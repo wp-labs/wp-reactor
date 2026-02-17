@@ -1,0 +1,114 @@
+use std::collections::HashMap;
+use std::time::Duration;
+
+use crate::fusion::FusionConfig;
+use crate::window::WindowConfig;
+
+/// Internal validation, called automatically during `FusionConfig::from_str` / `load`.
+pub(crate) fn validate(config: &FusionConfig) -> anyhow::Result<()> {
+    // server.listen must start with tcp://
+    if !config.server.listen.starts_with("tcp://") {
+        anyhow::bail!(
+            "server.listen must start with \"tcp://\", got {:?}",
+            config.server.listen,
+        );
+    }
+
+    // runtime.executor_parallelism > 0
+    if config.runtime.executor_parallelism == 0 {
+        anyhow::bail!("runtime.executor_parallelism must be > 0");
+    }
+
+    // Each window's max_window_bytes ≤ window_defaults.max_total_bytes
+    let max_total = config.window_defaults.max_total_bytes.as_bytes();
+    for w in &config.windows {
+        if w.max_window_bytes.as_bytes() > max_total {
+            anyhow::bail!(
+                "window {:?}: max_window_bytes ({}) exceeds window_defaults.max_total_bytes ({})",
+                w.name,
+                w.max_window_bytes,
+                config.window_defaults.max_total_bytes,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Cross-file validation: check that every window's `.ws` `over` duration does not exceed
+/// the `over_cap` configured in `fusion.toml`.
+///
+/// Call this after loading both the config and the `.ws` schema files.
+///
+/// - `windows`: resolved window configs from `FusionConfig`.
+/// - `window_overs`: map of window name → `over` duration parsed from `.ws` files.
+pub fn validate_over_vs_over_cap(
+    windows: &[WindowConfig],
+    window_overs: &HashMap<String, Duration>,
+) -> anyhow::Result<()> {
+    for (name, over) in window_overs {
+        let wc = windows
+            .iter()
+            .find(|w| w.name == *name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "window {name:?} found in .ws schema but not in fusion.toml [window.{name}]"
+                )
+            })?;
+        let cap: Duration = wc.over_cap.into();
+        if *over > cap {
+            anyhow::bail!(
+                "window {name:?}: over ({over:?}) exceeds over_cap ({cap:?})",
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ByteSize, DistMode, EvictPolicy, HumanDuration, LatePolicy};
+
+    fn sample_window(name: &str, over_cap_secs: u64) -> WindowConfig {
+        WindowConfig {
+            name: name.to_string(),
+            mode: DistMode::Local,
+            max_window_bytes: ByteSize::from(256 * 1024 * 1024),
+            over_cap: HumanDuration::from(Duration::from_secs(over_cap_secs)),
+            evict_policy: EvictPolicy::TimeFirst,
+            watermark: HumanDuration::from(Duration::from_secs(5)),
+            allowed_lateness: HumanDuration::from(Duration::from_secs(0)),
+            late_policy: LatePolicy::Drop,
+        }
+    }
+
+    #[test]
+    fn over_vs_over_cap_accept() {
+        let windows = vec![sample_window("auth_events", 1800)]; // 30m
+        let mut overs = HashMap::new();
+        overs.insert("auth_events".into(), Duration::from_secs(300)); // 5m ≤ 30m
+        assert!(validate_over_vs_over_cap(&windows, &overs).is_ok());
+    }
+
+    #[test]
+    fn over_vs_over_cap_reject() {
+        let windows = vec![sample_window("auth_events", 1800)]; // 30m
+        let mut overs = HashMap::new();
+        overs.insert("auth_events".into(), Duration::from_secs(3600)); // 60m > 30m
+        let err = validate_over_vs_over_cap(&windows, &overs).unwrap_err();
+        assert!(err.to_string().contains("auth_events"));
+    }
+
+    #[test]
+    fn over_vs_over_cap_missing_window() {
+        let windows = vec![sample_window("auth_events", 1800)];
+        let mut overs = HashMap::new();
+        overs.insert("unknown_window".into(), Duration::from_secs(300));
+        assert!(validate_over_vs_over_cap(&windows, &overs).is_err());
+    }
+}

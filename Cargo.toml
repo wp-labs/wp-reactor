@@ -1,0 +1,12 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+anyhow = "1.0"
