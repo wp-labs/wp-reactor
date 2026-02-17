@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use winnow::ascii::multispace1;
 use winnow::combinator::{alt, cut_err, delimited, opt, preceded, repeat, separated};
+use crate::parse_utils::duration_value;
 use winnow::error::{AddContext, ContextError, ErrMode, StrContext, StrContextValue};
 use winnow::prelude::*;
 use winnow::token::literal;
@@ -9,11 +10,9 @@ use winnow::token::literal;
 mod primitives;
 mod validate;
 
+use crate::parse_utils::{ident, quoted_string, ws_skip};
 use crate::schema::{FieldDef, FieldType, WindowSchema};
-use primitives::{
-    backtick_ident, base_type_parser, dotted_or_plain_ident, duration_value, ident, quoted_string,
-    ws_skip,
-};
+use primitives::{backtick_ident, base_type_parser, dotted_or_plain_ident};
 
 #[cfg(test)]
 mod tests;
@@ -70,6 +69,7 @@ fn window_decl(input: &mut &str) -> ModalResult<WindowSchema> {
     let mut time_field: Option<String> = None;
     let mut over: Option<Duration> = None;
     let mut fields: Option<Vec<FieldDef>> = None;
+    let mut has_stream = false;
 
     loop {
         ws_skip.parse_next(input)?;
@@ -77,12 +77,49 @@ fn window_decl(input: &mut &str) -> ModalResult<WindowSchema> {
             break;
         }
         if let Some(s) = opt(stream_attr).parse_next(input)? {
+            if has_stream {
+                return Err(ErrMode::Cut(ContextError::new().add_context(
+                    input,
+                    &input.checkpoint(),
+                    StrContext::Expected(StrContextValue::Description(
+                        "duplicate 'stream' attribute",
+                    )),
+                )));
+            }
+            has_stream = true;
             streams.extend(s);
         } else if let Some(t) = opt(time_attr).parse_next(input)? {
+            if time_field.is_some() {
+                return Err(ErrMode::Cut(ContextError::new().add_context(
+                    input,
+                    &input.checkpoint(),
+                    StrContext::Expected(StrContextValue::Description(
+                        "duplicate 'time' attribute",
+                    )),
+                )));
+            }
             time_field = Some(t);
         } else if let Some(o) = opt(over_attr).parse_next(input)? {
+            if over.is_some() {
+                return Err(ErrMode::Cut(ContextError::new().add_context(
+                    input,
+                    &input.checkpoint(),
+                    StrContext::Expected(StrContextValue::Description(
+                        "duplicate 'over' attribute",
+                    )),
+                )));
+            }
             over = Some(o);
         } else if let Some(f) = opt(fields_block).parse_next(input)? {
+            if fields.is_some() {
+                return Err(ErrMode::Cut(ContextError::new().add_context(
+                    input,
+                    &input.checkpoint(),
+                    StrContext::Expected(StrContextValue::Description(
+                        "duplicate 'fields' block",
+                    )),
+                )));
+            }
             fields = Some(f);
         } else {
             return Err(ErrMode::Cut(ContextError::new().add_context(
@@ -95,7 +132,13 @@ fn window_decl(input: &mut &str) -> ModalResult<WindowSchema> {
         }
     }
 
-    let fields = fields.unwrap_or_default();
+    let fields = fields.ok_or_else(|| {
+        ErrMode::Cut(ContextError::new().add_context(
+            input,
+            &input.checkpoint(),
+            StrContext::Expected(StrContextValue::Description("'fields' block is required")),
+        ))
+    })?;
     let over = over.unwrap_or(Duration::ZERO);
 
     Ok(WindowSchema {

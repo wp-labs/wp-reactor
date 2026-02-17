@@ -1,20 +1,14 @@
-use std::time::Duration;
-
-use winnow::ascii::multispace0;
 use winnow::combinator::{alt, cut_err, opt, trace};
-use winnow::error::{ContextError, ErrMode, StrContext, StrContextValue};
+use winnow::error::{StrContext, StrContextValue};
 use winnow::prelude::*;
 use winnow::token::{literal, take_while};
 
+use crate::parse_utils::ident;
 use crate::schema::BaseType;
 
 // ---------------------------------------------------------------------------
-// Identifiers
+// .ws-specific: identifiers
 // ---------------------------------------------------------------------------
-
-pub(super) fn ident<'a>(input: &mut &'a str) -> ModalResult<&'a str> {
-    take_while(1.., |c: char| c.is_ascii_alphanumeric() || c == '_').parse_next(input)
-}
 
 pub(super) fn dotted_or_plain_ident(input: &mut &str) -> ModalResult<String> {
     let first = ident.parse_next(input)?;
@@ -39,58 +33,7 @@ pub(super) fn backtick_ident(input: &mut &str) -> ModalResult<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Strings
-// ---------------------------------------------------------------------------
-
-pub(super) fn quoted_string(input: &mut &str) -> ModalResult<String> {
-    literal("\"").parse_next(input)?;
-    let content = take_while(0.., |c: char| c != '"').parse_next(input)?;
-    cut_err(literal("\""))
-        .context(StrContext::Expected(StrContextValue::Description(
-            "closing quote",
-        )))
-        .parse_next(input)?;
-    Ok(content.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Duration
-// ---------------------------------------------------------------------------
-
-pub(super) fn duration_value(input: &mut &str) -> ModalResult<Duration> {
-    let digits = take_while(1.., |c: char| c.is_ascii_digit()).parse_next(input)?;
-    let num: u64 = digits
-        .parse()
-        .map_err(|_| ErrMode::Cut(ContextError::new()))?;
-
-    // "0" with no suffix is valid (static collection)
-    if num == 0 {
-        let _ = opt(alt((
-            literal("s"),
-            literal("m"),
-            literal("h"),
-            literal("d"),
-        )))
-        .parse_next(input)?;
-        return Ok(Duration::ZERO);
-    }
-
-    let suffix = alt((
-        literal("s").value(1u64),
-        literal("m").value(60u64),
-        literal("h").value(3600u64),
-        literal("d").value(86400u64),
-    ))
-    .context(StrContext::Expected(StrContextValue::Description(
-        "duration suffix (s|m|h|d)",
-    )))
-    .parse_next(input)?;
-
-    Ok(Duration::from_secs(num * suffix))
-}
-
-// ---------------------------------------------------------------------------
-// Types
+// .ws-specific: types
 // ---------------------------------------------------------------------------
 
 pub(super) fn base_type_parser(input: &mut &str) -> ModalResult<BaseType> {
@@ -110,21 +53,4 @@ pub(super) fn base_type_parser(input: &mut &str) -> ModalResult<BaseType> {
         "type (chars|digit|float|bool|time|ip|hex)",
     )))
     .parse_next(input)
-}
-
-// ---------------------------------------------------------------------------
-// Whitespace & comments
-// ---------------------------------------------------------------------------
-
-/// Skip whitespace and `# ...` comments.
-pub(super) fn ws_skip(input: &mut &str) -> ModalResult<()> {
-    loop {
-        let _ = multispace0.parse_next(input)?;
-        if opt(literal("#")).parse_next(input)?.is_some() {
-            let _ = take_while(0.., |c: char| c != '\n').parse_next(input)?;
-        } else {
-            break;
-        }
-    }
-    Ok(())
 }

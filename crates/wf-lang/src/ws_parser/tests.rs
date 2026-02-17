@@ -3,7 +3,8 @@ use std::time::Duration;
 use winnow::prelude::*;
 
 use super::parse_ws;
-use super::primitives::{base_type_parser, duration_value};
+use super::primitives::base_type_parser;
+use crate::parse_utils::duration_value;
 use crate::schema::{BaseType, FieldType};
 
 // -----------------------------------------------------------------------
@@ -451,4 +452,65 @@ window defaults {
 "#;
     let schemas = parse_ws(input).unwrap();
     assert_eq!(schemas[0].over, Duration::ZERO);
+}
+
+#[test]
+fn reject_missing_fields_block() {
+    let input = r#"
+window bad {
+    over = 0
+}
+"#;
+    assert!(parse_ws(input).is_err());
+}
+
+#[test]
+fn reject_duplicate_stream_attr() {
+    let input = r#"
+window bad {
+    stream = "a"
+    stream = "b"
+    over = 0
+    fields { x: chars }
+}
+"#;
+    assert!(parse_ws(input).is_err());
+}
+
+#[test]
+fn reject_duplicate_time_attr() {
+    let input = r#"
+window bad {
+    time = ts
+    time = ts2
+    over = 5m
+    fields { ts: time  ts2: time }
+}
+"#;
+    assert!(parse_ws(input).is_err());
+}
+
+#[test]
+fn reject_duplicate_over_attr() {
+    let input = r#"
+window bad {
+    over = 5m
+    over = 10m
+    time = ts
+    fields { ts: time }
+}
+"#;
+    assert!(parse_ws(input).is_err());
+}
+
+#[test]
+fn reject_duplicate_fields_block() {
+    let input = r#"
+window bad {
+    over = 0
+    fields { x: chars }
+    fields { y: digit }
+}
+"#;
+    assert!(parse_ws(input).is_err());
 }
