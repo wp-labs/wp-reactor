@@ -277,4 +277,51 @@ SCAN_THRESHOLD = "10"
         assert_eq!(cfg.vars["FAIL_THRESHOLD"], "5");
         assert_eq!(cfg.vars["SCAN_THRESHOLD"], "10");
     }
+
+    #[test]
+    fn reject_invalid_var_name_hyphen() {
+        let toml = format!(
+            r#"{}
+[vars]
+my-var = "value"
+"#,
+            FULL_TOML
+        );
+        let err = toml.parse::<FusionConfig>().unwrap_err();
+        assert!(
+            err.to_string().contains("my-var"),
+            "error should mention the bad key: {err}",
+        );
+    }
+
+    #[test]
+    fn reject_invalid_var_name_digit_start() {
+        let toml = format!(
+            r#"{}
+[vars]
+1BAD = "value"
+"#,
+            FULL_TOML
+        );
+        let err = toml.parse::<FusionConfig>().unwrap_err();
+        assert!(
+            err.to_string().contains("1BAD"),
+            "error should mention the bad key: {err}",
+        );
+    }
+
+    #[test]
+    fn accept_underscore_var_name() {
+        let toml = format!(
+            r#"{}
+[vars]
+_PRIVATE = "ok"
+MAX_COUNT_2 = "99"
+"#,
+            FULL_TOML
+        );
+        let cfg: FusionConfig = toml.parse().unwrap();
+        assert_eq!(cfg.vars["_PRIVATE"], "ok");
+        assert_eq!(cfg.vars["MAX_COUNT_2"], "99");
+    }
 }

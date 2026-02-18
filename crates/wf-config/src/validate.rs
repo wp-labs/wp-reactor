@@ -32,7 +32,28 @@ pub(crate) fn validate(config: &FusionConfig) -> anyhow::Result<()> {
         }
     }
 
+    // vars keys must be valid WFL identifiers: [A-Za-z_][A-Za-z0-9_]*
+    for key in config.vars.keys() {
+        if !is_valid_var_name(key) {
+            anyhow::bail!(
+                "vars: invalid variable name {:?} — must match [A-Za-z_][A-Za-z0-9_]*",
+                key,
+            );
+        }
+    }
+
     Ok(())
+}
+
+/// A valid variable name starts with ASCII letter or underscore, followed by
+/// ASCII alphanumerics or underscores.
+fn is_valid_var_name(name: &str) -> bool {
+    let mut chars = name.bytes();
+    match chars.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    chars.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Cross-file validation: check that every window's `.ws` `over` duration does not exceed
