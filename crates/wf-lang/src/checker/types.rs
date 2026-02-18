@@ -468,6 +468,26 @@ pub fn check_pipe_chain(
     // Check threshold expression type
     check_expr_type(&branch.pipe.threshold, scope, rule_name, errors);
 
+    // T5: threshold type must be compatible with measure result type
+    // Note: numeric types (Digit, Float, Numeric) are all interchangeable at runtime
+    // (all become Value::Number), so we allow any numeric-to-numeric pairing.
+    if let Some(result_type) = measure_result_type(branch.pipe.measure, &field_val_type)
+        && let Some(threshold_type) = infer_type(&branch.pipe.threshold, scope)
+        && !compatible(&result_type, &threshold_type)
+        && !(is_numeric(&result_type) && is_numeric(&threshold_type))
+    {
+        errors.push(CheckError {
+            rule: Some(rule_name.to_string()),
+            contract: None,
+            message: format!(
+                "threshold type {:?} is not compatible with {}() result type {:?}",
+                threshold_type,
+                measure_name(branch.pipe.measure),
+                result_type
+            ),
+        });
+    }
+
     // Check guard expression if present
     if let Some(ref guard) = branch.guard {
         check_expr_type(guard, scope, rule_name, errors);
@@ -509,5 +529,15 @@ fn measure_name(m: Measure) -> &'static str {
         Measure::Avg => "avg",
         Measure::Min => "min",
         Measure::Max => "max",
+    }
+}
+
+/// Infer the result type of a measure given its field type.
+fn measure_result_type(measure: Measure, field_val_type: &Option<ValType>) -> Option<ValType> {
+    match measure {
+        Measure::Count => Some(ValType::Base(BaseType::Digit)),
+        Measure::Sum => field_val_type.clone(),
+        Measure::Avg => Some(ValType::Base(BaseType::Float)),
+        Measure::Min | Measure::Max => field_val_type.clone(),
     }
 }
