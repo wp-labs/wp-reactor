@@ -22,7 +22,7 @@ fn single_step_threshold() {
 
     if let StepResult::Matched(ctx) = sm.advance("fail", &e) {
         assert_eq!(ctx.rule_name, "rule1");
-        assert_eq!(ctx.scope_key, vec!["10.0.0.1"]);
+        assert_eq!(ctx.scope_key, vec![str_val("10.0.0.1")]);
         assert_eq!(ctx.step_data.len(), 1);
         assert_eq!(ctx.step_data[0].measure_value, 3.0);
     } else {
@@ -100,14 +100,14 @@ fn composite_key_isolation() {
 
     // Third event to key1 → matched
     if let StepResult::Matched(ctx) = sm.advance("fail", &e1) {
-        assert_eq!(ctx.scope_key, vec!["10.0.0.1", "22"]);
+        assert_eq!(ctx.scope_key, vec![str_val("10.0.0.1"), num(22.0)]);
     } else {
         panic!("expected Matched for key1");
     }
 
     // key2 still needs one more
     if let StepResult::Matched(ctx) = sm.advance("fail", &e2) {
-        assert_eq!(ctx.scope_key, vec!["10.0.0.1", "80"]);
+        assert_eq!(ctx.scope_key, vec![str_val("10.0.0.1"), num(80.0)]);
     } else {
         panic!("expected Matched for key2");
     }
@@ -308,5 +308,28 @@ fn instance_resets_after_match() {
         assert_eq!(ctx.step_data[0].measure_value, 2.0);
     } else {
         panic!("expected second Matched");
+    }
+}
+
+#[test]
+fn numeric_key_type_preserved_through_pipeline() {
+    // dport is a numeric key (443.0). After advance + match, scope_key
+    // should contain Value::Number(443.0), not Value::Str("443").
+    let plan = simple_plan(
+        vec![simple_key("sip"), simple_key("dport")],
+        vec![step(vec![branch("conn", count_ge(1.0))])],
+    );
+    let mut sm = CepStateMachine::new("rule_num_key".to_string(), plan);
+
+    let e = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("dport", num(443.0)),
+    ]);
+    if let StepResult::Matched(ctx) = sm.advance("conn", &e) {
+        assert_eq!(ctx.scope_key.len(), 2);
+        assert_eq!(ctx.scope_key[0], str_val("10.0.0.1"));
+        assert_eq!(ctx.scope_key[1], num(443.0));
+    } else {
+        panic!("expected Matched");
     }
 }

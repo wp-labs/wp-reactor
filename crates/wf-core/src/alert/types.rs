@@ -4,7 +4,10 @@ use arrow::record_batch::RecordBatch;
 /// CEP state machine signals a match or close.
 #[derive(Debug, Clone)]
 pub struct AlertRecord {
-    /// Deterministic composite key: `"rule|key1,key2|millis"`.
+    /// Composite alert key: `"rule|key1\x1fkey2|fired_at#seq"`.
+    ///
+    /// - Keys joined with `\x1f` (unit separator) to avoid value-containing-comma ambiguity
+    /// - `seq` is a process-wide monotonic counter for same-millisecond uniqueness
     pub alert_id: String,
     /// Name of the rule that fired.
     pub rule_name: String,

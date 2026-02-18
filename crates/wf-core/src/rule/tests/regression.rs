@@ -325,7 +325,7 @@ fn close_guard_event_field() {
     // Close: guard `status == "error"` references event field.
     // At close time, status is missing from synthetic event → permissive (passes).
     // 2 error events were accumulated (3 success filtered) → count=2 >= 2 → close_ok
-    let out = sm.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out = sm.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(out.event_ok);
     assert!(out.close_ok);
     assert_eq!(out.close_step_data[0].measure_value, 2.0);
@@ -375,14 +375,14 @@ fn close_guard_mixed_event_and_close_reason() {
         ("status", str_val("error")),
     ]);
     sm_a.advance_with_instant("resp", &resp_err, now);
-    let out_a = sm_a.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out_a = sm_a.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(out_a.close_ok);
 
     // Scenario B: error events + Flush close → close_reason != "timeout" → close_ok=false
     let mut sm_b = CepStateMachine::new("rule29b".to_string(), plan.clone());
     sm_b.advance_with_instant("req", &req, now);
     sm_b.advance_with_instant("resp", &resp_err, now);
-    let out_b = sm_b.close(&["10.0.0.1".to_string()], CloseReason::Flush).unwrap();
+    let out_b = sm_b.close(&[str_val("10.0.0.1")], CloseReason::Flush).unwrap();
     assert!(!out_b.close_ok);
 
     // Scenario C: success events + Timeout → status filter blocks accumulation → count=0 < 1
@@ -393,7 +393,7 @@ fn close_guard_mixed_event_and_close_reason() {
         ("status", str_val("success")),
     ]);
     sm_c.advance_with_instant("resp", &resp_ok, now);
-    let out_c = sm_c.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out_c = sm_c.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(!out_c.close_ok);
 }
 
@@ -450,7 +450,7 @@ fn close_guard_close_reason_only_permissive() {
     sm.advance_with_instant("resp", &resp, now);
 
     // Close with Timeout → guard passes at close time → count=3 >= 3 → close_ok
-    let out = sm.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out = sm.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(out.close_ok);
     assert_eq!(out.close_step_data[0].measure_value, 3.0);
 
@@ -471,7 +471,7 @@ fn close_guard_close_reason_only_permissive() {
     sm2.advance_with_instant("resp", &resp, now);
     sm2.advance_with_instant("resp", &resp, now);
     sm2.advance_with_instant("resp", &resp, now);
-    let out2 = sm2.close(&["10.0.0.1".to_string()], CloseReason::Flush).unwrap();
+    let out2 = sm2.close(&[str_val("10.0.0.1")], CloseReason::Flush).unwrap();
     assert!(!out2.close_ok);
 }
 
@@ -518,7 +518,7 @@ fn close_step_string_min_max() {
     sm_a.advance_with_instant("dns", &mk_dns("alpha"), now); // min becomes "alpha"
     sm_a.advance_with_instant("dns", &mk_dns("delta"), now);
 
-    let out_a = sm_a.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out_a = sm_a.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(out_a.event_ok);
     assert!(!out_a.close_ok); // min="alpha" < "beta" → not satisfied
 
@@ -528,7 +528,7 @@ fn close_step_string_min_max() {
     sm_b.advance_with_instant("dns", &mk_dns("gamma"), now);
     sm_b.advance_with_instant("dns", &mk_dns("beta"), now); // min becomes "beta"
 
-    let out_b = sm_b.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out_b = sm_b.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(out_b.event_ok);
     assert!(out_b.close_ok); // min="beta" >= "beta" → satisfied
 
@@ -556,7 +556,7 @@ fn close_step_string_min_max() {
     sm_c.advance_with_instant("dns", &mk_dns("alpha"), now);
     sm_c.advance_with_instant("dns", &mk_dns("gamma"), now); // max becomes "gamma"
 
-    let out_c = sm_c.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out_c = sm_c.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(out_c.event_ok);
     assert!(out_c.close_ok); // max="gamma" >= "delta" → true
 }
@@ -664,7 +664,7 @@ fn min_max_non_constant_threshold_no_false_positive() {
     ]);
     sm2.advance_with_instant("dns", &dns_ev, now);
 
-    let out = sm2.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out = sm2.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(out.event_ok);
     assert!(!out.close_ok); // threshold is non-constant → must not satisfy
 }

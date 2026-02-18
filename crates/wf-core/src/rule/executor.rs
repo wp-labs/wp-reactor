@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
@@ -130,19 +131,19 @@ impl RuleExecutor {
 
 /// Build a synthetic [`Event`] from match context for expression evaluation.
 ///
-/// - Maps `keys[i]` field name → `scope_key[i]` value (as `Value::Str`)
+/// - Maps `keys[i]` field name → `scope_key[i]` value (original type preserved)
 /// - Adds step labels as fields → `label` → `Value::Number(measure_value)`
 fn build_eval_context(
     keys: &[FieldRef],
-    scope_key: &[String],
+    scope_key: &[Value],
     step_data: &[StepData],
 ) -> Event {
     let mut fields = std::collections::HashMap::new();
 
-    // Key fields
+    // Key fields — preserve original Value type
     for (fr, val) in keys.iter().zip(scope_key.iter()) {
         let name = field_ref_name(fr).to_string();
-        fields.insert(name, Value::Str(val.clone()));
+        fields.insert(name, val.clone());
     }
 
     // Step labels → measure values
@@ -222,21 +223,28 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// Build a deterministic alert id: `"rule|key1,key2|fired_at"`.
-fn build_alert_id(rule_name: &str, scope_key: &[String], fired_at: &str) -> String {
+/// Process-wide monotonic counter for alert_id uniqueness.
+static ALERT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Build a composite alert id: `"rule|key1\x1fkey2|fired_at#seq"`.
+///
+/// - Keys joined with `\x1f` (unit separator) to avoid value-containing-comma ambiguity
+/// - `seq` is a process-wide monotonic counter for same-millisecond uniqueness
+fn build_alert_id(rule_name: &str, scope_key: &[Value], fired_at: &str) -> String {
     let keys_part = if scope_key.is_empty() {
         "global".to_string()
     } else {
-        scope_key.join(",")
+        scope_key.iter().map(value_to_string).collect::<Vec<_>>().join("\x1f")
     };
-    format!("{}|{}|{}", rule_name, keys_part, fired_at)
+    let seq = ALERT_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{}|{}|{}#{}", rule_name, keys_part, fired_at, seq)
 }
 
 /// Build a human-readable summary.
 fn build_summary(
     rule_name: &str,
     keys: &[FieldRef],
-    scope_key: &[String],
+    scope_key: &[Value],
     step_data: &[StepData],
     close_reason: Option<&str>,
 ) -> String {
@@ -250,7 +258,7 @@ fn build_summary(
         let key_strs: Vec<String> = keys
             .iter()
             .zip(scope_key.iter())
-            .map(|(fr, val)| format!("{}={}", field_ref_name(fr), val))
+            .map(|(fr, val)| format!("{}={}", field_ref_name(fr), value_to_string(val)))
             .collect();
         parts.push(format!("scope=[{}]", key_strs.join(", ")));
     }

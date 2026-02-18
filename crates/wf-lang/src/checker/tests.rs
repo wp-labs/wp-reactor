@@ -1016,3 +1016,54 @@ rule bad_hostname_check {
         "error should be attributed to the rule"
     );
 }
+
+// =========================================================================
+// Cross-segment label uniqueness (Bug 2)
+// =========================================================================
+
+#[test]
+fn duplicate_label_across_event_and_close() {
+    let input = r#"
+rule r {
+    events { a : auth_events  b : fw_events }
+    match<sip:5m> {
+        on event {
+            lbl: a | count >= 1;
+        }
+        on close {
+            lbl: b | count >= 1;
+        }
+    } -> score(50.0)
+    entity(ip, a.sip)
+    yield out (x = a.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), fw_events_window(), output_window()],
+        "duplicate step label `lbl`",
+    );
+}
+
+#[test]
+fn distinct_labels_across_event_and_close() {
+    let input = r#"
+rule r {
+    events { a : auth_events  b : fw_events }
+    match<sip:5m> {
+        on event {
+            evt_lbl: a | count >= 1;
+        }
+        on close {
+            cls_lbl: b | count >= 1;
+        }
+    } -> score(50.0)
+    entity(ip, a.sip)
+    yield out (x = a.sip)
+}
+"#;
+    assert_no_errors(
+        input,
+        &[auth_events_window(), fw_events_window(), output_window()],
+    );
+}

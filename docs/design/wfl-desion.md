@@ -11,7 +11,7 @@
 
 ### 1.2 范围
 - WFL 是 WarpFusion 的检测 DSL，不是通用流计算平台 SQL。
-- 优先支持：安全关联检测、告警归并与实体行为分析。
+- 优先支持：安全关联检测、风险告警归并与实体行为分析。
 - 不追求：任意 DAG、任意子查询、全功能分析查询语言。
 
 ---
@@ -63,15 +63,15 @@ runtime: runtime/fusion.toml
 ## 4. 能力分层（L1/L2/L3）
 
 ### L1（默认，MVP）
-- `events + match + yield + fixed severity + fmt()`
+- `events + match + score + entity + yield + fmt()`
 - 含：OR 分支（`||`）、复合 key（`match<f1,f2:dur>`）、`on close` 缺失检测
 - 含：`count`/`sum`/`avg`/`min`/`max`/`distinct` 聚合
 - 含：`$VAR` / `${VAR:default}` 变量预处理
 - 场景：阈值、单步/多步时序、缺失检测、基础聚合。
 
 ### L2（增强）
-- `join + severity_map + baseline + window.has() + entity()`
-- 场景：情报关联、动态分级、异常偏离、集合判定、实体建模。
+- `join + baseline + window.has() + derive + score 分项块`
+- 场景：情报关联、异常偏离、集合判定、实体建模、可解释评分。
 
 ### L3（高级，feature gate）
 - `|>`、`conv`、`tumble`、隐式中间窗口。
@@ -88,14 +88,15 @@ runtime: runtime/fusion.toml
 | 多步序列、`on close`、OR 分支（`\|\|`） | ✓ | | |
 | `count`/`sum`/`avg`/`min`/`max`/`distinct` | ✓ | | |
 | `yield target (...)` 显式目标 | ✓ | | |
-| `-> level` 固定 severity | ✓ | | |
+| `-> score(expr)` 单通道风险分 | ✓ | | |
+| `score { item = expr @ weight; ... }` 分项评分 | | ✓ | |
+| `derive { x = expr; ... }` 特征派生块 | | ✓ | |
 | `fmt()` 格式化 | ✓ | | |
 | `$VAR` 变量预处理 | ✓ | | |
 | `join` 外部关联 | | ✓ | |
-| `-> { expr => level }` 动态 severity | | ✓ | |
 | `baseline()` 基线偏离 | | ✓ | |
 | `window.has(field)` 集合判定 | | ✓ | |
-| `entity(type, id_expr)` 实体声明 | | ✓ | ✓ |
+| `entity(type, id_expr)` 实体声明 | ✓ | | |
 | `tumble` 固定间隔窗口 | | | ✓ |
 | `conv { ... }` 结果集变换 | | | ✓ |
 | `\|>` 多级管道 | | | ✓ |
@@ -108,17 +109,17 @@ runtime: runtime/fusion.toml
 | `match<key:session(gap)>` 会话窗口 | | | ✓ |
 | 统计函数（`stddev`/`percentile`） | | | ✓ |
 | 增强 `baseline(expr, dur, method)` + 持久化 | | | ✓ |
-| `-> score(expr)` 数值风险评分 | | | ✓ |
 
 ### 4.1 行为分析能力扩展（规划）
 
-> 以下能力用于支持实体行为分析场景（用户会话建模、行为基线、风险评分），**不影响 Core IR 四原语和五阶段管道结构**。所有新能力均为函数/表达式/窗口模式/实体声明扩展，编译器将新语法 desugar 到现有 Bind/Match/Join/Yield 框架内执行。
+> 以下能力用于支持实体行为分析场景（用户会话建模、行为基线、风险评分），**不影响 Core IR 四原语和五阶段管道结构**。所有新能力均为函数/表达式/窗口模式/实体声明/特征派生扩展，编译器将新语法 desugar 到现有 Bind/Match/Join/Yield 框架内执行。
 
 #### 4.1.1 L2 行为分析基础
 
 **条件表达式**：`if expr then expr else expr`
 - 分支计算，替代多规则拆分。
 - 典型场景：按条件赋值（`if duration > 300 then "long" else "short"`）。
+- 评分场景推荐辅助函数 `hit(cond)`，将 bool 条件映射为 1.0/0.0。
 
 **时间函数**：
 - `time_diff(t1, t2)` → float：两时间戳间隔（秒），用于响应时延分析、会话间隔计算。
@@ -151,21 +152,21 @@ runtime: runtime/fusion.toml
 - `baseline(expr, dur, method)` 扩展 `method` 参数：`mean`（默认）/ `ewma`（指数加权） / `median`。
 - 基线持久化：基线状态定期快照落盘，重启后恢复（不从零冷启动）。
 
-**数值风险评分**：`-> score(expr)`
-- 替代分类 severity（low/medium/high/critical），输出数值型风险分数。
+**单通道风险评分**：`-> score(expr)` / `-> score { ... }`
+- 规则层仅产出单一风险分，不再在规则中声明等级。
 - 支持跨规则累加：多条规则对同一实体产出 score，下游聚合总分。
-- `score(expr)` 中 `expr` 须为 digit/float 类型。
+- `score(expr)` 或 `score { item = expr @ weight; ... }` 中 `expr` 均须为 digit/float 类型。
 
 #### 4.1.3 结构影响评估
 
 | 组件 | 是否变更 | 说明 |
 |------|:--------:|------|
 | Core IR 四原语 | 否 | Bind/Match/Join/Yield 不变 |
-| 主执行链 | 否 | BIND→SCOPE→JOIN→YIELD→CONV 不变；`entity(...)` 作为 YIELD 前置声明，不新增独立执行阶段 |
+| 主执行链 | 调整 | 执行链统一为 BIND→SCOPE→JOIN→ENTITY→YIELD→CONV；其中 ENTITY 为声明位，不引入独立计算算子 |
 | 表达式求值器 | 扩展 | 新增 `if/then/else` 节点、新内置函数 |
 | WindowStore | 扩展 | 新增 session window 模式 |
 | MatchEngine | 扩展 | 支持 session gap 触发窗口切分 |
-| YieldWriter | 扩展 | 支持 `score()` 数值输出与 `entity_type/entity_id` 系统字段注入 |
+| YieldWriter | 扩展 | 支持 `score` 输出与 `entity_type/entity_id` 系统字段注入 |
 | 运行时状态 | 扩展 | baseline 持久化需增加 snapshot 组件 |
 
 ---
@@ -174,12 +175,12 @@ runtime: runtime/fusion.toml
 
 WFL 采用固定主执行链，阶段顺序不可变（`entity(...)` 为 YIELD 前置声明，不新增独立执行阶段）：
 
-`BIND -> SCOPE -> JOIN -> [ENTITY] -> YIELD -> CONV`
+`BIND -> SCOPE -> JOIN -> ENTITY -> YIELD -> CONV`
 
 - BIND：`events { alias : window && filter }`
-- SCOPE：`match<keys:window_spec> { steps } [-> severity_map | -> score(expr)]`
+- SCOPE：`match<keys:window_spec> { steps [derive] } -> score(expr)` 或 `-> score { ... }`
 - JOIN：`join dim_window on sip == dim_window.ip`
-- ENTITY：`entity(host, e.host_id)`（可选，声明规则输出实体键）
+- ENTITY：`entity(host, e.host_id)`（必选，声明规则输出实体键）
 - YIELD：`yield target_window (field = expr, ...)`（L3 允许 `yield (field=...)` 隐式目标）
 - CONV（L3）：`conv { where/sort/top/dedup ... }`
 
@@ -189,8 +190,10 @@ WFL 采用固定主执行链，阶段顺序不可变（`entity(...)` 为 YIELD �
 - `yield` 采用 **子集映射**：yield 命名参数 + 系统字段必须是目标 window fields 的子集（名称、类型一致）。
 - yield 中不得出现未定义字段；未覆盖的非系统字段写入 `null`。同一输出 window 可被多条规则复用。
 - `match` 采用显式双阶段：`on event { ... }`（必选）+ `on close { ... }`（可选，窗口关闭求值）。
+- `derive { ... }` 为特征派生块：先计算可复用特征，再供 `score`/`yield` 引用。
 - `entity(type, id_expr)` 为实体建模一等语法，禁止再依赖 `yield` 手工拼 `entity_type/entity_id`。
 - **聚合写法统一**：`alias.field | distinct | count` 与 `distinct(alias.field)` 在语义上等价，编译阶段统一 desugar 为同一聚合 IR。
+- 新增 `contract { given/expect }` 规则契约测试块：仅用于 `wf test`/CI 前置校验，不进入生产执行链。
 
 ---
 
@@ -238,11 +241,11 @@ base_type     = "chars" | "digit" | "float" | "bool" | "time" | "ip" | "hex" ;
 > L3 特性（`|>`、`conv`、`tumble`）以 `(* L3 *)` 标注。L1/L2 实现可忽略带 L3 标注的产生式。
 
 ```ebnf
-wfl_file      = { use_decl } , { rule_decl } ;
+wfl_file      = { use_decl } , { rule_decl } , { contract_block } ;
 use_decl      = "use" , STRING ;
 rule_decl     = "rule" , IDENT , "{" , [ meta_block ] , events_block , stage_chain , "}" ;
 
-stage_chain   = stage , { "|>" , stage } , [ entity_clause ] , yield_clause , [ conv_clause ] ;  (* |> 和 conv 为 L3 *)
+stage_chain   = stage , { "|>" , stage } , entity_clause , yield_clause , [ conv_clause ] ;  (* |> 和 conv 为 L3 *)
 stage         = match_clause , { join_clause } ;
 
 meta_block    = "meta" , "{" , { IDENT , "=" , STRING } , "}" ;
@@ -250,13 +253,15 @@ meta_block    = "meta" , "{" , { IDENT , "=" , STRING } , "}" ;
 events_block  = "events" , "{" , event_decl , { event_decl } , "}" ;
 event_decl    = IDENT , ":" , IDENT , [ "&&" , expr ] ;
 
-match_clause  = "match" , "<" , match_params , ">" , "{" , on_event_block , [ on_close_block ] , "}" , [ "->" , severity_out ] ;
+match_clause  = "match" , "<" , match_params , ">" , "{" , on_event_block , [ on_close_block ] , [ derive_block ] , "}" , "->" , score_out ;
 match_params  = [ field_ref , { "," , field_ref } ] , ":" , window_spec ;
 window_spec   = DURATION                              (* 滑动窗口 *)
               | DURATION , ":" , "tumble"              (* 固定间隔窗口，L3 *)
               | "session" , "(" , DURATION , ")"  ;    (* 会话窗口，L3 行为分析 *)
 on_event_block= "on" , "event" , "{" , match_step , { match_step } , "}" ;
 on_close_block= "on" , "close" , "{" , match_step , { match_step } , "}" ;
+derive_block  = "derive" , "{" , derive_item , { derive_item } , "}" ;
+derive_item   = IDENT , "=" , expr , ";" ;
 match_step    = step_branch , { "||" , step_branch } , ";" ;
 step_branch   = [ IDENT , ":" ] , source_ref , [ "." , IDENT | "[" , STRING , "]" ] , [ "&&" , expr ] , pipe_chain ;
 source_ref    = IDENT ;                (* events 别名 或 |> 后续 stage 的 _in *)
@@ -267,13 +272,12 @@ measure       = "count" | "sum" | "avg" | "min" | "max" ;
 join_clause   = "join" , IDENT , "on" , join_cond , { "&&" , join_cond } ;     (* L2 *)
 join_cond     = field_ref , "==" , field_ref ;
 
-severity_out  = severity_map | score_expr ;                                     (* score 为 L3 行为分析 *)
-severity_map  = severity | "{" , sev_branch , { "," , sev_branch } , "}" ;     (* 动态 map 为 L2 *)
-sev_branch    = ( expr | "_" ) , "=>" , severity ;
-severity      = "low" | "medium" | "high" | "critical" ;
-score_expr    = "score" , "(" , expr , ")" ;                                   (* L3 行为分析：数值风险评分 *)
+score_out     = score_expr | score_block ;
+score_expr    = "score" , "(" , expr , ")" ;                                   (* 简洁写法 *)
+score_block   = "score" , "{" , score_item , { score_item } , "}" ;            (* 可解释分项写法 *)
+score_item    = IDENT , "=" , expr , "@" , NUMBER , ";" ;
 
-entity_clause = "entity" , "(" , entity_type , "," , expr , ")" ;              (* L2+：实体声明 *)
+entity_clause = "entity" , "(" , entity_type , "," , expr , ")" ;              (* L1：实体声明，规则必选 *)
 entity_type   = IDENT | STRING ;
 
 yield_clause  = "yield" , [ IDENT ] , "(" , named_arg , { "," , named_arg } , ")" ;  (* 省略 IDENT 的隐式 yield 为 L3 *)
@@ -283,6 +287,24 @@ conv_clause   = "conv" , "{" , conv_chain , { conv_chain } , "}" ;             (
 conv_chain    = conv_step , { "|" , conv_step } , ";" ;
 conv_step     = ("sort" | "top" | "dedup" | "where") , "(" , [ conv_args ] , ")" ;
 conv_args     = expr , { "," , expr } ;
+
+(* 规则契约测试（given/expect，供 wf test 使用） *)
+contract_block = "contract" , IDENT , "for" , IDENT , "{" , given_block , expect_block , [ options_block ] , "}" ;
+given_block    = "given" , "{" , { given_stmt } , "}" ;
+given_stmt     = "row" , "(" , IDENT , "," , field_assign , { "," , field_assign } , ")" , ";"
+               | "tick" , "(" , DURATION , ")" , ";" ;
+field_assign   = ( IDENT | STRING ) , "=" , expr ;
+expect_block   = "expect" , "{" , { expect_stmt } , "}" ;
+expect_stmt    = "hits" , cmp_op , NUMBER , ";"
+               | "hit" , "[" , NUMBER , "]" , "." , hit_assert , ";" ;
+hit_assert     = "score" , cmp_op , NUMBER
+               | "close_reason" , "==" , STRING
+               | "entity_type" , "==" , STRING
+               | "entity_id" , "==" , STRING
+               | "field" , "(" , STRING , ")" , cmp_op , expr ;
+options_block  = "options" , "{" , [ "close_trigger" , "=" , close_trigger_val , ";" ] , [ "eval_mode" , "=" , eval_mode_val , ";" ] , "}" ;
+close_trigger_val = "timeout" | "flush" | "eos" ;
+eval_mode_val  = "strict" | "lenient" ;
 
 (* 表达式（简化） *)
 expr          = or_expr ;
@@ -297,11 +319,15 @@ mul_expr      = unary_expr , { ("*" | "/" | "%") , unary_expr } ;
 unary_expr    = [ "-" ] , primary ;
 primary       = NUMBER | STRING | "true" | "false"
               | field_ref
+              | derive_ref
+              | close_reason_ref
               | func_call
               | agg_pipe_expr
               | if_expr
               | "(" , expr , ")" ;
 if_expr       = "if" , expr , "then" , expr , "else" , expr ;                  (* L2 行为分析：条件表达式 *)
+derive_ref    = "@" , IDENT ;
+close_reason_ref = "close_reason" ;
 func_call     = [ IDENT , "." ] , IDENT , "(" , [ expr , { "," , expr } ] , ")" ;
 agg_pipe_expr = source_ref , [ "." , IDENT | "[" , STRING , "]" ] , { "|" , transform } , "|" , measure ;
 field_ref     = IDENT
@@ -320,6 +346,8 @@ ANY           = ? any unicode char ? ;
 
 ### 7.1 保留标识符
 - `_in`：`|>` 后续 stage 的隐式输入别名，编译器注入，用户必须以此名引用前级输出。
+- `@name`：`derive` 派生项引用前缀，不可作为普通字段名使用。
+- `close_reason`：窗口关闭原因只读上下文字段（`timeout` / `flush` / `eos`）。
 
 ### 7.1.1 带点字段名访问
 - `.ws` 允许字段名包含 `.`（如 `detail.sha256`）。
@@ -343,6 +371,9 @@ ANY           = ? any unicode char ? ;
 | `window.has` | `window.has(field)` / `window.has(field, target_field)` → bool | L2 | 成员判定：判断当前上下文字段值是否存在于目标 window 字段值集合 |
 | **── 行为分析扩展 ──** | | | |
 | `if/then/else` | `if expr then expr else expr` → T | L2 | 条件表达式，两分支类型须一致 |
+| `hit` | `hit(cond)` → float | L2 | 条件命中映射：`true -> 1.0`，`false -> 0.0` |
+| `derive` | `derive { x = expr; ... }` | L2 | 特征派生块：复用表达式结果，供 `score` 与 `yield` 引用 |
+| `score`（分项） | `score { item = expr @ weight; ... }` | L2 | 分项评分聚合；用于解释每项贡献 |
 | `time_diff` | `time_diff(t1, t2)` → float | L2 | 两时间戳间隔（秒） |
 | `time_bucket` | `time_bucket(field, interval)` → time | L2 | 时间分桶（interval 为 DURATION 字面量） |
 | `contains` | `contains(field, pattern)` → bool | L2 | 子串包含判定 |
@@ -357,6 +388,10 @@ ANY           = ? any unicode char ? ;
 | `stddev` | `stddev(alias.field)` → float | L3 | 标准差 |
 | `percentile` | `percentile(alias.field, p)` → float | L3 | 分位数（p 为 0~100） |
 
+- `score` 输出支持两种写法：`score(expr)`（简洁）与 `score { item = expr @ weight; ... }`（可解释）。
+- `score` 分项块中，单项贡献 = `expr * weight`；总分为所有分项贡献之和。
+- `derive` 先于 `score`/`yield` 求值；同一窗口内每个派生项只计算一次。
+- `derive` 引用使用 `@name`；可用于 `score` 与 `yield`，不可用于 `events` 过滤。
 - 集合判定（L2）：`window.has(field)` 判断“当前上下文字段值”是否存在于目标 window 的同名字段值集中；目标 window 须为静态集合（`over = 0`）或维度表。返回 `bool`。
 
 **`window.has(field)` 语义（L2）：**
@@ -375,7 +410,7 @@ ANY           = ? any unicode char ? ;
 | 写法 | 示例 | 说明 |
 |------|------|------|
 | 管道式 | `scan.dport | distinct | count` | 常用于 `match` 步骤 |
-| 函数式 | `distinct(scan.dport)` | 常用于 `yield` / `severity_map` 表达式 |
+| 函数式 | `distinct(scan.dport)` | 常用于 `yield` / `score(expr)` 表达式 |
 
 - 两种写法编译后等价，统一到同一聚合 IR。
 - 推荐：`match` 用管道式，`yield` 用函数式，保持可读性一致。
@@ -404,8 +439,9 @@ match<sip:5m> {
 
 ### 7.4 关键语义
 - OR 分支：任一命中即转移；未命中分支字段为 `null`。
-- `on event`：事件到达时求值；`on close`：窗口关闭时求值（固定窗口到期、session gap 超时或 flush）。
+- `on event`：事件到达时求值；`on close`：窗口关闭时求值（固定窗口到期、session gap 超时、flush 或 eos）。
 - 若省略 `on close`，关闭阶段视为恒为 true，不额外阻断命中。
+- `null` 与运行时异常按 `runtime.eval.mode` 执行（`strict` 或 `lenient`），避免规则结果漂移。
 - `join`：固定 LEFT JOIN 语义。
 - `conv`：仅 `tumble` 可用。
 
@@ -420,6 +456,7 @@ match<sip:5m> {
 4. desugar：展开 `|>`、隐式 stage、`conv` 钩子。
 5. 生成 Core IR（Bind/Match/Join/Yield）。
 6. 输出 RulePlan（供 MatchEngine 执行）。
+7. 若存在 `contract_block`，输出 ContractPlan（供 `wf test` 执行；不进入生产运行时）。
 
 ### 8.2 RulePlan 结构
 ```rust
@@ -428,7 +465,7 @@ pub struct RulePlan {
     pub binds: Vec<BindPlan>,
     pub match_plan: MatchPlan,
     pub joins: Vec<JoinPlan>,
-    pub entity_plan: Option<EntityPlan>,
+    pub entity_plan: EntityPlan,
     pub yield_plan: YieldPlan,
     pub conv_plan: Option<ConvPlan>,
 }
@@ -441,6 +478,7 @@ pub struct MatchClauseAst {
     pub params: MatchParamsAst,
     pub on_event: Vec<MatchStepAst>,           // 必选，且非空
     pub on_close: Option<Vec<MatchStepAst>>,   // 可选
+    pub derives: Vec<DeriveItemAst>,           // 可选
 }
 
 pub struct MatchStepAst {
@@ -453,6 +491,11 @@ pub struct StepBranchAst {
     pub field: Option<FieldSelectorAst>,
     pub guard: Option<ExprAst>,
     pub pipe: PipeChainAst,
+}
+
+pub struct DeriveItemAst {
+    pub name: String,
+    pub expr: ExprAst,
 }
 
 pub struct EntityClauseAst {
@@ -474,15 +517,24 @@ pub enum MatchPhase {
     Close,
 }
 
+pub enum CloseReason {
+    Timeout,
+    Flush,
+    Eos,
+}
+
 pub struct MatchPlan {
     pub keys: Vec<FieldRef>,
     pub window_spec: WindowSpec,
     pub event_steps: Vec<StepPlan>,
     pub close_steps: Vec<StepPlan>,            // 为空时等价 close_ok = true
+    pub derive_plans: Vec<DerivePlan>,
 }
 ```
 
 - 运行期判定：`event_ok = eval(event_steps)`，`close_ok = close_steps.is_empty() || eval(close_steps)`。
+- 关闭上下文：执行 `on close` 时注入 `close_reason ∈ {timeout, flush, eos}`。
+- 派生求值：`derive_ctx = eval_once(derive_plans)`，供 `score`/`yield` 共享。
 - 最终命中条件：`event_ok && close_ok`。
 - `on_close` 仅做条件判定，不新增独立 `join/yield` 执行动作。
 
@@ -490,6 +542,8 @@ pub struct MatchPlan {
 - 展开后的规则（去语法糖）。
 - 状态机图（状态/转移/超时）。
 - 字段血缘（字段从哪来、在哪步变换）。
+- 评分展开（`score { ... }` 展开后的分项贡献与总分公式）。
+- 派生图（`derive` 项依赖 DAG 与求值顺序）。
 
 ---
 
@@ -501,7 +555,9 @@ pub struct MatchPlan {
 ### 9.2 事件驱动
 - 新事件只分发到“引用该 window”的规则。
 - 匹配成功后触发 join/yield。
-- timeout wheel 定期触发窗口关闭与 maxspan 过期，并执行 `on close` 求值。
+- timeout wheel 定期触发窗口关闭与 maxspan 过期，并以 `close_reason = timeout` 执行 `on close` 求值。
+- 显式 flush 触发时，`close_reason = flush`。
+- 输入流结束（end-of-stream）触发时，`close_reason = eos`。
 
 ### 9.3 并发控制
 - 全局 `Semaphore(executor_parallelism)`。
@@ -512,61 +568,51 @@ pub struct MatchPlan {
 
 ## 10. 容错与一致性语义
 
-### 10.1 传输层
-- 语义：At-Least-Once（尽力而为）。
-- 帧头字段：`source_id + stream_tag + batch_seq`。
-- Sink：发送前先写本地 WAL，收到 ACK 后清理已确认条目。
-- Receiver：写入接收侧 Ingress WAL（可重放）+ 位图滑动窗口去重（支持乱序）。
+### 10.1 传输层（单向 TCP，Best-Effort）
+- 语义：Best-Effort / At-Most-Once。
+- 协议：`wp-motor -> wp-reactor` 单向推送，帧格式为 `[4B len][payload]`。
+- 不使用应用层 ACK，不引入发送端/接收端 WAL 与重放协议。
+- 背压：以 TCP 流控为主，叠加本地有界队列保护。
 
-**Ingress WAL 规格（Receiver 侧）：**
+**可靠性边界（明确承诺）：**
+- TCP 仅保证“连接存活期间的字节传输”，不保证“接收端已处理/已持久化”。
+- 发生进程崩溃、断连或队列溢出时，允许数据丢失；丢失数据不可自动重放恢复。
+- 本模式适用于检测场景（允许少量漏检），不适用于审计级“逐条必达”场景。
+
+**过载策略（必须配置）：**
 
 | 项 | 规范 |
 |----|------|
-| 保留策略 | **独立配置**，不与 Sink WAL 共享；参数名 `ingress_wal_retention`（默认 `30m`）。 |
-| 组织方式 | **per-source 分目录**：`.../ingress-wal/<source_id>/segment-*`，回放与清理按 source 隔离。 |
-| 回放粒度 | 按 `(source_id, batch_seq)` 单调顺序回放；不同 source 互不影响。 |
-| fsync 策略 | 可配置：`strict`（每条 fsync）/ `interval`（默认，`100ms` 或 `256` 条触发）/ `off`（仅测试）。 |
-| ACK 推进 | 仅能推进到“已落 Ingress WAL 且连续无缺口”的 `ack_seq`。 |
+| 队列容量 | 接收侧/发送侧均使用有界队列，避免无界内存增长。 |
+| 溢出策略 | `drop_oldest`（默认）\| `drop_newest` \| `sample`。 |
+| 退化策略 | 连续溢出时触发限流或采样，并上报质量降级指标。 |
+| 可观测性 | 至少暴露 `dropped_events_total`、`send_queue_full_total`、`reconnect_total`、`backpressure_seconds_total`。 |
 
 建议配置（`runtime.toml`）：
 
 ```toml
-[receiver.ingress_wal]
-dir = "/var/lib/warpfusion/ingress-wal"
-retention = "30m"               # ingress_wal_retention
-fsync_mode = "interval"         # strict | interval | off
-fsync_interval = "100ms"        # interval 模式生效
-fsync_batch = 256               # interval 模式生效
+[transport]
+mode = "best_effort"            # 固定：best_effort
+frame = "len32_payload"         # [4B len][payload]
+max_frame_bytes = 1048576
+read_timeout = "30s"
+write_timeout = "30s"
+
+[transport.backpressure]
+queue_capacity = 65536
+on_overflow = "drop_oldest"     # drop_oldest | drop_newest | sample
+sample_ratio = 0.2               # on_overflow=sample 时生效
+max_block = "200ms"
+
+[monitoring.thresholds]
+dropped_events_ratio_warn = 0.001
+backpressure_seconds_warn = 30
 ```
-
-**ACK 协议（累积确认）：**
-
-```
-Sink                                  Receiver
- │ ── Frame(source_id, seq=1, tag, batch) ──→ │
- │ ── Frame(source_id, seq=2, tag, batch) ──→ │
- │ ←── Ack(source_id, ack_seq=2) ──────────── │  // 连续前缀累积确认
- │                                             │
- │  Sink 收到 ack_seq=2 → 清理 WAL 中 seq ≤ 2
-```
-
-- **ACK 帧**：`source_id(u64) + ack_seq(u64)`；`ack_seq` 必须是“已持久化且连续”的最大序号（即 `<= ack_seq` 无缺口）。
-- **落盘时机**：Receiver 将 batch 追加到 Ingress WAL 并 `fsync` 成功后，才允许推进 `ack_seq`；仅写入 Window 内存不允许 ACK。
-- **乱序处理**：若先收到 `seq=5` 再收到 `seq=4`，在 `4` 到达前 `ack_seq` 不能越过缺口。
-- **断连重放**：重连后 Sink 从 WAL 中最小未确认 seq 开始重放，Receiver 位图去重保证幂等。
-- **重启恢复**：WarpFusion 启动时先回放 Ingress WAL，再恢复实时接收；已 ACK 的 batch 必须可从 Ingress WAL 重建到 WindowStore。
-- **WAL 保留**：可配置（默认 30m，对应 `ingress_wal_retention`），超期清理不可恢复，`wal_dropped_batches` 监控。
-- **恢复边界**：当前仅保证 `ingress_wal_retention` 时间窗内可重放恢复；超过该窗口需依赖外部补数或后续 checkpoint 能力（V3+）。
-
-**Ingress WAL 与 WindowStore 关系：**
-1. 运行时写入顺序：`Ingress WAL append(+fsync) -> WindowStore apply -> ACK`。  
-2. 重启回放顺序：按 `source_id` 分组、`batch_seq` 升序执行 `Ingress WAL -> 去重器 -> WindowStore`。  
-3. 重复 batch 在回放阶段被去重器丢弃，不会重复写入 WindowStore。  
 
 ### 10.2 基线持久化（行为分析）
 - 目标：避免重启后 baseline 从零冷启动，减少误报尖峰。
-- 快照对象：`baseline(expr, dur[, method])` 的聚合状态（mean/ewma/median），并记录对应 `ack_seq` 锚点。
-- 恢复顺序：先加载快照，再从锚点回放后续 `Ingress WAL` 增量，避免重复计入。
+- 快照对象：`baseline(expr, dur[, method])` 的聚合状态（mean/ewma/median）。
+- 恢复顺序：启动时加载最新快照后，从实时输入继续更新；历史缺口需依赖外部补数。
 
 建议配置（`runtime.toml`）：
 
@@ -578,9 +624,9 @@ max_snapshots = 24
 restore = "latest"             # latest | clean
 ```
 
-### 10.3 告警幂等
+### 10.3 风险告警幂等
 - `alert_id = sha256(rule_name + scope_key + window_range)`。
-- AlertSink 本地去重缓存 + 下游透传。
+- AlertSink 本地去重缓存 + 下游透传（风险告警输出）。
 
 ### 10.4 事件时间
 - per-window：`watermark`、`allowed_lateness`、`late_policy`。
@@ -616,6 +662,7 @@ wf reload
 - `sum/avg` 仅数值；`distinct` 仅列投影。
 - `on event` 块必选且至少包含一条 step。
 - `on close` 块可选；若省略，等价于关闭阶段恒为 true。
+- `derive` 块可选；若存在，位于 `on event/on close` 之后。
 - step 必须显式 source（不允许空 source）。
 
 **双阶段求值语义：**
@@ -626,6 +673,15 @@ wf reload
 | M2 | `on close` 在窗口关闭时求值一次，得到关闭阶段命中状态 `close_ok`；若缺省则 `close_ok = true`。 |
 | M3 | 规则在该窗口上的最终命中条件为 `event_ok && close_ok`。 |
 | M4 | `on close` 只做条件判定，不引入新的 `join/yield` 动作；命中后仍按同一 stage 的 `join -> yield` 流程输出。 |
+
+**derive 求值规则：**
+
+| ID | 规则 |
+|----|------|
+| D1 | `derive` 在 `on event/on close` 判定后求值，先于 `score` 与 `yield`。 |
+| D2 | `derive` 在同一窗口内按声明顺序求值；每项仅计算一次并缓存。 |
+| D3 | `@name` 仅可引用同一 `derive` 块内已声明项；前向引用编译错误。 |
+| D4 | `derive` 禁止循环依赖；出现环时报编译错误。 |
 
 **match key 解析规则：**
 
@@ -646,6 +702,95 @@ wf reload
 | S3 | `on close` 在 session 关闭时求值；关闭时点为 S2 触发时刻。 |
 | S4 | session 无固定 duration；状态保留仍受 window `over` 与运行时上限约束。超限时强制切段并触发一次 `on close` 求值。 |
 
+**`close_reason` 语义：**
+
+| ID | 规则 |
+|----|------|
+| C1 | `close_reason` 为只读上下文字段，取值集合固定为：`timeout` / `flush` / `eos`。 |
+| C2 | `close_reason` 仅允许在 `on close` 与其后的 `derive`/`yield` 中引用；在 `on event` 中引用编译错误。 |
+| C3 | 关闭触发映射：定时器/窗口到期 -> `timeout`，显式 flush -> `flush`，输入流结束 -> `eos`。 |
+| C4 | `on close` 规则可显式按原因分流（如 `close_reason == "timeout"`），用于抑制 flush/eos 场景误报。 |
+
+**窗口关闭触发状态图（timeout / flush / eos）：**
+
+```text
+              +----------------------------+
+              | Window Active (event_ok ?) |
+              +-------------+--------------+
+                            |
+         close(timeout/flush/eos) arrives
+                            v
+              +----------------------------+
+              | Inject close_reason        |
+              | eval on close -> close_ok  |
+              +-------------+--------------+
+                            |
+              +-------------+--------------+
+              | event_ok && close_ok ?     |
+              +------+---------------------+
+                     |yes                  |no
+                     v                     v
+      +----------------------------+   +------------------+
+      | emit join -> yield         |   | no emit          |
+      | close_reason=timeout/..    |   | (window closes)  |
+      +----------------------------+   +------------------+
+```
+
+**关闭原因与输出判定（统一规则）：**
+
+| 关闭触发 | `close_reason` | 是否输出 |
+|----------|----------------|----------|
+| 窗口到期 / session gap 超时 | `timeout` | 仅当 `event_ok && close_ok` |
+| 显式 flush | `flush` | 仅当 `event_ok && close_ok` |
+| 输入流结束（EOS） | `eos` | 仅当 `event_ok && close_ok` |
+
+> 说明：`close_reason` 仅标记“为什么关闭”，不改变命中判定公式；命中公式始终是 `event_ok && close_ok`。
+
+**生产触发策略建议（flush / eos）：**
+
+| 场景 | 推荐触发 | 目的 | 规则侧建议 |
+|------|----------|------|------------|
+| 日常在线运行 | 仅 `timeout` | 维持稳定窗口生命周期 | 缺失检测优先按 `close_reason == "timeout"` 判定，避免维护期误报 |
+| 规则热加载 / 滚动发布 | 主动 `flush` | 在切换前收敛在途窗口并生成可审计关闭输出 | 对“必须完整窗口”的规则，可在 `on close` 中显式排除 `flush` |
+| 有界批次输入完成 | `eos` | 明确批次边界并触发最终关闭 | 批处理规则可允许 `eos` 触发输出；实时规则可对 `eos` 单独分流 |
+| 异常中断（崩溃/kill -9） | 无显式触发（恢复后进入新窗口周期） | 保证流程可继续，不承诺中断期间数据补回 | 不应依赖 `flush/eos` 才能产出关键检测结果 |
+
+**运维流程建议：**
+1. **滚动发布/重启：** `stop intake -> wait in-flight drain -> trigger flush -> wait flush outputs -> switch binary`。
+2. **热加载规则：** 新规则先编译通过并原子替换，再对旧代状态执行一次 `flush`，确保审计链路连续。
+3. **EOS 使用边界：** `eos` 仅用于“输入确实结束”的场景；对常驻流若频繁出现 `eos`，应视为上游稳定性异常并触发运维告警。
+
+**监控指标建议：**
+- `window_close_total{reason=timeout|flush|eos}`
+- `window_emit_total{reason=timeout|flush|eos}`
+- `window_emit_suppressed_total{reason=...}`（`event_ok && close_ok` 为 false）
+- `unexpected_eos_total`（常驻流应接近 0）
+
+**推荐配置（runtime.toml）：**
+
+```toml
+[runtime.close]
+# 审计字段映射（与语义规则 C3 保持一致）
+flush_emit_reason = "flush"
+eos_emit_reason = "eos"
+
+# 运维触发策略
+enable_flush_on_reload = true      # 热加载时自动触发一次 flush
+enable_flush_on_shutdown = true    # 优雅停机前触发 flush
+drain_timeout = "30s"              # 等待在途窗口收敛
+flush_wait_timeout = "10s"         # flush 后等待输出收敛
+eos_for_bounded_input_only = true  # 仅有界输入允许主动 eos
+
+[monitoring.thresholds]
+unexpected_eos_total_per_5m = 1            # >0 即建议触发运维告警
+flush_close_ratio_warn = 0.30              # 5m 内 flush close 占比运维告警阈值
+window_emit_suppressed_ratio_warn = 0.20   # 抑制率预警
+window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
+```
+
+- `flush_close_ratio` 计算口径：`close_total{reason=flush} / close_total{reason=timeout|flush|eos}`。
+- `window_emit_suppressed_ratio` 计算口径：`emit_suppressed_total / (emit_total + emit_suppressed_total)`。
+
 ### 12.3 Join
 - `on` 两侧字段必须可解析且类型**一致**（跨类型编译错误）。
 - join 右侧字段（来自 join window）**必须**以 `window_name.field` 限定名引用；左侧可使用上下文字段（如 `sip` 或 `fail.sip`）。
@@ -655,12 +800,14 @@ wf reload
 - 目标 window 必须存在，且满足：`stream` 为空（纯输出 window）并且 `over > 0`。
 - yield 命名参数 + 系统字段必须是目标 window fields 的**子集**（名称和类型匹配）。
 - yield 中不得出现 window 未定义的字段名；未覆盖的非系统字段值为 null。
-- 自动注入系统字段：`rule_name`(chars)、`emit_time`(time)。
-- 若声明 `entity(type, id_expr)`，自动注入 `entity_type`(chars)、`entity_id`(chars)。
-- 使用 `-> score(expr)` 时必须声明 `entity(type, id_expr)`。
-- 输出等级二选一：`-> severity_map` 注入 `severity`(chars)，`-> score(expr)` 注入 `score`(float)。
-- `severity` 与 `score` 在同一规则中互斥，并存时报编译错误。
-- `entity_type/entity_id` 为系统字段，禁止在 `yield` 命名参数中手工赋值。
+- 自动注入系统字段：`rule_name`(chars)、`emit_time`(time)、`score`(float)、`entity_type`(chars)、`entity_id`(chars)、`close_reason`(chars, nullable)。
+- 使用 `score { ... }` 时，额外注入 `score_contrib`(chars, JSON) 记录分项贡献明细。
+- `score_contrib` 传递契约：内部表示为 `map<string,float>`；写出时按 sink 协议序列化并透传下游（JSON sink 输出对象，行式 sink 输出 JSON 字符串）。
+- `score` 仅由 `match ... -> score_out` 产生（`score(expr)` 或 `score { ... }`）；`entity_type/entity_id` 仅由 `entity(type, id_expr)` 产生。
+- `close_reason` 仅在关闭触发输出时取值（`timeout`/`flush`/`eos`）；非关闭触发输出为 `null`。
+- `entity(type, id_expr)` 为必选声明。
+- `score` 范围固定为 `[0,100]`；超出范围按运行时策略处理（默认 `clamp`）。
+- `score`、`entity_type`、`entity_id`、`score_contrib` 为系统字段，禁止在 `yield` 命名参数中手工赋值。
 - `yield target(...)` 为默认写法（L1/L2）；`yield (...)` 隐式目标仅在 L3 允许。
 
 ### 12.5 Pipeline/Conv
@@ -704,23 +851,38 @@ wf reload
 | T13 | `window.has(...)` 的目标 window 必须满足：`over = 0` 或被标记为维度表（dimension） |
 | **── 行为分析扩展类型规则 ──** | |
 | T14 | `if c then a else b` — `c` 必须为 `bool`；`a` 与 `b` 类型必须一致；返回类型 = `a` 的类型 |
-| T15 | `time_diff(t1, t2)` — `t1`、`t2` 必须为 `time` 类型；返回 `float`（秒） |
-| T16 | `time_bucket(f, interval)` — `f` 必须为 `time` 类型；`interval` 为 DURATION 字面量；返回 `time` |
-| T17 | `contains(f, pat)` — `f` 必须为 `chars`/`ip`/`hex`；`pat` 须为 STRING 字面量；返回 `bool` |
-| T18 | `regex_match(f, pat)` — `f` 必须为 `chars`/`ip`/`hex`；`pat` 须为 STRING 字面量（编译期校验正则合法性）；返回 `bool` |
-| T19 | `len(f)` — `f` 必须为 `chars`/`ip`/`hex`；返回 `digit` |
-| T20 | `lower(f)` / `upper(f)` — `f` 必须为 `chars`；返回 `chars` |
-| T21 | `collect_set(a.f)` / `collect_list(a.f)` — 参数必须为 Column 投影；返回 `array/T`（T 为 f 的类型） |
-| T22 | `first(a.f)` / `last(a.f)` — 参数必须为 Column 投影；返回类型 = f 的类型 |
-| T23 | `stddev(a.f)` — f 必须为 `digit` 或 `float`；返回 `float` |
-| T24 | `percentile(a.f, p)` — f 必须为 `digit` 或 `float`；`p` 须为 digit 字面量且 0 ≤ p ≤ 100；返回 `float` |
-| T25 | `baseline(expr, dur, method)` — expr 须为 `digit`/`float`；method 须为 STRING 字面量（`"mean"`/`"ewma"`/`"median"`）；返回 `float` |
-| T26 | `-> score(expr)` — expr 须为 `digit` 或 `float`；yield 自动注入 `score: float` 系统字段 |
-| T27 | `severity_map` 与 `score(expr)` 在同一规则中互斥；并存时报编译错误 |
-| T28 | `entity(type, id_expr)` 中 `type` 必须为编译期常量（IDENT 或 STRING） |
-| T29 | `entity(type, id_expr)` 中 `id_expr` 必须为可标识标量（`chars`/`ip`/`hex`/`digit`）；执行期统一归一化为 `chars` |
-| T30 | 使用 `-> score(expr)` 的规则必须声明 `entity(type, id_expr)`；缺失时报编译错误 |
-| T31 | `yield` 命名参数中禁止出现 `entity_type` / `entity_id`（由系统注入） |
+| T15 | `hit(c)` — `c` 必须为 `bool`；返回 `float`（`true -> 1.0`，`false -> 0.0`） |
+| T16 | `time_diff(t1, t2)` — `t1`、`t2` 必须为 `time` 类型；返回 `float`（秒） |
+| T17 | `time_bucket(f, interval)` — `f` 必须为 `time` 类型；`interval` 为 DURATION 字面量；返回 `time` |
+| T18 | `contains(f, pat)` — `f` 必须为 `chars`/`ip`/`hex`；`pat` 须为 STRING 字面量；返回 `bool` |
+| T19 | `regex_match(f, pat)` — `f` 必须为 `chars`/`ip`/`hex`；`pat` 须为 STRING 字面量（编译期校验正则合法性）；返回 `bool` |
+| T20 | `len(f)` — `f` 必须为 `chars`/`ip`/`hex`；返回 `digit` |
+| T21 | `lower(f)` / `upper(f)` — `f` 必须为 `chars`；返回 `chars` |
+| T22 | `collect_set(a.f)` / `collect_list(a.f)` — 参数必须为 Column 投影；返回 `array/T`（T 为 f 的类型） |
+| T23 | `first(a.f)` / `last(a.f)` — 参数必须为 Column 投影；返回类型 = f 的类型 |
+| T24 | `stddev(a.f)` — f 必须为 `digit` 或 `float`；返回 `float` |
+| T25 | `percentile(a.f, p)` — f 必须为 `digit` 或 `float`；`p` 须为 digit 字面量且 0 ≤ p ≤ 100；返回 `float` |
+| T26 | `baseline(expr, dur, method)` — expr 须为 `digit`/`float`；method 须为 STRING 字面量（`"mean"`/`"ewma"`/`"median"`）；返回 `float` |
+| T27 | `match ... -> score(expr)` 中 `expr` 须为 `digit` 或 `float`；规则产出单一 `score: float` |
+| T28 | `match ... -> score { item = expr @ weight; ... }` 中每个 `expr` 必须为 `digit` 或 `float` |
+| T29 | `score` 分项 `weight` 必须是 NUMBER 字面量，且 `0 <= weight <= 100` |
+| T30 | `score` 分项名在同一 block 内必须唯一 |
+| T31 | 规则总分范围为 `[0,100]`；超出范围按 `on_overflow` 策略处理（默认 `clamp`） |
+| T32 | `entity(type, id_expr)` 中 `type` 必须为编译期常量（IDENT 或 STRING） |
+| T33 | `entity(type, id_expr)` 中 `id_expr` 必须为可标识标量（`chars`/`ip`/`hex`/`digit`）；执行期统一归一化为 `chars` |
+| T34 | 每条规则必须且仅能声明一个 `entity(type, id_expr)` |
+| T35 | 每个 `match` 必须且仅能产出一个 `score_out`（`score(expr)` 或 `score { ... }`） |
+| T36 | `yield` 命名参数中禁止出现 `score` / `entity_type` / `entity_id` / `score_contrib`（系统注入） |
+| T37 | `derive` 项名在同一 `match` 内必须唯一；与系统保留名冲突时报编译错误 |
+| T38 | `derive` 引用 `@name` 必须可解析到同一块内已声明项 |
+| T39 | `derive` 图必须无环；存在环路时报编译错误 |
+| T40 | `@name` 的类型等于其 `derive` 表达式类型；在 `score` 中使用时必须满足对应数值约束 |
+| T41 | `runtime.eval.mode` 仅允许 `strict` 或 `lenient`；默认 `strict` |
+| T42 | `strict` 模式下，`null` 参与比较/算术/逻辑或运行时异常会中止当前 `(rule,entity,window)` 求值，且不输出 `yield` |
+| T43 | `lenient` 模式下，`null`/异常按配置缺省值折算后继续求值，并记录运行时运维告警计数 |
+| T44 | `close_reason` 类型为 `chars`，仅允许与字符串字面量 `"timeout"`/`"flush"`/`"eos"` 比较 |
+| T45 | 在 `on event` 中引用 `close_reason` 编译错误 |
+| T46 | `yield` 中引用 `close_reason` 时类型为 `chars?`（nullable），需与目标字段类型一致 |
 
 **静态引用解析：**
 
@@ -732,6 +894,8 @@ wf reload
 | R4 | **join 字段引用**：join window 字段**必须**以 `window_name.field` 或 `window_name["field.with.dot"]` 限定名引用；裸字段名不搜索 join window |
 | R5 | **解析优先级**：events 别名 → match 步骤标签 → 聚合函数结果；未找到即编译错误，不做回退猜测 |
 | R6 | **OR 分支 nullable**：`\|\|` 各分支标签字段在后续可引用，但标注为 nullable；对 nullable 字段做 `sum`/`avg` 时编译器警告 |
+| R7 | **derive 引用解析**：`@name` 仅在当前 `match` 的 `derive` 作用域内解析，不回退到 events/join/步骤标签 |
+| R8 | **close_reason 解析**：`close_reason` 解析为关闭上下文字段，不参与 events/join/步骤标签同名搜索 |
 
 ### 12.7 实体主键与评分聚合
 
@@ -740,9 +904,265 @@ wf reload
 | E1 | 实体键通过 `entity(type, id_expr)` 显式声明；编译器生成系统字段 `entity_type/entity_id`。 |
 | E2 | `type` 建议使用稳定字面量（如 `user`/`host`/`ip`/`process`）；同一规则内不可变化。 |
 | E3 | `id_expr` 允许引用当前上下文字段或表达式结果；执行期若为空则该次输出丢弃并计入 `entity_id_null_dropped`。 |
-| E4 | 使用 `-> score(expr)` 的规则必须声明 `entity(...)`；不再允许自动推导实体键。 |
-| E5 | 跨规则评分累加键固定为 `(entity_type, entity_id, time_bucket)`；缺少任一维度不得参与累加。 |
-| E6 | `yield` 中禁止手工写 `entity_type/entity_id`，避免与系统注入冲突。 |
+| E4 | 跨规则评分累加键固定为 `(entity_type, entity_id, time_bucket)`；缺少任一维度不得参与累加。 |
+| E5 | `yield` 中禁止手工写 `score/entity_type/entity_id/score_contrib`，避免与系统注入冲突。 |
+
+### 12.8 风险等级映射层（可选）
+
+- WFL 规则层只产出 `score`，不声明等级字段。
+- 若需要等级展示，由运行时按统一映射策略从 `score` 派生 `risk_level`。
+- 映射策略需版本化（如 `risk_level_map_version`），便于审计与回放一致。
+- 等级映射默认基于 `[0,100]` 评分刻度。
+
+建议配置（`runtime.toml`）：
+
+```toml
+[risk]
+risk_level_map = "default_v1"
+
+[risk.score]
+min = 0
+max = 100
+on_overflow = "clamp"      # clamp | error
+emit_contrib = true         # 开启时输出 score_contrib(JSON)
+contrib_format = "auto"      # auto | object | json_string
+
+[risk.level_maps.default_v1]
+low_max = 30
+medium_max = 60
+high_max = 85
+# > high_max => critical
+```
+
+### 12.9 `score_contrib` 下游传递契约
+
+- 生成时机：`match -> score_out` 求值完成后生成 `score_contrib`，再进入 `entity -> yield`。
+- 透传字段：`rule_name`、`entity_type`、`entity_id`、`score`、`score_contrib` 一并写入输出 row。
+- Sink 编码：
+  - `contrib_format = "object"`：JSON 类 sink 以嵌套对象输出。
+  - `contrib_format = "json_string"`：行式 sink 以 JSON 字符串输出。
+  - `contrib_format = "auto"`：由 sink 类型自动选择（默认）。
+- 下游约束：下游不得重算总分，应以 `score` 为准，仅将 `score_contrib` 用于解释与审计。
+
+下游消费示例：
+
+```json
+{
+  "rule_name": "entity_risk_score",
+  "entity_type": "host",
+  "entity_id": "host:node-01",
+  "score": 75.0,
+  "score_contrib": {
+    "burst": 30.0,
+    "uniq_dests": 25.0,
+    "ps_hit": 20.0,
+    "exfil": 0.0,
+    "total": 75.0
+  }
+}
+```
+
+```json
+{
+  "rule_name": "entity_risk_score",
+  "entity_type": "host",
+  "entity_id": "host:node-01",
+  "score": 75.0,
+  "score_contrib": "{\"burst\":30.0,\"uniq_dests\":25.0,\"ps_hit\":20.0,\"exfil\":0.0,\"total\":75.0}"
+}
+```
+
+- 上例第一条对应 `contrib_format = "object"`；第二条对应 `contrib_format = "json_string"`。
+
+### 12.10 Null/异常语义矩阵（strict / lenient）
+
+- 目标：统一 `null` 与运行时异常行为，避免不同执行节点产生结果漂移。
+
+| 场景 | `strict` | `lenient` | 说明 |
+|------|----------|-----------|------|
+| 比较（`== != > >= < <=`）任一侧为 `null` | 运行时错误 `E_NULL_CMP`，中止当前求值 | 结果为 `false` | 避免隐式三值逻辑渗透到检测语义 |
+| 算术（`+ - * / %`）任一侧为 `null` | 运行时错误 `E_NULL_ARITH` | 使用 `lenient_numeric_default`（默认 `0.0`）替代 | 仅在 `lenient` 折算 |
+| 逻辑（`&& ||`）任一侧为 `null` | 运行时错误 `E_NULL_BOOL` | 使用 `lenient_bool_default`（默认 `false`）替代 | 保持 bool 决策稳定 |
+| `hit(cond)` 中 `cond = null` | 运行时错误 `E_NULL_HIT` | 返回 `0.0` | 命中不确定时默认不加分 |
+| 聚合 `sum/avg/min/max` 输入含 `null` | 跳过 `null`；若有效样本数为 0 则报 `E_EMPTY_AGG` | 跳过 `null`；若有效样本数为 0 返回 `lenient_numeric_default` | 与窗口稀疏数据兼容 |
+| 聚合 `count(set)` | 与 `null` 无关，按事件条数计数 | 同 `strict` | `count(set)` 不看列值 |
+| 聚合 `distinct(col)` | 跳过 `null` 值 | 同 `strict` | 统一高基数统计口径 |
+| 除零（`x / 0`） | 运行时错误 `E_DIV_ZERO` | 返回 `lenient_numeric_default` | 建议配合运维告警计数监控 |
+| `derive` 项求值异常 | 当前窗口求值失败，不输出 | 当前项按默认值折算，继续后续项 | 仍记录错误计数与规则名 |
+
+对照样例（同一输入在 strict / lenient 下的结果）：
+
+```wfl
+rule null_semantics_demo {
+  events {
+    e: endpoint_events
+  }
+  match<host_id:1h:tumble> {
+    on close {
+      e | count >= 1;
+    }
+    derive {
+      p95_out = percentile(e.bytes_out, 95);   // bytes_out 全为 null 时会触发空聚合
+      first_proc = first(e.process);           // 可能为 null
+    }
+  } -> score {
+    exfil = hit(@p95_out > 1000000) @ 70.0;
+    script = hit(@first_proc == "powershell") @ 30.0;
+  }
+  entity(host, e.host_id)
+  yield risk_scores (
+    host_id = e.host_id,
+    p95_bytes = @p95_out
+  )
+}
+```
+
+输入（同一窗口）：`host_id="node-01"`，`bytes_out=null`，`process=null`。
+
+| 模式 | 结果 |
+|------|------|
+| `strict` | `derive.p95_out` 触发 `E_EMPTY_AGG`，当前 `(rule,entity,window)` 求值中止，不输出 `yield`。 |
+| `lenient` + `coerce` | `p95_out = lenient_numeric_default(0.0)`，`first_proc` 比较结果为 `false`，总分 `score = 0.0`，可正常输出并附带 `score_contrib`。 |
+| `lenient` + `drop_rule` | 发生异常时行为与 strict 接近：当前窗口不输出，但仍记入 lenient 统计。 |
+
+回放样例（输入 -> 输出）：
+
+输入事件（同一窗口）：
+
+```json
+[
+  {
+    "host_id": "node-01",
+    "event_time": "2026-02-16T10:00:00Z",
+    "bytes_out": null,
+    "process": null
+  }
+]
+```
+
+`strict`（无输出，当前窗口被中止）：
+
+```json
+[]
+```
+
+`lenient + coerce`（继续输出）：
+
+```json
+[
+  {
+    "rule_name": "null_semantics_demo",
+    "entity_type": "host",
+    "entity_id": "node-01",
+    "score": 0.0,
+    "score_contrib": {
+      "exfil": 0.0,
+      "script": 0.0,
+      "total": 0.0
+    },
+    "host_id": "node-01",
+    "p95_bytes": 0.0
+  }
+]
+```
+
+`lenient + drop_rule`（无输出，但计数增加）：
+
+```json
+[]
+```
+
+建议配置（`runtime.toml`）：
+
+```toml
+[runtime.eval]
+mode = "strict"                 # strict | lenient
+lenient_numeric_default = 0.0    # lenient 生效
+lenient_bool_default = false     # lenient 生效
+lenient_string_default = ""      # lenient 生效
+lenient_on_error = "coerce"      # coerce | drop_rule
+
+[runtime.close]
+flush_emit_reason = "flush"      # 固定为 flush，供审计
+eos_emit_reason = "eos"          # 固定为 eos，供审计
+```
+
+- 监控建议：暴露 `eval_null_coerced_total`、`eval_runtime_error_total`、`eval_drop_rule_total` 三类指标。
+
+### 12.11 规则契约测试（given / expect）
+
+- 目标：把规则正确性前置到 CI，在发布前通过可回放、可断言的小样本契约测试拦截回归。
+- 运行入口：`wf test --contracts rules/security.wfl`；可用 `--contract <name>` 只跑单个契约。
+- 契约块只用于测试，不参与生产执行链。
+
+**契约语义规则：**
+
+| ID | 规则 |
+|----|------|
+| CT1 | `contract <name> for <rule_name>` 的目标规则必须存在且唯一。 |
+| CT2 | `given` 中 `row(alias, ...)` 的 `alias` 必须在目标规则 `events {}` 中声明。 |
+| CT3 | `row` 字段名允许 `IDENT` 或 `STRING`（用于 `detail.sha256` 等带点字段）。 |
+| CT4 | `row` 按声明顺序注入；缺失字段按 `null` 处理，类型转换与运行时一致。 |
+| CT5 | `tick(dur)` 推进测试时钟并触发窗口关闭；若未显式 `tick`，测试结束自动按 `options.close_trigger`（默认 `timeout`）收尾。 |
+| CT6 | `expect { hits ... }` 断言该契约产生的输出条数；`hit[i]` 要求 `0 <= i < hits`。 |
+| CT7 | `hit[i].field("x")` 读取第 `i` 条输出字段；字段不存在或类型不匹配即断言失败。 |
+| CT8 | `options.eval_mode` 仅允许 `strict|lenient`；`options.close_trigger` 仅允许 `timeout|flush|eos`。 |
+
+**CI 建议：**
+- Pull Request 必跑：`wf test --contracts <all-wfl-files>`。
+- 失败即阻断合并，并输出失败契约名、失败断言、输入重放片段。
+
+**`wf test` 失败输出契约（建议实现）：**
+
+- 退出码：全部通过返回 `0`；任一契约失败返回 `2`；解析/编译错误返回 `3`。
+- 输出层级：先给 `summary`，再列 `failures[]`；每个失败项都可独立重放。
+
+推荐 JSON（`--format json`）结构：
+
+```json
+{
+  "summary": {
+    "total": 12,
+    "passed": 11,
+    "failed": 1,
+    "duration_ms": 842
+  },
+  "failures": [
+    {
+      "contract": "dns_no_response_timeout",
+      "rule": "dns_no_response",
+      "code": "E_ASSERT_EQ",
+      "message": "hit[0].close_reason expected timeout but got flush",
+      "assertion": "hit[0].close_reason == \"timeout\"",
+      "actual": "flush",
+      "replay": {
+        "rows": 1,
+        "ticks": ["31s"],
+        "close_trigger": "flush"
+      },
+      "loc": {
+        "file": "rules/dns.wfl",
+        "line": 1333
+      }
+    }
+  ]
+}
+```
+
+建议错误码：
+- `E_PARSE_CONTRACT`：契约语法错误。
+- `E_RULE_NOT_FOUND`：`for <rule>` 目标不存在。
+- `E_GIVEN_ALIAS`：`row(alias, ...)` 的 alias 未在规则 `events` 中声明。
+- `E_ASSERT_EQ`：等值断言失败。
+- `E_ASSERT_BOUNDS`：`hit[i]` 越界。
+- `E_FIELD_MISSING`：`hit[i].field("x")` 字段不存在。
+
+终端摘要（默认文本）建议：
+- `FAILED contracts=1/12 file=rules/dns.wfl`
+- `- dns_no_response_timeout: E_ASSERT_EQ at rules/dns.wfl:1333`
+- `  assertion: hit[0].close_reason == "timeout"`
+- `  actual: flush`
+- `  replay: wf test --contracts rules/dns.wfl --contract dns_no_response_timeout --dump-replay`
 
 ---
 
@@ -760,7 +1180,8 @@ rule brute_force {
     on event {
       fail | count >= 3;
     }
-  } -> high
+  } -> score(70.0)
+  entity(ip, fail.sip)
   yield security_alerts (
     sip = fail.sip,
     fail_count = count(fail),
@@ -783,8 +1204,9 @@ rule brute_then_scan {
       fail | count >= 3;
       scan.dport | distinct | count > 10;
     }
-  } -> { count(fail) > 10 => critical, _ => high }
+  } -> score(if count(fail) > 10 then 90.0 else 70.0)
   join ip_blocklist on sip == ip_blocklist.ip
+  entity(ip, fail.sip)
   yield security_alerts (
     sip = fail.sip,
     threat = ip_blocklist.threat_level,
@@ -807,9 +1229,10 @@ rule dns_no_response {
       req | count >= 1;
     }
     on close {
-      resp | count == 0;
+      resp && close_reason == "timeout" | count == 0;
     }
-  } -> medium
+  } -> score(50.0)
+  entity(ip, req.sip)
   yield security_alerts (
     sip = req.sip,
     domain = req.domain,
@@ -835,7 +1258,8 @@ rule port_scan_detect {
     on close {
       _in | count >= 10;
     }
-  } -> high
+  } -> score(80.0)
+  entity(ip, _in.sip)
   yield security_alerts (
     sip = _in.sip,
     port_count = count(_in),
@@ -859,11 +1283,12 @@ rule abnormal_session {
     on close {
       op | count >= 1;
     }
-  } -> {
-    distinct(op.resource) > 50 => critical,
-    time_diff(last(op.event_time), first(op.event_time)) > 1800 => high,
-    _ => medium
-  }
+  } -> score(
+    if distinct(op.resource) > 50 then 95.0
+    else if time_diff(last(op.event_time), first(op.event_time)) > 1800 then 75.0
+    else 55.0
+  )
+  entity(user, op.uid)
   yield behavior_alerts (
     uid = op.uid,
     resource_count = distinct(op.resource),
@@ -893,18 +1318,25 @@ rule entity_risk_score {
     on close {
       e | count >= 1;
     }
-  } -> score(
-    if count(e) > baseline(count(e), 7d) * 2.0 then 30.0 else 0.0
-    + if distinct(e.dest_ip) > 100 then 25.0 else 0.0
-    + if count(ps) > 0 then 20.0 else 0.0
-    + if percentile(e.bytes_out, 95) > baseline(avg(e.bytes_out), 7d) * 3.0 then 25.0 else 0.0
-  )
+    derive {
+      burst = count(e) / baseline(count(e), 7d);
+      uniq_dests = distinct(e.dest_ip);
+      p95_out = percentile(e.bytes_out, 95);
+      ps_hit = hit(count(ps) > 0);
+      exfil = hit(@p95_out > baseline(avg(e.bytes_out), 7d) * 3.0);
+    }
+  } -> score {
+    burst = hit(@burst > 2.0) @ 30.0;
+    uniq_dests = hit(@uniq_dests > 100) @ 25.0;
+    ps_hit = @ps_hit @ 20.0;
+    exfil = @exfil @ 25.0;
+  }
   entity(host, e.host_id)
   yield risk_scores (
     host_id = e.host_id,
     event_count = count(e),
-    unique_dests = distinct(e.dest_ip),
-    p95_bytes = percentile(e.bytes_out, 95),
+    unique_dests = @uniq_dests,
+    p95_bytes = @p95_out,
     processes = collect_set(e.process),
     message = fmt("{} risk score computed over 1h window", e.host_id)
   )
@@ -923,10 +1355,12 @@ rule login_anomaly {
     on close {
       login | count >= 1;
     }
-  } -> {
-    count(login) > baseline(count(login), 30d, "ewma") * 3.0 => high,
-    _ => low
+  } -> score {
+    surge = hit(count(login) > baseline(count(login), 30d, "ewma") * 3.0) @ 50.0;
+    volume = hit(count(login) > 20) @ 30.0;
+    geo_spread = hit(distinct(login.geo_city) > 3) @ 20.0;
   }
+  entity(user, login.uid)
   yield behavior_alerts (
     uid = login.uid,
     login_count = count(login),
@@ -935,6 +1369,33 @@ rule login_anomaly {
     login_category = if count(login) > 20 then "heavy" else if count(login) > 5 then "normal" else "light",
     message = fmt("{} login count {} vs baseline {}", login.uid, count(login), baseline(count(login), 30d, "ewma"))
   )
+}
+```
+
+### 13.8 规则契约测试（CI 前置）
+```wfl
+contract dns_no_response_timeout for dns_no_response {
+  given {
+    row(req,
+      query_id = "q-1",
+      sip = "10.0.0.8",
+      domain = "evil.test",
+      event_time = "2026-02-17T10:00:00Z"
+    );
+    tick(31s);
+  }
+  expect {
+    hits == 1;
+    hit[0].score == 50.0;
+    hit[0].close_reason == "timeout";
+    hit[0].entity_type == "ip";
+    hit[0].entity_id == "10.0.0.8";
+    hit[0].field("domain") == "evil.test";
+  }
+  options {
+    close_trigger = timeout;
+    eval_mode = strict;
+  }
 }
 ```
 
@@ -963,9 +1424,10 @@ rule login_anomaly {
 
 ### Phase A（先稳）
 - Core IR + L1 + 可读语法 + lint/fmt。
+- `wf test` 契约测试（given/expect）+ CI 阻断策略。
 
 ### Phase B（增强）
-- L2（join/severity/baseline/entity）+ explain/replay。
+- L2（join/baseline/window.has）+ explain/replay。
 - L2 行为分析基础：`if/then/else`、字符串函数、时间函数。
 
 ### Phase C（高级）
@@ -974,7 +1436,7 @@ rule login_anomaly {
 ### Phase D（行为分析）
 - L3 行为分析：session window、集合函数（`collect_set`/`collect_list`/`first`/`last`）、统计函数（`stddev`/`percentile`）。
 - 增强 baseline（`ewma`/`median` + 持久化快照）。
-- 数值风险评分（`-> score(expr)`）+ `entity(type,id_expr)` + 跨规则评分累加。
+- 单通道风险评分（`-> score(expr)` / `-> score { ... }`）+ `entity(type,id_expr)` + 跨规则评分累加。
 
 ---
 
@@ -985,3 +1447,120 @@ rule login_anomaly {
 3. 编译器可解释性优先于语法炫技。
 4. 先稳定 L1/L2 再扩 L3。
 5. 文法、示例、执行器必须同步演进。
+
+
+---
+
+## 17. 下一阶段设计提案（P0/P1）
+
+> 目标：在不破坏“简洁主链（BIND -> SCOPE -> JOIN -> ENTITY -> YIELD）”的前提下，提升表达力、可控性与可验证性。
+
+### 17.1 P0-1 显式 key 映射语法（消除多源 key 歧义）
+
+- 问题：`match<k1,k2:dur>` 在多源异名字段下需要上游对齐，规则层表达不够直接。
+- 建议：引入 `key { logical = alias.field }`，把“逻辑键名”与“源字段”分离。
+
+```wfl
+match<:5m> {
+  key {
+    src = fail.sip;
+    dst = scan.src_ip;
+  }
+  on event {
+    fail | count >= 3;
+    scan | count >= 10;
+  }
+} -> score(80)
+```
+
+- 约束：`key` 中逻辑键名唯一；映射字段类型必须一致；缺失键按编译错误处理。
+
+### 17.2 P0-2 Join 时间语义一等化（snapshot / asof）
+
+- 问题：仅有 `join ... on ...` 时，回放与在线对“维表取值时点”的理解可能不一致。
+- 建议：显式声明 join 模式，禁止隐式推断。
+
+```wfl
+join ip_blocklist snapshot on sip == ip_blocklist.ip
+join asset_profile asof on uid == asset_profile.uid within 24h
+```
+
+- 语义：
+  - `snapshot`：使用当前可见最新维表。
+  - `asof`：按事件时间回看最近版本（不晚于事件时间，且在 `within` 约束内）。
+
+### 17.3 P0-3 规则资源预算内建（limits）
+
+- 问题：规则可写性强，但缺少规则级资源上限，容易出现高基数状态膨胀。
+- 建议：新增 `limits` 块，提供统一防护。
+
+```wfl
+limits {
+  max_state = "512MB";
+  max_cardinality = 200000;
+  max_emit_rate = "1000/m";
+  on_exceed = "throttle";   // throttle | drop_oldest | fail_rule
+}
+```
+
+- 验收：触发上限时必须有稳定行为和指标（如 `rule_limit_exceeded_total`）。
+
+### 17.4 P0-4 输出契约版本化（yield contract）
+
+- 问题：下游消费字段演进时，缺少强约束版本标签。
+- 建议：为输出声明契约版本，支持灰度与审计回放。
+
+```wfl
+yield risk_scores@v2 (
+  host_id = e.host_id,
+  score_detail = score_contrib
+)
+```
+
+- 约束：同名 output window 的契约版本需可并存；跨版本字段变更需在编译期校验。
+
+### 17.5 P1-1 可组合规则片段（pattern/template）
+
+- 目标：复用常见安全模式，减少复制粘贴造成的语义漂移。
+- 建议：支持参数化片段，在编译期展开到标准 RulePlan。
+
+```wfl
+pattern burst(alias, key, win, threshold) {
+  match<${key}:${win}> {
+    on event { ${alias} | count >= ${threshold}; }
+  }
+}
+```
+
+- 约束：片段不可引入隐式副作用；展开后必须可 `wf explain` 完整还原。
+
+### 17.6 P1-2 顺序/乱序不变性契约测试
+
+- 目标：保证时间语义稳定，避免“同数据不同到达顺序”导致结果漂移。
+- 建议：扩展 `contract` 的 `options/expect`，增加重排测试模式。
+
+```wfl
+contract dns_order_invariance for dns_no_response {
+  given {
+    row(req, query_id="q-1", sip="10.0.0.8", domain="evil.test", event_time="2026-02-17T10:00:00Z");
+    row(resp, query_id="q-1", sip="10.0.0.8", event_time="2026-02-17T10:00:01Z");
+    tick(31s);
+  }
+  options {
+    permutation = "shuffle";  // future: none | shuffle
+    runs = 20;
+  }
+  expect {
+    stable_hits == true;
+    stable_score == true;
+  }
+}
+```
+
+- 验收：`wf test` 输出必须包含“重排轮次/失败样本/最小重放输入”。
+
+### 17.7 建议落地顺序
+
+1. **先做 P0-2 + P0-3**：先把语义一致性与资源安全兜住。
+2. **再做 P0-1 + P0-4**：增强可表达性与下游契约治理。
+3. **最后做 P1-1 + P1-2**：提升复用能力与回归防线。

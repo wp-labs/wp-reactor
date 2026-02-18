@@ -66,7 +66,7 @@ fn close_missing_detection() {
 
     let out = &expired[0];
     assert_eq!(out.rule_name, "rule13");
-    assert_eq!(out.scope_key, vec!["10.0.0.1"]);
+    assert_eq!(out.scope_key, vec![str_val("10.0.0.1")]);
     assert_eq!(out.close_reason, CloseReason::Timeout);
     assert!(out.event_ok);
     assert!(out.close_ok);
@@ -131,7 +131,7 @@ fn on_close_trigger_eval() {
     assert_eq!(sm.advance_with_instant("resp", &resp, now), StepResult::Accumulate);
 
     // Close explicitly
-    let out = sm.close(&["10.0.0.1".to_string()], CloseReason::Flush).unwrap();
+    let out = sm.close(&[str_val("10.0.0.1")], CloseReason::Flush).unwrap();
     assert!(out.event_ok);
     assert!(out.close_ok);
     assert_eq!(out.close_step_data[0].measure_value, 2.0);
@@ -167,7 +167,7 @@ fn close_on_incomplete_instance() {
     assert_eq!(sm.instance_count(), 1);
 
     // Close — event_ok=false, close_ok=true (resp count == 0 is true)
-    let out = sm.close(&["10.0.0.1".to_string()], CloseReason::Eos).unwrap();
+    let out = sm.close(&[str_val("10.0.0.1")], CloseReason::Eos).unwrap();
     assert!(!out.event_ok);
     assert!(out.close_ok);
     assert_eq!(out.close_reason, CloseReason::Eos);
@@ -211,7 +211,7 @@ fn close_step_accumulation() {
     sm.advance_with_instant("traffic", &mk(700.0), now);
 
     // Close: sum = 1100 >= 1000 → close_ok
-    let out = sm.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out = sm.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(out.event_ok);
     assert!(out.close_ok);
     assert!((out.close_step_data[0].measure_value - 1100.0).abs() < f64::EPSILON);
@@ -244,13 +244,13 @@ fn close_reason_guard_filters() {
     let now = Instant::now();
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
     sm1.advance_with_instant("req", &req, now);
-    let out1 = sm1.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out1 = sm1.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(out1.close_ok);
 
     // Scenario 2: close with Flush → guard fails → close_ok=false
     let mut sm2 = CepStateMachine::new("rule18b".to_string(), plan);
     sm2.advance_with_instant("req", &req, now);
-    let out2 = sm2.close(&["10.0.0.1".to_string()], CloseReason::Flush).unwrap();
+    let out2 = sm2.close(&[str_val("10.0.0.1")], CloseReason::Flush).unwrap();
     assert!(!out2.close_ok);
 }
 
@@ -277,14 +277,14 @@ fn scan_expired_only_removes_expired() {
     let scan_time = now + Duration::from_secs(61);
     let expired = sm.scan_expired(scan_time);
     assert_eq!(expired.len(), 1);
-    assert_eq!(expired[0].scope_key, vec!["10.0.0.1"]);
+    assert_eq!(expired[0].scope_key, vec![str_val("10.0.0.1")]);
     assert_eq!(sm.instance_count(), 1);
 
     // At now+101: second instance now expired too (created at now+40, 61s ago)
     let scan_time2 = now + Duration::from_secs(101);
     let expired2 = sm.scan_expired(scan_time2);
     assert_eq!(expired2.len(), 1);
-    assert_eq!(expired2[0].scope_key, vec!["10.0.0.2"]);
+    assert_eq!(expired2[0].scope_key, vec![str_val("10.0.0.2")]);
     assert_eq!(sm.instance_count(), 0);
 }
 
@@ -304,12 +304,12 @@ fn close_removes_instance() {
     assert_eq!(sm.instance_count(), 1);
 
     // Close removes the instance
-    let out = sm.close(&["10.0.0.1".to_string()], CloseReason::Flush);
+    let out = sm.close(&[str_val("10.0.0.1")], CloseReason::Flush);
     assert!(out.is_some());
     assert_eq!(sm.instance_count(), 0);
 
     // Closing again → None
-    let out2 = sm.close(&["10.0.0.1".to_string()], CloseReason::Flush);
+    let out2 = sm.close(&[str_val("10.0.0.1")], CloseReason::Flush);
     assert!(out2.is_none());
 }
 
@@ -347,14 +347,14 @@ fn multiple_close_steps_all_must_pass() {
     let mut sm_a = CepStateMachine::new("rule21a".to_string(), plan.clone());
     sm_a.advance_with_instant("req", &req, now);
     sm_a.advance_with_instant("resp", &resp, now);
-    let out_a = sm_a.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out_a = sm_a.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(out_a.event_ok);
     assert!(out_a.close_ok);
 
     // Scenario B: no resp → close step 1 fails (count 0 < 1)
     let mut sm_b = CepStateMachine::new("rule21b".to_string(), plan.clone());
     sm_b.advance_with_instant("req", &req, now);
-    let out_b = sm_b.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out_b = sm_b.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(out_b.event_ok);
     assert!(!out_b.close_ok);
 
@@ -364,7 +364,7 @@ fn multiple_close_steps_all_must_pass() {
     sm_c.advance_with_instant("resp", &resp, now);
     let err = event(vec![("sip", str_val("10.0.0.1"))]);
     sm_c.advance_with_instant("error", &err, now);
-    let out_c = sm_c.close(&["10.0.0.1".to_string()], CloseReason::Timeout).unwrap();
+    let out_c = sm_c.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
     assert!(out_c.event_ok);
     assert!(!out_c.close_ok);
 }

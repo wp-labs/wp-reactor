@@ -31,10 +31,11 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
     // Check match keys
     check_match_keys(rule, &scope, name, errors);
 
-    // Check match steps
-    check_match_steps(&rule.match_clause.on_event, &scope, name, errors);
+    // Check match steps (shared labels_seen across on_event and on_close)
+    let mut labels_seen = HashSet::new();
+    check_match_steps(&rule.match_clause.on_event, &scope, name, errors, &mut labels_seen);
     if let Some(ref close_steps) = rule.match_clause.on_close {
-        check_match_steps(close_steps, &scope, name, errors);
+        check_match_steps(close_steps, &scope, name, errors, &mut labels_seen);
     }
 
     // Check score expression (T27)
@@ -205,14 +206,13 @@ fn check_key_type_consistency(
 // Match steps validation
 // ---------------------------------------------------------------------------
 
-fn check_match_steps(
-    steps: &[MatchStep],
+fn check_match_steps<'a>(
+    steps: &'a [MatchStep],
     scope: &Scope<'_>,
     rule_name: &str,
     errors: &mut Vec<CheckError>,
+    labels_seen: &mut HashSet<&'a str>,
 ) {
-    let mut labels_seen = HashSet::new();
-
     for step in steps {
         for branch in &step.branches {
             // R5: source must be a declared alias

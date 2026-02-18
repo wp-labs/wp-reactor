@@ -44,7 +44,7 @@ pub enum StepResult {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchedContext {
     pub rule_name: String,
-    pub scope_key: Vec<String>,
+    pub scope_key: Vec<Value>,
     pub step_data: Vec<StepData>,
 }
 
@@ -82,7 +82,7 @@ impl CloseReason {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CloseOutput {
     pub rule_name: String,
-    pub scope_key: Vec<String>,
+    pub scope_key: Vec<Value>,
     pub close_reason: CloseReason,
     pub event_ok: bool,
     pub close_ok: bool,
@@ -138,7 +138,7 @@ impl StepState {
 
 #[derive(Debug, Clone)]
 struct Instance {
-    scope_key: Vec<String>,
+    scope_key: Vec<Value>,
     created_at: Instant,
     current_step: usize,
     event_ok: bool,
@@ -148,7 +148,7 @@ struct Instance {
 }
 
 impl Instance {
-    fn new(plan: &MatchPlan, scope_key: Vec<String>, now: Instant) -> Self {
+    fn new(plan: &MatchPlan, scope_key: Vec<Value>, now: Instant) -> Self {
         let step_states = plan
             .event_steps
             .iter()
@@ -311,7 +311,7 @@ impl CepStateMachine {
     ///
     /// Removes the instance from the map and returns the [`CloseOutput`].
     /// Returns `None` if no instance exists for the given scope key.
-    pub fn close(&mut self, scope_key: &[String], reason: CloseReason) -> Option<CloseOutput> {
+    pub fn close(&mut self, scope_key: &[Value], reason: CloseReason) -> Option<CloseOutput> {
         let instance_key = make_instance_key(scope_key);
         let instance = self.instances.remove(&instance_key)?;
         Some(evaluate_close(
@@ -359,12 +359,12 @@ impl CepStateMachine {
 ///
 /// Returns `None` if any key field is missing from the event.
 /// Returns `Some(vec![])` if the key list is empty (shared instance).
-fn extract_key(event: &Event, keys: &[FieldRef]) -> Option<Vec<String>> {
+fn extract_key(event: &Event, keys: &[FieldRef]) -> Option<Vec<Value>> {
     let mut result = Vec::with_capacity(keys.len());
     for key in keys {
         let field_name = field_ref_name(key);
         let val = event.fields.get(field_name)?;
-        result.push(value_to_string(val));
+        result.push(val.clone());
     }
     Some(result)
 }
@@ -377,8 +377,8 @@ pub(crate) fn field_ref_name(fr: &FieldRef) -> &str {
     }
 }
 
-fn make_instance_key(scope_key: &[String]) -> String {
-    scope_key.join("\x1f") // unit separator
+fn make_instance_key(scope_key: &[Value]) -> String {
+    scope_key.iter().map(value_to_string).collect::<Vec<_>>().join("\x1f")
 }
 
 pub(crate) fn value_to_string(v: &Value) -> String {
