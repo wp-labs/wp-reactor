@@ -9,17 +9,17 @@ use crate::ast::*;
 
 #[test]
 fn parse_use_decl() {
-    let file = parse_wfl(r#"use "security.ws""#).unwrap();
+    let file = parse_wfl(r#"use "security.wfs""#).unwrap();
     assert_eq!(file.uses.len(), 1);
-    assert_eq!(file.uses[0].path, "security.ws");
+    assert_eq!(file.uses[0].path, "security.wfs");
 }
 
 #[test]
 fn parse_multiple_uses() {
     let file = parse_wfl(
         r#"
-use "security.ws"
-use "dns.ws"
+use "security.wfs"
+use "dns.wfs"
 "#,
     )
     .unwrap();
@@ -33,7 +33,7 @@ use "dns.ws"
 #[test]
 fn parse_minimal_rule() {
     let input = r#"
-use "security.ws"
+use "security.wfs"
 
 rule brute_force {
     events {
@@ -584,7 +584,7 @@ rule r {
 #[test]
 fn parse_brute_force_then_scan() {
     let input = r#"
-use "security.ws"
+use "security.wfs"
 
 rule brute_force_then_scan {
     meta {
@@ -636,7 +636,7 @@ rule brute_force_then_scan {
 #[test]
 fn parse_dns_no_response() {
     let input = r#"
-use "dns.ws"
+use "dns.wfs"
 
 rule dns_no_response {
     events {
@@ -675,7 +675,7 @@ rule dns_no_response {
 #[test]
 fn parse_multiple_rules() {
     let input = r#"
-use "sec.ws"
+use "sec.wfs"
 
 rule r1 {
     events { e : win }
@@ -1063,7 +1063,7 @@ contract ct2 for r2 {
 #[test]
 fn parse_rules_and_contracts() {
     let input = r#"
-use "security.ws"
+use "security.wfs"
 
 rule brute_force {
     events { fail : auth_events && action == "failed" }

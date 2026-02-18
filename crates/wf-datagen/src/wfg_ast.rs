@@ -4,15 +4,15 @@ use std::time::Duration;
 // Top-level
 // ---------------------------------------------------------------------------
 
-/// A complete `.wsc` scenario file.
+/// A complete `.wfg` scenario file.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
-pub struct WscFile {
+pub struct WfgFile {
     pub uses: Vec<UseDecl>,
     pub scenario: ScenarioDecl,
 }
 
-/// `use "path.ws"` or `use "path.wfl"`
+/// `use "path.wfs"` or `use "path.wfl"`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct UseDecl {

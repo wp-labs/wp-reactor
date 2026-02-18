@@ -50,14 +50,14 @@ WarpFusion 的核心抽象是 **Window**——它不是被动的缓冲区，而�
 
 每个 Window 的定义分布在三个文件中：
 
-1. **Window Schema (.ws)**：逻辑属性——订阅哪个 stream、时间字段、保持时长（over）、字段 schema
+1. **Window Schema (.wfs)**：逻辑属性——订阅哪个 stream、时间字段、保持时长（over）、字段 schema
 2. **TOML Config (.toml)**：物理属性——分布模式（mode）、内存上限、over 能力上限（over_cap）
 3. **WFL Rule (.wfl)**：使用方——通过 window 名称引用数据，定义检测逻辑
 
 ```
-三文件架构：.ws (数据定义) → .wfl (检测逻辑) → .toml (物理参数)
+三文件架构：.wfs (数据定义) → .wfl (检测逻辑) → .toml (物理参数)
 
-Window Schema (.ws)  定义 stream 来源、字段 schema、over 时长
+Window Schema (.wfs)  定义 stream 来源、字段 schema、over 时长
 WFL Rule (.wfl)      引用 window 名称，定义 events/match/join/yield
 TOML Config (.toml)  定义 mode(local/replicated/partitioned)、max_bytes、over_cap
 ```
@@ -157,7 +157,7 @@ WarpFusion 面向安全检测场景，窗口化统计（阈值、计数、聚合
 ### 2.5 核心处理流程
 
 ```
-1. 启动：加载 .ws 文件注册 Window Schema，加载 .toml 绑定物理参数，加载 .wfl 编译规则
+1. 启动：加载 .wfs 文件注册 Window Schema，加载 .toml 绑定物理参数，加载 .wfl 编译规则
 2. Receiver 从 Socket 接收 Arrow IPC 消息，解析 stream tag
 3. Router 查询 WindowRegistry，找到订阅该 stream 的所有 Window
 4. 按各 Window 的分布模式路由数据（单机直接本地分发）
@@ -290,7 +290,7 @@ warp-fusion/
 ├── config/                         # 配置示例
 │   ├── fusion.toml                 # 主配置文件（运行时物理参数）
 │   ├── schemas/
-│   │   └── security.ws             # Window Schema 文件
+│   │   └── security.wfs             # Window Schema 文件
 │   └── rules/
 │       ├── brute_scan.wfl          # 安全关联规则（WFL）
 │       └── traffic.wfl             # 流量分析规则（WFL）
@@ -308,7 +308,7 @@ warp-fusion/
 Window 是 WarpFusion 的核心抽象，兼具数据订阅声明和时间窗口缓冲两个职责。
 
 ```rust
-/// Window 逻辑定义（来自 .ws 文件）
+/// Window 逻辑定义（来自 .wfs 文件）
 pub struct WindowSchema {
     pub name: String,                     // Window 名称
     pub streams: Vec<String>,             // 订阅的 stream tag（支持多个）
@@ -349,7 +349,7 @@ pub enum DistMode {
 
 /// Window 运行时实例：持有实际数据
 pub struct Window {
-    ws: WindowSchema,                     // 逻辑定义（from .ws）
+    ws: WindowSchema,                     // 逻辑定义（from .wfs）
     rt: WindowRtConfig,                   // 运行时配置（from .toml）
     schema: SchemaRef,                    // Arrow Schema（从 ws.fields 映射）
     batches: VecDeque<TimedBatch>,        // 带时间戳的批数据队列
@@ -545,7 +545,7 @@ impl RuleExecutor {
 **关键设计决策：**
 
 - WFL 规则由 `wf-lang` 编译器统一编译为 `RulePlan`（CEP 状态机），RuleExecutor 以事件驱动方式执行
-- Rule 引用 Window 名称（定义在 .ws 中），而非 Stream 名称——同一个 Stream 可被不同 Window 以不同方式订阅
+- Rule 引用 Window 名称（定义在 .wfs 中），而非 Stream 名称——同一个 Stream 可被不同 Window 以不同方式订阅
 - 每次 join SQL 执行创建新的 `SessionContext`，避免状态污染
 - 窗口快照是只读的（`snapshot()` 返回 `Vec<RecordBatch>` 的 clone/Arc），不阻塞写入
 - 多条规则可并行执行（各自独立的 SessionContext）
@@ -730,7 +730,7 @@ TaskGroup: maintenance
 
 ### 6.1 主配置 fusion.toml
 
-三文件架构下，TOML 仅负责**运行时物理参数**。数据 schema 在 `.ws` 文件中定义，检测逻辑在 `.wfl` 文件中定义。
+三文件架构下，TOML 仅负责**运行时物理参数**。数据 schema 在 `.wfs` 文件中定义，检测逻辑在 `.wfl` 文件中定义。
 
 ```toml
 [server]
@@ -741,7 +741,7 @@ executor_parallelism = 2                       # 规则执行并行度（Semapho
 rule_exec_timeout = "30s"                      # 单条规则执行超时
 
 # 文件引用
-window_schemas = ["security.ws"]               # Window Schema 文件列表
+window_schemas = ["security.wfs"]               # Window Schema 文件列表
 wfl_rules      = ["brute_scan.wfl", "traffic.wfl"]  # WFL 规则文件列表
 
 [window_defaults]
@@ -757,7 +757,7 @@ late_policy = "drop"                           # drop | revise | side_output
 [window.auth_events]
 mode = "local"                                 # 分布模式: local | replicated | partitioned
 max_window_bytes = "256MB"
-over_cap = "30m"                               # over 能力上限（.ws 中 over ≤ over_cap）
+over_cap = "30m"                               # over 能力上限（.wfs 中 over ≤ over_cap）
 
 [window.fw_events]
 mode = "local"
@@ -783,22 +783,22 @@ sinks = [
 
 | 层级 | 文件 | 内容 | 示例 |
 |------|------|------|------|
-| 数据定义 | `.ws` | stream 来源、time 字段、over 时长、字段 schema | `over = 5m` |
+| 数据定义 | `.wfs` | stream 来源、time 字段、over 时长、字段 schema | `over = 5m` |
 | 检测逻辑 | `.wfl` | 事件绑定、模式匹配、条件、输出 | `count(src) >= 3` |
 | 物理约束 | `.toml` | mode、max_bytes、over_cap、watermark | `over_cap = "30m"` |
 
-**over vs over_cap 校验：** 启动时检查每个 window 的 `.ws` 中 `over` ≤ `.toml` 中 `over_cap`，不满足则报错拒绝启动。
+**over vs over_cap 校验：** 启动时检查每个 window 的 `.wfs` 中 `over` ≤ `.toml` 中 `over_cap`，不满足则报错拒绝启动。
 
 ### 6.2 关联规则
 
 关联检测规则使用 WFL 语言编写，存储在 `.wfl` 文件中。完整语法和语义模型见 [WFL v2 设计方案](wfl-desion.md)，与主流 DSL 的对比分析见 [WFL DSL 对比](11-wfl-dsl-comparison.md)。
 
-WFL 规则中的数据源名称引用 **Window Schema (.ws) 中定义的 window 名称**，不直接引用 stream tag。这使得同一个 stream 可以以不同方式（不同 mode、不同 over）被多个 window 引用，规则按需选择合适的 window。
+WFL 规则中的数据源名称引用 **Window Schema (.wfs) 中定义的 window 名称**，不直接引用 stream tag。这使得同一个 stream 可以以不同方式（不同 mode、不同 over）被多个 window 引用，规则按需选择合适的 window。
 
 **规则文件示例（brute_scan.wfl）：**
 
 ```wfl
-use "security.ws"
+use "security.wfs"
 
 rule brute_force_then_scan {
     meta {
@@ -981,7 +981,7 @@ retry_max_interval = "30s"                        # 最大重试间隔
 |------|--------|---------|
 | **I 数据基建** | M01–M05 | wp-motor 能通过 Arrow IPC best-effort 传输数据（无 ACK/WAL） |
 | **II 配置与窗口** | M06–M10 | 配置可加载、Window 能接收路由并缓存数据 |
-| **III WFL 编译器** | M11–M13 | .ws + .wfl 编译为 RulePlan |
+| **III WFL 编译器** | M11–M13 | .wfs + .wfl 编译为 RulePlan |
 | **IV 执行引擎** | M14–M16 | CEP 状态机 + DataFusion join 可执行 |
 | **V 运行时闭环** | M17–M20 | **单机 MVP：数据接收 -> 规则执行 -> 风险告警输出** |
 | **VI 生产化** | M21–M24 | 热加载、多通道风险告警、监控、工具链 |
@@ -1010,10 +1010,10 @@ retry_max_interval = "30s"                        # 最大重试间隔
 WFL 语言设计已独立为专属文档，详见：
 
 - **WFL v2 设计方案** → [wfl-desion.md](wfl-desion.md)
-  - 三文件架构（.ws / .wfl / .toml）
+  - 三文件架构（.wfs / .wfl / .toml）
   - 固定执行链与语义模型（BIND / SCOPE / JOIN / ENTITY / YIELD / CONV）
   - 单通道风险输出（score）+ 实体建模（entity）+ 贡献明细（score_contrib）
-  - Window Schema (.ws) 文法与语义约束
+  - Window Schema (.wfs) 文法与语义约束
   - WFL (.wfl) EBNF 文法、类型系统与语义约束（含 on close / close_reason）
   - 行为分析扩展（session window、baseline、score、collect 函数）
   - 编译模型（源码 → AST → RulePlan → CEP 状态机）

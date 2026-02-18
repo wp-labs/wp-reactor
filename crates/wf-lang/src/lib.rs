@@ -6,11 +6,11 @@ pub mod plan;
 pub mod preprocess;
 mod schema;
 mod wfl_parser;
-mod ws_parser;
+mod wfs_parser;
 
 pub use checker::{CheckError, check_wfl};
 pub use compiler::compile_wfl;
 pub use preprocess::preprocess_vars;
 pub use schema::{BaseType, FieldDef, FieldType, WindowSchema};
 pub use wfl_parser::parse_wfl;
-pub use ws_parser::parse_ws;
+pub use wfs_parser::parse_wfs;

@@ -9,7 +9,7 @@ use winnow::token::literal;
 
 use wf_lang::parse_utils::{ident, nonneg_integer, quoted_string};
 
-use crate::wsc_ast::*;
+use crate::wfg_ast::*;
 
 use self::primitives::{field_name, gen_expr, param_value, percent, rate, semi, ws_skip};
 
@@ -17,10 +17,10 @@ use self::primitives::{field_name, gen_expr, param_value, percent, rate, semi, w
 // Top-level
 // ---------------------------------------------------------------------------
 
-/// Parse a `.wsc` scenario file from a string.
-pub fn parse_wsc(input: &str) -> anyhow::Result<WscFile> {
+/// Parse a `.wfg` scenario file from a string.
+pub fn parse_wfg(input: &str) -> anyhow::Result<WfgFile> {
     let mut rest = input;
-    let result = wsc_file(&mut rest).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+    let result = wfg_file(&mut rest).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
 
     ws_skip(&mut rest).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
     if !rest.is_empty() {
@@ -32,7 +32,7 @@ pub fn parse_wsc(input: &str) -> anyhow::Result<WscFile> {
     Ok(result)
 }
 
-fn wsc_file(input: &mut &str) -> ModalResult<WscFile> {
+fn wfg_file(input: &mut &str) -> ModalResult<WfgFile> {
     let mut uses = Vec::new();
     loop {
         ws_skip(input)?;
@@ -55,7 +55,7 @@ fn wsc_file(input: &mut &str) -> ModalResult<WscFile> {
     ws_skip(input)?;
     let scenario = scenario_decl(input)?;
 
-    Ok(WscFile { uses, scenario })
+    Ok(WfgFile { uses, scenario })
 }
 
 // ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ use rand::rngs::StdRng;
 use serde_json::Value;
 use wf_lang::{BaseType, FieldType, WindowSchema};
 
-use crate::wsc_ast::{GenExpr, StreamBlock};
+use crate::wfg_ast::{GenExpr, StreamBlock};
 
 use super::field_gen::generate_field_value;
 

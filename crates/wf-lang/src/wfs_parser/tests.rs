@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use winnow::prelude::*;
 
-use super::parse_ws;
+use super::parse_wfs;
 use super::primitives::base_type_parser;
 use crate::parse_utils::duration_value;
 use crate::schema::{BaseType, FieldType};
@@ -106,7 +106,7 @@ window ip_blocklist {
     }
 }
 "#;
-    let schemas = parse_ws(input).unwrap();
+    let schemas = parse_wfs(input).unwrap();
     assert_eq!(schemas.len(), 1);
     let w = &schemas[0];
     assert_eq!(w.name, "ip_blocklist");
@@ -131,7 +131,7 @@ window auth_events {
     }
 }
 "#;
-    let schemas = parse_ws(input).unwrap();
+    let schemas = parse_wfs(input).unwrap();
     assert_eq!(schemas.len(), 1);
     let w = &schemas[0];
     assert_eq!(w.name, "auth_events");
@@ -155,7 +155,7 @@ window fw_events {
     }
 }
 "#;
-    let schemas = parse_ws(input).unwrap();
+    let schemas = parse_wfs(input).unwrap();
     let w = &schemas[0];
     assert_eq!(w.streams, vec!["firewall", "netflow"]);
 }
@@ -174,7 +174,7 @@ window b {
     fields { ts: time  v: digit }
 }
 "#;
-    let schemas = parse_ws(input).unwrap();
+    let schemas = parse_wfs(input).unwrap();
     assert_eq!(schemas.len(), 2);
     assert_eq!(schemas[0].name, "a");
     assert_eq!(schemas[1].name, "b");
@@ -194,13 +194,13 @@ window alerts {
     }
 }
 "#;
-    let schemas = parse_ws(input).unwrap();
+    let schemas = parse_wfs(input).unwrap();
     assert_eq!(schemas.len(), 1);
     assert_eq!(schemas[0].fields.len(), 2);
 }
 
 // -----------------------------------------------------------------------
-// Full security.ws example
+// Full security.wfs example
 // -----------------------------------------------------------------------
 
 #[test]
@@ -261,7 +261,7 @@ window security_alerts {
     }
 }
 "#;
-    let schemas = parse_ws(input).unwrap();
+    let schemas = parse_wfs(input).unwrap();
     assert_eq!(schemas.len(), 4);
     assert_eq!(schemas[0].name, "auth_events");
     assert_eq!(schemas[0].streams, vec!["auth"]);
@@ -286,7 +286,7 @@ fn reject_duplicate_window_names() {
 window foo { over = 0  fields { x: chars } }
 window foo { over = 0  fields { y: digit } }
 "#;
-    let err = parse_ws(input).unwrap_err();
+    let err = parse_wfs(input).unwrap_err();
     assert!(err.to_string().contains("duplicate window name"));
 }
 
@@ -300,7 +300,7 @@ window bad {
     }
 }
 "#;
-    let err = parse_ws(input).unwrap_err();
+    let err = parse_wfs(input).unwrap_err();
     assert!(err.to_string().contains("requires a 'time' attribute"));
 }
 
@@ -315,7 +315,7 @@ window bad {
     }
 }
 "#;
-    let err = parse_ws(input).unwrap_err();
+    let err = parse_wfs(input).unwrap_err();
     assert!(err.to_string().contains("not found in fields"));
 }
 
@@ -330,7 +330,7 @@ window bad {
     }
 }
 "#;
-    let err = parse_ws(input).unwrap_err();
+    let err = parse_wfs(input).unwrap_err();
     assert!(err.to_string().contains("must have type 'time'"));
 }
 
@@ -345,7 +345,7 @@ window static_table {
     }
 }
 "#;
-    let schemas = parse_ws(input).unwrap();
+    let schemas = parse_wfs(input).unwrap();
     assert_eq!(schemas.len(), 1);
     assert!(schemas[0].time_field.is_none());
 }
@@ -356,13 +356,13 @@ window static_table {
 
 #[test]
 fn parse_empty_file() {
-    let schemas = parse_ws("").unwrap();
+    let schemas = parse_wfs("").unwrap();
     assert!(schemas.is_empty());
 }
 
 #[test]
 fn parse_comment_only_file() {
-    let schemas = parse_ws("# just a comment\n# another\n").unwrap();
+    let schemas = parse_wfs("# just a comment\n# another\n").unwrap();
     assert!(schemas.is_empty());
 }
 
@@ -379,7 +379,7 @@ window parsed_logs {
     }
 }
 "#;
-    let schemas = parse_ws(input).unwrap();
+    let schemas = parse_wfs(input).unwrap();
     assert_eq!(schemas[0].fields[0].name, "detail.sha256");
     assert_eq!(schemas[0].fields[1].name, "detail.severity");
 }
@@ -395,7 +395,7 @@ window special {
     }
 }
 "#;
-    let schemas = parse_ws(input).unwrap();
+    let schemas = parse_wfs(input).unwrap();
     assert_eq!(schemas[0].fields[0].name, "src-ip");
     assert_eq!(schemas[0].fields[1].name, "content type");
 }
@@ -416,7 +416,7 @@ window arrays {
     }
 }
 "#;
-    let schemas = parse_ws(input).unwrap();
+    let schemas = parse_wfs(input).unwrap();
     assert_eq!(schemas[0].fields.len(), 7);
     assert_eq!(
         schemas[0].fields[0].field_type,
@@ -438,7 +438,7 @@ window bad {
     }
 }
 "#;
-    assert!(parse_ws(input).is_err());
+    assert!(parse_wfs(input).is_err());
 }
 
 #[test]
@@ -450,7 +450,7 @@ window defaults {
     }
 }
 "#;
-    let schemas = parse_ws(input).unwrap();
+    let schemas = parse_wfs(input).unwrap();
     assert_eq!(schemas[0].over, Duration::ZERO);
 }
 
@@ -461,7 +461,7 @@ window bad {
     over = 0
 }
 "#;
-    assert!(parse_ws(input).is_err());
+    assert!(parse_wfs(input).is_err());
 }
 
 #[test]
@@ -474,7 +474,7 @@ window bad {
     fields { x: chars }
 }
 "#;
-    assert!(parse_ws(input).is_err());
+    assert!(parse_wfs(input).is_err());
 }
 
 #[test]
@@ -487,7 +487,7 @@ window bad {
     fields { ts: time  ts2: time }
 }
 "#;
-    assert!(parse_ws(input).is_err());
+    assert!(parse_wfs(input).is_err());
 }
 
 #[test]
@@ -500,7 +500,7 @@ window bad {
     fields { ts: time }
 }
 "#;
-    assert!(parse_ws(input).is_err());
+    assert!(parse_wfs(input).is_err());
 }
 
 #[test]
@@ -512,5 +512,5 @@ window bad {
     fields { y: digit }
 }
 "#;
-    assert!(parse_ws(input).is_err());
+    assert!(parse_wfs(input).is_err());
 }

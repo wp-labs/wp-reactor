@@ -13,7 +13,7 @@ pub struct WflFile {
     pub contracts: Vec<ContractBlock>,
 }
 
-/// `use "path.ws"`
+/// `use "path.wfs"`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct UseDecl {

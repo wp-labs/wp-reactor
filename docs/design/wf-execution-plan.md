@@ -8,7 +8,7 @@
 ```
 阶段 I ─ 数据基建          阶段 II ─ 配置与窗口       阶段 III ─ WFL 编译器
 M01 Arrow 类型映射    ✅   M06 TOML 配置解析    ✅   M11 WFL 词法语法+AST  ✅
-M02 Arrow 行列转换    ✅   M07 .ws Schema 解析  ✅   M12 语义检查+变量预处理✅
+M02 Arrow 行列转换    ✅   M07 .wfs Schema 解析  ✅   M12 语义检查+变量预处理✅
 M03 Arrow IPC 编解码  ✅   M08 Window 类型与缓冲 ✅   M13 编译器 → RulePlan ✅
 M04 Arrow IPC Sink    ✅   M09 WindowRegistry 路由✅
 M05 Sink 断连重连     ✅   M10 Router + Evictor  ✅
@@ -26,7 +26,7 @@ M26 条件/字符串/时间       M28 |> 管道+隐式yield            +score
     +replay+yield契约
 
 阶段 XI ─ 测试数据生成 (wf-datagen)
-M31 .wsc Parser+随机生成          M32 Rule-aware+Oracle+Verify      M33 时序扰动+压测
+M31 .wfg Parser+随机生成          M32 Rule-aware+Oracle+Verify      M33 时序扰动+压测
 ```
 
 ---
@@ -97,15 +97,15 @@ M31 .wsc Parser+随机生成          M32 Rule-aware+Oracle+Verify      M33 时�
 | 验收 | fusion.toml 示例加载成功；非法配置报错测试（over > over_cap、缺失必填项） |
 | 状态 | **已完成** — `wf-config/src/fusion.rs` 实现 |
 
-### M07：Window Schema (.ws) 解析器 ✅
+### M07：Window Schema (.wfs) 解析器 ✅
 
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-lang` |
-| 范围 | .ws EBNF → winnow 解析器；产出 WindowSchema 数据结构；语义约束：window 名称全局唯一、over > 0 时 time 必选且为 time 类型、over = 0 表示静态集合 |
+| 范围 | .wfs EBNF → winnow 解析器；产出 WindowSchema 数据结构；语义约束：window 名称全局唯一、over > 0 时 time 必选且为 time 类型、over = 0 表示静态集合 |
 | 依赖 | 无（可与 M06 并行） |
-| 验收 | security.ws 示例解析成功；违反约束报错测试 |
-| 状态 | **已完成** — `wf-lang/src/ws_parser/mod.rs` 实现 |
+| 验收 | security.wfs 示例解析成功；违反约束报错测试 |
+| 状态 | **已完成** — `wf-lang/src/wfs_parser/mod.rs` 实现 |
 
 ### M08：Window 类型与缓冲核心 ✅
 
@@ -147,7 +147,7 @@ M31 .wsc Parser+随机生成          M32 Rule-aware+Oracle+Verify      M33 时�
 |------|------|
 | crate | `wf-lang` |
 | 范围 | WFL L1 词法分析器（关键字、标识符、字面量、运算符）；L1 语法解析器（winnow）覆盖：`use` / `rule` / `meta` / `events` / `match<key:dur>` / `yield` / `-> severity` / `-> score(expr)` / `entity()` / `fmt()` / OR 分支 / 复合 key / `on event` + `on close`；AST 定义：RuleNode / MetaNode / EventsNode / MatchNode / StepNode / YieldNode / ExprNode |
-| 依赖 | M07（.ws 解析器复用基础 winnow 设施） |
+| 依赖 | M07（.wfs 解析器复用基础 winnow 设施） |
 | 验收 | brute_scan.wfl 等 L1 规则解析为 AST；语法错误定位测试（行号+列号） |
 | 状态 | **已完成** — `wf-lang/src/ast.rs` + `wf-lang/src/wfl_parser/` 实现 |
 
@@ -156,7 +156,7 @@ M31 .wsc Parser+随机生成          M32 Rule-aware+Oracle+Verify      M33 时�
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-lang` |
-| 范围 | `$VAR` / `${VAR:default}` 变量替换预处理（编译前阶段）；语义检查器：① .ws ↔ .wfl 交叉校验（`use` 引用的 window 必须存在、字段类型一致）② 类型约束 T1–T10 检查（聚合输入类型、比较类型对齐等）③ 语义约束 R1–R6（match 必须有 events、yield 字段子集映射等） |
+| 范围 | `$VAR` / `${VAR:default}` 变量替换预处理（编译前阶段）；语义检查器：① .wfs ↔ .wfl 交叉校验（`use` 引用的 window 必须存在、字段类型一致）② 类型约束 T1–T10 检查（聚合输入类型、比较类型对齐等）③ 语义约束 R1–R6（match 必须有 events、yield 字段子集映射等） |
 | 依赖 | M11, M07 |
 | 验收 | 变量替换测试；非法规则全面报错：未定义 window、字段类型不匹配、聚合在非 digit/float 字段上、yield 字段不在目标 window 中 |
 | 状态 | **已完成** — `wf-lang/src/checker/` 实现 |
@@ -324,7 +324,7 @@ M31 .wsc Parser+随机生成          M32 Rule-aware+Oracle+Verify      M33 时�
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-lang` + `wf-core` |
-| 范围 | `\|>` 多级管道：规则内串联，后续 stage 自动绑定 `_in` 别名；隐式 yield：`yield (field=...)` 无目标名，编译器推导中间 window；隐式 window：编译器自动生成中间 Window Schema，无需手写 .ws |
+| 范围 | `\|>` 多级管道：规则内串联，后续 stage 自动绑定 `_in` 别名；隐式 yield：`yield (field=...)` 无目标名，编译器推导中间 window；隐式 window：编译器自动生成中间 Window Schema，无需手写 .wfs |
 | 依赖 | M27 |
 | 验收 | 两级管道场景（端口扫描检测 `\|>` 扫描源聚合）；三级管道链测试；`wf explain` 可展示 desugar 后的 Core IR |
 
@@ -360,16 +360,16 @@ M31 .wsc Parser+随机生成          M32 Rule-aware+Oracle+Verify      M33 时�
 
 > 详细设计见 [wfl-desion.md §18](wfl-desion.md)。各阶段穿插在其依赖就绪的最早时机，可与其他阶段并行推进。
 
-### M31：wf-datagen P0 — .wsc Parser + Schema 驱动随机生成
+### M31：wf-datagen P0 — .wfg Parser + Schema 驱动随机生成
 
 > **可立即启动**：唯一依赖 M07 已完成。建议与 M16→M18→M20 并行推进。
 
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-datagen` |
-| 范围 | `.wsc` 场景 DSL 解析器（EBNF → AST，语法见 §18.2）；schema 驱动随机数据生成（从 `.ws` 读取字段类型 → 按 gen 函数分布产出样本）；seed 可复现（固定 seed + 确定性 RNG）；输出格式 JSONL + Arrow IPC；CLI `wf-datagen gen --scenario ... --format ... --out ...`；`wf-datagen lint` 一致性校验（.wsc 引用与 .ws/.wfl 的一致性） |
+| 范围 | `.wfg` 场景 DSL 解析器（EBNF → AST，语法见 §18.2）；schema 驱动随机数据生成（从 `.wfs` 读取字段类型 → 按 gen 函数分布产出样本）；seed 可复现（固定 seed + 确定性 RNG）；输出格式 JSONL + Arrow IPC；CLI `wf-datagen gen --scenario ... --format ... --out ...`；`wf-datagen lint` 一致性校验（.wfg 引用与 .wfs/.wfl 的一致性） |
 | 依赖 | M07 ✅ |
-| 验收 | .wsc 文件解析为 AST 测试；同 seed 两次生成结果一致；JSONL / Arrow 输出可被 `wf run --replay` 消费；lint 检出引用缺失 |
+| 验收 | .wfg 文件解析为 AST 测试；同 seed 两次生成结果一致；JSONL / Arrow 输出可被 `wf run --replay` 消费；lint 检出引用缺失 |
 
 ### M32：wf-datagen P1 — Rule-aware 生成 + Oracle + Verify
 
@@ -387,7 +387,7 @@ M31 .wsc Parser+随机生成          M32 Rule-aware+Oracle+Verify      M33 时�
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-datagen` |
-| 范围 | 时序扰动矩阵（乱序 / 迟到 / 重复 / 丢弃，可组合，由 `.wsc` faults 块声明）；压测模式（高 EPS 连续生成，持续指定时长）；PR 友好差异报告（Markdown 格式，可直接贴入 PR）；配合 §17 P1-2 顺序/乱序不变性契约测试（M29）做回归防线 |
+| 范围 | 时序扰动矩阵（乱序 / 迟到 / 重复 / 丢弃，可组合，由 `.wfg` faults 块声明）；压测模式（高 EPS 连续生成，持续指定时长）；PR 友好差异报告（Markdown 格式，可直接贴入 PR）；配合 §17 P1-2 顺序/乱序不变性契约测试（M29）做回归防线 |
 | 依赖 | M32 |
 | 验收 | 扰动后 oracle 仍正确校验（考虑 allowed_lateness 边界）；压测模式下引擎无崩溃无内存泄漏；差异报告 Markdown 可在 GitHub PR 渲染 |
 
@@ -445,7 +445,7 @@ wf-datagen: M31 可立即启动(M07✅); M32 跟随M31(M13✅); verify 端到端
 |------|--------|---------|------|
 | **I 数据基建** | M01–M05 | wp-motor 能通过 Arrow IPC 可靠传输数据 | ✅ 已完成 |
 | **II 配置与窗口** | M06–M10 | 配置可加载、Window 能接收路由并缓存数据 | ✅ 已完成 |
-| **III WFL 编译器** | M11–M13 | .ws + .wfl 编译为 RulePlan | ✅ 已完成 |
+| **III WFL 编译器** | M11–M13 | .wfs + .wfl 编译为 RulePlan | ✅ 已完成 |
 | **IV 执行引擎** | M14–M16 | CEP 状态机 + DataFusion join 可执行 | M14–M15 ✅ / M16 待开始 |
 | **V 运行时闭环** | M17–M20 | **单机 MVP：数据接收→规则执行→告警输出** | M17 ✅ / M18–M20 待开始 |
 | **VI 生产化** | M21–M24 | 热加载、多通道告警、监控、工具链 | 待开始 |
@@ -453,7 +453,7 @@ wf-datagen: M31 可立即启动(M07✅); M32 跟随M31(M13✅); verify 端到端
 | **VIII L3 高级** | M27–M28 | tumble / conv / composable pattern / 多级管道 | 待开始 |
 | **IX 行为分析** | M29 | session / collect / statistics / score / 乱序不变性 | 待开始 |
 | **X 分布式** | M30 | 多节点分布式部署 | 待开始 |
-| **XI 测试数据生成** | M31–M33 | .wsc DSL / rule-aware oracle / 时序扰动压测 | 待开始 |
+| **XI 测试数据生成** | M31–M33 | .wfg DSL / rule-aware oracle / 时序扰动压测 | 待开始 |
 
 
 ## 验收检查点

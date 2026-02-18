@@ -1,9 +1,14 @@
 use std::time::Duration;
 
+use wf_lang::ast::{CmpOp, Expr, FieldRef, Measure};
+use wf_lang::plan::{
+    AggPlan, BindPlan, BranchPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
+    WindowSpec, YieldPlan,
+};
 use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
 use super::generate;
-use crate::wsc_parser::parse_wsc;
+use crate::wfg_parser::parse_wfg;
 
 fn make_login_schema() -> WindowSchema {
     WindowSchema {
@@ -53,11 +58,11 @@ scenario deterministic seed 42 {
     stream s1 : LoginWindow 10/s
 }
 "#;
-    let wsc = parse_wsc(input).unwrap();
+    let wfg = parse_wfg(input).unwrap();
     let schemas = vec![make_login_schema()];
 
-    let result1 = generate(&wsc, &schemas).unwrap();
-    let result2 = generate(&wsc, &schemas).unwrap();
+    let result1 = generate(&wfg, &schemas, &[]).unwrap();
+    let result2 = generate(&wfg, &schemas, &[]).unwrap();
 
     assert_eq!(result1.events.len(), result2.events.len());
     for (e1, e2) in result1.events.iter().zip(result2.events.iter()) {
@@ -82,12 +87,12 @@ scenario seed_b seed 99 {
     stream s1 : LoginWindow 10/s
 }
 "#;
-    let wsc1 = parse_wsc(input1).unwrap();
-    let wsc2 = parse_wsc(input2).unwrap();
+    let wsc1 = parse_wfg(input1).unwrap();
+    let wsc2 = parse_wfg(input2).unwrap();
     let schemas = vec![make_login_schema()];
 
-    let result1 = generate(&wsc1, &schemas).unwrap();
-    let result2 = generate(&wsc2, &schemas).unwrap();
+    let result1 = generate(&wsc1, &schemas, &[]).unwrap();
+    let result2 = generate(&wsc2, &schemas, &[]).unwrap();
 
     assert_eq!(result1.events.len(), result2.events.len());
     // At least some fields should differ
@@ -113,10 +118,10 @@ scenario count_test seed 1 {
     stream s1 : LoginWindow 10/s
 }
 "#;
-    let wsc = parse_wsc(input).unwrap();
+    let wfg = parse_wfg(input).unwrap();
     let schemas = vec![make_login_schema()];
 
-    let result = generate(&wsc, &schemas).unwrap();
+    let result = generate(&wfg, &schemas, &[]).unwrap();
     assert_eq!(result.events.len(), 200);
 }
 
@@ -129,10 +134,10 @@ scenario types_test seed 7 {
     stream s1 : LoginWindow 10/s
 }
 "#;
-    let wsc = parse_wsc(input).unwrap();
+    let wfg = parse_wfg(input).unwrap();
     let schemas = vec![make_login_schema()];
 
-    let result = generate(&wsc, &schemas).unwrap();
+    let result = generate(&wfg, &schemas, &[]).unwrap();
     assert!(!result.events.is_empty());
 
     let event = &result.events[0];
@@ -161,10 +166,10 @@ scenario sorted_test seed 42 {
     stream s1 : LoginWindow 10/s
 }
 "#;
-    let wsc = parse_wsc(input).unwrap();
+    let wfg = parse_wfg(input).unwrap();
     let schemas = vec![make_login_schema()];
 
-    let result = generate(&wsc, &schemas).unwrap();
+    let result = generate(&wfg, &schemas, &[]).unwrap();
     for window in result.events.windows(2) {
         assert!(window[0].timestamp <= window[1].timestamp);
     }
@@ -198,10 +203,10 @@ scenario multi_stream seed 42 {
     stream s2 : DnsWindow 10/s
 }
 "#;
-    let wsc = parse_wsc(input).unwrap();
+    let wfg = parse_wfg(input).unwrap();
     let schemas = vec![make_login_schema(), schema2];
 
-    let result = generate(&wsc, &schemas).unwrap();
+    let result = generate(&wfg, &schemas, &[]).unwrap();
     assert_eq!(result.events.len(), 300);
 
     let login_count = result
@@ -234,13 +239,258 @@ scenario enum_values seed 7 {
     }
 }
 "#;
-    let wsc = parse_wsc(input).unwrap();
+    let wfg = parse_wfg(input).unwrap();
     let schemas = vec![make_login_schema()];
 
-    let result = generate(&wsc, &schemas).unwrap();
+    let result = generate(&wfg, &schemas, &[]).unwrap();
     assert!(!result.events.is_empty());
     for event in &result.events {
         let user = event.fields["username"].as_str().unwrap();
         assert!(matches!(user, "alice" | "bob" | "charlie"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inject generation tests
+// ---------------------------------------------------------------------------
+
+fn make_brute_force_plan() -> RulePlan {
+    RulePlan {
+        name: "brute_force".to_string(),
+        binds: vec![BindPlan {
+            alias: "fail".to_string(),
+            window: "LoginWindow".to_string(),
+            filter: None,
+        }],
+        match_plan: MatchPlan {
+            keys: vec![FieldRef::Simple("src_ip".to_string())],
+            window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
+            event_steps: vec![StepPlan {
+                branches: vec![BranchPlan {
+                    label: Some("fail_count".to_string()),
+                    source: "fail".to_string(),
+                    field: None,
+                    guard: None,
+                    agg: AggPlan {
+                        transforms: vec![],
+                        measure: Measure::Count,
+                        cmp: CmpOp::Ge,
+                        threshold: Expr::Number(5.0),
+                    },
+                }],
+            }],
+            close_steps: vec![],
+        },
+        joins: vec![],
+        entity_plan: EntityPlan {
+            entity_type: "ip".to_string(),
+            entity_id_expr: Expr::Field(FieldRef::Simple("src_ip".to_string())),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".to_string(),
+            fields: vec![],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(85.0),
+        },
+        conv_plan: None,
+    }
+}
+
+#[test]
+fn test_inject_hit_cluster_correctness() {
+    let input = r#"
+scenario inject_hit seed 42 {
+    time "2024-01-01T00:00:00Z" duration 1h
+    total 1000
+    stream s1 : LoginWindow 100/s
+    inject for brute_force on [s1] {
+        hit 50%;
+    }
+}
+"#;
+    let wfg = parse_wfg(input).unwrap();
+    let schemas = vec![make_login_schema()];
+    let plans = vec![make_brute_force_plan()];
+
+    let result = generate(&wfg, &schemas, &plans).unwrap();
+    assert_eq!(result.events.len(), 1000);
+
+    // Hit clusters: 1000 * 50% = 500 events / 5 per cluster = 100 clusters
+    // Count events that are inject hit events by checking src_ip pattern
+    let hit_events: Vec<_> = result
+        .events
+        .iter()
+        .filter(|e| {
+            e.fields
+                .get("src_ip")
+                .and_then(|v| v.as_str())
+                .map(|s| s.starts_with("10."))
+                .unwrap_or(false)
+                && e.fields
+                    .get("src_ip")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .len()
+                    <= 15 // typical inject IP pattern
+        })
+        .collect();
+
+    // At minimum we should have some hit events
+    assert!(
+        hit_events.len() >= 100,
+        "expected at least 100 hit events, got {}",
+        hit_events.len()
+    );
+
+    // All events should be sorted by timestamp
+    for w in result.events.windows(2) {
+        assert!(w[0].timestamp <= w[1].timestamp);
+    }
+}
+
+#[test]
+fn test_inject_near_miss_no_trigger() {
+    // near-miss events should produce N-1 events per cluster (not enough to trigger)
+    let input = r#"
+scenario inject_nm seed 42 {
+    time "2024-01-01T00:00:00Z" duration 1h
+    total 1000
+    stream s1 : LoginWindow 100/s
+    inject for brute_force on [s1] {
+        near_miss 40%;
+    }
+}
+"#;
+    let wfg = parse_wfg(input).unwrap();
+    let schemas = vec![make_login_schema()];
+    let plans = vec![make_brute_force_plan()];
+
+    let result = generate(&wfg, &schemas, &plans).unwrap();
+    assert_eq!(result.events.len(), 1000);
+
+    // Run oracle — near-miss clusters should NOT produce alerts
+    use crate::oracle::run_oracle;
+    let start = "2024-01-01T00:00:00Z".parse().unwrap();
+    let duration = Duration::from_secs(3600);
+    let oracle = run_oracle(&result.events, &plans, &start, &duration).unwrap();
+    assert_eq!(
+        oracle.alerts.len(),
+        0,
+        "near-miss clusters should not trigger any alerts"
+    );
+}
+
+#[test]
+fn test_inject_hit_triggers_oracle() {
+    let input = r#"
+scenario inject_oracle seed 42 {
+    time "2024-01-01T00:00:00Z" duration 1h
+    total 1000
+    stream s1 : LoginWindow 100/s
+    inject for brute_force on [s1] {
+        hit 50%;
+    }
+}
+"#;
+    let wfg = parse_wfg(input).unwrap();
+    let schemas = vec![make_login_schema()];
+    let plans = vec![make_brute_force_plan()];
+
+    let result = generate(&wfg, &schemas, &plans).unwrap();
+
+    // Run oracle — hit clusters should produce alerts
+    use crate::oracle::run_oracle;
+    let start = "2024-01-01T00:00:00Z".parse().unwrap();
+    let duration = Duration::from_secs(3600);
+    let oracle = run_oracle(&result.events, &plans, &start, &duration).unwrap();
+
+    // 1000 events * 50% = 500 hit events / 5 per cluster = 100 clusters → 100 alerts
+    assert_eq!(
+        oracle.alerts.len(),
+        100,
+        "expected 100 alerts from 100 hit clusters, got {}",
+        oracle.alerts.len()
+    );
+
+    // All alerts should have correct rule name and score
+    for alert in &oracle.alerts {
+        assert_eq!(alert.rule_name, "brute_force");
+        assert!((alert.score - 85.0).abs() < f64::EPSILON);
+        assert_eq!(alert.entity_type, "ip");
+    }
+}
+
+#[test]
+fn test_inject_budget_allocation() {
+    // hit% + near_miss% + non_hit% should be accounted for; rest is background
+    let input = r#"
+scenario inject_budget seed 42 {
+    time "2024-01-01T00:00:00Z" duration 1h
+    total 1000
+    stream s1 : LoginWindow 100/s
+    inject for brute_force on [s1] {
+        hit 30%;
+        near_miss 10%;
+        non_hit 20%;
+    }
+}
+"#;
+    let wfg = parse_wfg(input).unwrap();
+    let schemas = vec![make_login_schema()];
+    let plans = vec![make_brute_force_plan()];
+
+    let result = generate(&wfg, &schemas, &plans).unwrap();
+    // Total should still be 1000
+    assert_eq!(result.events.len(), 1000);
+}
+
+#[test]
+fn test_inject_deterministic() {
+    let input = r#"
+scenario inject_det seed 42 {
+    time "2024-01-01T00:00:00Z" duration 1h
+    total 500
+    stream s1 : LoginWindow 100/s
+    inject for brute_force on [s1] {
+        hit 30%;
+    }
+}
+"#;
+    let wfg = parse_wfg(input).unwrap();
+    let schemas = vec![make_login_schema()];
+    let plans = vec![make_brute_force_plan()];
+
+    let result1 = generate(&wfg, &schemas, &plans).unwrap();
+    let result2 = generate(&wfg, &schemas, &plans).unwrap();
+
+    assert_eq!(result1.events.len(), result2.events.len());
+    for (e1, e2) in result1.events.iter().zip(result2.events.iter()) {
+        assert_eq!(e1.timestamp, e2.timestamp);
+        assert_eq!(e1.fields, e2.fields);
+    }
+}
+
+#[test]
+fn test_no_inject_backward_compat() {
+    // Without inject blocks, generate() behaves identically with or without rule_plans
+    let input = r#"
+scenario compat seed 42 {
+    time "2024-01-01T00:00:00Z" duration 1h
+    total 100
+    stream s1 : LoginWindow 10/s
+}
+"#;
+    let wfg = parse_wfg(input).unwrap();
+    let schemas = vec![make_login_schema()];
+    let plans = vec![make_brute_force_plan()];
+
+    let result_with_plans = generate(&wfg, &schemas, &plans).unwrap();
+    let result_without = generate(&wfg, &schemas, &[]).unwrap();
+
+    assert_eq!(result_with_plans.events.len(), result_without.events.len());
+    for (e1, e2) in result_with_plans.events.iter().zip(result_without.events.iter()) {
+        assert_eq!(e1.timestamp, e2.timestamp);
+        assert_eq!(e1.fields, e2.fields);
     }
 }

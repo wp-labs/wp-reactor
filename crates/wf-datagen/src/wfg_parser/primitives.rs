@@ -7,7 +7,7 @@ use winnow::token::{literal, take_while};
 use wf_lang::parse_utils::{ident, number_literal};
 
 // ---------------------------------------------------------------------------
-// Whitespace & comments (// style for .wsc)
+// Whitespace & comments (// style for .wfg)
 // ---------------------------------------------------------------------------
 
 /// Skip whitespace and `// ...` line comments.
@@ -27,7 +27,7 @@ pub fn ws_skip(input: &mut &str) -> ModalResult<()> {
 // Rate: NUMBER "/" ("s"|"m"|"h")
 // ---------------------------------------------------------------------------
 
-use crate::wsc_ast::{Rate, RateUnit};
+use crate::wfg_ast::{Rate, RateUnit};
 
 pub fn rate(input: &mut &str) -> ModalResult<Rate> {
     let num = number_literal(input)?;
@@ -69,7 +69,7 @@ pub fn semi(input: &mut &str) -> ModalResult<()> {
 // param_value: number (possibly with duration suffix), or quoted string
 // ---------------------------------------------------------------------------
 
-use crate::wsc_ast::ParamValue;
+use crate::wfg_ast::ParamValue;
 use std::time::Duration;
 
 pub fn param_value(input: &mut &str) -> ModalResult<ParamValue> {
@@ -127,7 +127,7 @@ pub fn field_name(input: &mut &str) -> ModalResult<String> {
 // gen_expr: literal or gen function call (with named arg support)
 // ---------------------------------------------------------------------------
 
-use crate::wsc_ast::{GenArg, GenExpr};
+use crate::wfg_ast::{GenArg, GenExpr};
 
 pub fn gen_expr(input: &mut &str) -> ModalResult<GenExpr> {
     // Try quoted string

@@ -9,6 +9,7 @@ name = "wf-datagen"
 path = "src/main.rs"
 
 [dependencies]
+wf-core = { path = "../wf-core" }
 wf-lang = { path = "../wf-lang" }
 winnow = { workspace = true }
 anyhow = { workspace = true }

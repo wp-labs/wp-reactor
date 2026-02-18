@@ -21,14 +21,14 @@ mod tests;
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Parse a `.ws` file containing one or more window declarations.
+/// Parse a `.wfs` file containing one or more window declarations.
 ///
 /// Returns a list of parsed [`WindowSchema`] values after semantic validation:
 /// - Window names must be unique within the file.
 /// - If `over > 0`, a `time` attribute is required and the referenced field
 ///   must exist and have type `time`.
-pub fn parse_ws(input: &str) -> anyhow::Result<Vec<WindowSchema>> {
-    let windows = ws_file
+pub fn parse_wfs(input: &str) -> anyhow::Result<Vec<WindowSchema>> {
+    let windows = wfs_file
         .parse(input)
         .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
     validate::validate_schemas(&windows)?;
@@ -39,7 +39,7 @@ pub fn parse_ws(input: &str) -> anyhow::Result<Vec<WindowSchema>> {
 // Top-level grammar
 // ---------------------------------------------------------------------------
 
-fn ws_file(input: &mut &str) -> ModalResult<Vec<WindowSchema>> {
+fn wfs_file(input: &mut &str) -> ModalResult<Vec<WindowSchema>> {
     ws_skip.parse_next(input)?;
     let windows: Vec<WindowSchema> = repeat(0.., window_decl).parse_next(input)?;
     ws_skip.parse_next(input)?;

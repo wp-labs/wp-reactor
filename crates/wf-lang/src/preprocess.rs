@@ -337,7 +337,7 @@ mod tests {
 
         let v = vars(&[("THRESHOLD", "3")]);
         let source = r#"
-use "security.ws"
+use "security.wfs"
 
 rule brute_force {
     events {

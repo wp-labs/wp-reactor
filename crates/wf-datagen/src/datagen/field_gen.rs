@@ -2,7 +2,7 @@ use rand::Rng;
 use rand::rngs::StdRng;
 use wf_lang::FieldType;
 
-use crate::wsc_ast::{GenArg, GenExpr};
+use crate::wfg_ast::{GenArg, GenExpr};
 
 /// Generate a value for a field based on its type and optional override.
 pub fn generate_field_value(
