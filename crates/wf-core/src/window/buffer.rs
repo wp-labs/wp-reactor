@@ -199,6 +199,15 @@ impl Window {
             return Ok(AppendOutcome::Appended);
         }
 
+        if batch.schema() != self.schema {
+            bail!(
+                "schema mismatch: window {:?} expects {:?}, got {:?}",
+                self.name,
+                self.schema,
+                batch.schema()
+            );
+        }
+
         let (min_event_time, max_event_time) = self.extract_time_range(&batch);
 
         // Advance watermark (only for windows with a time column and real timestamps).
@@ -621,5 +630,26 @@ mod tests {
         win.append_with_watermark(make_batch(&schema, &[30_000_000_000], &[3]))
             .unwrap();
         assert_eq!(win.watermark_nanos(), 25_000_000_000);
+    }
+
+    // -- 13. append_with_watermark_schema_mismatch_rejected --------------------
+
+    #[test]
+    fn append_with_watermark_schema_mismatch_rejected() {
+        let mut win = test_window(3600, usize::MAX);
+
+        let wrong_schema = Arc::new(Schema::new(vec![Field::new(
+            "different",
+            DataType::Int64,
+            false,
+        )]));
+        let wrong_batch = RecordBatch::try_new(
+            wrong_schema,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        // Must return Err, not panic.
+        assert!(win.append_with_watermark(wrong_batch).is_err());
     }
 }

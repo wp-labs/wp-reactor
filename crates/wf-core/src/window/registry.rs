@@ -92,6 +92,7 @@ impl WindowRegistry {
     /// Only `DistMode::Local` subscriptions are handled here; `Replicated`
     /// and `Partitioned` are skipped (deferred to M10 Router).
     /// Unknown stream tags are a no-op (returns `Ok(())`).
+    #[deprecated(note = "Use Router::route for watermark-aware routing")]
     pub fn route(&self, stream_tag: &str, batch: RecordBatch) -> Result<()> {
         let Some(subs) = self.subscriptions.get(stream_tag) else {
             return Ok(());
@@ -106,7 +107,7 @@ impl WindowRegistry {
                 .get(&sub.window_name)
                 .expect("subscription references non-existent window");
             let mut win = win_lock.write().expect("window lock poisoned");
-            win.append(batch.clone())?;
+            win.append_with_watermark(batch.clone()).map(|_| ())?;
         }
 
         Ok(())
@@ -163,6 +164,7 @@ impl WindowRegistry {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, TimestampNanosecondArray};
