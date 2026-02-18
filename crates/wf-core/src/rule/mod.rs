@@ -4,5 +4,5 @@ mod match_engine;
 mod tests;
 
 pub use match_engine::{
-    CepStateMachine, Event, MatchedContext, StepData, StepResult, Value,
+    CepStateMachine, CloseOutput, CloseReason, Event, MatchedContext, StepData, StepResult, Value,
 };

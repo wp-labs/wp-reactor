@@ -1,70 +1,11 @@
-use std::time::Duration;
+//! M14 core CEP state machine tests (1–11).
 
-use wf_lang::ast::{CmpOp, Expr, FieldRef, FieldSelector, Measure, Transform};
-use wf_lang::plan::{AggPlan, BranchPlan, MatchPlan, StepPlan, WindowSpec};
+use wf_lang::ast::{CmpOp, Expr, FieldSelector, Measure, Transform};
+use wf_lang::plan::{AggPlan, BranchPlan};
 
-use super::match_engine::{CepStateMachine, Event, StepResult, Value};
+use crate::rule::match_engine::{CepStateMachine, StepResult};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn event(fields: Vec<(&str, Value)>) -> Event {
-    Event {
-        fields: fields
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect(),
-    }
-}
-
-fn num(n: f64) -> Value {
-    Value::Number(n)
-}
-
-fn str_val(s: &str) -> Value {
-    Value::Str(s.to_string())
-}
-
-fn count_ge(n: f64) -> AggPlan {
-    AggPlan {
-        transforms: vec![],
-        measure: Measure::Count,
-        cmp: CmpOp::Ge,
-        threshold: Expr::Number(n),
-    }
-}
-
-fn simple_key(name: &str) -> FieldRef {
-    FieldRef::Simple(name.to_string())
-}
-
-fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
-    MatchPlan {
-        keys,
-        window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
-        event_steps: steps,
-        close_steps: vec![],
-    }
-}
-
-fn branch(source: &str, agg: AggPlan) -> BranchPlan {
-    BranchPlan {
-        label: None,
-        source: source.to_string(),
-        field: None,
-        guard: None,
-        agg,
-    }
-}
-
-fn step(branches: Vec<BranchPlan>) -> StepPlan {
-    StepPlan { branches }
-}
-
-// ---------------------------------------------------------------------------
-// Test 1: single_step_threshold
-// ---------------------------------------------------------------------------
+use super::helpers::*;
 
 #[test]
 fn single_step_threshold() {
@@ -88,10 +29,6 @@ fn single_step_threshold() {
         panic!("expected Matched");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Test 2: multi_step_sequential
-// ---------------------------------------------------------------------------
 
 #[test]
 fn multi_step_sequential() {
@@ -122,10 +59,6 @@ fn multi_step_sequential() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test 3: or_branch_first_wins
-// ---------------------------------------------------------------------------
-
 #[test]
 fn or_branch_first_wins() {
     // Two branches in one step; branch 0 completes first
@@ -146,10 +79,6 @@ fn or_branch_first_wins() {
         panic!("expected Matched");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Test 4: composite_key_isolation
-// ---------------------------------------------------------------------------
 
 #[test]
 fn composite_key_isolation() {
@@ -184,16 +113,12 @@ fn composite_key_isolation() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test 5: guard_filter_skips
-// ---------------------------------------------------------------------------
-
 #[test]
 fn guard_filter_skips() {
     // events not matching `action == "failed"` don't count
     let guard = Expr::BinOp {
         op: wf_lang::ast::BinOp::Eq,
-        left: Box::new(Expr::Field(FieldRef::Simple("action".to_string()))),
+        left: Box::new(Expr::Field(wf_lang::ast::FieldRef::Simple("action".to_string()))),
         right: Box::new(Expr::StringLit("failed".to_string())),
     };
 
@@ -227,10 +152,6 @@ fn guard_filter_skips() {
     // second failed event → matched
     assert!(matches!(sm.advance("auth", &fail_event), StepResult::Matched(_)));
 }
-
-// ---------------------------------------------------------------------------
-// Test 6: distinct_transform
-// ---------------------------------------------------------------------------
 
 #[test]
 fn distinct_transform() {
@@ -271,10 +192,6 @@ fn distinct_transform() {
     assert!(matches!(sm.advance("conn", &mk(443.0)), StepResult::Matched(_)));
 }
 
-// ---------------------------------------------------------------------------
-// Test 7: source_matching
-// ---------------------------------------------------------------------------
-
 #[test]
 fn source_matching() {
     // events with wrong alias don't contribute to branch
@@ -295,10 +212,6 @@ fn source_matching() {
     assert!(matches!(sm.advance("fail", &e), StepResult::Matched(_)));
 }
 
-// ---------------------------------------------------------------------------
-// Test 8: no_key_match (empty keys → shared instance)
-// ---------------------------------------------------------------------------
-
 #[test]
 fn no_key_match() {
     // all events share one instance
@@ -315,10 +228,6 @@ fn no_key_match() {
 
     assert!(matches!(sm.advance("alert", &e3), StepResult::Matched(_)));
 }
-
-// ---------------------------------------------------------------------------
-// Test 9: sum_measure
-// ---------------------------------------------------------------------------
 
 #[test]
 fn sum_measure() {
@@ -359,10 +268,6 @@ fn sum_measure() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test 10: missing_key_skips
-// ---------------------------------------------------------------------------
-
 #[test]
 fn missing_key_skips() {
     // event without key field → Accumulate (skipped)
@@ -381,10 +286,6 @@ fn missing_key_skips() {
     let e_ok = event(vec![("sip", str_val("10.0.0.1"))]);
     assert!(matches!(sm.advance("fail", &e_ok), StepResult::Matched(_)));
 }
-
-// ---------------------------------------------------------------------------
-// Test 11: instance_resets_after_match
-// ---------------------------------------------------------------------------
 
 #[test]
 fn instance_resets_after_match() {

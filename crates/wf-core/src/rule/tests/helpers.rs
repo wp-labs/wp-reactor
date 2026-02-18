@@ -1,0 +1,81 @@
+use std::time::Duration;
+
+use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, Measure};
+use wf_lang::plan::{AggPlan, BranchPlan, MatchPlan, StepPlan, WindowSpec};
+
+use crate::rule::match_engine::{Event, Value};
+
+pub fn event(fields: Vec<(&str, Value)>) -> Event {
+    Event {
+        fields: fields
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+    }
+}
+
+pub fn num(n: f64) -> Value {
+    Value::Number(n)
+}
+
+pub fn str_val(s: &str) -> Value {
+    Value::Str(s.to_string())
+}
+
+pub fn count_ge(n: f64) -> AggPlan {
+    AggPlan {
+        transforms: vec![],
+        measure: Measure::Count,
+        cmp: CmpOp::Ge,
+        threshold: Expr::Number(n),
+    }
+}
+
+pub fn simple_key(name: &str) -> FieldRef {
+    FieldRef::Simple(name.to_string())
+}
+
+pub fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
+    MatchPlan {
+        keys,
+        window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
+        event_steps: steps,
+        close_steps: vec![],
+    }
+}
+
+pub fn branch(source: &str, agg: AggPlan) -> BranchPlan {
+    BranchPlan {
+        label: None,
+        source: source.to_string(),
+        field: None,
+        guard: None,
+        agg,
+    }
+}
+
+pub fn step(branches: Vec<BranchPlan>) -> StepPlan {
+    StepPlan { branches }
+}
+
+pub fn plan_with_close(
+    keys: Vec<FieldRef>,
+    event_steps: Vec<StepPlan>,
+    close_steps: Vec<StepPlan>,
+    window_dur: Duration,
+) -> MatchPlan {
+    MatchPlan {
+        keys,
+        window_spec: WindowSpec::Sliding(window_dur),
+        event_steps,
+        close_steps,
+    }
+}
+
+pub fn close_reason_guard(reason: &str) -> Expr {
+    Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Simple("close_reason".to_string()))),
+        right: Box::new(Expr::StringLit(reason.to_string())),
+    }
+}
