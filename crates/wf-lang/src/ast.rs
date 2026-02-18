@@ -6,6 +6,7 @@ use std::time::Duration;
 
 /// A complete `.wfl` file.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct WflFile {
     pub uses: Vec<UseDecl>,
     pub rules: Vec<RuleDecl>,
@@ -14,6 +15,7 @@ pub struct WflFile {
 
 /// `use "path.ws"`
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct UseDecl {
     pub path: String,
 }
@@ -24,6 +26,7 @@ pub struct UseDecl {
 
 /// `rule name { meta events match->score entity yield }`
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct RuleDecl {
     pub name: String,
     pub meta: Option<MetaBlock>,
@@ -36,11 +39,13 @@ pub struct RuleDecl {
 
 /// `meta { key = "value" ... }`
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MetaBlock {
     pub entries: Vec<MetaEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MetaEntry {
     pub key: String,
     pub value: String,
@@ -52,12 +57,14 @@ pub struct MetaEntry {
 
 /// `events { alias: window [&& filter] ... }`
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct EventsBlock {
     pub decls: Vec<EventDecl>,
 }
 
 /// `alias : window [&& filter]`
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct EventDecl {
     pub alias: String,
     pub window: String,
@@ -70,6 +77,7 @@ pub struct EventDecl {
 
 /// `match<keys:dur> { on event { ... } [on close { ... }] }`
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MatchClause {
     pub keys: Vec<FieldRef>,
     pub duration: Duration,
@@ -79,12 +87,14 @@ pub struct MatchClause {
 
 /// One semicolon-terminated match step, potentially with `||` OR branches.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MatchStep {
     pub branches: Vec<StepBranch>,
 }
 
 /// `[label:] source[.field]["field"] [&& guard] pipe_chain`
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct StepBranch {
     pub label: Option<String>,
     pub source: String,
@@ -95,6 +105,7 @@ pub struct StepBranch {
 
 /// `{ | transform } | measure cmp threshold`
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PipeChain {
     pub transforms: Vec<Transform>,
     pub measure: Measure,
@@ -103,11 +114,13 @@ pub struct PipeChain {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Transform {
     Distinct,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Measure {
     Count,
     Sum,
@@ -122,6 +135,7 @@ pub enum Measure {
 
 /// `-> score(expr)`
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ScoreExpr {
     pub expr: Expr,
 }
@@ -132,12 +146,14 @@ pub struct ScoreExpr {
 
 /// `entity(type, id_expr)`
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct EntityClause {
     pub entity_type: EntityTypeVal,
     pub id_expr: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum EntityTypeVal {
     Ident(String),
     StringLit(String),
@@ -149,12 +165,14 @@ pub enum EntityTypeVal {
 
 /// `yield target (name = expr, ...)`
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct YieldClause {
     pub target: String,
     pub args: Vec<NamedArg>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct NamedArg {
     pub name: String,
     pub value: Expr,
@@ -166,6 +184,7 @@ pub struct NamedArg {
 
 /// Field selector within a step branch: `.ident` or `["string"]`.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum FieldSelector {
     Dot(String),
     Bracket(String),
@@ -173,6 +192,7 @@ pub enum FieldSelector {
 
 /// Field reference in expressions.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum FieldRef {
     /// Bare identifier, e.g. `sip`.
     Simple(String),
@@ -187,6 +207,7 @@ pub enum FieldRef {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -197,6 +218,7 @@ pub enum CmpOp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BinOp {
     And,
     Or,
@@ -218,6 +240,7 @@ pub enum BinOp {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Expr {
     /// Number literal (integer or float).
     Number(f64),
@@ -255,6 +278,7 @@ pub enum Expr {
 
 /// `contract name for rule_name { given { ... } expect { ... } [options { ... }] }`
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ContractBlock {
     pub name: String,
     pub rule_name: String,
@@ -265,6 +289,7 @@ pub struct ContractBlock {
 
 /// Statement inside a `given { ... }` block.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum GivenStmt {
     /// `row(alias, field = expr, ...);`
     Row {
@@ -277,6 +302,7 @@ pub enum GivenStmt {
 
 /// `name = expr` — field assignment in a `row(...)` statement.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FieldAssign {
     pub name: String,
     pub value: Expr,
@@ -284,6 +310,7 @@ pub struct FieldAssign {
 
 /// Statement inside an `expect { ... }` block.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ExpectStmt {
     /// `hits cmp_op INTEGER;`
     Hits { cmp: CmpOp, count: usize },
@@ -293,6 +320,7 @@ pub enum ExpectStmt {
 
 /// Assertion on a specific hit output.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum HitAssert {
     /// `score cmp_op NUMBER`
     Score { cmp: CmpOp, value: f64 },
@@ -308,6 +336,7 @@ pub enum HitAssert {
 
 /// Options for a contract block.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ContractOptions {
     pub close_trigger: Option<CloseTrigger>,
     pub eval_mode: Option<EvalMode>,
@@ -315,6 +344,7 @@ pub struct ContractOptions {
 
 /// Window close trigger mode for contract testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CloseTrigger {
     Timeout,
     Flush,
@@ -323,6 +353,7 @@ pub enum CloseTrigger {
 
 /// Evaluation mode for contract testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EvalMode {
     Strict,
     Lenient,
