@@ -1,7 +1,43 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git remote add:*)"
+      "Bash(git remote add:*)",
+      "WebSearch",
+      "WebFetch(domain:zed.dev)",
+      "WebFetch(domain:boundaryml.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(npm install)",
+      "Bash(npx tree-sitter generate)",
+      "Bash(npx tree-sitter parse:*)",
+      "Bash(done)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(gh api:*)",
+      "Bash(curl:*)",
+      "Bash(python3 -c \"import sys,json,base64; d=json.load\\(sys.stdin\\); print\\(base64.b64decode\\(d[''''content'''']\\).decode\\(\\)\\)\")",
+      "Bash(find:*)",
+      "Bash(npm install:*)",
+      "Bash(printf:*)",
+      "Bash(git -C /Users/zuowenjian/devspace/wp-labs/wp-reactor/tools/tree-sitter-wpl rev-parse HEAD)",
+      "Bash(git -C /Users/zuowenjian/devspace/wp-labs/wp-reactor/tools/tree-sitter-wpl add -A)",
+      "Bash(git -C /Users/zuowenjian/devspace/wp-labs/wp-reactor/tools/tree-sitter-wpl commit -m \"Add highlight queries\")",
+      "Bash(echo:*)",
+      "Bash(git checkout:*)",
+      "Bash(git pull:*)",
+      "Bash(git fetch:*)",
+      "Bash(git reset:*)",
+      "Bash(ls:*)",
+      "Bash(git ls-tree --name-only c7f0494 src/)",
+      "Bash(git ls-tree:*)",
+      "Bash(tree-sitter init:*)",
+      "Bash(tree-sitter generate:*)",
+      "Bash(tree-sitter parse:*)",
+      "Bash(tree-sitter highlight:*)",
+      "Bash(git -C /Users/zuowenjian/devspace/wp-labs/wp-reactor log --oneline -10)",
+      "Bash(cargo build:*)",
+      "Bash(cargo run:*)"
     ]
   }
 }
