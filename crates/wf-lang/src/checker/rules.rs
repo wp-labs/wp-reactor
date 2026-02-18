@@ -38,6 +38,29 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
         check_match_steps(close_steps, &scope, name, errors, &mut labels_seen);
     }
 
+    // Check label vs key name collision: a label with the same name as a match
+    // key field would shadow the key in the eval context, corrupting score/entity
+    // expressions that reference the key.
+    for key in &rule.match_clause.keys {
+        let key_name = match key {
+            FieldRef::Simple(n) | FieldRef::Qualified(_, n) | FieldRef::Bracketed(_, n) => {
+                n.as_str()
+            }
+            #[allow(unreachable_patterns)]
+            _ => continue,
+        };
+        if labels_seen.contains(key_name) {
+            errors.push(CheckError {
+                rule: Some(name.to_string()),
+                contract: None,
+                message: format!(
+                    "step label `{}` conflicts with match key field of the same name",
+                    key_name
+                ),
+            });
+        }
+    }
+
     // Check score expression (T27)
     check_score(rule, &scope, errors);
 

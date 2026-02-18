@@ -1067,3 +1067,47 @@ rule r {
         &[auth_events_window(), fw_events_window(), output_window()],
     );
 }
+
+// =========================================================================
+// Label vs key name collision
+// =========================================================================
+
+#[test]
+fn label_conflicts_with_match_key() {
+    // Label "sip" shadows the match key "sip" → should be rejected
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> {
+        on event {
+            sip: e | count >= 1;
+        }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "conflicts with match key field",
+    );
+}
+
+#[test]
+fn label_does_not_conflict_with_unrelated_key() {
+    // Label "fail" does not conflict with key "sip" → should pass
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> {
+        on event {
+            fail: e | count >= 1;
+        }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
+}

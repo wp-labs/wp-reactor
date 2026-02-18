@@ -281,7 +281,9 @@ entity_clause = "entity" , "(" , entity_type , "," , expr , ")" ;              (
 entity_type   = IDENT | STRING ;
 
 yield_clause  = "yield" , [ IDENT ] , "(" , named_arg , { "," , named_arg } , ")" ;  (* 省略 IDENT 的隐式 yield 为 L3 *)
-named_arg     = IDENT , "=" , expr ;
+named_arg     = yield_field , "=" , expr ;
+yield_field   = IDENT | IDENT , "." , IDENT , { "." , IDENT } | quoted_ident ;    (* 与 .ws field_name 对齐 *)
+quoted_ident  = "`" , { ANY - "`" } , "`" ;                                     (* 同 §6.1 .ws 定义 *)
 
 conv_clause   = "conv" , "{" , conv_chain , { conv_chain } , "}" ;             (* L3 *)
 conv_chain    = conv_step , { "|" , conv_step } , ";" ;
@@ -295,8 +297,8 @@ given_stmt     = "row" , "(" , IDENT , "," , field_assign , { "," , field_assign
                | "tick" , "(" , DURATION , ")" , ";" ;
 field_assign   = ( IDENT | STRING ) , "=" , expr ;
 expect_block   = "expect" , "{" , { expect_stmt } , "}" ;
-expect_stmt    = "hits" , cmp_op , NUMBER , ";"
-               | "hit" , "[" , NUMBER , "]" , "." , hit_assert , ";" ;
+expect_stmt    = "hits" , cmp_op , INTEGER , ";"
+               | "hit" , "[" , INTEGER , "]" , "." , hit_assert , ";" ;
 hit_assert     = "score" , cmp_op , NUMBER
                | "close_reason" , "==" , STRING
                | "entity_type" , "==" , STRING
@@ -329,6 +331,8 @@ if_expr       = "if" , expr , "then" , expr , "else" , expr ;                  (
 derive_ref    = "@" , IDENT ;
 close_reason_ref = "close_reason" ;
 func_call     = [ IDENT , "." ] , IDENT , "(" , [ expr , { "," , expr } ] , ")" ;
+                (* window.has 的第二参数为 STRING 字面量（目标字段名），语法上走 expr→primary→STRING，
+                   语义上由编译器按 T12 规则校验为目标 window 的字段名。 *)
 agg_pipe_expr = source_ref , [ "." , IDENT | "[" , STRING , "]" ] , { "|" , transform } , "|" , measure ;
 field_ref     = IDENT
               | IDENT , "." , IDENT
@@ -337,6 +341,7 @@ field_ref     = IDENT
 (* 词法（简化） *)
 IDENT         = ALPHA , { ALPHA | DIGIT | "_" } ;
 NUMBER        = DIGIT , { DIGIT } , [ "." , DIGIT , { DIGIT } ] ;
+INTEGER       = DIGIT , { DIGIT } ;                           (* 非负整数，用于 contract hits/hit[idx] *)
 STRING        = '"' , { ANY - '"' } , '"' ;
 DURATION      = DIGIT , { DIGIT } , ( "s" | "m" | "h" | "d" ) ;
 ALPHA         = "a".."z" | "A".."Z" | "_" ;
@@ -400,7 +405,7 @@ ANY           = ? any unicode char ? ;
 |------|------|
 | `field` 参数含义 | 参数是**当前上下文的字段值表达式**（如 `domain`、`req.domain`），不是字段名字面量。 |
 | 匹配目标字段 | 默认按“同名字段”匹配：`window.has(req.domain)` 会在目标 window 中查找字段 `domain`。 |
-| 异名字段匹配 | 使用两参数形式：`window.has(ctx_expr, target_field)`，如 `bad_ips.has(req.sip, ip)`。 |
+| 异名字段匹配 | 使用两参数形式：`window.has(ctx_expr, "target_field")`，如 `bad_ips.has(req.sip, "ip")`。第二参数为 STRING 字面量（目标 window 字段名），避免与别名/标签解析冲突。 |
 | 匹配范围 | 仅在目标字段上做等值成员判定，不做全字段扫描。 |
 | 可用窗口类型 | 目标 window 必须是静态集合（`over = 0`）或维度表（低频更新、用于 enrich/查表；在 `runtime.toml` 通过 `role = "dimension"` 声明）。 |
 | 判定时点 | 在规则求值时基于目标 window 的当前快照判定。 |
@@ -847,7 +852,7 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 | T9 | `&&` / `\|\|` 两侧必须为 `bool` 类型表达式 |
 | T10 | yield 命名参数的值表达式类型必须与目标 window 对应字段类型一致 |
 | T11 | `window.has(x)` 中 `x` 必须可解析为当前上下文字段值；其类型必须与目标 window 同名字段类型一致 |
-| T12 | `window.has(x, f)` 中 `f` 必须是目标 window 已定义字段名；`x` 类型必须与 `f` 类型一致 |
+| T12 | `window.has(x, "f")` 中 `"f"` 必须是 STRING 字面量且为目标 window 已定义字段名；`x` 类型必须与 `f` 类型一致 |
 | T13 | `window.has(...)` 的目标 window 必须满足：`over = 0` 或被标记为维度表（dimension） |
 | **── 行为分析扩展类型规则 ──** | |
 | T14 | `if c then a else b` — `c` 必须为 `bool`；`a` 与 `b` 类型必须一致；返回类型 = `a` 的类型 |
@@ -890,9 +895,10 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 |----|------|
 | R1 | **跨步引用**：`label.field` / `label["field.with.dot"]` 中 `label` 必须是当前步骤的**前序步骤**标签；引用后续步骤编译错误 |
 | R2 | **跨步字段类型**：`label.field` 或下标形式的字段类型由 label 所在步骤的事件集 window schema 静态确定；不存在的字段编译错误 |
-| R3 | **events 字段引用**：`alias.field` / `alias["field.with.dot"]` 中 `alias` 必须在 `events {}` 中声明，字段必须在对应 window 的 `fields {}` 中定义 |
+| R3 | **events 字段引用**（规则体内）：`alias.field` / `alias["field.with.dot"]` 中 `alias` 必须在 `events {}` 中声明，字段必须在对应 window 的 `fields {}` 中定义 |
+| R3a | **events 过滤表达式**（`event_decl` 的 `&& expr` 部分）：过滤表达式的上下文是**单一 window**，裸 IDENT 直接解析为该 window 的字段名（如 `action == "failed"`）。若同时需要引用其他 window（如 `window.has`），则自身别名也可前置引用（如 `req: dns_query && bad_domains.has(req.domain)`），编译器将 `event_decl` 的 alias 在过滤表达式作用域内提前注册。 |
 | R4 | **join 字段引用**：join window 字段**必须**以 `window_name.field` 或 `window_name["field.with.dot"]` 限定名引用；裸字段名不搜索 join window |
-| R5 | **解析优先级**：events 别名 → match 步骤标签 → 聚合函数结果；未找到即编译错误，不做回退猜测 |
+| R5 | **解析优先级**（规则体内）：events 别名 → match 步骤标签 → 聚合函数结果；未找到即编译错误，不做回退猜测。**例外**：`event_decl` 过滤表达式内裸 IDENT 按 R3a 规则优先解析为当前 window 字段 |
 | R6 | **OR 分支 nullable**：`\|\|` 各分支标签字段在后续可引用，但标注为 nullable；对 nullable 字段做 `sum`/`avg` 时编译器警告 |
 | R7 | **derive 引用解析**：`@name` 仅在当前 `match` 的 `derive` 作用域内解析，不回退到 events/join/步骤标签 |
 | R8 | **close_reason 解析**：`close_reason` 解析为关闭上下文字段，不参与 events/join/步骤标签同名搜索 |
@@ -1422,21 +1428,32 @@ contract dns_no_response_timeout for dns_no_response {
 
 ## 15. 实施路线
 
+> 各 Phase 内条目按建议优先级排列；wf-datagen 各阶段穿插在其依赖就绪的最早 Phase。
+
 ### Phase A（先稳）
 - Core IR + L1 + 可读语法 + lint/fmt。
 - `wf test` 契约测试（given/expect）+ CI 阻断策略。
+- **wf-datagen P0**：`.wsc` parser + schema 驱动随机生成 + seed 可复现 + JSONL/Arrow 输出（依赖 `.ws` parser）。
 
 ### Phase B（增强）
 - L2（join/baseline/window.has）+ explain/replay。
 - L2 行为分析基础：`if/then/else`、字符串函数、时间函数。
+- §17 P0-2 Join 时间语义一等化（snapshot/asof）—— 随 L2 join 一并落地。
+- §17 P0-3 规则资源预算内建（limits）—— 先把资源安全兜住。
+- §17 P0-1 显式 key 映射语法 —— 消除多源 key 歧义。
+- **wf-datagen P1**：rule-aware（hit/near_miss/non_hit）+ Reference Evaluator + oracle 生成 + verify（依赖 `.wfl` compiler）。
 
 ### Phase C（高级）
 - L3（`|>`/`conv`）+ 性能优化 + 分布式 V2 完善。
+- §17 P0-4 输出契约版本化（yield contract）—— 下游契约治理。
+- §17 P1-1 可组合规则片段（pattern/template）—— 提升规则复用。
+- **wf-datagen P2**：时序扰动矩阵 + 压测模式 + PR 友好差异报告（依赖 P1）。
 
 ### Phase D（行为分析）
 - L3 行为分析：session window、集合函数（`collect_set`/`collect_list`/`first`/`last`）、统计函数（`stddev`/`percentile`）。
 - 增强 baseline（`ewma`/`median` + 持久化快照）。
 - 单通道风险评分（`-> score(expr)` / `-> score { ... }`）+ `entity(type,id_expr)` + 跨规则评分累加。
+- §17 P1-2 顺序/乱序不变性契约测试 —— 配合 wf-datagen 扰动能力做回归防线。
 
 ---
 
@@ -1564,3 +1581,398 @@ contract dns_order_invariance for dns_no_response {
 1. **先做 P0-2 + P0-3**：先把语义一致性与资源安全兜住。
 2. **再做 P0-1 + P0-4**：增强可表达性与下游契约治理。
 3. **最后做 P1-1 + P1-2**：提升复用能力与回归防线。
+
+---
+
+## 18. 测试数据生成工具方案（wf-datagen）
+
+> 目标：为 WFL 规则提供"可复现、可注入时序故障、可自动对拍"的测试数据与期望结果（oracle），将正确性校验前置到 CI。
+
+### 18.1 设计目标
+
+- **可复现**：同一 `seed + ws + wfl + scenario` 产出一致数据集。
+- **可验证**：生成 `events` 与 `oracle`，支持自动差异比对。
+- **可扰动**：支持乱序、迟到、重复、丢弃等时序扰动。
+- **可接入**：支持 `gen -> run -> verify` 标准流水线接入 CI。
+
+### 18.2 Scenario DSL（`.wsc`）
+
+#### 18.2.1 设计原则
+
+- **语义即语法**：每个语法块（`stream`、`inject`、`faults`、`oracle`）直接对应一个生成概念，不经中间数据格式间接表达。
+- **与 WFL 同族**：复用 WFL 词法基础（IDENT、STRING、NUMBER、DURATION）和注释风格（`//`），降低学习成本。
+- **声明头承载核心信息**：`stream alias: window rate`、`inject for rule on [streams]` 等关键语义在声明行即可读取，块体仅承载覆盖项与参数。
+- **引用不重复声明**：字段类型以 `.ws` 为准，规则语义以 `.wfl` 为准，`.wsc` 仅覆盖生成策略。
+
+文件扩展名：`.wsc`（WarpFusion SCenario）。
+
+#### 18.2.2 完整示例
+
+```wsc
+use "windows/security.ws"
+use "rules/brute_force.wfl"
+
+scenario brute_force_load seed 42 {
+
+  time "2026-02-18T00:00:00Z" duration 30m
+  total 200000
+
+  // ── 基础流量 ──
+
+  stream fail: auth_events 200/s {
+    sip    = ipv4(pool: 500)
+    uid    = pattern("user-{seq:0000}")
+    action = "failed"
+  }
+
+  stream success: auth_events 400/s {
+    sip    = ipv4(pool: 500)
+    uid    = pattern("user-{seq:0000}")
+    action = "success"
+  }
+
+  // ── 模式注入 ──
+
+  inject for brute_force on [fail] {
+    hit       5%  count_per_entity=5 within=2m;
+    near_miss 3%  count_per_entity=2 within=2m;
+  }
+
+  // ── 时序扰动 ──
+
+  faults {
+    out_of_order 2%;    // 交换相邻事件的发送顺序（事件时间不变，到达顺序乱）
+    late         1%;    // 事件发送时间推迟到 watermark 之后（可能被引擎 drop）
+    duplicate    0.5%;  // 重复发送同一事件
+    drop         0.2%;  // 生成但不发送（oracle 中仍标记为已生成）
+  }
+
+  // ── 期望结果 ──
+
+  oracle {
+    time_tolerance  = 1s;
+    score_tolerance = 0.01;
+  }
+}
+```
+
+#### 18.2.3 文法（EBNF）
+
+> 词法基础（IDENT、NUMBER、STRING、DURATION、ALPHA、DIGIT）与 WFL §7 一致，此处不重复。新增 `PERCENT` 和 `RATE` 词法。
+
+```ebnf
+scenario_file   = { use_decl } , scenario_decl ;
+
+use_decl        = "use" , STRING ;
+
+scenario_decl   = "scenario" , IDENT , "seed" , NUMBER , "{" ,
+                    time_clause ,
+                    total_clause ,
+                    { stream_block } ,
+                    { inject_block } ,
+                    [ faults_block ] ,
+                    [ oracle_block ] ,
+                  "}" ;
+
+time_clause     = "time" , STRING , "duration" , DURATION ;
+total_clause    = "total" , NUMBER ;
+
+(* ── 流定义 ── *)
+stream_block    = "stream" , IDENT , ":" , IDENT , RATE ,
+                  [ "{" , { field_override } , "}" ] ;
+field_override  = field_name , "=" , gen_expr ;
+field_name      = IDENT | quoted_ident ;
+quoted_ident    = "`" , { ANY - "`" } , "`" ;
+gen_expr        = literal | gen_func ;
+literal         = STRING | NUMBER | "true" | "false" ;
+gen_func        = IDENT , "(" , [ named_arg , { "," , named_arg } ] , ")" ;
+named_arg       = IDENT , ":" , ( STRING | NUMBER ) ;
+
+(* ── 模式注入 ── *)
+inject_block    = "inject" , "for" , IDENT , "on" , stream_list , "{" ,
+                    inject_line , { inject_line } ,
+                  "}" ;
+stream_list     = "[" , IDENT , { "," , IDENT } , "]" ;
+inject_line     = mode_kw , PERCENT , { param_assign } , ";" ;
+mode_kw         = "hit" | "near_miss" | "non_hit" ;
+param_assign    = IDENT , "=" , ( NUMBER | DURATION | STRING ) ;
+
+(* ── 时序扰动 ── *)
+faults_block    = "faults" , "{" , { fault_line } , "}" ;
+fault_line      = IDENT , PERCENT , ";" ;
+
+(* ── 期望结果配置 ── *)
+oracle_block    = "oracle" , "{" , { param_assign , ";" } , "}" ;
+
+(* ── 新增词法 ── *)
+RATE            = NUMBER , "/" , ( "s" | "m" | "h" ) ;
+PERCENT         = NUMBER , "%" ;
+```
+
+#### 18.2.4 语义约束
+
+**引用校验：**
+
+| ID | 规则 |
+|----|------|
+| SC1 | `use` 引用的 `.ws` / `.wfl` 文件必须存在且可解析；文件类型由扩展名确定。 |
+| SC2 | `stream` 的 alias 必须在所引用 `.wfl` 的某条规则 `events {}` 中声明。 |
+| SC2a | `stream` 的 window 名（`:`后）必须与目标规则中该 alias 绑定的 window 一致。即 `.wsc` 中 `stream fail: auth_events` 要求 `.wfl` 中有 `fail: auth_events ...`；window 名不匹配则编译错误。 |
+| SC3 | `stream` 的 window 名必须在 `.ws` 中定义。 |
+| SC4 | `field_override` 的字段名必须存在于该 stream 对应 window 的 `fields {}` 中。 |
+| SC5 | `inject for <rule>` 的 `<rule>` 必须存在于所引用的 `.wfl` 中。 |
+| SC6 | `inject on [streams]` 中的每个 alias 必须是该 `<rule>` 的 events alias 子集。 |
+| SC7 | 未被 `inject` 覆盖的规则仅接收 `stream` 基础流量；oracle 中不为这些规则生成期望命中记录。 |
+
+**值域校验：**
+
+| ID | 规则 |
+|----|------|
+| SV1 | `seed` 必须为非负整数。 |
+| SV2 | `total` 必须为正整数。 |
+| SV3 | `RATE` 的数值部分必须 > 0。 |
+| SV4 | `PERCENT` 的数值部分必须在 `(0, 100]` 之间。 |
+| SV5 | 同一 `inject` 块内各 `mode_kw` 行的 `PERCENT` 之和不得超过 100%。 |
+| SV6 | `faults` 中各项 `PERCENT` 之和不得超过 100%（一条事件最多命中一种 fault）。 |
+| SV7 | `gen_expr` 的类型必须与 `.ws` 中对应字段类型兼容（`const "failed"` 赋给 `chars` 字段合法，赋给 `digit` 字段编译错误）。 |
+| SV8 | `oracle.time_tolerance` 必须为 DURATION 类型；`oracle.score_tolerance` 必须为 NUMBER 类型且 >= 0。 |
+| SV9 | 目标规则 `events` 中的 filter 条件（`&& expr`）隐含字段值约束。生成器从 filter 中提取常量等值条件（如 `action == "failed"`），作为该 stream 对应字段的**隐式 const override**。若 `.wsc` 中已显式声明同字段的 `field_override`，则以显式声明为准；未声明时自动应用 filter 中的常量值。非常量条件（如 `x > 10`）不自动提取，需用户显式覆盖。 |
+
+#### 18.2.5 `stream` 块详解
+
+声明行 `stream alias: window rate` 承载三个核心属性：
+- **alias**：对应 `.wfl` 规则中 `events {}` 的别名。
+- **window**：对应 `.ws` 中的 window 名，决定字段 schema。
+- **rate**：基础事件生成速率（如 `200/s`、`12000/m`、`720000/h`）。
+
+块体 `{ field_override ... }` 为可选；省略时所有字段按 `.ws` 类型自动随机生成。此外，生成器会自动从目标规则的 `events` filter 中提取常量等值条件作为隐式覆盖（SV9），确保生成的数据能通过 filter 进入规则求值链路。
+
+**gen 函数清单：**
+
+| gen 函数 | 参数 | 适用字段类型 | 说明 |
+|----------|------|:------------:|------|
+| *(常量)* | 直接写字面值 | 全部 | `action = "failed"` |
+| `ipv4` | `pool: N` | `ip` / `chars` | 从随机池取 IPv4，`pool` 控制 key 基数 |
+| `ipv6` | `pool: N` | `ip` / `chars` | 同上，IPv6 |
+| `pattern` | `format: STRING` | `chars` | 模板生成：`{seq:0000}` 递增，`{rand:N}` 随机 N 位 |
+| `enum` | `values: STRING` | `chars` | 从逗号分隔列表均匀抽取，如 `enum(values: "a,b,c")` |
+| `range` | `min: N, max: N` | `digit` / `float` | 均匀随机 |
+| `timestamp` | *(无参)* | `time` | 默认：按 stream rate 在 `time` 范围内递增 |
+
+未声明 override 的字段按类型默认策略生成：
+
+| 字段类型 | 默认策略 |
+|----------|----------|
+| `chars` | 随机 8~16 字符字母数字串 |
+| `digit` | `range(min: 0, max: 100000)` |
+| `float` | `range(min: 0.0, max: 1000.0)` |
+| `bool` | 50/50 随机 |
+| `time` | 按 rate 递增 |
+| `ip` | `ipv4(pool: 1000)` |
+| `hex` | 随机 32 字符十六进制串 |
+
+#### 18.2.6 `inject` 块详解
+
+声明行 `inject for <rule> on [<streams>]` 指定目标规则和注入流。块体内每行声明一种模式：
+
+```
+mode_kw  percent  param=value ... ;
+```
+
+**模式语义：**
+
+| 模式 | 语义 | oracle 中的期望 |
+|------|------|----------------|
+| `hit` | 按目标规则构造"应命中"事件序列 | 必须出现对应命中记录 |
+| `near_miss` | 构造"接近命中但不命中"事件序列 | 不应出现命中记录 |
+| `non_hit` | 构造"与规则无关或同实体但显式不满足条件"的事件 | 不应出现命中记录 |
+
+**`near_miss` 细化（按规则结构）：**
+
+| 规则结构 | near_miss 默认行为 | 可覆盖参数 |
+|----------|--------------------|-----------|
+| 单步阈值 `count >= N` | 生成 `N-1` 条（差一条不命中） | `count_per_entity` |
+| 多步序列（A then B） | 只完成第一步，不产生第二步事件 | `steps_completed` |
+| 时间窗口 `match<:dur>` | 事件分散在窗口内但数量不足 | `within` |
+
+**`params` 约定：**
+- `params` 的可用字段取决于 `target_rule` 的规则结构。
+- 生成器从规则的 `match` 子句中提取阈值和窗口参数作为基准。
+- `inject` 行中的 `param=value` 允许覆盖这些基准值；未覆盖的参数使用规则中的原始值。
+
+#### 18.2.7 `faults` 块详解
+
+`faults` 控制事件的时序扰动，作用于生成后的全局事件流。
+
+| 扰动 | 语义 | 互斥性 |
+|------|------|--------|
+| `out_of_order` | 交换相邻事件的发送顺序（事件时间不变，到达顺序乱） | 一条事件最多命中一种 fault |
+| `late` | 将事件的发送时间推迟到 watermark 之后（可能被引擎 drop） | 同上 |
+| `duplicate` | 复制一份事件再发一次 | 同上 |
+| `drop` | 生成但不发送（oracle 中仍标记为已生成） | 同上 |
+
+处理顺序：生成器先生成完整事件流，再按各项比例随机标记 fault 类型（互斥），最后按 fault 类型变换发送行为。
+
+#### 18.2.8 `oracle` 块详解
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `time_tolerance` | DURATION | `1s` | verify 阶段 emit_time 比对容差 |
+| `score_tolerance` | NUMBER | `0.01` | verify 阶段 score 比对容差 |
+
+省略 `oracle` 块时等价于不生成 oracle（P0 行为）。存在 `oracle` 块即表示启用 oracle 生成。
+
+### 18.3 输出契约
+
+- `out/events/*.jsonl|parquet|arrow`：生成事件流（`--format` 指定，默认 `jsonl`）。
+- `out/oracle/alerts.jsonl`：期望告警（**仅当 `.wsc` 中存在 `oracle` 块时生成**；省略 `oracle` 块则不产出此文件）。
+- `out/manifest.json`：输入快照、hash、seed、统计信息。
+
+`manifest.json`（关键字段）：
+
+```json
+{
+  "version": "v1",
+  "seed": 42,
+  "inputs": {
+    "ws_sha256": "...",
+    "wfl_sha256": "...",
+    "wsc_sha256": "..."
+  },
+  "outputs": {
+    "events_count": 200000,
+    "oracle_count": 1234,
+    "oracle_enabled": true
+  }
+}
+```
+
+### 18.4 Oracle 生成策略
+
+| 阶段 | Oracle 来源 | 说明 |
+|------|-------------|------|
+| P0 | 不生成（`.wsc` 中无 `oracle` 块） | 仅做数据可复现与吞吐链路验证 |
+| P1 | rule-aware + 独立求值器（Reference Evaluator） | 用规则语义计算期望命中，避免"生成逻辑=验证逻辑"同源偏差 |
+| P2 | 在 P1 基础上叠加时序扰动求值 | 生成延迟/乱序下的期望结果 |
+
+**Reference Evaluator 定位：**
+- 复用 `.wfl` compiler 的 RulePlan 输出，但运行在单线程、无时序扰动的理想环境中（事件严格按事件时间排序、无迟到/乱序）。
+- 与生产 MatchEngine 共享 RulePlan 结构，但执行路径独立（无 watermark/背压），因此可检出生产引擎在时序处理中引入的偏差。
+
+**模式与 Oracle 的对应关系：**
+
+| 模式 | Oracle 期望 |
+|------|-------------|
+| `hit` | 必须出现对应命中记录 |
+| `near_miss` | 不应命中 |
+| `non_hit` | 不应命中 |
+
+### 18.5 Verify 匹配规则
+
+- `wf-datagen verify` 对比 `actual_alerts` 与 `oracle`，输出 `verify_report.json` 与 `verify_report.md`。
+- 差异分类：`missing` / `unexpected` / `field_mismatch`。
+
+匹配规则：
+
+| 项 | 规则 |
+|----|------|
+| 匹配键 | `(rule_name, entity_type, entity_id, close_reason)`（均为 yield 系统字段） |
+| 时间配对 | 同一匹配键下按 `abs(actual.emit_time - oracle.emit_time)` 最小贪心配对 |
+| 时间容差 | 配对后 `abs(actual.emit_time - oracle.emit_time) <= time_tolerance`，超出则计入 `field_mismatch`（取 `.wsc` 中 `oracle.time_tolerance`，默认 `1s`） |
+| 分数容差 | `abs(actual.score - oracle.score) <= score_tolerance`（取 `.wsc` 中 `oracle.score_tolerance`，默认 `0.01`） |
+| 排序要求 | 无序比较（order-insensitive） |
+| 多对多 | 同一匹配键下按"时间差最小、分差最小"贪心配对；未配对项分别计入 `missing/unexpected` |
+
+最小差异报告结构：
+
+```json
+{
+  "status": "fail",
+  "summary": {
+    "oracle_total": 1234,
+    "actual_total": 1231,
+    "missing": 14,
+    "unexpected": 11,
+    "field_mismatch": 9
+  }
+}
+```
+
+### 18.6 端到端数据流（gen -> run -> verify）
+
+```text
+*.wsc + *.ws + *.wfl
+         │
+    wf-datagen gen
+         │
+   ┌─────┴─────────────┐
+   │                    │
+out/events/*    out/oracle/alerts.jsonl
+   │                    │
+wf run --replay         │
+   │                    │
+actual_alerts.jsonl     │
+   │                    │
+   └──────┬─────────────┘
+          │
+   wf-datagen verify
+          │
+verify_report.json/.md
+```
+
+说明：
+- 回放默认走 `wf run --replay` 文件输入路径（绕过 TCP）。
+- 若需覆盖 Receiver/TCP 链路，可启用 `wf-replay-sender --tcp` 模式发送 length-prefixed 帧。
+
+### 18.7 CLI 约定
+
+```bash
+# 生成
+wf-datagen gen \
+  --scenario tests/brute_force_load.wsc \
+  --format jsonl \
+  --out out/
+
+# 一致性校验（检查 .wsc 引用与 .ws/.wfl 的一致性）
+wf-datagen lint tests/brute_force_load.wsc
+
+# 对拍验证
+wf-datagen verify \
+  --actual out/actual_alerts.jsonl \
+  --oracle out/oracle/alerts.jsonl
+
+# 覆盖 ws/wfl 引用（调试用途）
+wf-datagen gen \
+  --scenario tests/brute_force_load.wsc \
+  --ws windows/security.ws \
+  --wfl rules/brute_force.wfl \
+  --out out/
+```
+
+### 18.8 CI 接入标准流程
+
+1. `wf-datagen gen` 生成 `events + oracle + manifest`。
+2. `wf run --replay out/events/*` 产出 `actual_alerts.jsonl`（可切换 TCP 回放模式）。
+3. `wf-datagen verify` 输出差异报告。
+4. CI 阻断条件（默认）：`missing == 0 && unexpected == 0 && field_mismatch == 0`。
+
+### 18.9 与 `contract` 的关系
+
+| 维度 | `contract`（§12.11） | `scenario`（`.wsc`） |
+|------|---------------------|---------------------|
+| 用途 | 单规则小样本精确断言 | 多规则大规模统计验证 |
+| 数据来源 | 手写 `row()`，逐条可控 | 生成器按分布自动产出 |
+| 期望结果 | 手写 `expect { hits; hit[i].score; ... }` | Reference Evaluator 自动生成 oracle |
+| 扰动 | 无（理想序列） | `faults` 支持乱序/迟到/重复/丢弃 |
+| 定位 | **单元测试**：验证单条规则的逻辑正确性 | **集成测试**：验证引擎在接近生产负载下的端到端正确性 |
+| CI 阶段 | PR 必跑（秒级） | 定时/Release 跑（分钟级） |
+
+两者互补：`contract` 先保证规则逻辑正确，`scenario` 再保证引擎处理正确。
+
+### 18.10 分阶段落地
+
+| 阶段 | 功能 | 依赖 |
+|------|------|------|
+| P0 | `.wsc` parser + schema 驱动随机生成 + seed 可复现 + JSONL/Arrow 输出 | `.ws` parser |
+| P1 | rule-aware（hit/near_miss/non_hit）+ Reference Evaluator + oracle 生成 + verify | `.wfl` compiler |
+| P2 | 时序扰动矩阵 + 压测模式 + PR 友好差异报告（md） | P1 |

@@ -133,6 +133,7 @@ impl RuleExecutor {
 ///
 /// - Maps `keys[i]` field name → `scope_key[i]` value (original type preserved)
 /// - Adds step labels as fields → `label` → `Value::Number(measure_value)`
+/// - Labels that collide with key names are silently skipped (keys take priority)
 fn build_eval_context(
     keys: &[FieldRef],
     scope_key: &[Value],
@@ -146,9 +147,11 @@ fn build_eval_context(
         fields.insert(name, val.clone());
     }
 
-    // Step labels → measure values
+    // Step labels → measure values (skip if name collides with a key field)
     for sd in step_data {
-        if let Some(label) = &sd.label {
+        if let Some(label) = &sd.label
+            && !fields.contains_key(label.as_str())
+        {
             fields.insert(label.clone(), Value::Number(sd.measure_value));
         }
     }
@@ -226,18 +229,43 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// Process-wide monotonic counter for alert_id uniqueness.
 static ALERT_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Percent-encode characters that would break alert_id structure.
+///
+/// Encodes `%`, `|`, `#`, and `\x1f` so the three-segment `|` split and
+/// the `#seq` suffix can always be parsed unambiguously.
+fn encode_alert_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '|' => out.push_str("%7C"),
+            '#' => out.push_str("%23"),
+            '\x1f' => out.push_str("%1F"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Build a composite alert id: `"rule|key1\x1fkey2|fired_at#seq"`.
 ///
-/// - Keys joined with `\x1f` (unit separator) to avoid value-containing-comma ambiguity
-/// - `seq` is a process-wide monotonic counter for same-millisecond uniqueness
+/// - Each key value is percent-encoded (`|` → `%7C`, `#` → `%23`, `%` → `%25`)
+///   so that the outer `|` split is always unambiguous.
+/// - Keys joined with `\x1f` (unit separator) to avoid multi-key ambiguity.
+/// - `seq` is a process-wide monotonic counter for same-millisecond uniqueness.
 fn build_alert_id(rule_name: &str, scope_key: &[Value], fired_at: &str) -> String {
+    let rule_enc = encode_alert_segment(rule_name);
     let keys_part = if scope_key.is_empty() {
         "global".to_string()
     } else {
-        scope_key.iter().map(value_to_string).collect::<Vec<_>>().join("\x1f")
+        scope_key
+            .iter()
+            .map(|v| encode_alert_segment(&value_to_string(v)))
+            .collect::<Vec<_>>()
+            .join("\x1f")
     };
     let seq = ALERT_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{}|{}|{}#{}", rule_name, keys_part, fired_at, seq)
+    format!("{}|{}|{}#{}", rule_enc, keys_part, fired_at, seq)
 }
 
 /// Build a human-readable summary.

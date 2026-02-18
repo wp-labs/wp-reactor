@@ -403,6 +403,41 @@ fn numeric_key_preserves_type_in_eval_context() {
 }
 
 // =========================================================================
+// Test 14: label does not overwrite key in eval context
+// =========================================================================
+
+#[test]
+fn label_cannot_overwrite_key_in_eval_context() {
+    // Key "sip" = "10.0.0.1" (string), label also named "sip" with measure 99.0.
+    // entity(ip, sip) should resolve to "10.0.0.1" (the key), not "99" (the label).
+    let match_plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch_with_label("fail", "sip", count_ge(1.0))])],
+    );
+    let plan = simple_rule_plan(
+        "r1",
+        match_plan,
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".to_string())),
+    );
+    let exec = RuleExecutor::new(plan);
+    let matched = MatchedContext {
+        rule_name: "r1".to_string(),
+        scope_key: vec![str_val("10.0.0.1")],
+        step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: Some("sip".to_string()),
+            measure_value: 99.0,
+        }],
+    };
+
+    let alert = exec.execute_match(&matched).unwrap();
+    // Key must win: entity_id should be "10.0.0.1", not "99"
+    assert_eq!(alert.entity_id, "10.0.0.1");
+}
+
+// =========================================================================
 // Test 14: alert_id unique across same millisecond
 // =========================================================================
 
@@ -433,6 +468,7 @@ fn alert_id_unique_across_same_millisecond() {
 #[test]
 fn alert_id_no_separator_ambiguity() {
     // Key values containing "," and "|" should not cause structural ambiguity
+    // because | in key values is percent-encoded to %7C.
     let match_plan = simple_plan(
         vec![simple_key("tag")],
         vec![step(vec![branch("src", count_ge(1.0))])],
@@ -456,17 +492,16 @@ fn alert_id_no_separator_ambiguity() {
     };
 
     let alert = exec.execute_match(&matched).unwrap();
-    // Split by "|" → ["r1", "a,b", "c|<fired_at>#<seq>"] is wrong if "|" in key
-    // But with the new format, keys use \x1f separator, so "|" splits into:
-    // [rule_name, keys_part, fired_at#seq]
-    let parts: Vec<&str> = alert.alert_id.splitn(3, '|').collect();
-    assert_eq!(parts.len(), 3, "alert_id should have exactly 3 '|'-delimited parts");
+    // With percent-encoding, "|" in key value becomes "%7C", so plain split works
+    let parts: Vec<&str> = alert.alert_id.split('|').collect();
+    assert_eq!(parts.len(), 3, "alert_id should have exactly 3 '|'-delimited parts, got: {:?}", parts);
     assert_eq!(parts[0], "r1");
-    // keys_part contains the literal "a,b|c" — the key value has a "|" in it,
-    // but splitn(3, '|') handles this because we limit to 3 splits
-    // Actually, the key contains "|" so the first "|" after rule_name is ambiguous.
-    // However the keys part uses \x1f as internal separator between multiple keys,
-    // and the structure is: rule_name | keys_part | fired_at#seq
-    // The fired_at part always contains a '#' followed by a number
+    // keys_part: "a,b|c" → "a,b%7Cc"
+    assert_eq!(parts[1], "a,b%7Cc");
+    // third part: fired_at#seq
     assert!(parts[2].contains('#'), "third part should contain '#seq'");
+    // Verify seq is a number after the last '#'
+    let ts_seq: Vec<&str> = parts[2].rsplitn(2, '#').collect();
+    assert_eq!(ts_seq.len(), 2);
+    assert!(ts_seq[0].parse::<u64>().is_ok(), "seq should be a number, got: {}", ts_seq[0]);
 }

@@ -1,0 +1,23 @@
+[package]
+name = "wf-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wf_runtime"
+
+[dependencies]
+wf-core = { path = "../wf-core" }
+wf-config = { path = "../wf-config" }
+wp-arrow = { path = "../../../wp-arrow" }
+arrow = { version = "54", default-features = false, features = ["ipc"] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt-multi-thread"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+anyhow.workspace = true
+log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+wp-arrow = { path = "../../../wp-arrow" }
+arrow = { version = "54", default-features = false, features = ["ipc"] }
