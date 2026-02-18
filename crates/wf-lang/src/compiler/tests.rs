@@ -569,10 +569,7 @@ rule r {
     );
     assert!(matches!(
         &plans[0].score_plan.expr,
-        Expr::BinOp {
-            op: BinOp::Add,
-            ..
-        }
+        Expr::BinOp { op: BinOp::Add, .. }
     ));
 }
 
@@ -628,10 +625,7 @@ rule r {
     assert!(bind.filter.is_some());
     assert!(matches!(
         bind.filter.as_ref().unwrap(),
-        Expr::BinOp {
-            op: BinOp::Eq,
-            ..
-        }
+        Expr::BinOp { op: BinOp::Eq, .. }
     ));
 }
 

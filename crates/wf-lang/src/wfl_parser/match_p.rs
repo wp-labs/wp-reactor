@@ -74,8 +74,8 @@ fn match_params(input: &mut &str) -> ModalResult<(Vec<FieldRef>, std::time::Dura
         vec![]
     } else {
         // Parse comma-separated field refs, then ':'
-        let keys: Vec<FieldRef> = separated(1.., field_ref, (ws_skip, literal(","), ws_skip))
-            .parse_next(input)?;
+        let keys: Vec<FieldRef> =
+            separated(1.., field_ref, (ws_skip, literal(","), ws_skip)).parse_next(input)?;
         ws_skip.parse_next(input)?;
         cut_err(literal(":")).parse_next(input)?;
         keys
@@ -287,7 +287,9 @@ fn pipe_chain(input: &mut &str) -> ModalResult<PipeChain> {
 }
 
 fn transform(input: &mut &str) -> ModalResult<Transform> {
-    kw("distinct").map(|_| Transform::Distinct).parse_next(input)
+    kw("distinct")
+        .map(|_| Transform::Distinct)
+        .parse_next(input)
 }
 
 fn measure(input: &mut &str) -> ModalResult<Measure> {

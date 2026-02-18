@@ -211,7 +211,10 @@ rule r {
         steps[1].branches[0].field,
         Some(FieldSelector::Dot("dport".into()))
     );
-    assert_eq!(steps[1].branches[0].pipe.transforms, vec![Transform::Distinct]);
+    assert_eq!(
+        steps[1].branches[0].pipe.transforms,
+        vec![Transform::Distinct]
+    );
     assert_eq!(steps[1].branches[0].pipe.measure, Measure::Count);
     assert_eq!(steps[1].branches[0].pipe.cmp, CmpOp::Gt);
 }
@@ -487,7 +490,11 @@ rule r {
 "#;
     let file = parse_wfl(input).unwrap();
     match &file.rules[0].score.expr {
-        Expr::BinOp { op: BinOp::Add, left, .. } => {
+        Expr::BinOp {
+            op: BinOp::Add,
+            left,
+            ..
+        } => {
             assert!(matches!(left.as_ref(), Expr::Neg(_)));
         }
         other => panic!("expected BinOp Add, got {other:?}"),
@@ -527,9 +534,7 @@ rule r {
     let file = parse_wfl(input).unwrap();
     let filter = file.rules[0].events.decls[0].filter.as_ref().unwrap();
     match filter {
-        Expr::InList {
-            negated, list, ..
-        } => {
+        Expr::InList { negated, list, .. } => {
             assert!(!negated);
             assert_eq!(list.len(), 3);
         }
@@ -623,10 +628,7 @@ rule brute_force_then_scan {
     assert_eq!(rule.match_clause.on_event.len(), 2);
     assert!(rule.match_clause.on_close.is_none());
     assert_eq!(rule.score.expr, Expr::Number(80.0));
-    assert_eq!(
-        rule.entity.entity_type,
-        EntityTypeVal::Ident("ip".into())
-    );
+    assert_eq!(rule.entity.entity_type, EntityTypeVal::Ident("ip".into()));
     assert_eq!(rule.yield_clause.target, "security_alerts");
     assert_eq!(rule.yield_clause.args.len(), 4);
 }
@@ -910,7 +912,9 @@ contract dns_no_response_timeout for dns_no_response {
     }
     match &c.expect[5] {
         ExpectStmt::HitAssert { assert, .. } => {
-            assert!(matches!(assert, HitAssert::Field { name, cmp: CmpOp::Eq, .. } if name == "domain"));
+            assert!(
+                matches!(assert, HitAssert::Field { name, cmp: CmpOp::Eq, .. } if name == "domain")
+            );
         }
         other => panic!("expected HitAssert field, got {other:?}"),
     }
@@ -1101,7 +1105,10 @@ contract brute_test for brute_force {
         .filter(|s| matches!(s, GivenStmt::Row { .. }))
         .collect();
     assert_eq!(rows.len(), 3);
-    assert_eq!(file.contracts[0].given[3], GivenStmt::Tick(Duration::from_secs(360)));
+    assert_eq!(
+        file.contracts[0].given[3],
+        GivenStmt::Tick(Duration::from_secs(360))
+    );
 }
 
 #[test]

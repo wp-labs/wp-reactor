@@ -118,7 +118,9 @@ fn guard_filter_skips() {
     // events not matching `action == "failed"` don't count
     let guard = Expr::BinOp {
         op: wf_lang::ast::BinOp::Eq,
-        left: Box::new(Expr::Field(wf_lang::ast::FieldRef::Simple("action".to_string()))),
+        left: Box::new(Expr::Field(wf_lang::ast::FieldRef::Simple(
+            "action".to_string(),
+        ))),
         right: Box::new(Expr::StringLit("failed".to_string())),
     };
 
@@ -150,7 +152,10 @@ fn guard_filter_skips() {
     // first failed event → accumulate
     assert_eq!(sm.advance("auth", &fail_event), StepResult::Accumulate);
     // second failed event → matched
-    assert!(matches!(sm.advance("auth", &fail_event), StepResult::Matched(_)));
+    assert!(matches!(
+        sm.advance("auth", &fail_event),
+        StepResult::Matched(_)
+    ));
 }
 
 #[test]
@@ -174,12 +179,7 @@ fn distinct_transform() {
     );
     let mut sm = CepStateMachine::new("rule6".to_string(), plan);
 
-    let mk = |port: f64| {
-        event(vec![
-            ("sip", str_val("10.0.0.1")),
-            ("dport", num(port)),
-        ])
-    };
+    let mk = |port: f64| event(vec![("sip", str_val("10.0.0.1")), ("dport", num(port))]);
 
     // port 22 twice — only counted once
     assert_eq!(sm.advance("conn", &mk(22.0)), StepResult::Accumulate);
@@ -189,7 +189,10 @@ fn distinct_transform() {
     assert_eq!(sm.advance("conn", &mk(80.0)), StepResult::Accumulate);
 
     // port 443 — count=3 > 2 → Matched
-    assert!(matches!(sm.advance("conn", &mk(443.0)), StepResult::Matched(_)));
+    assert!(matches!(
+        sm.advance("conn", &mk(443.0)),
+        StepResult::Matched(_)
+    ));
 }
 
 #[test]
@@ -250,12 +253,7 @@ fn sum_measure() {
     );
     let mut sm = CepStateMachine::new("rule9".to_string(), plan);
 
-    let mk = |bytes: f64| {
-        event(vec![
-            ("sip", str_val("10.0.0.1")),
-            ("bytes", num(bytes)),
-        ])
-    };
+    let mk = |bytes: f64| event(vec![("sip", str_val("10.0.0.1")), ("bytes", num(bytes))]);
 
     assert_eq!(sm.advance("traffic", &mk(400.0)), StepResult::Accumulate); // sum=400
     assert_eq!(sm.advance("traffic", &mk(500.0)), StepResult::Accumulate); // sum=900
@@ -321,10 +319,7 @@ fn numeric_key_type_preserved_through_pipeline() {
     );
     let mut sm = CepStateMachine::new("rule_num_key".to_string(), plan);
 
-    let e = event(vec![
-        ("sip", str_val("10.0.0.1")),
-        ("dport", num(443.0)),
-    ]);
+    let e = event(vec![("sip", str_val("10.0.0.1")), ("dport", num(443.0))]);
     if let StepResult::Matched(ctx) = sm.advance("conn", &e) {
         assert_eq!(ctx.scope_key.len(), 2);
         assert_eq!(ctx.scope_key[0], str_val("10.0.0.1"));

@@ -87,11 +87,7 @@ mod tests {
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
             Field::new("value", DataType::Int64, false),
         ]))
     }
@@ -137,10 +133,8 @@ mod tests {
 
     #[test]
     fn route_delivers_to_local_windows() {
-        let reg = WindowRegistry::build(vec![
-            make_def("win_a", vec!["events"], DistMode::Local),
-        ])
-        .unwrap();
+        let reg = WindowRegistry::build(vec![make_def("win_a", vec!["events"], DistMode::Local)])
+            .unwrap();
         let router = Router::new(reg);
 
         let schema = test_schema();
@@ -161,9 +155,11 @@ mod tests {
 
     #[test]
     fn route_skips_non_local() {
-        let reg = WindowRegistry::build(vec![
-            make_def("win_rep", vec!["data"], DistMode::Replicated),
-        ])
+        let reg = WindowRegistry::build(vec![make_def(
+            "win_rep",
+            vec!["data"],
+            DistMode::Replicated,
+        )])
         .unwrap();
         let router = Router::new(reg);
 
@@ -184,10 +180,9 @@ mod tests {
 
     #[test]
     fn route_drops_late_data() {
-        let reg = WindowRegistry::build(vec![
-            make_def("win_late", vec!["stream"], DistMode::Local),
-        ])
-        .unwrap();
+        let reg =
+            WindowRegistry::build(vec![make_def("win_late", vec!["stream"], DistMode::Local)])
+                .unwrap();
         let router = Router::new(reg);
 
         let schema = test_schema();
@@ -214,10 +209,8 @@ mod tests {
 
     #[test]
     fn route_unknown_stream_noop() {
-        let reg = WindowRegistry::build(vec![
-            make_def("win_x", vec!["known"], DistMode::Local),
-        ])
-        .unwrap();
+        let reg =
+            WindowRegistry::build(vec![make_def("win_x", vec!["known"], DistMode::Local)]).unwrap();
         let router = Router::new(reg);
 
         let schema = test_schema();

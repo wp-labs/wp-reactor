@@ -10,7 +10,7 @@ use winnow::token::{literal, take_while};
 // Identifiers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn ident<'a>(input: &mut &'a str) -> ModalResult<&'a str> {
+pub fn ident<'a>(input: &mut &'a str) -> ModalResult<&'a str> {
     // First character must be alphabetic or underscore (not digit).
     if !input.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
         return Err(ErrMode::Backtrack(ContextError::new()));
@@ -22,7 +22,7 @@ pub(crate) fn ident<'a>(input: &mut &'a str) -> ModalResult<&'a str> {
 // Strings
 // ---------------------------------------------------------------------------
 
-pub(crate) fn quoted_string(input: &mut &str) -> ModalResult<String> {
+pub fn quoted_string(input: &mut &str) -> ModalResult<String> {
     literal("\"").parse_next(input)?;
     let content = take_while(0.., |c: char| c != '"').parse_next(input)?;
     winnow::combinator::cut_err(literal("\""))
@@ -37,7 +37,7 @@ pub(crate) fn quoted_string(input: &mut &str) -> ModalResult<String> {
 // Duration
 // ---------------------------------------------------------------------------
 
-pub(crate) fn duration_value(input: &mut &str) -> ModalResult<Duration> {
+pub fn duration_value(input: &mut &str) -> ModalResult<Duration> {
     let digits = take_while(1.., |c: char| c.is_ascii_digit()).parse_next(input)?;
     let num: u64 = digits
         .parse()
@@ -74,7 +74,7 @@ pub(crate) fn duration_value(input: &mut &str) -> ModalResult<Duration> {
 // ---------------------------------------------------------------------------
 
 /// Skip whitespace and `# ...` line comments.
-pub(crate) fn ws_skip(input: &mut &str) -> ModalResult<()> {
+pub fn ws_skip(input: &mut &str) -> ModalResult<()> {
     loop {
         let _ = multispace0.parse_next(input)?;
         if opt(literal("#")).parse_next(input)?.is_some() {
@@ -92,7 +92,7 @@ pub(crate) fn ws_skip(input: &mut &str) -> ModalResult<()> {
 
 /// Match an exact keyword string, ensuring it's not a prefix of a longer
 /// identifier (i.e. the next character is not alphanumeric or `_`).
-pub(crate) fn kw<'a>(keyword: &'static str) -> impl FnMut(&mut &'a str) -> ModalResult<()> {
+pub fn kw<'a>(keyword: &'static str) -> impl FnMut(&mut &'a str) -> ModalResult<()> {
     move |input: &mut &'a str| {
         let saved = *input;
         literal(keyword).parse_next(input)?;
@@ -105,7 +105,7 @@ pub(crate) fn kw<'a>(keyword: &'static str) -> impl FnMut(&mut &'a str) -> Modal
 }
 
 /// Parse a non-negative integer literal (digits only, no decimal point).
-pub(crate) fn nonneg_integer(input: &mut &str) -> ModalResult<usize> {
+pub fn nonneg_integer(input: &mut &str) -> ModalResult<usize> {
     let saved = *input;
     let digits = take_while(1.., |c: char| c.is_ascii_digit()).parse_next(input)?;
     // Reject if followed by decimal point (float, not integer)
@@ -124,7 +124,7 @@ pub(crate) fn nonneg_integer(input: &mut &str) -> ModalResult<usize> {
 // ---------------------------------------------------------------------------
 
 /// Parse a number literal: integer or float.
-pub(crate) fn number_literal(input: &mut &str) -> ModalResult<f64> {
+pub fn number_literal(input: &mut &str) -> ModalResult<f64> {
     let integer_part = take_while(1.., |c: char| c.is_ascii_digit()).parse_next(input)?;
     let has_dot = opt(literal(".")).parse_next(input)?.is_some();
     if has_dot {
@@ -143,4 +143,3 @@ pub(crate) fn number_literal(input: &mut &str) -> ModalResult<f64> {
         Ok(v)
     }
 }
-

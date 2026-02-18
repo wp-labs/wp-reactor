@@ -1,7 +1,7 @@
 use wf_lang::ast::{BinOp, Expr, FieldRef};
 
-use crate::rule::match_engine::{CloseOutput, CloseReason, MatchedContext, StepData};
 use crate::rule::RuleExecutor;
+use crate::rule::match_engine::{CloseOutput, CloseReason, MatchedContext, StepData};
 
 use super::helpers::*;
 
@@ -494,7 +494,12 @@ fn alert_id_no_separator_ambiguity() {
     let alert = exec.execute_match(&matched).unwrap();
     // With percent-encoding, "|" in key value becomes "%7C", so plain split works
     let parts: Vec<&str> = alert.alert_id.split('|').collect();
-    assert_eq!(parts.len(), 3, "alert_id should have exactly 3 '|'-delimited parts, got: {:?}", parts);
+    assert_eq!(
+        parts.len(),
+        3,
+        "alert_id should have exactly 3 '|'-delimited parts, got: {:?}",
+        parts
+    );
     assert_eq!(parts[0], "r1");
     // keys_part: "a,b|c" → "a,b%7Cc"
     assert_eq!(parts[1], "a,b%7Cc");
@@ -503,5 +508,9 @@ fn alert_id_no_separator_ambiguity() {
     // Verify seq is a number after the last '#'
     let ts_seq: Vec<&str> = parts[2].rsplitn(2, '#').collect();
     assert_eq!(ts_seq.len(), 2);
-    assert!(ts_seq[0].parse::<u64>().is_ok(), "seq should be a number, got: {}", ts_seq[0]);
+    assert!(
+        ts_seq[0].parse::<u64>().is_ok(),
+        "seq should be a number, got: {}",
+        ts_seq[0]
+    );
 }

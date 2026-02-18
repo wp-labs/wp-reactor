@@ -1,8 +1,8 @@
 use crate::ast::{BinOp, Expr, FieldRef, FieldSelector, Measure, StepBranch, Transform};
 use crate::schema::BaseType;
 
-use super::scope::Scope;
 use super::CheckError;
+use super::scope::Scope;
 
 // ---------------------------------------------------------------------------
 // ValType — lightweight type representation for semantic checks
@@ -106,15 +106,9 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
         Expr::BinOp { op, left, right } => infer_binop(*op, left, right, scope),
         Expr::Neg(inner) => {
             let t = infer_type(inner, scope)?;
-            if is_numeric(&t) {
-                Some(t)
-            } else {
-                None
-            }
+            if is_numeric(&t) { Some(t) } else { None }
         }
-        Expr::FuncCall {
-            name, args, ..
-        } => infer_func_call(name, args, scope),
+        Expr::FuncCall { name, args, .. } => infer_func_call(name, args, scope),
         Expr::InList { .. } => Some(ValType::Bool),
     }
 }
@@ -169,111 +163,119 @@ pub fn check_expr_type(
                 BinOp::And | BinOp::Or => {
                     // T9: both sides must be bool
                     if let Some(ref t) = lt
-                        && !compatible(t, &ValType::Bool) {
-                            errors.push(CheckError {
-                                rule: Some(rule_name.to_string()),
-                                contract: None,
-                                message: format!(
-                                    "logical `{}` requires bool operands, left side is {:?}",
-                                    op_symbol(*op),
-                                    t
-                                ),
-                            });
-                        }
+                        && !compatible(t, &ValType::Bool)
+                    {
+                        errors.push(CheckError {
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "logical `{}` requires bool operands, left side is {:?}",
+                                op_symbol(*op),
+                                t
+                            ),
+                        });
+                    }
                     if let Some(ref t) = rt
-                        && !compatible(t, &ValType::Bool) {
-                            errors.push(CheckError {
-                                rule: Some(rule_name.to_string()),
-                                contract: None,
-                                message: format!(
-                                    "logical `{}` requires bool operands, right side is {:?}",
-                                    op_symbol(*op),
-                                    t
-                                ),
-                            });
-                        }
+                        && !compatible(t, &ValType::Bool)
+                    {
+                        errors.push(CheckError {
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "logical `{}` requires bool operands, right side is {:?}",
+                                op_symbol(*op),
+                                t
+                            ),
+                        });
+                    }
                 }
                 BinOp::Eq | BinOp::Ne => {
                     // T7: both sides must have compatible types
                     if let (Some(l), Some(r)) = (&lt, &rt)
-                        && !compatible(l, r) {
-                            errors.push(CheckError {
-                                rule: Some(rule_name.to_string()),
-                                contract: None,
-                                message: format!(
-                                    "`{}` comparison between incompatible types {:?} and {:?}",
-                                    op_symbol(*op),
-                                    l,
-                                    r
-                                ),
-                            });
-                        }
+                        && !compatible(l, r)
+                    {
+                        errors.push(CheckError {
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "`{}` comparison between incompatible types {:?} and {:?}",
+                                op_symbol(*op),
+                                l,
+                                r
+                            ),
+                        });
+                    }
                 }
                 BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                     // T8: both sides must be numeric
                     if let Some(ref t) = lt
-                        && !is_numeric(t) {
-                            errors.push(CheckError {
-                                rule: Some(rule_name.to_string()),
-                                contract: None,
-                                message: format!(
-                                    "ordering `{}` requires numeric operands, left side is {:?}",
-                                    op_symbol(*op),
-                                    t
-                                ),
-                            });
-                        }
+                        && !is_numeric(t)
+                    {
+                        errors.push(CheckError {
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "ordering `{}` requires numeric operands, left side is {:?}",
+                                op_symbol(*op),
+                                t
+                            ),
+                        });
+                    }
                     if let Some(ref t) = rt
-                        && !is_numeric(t) {
-                            errors.push(CheckError {
-                                rule: Some(rule_name.to_string()),
-                                contract: None,
-                                message: format!(
-                                    "ordering `{}` requires numeric operands, right side is {:?}",
-                                    op_symbol(*op),
-                                    t
-                                ),
-                            });
-                        }
+                        && !is_numeric(t)
+                    {
+                        errors.push(CheckError {
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "ordering `{}` requires numeric operands, right side is {:?}",
+                                op_symbol(*op),
+                                t
+                            ),
+                        });
+                    }
                 }
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                     if let Some(ref t) = lt
-                        && !is_numeric(t) {
-                            errors.push(CheckError {
-                                rule: Some(rule_name.to_string()),
-                                contract: None,
-                                message: format!(
-                                    "arithmetic `{}` requires numeric operands, left side is {:?}",
-                                    op_symbol(*op),
-                                    t
-                                ),
-                            });
-                        }
+                        && !is_numeric(t)
+                    {
+                        errors.push(CheckError {
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "arithmetic `{}` requires numeric operands, left side is {:?}",
+                                op_symbol(*op),
+                                t
+                            ),
+                        });
+                    }
                     if let Some(ref t) = rt
-                        && !is_numeric(t) {
-                            errors.push(CheckError {
-                                rule: Some(rule_name.to_string()),
-                                contract: None,
-                                message: format!(
-                                    "arithmetic `{}` requires numeric operands, right side is {:?}",
-                                    op_symbol(*op),
-                                    t
-                                ),
-                            });
-                        }
+                        && !is_numeric(t)
+                    {
+                        errors.push(CheckError {
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "arithmetic `{}` requires numeric operands, right side is {:?}",
+                                op_symbol(*op),
+                                t
+                            ),
+                        });
+                    }
                 }
             }
         }
         Expr::Neg(inner) => {
             check_expr_type(inner, scope, rule_name, errors);
             if let Some(ref t) = infer_type(inner, scope)
-                && !is_numeric(t) {
-                    errors.push(CheckError {
-                        rule: Some(rule_name.to_string()),
-                        contract: None,
-                        message: format!("unary negation requires numeric operand, got {:?}", t),
-                    });
-                }
+                && !is_numeric(t)
+            {
+                errors.push(CheckError {
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!("unary negation requires numeric operand, got {:?}", t),
+                });
+            }
         }
         Expr::FuncCall { name, args, .. } => {
             for arg in args {
@@ -281,7 +283,9 @@ pub fn check_expr_type(
             }
             check_func_call(name, args, scope, rule_name, errors);
         }
-        Expr::InList { expr: inner, list, .. } => {
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
             check_expr_type(inner, scope, rule_name, errors);
             for item in list {
                 check_expr_type(item, scope, rule_name, errors);
@@ -326,31 +330,27 @@ fn check_func_call(
             // T1: field must be digit or float
             if let Some(arg) = args.first()
                 && let Some(t) = infer_type(arg, scope)
-                    && !is_numeric(&t) {
-                        errors.push(CheckError {
-                            rule: Some(rule_name.to_string()),
-                            contract: None,
-                            message: format!(
-                                "{}() requires a numeric field, got {:?}",
-                                name, t
-                            ),
-                        });
-                    }
+                && !is_numeric(&t)
+            {
+                errors.push(CheckError {
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!("{}() requires a numeric field, got {:?}", name, t),
+                });
+            }
         }
         "min" | "max" => {
             // T2: field must be orderable
             if let Some(arg) = args.first()
                 && let Some(t) = infer_type(arg, scope)
-                    && !is_orderable(&t) {
-                        errors.push(CheckError {
-                            rule: Some(rule_name.to_string()),
-                            contract: None,
-                            message: format!(
-                                "{}() requires an orderable field, got {:?}",
-                                name, t
-                            ),
-                        });
-                    }
+                && !is_orderable(&t)
+            {
+                errors.push(CheckError {
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!("{}() requires an orderable field, got {:?}", name, t),
+                });
+            }
         }
         _ => {}
     }
@@ -414,18 +414,19 @@ pub fn check_pipe_chain(
         Measure::Sum | Measure::Avg => {
             // T1: field must be numeric
             if let Some(ref vt) = field_val_type
-                && !is_numeric(vt) {
-                    errors.push(CheckError {
-                        rule: Some(rule_name.to_string()),
-                        contract: None,
-                        message: format!(
-                            "{}() requires a numeric field, `{}` is {:?}",
-                            measure_name(branch.pipe.measure),
-                            field_selector_name(branch.field.as_ref().unwrap()),
-                            vt
-                        ),
-                    });
-                }
+                && !is_numeric(vt)
+            {
+                errors.push(CheckError {
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!(
+                        "{}() requires a numeric field, `{}` is {:?}",
+                        measure_name(branch.pipe.measure),
+                        field_selector_name(branch.field.as_ref().unwrap()),
+                        vt
+                    ),
+                });
+            }
             if !has_field {
                 errors.push(CheckError {
                     rule: Some(rule_name.to_string()),
@@ -440,18 +441,19 @@ pub fn check_pipe_chain(
         Measure::Min | Measure::Max => {
             // T2: field must be orderable
             if let Some(ref vt) = field_val_type
-                && !is_orderable(vt) {
-                    errors.push(CheckError {
-                        rule: Some(rule_name.to_string()),
-                        contract: None,
-                        message: format!(
-                            "{}() requires an orderable field, `{}` is {:?}",
-                            measure_name(branch.pipe.measure),
-                            field_selector_name(branch.field.as_ref().unwrap()),
-                            vt
-                        ),
-                    });
-                }
+                && !is_orderable(vt)
+            {
+                errors.push(CheckError {
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!(
+                        "{}() requires an orderable field, `{}` is {:?}",
+                        measure_name(branch.pipe.measure),
+                        field_selector_name(branch.field.as_ref().unwrap()),
+                        vt
+                    ),
+                });
+            }
             if !has_field {
                 errors.push(CheckError {
                     rule: Some(rule_name.to_string()),

@@ -3,12 +3,12 @@ use std::collections::HashSet;
 use crate::ast::{FieldRef, FieldSelector, MatchStep, RuleDecl};
 use crate::schema::WindowSchema;
 
+use super::CheckError;
 use super::scope::Scope;
 use super::types::{
-    check_expr_type, check_pipe_chain, compatible, infer_type, is_numeric,
-    is_scalar_identity, ValType,
+    ValType, check_expr_type, check_pipe_chain, compatible, infer_type, is_numeric,
+    is_scalar_identity,
 };
-use super::CheckError;
 
 /// System fields that must not appear in yield named arguments.
 const SYSTEM_FIELDS: &[&str] = &[
@@ -33,7 +33,13 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
 
     // Check match steps (shared labels_seen across on_event and on_close)
     let mut labels_seen = HashSet::new();
-    check_match_steps(&rule.match_clause.on_event, &scope, name, errors, &mut labels_seen);
+    check_match_steps(
+        &rule.match_clause.on_event,
+        &scope,
+        name,
+        errors,
+        &mut labels_seen,
+    );
     if let Some(ref close_steps) = rule.match_clause.on_close {
         check_match_steps(close_steps, &scope, name, errors, &mut labels_seen);
     }
@@ -252,13 +258,14 @@ fn check_match_steps<'a>(
 
             // R1: label uniqueness within this match block
             if let Some(ref label) = branch.label
-                && !labels_seen.insert(label.as_str()) {
-                    errors.push(CheckError {
-                        rule: Some(rule_name.to_string()),
-                        contract: None,
-                        message: format!("duplicate step label `{}`", label),
-                    });
-                }
+                && !labels_seen.insert(label.as_str())
+            {
+                errors.push(CheckError {
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!("duplicate step label `{}`", label),
+                });
+            }
 
             // Validate field selector resolves against source's window
             if let Some(ref fs) = branch.field {
@@ -294,13 +301,14 @@ fn check_score(rule: &RuleDecl, scope: &Scope<'_>, errors: &mut Vec<CheckError>)
     check_expr_type(&rule.score.expr, scope, name, errors);
 
     if let Some(t) = infer_type(&rule.score.expr, scope)
-        && !is_numeric(&t) {
-            errors.push(CheckError {
-                rule: Some(name.to_string()),
-                contract: None,
-                message: format!("score expression must be numeric, got {:?}", t),
-            });
-        }
+        && !is_numeric(&t)
+    {
+        errors.push(CheckError {
+            rule: Some(name.to_string()),
+            contract: None,
+            message: format!("score expression must be numeric, got {:?}", t),
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -312,8 +320,9 @@ fn check_entity(rule: &RuleDecl, scope: &Scope<'_>, errors: &mut Vec<CheckError>
     check_expr_type(&rule.entity.id_expr, scope, name, errors);
 
     if let Some(t) = infer_type(&rule.entity.id_expr, scope)
-        && !is_scalar_identity(&t) {
-            errors.push(CheckError {
+        && !is_scalar_identity(&t)
+    {
+        errors.push(CheckError {
                 rule: Some(name.to_string()),
                 contract: None,
                 message: format!(
@@ -321,7 +330,7 @@ fn check_entity(rule: &RuleDecl, scope: &Scope<'_>, errors: &mut Vec<CheckError>
                     t
                 ),
             });
-        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -345,7 +354,7 @@ fn check_yield(
                 rule: Some(name.to_string()),
                 contract: None,
                 message: format!("yield target window `{}` does not exist", yc.target),
-            });// Can't check further without schema
+            }); // Can't check further without schema
         }
         Some(ws) => {
             // Y1: target window must be an output window (stream is empty)
@@ -391,8 +400,7 @@ fn check_yield(
                         // T10: type must match
                         check_expr_type(&arg.value, scope, name, errors);
                         if let Some(val_type) = infer_type(&arg.value, scope) {
-                            let expected =
-                                super::scope::field_type_to_val(&fd.field_type);
+                            let expected = super::scope::field_type_to_val(&fd.field_type);
                             if !compatible(&expected, &val_type) {
                                 errors.push(CheckError {
                                     rule: Some(name.to_string()),

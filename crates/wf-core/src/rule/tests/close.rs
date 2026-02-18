@@ -124,14 +124,25 @@ fn on_close_trigger_eval() {
     let resp = event(vec![("sip", str_val("10.0.0.1"))]);
 
     // req → Advance (event step done)
-    assert_eq!(sm.advance_with_instant("req", &req, now), StepResult::Advance);
+    assert_eq!(
+        sm.advance_with_instant("req", &req, now),
+        StepResult::Advance
+    );
 
     // 2 resp events → accumulate close step data
-    assert_eq!(sm.advance_with_instant("resp", &resp, now), StepResult::Accumulate);
-    assert_eq!(sm.advance_with_instant("resp", &resp, now), StepResult::Accumulate);
+    assert_eq!(
+        sm.advance_with_instant("resp", &resp, now),
+        StepResult::Accumulate
+    );
+    assert_eq!(
+        sm.advance_with_instant("resp", &resp, now),
+        StepResult::Accumulate
+    );
 
     // Close explicitly
-    let out = sm.close(&[str_val("10.0.0.1")], CloseReason::Flush).unwrap();
+    let out = sm
+        .close(&[str_val("10.0.0.1")], CloseReason::Flush)
+        .unwrap();
     assert!(out.event_ok);
     assert!(out.close_ok);
     assert_eq!(out.close_step_data[0].measure_value, 2.0);
@@ -201,17 +212,14 @@ fn close_step_accumulation() {
     sm.advance_with_instant("req", &req, now);
 
     // Accumulate traffic
-    let mk = |bytes: f64| {
-        event(vec![
-            ("sip", str_val("10.0.0.1")),
-            ("bytes", num(bytes)),
-        ])
-    };
+    let mk = |bytes: f64| event(vec![("sip", str_val("10.0.0.1")), ("bytes", num(bytes))]);
     sm.advance_with_instant("traffic", &mk(400.0), now);
     sm.advance_with_instant("traffic", &mk(700.0), now);
 
     // Close: sum = 1100 >= 1000 → close_ok
-    let out = sm.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out = sm
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(out.event_ok);
     assert!(out.close_ok);
     assert!((out.close_step_data[0].measure_value - 1100.0).abs() < f64::EPSILON);
@@ -244,13 +252,17 @@ fn close_reason_guard_filters() {
     let now = Instant::now();
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
     sm1.advance_with_instant("req", &req, now);
-    let out1 = sm1.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out1 = sm1
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(out1.close_ok);
 
     // Scenario 2: close with Flush → guard fails → close_ok=false
     let mut sm2 = CepStateMachine::new("rule18b".to_string(), plan);
     sm2.advance_with_instant("req", &req, now);
-    let out2 = sm2.close(&[str_val("10.0.0.1")], CloseReason::Flush).unwrap();
+    let out2 = sm2
+        .close(&[str_val("10.0.0.1")], CloseReason::Flush)
+        .unwrap();
     assert!(!out2.close_ok);
 }
 
@@ -347,14 +359,18 @@ fn multiple_close_steps_all_must_pass() {
     let mut sm_a = CepStateMachine::new("rule21a".to_string(), plan.clone());
     sm_a.advance_with_instant("req", &req, now);
     sm_a.advance_with_instant("resp", &resp, now);
-    let out_a = sm_a.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out_a = sm_a
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(out_a.event_ok);
     assert!(out_a.close_ok);
 
     // Scenario B: no resp → close step 1 fails (count 0 < 1)
     let mut sm_b = CepStateMachine::new("rule21b".to_string(), plan.clone());
     sm_b.advance_with_instant("req", &req, now);
-    let out_b = sm_b.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out_b = sm_b
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(out_b.event_ok);
     assert!(!out_b.close_ok);
 
@@ -364,7 +380,9 @@ fn multiple_close_steps_all_must_pass() {
     sm_c.advance_with_instant("resp", &resp, now);
     let err = event(vec![("sip", str_val("10.0.0.1"))]);
     sm_c.advance_with_instant("error", &err, now);
-    let out_c = sm_c.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out_c = sm_c
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(out_c.event_ok);
     assert!(!out_c.close_ok);
 }

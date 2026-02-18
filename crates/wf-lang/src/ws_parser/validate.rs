@@ -15,23 +15,20 @@ pub(super) fn validate_schemas(windows: &[WindowSchema]) -> anyhow::Result<()> {
         if w.over > Duration::ZERO {
             // time attribute is required
             let time_field = w.time_field.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "window '{}': over > 0 requires a 'time' attribute",
-                    w.name
-                )
+                anyhow::anyhow!("window '{}': over > 0 requires a 'time' attribute", w.name)
             })?;
             // Referenced field must exist
-            let field =
-                w.fields
-                    .iter()
-                    .find(|f| f.name == *time_field)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "window '{}': time field '{}' not found in fields",
-                            w.name,
-                            time_field
-                        )
-                    })?;
+            let field = w
+                .fields
+                .iter()
+                .find(|f| f.name == *time_field)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "window '{}': time field '{}' not found in fields",
+                        w.name,
+                        time_field
+                    )
+                })?;
             // Must be of type time
             if field.field_type != FieldType::Base(BaseType::Time) {
                 anyhow::bail!(

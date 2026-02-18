@@ -1,7 +1,15 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git remote add:*)"
+      "Bash(git remote add:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(cargo doc:*)",
+      "Bash(wc:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo run:*)",
+      "Bash(python3:*)"
     ]
   }
 }

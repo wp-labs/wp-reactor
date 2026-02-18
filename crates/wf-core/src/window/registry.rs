@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use arrow::record_batch::RecordBatch;
 use wf_config::{DistMode, WindowConfig};
 
@@ -47,7 +47,10 @@ impl std::fmt::Debug for WindowRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WindowRegistry")
             .field("window_count", &self.windows.len())
-            .field("subscription_streams", &self.subscriptions.keys().collect::<Vec<_>>())
+            .field(
+                "subscription_streams",
+                &self.subscriptions.keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -174,11 +177,7 @@ mod tests {
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
             Field::new("value", DataType::Int64, false),
         ]))
     }
@@ -256,17 +255,18 @@ mod tests {
         ]);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("duplicate"), "error should mention duplicate: {msg}");
+        assert!(
+            msg.contains("duplicate"),
+            "error should mention duplicate: {msg}"
+        );
     }
 
     // -- 3. route_single_stream ----------------------------------------------
 
     #[test]
     fn route_single_stream() {
-        let reg = WindowRegistry::build(vec![
-            make_def("win_auth", vec!["auth"], DistMode::Local),
-        ])
-        .unwrap();
+        let reg = WindowRegistry::build(vec![make_def("win_auth", vec!["auth"], DistMode::Local)])
+            .unwrap();
 
         let schema = test_schema();
         let batch = make_batch(&schema, &[1_000_000_000], &[42]);
@@ -281,9 +281,11 @@ mod tests {
 
     #[test]
     fn route_multi_stream_union() {
-        let reg = WindowRegistry::build(vec![
-            make_def("logs", vec!["syslog", "winlog"], DistMode::Local),
-        ])
+        let reg = WindowRegistry::build(vec![make_def(
+            "logs",
+            vec!["syslog", "winlog"],
+            DistMode::Local,
+        )])
         .unwrap();
 
         let schema = test_schema();
@@ -322,10 +324,8 @@ mod tests {
 
     #[test]
     fn route_unknown_stream_is_noop() {
-        let reg = WindowRegistry::build(vec![
-            make_def("win_x", vec!["known"], DistMode::Local),
-        ])
-        .unwrap();
+        let reg =
+            WindowRegistry::build(vec![make_def("win_x", vec!["known"], DistMode::Local)]).unwrap();
 
         let schema = test_schema();
         // Route to a stream with no subscribers.
@@ -341,10 +341,8 @@ mod tests {
 
     #[test]
     fn snapshot_through_registry() {
-        let reg = WindowRegistry::build(vec![
-            make_def("snap_win", vec!["data"], DistMode::Local),
-        ])
-        .unwrap();
+        let reg = WindowRegistry::build(vec![make_def("snap_win", vec!["data"], DistMode::Local)])
+            .unwrap();
 
         let schema = test_schema();
         reg.route("data", make_batch(&schema, &[1_000_000_000], &[100]))

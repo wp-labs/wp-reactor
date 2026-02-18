@@ -1,15 +1,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use wf_lang::ast::FieldRef;
 use wf_lang::plan::RulePlan;
 
 use crate::alert::AlertRecord;
 use crate::rule::match_engine::{
-    eval_expr, field_ref_name, value_to_string, CloseOutput, Event, MatchedContext, StepData,
-    Value,
+    CloseOutput, Event, MatchedContext, StepData, Value, eval_expr, field_ref_name, value_to_string,
 };
 
 // ---------------------------------------------------------------------------
@@ -45,11 +44,7 @@ impl RuleExecutor {
         let score = eval_score(&self.plan.score_plan.expr, &ctx)?;
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, &ctx)?;
         let fired_at = format_fired_at(SystemTime::now());
-        let alert_id = build_alert_id(
-            &self.plan.name,
-            &matched.scope_key,
-            &fired_at,
-        );
+        let alert_id = build_alert_id(&self.plan.name, &matched.scope_key, &fired_at);
         let summary = build_summary(
             &self.plan.name,
             &self.plan.match_plan.keys,
@@ -88,21 +83,13 @@ impl RuleExecutor {
             .cloned()
             .collect();
 
-        let ctx = build_eval_context(
-            &self.plan.match_plan.keys,
-            &close.scope_key,
-            &all_step_data,
-        );
+        let ctx = build_eval_context(&self.plan.match_plan.keys, &close.scope_key, &all_step_data);
 
         let score = eval_score(&self.plan.score_plan.expr, &ctx)?;
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, &ctx)?;
         let close_reason_str = close.close_reason.as_str().to_string();
         let fired_at = format_fired_at(SystemTime::now());
-        let alert_id = build_alert_id(
-            &self.plan.name,
-            &close.scope_key,
-            &fired_at,
-        );
+        let alert_id = build_alert_id(&self.plan.name, &close.scope_key, &fired_at);
         let summary = build_summary(
             &self.plan.name,
             &self.plan.match_plan.keys,
@@ -134,11 +121,7 @@ impl RuleExecutor {
 /// - Maps `keys[i]` field name → `scope_key[i]` value (original type preserved)
 /// - Adds step labels as fields → `label` → `Value::Number(measure_value)`
 /// - Labels that collide with key names are silently skipped (keys take priority)
-fn build_eval_context(
-    keys: &[FieldRef],
-    scope_key: &[Value],
-    step_data: &[StepData],
-) -> Event {
+fn build_eval_context(keys: &[FieldRef], scope_key: &[Value], step_data: &[StepData]) -> Event {
     let mut fields = std::collections::HashMap::new();
 
     // Key fields — preserve original Value type
@@ -215,8 +198,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as u32; // day of era [0, 146096]
-    let yoe =
-        (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]

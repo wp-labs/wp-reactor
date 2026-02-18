@@ -1,0 +1,213 @@
+use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// Top-level
+// ---------------------------------------------------------------------------
+
+/// A complete `.wsc` scenario file.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct WscFile {
+    pub uses: Vec<UseDecl>,
+    pub scenario: ScenarioDecl,
+}
+
+/// `use "path.ws"` or `use "path.wfl"`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct UseDecl {
+    pub path: String,
+}
+
+// ---------------------------------------------------------------------------
+// Scenario
+// ---------------------------------------------------------------------------
+
+/// `scenario NAME seed NUMBER { ... }`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ScenarioDecl {
+    pub name: String,
+    pub seed: u64,
+    pub time_clause: TimeClause,
+    pub total: u64,
+    pub streams: Vec<StreamBlock>,
+    pub injects: Vec<InjectBlock>,
+    pub faults: Option<FaultsBlock>,
+    pub oracle: Option<OracleBlock>,
+}
+
+/// `time "ISO8601" duration DURATION`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct TimeClause {
+    pub start: String,
+    pub duration: Duration,
+}
+
+// ---------------------------------------------------------------------------
+// Rate
+// ---------------------------------------------------------------------------
+
+/// Event rate, e.g. `100/s`, `50/m`, `10/h`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Rate {
+    pub count: u64,
+    pub unit: RateUnit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RateUnit {
+    PerSecond,
+    PerMinute,
+    PerHour,
+}
+
+impl Rate {
+    /// Convert rate to events per second.
+    pub fn events_per_second(&self) -> f64 {
+        match self.unit {
+            RateUnit::PerSecond => self.count as f64,
+            RateUnit::PerMinute => self.count as f64 / 60.0,
+            RateUnit::PerHour => self.count as f64 / 3600.0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stream
+// ---------------------------------------------------------------------------
+
+/// `stream ALIAS : WINDOW RATE { field_override* }`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct StreamBlock {
+    pub alias: String,
+    pub window: String,
+    pub rate: Rate,
+    pub overrides: Vec<FieldOverride>,
+}
+
+/// `FIELD_NAME = gen_expr`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct FieldOverride {
+    pub field_name: String,
+    pub gen_expr: GenExpr,
+}
+
+/// Generator expression for a field override.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum GenExpr {
+    StringLit(String),
+    NumberLit(f64),
+    BoolLit(bool),
+    GenFunc { name: String, args: Vec<GenArg> },
+}
+
+/// A gen function argument, optionally named.
+///
+/// Supports both positional `ipv4(500)` and named `ipv4(pool: 500)` syntax.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct GenArg {
+    pub name: Option<String>,
+    pub value: GenExpr,
+}
+
+impl GenArg {
+    pub fn positional(value: GenExpr) -> Self {
+        Self { name: None, value }
+    }
+
+    pub fn named(name: impl Into<String>, value: GenExpr) -> Self {
+        Self {
+            name: Some(name.into()),
+            value,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inject
+// ---------------------------------------------------------------------------
+
+/// `inject for RULE on [STREAM, ...] { inject_line* }`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct InjectBlock {
+    pub rule: String,
+    pub streams: Vec<String>,
+    pub lines: Vec<InjectLine>,
+}
+
+/// `MODE PERCENT% { param_assigns }`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct InjectLine {
+    pub mode: InjectMode,
+    pub percent: f64,
+    pub params: Vec<ParamAssign>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InjectMode {
+    Hit,
+    NearMiss,
+    NonHit,
+}
+
+// ---------------------------------------------------------------------------
+// Faults
+// ---------------------------------------------------------------------------
+
+/// `faults { fault_line* }`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct FaultsBlock {
+    pub faults: Vec<FaultLine>,
+}
+
+/// `FAULT_NAME PERCENT%`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct FaultLine {
+    pub name: String,
+    pub percent: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Oracle
+// ---------------------------------------------------------------------------
+
+/// `oracle { param_assigns }`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct OracleBlock {
+    pub params: Vec<ParamAssign>,
+}
+
+// ---------------------------------------------------------------------------
+// Shared
+// ---------------------------------------------------------------------------
+
+/// `NAME = VALUE`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ParamAssign {
+    pub name: String,
+    pub value: ParamValue,
+}
+
+/// Value in a parameter assignment.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ParamValue {
+    Number(f64),
+    Duration(Duration),
+    String(String),
+}

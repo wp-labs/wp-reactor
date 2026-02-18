@@ -117,9 +117,7 @@ mod tests {
     fn resolve_mode_partitioned() {
         assert_eq!(
             resolve_mode("partitioned", Some("sip".into())).unwrap(),
-            DistMode::Partitioned {
-                key: "sip".into()
-            },
+            DistMode::Partitioned { key: "sip".into() },
         );
     }
 
@@ -173,10 +171,7 @@ mod tests {
         assert_eq!(wc.max_window_bytes, "64MB".parse::<ByteSize>().unwrap());
         assert_eq!(wc.evict_policy, EvictPolicy::Lru);
         assert_eq!(wc.watermark, "10s".parse::<HumanDuration>().unwrap());
-        assert_eq!(
-            wc.allowed_lateness,
-            "30s".parse::<HumanDuration>().unwrap()
-        );
+        assert_eq!(wc.allowed_lateness, "30s".parse::<HumanDuration>().unwrap());
         assert_eq!(wc.late_policy, LatePolicy::Revise);
     }
 }

@@ -18,9 +18,7 @@ pub struct Receiver {
 impl Receiver {
     /// Parse `"tcp://host:port"` and bind a TCP listener.
     pub async fn bind(listen: &str, router: Arc<Router>) -> anyhow::Result<Self> {
-        let addr = listen
-            .strip_prefix("tcp://")
-            .unwrap_or(listen);
+        let addr = listen.strip_prefix("tcp://").unwrap_or(listen);
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
             listener,
@@ -125,16 +123,16 @@ mod tests {
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
             Field::new("value", DataType::Int64, false),
         ]))
     }
 
-    fn make_batch(schema: &SchemaRef, times: &[i64], values: &[i64]) -> arrow::record_batch::RecordBatch {
+    fn make_batch(
+        schema: &SchemaRef,
+        times: &[i64],
+        values: &[i64],
+    ) -> arrow::record_batch::RecordBatch {
         arrow::record_batch::RecordBatch::try_new(
             schema.clone(),
             vec![

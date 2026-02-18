@@ -50,7 +50,9 @@ impl FromStr for HumanDuration {
             "m" => value * 60,
             "h" => value * 3600,
             "d" => value * 86400,
-            _ => anyhow::bail!("unsupported duration suffix {suffix:?} in {s:?} (expected s/m/h/d)"),
+            _ => {
+                anyhow::bail!("unsupported duration suffix {suffix:?} in {s:?} (expected s/m/h/d)")
+            }
         };
 
         Ok(Self(Duration::from_secs(secs)))
@@ -135,7 +137,9 @@ impl FromStr for ByteSize {
             "KB" => value * 1024,
             "MB" => value * 1024 * 1024,
             "GB" => value * 1024 * 1024 * 1024,
-            _ => anyhow::bail!("unsupported byte-size suffix {suffix:?} in {s:?} (expected B/KB/MB/GB)"),
+            _ => anyhow::bail!(
+                "unsupported byte-size suffix {suffix:?} in {s:?} (expected B/KB/MB/GB)"
+            ),
         };
 
         Ok(Self(bytes))

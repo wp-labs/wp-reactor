@@ -1,14 +1,14 @@
 pub mod ast;
 mod checker;
 mod compiler;
-mod parse_utils;
+pub mod parse_utils;
 pub mod plan;
 pub mod preprocess;
 mod schema;
 mod wfl_parser;
 mod ws_parser;
 
-pub use checker::{check_wfl, CheckError};
+pub use checker::{CheckError, check_wfl};
 pub use compiler::compile_wfl;
 pub use preprocess::preprocess_vars;
 pub use schema::{BaseType, FieldDef, FieldType, WindowSchema};

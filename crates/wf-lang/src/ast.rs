@@ -331,7 +331,11 @@ pub enum HitAssert {
     /// `entity_id == STRING`
     EntityId { value: String },
     /// `field(STRING) cmp_op expr`
-    Field { name: String, cmp: CmpOp, value: Expr },
+    Field {
+        name: String,
+        cmp: CmpOp,
+        value: Expr,
+    },
 }
 
 /// Options for a contract block.

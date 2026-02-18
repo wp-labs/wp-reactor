@@ -147,10 +147,7 @@ sinks = ["file:///var/log/wf-alerts.jsonl"]
             Duration::from_secs(30),
         );
         assert_eq!(cfg.runtime.window_schemas, vec!["security.ws"]);
-        assert_eq!(
-            cfg.runtime.wfl_rules,
-            vec!["brute_scan.wfl", "traffic.wfl"],
-        );
+        assert_eq!(cfg.runtime.wfl_rules, vec!["brute_scan.wfl", "traffic.wfl"],);
 
         // window_defaults
         assert_eq!(
@@ -192,18 +189,12 @@ sinks = ["file:///var/log/wf-alerts.jsonl"]
         );
 
         // alert
-        assert_eq!(
-            cfg.alert.sinks,
-            vec!["file:///var/log/wf-alerts.jsonl"],
-        );
+        assert_eq!(cfg.alert.sinks, vec!["file:///var/log/wf-alerts.jsonl"],);
     }
 
     #[test]
     fn reject_invalid_listen() {
-        let toml = FULL_TOML.replace(
-            "tcp://127.0.0.1:9800",
-            "http://bad",
-        );
+        let toml = FULL_TOML.replace("tcp://127.0.0.1:9800", "http://bad");
         assert!(toml.parse::<FusionConfig>().is_err());
     }
 
