@@ -22,6 +22,9 @@ struct FusionConfigRaw {
     #[serde(default)]
     window: HashMap<String, WindowOverride>,
     alert: AlertConfig,
+    /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
+    #[serde(default)]
+    vars: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -35,6 +38,8 @@ pub struct FusionConfig {
     pub window_defaults: WindowDefaults,
     pub windows: Vec<WindowConfig>,
     pub alert: AlertConfig,
+    /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
+    pub vars: HashMap<String, String>,
 }
 
 impl FusionConfig {
@@ -68,6 +73,7 @@ impl FromStr for FusionConfig {
             window_defaults: raw.window_defaults,
             windows,
             alert: raw.alert,
+            vars: raw.vars,
         };
 
         validate::validate(&config)?;
@@ -254,5 +260,21 @@ late_policy = "drop"
 sinks = ["file:///var/log/wf-alerts.jsonl"]
 "#;
         assert!(toml.parse::<FusionConfig>().is_err());
+    }
+
+    #[test]
+    fn load_with_vars() {
+        let toml = format!(
+            r#"{}
+[vars]
+FAIL_THRESHOLD = "5"
+SCAN_THRESHOLD = "10"
+"#,
+            FULL_TOML
+        );
+        let cfg: FusionConfig = toml.parse().unwrap();
+        assert_eq!(cfg.vars.len(), 2);
+        assert_eq!(cfg.vars["FAIL_THRESHOLD"], "5");
+        assert_eq!(cfg.vars["SCAN_THRESHOLD"], "10");
     }
 }

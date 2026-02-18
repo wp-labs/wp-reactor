@@ -5,7 +5,17 @@ use anyhow::{bail, Result};
 use arrow::array::{Array, TimestampNanosecondArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use wf_config::WindowConfig;
+use wf_config::{LatePolicy, WindowConfig};
+
+// ---------------------------------------------------------------------------
+// AppendOutcome
+// ---------------------------------------------------------------------------
+
+/// Result of a watermark-aware append.
+pub enum AppendOutcome {
+    Appended,
+    DroppedLate,
+}
 
 // ---------------------------------------------------------------------------
 // WindowParams
@@ -52,6 +62,7 @@ pub struct Window {
     batches: VecDeque<TimedBatch>,
     current_bytes: usize,
     total_rows: usize,
+    watermark_nanos: i64,
 }
 
 impl Window {
@@ -66,6 +77,7 @@ impl Window {
             batches: VecDeque::new(),
             current_bytes: 0,
             total_rows: 0,
+            watermark_nanos: i64::MIN,
         }
     }
 
@@ -170,6 +182,64 @@ impl Window {
 
     pub fn is_empty(&self) -> bool {
         self.batches.is_empty()
+    }
+
+    /// Append a batch with watermark advancement and lateness checking.
+    ///
+    /// 1. Extracts the event-time range from the batch.
+    /// 2. Advances the watermark: `max(current, max_event_time - watermark_delay)`.
+    /// 3. If `min_event_time < watermark - allowed_lateness`, applies the late
+    ///    policy (Drop/SideOutput → skip, Revise → append anyway).
+    /// 4. Otherwise appends normally via [`Self::append`].
+    ///
+    /// Windows without a time column never advance the watermark and never
+    /// reject data as late.
+    pub fn append_with_watermark(&mut self, batch: RecordBatch) -> Result<AppendOutcome> {
+        if batch.num_rows() == 0 {
+            return Ok(AppendOutcome::Appended);
+        }
+
+        let (min_event_time, max_event_time) = self.extract_time_range(&batch);
+
+        // Advance watermark (only for windows with a time column and real timestamps).
+        if self.time_col_index.is_some() && max_event_time != i64::MAX {
+            let delay = self.config.watermark.as_duration().as_nanos() as i64;
+            let candidate = max_event_time.saturating_sub(delay);
+            self.watermark_nanos = self.watermark_nanos.max(candidate);
+        }
+
+        // Lateness check (only for windows with a time column and real timestamps).
+        if self.time_col_index.is_some() && min_event_time != i64::MIN {
+            let allowed = self.config.allowed_lateness.as_duration().as_nanos() as i64;
+            let cutoff = self.watermark_nanos.saturating_sub(allowed);
+            if min_event_time < cutoff {
+                match self.config.late_policy {
+                    // SideOutput not yet implemented — treated as Drop in M10.
+                    LatePolicy::Drop | LatePolicy::SideOutput => {
+                        return Ok(AppendOutcome::DroppedLate);
+                    }
+                    LatePolicy::Revise => { /* fall through to append */ }
+                }
+            }
+        }
+
+        self.append(batch)?;
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Current watermark in nanoseconds.
+    pub fn watermark_nanos(&self) -> i64 {
+        self.watermark_nanos
+    }
+
+    /// Pop the oldest (front) batch, returning its byte size.
+    ///
+    /// Returns `None` if the window is empty.
+    pub fn evict_oldest(&mut self) -> Option<usize> {
+        let evicted = self.batches.pop_front()?;
+        self.current_bytes -= evicted.byte_size;
+        self.total_rows -= evicted.row_count;
+        Some(evicted.byte_size)
     }
 
     // -- private helpers ----------------------------------------------------
@@ -484,5 +554,72 @@ mod tests {
         // cutoff = 19s - 10s = 9s → batch max=8s < 9s → evicted
         win.evict_expired(19_000_000_000);
         assert_eq!(win.batch_count(), 0);
+    }
+
+    // -- 10. append_with_watermark_on_time ------------------------------------
+
+    #[test]
+    fn append_with_watermark_on_time() {
+        // watermark delay = 5s, allowed_lateness = 0s
+        let mut win = test_window(3600, usize::MAX);
+        let schema = win.schema().clone();
+
+        // Initial watermark is i64::MIN. Batch at 10s:
+        //   watermark = max(MIN, 10s - 5s) = 5s
+        //   min_event_time(10s) >= 5s → on time
+        let outcome = win
+            .append_with_watermark(make_batch(&schema, &[10_000_000_000], &[1]))
+            .unwrap();
+        assert!(matches!(outcome, AppendOutcome::Appended));
+        assert_eq!(win.batch_count(), 1);
+        assert_eq!(win.watermark_nanos(), 5_000_000_000);
+    }
+
+    // -- 11. append_with_watermark_drop_late ----------------------------------
+
+    #[test]
+    fn append_with_watermark_drop_late() {
+        // watermark delay = 5s, allowed_lateness = 0s, late_policy = Drop
+        let mut win = test_window(3600, usize::MAX);
+        let schema = win.schema().clone();
+
+        // Send fresh batch at 20s → watermark = 15s
+        win.append_with_watermark(make_batch(&schema, &[20_000_000_000], &[1]))
+            .unwrap();
+        assert_eq!(win.watermark_nanos(), 15_000_000_000);
+
+        // Send old batch at 5s → 5s < 15s → DroppedLate
+        let outcome = win
+            .append_with_watermark(make_batch(&schema, &[5_000_000_000], &[2]))
+            .unwrap();
+        assert!(matches!(outcome, AppendOutcome::DroppedLate));
+        // Only the first batch should be in the window.
+        assert_eq!(win.batch_count(), 1);
+    }
+
+    // -- 12. watermark_advances_monotonically ---------------------------------
+
+    #[test]
+    fn watermark_advances_monotonically() {
+        let mut win = test_window(3600, usize::MAX);
+        let schema = win.schema().clone();
+
+        // Batch at 20s → watermark = 15s
+        win.append_with_watermark(make_batch(&schema, &[20_000_000_000], &[1]))
+            .unwrap();
+        assert_eq!(win.watermark_nanos(), 15_000_000_000);
+
+        // Batch at 10s (on-time since 10s >= 15s - 0s is false... wait:
+        //   10s < 15s → late → DroppedLate). The watermark should NOT regress.
+        //   candidate = 10s - 5s = 5s; max(15s, 5s) = 15s → unchanged
+        let _ = win
+            .append_with_watermark(make_batch(&schema, &[10_000_000_000], &[2]))
+            .unwrap();
+        assert_eq!(win.watermark_nanos(), 15_000_000_000);
+
+        // Batch at 30s → watermark = max(15s, 25s) = 25s
+        win.append_with_watermark(make_batch(&schema, &[30_000_000_000], &[3]))
+            .unwrap();
+        assert_eq!(win.watermark_nanos(), 25_000_000_000);
     }
 }

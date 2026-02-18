@@ -144,6 +144,18 @@ impl WindowRegistry {
     pub fn is_empty(&self) -> bool {
         self.windows.is_empty()
     }
+
+    /// Returns `(window_name, dist_mode)` pairs for all subscribers of a stream
+    /// tag. Used internally by [`super::router::Router`].
+    pub(crate) fn subscribers_of(&self, stream_tag: &str) -> Vec<(&str, &DistMode)> {
+        match self.subscriptions.get(stream_tag) {
+            Some(subs) => subs
+                .iter()
+                .map(|s| (s.window_name.as_str(), &s.mode))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
