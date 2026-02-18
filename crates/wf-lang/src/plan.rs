@@ -102,7 +102,9 @@ pub struct JoinPlan {
 // EntityPlan
 // ---------------------------------------------------------------------------
 
-/// Entity identification: normalized type string + id expression.
+/// Entity identification: lowercase-normalized type string + id expression.
+///
+/// Both `entity(IP, ...)` and `entity("ip", ...)` compile to `entity_type = "ip"`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityPlan {
     pub entity_type: String,

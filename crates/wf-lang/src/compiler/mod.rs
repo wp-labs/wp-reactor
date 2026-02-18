@@ -1,4 +1,5 @@
 use crate::ast::{EntityTypeVal, RuleDecl, WflFile};
+use crate::checker::check_wfl;
 use crate::plan::{
     AggPlan, BindPlan, BranchPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
     WindowSpec, YieldField, YieldPlan,
@@ -8,12 +9,21 @@ use crate::schema::WindowSchema;
 #[cfg(test)]
 mod tests;
 
-/// Compile a parsed & checked WFL file into executable `RulePlan`s.
+/// Compile a parsed WFL file into executable `RulePlan`s.
 ///
-/// This is the L1 compiler: structural translation only. The input AST is
-/// assumed to have passed `check_wfl` already. Contracts, use declarations,
-/// and meta blocks are stripped — only rule logic is compiled.
-pub fn compile_wfl(file: &WflFile, _schemas: &[WindowSchema]) -> anyhow::Result<Vec<RulePlan>> {
+/// Runs semantic checks (`check_wfl`) first; returns an error if any check
+/// fails.  This guarantees that a successful return implies the AST was both
+/// syntactically and semantically valid — callers never need to remember to
+/// call `check_wfl` separately.
+///
+/// Contracts, use declarations, and meta blocks are stripped — only rule
+/// logic is compiled.
+pub fn compile_wfl(file: &WflFile, schemas: &[WindowSchema]) -> anyhow::Result<Vec<RulePlan>> {
+    let errors = check_wfl(file, schemas);
+    if !errors.is_empty() {
+        let msgs: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+        anyhow::bail!("semantic errors:\n{}", msgs.join("\n"));
+    }
     file.rules.iter().map(compile_rule).collect()
 }
 
@@ -90,11 +100,11 @@ fn compile_branch(branch: &crate::ast::StepBranch) -> BranchPlan {
 // ---------------------------------------------------------------------------
 
 fn compile_entity(rule: &RuleDecl) -> EntityPlan {
-    let entity_type = match &rule.entity.entity_type {
+    let raw = match &rule.entity.entity_type {
         EntityTypeVal::Ident(s) | EntityTypeVal::StringLit(s) => s.clone(),
     };
     EntityPlan {
-        entity_type,
+        entity_type: raw.to_ascii_lowercase(),
         entity_id_expr: rule.entity.id_expr.clone(),
     }
 }
