@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, Measure};
-use wf_lang::plan::{AggPlan, BranchPlan, MatchPlan, StepPlan, WindowSpec};
+use wf_lang::plan::{
+    AggPlan, BindPlan, BranchPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
+    WindowSpec, YieldPlan,
+};
 
 use crate::rule::match_engine::{Event, Value};
 
@@ -77,5 +80,41 @@ pub fn close_reason_guard(reason: &str) -> Expr {
         op: BinOp::Eq,
         left: Box::new(Expr::Field(FieldRef::Simple("close_reason".to_string()))),
         right: Box::new(Expr::StringLit(reason.to_string())),
+    }
+}
+
+/// Build a minimal [`RulePlan`] suitable for executor tests.
+///
+/// Defaults:
+/// - `score_expr`: the score expression (e.g. `Expr::Number(70.0)`)
+/// - `entity_type`: `"ip"`
+/// - `entity_id_expr`: the entity id expression
+/// - `match_plan`: provided
+pub fn simple_rule_plan(
+    name: &str,
+    match_plan: MatchPlan,
+    score_expr: Expr,
+    entity_type: &str,
+    entity_id_expr: Expr,
+) -> RulePlan {
+    RulePlan {
+        name: name.to_string(),
+        binds: vec![BindPlan {
+            alias: "fail".to_string(),
+            window: "w".to_string(),
+            filter: None,
+        }],
+        match_plan,
+        joins: vec![],
+        entity_plan: EntityPlan {
+            entity_type: entity_type.to_string(),
+            entity_id_expr,
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".to_string(),
+            fields: vec![],
+        },
+        score_plan: ScorePlan { expr: score_expr },
+        conv_plan: None,
     }
 }

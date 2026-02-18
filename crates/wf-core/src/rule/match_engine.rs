@@ -369,7 +369,7 @@ fn extract_key(event: &Event, keys: &[FieldRef]) -> Option<Vec<String>> {
     Some(result)
 }
 
-fn field_ref_name(fr: &FieldRef) -> &str {
+pub(crate) fn field_ref_name(fr: &FieldRef) -> &str {
     match fr {
         FieldRef::Simple(name) => name,
         FieldRef::Qualified(_, name) | FieldRef::Bracketed(_, name) => name,
@@ -381,7 +381,7 @@ fn make_instance_key(scope_key: &[String]) -> String {
     scope_key.join("\x1f") // unit separator
 }
 
-fn value_to_string(v: &Value) -> String {
+pub(crate) fn value_to_string(v: &Value) -> String {
     match v {
         Value::Number(n) => n.to_string(),
         Value::Str(s) => s.clone(),
@@ -671,7 +671,7 @@ fn compare_value_threshold(cmp: CmpOp, val: &Value, threshold: &Value) -> bool {
 ///
 /// Supports: literals, field refs, BinOp (And/Or/comparisons/arithmetic),
 /// Neg, InList, and basic FuncCall (contains, lower, upper, len).
-fn eval_expr(expr: &Expr, event: &Event) -> Option<Value> {
+pub(crate) fn eval_expr(expr: &Expr, event: &Event) -> Option<Value> {
     match expr {
         Expr::Number(n) => Some(Value::Number(*n)),
         Expr::StringLit(s) => Some(Value::Str(s.clone())),
