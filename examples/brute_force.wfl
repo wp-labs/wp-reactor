@@ -1,6 +1,6 @@
 use "security.wfs"
 
-rule brute_force {
+rule brute_force_then_scan {
     events {
         fail : auth_events && action == "failed"
     }
@@ -8,6 +8,9 @@ rule brute_force {
     match<sip:5m> {
         on event {
             fail | count >= $FAIL_THRESHOLD;
+        }
+        on close {
+            fail | count >= 1;
         }
     } -> score(70.0)
 

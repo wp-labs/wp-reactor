@@ -15,7 +15,9 @@
       "Bash(git -C /Users/zuowenjian/devspace/wp-labs/wp-reactor status)",
       "Bash(git -C /Users/zuowenjian/devspace/wp-labs/wp-reactor diff --stat)",
       "Bash(git -C /Users/zuowenjian/devspace/wp-labs/wp-reactor log --oneline -5)",
-      "Bash(git -C /Users/zuowenjian/devspace/wp-labs/wp-reactor diff crates/wf-runtime/src/scheduler.rs)"
+      "Bash(git -C /Users/zuowenjian/devspace/wp-labs/wp-reactor diff crates/wf-runtime/src/scheduler.rs)",
+      "Bash(./target/debug/wf:*)",
+      "Bash(/Users/zuowenjian/devspace/wp-labs/wp-reactor/target/release/wf run:*)"
     ]
   }
 }

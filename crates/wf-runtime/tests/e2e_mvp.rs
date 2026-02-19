@@ -124,10 +124,11 @@ FAIL_THRESHOLD = "3"
         .expect("TCP write failed");
     stream.flush().await.expect("TCP flush failed");
 
-    // Give the pipeline time to process.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Allow time for TCP → Scheduler pipeline delivery.
+    // Actual latency is <10ms; 200ms gives ample margin for slow CI.
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // -- Shutdown --
+    // -- Shutdown (flush triggers on-close evaluation) --
     engine.shutdown();
     // Drop TCP stream so the receiver's event_tx can close.
     drop(stream);
@@ -138,9 +139,11 @@ FAIL_THRESHOLD = "3"
         .unwrap_or_else(|e| panic!("failed to read alert file {}: {e}", alert_path.display()));
 
     let lines: Vec<&str> = alert_content.lines().collect();
-    assert!(
-        !lines.is_empty(),
-        "expected at least 1 alert line, got 0. Alert file contents: {alert_content:?}"
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly 1 alert line, got {}. Full alert file:\n{alert_content}",
+        lines.len()
     );
 
     let alert: serde_json::Value =
@@ -148,7 +151,7 @@ FAIL_THRESHOLD = "3"
 
     assert_eq!(
         alert["rule_name"].as_str().unwrap(),
-        "brute_force",
+        "brute_force_then_scan",
         "unexpected rule_name: {alert}"
     );
     assert_eq!(
@@ -165,5 +168,9 @@ FAIL_THRESHOLD = "3"
     assert!(
         (score - 70.0).abs() < f64::EPSILON,
         "expected score 70.0, got {score}"
+    );
+    assert!(
+        alert["close_reason"].as_str().is_some(),
+        "expected close_reason to be present (on-close path), got: {alert}"
     );
 }

@@ -149,7 +149,7 @@ impl FusionEngine {
         // 9. Alert pipeline — build sink, create channel, spawn consumer task.
         //    The alert task has no cancel token; it exits when the scheduler
         //    drops its Sender after drain + flush, ensuring zero alert loss.
-        let alert_sink = build_alert_sink(&config)?;
+        let alert_sink = build_alert_sink(&config, base_dir)?;
         let (alert_tx, alert_rx) = mpsc::channel(alert_task::ALERT_CHANNEL_CAPACITY);
         let mut alert_group = TaskGroup::new("alert");
         alert_group.push(tokio::spawn(async move {
@@ -250,12 +250,21 @@ impl FusionEngine {
 }
 
 /// Build the alert sink from config, supporting multiple file:// destinations.
-fn build_alert_sink(config: &FusionConfig) -> Result<Arc<dyn AlertSink>> {
+///
+/// Relative `file://` paths are resolved against `base_dir` (typically the
+/// directory containing `fusion.toml`), so that `file://alerts/wf-alerts.jsonl`
+/// lands next to the config rather than relative to CWD.
+fn build_alert_sink(config: &FusionConfig, base_dir: &Path) -> Result<Arc<dyn AlertSink>> {
     let uris = config.alert.parsed_sinks()?;
     let mut sinks: Vec<Box<dyn AlertSink>> = Vec::new();
     for uri in uris {
         match uri {
             SinkUri::File { path } => {
+                let path = if path.is_relative() {
+                    base_dir.join(&path)
+                } else {
+                    path
+                };
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
