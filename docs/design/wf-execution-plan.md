@@ -226,6 +226,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 范围 | Scheduler task：`tokio::select!` 事件驱动分发 + 超时扫描循环 + 控制命令接收；全局并发上限（`Semaphore(executor_parallelism)`）；执行超时（`tokio::time::timeout` 包裹 join SQL）；Lifecycle：启动顺序（AlertSink → Executor → Scheduler → Evictor → Router → Receiver）；信号处理（SIGTERM/SIGINT）；优雅关闭（先停 Receiver，等执行完毕） |
 | 依赖 | M16（RuleExecutor）, M17（Receiver） |
 | 验收 | 多规则并行分发测试；并发上限背压测试；Ctrl-C 优雅关闭测试 |
+| 状态 | **已完成** — `wf-runtime/src/scheduler.rs` + `lifecycle.rs` + `receiver.rs`；`SchedulerCommand` 控制通道、`EngineHandle`/`EngineCore` 并行执行、`tokio::time::timeout` 包裹、receiver 错误处理；5 项调度器测试 + 1 项 E2E 测试通过 |
 
 ### M19：告警系统
 
@@ -235,6 +236,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 范围 | AlertRecord 定义（rule_name / severity / fired_at / matched_rows / summary）；`alert_id = sha256(rule_name + scope_key + window_range)` 幂等键生成；FileAlertSink 实现（JSON Lines 写入文件，含 alert_id 字段） |
 | 依赖 | M16（AlertRecord 产出） |
 | 验收 | 告警写入 JSON Lines 文件；alert_id 相同输入一致性测试；文件可被 jq 解析 |
+| 状态 | **已完成** — `wf-core/src/alert/types.rs` + `sink.rs` + `wf-core/src/rule/executor.rs`；AlertRecord 序列化、确定性复合键 alert_id、FileAlertSink JSON Lines 输出；8 项告警相关测试通过 |
 
 ### M20：端到端 MVP 验收 ★
 
@@ -450,7 +452,7 @@ wf-datagen: M31 ✅; M32 ✅; M33 ✅; verify 端到端需 M20 汇合
 | **II 配置与窗口** | M06–M10 | 配置可加载、Window 能接收路由并缓存数据 | ✅ 已完成 |
 | **III WFL 编译器** | M11–M13 | .wfs + .wfl 编译为 RulePlan | ✅ 已完成 |
 | **IV 执行引擎** | M14–M16 | CEP 状态机 + DataFusion join 可执行 | M14–M15 ✅ / M16 待开始 |
-| **V 运行时闭环** | M17–M20 | **单机 MVP：数据接收→规则执行→告警输出** | M17 ✅ / M18–M20 待开始 |
+| **V 运行时闭环** | M17–M20 | **单机 MVP：数据接收→规则执行→告警输出** | M17–M19 ✅ / M20 待开始 |
 | **VI 生产化** | M21–M24 | 热加载、多通道告警、监控、工具链 | 待开始 |
 | **VII L2 增强** | M25–M26 | join / baseline / key 映射 / limits / 条件表达式 / yield 契约 | 待开始 |
 | **VIII L3 高级** | M27–M28 | tumble / conv / composable pattern / 多级管道 | 待开始 |

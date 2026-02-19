@@ -562,4 +562,130 @@ mod tests {
         // Both queued batches must have been drained and processed.
         assert_eq!(alerts.len(), 2, "expected 2 alerts from drained batches, got {}", alerts.len());
     }
+
+    /// M18 验收：多规则并行分发 — 两个引擎同时处理同一批事件，各自
+    /// 独立产出告警。
+    #[tokio::test]
+    async fn test_multi_engine_parallel_dispatch() {
+        let schemas = vec![simple_schema("auth_events", "syslog")];
+
+        // Engine α
+        let mut plan_a = simple_rule_plan("a", "auth_events");
+        plan_a.name = "rule_alpha".to_string();
+        let aliases_a = build_stream_aliases(&plan_a.binds, &schemas);
+        let engine_a = RuleEngine {
+            machine: CepStateMachine::new(plan_a.name.clone(), plan_a.match_plan.clone()),
+            executor: RuleExecutor::new(plan_a),
+            stream_aliases: aliases_a,
+        };
+
+        // Engine β
+        let mut plan_b = simple_rule_plan("a", "auth_events");
+        plan_b.name = "rule_beta".to_string();
+        let aliases_b = build_stream_aliases(&plan_b.binds, &schemas);
+        let engine_b = RuleEngine {
+            machine: CepStateMachine::new(plan_b.name.clone(), plan_b.match_plan.clone()),
+            executor: RuleExecutor::new(plan_b),
+            stream_aliases: aliases_b,
+        };
+
+        let (alert_tx, alert_rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        let (_cmd_tx, cmd_rx) = mpsc::channel(64);
+
+        // parallelism=4 > 2 engines → both may run truly in parallel
+        let scheduler = Scheduler::new(
+            rx, vec![engine_a, engine_b], alert_tx, cancel.clone(),
+            4, Duration::from_secs(30), cmd_rx,
+        );
+        let handle = tokio::spawn(async move { scheduler.run().await });
+
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("sip", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["10.0.0.1"]))],
+        )
+        .unwrap();
+
+        tx.send(("syslog".to_string(), batch)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        cancel.cancel();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let alerts = collect_alerts(alert_rx).await;
+        assert_eq!(alerts.len(), 2, "expected 2 alerts from 2 engines, got {}", alerts.len());
+
+        let mut names: Vec<&str> = alerts.iter().map(|a| a.rule_name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["rule_alpha", "rule_beta"]);
+    }
+
+    /// M18 验收：并发上限背压 — 3 个引擎但 parallelism=1，信号量保证
+    /// 同一时刻最多 1 个引擎执行。所有事件仍必须被处理，不允许丢弃。
+    #[tokio::test]
+    async fn test_parallelism_backpressure() {
+        let schemas = vec![simple_schema("auth_events", "syslog")];
+
+        let mut engines = Vec::new();
+        for name in ["rule_a", "rule_b", "rule_c"] {
+            let mut plan = simple_rule_plan("a", "auth_events");
+            plan.name = name.to_string();
+            let aliases = build_stream_aliases(&plan.binds, &schemas);
+            engines.push(RuleEngine {
+                machine: CepStateMachine::new(plan.name.clone(), plan.match_plan.clone()),
+                executor: RuleExecutor::new(plan),
+                stream_aliases: aliases,
+            });
+        }
+
+        let (alert_tx, alert_rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        let (_cmd_tx, cmd_rx) = mpsc::channel(64);
+
+        // parallelism=1 → only one engine holds a permit at a time
+        let scheduler = Scheduler::new(
+            rx, engines, alert_tx, cancel.clone(),
+            1, Duration::from_secs(30), cmd_rx,
+        );
+        let handle = tokio::spawn(async move { scheduler.run().await });
+
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("sip", DataType::Utf8, false)]));
+
+        // Send 2 events with distinct scope keys
+        for ip in ["10.0.0.1", "10.0.0.2"] {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(vec![ip]))],
+            )
+            .unwrap();
+            tx.send(("syslog".to_string(), batch)).await.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        cancel.cancel();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let alerts = collect_alerts(alert_rx).await;
+        // 3 engines × 2 events = 6 alerts — none dropped despite parallelism=1
+        assert_eq!(alerts.len(), 6, "expected 6 alerts (3 engines × 2 events), got {}", alerts.len());
+
+        // Each rule must have fired exactly twice
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for alert in &alerts {
+            *counts.entry(alert.rule_name.as_str()).or_default() += 1;
+        }
+        assert_eq!(counts.get("rule_a"), Some(&2));
+        assert_eq!(counts.get("rule_b"), Some(&2));
+        assert_eq!(counts.get("rule_c"), Some(&2));
+    }
 }
