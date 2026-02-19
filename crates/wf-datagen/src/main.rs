@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
+use wf_datagen::datagen::fault_gen::apply_faults;
 use wf_datagen::datagen::generate;
 use wf_datagen::oracle::run_oracle;
 use wf_datagen::output::arrow_ipc::write_arrow_ipc;
@@ -75,6 +78,24 @@ enum Commands {
         /// Score tolerance for matching (default: 0.01)
         #[arg(long, default_value = "0.01")]
         score_tolerance: f64,
+
+        /// Output format: "json" or "markdown" (default: json)
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    /// Measure pure generation throughput (no disk I/O)
+    Bench {
+        /// Path to the .wfg scenario file
+        #[arg(long)]
+        scenario: PathBuf,
+
+        /// Additional .wfs schema files (beyond those in `use` declarations)
+        #[arg(long)]
+        ws: Vec<PathBuf>,
+
+        /// Additional .wfl rule files (beyond those in `use` declarations)
+        #[arg(long)]
+        wfl: Vec<PathBuf>,
     },
 }
 
@@ -129,31 +150,11 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Generate clean events
             let result = generate(&wfg, &schemas, &rule_plans)?;
 
-            match normalized_format {
-                "jsonl" => {
-                    let output_file = out.join(format!("{}.jsonl", wfg.scenario.name));
-                    write_jsonl(&result.events, &output_file)?;
-                    println!(
-                        "Generated {} events -> {}",
-                        result.events.len(),
-                        output_file.display()
-                    );
-                }
-                "arrow" => {
-                    let output_file = out.join(format!("{}.arrow", wfg.scenario.name));
-                    write_arrow_ipc(&result.events, &output_file)?;
-                    println!(
-                        "Generated {} events -> {}",
-                        result.events.len(),
-                        output_file.display()
-                    );
-                }
-                _ => unreachable!(),
-            }
-
-            // Oracle evaluation
+            // Oracle evaluation (on CLEAN events, before faults)
+            let mut oracle_alert_count = 0;
             if oracle && !rule_plans.is_empty() {
                 let start = wfg.scenario.time_clause.start.parse().map_err(|e| {
                     anyhow::anyhow!(
@@ -166,6 +167,7 @@ fn main() -> anyhow::Result<()> {
 
                 let oracle_result =
                     run_oracle(&result.events, &rule_plans, &start, &duration)?;
+                oracle_alert_count = oracle_result.alerts.len();
 
                 let oracle_file =
                     out.join(format!("{}.oracle.jsonl", wfg.scenario.name));
@@ -175,6 +177,40 @@ fn main() -> anyhow::Result<()> {
                     oracle_result.alerts.len(),
                     oracle_file.display()
                 );
+            }
+            let _ = oracle_alert_count;
+
+            // Apply faults (after oracle, on clean events)
+            let output_events = if let Some(faults) = &wfg.scenario.faults {
+                let mut fault_rng = StdRng::seed_from_u64(wfg.scenario.seed.wrapping_add(1));
+                let fault_result = apply_faults(result.events, faults, &mut fault_rng);
+                eprintln!("Faults applied: {}", fault_result.stats);
+                fault_result.events
+            } else {
+                result.events
+            };
+
+            // Write output
+            match normalized_format {
+                "jsonl" => {
+                    let output_file = out.join(format!("{}.jsonl", wfg.scenario.name));
+                    write_jsonl(&output_events, &output_file)?;
+                    println!(
+                        "Generated {} events -> {}",
+                        output_events.len(),
+                        output_file.display()
+                    );
+                }
+                "arrow" => {
+                    let output_file = out.join(format!("{}.arrow", wfg.scenario.name));
+                    write_arrow_ipc(&output_events, &output_file)?;
+                    println!(
+                        "Generated {} events -> {}",
+                        output_events.len(),
+                        output_file.display()
+                    );
+                }
+                _ => unreachable!(),
             }
 
             Ok(())
@@ -202,6 +238,7 @@ fn main() -> anyhow::Result<()> {
             expected,
             actual,
             score_tolerance,
+            format,
         } => {
             let oracle_alerts = read_oracle_jsonl(&expected)
                 .with_context(|| format!("reading expected: {}", expected.display()))?;
@@ -210,14 +247,58 @@ fn main() -> anyhow::Result<()> {
 
             let report = verify(&oracle_alerts, &actual_alerts, score_tolerance);
 
-            let json = serde_json::to_string_pretty(&report)?;
-            println!("{}", json);
+            match format.as_str() {
+                "markdown" | "md" => {
+                    println!("{}", report.to_markdown());
+                }
+                _ => {
+                    let json = serde_json::to_string_pretty(&report)?;
+                    println!("{}", json);
+                }
+            }
 
             if report.status == "pass" {
                 std::process::exit(0);
             } else {
                 std::process::exit(1);
             }
+        }
+        Commands::Bench { scenario, ws, wfl } => {
+            let wfg_content = std::fs::read_to_string(&scenario).context("reading .wfg file")?;
+            let wfg = parse_wfg(&wfg_content).context("parsing .wfg file")?;
+
+            let (mut schemas, mut wfl_files) = load_from_uses(&wfg, &scenario)?;
+            schemas.extend(load_ws_files(&ws)?);
+            wfl_files.extend(load_wfl_files(&wfl)?);
+
+            // Compile WFL rules
+            let mut rule_plans = Vec::new();
+            for wfl_file in &wfl_files {
+                match wf_lang::compile_wfl(wfl_file, &schemas) {
+                    Ok(plans) => rule_plans.extend(plans),
+                    Err(e) => {
+                        eprintln!("Warning: WFL compilation failed: {}", e);
+                    }
+                }
+            }
+
+            let start = std::time::Instant::now();
+            let result = generate(&wfg, &schemas, &rule_plans)?;
+            let elapsed = start.elapsed();
+
+            let events = result.events.len();
+            let secs = elapsed.as_secs_f64();
+            let eps = if secs > 0.0 {
+                events as f64 / secs
+            } else {
+                f64::INFINITY
+            };
+
+            println!("Events:     {}", events);
+            println!("Duration:   {:.3}s", secs);
+            println!("Throughput: {:.0} events/sec", eps);
+
+            Ok(())
         }
     }
 }

@@ -1,3 +1,4 @@
+pub mod fault_gen;
 pub mod field_gen;
 pub mod inject_gen;
 pub mod stream_gen;

@@ -272,7 +272,7 @@ scenario faults_test seed 3 {
     stream s1 : LoginWindow 10/s
 
     faults {
-        late_arrival 5%;
+        late 5%;
         duplicate 2%;
     }
 }
@@ -280,9 +280,9 @@ scenario faults_test seed 3 {
     let wfg = parse_wfg(input).unwrap();
     let faults = wfg.scenario.faults.as_ref().unwrap();
     assert_eq!(faults.faults.len(), 2);
-    assert_eq!(faults.faults[0].name, "late_arrival");
+    assert_eq!(faults.faults[0].fault_type, FaultType::Late);
     assert_eq!(faults.faults[0].percent, 5.0);
-    assert_eq!(faults.faults[1].name, "duplicate");
+    assert_eq!(faults.faults[1].fault_type, FaultType::Duplicate);
     assert_eq!(faults.faults[1].percent, 2.0);
 }
 
@@ -296,7 +296,7 @@ scenario faults_semi seed 3 {
     stream s1 : LoginWindow 10/s
 
     faults {
-        late_arrival 5%;
+        late 5%;
         duplicate 2%;
     }
 }
@@ -481,7 +481,7 @@ scenario full_test seed 12345 {
     }
 
     faults {
-        late_arrival 3%;
+        late 3%;
         duplicate 1%;
     }
 
@@ -545,4 +545,51 @@ scenario bool_prefix seed 1 {
     assert!(
         matches!(&ov[3].gen_expr, GenExpr::GenFunc { name, args } if name == "false_flag" && args.len() == 2)
     );
+}
+
+#[test]
+fn test_fault_type_all_variants() {
+    let input = r#"
+scenario all_faults seed 1 {
+    time "2024-01-01T00:00:00Z" duration 1h
+    total 100
+
+    stream s1 : W 10/s
+
+    faults {
+        out_of_order 10%;
+        late 5%;
+        duplicate 3%;
+        drop 2%;
+    }
+}
+"#;
+    let wfg = parse_wfg(input).unwrap();
+    let faults = wfg.scenario.faults.as_ref().unwrap();
+    assert_eq!(faults.faults.len(), 4);
+    assert_eq!(faults.faults[0].fault_type, FaultType::OutOfOrder);
+    assert_eq!(faults.faults[0].percent, 10.0);
+    assert_eq!(faults.faults[1].fault_type, FaultType::Late);
+    assert_eq!(faults.faults[1].percent, 5.0);
+    assert_eq!(faults.faults[2].fault_type, FaultType::Duplicate);
+    assert_eq!(faults.faults[2].percent, 3.0);
+    assert_eq!(faults.faults[3].fault_type, FaultType::Drop);
+    assert_eq!(faults.faults[3].percent, 2.0);
+}
+
+#[test]
+fn test_fault_unknown_type_rejected() {
+    let input = r#"
+scenario bad_fault seed 1 {
+    time "2024-01-01T00:00:00Z" duration 1h
+    total 100
+
+    stream s1 : W 10/s
+
+    faults {
+        late_arrival 5%;
+    }
+}
+"#;
+    assert!(parse_wfg(input).is_err());
 }

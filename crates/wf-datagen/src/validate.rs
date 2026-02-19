@@ -72,7 +72,7 @@ pub fn validate_wfg(
                     code: "SV4",
                     message: format!(
                         "fault '{}': percent {} must be in (0, 100]",
-                        fault.name, fault.percent
+                        fault.fault_type, fault.percent
                     ),
                 });
             }

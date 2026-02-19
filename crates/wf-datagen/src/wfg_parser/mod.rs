@@ -456,14 +456,26 @@ fn faults_block(input: &mut &str) -> ModalResult<FaultsBlock> {
 }
 
 fn fault_line(input: &mut &str) -> ModalResult<FaultLine> {
-    let name = ident(input)?.to_string();
+    let fault_type = alt((
+        wf_lang::parse_utils::kw("out_of_order").value(FaultType::OutOfOrder),
+        wf_lang::parse_utils::kw("late").value(FaultType::Late),
+        wf_lang::parse_utils::kw("duplicate").value(FaultType::Duplicate),
+        wf_lang::parse_utils::kw("drop").value(FaultType::Drop),
+    ))
+    .context(StrContext::Expected(StrContextValue::Description(
+        "fault type (out_of_order, late, duplicate, drop)",
+    )))
+    .parse_next(input)?;
     ws_skip(input)?;
     let pct = cut_err(percent)
         .context(StrContext::Expected(StrContextValue::Description(
             "percent for fault",
         )))
         .parse_next(input)?;
-    Ok(FaultLine { name, percent: pct })
+    Ok(FaultLine {
+        fault_type,
+        percent: pct,
+    })
 }
 
 // ---------------------------------------------------------------------------
