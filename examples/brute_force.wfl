@@ -1,0 +1,21 @@
+use "security.wfs"
+
+rule brute_force {
+    events {
+        fail : auth_events && action == "failed"
+    }
+
+    match<sip:5m> {
+        on event {
+            fail | count >= $FAIL_THRESHOLD;
+        }
+    } -> score(70.0)
+
+    entity(ip, fail.sip)
+
+    yield security_alerts (
+        sip = fail.sip,
+        fail_count = count(fail),
+        message = fmt("{} brute force detected", fail.sip)
+    )
+}

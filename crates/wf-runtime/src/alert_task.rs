@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use wf_core::alert::{AlertRecord, AlertSink};
 
@@ -10,36 +9,18 @@ pub const ALERT_CHANNEL_CAPACITY: usize = 64;
 
 /// Consume alert records from the channel and forward them to the sink.
 ///
-/// Primary shutdown: channel close (all senders dropped after scheduler
-/// `flush_all`). The cancel token is a backup to unblock `recv` if the
-/// sender side hangs.
+/// Shutdown is driven entirely by channel close: when the scheduler finishes
+/// its drain + flush and drops its `Sender<AlertRecord>`, `rx.recv()` returns
+/// `None` and this task exits.  No cancel token is needed — this avoids a race
+/// where the cancel could close the receiver while the scheduler is still
+/// sending flush alerts.
 pub async fn run_alert_sink(
     mut rx: mpsc::Receiver<AlertRecord>,
     sink: Arc<dyn AlertSink>,
-    cancel: CancellationToken,
 ) {
-    loop {
-        tokio::select! {
-            msg = rx.recv() => {
-                match msg {
-                    Some(record) => {
-                        if let Err(e) = sink.send(&record) {
-                            log::warn!("alert sink error: {e}");
-                        }
-                    }
-                    None => break, // all senders dropped
-                }
-            }
-            _ = cancel.cancelled() => {
-                // Drain remaining messages before exiting.
-                rx.close();
-                while let Some(record) = rx.recv().await {
-                    if let Err(e) = sink.send(&record) {
-                        log::warn!("alert sink drain error: {e}");
-                    }
-                }
-                break;
-            }
+    while let Some(record) = rx.recv().await {
+        if let Err(e) = sink.send(&record) {
+            log::warn!("alert sink error: {e}");
         }
     }
 }
@@ -53,7 +34,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use std::time::Duration;
 
     fn sample_alert(id: &str) -> AlertRecord {
         AlertRecord {
@@ -117,47 +97,36 @@ mod tests {
     async fn normal_delivery() {
         let (tx, rx) = mpsc::channel(16);
         let sink = Arc::new(CollectorSink::new());
-        let cancel = CancellationToken::new();
 
         let task_sink = Arc::clone(&sink);
-        let task_cancel = cancel.clone();
         let handle = tokio::spawn(async move {
-            run_alert_sink(rx, task_sink, task_cancel).await;
+            run_alert_sink(rx, task_sink).await;
         });
 
         tx.send(sample_alert("a1")).await.unwrap();
         tx.send(sample_alert("a2")).await.unwrap();
-        drop(tx); // close channel
+        drop(tx); // close channel → task exits
 
         handle.await.unwrap();
         assert_eq!(sink.ids(), vec!["a1", "a2"]);
     }
 
     #[tokio::test]
-    async fn drain_on_cancel() {
+    async fn exits_on_channel_close() {
         let (tx, rx) = mpsc::channel(16);
         let sink = Arc::new(CollectorSink::new());
-        let cancel = CancellationToken::new();
 
         let task_sink = Arc::clone(&sink);
-        let task_cancel = cancel.clone();
         let handle = tokio::spawn(async move {
-            run_alert_sink(rx, task_sink, task_cancel).await;
+            run_alert_sink(rx, task_sink).await;
         });
 
-        // Send some alerts, then cancel before dropping tx
         tx.send(sample_alert("b1")).await.unwrap();
         tx.send(sample_alert("b2")).await.unwrap();
-
-        // Give the task time to start processing
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        cancel.cancel();
-        // Drop tx after cancel so the drain loop can finish
+        // Drop sender — task should drain and exit
         drop(tx);
 
         handle.await.unwrap();
-        // Both alerts should have been delivered (either in the main loop or drain)
         assert_eq!(sink.ids().len(), 2);
     }
 
@@ -165,12 +134,10 @@ mod tests {
     async fn sink_error_continues() {
         let (tx, rx) = mpsc::channel(16);
         let sink = Arc::new(FailCountSink::new());
-        let cancel = CancellationToken::new();
 
         let task_sink = Arc::clone(&sink);
-        let task_cancel = cancel.clone();
         let handle = tokio::spawn(async move {
-            run_alert_sink(rx, task_sink, task_cancel).await;
+            run_alert_sink(rx, task_sink).await;
         });
 
         tx.send(sample_alert("c1")).await.unwrap();

@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,8 +16,48 @@ use wf_core::window::{Evictor, Router, WindowRegistry};
 use crate::alert_task;
 use crate::evictor_task;
 use crate::receiver::Receiver;
-use crate::scheduler::{RuleEngine, Scheduler, build_stream_aliases};
+use crate::scheduler::{RuleEngine, Scheduler, SchedulerCommand, build_stream_aliases};
 use crate::schema_bridge::schemas_to_window_defs;
+
+// ---------------------------------------------------------------------------
+// TaskGroup — named collection of async tasks for ordered shutdown
+// ---------------------------------------------------------------------------
+
+/// A named group of async tasks that are shut down together.
+///
+/// Groups are assembled in *start order* and joined in *reverse order*
+/// (LIFO) during shutdown, mirroring the dependency graph:
+///
+///   start:  alert → infra → scheduler → receiver
+///   join:   receiver → scheduler → alert → infra
+///
+/// This ensures upstream producers exit before downstream consumers,
+/// and consumers can drain all in-flight work before the engine stops.
+pub(crate) struct TaskGroup {
+    name: &'static str,
+    handles: Vec<JoinHandle<Result<()>>>,
+}
+
+impl TaskGroup {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            handles: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, handle: JoinHandle<Result<()>>) {
+        self.handles.push(handle);
+    }
+
+    /// Join all tasks in this group, returning the first error.
+    async fn wait(self) -> Result<()> {
+        for handle in self.handles {
+            handle.await??;
+        }
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FusionEngine — the top-level lifecycle handle
@@ -24,9 +65,16 @@ use crate::schema_bridge::schemas_to_window_defs;
 
 /// Manages the full lifecycle of the CEP runtime: bootstrap, run, and
 /// graceful shutdown.
+///
+/// Task groups are stored in start order and joined in reverse (LIFO)
+/// during [`wait`](Self::wait), ensuring correct drain sequencing:
+/// receiver stops first, then scheduler drains events, then alert sink
+/// flushes to disk, and finally infrastructure (evictor) stops.
 pub struct FusionEngine {
     cancel: CancellationToken,
-    join_handles: Vec<JoinHandle<Result<()>>>,
+    groups: Vec<TaskGroup>,
+    listen_addr: SocketAddr,
+    cmd_tx: mpsc::Sender<SchedulerCommand>,
 }
 
 impl FusionEngine {
@@ -90,30 +138,53 @@ impl FusionEngine {
         // 8. Create bounded event channel
         let (event_tx, event_rx) = mpsc::channel(4096);
 
-        // 9. Alert pipeline — build sink, create channel, spawn consumer task
+        // ---------------------------------------------------------------
+        // Task groups — assembled in start order, joined LIFO on shutdown.
+        //
+        //   start:  alert → infra → scheduler → receiver
+        //   join:   receiver → scheduler → alert → infra
+        // ---------------------------------------------------------------
+        let mut groups: Vec<TaskGroup> = Vec::with_capacity(4);
+
+        // 9. Alert pipeline — build sink, create channel, spawn consumer task.
+        //    The alert task has no cancel token; it exits when the scheduler
+        //    drops its Sender after drain + flush, ensuring zero alert loss.
         let alert_sink = build_alert_sink(&config)?;
         let (alert_tx, alert_rx) = mpsc::channel(alert_task::ALERT_CHANNEL_CAPACITY);
-        let mut join_handles: Vec<JoinHandle<Result<()>>> = Vec::new();
-        let alert_cancel = cancel.child_token();
-        join_handles.push(tokio::spawn(async move {
-            alert_task::run_alert_sink(alert_rx, alert_sink, alert_cancel).await;
+        let mut alert_group = TaskGroup::new("alert");
+        alert_group.push(tokio::spawn(async move {
+            alert_task::run_alert_sink(alert_rx, alert_sink).await;
             Ok(())
         }));
+        groups.push(alert_group);
 
         // 10. Evictor task
         let evictor = Evictor::new(config.window_defaults.max_total_bytes.as_bytes());
         let evict_interval = config.window_defaults.evict_interval.as_duration();
         let evictor_cancel = cancel.child_token();
         let evictor_router = Arc::clone(&router);
-        join_handles.push(tokio::spawn(async move {
+        let mut infra_group = TaskGroup::new("infra");
+        infra_group.push(tokio::spawn(async move {
             evictor_task::run_evictor(evictor, evictor_router, evict_interval, evictor_cancel)
                 .await;
             Ok(())
         }));
+        groups.push(infra_group);
 
-        // 11. Scheduler task
-        let scheduler = Scheduler::new(event_rx, engines, alert_tx, cancel.child_token());
-        join_handles.push(tokio::spawn(async move { scheduler.run().await }));
+        // 11. Control command channel + Scheduler task
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let scheduler = Scheduler::new(
+            event_rx,
+            engines,
+            alert_tx,
+            cancel.child_token(),
+            config.runtime.executor_parallelism,
+            config.runtime.rule_exec_timeout.as_duration(),
+            cmd_rx,
+        );
+        let mut scheduler_group = TaskGroup::new("scheduler");
+        scheduler_group.push(tokio::spawn(async move { scheduler.run().await }));
+        groups.push(scheduler_group);
 
         // 12. Receiver task (last — starts accepting data)
         let receiver = Receiver::bind_with_event_tx(
@@ -122,6 +193,7 @@ impl FusionEngine {
             event_tx,
         )
         .await?;
+        let listen_addr = receiver.local_addr()?;
         // Wire the receiver's internal cancel to our root cancel
         let receiver_cancel = receiver.cancel_token();
         let root_cancel = cancel.clone();
@@ -129,23 +201,39 @@ impl FusionEngine {
             root_cancel.cancelled().await;
             receiver_cancel.cancel();
         });
-        join_handles.push(tokio::spawn(async move { receiver.run().await }));
+        let mut receiver_group = TaskGroup::new("receiver");
+        receiver_group.push(tokio::spawn(async move { receiver.run().await }));
+        groups.push(receiver_group);
 
         Ok(Self {
             cancel,
-            join_handles,
+            groups,
+            listen_addr,
+            cmd_tx,
         })
+    }
+
+    /// Returns the local address the engine is listening on.
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.listen_addr
     }
 
     /// Request graceful shutdown of all tasks.
     pub fn shutdown(&self) {
+        log::info!("initiating graceful shutdown");
         self.cancel.cancel();
     }
 
-    /// Wait for all tasks to complete after shutdown.
-    pub async fn wait(self) -> Result<()> {
-        for handle in self.join_handles {
-            handle.await??;
+    /// Wait for all task groups to complete after shutdown.
+    ///
+    /// Groups are joined in LIFO order (reverse of start order):
+    /// receiver → scheduler → alert → infra.
+    pub async fn wait(mut self) -> Result<()> {
+        while let Some(group) = self.groups.pop() {
+            let name = group.name;
+            log::debug!("waiting for task group '{name}' to finish");
+            group.wait().await?;
+            log::debug!("task group '{name}' finished");
         }
         Ok(())
     }
@@ -153,6 +241,11 @@ impl FusionEngine {
     /// Returns a clone of the root cancellation token (for signal integration).
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
+    }
+
+    /// Returns a clone of the scheduler command sender.
+    pub fn command_sender(&self) -> mpsc::Sender<SchedulerCommand> {
+        self.cmd_tx.clone()
     }
 }
 
@@ -177,11 +270,29 @@ fn build_alert_sink(config: &FusionConfig) -> Result<Arc<dyn AlertSink>> {
     })
 }
 
-/// Register Ctrl-C / SIGTERM handling and cancel the engine on signal.
+/// Register Ctrl-C (SIGINT) and SIGTERM handling; cancel the engine on first
+/// signal received.
 pub async fn wait_for_signal(cancel: CancellationToken) {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for Ctrl-C");
-    log::info!("received shutdown signal, initiating graceful shutdown");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                log::info!("received SIGINT, initiating graceful shutdown");
+            }
+            _ = sigterm.recv() => {
+                log::info!("received SIGTERM, initiating graceful shutdown");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for Ctrl-C");
+        log::info!("received shutdown signal, initiating graceful shutdown");
+    }
     cancel.cancel();
 }

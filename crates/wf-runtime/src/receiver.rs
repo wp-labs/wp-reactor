@@ -99,7 +99,10 @@ async fn handle_connection(
                             Ok(frame) => {
                                 // Send to scheduler before routing to windows
                                 if let Some(tx) = &event_tx {
-                                    let _ = tx.send((frame.tag.clone(), frame.batch.clone())).await;
+                                    if tx.send((frame.tag.clone(), frame.batch.clone())).await.is_err() {
+                                        log::warn!("event channel closed, dropping connection from {peer}");
+                                        break;
+                                    }
                                 }
                                 if let Err(e) = router.route(&frame.tag, frame.batch) {
                                     log::warn!("route error: {e}");
