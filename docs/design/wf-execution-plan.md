@@ -379,7 +379,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-datagen` |
-| 范围 | Rule-aware 数据生成：按 `.wfl` 编译产物驱动 hit / near_miss / non_hit 三类数据分布；Reference Evaluator 自动计算 oracle（期望告警）；oracle 输出为标准 JSONL（match key = `rule_name, entity_type, entity_id, close_reason`）；`wf-datagen verify` 对拍命令（actual vs oracle 差异报告）；CI 阻断条件（`missing == 0 && unexpected == 0 && field_mismatch == 0`） |
+| 范围 | Rule-aware 数据生成：按 `.wfl` 编译产物驱动 hit / near_miss / non_hit 三类数据分布；Reference Evaluator 自动计算 oracle（期望告警）；oracle 输出为标准 JSONL（match key = `rule_name, entity_type, entity_id, close_reason`）；oracle 开关策略统一为“语法优先”（`.wfg` 存在 `oracle` 块即默认生成，CLI 仅允许 `--no-oracle` 临时关闭）；`wf-datagen verify` 对拍命令（actual vs oracle 差异报告）；CI 阻断条件（`missing == 0 && unexpected == 0 && field_mismatch == 0`） |
 | 依赖 | M13 ✅, M31；verify 端到端需 M20 |
 | 验收 | 生成的 hit 数据确实触发规则；near_miss 数据不触发规则；oracle 与 `wf run --replay` 实际告警对拍通过；verify 差异报告格式正确 |
 | 状态 | **已完成** — `inject_gen.rs` rule-aware 生成 + `oracle/` Reference Evaluator + `verify/` 贪心配对报告 + `verify` CLI 子命令，60 项测试通过 |

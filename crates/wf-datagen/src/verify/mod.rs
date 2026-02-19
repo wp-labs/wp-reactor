@@ -152,13 +152,15 @@ type MatchKey = (String, String, String, Option<String>);
 /// Algorithm:
 /// 1. Group both sides by match key `(rule_name, entity_type, entity_id, close_reason)`.
 /// 2. Within each group, greedily pair by nearest time.
-/// 3. Paired alerts with `|score_diff| > tolerance` count as field_mismatch.
+/// 3. Paired alerts with `|time_diff| > time_tolerance` or `|score_diff| > score_tolerance`
+///    count as field_mismatch.
 /// 4. Unpaired expected → missing, unpaired actual → unexpected.
 /// 5. Status = "pass" iff missing == 0 && unexpected == 0 && field_mismatch == 0.
 pub fn verify(
     expected: &[OracleAlert],
     actual: &[ActualAlert],
     score_tolerance: f64,
+    time_tolerance_secs: f64,
 ) -> VerifyReport {
     let expected_groups = group_expected(expected);
     let actual_groups = group_actual(actual);
@@ -189,7 +191,7 @@ pub fn verify(
 
         match (exp_list, act_list) {
             (Some(exp), Some(act)) => {
-                let result = greedy_match(exp, act, score_tolerance);
+                let result = greedy_match(exp, act, score_tolerance, time_tolerance_secs);
                 matched += result.matched;
                 field_mismatch += result.mismatches.len();
                 missing += result.missing_indices.len();
@@ -333,6 +335,7 @@ fn greedy_match(
     expected: &[&OracleAlert],
     actual: &[&ActualAlert],
     score_tolerance: f64,
+    time_tolerance_secs: f64,
 ) -> MatchResult {
     let mut used_actual = vec![false; actual.len()];
     let mut matched = 0usize;
@@ -361,7 +364,8 @@ fn greedy_match(
             used_actual[j] = true;
             paired_expected[ei] = true;
             let score_diff = (exp.score - actual[j].score).abs();
-            if score_diff <= score_tolerance {
+            let time_diff = best_dist; // abs time diff in seconds
+            if score_diff <= score_tolerance && time_diff <= time_tolerance_secs {
                 matched += 1;
             } else {
                 mismatches.push((ei, j));

@@ -35,19 +35,29 @@ pub struct OracleResult {
 /// timestamp order, and collects oracle alerts. Uses synthetic `Instant`s
 /// derived from event timestamps so that window expiry works correctly in
 /// single-threaded deterministic mode.
+///
+/// SC7: when `injected_rules` is `Some`, only the rules whose names appear
+/// in the set are evaluated. Rules without `inject` coverage are skipped so
+/// the oracle doesn't generate spurious expected hits from baseline traffic.
 pub fn run_oracle(
     events: &[GenEvent],
     rule_plans: &[RulePlan],
     scenario_start: &DateTime<Utc>,
     scenario_duration: &Duration,
+    injected_rules: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<OracleResult> {
     if rule_plans.is_empty() {
         return Ok(OracleResult { alerts: vec![] });
     }
 
-    // Build per-rule engines
+    // Build per-rule engines, filtering to injected rules only (SC7)
     let mut engines: Vec<RuleEngine> = rule_plans
         .iter()
+        .filter(|plan| {
+            injected_rules
+                .map(|set| set.contains(&plan.name))
+                .unwrap_or(true)
+        })
         .map(|plan| {
             let alias_map = build_window_alias_map(plan);
             RuleEngine {
@@ -88,28 +98,30 @@ pub fn run_oracle(
                 }
             }
 
-            // Find bind alias for this event's window
-            let bind_alias = match engine.alias_map.get(&event.window_name) {
-                Some(alias) => alias.clone(),
+            // Find bind aliases for this event's window
+            let bind_aliases = match engine.alias_map.get(&event.window_name) {
+                Some(aliases) => aliases,
                 None => continue, // this rule doesn't use this window
             };
 
-            // Advance the state machine
-            let result =
-                engine
-                    .sm
-                    .advance_with_instant(&bind_alias, &core_event, synthetic_now);
+            // Advance the state machine for each alias bound to this window
+            for bind_alias in bind_aliases {
+                let result =
+                    engine
+                        .sm
+                        .advance_with_instant(bind_alias, &core_event, synthetic_now);
 
-            if let StepResult::Matched(ctx) = result {
-                if let Ok(alert_record) = engine.executor.execute_match(&ctx) {
-                    alerts.push(OracleAlert {
-                        rule_name: alert_record.rule_name,
-                        score: alert_record.score,
-                        entity_type: alert_record.entity_type,
-                        entity_id: alert_record.entity_id,
-                        close_reason: None,
-                        emit_time: event.timestamp.to_rfc3339(),
-                    });
+                if let StepResult::Matched(ctx) = result {
+                    if let Ok(alert_record) = engine.executor.execute_match(&ctx) {
+                        alerts.push(OracleAlert {
+                            rule_name: alert_record.rule_name,
+                            score: alert_record.score,
+                            entity_type: alert_record.entity_type,
+                            entity_id: alert_record.entity_id,
+                            close_reason: None,
+                            emit_time: event.timestamp.to_rfc3339(),
+                        });
+                    }
                 }
             }
         }
@@ -148,16 +160,17 @@ pub fn run_oracle(
 struct RuleEngine {
     sm: CepStateMachine,
     executor: RuleExecutor,
-    /// window_name → bind_alias
-    alias_map: HashMap<String, String>,
+    /// window_name → Vec<bind_alias> for routing events to all matching aliases
+    alias_map: HashMap<String, Vec<String>>,
 }
 
-/// Build a mapping from window name to bind alias for a rule.
-fn build_window_alias_map(plan: &RulePlan) -> HashMap<String, String> {
-    let mut map = HashMap::new();
+/// Build a mapping from window name to ALL bind aliases for a rule.
+fn build_window_alias_map(plan: &RulePlan) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for bind in &plan.binds {
         map.entry(bind.window.clone())
-            .or_insert_with(|| bind.alias.clone());
+            .or_default()
+            .push(bind.alias.clone());
     }
     map
 }
@@ -180,4 +193,43 @@ fn json_to_core_value(v: &serde_json::Value) -> Option<Value> {
         serde_json::Value::Bool(b) => Some(Value::Bool(*b)),
         _ => None,
     }
+}
+
+/// Tolerance settings extracted from the oracle block params.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OracleTolerances {
+    /// Time tolerance for verify matching (default 1s).
+    pub time_tolerance_secs: f64,
+    /// Score tolerance for verify matching (default 0.01).
+    pub score_tolerance: f64,
+}
+
+impl Default for OracleTolerances {
+    fn default() -> Self {
+        Self {
+            time_tolerance_secs: 1.0,
+            score_tolerance: 0.01,
+        }
+    }
+}
+
+/// Extract tolerance parameters from the parsed oracle block.
+pub fn extract_oracle_tolerances(oracle: &crate::wfg_ast::OracleBlock) -> OracleTolerances {
+    let mut tolerances = OracleTolerances::default();
+    for param in &oracle.params {
+        match param.name.as_str() {
+            "time_tolerance" => {
+                if let crate::wfg_ast::ParamValue::Duration(d) = &param.value {
+                    tolerances.time_tolerance_secs = d.as_secs_f64();
+                }
+            }
+            "score_tolerance" => {
+                if let crate::wfg_ast::ParamValue::Number(n) = &param.value {
+                    tolerances.score_tolerance = *n;
+                }
+            }
+            _ => {}
+        }
+    }
+    tolerances
 }

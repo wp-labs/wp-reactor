@@ -2,7 +2,7 @@ use arrow::record_batch::RecordBatch;
 
 /// An alert produced by [`RuleExecutor`](crate::rule::RuleExecutor) when the
 /// CEP state machine signals a match or close.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AlertRecord {
     /// Composite alert key: `"rule|key1\x1fkey2|fired_at#seq"`.
     ///
@@ -24,6 +24,7 @@ pub struct AlertRecord {
     /// ISO 8601 UTC timestamp (`SystemTime`-based, no chrono).
     pub fired_at: String,
     /// Matched rows — always `vec![]` for L1 (placeholder for M25 join).
+    #[serde(skip)]
     pub matched_rows: Vec<RecordBatch>,
     /// Human-readable summary of the alert.
     pub summary: String,

@@ -346,6 +346,25 @@ impl CepStateMachine {
         }
         results
     }
+
+    /// Close all active instances, returning a [`CloseOutput`] for each.
+    ///
+    /// Used during shutdown to flush all in-flight state.
+    pub fn close_all(&mut self, reason: CloseReason) -> Vec<CloseOutput> {
+        let keys: Vec<String> = self.instances.keys().cloned().collect();
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(instance) = self.instances.remove(&key) {
+                results.push(evaluate_close(
+                    &self.rule_name,
+                    &self.plan,
+                    instance,
+                    reason,
+                ));
+            }
+        }
+        results
+    }
 }
 
 // ---------------------------------------------------------------------------

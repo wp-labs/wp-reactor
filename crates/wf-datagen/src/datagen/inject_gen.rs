@@ -10,7 +10,7 @@ use wf_lang::{BaseType, FieldType, WindowSchema};
 
 use crate::datagen::field_gen::generate_field_value;
 use crate::datagen::stream_gen::GenEvent;
-use crate::wfg_ast::{InjectLine, InjectMode, StreamBlock, WfgFile};
+use crate::wfg_ast::{InjectLine, InjectMode, ParamValue, StreamBlock, WfgFile};
 
 /// Result of inject event generation.
 pub struct InjectGenResult {
@@ -28,6 +28,7 @@ struct RuleStructure {
     entity_id_field: Option<String>,
 }
 
+#[derive(Clone)]
 #[allow(dead_code)]
 struct StepInfo {
     bind_alias: String,
@@ -141,6 +142,10 @@ fn build_alias_map(
 ) -> anyhow::Result<AliasMap> {
     let mut bind_to_scenario = HashMap::new();
 
+    // Per SC6/SC2a, each inject stream alias IS the rule bind alias.
+    // The scenario stream declaration `stream fail: LoginWindow 100/s`
+    // declares alias "fail" which matches `events fail : LoginWindow`
+    // in the .wfl rule. Match directly by alias name.
     for scenario_alias in inject_streams {
         let stream_block = scenario_streams
             .iter()
@@ -149,23 +154,19 @@ fn build_alias_map(
                 anyhow::anyhow!("inject stream '{}' not found in scenario", scenario_alias)
             })?;
 
-        let window = &stream_block.window;
-
-        let bind = rule_plan
-            .binds
-            .iter()
-            .find(|b| &b.window == window)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no rule bind for window '{}' (inject stream '{}')",
-                    window,
-                    scenario_alias
-                )
-            })?;
+        // Verify the alias exists in the rule's binds (SC6 should have
+        // caught this at validation time, but belt-and-suspenders).
+        if !rule_plan.binds.iter().any(|b| b.alias == *scenario_alias) {
+            anyhow::bail!(
+                "inject stream '{}' is not a bind alias in rule '{}'",
+                scenario_alias,
+                rule_plan.name
+            );
+        }
 
         bind_to_scenario.insert(
-            bind.alias.clone(),
-            (scenario_alias.clone(), window.clone()),
+            scenario_alias.clone(),
+            (scenario_alias.clone(), stream_block.window.clone()),
         );
     }
 
@@ -236,6 +237,47 @@ pub(crate) fn eval_const_threshold(expr: &Expr) -> Option<f64> {
     }
 }
 
+/// Override parameters extracted from inject line params.
+struct InjectOverrides {
+    /// Override the threshold (events per entity) for hit/near_miss clusters.
+    count_per_entity: Option<u64>,
+    /// For near_miss multi-step: how many steps to complete (0-indexed last step).
+    steps_completed: Option<usize>,
+    /// Override the window duration for cluster time distribution.
+    within: Option<Duration>,
+}
+
+fn extract_inject_overrides(inject_line: &InjectLine) -> InjectOverrides {
+    let mut overrides = InjectOverrides {
+        count_per_entity: None,
+        steps_completed: None,
+        within: None,
+    };
+
+    for param in &inject_line.params {
+        match param.name.as_str() {
+            "count_per_entity" => {
+                if let ParamValue::Number(n) = &param.value {
+                    overrides.count_per_entity = Some(*n as u64);
+                }
+            }
+            "steps_completed" => {
+                if let ParamValue::Number(n) = &param.value {
+                    overrides.steps_completed = Some(*n as usize);
+                }
+            }
+            "within" => {
+                if let ParamValue::Duration(d) = &param.value {
+                    overrides.within = Some(*d);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    overrides
+}
+
 pub(crate) fn field_ref_field_name(fr: &FieldRef) -> &str {
     match fr {
         FieldRef::Simple(name) => name,
@@ -266,6 +308,8 @@ fn generate_for_line(
     rng: &mut StdRng,
     inject_counts: &mut HashMap<String, u64>,
 ) -> anyhow::Result<Vec<GenEvent>> {
+    let overrides = extract_inject_overrides(inject_line);
+
     match inject_line.mode {
         InjectMode::Hit => generate_hit_clusters(
             inject_line.percent,
@@ -277,6 +321,7 @@ fn generate_for_line(
             duration,
             rng,
             inject_counts,
+            &overrides,
         ),
         InjectMode::NearMiss => generate_near_miss_clusters(
             inject_line.percent,
@@ -288,6 +333,7 @@ fn generate_for_line(
             duration,
             rng,
             inject_counts,
+            &overrides,
         ),
         InjectMode::NonHit => generate_non_hit_events(
             inject_line.percent,
@@ -317,21 +363,40 @@ fn generate_hit_clusters(
     duration: &Duration,
     rng: &mut StdRng,
     inject_counts: &mut HashMap<String, u64>,
+    overrides: &InjectOverrides,
 ) -> anyhow::Result<Vec<GenEvent>> {
-    let num_clusters = compute_cluster_count(percent, &rule_struct.steps, stream_totals);
+    // Apply count_per_entity override: use overridden threshold for cluster sizing
+    let effective_steps: Vec<StepInfo> = if let Some(cpe) = overrides.count_per_entity {
+        rule_struct
+            .steps
+            .iter()
+            .map(|s| StepInfo {
+                bind_alias: s.bind_alias.clone(),
+                scenario_alias: s.scenario_alias.clone(),
+                window_name: s.window_name.clone(),
+                measure: s.measure,
+                threshold: cpe, // override
+            })
+            .collect()
+    } else {
+        rule_struct.steps.clone()
+    };
+
+    let num_clusters = compute_cluster_count(percent, &effective_steps, stream_totals);
     if num_clusters == 0 {
         return Ok(Vec::new());
     }
 
     // Update inject counts
-    for step in &rule_struct.steps {
+    for step in &effective_steps {
         *inject_counts
             .entry(step.scenario_alias.clone())
             .or_insert(0) += step.threshold * num_clusters;
     }
 
     let dur_secs = duration.as_secs_f64();
-    let window_secs = rule_struct.window_dur.as_secs_f64();
+    let window_dur = overrides.within.unwrap_or(rule_struct.window_dur);
+    let window_secs = window_dur.as_secs_f64();
     let max_start_offset = (dur_secs - window_secs).max(0.0);
 
     let mut events = Vec::new();
@@ -343,7 +408,7 @@ fn generate_hit_clusters(
             entity_counter,
             "hit",
             schemas,
-            &rule_struct.steps,
+            &effective_steps,
         );
         entity_counter += 1;
 
@@ -354,7 +419,7 @@ fn generate_hit_clusters(
         };
 
         generate_cluster_events(
-            &rule_struct.steps,
+            &effective_steps,
             |step| step.threshold,
             &key_overrides,
             cluster_start_secs,
@@ -384,6 +449,7 @@ fn generate_near_miss_clusters(
     duration: &Duration,
     rng: &mut StdRng,
     inject_counts: &mut HashMap<String, u64>,
+    overrides: &InjectOverrides,
 ) -> anyhow::Result<Vec<GenEvent>> {
     // For near-miss: N-1 events per cluster for the last step,
     // full threshold for preceding steps.
@@ -393,16 +459,31 @@ fn generate_near_miss_clusters(
         return Ok(Vec::new());
     }
 
+    // Apply count_per_entity to override the near-miss step threshold
+    let effective_threshold_nm = overrides
+        .count_per_entity
+        .unwrap_or(steps[steps.len() - 1].threshold);
+
+    // Apply steps_completed to control which steps get full events.
+    // steps_completed = index of the near-miss step (gets threshold-1).
+    // Steps before it: full threshold. Steps after it: 0 events.
+    let steps_completed = overrides.steps_completed.unwrap_or(steps.len() - 1);
+    let nm_step_idx = steps_completed.min(steps.len() - 1);
+
     // Events per cluster for near-miss
     let near_miss_counts: Vec<u64> = steps
         .iter()
         .enumerate()
         .map(|(i, step)| {
-            if i == steps.len() - 1 {
-                // Last step: N-1 (or 0 if threshold <= 1)
-                step.threshold.saturating_sub(1)
+            if i > nm_step_idx {
+                // Beyond the near-miss step: no events
+                0
+            } else if i == nm_step_idx {
+                // The near-miss step: threshold - 1
+                effective_threshold_nm.saturating_sub(1)
             } else {
-                step.threshold
+                // Fully completed preceding steps
+                overrides.count_per_entity.unwrap_or(step.threshold)
             }
         })
         .collect();
@@ -413,13 +494,13 @@ fn generate_near_miss_clusters(
         return Ok(Vec::new());
     }
 
-    // Compute number of clusters from the primary step's budget
-    let primary_step = &steps[steps.len() - 1];
+    // Compute number of clusters from the near-miss step's budget
+    let primary_step = &steps[nm_step_idx];
     let stream_total = *stream_totals.get(&primary_step.scenario_alias).unwrap_or(&0);
     let budget = (stream_total as f64 * percent / 100.0).round() as u64;
-    let nm_count_for_last = near_miss_counts[steps.len() - 1];
-    let num_clusters = if nm_count_for_last > 0 {
-        budget / nm_count_for_last
+    let nm_count = near_miss_counts[nm_step_idx];
+    let num_clusters = if nm_count > 0 {
+        budget / nm_count
     } else {
         0
     };
@@ -436,7 +517,8 @@ fn generate_near_miss_clusters(
     }
 
     let dur_secs = duration.as_secs_f64();
-    let window_secs = rule_struct.window_dur.as_secs_f64();
+    let window_dur = overrides.within.unwrap_or(rule_struct.window_dur);
+    let window_secs = window_dur.as_secs_f64();
     let max_start_offset = (dur_secs - window_secs).max(0.0);
 
     let mut events = Vec::new();
