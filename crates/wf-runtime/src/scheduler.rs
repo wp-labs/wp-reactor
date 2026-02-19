@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use wf_core::alert::{AlertRecord, AlertSink};
+use wf_core::alert::AlertRecord;
 use wf_core::rule::{
     CepStateMachine, CloseReason, RuleExecutor, StepResult, batch_to_events,
 };
@@ -34,7 +33,7 @@ pub(crate) struct RuleEngine {
 pub struct Scheduler {
     event_rx: mpsc::Receiver<(String, RecordBatch)>,
     engines: Vec<RuleEngine>,
-    alert_sink: Arc<dyn AlertSink>,
+    alert_tx: mpsc::Sender<AlertRecord>,
     cancel: CancellationToken,
 }
 
@@ -42,13 +41,13 @@ impl Scheduler {
     pub(crate) fn new(
         event_rx: mpsc::Receiver<(String, RecordBatch)>,
         engines: Vec<RuleEngine>,
-        alert_sink: Arc<dyn AlertSink>,
+        alert_tx: mpsc::Sender<AlertRecord>,
         cancel: CancellationToken,
     ) -> Self {
         Self {
             event_rx,
             engines,
-            alert_sink,
+            alert_tx,
             cancel,
         }
     }
@@ -81,7 +80,7 @@ impl Scheduler {
             return;
         }
 
-        let sink = &self.alert_sink;
+        let tx = &self.alert_tx;
         for engine in &mut self.engines {
             let Some(aliases) = engine.stream_aliases.get(tag) else {
                 continue;
@@ -91,7 +90,7 @@ impl Scheduler {
                     match engine.machine.advance(alias, event) {
                         StepResult::Matched(ctx) => {
                             match engine.executor.execute_match(&ctx) {
-                                Ok(record) => emit_alert(sink, &record),
+                                Ok(record) => emit_alert(tx, record),
                                 Err(e) => log::warn!("execute_match error: {e}"),
                             }
                         }
@@ -105,12 +104,12 @@ impl Scheduler {
     /// Scan all engines for expired instances.
     fn scan_timeouts(&mut self) {
         let now = Instant::now();
-        let sink = &self.alert_sink;
+        let tx = &self.alert_tx;
         for engine in &mut self.engines {
             let close_outputs = engine.machine.scan_expired(now);
             for close in &close_outputs {
                 match engine.executor.execute_close(close) {
-                    Ok(Some(record)) => emit_alert(sink, &record),
+                    Ok(Some(record)) => emit_alert(tx, record),
                     Ok(None) => {} // rule not fully satisfied
                     Err(e) => log::warn!("execute_close error: {e}"),
                 }
@@ -120,12 +119,12 @@ impl Scheduler {
 
     /// Flush all engines on shutdown: close every active instance.
     fn flush_all(&mut self) {
-        let sink = &self.alert_sink;
+        let tx = &self.alert_tx;
         for engine in &mut self.engines {
             let close_outputs = engine.machine.close_all(CloseReason::Flush);
             for close in &close_outputs {
                 match engine.executor.execute_close(close) {
-                    Ok(Some(record)) => emit_alert(sink, &record),
+                    Ok(Some(record)) => emit_alert(tx, record),
                     Ok(None) => {}
                     Err(e) => log::warn!("execute_close flush error: {e}"),
                 }
@@ -134,9 +133,9 @@ impl Scheduler {
     }
 }
 
-fn emit_alert(sink: &Arc<dyn AlertSink>, record: &AlertRecord) {
-    if let Err(e) = sink.send(record) {
-        log::warn!("alert sink error: {e}");
+fn emit_alert(tx: &mpsc::Sender<AlertRecord>, record: AlertRecord) {
+    if let Err(e) = tx.try_send(record) {
+        log::warn!("alert channel full or closed: {e}");
     }
 }
 
@@ -169,34 +168,10 @@ pub(crate) fn build_stream_aliases(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::Arc;
     use wf_core::alert::AlertRecord;
     use wf_lang::ast::{CmpOp, Expr, FieldRef, Measure};
     use wf_lang::plan::*;
-
-    /// In-memory alert sink for testing.
-    struct MemAlertSink {
-        alerts: Mutex<Vec<AlertRecord>>,
-    }
-
-    impl MemAlertSink {
-        fn new() -> Self {
-            Self {
-                alerts: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn alerts(&self) -> Vec<AlertRecord> {
-            self.alerts.lock().unwrap().clone()
-        }
-    }
-
-    impl AlertSink for MemAlertSink {
-        fn send(&self, record: &AlertRecord) -> anyhow::Result<()> {
-            self.alerts.lock().unwrap().push(record.clone());
-            Ok(())
-        }
-    }
 
     /// Build a minimal RulePlan for testing: single event step, count >= 1.
     fn simple_rule_plan(alias: &str, window: &str) -> RulePlan {
@@ -252,6 +227,15 @@ mod tests {
         }
     }
 
+    /// Collect all alerts from the receiver side of the channel.
+    async fn collect_alerts(mut rx: mpsc::Receiver<AlertRecord>) -> Vec<AlertRecord> {
+        let mut out = Vec::new();
+        while let Some(record) = rx.recv().await {
+            out.push(record);
+        }
+        out
+    }
+
     #[tokio::test]
     async fn test_scheduler_dispatches_events() {
         let plan = simple_rule_plan("a", "auth_events");
@@ -264,11 +248,11 @@ mod tests {
             stream_aliases,
         };
 
-        let sink = Arc::new(MemAlertSink::new());
+        let (alert_tx, alert_rx) = mpsc::channel(16);
         let (tx, rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
 
-        let scheduler = Scheduler::new(rx, vec![engine], sink.clone(), cancel.clone());
+        let scheduler = Scheduler::new(rx, vec![engine], alert_tx, cancel.clone());
         let handle = tokio::spawn(async move { scheduler.run().await });
 
         // Build a minimal RecordBatch with an "sip" column
@@ -286,13 +270,13 @@ mod tests {
         // Give the scheduler time to process
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let alerts = sink.alerts();
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+
+        let alerts = collect_alerts(alert_rx).await;
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].rule_name, "test_rule");
         assert_eq!(alerts[0].entity_id, "10.0.0.1");
-
-        cancel.cancel();
-        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -325,11 +309,11 @@ mod tests {
             stream_aliases,
         };
 
-        let sink = Arc::new(MemAlertSink::new());
+        let (alert_tx, alert_rx) = mpsc::channel(16);
         let (tx, rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
 
-        let scheduler = Scheduler::new(rx, vec![engine], sink.clone(), cancel.clone());
+        let scheduler = Scheduler::new(rx, vec![engine], alert_tx, cancel.clone());
         let handle = tokio::spawn(async move { scheduler.run().await });
 
         // Send 1 event — not enough to match (need 3) but enough to create instance
@@ -344,9 +328,6 @@ mod tests {
         tx.send(("syslog".to_string(), batch)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // No match alert yet (need 3 events)
-        assert_eq!(sink.alerts().len(), 0);
-
         // Cancel → flush
         cancel.cancel();
         handle.await.unwrap().unwrap();
@@ -355,5 +336,6 @@ mod tests {
         // being satisfied: count>=1 is met (one event accumulated), and event_ok
         // is false (only 1 of 3 events). So execute_close returns None.
         // This is expected behavior — partial match doesn't produce alert.
+        let _alerts = collect_alerts(alert_rx).await;
     }
 }

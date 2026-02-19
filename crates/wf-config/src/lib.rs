@@ -6,7 +6,7 @@ pub mod types;
 pub mod validate;
 pub mod window;
 
-pub use alert::AlertConfig;
+pub use alert::{AlertConfig, SinkUri, parse_sink_uri};
 pub use fusion::FusionConfig;
 pub use runtime::RuntimeConfig;
 pub use server::ServerConfig;

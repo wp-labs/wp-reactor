@@ -1839,7 +1839,6 @@ mode_kw  percent  param=value ... ;
 Generated 200000 events -> out/brute_force_load.jsonl
 Oracle: 1234 alerts -> out/brute_force_load.oracle.jsonl
 ```
-```
 
 ### 18.4 Oracle 生成策略
 
@@ -1954,7 +1953,7 @@ wf-datagen gen \
 
 ### 18.8 CI 接入标准流程
 
-1. `wf-datagen gen` 生成 `events + manifest`；当 `.wfg` 存在 `oracle` 块且未指定 `--no-oracle` 时，同时生成 oracle。
+1. `wf-datagen gen` 生成 events；当 `.wfg` 存在 `oracle` 块且未指定 `--no-oracle` 时，同时生成 oracle。
 2. `wf run --replay out/events/*` 产出 `actual_alerts.jsonl`（可切换 TCP 回放模式）。
 3. `wf-datagen verify` 输出差异报告。
 4. CI 阻断条件（默认）：`missing == 0 && unexpected == 0 && field_mismatch == 0`。

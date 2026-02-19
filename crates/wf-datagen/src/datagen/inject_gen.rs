@@ -195,15 +195,13 @@ fn extract_rule_structure(
             .ok_or_else(|| anyhow::anyhow!("step has no branches"))?;
 
         let bind_alias = &branch.source;
-        let (scenario_alias, window_name) = alias_map
-            .bind_to_scenario
-            .get(bind_alias)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "bind alias '{}' not mapped to any inject stream",
-                    bind_alias
-                )
-            })?;
+
+        // SC6: inject streams are a *subset* of rule aliases.
+        // Skip steps whose bind alias is not covered by inject.
+        let (scenario_alias, window_name) = match alias_map.bind_to_scenario.get(bind_alias) {
+            Some(pair) => pair,
+            None => continue,
+        };
 
         let threshold = eval_const_threshold(&branch.agg.threshold)
             .ok_or_else(|| anyhow::anyhow!("cannot evaluate threshold as constant"))?
@@ -216,6 +214,14 @@ fn extract_rule_structure(
             measure: branch.agg.measure,
             threshold,
         });
+    }
+
+    if steps.is_empty() {
+        anyhow::bail!(
+            "no inject streams map to any step in rule '{}'; \
+             at least one inject alias must match a rule bind alias",
+            rule_plan.name
+        );
     }
 
     let entity_id_field = extract_entity_id_field(&rule_plan.entity_plan.entity_id_expr);
@@ -420,7 +426,7 @@ fn generate_hit_clusters(
 
         generate_cluster_events(
             &effective_steps,
-            |step| step.threshold,
+            |_idx, step| step.threshold,
             &key_overrides,
             cluster_start_secs,
             window_secs,
@@ -543,10 +549,7 @@ fn generate_near_miss_clusters(
         let nm = near_miss_counts.clone();
         generate_cluster_events(
             steps,
-            |step| {
-                let idx = steps.iter().position(|s| s.bind_alias == step.bind_alias).unwrap_or(0);
-                nm[idx]
-            },
+            |idx, _step| nm[idx],
             &key_overrides,
             cluster_start_secs,
             window_secs,
@@ -682,7 +685,7 @@ fn compute_cluster_count(
 /// Generate cluster events across all steps.
 fn generate_cluster_events(
     steps: &[StepInfo],
-    count_fn: impl Fn(&StepInfo) -> u64,
+    count_fn: impl Fn(usize, &StepInfo) -> u64,
     key_overrides: &HashMap<String, serde_json::Value>,
     cluster_start_secs: f64,
     window_secs: f64,
@@ -700,8 +703,8 @@ fn generate_cluster_events(
         window_secs
     };
 
-    for step in steps {
-        let event_count = count_fn(step);
+    for (step_idx, step) in steps.iter().enumerate() {
+        let event_count = count_fn(step_idx, step);
         if event_count == 0 {
             continue;
         }

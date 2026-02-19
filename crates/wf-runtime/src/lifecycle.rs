@@ -7,11 +7,12 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use wf_config::FusionConfig;
-use wf_core::alert::{AlertSink, FileAlertSink};
+use wf_config::{FusionConfig, SinkUri};
+use wf_core::alert::{AlertSink, FanOutSink, FileAlertSink};
 use wf_core::rule::{CepStateMachine, RuleExecutor};
 use wf_core::window::{Evictor, Router, WindowRegistry};
 
+use crate::alert_task;
 use crate::evictor_task;
 use crate::receiver::Receiver;
 use crate::scheduler::{RuleEngine, Scheduler, build_stream_aliases};
@@ -89,14 +90,17 @@ impl FusionEngine {
         // 8. Create bounded event channel
         let (event_tx, event_rx) = mpsc::channel(4096);
 
-        // 9. AlertSink — use the first file:// sink URI, or a default path
-        let alert_path = resolve_alert_path(&config, base_dir);
-        let alert_sink: Arc<dyn AlertSink> = Arc::new(FileAlertSink::open(&alert_path)?);
+        // 9. Alert pipeline — build sink, create channel, spawn consumer task
+        let alert_sink = build_alert_sink(&config)?;
+        let (alert_tx, alert_rx) = mpsc::channel(alert_task::ALERT_CHANNEL_CAPACITY);
+        let mut join_handles: Vec<JoinHandle<Result<()>>> = Vec::new();
+        let alert_cancel = cancel.child_token();
+        join_handles.push(tokio::spawn(async move {
+            alert_task::run_alert_sink(alert_rx, alert_sink, alert_cancel).await;
+            Ok(())
+        }));
 
-        // 10. Spawn tasks
-        let mut join_handles = Vec::new();
-
-        // a. Evictor task
+        // 10. Evictor task
         let evictor = Evictor::new(config.window_defaults.max_total_bytes.as_bytes());
         let evict_interval = config.window_defaults.evict_interval.as_duration();
         let evictor_cancel = cancel.child_token();
@@ -107,11 +111,11 @@ impl FusionEngine {
             Ok(())
         }));
 
-        // b. Scheduler task
-        let scheduler = Scheduler::new(event_rx, engines, alert_sink, cancel.child_token());
+        // 11. Scheduler task
+        let scheduler = Scheduler::new(event_rx, engines, alert_tx, cancel.child_token());
         join_handles.push(tokio::spawn(async move { scheduler.run().await }));
 
-        // c. Receiver task (last — starts accepting data)
+        // 12. Receiver task (last — starts accepting data)
         let receiver = Receiver::bind_with_event_tx(
             &config.server.listen,
             Arc::clone(&router),
@@ -152,15 +156,25 @@ impl FusionEngine {
     }
 }
 
-/// Extract the alert output path from the first `file://` sink URI.
-/// Falls back to `{base_dir}/alerts.jsonl` if no file sink is configured.
-fn resolve_alert_path(config: &FusionConfig, base_dir: &Path) -> std::path::PathBuf {
-    for sink_uri in &config.alert.sinks {
-        if let Some(path) = sink_uri.strip_prefix("file://") {
-            return std::path::PathBuf::from(path);
+/// Build the alert sink from config, supporting multiple file:// destinations.
+fn build_alert_sink(config: &FusionConfig) -> Result<Arc<dyn AlertSink>> {
+    let uris = config.alert.parsed_sinks()?;
+    let mut sinks: Vec<Box<dyn AlertSink>> = Vec::new();
+    for uri in uris {
+        match uri {
+            SinkUri::File { path } => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                sinks.push(Box::new(FileAlertSink::open(&path)?));
+            }
         }
     }
-    base_dir.join("alerts.jsonl")
+    Ok(if sinks.len() == 1 {
+        Arc::from(sinks.into_iter().next().unwrap())
+    } else {
+        Arc::new(FanOutSink::new(sinks))
+    })
 }
 
 /// Register Ctrl-C / SIGTERM handling and cancel the engine on signal.
