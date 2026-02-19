@@ -36,7 +36,7 @@
 ## 3. 三文件 + RulePack 模型
 
 ### 3.1 文件职责
-- `windows.ws`：逻辑数据定义（window、field、time、over）。
+- `windows.wfs`：逻辑数据定义（window、field、time、over）。
 - `rules.wfl`：检测逻辑（bind/match/join/yield）。
 - `runtime.toml`：物理参数（mode、max_bytes、watermark、sinks）。
 
@@ -47,14 +47,14 @@
 version: "2.0"
 features: ["l1", "l2"]
 windows:
-  - windows/security.ws
+  - windows/security.wfs
 rules:
   - rules/brute_scan.wfl
 runtime: runtime/fusion.toml
 ```
 
 ### 3.3 设计约束
-- `.ws` 是上游依赖（先有数据定义，后有规则）。
+- `.wfs` 是上游依赖（先有数据定义，后有规则）。
 - `.wfl` 仅能引用 `use` 导入的 window。
 - `.toml` 只管物理参数，不写业务规则。
 
@@ -197,7 +197,7 @@ WFL 采用固定主执行链，阶段顺序不可变（`entity(...)` 为 YIELD �
 
 ---
 
-## 6. Window Schema（.ws）
+## 6. Window Schema（.wfs）
 
 ### 6.1 EBNF（简化版）
 
@@ -282,8 +282,8 @@ entity_type   = IDENT | STRING ;
 
 yield_clause  = "yield" , [ IDENT ] , "(" , named_arg , { "," , named_arg } , ")" ;  (* 省略 IDENT 的隐式 yield 为 L3 *)
 named_arg     = yield_field , "=" , expr ;
-yield_field   = IDENT | IDENT , "." , IDENT , { "." , IDENT } | quoted_ident ;    (* 与 .ws field_name 对齐 *)
-quoted_ident  = "`" , { ANY - "`" } , "`" ;                                     (* 同 §6.1 .ws 定义 *)
+yield_field   = IDENT | IDENT , "." , IDENT , { "." , IDENT } | quoted_ident ;    (* 与 .wfs field_name 对齐 *)
+quoted_ident  = "`" , { ANY - "`" } , "`" ;                                     (* 同 §6.1 .wfs 定义 *)
 
 conv_clause   = "conv" , "{" , conv_chain , { conv_chain } , "}" ;             (* L3 *)
 conv_chain    = conv_step , { "|" , conv_step } , ";" ;
@@ -355,7 +355,7 @@ ANY           = ? any unicode char ? ;
 - `close_reason`：窗口关闭原因只读上下文字段（`timeout` / `flush` / `eos`）。
 
 ### 7.1.1 带点字段名访问
-- `.ws` 允许字段名包含 `.`（如 `detail.sha256`）。
+- `.wfs` 允许字段名包含 `.`（如 `detail.sha256`）。
 - `.wfl` 引用这类字段时，使用下标形式：`alias["detail.sha256"]`，避免与 `alias.field` 命名空间歧义。
 
 ### 7.2 表达式与函数
@@ -456,7 +456,7 @@ match<sip:5m> {
 
 ### 8.1 编译流水线
 1. 变量预处理：`$VAR` / `${VAR:default}`。
-2. 解析：`.ws` + `.wfl` -> AST。
+2. 解析：`.wfs` + `.wfl` -> AST。
 3. 语义检查：字段、类型、window 引用、over 约束。
 4. desugar：展开 `|>`、隐式 stage、`conv` 钩子。
 5. 生成 Core IR（Bind/Match/Join/Yield）。
@@ -642,7 +642,7 @@ restore = "latest"             # latest | clean
 ## 11. 热加载策略
 
 - 仅 `.wfl` 与 `[vars]` 支持热加载。
-- `.ws` 与运行时物理参数变更需重启。
+- `.wfs` 与运行时物理参数变更需重启。
 - reload 采用 Drop 策略：丢弃在途状态机，立即切新规则。
 
 ```text
@@ -694,7 +694,7 @@ wf reload
 |----|------|
 | K1 | `match<k1,k2:dur>` 中未限定名 key（如 `sip`）要求在本 match 涉及的所有事件源中都存在同名字段。 |
 | K2 | key 可用限定名（如 `fail.sip`）消歧；仅影响解析，不改变“各事件源都需可提取该 key”的约束。 |
-| K3 | 多事件源字段名不同（如 `fail.sip` vs `scan.src_ip`）时，**不能**直接在同一 match key 中做自动映射；需先在上游 `.ws` 对齐字段名，或用前级规则 `yield` 归一化后再匹配。 |
+| K3 | 多事件源字段名不同（如 `fail.sip` vs `scan.src_ip`）时，**不能**直接在同一 match key 中做自动映射；需先在上游 `.wfs` 对齐字段名，或用前级规则 `yield` 归一化后再匹配。 |
 | K4 | key 字段跨事件源类型必须一致；不允许 `ip` 与 `chars`、`digit` 与 `chars` 混用。 |
 | K5 | 复合 key 按位置形成键元组（`<k1,k2>`），各位置按 K1~K4 独立校验。 |
 
@@ -1176,7 +1176,7 @@ eos_emit_reason = "eos"          # 固定为 eos，供审计
 
 ### 13.1 阈值检测
 ```wfl
-use "security.ws"
+use "security.wfs"
 
 rule brute_force {
   events {
@@ -1198,7 +1198,7 @@ rule brute_force {
 
 ### 13.2 时序关联 + enrich
 ```wfl
-use "security.ws"
+use "security.wfs"
 
 rule brute_then_scan {
   events {
@@ -1223,7 +1223,7 @@ rule brute_then_scan {
 
 ### 13.3 缺失检测（A -> NOT B）
 ```wfl
-use "dns.ws"
+use "dns.wfs"
 
 rule dns_no_response {
   events {
@@ -1249,7 +1249,7 @@ rule dns_no_response {
 
 ### 13.4 多级管道（L3）
 ```wfl
-use "security.ws"
+use "security.wfs"
 
 rule port_scan_detect {
   events {
@@ -1276,7 +1276,7 @@ rule port_scan_detect {
 
 ### 13.5 用户会话行为分析（L3 行为分析）
 ```wfl
-use "access.ws"
+use "access.wfs"
 
 rule abnormal_session {
   meta {
@@ -1310,7 +1310,7 @@ rule abnormal_session {
 
 ### 13.6 实体风险评分（L3 行为分析）
 ```wfl
-use "security.ws"
+use "security.wfs"
 
 rule entity_risk_score {
   meta {
@@ -1351,7 +1351,7 @@ rule entity_risk_score {
 
 ### 13.7 登录行为基线偏离（L2/L3 行为分析）
 ```wfl
-use "auth.ws"
+use "auth.wfs"
 
 rule login_anomaly {
   events {
@@ -1410,7 +1410,7 @@ contract dns_no_response_timeout for dns_no_response {
 ## 14. 与原方案差异与兼容
 
 ### 14.1 保留内容
-- 三文件模型（.ws/.wfl/.toml）。
+- 三文件模型（.wfs/.wfl/.toml）。
 - 事件时间语义（watermark/allowed_lateness）。
 - OR 分支、`on close`、join enrich、baseline、conv。
 
@@ -1433,7 +1433,7 @@ contract dns_no_response_timeout for dns_no_response {
 ### Phase A（先稳）
 - Core IR + L1 + 可读语法 + lint/fmt。
 - `wf test` 契约测试（given/expect）+ CI 阻断策略。
-- **wf-datagen P0**：`.wsc` parser + schema 驱动随机生成 + seed 可复现 + JSONL/Arrow 输出（依赖 `.ws` parser）。
+- **wf-datagen P0**：`.wfg` parser + schema 驱动随机生成 + seed 可复现 + JSONL/Arrow 输出（依赖 `.wfs` parser）。
 
 ### Phase B（增强）
 - L2（join/baseline/window.has）+ explain/replay。
@@ -1595,21 +1595,21 @@ contract dns_order_invariance for dns_no_response {
 - **可扰动**：支持乱序、迟到、重复、丢弃等时序扰动。
 - **可接入**：支持 `gen -> run -> verify` 标准流水线接入 CI。
 
-### 18.2 Scenario DSL（`.wsc`）
+### 18.2 Scenario DSL（`.wfg`）
 
 #### 18.2.1 设计原则
 
 - **语义即语法**：每个语法块（`stream`、`inject`、`faults`、`oracle`）直接对应一个生成概念，不经中间数据格式间接表达。
 - **与 WFL 同族**：复用 WFL 词法基础（IDENT、STRING、NUMBER、DURATION）和注释风格（`//`），降低学习成本。
 - **声明头承载核心信息**：`stream alias: window rate`、`inject for rule on [streams]` 等关键语义在声明行即可读取，块体仅承载覆盖项与参数。
-- **引用不重复声明**：字段类型以 `.ws` 为准，规则语义以 `.wfl` 为准，`.wsc` 仅覆盖生成策略。
+- **引用不重复声明**：字段类型以 `.wfs` 为准，规则语义以 `.wfl` 为准，`.wfg` 仅覆盖生成策略。
 
-文件扩展名：`.wsc`（WarpFusion SCenario）。
+文件扩展名：`.wfg`（WarpFusion SCenario）。
 
 #### 18.2.2 完整示例
 
-```wsc
-use "windows/security.ws"
+```wfg
+use "windows/security.wfs"
 use "rules/brute_force.wfl"
 
 scenario brute_force_load seed 42 {
@@ -1715,10 +1715,10 @@ PERCENT         = NUMBER , "%" ;
 
 | ID | 规则 |
 |----|------|
-| SC1 | `use` 引用的 `.ws` / `.wfl` 文件必须存在且可解析；文件类型由扩展名确定。 |
+| SC1 | `use` 引用的 `.wfs` / `.wfl` 文件必须存在且可解析；文件类型由扩展名确定。 |
 | SC2 | `stream` 的 alias 必须在所引用 `.wfl` 的某条规则 `events {}` 中声明。 |
-| SC2a | `stream` 的 window 名（`:`后）必须与目标规则中该 alias 绑定的 window 一致。即 `.wsc` 中 `stream fail: auth_events` 要求 `.wfl` 中有 `fail: auth_events ...`；window 名不匹配则编译错误。 |
-| SC3 | `stream` 的 window 名必须在 `.ws` 中定义。 |
+| SC2a | `stream` 的 window 名（`:`后）必须与目标规则中该 alias 绑定的 window 一致。即 `.wfg` 中 `stream fail: auth_events` 要求 `.wfl` 中有 `fail: auth_events ...`；window 名不匹配则编译错误。 |
+| SC3 | `stream` 的 window 名必须在 `.wfs` 中定义。 |
 | SC4 | `field_override` 的字段名必须存在于该 stream 对应 window 的 `fields {}` 中。 |
 | SC5 | `inject for <rule>` 的 `<rule>` 必须存在于所引用的 `.wfl` 中。 |
 | SC6 | `inject on [streams]` 中的每个 alias 必须是该 `<rule>` 的 events alias 子集。 |
@@ -1734,18 +1734,18 @@ PERCENT         = NUMBER , "%" ;
 | SV4 | `PERCENT` 的数值部分必须在 `(0, 100]` 之间。 |
 | SV5 | 同一 `inject` 块内各 `mode_kw` 行的 `PERCENT` 之和不得超过 100%。 |
 | SV6 | `faults` 中各项 `PERCENT` 之和不得超过 100%（一条事件最多命中一种 fault）。 |
-| SV7 | `gen_expr` 的类型必须与 `.ws` 中对应字段类型兼容（`const "failed"` 赋给 `chars` 字段合法，赋给 `digit` 字段编译错误）。 |
+| SV7 | `gen_expr` 的类型必须与 `.wfs` 中对应字段类型兼容（`const "failed"` 赋给 `chars` 字段合法，赋给 `digit` 字段编译错误）。 |
 | SV8 | `oracle.time_tolerance` 必须为 DURATION 类型；`oracle.score_tolerance` 必须为 NUMBER 类型且 >= 0。 |
-| SV9 | 目标规则 `events` 中的 filter 条件（`&& expr`）隐含字段值约束。生成器从 filter 中提取常量等值条件（如 `action == "failed"`），作为该 stream 对应字段的**隐式 const override**。若 `.wsc` 中已显式声明同字段的 `field_override`，则以显式声明为准；未声明时自动应用 filter 中的常量值。非常量条件（如 `x > 10`）不自动提取，需用户显式覆盖。 |
+| SV9 | 目标规则 `events` 中的 filter 条件（`&& expr`）隐含字段值约束。生成器从 filter 中提取常量等值条件（如 `action == "failed"`），作为该 stream 对应字段的**隐式 const override**。若 `.wfg` 中已显式声明同字段的 `field_override`，则以显式声明为准；未声明时自动应用 filter 中的常量值。非常量条件（如 `x > 10`）不自动提取，需用户显式覆盖。 |
 
 #### 18.2.5 `stream` 块详解
 
 声明行 `stream alias: window rate` 承载三个核心属性：
 - **alias**：对应 `.wfl` 规则中 `events {}` 的别名。
-- **window**：对应 `.ws` 中的 window 名，决定字段 schema。
+- **window**：对应 `.wfs` 中的 window 名，决定字段 schema。
 - **rate**：基础事件生成速率（如 `200/s`、`12000/m`、`720000/h`）。
 
-块体 `{ field_override ... }` 为可选；省略时所有字段按 `.ws` 类型自动随机生成。此外，生成器会自动从目标规则的 `events` filter 中提取常量等值条件作为隐式覆盖（SV9），确保生成的数据能通过 filter 进入规则求值链路。
+块体 `{ field_override ... }` 为可选；省略时所有字段按 `.wfs` 类型自动随机生成。此外，生成器会自动从目标规则的 `events` filter 中提取常量等值条件作为隐式覆盖（SV9），确保生成的数据能通过 filter 进入规则求值链路。
 
 **gen 函数清单：**
 
@@ -1825,7 +1825,7 @@ mode_kw  percent  param=value ... ;
 ### 18.3 输出契约
 
 - `out/events/*.jsonl|parquet|arrow`：生成事件流（`--format` 指定，默认 `jsonl`）。
-- `out/oracle/alerts.jsonl`：期望告警（**仅当 `.wsc` 中存在 `oracle` 块时生成**；省略 `oracle` 块则不产出此文件）。
+- `out/oracle/alerts.jsonl`：期望告警（**仅当 `.wfg` 中存在 `oracle` 块时生成**；省略 `oracle` 块则不产出此文件）。
 - `out/manifest.json`：输入快照、hash、seed、统计信息。
 
 `manifest.json`（关键字段）：
@@ -1851,7 +1851,7 @@ mode_kw  percent  param=value ... ;
 
 | 阶段 | Oracle 来源 | 说明 |
 |------|-------------|------|
-| P0 | 不生成（`.wsc` 中无 `oracle` 块） | 仅做数据可复现与吞吐链路验证 |
+| P0 | 不生成（`.wfg` 中无 `oracle` 块） | 仅做数据可复现与吞吐链路验证 |
 | P1 | rule-aware + 独立求值器（Reference Evaluator） | 用规则语义计算期望命中，避免"生成逻辑=验证逻辑"同源偏差 |
 | P2 | 在 P1 基础上叠加时序扰动求值 | 生成延迟/乱序下的期望结果 |
 
@@ -1878,8 +1878,8 @@ mode_kw  percent  param=value ... ;
 |----|------|
 | 匹配键 | `(rule_name, entity_type, entity_id, close_reason)`（均为 yield 系统字段） |
 | 时间配对 | 同一匹配键下按 `abs(actual.emit_time - oracle.emit_time)` 最小贪心配对 |
-| 时间容差 | 配对后 `abs(actual.emit_time - oracle.emit_time) <= time_tolerance`，超出则计入 `field_mismatch`（取 `.wsc` 中 `oracle.time_tolerance`，默认 `1s`） |
-| 分数容差 | `abs(actual.score - oracle.score) <= score_tolerance`（取 `.wsc` 中 `oracle.score_tolerance`，默认 `0.01`） |
+| 时间容差 | 配对后 `abs(actual.emit_time - oracle.emit_time) <= time_tolerance`，超出则计入 `field_mismatch`（取 `.wfg` 中 `oracle.time_tolerance`，默认 `1s`） |
+| 分数容差 | `abs(actual.score - oracle.score) <= score_tolerance`（取 `.wfg` 中 `oracle.score_tolerance`，默认 `0.01`） |
 | 排序要求 | 无序比较（order-insensitive） |
 | 多对多 | 同一匹配键下按"时间差最小、分差最小"贪心配对；未配对项分别计入 `missing/unexpected` |
 
@@ -1901,7 +1901,7 @@ mode_kw  percent  param=value ... ;
 ### 18.6 端到端数据流（gen -> run -> verify）
 
 ```text
-*.wsc + *.ws + *.wfl
+*.wfg + *.wfs + *.wfl
          │
     wf-datagen gen
          │
@@ -1929,12 +1929,12 @@ verify_report.json/.md
 ```bash
 # 生成
 wf-datagen gen \
-  --scenario tests/brute_force_load.wsc \
+  --scenario tests/brute_force_load.wfg \
   --format jsonl \
   --out out/
 
-# 一致性校验（检查 .wsc 引用与 .ws/.wfl 的一致性）
-wf-datagen lint tests/brute_force_load.wsc
+# 一致性校验（检查 .wfg 引用与 .wfs/.wfl 的一致性）
+wf-datagen lint tests/brute_force_load.wfg
 
 # 对拍验证
 wf-datagen verify \
@@ -1943,8 +1943,8 @@ wf-datagen verify \
 
 # 覆盖 ws/wfl 引用（调试用途）
 wf-datagen gen \
-  --scenario tests/brute_force_load.wsc \
-  --ws windows/security.ws \
+  --scenario tests/brute_force_load.wfg \
+  --ws windows/security.wfs \
   --wfl rules/brute_force.wfl \
   --out out/
 ```
@@ -1958,7 +1958,7 @@ wf-datagen gen \
 
 ### 18.9 与 `contract` 的关系
 
-| 维度 | `contract`（§12.11） | `scenario`（`.wsc`） |
+| 维度 | `contract`（§12.11） | `scenario`（`.wfg`） |
 |------|---------------------|---------------------|
 | 用途 | 单规则小样本精确断言 | 多规则大规模统计验证 |
 | 数据来源 | 手写 `row()`，逐条可控 | 生成器按分布自动产出 |
@@ -1973,6 +1973,6 @@ wf-datagen gen \
 
 | 阶段 | 功能 | 依赖 |
 |------|------|------|
-| P0 | `.wsc` parser + schema 驱动随机生成 + seed 可复现 + JSONL/Arrow 输出 | `.ws` parser |
+| P0 | `.wfg` parser + schema 驱动随机生成 + seed 可复现 + JSONL/Arrow 输出 | `.wfs` parser |
 | P1 | rule-aware（hit/near_miss/non_hit）+ Reference Evaluator + oracle 生成 + verify | `.wfl` compiler |
 | P2 | 时序扰动矩阵 + 压测模式 + PR 友好差异报告（md） | P1 |

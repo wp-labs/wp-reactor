@@ -4,15 +4,15 @@ use std::time::Duration;
 // Top-level
 // ---------------------------------------------------------------------------
 
-/// A complete `.wsc` scenario file.
+/// A complete `.wfg` scenario file.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
-pub struct WscFile {
+pub struct WfgFile {
     pub uses: Vec<UseDecl>,
     pub scenario: ScenarioDecl,
 }
 
-/// `use "path.ws"` or `use "path.wfl"`
+/// `use "path.wfs"` or `use "path.wfl"`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct UseDecl {
@@ -172,11 +172,36 @@ pub struct FaultsBlock {
     pub faults: Vec<FaultLine>,
 }
 
-/// `FAULT_NAME PERCENT%`
+/// Supported fault types for temporal perturbation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FaultType {
+    /// Swap adjacent events' arrival order.
+    OutOfOrder,
+    /// Delay event arrival position (across watermark boundary).
+    Late,
+    /// Clone event and insert a duplicate.
+    Duplicate,
+    /// Remove event from the output stream.
+    Drop,
+}
+
+impl std::fmt::Display for FaultType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FaultType::OutOfOrder => write!(f, "out_of_order"),
+            FaultType::Late => write!(f, "late"),
+            FaultType::Duplicate => write!(f, "duplicate"),
+            FaultType::Drop => write!(f, "drop"),
+        }
+    }
+}
+
+/// `FAULT_TYPE PERCENT%`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct FaultLine {
-    pub name: String,
+    pub fault_type: FaultType,
     pub percent: f64,
 }
 

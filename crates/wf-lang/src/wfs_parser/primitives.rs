@@ -7,7 +7,7 @@ use crate::parse_utils::ident;
 use crate::schema::BaseType;
 
 // ---------------------------------------------------------------------------
-// .ws-specific: identifiers
+// .wfs-specific: identifiers
 // ---------------------------------------------------------------------------
 
 pub(super) fn dotted_or_plain_ident(input: &mut &str) -> ModalResult<String> {
@@ -33,7 +33,7 @@ pub(super) fn backtick_ident(input: &mut &str) -> ModalResult<String> {
 }
 
 // ---------------------------------------------------------------------------
-// .ws-specific: types
+// .wfs-specific: types
 // ---------------------------------------------------------------------------
 
 pub(super) fn base_type_parser(input: &mut &str) -> ModalResult<BaseType> {

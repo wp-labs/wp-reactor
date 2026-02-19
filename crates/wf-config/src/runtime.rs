@@ -8,7 +8,7 @@ pub struct RuntimeConfig {
     pub executor_parallelism: usize,
     /// Single rule execution timeout.
     pub rule_exec_timeout: HumanDuration,
-    /// Window Schema (.ws) file paths.
+    /// Window Schema (.wfs) file paths.
     pub window_schemas: Vec<String>,
     /// WFL rule (.wfl) file paths.
     pub wfl_rules: Vec<String>,

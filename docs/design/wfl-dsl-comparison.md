@@ -38,7 +38,7 @@
 | 子查询合并 | 隐式 yield 规则链 + join | ✗ | ✗ | ✗ | `join [subsearch]` | `join (subquery)` |
 | 变量参数化 | `$VAR` / `${VAR:default}` (L1) | ✗ | ✗ | ✗ | `$token$` | ✗ |
 | `in`/`not in` | `expr in (...)`/`expr not in (...)` | `in %list` | `in (...)` | ✗ | `IN (...)` | `in (...)` |
-| 数据/逻辑分离 | .ws / .wfl / .toml 三文件 + `pack.yaml` | 单文件 | 单文件 | 单文件 | 单文件 | 单文件 |
+| 数据/逻辑分离 | .wfs / .wfl / .toml 三文件 + `pack.yaml` | 单文件 | 单文件 | 单文件 | 单文件 | 单文件 |
 | 能力分层 | L1/L2/L3 feature gate | ✗ | ✗ | ✗ | ✗ | ✗ |
 | 热加载 | `wf reload` (Drop) | 平台管理 | Kibana UI | 无运行时 | 平台管理 | 平台管理 |
 
@@ -152,7 +152,7 @@
 | 内置基线偏离 | `baseline(expr, dur[, method])` | L2/L3 | 无需外部 ML 模块即可做行为偏离检测，支持持久化 |
 | `yield` 统一输出 | 告警和归并共用一个关键字 + window 抽象 | L1 | 消除 alert/output 概念分裂 |
 | 风险等级派生 | `score` → runtime `level_map`（可版本化） | — | 等级映射与规则解耦，审计友好 |
-| 三文件分离 | .ws / .wfl / .toml + `pack.yaml` | L1 | 数据工程师、安全分析师、SRE 各改各的 |
+| 三文件分离 | .wfs / .wfl / .toml + `pack.yaml` | L1 | 数据工程师、安全分析师、SRE 各改各的 |
 | 隐式 window | `yield (...)` 无目标名，编译器推导 | L3 | 多级规则链零配置 |
 | 能力分层 | L1(MVP) / L2(增强) / L3(高级+feature gate) | — | 渐进学习，避免首版认知过载 |
 | 格式化函数 | `fmt(STRING, expr, ...)` | L1 | 统一告警 message 格式化 |

@@ -1,5 +1,7 @@
 pub mod datagen;
+pub mod oracle;
 pub mod output;
 pub mod validate;
-pub mod wsc_ast;
-pub mod wsc_parser;
+pub mod verify;
+pub mod wfg_ast;
+pub mod wfg_parser;

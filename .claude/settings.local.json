@@ -46,7 +46,9 @@
       "Bash(cargo build:*)",
       "Bash(cargo test:*)",
       "Bash(cargo run:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(git mv:*)",
+      "Bash(xargs perl -pi -e '\n  # --- Phase A: .wsc → .wfg \\(do LONGER extension first\\) ---\n  # Identifier renames\n  s/\\\\bwsc_content\\\\b/wfg_content/g;\n  s/\\\\bwsc_parser\\\\b/wfg_parser/g;\n  s/\\\\bwsc_ast\\\\b/wfg_ast/g;\n  s/\\\\bwsc_file\\\\b/wfg_file/g;\n  s/\\\\bWscFile\\\\b/WfgFile/g;\n  s/\\\\bparse_wsc\\\\b/parse_wfg/g;\n  s/\\\\bvalidate_wsc\\\\b/validate_wfg/g;\n  s/\\\\bminimal_wsc\\\\b/minimal_wfg/g;\n  # Standalone wsc variable names \\(param names, local vars\\)\n  s/\\\\bwsc\\\\b/wfg/g;\n  # Extension string: .wsc → .wfg\n  s/\\\\.wsc\\(?![a-zA-Z0-9_]\\)/\\\\.wfg/g;\n\n  # --- Phase B: .ws → .wfs \\(shorter extension, after .wsc is already gone\\) ---\n  # Identifier renames\n  s/\\\\bws_parser\\\\b/wfs_parser/g;\n  s/\\\\bparse_ws\\\\b/parse_wfs/g;\n  s/\\\\bws_file\\\\b/wfs_file/g;\n  # Extension string: .ws NOT followed by word char \\(avoiding .wfl etc that already changed\\)\n  s/\\\\.ws\\(?![a-zA-Z0-9_]\\)/\\\\.wfs/g;\n  # Bare extension name in match arms: \"\"\"\"ws\"\"\"\" → \"\"\"\"wfs\"\"\"\"\n  s/\"\"\"\"ws\"\"\"\"/\"\"\"\"wfs\"\"\"\"/g;\n')"
     ]
   }
 }

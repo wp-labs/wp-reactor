@@ -27,7 +27,7 @@ pub struct WindowParams {
     pub schema: SchemaRef,
     /// Index of the time column in the schema, `None` for output windows.
     pub time_col_index: Option<usize>,
-    /// Retention duration from the `.ws` file.
+    /// Retention duration from the `.wfs` file.
     pub over: Duration,
 }
 

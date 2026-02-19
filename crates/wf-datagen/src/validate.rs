@@ -1,9 +1,9 @@
 use wf_lang::ast::WflFile;
 use wf_lang::{BaseType, FieldType, WindowSchema};
 
-use crate::wsc_ast::{GenExpr, WscFile};
+use crate::wfg_ast::{GenExpr, WfgFile};
 
-/// A validation error found in a `.wsc` file.
+/// A validation error found in a `.wfg` file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidationError {
     pub code: &'static str,
@@ -16,17 +16,17 @@ impl std::fmt::Display for ValidationError {
     }
 }
 
-/// Validate a parsed `.wsc` file against schemas and WFL rules.
+/// Validate a parsed `.wfg` file against schemas and WFL rules.
 ///
 /// Returns a list of validation errors (empty if valid).
-pub fn validate_wsc(
-    wsc: &WscFile,
+pub fn validate_wfg(
+    wfg: &WfgFile,
     schemas: &[WindowSchema],
     wfl_files: &[WflFile],
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
-    let scenario = &wsc.scenario;
+    let scenario = &wfg.scenario;
 
     // SV2: total > 0
     if scenario.total == 0 {
@@ -72,7 +72,7 @@ pub fn validate_wsc(
                     code: "SV4",
                     message: format!(
                         "fault '{}': percent {} must be in (0, 100]",
-                        fault.name, fault.percent
+                        fault.fault_type, fault.percent
                     ),
                 });
             }
@@ -339,13 +339,13 @@ fn check_gen_func_compat(func_name: &str, base: &BaseType) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wsc_ast::*;
+    use crate::wfg_ast::*;
     use std::time::Duration;
     use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
-    /// Helper: build a minimal WscFile.
-    fn minimal_wsc(streams: Vec<StreamBlock>, injects: Vec<InjectBlock>) -> WscFile {
-        WscFile {
+    /// Helper: build a minimal WfgFile.
+    fn minimal_wfg(streams: Vec<StreamBlock>, injects: Vec<InjectBlock>) -> WfgFile {
+        WfgFile {
             uses: vec![],
             scenario: ScenarioDecl {
                 name: "test".into(),
@@ -454,10 +454,10 @@ mod tests {
 
     #[test]
     fn test_sc2_stream_alias_not_in_any_rule() {
-        let wsc = minimal_wsc(vec![stream("s_missing", "LoginWindow")], vec![]);
+        let wfg = minimal_wfg(vec![stream("s_missing", "LoginWindow")], vec![]);
         let schemas = vec![make_schema("LoginWindow", vec![])];
         let wfl = make_wfl("my_rule", vec![("e", "LoginWindow")]);
-        let errors = validate_wsc(&wsc, &schemas, &[wfl]);
+        let errors = validate_wfg(&wfg, &schemas, &[wfl]);
         assert!(
             errors
                 .iter()
@@ -467,13 +467,13 @@ mod tests {
 
     #[test]
     fn test_sc2a_stream_alias_window_mismatch() {
-        let wsc = minimal_wsc(vec![stream("e", "DnsWindow")], vec![]);
+        let wfg = minimal_wfg(vec![stream("e", "DnsWindow")], vec![]);
         let schemas = vec![
             make_schema("DnsWindow", vec![]),
             make_schema("LoginWindow", vec![]),
         ];
         let wfl = make_wfl("my_rule", vec![("e", "LoginWindow")]);
-        let errors = validate_wsc(&wsc, &schemas, &[wfl]);
+        let errors = validate_wfg(&wfg, &schemas, &[wfl]);
         assert!(
             errors
                 .iter()
@@ -487,13 +487,13 @@ mod tests {
 
     #[test]
     fn test_sc6_inject_stream_not_in_scenario() {
-        let wsc = minimal_wsc(
+        let wfg = minimal_wfg(
             vec![stream("s1", "LoginWindow")],
             vec![inject("my_rule", vec!["s1", "s_missing"])],
         );
         let schemas = vec![make_schema("LoginWindow", vec![])];
         let wfl = make_wfl("my_rule", vec![("s1", "LoginWindow")]);
-        let errors = validate_wsc(&wsc, &schemas, &[wfl]);
+        let errors = validate_wfg(&wfg, &schemas, &[wfl]);
         assert!(
             errors
                 .iter()
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn test_sc6_sc2a_stream_window_not_in_rule_events() {
         // Stream s1 uses DnsWindow, but the rule only references LoginWindow.
-        let wsc = minimal_wsc(
+        let wfg = minimal_wfg(
             vec![stream("s1", "DnsWindow")],
             vec![inject("my_rule", vec!["s1"])],
         );
@@ -513,7 +513,7 @@ mod tests {
             make_schema("LoginWindow", vec![]),
         ];
         let wfl = make_wfl("my_rule", vec![("s1", "LoginWindow")]);
-        let errors = validate_wsc(&wsc, &schemas, &[wfl]);
+        let errors = validate_wfg(&wfg, &schemas, &[wfl]);
         assert!(errors.iter().any(|e| {
             e.code == "SC6" && e.message.contains("DnsWindow") && e.message.contains("LoginWindow")
         }));
@@ -521,13 +521,13 @@ mod tests {
 
     #[test]
     fn test_sc6_inject_alias_not_in_target_rule_events() {
-        let wsc = minimal_wsc(
+        let wfg = minimal_wfg(
             vec![stream("s1", "LoginWindow")],
             vec![inject("my_rule", vec!["s1"])],
         );
         let schemas = vec![make_schema("LoginWindow", vec![])];
         let wfl = make_wfl("my_rule", vec![("other_alias", "LoginWindow")]);
-        let errors = validate_wsc(&wsc, &schemas, &[wfl]);
+        let errors = validate_wfg(&wfg, &schemas, &[wfl]);
         assert!(
             errors
                 .iter()
@@ -537,13 +537,13 @@ mod tests {
 
     #[test]
     fn test_sc6_sc2a_valid_stream_window_matches_rule() {
-        let wsc = minimal_wsc(
+        let wfg = minimal_wfg(
             vec![stream("s1", "LoginWindow")],
             vec![inject("my_rule", vec!["s1"])],
         );
         let schemas = vec![make_schema("LoginWindow", vec![])];
         let wfl = make_wfl("my_rule", vec![("s1", "LoginWindow")]);
-        let errors = validate_wsc(&wsc, &schemas, &[wfl]);
+        let errors = validate_wfg(&wfg, &schemas, &[wfl]);
         // No SC6 errors expected
         assert!(
             !errors.iter().any(|e| e.code == "SC6"),
@@ -558,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_sv7_string_lit_on_digit_field() {
-        let wsc = minimal_wsc(
+        let wfg = minimal_wfg(
             vec![stream_with_override(
                 "s1",
                 "W",
@@ -568,7 +568,7 @@ mod tests {
             vec![],
         );
         let schemas = vec![make_schema("W", vec![("count", BaseType::Digit)])];
-        let errors = validate_wsc(&wsc, &schemas, &[]);
+        let errors = validate_wfg(&wfg, &schemas, &[]);
         assert!(
             errors
                 .iter()
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn test_sv7_number_lit_on_bool_field() {
-        let wsc = minimal_wsc(
+        let wfg = minimal_wfg(
             vec![stream_with_override(
                 "s1",
                 "W",
@@ -588,7 +588,7 @@ mod tests {
             vec![],
         );
         let schemas = vec![make_schema("W", vec![("flag", BaseType::Bool)])];
-        let errors = validate_wsc(&wsc, &schemas, &[]);
+        let errors = validate_wfg(&wfg, &schemas, &[]);
         assert!(
             errors
                 .iter()
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn test_sv7_bool_lit_on_chars_field() {
-        let wsc = minimal_wsc(
+        let wfg = minimal_wfg(
             vec![stream_with_override(
                 "s1",
                 "W",
@@ -608,7 +608,7 @@ mod tests {
             vec![],
         );
         let schemas = vec![make_schema("W", vec![("name", BaseType::Chars)])];
-        let errors = validate_wsc(&wsc, &schemas, &[]);
+        let errors = validate_wfg(&wfg, &schemas, &[]);
         assert!(
             errors
                 .iter()
@@ -618,7 +618,7 @@ mod tests {
 
     #[test]
     fn test_sv7_ipv4_on_digit_field() {
-        let wsc = minimal_wsc(
+        let wfg = minimal_wfg(
             vec![stream_with_override(
                 "s1",
                 "W",
@@ -631,7 +631,7 @@ mod tests {
             vec![],
         );
         let schemas = vec![make_schema("W", vec![("port", BaseType::Digit)])];
-        let errors = validate_wsc(&wsc, &schemas, &[]);
+        let errors = validate_wfg(&wfg, &schemas, &[]);
         assert!(
             errors
                 .iter()
@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn test_sv7_range_on_ip_field() {
-        let wsc = minimal_wsc(
+        let wfg = minimal_wfg(
             vec![stream_with_override(
                 "s1",
                 "W",
@@ -654,7 +654,7 @@ mod tests {
             vec![],
         );
         let schemas = vec![make_schema("W", vec![("addr", BaseType::Ip)])];
-        let errors = validate_wsc(&wsc, &schemas, &[]);
+        let errors = validate_wfg(&wfg, &schemas, &[]);
         assert!(
             errors
                 .iter()
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_sv7_enum_compatible_with_any_type() {
-        let wsc = minimal_wsc(
+        let wfg = minimal_wfg(
             vec![stream_with_override(
                 "s1",
                 "W",
@@ -677,7 +677,7 @@ mod tests {
             vec![],
         );
         let schemas = vec![make_schema("W", vec![("val", BaseType::Digit)])];
-        let errors = validate_wsc(&wsc, &schemas, &[]);
+        let errors = validate_wfg(&wfg, &schemas, &[]);
         assert!(
             !errors.iter().any(|e| e.code == "SV7"),
             "enum should be compatible with any type"
@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn test_sv7_valid_combinations() {
         // String on Chars, Number on Float, ipv4 on Ip, range on Digit — all valid
-        let wsc = minimal_wsc(
+        let wfg = minimal_wfg(
             vec![StreamBlock {
                 alias: "s1".into(),
                 window: "W".into(),
@@ -731,7 +731,7 @@ mod tests {
                 ("count", BaseType::Digit),
             ],
         )];
-        let errors = validate_wsc(&wsc, &schemas, &[]);
+        let errors = validate_wfg(&wfg, &schemas, &[]);
         assert!(
             !errors.iter().any(|e| e.code == "SV7"),
             "all valid: {:?}",

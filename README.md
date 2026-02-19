@@ -8,7 +8,7 @@ WarpFusion Reactor 是一个基于 Rust 构建的安全事件流处理引擎，�
 wp-reactor/
 ├── Cargo.toml              # Workspace 根配置
 ├── crates/
-│   ├── wf-lang/            # Window Schema (.ws) 解析器
+│   ├── wf-lang/            # Window Schema (.wfs) 解析器
 │   └── wf-config/          # fusion.toml 配置管理与校验
 └── docs/
     └── design/             # 设计文档
@@ -18,11 +18,11 @@ wp-reactor/
 
 ### wf-lang
 
-Window Schema 解析器，负责解析 `.ws` 文件中的窗口定义 DSL。
+Window Schema 解析器，负责解析 `.wfs` 文件中的窗口定义 DSL。
 
 支持的字段类型：`chars` | `digit` | `float` | `bool` | `time` | `ip` | `hex` | `array/T`
 
-示例 `.ws` 文件：
+示例 `.wfs` 文件：
 
 ```
 window auth_events {
@@ -60,7 +60,7 @@ listen = "tcp://127.0.0.1:9800"
 [runtime]
 executor_parallelism = 2
 rule_exec_timeout = "30s"
-window_schemas = ["security.ws"]
+window_schemas = ["security.wfs"]
 wfl_rules = ["brute_scan.wfl"]
 
 [window_defaults]
@@ -84,7 +84,7 @@ sinks = ["file:///var/log/wf-alerts.jsonl"]
 
 | 文件 | 职责 |
 |------|------|
-| `.ws` | 逻辑数据定义（window、field、time、over） |
+| `.wfs` | 逻辑数据定义（window、field、time、over） |
 | `.wfl` | 检测规则（bind / match / join / yield） |
 | `fusion.toml` | 物理参数（mode、max_bytes、watermark、sinks） |
 

@@ -56,13 +56,13 @@ fn is_valid_var_name(name: &str) -> bool {
     chars.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// Cross-file validation: check that every window's `.ws` `over` duration does not exceed
+/// Cross-file validation: check that every window's `.wfs` `over` duration does not exceed
 /// the `over_cap` configured in `fusion.toml`.
 ///
-/// Call this after loading both the config and the `.ws` schema files.
+/// Call this after loading both the config and the `.wfs` schema files.
 ///
 /// - `windows`: resolved window configs from `FusionConfig`.
-/// - `window_overs`: map of window name → `over` duration parsed from `.ws` files.
+/// - `window_overs`: map of window name → `over` duration parsed from `.wfs` files.
 pub fn validate_over_vs_over_cap(
     windows: &[WindowConfig],
     window_overs: &HashMap<String, Duration>,
@@ -70,7 +70,7 @@ pub fn validate_over_vs_over_cap(
     for (name, over) in window_overs {
         let wc = windows.iter().find(|w| w.name == *name).ok_or_else(|| {
             anyhow::anyhow!(
-                "window {name:?} found in .ws schema but not in fusion.toml [window.{name}]"
+                "window {name:?} found in .wfs schema but not in fusion.toml [window.{name}]"
             )
         })?;
         let cap: Duration = wc.over_cap.into();
