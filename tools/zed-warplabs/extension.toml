@@ -1,0 +1,22 @@
+id = "warplabs"
+name = "WarpLabs"
+version = "0.8.0"
+schema_version = 1
+authors = ["WarpLabs Team"]
+description = "WFL, WFS, WPL, and OML syntax highlighting for WarpLabs"
+
+[grammars.wfl]
+repository = "file:///Users/zuowenjian/devspace/wp-labs/wp-reactor/tools/tree-sitter-wfl"
+rev = "e9597a40501e591cc32140f812ccdc00c4891827"
+
+[grammars.wfs]
+repository = "file:///Users/zuowenjian/devspace/wp-labs/wp-reactor/tools/tree-sitter-wfs"
+rev = "b9f6a25d334527edcea02096133418ad6b421846"
+
+[grammars.wpl]
+repository = "file:///Users/zuowenjian/devspace/wp-labs/wp-reactor/tools/tree-sitter-wpl"
+rev = "e10c8741d82e0bbbc405d9ba8b19135b390f428b"
+
+[grammars.oml]
+repository = "file:///Users/zuowenjian/devspace/wp-labs/wp-reactor/tools/tree-sitter-oml"
+rev = "a2275643714a36e7d9ec8dcb7378daceec98db41"

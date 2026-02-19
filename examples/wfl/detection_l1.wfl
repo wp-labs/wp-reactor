@@ -1,0 +1,69 @@
+// ── L1: Threshold detection ──
+use "security.ws"
+
+rule brute_force {
+  meta {
+    description = "Detect brute-force login attempts from single IP"
+  }
+  events {
+    fail: auth_events && action == "failed"
+  }
+  match<sip:5m> {
+    on event {
+      fail | count >= $FAIL_THRESHOLD;
+    }
+  } -> score(70.0)
+  entity(ip, fail.sip)
+  yield security_alerts (
+    sip = fail.sip,
+    fail_count = count(fail),
+    message = fmt("{} failed {} times in 5m", fail.sip, count(fail))
+  )
+}
+
+// ── L1: Multi-step sequence + enrich ──
+
+rule brute_then_scan {
+  meta {
+    description = "Brute-force followed by port scanning from same source"
+  }
+  events {
+    fail: auth_events && action == "failed"
+    scan: fw_events && action == "deny"
+  }
+  match<sip:5m> {
+    on event {
+      fail | count >= 3;
+      scan.dport | distinct | count > ${SCAN_THRESHOLD:10};
+    }
+  } -> score(if count(fail) > 10 then 90.0 else 70.0)
+  join ip_blocklist on sip == ip_blocklist.ip
+  entity(ip, fail.sip)
+  yield security_alerts (
+    sip = fail.sip,
+    threat = ip_blocklist.threat_level,
+    message = fmt("{} brute+scan, threat={}", fail.sip, ip_blocklist.threat_level)
+  )
+}
+
+// ── L1: Absence detection (A -> NOT B) ──
+
+rule dns_no_response {
+  events {
+    req: dns_query && bad_domains.has(req.domain)
+    resp: dns_response
+  }
+  match<query_id:30s> {
+    on event { req | count >= 1;
+    }
+    on close {
+      resp && close_reason == "timeout" | count == 0;
+    }
+  } -> score(50.0)
+  entity(ip, req.sip)
+  yield security_alerts (
+    sip = req.sip,
+    domain = req.domain,
+    message = fmt("{} query {} got no response", req.sip, req.domain)
+  )
+}

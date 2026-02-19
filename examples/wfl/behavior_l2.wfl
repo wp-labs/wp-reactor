@@ -1,0 +1,70 @@
+// ── L2: Entity risk scoring with derive + score block ──
+use "security.ws"
+
+rule entity_risk_score {
+  meta {
+    description = "Multi-dimensional entity risk scoring per hour"
+  }
+  events {
+    e: endpoint_events
+    ps: endpoint_events && contains(lower(e.process), "powershell")
+  }
+  match<host_id:1h:tumble> {
+    on close {
+      e | count >= 1;
+    }
+    derive {
+      burst = count(e) / baseline(count(e), 7d);
+      uniq_dests = distinct(e.dest_ip);
+      p95_out = percentile(e.bytes_out, 95);
+      ps_hit = hit(count(ps) > 0);
+      exfil = hit(@p95_out > baseline(avg(e.bytes_out), 7d) * 3.0);
+    }
+  } -> score {
+    burst = hit(@burst > 2.0) @ 30.0;
+    uniq_dests = hit(@uniq_dests > 100) @ 25.0;
+    ps_hit = @ps_hit @ 20.0;
+    exfil = @exfil @ 25.0;
+  }
+  entity(host, e.host_id)
+  yield risk_scores (
+    host_id = e.host_id,
+    event_count = count(e),
+    unique_dests = @uniq_dests,
+    p95_bytes = @p95_out,
+    processes = collect_set(e.process),
+    message = fmt("{} risk score over 1h window", e.host_id)
+  )
+}
+
+// ── L2: Login anomaly detection with baseline ──
+
+rule login_anomaly {
+  meta {
+    description = "Detect anomalous login volume using EWMA baseline"
+  }
+  events {
+    login: auth_events && action == "success"
+  }
+  match<uid:1h:tumble> {
+    on close {
+      login | count >= 1;
+    }
+  } -> score {
+    surge = hit(count(login) > baseline(count(login), 30d, "ewma") * 3.0) @ 50.0;
+    volume = hit(count(login) > 20) @ 30.0;
+    geo_spread = hit(distinct(login.geo_city) > 3) @ 20.0;
+  }
+  entity(user, login.uid)
+  yield behavior_alerts (
+    uid = login.uid,
+    login_count = count(login),
+    baseline_count = baseline(count(login), 30d, "ewma"),
+    locations = collect_set(login.geo_city),
+    login_category = if count(login) > 20 then "heavy"
+                     else if count(login) > 5 then "normal"
+                     else "light",
+    message = fmt("{} login count {} vs baseline {}",
+      login.uid, count(login), baseline(count(login), 30d, "ewma"))
+  )
+}

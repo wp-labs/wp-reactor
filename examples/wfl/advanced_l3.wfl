@@ -1,0 +1,58 @@
+// ── L3: Multi-stage pipeline ──
+use "security.ws"
+
+rule port_scan_detect {
+  meta {
+    description = "Two-stage port scan: aggregate per (sip,dport), then count distinct ports per sip"
+  }
+  events {
+    d: fw_events && action == "deny"
+  }
+  match<sip,dport:5m> {
+    on close {
+      d | count >= 3;
+    }
+  }
+  |> match<sip:10m> {
+    on close {
+      _in | count >= 10;
+    }
+  } -> score(80.0)
+  entity(ip, _in.sip)
+  yield security_alerts (
+    sip = _in.sip,
+    port_count = count(_in),
+    message = fmt("{} scanned {} ports in 10m", _in.sip, count(_in))
+  )
+}
+
+// ── L3: Session-based behavior analysis ──
+
+rule abnormal_session {
+  meta {
+    description = "Detect abnormal resource access within a user session"
+  }
+  events {
+    op: user_operations
+  }
+  match<uid:session(30m)> {
+    on close {
+      op | count >= 1;
+    }
+  } -> score(
+    if distinct(op.resource) > 50 then 95.0
+    else if time_diff(last(op.event_time), first(op.event_time)) > 1800 then 75.0
+    else 55.0
+  )
+  entity(user, op.uid)
+  yield behavior_alerts (
+    uid = op.uid,
+    resource_count = distinct(op.resource),
+    resources = collect_set(op.resource),
+    op_sequence = collect_list(op.action),
+    first_seen = first(op.event_time),
+    last_seen = last(op.event_time),
+    session_duration = time_diff(last(op.event_time), first(op.event_time)),
+    message = fmt("{} accessed {} resources in session", op.uid, distinct(op.resource))
+  )
+}

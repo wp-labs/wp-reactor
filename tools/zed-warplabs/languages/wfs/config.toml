@@ -1,0 +1,12 @@
+name = "WFS"
+grammar = "wfs"
+path_suffixes = ["wfs"]
+line_comments = ["//"]
+brackets = [
+  { start = "{", end = "}", close = true, newline = true },
+  { start = "(", end = ")", close = true, newline = false },
+  { start = "[", end = "]", close = true, newline = false },
+  { start = "\"", end = "\"", close = true, newline = false, not_in = ["string", "comment"] },
+  { start = "`", end = "`", close = true, newline = false, not_in = ["string", "comment"] },
+]
+autoclose_before = ";:.,=}])> \n\t"

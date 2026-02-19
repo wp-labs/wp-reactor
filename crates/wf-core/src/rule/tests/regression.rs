@@ -197,12 +197,7 @@ fn string_min_max() {
     );
     let mut sm = CepStateMachine::new("rule26".to_string(), plan);
 
-    let mk = |h: &str| {
-        event(vec![
-            ("sip", str_val("10.0.0.1")),
-            ("hostname", str_val(h)),
-        ])
-    };
+    let mk = |h: &str| event(vec![("sip", str_val("10.0.0.1")), ("hostname", str_val(h))]);
 
     // "alpha" < "beta" → min="alpha", min >= "beta" is false
     assert_eq!(sm.advance("dns", &mk("alpha")), StepResult::Accumulate);
@@ -233,7 +228,10 @@ fn string_min_max() {
     // "alpha" → max="alpha", max >= "delta" is false
     assert_eq!(sm2.advance("dns", &mk("alpha")), StepResult::Accumulate);
     // "delta" → max="delta", max >= "delta" is true → matched
-    assert!(matches!(sm2.advance("dns", &mk("delta")), StepResult::Matched(_)));
+    assert!(matches!(
+        sm2.advance("dns", &mk("delta")),
+        StepResult::Matched(_)
+    ));
 }
 
 #[test]
@@ -303,7 +301,10 @@ fn close_guard_event_field() {
 
     // Event step: req arrives → Advance
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
-    assert_eq!(sm.advance_with_instant("req", &req, now), StepResult::Advance);
+    assert_eq!(
+        sm.advance_with_instant("req", &req, now),
+        StepResult::Advance
+    );
 
     // Close step accumulation: success responses should be filtered by guard
     let resp_ok = event(vec![
@@ -325,11 +326,16 @@ fn close_guard_event_field() {
     // Close: guard `status == "error"` references event field.
     // At close time, status is missing from synthetic event → permissive (passes).
     // 2 error events were accumulated (3 success filtered) → count=2 >= 2 → close_ok
-    let out = sm.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out = sm
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(out.event_ok);
     assert!(out.close_ok);
     assert_eq!(out.close_step_data[0].measure_value, 2.0);
-    assert_eq!(out.close_step_data[0].label, Some("errors_only".to_string()));
+    assert_eq!(
+        out.close_step_data[0].label,
+        Some("errors_only".to_string())
+    );
 }
 
 #[test]
@@ -375,14 +381,18 @@ fn close_guard_mixed_event_and_close_reason() {
         ("status", str_val("error")),
     ]);
     sm_a.advance_with_instant("resp", &resp_err, now);
-    let out_a = sm_a.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out_a = sm_a
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(out_a.close_ok);
 
     // Scenario B: error events + Flush close → close_reason != "timeout" → close_ok=false
     let mut sm_b = CepStateMachine::new("rule29b".to_string(), plan.clone());
     sm_b.advance_with_instant("req", &req, now);
     sm_b.advance_with_instant("resp", &resp_err, now);
-    let out_b = sm_b.close(&[str_val("10.0.0.1")], CloseReason::Flush).unwrap();
+    let out_b = sm_b
+        .close(&[str_val("10.0.0.1")], CloseReason::Flush)
+        .unwrap();
     assert!(!out_b.close_ok);
 
     // Scenario C: success events + Timeout → status filter blocks accumulation → count=0 < 1
@@ -393,7 +403,9 @@ fn close_guard_mixed_event_and_close_reason() {
         ("status", str_val("success")),
     ]);
     sm_c.advance_with_instant("resp", &resp_ok, now);
-    let out_c = sm_c.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out_c = sm_c
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(!out_c.close_ok);
 }
 
@@ -450,28 +462,35 @@ fn close_guard_close_reason_only_permissive() {
     sm.advance_with_instant("resp", &resp, now);
 
     // Close with Timeout → guard passes at close time → count=3 >= 3 → close_ok
-    let out = sm.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out = sm
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(out.close_ok);
     assert_eq!(out.close_step_data[0].measure_value, 3.0);
 
     // Scenario B: same but close with Flush → close_reason guard fails
-    let mut sm2 = CepStateMachine::new("rule31b".to_string(), plan_with_close(
-        vec![simple_key("sip")],
-        vec![step(vec![branch("req", count_ge(1.0))])],
-        vec![step(vec![BranchPlan {
-            label: None,
-            source: "resp".to_string(),
-            field: None,
-            guard: Some(close_reason_guard("timeout")),
-            agg: count_ge(3.0),
-        }])],
-        Duration::from_secs(60),
-    ));
+    let mut sm2 = CepStateMachine::new(
+        "rule31b".to_string(),
+        plan_with_close(
+            vec![simple_key("sip")],
+            vec![step(vec![branch("req", count_ge(1.0))])],
+            vec![step(vec![BranchPlan {
+                label: None,
+                source: "resp".to_string(),
+                field: None,
+                guard: Some(close_reason_guard("timeout")),
+                agg: count_ge(3.0),
+            }])],
+            Duration::from_secs(60),
+        ),
+    );
     sm2.advance_with_instant("req", &req, now);
     sm2.advance_with_instant("resp", &resp, now);
     sm2.advance_with_instant("resp", &resp, now);
     sm2.advance_with_instant("resp", &resp, now);
-    let out2 = sm2.close(&[str_val("10.0.0.1")], CloseReason::Flush).unwrap();
+    let out2 = sm2
+        .close(&[str_val("10.0.0.1")], CloseReason::Flush)
+        .unwrap();
     assert!(!out2.close_ok);
 }
 
@@ -508,17 +527,14 @@ fn close_step_string_min_max() {
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
     sm_a.advance_with_instant("req", &req, now);
 
-    let mk_dns = |h: &str| {
-        event(vec![
-            ("sip", str_val("10.0.0.1")),
-            ("hostname", str_val(h)),
-        ])
-    };
+    let mk_dns = |h: &str| event(vec![("sip", str_val("10.0.0.1")), ("hostname", str_val(h))]);
     sm_a.advance_with_instant("dns", &mk_dns("gamma"), now);
     sm_a.advance_with_instant("dns", &mk_dns("alpha"), now); // min becomes "alpha"
     sm_a.advance_with_instant("dns", &mk_dns("delta"), now);
 
-    let out_a = sm_a.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out_a = sm_a
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(out_a.event_ok);
     assert!(!out_a.close_ok); // min="alpha" < "beta" → not satisfied
 
@@ -528,7 +544,9 @@ fn close_step_string_min_max() {
     sm_b.advance_with_instant("dns", &mk_dns("gamma"), now);
     sm_b.advance_with_instant("dns", &mk_dns("beta"), now); // min becomes "beta"
 
-    let out_b = sm_b.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out_b = sm_b
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(out_b.event_ok);
     assert!(out_b.close_ok); // min="beta" >= "beta" → satisfied
 
@@ -556,7 +574,9 @@ fn close_step_string_min_max() {
     sm_c.advance_with_instant("dns", &mk_dns("alpha"), now);
     sm_c.advance_with_instant("dns", &mk_dns("gamma"), now); // max becomes "gamma"
 
-    let out_c = sm_c.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out_c = sm_c
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(out_c.event_ok);
     assert!(out_c.close_ok); // max="gamma" >= "delta" → true
 }
@@ -587,10 +607,7 @@ fn non_constant_threshold_no_silent_zero() {
     let mut sm = CepStateMachine::new("rule33".to_string(), plan);
 
     // Even after many events, the threshold can't be resolved, so it never matches
-    let e = event(vec![
-        ("sip", str_val("10.0.0.1")),
-        ("limit", num(5.0)),
-    ]);
+    let e = event(vec![("sip", str_val("10.0.0.1")), ("limit", num(5.0))]);
     for _ in 0..10 {
         assert_eq!(sm.advance("fail", &e), StepResult::Accumulate);
     }
@@ -664,7 +681,9 @@ fn min_max_non_constant_threshold_no_false_positive() {
     ]);
     sm2.advance_with_instant("dns", &dns_ev, now);
 
-    let out = sm2.close(&[str_val("10.0.0.1")], CloseReason::Timeout).unwrap();
+    let out = sm2
+        .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
+        .unwrap();
     assert!(out.event_ok);
     assert!(!out.close_ok); // threshold is non-constant → must not satisfy
 }
@@ -723,10 +742,7 @@ fn min_max_cross_type_threshold_rejected() {
     );
     let mut sm2 = CepStateMachine::new("rule35b".to_string(), plan2);
 
-    let e2 = event(vec![
-        ("sip", str_val("10.0.0.1")),
-        ("score", num(999.0)),
-    ]);
+    let e2 = event(vec![("sip", str_val("10.0.0.1")), ("score", num(999.0))]);
     for _ in 0..5 {
         assert_eq!(sm2.advance("alert", &e2), StepResult::Accumulate);
     }

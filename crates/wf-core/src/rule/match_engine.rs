@@ -225,12 +225,7 @@ impl CepStateMachine {
 
     /// Same as [`advance`](Self::advance) but accepts an explicit `now` timestamp
     /// (useful for testing without real clocks).
-    pub fn advance_with_instant(
-        &mut self,
-        alias: &str,
-        event: &Event,
-        now: Instant,
-    ) -> StepResult {
+    pub fn advance_with_instant(&mut self, alias: &str, event: &Event, now: Instant) -> StepResult {
         // 1. Extract scope key from event
         let scope_key = match extract_key(event, &self.plan.keys) {
             Some(k) => k,
@@ -247,7 +242,12 @@ impl CepStateMachine {
 
         // 3. Accumulate close steps (if any) — happens on every event
         if !plan.close_steps.is_empty() {
-            accumulate_close_steps(alias, event, &plan.close_steps, &mut instance.close_step_states);
+            accumulate_close_steps(
+                alias,
+                event,
+                &plan.close_steps,
+                &mut instance.close_step_states,
+            );
         }
 
         // 4. If event steps already complete, just accumulate for close
@@ -378,7 +378,11 @@ pub(crate) fn field_ref_name(fr: &FieldRef) -> &str {
 }
 
 fn make_instance_key(scope_key: &[Value]) -> String {
-    scope_key.iter().map(value_to_string).collect::<Vec<_>>().join("\x1f")
+    scope_key
+        .iter()
+        .map(value_to_string)
+        .collect::<Vec<_>>()
+        .join("\x1f")
 }
 
 pub(crate) fn value_to_string(v: &Value) -> String {
@@ -627,7 +631,9 @@ fn compare(cmp: CmpOp, lhs: f64, rhs: f64) -> bool {
 /// Number < Str < Bool for cross-type (shouldn't happen in practice).
 fn value_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Number(x), Value::Number(y)) => {
+            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        }
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         // Cross-type: shouldn't happen with well-typed rules
@@ -701,9 +707,7 @@ pub(crate) fn eval_expr(expr: &Expr, event: &Event) -> Option<Value> {
             });
             Some(Value::Bool(if *negated { !found } else { found }))
         }
-        Expr::FuncCall {
-            name, args, ..
-        } => eval_func_call(name, args, event),
+        Expr::FuncCall { name, args, .. } => eval_func_call(name, args, event),
         _ => None,
     }
 }
@@ -1015,7 +1019,10 @@ fn evaluate_close_steps(
     let synthetic_event = Event {
         fields: {
             let mut m = HashMap::new();
-            m.insert("close_reason".to_string(), Value::Str(reason.as_str().to_string()));
+            m.insert(
+                "close_reason".to_string(),
+                Value::Str(reason.as_str().to_string()),
+            );
             m
         },
     };

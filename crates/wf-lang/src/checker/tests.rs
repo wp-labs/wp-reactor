@@ -139,7 +139,11 @@ rule r {
     yield out (x = a.sip)
 }
 "#;
-    assert_has_error(input, &[auth_events_window(), fw_events_window(), output_window()], "duplicate event alias `a`");
+    assert_has_error(
+        input,
+        &[auth_events_window(), fw_events_window(), output_window()],
+        "duplicate event alias `a`",
+    );
 }
 
 #[test]
@@ -214,10 +218,7 @@ rule brute_force {
     )
 }
 "#;
-    assert_no_errors(
-        input,
-        &[auth_events_window(), security_alerts_window()],
-    );
+    assert_no_errors(input, &[auth_events_window(), security_alerts_window()]);
 }
 
 // =========================================================================
@@ -332,11 +333,7 @@ rule r {
     yield auth_events (sip = e.sip)
 }
 "#;
-    assert_has_error(
-        input,
-        &[auth_events_window()],
-        "has stream subscriptions",
-    );
+    assert_has_error(input, &[auth_events_window()], "has stream subscriptions");
 }
 
 #[test]
@@ -582,11 +579,7 @@ contract ct for r {
     let file = parse_wfl(input).unwrap();
     let errs = check_wfl(&file, &[auth_events_window(), output_window()]);
     // The rule itself is valid and contract refs are valid
-    assert!(
-        errs.is_empty(),
-        "expected no errors, got: {:?}",
-        errs
-    );
+    assert!(errs.is_empty(), "expected no errors, got: {:?}", errs);
 }
 
 // =========================================================================
@@ -616,7 +609,11 @@ rule brute_force_then_scan {
 "#;
     assert_no_errors(
         input,
-        &[auth_events_window(), fw_events_window(), security_alerts_window()],
+        &[
+            auth_events_window(),
+            fw_events_window(),
+            security_alerts_window(),
+        ],
     );
 }
 
@@ -803,7 +800,8 @@ rule hostname_anomaly {
     // The checker must report the incompatibility, not silently pass.
     let errs = check_errors(input, &[auth_events_window(), output_window()]);
     assert!(
-        errs.iter().any(|e| e.contains("not compatible") && e.contains("min()")),
+        errs.iter()
+            .any(|e| e.contains("not compatible") && e.contains("min()")),
         "expected T5 error for min(Chars) vs Digit threshold, got: {:?}",
         errs
     );
@@ -836,7 +834,10 @@ rule multi_measure {
 }
 "#;
     let errs = check_errors(input, &[auth_events_window(), output_window()]);
-    let t5_errors: Vec<_> = errs.iter().filter(|e| e.contains("not compatible")).collect();
+    let t5_errors: Vec<_> = errs
+        .iter()
+        .filter(|e| e.contains("not compatible"))
+        .collect();
     assert_eq!(
         t5_errors.len(),
         1,
@@ -1001,13 +1002,27 @@ rule bad_hostname_check {
         .iter()
         .filter(|e| e.message.contains("not compatible"))
         .collect();
-    assert_eq!(t5_errs.len(), 1, "expected exactly 1 T5 error, got: {:?}", t5_errs);
+    assert_eq!(
+        t5_errs.len(),
+        1,
+        "expected exactly 1 T5 error, got: {:?}",
+        t5_errs
+    );
 
     let msg = &t5_errs[0].message;
     // Verify the error message contains the key diagnostic info
-    assert!(msg.contains("min()"), "error should name the measure: {msg}");
-    assert!(msg.contains("Chars"), "error should mention the result type Chars: {msg}");
-    assert!(msg.contains("Digit"), "error should mention the threshold type Digit: {msg}");
+    assert!(
+        msg.contains("min()"),
+        "error should name the measure: {msg}"
+    );
+    assert!(
+        msg.contains("Chars"),
+        "error should mention the result type Chars: {msg}"
+    );
+    assert!(
+        msg.contains("Digit"),
+        "error should mention the threshold type Digit: {msg}"
+    );
 
     // Verify the error is attributed to the correct rule
     assert_eq!(
@@ -1066,4 +1081,48 @@ rule r {
         input,
         &[auth_events_window(), fw_events_window(), output_window()],
     );
+}
+
+// =========================================================================
+// Label vs key name collision
+// =========================================================================
+
+#[test]
+fn label_conflicts_with_match_key() {
+    // Label "sip" shadows the match key "sip" → should be rejected
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> {
+        on event {
+            sip: e | count >= 1;
+        }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "conflicts with match key field",
+    );
+}
+
+#[test]
+fn label_does_not_conflict_with_unrelated_key() {
+    // Label "fail" does not conflict with key "sip" → should pass
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> {
+        on event {
+            fail: e | count >= 1;
+        }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
 }

@@ -29,16 +29,17 @@ pub fn check_contracts(file: &WflFile, errors: &mut Vec<CheckError>) {
 
                 for stmt in &contract.given {
                     if let GivenStmt::Row { alias, .. } = stmt
-                        && !event_aliases.contains(&alias.as_str()) {
-                            errors.push(CheckError {
-                                rule: None,
-                                contract: Some(cname.to_string()),
-                                message: format!(
-                                    "row alias `{}` is not declared in rule `{}`'s events",
-                                    alias, contract.rule_name
-                                ),
-                            });
-                        }
+                        && !event_aliases.contains(&alias.as_str())
+                    {
+                        errors.push(CheckError {
+                            rule: None,
+                            contract: Some(cname.to_string()),
+                            message: format!(
+                                "row alias `{}` is not declared in rule `{}`'s events",
+                                alias, contract.rule_name
+                            ),
+                        });
+                    }
                 }
             }
         }

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
+use crate::parse_utils::duration_value;
 use winnow::ascii::multispace1;
 use winnow::combinator::{alt, cut_err, delimited, opt, preceded, repeat, separated};
-use crate::parse_utils::duration_value;
 use winnow::error::{AddContext, ContextError, ErrMode, StrContext, StrContextValue};
 use winnow::prelude::*;
 use winnow::token::literal;
@@ -115,9 +115,7 @@ fn window_decl(input: &mut &str) -> ModalResult<WindowSchema> {
                 return Err(ErrMode::Cut(ContextError::new().add_context(
                     input,
                     &input.checkpoint(),
-                    StrContext::Expected(StrContextValue::Description(
-                        "duplicate 'fields' block",
-                    )),
+                    StrContext::Expected(StrContextValue::Description("duplicate 'fields' block")),
                 )));
             }
             fields = Some(f);
@@ -173,7 +171,11 @@ fn stream_single(input: &mut &str) -> ModalResult<String> {
 fn stream_array(input: &mut &str) -> ModalResult<Vec<String>> {
     delimited(
         literal("["),
-        separated(1.., preceded(ws_skip, quoted_string), preceded(ws_skip, literal(","))),
+        separated(
+            1..,
+            preceded(ws_skip, quoted_string),
+            preceded(ws_skip, literal(",")),
+        ),
         preceded(ws_skip, literal("]")),
     )
     .parse_next(input)

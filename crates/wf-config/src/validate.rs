@@ -68,19 +68,14 @@ pub fn validate_over_vs_over_cap(
     window_overs: &HashMap<String, Duration>,
 ) -> anyhow::Result<()> {
     for (name, over) in window_overs {
-        let wc = windows
-            .iter()
-            .find(|w| w.name == *name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "window {name:?} found in .ws schema but not in fusion.toml [window.{name}]"
-                )
-            })?;
+        let wc = windows.iter().find(|w| w.name == *name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "window {name:?} found in .ws schema but not in fusion.toml [window.{name}]"
+            )
+        })?;
         let cap: Duration = wc.over_cap.into();
         if *over > cap {
-            anyhow::bail!(
-                "window {name:?}: over ({over:?}) exceeds over_cap ({cap:?})",
-            );
+            anyhow::bail!("window {name:?}: over ({over:?}) exceeds over_cap ({cap:?})",);
         }
     }
     Ok(())

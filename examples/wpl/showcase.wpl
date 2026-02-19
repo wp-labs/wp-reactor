@@ -1,0 +1,66 @@
+package /nginx/ {
+  rule example {
+    (ip:sip, 2*_, time/clf:recv_time<[,]>, http/request", http/status, digit, chars", http/agent", _")
+  }
+}
+
+package /firewall/ {
+  #[tag(vendor: "huawei", product: "usg")]
+  rule huawei_log {
+    |decode/base64|
+    (digit<,>, time, sn, kvarr(@CID), *kv\,)
+  }
+
+  rule h3c_waf {
+    |decode/base64|
+    (digit<,>, time, sn, time, 2*chars, 12*kv, 2*_, 7*kv, _)
+  }
+}
+
+package wpl_example {
+  #[tag(category: "test"), copy_raw(name: "raw_data")]
+  rule full_types {
+    (
+      bool:bool_val,
+      chars:quoted_str",
+      digit:integer,
+      float:float_val,
+      time_3339:time_rfc3339,
+      time/clf:time_common<[,]>,
+      ip:ip_addr,
+      ip_net:ip_network,
+      kvarr(chars@name, digit@count):kv_data,
+      json(bool@strict):json_data,
+      http/request",
+      http/status:http_status,
+      http/agent:user_agent",
+      port:port_num,
+      sn:serial,
+      hex:hex_data,
+      base64:base64_data,
+      url:link,
+      domain:host,
+      email:addr,
+      array/ip:ip_list
+    )
+  }
+
+  rule with_pipes {
+    (
+      chars:action | has(),
+      digit:code | digit_range(200, 499),
+      kvarr:params | take(user_id),
+      json(chars@msg):data | json_unescape()
+    )
+  }
+
+  rule with_separators {
+    (chars:key{*=}, chars:value)\,
+  }
+
+  rule with_plg_pipe {
+    @plg_pipe(id: my_custom_pipe) {
+      (chars:raw_line)
+    }
+  }
+}

@@ -1,0 +1,89 @@
+// ── Contract tests for L1 detection rules ──
+
+// Brute-force: 3 failed logins within 5m should trigger
+contract brute_force_basic for brute_force {
+  given {
+    row(fail, sip = "10.0.0.1", action = "failed", event_time = "2026-02-17T10:00:00Z");
+    row(fail, sip = "10.0.0.1", action = "failed", event_time = "2026-02-17T10:00:30Z");
+    row(fail, sip = "10.0.0.1", action = "failed", event_time = "2026-02-17T10:01:00Z");
+    tick(5m);
+  }
+  expect {
+    hits == 1;
+    hit[0].score == 70.0;
+    hit[0].entity_type == "ip";
+    hit[0].entity_id == "10.0.0.1";
+    hit[0].field("fail_count") == 3;
+  }
+  options {
+    close_trigger = timeout;
+    eval_mode = strict;
+  }
+}
+
+// Brute-force: only 2 failures should NOT trigger
+contract brute_force_below_threshold for brute_force {
+  given {
+    row(fail, sip = "10.0.0.2", action = "failed", event_time = "2026-02-17T10:00:00Z");
+    row(fail, sip = "10.0.0.2", action = "failed", event_time = "2026-02-17T10:00:30Z");
+    tick(5m);
+  }
+  expect {
+    hits == 0;
+  }
+  options {
+    close_trigger = timeout;
+    eval_mode = strict;
+  }
+}
+
+// DNS no-response: query with no reply should fire on timeout
+contract dns_no_response_timeout for dns_no_response {
+  given {
+    row(req,
+      query_id = "q-1",
+      sip = "10.0.0.8",
+      domain = "evil.test",
+      event_time = "2026-02-17T10:00:00Z"
+    );
+    tick(31s);
+  }
+  expect {
+    hits == 1;
+    hit[0].score == 50.0;
+    hit[0].close_reason == "timeout";
+    hit[0].entity_type == "ip";
+    hit[0].entity_id == "10.0.0.8";
+    hit[0].field("domain") == "evil.test";
+  }
+  options {
+    close_trigger = timeout;
+    eval_mode = strict;
+  }
+}
+
+// DNS no-response: query WITH response should NOT fire
+contract dns_has_response for dns_no_response {
+  given {
+    row(req,
+      query_id = "q-2",
+      sip = "10.0.0.9",
+      domain = "evil.test",
+      event_time = "2026-02-17T10:00:00Z"
+    );
+    row(resp,
+      query_id = "q-2",
+      sip = "10.0.0.9",
+      rcode = 0,
+      event_time = "2026-02-17T10:00:01Z"
+    );
+    tick(31s);
+  }
+  expect {
+    hits == 0;
+  }
+  options {
+    close_trigger = timeout;
+    eval_mode = strict;
+  }
+}

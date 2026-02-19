@@ -4,7 +4,9 @@ use winnow::prelude::*;
 use winnow::token::literal;
 
 use crate::ast::*;
-use crate::parse_utils::{duration_value, ident, kw, nonneg_integer, number_literal, quoted_string, ws_skip};
+use crate::parse_utils::{
+    duration_value, ident, kw, nonneg_integer, number_literal, quoted_string, ws_skip,
+};
 
 use super::expr;
 

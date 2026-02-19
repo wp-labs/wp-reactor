@@ -57,6 +57,16 @@ pub fn branch(source: &str, agg: AggPlan) -> BranchPlan {
     }
 }
 
+pub fn branch_with_label(source: &str, label: &str, agg: AggPlan) -> BranchPlan {
+    BranchPlan {
+        label: Some(label.to_string()),
+        source: source.to_string(),
+        field: None,
+        guard: None,
+        agg,
+    }
+}
+
 pub fn step(branches: Vec<BranchPlan>) -> StepPlan {
     StepPlan { branches }
 }

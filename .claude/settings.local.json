@@ -2,6 +2,7 @@
   "permissions": {
     "allow": [
       "Bash(git remote add:*)",
+<<<<<<< HEAD
       "WebSearch",
       "WebFetch(domain:zed.dev)",
       "WebFetch(domain:boundaryml.com)",
@@ -37,7 +38,15 @@
       "Bash(tree-sitter highlight:*)",
       "Bash(git -C /Users/zuowenjian/devspace/wp-labs/wp-reactor log --oneline -10)",
       "Bash(cargo build:*)",
-      "Bash(cargo run:*)"
+      "Bash(cargo run:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(cargo doc:*)",
+      "Bash(wc:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo run:*)",
+      "Bash(python3:*)"
     ]
   }
 }

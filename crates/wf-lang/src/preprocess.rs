@@ -21,7 +21,11 @@ pub struct PreprocessError {
 
 impl fmt::Display for PreprocessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "preprocess error at position {}: {}", self.position, self.message)
+        write!(
+            f,
+            "preprocess error at position {}: {}",
+            self.position, self.message
+        )
     }
 }
 
@@ -187,7 +191,10 @@ mod tests {
     use super::*;
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -222,21 +229,33 @@ mod tests {
     fn undefined_var_error() {
         let v = HashMap::new();
         let err = preprocess_vars("$UNDEF", &v).unwrap_err();
-        assert!(err.message.contains("UNDEF"), "error should mention var name: {}", err.message);
+        assert!(
+            err.message.contains("UNDEF"),
+            "error should mention var name: {}",
+            err.message
+        );
     }
 
     #[test]
     fn undefined_braced_var_error() {
         let v = HashMap::new();
         let err = preprocess_vars("${UNDEF}", &v).unwrap_err();
-        assert!(err.message.contains("UNDEF"), "error should mention var name: {}", err.message);
+        assert!(
+            err.message.contains("UNDEF"),
+            "error should mention var name: {}",
+            err.message
+        );
     }
 
     #[test]
     fn unterminated_brace_error() {
         let v = vars(&[("VAR", "x")]);
         let err = preprocess_vars("${VAR", &v).unwrap_err();
-        assert!(err.message.contains("unterminated"), "error should indicate unterminated: {}", err.message);
+        assert!(
+            err.message.contains("unterminated"),
+            "error should indicate unterminated: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -287,10 +306,8 @@ mod tests {
     #[test]
     fn mixed_comment_and_var() {
         let v = vars(&[("THRESHOLD", "3")]);
-        let result = preprocess_vars(
-            "count >= $THRESHOLD # compare against $THRESHOLD\n",
-            &v,
-        ).unwrap();
+        let result =
+            preprocess_vars("count >= $THRESHOLD # compare against $THRESHOLD\n", &v).unwrap();
         assert_eq!(result, "count >= 3 # compare against $THRESHOLD\n");
     }
 
@@ -304,11 +321,12 @@ mod tests {
     #[test]
     fn dollar_in_fmt_string_ignored() {
         let v = HashMap::new();
-        let result = preprocess_vars(
-            r#"message = fmt("$USER failed {} times", fail.sip)"#,
-            &v,
-        ).unwrap();
-        assert_eq!(result, r#"message = fmt("$USER failed {} times", fail.sip)"#);
+        let result =
+            preprocess_vars(r#"message = fmt("$USER failed {} times", fail.sip)"#, &v).unwrap();
+        assert_eq!(
+            result,
+            r#"message = fmt("$USER failed {} times", fail.sip)"#
+        );
     }
 
     // --- Integration: preprocess then parse ---
@@ -339,7 +357,10 @@ rule brute_force {
 }
 "#;
         let processed = preprocess_vars(source, &v).unwrap();
-        assert!(processed.contains("count >= 3"), "variable should be substituted");
+        assert!(
+            processed.contains("count >= 3"),
+            "variable should be substituted"
+        );
         let file = parse_wfl(&processed).unwrap();
         assert_eq!(file.rules.len(), 1);
     }

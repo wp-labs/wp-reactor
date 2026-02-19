@@ -1,0 +1,8 @@
+[package]
+name = "oml-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tree-sitter = "0.22"
+tree-sitter-oml = { path = "../tree-sitter-oml" }

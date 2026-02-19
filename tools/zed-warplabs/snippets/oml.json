@@ -1,0 +1,134 @@
+{
+  "New OML file": {
+    "prefix": "oml",
+    "body": [
+      "name: ${1:my_rule}",
+      "rule: ${2:rule_path}",
+      "---",
+      "${3:field} = read(${4:source});",
+      "$0"
+    ],
+    "description": "New OML file skeleton with header and body"
+  },
+  "Name field": {
+    "prefix": "name",
+    "body": "name: ${1:rule_name}",
+    "description": "OML name header field"
+  },
+  "Rule field": {
+    "prefix": "rule",
+    "body": "rule: ${1:rule_path}",
+    "description": "OML rule header field"
+  },
+  "Read expression": {
+    "prefix": "read",
+    "body": "read(${1:source})",
+    "description": "Read data from source"
+  },
+  "Read with default": {
+    "prefix": "readd",
+    "body": [
+      "read(${1:source}) {",
+      "  _: ${2:value_expr(\"${3:default}\")};",
+      "}"
+    ],
+    "description": "Read data with default fallback"
+  },
+  "Take expression": {
+    "prefix": "take",
+    "body": "take(${1:source})",
+    "description": "Take data from source"
+  },
+  "Take with default": {
+    "prefix": "taked",
+    "body": [
+      "take(${1:source}) {",
+      "  _: ${2:value_expr(\"${3:default}\")};",
+      "}"
+    ],
+    "description": "Take data with default fallback"
+  },
+  "Pipe expression": {
+    "prefix": "pipe",
+    "body": "pipe ${1|read,take|}(${2:source}) | ${3:func}",
+    "description": "Pipe expression with function chain"
+  },
+  "Pipe with @ref": {
+    "prefix": "piperef",
+    "body": "pipe @${1:var} | ${2:func}",
+    "description": "Pipe expression using @ref variable"
+  },
+  "Format expression": {
+    "prefix": "fmt",
+    "body": "fmt(\"${1:template}\", ${2|read,take|}(${3:source}))",
+    "description": "Format expression with template string"
+  },
+  "Object expression": {
+    "prefix": "object",
+    "body": [
+      "object {",
+      "  ${1:field} = ${2|read,take|}(${3:source});",
+      "  $0",
+      "}"
+    ],
+    "description": "Object aggregation expression"
+  },
+  "Collect expression": {
+    "prefix": "collect",
+    "body": "collect ${1|read,take|}(${2:source})",
+    "description": "Collect expression"
+  },
+  "Match expression": {
+    "prefix": "match",
+    "body": [
+      "match ${1|read,take|}(${2:source}) {",
+      "  ${3:condition} => ${4:result};",
+      "  _ => ${5:default};",
+      "}"
+    ],
+    "description": "Match expression with cases"
+  },
+  "Match multi-source": {
+    "prefix": "matchm",
+    "body": [
+      "match (${1|read,take|}(${2:src1}), ${3|read,take|}(${4:src2})) {",
+      "  (${5:cond1}, ${6:cond2}) => ${7:result};",
+      "  _ => ${8:default};",
+      "}"
+    ],
+    "description": "Multi-source match expression"
+  },
+  "SQL expression": {
+    "prefix": "sql",
+    "body": "select ${1:*} from ${2:table} where ${3:column} ${4|=,!=,<,>,<=,>=|} ${5:value}",
+    "description": "SQL select expression"
+  },
+  "Value expression": {
+    "prefix": "val",
+    "body": "${1|chars,digit,float,ip,time,bool,auto,obj,array|}(${2:value})",
+    "description": "Typed value expression"
+  },
+  "Aggregate item": {
+    "prefix": "agg",
+    "body": "${1:target}${2: :${3|chars,digit,float,ip,time,bool,auto,obj,array|}} = ${4|read,take|}(${5:source});",
+    "description": "Aggregate assignment item"
+  },
+  "Privacy section": {
+    "prefix": "privacy",
+    "body": [
+      "---",
+      "${1:field}: ${2|privacy_ip,privacy_specify_ip,privacy_id_card,privacy_mobile,privacy_mail,privacy_domain,privacy_specify_name,privacy_specify_domain,privacy_specify_address,privacy_specify_company,privacy_keymsg|}"
+    ],
+    "description": "Privacy section with field declaration"
+  },
+  "Separator": {
+    "prefix": "---",
+    "body": "---",
+    "description": "Section separator"
+  },
+  "At reference": {
+    "prefix": "@",
+    "body": "@${1:var}",
+    "description": "@ref variable reference"
+  }
+}

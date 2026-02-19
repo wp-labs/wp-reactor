@@ -6,7 +6,9 @@ use arrow::record_batch::RecordBatch;
 pub struct AlertRecord {
     /// Composite alert key: `"rule|key1\x1fkey2|fired_at#seq"`.
     ///
-    /// - Keys joined with `\x1f` (unit separator) to avoid value-containing-comma ambiguity
+    /// - Each segment is percent-encoded (`|` → `%7C`, `#` → `%23`) so
+    ///   splitting on literal `|` always yields exactly three parts
+    /// - Keys joined with `\x1f` (unit separator)
     /// - `seq` is a process-wide monotonic counter for same-millisecond uniqueness
     pub alert_id: String,
     /// Name of the rule that fired.
