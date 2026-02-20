@@ -1,5 +1,5 @@
 # WarpFusion 执行计划
-<!-- 角色：架构师 / 项目管理 | 状态：v2.1 对齐中 | 创建：2026-02-15 | 更新：2026-02-20 -->
+<!-- 角色：架构师 / 项目管理 | 状态：v2.2 M20 MVP 已完成 | 创建：2026-02-15 | 更新：2026-02-20 -->
 
 > 本文档将 WarpFusion 引擎基建（[warp-fusion.md](warp-fusion.md) P0–P7）与 WFL v2.1 语言实现（[wfl-desion.md](wfl-desion.md) Phase 0–4）统一为主干 30 个里程碑（M01–M30，十个阶段）。  
 > `wf-datagen` 的 M31–M33 保留为**支撑轨道**（已完成），用于 `gen -> run -> verify` 质量闭环。
@@ -16,9 +16,9 @@ M05 Sink 断连重连     ✅   M10 Router + Evictor  ✅
 
 阶段 IV ─ 执行引擎        阶段 V ─ 运行时与闭环       阶段 VI ─ 生产化
 M14 MatchEngine CEP   ✅   M17 Receiver          ✅   M21 热加载
-M15 缺失检测+超时     ✅   M18 Scheduler+Lifecycle     M22 多通道告警+去重
-M16 RuleExecutor+join       M19 告警系统                M23 监控+性能
-                            M20 ★ E2E MVP 验收          M24 开发者工具链
+M15 缺失检测+超时     ✅   M18 Scheduler+Lifecycle ✅  M22 多通道告警+去重
+M16 RuleExecutor+join       M19 告警系统           ✅   M23 监控+性能
+                            M20 ★ E2E MVP 验收    ✅   M24 开发者工具链
 
 阶段 VII ─ WFL L2         阶段 VIII ─ L3+Conformance   阶段 IX ─ 可靠性分级   阶段 X ─ 分布式
 M25 join+baseline+has      M27 tumble+conv+pattern      M29 传输可靠性三档      M30 分布式 V2
@@ -59,7 +59,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-arrow` |
-| 范围 | `encode_ipc` / `decode_ipc`（帧格式：4B BE len + stream_tag + Arrow IPC RecordBatch）；帧读取器（从 TCP 流中按长度前缀切分帧） |
+| 范围 | `encode_ipc` / `decode_ipc`（帧格式：4B BE len + stream_name + Arrow IPC RecordBatch）；帧读取器（从 TCP 流中按长度前缀切分帧） |
 | 依赖 | M02 |
 | 验收 | 编解码往返测试；帧头字段完整性校验；畸形帧拒绝测试 |
 | 状态 | **已完成** — `wf-arrow/src/ipc.rs` 实现 |
@@ -219,7 +219,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 验收 | 多连接并发接收测试；持续接收 wp-motor 数据测试；连接断开不影响其他连接测试 |
 | 状态 | **已完成** — `wf-runtime/src/receiver.rs` 实现，3 项测试通过 |
 
-### M18：Scheduler + Lifecycle
+### M18：Scheduler + Lifecycle ✅
 
 | 项目 | 内容 |
 |------|------|
@@ -229,7 +229,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 验收 | 多规则并行分发测试；并发上限背压测试；Ctrl-C 优雅关闭测试 |
 | 状态 | **已完成** — `wf-runtime/src/scheduler.rs` + `lifecycle.rs` + `receiver.rs`；`SchedulerCommand` 控制通道、`EngineHandle`/`EngineCore` 并行执行、`tokio::time::timeout` 包裹、receiver 错误处理；5 项调度器测试 + 1 项 E2E 测试通过 |
 
-### M19：告警系统
+### M19：告警系统 ✅
 
 | 项目 | 内容 |
 |------|------|
@@ -239,13 +239,14 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 验收 | 告警写入 JSON Lines 文件；alert_id 相同输入一致性测试；文件可被 jq 解析 |
 | 状态 | **已完成** — `wf-core/src/alert/types.rs` + `sink.rs` + `wf-core/src/rule/executor.rs`；AlertRecord 序列化、确定性复合键 alert_id、FileAlertSink JSON Lines 输出；8 项告警相关测试通过 |
 
-### M20：端到端 MVP 验收 ★
+### M20：端到端 MVP 验收 ★ ✅
 
 | 项目 | 内容 |
 |------|------|
 | 范围 | **集成验收**：wp-motor 发送模拟日志 → TCP + Arrow IPC 传输 → WarpFusion 接收 → brute_force_then_scan 规则触发 → 告警写入文件；CLI 启动命令（`wf run -c fusion.toml`） |
 | 依赖 | M05, M06, M07, M13, M18, M19（全链路） |
 | 验收 | **单机 MVP 达成**：一条完整 L1 规则从数据接收到告警输出全流程跑通；可作为独立进程启动运行 |
+| 状态 | **已完成** — `e2e_brute_force_alert` 集成测试跑通完整链路（TCP 接收 → Arrow IPC 解码 → Router 路由 → Scheduler 分发 → CEP 匹配 → 告警写入文件）；CLI `cargo run -p wf-cli -- run -c examples/fusion.toml` 正常启动并监听 `127.0.0.1:9800`，SIGTERM 优雅关闭 |
 
 ---
 
@@ -283,9 +284,10 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-lang` |
-| 范围 | `wf explain`：输出 RulePlan 的人类可读描述（状态机步骤、join 模式、score 展开、字段血缘）；`wf lint`：静态检查（常见错误、性能陷阱、废弃用法）；`wf fmt`：规则格式化（统一缩进、空格、换行） |
+| 范围 | `wf explain`：输出 RulePlan 的人类可读描述（状态机步骤、join 模式、score 展开、字段血缘）；`wf lint`：静态检查（常见错误、性能陷阱、废弃用法）；`wf fmt`：规则格式化（统一缩进、空格、换行）；编辑器集成：Zed 支持 WFL 语法高亮与 LSP（诊断、跳转、补全） |
 | 依赖 | M13 |
 | 验收 | explain 输出可读；lint 检出未使用变量 / 无效过滤等；fmt 格式化后重新解析一致 |
+| 状态 | **进行中** — Zed 已支持 WFL 语法高亮与 LSP，CLI 工具链能力继续完善 |
 
 ---
 
@@ -434,14 +436,14 @@ wf-datagen: M31 ✅; M32 ✅; M33 ✅; verify 端到端需 M20 汇合
 
 ### 当前推荐执行顺序
 
-两条并行轨道同步推进，在 M20 汇合后即可跑通 `gen → run → verify` 全流程：
+M20 MVP 已完成，下一步两条路径可并行推进：
 
 ```
-轨道 A（引擎）    M16 ──→ M18 ──→ M19 ──→ M20 ★ MVP
-                                                │
-轨道 B（测试）    M31 ✅ → M32 ✅ (gen+oracle) ─┤──→ M32(verify端到端) ──→ M33 ✅
-                                                │
-                                           汇合点：端到端 verify
+轨道 A（执行引擎补全）  M16（DataFusion join）
+                              │
+轨道 B（生产化）         M21 → M22 → M23 → M24
+                              ↑
+                            M20 ✅
 ```
 
 
@@ -453,8 +455,8 @@ wf-datagen: M31 ✅; M32 ✅; M33 ✅; verify 端到端需 M20 汇合
 | **II 配置与窗口** | M06–M10 | 配置可加载、Window 能接收路由并缓存数据 | ✅ 已完成 |
 | **III WFL 编译器** | M11–M13 | .wfs + .wfl 编译为 RulePlan | ✅ 已完成 |
 | **IV 执行引擎** | M14–M16 | CEP 状态机 + DataFusion join 可执行 | M14–M15 ✅ / M16 待开始 |
-| **V 运行时闭环** | M17–M20 | **单机 MVP：数据接收→规则执行→告警输出** | M17–M19 ✅ / M20 待开始 |
-| **VI 生产化** | M21–M24 | 热加载、多通道告警、监控、工具链 | 待开始 |
+| **V 运行时闭环** | M17–M20 | **单机 MVP：数据接收→规则执行→告警输出** | ✅ 已完成 |
+| **VI 生产化** | M21–M24 | 热加载、多通道告警、监控、工具链 | 进行中（M24 部分完成） |
 | **VII L2 增强** | M25–M26 | snapshot/asof / baseline / key 映射 / limits / 条件表达式 / yield@vN | 待开始 |
 | **VIII L3 + Conformance** | M27–M28 | tumble / conv / composable pattern / 多级管道 / shuffle 契约 | 待开始 |
 | **IX 可靠性分级** | M29 | best_effort / at_least_once / exactly_once | 待开始 |
@@ -468,7 +470,7 @@ wf-datagen: M31 ✅; M32 ✅; M33 ✅; verify 端到端需 M20 汇合
 |--------|--------|---------|------|
 | **CP1 传输就绪** | M05 | wp-motor → TCP → 对端解码正确；断连重连恢复正常 | ✅ 已通过 |
 | **CP2 编译就绪** | M13 | brute_scan.wfl 编译为正确的 RulePlan | ✅ 已通过 |
-| **CP3 单机 MVP** | M20 | 一条 L1 规则从数据接收到告警输出全流程跑通 | 待验收 |
+| **CP3 单机 MVP** | M20 | 一条 L1 规则从数据接收到告警输出全流程跑通 | ✅ 已通过 |
 | **CP4 生产就绪** | M24 | 热加载 + 监控 + 1K EPS 性能达标 + 工具链可用 | 待验收 |
 | **CP5 Conformance 门禁** | M28 | `contract + shuffle + scenario verify` 三层门禁接入 CI | 待验收 |
 | **CP6 可靠性分级** | M29 | 三档传输语义可切换，指标与回放行为符合预期 | 待验收 |

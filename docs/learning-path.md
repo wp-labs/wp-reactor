@@ -220,7 +220,7 @@ wf-datagen (独立二进制)
 运行时数据流：
 
 ```
-TCP 客户端发送: [4B 长度][stream_tag][Arrow IPC batch]
+TCP 客户端发送: [4B 长度][stream_name][Arrow IPC batch]
         │
         ▼
    ┌──────────┐

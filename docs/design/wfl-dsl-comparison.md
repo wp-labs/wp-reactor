@@ -1,9 +1,9 @@
 # WFL 与主流关联引擎 DSL 对比分析
-<!-- 角色：架构师 | 创建：2026-02-13 | 更新：2026-02-16 -->
+<!-- 角色：架构师 | 状态：v2.1 对齐中 | 创建：2026-02-13 | 更新：2026-02-20 -->
 
 > 本文档对比 WFL（Warp Fusion Language）与 YARA-L 2.0、Elastic EQL、Sigma、Splunk SPL、KQL（Microsoft Sentinel）五种主流关联/检测 DSL 的能力差异，分析 WFL 的设计优势与已知短板。
 >
-> 本文基于 [wfl-desion.md](wfl-desion.md)（2026-02-15）的最新设计。
+> 本文基于 [wfl-desion.md](wfl-desion.md)（2026-02-20，v2.1）的最新设计。
 
 
 ## 1. 能力矩阵
@@ -26,7 +26,8 @@
 | 多级管道 | `\|>` 串联 + 隐式 window (L3) | ✗ | ✗ | ✗ | `\|` 无限管道 | `\|` 管道 |
 | 缺失检测 | `on close { resp \| count == 0; }` | `!$e2` | `!sequence` | ✗ | `NOT` 子搜索 | ✗ |
 | OR 分支 | `branch_a \|\| branch_b ;` | ✗ | ✗ | ✗ | ✗ | ✗ |
-| 外部关联 | `join window on field == field` (L2) | 无（平台侧） | 无 | 无 | `lookup` | `externaldata` |
+| 外部关联 | `join window snapshot/asof on ...` (L2) | 无（平台侧） | 无 | 无 | `lookup` | `externaldata` |
+| Join 时点语义 | `snapshot` / `asof within` 一等语法 | ✗ | ✗ | ✗ | ✗ | ✗ |
 | 集合判定 | `window.has(field[, target])` (L2) | `$e.ip in %list` | ✗ | ✗ | `inputlookup` | `in (externaldata)` |
 | 数值风险评分 | `-> score(expr)` (L1) | ✗ | ✗ | ✗ | ✗（需 eval 手算） | ✗ |
 | 分项可解释评分 | `-> score { item = expr @ weight; }` (L2) | ✗ | ✗ | ✗ | ✗ | ✗ |
@@ -38,9 +39,13 @@
 | 子查询合并 | 隐式 yield 规则链 + join | ✗ | ✗ | ✗ | `join [subsearch]` | `join (subquery)` |
 | 变量参数化 | `$VAR` / `${VAR:default}` (L1) | ✗ | ✗ | ✗ | `$token$` | ✗ |
 | `in`/`not in` | `expr in (...)`/`expr not in (...)` | `in %list` | `in (...)` | ✗ | `IN (...)` | `in (...)` |
+| 规则资源预算 | `limits { max_state ... }` (v2.1) | ✗ | ✗ | ✗ | 平台配置 | 平台配置 |
+| 输出契约版本 | `yield target@vN` + `meta.contract_version` | ✗ | ✗ | ✗ | ✗ | ✗ |
+| 可证明正确性门禁 | `contract + shuffle + scenario verify` | 平台回放 | 平台测试 | ✗ | 平台测试 | 平台测试 |
 | 数据/逻辑分离 | .wfs / .wfl / .toml 三文件 + `pack.yaml` | 单文件 | 单文件 | 单文件 | 单文件 | 单文件 |
 | 能力分层 | L1/L2/L3 feature gate | ✗ | ✗ | ✗ | ✗ | ✗ |
 | 热加载 | `wf reload` (Drop) | 平台管理 | Kibana UI | 无运行时 | 平台管理 | 平台管理 |
+| 编辑器与语言服务 | Zed 已支持语法高亮 + LSP（诊断/跳转/补全） | 平台 UI | Kibana/IDE 插件 | 社区插件丰富 | 平台 UI + 插件 | Azure/Kusto 工具链 |
 
 
 ## 2. 逐引擎对比
@@ -62,7 +67,7 @@
 | 上手成本 | 三文件 + 六阶段 + L1/L2/L3 分层 | 单文件 + 四段式，门槛更低 |
 | 生态 | 独立引擎，需自建 | Chronicle 平台内置，开箱即用 |
 
-**总结**：WFL 在检测表达力上全面超越 YARA-L。WFL 的核心差异化在于：① OR 分支时序 + 双阶段匹配（`on event`/`on close`）；② 分项可解释评分（`score { item @ weight }`）+ 跨规则累加；③ 一等实体声明（`entity()`），YARA-L 完全没有实体行为建模能力；④ 行为分析扩展（session window、collect 函数、baseline、score）进一步拉开差距。代价是学习曲线更陡——但 L1/L2/L3 分层降低了初始上手门槛。
+**总结**：WFL 在检测表达力上全面超越 YARA-L。WFL 的核心差异化在于：① OR 分支时序 + 双阶段匹配（`on event`/`on close`）；② 分项可解释评分（`score { item @ weight }`）+ 跨规则累加；③ 一等实体声明（`entity()`），YARA-L 完全没有实体行为建模能力；④ 行为分析扩展（session window、collect 函数、baseline、score）进一步拉开差距；⑤ v2.1 的 `join snapshot/asof`、`limits`、`yield@vN` 与 conformance 门禁提高了可治理性。代价是学习曲线更陡——但 L1/L2/L3 分层降低了初始上手门槛。
 
 ### 2.2 vs Elastic EQL
 
@@ -78,7 +83,7 @@
 | 查询能力 | 检测+归并+行为分析统一 | 纯事件查询，和 Kibana 深度集成 |
 | 部署 | 独立进程 | 依赖 Elasticsearch 集群 |
 
-**总结**：EQL 定位是事件查询语言（和 ES 绑定），WFL 定位是独立检测+行为分析引擎。EQL 的 `sequence` 语法更简洁，字符串函数更丰富，但缺乏聚合、行为分析、风险评分和输出能力。两者不是同层竞争。
+**总结**：EQL 定位是事件查询语言（和 ES 绑定），WFL 定位是独立检测+行为分析引擎。EQL 的 `sequence` 语法更简洁，字符串函数更丰富，但缺乏聚合、行为分析、风险评分和输出能力。v2.1 进一步把 `join` 时点语义和输出契约版本做成语言级能力，这是 EQL 不覆盖的工程治理域。两者不是同层竞争。
 
 ### 2.3 vs Sigma
 
@@ -90,7 +95,7 @@
 | 社区 | 无 | 5000+ 开源规则，社区庞大 |
 | 上手 | 多关键字 + 六阶段（L1 子集可快速上手） | YAML 格式，几乎零学习成本 |
 
-**总结**：Sigma 是"规则分发格式"，WFL 是"执行语言"。Sigma 赢在可移植性和社区，WFL 赢在表达力。二者互补——可以考虑支持 Sigma 规则导入编译为 WFL。
+**总结**：Sigma 是"规则分发格式"，WFL 是"执行语言"。Sigma 赢在可移植性和社区，WFL 赢在表达力与执行语义。v2.1 增加的 `limits`、`yield@vN`、conformance 门禁进一步强化了执行侧治理。二者互补——可以考虑支持 Sigma 规则导入编译为 WFL。
 
 ### 2.4 vs Splunk SPL
 
@@ -150,6 +155,10 @@
 | 分项可解释评分 | `-> score { item = expr @ weight; ... }` | L2 | 多维指标加权评分，产出 `score_contrib` JSON 明细 |
 | 条件命中映射 | `hit(cond)` → 1.0/0.0 | L2 | 布尔条件映射为评分权重，简化 score 表达式 |
 | 内置基线偏离 | `baseline(expr, dur[, method])` | L2/L3 | 无需外部 ML 模块即可做行为偏离检测，支持持久化 |
+| Join 时点语义一等化 | `join ... snapshot/asof ... within` | L2 | 消除在线/回放在维表取值时点上的语义漂移 |
+| 规则资源预算 | `limits { max_state; ... }` | v2.1 | 规则级资源防护，阻断高基数状态膨胀 |
+| 输出契约版本化 | `yield target@vN` + `meta.contract_version` | v2.1 | 下游字段演进可灰度、可回滚、可审计 |
+| Conformance 门禁 | `contract + shuffle + scenario verify` | v2.1 | 把“正确性验证”前置为发布门槛 |
 | `yield` 统一输出 | 告警和归并共用一个关键字 + window 抽象 | L1 | 消除 alert/output 概念分裂 |
 | 风险等级派生 | `score` → runtime `level_map`（可版本化） | — | 等级映射与规则解耦，审计友好 |
 | 三文件分离 | .wfs / .wfl / .toml + `pack.yaml` | L1 | 数据工程师、安全分析师、SRE 各改各的 |
@@ -197,7 +206,7 @@ WFL 设计初期与 SPL/KQL 在聚合能力上存在多项差距，经过 `tumbl
 | 字符串函数库深度 | 仅 5 个基础函数（L2），缺 `replace`/`substr`/`split` 等 | 可后续按需扩展 |
 | 通用数学函数 | 缺 `abs`/`ceil`/`floor`/`log`/`pow` 等 | 可后续按需扩展 |
 | 社区规则库 | 无现成规则 | 可考虑支持 Sigma 规则导入 |
-| 三文件 + pack.yaml 认知成本 | 新用户需理解文件协作关系 | L1 子集 + 模板 + 文档覆盖 |
+| 三文件 + pack.yaml 认知成本 | 新用户需理解文件协作关系 | L1 子集 + 模板 + 文档覆盖 + Zed 语法高亮/LSP 降低上手成本 |
 | L3 feature gate 复杂度 | 高级特性需显式启用，增加配置步骤 | 文档明确分层边界 |
 
 
@@ -214,9 +223,9 @@ YARA-L ░░░░░░░░░░░░░░░█████████�
 Sigma ░░░░░░░░░░░░░░░░░░██████░░░░         规则分发格式，无执行
 ```
 
-WFL 在检测语言中表达力最强（OR 分支、双阶段匹配、缺失检测、数据归并），同时通过行为分析扩展（session window、collect 函数、统计函数、baseline、score）将能力边界从"安全检测"推进到"实体行为分析"。与 SPL/KQL 的差距从设计初期的"远弱"持续收窄——11 项差距中 7 项已消除，剩余差距集中在通用函数库丰富度和行保留聚合，这是 DSL vs 通用查询语言的设计边界，不是能力缺陷。
+WFL 在检测语言中表达力最强（OR 分支、双阶段匹配、缺失检测、数据归并），同时通过行为分析扩展（session window、collect 函数、统计函数、baseline、score）将能力边界从"安全检测"推进到"实体行为分析"。与 SPL/KQL 的差距从设计初期的"远弱"持续收窄——11 项差距中 7 项已消除，剩余差距集中在通用函数库丰富度和行保留聚合，这是 DSL vs 通用查询语言的设计边界，不是能力缺陷。v2.1 进一步补上工程治理维度（`join` 时点语义、规则预算、契约版本、conformance 门禁），让“能表达”走向“可证明、可演进”。
 
-**WFL v2 的核心设计演进**：
+**WFL v2.1 的核心设计演进**：
 
 | 演进 | 说明 |
 |------|------|
@@ -225,12 +234,16 @@ WFL 在检测语言中表达力最强（OR 分支、双阶段匹配、缺失检�
 | 评分可解释 | `score { item = expr @ weight; ... }` 分项评分产出 `score_contrib` JSON 明细 |
 | Core IR 收敛 | 四原语（Bind/Match/Join/Yield）为唯一语义内核，所有语法糖编译期 desugar |
 | 六阶段管道 | BIND→SCOPE→JOIN→ENTITY→YIELD→CONV（ENTITY 为声明位，不新增计算算子） |
+| Join 语义固定 | `join` 必须显式声明 `snapshot` 或 `asof within` |
+| 资源预算内建 | `limits` 成为规则必填，编译阶段产出成本/风险评估 |
+| 输出契约治理 | `yield target@vN` + `meta.contract_version`，支持版本化演进 |
+| 正确性门禁 | `contract + shuffle + scenario verify` 三层校验作为发布门槛 |
 
-WFL 的独特定位：**唯一同时提供时序检测、实体建模、可解释数值评分、内置基线的独立 DSL**。SPL/KQL 通过平台能力（ML 模块、外部插件）可实现类似效果，但不是语言层原语——WFL 将这些能力内化为编译期可检查、运行期可解释的语言一等公民。
+WFL 的独特定位：**唯一同时提供时序检测、实体建模、可解释数值评分、内置基线的独立 DSL**。SPL/KQL 通过平台能力（ML 模块、外部插件）可实现类似效果，但不是语言层原语——WFL 将这些能力内化为编译期可检查、运行期可解释的语言一等公民。随着 Zed 语法高亮与 LSP 落地，WFL 在开发体验上的短板也开始收敛。
 
 
 ## 相关文档
 
-- WarpFusion 设计方案 → [10-warp-fusion.md](10-warp-fusion.md)
-- WFL v2 设计方案 → [wfl-desion.md](wfl-desion.md)
-- WarpFusion 执行计划 → [12-wf-execution-plan.md](12-wf-execution-plan.md)
+- WarpFusion 设计方案 → [warp-fusion.md](warp-fusion.md)
+- WFL v2.1 设计方案 → [wfl-desion.md](wfl-desion.md)
+- WarpFusion 执行计划 → [wf-execution-plan.md](wf-execution-plan.md)

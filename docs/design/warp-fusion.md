@@ -109,7 +109,7 @@ WarpParse → WarpFusion 之间使用 **Arrow IPC Streaming** 协议，通过 **
 
 - 基于 Arrow 官方 Streaming 格式，带 schema + 数据块
 - 统一使用 TCP 传输（同机走 `127.0.0.1`，跨机改为实际地址，零代码改动）
-- 每个消息携带 `stream_tag` 标识数据流（如 `auth`、`firewall`）
+- 每个消息携带 `stream_name` 标识数据流（如 `auth`、`firewall`）
 - 接收端零反序列化——Arrow IPC 直接映射为内存中的 RecordBatch
 - 无应用层 ACK，背压依赖 TCP 流控（send buffer 满 → write 阻塞 → 发送端自然减速）
 
@@ -133,13 +133,13 @@ v2.1 起，WarpFusion 支持 `best_effort / at_least_once / exactly_once` 三档
 每条 Arrow IPC 消息使用长度前缀分帧：
 
 ```
-[4 字节 BE u32: payload 长度][payload: stream_tag + Arrow IPC RecordBatch]
+[4 字节 BE u32: payload 长度][payload: stream_name + Arrow IPC RecordBatch]
 ```
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `frame_len` | `u32` (big-endian) | payload 总长度 |
-| `stream_tag` | length-prefixed String | 数据流标识（如 `auth`、`firewall`） |
+| `stream_name` | length-prefixed String | 数据流标识（如 `auth`、`firewall`） |
 | `payload` | bytes | Arrow IPC Streaming 格式的 RecordBatch |
 
 #### 2.4.2 可靠性等级
@@ -320,7 +320,7 @@ Window 是 WarpFusion 的核心抽象，兼具数据订阅声明和时间窗口�
 /// Window 逻辑定义（来自 .wfs 文件）
 pub struct WindowSchema {
     pub name: String,                     // Window 名称
-    pub streams: Vec<String>,             // 订阅的 stream tag（支持多个）
+    pub streams: Vec<String>,             // 订阅的 stream name（支持多个）
     pub time_field: String,               // 事件时间字段
     pub over: Duration,                   // 窗口保持时长（需求侧）
     pub fields: Vec<FieldDef>,            // 字段 schema
@@ -433,7 +433,7 @@ Window 基于 **事件时间**（event time）而非处理时间（processing ti
 pub struct WindowRegistry {
     /// Window 名称 → 运行时实例
     windows: HashMap<String, Arc<RwLock<Window>>>,
-    /// Stream tag → 订阅该 stream 的 Window 列表（路由表）
+    /// Stream name → 订阅该 stream 的 Window 列表（路由表）
     subscriptions: HashMap<String, Vec<Subscription>>,
 }
 
@@ -443,34 +443,167 @@ struct Subscription {
 }
 ```
 
-**路由推导（启动时自动构建）：**
+#### 4.2.1 数据流全景
 
 ```
-扫描所有 WindowSchema:
-  对每个 window:
-    for stream in window.streams:         // 多流订阅：逐个 stream 注册
-      subscriptions[stream].push(Subscription {
-          window_name: window.name,
-          mode: rt_config[window.name].mode,   // mode 来自 .toml
-      })
+                         ┌─────────────────────────────────┐
+                         │         BOOT 阶段                │
+                         │   .wfs + fusion.toml → 订阅表    │
+                         └───────────────┬─────────────────┘
+                                         │
+                                         ▼
+ ┌───────────┐    TCP 帧     ┌───────────────────┐
+ │ wp-motor  │──────────────▶│     Receiver       │
+ │ (sender)  │ [len][name]   │ decode_ipc(payload)│
+ └───────────┘ [RecordBatch] └─────────┬─────────┘
+                                       │
+                          frame.tag ──▶ stream_name
+                          frame.batch ─▶ RecordBatch
+                                       │
+                          ┌────────────┴────────────┐
+                          │                         │
+                          ▼                         ▼
+                 ┌─────────────────┐     ┌──────────────────────┐
+                 │ Router.route()  │     │ event_tx.send()      │
+                 │ → Window 写入   │     │ → Scheduler 消费     │
+                 └────────┬────────┘     └──────────┬───────────┘
+                          │                         │
+                          ▼                         ▼
+                 ┌─────────────────┐     ┌──────────────────────┐
+                 │ Window Buffer   │     │ CEP StateMachine     │
+                 │ (时间窗口存储)   │     │ (规则状态推进)        │
+                 └─────────────────┘     └──────────────────────┘
+```
 
-结果示例（单流）:
-  "auth"      → [auth_events(local)]
-  "firewall"  → [fw_events(local)]
-  "threat"    → [ip_blocklist(replicated)]
+Router 和 Scheduler 并行消费同一帧数据：Router 负责将 batch 写入 Window 缓冲区供 join/snapshot 使用；Scheduler 负责驱动 CEP 状态机进行规则匹配。
 
-结果示例（多流联合，stream = ["syslog", "winlog"]）:
-  "syslog"    → [unified_os_events(local)]
-  "winlog"    → [unified_os_events(local)]
+#### 4.2.2 启动阶段：订阅表构建
+
+```
+.wfs 定义:                             fusion.toml 配置:
+┌──────────────────────┐              ┌─────────────────────┐
+│ window auth_events { │              │ [window.auth_events] │
+│   stream = "syslog"  │              │ mode = "local"       │
+│   time = event_time  │              │ over_cap = "30m"     │
+│   over = 5m          │              └──────────┬──────────┘
+│   fields { ... }     │                         │
+└──────────┬───────────┘                         │
+           │                                     │
+           ▼                                     ▼
+┌────────────────────────────────────────────────────────┐
+│            schema_bridge::schema_to_window_def          │
+│  WindowSchema + WindowConfig → WindowDef {              │
+│    params:  { name: "auth_events", schema, over, ... }  │
+│    streams: ["syslog"],         ← 来自 .wfs             │
+│    config:  { mode: Local, ... } ← 来自 fusion.toml     │
+│  }                                                      │
+└────────────────────────┬───────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────┐
+│            WindowRegistry::build(defs)                  │
+│                                                         │
+│  for def in defs:                                       │
+│    windows["auth_events"] = Window::new(...)             │
+│    for stream_name in def.streams:                      │
+│      subscriptions["syslog"]                            │
+│        .push(Subscription {                             │
+│          window_name: "auth_events",                    │
+│          mode: Local,                                   │
+│        })                                               │
+│                                                         │
+│  生成的订阅表 (HashMap<String, Vec<Subscription>>):      │
+│  ┌────────────────────────────────────────────────┐     │
+│  │ "syslog"  → [ auth_events(Local) ]             │     │
+│  │ "netflow" → [ fw_events(Local),                │     │
+│  │              ip_stats(Replicated) ]             │     │
+│  └────────────────────────────────────────────────┘     │
+└────────────────────────────────────────────────────────┘
+```
+
+多对多关系：
+
+```
+stream_name         subscriptions            window
+───────────         ─────────────            ──────
+                 ┌→ auth_events (Local)
+"syslog"    ─────┤                            扇出: 1 stream → N windows
+                 └→ all_logs    (Local)
+
+"syslog"    ─────┐
+                 ├→ all_logs    (Local)       聚合: N streams → 1 window
+"winlog"    ─────┘
+```
+
+#### 4.2.3 运行阶段：Router 路由逻辑
+
+```
+Router.route(stream_name, batch):
+│
+├─ ① 查订阅表
+│    subs = registry.subscribers_of(stream_name)
+│    无订阅者 → 静默丢弃（RouteReport 全零）
+│
+├─ ② 遍历订阅者
+│    for (window_name, mode) in subs:
+│    │
+│    ├─ mode != Local
+│    │   → skipped_non_local += 1（Replicated/Partitioned 暂不处理）
+│    │
+│    └─ mode == Local
+│        → window.append_with_watermark(batch)
+│          │
+│          ├─ ③ 提取时间范围
+│          │    (min_ts, max_ts) = extract_time_range(batch)
+│          │
+│          ├─ ④ 推进 Watermark
+│          │    watermark = max(watermark, max_ts - delay)
+│          │
+│          └─ ⑤ 迟到检查
+│               cutoff = watermark - allowed_lateness
+│               min_ts < cutoff ?
+│               ├─ YES → late_policy:
+│               │   ├─ Drop       → DroppedLate（丢弃）
+│               │   └─ Revise     → 仍写入窗口
+│               └─ NO  → append(batch) → Appended ✓
+│
+└─ 返回 RouteReport { delivered, dropped_late, skipped_non_local }
+```
+
+#### 4.2.4 运行阶段：Scheduler 分发逻辑
+
+Scheduler 消费 `(stream_name, RecordBatch)` 元组，通过预计算的 `stream_aliases` 映射将事件分发到对应的 CEP 状态机。
+
+```
+启动时预计算 (build_stream_aliases):
+  WFL 规则: events { fail : auth_events && action == "failed" }
+  .wfs 定义: window auth_events { stream = "syslog" }
+  → stream_aliases["syslog"] = ["fail"]
+
+运行时分发:
+Scheduler.dispatch_batch(stream_name, batch):
+│
+├─ events = batch_to_events(batch)
+│  空 → 返回
+│
+└─ for engine in engines:       // 并行, 受 exec_semaphore 限制
+     aliases = engine.stream_aliases.get(stream_name)
+     ├─ None → skip（此规则不关心该 stream）
+     └─ Some(["fail"]) →
+          for event in events:
+            for alias in aliases:
+              machine.advance(alias, event)
+              └─ Matched(ctx) → executor.execute_match(ctx)
+                                  → alert_tx.send(alert)
 ```
 
 > **注意**：行级过滤（`events { alias : window && filter }` 中的 `&&` 条件）不在路由层执行——路由层负责将整个 RecordBatch 分发到 Window，过滤在 RuleExecutor 的事件匹配阶段执行。这保证了同一 Window 被多条规则以不同过滤条件引用时，数据只存储一份。
 
-**Router 逻辑（收到数据时）：**
+**Router 分布式路由（收到数据时）：**
 
 ```
-收到 (stream_tag, RecordBatch):
-  for sub in subscriptions[stream_tag]:
+收到 (stream_name, RecordBatch):
+  for sub in subscriptions[stream_name]:
     match sub.mode:
       Local | 单机模式  → 直接 window.append(batch)
       Replicated        → broadcast batch → 所有节点
@@ -951,7 +1084,7 @@ pub struct ArrowIpcSink {
 
 ```
 1. records → records_to_batch → encode_ipc → payload
-2. 组帧：[4B BE len][stream_tag][payload]
+2. 组帧：[4B BE len][stream_name][payload]
 3. if Connected → try write, error → enter_disconnected()
    if Disconnected → if now >= next_attempt → try_reconnect()
 4. return Ok(())
@@ -1112,7 +1245,7 @@ Fusion Node 2 ─TCP┘                  │  Window(partitioned:sip) 子集 1
                                         Window(replicated) 全量
 ```
 
-wp-motor 和其他 Fusion 节点均通过 TCP 连入同一监听端口。Receiver 不区分来源类型，统一按帧 payload 中的 `stream_tag` 路由到目标 Window。
+wp-motor 和其他 Fusion 节点均通过 TCP 连入同一监听端口。Receiver 不区分来源类型，统一按帧 payload 中的 `stream_name` 路由到目标 Window。
 
 路由逻辑可在 WarpParse 的 Sink 侧或 WarpFusion 的 Receiver 侧完成。`partitioned` 模式下需按行级 key hash 分桶（见 4.2 节 Router 伪代码），不能按整个 batch 路由。
 
