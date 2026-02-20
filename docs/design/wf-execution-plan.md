@@ -1,7 +1,8 @@
 # WarpFusion 执行计划
-<!-- 角色：架构师 / 项目管理 | 创建：2026-02-15 | 更新：2026-02-19 -->
+<!-- 角色：架构师 / 项目管理 | 状态：v2.1 对齐中 | 创建：2026-02-15 | 更新：2026-02-20 -->
 
-> 本文档将 WarpFusion 引擎基建（[10-warp-fusion.md](10-warp-fusion.md) P0–P7）、WFL 语言实现（[wfl-desion.md](wfl-desion.md) Phase A–D）与测试数据生成（[wfl-desion.md](wfl-desion.md) §18）统一拆分为 33 个里程碑（M01–M33），分属十一个阶段。
+> 本文档将 WarpFusion 引擎基建（[warp-fusion.md](warp-fusion.md) P0–P7）与 WFL v2.1 语言实现（[wfl-desion.md](wfl-desion.md) Phase 0–4）统一为主干 30 个里程碑（M01–M30，十个阶段）。  
+> `wf-datagen` 的 M31–M33 保留为**支撑轨道**（已完成），用于 `gen -> run -> verify` 质量闭环。
 
 ## 总览
 
@@ -19,13 +20,13 @@ M15 缺失检测+超时     ✅   M18 Scheduler+Lifecycle     M22 多通道告�
 M16 RuleExecutor+join       M19 告警系统                M23 监控+性能
                             M20 ★ E2E MVP 验收          M24 开发者工具链
 
-阶段 VII ─ WFL L2         阶段 VIII ─ WFL L3          阶段 IX ─ 行为分析     阶段 X ─ 分布式
-M25 join+baseline+has      M27 tumble+conv             M29 session+collect     M30 分布式 V2
-    +key映射+limits            +composable pattern          +statistics+baseline
-M26 条件/字符串/时间       M28 |> 管道+隐式yield            +score
-    +replay+yield契约
+阶段 VII ─ WFL L2         阶段 VIII ─ L3+Conformance   阶段 IX ─ 可靠性分级   阶段 X ─ 分布式
+M25 join+baseline+has      M27 tumble+conv+pattern      M29 传输可靠性三档      M30 分布式 V2
+    +key映射+limits            +explain/lint/fmt             +WAL/ACK/replay
+M26 条件/字符串/时间       M28 |> 管道+行为分析            +幂等/指标验证
+    +replay+yield契约            +shuffle 契约
 
-阶段 XI ─ 测试数据生成 (wf-datagen)
+支撑轨道（独立并行） ─ 测试数据生成 (wf-datagen)
 M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时序扰动+压测 ✅
 ```
 
@@ -166,9 +167,9 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-lang` |
-| 范围 | AST → CepStateMachine（步骤序列 + 转换条件 + 超时 + OR 分支）；AST → join SQL 生成（DataFusion SQL 方言）；AST → severity 映射（`-> high` 静态 / `-> { expr => level }` 动态 / `-> score(expr)` 评分）；聚合 desugar（`alias.field | distinct | count` → 聚合 IR） |
+| 范围 | AST → RulePlan(Core IR)：`Bind/Match/Join/Yield`；`on event/on close` 双阶段状态机；`join` 模式编译（`snapshot/asof`）；`yield target@vN` 契约注入；聚合 desugar（`alias.field | distinct | count` → 聚合 IR）；`limits` 编译为 `LimitsPlan` |
 | 依赖 | M12 |
-| 验收 | brute_scan.wfl 编译为 RulePlan（状态机步骤 + join SQL + severity 全部正确）；entity() 编译为系统字段注入 |
+| 验收 | brute_scan.wfl 编译为 RulePlan（状态机步骤 + join 模式 + `yield@vN` + `limits` 全部正确）；entity() 编译为系统字段注入 |
 | 状态 | **已完成** — `wf-lang/src/compiler/` 实现，产出 `plan.rs` 中定义的 RulePlan |
 
 ---
@@ -200,9 +201,9 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-core/rule` |
-| 范围 | RuleExecutor 集成：状态机完成 → 创建 SessionContext → 注册 Window 快照为临时表 → 执行 join SQL → 产出 AlertRecord；severity 求值（静态 / 动态 / score）；空窗口安全（`RecordBatch::new_empty(schema)`） |
+| 范围 | RuleExecutor 集成：状态机完成 → 创建 SessionContext → 注册 Window 快照为临时表 → 按 `JoinPlan(snapshot/asof)` 执行关联 → `score/entity/yield@vN` 产出 AlertRecord；空窗口安全（`RecordBatch::new_empty(schema)`） |
 | 依赖 | M14, M08（Window snapshot） |
-| 验收 | 事件序列 → 状态机完成 → join SQL 执行 → AlertRecord 字段正确；空窗口不报错测试 |
+| 验收 | 事件序列 → 状态机完成 → `join(snapshot/asof)` 执行 → AlertRecord 字段正确；空窗口不报错测试 |
 
 ---
 
@@ -282,7 +283,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-lang` |
-| 范围 | `wf explain`：输出 RulePlan 的人类可读描述（状态机步骤、join SQL、severity 映射）；`wf lint`：静态检查（常见错误、性能陷阱、废弃用法）；`wf fmt`：规则格式化（统一缩进、空格、换行） |
+| 范围 | `wf explain`：输出 RulePlan 的人类可读描述（状态机步骤、join 模式、score 展开、字段血缘）；`wf lint`：静态检查（常见错误、性能陷阱、废弃用法）；`wf fmt`：规则格式化（统一缩进、空格、换行） |
 | 依赖 | M13 |
 | 验收 | explain 输出可读；lint 检出未使用变量 / 无效过滤等；fmt 格式化后重新解析一致 |
 
@@ -295,7 +296,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-lang` + `wf-core` |
-| 范围 | `join dim_window on field == field`（LEFT JOIN enrich）：编译为 DataFusion SQL + 运行时 Window 快照注册；`baseline(expr, dur)`：基线偏离检测（均值 ± N 倍标准差），运行时维护滑动窗口统计量；`window.has(field)`：集合判定（编译为 `EXISTS` 子查询或 `IN` 列表）；**§17 P0-1 显式 key 映射**：`key { logical = alias.field }` 消除多源 key 歧义；**§17 P0-2 Join 时间语义一等化**：`join ... snapshot on ...` / `join ... asof on ... within dur` 显式声明 join 模式；**§17 P0-3 规则资源预算**：`limits { max_state; max_cardinality; max_emit_rate; on_exceed }` 防止高基数状态膨胀 |
+| 范围 | `join` 关联增强（`snapshot/asof`）：运行时按 JoinPlan 执行；`baseline(expr, dur)`：基线偏离检测（均值 ± N 倍标准差），运行时维护滑动窗口统计量；`window.has(field)`：集合判定（编译为 `EXISTS` 子查询或 `IN` 列表）；显式 key 映射：`key { logical = alias.field }`；规则资源预算：`limits { max_state; max_cardinality; max_emit_rate; on_exceed }` 防止高基数状态膨胀 |
 | 依赖 | M20（MVP 稳定后） |
 | 验收 | 情报关联场景（IP 命中威胁情报）；基线偏离场景（登录频率异常）；集合判定场景（IP 在黑名单中）；显式 key 映射多源 join 测试；snapshot / asof 语义正确性测试；limits 触发 throttle / drop_oldest 行为测试 |
 
@@ -304,13 +305,13 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-lang` + `wf-core` |
-| 范围 | `if expr then expr else expr` 条件表达式；字符串函数：`contains(field, pattern)` / `regex_match(field, pattern)` / `len(field)` / `lower(field)` / `upper(field)`；时间函数：`time_diff(t1, t2) → float` / `time_bucket(field, interval) → time`；`wf replay`：离线数据回放调试（读取文件 → 模拟事件流 → 执行规则 → 输出匹配结果）；**§17 P0-4 输出契约版本化**：`yield output@v2 (...)` 为输出声明契约版本，支持灰度与审计回放，同名 output 的契约版本可并存 |
+| 范围 | `if expr then expr else expr` 条件表达式；字符串函数：`contains(field, pattern)` / `regex_match(field, pattern)` / `len(field)` / `lower(field)` / `upper(field)`；时间函数：`time_diff(t1, t2) → float` / `time_bucket(field, interval) → time`；`wf replay`：离线数据回放调试（读取文件 → 模拟事件流 → 执行规则 → 输出匹配结果）；输出契约版本化：`yield output@v2 (...)`，支持灰度与审计回放，同名 output 的契约版本可并存 |
 | 依赖 | M25 |
 | 验收 | 条件表达式求值测试；5 个字符串函数 + 2 个时间函数单元测试；replay 回放离线数据并输出匹配结果；yield 契约版本跨版本字段变更编译期校验测试 |
 
 ---
 
-## 阶段 VIII：WFL L3 高级语法（M27–M28）
+## 阶段 VIII：WFL L3 + Conformance（M27–M28）
 
 ### M27：L3 固定间隔窗口、结果集变换与可组合规则片段
 
@@ -321,27 +322,27 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 依赖 | M26（L2 稳定后）；需 feature gate `l3` |
 | 验收 | tumble 时间分桶聚合场景；Top-N 统计场景（每小时端口扫描最多的 10 个 IP）；pattern 片段展开正确性测试；`wf explain` 还原展开前后一致 |
 
-### M28：L3 多级管道与隐式 yield
+### M28：L3 多级管道、行为分析扩展与顺序一致性
 
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-lang` + `wf-core` |
-| 范围 | `\|>` 多级管道：规则内串联，后续 stage 自动绑定 `_in` 别名；隐式 yield：`yield (field=...)` 无目标名，编译器推导中间 window；隐式 window：编译器自动生成中间 Window Schema，无需手写 .wfs |
+| 范围 | `\|>` 多级管道：规则内串联，后续 stage 自动绑定 `_in` 别名；隐式 yield：`yield (field=...)` 无目标名，编译器推导中间 window；行为分析扩展：`session(gap)`、`collect_set/list`、`first/last`、`stddev/percentile`、增强 `baseline(method)`；Conformance：`contract ... options { permutation = "shuffle"; runs = N; }` 顺序/乱序不变性契约 |
 | 依赖 | M27 |
-| 验收 | 两级管道场景（端口扫描检测 `\|>` 扫描源聚合）；三级管道链测试；`wf explain` 可展示 desugar 后的 Core IR |
+| 验收 | 两级/三级管道场景通过；行为分析样例（会话检测、统计偏离）通过；`wf test --shuffle` 结果稳定；`wf explain` 可展示 desugar 后的 Core IR |
 
 ---
 
-## 阶段 IX：行为分析（M29）
+## 阶段 IX：可靠性分级（M29）
 
-### M29：行为分析能力
+### M29：传输可靠性三档与运行时幂等
 
 | 项目 | 内容 |
 |------|------|
-| crate | `wf-lang` + `wf-core` |
-| 范围 | **会话窗口**：`match<key:session(gap)>` 按活动间隔自动分割会话，gap 为静默超时；**集合函数**：`collect_set(field)` / `collect_list(field)` / `first(field)` / `last(field)`；**统计函数**：`stddev(field)` / `percentile(field, p)`；**增强基线**：`baseline(expr, dur, method)` 支持 ewma / median 方法 + 基线状态持久化快照（重启恢复）；**数值风险评分**：`-> score(expr)` 产出单一风险分 + `entity(type, id_expr)` 实体声明 + 跨规则评分累加；**§17 P1-2 顺序/乱序不变性契约测试**：`contract ... { options { permutation = "shuffle"; runs = N; } expect { stable_hits; stable_score; } }` 保证时间语义稳定（配合 M33 wf-datagen 扰动能力） |
-| 依赖 | M28（L3 稳定后） |
-| 验收 | 用户会话行为建模场景（异常会话检测）；实体风险评分场景（多规则评分聚合）；基线持久化重启恢复测试 |
+| crate | `wp-motor` + `wf-runtime` + `wf-core` |
+| 范围 | 传输层可靠性分级：`best_effort / at_least_once / exactly_once`；`at_least_once` 引入 WAL + ACK + replay；`exactly_once` 引入 `alert_id` 幂等与事务 sink（或等价幂等提交）策略；监控指标：`connection_drops`、`replay_lag_seconds`、`duplicate_alerts_suppressed_total` |
+| 依赖 | M20（MVP 稳定后） |
+| 验收 | 三档模式切换测试；断连重放一致性测试；重复告警抑制测试；replay lag 指标可观测并可告警 |
 
 ---
 
@@ -358,7 +359,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 
 ---
 
-## 阶段 XI：测试数据生成（M31–M33）
+## 支撑轨道：测试数据生成（M31–M33）
 
 > 详细设计见 [wfl-desion.md §18](wfl-desion.md)。各阶段穿插在其依赖就绪的最早时机，可与其他阶段并行推进。
 
@@ -421,7 +422,7 @@ M01→M02→M03→M04→M05     M06 ─────┐              M11→M12→
         M23 │                      M20┘             M26┘        M30 ←─ M20
         M24─┘                                                   (可与VII-IX并行)
 
-        阶段 XI（wf-datagen，与 IV–V 并行推进，优先轨道）
+        支撑轨道（wf-datagen，与 IV–V 并行推进）
         M31 ✅ ─→ M32 ✅ ─→ M33 ✅
          ↑          ↑         ↑
         M07✅     M13✅    M20(verify 端到端)
@@ -448,17 +449,17 @@ wf-datagen: M31 ✅; M32 ✅; M33 ✅; verify 端到端需 M20 汇合
 
 | 阶段 | 里程碑 | 阶段目标 | 状态 |
 |------|--------|---------|------|
-| **I 数据基建** | M01–M05 | wp-motor 能通过 Arrow IPC 可靠传输数据 | ✅ 已完成 |
+| **I 数据基建** | M01–M05 | wp-motor 能通过 Arrow IPC 完成基础（best_effort）传输 | ✅ 已完成 |
 | **II 配置与窗口** | M06–M10 | 配置可加载、Window 能接收路由并缓存数据 | ✅ 已完成 |
 | **III WFL 编译器** | M11–M13 | .wfs + .wfl 编译为 RulePlan | ✅ 已完成 |
 | **IV 执行引擎** | M14–M16 | CEP 状态机 + DataFusion join 可执行 | M14–M15 ✅ / M16 待开始 |
 | **V 运行时闭环** | M17–M20 | **单机 MVP：数据接收→规则执行→告警输出** | M17–M19 ✅ / M20 待开始 |
 | **VI 生产化** | M21–M24 | 热加载、多通道告警、监控、工具链 | 待开始 |
-| **VII L2 增强** | M25–M26 | join / baseline / key 映射 / limits / 条件表达式 / yield 契约 | 待开始 |
-| **VIII L3 高级** | M27–M28 | tumble / conv / composable pattern / 多级管道 | 待开始 |
-| **IX 行为分析** | M29 | session / collect / statistics / score / 乱序不变性 | 待开始 |
+| **VII L2 增强** | M25–M26 | snapshot/asof / baseline / key 映射 / limits / 条件表达式 / yield@vN | 待开始 |
+| **VIII L3 + Conformance** | M27–M28 | tumble / conv / composable pattern / 多级管道 / shuffle 契约 | 待开始 |
+| **IX 可靠性分级** | M29 | best_effort / at_least_once / exactly_once | 待开始 |
 | **X 分布式** | M30 | 多节点分布式部署 | 待开始 |
-| **XI 测试数据生成** | M31–M33 | .wfg DSL / rule-aware oracle / 时序扰动压测 | ✅ 已完成 |
+| **支撑轨道（wf-datagen）** | M31–M33 | .wfg DSL / rule-aware oracle / 时序扰动压测 | ✅ 已完成 |
 
 
 ## 验收检查点
@@ -469,9 +470,10 @@ wf-datagen: M31 ✅; M32 ✅; M33 ✅; verify 端到端需 M20 汇合
 | **CP2 编译就绪** | M13 | brute_scan.wfl 编译为正确的 RulePlan | ✅ 已通过 |
 | **CP3 单机 MVP** | M20 | 一条 L1 规则从数据接收到告警输出全流程跑通 | 待验收 |
 | **CP4 生产就绪** | M24 | 热加载 + 监控 + 1K EPS 性能达标 + 工具链可用 | 待验收 |
-| **CP5 语言完整** | M28 | L1/L2/L3 全语法可用，8 种示例场景全部通过 | 待验收 |
-| **CP6 完整版本** | M30 | 行为分析 + 分布式部署通过端到端验证 | 待验收 |
-| **CP7 测试闭环** | M33 | gen → run → verify 全流水线 CI 集成；扰动回归通过 | 待验收 |
+| **CP5 Conformance 门禁** | M28 | `contract + shuffle + scenario verify` 三层门禁接入 CI | 待验收 |
+| **CP6 可靠性分级** | M29 | 三档传输语义可切换，指标与回放行为符合预期 | 待验收 |
+| **CP7 完整版本** | M30 | 分布式部署通过端到端验证 | 待验收 |
+| **CP8 测试闭环** | M33 | gen → run → verify 全流水线 CI 集成；扰动回归通过 | 待验收 |
 
 
 ## 风险检查点
@@ -484,13 +486,14 @@ wf-datagen: M31 ✅; M32 ✅; M33 ✅; verify 端到端需 M20 汇合
 | M20 末 | 端到端延迟是否达标（目标 <1s @ 1K EPS） | 优化 Window 快照路径、Scheduler 分发策略 |
 | M26 末 | L2 函数扩展是否引入表达式求值瓶颈 | 延迟优化或推迟非核心函数 |
 | M28 末 | L3 feature gate 是否引入意外复杂度 | 推迟 L3 非核心特性（如隐式 window） |
+| M29 末 | WAL/ACK/replay 是否带来不可接受延迟抖动 | 默认降级 `best_effort`，关键链路单独启用高可靠档位 |
 | M32 末 | Reference Evaluator 与引擎语义是否一致 | 先收窄 oracle 覆盖范围至 L1，L2/L3 逐步扩展 |
 
 
 ## 相关文档
 
-- WarpFusion 设计方案 → [10-warp-fusion.md](10-warp-fusion.md)
-- WFL v2 设计方案 → [wfl-desion.md](wfl-desion.md)
-- WFL 与主流 DSL 对比分析 → [11-wfl-dsl-comparison.md](11-wfl-dsl-comparison.md)
+- WarpFusion 设计方案 → [warp-fusion.md](warp-fusion.md)
+- WFL v2.1 设计方案 → [wfl-desion.md](wfl-desion.md)
+- WFL 与主流 DSL 对比分析 → [wfl-dsl-comparison.md](wfl-dsl-comparison.md)
 - wf-datagen 测试数据生成方案 → [wfl-desion.md §18](wfl-desion.md)
-- 下一阶段设计提案（P0/P1） → [wfl-desion.md §17](wfl-desion.md)
+- 后续提案（P1/P2） → [wfl-desion.md §17](wfl-desion.md)

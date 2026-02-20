@@ -17,7 +17,7 @@ use super::buffer::{Window, WindowParams};
 /// wf-core stays free of wf-lang / compiler dependencies.
 pub struct WindowDef {
     pub params: WindowParams,
-    /// Stream tags this window subscribes to.
+    /// Stream names this window subscribes to.
     pub streams: Vec<String>,
     pub config: WindowConfig,
 }
@@ -37,7 +37,7 @@ struct Subscription {
 // ---------------------------------------------------------------------------
 
 /// Central structure holding all [`Window`] instances and a subscription
-/// routing table that maps stream tags → windows.
+/// routing table that maps stream names → windows.
 pub struct WindowRegistry {
     windows: HashMap<String, Arc<RwLock<Window>>>,
     subscriptions: HashMap<String, Vec<Subscription>>,
@@ -73,9 +73,9 @@ impl WindowRegistry {
             let window = Window::new(def.params, def.config);
             windows.insert(name.clone(), Arc::new(RwLock::new(window)));
 
-            for stream_tag in def.streams {
+            for stream_name in def.streams {
                 subscriptions
-                    .entry(stream_tag)
+                    .entry(stream_name)
                     .or_default()
                     .push(Subscription {
                         window_name: name.clone(),
@@ -90,14 +90,14 @@ impl WindowRegistry {
         })
     }
 
-    /// Route a [`RecordBatch`] to all windows subscribed to `stream_tag`.
+    /// Route a [`RecordBatch`] to all windows subscribed to `stream_name`.
     ///
     /// Only `DistMode::Local` subscriptions are handled here; `Replicated`
     /// and `Partitioned` are skipped (deferred to M10 Router).
-    /// Unknown stream tags are a no-op (returns `Ok(())`).
+    /// Unknown stream names are a no-op (returns `Ok(())`).
     #[deprecated(note = "Use Router::route for watermark-aware routing")]
-    pub fn route(&self, stream_tag: &str, batch: RecordBatch) -> Result<()> {
-        let Some(subs) = self.subscriptions.get(stream_tag) else {
+    pub fn route(&self, stream_name: &str, batch: RecordBatch) -> Result<()> {
+        let Some(subs) = self.subscriptions.get(stream_name) else {
             return Ok(());
         };
 
@@ -150,9 +150,9 @@ impl WindowRegistry {
     }
 
     /// Returns `(window_name, dist_mode)` pairs for all subscribers of a stream
-    /// tag. Used internally by [`super::router::Router`].
-    pub(crate) fn subscribers_of(&self, stream_tag: &str) -> Vec<(&str, &DistMode)> {
-        match self.subscriptions.get(stream_tag) {
+    /// name. Used internally by [`super::router::Router`].
+    pub(crate) fn subscribers_of(&self, stream_name: &str) -> Vec<(&str, &DistMode)> {
+        match self.subscriptions.get(stream_name) {
             Some(subs) => subs
                 .iter()
                 .map(|s| (s.window_name.as_str(), &s.mode))

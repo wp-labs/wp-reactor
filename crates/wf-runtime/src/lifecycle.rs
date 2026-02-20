@@ -84,7 +84,7 @@ impl FusionEngine {
         let cancel = CancellationToken::new();
 
         // 1. Load .wfs files → Vec<WindowSchema>
-        let wfs_paths = resolve_glob(&config.runtime.window_schemas, base_dir)?;
+        let wfs_paths = resolve_glob(&config.runtime.schemas, base_dir)?;
         let mut all_schemas = Vec::new();
         for full_path in &wfs_paths {
             let content = std::fs::read_to_string(full_path)
@@ -94,7 +94,7 @@ impl FusionEngine {
         }
 
         // 2. Preprocess .wfl with config.vars → parse → Vec<WflFile>
-        let wfl_paths = resolve_glob(&config.runtime.wfl_rules, base_dir)?;
+        let wfl_paths = resolve_glob(&config.runtime.rules, base_dir)?;
         let mut all_rule_plans = Vec::new();
         for full_path in &wfl_paths {
             let raw = std::fs::read_to_string(full_path)
@@ -122,7 +122,7 @@ impl FusionEngine {
         // 6. Router::new(registry)
         let router = Arc::new(Router::new(registry));
 
-        // 7. Build RuleEngines (precompute stream_tag → alias routing)
+        // 7. Build RuleEngines (precompute stream_name → alias routing)
         let mut engines = Vec::with_capacity(all_rule_plans.len());
         for plan in all_rule_plans {
             let stream_aliases = build_stream_aliases(&plan.binds, &all_schemas);

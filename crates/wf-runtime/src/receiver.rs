@@ -12,7 +12,7 @@ use wf_core::window::Router;
 /// TCP receiver that accepts connections, reads length-prefixed Arrow IPC
 /// frames, decodes them, and routes batches to the [`Router`].
 ///
-/// Optionally sends `(stream_tag, RecordBatch)` to the scheduler via
+/// Optionally sends `(stream_name, RecordBatch)` to the scheduler via
 /// `event_tx` so the CEP engine can process each incoming batch.
 pub struct Receiver {
     listener: TcpListener,
@@ -189,7 +189,7 @@ mod tests {
         }
     }
 
-    fn make_router(stream_tag: &str) -> Arc<Router> {
+    fn make_router(stream_name: &str) -> Arc<Router> {
         let reg = WindowRegistry::build(vec![WindowDef {
             params: WindowParams {
                 name: "test_win".into(),
@@ -197,7 +197,7 @@ mod tests {
                 time_col_index: Some(0),
                 over: Duration::from_secs(3600),
             },
-            streams: vec![stream_tag.to_string()],
+            streams: vec![stream_name.to_string()],
             config: test_config(),
         }])
         .unwrap();
@@ -205,8 +205,8 @@ mod tests {
     }
 
     /// Encode a RecordBatch and wrap it in a length-prefixed outer frame.
-    fn make_frame(tag: &str, batch: &arrow::record_batch::RecordBatch) -> Vec<u8> {
-        let payload = wp_arrow::ipc::encode_ipc(tag, batch).unwrap();
+    fn make_frame(stream_name: &str, batch: &arrow::record_batch::RecordBatch) -> Vec<u8> {
+        let payload = wp_arrow::ipc::encode_ipc(stream_name, batch).unwrap();
         let mut frame = Vec::with_capacity(4 + payload.len());
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(&payload);
@@ -364,11 +364,11 @@ mod tests {
         send_frame(&mut conn, &frame).await;
 
         // Receive from the event channel
-        let (tag, received_batch) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let (stream_name, received_batch) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(tag, "events");
+        assert_eq!(stream_name, "events");
         assert_eq!(received_batch.num_rows(), 1);
 
         cancel.cancel();

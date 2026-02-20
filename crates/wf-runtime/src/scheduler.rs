@@ -28,12 +28,12 @@ pub enum SchedulerCommand {
 // ---------------------------------------------------------------------------
 
 /// Pairs a [`CepStateMachine`] with its [`RuleExecutor`] and precomputed
-/// routing from stream tags to CEP aliases.
+/// routing from stream names to CEP aliases.
 pub(crate) struct RuleEngine {
     pub machine: CepStateMachine,
     pub executor: RuleExecutor,
-    /// `stream_tag → Vec<alias>` — which aliases should receive events from
-    /// each stream tag.
+    /// `stream_name → Vec<alias>` — which aliases should receive events from
+    /// each stream name.
     pub stream_aliases: HashMap<String, Vec<String>>,
 }
 
@@ -43,7 +43,7 @@ pub(crate) struct RuleEngine {
 
 /// Read-only routing metadata + shared mutable engine state.
 struct EngineHandle {
-    /// `stream_tag → Vec<alias>` — read-only after construction.
+    /// `stream_name → Vec<alias>` — read-only after construction.
     stream_aliases: HashMap<String, Vec<String>>,
     state: Arc<Mutex<EngineCore>>,
 }
@@ -116,8 +116,8 @@ impl Scheduler {
             tokio::select! {
                 msg = self.event_rx.recv() => {
                     match msg {
-                        Some((tag, batch)) => {
-                            self.dispatch_batch(&tag, &batch).await;
+                        Some((stream_name, batch)) => {
+                            self.dispatch_batch(&stream_name, &batch).await;
                         }
                         None => {
                             // All senders dropped — clean shutdown without cancel.
@@ -135,8 +135,8 @@ impl Scheduler {
                 _ = self.cancel.cancelled() => {
                     // Wait for Receiver + connection handlers to drop their
                     // event_tx clones, draining all in-flight batches.
-                    while let Some((tag, batch)) = self.event_rx.recv().await {
-                        self.dispatch_batch(&tag, &batch).await;
+                    while let Some((stream_name, batch)) = self.event_rx.recv().await {
+                        self.dispatch_batch(&stream_name, &batch).await;
                     }
                     self.flush_all().await;
                     break;
@@ -164,7 +164,7 @@ impl Scheduler {
     /// starts it always runs to completion — no partial state corruption.
     /// Alert emission is outside the timeout to guarantee delivery of
     /// successfully processed results.
-    async fn dispatch_batch(&self, tag: &str, batch: &RecordBatch) {
+    async fn dispatch_batch(&self, stream_name: &str, batch: &RecordBatch) {
         let events = batch_to_events(batch);
         if events.is_empty() {
             return;
@@ -174,7 +174,7 @@ impl Scheduler {
         let mut join_set = JoinSet::new();
 
         for engine in &self.engines {
-            let Some(aliases) = engine.stream_aliases.get(tag) else {
+            let Some(aliases) = engine.stream_aliases.get(stream_name) else {
                 continue;
             };
             let aliases = aliases.clone();
@@ -307,7 +307,7 @@ async fn emit_alert(tx: &mpsc::Sender<AlertRecord>, record: AlertRecord) {
     }
 }
 
-/// Build stream_tag → alias routing for a rule, given its binds and the
+/// Build stream_name → alias routing for a rule, given its binds and the
 /// window schemas.
 ///
 /// For each `BindPlan { alias, window, .. }`, find the `WindowSchema` with
@@ -319,8 +319,8 @@ pub(crate) fn build_stream_aliases(
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for bind in binds {
         if let Some(ws) = schemas.iter().find(|s| s.name == bind.window) {
-            for stream_tag in &ws.streams {
-                map.entry(stream_tag.clone())
+            for stream_name in &ws.streams {
+                map.entry(stream_name.clone())
                     .or_default()
                     .push(bind.alias.clone());
             }

@@ -22,7 +22,7 @@ pub struct RouteReport {
 
 /// Watermark-aware routing layer that wraps a [`WindowRegistry`].
 ///
-/// For each subscriber of a stream tag the router checks the distribution mode:
+/// For each subscriber of a stream name the router checks the distribution mode:
 /// - `Local` → calls [`Window::append_with_watermark`].
 /// - non-`Local` → skips (counted in `RouteReport::skipped_non_local`).
 pub struct Router {
@@ -34,15 +34,15 @@ impl Router {
         Self { registry }
     }
 
-    /// Route a batch to all windows subscribed to `stream_tag`.
-    pub fn route(&self, stream_tag: &str, batch: RecordBatch) -> Result<RouteReport> {
+    /// Route a batch to all windows subscribed to `stream_name`.
+    pub fn route(&self, stream_name: &str, batch: RecordBatch) -> Result<RouteReport> {
         let mut report = RouteReport {
             delivered: 0,
             dropped_late: 0,
             skipped_non_local: 0,
         };
 
-        let subs = self.registry.subscribers_of(stream_tag);
+        let subs = self.registry.subscribers_of(stream_name);
 
         for (window_name, mode) in subs {
             if !matches!(mode, DistMode::Local) {

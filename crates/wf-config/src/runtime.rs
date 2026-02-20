@@ -12,9 +12,9 @@ pub struct RuntimeConfig {
     /// Single rule execution timeout.
     pub rule_exec_timeout: HumanDuration,
     /// Glob pattern for Window Schema (.wfs) files, relative to config dir.
-    pub window_schemas: String,
+    pub schemas: String,
     /// Glob pattern for WFL rule (.wfl) files, relative to config dir.
-    pub wfl_rules: String,
+    pub rules: String,
 }
 
 /// Expand a glob `pattern` relative to `base_dir` and return matched paths

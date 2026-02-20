@@ -173,8 +173,8 @@ listen = "tcp://127.0.0.1:9800"
 [runtime]
 executor_parallelism = 1
 rule_exec_timeout = "30s"
-window_schemas = "*.wfs"
-wfl_rules = "*.wfl"
+schemas = "*.wfs"
+rules   = "*.wfl"
 
 [window_defaults]
 evict_interval = "30s"
