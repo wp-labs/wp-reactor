@@ -21,7 +21,7 @@ fn exact_match_passes() {
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
-    let report = verify(&expected, &actual, 0.01);
+    let report = verify(&expected, &actual, 0.01, 1.0);
     assert_eq!(report.status, "pass");
     assert_eq!(report.summary.matched, 1);
     assert_eq!(report.summary.missing, 0);
@@ -42,7 +42,7 @@ fn missing_alert_fails() {
 
     let actual = vec![];
 
-    let report = verify(&expected, &actual, 0.01);
+    let report = verify(&expected, &actual, 0.01, 1.0);
     assert_eq!(report.status, "fail");
     assert_eq!(report.summary.missing, 1);
 }
@@ -60,7 +60,7 @@ fn unexpected_alert_fails() {
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
-    let report = verify(&expected, &actual, 0.01);
+    let report = verify(&expected, &actual, 0.01, 1.0);
     assert_eq!(report.status, "fail");
     assert_eq!(report.summary.unexpected, 1);
 }
@@ -85,7 +85,7 @@ fn score_mismatch_fails() {
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
-    let report = verify(&expected, &actual, 0.01);
+    let report = verify(&expected, &actual, 0.01, 1.0);
     assert_eq!(report.status, "fail");
     assert_eq!(report.summary.field_mismatch, 1);
 }
@@ -110,14 +110,14 @@ fn score_within_tolerance_passes() {
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
-    let report = verify(&expected, &actual, 0.01);
+    let report = verify(&expected, &actual, 0.01, 1.0);
     assert_eq!(report.status, "pass");
     assert_eq!(report.summary.matched, 1);
 }
 
 #[test]
 fn empty_both_passes() {
-    let report = verify(&[], &[], 0.01);
+    let report = verify(&[], &[], 0.01, 1.0);
     assert_eq!(report.status, "pass");
     assert_eq!(report.summary.matched, 0);
 }
@@ -133,7 +133,7 @@ fn missing_alert_has_details() {
         emit_time: "2024-01-01T00:05:00Z".to_string(),
     }];
 
-    let report = verify(&expected, &[], 0.01);
+    let report = verify(&expected, &[], 0.01, 1.0);
     assert_eq!(report.missing_details.len(), 1);
     assert_eq!(report.missing_details[0].rule_name, "r1");
     assert_eq!(report.missing_details[0].entity_id, "10.0.0.1");
@@ -150,7 +150,7 @@ fn unexpected_alert_has_details() {
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
-    let report = verify(&[], &actual, 0.01);
+    let report = verify(&[], &actual, 0.01, 1.0);
     assert_eq!(report.unexpected_details.len(), 1);
     assert_eq!(report.unexpected_details[0].entity_id, "10.0.0.2");
 }
@@ -175,7 +175,7 @@ fn score_mismatch_has_details() {
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
-    let report = verify(&expected, &actual, 0.01);
+    let report = verify(&expected, &actual, 0.01, 1.0);
     assert_eq!(report.mismatch_details.len(), 1);
     assert_eq!(report.mismatch_details[0].expected_score, 85.0);
     assert_eq!(report.mismatch_details[0].actual_score, 50.0);
@@ -201,7 +201,7 @@ fn test_markdown_report_format() {
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
-    let report = verify(&expected, &actual, 0.01);
+    let report = verify(&expected, &actual, 0.01, 1.0);
     let md = report.to_markdown();
 
     assert!(md.contains("## wf-datagen Verify Report"), "should have header");
@@ -216,7 +216,7 @@ fn test_markdown_report_format() {
 
 #[test]
 fn test_markdown_pass_report() {
-    let report = verify(&[], &[], 0.01);
+    let report = verify(&[], &[], 0.01, 1.0);
     let md = report.to_markdown();
 
     assert!(md.contains("**Status**: PASS"));
@@ -224,4 +224,36 @@ fn test_markdown_pass_report() {
     assert!(!md.contains("### Missing"));
     assert!(!md.contains("### Unexpected"));
     assert!(!md.contains("### Field Mismatches"));
+}
+
+#[test]
+fn time_mismatch_beyond_tolerance_fails() {
+    let expected = vec![OracleAlert {
+        rule_name: "r1".to_string(),
+        score: 85.0,
+        entity_type: "ip".to_string(),
+        entity_id: "10.0.0.1".to_string(),
+        close_reason: None,
+        emit_time: "2024-01-01T00:05:00Z".to_string(),
+    }];
+
+    let actual = vec![ActualAlert {
+        rule_name: "r1".to_string(),
+        score: 85.0, // score matches
+        entity_type: "ip".to_string(),
+        entity_id: "10.0.0.1".to_string(),
+        close_reason: None,
+        fired_at: "2024-01-01T00:05:05Z".to_string(), // 5s later
+    }];
+
+    // With 1s tolerance → mismatch
+    let report = verify(&expected, &actual, 0.01, 1.0);
+    assert_eq!(report.status, "fail");
+    assert_eq!(report.summary.field_mismatch, 1);
+    assert_eq!(report.summary.matched, 0);
+
+    // With 10s tolerance → pass
+    let report = verify(&expected, &actual, 0.01, 10.0);
+    assert_eq!(report.status, "pass");
+    assert_eq!(report.summary.matched, 1);
 }

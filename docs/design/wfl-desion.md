@@ -1822,29 +1822,22 @@ mode_kw  percent  param=value ... ;
 
 省略 `oracle` 块时等价于不生成 oracle（P0 行为）。存在 `oracle` 块即表示启用 oracle 生成。
 
+开关策略统一为“语法优先”：
+- 默认行为由 `.wfg` 决定：有 `oracle` 块则生成 oracle，无 `oracle` 块则不生成。
+- `gen` 子命令不再提供 `--oracle` 正向开关，仅保留 `--no-oracle` 作为一次性覆盖（即使存在 `oracle` 块也强制不生成）。
+
 ### 18.3 输出契约
 
-- `out/events/*.jsonl|parquet|arrow`：生成事件流（`--format` 指定，默认 `jsonl`）。
-- `out/oracle/alerts.jsonl`：期望告警（**仅当 `.wfg` 中存在 `oracle` 块时生成**；省略 `oracle` 块则不产出此文件）。
-- `out/manifest.json`：输入快照、hash、seed、统计信息。
+- `<out>/<scenario>.jsonl|arrow`：生成事件流（`--format` 指定，默认 `jsonl`）。
+- `<out>/<scenario>.oracle.jsonl`：期望告警（**仅当 `.wfg` 中存在 `oracle` 块时生成**；省略 `oracle` 块则不产出此文件）。
+- `<out>/<scenario>.oracle.meta.json`：oracle 容差参数（与 oracle.jsonl 同时生成）。
+- `<out>/<scenario>.faulted-oracle.jsonl`：扰动后期望告警（仅当存在 `faults` 块且 oracle 启用时生成）。
 
-`manifest.json`（关键字段）：
+`manifest.json` 尚未实现（reserved for future）；当前通过 stdout 输出统计信息：
 
-```json
-{
-  "version": "v1",
-  "seed": 42,
-  "inputs": {
-    "ws_sha256": "...",
-    "wfl_sha256": "...",
-    "wsc_sha256": "..."
-  },
-  "outputs": {
-    "events_count": 200000,
-    "oracle_count": 1234,
-    "oracle_enabled": true
-  }
-}
+```
+Generated 200000 events -> out/brute_force_load.jsonl
+Oracle: 1234 alerts -> out/brute_force_load.oracle.jsonl
 ```
 
 ### 18.4 Oracle 生成策略
@@ -1926,6 +1919,8 @@ verify_report.json/.md
 
 ### 18.7 CLI 约定
 
+`gen` 子命令遵循 `.wfg` 的 `oracle` 块；如需临时关闭 oracle 生成，使用 `--no-oracle`。
+
 ```bash
 # 生成
 wf-datagen gen \
@@ -1939,7 +1934,8 @@ wf-datagen lint tests/brute_force_load.wfg
 # 对拍验证
 wf-datagen verify \
   --actual out/actual_alerts.jsonl \
-  --oracle out/oracle/alerts.jsonl
+  --expected out/brute_force_load.oracle.jsonl \
+  --meta out/brute_force_load.oracle.meta.json
 
 # 覆盖 ws/wfl 引用（调试用途）
 wf-datagen gen \
@@ -1947,11 +1943,17 @@ wf-datagen gen \
   --ws windows/security.wfs \
   --wfl rules/brute_force.wfl \
   --out out/
+
+# 临时关闭 oracle（即使 .wfg 中存在 oracle 块）
+wf-datagen gen \
+  --scenario tests/brute_force_load.wfg \
+  --no-oracle \
+  --out out/
 ```
 
 ### 18.8 CI 接入标准流程
 
-1. `wf-datagen gen` 生成 `events + oracle + manifest`。
+1. `wf-datagen gen` 生成 events；当 `.wfg` 存在 `oracle` 块且未指定 `--no-oracle` 时，同时生成 oracle。
 2. `wf run --replay out/events/*` 产出 `actual_alerts.jsonl`（可切换 TCP 回放模式）。
 3. `wf-datagen verify` 输出差异报告。
 4. CI 阻断条件（默认）：`missing == 0 && unexpected == 0 && field_mismatch == 0`。

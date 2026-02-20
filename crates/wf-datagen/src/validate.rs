@@ -1,7 +1,7 @@
 use wf_lang::ast::WflFile;
 use wf_lang::{BaseType, FieldType, WindowSchema};
 
-use crate::wfg_ast::{GenExpr, WfgFile};
+use crate::wfg_ast::{GenExpr, ParamValue, WfgFile};
 
 /// A validation error found in a `.wfg` file.
 #[derive(Debug, Clone, PartialEq)]
@@ -270,6 +270,42 @@ pub fn validate_wfg(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // SV8: oracle param type/range validation
+    if let Some(oracle) = &scenario.oracle {
+        for param in &oracle.params {
+            match param.name.as_str() {
+                "time_tolerance" => {
+                    if !matches!(&param.value, ParamValue::Duration(_)) {
+                        errors.push(ValidationError {
+                            code: "SV8",
+                            message: "oracle.time_tolerance must be a duration (e.g. 1s, 500ms)"
+                                .to_string(),
+                        });
+                    }
+                }
+                "score_tolerance" => match &param.value {
+                    ParamValue::Number(n) if *n >= 0.0 => {}
+                    ParamValue::Number(n) => {
+                        errors.push(ValidationError {
+                            code: "SV8",
+                            message: format!(
+                                "oracle.score_tolerance must be >= 0, got {}",
+                                n
+                            ),
+                        });
+                    }
+                    _ => {
+                        errors.push(ValidationError {
+                            code: "SV8",
+                            message: "oracle.score_tolerance must be a number".to_string(),
+                        });
+                    }
+                },
+                _ => {}
             }
         }
     }
@@ -735,6 +771,105 @@ mod tests {
         assert!(
             !errors.iter().any(|e| e.code == "SV7"),
             "all valid: {:?}",
+            errors
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SV8 tests (oracle param validation)
+    // -----------------------------------------------------------------------
+
+    fn wfg_with_oracle(oracle: OracleBlock) -> WfgFile {
+        WfgFile {
+            uses: vec![],
+            scenario: ScenarioDecl {
+                name: "test".into(),
+                seed: 1,
+                time_clause: TimeClause {
+                    start: "2024-01-01T00:00:00Z".into(),
+                    duration: Duration::from_secs(3600),
+                },
+                total: 100,
+                streams: vec![],
+                injects: vec![],
+                faults: None,
+                oracle: Some(oracle),
+            },
+        }
+    }
+
+    #[test]
+    fn test_sv8_time_tolerance_must_be_duration() {
+        let oracle = OracleBlock {
+            params: vec![ParamAssign {
+                name: "time_tolerance".into(),
+                value: ParamValue::Number(42.0), // wrong: should be Duration
+            }],
+        };
+        let wfg = wfg_with_oracle(oracle);
+        let errors = validate_wfg(&wfg, &[], &[]);
+        assert!(
+            errors.iter().any(|e| e.code == "SV8"
+                && e.message.contains("time_tolerance")),
+            "errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_sv8_score_tolerance_must_be_nonneg_number() {
+        let oracle = OracleBlock {
+            params: vec![ParamAssign {
+                name: "score_tolerance".into(),
+                value: ParamValue::Number(-0.5), // negative
+            }],
+        };
+        let wfg = wfg_with_oracle(oracle);
+        let errors = validate_wfg(&wfg, &[], &[]);
+        assert!(
+            errors.iter().any(|e| e.code == "SV8"
+                && e.message.contains("score_tolerance")),
+            "errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_sv8_score_tolerance_string_rejected() {
+        let oracle = OracleBlock {
+            params: vec![ParamAssign {
+                name: "score_tolerance".into(),
+                value: ParamValue::String("hello".into()),
+            }],
+        };
+        let wfg = wfg_with_oracle(oracle);
+        let errors = validate_wfg(&wfg, &[], &[]);
+        assert!(
+            errors.iter().any(|e| e.code == "SV8"),
+            "errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_sv8_valid_oracle_params() {
+        let oracle = OracleBlock {
+            params: vec![
+                ParamAssign {
+                    name: "time_tolerance".into(),
+                    value: ParamValue::Duration(Duration::from_secs(2)),
+                },
+                ParamAssign {
+                    name: "score_tolerance".into(),
+                    value: ParamValue::Number(0.05),
+                },
+            ],
+        };
+        let wfg = wfg_with_oracle(oracle);
+        let errors = validate_wfg(&wfg, &[], &[]);
+        assert!(
+            !errors.iter().any(|e| e.code == "SV8"),
+            "should pass: {:?}",
             errors
         );
     }

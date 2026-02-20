@@ -303,8 +303,8 @@ fn test_inject_hit_cluster_correctness() {
 scenario inject_hit seed 42 {
     time "2024-01-01T00:00:00Z" duration 1h
     total 1000
-    stream s1 : LoginWindow 100/s
-    inject for brute_force on [s1] {
+    stream fail : LoginWindow 100/s
+    inject for brute_force on [fail] {
         hit 50%;
     }
 }
@@ -356,8 +356,8 @@ fn test_inject_near_miss_no_trigger() {
 scenario inject_nm seed 42 {
     time "2024-01-01T00:00:00Z" duration 1h
     total 1000
-    stream s1 : LoginWindow 100/s
-    inject for brute_force on [s1] {
+    stream fail : LoginWindow 100/s
+    inject for brute_force on [fail] {
         near_miss 40%;
     }
 }
@@ -373,7 +373,7 @@ scenario inject_nm seed 42 {
     use crate::oracle::run_oracle;
     let start = "2024-01-01T00:00:00Z".parse().unwrap();
     let duration = Duration::from_secs(3600);
-    let oracle = run_oracle(&result.events, &plans, &start, &duration).unwrap();
+    let oracle = run_oracle(&result.events, &plans, &start, &duration, None).unwrap();
     assert_eq!(
         oracle.alerts.len(),
         0,
@@ -387,8 +387,8 @@ fn test_inject_hit_triggers_oracle() {
 scenario inject_oracle seed 42 {
     time "2024-01-01T00:00:00Z" duration 1h
     total 1000
-    stream s1 : LoginWindow 100/s
-    inject for brute_force on [s1] {
+    stream fail : LoginWindow 100/s
+    inject for brute_force on [fail] {
         hit 50%;
     }
 }
@@ -403,7 +403,7 @@ scenario inject_oracle seed 42 {
     use crate::oracle::run_oracle;
     let start = "2024-01-01T00:00:00Z".parse().unwrap();
     let duration = Duration::from_secs(3600);
-    let oracle = run_oracle(&result.events, &plans, &start, &duration).unwrap();
+    let oracle = run_oracle(&result.events, &plans, &start, &duration, None).unwrap();
 
     // 1000 events * 50% = 500 hit events / 5 per cluster = 100 clusters → 100 alerts
     assert_eq!(
@@ -428,8 +428,8 @@ fn test_inject_budget_allocation() {
 scenario inject_budget seed 42 {
     time "2024-01-01T00:00:00Z" duration 1h
     total 1000
-    stream s1 : LoginWindow 100/s
-    inject for brute_force on [s1] {
+    stream fail : LoginWindow 100/s
+    inject for brute_force on [fail] {
         hit 30%;
         near_miss 10%;
         non_hit 20%;
@@ -451,8 +451,8 @@ fn test_inject_deterministic() {
 scenario inject_det seed 42 {
     time "2024-01-01T00:00:00Z" duration 1h
     total 500
-    stream s1 : LoginWindow 100/s
-    inject for brute_force on [s1] {
+    stream fail : LoginWindow 100/s
+    inject for brute_force on [fail] {
         hit 30%;
     }
 }
