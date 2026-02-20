@@ -1,5 +1,5 @@
 # WarpFusion — 实时关联计算引擎设计方案
-<!-- 角色：架构师 / 技术决策者 | 创建：2026-02-13 | 更新：2026-02-16 -->
+<!-- 角色：架构师 / 技术决策者 | 创建：2026-02-13 | 更新：2026-02-20 -->
 
 ## 1. 背景与动机
 
@@ -30,7 +30,7 @@ WarpParse（wp-motor）是一个高性能日志解析引擎，核心能力是：
 | 独立部署 | 与 WarpParse 分离，独立进程 |
 | 单机运行 | 无外部依赖（不依赖 Kafka、etcd、数据库） |
 | 轻量 | 资源占用低（目标 <100MB 内存 / 空载） |
-| WFL 驱动 | 用声明式 WFL 语言定义关联规则，内含 SQL 表达式，降低学习门槛 |
+| WFL 驱动 | 用声明式 WFL 语言定义关联规则，编译为 Core IR 执行 |
 | 实时 | 秒级关联延迟 |
 | 可分布 | 单机和分布式统一模型，通过 Window 分布声明平滑扩展 |
 
@@ -41,6 +41,13 @@ WarpParse（wp-motor）是一个高性能日志解析引擎，核心能力是：
 - **风险告警（Risk Alert）**：规则命中后输出的业务结果，核心字段为 `rule_name + score + entity_type/entity_id`（可含 `close_reason`、`score_contrib`）。
 - **运维告警（Ops Alert）**：对系统运行状态（断连、积压、丢弃率）的监控告警，区别于业务风险告警。
 - 代码中的 `AlertRecord` / `AlertSink` 保留原命名，但语义统一指“风险告警记录/输出通道”。
+
+### 1.5 与 WFL v2.1 的实现对齐范围（本次更新）
+
+- 规则治理：强制 `meta.lang`、`meta.contract_version`、`limits`、`yield@vN`。
+- 语义收敛：`join` 强制 `snapshot/asof` 模式，不再允许隐式时点。
+- 正确性门禁：发布前必须通过 `contract + shuffle + scenario verify` 三层校验。
+- 可靠性分级：传输层从单一 best-effort 升级为可配置分级（默认仍为 best-effort）。
 
 ## 2. 整体架构
 
@@ -88,7 +95,7 @@ WarpParse (wp-motor) ×N                WarpFusion (wp-reactor，独立进程)
 │   ├ TCP          │                  │                                          │
 │   └ Arrow (新增) │                  │  Scheduler (事件驱动 + 超时扫描)           │
 └──────────────────┘                  │    ↓                                     │
-                                      │  RuleExecutor ×N (CEP 状态机 + SQL)     │
+                                      │  RuleExecutor ×N (CEP 状态机 + Core IR) │
 wp-reactor Node X ─TCP─┐              │    ↓                                     │
 wp-reactor Node Y ─TCP─┼──→ 同一端口  │  AlertSink (风险告警输出: File/HTTP/Syslog)            │
                        └──→           └──────────────────────────────────────────┘
@@ -117,9 +124,9 @@ WarpParse → WarpFusion 之间使用 **Arrow IPC Streaming** 协议，通过 **
 
 ### 2.4 传输可靠性语义
 
-**投递保证：Best-Effort（TCP 可靠传输，无应用层 ACK）。**
+**投递保证：可靠性分级（默认 Best-Effort）。**
 
-WarpFusion 面向安全检测场景，窗口化统计（阈值、计数、聚合）对少量数据丢失有天然容忍度。传输可靠性完全依赖 TCP 协议层保证，不引入应用层 ACK/WAL/去重机制。
+v2.1 起，WarpFusion 支持 `best_effort / at_least_once / exactly_once` 三档传输语义。默认仍为 `best_effort`，以保持低复杂度和低延迟。
 
 #### 2.4.1 帧格式
 
@@ -135,24 +142,26 @@ WarpFusion 面向安全检测场景，窗口化统计（阈值、计数、聚合
 | `stream_tag` | length-prefixed String | 数据流标识（如 `auth`、`firewall`） |
 | `payload` | bytes | Arrow IPC Streaming 格式的 RecordBatch |
 
-#### 2.4.2 可靠性保证
+#### 2.4.2 可靠性等级
 
-| 层级 | 机制 | 说明 |
-|------|------|------|
-| **传输层** | TCP | 有序、可靠、流控。连接正常期间数据不丢失 |
-| **背压** | TCP 流控 | Receiver 处理不过来 → TCP recv buffer 满 → Sender send buffer 满 → `write` 阻塞 → wp-motor 自然减速 |
-| **断连处理** | 指数退避重连 | 连接断开期间数据丢失（无 WAL 缓冲）；重连后继续推送新数据 |
+| 模式 | 语义 | 成本 | 适用场景 |
+|------|------|------|----------|
+| `best_effort` | At-Most-Once，断连期间允许丢失 | 最低 | 默认在线检测场景 |
+| `at_least_once` | WAL + ACK，断连后重放，可能重复 | 中 | 需要可补算能力 |
+| `exactly_once` | 幂等键/事务 sink，端到端去重一致 | 最高 | 高审计要求场景 |
+
+通用保障仍包含：
+- 背压：TCP 流控 + 本地有界队列。
+- 断连：指数退避重连；非 `best_effort` 模式下配合 replay 追平。
 
 #### 2.4.3 设计取舍
 
-不引入 WAL + ACK + 去重的原因：
+1. 默认 `best_effort`，优先保障吞吐、延迟与部署简单性。  
+2. 对关键链路按需升级到 `at_least_once`，避免“一刀切”复杂化。  
+3. `exactly_once` 仅在高价值链路启用，并配套幂等 sink。  
+4. 三档模式共享同一 WFL/RulePlan，不影响规则语义与编译结果。  
 
-1. **输入源本身不完美** — UDP syslog 天然丢包，TCP 源在采集端也可能因 buffer 溢出丢数据
-2. **统计检测容忍丢失** — 100 次暴力破解丢了 3 条不影响风险告警触发
-3. **复杂度 vs 收益** — At-Least-Once 需要 WAL 落盘 + 位图去重 + 累积 ACK + 断连重放，大幅增加实现复杂度，但对检测准确率提升微乎其微
-4. **TCP 流控足够** — Receiver 慢时 TCP 自动背压，不需要应用层流控
-
-> **断连期间数据会丢失。** 系统通过 metrics 暴露 `connection_drops` 计数器和 `reconnect_latency` 直方图，运维侧应设置告警。对于持续中断场景，通过监控 + 人工干预处理（触发运维告警）。
+> 默认模式下断连期间仍可能丢失数据；系统暴露 `connection_drops`、`replay_lag_seconds`、`reconnect_latency` 等指标供运维告警。
 
 ### 2.5 核心处理流程
 
@@ -163,8 +172,8 @@ WarpFusion 面向安全检测场景，窗口化统计（阈值、计数、聚合
 4. 按各 Window 的分布模式路由数据（单机直接本地分发）
 5. Window 追加 RecordBatch，按时间窗口策略维护活跃数据
 6. Scheduler 以事件驱动方式将新事件分发到相关规则的 match 引擎
-7. RuleExecutor 推进 match 步骤，全部步骤完成后求值 score（可输出 score_contrib）、执行 join（DataFusion SQL）
-8. 结合 entity(type,id_expr) 生成实体键，yield 写入目标 window（含系统字段）→ conv 后处理（如有）→ window sinks 输出
+7. RuleExecutor 推进 `on event/on close` 双阶段求值，命中后执行 `join(snapshot/asof)` 并计算 `score`（可输出 `score_contrib`）
+8. 结合 `entity(type,id_expr)` 生成实体键，`yield target@vN` 写入目标 window（含系统字段）→ conv 后处理（如有）→ window sinks 输出
 9. Evictor 定期淘汰过期窗口数据
 ```
 
@@ -486,58 +495,45 @@ struct Subscription {
 
 ### 4.3 RuleExecutor — 规则执行器
 
-每条规则编译为 CEP 状态机。事件到达时推进状态转换，在 `on event`/`on close` 条件满足后求值 `score`、执行 join（DataFusion SQL），并按 `entity(type,id_expr)` 产出风险告警写入目标 window。
+每条规则由 `wf-lang` 编译为 `RulePlan(Core IR)`。事件到达时推进状态机，在 `on event`/`on close` 条件满足后按 `JoinPlan(snapshot/asof)` 执行关联、计算 `score`，并按 `entity(type,id_expr)` 产出风险告警写入目标 window。
 
 ```rust
 /// 编译后的规则执行计划（由 wf-lang 编译器生成）
 /// 所有 WFL 规则统一编译为 CEP 状态机
 pub struct RulePlan {
     pub name: String,
+    pub lang: String,                      // v2.1
+    pub contract_version: u32,             // 对应 yield@vN
     pub windows: Vec<String>,             // 引用的 Window 名称列表
-    pub state_machine: CepStateMachine,   // 状态机定义（含步骤、转换条件、超时）
-    pub join_sql: Option<String>,          // join 编译出的 DataFusion SQL（可选）
-    pub score_plan: ScorePlan,              // score(expr) 或 score { ... }
-    pub entity_plan: EntityPlan,            // entity(type, id_expr)
+    pub state_machine: CepStateMachine,    // 含 on event / on close
+    pub joins: Vec<JoinPlan>,              // join(snapshot|asof)
+    pub limits_plan: LimitsPlan,           // 规则资源预算
+    pub score_plan: ScorePlan,             // score(expr) 或 score { ... }
+    pub entity_plan: EntityPlan,           // entity(type, id_expr)
+    pub yield_plan: YieldPlan,             // yield target@vN(...)
 }
 
 pub struct RuleExecutor {
     plan: RulePlan,
-    ctx_template: SessionConfig,          // DataFusion 配置模板（用于 join SQL）
+    ctx_template: SessionConfig,           // DataFusion 配置模板（用于 JoinExecutor）
 }
 
 impl RuleExecutor {
-    /// 状态机驱动：事件到达时推进状态转换
+    /// 状态机驱动：事件到达时推进 on event/on close
     pub fn on_event(&self, event: &DataRecord) -> StepResult {
         self.plan.state_machine.advance(event)
     }
 
-    /// 全部步骤完成后，执行 join SQL
-    pub async fn execute_join(
+    /// 全部步骤完成后，按 JoinPlan 执行关联并产出告警
+    pub async fn execute_join_plan(
         &self,
         registry: &WindowRegistry,
         matched: &MatchedContext,
     ) -> Result<AlertRecord> {
-        if let Some(sql) = &self.plan.join_sql {
-            let ctx = SessionContext::new_with_config(self.ctx_template.clone());
-
-            // 将匹配上下文和 join window 注册为临时表
-            for window_name in self.plan.windows.iter() {
-                let snapshot = registry.snapshot(window_name)?;
-                if snapshot.is_empty() {
-                    let empty = RecordBatch::new_empty(registry.schema(window_name)?);
-                    ctx.register_batch(window_name, empty)?;
-                } else {
-                    let batch = concat_batches(&snapshot)?;
-                    ctx.register_batch(window_name, batch)?;
-                }
-            }
-
-            let df = ctx.sql(sql).await?;
-            let results = df.collect().await?;
-            Ok(AlertRecord::from_results(results, &self.plan))
-        } else {
-            Ok(AlertRecord::from_matched(matched, &self.plan))
-        }
+        let ctx = SessionContext::new_with_config(self.ctx_template.clone());
+        let joined = JoinExecutor::run(&ctx, registry, matched, &self.plan.joins).await?;
+        let scored = ScoreEvaluator::eval(&self.plan.score_plan, &joined)?;
+        AlertBuilder::build(&self.plan, joined, scored)
     }
 }
 ```
@@ -546,10 +542,11 @@ impl RuleExecutor {
 
 - WFL 规则由 `wf-lang` 编译器统一编译为 `RulePlan`（CEP 状态机），RuleExecutor 以事件驱动方式执行
 - Rule 引用 Window 名称（定义在 .wfs 中），而非 Stream 名称——同一个 Stream 可被不同 Window 以不同方式订阅
-- 每次 join SQL 执行创建新的 `SessionContext`，避免状态污染
+- Join 执行使用 `JoinPlan`（`snapshot/asof`）而不是“规则内 SQL 字符串”
+- 每次 Join 执行创建新的 `SessionContext`，避免状态污染
 - 窗口快照是只读的（`snapshot()` 返回 `Vec<RecordBatch>` 的 clone/Arc），不阻塞写入
 - 多条规则可并行执行（各自独立的 SessionContext）
-- **空窗口安全**：Window 无数据时注册 `RecordBatch::new_empty(schema)` 为临时表，SQL 正常执行返回零行，不会因 "table not found" 报错
+- **空窗口安全**：Window 无数据时注册 `RecordBatch::new_empty(schema)` 为临时表，Join 正常执行返回零行，不会因 "table not found" 报错
 
 ### 4.4 Scheduler — 规则调度器
 
@@ -562,7 +559,7 @@ pub struct Scheduler {
 struct ManagedRule {
     executor: RuleExecutor,
     alert_sink: Arc<dyn AlertSink>,
-    exec_timeout: Duration,               // 单次 join 执行超时
+    exec_timeout: Duration,               // 单次 join/score/yield 执行超时
 }
 ```
 
@@ -589,9 +586,9 @@ loop {
                     StepResult::Accumulate => {} // 继续累积，等待下一个事件
                     StepResult::Advance => {}    // 步骤条件满足，推进到下一步
                     StepResult::Matched(ctx) => {
-                        // 全部步骤完成 -> score/entity -> join -> alert
+                        // 全部步骤完成 -> join(snapshot/asof) -> score/entity -> yield -> alert
                         let _permit = permit;
-                        match timeout(rule.exec_timeout, rule.executor.execute_join(&registry, &ctx)).await {
+                        match timeout(rule.exec_timeout, rule.executor.execute_join_plan(&registry, &ctx)).await {
                             Ok(Ok(alert)) => rule.alert_sink.emit(&alert).await,
                             Ok(Err(e)) => tracing::error!("join error: {e}"),
                             Err(_) => tracing::error!("join timeout"),
@@ -629,7 +626,7 @@ loop {
 | 事件驱动 | 事件到达时分发到相关规则，推进状态机；非定时轮询 |
 | 超时扫描 | 定期检查 `on close` 条件和 maxspan 超期的状态机实例 |
 | 全局并发上限 | `Semaphore(executor_parallelism)`，防止大量规则同时执行耗尽 CPU |
-| 执行超时 | `tokio::time::timeout` 包裹 join SQL，超时自动取消 |
+| 执行超时 | `tokio::time::timeout` 包裹 join/score/yield 主路径，超时自动取消 |
 
 ### 4.5 AlertSink — 风险告警输出
 
@@ -644,7 +641,7 @@ pub struct AlertRecord {
     pub score_contrib: Option<JsonValue>,      // score { ... } 时输出
     pub fired_at: DateTime<Utc>,
     pub matched_rows: Vec<RecordBatch>,        // 命中的事件数据
-    pub summary: String,                       // 规则 SQL 执行摘要
+    pub summary: String,                       // 规则执行摘要
 }
 
 #[async_trait]
@@ -655,7 +652,7 @@ pub trait AlertSink: Send + Sync {
 
 **风险告警去重（幂等保证）：**
 
-Best-Effort 传输下仍可能出现重复风险告警（上游重复发送、规则热加载窗口重叠、多实例并发输出）。通过 `alert_id` 实现幂等：
+无论 `best_effort` 还是 `at_least_once`，都可能出现重复风险告警（上游重复发送、重放、多实例并发输出）。通过 `alert_id` 实现幂等：
 
 ```
 alert_id = sha256(rule_name + scope_key_value + window_start + window_end)
@@ -742,7 +739,12 @@ rule_exec_timeout = "30s"                      # 单条规则执行超时
 
 # 文件引用
 window_schemas = ["security.wfs"]               # Window Schema 文件列表
-wfl_rules      = ["brute_scan.wfl", "traffic.wfl"]  # WFL 规则文件列表
+rule_packs     = ["pack/security.yaml"]         # RulePack 入口（推荐）
+wfl_rules      = ["brute_scan.wfl", "traffic.wfl"]  # 兼容模式（conformance=compat）
+
+[language]
+version = "wfl-2.1"
+conformance = "strict"                          # strict | compat
 
 [window_defaults]
 evict_interval = "30s"                         # 淘汰检查间隔
@@ -772,6 +774,14 @@ mode = "replicated"                            # 全局复制（分布式下每�
 max_window_bytes = "64MB"
 over_cap = "48h"
 
+[transport]
+reliability = "best_effort"                    # best_effort | at_least_once | exactly_once
+
+[transport.replay]
+wal_dir = "/var/lib/warpfusion/transport-wal"  # reliability != best_effort 时启用
+ack_timeout = "5s"
+max_inflight = 10000
+
 [alert]
 sinks = [
     "file:///var/log/wf-alerts.jsonl",
@@ -784,14 +794,22 @@ sinks = [
 | 层级 | 文件 | 内容 | 示例 |
 |------|------|------|------|
 | 数据定义 | `.wfs` | stream 来源、time 字段、over 时长、字段 schema | `over = 5m` |
-| 检测逻辑 | `.wfl` | 事件绑定、模式匹配、条件、输出 | `count(src) >= 3` |
-| 物理约束 | `.toml` | mode、max_bytes、over_cap、watermark | `over_cap = "30m"` |
+| 检测逻辑 | `.wfl` | 事件绑定、模式匹配、条件、输出、`limits` | `yield risk_scores@v2 (...)` |
+| 规则入口 | `pack.yaml` | `language/features/rules/runtime` 统一入口 | `conformance: strict` |
+| 物理约束 | `.toml` | mode、max_bytes、over_cap、watermark、reliability | `reliability = "best_effort"` |
 
 **over vs over_cap 校验：** 启动时检查每个 window 的 `.wfs` 中 `over` ≤ `.toml` 中 `over_cap`，不满足则报错拒绝启动。
 
 ### 6.2 关联规则
 
-关联检测规则使用 WFL 语言编写，存储在 `.wfl` 文件中。完整语法和语义模型见 [WFL v2 设计方案](wfl-desion.md)，与主流 DSL 的对比分析见 [WFL DSL 对比](11-wfl-dsl-comparison.md)。
+关联检测规则使用 WFL 语言编写，存储在 `.wfl` 文件中。完整语法和语义模型见 [WFL v2.1 设计方案](wfl-desion.md)，与主流 DSL 的对比分析见 [WFL DSL 对比](wfl-dsl-comparison.md)。
+
+v2.1 实现中，规则发布默认使用 `conformance=strict`，并强制校验：
+- `meta.lang = "2.1"`
+- `meta.contract_version`
+- `join snapshot/asof`
+- `limits { ... }`
+- `yield target@vN (...)`
 
 WFL 规则中的数据源名称引用 **Window Schema (.wfs) 中定义的 window 名称**，不直接引用 stream tag。这使得同一个 stream 可以以不同方式（不同 mode、不同 over）被多个 window 引用，规则按需选择合适的 window。
 
@@ -802,30 +820,46 @@ use "security.wfs"
 
 rule brute_force_then_scan {
     meta {
+        lang        = "2.1"
+        contract_version = "2"
         description = "Login failures followed by port scan from same IP"
         mitre       = "T1110, T1046"
     }
+
+    features [l1, l2]
 
     events {
         fail : auth_events && action == "failed"
         scan : fw_events
     }
 
-    match<sip:5m> {
+    match<:5m> {
+        key {
+            src = fail.sip;
+        }
         on event {
             fail | count >= 3;
             scan.dport | distinct | count > 10;
         }
     } -> score(80.0)
 
+    join ip_blocklist snapshot on fail.sip == ip_blocklist.ip
+
     entity(ip, fail.sip)
 
-    yield security_alerts (
+    yield security_alerts@v2 (
         sip        = fail.sip,
         fail_count = count(fail),
         port_count = distinct(scan.dport),
         message    = fmt("{}: brute force then port scan detected", fail.sip)
     )
+
+    limits {
+        max_state = "512MB";
+        max_cardinality = 200000;
+        max_emit_rate = "1000/m";
+        on_exceed = "throttle";
+    }
 }
 ```
 
@@ -923,7 +957,8 @@ pub struct ArrowIpcSink {
 4. return Ok(())
 ```
 
-**写入失败时数据丢弃**，不缓冲。TCP 流控保证正常运行时不丢数据。
+默认（`best_effort`）下：**写入失败时数据丢弃**，不缓冲。  
+当启用 `at_least_once/exactly_once` 时：进入本地 WAL 并等待 ACK/重放，不走“直接丢弃”路径。
 
 #### 重连状态机
 
@@ -948,6 +983,7 @@ name = "to-fusion"
 type = "arrow-ipc"
 target = "tcp://127.0.0.1:9800"
 tag = "firewall"
+reliability = "best_effort"                       # best_effort | at_least_once | exactly_once
 retry_interval = "1s"                             # 初始重试间隔（指数退避）
 retry_max_interval = "30s"                        # 最大重试间隔
 ```
@@ -959,13 +995,13 @@ retry_max_interval = "30s"                        # 最大重试间隔
 |------|------|--------|------|
 | **P0** | wf-arrow: schema 映射 + 行列转换 + IPC 编解码 | wf-arrow crate 可用 | 无 |
 | **P1** | wp-motor: 新增 Arrow IPC Sink | WarpParse 可输出 Arrow IPC | P0 |
-| **P1** | wf-config: 三层配置解析（stream / window / rule） | fusion.toml 可加载 | 无 |
+| **P1** | wf-config: RulePack + conformance + reliability 配置解析 | fusion.toml/pack.yaml 可加载 | 无 |
 | **P2** | wf-core/window: Window + WindowRegistry + Router | 能接收多流、按订阅声明路由并缓存 | P0, P1-config |
-| **P3** | wf-core/rule: Loader + Executor (DataFusion) | 能执行 SQL 关联 | P2 |
+| **P3** | wf-core/rule: Loader + Executor(Core IR) | 支持 `join snapshot/asof` + `yield@vN` | P2 |
 | **P3** | runtime: Receiver + Scheduler + Lifecycle | 主进程可运行 | P2, P3-rule |
-| **P4** | wf-core/alert: AlertSink 实现 | 完整单机闭环 | P3 |
-| **P5** | .wfl 热加载（CLI/API + Drop 策略）、监控指标、性能调优 | 生产化 | P4 |
-| **P6** | 分布式 V2: Sink 侧按 key hash 路由 + 多实例 | 分布式等值 JOIN | P4 |
+| **P4** | wf-core/alert: AlertSink 实现 + score_contrib 透传 | 完整单机闭环 | P3 |
+| **P5** | 可证明正确性门禁：contract + shuffle + datagen verify | 发布前一致性可验证 | P4 |
+| **P6** | 可靠性分级：best_effort/at_least_once/exactly_once | 按场景切换可靠性档位 | P4 |
 | **P7** | 分布式 V3: 两阶段聚合汇总 | 全局 GROUP BY | P6 |
 
 **P0 和 P1 可并行**——wf-arrow 完成后，wp-motor 侧的 Sink 和 warp-fusion 侧的 Receiver 可同时开发。
@@ -973,21 +1009,21 @@ retry_max_interval = "30s"                        # 最大重试间隔
 
 ## 9.1 执行计划
 
-详细的 30 里程碑执行计划已独立为专属文档，详见 → [12-wf-execution-plan.md](12-wf-execution-plan.md)
+详细的 30 里程碑执行计划已独立为专属文档，详见 → [wf-execution-plan.md](wf-execution-plan.md)
 
 计划将引擎基建（P0–P7）与 WFL 语言实现（Phase A–D）统一拆分为 **M01–M30**，分属十个阶段：
 
 | 阶段 | 里程碑 | 阶段目标 |
 |------|--------|---------|
-| **I 数据基建** | M01–M05 | wp-motor 能通过 Arrow IPC best-effort 传输数据（无 ACK/WAL） |
+| **I 数据基建** | M01–M05 | wp-motor 能通过 Arrow IPC 推送数据，WarpFusion 可接收路由 |
 | **II 配置与窗口** | M06–M10 | 配置可加载、Window 能接收路由并缓存数据 |
 | **III WFL 编译器** | M11–M13 | .wfs + .wfl 编译为 RulePlan |
 | **IV 执行引擎** | M14–M16 | CEP 状态机 + DataFusion join 可执行 |
 | **V 运行时闭环** | M17–M20 | **单机 MVP：数据接收 -> 规则执行 -> 风险告警输出** |
-| **VI 生产化** | M21–M24 | 热加载、多通道风险告警、监控、工具链 |
+| **VI 生产化** | M21–M24 | 热加载、多通道风险告警、监控、工具链、CostPlan |
 | **VII L2 增强** | M25–M26 | join / baseline / 条件表达式 / 函数 |
-| **VIII L3 高级** | M27–M28 | tumble / conv / 多级管道 |
-| **IX 行为分析** | M29 | session / collect / statistics / score |
+| **VIII 正确性门禁** | M27–M28 | contract + shuffle + scenario verify |
+| **IX 可靠性分级** | M29 | best_effort/at_least_once/exactly_once |
 | **X 分布式** | M30 | 多节点分布式部署 |
 
 
@@ -1000,7 +1036,7 @@ retry_max_interval = "30s"                        # 最大重试间隔
 | Arrow IPC 传输断连 | 断连期间数据丢失 | TCP 可靠传输 + 指数退避重连；`connection_drops` 监控告警（见 2.4 节） |
 | 上游重复发送/多实例并发导致重复风险告警 | 风险告警风暴 | alert_id 幂等去重 + AlertSink 本地去重缓存 + 下游幂等键（见 4.5 节） |
 | DataFusion 版本升级不兼容 | 编译失败 | workspace 锁定版本；跟进 DataFusion 发布周期 |
-| 规则 SQL 写错导致全表扫描 | CPU 飙升 | 执行超时设置 + 规则校验 |
+| 规则表达式/Join 模式写错导致高开销 | CPU 飙升 | 执行超时 + `wf lint --strict` + CostPlan 风险阻断 |
 | replicated 窗口数据量过大 | 所有节点内存膨胀 | replicated 仅用于小表（字典/情报），配置层限制最大行数 |
 | 分布式下 key 热点 | 单节点负载倾斜 | 监控各节点 Window 大小；极端情况拆分子 key |
 
@@ -1009,17 +1045,20 @@ retry_max_interval = "30s"                        # 最大重试间隔
 
 WFL 语言设计已独立为专属文档，详见：
 
-- **WFL v2 设计方案** → [wfl-desion.md](wfl-desion.md)
+- **WFL v2.1 设计方案** → [wfl-desion.md](wfl-desion.md)
   - 三文件架构（.wfs / .wfl / .toml）
+  - v2.1 规则治理（`meta.lang` / `meta.contract_version` / `limits` / `yield@vN`）
   - 固定执行链与语义模型（BIND / SCOPE / JOIN / ENTITY / YIELD / CONV）
+  - Join 时点语义一等化（`snapshot` / `asof`）
   - 单通道风险输出（score）+ 实体建模（entity）+ 贡献明细（score_contrib）
   - Window Schema (.wfs) 文法与语义约束
   - WFL (.wfl) EBNF 文法、类型系统与语义约束（含 on close / close_reason）
+  - Conformance 门禁（contract / shuffle / scenario verify）
   - 行为分析扩展（session window、baseline、score、collect 函数）
   - 编译模型（源码 → AST → RulePlan → CEP 状态机）
   - 完整示例与开发分期
 
-- **WFL 与主流 DSL 对比分析** → [11-wfl-dsl-comparison.md](11-wfl-dsl-comparison.md)
+- **WFL 与主流 DSL 对比分析** → [wfl-dsl-comparison.md](wfl-dsl-comparison.md)
   - 与 YARA-L 2.0 / Elastic EQL / Sigma / Splunk SPL / KQL 的能力对比
 
 

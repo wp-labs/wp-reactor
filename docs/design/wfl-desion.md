@@ -1,5 +1,5 @@
-# WFL v2 设计方案（整合版）
-<!-- 角色：架构师 / 语言设计 | 状态：Draft | 更新：2026-02-15 -->
+# WFL v2.1 设计方案（整合版）
+<!-- 角色：架构师 / 语言设计 | 状态：Draft | 更新：2026-02-20 -->
 
 ## 1. 设计目标与范围
 
@@ -13,6 +13,11 @@
 - WFL 是 WarpFusion 的检测 DSL，不是通用流计算平台 SQL。
 - 优先支持：安全关联检测、风险告警归并与实体行为分析。
 - 不追求：任意 DAG、任意子查询、全功能分析查询语言。
+
+### 1.3 v2.1 升级目标（从“设计完整”到“可证明正确 + 可持续演进”）
+- **可证明正确**：同一输入在 `online/replay/shuffle` 三条路径上结果一致（在容差内）。
+- **可持续演进**：语法、输出字段、运行模式都能灰度发布与可回滚。
+- **可运营治理**：规则上线前给出资源预算、兼容性报告与风险分级。
 
 ---
 
@@ -41,11 +46,13 @@
 - `runtime.toml`：物理参数（mode、max_bytes、watermark、sinks）。
 
 ### 3.2 RulePack 入口
-- `pack.yaml` 作为统一入口，声明版本、特性和文件列表。
+- `pack.yaml` 作为统一入口，声明版本、语言配置、特性和文件列表。
 
 ```yaml
-version: "2.0"
-features: ["l1", "l2"]
+version: "2.1"
+language: "wfl-2.1"
+default_features: ["l1", "l2"]
+conformance: "strict"
 windows:
   - windows/security.wfs
 rules:
@@ -57,6 +64,11 @@ runtime: runtime/fusion.toml
 - `.wfs` 是上游依赖（先有数据定义，后有规则）。
 - `.wfl` 仅能引用 `use` 导入的 window。
 - `.toml` 只管物理参数，不写业务规则。
+
+### 3.4 v2.1 治理字段（新增）
+- RulePack 级：`language` 与 `conformance` 必填；`conformance` 当前允许 `strict|compat`。
+- Rule 级：每条规则必须声明 `meta.lang`（如 `"2.1"`）和 `meta.contract_version`（输出契约版本号）。
+- 发布门禁：`wf lint --strict` 默认校验治理字段完整性，缺失即编译错误。
 
 ---
 
@@ -78,6 +90,13 @@ runtime: runtime/fusion.toml
 - 场景：多级聚合、Top-N、固定间隔报表、后处理。
 
 > 默认启用 L1/L2；L3 需显式开启 `features: ["l3"]`。
+
+### 4.1 v2.1 强制能力（由提案升级为主规范）
+- 显式 key 映射：多源异名字段必须使用 `key { logical = alias.field }`。
+- Join 时点语义：`join` 必须显式声明 `snapshot` 或 `asof [within dur]`。
+- 规则资源预算：每条规则必须包含 `limits { ... }`。
+- 输出契约版本：`yield target@vN (...)` 成为标准写法（L1/L2 不再省略版本）。
+- 一致性测试门禁：`wf test --contracts` 与 `wf test --shuffle` 均为发布前必跑。
 
 **分层对照表：**
 
@@ -110,11 +129,11 @@ runtime: runtime/fusion.toml
 | 统计函数（`stddev`/`percentile`） | | | ✓ |
 | 增强 `baseline(expr, dur, method)` + 持久化 | | | ✓ |
 
-### 4.1 行为分析能力扩展（规划）
+### 4.2 行为分析能力扩展（规划）
 
 > 以下能力用于支持实体行为分析场景（用户会话建模、行为基线、风险评分），**不影响 Core IR 四原语和五阶段管道结构**。所有新能力均为函数/表达式/窗口模式/实体声明/特征派生扩展，编译器将新语法 desugar 到现有 Bind/Match/Join/Yield 框架内执行。
 
-#### 4.1.1 L2 行为分析基础
+#### 4.2.1 L2 行为分析基础
 
 **条件表达式**：`if expr then expr else expr`
 - 分支计算，替代多规则拆分。
@@ -131,7 +150,7 @@ runtime: runtime/fusion.toml
 - `len(field)` → digit：字符串长度。
 - `lower(field)` / `upper(field)` → chars：大小写转换。
 
-#### 4.1.2 L3 行为分析高级
+#### 4.2.2 L3 行为分析高级
 
 **集合函数**（窗口内值收集）：
 - `collect_set(alias.field)` → array/T：去重值收集（用于行为模式提取：一个会话访问了哪些资源）。
@@ -157,7 +176,7 @@ runtime: runtime/fusion.toml
 - 支持跨规则累加：多条规则对同一实体产出 score，下游聚合总分。
 - `score(expr)` 或 `score { item = expr @ weight; ... }` 中 `expr` 均须为 digit/float 类型。
 
-#### 4.1.3 结构影响评估
+#### 4.2.3 结构影响评估
 
 | 组件 | 是否变更 | 说明 |
 |------|:--------:|------|
@@ -179,9 +198,9 @@ WFL 采用固定主执行链，阶段顺序不可变（`entity(...)` 为 YIELD �
 
 - BIND：`events { alias : window && filter }`
 - SCOPE：`match<keys:window_spec> { steps [derive] } -> score(expr)` 或 `-> score { ... }`
-- JOIN：`join dim_window on sip == dim_window.ip`
+- JOIN：`join dim_window snapshot on sip == dim_window.ip` 或 `join dim_window asof on ... within 24h`
 - ENTITY：`entity(host, e.host_id)`（必选，声明规则输出实体键）
-- YIELD：`yield target_window (field = expr, ...)`（L3 允许 `yield (field=...)` 隐式目标）
+- YIELD：`yield target_window@vN (field = expr, ...)`（L3 允许 `yield (field=...)` 隐式目标）
 - CONV（L3）：`conv { where/sort/top/dedup ... }`
 
 ### 5.1 关键统一（解决旧版歧义）
@@ -192,6 +211,7 @@ WFL 采用固定主执行链，阶段顺序不可变（`entity(...)` 为 YIELD �
 - `match` 采用显式双阶段：`on event { ... }`（必选）+ `on close { ... }`（可选，窗口关闭求值）。
 - `derive { ... }` 为特征派生块：先计算可复用特征，再供 `score`/`yield` 引用。
 - `entity(type, id_expr)` 为实体建模一等语法，禁止再依赖 `yield` 手工拼 `entity_type/entity_id`。
+- 每条规则必须声明 `limits { ... }` 资源预算，并在编译期产出 `CostPlan`。
 - **聚合写法统一**：`alias.field | distinct | count` 与 `distinct(alias.field)` 在语义上等价，编译阶段统一 desugar 为同一聚合 IR。
 - 新增 `contract { given/expect }` 规则契约测试块：仅用于 `wf test`/CI 前置校验，不进入生产执行链。
 
@@ -243,18 +263,21 @@ base_type     = "chars" | "digit" | "float" | "bool" | "time" | "ip" | "hex" ;
 ```ebnf
 wfl_file      = { use_decl } , { rule_decl } , { contract_block } ;
 use_decl      = "use" , STRING ;
-rule_decl     = "rule" , IDENT , "{" , [ meta_block ] , events_block , stage_chain , "}" ;
+rule_decl     = "rule" , IDENT , "{" , [ meta_block ] , [ features_block ] , events_block , stage_chain , limits_clause , "}" ;
 
 stage_chain   = stage , { "|>" , stage } , entity_clause , yield_clause , [ conv_clause ] ;  (* |> 和 conv 为 L3 *)
 stage         = match_clause , { join_clause } ;
 
 meta_block    = "meta" , "{" , { IDENT , "=" , STRING } , "}" ;
+features_block= "features" , "[" , IDENT , { "," , IDENT } , "]" ;
 
 events_block  = "events" , "{" , event_decl , { event_decl } , "}" ;
 event_decl    = IDENT , ":" , IDENT , [ "&&" , expr ] ;
 
-match_clause  = "match" , "<" , match_params , ">" , "{" , on_event_block , [ on_close_block ] , [ derive_block ] , "}" , "->" , score_out ;
+match_clause  = "match" , "<" , match_params , ">" , "{" , [ key_block ] , on_event_block , [ on_close_block ] , [ derive_block ] , "}" , "->" , score_out ;
 match_params  = [ field_ref , { "," , field_ref } ] , ":" , window_spec ;
+key_block     = "key" , "{" , key_item , { key_item } , "}" ;
+key_item      = IDENT , "=" , field_ref , ";" ;
 window_spec   = DURATION                              (* 滑动窗口 *)
               | DURATION , ":" , "tumble"              (* 固定间隔窗口，L3 *)
               | "session" , "(" , DURATION , ")"  ;    (* 会话窗口，L3 行为分析 *)
@@ -269,7 +292,9 @@ pipe_chain    = { "|" , transform } , "|" , measure , cmp_op , primary ;
 transform     = "distinct" ;
 measure       = "count" | "sum" | "avg" | "min" | "max" ;
 
-join_clause   = "join" , IDENT , "on" , join_cond , { "&&" , join_cond } ;     (* L2 *)
+join_clause   = "join" , IDENT , join_mode , "on" , join_cond , { "&&" , join_cond } ;     (* L2 *)
+join_mode     = "snapshot"
+              | "asof" , [ "within" , DURATION ] ;
 join_cond     = field_ref , "==" , field_ref ;
 
 score_out     = score_expr | score_block ;
@@ -280,7 +305,8 @@ score_item    = IDENT , "=" , expr , "@" , NUMBER , ";" ;
 entity_clause = "entity" , "(" , entity_type , "," , expr , ")" ;              (* L1：实体声明，规则必选 *)
 entity_type   = IDENT | STRING ;
 
-yield_clause  = "yield" , [ IDENT ] , "(" , named_arg , { "," , named_arg } , ")" ;  (* 省略 IDENT 的隐式 yield 为 L3 *)
+yield_clause  = "yield" , [ yield_target ] , "(" , named_arg , { "," , named_arg } , ")" ;  (* 省略 target 的隐式 yield 为 L3 *)
+yield_target  = IDENT , [ "@" , "v" , INTEGER ] ;
 named_arg     = yield_field , "=" , expr ;
 yield_field   = IDENT | IDENT , "." , IDENT , { "." , IDENT } | quoted_ident ;    (* 与 .wfs field_name 对齐 *)
 quoted_ident  = "`" , { ANY - "`" } , "`" ;                                     (* 同 §6.1 .wfs 定义 *)
@@ -289,6 +315,12 @@ conv_clause   = "conv" , "{" , conv_chain , { conv_chain } , "}" ;             (
 conv_chain    = conv_step , { "|" , conv_step } , ";" ;
 conv_step     = ("sort" | "top" | "dedup" | "where") , "(" , [ conv_args ] , ")" ;
 conv_args     = expr , { "," , expr } ;
+
+limits_clause = "limits" , "{" , limit_item , { limit_item } , "}" ;
+limit_item    = "max_state" , "=" , STRING , ";"
+              | "max_cardinality" , "=" , INTEGER , ";"
+              | "max_emit_rate" , "=" , STRING , ";"
+              | "on_exceed" , "=" , STRING , ";" ;       (* throttle | drop_oldest | fail_rule *)
 
 (* 规则契约测试（given/expect，供 wf test 使用） *)
 contract_block = "contract" , IDENT , "for" , IDENT , "{" , given_block , expect_block , [ options_block ] , "}" ;
@@ -386,6 +418,8 @@ ANY           = ? any unicode char ? ;
 | `len` | `len(field)` → digit | L2 | 字符串长度 |
 | `lower` | `lower(field)` → chars | L2 | 转小写 |
 | `upper` | `upper(field)` → chars | L2 | 转大写 |
+| `coalesce` | `coalesce(expr, default)` → T | L2 | 局部空值兜底（优先于全局 lenient） |
+| `try` | `try(expr, default)` → T | L2 | 表达式异常兜底，不中断当前求值 |
 | `collect_set` | `collect_set(alias.field)` → array/T | L3 | 窗口内去重值收集 |
 | `collect_list` | `collect_list(alias.field)` → array/T | L3 | 窗口内有序值收集 |
 | `first` | `first(alias.field)` → T | L3 | 窗口内首个值 |
@@ -398,6 +432,8 @@ ANY           = ? any unicode char ? ;
 - `derive` 先于 `score`/`yield` 求值；同一窗口内每个派生项只计算一次。
 - `derive` 引用使用 `@name`；可用于 `score` 与 `yield`，不可用于 `events` 过滤。
 - 集合判定（L2）：`window.has(field)` 判断“当前上下文字段值”是否存在于目标 window 的同名字段值集中；目标 window 须为静态集合（`over = 0`）或维度表。返回 `bool`。
+- v2.1 中，`join` 必须显式声明 `snapshot/asof`；`yield` 推荐显式目标并携带契约版本（`target@vN`）。
+- v2.1 中，`limits { ... }` 为规则必填块，作为资源安全边界。
 
 **`window.has(field)` 语义（L2）：**
 
@@ -449,6 +485,7 @@ match<sip:5m> {
 - `null` 与运行时异常按 `runtime.eval.mode` 执行（`strict` 或 `lenient`），避免规则结果漂移。
 - `join`：固定 LEFT JOIN 语义。
 - `conv`：仅 `tumble` 可用。
+- 规则发布时，编译器同时校验 `limits`、契约版本兼容性与 conformance 套件结果。
 
 ---
 
@@ -457,22 +494,51 @@ match<sip:5m> {
 ### 8.1 编译流水线
 1. 变量预处理：`$VAR` / `${VAR:default}`。
 2. 解析：`.wfs` + `.wfl` -> AST。
-3. 语义检查：字段、类型、window 引用、over 约束。
-4. desugar：展开 `|>`、隐式 stage、`conv` 钩子。
-5. 生成 Core IR（Bind/Match/Join/Yield）。
-6. 输出 RulePlan（供 MatchEngine 执行）。
-7. 若存在 `contract_block`，输出 ContractPlan（供 `wf test` 执行；不进入生产运行时）。
+3. 语义检查：字段、类型、window 引用、over 约束、`join` 时间模式、`yield@vN` 契约声明。
+4. 治理检查：`meta.lang`、`meta.contract_version`、`limits` 必填项与取值范围。
+5. 成本估算：输出 `CostPlan`（状态基数、内存上界、最坏 emit 速率）。
+6. desugar：展开 `|>`、隐式 stage、`conv` 钩子。
+7. 生成 Core IR（Bind/Match/Join/Yield）。
+8. 输出 RulePlan（供 MatchEngine 执行）。
+9. 若存在 `contract_block`，输出 ContractPlan（供 `wf test` 执行；不进入生产运行时）。
+10. 输出 ExplainJSON（展开规则、血缘图、评分图、derive DAG、成本摘要）。
 
 ### 8.2 RulePlan 结构
 ```rust
 pub struct RulePlan {
     pub name: String,
+    pub lang: String,
+    pub contract_version: u32,
     pub binds: Vec<BindPlan>,
     pub match_plan: MatchPlan,
     pub joins: Vec<JoinPlan>,
+    pub limits_plan: LimitsPlan,
     pub entity_plan: EntityPlan,
     pub yield_plan: YieldPlan,
     pub conv_plan: Option<ConvPlan>,
+}
+```
+
+```rust
+pub struct CostPlan {
+    pub estimated_state_bytes: u64,
+    pub estimated_cardinality: u64,
+    pub estimated_emit_per_min: u64,
+    pub risk_level: CostRiskLevel, // low | medium | high
+}
+```
+
+```rust
+pub struct JoinPlan {
+    pub right_window: String,
+    pub mode: JoinMode,                 // Snapshot | Asof { within }
+    pub conds: Vec<JoinCondPlan>,
+}
+
+pub struct YieldPlan {
+    pub target_window: String,
+    pub contract_version: u32,          // from yield@vN
+    pub args: Vec<NamedArgPlan>,
 }
 ```
 
@@ -481,9 +547,15 @@ pub struct RulePlan {
 ```rust
 pub struct MatchClauseAst {
     pub params: MatchParamsAst,
+    pub key_map: Vec<KeyMapItemAst>,          // 可选；多源异名键时必填
     pub on_event: Vec<MatchStepAst>,           // 必选，且非空
     pub on_close: Option<Vec<MatchStepAst>>,   // 可选
     pub derives: Vec<DeriveItemAst>,           // 可选
+}
+
+pub struct KeyMapItemAst {
+    pub logical_key: String,
+    pub source: FieldRefAst,                   // alias.field
 }
 
 pub struct MatchStepAst {
@@ -506,6 +578,11 @@ pub struct DeriveItemAst {
 pub struct EntityClauseAst {
     pub entity_type: EntityTypeAst,
     pub entity_id_expr: ExprAst,
+}
+
+pub enum JoinModeAst {
+    Snapshot,
+    Asof { within: Option<DurationLitAst> },
 }
 ```
 
@@ -549,6 +626,8 @@ pub struct MatchPlan {
 - 字段血缘（字段从哪来、在哪步变换）。
 - 评分展开（`score { ... }` 展开后的分项贡献与总分公式）。
 - 派生图（`derive` 项依赖 DAG 与求值顺序）。
+- 机器可消费 JSON（稳定 schema，供 CI 比对与审计系统入库）。
+- 规则决策 trace 模板（事件命中路径、join 取值时点、score_contrib 明细）。
 
 ---
 
@@ -573,16 +652,18 @@ pub struct MatchPlan {
 
 ## 10. 容错与一致性语义
 
-### 10.1 传输层（单向 TCP，Best-Effort）
-- 语义：Best-Effort / At-Most-Once。
-- 协议：`wp-motor -> wp-reactor` 单向推送，帧格式为 `[4B len][payload]`。
-- 不使用应用层 ACK，不引入发送端/接收端 WAL 与重放协议。
-- 背压：以 TCP 流控为主，叠加本地有界队列保护。
+### 10.1 传输层（可靠性分级）
+- v2.1 将传输从“仅 best-effort”升级为可选分级：`best_effort` / `at_least_once` / `exactly_once`。
+- 协议基础仍为 `wp-motor -> wp-reactor` 单向推送，帧格式 `[4B len][payload]`。
+- 默认模式维持 `best_effort`（成本最低）；高价值场景可按配置切换更高可靠性。
 
-**可靠性边界（明确承诺）：**
-- TCP 仅保证“连接存活期间的字节传输”，不保证“接收端已处理/已持久化”。
-- 发生进程崩溃、断连或队列溢出时，允许数据丢失；丢失数据不可自动重放恢复。
-- 本模式适用于检测场景（允许少量漏检），不适用于审计级“逐条必达”场景。
+**可靠性等级与适用场景：**
+
+| 模式 | 语义 | 成本 | 典型场景 |
+|------|------|------|----------|
+| `best_effort` | At-Most-Once（允许丢失） | 最低 | 大规模在线检测、低延迟优先 |
+| `at_least_once` | 至少一次（允许重复） | 中 | 需要可重放、可补算的生产检测 |
+| `exactly_once` | 端到端幂等/事务一致 | 最高 | 高审计要求、逐条可追溯场景 |
 
 **过载策略（必须配置）：**
 
@@ -597,21 +678,27 @@ pub struct MatchPlan {
 
 ```toml
 [transport]
-mode = "best_effort"            # 固定：best_effort
+reliability = "best_effort"     # best_effort | at_least_once | exactly_once
 frame = "len32_payload"         # [4B len][payload]
 max_frame_bytes = 1048576
 read_timeout = "30s"
 write_timeout = "30s"
 
+[transport.replay]              # reliability != best_effort 时启用
+wal_dir = "/var/lib/warpfusion/transport-wal"
+ack_timeout = "5s"
+max_inflight = 10000
+
 [transport.backpressure]
 queue_capacity = 65536
 on_overflow = "drop_oldest"     # drop_oldest | drop_newest | sample
-sample_ratio = 0.2               # on_overflow=sample 时生效
+sample_ratio = 0.2              # on_overflow=sample 时生效
 max_block = "200ms"
 
 [monitoring.thresholds]
 dropped_events_ratio_warn = 0.001
 backpressure_seconds_warn = 30
+replay_lag_seconds_warn = 60
 ```
 
 ### 10.2 基线持久化（行为分析）
@@ -657,11 +744,18 @@ wf reload
 
 ## 12. 语义约束（整合版）
 
+### 12.0 Rule 头部与治理约束（v2.1）
+- 每条规则必须声明 `meta.lang`，且当前仅允许 `"2.1"`。
+- 每条规则必须声明 `meta.contract_version`（正整数）。
+- 每条规则必须包含 `limits { ... }`，四项字段必填：`max_state`、`max_cardinality`、`max_emit_rate`、`on_exceed`。
+- `yield target@vN (...)` 中 `vN` 必须与 `meta.contract_version` 一致，不一致编译错误。
+- 编译输出必须生成 `CostPlan`；若风险级别为 `high` 且未显式 override，发布阻断。
+
 ### 12.1 Events
 - 别名唯一；window 必须存在；过滤字段必须存在。
 
 ### 12.2 Match
-- key 可为空。
+- `match<...>` 中 key 允许为空；但多事件源且存在异名键时，必须声明 `key { logical = alias.field }`。
 - 固定窗口：`duration > 0`；会话窗口：`gap > 0`。
 - `maxspan` 仅用于固定窗口，且 `maxspan <= 涉及 window 的最小 over`。
 - `sum/avg` 仅数值；`distinct` 仅列投影。
@@ -694,9 +788,9 @@ wf reload
 |----|------|
 | K1 | `match<k1,k2:dur>` 中未限定名 key（如 `sip`）要求在本 match 涉及的所有事件源中都存在同名字段。 |
 | K2 | key 可用限定名（如 `fail.sip`）消歧；仅影响解析，不改变“各事件源都需可提取该 key”的约束。 |
-| K3 | 多事件源字段名不同（如 `fail.sip` vs `scan.src_ip`）时，**不能**直接在同一 match key 中做自动映射；需先在上游 `.wfs` 对齐字段名，或用前级规则 `yield` 归一化后再匹配。 |
-| K4 | key 字段跨事件源类型必须一致；不允许 `ip` 与 `chars`、`digit` 与 `chars` 混用。 |
-| K5 | 复合 key 按位置形成键元组（`<k1,k2>`），各位置按 K1~K4 独立校验。 |
+| K3 | 多事件源字段名不同（如 `fail.sip` vs `scan.src_ip`）时，必须使用 `key { logical = alias.field }` 显式映射；禁止自动推断。 |
+| K4 | `key` 块中逻辑键名必须唯一；同一逻辑键映射到的字段类型必须一致。 |
+| K5 | 复合 key 按逻辑键声明顺序形成键元组，各位置按 K1~K4 独立校验。 |
 
 **session 模式约束：**
 
@@ -797,12 +891,16 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 - `window_emit_suppressed_ratio` 计算口径：`emit_suppressed_total / (emit_total + emit_suppressed_total)`。
 
 ### 12.3 Join
+- `join` 必须显式声明时间模式：`snapshot` 或 `asof [within dur]`；省略模式编译错误。
 - `on` 两侧字段必须可解析且类型**一致**（跨类型编译错误）。
 - join 右侧字段（来自 join window）**必须**以 `window_name.field` 限定名引用；左侧可使用上下文字段（如 `sip` 或 `fail.sip`）。
-- 多 join 按声明顺序执行。
+- `snapshot`：使用求值时可见的最新维表版本。
+- `asof`：按事件时间回看不晚于事件时间的最近版本；若声明 `within`，超出窗口视为未命中。
+- 多 join 按声明顺序执行；后续 join 可引用前序 join 新增字段。
 
 ### 12.4 Yield
 - 目标 window 必须存在，且满足：`stream` 为空（纯输出 window）并且 `over > 0`。
+- v2.1 推荐并默认要求显式版本目标：`yield target@vN (...)`；`vN` 必须与 `meta.contract_version` 一致。
 - yield 命名参数 + 系统字段必须是目标 window fields 的**子集**（名称和类型匹配）。
 - yield 中不得出现 window 未定义的字段名；未覆盖的非系统字段值为 null。
 - 自动注入系统字段：`rule_name`(chars)、`emit_time`(time)、`score`(float)、`entity_type`(chars)、`entity_id`(chars)、`close_reason`(chars, nullable)。
@@ -813,7 +911,7 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 - `entity(type, id_expr)` 为必选声明。
 - `score` 范围固定为 `[0,100]`；超出范围按运行时策略处理（默认 `clamp`）。
 - `score`、`entity_type`、`entity_id`、`score_contrib` 为系统字段，禁止在 `yield` 命名参数中手工赋值。
-- `yield target(...)` 为默认写法（L1/L2）；`yield (...)` 隐式目标仅在 L3 允许。
+- `yield target@vN (...)` 为默认写法（L1/L2）；`yield (...)` 隐式目标仅在 L3 且 `conformance=compat` 时允许。
 
 ### 12.5 Pipeline/Conv
 - `|>` 后续 stage 禁止 `events`。
@@ -888,6 +986,14 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 | T44 | `close_reason` 类型为 `chars`，仅允许与字符串字面量 `"timeout"`/`"flush"`/`"eos"` 比较 |
 | T45 | 在 `on event` 中引用 `close_reason` 编译错误 |
 | T46 | `yield` 中引用 `close_reason` 时类型为 `chars?`（nullable），需与目标字段类型一致 |
+| T47 | `coalesce(a, b)` 中 `a` 与 `b` 类型必须一致；返回该类型 |
+| T48 | `try(expr, default)` 中 `default` 类型必须与 `expr` 推断类型一致；返回该类型 |
+| T49 | `join ... asof` 中 `asof` 右表必须具备版本时间列（由 window `time` 字段声明） |
+| T50 | `join ... asof within DURATION` 中 `within` 必须 > 0；省略 `within` 时使用运行时默认值 |
+| T51 | `yield target@vN (...)` 中 `vN` 必须为正整数，且与 `meta.contract_version` 一致 |
+| T52 | `meta.lang` 必须存在且为 `"2.1"`；不允许省略 |
+| T53 | `limits.max_state/max_cardinality/max_emit_rate/on_exceed` 均为必填；`on_exceed` 仅允许 `throttle|drop_oldest|fail_rule` |
+| T54 | 编译器必须输出 `CostPlan`；`risk_level=high` 时默认阻断发布，除非显式 override |
 
 **静态引用解析：**
 
@@ -1016,7 +1122,7 @@ rule null_semantics_demo {
     script = hit(@first_proc == "powershell") @ 30.0;
   }
   entity(host, e.host_id)
-  yield risk_scores (
+  yield risk_scores@v2 (
     host_id = e.host_id,
     p95_bytes = @p95_out
   )
@@ -1170,9 +1276,34 @@ eos_emit_reason = "eos"          # 固定为 eos，供审计
 - `  actual: flush`
 - `  replay: wf test --contracts rules/dns.wfl --contract dns_no_response_timeout --dump-replay`
 
+### 12.12 可证明正确性门禁（Conformance）
+
+- v2.1 发布门禁包含三层：`contract`、`shuffle`、`scenario verify`，三者均通过才允许发布。
+- 引入 Reference Evaluator 作为语义裁判：与生产引擎共享 RulePlan，但执行路径独立。
+- 判定口径统一：`missing == 0 && unexpected == 0 && field_mismatch == 0`。
+
+**Conformance 套件（必须）：**
+
+| 层级 | 命令 | 目标 |
+|------|------|------|
+| 单元契约 | `wf test --contracts rules/*.wfl` | 规则逻辑正确性 |
+| 顺序扰动 | `wf test --contracts rules/*.wfl --shuffle --runs 20` | 顺序/乱序不变性 |
+| 集成对拍 | `wf-datagen gen -> wf run --replay -> wf-datagen verify` | 引擎端到端一致性 |
+
+**Reference Evaluator 约束：**
+
+| ID | 规则 |
+|----|------|
+| CF1 | Reference Evaluator 必须按事件时间有序执行，不启用背压、乱序和迟到丢弃策略。 |
+| CF2 | Reference 与 Runtime 的输出比较必须使用统一容差参数（`time_tolerance`、`score_tolerance`）。 |
+| CF3 | 任一层级失败都必须输出可复放最小样本（行集 + tick + 配置）。 |
+| CF4 | 发布流程默认阻断失败构建；仅允许带审计记录的人工 override。 |
+
 ---
 
 ## 13. 示例（从原设计迁移后的标准写法）
+
+> 说明：以下示例聚焦检测语义；若片段中省略 `meta.lang`、`meta.contract_version` 或 `limits`，视为“文档简写”。生产发布须补全 §12.0 治理约束。
 
 ### 13.1 阈值检测
 ```wfl
@@ -1188,7 +1319,7 @@ rule brute_force {
     }
   } -> score(70.0)
   entity(ip, fail.sip)
-  yield security_alerts (
+  yield security_alerts@v2 (
     sip = fail.sip,
     fail_count = count(fail),
     message = fmt("{} failed {} times", fail.sip, count(fail))
@@ -1211,9 +1342,9 @@ rule brute_then_scan {
       scan.dport | distinct | count > 10;
     }
   } -> score(if count(fail) > 10 then 90.0 else 70.0)
-  join ip_blocklist on sip == ip_blocklist.ip
+  join ip_blocklist snapshot on sip == ip_blocklist.ip
   entity(ip, fail.sip)
-  yield security_alerts (
+  yield security_alerts@v2 (
     sip = fail.sip,
     threat = ip_blocklist.threat_level,
     message = fmt("{} brute+scan", fail.sip)
@@ -1239,7 +1370,7 @@ rule dns_no_response {
     }
   } -> score(50.0)
   entity(ip, req.sip)
-  yield security_alerts (
+  yield security_alerts@v2 (
     sip = req.sip,
     domain = req.domain,
     message = fmt("{} query {} no response", req.sip, req.domain)
@@ -1266,7 +1397,7 @@ rule port_scan_detect {
     }
   } -> score(80.0)
   entity(ip, _in.sip)
-  yield security_alerts (
+  yield security_alerts@v2 (
     sip = _in.sip,
     port_count = count(_in),
     message = fmt("{} scanned {} ports", _in.sip, count(_in))
@@ -1295,7 +1426,7 @@ rule abnormal_session {
     else 55.0
   )
   entity(user, op.uid)
-  yield behavior_alerts (
+  yield behavior_alerts@v2 (
     uid = op.uid,
     resource_count = distinct(op.resource),
     resources = collect_set(op.resource),
@@ -1338,7 +1469,7 @@ rule entity_risk_score {
     exfil = @exfil @ 25.0;
   }
   entity(host, e.host_id)
-  yield risk_scores (
+  yield risk_scores@v2 (
     host_id = e.host_id,
     event_count = count(e),
     unique_dests = @uniq_dests,
@@ -1367,7 +1498,7 @@ rule login_anomaly {
     geo_spread = hit(distinct(login.geo_city) > 3) @ 20.0;
   }
   entity(user, login.uid)
-  yield behavior_alerts (
+  yield behavior_alerts@v2 (
     uid = login.uid,
     login_count = count(login),
     baseline_count = baseline(count(login), 30d, "ewma"),
@@ -1421,39 +1552,39 @@ contract dns_no_response_timeout for dns_no_response {
 - L1/L2/L3 分层上线，避免首版过载。
 
 ### 14.3 迁移策略
-- 提供 `wf migrate`：旧规则自动转换到 v2 规范。
+- 提供 `wf migrate`：旧规则自动转换到 v2.1 规范（补全 `meta/lang`、`limits`、`yield@vN`）。
 - 提供 `wf lint --strict`：识别不兼容写法并给修复建议。
 
 ---
 
 ## 15. 实施路线
 
-> 各 Phase 内条目按建议优先级排列；wf-datagen 各阶段穿插在其依赖就绪的最早 Phase。
+> v2.1 路线按“先立硬门槛，再扩能力”执行；每个 Phase 都要求可回放验收。
 
-### Phase A（先稳）
-- Core IR + L1 + 可读语法 + lint/fmt。
-- `wf test` 契约测试（given/expect）+ CI 阻断策略。
-- **wf-datagen P0**：`.wfg` parser + schema 驱动随机生成 + seed 可复现 + JSONL/Arrow 输出（依赖 `.wfs` parser）。
+### Phase 0（v2.1 规范冻结）
+- 将 `key` 映射、`join snapshot/asof`、`limits`、`yield@vN` 升级为主规范。
+- 固化 `meta.lang` / `meta.contract_version` 约束与 `pack.yaml` 治理字段。
+- 同步更新 lint 规则：缺失治理字段直接编译失败。
 
-### Phase B（增强）
-- L2（join/baseline/window.has）+ explain/replay。
-- L2 行为分析基础：`if/then/else`、字符串函数、时间函数。
-- §17 P0-2 Join 时间语义一等化（snapshot/asof）—— 随 L2 join 一并落地。
-- §17 P0-3 规则资源预算内建（limits）—— 先把资源安全兜住。
-- §17 P0-1 显式 key 映射语法 —— 消除多源 key 歧义。
-- **wf-datagen P1**：rule-aware（hit/near_miss/non_hit）+ Reference Evaluator + oracle 生成 + verify（依赖 `.wfl` compiler）。
+### Phase 1（可证明正确基础）
+- 交付 Reference Evaluator（语义裁判）与 Conformance 套件。
+- CI 接入三层门禁：`contract` + `shuffle` + `scenario verify`。
+- **wf-datagen P1**：rule-aware + oracle + verify，输出差异归因报告。
 
-### Phase C（高级）
+### Phase 2（可运营治理）
+- 编译器输出 `CostPlan`，支持规则级资源预算预估与风险分级。
+- 发布流程引入阻断策略：`risk_level=high` 默认阻断，需审计化 override。
+- ExplainJSON 落地，支持机器消费的血缘/评分/成本视图。
+
+### Phase 3（能力扩展）
 - L3（`|>`/`conv`）+ 性能优化 + 分布式 V2 完善。
-- §17 P0-4 输出契约版本化（yield contract）—— 下游契约治理。
-- §17 P1-1 可组合规则片段（pattern/template）—— 提升规则复用。
-- **wf-datagen P2**：时序扰动矩阵 + 压测模式 + PR 友好差异报告（依赖 P1）。
+- 行为分析高级能力：session window、集合函数、统计函数、增强 baseline。
+- **wf-datagen P2**：时序扰动矩阵 + 压测模式 + PR 友好差异报告。
 
-### Phase D（行为分析）
-- L3 行为分析：session window、集合函数（`collect_set`/`collect_list`/`first`/`last`）、统计函数（`stddev`/`percentile`）。
-- 增强 baseline（`ewma`/`median` + 持久化快照）。
-- 单通道风险评分（`-> score(expr)` / `-> score { ... }`）+ `entity(type,id_expr)` + 跨规则评分累加。
-- §17 P1-2 顺序/乱序不变性契约测试 —— 配合 wf-datagen 扰动能力做回归防线。
+### Phase 4（可靠性分级）
+- 传输层从单一 best-effort 扩展到 `best_effort/at_least_once/exactly_once`。
+- 对不同可靠性档位产出 SLA、吞吐、延迟与成本基准。
+- 建立灰度与回滚手册：同规则在不同可靠性档位可平滑切换。
 
 ---
 
@@ -1468,75 +1599,21 @@ contract dns_no_response_timeout for dns_no_response {
 
 ---
 
-## 17. 下一阶段设计提案（P0/P1）
+## 17. v2.1 已纳入主规范与后续提案（P1/P2）
 
-> 目标：在不破坏“简洁主链（BIND -> SCOPE -> JOIN -> ENTITY -> YIELD）”的前提下，提升表达力、可控性与可验证性。
+> 目标：先把“正确性与治理”做成硬门槛，再继续提升复用能力与开发效率。
 
-### 17.1 P0-1 显式 key 映射语法（消除多源 key 歧义）
+### 17.1 已纳入 v2.1 主规范（原 P0 项）
 
-- 问题：`match<k1,k2:dur>` 在多源异名字段下需要上游对齐，规则层表达不够直接。
-- 建议：引入 `key { logical = alias.field }`，把“逻辑键名”与“源字段”分离。
+| 能力 | 状态 | 主规范落点 |
+|------|------|------------|
+| 显式 key 映射 | 已纳入 | §7 `key_block`、§12.2 K3~K5 |
+| Join 时间语义（snapshot/asof） | 已纳入 | §7 `join_mode`、§12.3 |
+| 规则资源预算（limits） | 已纳入 | §7 `limits_clause`、§12.0、§12.6 T53/T54 |
+| 输出契约版本（yield@vN） | 已纳入 | §7 `yield_target`、§12.4、§12.6 T51 |
+| 顺序/乱序一致性门禁 | 已纳入 | §12.12 Conformance |
 
-```wfl
-match<:5m> {
-  key {
-    src = fail.sip;
-    dst = scan.src_ip;
-  }
-  on event {
-    fail | count >= 3;
-    scan | count >= 10;
-  }
-} -> score(80)
-```
-
-- 约束：`key` 中逻辑键名唯一；映射字段类型必须一致；缺失键按编译错误处理。
-
-### 17.2 P0-2 Join 时间语义一等化（snapshot / asof）
-
-- 问题：仅有 `join ... on ...` 时，回放与在线对“维表取值时点”的理解可能不一致。
-- 建议：显式声明 join 模式，禁止隐式推断。
-
-```wfl
-join ip_blocklist snapshot on sip == ip_blocklist.ip
-join asset_profile asof on uid == asset_profile.uid within 24h
-```
-
-- 语义：
-  - `snapshot`：使用当前可见最新维表。
-  - `asof`：按事件时间回看最近版本（不晚于事件时间，且在 `within` 约束内）。
-
-### 17.3 P0-3 规则资源预算内建（limits）
-
-- 问题：规则可写性强，但缺少规则级资源上限，容易出现高基数状态膨胀。
-- 建议：新增 `limits` 块，提供统一防护。
-
-```wfl
-limits {
-  max_state = "512MB";
-  max_cardinality = 200000;
-  max_emit_rate = "1000/m";
-  on_exceed = "throttle";   // throttle | drop_oldest | fail_rule
-}
-```
-
-- 验收：触发上限时必须有稳定行为和指标（如 `rule_limit_exceeded_total`）。
-
-### 17.4 P0-4 输出契约版本化（yield contract）
-
-- 问题：下游消费字段演进时，缺少强约束版本标签。
-- 建议：为输出声明契约版本，支持灰度与审计回放。
-
-```wfl
-yield risk_scores@v2 (
-  host_id = e.host_id,
-  score_detail = score_contrib
-)
-```
-
-- 约束：同名 output window 的契约版本需可并存；跨版本字段变更需在编译期校验。
-
-### 17.5 P1-1 可组合规则片段（pattern/template）
+### 17.2 P1-1 可组合规则片段（pattern/template）
 
 - 目标：复用常见安全模式，减少复制粘贴造成的语义漂移。
 - 建议：支持参数化片段，在编译期展开到标准 RulePlan。
@@ -1551,36 +1628,26 @@ pattern burst(alias, key, win, threshold) {
 
 - 约束：片段不可引入隐式副作用；展开后必须可 `wf explain` 完整还原。
 
-### 17.6 P1-2 顺序/乱序不变性契约测试
+### 17.3 P1-2 规则包发布治理（Registry + Rollback）
 
-- 目标：保证时间语义稳定，避免“同数据不同到达顺序”导致结果漂移。
-- 建议：扩展 `contract` 的 `options/expect`，增加重排测试模式。
+- 目标：让语言升级、契约升级、可靠性切换都能灰度发布并可回滚。
+- 建议：引入规则包注册中心，记录 `rule/version/contract/compatibility/owner`。
 
-```wfl
-contract dns_order_invariance for dns_no_response {
-  given {
-    row(req, query_id="q-1", sip="10.0.0.8", domain="evil.test", event_time="2026-02-17T10:00:00Z");
-    row(resp, query_id="q-1", sip="10.0.0.8", event_time="2026-02-17T10:00:01Z");
-    tick(31s);
-  }
-  options {
-    permutation = "shuffle";  // future: none | shuffle
-    runs = 20;
-  }
-  expect {
-    stable_hits == true;
-    stable_score == true;
-  }
-}
+```yaml
+rule: brute_force
+lang: "2.1"
+contract: "risk_scores@v2"
+compatibility: "backward"
+rollback_to: "risk_scores@v1"
 ```
 
-- 验收：`wf test` 输出必须包含“重排轮次/失败样本/最小重放输入”。
+- 验收：任一规则发布都能回答“影响面、灰度计划、回滚目标”。
 
-### 17.7 建议落地顺序
+### 17.4 建议落地顺序
 
-1. **先做 P0-2 + P0-3**：先把语义一致性与资源安全兜住。
-2. **再做 P0-1 + P0-4**：增强可表达性与下游契约治理。
-3. **最后做 P1-1 + P1-2**：提升复用能力与回归防线。
+1. 先完成 v2.1 强制项（本版已冻结到主规范）。
+2. 再做 `pattern/template`，提升规则研发效率。
+3. 最后做 Registry/Rollback 治理，把演进过程产品化。
 
 ---
 

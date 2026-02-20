@@ -99,8 +99,8 @@ listen = "tcp://127.0.0.1:9800"
 [runtime]
 executor_parallelism = 2
 rule_exec_timeout = "30s"
-window_schemas = ["security.wfs"]
-wfl_rules = ["brute_scan.wfl", "traffic.wfl"]
+window_schemas = "schemas/*.wfs"
+wfl_rules = "rules/*.wfl"
 
 [window_defaults]
 evict_interval = "30s"
@@ -146,8 +146,8 @@ sinks = ["file:///var/log/wf-alerts.jsonl"]
             cfg.runtime.rule_exec_timeout.as_duration(),
             Duration::from_secs(30),
         );
-        assert_eq!(cfg.runtime.window_schemas, vec!["security.wfs"]);
-        assert_eq!(cfg.runtime.wfl_rules, vec!["brute_scan.wfl", "traffic.wfl"],);
+        assert_eq!(cfg.runtime.window_schemas, "schemas/*.wfs");
+        assert_eq!(cfg.runtime.wfl_rules, "rules/*.wfl");
 
         // window_defaults
         assert_eq!(
@@ -235,8 +235,8 @@ sinks = ["file:///var/log/wf-alerts.jsonl"]
 [runtime]
 executor_parallelism = 2
 rule_exec_timeout = "30s"
-window_schemas = ["security.wfs"]
-wfl_rules = ["brute_scan.wfl"]
+window_schemas = "schemas/*.wfs"
+wfl_rules = "rules/*.wfl"
 
 [window_defaults]
 evict_interval = "30s"

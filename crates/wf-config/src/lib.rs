@@ -8,7 +8,7 @@ pub mod window;
 
 pub use alert::{AlertConfig, SinkUri, parse_sink_uri};
 pub use fusion::FusionConfig;
-pub use runtime::RuntimeConfig;
+pub use runtime::{RuntimeConfig, resolve_glob};
 pub use server::ServerConfig;
 pub use types::{ByteSize, DistMode, EvictPolicy, HumanDuration, LatePolicy};
 pub use validate::validate_over_vs_over_cap;

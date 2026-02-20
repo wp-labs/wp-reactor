@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use wf_config::{FusionConfig, SinkUri};
+use wf_config::{FusionConfig, SinkUri, resolve_glob};
 use wf_core::alert::{AlertSink, FanOutSink, FileAlertSink};
 use wf_core::rule::{CepStateMachine, RuleExecutor};
 use wf_core::window::{Evictor, Router, WindowRegistry};
@@ -84,20 +84,20 @@ impl FusionEngine {
         let cancel = CancellationToken::new();
 
         // 1. Load .wfs files → Vec<WindowSchema>
+        let wfs_paths = resolve_glob(&config.runtime.window_schemas, base_dir)?;
         let mut all_schemas = Vec::new();
-        for wfs_path in &config.runtime.window_schemas {
-            let full_path = base_dir.join(wfs_path);
-            let content = std::fs::read_to_string(&full_path)
+        for full_path in &wfs_paths {
+            let content = std::fs::read_to_string(full_path)
                 .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", full_path.display()))?;
             let schemas = wf_lang::parse_wfs(&content)?;
             all_schemas.extend(schemas);
         }
 
         // 2. Preprocess .wfl with config.vars → parse → Vec<WflFile>
+        let wfl_paths = resolve_glob(&config.runtime.wfl_rules, base_dir)?;
         let mut all_rule_plans = Vec::new();
-        for wfl_path in &config.runtime.wfl_rules {
-            let full_path = base_dir.join(wfl_path);
-            let raw = std::fs::read_to_string(&full_path)
+        for full_path in &wfl_paths {
+            let raw = std::fs::read_to_string(full_path)
                 .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", full_path.display()))?;
             let preprocessed = wf_lang::preprocess_vars(&raw, &config.vars)
                 .map_err(|e| anyhow::anyhow!("preprocess error in {}: {e}", full_path.display()))?;
