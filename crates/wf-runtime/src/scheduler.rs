@@ -110,6 +110,7 @@ impl Scheduler {
     ///
     /// When `run` returns, `self` (including `alert_tx`) is dropped, which
     /// closes the alert channel and signals the alert task to exit.
+    #[tracing::instrument(name = "scheduler", skip_all)]
     pub async fn run(mut self) -> anyhow::Result<()> {
         let mut scan_interval = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -196,7 +197,7 @@ impl Scheduler {
                                 StepResult::Matched(ctx) => {
                                     match core.executor.execute_match(&ctx) {
                                         Ok(record) => alerts.push(record),
-                                        Err(e) => log::warn!("execute_match error: {e}"),
+                                        Err(e) => wf_warn!(pipe, error = %e, "execute_match error"),
                                     }
                                 }
                                 StepResult::Advance | StepResult::Accumulate => {}
@@ -214,9 +215,9 @@ impl Scheduler {
                         }
                     }
                     Err(_) => {
-                        log::warn!(
-                            "dispatch_batch engine timed out ({exec_timeout:?}), \
-                             execution cancelled"
+                        wf_warn!(pipe,
+                            timeout = ?exec_timeout,
+                            "dispatch_batch engine timed out, execution cancelled"
                         );
                     }
                 }
@@ -225,7 +226,7 @@ impl Scheduler {
 
         while let Some(result) = join_set.join_next().await {
             if let Err(e) = result {
-                log::warn!("engine task panicked: {e}");
+                wf_warn!(pipe, error = %e, "engine task panicked");
             }
         }
     }
@@ -254,7 +255,7 @@ impl Scheduler {
                         match core.executor.execute_close(close) {
                             Ok(Some(record)) => alerts.push(record),
                             Ok(None) => {}
-                            Err(e) => log::warn!("execute_close error: {e}"),
+                            Err(e) => wf_warn!(pipe, error = %e, "execute_close error"),
                         }
                     }
                     alerts
@@ -268,9 +269,9 @@ impl Scheduler {
                         }
                     }
                     Err(_) => {
-                        log::warn!(
-                            "scan_timeouts engine timed out ({exec_timeout:?}), \
-                             execution cancelled"
+                        wf_warn!(pipe,
+                            timeout = ?exec_timeout,
+                            "scan_timeouts engine timed out, execution cancelled"
                         );
                     }
                 }
@@ -279,7 +280,7 @@ impl Scheduler {
 
         while let Some(result) = join_set.join_next().await {
             if let Err(e) = result {
-                log::warn!("scan_timeouts task panicked: {e}");
+                wf_warn!(pipe, error = %e, "scan_timeouts task panicked");
             }
         }
     }
@@ -294,7 +295,7 @@ impl Scheduler {
                 match core.executor.execute_close(close) {
                     Ok(Some(record)) => emit_alert(&self.alert_tx, record).await,
                     Ok(None) => {}
-                    Err(e) => log::warn!("execute_close flush error: {e}"),
+                    Err(e) => wf_warn!(pipe, error = %e, "execute_close flush error"),
                 }
             }
         }
@@ -303,7 +304,7 @@ impl Scheduler {
 
 async fn emit_alert(tx: &mpsc::Sender<AlertRecord>, record: AlertRecord) {
     if let Err(e) = tx.send(record).await {
-        log::warn!("alert channel closed: {e}");
+        wf_warn!(pipe, error = %e, "alert channel closed");
     }
 }
 

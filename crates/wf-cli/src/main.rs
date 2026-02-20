@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 use wf_config::FusionConfig;
 use wf_runtime::lifecycle::{FusionEngine, wait_for_signal};
+use wf_runtime::tracing_init::init_tracing;
 
 #[derive(Parser)]
 #[command(name = "wf", about = "WarpFusion CEP engine")]
@@ -25,7 +26,6 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
     let cli = Cli::parse();
 
     match cli.command {
@@ -38,8 +38,10 @@ async fn main() -> Result<()> {
                 .parent()
                 .expect("config path must have a parent directory");
 
+            let _guard = init_tracing(&fusion_config.logging, base_dir)?;
+
             let engine = FusionEngine::start(fusion_config, base_dir).await?;
-            log::info!("WarpFusion listening on {}", engine.listen_addr());
+            tracing::info!(listen = %engine.listen_addr(), "WarpFusion engine started");
 
             wait_for_signal(engine.cancel_token()).await;
             engine.shutdown();

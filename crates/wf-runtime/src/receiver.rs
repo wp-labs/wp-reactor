@@ -62,12 +62,13 @@ impl Receiver {
     }
 
     /// Start the accept loop. Blocks until the cancellation token is triggered.
+    #[tracing::instrument(name = "receiver", skip_all)]
     pub async fn run(self) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 result = self.listener.accept() => {
                     let (stream, peer) = result?;
-                    log::info!("accepted connection from {peer}");
+                    wf_debug!(conn, peer = %peer, "accepted connection");
                     let router = Arc::clone(&self.router);
                     let cancel = self.cancel.child_token();
                     let event_tx = self.event_tx.clone();
@@ -80,6 +81,7 @@ impl Receiver {
     }
 }
 
+#[tracing::instrument(skip_all, fields(peer = %peer))]
 async fn handle_connection(
     stream: TcpStream,
     router: Arc<Router>,
@@ -100,19 +102,19 @@ async fn handle_connection(
                                 // Send to scheduler before routing to windows
                                 if let Some(tx) = &event_tx {
                                     if tx.send((frame.tag.clone(), frame.batch.clone())).await.is_err() {
-                                        log::warn!("event channel closed, dropping connection from {peer}");
+                                        wf_warn!(conn, peer = %peer, "event channel closed, dropping connection");
                                         break;
                                     }
                                 }
                                 if let Err(e) = router.route(&frame.tag, frame.batch) {
-                                    log::warn!("route error: {e}");
+                                    wf_warn!(pipe, error = %e, "route error");
                                 }
                             }
-                            Err(e) => log::warn!("IPC decode error: {e}"),
+                            Err(e) => wf_warn!(conn, error = %e, "IPC decode error"),
                         }
                     }
                     Err(e) => {
-                        log::warn!("connection read error: {e}");
+                        wf_warn!(conn, error = %e, "connection read error");
                         break;
                     }
                 }
@@ -120,7 +122,7 @@ async fn handle_connection(
             _ = cancel.cancelled() => break,
         }
     }
-    log::info!("connection closed: {peer}");
+    wf_debug!(conn, peer = %peer, "connection closed");
 }
 
 /// Read a single length-prefixed frame: `[4B BE u32 len][payload]`.

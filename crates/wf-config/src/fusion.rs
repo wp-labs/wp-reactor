@@ -5,6 +5,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 
 use crate::alert::AlertConfig;
+use crate::logging::LoggingConfig;
 use crate::runtime::RuntimeConfig;
 use crate::server::ServerConfig;
 use crate::validate;
@@ -22,6 +23,8 @@ struct FusionConfigRaw {
     #[serde(default)]
     window: HashMap<String, WindowOverride>,
     alert: AlertConfig,
+    #[serde(default)]
+    logging: LoggingConfig,
     /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
     #[serde(default)]
     vars: HashMap<String, String>,
@@ -38,6 +41,7 @@ pub struct FusionConfig {
     pub window_defaults: WindowDefaults,
     pub windows: Vec<WindowConfig>,
     pub alert: AlertConfig,
+    pub logging: LoggingConfig,
     /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
     pub vars: HashMap<String, String>,
 }
@@ -73,6 +77,7 @@ impl FromStr for FusionConfig {
             window_defaults: raw.window_defaults,
             windows,
             alert: raw.alert,
+            logging: raw.logging,
             vars: raw.vars,
         };
 

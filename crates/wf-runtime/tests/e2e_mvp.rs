@@ -25,10 +25,18 @@ fn make_tcp_frame(ipc_payload: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn e2e_brute_force_alert() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_new("info").unwrap())
+        .try_init();
 
-    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
-    let alert_path = tmpdir.path().join("alerts.jsonl");
+    // Write to target/test-artifacts/ for easy post-run inspection.
+    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-artifacts/e2e_mvp");
+    std::fs::create_dir_all(&artifact_dir).expect("failed to create artifact dir");
+    let alert_path = artifact_dir.join("alerts.jsonl");
+    // Clear any stale output from previous runs.
+    let _ = std::fs::remove_file(&alert_path);
 
     // -- Build config from inline TOML with port 0 and tempdir alert sink --
     let toml_str = format!(

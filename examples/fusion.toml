@@ -31,3 +31,10 @@ sinks = ["file://alerts/wf-alerts.jsonl"]
 
 [vars]
 FAIL_THRESHOLD = "3"
+
+[logging]
+level = "info"
+format = "plain"
+file = "logs/wf-engine.log"
+[logging.modules]
+"wf_runtime::receiver" = "debug"

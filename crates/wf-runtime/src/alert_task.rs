@@ -14,13 +14,14 @@ pub const ALERT_CHANNEL_CAPACITY: usize = 64;
 /// `None` and this task exits.  No cancel token is needed — this avoids a race
 /// where the cancel could close the receiver while the scheduler is still
 /// sending flush alerts.
+#[tracing::instrument(name = "alert_sink", skip_all)]
 pub async fn run_alert_sink(
     mut rx: mpsc::Receiver<AlertRecord>,
     sink: Arc<dyn AlertSink>,
 ) {
     while let Some(record) = rx.recv().await {
         if let Err(e) = sink.send(&record) {
-            log::warn!("alert sink error: {e}");
+            wf_error!(pipe, error = %e, "alert sink write failed");
         }
     }
 }

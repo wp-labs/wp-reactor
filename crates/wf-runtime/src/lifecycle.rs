@@ -80,6 +80,7 @@ pub struct FusionEngine {
 impl FusionEngine {
     /// Bootstrap the entire runtime from a [`FusionConfig`] and a base
     /// directory (for resolving relative `.wfs` / `.wfl` file paths).
+    #[tracing::instrument(name = "engine.start", skip_all, fields(listen = %config.server.listen))]
     pub async fn start(config: FusionConfig, base_dir: &Path) -> Result<Self> {
         let cancel = CancellationToken::new();
 
@@ -136,6 +137,12 @@ impl FusionEngine {
         }
 
         // 8. Create bounded event channel
+        wf_info!(sys,
+            schemas = wfs_paths.len(),
+            rules = engines.len(),
+            windows = config.windows.len(),
+            "engine bootstrap complete"
+        );
         let (event_tx, event_rx) = mpsc::channel(4096);
 
         // ---------------------------------------------------------------
@@ -220,7 +227,7 @@ impl FusionEngine {
 
     /// Request graceful shutdown of all tasks.
     pub fn shutdown(&self) {
-        log::info!("initiating graceful shutdown");
+        wf_info!(sys, "initiating graceful shutdown");
         self.cancel.cancel();
     }
 
@@ -231,9 +238,9 @@ impl FusionEngine {
     pub async fn wait(mut self) -> Result<()> {
         while let Some(group) = self.groups.pop() {
             let name = group.name;
-            log::debug!("waiting for task group '{name}' to finish");
+            wf_debug!(sys, task_group = name, "waiting for task group to finish");
             group.wait().await?;
-            log::debug!("task group '{name}' finished");
+            wf_debug!(sys, task_group = name, "task group finished");
         }
         Ok(())
     }
@@ -289,10 +296,10 @@ pub async fn wait_for_signal(cancel: CancellationToken) {
             signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                log::info!("received SIGINT, initiating graceful shutdown");
+                wf_info!(sys, signal = "SIGINT", "received signal, initiating graceful shutdown");
             }
             _ = sigterm.recv() => {
-                log::info!("received SIGTERM, initiating graceful shutdown");
+                wf_info!(sys, signal = "SIGTERM", "received signal, initiating graceful shutdown");
             }
         }
     }
@@ -301,7 +308,7 @@ pub async fn wait_for_signal(cancel: CancellationToken) {
         tokio::signal::ctrl_c()
             .await
             .expect("failed to listen for Ctrl-C");
-        log::info!("received shutdown signal, initiating graceful shutdown");
+        wf_info!(sys, "received shutdown signal, initiating graceful shutdown");
     }
     cancel.cancel();
 }

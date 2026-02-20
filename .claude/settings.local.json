@@ -69,7 +69,8 @@
       "Bash(bash -n:*)",
       "Bash(/Users/zuowenjian/devspace/wp-labs/wp-reactor/tools/zed-warplabs/sync-grammar.sh:*)",
       "Bash(cargo check:*)",
-      "Bash(gtimeout:*)"
+      "Bash(gtimeout:*)",
+      "Bash(xxd:*)"
     ]
   }
 }

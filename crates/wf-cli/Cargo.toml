@@ -14,5 +14,4 @@ wf-runtime = { path = "../wf-runtime" }
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
-env_logger = "0.11"
-log = "0.4"
+tracing = { workspace = true }
