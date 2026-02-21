@@ -70,7 +70,9 @@
       "Bash(/Users/zuowenjian/devspace/wp-labs/wp-reactor/tools/zed-warplabs/sync-grammar.sh:*)",
       "Bash(cargo check:*)",
       "Bash(gtimeout:*)",
-      "Bash(xxd:*)"
+      "Bash(xxd:*)",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:docs.rs)"
     ]
   }
 }
