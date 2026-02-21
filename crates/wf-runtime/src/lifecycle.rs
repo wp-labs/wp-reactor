@@ -91,6 +91,7 @@ impl FusionEngine {
             let content = std::fs::read_to_string(full_path)
                 .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", full_path.display()))?;
             let schemas = wf_lang::parse_wfs(&content)?;
+            wf_debug!(conf, file = %full_path.display(), schemas = schemas.len(), "loaded schema file");
             all_schemas.extend(schemas);
         }
 
@@ -104,6 +105,7 @@ impl FusionEngine {
                 .map_err(|e| anyhow::anyhow!("preprocess error in {}: {e}", full_path.display()))?;
             let wfl_file = wf_lang::parse_wfl(&preprocessed)?;
             let plans = wf_lang::compile_wfl(&wfl_file, &all_schemas)?;
+            wf_debug!(conf, file = %full_path.display(), rules = plans.len(), "compiled rule file");
             all_rule_plans.extend(plans);
         }
 
@@ -113,6 +115,7 @@ impl FusionEngine {
             .map(|ws| (ws.name.clone(), ws.over))
             .collect();
         wf_config::validate_over_vs_over_cap(&config.windows, &window_overs)?;
+        wf_debug!(conf, windows = config.windows.len(), "over vs over_cap validation passed");
 
         // 4. Schema bridge: WindowSchema × WindowConfig → Vec<WindowDef>
         let window_defs = schemas_to_window_defs(&all_schemas, &config.windows)?;
@@ -276,6 +279,7 @@ fn build_alert_sink(config: &FusionConfig, base_dir: &Path) -> Result<Arc<dyn Al
                     std::fs::create_dir_all(parent)?;
                 }
                 sinks.push(Box::new(FileAlertSink::open(&path)?));
+                wf_debug!(conf, path = %path.display(), "opened alert file sink");
             }
         }
     }

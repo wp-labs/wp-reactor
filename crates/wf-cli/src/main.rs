@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
             let _guard = init_tracing(&fusion_config.logging, base_dir)?;
 
             let engine = FusionEngine::start(fusion_config, base_dir).await?;
-            tracing::info!(listen = %engine.listen_addr(), "WarpFusion engine started");
+            tracing::info!(domain = "sys", listen = %engine.listen_addr(), "WarpFusion engine started");
 
             wait_for_signal(engine.cancel_token()).await;
             engine.shutdown();

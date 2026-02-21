@@ -22,6 +22,8 @@ pub async fn run_alert_sink(
     while let Some(record) = rx.recv().await {
         if let Err(e) = sink.send(&record) {
             wf_error!(pipe, error = %e, "alert sink write failed");
+        } else {
+            wf_debug!(pipe, rule = &*record.rule_name, "alert delivered");
         }
     }
 }

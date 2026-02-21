@@ -166,11 +166,13 @@ impl Scheduler {
     /// Alert emission is outside the timeout to guarantee delivery of
     /// successfully processed results.
     async fn dispatch_batch(&self, stream_name: &str, batch: &RecordBatch) {
+        let start = Instant::now();
         let events = batch_to_events(batch);
         if events.is_empty() {
             return;
         }
 
+        let rows = events.len();
         let events = Arc::new(events);
         let mut join_set = JoinSet::new();
 
@@ -210,25 +212,38 @@ impl Scheduler {
 
                 match result {
                     Ok(alerts) => {
+                        let n = alerts.len();
                         for record in alerts {
                             emit_alert(&alert_tx, record).await;
                         }
+                        n
                     }
                     Err(_) => {
                         wf_warn!(pipe,
                             timeout = ?exec_timeout,
                             "dispatch_batch engine timed out, execution cancelled"
                         );
+                        0
                     }
                 }
             });
         }
 
+        let mut total_alerts = 0usize;
         while let Some(result) = join_set.join_next().await {
-            if let Err(e) = result {
-                wf_warn!(pipe, error = %e, "engine task panicked");
+            match result {
+                Ok(n) => total_alerts += n,
+                Err(e) => wf_warn!(pipe, error = %e, "engine task panicked"),
             }
         }
+
+        wf_debug!(pipe,
+            stream = stream_name,
+            rows = rows,
+            alerts = total_alerts,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "dispatch_batch complete"
+        );
     }
 
     /// Scan all engines for expired instances — engines execute in parallel,
@@ -264,41 +279,59 @@ impl Scheduler {
 
                 match result {
                     Ok(alerts) => {
+                        let n = alerts.len();
                         for record in alerts {
                             emit_alert(&alert_tx, record).await;
                         }
+                        n
                     }
                     Err(_) => {
                         wf_warn!(pipe,
                             timeout = ?exec_timeout,
                             "scan_timeouts engine timed out, execution cancelled"
                         );
+                        0
                     }
                 }
             });
         }
 
+        let mut total_alerts = 0usize;
         while let Some(result) = join_set.join_next().await {
-            if let Err(e) = result {
-                wf_warn!(pipe, error = %e, "scan_timeouts task panicked");
+            match result {
+                Ok(n) => total_alerts += n,
+                Err(e) => wf_warn!(pipe, error = %e, "scan_timeouts task panicked"),
             }
+        }
+
+        if total_alerts > 0 {
+            wf_debug!(pipe,
+                alerts = total_alerts,
+                duration_ms = now.elapsed().as_millis() as u64,
+                "scan_timeouts complete"
+            );
         }
     }
 
     /// Flush all engines on shutdown: close every active instance.
     /// Sequential — no parallelism needed on the shutdown path.
     async fn flush_all(&self) {
+        let mut total_alerts = 0usize;
         for engine in &self.engines {
             let mut core = engine.state.lock().await;
             let close_outputs = core.machine.close_all(CloseReason::Flush);
             for close in &close_outputs {
                 match core.executor.execute_close(close) {
-                    Ok(Some(record)) => emit_alert(&self.alert_tx, record).await,
+                    Ok(Some(record)) => {
+                        emit_alert(&self.alert_tx, record).await;
+                        total_alerts += 1;
+                    }
                     Ok(None) => {}
                     Err(e) => wf_warn!(pipe, error = %e, "execute_close flush error"),
                 }
             }
         }
+        wf_debug!(pipe, alerts = total_alerts, "flush_all complete");
     }
 }
 

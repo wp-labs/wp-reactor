@@ -99,6 +99,7 @@ async fn handle_connection(
                     Ok(Some(payload)) => {
                         match wp_arrow::ipc::decode_ipc(&payload) {
                             Ok(frame) => {
+                                wf_trace!(pipe, stream = &*frame.tag, rows = frame.batch.num_rows(), "frame decoded");
                                 // Send to scheduler before routing to windows
                                 if let Some(tx) = &event_tx {
                                     if tx.send((frame.tag.clone(), frame.batch.clone())).await.is_err() {
