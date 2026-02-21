@@ -19,7 +19,7 @@ use wf_config::{LogFormat, LoggingConfig};
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-struct FileFields(DefaultFields);
+pub struct FileFields(DefaultFields);
 
 impl<'writer> fmt::FormatFields<'writer> for FileFields {
     fn format_fields<R: tracing_subscriber::field::RecordFields>(
@@ -46,12 +46,12 @@ impl<'writer> fmt::FormatFields<'writer> for FileFields {
 /// Events without a `domain` field (e.g. from dependencies) are rendered
 /// without the prefix.  ANSI colouring adapts automatically based on the
 /// writer.
-struct DomainFormat {
+pub struct DomainFormat {
     timer: SystemTime,
 }
 
 impl DomainFormat {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self { timer: SystemTime }
     }
 }

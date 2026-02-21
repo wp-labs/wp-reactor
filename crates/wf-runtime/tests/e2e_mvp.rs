@@ -12,8 +12,12 @@ use arrow::record_batch::RecordBatch;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, EnvFilter, Layer};
 use wf_config::FusionConfig;
 use wf_runtime::lifecycle::FusionEngine;
+use wf_runtime::tracing_init::{DomainFormat, FileFields};
 
 /// Build a length-prefixed TCP frame from an Arrow IPC payload.
 fn make_tcp_frame(ipc_payload: &[u8]) -> Vec<u8> {
@@ -25,11 +29,6 @@ fn make_tcp_frame(ipc_payload: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn e2e_brute_force_alert() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_new("info").unwrap())
-        .try_init();
-
     // Write to target/test-artifacts/ for easy post-run inspection.
     let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/test-artifacts/e2e_mvp");
@@ -37,6 +36,28 @@ async fn e2e_brute_force_alert() {
     let alert_path = artifact_dir.join("alerts.jsonl");
     // Clear any stale output from previous runs.
     let _ = std::fs::remove_file(&alert_path);
+
+    // -- Set up tracing with file output --
+    let log_file = artifact_dir.join("e2e_mvp.log");
+    let _ = std::fs::remove_file(&log_file);
+    let file_appender = tracing_appender::rolling::never(&artifact_dir, "e2e_mvp.log");
+    let (non_blocking, _log_guard) = tracing_appender::non_blocking(file_appender);
+    let _ = tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .event_format(DomainFormat::new())
+                .with_test_writer()
+                .with_filter(EnvFilter::try_new("info").unwrap()),
+        )
+        .with(
+            fmt::layer()
+                .event_format(DomainFormat::new())
+                .fmt_fields(FileFields::default())
+                .with_ansi(false)
+                .with_writer(non_blocking)
+                .with_filter(EnvFilter::try_new("debug").unwrap()),
+        )
+        .try_init();
 
     // -- Build config from inline TOML with port 0 and tempdir alert sink --
     let toml_str = format!(
