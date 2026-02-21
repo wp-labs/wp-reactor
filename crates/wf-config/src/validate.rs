@@ -140,10 +140,7 @@ mod tests {
     #[test]
     fn reject_empty_alert_sinks() {
         use crate::FusionConfig;
-        let toml = MINIMAL_TOML.replace(
-            r#"sinks = ["file:///tmp/alerts.jsonl"]"#,
-            "sinks = []",
-        );
+        let toml = MINIMAL_TOML.replace(r#"sinks = ["file:///tmp/alerts.jsonl"]"#, "sinks = []");
         let err = toml.parse::<FusionConfig>().unwrap_err();
         assert!(
             err.to_string().contains("at least one sink"),

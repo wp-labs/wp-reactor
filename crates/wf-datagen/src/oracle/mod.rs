@@ -5,9 +5,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use wf_core::rule::{
-    CepStateMachine, Event, RuleExecutor, StepResult, Value,
-};
+use wf_core::rule::{CepStateMachine, Event, RuleExecutor, StepResult, Value};
 use wf_lang::plan::RulePlan;
 
 use crate::datagen::stream_gen::GenEvent;
@@ -106,10 +104,9 @@ pub fn run_oracle(
 
             // Advance the state machine for each alias bound to this window
             for bind_alias in bind_aliases {
-                let result =
-                    engine
-                        .sm
-                        .advance_with_instant(bind_alias, &core_event, synthetic_now);
+                let result = engine
+                    .sm
+                    .advance_with_instant(bind_alias, &core_event, synthetic_now);
 
                 if let StepResult::Matched(ctx) = result {
                     if let Ok(alert_record) = engine.executor.execute_match(&ctx) {
@@ -133,8 +130,8 @@ pub fn run_oracle(
 
     for engine in &mut engines {
         let expired = engine.sm.scan_expired(eos_instant);
-        let eos_time = *scenario_start
-            + chrono::Duration::from_std(*scenario_duration).unwrap_or_default();
+        let eos_time =
+            *scenario_start + chrono::Duration::from_std(*scenario_duration).unwrap_or_default();
 
         for close_out in expired {
             if let Ok(Some(alert_record)) = engine.executor.execute_close(&close_out) {

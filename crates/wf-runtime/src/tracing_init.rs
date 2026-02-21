@@ -225,10 +225,7 @@ impl Visit for DomainExtractor {
 ///
 /// The `log` → `tracing` bridge is set up automatically by
 /// `tracing-subscriber`'s default `tracing-log` feature.
-pub fn init_tracing(
-    config: &LoggingConfig,
-    base_dir: &Path,
-) -> Result<Option<WorkerGuard>> {
+pub fn init_tracing(config: &LoggingConfig, base_dir: &Path) -> Result<Option<WorkerGuard>> {
     // 1. Build EnvFilter ------------------------------------------------
     let filter = if std::env::var("RUST_LOG").is_ok() {
         EnvFilter::from_default_env()

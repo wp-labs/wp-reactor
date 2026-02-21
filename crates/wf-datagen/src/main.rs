@@ -8,7 +8,7 @@ use rand::rngs::StdRng;
 
 use wf_datagen::datagen::fault_gen::apply_faults;
 use wf_datagen::datagen::generate;
-use wf_datagen::oracle::{extract_oracle_tolerances, run_oracle, OracleTolerances};
+use wf_datagen::oracle::{OracleTolerances, extract_oracle_tolerances, run_oracle};
 use wf_datagen::output::arrow_ipc::write_arrow_ipc;
 use wf_datagen::output::jsonl::{
     read_alerts_jsonl, read_oracle_jsonl, write_jsonl, write_oracle_jsonl,
@@ -218,8 +218,7 @@ fn main() -> anyhow::Result<()> {
                 )?;
                 oracle_alert_count = oracle_result.alerts.len();
 
-                let oracle_file =
-                    out.join(format!("{}.oracle.jsonl", wfg.scenario.name));
+                let oracle_file = out.join(format!("{}.oracle.jsonl", wfg.scenario.name));
                 write_oracle_jsonl(&oracle_result.alerts, &oracle_file)?;
                 println!(
                     "Oracle: {} alerts -> {}",
@@ -234,8 +233,7 @@ fn main() -> anyhow::Result<()> {
                     .as_ref()
                     .map(|o| extract_oracle_tolerances(o))
                     .unwrap_or_default();
-                let meta_file =
-                    out.join(format!("{}.oracle.meta.json", wfg.scenario.name));
+                let meta_file = out.join(format!("{}.oracle.meta.json", wfg.scenario.name));
                 let meta_json = serde_json::to_string_pretty(&tolerances)?;
                 std::fs::write(&meta_file, meta_json)?;
             }
@@ -352,8 +350,7 @@ fn main() -> anyhow::Result<()> {
             };
 
             let effective_score_tol = score_tolerance.unwrap_or(base_tolerances.score_tolerance);
-            let effective_time_tol =
-                time_tolerance.unwrap_or(base_tolerances.time_tolerance_secs);
+            let effective_time_tol = time_tolerance.unwrap_or(base_tolerances.time_tolerance_secs);
 
             let oracle_alerts = read_oracle_jsonl(&expected)
                 .with_context(|| format!("reading expected: {}", expected.display()))?;

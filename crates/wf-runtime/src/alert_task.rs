@@ -15,10 +15,7 @@ pub const ALERT_CHANNEL_CAPACITY: usize = 64;
 /// where the cancel could close the receiver while the scheduler is still
 /// sending flush alerts.
 #[tracing::instrument(name = "alert_sink", skip_all)]
-pub async fn run_alert_sink(
-    mut rx: mpsc::Receiver<AlertRecord>,
-    sink: Arc<dyn AlertSink>,
-) {
+pub async fn run_alert_sink(mut rx: mpsc::Receiver<AlertRecord>, sink: Arc<dyn AlertSink>) {
     while let Some(record) = rx.recv().await {
         if let Err(e) = sink.send(&record) {
             wf_error!(pipe, error = %e, "alert sink write failed");
@@ -35,8 +32,8 @@ pub async fn run_alert_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sample_alert(id: &str) -> AlertRecord {
         AlertRecord {

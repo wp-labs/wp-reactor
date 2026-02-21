@@ -292,10 +292,7 @@ pub fn validate_wfg(
                     ParamValue::Number(n) => {
                         errors.push(ValidationError {
                             code: "SV8",
-                            message: format!(
-                                "oracle.score_tolerance must be >= 0, got {}",
-                                n
-                            ),
+                            message: format!("oracle.score_tolerance must be >= 0, got {}", n),
                         });
                     }
                     _ => {
@@ -809,8 +806,9 @@ mod tests {
         let wfg = wfg_with_oracle(oracle);
         let errors = validate_wfg(&wfg, &[], &[]);
         assert!(
-            errors.iter().any(|e| e.code == "SV8"
-                && e.message.contains("time_tolerance")),
+            errors
+                .iter()
+                .any(|e| e.code == "SV8" && e.message.contains("time_tolerance")),
             "errors: {:?}",
             errors
         );
@@ -827,8 +825,9 @@ mod tests {
         let wfg = wfg_with_oracle(oracle);
         let errors = validate_wfg(&wfg, &[], &[]);
         assert!(
-            errors.iter().any(|e| e.code == "SV8"
-                && e.message.contains("score_tolerance")),
+            errors
+                .iter()
+                .any(|e| e.code == "SV8" && e.message.contains("score_tolerance")),
             "errors: {:?}",
             errors
         );

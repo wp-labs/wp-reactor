@@ -58,10 +58,10 @@ impl AlertSink for FanOutSink {
     fn send(&self, record: &AlertRecord) -> Result<()> {
         let mut first_err: Option<anyhow::Error> = None;
         for sink in &self.sinks {
-            if let Err(e) = sink.send(record) {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
+            if let Err(e) = sink.send(record)
+                && first_err.is_none()
+            {
+                first_err = Some(e);
             }
         }
         match first_err {
@@ -79,8 +79,8 @@ impl AlertSink for FanOutSink {
 mod tests {
     use super::*;
     use std::io::Read;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Implement AlertSink for Arc<T> so Arc<CountingSink> works as Box<dyn AlertSink>
     impl<T: AlertSink> AlertSink for Arc<T> {

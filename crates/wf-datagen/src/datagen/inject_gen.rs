@@ -74,8 +74,7 @@ pub fn generate_inject_events(
                 )
             })?;
 
-        let alias_map =
-            build_alias_map(&inject_block.streams, &scenario.streams, rule_plan)?;
+        let alias_map = build_alias_map(&inject_block.streams, &scenario.streams, rule_plan)?;
         let rule_struct = extract_rule_structure(rule_plan, &alias_map)?;
 
         for inject_line in &inject_block.lines {
@@ -502,14 +501,12 @@ fn generate_near_miss_clusters(
 
     // Compute number of clusters from the near-miss step's budget
     let primary_step = &steps[nm_step_idx];
-    let stream_total = *stream_totals.get(&primary_step.scenario_alias).unwrap_or(&0);
+    let stream_total = *stream_totals
+        .get(&primary_step.scenario_alias)
+        .unwrap_or(&0);
     let budget = (stream_total as f64 * percent / 100.0).round() as u64;
     let nm_count = near_miss_counts[nm_step_idx];
-    let num_clusters = if nm_count > 0 {
-        budget / nm_count
-    } else {
-        0
-    };
+    let num_clusters = if nm_count > 0 { budget / nm_count } else { 0 };
 
     if num_clusters == 0 {
         return Ok(Vec::new());
@@ -601,9 +598,7 @@ fn generate_non_hit_events(
         let schema = schemas
             .iter()
             .find(|s| s.name == step.window_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!("schema not found for '{}'", step.window_name)
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("schema not found for '{}'", step.window_name))?;
 
         let stream_block = scenario_streams
             .iter()
@@ -634,13 +629,7 @@ fn generate_non_hit_events(
             };
             let ts = *start + ChronoDuration::nanoseconds(offset_nanos);
 
-            let fields = build_event_fields(
-                schema,
-                &overrides_map,
-                &key_overrides,
-                &ts,
-                rng,
-            );
+            let fields = build_event_fields(schema, &overrides_map, &key_overrides, &ts, rng);
 
             events.push(GenEvent {
                 stream_alias: step.scenario_alias.clone(),
@@ -712,9 +701,7 @@ fn generate_cluster_events(
         let schema = schemas
             .iter()
             .find(|s| s.name == step.window_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!("schema not found for '{}'", step.window_name)
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("schema not found for '{}'", step.window_name))?;
 
         let stream_block = scenario_streams
             .iter()
@@ -731,16 +718,9 @@ fn generate_cluster_events(
             let event_offset_secs = cluster_start_secs
                 + cumulative_offset
                 + (per_step_window * i as f64 / event_count.max(1) as f64);
-            let ts = *start
-                + ChronoDuration::nanoseconds((event_offset_secs * 1e9) as i64);
+            let ts = *start + ChronoDuration::nanoseconds((event_offset_secs * 1e9) as i64);
 
-            let fields = build_event_fields(
-                schema,
-                &overrides_map,
-                key_overrides,
-                &ts,
-                rng,
-            );
+            let fields = build_event_fields(schema, &overrides_map, key_overrides, &ts, rng);
 
             out.push(GenEvent {
                 stream_alias: step.scenario_alias.clone(),

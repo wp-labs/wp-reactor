@@ -53,14 +53,12 @@ fn make_simple_rule_plan() -> RulePlan {
     }
 }
 
-fn make_event(
-    alias: &str,
-    window: &str,
-    sip: &str,
-    ts: &str,
-) -> GenEvent {
+fn make_event(alias: &str, window: &str, sip: &str, ts: &str) -> GenEvent {
     let mut fields = serde_json::Map::new();
-    fields.insert("sip".to_string(), serde_json::Value::String(sip.to_string()));
+    fields.insert(
+        "sip".to_string(),
+        serde_json::Value::String(sip.to_string()),
+    );
     fields.insert(
         "timestamp".to_string(),
         serde_json::Value::String(ts.to_string()),

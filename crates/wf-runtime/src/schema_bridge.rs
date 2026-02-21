@@ -73,16 +73,13 @@ pub fn schemas_to_window_defs(
 ) -> Result<Vec<WindowDef>> {
     let mut defs = Vec::with_capacity(schemas.len());
     for ws in schemas {
-        let config = configs
-            .iter()
-            .find(|c| c.name == ws.name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "window {:?} found in .wfs schema but not in fusion.toml [window.{}]",
-                    ws.name,
-                    ws.name
-                )
-            })?;
+        let config = configs.iter().find(|c| c.name == ws.name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "window {:?} found in .wfs schema but not in fusion.toml [window.{}]",
+                ws.name,
+                ws.name
+            )
+        })?;
         defs.push(schema_to_window_def(ws, config)?);
     }
     Ok(defs)

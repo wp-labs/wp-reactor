@@ -30,9 +30,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Run { config } => {
-            let config_path = config.canonicalize().map_err(|e| {
-                anyhow::anyhow!("config path '{}': {e}", config.display())
-            })?;
+            let config_path = config
+                .canonicalize()
+                .map_err(|e| anyhow::anyhow!("config path '{}': {e}", config.display()))?;
             let fusion_config = FusionConfig::load(&config_path)?;
             let base_dir = config_path
                 .parent()

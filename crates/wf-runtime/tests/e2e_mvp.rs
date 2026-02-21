@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, fmt};
 use wf_config::FusionConfig;
 use wf_runtime::lifecycle::FusionEngine;
 use wf_runtime::tracing_init::{DomainFormat, FileFields};
@@ -127,9 +127,7 @@ FAIL_THRESHOLD = "3"
     let batch = RecordBatch::try_new(
         arrow_schema,
         vec![
-            Arc::new(StringArray::from(vec![
-                "10.0.0.1", "10.0.0.1", "10.0.0.1",
-            ])),
+            Arc::new(StringArray::from(vec!["10.0.0.1", "10.0.0.1", "10.0.0.1"])),
             Arc::new(StringArray::from(vec!["admin", "admin", "admin"])),
             Arc::new(StringArray::from(vec!["failed", "failed", "failed"])),
             Arc::new(TimestampNanosecondArray::from(vec![
@@ -144,9 +142,7 @@ FAIL_THRESHOLD = "3"
     let ipc_payload = wp_arrow::ipc::encode_ipc("syslog", &batch).expect("encode_ipc failed");
     let tcp_frame = make_tcp_frame(&ipc_payload);
 
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .expect("TCP connect failed");
+    let mut stream = TcpStream::connect(addr).await.expect("TCP connect failed");
     stream
         .write_all(&tcp_frame)
         .await

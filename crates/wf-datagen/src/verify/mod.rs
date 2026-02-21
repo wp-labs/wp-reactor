@@ -67,17 +67,20 @@ impl VerifyReport {
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
         md.push_str("## wf-datagen Verify Report\n\n");
-        md.push_str(&format!(
-            "**Status**: {}\n\n",
-            self.status.to_uppercase()
-        ));
+        md.push_str(&format!("**Status**: {}\n\n", self.status.to_uppercase()));
 
         // Summary table
         md.push_str("### Summary\n\n");
         md.push_str("| Metric | Count |\n");
         md.push_str("|--------|-------|\n");
-        md.push_str(&format!("| Oracle total | {} |\n", self.summary.oracle_total));
-        md.push_str(&format!("| Actual total | {} |\n", self.summary.actual_total));
+        md.push_str(&format!(
+            "| Oracle total | {} |\n",
+            self.summary.oracle_total
+        ));
+        md.push_str(&format!(
+            "| Actual total | {} |\n",
+            self.summary.actual_total
+        ));
         md.push_str(&format!("| Matched | {} |\n", self.summary.matched));
         md.push_str(&format!("| Missing | {} |\n", self.summary.missing));
         md.push_str(&format!("| Unexpected | {} |\n", self.summary.unexpected));

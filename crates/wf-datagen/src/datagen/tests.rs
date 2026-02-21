@@ -489,7 +489,11 @@ scenario compat seed 42 {
     let result_without = generate(&wfg, &schemas, &[]).unwrap();
 
     assert_eq!(result_with_plans.events.len(), result_without.events.len());
-    for (e1, e2) in result_with_plans.events.iter().zip(result_without.events.iter()) {
+    for (e1, e2) in result_with_plans
+        .events
+        .iter()
+        .zip(result_without.events.iter())
+    {
         assert_eq!(e1.timestamp, e2.timestamp);
         assert_eq!(e1.fields, e2.fields);
     }
@@ -588,7 +592,10 @@ fn test_fault_out_of_order_preserves_count() {
             break;
         }
     }
-    assert!(has_disorder, "out_of_order should produce timestamp disorder");
+    assert!(
+        has_disorder,
+        "out_of_order should produce timestamp disorder"
+    );
 }
 
 #[test]

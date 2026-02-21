@@ -7,9 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{
-    BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
-};
+use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
@@ -18,7 +16,7 @@ use tokio::net::TcpStream;
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, fmt};
 use wf_config::FusionConfig;
 use wf_datagen::datagen::stream_gen::GenEvent;
 use wf_runtime::lifecycle::FusionEngine;
@@ -41,10 +39,7 @@ fn make_tcp_frame(ipc_payload: &[u8]) -> Vec<u8> {
 /// 2. Build an Arrow Schema with typed columns (all nullable=true).
 /// 3. Build Arrow arrays from the JSON field values in each GenEvent.
 /// 4. Encode as IPC and wrap in a length-prefixed frame.
-fn events_to_tcp_frames(
-    events: &[GenEvent],
-    schemas: &[WindowSchema],
-) -> Vec<(String, Vec<u8>)> {
+fn events_to_tcp_frames(events: &[GenEvent], schemas: &[WindowSchema]) -> Vec<(String, Vec<u8>)> {
     // Group events by window_name
     let mut groups: HashMap<String, Vec<&GenEvent>> = HashMap::new();
     for event in events {
@@ -82,9 +77,7 @@ fn events_to_tcp_frames(
         let columns: Vec<Arc<dyn arrow::array::Array>> = schema
             .fields
             .iter()
-            .map(|field_def| {
-                build_arrow_column(field_def, group_events)
-            })
+            .map(|field_def| build_arrow_column(field_def, group_events))
             .collect();
 
         let batch = RecordBatch::try_new(arrow_schema, columns)
@@ -127,7 +120,12 @@ fn build_arrow_column(
         BaseType::Chars | BaseType::Ip | BaseType::Hex => {
             let values: Vec<Option<String>> = events
                 .iter()
-                .map(|e| e.fields.get(name).and_then(|v| v.as_str()).map(String::from))
+                .map(|e| {
+                    e.fields
+                        .get(name)
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
                 .collect();
             Arc::new(StringArray::from(values))
         }
@@ -210,8 +208,7 @@ async fn e2e_datagen_brute_force() {
     // ---- Parse .wfg scenario ----
     let base_dir = manifest_dir.join("../../examples");
     let wfg_path = base_dir.join("scenarios/brute_force.wfg");
-    let wfg_content =
-        std::fs::read_to_string(&wfg_path).expect("failed to read brute_force.wfg");
+    let wfg_content = std::fs::read_to_string(&wfg_path).expect("failed to read brute_force.wfg");
     let wfg =
         wf_datagen::wfg_parser::parse_wfg(&wfg_content).expect("failed to parse .wfg scenario");
 
@@ -231,8 +228,7 @@ async fn e2e_datagen_brute_force() {
         wf_lang::compile_wfl(&wfl_file, &schemas).expect("failed to compile .wfl rules");
 
     // ---- Validate scenario ----
-    let validation_errors =
-        wf_datagen::validate::validate_wfg(&wfg, &schemas, &[wfl_file]);
+    let validation_errors = wf_datagen::validate::validate_wfg(&wfg, &schemas, &[wfl_file]);
     assert!(
         validation_errors.is_empty(),
         "scenario validation failed: {:?}",
@@ -324,15 +320,10 @@ FAIL_THRESHOLD = "3"
     let tcp_frames = events_to_tcp_frames(&events, &schemas);
 
     // ---- TCP send ----
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .expect("TCP connect failed");
+    let mut stream = TcpStream::connect(addr).await.expect("TCP connect failed");
 
     for (_stream_name, frame) in &tcp_frames {
-        stream
-            .write_all(frame)
-            .await
-            .expect("TCP write failed");
+        stream.write_all(frame).await.expect("TCP write failed");
     }
     stream.flush().await.expect("TCP flush failed");
 
@@ -374,16 +365,11 @@ FAIL_THRESHOLD = "3"
     // appear in the actual alerts, and vice versa. Scores must also match.
 
     // Unique entity_ids from oracle alerts
-    let oracle_entities: HashSet<String> = oracle_alerts
-        .iter()
-        .map(|a| a.entity_id.clone())
-        .collect();
+    let oracle_entities: HashSet<String> =
+        oracle_alerts.iter().map(|a| a.entity_id.clone()).collect();
 
     // Unique entity_ids from actual alerts
-    let actual_entities: HashSet<String> = actual
-        .iter()
-        .map(|a| a.entity_id.clone())
-        .collect();
+    let actual_entities: HashSet<String> = actual.iter().map(|a| a.entity_id.clone()).collect();
 
     // Check: oracle entities ⊆ actual entities (no missing)
     let missing: Vec<&String> = oracle_entities.difference(&actual_entities).collect();

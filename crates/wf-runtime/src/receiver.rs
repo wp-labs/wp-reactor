@@ -351,10 +351,9 @@ mod tests {
     async fn event_tx_receives_batches() {
         let router = make_router("events");
         let (tx, mut rx) = mpsc::channel::<(String, RecordBatch)>(16);
-        let receiver =
-            Receiver::bind_with_event_tx("tcp://127.0.0.1:0", Arc::clone(&router), tx)
-                .await
-                .unwrap();
+        let receiver = Receiver::bind_with_event_tx("tcp://127.0.0.1:0", Arc::clone(&router), tx)
+            .await
+            .unwrap();
         let addr = receiver.local_addr().unwrap();
         let cancel = receiver.cancel_token();
 

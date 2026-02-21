@@ -8,9 +8,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use wf_core::alert::AlertRecord;
-use wf_core::rule::{
-    CepStateMachine, CloseReason, RuleExecutor, StepResult, batch_to_events,
-};
+use wf_core::rule::{CepStateMachine, CloseReason, RuleExecutor, StepResult, batch_to_events};
 
 // ---------------------------------------------------------------------------
 // SchedulerCommand — control channel messages
@@ -237,7 +235,8 @@ impl Scheduler {
             }
         }
 
-        wf_debug!(pipe,
+        wf_debug!(
+            pipe,
             stream = stream_name,
             rows = rows,
             alerts = total_alerts,
@@ -305,7 +304,8 @@ impl Scheduler {
         }
 
         if total_alerts > 0 {
-            wf_debug!(pipe,
+            wf_debug!(
+                pipe,
                 alerts = total_alerts,
                 duration_ms = now.elapsed().as_millis() as u64,
                 "scan_timeouts complete"
@@ -455,18 +455,24 @@ mod tests {
         let cancel = CancellationToken::new();
         let (_cmd_tx, cmd_rx) = mpsc::channel(64);
 
-        let scheduler = Scheduler::new(rx, vec![engine], alert_tx, cancel.clone(), 4, Duration::from_secs(30), cmd_rx);
+        let scheduler = Scheduler::new(
+            rx,
+            vec![engine],
+            alert_tx,
+            cancel.clone(),
+            4,
+            Duration::from_secs(30),
+            cmd_rx,
+        );
         let handle = tokio::spawn(async move { scheduler.run().await });
 
         // Build a minimal RecordBatch with an "sip" column
         use arrow::array::StringArray;
         use arrow::datatypes::{DataType, Field, Schema};
         let schema = Arc::new(Schema::new(vec![Field::new("sip", DataType::Utf8, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["10.0.0.1"]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["10.0.0.1"]))])
+                .unwrap();
 
         tx.send(("syslog".to_string(), batch)).await.unwrap();
 
@@ -518,18 +524,24 @@ mod tests {
         let cancel = CancellationToken::new();
         let (_cmd_tx, cmd_rx) = mpsc::channel(64);
 
-        let scheduler = Scheduler::new(rx, vec![engine], alert_tx, cancel.clone(), 4, Duration::from_secs(30), cmd_rx);
+        let scheduler = Scheduler::new(
+            rx,
+            vec![engine],
+            alert_tx,
+            cancel.clone(),
+            4,
+            Duration::from_secs(30),
+            cmd_rx,
+        );
         let handle = tokio::spawn(async move { scheduler.run().await });
 
         // Send 1 event — not enough to match (need 3) but enough to create instance
         use arrow::array::StringArray;
         use arrow::datatypes::{DataType, Field, Schema};
         let schema = Arc::new(Schema::new(vec![Field::new("sip", DataType::Utf8, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["10.0.0.1"]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["10.0.0.1"]))])
+                .unwrap();
         tx.send(("syslog".to_string(), batch)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -574,11 +586,9 @@ mod tests {
             vec![Arc::new(StringArray::from(vec!["10.0.0.1"]))],
         )
         .unwrap();
-        let batch2 = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["10.0.0.2"]))],
-        )
-        .unwrap();
+        let batch2 =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["10.0.0.2"]))])
+                .unwrap();
 
         tx.send(("syslog".to_string(), batch1)).await.unwrap();
         tx.send(("syslog".to_string(), batch2)).await.unwrap();
@@ -588,13 +598,26 @@ mod tests {
         // branch immediately, exercising the drain path.
         cancel.cancel();
 
-        let scheduler = Scheduler::new(rx, vec![engine], alert_tx, cancel.clone(), 4, Duration::from_secs(30), cmd_rx);
+        let scheduler = Scheduler::new(
+            rx,
+            vec![engine],
+            alert_tx,
+            cancel.clone(),
+            4,
+            Duration::from_secs(30),
+            cmd_rx,
+        );
         let handle = tokio::spawn(async move { scheduler.run().await });
         handle.await.unwrap().unwrap();
 
         let alerts = collect_alerts(alert_rx).await;
         // Both queued batches must have been drained and processed.
-        assert_eq!(alerts.len(), 2, "expected 2 alerts from drained batches, got {}", alerts.len());
+        assert_eq!(
+            alerts.len(),
+            2,
+            "expected 2 alerts from drained batches, got {}",
+            alerts.len()
+        );
     }
 
     /// M18 验收：多规则并行分发 — 两个引擎同时处理同一批事件，各自
@@ -630,19 +653,22 @@ mod tests {
 
         // parallelism=4 > 2 engines → both may run truly in parallel
         let scheduler = Scheduler::new(
-            rx, vec![engine_a, engine_b], alert_tx, cancel.clone(),
-            4, Duration::from_secs(30), cmd_rx,
+            rx,
+            vec![engine_a, engine_b],
+            alert_tx,
+            cancel.clone(),
+            4,
+            Duration::from_secs(30),
+            cmd_rx,
         );
         let handle = tokio::spawn(async move { scheduler.run().await });
 
         use arrow::array::StringArray;
         use arrow::datatypes::{DataType, Field, Schema};
         let schema = Arc::new(Schema::new(vec![Field::new("sip", DataType::Utf8, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["10.0.0.1"]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["10.0.0.1"]))])
+                .unwrap();
 
         tx.send(("syslog".to_string(), batch)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -652,7 +678,12 @@ mod tests {
         handle.await.unwrap().unwrap();
 
         let alerts = collect_alerts(alert_rx).await;
-        assert_eq!(alerts.len(), 2, "expected 2 alerts from 2 engines, got {}", alerts.len());
+        assert_eq!(
+            alerts.len(),
+            2,
+            "expected 2 alerts from 2 engines, got {}",
+            alerts.len()
+        );
 
         let mut names: Vec<&str> = alerts.iter().map(|a| a.rule_name.as_str()).collect();
         names.sort();
@@ -684,8 +715,13 @@ mod tests {
 
         // parallelism=1 → only one engine holds a permit at a time
         let scheduler = Scheduler::new(
-            rx, engines, alert_tx, cancel.clone(),
-            1, Duration::from_secs(30), cmd_rx,
+            rx,
+            engines,
+            alert_tx,
+            cancel.clone(),
+            1,
+            Duration::from_secs(30),
+            cmd_rx,
         );
         let handle = tokio::spawn(async move { scheduler.run().await });
 
@@ -695,11 +731,9 @@ mod tests {
 
         // Send 2 events with distinct scope keys
         for ip in ["10.0.0.1", "10.0.0.2"] {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(StringArray::from(vec![ip]))],
-            )
-            .unwrap();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec![ip]))])
+                    .unwrap();
             tx.send(("syslog".to_string(), batch)).await.unwrap();
         }
 
@@ -711,7 +745,12 @@ mod tests {
 
         let alerts = collect_alerts(alert_rx).await;
         // 3 engines × 2 events = 6 alerts — none dropped despite parallelism=1
-        assert_eq!(alerts.len(), 6, "expected 6 alerts (3 engines × 2 events), got {}", alerts.len());
+        assert_eq!(
+            alerts.len(),
+            6,
+            "expected 6 alerts (3 engines × 2 events), got {}",
+            alerts.len()
+        );
 
         // Each rule must have fired exactly twice
         let mut counts: HashMap<&str, usize> = HashMap::new();

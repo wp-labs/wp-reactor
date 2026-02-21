@@ -115,7 +115,11 @@ impl FusionEngine {
             .map(|ws| (ws.name.clone(), ws.over))
             .collect();
         wf_config::validate_over_vs_over_cap(&config.windows, &window_overs)?;
-        wf_debug!(conf, windows = config.windows.len(), "over vs over_cap validation passed");
+        wf_debug!(
+            conf,
+            windows = config.windows.len(),
+            "over vs over_cap validation passed"
+        );
 
         // 4. Schema bridge: WindowSchema × WindowConfig → Vec<WindowDef>
         let window_defs = schemas_to_window_defs(&all_schemas, &config.windows)?;
@@ -140,7 +144,8 @@ impl FusionEngine {
         }
 
         // 8. Create bounded event channel
-        wf_info!(sys,
+        wf_info!(
+            sys,
             schemas = wfs_paths.len(),
             rules = engines.len(),
             windows = config.windows.len(),
@@ -197,12 +202,9 @@ impl FusionEngine {
         groups.push(scheduler_group);
 
         // 12. Receiver task (last — starts accepting data)
-        let receiver = Receiver::bind_with_event_tx(
-            &config.server.listen,
-            Arc::clone(&router),
-            event_tx,
-        )
-        .await?;
+        let receiver =
+            Receiver::bind_with_event_tx(&config.server.listen, Arc::clone(&router), event_tx)
+                .await?;
         let listen_addr = receiver.local_addr()?;
         // Wire the receiver's internal cancel to our root cancel
         let receiver_cancel = receiver.cancel_token();
@@ -296,8 +298,7 @@ pub async fn wait_for_signal(cancel: CancellationToken) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
+        let mut sigterm = signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 wf_info!(sys, signal = "SIGINT", "received signal, initiating graceful shutdown");
@@ -312,7 +313,10 @@ pub async fn wait_for_signal(cancel: CancellationToken) {
         tokio::signal::ctrl_c()
             .await
             .expect("failed to listen for Ctrl-C");
-        wf_info!(sys, "received shutdown signal, initiating graceful shutdown");
+        wf_info!(
+            sys,
+            "received shutdown signal, initiating graceful shutdown"
+        );
     }
     cancel.cancel();
 }
