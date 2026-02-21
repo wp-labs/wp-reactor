@@ -303,10 +303,7 @@ fn close_guard_event_field() {
 
     // Event step: req arrives → Advance
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
-    assert_eq!(
-        sm.advance_at("req", &req, base),
-        StepResult::Advance
-    );
+    assert_eq!(sm.advance_at("req", &req, base), StepResult::Advance);
 
     // Close step accumulation: success responses should be filtered by guard
     let resp_ok = event(vec![

@@ -360,7 +360,8 @@ FAIL_THRESHOLD = "3"
     // ---- Verify report must pass ----
     assert_eq!(
         report.status, "pass",
-        "verify report failed:\n{}", report_md
+        "verify report failed:\n{}",
+        report_md
     );
 
     // Check: all alerts reference the correct rule

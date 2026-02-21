@@ -126,20 +126,11 @@ fn on_close_trigger_eval() {
     let resp = event(vec![("sip", str_val("10.0.0.1"))]);
 
     // req → Advance (event step done)
-    assert_eq!(
-        sm.advance_at("req", &req, base),
-        StepResult::Advance
-    );
+    assert_eq!(sm.advance_at("req", &req, base), StepResult::Advance);
 
     // 2 resp events → accumulate close step data
-    assert_eq!(
-        sm.advance_at("resp", &resp, base),
-        StepResult::Accumulate
-    );
-    assert_eq!(
-        sm.advance_at("resp", &resp, base),
-        StepResult::Accumulate
-    );
+    assert_eq!(sm.advance_at("resp", &resp, base), StepResult::Accumulate);
+    assert_eq!(sm.advance_at("resp", &resp, base), StepResult::Accumulate);
 
     // Close explicitly
     let out = sm
