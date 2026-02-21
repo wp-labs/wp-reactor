@@ -12,7 +12,7 @@
 |------|------|--------|
 | 0-1 | `examples/security.wfs` | 窗口是什么？stream/time/over/fields 各代表什么 |
 | 0-2 | `examples/brute_force.wfl` | 规则长什么样？events/match/on event/on close/entity/yield |
-| 0-3 | `examples/fusion.toml` | 运行时配置如何把 .wfs + .wfl 组装起来 |
+| 0-3 | `examples/wfusion.toml` | 运行时配置如何把 .wfs + .wfl 组装起来 |
 
 **目标**：能用自然语言描述"3 次登录失败 → 产出告警"的完整语义。
 
@@ -145,14 +145,14 @@ cargo test -p wf-runtime -- --nocapture   # 15 单元测试 + 1 e2e 测试
 | 顺序 | 文件 | 关注点 |
 |------|------|--------|
 | 5-1 | `crates/wf-runtime/tests/e2e_mvp.rs` | 完整数据流：构造 config → 启动引擎 → 发送 TCP Arrow 帧 → shutdown flush → 验证告警文件 |
-| 5-2 | `crates/wf-cli/src/main.rs` | 生产入口：clap CLI → 加载 fusion.toml → 信号处理 → 优雅关闭 |
+| 5-2 | `crates/wf-cli/src/main.rs` | 生产入口：clap CLI → 加载 wfusion.toml → 信号处理 → 优雅关闭 |
 
 ### 动手练习
 
 在 `examples/` 下用 CLI 启动引擎，手动理解完整生命周期：
 
 ```bash
-cargo run -p wf-cli -- run --config examples/fusion.toml
+cargo run -p wf-cli -- run --config examples/wfusion.toml
 ```
 
 ---
@@ -194,7 +194,7 @@ wf-datagen (独立二进制)
 ## 附录 B：核心数据流
 
 ```
-.wfs + .wfl + fusion.toml
+.wfs + .wfl + wfusion.toml
          │
     ┌────▼────┐
     │ wf-lang │  解析 + 编译 → RulePlan

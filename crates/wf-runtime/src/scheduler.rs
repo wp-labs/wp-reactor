@@ -249,7 +249,7 @@ impl Scheduler {
     /// bounded by `exec_semaphore`.  Same timeout semantics as
     /// [`dispatch_batch`](Self::dispatch_batch).
     async fn scan_timeouts(&self) {
-        let now = Instant::now();
+        let start = Instant::now();
         let mut join_set = JoinSet::new();
 
         for engine in &self.engines {
@@ -263,7 +263,7 @@ impl Scheduler {
                     let _permit = semaphore.acquire().await.expect("semaphore closed");
                     let mut core = state.lock().await;
 
-                    let close_outputs = core.machine.scan_expired(now);
+                    let close_outputs = core.machine.scan_expired();
                     let mut alerts = Vec::new();
                     for close in &close_outputs {
                         match core.executor.execute_close(close) {
@@ -307,7 +307,7 @@ impl Scheduler {
             wf_debug!(
                 pipe,
                 alerts = total_alerts,
-                duration_ms = now.elapsed().as_millis() as u64,
+                duration_ms = start.elapsed().as_millis() as u64,
                 "scan_timeouts complete"
             );
         }
@@ -445,7 +445,7 @@ mod tests {
         let stream_aliases = build_stream_aliases(&plan.binds, &schemas);
 
         let engine = RuleEngine {
-            machine: CepStateMachine::new("test_rule".to_string(), plan.match_plan.clone()),
+            machine: CepStateMachine::new("test_rule".to_string(), plan.match_plan.clone(), None),
             executor: RuleExecutor::new(plan),
             stream_aliases,
         };
@@ -514,7 +514,7 @@ mod tests {
         let stream_aliases = build_stream_aliases(&plan.binds, &schemas);
 
         let engine = RuleEngine {
-            machine: CepStateMachine::new("test_rule".to_string(), plan.match_plan.clone()),
+            machine: CepStateMachine::new("test_rule".to_string(), plan.match_plan.clone(), None),
             executor: RuleExecutor::new(plan),
             stream_aliases,
         };
@@ -566,7 +566,7 @@ mod tests {
         let stream_aliases = build_stream_aliases(&plan.binds, &schemas);
 
         let engine = RuleEngine {
-            machine: CepStateMachine::new("test_rule".to_string(), plan.match_plan.clone()),
+            machine: CepStateMachine::new("test_rule".to_string(), plan.match_plan.clone(), None),
             executor: RuleExecutor::new(plan),
             stream_aliases,
         };
@@ -631,7 +631,7 @@ mod tests {
         plan_a.name = "rule_alpha".to_string();
         let aliases_a = build_stream_aliases(&plan_a.binds, &schemas);
         let engine_a = RuleEngine {
-            machine: CepStateMachine::new(plan_a.name.clone(), plan_a.match_plan.clone()),
+            machine: CepStateMachine::new(plan_a.name.clone(), plan_a.match_plan.clone(), None),
             executor: RuleExecutor::new(plan_a),
             stream_aliases: aliases_a,
         };
@@ -641,7 +641,7 @@ mod tests {
         plan_b.name = "rule_beta".to_string();
         let aliases_b = build_stream_aliases(&plan_b.binds, &schemas);
         let engine_b = RuleEngine {
-            machine: CepStateMachine::new(plan_b.name.clone(), plan_b.match_plan.clone()),
+            machine: CepStateMachine::new(plan_b.name.clone(), plan_b.match_plan.clone(), None),
             executor: RuleExecutor::new(plan_b),
             stream_aliases: aliases_b,
         };
@@ -702,7 +702,7 @@ mod tests {
             plan.name = name.to_string();
             let aliases = build_stream_aliases(&plan.binds, &schemas);
             engines.push(RuleEngine {
-                machine: CepStateMachine::new(plan.name.clone(), plan.match_plan.clone()),
+                machine: CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), None),
                 executor: RuleExecutor::new(plan),
                 stream_aliases: aliases,
             });

@@ -134,7 +134,9 @@ impl FusionEngine {
         let mut engines = Vec::with_capacity(all_rule_plans.len());
         for plan in all_rule_plans {
             let stream_aliases = build_stream_aliases(&plan.binds, &all_schemas);
-            let machine = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone());
+            let time_field = resolve_time_field(&plan.binds, &all_schemas);
+            let machine =
+                CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), time_field);
             let executor = RuleExecutor::new(plan);
             engines.push(RuleEngine {
                 machine,
@@ -261,10 +263,23 @@ impl FusionEngine {
     }
 }
 
+/// Resolve the event-time field name for a rule from its first bind's window schema.
+fn resolve_time_field(
+    binds: &[wf_lang::plan::BindPlan],
+    schemas: &[wf_lang::WindowSchema],
+) -> Option<String> {
+    binds.first().and_then(|bind| {
+        schemas
+            .iter()
+            .find(|ws| ws.name == bind.window)
+            .and_then(|ws| ws.time_field.clone())
+    })
+}
+
 /// Build the alert sink from config, supporting multiple file:// destinations.
 ///
 /// Relative `file://` paths are resolved against `base_dir` (typically the
-/// directory containing `fusion.toml`), so that `file://alerts/wf-alerts.jsonl`
+/// directory containing `wfusion.toml`), so that `file://alerts/wf-alerts.jsonl`
 /// lands next to the config rather than relative to CWD.
 fn build_alert_sink(config: &FusionConfig, base_dir: &Path) -> Result<Arc<dyn AlertSink>> {
     let uris = config.alert.parsed_sinks()?;

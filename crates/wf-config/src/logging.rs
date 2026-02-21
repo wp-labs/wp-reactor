@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 /// Logging configuration. All fields have defaults so the entire `[logging]`
-/// section may be omitted from `fusion.toml`.
+/// section may be omitted from `wfusion.toml`.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct LoggingConfig {

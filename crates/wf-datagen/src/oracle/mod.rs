@@ -2,7 +2,7 @@
 mod tests;
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use wf_core::rule::{CepStateMachine, Event, RuleExecutor, StepResult, Value};
@@ -30,9 +30,8 @@ pub struct OracleResult {
 /// Run the reference evaluator on generated events.
 ///
 /// Creates a `CepStateMachine` + `RuleExecutor` per rule, feeds events in
-/// timestamp order, and collects oracle alerts. Uses synthetic `Instant`s
-/// derived from event timestamps so that window expiry works correctly in
-/// single-threaded deterministic mode.
+/// timestamp order, and collects oracle alerts. Uses event-time nanoseconds
+/// for deterministic window expiry.
 ///
 /// SC7: when `injected_rules` is `Some`, only the rules whose names appear
 /// in the set are evaluated. Rules without `inject` coverage are skipped so
@@ -59,30 +58,24 @@ pub fn run_oracle(
         .map(|plan| {
             let alias_map = build_window_alias_map(plan);
             RuleEngine {
-                sm: CepStateMachine::new(plan.name.clone(), plan.match_plan.clone()),
+                sm: CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), None),
                 executor: RuleExecutor::new(plan.clone()),
                 alias_map,
             }
         })
         .collect();
 
-    let base_instant = Instant::now();
     let mut alerts = Vec::new();
 
     // Process events in order (caller should have sorted by timestamp)
     for event in events {
-        let offset = event
-            .timestamp
-            .signed_duration_since(*scenario_start)
-            .to_std()
-            .unwrap_or_default();
-        let synthetic_now = base_instant + offset;
+        let event_nanos = event.timestamp.timestamp_nanos_opt().unwrap_or(0);
 
         let core_event = gen_event_to_core(event);
 
         for engine in &mut engines {
             // Scan for expired instances first
-            let expired = engine.sm.scan_expired(synthetic_now);
+            let expired = engine.sm.scan_expired_at(event_nanos);
             for close_out in expired {
                 if let Ok(Some(alert_record)) = engine.executor.execute_close(&close_out) {
                     alerts.push(OracleAlert {
@@ -91,7 +84,7 @@ pub fn run_oracle(
                         entity_type: alert_record.entity_type,
                         entity_id: alert_record.entity_id,
                         close_reason: alert_record.close_reason,
-                        emit_time: event.timestamp.to_rfc3339(),
+                        emit_time: alert_record.fired_at.clone(),
                     });
                 }
             }
@@ -104,9 +97,7 @@ pub fn run_oracle(
 
             // Advance the state machine for each alias bound to this window
             for bind_alias in bind_aliases {
-                let result = engine
-                    .sm
-                    .advance_with_instant(bind_alias, &core_event, synthetic_now);
+                let result = engine.sm.advance_at(bind_alias, &core_event, event_nanos);
 
                 if let StepResult::Matched(ctx) = result
                     && let Ok(alert_record) = engine.executor.execute_match(&ctx)
@@ -117,21 +108,20 @@ pub fn run_oracle(
                         entity_type: alert_record.entity_type,
                         entity_id: alert_record.entity_id,
                         close_reason: None,
-                        emit_time: event.timestamp.to_rfc3339(),
+                        emit_time: alert_record.fired_at.clone(),
                     });
                 }
             }
         }
     }
 
-    // End-of-scenario sweep: flush remaining instances with 1h buffer
-    let eos_offset = *scenario_duration + Duration::from_secs(3600);
-    let eos_instant = base_instant + eos_offset;
+    // End-of-scenario sweep: flush remaining instances
+    let eos_time =
+        *scenario_start + chrono::Duration::from_std(*scenario_duration).unwrap_or_default();
+    let eos_nanos = eos_time.timestamp_nanos_opt().unwrap_or(i64::MAX);
 
     for engine in &mut engines {
-        let expired = engine.sm.scan_expired(eos_instant);
-        let eos_time =
-            *scenario_start + chrono::Duration::from_std(*scenario_duration).unwrap_or_default();
+        let expired = engine.sm.scan_expired_at(eos_nanos);
 
         for close_out in expired {
             if let Ok(Some(alert_record)) = engine.executor.execute_close(&close_out) {
@@ -141,7 +131,7 @@ pub fn run_oracle(
                     entity_type: alert_record.entity_type,
                     entity_id: alert_record.entity_id,
                     close_reason: alert_record.close_reason,
-                    emit_time: eos_time.to_rfc3339(),
+                    emit_time: alert_record.fired_at.clone(),
                 });
             }
         }

@@ -357,55 +357,11 @@ FAIL_THRESHOLD = "3"
     std::fs::write(&report_path, &report_md)
         .unwrap_or_else(|e| panic!("failed to write report to {}: {e}", report_path.display()));
 
-    // ---- Entity-level verification ----
-    //
-    // The oracle uses synthetic event-based time while the engine uses wall-clock
-    // time, so per-alert time/close_reason matching won't align. Instead, verify
-    // at the entity level: every entity the oracle predicted should fire must
-    // appear in the actual alerts, and vice versa. Scores must also match.
-
-    // Unique entity_ids from oracle alerts
-    let oracle_entities: HashSet<String> =
-        oracle_alerts.iter().map(|a| a.entity_id.clone()).collect();
-
-    // Unique entity_ids from actual alerts
-    let actual_entities: HashSet<String> = actual.iter().map(|a| a.entity_id.clone()).collect();
-
-    // Check: oracle entities ⊆ actual entities (no missing)
-    let missing: Vec<&String> = oracle_entities.difference(&actual_entities).collect();
-    assert!(
-        missing.is_empty(),
-        "entities predicted by oracle but missing from engine output: {:?}\n\
-         oracle entities: {}\n\
-         actual entities: {}",
-        missing,
-        oracle_entities.len(),
-        actual_entities.len()
+    // ---- Verify report must pass ----
+    assert_eq!(
+        report.status, "pass",
+        "verify report failed:\n{}", report_md
     );
-
-    // Check: actual entities ⊆ oracle entities (no unexpected)
-    let unexpected: Vec<&String> = actual_entities.difference(&oracle_entities).collect();
-    assert!(
-        unexpected.is_empty(),
-        "entities in engine output but not predicted by oracle: {:?}\n\
-         oracle entities: {}\n\
-         actual entities: {}",
-        unexpected,
-        oracle_entities.len(),
-        actual_entities.len()
-    );
-
-    // Check: all actual alert scores match expected (70.0)
-    let expected_score = 70.0;
-    for alert in &actual {
-        assert!(
-            (alert.score - expected_score).abs() <= tolerances.score_tolerance,
-            "alert for entity {} has score {}, expected {}",
-            alert.entity_id,
-            alert.score,
-            expected_score
-        );
-    }
 
     // Check: all alerts reference the correct rule
     for alert in &actual {

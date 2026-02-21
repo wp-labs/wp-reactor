@@ -8,7 +8,7 @@ use wf_runtime::lifecycle::{FusionEngine, wait_for_signal};
 use wf_runtime::tracing_init::init_tracing;
 
 #[derive(Parser)]
-#[command(name = "wf", about = "WarpFusion CEP engine")]
+#[command(name = "warp-fusion", about = "WarpFusion CEP engine")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -18,7 +18,7 @@ struct Cli {
 enum Commands {
     /// Start the WarpFusion engine
     Run {
-        /// Path to fusion.toml config file
+        /// Path to wfusion.toml config file
         #[arg(short, long)]
         config: PathBuf,
     },

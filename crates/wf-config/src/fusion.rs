@@ -47,7 +47,7 @@ pub struct FusionConfig {
 }
 
 impl FusionConfig {
-    /// Read and parse a `fusion.toml` file.
+    /// Read and parse a `wfusion.toml` file.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path.as_ref())
             .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.as_ref().display()))?;

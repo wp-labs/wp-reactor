@@ -1,6 +1,6 @@
 //! Regression tests for P0/P1 bug fixes (22–34).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, FieldSelector, Measure};
 use wf_lang::plan::{AggPlan, BranchPlan};
@@ -8,6 +8,8 @@ use wf_lang::plan::{AggPlan, BranchPlan};
 use crate::rule::match_engine::{CepStateMachine, CloseReason, StepResult};
 
 use super::helpers::*;
+
+const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 // ---------------------------------------------------------------------------
 // Guards: InList / FuncCall (22–25)
@@ -35,7 +37,7 @@ fn guard_in_list() {
             agg: count_ge(2.0),
         }])],
     );
-    let mut sm = CepStateMachine::new("rule22".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule22".to_string(), plan, None);
 
     // "upload" not in list → skipped
     let upload = event(vec![
@@ -73,7 +75,7 @@ fn guard_not_in_list() {
             agg: count_ge(1.0),
         }])],
     );
-    let mut sm = CepStateMachine::new("rule23".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule23".to_string(), plan, None);
 
     // "success" → filtered out by NOT IN
     let ok = event(vec![
@@ -112,7 +114,7 @@ fn guard_func_call_contains() {
             agg: count_ge(1.0),
         }])],
     );
-    let mut sm = CepStateMachine::new("rule24".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule24".to_string(), plan, None);
 
     // cmd without "powershell" → skipped
     let notepad = event(vec![
@@ -155,7 +157,7 @@ fn guard_func_lower_in_list() {
             agg: count_ge(1.0),
         }])],
     );
-    let mut sm = CepStateMachine::new("rule25".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule25".to_string(), plan, None);
 
     // "ICMP" → lower → "icmp" → not in list → skipped
     let icmp = event(vec![
@@ -195,7 +197,7 @@ fn string_min_max() {
             agg,
         }])],
     );
-    let mut sm = CepStateMachine::new("rule26".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule26".to_string(), plan, None);
 
     let mk = |h: &str| event(vec![("sip", str_val("10.0.0.1")), ("hostname", str_val(h))]);
 
@@ -223,7 +225,7 @@ fn string_min_max() {
             agg: agg_max,
         }])],
     );
-    let mut sm2 = CepStateMachine::new("rule26b".to_string(), plan2);
+    let mut sm2 = CepStateMachine::new("rule26b".to_string(), plan2, None);
 
     // "alpha" → max="alpha", max >= "delta" is false
     assert_eq!(sm2.advance("dns", &mk("alpha")), StepResult::Accumulate);
@@ -257,7 +259,7 @@ fn compound_threshold() {
             agg,
         }])],
     );
-    let mut sm = CepStateMachine::new("rule27".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule27".to_string(), plan, None);
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
 
     // Should NOT match on first event (old bug: threshold=0.0 → immediate match)
@@ -296,13 +298,13 @@ fn close_guard_event_field() {
         }])],
         Duration::from_secs(60),
     );
-    let mut sm = CepStateMachine::new("rule28".to_string(), plan);
-    let now = Instant::now();
+    let mut sm = CepStateMachine::new("rule28".to_string(), plan, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
 
     // Event step: req arrives → Advance
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
     assert_eq!(
-        sm.advance_with_instant("req", &req, now),
+        sm.advance_at("req", &req, base),
         StepResult::Advance
     );
 
@@ -311,17 +313,17 @@ fn close_guard_event_field() {
         ("sip", str_val("10.0.0.1")),
         ("status", str_val("success")),
     ]);
-    sm.advance_with_instant("resp", &resp_ok, now);
-    sm.advance_with_instant("resp", &resp_ok, now);
-    sm.advance_with_instant("resp", &resp_ok, now);
+    sm.advance_at("resp", &resp_ok, base);
+    sm.advance_at("resp", &resp_ok, base);
+    sm.advance_at("resp", &resp_ok, base);
 
     // Only errors should count
     let resp_err = event(vec![
         ("sip", str_val("10.0.0.1")),
         ("status", str_val("error")),
     ]);
-    sm.advance_with_instant("resp", &resp_err, now);
-    sm.advance_with_instant("resp", &resp_err, now);
+    sm.advance_at("resp", &resp_err, base);
+    sm.advance_at("resp", &resp_err, base);
 
     // Close: guard `status == "error"` references event field.
     // At close time, status is missing from synthetic event → permissive (passes).
@@ -370,39 +372,39 @@ fn close_guard_mixed_event_and_close_reason() {
         Duration::from_secs(60),
     );
 
-    let now = Instant::now();
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
 
     // Scenario A: error events + Timeout close → both parts satisfied → close_ok
-    let mut sm_a = CepStateMachine::new("rule29a".to_string(), plan.clone());
-    sm_a.advance_with_instant("req", &req, now);
+    let mut sm_a = CepStateMachine::new("rule29a".to_string(), plan.clone(), None);
+    sm_a.advance_at("req", &req, base);
     let resp_err = event(vec![
         ("sip", str_val("10.0.0.1")),
         ("status", str_val("error")),
     ]);
-    sm_a.advance_with_instant("resp", &resp_err, now);
+    sm_a.advance_at("resp", &resp_err, base);
     let out_a = sm_a
         .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
         .unwrap();
     assert!(out_a.close_ok);
 
     // Scenario B: error events + Flush close → close_reason != "timeout" → close_ok=false
-    let mut sm_b = CepStateMachine::new("rule29b".to_string(), plan.clone());
-    sm_b.advance_with_instant("req", &req, now);
-    sm_b.advance_with_instant("resp", &resp_err, now);
+    let mut sm_b = CepStateMachine::new("rule29b".to_string(), plan.clone(), None);
+    sm_b.advance_at("req", &req, base);
+    sm_b.advance_at("resp", &resp_err, base);
     let out_b = sm_b
         .close(&[str_val("10.0.0.1")], CloseReason::Flush)
         .unwrap();
     assert!(!out_b.close_ok);
 
     // Scenario C: success events + Timeout → status filter blocks accumulation → count=0 < 1
-    let mut sm_c = CepStateMachine::new("rule29c".to_string(), plan);
-    sm_c.advance_with_instant("req", &req, now);
+    let mut sm_c = CepStateMachine::new("rule29c".to_string(), plan, None);
+    sm_c.advance_at("req", &req, base);
     let resp_ok = event(vec![
         ("sip", str_val("10.0.0.1")),
         ("status", str_val("success")),
     ]);
-    sm_c.advance_with_instant("resp", &resp_ok, now);
+    sm_c.advance_at("resp", &resp_ok, base);
     let out_c = sm_c
         .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
         .unwrap();
@@ -411,23 +413,24 @@ fn close_guard_mixed_event_and_close_reason() {
 
 #[test]
 fn scan_expired_no_panic_on_future_created_at() {
-    // Instance created at a time after `now` (out-of-order clocks) — must not panic.
+    // Instance created at a time after watermark (out-of-order clocks) — must not panic.
     let plan = plan_with_close(
         vec![simple_key("sip")],
         vec![step(vec![branch("fail", count_ge(5.0))])],
         vec![],
         Duration::from_secs(60),
     );
-    let mut sm = CepStateMachine::new("rule30".to_string(), plan);
-    let future = Instant::now() + Duration::from_secs(100);
-    let past = Instant::now();
+    let mut sm = CepStateMachine::new("rule30".to_string(), plan, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
+    let future = base + 100 * NANOS_PER_SEC;
+    let past = base;
 
     // Create instance at future time
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
-    sm.advance_with_instant("fail", &e, future);
+    sm.advance_at("fail", &e, future);
 
     // Scan with `past` < `future` — should not panic, and instance should survive
-    let expired = sm.scan_expired(past);
+    let expired = sm.scan_expired_at(past);
     assert!(expired.is_empty());
     assert_eq!(sm.instance_count(), 1);
 }
@@ -448,18 +451,18 @@ fn close_guard_close_reason_only_permissive() {
         }])],
         Duration::from_secs(60),
     );
-    let mut sm = CepStateMachine::new("rule31".to_string(), plan);
-    let now = Instant::now();
+    let mut sm = CepStateMachine::new("rule31".to_string(), plan, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
 
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
-    sm.advance_with_instant("req", &req, now);
+    sm.advance_at("req", &req, base);
 
     // 3 resp events — guard has close_reason which is missing from events,
     // so it should NOT block accumulation (permissive None)
     let resp = event(vec![("sip", str_val("10.0.0.1"))]);
-    sm.advance_with_instant("resp", &resp, now);
-    sm.advance_with_instant("resp", &resp, now);
-    sm.advance_with_instant("resp", &resp, now);
+    sm.advance_at("resp", &resp, base);
+    sm.advance_at("resp", &resp, base);
+    sm.advance_at("resp", &resp, base);
 
     // Close with Timeout → guard passes at close time → count=3 >= 3 → close_ok
     let out = sm
@@ -483,11 +486,12 @@ fn close_guard_close_reason_only_permissive() {
             }])],
             Duration::from_secs(60),
         ),
+        None,
     );
-    sm2.advance_with_instant("req", &req, now);
-    sm2.advance_with_instant("resp", &resp, now);
-    sm2.advance_with_instant("resp", &resp, now);
-    sm2.advance_with_instant("resp", &resp, now);
+    sm2.advance_at("req", &req, base);
+    sm2.advance_at("resp", &resp, base);
+    sm2.advance_at("resp", &resp, base);
+    sm2.advance_at("resp", &resp, base);
     let out2 = sm2
         .close(&[str_val("10.0.0.1")], CloseReason::Flush)
         .unwrap();
@@ -520,17 +524,17 @@ fn close_step_string_min_max() {
         }])],
         Duration::from_secs(60),
     );
-    let now = Instant::now();
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
 
     // Scenario A: min="alpha" < "beta" → close_ok=false
-    let mut sm_a = CepStateMachine::new("rule32a".to_string(), plan.clone());
+    let mut sm_a = CepStateMachine::new("rule32a".to_string(), plan.clone(), None);
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
-    sm_a.advance_with_instant("req", &req, now);
+    sm_a.advance_at("req", &req, base);
 
     let mk_dns = |h: &str| event(vec![("sip", str_val("10.0.0.1")), ("hostname", str_val(h))]);
-    sm_a.advance_with_instant("dns", &mk_dns("gamma"), now);
-    sm_a.advance_with_instant("dns", &mk_dns("alpha"), now); // min becomes "alpha"
-    sm_a.advance_with_instant("dns", &mk_dns("delta"), now);
+    sm_a.advance_at("dns", &mk_dns("gamma"), base);
+    sm_a.advance_at("dns", &mk_dns("alpha"), base); // min becomes "alpha"
+    sm_a.advance_at("dns", &mk_dns("delta"), base);
 
     let out_a = sm_a
         .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
@@ -539,10 +543,10 @@ fn close_step_string_min_max() {
     assert!(!out_a.close_ok); // min="alpha" < "beta" → not satisfied
 
     // Scenario B: min="beta" >= "beta" → close_ok=true
-    let mut sm_b = CepStateMachine::new("rule32b".to_string(), plan.clone());
-    sm_b.advance_with_instant("req", &req, now);
-    sm_b.advance_with_instant("dns", &mk_dns("gamma"), now);
-    sm_b.advance_with_instant("dns", &mk_dns("beta"), now); // min becomes "beta"
+    let mut sm_b = CepStateMachine::new("rule32b".to_string(), plan.clone(), None);
+    sm_b.advance_at("req", &req, base);
+    sm_b.advance_at("dns", &mk_dns("gamma"), base);
+    sm_b.advance_at("dns", &mk_dns("beta"), base); // min becomes "beta"
 
     let out_b = sm_b
         .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
@@ -569,10 +573,10 @@ fn close_step_string_min_max() {
         }])],
         Duration::from_secs(60),
     );
-    let mut sm_c = CepStateMachine::new("rule32c".to_string(), plan_max);
-    sm_c.advance_with_instant("req", &req, now);
-    sm_c.advance_with_instant("dns", &mk_dns("alpha"), now);
-    sm_c.advance_with_instant("dns", &mk_dns("gamma"), now); // max becomes "gamma"
+    let mut sm_c = CepStateMachine::new("rule32c".to_string(), plan_max, None);
+    sm_c.advance_at("req", &req, base);
+    sm_c.advance_at("dns", &mk_dns("alpha"), base);
+    sm_c.advance_at("dns", &mk_dns("gamma"), base); // max becomes "gamma"
 
     let out_c = sm_c
         .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
@@ -604,7 +608,7 @@ fn non_constant_threshold_no_silent_zero() {
             agg,
         }])],
     );
-    let mut sm = CepStateMachine::new("rule33".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule33".to_string(), plan, None);
 
     // Even after many events, the threshold can't be resolved, so it never matches
     let e = event(vec![("sip", str_val("10.0.0.1")), ("limit", num(5.0))]);
@@ -638,7 +642,7 @@ fn min_max_non_constant_threshold_no_false_positive() {
             agg: agg_min,
         }])],
     );
-    let mut sm = CepStateMachine::new("rule34a".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule34a".to_string(), plan, None);
 
     let e = event(vec![
         ("sip", str_val("10.0.0.1")),
@@ -670,16 +674,16 @@ fn min_max_non_constant_threshold_no_false_positive() {
         }])],
         Duration::from_secs(60),
     );
-    let mut sm2 = CepStateMachine::new("rule34b".to_string(), plan_close);
-    let now = Instant::now();
+    let mut sm2 = CepStateMachine::new("rule34b".to_string(), plan_close, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
-    sm2.advance_with_instant("req", &req, now);
+    sm2.advance_at("req", &req, base);
 
     let dns_ev = event(vec![
         ("sip", str_val("10.0.0.1")),
         ("hostname", str_val("alpha")),
     ]);
-    sm2.advance_with_instant("dns", &dns_ev, now);
+    sm2.advance_at("dns", &dns_ev, base);
 
     let out = sm2
         .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
@@ -712,7 +716,7 @@ fn min_max_cross_type_threshold_rejected() {
             agg,
         }])],
     );
-    let mut sm = CepStateMachine::new("rule35a".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule35a".to_string(), plan, None);
 
     // String values — old behavior: Str > Number in cross-type ordering → false positive
     let e = event(vec![
@@ -740,7 +744,7 @@ fn min_max_cross_type_threshold_rejected() {
             agg: agg_max,
         }])],
     );
-    let mut sm2 = CepStateMachine::new("rule35b".to_string(), plan2);
+    let mut sm2 = CepStateMachine::new("rule35b".to_string(), plan2, None);
 
     let e2 = event(vec![("sip", str_val("10.0.0.1")), ("score", num(999.0))]);
     for _ in 0..5 {

@@ -57,7 +57,7 @@ windows:
   - windows/security.wfs
 rules:
   - rules/brute_scan.wfl
-runtime: runtime/fusion.toml
+runtime: runtime/wfusion.toml
 ```
 
 ### 3.3 设计约束

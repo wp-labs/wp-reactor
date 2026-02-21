@@ -1,6 +1,6 @@
 //! M15 close step / timeout tests (12–21).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use wf_lang::ast::{CmpOp, Expr, FieldSelector, Measure};
 use wf_lang::plan::{AggPlan, BranchPlan};
@@ -9,6 +9,8 @@ use crate::rule::match_engine::{CepStateMachine, CloseReason, StepResult};
 
 use super::helpers::*;
 
+const NANOS_PER_SEC: i64 = 1_000_000_000;
+
 #[test]
 fn no_close_steps_preserves_m14() {
     // Empty close_steps → advance() returns Matched (backward compat)
@@ -16,7 +18,7 @@ fn no_close_steps_preserves_m14() {
         vec![simple_key("sip")],
         vec![step(vec![branch("fail", count_ge(2.0))])],
     );
-    let mut sm = CepStateMachine::new("rule12".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule12".to_string(), plan, None);
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
 
     assert_eq!(sm.advance("fail", &e), StepResult::Accumulate);
@@ -50,18 +52,18 @@ fn close_missing_detection() {
         }])],
         Duration::from_secs(60),
     );
-    let mut sm = CepStateMachine::new("rule13".to_string(), plan);
-    let now = Instant::now();
+    let mut sm = CepStateMachine::new("rule13".to_string(), plan, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
 
     // Send a request → event step completes, returns Advance (not Matched, close steps present)
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
-    let result = sm.advance_with_instant("req", &req, now);
+    let result = sm.advance_at("req", &req, base);
     assert_eq!(result, StepResult::Advance);
     assert_eq!(sm.instance_count(), 1);
 
     // No response arrives. Timeout triggers close.
-    let close_time = now + Duration::from_secs(61);
-    let expired = sm.scan_expired(close_time);
+    let close_time = base + 61 * NANOS_PER_SEC;
+    let expired = sm.scan_expired_at(close_time);
     assert_eq!(expired.len(), 1);
 
     let out = &expired[0];
@@ -84,23 +86,23 @@ fn maxspan_expiry_resets() {
         vec![],
         Duration::from_secs(30),
     );
-    let mut sm = CepStateMachine::new("rule14".to_string(), plan);
-    let now = Instant::now();
+    let mut sm = CepStateMachine::new("rule14".to_string(), plan, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
 
     // Create an instance
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
-    sm.advance_with_instant("fail", &e, now);
+    sm.advance_at("fail", &e, base);
     assert_eq!(sm.instance_count(), 1);
 
     // Scan before expiry — nothing removed
-    let before = now + Duration::from_secs(29);
-    let expired = sm.scan_expired(before);
+    let before = base + 29 * NANOS_PER_SEC;
+    let expired = sm.scan_expired_at(before);
     assert!(expired.is_empty());
     assert_eq!(sm.instance_count(), 1);
 
     // Scan after expiry — instance removed
-    let after = now + Duration::from_secs(31);
-    let expired = sm.scan_expired(after);
+    let after = base + 31 * NANOS_PER_SEC;
+    let expired = sm.scan_expired_at(after);
     assert_eq!(expired.len(), 1);
     assert_eq!(expired[0].close_reason, CloseReason::Timeout);
     assert!(!expired[0].event_ok); // event steps not complete
@@ -117,25 +119,25 @@ fn on_close_trigger_eval() {
         vec![step(vec![branch("resp", count_ge(2.0))])],
         Duration::from_secs(60),
     );
-    let mut sm = CepStateMachine::new("rule15".to_string(), plan);
-    let now = Instant::now();
+    let mut sm = CepStateMachine::new("rule15".to_string(), plan, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
 
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
     let resp = event(vec![("sip", str_val("10.0.0.1"))]);
 
     // req → Advance (event step done)
     assert_eq!(
-        sm.advance_with_instant("req", &req, now),
+        sm.advance_at("req", &req, base),
         StepResult::Advance
     );
 
     // 2 resp events → accumulate close step data
     assert_eq!(
-        sm.advance_with_instant("resp", &resp, now),
+        sm.advance_at("resp", &resp, base),
         StepResult::Accumulate
     );
     assert_eq!(
-        sm.advance_with_instant("resp", &resp, now),
+        sm.advance_at("resp", &resp, base),
         StepResult::Accumulate
     );
 
@@ -169,12 +171,12 @@ fn close_on_incomplete_instance() {
         }])],
         Duration::from_secs(60),
     );
-    let mut sm = CepStateMachine::new("rule16".to_string(), plan);
-    let now = Instant::now();
+    let mut sm = CepStateMachine::new("rule16".to_string(), plan, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
 
     // One event — event step not yet satisfied (needs 5)
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
-    sm.advance_with_instant("fail", &e, now);
+    sm.advance_at("fail", &e, base);
     assert_eq!(sm.instance_count(), 1);
 
     // Close — event_ok=false, close_ok=true (resp count == 0 is true)
@@ -205,16 +207,16 @@ fn close_step_accumulation() {
         }])],
         Duration::from_secs(60),
     );
-    let mut sm = CepStateMachine::new("rule17".to_string(), plan);
-    let now = Instant::now();
+    let mut sm = CepStateMachine::new("rule17".to_string(), plan, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
 
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
-    sm.advance_with_instant("req", &req, now);
+    sm.advance_at("req", &req, base);
 
     // Accumulate traffic
     let mk = |bytes: f64| event(vec![("sip", str_val("10.0.0.1")), ("bytes", num(bytes))]);
-    sm.advance_with_instant("traffic", &mk(400.0), now);
-    sm.advance_with_instant("traffic", &mk(700.0), now);
+    sm.advance_at("traffic", &mk(400.0), base);
+    sm.advance_at("traffic", &mk(700.0), base);
 
     // Close: sum = 1100 >= 1000 → close_ok
     let out = sm
@@ -248,18 +250,18 @@ fn close_reason_guard_filters() {
     );
 
     // Scenario 1: close with Timeout → guard passes → close_ok
-    let mut sm1 = CepStateMachine::new("rule18a".to_string(), plan.clone());
-    let now = Instant::now();
+    let mut sm1 = CepStateMachine::new("rule18a".to_string(), plan.clone(), None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
-    sm1.advance_with_instant("req", &req, now);
+    sm1.advance_at("req", &req, base);
     let out1 = sm1
         .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
         .unwrap();
     assert!(out1.close_ok);
 
     // Scenario 2: close with Flush → guard fails → close_ok=false
-    let mut sm2 = CepStateMachine::new("rule18b".to_string(), plan);
-    sm2.advance_with_instant("req", &req, now);
+    let mut sm2 = CepStateMachine::new("rule18b".to_string(), plan, None);
+    sm2.advance_at("req", &req, base);
     let out2 = sm2
         .close(&[str_val("10.0.0.1")], CloseReason::Flush)
         .unwrap();
@@ -274,27 +276,27 @@ fn scan_expired_only_removes_expired() {
         vec![],
         Duration::from_secs(60),
     );
-    let mut sm = CepStateMachine::new("rule19".to_string(), plan);
-    let now = Instant::now();
+    let mut sm = CepStateMachine::new("rule19".to_string(), plan, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
 
     // Create two instances at different times
     let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
     let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
-    sm.advance_with_instant("fail", &e1, now);
-    sm.advance_with_instant("fail", &e2, now + Duration::from_secs(40));
+    sm.advance_at("fail", &e1, base);
+    sm.advance_at("fail", &e2, base + 40 * NANOS_PER_SEC);
     assert_eq!(sm.instance_count(), 2);
 
-    // At now+61: only first instance is expired (created at now, 61s ago)
-    // Second instance was created at now+40, only 21s ago → not expired
-    let scan_time = now + Duration::from_secs(61);
-    let expired = sm.scan_expired(scan_time);
+    // At base+61s: only first instance is expired (created at base, 61s ago)
+    // Second instance was created at base+40s, only 21s ago → not expired
+    let scan_time = base + 61 * NANOS_PER_SEC;
+    let expired = sm.scan_expired_at(scan_time);
     assert_eq!(expired.len(), 1);
     assert_eq!(expired[0].scope_key, vec![str_val("10.0.0.1")]);
     assert_eq!(sm.instance_count(), 1);
 
-    // At now+101: second instance now expired too (created at now+40, 61s ago)
-    let scan_time2 = now + Duration::from_secs(101);
-    let expired2 = sm.scan_expired(scan_time2);
+    // At base+101s: second instance now expired too (created at base+40s, 61s ago)
+    let scan_time2 = base + 101 * NANOS_PER_SEC;
+    let expired2 = sm.scan_expired_at(scan_time2);
     assert_eq!(expired2.len(), 1);
     assert_eq!(expired2[0].scope_key, vec![str_val("10.0.0.2")]);
     assert_eq!(sm.instance_count(), 0);
@@ -308,11 +310,11 @@ fn close_removes_instance() {
         vec![step(vec![branch("resp", count_ge(0.0))])],
         Duration::from_secs(60),
     );
-    let mut sm = CepStateMachine::new("rule20".to_string(), plan);
-    let now = Instant::now();
+    let mut sm = CepStateMachine::new("rule20".to_string(), plan, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
 
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
-    sm.advance_with_instant("req", &req, now);
+    sm.advance_at("req", &req, base);
     assert_eq!(sm.instance_count(), 1);
 
     // Close removes the instance
@@ -351,14 +353,14 @@ fn multiple_close_steps_all_must_pass() {
         Duration::from_secs(60),
     );
 
-    let now = Instant::now();
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
     let req = event(vec![("sip", str_val("10.0.0.1"))]);
     let resp = event(vec![("sip", str_val("10.0.0.1"))]);
 
     // Scenario A: resp arrives, no error → both close steps pass
-    let mut sm_a = CepStateMachine::new("rule21a".to_string(), plan.clone());
-    sm_a.advance_with_instant("req", &req, now);
-    sm_a.advance_with_instant("resp", &resp, now);
+    let mut sm_a = CepStateMachine::new("rule21a".to_string(), plan.clone(), None);
+    sm_a.advance_at("req", &req, base);
+    sm_a.advance_at("resp", &resp, base);
     let out_a = sm_a
         .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
         .unwrap();
@@ -366,8 +368,8 @@ fn multiple_close_steps_all_must_pass() {
     assert!(out_a.close_ok);
 
     // Scenario B: no resp → close step 1 fails (count 0 < 1)
-    let mut sm_b = CepStateMachine::new("rule21b".to_string(), plan.clone());
-    sm_b.advance_with_instant("req", &req, now);
+    let mut sm_b = CepStateMachine::new("rule21b".to_string(), plan.clone(), None);
+    sm_b.advance_at("req", &req, base);
     let out_b = sm_b
         .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
         .unwrap();
@@ -375,11 +377,11 @@ fn multiple_close_steps_all_must_pass() {
     assert!(!out_b.close_ok);
 
     // Scenario C: resp arrives + error arrives → close step 2 fails (error count 1 != 0)
-    let mut sm_c = CepStateMachine::new("rule21c".to_string(), plan);
-    sm_c.advance_with_instant("req", &req, now);
-    sm_c.advance_with_instant("resp", &resp, now);
+    let mut sm_c = CepStateMachine::new("rule21c".to_string(), plan, None);
+    sm_c.advance_at("req", &req, base);
+    sm_c.advance_at("resp", &resp, base);
     let err = event(vec![("sip", str_val("10.0.0.1"))]);
-    sm_c.advance_with_instant("error", &err, now);
+    sm_c.advance_at("error", &err, base);
     let out_c = sm_c
         .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
         .unwrap();

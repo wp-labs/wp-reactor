@@ -297,7 +297,7 @@ warp-fusion/
 │           └── limits.rs           # 常量: channel 容量、默认窗口大小
 │
 ├── config/                         # 配置示例
-│   ├── fusion.toml                 # 主配置文件（运行时物理参数）
+│   ├── wfusion.toml                 # 主配置文件（运行时物理参数）
 │   ├── schemas/
 │   │   └── security.wfs             # Window Schema 文件
 │   └── rules/
@@ -448,7 +448,7 @@ struct Subscription {
 ```
                          ┌─────────────────────────────────┐
                          │         BOOT 阶段                │
-                         │   .wfs + fusion.toml → 订阅表    │
+                         │   .wfs + wfusion.toml → 订阅表    │
                          └───────────────┬─────────────────┘
                                          │
                                          ▼
@@ -480,7 +480,7 @@ Router 和 Scheduler 并行消费同一帧数据：Router 负责将 batch 写入
 #### 4.2.2 启动阶段：订阅表构建
 
 ```
-.wfs 定义:                             fusion.toml 配置:
+.wfs 定义:                             wfusion.toml 配置:
 ┌──────────────────────┐              ┌─────────────────────┐
 │ window auth_events { │              │ [window.auth_events] │
 │   stream = "syslog"  │              │ mode = "local"       │
@@ -495,7 +495,7 @@ Router 和 Scheduler 并行消费同一帧数据：Router 负责将 batch 写入
 │  WindowSchema + WindowConfig → WindowDef {              │
 │    params:  { name: "auth_events", schema, over, ... }  │
 │    streams: ["syslog"],         ← 来自 .wfs             │
-│    config:  { mode: Local, ... } ← 来自 fusion.toml     │
+│    config:  { mode: Local, ... } ← 来自 wfusion.toml     │
 │  }                                                      │
 └────────────────────────┬───────────────────────────────┘
                          │
@@ -858,7 +858,7 @@ TaskGroup: maintenance
 
 ## 6. 配置设计
 
-### 6.1 主配置 fusion.toml
+### 6.1 主配置 wfusion.toml
 
 三文件架构下，TOML 仅负责**运行时物理参数**。数据 schema 在 `.wfs` 文件中定义，检测逻辑在 `.wfl` 文件中定义。
 
@@ -1128,7 +1128,7 @@ retry_max_interval = "30s"                        # 最大重试间隔
 |------|------|--------|------|
 | **P0** | wf-arrow: schema 映射 + 行列转换 + IPC 编解码 | wf-arrow crate 可用 | 无 |
 | **P1** | wp-motor: 新增 Arrow IPC Sink | WarpParse 可输出 Arrow IPC | P0 |
-| **P1** | wf-config: RulePack + conformance + reliability 配置解析 | fusion.toml/pack.yaml 可加载 | 无 |
+| **P1** | wf-config: RulePack + conformance + reliability 配置解析 | wfusion.toml/pack.yaml 可加载 | 无 |
 | **P2** | wf-core/window: Window + WindowRegistry + Router | 能接收多流、按订阅声明路由并缓存 | P0, P1-config |
 | **P3** | wf-core/rule: Loader + Executor(Core IR) | 支持 `join snapshot/asof` + `yield@vN` | P2 |
 | **P3** | runtime: Receiver + Scheduler + Lifecycle | 主进程可运行 | P2, P3-rule |

@@ -17,8 +17,8 @@ M05 Sink 断连重连     ✅   M10 Router + Evictor  ✅
 阶段 IV ─ 执行引擎        阶段 V ─ 运行时与闭环       阶段 VI ─ 生产化
 M14 MatchEngine CEP   ✅   M17 Receiver          ✅   M21 热加载
 M15 缺失检测+超时     ✅   M18 Scheduler+Lifecycle ✅  M22 多通道告警+去重
-M16 RuleExecutor+join       M19 告警系统           ✅   M23 监控+性能
-                            M20 ★ E2E MVP 验收    ✅   M24 开发者工具链
+M15a CEP 事件时间语义       M19 告警系统           ✅   M23 监控+性能
+M16 RuleExecutor+join       M20 ★ E2E MVP 验收    ✅   M24 开发者工具链
 
 阶段 VII ─ WFL L2         阶段 VIII ─ L3+Conformance   阶段 IX ─ 可靠性分级   阶段 X ─ 分布式
 M25 join+baseline+has      M27 tumble+conv+pattern      M29 传输可靠性三档      M30 分布式 V2
@@ -93,9 +93,9 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-config` |
-| 范围 | fusion.toml 完整解析：`[server]`/`[runtime]`/`[window_defaults]`/`[window.*]`/`[alert]`；over vs over_cap 校验（不满足报错拒绝启动）；配置默认值继承（window 级覆盖 defaults） |
+| 范围 | wfusion.toml 完整解析：`[server]`/`[runtime]`/`[window_defaults]`/`[window.*]`/`[alert]`；over vs over_cap 校验（不满足报错拒绝启动）；配置默认值继承（window 级覆盖 defaults） |
 | 依赖 | 无（可与 M01-M05 并行） |
-| 验收 | fusion.toml 示例加载成功；非法配置报错测试（over > over_cap、缺失必填项） |
+| 验收 | wfusion.toml 示例加载成功；非法配置报错测试（over > over_cap、缺失必填项） |
 | 状态 | **已完成** — `wf-config/src/fusion.rs` 实现 |
 
 ### M07：Window Schema (.wfs) 解析器 ✅
@@ -196,6 +196,15 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 验收 | A → NOT B 缺失检测场景（请求无响应）；maxspan 过期自动重置测试；on close 触发求值测试；close_reason guard 过滤测试 |
 | 状态 | **已完成** — `CloseReason`/`CloseOutput` 类型 + `close()`/`scan_expired()` API，10 项新测试通过（共 21 项） |
 
+### M15a：CEP 事件时间语义
+
+| 项目 | 内容 |
+|------|------|
+| crate | `wf-core/rule` + `wf-runtime` |
+| 范围 | 将 CEP 状态机的实例生命周期从 processing-time（`Instant::now()`）切换为 event-time（事件时间戳）。具体改动：① `Instance.created_at` 从 `Instant` 改为事件时间戳（`i64` nanos 或 `DateTime<Utc>`），记录首个事件的时间戳；② `maxspan` 过期判定改为 `event.timestamp - instance.created_at > maxspan`；③ `scan_expired(now: Instant)` 改为 `scan_expired(watermark: DateTime)` 基于 watermark 判定过期；④ Scheduler 的 `scan_timeouts()` 传递当前 watermark 而非 `Instant::now()`；⑤ `advance()` 默认从 event 中提取时间戳而非调用 `Instant::now()` |
+| 依赖 | M15 |
+| 验收 | 现有 21 项 CEP 测试全部适配通过（使用事件时间戳替代 Instant）；datagen e2e 测试中 `verify()` 从 entity-level 提升到 per-alert 精确匹配（oracle 时间与引擎时间一致）；乱序事件下 maxspan 判定正确（事件时间乱序不导致误过期） |
+
 ### M16：RuleExecutor + DataFusion join
 
 | 项目 | 内容 |
@@ -243,10 +252,10 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 
 | 项目 | 内容 |
 |------|------|
-| 范围 | **集成验收**：wp-motor 发送模拟日志 → TCP + Arrow IPC 传输 → WarpFusion 接收 → brute_force_then_scan 规则触发 → 告警写入文件；CLI 启动命令（`wf run -c fusion.toml`） |
+| 范围 | **集成验收**：wp-motor 发送模拟日志 → TCP + Arrow IPC 传输 → WarpFusion 接收 → brute_force_then_scan 规则触发 → 告警写入文件；CLI 启动命令（`warp-fusion run -c wfusion.toml`） |
 | 依赖 | M05, M06, M07, M13, M18, M19（全链路） |
 | 验收 | **单机 MVP 达成**：一条完整 L1 规则从数据接收到告警输出全流程跑通；可作为独立进程启动运行 |
-| 状态 | **已完成** — `e2e_brute_force_alert` 集成测试跑通完整链路（TCP 接收 → Arrow IPC 解码 → Router 路由 → Scheduler 分发 → CEP 匹配 → 告警写入文件）；CLI `cargo run -p wf-cli -- run -c examples/fusion.toml` 正常启动并监听 `127.0.0.1:9800`，SIGTERM 优雅关闭 |
+| 状态 | **已完成** — `e2e_brute_force_alert` 集成测试跑通完整链路（TCP 接收 → Arrow IPC 解码 → Router 路由 → Scheduler 分发 → CEP 匹配 → 告警写入文件）；CLI `cargo run -p wf-cli -- run -c examples/wfusion.toml` 正常启动并监听 `127.0.0.1:9800`，SIGTERM 优雅关闭 |
 
 ---
 
@@ -412,11 +421,11 @@ M01→M02→M03→M04→M05     M06 ─────┐              M11→M12→
                          M01┘
 
                     阶段 IV              阶段 V
-                    M14→M15              M17→┐
-                      ↑  ↓               M18→┤ M20 ★ MVP
-                    M13┘ M16             M19→┘
-                         ↑                 ↑
-                    M08,M14┘          全链路┘
+                    M14→M15→M15a        M17→┐
+                      ↑     ↓            M18→┤ M20 ★ MVP
+                    M13┘   M16          M19→┘
+                            ↑                 ↑
+                       M08,M14┘          全链路┘
 
         阶段 VI                  阶段 VII         阶段 VIII        IX      X
         M21─┐                    M25→M26           M27→M28 ──→ M29
@@ -439,7 +448,7 @@ wf-datagen: M31 ✅; M32 ✅; M33 ✅; verify 端到端需 M20 汇合
 M20 MVP 已完成，下一步两条路径可并行推进：
 
 ```
-轨道 A（执行引擎补全）  M16（DataFusion join）
+轨道 A（执行引擎补全）  M15a（CEP 事件时间语义）→ M16（DataFusion join）
                               │
 轨道 B（生产化）         M21 → M22 → M23 → M24
                               ↑
@@ -454,7 +463,7 @@ M20 MVP 已完成，下一步两条路径可并行推进：
 | **I 数据基建** | M01–M05 | wp-motor 能通过 Arrow IPC 完成基础（best_effort）传输 | ✅ 已完成 |
 | **II 配置与窗口** | M06–M10 | 配置可加载、Window 能接收路由并缓存数据 | ✅ 已完成 |
 | **III WFL 编译器** | M11–M13 | .wfs + .wfl 编译为 RulePlan | ✅ 已完成 |
-| **IV 执行引擎** | M14–M16 | CEP 状态机 + DataFusion join 可执行 | M14–M15 ✅ / M16 待开始 |
+| **IV 执行引擎** | M14–M16 | CEP 状态机 + 事件时间语义 + DataFusion join 可执行 | M14–M15 ✅ / M15a, M16 待开始 |
 | **V 运行时闭环** | M17–M20 | **单机 MVP：数据接收→规则执行→告警输出** | ✅ 已完成 |
 | **VI 生产化** | M21–M24 | 热加载、多通道告警、监控、工具链 | 进行中（M24 部分完成） |
 | **VII L2 增强** | M25–M26 | snapshot/asof / baseline / key 映射 / limits / 条件表达式 / yield@vN | 待开始 |

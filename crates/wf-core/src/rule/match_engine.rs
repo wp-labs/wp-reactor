@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
 use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, FieldSelector, Measure, Transform};
 use wf_lang::plan::{AggPlan, MatchPlan, StepPlan, WindowSpec};
@@ -46,6 +45,7 @@ pub struct MatchedContext {
     pub rule_name: String,
     pub scope_key: Vec<Value>,
     pub step_data: Vec<StepData>,
+    pub event_time_nanos: i64,
 }
 
 /// Per-step snapshot captured when a step is satisfied.
@@ -88,6 +88,7 @@ pub struct CloseOutput {
     pub close_ok: bool,
     pub event_step_data: Vec<StepData>,
     pub close_step_data: Vec<StepData>,
+    pub watermark_nanos: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +140,7 @@ impl StepState {
 #[derive(Debug, Clone)]
 struct Instance {
     scope_key: Vec<Value>,
-    created_at: Instant,
+    created_at: i64,
     current_step: usize,
     event_ok: bool,
     step_states: Vec<StepState>,
@@ -148,7 +149,7 @@ struct Instance {
 }
 
 impl Instance {
-    fn new(plan: &MatchPlan, scope_key: Vec<Value>, now: Instant) -> Self {
+    fn new(plan: &MatchPlan, scope_key: Vec<Value>, now_nanos: i64) -> Self {
         let step_states = plan
             .event_steps
             .iter()
@@ -161,7 +162,7 @@ impl Instance {
             .collect();
         Self {
             scope_key,
-            created_at: now,
+            created_at: now_nanos,
             current_step: 0,
             event_ok: false,
             step_states,
@@ -170,8 +171,8 @@ impl Instance {
         }
     }
 
-    fn reset(&mut self, plan: &MatchPlan, now: Instant) {
-        self.created_at = now;
+    fn reset(&mut self, plan: &MatchPlan, now_nanos: i64) {
+        self.created_at = now_nanos;
         self.current_step = 0;
         self.event_ok = false;
         self.step_states = plan
@@ -202,30 +203,49 @@ pub struct CepStateMachine {
     rule_name: String,
     plan: MatchPlan,
     instances: HashMap<String, Instance>,
+    time_field: Option<String>,
+    watermark_nanos: i64,
 }
 
 impl CepStateMachine {
     /// Create a new state machine for the given rule + plan.
-    pub fn new(rule_name: String, plan: MatchPlan) -> Self {
+    pub fn new(rule_name: String, plan: MatchPlan, time_field: Option<String>) -> Self {
         Self {
             rule_name,
             plan,
             instances: HashMap::new(),
+            time_field,
+            watermark_nanos: 0,
         }
     }
 
     /// Feed one event (arriving on `alias`) into the state machine.
     ///
-    /// Returns [`StepResult::Matched`] when all steps are satisfied,
-    /// [`StepResult::Advance`] when a step boundary is crossed,
-    /// or [`StepResult::Accumulate`] otherwise.
+    /// Extracts event time from the configured `time_field`, falling back to 0.
     pub fn advance(&mut self, alias: &str, event: &Event) -> StepResult {
-        self.advance_with_instant(alias, event, Instant::now())
+        let event_nanos = self.extract_event_time(event);
+        self.advance_at(alias, event, event_nanos)
     }
 
-    /// Same as [`advance`](Self::advance) but accepts an explicit `now` timestamp
-    /// (useful for testing without real clocks).
-    pub fn advance_with_instant(&mut self, alias: &str, event: &Event, now: Instant) -> StepResult {
+    /// Extract event time from the event using the configured time_field.
+    fn extract_event_time(&self, event: &Event) -> i64 {
+        self.time_field
+            .as_ref()
+            .and_then(|tf| event.fields.get(tf))
+            .and_then(|v| match v {
+                Value::Number(n) => Some(*n as i64),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    /// Feed one event with an explicit event-time timestamp (nanoseconds since epoch).
+    pub fn advance_at(&mut self, alias: &str, event: &Event, now_nanos: i64) -> StepResult {
+        // Update watermark
+        if now_nanos > self.watermark_nanos {
+            self.watermark_nanos = now_nanos;
+        }
+
         // 1. Extract scope key from event
         let scope_key = match extract_key(event, &self.plan.keys) {
             Some(k) => k,
@@ -238,7 +258,7 @@ impl CepStateMachine {
         let instance = self
             .instances
             .entry(instance_key)
-            .or_insert_with(|| Instance::new(plan, scope_key.clone(), now));
+            .or_insert_with(|| Instance::new(plan, scope_key.clone(), now_nanos));
 
         // 3. Accumulate close steps (if any) — happens on every event
         if !plan.close_steps.is_empty() {
@@ -282,8 +302,9 @@ impl CepStateMachine {
                             rule_name: self.rule_name.clone(),
                             scope_key,
                             step_data: instance.completed_steps.clone(),
+                            event_time_nanos: now_nanos,
                         };
-                        instance.reset(plan, now);
+                        instance.reset(plan, now_nanos);
                         StepResult::Matched(ctx)
                     } else {
                         // Close steps present → mark event_ok, keep accumulating
@@ -319,28 +340,45 @@ impl CepStateMachine {
             &self.plan,
             instance,
             reason,
+            self.watermark_nanos,
         ))
     }
 
-    /// Scan all instances for maxspan expiry.
+    /// Scan all instances for maxspan expiry using the internal watermark.
     ///
-    /// Removes expired instances and returns a [`CloseOutput`] for each.
-    pub fn scan_expired(&mut self, now: Instant) -> Vec<CloseOutput> {
+    /// Used by the scheduler on periodic ticks.
+    pub fn scan_expired(&mut self) -> Vec<CloseOutput> {
+        self.scan_expired_at(self.watermark_nanos)
+    }
+
+    /// Scan all instances for maxspan expiry using an explicit watermark.
+    ///
+    /// Used by the oracle and tests.
+    ///
+    /// Each expired instance's close output uses `created_at + maxspan` as its
+    /// watermark (the logical expiry time), rather than the detection-time
+    /// watermark. This makes `fired_at` deterministic regardless of batch size
+    /// or scan frequency.
+    pub fn scan_expired_at(&mut self, watermark_nanos: i64) -> Vec<CloseOutput> {
         let WindowSpec::Sliding(maxspan) = self.plan.window_spec;
+        let maxspan_nanos = maxspan.as_nanos() as i64;
         let mut expired_keys = Vec::new();
         for (key, inst) in &self.instances {
-            if now.saturating_duration_since(inst.created_at) >= maxspan {
+            if watermark_nanos.saturating_sub(inst.created_at) >= maxspan_nanos {
                 expired_keys.push(key.clone());
             }
         }
         let mut results = Vec::with_capacity(expired_keys.len());
         for key in expired_keys {
             if let Some(instance) = self.instances.remove(&key) {
+                // Use the instance's logical expiry time for deterministic fired_at
+                let expire_time = instance.created_at + maxspan_nanos;
                 results.push(evaluate_close(
                     &self.rule_name,
                     &self.plan,
                     instance,
                     CloseReason::Timeout,
+                    expire_time,
                 ));
             }
         }
@@ -360,10 +398,16 @@ impl CepStateMachine {
                     &self.plan,
                     instance,
                     reason,
+                    self.watermark_nanos,
                 ));
             }
         }
         results
+    }
+
+    /// Current watermark (nanoseconds since epoch).
+    pub fn watermark_nanos(&self) -> i64 {
+        self.watermark_nanos
     }
 }
 
@@ -1113,6 +1157,7 @@ fn evaluate_close(
     plan: &MatchPlan,
     instance: Instance,
     reason: CloseReason,
+    watermark_nanos: i64,
 ) -> CloseOutput {
     let (close_ok, close_step_data) =
         evaluate_close_steps(&plan.close_steps, &instance.close_step_states, reason);
@@ -1124,5 +1169,6 @@ fn evaluate_close(
         close_ok,
         event_step_data: instance.completed_steps,
         close_step_data,
+        watermark_nanos,
     }
 }

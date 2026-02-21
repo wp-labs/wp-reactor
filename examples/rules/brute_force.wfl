@@ -1,24 +1,24 @@
 use "security.wfs"
 
 rule brute_force_then_scan {
-    events {
-        fail : auth_events && action == "failed"
+  events {
+    fail : auth_events && action == "failed"
+  }
+
+  match<sip:5m> {
+    on event {
+      fail | count >= $FAIL_THRESHOLD;
     }
+    on close {
+      fail | count >= 1;
+    }
+  } -> score(70.0)
 
-    match<sip:5m> {
-        on event {
-            fail | count >= $FAIL_THRESHOLD;
-        }
-        on close {
-            fail | count >= 1;
-        }
-    } -> score(70.0)
+  entity(ip, fail.sip)
 
-    entity(ip, fail.sip)
-
-    yield security_alerts (
-        sip = fail.sip,
-        fail_count = count(fail),
-        message = fmt("{} brute force detected", fail.sip)
-    )
+  yield security_alerts (
+    sip = fail.sip,
+    fail_count = count(fail),
+    message = fmt("{} brute force detected", fail.sip)
+  )
 }

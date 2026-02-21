@@ -1,5 +1,4 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 
@@ -43,7 +42,7 @@ impl RuleExecutor {
 
         let score = eval_score(&self.plan.score_plan.expr, &ctx)?;
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, &ctx)?;
-        let fired_at = format_fired_at(SystemTime::now());
+        let fired_at = format_nanos_utc(matched.event_time_nanos);
         let alert_id = build_alert_id(&self.plan.name, &matched.scope_key, &fired_at);
         let summary = build_summary(
             &self.plan.name,
@@ -88,7 +87,7 @@ impl RuleExecutor {
         let score = eval_score(&self.plan.score_plan.expr, &ctx)?;
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, &ctx)?;
         let close_reason_str = close.close_reason.as_str().to_string();
-        let fired_at = format_fired_at(SystemTime::now());
+        let fired_at = format_nanos_utc(close.watermark_nanos);
         let alert_id = build_alert_id(&self.plan.name, &close.scope_key, &fired_at);
         let summary = build_summary(
             &self.plan.name,
@@ -169,14 +168,16 @@ fn eval_entity_id(expr: &wf_lang::ast::Expr, ctx: &Event) -> Result<String> {
     }
 }
 
-/// Format `SystemTime` as ISO 8601 UTC string without `chrono`.
+/// Format nanoseconds since epoch as ISO 8601 UTC string.
 ///
-/// Uses the Hinnant civil-from-days algorithm to convert days since
-/// UNIX epoch to (year, month, day).
-pub(crate) fn format_fired_at(t: SystemTime) -> String {
-    let dur = t.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let total_secs = dur.as_secs();
-    let millis = dur.subsec_millis();
+/// Reuses the Hinnant civil-from-days algorithm. For `nanos <= 0`
+/// returns the epoch string.
+pub(crate) fn format_nanos_utc(nanos: i64) -> String {
+    if nanos <= 0 {
+        return "1970-01-01T00:00:00.000Z".to_string();
+    }
+    let total_secs = (nanos / 1_000_000_000) as u64;
+    let millis = ((nanos % 1_000_000_000) / 1_000_000) as u32;
 
     let secs_of_day = total_secs % 86400;
     let days_since_epoch = (total_secs / 86400) as i64;
