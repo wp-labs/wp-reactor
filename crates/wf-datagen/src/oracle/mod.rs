@@ -108,17 +108,17 @@ pub fn run_oracle(
                     .sm
                     .advance_with_instant(bind_alias, &core_event, synthetic_now);
 
-                if let StepResult::Matched(ctx) = result {
-                    if let Ok(alert_record) = engine.executor.execute_match(&ctx) {
-                        alerts.push(OracleAlert {
-                            rule_name: alert_record.rule_name,
-                            score: alert_record.score,
-                            entity_type: alert_record.entity_type,
-                            entity_id: alert_record.entity_id,
-                            close_reason: None,
-                            emit_time: event.timestamp.to_rfc3339(),
-                        });
-                    }
+                if let StepResult::Matched(ctx) = result
+                    && let Ok(alert_record) = engine.executor.execute_match(&ctx)
+                {
+                    alerts.push(OracleAlert {
+                        rule_name: alert_record.rule_name,
+                        score: alert_record.score,
+                        entity_type: alert_record.entity_type,
+                        entity_id: alert_record.entity_id,
+                        close_reason: None,
+                        emit_time: event.timestamp.to_rfc3339(),
+                    });
                 }
             }
         }

@@ -231,7 +231,7 @@ fn main() -> anyhow::Result<()> {
                     .scenario
                     .oracle
                     .as_ref()
-                    .map(|o| extract_oracle_tolerances(o))
+                    .map(extract_oracle_tolerances)
                     .unwrap_or_default();
                 let meta_file = out.join(format!("{}.oracle.meta.json", wfg.scenario.name));
                 let meta_json = serde_json::to_string_pretty(&tolerances)?;
@@ -544,12 +544,12 @@ fn parse_bench_duration(s: &str) -> anyhow::Result<std::time::Duration> {
         anyhow::bail!("empty duration string");
     }
 
-    let (num_str, suffix) = if s.ends_with('s') {
-        (&s[..s.len() - 1], "s")
-    } else if s.ends_with('m') {
-        (&s[..s.len() - 1], "m")
-    } else if s.ends_with('h') {
-        (&s[..s.len() - 1], "h")
+    let (num_str, suffix) = if let Some(stripped) = s.strip_suffix('s') {
+        (stripped, "s")
+    } else if let Some(stripped) = s.strip_suffix('m') {
+        (stripped, "m")
+    } else if let Some(stripped) = s.strip_suffix('h') {
+        (stripped, "h")
     } else {
         // Assume seconds if no suffix
         (s, "s")

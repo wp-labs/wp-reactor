@@ -1,22 +1,21 @@
-/// Domain-aware logging macros.
-///
-/// Each macro injects a `domain` field automatically so callers never need to
-/// remember the string literal.  The domain value is one of the five defined in
-/// `docs/design/logging-spec.md`: `sys`, `conn`, `pipe`, `res`, `conf`.
-///
-/// # Usage
-///
-/// ```ignore
-/// use crate::log_macros::*;
-///
-/// wf_info!(sys, schemas = 1, rules = 2, "engine bootstrap complete");
-/// wf_warn!(pipe, error = %e, "execute_match error");
-/// wf_debug!(conn, peer = %peer, "accepted connection");
-/// ```
-///
-/// The macros accept any tracing-compatible field syntax after the domain
-/// identifier.  The domain identifier is **not** a string — it is a bare
-/// identifier that the macro converts to a `&str` literal.
+//! Domain-aware logging macros.
+//!
+//! Each macro injects a `domain` field automatically so callers never need to
+//! remember the string literal.  The domain value is one of the five defined in
+//! `docs/design/logging-spec.md`: `sys`, `conn`, `pipe`, `res`, `conf`.
+//!
+//! # Usage
+//!
+//! ```ignore
+//! use crate::log_macros::*;
+//!
+//! wf_info!(sys, schemas = 1, rules = 2, "engine bootstrap complete");
+//! wf_warn!(pipe, error = %e, "execute_match error");
+//! wf_debug!(conn, peer = %peer, "accepted connection");
+//! ```
+//! The macros accept any tracing-compatible field syntax after the domain
+//! identifier.  The domain identifier is **not** a string — it is a bare
+//! identifier that the macro converts to a `&str` literal.
 
 // ---------------------------------------------------------------------------
 // Core macro — dispatches to the matching tracing level macro.

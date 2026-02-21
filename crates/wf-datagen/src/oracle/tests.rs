@@ -246,7 +246,14 @@ fn sc7_uninjected_rule_skipped() {
     // With injected_rules containing "brute_force" → alert generated
     let injected: std::collections::HashSet<String> =
         ["brute_force".to_string()].into_iter().collect();
-    let result = run_oracle(&events, &[plan.clone()], &start, &duration, Some(&injected)).unwrap();
+    let result = run_oracle(
+        &events,
+        std::slice::from_ref(&plan),
+        &start,
+        &duration,
+        Some(&injected),
+    )
+    .unwrap();
     assert_eq!(result.alerts.len(), 1);
 
     // With injected_rules NOT containing "brute_force" → no alert (SC7)

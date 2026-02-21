@@ -735,7 +735,7 @@ mod tests {
                     },
                     FieldOverride {
                         field_name: "score".into(),
-                        gen_expr: GenExpr::NumberLit(3.14),
+                        gen_expr: GenExpr::NumberLit(3.21),
                     },
                     FieldOverride {
                         field_name: "addr".into(),

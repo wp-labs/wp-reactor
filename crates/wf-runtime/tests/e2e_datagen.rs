@@ -156,10 +156,10 @@ fn build_arrow_column(
                 .map(|e| {
                     // First try: the field is a timestamp string in the JSON fields
                     if let Some(v) = e.fields.get(name) {
-                        if let Some(s) = v.as_str() {
-                            if let Ok(dt) = s.parse::<DateTime<Utc>>() {
-                                return dt.timestamp_nanos_opt();
-                            }
+                        if let Some(s) = v.as_str()
+                            && let Ok(dt) = s.parse::<DateTime<Utc>>()
+                        {
+                            return dt.timestamp_nanos_opt();
                         }
                         if let Some(n) = v.as_i64() {
                             return Some(n);

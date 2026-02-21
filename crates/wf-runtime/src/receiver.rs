@@ -101,11 +101,11 @@ async fn handle_connection(
                             Ok(frame) => {
                                 wf_trace!(pipe, stream = &*frame.tag, rows = frame.batch.num_rows(), "frame decoded");
                                 // Send to scheduler before routing to windows
-                                if let Some(tx) = &event_tx {
-                                    if tx.send((frame.tag.clone(), frame.batch.clone())).await.is_err() {
-                                        wf_warn!(conn, peer = %peer, "event channel closed, dropping connection");
-                                        break;
-                                    }
+                                if let Some(tx) = &event_tx
+                                    && tx.send((frame.tag.clone(), frame.batch.clone())).await.is_err()
+                                {
+                                    wf_warn!(conn, peer = %peer, "event channel closed, dropping connection");
+                                    break;
                                 }
                                 if let Err(e) = router.route(&frame.tag, frame.batch) {
                                     wf_warn!(pipe, error = %e, "route error");

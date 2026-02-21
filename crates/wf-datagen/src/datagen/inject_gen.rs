@@ -302,6 +302,7 @@ fn extract_entity_id_field(expr: &Expr) -> Option<String> {
 // Per-line dispatch
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn generate_for_line(
     inject_line: &InjectLine,
     rule_struct: &RuleStructure,
@@ -358,6 +359,7 @@ fn generate_for_line(
 // Hit cluster generation
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn generate_hit_clusters(
     percent: f64,
     rule_struct: &RuleStructure,
@@ -405,9 +407,8 @@ fn generate_hit_clusters(
     let max_start_offset = (dur_secs - window_secs).max(0.0);
 
     let mut events = Vec::new();
-    let mut entity_counter: u64 = 0;
 
-    for _cluster_idx in 0..num_clusters {
+    for (entity_counter, _cluster_idx) in (0_u64..).zip(0..num_clusters) {
         let key_overrides = generate_key_values(
             &rule_struct.keys,
             entity_counter,
@@ -415,7 +416,6 @@ fn generate_hit_clusters(
             schemas,
             &effective_steps,
         );
-        entity_counter += 1;
 
         let cluster_start_secs = if max_start_offset > 0.0 {
             rng.random_range(0.0..max_start_offset)
@@ -444,6 +444,7 @@ fn generate_hit_clusters(
 // Near-miss cluster generation
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn generate_near_miss_clusters(
     percent: f64,
     rule_struct: &RuleStructure,
@@ -525,9 +526,8 @@ fn generate_near_miss_clusters(
     let max_start_offset = (dur_secs - window_secs).max(0.0);
 
     let mut events = Vec::new();
-    let mut entity_counter: u64 = 0;
 
-    for _cluster_idx in 0..num_clusters {
+    for (entity_counter, _cluster_idx) in (0_u64..).zip(0..num_clusters) {
         let key_overrides = generate_key_values(
             &rule_struct.keys,
             entity_counter,
@@ -535,7 +535,6 @@ fn generate_near_miss_clusters(
             schemas,
             &rule_struct.steps,
         );
-        entity_counter += 1;
 
         let cluster_start_secs = if max_start_offset > 0.0 {
             rng.random_range(0.0..max_start_offset)
@@ -565,6 +564,7 @@ fn generate_near_miss_clusters(
 // Non-hit event generation
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn generate_non_hit_events(
     percent: f64,
     rule_struct: &RuleStructure,
@@ -672,6 +672,7 @@ fn compute_cluster_count(
 }
 
 /// Generate cluster events across all steps.
+#[allow(clippy::too_many_arguments)]
 fn generate_cluster_events(
     steps: &[StepInfo],
     count_fn: impl Fn(usize, &StepInfo) -> u64,

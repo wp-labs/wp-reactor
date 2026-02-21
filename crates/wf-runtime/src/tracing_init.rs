@@ -50,6 +50,12 @@ pub struct DomainFormat {
     timer: SystemTime,
 }
 
+impl Default for DomainFormat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DomainFormat {
     pub fn new() -> Self {
         Self { timer: SystemTime }
@@ -119,10 +125,10 @@ where
                 }
                 write!(writer, "{{")?;
                 let ext = span.extensions();
-                if let Some(fields) = ext.get::<FormattedFields<N>>() {
-                    if !fields.is_empty() {
-                        write!(writer, "{fields}")?;
-                    }
+                if let Some(fields) = ext.get::<FormattedFields<N>>()
+                    && !fields.is_empty()
+                {
+                    write!(writer, "{fields}")?;
                 }
                 write!(writer, "}}: ")?;
             }

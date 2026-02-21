@@ -175,13 +175,13 @@ mod tests {
         let schema = make_schema(vec![Field::new("score", DataType::Float64, false)]);
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(Float64Array::from(vec![3.140001, 2.71828])) as ArrayRef],
+            vec![Arc::new(Float64Array::from(vec![3.21, 9.87])) as ArrayRef],
         )
         .unwrap();
 
         let events = batch_to_events(&batch);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].fields["score"], Value::Number(3.140001));
-        assert_eq!(events[1].fields["score"], Value::Number(2.71828));
+        assert_eq!(events[0].fields["score"], Value::Number(3.21));
+        assert_eq!(events[1].fields["score"], Value::Number(9.87));
     }
 }
