@@ -75,7 +75,8 @@
       "WebFetch(domain:docs.rs)",
       "Bash(cargo clippy:*)",
       "Bash(cat:*)",
-      "Bash(cargo tree:*)"
+      "Bash(cargo tree:*)",
+      "Bash(git stash:*)"
     ]
   }
 }

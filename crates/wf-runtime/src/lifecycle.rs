@@ -97,37 +97,11 @@ impl FusionEngine {
         let cancel = CancellationToken::new();
 
         // 1. Load .wfs files → Vec<WindowSchema>
-        let wfs_paths = resolve_glob(&config.runtime.schemas, base_dir).owe_conf()?;
-        let mut all_schemas = Vec::new();
-        for full_path in &wfs_paths {
-            let content = std::fs::read_to_string(full_path)
-                .owe_sys()
-                .position(full_path.display().to_string())?;
-            let schemas = wf_lang::parse_wfs(&content)
-                .owe(RuntimeReason::Bootstrap)
-                .position(full_path.display().to_string())?;
-            wf_debug!(conf, file = %full_path.display(), schemas = schemas.len(), "loaded schema file");
-            all_schemas.extend(schemas);
-        }
+        let all_schemas = load_schemas(&config.runtime.schemas, base_dir)?;
 
-        // 2. Preprocess .wfl with config.vars → parse → Vec<WflFile>
-        let wfl_paths = resolve_glob(&config.runtime.rules, base_dir).owe_conf()?;
-        let mut all_rule_plans = Vec::new();
-        for full_path in &wfl_paths {
-            let raw = std::fs::read_to_string(full_path)
-                .owe_sys()
-                .position(full_path.display().to_string())?;
-            let preprocessed = wf_lang::preprocess_vars(&raw, &config.vars)
-                .owe_data()
-                .position(full_path.display().to_string())?;
-            let wfl_file = wf_lang::parse_wfl(&preprocessed)
-                .owe(RuntimeReason::Bootstrap)
-                .position(full_path.display().to_string())?;
-            let plans = wf_lang::compile_wfl(&wfl_file, &all_schemas)
-                .owe(RuntimeReason::Bootstrap)?;
-            wf_debug!(conf, file = %full_path.display(), rules = plans.len(), "compiled rule file");
-            all_rule_plans.extend(plans);
-        }
+        // 2. Preprocess .wfl with config.vars → parse → compile → Vec<RulePlan>
+        let all_rule_plans =
+            compile_rules(&config.runtime.rules, base_dir, &config.vars, &all_schemas)?;
 
         // 3. Cross-validate over vs over_cap
         let window_overs: std::collections::HashMap<String, Duration> = all_schemas
@@ -152,24 +126,12 @@ impl FusionEngine {
         let router = Arc::new(Router::new(registry));
 
         // 7. Build RuleEngines (precompute stream_name → alias routing)
-        let mut engines = Vec::with_capacity(all_rule_plans.len());
-        for plan in all_rule_plans {
-            let stream_aliases = build_stream_aliases(&plan.binds, &all_schemas);
-            let time_field = resolve_time_field(&plan.binds, &all_schemas);
-            let machine =
-                CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), time_field);
-            let executor = RuleExecutor::new(plan);
-            engines.push(RuleEngine {
-                machine,
-                executor,
-                stream_aliases,
-            });
-        }
+        let engines = build_rule_engines(all_rule_plans, &all_schemas);
 
         // 8. Create bounded event channel
         wf_info!(
             sys,
-            schemas = wfs_paths.len(),
+            schemas = all_schemas.len(),
             rules = engines.len(),
             windows = config.windows.len(),
             "engine bootstrap complete"
@@ -284,6 +246,81 @@ impl FusionEngine {
     pub fn command_sender(&self) -> mpsc::Sender<SchedulerCommand> {
         self.cmd_tx.clone()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Compile-phase helpers — pure data transforms extracted from start()
+// ---------------------------------------------------------------------------
+
+/// Load all `.wfs` schema files matching `glob_pattern` under `base_dir`.
+fn load_schemas(
+    glob_pattern: &str,
+    base_dir: &Path,
+) -> RuntimeResult<Vec<wf_lang::WindowSchema>> {
+    let wfs_paths = resolve_glob(glob_pattern, base_dir).owe_conf()?;
+    let mut all_schemas = Vec::new();
+    for full_path in &wfs_paths {
+        let content = std::fs::read_to_string(full_path)
+            .owe_sys()
+            .position(full_path.display().to_string())?;
+        let schemas = wf_lang::parse_wfs(&content)
+            .owe(RuntimeReason::Bootstrap)
+            .position(full_path.display().to_string())?;
+        wf_debug!(conf, file = %full_path.display(), schemas = schemas.len(), "loaded schema file");
+        all_schemas.extend(schemas);
+    }
+    Ok(all_schemas)
+}
+
+/// Load, preprocess, parse, and compile all `.wfl` rule files matching
+/// `glob_pattern` under `base_dir`, substituting `vars` and validating
+/// against the given `schemas`.
+fn compile_rules(
+    glob_pattern: &str,
+    base_dir: &Path,
+    vars: &std::collections::HashMap<String, String>,
+    schemas: &[wf_lang::WindowSchema],
+) -> RuntimeResult<Vec<wf_lang::plan::RulePlan>> {
+    let wfl_paths = resolve_glob(glob_pattern, base_dir).owe_conf()?;
+    let mut all_rule_plans = Vec::new();
+    for full_path in &wfl_paths {
+        let raw = std::fs::read_to_string(full_path)
+            .owe_sys()
+            .position(full_path.display().to_string())?;
+        let preprocessed = wf_lang::preprocess_vars(&raw, vars)
+            .owe_data()
+            .position(full_path.display().to_string())?;
+        let wfl_file = wf_lang::parse_wfl(&preprocessed)
+            .owe(RuntimeReason::Bootstrap)
+            .position(full_path.display().to_string())?;
+        let plans = wf_lang::compile_wfl(&wfl_file, schemas)
+            .owe(RuntimeReason::Bootstrap)?;
+        wf_debug!(conf, file = %full_path.display(), rules = plans.len(), "compiled rule file");
+        all_rule_plans.extend(plans);
+    }
+    Ok(all_rule_plans)
+}
+
+/// Build [`RuleEngine`] instances from compiled plans, pre-computing stream
+/// alias routing and constructing the CEP state machines.
+fn build_rule_engines(
+    plans: Vec<wf_lang::plan::RulePlan>,
+    schemas: &[wf_lang::WindowSchema],
+) -> Vec<RuleEngine> {
+    let mut engines = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let stream_aliases = build_stream_aliases(&plan.binds, schemas);
+        let time_field = resolve_time_field(&plan.binds, schemas);
+        let machine =
+            CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), time_field);
+        let executor = RuleExecutor::new(plan);
+        engines.push(RuleEngine {
+            machine,
+            executor,
+            stream_aliases,
+        });
+    }
+    engines
 }
 
 /// Resolve the event-time field name for a rule from its first bind's window schema.
