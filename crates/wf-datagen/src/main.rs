@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -13,9 +13,9 @@ use wf_datagen::output::arrow_ipc::write_arrow_ipc;
 use wf_datagen::output::jsonl::{
     read_alerts_jsonl, read_oracle_jsonl, write_jsonl, write_oracle_jsonl,
 };
+use wf_datagen::loader::load_from_uses;
 use wf_datagen::validate::validate_wfg;
 use wf_datagen::verify::verify;
-use wf_datagen::wfg_ast::WfgFile;
 use wf_datagen::wfg_parser::parse_wfg;
 
 #[derive(Parser)]
@@ -139,7 +139,7 @@ fn main() -> anyhow::Result<()> {
             let wfg_content = std::fs::read_to_string(&scenario).context("reading .wfg file")?;
             let wfg = parse_wfg(&wfg_content).context("parsing .wfg file")?;
 
-            let (mut schemas, mut wfl_files) = load_from_uses(&wfg, &scenario)?;
+            let (mut schemas, mut wfl_files) = load_from_uses(&wfg, &scenario, &HashMap::new())?;
             schemas.extend(load_ws_files(&ws)?);
             wfl_files.extend(load_wfl_files(&wfl)?);
 
@@ -316,7 +316,7 @@ fn main() -> anyhow::Result<()> {
             let wfg_content = std::fs::read_to_string(&scenario).context("reading .wfg file")?;
             let wfg = parse_wfg(&wfg_content).context("parsing .wfg file")?;
 
-            let (mut schemas, mut wfl_files) = load_from_uses(&wfg, &scenario)?;
+            let (mut schemas, mut wfl_files) = load_from_uses(&wfg, &scenario, &HashMap::new())?;
             schemas.extend(load_ws_files(&ws)?);
             wfl_files.extend(load_wfl_files(&wfl)?);
 
@@ -389,7 +389,7 @@ fn main() -> anyhow::Result<()> {
             let wfg_content = std::fs::read_to_string(&scenario).context("reading .wfg file")?;
             let wfg = parse_wfg(&wfg_content).context("parsing .wfg file")?;
 
-            let (mut schemas, mut wfl_files) = load_from_uses(&wfg, &scenario)?;
+            let (mut schemas, mut wfl_files) = load_from_uses(&wfg, &scenario, &HashMap::new())?;
             schemas.extend(load_ws_files(&ws)?);
             wfl_files.extend(load_wfl_files(&wfl)?);
 
@@ -457,60 +457,6 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
-}
-
-/// Auto-load .wfs and .wfl files referenced by `use` declarations in the .wfg file.
-///
-/// Paths in `use` declarations are resolved relative to the .wfg file's directory.
-fn load_from_uses(
-    wfg: &WfgFile,
-    wsc_path: &Path,
-) -> anyhow::Result<(Vec<wf_lang::WindowSchema>, Vec<wf_lang::ast::WflFile>)> {
-    let base_dir = wsc_path.parent().unwrap_or_else(|| Path::new("."));
-
-    let mut schemas = Vec::new();
-    let mut wfl_files = Vec::new();
-
-    for use_decl in &wfg.uses {
-        let resolved = base_dir.join(&use_decl.path);
-        let ext = resolved.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-        match ext {
-            "wfs" => {
-                let content = std::fs::read_to_string(&resolved).with_context(|| {
-                    format!(
-                        "reading .wfs file from use declaration: {} (resolved: {})",
-                        use_decl.path,
-                        resolved.display()
-                    )
-                })?;
-                let parsed = wf_lang::parse_wfs(&content)
-                    .with_context(|| format!("parsing .wfs file: {}", resolved.display()))?;
-                schemas.extend(parsed);
-            }
-            "wfl" => {
-                let content = std::fs::read_to_string(&resolved).with_context(|| {
-                    format!(
-                        "reading .wfl file from use declaration: {} (resolved: {})",
-                        use_decl.path,
-                        resolved.display()
-                    )
-                })?;
-                let parsed = wf_lang::parse_wfl(&content)
-                    .with_context(|| format!("parsing .wfl file: {}", resolved.display()))?;
-                wfl_files.push(parsed);
-            }
-            other => {
-                anyhow::bail!(
-                    "unsupported file extension '{}' in use declaration: {}",
-                    other,
-                    use_decl.path
-                );
-            }
-        }
-    }
-
-    Ok((schemas, wfl_files))
 }
 
 fn load_ws_files(paths: &[PathBuf]) -> anyhow::Result<Vec<wf_lang::WindowSchema>> {

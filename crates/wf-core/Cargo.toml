@@ -17,6 +17,7 @@ serde_json = "1.0"
 orion-error = { workspace = true }
 derive_more = { workspace = true }
 thiserror = { workspace = true }
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 arrow = { version = "54", default-features = false, features = ["ipc"] }

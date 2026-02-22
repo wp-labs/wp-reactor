@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
 use orion_error::prelude::*;
+use tokio::sync::Notify;
 use wf_config::{DistMode, WindowConfig};
 
 use crate::error::{CoreReason, CoreResult};
@@ -43,6 +44,7 @@ struct Subscription {
 pub struct WindowRegistry {
     windows: HashMap<String, Arc<RwLock<Window>>>,
     subscriptions: HashMap<String, Vec<Subscription>>,
+    notifiers: HashMap<String, Arc<Notify>>,
 }
 
 impl std::fmt::Debug for WindowRegistry {
@@ -53,6 +55,7 @@ impl std::fmt::Debug for WindowRegistry {
                 "subscription_streams",
                 &self.subscriptions.keys().collect::<Vec<_>>(),
             )
+            .field("notifier_count", &self.notifiers.len())
             .finish()
     }
 }
@@ -64,6 +67,7 @@ impl WindowRegistry {
     pub fn build(defs: Vec<WindowDef>) -> CoreResult<Self> {
         let mut windows = HashMap::with_capacity(defs.len());
         let mut subscriptions: HashMap<String, Vec<Subscription>> = HashMap::new();
+        let mut notifiers = HashMap::with_capacity(defs.len());
 
         for def in defs {
             let name = def.params.name.clone();
@@ -76,6 +80,7 @@ impl WindowRegistry {
             let mode = def.config.mode.clone();
             let window = Window::new(def.params, def.config);
             windows.insert(name.clone(), Arc::new(RwLock::new(window)));
+            notifiers.insert(name.clone(), Arc::new(Notify::new()));
 
             for stream_name in def.streams {
                 subscriptions
@@ -91,6 +96,7 @@ impl WindowRegistry {
         Ok(Self {
             windows,
             subscriptions,
+            notifiers,
         })
     }
 
@@ -165,6 +171,11 @@ impl WindowRegistry {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Get the notifier for a named window.
+    pub fn get_notifier(&self, name: &str) -> Option<&Arc<Notify>> {
+        self.notifiers.get(name)
     }
 }
 

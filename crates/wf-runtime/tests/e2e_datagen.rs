@@ -4,12 +4,8 @@
 //! prediction → FusionEngine execution → alert verification.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -18,11 +14,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 use wf_config::FusionConfig;
-use wf_datagen::datagen::stream_gen::GenEvent;
 use wf_runtime::lifecycle::FusionEngine;
 use wf_runtime::tracing_init::{DomainFormat, FileFields};
-
-use wf_lang::{BaseType, FieldType, WindowSchema};
 
 /// Build a length-prefixed TCP frame from an Arrow IPC payload.
 fn make_tcp_frame(ipc_payload: &[u8]) -> Vec<u8> {
@@ -30,148 +23,6 @@ fn make_tcp_frame(ipc_payload: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&(ipc_payload.len() as u32).to_be_bytes());
     frame.extend_from_slice(ipc_payload);
     frame
-}
-
-/// Convert GenEvents into length-prefixed TCP frames grouped by window_name.
-///
-/// For each window group:
-/// 1. Look up the WindowSchema to get field definitions and stream name.
-/// 2. Build an Arrow Schema with typed columns (all nullable=true).
-/// 3. Build Arrow arrays from the JSON field values in each GenEvent.
-/// 4. Encode as IPC and wrap in a length-prefixed frame.
-fn events_to_tcp_frames(events: &[GenEvent], schemas: &[WindowSchema]) -> Vec<(String, Vec<u8>)> {
-    // Group events by window_name
-    let mut groups: HashMap<String, Vec<&GenEvent>> = HashMap::new();
-    for event in events {
-        groups
-            .entry(event.window_name.clone())
-            .or_default()
-            .push(event);
-    }
-
-    let mut frames = Vec::new();
-
-    for (window_name, group_events) in &groups {
-        let schema = schemas
-            .iter()
-            .find(|s| s.name == *window_name)
-            .unwrap_or_else(|| panic!("schema not found for window '{window_name}'"));
-
-        let stream_name = schema
-            .streams
-            .first()
-            .unwrap_or_else(|| panic!("no stream defined for window '{window_name}'"));
-
-        // Build Arrow schema from field definitions
-        let arrow_fields: Vec<Field> = schema
-            .fields
-            .iter()
-            .map(|f| {
-                let dt = base_type_to_arrow_dt(&f.field_type);
-                Field::new(&f.name, dt, true)
-            })
-            .collect();
-        let arrow_schema = Arc::new(Schema::new(arrow_fields));
-
-        // Build columns
-        let columns: Vec<Arc<dyn arrow::array::Array>> = schema
-            .fields
-            .iter()
-            .map(|field_def| build_arrow_column(field_def, group_events))
-            .collect();
-
-        let batch = RecordBatch::try_new(arrow_schema, columns)
-            .unwrap_or_else(|e| panic!("failed to build RecordBatch for '{window_name}': {e}"));
-
-        let ipc_payload = wp_arrow::ipc::encode_ipc(stream_name, &batch)
-            .unwrap_or_else(|e| panic!("encode_ipc failed for '{stream_name}': {e}"));
-
-        frames.push((stream_name.clone(), make_tcp_frame(&ipc_payload)));
-    }
-
-    frames
-}
-
-fn base_type_to_arrow_dt(ft: &FieldType) -> DataType {
-    let base = match ft {
-        FieldType::Base(b) => b,
-        FieldType::Array(b) => b,
-    };
-    match base {
-        BaseType::Chars | BaseType::Ip | BaseType::Hex => DataType::Utf8,
-        BaseType::Digit => DataType::Int64,
-        BaseType::Float => DataType::Float64,
-        BaseType::Bool => DataType::Boolean,
-        BaseType::Time => DataType::Timestamp(TimeUnit::Nanosecond, None),
-    }
-}
-
-fn build_arrow_column(
-    field_def: &wf_lang::FieldDef,
-    events: &[&GenEvent],
-) -> Arc<dyn arrow::array::Array> {
-    let base = match &field_def.field_type {
-        FieldType::Base(b) => b,
-        FieldType::Array(b) => b,
-    };
-    let name = &field_def.name;
-
-    match base {
-        BaseType::Chars | BaseType::Ip | BaseType::Hex => {
-            let values: Vec<Option<String>> = events
-                .iter()
-                .map(|e| {
-                    e.fields
-                        .get(name)
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                })
-                .collect();
-            Arc::new(StringArray::from(values))
-        }
-        BaseType::Digit => {
-            let values: Vec<Option<i64>> = events
-                .iter()
-                .map(|e| e.fields.get(name).and_then(|v| v.as_i64()))
-                .collect();
-            Arc::new(Int64Array::from(values))
-        }
-        BaseType::Float => {
-            let values: Vec<Option<f64>> = events
-                .iter()
-                .map(|e| e.fields.get(name).and_then(|v| v.as_f64()))
-                .collect();
-            Arc::new(Float64Array::from(values))
-        }
-        BaseType::Bool => {
-            let values: Vec<Option<bool>> = events
-                .iter()
-                .map(|e| e.fields.get(name).and_then(|v| v.as_bool()))
-                .collect();
-            Arc::new(BooleanArray::from(values))
-        }
-        BaseType::Time => {
-            let values: Vec<Option<i64>> = events
-                .iter()
-                .map(|e| {
-                    // First try: the field is a timestamp string in the JSON fields
-                    if let Some(v) = e.fields.get(name) {
-                        if let Some(s) = v.as_str()
-                            && let Ok(dt) = s.parse::<DateTime<Utc>>()
-                        {
-                            return dt.timestamp_nanos_opt();
-                        }
-                        if let Some(n) = v.as_i64() {
-                            return Some(n);
-                        }
-                    }
-                    // Fallback: use the event's timestamp
-                    e.timestamp.timestamp_nanos_opt()
-                })
-                .collect();
-            Arc::new(TimestampNanosecondArray::from(values))
-        }
-    }
 }
 
 #[tokio::test]
@@ -205,30 +56,16 @@ async fn e2e_datagen_brute_force() {
         )
         .try_init();
 
-    // ---- Parse .wfg scenario ----
+    // ---- Load scenario (.wfg → schemas + rules) ----
     let base_dir = manifest_dir.join("../../examples");
     let wfg_path = base_dir.join("scenarios/brute_force.wfg");
-    let wfg_content = std::fs::read_to_string(&wfg_path).expect("failed to read brute_force.wfg");
-    let wfg =
-        wf_datagen::wfg_parser::parse_wfg(&wfg_content).expect("failed to parse .wfg scenario");
-
-    // ---- Parse .wfs schemas ----
-    let wfs_path = base_dir.join("schemas/security.wfs");
-    let wfs_content = std::fs::read_to_string(&wfs_path).expect("failed to read security.wfs");
-    let schemas = wf_lang::parse_wfs(&wfs_content).expect("failed to parse .wfs schemas");
-
-    // ---- Preprocess + parse + compile .wfl rules ----
-    let wfl_path = base_dir.join("rules/brute_force.wfl");
-    let wfl_raw = std::fs::read_to_string(&wfl_path).expect("failed to read brute_force.wfl");
     let vars = HashMap::from([("FAIL_THRESHOLD".into(), "3".into())]);
-    let preprocessed =
-        wf_lang::preprocess_vars(&wfl_raw, &vars).expect("failed to preprocess .wfl vars");
-    let wfl_file = wf_lang::parse_wfl(&preprocessed).expect("failed to parse .wfl rules");
-    let rule_plans =
-        wf_lang::compile_wfl(&wfl_file, &schemas).expect("failed to compile .wfl rules");
+    let loaded = wf_datagen::loader::load_scenario(&wfg_path, &vars)
+        .expect("failed to load scenario");
 
     // ---- Validate scenario ----
-    let validation_errors = wf_datagen::validate::validate_wfg(&wfg, &schemas, &[wfl_file]);
+    let validation_errors =
+        wf_datagen::validate::validate_wfg(&loaded.wfg, &loaded.schemas, &loaded.wfl_files);
     assert!(
         validation_errors.is_empty(),
         "scenario validation failed: {:?}",
@@ -236,8 +73,9 @@ async fn e2e_datagen_brute_force() {
     );
 
     // ---- Generate events ----
-    let gen_result = wf_datagen::datagen::generate(&wfg, &schemas, &rule_plans)
-        .expect("event generation failed");
+    let gen_result =
+        wf_datagen::datagen::generate(&loaded.wfg, &loaded.schemas, &loaded.rule_plans)
+            .expect("event generation failed");
     let events = gen_result.events;
     assert!(
         !events.is_empty(),
@@ -245,15 +83,17 @@ async fn e2e_datagen_brute_force() {
     );
 
     // ---- Oracle prediction (SC7: only injected rules) ----
-    let start: DateTime<Utc> = wfg
+    let start: DateTime<Utc> = loaded
+        .wfg
         .scenario
         .time_clause
         .start
         .parse()
         .expect("invalid scenario start time");
-    let duration = wfg.scenario.time_clause.duration;
+    let duration = loaded.wfg.scenario.time_clause.duration;
 
-    let injected_rules: HashSet<String> = wfg
+    let injected_rules: HashSet<String> = loaded
+        .wfg
         .scenario
         .injects
         .iter()
@@ -261,7 +101,7 @@ async fn e2e_datagen_brute_force() {
         .collect();
     let oracle_result = wf_datagen::oracle::run_oracle(
         &events,
-        &rule_plans,
+        &loaded.rule_plans,
         &start,
         &duration,
         Some(&injected_rules),
@@ -316,14 +156,21 @@ FAIL_THRESHOLD = "3"
         .expect("FusionEngine::start failed");
     let addr = engine.listen_addr();
 
-    // ---- Convert GenEvents → Arrow TCP frames ----
-    let tcp_frames = events_to_tcp_frames(&events, &schemas);
+    // ---- Convert GenEvents → typed Arrow batches → TCP frames ----
+    let batches =
+        wf_datagen::output::arrow_ipc::events_to_typed_batches(&events, &loaded.schemas)
+            .expect("events_to_typed_batches failed");
 
     // ---- TCP send ----
     let mut stream = TcpStream::connect(addr).await.expect("TCP connect failed");
 
-    for (_stream_name, frame) in &tcp_frames {
-        stream.write_all(frame).await.expect("TCP write failed");
+    for (stream_name, batch) in &batches {
+        let ipc_payload = wp_arrow::ipc::encode_ipc(stream_name, batch)
+            .unwrap_or_else(|e| panic!("encode_ipc failed for '{stream_name}': {e}"));
+        stream
+            .write_all(&make_tcp_frame(&ipc_payload))
+            .await
+            .expect("TCP write failed");
     }
     stream.flush().await.expect("TCP flush failed");
 
@@ -338,7 +185,8 @@ FAIL_THRESHOLD = "3"
         .unwrap_or_else(|e| panic!("failed to read alerts from {}: {e}", alert_path.display()));
 
     // ---- Extract oracle tolerances ----
-    let tolerances = wfg
+    let tolerances = loaded
+        .wfg
         .scenario
         .oracle
         .as_ref()

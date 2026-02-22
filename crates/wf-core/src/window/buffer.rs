@@ -43,6 +43,8 @@ struct TimedBatch {
     ingested_at: Instant,
     row_count: usize,
     byte_size: usize,
+    /// Monotonically increasing sequence number assigned on append.
+    seq: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +65,8 @@ pub struct Window {
     current_bytes: usize,
     total_rows: usize,
     watermark_nanos: i64,
+    /// Next sequence number to assign to an appended batch.
+    next_seq: u64,
 }
 
 impl Window {
@@ -78,6 +82,7 @@ impl Window {
             current_bytes: 0,
             total_rows: 0,
             watermark_nanos: i64::MIN,
+            next_seq: 0,
         }
     }
 
@@ -103,6 +108,8 @@ impl Window {
         let event_time_range = self.extract_time_range(&batch);
         let row_count = batch.num_rows();
         let byte_size = batch.get_array_memory_size();
+        let seq = self.next_seq;
+        self.next_seq += 1;
 
         self.batches.push_back(TimedBatch {
             batch,
@@ -110,6 +117,7 @@ impl Window {
             ingested_at: Instant::now(),
             row_count,
             byte_size,
+            seq,
         });
 
         self.current_bytes += byte_size;
@@ -210,14 +218,9 @@ impl Window {
 
         let (min_event_time, max_event_time) = self.extract_time_range(&batch);
 
-        // Advance watermark (only for windows with a time column and real timestamps).
-        if self.time_col_index.is_some() && max_event_time != i64::MAX {
-            let delay = self.config.watermark.as_duration().as_nanos() as i64;
-            let candidate = max_event_time.saturating_sub(delay);
-            self.watermark_nanos = self.watermark_nanos.max(candidate);
-        }
-
-        // Lateness check (only for windows with a time column and real timestamps).
+        // Lateness check FIRST against the current watermark (before this batch
+        // advances it). This ensures a batch cannot be rejected by its own
+        // watermark advancement — only by previously established watermarks.
         if self.time_col_index.is_some() && min_event_time != i64::MIN {
             let allowed = self.config.allowed_lateness.as_duration().as_nanos() as i64;
             let cutoff = self.watermark_nanos.saturating_sub(allowed);
@@ -232,6 +235,13 @@ impl Window {
             }
         }
 
+        // Advance watermark AFTER lateness check.
+        if self.time_col_index.is_some() && max_event_time != i64::MAX {
+            let delay = self.config.watermark.as_duration().as_nanos() as i64;
+            let candidate = max_event_time.saturating_sub(delay);
+            self.watermark_nanos = self.watermark_nanos.max(candidate);
+        }
+
         self.append(batch)?;
         Ok(AppendOutcome::Appended)
     }
@@ -239,6 +249,36 @@ impl Window {
     /// Current watermark in nanoseconds.
     pub fn watermark_nanos(&self) -> i64 {
         self.watermark_nanos
+    }
+
+    /// Read batches appended since the given cursor position.
+    ///
+    /// Returns `(new_batches, new_cursor, gap_detected)`.
+    /// `gap_detected = true` means the cursor fell behind eviction and some
+    /// data was lost.
+    pub fn read_since(&self, cursor: u64) -> (Vec<RecordBatch>, u64, bool) {
+        if self.batches.is_empty() {
+            return (Vec::new(), cursor, false);
+        }
+        let oldest_seq = self.batches.front().unwrap().seq;
+        let newest_seq = self.batches.back().unwrap().seq;
+        if cursor > newest_seq {
+            return (Vec::new(), cursor, false);
+        }
+        let gap = cursor < oldest_seq;
+        let effective_start = if gap { oldest_seq } else { cursor };
+        let batches: Vec<RecordBatch> = self
+            .batches
+            .iter()
+            .filter(|tb| tb.seq >= effective_start)
+            .map(|tb| tb.batch.clone()) // Arc clone, zero data copy
+            .collect();
+        (batches, newest_seq + 1, gap)
+    }
+
+    /// Next sequence number that will be assigned to the next appended batch.
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
     }
 
     /// Pop the oldest (front) batch, returning its byte size.
@@ -647,5 +687,99 @@ mod tests {
 
         // Must return Err, not panic.
         assert!(win.append_with_watermark(wrong_batch).is_err());
+    }
+
+    // -- 14. read_since_normal -----------------------------------------------
+
+    #[test]
+    fn read_since_normal() {
+        let mut win = test_window(3600, usize::MAX);
+        let schema = win.schema().clone();
+
+        assert_eq!(win.next_seq(), 0);
+        win.append(make_batch(&schema, &[1_000_000_000], &[100]))
+            .unwrap();
+        win.append(make_batch(&schema, &[2_000_000_000], &[200]))
+            .unwrap();
+        win.append(make_batch(&schema, &[3_000_000_000], &[300]))
+            .unwrap();
+        assert_eq!(win.next_seq(), 3);
+
+        // Read from cursor 0 → all 3 batches
+        let (batches, cursor, gap) = win.read_since(0);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(cursor, 3);
+        assert!(!gap);
+
+        // Read from cursor 1 → last 2 batches
+        let (batches, cursor, gap) = win.read_since(1);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(cursor, 3);
+        assert!(!gap);
+
+        // Read from cursor 3 → no new batches
+        let (batches, cursor, gap) = win.read_since(3);
+        assert!(batches.is_empty());
+        assert_eq!(cursor, 3);
+        assert!(!gap);
+    }
+
+    // -- 15. read_since_gap_detection ----------------------------------------
+
+    #[test]
+    fn read_since_gap_detection() {
+        let schema = test_schema();
+        let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+        let one_batch_size = probe.get_array_memory_size();
+        // Allow room for exactly 2 batches → oldest evicted when 3rd arrives.
+        let max_bytes = one_batch_size * 2;
+        let mut win = Window::new(
+            WindowParams {
+                name: "gap_win".into(),
+                schema,
+                time_col_index: Some(0),
+                over: Duration::from_secs(3600),
+            },
+            test_config(max_bytes),
+        );
+
+        win.append(probe).unwrap(); // seq 0
+        win.append(make_batch(win.schema(), &[2_000_000_000], &[200]))
+            .unwrap(); // seq 1
+        win.append(make_batch(win.schema(), &[3_000_000_000], &[300]))
+            .unwrap(); // seq 2 → seq 0 evicted
+
+        // Cursor 0 was evicted → gap
+        let (batches, cursor, gap) = win.read_since(0);
+        assert!(gap);
+        assert_eq!(batches.len(), 2); // seq 1 and 2
+        assert_eq!(cursor, 3);
+    }
+
+    // -- 16. read_since_empty_window -----------------------------------------
+
+    #[test]
+    fn read_since_empty_window() {
+        let win = test_window(3600, usize::MAX);
+        let (batches, cursor, gap) = win.read_since(0);
+        assert!(batches.is_empty());
+        assert_eq!(cursor, 0);
+        assert!(!gap);
+    }
+
+    // -- 17. read_since_cursor_ahead -----------------------------------------
+
+    #[test]
+    fn read_since_cursor_ahead() {
+        let mut win = test_window(3600, usize::MAX);
+        let schema = win.schema().clone();
+        win.append(make_batch(&schema, &[1_000_000_000], &[100]))
+            .unwrap();
+
+        // Cursor ahead of newest → no data, no gap
+        let (batches, cursor, gap) = win.read_since(999);
+        assert!(batches.is_empty());
+        assert_eq!(cursor, 999);
+        assert!(!gap);
     }
 }

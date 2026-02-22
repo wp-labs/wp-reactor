@@ -2,23 +2,17 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wf_core::window::Router;
 
 /// TCP receiver that accepts connections, reads length-prefixed Arrow IPC
 /// frames, decodes them, and routes batches to the [`Router`].
-///
-/// Optionally sends `(stream_name, RecordBatch)` to the scheduler via
-/// `event_tx` so the CEP engine can process each incoming batch.
 pub struct Receiver {
     listener: TcpListener,
     router: Arc<Router>,
     cancel: CancellationToken,
-    event_tx: Option<mpsc::Sender<(String, RecordBatch)>>,
 }
 
 impl Receiver {
@@ -30,24 +24,6 @@ impl Receiver {
             listener,
             router,
             cancel: CancellationToken::new(),
-            event_tx: None,
-        })
-    }
-
-    /// Parse `"tcp://host:port"` and bind a TCP listener with an event channel
-    /// for the scheduler.
-    pub async fn bind_with_event_tx(
-        listen: &str,
-        router: Arc<Router>,
-        event_tx: mpsc::Sender<(String, RecordBatch)>,
-    ) -> anyhow::Result<Self> {
-        let addr = listen.strip_prefix("tcp://").unwrap_or(listen);
-        let listener = TcpListener::bind(addr).await?;
-        Ok(Self {
-            listener,
-            router,
-            cancel: CancellationToken::new(),
-            event_tx: Some(event_tx),
         })
     }
 
@@ -71,8 +47,7 @@ impl Receiver {
                     wf_debug!(conn, peer = %peer, "accepted connection");
                     let router = Arc::clone(&self.router);
                     let cancel = self.cancel.child_token();
-                    let event_tx = self.event_tx.clone();
-                    tokio::spawn(handle_connection(stream, router, cancel, peer, event_tx));
+                    tokio::spawn(handle_connection(stream, router, cancel, peer));
                 }
                 _ = self.cancel.cancelled() => break,
             }
@@ -87,7 +62,6 @@ async fn handle_connection(
     router: Arc<Router>,
     cancel: CancellationToken,
     peer: SocketAddr,
-    event_tx: Option<mpsc::Sender<(String, RecordBatch)>>,
 ) {
     let (reader, _writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -99,16 +73,17 @@ async fn handle_connection(
                     Ok(Some(payload)) => {
                         match wp_arrow::ipc::decode_ipc(&payload) {
                             Ok(frame) => {
-                                wf_trace!(pipe, stream = &*frame.tag, rows = frame.batch.num_rows(), "frame decoded");
-                                // Send to scheduler before routing to windows
-                                if let Some(tx) = &event_tx
-                                    && tx.send((frame.tag.clone(), frame.batch.clone())).await.is_err()
-                                {
-                                    wf_warn!(conn, peer = %peer, "event channel closed, dropping connection");
-                                    break;
-                                }
-                                if let Err(e) = router.route(&frame.tag, frame.batch) {
-                                    wf_warn!(pipe, error = %e, "route error");
+                                wf_debug!(pipe, stream = &*frame.tag, rows = frame.batch.num_rows(), "frame decoded");
+                                match router.route(&frame.tag, frame.batch) {
+                                    Ok(report) => {
+                                        wf_debug!(pipe,
+                                            delivered = report.delivered,
+                                            dropped_late = report.dropped_late,
+                                            skipped = report.skipped_non_local,
+                                            "route report"
+                                        );
+                                    }
+                                    Err(e) => wf_warn!(pipe, error = %e, "route error"),
                                 }
                             }
                             Err(e) => wf_warn!(conn, error = %e, "IPC decode error"),
@@ -340,38 +315,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(snapshot_row_count(&router), 2);
-
-        cancel.cancel();
-        server.await.unwrap().unwrap();
-    }
-
-    // -- Test 4: event_tx_receives_batches ------------------------------------
-
-    #[tokio::test]
-    async fn event_tx_receives_batches() {
-        let router = make_router("events");
-        let (tx, mut rx) = mpsc::channel::<(String, RecordBatch)>(16);
-        let receiver = Receiver::bind_with_event_tx("tcp://127.0.0.1:0", Arc::clone(&router), tx)
-            .await
-            .unwrap();
-        let addr = receiver.local_addr().unwrap();
-        let cancel = receiver.cancel_token();
-
-        let server = tokio::spawn(async move { receiver.run().await });
-
-        let schema = test_schema();
-        let mut conn = TcpStream::connect(addr).await.unwrap();
-        let batch = make_batch(&schema, &[10_000_000_000], &[42]);
-        let frame = make_frame("events", &batch);
-        send_frame(&mut conn, &frame).await;
-
-        // Receive from the event channel
-        let (stream_name, received_batch) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stream_name, "events");
-        assert_eq!(received_batch.num_rows(), 1);
 
         cancel.cancel();
         server.await.unwrap().unwrap();

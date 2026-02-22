@@ -112,14 +112,15 @@ FAIL_THRESHOLD = "3"
     let addr = engine.listen_addr();
 
     // -- Connect TCP and send 3 "failed" auth events --
+    // Fields must be nullable to match the Window schema built from .wfs files.
     let arrow_schema = Arc::new(Schema::new(vec![
-        Field::new("sip", DataType::Utf8, false),
-        Field::new("username", DataType::Utf8, false),
-        Field::new("action", DataType::Utf8, false),
+        Field::new("sip", DataType::Utf8, true),
+        Field::new("username", DataType::Utf8, true),
+        Field::new("action", DataType::Utf8, true),
         Field::new(
             "event_time",
             DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
+            true,
         ),
     ]));
 

@@ -54,10 +54,20 @@ impl Router {
                 .registry
                 .get_window(window_name)
                 .expect("subscription references non-existent window");
-            let mut win = win_lock.write().expect("window lock poisoned");
+            let outcome = {
+                let mut win = win_lock.write().expect("window lock poisoned");
+                win.append_with_watermark(batch.clone())?
+            };
 
-            match win.append_with_watermark(batch.clone())? {
-                AppendOutcome::Appended => report.delivered += 1,
+            match outcome {
+                AppendOutcome::Appended => {
+                    report.delivered += 1;
+                    // Notify after releasing the write lock so waiters can
+                    // immediately acquire a read lock.
+                    if let Some(notify) = self.registry.get_notifier(window_name) {
+                        notify.notify_waiters();
+                    }
+                }
                 AppendOutcome::DroppedLate => report.dropped_late += 1,
             }
         }

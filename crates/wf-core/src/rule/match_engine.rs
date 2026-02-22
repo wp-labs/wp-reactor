@@ -219,6 +219,11 @@ impl CepStateMachine {
         }
     }
 
+    /// Returns the rule name this state machine was created for.
+    pub fn rule_name(&self) -> &str {
+        &self.rule_name
+    }
+
     /// Feed one event (arriving on `alias`) into the state machine.
     ///
     /// Extracts event time from the configured `time_field`, falling back to 0.
