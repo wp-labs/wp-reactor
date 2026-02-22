@@ -403,8 +403,7 @@ fn generate_hit_clusters(
 
     let dur_secs = duration.as_secs_f64();
     let window_dur = overrides.within.unwrap_or(rule_struct.window_dur);
-    let window_secs = window_dur.as_secs_f64();
-    let max_start_offset = (dur_secs - window_secs).max(0.0);
+    let (window_secs, max_start_offset) = compute_window_bounds(dur_secs, window_dur);
 
     let mut events = Vec::new();
 
@@ -457,42 +456,12 @@ fn generate_near_miss_clusters(
     inject_counts: &mut HashMap<String, u64>,
     overrides: &InjectOverrides,
 ) -> anyhow::Result<Vec<GenEvent>> {
-    // For near-miss: N-1 events per cluster for the last step,
-    // full threshold for preceding steps.
-    // Multi-step near-miss: complete all steps except last.
     let steps = &rule_struct.steps;
     if steps.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Apply count_per_entity to override the near-miss step threshold
-    let effective_threshold_nm = overrides
-        .count_per_entity
-        .unwrap_or(steps[steps.len() - 1].threshold);
-
-    // Apply steps_completed to control which steps get full events.
-    // steps_completed = index of the near-miss step (gets threshold-1).
-    // Steps before it: full threshold. Steps after it: 0 events.
-    let steps_completed = overrides.steps_completed.unwrap_or(steps.len() - 1);
-    let nm_step_idx = steps_completed.min(steps.len() - 1);
-
-    // Events per cluster for near-miss
-    let near_miss_counts: Vec<u64> = steps
-        .iter()
-        .enumerate()
-        .map(|(i, step)| {
-            if i > nm_step_idx {
-                // Beyond the near-miss step: no events
-                0
-            } else if i == nm_step_idx {
-                // The near-miss step: threshold - 1
-                effective_threshold_nm.saturating_sub(1)
-            } else {
-                // Fully completed preceding steps
-                overrides.count_per_entity.unwrap_or(step.threshold)
-            }
-        })
-        .collect();
+    let near_miss_counts = compute_near_miss_counts(steps, overrides);
 
     // Total events per cluster
     let events_per_cluster: u64 = near_miss_counts.iter().sum();
@@ -501,6 +470,10 @@ fn generate_near_miss_clusters(
     }
 
     // Compute number of clusters from the near-miss step's budget
+    let nm_step_idx = overrides
+        .steps_completed
+        .unwrap_or(steps.len() - 1)
+        .min(steps.len() - 1);
     let primary_step = &steps[nm_step_idx];
     let stream_total = *stream_totals
         .get(&primary_step.scenario_alias)
@@ -522,8 +495,7 @@ fn generate_near_miss_clusters(
 
     let dur_secs = duration.as_secs_f64();
     let window_dur = overrides.within.unwrap_or(rule_struct.window_dur);
-    let window_secs = window_dur.as_secs_f64();
-    let max_start_offset = (dur_secs - window_secs).max(0.0);
+    let (window_secs, max_start_offset) = compute_window_bounds(dur_secs, window_dur);
 
     let mut events = Vec::new();
 
@@ -646,6 +618,44 @@ fn generate_non_hit_events(
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// Compute the time window bounds for cluster generation.
+///
+/// Returns `(window_secs, max_start_offset)` where `max_start_offset` is the
+/// latest second at which a cluster can start without exceeding the duration.
+fn compute_window_bounds(dur_secs: f64, window_dur: Duration) -> (f64, f64) {
+    let window_secs = window_dur.as_secs_f64();
+    let max_start_offset = (dur_secs - window_secs).max(0.0);
+    (window_secs, max_start_offset)
+}
+
+/// Compute per-step event counts for near-miss clusters.
+///
+/// For the near-miss step (determined by `steps_completed` override or the
+/// last step by default): `threshold - 1` events. Steps before it get the
+/// full threshold. Steps after it get 0 events.
+fn compute_near_miss_counts(steps: &[StepInfo], overrides: &InjectOverrides) -> Vec<u64> {
+    let effective_threshold_nm = overrides
+        .count_per_entity
+        .unwrap_or(steps[steps.len() - 1].threshold);
+
+    let steps_completed = overrides.steps_completed.unwrap_or(steps.len() - 1);
+    let nm_step_idx = steps_completed.min(steps.len() - 1);
+
+    steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            if i > nm_step_idx {
+                0
+            } else if i == nm_step_idx {
+                effective_threshold_nm.saturating_sub(1)
+            } else {
+                overrides.count_per_entity.unwrap_or(step.threshold)
+            }
+        })
+        .collect()
+}
 
 /// Compute the number of clusters based on per-stream event budgets.
 fn compute_cluster_count(

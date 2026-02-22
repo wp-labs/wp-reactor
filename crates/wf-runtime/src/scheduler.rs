@@ -156,13 +156,6 @@ impl Scheduler {
 
     /// Route a batch to all matching rule engines and advance their state
     /// machines — engines execute in parallel, bounded by `exec_semaphore`.
-    ///
-    /// Each per-engine task is wrapped in `tokio::time::timeout` so the
-    /// scheduler is never blocked indefinitely by semaphore back-pressure or
-    /// lock contention.  The inner advance loop is synchronous, so once it
-    /// starts it always runs to completion — no partial state corruption.
-    /// Alert emission is outside the timeout to guarantee delivery of
-    /// successfully processed results.
     async fn dispatch_batch(&self, stream_name: &str, batch: &RecordBatch) {
         let start = Instant::now();
         let events = batch_to_events(batch);
@@ -180,16 +173,14 @@ impl Scheduler {
             };
             let aliases = aliases.clone();
             let events = Arc::clone(&events);
-            let state = Arc::clone(&engine.state);
-            let semaphore = Arc::clone(&self.exec_semaphore);
-            let alert_tx = self.alert_tx.clone();
-            let exec_timeout = self.exec_timeout;
 
-            join_set.spawn(async move {
-                let result = tokio::time::timeout(exec_timeout, async {
-                    let _permit = semaphore.acquire().await.expect("semaphore closed");
-                    let mut core = state.lock().await;
-
+            join_set.spawn(run_engine_task(
+                Arc::clone(&engine.state),
+                Arc::clone(&self.exec_semaphore),
+                self.alert_tx.clone(),
+                self.exec_timeout,
+                "dispatch_batch",
+                move |core| {
                     let mut alerts = Vec::new();
                     for event in events.iter() {
                         for alias in &aliases {
@@ -205,35 +196,11 @@ impl Scheduler {
                         }
                     }
                     alerts
-                })
-                .await;
-
-                match result {
-                    Ok(alerts) => {
-                        let n = alerts.len();
-                        for record in alerts {
-                            emit_alert(&alert_tx, record).await;
-                        }
-                        n
-                    }
-                    Err(_) => {
-                        wf_warn!(pipe,
-                            timeout = ?exec_timeout,
-                            "dispatch_batch engine timed out, execution cancelled"
-                        );
-                        0
-                    }
-                }
-            });
+                },
+            ));
         }
 
-        let mut total_alerts = 0usize;
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(n) => total_alerts += n,
-                Err(e) => wf_warn!(pipe, error = %e, "engine task panicked"),
-            }
-        }
+        let total_alerts = collect_engine_results(&mut join_set, "dispatch_batch").await;
 
         wf_debug!(
             pipe,
@@ -253,16 +220,13 @@ impl Scheduler {
         let mut join_set = JoinSet::new();
 
         for engine in &self.engines {
-            let state = Arc::clone(&engine.state);
-            let semaphore = Arc::clone(&self.exec_semaphore);
-            let alert_tx = self.alert_tx.clone();
-            let exec_timeout = self.exec_timeout;
-
-            join_set.spawn(async move {
-                let result = tokio::time::timeout(exec_timeout, async {
-                    let _permit = semaphore.acquire().await.expect("semaphore closed");
-                    let mut core = state.lock().await;
-
+            join_set.spawn(run_engine_task(
+                Arc::clone(&engine.state),
+                Arc::clone(&self.exec_semaphore),
+                self.alert_tx.clone(),
+                self.exec_timeout,
+                "scan_timeouts",
+                |core| {
                     let close_outputs = core.machine.scan_expired();
                     let mut alerts = Vec::new();
                     for close in &close_outputs {
@@ -273,35 +237,11 @@ impl Scheduler {
                         }
                     }
                     alerts
-                })
-                .await;
-
-                match result {
-                    Ok(alerts) => {
-                        let n = alerts.len();
-                        for record in alerts {
-                            emit_alert(&alert_tx, record).await;
-                        }
-                        n
-                    }
-                    Err(_) => {
-                        wf_warn!(pipe,
-                            timeout = ?exec_timeout,
-                            "scan_timeouts engine timed out, execution cancelled"
-                        );
-                        0
-                    }
-                }
-            });
+                },
+            ));
         }
 
-        let mut total_alerts = 0usize;
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(n) => total_alerts += n,
-                Err(e) => wf_warn!(pipe, error = %e, "scan_timeouts task panicked"),
-            }
-        }
+        let total_alerts = collect_engine_results(&mut join_set, "scan_timeouts").await;
 
         if total_alerts > 0 {
             wf_debug!(
@@ -339,6 +279,63 @@ async fn emit_alert(tx: &mpsc::Sender<AlertRecord>, record: AlertRecord) {
     if let Err(e) = tx.send(record).await {
         wf_warn!(pipe, error = %e, "alert channel closed");
     }
+}
+
+/// Execute an operation on a single engine core with semaphore, timeout, and alert emission.
+///
+/// Acquires a semaphore permit, locks the engine core, runs the synchronous
+/// `operation` closure, emits any resulting alerts, and returns the alert count.
+/// If the timeout fires before the permit/lock is acquired, returns 0.
+async fn run_engine_task<F>(
+    state: Arc<Mutex<EngineCore>>,
+    semaphore: Arc<Semaphore>,
+    alert_tx: mpsc::Sender<AlertRecord>,
+    exec_timeout: Duration,
+    op_name: &'static str,
+    operation: F,
+) -> usize
+where
+    F: FnOnce(&mut EngineCore) -> Vec<AlertRecord> + Send + 'static,
+{
+    let result = tokio::time::timeout(exec_timeout, async {
+        let _permit = semaphore.acquire().await.expect("semaphore closed");
+        let mut core = state.lock().await;
+        operation(&mut core)
+    })
+    .await;
+
+    match result {
+        Ok(alerts) => {
+            let n = alerts.len();
+            for record in alerts {
+                emit_alert(&alert_tx, record).await;
+            }
+            n
+        }
+        Err(_) => {
+            wf_warn!(pipe,
+                timeout = ?exec_timeout,
+                op = op_name,
+                "engine task timed out, execution cancelled"
+            );
+            0
+        }
+    }
+}
+
+/// Collect results from a set of spawned engine tasks, logging any panics.
+async fn collect_engine_results(
+    join_set: &mut JoinSet<usize>,
+    op_name: &'static str,
+) -> usize {
+    let mut total = 0usize;
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(n) => total += n,
+            Err(e) => wf_warn!(pipe, error = %e, op = op_name, "engine task panicked"),
+        }
+    }
+    total
 }
 
 /// Build stream_name → alias routing for a rule, given its binds and the

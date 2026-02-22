@@ -568,40 +568,39 @@ fn update_measure(measure: &Measure, field_value: &Option<Value>, bs: &mut Branc
             }
         }
         Measure::Min => {
-            if let Some(v) = fval
-                && v < bs.min
-            {
-                bs.min = v;
-            }
-            // Also track Value-based min for orderable non-numeric fields
-            if let Some(val) = field_value {
-                let replace = match &bs.min_val {
-                    None => true,
-                    Some(cur) => value_ordering(val, cur).is_lt(),
-                };
-                if replace {
-                    bs.min_val = Some(val.clone());
-                }
-            }
+            update_extreme(fval, field_value, &mut bs.min, &mut bs.min_val, true);
         }
         Measure::Max => {
-            if let Some(v) = fval
-                && v > bs.max
-            {
-                bs.max = v;
-            }
-            // Also track Value-based max for orderable non-numeric fields
-            if let Some(val) = field_value {
-                let replace = match &bs.max_val {
-                    None => true,
-                    Some(cur) => value_ordering(val, cur).is_gt(),
-                };
-                if replace {
-                    bs.max_val = Some(val.clone());
-                }
-            }
+            update_extreme(fval, field_value, &mut bs.max, &mut bs.max_val, false);
         }
         _ => {} // unknown measure — no-op
+    }
+}
+
+/// Update numeric extreme + Value-based extreme in one shot.
+fn update_extreme(
+    fval: Option<f64>,
+    field_value: &Option<Value>,
+    num_acc: &mut f64,
+    val_acc: &mut Option<Value>,
+    is_min: bool,
+) {
+    if let Some(v) = fval
+        && ((is_min && v < *num_acc) || (!is_min && v > *num_acc))
+    {
+        *num_acc = v;
+    }
+    if let Some(val) = field_value {
+        let replace = match val_acc.as_ref() {
+            None => true,
+            Some(cur) => {
+                let ord = value_ordering(val, cur);
+                if is_min { ord.is_lt() } else { ord.is_gt() }
+            }
+        };
+        if replace {
+            *val_acc = Some(val.clone());
+        }
     }
 }
 
@@ -777,73 +776,76 @@ pub(crate) fn eval_expr(expr: &Expr, event: &Event) -> Option<Value> {
 
 fn eval_binop(op: BinOp, left: &Expr, right: &Expr, event: &Event) -> Option<Value> {
     match op {
-        // Three-valued (SQL NULL) logical ops — both sides are always
-        // evaluated so that partial information is preserved.  This is
-        // essential for close-step guards where one side references an
-        // event field (missing at close time) and the other references
-        // close_reason (missing during accumulation).
-        BinOp::And => {
-            let lv = eval_expr(left, event);
-            let rv = eval_expr(right, event);
-            match (lv.as_ref(), rv.as_ref()) {
-                // Any side is definitely false → false
-                (Some(Value::Bool(false)), _) | (_, Some(Value::Bool(false))) => {
-                    Some(Value::Bool(false))
-                }
-                // Both true → true
-                (Some(Value::Bool(true)), Some(Value::Bool(true))) => Some(Value::Bool(true)),
-                // One true, other unknown → unknown
-                _ => None,
-            }
-        }
-        BinOp::Or => {
-            let lv = eval_expr(left, event);
-            let rv = eval_expr(right, event);
-            match (lv.as_ref(), rv.as_ref()) {
-                // Any side is definitely true → true
-                (Some(Value::Bool(true)), _) | (_, Some(Value::Bool(true))) => {
-                    Some(Value::Bool(true))
-                }
-                // Both false → false
-                (Some(Value::Bool(false)), Some(Value::Bool(false))) => Some(Value::Bool(false)),
-                // One false, other unknown → unknown
-                _ => None,
-            }
-        }
-        // Comparison ops — work on Number and Str
+        BinOp::And => eval_logic_and(left, right, event),
+        BinOp::Or => eval_logic_or(left, right, event),
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
             let lv = eval_expr(left, event)?;
             let rv = eval_expr(right, event)?;
             Some(Value::Bool(compare_values(op, &lv, &rv)))
         }
-        // Arithmetic ops — numeric only
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
             let lv = eval_expr(left, event)?;
             let rv = eval_expr(right, event)?;
             let ln = value_to_f64(&lv)?;
             let rn = value_to_f64(&rv)?;
-            let result = match op {
-                BinOp::Add => ln + rn,
-                BinOp::Sub => ln - rn,
-                BinOp::Mul => ln * rn,
-                BinOp::Div => {
-                    if rn == 0.0 {
-                        return None;
-                    }
-                    ln / rn
-                }
-                BinOp::Mod => {
-                    if rn == 0.0 {
-                        return None;
-                    }
-                    ln % rn
-                }
-                _ => unreachable!(),
-            };
-            Some(Value::Number(result))
+            eval_arithmetic(op, ln, rn)
         }
-        _ => None, // unknown BinOp variant
+        _ => None,
     }
+}
+
+/// Three-valued (SQL NULL) logical AND.
+///
+/// Both sides are always evaluated so that partial information is preserved.
+/// This is essential for close-step guards where one side references an
+/// event field (missing at close time) and the other references
+/// close_reason (missing during accumulation).
+fn eval_logic_and(left: &Expr, right: &Expr, event: &Event) -> Option<Value> {
+    let lv = eval_expr(left, event);
+    let rv = eval_expr(right, event);
+    match (lv.as_ref(), rv.as_ref()) {
+        (Some(Value::Bool(false)), _) | (_, Some(Value::Bool(false))) => {
+            Some(Value::Bool(false))
+        }
+        (Some(Value::Bool(true)), Some(Value::Bool(true))) => Some(Value::Bool(true)),
+        _ => None,
+    }
+}
+
+/// Three-valued (SQL NULL) logical OR.
+fn eval_logic_or(left: &Expr, right: &Expr, event: &Event) -> Option<Value> {
+    let lv = eval_expr(left, event);
+    let rv = eval_expr(right, event);
+    match (lv.as_ref(), rv.as_ref()) {
+        (Some(Value::Bool(true)), _) | (_, Some(Value::Bool(true))) => {
+            Some(Value::Bool(true))
+        }
+        (Some(Value::Bool(false)), Some(Value::Bool(false))) => Some(Value::Bool(false)),
+        _ => None,
+    }
+}
+
+/// Arithmetic on two numeric values: +, -, *, /, %.
+fn eval_arithmetic(op: BinOp, lv: f64, rv: f64) -> Option<Value> {
+    let result = match op {
+        BinOp::Add => lv + rv,
+        BinOp::Sub => lv - rv,
+        BinOp::Mul => lv * rv,
+        BinOp::Div => {
+            if rv == 0.0 {
+                return None;
+            }
+            lv / rv
+        }
+        BinOp::Mod => {
+            if rv == 0.0 {
+                return None;
+            }
+            lv % rv
+        }
+        _ => return None,
+    };
+    Some(Value::Number(result))
 }
 
 /// Equality check for InList membership.

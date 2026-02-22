@@ -1,7 +1,7 @@
-use wf_lang::ast::WflFile;
+use wf_lang::ast::{RuleDecl, WflFile};
 use wf_lang::{BaseType, FieldType, WindowSchema};
 
-use crate::wfg_ast::{GenExpr, ParamValue, WfgFile};
+use crate::wfg_ast::{GenExpr, ParamValue, ScenarioDecl, WfgFile};
 
 /// A validation error found in a `.wfg` file.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,8 +25,23 @@ pub fn validate_wfg(
     wfl_files: &[WflFile],
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-
     let scenario = &wfg.scenario;
+
+    errors.extend(validate_scenario_basics(scenario));
+    errors.extend(validate_streams_with_schemas(scenario, schemas));
+
+    let all_rules: Vec<_> = wfl_files.iter().flat_map(|f| f.rules.iter()).collect();
+
+    errors.extend(validate_stream_rule_bindings(scenario, &all_rules));
+    errors.extend(validate_inject_blocks(scenario, &all_rules));
+    errors.extend(validate_oracle_params(scenario));
+
+    errors
+}
+
+/// SV2–SV6: basic scenario value checks (total, rates, percents).
+fn validate_scenario_basics(scenario: &ScenarioDecl) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
 
     // SV2: total > 0
     if scenario.total == 0 {
@@ -104,6 +119,16 @@ pub fn validate_wfg(
         }
     }
 
+    errors
+}
+
+/// SC3, SC4, SV7: stream–schema cross-checks (window exists, field names, type compat).
+fn validate_streams_with_schemas(
+    scenario: &ScenarioDecl,
+    schemas: &[WindowSchema],
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
     // SC3: stream.window must exist in schemas
     for stream in &scenario.streams {
         if !schemas.iter().any(|s| s.name == stream.window) {
@@ -157,46 +182,63 @@ pub fn validate_wfg(
         }
     }
 
-    // Collect all rules from WFL files
-    let all_rules: Vec<_> = wfl_files.iter().flat_map(|f| f.rules.iter()).collect();
+    errors
+}
 
-    // SC2 / SC2a: each stream alias should be declared in some WFL rule's events,
-    // and alias->window binding should be consistent with at least one rule.
-    if !all_rules.is_empty() {
-        for stream in &scenario.streams {
-            let alias_decls: Vec<_> = all_rules
+/// SC2, SC2a: stream alias ↔ rule events binding consistency.
+fn validate_stream_rule_bindings(
+    scenario: &ScenarioDecl,
+    all_rules: &[&RuleDecl],
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    if all_rules.is_empty() {
+        return errors;
+    }
+
+    for stream in &scenario.streams {
+        let alias_decls: Vec<_> = all_rules
+            .iter()
+            .flat_map(|r| r.events.decls.iter())
+            .filter(|e| e.alias == stream.alias)
+            .collect();
+
+        if alias_decls.is_empty() {
+            errors.push(ValidationError {
+                code: "SC2",
+                message: format!(
+                    "stream '{}': alias '{}' is not referenced by any rule events",
+                    stream.alias, stream.alias
+                ),
+            });
+            continue;
+        }
+
+        if !alias_decls.iter().any(|e| e.window == stream.window) {
+            let windows = alias_decls
                 .iter()
-                .flat_map(|r| r.events.decls.iter())
-                .filter(|e| e.alias == stream.alias)
-                .collect();
-
-            if alias_decls.is_empty() {
-                errors.push(ValidationError {
-                    code: "SC2",
-                    message: format!(
-                        "stream '{}': alias '{}' is not referenced by any rule events",
-                        stream.alias, stream.alias
-                    ),
-                });
-                continue;
-            }
-
-            if !alias_decls.iter().any(|e| e.window == stream.window) {
-                let windows = alias_decls
-                    .iter()
-                    .map(|e| e.window.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                errors.push(ValidationError {
-                    code: "SC2a",
-                    message: format!(
-                        "stream '{}': alias '{}' maps to window '{}' but rules map it to: {}",
-                        stream.alias, stream.alias, stream.window, windows
-                    ),
-                });
-            }
+                .map(|e| e.window.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            errors.push(ValidationError {
+                code: "SC2a",
+                message: format!(
+                    "stream '{}': alias '{}' maps to window '{}' but rules map it to: {}",
+                    stream.alias, stream.alias, stream.window, windows
+                ),
+            });
         }
     }
+
+    errors
+}
+
+/// SC5, SC6: inject block cross-checks (rule exists, stream aliases valid).
+fn validate_inject_blocks(
+    scenario: &ScenarioDecl,
+    all_rules: &[&RuleDecl],
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
 
     // SC5: inject.rule must exist in WFL files
     for inject in &scenario.injects {
@@ -211,7 +253,6 @@ pub fn validate_wfg(
     // SC6: inject.streams must be aliases of streams defined in the scenario
     // and must be declared in the target rule's events (alias + window).
     for inject in &scenario.injects {
-        // Find the target rule (if it exists — SC5 catches missing rules).
         let target_rule = all_rules.iter().find(|r| r.name == inject.rule);
 
         for stream_name in &inject.streams {
@@ -227,7 +268,6 @@ pub fn validate_wfg(
                     });
                 }
                 Some(stream) => {
-                    // SC6/SC2a: target rule must have the alias and matching window.
                     if let Some(rule) = target_rule {
                         let alias_events: Vec<_> = rule
                             .events
@@ -274,36 +314,44 @@ pub fn validate_wfg(
         }
     }
 
-    // SV8: oracle param type/range validation
-    if let Some(oracle) = &scenario.oracle {
-        for param in &oracle.params {
-            match param.name.as_str() {
-                "time_tolerance" => {
-                    if !matches!(&param.value, ParamValue::Duration(_)) {
-                        errors.push(ValidationError {
-                            code: "SV8",
-                            message: "oracle.time_tolerance must be a duration (e.g. 1s, 500ms)"
-                                .to_string(),
-                        });
-                    }
+    errors
+}
+
+/// SV8: oracle param type/range validation.
+fn validate_oracle_params(scenario: &ScenarioDecl) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    let Some(oracle) = &scenario.oracle else {
+        return errors;
+    };
+
+    for param in &oracle.params {
+        match param.name.as_str() {
+            "time_tolerance" => {
+                if !matches!(&param.value, ParamValue::Duration(_)) {
+                    errors.push(ValidationError {
+                        code: "SV8",
+                        message: "oracle.time_tolerance must be a duration (e.g. 1s, 500ms)"
+                            .to_string(),
+                    });
                 }
-                "score_tolerance" => match &param.value {
-                    ParamValue::Number(n) if *n >= 0.0 => {}
-                    ParamValue::Number(n) => {
-                        errors.push(ValidationError {
-                            code: "SV8",
-                            message: format!("oracle.score_tolerance must be >= 0, got {}", n),
-                        });
-                    }
-                    _ => {
-                        errors.push(ValidationError {
-                            code: "SV8",
-                            message: "oracle.score_tolerance must be a number".to_string(),
-                        });
-                    }
-                },
-                _ => {}
             }
+            "score_tolerance" => match &param.value {
+                ParamValue::Number(n) if *n >= 0.0 => {}
+                ParamValue::Number(n) => {
+                    errors.push(ValidationError {
+                        code: "SV8",
+                        message: format!("oracle.score_tolerance must be >= 0, got {}", n),
+                    });
+                }
+                _ => {
+                    errors.push(ValidationError {
+                        code: "SV8",
+                        message: "oracle.score_tolerance must be a number".to_string(),
+                    });
+                }
+            },
+            _ => {}
         }
     }
 
