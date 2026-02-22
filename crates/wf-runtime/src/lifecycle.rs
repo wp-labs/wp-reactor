@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::record_batch::RecordBatch;
 use orion_error::op_context;
 use orion_error::prelude::*;
 use tokio::sync::mpsc;
@@ -10,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use wf_config::{FusionConfig, SinkUri, resolve_glob};
-use wf_core::alert::{AlertSink, FanOutSink, FileAlertSink};
+use wf_core::alert::{AlertRecord, AlertSink, FanOutSink, FileAlertSink};
 use wf_core::rule::{CepStateMachine, RuleExecutor};
 use wf_core::window::{Evictor, Router, WindowRegistry};
 
@@ -68,6 +70,18 @@ impl TaskGroup {
 }
 
 // ---------------------------------------------------------------------------
+// BootstrapData — compiled artifacts from config-loading phase
+// ---------------------------------------------------------------------------
+
+/// Compiled artifacts from the config-loading phase, ready for task spawning.
+struct BootstrapData {
+    engines: Vec<RuleEngine>,
+    router: Arc<Router>,
+    alert_sink: Arc<dyn AlertSink>,
+    schema_count: usize,
+}
+
+// ---------------------------------------------------------------------------
 // FusionEngine — the top-level lifecycle handle
 // ---------------------------------------------------------------------------
 
@@ -96,111 +110,35 @@ impl FusionEngine {
 
         let cancel = CancellationToken::new();
 
-        // 1. Load .wfs files → Vec<WindowSchema>
-        let all_schemas = load_schemas(&config.runtime.schemas, base_dir)?;
-
-        // 2. Preprocess .wfl with config.vars → parse → compile → Vec<RulePlan>
-        let all_rule_plans =
-            compile_rules(&config.runtime.rules, base_dir, &config.vars, &all_schemas)?;
-
-        // 3. Cross-validate over vs over_cap
-        let window_overs: std::collections::HashMap<String, Duration> = all_schemas
-            .iter()
-            .map(|ws| (ws.name.clone(), ws.over))
-            .collect();
-        wf_config::validate_over_vs_over_cap(&config.windows, &window_overs).owe_conf()?;
-        wf_debug!(
-            conf,
-            windows = config.windows.len(),
-            "over vs over_cap validation passed"
-        );
-
-        // 4. Schema bridge: WindowSchema × WindowConfig → Vec<WindowDef>
-        let window_defs = schemas_to_window_defs(&all_schemas, &config.windows)
-            .owe(RuntimeReason::Bootstrap)?;
-
-        // 5. WindowRegistry::build → registry
-        let registry = WindowRegistry::build(window_defs).err_conv()?;
-
-        // 6. Router::new(registry)
-        let router = Arc::new(Router::new(registry));
-
-        // 7. Build RuleEngines (precompute stream_name → alias routing)
-        let engines = build_rule_engines(all_rule_plans, &all_schemas);
-
-        // 8. Create bounded event channel
+        // Phase 1: Load config & compile rules
+        let data = load_and_compile(&config, base_dir)?;
         wf_info!(
             sys,
-            schemas = all_schemas.len(),
-            rules = engines.len(),
-            windows = config.windows.len(),
+            schemas = data.schema_count,
+            rules = data.engines.len(),
             "engine bootstrap complete"
         );
-        let (event_tx, event_rx) = mpsc::channel(4096);
 
-        // ---------------------------------------------------------------
-        // Task groups — assembled in start order, joined LIFO on shutdown.
-        //
-        //   start:  alert → infra → scheduler → receiver
-        //   join:   receiver → scheduler → alert → infra
-        // ---------------------------------------------------------------
+        // Phase 2: Spawn task groups (start order: alert → infra → scheduler → receiver)
+        let (event_tx, event_rx) = mpsc::channel(4096);
         let mut groups: Vec<TaskGroup> = Vec::with_capacity(4);
 
-        // 9. Alert pipeline — build sink, create channel, spawn consumer task.
-        //    The alert task has no cancel token; it exits when the scheduler
-        //    drops its Sender after drain + flush, ensuring zero alert loss.
-        let alert_sink = build_alert_sink(&config, base_dir)?;
-        let (alert_tx, alert_rx) = mpsc::channel(alert_task::ALERT_CHANNEL_CAPACITY);
-        let mut alert_group = TaskGroup::new("alert");
-        alert_group.push(tokio::spawn(async move {
-            alert_task::run_alert_sink(alert_rx, alert_sink).await;
-            Ok(())
-        }));
+        let (alert_tx, alert_group) = spawn_alert_task(data.alert_sink);
         groups.push(alert_group);
 
-        // 10. Evictor task
-        let evictor = Evictor::new(config.window_defaults.max_total_bytes.as_bytes());
-        let evict_interval = config.window_defaults.evict_interval.as_duration();
-        let evictor_cancel = cancel.child_token();
-        let evictor_router = Arc::clone(&router);
-        let mut infra_group = TaskGroup::new("infra");
-        infra_group.push(tokio::spawn(async move {
-            evictor_task::run_evictor(evictor, evictor_router, evict_interval, evictor_cancel)
-                .await;
-            Ok(())
-        }));
-        groups.push(infra_group);
+        groups.push(spawn_evictor_task(&config, &data.router, cancel.child_token()));
 
-        // 11. Control command channel + Scheduler task
-        let (cmd_tx, cmd_rx) = mpsc::channel(64);
-        let scheduler = Scheduler::new(
+        let (cmd_tx, scheduler_group) = spawn_scheduler_task(
             event_rx,
-            engines,
+            data.engines,
             alert_tx,
+            &config,
             cancel.child_token(),
-            config.runtime.executor_parallelism,
-            config.runtime.rule_exec_timeout.as_duration(),
-            cmd_rx,
         );
-        let mut scheduler_group = TaskGroup::new("scheduler");
-        scheduler_group.push(tokio::spawn(async move { scheduler.run().await }));
         groups.push(scheduler_group);
 
-        // 12. Receiver task (last — starts accepting data)
-        let receiver =
-            Receiver::bind_with_event_tx(&config.server.listen, Arc::clone(&router), event_tx)
-                .await
-                .owe_sys()?;
-        let listen_addr = receiver.local_addr().owe_sys()?;
-        // Wire the receiver's internal cancel to our root cancel
-        let receiver_cancel = receiver.cancel_token();
-        let root_cancel = cancel.clone();
-        tokio::spawn(async move {
-            root_cancel.cancelled().await;
-            receiver_cancel.cancel();
-        });
-        let mut receiver_group = TaskGroup::new("receiver");
-        receiver_group.push(tokio::spawn(async move { receiver.run().await }));
+        let (listen_addr, receiver_group) =
+            spawn_receiver_task(&config, data.router, event_tx, cancel.clone()).await?;
         groups.push(receiver_group);
 
         op.mark_suc();
@@ -249,14 +187,140 @@ impl FusionEngine {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 1: load_and_compile — pure data transforms
+// ---------------------------------------------------------------------------
+
+/// Load schemas, compile rules, validate config, build engines and alert sink.
+fn load_and_compile(config: &FusionConfig, base_dir: &Path) -> RuntimeResult<BootstrapData> {
+    // 1. Load .wfs files → Vec<WindowSchema>
+    let all_schemas = load_schemas(&config.runtime.schemas, base_dir)?;
+
+    // 2. Preprocess .wfl with config.vars → parse → compile → Vec<RulePlan>
+    let all_rule_plans =
+        compile_rules(&config.runtime.rules, base_dir, &config.vars, &all_schemas)?;
+
+    // 3. Cross-validate over vs over_cap
+    let window_overs: HashMap<String, Duration> = all_schemas
+        .iter()
+        .map(|ws| (ws.name.clone(), ws.over))
+        .collect();
+    wf_config::validate_over_vs_over_cap(&config.windows, &window_overs).owe_conf()?;
+    wf_debug!(
+        conf,
+        windows = config.windows.len(),
+        "over vs over_cap validation passed"
+    );
+
+    // 4. Schema bridge: WindowSchema × WindowConfig → Vec<WindowDef>
+    let window_defs =
+        schemas_to_window_defs(&all_schemas, &config.windows).owe(RuntimeReason::Bootstrap)?;
+
+    // 5. WindowRegistry::build → registry
+    let registry = WindowRegistry::build(window_defs).err_conv()?;
+
+    // 6. Router::new(registry)
+    let router = Arc::new(Router::new(registry));
+
+    // 7. Build RuleEngines (precompute stream_name → alias routing)
+    let engines = build_rule_engines(all_rule_plans, &all_schemas);
+
+    // 8. Build alert sink
+    let alert_sink = build_alert_sink(config, base_dir)?;
+
+    let schema_count = all_schemas.len();
+    Ok(BootstrapData {
+        engines,
+        router,
+        alert_sink,
+        schema_count,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: task spawn helpers — each creates channel + spawns task
+// ---------------------------------------------------------------------------
+
+/// Spawn the alert pipeline: build channel, spawn consumer task.
+/// Returns (alert_tx, task_group).
+fn spawn_alert_task(alert_sink: Arc<dyn AlertSink>) -> (mpsc::Sender<AlertRecord>, TaskGroup) {
+    let (alert_tx, alert_rx) = mpsc::channel(alert_task::ALERT_CHANNEL_CAPACITY);
+    let mut group = TaskGroup::new("alert");
+    group.push(tokio::spawn(async move {
+        alert_task::run_alert_sink(alert_rx, alert_sink).await;
+        Ok(())
+    }));
+    (alert_tx, group)
+}
+
+/// Spawn the periodic window evictor task.
+fn spawn_evictor_task(
+    config: &FusionConfig,
+    router: &Arc<Router>,
+    cancel: CancellationToken,
+) -> TaskGroup {
+    let evictor = Evictor::new(config.window_defaults.max_total_bytes.as_bytes());
+    let evict_interval = config.window_defaults.evict_interval.as_duration();
+    let router = Arc::clone(router);
+    let mut group = TaskGroup::new("infra");
+    group.push(tokio::spawn(async move {
+        evictor_task::run_evictor(evictor, router, evict_interval, cancel).await;
+        Ok(())
+    }));
+    group
+}
+
+/// Spawn the CEP scheduler task.
+/// Returns (cmd_tx, task_group).
+fn spawn_scheduler_task(
+    event_rx: mpsc::Receiver<(String, RecordBatch)>,
+    engines: Vec<RuleEngine>,
+    alert_tx: mpsc::Sender<AlertRecord>,
+    config: &FusionConfig,
+    cancel: CancellationToken,
+) -> (mpsc::Sender<SchedulerCommand>, TaskGroup) {
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let scheduler = Scheduler::new(
+        event_rx,
+        engines,
+        alert_tx,
+        cancel,
+        config.runtime.executor_parallelism,
+        config.runtime.rule_exec_timeout.as_duration(),
+        cmd_rx,
+    );
+    let mut group = TaskGroup::new("scheduler");
+    group.push(tokio::spawn(async move { scheduler.run().await }));
+    (cmd_tx, group)
+}
+
+/// Bind the receiver and spawn its task.
+/// Returns (listen_addr, task_group).
+async fn spawn_receiver_task(
+    config: &FusionConfig,
+    router: Arc<Router>,
+    event_tx: mpsc::Sender<(String, RecordBatch)>,
+    cancel: CancellationToken,
+) -> RuntimeResult<(SocketAddr, TaskGroup)> {
+    let receiver = Receiver::bind_with_event_tx(&config.server.listen, router, event_tx)
+        .await
+        .owe_sys()?;
+    let listen_addr = receiver.local_addr().owe_sys()?;
+    let receiver_cancel = receiver.cancel_token();
+    tokio::spawn(async move {
+        cancel.cancelled().await;
+        receiver_cancel.cancel();
+    });
+    let mut group = TaskGroup::new("receiver");
+    group.push(tokio::spawn(async move { receiver.run().await }));
+    Ok((listen_addr, group))
+}
+
+// ---------------------------------------------------------------------------
 // Compile-phase helpers — pure data transforms extracted from start()
 // ---------------------------------------------------------------------------
 
 /// Load all `.wfs` schema files matching `glob_pattern` under `base_dir`.
-fn load_schemas(
-    glob_pattern: &str,
-    base_dir: &Path,
-) -> RuntimeResult<Vec<wf_lang::WindowSchema>> {
+fn load_schemas(glob_pattern: &str, base_dir: &Path) -> RuntimeResult<Vec<wf_lang::WindowSchema>> {
     let wfs_paths = resolve_glob(glob_pattern, base_dir).owe_conf()?;
     let mut all_schemas = Vec::new();
     for full_path in &wfs_paths {
@@ -293,8 +357,7 @@ fn compile_rules(
         let wfl_file = wf_lang::parse_wfl(&preprocessed)
             .owe(RuntimeReason::Bootstrap)
             .position(full_path.display().to_string())?;
-        let plans = wf_lang::compile_wfl(&wfl_file, schemas)
-            .owe(RuntimeReason::Bootstrap)?;
+        let plans = wf_lang::compile_wfl(&wfl_file, schemas).owe(RuntimeReason::Bootstrap)?;
         wf_debug!(conf, file = %full_path.display(), rules = plans.len(), "compiled rule file");
         all_rule_plans.extend(plans);
     }
@@ -311,8 +374,7 @@ fn build_rule_engines(
     for plan in plans {
         let stream_aliases = build_stream_aliases(&plan.binds, schemas);
         let time_field = resolve_time_field(&plan.binds, schemas);
-        let machine =
-            CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), time_field);
+        let machine = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), time_field);
         let executor = RuleExecutor::new(plan);
         engines.push(RuleEngine {
             machine,
