@@ -1,7 +1,7 @@
 //! End-to-end integration test driven by `wf-datagen`.
 //!
 //! Uses the full datagen pipeline: `.wfg` scenario → event generation → oracle
-//! prediction → FusionEngine execution → alert verification.
+//! prediction → Reactor execution → alert verification.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -14,7 +14,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 use wf_config::FusionConfig;
-use wf_runtime::lifecycle::FusionEngine;
+use wf_runtime::lifecycle::Reactor;
 use wf_runtime::tracing_init::{DomainFormat, FileFields};
 
 /// Build a length-prefixed TCP frame from an Arrow IPC payload.
@@ -151,10 +151,10 @@ FAIL_THRESHOLD = "3"
     let config: FusionConfig = toml_str.parse().expect("failed to parse config TOML");
 
     // ---- Start engine ----
-    let engine = FusionEngine::start(config, &base_dir)
+    let reactor = Reactor::start(config, &base_dir)
         .await
-        .expect("FusionEngine::start failed");
-    let addr = engine.listen_addr();
+        .expect("Reactor::start failed");
+    let addr = reactor.listen_addr();
 
     // ---- Convert GenEvents → typed Arrow batches → TCP frames ----
     let batches =
@@ -176,9 +176,9 @@ FAIL_THRESHOLD = "3"
 
     // ---- Wait for processing + shutdown ----
     tokio::time::sleep(Duration::from_millis(500)).await;
-    engine.shutdown();
+    reactor.shutdown();
     drop(stream);
-    engine.wait().await.expect("engine.wait failed");
+    reactor.wait().await.expect("reactor.wait failed");
 
     // ---- Read actual alerts ----
     let actual = wf_datagen::output::jsonl::read_alerts_jsonl(&alert_path)

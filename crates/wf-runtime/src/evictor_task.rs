@@ -13,7 +13,11 @@ pub async fn run_evictor(
     interval: Duration,
     cancel: CancellationToken,
 ) {
-    let mut tick = tokio::time::interval(interval);
+    // Use interval_at with an initial delay equal to the interval period.
+    // tokio::time::interval() fires its first tick immediately, which can
+    // race with freshly appended data and evict it before engine tasks read it.
+    let start = tokio::time::Instant::now() + interval;
+    let mut tick = tokio::time::interval_at(start, interval);
     loop {
         tokio::select! {
             _ = tick.tick() => {

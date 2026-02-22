@@ -16,7 +16,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 use wf_config::FusionConfig;
-use wf_runtime::lifecycle::FusionEngine;
+use wf_runtime::lifecycle::Reactor;
 use wf_runtime::tracing_init::{DomainFormat, FileFields};
 
 /// Build a length-prefixed TCP frame from an Arrow IPC payload.
@@ -105,11 +105,11 @@ FAIL_THRESHOLD = "3"
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let base_dir = manifest_dir.join("../../examples");
 
-    // -- Start engine --
-    let engine = FusionEngine::start(config, &base_dir)
+    // -- Start reactor --
+    let reactor = Reactor::start(config, &base_dir)
         .await
-        .expect("FusionEngine::start failed");
-    let addr = engine.listen_addr();
+        .expect("Reactor::start failed");
+    let addr = reactor.listen_addr();
 
     // -- Connect TCP and send 3 "failed" auth events --
     // Fields must be nullable to match the Window schema built from .wfs files.
@@ -155,10 +155,10 @@ FAIL_THRESHOLD = "3"
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // -- Shutdown (flush triggers on-close evaluation) --
-    engine.shutdown();
+    reactor.shutdown();
     // Drop TCP stream so the receiver's event_tx can close.
     drop(stream);
-    engine.wait().await.expect("engine.wait failed");
+    reactor.wait().await.expect("reactor.wait failed");
 
     // -- Verify alert output --
     let alert_content = std::fs::read_to_string(&alert_path)

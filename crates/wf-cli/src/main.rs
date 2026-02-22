@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use wf_config::FusionConfig;
-use wf_runtime::lifecycle::{FusionEngine, wait_for_signal};
+use wf_runtime::lifecycle::{Reactor, wait_for_signal};
 use wf_runtime::tracing_init::init_tracing;
 
 #[derive(Parser)]
@@ -40,14 +40,14 @@ async fn main() -> Result<()> {
 
             let _guard = init_tracing(&fusion_config.logging, base_dir)?;
 
-            let engine = FusionEngine::start(fusion_config, base_dir)
+            let reactor = Reactor::start(fusion_config, base_dir)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            tracing::info!(domain = "sys", listen = %engine.listen_addr(), "WarpFusion engine started");
+            tracing::info!(domain = "sys", listen = %reactor.listen_addr(), "WarpFusion reactor started");
 
-            wait_for_signal(engine.cancel_token()).await;
-            engine.shutdown();
-            engine.wait().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            wait_for_signal(reactor.cancel_token()).await;
+            reactor.shutdown();
+            reactor.wait().await.map_err(|e| anyhow::anyhow!("{e}"))?;
         }
     }
 

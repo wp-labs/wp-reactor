@@ -114,6 +114,15 @@ where
             }
         }
 
+        // 4b. <task_id> prefix
+        if let Some(ref task_id) = visitor.task_id {
+            if ansi {
+                write!(writer, "\x1b[1m<{task_id}>\x1b[0m ")?;
+            } else {
+                write!(writer, "<{task_id}> ")?;
+            }
+        }
+
         // 5. Span context
         if let Some(scope) = ctx.event_scope() {
             for span in scope.from_root() {
@@ -157,6 +166,7 @@ where
 #[derive(Default)]
 struct DomainExtractor {
     domain: Option<String>,
+    task_id: Option<String>,
     message: String,
     other_fields: String,
 }
@@ -173,6 +183,7 @@ impl Visit for DomainExtractor {
     fn record_str(&mut self, field: &Field, value: &str) {
         match field.name() {
             "domain" => self.domain = Some(value.to_string()),
+            "task_id" => self.task_id = Some(value.to_string()),
             "message" => self.message = value.to_string(),
             name => {
                 self.push_separator();
@@ -186,6 +197,10 @@ impl Visit for DomainExtractor {
             "domain" => {
                 let s = format!("{value:?}");
                 self.domain = Some(s.trim_matches('"').to_string());
+            }
+            "task_id" => {
+                let s = format!("{value:?}");
+                self.task_id = Some(s.trim_matches('"').to_string());
             }
             "message" => {
                 write!(&mut self.message, "{value:?}").ok();

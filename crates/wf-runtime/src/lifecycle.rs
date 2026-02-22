@@ -16,7 +16,7 @@ use wf_core::rule::{CepStateMachine, RuleExecutor};
 use wf_core::window::{Evictor, Router, WindowRegistry};
 
 use crate::alert_task;
-use crate::engine_task::{EngineTaskConfig, WindowSource, run_engine_task};
+use crate::engine_task::{RuleTaskConfig, WindowSource, run_rule_task};
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::evictor_task;
 use crate::receiver::Receiver;
@@ -31,11 +31,11 @@ use crate::schema_bridge::schemas_to_window_defs;
 /// Groups are assembled in *start order* and joined in *reverse order*
 /// (LIFO) during shutdown, mirroring the dependency graph:
 ///
-///   start:  alert → infra → engines → receiver
-///   join:   receiver → engines → alert → infra
+///   start:  alert → evictor → rules → receiver
+///   join:   receiver → rules → alert → evictor
 ///
 /// This ensures upstream producers exit before downstream consumers,
-/// and consumers can drain all in-flight work before the engine stops.
+/// and consumers can drain all in-flight work before the reactor stops.
 pub(crate) struct TaskGroup {
     name: &'static str,
     handles: Vec<JoinHandle<anyhow::Result<()>>>,
@@ -69,12 +69,12 @@ impl TaskGroup {
 }
 
 // ---------------------------------------------------------------------------
-// RuleEngine — one per compiled rule (construction interface)
+// RunRule — one per compiled rule (construction interface)
 // ---------------------------------------------------------------------------
 
 /// Pairs a [`CepStateMachine`] with its [`RuleExecutor`] and precomputed
 /// routing from stream names to CEP aliases.
-pub(crate) struct RuleEngine {
+pub(crate) struct RunRule {
     pub machine: CepStateMachine,
     pub executor: RuleExecutor,
     /// `stream_name → Vec<alias>` — which aliases should receive events from
@@ -88,7 +88,7 @@ pub(crate) struct RuleEngine {
 
 /// Compiled artifacts from the config-loading phase, ready for task spawning.
 struct BootstrapData {
-    engines: Vec<RuleEngine>,
+    rules: Vec<RunRule>,
     router: Arc<Router>,
     alert_sink: Arc<dyn AlertSink>,
     schema_count: usize,
@@ -96,7 +96,7 @@ struct BootstrapData {
 }
 
 // ---------------------------------------------------------------------------
-// FusionEngine — the top-level lifecycle handle
+// Reactor — the top-level lifecycle handle
 // ---------------------------------------------------------------------------
 
 /// Manages the full lifecycle of the CEP runtime: bootstrap, run, and
@@ -104,18 +104,18 @@ struct BootstrapData {
 ///
 /// Task groups are stored in start order and joined in reverse (LIFO)
 /// during [`wait`](Self::wait), ensuring correct drain sequencing:
-/// receiver stops first, then engine tasks drain and flush, then alert
-/// sink flushes to disk, and finally infrastructure (evictor) stops.
-pub struct FusionEngine {
+/// receiver stops first, then rule tasks drain and flush, then alert
+/// sink flushes to disk, and finally evictor stops.
+pub struct Reactor {
     cancel: CancellationToken,
-    /// Separate cancel token for engine tasks — triggered only after the
+    /// Separate cancel token for rule tasks — triggered only after the
     /// receiver has fully stopped, ensuring all in-flight data is drained.
-    engine_cancel: CancellationToken,
+    rule_cancel: CancellationToken,
     groups: Vec<TaskGroup>,
     listen_addr: SocketAddr,
 }
 
-impl FusionEngine {
+impl Reactor {
     /// Bootstrap the entire runtime from a [`FusionConfig`] and a base
     /// directory (for resolving relative `.wfs` / `.wfl` file paths).
     #[tracing::instrument(name = "engine.start", skip_all, fields(listen = %config.server.listen))]
@@ -125,18 +125,18 @@ impl FusionEngine {
         op.record("base_dir", base_dir.display().to_string().as_str());
 
         let cancel = CancellationToken::new();
-        let engine_cancel = CancellationToken::new();
+        let rule_cancel = CancellationToken::new();
 
         // Phase 1: Load config & compile rules
         let data = load_and_compile(&config, base_dir)?;
         wf_info!(
             sys,
             schemas = data.schema_count,
-            rules = data.engines.len(),
+            rules = data.rules.len(),
             "engine bootstrap complete"
         );
 
-        // Phase 2: Spawn task groups (start order: alert → infra → engines → receiver)
+        // Phase 2: Spawn task groups (start order: alert → evictor → rules → receiver)
         let mut groups: Vec<TaskGroup> = Vec::with_capacity(4);
 
         let (alert_tx, alert_group) = spawn_alert_task(data.alert_sink);
@@ -144,15 +144,15 @@ impl FusionEngine {
 
         groups.push(spawn_evictor_task(&config, &data.router, cancel.child_token()));
 
-        let engine_group = spawn_engine_tasks(
-            data.engines,
+        let rule_group = spawn_rule_tasks(
+            data.rules,
             &data.router,
             &data.schemas,
             alert_tx,
             &config,
-            engine_cancel.child_token(),
+            rule_cancel.child_token(),
         );
-        groups.push(engine_group);
+        groups.push(rule_group);
 
         let (listen_addr, receiver_group) =
             spawn_receiver_task(&config, data.router, cancel.clone()).await?;
@@ -161,7 +161,7 @@ impl FusionEngine {
         op.mark_suc();
         Ok(Self {
             cancel,
-            engine_cancel,
+            rule_cancel,
             groups,
             listen_addr,
         })
@@ -181,10 +181,10 @@ impl FusionEngine {
     /// Wait for all task groups to complete after shutdown.
     ///
     /// Groups are joined in LIFO order (reverse of start order):
-    /// receiver → engines → alert → infra.
+    /// receiver → rules → alert → evictor.
     ///
     /// Two-phase shutdown: the receiver is joined first, ensuring all
-    /// in-flight data has been routed to windows. Only then are the engine
+    /// in-flight data has been routed to windows. Only then are the rule
     /// tasks cancelled so they can do a final drain + flush.
     pub async fn wait(mut self) -> RuntimeResult<()> {
         while let Some(group) = self.groups.pop() {
@@ -196,7 +196,7 @@ impl FusionEngine {
             if name == "receiver" {
                 // Receiver fully stopped — all data is in windows.
                 // Now signal engine tasks to do their final drain + flush.
-                self.engine_cancel.cancel();
+                self.rule_cancel.cancel();
             }
         }
         Ok(())
@@ -243,15 +243,15 @@ fn load_and_compile(config: &FusionConfig, base_dir: &Path) -> RuntimeResult<Boo
     // 6. Router::new(registry)
     let router = Arc::new(Router::new(registry));
 
-    // 7. Build RuleEngines (precompute stream_name → alias routing)
-    let engines = build_rule_engines(&all_rule_plans, &all_schemas);
+    // 7. Build RunRules (precompute stream_name → alias routing)
+    let rules = build_run_rules(&all_rule_plans, &all_schemas);
 
     // 8. Build alert sink
     let alert_sink = build_alert_sink(config, base_dir)?;
 
     let schema_count = all_schemas.len();
     Ok(BootstrapData {
-        engines,
+        rules,
         router,
         alert_sink,
         schema_count,
@@ -284,7 +284,7 @@ fn spawn_evictor_task(
     let evictor = Evictor::new(config.window_defaults.max_total_bytes.as_bytes());
     let evict_interval = config.window_defaults.evict_interval.as_duration();
     let router = Arc::clone(router);
-    let mut group = TaskGroup::new("infra");
+    let mut group = TaskGroup::new("evictor");
     group.push(tokio::spawn(async move {
         evictor_task::run_evictor(evictor, router, evict_interval, cancel).await;
         Ok(())
@@ -292,49 +292,49 @@ fn spawn_evictor_task(
     group
 }
 
-/// Spawn one independent task per rule engine.
+/// Spawn one independent task per compiled rule.
 ///
-/// Each engine task owns its `CepStateMachine` exclusively (no `Arc<Mutex>`).
+/// Each rule task owns its `CepStateMachine` exclusively (no `Arc<Mutex>`).
 /// It subscribes to window notifications and uses cursor-based `read_since()`
 /// to pull new batches.
-fn spawn_engine_tasks(
-    engines: Vec<RuleEngine>,
+fn spawn_rule_tasks(
+    rules: Vec<RunRule>,
     router: &Arc<Router>,
     schemas: &[wf_lang::WindowSchema],
     alert_tx: mpsc::Sender<AlertRecord>,
     _config: &FusionConfig,
     cancel: CancellationToken,
 ) -> TaskGroup {
-    let mut group = TaskGroup::new("engines");
+    let mut group = TaskGroup::new("rules");
     let timeout_scan_interval = Duration::from_secs(1);
 
-    for engine in engines {
+    for rule in rules {
         let window_sources =
-            resolve_window_sources(&engine.stream_aliases, schemas, router.registry());
+            resolve_window_sources(&rule.stream_aliases, schemas, router.registry());
 
-        let task_config = EngineTaskConfig {
-            machine: engine.machine,
-            executor: engine.executor,
+        let task_config = RuleTaskConfig {
+            machine: rule.machine,
+            executor: rule.executor,
             window_sources,
-            stream_aliases: engine.stream_aliases,
+            stream_aliases: rule.stream_aliases,
             alert_tx: alert_tx.clone(),
             cancel: cancel.child_token(),
             timeout_scan_interval,
         };
 
         group.push(tokio::spawn(async move {
-            run_engine_task(task_config).await
+            run_rule_task(task_config).await
         }));
     }
 
-    // Drop our copy of alert_tx so the alert channel closes when all engine
+    // Drop our copy of alert_tx so the alert channel closes when all rule
     // tasks finish.
     drop(alert_tx);
 
     group
 }
 
-/// Resolve which windows an engine needs to subscribe to, based on its
+/// Resolve which windows a rule needs to subscribe to, based on its
 /// stream_aliases (stream → alias mapping) and the window schemas (which
 /// define which streams flow into each window).
 fn resolve_window_sources(
@@ -449,25 +449,25 @@ fn compile_rules(
     Ok(all_rule_plans)
 }
 
-/// Build [`RuleEngine`] instances from compiled plans, pre-computing stream
+/// Build [`RunRule`] instances from compiled plans, pre-computing stream
 /// alias routing and constructing the CEP state machines.
-fn build_rule_engines(
+fn build_run_rules(
     plans: &[wf_lang::plan::RulePlan],
     schemas: &[wf_lang::WindowSchema],
-) -> Vec<RuleEngine> {
-    let mut engines = Vec::with_capacity(plans.len());
+) -> Vec<RunRule> {
+    let mut rules = Vec::with_capacity(plans.len());
     for plan in plans {
         let stream_aliases = build_stream_aliases(&plan.binds, schemas);
         let time_field = resolve_time_field(&plan.binds, schemas);
         let machine = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), time_field);
         let executor = RuleExecutor::new(plan.clone());
-        engines.push(RuleEngine {
+        rules.push(RunRule {
             machine,
             executor,
             stream_aliases,
         });
     }
-    engines
+    rules
 }
 
 /// Resolve the event-time field name for a rule from its first bind's window schema.
