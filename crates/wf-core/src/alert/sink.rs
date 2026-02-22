@@ -3,13 +3,15 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-use anyhow::Result;
+use orion_error::prelude::*;
+
+use crate::error::{CoreError, CoreReason, CoreResult};
 
 use super::AlertRecord;
 
 /// Trait for alert output destinations.
 pub trait AlertSink: Send + Sync {
-    fn send(&self, record: &AlertRecord) -> Result<()>;
+    fn send(&self, record: &AlertRecord) -> CoreResult<()>;
 }
 
 /// Appends alerts as JSON Lines to a file.
@@ -18,11 +20,12 @@ pub struct FileAlertSink {
 }
 
 impl FileAlertSink {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> CoreResult<Self> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path.as_ref())?;
+            .open(path.as_ref())
+            .owe(CoreReason::AlertSink)?;
         Ok(Self {
             writer: Mutex::new(BufWriter::new(file)),
         })
@@ -30,12 +33,12 @@ impl FileAlertSink {
 }
 
 impl AlertSink for FileAlertSink {
-    fn send(&self, record: &AlertRecord) -> Result<()> {
-        let json = serde_json::to_string(record)?;
+    fn send(&self, record: &AlertRecord) -> CoreResult<()> {
+        let json = serde_json::to_string(record).owe(CoreReason::AlertSink)?;
         let mut w = self.writer.lock().expect("alert sink lock poisoned");
-        w.write_all(json.as_bytes())?;
-        w.write_all(b"\n")?;
-        w.flush()?;
+        w.write_all(json.as_bytes()).owe(CoreReason::AlertSink)?;
+        w.write_all(b"\n").owe(CoreReason::AlertSink)?;
+        w.flush().owe(CoreReason::AlertSink)?;
         Ok(())
     }
 }
@@ -55,8 +58,8 @@ impl FanOutSink {
 }
 
 impl AlertSink for FanOutSink {
-    fn send(&self, record: &AlertRecord) -> Result<()> {
-        let mut first_err: Option<anyhow::Error> = None;
+    fn send(&self, record: &AlertRecord) -> CoreResult<()> {
+        let mut first_err: Option<CoreError> = None;
         for sink in &self.sinks {
             if let Err(e) = sink.send(record)
                 && first_err.is_none()
@@ -84,7 +87,7 @@ mod tests {
 
     // Implement AlertSink for Arc<T> so Arc<CountingSink> works as Box<dyn AlertSink>
     impl<T: AlertSink> AlertSink for Arc<T> {
-        fn send(&self, record: &AlertRecord) -> Result<()> {
+        fn send(&self, record: &AlertRecord) -> CoreResult<()> {
             (**self).send(record)
         }
     }
@@ -175,7 +178,7 @@ mod tests {
     }
 
     impl AlertSink for CountingSink {
-        fn send(&self, _record: &AlertRecord) -> Result<()> {
+        fn send(&self, _record: &AlertRecord) -> CoreResult<()> {
             self.count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -185,8 +188,10 @@ mod tests {
     struct FailSink;
 
     impl AlertSink for FailSink {
-        fn send(&self, _record: &AlertRecord) -> Result<()> {
-            anyhow::bail!("intentional failure");
+        fn send(&self, _record: &AlertRecord) -> CoreResult<()> {
+            StructError::from(CoreReason::AlertSink)
+                .with_detail("intentional failure")
+                .err()
         }
     }
 

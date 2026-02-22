@@ -34,6 +34,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use wf_core::error::CoreResult;
 
     fn sample_alert(id: &str) -> AlertRecord {
         AlertRecord {
@@ -65,7 +66,7 @@ mod tests {
     }
 
     impl AlertSink for CollectorSink {
-        fn send(&self, record: &AlertRecord) -> anyhow::Result<()> {
+        fn send(&self, record: &AlertRecord) -> CoreResult<()> {
             self.alerts.lock().unwrap().push(record.alert_id.clone());
             Ok(())
         }
@@ -87,9 +88,11 @@ mod tests {
     }
 
     impl AlertSink for FailCountSink {
-        fn send(&self, _record: &AlertRecord) -> anyhow::Result<()> {
+        fn send(&self, _record: &AlertRecord) -> CoreResult<()> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
-            anyhow::bail!("intentional");
+            orion_error::StructError::from(wf_core::error::CoreReason::AlertSink)
+                .with_detail("intentional")
+                .err()
         }
     }
 

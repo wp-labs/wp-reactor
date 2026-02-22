@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{Result, bail};
 use arrow::record_batch::RecordBatch;
+use orion_error::prelude::*;
 use wf_config::{DistMode, WindowConfig};
+
+use crate::error::{CoreReason, CoreResult};
 
 use super::buffer::{Window, WindowParams};
 
@@ -59,14 +61,16 @@ impl WindowRegistry {
     /// Build a registry from a list of window definitions.
     ///
     /// Returns `Err` if two definitions share the same window name.
-    pub fn build(defs: Vec<WindowDef>) -> Result<Self> {
+    pub fn build(defs: Vec<WindowDef>) -> CoreResult<Self> {
         let mut windows = HashMap::with_capacity(defs.len());
         let mut subscriptions: HashMap<String, Vec<Subscription>> = HashMap::new();
 
         for def in defs {
             let name = def.params.name.clone();
             if windows.contains_key(&name) {
-                bail!("duplicate window name: {:?}", name);
+                return StructError::from(CoreReason::WindowBuild)
+                    .with_detail(format!("duplicate window name: {:?}", name))
+                    .err();
             }
 
             let mode = def.config.mode.clone();
@@ -96,7 +100,7 @@ impl WindowRegistry {
     /// and `Partitioned` are skipped (deferred to M10 Router).
     /// Unknown stream names are a no-op (returns `Ok(())`).
     #[deprecated(note = "Use Router::route for watermark-aware routing")]
-    pub fn route(&self, stream_name: &str, batch: RecordBatch) -> Result<()> {
+    pub fn route(&self, stream_name: &str, batch: RecordBatch) -> CoreResult<()> {
         let Some(subs) = self.subscriptions.get(stream_name) else {
             return Ok(());
         };
@@ -110,7 +114,9 @@ impl WindowRegistry {
                 .get(&sub.window_name)
                 .expect("subscription references non-existent window");
             let mut win = win_lock.write().expect("window lock poisoned");
-            win.append_with_watermark(batch.clone()).map(|_| ())?;
+            win.append_with_watermark(batch.clone())
+                .map(|_| ())
+                .owe(CoreReason::WindowBuild)?;
         }
 
         Ok(())

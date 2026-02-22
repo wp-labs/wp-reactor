@@ -1,11 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Result, bail};
+use orion_error::prelude::*;
 
 use wf_lang::ast::FieldRef;
 use wf_lang::plan::RulePlan;
 
 use crate::alert::AlertRecord;
+use crate::error::{CoreReason, CoreResult};
 use crate::rule::match_engine::{
     CloseOutput, Event, MatchedContext, StepData, Value, eval_expr, field_ref_name, value_to_string,
 };
@@ -33,7 +34,7 @@ impl RuleExecutor {
     }
 
     /// Produce an [`AlertRecord`] from an on-event match.
-    pub fn execute_match(&self, matched: &MatchedContext) -> Result<AlertRecord> {
+    pub fn execute_match(&self, matched: &MatchedContext) -> CoreResult<AlertRecord> {
         let ctx = build_eval_context(
             &self.plan.match_plan.keys,
             &matched.scope_key,
@@ -69,7 +70,7 @@ impl RuleExecutor {
     ///
     /// Returns `Ok(None)` when `!event_ok || !close_ok` — the instance
     /// did not fully satisfy the rule.
-    pub fn execute_close(&self, close: &CloseOutput) -> Result<Option<AlertRecord>> {
+    pub fn execute_close(&self, close: &CloseOutput) -> CoreResult<Option<AlertRecord>> {
         if !close.event_ok || !close.close_ok {
             return Ok(None);
         }
@@ -142,15 +143,23 @@ fn build_eval_context(keys: &[FieldRef], scope_key: &[Value], step_data: &[StepD
 }
 
 /// Evaluate the score expression and clamp to `[0, 100]`.
-fn eval_score(expr: &wf_lang::ast::Expr, ctx: &Event) -> Result<f64> {
+fn eval_score(expr: &wf_lang::ast::Expr, ctx: &Event) -> CoreResult<f64> {
     let val = eval_expr(expr, ctx);
     let raw = match val {
         Some(Value::Number(n)) => n,
-        Some(other) => bail!(
-            "score expression evaluated to non-numeric value: {:?}",
-            other
-        ),
-        None => bail!("score expression evaluated to None"),
+        Some(other) => {
+            return StructError::from(CoreReason::RuleExec)
+                .with_detail(format!(
+                    "score expression evaluated to non-numeric value: {:?}",
+                    other
+                ))
+                .err();
+        }
+        None => {
+            return StructError::from(CoreReason::RuleExec)
+                .with_detail("score expression evaluated to None")
+                .err();
+        }
     };
     Ok(clamp_score(raw))
 }
@@ -160,11 +169,13 @@ fn clamp_score(v: f64) -> f64 {
 }
 
 /// Evaluate the entity_id expression.
-fn eval_entity_id(expr: &wf_lang::ast::Expr, ctx: &Event) -> Result<String> {
+fn eval_entity_id(expr: &wf_lang::ast::Expr, ctx: &Event) -> CoreResult<String> {
     let val = eval_expr(expr, ctx);
     match val {
         Some(v) => Ok(value_to_string(&v)),
-        None => bail!("entity_id expression evaluated to None"),
+        None => StructError::from(CoreReason::RuleExec)
+            .with_detail("entity_id expression evaluated to None")
+            .err(),
     }
 }
 

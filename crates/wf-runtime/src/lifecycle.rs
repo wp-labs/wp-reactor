@@ -3,7 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use orion_error::op_context;
+use orion_error::prelude::*;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -14,6 +15,7 @@ use wf_core::rule::{CepStateMachine, RuleExecutor};
 use wf_core::window::{Evictor, Router, WindowRegistry};
 
 use crate::alert_task;
+use crate::error::{RuntimeReason, RuntimeResult};
 use crate::evictor_task;
 use crate::receiver::Receiver;
 use crate::scheduler::{RuleEngine, Scheduler, SchedulerCommand, build_stream_aliases};
@@ -35,7 +37,7 @@ use crate::schema_bridge::schemas_to_window_defs;
 /// and consumers can drain all in-flight work before the engine stops.
 pub(crate) struct TaskGroup {
     name: &'static str,
-    handles: Vec<JoinHandle<Result<()>>>,
+    handles: Vec<JoinHandle<anyhow::Result<()>>>,
 }
 
 impl TaskGroup {
@@ -46,14 +48,20 @@ impl TaskGroup {
         }
     }
 
-    fn push(&mut self, handle: JoinHandle<Result<()>>) {
+    fn push(&mut self, handle: JoinHandle<anyhow::Result<()>>) {
         self.handles.push(handle);
     }
 
     /// Join all tasks in this group, returning the first error.
-    async fn wait(self) -> Result<()> {
+    async fn wait(self) -> RuntimeResult<()> {
         for handle in self.handles {
-            handle.await??;
+            handle
+                .await
+                .map_err(|e| {
+                    StructError::from(RuntimeReason::Shutdown)
+                        .with_detail(format!("task join error: {e}"))
+                })?
+                .owe(RuntimeReason::Shutdown)?;
         }
         Ok(())
     }
@@ -81,30 +89,42 @@ impl FusionEngine {
     /// Bootstrap the entire runtime from a [`FusionConfig`] and a base
     /// directory (for resolving relative `.wfs` / `.wfl` file paths).
     #[tracing::instrument(name = "engine.start", skip_all, fields(listen = %config.server.listen))]
-    pub async fn start(config: FusionConfig, base_dir: &Path) -> Result<Self> {
+    pub async fn start(config: FusionConfig, base_dir: &Path) -> RuntimeResult<Self> {
+        let mut op = op_context!("engine-bootstrap").with_auto_log();
+        op.record("listen", config.server.listen.as_str());
+        op.record("base_dir", base_dir.display().to_string().as_str());
+
         let cancel = CancellationToken::new();
 
         // 1. Load .wfs files → Vec<WindowSchema>
-        let wfs_paths = resolve_glob(&config.runtime.schemas, base_dir)?;
+        let wfs_paths = resolve_glob(&config.runtime.schemas, base_dir).owe_conf()?;
         let mut all_schemas = Vec::new();
         for full_path in &wfs_paths {
             let content = std::fs::read_to_string(full_path)
-                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", full_path.display()))?;
-            let schemas = wf_lang::parse_wfs(&content)?;
+                .owe_sys()
+                .position(full_path.display().to_string())?;
+            let schemas = wf_lang::parse_wfs(&content)
+                .owe(RuntimeReason::Bootstrap)
+                .position(full_path.display().to_string())?;
             wf_debug!(conf, file = %full_path.display(), schemas = schemas.len(), "loaded schema file");
             all_schemas.extend(schemas);
         }
 
         // 2. Preprocess .wfl with config.vars → parse → Vec<WflFile>
-        let wfl_paths = resolve_glob(&config.runtime.rules, base_dir)?;
+        let wfl_paths = resolve_glob(&config.runtime.rules, base_dir).owe_conf()?;
         let mut all_rule_plans = Vec::new();
         for full_path in &wfl_paths {
             let raw = std::fs::read_to_string(full_path)
-                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", full_path.display()))?;
+                .owe_sys()
+                .position(full_path.display().to_string())?;
             let preprocessed = wf_lang::preprocess_vars(&raw, &config.vars)
-                .map_err(|e| anyhow::anyhow!("preprocess error in {}: {e}", full_path.display()))?;
-            let wfl_file = wf_lang::parse_wfl(&preprocessed)?;
-            let plans = wf_lang::compile_wfl(&wfl_file, &all_schemas)?;
+                .owe_data()
+                .position(full_path.display().to_string())?;
+            let wfl_file = wf_lang::parse_wfl(&preprocessed)
+                .owe(RuntimeReason::Bootstrap)
+                .position(full_path.display().to_string())?;
+            let plans = wf_lang::compile_wfl(&wfl_file, &all_schemas)
+                .owe(RuntimeReason::Bootstrap)?;
             wf_debug!(conf, file = %full_path.display(), rules = plans.len(), "compiled rule file");
             all_rule_plans.extend(plans);
         }
@@ -114,7 +134,7 @@ impl FusionEngine {
             .iter()
             .map(|ws| (ws.name.clone(), ws.over))
             .collect();
-        wf_config::validate_over_vs_over_cap(&config.windows, &window_overs)?;
+        wf_config::validate_over_vs_over_cap(&config.windows, &window_overs).owe_conf()?;
         wf_debug!(
             conf,
             windows = config.windows.len(),
@@ -122,10 +142,11 @@ impl FusionEngine {
         );
 
         // 4. Schema bridge: WindowSchema × WindowConfig → Vec<WindowDef>
-        let window_defs = schemas_to_window_defs(&all_schemas, &config.windows)?;
+        let window_defs = schemas_to_window_defs(&all_schemas, &config.windows)
+            .owe(RuntimeReason::Bootstrap)?;
 
         // 5. WindowRegistry::build → registry
-        let registry = WindowRegistry::build(window_defs)?;
+        let registry = WindowRegistry::build(window_defs).err_conv()?;
 
         // 6. Router::new(registry)
         let router = Arc::new(Router::new(registry));
@@ -206,8 +227,9 @@ impl FusionEngine {
         // 12. Receiver task (last — starts accepting data)
         let receiver =
             Receiver::bind_with_event_tx(&config.server.listen, Arc::clone(&router), event_tx)
-                .await?;
-        let listen_addr = receiver.local_addr()?;
+                .await
+                .owe_sys()?;
+        let listen_addr = receiver.local_addr().owe_sys()?;
         // Wire the receiver's internal cancel to our root cancel
         let receiver_cancel = receiver.cancel_token();
         let root_cancel = cancel.clone();
@@ -219,6 +241,7 @@ impl FusionEngine {
         receiver_group.push(tokio::spawn(async move { receiver.run().await }));
         groups.push(receiver_group);
 
+        op.mark_suc();
         Ok(Self {
             cancel,
             groups,
@@ -242,7 +265,7 @@ impl FusionEngine {
     ///
     /// Groups are joined in LIFO order (reverse of start order):
     /// receiver → scheduler → alert → infra.
-    pub async fn wait(mut self) -> Result<()> {
+    pub async fn wait(mut self) -> RuntimeResult<()> {
         while let Some(group) = self.groups.pop() {
             let name = group.name;
             wf_debug!(sys, task_group = name, "waiting for task group to finish");
@@ -281,8 +304,9 @@ fn resolve_time_field(
 /// Relative `file://` paths are resolved against `base_dir` (typically the
 /// directory containing `wfusion.toml`), so that `file://alerts/wf-alerts.jsonl`
 /// lands next to the config rather than relative to CWD.
-fn build_alert_sink(config: &FusionConfig, base_dir: &Path) -> Result<Arc<dyn AlertSink>> {
-    let uris = config.alert.parsed_sinks()?;
+fn build_alert_sink(config: &FusionConfig, base_dir: &Path) -> RuntimeResult<Arc<dyn AlertSink>> {
+    let mut op = op_context!("build-alert-sink").with_auto_log();
+    let uris = config.alert.parsed_sinks().owe_conf()?;
     let mut sinks: Vec<Box<dyn AlertSink>> = Vec::new();
     for uri in uris {
         match uri {
@@ -293,13 +317,15 @@ fn build_alert_sink(config: &FusionConfig, base_dir: &Path) -> Result<Arc<dyn Al
                     path
                 };
                 if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    std::fs::create_dir_all(parent).owe_sys()?;
                 }
-                sinks.push(Box::new(FileAlertSink::open(&path)?));
+                sinks.push(Box::new(FileAlertSink::open(&path).err_conv()?));
+                op.record("sink_path", path.display().to_string().as_str());
                 wf_debug!(conf, path = %path.display(), "opened alert file sink");
             }
         }
     }
+    op.mark_suc();
     Ok(if sinks.len() == 1 {
         Arc::from(sinks.into_iter().next().unwrap())
     } else {
