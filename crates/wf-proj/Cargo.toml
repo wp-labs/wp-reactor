@@ -11,5 +11,7 @@ path = "src/main.rs"
 [dependencies]
 wf-config = { path = "../wf-config" }
 wf-lang = { path = "../wf-lang" }
+tree-sitter = "0.22"
+tree-sitter-wfl = { path = "../../../zed-tools/tree-sitter-wfl" }
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
