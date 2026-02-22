@@ -1,7 +1,7 @@
 use crate::ast::{BinOp, Expr, FieldRef, FieldSelector, Measure, StepBranch, Transform};
 use crate::schema::BaseType;
 
-use super::CheckError;
+use super::{CheckError, Severity};
 use super::scope::Scope;
 
 // ---------------------------------------------------------------------------
@@ -166,6 +166,7 @@ pub fn check_expr_type(
                         && !compatible(t, &ValType::Bool)
                     {
                         errors.push(CheckError {
+                            severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
                             contract: None,
                             message: format!(
@@ -179,6 +180,7 @@ pub fn check_expr_type(
                         && !compatible(t, &ValType::Bool)
                     {
                         errors.push(CheckError {
+                            severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
                             contract: None,
                             message: format!(
@@ -195,6 +197,7 @@ pub fn check_expr_type(
                         && !compatible(l, r)
                     {
                         errors.push(CheckError {
+                            severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
                             contract: None,
                             message: format!(
@@ -212,6 +215,7 @@ pub fn check_expr_type(
                         && !is_numeric(t)
                     {
                         errors.push(CheckError {
+                            severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
                             contract: None,
                             message: format!(
@@ -225,6 +229,7 @@ pub fn check_expr_type(
                         && !is_numeric(t)
                     {
                         errors.push(CheckError {
+                            severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
                             contract: None,
                             message: format!(
@@ -240,6 +245,7 @@ pub fn check_expr_type(
                         && !is_numeric(t)
                     {
                         errors.push(CheckError {
+                            severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
                             contract: None,
                             message: format!(
@@ -253,6 +259,7 @@ pub fn check_expr_type(
                         && !is_numeric(t)
                     {
                         errors.push(CheckError {
+                            severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
                             contract: None,
                             message: format!(
@@ -271,6 +278,7 @@ pub fn check_expr_type(
                 && !is_numeric(t)
             {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: format!("unary negation requires numeric operand, got {:?}", t),
@@ -295,6 +303,7 @@ pub fn check_expr_type(
             // Just verify the field resolves.
             if let Err(msg) = scope.resolve_field_ref(fref) {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: msg,
@@ -319,6 +328,7 @@ fn check_func_call(
             | Some(Expr::Field(FieldRef::Bracketed(..))) = args.first()
             {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: "count() expects a set-level argument (alias), not a field projection"
@@ -333,6 +343,7 @@ fn check_func_call(
                 && !is_numeric(&t)
             {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: format!("{}() requires a numeric field, got {:?}", name, t),
@@ -346,6 +357,7 @@ fn check_func_call(
                 && !is_orderable(&t)
             {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: format!("{}() requires an orderable field, got {:?}", name, t),
@@ -384,6 +396,7 @@ pub fn check_pipe_chain(
                 // T3: distinct requires a column projection (field selector)
                 if !has_field {
                     errors.push(CheckError {
+                        severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
                         contract: None,
                         message: format!(
@@ -402,6 +415,7 @@ pub fn check_pipe_chain(
             // T4: count operates on a set level. If there's a field but no distinct, it's an error.
             if has_field && !branch.pipe.transforms.contains(&Transform::Distinct) {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: format!(
@@ -417,6 +431,7 @@ pub fn check_pipe_chain(
                 && !is_numeric(vt)
             {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: format!(
@@ -429,6 +444,7 @@ pub fn check_pipe_chain(
             }
             if !has_field {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: format!(
@@ -444,6 +460,7 @@ pub fn check_pipe_chain(
                 && !is_orderable(vt)
             {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: format!(
@@ -456,6 +473,7 @@ pub fn check_pipe_chain(
             }
             if !has_field {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: format!(
@@ -479,6 +497,7 @@ pub fn check_pipe_chain(
         && !(is_numeric(&result_type) && is_numeric(&threshold_type))
     {
         errors.push(CheckError {
+            severity: Severity::Error,
             rule: Some(rule_name.to_string()),
             contract: None,
             message: format!(

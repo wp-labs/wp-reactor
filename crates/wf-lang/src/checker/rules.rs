@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::ast::{FieldRef, FieldSelector, MatchStep, RuleDecl};
 use crate::schema::WindowSchema;
 
-use super::CheckError;
+use super::{CheckError, Severity};
 use super::scope::Scope;
 use super::types::{
     ValType, check_expr_type, check_pipe_chain, compatible, infer_type, is_numeric,
@@ -57,6 +57,7 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
         };
         if labels_seen.contains(key_name) {
             errors.push(CheckError {
+                severity: Severity::Error,
                 rule: Some(name.to_string()),
                 contract: None,
                 message: format!(
@@ -94,6 +95,7 @@ fn build_scope<'a>(
         // EV1: alias uniqueness
         if !seen_aliases.insert(decl.alias.as_str()) {
             errors.push(CheckError {
+                severity: Severity::Error,
                 rule: Some(rule_name.to_string()),
                 contract: None,
                 message: format!("duplicate event alias `{}`", decl.alias),
@@ -107,6 +109,7 @@ fn build_scope<'a>(
             }
             None => {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: format!(
@@ -143,6 +146,7 @@ fn check_match_keys(
                 for (alias, schema) in &scope.aliases {
                     if !schema.fields.iter().any(|f| f.name == *field) {
                         errors.push(CheckError {
+                            severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
                             contract: None,
                             message: format!(
@@ -159,6 +163,7 @@ fn check_match_keys(
                 // K2: qualified key — alias must exist and field must be in its window
                 if !scope.aliases.contains_key(alias.as_str()) {
                     errors.push(CheckError {
+                        severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
                         contract: None,
                         message: format!(
@@ -168,6 +173,7 @@ fn check_match_keys(
                     });
                 } else if !scope.alias_has_field(alias, field) {
                     errors.push(CheckError {
+                        severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
                         contract: None,
                         message: format!(
@@ -180,6 +186,7 @@ fn check_match_keys(
             FieldRef::Bracketed(alias, key) => {
                 if !scope.aliases.contains_key(alias.as_str()) {
                     errors.push(CheckError {
+                        severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
                         contract: None,
                         message: format!(
@@ -189,6 +196,7 @@ fn check_match_keys(
                     });
                 } else if !scope.alias_has_field(alias, key) {
                     errors.push(CheckError {
+                        severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
                         contract: None,
                         message: format!(
@@ -216,6 +224,7 @@ fn check_key_type_consistency(
             if let Some((ref prev_type, ref prev_alias)) = found_type {
                 if !compatible(prev_type, &vt) {
                     errors.push(CheckError {
+                        severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
                         contract: None,
                         message: format!(
@@ -247,6 +256,7 @@ fn check_match_steps<'a>(
             // R5: source must be a declared alias
             if !scope.aliases.contains_key(branch.source.as_str()) {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: format!(
@@ -261,6 +271,7 @@ fn check_match_steps<'a>(
                 && !labels_seen.insert(label.as_str())
             {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     contract: None,
                     message: format!("duplicate step label `{}`", label),
@@ -276,6 +287,7 @@ fn check_match_steps<'a>(
                     && !scope.alias_has_field(&branch.source, field_name)
                 {
                     errors.push(CheckError {
+                        severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
                         contract: None,
                         message: format!(
@@ -304,6 +316,7 @@ fn check_score(rule: &RuleDecl, scope: &Scope<'_>, errors: &mut Vec<CheckError>)
         && !is_numeric(&t)
     {
         errors.push(CheckError {
+            severity: Severity::Error,
             rule: Some(name.to_string()),
             contract: None,
             message: format!("score expression must be numeric, got {:?}", t),
@@ -323,6 +336,7 @@ fn check_entity(rule: &RuleDecl, scope: &Scope<'_>, errors: &mut Vec<CheckError>
         && !is_scalar_identity(&t)
     {
         errors.push(CheckError {
+                severity: Severity::Error,
                 rule: Some(name.to_string()),
                 contract: None,
                 message: format!(
@@ -351,6 +365,7 @@ fn check_yield(
     match target_schema {
         None => {
             errors.push(CheckError {
+                severity: Severity::Error,
                 rule: Some(name.to_string()),
                 contract: None,
                 message: format!("yield target window `{}` does not exist", yc.target),
@@ -360,6 +375,7 @@ fn check_yield(
             // Y1: target window must be an output window (stream is empty)
             if !ws.streams.is_empty() {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: Some(name.to_string()),
                     contract: None,
                     message: format!(
@@ -373,6 +389,7 @@ fn check_yield(
                 // T36/Y8: no system fields in yield arguments
                 if SYSTEM_FIELDS.contains(&arg.name.as_str()) {
                     errors.push(CheckError {
+                        severity: Severity::Error,
                         rule: Some(name.to_string()),
                         contract: None,
                         message: format!(
@@ -388,6 +405,7 @@ fn check_yield(
                 match target_field {
                     None => {
                         errors.push(CheckError {
+                            severity: Severity::Error,
                             rule: Some(name.to_string()),
                             contract: None,
                             message: format!(
@@ -403,6 +421,7 @@ fn check_yield(
                             let expected = super::scope::field_type_to_val(&fd.field_type);
                             if !compatible(&expected, &val_type) {
                                 errors.push(CheckError {
+                                    severity: Severity::Error,
                                     rule: Some(name.to_string()),
                                     contract: None,
                                     message: format!(

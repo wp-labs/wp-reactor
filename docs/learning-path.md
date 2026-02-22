@@ -145,14 +145,14 @@ cargo test -p wf-runtime -- --nocapture   # 15 单元测试 + 1 e2e 测试
 | 顺序 | 文件 | 关注点 |
 |------|------|--------|
 | 5-1 | `crates/wf-runtime/tests/e2e_mvp.rs` | 完整数据流：构造 config → 启动引擎 → 发送 TCP Arrow 帧 → shutdown flush → 验证告警文件 |
-| 5-2 | `crates/wf-cli/src/main.rs` | 生产入口：clap CLI → 加载 wfusion.toml → 信号处理 → 优雅关闭 |
+| 5-2 | `crates/wf-engine/src/main.rs` | 生产入口：clap CLI → 加载 wfusion.toml → 信号处理 → 优雅关闭 |
 
 ### 动手练习
 
 在 `examples/` 下用 CLI 启动引擎，手动理解完整生命周期：
 
 ```bash
-cargo run -p wf-cli -- run --config examples/wfusion.toml
+cargo run -p wf-engine -- run --config examples/wfusion.toml
 ```
 
 ---
@@ -171,7 +171,7 @@ cargo run -p wf-cli -- run --config examples/wfusion.toml
 ## 附录 A：依赖关系图
 
 ```
-wf-cli ─────────┐
+wf-engine ─────────┐
                  ├─► wf-runtime
                  │     ├─► wf-core
                  │     │     ├─► wf-lang     (解析 + 编译)
@@ -213,7 +213,7 @@ wf-datagen (独立二进制)
     └────┬───────┘
          │
     ┌────▼────┐
-    │ wf-cli  │  main() 入口
+    │ wf-engine│  main() 入口
     └─────────┘
 ```
 
@@ -267,7 +267,7 @@ TCP 客户端发送: [4B 长度][stream_name][Arrow IPC batch]
 | TCP 接收器 | `crates/wf-runtime/src/receiver.rs` |
 | 生命周期管理 | `crates/wf-runtime/src/lifecycle.rs` |
 | 配置加载 | `crates/wf-config/src/fusion.rs` |
-| CLI 入口 | `crates/wf-cli/src/main.rs` |
+| CLI 入口 | `crates/wf-engine/src/main.rs` |
 | E2E 测试 | `crates/wf-runtime/tests/e2e_mvp.rs` |
 
 ---

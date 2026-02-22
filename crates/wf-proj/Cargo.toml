@@ -1,17 +1,15 @@
 [package]
-name = "wf-cli"
+name = "wf-proj"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "warp-fusion"
+name = "wf-proj"
 path = "src/main.rs"
 
 [dependencies]
 wf-config = { path = "../wf-config" }
-wf-runtime = { path = "../wf-runtime" }
+wf-lang = { path = "../wf-lang" }
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
-tracing = { workspace = true }

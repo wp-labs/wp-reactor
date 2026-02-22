@@ -6,7 +6,7 @@ wp-reactor 基于 orion-error 0.6.0 的分层错误处理。理解何时使用 S
 
 ```
                      ┌─────────────┐
-                     │   wf-cli    │  map_err → anyhow
+                     │  wf-engine  │  map_err → anyhow
                      └──────┬──────┘
                             │
                      ┌──────▼──────┐
@@ -25,7 +25,7 @@ wp-reactor 基于 orion-error 0.6.0 的分层错误处理。理解何时使用 S
 |-------|------|------|
 | wf-core | `StructError<CoreReason>` | 业务层，错误需要分类 |
 | wf-runtime | `StructError<RuntimeReason>` | 收敛层，统一下层错误 |
-| wf-cli | anyhow（入口） | 格式化输出即可 |
+| wf-engine | anyhow（入口） | 格式化输出即可 |
 | wf-lang | anyhow + `Vec<CheckError>` | 解析库，不需要分类 |
 | wf-config | anyhow | 配置错误全部 fatal |
 | wf-datagen | anyhow + `Vec<ValidationError>` | 独立工具 |
@@ -176,7 +176,7 @@ pub async fn start(config: FusionConfig, base_dir: &Path) -> RuntimeResult<Self>
 
 ## CLI 入口桥接
 
-wf-cli 不引入 orion-error 依赖，通过 `map_err` 转回 anyhow：
+wf-engine 不引入 orion-error 依赖，通过 `map_err` 转回 anyhow：
 
 ```rust
 let engine = FusionEngine::start(fusion_config, base_dir)

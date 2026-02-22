@@ -76,7 +76,10 @@
       "Bash(cargo clippy:*)",
       "Bash(cat:*)",
       "Bash(cargo tree:*)",
-      "Bash(git stash:*)"
+      "Bash(git stash:*)",
+      "Bash(cargo clean:*)",
+      "Bash(./target/debug/wf-proj:*)",
+      "Bash(FAIL_THRESHOLD=3 ./target/debug/wf-proj:*)"
     ]
   }
 }

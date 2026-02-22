@@ -50,6 +50,25 @@ pub fn preprocess_vars(
     source: &str,
     vars: &HashMap<String, String>,
 ) -> Result<String, PreprocessError> {
+    preprocess_impl(source, vars, false)
+}
+
+/// Like [`preprocess_vars`], but falls back to environment variables for
+/// any variable not found in `vars`. Useful for project tools (explain,
+/// lint) where variables may come from the shell environment rather than
+/// a config file.
+pub fn preprocess_vars_with_env(
+    source: &str,
+    vars: &HashMap<String, String>,
+) -> Result<String, PreprocessError> {
+    preprocess_impl(source, vars, true)
+}
+
+fn preprocess_impl(
+    source: &str,
+    vars: &HashMap<String, String>,
+    env_fallback: bool,
+) -> Result<String, PreprocessError> {
     let bytes = source.as_bytes();
     let len = bytes.len();
     let mut out = String::with_capacity(len);
@@ -134,6 +153,15 @@ pub fn preprocess_vars(
                         out.push_str(val);
                     } else if let Some(def) = default_val {
                         out.push_str(def);
+                    } else if env_fallback {
+                        if let Ok(val) = std::env::var(ident) {
+                            out.push_str(&val);
+                        } else {
+                            return Err(PreprocessError {
+                                position: dollar_pos,
+                                message: format!("undefined variable '{}' (not in --var or environment)", ident),
+                            });
+                        }
                     } else {
                         return Err(PreprocessError {
                             position: dollar_pos,
@@ -150,6 +178,15 @@ pub fn preprocess_vars(
 
                     if let Some(val) = vars.get(ident) {
                         out.push_str(val);
+                    } else if env_fallback {
+                        if let Ok(val) = std::env::var(ident) {
+                            out.push_str(&val);
+                        } else {
+                            return Err(PreprocessError {
+                                position: dollar_pos,
+                                message: format!("undefined variable '{}' (not in --var or environment)", ident),
+                            });
+                        }
                     } else {
                         return Err(PreprocessError {
                             position: dollar_pos,
@@ -327,6 +364,42 @@ mod tests {
             result,
             r#"message = fmt("$USER failed {} times", fail.sip)"#
         );
+    }
+
+    // --- Environment variable fallback ---
+
+    #[test]
+    fn env_fallback_reads_env_var() {
+        let v = HashMap::new();
+        unsafe { std::env::set_var("WFL_TEST_ENV_VAR_42", "99") };
+        let result = preprocess_vars_with_env("count >= $WFL_TEST_ENV_VAR_42", &v).unwrap();
+        assert_eq!(result, "count >= 99");
+        unsafe { std::env::remove_var("WFL_TEST_ENV_VAR_42") };
+    }
+
+    #[test]
+    fn env_fallback_explicit_var_takes_priority() {
+        let v = vars(&[("WFL_TEST_ENV_VAR_43", "1")]);
+        unsafe { std::env::set_var("WFL_TEST_ENV_VAR_43", "2") };
+        let result = preprocess_vars_with_env("$WFL_TEST_ENV_VAR_43", &v).unwrap();
+        assert_eq!(result, "1"); // --var wins over env
+        unsafe { std::env::remove_var("WFL_TEST_ENV_VAR_43") };
+    }
+
+    #[test]
+    fn env_fallback_undefined_still_errors() {
+        let v = HashMap::new();
+        let err = preprocess_vars_with_env("$WFL_TEST_CERTAINLY_UNDEFINED_XYZ", &v).unwrap_err();
+        assert!(err.message.contains("WFL_TEST_CERTAINLY_UNDEFINED_XYZ"));
+    }
+
+    #[test]
+    fn env_fallback_braced_form() {
+        let v = HashMap::new();
+        unsafe { std::env::set_var("WFL_TEST_ENV_VAR_44", "hello") };
+        let result = preprocess_vars_with_env("${WFL_TEST_ENV_VAR_44}_suffix", &v).unwrap();
+        assert_eq!(result, "hello_suffix");
+        unsafe { std::env::remove_var("WFL_TEST_ENV_VAR_44") };
     }
 
     // --- Integration: preprocess then parse ---

@@ -89,7 +89,7 @@ wf-core (StructError<CoreReason>) ──err_conv──▶ wf-runtime (StructErro
 
 ```
                      ┌─────────────┐
-                     │   wf-cli    │  直接使用 RuntimeReason
+                     │  wf-engine  │  直接使用 RuntimeReason
                      └──────┬──────┘
                             │
                      ┌──────▼──────┐
@@ -112,7 +112,7 @@ wf-core (StructError<CoreReason>) ──err_conv──▶ wf-runtime (StructErro
 | **wf-config** | 保持 `anyhow` | 不定义 | 配置错误全部 fatal，不需要分类 |
 | **wf-core** | 引入 `StructError<CoreReason>` | `CoreReason` | 业务层，错误需要分类（窗口/规则/告警/数据） |
 | **wf-runtime** | 引入 `StructError<RuntimeReason>` | `RuntimeReason` | 收敛层，统一下层错误 + 自有运行时错误 |
-| **wf-cli** | 直接使用 `RuntimeReason` | 不定义 | 入口，格式化输出即可 |
+| **wf-engine** | 直接使用 `RuntimeReason` | 不定义 | 入口，格式化输出即可 |
 | **wf-datagen** | 保持 `anyhow` + `ValidationError` | 不定义 | 独立工具，不需要 |
 
 ---
@@ -590,9 +590,9 @@ orion-error = { version = "0.6", features = ["tracing"] }
 
 ### 8.3 不引入 orion-error 的 crate
 
-wf-lang、wf-config、wf-cli、wf-datagen **不**添加 orion-error 依赖。
+wf-lang、wf-config、wf-engine、wf-datagen **不**添加 orion-error 依赖。
 
-wf-cli 通过 wf-runtime 的 re-export 使用 `StructError<RuntimeReason>`。
+wf-engine 通过 wf-runtime 的 re-export 使用 `StructError<RuntimeReason>`。
 
 ---
 
@@ -621,7 +621,7 @@ wf-cli 通过 wf-runtime 的 re-export 使用 `StructError<RuntimeReason>`。
 - 对 wf-core 的 StructError 用 `.err_conv()` 转换
 - 添加 `OperationContext` RAII 日志（`op_context!` + `with_auto_log` + `record` + `mark_suc`）
 
-### 阶段 4: 适配 wf-cli
+### 阶段 4: 适配 wf-engine
 
 - `main()` 处理 `StructError<RuntimeReason>` 的格式化输出
 
