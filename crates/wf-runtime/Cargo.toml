@@ -12,7 +12,7 @@ wf-core = { path = "../wf-core" }
 wf-config = { path = "../wf-config" }
 wp-arrow = "0.1"
 wf-lang = { path = "../wf-lang" }
-arrow = { version = "54", default-features = false, features = ["ipc"] }
+arrow = { version = "57", default-features = false, features = ["ipc"] }
 tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt-multi-thread", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 anyhow.workspace = true
@@ -26,7 +26,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-arrow = { version = "54", default-features = false, features = ["ipc"] }
+arrow = { version = "57", default-features = false, features = ["ipc"] }
 wf-config = { path = "../wf-config" }
 wf-lang = { path = "../wf-lang" }
 wf-datagen = { path = "../wf-datagen" }
