@@ -1,8 +1,11 @@
-use crate::ast::{EntityTypeVal, RuleDecl, WflFile};
+use std::time::Duration;
+
+use crate::ast::{EntityTypeVal, FieldRef, RuleDecl, WflFile};
 use crate::checker::check_wfl;
 use crate::plan::{
-    AggPlan, BindPlan, BranchPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
-    WindowSpec, YieldField, YieldPlan,
+    AggPlan, BindPlan, BranchPlan, EntityPlan, ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan,
+    LimitsPlan, MatchPlan, RateSpec, RulePlan, ScorePlan, StepPlan, WindowSpec, YieldField,
+    YieldPlan,
 };
 use crate::schema::WindowSchema;
 
@@ -32,12 +35,12 @@ fn compile_rule(rule: &RuleDecl) -> anyhow::Result<RulePlan> {
         name: rule.name.clone(),
         binds: compile_binds(rule),
         match_plan: compile_match(rule),
-        joins: vec![],
+        joins: compile_joins(&rule.joins),
         entity_plan: compile_entity(rule),
         yield_plan: compile_yield(rule),
         score_plan: compile_score(rule),
         conv_plan: None,
-        limits_plan: None,
+        limits_plan: compile_limits(&rule.limits),
     })
 }
 
@@ -63,9 +66,47 @@ fn compile_binds(rule: &RuleDecl) -> Vec<BindPlan> {
 
 fn compile_match(rule: &RuleDecl) -> MatchPlan {
     let mc = &rule.match_clause;
+
+    let (keys, key_map) = if let Some(ref km) = mc.key_mapping {
+        // When key mapping is present, use logical key names as keys
+        let logical_names: Vec<FieldRef> = km
+            .iter()
+            .map(|item| FieldRef::Simple(item.logical_name.clone()))
+            .collect();
+        // Deduplicate logical names (same logical name maps from multiple sources)
+        let mut seen = std::collections::HashSet::new();
+        let deduped: Vec<FieldRef> = logical_names
+            .into_iter()
+            .filter(|f| {
+                if let FieldRef::Simple(name) = f {
+                    seen.insert(name.clone())
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let key_map_plans: Vec<KeyMapPlan> = km
+            .iter()
+            .filter_map(|item| {
+                if let FieldRef::Qualified(alias, field) = &item.source_field {
+                    Some(KeyMapPlan {
+                        logical_name: item.logical_name.clone(),
+                        source_alias: alias.clone(),
+                        source_field: field.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        (deduped, Some(key_map_plans))
+    } else {
+        (mc.keys.clone(), None)
+    };
+
     MatchPlan {
-        keys: mc.keys.clone(),
-        key_map: None,
+        keys,
+        key_map,
         window_spec: WindowSpec::Sliding(mc.duration),
         event_steps: mc.on_event.iter().map(compile_step).collect(),
         close_steps: mc
@@ -138,4 +179,106 @@ fn compile_yield(rule: &RuleDecl) -> YieldPlan {
             })
             .collect(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Joins
+// ---------------------------------------------------------------------------
+
+fn compile_joins(joins: &[crate::ast::JoinClause]) -> Vec<JoinPlan> {
+    joins
+        .iter()
+        .map(|j| JoinPlan {
+            right_window: j.target_window.clone(),
+            mode: j.mode.clone(),
+            conds: j
+                .conditions
+                .iter()
+                .map(|c| JoinCondPlan {
+                    left: c.left.clone(),
+                    right: c.right.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan> {
+    let limits = limits.as_ref()?;
+
+    let mut max_state_bytes = None;
+    let mut max_cardinality = None;
+    let mut max_emit_rate = None;
+    let mut on_exceed = ExceedAction::Throttle; // default
+
+    for item in &limits.items {
+        match item.key.as_str() {
+            "max_state" => {
+                max_state_bytes = parse_byte_size(&item.value);
+            }
+            "max_cardinality" => {
+                max_cardinality = item.value.parse::<usize>().ok();
+            }
+            "max_emit_rate" => {
+                max_emit_rate = parse_rate_spec(&item.value);
+            }
+            "on_exceed" => {
+                on_exceed = match item.value.as_str() {
+                    "throttle" => ExceedAction::Throttle,
+                    "drop_oldest" => ExceedAction::DropOldest,
+                    "fail_rule" => ExceedAction::FailRule,
+                    _ => ExceedAction::Throttle,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    Some(LimitsPlan {
+        max_state_bytes,
+        max_cardinality,
+        max_emit_rate,
+        on_exceed,
+    })
+}
+
+fn parse_byte_size(s: &str) -> Option<usize> {
+    let s_upper = s.to_uppercase();
+    if let Some(num_str) = s_upper.strip_suffix("GB") {
+        num_str
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| n * 1024 * 1024 * 1024)
+    } else if let Some(num_str) = s_upper.strip_suffix("MB") {
+        num_str
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| n * 1024 * 1024)
+    } else if let Some(num_str) = s_upper.strip_suffix("KB") {
+        num_str.trim().parse::<usize>().ok().map(|n| n * 1024)
+    } else {
+        s.parse::<usize>().ok()
+    }
+}
+
+fn parse_rate_spec(s: &str) -> Option<RateSpec> {
+    let parts: Vec<&str> = s.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let count = parts[0].trim().parse::<u64>().ok()?;
+    let per = match parts[1].trim() {
+        "s" | "sec" => Duration::from_secs(1),
+        "m" | "min" => Duration::from_secs(60),
+        "h" | "hr" | "hour" => Duration::from_secs(3600),
+        "d" | "day" => Duration::from_secs(86400),
+        _ => return None,
+    };
+    Some(RateSpec { count, per })
 }

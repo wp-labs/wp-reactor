@@ -31,6 +31,9 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
     // Check match keys
     check_match_keys(rule, &scope, name, errors);
 
+    // Check key mapping (K3, K4)
+    check_key_mapping(rule, &scope, name, errors);
+
     // Check match steps (shared labels_seen across on_event and on_close)
     let mut labels_seen = HashSet::new();
     check_match_steps(
@@ -76,6 +79,12 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
 
     // Check yield clause
     check_yield(rule, schemas, &scope, errors);
+
+    // Check joins
+    check_joins(rule, schemas, &scope, name, errors);
+
+    // Check limits
+    check_limits(rule, name, errors);
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +443,287 @@ fn check_yield(
                     }
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key mapping validation (K3, K4)
+// ---------------------------------------------------------------------------
+
+fn check_key_mapping(
+    rule: &RuleDecl,
+    scope: &Scope<'_>,
+    rule_name: &str,
+    errors: &mut Vec<CheckError>,
+) {
+    let mapping = match &rule.match_clause.key_mapping {
+        Some(m) => m,
+        None => return,
+    };
+
+    // K4: source field alias must exist in events, field must exist
+    for item in mapping {
+        match &item.source_field {
+            FieldRef::Qualified(alias, field) => {
+                if !scope.aliases.contains_key(alias.as_str()) {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        contract: None,
+                        message: format!(
+                            "key mapping `{} = {}.{}`: alias `{}` not declared in events",
+                            item.logical_name, alias, field, alias
+                        ),
+                    });
+                } else if !scope.alias_has_field(alias, field) {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        contract: None,
+                        message: format!(
+                            "key mapping `{} = {}.{}`: field `{}` not found in window",
+                            item.logical_name, alias, field, field
+                        ),
+                    });
+                }
+            }
+            _ => {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!(
+                        "key mapping `{}`: source field must be qualified (alias.field)",
+                        item.logical_name
+                    ),
+                });
+            }
+        }
+    }
+
+    // K4: check type consistency for same logical key name across sources
+    let mut logical_types: std::collections::HashMap<&str, (ValType, String)> =
+        std::collections::HashMap::new();
+    for item in mapping {
+        if let FieldRef::Qualified(alias, field) = &item.source_field
+            && scope.aliases.contains_key(alias.as_str())
+            && let Some(vt) = scope.get_field_type_for_alias(alias, field)
+        {
+            if let Some((prev_type, prev_source)) = logical_types.get(item.logical_name.as_str()) {
+                if !compatible(prev_type, &vt) {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        contract: None,
+                        message: format!(
+                            "key mapping `{}` type mismatch: {:?} (from {}) vs {:?} (from {}.{})",
+                            item.logical_name, prev_type, prev_source, vt, alias, field
+                        ),
+                    });
+                }
+            } else {
+                logical_types.insert(&item.logical_name, (vt, format!("{}.{}", alias, field)));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Join validation
+// ---------------------------------------------------------------------------
+
+fn check_joins(
+    rule: &RuleDecl,
+    schemas: &[WindowSchema],
+    scope: &Scope<'_>,
+    rule_name: &str,
+    errors: &mut Vec<CheckError>,
+) {
+    for join in &rule.joins {
+        // Target window must exist in schemas
+        let target = schemas.iter().find(|s| s.name == join.target_window);
+        match target {
+            None => {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!(
+                        "join target window `{}` does not exist in schemas",
+                        join.target_window
+                    ),
+                });
+            }
+            Some(target_schema) => {
+                // Validate conditions
+                for cond in &join.conditions {
+                    // Left side must resolve in scope
+                    if let Err(msg) = scope.resolve_field_ref(&cond.left) {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!("join condition left side: {}", msg),
+                        });
+                    }
+
+                    // Right side must be qualified with target window name
+                    match &cond.right {
+                        FieldRef::Qualified(qualifier, field) => {
+                            if qualifier != &join.target_window {
+                                errors.push(CheckError {
+                                    severity: Severity::Error,
+                                    rule: Some(rule_name.to_string()),
+                                    contract: None,
+                                    message: format!(
+                                        "join condition right side `{}.{}` must be qualified with target window `{}`",
+                                        qualifier, field, join.target_window
+                                    ),
+                                });
+                            } else if !target_schema.fields.iter().any(|f| f.name == *field) {
+                                errors.push(CheckError {
+                                    severity: Severity::Error,
+                                    rule: Some(rule_name.to_string()),
+                                    contract: None,
+                                    message: format!(
+                                        "join condition: field `{}` not found in window `{}`",
+                                        field, join.target_window
+                                    ),
+                                });
+                            }
+                        }
+                        _ => {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                contract: None,
+                                message: format!(
+                                    "join condition right side must be qualified with window name (e.g. `{}.field`)",
+                                    join.target_window
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                // T49: asof mode requires time field on right table
+                if let crate::ast::JoinMode::Asof { within } = &join.mode {
+                    if target_schema.time_field.is_none() {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "join `{}` uses asof mode but target window has no time field",
+                                join.target_window
+                            ),
+                        });
+                    }
+                    if let Some(dur) = within
+                        && dur.is_zero()
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "join `{}` asof within must be > 0",
+                                join.target_window
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Limits validation
+// ---------------------------------------------------------------------------
+
+const VALID_LIMIT_KEYS: &[&str] = &["max_state", "max_cardinality", "max_emit_rate", "on_exceed"];
+
+const VALID_ON_EXCEED: &[&str] = &["throttle", "drop_oldest", "fail_rule"];
+
+fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckError>) {
+    let limits = match &rule.limits {
+        Some(l) => l,
+        None => return,
+    };
+
+    for item in &limits.items {
+        if !VALID_LIMIT_KEYS.contains(&item.key.as_str()) {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                contract: None,
+                message: format!(
+                    "unknown limits key `{}`; valid keys are: {}",
+                    item.key,
+                    VALID_LIMIT_KEYS.join(", ")
+                ),
+            });
+            continue;
+        }
+
+        match item.key.as_str() {
+            "on_exceed" => {
+                if !VALID_ON_EXCEED.contains(&item.value.as_str()) {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        contract: None,
+                        message: format!(
+                            "on_exceed value `{}` invalid; valid values are: {}",
+                            item.value,
+                            VALID_ON_EXCEED.join(", ")
+                        ),
+                    });
+                }
+            }
+            "max_cardinality" => {
+                if item.value.parse::<usize>().is_err() {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        contract: None,
+                        message: format!(
+                            "max_cardinality value `{}` must be a positive integer",
+                            item.value
+                        ),
+                    });
+                }
+            }
+            "max_emit_rate" => {
+                if !item.value.contains('/') {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        contract: None,
+                        message: format!(
+                            "max_emit_rate value `{}` must be in format count/unit (e.g. \"1000/min\")",
+                            item.value
+                        ),
+                    });
+                }
+            }
+            "max_state" => {
+                let s = item.value.to_uppercase();
+                if !(s.ends_with("MB") || s.ends_with("GB") || s.ends_with("KB")) {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        contract: None,
+                        message: format!(
+                            "max_state value `{}` must end with KB, MB, or GB (e.g. \"256MB\")",
+                            item.value
+                        ),
+                    });
+                }
+            }
+            _ => {}
         }
     }
 }

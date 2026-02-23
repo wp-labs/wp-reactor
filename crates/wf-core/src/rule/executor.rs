@@ -3,12 +3,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use orion_error::prelude::*;
 
 use wf_lang::ast::FieldRef;
-use wf_lang::plan::RulePlan;
+use wf_lang::plan::{JoinPlan, RulePlan};
 
 use crate::alert::AlertRecord;
 use crate::error::{CoreReason, CoreResult};
 use crate::rule::match_engine::{
-    CloseOutput, Event, MatchedContext, StepData, Value, eval_expr, field_ref_name, value_to_string,
+    CloseOutput, Event, MatchedContext, StepData, Value, WindowLookup, eval_expr, field_ref_name,
+    value_to_string, values_equal,
 };
 
 // ---------------------------------------------------------------------------
@@ -18,8 +19,9 @@ use crate::rule::match_engine::{
 /// Evaluates score/entity expressions from a [`RulePlan`] and produces
 /// [`AlertRecord`]s from CEP match/close outputs.
 ///
-/// No DataFusion — `JoinPlan` is empty for L1. DataFusion SQL execution
-/// will be added in M25 (L2 join).
+/// L1 rules use `execute_match` / `execute_close` (no joins).
+/// L2 rules with joins use `execute_match_with_joins` / `execute_close_with_joins`
+/// which accept a [`WindowLookup`] for resolving join data.
 pub struct RuleExecutor {
     plan: RulePlan,
 }
@@ -33,16 +35,38 @@ impl RuleExecutor {
         &self.plan
     }
 
-    /// Produce an [`AlertRecord`] from an on-event match.
+    /// Produce an [`AlertRecord`] from an on-event match (L1 — no joins).
     pub fn execute_match(&self, matched: &MatchedContext) -> CoreResult<AlertRecord> {
         let ctx = build_eval_context(
             &self.plan.match_plan.keys,
             &matched.scope_key,
             &matched.step_data,
         );
+        self.build_match_alert(matched, &ctx)
+    }
 
-        let score = eval_score(&self.plan.score_plan.expr, &ctx)?;
-        let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, &ctx)?;
+    /// Produce an [`AlertRecord`] from an on-event match with join support.
+    ///
+    /// Executes joins before score/entity evaluation, enriching the eval
+    /// context with joined fields from external windows.
+    pub fn execute_match_with_joins(
+        &self,
+        matched: &MatchedContext,
+        windows: &dyn WindowLookup,
+    ) -> CoreResult<AlertRecord> {
+        let mut ctx = build_eval_context(
+            &self.plan.match_plan.keys,
+            &matched.scope_key,
+            &matched.step_data,
+        );
+        execute_joins(&self.plan.joins, &mut ctx, windows);
+        self.build_match_alert(matched, &ctx)
+    }
+
+    /// Internal: build the AlertRecord from an already-constructed eval context.
+    fn build_match_alert(&self, matched: &MatchedContext, ctx: &Event) -> CoreResult<AlertRecord> {
+        let score = eval_score(&self.plan.score_plan.expr, ctx)?;
+        let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
         let fired_at = format_nanos_utc(matched.event_time_nanos);
         let alert_id = build_alert_id(&self.plan.name, &matched.scope_key, &fired_at);
         let summary = build_summary(
@@ -66,7 +90,7 @@ impl RuleExecutor {
         })
     }
 
-    /// Produce an [`AlertRecord`] from a close output.
+    /// Produce an [`AlertRecord`] from a close output (L1 — no joins).
     ///
     /// Returns `Ok(None)` when `!event_ok || !close_ok` — the instance
     /// did not fully satisfy the rule.
@@ -74,19 +98,36 @@ impl RuleExecutor {
         if !close.event_ok || !close.close_ok {
             return Ok(None);
         }
-
-        // Combine event + close step data for expression context
-        let all_step_data: Vec<StepData> = close
-            .event_step_data
-            .iter()
-            .chain(close.close_step_data.iter())
-            .cloned()
-            .collect();
-
+        let all_step_data = combine_step_data(close);
         let ctx = build_eval_context(&self.plan.match_plan.keys, &close.scope_key, &all_step_data);
+        self.build_close_alert(close, &all_step_data, &ctx)
+    }
 
-        let score = eval_score(&self.plan.score_plan.expr, &ctx)?;
-        let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, &ctx)?;
+    /// Produce an [`AlertRecord`] from a close output with join support.
+    pub fn execute_close_with_joins(
+        &self,
+        close: &CloseOutput,
+        windows: &dyn WindowLookup,
+    ) -> CoreResult<Option<AlertRecord>> {
+        if !close.event_ok || !close.close_ok {
+            return Ok(None);
+        }
+        let all_step_data = combine_step_data(close);
+        let mut ctx =
+            build_eval_context(&self.plan.match_plan.keys, &close.scope_key, &all_step_data);
+        execute_joins(&self.plan.joins, &mut ctx, windows);
+        self.build_close_alert(close, &all_step_data, &ctx)
+    }
+
+    /// Internal: build the AlertRecord from an already-constructed eval context.
+    fn build_close_alert(
+        &self,
+        close: &CloseOutput,
+        all_step_data: &[StepData],
+        ctx: &Event,
+    ) -> CoreResult<Option<AlertRecord>> {
+        let score = eval_score(&self.plan.score_plan.expr, ctx)?;
+        let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
         let close_reason_str = close.close_reason.as_str().to_string();
         let fired_at = format_nanos_utc(close.watermark_nanos);
         let alert_id = build_alert_id(&self.plan.name, &close.scope_key, &fired_at);
@@ -94,7 +135,7 @@ impl RuleExecutor {
             &self.plan.name,
             &self.plan.match_plan.keys,
             &close.scope_key,
-            &all_step_data,
+            all_step_data,
             Some(&close_reason_str),
         );
 
@@ -140,6 +181,64 @@ fn build_eval_context(keys: &[FieldRef], scope_key: &[Value], step_data: &[StepD
     }
 
     Event { fields }
+}
+
+/// Combine event + close step data into a single vec.
+fn combine_step_data(close: &CloseOutput) -> Vec<StepData> {
+    close
+        .event_step_data
+        .iter()
+        .chain(close.close_step_data.iter())
+        .cloned()
+        .collect()
+}
+
+/// Execute join plans, enriching the eval context with joined fields.
+///
+/// For each join, snapshots the right window and finds the first row
+/// matching all join conditions. Matched fields are added to the context
+/// both as `window.field` (qualified) and as plain `field` (if not already present).
+///
+/// Both `Snapshot` and `Asof` modes currently use the same row-matching logic.
+/// Time-based asof refinement will be added in L3.
+fn execute_joins(joins: &[JoinPlan], ctx: &mut Event, windows: &dyn WindowLookup) {
+    for join in joins {
+        let Some(rows) = windows.snapshot(&join.right_window) else {
+            continue;
+        };
+
+        let Some(row) = find_matching_row(&rows, &join.conds, ctx) else {
+            continue;
+        };
+
+        for (field_name, value) in &row {
+            let qualified = format!("{}.{}", join.right_window, field_name);
+            ctx.fields.insert(qualified, value.clone());
+            ctx.fields
+                .entry(field_name.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+}
+
+/// Find the first row matching all join conditions.
+fn find_matching_row(
+    rows: &[std::collections::HashMap<String, Value>],
+    conds: &[wf_lang::plan::JoinCondPlan],
+    ctx: &Event,
+) -> Option<std::collections::HashMap<String, Value>> {
+    rows.iter()
+        .find(|row| {
+            conds.iter().all(|cond| {
+                let left_name = field_ref_name(&cond.left);
+                let right_name = field_ref_name(&cond.right);
+                match (ctx.fields.get(left_name), row.get(right_name)) {
+                    (Some(lv), Some(rv)) => values_equal(lv, rv),
+                    _ => false,
+                }
+            })
+        })
+        .cloned()
 }
 
 /// Evaluate the score expression and clamp to `[0, 100]`.

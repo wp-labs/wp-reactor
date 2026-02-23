@@ -4,7 +4,7 @@ use winnow::prelude::*;
 use winnow::token::literal;
 
 use crate::ast::*;
-use crate::parse_utils::{ident, kw, number_literal, quoted_string, ws_skip};
+use crate::parse_utils::{duration_value, ident, kw, number_literal, quoted_string, ws_skip};
 
 // ---------------------------------------------------------------------------
 // Public entry: full expression
@@ -287,7 +287,7 @@ fn parse_func_call_args(
     }
 
     let args: Vec<Expr> =
-        separated(1.., (ws_skip, parse_expr).map(|(_, e)| e), literal(",")).parse_next(input)?;
+        separated(1.., (ws_skip, func_arg_expr).map(|(_, e)| e), literal(",")).parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal(")")).parse_next(input)?;
 
@@ -296,4 +296,23 @@ fn parse_func_call_args(
         name,
         args,
     })
+}
+
+/// Parse a function argument expression.
+/// Allows duration literals (e.g. `5m`, `1h`) which are converted to seconds as Number.
+fn func_arg_expr(input: &mut &str) -> ModalResult<Expr> {
+    // Try duration literal first (before number, since `5m` starts with digit)
+    let saved = *input;
+    if let Ok(dur) = duration_value.parse_next(input) {
+        // Only accept if followed by `)` or `,` or whitespace — not more ident chars
+        let trimmed = input.trim_start();
+        if trimmed.starts_with(')') || trimmed.starts_with(',') || trimmed.is_empty() {
+            return Ok(Expr::Number(dur.as_secs_f64()));
+        }
+        // Not a duration in this context, backtrack
+        *input = saved;
+    } else {
+        *input = saved;
+    }
+    parse_expr(input)
 }

@@ -20,6 +20,7 @@ fn make_simple_rule_plan() -> RulePlan {
         }],
         match_plan: MatchPlan {
             keys: vec![FieldRef::Simple("sip".to_string())],
+            key_map: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
             event_steps: vec![StepPlan {
                 branches: vec![BranchPlan {
@@ -50,6 +51,7 @@ fn make_simple_rule_plan() -> RulePlan {
             expr: Expr::Number(85.0),
         },
         conv_plan: None,
+        limits_plan: None,
     }
 }
 
@@ -158,6 +160,7 @@ fn multi_alias_same_window_both_receive_events() {
         ],
         match_plan: MatchPlan {
             keys: vec![FieldRef::Simple("sip".to_string())],
+            key_map: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
             event_steps: vec![
                 StepPlan {
@@ -204,6 +207,7 @@ fn multi_alias_same_window_both_receive_events() {
             expr: Expr::Number(90.0),
         },
         conv_plan: None,
+        limits_plan: None,
     };
 
     let start: chrono::DateTime<Utc> = "2024-01-01T00:00:00Z".parse().unwrap();

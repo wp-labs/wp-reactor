@@ -2,7 +2,8 @@ use std::fmt;
 
 use crate::ast::{BinOp, CmpOp, Expr, FieldRef, FieldSelector, Measure, Transform};
 use crate::plan::{
-    AggPlan, BindPlan, BranchPlan, MatchPlan, RulePlan, StepPlan, WindowSpec, YieldPlan,
+    AggPlan, BindPlan, BranchPlan, JoinPlan, LimitsPlan, MatchPlan, RulePlan, StepPlan, WindowSpec,
+    YieldPlan,
 };
 use crate::schema::WindowSchema;
 
@@ -13,10 +14,12 @@ pub struct RuleExplanation {
     pub bindings: Vec<BindingExpl>,
     pub match_expl: MatchExpl,
     pub score: String,
+    pub joins: Vec<String>,
     pub entity_type: String,
     pub entity_id: String,
     pub yield_target: String,
     pub yield_fields: Vec<(String, String)>,
+    pub limits: Option<String>,
     pub lineage: Vec<(String, String)>,
 }
 
@@ -44,10 +47,12 @@ fn explain_rule(plan: &RulePlan, schemas: &[WindowSchema]) -> RuleExplanation {
     let bindings = explain_binds(&plan.binds);
     let match_expl = explain_match(&plan.match_plan);
     let score = format_expr(&plan.score_plan.expr);
+    let joins = explain_joins(&plan.joins);
     let entity_type = plan.entity_plan.entity_type.clone();
     let entity_id = format_expr(&plan.entity_plan.entity_id_expr);
     let yield_target = plan.yield_plan.target.clone();
     let yield_fields = explain_yield(&plan.yield_plan);
+    let limits = plan.limits_plan.as_ref().map(explain_limits);
     let lineage = compute_lineage(&plan.binds, &plan.yield_plan, schemas);
 
     RuleExplanation {
@@ -55,10 +60,12 @@ fn explain_rule(plan: &RulePlan, schemas: &[WindowSchema]) -> RuleExplanation {
         bindings,
         match_expl,
         score,
+        joins,
         entity_type,
         entity_id,
         yield_target,
         yield_fields,
+        limits,
         lineage,
     }
 }
@@ -150,6 +157,60 @@ fn format_agg(agg: &AggPlan) -> String {
         format_expr(&agg.threshold)
     ));
     chain
+}
+
+// ---------------------------------------------------------------------------
+// Joins
+// ---------------------------------------------------------------------------
+
+fn explain_joins(joins: &[JoinPlan]) -> Vec<String> {
+    joins
+        .iter()
+        .map(|j| {
+            let mode = match &j.mode {
+                crate::ast::JoinMode::Snapshot => "snapshot".to_string(),
+                crate::ast::JoinMode::Asof { within: None } => "asof".to_string(),
+                crate::ast::JoinMode::Asof { within: Some(d) } => {
+                    format!("asof within {}", format_duration(d))
+                }
+            };
+            let conds: Vec<String> = j
+                .conds
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} == {}",
+                        format_field_ref(&c.left),
+                        format_field_ref(&c.right)
+                    )
+                })
+                .collect();
+            format!("join {} {} on {}", j.right_window, mode, conds.join(" && "))
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+fn explain_limits(lp: &LimitsPlan) -> String {
+    let mut parts = Vec::new();
+    if let Some(max_state) = lp.max_state_bytes {
+        parts.push(format!("max_state={}B", max_state));
+    }
+    if let Some(max_card) = lp.max_cardinality {
+        parts.push(format!("max_cardinality={}", max_card));
+    }
+    if let Some(ref rate) = lp.max_emit_rate {
+        parts.push(format!(
+            "max_emit_rate={}/{}",
+            rate.count,
+            format_duration(&rate.per)
+        ));
+    }
+    parts.push(format!("on_exceed={:?}", lp.on_exceed));
+    parts.join(", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +433,14 @@ impl fmt::Display for RuleExplanation {
         // Score
         writeln!(f, "  Score: {}", self.score)?;
 
+        // Joins
+        if !self.joins.is_empty() {
+            writeln!(f, "  Joins:")?;
+            for j in &self.joins {
+                writeln!(f, "    {}", j)?;
+            }
+        }
+
         // Entity
         writeln!(f, "  Entity: {} = {}", self.entity_type, self.entity_id)?;
 
@@ -399,6 +468,11 @@ impl fmt::Display for RuleExplanation {
                     width = max_field_width(&self.lineage)
                 )?;
             }
+        }
+
+        // Limits
+        if let Some(ref limits) = self.limits {
+            writeln!(f, "  Limits: {}", limits)?;
         }
 
         Ok(())

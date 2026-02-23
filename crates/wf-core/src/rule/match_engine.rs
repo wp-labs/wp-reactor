@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, FieldSelector, Measure, Transform};
-use wf_lang::plan::{AggPlan, MatchPlan, StepPlan, WindowSpec};
+use wf_lang::plan::{AggPlan, ExceedAction, LimitsPlan, MatchPlan, StepPlan, WindowSpec};
 
 // ---------------------------------------------------------------------------
 // Public types — Event & Value
@@ -92,6 +92,75 @@ pub struct CloseOutput {
 }
 
 // ---------------------------------------------------------------------------
+// WindowLookup trait — external window access for has() and join
+// ---------------------------------------------------------------------------
+
+/// Trait for accessing external window data at runtime.
+/// Used by `window.has()` and join operations.
+pub trait WindowLookup: Send + Sync {
+    /// Get all distinct values for a field in a static window (for `has()`).
+    fn snapshot_field_values(&self, window: &str, field: &str) -> Option<HashSet<String>>;
+
+    /// Get a full snapshot of a window (for join).
+    fn snapshot(&self, window: &str) -> Option<Vec<HashMap<String, Value>>>;
+}
+
+// ---------------------------------------------------------------------------
+// RollingStats — baseline deviation tracking
+// ---------------------------------------------------------------------------
+
+/// Cumulative statistics tracker for `baseline()` function.
+#[derive(Debug, Clone)]
+struct RollingStats {
+    count: u64,
+    sum: f64,
+    sum_sq: f64,
+}
+
+impl RollingStats {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            sum: 0.0,
+            sum_sq: 0.0,
+        }
+    }
+
+    fn update(&mut self, value: f64) {
+        self.count += 1;
+        self.sum += value;
+        self.sum_sq += value * value;
+    }
+
+    fn mean(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum / self.count as f64
+        }
+    }
+
+    fn stddev(&self) -> f64 {
+        if self.count < 2 {
+            return 0.0;
+        }
+        let n = self.count as f64;
+        let variance = (self.sum_sq / n) - (self.mean() * self.mean());
+        if variance < 0.0 { 0.0 } else { variance.sqrt() }
+    }
+
+    /// How many standard deviations the value is from the mean.
+    fn deviation(&self, value: f64) -> f64 {
+        let std = self.stddev();
+        if std == 0.0 {
+            0.0
+        } else {
+            (value - self.mean()) / std
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal — per-branch / per-step / per-instance state
 // ---------------------------------------------------------------------------
 
@@ -146,6 +215,7 @@ struct Instance {
     step_states: Vec<StepState>,
     completed_steps: Vec<StepData>,
     close_step_states: Vec<StepState>,
+    baselines: HashMap<String, RollingStats>,
 }
 
 impl Instance {
@@ -168,6 +238,7 @@ impl Instance {
             step_states,
             completed_steps: Vec::new(),
             close_step_states,
+            baselines: HashMap::new(),
         }
     }
 
@@ -186,6 +257,7 @@ impl Instance {
             .iter()
             .map(|sp| StepState::new(sp.branches.len()))
             .collect();
+        self.baselines.clear();
     }
 }
 
@@ -205,6 +277,11 @@ pub struct CepStateMachine {
     instances: HashMap<String, Instance>,
     time_field: Option<String>,
     watermark_nanos: i64,
+    limits: Option<LimitsPlan>,
+    #[allow(dead_code)] // Reserved for emit rate limiting (L2)
+    emit_count: u64,
+    #[allow(dead_code)] // Reserved for emit rate limiting (L2)
+    emit_window_start: i64,
 }
 
 impl CepStateMachine {
@@ -216,6 +293,28 @@ impl CepStateMachine {
             instances: HashMap::new(),
             time_field,
             watermark_nanos: 0,
+            limits: None,
+            emit_count: 0,
+            emit_window_start: 0,
+        }
+    }
+
+    /// Create a new state machine with limits enforcement.
+    pub fn with_limits(
+        rule_name: String,
+        plan: MatchPlan,
+        time_field: Option<String>,
+        limits: Option<LimitsPlan>,
+    ) -> Self {
+        Self {
+            rule_name,
+            plan,
+            instances: HashMap::new(),
+            time_field,
+            watermark_nanos: 0,
+            limits,
+            emit_count: 0,
+            emit_window_start: 0,
         }
     }
 
@@ -252,14 +351,38 @@ impl CepStateMachine {
         }
 
         // 1. Extract scope key from event
-        let scope_key = match extract_key(event, &self.plan.keys) {
-            Some(k) => k,
-            None => return StepResult::Accumulate, // missing key field → skip
-        };
+        let scope_key =
+            match extract_key(event, &self.plan.keys, self.plan.key_map.as_deref(), alias) {
+                Some(k) => k,
+                None => return StepResult::Accumulate, // missing key field → skip
+            };
         let instance_key = make_instance_key(&scope_key);
 
-        // 2. Get or create instance
+        // 2. Get or create instance (with limits check)
         let plan = &self.plan;
+        let is_new = !self.instances.contains_key(&instance_key);
+        if is_new
+            && let Some(ref limits) = self.limits
+            && let Some(max_card) = limits.max_cardinality
+            && self.instances.len() >= max_card
+        {
+            match limits.on_exceed {
+                ExceedAction::Throttle => return StepResult::Accumulate,
+                ExceedAction::DropOldest => {
+                    // Find and remove the oldest instance
+                    if let Some(oldest_key) = self
+                        .instances
+                        .iter()
+                        .min_by_key(|(_, inst)| inst.created_at)
+                        .map(|(k, _)| k.clone())
+                    {
+                        self.instances.remove(&oldest_key);
+                    }
+                }
+                ExceedAction::FailRule => return StepResult::Accumulate,
+            }
+        }
+
         let instance = self
             .instances
             .entry(instance_key)
@@ -422,12 +545,65 @@ impl CepStateMachine {
 
 /// Extract the scope key values from an event using the plan's key fields.
 ///
-/// `FieldRef::Simple("sip")` / `Qualified(_, "sip")` / `Bracketed(_, "sip")`
-/// all resolve to `event.fields["sip"]`.
+/// When `key_map` is provided, uses alias-specific field mappings to extract
+/// the key from different source fields depending on the event's alias.
 ///
 /// Returns `None` if any key field is missing from the event.
 /// Returns `Some(vec![])` if the key list is empty (shared instance).
-fn extract_key(event: &Event, keys: &[FieldRef]) -> Option<Vec<Value>> {
+fn extract_key(
+    event: &Event,
+    keys: &[FieldRef],
+    key_map: Option<&[wf_lang::plan::KeyMapPlan]>,
+    alias: &str,
+) -> Option<Vec<Value>> {
+    let km = match key_map {
+        Some(km) => km,
+        None => return extract_key_simple(event, keys),
+    };
+
+    // Collect unique logical key names (preserving order)
+    let mut logical_names = Vec::new();
+    for entry in km {
+        if !logical_names.contains(&entry.logical_name) {
+            logical_names.push(entry.logical_name.clone());
+        }
+    }
+
+    if logical_names.is_empty() && keys.is_empty() {
+        return Some(vec![]);
+    }
+
+    // For each logical key, try to extract a value:
+    //   1. From this alias's mapped source field
+    //   2. Fallback: from the event using the logical name directly
+    let mut result = Vec::with_capacity(logical_names.len());
+    for logical in &logical_names {
+        // Try alias-specific mapping first
+        let mapped = km
+            .iter()
+            .find(|e| e.logical_name == *logical && e.source_alias == alias)
+            .and_then(|e| event.fields.get(&e.source_field));
+
+        if let Some(val) = mapped {
+            result.push(val.clone());
+            continue;
+        }
+
+        // Fallback: field named after the logical key
+        if let Some(val) = event.fields.get(logical.as_str()) {
+            result.push(val.clone());
+            continue;
+        }
+    }
+
+    if result.is_empty() && !keys.is_empty() {
+        return extract_key_simple(event, keys);
+    }
+
+    Some(result)
+}
+
+fn extract_key_simple(event: &Event, keys: &[FieldRef]) -> Option<Vec<Value>> {
     let mut result = Vec::with_capacity(keys.len());
     for key in keys {
         let field_name = field_ref_name(key);
@@ -743,8 +919,18 @@ fn compare_value_threshold(cmp: CmpOp, val: &Value, threshold: &Value) -> bool {
 /// Evaluate an expression against an event, returning a [`Value`].
 ///
 /// Supports: literals, field refs, BinOp (And/Or/comparisons/arithmetic),
-/// Neg, InList, and basic FuncCall (contains, lower, upper, len).
+/// Neg, InList, and basic FuncCall (contains, lower, upper, len, has, baseline).
 pub(crate) fn eval_expr(expr: &Expr, event: &Event) -> Option<Value> {
+    eval_expr_ext(expr, event, None, None)
+}
+
+/// Extended expression evaluator with window lookup and baseline store access.
+fn eval_expr_ext(
+    expr: &Expr,
+    event: &Event,
+    windows: Option<&dyn WindowLookup>,
+    baselines: Option<&mut HashMap<String, RollingStats>>,
+) -> Option<Value> {
     match expr {
         Expr::Number(n) => Some(Value::Number(*n)),
         Expr::StringLit(s) => Some(Value::Str(s.clone())),
@@ -774,8 +960,74 @@ pub(crate) fn eval_expr(expr: &Expr, event: &Event) -> Option<Value> {
             });
             Some(Value::Bool(if *negated { !found } else { found }))
         }
-        Expr::FuncCall { name, args, .. } => eval_func_call(name, args, event),
+        Expr::FuncCall {
+            qualifier,
+            name,
+            args,
+        } => {
+            // Handle window.has()
+            if let Some(window_name) = qualifier
+                && name == "has"
+            {
+                return eval_window_has(window_name, args, event, windows);
+            }
+            // Handle baseline()
+            if name == "baseline" && args.len() == 2 {
+                return eval_baseline(args, event, baselines);
+            }
+            eval_func_call(name, args, event)
+        }
         _ => None,
+    }
+}
+
+/// Evaluate `window.has(expr [, "field"])`.
+fn eval_window_has(
+    window_name: &str,
+    args: &[Expr],
+    event: &Event,
+    windows: Option<&dyn WindowLookup>,
+) -> Option<Value> {
+    let windows = windows?;
+    let lookup_val = eval_expr(&args[0], event)?;
+    let lookup_str = value_to_string(&lookup_val);
+
+    // Explicit field name from 2nd arg, or infer from the field ref in 1st arg
+    let field_name = match args.get(1) {
+        Some(Expr::StringLit(f)) => f.clone(),
+        Some(_) => return None,
+        None => match &args[0] {
+            Expr::Field(fr) => field_ref_name(fr).to_string(),
+            _ => return None,
+        },
+    };
+
+    let values = windows.snapshot_field_values(window_name, &field_name)?;
+    Some(Value::Bool(values.contains(&lookup_str)))
+}
+
+/// Evaluate `baseline(expr, duration_seconds)`.
+fn eval_baseline(
+    args: &[Expr],
+    event: &Event,
+    baselines: Option<&mut HashMap<String, RollingStats>>,
+) -> Option<Value> {
+    let current_val = match eval_expr(&args[0], event)? {
+        Value::Number(n) => n,
+        _ => return None,
+    };
+
+    // Build a key to identify this baseline expression
+    let key = format!("{:?}", args[0]);
+
+    if let Some(baselines) = baselines {
+        let stats = baselines.entry(key).or_insert_with(RollingStats::new);
+        let deviation = stats.deviation(current_val);
+        stats.update(current_val);
+        Some(Value::Number(deviation))
+    } else {
+        // No baseline store available — return 0 (neutral deviation)
+        Some(Value::Number(0.0))
     }
 }
 
@@ -850,7 +1102,7 @@ fn eval_arithmetic(op: BinOp, lv: f64, rv: f64) -> Option<Value> {
 }
 
 /// Equality check for InList membership.
-fn values_equal(a: &Value, b: &Value) -> bool {
+pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => (x - y).abs() < f64::EPSILON,
         (Value::Str(x), Value::Str(y)) => x == y,

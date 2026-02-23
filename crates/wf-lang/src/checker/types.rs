@@ -136,6 +136,8 @@ fn infer_func_call(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<ValTy
         "avg" => Some(ValType::Base(BaseType::Float)),
         "distinct" => Some(ValType::Base(BaseType::Digit)),
         "fmt" => Some(ValType::Base(BaseType::Chars)),
+        "has" => Some(ValType::Bool),
+        "baseline" => Some(ValType::Base(BaseType::Float)),
         _ => None,
     }
 }
@@ -362,6 +364,65 @@ fn check_func_call(
                     contract: None,
                     message: format!("{}() requires an orderable field, got {:?}", name, t),
                 });
+            }
+        }
+        "has" => {
+            // T11-T13: window.has() checks
+            // Argument count: 1 or 2
+            if args.is_empty() || args.len() > 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: "has() expects 1 or 2 arguments".to_string(),
+                });
+            }
+            // T12: second argument must be a string literal
+            if args.len() == 2 && !matches!(args[1], Expr::StringLit(_)) {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: "has() second argument must be a string literal (field name)"
+                        .to_string(),
+                });
+            }
+        }
+        "baseline" => {
+            // T6: baseline(expr, duration)
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: "baseline() requires exactly 2 arguments: (expr, duration)"
+                        .to_string(),
+                });
+            } else {
+                // First argument must be numeric
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        contract: None,
+                        message: format!("baseline() first argument must be numeric, got {:?}", t),
+                    });
+                }
+                // Second argument must be a positive number (duration in seconds)
+                match &args[1] {
+                    Expr::Number(n) if *n > 0.0 => {} // OK
+                    _ => {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: "baseline() second argument must be a positive duration"
+                                .to_string(),
+                        });
+                    }
+                }
             }
         }
         _ => {}

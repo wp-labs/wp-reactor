@@ -264,6 +264,7 @@ fn make_brute_force_plan() -> RulePlan {
         }],
         match_plan: MatchPlan {
             keys: vec![FieldRef::Simple("src_ip".to_string())],
+            key_map: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
             event_steps: vec![StepPlan {
                 branches: vec![BranchPlan {
@@ -294,6 +295,7 @@ fn make_brute_force_plan() -> RulePlan {
             expr: Expr::Number(85.0),
         },
         conv_plan: None,
+        limits_plan: None,
     }
 }
 

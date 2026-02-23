@@ -467,6 +467,7 @@ mod tests {
                 expr: Expr::Number(70.0),
             },
             conv_plan: None,
+            limits_plan: None,
         };
 
         let machine = CepStateMachine::new("test_rule".into(), match_plan, None);
