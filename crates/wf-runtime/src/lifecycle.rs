@@ -18,6 +18,8 @@ use crate::evictor_task;
 use crate::receiver::Receiver;
 use crate::scheduler::{RuleEngine, Scheduler, SchedulerCommand, build_stream_aliases};
 use crate::schema_bridge::schemas_to_window_defs;
+use crate::sink_build::{SinkFactoryRegistry, build_sink_dispatcher};
+use crate::sink_factory::file::FileSinkFactory;
 
 // ---------------------------------------------------------------------------
 // TaskGroup — named collection of async tasks for ordered shutdown
@@ -122,7 +124,13 @@ impl FusionEngine {
         // 6. Router::new(registry)
         let router = Arc::new(Router::new(registry));
 
-        // 7. Build RuleEngines (precompute stream_name → alias routing)
+        // 7. Collect yield targets before consuming rule plans (needed for sink coverage validation).
+        let yield_targets: Vec<String> = all_rule_plans
+            .iter()
+            .map(|p| p.yield_plan.target.clone())
+            .collect();
+
+        // 8. Build RuleEngines (precompute stream_name → alias routing)
         let mut engines = Vec::with_capacity(all_rule_plans.len());
         for plan in all_rule_plans {
             let stream_aliases = build_stream_aliases(&plan.binds, &all_schemas);
@@ -135,7 +143,7 @@ impl FusionEngine {
             });
         }
 
-        // 8. Create bounded event channel
+        // 9. Create bounded event channel
         let (event_tx, event_rx) = mpsc::channel(4096);
 
         // ---------------------------------------------------------------
@@ -146,16 +154,38 @@ impl FusionEngine {
         // ---------------------------------------------------------------
         let mut groups: Vec<TaskGroup> = Vec::with_capacity(4);
 
-        // 9. Alert pipeline — build sink, create channel, spawn consumer task.
-        //    The alert task has no cancel token; it exits when the scheduler
-        //    drops its Sender after drain + flush, ensuring zero alert loss.
-        let alert_sink = build_alert_sink(&config, base_dir)?;
+        // 10. Alert pipeline — build sink, create channel, spawn consumer task.
+        //     The alert task has no cancel token; it exits when the scheduler
+        //     drops its Sender after drain + flush, ensuring zero alert loss.
         let (alert_tx, alert_rx) = mpsc::channel(alert_task::ALERT_CHANNEL_CAPACITY);
         let mut alert_group = TaskGroup::new("alert");
-        alert_group.push(tokio::spawn(async move {
-            alert_task::run_alert_sink(alert_rx, alert_sink).await;
-            Ok(())
-        }));
+
+        if let Some(ref sink_dir) = config.sinks {
+            // --- New path: connector-based sink routing ---
+            let sink_root = base_dir.join(sink_dir);
+            let bundle = wf_config::sink::load_sink_config(&sink_root)?;
+
+            // Static coverage validation
+            wf_config::sink::validate_sink_coverage(&yield_targets, &bundle)?;
+
+            // Build SinkFactoryRegistry + SinkDispatcher
+            let mut registry = SinkFactoryRegistry::new();
+            registry.register(Arc::new(FileSinkFactory));
+            let dispatcher = build_sink_dispatcher(&bundle, &registry, &sink_root).await?;
+            let dispatcher = Arc::new(dispatcher);
+
+            alert_group.push(tokio::spawn(async move {
+                alert_task::run_alert_dispatcher(alert_rx, dispatcher).await;
+                Ok(())
+            }));
+        } else {
+            // --- Legacy path: AlertSink (backward compatible) ---
+            let alert_sink = build_alert_sink(&config, base_dir)?;
+            alert_group.push(tokio::spawn(async move {
+                alert_task::run_alert_sink(alert_rx, alert_sink).await;
+                Ok(())
+            }));
+        }
         groups.push(alert_group);
 
         // 10. Evictor task

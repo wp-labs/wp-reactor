@@ -21,7 +21,12 @@ struct FusionConfigRaw {
     window_defaults: WindowDefaults,
     #[serde(default)]
     window: HashMap<String, WindowOverride>,
+    #[serde(default)]
     alert: AlertConfig,
+    /// Path to the sinks/ directory for connector-based sink routing.
+    /// When present, the new sink system is used instead of alert.sinks.
+    #[serde(default)]
+    sinks: Option<String>,
     /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
     #[serde(default)]
     vars: HashMap<String, String>,
@@ -38,6 +43,9 @@ pub struct FusionConfig {
     pub window_defaults: WindowDefaults,
     pub windows: Vec<WindowConfig>,
     pub alert: AlertConfig,
+    /// Path to the sinks/ directory for connector-based sink routing.
+    /// When present, the new sink system is used instead of `alert.sinks`.
+    pub sinks: Option<String>,
     /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
     pub vars: HashMap<String, String>,
 }
@@ -73,6 +81,7 @@ impl FromStr for FusionConfig {
             window_defaults: raw.window_defaults,
             windows,
             alert: raw.alert,
+            sinks: raw.sinks,
             vars: raw.vars,
         };
 

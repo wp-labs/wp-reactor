@@ -28,4 +28,7 @@ pub struct AlertRecord {
     pub matched_rows: Vec<RecordBatch>,
     /// Human-readable summary of the alert.
     pub summary: String,
+    /// Yield target window name, used for sink routing.
+    #[serde(skip)]
+    pub yield_target: String,
 }

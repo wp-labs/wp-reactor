@@ -1,0 +1,8 @@
+[sink_group]
+name = "__error"
+
+[[sink_group.sinks]]
+connect = "file_json"
+
+[sink_group.sinks.params]
+path = "alerts/error.jsonl"

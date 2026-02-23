@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use wf_core::alert::{AlertRecord, AlertSink};
+use wf_core::sink::SinkDispatcher;
 
 /// Bounded channel capacity for the alert pipeline.
 pub const ALERT_CHANNEL_CAPACITY: usize = 64;
@@ -23,6 +24,28 @@ pub async fn run_alert_sink(
             log::warn!("alert sink error: {e}");
         }
     }
+}
+
+/// Consume alert records from the channel and route them via the connector-based
+/// `SinkDispatcher`.
+///
+/// Shutdown is driven by channel close, same as `run_alert_sink`. After all
+/// records are consumed, all sinks in the dispatcher are gracefully stopped.
+pub async fn run_alert_dispatcher(
+    mut rx: mpsc::Receiver<AlertRecord>,
+    dispatcher: Arc<SinkDispatcher>,
+) {
+    while let Some(record) = rx.recv().await {
+        let json = match serde_json::to_string(&record) {
+            Ok(j) => j,
+            Err(e) => {
+                log::warn!("alert serialize error: {e}");
+                continue;
+            }
+        };
+        dispatcher.dispatch(&record.yield_target, &json).await;
+    }
+    dispatcher.stop_all().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -46,6 +69,7 @@ mod tests {
             fired_at: "2024-01-01T00:00:00Z".to_string(),
             matched_rows: vec![],
             summary: "test".to_string(),
+            yield_target: String::new(),
         }
     }
 

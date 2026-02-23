@@ -2,6 +2,7 @@ pub mod alert;
 pub mod fusion;
 pub mod runtime;
 pub mod server;
+pub mod sink;
 pub mod types;
 pub mod validate;
 pub mod window;

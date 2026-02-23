@@ -63,6 +63,7 @@ impl RuleExecutor {
             fired_at,
             matched_rows: vec![],
             summary,
+            yield_target: self.plan.yield_plan.target.clone(),
         })
     }
 
@@ -108,6 +109,7 @@ impl RuleExecutor {
             fired_at,
             matched_rows: vec![],
             summary,
+            yield_target: self.plan.yield_plan.target.clone(),
         }))
     }
 }

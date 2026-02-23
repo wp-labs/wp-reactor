@@ -10,14 +10,17 @@ name = "wf_runtime"
 [dependencies]
 wf-core = { path = "../wf-core" }
 wf-config = { path = "../wf-config" }
+wp-connector-api = { workspace = true }
 wp-arrow = "0.1"
 wf-lang = { path = "../wf-lang" }
 arrow = { version = "54", default-features = false, features = ["ipc"] }
-tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt-multi-thread", "signal", "time", "fs"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 anyhow.workspace = true
 serde_json = "1.0"
 log = "0.4"
+async-trait = "0.1"
+wp-model-core = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

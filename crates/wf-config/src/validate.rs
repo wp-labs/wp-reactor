@@ -43,12 +43,15 @@ pub(crate) fn validate(config: &FusionConfig) -> anyhow::Result<()> {
     }
 
     // alert.sinks must be non-empty and each URI must be parseable
-    if config.alert.sinks.is_empty() {
-        anyhow::bail!("alert.sinks must contain at least one sink URI");
-    }
-    for (i, uri) in config.alert.sinks.iter().enumerate() {
-        crate::alert::parse_sink_uri(uri)
-            .map_err(|e| anyhow::anyhow!("alert.sinks[{}]: {}", i, e))?;
+    // (unless new sink system is configured via `sinks` directory)
+    if config.sinks.is_none() {
+        if config.alert.sinks.is_empty() {
+            anyhow::bail!("alert.sinks must contain at least one sink URI");
+        }
+        for (i, uri) in config.alert.sinks.iter().enumerate() {
+            crate::alert::parse_sink_uri(uri)
+                .map_err(|e| anyhow::anyhow!("alert.sinks[{}]: {}", i, e))?;
+        }
     }
 
     Ok(())

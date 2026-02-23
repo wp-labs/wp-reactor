@@ -29,5 +29,8 @@ over_cap = "1h"
 [alert]
 sinks = ["file://alerts/wf-alerts.jsonl"]
 
+# Connector-based sink routing (when enabled, overrides alert.sinks above)
+# sinks = "sinks"
+
 [vars]
 FAIL_THRESHOLD = "3"

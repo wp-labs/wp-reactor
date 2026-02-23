@@ -100,6 +100,7 @@ mod tests {
             fired_at: "2024-01-01T00:00:00.000Z".to_string(),
             matched_rows: vec![],
             summary: "rule=test_rule; scope=[sip=192.168.1.1]".to_string(),
+            yield_target: String::new(),
         }
     }
 
