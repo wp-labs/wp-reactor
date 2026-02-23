@@ -1460,3 +1460,111 @@ rule r {
         other => panic!("expected FuncCall, got {other:?}"),
     }
 }
+
+// -----------------------------------------------------------------------
+// L2: if-then-else expression
+// -----------------------------------------------------------------------
+
+#[test]
+fn parse_if_expr_basic() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<sip:5m> { on event { e | count >= 1; } }
+    -> score(if e.action == "failed" then 80.0 else 40.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let score = &file.rules[0].score.expr;
+    match score {
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            assert!(matches!(cond.as_ref(), Expr::BinOp { op: BinOp::Eq, .. }));
+            assert_eq!(then_expr.as_ref(), &Expr::Number(80.0));
+            assert_eq!(else_expr.as_ref(), &Expr::Number(40.0));
+        }
+        other => panic!("expected IfThenElse, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_if_expr_nested() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<sip:5m> { on event { e | count >= 1; } }
+    -> score(if e.action == "a" then 80.0 else if e.action == "b" then 60.0 else 40.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let score = &file.rules[0].score.expr;
+    match score {
+        Expr::IfThenElse { else_expr, .. } => {
+            assert!(
+                matches!(else_expr.as_ref(), Expr::IfThenElse { .. }),
+                "else branch should be a nested IfThenElse"
+            );
+        }
+        other => panic!("expected IfThenElse, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_if_expr_in_yield() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        x = e.sip,
+        y = if e.action == "ok" then "good" else "bad"
+    )
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let y = &file.rules[0].yield_clause;
+    assert!(matches!(y.args[1].value, Expr::IfThenElse { .. }));
+}
+
+// -----------------------------------------------------------------------
+// L2: yield @vN
+// -----------------------------------------------------------------------
+
+#[test]
+fn parse_yield_with_version() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out@v2 (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let y = &file.rules[0].yield_clause;
+    assert_eq!(y.target, "out");
+    assert_eq!(y.version, Some(2));
+    assert_eq!(y.args.len(), 1);
+}
+
+#[test]
+fn parse_yield_without_version() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    assert_eq!(file.rules[0].yield_clause.version, None);
+}

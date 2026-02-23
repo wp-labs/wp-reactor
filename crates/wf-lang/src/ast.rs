@@ -174,11 +174,12 @@ pub enum EntityTypeVal {
 // Yield
 // ---------------------------------------------------------------------------
 
-/// `yield target (name = expr, ...)`
+/// `yield target[@vN] (name = expr, ...)`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct YieldClause {
     pub target: String,
+    pub version: Option<u32>,
     pub args: Vec<NamedArg>,
 }
 
@@ -280,6 +281,12 @@ pub enum Expr {
         expr: Box<Expr>,
         list: Vec<Expr>,
         negated: bool,
+    },
+    /// Conditional expression: `if cond then yes else no`.
+    IfThenElse {
+        cond: Box<Expr>,
+        then_expr: Box<Expr>,
+        else_expr: Box<Expr>,
     },
 }
 

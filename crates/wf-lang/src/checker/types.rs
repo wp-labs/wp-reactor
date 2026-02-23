@@ -110,6 +110,7 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
         }
         Expr::FuncCall { name, args, .. } => infer_func_call(name, args, scope),
         Expr::InList { .. } => Some(ValType::Bool),
+        Expr::IfThenElse { then_expr, .. } => infer_type(then_expr, scope),
     }
 }
 
@@ -136,8 +137,11 @@ fn infer_func_call(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<ValTy
         "avg" => Some(ValType::Base(BaseType::Float)),
         "distinct" => Some(ValType::Base(BaseType::Digit)),
         "fmt" => Some(ValType::Base(BaseType::Chars)),
-        "has" => Some(ValType::Bool),
-        "baseline" => Some(ValType::Base(BaseType::Float)),
+        "has" | "contains" | "regex_match" => Some(ValType::Bool),
+        "baseline" | "time_diff" => Some(ValType::Base(BaseType::Float)),
+        "lower" | "upper" => Some(ValType::Base(BaseType::Chars)),
+        "len" => Some(ValType::Base(BaseType::Digit)),
+        "time_bucket" => Some(ValType::Base(BaseType::Time)),
         _ => None,
     }
 }
@@ -313,6 +317,43 @@ pub fn check_expr_type(
             }
         }
         Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => {}
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            check_expr_type(cond, scope, rule_name, errors);
+            check_expr_type(then_expr, scope, rule_name, errors);
+            check_expr_type(else_expr, scope, rule_name, errors);
+
+            // T14: cond must be Bool
+            if let Some(ref t) = infer_type(cond, scope)
+                && !compatible(t, &ValType::Bool)
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!("if-then-else condition must be bool, got {:?}", t),
+                });
+            }
+
+            // T14: then/else types must be compatible
+            if let (Some(ref tt), Some(ref et)) =
+                (infer_type(then_expr, scope), infer_type(else_expr, scope))
+                && !(compatible(tt, et) || is_numeric(tt) && is_numeric(et))
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!(
+                        "if-then-else branches have incompatible types: then={:?}, else={:?}",
+                        tt, et
+                    ),
+                });
+            }
+        }
     }
 }
 
@@ -423,6 +464,190 @@ fn check_func_call(
                         });
                     }
                 }
+            }
+        }
+        "regex_match" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: "regex_match() requires exactly 2 arguments: (field, pattern)"
+                        .to_string(),
+                });
+            } else {
+                // First argument should be Chars
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        contract: None,
+                        message: format!("regex_match() first argument must be chars, got {:?}", t),
+                    });
+                }
+                // Second argument should be a string literal (compile-time regex check)
+                match &args[1] {
+                    Expr::StringLit(pat) => {
+                        if regex_syntax::Parser::new().parse(pat).is_err() {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                contract: None,
+                                message: format!(
+                                    "regex_match() pattern \"{}\" is not valid regex",
+                                    pat
+                                ),
+                            });
+                        }
+                    }
+                    _ => {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message:
+                                "regex_match() second argument must be a string literal pattern"
+                                    .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        "time_diff" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: "time_diff() requires exactly 2 arguments: (t1, t2)".to_string(),
+                });
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Time))
+                        && !is_numeric(&t)
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "time_diff() argument {} must be time or numeric, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        "time_bucket" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: "time_bucket() requires exactly 2 arguments: (time, interval_seconds)"
+                        .to_string(),
+                });
+            } else {
+                // First argument must be time or numeric
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Time))
+                    && !is_numeric(&t)
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        contract: None,
+                        message: format!(
+                            "time_bucket() first argument must be time or numeric, got {:?}",
+                            t
+                        ),
+                    });
+                }
+                // Second argument must be numeric (duration in seconds)
+                if let Some(t) = infer_type(&args[1], scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        contract: None,
+                        message: format!(
+                            "time_bucket() second argument must be numeric (interval seconds), got {:?}",
+                            t
+                        ),
+                    });
+                }
+            }
+        }
+        "contains" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: "contains() requires exactly 2 arguments: (haystack, needle)"
+                        .to_string(),
+                });
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "contains() argument {} must be chars, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        "lower" | "upper" => {
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!("{}() requires exactly 1 argument", name),
+                });
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !compatible(&t, &ValType::Base(BaseType::Chars))
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!("{}() argument must be chars, got {:?}", name, t),
+                });
+            }
+        }
+        "len" => {
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: "len() requires exactly 1 argument".to_string(),
+                });
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !compatible(&t, &ValType::Base(BaseType::Chars))
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    contract: None,
+                    message: format!("len() argument must be chars, got {:?}", t),
+                });
             }
         }
         _ => {}

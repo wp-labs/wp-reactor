@@ -977,6 +977,18 @@ fn eval_expr_ext(
             }
             eval_func_call(name, args, event)
         }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            let cond_val = eval_expr(cond, event);
+            match cond_val {
+                Some(Value::Bool(true)) => eval_expr_ext(then_expr, event, windows, baselines),
+                Some(Value::Bool(false)) => eval_expr_ext(else_expr, event, windows, baselines),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -1160,6 +1172,54 @@ fn eval_func_call(name: &str, args: &[Expr], event: &Event) -> Option<Value> {
                 Value::Str(s) => Some(Value::Number(s.len() as f64)),
                 _ => None,
             }
+        }
+        "regex_match" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let hay = match eval_expr(&args[0], event)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let pat = match eval_expr(&args[1], event)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let re = regex::Regex::new(&pat).ok()?;
+            Some(Value::Bool(re.is_match(&hay)))
+        }
+        "time_diff" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let t1 = match eval_expr(&args[0], event)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let t2 = match eval_expr(&args[1], event)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            Some(Value::Number((t1 - t2).abs() / 1_000_000_000.0))
+        }
+        "time_bucket" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let t = match eval_expr(&args[0], event)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let interval = match eval_expr(&args[1], event)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let interval_nanos = interval * 1_000_000_000.0;
+            if interval_nanos == 0.0 {
+                return None;
+            }
+            let bucketed = (t / interval_nanos).floor() * interval_nanos;
+            Some(Value::Number(bucketed))
         }
         _ => None, // unsupported function
     }

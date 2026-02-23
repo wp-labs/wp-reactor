@@ -371,6 +371,42 @@ fn check_yield(
 
     // Y1: target window must exist
     let target_schema = schemas.iter().find(|s| s.name == yc.target);
+
+    // T51: yield version must match meta.contract_version
+    if let Some(yield_ver) = yc.version {
+        let meta_ver = rule.meta.as_ref().and_then(|m| {
+            m.entries
+                .iter()
+                .find(|e| e.key == "contract_version")
+                .and_then(|e| e.value.parse::<u32>().ok())
+        });
+        match meta_ver {
+            Some(mv) if mv == yield_ver => {} // OK
+            Some(mv) => {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(name.to_string()),
+                    contract: None,
+                    message: format!(
+                        "yield version @v{} does not match meta contract_version = {}",
+                        yield_ver, mv
+                    ),
+                });
+            }
+            None => {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(name.to_string()),
+                    contract: None,
+                    message: format!(
+                        "yield specifies @v{} but no contract_version in meta block",
+                        yield_ver
+                    ),
+                });
+            }
+        }
+    }
+
     match target_schema {
         None => {
             errors.push(CheckError {

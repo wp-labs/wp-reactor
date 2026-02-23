@@ -171,10 +171,11 @@ pub struct ScorePlan {
 // YieldPlan
 // ---------------------------------------------------------------------------
 
-/// Output yield: target window + fields.
+/// Output yield: target window + optional version + fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct YieldPlan {
     pub target: String,
+    pub version: Option<u32>,
     pub fields: Vec<YieldField>,
 }
 

@@ -8,7 +8,7 @@ mod expr;
 mod match_p;
 
 use crate::ast::*;
-use crate::parse_utils::{duration_value, ident, kw, quoted_string, ws_skip};
+use crate::parse_utils::{duration_value, ident, kw, nonneg_integer, quoted_string, ws_skip};
 
 #[cfg(test)]
 mod tests;
@@ -260,6 +260,15 @@ fn yield_clause(input: &mut &str) -> ModalResult<YieldClause> {
         .parse_next(input)?
         .to_string();
 
+    // Optional version: @vN
+    let version = if opt(literal("@")).parse_next(input)?.is_some() {
+        cut_err(literal("v")).parse_next(input)?;
+        let n = cut_err(nonneg_integer).parse_next(input)?;
+        Some(n as u32)
+    } else {
+        None
+    };
+
     ws_skip.parse_next(input)?;
     cut_err(literal("(")).parse_next(input)?;
     ws_skip.parse_next(input)?;
@@ -273,7 +282,11 @@ fn yield_clause(input: &mut &str) -> ModalResult<YieldClause> {
     ws_skip.parse_next(input)?;
     cut_err(literal(")")).parse_next(input)?;
 
-    Ok(YieldClause { target, args })
+    Ok(YieldClause {
+        target,
+        version,
+        args,
+    })
 }
 
 fn named_arg(input: &mut &str) -> ModalResult<NamedArg> {

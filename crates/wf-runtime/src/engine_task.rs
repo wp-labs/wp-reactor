@@ -461,6 +461,7 @@ mod tests {
             },
             yield_plan: YieldPlan {
                 target: "alerts".into(),
+                version: None,
                 fields: vec![],
             },
             score_plan: ScorePlan {

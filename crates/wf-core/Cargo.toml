@@ -18,6 +18,7 @@ orion-error = { workspace = true }
 derive_more = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["sync"] }
+regex = "1"
 
 [dev-dependencies]
 arrow = { version = "54", default-features = false, features = ["ipc"] }

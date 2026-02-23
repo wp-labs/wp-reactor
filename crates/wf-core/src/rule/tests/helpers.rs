@@ -124,6 +124,7 @@ pub fn simple_rule_plan(
         },
         yield_plan: YieldPlan {
             target: "alerts".to_string(),
+            version: None,
             fields: vec![],
         },
         score_plan: ScorePlan { expr: score_expr },

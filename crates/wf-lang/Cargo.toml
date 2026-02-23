@@ -10,3 +10,4 @@ name = "wf_lang"
 [dependencies]
 winnow = { workspace = true }
 anyhow = { workspace = true }
+regex-syntax = "0.8"

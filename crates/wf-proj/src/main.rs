@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 mod cmd_explain;
 mod cmd_fmt;
 mod cmd_lint;
+mod cmd_replay;
 
 #[derive(Parser)]
 #[command(
@@ -60,6 +61,28 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+
+    /// Replay NDJSON data through a compiled rule for offline debugging
+    Replay {
+        /// Path to the .wfl rule file
+        file: PathBuf,
+
+        /// Schema file glob patterns (e.g. "schemas/*.wfs")
+        #[arg(short, long)]
+        schemas: Vec<String>,
+
+        /// NDJSON input data file
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Event alias to replay as (matches events block alias)
+        #[arg(long)]
+        alias: String,
+
+        /// Variable substitutions in KEY=VALUE format
+        #[arg(long)]
+        var: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -80,6 +103,16 @@ fn main() -> Result<()> {
             check,
         } => {
             cmd_fmt::run(files, write, check)?;
+        }
+
+        Commands::Replay {
+            file,
+            schemas,
+            input,
+            alias,
+            var,
+        } => {
+            cmd_replay::run(file, schemas, input, alias, var)?;
         }
     }
 

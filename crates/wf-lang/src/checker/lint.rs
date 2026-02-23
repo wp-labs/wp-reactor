@@ -130,6 +130,15 @@ fn collect_expr_aliases<'a>(expr: &'a Expr, declared: &HashSet<&str>, used: &mut
             }
         }
         Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => {}
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            collect_expr_aliases(cond, declared, used);
+            collect_expr_aliases(then_expr, declared, used);
+            collect_expr_aliases(else_expr, declared, used);
+        }
     }
 }
 

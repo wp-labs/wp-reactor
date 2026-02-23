@@ -169,6 +169,7 @@ fn compile_score(rule: &RuleDecl) -> ScorePlan {
 fn compile_yield(rule: &RuleDecl) -> YieldPlan {
     YieldPlan {
         target: rule.yield_clause.target.clone(),
+        version: rule.yield_clause.version,
         fields: rule
             .yield_clause
             .args

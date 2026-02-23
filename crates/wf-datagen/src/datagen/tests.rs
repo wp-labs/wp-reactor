@@ -289,6 +289,7 @@ fn make_brute_force_plan() -> RulePlan {
         },
         yield_plan: YieldPlan {
             target: "alerts".to_string(),
+            version: None,
             fields: vec![],
         },
         score_plan: ScorePlan {

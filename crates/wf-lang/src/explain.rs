@@ -50,7 +50,10 @@ fn explain_rule(plan: &RulePlan, schemas: &[WindowSchema]) -> RuleExplanation {
     let joins = explain_joins(&plan.joins);
     let entity_type = plan.entity_plan.entity_type.clone();
     let entity_id = format_expr(&plan.entity_plan.entity_id_expr);
-    let yield_target = plan.yield_plan.target.clone();
+    let yield_target = match plan.yield_plan.version {
+        Some(v) => format!("{}@v{}", plan.yield_plan.target, v),
+        None => plan.yield_plan.target.clone(),
+    };
     let yield_fields = explain_yield(&plan.yield_plan);
     let limits = plan.limits_plan.as_ref().map(explain_limits);
     let lineage = compute_lineage(&plan.binds, &plan.yield_plan, schemas);
@@ -312,6 +315,18 @@ pub fn format_expr(expr: &Expr) -> String {
             let items = list.iter().map(format_expr).collect::<Vec<_>>().join(", ");
             let kw = if *negated { "not in" } else { "in" };
             format!("{} {} ({})", format_expr(inner), kw, items)
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            format!(
+                "if {} then {} else {}",
+                format_expr(cond),
+                format_expr(then_expr),
+                format_expr(else_expr)
+            )
         }
     }
 }

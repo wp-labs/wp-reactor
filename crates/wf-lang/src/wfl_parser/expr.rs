@@ -207,6 +207,8 @@ fn primary(input: &mut &str) -> ModalResult<Expr> {
         // Boolean literals (keyword-checked)
         kw("true").map(|_| Expr::Bool(true)),
         kw("false").map(|_| Expr::Bool(false)),
+        // Conditional expression
+        if_expr,
         // Parenthesized expression
         paren_expr,
         // Ident-based: field ref or function call
@@ -315,4 +317,36 @@ fn func_arg_expr(input: &mut &str) -> ModalResult<Expr> {
         *input = saved;
     }
     parse_expr(input)
+}
+
+// ---------------------------------------------------------------------------
+// Conditional expression
+// ---------------------------------------------------------------------------
+
+/// `if expr then expr else expr`
+fn if_expr(input: &mut &str) -> ModalResult<Expr> {
+    kw("if").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let cond = cut_err(parse_expr).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(kw("then"))
+        .context(StrContext::Expected(StrContextValue::Description(
+            "'then' after if condition",
+        )))
+        .parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let then_e = cut_err(or_expr).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(kw("else"))
+        .context(StrContext::Expected(StrContextValue::Description(
+            "'else' after then branch",
+        )))
+        .parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let else_e = cut_err(or_expr).parse_next(input)?;
+    Ok(Expr::IfThenElse {
+        cond: Box::new(cond),
+        then_expr: Box::new(then_e),
+        else_expr: Box::new(else_e),
+    })
 }

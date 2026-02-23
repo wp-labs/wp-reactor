@@ -45,6 +45,7 @@ fn make_simple_rule_plan() -> RulePlan {
         },
         yield_plan: YieldPlan {
             target: "alerts".to_string(),
+            version: None,
             fields: vec![],
         },
         score_plan: ScorePlan {
@@ -201,6 +202,7 @@ fn multi_alias_same_window_both_receive_events() {
         },
         yield_plan: YieldPlan {
             target: "alerts".to_string(),
+            version: None,
             fields: vec![],
         },
         score_plan: ScorePlan {
