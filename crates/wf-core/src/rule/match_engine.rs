@@ -111,7 +111,7 @@ pub trait WindowLookup: Send + Sync {
 
 /// Cumulative statistics tracker for `baseline()` function.
 #[derive(Debug, Clone)]
-struct RollingStats {
+pub(crate) struct RollingStats {
     count: u64,
     sum: f64,
     sum_sq: f64,
@@ -278,6 +278,9 @@ pub struct CepStateMachine {
     time_field: Option<String>,
     watermark_nanos: i64,
     limits: Option<LimitsPlan>,
+    /// Set to true when `FailRule` limit is exceeded — all future events are
+    /// rejected until the machine is reset.
+    failed: bool,
     #[allow(dead_code)] // Reserved for emit rate limiting (L2)
     emit_count: u64,
     #[allow(dead_code)] // Reserved for emit rate limiting (L2)
@@ -294,6 +297,7 @@ impl CepStateMachine {
             time_field,
             watermark_nanos: 0,
             limits: None,
+            failed: false,
             emit_count: 0,
             emit_window_start: 0,
         }
@@ -313,6 +317,7 @@ impl CepStateMachine {
             time_field,
             watermark_nanos: 0,
             limits,
+            failed: false,
             emit_count: 0,
             emit_window_start: 0,
         }
@@ -327,8 +332,18 @@ impl CepStateMachine {
     ///
     /// Extracts event time from the configured `time_field`, falling back to 0.
     pub fn advance(&mut self, alias: &str, event: &Event) -> StepResult {
+        self.advance_with(alias, event, None)
+    }
+
+    /// Feed one event with optional window lookup for `window.has()` in guards.
+    pub fn advance_with(
+        &mut self,
+        alias: &str,
+        event: &Event,
+        windows: Option<&dyn WindowLookup>,
+    ) -> StepResult {
         let event_nanos = self.extract_event_time(event);
-        self.advance_at(alias, event, event_nanos)
+        self.advance_at_with(alias, event, event_nanos, windows)
     }
 
     /// Extract event time from the event using the configured time_field.
@@ -345,6 +360,22 @@ impl CepStateMachine {
 
     /// Feed one event with an explicit event-time timestamp (nanoseconds since epoch).
     pub fn advance_at(&mut self, alias: &str, event: &Event, now_nanos: i64) -> StepResult {
+        self.advance_at_with(alias, event, now_nanos, None)
+    }
+
+    /// Feed one event with explicit timestamp and optional window lookup.
+    fn advance_at_with(
+        &mut self,
+        alias: &str,
+        event: &Event,
+        now_nanos: i64,
+        windows: Option<&dyn WindowLookup>,
+    ) -> StepResult {
+        // FailRule: once the rule has failed, reject all future events
+        if self.failed {
+            return StepResult::Accumulate;
+        }
+
         // Update watermark
         if now_nanos > self.watermark_nanos {
             self.watermark_nanos = now_nanos;
@@ -379,7 +410,10 @@ impl CepStateMachine {
                         self.instances.remove(&oldest_key);
                     }
                 }
-                ExceedAction::FailRule => return StepResult::Accumulate,
+                ExceedAction::FailRule => {
+                    self.failed = true;
+                    return StepResult::Accumulate;
+                }
             }
         }
 
@@ -395,6 +429,8 @@ impl CepStateMachine {
                 event,
                 &plan.close_steps,
                 &mut instance.close_step_states,
+                windows,
+                &mut instance.baselines,
             );
         }
 
@@ -412,7 +448,7 @@ impl CepStateMachine {
         let step_state = &mut instance.step_states[step_idx];
 
         // 6. Evaluate step
-        match evaluate_step(alias, event, step_plan, step_state) {
+        match evaluate_step(alias, event, step_plan, step_state, windows, &mut instance.baselines) {
             None => StepResult::Accumulate,
             Some((branch_idx, measure_value)) => {
                 let label = step_plan.branches[branch_idx].label.clone();
@@ -600,6 +636,11 @@ fn extract_key(
         return extract_key_simple(event, keys);
     }
 
+    // Reject partial keys: all logical keys must be present
+    if result.len() != logical_names.len() {
+        return None;
+    }
+
     Some(result)
 }
 
@@ -648,6 +689,8 @@ fn evaluate_step(
     event: &Event,
     step_plan: &StepPlan,
     step_state: &mut StepState,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut HashMap<String, RollingStats>,
 ) -> Option<(usize, f64)> {
     for (branch_idx, branch) in step_plan.branches.iter().enumerate() {
         // Source must match alias
@@ -657,7 +700,7 @@ fn evaluate_step(
 
         // Guard check
         if let Some(guard) = &branch.guard {
-            match eval_expr(guard, event) {
+            match eval_expr_ext(guard, event, windows, baselines) {
                 Some(Value::Bool(true)) => {} // guard passed
                 _ => continue,                // guard failed or non-bool
             }
@@ -921,15 +964,19 @@ fn compare_value_threshold(cmp: CmpOp, val: &Value, threshold: &Value) -> bool {
 /// Supports: literals, field refs, BinOp (And/Or/comparisons/arithmetic),
 /// Neg, InList, and basic FuncCall (contains, lower, upper, len, has, baseline).
 pub(crate) fn eval_expr(expr: &Expr, event: &Event) -> Option<Value> {
-    eval_expr_ext(expr, event, None, None)
+    let mut empty = HashMap::new();
+    eval_expr_ext(expr, event, None, &mut empty)
 }
 
 /// Extended expression evaluator with window lookup and baseline store access.
-fn eval_expr_ext(
+///
+/// All recursive calls go through this function (not `eval_expr`) to preserve
+/// the `windows` and `baselines` context through compound expressions.
+pub(crate) fn eval_expr_ext(
     expr: &Expr,
     event: &Event,
     windows: Option<&dyn WindowLookup>,
-    baselines: Option<&mut HashMap<String, RollingStats>>,
+    baselines: &mut HashMap<String, RollingStats>,
 ) -> Option<Value> {
     match expr {
         Expr::Number(n) => Some(Value::Number(*n)),
@@ -940,21 +987,25 @@ fn eval_expr_ext(
             event.fields.get(name).cloned()
         }
         Expr::Neg(inner) => {
-            let v = eval_expr(inner, event)?;
+            let v = eval_expr_ext(inner, event, windows, baselines)?;
             match v {
                 Value::Number(n) => Some(Value::Number(-n)),
                 _ => None,
             }
         }
-        Expr::BinOp { op, left, right } => eval_binop(*op, left, right, event),
+        Expr::BinOp { op, left, right } => {
+            eval_binop(*op, left, right, event, windows, baselines)
+        }
         Expr::InList {
             expr: target,
             list,
             negated,
         } => {
-            let target_val = eval_expr(target, event)?;
+            let target_val = eval_expr_ext(target, event, windows, baselines)?;
+            // InList items are typically literals — context not needed, but
+            // we pass it for correctness in case of field refs / func calls.
             let found = list.iter().any(|item| {
-                eval_expr(item, event)
+                eval_expr_ext(item, event, windows, baselines)
                     .map(|v| values_equal(&target_val, &v))
                     .unwrap_or(false)
             });
@@ -975,14 +1026,14 @@ fn eval_expr_ext(
             if name == "baseline" && args.len() == 2 {
                 return eval_baseline(args, event, baselines);
             }
-            eval_func_call(name, args, event)
+            eval_func_call(name, args, event, windows, baselines)
         }
         Expr::IfThenElse {
             cond,
             then_expr,
             else_expr,
         } => {
-            let cond_val = eval_expr(cond, event);
+            let cond_val = eval_expr_ext(cond, event, windows, baselines);
             match cond_val {
                 Some(Value::Bool(true)) => eval_expr_ext(then_expr, event, windows, baselines),
                 Some(Value::Bool(false)) => eval_expr_ext(else_expr, event, windows, baselines),
@@ -1019,10 +1070,13 @@ fn eval_window_has(
 }
 
 /// Evaluate `baseline(expr, duration_seconds)`.
+///
+/// Computes the z-score (number of standard deviations from the running mean)
+/// of the current value, then updates the running statistics.
 fn eval_baseline(
     args: &[Expr],
     event: &Event,
-    baselines: Option<&mut HashMap<String, RollingStats>>,
+    baselines: &mut HashMap<String, RollingStats>,
 ) -> Option<Value> {
     let current_val = match eval_expr(&args[0], event)? {
         Value::Number(n) => n,
@@ -1032,29 +1086,31 @@ fn eval_baseline(
     // Build a key to identify this baseline expression
     let key = format!("{:?}", args[0]);
 
-    if let Some(baselines) = baselines {
-        let stats = baselines.entry(key).or_insert_with(RollingStats::new);
-        let deviation = stats.deviation(current_val);
-        stats.update(current_val);
-        Some(Value::Number(deviation))
-    } else {
-        // No baseline store available — return 0 (neutral deviation)
-        Some(Value::Number(0.0))
-    }
+    let stats = baselines.entry(key).or_insert_with(RollingStats::new);
+    let deviation = stats.deviation(current_val);
+    stats.update(current_val);
+    Some(Value::Number(deviation))
 }
 
-fn eval_binop(op: BinOp, left: &Expr, right: &Expr, event: &Event) -> Option<Value> {
+fn eval_binop(
+    op: BinOp,
+    left: &Expr,
+    right: &Expr,
+    event: &Event,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut HashMap<String, RollingStats>,
+) -> Option<Value> {
     match op {
-        BinOp::And => eval_logic_and(left, right, event),
-        BinOp::Or => eval_logic_or(left, right, event),
+        BinOp::And => eval_logic_and(left, right, event, windows, baselines),
+        BinOp::Or => eval_logic_or(left, right, event, windows, baselines),
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
-            let lv = eval_expr(left, event)?;
-            let rv = eval_expr(right, event)?;
+            let lv = eval_expr_ext(left, event, windows, baselines)?;
+            let rv = eval_expr_ext(right, event, windows, baselines)?;
             Some(Value::Bool(compare_values(op, &lv, &rv)))
         }
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-            let lv = eval_expr(left, event)?;
-            let rv = eval_expr(right, event)?;
+            let lv = eval_expr_ext(left, event, windows, baselines)?;
+            let rv = eval_expr_ext(right, event, windows, baselines)?;
             let ln = value_to_f64(&lv)?;
             let rn = value_to_f64(&rv)?;
             eval_arithmetic(op, ln, rn)
@@ -1069,9 +1125,15 @@ fn eval_binop(op: BinOp, left: &Expr, right: &Expr, event: &Event) -> Option<Val
 /// This is essential for close-step guards where one side references an
 /// event field (missing at close time) and the other references
 /// close_reason (missing during accumulation).
-fn eval_logic_and(left: &Expr, right: &Expr, event: &Event) -> Option<Value> {
-    let lv = eval_expr(left, event);
-    let rv = eval_expr(right, event);
+fn eval_logic_and(
+    left: &Expr,
+    right: &Expr,
+    event: &Event,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut HashMap<String, RollingStats>,
+) -> Option<Value> {
+    let lv = eval_expr_ext(left, event, windows, baselines);
+    let rv = eval_expr_ext(right, event, windows, baselines);
     match (lv.as_ref(), rv.as_ref()) {
         (Some(Value::Bool(false)), _) | (_, Some(Value::Bool(false))) => Some(Value::Bool(false)),
         (Some(Value::Bool(true)), Some(Value::Bool(true))) => Some(Value::Bool(true)),
@@ -1080,9 +1142,15 @@ fn eval_logic_and(left: &Expr, right: &Expr, event: &Event) -> Option<Value> {
 }
 
 /// Three-valued (SQL NULL) logical OR.
-fn eval_logic_or(left: &Expr, right: &Expr, event: &Event) -> Option<Value> {
-    let lv = eval_expr(left, event);
-    let rv = eval_expr(right, event);
+fn eval_logic_or(
+    left: &Expr,
+    right: &Expr,
+    event: &Event,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut HashMap<String, RollingStats>,
+) -> Option<Value> {
+    let lv = eval_expr_ext(left, event, windows, baselines);
+    let rv = eval_expr_ext(right, event, windows, baselines);
     match (lv.as_ref(), rv.as_ref()) {
         (Some(Value::Bool(true)), _) | (_, Some(Value::Bool(true))) => Some(Value::Bool(true)),
         (Some(Value::Bool(false)), Some(Value::Bool(false))) => Some(Value::Bool(false)),
@@ -1130,17 +1198,23 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
 /// - `lower(s)` → Str
 /// - `upper(s)` → Str
 /// - `len(s)` → Number
-fn eval_func_call(name: &str, args: &[Expr], event: &Event) -> Option<Value> {
+fn eval_func_call(
+    name: &str,
+    args: &[Expr],
+    event: &Event,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut HashMap<String, RollingStats>,
+) -> Option<Value> {
     match name {
         "contains" => {
             if args.len() != 2 {
                 return None;
             }
-            let haystack = match eval_expr(&args[0], event)? {
+            let haystack = match eval_expr_ext(&args[0], event, windows, baselines)? {
                 Value::Str(s) => s,
                 _ => return None,
             };
-            let needle = match eval_expr(&args[1], event)? {
+            let needle = match eval_expr_ext(&args[1], event, windows, baselines)? {
                 Value::Str(s) => s,
                 _ => return None,
             };
@@ -1150,7 +1224,7 @@ fn eval_func_call(name: &str, args: &[Expr], event: &Event) -> Option<Value> {
             if args.len() != 1 {
                 return None;
             }
-            match eval_expr(&args[0], event)? {
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
                 Value::Str(s) => Some(Value::Str(s.to_lowercase())),
                 _ => None,
             }
@@ -1159,7 +1233,7 @@ fn eval_func_call(name: &str, args: &[Expr], event: &Event) -> Option<Value> {
             if args.len() != 1 {
                 return None;
             }
-            match eval_expr(&args[0], event)? {
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
                 Value::Str(s) => Some(Value::Str(s.to_uppercase())),
                 _ => None,
             }
@@ -1168,7 +1242,7 @@ fn eval_func_call(name: &str, args: &[Expr], event: &Event) -> Option<Value> {
             if args.len() != 1 {
                 return None;
             }
-            match eval_expr(&args[0], event)? {
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
                 Value::Str(s) => Some(Value::Number(s.len() as f64)),
                 _ => None,
             }
@@ -1177,11 +1251,11 @@ fn eval_func_call(name: &str, args: &[Expr], event: &Event) -> Option<Value> {
             if args.len() != 2 {
                 return None;
             }
-            let hay = match eval_expr(&args[0], event)? {
+            let hay = match eval_expr_ext(&args[0], event, windows, baselines)? {
                 Value::Str(s) => s,
                 _ => return None,
             };
-            let pat = match eval_expr(&args[1], event)? {
+            let pat = match eval_expr_ext(&args[1], event, windows, baselines)? {
                 Value::Str(s) => s,
                 _ => return None,
             };
@@ -1192,11 +1266,11 @@ fn eval_func_call(name: &str, args: &[Expr], event: &Event) -> Option<Value> {
             if args.len() != 2 {
                 return None;
             }
-            let t1 = match eval_expr(&args[0], event)? {
+            let t1 = match eval_expr_ext(&args[0], event, windows, baselines)? {
                 Value::Number(n) => n,
                 _ => return None,
             };
-            let t2 = match eval_expr(&args[1], event)? {
+            let t2 = match eval_expr_ext(&args[1], event, windows, baselines)? {
                 Value::Number(n) => n,
                 _ => return None,
             };
@@ -1206,11 +1280,11 @@ fn eval_func_call(name: &str, args: &[Expr], event: &Event) -> Option<Value> {
             if args.len() != 2 {
                 return None;
             }
-            let t = match eval_expr(&args[0], event)? {
+            let t = match eval_expr_ext(&args[0], event, windows, baselines)? {
                 Value::Number(n) => n,
                 _ => return None,
             };
-            let interval = match eval_expr(&args[1], event)? {
+            let interval = match eval_expr_ext(&args[1], event, windows, baselines)? {
                 Value::Number(n) => n,
                 _ => return None,
             };
@@ -1350,6 +1424,8 @@ fn accumulate_close_steps(
     event: &Event,
     close_steps: &[StepPlan],
     close_step_states: &mut [StepState],
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut HashMap<String, RollingStats>,
 ) {
     for (step_idx, step_plan) in close_steps.iter().enumerate() {
         let step_state = &mut close_step_states[step_idx];
@@ -1360,7 +1436,7 @@ fn accumulate_close_steps(
 
             // Permissive guard: only explicit false blocks accumulation
             if let Some(guard) = &branch.guard
-                && let Some(Value::Bool(false)) = eval_expr(guard, event)
+                && let Some(Value::Bool(false)) = eval_expr_ext(guard, event, windows, baselines)
             {
                 continue;
             }

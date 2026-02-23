@@ -11,8 +11,55 @@ use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use wf_core::alert::AlertRecord;
-use wf_core::rule::{CepStateMachine, CloseReason, RuleExecutor, StepResult, batch_to_events};
-use wf_core::window::Window;
+use wf_core::rule::{
+    CepStateMachine, CloseReason, RuleExecutor, StepResult, Value, WindowLookup, batch_to_events,
+};
+use wf_core::window::{Router, Window};
+
+// ---------------------------------------------------------------------------
+// RegistryLookup — WindowLookup adapter backed by the shared Router
+// ---------------------------------------------------------------------------
+
+/// Implements [`WindowLookup`] by snapshotting windows from the shared
+/// [`Router`]'s registry. Used for `window.has()` guards and join evaluation.
+struct RegistryLookup<'a>(&'a Router);
+
+impl WindowLookup for RegistryLookup<'_> {
+    fn snapshot_field_values(&self, window: &str, field: &str) -> Option<HashSet<String>> {
+        let batches = self.0.registry().snapshot(window)?;
+        let mut values = HashSet::new();
+        for batch in &batches {
+            for event in batch_to_events(batch) {
+                if let Some(val) = event.fields.get(field) {
+                    // Convert all value types to string for set membership
+                    match val {
+                        Value::Str(s) => {
+                            values.insert(s.clone());
+                        }
+                        Value::Number(n) => {
+                            values.insert(n.to_string());
+                        }
+                        Value::Bool(b) => {
+                            values.insert(b.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Some(values)
+    }
+
+    fn snapshot(&self, window: &str) -> Option<Vec<HashMap<String, Value>>> {
+        let batches = self.0.registry().snapshot(window)?;
+        let mut rows = Vec::new();
+        for batch in &batches {
+            for event in batch_to_events(batch) {
+                rows.push(event.fields);
+            }
+        }
+        Some(rows)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // WindowSource — one window a rule task reads from
@@ -39,6 +86,8 @@ pub(crate) struct RuleTaskConfig {
     pub alert_tx: mpsc::Sender<AlertRecord>,
     pub cancel: CancellationToken,
     pub timeout_scan_interval: Duration,
+    /// Shared router for WindowLookup (joins + has()).
+    pub router: Arc<Router>,
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +107,8 @@ struct RuleTask {
     alert_tx: mpsc::Sender<AlertRecord>,
     /// window_name → cursor: tracks read position per window.
     cursors: HashMap<String, u64>,
+    /// Shared router for WindowLookup (joins + has()).
+    router: Arc<Router>,
 }
 
 impl RuleTask {
@@ -70,6 +121,7 @@ impl RuleTask {
             alert_tx,
             cancel,
             timeout_scan_interval,
+            router,
         } = config;
 
         // Pre-compute aliases per window: for each window, collect all
@@ -109,6 +161,7 @@ impl RuleTask {
             aliases,
             alert_tx,
             cursors,
+            router,
         };
         (task, cancel, timeout_scan_interval)
     }
@@ -150,10 +203,13 @@ impl RuleTask {
 
             for batch in &batches {
                 let events = batch_to_events(batch);
+                let lookup = RegistryLookup(&self.router);
                 for event in &events {
                     for alias in aliases {
-                        if let StepResult::Matched(ctx) = self.machine.advance(alias, event) {
-                            match self.executor.execute_match(&ctx) {
+                        if let StepResult::Matched(ctx) =
+                            self.machine.advance_with(alias, event, Some(&lookup))
+                        {
+                            match self.executor.execute_match_with_joins(&ctx, &lookup) {
                                 Ok(record) => self.emit(record).await,
                                 Err(e) => {
                                     wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_match error")
@@ -170,8 +226,9 @@ impl RuleTask {
 
     /// Scan for expired state machine instances and emit alerts.
     async fn scan_timeouts(&mut self) {
+        let lookup = RegistryLookup(&self.router);
         for close in &self.machine.scan_expired() {
-            match self.executor.execute_close(close) {
+            match self.executor.execute_close_with_joins(close, &lookup) {
                 Ok(Some(record)) => self.emit(record).await,
                 Ok(None) => {}
                 Err(e) => {
@@ -184,8 +241,9 @@ impl RuleTask {
     /// Close all active instances (shutdown flush) and emit alerts.
     async fn flush(&mut self) {
         let mut emitted = 0usize;
+        let lookup = RegistryLookup(&self.router);
         for close in &self.machine.close_all(CloseReason::Flush) {
-            match self.executor.execute_close(close) {
+            match self.executor.execute_close_with_joins(close, &lookup) {
                 Ok(Some(record)) => {
                     self.emit(record).await;
                     emitted += 1;
@@ -302,7 +360,7 @@ mod tests {
     use tracing_subscriber::{EnvFilter, Layer, fmt};
 
     use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
-    use wf_core::window::{Window, WindowParams};
+    use wf_core::window::{Window, WindowParams, WindowRegistry};
     use wf_lang::ast::{CmpOp, Expr, FieldRef, Measure};
     use wf_lang::plan::{
         AggPlan, BindPlan, BranchPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
@@ -476,6 +534,10 @@ mod tests {
 
         let (alert_tx, alert_rx) = mpsc::channel(64);
 
+        // Empty registry for tests (no joins or has() usage).
+        let registry = WindowRegistry::build(vec![]).unwrap();
+        let router = Arc::new(Router::new(registry));
+
         let config = RuleTaskConfig {
             machine,
             executor,
@@ -489,6 +551,7 @@ mod tests {
             alert_tx,
             cancel: CancellationToken::new(),
             timeout_scan_interval: Duration::from_secs(60),
+            router,
         };
 
         let (task, _cancel, _interval) = RuleTask::new(config);

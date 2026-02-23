@@ -743,6 +743,33 @@ fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckError>) 
                             item.value
                         ),
                     });
+                } else {
+                    let parts: Vec<&str> = item.value.splitn(2, '/').collect();
+                    if parts.len() == 2 {
+                        if parts[0].trim().parse::<u64>().is_err() {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                contract: None,
+                                message: format!(
+                                    "max_emit_rate count `{}` is not a valid integer",
+                                    parts[0].trim()
+                                ),
+                            });
+                        }
+                        let valid_units = ["s", "sec", "m", "min", "h", "hr", "hour", "d", "day"];
+                        if !valid_units.contains(&parts[1].trim()) {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                contract: None,
+                                message: format!(
+                                    "max_emit_rate unit `{}` invalid; valid units are: s, sec, m, min, h, hr, hour, d, day",
+                                    parts[1].trim()
+                                ),
+                            });
+                        }
+                    }
                 }
             }
             "max_state" => {
@@ -757,6 +784,21 @@ fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckError>) 
                             item.value
                         ),
                     });
+                } else {
+                    // Validate numeric prefix (suffix is always 2 chars: GB, MB, etc.)
+                    let num_str = &s[..s.len() - 2];
+                    if num_str.trim().parse::<usize>().is_err() {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "max_state numeric prefix `{}` in `{}` is not a valid positive integer",
+                                num_str.trim(),
+                                item.value
+                            ),
+                        });
+                    }
                 }
             }
             _ => {}

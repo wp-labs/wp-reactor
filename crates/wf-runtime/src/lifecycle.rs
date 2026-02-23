@@ -324,6 +324,7 @@ fn spawn_rule_tasks(
             alert_tx: alert_tx.clone(),
             cancel: cancel.child_token(),
             timeout_scan_interval,
+            router: Arc::clone(router),
         };
 
         group.push(tokio::spawn(
@@ -463,7 +464,9 @@ fn build_run_rules(
     for plan in plans {
         let stream_aliases = build_stream_aliases(&plan.binds, schemas);
         let time_field = resolve_time_field(&plan.binds, schemas);
-        let machine = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), time_field);
+        let limits = plan.limits_plan.clone();
+        let machine =
+            CepStateMachine::with_limits(plan.name.clone(), plan.match_plan.clone(), time_field, limits);
         let executor = RuleExecutor::new(plan.clone());
         rules.push(RunRule {
             machine,
