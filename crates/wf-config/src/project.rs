@@ -51,9 +51,9 @@ fn resolve_schema_glob(pattern: &str, base_dir: &Path) -> Result<Vec<PathBuf>> {
 pub fn parse_vars(var_args: &[String]) -> Result<HashMap<String, String>> {
     let mut vars = HashMap::new();
     for arg in var_args {
-        let (key, value) = arg
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!("invalid --var format: expected KEY=VALUE, got '{}'", arg))?;
+        let (key, value) = arg.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("invalid --var format: expected KEY=VALUE, got '{}'", arg)
+        })?;
         vars.insert(key.to_string(), value.to_string());
     }
     Ok(vars)

@@ -1,8 +1,8 @@
 use crate::ast::{BinOp, Expr, FieldRef, FieldSelector, Measure, StepBranch, Transform};
 use crate::schema::BaseType;
 
-use super::{CheckError, Severity};
 use super::scope::Scope;
+use super::{CheckError, Severity};
 
 // ---------------------------------------------------------------------------
 // ValType — lightweight type representation for semantic checks

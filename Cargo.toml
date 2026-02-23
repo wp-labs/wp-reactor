@@ -1,6 +1,5 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["tools/tree-sitter-oml", "tools/tree-sitter-wfs", "tools/oml-tools", "tools/wplabs-lsp", "tools/zed-warplabs"]
 resolver = "2"
 
 [workspace.package]

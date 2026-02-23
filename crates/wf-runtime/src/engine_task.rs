@@ -155,7 +155,9 @@ impl RuleTask {
                         if let StepResult::Matched(ctx) = self.machine.advance(alias, event) {
                             match self.executor.execute_match(&ctx) {
                                 Ok(record) => self.emit(record).await,
-                                Err(e) => wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_match error"),
+                                Err(e) => {
+                                    wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_match error")
+                                }
                             }
                         }
                     }
@@ -172,7 +174,9 @@ impl RuleTask {
             match self.executor.execute_close(close) {
                 Ok(Some(record)) => self.emit(record).await,
                 Ok(None) => {}
-                Err(e) => wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_close error"),
+                Err(e) => {
+                    wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_close error")
+                }
             }
         }
     }
@@ -187,7 +191,9 @@ impl RuleTask {
                     emitted += 1;
                 }
                 Ok(None) => {}
-                Err(e) => wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_close flush error"),
+                Err(e) => {
+                    wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_close flush error")
+                }
             }
         }
         if emitted > 0 {
@@ -223,8 +229,7 @@ pub(crate) async fn run_rule_task(config: RuleTaskConfig) -> anyhow::Result<()> 
     // Clone Arc<Notify> handles outside the struct so that notification
     // registration borrows `notifiers` (not `task`), allowing `&mut task`
     // for processing in the same loop iteration.
-    let notifiers: Vec<Arc<Notify>> =
-        task.sources.iter().map(|s| Arc::clone(&s.notify)).collect();
+    let notifiers: Vec<Arc<Notify>> = task.sources.iter().map(|s| Arc::clone(&s.notify)).collect();
 
     loop {
         let mut notifications = register_notifications(&notifiers);
@@ -256,10 +261,7 @@ pub(crate) async fn run_rule_task(config: RuleTaskConfig) -> anyhow::Result<()> 
 fn register_notifications(
     notifiers: &[Arc<Notify>],
 ) -> Vec<Pin<Box<tokio::sync::futures::Notified<'_>>>> {
-    let mut notified: Vec<_> = notifiers
-        .iter()
-        .map(|n| Box::pin(n.notified()))
-        .collect();
+    let mut notified: Vec<_> = notifiers.iter().map(|n| Box::pin(n.notified())).collect();
     for n in &mut notified {
         n.as_mut().enable();
     }
@@ -518,7 +520,10 @@ mod tests {
 
         task.pull_and_advance().await;
         let cursor = task.cursors["auth_events"];
-        assert_eq!(cursor, 1, "cursor should advance to 1 after reading one batch");
+        assert_eq!(
+            cursor, 1,
+            "cursor should advance to 1 after reading one batch"
+        );
 
         // 无新数据 — cursor 不变
         task.pull_and_advance().await;
@@ -540,9 +545,7 @@ mod tests {
 
         task.pull_and_advance().await;
 
-        let alert = alert_rx
-            .try_recv()
-            .expect("should have produced an alert");
+        let alert = alert_rx.try_recv().expect("should have produced an alert");
         assert_eq!(alert.rule_name, "test_rule");
         assert_eq!(alert.entity_type, "ip");
         assert_eq!(alert.entity_id, "10.0.0.1");
@@ -627,7 +630,10 @@ mod tests {
         task.pull_and_advance().await;
 
         let cursor = task.cursors["auth_events"];
-        assert_eq!(cursor, 2, "cursor should advance to 2 (past the surviving batch)");
+        assert_eq!(
+            cursor, 2,
+            "cursor should advance to 2 (past the surviving batch)"
+        );
     }
 
     /// 关闭刷新：

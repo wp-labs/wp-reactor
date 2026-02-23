@@ -3,12 +3,12 @@ use std::collections::HashSet;
 use crate::ast::{FieldRef, FieldSelector, MatchStep, RuleDecl};
 use crate::schema::WindowSchema;
 
-use super::{CheckError, Severity};
 use super::scope::Scope;
 use super::types::{
     ValType, check_expr_type, check_pipe_chain, compatible, infer_type, is_numeric,
     is_scalar_identity,
 };
+use super::{CheckError, Severity};
 
 /// System fields that must not appear in yield named arguments.
 const SYSTEM_FIELDS: &[&str] = &[

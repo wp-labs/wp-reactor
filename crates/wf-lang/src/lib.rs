@@ -9,8 +9,8 @@ mod schema;
 mod wfl_parser;
 mod wfs_parser;
 
-pub use checker::{CheckError, Severity, check_wfl};
 pub use checker::lint::lint_wfl;
+pub use checker::{CheckError, Severity, check_wfl};
 pub use compiler::compile_wfl;
 pub use preprocess::{preprocess_vars, preprocess_vars_with_env};
 pub use schema::{BaseType, FieldDef, FieldType, WindowSchema};

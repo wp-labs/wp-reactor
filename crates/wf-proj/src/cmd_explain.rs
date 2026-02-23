@@ -15,8 +15,7 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
     let source = load_wfl(&file, &var_map)?;
 
     // Parse
-    let wfl_file = wf_lang::parse_wfl(&source)
-        .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+    let wfl_file = wf_lang::parse_wfl(&source).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
 
     // Compile (runs check_wfl internally)
     let plans = wf_lang::compile_wfl(&wfl_file, &all_schemas)?;

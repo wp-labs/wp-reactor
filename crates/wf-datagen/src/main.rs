@@ -8,12 +8,12 @@ use rand::rngs::StdRng;
 
 use wf_datagen::datagen::fault_gen::apply_faults;
 use wf_datagen::datagen::generate;
+use wf_datagen::loader::load_from_uses;
 use wf_datagen::oracle::{OracleTolerances, extract_oracle_tolerances, run_oracle};
 use wf_datagen::output::arrow_ipc::write_arrow_ipc;
 use wf_datagen::output::jsonl::{
     read_alerts_jsonl, read_oracle_jsonl, write_jsonl, write_oracle_jsonl,
 };
-use wf_datagen::loader::load_from_uses;
 use wf_datagen::validate::validate_wfg;
 use wf_datagen::verify::verify;
 use wf_datagen::wfg_parser::parse_wfg;

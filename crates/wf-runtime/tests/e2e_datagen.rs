@@ -60,8 +60,8 @@ async fn e2e_datagen_brute_force() {
     let base_dir = manifest_dir.join("../../examples");
     let wfg_path = base_dir.join("scenarios/brute_force.wfg");
     let vars = HashMap::from([("FAIL_THRESHOLD".into(), "3".into())]);
-    let loaded = wf_datagen::loader::load_scenario(&wfg_path, &vars)
-        .expect("failed to load scenario");
+    let loaded =
+        wf_datagen::loader::load_scenario(&wfg_path, &vars).expect("failed to load scenario");
 
     // ---- Validate scenario ----
     let validation_errors =
@@ -157,9 +157,8 @@ FAIL_THRESHOLD = "3"
     let addr = reactor.listen_addr();
 
     // ---- Convert GenEvents → typed Arrow batches → TCP frames ----
-    let batches =
-        wf_datagen::output::arrow_ipc::events_to_typed_batches(&events, &loaded.schemas)
-            .expect("events_to_typed_batches failed");
+    let batches = wf_datagen::output::arrow_ipc::events_to_typed_batches(&events, &loaded.schemas)
+        .expect("events_to_typed_batches failed");
 
     // ---- TCP send ----
     let mut stream = TcpStream::connect(addr).await.expect("TCP connect failed");

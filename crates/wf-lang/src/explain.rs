@@ -86,7 +86,11 @@ fn explain_match(mp: &MatchPlan) -> MatchExpl {
     let keys = if mp.keys.is_empty() {
         "(none)".to_string()
     } else {
-        mp.keys.iter().map(format_field_ref).collect::<Vec<_>>().join(", ")
+        mp.keys
+            .iter()
+            .map(format_field_ref)
+            .collect::<Vec<_>>()
+            .join(", ")
     };
 
     let window_spec = match &mp.window_spec {
@@ -220,7 +224,12 @@ pub fn format_expr(expr: &Expr) -> String {
         Expr::Bool(b) => format!("{}", b),
         Expr::Field(fref) => format_field_ref(fref),
         Expr::BinOp { op, left, right } => {
-            format!("{} {} {}", format_expr(left), format_binop(*op), format_expr(right))
+            format!(
+                "{} {} {}",
+                format_expr(left),
+                format_binop(*op),
+                format_expr(right)
+            )
         }
         Expr::Neg(inner) => format!("-{}", format_expr(inner)),
         Expr::FuncCall {
@@ -334,7 +343,9 @@ impl fmt::Display for RuleExplanation {
         writeln!(f, "  Bindings:")?;
         for b in &self.bindings {
             match &b.filter {
-                Some(filter) => writeln!(f, "    {} -> {}  [filter: {}]", b.alias, b.window, filter)?,
+                Some(filter) => {
+                    writeln!(f, "    {} -> {}  [filter: {}]", b.alias, b.window, filter)?
+                }
                 None => writeln!(f, "    {} -> {}", b.alias, b.window)?,
             }
         }
@@ -367,14 +378,26 @@ impl fmt::Display for RuleExplanation {
         // Yield
         writeln!(f, "  Yield -> {}:", self.yield_target)?;
         for (name, value) in &self.yield_fields {
-            writeln!(f, "    {:width$} = {}", name, value, width = max_field_width(&self.yield_fields))?;
+            writeln!(
+                f,
+                "    {:width$} = {}",
+                name,
+                value,
+                width = max_field_width(&self.yield_fields)
+            )?;
         }
 
         // Lineage
         if !self.lineage.is_empty() {
             writeln!(f, "  Field Lineage:")?;
             for (name, origin) in &self.lineage {
-                writeln!(f, "    {:width$} <- {}", name, origin, width = max_field_width(&self.lineage))?;
+                writeln!(
+                    f,
+                    "    {:width$} <- {}",
+                    name,
+                    origin,
+                    width = max_field_width(&self.lineage)
+                )?;
             }
         }
 
@@ -411,9 +434,18 @@ mod tests {
             time_field: Some("event_time".to_string()),
             over: Duration::from_secs(3600),
             fields: vec![
-                FieldDef { name: "sip".to_string(), field_type: bt(BaseType::Ip) },
-                FieldDef { name: "action".to_string(), field_type: bt(BaseType::Chars) },
-                FieldDef { name: "event_time".to_string(), field_type: bt(BaseType::Time) },
+                FieldDef {
+                    name: "sip".to_string(),
+                    field_type: bt(BaseType::Ip),
+                },
+                FieldDef {
+                    name: "action".to_string(),
+                    field_type: bt(BaseType::Chars),
+                },
+                FieldDef {
+                    name: "event_time".to_string(),
+                    field_type: bt(BaseType::Time),
+                },
             ],
         }
     }
@@ -425,9 +457,18 @@ mod tests {
             time_field: None,
             over: Duration::from_secs(3600),
             fields: vec![
-                FieldDef { name: "sip".to_string(), field_type: bt(BaseType::Ip) },
-                FieldDef { name: "fail_count".to_string(), field_type: bt(BaseType::Digit) },
-                FieldDef { name: "message".to_string(), field_type: bt(BaseType::Chars) },
+                FieldDef {
+                    name: "sip".to_string(),
+                    field_type: bt(BaseType::Ip),
+                },
+                FieldDef {
+                    name: "fail_count".to_string(),
+                    field_type: bt(BaseType::Digit),
+                },
+                FieldDef {
+                    name: "message".to_string(),
+                    field_type: bt(BaseType::Chars),
+                },
             ],
         }
     }
@@ -490,7 +531,7 @@ rule brute_force_then_scan {
     #[test]
     fn format_expr_variants() {
         assert_eq!(format_expr(&Expr::Number(42.0)), "42.0");
-        assert_eq!(format_expr(&Expr::Number(3.14)), "3.14");
+        assert_eq!(format_expr(&Expr::Number(3.24)), "3.24");
         assert_eq!(format_expr(&Expr::StringLit("hello".into())), "\"hello\"");
         assert_eq!(format_expr(&Expr::Bool(true)), "true");
         assert_eq!(

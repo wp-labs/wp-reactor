@@ -8,7 +8,10 @@ mod cmd_fmt;
 mod cmd_lint;
 
 #[derive(Parser)]
-#[command(name = "wf-proj", about = "WarpFusion project tools for rule developers")]
+#[command(
+    name = "wf-proj",
+    about = "WarpFusion project tools for rule developers"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -63,19 +66,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Explain {
-            file,
-            schemas,
-            var,
-        } => {
+        Commands::Explain { file, schemas, var } => {
             cmd_explain::run(file, schemas, var)?;
         }
 
-        Commands::Lint {
-            file,
-            schemas,
-            var,
-        } => {
+        Commands::Lint { file, schemas, var } => {
             cmd_lint::run(file, schemas, var)?;
         }
 

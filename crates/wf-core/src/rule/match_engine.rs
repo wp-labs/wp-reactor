@@ -809,9 +809,7 @@ fn eval_logic_and(left: &Expr, right: &Expr, event: &Event) -> Option<Value> {
     let lv = eval_expr(left, event);
     let rv = eval_expr(right, event);
     match (lv.as_ref(), rv.as_ref()) {
-        (Some(Value::Bool(false)), _) | (_, Some(Value::Bool(false))) => {
-            Some(Value::Bool(false))
-        }
+        (Some(Value::Bool(false)), _) | (_, Some(Value::Bool(false))) => Some(Value::Bool(false)),
         (Some(Value::Bool(true)), Some(Value::Bool(true))) => Some(Value::Bool(true)),
         _ => None,
     }
@@ -822,9 +820,7 @@ fn eval_logic_or(left: &Expr, right: &Expr, event: &Event) -> Option<Value> {
     let lv = eval_expr(left, event);
     let rv = eval_expr(right, event);
     match (lv.as_ref(), rv.as_ref()) {
-        (Some(Value::Bool(true)), _) | (_, Some(Value::Bool(true))) => {
-            Some(Value::Bool(true))
-        }
+        (Some(Value::Bool(true)), _) | (_, Some(Value::Bool(true))) => Some(Value::Bool(true)),
         (Some(Value::Bool(false)), Some(Value::Bool(false))) => Some(Value::Bool(false)),
         _ => None,
     }

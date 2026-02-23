@@ -56,11 +56,7 @@ pub fn lint_wfl(file: &WflFile, _schemas: &[WindowSchema]) -> Vec<CheckError> {
 // W001: unused event alias
 // ---------------------------------------------------------------------------
 
-fn lint_unused_alias(
-    rule: &crate::ast::RuleDecl,
-    rule_name: &str,
-    warnings: &mut Vec<CheckError>,
-) {
+fn lint_unused_alias(rule: &crate::ast::RuleDecl, rule_name: &str, warnings: &mut Vec<CheckError>) {
     let declared: HashSet<&str> = rule.events.decls.iter().map(|d| d.alias.as_str()).collect();
     let mut used: HashSet<&str> = HashSet::new();
 
@@ -104,11 +100,7 @@ fn collect_step_sources<'a>(steps: &'a [MatchStep], used: &mut HashSet<&'a str>)
     }
 }
 
-fn collect_expr_aliases<'a>(
-    expr: &'a Expr,
-    declared: &HashSet<&str>,
-    used: &mut HashSet<&'a str>,
-) {
+fn collect_expr_aliases<'a>(expr: &'a Expr, declared: &HashSet<&str>, used: &mut HashSet<&'a str>) {
     match expr {
         Expr::Field(crate::ast::FieldRef::Simple(name)) => {
             if declared.contains(name.as_str()) {
@@ -129,7 +121,9 @@ fn collect_expr_aliases<'a>(
                 collect_expr_aliases(arg, declared, used);
             }
         }
-        Expr::InList { expr: inner, list, .. } => {
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
             collect_expr_aliases(inner, declared, used);
             for item in list {
                 collect_expr_aliases(item, declared, used);
@@ -184,17 +178,11 @@ fn lint_high_cardinality_key(
 // W004: threshold is 0 with >= or >
 // ---------------------------------------------------------------------------
 
-fn lint_steps(
-    steps: &[MatchStep],
-    rule_name: &str,
-    warnings: &mut Vec<CheckError>,
-) {
+fn lint_steps(steps: &[MatchStep], rule_name: &str, warnings: &mut Vec<CheckError>) {
     for step in steps {
         for branch in &step.branches {
             // W004: threshold == 0 with >= or >
-            if is_zero(&branch.pipe.threshold)
-                && matches!(branch.pipe.cmp, CmpOp::Ge | CmpOp::Gt)
-            {
+            if is_zero(&branch.pipe.threshold) && matches!(branch.pipe.cmp, CmpOp::Ge | CmpOp::Gt) {
                 warnings.push(CheckError {
                     severity: Severity::Warning,
                     rule: Some(rule_name.to_string()),
@@ -213,17 +201,15 @@ fn lint_steps(
 // W005: score expression is literally 0
 // ---------------------------------------------------------------------------
 
-fn lint_score_zero(
-    rule: &crate::ast::RuleDecl,
-    rule_name: &str,
-    warnings: &mut Vec<CheckError>,
-) {
+fn lint_score_zero(rule: &crate::ast::RuleDecl, rule_name: &str, warnings: &mut Vec<CheckError>) {
     if is_zero(&rule.score.expr) {
         warnings.push(CheckError {
             severity: Severity::Warning,
             rule: Some(rule_name.to_string()),
             contract: None,
-            message: "[W005] score expression is always 0.0; this rule will produce zero-score alerts".to_string(),
+            message:
+                "[W005] score expression is always 0.0; this rule will produce zero-score alerts"
+                    .to_string(),
         });
     }
 }
@@ -300,12 +286,30 @@ mod tests {
             time_field: Some("event_time".to_string()),
             over: Duration::from_secs(3600),
             fields: vec![
-                FieldDef { name: "sip".to_string(), field_type: bt(BaseType::Ip) },
-                FieldDef { name: "dip".to_string(), field_type: bt(BaseType::Ip) },
-                FieldDef { name: "action".to_string(), field_type: bt(BaseType::Chars) },
-                FieldDef { name: "user".to_string(), field_type: bt(BaseType::Chars) },
-                FieldDef { name: "count".to_string(), field_type: bt(BaseType::Digit) },
-                FieldDef { name: "event_time".to_string(), field_type: bt(BaseType::Time) },
+                FieldDef {
+                    name: "sip".to_string(),
+                    field_type: bt(BaseType::Ip),
+                },
+                FieldDef {
+                    name: "dip".to_string(),
+                    field_type: bt(BaseType::Ip),
+                },
+                FieldDef {
+                    name: "action".to_string(),
+                    field_type: bt(BaseType::Chars),
+                },
+                FieldDef {
+                    name: "user".to_string(),
+                    field_type: bt(BaseType::Chars),
+                },
+                FieldDef {
+                    name: "count".to_string(),
+                    field_type: bt(BaseType::Digit),
+                },
+                FieldDef {
+                    name: "event_time".to_string(),
+                    field_type: bt(BaseType::Time),
+                },
             ],
         }
     }
@@ -317,9 +321,18 @@ mod tests {
             time_field: None,
             over: Duration::from_secs(3600),
             fields: vec![
-                FieldDef { name: "x".to_string(), field_type: bt(BaseType::Ip) },
-                FieldDef { name: "y".to_string(), field_type: bt(BaseType::Chars) },
-                FieldDef { name: "n".to_string(), field_type: bt(BaseType::Digit) },
+                FieldDef {
+                    name: "x".to_string(),
+                    field_type: bt(BaseType::Ip),
+                },
+                FieldDef {
+                    name: "y".to_string(),
+                    field_type: bt(BaseType::Chars),
+                },
+                FieldDef {
+                    name: "n".to_string(),
+                    field_type: bt(BaseType::Digit),
+                },
             ],
         }
     }
@@ -364,11 +377,7 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-        assert_has_warning(
-            input,
-            &[auth_events_window(), output_window()],
-            "W001",
-        );
+        assert_has_warning(input, &[auth_events_window(), output_window()], "W001");
     }
 
     #[test]
@@ -381,11 +390,7 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-        assert_no_warning(
-            input,
-            &[auth_events_window(), output_window()],
-            "W001",
-        );
+        assert_no_warning(input, &[auth_events_window(), output_window()], "W001");
     }
 
     // W002: missing on_close
@@ -399,11 +404,7 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-        assert_has_warning(
-            input,
-            &[auth_events_window(), output_window()],
-            "W002",
-        );
+        assert_has_warning(input, &[auth_events_window(), output_window()], "W002");
     }
 
     #[test]
@@ -419,11 +420,7 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-        assert_no_warning(
-            input,
-            &[auth_events_window(), output_window()],
-            "W002",
-        );
+        assert_no_warning(input, &[auth_events_window(), output_window()], "W002");
     }
 
     // W003: high cardinality key
@@ -437,11 +434,7 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-        assert_has_warning(
-            input,
-            &[auth_events_window(), output_window()],
-            "W003",
-        );
+        assert_has_warning(input, &[auth_events_window(), output_window()], "W003");
     }
 
     #[test]
@@ -454,11 +447,7 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-        assert_no_warning(
-            input,
-            &[auth_events_window(), output_window()],
-            "W003",
-        );
+        assert_no_warning(input, &[auth_events_window(), output_window()], "W003");
     }
 
     // W004: threshold zero with >= or >
@@ -472,11 +461,7 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-        assert_has_warning(
-            input,
-            &[auth_events_window(), output_window()],
-            "W004",
-        );
+        assert_has_warning(input, &[auth_events_window(), output_window()], "W004");
     }
 
     #[test]
@@ -489,11 +474,7 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-        assert_no_warning(
-            input,
-            &[auth_events_window(), output_window()],
-            "W004",
-        );
+        assert_no_warning(input, &[auth_events_window(), output_window()], "W004");
     }
 
     // W005: score always zero
@@ -507,11 +488,7 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-        assert_has_warning(
-            input,
-            &[auth_events_window(), output_window()],
-            "W005",
-        );
+        assert_has_warning(input, &[auth_events_window(), output_window()], "W005");
     }
 
     #[test]
@@ -524,11 +501,7 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-        assert_no_warning(
-            input,
-            &[auth_events_window(), output_window()],
-            "W005",
-        );
+        assert_no_warning(input, &[auth_events_window(), output_window()], "W005");
     }
 
     // W006: yield field case collision with system field
@@ -539,9 +512,10 @@ rule r {
             streams: vec![],
             time_field: None,
             over: Duration::from_secs(3600),
-            fields: vec![
-                FieldDef { name: "Score".to_string(), field_type: bt(BaseType::Float) },
-            ],
+            fields: vec![FieldDef {
+                name: "Score".to_string(),
+                field_type: bt(BaseType::Float),
+            }],
         };
         let input = r#"
 rule r {
@@ -551,11 +525,7 @@ rule r {
     yield out (Score = 42.0)
 }
 "#;
-        assert_has_warning(
-            input,
-            &[auth_events_window(), out],
-            "W006",
-        );
+        assert_has_warning(input, &[auth_events_window(), out], "W006");
     }
 
     #[test]
@@ -566,9 +536,10 @@ rule r {
             streams: vec![],
             time_field: None,
             over: Duration::from_secs(3600),
-            fields: vec![
-                FieldDef { name: "sip".to_string(), field_type: bt(BaseType::Ip) },
-            ],
+            fields: vec![FieldDef {
+                name: "sip".to_string(),
+                field_type: bt(BaseType::Ip),
+            }],
         };
         let input = r#"
 rule r {
@@ -578,10 +549,6 @@ rule r {
     yield out (sip = e.sip)
 }
 "#;
-        assert_no_warning(
-            input,
-            &[auth_events_window(), out],
-            "W006",
-        );
+        assert_no_warning(input, &[auth_events_window(), out], "W006");
     }
 }

@@ -31,8 +31,7 @@ pub fn load_scenario(
 
     let mut rule_plans = Vec::new();
     for wfl_file in &wfl_files {
-        let plans = wf_lang::compile_wfl(wfl_file, &schemas)
-            .context("compiling .wfl rules")?;
+        let plans = wf_lang::compile_wfl(wfl_file, &schemas).context("compiling .wfl rules")?;
         rule_plans.extend(plans);
     }
 
@@ -61,10 +60,7 @@ pub fn load_from_uses(
 
     for use_decl in &wfg.uses {
         let resolved = base_dir.join(&use_decl.path);
-        let ext = resolved
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = resolved.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         match ext {
             "wfs" => {

@@ -142,7 +142,11 @@ impl Reactor {
         let (alert_tx, alert_group) = spawn_alert_task(data.alert_sink);
         groups.push(alert_group);
 
-        groups.push(spawn_evictor_task(&config, &data.router, cancel.child_token()));
+        groups.push(spawn_evictor_task(
+            &config,
+            &data.router,
+            cancel.child_token(),
+        ));
 
         let rule_group = spawn_rule_tasks(
             data.rules,
@@ -322,9 +326,9 @@ fn spawn_rule_tasks(
             timeout_scan_interval,
         };
 
-        group.push(tokio::spawn(async move {
-            run_rule_task(task_config).await
-        }));
+        group.push(tokio::spawn(
+            async move { run_rule_task(task_config).await },
+        ));
     }
 
     // Drop our copy of alert_tx so the alert channel closes when all rule

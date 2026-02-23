@@ -18,8 +18,7 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
     let source = load_wfl(&file, &var_map)?;
 
     // Parse
-    let wfl_file = wf_lang::parse_wfl(&source)
-        .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+    let wfl_file = wf_lang::parse_wfl(&source).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
 
     // Run error-level checks
     let errors = wf_lang::check_wfl(&wfl_file, &all_schemas);
@@ -43,10 +42,7 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
     } else {
         let error_count = errors.len();
         let warning_count = warnings.len();
-        eprintln!(
-            "\n{} error(s), {} warning(s)",
-            error_count, warning_count
-        );
+        eprintln!("\n{} error(s), {} warning(s)", error_count, warning_count);
     }
 
     if has_errors {

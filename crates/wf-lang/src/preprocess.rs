@@ -159,7 +159,10 @@ fn preprocess_impl(
                         } else {
                             return Err(PreprocessError {
                                 position: dollar_pos,
-                                message: format!("undefined variable '{}' (not in --var or environment)", ident),
+                                message: format!(
+                                    "undefined variable '{}' (not in --var or environment)",
+                                    ident
+                                ),
                             });
                         }
                     } else {
@@ -184,7 +187,10 @@ fn preprocess_impl(
                         } else {
                             return Err(PreprocessError {
                                 position: dollar_pos,
-                                message: format!("undefined variable '{}' (not in --var or environment)", ident),
+                                message: format!(
+                                    "undefined variable '{}' (not in --var or environment)",
+                                    ident
+                                ),
                             });
                         }
                     } else {
