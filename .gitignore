@@ -3,3 +3,4 @@ target
 .report
 .run.gxl
 examples/logs
+out/

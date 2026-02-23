@@ -16,10 +16,8 @@ pub struct LoadedScenario {
 
 /// Load a `.wfg` scenario file, resolve `use` declarations, and compile rules.
 ///
-/// `.wfl` files are preprocessed with `vars` before parsing. Pass an empty map
-/// if no variable substitution is needed (preprocessing is skipped entirely
-/// when `vars` is empty, so `.wfl` files with `$VAR` references will be
-/// parsed as-is).
+/// `.wfl` files are preprocessed with `vars` before parsing, falling back to
+/// environment variables for any undefined references.
 pub fn load_scenario(
     wfg_path: &Path,
     vars: &HashMap<String, String>,
@@ -49,8 +47,8 @@ pub fn load_scenario(
 /// Load `.wfs` schemas and `.wfl` rule files referenced by `use` declarations.
 ///
 /// Paths in `use` declarations are resolved relative to `wfg_path`'s directory.
-/// When `vars` is non-empty, `.wfl` sources are preprocessed with
-/// [`wf_lang::preprocess_vars`] before parsing.
+/// `.wfl` sources are preprocessed with `vars` (and environment variable
+/// fallback) via [`wf_lang::preprocess_vars_with_env`] before parsing.
 pub fn load_from_uses(
     wfg: &WfgFile,
     wfg_path: &Path,
@@ -81,12 +79,8 @@ pub fn load_from_uses(
                 let raw = std::fs::read_to_string(&resolved).with_context(|| {
                     format!("reading .wfl from use declaration: {}", resolved.display())
                 })?;
-                let source = if vars.is_empty() {
-                    raw
-                } else {
-                    wf_lang::preprocess_vars(&raw, vars)
-                        .with_context(|| format!("preprocessing .wfl: {}", resolved.display()))?
-                };
+                let source = wf_lang::preprocess_vars_with_env(&raw, vars)
+                    .with_context(|| format!("preprocessing .wfl: {}", resolved.display()))?;
                 let parsed = wf_lang::parse_wfl(&source)
                     .with_context(|| format!("parsing .wfl: {}", resolved.display()))?;
                 wfl_files.push(parsed);
