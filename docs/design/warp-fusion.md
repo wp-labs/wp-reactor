@@ -1,5 +1,5 @@
 # WarpFusion — 实时关联计算引擎设计方案
-<!-- 角色：架构师 / 技术决策者 | 状态：v2.1 对齐中 | 创建：2026-02-13 | 更新：2026-02-20 -->
+<!-- 角色：架构师 / 技术决策者 | 状态：L1 已实现 | 创建：2026-02-13 | 更新：2026-02-23 -->
 
 ## 1. 背景与动机
 
@@ -42,12 +42,22 @@ WarpParse（wp-motor）是一个高性能日志解析引擎，核心能力是：
 - **运维告警（Ops Alert）**：对系统运行状态（断连、积压、丢弃率）的监控告警，区别于业务风险告警。
 - 代码中的 `AlertRecord` / `AlertSink` 保留原命名，但语义统一指“风险告警记录/输出通道”。
 
-### 1.5 与 WFL v2.1 的实现对齐范围（本次更新）
+### 1.5 当前实现状态（L1）
 
-- 规则治理：强制 `meta.lang`、`meta.contract_version`、`limits`、`yield@vN`。
-- 语义收敛：`join` 强制 `snapshot/asof` 模式，不再允许隐式时点。
-- 正确性门禁：发布前必须通过 `contract + shuffle + scenario verify` 三层校验。
-- 可靠性分级：传输层从单一 best-effort 升级为可配置分级（默认仍为 best-effort）。
+截至 M24，WarpFusion 已完成 L1（单机 MVP）闭环：
+
+- **WFL 编译器**：.wfs + .wfl 解析 → 语义检查 → 编译为 `RulePlan`（CEP 状态机 + score/entity/yield 求值计划）
+- **CEP 引擎**：基于 scope-key 的状态机实例管理，支持 `on event` / `on close` 双阶段求值
+- **运行时闭环**：TCP 接收 Arrow IPC → Window 缓冲 → 规则执行 → 风险告警输出（File Sink）
+- **开发者工具**：`wf-proj`（explain / lint / fmt）、`wf-datagen`（测试数据生成 + oracle + verify）
+- **传输层**：Best-Effort 模式，Arrow IPC over TCP
+
+**L1 未实现**（计划 L2+）：
+- `join snapshot/asof`（JoinPlan 为空）
+- DataFusion SQL 执行
+- `limits` 资源预算执行
+- `at_least_once` / `exactly_once` 传输可靠性
+- 分布式路由（Replicated / Partitioned）
 
 ## 2. 整体架构
 
@@ -86,19 +96,20 @@ WarpParse (wp-motor) ×N                WarpFusion (wp-reactor，独立进程)
 ┌──────────────────┐                  ┌──────────────────────────────────────────┐
 │ Sources          │                  │                                          │
 │   ↓              │  TCP             │  Receiver (accept 多连接)                │
-│ Parser (WPL)     │  Arrow IPC       │    ↓                                     │
+│ Parser (WPL)     │  Arrow IPC       │    ↓ 路由到 Window                       │
 │   ↓              │  单向推送        │  Router (根据 Window 订阅声明路由)        │
-│ Router           │  ────────────→   │    ↓                                     │
+│ Router           │  ────────────→   │    ↓ Notify 通知                         │
 │   ↓              │                  │  ┌→ Window["auth_events"]    local        │
-│ Sinks            │                  │  ├→ Window["fw_events"]      local        │
-│   ├ File         │                  │  └→ Window["ip_blocklist"]   replicated   │
-│   ├ TCP          │                  │                                          │
-│   └ Arrow (新增) │                  │  Scheduler (事件驱动 + 超时扫描)           │
-└──────────────────┘                  │    ↓                                     │
-                                      │  RuleExecutor ×N (CEP 状态机 + Core IR) │
-wp-reactor Node X ─TCP─┐              │    ↓                                     │
-wp-reactor Node Y ─TCP─┼──→ 同一端口  │  AlertSink (风险告警输出: File/HTTP/Syslog)            │
-                       └──→           └──────────────────────────────────────────┘
+│ Sinks            │                  │  └→ Window["security_alerts"] local       │
+│   ├ File         │                  │                                          │
+│   ├ TCP          │                  │  RuleTask ×N (per-rule, pull-based)       │
+│   └ Arrow (新增) │                  │    ↓ cursor-based read_since             │
+└──────────────────┘                  │  CepStateMachine + RuleExecutor           │
+                                      │    ↓                                     │
+wp-reactor Node X ─TCP─┐              │  AlertSink (风险告警输出: File)            │
+wp-reactor Node Y ─TCP─┼──→ 同一端口  │                                          │
+                       └──→           │  Evictor (定期淘汰过期窗口数据)            │
+                                      └──────────────────────────────────────────┘
 ```
 
 多个 wp-motor 实例和分布式模式下的其他 wp-reactor 节点，均通过 TCP 连入同一个监听端口。
@@ -167,14 +178,17 @@ v2.1 起，WarpFusion 支持 `best_effort / at_least_once / exactly_once` 三档
 
 ```
 1. 启动：加载 .wfs 文件注册 Window Schema，加载 .toml 绑定物理参数，加载 .wfl 编译规则
-2. Receiver 从 Socket 接收 Arrow IPC 消息，解析 stream tag
-3. Router 查询 WindowRegistry，找到订阅该 stream 的所有 Window
-4. 按各 Window 的分布模式路由数据（单机直接本地分发）
-5. Window 追加 RecordBatch，按时间窗口策略维护活跃数据
-6. Scheduler 以事件驱动方式将新事件分发到相关规则的 match 引擎
-7. RuleExecutor 推进 `on event/on close` 双阶段求值，命中后执行 `join(snapshot/asof)` 并计算 `score`（可输出 `score_contrib`）
-8. 结合 `entity(type,id_expr)` 生成实体键，`yield target@vN` 写入目标 window（含系统字段）→ conv 后处理（如有）→ window sinks 输出
-9. Evictor 定期淘汰过期窗口数据
+2. 构建 WindowRegistry（schema → WindowDef → Window 实例 + 订阅表）
+3. 按 LIFO 顺序启动任务：alert → evictor → rules → receiver
+4. Receiver 从 Socket 接收 Arrow IPC 消息，解析 stream tag
+5. Router 查询 WindowRegistry，找到订阅该 stream 的所有 Window
+6. 按各 Window 的分布模式路由数据（单机直接本地 append），推进 watermark
+7. append 成功后通过 Notify 唤醒关联的 RuleTask
+8. RuleTask 通过 read_since(cursor) 拉取新数据，转换为 Event 后推进 CepStateMachine
+9. 状态机 on event 命中后，RuleExecutor 求值 score/entity，生成 AlertRecord
+10. AlertRecord 通过 mpsc channel 发送到 AlertSink 任务，写入 JSON Lines 文件
+11. Evictor 定期淘汰过期窗口数据（时间淘汰 + 内存淘汰）
+12. 关闭：先停 Receiver，通过 rule_cancel 触发规则最终 drain+flush，LIFO 逆序 join
 ```
 
 
@@ -182,131 +196,173 @@ v2.1 起，WarpFusion 支持 `best_effort / at_least_once / exactly_once` 三档
 
 ### 3.1 代码仓库布局
 
-WarpFusion 作为独立工程，与 wp-motor 平级。通过共享 crate `wf-arrow` 桥接。
+WarpFusion 使用 Cargo workspace 组织，工程名 `wp-reactor`，与 wp-motor 平级。通过共享 crate `wp-arrow` 桥接 Arrow IPC 传输。
 
 ```
 wp-labs/
 ├── wp-motor/                  # 现有解析引擎（不动）
-│
-├── wf-arrow/                  # 共享 crate：Arrow 转换层
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs
-│       ├── schema.rs          # DataType → Arrow DataType 映射
-│       ├── convert.rs         # Vec<DataRecord> → RecordBatch
-│       ├── reverse.rs         # RecordBatch → Vec<DataRecord>
-│       └── ipc.rs             # Arrow IPC StreamWriter/StreamReader 封装
-│
-└── warp-fusion/               # 新工程：关联计算引擎
+├── wp-arrow/                  # 共享 crate：Arrow IPC 编解码
+└── wp-reactor/                # WarpFusion 关联计算引擎
     ├── Cargo.toml             # workspace 根
-    ├── src/                   # 主二进制
-    ├── crates/                # 内部 crate
-    ├── config/                # 配置示例
-    ├── tests/                 # 集成测试
+    ├── crates/
+    │   ├── wf-lang/           # WFL/WFS 语言编译器（纯同步，零运行时依赖）
+    │   ├── wf-config/         # 配置解析（.toml + 项目工具共享函数）
+    │   ├── wf-core/           # 核心引擎（Window + CEP + Alert）
+    │   ├── wf-runtime/        # 异步运行时（Receiver + RuleTask + Lifecycle）
+    │   ├── wf-engine/         # 引擎二进制 → warp-fusion（面向运维）
+    │   ├── wf-proj/           # 项目工具二进制 → wf-proj（面向规则开发者）
+    │   └── wf-datagen/        # 测试数据生成二进制 → wf-datagen
+    ├── examples/              # 配置与规则示例
+    │   ├── wfusion.toml
+    │   ├── schemas/
+    │   │   └── security.wfs
+    │   ├── rules/
+    │   │   └── brute_force.wfl
+    │   └── scenarios/
+    │       └── brute_force.wfg
     └── docs/                  # 工程文档
 ```
 
-### 3.2 wf-arrow（共享 crate）
+**三个二进制：**
 
-独立仓库，wp-motor 和 warp-fusion 均通过 path/git 依赖引用。
+| Crate | 二进制名 | 用途 |
+|-------|---------|------|
+| wf-engine | `warp-fusion` | 运行时引擎，`run --config wfusion.toml` |
+| wf-proj | `wf-proj` | 开发者工具：`explain` / `lint` / `fmt` |
+| wf-datagen | `wf-datagen` | 测试数据生成：`gen` / `lint` / `verify` / `bench` |
+
+### 3.2 Crate 依赖关系
 
 ```
-wf-arrow/
-├── Cargo.toml
-│   # 依赖: arrow, parquet, wp-model-core
+wf-lang  (纯同步，无运行时依赖)
+  ↑
+wf-config  (依赖 wf-lang 做 .wfs 解析和变量预处理)
+  ↑
+wf-core  (依赖 wf-config + wf-lang，核心引擎逻辑)
+  ↑
+wf-runtime  (依赖 wf-core + wp-arrow，异步运行时)
+  ↑
+wf-engine  (依赖 wf-config + wf-runtime，引擎二进制)
+
+wf-proj  (依赖 wf-config + wf-lang + tree-sitter，开发者工具)
+wf-datagen  (依赖 wf-core + wf-lang，测试数据生成)
+```
+
+### 3.3 wf-lang（WFL 编译器）
+
+纯同步 crate，零运行时依赖。使用 winnow 解析器组合子。
+
+```
+wf-lang/
+└── src/
+    ├── lib.rs                 # 公开 API：parse_wfl, parse_wfs, check_wfl, lint_wfl,
+    │                          #           compile_wfl, preprocess_vars, preprocess_vars_with_env
+    ├── ast.rs                 # WFL AST 类型（WflFile, RuleDecl, Expr, ContractBlock...）
+    ├── plan.rs                # 编译产物：RulePlan, MatchPlan, BindPlan, ScorePlan...
+    ├── schema.rs              # WindowSchema, FieldDef, BaseType, FieldType
+    ├── wfl_parser/            # .wfl 解析器（winnow）
+    ├── wfs_parser/            # .wfs 解析器（winnow）
+    ├── checker/               # 语义检查
+    │   ├── mod.rs             # check_wfl: L1 语义错误检查
+    │   ├── lint.rs            # lint_wfl: 最佳实践警告（W001–W006）
+    │   ├── rules.rs           # 规则级检查逻辑
+    │   ├── contracts.rs       # contract 块检查逻辑
+    │   └── types.rs           # CheckError, Severity
+    ├── compiler/              # AST → RulePlan 编译
+    │   └── mod.rs             # compile_wfl: 语义检查 + 编译
+    ├── explain.rs             # 规则人类可读解释 + 字段血缘分析
+    ├── preprocess.rs          # 变量替换预处理（支持环境变量回退）
+    └── parse_utils.rs         # 解析工具函数
+```
+
+### 3.4 wf-core（核心引擎）
+
+Window 缓冲、CEP 状态机、规则执行、告警输出。同步 API（仅依赖 tokio::sync 的 Notify/RwLock）。
+
+```
+wf-core/
 └── src/
     ├── lib.rs
-    ├── schema.rs              # 类型映射
-    │   └── to_arrow_type(DataType) → arrow::DataType
-    │   └── to_arrow_schema(Vec<FieldDef>) → Schema
-    ├── convert.rs             # 行转列
-    │   └── records_to_batch(Vec<DataRecord>, Schema) → RecordBatch
-    │   └── batch_to_records(RecordBatch) → Vec<DataRecord>
-    └── ipc.rs                 # IPC 编解码
-        └── encode_ipc(tag, RecordBatch) → Bytes
-        └── decode_ipc(Bytes) → IpcFrame { tag, RecordBatch }
+    ├── window/
+    │   ├── mod.rs
+    │   ├── buffer.rs          # Window: 带 watermark 的时间窗口缓冲 + cursor-based 读取
+    │   ├── registry.rs        # WindowRegistry: 窗口注册 + stream→window 订阅表
+    │   ├── router.rs          # Router: watermark-aware 路由 + Notify 通知
+    │   └── evictor.rs         # Evictor: 时间淘汰 + 内存淘汰
+    ├── rule/
+    │   ├── mod.rs
+    │   ├── match_engine.rs    # CepStateMachine: scope-key 状态机 + 表达式求值
+    │   ├── executor.rs        # RuleExecutor: score/entity 求值 → AlertRecord
+    │   └── event_bridge.rs    # batch_to_events: RecordBatch → Vec<Event>
+    ├── alert/
+    │   ├── mod.rs
+    │   ├── types.rs           # AlertRecord（alert_id, score, entity, fired_at...）
+    │   └── sink.rs            # AlertSink trait + FileAlertSink + FanOutSink
+    └── error.rs               # CoreError（基于 orion-error 结构化错误）
 ```
 
-**类型映射表：**
+### 3.5 wf-runtime（异步运行时）
 
-| wp-model-core DataType | Arrow DataType | 说明 |
-|------------------------|----------------|------|
-| Chars | Utf8 | |
-| Digit | Int64 | |
-| Float | Float64 | |
-| Bool | Boolean | |
-| Time | Timestamp(Nanosecond, None) | NaiveDateTime → i64 纳秒 |
-| IP | Utf8 | IpAddr → 字符串（便于 SQL 操作） |
-| Hex | Utf8 | |
-| Array(T) | List(T) | 递归映射内部类型 |
-
-### 3.3 warp-fusion（主工程）
+Tokio 异步运行时，管理任务生命周期。
 
 ```
-warp-fusion/
-├── Cargo.toml                      # workspace 根
-├── src/
-│   ├── main.rs                     # 入口
-│   ├── lib.rs                      # 库根
-│   ├── cli.rs                      # clap CLI 参数定义
-│   ├── types.rs                    # 全局类型别名
-│   │
-│   ├── runtime/                    # 运行时
-│   │   ├── mod.rs
-│   │   ├── actor/                  # actor 基础设施（复用 wp-motor 模式）
-│   │   │   ├── mod.rs
-│   │   │   ├── group.rs            # TaskGroup: JoinHandle 管理
-│   │   │   ├── channel.rs          # 有界 mpsc channel 封装
-│   │   │   └── command.rs          # 控制命令: Start/Stop/Reload/Drain
-│   │   ├── receiver.rs             # 接收 task: 监听 Socket，解码 Arrow IPC
-│   │   ├── scheduler.rs            # 调度 task: 事件驱动分发 + 超时扫描
-│   │   └── lifecycle.rs            # 启停管理: 信号处理、优雅关闭
-│   │
-│   └── facade/                     # 外部接口
-│       ├── mod.rs
-│       └── health.rs               # 健康检查（可选 HTTP 端点）
-│
-├── crates/
-│   ├── wf-core/                    # 核心引擎
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── window/             # Window 订阅者模型
-│   │       │   ├── mod.rs
-│   │       │   ├── types.rs        # WindowSchema, WindowRtConfig, DistMode, Window
-│   │       │   ├── buffer.rs       # Window 时间窗口缓冲实现
-│   │       │   ├── registry.rs     # WindowRegistry: 订阅表 + 路由推导
-│   │       │   ├── router.rs       # Router: 根据订阅声明分发数据
-│   │       │   └── evictor.rs      # 过期淘汰
-│   │       ├── rule/               # 关联规则
-│   │       │   ├── mod.rs
-│   │       │   ├── executor.rs     # RuleExecutor: 状态机驱动 + DataFusion join
-│   │       │   ├── match_engine.rs  # MatchEngine: CEP 状态机驱动
-│   │       │   └── timeout.rs     # 超时管理: on close 求值 / maxspan 过期清理
-│   │       └── alert/              # 风险告警输出
-│   │           ├── mod.rs
-│   │           ├── types.rs        # AlertRecord（score/entity）定义
-│   │           └── sink.rs         # AlertSink trait + File/HTTP/Syslog 实现
-│   │
-│   └── wf-config/                  # 配置管理
-│       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs
-│           ├── fusion.rs           # FusionConfig 主配置（加载 .toml）
-│           ├── window_rt.rs        # WindowRtConfig: 运行时物理参数（mode, max_bytes, over_cap）
-│           └── limits.rs           # 常量: channel 容量、默认窗口大小
-│
-├── config/                         # 配置示例
-│   ├── wfusion.toml                 # 主配置文件（运行时物理参数）
-│   ├── schemas/
-│   │   └── security.wfs             # Window Schema 文件
-│   └── rules/
-│       ├── brute_scan.wfl          # 安全关联规则（WFL）
-│       └── traffic.wfl             # 流量分析规则（WFL）
-│
-└── tests/                          # 集成测试
-    ├── e2e_basic.rs                # 端到端: 发送数据 -> 触发规则 -> 验证风险告警
-    └── window_test.rs              # 窗口缓冲与淘汰测试
+wf-runtime/
+└── src/
+    ├── lib.rs
+    ├── lifecycle.rs           # Reactor: 启动引导 + 任务编排 + 两阶段关闭
+    ├── receiver.rs            # Receiver: TCP 监听 + Arrow IPC 解码 + 路由
+    ├── engine_task.rs         # RuleTask: per-rule pull-based 规则执行循环
+    ├── alert_task.rs          # run_alert_sink: channel-close-driven 告警写入
+    ├── evictor_task.rs        # run_evictor: 定时淘汰
+    ├── schema_bridge.rs       # WindowSchema + WindowConfig → WindowDef 转换
+    └── error.rs               # RuntimeError（基于 orion-error）
+```
+
+### 3.6 wf-config（配置管理）
+
+```
+wf-config/
+└── src/
+    ├── lib.rs                 # 公开 API 统一导出
+    ├── fusion.rs              # FusionConfig: 加载 wfusion.toml
+    ├── server.rs              # ServerConfig: listen 地址
+    ├── runtime.rs             # RuntimeConfig: schemas/rules glob、并行度
+    ├── window.rs              # WindowConfig, WindowDefaults, WindowOverride
+    ├── alert.rs               # AlertConfig, SinkUri（目前仅 file://）
+    ├── logging.rs             # LoggingConfig: level, format, file, modules
+    ├── types.rs               # HumanDuration, ByteSize, DistMode, LatePolicy
+    ├── validate.rs            # over vs over_cap 校验
+    └── project.rs             # 项目工具共享函数: load_wfl, load_schemas, parse_vars
+```
+
+### 3.7 wf-proj（开发者工具）
+
+同步 CLI，不依赖 tokio。使用 tree-sitter-wfl 做代码格式化。
+
+```
+wf-proj/
+└── src/
+    ├── main.rs                # CLI: Explain / Lint / Fmt 子命令
+    ├── cmd_explain.rs         # 编译规则并输出人类可读解释
+    ├── cmd_lint.rs            # 语义检查 + lint 检查，输出诊断信息
+    └── cmd_fmt.rs             # tree-sitter 语法验证 + 行级缩进规范化
+```
+
+### 3.8 wf-datagen（测试数据生成）
+
+```
+wf-datagen/
+└── src/
+    ├── main.rs                # CLI: Gen / Lint / Verify / Bench 子命令
+    ├── lib.rs
+    ├── wfg_ast.rs             # .wfg 场景文件 AST
+    ├── wfg_parser.rs          # .wfg 解析器（winnow）
+    ├── loader.rs              # 场景加载: .wfg → schemas + rules + plans
+    ├── datagen.rs             # 数据生成: stream/field/inject/fault
+    ├── oracle.rs              # Oracle: 在生成数据上运行规则，输出期望告警
+    ├── validate.rs            # 场景文件校验
+    ├── verify.rs              # 告警验证: expected vs actual → VerifyReport
+    └── output.rs              # 输出格式: Arrow IPC / JSON Lines
 ```
 
 
@@ -317,53 +373,44 @@ warp-fusion/
 Window 是 WarpFusion 的核心抽象，兼具数据订阅声明和时间窗口缓冲两个职责。
 
 ```rust
-/// Window 逻辑定义（来自 .wfs 文件）
+/// Window 逻辑定义（来自 .wfs 文件，由 wf-lang 解析）
 pub struct WindowSchema {
     pub name: String,                     // Window 名称
-    pub streams: Vec<String>,             // 订阅的 stream name（支持多个）
-    pub time_field: String,               // 事件时间字段
-    pub over: Duration,                   // 窗口保持时长（需求侧）
+    pub streams: Vec<String>,             // 订阅的 stream name（空 = yield-only 窗口）
+    pub time_field: Option<String>,       // 事件时间字段（over > 0 时必须）
+    pub over: Duration,                   // 窗口保持时长（Duration::ZERO = 静态集合）
     pub fields: Vec<FieldDef>,            // 字段 schema
 }
 
-/// Window 运行时配置（来自 .toml 文件）
-pub struct WindowRtConfig {
+/// Window 运行时配置（来自 .toml 文件，经 WindowDefaults 合并后）
+pub struct WindowConfig {
+    pub name: String,
     pub mode: DistMode,                   // 分布模式
-    pub max_window_bytes: usize,          // 单窗口内存上限（字节）
-    pub over_cap: Duration,               // over 能力上限（over ≤ over_cap）
-    pub watermark: Duration,              // Watermark 延迟（默认 5s）
-    pub allowed_lateness: Duration,       // 允许迟到时长（默认 0）
+    pub max_window_bytes: ByteSize,       // 单窗口内存上限
+    pub over_cap: HumanDuration,          // over 能力上限（over ≤ over_cap）
+    pub evict_policy: EvictPolicy,        // 淘汰策略
+    pub watermark: HumanDuration,         // Watermark 延迟（默认 5s）
+    pub allowed_lateness: HumanDuration,  // 允许迟到时长（默认 0）
     pub late_policy: LatePolicy,          // 迟到数据处理策略
-}
-
-/// 迟到数据处理策略
-pub enum LatePolicy {
-    /// 丢弃迟到数据，不进入窗口（默认；最简单，适合大多数场景）
-    Drop,
-    /// 接受迟到数据并修正窗口（可能导致已触发的规则重新计算）
-    Revise,
-    /// 写入旁路输出（late_sink），不影响主窗口
-    SideOutput { sink: String },
 }
 
 /// 分布模式
 pub enum DistMode {
-    /// 按 key hash 分区，同 key 的数据保证在同一节点
-    Partitioned { key: String },
-    /// 全局复制，每个节点持有完整副本
-    Replicated,
-    /// 仅本机，不参与分布式路由
     Local,
+    Replicated,
+    Partitioned { key: String },
 }
 
-/// Window 运行时实例：持有实际数据
+/// Window 运行时实例：带 watermark 的时间窗口缓冲
 pub struct Window {
-    ws: WindowSchema,                     // 逻辑定义（from .wfs）
-    rt: WindowRtConfig,                   // 运行时配置（from .toml）
-    schema: SchemaRef,                    // Arrow Schema（从 ws.fields 映射）
+    // 内部字段（private）
+    params: WindowParams,                 // name, schema, time_col_index, over
+    config: WindowConfig,                 // 运行时配置
     batches: VecDeque<TimedBatch>,        // 带时间戳的批数据队列
     current_bytes: usize,                 // 当前已用字节数
-    total_rows: usize,                    // 当前总行数（监控用）
+    total_rows: usize,                    // 当前总行数
+    watermark_nanos: i64,                 // 当前 watermark 时间戳
+    next_seq: u64,                        // 单调递增序列号（用于 cursor）
 }
 
 struct TimedBatch {
@@ -371,18 +418,30 @@ struct TimedBatch {
     event_time_range: (i64, i64),         // 该批数据的事件时间范围
     ingested_at: Instant,                 // 接收时间
     row_count: usize,
-    byte_size: usize,                     // 该 batch 的内存占用（arrow get_array_memory_size）
+    byte_size: usize,
+    seq: u64,                             // 分配的序列号
 }
 
 impl Window {
-    /// 追加数据；若追加后超出 max_window_bytes 则先淘汰最早的 batch
-    pub fn append(&mut self, batch: RecordBatch);
-    /// 获取当前窗口内的只读快照（不阻塞写入）
+    /// 追加数据（不检查 watermark）
+    pub fn append(&mut self, batch: RecordBatch) -> Result<()>;
+    /// 追加数据并检查 watermark；迟到数据按 late_policy 处理
+    pub fn append_with_watermark(&mut self, batch: RecordBatch) -> Result<AppendOutcome>;
+    /// 获取当前窗口内的只读快照
     pub fn snapshot(&self) -> Vec<RecordBatch>;
-    /// 淘汰过期数据
-    pub fn evict_expired(&mut self, now: i64);
+    /// cursor-based 读取：返回 (batches, new_cursor, gap_detected)
+    pub fn read_since(&self, cursor: u64) -> (Vec<RecordBatch>, u64, bool);
+    /// 淘汰过期数据（基于事件时间）
+    pub fn evict_expired(&mut self, now_nanos: i64);
+    /// 淘汰最早的一个 batch（内存压力时使用）
+    pub fn evict_oldest(&mut self) -> Option<usize>;
     /// 返回当前窗口的内存占用（字节）
     pub fn memory_usage(&self) -> usize;
+}
+
+pub enum AppendOutcome {
+    Appended,
+    DroppedLate,
 }
 ```
 
@@ -425,21 +484,49 @@ Window 基于 **事件时间**（event time）而非处理时间（processing ti
 
 **一个 Stream 可被多个 Window 订阅**——例如 `firewall` 流可以同时被 `fw_by_sip`（partitioned by sip）和 `fw_global_stats`（replicated）订阅，Router 按各自的 mode 分别路由。
 
-### 4.2 WindowRegistry — 窗口注册与路由
+### 4.2 WindowRegistry + Router — 窗口注册与路由
 
-维护所有 Window 实例，并根据 Window 的订阅声明推导路由表。
+WindowRegistry 维护所有 Window 实例及订阅表。Router 封装 WindowRegistry 提供 watermark-aware 路由。
 
 ```rust
+pub struct WindowDef {
+    pub params: WindowParams,
+    pub streams: Vec<String>,     // 此窗口订阅的 stream 名称
+    pub config: WindowConfig,
+}
+
 pub struct WindowRegistry {
     /// Window 名称 → 运行时实例
     windows: HashMap<String, Arc<RwLock<Window>>>,
     /// Stream name → 订阅该 stream 的 Window 列表（路由表）
     subscriptions: HashMap<String, Vec<Subscription>>,
+    /// Window 名称 → Notify handle（用于唤醒 RuleTask）
+    notifiers: HashMap<String, Arc<Notify>>,
 }
 
-struct Subscription {
-    window_name: String,
-    mode: DistMode,
+impl WindowRegistry {
+    pub fn build(defs: Vec<WindowDef>) -> CoreResult<Self>;
+    pub fn get_window(&self, name: &str) -> Option<&Arc<RwLock<Window>>>;
+    pub fn get_notifier(&self, name: &str) -> Option<&Arc<Notify>>;
+    pub fn snapshot(&self, name: &str) -> Option<Vec<RecordBatch>>;
+    pub(crate) fn subscribers_of(&self, stream_name: &str) -> Vec<(&str, &DistMode)>;
+}
+
+pub struct Router {
+    registry: WindowRegistry,
+}
+
+pub struct RouteReport {
+    pub delivered: usize,
+    pub dropped_late: usize,
+    pub skipped_non_local: usize,
+}
+
+impl Router {
+    pub fn new(registry: WindowRegistry) -> Self;
+    /// 路由 batch 到所有订阅该 stream 的 Local 窗口，append 成功后 Notify 唤醒 RuleTask
+    pub fn route(&self, stream_name: &str, batch: RecordBatch) -> Result<RouteReport>;
+    pub fn registry(&self) -> &WindowRegistry;
 }
 ```
 
@@ -449,6 +536,7 @@ struct Subscription {
                          ┌─────────────────────────────────┐
                          │         BOOT 阶段                │
                          │   .wfs + wfusion.toml → 订阅表    │
+                         │   .wfl → RulePlan → RunRule       │
                          └───────────────┬─────────────────┘
                                          │
                                          ▼
@@ -461,21 +549,31 @@ struct Subscription {
                           frame.batch ─▶ RecordBatch
                                        │
                           ┌────────────┴────────────┐
+                          │   Router.route()         │
+                          │   → Window.append_with_  │
+                          │     watermark(batch)      │
+                          │   → Notify.notify_        │
+                          │     waiters()             │
+                          └────────────┬─────────────┘
+                                       │
+                          ┌────────────┴────────────┐
                           │                         │
                           ▼                         ▼
                  ┌─────────────────┐     ┌──────────────────────┐
-                 │ Router.route()  │     │ event_tx.send()      │
-                 │ → Window 写入   │     │ → Scheduler 消费     │
-                 └────────┬────────┘     └──────────┬───────────┘
-                          │                         │
-                          ▼                         ▼
-                 ┌─────────────────┐     ┌──────────────────────┐
-                 │ Window Buffer   │     │ CEP StateMachine     │
-                 │ (时间窗口存储)   │     │ (规则状态推进)        │
-                 └─────────────────┘     └──────────────────────┘
+                 │ Window Buffer   │     │ RuleTask (pull-based) │
+                 │ (时间窗口存储)   │←────│ read_since(cursor)    │
+                 └─────────────────┘     │ batch_to_events()     │
+                                         │ machine.advance()     │
+                                         └──────────┬───────────┘
+                                                    │
+                                                    ▼
+                                         ┌──────────────────────┐
+                                         │ AlertSink            │
+                                         │ (JSON Lines 文件)     │
+                                         └──────────────────────┘
 ```
 
-Router 和 Scheduler 并行消费同一帧数据：Router 负责将 batch 写入 Window 缓冲区供 join/snapshot 使用；Scheduler 负责驱动 CEP 状态机进行规则匹配。
+Router 负责将 batch 写入 Window 缓冲区并通过 Notify 唤醒 RuleTask。RuleTask 通过 cursor-based `read_since()` 拉取新数据，转换为事件后推进 CEP 状态机。
 
 #### 4.2.2 启动阶段：订阅表构建
 
@@ -491,11 +589,11 @@ Router 和 Scheduler 并行消费同一帧数据：Router 负责将 batch 写入
            │                                     │
            ▼                                     ▼
 ┌────────────────────────────────────────────────────────┐
-│            schema_bridge::schema_to_window_def          │
+│          schema_bridge::schema_to_window_def            │
 │  WindowSchema + WindowConfig → WindowDef {              │
 │    params:  { name: "auth_events", schema, over, ... }  │
 │    streams: ["syslog"],         ← 来自 .wfs             │
-│    config:  { mode: Local, ... } ← 来自 wfusion.toml     │
+│    config:  { mode: Local, ... } ← 来自 wfusion.toml    │
 │  }                                                      │
 └────────────────────────┬───────────────────────────────┘
                          │
@@ -504,7 +602,9 @@ Router 和 Scheduler 并行消费同一帧数据：Router 负责将 batch 写入
 │            WindowRegistry::build(defs)                  │
 │                                                         │
 │  for def in defs:                                       │
-│    windows["auth_events"] = Window::new(...)             │
+│    windows["auth_events"] = Arc::new(RwLock::new(       │
+│      Window::new(params, config)))                      │
+│    notifiers["auth_events"] = Arc::new(Notify::new())   │
 │    for stream_name in def.streams:                      │
 │      subscriptions["syslog"]                            │
 │        .push(Subscription {                             │
@@ -515,24 +615,8 @@ Router 和 Scheduler 并行消费同一帧数据：Router 负责将 batch 写入
 │  生成的订阅表 (HashMap<String, Vec<Subscription>>):      │
 │  ┌────────────────────────────────────────────────┐     │
 │  │ "syslog"  → [ auth_events(Local) ]             │     │
-│  │ "netflow" → [ fw_events(Local),                │     │
-│  │              ip_stats(Replicated) ]             │     │
 │  └────────────────────────────────────────────────┘     │
 └────────────────────────────────────────────────────────┘
-```
-
-多对多关系：
-
-```
-stream_name         subscriptions            window
-───────────         ─────────────            ──────
-                 ┌→ auth_events (Local)
-"syslog"    ─────┤                            扇出: 1 stream → N windows
-                 └→ all_logs    (Local)
-
-"syslog"    ─────┐
-                 ├→ all_logs    (Local)       聚合: N streams → 1 window
-"winlog"    ─────┘
 ```
 
 #### 4.2.3 运行阶段：Router 路由逻辑
@@ -548,7 +632,7 @@ Router.route(stream_name, batch):
 │    for (window_name, mode) in subs:
 │    │
 │    ├─ mode != Local
-│    │   → skipped_non_local += 1（Replicated/Partitioned 暂不处理）
+│    │   → skipped_non_local += 1（Replicated/Partitioned L1 暂不处理）
 │    │
 │    └─ mode == Local
 │        → window.append_with_watermark(batch)
@@ -556,332 +640,364 @@ Router.route(stream_name, batch):
 │          ├─ ③ 提取时间范围
 │          │    (min_ts, max_ts) = extract_time_range(batch)
 │          │
-│          ├─ ④ 推进 Watermark
+│          ├─ ④ 迟到检查（在推进 watermark 之前）
+│          │    cutoff = watermark - allowed_lateness
+│          │    min_ts < cutoff ?
+│          │    ├─ YES → late_policy:
+│          │    │   └─ Drop → DroppedLate
+│          │    └─ NO  → append(batch) → Appended ✓
+│          │
+│          ├─ ⑤ 推进 Watermark
 │          │    watermark = max(watermark, max_ts - delay)
 │          │
-│          └─ ⑤ 迟到检查
-│               cutoff = watermark - allowed_lateness
-│               min_ts < cutoff ?
-│               ├─ YES → late_policy:
-│               │   ├─ Drop       → DroppedLate（丢弃）
-│               │   └─ Revise     → 仍写入窗口
-│               └─ NO  → append(batch) → Appended ✓
+│          └─ ⑥ 唤醒 RuleTask
+│               notifiers[window_name].notify_waiters()
+│               （在释放 write lock 之后）
 │
 └─ 返回 RouteReport { delivered, dropped_late, skipped_non_local }
 ```
 
-#### 4.2.4 运行阶段：Scheduler 分发逻辑
+#### 4.2.4 RuleTask：Pull-Based 规则执行
 
-Scheduler 消费 `(stream_name, RecordBatch)` 元组，通过预计算的 `stream_aliases` 映射将事件分发到对应的 CEP 状态机。
-
-```
-启动时预计算 (build_stream_aliases):
-  WFL 规则: events { fail : auth_events && action == "failed" }
-  .wfs 定义: window auth_events { stream = "syslog" }
-  → stream_aliases["syslog"] = ["fail"]
-
-运行时分发:
-Scheduler.dispatch_batch(stream_name, batch):
-│
-├─ events = batch_to_events(batch)
-│  空 → 返回
-│
-└─ for engine in engines:       // 并行, 受 exec_semaphore 限制
-     aliases = engine.stream_aliases.get(stream_name)
-     ├─ None → skip（此规则不关心该 stream）
-     └─ Some(["fail"]) →
-          for event in events:
-            for alias in aliases:
-              machine.advance(alias, event)
-              └─ Matched(ctx) → executor.execute_match(ctx)
-                                  → alert_tx.send(alert)
-```
-
-> **注意**：行级过滤（`events { alias : window && filter }` 中的 `&&` 条件）不在路由层执行——路由层负责将整个 RecordBatch 分发到 Window，过滤在 RuleExecutor 的事件匹配阶段执行。这保证了同一 Window 被多条规则以不同过滤条件引用时，数据只存储一份。
-
-**Router 分布式路由（收到数据时）：**
-
-```
-收到 (stream_name, RecordBatch):
-  for sub in subscriptions[stream_name]:
-    match sub.mode:
-      Local | 单机模式  → 直接 window.append(batch)
-      Replicated        → broadcast batch → 所有节点
-
-      Partitioned(key)  → 行级分桶路由:
-        // ① 取出 key 列，逐行计算 hash
-        buckets: HashMap<NodeId, Vec<row_index>> = {}
-        for row in 0..batch.num_rows():
-          node = hash(batch.column(key)[row]) % N
-          buckets[node].push(row)
-        // ② 按目标节点组装子 batch
-        for (node, indices) in buckets:
-          sub_batch = batch.take(indices)   // Arrow take 内核，gather 拷贝
-          send(node, sub_batch)
-```
-
-> **设计说明**：`Partitioned` 不能按整个 RecordBatch 做 hash——同一 batch 可能包含多个不同 key 值的行。必须逐行提取 key、分桶，再按目标节点重组子 batch 发送。Arrow 的 `take` 内核按索引 gather 行数据，**会产生内存拷贝**（非零拷贝），单机模式下不涉及此路径。分布式模式下需关注其 CPU/内存开销，优化手段：
->
-> - **预排序优化**：若上游 batch 已按 key 排序（WarpParse Sink 侧可选排序），则同 key 行连续，可用 `slice()` 做零拷贝切片代替 `take()` gather
-> - **batch 尺寸控制**：控制单个 batch 的行数（如 ≤4096 行），限制单次 gather 的开销
-> - **单机跳过**：单机模式下所有 Window 实质为 `local`，Router 直接 append 原始 batch，不触发分桶逻辑
-
-### 4.3 RuleExecutor — 规则执行器
-
-每条规则由 `wf-lang` 编译为 `RulePlan(Core IR)`。事件到达时推进状态机，在 `on event`/`on close` 条件满足后按 `JoinPlan(snapshot/asof)` 执行关联、计算 `score`，并按 `entity(type,id_expr)` 产出风险告警写入目标 window。
+取代了原设计中的 Scheduler，每条编译后的规则对应一个独立的 `RuleTask`，通过 Notify + cursor 机制拉取数据。
 
 ```rust
-/// 编译后的规则执行计划（由 wf-lang 编译器生成）
-/// 所有 WFL 规则统一编译为 CEP 状态机
-pub struct RulePlan {
-    pub name: String,
-    pub lang: String,                      // v2.1
-    pub contract_version: u32,             // 对应 yield@vN
-    pub windows: Vec<String>,             // 引用的 Window 名称列表
-    pub state_machine: CepStateMachine,    // 含 on event / on close
-    pub joins: Vec<JoinPlan>,              // join(snapshot|asof)
-    pub limits_plan: LimitsPlan,           // 规则资源预算
-    pub score_plan: ScorePlan,             // score(expr) 或 score { ... }
-    pub entity_plan: EntityPlan,           // entity(type, id_expr)
-    pub yield_plan: YieldPlan,             // yield target@vN(...)
+pub(crate) struct RuleTaskConfig {
+    pub machine: CepStateMachine,
+    pub executor: RuleExecutor,
+    pub window_sources: Vec<WindowSource>,
+    pub stream_aliases: HashMap<String, Vec<String>>,  // stream_name → Vec<alias>
+    pub alert_tx: mpsc::Sender<AlertRecord>,
+    pub cancel: CancellationToken,
+    pub timeout_scan_interval: Duration,
 }
 
+pub(crate) struct WindowSource {
+    pub window_name: String,
+    pub window: Arc<RwLock<Window>>,
+    pub notify: Arc<Notify>,
+    pub stream_names: Vec<String>,
+}
+```
+
+**Pull-based 执行循环：**
+
+```
+RuleTask main loop:
+│
+├─ 初始化 cursors: window_name → window.next_seq()
+│  （跳过历史数据，仅处理新 batch）
+│
+├─ loop:
+│    ├─ ① 注册 Notify futures（调用 .enable() 后再读数据，防止丢失通知）
+│    │
+│    ├─ ② pull_and_advance()
+│    │    for source in window_sources:
+│    │      (batches, new_cursor, gap) = window.read_since(cursor)
+│    │      cursor = new_cursor
+│    │      for batch in batches:
+│    │        events = batch_to_events(batch)
+│    │        for event in events:
+│    │          for alias in stream_aliases[source.stream_name]:
+│    │            match machine.advance(alias, event):
+│    │              Accumulate → (继续)
+│    │              Advance    → (继续)
+│    │              Matched(ctx) →
+│    │                alert = executor.execute_match(ctx)
+│    │                alert_tx.send(alert)
+│    │
+│    ├─ ③ select!:
+│    │    ├─ any Notify triggered → continue loop
+│    │    ├─ timeout_interval.tick() →
+│    │    │    expired = machine.scan_expired()
+│    │    │    for close in expired:
+│    │    │      if let Some(alert) = executor.execute_close(close):
+│    │    │        alert_tx.send(alert)
+│    │    └─ cancel triggered →
+│    │         final pull_and_advance()  // 处理剩余数据
+│    │         machine.close_all(Eos)    // flush 所有实例
+│    │         break
+```
+
+> **设计要点**：RuleTask 的 cursor 在创建时设置为 `window.next_seq()`，只处理新到达的数据。如果 cursor 落后于 eviction（`gap_detected = true`），RuleTask 会记录日志但继续处理。
+
+### 4.3 CepStateMachine — CEP 状态机
+
+每条规则编译为一个 `MatchPlan`，由 `CepStateMachine` 在运行时驱动。状态机按 scope-key 维护独立的 `Instance`，支持多步骤 OR 分支和聚合管道。
+
+```rust
+/// CEP 状态机
+pub struct CepStateMachine {
+    rule_name: String,
+    plan: MatchPlan,
+    instances: HashMap<String, Instance>,  // scope-key 序列化值 → 实例
+    time_field: Option<String>,
+    watermark_nanos: i64,
+}
+
+/// 事件
+pub struct Event {
+    pub fields: HashMap<String, Value>,
+}
+
+pub enum Value {
+    Number(f64),
+    Str(String),
+    Bool(bool),
+}
+
+/// 步骤推进结果
+pub enum StepResult {
+    Accumulate,                    // 事件已消费，未跨越步骤边界
+    Advance,                      // 步骤条件满足，推进到下一步
+    Matched(MatchedContext),       // 所有步骤完成，规则命中
+}
+
+/// 命中上下文
+pub struct MatchedContext {
+    pub rule_name: String,
+    pub scope_key: Vec<Value>,
+    pub step_data: Vec<StepData>,
+    pub event_time_nanos: i64,
+}
+
+/// 窗口关闭输出
+pub struct CloseOutput {
+    pub rule_name: String,
+    pub scope_key: Vec<Value>,
+    pub close_reason: CloseReason,  // Timeout | Flush | Eos
+    pub event_ok: bool,             // on event 是否满足
+    pub close_ok: bool,             // on close 是否满足
+    pub event_step_data: Vec<StepData>,
+    pub close_step_data: Vec<StepData>,
+    pub watermark_nanos: i64,
+}
+
+impl CepStateMachine {
+    pub fn advance(&mut self, alias: &str, event: &Event) -> StepResult;
+    pub fn close(&mut self, scope_key: &[Value], reason: CloseReason) -> Option<CloseOutput>;
+    pub fn scan_expired(&mut self) -> Vec<CloseOutput>;      // 按 watermark 扫描过期实例
+    pub fn close_all(&mut self, reason: CloseReason) -> Vec<CloseOutput>;  // shutdown flush
+    pub fn instance_count(&self) -> usize;
+}
+```
+
+**内部实例状态：**
+
+```rust
+struct Instance {
+    scope_key: Vec<Value>,
+    created_at: i64,           // 纳秒时间戳
+    current_step: usize,       // on event 当前步骤索引
+    event_ok: bool,            // on event 所有步骤是否已完成
+    step_states: Vec<StepState>,        // on event 步骤状态
+    completed_steps: Vec<StepData>,     // on event 已完成步骤数据
+    close_step_states: Vec<StepState>,  // on close 步骤状态
+}
+
+struct BranchState {
+    count: usize, sum: f64, min: f64, max: f64,
+    min_val: Option<Value>, max_val: Option<Value>,
+    avg_sum: f64, avg_count: usize,
+    distinct_set: HashSet<String>,  // Distinct transform
+}
+```
+
+**表达式求值器**：`eval_expr` 支持字面量、字段引用、二元运算（And/Or/比较/算术）、取反、InList、函数调用（`contains`/`lower`/`upper`/`len`）。AND/OR 使用三值 SQL NULL 语义。
+
+**聚合度量**：Count、Sum、Avg、Min、Max。**变换**：Distinct（在累积阶段去重）。
+
+### 4.4 RuleExecutor — 规则执行器
+
+RuleExecutor 从 CEP 状态机的 match/close 输出中求值 score/entity 表达式，生成 AlertRecord。
+
+```rust
 pub struct RuleExecutor {
     plan: RulePlan,
-    ctx_template: SessionConfig,           // DataFusion 配置模板（用于 JoinExecutor）
 }
 
 impl RuleExecutor {
-    /// 状态机驱动：事件到达时推进 on event/on close
-    pub fn on_event(&self, event: &DataRecord) -> StepResult {
-        self.plan.state_machine.advance(event)
-    }
-
-    /// 全部步骤完成后，按 JoinPlan 执行关联并产出告警
-    pub async fn execute_join_plan(
-        &self,
-        registry: &WindowRegistry,
-        matched: &MatchedContext,
-    ) -> Result<AlertRecord> {
-        let ctx = SessionContext::new_with_config(self.ctx_template.clone());
-        let joined = JoinExecutor::run(&ctx, registry, matched, &self.plan.joins).await?;
-        let scored = ScoreEvaluator::eval(&self.plan.score_plan, &joined)?;
-        AlertBuilder::build(&self.plan, joined, scored)
-    }
+    /// 事件命中后求值，生成告警
+    pub fn execute_match(&self, matched: &MatchedContext) -> CoreResult<AlertRecord>;
+    /// 窗口关闭后求值，仅当 event_ok && close_ok 时生成告警
+    pub fn execute_close(&self, close: &CloseOutput) -> CoreResult<Option<AlertRecord>>;
 }
 ```
+
+**编译后的规则计划（RulePlan）：**
+
+```rust
+pub struct RulePlan {
+    pub name: String,
+    pub binds: Vec<BindPlan>,          // 事件绑定
+    pub match_plan: MatchPlan,         // CEP 状态机计划
+    pub joins: Vec<JoinPlan>,          // L1 为空；L2 支持 snapshot/asof
+    pub entity_plan: EntityPlan,       // entity(type, id_expr)
+    pub yield_plan: YieldPlan,         // yield target(fields...)
+    pub score_plan: ScorePlan,         // score(expr)
+    pub conv_plan: Option<ConvPlan>,   // L1 为 None
+}
+```
+
+**Alert ID 格式**：`”rule|key1\x1fkey2|fired_at#seq”`，使用 `%` 编码分隔符，`seq` 为进程级 `AtomicU64`。
 
 **关键设计决策：**
 
 - WFL 规则由 `wf-lang` 编译器统一编译为 `RulePlan`（CEP 状态机），RuleExecutor 以事件驱动方式执行
 - Rule 引用 Window 名称（定义在 .wfs 中），而非 Stream 名称——同一个 Stream 可被不同 Window 以不同方式订阅
-- Join 执行使用 `JoinPlan`（`snapshot/asof`）而不是“规则内 SQL 字符串”
-- 每次 Join 执行创建新的 `SessionContext`，避免状态污染
-- 窗口快照是只读的（`snapshot()` 返回 `Vec<RecordBatch>` 的 clone/Arc），不阻塞写入
-- 多条规则可并行执行（各自独立的 SessionContext）
-- **空窗口安全**：Window 无数据时注册 `RecordBatch::new_empty(schema)` 为临时表，Join 正常执行返回零行，不会因 "table not found" 报错
-
-### 4.4 Scheduler — 规则调度器
-
-```rust
-pub struct Scheduler {
-    rules: Vec<ManagedRule>,
-    exec_semaphore: Arc<Semaphore>,       // 全局并发上限
-}
-
-struct ManagedRule {
-    executor: RuleExecutor,
-    alert_sink: Arc<dyn AlertSink>,
-    exec_timeout: Duration,               // 单次 join/score/yield 执行超时
-}
-```
-
-**调度循环（事件驱动）：**
-
-```
-loop {
-    tokio::select! {
-        // 事件到达：从 Window 接收新事件
-        event = event_rx.recv() => {
-            for rule in &rules {
-                // 只分发到引用该 window 的规则
-                if !rule.executor.accepts(&event.window) { continue }
-
-                // 全局并发上限（背压）
-                let permit = exec_semaphore.clone().try_acquire_owned();
-                let Ok(permit) = permit else {
-                    tracing::warn!("executor concurrency limit reached");
-                    continue;
-                };
-
-                let result = rule.executor.on_event(&event);
-                match result {
-                    StepResult::Accumulate => {} // 继续累积，等待下一个事件
-                    StepResult::Advance => {}    // 步骤条件满足，推进到下一步
-                    StepResult::Matched(ctx) => {
-                        // 全部步骤完成 -> join(snapshot/asof) -> score/entity -> yield -> alert
-                        let _permit = permit;
-                        match timeout(rule.exec_timeout, rule.executor.execute_join_plan(&registry, &ctx)).await {
-                            Ok(Ok(alert)) => rule.alert_sink.emit(&alert).await,
-                            Ok(Err(e)) => tracing::error!("join error: {e}"),
-                            Err(_) => tracing::error!("join timeout"),
-                        }
-                    }
-                }
-            }
-        }
-        // 超时检查：定期扫描过期的状态机实例并执行 on close 求值
-        _ = timeout_interval.tick() => {
-            for rule in &rules {
-                let expired = rule.executor.check_timeouts(now);
-                for ctx in expired {
-                    // on close：窗口关闭（timeout/flush/eos）时求值
-                    // maxspan 过期：重置状态机实例
-                    rule.executor.handle_timeout(ctx);
-                }
-            }
-        }
-        // 控制命令
-        cmd = cmd_rx.recv() => {
-            match cmd {
-                Reload => reload_rules(),
-                Stop   => break,
-            }
-        }
-    }
-}
-```
-
-**调度保护机制：**
-
-| 机制 | 说明 |
-|------|------|
-| 事件驱动 | 事件到达时分发到相关规则，推进状态机；非定时轮询 |
-| 超时扫描 | 定期检查 `on close` 条件和 maxspan 超期的状态机实例 |
-| 全局并发上限 | `Semaphore(executor_parallelism)`，防止大量规则同时执行耗尽 CPU |
-| 执行超时 | `tokio::time::timeout` 包裹 join/score/yield 主路径，超时自动取消 |
+- L1 不含 Join 执行（JoinPlan 为空），L2 将引入 DataFusion 执行 `join snapshot/asof`
+- Score 求值直接从 `ScorePlan.expr` 计算，结果 clamp 到 [0, 100]
+- Entity ID 从 MatchedContext 中的 scope-key 或 step-data 提取
+- `on close` 仅在 `event_ok && close_ok` 时生成告警（部分满足的实例不输出）
 
 ### 4.5 AlertSink — 风险告警输出
 
 ```rust
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AlertRecord {
-    pub alert_id: String,                      // 幂等键：hash(rule_name + scope_key + window_range)
+    pub alert_id: String,                      // "rule|key1\x1fkey2|fired_at#seq"
     pub rule_name: String,
-    pub score: f64,                            // 统一风险分数 [0,100]
-    pub entity_type: String,                   // 由 entity(type, id_expr) 注入
+    pub score: f64,                            // [0, 100]
+    pub entity_type: String,                   // 由 entity(type, id_expr) 求值
     pub entity_id: String,
-    pub close_reason: Option<String>,          // timeout | flush | eos | null
-    pub score_contrib: Option<JsonValue>,      // score { ... } 时输出
-    pub fired_at: DateTime<Utc>,
-    pub matched_rows: Vec<RecordBatch>,        // 命中的事件数据
+    pub close_reason: Option<String>,          // "timeout" | "flush" | "eos" | None
+    pub fired_at: String,                      // ISO 8601 UTC（无 chrono 依赖，内置实现）
+    #[serde(skip)]
+    pub matched_rows: Vec<RecordBatch>,        // L1 为空
     pub summary: String,                       // 规则执行摘要
 }
 
-#[async_trait]
+/// 同步告警输出 trait
 pub trait AlertSink: Send + Sync {
-    async fn emit(&self, alert: &AlertRecord) -> Result<()>;
+    fn send(&self, record: &AlertRecord) -> CoreResult<()>;
 }
 ```
 
-**风险告警去重（幂等保证）：**
+L1 内置实现：
+- `FileAlertSink` — JSON Lines 写入文件（`Mutex<BufWriter<File>>`）
+- `FanOutSink` — 广播到多个 sink；遇到错误继续，返回第一个错误
 
-无论 `best_effort` 还是 `at_least_once`，都可能出现重复风险告警（上游重复发送、重放、多实例并发输出）。通过 `alert_id` 实现幂等：
-
-```
-alert_id = sha256(rule_name + scope_key_value + window_start + window_end)
-```
-
-| 组件 | 职责 |
-|------|------|
-| `alert_id` 生成 | RuleExecutor 在产出风险告警时计算，相同规则 + 相同关联 key + 相同窗口区间 -> 相同 ID |
-| 本地去重缓存 | AlertSink 维护最近 N 分钟（可配置，默认 `2 × max(rule.maxspan)`）的 `alert_id` 集合，重复 ID 直接跳过 |
-| 下游幂等 | `alert_id` 随风险告警一起输出，下游系统可据此做最终去重（防止 WarpFusion 多实例场景的分布式重复） |
-
-内置实现：
-- `FileAlertSink` — JSON Lines 写入文件（含 `alert_id` 字段）
-- `HttpAlertSink` — POST 到 HTTP 端点（`alert_id` 作为幂等键 header）
-- `SyslogAlertSink` — 发送到 Syslog（`alert_id` 写入 structured data）
+AlertSink 任务（`run_alert_sink`）通过 mpsc channel（容量 64）接收 AlertRecord。关闭是 channel-close-driven：当所有 RuleTask drop 了 `alert_tx` sender 后，接收端返回 `None`，任务自动退出。
 
 
 ## 5. 并发模型
 
-### 5.1 复用 wp-motor 模式
+### 5.1 设计原则
 
-| 模式 | wp-motor 实现 | WarpFusion 复用方式 |
-|------|--------------|-------------------|
-| TaskGroup | `runtime/actor/group.rs` | 直接复刻，管理 Receiver/Scheduler/Evictor |
-| 有界 channel | `tokio::mpsc` + 容量常量 | 相同，Receiver→Router、Scheduler→Executor |
-| broadcast 控制 | `async_broadcast` | 相同，用于 Stop/Reload 全局广播 |
-| 优雅关闭 | Drain + Timeout | 相同，先停 Receiver，等规则执行完毕 |
-| 对象池 | `SinkRecUnitPool` | 适配为 RecordBatch 缓冲池 |
+| 原则 | 说明 |
+|------|------|
+| Pull-based | RuleTask 主动拉取 Window 数据（通过 cursor），而非被动接收推送 |
+| Notify 唤醒 | Router append 后通过 `Notify::notify_waiters()` 唤醒关联 RuleTask |
+| Per-rule 独立 | 每条规则一个独立的 tokio task，互不阻塞 |
+| LIFO 生命周期 | 启动顺序：消费者先于生产者；关闭顺序：生产者先于消费者 |
+| Channel-close-driven | AlertSink 任务通过 channel 关闭信号自然退出 |
+| CancellationToken | 两级取消：`cancel`（全局）+ `rule_cancel`（规则级，延迟触发） |
 
-### 5.2 WarpFusion 任务拓扑
+### 5.2 任务拓扑
 
 ```
-TaskGroup: receiver
-  └─ Receiver task (×1)
-       ↓ mpsc channel (容量 256)
-       ↓ (tag, RecordBatch)
-TaskGroup: router
-  └─ Router task (×1)
-       ↓ 根据 WindowRegistry 订阅表分发到各 Window
-       ↓ (事件到达时通知 Scheduler)
-
-TaskGroup: scheduler
-  └─ Scheduler task (×1)
-       ↓ tokio::spawn 执行规则
-       ↓ mpsc channel (容量 64)
-
-TaskGroup: executor
-  └─ RuleExecutor tasks (×N, 可配并行度)
-       ↓ 执行结果
-       ↓ mpsc channel (容量 64)
-
 TaskGroup: alert
-  └─ AlertSink task (×1)
-       ↓ 写文件 / HTTP / Syslog
+  └─ run_alert_sink (×1)
+       ↑ mpsc channel (容量 64)
+       │ AlertRecord
 
-TaskGroup: maintenance
-  └─ Evictor task (×1，定时清理过期窗口数据)
-  └─ Monitor task (×1，统计指标输出)
+TaskGroup: evictor
+  └─ run_evictor (×1，定时清理过期窗口数据)
+
+TaskGroup: rules
+  └─ run_rule_task (×N, 每条规则一个)
+       ← Notify 唤醒
+       ← cursor-based read_since()
+       → alert_tx.send(AlertRecord)
+
+TaskGroup: receiver
+  └─ Receiver::run (×1)
+       ↓ per-connection task (tokio::spawn)
+       ↓ decode Arrow IPC → Router.route()
+       ↓ → Window.append_with_watermark()
+       ↓ → Notify.notify_waiters()
 ```
 
-**启动顺序（复用 wp-motor 原则：先消费者后生产者）：**
+### 5.3 启动与关闭顺序
 
-1. AlertSink 启动（持有接收端）
-2. Executor 启动（持有接收端）
-3. Scheduler 启动
-4. Evictor / Monitor 启动
-5. Router 启动（持有接收端）
-6. Receiver 最后启动（开始接收数据）
+**启动顺序（先消费者后生产者）：**
+
+1. `alert` — AlertSink 启动，持有 `alert_rx` 接收端
+2. `evictor` — Evictor 启动，定时清理（初始延迟 = interval，避免清理新数据）
+3. `rules` — RuleTask ×N 启动，各自初始化 cursor 为 `window.next_seq()`
+4. `receiver` — Receiver 最后启动，开始接收网络数据
+
+**关闭顺序（两阶段，LIFO join）：**
+
+```
+Phase 1: 停止数据输入
+  cancel.cancel()
+  → Receiver 停止 accept，现有连接完成当前帧后退出
+  → join receiver task group
+
+Phase 2: 清空规则管道
+  rule_cancel.cancel()
+  → 每个 RuleTask:
+    ① 最后一次 pull_and_advance()（处理 Window 中剩余数据）
+    ② machine.close_all(Eos)（flush 所有状态机实例）
+    ③ drop alert_tx（关闭 channel sender）
+  → join rules task group
+  → alert_rx 收到 None，AlertSink 自动退出
+  → join alert task group
+  → join evictor task group
+```
+
+### 5.4 Reactor — 生命周期管理
+
+```rust
+pub struct Reactor {
+    cancel: CancellationToken,
+    rule_cancel: CancellationToken,  // receiver 停止后延迟触发
+    groups: Vec<TaskGroup>,          // 按启动顺序存储
+    listen_addr: SocketAddr,
+}
+
+impl Reactor {
+    pub async fn start(config: FusionConfig, base_dir: &Path) -> RuntimeResult<Self>;
+    pub fn shutdown(&self);           // 触发 cancel
+    pub async fn wait(mut self) -> RuntimeResult<()>;  // LIFO join all groups
+}
+
+pub async fn wait_for_signal(cancel: CancellationToken);  // SIGINT + SIGTERM
+```
+
+**Bootstrap 阶段（`Reactor::start` 内部）：**
+
+1. 加载 `.wfs` → `Vec<WindowSchema>`
+2. 预处理 + 解析 + 编译 `.wfl` → `Vec<RulePlan>`
+3. 校验 `over` ≤ `over_cap`
+4. `schema_bridge`: `WindowSchema × WindowConfig` → `Vec<WindowDef>`
+5. `WindowRegistry::build(defs)`
+6. `Router::new(registry)`
+7. 构建 `RunRule`（预计算 stream_name → alias 路由）
+8. 构建 AlertSink
+9. 按顺序启动 4 个 TaskGroup
 
 
 ## 6. 配置设计
 
 ### 6.1 主配置 wfusion.toml
 
-三文件架构下，TOML 仅负责**运行时物理参数**。数据 schema 在 `.wfs` 文件中定义，检测逻辑在 `.wfl` 文件中定义。
+三文件架构下，TOML 负责**运行时物理参数**。数据 schema 在 `.wfs` 文件中定义，检测逻辑在 `.wfl` 文件中定义。
 
 ```toml
 [server]
-listen = "tcp://127.0.0.1:9800"                   # 监听地址（多个 wp-motor + 分布式节点共用同一端口）
+listen = "tcp://127.0.0.1:9800"                   # 监听地址
 
 [runtime]
-executor_parallelism = 2                       # 规则执行并行度（Semaphore 上限）
+executor_parallelism = 2                       # 规则执行并行度
 rule_exec_timeout = "30s"                      # 单条规则执行超时
-
-# 文件引用
-window_schemas = ["security.wfs"]               # Window Schema 文件列表
-rule_packs     = ["pack/security.yaml"]         # RulePack 入口（推荐）
-wfl_rules      = ["brute_scan.wfl", "traffic.wfl"]  # 兼容模式（conformance=compat）
-
-[language]
-version = "wfl-2.1"
-conformance = "strict"                          # strict | compat
+schemas = "schemas/*.wfs"                      # Window Schema 文件 glob 模式
+rules   = "rules/*.wfl"                        # WFL 规则文件 glob 模式
 
 [window_defaults]
 evict_interval = "30s"                         # 淘汰检查间隔
-max_window_bytes = "256MB"                     # 单窗口内存上限（默认）
+max_window_bytes = "256MB"                     # 单窗口内存上限
 max_total_bytes = "2GB"                        # 全局窗口内存上限
 evict_policy = "time_first"                    # 淘汰策略: time_first | lru
 watermark = "5s"                               # 默认 watermark 延迟
@@ -894,32 +1010,23 @@ mode = "local"                                 # 分布模式: local | replicate
 max_window_bytes = "256MB"
 over_cap = "30m"                               # over 能力上限（.wfs 中 over ≤ over_cap）
 
-[window.fw_events]
+[window.security_alerts]
 mode = "local"
-max_window_bytes = "256MB"
-over_cap = "30m"
-watermark = "10s"                              # 防火墙日志乱序较多，放宽 watermark
-allowed_lateness = "30s"
-late_policy = "drop"
-
-[window.ip_blocklist]
-mode = "replicated"                            # 全局复制（分布式下每节点有全量）
 max_window_bytes = "64MB"
-over_cap = "48h"
-
-[transport]
-reliability = "best_effort"                    # best_effort | at_least_once | exactly_once
-
-[transport.replay]
-wal_dir = "/var/lib/warpfusion/transport-wal"  # reliability != best_effort 时启用
-ack_timeout = "5s"
-max_inflight = 10000
+over_cap = "1h"
 
 [alert]
-sinks = [
-    "file:///var/log/wf-alerts.jsonl",
-    # "http://alert-api:8080/v1/alerts",
-]
+sinks = ["file://alerts/wf-alerts.jsonl"]      # 目前仅支持 file:// 协议
+
+[vars]                                         # WFL $VAR 变量替换
+FAIL_THRESHOLD = "3"
+
+[logging]
+level = "info"                                 # 全局日志级别
+format = "plain"                               # plain | json
+file = "logs/wf-engine.log"                    # 日志文件路径
+[logging.modules]                              # 模块级日志级别覆盖
+"wf_runtime::receiver" = "debug"
 ```
 
 **配置分层原则：**
@@ -927,123 +1034,213 @@ sinks = [
 | 层级 | 文件 | 内容 | 示例 |
 |------|------|------|------|
 | 数据定义 | `.wfs` | stream 来源、time 字段、over 时长、字段 schema | `over = 5m` |
-| 检测逻辑 | `.wfl` | 事件绑定、模式匹配、条件、输出、`limits` | `yield risk_scores@v2 (...)` |
-| 规则入口 | `pack.yaml` | `language/features/rules/runtime` 统一入口 | `conformance: strict` |
-| 物理约束 | `.toml` | mode、max_bytes、over_cap、watermark、reliability | `reliability = "best_effort"` |
+| 检测逻辑 | `.wfl` | 事件绑定、模式匹配、条件、输出 | `yield security_alerts (...)` |
+| 物理约束 | `.toml` | mode、max_bytes、over_cap、watermark | `watermark = "5s"` |
+| 变量替换 | `.toml [vars]` | WFL `$VAR` 替换值（也支持环境变量回退） | `FAIL_THRESHOLD = "3"` |
 
 **over vs over_cap 校验：** 启动时检查每个 window 的 `.wfs` 中 `over` ≤ `.toml` 中 `over_cap`，不满足则报错拒绝启动。
+
+**变量预处理：** `.wfl` 文件中的 `$VAR` 或 `${VAR}` 引用按以下优先级解析：
+1. `.toml` 中 `[vars]` 显式定义
+2. 环境变量（`std::env::var`）
+3. 均未定义则报错
+
+**Glob 解析：** `schemas` 和 `rules` 字段支持 glob 模式（如 `schemas/*.wfs`），相对于 `.toml` 文件所在目录解析。无匹配文件时报错。
 
 ### 6.2 关联规则
 
 关联检测规则使用 WFL 语言编写，存储在 `.wfl` 文件中。完整语法和语义模型见 [WFL v2.1 设计方案](wfl-desion.md)，与主流 DSL 的对比分析见 [WFL DSL 对比](wfl-dsl-comparison.md)。
 
-v2.1 实现中，规则发布默认使用 `conformance=strict`，并强制校验：
-- `meta.lang = "2.1"`
-- `meta.contract_version`
-- `join snapshot/asof`
-- `limits { ... }`
-- `yield target@vN (...)`
-
 WFL 规则中的数据源名称引用 **Window Schema (.wfs) 中定义的 window 名称**，不直接引用 stream tag。这使得同一个 stream 可以以不同方式（不同 mode、不同 over）被多个 window 引用，规则按需选择合适的 window。
 
-**规则文件示例（brute_scan.wfl）：**
+**Window Schema 示例（security.wfs）：**
+
+```wfs
+window auth_events {
+    stream = "syslog"
+    time = event_time
+    over = 5m
+
+    fields {
+        sip: ip
+        username: chars
+        action: chars
+        event_time: time
+    }
+}
+
+window security_alerts {
+    over = 0
+    fields {
+        sip: ip
+        fail_count: digit
+        message: chars
+    }
+}
+```
+
+**规则文件示例（brute_force.wfl）：**
 
 ```wfl
 use "security.wfs"
 
 rule brute_force_then_scan {
-    meta {
-        lang        = "2.1"
-        contract_version = "2"
-        description = "Login failures followed by port scan from same IP"
-        mitre       = "T1110, T1046"
-    }
-
-    features [l1, l2]
-
     events {
         fail : auth_events && action == "failed"
-        scan : fw_events
     }
 
-    match<:5m> {
-        key {
-            src = fail.sip;
-        }
+    match<sip:5m> {
         on event {
-            fail | count >= 3;
-            scan.dport | distinct | count > 10;
+            fail | count >= $FAIL_THRESHOLD;
         }
-    } -> score(80.0)
-
-    join ip_blocklist snapshot on fail.sip == ip_blocklist.ip
+        on close {
+            fail | count >= 1;
+        }
+    } -> score(70.0)
 
     entity(ip, fail.sip)
 
-    yield security_alerts@v2 (
-        sip        = fail.sip,
+    yield security_alerts (
+        sip = fail.sip,
         fail_count = count(fail),
-        port_count = distinct(scan.dport),
-        message    = fmt("{}: brute force then port scan detected", fail.sip)
+        message = fmt("{} brute force detected", fail.sip)
     )
-
-    limits {
-        max_state = "512MB";
-        max_cardinality = 200000;
-        max_emit_rate = "1000/m";
-        on_exceed = "throttle";
-    }
 }
+```
+
+**L1 规则编译管线（wf-lang）：**
+
+```
+.wfl 源码
+  → preprocess_vars_with_env（变量替换，支持环境变量回退）
+  → parse_wfl（winnow 解析器 → WflFile AST）
+  → check_wfl（语义检查，返回 Vec<CheckError>）
+  → compile_wfl（AST → Vec<RulePlan>）
+    ├─ compile_binds → Vec<BindPlan>
+    ├─ compile_match → MatchPlan（keys, WindowSpec::Sliding, event_steps, close_steps）
+    ├─ compile_entity → EntityPlan
+    ├─ compile_score → ScorePlan
+    ├─ compile_yield → YieldPlan
+    └─ joins: vec![], conv_plan: None（L1 未实现）
 ```
 
 
 ## 7. 依赖清单
 
-### 7.1 wf-arrow
+### 7.1 Workspace 共享依赖
 
 ```toml
-[dependencies]
-wp-model-core = "0.8"
-arrow = { version = "54", features = ["ipc"] }
-parquet = { version = "54", optional = true }
-bytes = "1.10"
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+anyhow = "1.0"
+winnow = "0.7"                   # 解析器组合子（替代 nom）
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+orion-error = { version = "0.6", default-features = false, features = ["tracing"] }  # 结构化错误
+derive_more = { version = "2.1", features = ["from"] }
+thiserror = "2.0"
 ```
 
-### 7.2 wf-core
+### 7.2 wf-lang
 
 ```toml
 [dependencies]
-wf-arrow = { path = "../../wf-arrow" }
-datafusion = "45"
-arrow = { version = "54" }
-tokio = { version = "1.48", features = ["sync", "time"] }
-tracing = "0.1"
-anyhow = "1.0"
-chrono = "0.4"
+winnow.workspace = true          # .wfl + .wfs 解析
+anyhow.workspace = true
 ```
 
 ### 7.3 wf-config
 
 ```toml
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.9"
-anyhow = "1.0"
+wf-lang = { path = "../wf-lang" }  # 用于 parse_wfs 和 preprocess_vars
+serde.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+glob = "0.3"                     # 文件 glob 匹配
 ```
 
-### 7.4 warp-fusion（主二进制）
+### 7.4 wf-core
 
 ```toml
 [dependencies]
-wf-core = { path = "crates/wf-core" }
-wf-arrow = { path = "../wf-arrow" }
-wf-config = { path = "crates/wf-config" }
-tokio = { version = "1.48", features = ["full"] }
-clap = { version = "4.5", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
-anyhow = "1.0"
-async-broadcast = "0.7"
+wf-config = { path = "../wf-config" }
+wf-lang = { path = "../wf-lang" }
+arrow = { version = "54", default-features = false, features = ["ipc"] }
+anyhow.workspace = true
+serde.workspace = true
+serde_json = "1.0"
+orion-error.workspace = true
+derive_more.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["sync"] }  # Notify, RwLock
+```
+
+### 7.5 wf-runtime
+
+```toml
+[dependencies]
+wf-core = { path = "../wf-core" }
+wf-config = { path = "../wf-config" }
+wf-lang = { path = "../wf-lang" }
+wp-arrow = "0.1"                 # Arrow IPC 编解码
+arrow = { version = "54", default-features = false, features = ["ipc"] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt-multi-thread", "signal", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+anyhow.workspace = true
+serde_json = "1.0"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+orion-error.workspace = true
+derive_more.workspace = true
+thiserror.workspace = true
+```
+
+### 7.6 wf-engine（二进制 `warp-fusion`）
+
+```toml
+[dependencies]
+wf-config = { path = "../wf-config" }
+wf-runtime = { path = "../wf-runtime" }
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing.workspace = true
+```
+
+### 7.7 wf-proj（二进制 `wf-proj`）
+
+```toml
+[dependencies]
+wf-config = { path = "../wf-config" }
+wf-lang = { path = "../wf-lang" }
+tree-sitter = "0.22"             # WFL 代码格式化
+tree-sitter-wfl = { git = "https://github.com/wp-labs/tree-sitter-wfl.git", branch = "main" }
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+```
+
+### 7.8 wf-datagen（二进制 `wf-datagen`）
+
+```toml
+[dependencies]
+wf-core = { path = "../wf-core" }
+wf-lang = { path = "../wf-lang" }
+winnow.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json = "1.0"
+clap = { version = "4", features = ["derive"] }
+rand = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+arrow = { version = "54", default-features = false, features = ["ipc"] }
 ```
 
 
@@ -1124,39 +1321,47 @@ retry_max_interval = "30s"                        # 最大重试间隔
 
 ## 9. 开发路线
 
-| 阶段 | 内容 | 交付物 | 依赖 |
-|------|------|--------|------|
-| **P0** | wf-arrow: schema 映射 + 行列转换 + IPC 编解码 | wf-arrow crate 可用 | 无 |
-| **P1** | wp-motor: 新增 Arrow IPC Sink | WarpParse 可输出 Arrow IPC | P0 |
-| **P1** | wf-config: RulePack + conformance + reliability 配置解析 | wfusion.toml/pack.yaml 可加载 | 无 |
-| **P2** | wf-core/window: Window + WindowRegistry + Router | 能接收多流、按订阅声明路由并缓存 | P0, P1-config |
-| **P3** | wf-core/rule: Loader + Executor(Core IR) | 支持 `join snapshot/asof` + `yield@vN` | P2 |
-| **P3** | runtime: Receiver + Scheduler + Lifecycle | 主进程可运行 | P2, P3-rule |
-| **P4** | wf-core/alert: AlertSink 实现 + score_contrib 透传 | 完整单机闭环 | P3 |
-| **P5** | 可证明正确性门禁：contract + shuffle + datagen verify | 发布前一致性可验证 | P4 |
-| **P6** | 可靠性分级：best_effort/at_least_once/exactly_once | 按场景切换可靠性档位 | P4 |
-| **P7** | 分布式 V3: 两阶段聚合汇总 | 全局 GROUP BY | P6 |
+### 9.1 里程碑总览
 
-**P0 和 P1 可并行**——wf-arrow 完成后，wp-motor 侧的 Sink 和 warp-fusion 侧的 Receiver 可同时开发。
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| **P0** | wp-arrow: schema 映射 + 行列转换 + IPC 编解码 | 已完成 |
+| **P1** | wp-motor: Arrow IPC Sink | 已完成 |
+| **P1** | wf-config: 配置解析 | 已完成 |
+| **P2** | wf-core/window: Window + WindowRegistry + Router | 已完成 |
+| **P3** | wf-core/rule: CEP 状态机 + RuleExecutor | 已完成 |
+| **P3** | wf-runtime: Receiver + RuleTask + Lifecycle | 已完成 |
+| **P4** | wf-core/alert: AlertSink + FileAlertSink | 已完成 |
+| **P5** | wf-lang: 编译器 + checker + lint | 已完成 |
+| **P6** | wf-proj: explain / lint / fmt 工具 | 已完成 |
+| **P7** | wf-datagen: 数据生成 + oracle + verify | 已完成 |
+| **P8** | L2 增强: join / baseline / 条件表达式 / 函数 | 计划中 |
+| **P9** | 正确性门禁: contract + shuffle + scenario verify | 计划中 |
+| **P10** | 可靠性分级: at_least_once / exactly_once | 计划中 |
+| **P11** | 分布式 V2+: 多节点部署 | 计划中 |
 
+### 9.2 执行计划
 
-## 9.1 执行计划
+详细的里程碑执行计划已独立为专属文档，详见 → [wf-execution-plan.md](wf-execution-plan.md)
 
-详细的 30 里程碑执行计划已独立为专属文档，详见 → [wf-execution-plan.md](wf-execution-plan.md)
+**已完成阶段（截至 M24）：**
 
-计划将引擎基建（P0–P7）与 WFL 语言实现（Phase A–D）统一拆分为 **M01–M30**，分属十个阶段：
+| 阶段 | 里程碑 | 阶段目标 | 状态 |
+|------|--------|---------|------|
+| **I 数据基建** | M01–M05 | Arrow IPC 传输可用 | 已完成 |
+| **II 配置与窗口** | M06–M10 | 配置加载、Window 接收路由缓存 | 已完成 |
+| **III WFL 编译器** | M11–M13 | .wfs + .wfl → RulePlan | 已完成 |
+| **IV 执行引擎** | M14–M16 | CEP 状态机 + RuleExecutor | 已完成 |
+| **V 运行时闭环** | M17–M20 | **单机 MVP** | 已完成 |
+| **VI 生产化** | M21–M24 | wf-proj + wf-datagen + lint + fmt | 已完成 |
+
+**计划阶段：**
 
 | 阶段 | 里程碑 | 阶段目标 |
 |------|--------|---------|
-| **I 数据基建** | M01–M05 | wp-motor 能通过 Arrow IPC 推送数据，WarpFusion 可接收路由 |
-| **II 配置与窗口** | M06–M10 | 配置可加载、Window 能接收路由并缓存数据 |
-| **III WFL 编译器** | M11–M13 | .wfs + .wfl 编译为 RulePlan |
-| **IV 执行引擎** | M14–M16 | CEP 状态机 + DataFusion join 可执行 |
-| **V 运行时闭环** | M17–M20 | **单机 MVP：数据接收 -> 规则执行 -> 风险告警输出** |
-| **VI 生产化** | M21–M24 | 热加载、多通道风险告警、监控、工具链、CostPlan |
-| **VII L2 增强** | M25–M26 | join / baseline / 条件表达式 / 函数 |
+| **VII L2 增强** | M25–M26 | join snapshot/asof（DataFusion）、条件表达式增强 |
 | **VIII 正确性门禁** | M27–M28 | contract + shuffle + scenario verify |
-| **IX 可靠性分级** | M29 | best_effort/at_least_once/exactly_once |
+| **IX 可靠性分级** | M29 | at_least_once / exactly_once 传输 |
 | **X 分布式** | M30 | 多节点分布式部署 |
 
 
@@ -1164,12 +1369,12 @@ retry_max_interval = "30s"                        # 最大重试间隔
 
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
-| DataFusion 每次建 SessionContext 的开销 | 规则频繁执行时延迟增加 | 复用 SessionContext + 仅替换表数据；benchmark 验证 |
-| 窗口数据量超内存 | OOM | max_window_bytes + max_total_bytes 硬限 + evict_policy 自动淘汰 + 监控告警 |
-| Arrow IPC 传输断连 | 断连期间数据丢失 | TCP 可靠传输 + 指数退避重连；`connection_drops` 监控告警（见 2.4 节） |
-| 上游重复发送/多实例并发导致重复风险告警 | 风险告警风暴 | alert_id 幂等去重 + AlertSink 本地去重缓存 + 下游幂等键（见 4.5 节） |
-| DataFusion 版本升级不兼容 | 编译失败 | workspace 锁定版本；跟进 DataFusion 发布周期 |
-| 规则表达式/Join 模式写错导致高开销 | CPU 飙升 | 执行超时 + `wf lint --strict` + CostPlan 风险阻断 |
+| 窗口数据量超内存 | OOM | max_window_bytes + max_total_bytes 硬限 + Evictor 两阶段淘汰（时间 + 内存） |
+| Arrow IPC 传输断连 | 断连期间数据丢失 | TCP 可靠传输 + 指数退避重连；L1 为 best-effort |
+| 规则状态机实例膨胀 | 高基数 scope-key 导致内存增长 | W003 lint 警告（≥4 key 字段）；L2 规划 limits.max_cardinality |
+| cursor 落后于 eviction | RuleTask 丢失历史数据 | read_since 返回 gap_detected=true，记录日志继续处理 |
+| CEP 状态机未做 scope-key 限制 | 恶意/异常数据产生大量实例 | L2 规划 limits 资源预算执行 |
+| DataFusion 引入后的性能开销 | L2 join 执行时延迟增加 | L2 阶段 benchmark 验证；复用 SessionContext 策略 |
 | replicated 窗口数据量过大 | 所有节点内存膨胀 | replicated 仅用于小表（字典/情报），配置层限制最大行数 |
 | 分布式下 key 热点 | 单节点负载倾斜 | 监控各节点 Window 大小；极端情况拆分子 key |
 
@@ -1225,7 +1430,7 @@ Node 1 (sip hash N/2..N):
   ip_blocklist: 全量                               ← replicated
 ```
 
-**每个节点独立执行 SQL，零跨节点通信**。三个表在本地都有 Rule 所需的数据：
+**每个节点独立执行关联，零跨节点通信**。三个表在本地都有 Rule 所需的数据：
 - 两个 `partitioned(sip)` 窗口按同 key 分区 → 同 sip 在同节点
 - `replicated` 窗口每节点有全量 → JOIN 小表本地完成
 
@@ -1255,8 +1460,8 @@ wp-motor 和其他 Fusion 节点均通过 TCP 连入同一监听端口。Receive
 
 | 阶段 | 架构 | 支持能力 | 复杂度 |
 |------|------|---------|--------|
-| **V1** | 单机 | 全部 SQL，所有 Window 实质为 local | 低 |
-| **V2** | 按 key 分区，多实例 | 等值 JOIN + 本地聚合，每实例是独立的单机版 | 中 |
+| **V1** | 单机 | CEP 状态机 + score/entity 求值，所有 Window 为 local | 低（**L1 已实现**） |
+| **V2** | 按 key 分区，多实例 | 等值 JOIN + 本地聚合（需 L2 join 实现） | 中 |
 | **V3** | V2 + 聚合汇总节点 | V2 + 全局 GROUP BY（两阶段聚合） | 中+ |
 | **V4** | 引入 exchange 层 | 非等值 JOIN / 多 key JOIN（需 shuffle） | 高 |
 | **V5** | V4 + checkpoint | V4 + 节点故障恢复 | 很高 |

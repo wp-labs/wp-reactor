@@ -24,7 +24,7 @@ pub struct UseDecl {
 // Rule
 // ---------------------------------------------------------------------------
 
-/// `rule name { meta events match->score entity yield }`
+/// `rule name { meta events match->score [join...] entity yield [limits] }`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct RuleDecl {
@@ -33,8 +33,10 @@ pub struct RuleDecl {
     pub events: EventsBlock,
     pub match_clause: MatchClause,
     pub score: ScoreExpr,
+    pub joins: Vec<JoinClause>,
     pub entity: EntityClause,
     pub yield_clause: YieldClause,
+    pub limits: Option<LimitsBlock>,
 }
 
 /// `meta { key = "value" ... }`
@@ -75,14 +77,23 @@ pub struct EventDecl {
 // Match clause
 // ---------------------------------------------------------------------------
 
-/// `match<keys:dur> { on event { ... } [on close { ... }] }`
+/// `match<keys:dur> { [key {...}] on event { ... } [on close { ... }] }`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct MatchClause {
     pub keys: Vec<FieldRef>,
+    pub key_mapping: Option<Vec<KeyMapItem>>,
     pub duration: Duration,
     pub on_event: Vec<MatchStep>,
     pub on_close: Option<Vec<MatchStep>>,
+}
+
+/// Explicit key mapping: `logical = alias.field`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct KeyMapItem {
+    pub logical_name: String,
+    pub source_field: FieldRef,
 }
 
 /// One semicolon-terminated match step, potentially with `||` OR branches.
@@ -270,6 +281,54 @@ pub enum Expr {
         list: Vec<Expr>,
         negated: bool,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Join clause
+// ---------------------------------------------------------------------------
+
+/// `join window snapshot/asof on cond`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct JoinClause {
+    pub target_window: String,
+    pub mode: JoinMode,
+    pub conditions: Vec<JoinCondition>,
+}
+
+/// Join time-point semantics.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum JoinMode {
+    Snapshot,
+    Asof { within: Option<Duration> },
+}
+
+/// `left == right` in a join on-clause.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct JoinCondition {
+    pub left: FieldRef,
+    pub right: FieldRef,
+}
+
+// ---------------------------------------------------------------------------
+// Limits block
+// ---------------------------------------------------------------------------
+
+/// `limits { max_state = "256MB" max_cardinality = 10000 ... }`
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct LimitsBlock {
+    pub items: Vec<LimitItem>,
+}
+
+/// A single `key = value` entry in a limits block.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct LimitItem {
+    pub key: String,
+    pub value: String,
 }
 
 // ---------------------------------------------------------------------------

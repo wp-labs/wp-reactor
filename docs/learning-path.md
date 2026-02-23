@@ -119,7 +119,7 @@ cargo test -p wf-core -- --nocapture   # 90 个测试，重点关注 cep_core �
 | 4-3 | `crates/wf-runtime/src/alert_task.rs` | 告警消费者任务，channel close 即退出 |
 | 4-4 | `crates/wf-runtime/src/evictor_task.rs` | 定时驱逐任务 |
 | 4-5 | `crates/wf-runtime/src/schema_bridge.rs` | WindowSchema × WindowConfig → WindowDef 桥接 |
-| 4-6 | `crates/wf-runtime/src/lifecycle.rs` | **FusionEngine**：启动 12 步编排、TaskGroup LIFO 关闭顺序 |
+| 4-6 | `crates/wf-runtime/src/lifecycle.rs` | **Reactor**：启动编排、TaskGroup LIFO 关闭顺序 |
 
 ### 重点理解
 

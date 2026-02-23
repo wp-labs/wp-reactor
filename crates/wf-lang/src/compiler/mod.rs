@@ -37,6 +37,7 @@ fn compile_rule(rule: &RuleDecl) -> anyhow::Result<RulePlan> {
         yield_plan: compile_yield(rule),
         score_plan: compile_score(rule),
         conv_plan: None,
+        limits_plan: None,
     })
 }
 
@@ -64,6 +65,7 @@ fn compile_match(rule: &RuleDecl) -> MatchPlan {
     let mc = &rule.match_clause;
     MatchPlan {
         keys: mc.keys.clone(),
+        key_map: None,
         window_spec: WindowSpec::Sliding(mc.duration),
         event_steps: mc.on_event.iter().map(compile_step).collect(),
         close_steps: mc

@@ -179,7 +179,7 @@ pub async fn start(config: FusionConfig, base_dir: &Path) -> RuntimeResult<Self>
 wf-engine 不引入 orion-error 依赖，通过 `map_err` 转回 anyhow：
 
 ```rust
-let engine = FusionEngine::start(fusion_config, base_dir)
+let engine = Reactor::start(fusion_config, base_dir)
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 

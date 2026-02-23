@@ -127,8 +127,10 @@ fn rule_decl(input: &mut &str) -> ModalResult<RuleDecl> {
         events,
         match_clause,
         score,
+        joins: vec![],
         entity,
         yield_clause,
+        limits: None,
     })
 }
 

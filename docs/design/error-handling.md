@@ -412,7 +412,7 @@ Err(e) => {
 #[tokio::main]
 async fn main() -> Result<()> {
     // ...
-    let engine = FusionEngine::start(fusion_config, base_dir).await
+    let engine = Reactor::start(fusion_config, base_dir).await
         .map_err(|e| {
             // StructError 的 Display 自动输出 [error_code] reason + position + detail + context
             anyhow::anyhow!("{e}")
@@ -611,12 +611,12 @@ wf-engine 通过 wf-runtime 的 re-export 使用 `StructError<RuntimeReason>`。
 - `WindowRegistry::build()` → `CoreResult<Self>`
 - `RuleExecutor::execute_match/close()` → `CoreResult<T>`
 - 内部实现用 `.owe()` / `.owe_xxx()` 包装外部错误
-- **scheduler/receiver 内部的 log + continue 不改**，但日志输出可利用 StructError 的结构化信息
+- **rule_task/receiver 内部的 log + continue 不改**，但日志输出可利用 StructError 的结构化信息
 
 ### 阶段 3: 改造 wf-runtime lifecycle
 
-- `FusionEngine::start()` → `RuntimeResult<Self>`
-- `FusionEngine::wait()` → `RuntimeResult<()>`
+- `Reactor::start()` → `RuntimeResult<Self>`
+- `Reactor::wait()` → `RuntimeResult<()>`
 - 对 wf-lang/wf-config 的 anyhow 错误用 `.owe_xxx()` / `.owe()` 转换
 - 对 wf-core 的 StructError 用 `.err_conv()` 转换
 - 添加 `OperationContext` RAII 日志（`op_context!` + `with_auto_log` + `record` + `mark_suc`）

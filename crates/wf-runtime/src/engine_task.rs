@@ -427,6 +427,7 @@ mod tests {
 
         let match_plan = MatchPlan {
             keys: vec![FieldRef::Simple("sip".into())],
+            key_map: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
             event_steps: vec![StepPlan {
                 branches: vec![BranchPlan {

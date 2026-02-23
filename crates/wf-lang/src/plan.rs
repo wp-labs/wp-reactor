@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::ast::{CmpOp, Expr, FieldRef, FieldSelector, Measure, Transform};
+use crate::ast::{CmpOp, Expr, FieldRef, FieldSelector, JoinMode, Measure, Transform};
 
 // ---------------------------------------------------------------------------
 // ExprPlan — L1 alias for ast::Expr
@@ -28,6 +28,7 @@ pub struct RulePlan {
     pub yield_plan: YieldPlan,
     pub score_plan: ScorePlan,
     pub conv_plan: Option<ConvPlan>,
+    pub limits_plan: Option<LimitsPlan>,
 }
 
 // ---------------------------------------------------------------------------
@@ -46,13 +47,22 @@ pub struct BindPlan {
 // MatchPlan — temporal matching
 // ---------------------------------------------------------------------------
 
-/// The match plan: keys, window spec, event steps, and close steps.
+/// The match plan: keys, window spec, event steps, close steps, and key mapping.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchPlan {
     pub keys: Vec<FieldRef>,
+    pub key_map: Option<Vec<KeyMapPlan>>,
     pub window_spec: WindowSpec,
     pub event_steps: Vec<StepPlan>,
     pub close_steps: Vec<StepPlan>,
+}
+
+/// Explicit key mapping entry: logical name → source alias + field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyMapPlan {
+    pub logical_name: String,
+    pub source_alias: String,
+    pub source_field: String,
 }
 
 /// Window specification for the match clause.
@@ -88,14 +98,50 @@ pub struct AggPlan {
 }
 
 // ---------------------------------------------------------------------------
-// JoinPlan — cross-source joins (empty for L1)
+// JoinPlan — cross-source joins
 // ---------------------------------------------------------------------------
 
-/// Cross-source join plan. Empty for L1.
+/// Cross-source join plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JoinPlan {
-    pub window: Duration,
-    pub conditions: Vec<ExprPlan>,
+    pub right_window: String,
+    pub mode: JoinMode,
+    pub conds: Vec<JoinCondPlan>,
+}
+
+/// A single join condition: left field == right field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinCondPlan {
+    pub left: FieldRef,
+    pub right: FieldRef,
+}
+
+// ---------------------------------------------------------------------------
+// LimitsPlan — resource budget enforcement
+// ---------------------------------------------------------------------------
+
+/// Compiled limits for runtime enforcement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitsPlan {
+    pub max_state_bytes: Option<usize>,
+    pub max_cardinality: Option<usize>,
+    pub max_emit_rate: Option<RateSpec>,
+    pub on_exceed: ExceedAction,
+}
+
+/// What to do when a limit is exceeded.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExceedAction {
+    Throttle,
+    DropOldest,
+    FailRule,
+}
+
+/// Emit rate specification: count per duration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateSpec {
+    pub count: u64,
+    pub per: Duration,
 }
 
 // ---------------------------------------------------------------------------

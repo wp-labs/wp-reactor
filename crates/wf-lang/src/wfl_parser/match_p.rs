@@ -59,6 +59,7 @@ fn match_clause(input: &mut &str) -> ModalResult<MatchClause> {
 
     Ok(MatchClause {
         keys,
+        key_mapping: None,
         duration,
         on_event,
         on_close,

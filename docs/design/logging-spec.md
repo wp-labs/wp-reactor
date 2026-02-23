@@ -158,10 +158,10 @@ tracing::info!(domain = "sys", schemas = 1, rules = 2, "engine bootstrap complet
 
 | span 名 | 附加字段 | 所在函数 |
 |---------|---------|---------|
-| `engine.start` | `listen` | `FusionEngine::start()` |
+| `engine.start` | `listen` | `Reactor::start()` |
 | `receiver` | — | `Receiver::run()` |
 | `handle_connection` | `peer` | `handle_connection()` |
-| `scheduler` | — | `Scheduler::run()` |
+| `rule_task` | `task_id` | `run_rule_task()` |
 | `alert_sink` | — | `run_alert_sink()` |
 | `evictor` | — | `run_evictor()` |
 

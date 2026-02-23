@@ -67,7 +67,7 @@
 |------|------|----------|----|----|----------|
 | Receiver accept loop | 1 | TCP 连接到达 | TcpListener | — | `cancel` |
 | Connection handler | N (per client) | TCP frame 到达 | TcpStream | Router → Window (写锁) | `cancel` (child) |
-| Engine task | 每 rule 1 个 | Notify / timeout tick | Window (读锁) | CepStateMachine, alert_tx | `engine_cancel` |
+| Engine task | 每 rule 1 个 | Notify / timeout tick | Window (读锁) | CepStateMachine, alert_tx | `rule_cancel` |
 | Alert sink | 1 | mpsc::recv() | alert channel | 文件 / 网络 | channel 关闭 |
 | Evictor | 1 | 定时 interval | Window (读锁 → 写锁) | Window eviction | `cancel` |
 
@@ -78,13 +78,13 @@
 ### CancellationToken（两阶段关闭）
 
 ```rust
-pub struct FusionEngine {
+pub struct Reactor {
     cancel: CancellationToken,         // 主令牌：Receiver, Evictor
-    engine_cancel: CancellationToken,  // 引擎令牌：仅 Engine tasks
+    rule_cancel: CancellationToken,    // 引擎令牌：仅 RuleTask
 }
 ```
 
-`cancel` 触发后，Receiver 先停止。`wait()` 中 Receiver join 完成后，再触发 `engine_cancel`，确保引擎能读到所有已路由数据。
+`cancel` 触发后，Receiver 先停止。`wait()` 中 Receiver join 完成后，再触发 `rule_cancel`，确保引擎能读到所有已路由数据。
 
 ### Notify（每 Window 一个）
 
@@ -182,7 +182,7 @@ cancel.cancel()
 wait(): join receiver  ◄── Receiver 完全停止, 所有数据已在 Window 中
     │
     ▼
-engine_cancel.cancel()
+rule_cancel.cancel()
     │
     ├── Engine tasks:
     │     1. process_new_data()  ← 最后一次 drain

@@ -422,7 +422,7 @@ impl DomainReason for OMLRunReason {}
 
 ### 4.4 wp-motor 中不建议参考的模式
 
-1. **DomainReason 集中在独立 crate (wp-error)**: wp-reactor 的 crate 间依赖更简单（wf-core → wf-runtime → wf-cli），每个 crate 定义自己的 reason 再 err_conv 更清晰。
+1. **DomainReason 集中在独立 crate (wp-error)**: wp-reactor 的 crate 间依赖更简单（wf-core → wf-runtime → wf-engine），每个 crate 定义自己的 reason 再 err_conv 更清晰。
 
 2. **自定义 owe trait (RunErrorOwe)**: 这是 ErrorOwe 约束过强的 workaround，orion-error 0.6 拆分 ErrorOweBase 后不再需要。
 
