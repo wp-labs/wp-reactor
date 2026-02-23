@@ -5,8 +5,8 @@ use crate::compile_wfl;
 use crate::schema::{BaseType, FieldDef, FieldType, WindowSchema};
 use crate::wfl_parser::parse_wfl;
 
-use super::format::format_expr;
 use super::explain_rules;
+use super::format::format_expr;
 
 fn bt(b: BaseType) -> FieldType {
     FieldType::Base(b)

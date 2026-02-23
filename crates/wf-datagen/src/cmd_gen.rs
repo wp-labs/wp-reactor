@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Context;
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 use wf_datagen::datagen::fault_gen::apply_faults;
 use wf_datagen::datagen::generate;
@@ -177,8 +177,7 @@ pub(crate) fn run(
             Some(&injected_rules),
         )?;
 
-        let faulted_oracle_file =
-            out.join(format!("{}.faulted-oracle.jsonl", wfg.scenario.name));
+        let faulted_oracle_file = out.join(format!("{}.faulted-oracle.jsonl", wfg.scenario.name));
         write_oracle_jsonl(&faulted_oracle.alerts, &faulted_oracle_file)?;
         println!(
             "Faulted oracle: {} alerts -> {}",

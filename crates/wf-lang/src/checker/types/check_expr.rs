@@ -1,7 +1,7 @@
 use crate::ast::{BinOp, Expr};
 
 use super::infer::infer_type;
-use super::{compatible, is_numeric, op_symbol, ValType};
+use super::{ValType, compatible, is_numeric, op_symbol};
 use crate::checker::scope::Scope;
 use crate::checker::{CheckError, Severity};
 

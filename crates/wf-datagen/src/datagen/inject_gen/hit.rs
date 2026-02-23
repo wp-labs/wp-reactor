@@ -6,7 +6,9 @@ use rand::Rng;
 use rand::rngs::StdRng;
 use wf_lang::WindowSchema;
 
-use super::helpers::{compute_cluster_count, compute_window_bounds, generate_cluster_events, generate_key_values};
+use super::helpers::{
+    compute_cluster_count, compute_window_bounds, generate_cluster_events, generate_key_values,
+};
 use super::structures::{InjectOverrides, RuleStructure, StepInfo};
 use crate::datagen::stream_gen::GenEvent;
 use crate::wfg_ast::StreamBlock;

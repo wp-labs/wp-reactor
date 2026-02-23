@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use crate::window::buffer::types::WindowParams;
     use crate::window::buffer::Window;
     use crate::window::buffer::types::AppendOutcome;
+    use crate::window::buffer::types::WindowParams;
     use arrow::array::{Int64Array, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
     use arrow::record_batch::RecordBatch;

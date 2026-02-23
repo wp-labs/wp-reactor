@@ -6,8 +6,8 @@ use winnow::token::literal;
 use crate::ast::*;
 use crate::parse_utils::{kw, nonneg_integer, number_literal, quoted_string, ws_skip};
 
-use super::cmp_op;
 use super::super::expr;
+use super::cmp_op;
 
 // ---------------------------------------------------------------------------
 // expect block

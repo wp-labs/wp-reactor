@@ -8,8 +8,8 @@ mod stream_schema;
 #[cfg(test)]
 mod tests;
 
-use wf_lang::ast::{WflFile};
 use wf_lang::WindowSchema;
+use wf_lang::ast::WflFile;
 
 use crate::wfg_ast::WfgFile;
 
@@ -38,11 +38,15 @@ pub fn validate_wfg(
     let scenario = &wfg.scenario;
 
     errors.extend(scenario::validate_scenario_basics(scenario));
-    errors.extend(stream_schema::validate_streams_with_schemas(scenario, schemas));
+    errors.extend(stream_schema::validate_streams_with_schemas(
+        scenario, schemas,
+    ));
 
     let all_rules: Vec<_> = wfl_files.iter().flat_map(|f| f.rules.iter()).collect();
 
-    errors.extend(stream_rule::validate_stream_rule_bindings(scenario, &all_rules));
+    errors.extend(stream_rule::validate_stream_rule_bindings(
+        scenario, &all_rules,
+    ));
     errors.extend(inject::validate_inject_blocks(scenario, &all_rules));
     errors.extend(oracle::validate_oracle_params(scenario));
 

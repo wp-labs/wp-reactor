@@ -2,7 +2,7 @@ use crate::ast::{Expr, FieldRef};
 use crate::schema::BaseType;
 
 use super::infer::infer_type;
-use super::{compatible, is_numeric, is_orderable, ValType};
+use super::{ValType, compatible, is_numeric, is_orderable};
 use crate::checker::scope::Scope;
 use crate::checker::{CheckError, Severity};
 

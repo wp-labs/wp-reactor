@@ -25,7 +25,10 @@ pub(super) fn compute_window_bounds(dur_secs: f64, window_dur: Duration) -> (f64
 /// For the near-miss step (determined by `steps_completed` override or the
 /// last step by default): `threshold - 1` events. Steps before it get the
 /// full threshold. Steps after it get 0 events.
-pub(super) fn compute_near_miss_counts(steps: &[StepInfo], overrides: &InjectOverrides) -> Vec<u64> {
+pub(super) fn compute_near_miss_counts(
+    steps: &[StepInfo],
+    overrides: &InjectOverrides,
+) -> Vec<u64> {
     let effective_threshold_nm = overrides
         .count_per_entity
         .unwrap_or(steps[steps.len() - 1].threshold);

@@ -1,7 +1,7 @@
 use crate::ast::{BinOp, Expr};
 use crate::schema::BaseType;
 
-use super::{is_numeric, numeric_promote, ValType};
+use super::{ValType, is_numeric, numeric_promote};
 use crate::checker::scope::Scope;
 
 /// Infer the type of an expression within the given scope.

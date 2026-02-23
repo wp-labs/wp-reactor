@@ -48,6 +48,8 @@ pub fn check_wfl(file: &WflFile, schemas: &[WindowSchema]) -> Vec<CheckError> {
 
     contracts::check_contracts(file, &mut errors);
 
+    rules::yield_version::check_yield_versions(file, &mut errors);
+
     errors
 }
 

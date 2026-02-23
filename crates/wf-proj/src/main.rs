@@ -6,7 +6,6 @@ use clap::{Parser, Subcommand};
 mod cmd_explain;
 mod cmd_fmt;
 mod cmd_lint;
-mod cmd_replay;
 
 #[derive(Parser)]
 #[command(
@@ -83,6 +82,20 @@ enum Commands {
         #[arg(long)]
         var: Vec<String>,
     },
+
+    /// Run contract tests against compiled rules
+    Test {
+        /// Path to the .wfl rule file (must contain contract blocks)
+        file: PathBuf,
+
+        /// Schema file glob patterns (e.g. "schemas/*.wfs")
+        #[arg(short, long)]
+        schemas: Vec<String>,
+
+        /// Variable substitutions in KEY=VALUE format
+        #[arg(long)]
+        var: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -112,7 +125,11 @@ fn main() -> Result<()> {
             alias,
             var,
         } => {
-            cmd_replay::run(file, schemas, input, alias, var)?;
+            wf_proj::cmd_replay::run(file, schemas, input, alias, var)?;
+        }
+
+        Commands::Test { file, schemas, var } => {
+            wf_proj::cmd_test::run(file, schemas, var)?;
         }
     }
 

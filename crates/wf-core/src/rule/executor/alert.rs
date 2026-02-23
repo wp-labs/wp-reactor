@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use wf_lang::ast::FieldRef;
 
-use crate::rule::match_engine::{field_ref_name, value_to_string, StepData, Value};
+use crate::rule::match_engine::{StepData, Value, field_ref_name, value_to_string};
 
 /// Format nanoseconds since epoch as ISO 8601 UTC string.
 ///

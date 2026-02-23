@@ -1,13 +1,13 @@
-mod window_lookup;
-mod task_types;
 mod rule_task;
+mod task_types;
+mod window_lookup;
 
 #[cfg(test)]
 mod tests;
 
 use std::pin::Pin;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::task::Poll;
 
 use tokio::sync::Notify;

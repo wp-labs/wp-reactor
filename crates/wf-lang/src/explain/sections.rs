@@ -1,7 +1,6 @@
 use crate::ast::{Expr, FieldRef};
 use crate::plan::{
-    AggPlan, BindPlan, BranchPlan, JoinPlan, LimitsPlan, MatchPlan, StepPlan, WindowSpec,
-    YieldPlan,
+    AggPlan, BindPlan, BranchPlan, JoinPlan, LimitsPlan, MatchPlan, StepPlan, WindowSpec, YieldPlan,
 };
 use crate::schema::WindowSchema;
 

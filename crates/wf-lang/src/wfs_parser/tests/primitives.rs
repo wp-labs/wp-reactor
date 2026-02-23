@@ -72,7 +72,9 @@ fn parse_field_decl_simple() {
 
 #[test]
 fn parse_field_decl_dotted() {
-    let fd = super::super::field_decl.parse("detail.sha256: hex").unwrap();
+    let fd = super::super::field_decl
+        .parse("detail.sha256: hex")
+        .unwrap();
     assert_eq!(fd.name, "detail.sha256");
     assert_eq!(fd.field_type, FieldType::Base(BaseType::Hex));
 }

@@ -76,8 +76,12 @@ pub(super) fn build_run_rules(
         let stream_aliases = build_stream_aliases(&plan.binds, schemas);
         let time_field = resolve_time_field(&plan.binds, schemas);
         let limits = plan.limits_plan.clone();
-        let machine =
-            CepStateMachine::with_limits(plan.name.clone(), plan.match_plan.clone(), time_field, limits);
+        let machine = CepStateMachine::with_limits(
+            plan.name.clone(),
+            plan.match_plan.clone(),
+            time_field,
+            limits,
+        );
         let executor = RuleExecutor::new(plan.clone());
         rules.push(RunRule {
             machine,

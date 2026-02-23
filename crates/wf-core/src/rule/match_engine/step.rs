@@ -103,11 +103,7 @@ pub(super) fn apply_transforms(
 // Measure update & computation
 // ---------------------------------------------------------------------------
 
-pub(super) fn update_measure(
-    measure: &Measure,
-    field_value: &Option<Value>,
-    bs: &mut BranchState,
-) {
+pub(super) fn update_measure(measure: &Measure, field_value: &Option<Value>, bs: &mut BranchState) {
     let fval = field_value.as_ref().and_then(value_to_f64);
 
     match measure {

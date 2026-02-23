@@ -9,7 +9,9 @@ use crate::schema::WindowSchema;
 
 pub use format::{format_cmp, format_expr, format_field_ref, format_measure};
 
-use sections::{compute_lineage, explain_binds, explain_joins, explain_limits, explain_match, explain_yield};
+use sections::{
+    compute_lineage, explain_binds, explain_joins, explain_limits, explain_match, explain_yield,
+};
 
 /// Human-readable explanation of a compiled rule.
 #[derive(Debug)]

@@ -43,9 +43,7 @@ pub(crate) fn eval_expr_ext(
                 _ => None,
             }
         }
-        Expr::BinOp { op, left, right } => {
-            eval_binop(*op, left, right, event, windows, baselines)
-        }
+        Expr::BinOp { op, left, right } => eval_binop(*op, left, right, event, windows, baselines),
         Expr::InList {
             expr: target,
             list,

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::sync::mpsc;
 
@@ -8,9 +8,9 @@ use wf_core::alert::AlertRecord;
 use wf_core::rule::{CepStateMachine, CloseReason, RuleExecutor, StepResult, batch_to_events};
 use wf_core::window::Router;
 
+use super::TASK_SEQ;
 use super::task_types::{RuleTaskConfig, WindowSource};
 use super::window_lookup::RegistryLookup;
-use super::TASK_SEQ;
 
 // ---------------------------------------------------------------------------
 // RuleTask -- runtime state for a single rule
@@ -34,7 +34,13 @@ pub(super) struct RuleTask {
 }
 
 impl RuleTask {
-    pub(super) fn new(config: RuleTaskConfig) -> (Self, tokio_util::sync::CancellationToken, std::time::Duration) {
+    pub(super) fn new(
+        config: RuleTaskConfig,
+    ) -> (
+        Self,
+        tokio_util::sync::CancellationToken,
+        std::time::Duration,
+    ) {
         let RuleTaskConfig {
             machine,
             executor,

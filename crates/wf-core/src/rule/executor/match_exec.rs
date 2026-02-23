@@ -37,11 +37,7 @@ impl RuleExecutor {
     }
 
     /// Internal: build the AlertRecord from an already-constructed eval context.
-    fn build_match_alert(
-        &self,
-        matched: &MatchedContext,
-        ctx: &Event,
-    ) -> CoreResult<AlertRecord> {
+    fn build_match_alert(&self, matched: &MatchedContext, ctx: &Event) -> CoreResult<AlertRecord> {
         let score = eval_score(&self.plan.score_plan.expr, ctx)?;
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
         let fired_at = format_nanos_utc(matched.event_time_nanos);

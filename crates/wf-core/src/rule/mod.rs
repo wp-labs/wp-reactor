@@ -1,3 +1,4 @@
+pub mod contract;
 pub mod event_bridge;
 mod executor;
 mod match_engine;

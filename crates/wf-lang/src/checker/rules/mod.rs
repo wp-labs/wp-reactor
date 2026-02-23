@@ -1,10 +1,11 @@
 mod joins;
 mod keys;
 mod limits;
-mod score_entity;
 mod scope_build;
+mod score_entity;
 mod steps;
 mod yield_check;
+pub(crate) mod yield_version;
 
 use std::collections::HashSet;
 

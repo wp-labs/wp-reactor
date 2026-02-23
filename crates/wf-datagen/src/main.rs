@@ -122,7 +122,14 @@ fn main() -> anyhow::Result<()> {
             time_tolerance,
             meta,
             format,
-        } => cmd_verify::run(expected, actual, score_tolerance, time_tolerance, meta, format),
+        } => cmd_verify::run(
+            expected,
+            actual,
+            score_tolerance,
+            time_tolerance,
+            meta,
+            format,
+        ),
         Commands::Bench {
             scenario,
             ws,

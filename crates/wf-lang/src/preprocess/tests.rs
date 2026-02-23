@@ -116,8 +116,7 @@ fn dollar_dollar_before_ident() {
 #[test]
 fn mixed_comment_and_var() {
     let v = vars(&[("THRESHOLD", "3")]);
-    let result =
-        preprocess_vars("count >= $THRESHOLD # compare against $THRESHOLD\n", &v).unwrap();
+    let result = preprocess_vars("count >= $THRESHOLD # compare against $THRESHOLD\n", &v).unwrap();
     assert_eq!(result, "count >= 3 # compare against $THRESHOLD\n");
 }
 

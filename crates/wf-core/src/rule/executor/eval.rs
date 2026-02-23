@@ -1,7 +1,7 @@
 use orion_error::prelude::*;
 
 use crate::error::{CoreReason, CoreResult};
-use crate::rule::match_engine::{eval_expr, value_to_string, Event, Value};
+use crate::rule::match_engine::{Event, Value, eval_expr, value_to_string};
 
 /// Evaluate the score expression and clamp to `[0, 100]`.
 pub(super) fn eval_score(expr: &wf_lang::ast::Expr, ctx: &Event) -> CoreResult<f64> {

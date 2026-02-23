@@ -213,7 +213,14 @@ impl CepStateMachine {
         let step_state = &mut instance.step_states[step_idx];
 
         // 6. Evaluate step
-        match evaluate_step(alias, event, step_plan, step_state, windows, &mut instance.baselines) {
+        match evaluate_step(
+            alias,
+            event,
+            step_plan,
+            step_state,
+            windows,
+            &mut instance.baselines,
+        ) {
             None => StepResult::Accumulate,
             Some((branch_idx, measure_value)) => {
                 let label = step_plan.branches[branch_idx].label.clone();

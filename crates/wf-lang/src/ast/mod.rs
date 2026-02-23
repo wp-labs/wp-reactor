@@ -1,17 +1,17 @@
-mod rule;
-mod events;
-mod match_;
 mod clauses;
+mod contract;
+mod events;
 mod expr;
 mod join;
 mod limits;
-mod contract;
+mod match_;
+mod rule;
 
-pub use rule::*;
-pub use events::*;
-pub use match_::*;
 pub use clauses::*;
+pub use contract::*;
+pub use events::*;
 pub use expr::*;
 pub use join::*;
 pub use limits::*;
-pub use contract::*;
+pub use match_::*;
+pub use rule::*;

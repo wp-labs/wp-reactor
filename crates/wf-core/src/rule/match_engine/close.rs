@@ -7,9 +7,7 @@ use super::state::{Instance, StepState};
 use super::step::{
     apply_transforms, check_threshold, compute_measure, extract_branch_field, update_measure,
 };
-use super::types::{
-    CloseOutput, CloseReason, Event, RollingStats, StepData, Value, WindowLookup,
-};
+use super::types::{CloseOutput, CloseReason, Event, RollingStats, StepData, Value, WindowLookup};
 
 // ---------------------------------------------------------------------------
 // Close-step accumulation (during advance)
