@@ -85,7 +85,20 @@
       "Bash(./target/debug/wfl:*)",
       "Bash(FAIL_THRESHOLD=3 ./target/debug/wfl:*)",
       "Bash(FAIL_THRESHOLD=3 ./target/debug/wfgen gen:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples && mv schemas/security.wfs count/schemas/security.wfs && mv rules/brute_force.wfl count/rules/brute_force.wfl && mv data/auth_events.ndjson count/data/auth_events.ndjson && mv scenarios/brute_force.wfg count/scenarios/brute_force.wfg && mv alerts/wf-alerts.jsonl count/out/wf-alerts.jsonl && rmdir schemas rules data scenarios alerts)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/count && wfl test rules/brute_force.wfl --schemas \"schemas/*.wfs\" --var FAIL_THRESHOLD=3 2>&1)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/distinct && wfl test rules/port_scan.wfl --schemas \"schemas/*.wfs\" 2>&1)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/sum && wfl test rules/data_exfil.wfl --schemas \"schemas/*.wfs\" 2>&1)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/multi_step && wfl test rules/chain_attack.wfl --schemas \"schemas/*.wfs\" 2>&1)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/avg && wfl test rules/dns_tunnel.wfl --schemas \"schemas/*.wfs\" 2>&1)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/close_modes && wfl test rules/close_demo.wfl --schemas \"schemas/*.wfs\" 2>&1)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/avg && /Users/zuowenjian/devspace/wp-labs/wp-reactor/target/debug/wfl test -f rules/dns_tunnel.wfl -s schemas/dns.wfs 2>&1)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/avg && /Users/zuowenjian/devspace/wp-labs/wp-reactor/target/debug/wfl test --help)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/avg && /Users/zuowenjian/devspace/wp-labs/wp-reactor/target/debug/wfl test rules/dns_tunnel.wfl -s schemas/dns.wfs 2>&1)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/sum && /Users/zuowenjian/devspace/wp-labs/wp-reactor/target/debug/wfl test rules/data_exfil.wfl -s schemas/network.wfs 2>&1)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/distinct && /Users/zuowenjian/devspace/wp-labs/wp-reactor/target/debug/wfl test rules/port_scan.wfl -s schemas/network.wfs 2>&1)",
+      "Bash(wfl test rules/chain_attack.wfl --schemas \"schemas/*.wfs\" 2>&1)"
     ]
   }
 }

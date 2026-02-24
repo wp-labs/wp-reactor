@@ -1,0 +1,12 @@
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":80,"bytes":100,"protocol":"tcp","action":"syn","event_time":1767225600000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":443,"bytes":100,"protocol":"tcp","action":"syn","event_time":1767225601000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":8080,"bytes":100,"protocol":"tcp","action":"syn","event_time":1767225602000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":22,"bytes":100,"protocol":"tcp","action":"syn","event_time":1767225603000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":3306,"bytes":100,"protocol":"tcp","action":"syn","event_time":1767225604000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":5432,"bytes":100,"protocol":"tcp","action":"syn","event_time":1767225605000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":6379,"bytes":100,"protocol":"tcp","action":"syn","event_time":1767225606000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":27017,"bytes":100,"protocol":"tcp","action":"syn","event_time":1767225607000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":9200,"bytes":100,"protocol":"tcp","action":"syn","event_time":1767225608000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":11211,"bytes":100,"protocol":"tcp","action":"syn","event_time":1767225609000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":6380,"bytes":100,"protocol":"tcp","action":"syn","event_time":1767225610000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":8443,"bytes":100,"protocol":"tcp","action":"syn","event_time":1767225611000000000}

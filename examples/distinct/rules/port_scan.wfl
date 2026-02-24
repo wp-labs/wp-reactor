@@ -1,0 +1,55 @@
+use "network.wfs"
+rule port_scan {
+    events { c : conn_events && action == "syn" }
+    match<sip:5m> {
+        on event { c.dport | distinct | count >= 10; }
+    } -> score(60.0)
+    entity(ip, c.sip)
+    yield network_alerts (sip = c.sip, alert_type = "port_scan", detail = "distinct ports >= 10")
+}
+
+test scan_detected for port_scan {
+  input {
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "80", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:00Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:01Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "8080", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:02Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "22", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:03Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "3306", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:04Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "5432", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:05Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "6379", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:06Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "27017", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:07Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "9200", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:08Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "11211", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:09Z");
+  }
+  expect {
+    hits == 1;
+    hit[0].score == 60.0;
+    hit[0].entity_type == "ip";
+    hit[0].entity_id == "10.0.0.1";
+  }
+}
+
+test repeat_ports_no_trigger for port_scan {
+  input {
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "80", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:00Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "80", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:01Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:02Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:03Z");
+  }
+  expect {
+    hits == 0;
+  }
+}
+
+test different_sip_isolated for port_scan {
+  input {
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "80", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:00Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:01Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "8080", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:02Z");
+    row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "22", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:03Z");
+    row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "3306", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:04Z");
+  }
+  expect {
+    hits == 0;
+  }
+}

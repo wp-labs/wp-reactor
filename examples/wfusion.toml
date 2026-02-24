@@ -6,8 +6,8 @@ listen = "tcp://127.0.0.1:9800"
 [runtime]
 executor_parallelism = 2
 rule_exec_timeout = "30s"
-schemas = "schemas/*.wfs"
-rules   = "rules/*.wfl"
+schemas = "count/schemas/*.wfs"
+rules   = "count/rules/*.wfl"
 
 [window_defaults]
 evict_interval = "30s"

@@ -1,0 +1,5 @@
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":443,"bytes":20000000,"protocol":"tcp","action":"send","event_time":1767225600000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":443,"bytes":20000000,"protocol":"tcp","action":"send","event_time":1767225660000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":443,"bytes":20000000,"protocol":"tcp","action":"send","event_time":1767225720000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":443,"bytes":25000000,"protocol":"tcp","action":"send","event_time":1767225780000000000}
+{"sip":"10.0.0.1","dip":"192.168.1.1","dport":443,"bytes":25000000,"protocol":"tcp","action":"send","event_time":1767225840000000000}

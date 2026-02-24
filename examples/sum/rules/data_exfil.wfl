@@ -1,0 +1,40 @@
+use "network.wfs"
+rule data_exfil {
+    events { c : conn_events }
+    match<sip:10m> {
+        on event { c.bytes | sum >= 100000000; }
+        on close { total: c.bytes | sum >= 50000000; }
+    } -> score(85.0)
+    entity(ip, c.sip)
+    yield network_alerts (sip = c.sip, alert_type = "data_exfil", detail = "high volume")
+}
+
+test exfil_close_timeout for data_exfil {
+  input {
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 20000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:00:00Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 20000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:01:00Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 20000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:02:00Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 20000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:03:00Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 20000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:04:00Z");
+    tick(11m);
+  }
+  expect {
+    hits == 1;
+    hit[0].score == 85.0;
+    hit[0].close_reason == "timeout";
+    hit[0].entity_id == "10.0.0.1";
+  }
+  options {
+    close_trigger = timeout;
+  }
+}
+
+test low_traffic for data_exfil {
+  input {
+    row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "443", bytes = 1000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:00:00Z");
+    row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "443", bytes = 2000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:01:00Z");
+  }
+  expect {
+    hits == 0;
+  }
+}

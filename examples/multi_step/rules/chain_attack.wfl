@@ -1,0 +1,47 @@
+use "network.wfs"
+rule chain_attack {
+    events {
+        scan : conn_events && action == "syn"
+        login : conn_events && action == "login_fail"
+    }
+    match<sip:30m> {
+        on event {
+            scan | count >= 5;
+            login | count >= 3;
+        }
+    } -> score(90.0)
+    entity(ip, scan.sip)
+    yield network_alerts (sip = scan.sip, alert_type = "chain_attack", detail = "scan then brute force")
+}
+
+test full_chain for chain_attack {
+  input {
+    row(scan, sip = "10.0.0.1", dip = "192.168.1.1", dport = "80", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:00Z");
+    row(scan, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:01Z");
+    row(scan, sip = "10.0.0.1", dip = "192.168.1.1", dport = "8080", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:02Z");
+    row(scan, sip = "10.0.0.1", dip = "192.168.1.1", dport = "22", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:03Z");
+    row(scan, sip = "10.0.0.1", dip = "192.168.1.1", dport = "3306", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:04Z");
+    row(login, sip = "10.0.0.1", dip = "192.168.1.1", dport = "22", bytes = "200", protocol = "tcp", action = "login_fail", event_time = "2026-01-01T00:00:05Z");
+    row(login, sip = "10.0.0.1", dip = "192.168.1.1", dport = "22", bytes = "200", protocol = "tcp", action = "login_fail", event_time = "2026-01-01T00:00:06Z");
+    row(login, sip = "10.0.0.1", dip = "192.168.1.1", dport = "22", bytes = "200", protocol = "tcp", action = "login_fail", event_time = "2026-01-01T00:00:07Z");
+  }
+  expect {
+    hits == 1;
+    hit[0].score == 90.0;
+    hit[0].entity_type == "ip";
+    hit[0].entity_id == "10.0.0.1";
+  }
+}
+
+test scan_only for chain_attack {
+  input {
+    row(scan, sip = "10.0.0.2", dip = "192.168.1.1", dport = "80", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:00Z");
+    row(scan, sip = "10.0.0.2", dip = "192.168.1.1", dport = "443", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:01Z");
+    row(scan, sip = "10.0.0.2", dip = "192.168.1.1", dport = "8080", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:02Z");
+    row(scan, sip = "10.0.0.2", dip = "192.168.1.1", dport = "22", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:03Z");
+    row(scan, sip = "10.0.0.2", dip = "192.168.1.1", dport = "3306", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:04Z");
+  }
+  expect {
+    hits == 0;
+  }
+}

@@ -1,0 +1,5 @@
+{"sip":"10.0.0.1","domain":"evil.example.com","query_type":"TXT","resp_size":200,"event_time":1767225600000000000}
+{"sip":"10.0.0.1","domain":"evil.example.com","query_type":"TXT","resp_size":200,"event_time":1767225601000000000}
+{"sip":"10.0.0.1","domain":"evil.example.com","query_type":"TXT","resp_size":1100,"event_time":1767225602000000000}
+{"sip":"10.0.0.2","domain":"google.com","query_type":"A","resp_size":50,"event_time":1767225604000000000}
+{"sip":"10.0.0.2","domain":"github.com","query_type":"A","resp_size":60,"event_time":1767225605000000000}

@@ -1,0 +1,17 @@
+window dns_events {
+    stream = "dns_log"
+    time = event_time
+    over = 5m
+    fields {
+        sip: ip
+        domain: chars
+        query_type: chars
+        resp_size: digit
+        event_time: time
+    }
+}
+
+window dns_alerts {
+    over = 0
+    fields { sip: ip  alert_type: chars  detail: chars }
+}

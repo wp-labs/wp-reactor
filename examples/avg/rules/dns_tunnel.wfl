@@ -1,0 +1,33 @@
+use "dns.wfs"
+rule dns_tunnel {
+    events { d : dns_events }
+    match<sip:5m> {
+        on event { d.resp_size | avg >= 500; }
+    } -> score(50.0 + 20.0)
+    entity(ip, d.sip)
+    yield dns_alerts (sip = d.sip, alert_type = "dns_tunnel", detail = "high avg resp")
+}
+
+test tunnel_detected for dns_tunnel {
+  input {
+    row(d, sip = "10.0.0.1", domain = "evil.example.com", query_type = "TXT", resp_size = 200, event_time = "2026-01-01T00:00:00Z");
+    row(d, sip = "10.0.0.1", domain = "evil.example.com", query_type = "TXT", resp_size = 200, event_time = "2026-01-01T00:00:01Z");
+    row(d, sip = "10.0.0.1", domain = "evil.example.com", query_type = "TXT", resp_size = 1100, event_time = "2026-01-01T00:00:02Z");
+  }
+  expect {
+    hits == 1;
+    hit[0].score == 70.0;
+    hit[0].entity_type == "ip";
+    hit[0].entity_id == "10.0.0.1";
+  }
+}
+
+test normal_dns for dns_tunnel {
+  input {
+    row(d, sip = "10.0.0.2", domain = "google.com", query_type = "A", resp_size = 50, event_time = "2026-01-01T00:00:00Z");
+    row(d, sip = "10.0.0.2", domain = "github.com", query_type = "A", resp_size = 60, event_time = "2026-01-01T00:00:01Z");
+  }
+  expect {
+    hits == 0;
+  }
+}

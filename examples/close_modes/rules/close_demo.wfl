@@ -1,0 +1,50 @@
+use "network.wfs"
+rule close_demo {
+    events { c : conn_events }
+    match<sip:5m> {
+        on event { c | count >= 1; }
+        on close { total: c | count >= 1; }
+    } -> score(70.0)
+    entity(ip, c.sip)
+    yield network_alerts (sip = c.sip, alert_type = "close_demo", detail = "triggered")
+}
+
+test close_eos for close_demo {
+  input {
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "80", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:00Z");
+  }
+  expect {
+    hits == 1;
+    hit[0].score == 70.0;
+    hit[0].close_reason == "eos";
+    hit[0].entity_id == "10.0.0.1";
+  }
+}
+
+test close_timeout for close_demo {
+  input {
+    row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "80", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:00Z");
+    tick(6m);
+  }
+  expect {
+    hits == 1;
+    hit[0].score == 70.0;
+    hit[0].close_reason == "timeout";
+    hit[0].entity_id == "10.0.0.2";
+  }
+}
+
+test close_flush for close_demo {
+  input {
+    row(c, sip = "10.0.0.3", dip = "192.168.1.1", dport = "80", bytes = "100", protocol = "tcp", action = "syn", event_time = "2026-01-01T00:00:00Z");
+  }
+  expect {
+    hits == 1;
+    hit[0].score == 70.0;
+    hit[0].close_reason == "flush";
+    hit[0].entity_id == "10.0.0.3";
+  }
+  options {
+    close_trigger = flush;
+  }
+}
