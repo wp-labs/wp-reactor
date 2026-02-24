@@ -138,6 +138,11 @@ impl Window {
         self.batches.is_empty()
     }
 
+    /// Index of the time column in the schema, if present.
+    pub fn time_col_index(&self) -> Option<usize> {
+        self.time_col_index
+    }
+
     // -- private helpers ----------------------------------------------------
 
     /// Extract the (min, max) event-time range from a batch.

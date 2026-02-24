@@ -86,6 +86,11 @@ pub struct CloseOutput {
     pub event_step_data: Vec<StepData>,
     pub close_step_data: Vec<StepData>,
     pub watermark_nanos: i64,
+    /// The timestamp of the last event processed by this instance.
+    /// Used as the asof join time in the close path to avoid
+    /// matching against right-table rows that appeared after the
+    /// instance stopped receiving events.
+    pub last_event_nanos: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +105,15 @@ pub trait WindowLookup: Send + Sync {
 
     /// Get a full snapshot of a window (for join).
     fn snapshot(&self, window: &str) -> Option<Vec<HashMap<String, Value>>>;
+
+    /// Get a full snapshot with per-row timestamps (for asof join).
+    ///
+    /// Returns `None` if the window doesn't exist or doesn't support timestamps.
+    /// Each entry is `(timestamp_nanos, fields)`.
+    fn snapshot_with_timestamps(&self, window: &str) -> Option<Vec<(i64, HashMap<String, Value>)>> {
+        let _ = window;
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -33,7 +33,7 @@ impl RuleExecutor {
         let all_step_data = combine_step_data(close);
         let mut ctx =
             build_eval_context(&self.plan.match_plan.keys, &close.scope_key, &all_step_data);
-        execute_joins(&self.plan.joins, &mut ctx, windows);
+        execute_joins(&self.plan.joins, &mut ctx, windows, close.last_event_nanos);
         self.build_close_alert(close, &all_step_data, &ctx)
     }
 

@@ -1,5 +1,7 @@
-use wf_lang::ast::FieldRef;
-use wf_lang::plan::JoinPlan;
+use std::time::Duration;
+
+use wf_lang::ast::{FieldRef, JoinMode};
+use wf_lang::plan::{JoinCondPlan, JoinPlan};
 
 use crate::rule::match_engine::{
     Event, StepData, Value, WindowLookup, field_ref_name, values_equal,
@@ -37,19 +39,39 @@ pub(super) fn build_eval_context(
 
 /// Execute join plans, enriching the eval context with joined fields.
 ///
-/// For each join, snapshots the right window and finds the first row
-/// matching all join conditions. Matched fields are added to the context
-/// both as `window.field` (qualified) and as plain `field` (if not already present).
+/// For each join, dispatches on join mode:
+/// - `Snapshot`: snapshots all rows and finds the first condition-matching row.
+/// - `Asof`: gets timestamped rows, filters by time proximity, picks the latest match.
 ///
-/// Both `Snapshot` and `Asof` modes currently use the same row-matching logic.
-/// Time-based asof refinement will be added in L3.
-pub(super) fn execute_joins(joins: &[JoinPlan], ctx: &mut Event, windows: &dyn WindowLookup) {
+/// Matched fields are added to the context both as `window.field` (qualified)
+/// and as plain `field` (if not already present).
+pub(super) fn execute_joins(
+    joins: &[JoinPlan],
+    ctx: &mut Event,
+    windows: &dyn WindowLookup,
+    event_time_nanos: i64,
+) {
     for join in joins {
-        let Some(rows) = windows.snapshot(&join.right_window) else {
-            continue;
+        let matched_row = match &join.mode {
+            JoinMode::Snapshot => {
+                let Some(rows) = windows.snapshot(&join.right_window) else {
+                    continue;
+                };
+                find_matching_row(&rows, &join.conds, ctx)
+            }
+            JoinMode::Asof { within } => {
+                let Some(rows) = windows.snapshot_with_timestamps(&join.right_window) else {
+                    continue;
+                };
+                find_asof_row(&rows, &join.conds, ctx, event_time_nanos, within.as_ref())
+            }
+            _ => {
+                // Unknown join mode — skip gracefully
+                continue;
+            }
         };
 
-        let Some(row) = find_matching_row(&rows, &join.conds, ctx) else {
+        let Some(row) = matched_row else {
             continue;
         };
 
@@ -66,19 +88,46 @@ pub(super) fn execute_joins(joins: &[JoinPlan], ctx: &mut Event, windows: &dyn W
 /// Find the first row matching all join conditions.
 fn find_matching_row(
     rows: &[std::collections::HashMap<String, Value>],
-    conds: &[wf_lang::plan::JoinCondPlan],
+    conds: &[JoinCondPlan],
     ctx: &Event,
 ) -> Option<std::collections::HashMap<String, Value>> {
     rows.iter()
-        .find(|row| {
-            conds.iter().all(|cond| {
-                let left_name = field_ref_name(&cond.left);
-                let right_name = field_ref_name(&cond.right);
-                match (ctx.fields.get(left_name), row.get(right_name)) {
-                    (Some(lv), Some(rv)) => values_equal(lv, rv),
-                    _ => false,
-                }
-            })
-        })
+        .find(|row| row_matches_conds(row, conds, ctx))
         .cloned()
+}
+
+/// Find the latest row that matches all conditions AND has timestamp <= event_time.
+/// If `within` is specified, also require timestamp >= event_time - within.
+fn find_asof_row(
+    rows: &[(i64, std::collections::HashMap<String, Value>)],
+    conds: &[JoinCondPlan],
+    ctx: &Event,
+    event_time_nanos: i64,
+    within: Option<&Duration>,
+) -> Option<std::collections::HashMap<String, Value>> {
+    let min_ts = within
+        .map(|d| event_time_nanos - d.as_nanos() as i64)
+        .unwrap_or(i64::MIN);
+
+    rows.iter()
+        .filter(|(ts, _)| *ts <= event_time_nanos && *ts >= min_ts)
+        .filter(|(_, row)| row_matches_conds(row, conds, ctx))
+        .max_by_key(|(ts, _)| *ts)
+        .map(|(_, row)| row.clone())
+}
+
+/// Check whether a row satisfies all join conditions against the current context.
+fn row_matches_conds(
+    row: &std::collections::HashMap<String, Value>,
+    conds: &[JoinCondPlan],
+    ctx: &Event,
+) -> bool {
+    conds.iter().all(|cond| {
+        let left_name = field_ref_name(&cond.left);
+        let right_name = field_ref_name(&cond.right);
+        match (ctx.fields.get(left_name), row.get(right_name)) {
+            (Some(lv), Some(rv)) => values_equal(lv, rv),
+            _ => false,
+        }
+    })
 }

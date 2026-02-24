@@ -9,8 +9,9 @@ mod keymap;
 mod limits;
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
-use wf_lang::ast::{Expr, FieldRef};
+use wf_lang::ast::{Expr, FieldRef, JoinMode};
 use wf_lang::plan::{
     ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, WindowSpec,
 };
@@ -29,6 +30,7 @@ use super::helpers::*;
 struct MockWindowLookup {
     field_values: HashMap<(String, String), HashSet<String>>,
     snapshots: HashMap<String, Vec<HashMap<String, Value>>>,
+    timestamped_snapshots: HashMap<String, Vec<(i64, HashMap<String, Value>)>>,
 }
 
 impl MockWindowLookup {
@@ -36,6 +38,7 @@ impl MockWindowLookup {
         Self {
             field_values: HashMap::new(),
             snapshots: HashMap::new(),
+            timestamped_snapshots: HashMap::new(),
         }
     }
 
@@ -50,6 +53,15 @@ impl MockWindowLookup {
     fn add_snapshot(&mut self, window: &str, rows: Vec<HashMap<String, Value>>) {
         self.snapshots.insert(window.to_string(), rows);
     }
+
+    fn add_timestamped_snapshot(
+        &mut self,
+        window: &str,
+        rows: Vec<(i64, HashMap<String, Value>)>,
+    ) {
+        self.timestamped_snapshots
+            .insert(window.to_string(), rows);
+    }
 }
 
 impl WindowLookup for MockWindowLookup {
@@ -61,6 +73,10 @@ impl WindowLookup for MockWindowLookup {
 
     fn snapshot(&self, window: &str) -> Option<Vec<HashMap<String, Value>>> {
         self.snapshots.get(window).cloned()
+    }
+
+    fn snapshot_with_timestamps(&self, window: &str) -> Option<Vec<(i64, HashMap<String, Value>)>> {
+        self.timestamped_snapshots.get(window).cloned()
     }
 }
 
@@ -81,6 +97,37 @@ fn snapshot_join(window: &str, left_field: &str, right_field: &str) -> JoinPlan 
     JoinPlan {
         right_window: window.to_string(),
         mode: wf_lang::ast::JoinMode::Snapshot,
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Simple(left_field.to_string()),
+            right: FieldRef::Simple(right_field.to_string()),
+        }],
+    }
+}
+
+/// Build an asof JoinPlan without a within duration.
+fn asof_join(window: &str, left_field: &str, right_field: &str) -> JoinPlan {
+    JoinPlan {
+        right_window: window.to_string(),
+        mode: JoinMode::Asof { within: None },
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Simple(left_field.to_string()),
+            right: FieldRef::Simple(right_field.to_string()),
+        }],
+    }
+}
+
+/// Build an asof JoinPlan with a within duration.
+fn asof_join_within(
+    window: &str,
+    left_field: &str,
+    right_field: &str,
+    within: Duration,
+) -> JoinPlan {
+    JoinPlan {
+        right_window: window.to_string(),
+        mode: JoinMode::Asof {
+            within: Some(within),
+        },
         conds: vec![JoinCondPlan {
             left: FieldRef::Simple(left_field.to_string()),
             right: FieldRef::Simple(right_field.to_string()),

@@ -195,6 +195,7 @@ fn execute_close_both_ok() {
         }],
         close_step_data: vec![],
         watermark_nanos: 0,
+        last_event_nanos: 0,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
@@ -226,6 +227,7 @@ fn execute_close_close_not_ok() {
         event_step_data: vec![],
         close_step_data: vec![],
         watermark_nanos: 0,
+        last_event_nanos: 0,
     };
 
     let result = exec.execute_close(&close).unwrap();
@@ -255,6 +257,7 @@ fn execute_close_event_not_ok() {
         event_step_data: vec![],
         close_step_data: vec![],
         watermark_nanos: 0,
+        last_event_nanos: 0,
     };
 
     let result = exec.execute_close(&close).unwrap();

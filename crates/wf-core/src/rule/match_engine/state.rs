@@ -54,6 +54,7 @@ impl StepState {
 pub(super) struct Instance {
     pub(super) scope_key: Vec<Value>,
     pub(super) created_at: i64,
+    pub(super) last_event_nanos: i64,
     pub(super) current_step: usize,
     pub(super) event_ok: bool,
     pub(super) step_states: Vec<StepState>,
@@ -77,6 +78,7 @@ impl Instance {
         Self {
             scope_key,
             created_at: now_nanos,
+            last_event_nanos: now_nanos,
             current_step: 0,
             event_ok: false,
             step_states,
@@ -88,6 +90,7 @@ impl Instance {
 
     pub(super) fn reset(&mut self, plan: &MatchPlan, now_nanos: i64) {
         self.created_at = now_nanos;
+        self.last_event_nanos = now_nanos;
         self.current_step = 0;
         self.event_ok = false;
         self.step_states = plan

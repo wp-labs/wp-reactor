@@ -164,5 +164,6 @@ pub(super) fn evaluate_close(
         event_step_data: instance.completed_steps,
         close_step_data,
         watermark_nanos,
+        last_event_nanos: instance.last_event_nanos,
     }
 }

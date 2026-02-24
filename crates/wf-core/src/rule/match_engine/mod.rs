@@ -187,6 +187,11 @@ impl CepStateMachine {
             .entry(instance_key)
             .or_insert_with(|| Instance::new(plan, scope_key.clone(), now_nanos));
 
+        // Track the latest event time for this instance
+        if now_nanos > instance.last_event_nanos {
+            instance.last_event_nanos = now_nanos;
+        }
+
         // 3. Accumulate close steps (if any) — happens on every event
         if !plan.close_steps.is_empty() {
             accumulate_close_steps(

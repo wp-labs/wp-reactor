@@ -41,6 +41,45 @@ pub fn batch_to_events(batch: &RecordBatch) -> Vec<Event> {
     events
 }
 
+/// Convert an Arrow [`RecordBatch`] into timestamped rows for asof join.
+///
+/// Each row becomes `(timestamp_nanos, fields)`. The timestamp is extracted
+/// as a raw `i64` from the column at `time_col_index`. Rows with a null
+/// timestamp are skipped. All columns (including the time column) are
+/// included in the fields map via [`extract_value`], so the time field
+/// remains available in the join context.
+pub fn batch_to_timestamped_rows(
+    batch: &RecordBatch,
+    time_col_index: usize,
+) -> Vec<(i64, HashMap<String, Value>)> {
+    let num_rows = batch.num_rows();
+    let schema = batch.schema();
+    let ts_col = batch.column(time_col_index);
+    let Some(ts_array) = ts_col.as_any().downcast_ref::<TimestampNanosecondArray>() else {
+        return Vec::new();
+    };
+
+    let mut rows = Vec::with_capacity(num_rows);
+    for row in 0..num_rows {
+        if ts_array.is_null(row) {
+            continue;
+        }
+        let ts = ts_array.value(row);
+        let mut fields = HashMap::new();
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            let col = batch.column(col_idx);
+            if col.is_null(row) {
+                continue;
+            }
+            if let Some(val) = extract_value(col.as_ref(), row) {
+                fields.insert(field.name().clone(), val);
+            }
+        }
+        rows.push((ts, fields));
+    }
+    rows
+}
+
 fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
     match col.data_type() {
         DataType::Int64 => {
