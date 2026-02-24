@@ -3,6 +3,7 @@
 mod baseline;
 mod execute;
 mod expr;
+mod fixed;
 mod guards;
 mod joins;
 mod keymap;

@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use wf_lang::plan::{ExceedAction, LimitsPlan, MatchPlan, WindowSpec};
 
 use close::{accumulate_close_steps, evaluate_close};
-use key::{extract_key, make_instance_key};
+use key::{InstanceKey, extract_key, make_scope_key_str};
 use state::Instance;
 use step::evaluate_step;
 
@@ -39,7 +39,7 @@ use step::evaluate_step;
 pub struct CepStateMachine {
     rule_name: String,
     plan: MatchPlan,
-    instances: HashMap<String, Instance>,
+    instances: HashMap<InstanceKey, Instance>,
     time_field: Option<String>,
     watermark_nanos: i64,
     limits: Option<LimitsPlan>,
@@ -150,7 +150,19 @@ impl CepStateMachine {
                 Some(k) => k,
                 None => return StepResult::Accumulate, // missing key field → skip
             };
-        let instance_key = make_instance_key(&scope_key);
+
+        // Build structured instance key
+        let (instance_key, fixed_created_at) = match self.plan.window_spec {
+            WindowSpec::Sliding(_) => (InstanceKey::sliding(&scope_key), None),
+            WindowSpec::Fixed(dur) => {
+                let dur_nanos = dur.as_nanos() as i64;
+                let bucket_start = (now_nanos / dur_nanos) * dur_nanos;
+                (
+                    InstanceKey::fixed(&scope_key, bucket_start),
+                    Some(bucket_start),
+                )
+            }
+        };
 
         // 2. Get or create instance (with limits check)
         let plan = &self.plan;
@@ -236,10 +248,10 @@ impl CepStateMachine {
             }
         }
 
-        let instance = self
-            .instances
-            .entry(instance_key)
-            .or_insert_with(|| Instance::new(plan, scope_key.clone(), now_nanos));
+        let instance = self.instances.entry(instance_key).or_insert_with(|| {
+            let created = fixed_created_at.unwrap_or(now_nanos);
+            Instance::new_at(plan, scope_key.clone(), created)
+        });
 
         // Track the latest event time for this instance
         if now_nanos > instance.last_event_nanos {
@@ -306,7 +318,8 @@ impl CepStateMachine {
                                 match limits.on_exceed {
                                     ExceedAction::Throttle | ExceedAction::DropOldest => {
                                         // Suppress the match — reset instance for future use
-                                        instance.reset(plan, now_nanos);
+                                        let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                                        instance.reset(plan, reset_at);
                                         return StepResult::Accumulate;
                                     }
                                     ExceedAction::FailRule => {
@@ -325,7 +338,7 @@ impl CepStateMachine {
                             step_data: instance.completed_steps.clone(),
                             event_time_nanos: now_nanos,
                         };
-                        instance.reset(plan, now_nanos);
+                        instance.reset(plan, fixed_created_at.unwrap_or(now_nanos));
                         StepResult::Matched(ctx)
                     } else {
                         // Close steps present → mark event_ok, keep accumulating
@@ -353,8 +366,23 @@ impl CepStateMachine {
     ///
     /// Removes the instance from the map and returns the [`CloseOutput`].
     /// Returns `None` if no instance exists for the given scope key.
+    ///
+    /// For fixed windows, multiple bucket instances may exist for the same
+    /// scope key. This method closes the **oldest** bucket instance (by
+    /// `created_at`). Call repeatedly to drain all buckets.
     pub fn close(&mut self, scope_key: &[Value], reason: CloseReason) -> Option<CloseOutput> {
-        let instance_key = make_instance_key(scope_key);
+        let scope_key_str = make_scope_key_str(scope_key);
+
+        let instance_key = match self.plan.window_spec {
+            WindowSpec::Sliding(_) => InstanceKey::sliding(scope_key),
+            WindowSpec::Fixed(_) => self
+                .instances
+                .iter()
+                .filter(|(k, _)| k.matches_scope(&scope_key_str))
+                .min_by_key(|(_, inst)| inst.created_at)
+                .map(|(k, _)| k.clone())?,
+        };
+
         let instance = self.instances.remove(&instance_key)?;
         let mut output = evaluate_close(
             &self.rule_name,
@@ -383,9 +411,10 @@ impl CepStateMachine {
     /// watermark. This makes `fired_at` deterministic regardless of batch size
     /// or scan frequency.
     pub fn scan_expired_at(&mut self, watermark_nanos: i64) -> Vec<CloseOutput> {
-        let WindowSpec::Sliding(maxspan) = self.plan.window_spec;
-        let maxspan_nanos = maxspan.as_nanos() as i64;
-        let mut expired_keys: Vec<(String, i64)> = Vec::new();
+        let maxspan_nanos = match self.plan.window_spec {
+            WindowSpec::Sliding(d) | WindowSpec::Fixed(d) => d.as_nanos() as i64,
+        };
+        let mut expired_keys: Vec<(InstanceKey, i64)> = Vec::new();
         for (key, inst) in &self.instances {
             if watermark_nanos.saturating_sub(inst.created_at) >= maxspan_nanos {
                 expired_keys.push((key.clone(), inst.created_at));
@@ -419,7 +448,7 @@ impl CepStateMachine {
     pub fn close_all(&mut self, reason: CloseReason) -> Vec<CloseOutput> {
         // Sort by (created_at, key) for fully deterministic rate limiting
         // order, same rationale as scan_expired_at.
-        let mut keys: Vec<(String, i64)> = self
+        let mut keys: Vec<(InstanceKey, i64)> = self
             .instances
             .iter()
             .map(|(k, inst)| (k.clone(), inst.created_at))

@@ -35,8 +35,8 @@ fn match_clause(input: &mut &str) -> ModalResult<MatchClause> {
     ws_skip.parse_next(input)?;
     cut_err(literal("<")).parse_next(input)?;
 
-    // Parse keys (may be empty) and duration
-    let (keys, duration) = cut_err(match_params).parse_next(input)?;
+    // Parse keys (may be empty), duration, and optional window mode
+    let (keys, duration, window_mode) = cut_err(match_params).parse_next(input)?;
 
     cut_err(literal(">")).parse_next(input)?;
     ws_skip.parse_next(input)?;
@@ -65,13 +65,14 @@ fn match_clause(input: &mut &str) -> ModalResult<MatchClause> {
         keys,
         key_mapping,
         duration,
+        window_mode,
         on_event,
         on_close,
     })
 }
 
-/// Parse match params: `[key, key, ...] : duration`
-fn match_params(input: &mut &str) -> ModalResult<(Vec<FieldRef>, std::time::Duration)> {
+/// Parse match params: `[key, key, ...] : duration [:fixed]`
+fn match_params(input: &mut &str) -> ModalResult<(Vec<FieldRef>, std::time::Duration, WindowMode)> {
     ws_skip.parse_next(input)?;
 
     // If starts with ':', no keys
@@ -94,7 +95,21 @@ fn match_params(input: &mut &str) -> ModalResult<(Vec<FieldRef>, std::time::Dura
         .parse_next(input)?;
     ws_skip.parse_next(input)?;
 
-    Ok((keys, dur))
+    // Optional :fixed suffix
+    let window_mode = if opt(literal(":")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        cut_err(kw("fixed"))
+            .context(StrContext::Expected(StrContextValue::Description(
+                "'fixed'",
+            )))
+            .parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        WindowMode::Fixed
+    } else {
+        WindowMode::Sliding
+    };
+
+    Ok((keys, dur, window_mode))
 }
 
 // ---------------------------------------------------------------------------

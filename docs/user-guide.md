@@ -1684,7 +1684,7 @@ WFL 功能按 L1/L2/L3 分层，渐进式开放。
 |------|------|
 | `\|>` 多级管道 | 级联规则 |
 | `conv { ... }` | 结果集变换 |
-| `tumble` | 固定间隔窗口 |
+| `fixed` | 固定间隔窗口 |
 | `session(gap)` | 会话窗口 |
 | `collect_set`/`collect_list`/`first`/`last` | 集合函数 |
 | `stddev`/`percentile` | 统计函数 |

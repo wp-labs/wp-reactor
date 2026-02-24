@@ -153,3 +153,63 @@ rule r {
     assert_eq!(close_steps[0].branches[0].pipe.measure, Measure::Count);
     assert_eq!(close_steps[0].branches[0].pipe.cmp, CmpOp::Eq);
 }
+
+// -----------------------------------------------------------------------
+// Fixed window
+// -----------------------------------------------------------------------
+
+#[test]
+fn parse_fixed_window() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<sip:1h:fixed> {
+        on event { e | count >= 1; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let mc = &file.rules[0].match_clause;
+    assert_eq!(mc.keys, vec![FieldRef::Simple("sip".into())]);
+    assert_eq!(mc.duration, Duration::from_secs(3600));
+    assert_eq!(mc.window_mode, WindowMode::Fixed);
+}
+
+#[test]
+fn parse_sliding_default() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<sip:5m> {
+        on event { e | count >= 1; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let mc = &file.rules[0].match_clause;
+    assert_eq!(mc.duration, Duration::from_secs(300));
+    assert_eq!(mc.window_mode, WindowMode::Sliding);
+}
+
+#[test]
+fn parse_fixed_no_keys() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<:10s:fixed> {
+        on event { e | count >= 1; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let mc = &file.rules[0].match_clause;
+    assert!(mc.keys.is_empty());
+    assert_eq!(mc.duration, Duration::from_secs(10));
+    assert_eq!(mc.window_mode, WindowMode::Fixed);
+}

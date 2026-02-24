@@ -86,7 +86,7 @@ runtime: runtime/wfusion.toml
 - 场景：情报关联、异常偏离、集合判定、实体建模、可解释评分。
 
 ### L3（高级，feature gate）
-- `|>`、`conv`、`tumble`、隐式中间窗口。
+- `|>`、`conv`、`fixed`、隐式中间窗口。
 - 场景：多级聚合、Top-N、固定间隔报表、后处理。
 
 > 默认启用 L1/L2；L3 需显式开启 `features: ["l3"]`。
@@ -116,7 +116,7 @@ runtime: runtime/wfusion.toml
 | `baseline()` 基线偏离 | | ✓ | |
 | `window.has(field)` 集合判定 | | ✓ | |
 | `entity(type, id_expr)` 实体声明 | ✓ | | |
-| `tumble` 固定间隔窗口 | | | ✓ |
+| `fixed` 固定间隔窗口 | | | ✓ |
 | `conv { ... }` 结果集变换 | | | ✓ |
 | `\|>` 多级管道 | | | ✓ |
 | 隐式 yield / 隐式 window | | | ✓ |
@@ -142,7 +142,7 @@ runtime: runtime/wfusion.toml
 
 **时间函数**：
 - `time_diff(t1, t2)` → float：两时间戳间隔（秒），用于响应时延分析、会话间隔计算。
-- `time_bucket(field, interval)` → time：时间分桶，配合 `tumble` 做时间粒度归并。
+- `time_bucket(field, interval)` → time：时间分桶，配合 `fixed` 做时间粒度归并。
 
 **字符串函数**：
 - `contains(field, pattern)` → bool：子串包含判定。
@@ -160,7 +160,7 @@ runtime: runtime/wfusion.toml
 
 **会话窗口**：`match<key:session(gap)>`
 - 按活动间隔自动分割会话：相邻事件时间差超过 `gap` 即切分新窗口。
-- 与滑动窗口（固定时长）和 tumble（固定间隔）互补；适用于用户登录会话、操作序列等不规则时间跨度场景。
+- 与滑动窗口（固定时长）和 fixed（固定间隔）互补；适用于用户登录会话、操作序列等不规则时间跨度场景。
 - `gap` 为 DURATION 类型，语义为"静默超时"。
 
 **统计函数**：
@@ -258,7 +258,7 @@ base_type     = "chars" | "digit" | "float" | "bool" | "time" | "ip" | "hex" ;
 
 ## 7. WFL 文法
 
-> L3 特性（`|>`、`conv`、`tumble`）以 `(* L3 *)` 标注。L1/L2 实现可忽略带 L3 标注的产生式。
+> L3 特性（`|>`、`conv`、`fixed`）以 `(* L3 *)` 标注。L1/L2 实现可忽略带 L3 标注的产生式。
 
 ```ebnf
 wfl_file      = { use_decl } , { rule_decl } , { contract_block } ;
@@ -279,7 +279,7 @@ match_params  = [ field_ref , { "," , field_ref } ] , ":" , window_spec ;
 key_block     = "key" , "{" , key_item , { key_item } , "}" ;
 key_item      = IDENT , "=" , field_ref , ";" ;
 window_spec   = DURATION                              (* 滑动窗口 *)
-              | DURATION , ":" , "tumble"              (* 固定间隔窗口，L3 *)
+              | DURATION , ":" , "fixed"              (* 固定间隔窗口，L3 *)
               | "session" , "(" , DURATION , ")"  ;    (* 会话窗口，L3 行为分析 *)
 on_event_block= "on" , "event" , "{" , match_step , { match_step } , "}" ;
 on_close_block= "on" , "close" , "{" , match_step , { match_step } , "}" ;
@@ -484,7 +484,7 @@ match<sip:5m> {
 - 若省略 `on close`，关闭阶段视为恒为 true，不额外阻断命中。
 - `null` 与运行时异常按 `runtime.eval.mode` 执行（`strict` 或 `lenient`），避免规则结果漂移。
 - `join`：固定 LEFT JOIN 语义。
-- `conv`：仅 `tumble` 可用。
+- `conv`：仅 `fixed` 可用。
 - 规则发布时，编译器同时校验 `limits`、契约版本兼容性与 conformance 套件结果。
 
 ---
@@ -962,7 +962,7 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 ### 12.5 Pipeline/Conv
 - `|>` 后续 stage 禁止 `events`。
 - `yield`/`conv` 仅末 stage 可出现。
-- `conv` 仅 tumble 模式可用。
+- `conv` 仅 fixed 模式可用。
 
 **`|>` 展开语义：**
 
@@ -1155,7 +1155,7 @@ rule null_semantics_demo {
   events {
     e: endpoint_events
   }
-  match<host_id:1h:tumble> {
+  match<host_id:1h:fixed> {
     on close {
       e | count >= 1;
     }
@@ -1497,7 +1497,7 @@ rule entity_risk_score {
     e: endpoint_events
     ps: endpoint_events && contains(lower(process), "powershell")
   }
-  match<host_id:1h:tumble> {
+  match<host_id:1h:fixed> {
     on close {
       e | count >= 1;
     }
@@ -1534,7 +1534,7 @@ rule login_anomaly {
   events {
     login: auth_events && action == "success"
   }
-  match<uid:1h:tumble> {
+  match<uid:1h:fixed> {
     on close {
       login | count >= 1;
     }

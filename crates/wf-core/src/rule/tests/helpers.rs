@@ -87,6 +87,31 @@ pub fn plan_with_close(
     }
 }
 
+pub fn fixed_plan(keys: Vec<FieldRef>, dur: Duration, steps: Vec<StepPlan>) -> MatchPlan {
+    MatchPlan {
+        keys,
+        key_map: None,
+        window_spec: WindowSpec::Fixed(dur),
+        event_steps: steps,
+        close_steps: vec![],
+    }
+}
+
+pub fn fixed_plan_with_close(
+    keys: Vec<FieldRef>,
+    dur: Duration,
+    event_steps: Vec<StepPlan>,
+    close_steps: Vec<StepPlan>,
+) -> MatchPlan {
+    MatchPlan {
+        keys,
+        key_map: None,
+        window_spec: WindowSpec::Fixed(dur),
+        event_steps,
+        close_steps,
+    }
+}
+
 pub fn close_reason_guard(reason: &str) -> Expr {
     Expr::BinOp {
         op: BinOp::Eq,

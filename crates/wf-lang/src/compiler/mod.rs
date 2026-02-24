@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::ast::{EntityTypeVal, FieldRef, RuleDecl, WflFile};
+use crate::ast::{EntityTypeVal, FieldRef, RuleDecl, WflFile, WindowMode};
 use crate::checker::check_wfl;
 use crate::plan::{
     AggPlan, BindPlan, BranchPlan, EntityPlan, ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan,
@@ -111,7 +111,10 @@ fn compile_match(rule: &RuleDecl) -> MatchPlan {
     MatchPlan {
         keys,
         key_map,
-        window_spec: WindowSpec::Sliding(mc.duration),
+        window_spec: match mc.window_mode {
+            WindowMode::Sliding => WindowSpec::Sliding(mc.duration),
+            WindowMode::Fixed => WindowSpec::Fixed(mc.duration),
+        },
         event_steps: mc.on_event.iter().map(compile_step).collect(),
         close_steps: mc
             .on_close

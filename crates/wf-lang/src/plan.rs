@@ -70,6 +70,8 @@ pub struct KeyMapPlan {
 pub enum WindowSpec {
     /// Sliding window with a fixed duration.
     Sliding(Duration),
+    /// Fixed window with a fixed duration (non-overlapping buckets).
+    Fixed(Duration),
 }
 
 /// One match step containing one or more OR branches.

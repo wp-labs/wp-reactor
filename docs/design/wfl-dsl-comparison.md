@@ -13,7 +13,7 @@
 | 时序链 | `match` 多步 + OR 分支 | `$e1 before $e2` | `sequence by` | ✗ | `transaction` | ✗ |
 | 双阶段匹配 | `on event` + `on close` | 仅 match section | ✗ | ✗ | ✗ | ✗ |
 | 多维分组 | `match<f1,f2:dur>` 复合键 | `match` 单字段 | `by f1,f2` | ✗ | `by f1,f2` | `by f1,f2` |
-| 固定间隔窗口 | `match<key:1h:tumble>` (L3) | ✗ | ✗ | ✗ | `timechart span=` | `bin(time, 1h)` |
+| 固定间隔窗口 | `match<key:1h:fixed>` (L3) | ✗ | ✗ | ✗ | `timechart span=` | `bin(time, 1h)` |
 | 会话窗口 | `match<key:session(gap)>` (L3) | ✗ | ✗ | ✗ | `transaction maxpause=` | ✗（需手写） |
 | 聚合 | `count/sum/avg/min/max/distinct` | `#e > 3` | ✗ | `count`（基础） | `stats` 全功能 | `summarize` 全功能 |
 | 统计函数 | `stddev`/`percentile` (L3) | ✗ | ✗ | ✗ | `stdev`/`perc95` 等 | `stdev`/`percentile` |
@@ -56,7 +56,7 @@
 |------|---------|------------|
 | 时序链 | `match` 多步 + OR 分支 + `on close` 缺失检测 | `$e1 before $e2` 语法更简洁 |
 | 双阶段匹配 | `on event`（实时求值）+ `on close`（窗口关闭求值）显式分离 | 仅 match section，无双阶段概念 |
-| 聚合 | 6 个基础聚合 + `stddev`/`percentile` + `conv` + `tumble` | 基础（仅 `#e > N`） |
+| 聚合 | 6 个基础聚合 + `stddev`/`percentile` + `conv` + `fixed` | 基础（仅 `#e > N`） |
 | 行为分析 | session window + `collect_set`/`first`/`last` + `baseline` + `score` | 无 |
 | 表达式 | `if/then/else` + `hit()` + 字符串/时间函数 + `in`/`not in` | 仅基础条件 |
 | 风险评分 | `-> score(expr)` 单通道 + `-> score { item @ weight }` 分项可解释 + 跨规则累加 | ✗ |
@@ -75,7 +75,7 @@
 |------|---------|---------|
 | 时序链 | 多步 + OR 分支 + `on close` 缺失检测 | `sequence by ... with maxspan` 一行式更紧凑 |
 | 双阶段匹配 | `on event` + `on close` | 无 |
-| 聚合 | 完整聚合 + 统计函数 + `conv` + `tumble` | 无聚合能力 |
+| 聚合 | 完整聚合 + 统计函数 + `conv` + `fixed` | 无聚合能力 |
 | 行为分析 | session window + collect 函数 + baseline + score | 无 |
 | 风险评分 | `-> score(expr)` + 分项可解释评分 + 实体声明 | 无 |
 | 字符串 | `contains`/`regex_match`/`len`/`lower`/`upper` | `match`/`wildcard`/`length`/`stringContains` |
@@ -89,7 +89,7 @@
 
 | 维度 | WFL 优势 | Sigma 优势 |
 |------|---------|-----------|
-| 表达力 | 时序链、双阶段匹配、聚合、join、conv、tumble、session、baseline、score | 仅单事件匹配 |
+| 表达力 | 时序链、双阶段匹配、聚合、join、conv、fixed、session、baseline、score | 仅单事件匹配 |
 | 行为分析 | session window + collect + 统计函数 + baseline + 可解释风险评分 + 实体建模 | 无 |
 | 可移植性 | 绑定 WarpFusion 引擎 | 平台无关，可编译到任何 SIEM |
 | 社区 | 无 | 5000+ 开源规则，社区庞大 |
@@ -110,7 +110,7 @@
 | 统一输出 | `yield` 告警+归并+行为分析统一 | 告警是平台层，非语言层 |
 | 基线偏离 | `baseline(expr, dur, method)` 内置 + 持久化 | 无内置（需 MLTK 外部模块） |
 | 风险等级 | `score` → runtime `level_map` 可版本化映射 | 无内置概念 |
-| 聚合深度 | 基础聚合 + `stddev`/`percentile` + `conv` + `tumble` | **仍超** — `eventstats/streamstats` + 无限管道 + 200+ 函数 |
+| 聚合深度 | 基础聚合 + `stddev`/`percentile` + `conv` + `fixed` | **仍超** — `eventstats/streamstats` + 无限管道 + 200+ 函数 |
 | 集合收集 | `collect_set`/`collect_list`/`first`/`last` | `values`/`list`/`first`/`last` 功能等价 |
 | 条件表达式 | `if/then/else` + `hit()` 覆盖核心场景 | `eval if()`/`case()` + 完整表达式引擎 |
 | 字符串函数 | `contains`/`regex_match`/`len`/`lower`/`upper` | **远超** — `replace`/`substr`/`split`/`mvindex` 等 200+ |
@@ -132,7 +132,7 @@
 | 基线偏离 | `baseline(expr, dur, method)` 内置 + 持久化 | 无（Sentinel Fusion 依赖 ML 模型） |
 | 风险等级 | `score` → runtime `level_map` 配置化映射 | 无 |
 | 统一输出 | `yield` | 无 |
-| 聚合 | `conv` + `tumble` + `stddev`/`percentile` 覆盖主场景 | `summarize` 全功能 + `make-series` 时序分析 |
+| 聚合 | `conv` + `fixed` + `stddev`/`percentile` 覆盖主场景 | `summarize` 全功能 + `make-series` 时序分析 |
 | 集合收集 | `collect_set`/`collect_list`/`first`/`last` | `make_set`/`make_list`/`arg_min`/`arg_max` 功能等价 |
 | 条件表达式 | `if/then/else` + `hit()` | `iff()`/`case()` 功能等价 |
 | 可视化集成 | 无（交给下游） | Sentinel 工作簿深度集成 |
@@ -169,12 +169,12 @@
 
 ## 4. 与 SPL/KQL 聚合差距分析
 
-WFL 设计初期与 SPL/KQL 在聚合能力上存在多项差距，经过 `tumble`、`conv`、`|>` 等机制的引入，以及行为分析扩展（`if/then/else`、`hit()`、字符串/时间/集合/统计函数），差距已大幅缩小：
+WFL 设计初期与 SPL/KQL 在聚合能力上存在多项差距，经过 `fixed`、`conv`、`|>` 等机制的引入，以及行为分析扩展（`if/then/else`、`hit()`、字符串/时间/集合/统计函数），差距已大幅缩小：
 
 | 维度 | 差距状态 | WFL 实现 | SPL 对应 |
 |------|---------|---------|---------|
 | 多维分组 | **已消除** | `match<sip,dport:5m>` 复合键 | `stats ... by f1, f2` |
-| 时间分桶 | **已消除** | `match<sip:1h:tumble>` 固定间隔窗口 (L3) | `timechart span=1h` |
+| 时间分桶 | **已消除** | `match<sip:1h:fixed>` 固定间隔窗口 (L3) | `timechart span=1h` |
 | Top-N / 排序 / 去重 | **已消除** | `conv { sort(-f) \| top(10) ; }` (L3) | `sort / head / dedup` |
 | 后聚合过滤 | **已消除** | `conv { where(count > 5) ; }` (L3) | `\| where count > 5` |
 | 条件表达式 | **已消除** | `if c then a else b` + `hit(c)` (L2) | `eval if(c,a,b)` |

@@ -9,7 +9,9 @@ pub(super) fn extract_rule_structure(
     rule_plan: &RulePlan,
     alias_map: &AliasMap,
 ) -> anyhow::Result<RuleStructure> {
-    let WindowSpec::Sliding(window_dur) = rule_plan.match_plan.window_spec;
+    let window_dur = match rule_plan.match_plan.window_spec {
+        WindowSpec::Sliding(d) | WindowSpec::Fixed(d) => d,
+    };
 
     let keys: Vec<String> = rule_plan
         .match_plan

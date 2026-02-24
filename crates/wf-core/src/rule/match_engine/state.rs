@@ -64,7 +64,11 @@ pub(super) struct Instance {
 }
 
 impl Instance {
-    pub(super) fn new(plan: &MatchPlan, scope_key: Vec<Value>, now_nanos: i64) -> Self {
+    /// Create a new instance with the given `created_at` timestamp.
+    ///
+    /// For sliding windows, `created_at` is the event time.
+    /// For fixed windows, `created_at` is the bucket start.
+    pub(super) fn new_at(plan: &MatchPlan, scope_key: Vec<Value>, created_at: i64) -> Self {
         let step_states = plan
             .event_steps
             .iter()
@@ -77,8 +81,8 @@ impl Instance {
             .collect();
         Self {
             scope_key,
-            created_at: now_nanos,
-            last_event_nanos: now_nanos,
+            created_at,
+            last_event_nanos: created_at,
             current_step: 0,
             event_ok: false,
             step_states,
@@ -136,9 +140,9 @@ impl Instance {
         size
     }
 
-    pub(super) fn reset(&mut self, plan: &MatchPlan, now_nanos: i64) {
-        self.created_at = now_nanos;
-        self.last_event_nanos = now_nanos;
+    pub(super) fn reset(&mut self, plan: &MatchPlan, created_at: i64) {
+        self.created_at = created_at;
+        self.last_event_nanos = created_at;
         self.current_step = 0;
         self.event_ok = false;
         self.step_states = plan

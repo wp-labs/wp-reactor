@@ -3,6 +3,42 @@ use wf_lang::ast::FieldRef;
 use super::types::{Event, Value};
 
 // ---------------------------------------------------------------------------
+// Instance key — structured, unambiguous map key
+// ---------------------------------------------------------------------------
+
+/// Structured instance key for the `CepStateMachine` instances map.
+///
+/// For sliding windows: `scope_key` identifies the instance, `bucket_start`
+/// is `None`. For fixed windows: each `(scope_key, bucket_start)` pair is
+/// a separate instance.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) struct InstanceKey {
+    pub scope_key_str: String,
+    pub bucket_start: Option<i64>,
+}
+
+impl InstanceKey {
+    pub fn sliding(scope_key: &[Value]) -> Self {
+        Self {
+            scope_key_str: make_scope_key_str(scope_key),
+            bucket_start: None,
+        }
+    }
+
+    pub fn fixed(scope_key: &[Value], bucket_start: i64) -> Self {
+        Self {
+            scope_key_str: make_scope_key_str(scope_key),
+            bucket_start: Some(bucket_start),
+        }
+    }
+
+    /// Check if this key belongs to the given scope (ignoring bucket).
+    pub fn matches_scope(&self, scope_key_str: &str) -> bool {
+        self.scope_key_str == scope_key_str
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Key extraction
 // ---------------------------------------------------------------------------
 
@@ -89,7 +125,7 @@ pub(crate) fn field_ref_name(fr: &FieldRef) -> &str {
     }
 }
 
-pub(super) fn make_instance_key(scope_key: &[Value]) -> String {
+pub(super) fn make_scope_key_str(scope_key: &[Value]) -> String {
     scope_key
         .iter()
         .map(value_to_string)

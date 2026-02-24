@@ -6,13 +6,21 @@ use super::*;
 // Match clause
 // ---------------------------------------------------------------------------
 
-/// `match<keys:dur> { [key {...}] on event { ... } [on close { ... }] }`
+/// Window mode: sliding (default) or fixed (L3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowMode {
+    Sliding,
+    Fixed,
+}
+
+/// `match<keys:dur[:fixed]> { [key {...}] on event { ... } [on close { ... }] }`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct MatchClause {
     pub keys: Vec<FieldRef>,
     pub key_mapping: Option<Vec<KeyMapItem>>,
     pub duration: Duration,
+    pub window_mode: WindowMode,
     pub on_event: Vec<MatchStep>,
     pub on_close: Option<Vec<MatchStep>>,
 }

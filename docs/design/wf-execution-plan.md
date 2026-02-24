@@ -21,7 +21,7 @@ M15a CEP 事件时间语义       M19 告警系统           ✅   M23 监控+�
 M16 RuleExecutor+join       M20 ★ E2E MVP 验收    ✅   M24 开发者工具链
 
 阶段 VII ─ WFL L2         阶段 VIII ─ L3+Conformance   阶段 IX ─ 可靠性分级   阶段 X ─ 分布式
-M25 join+baseline+has      M27 tumble+conv+pattern      M29 传输可靠性三档      M30 分布式 V2
+M25 join+baseline+has      M27 fixed+conv+pattern      M29 传输可靠性三档      M30 分布式 V2
     +key映射+limits            +explain/lint/fmt             +WAL/ACK/replay
 M26 条件/字符串/时间       M28 |> 管道+行为分析            +幂等/指标验证
     +replay+yield契约            +shuffle 契约
@@ -302,7 +302,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 
 ## 阶段 VII：WFL L2 语言增强（M25–M26）
 
-### M25：L2 关联、基线、集合判定与语义增强
+### M25：L2 关联、基线、集合判定与语义增强 ✅
 
 | 项目 | 内容 |
 |------|------|
@@ -311,7 +311,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 依赖 | M20（MVP 稳定后） |
 | 验收 | 情报关联场景（IP 命中威胁情报）；基线偏离场景（登录频率异常）；集合判定场景（IP 在黑名单中）；显式 key 映射多源 join 测试；snapshot / asof 语义正确性测试；limits 触发 throttle / drop_oldest 行为测试 |
 
-### M26：L2 条件表达式、函数扩展、回放与输出契约
+### M26：L2 条件表达式、函数扩展、回放与输出契约 ✅
 
 | 项目 | 内容 |
 |------|------|
@@ -329,9 +329,9 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-lang` + `wf-core` |
-| 范围 | `match<key:dur:tumble>` 固定间隔窗口：按 dur 对齐切分不重叠窗口，每个窗口独立聚合；`conv { sort(-field) \| top(10) \| dedup(field) \| where(expr) ; }` 结果集变换：排序 / Top-N / 去重 / 后聚合过滤；**§17 P1-1 可组合规则片段**：`pattern name(params) { ... }` 参数化片段，编译期展开到标准 RulePlan，不可引入隐式副作用，`wf explain` 可完整还原 |
+| 范围 | `match<key:dur:fixed>` 固定间隔窗口：按 dur 对齐切分不重叠窗口，每个窗口独立聚合；`conv { sort(-field) \| top(10) \| dedup(field) \| where(expr) ; }` 结果集变换：排序 / Top-N / 去重 / 后聚合过滤；**§17 P1-1 可组合规则片段**：`pattern name(params) { ... }` 参数化片段，编译期展开到标准 RulePlan，不可引入隐式副作用，`wf explain` 可完整还原 |
 | 依赖 | M26（L2 稳定后）；需 feature gate `l3` |
-| 验收 | tumble 时间分桶聚合场景；Top-N 统计场景（每小时端口扫描最多的 10 个 IP）；pattern 片段展开正确性测试；`wf explain` 还原展开前后一致 |
+| 验收 | fixed 时间分桶聚合场景；Top-N 统计场景（每小时端口扫描最多的 10 个 IP）；pattern 片段展开正确性测试；`wf explain` 还原展开前后一致 |
 
 ### M28：L3 多级管道、行为分析扩展与顺序一致性
 
@@ -467,7 +467,7 @@ M20 MVP 已完成，下一步两条路径可并行推进：
 | **V 运行时闭环** | M17–M20 | **单机 MVP：数据接收→规则执行→告警输出** | ✅ 已完成 |
 | **VI 生产化** | M21–M24 | 热加载、多通道告警、监控、工具链 | 进行中（M24 部分完成） |
 | **VII L2 增强** | M25–M26 | snapshot/asof / baseline / key 映射 / limits / 条件表达式 / yield@vN | ✅ 已完成 |
-| **VIII L3 + Conformance** | M27–M28 | tumble / conv / composable pattern / 多级管道 / shuffle 契约 | 待开始 |
+| **VIII L3 + Conformance** | M27–M28 | fixed / conv / composable pattern / 多级管道 / shuffle 契约 | 待开始 |
 | **IX 可靠性分级** | M29 | best_effort / at_least_once / exactly_once | 待开始 |
 | **X 分布式** | M30 | 多节点分布式部署 | 待开始 |
 | **支撑轨道（wf-datagen）** | M31–M33 | .wfg DSL / rule-aware oracle / 时序扰动压测 | ✅ 已完成 |
