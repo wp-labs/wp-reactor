@@ -63,9 +63,8 @@ cargo test -p wf-lang -- --nocapture   # 160 个测试，对照 test 用例理�
 |------|------|--------|
 | 2-1 | `crates/wf-config/src/types.rs` | `HumanDuration`("5m")、`ByteSize`("256MB") 的自定义 serde 反序列化 |
 | 2-2 | `crates/wf-config/src/window.rs` | `WindowDefaults` + `WindowOverride` 的 merge 逻辑 |
-| 2-3 | `crates/wf-config/src/alert.rs` | `SinkUri` 枚举、`file://` URI 解析 |
-| 2-4 | `crates/wf-config/src/fusion.rs` | `FusionConfig` 总结构，`impl FromStr` 解析 TOML |
-| 2-5 | `crates/wf-config/src/validate.rs` | over vs over_cap 交叉校验 |
+| 2-3 | `crates/wf-config/src/fusion.rs` | `FusionConfig` 总结构，`impl FromStr` 解析 TOML |
+| 2-4 | `crates/wf-config/src/validate.rs` | over vs over_cap 交叉校验 |
 
 ### 验证练习
 
@@ -98,7 +97,6 @@ cargo test -p wf-config -- --nocapture
 | 3B-4 | `crates/wf-core/src/rule/tests/close.rs` | on close 路径：flush/timeout → evaluate\_close → execute\_close |
 | 3B-5 | `crates/wf-core/src/rule/executor.rs` | `RuleExecutor`：`execute_match()` / `execute_close()` → `AlertRecord` |
 | 3B-6 | `crates/wf-core/src/alert/types.rs` | `AlertRecord` 字段：alert\_id 幂等键、score、close\_reason |
-| 3B-7 | `crates/wf-core/src/alert/sink.rs` | `AlertSink` trait + `FileAlertSink` + `FanOutSink` |
 
 ### 验证练习
 

@@ -162,7 +162,7 @@ tracing::info!(domain = "sys", schemas = 1, rules = 2, "engine bootstrap complet
 | `receiver` | — | `Receiver::run()` |
 | `handle_connection` | `peer` | `handle_connection()` |
 | `rule_task` | `task_id` | `run_rule_task()` |
-| `alert_sink` | — | `run_alert_sink()` |
+| `alert_dispatcher` | — | `run_alert_dispatcher()` |
 | `evictor` | — | `run_evictor()` |
 
 ## 5. 域宏使用

@@ -53,8 +53,8 @@ impl Reactor {
         let cancel = CancellationToken::new();
         let rule_cancel = CancellationToken::new();
 
-        // Phase 1: Load config & compile rules
-        let data = load_and_compile(&config, base_dir)?;
+        // Phase 1: Load config & compile rules + build sink dispatcher
+        let data = load_and_compile(&config, base_dir).await?;
         wf_info!(
             sys,
             schemas = data.schema_count,
@@ -65,7 +65,7 @@ impl Reactor {
         // Phase 2: Spawn task groups (start order: alert → evictor → rules → receiver)
         let mut groups: Vec<TaskGroup> = Vec::with_capacity(4);
 
-        let (alert_tx, alert_group) = spawn_alert_task(data.alert_sink);
+        let (alert_tx, alert_group) = spawn_alert_task(data.dispatcher);
         groups.push(alert_group);
 
         groups.push(spawn_evictor_task(

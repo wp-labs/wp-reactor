@@ -33,7 +33,7 @@ async fn e2e_brute_force_alert() {
     let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/test-artifacts/e2e_mvp");
     std::fs::create_dir_all(&artifact_dir).expect("failed to create artifact dir");
-    let alert_path = artifact_dir.join("alerts.jsonl");
+    let alert_path = artifact_dir.join("alerts/all.jsonl");
     // Clear any stale output from previous runs.
     let _ = std::fs::remove_file(&alert_path);
 
@@ -59,9 +59,12 @@ async fn e2e_brute_force_alert() {
         )
         .try_init();
 
-    // -- Build config from inline TOML with port 0 and tempdir alert sink --
+    // -- Build config from inline TOML with port 0 and connector-based sink routing --
     let toml_str = format!(
         r#"
+sinks = "sinks"
+work_root = "{}"
+
 [server]
 listen = "tcp://127.0.0.1:0"
 
@@ -90,13 +93,10 @@ mode = "local"
 max_window_bytes = "64MB"
 over_cap = "1h"
 
-[alert]
-sinks = ["file://{}"]
-
 [vars]
 FAIL_THRESHOLD = "3"
 "#,
-        alert_path.display()
+        artifact_dir.display()
     );
 
     let config: FusionConfig = toml_str.parse().expect("failed to parse config TOML");
@@ -160,7 +160,7 @@ FAIL_THRESHOLD = "3"
     drop(stream);
     reactor.wait().await.expect("reactor.wait failed");
 
-    // -- Verify alert output --
+    // -- Verify alert output (catch_all sink writes to alerts/all.jsonl) --
     let alert_content = std::fs::read_to_string(&alert_path)
         .unwrap_or_else(|e| panic!("failed to read alert file {}: {e}", alert_path.display()));
 

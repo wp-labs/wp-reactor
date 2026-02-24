@@ -7,8 +7,6 @@ pub enum CoreReason {
     WindowBuild,
     #[error("rule execution error")]
     RuleExec,
-    #[error("alert sink error")]
-    AlertSink,
     #[error("data format error")]
     DataFormat,
     #[error("{0}")]
@@ -20,7 +18,6 @@ impl ErrorCode for CoreReason {
         match self {
             Self::WindowBuild => 1001,
             Self::RuleExec => 1002,
-            Self::AlertSink => 1003,
             Self::DataFormat => 1004,
             Self::Uvs(u) => u.error_code(),
         }

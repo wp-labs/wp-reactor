@@ -42,16 +42,9 @@ pub(crate) fn validate(config: &FusionConfig) -> anyhow::Result<()> {
         }
     }
 
-    // alert.sinks must be non-empty and each URI must be parseable
-    // (unless new sink system is configured via `sinks` directory)
-    if config.sinks.is_none() {
-        if config.alert.sinks.is_empty() {
-            anyhow::bail!("alert.sinks must contain at least one sink URI");
-        }
-        for (i, uri) in config.alert.sinks.iter().enumerate() {
-            crate::alert::parse_sink_uri(uri)
-                .map_err(|e| anyhow::anyhow!("alert.sinks[{}]: {}", i, e))?;
-        }
+    // sinks path must be non-empty
+    if config.sinks.is_empty() {
+        anyhow::bail!("sinks must be a non-empty path to the sinks/ directory");
     }
 
     Ok(())
@@ -140,33 +133,10 @@ mod tests {
         assert!(validate_over_vs_over_cap(&windows, &overs).is_err());
     }
 
-    #[test]
-    fn reject_empty_alert_sinks() {
-        use crate::FusionConfig;
-        let toml = MINIMAL_TOML.replace(r#"sinks = ["file:///tmp/alerts.jsonl"]"#, "sinks = []");
-        let err = toml.parse::<FusionConfig>().unwrap_err();
-        assert!(
-            err.to_string().contains("at least one sink"),
-            "expected empty-sinks error, got: {err}",
-        );
-    }
-
-    #[test]
-    fn reject_unknown_sink_scheme() {
-        use crate::FusionConfig;
-        let toml = MINIMAL_TOML.replace(
-            r#"sinks = ["file:///tmp/alerts.jsonl"]"#,
-            r#"sinks = ["http://localhost:9200"]"#,
-        );
-        let err = toml.parse::<FusionConfig>().unwrap_err();
-        assert!(
-            err.to_string().contains("alert.sinks[0]"),
-            "expected indexed error, got: {err}",
-        );
-    }
-
     /// Minimal valid TOML for validation tests.
     const MINIMAL_TOML: &str = r#"
+sinks = "sinks"
+
 [server]
 listen = "tcp://127.0.0.1:9800"
 
@@ -184,8 +154,5 @@ evict_policy = "time_first"
 watermark = "5s"
 allowed_lateness = "0s"
 late_policy = "drop"
-
-[alert]
-sinks = ["file:///tmp/alerts.jsonl"]
 "#;
 }

@@ -1,3 +1,5 @@
+sinks = "sinks"
+
 [server]
 listen = "tcp://127.0.0.1:9800"
 
@@ -25,12 +27,6 @@ over_cap = "30m"
 mode = "local"
 max_window_bytes = "64MB"
 over_cap = "1h"
-
-[alert]
-sinks = ["file://alerts/wf-alerts.jsonl"]
-
-# Connector-based sink routing (when enabled, overrides alert.sinks above)
-# sinks = "sinks"
 
 [vars]
 FAIL_THRESHOLD = "3"

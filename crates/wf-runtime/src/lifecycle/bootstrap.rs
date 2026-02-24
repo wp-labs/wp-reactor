@@ -10,16 +10,18 @@ use wf_core::window::{Router, WindowRegistry};
 
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::schema_bridge::schemas_to_window_defs;
+use crate::sink_build::{SinkFactoryRegistry, build_sink_dispatcher};
+use crate::sink_factory::file::FileSinkFactory;
 
-use super::compile::{build_alert_sink, build_run_rules, compile_rules, load_schemas};
+use super::compile::{build_run_rules, compile_rules, load_schemas};
 use super::types::BootstrapData;
 
 // ---------------------------------------------------------------------------
-// Phase 1: load_and_compile — pure data transforms
+// Phase 1: load_and_compile — pure data transforms + async sink build
 // ---------------------------------------------------------------------------
 
-/// Load schemas, compile rules, validate config, build engines and alert sink.
-pub(super) fn load_and_compile(
+/// Load schemas, compile rules, validate config, build engines and sink dispatcher.
+pub(super) async fn load_and_compile(
     config: &FusionConfig,
     base_dir: &Path,
 ) -> RuntimeResult<BootstrapData> {
@@ -55,14 +57,27 @@ pub(super) fn load_and_compile(
     // 7. Build RunRules (precompute stream_name → alias routing)
     let rules = build_run_rules(&all_rule_plans, &all_schemas);
 
-    // 8. Build alert sink
-    let alert_sink = build_alert_sink(config, base_dir)?;
+    // 8. Build connector-based sink dispatcher
+    let sinks_dir = base_dir.join(&config.sinks);
+    let bundle = wf_config::sink::load_sink_config(&sinks_dir).owe_conf()?;
+    let mut factory_registry = SinkFactoryRegistry::new();
+    factory_registry.register(Arc::new(FileSinkFactory));
+    let work_root = config
+        .work_root
+        .as_ref()
+        .map(|p| base_dir.join(p))
+        .unwrap_or_else(|| base_dir.to_path_buf());
+    let dispatcher = Arc::new(
+        build_sink_dispatcher(&bundle, &factory_registry, &work_root)
+            .await
+            .owe(RuntimeReason::Bootstrap)?,
+    );
 
     let schema_count = all_schemas.len();
     Ok(BootstrapData {
         rules,
         router,
-        alert_sink,
+        dispatcher,
         schema_count,
         schemas: all_schemas,
     })

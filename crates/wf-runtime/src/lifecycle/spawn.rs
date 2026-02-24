@@ -8,7 +8,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use wf_config::FusionConfig;
-use wf_core::alert::{AlertRecord, AlertSink};
+use wf_core::alert::AlertRecord;
+use wf_core::sink::SinkDispatcher;
 use wf_core::window::{Evictor, Router, WindowRegistry};
 
 use crate::alert_task;
@@ -26,12 +27,12 @@ use super::types::{RunRule, TaskGroup};
 /// Spawn the alert pipeline: build channel, spawn consumer task.
 /// Returns (alert_tx, task_group).
 pub(super) fn spawn_alert_task(
-    alert_sink: Arc<dyn AlertSink>,
+    dispatcher: Arc<SinkDispatcher>,
 ) -> (mpsc::Sender<AlertRecord>, TaskGroup) {
     let (alert_tx, alert_rx) = mpsc::channel(alert_task::ALERT_CHANNEL_CAPACITY);
     let mut group = TaskGroup::new("alert");
     group.push(tokio::spawn(async move {
-        alert_task::run_alert_sink(alert_rx, alert_sink).await;
+        alert_task::run_alert_dispatcher(alert_rx, dispatcher).await;
         Ok(())
     }));
     (alert_tx, group)

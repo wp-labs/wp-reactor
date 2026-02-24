@@ -47,13 +47,14 @@ window auth_events {
 - **window** — 窗口配置（全局默认值 + 逐窗口覆盖 → 合并解析）
 - **server** — 服务端监听配置
 - **runtime** — 执行器并行度、规则超时、schema/rule 文件路径
-- **alert** — 告警输出 sink 配置
 - **fusion** — 顶层配置组装与解析入口
 - **validate** — 跨文件语义校验
 
 示例 `wfusion.toml`：
 
 ```toml
+sinks = "sinks"
+
 [server]
 listen = "tcp://127.0.0.1:9800"
 
@@ -75,9 +76,6 @@ late_policy = "drop"
 [window.auth_events]
 mode = "local"
 over_cap = "30m"
-
-[alert]
-sinks = ["file:///var/log/wf-alerts.jsonl"]
 ```
 
 ## 三文件模型

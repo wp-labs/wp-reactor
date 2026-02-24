@@ -1,4 +1,3 @@
-pub mod alert;
 pub mod fusion;
 pub mod logging;
 pub mod project;
@@ -9,7 +8,6 @@ pub mod types;
 pub mod validate;
 pub mod window;
 
-pub use alert::{AlertConfig, SinkUri, parse_sink_uri};
 pub use fusion::FusionConfig;
 pub use logging::{LogFormat, LoggingConfig};
 pub use project::{load_schemas, load_wfl, parse_vars};

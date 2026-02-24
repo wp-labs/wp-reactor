@@ -1,5 +1,5 @@
 # WarpFusion — 实时关联计算引擎设计方案
-<!-- 角色：架构师 / 技术决策者 | 状态：L1 已实现 | 创建：2026-02-13 | 更新：2026-02-23 -->
+<!-- 角色：架构师 / 技术决策者 | 状态：L1 已实现 | 创建：2026-02-13 | 更新：2026-02-24 -->
 
 ## 1. 背景与动机
 
@@ -40,7 +40,7 @@ WarpParse（wp-motor）是一个高性能日志解析引擎，核心能力是：
 - **规则命中（Hit）**：规则在某个窗口实例上满足 `on event`/`on close` 条件。
 - **风险告警（Risk Alert）**：规则命中后输出的业务结果，核心字段为 `rule_name + score + entity_type/entity_id`（可含 `close_reason`、`score_contrib`）。
 - **运维告警（Ops Alert）**：对系统运行状态（断连、积压、丢弃率）的监控告警，区别于业务风险告警。
-- 代码中的 `AlertRecord` / `AlertSink` 保留原命名，但语义统一指“风险告警记录/输出通道”。
+- 代码中的 `AlertRecord` 保留原命名，但语义统一指”风险告警记录”。
 
 ### 1.5 当前实现状态（L1）
 
@@ -48,7 +48,8 @@ WarpParse（wp-motor）是一个高性能日志解析引擎，核心能力是：
 
 - **WFL 编译器**：.wfs + .wfl 解析 → 语义检查 → 编译为 `RulePlan`（CEP 状态机 + score/entity/yield 求值计划）
 - **CEP 引擎**：基于 scope-key 的状态机实例管理，支持 `on event` / `on close` 双阶段求值
-- **运行时闭环**：TCP 接收 Arrow IPC → Window 缓冲 → 规则执行 → 风险告警输出（File Sink）
+- **运行时闭环**：TCP 接收 Arrow IPC → Window 缓冲 → 规则执行 → 风险告警输出（Connector SinkDispatcher）
+- **告警输出**：Connector 模式（yield-target 路由 SinkDispatcher，基于 wp-connector-api）
 - **开发者工具**：`wf-proj`（explain / lint / fmt）、`wf-datagen`（测试数据生成 + oracle + verify）
 - **传输层**：Best-Effort 模式，Arrow IPC over TCP
 
@@ -106,7 +107,8 @@ WarpParse (wp-motor) ×N                WarpFusion (wp-reactor，独立进程)
 │   └ Arrow (新增) │                  │    ↓ cursor-based read_since             │
 └──────────────────┘                  │  CepStateMachine + RuleExecutor           │
                                       │    ↓                                     │
-wp-reactor Node X ─TCP─┐              │  AlertSink (风险告警输出: File)            │
+wp-reactor Node X ─TCP─┐              │  SinkDispatcher (风险告警输出)          │
+                       │              │    └ yield-target 路由                 │
 wp-reactor Node Y ─TCP─┼──→ 同一端口  │                                          │
                        └──→           │  Evictor (定期淘汰过期窗口数据)            │
                                       └──────────────────────────────────────────┘
@@ -186,7 +188,8 @@ v2.1 起，WarpFusion 支持 `best_effort / at_least_once / exactly_once` 三档
 7. append 成功后通过 Notify 唤醒关联的 RuleTask
 8. RuleTask 通过 read_since(cursor) 拉取新数据，转换为 Event 后推进 CepStateMachine
 9. 状态机 on event 命中后，RuleExecutor 求值 score/entity，生成 AlertRecord
-10. AlertRecord 通过 mpsc channel 发送到 AlertSink 任务，写入 JSON Lines 文件
+10. AlertRecord 通过 mpsc channel 发送到 alert dispatcher 任务：
+    - 序列化为 JSON，由 SinkDispatcher 按 yield_target 路由到匹配的 sink 组
 11. Evictor 定期淘汰过期窗口数据（时间淘汰 + 内存淘汰）
 12. 关闭：先停 Receiver，通过 rule_cancel 触发规则最终 drain+flush，LIFO 逆序 join
 ```
@@ -218,8 +221,13 @@ wp-labs/
     │   │   └── security.wfs
     │   ├── rules/
     │   │   └── brute_force.wfl
-    │   └── scenarios/
-    │       └── brute_force.wfg
+    │   ├── scenarios/
+    │   │   └── brute_force.wfg
+    │   └── sinks/             # Connector-based sink 路由配置
+    │       ├── defaults.toml
+    │       ├── sink.d/        # Connector 定义
+    │       ├── business.d/    # 业务路由组（按 yield-target 匹配）
+    │       └── infra.d/       # 基础设施组（default / error）
     └── docs/                  # 工程文档
 ```
 
@@ -236,11 +244,11 @@ wp-labs/
 ```
 wf-lang  (纯同步，无运行时依赖)
   ↑
-wf-config  (依赖 wf-lang 做 .wfs 解析和变量预处理)
+wf-config  (依赖 wf-lang + wp-connector-api，配置解析 + sink 路由配置)
   ↑
-wf-core  (依赖 wf-config + wf-lang，核心引擎逻辑)
+wf-core  (依赖 wf-config + wf-lang + wp-connector-api，核心引擎逻辑 + sink 调度)
   ↑
-wf-runtime  (依赖 wf-core + wp-arrow，异步运行时)
+wf-runtime  (依赖 wf-core + wp-arrow + wp-connector-api，异步运行时 + sink 工厂)
   ↑
 wf-engine  (依赖 wf-config + wf-runtime，引擎二进制)
 
@@ -277,7 +285,7 @@ wf-lang/
 
 ### 3.4 wf-core（核心引擎）
 
-Window 缓冲、CEP 状态机、规则执行、告警输出。同步 API（仅依赖 tokio::sync 的 Notify/RwLock）。
+Window 缓冲、CEP 状态机、规则执行、告警输出、sink 调度。同步与异步混合 API。
 
 ```
 wf-core/
@@ -296,8 +304,11 @@ wf-core/
     │   └── event_bridge.rs    # batch_to_events: RecordBatch → Vec<Event>
     ├── alert/
     │   ├── mod.rs
-    │   ├── types.rs           # AlertRecord（alert_id, score, entity, fired_at...）
-    │   └── sink.rs            # AlertSink trait + FileAlertSink + FanOutSink
+    │   └── types.rs           # AlertRecord（alert_id, score, entity, fired_at, yield_target...）
+    ├── sink/
+    │   ├── mod.rs
+    │   ├── dispatch.rs        # SinkDispatcher: yield-target 路由引擎（connector 模式）
+    │   └── runtime.rs         # SinkRuntime: 封装 wp-connector-api SinkHandle
     └── error.rs               # CoreError（基于 orion-error 结构化错误）
 ```
 
@@ -309,11 +320,25 @@ Tokio 异步运行时，管理任务生命周期。
 wf-runtime/
 └── src/
     ├── lib.rs
-    ├── lifecycle.rs           # Reactor: 启动引导 + 任务编排 + 两阶段关闭
+    ├── lifecycle/             # Reactor 生命周期管理
+    │   ├── mod.rs             # Reactor: 启动引导 + 任务编排 + 两阶段关闭
+    │   ├── bootstrap.rs       # load_and_compile: 配置加载 + 规则编译
+    │   ├── compile.rs         # 模式编译: schemas/rules 构建
+    │   ├── spawn.rs           # 任务组创建: alert/evictor/rules/receiver
+    │   ├── signal.rs          # wait_for_signal: SIGINT + SIGTERM
+    │   └── types.rs           # TaskGroup, RunRule, BootstrapData
     ├── receiver.rs            # Receiver: TCP 监听 + Arrow IPC 解码 + 路由
-    ├── engine_task.rs         # RuleTask: per-rule pull-based 规则执行循环
-    ├── alert_task.rs          # run_alert_sink: channel-close-driven 告警写入
+    ├── engine_task/           # RuleTask: per-rule pull-based 规则执行循环
+    │   ├── mod.rs
+    │   ├── rule_task.rs       # run_rule_task: Notify + cursor 驱动的事件处理
+    │   ├── task_types.rs      # RuleTaskConfig, WindowSource
+    │   └── window_lookup.rs   # 窗口查找辅助
+    ├── alert_task.rs          # run_alert_dispatcher（connector sink 路由）
     ├── evictor_task.rs        # run_evictor: 定时淘汰
+    ├── sink_build.rs          # SinkFactoryRegistry + build_sink_dispatcher
+    ├── sink_factory/          # Sink 工厂实现
+    │   ├── mod.rs
+    │   └── file.rs            # FileSinkFactory: 异步文件写入（tokio BufWriter）
     ├── schema_bridge.rs       # WindowSchema + WindowConfig → WindowDef 转换
     └── error.rs               # RuntimeError（基于 orion-error）
 ```
@@ -328,7 +353,17 @@ wf-config/
     ├── server.rs              # ServerConfig: listen 地址
     ├── runtime.rs             # RuntimeConfig: schemas/rules glob、并行度
     ├── window.rs              # WindowConfig, WindowDefaults, WindowOverride
-    ├── alert.rs               # AlertConfig, SinkUri（目前仅 file://）
+    ├── sink/                  # Connector-based sink 路由配置
+    │   ├── mod.rs             # 模块导出
+    │   ├── connector.rs       # ConnectorDefRaw, ConnectorTomlFile: sink.d/*.toml 解析
+    │   ├── route.rs           # RouteFile, RouteGroup, RouteSink: business.d/*.toml 解析
+    │   ├── defaults.rs        # DefaultsBody: defaults.toml 全局默认值
+    │   ├── expect.rs          # GroupExpectSpec, SinkExpectOverride: 投递保证
+    │   ├── group.rs           # FlexGroup（业务组）, FixedGroup（基础设施组）
+    │   ├── build.rs           # 参数合并（allow_override 白名单）、标签三级合并
+    │   ├── io.rs              # SinkConfigBundle, load_sink_config: 目录加载
+    │   ├── types.rs           # StringOrArray, WildArray, ParamMap
+    │   └── validate.rs        # validate_sink_coverage: yield-target 覆盖校验
     ├── logging.rs             # LoggingConfig: level, format, file, modules
     ├── types.rs               # HumanDuration, ByteSize, DistMode, LatePolicy
     ├── validate.rs            # over vs over_cap 校验
@@ -568,8 +603,8 @@ impl Router {
                                                     │
                                                     ▼
                                          ┌──────────────────────┐
-                                         │ AlertSink            │
-                                         │ (JSON Lines 文件)     │
+                                         │ SinkDispatcher       │
+                                         │   → yield-target 路由│
                                          └──────────────────────┘
 ```
 
@@ -839,8 +874,6 @@ pub struct RulePlan {
 }
 ```
 
-**Alert ID 格式**：`”rule|key1\x1fkey2|fired_at#seq”`，使用 `%` 编码分隔符，`seq` 为进程级 `AtomicU64`。
-
 **关键设计决策：**
 
 - WFL 规则由 `wf-lang` 编译器统一编译为 `RulePlan`（CEP 状态机），RuleExecutor 以事件驱动方式执行
@@ -849,8 +882,13 @@ pub struct RulePlan {
 - Score 求值直接从 `ScorePlan.expr` 计算，结果 clamp 到 [0, 100]
 - Entity ID 从 MatchedContext 中的 scope-key 或 step-data 提取
 - `on close` 仅在 `event_ok && close_ok` 时生成告警（部分满足的实例不输出）
+- AlertRecord 的 `yield_target` 字段（`serde(skip)`）来自 `YieldPlan.target`，用于 sink 路由
 
-### 4.5 AlertSink — 风险告警输出
+### 4.5 告警输出 — Connector-based Sink 路由
+
+WarpFusion 使用基于 `wp-connector-api` 的 Connector sink 路由系统输出告警。AlertRecord 序列化为 JSON 后，由 `SinkDispatcher` 按 `yield_target`（yield 目标窗口名）匹配路由到对应 sink 组。通过 `sinks = "sinks"` 在 `wfusion.toml` 中配置 sink 目录路径。
+
+#### 4.5.1 AlertRecord
 
 ```rust
 #[derive(Debug, Clone, serde::Serialize)]
@@ -865,19 +903,145 @@ pub struct AlertRecord {
     #[serde(skip)]
     pub matched_rows: Vec<RecordBatch>,        // L1 为空
     pub summary: String,                       // 规则执行摘要
-}
-
-/// 同步告警输出 trait
-pub trait AlertSink: Send + Sync {
-    fn send(&self, record: &AlertRecord) -> CoreResult<()>;
+    #[serde(skip)]
+    pub yield_target: String,                  // yield 目标窗口名，用于 sink 路由
 }
 ```
 
-L1 内置实现：
-- `FileAlertSink` — JSON Lines 写入文件（`Mutex<BufWriter<File>>`）
-- `FanOutSink` — 广播到多个 sink；遇到错误继续，返回第一个错误
+**Alert ID 格式**：`"rule|key1\x1fkey2|fired_at#seq"`，使用 `%` 编码分隔符，`seq` 为进程级 `AtomicU64`。
 
-AlertSink 任务（`run_alert_sink`）通过 mpsc channel（容量 64）接收 AlertRecord。关闭是 channel-close-driven：当所有 RuleTask drop 了 `alert_tx` sender 后，接收端返回 `None`，任务自动退出。
+#### 4.5.2 Sink 路由（yield-target 路由）
+
+```
+告警路由流程：
+
+AlertRecord → serde_json::to_string → SinkDispatcher.dispatch(yield_target, json)
+                                        │
+                                        ├─ ① 遍历 BusinessGroup
+                                        │    windows.matches(yield_target)?
+                                        │    ├─ YES → 发送到该组所有 SinkRuntime
+                                        │    └─ NO  → 继续下一个组
+                                        │
+                                        ├─ ② 无 BusinessGroup 匹配
+                                        │    → 发送到 default_group（如已配置）
+                                        │
+                                        └─ ③ 任何 sink 写入失败
+                                             → 额外发送到 error_group（如已配置）
+```
+
+**核心类型：**
+
+```rust
+/// yield-target 路由引擎
+pub struct SinkDispatcher {
+    business: Vec<BusinessGroup>,           // 业务路由组（带 window 通配符匹配）
+    default_group: Option<SinkGroup>,       // 兜底组（无匹配时使用）
+    error_group: Option<SinkGroup>,         // 错误组（写入失败时使用）
+}
+
+/// 单个 sink 实例的运行时状态
+pub struct SinkRuntime {
+    pub name: String,
+    pub spec: ResolvedSinkSpec,             // 来自 wp-connector-api
+    pub handle: Mutex<SinkHandle>,          // 异步 sink 句柄
+    pub tags: Vec<String>,
+}
+```
+
+`SinkDispatcher` 任务（`run_alert_dispatcher`）通过 mpsc channel（容量 64）接收 AlertRecord，channel-close-driven 退出。当所有 RuleTask drop 了 `alert_tx` sender 后，接收端返回 `None`，任务自动退出。退出前调用 `dispatcher.stop_all()` 优雅关闭所有 sink。
+
+#### 4.5.3 Sink 工厂
+
+`SinkFactoryRegistry` 管理 sink 类型（kind）到工厂的映射。`build_sink_dispatcher` 从 `SinkConfigBundle` 构建 `SinkDispatcher`。
+
+```rust
+/// Sink 工厂注册表
+pub struct SinkFactoryRegistry {
+    factories: HashMap<String, Arc<dyn SinkFactory>>,
+}
+```
+
+L1 内置工厂：
+
+| Kind | 工厂 | 实现 | 说明 |
+|------|------|------|------|
+| `"file"` | `FileSinkFactory` | `AsyncFileSink` | 异步文件写入（`tokio::io::BufWriter`），自动创建父目录 |
+
+`SinkFactory` trait 来自 `wp-connector-api`，定义 `kind()` / `validate_spec()` / `build()` 三个方法。`AsyncFileSink` 实现 `AsyncCtrl`（stop/reconnect）和 `AsyncRawDataSink`（sink_str/sink_bytes/batch）接口。
+
+#### 4.5.4 Sink 配置结构
+
+```
+sinks/                         # sinks 根目录（wfusion.toml 中 sinks = "sinks" 指向此处）
+├── defaults.toml              # 全局默认值（tags、expect）
+├── sink.d/                    # Connector 定义（sink 类型 + 默认参数 + 可覆盖白名单）
+│   └── file_json.toml
+├── business.d/                # 业务路由组（window 通配符匹配 + sink 列表）
+│   ├── security.toml
+│   └── catch_all.toml
+└── infra.d/                   # 基础设施组
+    ├── default.toml           # 兜底组（yield-target 无匹配时）
+    └── error.toml             # 错误组（sink 写入失败时）
+```
+
+**Connector 定义**（`sink.d/file_json.toml`）：
+
+```toml
+[[connectors]]
+id = "file_json"
+type = "file"
+allow_override = ["path"]
+
+[connectors.params]
+path = "alerts/default.jsonl"
+```
+
+**业务路由组**（`business.d/security.toml`）：
+
+```toml
+version = "1.0"
+
+[sink_group]
+name = "security_output"
+windows = ["security_*"]          # yield-target 通配符匹配
+
+[[sink_group.sinks]]
+connect = "file_json"             # 引用 connector id
+name = "sec_file"
+
+[sink_group.sinks.params]
+path = "alerts/security_alerts.jsonl"   # 覆盖 connector 默认参数
+```
+
+**基础设施组**（`infra.d/default.toml`）：
+
+```toml
+[sink_group]
+name = "__default"
+
+[[sink_group.sinks]]
+connect = "file_json"
+
+[sink_group.sinks.params]
+path = "alerts/unrouted.jsonl"
+```
+
+**配置解析产物：**
+
+```rust
+pub struct SinkConfigBundle {
+    pub connectors: BTreeMap<String, ConnectorDef>,  // id → connector 定义
+    pub defaults: DefaultsBody,                      // 全局默认值
+    pub business: Vec<FlexGroup>,                    // 业务路由组（已解析）
+    pub infra_default: Option<FixedGroup>,           // 兜底组
+    pub infra_error: Option<FixedGroup>,             // 错误组
+}
+```
+
+**参数合并规则：**
+- **allow_override 白名单**：sink 级参数覆盖仅允许 connector 声明的 `allow_override` 中列出的 key
+- **标签三级合并**：defaults（最低）→ group → sink（最高），同 key 前缀（`:`前部分）的标签后者覆盖前者
+- **sink coverage 校验**：启动时检查所有 yield-target 至少被一个 business group 或 infra_default 覆盖
 
 
 ## 5. 并发模型
@@ -890,16 +1054,17 @@ AlertSink 任务（`run_alert_sink`）通过 mpsc channel（容量 64）接收 A
 | Notify 唤醒 | Router append 后通过 `Notify::notify_waiters()` 唤醒关联 RuleTask |
 | Per-rule 独立 | 每条规则一个独立的 tokio task，互不阻塞 |
 | LIFO 生命周期 | 启动顺序：消费者先于生产者；关闭顺序：生产者先于消费者 |
-| Channel-close-driven | AlertSink 任务通过 channel 关闭信号自然退出 |
+| Channel-close-driven | Alert dispatcher 任务通过 channel 关闭信号自然退出 |
 | CancellationToken | 两级取消：`cancel`（全局）+ `rule_cancel`（规则级，延迟触发） |
 
 ### 5.2 任务拓扑
 
 ```
 TaskGroup: alert
-  └─ run_alert_sink (×1)
+  └─ run_alert_dispatcher (×1)
        ↑ mpsc channel (容量 64)
-       │ AlertRecord
+       │ AlertRecord → JSON → SinkDispatcher.dispatch(yield_target, json)
+       │ 退出时调用 dispatcher.stop_all()
 
 TaskGroup: evictor
   └─ run_evictor (×1，定时清理过期窗口数据)
@@ -942,7 +1107,7 @@ Phase 2: 清空规则管道
     ② machine.close_all(Eos)（flush 所有状态机实例）
     ③ drop alert_tx（关闭 channel sender）
   → join rules task group
-  → alert_rx 收到 None，AlertSink 自动退出
+  → alert_rx 收到 None，alert dispatcher 自动退出
   → join alert task group
   → join evictor task group
 ```
@@ -975,7 +1140,7 @@ pub async fn wait_for_signal(cancel: CancellationToken);  // SIGINT + SIGTERM
 5. `WindowRegistry::build(defs)`
 6. `Router::new(registry)`
 7. 构建 `RunRule`（预计算 stream_name → alias 路由）
-8. 构建 AlertSink
+8. 构建 SinkDispatcher（从 sinks/ 配置目录加载）
 9. 按顺序启动 4 个 TaskGroup
 
 
@@ -986,6 +1151,9 @@ pub async fn wait_for_signal(cancel: CancellationToken);  // SIGINT + SIGTERM
 三文件架构下，TOML 负责**运行时物理参数**。数据 schema 在 `.wfs` 文件中定义，检测逻辑在 `.wfl` 文件中定义。
 
 ```toml
+# Connector-based sink routing（指向 sinks/ 配置目录）
+sinks = "sinks"
+
 [server]
 listen = "tcp://127.0.0.1:9800"                   # 监听地址
 
@@ -1015,9 +1183,6 @@ mode = "local"
 max_window_bytes = "64MB"
 over_cap = "1h"
 
-[alert]
-sinks = ["file://alerts/wf-alerts.jsonl"]      # 目前仅支持 file:// 协议
-
 [vars]                                         # WFL $VAR 变量替换
 FAIL_THRESHOLD = "3"
 
@@ -1037,6 +1202,7 @@ file = "logs/wf-engine.log"                    # 日志文件路径
 | 检测逻辑 | `.wfl` | 事件绑定、模式匹配、条件、输出 | `yield security_alerts (...)` |
 | 物理约束 | `.toml` | mode、max_bytes、over_cap、watermark | `watermark = "5s"` |
 | 变量替换 | `.toml [vars]` | WFL `$VAR` 替换值（也支持环境变量回退） | `FAIL_THRESHOLD = "3"` |
+| 告警输出 | `sinks/` 目录 | Connector 路由配置 | `sinks = "sinks"` |
 
 **over vs over_cap 校验：** 启动时检查每个 window 的 `.wfs` 中 `over` ≤ `.toml` 中 `over_cap`，不满足则报错拒绝启动。
 
@@ -1139,6 +1305,7 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
 anyhow = "1.0"
 winnow = "0.7"                   # 解析器组合子（替代 nom）
+wp-connector-api = "0.8"        # Sink 抽象层（SinkFactory, SinkHandle, ConnectorDef）
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 tracing-appender = "0.2"
@@ -1164,6 +1331,9 @@ serde.workspace = true
 toml.workspace = true
 anyhow.workspace = true
 glob = "0.3"                     # 文件 glob 匹配
+wp-connector-api.workspace = true  # ConnectorDef, SinkSpec, ParamMap
+serde_json = "1.0"               # ParamMap (JSON 值) 序列化
+wildmatch = "2"                  # yield-target 通配符匹配
 ```
 
 ### 7.4 wf-core
@@ -1172,14 +1342,18 @@ glob = "0.3"                     # 文件 glob 匹配
 [dependencies]
 wf-config = { path = "../wf-config" }
 wf-lang = { path = "../wf-lang" }
+wp-connector-api.workspace = true  # SinkHandle, SinkSpec (用于 SinkRuntime)
 arrow = { version = "54", default-features = false, features = ["ipc"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json = "1.0"
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync"] }  # Notify, RwLock, Mutex
+log = "0.4"
 orion-error.workspace = true
 derive_more.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["sync"] }  # Notify, RwLock
+regex = "1"
 ```
 
 ### 7.5 wf-runtime
@@ -1189,12 +1363,16 @@ tokio = { version = "1", features = ["sync"] }  # Notify, RwLock
 wf-core = { path = "../wf-core" }
 wf-config = { path = "../wf-config" }
 wf-lang = { path = "../wf-lang" }
+wp-connector-api.workspace = true  # SinkFactory, SinkBuildCtx, SinkHandle
 wp-arrow = "0.1"                 # Arrow IPC 编解码
+wp-model-core = "0.8"            # DataRecord（FileSinkFactory 需要 AsyncRecordSink）
 arrow = { version = "54", default-features = false, features = ["ipc"] }
-tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt-multi-thread", "signal", "time", "fs"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 anyhow.workspace = true
 serde_json = "1.0"
+log = "0.4"
+async-trait = "0.1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
@@ -1331,7 +1509,7 @@ retry_max_interval = "30s"                        # 最大重试间隔
 | **P2** | wf-core/window: Window + WindowRegistry + Router | 已完成 |
 | **P3** | wf-core/rule: CEP 状态机 + RuleExecutor | 已完成 |
 | **P3** | wf-runtime: Receiver + RuleTask + Lifecycle | 已完成 |
-| **P4** | wf-core/alert: AlertSink + FileAlertSink | 已完成 |
+| **P4** | wf-core/alert: AlertRecord；wf-core/sink: SinkDispatcher + SinkRuntime；wf-config/sink: 路由配置；wf-runtime: SinkFactoryRegistry + FileSinkFactory | 已完成 |
 | **P5** | wf-lang: 编译器 + checker + lint | 已完成 |
 | **P6** | wf-proj: explain / lint / fmt 工具 | 已完成 |
 | **P7** | wf-datagen: 数据生成 + oracle + verify | 已完成 |

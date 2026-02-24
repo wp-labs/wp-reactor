@@ -1,12 +1,9 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
-use orion_error::op_context;
 use orion_error::prelude::*;
 
-use wf_config::{FusionConfig, SinkUri, resolve_glob};
-use wf_core::alert::{AlertSink, FanOutSink, FileAlertSink};
+use wf_config::resolve_glob;
 use wf_core::rule::{CepStateMachine, RuleExecutor};
 
 use crate::error::{RuntimeReason, RuntimeResult};
@@ -122,41 +119,4 @@ fn build_stream_aliases(
         }
     }
     map
-}
-
-/// Build the alert sink from config, supporting multiple file:// destinations.
-///
-/// Relative `file://` paths are resolved against `base_dir` (typically the
-/// directory containing `wfusion.toml`), so that `file://alerts/wf-alerts.jsonl`
-/// lands next to the config rather than relative to CWD.
-pub(super) fn build_alert_sink(
-    config: &FusionConfig,
-    base_dir: &Path,
-) -> RuntimeResult<Arc<dyn AlertSink>> {
-    let mut op = op_context!("build-alert-sink").with_auto_log();
-    let uris = config.alert.parsed_sinks().owe_conf()?;
-    let mut sinks: Vec<Box<dyn AlertSink>> = Vec::new();
-    for uri in uris {
-        match uri {
-            SinkUri::File { path } => {
-                let path = if path.is_relative() {
-                    base_dir.join(&path)
-                } else {
-                    path
-                };
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).owe_sys()?;
-                }
-                sinks.push(Box::new(FileAlertSink::open(&path).err_conv()?));
-                op.record("sink_path", path.display().to_string().as_str());
-                wf_debug!(conf, path = %path.display(), "opened alert file sink");
-            }
-        }
-    }
-    op.mark_suc();
-    Ok(if sinks.len() == 1 {
-        Arc::from(sinks.into_iter().next().unwrap())
-    } else {
-        Arc::new(FanOutSink::new(sinks))
-    })
 }

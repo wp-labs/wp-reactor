@@ -75,7 +75,7 @@ pub(super) struct RunRule {
 pub(super) struct BootstrapData {
     pub rules: Vec<RunRule>,
     pub router: std::sync::Arc<wf_core::window::Router>,
-    pub alert_sink: std::sync::Arc<dyn wf_core::alert::AlertSink>,
+    pub dispatcher: std::sync::Arc<wf_core::sink::SinkDispatcher>,
     pub schema_count: usize,
     pub schemas: Vec<wf_lang::WindowSchema>,
 }

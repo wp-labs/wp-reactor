@@ -31,7 +31,7 @@ async fn e2e_datagen_brute_force() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let artifact_dir = manifest_dir.join("../../target/test-artifacts/e2e_datagen");
     std::fs::create_dir_all(&artifact_dir).expect("failed to create artifact dir");
-    let alert_path = artifact_dir.join("alerts.jsonl");
+    let alert_path = artifact_dir.join("alerts/all.jsonl");
     let _ = std::fs::remove_file(&alert_path);
 
     // ---- Tracing (test_writer + file) ----
@@ -109,9 +109,12 @@ async fn e2e_datagen_brute_force() {
     .expect("oracle evaluation failed");
     let oracle_alerts = &oracle_result.alerts;
 
-    // ---- Build FusionConfig (inline TOML, port=0) ----
+    // ---- Build FusionConfig (inline TOML, port=0, connector-based sinks) ----
     let toml_str = format!(
         r#"
+sinks = "sinks"
+work_root = "{}"
+
 [server]
 listen = "tcp://127.0.0.1:0"
 
@@ -140,13 +143,10 @@ mode = "local"
 max_window_bytes = "64MB"
 over_cap = "1h"
 
-[alert]
-sinks = ["file://{}"]
-
 [vars]
 FAIL_THRESHOLD = "3"
 "#,
-        alert_path.display()
+        artifact_dir.display()
     );
     let config: FusionConfig = toml_str.parse().expect("failed to parse config TOML");
 
@@ -179,7 +179,7 @@ FAIL_THRESHOLD = "3"
     drop(stream);
     reactor.wait().await.expect("reactor.wait failed");
 
-    // ---- Read actual alerts ----
+    // ---- Read actual alerts (catch_all sink writes to alerts/all.jsonl) ----
     let actual = wf_datagen::output::jsonl::read_alerts_jsonl(&alert_path)
         .unwrap_or_else(|e| panic!("failed to read alerts from {}: {e}", alert_path.display()));
 

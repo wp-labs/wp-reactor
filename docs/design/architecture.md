@@ -2,7 +2,7 @@
 
 > Window-Centric Cursor+Notify 模型
 >
-> 2026-02-22
+> 2026-02-24
 
 ---
 
@@ -48,7 +48,7 @@
                          ▼
               ┌─────────────────────┐
               │   Alert Sink Task   │  mpsc channel 消费者
-              │   (file / network)  │
+              │   SinkDispatcher    │  → yield-target 路由
               └─────────────────────┘
 
               ┌─────────────────────┐
@@ -68,7 +68,7 @@
 | Receiver accept loop | 1 | TCP 连接到达 | TcpListener | — | `cancel` |
 | Connection handler | N (per client) | TCP frame 到达 | TcpStream | Router → Window (写锁) | `cancel` (child) |
 | Engine task | 每 rule 1 个 | Notify / timeout tick | Window (读锁) | CepStateMachine, alert_tx | `rule_cancel` |
-| Alert sink | 1 | mpsc::recv() | alert channel | 文件 / 网络 | channel 关闭 |
+| Alert sink | 1 | mpsc::recv() | alert channel | SinkDispatcher 路由 | channel 关闭 |
 | Evictor | 1 | 定时 interval | Window (读锁 → 写锁) | Window eviction | `cancel` |
 
 ---
@@ -195,7 +195,8 @@ wait(): join engines
     ▼
 alert channel 关闭 (所有 sender 已 drop)
     │
-    ├── Alert sink: drain 剩余 alert, 写入文件, 退出
+    ├── Alert sink: drain 剩余 alert, 路由, 退出
+    │                调用 dispatcher.stop_all() 优雅关闭
     │
     ▼
 wait(): join alert
@@ -221,4 +222,4 @@ wait(): join infra (evictor)
 
 **两阶段关闭防丢数据**：如果 Receiver 和 Engine 同时收到 cancel，引擎的 final drain 可能在 Receiver 路由完最后一批数据之前执行，导致数据丢失。分离为两个 token 解决了这个竞态。
 
-**Alert sink 靠 channel 关闭退出**：不用 cancel token，避免引擎 flush 期间 alert sink 提前退出的竞态。
+**Alert sink 靠 channel 关闭退出**：不用 cancel token，避免引擎 flush 期间 alert sink 提前退出的竞态。`run_alert_dispatcher` 在 channel 关闭后调用 `SinkDispatcher::stop_all()` 优雅关闭所有 sink 实例。

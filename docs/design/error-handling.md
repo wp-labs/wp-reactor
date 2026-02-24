@@ -110,7 +110,7 @@ wf-core (StructError<CoreReason>) ──err_conv──▶ wf-runtime (StructErro
 |-------|---------|-------------|------|
 | **wf-lang** | 保持 `anyhow` + 现有自定义类型 | 不定义 | 解析库，错误是位置+消息，不需要分类 |
 | **wf-config** | 保持 `anyhow` | 不定义 | 配置错误全部 fatal，不需要分类 |
-| **wf-core** | 引入 `StructError<CoreReason>` | `CoreReason` | 业务层，错误需要分类（窗口/规则/告警/数据） |
+| **wf-core** | 引入 `StructError<CoreReason>` | `CoreReason` | 业务层，错误需要分类（窗口/规则/数据） |
 | **wf-runtime** | 引入 `StructError<RuntimeReason>` | `RuntimeReason` | 收敛层，统一下层错误 + 自有运行时错误 |
 | **wf-engine** | 直接使用 `RuntimeReason` | 不定义 | 入口，格式化输出即可 |
 | **wf-datagen** | 保持 `anyhow` + `ValidationError` | 不定义 | 独立工具，不需要 |
@@ -137,10 +137,6 @@ pub enum CoreReason {
     #[error("rule execution error")]
     RuleExec,
 
-    /// 告警输出错误（文件写入、JSON序列化、锁中毒）
-    #[error("alert sink error")]
-    AlertSink,
-
     /// 数据格式错误（Arrow IPC 解码、schema 不匹配）
     #[error("data format error")]
     DataFormat,
@@ -155,7 +151,6 @@ impl ErrorCode for CoreReason {
         match self {
             Self::WindowBuild => 1001,
             Self::RuleExec    => 1002,
-            Self::AlertSink   => 1003,
             Self::DataFormat  => 1004,
             Self::Uvs(u)      => u.error_code(),
         }
@@ -171,7 +166,6 @@ pub type CoreResult<T> = Result<T, CoreError>;
 
 - `WindowBuild` — 对应 `WindowRegistry::build()` 中 `bail!("duplicate window name")`
 - `RuleExec` — 对应 `RuleExecutor::execute_match/close()` 的错误路径
-- `AlertSink` — 对应 `AlertSink::send()` 中的 IO/JSON/锁错误
 - `DataFormat` — 对应 `wp_arrow::ipc::decode_ipc()` 的解码错误
 - `Uvs(UvsReason)` — 启用 `ErrorOwe` 的 `.owe_sys()` / `.owe_data()` 等便捷方法。wp-motor 验证了 Uvs 变体的核心价值：错误策略 match 中，域特定变体先匹配，兜底通过 Uvs 委托给通用策略
 
@@ -231,7 +225,7 @@ wp-motor 中 `OMLCodeReason → RunReason` 的转换将所有 OML 错误映射�
   200-299            UvsReason 基础设施层（data, system, network, timeout...）
   300-399            UvsReason 配置/外部层（config, external）
 
-  1001-1099          CoreReason（窗口、规则、告警、数据）
+  1001-1099          CoreReason（窗口、规则、数据）
   2001-2099          RuntimeReason（启动、关闭）
 ```
 
@@ -302,9 +296,10 @@ pub async fn start(config: FusionConfig, base_dir: &Path)
     let registry = WindowRegistry::build(window_defs)
         .err_conv()?;
 
-    // 5. 构建告警 sink
-    let alert_sink = build_alert_sink(&config, base_dir)
-        .owe_sys()?;
+    // 5. 构建 sink dispatcher
+    let dispatcher = build_sink_dispatcher(&bundle, &registry, &work_root)
+        .await
+        .owe(RuntimeReason::Bootstrap)?;
 
     // ... 启动任务组 ...
 
@@ -326,25 +321,6 @@ op.mark_suc();
 ```
 
 ### 5.2 wf-core 内部（公共 API 改造）
-
-**AlertSink::send()**
-
-```rust
-pub trait AlertSink: Send + Sync {
-    fn send(&self, record: &AlertRecord) -> CoreResult<()>;
-}
-
-impl AlertSink for FileAlertSink {
-    fn send(&self, record: &AlertRecord) -> CoreResult<()> {
-        let json = serde_json::to_string(record).owe(CoreReason::AlertSink)?;
-        let mut w = self.writer.lock().expect("alert sink lock poisoned");
-        w.write_all(json.as_bytes()).owe(CoreReason::AlertSink)?;
-        w.write_all(b"\n").owe(CoreReason::AlertSink)?;
-        w.flush().owe(CoreReason::AlertSink)?;
-        Ok(())
-    }
-}
-```
 
 **WindowRegistry::build()**
 
@@ -399,7 +375,6 @@ Err(e) => {
 // match err.reason() {
 //     CoreReason::RuleExec => ErrStrategy::Ignore,   // 规则执行错误可忽略
 //     CoreReason::DataFormat => ErrStrategy::Ignore,  // 数据格式错误可忽略
-//     CoreReason::AlertSink => ErrStrategy::Throw,    // 告警写入失败需要上报
 //     CoreReason::Uvs(u) => universal_strategy(u),    // Uvs 穿透到通用策略
 //     _ => ErrStrategy::Throw,
 // }
@@ -474,17 +449,12 @@ pub async fn start(config: FusionConfig, base_dir: &Path) -> RuntimeResult<Self>
 **构建资源——独立操作上下文**（参考 wp-motor build_sinks.rs 模式）:
 
 ```rust
-fn build_alert_sink(config: &FusionConfig, base_dir: &Path) -> RuntimeResult<Arc<dyn AlertSink>> {
-    let mut op = op_context!("build-alert-sink").with_auto_log();
-    let uris = config.alert.parsed_sinks().owe_conf()?;
-    for uri in uris {
-        match uri {
-            SinkUri::File { path } => {
-                op.record("sink_path", &path.display().to_string());
-                // ...
-            }
-        }
-    }
+async fn build_sink_dispatcher(config: &FusionConfig, base_dir: &Path) -> RuntimeResult<Arc<SinkDispatcher>> {
+    let mut op = op_context!("build-sink-dispatcher").with_auto_log();
+    let sinks_dir = base_dir.join(&config.sinks);
+    let bundle = wf_config::sink::load_sink_config(&sinks_dir).owe_conf()?;
+    op.record("sinks_dir", &sinks_dir.display().to_string());
+    // ...
     op.mark_suc();
     Ok(...)
 }
@@ -607,7 +577,7 @@ wf-engine 通过 wf-runtime 的 re-export 使用 `StructError<RuntimeReason>`。
 
 ### 阶段 2: 改造 wf-core 公共 API
 
-- `AlertSink::send()` → `CoreResult<()>`
+- `AlertSink::send()` → `CoreResult<()>`（已移除，告警输出通过 SinkDispatcher 异步处理）
 - `WindowRegistry::build()` → `CoreResult<Self>`
 - `RuleExecutor::execute_match/close()` → `CoreResult<T>`
 - 内部实现用 `.owe()` / `.owe_xxx()` 包装外部错误

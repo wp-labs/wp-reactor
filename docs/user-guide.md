@@ -129,6 +129,8 @@ rule brute_force {
 **第 3 步 — 配置运行时** (`fusion.toml`)
 
 ```toml
+sinks = "sinks"
+
 [server]
 listen = "tcp://127.0.0.1:9800"
 
@@ -143,9 +145,6 @@ watermark = "5s"
 allowed_lateness = "0s"
 late_policy = "drop"
 
-[alert]
-sinks = ["file://alerts/wf-alerts.jsonl"]
-
 [vars]
 FAIL_THRESHOLD = "3"
 ```
@@ -156,7 +155,7 @@ FAIL_THRESHOLD = "3"
 wf run --config fusion.toml
 ```
 
-引擎启动后监听 `tcp://127.0.0.1:9800`，接收 Arrow IPC 格式的事件流，执行规则检测，输出告警到 `alerts/wf-alerts.jsonl`。
+引擎启动后监听 `tcp://127.0.0.1:9800`，接收 Arrow IPC 格式的事件流，执行规则检测，输出告警到 `sinks/` 配置的目标文件。
 
 ---
 
@@ -870,6 +869,9 @@ rule protocol_anomaly {
 ### 6.1 完整配置参考
 
 ```toml
+# ── 告警输出（Connector-based sink 路由） ──
+sinks = "sinks"                              # 指向 sinks/ 配置目录
+
 # ── 服务器 ──
 [server]
 listen = "tcp://127.0.0.1:9800"     # TCP 监听地址
@@ -901,10 +903,6 @@ over_cap = "30m"                     # 保留上限
 mode = "local"
 max_window_bytes = "64MB"
 over_cap = "1h"
-
-# ── 告警输出 ──
-[alert]
-sinks = ["file://alerts/wf-alerts.jsonl"]
 
 # ── 变量（可在 .wfl 中引用） ──
 [vars]
@@ -939,12 +937,17 @@ over_cap = "1h"
 
 #### 告警 Sink
 
-当前支持文件输出：
+告警输出通过 Connector-based sink 路由系统配置，使用 `sinks/` 目录：
 
 ```toml
-[alert]
-sinks = ["file://alerts/wf-alerts.jsonl"]
+sinks = "sinks"                              # 指向 sinks/ 配置目录
 ```
+
+`sinks/` 目录结构：
+- `defaults.toml` — 全局默认值
+- `sink.d/` — Connector 定义（sink 类型 + 参数）
+- `business.d/` — 业务路由组（按 yield-target 匹配）
+- `infra.d/` — 基础设施组（default / error）
 
 输出格式为 JSONL（每行一条 JSON 告警记录）。
 

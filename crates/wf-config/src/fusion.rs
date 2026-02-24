@@ -4,7 +4,6 @@ use std::str::FromStr;
 
 use serde::Deserialize;
 
-use crate::alert::AlertConfig;
 use crate::logging::LoggingConfig;
 use crate::runtime::RuntimeConfig;
 use crate::server::ServerConfig;
@@ -22,12 +21,11 @@ struct FusionConfigRaw {
     window_defaults: WindowDefaults,
     #[serde(default)]
     window: HashMap<String, WindowOverride>,
-    #[serde(default)]
-    alert: AlertConfig,
     /// Path to the sinks/ directory for connector-based sink routing.
-    /// When present, the new sink system is used instead of alert.sinks.
+    sinks: String,
+    /// Optional working root for sink file-path resolution.
     #[serde(default)]
-    sinks: Option<String>,
+    work_root: Option<String>,
     #[serde(default)]
     logging: LoggingConfig,
     /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
@@ -45,10 +43,10 @@ pub struct FusionConfig {
     pub runtime: RuntimeConfig,
     pub window_defaults: WindowDefaults,
     pub windows: Vec<WindowConfig>,
-    pub alert: AlertConfig,
     /// Path to the sinks/ directory for connector-based sink routing.
-    /// When present, the new sink system is used instead of `alert.sinks`.
-    pub sinks: Option<String>,
+    pub sinks: String,
+    /// Optional working root for sink file-path resolution.
+    pub work_root: Option<String>,
     pub logging: LoggingConfig,
     /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
     pub vars: HashMap<String, String>,
@@ -84,8 +82,8 @@ impl FromStr for FusionConfig {
             runtime: raw.runtime,
             window_defaults: raw.window_defaults,
             windows,
-            alert: raw.alert,
             sinks: raw.sinks,
+            work_root: raw.work_root,
             logging: raw.logging,
             vars: raw.vars,
         };
@@ -107,6 +105,8 @@ mod tests {
     use std::time::Duration;
 
     const FULL_TOML: &str = r#"
+sinks = "sinks"
+
 [server]
 listen = "tcp://127.0.0.1:9800"
 
@@ -142,9 +142,6 @@ late_policy = "drop"
 mode = "replicated"
 max_window_bytes = "64MB"
 over_cap = "48h"
-
-[alert]
-sinks = ["file:///var/log/wf-alerts.jsonl"]
 "#;
 
     #[test]
@@ -202,8 +199,8 @@ sinks = ["file:///var/log/wf-alerts.jsonl"]
             "64MB".parse::<ByteSize>().unwrap(),
         );
 
-        // alert
-        assert_eq!(cfg.alert.sinks, vec!["file:///var/log/wf-alerts.jsonl"],);
+        // sinks
+        assert_eq!(cfg.sinks, "sinks");
     }
 
     #[test]
@@ -246,6 +243,8 @@ sinks = ["file:///var/log/wf-alerts.jsonl"]
     #[test]
     fn missing_server_fails() {
         let toml = r#"
+sinks = "sinks"
+
 [runtime]
 executor_parallelism = 2
 rule_exec_timeout = "30s"
@@ -260,9 +259,6 @@ evict_policy = "time_first"
 watermark = "5s"
 allowed_lateness = "0s"
 late_policy = "drop"
-
-[alert]
-sinks = ["file:///var/log/wf-alerts.jsonl"]
 "#;
         assert!(toml.parse::<FusionConfig>().is_err());
     }
