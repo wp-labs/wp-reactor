@@ -7,7 +7,7 @@ use crate::wfl_parser::parse_wfl;
 fn contract_unknown_rule() {
     let input = r#"
 test ct for nonexistent {
-    given { row(e, x = 1); }
+    input { row(e, x = 1); }
     expect { hits == 1; }
 }
 "#;
@@ -30,7 +30,7 @@ rule r {
     yield out (x = e.sip)
 }
 test ct for r {
-    given { row(bad, x = 1); }
+    input { row(bad, x = 1); }
     expect { hits == 1; }
 }
 "#;
@@ -53,7 +53,7 @@ rule r {
     yield out (x = e.sip)
 }
 test ct for r {
-    given { row(e, action = "failed"); }
+    input { row(e, action = "failed"); }
     expect { hits == 1; }
 }
 "#;

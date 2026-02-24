@@ -274,7 +274,7 @@ wf-lang/
     │   ├── mod.rs             # check_wfl: L1 语义错误检查
     │   ├── lint.rs            # lint_wfl: 最佳实践警告（W001–W006）
     │   ├── rules.rs           # 规则级检查逻辑
-    │   ├── contracts.rs       # contract 块检查逻辑
+    │   ├── contracts.rs       # test 块检查逻辑
     │   └── types.rs           # CheckError, Severity
     ├── compiler/              # AST → RulePlan 编译
     │   └── mod.rs             # compile_wfl: 语义检查 + 编译
@@ -1514,7 +1514,7 @@ retry_max_interval = "30s"                        # 最大重试间隔
 | **P6** | wfl: explain / lint / fmt 工具 | 已完成 |
 | **P7** | wfgen: 数据生成 + oracle + verify | 已完成 |
 | **P8** | L2 增强: join / baseline / 条件表达式 / 函数 | 计划中 |
-| **P9** | 正确性门禁: contract + shuffle + scenario verify | 计划中 |
+| **P9** | 正确性门禁: test + shuffle + scenario verify | 计划中 |
 | **P10** | 可靠性分级: at_least_once / exactly_once | 计划中 |
 | **P11** | 分布式 V2+: 多节点部署 | 计划中 |
 
@@ -1538,7 +1538,7 @@ retry_max_interval = "30s"                        # 最大重试间隔
 | 阶段 | 里程碑 | 阶段目标 |
 |------|--------|---------|
 | **VII L2 增强** | M25–M26 | join snapshot/asof（DataFusion）、条件表达式增强 |
-| **VIII 正确性门禁** | M27–M28 | contract + shuffle + scenario verify |
+| **VIII 正确性门禁** | M27–M28 | test + shuffle + scenario verify |
 | **IX 可靠性分级** | M29 | at_least_once / exactly_once 传输 |
 | **X 分布式** | M30 | 多节点分布式部署 |
 

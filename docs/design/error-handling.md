@@ -22,7 +22,7 @@ wp-reactor 当前以 `anyhow::Result<T>` 作为唯一错误类型，贯穿所有
 
 | 类型 | 位置 | 字段 |
 |------|------|------|
-| `CheckError` | `wf-lang/src/checker/mod.rs:11-15` | `rule`, `contract`, `message` |
+| `CheckError` | `wf-lang/src/checker/mod.rs:11-15` | `rule`, `test`, `message` |
 | `PreprocessError` | `wf-lang/src/preprocess.rs` | `position`, `message` |
 | `ValidationError` | `wfgen/src/validate.rs` | `code`, `message` |
 

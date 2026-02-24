@@ -338,9 +338,9 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-lang` + `wf-core` |
-| 范围 | `\|>` 多级管道：规则内串联，后续 stage 自动绑定 `_in` 别名；隐式 yield：`yield (field=...)` 无目标名，编译器推导中间 window；行为分析扩展：`session(gap)`、`collect_set/list`、`first/last`、`stddev/percentile`、增强 `baseline(method)`；Conformance：`contract ... options { permutation = "shuffle"; runs = N; }` 顺序/乱序不变性契约 |
+| 范围 | `\|>` 多级管道：规则内串联，后续 stage 自动绑定 `_in` 别名；隐式 yield：`yield (field=...)` 无目标名，编译器推导中间 window；行为分析扩展：`session(gap)`、`collect_set/list`、`first/last`、`stddev/percentile`、增强 `baseline(method)`；Conformance：`test ... options { permutation = "shuffle"; runs = N; }` 顺序/乱序不变性测试 |
 | 依赖 | M27 |
-| 验收 | 两级/三级管道场景通过；行为分析样例（会话检测、统计偏离）通过；`wf test --shuffle` 结果稳定；`wf explain` 可展示 desugar 后的 Core IR |
+| 验收 | 两级/三级管道场景通过；行为分析样例（会话检测、统计偏离）通过；`wfl test --shuffle` 结果稳定；`wfl explain` 可展示 desugar 后的 Core IR |
 
 ---
 
@@ -481,7 +481,7 @@ M20 MVP 已完成，下一步两条路径可并行推进：
 | **CP2 编译就绪** | M13 | brute_scan.wfl 编译为正确的 RulePlan | ✅ 已通过 |
 | **CP3 单机 MVP** | M20 | 一条 L1 规则从数据接收到告警输出全流程跑通 | ✅ 已通过 |
 | **CP4 生产就绪** | M24 | 热加载 + 监控 + 1K EPS 性能达标 + 工具链可用 | 待验收 |
-| **CP5 Conformance 门禁** | M28 | `contract + shuffle + scenario verify` 三层门禁接入 CI | 待验收 |
+| **CP5 Conformance 门禁** | M28 | `test + shuffle + scenario verify` 三层门禁接入 CI | 待验收 |
 | **CP6 可靠性分级** | M29 | 三档传输语义可切换，指标与回放行为符合预期 | 待验收 |
 | **CP7 完整版本** | M30 | 分布式部署通过端到端验证 | 待验收 |
 | **CP8 测试闭环** | M33 | gen → run → verify 全流水线 CI 集成；扰动回归通过 | 待验收 |

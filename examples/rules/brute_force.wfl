@@ -23,8 +23,8 @@ rule brute_force_then_scan {
   )
 }
 
-contract close_hit for brute_force_then_scan {
-  given {
+test close_hit for brute_force_then_scan {
+  input {
     row(fail, sip = "10.0.0.1", username = "admin", action = "failed", event_time = "2026-01-01T00:00:00Z");
     row(fail, sip = "10.0.0.1", username = "admin", action = "failed", event_time = "2026-01-01T00:00:01Z");
     row(fail, sip = "10.0.0.1", username = "admin", action = "failed", event_time = "2026-01-01T00:00:02Z");
@@ -38,8 +38,8 @@ contract close_hit for brute_force_then_scan {
   }
 }
 
-contract below_threshold for brute_force_then_scan {
-  given {
+test below_threshold for brute_force_then_scan {
+  input {
     row(fail, sip = "10.0.0.2", username = "guest", action = "failed", event_time = "2026-01-01T00:00:00Z");
     row(fail, sip = "10.0.0.2", username = "guest", action = "failed", event_time = "2026-01-01T00:00:01Z");
   }

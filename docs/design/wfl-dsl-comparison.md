@@ -41,7 +41,7 @@
 | `in`/`not in` | `expr in (...)`/`expr not in (...)` | `in %list` | `in (...)` | ✗ | `IN (...)` | `in (...)` |
 | 规则资源预算 | `limits { max_memory ... }` (v2.1) | ✗ | ✗ | ✗ | 平台配置 | 平台配置 |
 | 输出契约版本 | `yield target@vN` + `meta.contract_version` | ✗ | ✗ | ✗ | ✗ | ✗ |
-| 可证明正确性门禁 | `contract + shuffle + scenario verify` | 平台回放 | 平台测试 | ✗ | 平台测试 | 平台测试 |
+| 可证明正确性门禁 | `test + shuffle + scenario verify` | 平台回放 | 平台测试 | ✗ | 平台测试 | 平台测试 |
 | 数据/逻辑分离 | .wfs / .wfl / .toml 三文件 + `pack.yaml` | 单文件 | 单文件 | 单文件 | 单文件 | 单文件 |
 | 能力分层 | L1/L2/L3 feature gate | ✗ | ✗ | ✗ | ✗ | ✗ |
 | 热加载 | `wf reload` (Drop) | 平台管理 | Kibana UI | 无运行时 | 平台管理 | 平台管理 |
@@ -158,7 +158,7 @@
 | Join 时点语义一等化 | `join ... snapshot/asof ... within` | L2 | 消除在线/回放在维表取值时点上的语义漂移 |
 | 规则资源预算 | `limits { max_memory; ... }` | v2.1 | 规则级资源防护，阻断高基数状态膨胀 |
 | 输出契约版本化 | `yield target@vN` + `meta.contract_version` | v2.1 | 下游字段演进可灰度、可回滚、可审计 |
-| Conformance 门禁 | `contract + shuffle + scenario verify` | v2.1 | 把“正确性验证”前置为发布门槛 |
+| Conformance 门禁 | `test + shuffle + scenario verify` | v2.1 | 把”正确性验证”前置为发布门槛 |
 | `yield` 统一输出 | 告警和归并共用一个关键字 + window 抽象 | L1 | 消除 alert/output 概念分裂 |
 | 风险等级派生 | `score` → runtime `level_map`（可版本化） | — | 等级映射与规则解耦，审计友好 |
 | 三文件分离 | .wfs / .wfl / .toml + `pack.yaml` | L1 | 数据工程师、安全分析师、SRE 各改各的 |
@@ -237,7 +237,7 @@ WFL 在检测语言中表达力最强（OR 分支、双阶段匹配、缺失检�
 | Join 语义固定 | `join` 必须显式声明 `snapshot` 或 `asof within` |
 | 资源预算内建 | `limits` 成为规则必填，编译阶段产出成本/风险评估 |
 | 输出契约治理 | `yield target@vN` + `meta.contract_version`，支持版本化演进 |
-| 正确性门禁 | `contract + shuffle + scenario verify` 三层校验作为发布门槛 |
+| 正确性门禁 | `test + shuffle + scenario verify` 三层校验作为发布门槛 |
 
 WFL 的独特定位：**唯一同时提供时序检测、实体建模、可解释数值评分、内置基线的独立 DSL**。SPL/KQL 通过平台能力（ML 模块、外部插件）可实现类似效果，但不是语言层原语——WFL 将这些能力内化为编译期可检查、运行期可解释的语言一等公民。随着 Zed 语法高亮与 LSP 落地，WFL 在开发体验上的短板也开始收敛。
 

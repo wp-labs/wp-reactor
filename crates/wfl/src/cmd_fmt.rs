@@ -1,12 +1,20 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process;
 
 use anyhow::Result;
 
+const GREEN: &str = "\x1b[1;32m";
+const RED: &str = "\x1b[1;31m";
+const YELLOW: &str = "\x1b[1;38;5;208m";
+const RESET: &str = "\x1b[0m";
+
 pub fn run(files: Vec<PathBuf>, write: bool, check: bool) -> Result<()> {
     if files.is_empty() {
         anyhow::bail!("no input files specified");
     }
+
+    let color = std::io::stderr().is_terminal();
 
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -25,7 +33,11 @@ pub fn run(files: Vec<PathBuf>, write: bool, check: bool) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("failed to parse {}", file.display()))?;
 
         if tree.root_node().has_error() {
-            eprintln!("error: syntax error in {}, skipping", file.display());
+            if color {
+                eprintln!("{RED}error{RESET}: syntax error in {}, skipping", file.display());
+            } else {
+                eprintln!("error: syntax error in {}, skipping", file.display());
+            }
             any_diff = true;
             continue;
         }
@@ -34,14 +46,22 @@ pub fn run(files: Vec<PathBuf>, write: bool, check: bool) -> Result<()> {
 
         if check {
             if source != formatted {
-                eprintln!("{}: not formatted", file.display());
+                if color {
+                    eprintln!("{YELLOW}{}{RESET}: not formatted", file.display());
+                } else {
+                    eprintln!("{}: not formatted", file.display());
+                }
                 any_diff = true;
             }
         } else if write {
             if source != formatted {
                 std::fs::write(file, &formatted)
                     .map_err(|e| anyhow::anyhow!("writing {}: {e}", file.display()))?;
-                eprintln!("formatted {}", file.display());
+                if color {
+                    eprintln!("{GREEN}formatted{RESET} {}", file.display());
+                } else {
+                    eprintln!("formatted {}", file.display());
+                }
             }
         } else {
             print!("{formatted}");

@@ -11,7 +11,7 @@ use crate::parse_wfl;
 fn parse_contract_full() {
     let input = r#"
 test dns_no_response_timeout for dns_no_response {
-    given {
+    input {
         row(req,
             query_id = "q-1",
             sip = "10.0.0.8",
@@ -35,16 +35,16 @@ test dns_no_response_timeout for dns_no_response {
 }
 "#;
     let file = parse_wfl(input).unwrap();
-    assert_eq!(file.contracts.len(), 1);
+    assert_eq!(file.tests.len(), 1);
 
-    let c = &file.contracts[0];
+    let c = &file.tests[0];
     assert_eq!(c.name, "dns_no_response_timeout");
     assert_eq!(c.rule_name, "dns_no_response");
 
     // given
-    assert_eq!(c.given.len(), 2);
-    match &c.given[0] {
-        GivenStmt::Row { alias, fields } => {
+    assert_eq!(c.input.len(), 2);
+    match &c.input[0] {
+        InputStmt::Row { alias, fields } => {
             assert_eq!(alias, "req");
             assert_eq!(fields.len(), 4);
             assert_eq!(fields[0].name, "query_id");
@@ -54,7 +54,7 @@ test dns_no_response_timeout for dns_no_response {
         }
         other => panic!("expected Row, got {other:?}"),
     }
-    assert_eq!(c.given[1], GivenStmt::Tick(Duration::from_secs(31)));
+    assert_eq!(c.input[1], InputStmt::Tick(Duration::from_secs(31)));
 
     // expect
     assert_eq!(c.expect.len(), 6);
@@ -108,7 +108,7 @@ test dns_no_response_timeout for dns_no_response {
 fn parse_contract_no_options() {
     let input = r#"
 test simple_test for my_rule {
-    given {
+    input {
         row(e, action = "failed");
         tick(5m);
     }
@@ -118,11 +118,11 @@ test simple_test for my_rule {
 }
 "#;
     let file = parse_wfl(input).unwrap();
-    let c = &file.contracts[0];
+    let c = &file.tests[0];
     assert_eq!(c.name, "simple_test");
     assert_eq!(c.rule_name, "my_rule");
     assert!(c.options.is_none());
-    assert_eq!(c.given.len(), 2);
+    assert_eq!(c.input.len(), 2);
     assert_eq!(
         c.expect[0],
         ExpectStmt::Hits {
@@ -136,13 +136,13 @@ test simple_test for my_rule {
 fn parse_contract_options_only_close_trigger() {
     let input = r#"
 test ct for r {
-    given { row(e, x = 1); }
+    input { row(e, x = 1); }
     expect { hits == 0; }
     options { close_trigger = flush; }
 }
 "#;
     let file = parse_wfl(input).unwrap();
-    let opts = file.contracts[0].options.as_ref().unwrap();
+    let opts = file.tests[0].options.as_ref().unwrap();
     assert_eq!(opts.close_trigger, Some(CloseTrigger::Flush));
     assert_eq!(opts.eval_mode, None);
 }
@@ -151,13 +151,13 @@ test ct for r {
 fn parse_contract_options_only_eval_mode() {
     let input = r#"
 test ct for r {
-    given { row(e, x = 1); }
+    input { row(e, x = 1); }
     expect { hits == 0; }
     options { eval_mode = lenient; }
 }
 "#;
     let file = parse_wfl(input).unwrap();
-    let opts = file.contracts[0].options.as_ref().unwrap();
+    let opts = file.tests[0].options.as_ref().unwrap();
     assert_eq!(opts.close_trigger, None);
     assert_eq!(opts.eval_mode, Some(EvalMode::Lenient));
 }
@@ -166,13 +166,13 @@ test ct for r {
 fn parse_contract_options_eos() {
     let input = r#"
 test ct for r {
-    given { row(e, x = 1); }
+    input { row(e, x = 1); }
     expect { hits == 1; }
     options { close_trigger = eos; }
 }
 "#;
     let file = parse_wfl(input).unwrap();
-    let opts = file.contracts[0].options.as_ref().unwrap();
+    let opts = file.tests[0].options.as_ref().unwrap();
     assert_eq!(opts.close_trigger, Some(CloseTrigger::Eos));
 }
 
@@ -180,7 +180,7 @@ test ct for r {
 fn parse_contract_field_assert_expr() {
     let input = r#"
 test ct for r {
-    given { row(e, count = 10); }
+    input { row(e, count = 10); }
     expect {
         hits == 1;
         hit[0].field("count") >= 5 + 3;
@@ -188,7 +188,7 @@ test ct for r {
 }
 "#;
     let file = parse_wfl(input).unwrap();
-    match &file.contracts[0].expect[1] {
+    match &file.tests[0].expect[1] {
         ExpectStmt::HitAssert {
             index,
             assert: HitAssert::Field { name, cmp, value },
@@ -206,15 +206,15 @@ test ct for r {
 fn parse_contract_string_field_name() {
     let input = r#"
 test ct for r {
-    given {
+    input {
         row(e, "detail.sha256" = "abc123");
     }
     expect { hits == 1; }
 }
 "#;
     let file = parse_wfl(input).unwrap();
-    match &file.contracts[0].given[0] {
-        GivenStmt::Row { fields, .. } => {
+    match &file.tests[0].input[0] {
+        InputStmt::Row { fields, .. } => {
             assert_eq!(fields[0].name, "detail.sha256");
         }
         other => panic!("expected Row, got {other:?}"),
@@ -225,18 +225,18 @@ test ct for r {
 fn parse_multiple_contracts() {
     let input = r#"
 test ct1 for r1 {
-    given { row(e, x = 1); }
+    input { row(e, x = 1); }
     expect { hits == 1; }
 }
 test ct2 for r2 {
-    given { row(e, x = 2); tick(10s); }
+    input { row(e, x = 2); tick(10s); }
     expect { hits == 0; }
 }
 "#;
     let file = parse_wfl(input).unwrap();
-    assert_eq!(file.contracts.len(), 2);
-    assert_eq!(file.contracts[0].name, "ct1");
-    assert_eq!(file.contracts[1].name, "ct2");
+    assert_eq!(file.tests.len(), 2);
+    assert_eq!(file.tests[0].name, "ct1");
+    assert_eq!(file.tests[1].name, "ct2");
 }
 
 #[test]
@@ -254,7 +254,7 @@ rule brute_force {
 }
 
 test brute_test for brute_force {
-    given {
+    input {
         row(fail, action = "failed", sip = "1.2.3.4");
         row(fail, action = "failed", sip = "1.2.3.4");
         row(fail, action = "failed", sip = "1.2.3.4");
@@ -273,20 +273,20 @@ test brute_test for brute_force {
     let file = parse_wfl(input).unwrap();
     assert_eq!(file.uses.len(), 1);
     assert_eq!(file.rules.len(), 1);
-    assert_eq!(file.contracts.len(), 1);
-    assert_eq!(file.contracts[0].rule_name, "brute_force");
-    assert_eq!(file.contracts[0].given.len(), 4);
+    assert_eq!(file.tests.len(), 1);
+    assert_eq!(file.tests[0].rule_name, "brute_force");
+    assert_eq!(file.tests[0].input.len(), 4);
 
     // 3 rows + 1 tick
-    let rows: Vec<_> = file.contracts[0]
-        .given
+    let rows: Vec<_> = file.tests[0]
+        .input
         .iter()
-        .filter(|s| matches!(s, GivenStmt::Row { .. }))
+        .filter(|s| matches!(s, InputStmt::Row { .. }))
         .collect();
     assert_eq!(rows.len(), 3);
     assert_eq!(
-        file.contracts[0].given[3],
-        GivenStmt::Tick(Duration::from_secs(360))
+        file.tests[0].input[3],
+        InputStmt::Tick(Duration::from_secs(360))
     );
 }
 
@@ -294,7 +294,7 @@ test brute_test for brute_force {
 fn parse_contract_multiple_rows() {
     let input = r#"
 test ct for r {
-    given {
+    input {
         row(req, query_id = "q-1", sip = "10.0.0.1");
         row(resp, query_id = "q-1", sip = "10.0.0.1");
         tick(31s);
@@ -305,17 +305,17 @@ test ct for r {
 }
 "#;
     let file = parse_wfl(input).unwrap();
-    let c = &file.contracts[0];
-    assert_eq!(c.given.len(), 3);
-    match &c.given[0] {
-        GivenStmt::Row { alias, fields } => {
+    let c = &file.tests[0];
+    assert_eq!(c.input.len(), 3);
+    match &c.input[0] {
+        InputStmt::Row { alias, fields } => {
             assert_eq!(alias, "req");
             assert_eq!(fields.len(), 2);
         }
         other => panic!("expected Row, got {other:?}"),
     }
-    match &c.given[1] {
-        GivenStmt::Row { alias, fields } => {
+    match &c.input[1] {
+        InputStmt::Row { alias, fields } => {
             assert_eq!(alias, "resp");
             assert_eq!(fields.len(), 2);
         }
@@ -327,7 +327,7 @@ test ct for r {
 fn parse_contract_hit_score_cmp() {
     let input = r#"
 test ct for r {
-    given { row(e, x = 1); }
+    input { row(e, x = 1); }
     expect {
         hit[0].score >= 50.0;
         hit[0].score <= 100.0;
@@ -336,7 +336,7 @@ test ct for r {
 }
 "#;
     let file = parse_wfl(input).unwrap();
-    let stmts = &file.contracts[0].expect;
+    let stmts = &file.tests[0].expect;
     assert_eq!(stmts.len(), 3);
     match &stmts[0] {
         ExpectStmt::HitAssert {

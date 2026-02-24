@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
-use crate::rule::contract::run_contract;
+use crate::rule::contract::run_test;
 
 /// Schema for auth_events window.
 fn auth_events_schema() -> WindowSchema {
@@ -56,28 +56,28 @@ fn security_alerts_schema() -> WindowSchema {
 }
 
 /// Parse a WFL source with rule + contract, compile the rule, and run the contract.
-fn run_contract_from_source(source: &str) -> crate::rule::contract::ContractResult {
+fn run_contract_from_source(source: &str) -> crate::rule::contract::TestResult {
     let schemas = vec![auth_events_schema(), security_alerts_schema()];
     let wfl_file = wf_lang::parse_wfl(source).expect("parse should succeed");
     let plans = wf_lang::compile_wfl(&wfl_file, &schemas).expect("compile should succeed");
 
     assert!(
-        !wfl_file.contracts.is_empty(),
-        "expected at least one contract"
+        !wfl_file.tests.is_empty(),
+        "expected at least one test"
     );
-    let test = &wfl_file.contracts[0];
+    let test = &wfl_file.tests[0];
 
     let plan = plans
         .iter()
-        .find(|p| p.name == contract.rule_name)
-        .unwrap_or_else(|| panic!("rule `{}` not found in plans", contract.rule_name));
+        .find(|p| p.name == test.rule_name)
+        .unwrap_or_else(|| panic!("rule `{}` not found in plans", test.rule_name));
 
     let time_field = schemas
         .iter()
         .find(|s| plan.binds.iter().any(|b| b.window == s.name))
         .and_then(|s| s.time_field.clone());
 
-    run_contract(contract, plan, time_field).expect("run_contract should succeed")
+    run_test(test, plan, time_field).expect("run_test should succeed")
 }
 
 #[test]
@@ -91,7 +91,7 @@ rule brute_force {
 }
 
 test five_hits for brute_force {
-    given {
+    input {
         row(e, sip = "10.0.0.1", action = "failed");
         row(e, sip = "10.0.0.1", action = "failed");
         row(e, sip = "10.0.0.1", action = "failed");
@@ -121,7 +121,7 @@ rule brute_force {
 }
 
 test below_threshold for brute_force {
-    given {
+    input {
         row(e, sip = "10.0.0.1", action = "failed");
         row(e, sip = "10.0.0.1", action = "failed");
         row(e, sip = "10.0.0.1", action = "failed");
@@ -150,7 +150,7 @@ rule timeout_rule {
 }
 
 test test_timeout for timeout_rule {
-    given {
+    input {
         row(e, sip = "10.0.0.1", action = "failed");
         row(e, sip = "10.0.0.1", action = "failed");
         tick(6m);
@@ -182,7 +182,7 @@ rule eos_rule {
 }
 
 test test_eos for eos_rule {
-    given {
+    input {
         row(e, sip = "10.0.0.1", action = "failed");
         row(e, sip = "10.0.0.1", action = "failed");
     }
@@ -209,7 +209,7 @@ rule brute_force {
 }
 
 test score_fail for brute_force {
-    given {
+    input {
         row(e, sip = "10.0.0.1");
         row(e, sip = "10.0.0.1");
         row(e, sip = "10.0.0.1");
@@ -241,7 +241,7 @@ rule brute_force {
 }
 
 test entity_check for brute_force {
-    given {
+    input {
         row(e, sip = "10.0.0.1");
         row(e, sip = "10.0.0.1");
         row(e, sip = "10.0.0.1");
@@ -268,7 +268,7 @@ rule brute_force {
 }
 
 test hits_ge for brute_force {
-    given {
+    input {
         row(e, sip = "10.0.0.1");
         row(e, sip = "10.0.0.1");
         row(e, sip = "10.0.0.1");

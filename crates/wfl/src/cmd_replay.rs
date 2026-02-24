@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, IsTerminal};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -10,6 +10,13 @@ use wf_core::rule::{
 };
 use wf_lang::WindowSchema;
 use wf_lang::plan::RulePlan;
+
+const GREEN: &str = "\x1b[1;32m";
+const RED: &str = "\x1b[1;31m";
+const YELLOW: &str = "\x1b[1;38;5;208m";
+const DIM: &str = "\x1b[2m";
+const BOLD: &str = "\x1b[1m";
+const RESET: &str = "\x1b[0m";
 
 /// Result of replaying events through compiled rules.
 pub struct ReplayResult {
@@ -31,6 +38,7 @@ pub fn run(
 
     let cwd = std::env::current_dir()?;
     let var_map = parse_vars(&vars)?;
+    let color = std::io::stderr().is_terminal();
 
     let all_schemas = load_schemas(&schemas, &cwd)?;
     let source = load_wfl(&file, &var_map)?;
@@ -40,7 +48,7 @@ pub fn run(
             .map_err(|e| anyhow::anyhow!("failed to open {}: {}", input.display(), e))?,
     );
 
-    let result = replay_events(&source, &all_schemas, reader, &alias)?;
+    let result = replay_events(&source, &all_schemas, reader, &alias, color)?;
 
     for alert in &result.alerts {
         match serde_json::to_string(alert) {
@@ -49,11 +57,30 @@ pub fn run(
         }
     }
 
+    // Summary
     eprintln!("---");
-    eprintln!(
-        "Replay complete: {} events processed, {} matches, {} errors",
-        result.event_count, result.match_count, result.error_count
-    );
+    if color {
+        let ev = result.event_count;
+        let mc = result.match_count;
+        let ec = result.error_count;
+        eprint!("{BOLD}Replay complete:{RESET} {ev} events processed, ");
+        if mc > 0 {
+            eprint!("{GREEN}{mc} matches{RESET}");
+        } else {
+            eprint!("{DIM}0 matches{RESET}");
+        }
+        eprint!(", ");
+        if ec > 0 {
+            eprintln!("{RED}{ec} errors{RESET}");
+        } else {
+            eprintln!("{DIM}0 errors{RESET}");
+        }
+    } else {
+        eprintln!(
+            "Replay complete: {} events processed, {} matches, {} errors",
+            result.event_count, result.match_count, result.error_count
+        );
+    }
 
     Ok(())
 }
@@ -67,6 +94,7 @@ pub fn replay_events<R: BufRead>(
     schemas: &[WindowSchema],
     reader: R,
     alias: &str,
+    color: bool,
 ) -> Result<ReplayResult> {
     let wfl_file =
         wf_lang::parse_wfl(wfl_source).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
@@ -81,7 +109,7 @@ pub fn replay_events<R: BufRead>(
         });
     }
 
-    replay_with_plans(&plans, schemas, reader, alias)
+    replay_with_plans(&plans, schemas, reader, alias, color)
 }
 
 /// Stub [`WindowLookup`] for replay mode.
@@ -110,6 +138,7 @@ fn replay_with_plans<R: BufRead>(
     schemas: &[WindowSchema],
     reader: R,
     alias: &str,
+    color: bool,
 ) -> Result<ReplayResult> {
     let mut engines: Vec<(CepStateMachine, RuleExecutor)> = plans
         .iter()
@@ -153,11 +182,19 @@ fn replay_with_plans<R: BufRead>(
         let json: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!(
-                    "WARN: skipping invalid JSON on line {}: {}",
-                    event_count + 1,
-                    e
-                );
+                if color {
+                    eprintln!(
+                        "{YELLOW}WARN{RESET}: skipping invalid JSON on line {}: {}",
+                        event_count + 1,
+                        e
+                    );
+                } else {
+                    eprintln!(
+                        "WARN: skipping invalid JSON on line {}: {}",
+                        event_count + 1,
+                        e
+                    );
+                }
                 error_count += 1;
                 continue;
             }
@@ -175,7 +212,11 @@ fn replay_with_plans<R: BufRead>(
                             match_count += 1;
                         }
                         Err(e) => {
-                            eprintln!("ERROR: execute_match failed: {}", e);
+                            if color {
+                                eprintln!("{RED}ERROR{RESET}: execute_match failed: {}", e);
+                            } else {
+                                eprintln!("ERROR: execute_match failed: {}", e);
+                            }
                             error_count += 1;
                         }
                     }
@@ -195,7 +236,11 @@ fn replay_with_plans<R: BufRead>(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    eprintln!("ERROR: execute_close failed: {}", e);
+                    if color {
+                        eprintln!("{RED}ERROR{RESET}: execute_close failed: {}", e);
+                    } else {
+                        eprintln!("ERROR: execute_close failed: {}", e);
+                    }
                     error_count += 1;
                 }
             }

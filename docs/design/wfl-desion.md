@@ -96,7 +96,7 @@ runtime: runtime/wfusion.toml
 - Join 时点语义：`join` 必须显式声明 `snapshot` 或 `asof [within dur]`。
 - 规则资源预算：推荐每条规则声明 `limits { ... }`；省略时编译器发出 Warning。
 - 输出契约版本：`yield target@vN (...)` 成为标准写法（L1/L2 不再省略版本）。
-- 一致性测试门禁：`wf test --contracts` 与 `wf test --shuffle` 均为发布前必跑。
+- 一致性测试门禁：`wfl test` 与 `wfl test --shuffle` 均为发布前必跑。
 
 **分层对照表：**
 
@@ -213,7 +213,7 @@ WFL 采用固定主执行链，阶段顺序不可变（`entity(...)` 为 YIELD �
 - `entity(type, id_expr)` 为实体建模一等语法，禁止再依赖 `yield` 手工拼 `entity_type/entity_id`。
 - 推荐每条规则声明 `limits { ... }` 资源预算；省略时编译器发出 Warning（未来版本可能升级为错误）。声明后编译期产出 `CostPlan`。
 - **聚合写法统一**：`alias.field | distinct | count` 与 `distinct(alias.field)` 在语义上等价，编译阶段统一 desugar 为同一聚合 IR。
-- 新增 `contract { given/expect }` 规则契约测试块：仅用于 `wf test`/CI 前置校验，不进入生产执行链。
+- 新增 `test { input/expect }` 规则测试块：仅用于 `wf test`/CI 前置校验，不进入生产执行链。
 
 ---
 
@@ -261,7 +261,7 @@ base_type     = "chars" | "digit" | "float" | "bool" | "time" | "ip" | "hex" ;
 > L3 特性（`|>`、`conv`、`fixed`）以 `(* L3 *)` 标注。L1/L2 实现可忽略带 L3 标注的产生式。
 
 ```ebnf
-wfl_file      = { use_decl } , { rule_decl } , { contract_block } ;
+wfl_file      = { use_decl } , { rule_decl } , { test_block } ;
 use_decl      = "use" , STRING ;
 rule_decl     = "rule" , IDENT , "{" , [ meta_block ] , [ features_block ] , events_block , stage_chain , [ limits_clause ] , "}" ;
 
@@ -322,10 +322,10 @@ limit_item    = "max_memory" , "=" , STRING , ";"
               | "max_throttle" , "=" , STRING , ";"
               | "on_exceed" , "=" , STRING , ";" ;       (* throttle | drop_oldest | fail_rule *)
 
-(* 规则契约测试（given/expect，供 wf test 使用） *)
-contract_block = "contract" , IDENT , "for" , IDENT , "{" , given_block , expect_block , [ options_block ] , "}" ;
-given_block    = "given" , "{" , { given_stmt } , "}" ;
-given_stmt     = "row" , "(" , IDENT , "," , field_assign , { "," , field_assign } , ")" , ";"
+(* 规则测试（input/expect，供 wf test 使用） *)
+test_block     = "test" , IDENT , "for" , IDENT , "{" , input_block , expect_block , [ options_block ] , "}" ;
+input_block    = "input" , "{" , { input_stmt } , "}" ;
+input_stmt     = "row" , "(" , IDENT , "," , field_assign , { "," , field_assign } , ")" , ";"
                | "tick" , "(" , DURATION , ")" , ";" ;
 field_assign   = ( IDENT | STRING ) , "=" , expr ;
 expect_block   = "expect" , "{" , { expect_stmt } , "}" ;
@@ -373,7 +373,7 @@ field_ref     = IDENT
 (* 词法（简化） *)
 IDENT         = ALPHA , { ALPHA | DIGIT | "_" } ;
 NUMBER        = DIGIT , { DIGIT } , [ "." , DIGIT , { DIGIT } ] ;
-INTEGER       = DIGIT , { DIGIT } ;                           (* 非负整数，用于 contract hits/hit[idx] *)
+INTEGER       = DIGIT , { DIGIT } ;                           (* 非负整数，用于 test hits/hit[idx] *)
 STRING        = '"' , { ANY - '"' } , '"' ;
 DURATION      = DIGIT , { DIGIT } , ( "s" | "m" | "h" | "d" ) ;
 ALPHA         = "a".."z" | "A".."Z" | "_" ;
@@ -500,7 +500,7 @@ match<sip:5m> {
 6. desugar：展开 `|>`、隐式 stage、`conv` 钩子。
 7. 生成 Core IR（Bind/Match/Join/Yield）。
 8. 输出 RulePlan（供 MatchEngine 执行）。
-9. 若存在 `contract_block`，输出 ContractPlan（供 `wf test` 执行；不进入生产运行时）。
+9. 若存在 `test_block`，输出 TestPlan（供 `wfl test` 执行；不进入生产运行时）。
 10. 输出 ExplainJSON（展开规则、血缘图、评分图、derive DAG、成本摘要）。
 
 ### 8.2 RulePlan 结构
@@ -1247,32 +1247,32 @@ eos_emit_reason = "eos"          # 固定为 eos，供审计
 
 - 监控建议：暴露 `eval_null_coerced_total`、`eval_runtime_error_total`、`eval_drop_rule_total` 三类指标。
 
-### 12.11 规则契约测试（given / expect）
+### 12.11 规则测试（input / expect）
 
-- 目标：把规则正确性前置到 CI，在发布前通过可回放、可断言的小样本契约测试拦截回归。
-- 运行入口：`wf test --contracts rules/security.wfl`；可用 `--contract <name>` 只跑单个契约。
-- 契约块只用于测试，不参与生产执行链。
+- 目标：把规则正确性前置到 CI，在发布前通过可回放、可断言的小样本测试拦截回归。
+- 运行入口：`wfl test rules/security.wfl`；可用 `--test <name>` 只跑单个测试。
+- 测试块只用于测试，不参与生产执行链。
 
-**契约语义规则：**
+**测试语义规则：**
 
 | ID | 规则 |
 |----|------|
-| CT1 | `contract <name> for <rule_name>` 的目标规则必须存在且唯一。 |
-| CT2 | `given` 中 `row(alias, ...)` 的 `alias` 必须在目标规则 `events {}` 中声明。 |
+| CT1 | `test <name> for <rule_name>` 的目标规则必须存在且唯一。 |
+| CT2 | `input` 中 `row(alias, ...)` 的 `alias` 必须在目标规则 `events {}` 中声明。 |
 | CT3 | `row` 字段名允许 `IDENT` 或 `STRING`（用于 `detail.sha256` 等带点字段）。 |
 | CT4 | `row` 按声明顺序注入；缺失字段按 `null` 处理，类型转换与运行时一致。 |
 | CT5 | `tick(dur)` 推进测试时钟并触发窗口关闭；若未显式 `tick`，测试结束自动按 `options.close_trigger`（默认 `timeout`）收尾。 |
-| CT6 | `expect { hits ... }` 断言该契约产生的输出条数；`hit[i]` 要求 `0 <= i < hits`。 |
+| CT6 | `expect { hits ... }` 断言该测试产生的输出条数；`hit[i]` 要求 `0 <= i < hits`。 |
 | CT7 | `hit[i].field("x")` 读取第 `i` 条输出字段；字段不存在或类型不匹配即断言失败。 |
 | CT8 | `options.eval_mode` 仅允许 `strict|lenient`；`options.close_trigger` 仅允许 `timeout|flush|eos`。 |
 
 **CI 建议：**
-- Pull Request 必跑：`wf test --contracts <all-wfl-files>`。
-- 失败即阻断合并，并输出失败契约名、失败断言、输入重放片段。
+- Pull Request 必跑：`wfl test <all-wfl-files>`。
+- 失败即阻断合并，并输出失败测试名、失败断言、输入重放片段。
 
-**`wf test` 失败输出契约（建议实现）：**
+**`wfl test` 失败输出（建议实现）：**
 
-- 退出码：全部通过返回 `0`；任一契约失败返回 `2`；解析/编译错误返回 `3`。
+- 退出码：全部通过返回 `0`；任一测试失败返回 `2`；解析/编译错误返回 `3`。
 - 输出层级：先给 `summary`，再列 `failures[]`；每个失败项都可独立重放。
 
 推荐 JSON（`--format json`）结构：
@@ -1287,7 +1287,7 @@ eos_emit_reason = "eos"          # 固定为 eos，供审计
   },
   "failures": [
     {
-      "contract": "dns_no_response_timeout",
+      "test": "dns_no_response_timeout",
       "rule": "dns_no_response",
       "code": "E_ASSERT_EQ",
       "message": "hit[0].close_reason expected timeout but got flush",
@@ -1316,15 +1316,15 @@ eos_emit_reason = "eos"          # 固定为 eos，供审计
 - `E_FIELD_MISSING`：`hit[i].field("x")` 字段不存在。
 
 终端摘要（默认文本）建议：
-- `FAILED contracts=1/12 file=rules/dns.wfl`
+- `FAILED tests=1/12 file=rules/dns.wfl`
 - `- dns_no_response_timeout: E_ASSERT_EQ at rules/dns.wfl:1333`
 - `  assertion: hit[0].close_reason == "timeout"`
 - `  actual: flush`
-- `  replay: wf test --contracts rules/dns.wfl --contract dns_no_response_timeout --dump-replay`
+- `  replay: wfl test rules/dns.wfl --test dns_no_response_timeout --dump-replay`
 
 ### 12.12 可证明正确性门禁（Conformance）
 
-- v2.1 发布门禁包含三层：`contract`、`shuffle`、`scenario verify`，三者均通过才允许发布。
+- v2.1 发布门禁包含三层：`test`、`shuffle`、`scenario verify`，三者均通过才允许发布。
 - 引入 Reference Evaluator 作为语义裁判：与生产引擎共享 RulePlan，但执行路径独立。
 - 判定口径统一：`missing == 0 && unexpected == 0 && field_mismatch == 0`。
 
@@ -1332,8 +1332,8 @@ eos_emit_reason = "eos"          # 固定为 eos，供审计
 
 | 层级 | 命令 | 目标 |
 |------|------|------|
-| 单元契约 | `wf test --contracts rules/*.wfl` | 规则逻辑正确性 |
-| 顺序扰动 | `wf test --contracts rules/*.wfl --shuffle --runs 20` | 顺序/乱序不变性 |
+| 单元测试 | `wfl test rules/*.wfl` | 规则逻辑正确性 |
+| 顺序扰动 | `wfl test rules/*.wfl --shuffle --runs 20` | 顺序/乱序不变性 |
 | 集成对拍 | `wfgen gen -> wf run --replay -> wfgen verify` | 引擎端到端一致性 |
 
 **Reference Evaluator 约束：**
@@ -1555,10 +1555,10 @@ rule login_anomaly {
 }
 ```
 
-### 13.8 规则契约测试（CI 前置）
+### 13.8 规则测试（CI 前置）
 ```wfl
-contract dns_no_response_timeout for dns_no_response {
-  given {
+test dns_no_response_timeout for dns_no_response {
+  input {
     row(req,
       query_id = "q-1",
       sip = "10.0.0.8",
@@ -1614,7 +1614,7 @@ contract dns_no_response_timeout for dns_no_response {
 
 ### Phase 1（可证明正确基础）
 - 交付 Reference Evaluator（语义裁判）与 Conformance 套件。
-- CI 接入三层门禁：`contract` + `shuffle` + `scenario verify`。
+- CI 接入三层门禁：`test` + `shuffle` + `scenario verify`。
 - **wfgen P1**：rule-aware + oracle + verify，输出差异归因报告。
 
 ### Phase 2（可运营治理）
@@ -2071,9 +2071,9 @@ wfgen gen \
 3. `wfgen verify` 输出差异报告。
 4. CI 阻断条件（默认）：`missing == 0 && unexpected == 0 && field_mismatch == 0`。
 
-### 18.9 与 `contract` 的关系
+### 18.9 与 `test` 的关系
 
-| 维度 | `contract`（§12.11） | `scenario`（`.wfg`） |
+| 维度 | `test`（§12.11） | `scenario`（`.wfg`） |
 |------|---------------------|---------------------|
 | 用途 | 单规则小样本精确断言 | 多规则大规模统计验证 |
 | 数据来源 | 手写 `row()`，逐条可控 | 生成器按分布自动产出 |
@@ -2082,7 +2082,7 @@ wfgen gen \
 | 定位 | **单元测试**：验证单条规则的逻辑正确性 | **集成测试**：验证引擎在接近生产负载下的端到端正确性 |
 | CI 阶段 | PR 必跑（秒级） | 定时/Release 跑（分钟级） |
 
-两者互补：`contract` 先保证规则逻辑正确，`scenario` 再保证引擎处理正确。
+两者互补：`test` 先保证规则逻辑正确，`scenario` 再保证引擎处理正确。
 
 ### 18.10 分阶段落地
 

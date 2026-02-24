@@ -74,9 +74,9 @@ enum Commands {
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Event alias to replay as (matches events block alias)
+        /// Event name to replay as (matches events block declaration)
         #[arg(long)]
-        alias: String,
+        event: String,
 
         /// Variable substitutions in KEY=VALUE format
         #[arg(long)]
@@ -122,10 +122,10 @@ fn main() -> Result<()> {
             file,
             schemas,
             input,
-            alias,
+            event,
             var,
         } => {
-            wfl::cmd_replay::run(file, schemas, input, alias, var)?;
+            wfl::cmd_replay::run(file, schemas, input, event, var)?;
         }
 
         Commands::Test { file, schemas, var } => {

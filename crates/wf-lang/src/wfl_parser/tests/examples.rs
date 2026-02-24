@@ -132,5 +132,5 @@ fn parse_empty_file() {
     let file = parse_wfl("").unwrap();
     assert!(file.uses.is_empty());
     assert!(file.rules.is_empty());
-    assert!(file.contracts.is_empty());
+    assert!(file.tests.is_empty());
 }

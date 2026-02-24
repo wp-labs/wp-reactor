@@ -1285,15 +1285,15 @@ if count(fail) > 10 then 90.0 else 70.0
 
 ---
 
-## 8. 规则契约测试
+## 8. 规则测试
 
-契约测试（Contract Test）用于在 CI 中前置验证规则的逻辑正确性，通过小样本输入和预期断言确保规则行为不退化。
+规则测试（Rule Test）用于在 CI 中前置验证规则的逻辑正确性，通过小样本输入和预期断言确保规则行为不退化。
 
-### 8.1 契约语法
+### 8.1 测试语法
 
 ```wfl
-contract <测试名> for <规则名> {
-    given {
+test <测试名> for <规则名> {
+    input {
         // 注入测试事件
         row(<别名>, <字段> = <值>, ...);
         tick(<时长>);     // 推进测试时钟
@@ -1314,10 +1314,10 @@ contract <测试名> for <规则名> {
 }
 ```
 
-### 8.2 given — 输入事件
+### 8.2 input — 输入事件
 
 ```wfl
-given {
+input {
     row(fail, action = "failed", sip = "1.2.3.4");
     row(fail, action = "failed", sip = "1.2.3.4");
     row(fail, action = "failed", sip = "1.2.3.4");
@@ -1371,8 +1371,8 @@ wfl test rules/brute_force.wfl --schemas "schemas/*.wfs"
 
 ```wfl
 // 暴力破解检测 — 基本命中
-contract brute_test for brute_force {
-    given {
+test brute_test for brute_force {
+    input {
         row(fail, action = "failed", sip = "1.2.3.4");
         row(fail, action = "failed", sip = "1.2.3.4");
         row(fail, action = "failed", sip = "1.2.3.4");
@@ -1389,8 +1389,8 @@ contract brute_test for brute_force {
 }
 
 // DNS 无响应 — 超时检测
-contract dns_no_response_timeout for dns_no_response {
-    given {
+test dns_no_response_timeout for dns_no_response {
+    input {
         row(req,
             query_id = "q-1",
             sip = "10.0.0.8",
@@ -1536,11 +1536,11 @@ PASS  brute_test (brute_force)
 FAIL  edge_case_test (brute_force)
       hits: expected hits == 1, got 0
 
-2 contracts: 1 passed, 1 failed
+2 tests: 1 passed, 1 failed
 ```
 
 - 有失败时退出码为 1，适合 CI 集成。
-- 无契约时输出 `No contracts found.`。
+- 无测试时输出 `No tests found.`。
 
 ---
 
@@ -1821,7 +1821,7 @@ WFL 功能按 L1/L2/L3 分层，渐进式开放。
 | `$VAR` / `${VAR:default}` | 变量预处理 |
 | `contains`/`lower`/`upper`/`len` | 字符串函数（guard/score/entity 表达式） |
 | `match<key:dur:fixed>` | 固定窗口（不重叠时间桶） |
-| `contract ... for ...` | 规则契约测试 |
+| `test ... for ...` | 规则测试 |
 | `wfl` CLI | 开发者工具（explain/lint/fmt/replay/test） |
 
 ### L2（增强 — 部分实现）

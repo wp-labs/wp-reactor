@@ -78,8 +78,7 @@ fn replay_five_events_one_match() {
     let ndjson = make_ndjson_events(5);
     let reader = BufReader::new(ndjson.as_bytes());
 
-    let result = replay_events(WFL_RULE, &schemas, reader, "e").expect("replay should succeed");
-
+    let result = replay_events(WFL_RULE, &schemas, reader, "e", false).expect("replay should succeed");
     assert_eq!(result.event_count, 5);
     assert_eq!(result.match_count, 1);
     assert_eq!(result.error_count, 0);
@@ -98,8 +97,7 @@ fn replay_below_threshold_no_match() {
     let ndjson = make_ndjson_events(3);
     let reader = BufReader::new(ndjson.as_bytes());
 
-    let result = replay_events(WFL_RULE, &schemas, reader, "e").expect("replay should succeed");
-
+    let result = replay_events(WFL_RULE, &schemas, reader, "e", false).expect("replay should succeed");
     assert_eq!(result.event_count, 3);
     assert_eq!(result.match_count, 0);
     assert_eq!(result.error_count, 0);
@@ -134,7 +132,7 @@ fn replay_eof_close_all_fires_alert() {
     let reader = BufReader::new(ndjson.as_bytes());
 
     let result =
-        replay_events(WFL_CLOSE_RULE, &schemas, reader, "e").expect("replay should succeed");
+        replay_events(WFL_CLOSE_RULE, &schemas, reader, "e", false).expect("replay should succeed");
 
     assert_eq!(result.event_count, 2);
     assert_eq!(result.match_count, 1, "expected one alert from EOF close");
@@ -208,7 +206,7 @@ rule multi_src {
         );
     let reader = BufReader::new(ndjson.as_bytes());
 
-    let result = replay_events(wfl, &schemas, reader, "b").expect("replay should succeed");
+    let result = replay_events(wfl, &schemas, reader, "b", false).expect("replay should succeed");
 
     assert_eq!(result.event_count, 2);
     assert_eq!(result.match_count, 1);
