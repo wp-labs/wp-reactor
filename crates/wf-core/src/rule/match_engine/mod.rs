@@ -198,22 +198,30 @@ impl CepStateMachine {
                     ExceedAction::Throttle => return StepResult::Accumulate,
                     ExceedAction::DropOldest => {
                         // Evict oldest instances in a loop until under limit or nothing left.
-                        // Never evict the current key's instance — doing so would lose
-                        // accumulated state and cause an unaccounted re-creation at entry().
+                        // If the current key is the oldest it gets evicted too — its
+                        // accumulated state is lost and entry() re-creates a fresh instance.
+                        // We add the re-creation base cost to the budget so the loop
+                        // keeps evicting until the fresh instance actually fits.
                         while total >= max_bytes {
                             if let Some(oldest_key) = self
                                 .instances
                                 .iter()
-                                .filter(|(k, _)| k.as_str() != instance_key)
                                 .min_by_key(|(_, inst)| inst.created_at)
                                 .map(|(k, _)| k.clone())
                             {
+                                let evicting_current = oldest_key == instance_key;
                                 let removed = self.instances.remove(&oldest_key);
                                 if let Some(ref inst) = removed {
                                     total = total.saturating_sub(inst.estimated_bytes());
                                 }
+                                // Current key will be re-created — account for base cost
+                                if evicting_current && !is_new {
+                                    total += Instance::base_estimated_bytes(
+                                        plan, &scope_key,
+                                    );
+                                }
                             } else {
-                                // No other instances to evict — cannot make room
+                                // No instances to evict — cannot make room
                                 return StepResult::Accumulate;
                             }
                         }
@@ -381,9 +389,9 @@ impl CepStateMachine {
                 expired_keys.push((key.clone(), inst.created_at));
             }
         }
-        // Sort by created_at so rate_limit_close sees monotonically increasing
-        // expire_time, producing deterministic results regardless of HashMap order.
-        expired_keys.sort_by_key(|(_, created_at)| *created_at);
+        // Sort by (created_at, key) so rate_limit_close sees a fully
+        // deterministic order regardless of HashMap iteration order.
+        expired_keys.sort_by(|(k1, t1), (k2, t2)| t1.cmp(t2).then_with(|| k1.cmp(k2)));
         let mut results = Vec::with_capacity(expired_keys.len());
         for (key, _) in expired_keys {
             if let Some(instance) = self.instances.remove(&key) {
@@ -407,14 +415,14 @@ impl CepStateMachine {
     ///
     /// Used during shutdown to flush all in-flight state.
     pub fn close_all(&mut self, reason: CloseReason) -> Vec<CloseOutput> {
-        // Sort by created_at for deterministic rate limiting order,
-        // same rationale as scan_expired_at.
+        // Sort by (created_at, key) for fully deterministic rate limiting
+        // order, same rationale as scan_expired_at.
         let mut keys: Vec<(String, i64)> = self
             .instances
             .iter()
             .map(|(k, inst)| (k.clone(), inst.created_at))
             .collect();
-        keys.sort_by_key(|(_, created_at)| *created_at);
+        keys.sort_by(|(k1, t1), (k2, t2)| t1.cmp(t2).then_with(|| k1.cmp(k2)));
         let mut results = Vec::with_capacity(keys.len());
         let wm = self.watermark_nanos;
         for (key, _) in keys {

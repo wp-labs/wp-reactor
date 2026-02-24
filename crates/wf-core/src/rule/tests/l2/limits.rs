@@ -409,11 +409,11 @@ fn limits_scan_expired_rate_limit_deterministic() {
 }
 
 // ===========================================================================
-// Limits: max_memory_bytes + DropOldest does not evict the current key
+// Limits: max_memory_bytes + DropOldest evicts the current key when oldest
 // ===========================================================================
 
 #[test]
-fn limits_max_memory_bytes_drop_oldest_preserves_current_key() {
+fn limits_max_memory_bytes_drop_oldest_evicts_current_key() {
     // Use a 2-step plan: each step needs count >= 1.
     // After step1 completes, completed_steps grows and estimated_bytes
     // increases from ~320 (base for 2-step) to ~384 bytes per instance.
@@ -434,7 +434,7 @@ fn limits_max_memory_bytes_drop_oldest_preserves_current_key() {
         on_exceed: ExceedAction::DropOldest,
     };
     let mut sm = CepStateMachine::with_limits(
-        "rule_drop_preserve".to_string(),
+        "rule_drop_current".to_string(),
         plan,
         None,
         Some(limits),
@@ -452,16 +452,18 @@ fn limits_max_memory_bytes_drop_oldest_preserves_current_key() {
 
     // Event 3 for A (oldest key, created_at=100):
     // Memory check: 768 >= 750 → DropOldest.
-    // Must skip A (current key), evict B instead.
-    // A continues with step2, count=1 >= 1 → Matched.
+    // A is the oldest → evicted. Re-creation base cost ~320 is budgeted:
+    //   768 - 384(A) + 320(base) = 704 < 750 → fits.
+    // Fresh A processes event: step1 count=1 >= 1 → Advance (step2 remains).
     let result = sm.advance_at("fail", &e1, 300);
-    assert!(
-        matches!(result, StepResult::Matched(_)),
-        "expected Matched (step2 on preserved key), got {:?}",
+    assert_eq!(
+        result,
+        StepResult::Advance,
+        "expected Advance (step1 on fresh re-created instance), got {:?}",
         result
     );
-    // B was evicted; A matched and was reset (stays in map for reuse)
-    assert_eq!(sm.instance_count(), 1);
+    // B (384 bytes) + fresh A (320 base) = 704: both instances alive.
+    assert_eq!(sm.instance_count(), 2);
 }
 
 // ===========================================================================

@@ -51,16 +51,19 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                 }
             }
             "max_instances" => {
-                if item.value.parse::<usize>().is_err() {
-                    errors.push(CheckError {
-                        severity: Severity::Error,
-                        rule: Some(rule_name.to_string()),
-                        contract: None,
-                        message: format!(
-                            "max_instances value `{}` must be a positive integer",
-                            item.value
-                        ),
-                    });
+                match item.value.parse::<usize>() {
+                    Ok(0) | Err(_) => {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            contract: None,
+                            message: format!(
+                                "max_instances value `{}` must be a positive integer (> 0)",
+                                item.value
+                            ),
+                        });
+                    }
+                    _ => {}
                 }
             }
             "max_throttle" => {
@@ -77,16 +80,19 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                 } else {
                     let parts: Vec<&str> = item.value.splitn(2, '/').collect();
                     if parts.len() == 2 {
-                        if parts[0].trim().parse::<u64>().is_err() {
-                            errors.push(CheckError {
-                                severity: Severity::Error,
-                                rule: Some(rule_name.to_string()),
-                                contract: None,
-                                message: format!(
-                                    "max_throttle count `{}` is not a valid integer",
-                                    parts[0].trim()
-                                ),
-                            });
+                        match parts[0].trim().parse::<u64>() {
+                            Ok(0) | Err(_) => {
+                                errors.push(CheckError {
+                                    severity: Severity::Error,
+                                    rule: Some(rule_name.to_string()),
+                                    contract: None,
+                                    message: format!(
+                                        "max_throttle count `{}` must be a positive integer (> 0)",
+                                        parts[0].trim()
+                                    ),
+                                });
+                            }
+                            _ => {}
                         }
                         let valid_units = ["s", "sec", "m", "min", "h", "hr", "hour", "d", "day"];
                         if !valid_units.contains(&parts[1].trim()) {
@@ -117,17 +123,19 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                     });
                 } else {
                     let num_str = &s[..s.len() - 2];
-                    if num_str.trim().parse::<usize>().is_err() {
-                        errors.push(CheckError {
-                            severity: Severity::Error,
-                            rule: Some(rule_name.to_string()),
-                            contract: None,
-                            message: format!(
-                                "max_memory numeric prefix `{}` in `{}` is not a valid positive integer",
-                                num_str.trim(),
-                                item.value
-                            ),
-                        });
+                    match num_str.trim().parse::<usize>() {
+                        Ok(0) | Err(_) => {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                contract: None,
+                                message: format!(
+                                    "max_memory value `{}` must have a positive numeric prefix (> 0)",
+                                    item.value
+                                ),
+                            });
+                        }
+                        _ => {}
                     }
                 }
             }
