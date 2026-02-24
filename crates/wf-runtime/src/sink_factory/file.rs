@@ -116,10 +116,7 @@ impl AsyncRawDataSink for AsyncFileSink {
     }
 
     async fn sink_bytes(&mut self, data: &[u8]) -> SinkResult<()> {
-        self.writer
-            .write_all(data)
-            .await
-            .owe_sink("write bytes")?;
+        self.writer.write_all(data).await.owe_sink("write bytes")?;
         self.writer.flush().await.owe_sink("flush")?;
         Ok(())
     }
@@ -158,10 +155,7 @@ impl AsyncRecordSink for AsyncFileSink {
         Ok(())
     }
 
-    async fn sink_records(
-        &mut self,
-        _records: Vec<Arc<DataRecord>>,
-    ) -> SinkResult<()> {
+    async fn sink_records(&mut self, _records: Vec<Arc<DataRecord>>) -> SinkResult<()> {
         Ok(())
     }
 }

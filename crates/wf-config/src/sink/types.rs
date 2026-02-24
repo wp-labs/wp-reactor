@@ -62,7 +62,10 @@ pub struct WildArray {
 impl WildArray {
     /// Compile from raw pattern strings.
     pub fn new(patterns: &[String]) -> Self {
-        let compiled = patterns.iter().map(|p| wildmatch::WildMatch::new(p)).collect();
+        let compiled = patterns
+            .iter()
+            .map(|p| wildmatch::WildMatch::new(p))
+            .collect();
         Self {
             patterns: patterns.to_vec(),
             compiled,
@@ -139,7 +142,9 @@ mod tests {
     #[test]
     fn string_or_array_single() {
         #[derive(Deserialize)]
-        struct W { v: StringOrArray }
+        struct W {
+            v: StringOrArray,
+        }
         let w: W = toml::from_str(r#"v = "hello""#).unwrap();
         assert_eq!(w.v.0, vec!["hello"]);
     }
@@ -147,7 +152,9 @@ mod tests {
     #[test]
     fn string_or_array_list() {
         #[derive(Deserialize)]
-        struct W { v: StringOrArray }
+        struct W {
+            v: StringOrArray,
+        }
         let w: W = toml::from_str(r#"v = ["a", "b"]"#).unwrap();
         assert_eq!(w.v.0, vec!["a", "b"]);
     }

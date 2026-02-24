@@ -71,3 +71,21 @@ rule r {
         "max_throttle",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Overflow rejection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn check_limits_max_memory_overflow_rejected() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    limits { max_memory = "18446744073709551615GB"; on_exceed = throttle; }
+}
+"#;
+    assert_has_error(input, &[auth_events_window(), output_window()], "overflows");
+}

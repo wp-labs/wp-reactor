@@ -50,22 +50,20 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                     });
                 }
             }
-            "max_instances" => {
-                match item.value.parse::<usize>() {
-                    Ok(0) | Err(_) => {
-                        errors.push(CheckError {
-                            severity: Severity::Error,
-                            rule: Some(rule_name.to_string()),
-                            contract: None,
-                            message: format!(
-                                "max_instances value `{}` must be a positive integer (> 0)",
-                                item.value
-                            ),
-                        });
-                    }
-                    _ => {}
+            "max_instances" => match item.value.parse::<usize>() {
+                Ok(0) | Err(_) => {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        contract: None,
+                        message: format!(
+                            "max_instances value `{}` must be a positive integer (> 0)",
+                            item.value
+                        ),
+                    });
                 }
-            }
+                _ => {}
+            },
             "max_throttle" => {
                 if !item.value.contains('/') {
                     errors.push(CheckError {
@@ -135,7 +133,27 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                                 ),
                             });
                         }
-                        _ => {}
+                        Ok(n) => {
+                            let multiplier: usize = if s.ends_with("GB") {
+                                1024 * 1024 * 1024
+                            } else if s.ends_with("MB") {
+                                1024 * 1024
+                            } else {
+                                1024
+                            };
+                            if n.checked_mul(multiplier).is_none() {
+                                errors.push(CheckError {
+                                    severity: Severity::Error,
+                                    rule: Some(rule_name.to_string()),
+                                    contract: None,
+                                    message: format!(
+                                        "max_memory value `{}` overflows; maximum representable is {}GB",
+                                        item.value,
+                                        usize::MAX / (1024 * 1024 * 1024)
+                                    ),
+                                });
+                            }
+                        }
                     }
                 }
             }

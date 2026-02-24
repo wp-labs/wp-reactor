@@ -54,13 +54,8 @@ impl MockWindowLookup {
         self.snapshots.insert(window.to_string(), rows);
     }
 
-    fn add_timestamped_snapshot(
-        &mut self,
-        window: &str,
-        rows: Vec<(i64, HashMap<String, Value>)>,
-    ) {
-        self.timestamped_snapshots
-            .insert(window.to_string(), rows);
+    fn add_timestamped_snapshot(&mut self, window: &str, rows: Vec<(i64, HashMap<String, Value>)>) {
+        self.timestamped_snapshots.insert(window.to_string(), rows);
     }
 }
 

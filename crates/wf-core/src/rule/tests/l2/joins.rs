@@ -222,26 +222,17 @@ fn join_asof_picks_latest_before_event_time() {
             // Row at 200ms — older, matching
             (
                 200_000_000,
-                row(vec![
-                    ("ip", str_val("10.0.0.1")),
-                    ("risk", num(50.0)),
-                ]),
+                row(vec![("ip", str_val("10.0.0.1")), ("risk", num(50.0))]),
             ),
             // Row at 800ms — newer, matching → should be picked
             (
                 800_000_000,
-                row(vec![
-                    ("ip", str_val("10.0.0.1")),
-                    ("risk", num(90.0)),
-                ]),
+                row(vec![("ip", str_val("10.0.0.1")), ("risk", num(90.0))]),
             ),
             // Row at 2s — after event time → should be excluded
             (
                 2_000_000_000,
-                row(vec![
-                    ("ip", str_val("10.0.0.1")),
-                    ("risk", num(99.0)),
-                ]),
+                row(vec![("ip", str_val("10.0.0.1")), ("risk", num(99.0))]),
             ),
         ],
     );
@@ -298,18 +289,12 @@ fn join_asof_within_filters_old_rows() {
             // Row at 200ms — within would require >= 500ms, so this is too old
             (
                 200_000_000,
-                row(vec![
-                    ("ip", str_val("10.0.0.1")),
-                    ("risk", num(50.0)),
-                ]),
+                row(vec![("ip", str_val("10.0.0.1")), ("risk", num(50.0))]),
             ),
             // Row at 600ms — within range [500ms, 1000ms] → should be picked
             (
                 600_000_000,
-                row(vec![
-                    ("ip", str_val("10.0.0.1")),
-                    ("risk", num(75.0)),
-                ]),
+                row(vec![("ip", str_val("10.0.0.1")), ("risk", num(75.0))]),
             ),
         ],
     );
@@ -408,18 +393,12 @@ fn join_asof_close_uses_last_event_nanos() {
             // Row at 500ms — before last_event → eligible
             (
                 500_000_000,
-                row(vec![
-                    ("ip", str_val("10.0.0.1")),
-                    ("risk", num(60.0)),
-                ]),
+                row(vec![("ip", str_val("10.0.0.1")), ("risk", num(60.0))]),
             ),
             // Row at 3s — after last_event, before watermark → must NOT match
             (
                 3_000_000_000,
-                row(vec![
-                    ("ip", str_val("10.0.0.1")),
-                    ("risk", num(99.0)),
-                ]),
+                row(vec![("ip", str_val("10.0.0.1")), ("risk", num(99.0))]),
             ),
         ],
     );
@@ -440,10 +419,7 @@ fn join_asof_close_uses_last_event_nanos() {
         last_event_nanos: last_event,
     };
 
-    let alert = exec
-        .execute_close_with_joins(&close, &wl)
-        .unwrap()
-        .unwrap();
+    let alert = exec.execute_close_with_joins(&close, &wl).unwrap().unwrap();
     // Should pick the row at 500ms (risk=60), NOT the row at 3s (risk=99)
     assert!(
         (alert.score - 60.0).abs() < f64::EPSILON,

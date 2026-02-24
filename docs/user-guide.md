@@ -773,7 +773,7 @@ yield out (
 limits {
     max_memory = "50MB";          // 可选，规则总状态内存上限
     max_instances = 10000;     // 可选，活跃实例（key 数）上限
-    max_throttle = "100/60s";   // 可选，告警产出速率上限
+    max_throttle = "100/min";     // 可选，告警产出速率上限
     on_exceed = "throttle";      // 可选，超限时动作（默认 throttle）
 }
 ```
@@ -782,9 +782,9 @@ limits {
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `max_memory` | STRING | 无限制 | 所有活跃实例的估算总内存上限（如 `"50MB"`） |
-| `max_instances` | INTEGER | 无限制 | 活跃实例数上限；超限时新 key 无法创建实例 |
-| `max_throttle` | STRING | 无限制 | 滑动窗口内最大告警数（格式 `"count/duration"`，如 `"100/60s"`） |
+| `max_memory` | STRING | 无限制 | 所有活跃实例的估算总内存上限（如 `"50MB"`）；单位 KB/MB/GB，数值必须 > 0 且换算后不得溢出 |
+| `max_instances` | INTEGER | 无限制 | 活跃实例数上限（必须 > 0）；超限时新 key 无法创建实例 |
+| `max_throttle` | STRING | 无限制 | 滑动窗口内最大告警数（格式 `"count/unit"`，如 `"100/min"`）；count 必须 > 0，unit 可选 s/sec/m/min/h/hr/hour/d/day |
 | `on_exceed` | STRING | `"throttle"` | 超限动作：`throttle` / `drop_oldest` / `fail_rule` |
 
 #### on_exceed 动作
@@ -792,14 +792,14 @@ limits {
 | 动作 | 行为 |
 |------|------|
 | `throttle` | 丢弃当前触发（事件路径：重置实例状态；关闭路径：抑制告警输出），不影响后续事件 |
-| `drop_oldest` | 淘汰 `created_at` 最早的实例后继续（仅对 `max_instances` / `max_memory` 有效；对 `max_throttle` 等效 `throttle`） |
+| `drop_oldest` | 严格淘汰 `created_at` 最早的实例后继续，包括当前 key 自身（若其为最老，累积状态丢失，以空白实例重建）。`max_memory` 场景下循环淘汰直到总量低于限额。仅对 `max_instances` / `max_memory` 有效；对 `max_throttle` 等效 `throttle` |
 | `fail_rule` | 标记规则永久失败，后续所有事件直接忽略，不可恢复 |
 
 #### 运行时行为
 
 - **`max_instances`**：新实例创建前检查活跃实例数。
-- **`max_memory`**：每次事件到达时检查（包括已有实例增长和即将创建的新实例基础开销）。
-- **`max_throttle`**：事件路径（match 命中）和关闭路径（timeout / flush / eos）均检查，共享同一滑动窗口计数器。
+- **`max_memory`**：每次事件到达时检查（包括已有实例增长和即将创建的新实例基础开销）。`drop_oldest` 可一次淘汰多个实例，若当前 key 是最老则同样被淘汰并以空白状态重建。
+- **`max_throttle`**：事件路径（match 命中）和关闭路径（timeout / flush / eos）均检查，共享同一滑动窗口计数器。关闭路径按 `(created_at, key)` 双键排序处理，保证确定性顺序。
 
 #### 示例
 
@@ -821,7 +821,7 @@ rule brute_force {
 
     limits {
         max_instances = 50000;
-        max_throttle = "200/60s";
+        max_throttle = "200/min";
         on_exceed = "throttle";
     }
 }

@@ -3,8 +3,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-pub use wp_connector_api::{ConnectorDef, ConnectorScope};
 use wp_connector_api::parammap_from_toml_table;
+pub use wp_connector_api::{ConnectorDef, ConnectorScope};
 
 use super::types::ParamMap;
 
@@ -122,7 +122,12 @@ path = "alerts/default.jsonl"
         assert_eq!(file.connectors[0].kind, "file");
         assert_eq!(file.connectors[0].allow_override, vec!["path"]);
 
-        let def = file.connectors.into_iter().next().unwrap().into_connector_def(None);
+        let def = file
+            .connectors
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_connector_def(None);
         assert_eq!(def.id, "file_json");
         assert_eq!(def.kind, "file");
         assert_eq!(def.scope, ConnectorScope::Sink);

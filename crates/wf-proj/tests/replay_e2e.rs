@@ -203,7 +203,10 @@ rule multi_src {
     let ndjson = format!(
         "{}\n{}",
         format!(r#"{{"sip":"10.0.0.1","tb":{}}}"#, base_nanos),
-        format!(r#"{{"sip":"10.0.0.1","tb":{}}}"#, base_nanos + 1_000_000_000),
+        format!(
+            r#"{{"sip":"10.0.0.1","tb":{}}}"#,
+            base_nanos + 1_000_000_000
+        ),
     );
     let reader = BufReader::new(ndjson.as_bytes());
 

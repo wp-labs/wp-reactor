@@ -376,12 +376,8 @@ fn limits_scan_expired_rate_limit_deterministic() {
         }),
         on_exceed: ExceedAction::Throttle,
     };
-    let mut sm = CepStateMachine::with_limits(
-        "rule_scan_rate".to_string(),
-        plan,
-        None,
-        Some(limits),
-    );
+    let mut sm =
+        CepStateMachine::with_limits("rule_scan_rate".to_string(), plan, None, Some(limits));
 
     // Create 5 instances at distinct creation times (1s apart).
     // Each satisfies event step (count >= 1) → Advance (deferred to close).
@@ -433,12 +429,8 @@ fn limits_max_memory_bytes_drop_oldest_evicts_current_key() {
         max_throttle: None,
         on_exceed: ExceedAction::DropOldest,
     };
-    let mut sm = CepStateMachine::with_limits(
-        "rule_drop_current".to_string(),
-        plan,
-        None,
-        Some(limits),
-    );
+    let mut sm =
+        CepStateMachine::with_limits("rule_drop_current".to_string(), plan, None, Some(limits));
 
     let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
     let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
@@ -490,12 +482,8 @@ fn limits_close_all_rate_limit_deterministic() {
         }),
         on_exceed: ExceedAction::Throttle,
     };
-    let mut sm = CepStateMachine::with_limits(
-        "rule_close_all_det".to_string(),
-        plan,
-        None,
-        Some(limits),
-    );
+    let mut sm =
+        CepStateMachine::with_limits("rule_close_all_det".to_string(), plan, None, Some(limits));
 
     let base = 1_000_000_000i64;
     for i in 0..5 {
@@ -518,6 +506,14 @@ fn limits_close_all_rate_limit_deterministic() {
     );
 
     // The first 2 results (sorted by created_at) should be the ones with alerts
-    let first_two_ok: Vec<bool> = results.iter().take(2).map(|c| c.event_ok && c.close_ok).collect();
-    assert_eq!(first_two_ok, vec![true, true], "earliest-created instances should get alerts");
+    let first_two_ok: Vec<bool> = results
+        .iter()
+        .take(2)
+        .map(|c| c.event_ok && c.close_ok)
+        .collect();
+    assert_eq!(
+        first_two_ok,
+        vec![true, true],
+        "earliest-created instances should get alerts"
+    );
 }

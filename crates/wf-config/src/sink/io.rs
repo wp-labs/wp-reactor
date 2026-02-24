@@ -97,9 +97,7 @@ fn load_business_groups(
     let pattern = dir.join("*.toml");
     let pattern_str = pattern.to_string_lossy();
 
-    let mut entries: Vec<_> = glob::glob(&pattern_str)?
-        .filter_map(|e| e.ok())
-        .collect();
+    let mut entries: Vec<_> = glob::glob(&pattern_str)?.filter_map(|e| e.ok()).collect();
     entries.sort();
 
     for path in entries {

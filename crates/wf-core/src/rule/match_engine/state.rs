@@ -117,10 +117,7 @@ impl Instance {
     ///
     /// Accounts for struct overhead, scope key, and empty branch states
     /// from the plan (same layout as `Instance::new` would produce).
-    pub(super) fn base_estimated_bytes(
-        plan: &MatchPlan,
-        scope_key: &[Value],
-    ) -> usize {
+    pub(super) fn base_estimated_bytes(plan: &MatchPlan, scope_key: &[Value]) -> usize {
         let mut size: usize = 128; // base struct overhead
 
         for val in scope_key {

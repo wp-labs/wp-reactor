@@ -26,7 +26,9 @@ rule r2 {
         .filter(|e| e.severity == Severity::Warning)
         .collect();
     assert!(
-        warnings.iter().any(|e| e.message.contains("field `message` added in @v2")),
+        warnings
+            .iter()
+            .any(|e| e.message.contains("field `message` added in @v2")),
         "expected warning about added field `message`, got: {:?}",
         warnings.iter().map(|e| &e.message).collect::<Vec<_>>()
     );

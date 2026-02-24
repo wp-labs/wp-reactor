@@ -95,10 +95,7 @@ pub fn build_flex_group(
     connectors: &BTreeMap<String, ConnectorDef>,
     defaults: &DefaultsBody,
 ) -> anyhow::Result<FlexGroup> {
-    let parallel = route_group
-        .parallel
-        .unwrap_or(1)
-        .clamp(1, 10);
+    let parallel = route_group.parallel.unwrap_or(1).clamp(1, 10);
 
     let windows = match &route_group.windows {
         Some(s) => WildArray::from(s),
@@ -197,10 +194,7 @@ fn resolve_route_sink(
         )
     })?;
 
-    let sink_name = rs
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("[{}]", index));
+    let sink_name = rs.name.clone().unwrap_or_else(|| format!("[{}]", index));
 
     let _tags = merge_tags(default_tags, group_tags, rs.tags.as_deref());
 
@@ -314,7 +308,10 @@ mod tests {
         assert_eq!(group.sinks.len(), 1);
         assert_eq!(group.sinks[0].name, "my_sink");
         assert_eq!(group.sinks[0].kind, "file");
-        assert_eq!(group.sinks[0].params["path"], serde_json::json!("alerts/sec.jsonl"));
+        assert_eq!(
+            group.sinks[0].params["path"],
+            serde_json::json!("alerts/sec.jsonl")
+        );
     }
 
     #[test]

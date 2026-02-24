@@ -258,15 +258,19 @@ fn parse_byte_size(s: &str) -> Option<usize> {
             .trim()
             .parse::<usize>()
             .ok()
-            .map(|n| n * 1024 * 1024 * 1024)
+            .and_then(|n| n.checked_mul(1024)?.checked_mul(1024)?.checked_mul(1024))
     } else if let Some(num_str) = s_upper.strip_suffix("MB") {
         num_str
             .trim()
             .parse::<usize>()
             .ok()
-            .map(|n| n * 1024 * 1024)
+            .and_then(|n| n.checked_mul(1024)?.checked_mul(1024))
     } else if let Some(num_str) = s_upper.strip_suffix("KB") {
-        num_str.trim().parse::<usize>().ok().map(|n| n * 1024)
+        num_str
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_mul(1024))
     } else {
         s.parse::<usize>().ok()
     }

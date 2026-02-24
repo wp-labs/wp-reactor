@@ -13,10 +13,7 @@ pub fn validate_sink_coverage(
     let mut uncovered = Vec::new();
 
     for target in yield_targets {
-        let matched = bundle
-            .business
-            .iter()
-            .any(|g| g.windows.matches(target));
+        let matched = bundle.business.iter().any(|g| g.windows.matches(target));
 
         if !matched && !has_default {
             uncovered.push(target.as_str());
@@ -39,16 +36,13 @@ pub fn validate_sink_coverage(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::defaults::DefaultsBody;
     use super::super::group::{FixedGroup, FlexGroup};
     use super::super::types::WildArray;
+    use super::*;
     use std::collections::BTreeMap;
 
-    fn make_bundle(
-        business: Vec<FlexGroup>,
-        has_default: bool,
-    ) -> SinkConfigBundle {
+    fn make_bundle(business: Vec<FlexGroup>, has_default: bool) -> SinkConfigBundle {
         SinkConfigBundle {
             connectors: BTreeMap::new(),
             defaults: DefaultsBody::default(),
@@ -71,9 +65,7 @@ mod tests {
         FlexGroup {
             name: "test".into(),
             parallel: 1,
-            windows: WildArray::new(
-                &patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            ),
+            windows: WildArray::new(&patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
             tags: vec![],
             expect: None,
             sinks: vec![],

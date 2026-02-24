@@ -80,11 +80,7 @@ mod tests {
 
     fn ts_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
             Field::new("ip", DataType::Utf8, false),
             Field::new("score", DataType::Int64, false),
         ]))

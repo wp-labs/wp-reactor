@@ -99,10 +99,7 @@ impl WindowLookup for NullWindowLookup {
         None
     }
 
-    fn snapshot(
-        &self,
-        _window: &str,
-    ) -> Option<Vec<std::collections::HashMap<String, Value>>> {
+    fn snapshot(&self, _window: &str) -> Option<Vec<std::collections::HashMap<String, Value>>> {
         None
     }
 }

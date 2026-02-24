@@ -902,12 +902,12 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 | ID | 规则 |
 |----|------|
 | LR1 | `max_instances`：在新实例创建前检查。当活跃实例数 ≥ 限额时，按 `on_exceed` 执行动作。 |
-| LR2 | `max_memory_bytes`：在**每次事件到达**时检查（非仅新实例创建时）。累加所有活跃实例的 `estimated_bytes()` + 即将创建的新实例基础开销 `base_estimated_bytes()`。总量 ≥ 限额时按 `on_exceed` 执行动作。 |
-| LR3 | `max_throttle`：在事件路径（match 命中）和关闭路径（close/scan_expired/close_all）均检查。使用滑动窗口计数器 `(emit_count, emit_window_start)` 跟踪；窗口过期后自动重置。 |
+| LR2 | `max_memory`：在**每次事件到达**时检查（非仅新实例创建时）。累加所有活跃实例的 `estimated_bytes()` + 即将创建的新实例基础开销 `base_estimated_bytes()`（仅 `is_new` 时计入）。总量 ≥ 限额时按 `on_exceed` 执行动作。`drop_oldest` 采用循环淘汰（可能一次淘汰多个实例），包括当前 key 的实例——若当前 key 是最老实例，其累积状态丢失，`entry()` 重新创建空白实例，循环将重建基础开销计入预算继续检查直到总量 < 限额。编译阶段对数值前缀做单位换算溢出检查（`checked_mul`），防止大数值 panic。 |
+| LR3 | `max_throttle`：在事件路径（match 命中）和关闭路径（close/scan_expired/close_all）均检查。使用滑动窗口计数器 `(emit_count, emit_window_start)` 跟踪；窗口过期后自动重置。关闭路径按 `(created_at, key)` 双键排序后处理，保证 `created_at` 相同时仍具备确定性顺序。 |
 | LR4 | `on_exceed = throttle`：丢弃当前事件/抑制当前告警，不影响后续事件。match 路径抑制时重置实例状态以复用。close 路径抑制时设 `close_ok = false`。 |
-| LR5 | `on_exceed = drop_oldest`：淘汰 `created_at` 最早的实例后继续。对 `max_throttle` 场景等效 `throttle`。 |
+| LR5 | `on_exceed = drop_oldest`：严格淘汰 `created_at` 最早的实例，包括当前 key 自身（若其为最老）——被淘汰的当前 key 将以空白状态重建，累积进度丢失。`max_memory` 场景下采用循环淘汰直到总量 < 限额（可一次淘汰多个实例）。无可淘汰实例时返回 `Accumulate`。对 `max_throttle` 场景等效 `throttle`。 |
 | LR6 | `on_exceed = fail_rule`：标记规则永久失败（`failed = true`），后续所有事件直接返回 `Accumulate`，不可恢复。 |
-| LR7 | 内存估算采用粗粒度方式（治理级，非精确分析器）：struct 基础开销 128 字节、每个 BranchState 80 字节、distinct_set 按元素计入、String 值 `len + 24` 字节。 |
+| LR7 | 内存估算采用粗粒度方式（治理级，非精确分析器）：struct 基础开销 128 字节、每个 BranchState 80 字节、distinct_set 按元素计入、String 值 `len + 24` 字节、completed_steps 每项 64 字节、baselines 每项 128 字节。 |
 
 ### 12.3 Join
 
@@ -1038,7 +1038,7 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 | T50 | `join ... asof within DURATION` 中 `within` 必须 > 0；省略 `within` 时使用运行时默认值 |
 | T51 | `yield target@vN (...)` 中 `vN` 必须为正整数，且与 `meta.contract_version` 一致 |
 | T52 | `meta.lang` 必须存在且为 `"2.1"`；不允许省略 |
-| T53 | `limits` 块省略时发出 Warning；块内 `max_memory/max_instances/max_throttle/on_exceed` 各项可省，省略默认 `None`（不限制）/ `on_exceed` 默认 `throttle`；`on_exceed` 仅允许 `throttle|drop_oldest|fail_rule` |
+| T53 | `limits` 块省略时发出 Warning；块内 `max_memory/max_instances/max_throttle/on_exceed` 各项可省，省略默认 `None`（不限制）/ `on_exceed` 默认 `throttle`；`on_exceed` 仅允许 `throttle|drop_oldest|fail_rule`。`max_instances` 必须为正整数（> 0）；`max_throttle` 的 count 部分必须为正整数（> 0），unit 仅允许 `s|sec|m|min|h|hr|hour|d|day`；`max_memory` 数值前缀必须 > 0，单位仅允许 `KB|MB|GB`，且单位换算后不得溢出 `usize` |
 | T54 | 编译器必须输出 `CostPlan`；`risk_level=high` 时默认阻断发布，除非显式 override |
 
 **静态引用解析：**

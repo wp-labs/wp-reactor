@@ -32,7 +32,12 @@ impl RuleExecutor {
             &matched.scope_key,
             &matched.step_data,
         );
-        execute_joins(&self.plan.joins, &mut ctx, windows, matched.event_time_nanos);
+        execute_joins(
+            &self.plan.joins,
+            &mut ctx,
+            windows,
+            matched.event_time_nanos,
+        );
         self.build_match_alert(matched, &ctx)
     }
 

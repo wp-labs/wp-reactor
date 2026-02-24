@@ -1,5 +1,5 @@
-use wp_connector_api::{SinkHandle, SinkSpec as ResolvedSinkSpec};
 use tokio::sync::Mutex;
+use wp_connector_api::{SinkHandle, SinkSpec as ResolvedSinkSpec};
 
 /// Runtime state for a single sink instance.
 ///

@@ -191,8 +191,12 @@ impl CepStateMachine {
             } else {
                 0
             };
-            let mut total: usize =
-                self.instances.values().map(|i| i.estimated_bytes()).sum::<usize>() + new_cost;
+            let mut total: usize = self
+                .instances
+                .values()
+                .map(|i| i.estimated_bytes())
+                .sum::<usize>()
+                + new_cost;
             if total >= max_bytes {
                 match limits.on_exceed {
                     ExceedAction::Throttle => return StepResult::Accumulate,
@@ -216,9 +220,7 @@ impl CepStateMachine {
                                 }
                                 // Current key will be re-created — account for base cost
                                 if evicting_current && !is_new {
-                                    total += Instance::base_estimated_bytes(
-                                        plan, &scope_key,
-                                    );
+                                    total += Instance::base_estimated_bytes(plan, &scope_key);
                                 }
                             } else {
                                 // No instances to evict — cannot make room
@@ -427,13 +429,7 @@ impl CepStateMachine {
         let wm = self.watermark_nanos;
         for (key, _) in keys {
             if let Some(instance) = self.instances.remove(&key) {
-                let mut output = evaluate_close(
-                    &self.rule_name,
-                    &self.plan,
-                    instance,
-                    reason,
-                    wm,
-                );
+                let mut output = evaluate_close(&self.rule_name, &self.plan, instance, reason, wm);
                 self.rate_limit_close(&mut output, wm);
                 results.push(output);
             }
