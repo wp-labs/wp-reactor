@@ -42,6 +42,10 @@ fn match_clause(input: &mut &str) -> ModalResult<MatchClause> {
     ws_skip.parse_next(input)?;
     cut_err(literal("{")).parse_next(input)?;
 
+    // Optional key mapping block
+    ws_skip.parse_next(input)?;
+    let key_mapping = opt(key_block).parse_next(input)?;
+
     // on event block (required)
     ws_skip.parse_next(input)?;
     let on_event = cut_err(on_event_block)
@@ -59,6 +63,7 @@ fn match_clause(input: &mut &str) -> ModalResult<MatchClause> {
 
     Ok(MatchClause {
         keys,
+        key_mapping,
         duration,
         on_event,
         on_close,
@@ -90,6 +95,47 @@ fn match_params(input: &mut &str) -> ModalResult<(Vec<FieldRef>, std::time::Dura
     ws_skip.parse_next(input)?;
 
     Ok((keys, dur))
+}
+
+// ---------------------------------------------------------------------------
+// key mapping block
+// ---------------------------------------------------------------------------
+
+/// `key { logical = alias.field; ... }`
+fn key_block(input: &mut &str) -> ModalResult<Vec<KeyMapItem>> {
+    kw("key").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(literal("{")).parse_next(input)?;
+
+    let mut items = Vec::new();
+    loop {
+        ws_skip.parse_next(input)?;
+        if opt(literal("}")).parse_next(input)?.is_some() {
+            break;
+        }
+        let logical = cut_err(ident).parse_next(input)?.to_string();
+        ws_skip.parse_next(input)?;
+        cut_err(literal("=")).parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        let source_field = cut_err(field_ref).parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        // Semicolon terminator
+        cut_err(literal(";"))
+            .context(StrContext::Expected(StrContextValue::Description(
+                "';' after key mapping item",
+            )))
+            .parse_next(input)?;
+        items.push(KeyMapItem {
+            logical_name: logical,
+            source_field,
+        });
+    }
+    if items.is_empty() {
+        return Err(winnow::error::ErrMode::Cut(
+            winnow::error::ContextError::new(),
+        ));
+    }
+    Ok(items)
 }
 
 /// Parse a field reference for match keys: `ident`, `ident.ident`, or `ident["string"]`

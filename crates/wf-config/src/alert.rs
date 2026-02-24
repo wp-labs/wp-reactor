@@ -31,10 +31,7 @@ pub fn parse_sink_uri(raw: &str) -> anyhow::Result<SinkUri> {
             path: PathBuf::from(path_str),
         })
     } else {
-        anyhow::bail!(
-            "unsupported alert sink URI: {:?} (supported: file://)",
-            raw
-        );
+        anyhow::bail!("unsupported alert sink URI: {:?} (supported: file://)", raw);
     }
 }
 
@@ -73,10 +70,7 @@ mod tests {
     #[test]
     fn parsed_sinks_collects() {
         let cfg = AlertConfig {
-            sinks: vec![
-                "file:///a.jsonl".to_string(),
-                "file:///b.jsonl".to_string(),
-            ],
+            sinks: vec!["file:///a.jsonl".to_string(), "file:///b.jsonl".to_string()],
         };
         let uris = cfg.parsed_sinks().unwrap();
         assert_eq!(uris.len(), 2);
@@ -85,10 +79,7 @@ mod tests {
     #[test]
     fn parsed_sinks_fails_on_bad_entry() {
         let cfg = AlertConfig {
-            sinks: vec![
-                "file:///ok.jsonl".to_string(),
-                "http://bad".to_string(),
-            ],
+            sinks: vec!["file:///ok.jsonl".to_string(), "http://bad".to_string()],
         };
         assert!(cfg.parsed_sinks().is_err());
     }

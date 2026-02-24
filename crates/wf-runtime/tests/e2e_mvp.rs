@@ -12,8 +12,12 @@ use arrow::record_batch::RecordBatch;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, fmt};
 use wf_config::FusionConfig;
-use wf_runtime::lifecycle::FusionEngine;
+use wf_runtime::lifecycle::Reactor;
+use wf_runtime::tracing_init::{DomainFormat, FileFields};
 
 /// Build a length-prefixed TCP frame from an Arrow IPC payload.
 fn make_tcp_frame(ipc_payload: &[u8]) -> Vec<u8> {
@@ -25,10 +29,35 @@ fn make_tcp_frame(ipc_payload: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn e2e_brute_force_alert() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    // Write to target/test-artifacts/ for easy post-run inspection.
+    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-artifacts/e2e_mvp");
+    std::fs::create_dir_all(&artifact_dir).expect("failed to create artifact dir");
+    let alert_path = artifact_dir.join("alerts.jsonl");
+    // Clear any stale output from previous runs.
+    let _ = std::fs::remove_file(&alert_path);
 
-    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
-    let alert_path = tmpdir.path().join("alerts.jsonl");
+    // -- Set up tracing with file output --
+    let log_file = artifact_dir.join("e2e_mvp.log");
+    let _ = std::fs::remove_file(&log_file);
+    let file_appender = tracing_appender::rolling::never(&artifact_dir, "e2e_mvp.log");
+    let (non_blocking, _log_guard) = tracing_appender::non_blocking(file_appender);
+    let _ = tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .event_format(DomainFormat::new())
+                .with_test_writer()
+                .with_filter(EnvFilter::try_new("info").unwrap()),
+        )
+        .with(
+            fmt::layer()
+                .event_format(DomainFormat::new())
+                .fmt_fields(FileFields::default())
+                .with_ansi(false)
+                .with_writer(non_blocking)
+                .with_filter(EnvFilter::try_new("debug").unwrap()),
+        )
+        .try_init();
 
     // -- Build config from inline TOML with port 0 and tempdir alert sink --
     let toml_str = format!(
@@ -76,21 +105,22 @@ FAIL_THRESHOLD = "3"
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let base_dir = manifest_dir.join("../../examples");
 
-    // -- Start engine --
-    let engine = FusionEngine::start(config, &base_dir)
+    // -- Start reactor --
+    let reactor = Reactor::start(config, &base_dir)
         .await
-        .expect("FusionEngine::start failed");
-    let addr = engine.listen_addr();
+        .expect("Reactor::start failed");
+    let addr = reactor.listen_addr();
 
     // -- Connect TCP and send 3 "failed" auth events --
+    // Fields must be nullable to match the Window schema built from .wfs files.
     let arrow_schema = Arc::new(Schema::new(vec![
-        Field::new("sip", DataType::Utf8, false),
-        Field::new("username", DataType::Utf8, false),
-        Field::new("action", DataType::Utf8, false),
+        Field::new("sip", DataType::Utf8, true),
+        Field::new("username", DataType::Utf8, true),
+        Field::new("action", DataType::Utf8, true),
         Field::new(
             "event_time",
             DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
+            true,
         ),
     ]));
 
@@ -98,9 +128,7 @@ FAIL_THRESHOLD = "3"
     let batch = RecordBatch::try_new(
         arrow_schema,
         vec![
-            Arc::new(StringArray::from(vec![
-                "10.0.0.1", "10.0.0.1", "10.0.0.1",
-            ])),
+            Arc::new(StringArray::from(vec!["10.0.0.1", "10.0.0.1", "10.0.0.1"])),
             Arc::new(StringArray::from(vec!["admin", "admin", "admin"])),
             Arc::new(StringArray::from(vec!["failed", "failed", "failed"])),
             Arc::new(TimestampNanosecondArray::from(vec![
@@ -115,9 +143,7 @@ FAIL_THRESHOLD = "3"
     let ipc_payload = wp_arrow::ipc::encode_ipc("syslog", &batch).expect("encode_ipc failed");
     let tcp_frame = make_tcp_frame(&ipc_payload);
 
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .expect("TCP connect failed");
+    let mut stream = TcpStream::connect(addr).await.expect("TCP connect failed");
     stream
         .write_all(&tcp_frame)
         .await
@@ -129,10 +155,10 @@ FAIL_THRESHOLD = "3"
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // -- Shutdown (flush triggers on-close evaluation) --
-    engine.shutdown();
+    reactor.shutdown();
     // Drop TCP stream so the receiver's event_tx can close.
     drop(stream);
-    engine.wait().await.expect("engine.wait failed");
+    reactor.wait().await.expect("reactor.wait failed");
 
     // -- Verify alert output --
     let alert_content = std::fs::read_to_string(&alert_path)

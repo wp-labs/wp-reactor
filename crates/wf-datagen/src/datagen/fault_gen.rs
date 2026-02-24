@@ -48,11 +48,7 @@ enum Assignment {
 ///
 /// The output represents **arrival order** — it is NOT necessarily sorted by
 /// timestamp.
-pub fn apply_faults(
-    events: Vec<GenEvent>,
-    faults: &FaultsBlock,
-    rng: &mut StdRng,
-) -> FaultResult {
+pub fn apply_faults(events: Vec<GenEvent>, faults: &FaultsBlock, rng: &mut StdRng) -> FaultResult {
     if events.is_empty() || faults.faults.is_empty() {
         let clean = events.len();
         return FaultResult {

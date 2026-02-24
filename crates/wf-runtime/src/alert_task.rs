@@ -15,13 +15,13 @@ pub const ALERT_CHANNEL_CAPACITY: usize = 64;
 /// `None` and this task exits.  No cancel token is needed — this avoids a race
 /// where the cancel could close the receiver while the scheduler is still
 /// sending flush alerts.
-pub async fn run_alert_sink(
-    mut rx: mpsc::Receiver<AlertRecord>,
-    sink: Arc<dyn AlertSink>,
-) {
+#[tracing::instrument(name = "alert_sink", skip_all)]
+pub async fn run_alert_sink(mut rx: mpsc::Receiver<AlertRecord>, sink: Arc<dyn AlertSink>) {
     while let Some(record) = rx.recv().await {
         if let Err(e) = sink.send(&record) {
-            log::warn!("alert sink error: {e}");
+            wf_error!(pipe, error = %e, "alert sink write failed");
+        } else {
+            wf_debug!(pipe, rule = &*record.rule_name, "alert delivered");
         }
     }
 }
@@ -55,8 +55,9 @@ pub async fn run_alert_dispatcher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wf_core::error::CoreResult;
 
     fn sample_alert(id: &str) -> AlertRecord {
         AlertRecord {
@@ -89,7 +90,7 @@ mod tests {
     }
 
     impl AlertSink for CollectorSink {
-        fn send(&self, record: &AlertRecord) -> anyhow::Result<()> {
+        fn send(&self, record: &AlertRecord) -> CoreResult<()> {
             self.alerts.lock().unwrap().push(record.alert_id.clone());
             Ok(())
         }
@@ -111,9 +112,11 @@ mod tests {
     }
 
     impl AlertSink for FailCountSink {
-        fn send(&self, _record: &AlertRecord) -> anyhow::Result<()> {
+        fn send(&self, _record: &AlertRecord) -> CoreResult<()> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
-            anyhow::bail!("intentional");
+            orion_error::StructError::from(wf_core::error::CoreReason::AlertSink)
+                .with_detail("intentional")
+                .err()
         }
     }
 

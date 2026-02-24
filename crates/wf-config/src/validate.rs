@@ -69,7 +69,7 @@ fn is_valid_var_name(name: &str) -> bool {
 }
 
 /// Cross-file validation: check that every window's `.wfs` `over` duration does not exceed
-/// the `over_cap` configured in `fusion.toml`.
+/// the `over_cap` configured in `wfusion.toml`.
 ///
 /// Call this after loading both the config and the `.wfs` schema files.
 ///
@@ -82,7 +82,7 @@ pub fn validate_over_vs_over_cap(
     for (name, over) in window_overs {
         let wc = windows.iter().find(|w| w.name == *name).ok_or_else(|| {
             anyhow::anyhow!(
-                "window {name:?} found in .wfs schema but not in fusion.toml [window.{name}]"
+                "window {name:?} found in .wfs schema but not in wfusion.toml [window.{name}]"
             )
         })?;
         let cap: Duration = wc.over_cap.into();
@@ -143,10 +143,7 @@ mod tests {
     #[test]
     fn reject_empty_alert_sinks() {
         use crate::FusionConfig;
-        let toml = MINIMAL_TOML.replace(
-            r#"sinks = ["file:///tmp/alerts.jsonl"]"#,
-            "sinks = []",
-        );
+        let toml = MINIMAL_TOML.replace(r#"sinks = ["file:///tmp/alerts.jsonl"]"#, "sinks = []");
         let err = toml.parse::<FusionConfig>().unwrap_err();
         assert!(
             err.to_string().contains("at least one sink"),

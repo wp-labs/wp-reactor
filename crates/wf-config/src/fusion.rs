@@ -5,6 +5,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 
 use crate::alert::AlertConfig;
+use crate::logging::LoggingConfig;
 use crate::runtime::RuntimeConfig;
 use crate::server::ServerConfig;
 use crate::validate;
@@ -27,6 +28,8 @@ struct FusionConfigRaw {
     /// When present, the new sink system is used instead of alert.sinks.
     #[serde(default)]
     sinks: Option<String>,
+    #[serde(default)]
+    logging: LoggingConfig,
     /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
     #[serde(default)]
     vars: HashMap<String, String>,
@@ -46,12 +49,13 @@ pub struct FusionConfig {
     /// Path to the sinks/ directory for connector-based sink routing.
     /// When present, the new sink system is used instead of `alert.sinks`.
     pub sinks: Option<String>,
+    pub logging: LoggingConfig,
     /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
     pub vars: HashMap<String, String>,
 }
 
 impl FusionConfig {
-    /// Read and parse a `fusion.toml` file.
+    /// Read and parse a `wfusion.toml` file.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path.as_ref())
             .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.as_ref().display()))?;
@@ -82,6 +86,7 @@ impl FromStr for FusionConfig {
             windows,
             alert: raw.alert,
             sinks: raw.sinks,
+            logging: raw.logging,
             vars: raw.vars,
         };
 

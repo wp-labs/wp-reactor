@@ -20,6 +20,7 @@ fn make_simple_rule_plan() -> RulePlan {
         }],
         match_plan: MatchPlan {
             keys: vec![FieldRef::Simple("sip".to_string())],
+            key_map: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
             event_steps: vec![StepPlan {
                 branches: vec![BranchPlan {
@@ -44,23 +45,23 @@ fn make_simple_rule_plan() -> RulePlan {
         },
         yield_plan: YieldPlan {
             target: "alerts".to_string(),
+            version: None,
             fields: vec![],
         },
         score_plan: ScorePlan {
             expr: Expr::Number(85.0),
         },
         conv_plan: None,
+        limits_plan: None,
     }
 }
 
-fn make_event(
-    alias: &str,
-    window: &str,
-    sip: &str,
-    ts: &str,
-) -> GenEvent {
+fn make_event(alias: &str, window: &str, sip: &str, ts: &str) -> GenEvent {
     let mut fields = serde_json::Map::new();
-    fields.insert("sip".to_string(), serde_json::Value::String(sip.to_string()));
+    fields.insert(
+        "sip".to_string(),
+        serde_json::Value::String(sip.to_string()),
+    );
     fields.insert(
         "timestamp".to_string(),
         serde_json::Value::String(ts.to_string()),
@@ -160,6 +161,7 @@ fn multi_alias_same_window_both_receive_events() {
         ],
         match_plan: MatchPlan {
             keys: vec![FieldRef::Simple("sip".to_string())],
+            key_map: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
             event_steps: vec![
                 StepPlan {
@@ -200,12 +202,14 @@ fn multi_alias_same_window_both_receive_events() {
         },
         yield_plan: YieldPlan {
             target: "alerts".to_string(),
+            version: None,
             fields: vec![],
         },
         score_plan: ScorePlan {
             expr: Expr::Number(90.0),
         },
         conv_plan: None,
+        limits_plan: None,
     };
 
     let start: chrono::DateTime<Utc> = "2024-01-01T00:00:00Z".parse().unwrap();
@@ -248,7 +252,14 @@ fn sc7_uninjected_rule_skipped() {
     // With injected_rules containing "brute_force" → alert generated
     let injected: std::collections::HashSet<String> =
         ["brute_force".to_string()].into_iter().collect();
-    let result = run_oracle(&events, &[plan.clone()], &start, &duration, Some(&injected)).unwrap();
+    let result = run_oracle(
+        &events,
+        std::slice::from_ref(&plan),
+        &start,
+        &duration,
+        Some(&injected),
+    )
+    .unwrap();
     assert_eq!(result.alerts.len(), 1);
 
     // With injected_rules NOT containing "brute_force" → no alert (SC7)

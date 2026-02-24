@@ -14,7 +14,7 @@ fn single_step_threshold() {
         vec![simple_key("sip")],
         vec![step(vec![branch("fail", count_ge(3.0))])],
     );
-    let mut sm = CepStateMachine::new("rule1".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule1".to_string(), plan, None);
 
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
     assert_eq!(sm.advance("fail", &e), StepResult::Accumulate);
@@ -40,7 +40,7 @@ fn multi_step_sequential() {
             step(vec![branch("scan", count_ge(1.0))]),
         ],
     );
-    let mut sm = CepStateMachine::new("rule2".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule2".to_string(), plan, None);
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
 
     // scan event before step1 is done — should accumulate (wrong step)
@@ -69,7 +69,7 @@ fn or_branch_first_wins() {
             branch("error", count_ge(1.0)), // branch 1
         ])],
     );
-    let mut sm = CepStateMachine::new("rule3".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule3".to_string(), plan, None);
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
 
     assert_eq!(sm.advance("fail", &e), StepResult::Accumulate);
@@ -86,7 +86,7 @@ fn composite_key_isolation() {
         vec![simple_key("sip"), simple_key("dport")],
         vec![step(vec![branch("fail", count_ge(3.0))])],
     );
-    let mut sm = CepStateMachine::new("rule4".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule4".to_string(), plan, None);
 
     let e1 = event(vec![("sip", str_val("10.0.0.1")), ("dport", num(22.0))]);
     let e2 = event(vec![("sip", str_val("10.0.0.1")), ("dport", num(80.0))]);
@@ -134,7 +134,7 @@ fn guard_filter_skips() {
             agg: count_ge(2.0),
         }])],
     );
-    let mut sm = CepStateMachine::new("rule5".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule5".to_string(), plan, None);
 
     let ok_event = event(vec![
         ("sip", str_val("10.0.0.1")),
@@ -177,7 +177,7 @@ fn distinct_transform() {
             agg,
         }])],
     );
-    let mut sm = CepStateMachine::new("rule6".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule6".to_string(), plan, None);
 
     let mk = |port: f64| event(vec![("sip", str_val("10.0.0.1")), ("dport", num(port))]);
 
@@ -202,7 +202,7 @@ fn source_matching() {
         vec![simple_key("sip")],
         vec![step(vec![branch("fail", count_ge(2.0))])],
     );
-    let mut sm = CepStateMachine::new("rule7".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule7".to_string(), plan, None);
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
 
     // wrong alias
@@ -219,7 +219,7 @@ fn source_matching() {
 fn no_key_match() {
     // all events share one instance
     let plan = simple_plan(vec![], vec![step(vec![branch("alert", count_ge(3.0))])]);
-    let mut sm = CepStateMachine::new("rule8".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule8".to_string(), plan, None);
 
     let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
     let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
@@ -251,7 +251,7 @@ fn sum_measure() {
             agg,
         }])],
     );
-    let mut sm = CepStateMachine::new("rule9".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule9".to_string(), plan, None);
 
     let mk = |bytes: f64| event(vec![("sip", str_val("10.0.0.1")), ("bytes", num(bytes))]);
 
@@ -273,7 +273,7 @@ fn missing_key_skips() {
         vec![simple_key("sip")],
         vec![step(vec![branch("fail", count_ge(1.0))])],
     );
-    let mut sm = CepStateMachine::new("rule10".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule10".to_string(), plan, None);
 
     // event missing "sip" field
     let e_no_key = event(vec![("dport", num(22.0))]);
@@ -292,7 +292,7 @@ fn instance_resets_after_match() {
         vec![simple_key("sip")],
         vec![step(vec![branch("fail", count_ge(2.0))])],
     );
-    let mut sm = CepStateMachine::new("rule11".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule11".to_string(), plan, None);
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
 
     // First match
@@ -317,7 +317,7 @@ fn numeric_key_type_preserved_through_pipeline() {
         vec![simple_key("sip"), simple_key("dport")],
         vec![step(vec![branch("conn", count_ge(1.0))])],
     );
-    let mut sm = CepStateMachine::new("rule_num_key".to_string(), plan);
+    let mut sm = CepStateMachine::new("rule_num_key".to_string(), plan, None);
 
     let e = event(vec![("sip", str_val("10.0.0.1")), ("dport", num(443.0))]);
     if let StepResult::Matched(ctx) = sm.advance("conn", &e) {

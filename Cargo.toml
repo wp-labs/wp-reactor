@@ -1,6 +1,5 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["tools/tree-sitter-oml", "tools/tree-sitter-wfs", "tools/oml-tools", "tools/wplabs-lsp", "tools/zed-warplabs"]
 resolver = "2"
 
 [workspace.package]
@@ -13,3 +12,9 @@ toml = "0.9"
 anyhow = "1.0"
 winnow = "0.7"
 wp-connector-api =  "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+orion-error = { version = "0.6", default-features = false, features = ["tracing"] }
+derive_more = { version = "2.1", features = ["from"] }
+thiserror = "2.0"

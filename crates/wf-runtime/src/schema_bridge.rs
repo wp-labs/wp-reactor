@@ -8,7 +8,7 @@ use wf_lang::{BaseType, FieldType, WindowSchema};
 use wp_arrow::schema::{FieldDef as WpFieldDef, WpDataType, to_arrow_schema};
 
 /// Convert a [`WindowSchema`] (parsed from `.wfs`) together with its
-/// [`WindowConfig`] (resolved from `fusion.toml`) into a [`WindowDef`]
+/// [`WindowConfig`] (resolved from `wfusion.toml`) into a [`WindowDef`]
 /// that can be fed to [`WindowRegistry::build`].
 pub fn schema_to_window_def(ws: &WindowSchema, config: &WindowConfig) -> Result<WindowDef> {
     // 1. Convert wf-lang FieldDef → wp-arrow FieldDef
@@ -73,16 +73,13 @@ pub fn schemas_to_window_defs(
 ) -> Result<Vec<WindowDef>> {
     let mut defs = Vec::with_capacity(schemas.len());
     for ws in schemas {
-        let config = configs
-            .iter()
-            .find(|c| c.name == ws.name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "window {:?} found in .wfs schema but not in fusion.toml [window.{}]",
-                    ws.name,
-                    ws.name
-                )
-            })?;
+        let config = configs.iter().find(|c| c.name == ws.name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "window {:?} found in .wfs schema but not in wfusion.toml [window.{}]",
+                ws.name,
+                ws.name
+            )
+        })?;
         defs.push(schema_to_window_def(ws, config)?);
     }
     Ok(defs)

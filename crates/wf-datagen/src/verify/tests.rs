@@ -1,5 +1,5 @@
 use crate::oracle::OracleAlert;
-use crate::verify::{verify, ActualAlert};
+use crate::verify::{ActualAlert, verify};
 
 #[test]
 fn exact_match_passes() {
@@ -204,11 +204,20 @@ fn test_markdown_report_format() {
     let report = verify(&expected, &actual, 0.01, 1.0);
     let md = report.to_markdown();
 
-    assert!(md.contains("## wf-datagen Verify Report"), "should have header");
+    assert!(
+        md.contains("## wf-datagen Verify Report"),
+        "should have header"
+    );
     assert!(md.contains("**Status**: FAIL"), "should show FAIL status");
     assert!(md.contains("### Summary"), "should have summary section");
-    assert!(md.contains("| Metric | Count |"), "should have summary table");
-    assert!(md.contains("### Field Mismatches"), "should have mismatch section");
+    assert!(
+        md.contains("| Metric | Count |"),
+        "should have summary table"
+    );
+    assert!(
+        md.contains("### Field Mismatches"),
+        "should have mismatch section"
+    );
     assert!(md.contains("brute_force"), "should contain rule name");
     assert!(md.contains("85.00"), "should contain expected score");
     assert!(md.contains("50.00"), "should contain actual score");

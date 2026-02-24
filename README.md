@@ -9,7 +9,7 @@ wp-reactor/
 ├── Cargo.toml              # Workspace 根配置
 ├── crates/
 │   ├── wf-lang/            # Window Schema (.wfs) 解析器
-│   └── wf-config/          # fusion.toml 配置管理与校验
+│   └── wf-config/          # wfusion.toml 配置管理与校验
 └── docs/
     └── design/             # 设计文档
 ```
@@ -39,7 +39,7 @@ window auth_events {
 
 ### wf-config
 
-运行时配置管理，负责加载、解析和校验 `fusion.toml` 配置文件。
+运行时配置管理，负责加载、解析和校验 `wfusion.toml` 配置文件。
 
 核心模块：
 
@@ -51,7 +51,7 @@ window auth_events {
 - **fusion** — 顶层配置组装与解析入口
 - **validate** — 跨文件语义校验
 
-示例 `fusion.toml`：
+示例 `wfusion.toml`：
 
 ```toml
 [server]
@@ -86,7 +86,7 @@ sinks = ["file:///var/log/wf-alerts.jsonl"]
 |------|------|
 | `.wfs` | 逻辑数据定义（window、field、time、over） |
 | `.wfl` | 检测规则（bind / match / join / yield） |
-| `fusion.toml` | 物理参数（mode、max_bytes、watermark、sinks） |
+| `wfusion.toml` | 物理参数（mode、max_bytes、watermark、sinks） |
 
 ## 构建
 

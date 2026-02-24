@@ -1,0 +1,23 @@
+use "../schemas/security.wfs"
+use "../rules/brute_force.wfl"
+
+scenario brute_force_detect seed 42 {
+    time "2024-01-01T00:00:00Z" duration 10m
+    total 500
+
+    stream fail : auth_events 100/s {
+        sip = ipv4(pool: 50)
+        username = pattern("user_{}")
+        action = enum("login", "logout", "failed")
+    }
+
+    inject for brute_force_then_scan on [fail] {
+        hit 30% count_per_entity=3;
+        near_miss 10% count_per_entity=2;
+    }
+
+    oracle {
+        time_tolerance = 5s;
+        score_tolerance = 0.1;
+    }
+}

@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{Result, bail};
 use arrow::record_batch::RecordBatch;
+use orion_error::prelude::*;
+use tokio::sync::Notify;
 use wf_config::{DistMode, WindowConfig};
+
+use crate::error::{CoreReason, CoreResult};
 
 use super::buffer::{Window, WindowParams};
 
@@ -41,6 +44,7 @@ struct Subscription {
 pub struct WindowRegistry {
     windows: HashMap<String, Arc<RwLock<Window>>>,
     subscriptions: HashMap<String, Vec<Subscription>>,
+    notifiers: HashMap<String, Arc<Notify>>,
 }
 
 impl std::fmt::Debug for WindowRegistry {
@@ -51,6 +55,7 @@ impl std::fmt::Debug for WindowRegistry {
                 "subscription_streams",
                 &self.subscriptions.keys().collect::<Vec<_>>(),
             )
+            .field("notifier_count", &self.notifiers.len())
             .finish()
     }
 }
@@ -59,19 +64,23 @@ impl WindowRegistry {
     /// Build a registry from a list of window definitions.
     ///
     /// Returns `Err` if two definitions share the same window name.
-    pub fn build(defs: Vec<WindowDef>) -> Result<Self> {
+    pub fn build(defs: Vec<WindowDef>) -> CoreResult<Self> {
         let mut windows = HashMap::with_capacity(defs.len());
         let mut subscriptions: HashMap<String, Vec<Subscription>> = HashMap::new();
+        let mut notifiers = HashMap::with_capacity(defs.len());
 
         for def in defs {
             let name = def.params.name.clone();
             if windows.contains_key(&name) {
-                bail!("duplicate window name: {:?}", name);
+                return StructError::from(CoreReason::WindowBuild)
+                    .with_detail(format!("duplicate window name: {:?}", name))
+                    .err();
             }
 
             let mode = def.config.mode.clone();
             let window = Window::new(def.params, def.config);
             windows.insert(name.clone(), Arc::new(RwLock::new(window)));
+            notifiers.insert(name.clone(), Arc::new(Notify::new()));
 
             for stream_name in def.streams {
                 subscriptions
@@ -87,6 +96,7 @@ impl WindowRegistry {
         Ok(Self {
             windows,
             subscriptions,
+            notifiers,
         })
     }
 
@@ -96,7 +106,7 @@ impl WindowRegistry {
     /// and `Partitioned` are skipped (deferred to M10 Router).
     /// Unknown stream names are a no-op (returns `Ok(())`).
     #[deprecated(note = "Use Router::route for watermark-aware routing")]
-    pub fn route(&self, stream_name: &str, batch: RecordBatch) -> Result<()> {
+    pub fn route(&self, stream_name: &str, batch: RecordBatch) -> CoreResult<()> {
         let Some(subs) = self.subscriptions.get(stream_name) else {
             return Ok(());
         };
@@ -110,7 +120,9 @@ impl WindowRegistry {
                 .get(&sub.window_name)
                 .expect("subscription references non-existent window");
             let mut win = win_lock.write().expect("window lock poisoned");
-            win.append_with_watermark(batch.clone()).map(|_| ())?;
+            win.append_with_watermark(batch.clone())
+                .map(|_| ())
+                .owe(CoreReason::WindowBuild)?;
         }
 
         Ok(())
@@ -159,6 +171,11 @@ impl WindowRegistry {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Get the notifier for a named window.
+    pub fn get_notifier(&self, name: &str) -> Option<&Arc<Notify>> {
+        self.notifiers.get(name)
     }
 }
 

@@ -1,10 +1,17 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
+    TimestampNanosecondArray,
+};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::writer::FileWriter;
+use chrono::{DateTime, Utc};
+
+use wf_lang::{BaseType, FieldType, WindowSchema};
 
 use crate::datagen::stream_gen::GenEvent;
 
@@ -74,4 +81,133 @@ pub fn write_arrow_ipc(events: &[GenEvent], output_path: &Path) -> anyhow::Resul
     writer.finish()?;
 
     Ok(())
+}
+
+/// Group GenEvents by window, build typed Arrow RecordBatches keyed by stream name.
+///
+/// Each window group produces one `(stream_name, RecordBatch)` pair. Column types
+/// are derived from the [`WindowSchema`] field definitions, matching the runtime's
+/// expected schema exactly.
+pub fn events_to_typed_batches(
+    events: &[GenEvent],
+    schemas: &[WindowSchema],
+) -> anyhow::Result<Vec<(String, RecordBatch)>> {
+    let mut groups: HashMap<String, Vec<&GenEvent>> = HashMap::new();
+    for event in events {
+        groups
+            .entry(event.window_name.clone())
+            .or_default()
+            .push(event);
+    }
+
+    let mut batches = Vec::new();
+
+    for (window_name, group_events) in &groups {
+        let schema = schemas
+            .iter()
+            .find(|s| s.name == *window_name)
+            .ok_or_else(|| anyhow::anyhow!("schema not found for window '{window_name}'"))?;
+
+        let stream_name = schema
+            .streams
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no stream defined for window '{window_name}'"))?;
+
+        let arrow_fields: Vec<Field> = schema
+            .fields
+            .iter()
+            .map(|f| Field::new(&f.name, field_type_to_arrow(&f.field_type), true))
+            .collect();
+        let arrow_schema = Arc::new(Schema::new(arrow_fields));
+
+        let columns: Vec<ArrayRef> = schema
+            .fields
+            .iter()
+            .map(|f| build_typed_column(f, group_events))
+            .collect();
+
+        let batch = RecordBatch::try_new(arrow_schema, columns)?;
+        batches.push((stream_name.clone(), batch));
+    }
+
+    Ok(batches)
+}
+
+/// Convert a wf-lang [`FieldType`] to the corresponding Arrow [`DataType`].
+fn field_type_to_arrow(ft: &FieldType) -> DataType {
+    let base = match ft {
+        FieldType::Base(b) => b,
+        FieldType::Array(b) => b,
+    };
+    match base {
+        BaseType::Chars | BaseType::Ip | BaseType::Hex => DataType::Utf8,
+        BaseType::Digit => DataType::Int64,
+        BaseType::Float => DataType::Float64,
+        BaseType::Bool => DataType::Boolean,
+        BaseType::Time => DataType::Timestamp(TimeUnit::Nanosecond, None),
+    }
+}
+
+/// Build a single typed Arrow column from GenEvent JSON field values.
+fn build_typed_column(field_def: &wf_lang::FieldDef, events: &[&GenEvent]) -> ArrayRef {
+    let base = match &field_def.field_type {
+        FieldType::Base(b) => b,
+        FieldType::Array(b) => b,
+    };
+    let name = &field_def.name;
+
+    match base {
+        BaseType::Chars | BaseType::Ip | BaseType::Hex => {
+            let values: Vec<Option<String>> = events
+                .iter()
+                .map(|e| {
+                    e.fields
+                        .get(name)
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .collect();
+            Arc::new(StringArray::from(values))
+        }
+        BaseType::Digit => {
+            let values: Vec<Option<i64>> = events
+                .iter()
+                .map(|e| e.fields.get(name).and_then(|v| v.as_i64()))
+                .collect();
+            Arc::new(Int64Array::from(values))
+        }
+        BaseType::Float => {
+            let values: Vec<Option<f64>> = events
+                .iter()
+                .map(|e| e.fields.get(name).and_then(|v| v.as_f64()))
+                .collect();
+            Arc::new(Float64Array::from(values))
+        }
+        BaseType::Bool => {
+            let values: Vec<Option<bool>> = events
+                .iter()
+                .map(|e| e.fields.get(name).and_then(|v| v.as_bool()))
+                .collect();
+            Arc::new(BooleanArray::from(values))
+        }
+        BaseType::Time => {
+            let values: Vec<Option<i64>> = events
+                .iter()
+                .map(|e| {
+                    if let Some(v) = e.fields.get(name) {
+                        if let Some(s) = v.as_str()
+                            && let Ok(dt) = s.parse::<DateTime<Utc>>()
+                        {
+                            return dt.timestamp_nanos_opt();
+                        }
+                        if let Some(n) = v.as_i64() {
+                            return Some(n);
+                        }
+                    }
+                    e.timestamp.timestamp_nanos_opt()
+                })
+                .collect();
+            Arc::new(TimestampNanosecondArray::from(values))
+        }
+    }
 }

@@ -1,6 +1,6 @@
 use crate::ast::{GivenStmt, WflFile};
 
-use super::CheckError;
+use super::{CheckError, Severity};
 
 /// Check all contract blocks in a WflFile.
 pub fn check_contracts(file: &WflFile, errors: &mut Vec<CheckError>) {
@@ -12,6 +12,7 @@ pub fn check_contracts(file: &WflFile, errors: &mut Vec<CheckError>) {
         match target_rule {
             None => {
                 errors.push(CheckError {
+                    severity: Severity::Error,
                     rule: None,
                     contract: Some(cname.to_string()),
                     message: format!(
@@ -32,6 +33,7 @@ pub fn check_contracts(file: &WflFile, errors: &mut Vec<CheckError>) {
                         && !event_aliases.contains(&alias.as_str())
                     {
                         errors.push(CheckError {
+                            severity: Severity::Error,
                             rule: None,
                             contract: Some(cname.to_string()),
                             message: format!(

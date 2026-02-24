@@ -95,8 +95,7 @@ pub fn generate(
             .find(|s| s.name == stream.window)
             .ok_or_else(|| anyhow::anyhow!("schema not found for window '{}'", stream.window))?;
 
-        let events =
-            generate_stream_events(stream, schema, bg_count, &start, &duration, &mut rng);
+        let events = generate_stream_events(stream, schema, bg_count, &start, &duration, &mut rng);
         all_events.extend(events);
     }
 

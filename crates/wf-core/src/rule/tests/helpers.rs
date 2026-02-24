@@ -41,6 +41,7 @@ pub fn simple_key(name: &str) -> FieldRef {
 pub fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
     MatchPlan {
         keys,
+        key_map: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
         event_steps: steps,
         close_steps: vec![],
@@ -79,6 +80,7 @@ pub fn plan_with_close(
 ) -> MatchPlan {
     MatchPlan {
         keys,
+        key_map: None,
         window_spec: WindowSpec::Sliding(window_dur),
         event_steps,
         close_steps,
@@ -122,9 +124,11 @@ pub fn simple_rule_plan(
         },
         yield_plan: YieldPlan {
             target: "alerts".to_string(),
+            version: None,
             fields: vec![],
         },
         score_plan: ScorePlan { expr: score_expr },
         conv_plan: None,
+        limits_plan: None,
     }
 }

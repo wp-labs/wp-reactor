@@ -12,7 +12,7 @@
 |------|------|--------|
 | 0-1 | `examples/security.wfs` | 窗口是什么？stream/time/over/fields 各代表什么 |
 | 0-2 | `examples/brute_force.wfl` | 规则长什么样？events/match/on event/on close/entity/yield |
-| 0-3 | `examples/fusion.toml` | 运行时配置如何把 .wfs + .wfl 组装起来 |
+| 0-3 | `examples/wfusion.toml` | 运行时配置如何把 .wfs + .wfl 组装起来 |
 
 **目标**：能用自然语言描述"3 次登录失败 → 产出告警"的完整语义。
 
@@ -119,7 +119,7 @@ cargo test -p wf-core -- --nocapture   # 90 个测试，重点关注 cep_core �
 | 4-3 | `crates/wf-runtime/src/alert_task.rs` | 告警消费者任务，channel close 即退出 |
 | 4-4 | `crates/wf-runtime/src/evictor_task.rs` | 定时驱逐任务 |
 | 4-5 | `crates/wf-runtime/src/schema_bridge.rs` | WindowSchema × WindowConfig → WindowDef 桥接 |
-| 4-6 | `crates/wf-runtime/src/lifecycle.rs` | **FusionEngine**：启动 12 步编排、TaskGroup LIFO 关闭顺序 |
+| 4-6 | `crates/wf-runtime/src/lifecycle.rs` | **Reactor**：启动编排、TaskGroup LIFO 关闭顺序 |
 
 ### 重点理解
 
@@ -145,14 +145,14 @@ cargo test -p wf-runtime -- --nocapture   # 15 单元测试 + 1 e2e 测试
 | 顺序 | 文件 | 关注点 |
 |------|------|--------|
 | 5-1 | `crates/wf-runtime/tests/e2e_mvp.rs` | 完整数据流：构造 config → 启动引擎 → 发送 TCP Arrow 帧 → shutdown flush → 验证告警文件 |
-| 5-2 | `crates/wf-cli/src/main.rs` | 生产入口：clap CLI → 加载 fusion.toml → 信号处理 → 优雅关闭 |
+| 5-2 | `crates/wf-engine/src/main.rs` | 生产入口：clap CLI → 加载 wfusion.toml → 信号处理 → 优雅关闭 |
 
 ### 动手练习
 
 在 `examples/` 下用 CLI 启动引擎，手动理解完整生命周期：
 
 ```bash
-cargo run -p wf-cli -- run --config examples/fusion.toml
+cargo run -p wf-engine -- run --config examples/wfusion.toml
 ```
 
 ---
@@ -171,7 +171,7 @@ cargo run -p wf-cli -- run --config examples/fusion.toml
 ## 附录 A：依赖关系图
 
 ```
-wf-cli ─────────┐
+wf-engine ─────────┐
                  ├─► wf-runtime
                  │     ├─► wf-core
                  │     │     ├─► wf-lang     (解析 + 编译)
@@ -194,7 +194,7 @@ wf-datagen (独立二进制)
 ## 附录 B：核心数据流
 
 ```
-.wfs + .wfl + fusion.toml
+.wfs + .wfl + wfusion.toml
          │
     ┌────▼────┐
     │ wf-lang │  解析 + 编译 → RulePlan
@@ -213,7 +213,7 @@ wf-datagen (独立二进制)
     └────┬───────┘
          │
     ┌────▼────┐
-    │ wf-cli  │  main() 入口
+    │ wf-engine│  main() 入口
     └─────────┘
 ```
 
@@ -267,7 +267,7 @@ TCP 客户端发送: [4B 长度][stream_name][Arrow IPC batch]
 | TCP 接收器 | `crates/wf-runtime/src/receiver.rs` |
 | 生命周期管理 | `crates/wf-runtime/src/lifecycle.rs` |
 | 配置加载 | `crates/wf-config/src/fusion.rs` |
-| CLI 入口 | `crates/wf-cli/src/main.rs` |
+| CLI 入口 | `crates/wf-engine/src/main.rs` |
 | E2E 测试 | `crates/wf-runtime/tests/e2e_mvp.rs` |
 
 ---

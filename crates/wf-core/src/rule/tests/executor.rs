@@ -25,6 +25,7 @@ fn default_matched_context() -> MatchedContext {
             label: Some("fail".to_string()),
             measure_value: 1.0,
         }],
+        event_time_nanos: 0,
     }
 }
 
@@ -124,6 +125,7 @@ fn execute_match_no_keys() {
             label: None,
             measure_value: 1.0,
         }],
+        event_time_nanos: 0,
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -157,6 +159,7 @@ fn execute_match_composite_keys() {
             label: None,
             measure_value: 1.0,
         }],
+        event_time_nanos: 0,
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -191,6 +194,7 @@ fn execute_close_both_ok() {
             measure_value: 3.0,
         }],
         close_step_data: vec![],
+        watermark_nanos: 0,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
@@ -221,6 +225,7 @@ fn execute_close_close_not_ok() {
         close_ok: false,
         event_step_data: vec![],
         close_step_data: vec![],
+        watermark_nanos: 0,
     };
 
     let result = exec.execute_close(&close).unwrap();
@@ -249,6 +254,7 @@ fn execute_close_event_not_ok() {
         close_ok: true,
         event_step_data: vec![],
         close_step_data: vec![],
+        watermark_nanos: 0,
     };
 
     let result = exec.execute_close(&close).unwrap();
@@ -314,15 +320,14 @@ fn entity_eval_failure() {
 
 #[test]
 fn alert_id_deterministic() {
-    use crate::rule::executor::format_fired_at;
-    use std::time::{Duration, UNIX_EPOCH};
+    use crate::rule::executor::format_nanos_utc;
 
-    // Use a fixed time to get deterministic fired_at
-    let fixed_time = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
-    let fired_at = format_fired_at(fixed_time);
+    // Use a fixed nanos value to get deterministic fired_at
+    let nanos: i64 = 1_700_000_000_123_000_000;
+    let fired_at = format_nanos_utc(nanos);
 
-    // Verify format_fired_at is deterministic
-    let fired_at2 = format_fired_at(fixed_time);
+    // Verify format_nanos_utc is deterministic
+    let fired_at2 = format_nanos_utc(nanos);
     assert_eq!(fired_at, fired_at2);
 
     // Verify ISO 8601 format
@@ -352,6 +357,7 @@ fn summary_format() {
             label: Some("fail".to_string()),
             measure_value: 5.0,
         }],
+        event_time_nanos: 0,
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -394,6 +400,7 @@ fn numeric_key_preserves_type_in_eval_context() {
             label: None,
             measure_value: 1.0,
         }],
+        event_time_nanos: 0,
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -430,6 +437,7 @@ fn label_cannot_overwrite_key_in_eval_context() {
             label: Some("sip".to_string()),
             measure_value: 99.0,
         }],
+        event_time_nanos: 0,
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -489,6 +497,7 @@ fn alert_id_no_separator_ambiguity() {
             label: None,
             measure_value: 1.0,
         }],
+        event_time_nanos: 0,
     };
 
     let alert = exec.execute_match(&matched).unwrap();

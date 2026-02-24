@@ -52,13 +52,12 @@ pub fn generate_stream_events(
             let override_expr = overrides.get(field_def.name.as_str()).copied();
 
             // For Time fields, set the timestamp
-            if matches!(&field_def.field_type, FieldType::Base(BaseType::Time)) {
-                if override_expr.is_none()
-                    || matches!(override_expr, Some(GenExpr::GenFunc { name, .. }) if name == "timestamp")
-                {
-                    fields.insert(field_def.name.clone(), Value::String(ts.to_rfc3339()));
-                    continue;
-                }
+            if matches!(&field_def.field_type, FieldType::Base(BaseType::Time))
+                && (override_expr.is_none()
+                    || matches!(override_expr, Some(GenExpr::GenFunc { name, .. }) if name == "timestamp"))
+            {
+                fields.insert(field_def.name.clone(), Value::String(ts.to_rfc3339()));
+                continue;
             }
 
             let value = generate_field_value(&field_def.field_type, override_expr, rng);

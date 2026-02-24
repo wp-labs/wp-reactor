@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
 use arrow::array::{
-    Array, BooleanArray, Float64Array, Int64Array, StringArray,
-    TimestampNanosecondArray,
+    Array, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -104,10 +103,7 @@ mod tests {
         assert_eq!(events.len(), 2);
 
         assert_eq!(events[0].fields["id"], Value::Number(42.0));
-        assert_eq!(
-            events[0].fields["name"],
-            Value::Str("alice".to_string())
-        );
+        assert_eq!(events[0].fields["name"], Value::Str("alice".to_string()));
         assert_eq!(events[0].fields["active"], Value::Bool(true));
 
         assert_eq!(events[1].fields["id"], Value::Number(99.0));
@@ -164,9 +160,11 @@ mod tests {
     #[test]
     fn test_batch_to_events_empty() {
         let schema = make_schema(vec![Field::new("id", DataType::Int64, false)]);
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![] as Vec<i64>)) as ArrayRef])
-                .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![] as Vec<i64>)) as ArrayRef],
+        )
+        .unwrap();
 
         let events = batch_to_events(&batch);
         assert!(events.is_empty());
@@ -177,13 +175,13 @@ mod tests {
         let schema = make_schema(vec![Field::new("score", DataType::Float64, false)]);
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(Float64Array::from(vec![3.14, 2.71])) as ArrayRef],
+            vec![Arc::new(Float64Array::from(vec![3.21, 9.87])) as ArrayRef],
         )
         .unwrap();
 
         let events = batch_to_events(&batch);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].fields["score"], Value::Number(3.14));
-        assert_eq!(events[1].fields["score"], Value::Number(2.71));
+        assert_eq!(events[0].fields["score"], Value::Number(3.21));
+        assert_eq!(events[1].fields["score"], Value::Number(9.87));
     }
 }
