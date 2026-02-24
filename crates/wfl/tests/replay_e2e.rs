@@ -2,7 +2,7 @@ use std::io::BufReader;
 use std::time::Duration;
 
 use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
-use wf_proj::cmd_replay::replay_events;
+use wfl::cmd_replay::replay_events;
 
 fn make_auth_events_schema() -> WindowSchema {
     WindowSchema {

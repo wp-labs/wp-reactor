@@ -50,7 +50,7 @@ WarpParse（wp-motor）是一个高性能日志解析引擎，核心能力是：
 - **CEP 引擎**：基于 scope-key 的状态机实例管理，支持 `on event` / `on close` 双阶段求值
 - **运行时闭环**：TCP 接收 Arrow IPC → Window 缓冲 → 规则执行 → 风险告警输出（Connector SinkDispatcher）
 - **告警输出**：Connector 模式（yield-target 路由 SinkDispatcher，基于 wp-connector-api）
-- **开发者工具**：`wf-proj`（explain / lint / fmt）、`wf-datagen`（测试数据生成 + oracle + verify）
+- **开发者工具**：`wfl`（explain / lint / fmt）、`wf-datagen`（测试数据生成 + oracle + verify）
 - **传输层**：Best-Effort 模式，Arrow IPC over TCP
 
 **L1 未实现**（计划 L2+）：
@@ -213,7 +213,7 @@ wp-labs/
     │   ├── wf-core/           # 核心引擎（Window + CEP + Alert）
     │   ├── wf-runtime/        # 异步运行时（Receiver + RuleTask + Lifecycle）
     │   ├── wf-engine/         # 引擎二进制 → warp-fusion（面向运维）
-    │   ├── wf-proj/           # 项目工具二进制 → wf-proj（面向规则开发者）
+    │   ├── wfl/               # 项目工具二进制 → wfl（面向规则开发者）
     │   └── wf-datagen/        # 测试数据生成二进制 → wf-datagen
     ├── examples/              # 配置与规则示例
     │   ├── wfusion.toml
@@ -236,7 +236,7 @@ wp-labs/
 | Crate | 二进制名 | 用途 |
 |-------|---------|------|
 | wf-engine | `warp-fusion` | 运行时引擎，`run --config wfusion.toml` |
-| wf-proj | `wf-proj` | 开发者工具：`explain` / `lint` / `fmt` |
+| wfl | `wfl` | 开发者工具：`explain` / `lint` / `fmt` |
 | wf-datagen | `wf-datagen` | 测试数据生成：`gen` / `lint` / `verify` / `bench` |
 
 ### 3.2 Crate 依赖关系
@@ -252,7 +252,7 @@ wf-runtime  (依赖 wf-core + wp-arrow + wp-connector-api，异步运行时 + si
   ↑
 wf-engine  (依赖 wf-config + wf-runtime，引擎二进制)
 
-wf-proj  (依赖 wf-config + wf-lang + tree-sitter，开发者工具)
+wfl  (依赖 wf-config + wf-lang + tree-sitter，开发者工具)
 wf-datagen  (依赖 wf-core + wf-lang，测试数据生成)
 ```
 
@@ -370,12 +370,12 @@ wf-config/
     └── project.rs             # 项目工具共享函数: load_wfl, load_schemas, parse_vars
 ```
 
-### 3.7 wf-proj（开发者工具）
+### 3.7 wfl（开发者工具）
 
 同步 CLI，不依赖 tokio。使用 tree-sitter-wfl 做代码格式化。
 
 ```
-wf-proj/
+wfl/
 └── src/
     ├── main.rs                # CLI: Explain / Lint / Fmt 子命令
     ├── cmd_explain.rs         # 编译规则并输出人类可读解释
@@ -1393,7 +1393,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing.workspace = true
 ```
 
-### 7.7 wf-proj（二进制 `wf-proj`）
+### 7.7 wfl（二进制 `wfl`）
 
 ```toml
 [dependencies]
@@ -1511,7 +1511,7 @@ retry_max_interval = "30s"                        # 最大重试间隔
 | **P3** | wf-runtime: Receiver + RuleTask + Lifecycle | 已完成 |
 | **P4** | wf-core/alert: AlertRecord；wf-core/sink: SinkDispatcher + SinkRuntime；wf-config/sink: 路由配置；wf-runtime: SinkFactoryRegistry + FileSinkFactory | 已完成 |
 | **P5** | wf-lang: 编译器 + checker + lint | 已完成 |
-| **P6** | wf-proj: explain / lint / fmt 工具 | 已完成 |
+| **P6** | wfl: explain / lint / fmt 工具 | 已完成 |
 | **P7** | wf-datagen: 数据生成 + oracle + verify | 已完成 |
 | **P8** | L2 增强: join / baseline / 条件表达式 / 函数 | 计划中 |
 | **P9** | 正确性门禁: contract + shuffle + scenario verify | 计划中 |
@@ -1531,7 +1531,7 @@ retry_max_interval = "30s"                        # 最大重试间隔
 | **III WFL 编译器** | M11–M13 | .wfs + .wfl → RulePlan | 已完成 |
 | **IV 执行引擎** | M14–M16 | CEP 状态机 + RuleExecutor | 已完成 |
 | **V 运行时闭环** | M17–M20 | **单机 MVP** | 已完成 |
-| **VI 生产化** | M21–M24 | wf-proj + wf-datagen + lint + fmt | 已完成 |
+| **VI 生产化** | M21–M24 | wfl + wf-datagen + lint + fmt | 已完成 |
 
 **计划阶段：**
 

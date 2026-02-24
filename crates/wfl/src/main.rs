@@ -9,7 +9,7 @@ mod cmd_lint;
 
 #[derive(Parser)]
 #[command(
-    name = "wf-proj",
+    name = "wfl",
     about = "WarpFusion project tools for rule developers"
 )]
 struct Cli {
@@ -125,11 +125,11 @@ fn main() -> Result<()> {
             alias,
             var,
         } => {
-            wf_proj::cmd_replay::run(file, schemas, input, alias, var)?;
+            wfl::cmd_replay::run(file, schemas, input, alias, var)?;
         }
 
         Commands::Test { file, schemas, var } => {
-            wf_proj::cmd_test::run(file, schemas, var)?;
+            wfl::cmd_test::run(file, schemas, var)?;
         }
     }
 
