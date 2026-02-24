@@ -2,7 +2,7 @@
 // Limits block
 // ---------------------------------------------------------------------------
 
-/// `limits { max_state = "256MB" max_cardinality = 10000 ... }`
+/// `limits { max_memory = "256MB" max_instances = 10000 ... }`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct LimitsBlock {

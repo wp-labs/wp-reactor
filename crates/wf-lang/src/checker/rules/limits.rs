@@ -2,7 +2,7 @@ use crate::ast::RuleDecl;
 
 use crate::checker::{CheckError, Severity};
 
-const VALID_LIMIT_KEYS: &[&str] = &["max_state", "max_cardinality", "max_emit_rate", "on_exceed"];
+const VALID_LIMIT_KEYS: &[&str] = &["max_memory", "max_instances", "max_throttle", "on_exceed"];
 
 const VALID_ON_EXCEED: &[&str] = &["throttle", "drop_oldest", "fail_rule"];
 
@@ -50,27 +50,27 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                     });
                 }
             }
-            "max_cardinality" => {
+            "max_instances" => {
                 if item.value.parse::<usize>().is_err() {
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
                         contract: None,
                         message: format!(
-                            "max_cardinality value `{}` must be a positive integer",
+                            "max_instances value `{}` must be a positive integer",
                             item.value
                         ),
                     });
                 }
             }
-            "max_emit_rate" => {
+            "max_throttle" => {
                 if !item.value.contains('/') {
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
                         contract: None,
                         message: format!(
-                            "max_emit_rate value `{}` must be in format count/unit (e.g. \"1000/min\")",
+                            "max_throttle value `{}` must be in format count/unit (e.g. \"1000/min\")",
                             item.value
                         ),
                     });
@@ -83,7 +83,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                                 rule: Some(rule_name.to_string()),
                                 contract: None,
                                 message: format!(
-                                    "max_emit_rate count `{}` is not a valid integer",
+                                    "max_throttle count `{}` is not a valid integer",
                                     parts[0].trim()
                                 ),
                             });
@@ -95,7 +95,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                                 rule: Some(rule_name.to_string()),
                                 contract: None,
                                 message: format!(
-                                    "max_emit_rate unit `{}` invalid; valid units are: s, sec, m, min, h, hr, hour, d, day",
+                                    "max_throttle unit `{}` invalid; valid units are: s, sec, m, min, h, hr, hour, d, day",
                                     parts[1].trim()
                                 ),
                             });
@@ -103,7 +103,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                     }
                 }
             }
-            "max_state" => {
+            "max_memory" => {
                 let s = item.value.to_uppercase();
                 if !(s.ends_with("MB") || s.ends_with("GB") || s.ends_with("KB")) {
                     errors.push(CheckError {
@@ -111,7 +111,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                         rule: Some(rule_name.to_string()),
                         contract: None,
                         message: format!(
-                            "max_state value `{}` must end with KB, MB, or GB (e.g. \"256MB\")",
+                            "max_memory value `{}` must end with KB, MB, or GB (e.g. \"256MB\")",
                             item.value
                         ),
                     });
@@ -123,7 +123,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                             rule: Some(rule_name.to_string()),
                             contract: None,
                             message: format!(
-                                "max_state numeric prefix `{}` in `{}` is not a valid positive integer",
+                                "max_memory numeric prefix `{}` in `{}` is not a valid positive integer",
                                 num_str.trim(),
                                 item.value
                             ),

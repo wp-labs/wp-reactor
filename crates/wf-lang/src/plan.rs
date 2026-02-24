@@ -123,9 +123,9 @@ pub struct JoinCondPlan {
 /// Compiled limits for runtime enforcement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LimitsPlan {
-    pub max_state_bytes: Option<usize>,
-    pub max_cardinality: Option<usize>,
-    pub max_emit_rate: Option<RateSpec>,
+    pub max_memory_bytes: Option<usize>,
+    pub max_instances: Option<usize>,
+    pub max_throttle: Option<RateSpec>,
     pub on_exceed: ExceedAction,
 }
 

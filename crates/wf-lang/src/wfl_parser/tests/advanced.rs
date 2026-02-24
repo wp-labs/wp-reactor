@@ -40,8 +40,8 @@ rule r {
     entity(ip, e.sip)
     yield out (x = e.sip)
     limits {
-        max_cardinality = 10000;
-        max_emit_rate = "1000/min";
+        max_instances = 10000;
+        max_throttle = "1000/min";
         on_exceed = drop_oldest;
     }
 }
@@ -50,9 +50,9 @@ rule r {
     let rule = &file.rules[0];
     let limits = rule.limits.as_ref().unwrap();
     assert_eq!(limits.items.len(), 3);
-    assert_eq!(limits.items[0].key, "max_cardinality");
+    assert_eq!(limits.items[0].key, "max_instances");
     assert_eq!(limits.items[0].value, "10000");
-    assert_eq!(limits.items[1].key, "max_emit_rate");
+    assert_eq!(limits.items[1].key, "max_throttle");
     assert_eq!(limits.items[1].value, "1000/min");
     assert_eq!(limits.items[2].key, "on_exceed");
     assert_eq!(limits.items[2].value, "drop_oldest");

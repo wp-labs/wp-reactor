@@ -94,7 +94,7 @@ runtime: runtime/wfusion.toml
 ### 4.1 v2.1 强制能力（由提案升级为主规范）
 - 显式 key 映射：多源异名字段必须使用 `key { logical = alias.field }`。
 - Join 时点语义：`join` 必须显式声明 `snapshot` 或 `asof [within dur]`。
-- 规则资源预算：每条规则必须包含 `limits { ... }`。
+- 规则资源预算：推荐每条规则声明 `limits { ... }`；省略时编译器发出 Warning。
 - 输出契约版本：`yield target@vN (...)` 成为标准写法（L1/L2 不再省略版本）。
 - 一致性测试门禁：`wf test --contracts` 与 `wf test --shuffle` 均为发布前必跑。
 
@@ -211,7 +211,7 @@ WFL 采用固定主执行链，阶段顺序不可变（`entity(...)` 为 YIELD �
 - `match` 采用显式双阶段：`on event { ... }`（必选）+ `on close { ... }`（可选，窗口关闭求值）。
 - `derive { ... }` 为特征派生块：先计算可复用特征，再供 `score`/`yield` 引用。
 - `entity(type, id_expr)` 为实体建模一等语法，禁止再依赖 `yield` 手工拼 `entity_type/entity_id`。
-- 每条规则必须声明 `limits { ... }` 资源预算，并在编译期产出 `CostPlan`。
+- 推荐每条规则声明 `limits { ... }` 资源预算；省略时编译器发出 Warning（未来版本可能升级为错误）。声明后编译期产出 `CostPlan`。
 - **聚合写法统一**：`alias.field | distinct | count` 与 `distinct(alias.field)` 在语义上等价，编译阶段统一 desugar 为同一聚合 IR。
 - 新增 `contract { given/expect }` 规则契约测试块：仅用于 `wf test`/CI 前置校验，不进入生产执行链。
 
@@ -263,7 +263,7 @@ base_type     = "chars" | "digit" | "float" | "bool" | "time" | "ip" | "hex" ;
 ```ebnf
 wfl_file      = { use_decl } , { rule_decl } , { contract_block } ;
 use_decl      = "use" , STRING ;
-rule_decl     = "rule" , IDENT , "{" , [ meta_block ] , [ features_block ] , events_block , stage_chain , limits_clause , "}" ;
+rule_decl     = "rule" , IDENT , "{" , [ meta_block ] , [ features_block ] , events_block , stage_chain , [ limits_clause ] , "}" ;
 
 stage_chain   = stage , { "|>" , stage } , entity_clause , yield_clause , [ conv_clause ] ;  (* |> 和 conv 为 L3 *)
 stage         = match_clause , { join_clause } ;
@@ -316,10 +316,10 @@ conv_chain    = conv_step , { "|" , conv_step } , ";" ;
 conv_step     = ("sort" | "top" | "dedup" | "where") , "(" , [ conv_args ] , ")" ;
 conv_args     = expr , { "," , expr } ;
 
-limits_clause = "limits" , "{" , limit_item , { limit_item } , "}" ;
-limit_item    = "max_state" , "=" , STRING , ";"
-              | "max_cardinality" , "=" , INTEGER , ";"
-              | "max_emit_rate" , "=" , STRING , ";"
+limits_clause = "limits" , "{" , limit_item , { limit_item } , "}" ;   (* 可选；省略时编译 Warning *)
+limit_item    = "max_memory" , "=" , STRING , ";"
+              | "max_instances" , "=" , INTEGER , ";"
+              | "max_throttle" , "=" , STRING , ";"
               | "on_exceed" , "=" , STRING , ";" ;       (* throttle | drop_oldest | fail_rule *)
 
 (* 规则契约测试（given/expect，供 wf test 使用） *)
@@ -433,7 +433,7 @@ ANY           = ? any unicode char ? ;
 - `derive` 引用使用 `@name`；可用于 `score` 与 `yield`，不可用于 `events` 过滤。
 - 集合判定（L2）：`window.has(field)` 判断“当前上下文字段值”是否存在于目标 window 的同名字段值集中；目标 window 须为静态集合（`over = 0`）或维度表。返回 `bool`。
 - v2.1 中，`join` 必须显式声明 `snapshot/asof`；`yield` 推荐显式目标并携带契约版本（`target@vN`）。
-- v2.1 中，`limits { ... }` 为规则必填块，作为资源安全边界。
+- v2.1 中，`limits { ... }` 为推荐声明块（省略时编译器发出 Warning）；声明后作为运行时资源安全边界。
 
 **`window.has(field)` 语义（L2）：**
 
@@ -495,7 +495,7 @@ match<sip:5m> {
 1. 变量预处理：`$VAR` / `${VAR:default}`。
 2. 解析：`.wfs` + `.wfl` -> AST。
 3. 语义检查：字段、类型、window 引用、over 约束、`join` 时间模式、`yield@vN` 契约声明。
-4. 治理检查：`meta.lang`、`meta.contract_version`、`limits` 必填项与取值范围。
+4. 治理检查：`meta.lang`、`meta.contract_version` 必填项；`limits` 推荐声明（省略发 Warning）。
 5. 成本估算：输出 `CostPlan`（状态基数、内存上界、最坏 emit 速率）。
 6. desugar：展开 `|>`、隐式 stage、`conv` 钩子。
 7. 生成 Core IR（Bind/Match/Join/Yield）。
@@ -754,7 +754,7 @@ wf reload
 ### 12.0 Rule 头部与治理约束（v2.1）
 - 每条规则必须声明 `meta.lang`，且当前仅允许 `"2.1"`。
 - 每条规则必须声明 `meta.contract_version`（正整数）。
-- 每条规则必须包含 `limits { ... }`，四项字段必填：`max_state`、`max_cardinality`、`max_emit_rate`、`on_exceed`。
+- `limits { ... }` 块推荐声明但当前非必需；省略时编译器发出 Warning（未来版本可能升级为编译错误）。块内各字段（`max_memory`、`max_instances`、`max_throttle`、`on_exceed`）均可省略，省略时编译默认值为 `None`（不限制），`on_exceed` 默认 `throttle`。
 - `yield target@vN (...)` 中 `vN` 必须与 `meta.contract_version` 一致，不一致编译错误。
 - 编译输出必须生成 `CostPlan`；若风险级别为 `high` 且未显式 override，发布阻断。
 
@@ -897,6 +897,18 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 - `flush_close_ratio` 计算口径：`close_total{reason=flush} / close_total{reason=timeout|flush|eos}`。
 - `window_emit_suppressed_ratio` 计算口径：`emit_suppressed_total / (emit_total + emit_suppressed_total)`。
 
+**Limits 运行时执行语义（L2）：**
+
+| ID | 规则 |
+|----|------|
+| LR1 | `max_instances`：在新实例创建前检查。当活跃实例数 ≥ 限额时，按 `on_exceed` 执行动作。 |
+| LR2 | `max_memory_bytes`：在**每次事件到达**时检查（非仅新实例创建时）。累加所有活跃实例的 `estimated_bytes()` + 即将创建的新实例基础开销 `base_estimated_bytes()`。总量 ≥ 限额时按 `on_exceed` 执行动作。 |
+| LR3 | `max_throttle`：在事件路径（match 命中）和关闭路径（close/scan_expired/close_all）均检查。使用滑动窗口计数器 `(emit_count, emit_window_start)` 跟踪；窗口过期后自动重置。 |
+| LR4 | `on_exceed = throttle`：丢弃当前事件/抑制当前告警，不影响后续事件。match 路径抑制时重置实例状态以复用。close 路径抑制时设 `close_ok = false`。 |
+| LR5 | `on_exceed = drop_oldest`：淘汰 `created_at` 最早的实例后继续。对 `max_throttle` 场景等效 `throttle`。 |
+| LR6 | `on_exceed = fail_rule`：标记规则永久失败（`failed = true`），后续所有事件直接返回 `Accumulate`，不可恢复。 |
+| LR7 | 内存估算采用粗粒度方式（治理级，非精确分析器）：struct 基础开销 128 字节、每个 BranchState 80 字节、distinct_set 按元素计入、String 值 `len + 24` 字节。 |
+
 ### 12.3 Join
 
 #### 12.3.1 编译约束
@@ -1026,7 +1038,7 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 | T50 | `join ... asof within DURATION` 中 `within` 必须 > 0；省略 `within` 时使用运行时默认值 |
 | T51 | `yield target@vN (...)` 中 `vN` 必须为正整数，且与 `meta.contract_version` 一致 |
 | T52 | `meta.lang` 必须存在且为 `"2.1"`；不允许省略 |
-| T53 | `limits.max_state/max_cardinality/max_emit_rate/on_exceed` 均为必填；`on_exceed` 仅允许 `throttle|drop_oldest|fail_rule` |
+| T53 | `limits` 块省略时发出 Warning；块内 `max_memory/max_instances/max_throttle/on_exceed` 各项可省，省略默认 `None`（不限制）/ `on_exceed` 默认 `throttle`；`on_exceed` 仅允许 `throttle|drop_oldest|fail_rule` |
 | T54 | 编译器必须输出 `CostPlan`；`risk_level=high` 时默认阻断发布，除非显式 override |
 
 **静态引用解析：**

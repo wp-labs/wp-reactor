@@ -18,7 +18,7 @@ use wf_lang::plan::{
 
 use crate::rule::RuleExecutor;
 use crate::rule::match_engine::{
-    CepStateMachine, MatchedContext, StepData, StepResult, Value, WindowLookup,
+    CepStateMachine, CloseReason, MatchedContext, StepData, StepResult, Value, WindowLookup,
 };
 
 use super::helpers::*;

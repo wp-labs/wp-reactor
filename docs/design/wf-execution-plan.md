@@ -307,7 +307,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-lang` + `wf-core` |
-| 范围 | `join` 关联增强（`snapshot/asof`）：运行时按 JoinPlan 执行；`baseline(expr, dur)`：基线偏离检测（均值 ± N 倍标准差），运行时维护滑动窗口统计量；`window.has(field)`：集合判定（编译为 `EXISTS` 子查询或 `IN` 列表）；显式 key 映射：`key { logical = alias.field }`；规则资源预算：`limits { max_state; max_cardinality; max_emit_rate; on_exceed }` 防止高基数状态膨胀 |
+| 范围 | `join` 关联增强（`snapshot/asof`）：运行时按 JoinPlan 执行；`baseline(expr, dur)`：基线偏离检测（均值 ± N 倍标准差），运行时维护滑动窗口统计量；`window.has(field)`：集合判定（编译为 `EXISTS` 子查询或 `IN` 列表）；显式 key 映射：`key { logical = alias.field }`；规则资源预算：`limits { max_memory; max_instances; max_throttle; on_exceed }` 防止高基数状态膨胀 |
 | 依赖 | M20（MVP 稳定后） |
 | 验收 | 情报关联场景（IP 命中威胁情报）；基线偏离场景（登录频率异常）；集合判定场景（IP 在黑名单中）；显式 key 映射多源 join 测试；snapshot / asof 语义正确性测试；limits 触发 throttle / drop_oldest 行为测试 |
 

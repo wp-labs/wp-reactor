@@ -39,7 +39,7 @@
 | 子查询合并 | 隐式 yield 规则链 + join | ✗ | ✗ | ✗ | `join [subsearch]` | `join (subquery)` |
 | 变量参数化 | `$VAR` / `${VAR:default}` (L1) | ✗ | ✗ | ✗ | `$token$` | ✗ |
 | `in`/`not in` | `expr in (...)`/`expr not in (...)` | `in %list` | `in (...)` | ✗ | `IN (...)` | `in (...)` |
-| 规则资源预算 | `limits { max_state ... }` (v2.1) | ✗ | ✗ | ✗ | 平台配置 | 平台配置 |
+| 规则资源预算 | `limits { max_memory ... }` (v2.1) | ✗ | ✗ | ✗ | 平台配置 | 平台配置 |
 | 输出契约版本 | `yield target@vN` + `meta.contract_version` | ✗ | ✗ | ✗ | ✗ | ✗ |
 | 可证明正确性门禁 | `contract + shuffle + scenario verify` | 平台回放 | 平台测试 | ✗ | 平台测试 | 平台测试 |
 | 数据/逻辑分离 | .wfs / .wfl / .toml 三文件 + `pack.yaml` | 单文件 | 单文件 | 单文件 | 单文件 | 单文件 |
@@ -156,7 +156,7 @@
 | 条件命中映射 | `hit(cond)` → 1.0/0.0 | L2 | 布尔条件映射为评分权重，简化 score 表达式 |
 | 内置基线偏离 | `baseline(expr, dur[, method])` | L2/L3 | 无需外部 ML 模块即可做行为偏离检测，支持持久化 |
 | Join 时点语义一等化 | `join ... snapshot/asof ... within` | L2 | 消除在线/回放在维表取值时点上的语义漂移 |
-| 规则资源预算 | `limits { max_state; ... }` | v2.1 | 规则级资源防护，阻断高基数状态膨胀 |
+| 规则资源预算 | `limits { max_memory; ... }` | v2.1 | 规则级资源防护，阻断高基数状态膨胀 |
 | 输出契约版本化 | `yield target@vN` + `meta.contract_version` | v2.1 | 下游字段演进可灰度、可回滚、可审计 |
 | Conformance 门禁 | `contract + shuffle + scenario verify` | v2.1 | 把“正确性验证”前置为发布门槛 |
 | `yield` 统一输出 | 告警和归并共用一个关键字 + window 抽象 | L1 | 消除 alert/output 概念分裂 |

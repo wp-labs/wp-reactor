@@ -157,8 +157,8 @@ impl CepStateMachine {
         let is_new = !self.instances.contains_key(&instance_key);
         if is_new
             && let Some(ref limits) = self.limits
-            && let Some(max_card) = limits.max_cardinality
-            && self.instances.len() >= max_card
+            && let Some(max_inst) = limits.max_instances
+            && self.instances.len() >= max_inst
         {
             match limits.on_exceed {
                 ExceedAction::Throttle => return StepResult::Accumulate,
@@ -180,23 +180,42 @@ impl CepStateMachine {
             }
         }
 
-        // max_state_bytes: total estimated memory across all instances
-        if is_new
-            && let Some(ref limits) = self.limits
-            && let Some(max_bytes) = limits.max_state_bytes
+        // max_memory_bytes: total estimated memory across all instances.
+        // Runs on every event to catch both new instance creation and
+        // existing instance growth (e.g. distinct_set expansion).
+        if let Some(ref limits) = self.limits
+            && let Some(max_bytes) = limits.max_memory_bytes
         {
-            let total: usize = self.instances.values().map(|i| i.estimated_bytes()).sum();
+            let new_cost = if is_new {
+                Instance::base_estimated_bytes(plan, &scope_key)
+            } else {
+                0
+            };
+            let mut total: usize =
+                self.instances.values().map(|i| i.estimated_bytes()).sum::<usize>() + new_cost;
             if total >= max_bytes {
                 match limits.on_exceed {
                     ExceedAction::Throttle => return StepResult::Accumulate,
                     ExceedAction::DropOldest => {
-                        if let Some(oldest_key) = self
-                            .instances
-                            .iter()
-                            .min_by_key(|(_, inst)| inst.created_at)
-                            .map(|(k, _)| k.clone())
-                        {
-                            self.instances.remove(&oldest_key);
+                        // Evict oldest instances in a loop until under limit or nothing left.
+                        // Never evict the current key's instance — doing so would lose
+                        // accumulated state and cause an unaccounted re-creation at entry().
+                        while total >= max_bytes {
+                            if let Some(oldest_key) = self
+                                .instances
+                                .iter()
+                                .filter(|(k, _)| k.as_str() != instance_key)
+                                .min_by_key(|(_, inst)| inst.created_at)
+                                .map(|(k, _)| k.clone())
+                            {
+                                let removed = self.instances.remove(&oldest_key);
+                                if let Some(ref inst) = removed {
+                                    total = total.saturating_sub(inst.estimated_bytes());
+                                }
+                            } else {
+                                // No other instances to evict — cannot make room
+                                return StepResult::Accumulate;
+                            }
                         }
                     }
                     ExceedAction::FailRule => {
@@ -265,7 +284,7 @@ impl CepStateMachine {
                     if plan.close_steps.is_empty() {
                         // Rate limiting check before emitting
                         if let Some(ref limits) = self.limits
-                            && let Some(ref rate) = limits.max_emit_rate
+                            && let Some(ref rate) = limits.max_throttle
                         {
                             let window_nanos = rate.per.as_nanos() as i64;
                             // Rotate window if expired
@@ -327,13 +346,15 @@ impl CepStateMachine {
     pub fn close(&mut self, scope_key: &[Value], reason: CloseReason) -> Option<CloseOutput> {
         let instance_key = make_instance_key(scope_key);
         let instance = self.instances.remove(&instance_key)?;
-        Some(evaluate_close(
+        let mut output = evaluate_close(
             &self.rule_name,
             &self.plan,
             instance,
             reason,
             self.watermark_nanos,
-        ))
+        );
+        self.rate_limit_close(&mut output, self.watermark_nanos);
+        Some(output)
     }
 
     /// Scan all instances for maxspan expiry using the internal watermark.
@@ -354,24 +375,29 @@ impl CepStateMachine {
     pub fn scan_expired_at(&mut self, watermark_nanos: i64) -> Vec<CloseOutput> {
         let WindowSpec::Sliding(maxspan) = self.plan.window_spec;
         let maxspan_nanos = maxspan.as_nanos() as i64;
-        let mut expired_keys = Vec::new();
+        let mut expired_keys: Vec<(String, i64)> = Vec::new();
         for (key, inst) in &self.instances {
             if watermark_nanos.saturating_sub(inst.created_at) >= maxspan_nanos {
-                expired_keys.push(key.clone());
+                expired_keys.push((key.clone(), inst.created_at));
             }
         }
+        // Sort by created_at so rate_limit_close sees monotonically increasing
+        // expire_time, producing deterministic results regardless of HashMap order.
+        expired_keys.sort_by_key(|(_, created_at)| *created_at);
         let mut results = Vec::with_capacity(expired_keys.len());
-        for key in expired_keys {
+        for (key, _) in expired_keys {
             if let Some(instance) = self.instances.remove(&key) {
                 // Use the instance's logical expiry time for deterministic fired_at
                 let expire_time = instance.created_at + maxspan_nanos;
-                results.push(evaluate_close(
+                let mut output = evaluate_close(
                     &self.rule_name,
                     &self.plan,
                     instance,
                     CloseReason::Timeout,
                     expire_time,
-                ));
+                );
+                self.rate_limit_close(&mut output, expire_time);
+                results.push(output);
             }
         }
         results
@@ -381,17 +407,27 @@ impl CepStateMachine {
     ///
     /// Used during shutdown to flush all in-flight state.
     pub fn close_all(&mut self, reason: CloseReason) -> Vec<CloseOutput> {
-        let keys: Vec<String> = self.instances.keys().cloned().collect();
+        // Sort by created_at for deterministic rate limiting order,
+        // same rationale as scan_expired_at.
+        let mut keys: Vec<(String, i64)> = self
+            .instances
+            .iter()
+            .map(|(k, inst)| (k.clone(), inst.created_at))
+            .collect();
+        keys.sort_by_key(|(_, created_at)| *created_at);
         let mut results = Vec::with_capacity(keys.len());
-        for key in keys {
+        let wm = self.watermark_nanos;
+        for (key, _) in keys {
             if let Some(instance) = self.instances.remove(&key) {
-                results.push(evaluate_close(
+                let mut output = evaluate_close(
                     &self.rule_name,
                     &self.plan,
                     instance,
                     reason,
-                    self.watermark_nanos,
-                ));
+                    wm,
+                );
+                self.rate_limit_close(&mut output, wm);
+                results.push(output);
             }
         }
         results
@@ -400,5 +436,38 @@ impl CepStateMachine {
     /// Current watermark (nanoseconds since epoch).
     pub fn watermark_nanos(&self) -> i64 {
         self.watermark_nanos
+    }
+
+    /// Apply max_throttle to a close output that would produce an alert.
+    ///
+    /// If the output would emit (`event_ok && close_ok`) and the rate limit
+    /// is exceeded, suppresses emission by clearing `close_ok`. This shares
+    /// the same sliding-window counter used by the match path.
+    fn rate_limit_close(&mut self, output: &mut CloseOutput, now_nanos: i64) {
+        if !output.event_ok || !output.close_ok {
+            return; // won't emit an alert anyway
+        }
+        if let Some(ref limits) = self.limits
+            && let Some(ref rate) = limits.max_throttle
+        {
+            let window_nanos = rate.per.as_nanos() as i64;
+            if now_nanos - self.emit_window_start >= window_nanos {
+                self.emit_count = 0;
+                self.emit_window_start = now_nanos;
+            }
+            if self.emit_count >= rate.count {
+                match limits.on_exceed {
+                    ExceedAction::Throttle | ExceedAction::DropOldest => {
+                        output.close_ok = false;
+                    }
+                    ExceedAction::FailRule => {
+                        self.failed = true;
+                        output.close_ok = false;
+                    }
+                }
+                return;
+            }
+            self.emit_count += 1;
+        }
     }
 }

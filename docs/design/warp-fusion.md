@@ -1549,7 +1549,7 @@ retry_max_interval = "30s"                        # 最大重试间隔
 |------|------|---------|
 | 窗口数据量超内存 | OOM | max_window_bytes + max_total_bytes 硬限 + Evictor 两阶段淘汰（时间 + 内存） |
 | Arrow IPC 传输断连 | 断连期间数据丢失 | TCP 可靠传输 + 指数退避重连；L1 为 best-effort |
-| 规则状态机实例膨胀 | 高基数 scope-key 导致内存增长 | W003 lint 警告（≥4 key 字段）；L2 规划 limits.max_cardinality |
+| 规则状态机实例膨胀 | 高基数 scope-key 导致内存增长 | W003 lint 警告（≥4 key 字段）；L2 规划 limits.max_instances |
 | cursor 落后于 eviction | RuleTask 丢失历史数据 | read_since 返回 gap_detected=true，记录日志继续处理 |
 | CEP 状态机未做 scope-key 限制 | 恶意/异常数据产生大量实例 | L2 规划 limits 资源预算执行 |
 | DataFusion 引入后的性能开销 | L2 join 执行时延迟增加 | L2 阶段 benchmark 验证；复用 SessionContext 策略 |

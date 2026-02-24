@@ -136,15 +136,15 @@ pub(super) fn explain_joins(joins: &[JoinPlan]) -> Vec<String> {
 
 pub(super) fn explain_limits(lp: &LimitsPlan) -> String {
     let mut parts = Vec::new();
-    if let Some(max_state) = lp.max_state_bytes {
-        parts.push(format!("max_state={}B", max_state));
+    if let Some(max_mem) = lp.max_memory_bytes {
+        parts.push(format!("max_memory={}B", max_mem));
     }
-    if let Some(max_card) = lp.max_cardinality {
-        parts.push(format!("max_cardinality={}", max_card));
+    if let Some(max_inst) = lp.max_instances {
+        parts.push(format!("max_instances={}", max_inst));
     }
-    if let Some(ref rate) = lp.max_emit_rate {
+    if let Some(ref rate) = lp.max_throttle {
         parts.push(format!(
-            "max_emit_rate={}/{}",
+            "max_throttle={}/{}",
             rate.count,
             format_duration(&rate.per)
         ));

@@ -215,21 +215,21 @@ fn compile_joins(joins: &[crate::ast::JoinClause]) -> Vec<JoinPlan> {
 fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan> {
     let limits = limits.as_ref()?;
 
-    let mut max_state_bytes = None;
-    let mut max_cardinality = None;
-    let mut max_emit_rate = None;
+    let mut max_memory_bytes = None;
+    let mut max_instances = None;
+    let mut max_throttle = None;
     let mut on_exceed = ExceedAction::Throttle; // default
 
     for item in &limits.items {
         match item.key.as_str() {
-            "max_state" => {
-                max_state_bytes = parse_byte_size(&item.value);
+            "max_memory" => {
+                max_memory_bytes = parse_byte_size(&item.value);
             }
-            "max_cardinality" => {
-                max_cardinality = item.value.parse::<usize>().ok();
+            "max_instances" => {
+                max_instances = item.value.parse::<usize>().ok();
             }
-            "max_emit_rate" => {
-                max_emit_rate = parse_rate_spec(&item.value);
+            "max_throttle" => {
+                max_throttle = parse_rate_spec(&item.value);
             }
             "on_exceed" => {
                 on_exceed = match item.value.as_str() {
@@ -244,9 +244,9 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
     }
 
     Some(LimitsPlan {
-        max_state_bytes,
-        max_cardinality,
-        max_emit_rate,
+        max_memory_bytes,
+        max_instances,
+        max_throttle,
         on_exceed,
     })
 }

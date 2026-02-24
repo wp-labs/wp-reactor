@@ -761,7 +761,73 @@ yield out (
 )
 ```
 
-### 5.10 完整规则示例
+### 5.10 limits — 资源预算（L2）
+
+`limits { ... }` 为规则声明运行时资源上界，防止单条规则耗尽系统内存或产生过量告警。
+
+> 省略 `limits` 块时编译器发出 Warning（未来版本可能升级为编译错误）。
+
+#### 语法
+
+```wfl
+limits {
+    max_memory = "50MB";          // 可选，规则总状态内存上限
+    max_instances = 10000;     // 可选，活跃实例（key 数）上限
+    max_throttle = "100/60s";   // 可选，告警产出速率上限
+    on_exceed = "throttle";      // 可选，超限时动作（默认 throttle）
+}
+```
+
+#### 字段说明
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `max_memory` | STRING | 无限制 | 所有活跃实例的估算总内存上限（如 `"50MB"`） |
+| `max_instances` | INTEGER | 无限制 | 活跃实例数上限；超限时新 key 无法创建实例 |
+| `max_throttle` | STRING | 无限制 | 滑动窗口内最大告警数（格式 `"count/duration"`，如 `"100/60s"`） |
+| `on_exceed` | STRING | `"throttle"` | 超限动作：`throttle` / `drop_oldest` / `fail_rule` |
+
+#### on_exceed 动作
+
+| 动作 | 行为 |
+|------|------|
+| `throttle` | 丢弃当前触发（事件路径：重置实例状态；关闭路径：抑制告警输出），不影响后续事件 |
+| `drop_oldest` | 淘汰 `created_at` 最早的实例后继续（仅对 `max_instances` / `max_memory` 有效；对 `max_throttle` 等效 `throttle`） |
+| `fail_rule` | 标记规则永久失败，后续所有事件直接忽略，不可恢复 |
+
+#### 运行时行为
+
+- **`max_instances`**：新实例创建前检查活跃实例数。
+- **`max_memory`**：每次事件到达时检查（包括已有实例增长和即将创建的新实例基础开销）。
+- **`max_throttle`**：事件路径（match 命中）和关闭路径（timeout / flush / eos）均检查，共享同一滑动窗口计数器。
+
+#### 示例
+
+```wfl
+rule brute_force {
+    meta { lang = "2.1" }
+    events { fail: auth_fail }
+
+    match<sip:5m> {
+        on event {
+            fail where count >= 10 -> "brute"
+        }
+    }
+    -> score(count)
+    entity(ip, sip)
+    yield alert_out (
+        src_ip = sip
+    )
+
+    limits {
+        max_instances = 50000;
+        max_throttle = "200/60s";
+        on_exceed = "throttle";
+    }
+}
+```
+
+### 5.11 完整规则示例
 
 #### 阈值检测
 
@@ -1594,6 +1660,7 @@ WFL 功能按 L1/L2/L3 分层，渐进式开放。
 | `lower(field)` / `upper(field)` | 已实现 | 大小写转换，支持嵌套调用 |
 | `len(field)` | 已实现 | 字符串长度 |
 | `join` + `snapshot`/`asof` | 已实现 | 外部关联（snapshot 及 asof 时点模式，含 within 窗口） |
+| `limits { ... }` | 已实现 | 资源预算（max_memory / max_instances / max_throttle） |
 
 **设计中（尚未实现）：**
 
@@ -1609,7 +1676,6 @@ WFL 功能按 L1/L2/L3 分层，渐进式开放。
 | `hit(cond)` | 条件命中映射 |
 | `coalesce`/`try` | 空值兜底函数 |
 | `key { logical = alias.field }` | 显式 key 映射 |
-| `limits { ... }` | 资源预算 |
 | `yield target@vN` | 输出契约版本 |
 
 ### L3（高级 — 设计中）

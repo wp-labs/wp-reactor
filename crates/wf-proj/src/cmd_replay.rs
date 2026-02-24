@@ -117,9 +117,14 @@ fn replay_with_plans<R: BufRead>(
     let mut engines: Vec<(CepStateMachine, RuleExecutor)> = plans
         .iter()
         .map(|plan| {
-            let time_field = schemas
+            // Resolve time_field from the schema that matches the replay alias.
+            // For multi-source rules (events { a: win_a, b: win_b }), the alias
+            // determines which window's time_field to use for event-time extraction.
+            let time_field = plan
+                .binds
                 .iter()
-                .find(|s| plan.binds.iter().any(|b| b.window == s.name))
+                .find(|b| b.alias == alias)
+                .and_then(|b| schemas.iter().find(|s| s.name == b.window))
                 .and_then(|s| s.time_field.clone());
 
             let limits = plan.limits_plan.clone();

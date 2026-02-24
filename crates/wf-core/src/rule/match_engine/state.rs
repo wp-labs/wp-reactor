@@ -113,6 +113,32 @@ impl Instance {
         size
     }
 
+    /// Estimate bytes for a new instance that hasn't been created yet.
+    ///
+    /// Accounts for struct overhead, scope key, and empty branch states
+    /// from the plan (same layout as `Instance::new` would produce).
+    pub(super) fn base_estimated_bytes(
+        plan: &MatchPlan,
+        scope_key: &[Value],
+    ) -> usize {
+        let mut size: usize = 128; // base struct overhead
+
+        for val in scope_key {
+            size += val_estimated_bytes(val);
+        }
+
+        // empty branch states: 80 bytes each
+        let branch_count: usize = plan
+            .event_steps
+            .iter()
+            .chain(plan.close_steps.iter())
+            .map(|sp| sp.branches.len())
+            .sum();
+        size += branch_count * 80;
+
+        size
+    }
+
     pub(super) fn reset(&mut self, plan: &MatchPlan, now_nanos: i64) {
         self.created_at = now_nanos;
         self.last_event_nanos = now_nanos;
