@@ -88,6 +88,31 @@ impl Instance {
         }
     }
 
+    pub(super) fn estimated_bytes(&self) -> usize {
+        let mut size: usize = 128; // base struct overhead
+
+        // scope_key
+        for val in &self.scope_key {
+            size += val_estimated_bytes(val);
+        }
+
+        // step_states + close_step_states
+        for ss in self.step_states.iter().chain(self.close_step_states.iter()) {
+            for bs in &ss.branch_states {
+                // base branch fields (~80 bytes) + distinct_set
+                size += 80 + bs.distinct_set.iter().map(|s| s.len() + 24).sum::<usize>();
+            }
+        }
+
+        // completed_steps
+        size += self.completed_steps.len() * 64;
+
+        // baselines
+        size += self.baselines.len() * 128;
+
+        size
+    }
+
     pub(super) fn reset(&mut self, plan: &MatchPlan, now_nanos: i64) {
         self.created_at = now_nanos;
         self.last_event_nanos = now_nanos;
@@ -105,5 +130,12 @@ impl Instance {
             .map(|sp| StepState::new(sp.branches.len()))
             .collect();
         self.baselines.clear();
+    }
+}
+
+fn val_estimated_bytes(v: &Value) -> usize {
+    match v {
+        Value::Str(s) => s.len() + 24,
+        Value::Number(_) | Value::Bool(_) => 8,
     }
 }

@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use wf_core::alert::AlertRecord;
-use wf_core::rule::{CepStateMachine, Event, RuleExecutor, StepResult, Value};
+use wf_core::rule::{
+    CepStateMachine, CloseReason, Event, RuleExecutor, StepResult, Value, WindowLookup,
+};
 use wf_lang::WindowSchema;
 use wf_lang::plan::RulePlan;
 
@@ -82,6 +84,29 @@ pub fn replay_events<R: BufRead>(
     replay_with_plans(&plans, schemas, reader, alias)
 }
 
+/// Stub [`WindowLookup`] for replay mode.
+///
+/// Replay operates without a live window store, so join lookups and
+/// `window.has()` guards always return `None` (no data available).
+struct NullWindowLookup;
+
+impl WindowLookup for NullWindowLookup {
+    fn snapshot_field_values(
+        &self,
+        _window: &str,
+        _field: &str,
+    ) -> Option<std::collections::HashSet<String>> {
+        None
+    }
+
+    fn snapshot(
+        &self,
+        _window: &str,
+    ) -> Option<Vec<std::collections::HashMap<String, Value>>> {
+        None
+    }
+}
+
 /// Replay events against pre-compiled rule plans.
 fn replay_with_plans<R: BufRead>(
     plans: &[RulePlan],
@@ -109,11 +134,13 @@ fn replay_with_plans<R: BufRead>(
         })
         .collect();
 
+    let lookup = NullWindowLookup;
     let mut alerts = Vec::new();
     let mut event_count: u64 = 0;
     let mut match_count: u64 = 0;
     let mut error_count: u64 = 0;
 
+    // -- Event loop --
     for line_result in reader.lines() {
         let line = line_result?;
         let line = line.trim();
@@ -138,18 +165,37 @@ fn replay_with_plans<R: BufRead>(
         event_count += 1;
 
         for (sm, executor) in &mut engines {
-            match sm.advance(alias, &event) {
-                StepResult::Matched(ctx) => match executor.execute_match(&ctx) {
-                    Ok(alert) => {
-                        alerts.push(alert);
-                        match_count += 1;
+            match sm.advance_with(alias, &event, Some(&lookup)) {
+                StepResult::Matched(ctx) => {
+                    match executor.execute_match_with_joins(&ctx, &lookup) {
+                        Ok(alert) => {
+                            alerts.push(alert);
+                            match_count += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("ERROR: execute_match failed: {}", e);
+                            error_count += 1;
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("ERROR: execute_match failed: {}", e);
-                        error_count += 1;
-                    }
-                },
+                }
                 StepResult::Advance | StepResult::Accumulate => {}
+            }
+        }
+    }
+
+    // -- EOF: close all remaining instances --
+    for (sm, executor) in &mut engines {
+        for close in &sm.close_all(CloseReason::Eos) {
+            match executor.execute_close_with_joins(close, &lookup) {
+                Ok(Some(alert)) => {
+                    alerts.push(alert);
+                    match_count += 1;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("ERROR: execute_close failed: {}", e);
+                    error_count += 1;
+                }
             }
         }
     }

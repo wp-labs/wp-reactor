@@ -106,7 +106,10 @@ fn find_asof_row(
     within: Option<&Duration>,
 ) -> Option<std::collections::HashMap<String, Value>> {
     let min_ts = within
-        .map(|d| event_time_nanos - d.as_nanos() as i64)
+        .map(|d| {
+            let nanos = i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
+            event_time_nanos.saturating_sub(nanos)
+        })
         .unwrap_or(i64::MIN);
 
     rows.iter()

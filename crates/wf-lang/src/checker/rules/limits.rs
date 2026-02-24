@@ -9,7 +9,15 @@ const VALID_ON_EXCEED: &[&str] = &["throttle", "drop_oldest", "fail_rule"];
 pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckError>) {
     let limits = match &rule.limits {
         Some(l) => l,
-        None => return,
+        None => {
+            errors.push(CheckError {
+                severity: Severity::Warning,
+                rule: Some(rule_name.to_string()),
+                contract: None,
+                message: "v2.1 requires `limits { ... }` block; omitting limits may become a compile error in a future release".to_string(),
+            });
+            return;
+        }
     };
 
     for item in &limits.items {

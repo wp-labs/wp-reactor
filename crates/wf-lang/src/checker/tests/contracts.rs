@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::checker::Severity;
 use crate::wfl_parser::parse_wfl;
 
 #[test]
@@ -58,6 +59,7 @@ contract ct for r {
 "#;
     let file = parse_wfl(input).unwrap();
     let errs = check_wfl(&file, &[auth_events_window(), output_window()]);
+    let hard: Vec<_> = errs.iter().filter(|e| e.severity == Severity::Error).collect();
     // The rule itself is valid and contract refs are valid
-    assert!(errs.is_empty(), "expected no errors, got: {:?}", errs);
+    assert!(hard.is_empty(), "expected no errors, got: {:?}", hard);
 }

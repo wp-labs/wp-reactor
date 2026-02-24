@@ -370,3 +370,84 @@ fn join_asof_no_timestamp_support_skips() {
     let alert = exec.execute_match_with_joins(&matched, &wl).unwrap();
     assert!((alert.score - 42.0).abs() < f64::EPSILON);
 }
+
+// ===========================================================================
+// Join asof: close path uses last_event_nanos, not watermark
+// ===========================================================================
+
+#[test]
+fn join_asof_close_uses_last_event_nanos() {
+    use crate::rule::match_engine::{CloseOutput, CloseReason};
+
+    let match_plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(1.0))])],
+    );
+    let mut rule_plan = simple_rule_plan(
+        "r_asof_close",
+        match_plan,
+        // Score uses the joined "risk" field
+        Expr::Field(FieldRef::Simple("risk".to_string())),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".to_string())),
+    );
+    rule_plan.joins = vec![asof_join("threat_intel", "sip", "ip")];
+
+    let exec = RuleExecutor::new(rule_plan);
+
+    // Instance last saw an event at 1s.
+    // Global watermark advanced to 5s (other instances pushed it forward).
+    // Right table has a row at 3s — after last_event but before watermark.
+    let last_event: i64 = 1_000_000_000;
+    let watermark: i64 = 5_000_000_000;
+
+    let mut wl = MockWindowLookup::new();
+    wl.add_timestamped_snapshot(
+        "threat_intel",
+        vec![
+            // Row at 500ms — before last_event → eligible
+            (
+                500_000_000,
+                row(vec![
+                    ("ip", str_val("10.0.0.1")),
+                    ("risk", num(60.0)),
+                ]),
+            ),
+            // Row at 3s — after last_event, before watermark → must NOT match
+            (
+                3_000_000_000,
+                row(vec![
+                    ("ip", str_val("10.0.0.1")),
+                    ("risk", num(99.0)),
+                ]),
+            ),
+        ],
+    );
+
+    let close = CloseOutput {
+        rule_name: "r_asof_close".to_string(),
+        scope_key: vec![str_val("10.0.0.1")],
+        close_reason: CloseReason::Flush,
+        event_ok: true,
+        close_ok: true,
+        event_step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: Some("fail".to_string()),
+            measure_value: 1.0,
+        }],
+        close_step_data: vec![],
+        watermark_nanos: watermark,
+        last_event_nanos: last_event,
+    };
+
+    let alert = exec
+        .execute_close_with_joins(&close, &wl)
+        .unwrap()
+        .unwrap();
+    // Should pick the row at 500ms (risk=60), NOT the row at 3s (risk=99)
+    assert!(
+        (alert.score - 60.0).abs() < f64::EPSILON,
+        "expected score 60.0 from 500ms row, got {}",
+        alert.score
+    );
+}

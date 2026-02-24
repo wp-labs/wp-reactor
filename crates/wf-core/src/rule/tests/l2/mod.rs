@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use wf_lang::ast::{Expr, FieldRef, JoinMode};
 use wf_lang::plan::{
-    ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, WindowSpec,
+    ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, RateSpec, WindowSpec,
 };
 
 use crate::rule::RuleExecutor;

@@ -13,6 +13,7 @@ mod yield_version;
 use std::time::Duration;
 
 use crate::check_wfl;
+use crate::checker::Severity;
 use crate::schema::{BaseType, FieldDef, FieldType, WindowSchema};
 use crate::wfl_parser::parse_wfl;
 
@@ -113,11 +114,14 @@ fn security_alerts_window() -> WindowSchema {
     )
 }
 
-/// Helper: check and return only the error messages for readability.
+/// Helper: check and return only the error messages (not warnings) for readability.
 fn check_errors(input: &str, schemas: &[WindowSchema]) -> Vec<String> {
     let file = parse_wfl(input).expect("parse should succeed");
     let errs = check_wfl(&file, schemas);
-    errs.into_iter().map(|e| e.message).collect()
+    errs.into_iter()
+        .filter(|e| e.severity == Severity::Error)
+        .map(|e| e.message)
+        .collect()
 }
 
 /// Helper: assert that checking produces no errors.

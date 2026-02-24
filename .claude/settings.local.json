@@ -84,7 +84,8 @@
       "Bash(cargo clean:*)",
       "Bash(./target/debug/wf-proj:*)",
       "Bash(FAIL_THRESHOLD=3 ./target/debug/wf-proj:*)",
-      "Bash(FAIL_THRESHOLD=3 ./target/debug/wf-datagen gen:*)"
+      "Bash(FAIL_THRESHOLD=3 ./target/debug/wf-datagen gen:*)",
+      "Bash(cd:*)"
     ]
   }
 }

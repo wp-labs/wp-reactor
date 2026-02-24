@@ -650,7 +650,78 @@ entity(host, e.host_id)            // 主机实体
 - `entity_id` 允许引用当前上下文字段。
 - 系统自动注入 `entity_type` 和 `entity_id` 到输出。
 
-### 5.8 yield — 输出
+### 5.8 join — 外部关联（L2）
+
+`join` 用于在 match 命中后、输出前，将外部维表数据关联到当前告警上下文。固定为 LEFT JOIN 语义：无匹配行时告警仍正常输出（缺少 join 字段可能导致引用失败）。
+
+```wfl
+join <右表window> <模式> on <左侧字段> == <右表window>.<右侧字段>
+```
+
+#### 模式选择
+
+| 模式 | 语法 | 语义 |
+|------|------|------|
+| `snapshot` | `join w snapshot on ...` | 使用右表当前最新版本，找第一行匹配 |
+| `asof` | `join w asof on ...` | 按事件时间回看，找**最近一行** `ts <= event_time` |
+| `asof within` | `join w asof within 1h on ...` | 同 asof，但只在 `within` 时间窗口内回看 |
+
+#### snapshot 示例
+
+```wfl
+rule brute_force_enrich {
+    events {
+        fail : auth_events && action == "failed"
+    }
+    match<sip:5m> {
+        on event {
+            fail | count >= 3;
+        }
+    } -> score(70.0)
+    join geo_lookup snapshot on sip == geo_lookup.ip
+    entity(ip, fail.sip)
+    yield security_alerts (
+        sip = fail.sip,
+        country = geo_lookup.country,
+        message = fmt("{} brute force from {}", fail.sip, geo_lookup.country)
+    )
+}
+```
+
+`geo_lookup` 是一个维表 window。命中后从中查找 `ip == sip` 的行，将 `country` 等字段注入上下文。
+
+#### asof 示例
+
+```wfl
+rule threat_intel_match {
+    events {
+        conn : fw_events
+    }
+    match<sip:5m> {
+        on event {
+            conn | count >= 10;
+        }
+    } -> score(conn_risk.risk)
+    join conn_risk asof within 24h on sip == conn_risk.ip
+    entity(ip, sip)
+    yield security_alerts (
+        sip = sip,
+        risk = conn_risk.risk,
+        message = fmt("{} matched threat intel (risk={})", sip, conn_risk.risk)
+    )
+}
+```
+
+`asof` 模式根据事件时间在 `conn_risk` 表中找到最近一条 `ts <= event_time` 且 `ip` 匹配的行。`within 24h` 限制只回看 24 小时内的数据，超出范围视为未命中。
+
+#### 使用说明
+
+- **右表要求**：`asof` 模式要求右表 window 声明了 `time` 字段；`snapshot` 模式无此要求。
+- **字段引用**：join 引入的字段在 yield/score/entity 中以 `window_name.field` 限定名引用（如 `geo_lookup.country`）。裸字段名（如 `country`）仅在与已有字段不冲突时可用。
+- **多 join**：多个 join 按声明顺序执行，后续 join 可引用前序 join 新增字段。
+- **on close 路径**：close 触发的 asof join 使用该匹配实例最后处理事件的时间（非全局水位），确保不会"前看"到实例生命周期之外的数据。
+
+### 5.9 yield — 输出
 
 `yield` 声明规则命中后输出哪些字段到目标 window。
 
@@ -690,7 +761,7 @@ yield out (
 )
 ```
 
-### 5.9 完整规则示例
+### 5.10 完整规则示例
 
 #### 阈值检测
 
@@ -1522,12 +1593,12 @@ WFL 功能按 L1/L2/L3 分层，渐进式开放。
 | `contains(haystack, needle)` | 已实现 | 子串包含判定，可用于 guard/score/entity 表达式 |
 | `lower(field)` / `upper(field)` | 已实现 | 大小写转换，支持嵌套调用 |
 | `len(field)` | 已实现 | 字符串长度 |
+| `join` + `snapshot`/`asof` | 已实现 | 外部关联（snapshot 及 asof 时点模式，含 within 窗口） |
 
 **设计中（尚未实现）：**
 
 | 特性 | 说明 |
 |------|------|
-| `join` + `snapshot`/`asof` | 外部关联 |
 | `baseline(expr, dur)` | 基线偏离 |
 | `window.has(field)` | 集合判定 |
 | `derive { x = expr; ... }` | 特征派生 |

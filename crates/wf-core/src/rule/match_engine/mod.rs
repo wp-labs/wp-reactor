@@ -46,9 +46,7 @@ pub struct CepStateMachine {
     /// Set to true when `FailRule` limit is exceeded — all future events are
     /// rejected until the machine is reset.
     failed: bool,
-    #[allow(dead_code)] // Reserved for emit rate limiting (L2)
     emit_count: u64,
-    #[allow(dead_code)] // Reserved for emit rate limiting (L2)
     emit_window_start: i64,
 }
 
@@ -182,6 +180,33 @@ impl CepStateMachine {
             }
         }
 
+        // max_state_bytes: total estimated memory across all instances
+        if is_new
+            && let Some(ref limits) = self.limits
+            && let Some(max_bytes) = limits.max_state_bytes
+        {
+            let total: usize = self.instances.values().map(|i| i.estimated_bytes()).sum();
+            if total >= max_bytes {
+                match limits.on_exceed {
+                    ExceedAction::Throttle => return StepResult::Accumulate,
+                    ExceedAction::DropOldest => {
+                        if let Some(oldest_key) = self
+                            .instances
+                            .iter()
+                            .min_by_key(|(_, inst)| inst.created_at)
+                            .map(|(k, _)| k.clone())
+                        {
+                            self.instances.remove(&oldest_key);
+                        }
+                    }
+                    ExceedAction::FailRule => {
+                        self.failed = true;
+                        return StepResult::Accumulate;
+                    }
+                }
+            }
+        }
+
         let instance = self
             .instances
             .entry(instance_key)
@@ -238,6 +263,32 @@ impl CepStateMachine {
 
                 if instance.current_step >= plan.event_steps.len() {
                     if plan.close_steps.is_empty() {
+                        // Rate limiting check before emitting
+                        if let Some(ref limits) = self.limits
+                            && let Some(ref rate) = limits.max_emit_rate
+                        {
+                            let window_nanos = rate.per.as_nanos() as i64;
+                            // Rotate window if expired
+                            if now_nanos - self.emit_window_start >= window_nanos {
+                                self.emit_count = 0;
+                                self.emit_window_start = now_nanos;
+                            }
+                            if self.emit_count >= rate.count {
+                                match limits.on_exceed {
+                                    ExceedAction::Throttle | ExceedAction::DropOldest => {
+                                        // Suppress the match — reset instance for future use
+                                        instance.reset(plan, now_nanos);
+                                        return StepResult::Accumulate;
+                                    }
+                                    ExceedAction::FailRule => {
+                                        self.failed = true;
+                                        return StepResult::Accumulate;
+                                    }
+                                }
+                            }
+                            self.emit_count += 1;
+                        }
+
                         // No close steps → M14 backward compat: Matched + reset
                         let ctx = MatchedContext {
                             rule_name: self.rule_name.clone(),

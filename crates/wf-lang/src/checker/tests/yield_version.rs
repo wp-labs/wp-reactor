@@ -87,7 +87,7 @@ rule r2 {
     let errs = check_wfl(&file, schemas);
     let warnings: Vec<_> = errs
         .iter()
-        .filter(|e| e.severity == Severity::Warning)
+        .filter(|e| e.severity == Severity::Warning && e.message.contains("yield"))
         .collect();
     assert!(
         warnings.is_empty(),
@@ -119,7 +119,7 @@ rule r2 {
     let errs = check_wfl(&file, schemas);
     let warnings: Vec<_> = errs
         .iter()
-        .filter(|e| e.severity == Severity::Warning)
+        .filter(|e| e.severity == Severity::Warning && e.message.contains("yield"))
         .collect();
     assert!(
         warnings.is_empty(),

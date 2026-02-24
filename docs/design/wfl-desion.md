@@ -637,11 +637,18 @@ pub struct MatchPlan {
 `Receiver -> Router -> WindowStore -> MatchEngine -> JoinExecutor -> YieldWriter -> Sink`
 
 ### 9.2 事件驱动
-- 新事件只分发到“引用该 window”的规则。
+- 新事件只分发到”引用该 window”的规则。
 - 匹配成功后触发 join/yield。
 - timeout wheel 定期触发窗口关闭与 maxspan 过期，并以 `close_reason = timeout` 执行 `on close` 求值。
 - 显式 flush 触发时，`close_reason = flush`。
 - 输入流结束（end-of-stream）触发时，`close_reason = eos`。
+
+### 9.2.1 Join 执行
+- Join 在 match 命中后、yield 输出前执行（`execute_match_with_joins` / `execute_close_with_joins`）。
+- `execute_joins()` 接收 `event_time_nanos` 参数，按声明顺序逐个执行 join。
+- Snapshot join 调用 `WindowLookup::snapshot()`；Asof join 调用 `WindowLookup::snapshot_with_timestamps()`。
+- `RegistryLookup` 通过 `Window::time_col_index()` 获取时间列位置，使用 `batch_to_timestamped_rows()` 从 Arrow RecordBatch 提取 `(i64, HashMap)` 行。
+- Close 路径 asof join 使用 `Instance.last_event_nanos`（实例最后处理事件时间），确保不会”前看”到实例生命周期之外的右表版本。
 
 ### 9.3 并发控制
 - 全局 `Semaphore(executor_parallelism)`。
@@ -891,12 +898,39 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 - `window_emit_suppressed_ratio` 计算口径：`emit_suppressed_total / (emit_total + emit_suppressed_total)`。
 
 ### 12.3 Join
+
+#### 12.3.1 编译约束
 - `join` 必须显式声明时间模式：`snapshot` 或 `asof [within dur]`；省略模式编译错误。
 - `on` 两侧字段必须可解析且类型**一致**（跨类型编译错误）。
 - join 右侧字段（来自 join window）**必须**以 `window_name.field` 限定名引用；左侧可使用上下文字段（如 `sip` 或 `fail.sip`）。
-- `snapshot`：使用求值时可见的最新维表版本。
-- `asof`：按事件时间回看不晚于事件时间的最近版本；若声明 `within`，超出窗口视为未命中。
+- `asof` 右表必须具备时间列（由 window `time` 字段声明）；无时间列编译错误（T49）。
+- `within` 必须 > 0（T50）。
 - 多 join 按声明顺序执行；后续 join 可引用前序 join 新增字段。
+
+#### 12.3.2 运行时语义
+
+**Snapshot 模式**：
+- 调用 `WindowLookup::snapshot()` 获取右表全量行（`Vec<HashMap<String, Value>>`）。
+- 按声明顺序遍历行，找到**第一行**满足所有 `on` 条件的即为命中行。
+
+**Asof 模式**：
+- 调用 `WindowLookup::snapshot_with_timestamps()` 获取带时间戳的行（`Vec<(i64, HashMap<String, Value>)>`）。
+- 时间戳由右表 window 的 `time` 列提取（`TimestampNanosecondArray` 原始 i64 纳秒值）。
+- 时间列字段同时作为普通字段保留在行的 fields map 中（与 snapshot 模式一致）。
+- 过滤条件：`ts <= event_time_nanos && ts >= min_ts`，其中：
+  - 无 `within`：`min_ts = i64::MIN`（回看无限远）。
+  - 有 `within`：`min_ts = event_time_nanos - within_nanos`（溢出安全：`i64::try_from(within.as_nanos()).unwrap_or(i64::MAX)` + `saturating_sub`）。
+- 在满足时间过滤和 `on` 条件的行中，选择**时间戳最大**的行（最近的版本）。
+- 若无符合条件的行，join 产出为空（不报错，后续表达式可能因缺少字段而失败）。
+
+**时间点选择（match vs close 路径）**：
+- `on event` 命中路径：`event_time_nanos` 取自 `MatchedContext.event_time_nanos`。
+- `on close` 命中路径：`event_time_nanos` 取自 `CloseOutput.last_event_nanos`（该实例最后一次处理事件的时间），**而非** `watermark_nanos`（全局水位）。这确保 asof join 不会"看到"该实例生命周期之外的右表数据。
+
+**字段合并**：
+- 命中行的每个字段以两种方式写入 eval context：
+  - 限定名：`window_name.field_name`（始终写入）。
+  - 裸名：`field_name`（仅当 eval context 中不存在同名字段时写入，防止覆盖 key/label 字段）。
 
 ### 12.4 Yield
 - 目标 window 必须存在，且满足：`stream` 为空（纯输出 window）并且 `over > 0`。

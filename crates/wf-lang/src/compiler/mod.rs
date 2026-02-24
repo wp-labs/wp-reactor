@@ -23,8 +23,12 @@ mod tests;
 /// logic is compiled.
 pub fn compile_wfl(file: &WflFile, schemas: &[WindowSchema]) -> anyhow::Result<Vec<RulePlan>> {
     let errors = check_wfl(file, schemas);
-    if !errors.is_empty() {
-        let msgs: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+    let hard_errors: Vec<_> = errors
+        .iter()
+        .filter(|e| e.severity == crate::checker::Severity::Error)
+        .collect();
+    if !hard_errors.is_empty() {
+        let msgs: Vec<String> = hard_errors.iter().map(|e| e.to_string()).collect();
         anyhow::bail!("semantic errors:\n{}", msgs.join("\n"));
     }
     file.rules.iter().map(compile_rule).collect()
