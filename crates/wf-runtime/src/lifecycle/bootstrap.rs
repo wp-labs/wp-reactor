@@ -67,8 +67,9 @@ pub(super) async fn load_and_compile(
         .as_ref()
         .map(|p| base_dir.join(p))
         .unwrap_or_else(|| base_dir.to_path_buf());
+    let window_names: Vec<String> = config.windows.iter().map(|w| w.name.clone()).collect();
     let dispatcher = Arc::new(
-        build_sink_dispatcher(&bundle, &factory_registry, &work_root)
+        build_sink_dispatcher(&bundle, &factory_registry, &work_root, &window_names)
             .await
             .owe(RuntimeReason::Bootstrap)?,
     );

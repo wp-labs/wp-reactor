@@ -1,100 +1,87 @@
+use std::collections::HashMap;
 use std::sync::Arc;
-
-use wf_config::sink::WildArray;
 
 use super::runtime::SinkRuntime;
 
 // ---------------------------------------------------------------------------
-// SinkDispatcher — core routing engine
+// SinkDispatcher — core routing engine (pre-bound at startup)
 // ---------------------------------------------------------------------------
 
-/// Routes alert JSON to appropriate sink groups based on yield-target window
-/// name matching.
+/// Routes alert JSON to appropriate sinks based on yield-target window name.
+///
+/// Window→sink bindings are pre-resolved at startup via a `HashMap` lookup,
+/// eliminating runtime wildcard matching on every dispatch call.
 ///
 /// Routing logic:
-/// 1. Iterate business groups — if `group.windows.matches(window_name)`,
-///    send to all sinks in that group.
-/// 2. If no business group matches, send to the `default_group` (if configured).
-/// 3. If any send fails, additionally send to the `error_group` (if configured).
+/// 1. Look up `window_name` in the pre-bound `routes` map.
+/// 2. If found (and non-empty), send to those sinks.
+/// 3. Otherwise, send to the `default_sinks` (if configured).
+/// 4. If any send fails, additionally send to `error_sinks` (if configured).
 pub struct SinkDispatcher {
-    business: Vec<BusinessGroup>,
-    default_group: Option<SinkGroup>,
-    error_group: Option<SinkGroup>,
-}
-
-struct BusinessGroup {
-    #[allow(dead_code)]
-    name: String,
-    windows: WildArray,
-    sinks: Vec<Arc<SinkRuntime>>,
-}
-
-struct SinkGroup {
-    #[allow(dead_code)]
-    name: String,
-    sinks: Vec<Arc<SinkRuntime>>,
+    /// Pre-resolved routing: window_name → bound sinks
+    routes: HashMap<String, Vec<Arc<SinkRuntime>>>,
+    /// Fallback sinks when no route matches
+    default_sinks: Vec<Arc<SinkRuntime>>,
+    /// Error-escalation sinks (sent to on any send failure)
+    error_sinks: Vec<Arc<SinkRuntime>>,
+    /// All unique SinkRuntime instances (for stop_all)
+    all_sinks: Vec<Arc<SinkRuntime>>,
 }
 
 impl SinkDispatcher {
-    /// Create a new dispatcher from business groups and optional infra groups.
+    /// Create a new dispatcher from pre-resolved routes and infra sinks.
     pub fn new(
-        business: Vec<(String, WildArray, Vec<Arc<SinkRuntime>>)>,
-        default_group: Option<(String, Vec<Arc<SinkRuntime>>)>,
-        error_group: Option<(String, Vec<Arc<SinkRuntime>>)>,
+        routes: HashMap<String, Vec<Arc<SinkRuntime>>>,
+        default_sinks: Vec<Arc<SinkRuntime>>,
+        error_sinks: Vec<Arc<SinkRuntime>>,
     ) -> Self {
+        // Collect all unique SinkRuntime instances by Arc pointer identity.
+        let mut seen = std::collections::HashSet::new();
+        let mut all_sinks = Vec::new();
+
+        let iter = routes
+            .values()
+            .flatten()
+            .chain(default_sinks.iter())
+            .chain(error_sinks.iter());
+
+        for sink in iter {
+            let ptr = Arc::as_ptr(sink) as usize;
+            if seen.insert(ptr) {
+                all_sinks.push(Arc::clone(sink));
+            }
+        }
+
         Self {
-            business: business
-                .into_iter()
-                .map(|(name, windows, sinks)| BusinessGroup {
-                    name,
-                    windows,
-                    sinks,
-                })
-                .collect(),
-            default_group: default_group.map(|(name, sinks)| SinkGroup { name, sinks }),
-            error_group: error_group.map(|(name, sinks)| SinkGroup { name, sinks }),
+            routes,
+            default_sinks,
+            error_sinks,
+            all_sinks,
         }
     }
 
-    /// Route alert JSON to matching sink groups by yield-target window name.
+    /// Route alert JSON to matching sinks by yield-target window name.
     ///
-    /// Returns the number of business groups that matched.
+    /// Returns 1 if a pre-bound route was found, 0 if only default sinks were used.
     pub async fn dispatch(&self, window_name: &str, alert_json: &str) -> usize {
-        let mut matched = 0;
+        let (sinks, matched) = match self.routes.get(window_name) {
+            Some(s) if !s.is_empty() => (s.as_slice(), 1),
+            _ => (self.default_sinks.as_slice(), 0),
+        };
+
         let mut had_error = false;
-
-        // 1. Try business groups
-        for group in &self.business {
-            if group.windows.matches(window_name) {
-                matched += 1;
-                for sink in &group.sinks {
-                    if let Err(e) = sink.send_str(alert_json).await {
-                        log::warn!("sink dispatch error: {e}");
-                        had_error = true;
-                    }
-                }
+        for sink in sinks {
+            if let Err(e) = sink.send_str(alert_json).await {
+                log::warn!("sink dispatch error: {e}");
+                had_error = true;
             }
         }
 
-        // 2. No business match → default group
-        if matched == 0 {
-            if let Some(ref default) = self.default_group {
-                for sink in &default.sinks {
-                    if let Err(e) = sink.send_str(alert_json).await {
-                        log::warn!("default sink error: {e}");
-                        had_error = true;
-                    }
-                }
-            }
-        }
-
-        // 3. Any error → error group
+        // Any error → error sinks
         if had_error {
-            if let Some(ref error) = self.error_group {
-                for sink in &error.sinks {
-                    if let Err(e) = sink.send_str(alert_json).await {
-                        log::warn!("error sink error: {e}");
-                    }
+            for sink in &self.error_sinks {
+                if let Err(e) = sink.send_str(alert_json).await {
+                    log::warn!("error sink error: {e}");
                 }
             }
         }
@@ -102,27 +89,11 @@ impl SinkDispatcher {
         matched
     }
 
-    /// Gracefully stop all sinks across all groups.
+    /// Gracefully stop all unique sinks.
     pub async fn stop_all(&self) {
-        for group in &self.business {
-            for sink in &group.sinks {
-                if let Err(e) = sink.stop().await {
-                    log::warn!("sink stop error: {e}");
-                }
-            }
-        }
-        if let Some(ref default) = self.default_group {
-            for sink in &default.sinks {
-                if let Err(e) = sink.stop().await {
-                    log::warn!("default sink stop error: {e}");
-                }
-            }
-        }
-        if let Some(ref error) = self.error_group {
-            for sink in &error.sinks {
-                if let Err(e) = sink.stop().await {
-                    log::warn!("error sink stop error: {e}");
-                }
+        for sink in &self.all_sinks {
+            if let Err(e) = sink.stop().await {
+                log::warn!("sink stop error: {e}");
             }
         }
     }

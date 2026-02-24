@@ -41,38 +41,54 @@ impl SinkFactoryRegistry {
 ///
 /// For each `ResolvedSinkSpec` in the bundle, looks up the factory by kind,
 /// validates, builds a `SinkHandle`, and wraps it in a `SinkRuntime`.
+///
+/// The `window_names` parameter lists all known window names from the config.
+/// Routes are pre-resolved at build time: each window name is matched against
+/// business group wildcard patterns, and the resulting window→sinks mapping
+/// is stored in a `HashMap` for O(1) dispatch lookup.
 pub async fn build_sink_dispatcher(
     bundle: &SinkConfigBundle,
     registry: &SinkFactoryRegistry,
     work_root: &Path,
+    window_names: &[String],
 ) -> anyhow::Result<SinkDispatcher> {
     let ctx = SinkBuildCtx::new(work_root.to_path_buf());
 
-    // Build business groups
-    let mut business = Vec::new();
+    // Build business groups (name, compiled windows, sinks)
+    let mut business: Vec<(String, WildArray, Vec<Arc<SinkRuntime>>)> = Vec::new();
     for flex in &bundle.business {
         let sinks = build_sink_runtimes(&flex.sinks, &flex.tags, registry, &ctx).await?;
         let windows = WildArray::new(flex.windows.raw_patterns());
         business.push((flex.name.clone(), windows, sinks));
     }
 
-    // Build infra default group
-    let default_group = if let Some(ref fixed) = bundle.infra_default {
-        let sinks = build_sink_runtimes(&fixed.sinks, &[], registry, &ctx).await?;
-        Some((fixed.name.clone(), sinks))
+    // Build infra default sinks
+    let default_sinks = if let Some(ref fixed) = bundle.infra_default {
+        build_sink_runtimes(&fixed.sinks, &[], registry, &ctx).await?
     } else {
-        None
+        Vec::new()
     };
 
-    // Build infra error group
-    let error_group = if let Some(ref fixed) = bundle.infra_error {
-        let sinks = build_sink_runtimes(&fixed.sinks, &[], registry, &ctx).await?;
-        Some((fixed.name.clone(), sinks))
+    // Build infra error sinks
+    let error_sinks = if let Some(ref fixed) = bundle.infra_error {
+        build_sink_runtimes(&fixed.sinks, &[], registry, &ctx).await?
     } else {
-        None
+        Vec::new()
     };
 
-    Ok(SinkDispatcher::new(business, default_group, error_group))
+    // Pre-resolve routes: window_name → matched sinks
+    let mut routes: HashMap<String, Vec<Arc<SinkRuntime>>> = HashMap::new();
+    for name in window_names {
+        let mut bound = Vec::new();
+        for (_group_name, windows, sinks) in &business {
+            if windows.matches(name) {
+                bound.extend(sinks.iter().cloned());
+            }
+        }
+        routes.insert(name.clone(), bound);
+    }
+
+    Ok(SinkDispatcher::new(routes, default_sinks, error_sinks))
 }
 
 /// Build `SinkRuntime` instances from resolved specs.
