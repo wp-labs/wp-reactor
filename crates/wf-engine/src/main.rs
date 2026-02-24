@@ -8,7 +8,7 @@ use wf_runtime::lifecycle::{Reactor, wait_for_signal};
 use wf_runtime::tracing_init::init_tracing;
 
 #[derive(Parser)]
-#[command(name = "warp-fusion", about = "WarpFusion CEP engine")]
+#[command(name = "wfusion", about = "WarpFusion CEP engine")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

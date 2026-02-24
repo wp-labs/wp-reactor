@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 
-use wf_datagen::oracle::OracleTolerances;
-use wf_datagen::output::jsonl::{read_alerts_jsonl, read_oracle_jsonl};
-use wf_datagen::verify::verify;
+use wfgen::oracle::OracleTolerances;
+use wfgen::output::jsonl::{read_alerts_jsonl, read_oracle_jsonl};
+use wfgen::verify::verify;
 
 pub(crate) fn run(
     expected: PathBuf,

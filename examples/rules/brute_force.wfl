@@ -22,3 +22,28 @@ rule brute_force_then_scan {
     message = fmt("{} brute force detected", fail.sip)
   )
 }
+
+contract close_hit for brute_force_then_scan {
+  given {
+    row(fail, sip = "10.0.0.1", username = "admin", action = "failed", event_time = "2026-01-01T00:00:00Z");
+    row(fail, sip = "10.0.0.1", username = "admin", action = "failed", event_time = "2026-01-01T00:00:01Z");
+    row(fail, sip = "10.0.0.1", username = "admin", action = "failed", event_time = "2026-01-01T00:00:02Z");
+  }
+  expect {
+    hits == 1;
+    hit[0].score == 70.0;
+    hit[0].close_reason == "eos";
+    hit[0].entity_type == "ip";
+    hit[0].entity_id == "10.0.0.1";
+  }
+}
+
+contract below_threshold for brute_force_then_scan {
+  given {
+    row(fail, sip = "10.0.0.2", username = "guest", action = "failed", event_time = "2026-01-01T00:00:00Z");
+    row(fail, sip = "10.0.0.2", username = "guest", action = "failed", event_time = "2026-01-01T00:00:01Z");
+  }
+  expect {
+    hits == 0;
+  }
+}

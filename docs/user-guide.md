@@ -12,10 +12,11 @@
 - [6. 运行时配置 (fusion.toml)](#6-运行时配置-fusiontoml)
 - [7. 表达式与函数](#7-表达式与函数)
 - [8. 规则契约测试](#8-规则契约测试)
-- [9. 测试数据生成 (wf-datagen)](#9-测试数据生成-wf-datagen)
-- [10. 告警输出](#10-告警输出)
-- [11. 运行引擎](#11-运行引擎)
-- [12. 能力分层参考](#12-能力分层参考)
+- [9. 开发者工具 (wfl)](#9-开发者工具-wfl)
+- [10. 测试数据生成 (wfgen)](#10-测试数据生成-wfgen)
+- [11. 告警输出](#11-告警输出)
+- [12. 运行引擎](#12-运行引擎)
+- [13. 能力分层参考](#13-能力分层参考)
 - [附录 A. 类型系统](#附录-a-类型系统)
 - [附录 B. 语义约束速查](#附录-b-语义约束速查)
 
@@ -152,7 +153,7 @@ FAIL_THRESHOLD = "3"
 **第 4 步 — 启动引擎**
 
 ```bash
-wf run --config fusion.toml
+wfusion run --config fusion.toml
 ```
 
 引擎启动后监听 `tcp://127.0.0.1:9800`，接收 Arrow IPC 格式的事件流，执行规则检测，输出告警到 `sinks/` 配置的目标文件。
@@ -480,6 +481,28 @@ match<sip:30s> { ... }   // 30 秒滑动窗口
 ```
 
 支持的时间单位：`s`（秒）、`m`（分钟）、`h`（小时）、`d`（天）。
+
+#### 固定窗口（`:fixed`）
+
+默认的滑动窗口中，同一 key 的事件持续在同一个状态机实例中累积。固定窗口（`:fixed`）将时间线切分为不重叠的等长桶，每个桶内独立累积。
+
+```wfl
+match<sip:5m:fixed> {
+    on event {
+        fail | count >= 3;
+    }
+}
+```
+
+**与滑动窗口的区别：**
+
+| 特性 | 滑动窗口 `<key:5m>` | 固定窗口 `<key:5m:fixed>` |
+|------|---------------------|--------------------------|
+| 桶划分 | 以事件到达时刻创建实例 | 按 `[0, 5m)`, `[5m, 10m)` … 分桶 |
+| 状态累积 | 同一 key 在同一实例中持续累积 | 不同桶的计数器互相独立 |
+| 到期时间 | `created_at + duration` | `bucket_start + duration` |
+| `on close` | 实例到期时触发 | 桶到期时触发 |
+| 适用场景 | 实时滑动窗口检测 | 定期统计、周期性基线 |
 
 #### on event — 事件到达求值
 
@@ -1323,8 +1346,28 @@ expect {
 - `hits` 断言输出条数。
 - `hit[i]` 访问第 i 条输出（0-based）。
 - 比较运算符支持 `==`、`!=`、`<`、`>`、`<=`、`>=`。
+- `hit[i].field(...)` 断言已解析但尚未完全支持。
 
-### 8.4 完整示例
+### 8.4 options — 测试选项
+
+| 字段 | 可选值 | 默认值 | 说明 |
+|------|--------|--------|------|
+| `close_trigger` | `timeout` / `flush` / `eos` | `eos` | 窗口关闭触发方式 |
+| `eval_mode` | `strict` / `lenient` | `lenient` | 评估模式 |
+
+- `eos`：输入结束后关闭所有剩余实例。
+- `timeout`：推进时钟使窗口自然到期。
+- `flush`：强制 flush 关闭。
+
+### 8.5 运行契约测试
+
+使用 `wfl test` 子命令运行规则文件中的契约测试（详见[第 9 节](#9-开发者工具-wfl)）：
+
+```bash
+wfl test rules/brute_force.wfl --schemas "schemas/*.wfs"
+```
+
+### 8.6 完整示例
 
 ```wfl
 // 暴力破解检测 — 基本命中
@@ -1373,11 +1416,139 @@ contract dns_no_response_timeout for dns_no_response {
 
 ---
 
-## 9. 测试数据生成 (wf-datagen)
+## 9. 开发者工具 (wfl)
 
-`wf-datagen` 是独立的测试数据生成工具，使用 `.wfg` 场景文件描述数据生成策略。
+`wfl` 是 WFL 语言的开发者命令行工具，用于规则开发周期中的解释、检查、格式化、离线回放和契约测试。同步 CLI，不依赖 tokio。
 
-### 9.1 Scenario 文件 (.wfg)
+### 9.1 子命令一览
+
+| 子命令 | 用途 |
+|--------|------|
+| `explain` | 编译规则并输出人类可读的执行计划解释 |
+| `lint` | 语义检查 + lint 检查，输出诊断信息 |
+| `fmt` | 基于 tree-sitter 的代码格式化 |
+| `replay` | 用 NDJSON 数据离线回放规则，调试匹配逻辑 |
+| `test` | 运行规则文件中的契约测试 |
+
+公共参数（除 `fmt` 外所有子命令均支持）：
+
+| 参数 | 说明 |
+|------|------|
+| `--schemas` / `-s` | Schema 文件 glob 模式（如 `"schemas/*.wfs"`） |
+| `--var` | 变量替换，`KEY=VALUE` 格式，可多次指定 |
+
+### 9.2 wfl explain
+
+编译 `.wfl` 规则并输出人类可读的执行计划解释，涵盖 bind、match、join、yield 各阶段。
+
+```bash
+wfl explain rules/brute_force.wfl \
+    --schemas "schemas/*.wfs" \
+    --var FAIL_THRESHOLD=3
+```
+
+### 9.3 wfl lint
+
+对 `.wfl` 文件运行语义检查和 lint 检查。
+
+```bash
+wfl lint rules/brute_force.wfl \
+    --schemas "schemas/*.wfs" \
+    --var FAIL_THRESHOLD=3
+```
+
+- 检查级别分为 Error 和 Warning。
+- 有 Error 时退出码为 1。
+- 无问题时输出 `No issues found.`。
+
+### 9.4 wfl fmt
+
+格式化 `.wfl` 源文件，基于 tree-sitter 语法验证 + 行级缩进规范化。
+
+```bash
+# 输出格式化结果到 stdout
+wfl fmt rules/brute_force.wfl
+
+# 就地格式化
+wfl fmt -w rules/*.wfl
+
+# CI 检查（未格式化则退出码 1）
+wfl fmt --check rules/*.wfl
+```
+
+格式化规则：
+
+- 4 空格缩进，按 `{}`/`()` 嵌套层级。
+- 多个连续空行合并为一个。
+- 保留注释内容。
+- 字符串内的 `{}`/`()` 不影响缩进。
+- 格式化是幂等的（多次运行结果一致）。
+
+### 9.5 wfl replay
+
+用 NDJSON 文件离线回放规则，无需启动引擎即可调试匹配逻辑。
+
+```bash
+wfl replay rules/brute_force.wfl \
+    --schemas "schemas/*.wfs" \
+    --input test_data/events.jsonl \
+    --alias fail \
+    --var FAIL_THRESHOLD=3
+```
+
+**参数说明：**
+
+| 参数 | 说明 |
+|------|------|
+| `--input` / `-i` | NDJSON 输入文件（每行一条 JSON 事件） |
+| `--alias` | 事件别名（对应规则 `events` 块中的别名） |
+
+**输出：**
+
+- 每条告警以 JSON 格式输出到 stdout（每行一条）。
+- 统计摘要输出到 stderr：
+
+```
+{"rule_name":"brute_force","score":70.0,"entity_type":"ip","entity_id":"10.0.0.1",...}
+---
+Replay complete: 5 events processed, 1 matches, 0 errors
+```
+
+**限制：**
+
+- 离线模式无 window store，`join` 查找和 `window.has()` guard 均返回空值。
+- EOF 时自动触发 `close_all(Eos)`，执行所有 `on close` 步骤。
+
+### 9.6 wfl test
+
+运行规则文件中嵌入的契约测试（语法参见[第 8 节](#8-规则契约测试)）。
+
+```bash
+wfl test rules/brute_force.wfl \
+    --schemas "schemas/*.wfs" \
+    --var FAIL_THRESHOLD=3
+```
+
+**输出：**
+
+```
+PASS  brute_test (brute_force)
+FAIL  edge_case_test (brute_force)
+      hits: expected hits == 1, got 0
+
+2 contracts: 1 passed, 1 failed
+```
+
+- 有失败时退出码为 1，适合 CI 集成。
+- 无契约时输出 `No contracts found.`。
+
+---
+
+## 10. 测试数据生成 (wfgen)
+
+`wfgen` 是独立的测试数据生成工具，使用 `.wfg` 场景文件描述数据生成策略。
+
+### 10.1 Scenario 文件 (.wfg)
 
 ```wfg
 use "windows/security.wfs"
@@ -1421,7 +1592,7 @@ scenario brute_force_load seed 42 {
 }
 ```
 
-### 9.2 stream — 流定义
+### 10.2 stream — 流定义
 
 ```wfg
 stream <别名> : <window名> <速率> {
@@ -1447,7 +1618,7 @@ stream <别名> : <window名> <速率> {
 
 未声明的字段按类型默认策略随机生成。
 
-### 9.3 inject — 模式注入
+### 10.3 inject — 模式注入
 
 ```wfg
 inject for <规则名> on [<流别名>, ...] {
@@ -1463,7 +1634,7 @@ inject for <规则名> on [<流别名>, ...] {
 | `near_miss` | 构造"接近但不命中"事件序列 | 不应出现告警 |
 | `non_hit` | 无关事件 | 不应出现告警 |
 
-### 9.4 faults — 时序扰动
+### 10.4 faults — 时序扰动
 
 ```wfg
 faults {
@@ -1476,46 +1647,46 @@ faults {
 
 各项百分比之和不得超过 100%。
 
-### 9.5 CLI 命令
+### 10.5 CLI 命令
 
 ```bash
 # 生成测试数据
-wf-datagen gen \
+wfgen gen \
     --scenario tests/brute_force_load.wfg \
     --format jsonl \
     --out out/
 
 # 一致性校验
-wf-datagen lint tests/brute_force_load.wfg
+wfgen lint tests/brute_force_load.wfg
 
 # 对拍验证
-wf-datagen verify \
+wfgen verify \
     --actual out/actual_alerts.jsonl \
     --expected out/brute_force_load.oracle.jsonl \
     --meta out/brute_force_load.oracle.meta.json
 ```
 
-### 9.6 端到端流程
+### 10.6 端到端流程
 
 ```
 .wfg + .wfs + .wfl
        │
-  wf-datagen gen           → events.jsonl + oracle.jsonl
+  wfgen gen           → events.jsonl + oracle.jsonl
        │
-  wf run --replay          → actual_alerts.jsonl
+  wfusion run --replay  → actual_alerts.jsonl
        │
-  wf-datagen verify        → verify_report.json
+  wfgen verify        → verify_report.json
 ```
 
 ---
 
-## 10. 告警输出
+## 11. 告警输出
 
-### 10.1 输出格式
+### 11.1 输出格式
 
 告警以 JSONL 格式写入文件，每行一条 JSON 记录。
 
-### 10.2 系统字段
+### 11.2 系统字段
 
 每条告警自动包含以下系统字段：
 
@@ -1529,7 +1700,7 @@ wf-datagen verify \
 | `emit_time` | time | 告警产出时间 |
 | `alert_id` | chars | 确定性告警 ID |
 
-### 10.3 alert_id 生成
+### 11.3 alert_id 生成
 
 ```
 alert_id = sha256(rule_name + scope_key + window_range)
@@ -1537,7 +1708,7 @@ alert_id = sha256(rule_name + scope_key + window_range)
 
 确定性 ID 可用于下游去重。
 
-### 10.4 示例告警
+### 11.4 示例告警
 
 ```json
 {
@@ -1556,12 +1727,12 @@ alert_id = sha256(rule_name + scope_key + window_range)
 
 ---
 
-## 11. 运行引擎
+## 12. 运行引擎
 
-### 11.1 启动
+### 12.1 启动
 
 ```bash
-wf run --config fusion.toml
+wfusion run --config fusion.toml
 ```
 
 引擎启动流程：
@@ -1574,7 +1745,7 @@ wf run --config fusion.toml
 6. 启动事件调度循环
 7. 等待 `Ctrl+C` 信号
 
-### 11.2 数据接入
+### 12.2 数据接入
 
 引擎通过 TCP 接收事件，帧格式为：
 
@@ -1584,7 +1755,7 @@ wf run --config fusion.toml
 
 事件以 Apache Arrow RecordBatch 格式传输。
 
-### 11.3 事件驱动执行
+### 12.3 事件驱动执行
 
 ```
 TCP → Receiver → Router → WindowStore → MatchEngine → YieldWriter → AlertSink
@@ -1597,13 +1768,13 @@ TCP → Receiver → Router → WindowStore → MatchEngine → YieldWriter → 
 - **YieldWriter**：生成告警记录。
 - **AlertSink**：写入 JSONL 文件。
 
-### 11.4 窗口管理
+### 12.4 窗口管理
 
 - **Watermark**：事件时间水印，延迟 watermark 之外的事件按 `late_policy` 处理。
 - **淘汰**：按 `evict_interval` 周期检查，淘汰超过 `over` 时长的事件。
 - **内存保护**：两阶段淘汰（TTL → 全局内存预算），防止内存溢出。
 
-### 11.5 热加载
+### 12.5 热加载
 
 ```bash
 # 修改 .wfl 或 [vars] 后，引擎自动重新加载（Drop 策略）
@@ -1617,7 +1788,7 @@ TCP → Receiver → Router → WindowStore → MatchEngine → YieldWriter → 
 3. 编译 RulePlan
 4. 原子替换规则集（丢弃在途状态机）
 
-### 11.6 优雅停机
+### 12.6 优雅停机
 
 收到 `Ctrl+C` 后，引擎按 LIFO 顺序停机：
 
@@ -1629,7 +1800,7 @@ TCP → Receiver → Router → WindowStore → MatchEngine → YieldWriter → 
 
 ---
 
-## 12. 能力分层参考
+## 13. 能力分层参考
 
 WFL 功能按 L1/L2/L3 分层，渐进式开放。
 
@@ -1649,6 +1820,9 @@ WFL 功能按 L1/L2/L3 分层，渐进式开放。
 | `fmt()` | 格式化 |
 | `$VAR` / `${VAR:default}` | 变量预处理 |
 | `contains`/`lower`/`upper`/`len` | 字符串函数（guard/score/entity 表达式） |
+| `match<key:dur:fixed>` | 固定窗口（不重叠时间桶） |
+| `contract ... for ...` | 规则契约测试 |
+| `wfl` CLI | 开发者工具（explain/lint/fmt/replay/test） |
 
 ### L2（增强 — 部分实现）
 
@@ -1684,7 +1858,6 @@ WFL 功能按 L1/L2/L3 分层，渐进式开放。
 |------|------|
 | `\|>` 多级管道 | 级联规则 |
 | `conv { ... }` | 结果集变换 |
-| `fixed` | 固定间隔窗口 |
 | `session(gap)` | 会话窗口 |
 | `collect_set`/`collect_list`/`first`/`last` | 集合函数 |
 | `stddev`/`percentile` | 统计函数 |

@@ -25,7 +25,7 @@ enum Commands {
         file: PathBuf,
 
         /// Schema file glob patterns (e.g. "schemas/*.wfs")
-        #[arg(short, long)]
+        #[arg(short, long, default_value = "schemas/*.wfs")]
         schemas: Vec<String>,
 
         /// Variable substitutions in KEY=VALUE format
@@ -39,7 +39,7 @@ enum Commands {
         file: PathBuf,
 
         /// Schema file glob patterns (e.g. "schemas/*.wfs")
-        #[arg(short, long)]
+        #[arg(short, long, default_value = "schemas/*.wfs")]
         schemas: Vec<String>,
 
         /// Variable substitutions in KEY=VALUE format
@@ -67,7 +67,7 @@ enum Commands {
         file: PathBuf,
 
         /// Schema file glob patterns (e.g. "schemas/*.wfs")
-        #[arg(short, long)]
+        #[arg(short, long, default_value = "schemas/*.wfs")]
         schemas: Vec<String>,
 
         /// NDJSON input data file
@@ -89,7 +89,7 @@ enum Commands {
         file: PathBuf,
 
         /// Schema file glob patterns (e.g. "schemas/*.wfs")
-        #[arg(short, long)]
+        #[arg(short, long, default_value = "schemas/*.wfs")]
         schemas: Vec<String>,
 
         /// Variable substitutions in KEY=VALUE format

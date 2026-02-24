@@ -9,7 +9,7 @@ mod cmd_lint;
 mod cmd_verify;
 
 #[derive(Parser)]
-#[command(name = "wf-datagen", about = "WarpFusion test data generator")]
+#[command(name = "wfgen", about = "WarpFusion test data generator")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

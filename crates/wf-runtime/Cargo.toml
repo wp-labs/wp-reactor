@@ -33,7 +33,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 arrow = { version = "54", default-features = false, features = ["ipc"] }
 wf-config = { path = "../wf-config" }
 wf-lang = { path = "../wf-lang" }
-wf-datagen = { path = "../wf-datagen" }
+wfgen = { path = "../wfgen" }
 chrono = "0.4"
 tempfile = "3"
 serde_json = "1.0"

@@ -155,14 +155,14 @@ cargo run -p wf-engine -- run --config examples/wfusion.toml
 
 ---
 
-## 阶段 6（可选）：测试数据生成 — `wf-datagen`
+## 阶段 6（可选）：测试数据生成 — `wfgen`
 
 | 顺序 | 文件 | 关注点 |
 |------|------|--------|
-| 6-1 | `crates/wf-datagen/src/wfg_parser/` | .wfg 场景 DSL 解析 |
-| 6-2 | `crates/wf-datagen/src/datagen/` | 事件生成 + 注入 + 故障注入（duplicate / drop / reorder） |
-| 6-3 | `crates/wf-datagen/src/oracle.rs` | 预言机：给定事件流 → 预计告警 |
-| 6-4 | `crates/wf-datagen/src/verify.rs` | 实际告警 vs 预期告警的 diff |
+| 6-1 | `crates/wfgen/src/wfg_parser/` | .wfg 场景 DSL 解析 |
+| 6-2 | `crates/wfgen/src/datagen/` | 事件生成 + 注入 + 故障注入（duplicate / drop / reorder） |
+| 6-3 | `crates/wfgen/src/oracle.rs` | 预言机：给定事件流 → 预计告警 |
+| 6-4 | `crates/wfgen/src/verify.rs` | 实际告警 vs 预期告警的 diff |
 
 ---
 
@@ -181,7 +181,7 @@ wf-engine ─────────┐
                  │     └─► tokio             (异步运行时)
                  └─► wf-config
 
-wf-datagen (独立二进制)
+wfgen (独立二进制)
   ├─► wf-core
   ├─► wf-lang
   └─► arrow

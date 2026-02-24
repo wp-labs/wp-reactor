@@ -59,7 +59,7 @@ impl VerifyReport {
     /// Render the report as a PR-friendly Markdown table.
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
-        md.push_str("## wf-datagen Verify Report\n\n");
+        md.push_str("## wfgen Verify Report\n\n");
         md.push_str(&format!("**Status**: {}\n\n", self.status.to_uppercase()));
 
         // Summary table

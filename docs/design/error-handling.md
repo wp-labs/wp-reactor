@@ -24,7 +24,7 @@ wp-reactor 当前以 `anyhow::Result<T>` 作为唯一错误类型，贯穿所有
 |------|------|------|
 | `CheckError` | `wf-lang/src/checker/mod.rs:11-15` | `rule`, `contract`, `message` |
 | `PreprocessError` | `wf-lang/src/preprocess.rs` | `position`, `message` |
-| `ValidationError` | `wf-datagen/src/validate.rs` | `code`, `message` |
+| `ValidationError` | `wfgen/src/validate.rs` | `code`, `message` |
 
 ### 1.2 为什么引入 orion-error
 
@@ -113,7 +113,7 @@ wf-core (StructError<CoreReason>) ──err_conv──▶ wf-runtime (StructErro
 | **wf-core** | 引入 `StructError<CoreReason>` | `CoreReason` | 业务层，错误需要分类（窗口/规则/数据） |
 | **wf-runtime** | 引入 `StructError<RuntimeReason>` | `RuntimeReason` | 收敛层，统一下层错误 + 自有运行时错误 |
 | **wf-engine** | 直接使用 `RuntimeReason` | 不定义 | 入口，格式化输出即可 |
-| **wf-datagen** | 保持 `anyhow` + `ValidationError` | 不定义 | 独立工具，不需要 |
+| **wfgen** | 保持 `anyhow` + `ValidationError` | 不定义 | 独立工具，不需要 |
 
 ---
 
@@ -534,7 +534,7 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 - `receiver.rs` 中的连接/解码错误 → log warn + break/continue
 - `check_wfl()` 返回 `Vec<CheckError>` → 收集模式不变
 - `validate_wfg()` 返回 `Vec<ValidationError>` → 收集模式不变
-- wf-datagen 全部 → 独立工具，保持 anyhow
+- wfgen 全部 → 独立工具，保持 anyhow
 
 ---
 
@@ -560,7 +560,7 @@ orion-error = { version = "0.6", features = ["tracing"] }
 
 ### 8.3 不引入 orion-error 的 crate
 
-wf-lang、wf-config、wf-engine、wf-datagen **不**添加 orion-error 依赖。
+wf-lang、wf-config、wf-engine、wfgen **不**添加 orion-error 依赖。
 
 wf-engine 通过 wf-runtime 的 re-export 使用 `StructError<RuntimeReason>`。
 

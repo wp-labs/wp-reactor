@@ -1,4 +1,4 @@
-//! End-to-end integration test driven by `wf-datagen`.
+//! End-to-end integration test driven by `wfgen`.
 //!
 //! Uses the full datagen pipeline: `.wfg` scenario → event generation → oracle
 //! prediction → Reactor execution → alert verification.
@@ -61,11 +61,11 @@ async fn e2e_datagen_brute_force() {
     let wfg_path = base_dir.join("scenarios/brute_force.wfg");
     let vars = HashMap::from([("FAIL_THRESHOLD".into(), "3".into())]);
     let loaded =
-        wf_datagen::loader::load_scenario(&wfg_path, &vars).expect("failed to load scenario");
+        wfgen::loader::load_scenario(&wfg_path, &vars).expect("failed to load scenario");
 
     // ---- Validate scenario ----
     let validation_errors =
-        wf_datagen::validate::validate_wfg(&loaded.wfg, &loaded.schemas, &loaded.wfl_files);
+        wfgen::validate::validate_wfg(&loaded.wfg, &loaded.schemas, &loaded.wfl_files);
     assert!(
         validation_errors.is_empty(),
         "scenario validation failed: {:?}",
@@ -74,7 +74,7 @@ async fn e2e_datagen_brute_force() {
 
     // ---- Generate events ----
     let gen_result =
-        wf_datagen::datagen::generate(&loaded.wfg, &loaded.schemas, &loaded.rule_plans)
+        wfgen::datagen::generate(&loaded.wfg, &loaded.schemas, &loaded.rule_plans)
             .expect("event generation failed");
     let events = gen_result.events;
     assert!(
@@ -99,7 +99,7 @@ async fn e2e_datagen_brute_force() {
         .iter()
         .map(|i| i.rule.clone())
         .collect();
-    let oracle_result = wf_datagen::oracle::run_oracle(
+    let oracle_result = wfgen::oracle::run_oracle(
         &events,
         &loaded.rule_plans,
         &start,
@@ -157,7 +157,7 @@ FAIL_THRESHOLD = "3"
     let addr = reactor.listen_addr();
 
     // ---- Convert GenEvents → typed Arrow batches → TCP frames ----
-    let batches = wf_datagen::output::arrow_ipc::events_to_typed_batches(&events, &loaded.schemas)
+    let batches = wfgen::output::arrow_ipc::events_to_typed_batches(&events, &loaded.schemas)
         .expect("events_to_typed_batches failed");
 
     // ---- TCP send ----
@@ -180,7 +180,7 @@ FAIL_THRESHOLD = "3"
     reactor.wait().await.expect("reactor.wait failed");
 
     // ---- Read actual alerts (catch_all sink writes to alerts/all.jsonl) ----
-    let actual = wf_datagen::output::jsonl::read_alerts_jsonl(&alert_path)
+    let actual = wfgen::output::jsonl::read_alerts_jsonl(&alert_path)
         .unwrap_or_else(|e| panic!("failed to read alerts from {}: {e}", alert_path.display()));
 
     // ---- Extract oracle tolerances ----
@@ -189,11 +189,11 @@ FAIL_THRESHOLD = "3"
         .scenario
         .oracle
         .as_ref()
-        .map(wf_datagen::oracle::extract_oracle_tolerances)
+        .map(wfgen::oracle::extract_oracle_tolerances)
         .unwrap_or_default();
 
     // ---- Run verify and write diagnostic report ----
-    let report = wf_datagen::verify::verify(
+    let report = wfgen::verify::verify(
         oracle_alerts,
         &actual,
         tolerances.score_tolerance,

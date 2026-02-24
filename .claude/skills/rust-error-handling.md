@@ -28,7 +28,7 @@ wp-reactor 基于 orion-error 0.6.0 的分层错误处理。理解何时使用 S
 | wf-engine | anyhow（入口） | 格式化输出即可 |
 | wf-lang | anyhow + `Vec<CheckError>` | 解析库，不需要分类 |
 | wf-config | anyhow | 配置错误全部 fatal |
-| wf-datagen | anyhow + `Vec<ValidationError>` | 独立工具 |
+| wfgen | anyhow + `Vec<ValidationError>` | 独立工具 |
 
 ## DomainReason 定义
 
@@ -171,7 +171,7 @@ pub async fn start(config: FusionConfig, base_dir: &Path) -> RuntimeResult<Self>
 | receiver.rs 连接/解码错误 | log warn + break | 错误被吞掉，不传播 |
 | `check_wfl()` 返回 `Vec<CheckError>` | 收集模式 | 非 Result 模式 |
 | `validate_wfg()` 返回 `Vec<ValidationError>` | 收集模式 | 非 Result 模式 |
-| wf-datagen 全部 | anyhow | 独立工具 |
+| wfgen 全部 | anyhow | 独立工具 |
 | wf-lang / wf-config 全部 | anyhow | 不需要错误分类 |
 
 ## CLI 入口桥接

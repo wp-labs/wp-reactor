@@ -1334,7 +1334,7 @@ eos_emit_reason = "eos"          # 固定为 eos，供审计
 |------|------|------|
 | 单元契约 | `wf test --contracts rules/*.wfl` | 规则逻辑正确性 |
 | 顺序扰动 | `wf test --contracts rules/*.wfl --shuffle --runs 20` | 顺序/乱序不变性 |
-| 集成对拍 | `wf-datagen gen -> wf run --replay -> wf-datagen verify` | 引擎端到端一致性 |
+| 集成对拍 | `wfgen gen -> wf run --replay -> wfgen verify` | 引擎端到端一致性 |
 
 **Reference Evaluator 约束：**
 
@@ -1615,7 +1615,7 @@ contract dns_no_response_timeout for dns_no_response {
 ### Phase 1（可证明正确基础）
 - 交付 Reference Evaluator（语义裁判）与 Conformance 套件。
 - CI 接入三层门禁：`contract` + `shuffle` + `scenario verify`。
-- **wf-datagen P1**：rule-aware + oracle + verify，输出差异归因报告。
+- **wfgen P1**：rule-aware + oracle + verify，输出差异归因报告。
 
 ### Phase 2（可运营治理）
 - 编译器输出 `CostPlan`，支持规则级资源预算预估与风险分级。
@@ -1625,7 +1625,7 @@ contract dns_no_response_timeout for dns_no_response {
 ### Phase 3（能力扩展）
 - L3（`|>`/`conv`）+ 性能优化 + 分布式 V2 完善。
 - 行为分析高级能力：session window、集合函数、统计函数、增强 baseline。
-- **wf-datagen P2**：时序扰动矩阵 + 压测模式 + PR 友好差异报告。
+- **wfgen P2**：时序扰动矩阵 + 压测模式 + PR 友好差异报告。
 
 ### Phase 4（可靠性分级）
 - 传输层从单一 best-effort 扩展到 `best_effort/at_least_once/exactly_once`。
@@ -1697,7 +1697,7 @@ rollback_to: "risk_scores@v1"
 
 ---
 
-## 18. 测试数据生成工具方案（wf-datagen）
+## 18. 测试数据生成工具方案（wfgen）
 
 > 目标：为 WFL 规则提供"可复现、可注入时序故障、可自动对拍"的测试数据与期望结果（oracle），将正确性校验前置到 CI。
 
@@ -1975,7 +1975,7 @@ Oracle: 1234 alerts -> out/brute_force_load.oracle.jsonl
 
 ### 18.5 Verify 匹配规则
 
-- `wf-datagen verify` 对比 `actual_alerts` 与 `oracle`，输出 `verify_report.json` 与 `verify_report.md`。
+- `wfgen verify` 对比 `actual_alerts` 与 `oracle`，输出 `verify_report.json` 与 `verify_report.md`。
 - 差异分类：`missing` / `unexpected` / `field_mismatch`。
 
 匹配规则：
@@ -2009,7 +2009,7 @@ Oracle: 1234 alerts -> out/brute_force_load.oracle.jsonl
 ```text
 *.wfg + *.wfs + *.wfl
          │
-    wf-datagen gen
+    wfgen gen
          │
    ┌─────┴─────────────┐
    │                    │
@@ -2021,7 +2021,7 @@ actual_alerts.jsonl     │
    │                    │
    └──────┬─────────────┘
           │
-   wf-datagen verify
+   wfgen verify
           │
 verify_report.json/.md
 ```
@@ -2036,29 +2036,29 @@ verify_report.json/.md
 
 ```bash
 # 生成
-wf-datagen gen \
+wfgen gen \
   --scenario tests/brute_force_load.wfg \
   --format jsonl \
   --out out/
 
 # 一致性校验（检查 .wfg 引用与 .wfs/.wfl 的一致性）
-wf-datagen lint tests/brute_force_load.wfg
+wfgen lint tests/brute_force_load.wfg
 
 # 对拍验证
-wf-datagen verify \
+wfgen verify \
   --actual out/actual_alerts.jsonl \
   --expected out/brute_force_load.oracle.jsonl \
   --meta out/brute_force_load.oracle.meta.json
 
 # 覆盖 ws/wfl 引用（调试用途）
-wf-datagen gen \
+wfgen gen \
   --scenario tests/brute_force_load.wfg \
   --ws windows/security.wfs \
   --wfl rules/brute_force.wfl \
   --out out/
 
 # 临时关闭 oracle（即使 .wfg 中存在 oracle 块）
-wf-datagen gen \
+wfgen gen \
   --scenario tests/brute_force_load.wfg \
   --no-oracle \
   --out out/
@@ -2066,9 +2066,9 @@ wf-datagen gen \
 
 ### 18.8 CI 接入标准流程
 
-1. `wf-datagen gen` 生成 events；当 `.wfg` 存在 `oracle` 块且未指定 `--no-oracle` 时，同时生成 oracle。
+1. `wfgen gen` 生成 events；当 `.wfg` 存在 `oracle` 块且未指定 `--no-oracle` 时，同时生成 oracle。
 2. `wf run --replay out/events/*` 产出 `actual_alerts.jsonl`（可切换 TCP 回放模式）。
-3. `wf-datagen verify` 输出差异报告。
+3. `wfgen verify` 输出差异报告。
 4. CI 阻断条件（默认）：`missing == 0 && unexpected == 0 && field_mismatch == 0`。
 
 ### 18.9 与 `contract` 的关系

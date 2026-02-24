@@ -5,14 +5,14 @@ use anyhow::Context;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-use wf_datagen::datagen::fault_gen::apply_faults;
-use wf_datagen::datagen::generate;
-use wf_datagen::loader::load_from_uses;
-use wf_datagen::oracle::{extract_oracle_tolerances, run_oracle};
-use wf_datagen::output::arrow_ipc::write_arrow_ipc;
-use wf_datagen::output::jsonl::{write_jsonl, write_oracle_jsonl};
-use wf_datagen::validate::validate_wfg;
-use wf_datagen::wfg_parser::parse_wfg;
+use wfgen::datagen::fault_gen::apply_faults;
+use wfgen::datagen::generate;
+use wfgen::loader::load_from_uses;
+use wfgen::oracle::{extract_oracle_tolerances, run_oracle};
+use wfgen::output::arrow_ipc::write_arrow_ipc;
+use wfgen::output::jsonl::{write_jsonl, write_oracle_jsonl};
+use wfgen::validate::validate_wfg;
+use wfgen::wfg_parser::parse_wfg;
 
 use crate::cmd_helpers::{load_wfl_files, load_ws_files};
 

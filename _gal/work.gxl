@@ -53,8 +53,14 @@ mod main  {
   #[usage(desp="lint code")]
   flow lint | rust_flow.lint {} ;
 
+  flow build | @pub {
+    gx.cmd ( "cp ./${MAIN_BLD_BINS}/wfusion ${HOME}/bin/"  );
+    gx.cmd ( "cp ./${MAIN_BLD_BINS}/wfgen ${HOME}/bin/"  );
+    gx.cmd ( "cp ./${MAIN_BLD_BINS}/wfl   ${HOME}/bin/"  );
+  }
+
   #[task(name="test")]
-  flow build  |   @test  {
+  flow build  |   @test   {
     gx.cmd ( "cargo test --all ${ENV_BUILD_FLAG}", log : "1" , out:"true"  );
   }
 

@@ -50,7 +50,7 @@ WarpParse（wp-motor）是一个高性能日志解析引擎，核心能力是：
 - **CEP 引擎**：基于 scope-key 的状态机实例管理，支持 `on event` / `on close` 双阶段求值
 - **运行时闭环**：TCP 接收 Arrow IPC → Window 缓冲 → 规则执行 → 风险告警输出（Connector SinkDispatcher）
 - **告警输出**：Connector 模式（yield-target 路由 SinkDispatcher，基于 wp-connector-api）
-- **开发者工具**：`wfl`（explain / lint / fmt）、`wf-datagen`（测试数据生成 + oracle + verify）
+- **开发者工具**：`wfl`（explain / lint / fmt）、`wfgen`（测试数据生成 + oracle + verify）
 - **传输层**：Best-Effort 模式，Arrow IPC over TCP
 
 **L1 未实现**（计划 L2+）：
@@ -212,9 +212,9 @@ wp-labs/
     │   ├── wf-config/         # 配置解析（.toml + 项目工具共享函数）
     │   ├── wf-core/           # 核心引擎（Window + CEP + Alert）
     │   ├── wf-runtime/        # 异步运行时（Receiver + RuleTask + Lifecycle）
-    │   ├── wf-engine/         # 引擎二进制 → warp-fusion（面向运维）
+    │   ├── wf-engine/         # 引擎二进制 → wfusion（面向运维）
     │   ├── wfl/               # 项目工具二进制 → wfl（面向规则开发者）
-    │   └── wf-datagen/        # 测试数据生成二进制 → wf-datagen
+    │   └── wfgen/        # 测试数据生成二进制 → wfgen
     ├── examples/              # 配置与规则示例
     │   ├── wfusion.toml
     │   ├── schemas/
@@ -235,9 +235,9 @@ wp-labs/
 
 | Crate | 二进制名 | 用途 |
 |-------|---------|------|
-| wf-engine | `warp-fusion` | 运行时引擎，`run --config wfusion.toml` |
+| wf-engine | `wfusion` | 运行时引擎，`run --config wfusion.toml` |
 | wfl | `wfl` | 开发者工具：`explain` / `lint` / `fmt` |
-| wf-datagen | `wf-datagen` | 测试数据生成：`gen` / `lint` / `verify` / `bench` |
+| wfgen | `wfgen` | 测试数据生成：`gen` / `lint` / `verify` / `bench` |
 
 ### 3.2 Crate 依赖关系
 
@@ -253,7 +253,7 @@ wf-runtime  (依赖 wf-core + wp-arrow + wp-connector-api，异步运行时 + si
 wf-engine  (依赖 wf-config + wf-runtime，引擎二进制)
 
 wfl  (依赖 wf-config + wf-lang + tree-sitter，开发者工具)
-wf-datagen  (依赖 wf-core + wf-lang，测试数据生成)
+wfgen  (依赖 wf-core + wf-lang，测试数据生成)
 ```
 
 ### 3.3 wf-lang（WFL 编译器）
@@ -383,10 +383,10 @@ wfl/
     └── cmd_fmt.rs             # tree-sitter 语法验证 + 行级缩进规范化
 ```
 
-### 3.8 wf-datagen（测试数据生成）
+### 3.8 wfgen（测试数据生成）
 
 ```
-wf-datagen/
+wfgen/
 └── src/
     ├── main.rs                # CLI: Gen / Lint / Verify / Bench 子命令
     ├── lib.rs
@@ -1381,7 +1381,7 @@ derive_more.workspace = true
 thiserror.workspace = true
 ```
 
-### 7.6 wf-engine（二进制 `warp-fusion`）
+### 7.6 wf-engine（二进制 `wfusion`）
 
 ```toml
 [dependencies]
@@ -1405,7 +1405,7 @@ anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 ```
 
-### 7.8 wf-datagen（二进制 `wf-datagen`）
+### 7.8 wfgen（二进制 `wfgen`）
 
 ```toml
 [dependencies]
@@ -1512,7 +1512,7 @@ retry_max_interval = "30s"                        # 最大重试间隔
 | **P4** | wf-core/alert: AlertRecord；wf-core/sink: SinkDispatcher + SinkRuntime；wf-config/sink: 路由配置；wf-runtime: SinkFactoryRegistry + FileSinkFactory | 已完成 |
 | **P5** | wf-lang: 编译器 + checker + lint | 已完成 |
 | **P6** | wfl: explain / lint / fmt 工具 | 已完成 |
-| **P7** | wf-datagen: 数据生成 + oracle + verify | 已完成 |
+| **P7** | wfgen: 数据生成 + oracle + verify | 已完成 |
 | **P8** | L2 增强: join / baseline / 条件表达式 / 函数 | 计划中 |
 | **P9** | 正确性门禁: contract + shuffle + scenario verify | 计划中 |
 | **P10** | 可靠性分级: at_least_once / exactly_once | 计划中 |
@@ -1531,7 +1531,7 @@ retry_max_interval = "30s"                        # 最大重试间隔
 | **III WFL 编译器** | M11–M13 | .wfs + .wfl → RulePlan | 已完成 |
 | **IV 执行引擎** | M14–M16 | CEP 状态机 + RuleExecutor | 已完成 |
 | **V 运行时闭环** | M17–M20 | **单机 MVP** | 已完成 |
-| **VI 生产化** | M21–M24 | wfl + wf-datagen + lint + fmt | 已完成 |
+| **VI 生产化** | M21–M24 | wfl + wfgen + lint + fmt | 已完成 |
 
 **计划阶段：**
 

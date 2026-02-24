@@ -1,15 +1,37 @@
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process;
 
 use anyhow::Result;
 
-use wf_lang::Severity;
+use wf_lang::{CheckError, Severity};
 
 use wf_config::project::{load_schemas, load_wfl, parse_vars};
+
+fn print_diag(diag: &CheckError, color: bool) {
+    let (prefix, code) = match diag.severity {
+        Severity::Error => ("error", "\x1b[1;31m"),   // bold red
+        Severity::Warning => ("warning", "\x1b[1;38;5;208m"), // bold orange
+    };
+    let reset = "\x1b[0m";
+
+    let context = match (&diag.rule, &diag.contract) {
+        (Some(r), _) => format!(": rule `{r}`"),
+        (_, Some(c)) => format!(": contract `{c}`"),
+        _ => String::new(),
+    };
+
+    if color {
+        eprintln!("{code}{prefix}{reset}{context}: {}", diag.message);
+    } else {
+        eprintln!("{prefix}{context}: {}", diag.message);
+    }
+}
 
 pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let var_map = parse_vars(&vars)?;
+    let color = std::io::stderr().is_terminal();
 
     // Load schemas
     let all_schemas = load_schemas(&schemas, &cwd)?;
@@ -34,15 +56,36 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
         if diag.severity == Severity::Error {
             has_errors = true;
         }
-        eprintln!("{diag}");
+        print_diag(diag, color);
     }
 
     if total == 0 {
-        eprintln!("No issues found.");
+        if color {
+            eprintln!("\x1b[1;32mNo issues found.\x1b[0m");
+        } else {
+            eprintln!("No issues found.");
+        }
     } else {
-        let error_count = errors.len();
-        let warning_count = warnings.len();
-        eprintln!("\n{} error(s), {} warning(s)", error_count, warning_count);
+        let ec = errors.len();
+        let wc = warnings.len();
+        if color {
+            let mut buf = String::new();
+            buf.push_str("\n\x1b[1m");
+            if ec > 0 {
+                buf.push_str(&format!("\x1b[31m{ec} error(s)\x1b[0m\x1b[1m"));
+            }
+            if ec > 0 && wc > 0 {
+                buf.push_str(", ");
+            }
+            if wc > 0 {
+                buf.push_str(&format!("\x1b[33m{wc} warning(s)\x1b[0m"));
+            }
+            eprint!("{buf}");
+            let _ = std::io::stderr().flush();
+            eprintln!();
+        } else {
+            eprintln!("\n{ec} error(s), {wc} warning(s)");
+        }
     }
 
     if has_errors {

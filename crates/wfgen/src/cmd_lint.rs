@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 
-use wf_datagen::loader::load_from_uses;
-use wf_datagen::validate::validate_wfg;
-use wf_datagen::wfg_parser::parse_wfg;
+use wfgen::loader::load_from_uses;
+use wfgen::validate::validate_wfg;
+use wfgen::wfg_parser::parse_wfg;
 
 use crate::cmd_helpers::{load_wfl_files, load_ws_files};
 

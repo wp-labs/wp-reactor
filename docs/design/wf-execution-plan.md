@@ -2,7 +2,7 @@
 <!-- 角色：架构师 / 项目管理 | 状态：v2.2 M20 MVP 已完成 | 创建：2026-02-15 | 更新：2026-02-20 -->
 
 > 本文档将 WarpFusion 引擎基建（[warp-fusion.md](warp-fusion.md) P0–P7）与 WFL v2.1 语言实现（[wfl-desion.md](wfl-desion.md) Phase 0–4）统一为主干 30 个里程碑（M01–M30，十个阶段）。  
-> `wf-datagen` 的 M31–M33 保留为**支撑轨道**（已完成），用于 `gen -> run -> verify` 质量闭环。
+> `wfgen` 的 M31–M33 保留为**支撑轨道**（已完成），用于 `gen -> run -> verify` 质量闭环。
 
 ## 总览
 
@@ -26,7 +26,7 @@ M25 join+baseline+has      M27 fixed+conv+pattern      M29 传输可靠性三档
 M26 条件/字符串/时间       M28 |> 管道+行为分析            +幂等/指标验证
     +replay+yield契约            +shuffle 契约
 
-支撑轨道（独立并行） ─ 测试数据生成 (wf-datagen)
+支撑轨道（独立并行） ─ 测试数据生成 (wfgen)
 M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时序扰动+压测 ✅
 ```
 
@@ -252,7 +252,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 
 | 项目 | 内容 |
 |------|------|
-| 范围 | **集成验收**：wp-motor 发送模拟日志 → TCP + Arrow IPC 传输 → WarpFusion 接收 → brute_force_then_scan 规则触发 → 告警写入文件；CLI 启动命令（`warp-fusion run -c wfusion.toml`） |
+| 范围 | **集成验收**：wp-motor 发送模拟日志 → TCP + Arrow IPC 传输 → WarpFusion 接收 → brute_force_then_scan 规则触发 → 告警写入文件；CLI 启动命令（`wfusion run -c wfusion.toml`） |
 | 依赖 | M05, M06, M07, M13, M18, M19（全链路） |
 | 验收 | **单机 MVP 达成**：一条完整 L1 规则从数据接收到告警输出全流程跑通；可作为独立进程启动运行 |
 | 状态 | **已完成** — `e2e_brute_force_alert` 集成测试跑通完整链路（TCP 接收 → Arrow IPC 解码 → Router 路由 → Scheduler 分发 → CEP 匹配 → 告警写入文件）；CLI `cargo run -p wf-cli -- run -c examples/wfusion.toml` 正常启动并监听 `127.0.0.1:9800`，SIGTERM 优雅关闭 |
@@ -374,35 +374,35 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 
 > 详细设计见 [wfl-desion.md §18](wfl-desion.md)。各阶段穿插在其依赖就绪的最早时机，可与其他阶段并行推进。
 
-### M31：wf-datagen P0 — .wfg Parser + Schema 驱动随机生成 ✅
+### M31：wfgen P0 — .wfg Parser + Schema 驱动随机生成 ✅
 
 > **可立即启动**：唯一依赖 M07 已完成。建议与 M16→M18→M20 并行推进。
 
 | 项目 | 内容 |
 |------|------|
-| crate | `wf-datagen` |
-| 范围 | `.wfg` 场景 DSL 解析器（EBNF → AST，语法见 §18.2）；schema 驱动随机数据生成（从 `.wfs` 读取字段类型 → 按 gen 函数分布产出样本）；seed 可复现（固定 seed + 确定性 RNG）；输出格式 JSONL + Arrow IPC；CLI `wf-datagen gen --scenario ... --format ... --out ...`；`wf-datagen lint` 一致性校验（.wfg 引用与 .wfs/.wfl 的一致性） |
+| crate | `wfgen` |
+| 范围 | `.wfg` 场景 DSL 解析器（EBNF → AST，语法见 §18.2）；schema 驱动随机数据生成（从 `.wfs` 读取字段类型 → 按 gen 函数分布产出样本）；seed 可复现（固定 seed + 确定性 RNG）；输出格式 JSONL + Arrow IPC；CLI `wfgen gen --scenario ... --format ... --out ...`；`wfgen lint` 一致性校验（.wfg 引用与 .wfs/.wfl 的一致性） |
 | 依赖 | M07 ✅ |
 | 验收 | .wfg 文件解析为 AST 测试；同 seed 两次生成结果一致；JSONL / Arrow 输出可被 `wf run --replay` 消费；lint 检出引用缺失 |
 | 状态 | **已完成** — `wfg_parser/` 解析器 + `datagen/` 生成器 + `output/` JSONL/Arrow IPC 输出，54 项测试通过 |
 
-### M32：wf-datagen P1 — Rule-aware 生成 + Oracle + Verify ✅
+### M32：wfgen P1 — Rule-aware 生成 + Oracle + Verify ✅
 
 > **M31 完成后可立即启动**：依赖 M13 已完成。生成 + oracle 部分独立于引擎；verify 对拍需 M20（MVP）就绪。
 
 | 项目 | 内容 |
 |------|------|
-| crate | `wf-datagen` |
-| 范围 | Rule-aware 数据生成：按 `.wfl` 编译产物驱动 hit / near_miss / non_hit 三类数据分布；Reference Evaluator 自动计算 oracle（期望告警）；oracle 输出为标准 JSONL（match key = `rule_name, entity_type, entity_id, close_reason`）；oracle 开关策略统一为“语法优先”（`.wfg` 存在 `oracle` 块即默认生成，CLI 仅允许 `--no-oracle` 临时关闭）；`wf-datagen verify` 对拍命令（actual vs oracle 差异报告）；CI 阻断条件（`missing == 0 && unexpected == 0 && field_mismatch == 0`） |
+| crate | `wfgen` |
+| 范围 | Rule-aware 数据生成：按 `.wfl` 编译产物驱动 hit / near_miss / non_hit 三类数据分布；Reference Evaluator 自动计算 oracle（期望告警）；oracle 输出为标准 JSONL（match key = `rule_name, entity_type, entity_id, close_reason`）；oracle 开关策略统一为“语法优先”（`.wfg` 存在 `oracle` 块即默认生成，CLI 仅允许 `--no-oracle` 临时关闭）；`wfgen verify` 对拍命令（actual vs oracle 差异报告）；CI 阻断条件（`missing == 0 && unexpected == 0 && field_mismatch == 0`） |
 | 依赖 | M13 ✅, M31；verify 端到端需 M20 |
 | 验收 | 生成的 hit 数据确实触发规则；near_miss 数据不触发规则；oracle 与 `wf run --replay` 实际告警对拍通过；verify 差异报告格式正确 |
 | 状态 | **已完成** — `inject_gen.rs` rule-aware 生成 + `oracle/` Reference Evaluator + `verify/` 贪心配对报告 + `verify` CLI 子命令，60 项测试通过 |
 
-### M33：wf-datagen P2 — 时序扰动 + 压测 ✅
+### M33：wfgen P2 — 时序扰动 + 压测 ✅
 
 | 项目 | 内容 |
 |------|------|
-| crate | `wf-datagen` |
+| crate | `wfgen` |
 | 范围 | 时序扰动矩阵（乱序 / 迟到 / 重复 / 丢弃，可组合，由 `.wfg` faults 块声明）；压测模式（高 EPS 连续生成，持续指定时长）；PR 友好差异报告（Markdown 格式，可直接贴入 PR）；配合 §17 P1-2 顺序/乱序不变性契约测试（M29）做回归防线 |
 | 依赖 | M32 |
 | 验收 | 扰动后 oracle 仍正确校验（考虑 allowed_lateness 边界）；压测模式下引擎无崩溃无内存泄漏；差异报告 Markdown 可在 GitHub PR 渲染 |
@@ -433,14 +433,14 @@ M01→M02→M03→M04→M05     M06 ─────┐              M11→M12→
         M23 │                      M20┘             M26┘        M30 ←─ M20
         M24─┘                                                   (可与VII-IX并行)
 
-        支撑轨道（wf-datagen，与 IV–V 并行推进）
+        支撑轨道（wfgen，与 IV–V 并行推进）
         M31 ✅ ─→ M32 ✅ ─→ M33 ✅
          ↑          ↑         ↑
         M07✅     M13✅    M20(verify 端到端)
 
 关键路径: M01→M02→M03→M04→M05 → M10 → M17 → M18 → M20(MVP)
 并行路径: M06∥M07 可与阶段I并行; M11-M13 可与M08-M10并行; M30 可与M25-M29并行
-wf-datagen: M31 ✅; M32 ✅; M33 ✅; verify 端到端需 M20 汇合
+wfgen: M31 ✅; M32 ✅; M33 ✅; verify 端到端需 M20 汇合
 ```
 
 ### 当前推荐执行顺序
@@ -470,7 +470,7 @@ M20 MVP 已完成，下一步两条路径可并行推进：
 | **VIII L3 + Conformance** | M27–M28 | fixed / conv / composable pattern / 多级管道 / shuffle 契约 | 待开始 |
 | **IX 可靠性分级** | M29 | best_effort / at_least_once / exactly_once | 待开始 |
 | **X 分布式** | M30 | 多节点分布式部署 | 待开始 |
-| **支撑轨道（wf-datagen）** | M31–M33 | .wfg DSL / rule-aware oracle / 时序扰动压测 | ✅ 已完成 |
+| **支撑轨道（wfgen）** | M31–M33 | .wfg DSL / rule-aware oracle / 时序扰动压测 | ✅ 已完成 |
 
 
 ## 验收检查点
@@ -506,5 +506,5 @@ M20 MVP 已完成，下一步两条路径可并行推进：
 - WarpFusion 设计方案 → [warp-fusion.md](warp-fusion.md)
 - WFL v2.1 设计方案 → [wfl-desion.md](wfl-desion.md)
 - WFL 与主流 DSL 对比分析 → [wfl-dsl-comparison.md](wfl-dsl-comparison.md)
-- wf-datagen 测试数据生成方案 → [wfl-desion.md §18](wfl-desion.md)
+- wfgen 测试数据生成方案 → [wfl-desion.md §18](wfl-desion.md)
 - 后续提案（P1/P2） → [wfl-desion.md §17](wfl-desion.md)
