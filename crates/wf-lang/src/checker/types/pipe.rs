@@ -33,7 +33,7 @@ pub fn check_pipe_chain(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "distinct requires a field selector (column projection), but step source `{}` has none",
                             branch.source
@@ -52,7 +52,7 @@ pub fn check_pipe_chain(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "count operates on sets; use `distinct | count` for column `{}`",
                         field_selector_name(branch.field.as_ref().unwrap())
@@ -68,7 +68,7 @@ pub fn check_pipe_chain(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "{}() requires a numeric field, `{}` is {:?}",
                         measure_name(branch.pipe.measure),
@@ -81,7 +81,7 @@ pub fn check_pipe_chain(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "{}() requires a field selector",
                         measure_name(branch.pipe.measure)
@@ -97,7 +97,7 @@ pub fn check_pipe_chain(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "{}() requires an orderable field, `{}` is {:?}",
                         measure_name(branch.pipe.measure),
@@ -110,7 +110,7 @@ pub fn check_pipe_chain(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "{}() requires a field selector",
                         measure_name(branch.pipe.measure)
@@ -132,7 +132,7 @@ pub fn check_pipe_chain(
         errors.push(CheckError {
             severity: Severity::Error,
             rule: Some(rule_name.to_string()),
-            contract: None,
+            test: None,
             message: format!(
                 "threshold type {:?} is not compatible with {}() result type {:?}",
                 threshold_type,

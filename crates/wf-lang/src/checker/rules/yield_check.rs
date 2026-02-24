@@ -33,7 +33,7 @@ pub fn check_yield(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "yield version @v{} does not match meta contract_version = {}",
                         yield_ver, mv
@@ -44,7 +44,7 @@ pub fn check_yield(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "yield specifies @v{} but no contract_version in meta block",
                         yield_ver
@@ -59,7 +59,7 @@ pub fn check_yield(
             errors.push(CheckError {
                 severity: Severity::Error,
                 rule: Some(name.to_string()),
-                contract: None,
+                test: None,
                 message: format!("yield target window `{}` does not exist", yc.target),
             });
         }
@@ -69,7 +69,7 @@ pub fn check_yield(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "yield target `{}` has stream subscriptions; it must be an output-only window",
                         yc.target
@@ -83,7 +83,7 @@ pub fn check_yield(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "yield argument `{}` is a system field and cannot be manually assigned",
                             arg.name
@@ -99,7 +99,7 @@ pub fn check_yield(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "yield argument `{}` is not a field in target window `{}`",
                                 arg.name, yc.target
@@ -115,7 +115,7 @@ pub fn check_yield(
                                 errors.push(CheckError {
                                     severity: Severity::Error,
                                     rule: Some(name.to_string()),
-                                    contract: None,
+                                    test: None,
                                     message: format!(
                                         "yield argument `{}` type mismatch: expected {:?}, got {:?}",
                                         arg.name, expected, val_type

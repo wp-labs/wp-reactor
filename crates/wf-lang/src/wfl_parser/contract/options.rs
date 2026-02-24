@@ -11,7 +11,7 @@ use crate::parse_utils::{kw, ws_skip};
 // ---------------------------------------------------------------------------
 
 /// `options { [close_trigger = val;] [eval_mode = val;] }`
-pub(super) fn options_block(input: &mut &str) -> ModalResult<ContractOptions> {
+pub(super) fn options_block(input: &mut &str) -> ModalResult<TestOptions> {
     kw("options").parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal("{")).parse_next(input)?;
@@ -47,7 +47,7 @@ pub(super) fn options_block(input: &mut &str) -> ModalResult<ContractOptions> {
 
     cut_err(literal("}")).parse_next(input)?;
 
-    Ok(ContractOptions {
+    Ok(TestOptions {
         close_trigger,
         eval_mode,
     })

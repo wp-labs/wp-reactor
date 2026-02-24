@@ -3,24 +3,24 @@ use std::time::Duration;
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Contract block (rule contract testing)
+// Test block (rule testing)
 // ---------------------------------------------------------------------------
 
-/// `contract name for rule_name { given { ... } expect { ... } [options { ... }] }`
+/// `test name for rule_name { input { ... } expect { ... } [options { ... }] }`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
-pub struct ContractBlock {
+pub struct TestBlock {
     pub name: String,
     pub rule_name: String,
-    pub given: Vec<GivenStmt>,
+    pub input: Vec<InputStmt>,
     pub expect: Vec<ExpectStmt>,
-    pub options: Option<ContractOptions>,
+    pub options: Option<TestOptions>,
 }
 
-/// Statement inside a `given { ... }` block.
+/// Statement inside an `input { ... }` block.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
-pub enum GivenStmt {
+pub enum InputStmt {
     /// `row(alias, field = expr, ...);`
     Row {
         alias: String,
@@ -68,15 +68,15 @@ pub enum HitAssert {
     },
 }
 
-/// Options for a contract block.
+/// Options for a test block.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
-pub struct ContractOptions {
+pub struct TestOptions {
     pub close_trigger: Option<CloseTrigger>,
     pub eval_mode: Option<EvalMode>,
 }
 
-/// Window close trigger mode for contract testing.
+/// Window close trigger mode for test execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CloseTrigger {
@@ -85,7 +85,7 @@ pub enum CloseTrigger {
     Eos,
 }
 
-/// Evaluation mode for contract testing.
+/// Evaluation mode for test execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EvalMode {

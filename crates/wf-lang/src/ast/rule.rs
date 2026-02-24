@@ -10,7 +10,7 @@ use super::*;
 pub struct WflFile {
     pub uses: Vec<UseDecl>,
     pub rules: Vec<RuleDecl>,
-    pub contracts: Vec<ContractBlock>,
+    pub tests: Vec<TestBlock>,
 }
 
 /// `use "path.wfs"`

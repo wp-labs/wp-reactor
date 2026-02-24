@@ -5,7 +5,7 @@ use std::process;
 use anyhow::Result;
 
 use wf_config::project::{load_schemas, load_wfl, parse_vars};
-use wf_core::rule::contract::run_contract;
+use wf_core::rule::contract::run_test;
 
 const GREEN: &str = "\x1b[1;32m";
 const RED: &str = "\x1b[1;31m";
@@ -30,8 +30,8 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
     // Compile rules into plans
     let plans = wf_lang::compile_wfl(&wfl_file, &all_schemas)?;
 
-    if wfl_file.contracts.is_empty() {
-        eprintln!("No contracts found.");
+    if wfl_file.tests.is_empty() {
+        eprintln!("No tests found.");
         return Ok(());
     }
 
@@ -39,21 +39,21 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
     let mut passed = 0;
     let mut failed = 0;
 
-    for contract in &wfl_file.contracts {
+    for test in &wfl_file.tests {
         total += 1;
 
-        let plan = match plans.iter().find(|p| p.name == contract.rule_name) {
+        let plan = match plans.iter().find(|p| p.name == test.rule_name) {
             Some(p) => p,
             None => {
                 if color {
                     eprintln!(
                         "{RED}FAIL{RESET}  {} — target rule `{}` not found",
-                        contract.name, contract.rule_name
+                        test.name, test.rule_name
                     );
                 } else {
                     eprintln!(
                         "FAIL  {} — target rule `{}` not found",
-                        contract.name, contract.rule_name
+                        test.name, test.rule_name
                     );
                 }
                 failed += 1;
@@ -66,29 +66,29 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
             .find(|s| plan.binds.iter().any(|b| b.window == s.name))
             .and_then(|s| s.time_field.clone());
 
-        match run_contract(contract, plan, time_field) {
+        match run_test(test, plan, time_field) {
             Ok(result) => {
                 if result.passed {
                     if color {
                         eprintln!(
                             "{GREEN}PASS{RESET}  {} {DIM}({}){RESET}",
-                            contract.name, contract.rule_name
+                            test.name, test.rule_name
                         );
                     } else {
-                        eprintln!("PASS  {} ({})", contract.name, contract.rule_name);
+                        eprintln!("PASS  {} ({})", test.name, test.rule_name);
                     }
                     passed += 1;
                 } else {
                     if color {
                         eprintln!(
                             "{RED}FAIL{RESET}  {} {DIM}({}){RESET}",
-                            contract.name, contract.rule_name
+                            test.name, test.rule_name
                         );
                         for f in &result.failures {
                             eprintln!("      {RED}{f}{RESET}");
                         }
                     } else {
-                        eprintln!("FAIL  {} ({})", contract.name, contract.rule_name);
+                        eprintln!("FAIL  {} ({})", test.name, test.rule_name);
                         for f in &result.failures {
                             eprintln!("      {}", f);
                         }
@@ -100,12 +100,12 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
                 if color {
                     eprintln!(
                         "{RED}FAIL{RESET}  {} {DIM}({}){RESET} — error: {}",
-                        contract.name, contract.rule_name, e
+                        test.name, test.rule_name, e
                     );
                 } else {
                     eprintln!(
                         "FAIL  {} ({}) — error: {}",
-                        contract.name, contract.rule_name, e
+                        test.name, test.rule_name, e
                     );
                 }
                 failed += 1;
@@ -114,11 +114,11 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
     }
 
     if color {
-        eprintln!("\n{BOLD}{total} contracts: {GREEN}{passed} passed{RESET}{BOLD}, {}{failed} failed{RESET}",
+        eprintln!("\n{BOLD}{total} tests: {GREEN}{passed} passed{RESET}{BOLD}, {}{failed} failed{RESET}",
             if failed > 0 { RED } else { GREEN },
         );
     } else {
-        eprintln!("\n{} contracts: {} passed, {} failed", total, passed, failed);
+        eprintln!("\n{} tests: {} passed, {} failed", total, passed, failed);
     }
 
     if failed > 0 {

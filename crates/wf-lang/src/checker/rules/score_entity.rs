@@ -14,7 +14,7 @@ pub fn check_score(rule: &RuleDecl, scope: &Scope<'_>, errors: &mut Vec<CheckErr
         errors.push(CheckError {
             severity: Severity::Error,
             rule: Some(name.to_string()),
-            contract: None,
+            test: None,
             message: format!("score expression must be numeric, got {:?}", t),
         });
     }
@@ -30,7 +30,7 @@ pub fn check_entity(rule: &RuleDecl, scope: &Scope<'_>, errors: &mut Vec<CheckEr
         errors.push(CheckError {
                 severity: Severity::Error,
                 rule: Some(name.to_string()),
-                contract: None,
+                test: None,
                 message: format!(
                     "entity id expression must be a scalar identity type (chars/ip/hex/digit), got {:?}",
                     t

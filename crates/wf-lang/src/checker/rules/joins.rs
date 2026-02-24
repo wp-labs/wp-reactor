@@ -19,7 +19,7 @@ pub fn check_joins(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "join target window `{}` does not exist in schemas",
                         join.target_window
@@ -34,7 +34,7 @@ pub fn check_joins(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!("join condition left side: {}", msg),
                         });
                     }
@@ -46,7 +46,7 @@ pub fn check_joins(
                                 errors.push(CheckError {
                                     severity: Severity::Error,
                                     rule: Some(rule_name.to_string()),
-                                    contract: None,
+                                    test: None,
                                     message: format!(
                                         "join condition right side `{}.{}` must be qualified with target window `{}`",
                                         qualifier, field, join.target_window
@@ -56,7 +56,7 @@ pub fn check_joins(
                                 errors.push(CheckError {
                                     severity: Severity::Error,
                                     rule: Some(rule_name.to_string()),
-                                    contract: None,
+                                    test: None,
                                     message: format!(
                                         "join condition: field `{}` not found in window `{}`",
                                         field, join.target_window
@@ -68,7 +68,7 @@ pub fn check_joins(
                             errors.push(CheckError {
                                 severity: Severity::Error,
                                 rule: Some(rule_name.to_string()),
-                                contract: None,
+                                test: None,
                                 message: format!(
                                     "join condition right side must be qualified with window name (e.g. `{}.field`)",
                                     join.target_window
@@ -84,7 +84,7 @@ pub fn check_joins(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "join `{}` uses asof mode but target window has no time field",
                                 join.target_window
@@ -97,7 +97,7 @@ pub fn check_joins(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "join `{}` asof within must be > 0",
                                 join.target_window

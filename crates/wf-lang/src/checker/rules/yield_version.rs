@@ -56,7 +56,7 @@ pub fn check_yield_versions(file: &WflFile, errors: &mut Vec<CheckError>) {
                 errors.push(CheckError {
                     severity: Severity::Warning,
                     rule: None,
-                    contract: None,
+                    test: None,
                     message: format!(
                         "yield target `{}`: field `{}` added in @v{} (not in @v{}); consumers may need to adapt",
                         target, field, v_hi, v_lo
@@ -69,7 +69,7 @@ pub fn check_yield_versions(file: &WflFile, errors: &mut Vec<CheckError>) {
                 errors.push(CheckError {
                     severity: Severity::Warning,
                     rule: None,
-                    contract: None,
+                    test: None,
                     message: format!(
                         "yield target `{}`: field `{}` removed in @v{} (present in @v{}); consumers may depend on it",
                         target, field, v_hi, v_lo

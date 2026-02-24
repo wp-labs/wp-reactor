@@ -10,7 +10,7 @@ use crate::parse_wfl;
 #[test]
 fn parse_contract_full() {
     let input = r#"
-contract dns_no_response_timeout for dns_no_response {
+test dns_no_response_timeout for dns_no_response {
     given {
         row(req,
             query_id = "q-1",
@@ -107,7 +107,7 @@ contract dns_no_response_timeout for dns_no_response {
 #[test]
 fn parse_contract_no_options() {
     let input = r#"
-contract simple_test for my_rule {
+test simple_test for my_rule {
     given {
         row(e, action = "failed");
         tick(5m);
@@ -135,7 +135,7 @@ contract simple_test for my_rule {
 #[test]
 fn parse_contract_options_only_close_trigger() {
     let input = r#"
-contract ct for r {
+test ct for r {
     given { row(e, x = 1); }
     expect { hits == 0; }
     options { close_trigger = flush; }
@@ -150,7 +150,7 @@ contract ct for r {
 #[test]
 fn parse_contract_options_only_eval_mode() {
     let input = r#"
-contract ct for r {
+test ct for r {
     given { row(e, x = 1); }
     expect { hits == 0; }
     options { eval_mode = lenient; }
@@ -165,7 +165,7 @@ contract ct for r {
 #[test]
 fn parse_contract_options_eos() {
     let input = r#"
-contract ct for r {
+test ct for r {
     given { row(e, x = 1); }
     expect { hits == 1; }
     options { close_trigger = eos; }
@@ -179,7 +179,7 @@ contract ct for r {
 #[test]
 fn parse_contract_field_assert_expr() {
     let input = r#"
-contract ct for r {
+test ct for r {
     given { row(e, count = 10); }
     expect {
         hits == 1;
@@ -205,7 +205,7 @@ contract ct for r {
 #[test]
 fn parse_contract_string_field_name() {
     let input = r#"
-contract ct for r {
+test ct for r {
     given {
         row(e, "detail.sha256" = "abc123");
     }
@@ -224,11 +224,11 @@ contract ct for r {
 #[test]
 fn parse_multiple_contracts() {
     let input = r#"
-contract ct1 for r1 {
+test ct1 for r1 {
     given { row(e, x = 1); }
     expect { hits == 1; }
 }
-contract ct2 for r2 {
+test ct2 for r2 {
     given { row(e, x = 2); tick(10s); }
     expect { hits == 0; }
 }
@@ -253,7 +253,7 @@ rule brute_force {
     yield security_alerts (sip = fail.sip)
 }
 
-contract brute_test for brute_force {
+test brute_test for brute_force {
     given {
         row(fail, action = "failed", sip = "1.2.3.4");
         row(fail, action = "failed", sip = "1.2.3.4");
@@ -293,7 +293,7 @@ contract brute_test for brute_force {
 #[test]
 fn parse_contract_multiple_rows() {
     let input = r#"
-contract ct for r {
+test ct for r {
     given {
         row(req, query_id = "q-1", sip = "10.0.0.1");
         row(resp, query_id = "q-1", sip = "10.0.0.1");
@@ -326,7 +326,7 @@ contract ct for r {
 #[test]
 fn parse_contract_hit_score_cmp() {
     let input = r#"
-contract ct for r {
+test ct for r {
     given { row(e, x = 1); }
     expect {
         hit[0].score >= 50.0;

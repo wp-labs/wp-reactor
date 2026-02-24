@@ -13,7 +13,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
             errors.push(CheckError {
                 severity: Severity::Warning,
                 rule: Some(rule_name.to_string()),
-                contract: None,
+                test: None,
                 message: "v2.1 requires `limits { ... }` block; omitting limits may become a compile error in a future release".to_string(),
             });
             return;
@@ -25,7 +25,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
             errors.push(CheckError {
                 severity: Severity::Error,
                 rule: Some(rule_name.to_string()),
-                contract: None,
+                test: None,
                 message: format!(
                     "unknown limits key `{}`; valid keys are: {}",
                     item.key,
@@ -41,7 +41,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "on_exceed value `{}` invalid; valid values are: {}",
                             item.value,
@@ -55,7 +55,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "max_instances value `{}` must be a positive integer (> 0)",
                             item.value
@@ -69,7 +69,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "max_throttle value `{}` must be in format count/unit (e.g. \"1000/min\")",
                             item.value
@@ -83,7 +83,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                                 errors.push(CheckError {
                                     severity: Severity::Error,
                                     rule: Some(rule_name.to_string()),
-                                    contract: None,
+                                    test: None,
                                     message: format!(
                                         "max_throttle count `{}` must be a positive integer (> 0)",
                                         parts[0].trim()
@@ -97,7 +97,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                             errors.push(CheckError {
                                 severity: Severity::Error,
                                 rule: Some(rule_name.to_string()),
-                                contract: None,
+                                test: None,
                                 message: format!(
                                     "max_throttle unit `{}` invalid; valid units are: s, sec, m, min, h, hr, hour, d, day",
                                     parts[1].trim()
@@ -113,7 +113,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "max_memory value `{}` must end with KB, MB, or GB (e.g. \"256MB\")",
                             item.value
@@ -126,7 +126,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                             errors.push(CheckError {
                                 severity: Severity::Error,
                                 rule: Some(rule_name.to_string()),
-                                contract: None,
+                                test: None,
                                 message: format!(
                                     "max_memory value `{}` must have a positive numeric prefix (> 0)",
                                     item.value
@@ -145,7 +145,7 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                                 errors.push(CheckError {
                                     severity: Severity::Error,
                                     rule: Some(rule_name.to_string()),
-                                    contract: None,
+                                    test: None,
                                     message: format!(
                                         "max_memory value `{}` overflows; maximum representable is {}GB",
                                         item.value,

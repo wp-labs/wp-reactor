@@ -20,7 +20,7 @@ pub fn check_match_steps<'a>(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "match step source `{}` is not a declared event alias",
                         branch.source
@@ -35,7 +35,7 @@ pub fn check_match_steps<'a>(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!("duplicate step label `{}`", label),
                 });
             }
@@ -51,7 +51,7 @@ pub fn check_match_steps<'a>(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "field `{}` not found in source `{}`'s window",
                             field_name, branch.source

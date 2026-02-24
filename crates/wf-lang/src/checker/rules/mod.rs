@@ -66,7 +66,7 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
             errors.push(CheckError {
                 severity: Severity::Error,
                 rule: Some(name.to_string()),
-                contract: None,
+                test: None,
                 message: format!(
                     "step label `{}` conflicts with match key field of the same name",
                     key_name

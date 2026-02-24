@@ -19,7 +19,7 @@ pub fn check_match_keys(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "match key `{}` not found in event source `{}` (window `{}`)",
                                 field, alias, schema.name
@@ -36,7 +36,7 @@ pub fn check_match_keys(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "match key `{}.{}` references unknown alias `{}`",
                             alias, field, alias
@@ -46,7 +46,7 @@ pub fn check_match_keys(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "match key `{}.{}`: field `{}` not found in window",
                             alias, field, field
@@ -59,7 +59,7 @@ pub fn check_match_keys(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "match key `{}[\"{}\"]` references unknown alias `{}`",
                             alias, key, alias
@@ -69,7 +69,7 @@ pub fn check_match_keys(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "match key `{}[\"{}\"]`: field `{}` not found in window",
                             alias, key, key
@@ -97,7 +97,7 @@ fn check_key_type_consistency(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "match key `{}` type mismatch: {:?} in `{}` vs {:?} in `{}`",
                             field, prev_type, prev_alias, vt, alias
@@ -130,7 +130,7 @@ pub fn check_key_mapping(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "key mapping `{} = {}.{}`: alias `{}` not declared in events",
                             item.logical_name, alias, field, alias
@@ -140,7 +140,7 @@ pub fn check_key_mapping(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "key mapping `{} = {}.{}`: field `{}` not found in window",
                             item.logical_name, alias, field, field
@@ -152,7 +152,7 @@ pub fn check_key_mapping(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "key mapping `{}`: source field must be qualified (alias.field)",
                         item.logical_name
@@ -175,7 +175,7 @@ pub fn check_key_mapping(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "key mapping `{}` type mismatch: {:?} (from {}) vs {:?} (from {}.{})",
                             item.logical_name, prev_type, prev_source, vt, alias, field

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use wf_lang::ast::{
-    CloseTrigger, CmpOp, ContractBlock, ExpectStmt, Expr, FieldAssign, GivenStmt, HitAssert,
+    CloseTrigger, CmpOp, TestBlock, ExpectStmt, Expr, FieldAssign, InputStmt, HitAssert,
 };
 use wf_lang::plan::RulePlan;
 
@@ -11,24 +11,24 @@ use crate::alert::AlertRecord;
 use crate::rule::match_engine::eval_expr;
 use crate::rule::{CepStateMachine, CloseReason, Event, RuleExecutor, StepResult, Value};
 
-/// Result of running a single contract block against a rule.
-pub struct ContractResult {
-    pub contract_name: String,
+/// Result of running a single test block against a rule.
+pub struct TestResult {
+    pub test_name: String,
     pub rule_name: String,
     pub passed: bool,
     pub failures: Vec<String>,
     pub alert_count: usize,
 }
 
-/// Run a single contract block against a pre-compiled rule plan.
+/// Run a single test block against a pre-compiled rule plan.
 ///
 /// Simulates event injection and close triggers, then validates
 /// the `expect` assertions against the resulting alerts.
-pub fn run_contract(
-    contract: &ContractBlock,
+pub fn run_test(
+    test: &TestBlock,
     plan: &RulePlan,
     time_field: Option<String>,
-) -> Result<ContractResult> {
+) -> Result<TestResult> {
     let mut sm = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), time_field);
     let executor = RuleExecutor::new(plan.clone());
 
@@ -43,10 +43,10 @@ pub fn run_contract(
         .map(|b| b.alias.clone())
         .unwrap_or_default();
 
-    // Process given statements
-    for stmt in &contract.given {
+    // Process input statements
+    for stmt in &test.input {
         match stmt {
-            GivenStmt::Row { alias, fields } => {
+            InputStmt::Row { alias, fields } => {
                 let event = fields_to_event(fields);
                 let use_alias = if alias.is_empty() {
                     &default_alias
@@ -65,7 +65,7 @@ pub fn run_contract(
 
                 current_nanos += 1_000_000_000; // +1 second per row
             }
-            GivenStmt::Tick(dur) => {
+            InputStmt::Tick(dur) => {
                 current_nanos += dur.as_nanos() as i64;
 
                 // Scan for expired instances at the new watermark
@@ -80,8 +80,8 @@ pub fn run_contract(
         }
     }
 
-    // Apply close trigger from contract options
-    let close_trigger = contract.options.as_ref().and_then(|o| o.close_trigger);
+    // Apply close trigger from test options
+    let close_trigger = test.options.as_ref().and_then(|o| o.close_trigger);
 
     match close_trigger {
         None | Some(CloseTrigger::Eos) => {
@@ -123,7 +123,7 @@ pub fn run_contract(
 
     // Validate expect assertions
     let mut failures = Vec::new();
-    for expect in &contract.expect {
+    for expect in &test.expect {
         match expect {
             ExpectStmt::Hits { cmp, count } => {
                 if !compare_usize(*cmp, alerts.len(), *count) {
@@ -153,9 +153,9 @@ pub fn run_contract(
     }
 
     let passed = failures.is_empty();
-    Ok(ContractResult {
-        contract_name: contract.name.clone(),
-        rule_name: contract.rule_name.clone(),
+    Ok(TestResult {
+        test_name: test.name.clone(),
+        rule_name: test.rule_name.clone(),
         passed,
         failures,
         alert_count: alerts.len(),
@@ -220,7 +220,7 @@ fn validate_hit_assert(
     }
 }
 
-/// Convert contract field assignments to an Event.
+/// Convert field assignments to an Event.
 fn fields_to_event(fields: &[FieldAssign]) -> Event {
     let mut map = HashMap::new();
     for f in fields {

@@ -22,7 +22,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: "count() expects a set-level argument (alias), not a field projection"
                         .to_string(),
                 });
@@ -37,7 +37,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!("{}() requires a numeric field, got {:?}", name, t),
                 });
             }
@@ -51,7 +51,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!("{}() requires an orderable field, got {:?}", name, t),
                 });
             }
@@ -62,7 +62,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: "has() expects 1 or 2 arguments".to_string(),
                 });
             }
@@ -71,7 +71,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: "has() second argument must be a string literal (field name)"
                         .to_string(),
                 });
@@ -83,7 +83,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: "baseline() requires exactly 2 arguments: (expr, duration)"
                         .to_string(),
                 });
@@ -95,7 +95,7 @@ pub fn check_func_call(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!("baseline() first argument must be numeric, got {:?}", t),
                     });
                 }
@@ -106,7 +106,7 @@ pub fn check_func_call(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: "baseline() second argument must be a positive duration"
                                 .to_string(),
                         });
@@ -119,7 +119,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: "regex_match() requires exactly 2 arguments: (field, pattern)"
                         .to_string(),
                 });
@@ -131,7 +131,7 @@ pub fn check_func_call(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!("regex_match() first argument must be chars, got {:?}", t),
                     });
                 }
@@ -142,7 +142,7 @@ pub fn check_func_call(
                             errors.push(CheckError {
                                 severity: Severity::Error,
                                 rule: Some(rule_name.to_string()),
-                                contract: None,
+                                test: None,
                                 message: format!(
                                     "regex_match() pattern \"{}\" is not valid regex",
                                     pat
@@ -154,7 +154,7 @@ pub fn check_func_call(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message:
                                 "regex_match() second argument must be a string literal pattern"
                                     .to_string(),
@@ -168,7 +168,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: "time_diff() requires exactly 2 arguments: (t1, t2)".to_string(),
                 });
             } else {
@@ -180,7 +180,7 @@ pub fn check_func_call(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "time_diff() argument {} must be time or numeric, got {:?}",
                                 i + 1,
@@ -196,7 +196,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: "time_bucket() requires exactly 2 arguments: (time, interval_seconds)"
                         .to_string(),
                 });
@@ -209,7 +209,7 @@ pub fn check_func_call(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "time_bucket() first argument must be time or numeric, got {:?}",
                             t
@@ -223,7 +223,7 @@ pub fn check_func_call(
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
-                        contract: None,
+                        test: None,
                         message: format!(
                             "time_bucket() second argument must be numeric (interval seconds), got {:?}",
                             t
@@ -237,7 +237,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: "contains() requires exactly 2 arguments: (haystack, needle)"
                         .to_string(),
                 });
@@ -249,7 +249,7 @@ pub fn check_func_call(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "contains() argument {} must be chars, got {:?}",
                                 i + 1,
@@ -265,7 +265,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!("{}() requires exactly 1 argument", name),
                 });
             } else if let Some(t) = infer_type(&args[0], scope)
@@ -274,7 +274,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!("{}() argument must be chars, got {:?}", name, t),
                 });
             }
@@ -284,7 +284,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: "len() requires exactly 1 argument".to_string(),
                 });
             } else if let Some(t) = infer_type(&args[0], scope)
@@ -293,7 +293,7 @@ pub fn check_func_call(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!("len() argument must be chars, got {:?}", t),
                 });
             }

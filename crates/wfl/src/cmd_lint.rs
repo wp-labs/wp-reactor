@@ -15,9 +15,9 @@ fn print_diag(diag: &CheckError, color: bool) {
     };
     let reset = "\x1b[0m";
 
-    let context = match (&diag.rule, &diag.contract) {
+    let context = match (&diag.rule, &diag.test) {
         (Some(r), _) => format!(": rule `{r}`"),
-        (_, Some(c)) => format!(": contract `{c}`"),
+        (_, Some(t)) => format!(": test `{t}`"),
         _ => String::new(),
     };
 

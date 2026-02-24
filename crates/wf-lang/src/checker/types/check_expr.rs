@@ -31,7 +31,7 @@ pub fn check_expr_type(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "logical `{}` requires bool operands, left side is {:?}",
                                 op_symbol(*op),
@@ -45,7 +45,7 @@ pub fn check_expr_type(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "logical `{}` requires bool operands, right side is {:?}",
                                 op_symbol(*op),
@@ -62,7 +62,7 @@ pub fn check_expr_type(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "`{}` comparison between incompatible types {:?} and {:?}",
                                 op_symbol(*op),
@@ -80,7 +80,7 @@ pub fn check_expr_type(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "ordering `{}` requires numeric operands, left side is {:?}",
                                 op_symbol(*op),
@@ -94,7 +94,7 @@ pub fn check_expr_type(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "ordering `{}` requires numeric operands, right side is {:?}",
                                 op_symbol(*op),
@@ -110,7 +110,7 @@ pub fn check_expr_type(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "arithmetic `{}` requires numeric operands, left side is {:?}",
                                 op_symbol(*op),
@@ -124,7 +124,7 @@ pub fn check_expr_type(
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
-                            contract: None,
+                            test: None,
                             message: format!(
                                 "arithmetic `{}` requires numeric operands, right side is {:?}",
                                 op_symbol(*op),
@@ -143,7 +143,7 @@ pub fn check_expr_type(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!("unary negation requires numeric operand, got {:?}", t),
                 });
             }
@@ -168,7 +168,7 @@ pub fn check_expr_type(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: msg,
                 });
             }
@@ -190,7 +190,7 @@ pub fn check_expr_type(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!("if-then-else condition must be bool, got {:?}", t),
                 });
             }
@@ -203,7 +203,7 @@ pub fn check_expr_type(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "if-then-else branches have incompatible types: then={:?}, else={:?}",
                         tt, et

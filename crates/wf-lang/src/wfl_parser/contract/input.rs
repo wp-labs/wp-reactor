@@ -9,12 +9,12 @@ use crate::parse_utils::{duration_value, ident, kw, quoted_string, ws_skip};
 use super::super::expr;
 
 // ---------------------------------------------------------------------------
-// given block
+// input block
 // ---------------------------------------------------------------------------
 
-/// `given { row(...); ... tick(...); ... }`
-pub(super) fn given_block(input: &mut &str) -> ModalResult<Vec<GivenStmt>> {
-    kw("given").parse_next(input)?;
+/// `input { row(...); ... tick(...); ... }`
+pub(super) fn input_block(input: &mut &str) -> ModalResult<Vec<InputStmt>> {
+    kw("input").parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal("{")).parse_next(input)?;
 
@@ -24,9 +24,9 @@ pub(super) fn given_block(input: &mut &str) -> ModalResult<Vec<GivenStmt>> {
         if input.starts_with('}') {
             break;
         }
-        let stmt = cut_err(given_stmt)
+        let stmt = cut_err(input_stmt)
             .context(StrContext::Expected(StrContextValue::Description(
-                "given statement (row or tick)",
+                "input statement (row or tick)",
             )))
             .parse_next(input)?;
         stmts.push(stmt);
@@ -36,12 +36,12 @@ pub(super) fn given_block(input: &mut &str) -> ModalResult<Vec<GivenStmt>> {
     Ok(stmts)
 }
 
-fn given_stmt(input: &mut &str) -> ModalResult<GivenStmt> {
-    alt((given_row, given_tick)).parse_next(input)
+fn input_stmt(input: &mut &str) -> ModalResult<InputStmt> {
+    alt((input_row, input_tick)).parse_next(input)
 }
 
 /// `row(IDENT, field = expr, ...);`
-fn given_row(input: &mut &str) -> ModalResult<GivenStmt> {
+fn input_row(input: &mut &str) -> ModalResult<InputStmt> {
     kw("row").parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal("(")).parse_next(input)?;
@@ -85,7 +85,7 @@ fn given_row(input: &mut &str) -> ModalResult<GivenStmt> {
     ws_skip.parse_next(input)?;
     cut_err(literal(";")).parse_next(input)?;
 
-    Ok(GivenStmt::Row { alias, fields })
+    Ok(InputStmt::Row { alias, fields })
 }
 
 /// `(IDENT | STRING) = expr`
@@ -99,7 +99,7 @@ fn field_assign(input: &mut &str) -> ModalResult<FieldAssign> {
 }
 
 /// `tick(DURATION);`
-fn given_tick(input: &mut &str) -> ModalResult<GivenStmt> {
+fn input_tick(input: &mut &str) -> ModalResult<InputStmt> {
     kw("tick").parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal("(")).parse_next(input)?;
@@ -113,5 +113,5 @@ fn given_tick(input: &mut &str) -> ModalResult<GivenStmt> {
     cut_err(literal(")")).parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal(";")).parse_next(input)?;
-    Ok(GivenStmt::Tick(dur))
+    Ok(InputStmt::Tick(dur))
 }

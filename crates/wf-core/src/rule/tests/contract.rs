@@ -65,7 +65,7 @@ fn run_contract_from_source(source: &str) -> crate::rule::contract::ContractResu
         !wfl_file.contracts.is_empty(),
         "expected at least one contract"
     );
-    let contract = &wfl_file.contracts[0];
+    let test = &wfl_file.contracts[0];
 
     let plan = plans
         .iter()
@@ -90,7 +90,7 @@ rule brute_force {
     yield security_alerts (sip = e.sip, fail_count = 5)
 }
 
-contract five_hits for brute_force {
+test five_hits for brute_force {
     given {
         row(e, sip = "10.0.0.1", action = "failed");
         row(e, sip = "10.0.0.1", action = "failed");
@@ -120,7 +120,7 @@ rule brute_force {
     yield security_alerts (sip = e.sip, fail_count = 5)
 }
 
-contract below_threshold for brute_force {
+test below_threshold for brute_force {
     given {
         row(e, sip = "10.0.0.1", action = "failed");
         row(e, sip = "10.0.0.1", action = "failed");
@@ -149,7 +149,7 @@ rule timeout_rule {
     yield security_alerts (sip = e.sip, fail_count = 1)
 }
 
-contract test_timeout for timeout_rule {
+test test_timeout for timeout_rule {
     given {
         row(e, sip = "10.0.0.1", action = "failed");
         row(e, sip = "10.0.0.1", action = "failed");
@@ -181,7 +181,7 @@ rule eos_rule {
     yield security_alerts (sip = e.sip, fail_count = 1)
 }
 
-contract test_eos for eos_rule {
+test test_eos for eos_rule {
     given {
         row(e, sip = "10.0.0.1", action = "failed");
         row(e, sip = "10.0.0.1", action = "failed");
@@ -208,7 +208,7 @@ rule brute_force {
     yield security_alerts (sip = e.sip, fail_count = 5)
 }
 
-contract score_fail for brute_force {
+test score_fail for brute_force {
     given {
         row(e, sip = "10.0.0.1");
         row(e, sip = "10.0.0.1");
@@ -222,7 +222,7 @@ contract score_fail for brute_force {
 }
 "#;
     let result = run_contract_from_source(source);
-    assert!(!result.passed, "expected failure but contract passed");
+    assert!(!result.passed, "expected failure but test passed");
     assert!(
         result.failures.iter().any(|f| f.contains("score")),
         "expected score failure, got: {:?}",
@@ -240,7 +240,7 @@ rule brute_force {
     yield security_alerts (sip = e.sip, fail_count = 5)
 }
 
-contract entity_check for brute_force {
+test entity_check for brute_force {
     given {
         row(e, sip = "10.0.0.1");
         row(e, sip = "10.0.0.1");
@@ -267,7 +267,7 @@ rule brute_force {
     yield security_alerts (sip = e.sip, fail_count = 5)
 }
 
-contract hits_ge for brute_force {
+test hits_ge for brute_force {
     given {
         row(e, sip = "10.0.0.1");
         row(e, sip = "10.0.0.1");

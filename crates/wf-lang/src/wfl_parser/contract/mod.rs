@@ -1,5 +1,5 @@
 mod expect;
-mod given;
+mod input;
 mod options;
 
 use winnow::combinator::{alt, cut_err, opt};
@@ -11,64 +11,64 @@ use crate::ast::*;
 use crate::parse_utils::{ident, kw, ws_skip};
 
 // ---------------------------------------------------------------------------
-// contract block
+// test block
 // ---------------------------------------------------------------------------
 
-/// `contract NAME for RULE_NAME { given { ... } expect { ... } [options { ... }] }`
-pub(super) fn contract_block(input: &mut &str) -> ModalResult<ContractBlock> {
-    ws_skip.parse_next(input)?;
-    kw("contract").parse_next(input)?;
-    ws_skip.parse_next(input)?;
+/// `test NAME for RULE_NAME { input { ... } expect { ... } [options { ... }] }`
+pub(super) fn test_block(input_str: &mut &str) -> ModalResult<TestBlock> {
+    ws_skip.parse_next(input_str)?;
+    kw("test").parse_next(input_str)?;
+    ws_skip.parse_next(input_str)?;
 
     let name = cut_err(ident)
         .context(StrContext::Expected(StrContextValue::Description(
-            "contract name",
+            "test name",
         )))
-        .parse_next(input)?
+        .parse_next(input_str)?
         .to_string();
 
-    ws_skip.parse_next(input)?;
+    ws_skip.parse_next(input_str)?;
     cut_err(kw("for"))
         .context(StrContext::Expected(StrContextValue::Description(
-            "'for' after contract name",
+            "'for' after test name",
         )))
-        .parse_next(input)?;
-    ws_skip.parse_next(input)?;
+        .parse_next(input_str)?;
+    ws_skip.parse_next(input_str)?;
 
     let rule_name = cut_err(ident)
         .context(StrContext::Expected(StrContextValue::Description(
             "rule name after 'for'",
         )))
-        .parse_next(input)?
+        .parse_next(input_str)?
         .to_string();
 
-    ws_skip.parse_next(input)?;
-    cut_err(literal("{")).parse_next(input)?;
+    ws_skip.parse_next(input_str)?;
+    cut_err(literal("{")).parse_next(input_str)?;
 
-    ws_skip.parse_next(input)?;
-    let given = cut_err(given::given_block)
+    ws_skip.parse_next(input_str)?;
+    let input_stmts = cut_err(input::input_block)
         .context(StrContext::Expected(StrContextValue::Description(
-            "given block",
+            "input block",
         )))
-        .parse_next(input)?;
+        .parse_next(input_str)?;
 
-    ws_skip.parse_next(input)?;
+    ws_skip.parse_next(input_str)?;
     let expect = cut_err(expect::expect_block)
         .context(StrContext::Expected(StrContextValue::Description(
             "expect block",
         )))
-        .parse_next(input)?;
+        .parse_next(input_str)?;
 
-    ws_skip.parse_next(input)?;
-    let options = opt(options::options_block).parse_next(input)?;
+    ws_skip.parse_next(input_str)?;
+    let options = opt(options::options_block).parse_next(input_str)?;
 
-    ws_skip.parse_next(input)?;
-    cut_err(literal("}")).parse_next(input)?;
+    ws_skip.parse_next(input_str)?;
+    cut_err(literal("}")).parse_next(input_str)?;
 
-    Ok(ContractBlock {
+    Ok(TestBlock {
         name,
         rule_name,
-        given,
+        input: input_stmts,
         expect,
         options,
     })

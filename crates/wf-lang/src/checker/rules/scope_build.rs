@@ -22,7 +22,7 @@ pub fn build_scope<'a>(
             errors.push(CheckError {
                 severity: Severity::Error,
                 rule: Some(rule_name.to_string()),
-                contract: None,
+                test: None,
                 message: format!("duplicate event alias `{}`", decl.alias),
             });
         }
@@ -36,7 +36,7 @@ pub fn build_scope<'a>(
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "event alias `{}` references unknown window `{}`",
                         decl.alias, decl.window

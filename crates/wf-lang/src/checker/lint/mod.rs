@@ -81,7 +81,7 @@ fn lint_unused_alias(rule: &crate::ast::RuleDecl, rule_name: &str, warnings: &mu
             warnings.push(CheckError {
                 severity: Severity::Warning,
                 rule: Some(rule_name.to_string()),
-                contract: None,
+                test: None,
                 message: format!(
                     "[W001] event alias `{}` is declared but never referenced in match steps or expressions",
                     alias
@@ -154,7 +154,7 @@ fn lint_missing_on_close(
         warnings.push(CheckError {
             severity: Severity::Warning,
             rule: Some(rule_name.to_string()),
-            contract: None,
+            test: None,
             message: "[W002] match clause has no `on close` block; window timeout will not trigger close-phase evaluation".to_string(),
         });
     }
@@ -173,7 +173,7 @@ fn lint_high_cardinality_key(
         warnings.push(CheckError {
             severity: Severity::Warning,
             rule: Some(rule_name.to_string()),
-            contract: None,
+            test: None,
             message: format!(
                 "[W003] match clause has {} keys; high-cardinality keys may cause excessive memory usage",
                 rule.match_clause.keys.len()
@@ -194,7 +194,7 @@ fn lint_steps(steps: &[MatchStep], rule_name: &str, warnings: &mut Vec<CheckErro
                 warnings.push(CheckError {
                     severity: Severity::Warning,
                     rule: Some(rule_name.to_string()),
-                    contract: None,
+                    test: None,
                     message: format!(
                         "[W004] step threshold is 0 with `{}`; this condition is trivially true for any non-negative measure",
                         cmp_symbol(branch.pipe.cmp)
@@ -214,7 +214,7 @@ fn lint_score_zero(rule: &crate::ast::RuleDecl, rule_name: &str, warnings: &mut 
         warnings.push(CheckError {
             severity: Severity::Warning,
             rule: Some(rule_name.to_string()),
-            contract: None,
+            test: None,
             message:
                 "[W005] score expression is always 0.0; this rule will produce zero-score alerts"
                     .to_string(),
@@ -240,7 +240,7 @@ fn lint_yield_case_collision(
             warnings.push(CheckError {
                 severity: Severity::Warning,
                 rule: Some(rule_name.to_string()),
-                contract: None,
+                test: None,
                 message: format!(
                     "[W006] yield field `{}` differs from system field `{}` only by case; this may cause confusion",
                     arg.name, lower

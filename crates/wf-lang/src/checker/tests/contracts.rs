@@ -6,7 +6,7 @@ use crate::wfl_parser::parse_wfl;
 #[test]
 fn contract_unknown_rule() {
     let input = r#"
-contract ct for nonexistent {
+test ct for nonexistent {
     given { row(e, x = 1); }
     expect { hits == 1; }
 }
@@ -29,7 +29,7 @@ rule r {
     entity(ip, e.sip)
     yield out (x = e.sip)
 }
-contract ct for r {
+test ct for r {
     given { row(bad, x = 1); }
     expect { hits == 1; }
 }
@@ -52,7 +52,7 @@ rule r {
     entity(ip, e.sip)
     yield out (x = e.sip)
 }
-contract ct for r {
+test ct for r {
     given { row(e, action = "failed"); }
     expect { hits == 1; }
 }
@@ -63,6 +63,6 @@ contract ct for r {
         .iter()
         .filter(|e| e.severity == Severity::Error)
         .collect();
-    // The rule itself is valid and contract refs are valid
+    // The rule itself is valid and test refs are valid
     assert!(hard.is_empty(), "expected no errors, got: {:?}", hard);
 }
