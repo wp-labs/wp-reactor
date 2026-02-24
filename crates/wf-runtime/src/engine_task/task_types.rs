@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use wf_core::alert::AlertRecord;
+use wf_core::alert::OutputRecord;
 use wf_core::rule::{CepStateMachine, RuleExecutor};
 use wf_core::window::{Router, Window};
 
@@ -31,7 +31,7 @@ pub(crate) struct RuleTaskConfig {
     pub window_sources: Vec<WindowSource>,
     /// stream_name -> Vec<alias>: which CEP aliases receive events from each stream.
     pub stream_aliases: HashMap<String, Vec<String>>,
-    pub alert_tx: mpsc::Sender<AlertRecord>,
+    pub alert_tx: mpsc::Sender<OutputRecord>,
     pub cancel: CancellationToken,
     pub timeout_scan_interval: Duration,
     /// Shared router for WindowLookup (joins + has()).

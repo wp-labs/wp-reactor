@@ -7,7 +7,7 @@ use wf_lang::ast::{
 };
 use wf_lang::plan::RulePlan;
 
-use crate::alert::AlertRecord;
+use crate::alert::OutputRecord;
 use crate::rule::match_engine::eval_expr;
 use crate::rule::{CepStateMachine, CloseReason, Event, RuleExecutor, StepResult, Value};
 
@@ -17,7 +17,7 @@ pub struct TestResult {
     pub rule_name: String,
     pub passed: bool,
     pub failures: Vec<String>,
-    pub alert_count: usize,
+    pub output_count: usize,
 }
 
 /// Run a single test block against a pre-compiled rule plan.
@@ -34,7 +34,7 @@ pub fn run_test(
 
     let base_nanos: i64 = 1_700_000_000_000_000_000;
     let mut current_nanos = base_nanos;
-    let mut alerts: Vec<AlertRecord> = Vec::new();
+    let mut alerts: Vec<OutputRecord> = Vec::new();
 
     // Resolve the alias for the rule (first bind's alias)
     let default_alias = plan
@@ -145,8 +145,8 @@ pub fn run_test(
                     ));
                     continue;
                 }
-                let alert = &alerts[*index];
-                validate_hit_assert(*index, alert, assert, &mut failures);
+                let output = &alerts[*index];
+                validate_hit_assert(*index, output, assert, &mut failures);
             }
             _ => {} // future-proof for non_exhaustive
         }
@@ -158,30 +158,30 @@ pub fn run_test(
         rule_name: test.rule_name.clone(),
         passed,
         failures,
-        alert_count: alerts.len(),
+        output_count: alerts.len(),
     })
 }
 
 fn validate_hit_assert(
     index: usize,
-    alert: &AlertRecord,
+    output: &OutputRecord,
     assert: &HitAssert,
     failures: &mut Vec<String>,
 ) {
     match assert {
         HitAssert::Score { cmp, value } => {
-            if !compare_f64(*cmp, alert.score, *value) {
+            if !compare_f64(*cmp, output.score, *value) {
                 failures.push(format!(
                     "hit[{}].score: expected {} {}, got {}",
                     index,
                     cmp_op_str(*cmp),
                     value,
-                    alert.score
+                    output.score
                 ));
             }
         }
         HitAssert::CloseReason { value } => {
-            let actual = alert.close_reason.as_deref().unwrap_or("");
+            let actual = output.close_reason.as_deref().unwrap_or("");
             if actual != value {
                 failures.push(format!(
                     "hit[{}].close_reason: expected {:?}, got {:?}",
@@ -190,18 +190,18 @@ fn validate_hit_assert(
             }
         }
         HitAssert::EntityType { value } => {
-            if alert.entity_type != *value {
+            if output.entity_type != *value {
                 failures.push(format!(
                     "hit[{}].entity_type: expected {:?}, got {:?}",
-                    index, value, alert.entity_type
+                    index, value, output.entity_type
                 ));
             }
         }
         HitAssert::EntityId { value } => {
-            if alert.entity_id != *value {
+            if output.entity_id != *value {
                 failures.push(format!(
                     "hit[{}].entity_id: expected {:?}, got {:?}",
-                    index, value, alert.entity_id
+                    index, value, output.entity_id
                 ));
             }
         }

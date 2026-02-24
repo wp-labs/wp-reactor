@@ -1,5 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-
+use sha2::{Digest, Sha256};
 use wf_lang::ast::FieldRef;
 
 use crate::rule::match_engine::{StepData, Value, field_ref_name, value_to_string};
@@ -45,46 +44,51 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// Process-wide monotonic counter for alert_id uniqueness.
-static ALERT_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Percent-encode characters that would break alert_id structure.
+/// Build a content-addressed output ID (16 hex chars from SHA-256).
 ///
-/// Encodes `%`, `|`, `#`, and `\x1f` so the three-segment `|` split and
-/// the `#seq` suffix can always be parsed unambiguously.
-fn encode_alert_segment(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '%' => out.push_str("%25"),
-            '|' => out.push_str("%7C"),
-            '#' => out.push_str("%23"),
-            '\x1f' => out.push_str("%1F"),
-            _ => out.push(ch),
-        }
+/// Feeds rule_name, scope_key, fired_at, step_data, and close_reason
+/// into a SHA-256 hasher, then takes the first 8 bytes as 16 hex characters.
+pub(super) fn build_wfx_id(
+    rule_name: &str,
+    scope_key: &[Value],
+    fired_at: &str,
+    step_data: &[StepData],
+    close_reason: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(rule_name.as_bytes());
+    hasher.update(b"\x00");
+    for v in scope_key {
+        hasher.update(value_to_string(v).as_bytes());
+        hasher.update(b"\x1f");
     }
-    out
+    hasher.update(b"\x00");
+    hasher.update(fired_at.as_bytes());
+    hasher.update(b"\x00");
+    for sd in step_data {
+        if let Some(label) = &sd.label {
+            hasher.update(label.as_bytes());
+        }
+        hasher.update(b"\x1e");
+        hasher.update(sd.measure_value.to_bits().to_le_bytes());
+        hasher.update(b"\x1f");
+    }
+    hasher.update(b"\x00");
+    if let Some(reason) = close_reason {
+        hasher.update(reason.as_bytes());
+    }
+    let hash = hasher.finalize();
+    // First 8 bytes → 16 hex characters
+    hex_encode(&hash[..8])
 }
 
-/// Build a composite alert id: `"rule|key1\x1fkey2|fired_at#seq"`.
-///
-/// - Each key value is percent-encoded (`|` → `%7C`, `#` → `%23`, `%` → `%25`)
-///   so that the outer `|` split is always unambiguous.
-/// - Keys joined with `\x1f` (unit separator) to avoid multi-key ambiguity.
-/// - `seq` is a process-wide monotonic counter for same-millisecond uniqueness.
-pub(super) fn build_alert_id(rule_name: &str, scope_key: &[Value], fired_at: &str) -> String {
-    let rule_enc = encode_alert_segment(rule_name);
-    let keys_part = if scope_key.is_empty() {
-        "global".to_string()
-    } else {
-        scope_key
-            .iter()
-            .map(|v| encode_alert_segment(&value_to_string(v)))
-            .collect::<Vec<_>>()
-            .join("\x1f")
-    };
-    let seq = ALERT_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{}|{}|{}#{}", rule_enc, keys_part, fired_at, seq)
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
 }
 
 /// Build a human-readable summary.

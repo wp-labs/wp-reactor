@@ -1,15 +1,15 @@
-use crate::alert::AlertRecord;
+use crate::alert::OutputRecord;
 use crate::error::CoreResult;
 use crate::rule::match_engine::{Event, MatchedContext, WindowLookup};
 
 use super::RuleExecutor;
-use super::alert::{build_alert_id, build_summary, format_nanos_utc};
+use super::alert::{build_summary, build_wfx_id, format_nanos_utc};
 use super::context::{build_eval_context, execute_joins};
 use super::eval::{eval_entity_id, eval_score};
 
 impl RuleExecutor {
-    /// Produce an [`AlertRecord`] from an on-event match (L1 — no joins).
-    pub fn execute_match(&self, matched: &MatchedContext) -> CoreResult<AlertRecord> {
+    /// Produce an [`OutputRecord`] from an on-event match (L1 — no joins).
+    pub fn execute_match(&self, matched: &MatchedContext) -> CoreResult<OutputRecord> {
         let ctx = build_eval_context(
             &self.plan.match_plan.keys,
             &matched.scope_key,
@@ -18,7 +18,7 @@ impl RuleExecutor {
         self.build_match_alert(matched, &ctx)
     }
 
-    /// Produce an [`AlertRecord`] from an on-event match with join support.
+    /// Produce an [`OutputRecord`] from an on-event match with join support.
     ///
     /// Executes joins before score/entity evaluation, enriching the eval
     /// context with joined fields from external windows.
@@ -26,7 +26,7 @@ impl RuleExecutor {
         &self,
         matched: &MatchedContext,
         windows: &dyn WindowLookup,
-    ) -> CoreResult<AlertRecord> {
+    ) -> CoreResult<OutputRecord> {
         let mut ctx = build_eval_context(
             &self.plan.match_plan.keys,
             &matched.scope_key,
@@ -41,12 +41,18 @@ impl RuleExecutor {
         self.build_match_alert(matched, &ctx)
     }
 
-    /// Internal: build the AlertRecord from an already-constructed eval context.
-    fn build_match_alert(&self, matched: &MatchedContext, ctx: &Event) -> CoreResult<AlertRecord> {
+    /// Internal: build the OutputRecord from an already-constructed eval context.
+    fn build_match_alert(&self, matched: &MatchedContext, ctx: &Event) -> CoreResult<OutputRecord> {
         let score = eval_score(&self.plan.score_plan.expr, ctx)?;
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
         let fired_at = format_nanos_utc(matched.event_time_nanos);
-        let alert_id = build_alert_id(&self.plan.name, &matched.scope_key, &fired_at);
+        let wfx_id = build_wfx_id(
+            &self.plan.name,
+            &matched.scope_key,
+            &fired_at,
+            &matched.step_data,
+            None,
+        );
         let summary = build_summary(
             &self.plan.name,
             &self.plan.match_plan.keys,
@@ -55,8 +61,8 @@ impl RuleExecutor {
             None,
         );
 
-        Ok(AlertRecord {
-            alert_id,
+        Ok(OutputRecord {
+            wfx_id,
             rule_name: self.plan.name.clone(),
             score,
             entity_type: self.plan.entity_plan.entity_type.clone(),

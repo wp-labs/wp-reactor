@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use wf_core::alert::AlertRecord;
+use wf_core::alert::OutputRecord;
 use wf_core::rule::{
     CepStateMachine, CloseReason, Event, RuleExecutor, StepResult, Value, WindowLookup,
 };
@@ -20,7 +20,7 @@ const RESET: &str = "\x1b[0m";
 
 /// Result of replaying events through compiled rules.
 pub struct ReplayResult {
-    pub alerts: Vec<AlertRecord>,
+    pub alerts: Vec<OutputRecord>,
     pub event_count: u64,
     pub match_count: u64,
     pub error_count: u64,

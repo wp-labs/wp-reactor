@@ -103,7 +103,7 @@ fn make_batch(schema: &SchemaRef, sips: &[&str], ts: i64) -> RecordBatch {
 /// Build a single-step count>=3 rule and return (task, alert_rx, window_arc, notify_arc).
 fn make_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_core::alert::AlertRecord>,
+    mpsc::Receiver<wf_core::alert::OutputRecord>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -132,7 +132,7 @@ fn make_task_with_window_bytes(
     max_bytes: usize,
 ) -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_core::alert::AlertRecord>,
+    mpsc::Receiver<wf_core::alert::OutputRecord>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {

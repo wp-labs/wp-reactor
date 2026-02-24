@@ -1,3 +1,3 @@
 mod types;
 
-pub use types::AlertRecord;
+pub use types::OutputRecord;

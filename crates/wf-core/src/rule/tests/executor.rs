@@ -164,8 +164,9 @@ fn execute_match_composite_keys() {
 
     let alert = exec.execute_match(&matched).unwrap();
     assert_eq!(alert.entity_id, "10.0.0.2");
-    // alert_id should contain both keys separated by unit separator
-    assert!(alert.alert_id.contains("10.0.0.1\x1f10.0.0.2"));
+    // wfx_id should be a 16-hex-char content hash
+    assert_eq!(alert.wfx_id.len(), 16);
+    assert!(alert.wfx_id.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
 // =========================================================================
@@ -318,24 +319,29 @@ fn entity_eval_failure() {
 }
 
 // =========================================================================
-// Test 11: alert_id structural properties
+// Test 11: wfx_id deterministic
 // =========================================================================
 
 #[test]
-fn alert_id_deterministic() {
-    use crate::rule::executor::format_nanos_utc;
+fn wfx_id_deterministic() {
+    let plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".to_string())),
+    );
+    let exec = RuleExecutor::new(plan);
+    let matched = default_matched_context();
 
-    // Use a fixed nanos value to get deterministic fired_at
-    let nanos: i64 = 1_700_000_000_123_000_000;
-    let fired_at = format_nanos_utc(nanos);
+    let alert1 = exec.execute_match(&matched).unwrap();
+    let alert2 = exec.execute_match(&matched).unwrap();
 
-    // Verify format_nanos_utc is deterministic
-    let fired_at2 = format_nanos_utc(nanos);
-    assert_eq!(fired_at, fired_at2);
-
-    // Verify ISO 8601 format
-    assert!(fired_at.contains('T'));
-    assert!(fired_at.ends_with('Z'));
+    // Same inputs produce the same content hash
+    assert_eq!(alert1.wfx_id, alert2.wfx_id);
+    // 16 hex characters
+    assert_eq!(alert1.wfx_id.len(), 16);
+    assert!(alert1.wfx_id.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
 // =========================================================================
@@ -449,37 +455,11 @@ fn label_cannot_overwrite_key_in_eval_context() {
 }
 
 // =========================================================================
-// Test 14: alert_id unique across same millisecond
+// Test 15: wfx_id is valid 16-hex format with no separators
 // =========================================================================
 
 #[test]
-fn alert_id_unique_across_same_millisecond() {
-    let plan = simple_rule_plan(
-        "r1",
-        default_match_plan(),
-        Expr::Number(50.0),
-        "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
-    );
-    let exec = RuleExecutor::new(plan);
-    let matched = default_matched_context();
-
-    // Two execute_match calls in rapid succession (same millisecond likely)
-    let alert1 = exec.execute_match(&matched).unwrap();
-    let alert2 = exec.execute_match(&matched).unwrap();
-
-    // Even if fired_at is the same, the seq counter makes them unique
-    assert_ne!(alert1.alert_id, alert2.alert_id);
-}
-
-// =========================================================================
-// Test 15: alert_id no separator ambiguity
-// =========================================================================
-
-#[test]
-fn alert_id_no_separator_ambiguity() {
-    // Key values containing "," and "|" should not cause structural ambiguity
-    // because | in key values is percent-encoded to %7C.
+fn wfx_id_hex_format() {
     let match_plan = simple_plan(
         vec![simple_key("tag")],
         vec![step(vec![branch("src", count_ge(1.0))])],
@@ -504,25 +484,14 @@ fn alert_id_no_separator_ambiguity() {
     };
 
     let alert = exec.execute_match(&matched).unwrap();
-    // With percent-encoding, "|" in key value becomes "%7C", so plain split works
-    let parts: Vec<&str> = alert.alert_id.split('|').collect();
-    assert_eq!(
-        parts.len(),
-        3,
-        "alert_id should have exactly 3 '|'-delimited parts, got: {:?}",
-        parts
-    );
-    assert_eq!(parts[0], "r1");
-    // keys_part: "a,b|c" → "a,b%7Cc"
-    assert_eq!(parts[1], "a,b%7Cc");
-    // third part: fired_at#seq
-    assert!(parts[2].contains('#'), "third part should contain '#seq'");
-    // Verify seq is a number after the last '#'
-    let ts_seq: Vec<&str> = parts[2].rsplitn(2, '#').collect();
-    assert_eq!(ts_seq.len(), 2);
+    // wfx_id is exactly 16 hex characters, no separators
+    assert_eq!(alert.wfx_id.len(), 16);
     assert!(
-        ts_seq[0].parse::<u64>().is_ok(),
-        "seq should be a number, got: {}",
-        ts_seq[0]
+        alert.wfx_id.chars().all(|c| c.is_ascii_hexdigit()),
+        "wfx_id should be all hex digits, got: {}",
+        alert.wfx_id
     );
+    // No structural separators
+    assert!(!alert.wfx_id.contains('|'));
+    assert!(!alert.wfx_id.contains('#'));
 }

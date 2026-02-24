@@ -1,16 +1,11 @@
 use arrow::record_batch::RecordBatch;
 
-/// An alert produced by [`RuleExecutor`](crate::rule::RuleExecutor) when the
-/// CEP state machine signals a match or close.
+/// An output record produced by [`RuleExecutor`](crate::rule::RuleExecutor)
+/// when the CEP state machine signals a match or close.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct AlertRecord {
-    /// Composite alert key: `"rule|key1\x1fkey2|fired_at#seq"`.
-    ///
-    /// - Each segment is percent-encoded (`|` → `%7C`, `#` → `%23`) so
-    ///   splitting on literal `|` always yields exactly three parts
-    /// - Keys joined with `\x1f` (unit separator)
-    /// - `seq` is a process-wide monotonic counter for same-millisecond uniqueness
-    pub alert_id: String,
+pub struct OutputRecord {
+    /// SHA-256 content hash (16 hex).
+    pub wfx_id: String,
     /// Name of the rule that fired.
     pub rule_name: String,
     /// Score in `[0, 100]`, clamped.

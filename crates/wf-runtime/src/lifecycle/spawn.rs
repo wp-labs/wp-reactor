@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use wf_config::FusionConfig;
-use wf_core::alert::AlertRecord;
+use wf_core::alert::OutputRecord;
 use wf_core::sink::SinkDispatcher;
 use wf_core::window::{Evictor, Router, WindowRegistry};
 
@@ -28,7 +28,7 @@ use super::types::{RunRule, TaskGroup};
 /// Returns (alert_tx, task_group).
 pub(super) fn spawn_alert_task(
     dispatcher: Arc<SinkDispatcher>,
-) -> (mpsc::Sender<AlertRecord>, TaskGroup) {
+) -> (mpsc::Sender<OutputRecord>, TaskGroup) {
     let (alert_tx, alert_rx) = mpsc::channel(alert_task::ALERT_CHANNEL_CAPACITY);
     let mut group = TaskGroup::new("alert");
     group.push(tokio::spawn(async move {
@@ -64,7 +64,7 @@ pub(super) fn spawn_rule_tasks(
     rules: Vec<RunRule>,
     router: &Arc<Router>,
     schemas: &[wf_lang::WindowSchema],
-    alert_tx: mpsc::Sender<AlertRecord>,
+    alert_tx: mpsc::Sender<OutputRecord>,
     _config: &FusionConfig,
     cancel: CancellationToken,
 ) -> TaskGroup {

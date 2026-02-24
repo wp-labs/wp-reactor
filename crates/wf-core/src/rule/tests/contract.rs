@@ -107,7 +107,7 @@ test five_hits for brute_force {
 "#;
     let result = run_contract_from_source(source);
     assert!(result.passed, "failures: {:?}", result.failures);
-    assert_eq!(result.alert_count, 1);
+    assert_eq!(result.output_count, 1);
 }
 
 #[test]
@@ -133,7 +133,7 @@ test below_threshold for brute_force {
 "#;
     let result = run_contract_from_source(source);
     assert!(result.passed, "failures: {:?}", result.failures);
-    assert_eq!(result.alert_count, 0);
+    assert_eq!(result.output_count, 0);
 }
 
 #[test]
@@ -165,7 +165,7 @@ test test_timeout for timeout_rule {
 "#;
     let result = run_contract_from_source(source);
     assert!(result.passed, "failures: {:?}", result.failures);
-    assert_eq!(result.alert_count, 1);
+    assert_eq!(result.output_count, 1);
 }
 
 #[test]

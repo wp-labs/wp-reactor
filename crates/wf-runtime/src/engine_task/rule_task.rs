@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 
 use tokio::sync::mpsc;
 
-use wf_core::alert::AlertRecord;
+use wf_core::alert::OutputRecord;
 use wf_core::rule::{CepStateMachine, CloseReason, RuleExecutor, StepResult, batch_to_events};
 use wf_core::window::Router;
 
@@ -26,7 +26,7 @@ pub(super) struct RuleTask {
     pub(super) sources: Vec<WindowSource>,
     /// window_name -> Vec<alias>: pre-computed from stream_aliases + window sources.
     aliases: HashMap<String, Vec<String>>,
-    alert_tx: mpsc::Sender<AlertRecord>,
+    alert_tx: mpsc::Sender<OutputRecord>,
     /// window_name -> cursor: tracks read position per window.
     pub(super) cursors: HashMap<String, u64>,
     /// Shared router for WindowLookup (joins + has()).
@@ -189,7 +189,7 @@ impl RuleTask {
 
     // -- Alert emission -----------------------------------------------------
 
-    async fn emit(&self, record: AlertRecord) {
+    async fn emit(&self, record: OutputRecord) {
         if let Err(e) = self.alert_tx.send(record).await {
             wf_warn!(pipe, error = %e, "alert channel closed");
         }

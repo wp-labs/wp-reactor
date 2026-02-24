@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use wf_core::alert::AlertRecord;
+use wf_core::alert::OutputRecord;
 use wf_core::sink::SinkDispatcher;
 
 /// Bounded channel capacity for the alert pipeline.
@@ -12,11 +12,11 @@ pub const ALERT_CHANNEL_CAPACITY: usize = 64;
 /// `SinkDispatcher`.
 ///
 /// Shutdown is driven by channel close: when the scheduler finishes
-/// its drain + flush and drops its `Sender<AlertRecord>`, `rx.recv()` returns
+/// its drain + flush and drops its `Sender<OutputRecord>`, `rx.recv()` returns
 /// `None` and this task exits. After all records are consumed, all sinks in
 /// the dispatcher are gracefully stopped.
 pub async fn run_alert_dispatcher(
-    mut rx: mpsc::Receiver<AlertRecord>,
+    mut rx: mpsc::Receiver<OutputRecord>,
     dispatcher: Arc<SinkDispatcher>,
 ) {
     while let Some(record) = rx.recv().await {
