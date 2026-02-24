@@ -200,14 +200,12 @@ rule multi_src {
 "#;
 
     let base_nanos = 1_700_000_000_000_000_000i64;
-    let ndjson = format!(
-        "{}\n{}",
-        format!(r#"{{"sip":"10.0.0.1","tb":{}}}"#, base_nanos),
-        format!(
+    let ndjson = format!(r#"{{"sip":"10.0.0.1","tb":{}}}"#, base_nanos)
+        + "\n"
+        + &format!(
             r#"{{"sip":"10.0.0.1","tb":{}}}"#,
             base_nanos + 1_000_000_000
-        ),
-    );
+        );
     let reader = BufReader::new(ndjson.as_bytes());
 
     let result = replay_events(wfl, &schemas, reader, "b").expect("replay should succeed");

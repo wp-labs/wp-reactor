@@ -45,7 +45,7 @@ impl ConnectorDefRaw {
     pub fn into_connector_def(self, origin: Option<String>) -> ConnectorDef {
         let default_params: ParamMap = self
             .params
-            .map(|t| parammap_from_toml_table(t))
+            .map(parammap_from_toml_table)
             .unwrap_or_default();
 
         ConnectorDef {

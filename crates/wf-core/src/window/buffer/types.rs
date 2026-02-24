@@ -19,7 +19,7 @@ pub struct WindowParams {
     pub over: Duration,
 }
 
-pub(super) struct TimedBatch {
+pub(in crate::window) struct TimedBatch {
     pub(super) batch: RecordBatch,
     /// (min, max) event time in nanoseconds.
     pub(super) event_time_range: (i64, i64),

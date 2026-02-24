@@ -132,27 +132,4 @@ mod tests {
         overs.insert("unknown_window".into(), Duration::from_secs(300));
         assert!(validate_over_vs_over_cap(&windows, &overs).is_err());
     }
-
-    /// Minimal valid TOML for validation tests.
-    const MINIMAL_TOML: &str = r#"
-sinks = "sinks"
-
-[server]
-listen = "tcp://127.0.0.1:9800"
-
-[runtime]
-executor_parallelism = 1
-rule_exec_timeout = "30s"
-schemas = "*.wfs"
-rules   = "*.wfl"
-
-[window_defaults]
-evict_interval = "30s"
-max_window_bytes = "256MB"
-max_total_bytes = "2GB"
-evict_policy = "time_first"
-watermark = "5s"
-allowed_lateness = "0s"
-late_policy = "drop"
-"#;
 }

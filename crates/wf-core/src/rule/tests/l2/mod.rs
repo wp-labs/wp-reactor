@@ -23,6 +23,8 @@ use crate::rule::match_engine::{
 
 use super::helpers::*;
 
+type TimestampedRows = Vec<(i64, HashMap<String, Value>)>;
+
 // ---------------------------------------------------------------------------
 // Mock WindowLookup
 // ---------------------------------------------------------------------------
@@ -30,7 +32,7 @@ use super::helpers::*;
 struct MockWindowLookup {
     field_values: HashMap<(String, String), HashSet<String>>,
     snapshots: HashMap<String, Vec<HashMap<String, Value>>>,
-    timestamped_snapshots: HashMap<String, Vec<(i64, HashMap<String, Value>)>>,
+    timestamped_snapshots: HashMap<String, TimestampedRows>,
 }
 
 impl MockWindowLookup {

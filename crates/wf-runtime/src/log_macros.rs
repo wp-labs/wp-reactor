@@ -39,6 +39,7 @@ macro_rules! wf_log {
 /// ```ignore
 /// wf_error!(pipe, error = %e, "alert sink write failed");
 /// ```
+#[allow(unused_macros)]
 macro_rules! wf_error {
     ($domain:ident, $($rest:tt)*) => {
         wf_log!(error, $domain, $($rest)*)

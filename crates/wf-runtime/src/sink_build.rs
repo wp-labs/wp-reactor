@@ -16,6 +16,12 @@ pub struct SinkFactoryRegistry {
     factories: HashMap<String, Arc<dyn SinkFactory>>,
 }
 
+impl Default for SinkFactoryRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SinkFactoryRegistry {
     pub fn new() -> Self {
         Self {
