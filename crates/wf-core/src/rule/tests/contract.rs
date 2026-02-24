@@ -61,10 +61,7 @@ fn run_contract_from_source(source: &str) -> crate::rule::contract::TestResult {
     let wfl_file = wf_lang::parse_wfl(source).expect("parse should succeed");
     let plans = wf_lang::compile_wfl(&wfl_file, &schemas).expect("compile should succeed");
 
-    assert!(
-        !wfl_file.tests.is_empty(),
-        "expected at least one test"
-    );
+    assert!(!wfl_file.tests.is_empty(), "expected at least one test");
     let test = &wfl_file.tests[0];
 
     let plan = plans

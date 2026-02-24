@@ -15,10 +15,7 @@ pub fn check_tests(file: &WflFile, errors: &mut Vec<CheckError>) {
                     severity: Severity::Error,
                     rule: None,
                     test: Some(tname.to_string()),
-                    message: format!(
-                        "target rule `{}` not found in this file",
-                        test.rule_name
-                    ),
+                    message: format!("target rule `{}` not found in this file", test.rule_name),
                 });
                 // Can't check row aliases without the target rule
                 continue;

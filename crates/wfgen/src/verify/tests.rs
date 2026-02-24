@@ -204,10 +204,7 @@ fn test_markdown_report_format() {
     let report = verify(&expected, &actual, 0.01, 1.0);
     let md = report.to_markdown();
 
-    assert!(
-        md.contains("## wfgen Verify Report"),
-        "should have header"
-    );
+    assert!(md.contains("## wfgen Verify Report"), "should have header");
     assert!(md.contains("**Status**: FAIL"), "should show FAIL status");
     assert!(md.contains("### Summary"), "should have summary section");
     assert!(

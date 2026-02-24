@@ -103,10 +103,7 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
                         test.name, test.rule_name, e
                     );
                 } else {
-                    eprintln!(
-                        "FAIL  {} ({}) — error: {}",
-                        test.name, test.rule_name, e
-                    );
+                    eprintln!("FAIL  {} ({}) — error: {}", test.name, test.rule_name, e);
                 }
                 failed += 1;
             }
@@ -114,7 +111,8 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
     }
 
     if color {
-        eprintln!("\n{BOLD}{total} tests: {GREEN}{passed} passed{RESET}{BOLD}, {}{failed} failed{RESET}",
+        eprintln!(
+            "\n{BOLD}{total} tests: {GREEN}{passed} passed{RESET}{BOLD}, {}{failed} failed{RESET}",
             if failed > 0 { RED } else { GREEN },
         );
     } else {

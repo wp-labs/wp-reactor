@@ -10,7 +10,7 @@ use wf_config::project::{load_schemas, load_wfl, parse_vars};
 
 fn print_diag(diag: &CheckError, color: bool) {
     let (prefix, code) = match diag.severity {
-        Severity::Error => ("error", "\x1b[1;31m"),   // bold red
+        Severity::Error => ("error", "\x1b[1;31m"), // bold red
         Severity::Warning => ("warning", "\x1b[1;38;5;208m"), // bold orange
     };
     let reset = "\x1b[0m";

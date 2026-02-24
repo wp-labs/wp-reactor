@@ -8,10 +8,7 @@ mod cmd_fmt;
 mod cmd_lint;
 
 #[derive(Parser)]
-#[command(
-    name = "wfl",
-    about = "WarpFusion project tools for rule developers"
-)]
+#[command(name = "wfl", about = "WarpFusion project tools for rule developers")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

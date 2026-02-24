@@ -60,8 +60,7 @@ async fn e2e_datagen_brute_force() {
     let base_dir = manifest_dir.join("../../examples");
     let wfg_path = base_dir.join("scenarios/brute_force.wfg");
     let vars = HashMap::from([("FAIL_THRESHOLD".into(), "3".into())]);
-    let loaded =
-        wfgen::loader::load_scenario(&wfg_path, &vars).expect("failed to load scenario");
+    let loaded = wfgen::loader::load_scenario(&wfg_path, &vars).expect("failed to load scenario");
 
     // ---- Validate scenario ----
     let validation_errors =
@@ -73,9 +72,8 @@ async fn e2e_datagen_brute_force() {
     );
 
     // ---- Generate events ----
-    let gen_result =
-        wfgen::datagen::generate(&loaded.wfg, &loaded.schemas, &loaded.rule_plans)
-            .expect("event generation failed");
+    let gen_result = wfgen::datagen::generate(&loaded.wfg, &loaded.schemas, &loaded.rule_plans)
+        .expect("event generation failed");
     let events = gen_result.events;
     assert!(
         !events.is_empty(),

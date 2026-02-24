@@ -59,10 +59,7 @@ fn print_colored(e: &RuleExplanation) {
                 );
             }
             None => {
-                println!(
-                    "    {CYAN}{}{RESET} {DIM}->{RESET} {}",
-                    b.alias, b.window
-                );
+                println!("    {CYAN}{}{RESET} {DIM}->{RESET} {}", b.alias, b.window);
             }
         }
     }
@@ -103,7 +100,10 @@ fn print_colored(e: &RuleExplanation) {
     );
 
     // Yield
-    println!("  {BOLD}Yield{RESET} {DIM}->{RESET} {CYAN}{}{RESET}:", e.yield_target);
+    println!(
+        "  {BOLD}Yield{RESET} {DIM}->{RESET} {CYAN}{}{RESET}:",
+        e.yield_target
+    );
     let yw = max_field_width(&e.yield_fields);
     for (name, value) in &e.yield_fields {
         println!(

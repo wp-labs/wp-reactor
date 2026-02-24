@@ -34,7 +34,10 @@ pub fn run(files: Vec<PathBuf>, write: bool, check: bool) -> Result<()> {
 
         if tree.root_node().has_error() {
             if color {
-                eprintln!("{RED}error{RESET}: syntax error in {}, skipping", file.display());
+                eprintln!(
+                    "{RED}error{RESET}: syntax error in {}, skipping",
+                    file.display()
+                );
             } else {
                 eprintln!("error: syntax error in {}, skipping", file.display());
             }

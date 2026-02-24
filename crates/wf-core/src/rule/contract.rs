@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use wf_lang::ast::{
-    CloseTrigger, CmpOp, TestBlock, ExpectStmt, Expr, FieldAssign, InputStmt, HitAssert,
+    CloseTrigger, CmpOp, ExpectStmt, Expr, FieldAssign, HitAssert, InputStmt, TestBlock,
 };
 use wf_lang::plan::RulePlan;
 
