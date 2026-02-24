@@ -78,7 +78,7 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
                 buf.push_str(", ");
             }
             if wc > 0 {
-                buf.push_str(&format!("\x1b[33m{wc} warning(s)\x1b[0m"));
+                buf.push_str(&format!("\x1b[38;5;208m{wc} warning(s)\x1b[0m"));
             }
             eprint!("{buf}");
             let _ = std::io::stderr().flush();
