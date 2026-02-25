@@ -259,32 +259,34 @@ base_type     = "chars" | "digit" | "float" | "bool" | "time" | "ip" | "hex" ;
 ## 7. WFL 文法
 
 > L3 特性（`|>`、`conv`、`fixed`）以 `(* L3 *)` 标注。L1/L2 实现可忽略带 L3 标注的产生式。
+>
+> 未实现的产生式以 `(* 未实现 *)` 标注。标注的产生式保留完整语法定义供前瞻参考，当前编译器不解析。
 
 ```ebnf
 wfl_file      = { use_decl } , { rule_decl } , { test_block } ;
 use_decl      = "use" , STRING ;
-rule_decl     = "rule" , IDENT , "{" , [ meta_block ] , [ features_block ] , events_block , stage_chain , [ limits_clause ] , "}" ;
+rule_decl     = "rule" , IDENT , "{" , [ meta_block ] , [ features_block ] (* 已由 pack.yaml 覆盖 *) , events_block , stage_chain , [ limits_clause ] , "}" ;
 
 stage_chain   = stage , { "|>" , stage } , entity_clause , yield_clause , [ conv_clause ] ;  (* |> 和 conv 为 L3 *)
 stage         = match_clause , { join_clause } ;
 
 meta_block    = "meta" , "{" , { IDENT , "=" , STRING } , "}" ;
-features_block= "features" , "[" , IDENT , { "," , IDENT } , "]" ;
+features_block= "features" , "[" , IDENT , { "," , IDENT } , "]" ;        (* 已由 pack.yaml 覆盖 *)
 
 events_block  = "events" , "{" , event_decl , { event_decl } , "}" ;
 event_decl    = IDENT , ":" , IDENT , [ "&&" , expr ] ;
 
-match_clause  = "match" , "<" , match_params , ">" , "{" , [ key_block ] , on_event_block , [ on_close_block ] , [ derive_block ] , "}" , "->" , score_out ;
+match_clause  = "match" , "<" , match_params , ">" , "{" , [ key_block ] , on_event_block , [ on_close_block ] , [ derive_block ] (* L2 未实现 *) , "}" , "->" , score_out ;
 match_params  = [ field_ref , { "," , field_ref } ] , ":" , window_spec ;
 key_block     = "key" , "{" , key_item , { key_item } , "}" ;
 key_item      = IDENT , "=" , field_ref , ";" ;
 window_spec   = DURATION                              (* 滑动窗口 *)
-              | DURATION , ":" , "fixed"              (* 固定间隔窗口，L3 *)
-              | "session" , "(" , DURATION , ")"  ;    (* 会话窗口，L3 行为分析 *)
+              | DURATION , ":" , "fixed"              (* 固定间隔窗口 *)
+              | "session" , "(" , DURATION , ")"  ;    (* 会话窗口，L3 行为分析，未实现 *)
 on_event_block= "on" , "event" , "{" , match_step , { match_step } , "}" ;
 on_close_block= "on" , "close" , "{" , match_step , { match_step } , "}" ;
-derive_block  = "derive" , "{" , derive_item , { derive_item } , "}" ;
-derive_item   = IDENT , "=" , expr , ";" ;
+derive_block  = "derive" , "{" , derive_item , { derive_item } , "}" ;    (* L2 未实现 *)
+derive_item   = IDENT , "=" , expr , ";" ;                               (* L2 未实现 *)
 match_step    = step_branch , { "||" , step_branch } , ";" ;
 step_branch   = [ IDENT , ":" ] , source_ref , [ "." , IDENT | "[" , STRING , "]" ] , [ "&&" , expr ] , pipe_chain ;
 source_ref    = IDENT ;                (* events 别名 或 |> 后续 stage 的 _in *)
@@ -299,8 +301,8 @@ join_cond     = field_ref , "==" , field_ref ;
 
 score_out     = score_expr | score_block ;
 score_expr    = "score" , "(" , expr , ")" ;                                   (* 简洁写法 *)
-score_block   = "score" , "{" , score_item , { score_item } , "}" ;            (* 可解释分项写法 *)
-score_item    = IDENT , "=" , expr , "@" , NUMBER , ";" ;
+score_block   = "score" , "{" , score_item , { score_item } , "}" ;            (* 可解释分项写法，L2 未实现 *)
+score_item    = IDENT , "=" , expr , "@" , NUMBER , ";" ;                      (* L2 未实现 *)
 
 entity_clause = "entity" , "(" , entity_type , "," , expr , ")" ;              (* L1：实体声明，规则必选 *)
 entity_type   = IDENT | STRING ;
@@ -311,10 +313,10 @@ named_arg     = yield_field , "=" , expr ;
 yield_field   = IDENT | IDENT , "." , IDENT , { "." , IDENT } | quoted_ident ;    (* 与 .wfs field_name 对齐 *)
 quoted_ident  = "`" , { ANY - "`" } , "`" ;                                     (* 同 §6.1 .wfs 定义 *)
 
-conv_clause   = "conv" , "{" , conv_chain , { conv_chain } , "}" ;             (* L3 *)
-conv_chain    = conv_step , { "|" , conv_step } , ";" ;
-conv_step     = ("sort" | "top" | "dedup" | "where") , "(" , [ conv_args ] , ")" ;
-conv_args     = expr , { "," , expr } ;
+conv_clause   = "conv" , "{" , conv_chain , { conv_chain } , "}" ;             (* L3，未实现 *)
+conv_chain    = conv_step , { "|" , conv_step } , ";" ;                        (* L3，未实现 *)
+conv_step     = ("sort" | "top" | "dedup" | "where") , "(" , [ conv_args ] , ")" ;  (* L3，未实现 *)
+conv_args     = expr , { "," , expr } ;                                        (* L3，未实现 *)
 
 limits_clause = "limits" , "{" , limit_item , { limit_item } , "}" ;   (* 可选；省略时编译 Warning *)
 limit_item    = "max_memory" , "=" , STRING , ";"
@@ -481,7 +483,7 @@ match<sip:5m> {
 ### 7.4 关键语义
 - OR 分支：任一命中即转移；未命中分支字段为 `null`。
 - `on event`：事件到达时求值；`on close`：窗口关闭时求值（固定窗口到期、session gap 超时、flush 或 eos）。
-- 若省略 `on close`，关闭阶段视为恒为 true，不额外阻断命中。
+- 若省略 `on close`，关闭阶段视为恒为 true，不额外阻断命中。此时命中在事件路径即刻产出，不等待窗口关闭触发。
 - `null` 与运行时异常按 `runtime.eval.mode` 执行（`strict` 或 `lenient`），避免规则结果漂移。
 - `join`：固定 LEFT JOIN 语义。
 - `conv`：仅 `fixed` 可用。
@@ -1261,7 +1263,7 @@ eos_emit_reason = "eos"          # 固定为 eos，供审计
 | CT2 | `input` 中 `row(alias, ...)` 的 `alias` 必须在目标规则 `events {}` 中声明。 |
 | CT3 | `row` 字段名允许 `IDENT` 或 `STRING`（用于 `detail.sha256` 等带点字段）。 |
 | CT4 | `row` 按声明顺序注入；缺失字段按 `null` 处理，类型转换与运行时一致。 |
-| CT5 | `tick(dur)` 推进测试时钟并触发窗口关闭；若未显式 `tick`，测试结束自动按 `options.close_trigger`（默认 `timeout`）收尾。 |
+| CT5 | `tick(dur)` 推进测试时钟并触发窗口关闭；若未显式 `tick`，测试结束自动按 `options.close_trigger`（默认 `eos`）收尾。 |
 | CT6 | `expect { hits ... }` 断言该测试产生的输出条数；`hit[i]` 要求 `0 <= i < hits`。 |
 | CT7 | `hit[i].field("x")` 读取第 `i` 条输出字段；字段不存在或类型不匹配即断言失败。 |
 | CT8 | `options.eval_mode` 仅允许 `strict|lenient`；`options.close_trigger` 仅允许 `timeout|flush|eos`。 |
