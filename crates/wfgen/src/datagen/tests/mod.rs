@@ -95,6 +95,7 @@ fn make_brute_force_plan() -> RulePlan {
         score_plan: ScorePlan {
             expr: Expr::Number(85.0),
         },
+        pattern_origin: None,
         conv_plan: None,
         limits_plan: None,
     }

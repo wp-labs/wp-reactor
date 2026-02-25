@@ -27,8 +27,20 @@ pub struct RulePlan {
     pub entity_plan: EntityPlan,
     pub yield_plan: YieldPlan,
     pub score_plan: ScorePlan,
+    pub pattern_origin: Option<PatternOriginPlan>,
     pub conv_plan: Option<ConvPlan>,
     pub limits_plan: Option<LimitsPlan>,
+}
+
+// ---------------------------------------------------------------------------
+// PatternOriginPlan — tracks pattern origin for explain
+// ---------------------------------------------------------------------------
+
+/// Tracks the pattern origin for `wf explain` display.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatternOriginPlan {
+    pub pattern_name: String,
+    pub args: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

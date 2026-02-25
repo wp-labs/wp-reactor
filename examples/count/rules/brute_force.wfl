@@ -7,7 +7,7 @@ rule brute_force_then_scan {
 
   match<sip:5m> {
     on event {
-      fail | count >= $FAIL_THRESHOLD;
+      fail | count >= ${FAIL_THRESHOLD:3};
     }
     on close {
       fail | count >= 1;

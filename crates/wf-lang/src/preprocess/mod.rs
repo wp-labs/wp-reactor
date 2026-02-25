@@ -210,6 +210,11 @@ fn preprocess_impl(
 
             // --- Normal character ---
             _ => {
+                // --- Pattern block: skip verbatim (avoid ${param} conflict) ---
+                if bytes[i] == b'p' && try_skip_pattern_block(source, &mut i, &mut out) {
+                    continue;
+                }
+
                 let ch = source[i..].chars().next().unwrap();
                 out.push(ch);
                 i += ch.len_utf8();
@@ -226,4 +231,112 @@ fn is_ident_start(b: u8) -> bool {
 
 fn is_ident_cont(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Detect a `pattern name(...) { ... }` block at position `i`.
+///
+/// If confirmed, copies the entire block (including the closing `}`) verbatim
+/// into `out`, advances `*pos` past the block, and returns `true`.
+/// If the text at `*pos` doesn't look like a pattern declaration, returns
+/// `false` without modifying `*pos` or `out`.
+fn try_skip_pattern_block(source: &str, pos: &mut usize, out: &mut String) -> bool {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let start = *pos;
+
+    // Must start with "pattern" keyword and be at a word boundary.
+    let kw = b"pattern";
+    if start + kw.len() > len {
+        return false;
+    }
+    if &bytes[start..start + kw.len()] != kw {
+        return false;
+    }
+    // Ensure it's not a prefix of a longer identifier.
+    let after_kw = start + kw.len();
+    if after_kw < len && is_ident_cont(bytes[after_kw]) {
+        return false;
+    }
+    // Ensure it's not in the middle of a longer identifier (check char before).
+    if start > 0 && is_ident_cont(bytes[start - 1]) {
+        return false;
+    }
+
+    // Look ahead: skip whitespace, expect ident, skip whitespace, expect '('
+    let mut j = after_kw;
+    // skip whitespace
+    while j < len && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    // expect ident
+    if j >= len || !is_ident_start(bytes[j]) {
+        return false;
+    }
+    while j < len && is_ident_cont(bytes[j]) {
+        j += 1;
+    }
+    // skip whitespace
+    while j < len && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    // expect '('
+    if j >= len || bytes[j] != b'(' {
+        return false;
+    }
+
+    // Confirmed: this is a pattern block. Now copy everything verbatim
+    // until we find the opening '{' of the body, then copy the balanced body.
+
+    // First, copy up to and including the opening '{' of the body.
+    // Skip past the '(' params ')' section.
+    let mut k = j + 1; // past '('
+    let mut paren_depth = 1;
+    while k < len && paren_depth > 0 {
+        match bytes[k] {
+            b'(' => paren_depth += 1,
+            b')' => paren_depth -= 1,
+            _ => {}
+        }
+        k += 1;
+    }
+    // Skip whitespace to find '{'
+    while k < len && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    if k >= len || bytes[k] != b'{' {
+        return false;
+    }
+    k += 1; // past '{'
+
+    // Now copy verbatim while tracking brace depth inside the body.
+    let mut brace_depth = 1;
+    while k < len && brace_depth > 0 {
+        match bytes[k] {
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth -= 1,
+            b'"' => {
+                // Skip string literal inside body.
+                k += 1;
+                while k < len && bytes[k] != b'"' {
+                    k += 1;
+                }
+                // k now points at closing '"' or end; the loop increment below handles it.
+            }
+            b'#' => {
+                // Skip comment inside body.
+                while k < len && bytes[k] != b'\n' {
+                    k += 1;
+                }
+                // k now points at '\n' or end; the loop increment below handles it.
+                continue; // don't double-advance
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+
+    // Copy the entire block verbatim [start..k).
+    out.push_str(&source[start..k]);
+    *pos = k;
+    true
 }

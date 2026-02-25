@@ -18,6 +18,7 @@ use sections::{
 #[derive(Debug)]
 pub struct RuleExplanation {
     pub name: String,
+    pub pattern_origin: Option<(String, Vec<String>)>,
     pub bindings: Vec<BindingExpl>,
     pub match_expl: MatchExpl,
     pub score: String,
@@ -66,9 +67,13 @@ fn explain_rule(plan: &RulePlan, schemas: &[WindowSchema]) -> RuleExplanation {
     let conv = plan.conv_plan.as_ref().map(explain_conv);
     let limits = plan.limits_plan.as_ref().map(explain_limits);
     let lineage = compute_lineage(&plan.binds, &plan.yield_plan, schemas);
+    let pattern_origin = plan.pattern_origin.as_ref().map(|po| {
+        (po.pattern_name.clone(), po.args.clone())
+    });
 
     RuleExplanation {
         name: plan.name.clone(),
+        pattern_origin,
         bindings,
         match_expl,
         score,

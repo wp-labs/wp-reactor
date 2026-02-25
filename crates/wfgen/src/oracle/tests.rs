@@ -51,6 +51,7 @@ fn make_simple_rule_plan() -> RulePlan {
         score_plan: ScorePlan {
             expr: Expr::Number(85.0),
         },
+        pattern_origin: None,
         conv_plan: None,
         limits_plan: None,
     }
@@ -208,6 +209,7 @@ fn multi_alias_same_window_both_receive_events() {
         score_plan: ScorePlan {
             expr: Expr::Number(90.0),
         },
+        pattern_origin: None,
         conv_plan: None,
         limits_plan: None,
     };
@@ -358,6 +360,7 @@ fn conv_top_filters_non_qualifying() {
         score_plan: ScorePlan {
             expr: Expr::Number(80.0),
         },
+        pattern_origin: None,
         conv_plan: Some(ConvPlan {
             chains: vec![ConvChainPlan {
                 ops: vec![

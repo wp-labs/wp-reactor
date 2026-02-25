@@ -209,3 +209,78 @@ rule brute_force {
     let file = parse_wfl(&processed).unwrap();
     assert_eq!(file.rules.len(), 1);
 }
+
+// --- Pattern block skipping ---
+
+#[test]
+fn pattern_body_not_substituted() {
+    // ${key} inside pattern body must NOT be treated as a preprocessor variable.
+    // Only the outer $key should be substituted.
+    let v = vars(&[("key", "sip")]);
+    let source = r#"
+pattern burst(alias, key, win, threshold) {
+    match<${key}:${win}> {
+        on event { ${alias} | count >= ${threshold}; }
+    } -> score(50.0)
+}
+
+rule r {
+    events { e : $key }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(1)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let processed = preprocess_vars(source, &v).unwrap();
+    // The ${key} inside the pattern body should still be ${key}
+    assert!(
+        processed.contains("${key}"),
+        "pattern body should not have ${{key}} substituted: {}",
+        processed
+    );
+    // The $key outside the pattern body should be substituted
+    assert!(
+        processed.contains("events { e : sip }"),
+        "outer $key should be substituted: {}",
+        processed
+    );
+}
+
+#[test]
+fn pattern_body_with_nested_braces() {
+    let v = vars(&[("THRESHOLD", "10")]);
+    let source = r#"
+pattern nested(a, b) {
+    match<${a}:5m> {
+        on event {
+            ${b} | count >= 1;
+        }
+    } -> score(50.0)
+}
+
+rule r {
+    events { e : win }
+    match<sip:5m> { on event { e | count >= $THRESHOLD; } } -> score(1)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let processed = preprocess_vars(source, &v).unwrap();
+    // The ${a} and ${b} inside the pattern body should be preserved
+    assert!(
+        processed.contains("${a}"),
+        "nested pattern body should not substitute ${{a}}: {}",
+        processed
+    );
+    assert!(
+        processed.contains("${b}"),
+        "nested pattern body should not substitute ${{b}}: {}",
+        processed
+    );
+    // The $THRESHOLD in the rule body should be substituted
+    assert!(
+        processed.contains("count >= 10"),
+        "outer $THRESHOLD should be substituted: {}",
+        processed
+    );
+}

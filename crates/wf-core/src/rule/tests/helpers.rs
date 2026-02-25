@@ -153,6 +153,7 @@ pub fn simple_rule_plan(
             fields: vec![],
         },
         score_plan: ScorePlan { expr: score_expr },
+        pattern_origin: None,
         conv_plan: None,
         limits_plan: None,
     }

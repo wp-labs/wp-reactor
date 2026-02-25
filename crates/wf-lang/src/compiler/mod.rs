@@ -4,8 +4,8 @@ use crate::ast::{EntityTypeVal, FieldRef, RuleDecl, WflFile, WindowMode};
 use crate::checker::check_wfl;
 use crate::plan::{
     AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, EntityPlan, ExceedAction,
-    JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, RateSpec, RulePlan, ScorePlan,
-    SortKeyPlan, StepPlan, WindowSpec, YieldField, YieldPlan,
+    JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, PatternOriginPlan, RateSpec,
+    RulePlan, ScorePlan, SortKeyPlan, StepPlan, WindowSpec, YieldField, YieldPlan,
 };
 use crate::schema::WindowSchema;
 
@@ -43,6 +43,10 @@ fn compile_rule(rule: &RuleDecl) -> anyhow::Result<RulePlan> {
         entity_plan: compile_entity(rule),
         yield_plan: compile_yield(rule),
         score_plan: compile_score(rule),
+        pattern_origin: rule.pattern_origin.as_ref().map(|po| PatternOriginPlan {
+            pattern_name: po.pattern_name.clone(),
+            args: po.args.clone(),
+        }),
         conv_plan: compile_conv(&rule.conv),
         limits_plan: compile_limits(&rule.limits),
     })

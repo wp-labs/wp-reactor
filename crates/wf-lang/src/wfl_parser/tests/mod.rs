@@ -7,3 +7,4 @@ mod errors;
 mod examples;
 mod expr;
 mod match_;
+mod pattern;

@@ -9,8 +9,29 @@ use super::*;
 #[non_exhaustive]
 pub struct WflFile {
     pub uses: Vec<UseDecl>,
+    pub patterns: Vec<PatternDecl>,
     pub rules: Vec<RuleDecl>,
     pub tests: Vec<TestBlock>,
+}
+
+/// A pattern declaration: `pattern name(params) { body }`
+///
+/// The body is stored as raw text containing a `match<...> { ... } -> score(...)`.
+/// When a rule invokes the pattern, parameters are textually substituted and the
+/// body is parsed as a concrete `MatchClause` + `ScoreExpr`.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct PatternDecl {
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: String,
+}
+
+/// Tracks which pattern was used to generate the match clause (for `wf explain`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatternOrigin {
+    pub pattern_name: String,
+    pub args: Vec<String>,
 }
 
 /// `use "path.wfs"`
@@ -36,6 +57,7 @@ pub struct RuleDecl {
     pub joins: Vec<JoinClause>,
     pub entity: EntityClause,
     pub yield_clause: YieldClause,
+    pub pattern_origin: Option<PatternOrigin>,
     pub conv: Option<ConvClause>,
     pub limits: Option<LimitsBlock>,
 }

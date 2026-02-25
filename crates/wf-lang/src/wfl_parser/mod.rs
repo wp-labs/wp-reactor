@@ -8,6 +8,7 @@ mod conv_p;
 mod events;
 mod expr;
 mod match_p;
+mod pattern_p;
 mod rule;
 
 use crate::ast::*;
@@ -34,10 +35,19 @@ pub fn parse_wfl(input: &str) -> anyhow::Result<WflFile> {
 fn wfl_file(input: &mut &str) -> ModalResult<WflFile> {
     ws_skip.parse_next(input)?;
     let uses: Vec<UseDecl> = repeat(0.., use_decl).parse_next(input)?;
-    let rules: Vec<RuleDecl> = repeat(0.., rule::rule_decl).parse_next(input)?;
+    let patterns: Vec<PatternDecl> = repeat(0.., pattern_p::pattern_decl).parse_next(input)?;
+    let rules: Vec<RuleDecl> = repeat(0.., |input: &mut &str| {
+        rule::rule_decl_with_patterns(input, &patterns)
+    })
+    .parse_next(input)?;
     let tests: Vec<TestBlock> = repeat(0.., contract::test_block).parse_next(input)?;
     ws_skip.parse_next(input)?;
-    Ok(WflFile { uses, rules, tests })
+    Ok(WflFile {
+        uses,
+        patterns,
+        rules,
+        tests,
+    })
 }
 
 // ---------------------------------------------------------------------------

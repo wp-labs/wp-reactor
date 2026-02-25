@@ -6,6 +6,11 @@ impl fmt::Display for RuleExplanation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Rule: {}", self.name)?;
 
+        // Pattern origin (if rule was expanded from a pattern)
+        if let Some((ref pat_name, ref args)) = self.pattern_origin {
+            writeln!(f, "  Pattern: {}({})", pat_name, args.join(", "))?;
+        }
+
         // Bindings
         writeln!(f, "  Bindings:")?;
         for b in &self.bindings {

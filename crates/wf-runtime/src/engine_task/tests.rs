@@ -181,6 +181,7 @@ fn make_task_with_window_bytes(
         score_plan: ScorePlan {
             expr: Expr::Number(70.0),
         },
+        pattern_origin: None,
         conv_plan: None,
         limits_plan: None,
     };
