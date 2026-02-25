@@ -225,3 +225,138 @@ rule multi_src {
         alert.fired_at
     );
 }
+
+// ===========================================================================
+// Conv + mixed qualifying/non-qualifying: cross-layer e2e
+// ===========================================================================
+
+fn make_conn_events_schema() -> WindowSchema {
+    WindowSchema {
+        name: "conn_events".to_string(),
+        streams: vec!["netflow".to_string()],
+        time_field: Some("event_time".to_string()),
+        over: Duration::from_secs(1800),
+        fields: vec![
+            FieldDef {
+                name: "sip".to_string(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "dport".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "action".to_string(),
+                field_type: FieldType::Base(BaseType::Chars),
+            },
+            FieldDef {
+                name: "event_time".to_string(),
+                field_type: FieldType::Base(BaseType::Time),
+            },
+        ],
+    }
+}
+
+fn make_network_alerts_schema() -> WindowSchema {
+    WindowSchema {
+        name: "network_alerts".to_string(),
+        streams: vec![],
+        time_field: None,
+        over: Duration::ZERO,
+        fields: vec![
+            FieldDef {
+                name: "sip".to_string(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "alert_type".to_string(),
+                field_type: FieldType::Base(BaseType::Chars),
+            },
+        ],
+    }
+}
+
+/// Conv with mixed qualifying/non-qualifying outputs in the replay path.
+///
+/// 4 IPs feed into a fixed-window rule with `on close { scan >= 3 }` and
+/// `conv { sort(-scan) | top(2) }`. Three IPs qualify (scan ≥ 3), one does
+/// not (scan = 2). Conv must operate only on qualifying outputs, keeping
+/// the top 2 by scan count. The non-qualifying IP must not steal a top(2)
+/// slot or produce a spurious alert.
+#[test]
+fn replay_conv_top_with_mixed_qualifying() {
+    let schemas = vec![make_conn_events_schema(), make_network_alerts_schema()];
+
+    let wfl = r#"
+rule conv_mixed {
+    events { c : conn_events && action == "syn" }
+    match<sip:1h:fixed> {
+        on event { c | count >= 1; }
+        on close { scan: c.dport | distinct | count >= 3; }
+    } -> score(80.0)
+    entity(ip, c.sip)
+    yield network_alerts (sip = c.sip, alert_type = "scan")
+    conv { sort(-scan) | top(2) ; }
+}
+"#;
+
+    let base = 1_700_000_000_000_000_000i64;
+    let sec = 1_000_000_000i64;
+    let mut lines = Vec::new();
+    let mut t = 0i64;
+
+    // IP-A: 5 distinct ports → qualifying (scan=5)
+    for port in [80, 443, 8080, 22, 3306] {
+        t += 1;
+        lines.push(format!(
+            r#"{{"sip":"10.0.0.1","dport":{},"action":"syn","event_time":{}}}"#,
+            port,
+            base + t * sec
+        ));
+    }
+
+    // IP-B: 4 distinct ports → qualifying (scan=4)
+    for port in [80, 443, 8080, 22] {
+        t += 1;
+        lines.push(format!(
+            r#"{{"sip":"10.0.0.2","dport":{},"action":"syn","event_time":{}}}"#,
+            port,
+            base + t * sec
+        ));
+    }
+
+    // IP-C: 3 distinct ports → qualifying (scan=3)
+    for port in [80, 443, 8080] {
+        t += 1;
+        lines.push(format!(
+            r#"{{"sip":"10.0.0.3","dport":{},"action":"syn","event_time":{}}}"#,
+            port,
+            base + t * sec
+        ));
+    }
+
+    // IP-D: 2 distinct ports → NON-qualifying (scan=2 < 3)
+    for port in [80, 443] {
+        t += 1;
+        lines.push(format!(
+            r#"{{"sip":"10.0.0.4","dport":{},"action":"syn","event_time":{}}}"#,
+            port,
+            base + t * sec
+        ));
+    }
+
+    let ndjson = lines.join("\n");
+    let reader = BufReader::new(ndjson.as_bytes());
+
+    let result =
+        replay_events(wfl, &schemas, reader, "c", false).expect("replay should succeed");
+
+    // 3 qualifying outputs, conv top(2) keeps 2; IP-D non-qualifying → no alert
+    assert_eq!(result.match_count, 2, "expected 2 alerts after conv top(2)");
+    assert_eq!(result.alerts.len(), 2);
+
+    // Alerts should be for IP-A (scan=5) and IP-B (scan=4) after sort(-scan)
+    let mut entity_ids: Vec<&str> = result.alerts.iter().map(|a| a.entity_id.as_str()).collect();
+    entity_ids.sort();
+    assert_eq!(entity_ids, vec!["10.0.0.1", "10.0.0.2"]);
+}

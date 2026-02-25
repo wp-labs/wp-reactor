@@ -89,3 +89,54 @@ test below_threshold for top_port_scanners {
         close_trigger = timeout;
     }
 }
+
+# -----------------------------------------------------------------------
+# Cross-layer e2e: mixed qualifying/non-qualifying outputs with conv.
+#
+# 4 IPs in the same fixed window:
+#   - IP-A (10.0.0.1): 5 distinct ports → qualifying (scan=5)
+#   - IP-B (10.0.0.2): 4 distinct ports → qualifying (scan=4)
+#   - IP-C (10.0.0.3): 3 distinct ports → qualifying (scan=3)
+#   - IP-D (10.0.0.4): 2 distinct ports → NON-qualifying (scan=2 < 3)
+#
+# Conv sort(-scan) | top(2) must operate only on the 3 qualifying
+# outputs, keeping the top 2 (IP-A and IP-B). The non-qualifying
+# IP-D is filtered out before conv, so it cannot steal a top(2) slot.
+# -----------------------------------------------------------------------
+
+test conv_mixed_qualifying for top_port_scanners {
+    input {
+        # IP-A: 5 distinct ports → scan=5, qualifying
+        row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "80",    action = "syn", event_time = "2026-01-01T00:00:01Z");
+        row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443",   action = "syn", event_time = "2026-01-01T00:00:02Z");
+        row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "8080",  action = "syn", event_time = "2026-01-01T00:00:03Z");
+        row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "22",    action = "syn", event_time = "2026-01-01T00:00:04Z");
+        row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "3306",  action = "syn", event_time = "2026-01-01T00:00:05Z");
+
+        # IP-B: 4 distinct ports → scan=4, qualifying
+        row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "80",    action = "syn", event_time = "2026-01-01T00:00:06Z");
+        row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "443",   action = "syn", event_time = "2026-01-01T00:00:07Z");
+        row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "8080",  action = "syn", event_time = "2026-01-01T00:00:08Z");
+        row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "22",    action = "syn", event_time = "2026-01-01T00:00:09Z");
+
+        # IP-C: 3 distinct ports → scan=3, qualifying
+        row(c, sip = "10.0.0.3", dip = "192.168.1.1", dport = "80",    action = "syn", event_time = "2026-01-01T00:00:10Z");
+        row(c, sip = "10.0.0.3", dip = "192.168.1.1", dport = "443",   action = "syn", event_time = "2026-01-01T00:00:11Z");
+        row(c, sip = "10.0.0.3", dip = "192.168.1.1", dport = "8080",  action = "syn", event_time = "2026-01-01T00:00:12Z");
+
+        # IP-D: 2 distinct ports → scan=2 < 3, NON-qualifying (close_ok=false)
+        row(c, sip = "10.0.0.4", dip = "192.168.1.1", dport = "80",    action = "syn", event_time = "2026-01-01T00:00:13Z");
+        row(c, sip = "10.0.0.4", dip = "192.168.1.1", dport = "443",   action = "syn", event_time = "2026-01-01T00:00:14Z");
+
+        tick(2h);
+    }
+    expect {
+        # 3 qualifying, conv top(2) keeps 2; non-qualifying IP-D produces no alert
+        hits == 2;
+        hit[0].entity_id == "10.0.0.1";
+        hit[1].entity_id == "10.0.0.2";
+    }
+    options {
+        close_trigger = timeout;
+    }
+}
