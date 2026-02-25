@@ -9,7 +9,7 @@ rule brute_force_then_scan {
     on event {
       fail | count >= ${FAIL_THRESHOLD:3};
     }
-    on close {
+    and close {
       fail | count >= 1;
     }
   } -> score(70.0)
@@ -32,7 +32,7 @@ test close_hit for brute_force_then_scan {
   expect {
     hits == 1;
     hit[0].score == 70.0;
-    hit[0].close_reason == "eos";
+    hit[0].origin == "close:eos";
     hit[0].entity_type == "ip";
     hit[0].entity_id == "10.0.0.1";
   }

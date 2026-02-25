@@ -35,7 +35,11 @@ impl fmt::Display for RuleExplanation {
             }
         }
         if !self.match_expl.close_steps.is_empty() {
-            writeln!(f, "    on close:")?;
+            let label = match self.match_expl.close_mode {
+                Some(crate::ast::CloseMode::And) => "and close:",
+                _ => "on close:",
+            };
+            writeln!(f, "    {}", label)?;
             for (i, step) in self.match_expl.close_steps.iter().enumerate() {
                 writeln!(f, "      step {}: {}", i + 1, step)?;
             }

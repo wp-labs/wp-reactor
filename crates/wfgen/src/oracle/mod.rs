@@ -17,7 +17,7 @@ pub struct OracleAlert {
     pub score: f64,
     pub entity_type: String,
     pub entity_id: String,
-    pub close_reason: Option<String>,
+    pub origin: String,
     /// ISO 8601 — logical time (triggering event's timestamp).
     pub emit_time: String,
 }
@@ -76,10 +76,9 @@ pub fn run_oracle(
 
         for engine in &mut engines {
             // Scan for expired instances first (with conv)
-            let expired =
-                engine
-                    .sm
-                    .scan_expired_at_with_conv(event_nanos, engine.conv_plan.as_ref());
+            let expired = engine
+                .sm
+                .scan_expired_at_with_conv(event_nanos, engine.conv_plan.as_ref());
             for close_out in expired {
                 if let Ok(Some(alert_record)) = engine.executor.execute_close(&close_out) {
                     alerts.push(OracleAlert {
@@ -87,7 +86,7 @@ pub fn run_oracle(
                         score: alert_record.score,
                         entity_type: alert_record.entity_type,
                         entity_id: alert_record.entity_id,
-                        close_reason: alert_record.close_reason,
+                        origin: alert_record.origin.as_str().to_string(),
                         emit_time: alert_record.fired_at.clone(),
                     });
                 }
@@ -111,7 +110,7 @@ pub fn run_oracle(
                         score: alert_record.score,
                         entity_type: alert_record.entity_type,
                         entity_id: alert_record.entity_id,
-                        close_reason: None,
+                        origin: alert_record.origin.as_str().to_string(),
                         emit_time: alert_record.fired_at.clone(),
                     });
                 }
@@ -125,10 +124,9 @@ pub fn run_oracle(
     let eos_nanos = eos_time.timestamp_nanos_opt().unwrap_or(i64::MAX);
 
     for engine in &mut engines {
-        let expired =
-            engine
-                .sm
-                .scan_expired_at_with_conv(eos_nanos, engine.conv_plan.as_ref());
+        let expired = engine
+            .sm
+            .scan_expired_at_with_conv(eos_nanos, engine.conv_plan.as_ref());
 
         for close_out in expired {
             if let Ok(Some(alert_record)) = engine.executor.execute_close(&close_out) {
@@ -137,7 +135,7 @@ pub fn run_oracle(
                     score: alert_record.score,
                     entity_type: alert_record.entity_type,
                     entity_id: alert_record.entity_id,
-                    close_reason: alert_record.close_reason,
+                    origin: alert_record.origin.as_str().to_string(),
                     emit_time: alert_record.fired_at.clone(),
                 });
             }

@@ -57,7 +57,10 @@ rule brute_force {
 
     // Match clause should be expanded from pattern
     assert_eq!(rule.match_clause.keys, vec![FieldRef::Simple("sip".into())]);
-    assert_eq!(rule.match_clause.duration, std::time::Duration::from_secs(300));
+    assert_eq!(
+        rule.match_clause.duration,
+        std::time::Duration::from_secs(300)
+    );
     assert_eq!(rule.match_clause.on_event.len(), 1);
     assert_eq!(rule.match_clause.on_event[0].branches[0].source, "e");
 
@@ -65,7 +68,10 @@ rule brute_force {
     assert_eq!(rule.score.expr, Expr::Number(50.0));
 
     // Pattern origin should be recorded
-    let origin = rule.pattern_origin.as_ref().expect("pattern_origin should be Some");
+    let origin = rule
+        .pattern_origin
+        .as_ref()
+        .expect("pattern_origin should be Some");
     assert_eq!(origin.pattern_name, "burst");
     assert_eq!(origin.args, vec!["e", "sip", "5m", "5"]);
 }
@@ -141,7 +147,9 @@ rule r2 {
     let origin2 = file.rules[1].pattern_origin.as_ref().unwrap();
     assert_eq!(origin2.pattern_name, "scan");
     assert_eq!(
-        file.rules[1].match_clause.on_event[0].branches[0].pipe.transforms,
+        file.rules[1].match_clause.on_event[0].branches[0]
+            .pipe
+            .transforms,
         vec![Transform::Distinct]
     );
 }
@@ -196,5 +204,8 @@ rule r {
     let file = parse_wfl(input).unwrap();
     let rule = &file.rules[0];
     assert_eq!(rule.match_clause.window_mode, WindowMode::Fixed);
-    assert_eq!(rule.match_clause.duration, std::time::Duration::from_secs(3600));
+    assert_eq!(
+        rule.match_clause.duration,
+        std::time::Duration::from_secs(3600)
+    );
 }

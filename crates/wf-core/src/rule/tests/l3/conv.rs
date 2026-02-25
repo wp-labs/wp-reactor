@@ -15,6 +15,8 @@ fn make_close_output(
         close_reason: CloseReason::Timeout,
         event_ok: true,
         close_ok: true,
+        close_mode: CloseMode::And,
+        event_emitted: false,
         event_step_data,
         close_step_data,
         watermark_nanos: 0,
@@ -294,7 +296,11 @@ fn scan_expired_at_with_conv_applies_transformations() {
     let plan = fixed_plan_with_close(
         vec![simple_key("sip")],
         dur,
-        vec![step(vec![branch_with_label("fail", "count", count_ge(1.0))])],
+        vec![step(vec![branch_with_label(
+            "fail",
+            "count",
+            count_ge(1.0),
+        )])],
         vec![step(vec![branch("close_scan", count_ge(0.0))])],
     );
     let mut sm = CepStateMachine::new("r_conv".to_string(), plan, None);
@@ -366,21 +372,9 @@ fn conv_empty_outputs_noop() {
 #[test]
 fn conv_sort_by_scope_key() {
     let outputs = vec![
-        make_close_output(
-            vec![Value::Str("charlie".into())],
-            vec![],
-            vec![],
-        ),
-        make_close_output(
-            vec![Value::Str("alpha".into())],
-            vec![],
-            vec![],
-        ),
-        make_close_output(
-            vec![Value::Str("bravo".into())],
-            vec![],
-            vec![],
-        ),
+        make_close_output(vec![Value::Str("charlie".into())], vec![], vec![]),
+        make_close_output(vec![Value::Str("alpha".into())], vec![], vec![]),
+        make_close_output(vec![Value::Str("bravo".into())], vec![], vec![]),
     ];
 
     let plan = make_conv_plan(vec![vec![ConvOpPlan::Sort(vec![SortKeyPlan {

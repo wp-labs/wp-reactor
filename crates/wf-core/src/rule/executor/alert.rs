@@ -1,6 +1,7 @@
 use sha2::{Digest, Sha256};
 use wf_lang::ast::FieldRef;
 
+use crate::alert::AlertOrigin;
 use crate::rule::match_engine::{StepData, Value, field_ref_name, value_to_string};
 
 /// Format nanoseconds since epoch as ISO 8601 UTC string.
@@ -46,14 +47,14 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// Build a content-addressed output ID (16 hex chars from SHA-256).
 ///
-/// Feeds rule_name, scope_key, fired_at, step_data, and close_reason
+/// Feeds rule_name, scope_key, fired_at, step_data, and origin
 /// into a SHA-256 hasher, then takes the first 8 bytes as 16 hex characters.
 pub(super) fn build_wfx_id(
     rule_name: &str,
     scope_key: &[Value],
     fired_at: &str,
     step_data: &[StepData],
-    close_reason: Option<&str>,
+    origin: &AlertOrigin,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(rule_name.as_bytes());
@@ -74,9 +75,7 @@ pub(super) fn build_wfx_id(
         hasher.update(b"\x1f");
     }
     hasher.update(b"\x00");
-    if let Some(reason) = close_reason {
-        hasher.update(reason.as_bytes());
-    }
+    hasher.update(origin.as_str().as_bytes());
     let hash = hasher.finalize();
     // First 8 bytes → 16 hex characters
     hex_encode(&hash[..8])
@@ -97,7 +96,7 @@ pub(super) fn build_summary(
     keys: &[FieldRef],
     scope_key: &[Value],
     step_data: &[StepData],
-    close_reason: Option<&str>,
+    origin: &AlertOrigin,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -122,9 +121,7 @@ pub(super) fn build_summary(
         parts.push(label_part);
     }
 
-    if let Some(reason) = close_reason {
-        parts.push(format!("close_reason={}", reason));
-    }
+    parts.push(format!("origin={}", origin.as_str()));
 
     parts.join("; ")
 }

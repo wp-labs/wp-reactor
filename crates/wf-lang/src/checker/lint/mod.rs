@@ -15,7 +15,7 @@ const SYSTEM_FIELD_NAMES: &[&str] = &[
     "score",
     "entity_type",
     "entity_id",
-    "close_reason",
+    "origin",
     "score_contrib",
 ];
 
@@ -37,8 +37,8 @@ pub fn lint_wfl(file: &WflFile, _schemas: &[WindowSchema]) -> Vec<CheckError> {
 
         // W004 + W005: threshold/score zero checks
         lint_steps(&rule.match_clause.on_event, name, &mut warnings);
-        if let Some(ref close_steps) = rule.match_clause.on_close {
-            lint_steps(close_steps, name, &mut warnings);
+        if let Some(ref close_block) = rule.match_clause.on_close {
+            lint_steps(&close_block.steps, name, &mut warnings);
         }
 
         // W005: score always zero
@@ -61,8 +61,8 @@ fn lint_unused_alias(rule: &crate::ast::RuleDecl, rule_name: &str, warnings: &mu
 
     // Collect aliases referenced in match steps
     collect_step_sources(&rule.match_clause.on_event, &mut used);
-    if let Some(ref close_steps) = rule.match_clause.on_close {
-        collect_step_sources(close_steps, &mut used);
+    if let Some(ref close_block) = rule.match_clause.on_close {
+        collect_step_sources(&close_block.steps, &mut used);
     }
 
     // Collect aliases referenced in score expression

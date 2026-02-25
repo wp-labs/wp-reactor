@@ -54,9 +54,9 @@ fn match_clause(input: &mut &str) -> ModalResult<MatchClause> {
         )))
         .parse_next(input)?;
 
-    // on close block (optional)
+    // close block: "on close {...}" (OR) or "and close {...}" (AND)
     ws_skip.parse_next(input)?;
-    let on_close = opt(on_close_block).parse_next(input)?;
+    let on_close = opt(close_block).parse_next(input)?;
 
     ws_skip.parse_next(input)?;
     cut_err(literal("}")).parse_next(input)?;
@@ -186,15 +186,18 @@ fn on_event_block(input: &mut &str) -> ModalResult<Vec<MatchStep>> {
     Ok(steps)
 }
 
-fn on_close_block(input: &mut &str) -> ModalResult<Vec<MatchStep>> {
-    kw("on").parse_next(input)?;
-    ws_skip.parse_next(input)?;
-    cut_err(kw("close")).parse_next(input)?;
+fn close_block(input: &mut &str) -> ModalResult<CloseBlock> {
+    // Try "and close" first (AND mode), then "on close" (OR mode)
+    let mode = alt((
+        (kw("and"), ws_skip, kw("close")).map(|_| CloseMode::And),
+        (kw("on"), ws_skip, kw("close")).map(|_| CloseMode::Or),
+    ))
+    .parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal("{")).parse_next(input)?;
     let steps = match_steps(input)?;
     cut_err(literal("}")).parse_next(input)?;
-    Ok(steps)
+    Ok(CloseBlock { mode, steps })
 }
 
 fn match_steps(input: &mut &str) -> ModalResult<Vec<MatchStep>> {

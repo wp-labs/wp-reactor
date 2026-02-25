@@ -75,6 +75,8 @@ impl CloseReason {
     }
 }
 
+use wf_lang::ast::CloseMode;
+
 /// Output produced when an instance is closed (by timeout, flush, or eos).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CloseOutput {
@@ -83,6 +85,8 @@ pub struct CloseOutput {
     pub close_reason: CloseReason,
     pub event_ok: bool,
     pub close_ok: bool,
+    pub close_mode: CloseMode,
+    pub event_emitted: bool,
     pub event_step_data: Vec<StepData>,
     pub close_step_data: Vec<StepData>,
     pub watermark_nanos: i64,

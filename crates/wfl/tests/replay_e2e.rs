@@ -117,7 +117,7 @@ rule eos_close {
     events { e : auth_events }
     match<sip:5m> {
         on event { e | count >= 1; }
-        on close { close_count: e | count >= 1; }
+        and close { close_count: e | count >= 1; }
     } -> score(80.0)
     entity(ip, e.sip)
     yield security_alerts (sip = e.sip, fail_count = 1)
@@ -292,7 +292,7 @@ rule conv_mixed {
     events { c : conn_events && action == "syn" }
     match<sip:1h:fixed> {
         on event { c | count >= 1; }
-        on close { scan: c.dport | distinct | count >= 3; }
+        and close { scan: c.dport | distinct | count >= 3; }
     } -> score(80.0)
     entity(ip, c.sip)
     yield network_alerts (sip = c.sip, alert_type = "scan")
@@ -348,8 +348,7 @@ rule conv_mixed {
     let ndjson = lines.join("\n");
     let reader = BufReader::new(ndjson.as_bytes());
 
-    let result =
-        replay_events(wfl, &schemas, reader, "c", false).expect("replay should succeed");
+    let result = replay_events(wfl, &schemas, reader, "c", false).expect("replay should succeed");
 
     // 3 qualifying outputs, conv top(2) keeps 2; IP-D non-qualifying → no alert
     assert_eq!(result.match_count, 2, "expected 2 alerts after conv top(2)");

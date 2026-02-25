@@ -1,4 +1,70 @@
+use std::fmt;
+
 use arrow::record_batch::RecordBatch;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::rule::CloseReason;
+
+/// Which path produced this alert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlertOrigin {
+    Event,
+    Close { reason: CloseReason },
+}
+
+impl AlertOrigin {
+    /// Canonical string form: `"event"`, `"close:timeout"`, `"close:flush"`, `"close:eos"`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AlertOrigin::Event => "event",
+            AlertOrigin::Close { reason } => match reason {
+                CloseReason::Timeout => "close:timeout",
+                CloseReason::Flush => "close:flush",
+                CloseReason::Eos => "close:eos",
+            },
+        }
+    }
+
+    pub fn close_reason(&self) -> Option<CloseReason> {
+        match self {
+            AlertOrigin::Event => None,
+            AlertOrigin::Close { reason } => Some(*reason),
+        }
+    }
+}
+
+impl fmt::Display for AlertOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for AlertOrigin {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AlertOrigin {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "event" => Ok(AlertOrigin::Event),
+            "close:timeout" => Ok(AlertOrigin::Close {
+                reason: CloseReason::Timeout,
+            }),
+            "close:flush" => Ok(AlertOrigin::Close {
+                reason: CloseReason::Flush,
+            }),
+            "close:eos" => Ok(AlertOrigin::Close {
+                reason: CloseReason::Eos,
+            }),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown AlertOrigin: {other}"
+            ))),
+        }
+    }
+}
 
 /// An output record produced by [`RuleExecutor`](crate::rule::RuleExecutor)
 /// when the CEP state machine signals a match or close.
@@ -14,8 +80,8 @@ pub struct OutputRecord {
     pub entity_type: String,
     /// Entity id evaluated from `entity_id_expr`.
     pub entity_id: String,
-    /// Present when the alert came from the close path.
-    pub close_reason: Option<String>,
+    /// Which path produced this alert.
+    pub origin: AlertOrigin,
     /// ISO 8601 UTC timestamp (`SystemTime`-based, no chrono).
     pub fired_at: String,
     /// Matched rows — always `vec![]` for L1 (placeholder for M25 join).

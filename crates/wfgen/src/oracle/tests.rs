@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use wf_lang::ast::{CmpOp, Expr, FieldRef, FieldSelector, Measure, Transform};
+use wf_lang::ast::{CmpOp, Expr, FieldRef, FieldSelector, Measure, Transform, CloseMode};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, EntityPlan, MatchPlan,
     RulePlan, ScorePlan, SortKeyPlan, StepPlan, WindowSpec, YieldPlan,
@@ -37,6 +37,7 @@ fn make_simple_rule_plan() -> RulePlan {
                 }],
             }],
             close_steps: vec![],
+            close_mode: CloseMode::Or,
         },
         joins: vec![],
         entity_plan: EntityPlan {
@@ -94,7 +95,7 @@ fn hit_cluster_triggers_alert() {
     assert_eq!(result.alerts[0].rule_name, "brute_force");
     assert_eq!(result.alerts[0].entity_id, "10.0.0.1");
     assert!((result.alerts[0].score - 85.0).abs() < f64::EPSILON);
-    assert!(result.alerts[0].close_reason.is_none());
+    assert_eq!(result.alerts[0].origin, "event");
 }
 
 #[test]
@@ -195,6 +196,7 @@ fn multi_alias_same_window_both_receive_events() {
                 },
             ],
             close_steps: vec![],
+            close_mode: CloseMode::Or,
         },
         joins: vec![],
         entity_plan: EntityPlan {
@@ -278,7 +280,10 @@ fn sc7_uninjected_rule_skipped() {
 /// Build an oracle event with sip + dport fields.
 fn make_scan_event(alias: &str, window: &str, sip: &str, dport: u16, ts: &str) -> GenEvent {
     let mut fields = serde_json::Map::new();
-    fields.insert("sip".to_string(), serde_json::Value::String(sip.to_string()));
+    fields.insert(
+        "sip".to_string(),
+        serde_json::Value::String(sip.to_string()),
+    );
     fields.insert(
         "dport".to_string(),
         serde_json::Value::Number(serde_json::Number::from(dport)),
@@ -346,6 +351,7 @@ fn conv_top_filters_non_qualifying() {
                     },
                 }],
             }],
+            close_mode: CloseMode::And,
         },
         joins: vec![],
         entity_plan: EntityPlan {
@@ -432,7 +438,11 @@ fn conv_top_filters_non_qualifying() {
     let result = run_oracle(&events, &[plan], &start, &duration, None).unwrap();
 
     // 3 qualifying, conv top(2) keeps 2; non-qualifying IP-D produces no alert
-    assert_eq!(result.alerts.len(), 2, "expected 2 alerts after conv top(2)");
+    assert_eq!(
+        result.alerts.len(),
+        2,
+        "expected 2 alerts after conv top(2)"
+    );
 
     let mut ids: Vec<&str> = result.alerts.iter().map(|a| a.entity_id.as_str()).collect();
     ids.sort();

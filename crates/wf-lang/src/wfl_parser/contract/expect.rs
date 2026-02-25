@@ -82,13 +82,13 @@ fn expect_hit_assert(input: &mut &str) -> ModalResult<ExpectStmt> {
 fn hit_assert(input: &mut &str) -> ModalResult<HitAssert> {
     alt((
         hit_assert_score,
-        hit_assert_close_reason,
+        hit_assert_origin,
         hit_assert_entity_type,
         hit_assert_entity_id,
         hit_assert_field,
     ))
     .context(StrContext::Expected(StrContextValue::Description(
-        "hit assertion (score|close_reason|entity_type|entity_id|field)",
+        "hit assertion (score|origin|entity_type|entity_id|field)",
     )))
     .parse_next(input)
 }
@@ -103,14 +103,14 @@ fn hit_assert_score(input: &mut &str) -> ModalResult<HitAssert> {
     Ok(HitAssert::Score { cmp, value })
 }
 
-/// `close_reason == STRING`
-fn hit_assert_close_reason(input: &mut &str) -> ModalResult<HitAssert> {
-    kw("close_reason").parse_next(input)?;
+/// `origin == STRING`
+fn hit_assert_origin(input: &mut &str) -> ModalResult<HitAssert> {
+    kw("origin").parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal("==")).parse_next(input)?;
     ws_skip.parse_next(input)?;
     let value = cut_err(quoted_string).parse_next(input)?;
-    Ok(HitAssert::CloseReason { value })
+    Ok(HitAssert::Origin { value })
 }
 
 /// `entity_type == STRING`

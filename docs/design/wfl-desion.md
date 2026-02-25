@@ -334,7 +334,7 @@ expect_block   = "expect" , "{" , { expect_stmt } , "}" ;
 expect_stmt    = "hits" , cmp_op , INTEGER , ";"
                | "hit" , "[" , INTEGER , "]" , "." , hit_assert , ";" ;
 hit_assert     = "score" , cmp_op , NUMBER
-               | "close_reason" , "==" , STRING
+               | "origin" , "==" , STRING
                | "entity_type" , "==" , STRING
                | "entity_id" , "==" , STRING
                | "field" , "(" , STRING , ")" , cmp_op , expr ;
@@ -951,11 +951,11 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 - v2.1 推荐并默认要求显式版本目标：`yield target@vN (...)`；`vN` 必须与 `meta.contract_version` 一致。
 - yield 命名参数 + 系统字段必须是目标 window fields 的**子集**（名称和类型匹配）。
 - yield 中不得出现 window 未定义的字段名；未覆盖的非系统字段值为 null。
-- 自动注入系统字段：`rule_name`(chars)、`emit_time`(time)、`score`(float)、`entity_type`(chars)、`entity_id`(chars)、`close_reason`(chars, nullable)。
+- 自动注入系统字段：`rule_name`(chars)、`emit_time`(time)、`score`(float)、`entity_type`(chars)、`entity_id`(chars)、`origin`(chars)。
 - 使用 `score { ... }` 时，额外注入 `score_contrib`(chars, JSON) 记录分项贡献明细。
 - `score_contrib` 传递契约：内部表示为 `map<string,float>`；写出时按 sink 协议序列化并透传下游（JSON sink 输出对象，行式 sink 输出 JSON 字符串）。
 - `score` 仅由 `match ... -> score_out` 产生（`score(expr)` 或 `score { ... }`）；`entity_type/entity_id` 仅由 `entity(type, id_expr)` 产生。
-- `close_reason` 仅在关闭触发输出时取值（`timeout`/`flush`/`eos`）；非关闭触发输出为 `null`。
+- `origin` 标识告警产生路径：事件路径为 `"event"`，关闭路径为 `"close:timeout"`/`"close:flush"`/`"close:eos"`。
 - `entity(type, id_expr)` 为必选声明。
 - `score` 范围固定为 `[0,100]`；超出范围按运行时策略处理（默认 `clamp`）。
 - `score`、`entity_type`、`entity_id`、`score_contrib` 为系统字段，禁止在 `yield` 命名参数中手工赋值。
@@ -1292,9 +1292,9 @@ eos_emit_reason = "eos"          # 固定为 eos，供审计
       "test": "dns_no_response_timeout",
       "rule": "dns_no_response",
       "code": "E_ASSERT_EQ",
-      "message": "hit[0].close_reason expected timeout but got flush",
-      "assertion": "hit[0].close_reason == \"timeout\"",
-      "actual": "flush",
+      "message": "hit[0].origin expected close:timeout but got close:flush",
+      "assertion": "hit[0].origin == \"close:timeout\"",
+      "actual": "close:flush",
       "replay": {
         "rows": 1,
         "ticks": ["31s"],
@@ -1320,8 +1320,8 @@ eos_emit_reason = "eos"          # 固定为 eos，供审计
 终端摘要（默认文本）建议：
 - `FAILED tests=1/12 file=rules/dns.wfl`
 - `- dns_no_response_timeout: E_ASSERT_EQ at rules/dns.wfl:1333`
-- `  assertion: hit[0].close_reason == "timeout"`
-- `  actual: flush`
+- `  assertion: hit[0].origin == "close:timeout"`
+- `  actual: close:flush`
 - `  replay: wfl test rules/dns.wfl --test dns_no_response_timeout --dump-replay`
 
 ### 12.12 可证明正确性门禁（Conformance）
@@ -1572,7 +1572,7 @@ test dns_no_response_timeout for dns_no_response {
   expect {
     hits == 1;
     hit[0].score == 50.0;
-    hit[0].close_reason == "timeout";
+    hit[0].origin == "close:timeout";
     hit[0].entity_type == "ip";
     hit[0].entity_id == "10.0.0.8";
     hit[0].field("domain") == "evil.test";
@@ -1984,7 +1984,7 @@ Oracle: 1234 alerts -> out/brute_force_load.oracle.jsonl
 
 | 项 | 规则 |
 |----|------|
-| 匹配键 | `(rule_name, entity_type, entity_id, close_reason)`（均为 yield 系统字段） |
+| 匹配键 | `(rule_name, entity_type, entity_id, origin)`（均为 yield 系统字段） |
 | 时间配对 | 同一匹配键下按 `abs(actual.emit_time - oracle.emit_time)` 最小贪心配对 |
 | 时间容差 | 配对后 `abs(actual.emit_time - oracle.emit_time) <= time_tolerance`，超出则计入 `field_mismatch`（取 `.wfg` 中 `oracle.time_tolerance`，默认 `1s`） |
 | 分数容差 | `abs(actual.score - oracle.score) <= score_tolerance`（取 `.wfg` 中 `oracle.score_tolerance`，默认 `0.01`） |

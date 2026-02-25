@@ -57,6 +57,7 @@ pub(super) struct Instance {
     pub(super) last_event_nanos: i64,
     pub(super) current_step: usize,
     pub(super) event_ok: bool,
+    pub(super) event_emitted: bool,
     pub(super) step_states: Vec<StepState>,
     pub(super) completed_steps: Vec<super::types::StepData>,
     pub(super) close_step_states: Vec<StepState>,
@@ -85,6 +86,7 @@ impl Instance {
             last_event_nanos: created_at,
             current_step: 0,
             event_ok: false,
+            event_emitted: false,
             step_states,
             completed_steps: Vec::new(),
             close_step_states,
@@ -145,6 +147,7 @@ impl Instance {
         self.last_event_nanos = created_at;
         self.current_step = 0;
         self.event_ok = false;
+        self.event_emitted = false;
         self.step_states = plan
             .event_steps
             .iter()

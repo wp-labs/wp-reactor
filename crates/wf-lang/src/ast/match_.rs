@@ -13,7 +13,23 @@ pub enum WindowMode {
     Fixed,
 }
 
-/// `match<keys:dur[:fixed]> { [key {...}] on event { ... } [on close { ... }] }`
+/// Close block mode: OR (independent paths) or AND (both required).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseMode {
+    /// `on close { ... }` — event path and close path fire independently.
+    Or,
+    /// `and close { ... }` — both event and close paths must satisfy.
+    And,
+}
+
+/// A parsed close block with its mode and steps.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloseBlock {
+    pub mode: CloseMode,
+    pub steps: Vec<MatchStep>,
+}
+
+/// `match<keys:dur[:fixed]> { [key {...}] on event { ... } [on close|and close { ... }] }`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct MatchClause {
@@ -22,7 +38,7 @@ pub struct MatchClause {
     pub duration: Duration,
     pub window_mode: WindowMode,
     pub on_event: Vec<MatchStep>,
-    pub on_close: Option<Vec<MatchStep>>,
+    pub on_close: Option<CloseBlock>,
 }
 
 /// Explicit key mapping: `logical = alias.field`

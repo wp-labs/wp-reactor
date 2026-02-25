@@ -1,4 +1,4 @@
-use crate::alert::OutputRecord;
+use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::CoreResult;
 use crate::rule::match_engine::{Event, MatchedContext, WindowLookup};
 
@@ -45,20 +45,21 @@ impl RuleExecutor {
     fn build_match_alert(&self, matched: &MatchedContext, ctx: &Event) -> CoreResult<OutputRecord> {
         let score = eval_score(&self.plan.score_plan.expr, ctx)?;
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
+        let origin = AlertOrigin::Event;
         let fired_at = format_nanos_utc(matched.event_time_nanos);
         let wfx_id = build_wfx_id(
             &self.plan.name,
             &matched.scope_key,
             &fired_at,
             &matched.step_data,
-            None,
+            &origin,
         );
         let summary = build_summary(
             &self.plan.name,
             &self.plan.match_plan.keys,
             &matched.scope_key,
             &matched.step_data,
-            None,
+            &origin,
         );
 
         Ok(OutputRecord {
@@ -67,7 +68,7 @@ impl RuleExecutor {
             score,
             entity_type: self.plan.entity_plan.entity_type.clone(),
             entity_id,
-            close_reason: None,
+            origin,
             fired_at,
             matched_rows: vec![],
             summary,

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::ast::{EntityTypeVal, FieldRef, RuleDecl, WflFile, WindowMode};
+use crate::ast::{EntityTypeVal, FieldRef, RuleDecl, WflFile, WindowMode, CloseMode};
 use crate::checker::check_wfl;
 use crate::plan::{
     AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, EntityPlan, ExceedAction,
@@ -123,8 +123,13 @@ fn compile_match(rule: &RuleDecl) -> MatchPlan {
         close_steps: mc
             .on_close
             .as_ref()
-            .map(|steps| steps.iter().map(compile_step).collect())
+            .map(|cb| cb.steps.iter().map(compile_step).collect())
             .unwrap_or_default(),
+        close_mode: mc
+            .on_close
+            .as_ref()
+            .map(|cb| cb.mode)
+            .unwrap_or(CloseMode::Or),
     }
 }
 

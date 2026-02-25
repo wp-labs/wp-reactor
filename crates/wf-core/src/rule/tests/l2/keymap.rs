@@ -30,6 +30,7 @@ fn key_map_extracts_from_alias_field() {
             branch("dns", count_ge(1.0)),
         ])],
         close_steps: vec![],
+        close_mode: CloseMode::Or,
     };
 
     let mut sm = CepStateMachine::new("rule_km".to_string(), plan, None);

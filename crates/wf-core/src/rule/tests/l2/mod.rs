@@ -12,7 +12,7 @@ mod limits;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use wf_lang::ast::{Expr, FieldRef, JoinMode};
+use wf_lang::ast::{CloseMode, Expr, FieldRef, JoinMode};
 use wf_lang::plan::{
     ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, RateSpec, WindowSpec,
 };

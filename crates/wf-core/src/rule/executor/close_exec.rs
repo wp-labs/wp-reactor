@@ -1,4 +1,6 @@
-use crate::alert::OutputRecord;
+use wf_lang::ast::CloseMode;
+
+use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::CoreResult;
 use crate::rule::match_engine::{CloseOutput, Event, StepData, WindowLookup};
 
@@ -7,13 +9,26 @@ use super::alert::{build_summary, build_wfx_id, format_nanos_utc};
 use super::context::{build_eval_context, execute_joins};
 use super::eval::{eval_entity_id, eval_score};
 
+/// Check whether a close output qualifies to produce an alert.
+fn is_qualified(close: &CloseOutput) -> bool {
+    match close.close_mode {
+        CloseMode::And => close.event_ok && close.close_ok,
+        CloseMode::Or => {
+            // In OR mode, the close path only qualifies when close steps
+            // exist. When there are no close steps (close_mode defaults to
+            // Or when no close block is present), the close output should
+            // not produce an alert — the event path already handles it.
+            close.close_ok && !close.close_step_data.is_empty()
+        }
+    }
+}
+
 impl RuleExecutor {
     /// Produce an [`OutputRecord`] from a close output (L1 — no joins).
     ///
-    /// Returns `Ok(None)` when `!event_ok || !close_ok` — the instance
-    /// did not fully satisfy the rule.
+    /// Returns `Ok(None)` when the instance did not qualify for an alert.
     pub fn execute_close(&self, close: &CloseOutput) -> CoreResult<Option<OutputRecord>> {
-        if !close.event_ok || !close.close_ok {
+        if !is_qualified(close) {
             return Ok(None);
         }
         let all_step_data = combine_step_data(close);
@@ -27,7 +42,7 @@ impl RuleExecutor {
         close: &CloseOutput,
         windows: &dyn WindowLookup,
     ) -> CoreResult<Option<OutputRecord>> {
-        if !close.event_ok || !close.close_ok {
+        if !is_qualified(close) {
             return Ok(None);
         }
         let all_step_data = combine_step_data(close);
@@ -46,21 +61,23 @@ impl RuleExecutor {
     ) -> CoreResult<Option<OutputRecord>> {
         let score = eval_score(&self.plan.score_plan.expr, ctx)?;
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
-        let close_reason_str = close.close_reason.as_str().to_string();
+        let origin = AlertOrigin::Close {
+            reason: close.close_reason,
+        };
         let fired_at = format_nanos_utc(close.watermark_nanos);
         let wfx_id = build_wfx_id(
             &self.plan.name,
             &close.scope_key,
             &fired_at,
             all_step_data,
-            Some(&close_reason_str),
+            &origin,
         );
         let summary = build_summary(
             &self.plan.name,
             &self.plan.match_plan.keys,
             &close.scope_key,
             all_step_data,
-            Some(&close_reason_str),
+            &origin,
         );
 
         Ok(Some(OutputRecord {
@@ -69,7 +86,7 @@ impl RuleExecutor {
             score,
             entity_type: self.plan.entity_plan.entity_type.clone(),
             entity_id,
-            close_reason: Some(close_reason_str),
+            origin,
             fired_at,
             matched_rows: vec![],
             summary,

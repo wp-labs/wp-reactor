@@ -38,7 +38,7 @@ WarpParse（wp-motor）是一个高性能日志解析引擎，核心能力是：
 
 - **事件（Event）**：输入到 WarpFusion 的原始结构化日志记录（RecordBatch 行）。
 - **规则命中（Hit）**：规则在某个窗口实例上满足 `on event`/`on close` 条件。
-- **风险告警（Risk Alert）**：规则命中后输出的业务结果，核心字段为 `rule_name + score + entity_type/entity_id`（可含 `close_reason`、`score_contrib`）。
+- **风险告警（Risk Alert）**：规则命中后输出的业务结果，核心字段为 `rule_name + score + entity_type/entity_id`（可含 `origin`、`score_contrib`）。
 - **运维告警（Ops Alert）**：对系统运行状态（断连、积压、丢弃率）的监控告警，区别于业务风险告警。
 - 代码中的 `AlertRecord` 保留原命名，但语义统一指”风险告警记录”。
 
@@ -898,7 +898,7 @@ pub struct AlertRecord {
     pub score: f64,                            // [0, 100]
     pub entity_type: String,                   // 由 entity(type, id_expr) 求值
     pub entity_id: String,
-    pub close_reason: Option<String>,          // "timeout" | "flush" | "eos" | None
+    pub origin: AlertOrigin,                   // Event | Close { reason }
     pub fired_at: String,                      // ISO 8601 UTC（无 chrono 依赖，内置实现）
     #[serde(skip)]
     pub matched_rows: Vec<RecordBatch>,        // L1 为空

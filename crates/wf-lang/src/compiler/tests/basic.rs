@@ -155,6 +155,7 @@ rule dns_timeout {
 
     assert_eq!(p.match_plan.event_steps.len(), 1);
     assert_eq!(p.match_plan.close_steps.len(), 1);
+    assert_eq!(p.match_plan.close_mode, CloseMode::Or);
 
     let close_branch = &p.match_plan.close_steps[0].branches[0];
     assert_eq!(close_branch.source, "resp");
@@ -162,6 +163,41 @@ rule dns_timeout {
     assert_eq!(close_branch.agg.measure, Measure::Count);
     assert_eq!(close_branch.agg.cmp, CmpOp::Eq);
     assert_eq!(close_branch.agg.threshold, Expr::Number(0.0));
+}
+
+// =========================================================================
+// 3b. compile_and_close
+// =========================================================================
+
+#[test]
+fn compile_and_close() {
+    let schemas = [dns_query_window(), dns_response_window(), output_window()];
+    let plans = compile_with(
+        r#"
+rule dns_timeout {
+    events {
+        req : dns_query
+        resp : dns_response
+    }
+    match<query_id:30s> {
+        on event {
+            req | count >= 1;
+        }
+        and close {
+            resp && close_reason == "timeout" | count == 0;
+        }
+    } -> score(50.0)
+    entity(ip, req.sip)
+    yield out (x = req.sip)
+}
+"#,
+        &schemas,
+    );
+    let p = &plans[0];
+
+    assert_eq!(p.match_plan.event_steps.len(), 1);
+    assert_eq!(p.match_plan.close_steps.len(), 1);
+    assert_eq!(p.match_plan.close_mode, CloseMode::And);
 }
 
 // =========================================================================

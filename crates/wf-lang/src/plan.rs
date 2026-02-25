@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::ast::{CmpOp, Expr, FieldRef, FieldSelector, JoinMode, Measure, Transform};
+use crate::ast::{CloseMode, CmpOp, Expr, FieldRef, FieldSelector, JoinMode, Measure, Transform};
 
 // ---------------------------------------------------------------------------
 // ExprPlan — L1 alias for ast::Expr
@@ -59,7 +59,7 @@ pub struct BindPlan {
 // MatchPlan — temporal matching
 // ---------------------------------------------------------------------------
 
-/// The match plan: keys, window spec, event steps, close steps, and key mapping.
+/// The match plan: keys, window spec, event steps, close steps, key mapping, and close mode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchPlan {
     pub keys: Vec<FieldRef>,
@@ -67,6 +67,7 @@ pub struct MatchPlan {
     pub window_spec: WindowSpec,
     pub event_steps: Vec<StepPlan>,
     pub close_steps: Vec<StepPlan>,
+    pub close_mode: CloseMode,
 }
 
 /// Explicit key mapping entry: logical name → source alias + field.

@@ -178,11 +178,11 @@ fn validate_hit_assert(
                 ));
             }
         }
-        HitAssert::CloseReason { value } => {
-            let actual = output.close_reason.as_deref().unwrap_or("");
+        HitAssert::Origin { value } => {
+            let actual = output.origin.as_str();
             if actual != value {
                 failures.push(format!(
-                    "hit[{}].close_reason: expected {:?}, got {:?}",
+                    "hit[{}].origin: expected {:?}, got {:?}",
                     index, value, actual
                 ));
             }

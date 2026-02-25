@@ -176,6 +176,8 @@ fn join_close_with_joins() {
         close_reason: CloseReason::Timeout,
         event_ok: true,
         close_ok: true,
+        close_mode: CloseMode::And,
+        event_emitted: false,
         event_step_data: vec![StepData {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),
@@ -187,7 +189,7 @@ fn join_close_with_joins() {
     };
 
     let alert = exec.execute_close_with_joins(&close, &wl).unwrap().unwrap();
-    assert_eq!(alert.close_reason.as_deref(), Some("timeout"));
+    assert_eq!(alert.origin.as_str(), "close:timeout");
     assert!((alert.score - 60.0).abs() < f64::EPSILON);
 }
 
@@ -409,6 +411,8 @@ fn join_asof_close_uses_last_event_nanos() {
         close_reason: CloseReason::Flush,
         event_ok: true,
         close_ok: true,
+        close_mode: CloseMode::And,
+        event_emitted: false,
         event_step_data: vec![StepData {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),

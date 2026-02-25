@@ -3,7 +3,7 @@ rule data_exfil {
     events { c : conn_events }
     match<sip:10m> {
         on event { c.bytes | sum >= 100000000; }
-        on close { total: c.bytes | sum >= 50000000; }
+        and close { total: c.bytes | sum >= 50000000; }
     } -> score(85.0)
     entity(ip, c.sip)
     yield network_alerts (sip = c.sip, alert_type = "data_exfil", detail = "high volume")
@@ -21,7 +21,7 @@ test exfil_close_timeout for data_exfil {
   expect {
     hits == 1;
     hit[0].score == 85.0;
-    hit[0].close_reason == "timeout";
+    hit[0].origin == "close:timeout";
     hit[0].entity_id == "10.0.0.1";
   }
   options {

@@ -58,7 +58,7 @@ async fn e2e_datagen_brute_force() {
 
     // ---- Load scenario (.wfg → schemas + rules) ----
     let base_dir = manifest_dir.join("../../examples");
-    let wfg_path = base_dir.join("scenarios/brute_force.wfg");
+    let wfg_path = base_dir.join("count/scenarios/brute_force.wfg");
     let vars = HashMap::from([("FAIL_THRESHOLD".into(), "3".into())]);
     let loaded = wfgen::loader::load_scenario(&wfg_path, &vars).expect("failed to load scenario");
 
@@ -119,8 +119,8 @@ listen = "tcp://127.0.0.1:0"
 [runtime]
 executor_parallelism = 2
 rule_exec_timeout = "30s"
-schemas = "schemas/*.wfs"
-rules   = "rules/*.wfl"
+schemas = "count/schemas/*.wfs"
+rules   = "count/rules/*.wfl"
 
 [window_defaults]
 evict_interval = "30s"

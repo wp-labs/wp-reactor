@@ -59,9 +59,7 @@ pub(super) fn rule_decl_with_patterns(
         // Standard: match<...> { ... } -> score(...)
         match_p::match_with_score.map(|(m, s)| (m, s, None)),
         // Pattern invocation: pattern_name(args...)
-        |input: &mut &str| {
-            pattern_invocation(input, patterns)
-        },
+        |input: &mut &str| pattern_invocation(input, patterns),
     )))
     .context(StrContext::Expected(StrContextValue::Description(
         "match clause or pattern invocation",
@@ -130,9 +128,7 @@ fn pattern_invocation(
     let name = ident.parse_next(input)?;
 
     // Must match a known pattern name
-    let pattern = patterns
-        .iter()
-        .find(|p| p.name == name);
+    let pattern = patterns.iter().find(|p| p.name == name);
     let pattern = match pattern {
         Some(p) => p,
         None => {
@@ -151,9 +147,12 @@ fn pattern_invocation(
         .parse_next(input)?;
 
     ws_skip.parse_next(input)?;
-    let args: Vec<String> =
-        separated(1.., (ws_skip, pattern_arg).map(|(_, a)| a), (ws_skip, literal(",")))
-            .parse_next(input)?;
+    let args: Vec<String> = separated(
+        1..,
+        (ws_skip, pattern_arg).map(|(_, a)| a),
+        (ws_skip, literal(",")),
+    )
+    .parse_next(input)?;
 
     ws_skip.parse_next(input)?;
     cut_err(literal(")"))
@@ -171,9 +170,7 @@ fn pattern_invocation(
 
     // Expand pattern
     let (mc, score, origin) = pattern_p::expand_pattern(pattern, &args)
-        .map_err(|_| {
-            winnow::error::ErrMode::Cut(winnow::error::ContextError::new())
-        })?;
+        .map_err(|_| winnow::error::ErrMode::Cut(winnow::error::ContextError::new()))?;
 
     Ok((mc, score, Some(origin)))
 }

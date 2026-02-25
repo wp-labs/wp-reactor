@@ -37,9 +37,12 @@ pub(super) fn pattern_decl(input: &mut &str) -> ModalResult<PatternDecl> {
         .parse_next(input)?;
 
     ws_skip.parse_next(input)?;
-    let params: Vec<&str> =
-        separated(1.., (ws_skip, ident).map(|(_, id)| id), (ws_skip, literal(",")))
-            .parse_next(input)?;
+    let params: Vec<&str> = separated(
+        1..,
+        (ws_skip, ident).map(|(_, id)| id),
+        (ws_skip, literal(",")),
+    )
+    .parse_next(input)?;
     let params: Vec<String> = params.into_iter().map(|s| s.to_string()).collect();
 
     ws_skip.parse_next(input)?;
@@ -149,12 +152,8 @@ pub(super) fn expand_pattern(
 
     // Parse expanded text as match_with_score.
     let mut text = expanded.as_str();
-    let (mc, score) = match_p::match_with_score(&mut text) .map_err(|e| {
-        format!(
-            "failed to parse expanded pattern '{}': {e}",
-            pattern.name
-        )
-    })?;
+    let (mc, score) = match_p::match_with_score(&mut text)
+        .map_err(|e| format!("failed to parse expanded pattern '{}': {e}", pattern.name))?;
 
     let origin = PatternOrigin {
         pattern_name: pattern.name.clone(),

@@ -5,7 +5,7 @@ mod inject;
 
 use std::time::Duration;
 
-use wf_lang::ast::{CmpOp, Expr, FieldRef, Measure};
+use wf_lang::ast::{CmpOp, Expr, FieldRef, Measure, CloseMode};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
     WindowSpec, YieldPlan,
@@ -81,6 +81,7 @@ fn make_brute_force_plan() -> RulePlan {
                 }],
             }],
             close_steps: vec![],
+            close_mode: CloseMode::Or,
         },
         joins: vec![],
         entity_plan: EntityPlan {

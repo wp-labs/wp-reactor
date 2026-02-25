@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, Measure};
+use wf_lang::ast::{BinOp, CmpOp, CloseMode, Expr, FieldRef, Measure};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
     WindowSpec, YieldPlan,
@@ -45,6 +45,7 @@ pub fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
         event_steps: steps,
         close_steps: vec![],
+        close_mode: CloseMode::Or,
     }
 }
 
@@ -84,6 +85,7 @@ pub fn plan_with_close(
         window_spec: WindowSpec::Sliding(window_dur),
         event_steps,
         close_steps,
+        close_mode: CloseMode::And,
     }
 }
 
@@ -94,6 +96,7 @@ pub fn fixed_plan(keys: Vec<FieldRef>, dur: Duration, steps: Vec<StepPlan>) -> M
         window_spec: WindowSpec::Fixed(dur),
         event_steps: steps,
         close_steps: vec![],
+        close_mode: CloseMode::Or,
     }
 }
 
@@ -109,6 +112,7 @@ pub fn fixed_plan_with_close(
         window_spec: WindowSpec::Fixed(dur),
         event_steps,
         close_steps,
+        close_mode: CloseMode::And,
     }
 }
 

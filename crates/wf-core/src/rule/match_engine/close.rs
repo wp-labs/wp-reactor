@@ -161,6 +161,8 @@ pub(super) fn evaluate_close(
         close_reason: reason,
         event_ok: instance.event_ok,
         close_ok,
+        close_mode: plan.close_mode,
+        event_emitted: instance.event_emitted,
         event_step_data: instance.completed_steps,
         close_step_data,
         watermark_nanos,

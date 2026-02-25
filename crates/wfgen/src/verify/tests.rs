@@ -8,7 +8,7 @@ fn exact_match_passes() {
         score: 85.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         emit_time: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -17,7 +17,7 @@ fn exact_match_passes() {
         score: 85.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -36,7 +36,7 @@ fn missing_alert_fails() {
         score: 85.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         emit_time: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -56,7 +56,7 @@ fn unexpected_alert_fails() {
         score: 85.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -72,7 +72,7 @@ fn score_mismatch_fails() {
         score: 85.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         emit_time: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -81,7 +81,7 @@ fn score_mismatch_fails() {
         score: 50.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -97,7 +97,7 @@ fn score_within_tolerance_passes() {
         score: 85.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         emit_time: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -106,7 +106,7 @@ fn score_within_tolerance_passes() {
         score: 85.005,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -129,7 +129,7 @@ fn missing_alert_has_details() {
         score: 85.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         emit_time: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -146,7 +146,7 @@ fn unexpected_alert_has_details() {
         score: 85.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.2".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -162,7 +162,7 @@ fn score_mismatch_has_details() {
         score: 85.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         emit_time: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -171,7 +171,7 @@ fn score_mismatch_has_details() {
         score: 50.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -188,7 +188,7 @@ fn test_markdown_report_format() {
         score: 85.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         emit_time: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -197,7 +197,7 @@ fn test_markdown_report_format() {
         score: 50.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         fired_at: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -239,7 +239,7 @@ fn time_mismatch_beyond_tolerance_fails() {
         score: 85.0,
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         emit_time: "2024-01-01T00:05:00Z".to_string(),
     }];
 
@@ -248,7 +248,7 @@ fn time_mismatch_beyond_tolerance_fails() {
         score: 85.0, // score matches
         entity_type: "ip".to_string(),
         entity_id: "10.0.0.1".to_string(),
-        close_reason: None,
+        origin: "event".to_string(),
         fired_at: "2024-01-01T00:05:05Z".to_string(), // 5s later
     }];
 

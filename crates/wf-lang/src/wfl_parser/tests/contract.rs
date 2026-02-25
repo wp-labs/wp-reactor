@@ -23,7 +23,7 @@ test dns_no_response_timeout for dns_no_response {
     expect {
         hits == 1;
         hit[0].score == 50.0;
-        hit[0].close_reason == "timeout";
+        hit[0].origin == "close:timeout";
         hit[0].entity_type == "ip";
         hit[0].entity_id == "10.0.0.8";
         hit[0].field("domain") == "evil.test";
@@ -82,8 +82,8 @@ test dns_no_response_timeout for dns_no_response {
         ExpectStmt::HitAssert { assert, .. } => {
             assert_eq!(
                 *assert,
-                HitAssert::CloseReason {
-                    value: "timeout".into()
+                HitAssert::Origin {
+                    value: "close:timeout".into()
                 }
             );
         }

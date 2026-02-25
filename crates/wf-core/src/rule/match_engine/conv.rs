@@ -34,11 +34,7 @@ fn apply_chain(
     outputs
 }
 
-fn apply_op(
-    op: &ConvOpPlan,
-    keys: &[FieldRef],
-    mut outputs: Vec<CloseOutput>,
-) -> Vec<CloseOutput> {
+fn apply_op(op: &ConvOpPlan, keys: &[FieldRef], mut outputs: Vec<CloseOutput>) -> Vec<CloseOutput> {
     match op {
         ConvOpPlan::Sort(sort_keys) => {
             outputs.sort_by(|a, b| {
@@ -132,7 +128,9 @@ fn compare_option_values(a: &Option<Value>, b: &Option<Value>) -> std::cmp::Orde
 /// Compare two values for sorting: numbers numerically, strings lexicographically.
 fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Number(x), Value::Number(y)) => {
+            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        }
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         // Mixed types: Number < Str < Bool

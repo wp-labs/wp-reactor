@@ -47,9 +47,12 @@ pub(super) fn conv_clause(input: &mut &str) -> ModalResult<ConvClause> {
 
 /// `conv_step { "|" conv_step } ";"`
 fn conv_chain(input: &mut &str) -> ModalResult<ConvChain> {
-    let steps: Vec<ConvStep> =
-        separated(1.., (ws_skip, conv_step).map(|(_, s)| s), (ws_skip, literal("|")))
-            .parse_next(input)?;
+    let steps: Vec<ConvStep> = separated(
+        1..,
+        (ws_skip, conv_step).map(|(_, s)| s),
+        (ws_skip, literal("|")),
+    )
+    .parse_next(input)?;
 
     ws_skip.parse_next(input)?;
     cut_err(literal(";"))
@@ -90,9 +93,12 @@ fn parse_sort(input: &mut &str) -> ModalResult<ConvStep> {
     cut_err(literal("(")).parse_next(input)?;
     ws_skip.parse_next(input)?;
 
-    let keys: Vec<SortKey> =
-        separated(1.., (ws_skip, sort_key).map(|(_, k)| k), (ws_skip, literal(",")))
-            .parse_next(input)?;
+    let keys: Vec<SortKey> = separated(
+        1..,
+        (ws_skip, sort_key).map(|(_, k)| k),
+        (ws_skip, literal(",")),
+    )
+    .parse_next(input)?;
 
     ws_skip.parse_next(input)?;
     cut_err(literal(")")).parse_next(input)?;

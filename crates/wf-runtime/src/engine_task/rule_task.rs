@@ -159,10 +159,10 @@ impl RuleTask {
     /// Scan for expired state machine instances and emit alerts.
     pub(super) async fn scan_timeouts(&mut self) {
         let lookup = RegistryLookup(&self.router);
-        for close in &self.machine.scan_expired_at_with_conv(
-            self.machine.watermark_nanos(),
-            self.conv_plan.as_ref(),
-        ) {
+        for close in &self
+            .machine
+            .scan_expired_at_with_conv(self.machine.watermark_nanos(), self.conv_plan.as_ref())
+        {
             match self.executor.execute_close_with_joins(close, &lookup) {
                 Ok(Some(record)) => self.emit(record).await,
                 Ok(None) => {}
@@ -177,10 +177,10 @@ impl RuleTask {
     pub(super) async fn flush(&mut self) {
         let mut emitted = 0usize;
         let lookup = RegistryLookup(&self.router);
-        for close in &self.machine.close_all_with_conv(
-            CloseReason::Flush,
-            self.conv_plan.as_ref(),
-        ) {
+        for close in &self
+            .machine
+            .close_all_with_conv(CloseReason::Flush, self.conv_plan.as_ref())
+        {
             match self.executor.execute_close_with_joins(close, &lookup) {
                 Ok(Some(record)) => {
                     self.emit(record).await;

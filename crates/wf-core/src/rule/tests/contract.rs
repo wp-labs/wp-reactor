@@ -140,7 +140,7 @@ rule timeout_rule {
     events { e : auth_events }
     match<sip:5m> {
         on event { e | count >= 1; }
-        on close { close_count: e | count >= 1; }
+        and close { close_count: e | count >= 1; }
     } -> score(80.0)
     entity(ip, e.sip)
     yield security_alerts (sip = e.sip, fail_count = 1)
@@ -172,7 +172,7 @@ rule eos_rule {
     events { e : auth_events }
     match<sip:5m> {
         on event { e | count >= 1; }
-        on close { close_count: e | count >= 1; }
+        and close { close_count: e | count >= 1; }
     } -> score(80.0)
     entity(ip, e.sip)
     yield security_alerts (sip = e.sip, fail_count = 1)

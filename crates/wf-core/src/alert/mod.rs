@@ -1,3 +1,3 @@
 mod types;
 
-pub use types::OutputRecord;
+pub use types::{AlertOrigin, OutputRecord};

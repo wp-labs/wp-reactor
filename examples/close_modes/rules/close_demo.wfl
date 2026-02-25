@@ -3,7 +3,7 @@ rule close_demo {
     events { c : conn_events }
     match<sip:5m> {
         on event { c | count >= 1; }
-        on close { total: c | count >= 1; }
+        and close { total: c | count >= 1; }
     } -> score(70.0)
     entity(ip, c.sip)
     yield network_alerts (sip = c.sip, alert_type = "close_demo", detail = "triggered")
@@ -16,7 +16,7 @@ test close_eos for close_demo {
   expect {
     hits == 1;
     hit[0].score == 70.0;
-    hit[0].close_reason == "eos";
+    hit[0].origin == "close:eos";
     hit[0].entity_id == "10.0.0.1";
   }
 }
@@ -29,7 +29,7 @@ test close_timeout for close_demo {
   expect {
     hits == 1;
     hit[0].score == 70.0;
-    hit[0].close_reason == "timeout";
+    hit[0].origin == "close:timeout";
     hit[0].entity_id == "10.0.0.2";
   }
 }
@@ -41,7 +41,7 @@ test close_flush for close_demo {
   expect {
     hits == 1;
     hit[0].score == 70.0;
-    hit[0].close_reason == "flush";
+    hit[0].origin == "close:flush";
     hit[0].entity_id == "10.0.0.3";
   }
   options {

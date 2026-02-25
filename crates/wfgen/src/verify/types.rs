@@ -5,7 +5,7 @@ pub struct ActualAlert {
     pub score: f64,
     pub entity_type: String,
     pub entity_id: String,
-    pub close_reason: Option<String>,
+    pub origin: String,
     pub fired_at: String,
 }
 

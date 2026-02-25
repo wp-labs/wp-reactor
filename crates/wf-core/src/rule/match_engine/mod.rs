@@ -23,6 +23,7 @@ pub(crate) use eval::eval_expr_ext;
 
 use std::collections::HashMap;
 
+use wf_lang::ast::CloseMode;
 use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, WindowSpec};
 
 use close::{accumulate_close_steps, evaluate_close};
@@ -274,12 +275,17 @@ impl CepStateMachine {
             );
         }
 
-        // 4. If event steps already complete, just accumulate for close
+        // 4. If event already emitted (OR mode), just accumulate for close
+        if instance.event_emitted {
+            return StepResult::Accumulate;
+        }
+
+        // 5. If event steps already complete (AND mode), just accumulate for close
         if instance.event_ok {
             return StepResult::Accumulate;
         }
 
-        // 5. Current step plan
+        // 6. Current step plan
         if instance.current_step >= plan.event_steps.len() {
             return StepResult::Accumulate;
         }
@@ -344,8 +350,40 @@ impl CepStateMachine {
                         };
                         instance.reset(plan, fixed_created_at.unwrap_or(now_nanos));
                         StepResult::Matched(ctx)
+                    } else if plan.close_mode == CloseMode::Or {
+                        // OR mode: emit from event path immediately, keep instance alive for close
+                        if let Some(ref limits) = self.limits
+                            && let Some(ref rate) = limits.max_throttle
+                        {
+                            let window_nanos = rate.per.as_nanos() as i64;
+                            if now_nanos - self.emit_window_start >= window_nanos {
+                                self.emit_count = 0;
+                                self.emit_window_start = now_nanos;
+                            }
+                            if self.emit_count >= rate.count {
+                                match limits.on_exceed {
+                                    ExceedAction::Throttle | ExceedAction::DropOldest => {
+                                        instance.event_emitted = true;
+                                        return StepResult::Accumulate;
+                                    }
+                                    ExceedAction::FailRule => {
+                                        self.failed = true;
+                                        return StepResult::Accumulate;
+                                    }
+                                }
+                            }
+                            self.emit_count += 1;
+                        }
+                        instance.event_emitted = true;
+                        let ctx = MatchedContext {
+                            rule_name: self.rule_name.clone(),
+                            scope_key,
+                            step_data: instance.completed_steps.clone(),
+                            event_time_nanos: now_nanos,
+                        };
+                        StepResult::Matched(ctx)
                     } else {
-                        // Close steps present → mark event_ok, keep accumulating
+                        // AND mode: mark event_ok, keep accumulating
                         instance.event_ok = true;
                         StepResult::Advance
                     }
@@ -508,7 +546,12 @@ impl CepStateMachine {
     /// is exceeded, suppresses emission by clearing `close_ok`. This shares
     /// the same sliding-window counter used by the match path.
     fn rate_limit_close(&mut self, output: &mut CloseOutput, now_nanos: i64) {
-        if !output.event_ok || !output.close_ok {
+        // Check if this output would emit based on close mode
+        let would_emit = match output.close_mode {
+            CloseMode::And => output.event_ok && output.close_ok,
+            CloseMode::Or => output.close_ok && !output.close_step_data.is_empty(),
+        };
+        if !would_emit {
             return; // won't emit an alert anyway
         }
         if let Some(ref limits) = self.limits
@@ -559,7 +602,10 @@ fn apply_conv_filtered(
     };
 
     let (qualifying, non_qualifying): (Vec<_>, Vec<_>) =
-        outputs.into_iter().partition(|o| o.event_ok && o.close_ok);
+        outputs.into_iter().partition(|o| match o.close_mode {
+            CloseMode::And => o.event_ok && o.close_ok,
+            CloseMode::Or => o.close_ok && !o.close_step_data.is_empty(),
+        });
 
     if qualifying.is_empty() {
         return non_qualifying;

@@ -47,13 +47,19 @@ pub(super) fn explain_match(mp: &MatchPlan) -> MatchExpl {
     };
 
     let event_steps = mp.event_steps.iter().map(format_step).collect();
-    let close_steps = mp.close_steps.iter().map(format_step).collect();
+    let close_steps: Vec<String> = mp.close_steps.iter().map(format_step).collect();
+    let close_mode = if close_steps.is_empty() {
+        None
+    } else {
+        Some(mp.close_mode)
+    };
 
     MatchExpl {
         keys,
         window_spec,
         event_steps,
         close_steps,
+        close_mode,
     }
 }
 

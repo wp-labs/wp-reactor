@@ -14,12 +14,12 @@ pub use types::{ActualAlert, AlertDetail, MismatchDetail, VerifyReport, VerifySu
 use matching::greedy_match;
 
 /// Match key for grouping alerts.
-type MatchKey = (String, String, String, Option<String>);
+type MatchKey = (String, String, String, String);
 
 /// Compare actual alerts against oracle (expected) alerts.
 ///
 /// Algorithm:
-/// 1. Group both sides by match key `(rule_name, entity_type, entity_id, close_reason)`.
+/// 1. Group both sides by match key `(rule_name, entity_type, entity_id, origin)`.
 /// 2. Within each group, greedily pair by nearest time.
 /// 3. Paired alerts with `|time_diff| > time_tolerance` or `|score_diff| > score_tolerance`
 ///    count as field_mismatch.
@@ -155,7 +155,7 @@ fn match_key_expected(a: &OracleAlert) -> MatchKey {
         a.rule_name.clone(),
         a.entity_type.clone(),
         a.entity_id.clone(),
-        a.close_reason.clone(),
+        a.origin.clone(),
     )
 }
 
@@ -164,7 +164,7 @@ fn match_key_actual(a: &ActualAlert) -> MatchKey {
         a.rule_name.clone(),
         a.entity_type.clone(),
         a.entity_id.clone(),
-        a.close_reason.clone(),
+        a.origin.clone(),
     )
 }
 

@@ -90,8 +90,8 @@ rule dns_no_response {
     assert_eq!(rule.name, "dns_no_response");
     assert!(rule.match_clause.on_close.is_some());
     let close = rule.match_clause.on_close.as_ref().unwrap();
-    assert_eq!(close.len(), 1);
-    assert_eq!(close[0].branches[0].source, "resp");
+    assert_eq!(close.steps.len(), 1);
+    assert_eq!(close.steps[0].branches[0].source, "resp");
 }
 
 // -----------------------------------------------------------------------

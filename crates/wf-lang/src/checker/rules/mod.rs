@@ -24,7 +24,7 @@ const SYSTEM_FIELDS: &[&str] = &[
     "score",
     "entity_type",
     "entity_id",
-    "close_reason",
+    "origin",
     "score_contrib",
 ];
 
@@ -50,8 +50,8 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
         errors,
         &mut labels_seen,
     );
-    if let Some(ref close_steps) = rule.match_clause.on_close {
-        steps::check_match_steps(close_steps, &scope, name, errors, &mut labels_seen);
+    if let Some(ref close_block) = rule.match_clause.on_close {
+        steps::check_match_steps(&close_block.steps, &scope, name, errors, &mut labels_seen);
     }
 
     // Check label vs key name collision

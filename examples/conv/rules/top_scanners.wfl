@@ -15,7 +15,7 @@ rule top_port_scanners {
     on event {
       c | count >= 1;
     }
-    on close {
+    and close {
       scan: c.dport | distinct | count >= 3;
     }
   } -> score(80.0)

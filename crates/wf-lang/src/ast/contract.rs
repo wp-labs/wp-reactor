@@ -54,8 +54,8 @@ pub enum ExpectStmt {
 pub enum HitAssert {
     /// `score cmp_op NUMBER`
     Score { cmp: CmpOp, value: f64 },
-    /// `close_reason == STRING`
-    CloseReason { value: String },
+    /// `origin == STRING`
+    Origin { value: String },
     /// `entity_type == STRING`
     EntityType { value: String },
     /// `entity_id == STRING`

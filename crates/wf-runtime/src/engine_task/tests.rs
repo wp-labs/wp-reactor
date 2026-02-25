@@ -17,7 +17,7 @@ use tracing_subscriber::{EnvFilter, Layer, fmt};
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 use wf_core::rule::{CepStateMachine, RuleExecutor};
 use wf_core::window::{Router, Window, WindowParams, WindowRegistry};
-use wf_lang::ast::{CmpOp, Expr, FieldRef, Measure};
+use wf_lang::ast::{CmpOp, Expr, FieldRef, Measure, CloseMode};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
     WindowSpec, YieldPlan,
@@ -158,6 +158,7 @@ fn make_task_with_window_bytes(
             }],
         }],
         close_steps: vec![],
+        close_mode: CloseMode::Or,
     };
 
     let rule_plan = RulePlan {

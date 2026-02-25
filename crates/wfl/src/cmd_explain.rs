@@ -76,7 +76,11 @@ fn print_colored(e: &RuleExplanation) {
         }
     }
     if !e.match_expl.close_steps.is_empty() {
-        println!("    {BOLD}on close:{RESET}");
+        let label = match e.match_expl.close_mode {
+            Some(wf_lang::ast::CloseMode::And) => "and close:",
+            _ => "on close:",
+        };
+        println!("    {BOLD}{label}{RESET}");
         for (i, step) in e.match_expl.close_steps.iter().enumerate() {
             println!("      step {}: {}", i + 1, step);
         }

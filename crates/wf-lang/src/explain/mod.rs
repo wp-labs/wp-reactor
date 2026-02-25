@@ -7,6 +7,7 @@ mod tests;
 use crate::plan::RulePlan;
 use crate::schema::WindowSchema;
 
+use crate::ast::CloseMode;
 pub use format::{format_cmp, format_expr, format_field_ref, format_measure};
 
 use sections::{
@@ -45,6 +46,7 @@ pub struct MatchExpl {
     pub window_spec: String,
     pub event_steps: Vec<String>,
     pub close_steps: Vec<String>,
+    pub close_mode: Option<CloseMode>,
 }
 
 /// Build explanations for a set of compiled rules.
@@ -67,9 +69,10 @@ fn explain_rule(plan: &RulePlan, schemas: &[WindowSchema]) -> RuleExplanation {
     let conv = plan.conv_plan.as_ref().map(explain_conv);
     let limits = plan.limits_plan.as_ref().map(explain_limits);
     let lineage = compute_lineage(&plan.binds, &plan.yield_plan, schemas);
-    let pattern_origin = plan.pattern_origin.as_ref().map(|po| {
-        (po.pattern_name.clone(), po.args.clone())
-    });
+    let pattern_origin = plan
+        .pattern_origin
+        .as_ref()
+        .map(|po| (po.pattern_name.clone(), po.args.clone()));
 
     RuleExplanation {
         name: plan.name.clone(),

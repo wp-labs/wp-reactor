@@ -1,4 +1,4 @@
-use wf_lang::ast::{BinOp, Expr, FieldRef};
+use wf_lang::ast::{BinOp, CloseMode, Expr, FieldRef};
 
 use crate::rule::RuleExecutor;
 use crate::rule::match_engine::{CloseOutput, CloseReason, MatchedContext, StepData};
@@ -51,7 +51,7 @@ fn execute_match_static_score() {
     assert!((alert.score - 70.0).abs() < f64::EPSILON);
     assert_eq!(alert.entity_type, "ip");
     assert_eq!(alert.entity_id, "10.0.0.1");
-    assert!(alert.close_reason.is_none());
+    assert_eq!(alert.origin, crate::alert::AlertOrigin::Event);
     assert!(alert.matched_rows.is_empty());
     assert!(alert.fired_at.ends_with('Z'));
 }
@@ -189,6 +189,8 @@ fn execute_close_both_ok() {
         close_reason: CloseReason::Timeout,
         event_ok: true,
         close_ok: true,
+        close_mode: CloseMode::And,
+        event_emitted: false,
         event_step_data: vec![StepData {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),
@@ -200,7 +202,7 @@ fn execute_close_both_ok() {
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
-    assert_eq!(alert.close_reason.as_deref(), Some("timeout"));
+    assert_eq!(alert.origin.as_str(), "close:timeout");
     assert!((alert.score - 70.0).abs() < f64::EPSILON);
     assert_eq!(alert.entity_id, "10.0.0.1");
 }
@@ -225,6 +227,8 @@ fn execute_close_close_not_ok() {
         close_reason: CloseReason::Flush,
         event_ok: true,
         close_ok: false,
+        close_mode: CloseMode::And,
+        event_emitted: false,
         event_step_data: vec![],
         close_step_data: vec![],
         watermark_nanos: 0,
@@ -255,6 +259,8 @@ fn execute_close_event_not_ok() {
         close_reason: CloseReason::Eos,
         event_ok: false,
         close_ok: true,
+        close_mode: CloseMode::And,
+        event_emitted: false,
         event_step_data: vec![],
         close_step_data: vec![],
         watermark_nanos: 0,

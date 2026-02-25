@@ -146,12 +146,40 @@ rule r {
     let mc = &file.rules[0].match_clause;
     assert_eq!(mc.on_event.len(), 1);
     assert!(mc.on_close.is_some());
-    let close_steps = mc.on_close.as_ref().unwrap();
-    assert_eq!(close_steps.len(), 1);
-    assert_eq!(close_steps[0].branches[0].source, "resp");
-    assert!(close_steps[0].branches[0].guard.is_some());
-    assert_eq!(close_steps[0].branches[0].pipe.measure, Measure::Count);
-    assert_eq!(close_steps[0].branches[0].pipe.cmp, CmpOp::Eq);
+    let close_block = mc.on_close.as_ref().unwrap();
+    assert_eq!(close_block.mode, CloseMode::Or);
+    assert_eq!(close_block.steps.len(), 1);
+    assert_eq!(close_block.steps[0].branches[0].source, "resp");
+    assert!(close_block.steps[0].branches[0].guard.is_some());
+    assert_eq!(close_block.steps[0].branches[0].pipe.measure, Measure::Count);
+    assert_eq!(close_block.steps[0].branches[0].pipe.cmp, CmpOp::Eq);
+}
+
+#[test]
+fn parse_and_close() {
+    let input = r#"
+rule r {
+    events { req : dns_query  resp : dns_response }
+    match<query_id:30s> {
+        on event {
+            req | count >= 1;
+        }
+        and close {
+            resp && close_reason == "timeout" | count == 0;
+        }
+    } -> score(50.0)
+    entity(ip, req.sip)
+    yield out (x = req.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let mc = &file.rules[0].match_clause;
+    assert_eq!(mc.on_event.len(), 1);
+    assert!(mc.on_close.is_some());
+    let close_block = mc.on_close.as_ref().unwrap();
+    assert_eq!(close_block.mode, CloseMode::And);
+    assert_eq!(close_block.steps.len(), 1);
+    assert_eq!(close_block.steps[0].branches[0].source, "resp");
 }
 
 // -----------------------------------------------------------------------

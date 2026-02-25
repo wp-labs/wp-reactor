@@ -71,8 +71,8 @@ listen = "tcp://127.0.0.1:0"
 [runtime]
 executor_parallelism = 2
 rule_exec_timeout = "30s"
-schemas = "schemas/*.wfs"
-rules   = "rules/*.wfl"
+schemas = "count/schemas/*.wfs"
+rules   = "count/rules/*.wfl"
 
 [window_defaults]
 evict_interval = "30s"
@@ -196,7 +196,7 @@ FAIL_THRESHOLD = "3"
         "expected score 70.0, got {score}"
     );
     assert!(
-        alert["close_reason"].as_str().is_some(),
-        "expected close_reason to be present (on-close path), got: {alert}"
+        alert["origin"].as_str().is_some(),
+        "expected origin to be present (on-close path), got: {alert}"
     );
 }
