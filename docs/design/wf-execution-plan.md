@@ -324,7 +324,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 
 ## 阶段 VIII：WFL L3 + Conformance（M27–M28）
 
-### M27：L3 固定间隔窗口、结果集变换与可组合规则片段
+### M27：L3 固定间隔窗口、结果集变换与可组合规则片段 ✅
 
 | 项目 | 内容 |
 |------|------|
@@ -467,7 +467,7 @@ M20 MVP 已完成，下一步两条路径可并行推进：
 | **V 运行时闭环** | M17–M20 | **单机 MVP：数据接收→规则执行→告警输出** | ✅ 已完成 |
 | **VI 生产化** | M21–M24 | 热加载、多通道告警、监控、工具链 | 进行中（M24 部分完成） |
 | **VII L2 增强** | M25–M26 | snapshot/asof / baseline / key 映射 / limits / 条件表达式 / yield@vN | ✅ 已完成 |
-| **VIII L3 + Conformance** | M27–M28 | fixed / conv / composable pattern / 多级管道 / shuffle 契约 | 待开始 |
+| **VIII L3 + Conformance** | M27–M28 | fixed / conv / composable pattern / 多级管道 / shuffle 契约 | 进行中（M27 已完成） |
 | **IX 可靠性分级** | M29 | best_effort / at_least_once / exactly_once | 待开始 |
 | **X 分布式** | M30 | 多节点分布式部署 | 待开始 |
 | **支撑轨道（wfgen）** | M31–M33 | .wfg DSL / rule-aware oracle / 时序扰动压测 | ✅ 已完成 |
