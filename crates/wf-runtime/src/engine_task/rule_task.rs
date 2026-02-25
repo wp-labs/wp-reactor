@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use wf_core::alert::OutputRecord;
 use wf_core::rule::{CepStateMachine, CloseReason, RuleExecutor, StepResult, batch_to_events};
 use wf_core::window::Router;
+use wf_lang::plan::ConvPlan;
 
 use super::TASK_SEQ;
 use super::task_types::{RuleTaskConfig, WindowSource};
@@ -23,6 +24,7 @@ pub(super) struct RuleTask {
     pub(super) task_id: String,
     machine: CepStateMachine,
     executor: RuleExecutor,
+    conv_plan: Option<ConvPlan>,
     pub(super) sources: Vec<WindowSource>,
     /// window_name -> Vec<alias>: pre-computed from stream_aliases + window sources.
     aliases: HashMap<String, Vec<String>>,
@@ -80,11 +82,13 @@ impl RuleTask {
 
         let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
         let task_id = format!("{}#{}", machine.rule_name(), seq);
+        let conv_plan = executor.plan().conv_plan.clone();
 
         let task = Self {
             task_id,
             machine,
             executor,
+            conv_plan,
             sources: window_sources,
             aliases,
             alert_tx,
@@ -155,7 +159,10 @@ impl RuleTask {
     /// Scan for expired state machine instances and emit alerts.
     pub(super) async fn scan_timeouts(&mut self) {
         let lookup = RegistryLookup(&self.router);
-        for close in &self.machine.scan_expired() {
+        for close in &self.machine.scan_expired_at_with_conv(
+            self.machine.watermark_nanos(),
+            self.conv_plan.as_ref(),
+        ) {
             match self.executor.execute_close_with_joins(close, &lookup) {
                 Ok(Some(record)) => self.emit(record).await,
                 Ok(None) => {}
@@ -170,7 +177,10 @@ impl RuleTask {
     pub(super) async fn flush(&mut self) {
         let mut emitted = 0usize;
         let lookup = RegistryLookup(&self.router);
-        for close in &self.machine.close_all(CloseReason::Flush) {
+        for close in &self.machine.close_all_with_conv(
+            CloseReason::Flush,
+            self.conv_plan.as_ref(),
+        ) {
             match self.executor.execute_close_with_joins(close, &lookup) {
                 Ok(Some(record)) => {
                     self.emit(record).await;

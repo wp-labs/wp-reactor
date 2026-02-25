@@ -31,6 +31,7 @@ pub fn run_test(
 ) -> Result<TestResult> {
     let mut sm = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), time_field);
     let executor = RuleExecutor::new(plan.clone());
+    let conv_plan = plan.conv_plan.as_ref();
 
     let base_nanos: i64 = 1_700_000_000_000_000_000;
     let mut current_nanos = base_nanos;
@@ -68,8 +69,8 @@ pub fn run_test(
             InputStmt::Tick(dur) => {
                 current_nanos += dur.as_nanos() as i64;
 
-                // Scan for expired instances at the new watermark
-                let expired = sm.scan_expired_at(current_nanos);
+                // Scan for expired instances at the new watermark (with conv)
+                let expired = sm.scan_expired_at_with_conv(current_nanos, conv_plan);
                 for close in expired {
                     if let Ok(Some(alert)) = executor.execute_close(&close) {
                         alerts.push(alert);
@@ -85,8 +86,7 @@ pub fn run_test(
 
     match close_trigger {
         None | Some(CloseTrigger::Eos) => {
-            let closes = sm.close_all(CloseReason::Eos);
-            for close in closes {
+            for close in sm.close_all_with_conv(CloseReason::Eos, conv_plan) {
                 if let Ok(Some(alert)) = executor.execute_close(&close) {
                     alerts.push(alert);
                 }
@@ -95,7 +95,7 @@ pub fn run_test(
         Some(CloseTrigger::Timeout) => {
             // Advance time by 1 day to force timeout
             current_nanos += 86_400_000_000_000i64;
-            let expired = sm.scan_expired_at(current_nanos);
+            let expired = sm.scan_expired_at_with_conv(current_nanos, conv_plan);
             for close in expired {
                 if let Ok(Some(alert)) = executor.execute_close(&close) {
                     alerts.push(alert);
@@ -103,8 +103,7 @@ pub fn run_test(
             }
         }
         Some(CloseTrigger::Flush) => {
-            let closes = sm.close_all(CloseReason::Flush);
-            for close in closes {
+            for close in sm.close_all_with_conv(CloseReason::Flush, conv_plan) {
                 if let Ok(Some(alert)) = executor.execute_close(&close) {
                     alerts.push(alert);
                 }
@@ -112,8 +111,7 @@ pub fn run_test(
         }
         _ => {
             // future-proof for non_exhaustive CloseTrigger
-            let closes = sm.close_all(CloseReason::Eos);
-            for close in closes {
+            for close in sm.close_all_with_conv(CloseReason::Eos, conv_plan) {
                 if let Ok(Some(alert)) = executor.execute_close(&close) {
                     alerts.push(alert);
                 }

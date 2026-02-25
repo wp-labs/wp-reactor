@@ -290,10 +290,12 @@ fn conv_multiple_chains_sequential() {
 #[test]
 fn scan_expired_at_with_conv_applies_transformations() {
     let dur = Duration::from_secs(10);
-    let plan = fixed_plan(
+    // Use close steps so instances stay alive (event_ok=true, close_ok=true at expiry)
+    let plan = fixed_plan_with_close(
         vec![simple_key("sip")],
         dur,
         vec![step(vec![branch_with_label("fail", "count", count_ge(1.0))])],
+        vec![step(vec![branch("close_scan", count_ge(0.0))])],
     );
     let mut sm = CepStateMachine::new("r_conv".to_string(), plan, None);
 
@@ -320,7 +322,7 @@ fn scan_expired_at_with_conv_applies_transformations() {
     // Expire all at t=10s
     let results = sm.scan_expired_at_with_conv(10_000_000_000, Some(&conv_plan));
 
-    // All 3 instances expire, conv truncates to 2
+    // All 3 instances expire with event_ok && close_ok; conv truncates qualifying to 2
     assert_eq!(results.len(), 2);
 }
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use wf_core::rule::{CepStateMachine, Event, RuleExecutor, StepResult, Value};
-use wf_lang::plan::RulePlan;
+use wf_lang::plan::{ConvPlan, RulePlan};
 
 use crate::datagen::stream_gen::GenEvent;
 
@@ -60,6 +60,7 @@ pub fn run_oracle(
             RuleEngine {
                 sm: CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), None),
                 executor: RuleExecutor::new(plan.clone()),
+                conv_plan: plan.conv_plan.clone(),
                 alias_map,
             }
         })
@@ -74,8 +75,11 @@ pub fn run_oracle(
         let core_event = gen_event_to_core(event);
 
         for engine in &mut engines {
-            // Scan for expired instances first
-            let expired = engine.sm.scan_expired_at(event_nanos);
+            // Scan for expired instances first (with conv)
+            let expired =
+                engine
+                    .sm
+                    .scan_expired_at_with_conv(event_nanos, engine.conv_plan.as_ref());
             for close_out in expired {
                 if let Ok(Some(alert_record)) = engine.executor.execute_close(&close_out) {
                     alerts.push(OracleAlert {
@@ -121,7 +125,10 @@ pub fn run_oracle(
     let eos_nanos = eos_time.timestamp_nanos_opt().unwrap_or(i64::MAX);
 
     for engine in &mut engines {
-        let expired = engine.sm.scan_expired_at(eos_nanos);
+        let expired =
+            engine
+                .sm
+                .scan_expired_at_with_conv(eos_nanos, engine.conv_plan.as_ref());
 
         for close_out in expired {
             if let Ok(Some(alert_record)) = engine.executor.execute_close(&close_out) {
@@ -147,6 +154,7 @@ pub fn run_oracle(
 struct RuleEngine {
     sm: CepStateMachine,
     executor: RuleExecutor,
+    conv_plan: Option<ConvPlan>,
     /// window_name → Vec<bind_alias> for routing events to all matching aliases
     alias_map: HashMap<String, Vec<String>>,
 }

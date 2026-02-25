@@ -14,7 +14,8 @@ examples/
 ├── sum/                      # 场景 3: sum 聚合 + on close + tick
 ├── multi_step/               # 场景 4: 多步骤序列
 ├── avg/                      # 场景 5: avg 聚合 + 算术 score
-└── close_modes/              # 场景 6: close trigger 三种模式
+├── close_modes/              # 场景 6: close trigger 三种模式
+└── conv/                     # 场景 7: conv 结果集变换 (M27, L3)
 ```
 
 每个场景目录包含：
@@ -107,6 +108,29 @@ cd examples/close_modes
 wfl test rules/close_demo.wfl --schemas "schemas/*.wfs"
 ```
 
+### 7. conv/ — Top-N 结果集变换 (M27)
+
+conv 后处理变换 + fixed 窗口。在固定 1 小时窗口内统计各 IP 的端口扫描数，窗口到期后通过 `conv { sort(-scan) | top(2) ; }` 对批量结果排序并只保留 Top-2 扫描者。
+
+- **规则**: `top_scanners.wfl` — `on close { scan: c.dport | distinct | count >= 3; }` + `conv { sort(-scan) | top(2) ; }`
+- **Schema**: `network.wfs` — conn_events (netflow)
+- **Score**: 80.0
+- **特性**: `match<sip:1h:fixed>` + `conv` (L3)
+
+conv 支持四种操作，可通过 `|` 管道串联：
+
+| 操作 | 语法 | 说明 |
+|------|------|------|
+| sort | `sort(-field)` | 按字段排序，`-` 前缀为降序 |
+| top | `top(N)` | 保留前 N 条 |
+| dedup | `dedup(field)` | 按字段去重，保留首次出现的 |
+| where | `where(expr)` | 布尔过滤 |
+
+```bash
+cd examples/conv
+wfl test rules/top_scanners.wfl --schemas "schemas/*.wfs"
+```
+
 ## 运行全部测试
 
 ```bash
@@ -116,6 +140,7 @@ cd examples/sum        && wfl test rules/data_exfil.wfl   --schemas "schemas/*.w
 cd examples/multi_step && wfl test rules/chain_attack.wfl --schemas "schemas/*.wfs"
 cd examples/avg        && wfl test rules/dns_tunnel.wfl   --schemas "schemas/*.wfs"
 cd examples/close_modes && wfl test rules/close_demo.wfl  --schemas "schemas/*.wfs"
+cd examples/conv       && wfl test rules/top_scanners.wfl --schemas "schemas/*.wfs"
 ```
 
 ## Replay 示例
@@ -133,3 +158,4 @@ wfl replay rules/port_scan.wfl --schemas "schemas/*.wfs" --input data/conn_event
 - `tick` 使用时长语法：`tick(6m);`、`tick(31s);`
 - `flush` 通过 options 块指定：`options { close_trigger = flush; }`
 - 匹配引擎按顺序执行：event 步骤必须先满足，close 步骤才会被评估
+- `conv` 仅作用于 `fixed` 窗口到期时产生的 CloseOutput 批次，需配合 `on close` 使用；`conv` + sliding 窗口会触发编译错误

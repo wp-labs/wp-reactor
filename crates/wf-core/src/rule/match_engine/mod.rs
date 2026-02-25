@@ -448,20 +448,29 @@ impl CepStateMachine {
 
     /// Scan expired instances and apply conv transformations if configured.
     ///
-    /// Convenience method that calls [`scan_expired_at`] then applies
-    /// `apply_conv` when a conv plan is provided and there are outputs.
+    /// Filters out non-qualifying outputs (`!event_ok || !close_ok`) before
+    /// applying conv, so that `top`/`dedup` operate only on entries that
+    /// would actually produce alerts.
     pub fn scan_expired_at_with_conv(
         &mut self,
         watermark_nanos: i64,
         conv_plan: Option<&ConvPlan>,
     ) -> Vec<CloseOutput> {
         let outputs = self.scan_expired_at(watermark_nanos);
-        match conv_plan {
-            Some(plan) if !outputs.is_empty() => {
-                conv::apply_conv(plan, &self.plan.keys, outputs)
-            }
-            _ => outputs,
-        }
+        apply_conv_filtered(outputs, conv_plan, &self.plan.keys)
+    }
+
+    /// Close all active instances with optional conv transformations.
+    ///
+    /// Like [`close_all`], but applies conv to the qualifying outputs
+    /// (where `event_ok && close_ok`) before returning.
+    pub fn close_all_with_conv(
+        &mut self,
+        reason: CloseReason,
+        conv_plan: Option<&ConvPlan>,
+    ) -> Vec<CloseOutput> {
+        let outputs = self.close_all(reason);
+        apply_conv_filtered(outputs, conv_plan, &self.plan.keys)
     }
 
     /// Close all active instances, returning a [`CloseOutput`] for each.
@@ -525,4 +534,38 @@ impl CepStateMachine {
             self.emit_count += 1;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Conv helper — filter-then-transform
+// ---------------------------------------------------------------------------
+
+/// Filter close outputs to only qualifying entries, then apply conv.
+///
+/// Non-qualifying outputs (`!event_ok || !close_ok`) are separated first so
+/// that `top`/`dedup`/`where` operate only on entries that would produce
+/// alerts. The non-qualifying outputs are appended back (unchanged) so that
+/// callers that iterate the full batch and call `execute_close` still see
+/// them (they'll be harmlessly discarded by the `event_ok && close_ok`
+/// check inside `execute_close`).
+fn apply_conv_filtered(
+    outputs: Vec<CloseOutput>,
+    conv_plan: Option<&ConvPlan>,
+    keys: &[wf_lang::ast::FieldRef],
+) -> Vec<CloseOutput> {
+    let conv = match conv_plan {
+        Some(plan) => plan,
+        None => return outputs,
+    };
+
+    let (qualifying, non_qualifying): (Vec<_>, Vec<_>) =
+        outputs.into_iter().partition(|o| o.event_ok && o.close_ok);
+
+    if qualifying.is_empty() {
+        return non_qualifying;
+    }
+
+    let mut result = conv::apply_conv(conv, keys, qualifying);
+    result.extend(non_qualifying);
+    result
 }

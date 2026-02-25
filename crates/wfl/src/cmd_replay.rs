@@ -226,9 +226,10 @@ fn replay_with_plans<R: BufRead>(
         }
     }
 
-    // -- EOF: close all remaining instances --
-    for (sm, executor) in &mut engines {
-        for close in &sm.close_all(CloseReason::Eos) {
+    // -- EOF: close all remaining instances (with conv) --
+    for (i, (sm, executor)) in engines.iter_mut().enumerate() {
+        let conv_plan = plans[i].conv_plan.as_ref();
+        for close in &sm.close_all_with_conv(CloseReason::Eos, conv_plan) {
             match executor.execute_close_with_joins(close, &lookup) {
                 Ok(Some(alert)) => {
                     alerts.push(alert);
