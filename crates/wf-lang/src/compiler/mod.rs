@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::ast::{EntityTypeVal, FieldRef, RuleDecl, WflFile, WindowMode, CloseMode};
+use crate::ast::{CloseMode, EntityTypeVal, FieldRef, RuleDecl, WflFile, WindowMode};
 use crate::checker::check_wfl;
 use crate::plan::{
     AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, EntityPlan, ExceedAction,

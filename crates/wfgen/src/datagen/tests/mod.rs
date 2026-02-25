@@ -5,7 +5,7 @@ mod inject;
 
 use std::time::Duration;
 
-use wf_lang::ast::{CmpOp, Expr, FieldRef, Measure, CloseMode};
+use wf_lang::ast::{CloseMode, CmpOp, Expr, FieldRef, Measure};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
     WindowSpec, YieldPlan,

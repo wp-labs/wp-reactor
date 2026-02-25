@@ -151,7 +151,10 @@ rule r {
     assert_eq!(close_block.steps.len(), 1);
     assert_eq!(close_block.steps[0].branches[0].source, "resp");
     assert!(close_block.steps[0].branches[0].guard.is_some());
-    assert_eq!(close_block.steps[0].branches[0].pipe.measure, Measure::Count);
+    assert_eq!(
+        close_block.steps[0].branches[0].pipe.measure,
+        Measure::Count
+    );
     assert_eq!(close_block.steps[0].branches[0].pipe.cmp, CmpOp::Eq);
 }
 

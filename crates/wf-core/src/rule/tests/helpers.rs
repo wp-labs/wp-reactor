@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use wf_lang::ast::{BinOp, CmpOp, CloseMode, Expr, FieldRef, Measure};
+use wf_lang::ast::{BinOp, CloseMode, CmpOp, Expr, FieldRef, Measure};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
     WindowSpec, YieldPlan,

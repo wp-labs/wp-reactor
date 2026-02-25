@@ -1,12 +1,12 @@
 use "network.wfs"
 rule data_exfil {
-    events { c : conn_events }
-    match<sip:10m> {
-        on event { c.bytes | sum >= 100000000; }
-        and close { total: c.bytes | sum >= 50000000; }
-    } -> score(85.0)
-    entity(ip, c.sip)
-    yield network_alerts (sip = c.sip, alert_type = "data_exfil", detail = "high volume")
+  events { c : conn_events }
+  match<sip:10m> {
+    on event { c.bytes | sum >= 100000000; }
+    and close { total: c.bytes | sum >= 50000000; }
+  } -> score(85.0)
+  entity(ip, c.sip)
+  yield network_alerts (sip = c.sip, alert_type = "data_exfil", detail = "high volume")
 }
 
 test exfil_close_timeout for data_exfil {

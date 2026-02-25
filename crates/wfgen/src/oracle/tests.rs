@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use wf_lang::ast::{CmpOp, Expr, FieldRef, FieldSelector, Measure, Transform, CloseMode};
+use wf_lang::ast::{CloseMode, CmpOp, Expr, FieldRef, FieldSelector, Measure, Transform};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, EntityPlan, MatchPlan,
     RulePlan, ScorePlan, SortKeyPlan, StepPlan, WindowSpec, YieldPlan,

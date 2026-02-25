@@ -37,7 +37,7 @@ WarpParse（wp-motor）是一个高性能日志解析引擎，核心能力是：
 ### 1.4 术语约定（全文统一）
 
 - **事件（Event）**：输入到 WarpFusion 的原始结构化日志记录（RecordBatch 行）。
-- **规则命中（Hit）**：规则在某个窗口实例上满足 `on event`/`on close` 条件。
+- **规则命中（Hit）**：规则在某个窗口实例上满足 `on event`/`on close`/`and close` 条件。
 - **风险告警（Risk Alert）**：规则命中后输出的业务结果，核心字段为 `rule_name + score + entity_type/entity_id`（可含 `origin`、`score_contrib`）。
 - **运维告警（Ops Alert）**：对系统运行状态（断连、积压、丢弃率）的监控告警，区别于业务风险告警。
 - 代码中的 `AlertRecord` 保留原命名，但语义统一指”风险告警记录”。
@@ -47,7 +47,7 @@ WarpParse（wp-motor）是一个高性能日志解析引擎，核心能力是：
 截至 M24，WarpFusion 已完成 L1（单机 MVP）闭环：
 
 - **WFL 编译器**：.wfs + .wfl 解析 → 语义检查 → 编译为 `RulePlan`（CEP 状态机 + score/entity/yield 求值计划）
-- **CEP 引擎**：基于 scope-key 的状态机实例管理，支持 `on event` / `on close` 双阶段求值
+- **CEP 引擎**：基于 scope-key 的状态机实例管理，支持 `on event` / `on close`（OR）/ `and close`（AND）双阶段求值
 - **运行时闭环**：TCP 接收 Arrow IPC → Window 缓冲 → 规则执行 → 风险告警输出（Connector SinkDispatcher）
 - **告警输出**：Connector 模式（yield-target 路由 SinkDispatcher，基于 wp-connector-api）
 - **开发者工具**：`wfl`（explain / lint / fmt）、`wfgen`（测试数据生成 + oracle + verify）
@@ -802,7 +802,9 @@ pub struct CloseOutput {
     pub scope_key: Vec<Value>,
     pub close_reason: CloseReason,  // Timeout | Flush | Eos
     pub event_ok: bool,             // on event 是否满足
-    pub close_ok: bool,             // on close 是否满足
+    pub close_ok: bool,             // 关闭块是否满足
+    pub close_mode: CloseMode,      // Or（on close）| And（and close）
+    pub event_emitted: bool,        // OR 模式下事件路径是否已发出告警
     pub event_step_data: Vec<StepData>,
     pub close_step_data: Vec<StepData>,
     pub watermark_nanos: i64,
@@ -824,10 +826,11 @@ struct Instance {
     scope_key: Vec<Value>,
     created_at: i64,           // 纳秒时间戳
     current_step: usize,       // on event 当前步骤索引
-    event_ok: bool,            // on event 所有步骤是否已完成
+    event_ok: bool,            // on event 所有步骤是否已完成（AND 模式使用）
+    event_emitted: bool,       // on event 路径是否已发出告警（OR 模式使用）
     step_states: Vec<StepState>,        // on event 步骤状态
     completed_steps: Vec<StepData>,     // on event 已完成步骤数据
-    close_step_states: Vec<StepState>,  // on close 步骤状态
+    close_step_states: Vec<StepState>,  // 关闭块步骤状态
 }
 
 struct BranchState {
@@ -854,7 +857,9 @@ pub struct RuleExecutor {
 impl RuleExecutor {
     /// 事件命中后求值，生成告警
     pub fn execute_match(&self, matched: &MatchedContext) -> CoreResult<AlertRecord>;
-    /// 窗口关闭后求值，仅当 event_ok && close_ok 时生成告警
+    /// 窗口关闭后求值，按 close_mode 判定是否生成告警：
+    /// - AND 模式：仅当 event_ok && close_ok
+    /// - OR 模式：仅当 close_ok 且关闭块非空
     pub fn execute_close(&self, close: &CloseOutput) -> CoreResult<Option<AlertRecord>>;
 }
 ```
@@ -881,7 +886,7 @@ pub struct RulePlan {
 - L1 不含 Join 执行（JoinPlan 为空），L2 将引入 DataFusion 执行 `join snapshot/asof`
 - Score 求值直接从 `ScorePlan.expr` 计算，结果 clamp 到 [0, 100]
 - Entity ID 从 MatchedContext 中的 scope-key 或 step-data 提取
-- `on close` 仅在 `event_ok && close_ok` 时生成告警（部分满足的实例不输出）
+- 关闭路径按 `close_mode` 判定：AND 模式（`and close`）仅在 `event_ok && close_ok` 时生成告警；OR 模式（`on close`）事件路径独立触发，关闭路径在 `close_ok` 且关闭块非空时独立生成告警
 - AlertRecord 的 `yield_target` 字段（`serde(skip)`）来自 `YieldPlan.target`，用于 sink 路由
 
 ### 4.5 告警输出 — Connector-based Sink 路由
@@ -1259,7 +1264,7 @@ rule brute_force_then_scan {
         on event {
             fail | count >= $FAIL_THRESHOLD;
         }
-        on close {
+        and close {
             fail | count >= 1;
         }
     } -> score(70.0)
@@ -1283,7 +1288,7 @@ rule brute_force_then_scan {
   → check_wfl（语义检查，返回 Vec<CheckError>）
   → compile_wfl（AST → Vec<RulePlan>）
     ├─ compile_binds → Vec<BindPlan>
-    ├─ compile_match → MatchPlan（keys, WindowSpec::Sliding, event_steps, close_steps）
+    ├─ compile_match → MatchPlan（keys, WindowSpec::Sliding, event_steps, close_steps, close_mode）
     ├─ compile_entity → EntityPlan
     ├─ compile_score → ScorePlan
     ├─ compile_yield → YieldPlan

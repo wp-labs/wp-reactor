@@ -134,13 +134,13 @@ wfl test rules/top_scanners.wfl --schemas "schemas/*.wfs"
 ## 运行全部测试
 
 ```bash
-cd examples/count      && wfl test rules/brute_force.wfl  --schemas "schemas/*.wfs" --var FAIL_THRESHOLD=3
-cd examples/distinct   && wfl test rules/port_scan.wfl    --schemas "schemas/*.wfs"
-cd examples/sum        && wfl test rules/data_exfil.wfl   --schemas "schemas/*.wfs"
-cd examples/multi_step && wfl test rules/chain_attack.wfl --schemas "schemas/*.wfs"
-cd examples/avg        && wfl test rules/dns_tunnel.wfl   --schemas "schemas/*.wfs"
-cd examples/close_modes && wfl test rules/close_demo.wfl  --schemas "schemas/*.wfs"
-cd examples/conv       && wfl test rules/top_scanners.wfl --schemas "schemas/*.wfs"
+cd examples/count       && wfl test rules/brute_force.wfl  --schemas "schemas/*.wfs" --var FAIL_THRESHOLD=3
+cd examples/distinct    && wfl test rules/port_scan.wfl    --schemas "schemas/*.wfs"
+cd examples/sum         && wfl test rules/data_exfil.wfl   --schemas "schemas/*.wfs"
+cd examples/multi_step  && wfl test rules/chain_attack.wfl --schemas "schemas/*.wfs"
+cd examples/avg         && wfl test rules/dns_tunnel.wfl   --schemas "schemas/*.wfs"
+cd examples/close_modes && wfl test rules/close_demo.wfl   --schemas "schemas/*.wfs"
+cd examples/conv        && wfl test rules/top_scanners.wfl --schemas "schemas/*.wfs"
 ```
 
 ## Replay 示例
