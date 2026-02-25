@@ -62,6 +62,14 @@ impl fmt::Display for RuleExplanation {
             )?;
         }
 
+        // Conv
+        if let Some(ref chains) = self.conv {
+            writeln!(f, "  Conv:")?;
+            for chain in chains {
+                writeln!(f, "    {}", chain)?;
+            }
+        }
+
         // Lineage
         if !self.lineage.is_empty() {
             writeln!(f, "  Field Lineage:")?;

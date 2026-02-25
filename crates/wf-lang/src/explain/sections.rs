@@ -1,6 +1,7 @@
 use crate::ast::{Expr, FieldRef};
 use crate::plan::{
-    AggPlan, BindPlan, BranchPlan, JoinPlan, LimitsPlan, MatchPlan, StepPlan, WindowSpec, YieldPlan,
+    AggPlan, BindPlan, BranchPlan, ConvOpPlan, ConvPlan, JoinPlan, LimitsPlan, MatchPlan, StepPlan,
+    WindowSpec, YieldPlan,
 };
 use crate::schema::WindowSchema;
 
@@ -207,4 +208,36 @@ fn trace_field_origin(expr: &Expr, binds: &[BindPlan]) -> String {
         }
         _ => format_expr(expr),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Conv
+// ---------------------------------------------------------------------------
+
+pub(super) fn explain_conv(plan: &ConvPlan) -> Vec<String> {
+    plan.chains
+        .iter()
+        .map(|chain| {
+            chain
+                .ops
+                .iter()
+                .map(|op| match op {
+                    ConvOpPlan::Sort(keys) => {
+                        let k: Vec<String> = keys
+                            .iter()
+                            .map(|k| {
+                                let prefix = if k.descending { "-" } else { "" };
+                                format!("{}{}", prefix, format_expr(&k.expr))
+                            })
+                            .collect();
+                        format!("sort({})", k.join(", "))
+                    }
+                    ConvOpPlan::Top(n) => format!("top({})", n),
+                    ConvOpPlan::Dedup(e) => format!("dedup({})", format_expr(e)),
+                    ConvOpPlan::Where(e) => format!("where({})", format_expr(e)),
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .collect()
 }

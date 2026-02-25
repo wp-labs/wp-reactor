@@ -1,5 +1,6 @@
 mod clauses;
 mod contract;
+mod conv;
 mod events;
 mod expr;
 mod join;
@@ -9,6 +10,7 @@ mod rule;
 
 pub use clauses::*;
 pub use contract::*;
+pub use conv::*;
 pub use events::*;
 pub use expr::*;
 pub use join::*;

@@ -24,7 +24,7 @@ pub struct UseDecl {
 // Rule
 // ---------------------------------------------------------------------------
 
-/// `rule name { meta events match->score [join...] entity yield [limits] }`
+/// `rule name { meta events match->score [join...] entity yield [conv] [limits] }`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct RuleDecl {
@@ -36,6 +36,7 @@ pub struct RuleDecl {
     pub joins: Vec<JoinClause>,
     pub entity: EntityClause,
     pub yield_clause: YieldClause,
+    pub conv: Option<ConvClause>,
     pub limits: Option<LimitsBlock>,
 }
 

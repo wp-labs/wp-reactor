@@ -189,11 +189,33 @@ pub struct YieldField {
 }
 
 // ---------------------------------------------------------------------------
-// ConvPlan — conversion / enrichment (None for L1)
+// ConvPlan — result set transformations for fixed windows (L3)
 // ---------------------------------------------------------------------------
 
-/// Conversion plan. `None` for L1 — no conv support yet.
+/// Compiled conv plan — post-close result set transformations.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConvPlan {
-    pub steps: Vec<ExprPlan>,
+    pub chains: Vec<ConvChainPlan>,
+}
+
+/// One semicolon-separated chain of piped operations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConvChainPlan {
+    pub ops: Vec<ConvOpPlan>,
+}
+
+/// A single conv operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConvOpPlan {
+    Sort(Vec<SortKeyPlan>),
+    Top(u64),
+    Dedup(ExprPlan),
+    Where(ExprPlan),
+}
+
+/// Sort key with direction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortKeyPlan {
+    pub expr: ExprPlan,
+    pub descending: bool,
 }

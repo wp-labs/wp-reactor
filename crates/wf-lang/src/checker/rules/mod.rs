@@ -1,3 +1,4 @@
+mod conv_check;
 mod joins;
 mod keys;
 mod limits;
@@ -89,4 +90,7 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
 
     // Check limits
     limits::check_limits(rule, name, errors);
+
+    // Check conv (L3: requires fixed window)
+    conv_check::check_conv(rule, name, errors);
 }

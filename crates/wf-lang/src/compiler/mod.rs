@@ -3,9 +3,9 @@ use std::time::Duration;
 use crate::ast::{EntityTypeVal, FieldRef, RuleDecl, WflFile, WindowMode};
 use crate::checker::check_wfl;
 use crate::plan::{
-    AggPlan, BindPlan, BranchPlan, EntityPlan, ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan,
-    LimitsPlan, MatchPlan, RateSpec, RulePlan, ScorePlan, StepPlan, WindowSpec, YieldField,
-    YieldPlan,
+    AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, EntityPlan, ExceedAction,
+    JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, RateSpec, RulePlan, ScorePlan,
+    SortKeyPlan, StepPlan, WindowSpec, YieldField, YieldPlan,
 };
 use crate::schema::WindowSchema;
 
@@ -43,7 +43,7 @@ fn compile_rule(rule: &RuleDecl) -> anyhow::Result<RulePlan> {
         entity_plan: compile_entity(rule),
         yield_plan: compile_yield(rule),
         score_plan: compile_score(rule),
-        conv_plan: None,
+        conv_plan: compile_conv(&rule.conv),
         limits_plan: compile_limits(&rule.limits),
     })
 }
@@ -293,4 +293,37 @@ fn parse_rate_spec(s: &str) -> Option<RateSpec> {
         _ => return None,
     };
     Some(RateSpec { count, per })
+}
+
+// ---------------------------------------------------------------------------
+// Conv
+// ---------------------------------------------------------------------------
+
+fn compile_conv(conv: &Option<crate::ast::ConvClause>) -> Option<ConvPlan> {
+    let conv = conv.as_ref()?;
+    Some(ConvPlan {
+        chains: conv
+            .chains
+            .iter()
+            .map(|chain| ConvChainPlan {
+                ops: chain
+                    .steps
+                    .iter()
+                    .map(|step| match step {
+                        crate::ast::ConvStep::Sort(keys) => ConvOpPlan::Sort(
+                            keys.iter()
+                                .map(|k| SortKeyPlan {
+                                    expr: k.expr.clone(),
+                                    descending: k.descending,
+                                })
+                                .collect(),
+                        ),
+                        crate::ast::ConvStep::Top(n) => ConvOpPlan::Top(*n),
+                        crate::ast::ConvStep::Dedup(e) => ConvOpPlan::Dedup(e.clone()),
+                        crate::ast::ConvStep::Where(e) => ConvOpPlan::Where(e.clone()),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
 }

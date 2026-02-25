@@ -10,7 +10,8 @@ use crate::schema::WindowSchema;
 pub use format::{format_cmp, format_expr, format_field_ref, format_measure};
 
 use sections::{
-    compute_lineage, explain_binds, explain_joins, explain_limits, explain_match, explain_yield,
+    compute_lineage, explain_binds, explain_conv, explain_joins, explain_limits, explain_match,
+    explain_yield,
 };
 
 /// Human-readable explanation of a compiled rule.
@@ -25,6 +26,7 @@ pub struct RuleExplanation {
     pub entity_id: String,
     pub yield_target: String,
     pub yield_fields: Vec<(String, String)>,
+    pub conv: Option<Vec<String>>,
     pub limits: Option<String>,
     pub lineage: Vec<(String, String)>,
 }
@@ -61,6 +63,7 @@ fn explain_rule(plan: &RulePlan, schemas: &[WindowSchema]) -> RuleExplanation {
         None => plan.yield_plan.target.clone(),
     };
     let yield_fields = explain_yield(&plan.yield_plan);
+    let conv = plan.conv_plan.as_ref().map(explain_conv);
     let limits = plan.limits_plan.as_ref().map(explain_limits);
     let lineage = compute_lineage(&plan.binds, &plan.yield_plan, schemas);
 
@@ -74,6 +77,7 @@ fn explain_rule(plan: &RulePlan, schemas: &[WindowSchema]) -> RuleExplanation {
         entity_id,
         yield_target,
         yield_fields,
+        conv,
         limits,
         lineage,
     }

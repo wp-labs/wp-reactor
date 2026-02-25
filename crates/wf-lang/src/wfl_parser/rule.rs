@@ -7,6 +7,7 @@ use crate::ast::*;
 use crate::parse_utils::{ident, kw, quoted_string, ws_skip};
 
 use super::clauses;
+use super::conv_p;
 use super::events;
 use super::match_p;
 
@@ -71,6 +72,10 @@ pub(super) fn rule_decl(input: &mut &str) -> ModalResult<RuleDecl> {
         )))
         .parse_next(input)?;
 
+    // Optional conv block (L3, fixed window only — checker enforces constraint)
+    ws_skip.parse_next(input)?;
+    let conv = opt(conv_p::conv_clause).parse_next(input)?;
+
     // Optional limits block
     ws_skip.parse_next(input)?;
     let limits = opt(clauses::limits_block).parse_next(input)?;
@@ -91,6 +96,7 @@ pub(super) fn rule_decl(input: &mut &str) -> ModalResult<RuleDecl> {
         joins,
         entity,
         yield_clause,
+        conv,
         limits,
     })
 }

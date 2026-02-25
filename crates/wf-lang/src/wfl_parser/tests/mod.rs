@@ -2,6 +2,7 @@ mod advanced;
 mod basic;
 mod clauses;
 mod contract;
+mod conv;
 mod errors;
 mod examples;
 mod expr;

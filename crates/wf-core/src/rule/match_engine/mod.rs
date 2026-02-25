@@ -1,4 +1,5 @@
 mod close;
+mod conv;
 mod eval;
 mod key;
 mod state;
@@ -15,11 +16,14 @@ pub(crate) use eval::{eval_expr, values_equal};
 pub(crate) use key::{field_ref_name, value_to_string};
 
 #[cfg(test)]
+pub(crate) use conv::apply_conv;
+
+#[cfg(test)]
 pub(crate) use eval::eval_expr_ext;
 
 use std::collections::HashMap;
 
-use wf_lang::plan::{ExceedAction, LimitsPlan, MatchPlan, WindowSpec};
+use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, WindowSpec};
 
 use close::{accumulate_close_steps, evaluate_close};
 use key::{InstanceKey, extract_key, make_scope_key_str};
@@ -440,6 +444,24 @@ impl CepStateMachine {
             }
         }
         results
+    }
+
+    /// Scan expired instances and apply conv transformations if configured.
+    ///
+    /// Convenience method that calls [`scan_expired_at`] then applies
+    /// `apply_conv` when a conv plan is provided and there are outputs.
+    pub fn scan_expired_at_with_conv(
+        &mut self,
+        watermark_nanos: i64,
+        conv_plan: Option<&ConvPlan>,
+    ) -> Vec<CloseOutput> {
+        let outputs = self.scan_expired_at(watermark_nanos);
+        match conv_plan {
+            Some(plan) if !outputs.is_empty() => {
+                conv::apply_conv(plan, &self.plan.keys, outputs)
+            }
+            _ => outputs,
+        }
     }
 
     /// Close all active instances, returning a [`CloseOutput`] for each.
