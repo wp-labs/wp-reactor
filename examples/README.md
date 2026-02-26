@@ -16,7 +16,8 @@ examples/
 ├── avg/                      # 场景 5: avg 聚合 + 算术 score
 ├── close_modes/              # 场景 6: close trigger 三种模式
 ├── conv/                     # 场景 7: conv 结果集变换 (M27, L3)
-└── pipeline/                 # 场景 8: 多级管道 |> (M28.5, L3)
+├── pipeline/                 # 场景 8: 多级管道 |> (M28.5, L3)
+└── functions/                # 场景 9: 字符/集合函数组合 (SPL 对齐)
 ```
 
 每个场景目录包含：
@@ -146,6 +147,20 @@ cd examples/pipeline
 wfl replay rules/repeated_fail_bursts.wfl --schemas "schemas/*.wfs" --input data/auth_events.ndjson --event e
 ```
 
+### 9. functions/ — 字符/集合函数组合
+
+演示在一个规则中组合使用 `trim`、`replace`、`split`、`mvcount`、`mvdedup`、`mvjoin`，用于把原始 action 文本标准化后再做集合汇总。
+
+- **规则**: `action_string_set_ops.wfl` — `mvcount(split(replace(trim(e.action), " ", ""), ","))` + `mvjoin(mvdedup(split(replace(trim(e.action), " ", ""), ",")), "|")`
+- **Schema**: `security.wfs` — auth_events (syslog)
+- **Score**: 72.0
+- **特性**: 字符处理 + 多值处理函数链式组合
+
+```bash
+cd examples/functions
+wfl replay rules/action_string_set_ops.wfl --schemas "schemas/*.wfs" --input data/auth_events.ndjson --event e
+```
+
 ## 运行全部示例验证
 
 ```bash
@@ -157,6 +172,7 @@ cd examples/avg         && wfl test rules/dns_tunnel.wfl   --schemas "schemas/*.
 cd examples/close_modes && wfl test rules/close_demo.wfl   --schemas "schemas/*.wfs"
 cd examples/conv        && wfl test rules/top_scanners.wfl --schemas "schemas/*.wfs"
 cd examples/pipeline    && wfl replay rules/repeated_fail_bursts.wfl --schemas "schemas/*.wfs" --input data/auth_events.ndjson --event e
+cd examples/functions   && wfl replay rules/action_string_set_ops.wfl --schemas "schemas/*.wfs" --input data/auth_events.ndjson --event e
 ```
 
 ## Replay 示例

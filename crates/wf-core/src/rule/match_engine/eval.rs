@@ -12,7 +12,7 @@ use super::types::{Event, RollingStats, Value, WindowLookup};
 /// Evaluate an expression against an event, returning a [`Value`].
 ///
 /// Supports: literals, field refs, BinOp (And/Or/comparisons/arithmetic),
-/// Neg, InList, and basic FuncCall (contains, lower, upper, len, has, baseline).
+/// Neg, InList, and basic FuncCall (contains, startswith, endswith, substr, replace, trim, lower, upper, len, mvcount, mvjoin, mvindex, mvappend, split, mvdedup, has, baseline).
 pub(crate) fn eval_expr(expr: &Expr, event: &Event) -> Option<Value> {
     let mut empty = HashMap::new();
     eval_expr_ext(expr, event, None, &mut empty)
@@ -256,9 +256,20 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
 ///
 /// Supported functions:
 /// - `contains(haystack, needle)` → Bool
+/// - `startswith(text, prefix)` → Bool
+/// - `endswith(text, suffix)` → Bool
+/// - `substr(text, start [, length])` → Str
+/// - `replace(text, pattern, replacement)` → Str
+/// - `trim(s)` → Str
 /// - `lower(s)` → Str
 /// - `upper(s)` → Str
 /// - `len(s)` → Number
+/// - `mvcount(arr)` → Number
+/// - `mvjoin(arr, sep)` → Str
+/// - `mvindex(arr, idx [, end])` → scalar or Array
+/// - `mvappend(v1, v2, ...)` → Array
+/// - `split(text, sep)` → Array<Str>
+/// - `mvdedup(arr)` → Array
 fn eval_func_call(
     name: &str,
     args: &[Expr],
@@ -280,6 +291,107 @@ fn eval_func_call(
                 _ => return None,
             };
             Some(Value::Bool(haystack.contains(&*needle)))
+        }
+        "startswith" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let prefix = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            Some(Value::Bool(text.starts_with(&prefix)))
+        }
+        "endswith" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let suffix = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            Some(Value::Bool(text.ends_with(&suffix)))
+        }
+        "substr" => {
+            if args.len() != 2 && args.len() != 3 {
+                return None;
+            }
+            let text = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let start = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Number(n) => n.trunc() as i64,
+                _ => return None,
+            };
+            let chars: Vec<char> = text.chars().collect();
+            let len = chars.len() as i64;
+            let mut start_idx = if start > 0 {
+                start - 1
+            } else if start < 0 {
+                len + start
+            } else {
+                0
+            };
+            if start_idx < 0 {
+                start_idx = 0;
+            }
+            if start_idx >= len {
+                return Some(Value::Str(String::new()));
+            }
+            let mut end_idx = len;
+            if args.len() == 3 {
+                let length = match eval_expr_ext(&args[2], event, windows, baselines)? {
+                    Value::Number(n) => n.trunc() as i64,
+                    _ => return None,
+                };
+                if length <= 0 {
+                    return Some(Value::Str(String::new()));
+                }
+                end_idx = (start_idx + length).min(len);
+            }
+            let sub = chars[start_idx as usize..end_idx as usize]
+                .iter()
+                .collect::<String>();
+            Some(Value::Str(sub))
+        }
+        "replace" => {
+            if args.len() != 3 {
+                return None;
+            }
+            let text = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let pattern = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let replacement = match eval_expr_ext(&args[2], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let re = regex::Regex::new(&pattern).ok()?;
+            Some(Value::Str(
+                re.replace_all(&text, replacement.as_str()).into_owned(),
+            ))
+        }
+        "trim" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => Some(Value::Str(s.trim().to_string())),
+                _ => None,
+            }
         }
         "lower" => {
             if args.len() != 1 {
@@ -307,6 +419,129 @@ fn eval_func_call(
                 Value::Str(s) => Some(Value::Number(s.len() as f64)),
                 _ => None,
             }
+        }
+        "mvcount" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Array(arr) => Some(Value::Number(arr.len() as f64)),
+                _ => None,
+            }
+        }
+        "mvjoin" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let arr = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Array(arr) => arr,
+                _ => return None,
+            };
+            let sep = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let joined = arr
+                .into_iter()
+                .map(|v| value_to_string(&v))
+                .collect::<Vec<_>>()
+                .join(&sep);
+            Some(Value::Str(joined))
+        }
+        "mvindex" => {
+            if args.len() != 2 && args.len() != 3 {
+                return None;
+            }
+            let arr = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Array(arr) => arr,
+                _ => return None,
+            };
+            if args.len() == 2 {
+                let idx = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                    Value::Number(n) => normalize_index(n.trunc() as i64, arr.len()),
+                    _ => return None,
+                }?;
+                return arr.get(idx).cloned();
+            }
+            if arr.is_empty() {
+                return Some(Value::Array(Vec::new()));
+            }
+            let start = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Number(n) => n.trunc() as i64,
+                _ => return None,
+            };
+            let end = match eval_expr_ext(&args[2], event, windows, baselines)? {
+                Value::Number(n) => n.trunc() as i64,
+                _ => return None,
+            };
+            let len = arr.len() as i64;
+            let mut start_idx = if start < 0 { len + start } else { start };
+            let mut end_idx = if end < 0 { len + end } else { end };
+            if end_idx < 0 || start_idx >= len {
+                return Some(Value::Array(Vec::new()));
+            }
+            if start_idx < 0 {
+                start_idx = 0;
+            }
+            if end_idx >= len {
+                end_idx = len - 1;
+            }
+            if start_idx > end_idx {
+                return Some(Value::Array(Vec::new()));
+            }
+            Some(Value::Array(
+                arr[start_idx as usize..=end_idx as usize].to_vec(),
+            ))
+        }
+        "mvappend" => {
+            if args.is_empty() {
+                return None;
+            }
+            let mut out: Vec<Value> = Vec::new();
+            for arg in args {
+                match eval_expr_ext(arg, event, windows, baselines)? {
+                    Value::Array(values) => out.extend(values),
+                    value => out.push(value),
+                }
+            }
+            Some(Value::Array(out))
+        }
+        "split" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let sep = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let parts = if sep.is_empty() {
+                text.chars().map(|c| Value::Str(c.to_string())).collect()
+            } else {
+                text.split(&sep)
+                    .map(|s| Value::Str(s.to_string()))
+                    .collect()
+            };
+            Some(Value::Array(parts))
+        }
+        "mvdedup" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let arr = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Array(arr) => arr,
+                _ => return None,
+            };
+            let mut deduped: Vec<Value> = Vec::new();
+            for v in arr {
+                if !deduped.iter().any(|existing| values_equal(existing, &v)) {
+                    deduped.push(v);
+                }
+            }
+            Some(Value::Array(deduped))
         }
         "regex_match" => {
             if args.len() != 2 {
@@ -488,5 +723,15 @@ fn coerce_to_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => Some(*n),
         _ => None,
+    }
+}
+
+fn normalize_index(index: i64, len: usize) -> Option<usize> {
+    let len = len as i64;
+    let normalized = if index < 0 { len + index } else { index };
+    if normalized < 0 || normalized >= len {
+        None
+    } else {
+        Some(normalized as usize)
     }
 }

@@ -1,0 +1,22 @@
+window auth_events {
+    stream = "syslog"
+    time = event_time
+    over = 5m
+
+    fields {
+        sip: ip
+        username: chars
+        action: chars
+        event_time: time
+    }
+}
+
+window security_alerts {
+    over = 0
+    fields {
+        sip: ip
+        token_count: digit
+        uniq_actions: chars
+        message: chars
+    }
+}

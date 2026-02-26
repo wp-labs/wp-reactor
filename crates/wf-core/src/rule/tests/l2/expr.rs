@@ -214,3 +214,308 @@ fn time_bucket_exact_boundary() {
     // Should stay at 600s
     assert_eq!(result, Some(Value::Number(600_000_000_000.0)));
 }
+
+// ===========================================================================
+// replace / trim / mvcount / mvjoin / mvindex / mvappend / split / mvdedup
+// ===========================================================================
+
+#[test]
+fn replace_regex_substitution() {
+    use crate::rule::match_engine::{Event, eval_expr};
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "replace".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("action".to_string())),
+            Expr::StringLit("fail.*".to_string()),
+            Expr::StringLit("blocked".to_string()),
+        ],
+    };
+    let mut fields = HashMap::new();
+    fields.insert("action".to_string(), Value::Str("failed_login".to_string()));
+    let event = Event { fields };
+    assert_eq!(
+        eval_expr(&expr, &event),
+        Some(Value::Str("blocked".to_string()))
+    );
+}
+
+#[test]
+fn startswith_and_endswith_work() {
+    use crate::rule::match_engine::{Event, eval_expr};
+
+    let starts = Expr::FuncCall {
+        qualifier: None,
+        name: "startswith".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("msg".to_string())),
+            Expr::StringLit("failed".to_string()),
+        ],
+    };
+    let ends = Expr::FuncCall {
+        qualifier: None,
+        name: "endswith".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("msg".to_string())),
+            Expr::StringLit("root".to_string()),
+        ],
+    };
+    let mut fields = HashMap::new();
+    fields.insert(
+        "msg".to_string(),
+        Value::Str("failed_login_root".to_string()),
+    );
+    let event = Event { fields };
+    assert_eq!(eval_expr(&starts, &event), Some(Value::Bool(true)));
+    assert_eq!(eval_expr(&ends, &event), Some(Value::Bool(true)));
+}
+
+#[test]
+fn substr_supports_one_based_and_negative_start() {
+    use crate::rule::match_engine::{Event, eval_expr};
+
+    let mut fields = HashMap::new();
+    fields.insert("msg".to_string(), Value::Str("abcdef".to_string()));
+    let event = Event { fields };
+
+    let one_based = Expr::FuncCall {
+        qualifier: None,
+        name: "substr".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("msg".to_string())),
+            Expr::Number(2.0),
+            Expr::Number(3.0),
+        ],
+    };
+    assert_eq!(
+        eval_expr(&one_based, &event),
+        Some(Value::Str("bcd".to_string()))
+    );
+
+    let negative = Expr::FuncCall {
+        qualifier: None,
+        name: "substr".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("msg".to_string())),
+            Expr::Neg(Box::new(Expr::Number(2.0))),
+        ],
+    };
+    assert_eq!(
+        eval_expr(&negative, &event),
+        Some(Value::Str("ef".to_string()))
+    );
+}
+
+#[test]
+fn trim_removes_surrounding_whitespace() {
+    use crate::rule::match_engine::{Event, eval_expr};
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "trim".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+    };
+    let mut fields = HashMap::new();
+    fields.insert("msg".to_string(), Value::Str("  hello\t".to_string()));
+    let event = Event { fields };
+    assert_eq!(
+        eval_expr(&expr, &event),
+        Some(Value::Str("hello".to_string()))
+    );
+}
+
+#[test]
+fn mvcount_array_returns_length() {
+    use crate::rule::match_engine::{Event, eval_expr};
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "mvcount".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("vals".to_string()))],
+    };
+    let mut fields = HashMap::new();
+    fields.insert(
+        "vals".to_string(),
+        Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str("c".to_string()),
+        ]),
+    );
+    let event = Event { fields };
+    assert_eq!(eval_expr(&expr, &event), Some(Value::Number(3.0)));
+}
+
+#[test]
+fn mvjoin_array_with_separator() {
+    use crate::rule::match_engine::{Event, eval_expr};
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "mvjoin".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("vals".to_string())),
+            Expr::StringLit("|".to_string()),
+        ],
+    };
+    let mut fields = HashMap::new();
+    fields.insert(
+        "vals".to_string(),
+        Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str("c".to_string()),
+        ]),
+    );
+    let event = Event { fields };
+    assert_eq!(
+        eval_expr(&expr, &event),
+        Some(Value::Str("a|b|c".to_string()))
+    );
+}
+
+#[test]
+fn mvindex_single_and_range() {
+    use crate::rule::match_engine::{Event, eval_expr};
+
+    let mut fields = HashMap::new();
+    fields.insert(
+        "vals".to_string(),
+        Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str("c".to_string()),
+            Value::Str("d".to_string()),
+        ]),
+    );
+    let event = Event { fields };
+
+    let single = Expr::FuncCall {
+        qualifier: None,
+        name: "mvindex".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("vals".to_string())),
+            Expr::Neg(Box::new(Expr::Number(1.0))),
+        ],
+    };
+    assert_eq!(
+        eval_expr(&single, &event),
+        Some(Value::Str("d".to_string()))
+    );
+
+    let range = Expr::FuncCall {
+        qualifier: None,
+        name: "mvindex".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("vals".to_string())),
+            Expr::Number(1.0),
+            Expr::Number(2.0),
+        ],
+    };
+    assert_eq!(
+        eval_expr(&range, &event),
+        Some(Value::Array(vec![
+            Value::Str("b".to_string()),
+            Value::Str("c".to_string()),
+        ]))
+    );
+}
+
+#[test]
+fn mvappend_flattens_arrays_and_scalars() {
+    use crate::rule::match_engine::{Event, eval_expr};
+
+    let mut fields = HashMap::new();
+    fields.insert(
+        "vals".to_string(),
+        Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+        ]),
+    );
+    let event = Event { fields };
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "mvappend".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("vals".to_string())),
+            Expr::StringLit("c".to_string()),
+            Expr::FuncCall {
+                qualifier: None,
+                name: "split".to_string(),
+                args: vec![
+                    Expr::StringLit("d,e".to_string()),
+                    Expr::StringLit(",".to_string()),
+                ],
+            },
+        ],
+    };
+    assert_eq!(
+        eval_expr(&expr, &event),
+        Some(Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str("c".to_string()),
+            Value::Str("d".to_string()),
+            Value::Str("e".to_string()),
+        ]))
+    );
+}
+
+#[test]
+fn split_text_to_array() {
+    use crate::rule::match_engine::{Event, eval_expr};
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "split".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("csv".to_string())),
+            Expr::StringLit(",".to_string()),
+        ],
+    };
+    let mut fields = HashMap::new();
+    fields.insert("csv".to_string(), Value::Str("a,b,,c".to_string()));
+    let event = Event { fields };
+    assert_eq!(
+        eval_expr(&expr, &event),
+        Some(Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str(String::new()),
+            Value::Str("c".to_string()),
+        ]))
+    );
+}
+
+#[test]
+fn mvdedup_removes_duplicates_keep_order() {
+    use crate::rule::match_engine::{Event, eval_expr};
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "mvdedup".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("vals".to_string()))],
+    };
+    let mut fields = HashMap::new();
+    fields.insert(
+        "vals".to_string(),
+        Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str("a".to_string()),
+            Value::Str("c".to_string()),
+            Value::Str("b".to_string()),
+        ]),
+    );
+    let event = Event { fields };
+    assert_eq!(
+        eval_expr(&expr, &event),
+        Some(Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str("c".to_string()),
+        ]))
+    );
+}

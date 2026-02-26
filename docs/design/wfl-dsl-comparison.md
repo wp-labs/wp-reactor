@@ -1,5 +1,5 @@
 # WFL 与主流关联引擎 DSL 对比分析
-<!-- 角色：架构师 | 状态：v2.1 对齐中 | 创建：2026-02-13 | 更新：2026-02-20 -->
+<!-- 角色：架构师 | 状态：v2.1 对齐中 | 创建：2026-02-13 | 更新：2026-02-26 -->
 
 > 本文档对比 WFL（Warp Fusion Language）与 YARA-L 2.0、Elastic EQL、Sigma、Splunk SPL、KQL（Microsoft Sentinel）五种主流关联/检测 DSL 的能力差异，分析 WFL 的设计优势与已知短板。
 >
@@ -17,9 +17,9 @@
 | 会话窗口 | `match<key:session(gap)>` (L3) | ✗ | ✗ | ✗ | `transaction maxpause=` | ✗（需手写） |
 | 聚合 | `count/sum/avg/min/max/distinct` | `#e > 3` | ✗ | `count`（基础） | `stats` 全功能 | `summarize` 全功能 |
 | 统计函数 | `stddev`/`percentile` (L3) | ✗ | ✗ | ✗ | `stdev`/`perc95` 等 | `stdev`/`percentile` |
-| 集合收集 | `collect_set`/`collect_list`/`first`/`last` (L3) | ✗ | ✗ | ✗ | `values`/`list`/`first`/`last` | `make_set`/`make_list` |
+| 集合收集 | `collect_set`/`collect_list`/`first`/`last` + `mvcount`/`mvjoin`/`mvdedup` (L3) | ✗ | ✗ | ✗ | `values`/`list`/`first`/`last` + `mvcount`/`mvjoin` | `make_set`/`make_list` |
 | 条件表达式 | `if/then/else` (L2) | ✗ | ✗ | ✗ | `eval if(c,a,b)` | `iff(c,a,b)` |
-| 字符串函数 | `contains`/`regex_match`/`len`/`lower`/`upper` (L2) | `re.regex` | `match`/`length` | `contains`（YAML） | 200+ 函数 | `contains`/`strlen` 等 |
+| 字符串函数 | `contains`/`regex_match`/`replace`/`trim`/`split`/`len`/`lower`/`upper` (L2) | `re.regex` | `match`/`length` | `contains`（YAML） | 200+ 函数 | `contains`/`strlen` 等 |
 | 时间函数 | `time_diff`/`time_bucket` (L2) | ✗ | ✗ | ✗ | `eval relative_time` | `datetime_diff`/`bin` |
 | 格式化函数 | `fmt(STRING, expr, ...)` (L1) | ✗ | ✗ | ✗ | `printf` | `strcat`/`format_*` |
 | 结果集变换 | `conv { sort \| top \| dedup ; }` (L3) | ✗ | ✗ | ✗ | `sort/head/dedup` | `sort/take` |
@@ -111,14 +111,14 @@
 | 基线偏离 | `baseline(expr, dur, method)` 内置 + 持久化 | 无内置（需 MLTK 外部模块） |
 | 风险等级 | `score` → runtime `level_map` 可版本化映射 | 无内置概念 |
 | 聚合深度 | 基础聚合 + `stddev`/`percentile` + `conv` + `fixed` | **仍超** — `eventstats/streamstats` + 无限管道 + 200+ 函数 |
-| 集合收集 | `collect_set`/`collect_list`/`first`/`last` | `values`/`list`/`first`/`last` 功能等价 |
+| 集合收集 | `collect_set`/`collect_list`/`first`/`last` + `mvcount`/`mvjoin`/`mvdedup` | `values`/`list`/`first`/`last` + `mvcount`/`mvjoin` 功能等价 |
 | 条件表达式 | `if/then/else` + `hit()` 覆盖核心场景 | `eval if()`/`case()` + 完整表达式引擎 |
-| 字符串函数 | `contains`/`regex_match`/`len`/`lower`/`upper` | **远超** — `replace`/`substr`/`split`/`mvindex` 等 200+ |
+| 字符串函数 | `contains`/`regex_match`/`replace`/`trim`/`split`/`len`/`lower`/`upper` | **仍远超** — `substr`/`mvindex` 等 200+ |
 | 子查询 | 隐式 yield 规则链（需两条规则） | `join [subsearch]` 单条查询内完成 |
 | 行保留 | 无 | `eventstats` 保留原始行 |
 | 部署 | 单机轻量 | 重量级平台 |
 
-**总结**：行为分析扩展后，WFL 与 SPL 的差距进一步缩小。集合收集、统计函数、条件表达式都已对齐 SPL 核心能力。**WFL 的新增差异化**：分项可解释评分（`score { ... }`）、一等实体建模（`entity()`）、跨规则评分累加——这三项是 SPL 完全不具备的检测/分析原语。SPL 仍在通用计算（200+ 函数、eventstats、无限管道）上保持优势，两者的差距从"聚合能力远弱"收窄到"通用函数库丰富度"——这是检测 DSL vs 通用查询语言的本质差异。
+**总结**：行为分析扩展后，WFL 与 SPL 的差距进一步缩小。集合收集、统计函数、条件表达式都已对齐 SPL 核心能力；字符串侧在 `replace`/`trim`/`split`/`mv*` 系列落地后继续收敛。**WFL 的新增差异化**：分项可解释评分（`score { ... }`）、一等实体建模（`entity()`）、跨规则评分累加——这三项是 SPL 完全不具备的检测/分析原语。SPL 仍在通用计算（200+ 函数、eventstats、无限管道）上保持优势，两者的差距从"聚合能力远弱"收窄到"通用函数库丰富度"——这是检测 DSL vs 通用查询语言的本质差异。
 
 ### 2.5 vs KQL（Microsoft Sentinel）
 
@@ -133,7 +133,7 @@
 | 风险等级 | `score` → runtime `level_map` 配置化映射 | 无 |
 | 统一输出 | `yield` | 无 |
 | 聚合 | `conv` + `fixed` + `stddev`/`percentile` 覆盖主场景 | `summarize` 全功能 + `make-series` 时序分析 |
-| 集合收集 | `collect_set`/`collect_list`/`first`/`last` | `make_set`/`make_list`/`arg_min`/`arg_max` 功能等价 |
+| 集合收集 | `collect_set`/`collect_list`/`first`/`last` + `mvcount`/`mvjoin`/`mvdedup` | `make_set`/`make_list`/`arg_min`/`arg_max` 功能等价 |
 | 条件表达式 | `if/then/else` + `hit()` | `iff()`/`case()` 功能等价 |
 | 可视化集成 | 无（交给下游） | Sentinel 工作簿深度集成 |
 | 子查询 | 规则链 | `join (subquery)` 内联 |
@@ -178,9 +178,9 @@ WFL 设计初期与 SPL/KQL 在聚合能力上存在多项差距，经过 `fixed
 | Top-N / 排序 / 去重 | **已消除** | `conv { sort(-f) \| top(10) ; }` (L3) | `sort / head / dedup` |
 | 后聚合过滤 | **已消除** | `conv { where(count > 5) ; }` (L3) | `\| where count > 5` |
 | 条件表达式 | **已消除** | `if c then a else b` + `hit(c)` (L2) | `eval if(c,a,b)` |
-| 集合收集 | **已消除** | `collect_set`/`collect_list`/`first`/`last` (L3) | `values`/`list`/`first`/`last` |
+| 集合收集 | **已消除** | `collect_set`/`collect_list`/`first`/`last` + `mvcount`/`mvjoin`/`mvdedup` (L3) | `values`/`list`/`first`/`last` + `mvcount`/`mvjoin` |
 | 统计函数 | **已消除** | `stddev`/`percentile` (L3) | `stdev`/`perc95` |
-| 字符串函数 | **大幅缩小** | `contains`/`regex_match`/`len`/`lower`/`upper` (L2, 5 个) | 200+ 函数 |
+| 字符串函数 | **进一步缩小** | `contains`/`regex_match`/`replace`/`trim`/`split`/`len`/`lower`/`upper` (L2, 8 个) | 200+ 函数 |
 | 多级管道 | **大幅缩小** | `\|>` 规则内串联 + 隐式 window (L3) | `\|` 无限管道 |
 | 子查询合并 | **大幅缩小** | 隐式 yield 规则链 + join 引用规则名 | `\| join [subsearch]` |
 | 行保留聚合 | 仍有差距 | 无（流式模型不保留原始行） | `eventstats` |
@@ -203,7 +203,7 @@ WFL 设计初期与 SPL/KQL 在聚合能力上存在多项差距，经过 `fixed
 | 短板 | 影响 | 是否需要解决 |
 |------|------|-------------|
 | 行保留聚合（eventstats） | 无法"给每行附加聚合值后保留原始行" | 否——分析查询能力，交给下游 SIEM |
-| 字符串函数库深度 | 仅 5 个基础函数（L2），缺 `replace`/`substr`/`split` 等 | 可后续按需扩展 |
+| 字符串/多值函数库深度 | 已补齐 `substr`/`startswith`/`endswith`/`mvindex`/`mvappend`，但整体函数总量仍低于 SPL | 可后续按需扩展 |
 | 通用数学函数 | 缺 `abs`/`ceil`/`floor`/`log`/`pow` 等 | 可后续按需扩展 |
 | 社区规则库 | 无现成规则 | 可考虑支持 Sigma 规则导入 |
 | 三文件 + pack.yaml 认知成本 | 新用户需理解文件协作关系 | L1 子集 + 模板 + 文档覆盖 + Zed 语法高亮/LSP 降低上手成本 |
@@ -240,6 +240,58 @@ WFL 在检测语言中表达力最强（OR 分支、双阶段匹配、缺失检�
 | 正确性门禁 | `test + shuffle + scenario verify` 三层校验作为发布门槛 |
 
 WFL 的独特定位：**唯一同时提供时序检测、实体建模、可解释数值评分、内置基线的独立 DSL**。SPL/KQL 通过平台能力（ML 模块、外部插件）可实现类似效果，但不是语言层原语——WFL 将这些能力内化为编译期可检查、运行期可解释的语言一等公民。随着 Zed 语法高亮与 LSP 落地，WFL 在开发体验上的短板也开始收敛。
+
+## 7. SPL Top30 对齐清单（v2.1）
+
+为避免“只追函数总数”的失真，后续目标改为：
+
+- **目标 A（覆盖率）**：SPL 高频 Top30 函数覆盖率 ≥ 90%
+- **目标 B（数量兜底）**：SPL 函数量级的 1/10（约 20+）作为下限参考
+
+### 7.1 Top30 清单与状态
+
+| SPL 常用函数 | WFL 对应 | 状态 | 优先级 |
+|---|---|---|---|
+| `count` | `count` | ✅ 已支持 | — |
+| `dc` / `distinct_count` | `distinct` | ✅ 已支持 | — |
+| `sum` | `sum` | ✅ 已支持 | — |
+| `avg` | `avg` | ✅ 已支持 | — |
+| `min` | `min` | ✅ 已支持 | — |
+| `max` | `max` | ✅ 已支持 | — |
+| `if` | `if ... then ... else ...` | ✅ 已支持 | — |
+| `stdev` | `stddev` | ✅ 已支持 | — |
+| `perc95` | `percentile` | ✅ 已支持 | — |
+| `lower` | `lower` | ✅ 已支持 | — |
+| `upper` | `upper` | ✅ 已支持 | — |
+| `len` / `strlen` | `len` | ✅ 已支持 | — |
+| `match` / `regex` | `regex_match` | ✅ 已支持 | — |
+| `replace` | `replace` | ✅ 已支持 | — |
+| `trim` | `trim` | ✅ 已支持 | — |
+| `split` | `split` | ✅ 已支持 | — |
+| `mvcount` | `mvcount` | ✅ 已支持 | — |
+| `mvjoin` | `mvjoin` | ✅ 已支持 | — |
+| `mvdedup` | `mvdedup` | ✅ 已支持 | — |
+| `first` | `first` | ✅ 已支持 | — |
+| `last` | `last` | ✅ 已支持 | — |
+| `substr` | `substr` | ✅ 已支持 | — |
+| `startswith` | `startswith` | ✅ 已支持 | — |
+| `endswith` | `endswith` | ✅ 已支持 | — |
+| `mvindex` | `mvindex` | ✅ 已支持 | — |
+| `mvappend` | `mvappend` | ✅ 已支持 | — |
+| `abs` | — | ⏳ 待支持 | P1 |
+| `ceil` | — | ⏳ 待支持 | P1 |
+| `floor` | — | ⏳ 待支持 | P1 |
+| `round` | — | ⏳ 待支持 | P1 |
+
+> 当前清单口径下，Top30 已支持 26/30（86.7%）。90% 目标为 27/30，还需补齐 1 个函数。
+
+### 7.2 下一步实现建议
+
+| 批次 | 函数 | 目标 |
+|---|---|---|
+| Batch-1 | `substr`, `startswith`, `endswith`, `mvindex`, `mvappend` | ✅ 已完成，补齐字符串/多值高频短板 |
+| Batch-2 | `abs` | 达到 Top30 覆盖率 90%（27/30） |
+| Batch-3 | `round`, `ceil`, `floor`, `strftime`, `strptime` | 继续增强数值与时间处理能力 |
 
 
 ## 相关文档

@@ -1,5 +1,5 @@
 # WFL v2.1 设计方案（整合版）
-<!-- 角色：架构师 / 语言设计 | 状态：v2.1 对齐中 | 更新：2026-02-20 -->
+<!-- 角色：架构师 / 语言设计 | 状态：v2.1 对齐中（含实现对齐清单） | 更新：2026-02-26 -->
 
 ## 1. 设计目标与范围
 
@@ -18,6 +18,31 @@
 - **可证明正确**：同一输入在 `online/replay/shuffle` 三条路径上结果一致（在容差内）。
 - **可持续演进**：语法、输出字段、运行模式都能灰度发布与可回滚。
 - **可运营治理**：规则上线前给出资源预算、兼容性报告与风险分级。
+
+### 1.4 文档-实现对齐清单（2026-02-26）
+
+> 本节按当前代码实现状态整理。若后文“设计目标/规划”与本节冲突，以本节为准。
+
+| 条目 | 文档目标 | 当前实现状态 | 备注 |
+|------|---------|--------------|------|
+| `|>` 多级管道 + `_in` | L3 核心能力 | ✅ 已实现 | 解析、编译、运行、replay 均可用 |
+| `conv { sort/top/dedup/where }` | L3 核心能力 | ✅ 已实现 | 仅与 `fixed` 窗口配合（语义检查已加） |
+| `match<...:session(gap)>` | L3 行为分析窗口 | ✅ 已实现 | gap 超时切段语义已落地 |
+| `join snapshot/asof [within]` | L2 关联能力 | ✅ 已实现 | 包含 asof 时间约束与右表时间列检查 |
+| `limits { ... }` | v2.1 推荐声明 + 运行时预算 | ✅ 已实现 | 未声明给 Warning，声明后有编译/运行时约束 |
+| `wfl test --shuffle --runs N` | Conformance 门禁 | ⚠️ 部分实现 | permutation/runs 生效；`eval_mode` 选项尚未接入执行路径 |
+| `yield@vN` 与契约版本治理 | v2.1 强制能力 | ⚠️ 部分实现 | 已做 `@vN` 与 `meta.contract_version` 一致性检查；未做到“每条规则强制声明” |
+| `derive { ... }` | L2 特征派生 | ❌ 未实现 | AST/解析/编译链路未接入 derive block |
+| `score { item = expr @ weight; ... }` | L2 可解释评分 | ❌ 未实现 | 当前仅支持 `score(expr)` |
+| 隐式 `yield (...)` | L3 语法糖 | ❌ 未实现 | 当前 `yield` 目标窗口仍必填 |
+| RulePack/`pack.yaml`/`lint --strict`/`meta.lang` 强制 | v2.1 治理 | ❌ 未实现 | CLI 与检查器尚未形成完整治理闭环 |
+| ExplainJSON / CostPlan / baseline 持久化 | v2.1 工程化能力 | ❌ 未实现 | 当前 explain 为文本输出，未产出机器可消费 JSON 与成本计划 |
+| M29 传输可靠性三档 | `best_effort/at_least_once/exactly_once` | ❌ 未实现 | 当前仍以 best-effort 路径为主 |
+
+**已知语义偏差（需文档与实现后续统一）：**
+- `time_bucket`：实现当前采用“秒数数值参数”，与文档中的 DURATION 字面量描述存在差异。
+- `expect { hit[i].field(...) }`：语法已支持，但执行器目前返回“not yet supported”。
+- 管道规则的内联 `test`：当前 `wfl test` 对 pipeline 主要覆盖最终编译计划，端到端链路建议优先用 `wfl replay` 验证。
 
 ---
 
@@ -284,7 +309,7 @@ key_block     = "key" , "{" , key_item , { key_item } , "}" ;
 key_item      = IDENT , "=" , field_ref , ";" ;
 window_spec   = DURATION                              (* 滑动窗口 *)
               | DURATION , ":" , "fixed"              (* 固定间隔窗口 *)
-              | "session" , "(" , DURATION , ")"  ;    (* 会话窗口，L3 行为分析，未实现 *)
+              | "session" , "(" , DURATION , ")"  ;    (* 会话窗口，L3 行为分析，已实现 *)
 on_event_block= "on" , "event" , "{" , match_step , { match_step } , "}" ;
 close_block   = close_mode , "close" , "{" , match_step , { match_step } , "}" ;
 close_mode    = "on"                                    (* OR 模式：事件路径与关闭路径独立触发 *)
@@ -317,10 +342,10 @@ named_arg     = yield_field , "=" , expr ;
 yield_field   = IDENT | IDENT , "." , IDENT , { "." , IDENT } | quoted_ident ;    (* 与 .wfs field_name 对齐 *)
 quoted_ident  = "`" , { ANY - "`" } , "`" ;                                     (* 同 §6.1 .wfs 定义 *)
 
-conv_clause   = "conv" , "{" , conv_chain , { conv_chain } , "}" ;             (* L3，未实现 *)
-conv_chain    = conv_step , { "|" , conv_step } , ";" ;                        (* L3，未实现 *)
-conv_step     = ("sort" | "top" | "dedup" | "where") , "(" , [ conv_args ] , ")" ;  (* L3，未实现 *)
-conv_args     = expr , { "," , expr } ;                                        (* L3，未实现 *)
+conv_clause   = "conv" , "{" , conv_chain , { conv_chain } , "}" ;             (* L3，已实现 *)
+conv_chain    = conv_step , { "|" , conv_step } , ";" ;                        (* L3，已实现 *)
+conv_step     = ("sort" | "top" | "dedup" | "where") , "(" , [ conv_args ] , ")" ;  (* L3，已实现 *)
+conv_args     = expr , { "," , expr } ;                                        (* L3，已实现 *)
 
 limits_clause = "limits" , "{" , limit_item , { limit_item } , "}" ;   (* 可选；省略时编译 Warning *)
 limit_item    = "max_memory" , "=" , STRING , ";"
@@ -420,6 +445,9 @@ ANY           = ? any unicode char ? ;
 | `time_diff` | `time_diff(t1, t2)` → float | L2 | 两时间戳间隔（秒） |
 | `time_bucket` | `time_bucket(field, interval)` → time | L2 | 时间分桶（interval 为 DURATION 字面量） |
 | `contains` | `contains(field, pattern)` → bool | L2 | 子串包含判定 |
+| `replace` | `replace(text, pattern, replacement)` → chars | L2 | 正则替换（SPL 对齐能力） |
+| `trim` | `trim(field)` → chars | L2 | 去除字符串首尾空白 |
+| `split` | `split(field, separator)` → array/chars | L2 | 按分隔符切分字符串为多值 |
 | `regex_match` | `regex_match(field, pattern)` → bool | L2 | 正则匹配判定（pattern 须为 STRING 字面量） |
 | `len` | `len(field)` → digit | L2 | 字符串长度 |
 | `lower` | `lower(field)` → chars | L2 | 转小写 |
@@ -428,10 +456,13 @@ ANY           = ? any unicode char ? ;
 | `try` | `try(expr, default)` → T | L2 | 表达式异常兜底，不中断当前求值 |
 | `collect_set` | `collect_set(alias.field)` → array/T | L3 | 窗口内去重值收集 |
 | `collect_list` | `collect_list(alias.field)` → array/T | L3 | 窗口内有序值收集 |
+| `mvjoin` | `mvjoin(array_expr, separator)` → chars | L3 | 多值数组按分隔符拼接为字符串（SPL 对齐能力） |
+| `mvdedup` | `mvdedup(array_expr)` → array/T | L3 | 多值数组去重（保留首次出现顺序） |
 | `first` | `first(alias.field)` → T | L3 | 窗口内首个值 |
 | `last` | `last(alias.field)` → T | L3 | 窗口内末个值 |
 | `stddev` | `stddev(alias.field)` → float | L3 | 标准差 |
 | `percentile` | `percentile(alias.field, p)` → float | L3 | 分位数（p 为 0~100） |
+| `mvcount` | `mvcount(array_expr)` → digit | L3 | 多值/集合元素个数（SPL 对齐能力） |
 
 - `score` 输出支持两种写法：`score(expr)`（简洁）与 `score { item = expr @ weight; ... }`（可解释）。
 - `score` 分项块中，单项贡献 = `expr * weight`；总分为所有分项贡献之和。

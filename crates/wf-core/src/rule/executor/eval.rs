@@ -216,6 +216,107 @@ fn eval_builtin_func_with_l3(
             };
             Some(Value::Bool(haystack.contains(&needle)))
         }
+        "startswith" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let prefix = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            Some(Value::Bool(text.starts_with(&prefix)))
+        }
+        "endswith" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let suffix = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            Some(Value::Bool(text.ends_with(&suffix)))
+        }
+        "substr" => {
+            if args.len() != 2 && args.len() != 3 {
+                return None;
+            }
+            let text = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let start = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Number(n) => n.trunc() as i64,
+                _ => return None,
+            };
+            let chars: Vec<char> = text.chars().collect();
+            let len = chars.len() as i64;
+            let mut start_idx = if start > 0 {
+                start - 1
+            } else if start < 0 {
+                len + start
+            } else {
+                0
+            };
+            if start_idx < 0 {
+                start_idx = 0;
+            }
+            if start_idx >= len {
+                return Some(Value::Str(String::new()));
+            }
+            let mut end_idx = len;
+            if args.len() == 3 {
+                let length = match eval_expr_with_l3(&args[2], ctx)? {
+                    Value::Number(n) => n.trunc() as i64,
+                    _ => return None,
+                };
+                if length <= 0 {
+                    return Some(Value::Str(String::new()));
+                }
+                end_idx = (start_idx + length).min(len);
+            }
+            let sub = chars[start_idx as usize..end_idx as usize]
+                .iter()
+                .collect::<String>();
+            Some(Value::Str(sub))
+        }
+        "replace" => {
+            if args.len() != 3 {
+                return None;
+            }
+            let text = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let pattern = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let replacement = match eval_expr_with_l3(&args[2], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let re = regex::Regex::new(&pattern).ok()?;
+            Some(Value::Str(
+                re.replace_all(&text, replacement.as_str()).into_owned(),
+            ))
+        }
+        "trim" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => Some(Value::Str(s.trim().to_string())),
+                _ => None,
+            }
+        }
         "lower" => {
             if args.len() != 1 {
                 return None;
@@ -242,6 +343,129 @@ fn eval_builtin_func_with_l3(
                 Value::Str(s) => Some(Value::Number(s.len() as f64)),
                 _ => None,
             }
+        }
+        "mvcount" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Array(arr) => Some(Value::Number(arr.len() as f64)),
+                _ => None,
+            }
+        }
+        "mvjoin" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let arr = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Array(arr) => arr,
+                _ => return None,
+            };
+            let sep = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let joined = arr
+                .into_iter()
+                .map(|v| value_to_string(&v))
+                .collect::<Vec<_>>()
+                .join(&sep);
+            Some(Value::Str(joined))
+        }
+        "mvindex" => {
+            if args.len() != 2 && args.len() != 3 {
+                return None;
+            }
+            let arr = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Array(arr) => arr,
+                _ => return None,
+            };
+            if args.len() == 2 {
+                let idx = match eval_expr_with_l3(&args[1], ctx)? {
+                    Value::Number(n) => normalize_index(n.trunc() as i64, arr.len()),
+                    _ => return None,
+                }?;
+                return arr.get(idx).cloned();
+            }
+            if arr.is_empty() {
+                return Some(Value::Array(Vec::new()));
+            }
+            let start = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Number(n) => n.trunc() as i64,
+                _ => return None,
+            };
+            let end = match eval_expr_with_l3(&args[2], ctx)? {
+                Value::Number(n) => n.trunc() as i64,
+                _ => return None,
+            };
+            let len = arr.len() as i64;
+            let mut start_idx = if start < 0 { len + start } else { start };
+            let mut end_idx = if end < 0 { len + end } else { end };
+            if end_idx < 0 || start_idx >= len {
+                return Some(Value::Array(Vec::new()));
+            }
+            if start_idx < 0 {
+                start_idx = 0;
+            }
+            if end_idx >= len {
+                end_idx = len - 1;
+            }
+            if start_idx > end_idx {
+                return Some(Value::Array(Vec::new()));
+            }
+            Some(Value::Array(
+                arr[start_idx as usize..=end_idx as usize].to_vec(),
+            ))
+        }
+        "mvappend" => {
+            if args.is_empty() {
+                return None;
+            }
+            let mut out: Vec<Value> = Vec::new();
+            for arg in args {
+                match eval_expr_with_l3(arg, ctx)? {
+                    Value::Array(values) => out.extend(values),
+                    value => out.push(value),
+                }
+            }
+            Some(Value::Array(out))
+        }
+        "split" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let sep = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let parts = if sep.is_empty() {
+                text.chars().map(|c| Value::Str(c.to_string())).collect()
+            } else {
+                text.split(&sep)
+                    .map(|s| Value::Str(s.to_string()))
+                    .collect()
+            };
+            Some(Value::Array(parts))
+        }
+        "mvdedup" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let arr = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Array(arr) => arr,
+                _ => return None,
+            };
+            let mut deduped: Vec<Value> = Vec::new();
+            for v in arr {
+                if !deduped.iter().any(|existing| values_equal(existing, &v)) {
+                    deduped.push(v);
+                }
+            }
+            Some(Value::Array(deduped))
         }
         "regex_match" => {
             if args.len() != 2 {
@@ -424,7 +648,7 @@ fn get_step_values(ctx: &Event, step_idx: usize) -> Option<&[Value]> {
     }
 }
 
-fn get_step_source<'a>(ctx: &'a Event, step_idx: usize) -> Option<&'a str> {
+fn get_step_source(ctx: &Event, step_idx: usize) -> Option<&str> {
     let field_name = format!("_step_{}_source", step_idx);
     match ctx.fields.get(&field_name) {
         Some(Value::Str(s)) => Some(s.as_str()),
@@ -439,6 +663,16 @@ fn extract_source_alias(expr: &wf_lang::ast::Expr) -> Option<&str> {
             Some(alias.as_str())
         }
         _ => None,
+    }
+}
+
+fn normalize_index(index: i64, len: usize) -> Option<usize> {
+    let len = len as i64;
+    let normalized = if index < 0 { len + index } else { index };
+    if normalized < 0 || normalized >= len {
+        None
+    } else {
+        Some(normalized as usize)
     }
 }
 
@@ -752,5 +986,235 @@ mod tests {
         };
         let result = eval_yield_expr(&expr, &ctx);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_replace_works_in_yield_eval() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "msg".to_string(),
+            Value::Str("failed_login_from_root".to_string()),
+        );
+        let ctx = Event { fields };
+        let expr = Expr::FuncCall {
+            qualifier: None,
+            name: "replace".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("msg".to_string())),
+                Expr::StringLit("fail.*root".to_string()),
+                Expr::StringLit("suspicious".to_string()),
+            ],
+        };
+        let result = eval_yield_expr(&expr, &ctx);
+        assert_eq!(result, Some(Value::Str("suspicious".to_string())));
+    }
+
+    #[test]
+    fn test_mvcount_with_collect_set_nested_l3() {
+        let ctx = make_test_event(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str("a".to_string()),
+        ]);
+        let expr = Expr::FuncCall {
+            qualifier: None,
+            name: "mvcount".to_string(),
+            args: vec![Expr::FuncCall {
+                qualifier: None,
+                name: "collect_set".to_string(),
+                args: vec![Expr::Field(FieldRef::Simple("value".to_string()))],
+            }],
+        };
+        let result = eval_yield_expr(&expr, &ctx);
+        assert_eq!(result, Some(Value::Number(2.0)));
+    }
+
+    #[test]
+    fn test_trim_works_in_yield_eval() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("msg".to_string(), Value::Str("  hello  ".to_string()));
+        let ctx = Event { fields };
+        let expr = Expr::FuncCall {
+            qualifier: None,
+            name: "trim".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+        };
+        let result = eval_yield_expr(&expr, &ctx);
+        assert_eq!(result, Some(Value::Str("hello".to_string())));
+    }
+
+    #[test]
+    fn test_mvjoin_with_collect_list_nested_l3() {
+        let ctx = make_test_event(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str("c".to_string()),
+        ]);
+        let expr = Expr::FuncCall {
+            qualifier: None,
+            name: "mvjoin".to_string(),
+            args: vec![
+                Expr::FuncCall {
+                    qualifier: None,
+                    name: "collect_list".to_string(),
+                    args: vec![Expr::Field(FieldRef::Simple("value".to_string()))],
+                },
+                Expr::StringLit(",".to_string()),
+            ],
+        };
+        let result = eval_yield_expr(&expr, &ctx);
+        assert_eq!(result, Some(Value::Str("a,b,c".to_string())));
+    }
+
+    #[test]
+    fn test_split_works_in_yield_eval() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("csv".to_string(), Value::Str("a,b,,c".to_string()));
+        let ctx = Event { fields };
+        let expr = Expr::FuncCall {
+            qualifier: None,
+            name: "split".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("csv".to_string())),
+                Expr::StringLit(",".to_string()),
+            ],
+        };
+        let result = eval_yield_expr(&expr, &ctx);
+        assert_eq!(
+            result,
+            Some(Value::Array(vec![
+                Value::Str("a".to_string()),
+                Value::Str("b".to_string()),
+                Value::Str(String::new()),
+                Value::Str("c".to_string()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_mvdedup_with_collect_list_nested_l3() {
+        let ctx = make_test_event(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str("a".to_string()),
+            Value::Str("c".to_string()),
+            Value::Str("b".to_string()),
+        ]);
+        let expr = Expr::FuncCall {
+            qualifier: None,
+            name: "mvdedup".to_string(),
+            args: vec![Expr::FuncCall {
+                qualifier: None,
+                name: "collect_list".to_string(),
+                args: vec![Expr::Field(FieldRef::Simple("value".to_string()))],
+            }],
+        };
+        let result = eval_yield_expr(&expr, &ctx);
+        assert_eq!(
+            result,
+            Some(Value::Array(vec![
+                Value::Str("a".to_string()),
+                Value::Str("b".to_string()),
+                Value::Str("c".to_string()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_substr_works_in_yield_eval() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("msg".to_string(), Value::Str("abcdef".to_string()));
+        let ctx = Event { fields };
+        let expr = Expr::FuncCall {
+            qualifier: None,
+            name: "substr".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("msg".to_string())),
+                Expr::Number(2.0),
+                Expr::Number(3.0),
+            ],
+        };
+        let result = eval_yield_expr(&expr, &ctx);
+        assert_eq!(result, Some(Value::Str("bcd".to_string())));
+    }
+
+    #[test]
+    fn test_startswith_and_endswith_in_yield_eval() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "msg".to_string(),
+            Value::Str("failed_login_root".to_string()),
+        );
+        let ctx = Event { fields };
+        let starts_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "startswith".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("msg".to_string())),
+                Expr::StringLit("failed".to_string()),
+            ],
+        };
+        let ends_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "endswith".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("msg".to_string())),
+                Expr::StringLit("root".to_string()),
+            ],
+        };
+        assert_eq!(eval_yield_expr(&starts_expr, &ctx), Some(Value::Bool(true)));
+        assert_eq!(eval_yield_expr(&ends_expr, &ctx), Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_mvindex_with_collect_list_nested_l3() {
+        let ctx = make_test_event(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str("c".to_string()),
+        ]);
+        let expr = Expr::FuncCall {
+            qualifier: None,
+            name: "mvindex".to_string(),
+            args: vec![
+                Expr::FuncCall {
+                    qualifier: None,
+                    name: "collect_list".to_string(),
+                    args: vec![Expr::Field(FieldRef::Simple("value".to_string()))],
+                },
+                Expr::Number(1.0),
+            ],
+        };
+        let result = eval_yield_expr(&expr, &ctx);
+        assert_eq!(result, Some(Value::Str("b".to_string())));
+    }
+
+    #[test]
+    fn test_mvappend_with_collect_list_nested_l3() {
+        let ctx = make_test_event(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+        ]);
+        let expr = Expr::FuncCall {
+            qualifier: None,
+            name: "mvappend".to_string(),
+            args: vec![
+                Expr::FuncCall {
+                    qualifier: None,
+                    name: "collect_list".to_string(),
+                    args: vec![Expr::Field(FieldRef::Simple("value".to_string()))],
+                },
+                Expr::StringLit("c".to_string()),
+            ],
+        };
+        let result = eval_yield_expr(&expr, &ctx);
+        assert_eq!(
+            result,
+            Some(Value::Array(vec![
+                Value::Str("a".to_string()),
+                Value::Str("b".to_string()),
+                Value::Str("c".to_string()),
+            ]))
+        );
     }
 }

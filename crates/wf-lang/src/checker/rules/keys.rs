@@ -9,15 +9,15 @@ pub fn check_session_gap_clause(
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
-    if let WindowMode::Session(gap) = match_clause.window_mode {
-        if gap.is_zero() {
-            errors.push(CheckError {
-                severity: Severity::Error,
-                rule: Some(rule_name.to_string()),
-                test: None,
-                message: "session(gap) gap must be > 0".to_string(),
-            });
-        }
+    if let WindowMode::Session(gap) = match_clause.window_mode
+        && gap.is_zero()
+    {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: "session(gap) gap must be > 0".to_string(),
+        });
     }
 }
 

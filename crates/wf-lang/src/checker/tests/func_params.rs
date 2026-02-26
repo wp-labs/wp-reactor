@@ -95,6 +95,53 @@ rule r {
 }
 
 #[test]
+fn startswith_and_endswith_valid() {
+    let input = r#"
+rule r {
+    events { e : auth_events && startswith(e.action, "fail") && endswith(e.action, "ed") }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
+}
+
+#[test]
+fn substr_valid() {
+    let out = make_output_window(
+        "out",
+        vec![("x", bt(BaseType::Ip)), ("part", bt(BaseType::Chars))],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (part = substr(e.action, 1, 4))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn substr_wrong_index_type() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = substr(e.action, "1"))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "second argument must be numeric",
+    );
+}
+
+#[test]
 fn len_valid() {
     let input = r#"
 rule r {
@@ -121,6 +168,112 @@ rule r {
         input,
         &[auth_events_window(), output_window()],
         "must be chars",
+    );
+}
+
+#[test]
+fn replace_valid() {
+    let out = make_output_window(
+        "out",
+        vec![("x", bt(BaseType::Ip)), ("msg", bt(BaseType::Chars))],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (msg = replace(e.action, "fail.*", "blocked"))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn replace_invalid_pattern() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = replace(e.action, "[bad", "x"))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "not valid regex",
+    );
+}
+
+#[test]
+fn trim_valid() {
+    let out = make_output_window(
+        "out",
+        vec![("x", bt(BaseType::Ip)), ("msg", bt(BaseType::Chars))],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (msg = trim(e.action))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn trim_wrong_type() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = trim(e.count))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "trim() argument must be chars",
+    );
+}
+
+#[test]
+fn split_valid() {
+    use crate::schema::FieldType;
+    let out = make_output_window(
+        "out",
+        vec![
+            ("x", bt(BaseType::Ip)),
+            ("parts", FieldType::Array(BaseType::Chars)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (parts = split(e.action, "_"))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn split_wrong_type() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = split(e.action, 42))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "split() second argument must be chars",
     );
 }
 
@@ -161,6 +314,192 @@ rule r {
         input,
         &[auth_events_window(), output_window()],
         "column projection",
+    );
+}
+
+#[test]
+fn mvcount_valid() {
+    let out = make_output_window(
+        "out",
+        vec![("x", bt(BaseType::Ip)), ("n", bt(BaseType::Digit))],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (n = mvcount(collect_set(e.action)))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn mvcount_wrong_type() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = mvcount(e.action))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "must be an array expression",
+    );
+}
+
+#[test]
+fn mvjoin_valid() {
+    let out = make_output_window(
+        "out",
+        vec![("x", bt(BaseType::Ip)), ("joined", bt(BaseType::Chars))],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (joined = mvjoin(collect_list(e.action), ","))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn mvjoin_wrong_type() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = mvjoin(e.action, ","))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "first argument must be an array expression",
+    );
+}
+
+#[test]
+fn mvdedup_valid() {
+    use crate::schema::FieldType;
+    let out = make_output_window(
+        "out",
+        vec![
+            ("x", bt(BaseType::Ip)),
+            ("uniq", FieldType::Array(BaseType::Chars)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (uniq = mvdedup(collect_list(e.action)))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn mvdedup_wrong_type() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = mvdedup(e.action))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "mvdedup() argument must be an array expression",
+    );
+}
+
+#[test]
+fn mvindex_valid_scalar_and_range() {
+    use crate::schema::FieldType;
+    let out = make_output_window(
+        "out",
+        vec![
+            ("x", bt(BaseType::Ip)),
+            ("pick", bt(BaseType::Chars)),
+            ("slice", FieldType::Array(BaseType::Chars)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        pick = mvindex(collect_list(e.action), 0),
+        slice = mvindex(collect_list(e.action), 0, 1)
+    )
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn mvindex_wrong_first_arg_type() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = mvindex(e.action, 0))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "first argument must be an array expression",
+    );
+}
+
+#[test]
+fn mvappend_valid() {
+    use crate::schema::FieldType;
+    let out = make_output_window(
+        "out",
+        vec![
+            ("x", bt(BaseType::Ip)),
+            ("vals", FieldType::Array(BaseType::Chars)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (vals = mvappend(collect_list(e.action), "tail"))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn mvappend_mixed_type_rejected() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = mvappend(collect_list(e.action), e.count))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "not compatible",
     );
 }
 

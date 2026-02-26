@@ -1,0 +1,31 @@
+use "security.wfs"
+
+// Demonstrates string + multivalue functions together:
+// trim / replace / split / mvcount / mvdedup / mvjoin.
+rule action_string_set_ops {
+  events {
+    e : auth_events
+  }
+
+  match<sip:5m:fixed> {
+    on event {
+      e | count >= 1;
+    }
+    and close {
+      e | count >= 2;
+    }
+  } -> score(72.0)
+
+  entity(ip, e.sip)
+
+  yield security_alerts (
+    sip = e.sip,
+    token_count = mvcount(split(replace(trim(e.action), " ", ""), ",")),
+    uniq_actions = mvjoin(mvdedup(split(replace(trim(e.action), " ", ""), ",")), "|"),
+    message = fmt(
+      "{} normalized action has {} tokens",
+      e.sip,
+      mvcount(split(replace(trim(e.action), " ", ""), ","))
+    )
+  )
+}

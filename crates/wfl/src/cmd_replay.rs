@@ -333,6 +333,7 @@ fn is_internal_window_name(name: &str) -> bool {
     name.starts_with(PIPE_WINDOW_PREFIX)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn route_event_once(
     routes: &HashMap<String, Vec<ConsumerRoute>>,
     engines: &mut [ReplayEngine],

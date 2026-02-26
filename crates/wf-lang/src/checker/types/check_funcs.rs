@@ -307,6 +307,371 @@ pub fn check_func_call(
                 }
             }
         }
+        "startswith" | "endswith" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "{}() requires exactly 2 arguments: (text, prefix_or_suffix)",
+                        name
+                    ),
+                });
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "{}() argument {} must be chars, got {:?}",
+                                name,
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        "substr" => {
+            if args.len() != 2 && args.len() != 3 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "substr() requires 2 or 3 arguments: (text, start, [length])"
+                        .to_string(),
+                });
+            } else {
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("substr() first argument must be chars, got {:?}", t),
+                    });
+                }
+                if let Some(t) = infer_type(&args[1], scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("substr() second argument must be numeric, got {:?}", t),
+                    });
+                }
+                if args.len() == 3
+                    && let Some(t) = infer_type(&args[2], scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("substr() third argument must be numeric, got {:?}", t),
+                    });
+                }
+            }
+        }
+        "replace" => {
+            if args.len() != 3 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "replace() requires exactly 3 arguments: (text, pattern, replacement)"
+                        .to_string(),
+                });
+            } else {
+                // text + replacement must be chars
+                for (i, arg) in [0usize, 2usize].iter().copied().enumerate() {
+                    if let Some(t) = infer_type(&args[arg], scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        let pos = if i == 0 { 1 } else { 3 };
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "replace() argument {} must be chars, got {:?}",
+                                pos, t
+                            ),
+                        });
+                    }
+                }
+                // pattern should be a valid regex string literal
+                match &args[1] {
+                    Expr::StringLit(pat) => {
+                        if regex_syntax::Parser::new().parse(pat).is_err() {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                test: None,
+                                message: format!(
+                                    "replace() pattern \"{}\" is not valid regex",
+                                    pat
+                                ),
+                            });
+                        }
+                    }
+                    _ => {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message:
+                                "replace() second argument must be a string literal regex pattern"
+                                    .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        "trim" => {
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "trim() requires exactly 1 argument".to_string(),
+                });
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !compatible(&t, &ValType::Base(BaseType::Chars))
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("trim() argument must be chars, got {:?}", t),
+                });
+            }
+        }
+        "mvcount" => {
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "mvcount() requires exactly 1 argument".to_string(),
+                });
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !matches!(t, ValType::Array(_))
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "mvcount() argument must be an array expression, got {:?}",
+                        t
+                    ),
+                });
+            }
+        }
+        "mvjoin" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "mvjoin() requires exactly 2 arguments: (array_expr, separator)"
+                        .to_string(),
+                });
+            } else {
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !matches!(t, ValType::Array(_))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "mvjoin() first argument must be an array expression, got {:?}",
+                            t
+                        ),
+                    });
+                }
+                if let Some(t) = infer_type(&args[1], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "mvjoin() second argument must be chars separator, got {:?}",
+                            t
+                        ),
+                    });
+                }
+            }
+        }
+        "split" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "split() requires exactly 2 arguments: (text, separator)".to_string(),
+                });
+            } else {
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("split() first argument must be chars, got {:?}", t),
+                    });
+                }
+                if let Some(t) = infer_type(&args[1], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("split() second argument must be chars, got {:?}", t),
+                    });
+                }
+            }
+        }
+        "mvdedup" => {
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "mvdedup() requires exactly 1 argument".to_string(),
+                });
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !matches!(t, ValType::Array(_))
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "mvdedup() argument must be an array expression, got {:?}",
+                        t
+                    ),
+                });
+            }
+        }
+        "mvindex" => {
+            if args.len() != 2 && args.len() != 3 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message:
+                        "mvindex() requires 2 or 3 arguments: (array_expr, index, [end_index])"
+                            .to_string(),
+                });
+            } else {
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !matches!(t, ValType::Array(_))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "mvindex() first argument must be an array expression, got {:?}",
+                            t
+                        ),
+                    });
+                }
+                if let Some(t) = infer_type(&args[1], scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "mvindex() second argument must be numeric index, got {:?}",
+                            t
+                        ),
+                    });
+                }
+                if args.len() == 3
+                    && let Some(t) = infer_type(&args[2], scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "mvindex() third argument must be numeric index, got {:?}",
+                            t
+                        ),
+                    });
+                }
+            }
+        }
+        "mvappend" => {
+            if args.is_empty() {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "mvappend() requires at least 1 argument".to_string(),
+                });
+            } else {
+                let mut element_type: Option<ValType> = None;
+                for (idx, arg) in args.iter().enumerate() {
+                    let Some(inferred) = infer_type(arg, scope) else {
+                        continue;
+                    };
+                    let arg_element_type = match inferred {
+                        ValType::Array(bt) | ValType::Base(bt) => ValType::Base(bt),
+                        ValType::Bool => ValType::Base(BaseType::Bool),
+                        other => {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                test: None,
+                                message: format!(
+                                    "mvappend() argument {} must be scalar or array expression, got {:?}",
+                                    idx + 1,
+                                    other
+                                ),
+                            });
+                            continue;
+                        }
+                    };
+                    if let Some(existing) = &element_type {
+                        if !compatible(existing, &arg_element_type) {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                test: None,
+                                message: format!(
+                                    "mvappend() argument {} type {:?} is not compatible with {:?}",
+                                    idx + 1,
+                                    arg_element_type,
+                                    existing
+                                ),
+                            });
+                        }
+                    } else {
+                        element_type = Some(arg_element_type);
+                    }
+                }
+            }
+        }
         "lower" | "upper" => {
             if args.len() != 1 {
                 errors.push(CheckError {

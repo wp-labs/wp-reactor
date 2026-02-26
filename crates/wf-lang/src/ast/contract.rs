@@ -69,24 +69,13 @@ pub enum HitAssert {
 }
 
 /// Options for a test block.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub struct TestOptions {
     pub close_trigger: Option<CloseTrigger>,
     pub eval_mode: Option<EvalMode>,
     pub permutation: Option<PermutationMode>,
     pub runs: Option<usize>,
-}
-
-impl Default for TestOptions {
-    fn default() -> Self {
-        Self {
-            close_trigger: None,
-            eval_mode: None,
-            permutation: None,
-            runs: None,
-        }
-    }
 }
 
 /// Window close trigger mode for test execution.

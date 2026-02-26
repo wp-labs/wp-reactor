@@ -1,0 +1,4 @@
+{"sip":"10.0.0.1","username":"alice","action":"  failed, captcha , retry  ","event_time":1767225600000000000}
+{"sip":"10.0.0.1","username":"alice","action":"failed","event_time":1767225660000000000}
+{"sip":"10.0.0.1","username":"alice","action":"failed, captcha , retry","event_time":1767225720000000000}
+{"sip":"10.0.0.2","username":"bob","action":"success","event_time":1767225780000000000}
