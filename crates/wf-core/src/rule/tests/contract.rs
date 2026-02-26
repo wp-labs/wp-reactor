@@ -280,3 +280,44 @@ test hits_ge for brute_force {
     let result = run_contract_from_source(source);
     assert!(result.passed, "failures: {:?}", result.failures);
 }
+
+#[test]
+fn contract_shuffle_permutation_exposes_order_sensitive_rule() {
+    let source = r#"
+rule ordered_ab {
+    events {
+        a : auth_events
+        b : auth_events
+    }
+    match<sip:5m> {
+        on event {
+            a | count >= 1;
+            b | count >= 1;
+        }
+    } -> score(60.0)
+    entity(ip, a.sip)
+    yield security_alerts (sip = a.sip, fail_count = 1)
+}
+
+test shuffle_order_check for ordered_ab {
+    input {
+        row(a, sip = "10.0.0.1", action = "A");
+        row(b, sip = "10.0.0.1", action = "B");
+    }
+    expect {
+        hits == 1;
+    }
+    options {
+        permutation = shuffle;
+        runs = 6;
+    }
+}
+"#;
+    let result = run_contract_from_source(source);
+    assert!(!result.passed, "expected shuffle run to expose ordering");
+    assert!(
+        result.failures.iter().any(|f| f.contains("run")),
+        "expected run-scoped failure messages, got: {:?}",
+        result.failures
+    );
+}

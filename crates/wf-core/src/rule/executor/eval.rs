@@ -394,12 +394,10 @@ fn resolve_step_indices(ctx: &Event, arg: Option<&wf_lang::ast::Expr>) -> Vec<us
     let Some(alias) = arg.and_then(extract_source_alias) else {
         return all;
     };
-    let filtered: Vec<usize> = all
-        .iter()
+    all.iter()
         .copied()
         .filter(|idx| get_step_source(ctx, *idx).is_some_and(|s| s == alias))
-        .collect();
-    if filtered.is_empty() { all } else { filtered }
+        .collect()
 }
 
 fn step_indices(ctx: &Event) -> Vec<usize> {
@@ -733,5 +731,26 @@ mod tests {
         };
         let result = eval_yield_expr(&expr, &ctx);
         assert_eq!(result, Some(Value::Number(99.0)));
+    }
+
+    #[test]
+    fn test_qualified_alias_without_match_returns_none_for_first() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "_step_0_values".to_string(),
+            Value::Array(vec![Value::Number(10.0)]),
+        );
+        fields.insert("_step_0_source".to_string(), Value::Str("a".to_string()));
+        let ctx = Event { fields };
+        let expr = Expr::FuncCall {
+            qualifier: None,
+            name: "first".to_string(),
+            args: vec![Expr::Field(FieldRef::Qualified(
+                "missing".to_string(),
+                "value".to_string(),
+            ))],
+        };
+        let result = eval_yield_expr(&expr, &ctx);
+        assert_eq!(result, None);
     }
 }

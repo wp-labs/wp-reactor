@@ -92,6 +92,14 @@ enum Commands {
         /// Variable substitutions in KEY=VALUE format
         #[arg(long)]
         var: Vec<String>,
+
+        /// Enable shuffle permutation mode for all tests in this run
+        #[arg(long)]
+        shuffle: bool,
+
+        /// Number of runs for conformance testing (requires > 0)
+        #[arg(long)]
+        runs: Option<usize>,
     },
 }
 
@@ -125,8 +133,14 @@ fn main() -> Result<()> {
             wfl::cmd_replay::run(file, schemas, input, event, var)?;
         }
 
-        Commands::Test { file, schemas, var } => {
-            wfl::cmd_test::run(file, schemas, var)?;
+        Commands::Test {
+            file,
+            schemas,
+            var,
+            shuffle,
+            runs,
+        } => {
+            wfl::cmd_test::run(file, schemas, var, shuffle, runs)?;
         }
     }
 

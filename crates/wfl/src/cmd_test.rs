@@ -6,6 +6,7 @@ use anyhow::Result;
 
 use wf_config::project::{load_schemas, load_wfl, parse_vars};
 use wf_core::rule::contract::run_test;
+use wf_lang::ast::PermutationMode;
 
 const GREEN: &str = "\x1b[1;32m";
 const RED: &str = "\x1b[1;31m";
@@ -13,7 +14,17 @@ const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
-pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()> {
+pub fn run(
+    file: PathBuf,
+    schemas: Vec<String>,
+    vars: Vec<String>,
+    shuffle: bool,
+    runs: Option<usize>,
+) -> Result<()> {
+    if let Some(0) = runs {
+        anyhow::bail!("--runs must be greater than 0");
+    }
+
     let cwd = std::env::current_dir()?;
     let var_map = parse_vars(&vars)?;
     let color = std::io::stderr().is_terminal();
@@ -66,7 +77,21 @@ pub fn run(file: PathBuf, schemas: Vec<String>, vars: Vec<String>) -> Result<()>
             .find(|s| plan.binds.iter().any(|b| b.window == s.name))
             .and_then(|s| s.time_field.clone());
 
-        match run_test(test, plan, time_field) {
+        let mut effective_test = test.clone();
+        if shuffle || runs.is_some() {
+            let mut opts = effective_test.options.unwrap_or_default();
+            if shuffle {
+                opts.permutation = Some(PermutationMode::Shuffle);
+            }
+            if let Some(n) = runs {
+                opts.runs = Some(n);
+            } else if shuffle && opts.runs.is_none() {
+                opts.runs = Some(10);
+            }
+            effective_test.options = Some(opts);
+        }
+
+        match run_test(&effective_test, plan, time_field) {
             Ok(result) => {
                 if result.passed {
                     if color {

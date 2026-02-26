@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use wf_lang::ast::{
-    CloseTrigger, CmpOp, ExpectStmt, Expr, FieldAssign, HitAssert, InputStmt, TestBlock,
+    CloseTrigger, CmpOp, ExpectStmt, Expr, FieldAssign, HitAssert, InputStmt, PermutationMode,
+    TestBlock,
 };
 use wf_lang::plan::RulePlan;
 
@@ -29,23 +30,56 @@ pub fn run_test(
     plan: &RulePlan,
     time_field: Option<String>,
 ) -> Result<TestResult> {
+    let permutation = test.options.as_ref().and_then(|o| o.permutation);
+    let runs = test.options.as_ref().and_then(|o| o.runs).unwrap_or(1);
+
+    let mut failures = Vec::new();
+    let mut output_count = 0usize;
+
+    for run_idx in 0..runs {
+        let run_input = match permutation {
+            Some(PermutationMode::Shuffle) => shuffle_row_input(&test.input, run_idx as u64 + 1),
+            _ => test.input.clone(),
+        };
+        let alerts = execute_test_run(test, plan, time_field.clone(), &run_input);
+        if run_idx == 0 {
+            output_count = alerts.len();
+        }
+        let run_failures = validate_expect_stmts(&test.expect, &alerts);
+        for failure in run_failures {
+            failures.push(format!("run {}: {}", run_idx + 1, failure));
+        }
+    }
+
+    let passed = failures.is_empty();
+    Ok(TestResult {
+        test_name: test.name.clone(),
+        rule_name: test.rule_name.clone(),
+        passed,
+        failures,
+        output_count,
+    })
+}
+
+fn execute_test_run(
+    test: &TestBlock,
+    plan: &RulePlan,
+    time_field: Option<String>,
+    input: &[InputStmt],
+) -> Vec<OutputRecord> {
     let mut sm = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), time_field);
     let executor = RuleExecutor::new(plan.clone());
     let conv_plan = plan.conv_plan.as_ref();
-
+    let mut alerts: Vec<OutputRecord> = Vec::new();
     let base_nanos: i64 = 1_700_000_000_000_000_000;
     let mut current_nanos = base_nanos;
-    let mut alerts: Vec<OutputRecord> = Vec::new();
-
-    // Resolve the alias for the rule (first bind's alias)
     let default_alias = plan
         .binds
         .first()
         .map(|b| b.alias.clone())
         .unwrap_or_default();
 
-    // Process input statements
-    for stmt in &test.input {
+    for stmt in input {
         match stmt {
             InputStmt::Row { alias, fields } => {
                 let event = fields_to_event(fields);
@@ -64,12 +98,10 @@ pub fn run_test(
                     StepResult::Advance | StepResult::Accumulate => {}
                 }
 
-                current_nanos += 1_000_000_000; // +1 second per row
+                current_nanos += 1_000_000_000;
             }
             InputStmt::Tick(dur) => {
                 current_nanos += dur.as_nanos() as i64;
-
-                // Scan for expired instances at the new watermark (with conv)
                 let expired = sm.scan_expired_at_with_conv(current_nanos, conv_plan);
                 for close in expired {
                     if let Ok(Some(alert)) = executor.execute_close(&close) {
@@ -77,13 +109,11 @@ pub fn run_test(
                     }
                 }
             }
-            _ => {} // future-proof for non_exhaustive
+            _ => {}
         }
     }
 
-    // Apply close trigger from test options
     let close_trigger = test.options.as_ref().and_then(|o| o.close_trigger);
-
     match close_trigger {
         None | Some(CloseTrigger::Eos) => {
             for close in sm.close_all_with_conv(CloseReason::Eos, conv_plan) {
@@ -93,7 +123,6 @@ pub fn run_test(
             }
         }
         Some(CloseTrigger::Timeout) => {
-            // Advance time by 1 day to force timeout
             current_nanos += 86_400_000_000_000i64;
             let expired = sm.scan_expired_at_with_conv(current_nanos, conv_plan);
             for close in expired {
@@ -110,7 +139,6 @@ pub fn run_test(
             }
         }
         _ => {
-            // future-proof for non_exhaustive CloseTrigger
             for close in sm.close_all_with_conv(CloseReason::Eos, conv_plan) {
                 if let Ok(Some(alert)) = executor.execute_close(&close) {
                     alerts.push(alert);
@@ -119,9 +147,12 @@ pub fn run_test(
         }
     }
 
-    // Validate expect assertions
+    alerts
+}
+
+fn validate_expect_stmts(expect_stmts: &[ExpectStmt], alerts: &[OutputRecord]) -> Vec<String> {
     let mut failures = Vec::new();
-    for expect in &test.expect {
+    for expect in expect_stmts {
         match expect {
             ExpectStmt::Hits { cmp, count } => {
                 if !compare_usize(*cmp, alerts.len(), *count) {
@@ -146,18 +177,52 @@ pub fn run_test(
                 let output = &alerts[*index];
                 validate_hit_assert(*index, output, assert, &mut failures);
             }
-            _ => {} // future-proof for non_exhaustive
+            _ => {}
         }
     }
+    failures
+}
 
-    let passed = failures.is_empty();
-    Ok(TestResult {
-        test_name: test.name.clone(),
-        rule_name: test.rule_name.clone(),
-        passed,
-        failures,
-        output_count: alerts.len(),
-    })
+fn shuffle_row_input(input: &[InputStmt], seed: u64) -> Vec<InputStmt> {
+    let mut out = input.to_vec();
+    let mut row_positions = Vec::new();
+    let mut rows = Vec::new();
+    for (idx, stmt) in out.iter().enumerate() {
+        if let InputStmt::Row { .. } = stmt {
+            row_positions.push(idx);
+            rows.push(stmt.clone());
+        }
+    }
+    if rows.len() < 2 {
+        return out;
+    }
+    shuffle_in_place(&mut rows, seed);
+    for (pos, row) in row_positions.into_iter().zip(rows.into_iter()) {
+        out[pos] = row;
+    }
+    out
+}
+
+fn shuffle_in_place<T>(items: &mut [T], seed: u64) {
+    let mut state = seed
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(0xBF58_476D_1CE4_E5B9);
+    if state == 0 {
+        state = 0xA5A5_A5A5_A5A5_A5A5;
+    }
+    for i in (1..items.len()).rev() {
+        let j = (next_u64(&mut state) % ((i + 1) as u64)) as usize;
+        items.swap(i, j);
+    }
+}
+
+fn next_u64(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
 }
 
 fn validate_hit_assert(

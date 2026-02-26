@@ -14,10 +14,30 @@ pub fn check_expr_type(
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
+    check_expr_type_inner(expr, scope, rule_name, true, errors);
+}
+
+/// Type-check a guard expression. Guard context does not allow L3 functions.
+pub fn check_guard_expr_type(
+    expr: &Expr,
+    scope: &Scope<'_>,
+    rule_name: &str,
+    errors: &mut Vec<CheckError>,
+) {
+    check_expr_type_inner(expr, scope, rule_name, false, errors);
+}
+
+fn check_expr_type_inner(
+    expr: &Expr,
+    scope: &Scope<'_>,
+    rule_name: &str,
+    allow_l3_funcs: bool,
+    errors: &mut Vec<CheckError>,
+) {
     match expr {
         Expr::BinOp { op, left, right } => {
-            check_expr_type(left, scope, rule_name, errors);
-            check_expr_type(right, scope, rule_name, errors);
+            check_expr_type_inner(left, scope, rule_name, allow_l3_funcs, errors);
+            check_expr_type_inner(right, scope, rule_name, allow_l3_funcs, errors);
 
             let lt = infer_type(left, scope);
             let rt = infer_type(right, scope);
@@ -136,7 +156,7 @@ pub fn check_expr_type(
             }
         }
         Expr::Neg(inner) => {
-            check_expr_type(inner, scope, rule_name, errors);
+            check_expr_type_inner(inner, scope, rule_name, allow_l3_funcs, errors);
             if let Some(ref t) = infer_type(inner, scope)
                 && !is_numeric(t)
             {
@@ -150,16 +170,16 @@ pub fn check_expr_type(
         }
         Expr::FuncCall { name, args, .. } => {
             for arg in args {
-                check_expr_type(arg, scope, rule_name, errors);
+                check_expr_type_inner(arg, scope, rule_name, allow_l3_funcs, errors);
             }
-            check_func_call(name, args, scope, rule_name, errors);
+            check_func_call(name, args, scope, rule_name, allow_l3_funcs, errors);
         }
         Expr::InList {
             expr: inner, list, ..
         } => {
-            check_expr_type(inner, scope, rule_name, errors);
+            check_expr_type_inner(inner, scope, rule_name, allow_l3_funcs, errors);
             for item in list {
-                check_expr_type(item, scope, rule_name, errors);
+                check_expr_type_inner(item, scope, rule_name, allow_l3_funcs, errors);
             }
         }
         Expr::Field(fref) => {
@@ -179,9 +199,9 @@ pub fn check_expr_type(
             then_expr,
             else_expr,
         } => {
-            check_expr_type(cond, scope, rule_name, errors);
-            check_expr_type(then_expr, scope, rule_name, errors);
-            check_expr_type(else_expr, scope, rule_name, errors);
+            check_expr_type_inner(cond, scope, rule_name, allow_l3_funcs, errors);
+            check_expr_type_inner(then_expr, scope, rule_name, allow_l3_funcs, errors);
+            check_expr_type_inner(else_expr, scope, rule_name, allow_l3_funcs, errors);
 
             // T14: cond must be Bool
             if let Some(ref t) = infer_type(cond, scope)

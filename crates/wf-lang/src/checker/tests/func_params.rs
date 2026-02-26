@@ -131,7 +131,10 @@ fn collect_set_valid() {
     use crate::schema::FieldType;
     let out = make_output_window(
         "out",
-        vec![("x", bt(BaseType::Ip)), ("resources", FieldType::Array(BaseType::Chars))],
+        vec![
+            ("x", bt(BaseType::Ip)),
+            ("resources", FieldType::Array(BaseType::Chars)),
+        ],
     );
     let input = r#"
 rule r {
@@ -165,7 +168,10 @@ rule r {
 fn first_valid() {
     let out = make_output_window(
         "out",
-        vec![("x", bt(BaseType::Ip)), ("first_action", bt(BaseType::Chars))],
+        vec![
+            ("x", bt(BaseType::Ip)),
+            ("first_action", bt(BaseType::Chars)),
+        ],
     );
     let input = r#"
 rule r {
@@ -192,6 +198,25 @@ rule r {
         input,
         &[auth_events_window(), output_window()],
         "column projection",
+    );
+}
+
+#[test]
+fn l3_function_rejected_in_guard_expression() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> {
+        on event { e && first(e.action) == "failed" | count >= 1; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "not allowed in guard expressions",
     );
 }
 

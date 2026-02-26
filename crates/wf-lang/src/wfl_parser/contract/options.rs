@@ -4,13 +4,13 @@ use winnow::prelude::*;
 use winnow::token::literal;
 
 use crate::ast::*;
-use crate::parse_utils::{kw, ws_skip};
+use crate::parse_utils::{kw, nonneg_integer, ws_skip};
 
 // ---------------------------------------------------------------------------
 // options block
 // ---------------------------------------------------------------------------
 
-/// `options { [close_trigger = val;] [eval_mode = val;] }`
+/// `options { [close_trigger = val;] [eval_mode = val;] [permutation = shuffle;] [runs = N;] }`
 pub(super) fn options_block(input: &mut &str) -> ModalResult<TestOptions> {
     kw("options").parse_next(input)?;
     ws_skip.parse_next(input)?;
@@ -18,6 +18,8 @@ pub(super) fn options_block(input: &mut &str) -> ModalResult<TestOptions> {
 
     let mut close_trigger = None;
     let mut eval_mode = None;
+    let mut permutation = None;
+    let mut runs = None;
 
     loop {
         ws_skip.parse_next(input)?;
@@ -38,6 +40,20 @@ pub(super) fn options_block(input: &mut &str) -> ModalResult<TestOptions> {
             eval_mode = Some(cut_err(eval_mode_val).parse_next(input)?);
             ws_skip.parse_next(input)?;
             cut_err(literal(";")).parse_next(input)?;
+        } else if opt(kw("permutation")).parse_next(input)?.is_some() {
+            ws_skip.parse_next(input)?;
+            cut_err(literal("=")).parse_next(input)?;
+            ws_skip.parse_next(input)?;
+            permutation = Some(cut_err(permutation_val).parse_next(input)?);
+            ws_skip.parse_next(input)?;
+            cut_err(literal(";")).parse_next(input)?;
+        } else if opt(kw("runs")).parse_next(input)?.is_some() {
+            ws_skip.parse_next(input)?;
+            cut_err(literal("=")).parse_next(input)?;
+            ws_skip.parse_next(input)?;
+            runs = Some(cut_err(runs_val).parse_next(input)?);
+            ws_skip.parse_next(input)?;
+            cut_err(literal(";")).parse_next(input)?;
         } else {
             return Err(winnow::error::ErrMode::Cut(
                 winnow::error::ContextError::new(),
@@ -50,6 +66,8 @@ pub(super) fn options_block(input: &mut &str) -> ModalResult<TestOptions> {
     Ok(TestOptions {
         close_trigger,
         eval_mode,
+        permutation,
+        runs,
     })
 }
 
@@ -74,4 +92,23 @@ fn eval_mode_val(input: &mut &str) -> ModalResult<EvalMode> {
         "eval mode (strict|lenient)",
     )))
     .parse_next(input)
+}
+
+fn permutation_val(input: &mut &str) -> ModalResult<PermutationMode> {
+    kw("shuffle")
+        .map(|_| PermutationMode::Shuffle)
+        .context(StrContext::Expected(StrContextValue::Description(
+            "permutation mode (shuffle)",
+        )))
+        .parse_next(input)
+}
+
+fn runs_val(input: &mut &str) -> ModalResult<usize> {
+    let n = nonneg_integer.parse_next(input)?;
+    if n == 0 {
+        return Err(winnow::error::ErrMode::Cut(
+            winnow::error::ContextError::new(),
+        ));
+    }
+    Ok(n)
 }

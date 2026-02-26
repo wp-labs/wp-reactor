@@ -1,7 +1,7 @@
 use crate::ast::{FieldSelector, Measure, StepBranch, Transform};
 use crate::schema::BaseType;
 
-use super::check_expr::check_expr_type;
+use super::check_expr::{check_expr_type, check_guard_expr_type};
 use super::infer::infer_type;
 use super::{ValType, compatible, is_numeric, is_orderable};
 use crate::checker::scope::Scope;
@@ -144,7 +144,7 @@ pub fn check_pipe_chain(
 
     // Check guard expression if present
     if let Some(ref guard) = branch.guard {
-        check_expr_type(guard, scope, rule_name, errors);
+        check_guard_expr_type(guard, scope, rule_name, errors);
     }
 }
 

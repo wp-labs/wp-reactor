@@ -102,6 +102,8 @@ test dns_no_response_timeout for dns_no_response {
     let opts = c.options.as_ref().unwrap();
     assert_eq!(opts.close_trigger, Some(CloseTrigger::Timeout));
     assert_eq!(opts.eval_mode, Some(EvalMode::Strict));
+    assert_eq!(opts.permutation, None);
+    assert_eq!(opts.runs, None);
 }
 
 #[test]
@@ -145,6 +147,8 @@ test ct for r {
     let opts = file.tests[0].options.as_ref().unwrap();
     assert_eq!(opts.close_trigger, Some(CloseTrigger::Flush));
     assert_eq!(opts.eval_mode, None);
+    assert_eq!(opts.permutation, None);
+    assert_eq!(opts.runs, None);
 }
 
 #[test]
@@ -160,6 +164,8 @@ test ct for r {
     let opts = file.tests[0].options.as_ref().unwrap();
     assert_eq!(opts.close_trigger, None);
     assert_eq!(opts.eval_mode, Some(EvalMode::Lenient));
+    assert_eq!(opts.permutation, None);
+    assert_eq!(opts.runs, None);
 }
 
 #[test]
@@ -174,6 +180,24 @@ test ct for r {
     let file = parse_wfl(input).unwrap();
     let opts = file.tests[0].options.as_ref().unwrap();
     assert_eq!(opts.close_trigger, Some(CloseTrigger::Eos));
+}
+
+#[test]
+fn parse_contract_options_permutation_shuffle_with_runs() {
+    let input = r#"
+test ct for r {
+    input { row(e, x = 1); }
+    expect { hits == 1; }
+    options {
+        permutation = shuffle;
+        runs = 8;
+    }
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let opts = file.tests[0].options.as_ref().unwrap();
+    assert_eq!(opts.permutation, Some(PermutationMode::Shuffle));
+    assert_eq!(opts.runs, Some(8));
 }
 
 #[test]

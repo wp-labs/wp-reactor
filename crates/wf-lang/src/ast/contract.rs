@@ -74,6 +74,19 @@ pub enum HitAssert {
 pub struct TestOptions {
     pub close_trigger: Option<CloseTrigger>,
     pub eval_mode: Option<EvalMode>,
+    pub permutation: Option<PermutationMode>,
+    pub runs: Option<usize>,
+}
+
+impl Default for TestOptions {
+    fn default() -> Self {
+        Self {
+            close_trigger: None,
+            eval_mode: None,
+            permutation: None,
+            runs: None,
+        }
+    }
 }
 
 /// Window close trigger mode for test execution.
@@ -91,4 +104,11 @@ pub enum CloseTrigger {
 pub enum EvalMode {
     Strict,
     Lenient,
+}
+
+/// Input permutation mode for conformance testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PermutationMode {
+    Shuffle,
 }

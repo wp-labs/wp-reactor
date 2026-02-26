@@ -11,8 +11,27 @@ pub fn check_func_call(
     args: &[Expr],
     scope: &Scope<'_>,
     rule_name: &str,
+    allow_l3_funcs: bool,
     errors: &mut Vec<CheckError>,
 ) {
+    if !allow_l3_funcs
+        && matches!(
+            name,
+            "collect_set" | "collect_list" | "first" | "last" | "stddev" | "percentile"
+        )
+    {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!(
+                "{}() is not allowed in guard expressions; use it in score/entity/yield instead",
+                name
+            ),
+        });
+        return;
+    }
+
     match name {
         "count" => {
             // T4: argument should be a set-level reference (bare alias), not a field projection
@@ -336,8 +355,10 @@ pub fn check_func_call(
                     test: None,
                     message: format!("{}() requires exactly 1 argument: alias.field", name),
                 });
-            } else if !matches!(args[0], Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..)))
-            {
+            } else if !matches!(
+                args[0],
+                Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
+            ) {
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
@@ -358,8 +379,10 @@ pub fn check_func_call(
                     test: None,
                     message: format!("{}() requires exactly 1 argument: alias.field", name),
                 });
-            } else if !matches!(args[0], Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..)))
-            {
+            } else if !matches!(
+                args[0],
+                Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
+            ) {
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
@@ -382,7 +405,9 @@ pub fn check_func_call(
                     message: "stddev() requires exactly 1 argument: alias.field".to_string(),
                 });
             } else if let Some(arg) = args.first() {
-                if let Some(t) = infer_type(arg, scope) && !is_numeric(&t) {
+                if let Some(t) = infer_type(arg, scope)
+                    && !is_numeric(&t)
+                {
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
@@ -391,8 +416,10 @@ pub fn check_func_call(
                     });
                 }
                 // Also check it's a column projection
-                if !matches!(args[0], Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..)))
-                {
+                if !matches!(
+                    args[0],
+                    Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
+                ) {
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
@@ -414,7 +441,9 @@ pub fn check_func_call(
                 });
             } else {
                 // First arg must be numeric column
-                if let Some(t) = infer_type(&args[0], scope) && !is_numeric(&t) {
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !is_numeric(&t)
+                {
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
@@ -422,8 +451,10 @@ pub fn check_func_call(
                         message: format!("percentile() field must be numeric, got {:?}", t),
                     });
                 }
-                if !matches!(args[0], Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..)))
-                {
+                if !matches!(
+                    args[0],
+                    Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..))
+                ) {
                     errors.push(CheckError {
                         severity: Severity::Error,
                         rule: Some(rule_name.to_string()),
