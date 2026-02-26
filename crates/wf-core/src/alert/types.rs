@@ -4,6 +4,7 @@ use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::rule::CloseReason;
+use crate::rule::Value;
 
 /// Which path produced this alert.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,4 +93,10 @@ pub struct OutputRecord {
     /// Yield target window name, used for sink routing.
     #[serde(skip)]
     pub yield_target: String,
+    /// Evaluated `yield (...)` fields, used by internal pipeline stages.
+    #[serde(skip)]
+    pub yield_fields: Vec<(String, Value)>,
+    /// Event-time for this output (nanos since epoch), used by internal windows.
+    #[serde(skip)]
+    pub event_time_nanos: i64,
 }

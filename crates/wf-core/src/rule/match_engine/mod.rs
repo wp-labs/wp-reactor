@@ -462,7 +462,9 @@ impl CepStateMachine {
     /// or scan frequency.
     pub fn scan_expired_at(&mut self, watermark_nanos: i64) -> Vec<CloseOutput> {
         let maxspan_nanos = match self.plan.window_spec {
-            WindowSpec::Sliding(d) | WindowSpec::Fixed(d) | WindowSpec::Session(d) => d.as_nanos() as i64,
+            WindowSpec::Sliding(d) | WindowSpec::Fixed(d) | WindowSpec::Session(d) => {
+                d.as_nanos() as i64
+            }
         };
         let is_session = matches!(self.plan.window_spec, WindowSpec::Session(_));
         let mut expired_keys: Vec<(InstanceKey, i64, i64)> = Vec::new();
@@ -483,7 +485,11 @@ impl CepStateMachine {
                     inst.created_at + maxspan_nanos
                 };
                 // Sort key: created_at for sliding/fixed, last_event_nanos for session
-                let sort_key = if is_session { inst.last_event_nanos } else { inst.created_at };
+                let sort_key = if is_session {
+                    inst.last_event_nanos
+                } else {
+                    inst.created_at
+                };
                 expired_keys.push((key.clone(), sort_key, logical_expire_time));
             }
         }

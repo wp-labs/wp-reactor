@@ -1,6 +1,7 @@
 //! L3 feature tests: conv transformations.
 
 mod conv;
+mod session;
 
 use std::time::Duration;
 

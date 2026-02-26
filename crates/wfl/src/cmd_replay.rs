@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, IsTerminal};
 use std::path::PathBuf;
 
@@ -17,6 +17,8 @@ const YELLOW: &str = "\x1b[1;38;5;208m";
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
+const PIPE_WINDOW_PREFIX: &str = "__wf_pipe_";
+const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
 
 /// Result of replaying events through compiled rules.
 pub struct ReplayResult {
@@ -132,6 +134,18 @@ impl WindowLookup for NullWindowLookup {
     }
 }
 
+struct ReplayEngine {
+    machine: CepStateMachine,
+    executor: RuleExecutor,
+    conv_plan: Option<wf_lang::plan::ConvPlan>,
+}
+
+#[derive(Clone)]
+struct ConsumerRoute {
+    engine_idx: usize,
+    bind_alias: String,
+}
+
 /// Replay events against pre-compiled rule plans.
 fn replay_with_plans<R: BufRead>(
     plans: &[RulePlan],
@@ -140,18 +154,10 @@ fn replay_with_plans<R: BufRead>(
     alias: &str,
     color: bool,
 ) -> Result<ReplayResult> {
-    let mut engines: Vec<(CepStateMachine, RuleExecutor)> = plans
+    let mut engines: Vec<ReplayEngine> = plans
         .iter()
         .map(|plan| {
-            // Resolve time_field from the schema that matches the replay alias.
-            // For multi-source rules (events { a: win_a, b: win_b }), the alias
-            // determines which window's time_field to use for event-time extraction.
-            let time_field = plan
-                .binds
-                .iter()
-                .find(|b| b.alias == alias)
-                .and_then(|b| schemas.iter().find(|s| s.name == b.window))
-                .and_then(|s| s.time_field.clone());
+            let time_field = resolve_replay_time_field(plan, schemas, alias);
 
             let limits = plan.limits_plan.clone();
             let sm = CepStateMachine::with_limits(
@@ -161,9 +167,14 @@ fn replay_with_plans<R: BufRead>(
                 limits,
             );
             let executor = RuleExecutor::new(plan.clone());
-            (sm, executor)
+            ReplayEngine {
+                machine: sm,
+                executor,
+                conv_plan: plan.conv_plan.clone(),
+            }
         })
         .collect();
+    let routes = build_replay_routes(plans);
 
     let lookup = NullWindowLookup;
     let mut alerts = Vec::new();
@@ -203,37 +214,40 @@ fn replay_with_plans<R: BufRead>(
         let event = json_to_event(&json);
         event_count += 1;
 
-        for (sm, executor) in &mut engines {
-            match sm.advance_with(alias, &event, Some(&lookup)) {
-                StepResult::Matched(ctx) => {
-                    match executor.execute_match_with_joins(&ctx, &lookup) {
-                        Ok(alert) => {
-                            alerts.push(alert);
-                            match_count += 1;
-                        }
-                        Err(e) => {
-                            if color {
-                                eprintln!("{RED}ERROR{RESET}: execute_match failed: {}", e);
-                            } else {
-                                eprintln!("ERROR: execute_match failed: {}", e);
-                            }
-                            error_count += 1;
-                        }
-                    }
-                }
-                StepResult::Advance | StepResult::Accumulate => {}
-            }
+        let mut queue = VecDeque::from([(external_route_key(alias), event)]);
+        while let Some((route_key, route_event)) = queue.pop_front() {
+            route_event_once(
+                &routes,
+                &mut engines,
+                &lookup,
+                &route_key,
+                &route_event,
+                &mut queue,
+                &mut alerts,
+                &mut match_count,
+                &mut error_count,
+                color,
+            );
         }
     }
 
     // -- EOF: close all remaining instances (with conv) --
-    for (i, (sm, executor)) in engines.iter_mut().enumerate() {
-        let conv_plan = plans[i].conv_plan.as_ref();
-        for close in &sm.close_all_with_conv(CloseReason::Eos, conv_plan) {
-            match executor.execute_close_with_joins(close, &lookup) {
-                Ok(Some(alert)) => {
-                    alerts.push(alert);
-                    match_count += 1;
+    for i in 0..engines.len() {
+        let close_outputs = {
+            let engine = &mut engines[i];
+            engine
+                .machine
+                .close_all_with_conv(CloseReason::Eos, engine.conv_plan.as_ref())
+        };
+        let mut queue = VecDeque::new();
+        for close in &close_outputs {
+            let result = {
+                let engine = &mut engines[i];
+                engine.executor.execute_close_with_joins(close, &lookup)
+            };
+            match result {
+                Ok(Some(record)) => {
+                    handle_output_record(record, &mut queue, &mut alerts, &mut match_count);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -246,6 +260,20 @@ fn replay_with_plans<R: BufRead>(
                 }
             }
         }
+        while let Some((route_key, route_event)) = queue.pop_front() {
+            route_event_once(
+                &routes,
+                &mut engines,
+                &lookup,
+                &route_key,
+                &route_event,
+                &mut queue,
+                &mut alerts,
+                &mut match_count,
+                &mut error_count,
+                color,
+            );
+        }
     }
 
     Ok(ReplayResult {
@@ -254,6 +282,121 @@ fn replay_with_plans<R: BufRead>(
         match_count,
         error_count,
     })
+}
+
+fn resolve_replay_time_field(
+    plan: &RulePlan,
+    schemas: &[WindowSchema],
+    replay_alias: &str,
+) -> Option<String> {
+    if let Some(bind) = plan.binds.iter().find(|b| b.alias == replay_alias) {
+        if is_internal_window_name(&bind.window) {
+            return Some(PIPE_EVENT_TIME_FIELD.to_string());
+        }
+        if let Some(tf) = schemas
+            .iter()
+            .find(|s| s.name == bind.window)
+            .and_then(|s| s.time_field.clone())
+        {
+            return Some(tf);
+        }
+    }
+    plan.binds
+        .iter()
+        .find(|b| is_internal_window_name(&b.window))
+        .map(|_| PIPE_EVENT_TIME_FIELD.to_string())
+}
+
+fn build_replay_routes(plans: &[RulePlan]) -> HashMap<String, Vec<ConsumerRoute>> {
+    let mut routes: HashMap<String, Vec<ConsumerRoute>> = HashMap::new();
+    for (engine_idx, plan) in plans.iter().enumerate() {
+        for bind in &plan.binds {
+            let route_key = if is_internal_window_name(&bind.window) {
+                bind.window.clone()
+            } else {
+                external_route_key(&bind.alias)
+            };
+            routes.entry(route_key).or_default().push(ConsumerRoute {
+                engine_idx,
+                bind_alias: bind.alias.clone(),
+            });
+        }
+    }
+    routes
+}
+
+fn external_route_key(alias: &str) -> String {
+    format!("__ext__{alias}")
+}
+
+fn is_internal_window_name(name: &str) -> bool {
+    name.starts_with(PIPE_WINDOW_PREFIX)
+}
+
+fn route_event_once(
+    routes: &HashMap<String, Vec<ConsumerRoute>>,
+    engines: &mut [ReplayEngine],
+    lookup: &NullWindowLookup,
+    route_key: &str,
+    event: &Event,
+    queue: &mut VecDeque<(String, Event)>,
+    alerts: &mut Vec<OutputRecord>,
+    match_count: &mut u64,
+    error_count: &mut u64,
+    color: bool,
+) {
+    let consumers = routes.get(route_key).cloned().unwrap_or_default();
+    for consumer in consumers {
+        let step = engines[consumer.engine_idx].machine.advance_with(
+            &consumer.bind_alias,
+            event,
+            Some(lookup),
+        );
+        if let StepResult::Matched(ctx) = step {
+            match engines[consumer.engine_idx]
+                .executor
+                .execute_match_with_joins(&ctx, lookup)
+            {
+                Ok(record) => {
+                    handle_output_record(record, queue, alerts, match_count);
+                }
+                Err(e) => {
+                    if color {
+                        eprintln!("{RED}ERROR{RESET}: execute_match failed: {}", e);
+                    } else {
+                        eprintln!("ERROR: execute_match failed: {}", e);
+                    }
+                    *error_count += 1;
+                }
+            }
+        }
+    }
+}
+
+fn handle_output_record(
+    record: OutputRecord,
+    queue: &mut VecDeque<(String, Event)>,
+    alerts: &mut Vec<OutputRecord>,
+    match_count: &mut u64,
+) {
+    if is_internal_window_name(&record.yield_target) {
+        queue.push_back((record.yield_target.clone(), output_record_to_event(&record)));
+    } else {
+        alerts.push(record);
+        *match_count += 1;
+    }
+}
+
+fn output_record_to_event(record: &OutputRecord) -> Event {
+    let mut fields = HashMap::new();
+    fields.insert(
+        PIPE_EVENT_TIME_FIELD.to_string(),
+        Value::Number(record.event_time_nanos as f64),
+    );
+    for (name, value) in &record.yield_fields {
+        fields.insert(name.clone(), value.clone());
+    }
+    Event { fields }
 }
 
 /// Convert a serde_json::Value (object) into our Event type.

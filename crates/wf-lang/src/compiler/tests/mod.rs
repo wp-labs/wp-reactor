@@ -9,6 +9,7 @@ use crate::wfl_parser::parse_wfl;
 mod basic;
 mod edge;
 mod keys_entity;
+mod pipeline;
 mod yield_score;
 
 // ---------------------------------------------------------------------------

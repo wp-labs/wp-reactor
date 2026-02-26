@@ -5,7 +5,7 @@ use crate::rule::match_engine::{Event, MatchedContext, WindowLookup};
 use super::RuleExecutor;
 use super::alert::{build_summary, build_wfx_id, format_nanos_utc};
 use super::context::{build_eval_context, execute_joins};
-use super::eval::{eval_entity_id, eval_score};
+use super::eval::{eval_entity_id, eval_score, eval_yield_expr};
 
 impl RuleExecutor {
     /// Produce an [`OutputRecord`] from an on-event match (L1 — no joins).
@@ -65,6 +65,16 @@ impl RuleExecutor {
             &matched.step_data,
             &origin,
         );
+        let yield_fields = self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .filter_map(|field| {
+                let value = eval_yield_expr(&field.value, ctx)?;
+                Some((field.name.clone(), value))
+            })
+            .collect();
 
         Ok(OutputRecord {
             wfx_id,
@@ -77,6 +87,8 @@ impl RuleExecutor {
             matched_rows: vec![],
             summary,
             yield_target: self.plan.yield_plan.target.clone(),
+            yield_fields,
+            event_time_nanos: matched.event_time_nanos,
         })
     }
 }

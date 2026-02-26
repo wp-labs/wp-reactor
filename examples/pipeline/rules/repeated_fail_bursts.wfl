@@ -1,0 +1,35 @@
+use "security.wfs"
+
+// Two-stage pipeline:
+// stage-1: per (sip,username), each fixed 5m bucket emits one burst summary
+// stage-2: per sip, in a fixed 30m bucket emit one alert when burst usernames >= 2
+rule repeated_fail_bursts {
+  events {
+    e : auth_events && action == "failed"
+  }
+
+  match<sip,username:5m:fixed> {
+    on event {
+      e | count >= 1;
+    }
+    and close {
+      burst: e | count >= 3;
+    }
+  }
+  |> match<sip:30m:fixed> {
+    on event {
+      _in | count >= 1;
+    }
+    and close {
+      users: _in.username | distinct | count >= 2;
+    }
+  } -> score(85.0)
+
+  entity(ip, _in.sip)
+
+  yield security_alerts (
+    sip = _in.sip,
+    fail_count = 2,
+    message = fmt("{} multi-user fail bursts", _in.sip)
+  )
+}

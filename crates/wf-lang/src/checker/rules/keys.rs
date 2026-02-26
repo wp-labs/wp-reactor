@@ -1,16 +1,15 @@
-use crate::ast::{FieldRef, RuleDecl, WindowMode};
+use crate::ast::{FieldRef, MatchClause, WindowMode};
 
 use crate::checker::scope::{self, Scope};
 use crate::checker::types::{ValType, compatible};
 use crate::checker::{CheckError, Severity};
 
-/// S1: session(gap) gap must be > 0
-pub fn check_session_gap(
-    rule: &RuleDecl,
+pub fn check_session_gap_clause(
+    match_clause: &MatchClause,
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
-    if let WindowMode::Session(gap) = rule.match_clause.window_mode {
+    if let WindowMode::Session(gap) = match_clause.window_mode {
         if gap.is_zero() {
             errors.push(CheckError {
                 severity: Severity::Error,
@@ -22,13 +21,13 @@ pub fn check_session_gap(
     }
 }
 
-pub fn check_match_keys(
-    rule: &RuleDecl,
+pub fn check_match_keys_clause(
+    match_clause: &MatchClause,
     scope: &Scope<'_>,
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
-    for key in &rule.match_clause.keys {
+    for key in &match_clause.keys {
         match key {
             FieldRef::Simple(field) => {
                 // K1: unqualified key must exist in ALL event sources
@@ -129,13 +128,13 @@ fn check_key_type_consistency(
     }
 }
 
-pub fn check_key_mapping(
-    rule: &RuleDecl,
+pub fn check_key_mapping_clause(
+    match_clause: &MatchClause,
     scope: &Scope<'_>,
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
-    let mapping = match &rule.match_clause.key_mapping {
+    let mapping = match &match_clause.key_mapping {
         Some(m) => m,
         None => return,
     };

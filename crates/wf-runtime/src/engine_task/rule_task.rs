@@ -2,16 +2,25 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
+    new_null_array,
+};
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc;
 
 use wf_core::alert::OutputRecord;
 use wf_core::rule::{CepStateMachine, CloseReason, RuleExecutor, StepResult, batch_to_events};
-use wf_core::window::Router;
+use wf_core::window::{AppendOutcome, Router};
 use wf_lang::plan::ConvPlan;
 
 use super::TASK_SEQ;
 use super::task_types::{RuleTaskConfig, WindowSource};
 use super::window_lookup::RegistryLookup;
+
+const PIPE_WINDOW_PREFIX: &str = "__wf_pipe_";
+const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
 
 // ---------------------------------------------------------------------------
 // RuleTask -- runtime state for a single rule
@@ -200,8 +209,134 @@ impl RuleTask {
     // -- Alert emission -----------------------------------------------------
 
     async fn emit(&self, record: OutputRecord) {
+        if record.yield_target.starts_with(PIPE_WINDOW_PREFIX) {
+            self.emit_pipeline_stage(record);
+            return;
+        }
         if let Err(e) = self.alert_tx.send(record).await {
             wf_warn!(pipe, error = %e, "alert channel closed");
         }
+    }
+
+    fn emit_pipeline_stage(&self, record: OutputRecord) {
+        let Some(win_lock) = self.router.registry().get_window(&record.yield_target) else {
+            wf_warn!(
+                pipe,
+                task_id = %self.task_id,
+                target = %record.yield_target,
+                "missing internal pipeline window"
+            );
+            return;
+        };
+
+        let (schema, time_col_index) = {
+            let win = win_lock.read().expect("lock poisoned");
+            (win.schema().clone(), win.time_col_index())
+        };
+        let batch = match build_pipeline_batch(
+            schema,
+            time_col_index,
+            record.event_time_nanos,
+            &record.yield_fields,
+        ) {
+            Ok(batch) => batch,
+            Err(e) => {
+                wf_warn!(
+                    pipe,
+                    task_id = %self.task_id,
+                    target = %record.yield_target,
+                    error = %e,
+                    "build internal pipeline row failed"
+                );
+                return;
+            }
+        };
+
+        let outcome = {
+            let mut win = win_lock.write().expect("lock poisoned");
+            match win.append_with_watermark(batch) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    wf_warn!(
+                        pipe,
+                        task_id = %self.task_id,
+                        target = %record.yield_target,
+                        error = %e,
+                        "append internal pipeline row failed"
+                    );
+                    return;
+                }
+            }
+        };
+
+        match outcome {
+            AppendOutcome::Appended => {
+                if let Some(notify) = self.router.registry().get_notifier(&record.yield_target) {
+                    notify.notify_waiters();
+                }
+            }
+            AppendOutcome::DroppedLate => {
+                wf_warn!(
+                    pipe,
+                    task_id = %self.task_id,
+                    target = %record.yield_target,
+                    "internal pipeline row dropped as late data"
+                );
+            }
+        }
+    }
+}
+
+fn build_pipeline_batch(
+    schema: arrow::datatypes::SchemaRef,
+    time_col_index: Option<usize>,
+    event_time_nanos: i64,
+    yield_fields: &[(String, wf_core::rule::Value)],
+) -> anyhow::Result<RecordBatch> {
+    let values: HashMap<&str, &wf_core::rule::Value> =
+        yield_fields.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let arrays: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            if time_col_index == Some(idx) || field.name() == PIPE_EVENT_TIME_FIELD {
+                return Arc::new(TimestampNanosecondArray::from(vec![Some(event_time_nanos)]))
+                    as ArrayRef;
+            }
+            let value = values.get(field.name().as_str()).copied();
+            value_to_single_row_array(field.data_type(), value)
+        })
+        .collect();
+    Ok(RecordBatch::try_new(schema, arrays)?)
+}
+
+fn value_to_single_row_array(
+    data_type: &DataType,
+    value: Option<&wf_core::rule::Value>,
+) -> ArrayRef {
+    match (data_type, value) {
+        (DataType::Int64, Some(wf_core::rule::Value::Number(n))) => {
+            Arc::new(Int64Array::from(vec![Some(*n as i64)]))
+        }
+        (DataType::Float64, Some(wf_core::rule::Value::Number(n))) => {
+            Arc::new(Float64Array::from(vec![Some(*n)]))
+        }
+        (DataType::Boolean, Some(wf_core::rule::Value::Bool(b))) => {
+            Arc::new(BooleanArray::from(vec![Some(*b)]))
+        }
+        (DataType::Utf8, Some(wf_core::rule::Value::Str(s))) => {
+            Arc::new(StringArray::from(vec![Some(s.as_str())]))
+        }
+        (DataType::Utf8, Some(wf_core::rule::Value::Number(n))) => {
+            Arc::new(StringArray::from(vec![Some(n.to_string())]))
+        }
+        (DataType::Utf8, Some(wf_core::rule::Value::Bool(b))) => {
+            Arc::new(StringArray::from(vec![Some(b.to_string())]))
+        }
+        (DataType::Timestamp(_, _), Some(wf_core::rule::Value::Number(n))) => {
+            Arc::new(TimestampNanosecondArray::from(vec![Some(*n as i64)]))
+        }
+        _ => new_null_array(data_type, 1),
     }
 }

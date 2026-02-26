@@ -4,7 +4,7 @@ use winnow::prelude::*;
 use winnow::token::literal;
 
 use crate::ast::*;
-use crate::parse_utils::{kw, nonneg_integer, ws_skip};
+use crate::parse_utils::{kw, nonneg_integer, quoted_string, ws_skip};
 
 // ---------------------------------------------------------------------------
 // options block
@@ -95,12 +95,18 @@ fn eval_mode_val(input: &mut &str) -> ModalResult<EvalMode> {
 }
 
 fn permutation_val(input: &mut &str) -> ModalResult<PermutationMode> {
-    kw("shuffle")
-        .map(|_| PermutationMode::Shuffle)
-        .context(StrContext::Expected(StrContextValue::Description(
-            "permutation mode (shuffle)",
-        )))
-        .parse_next(input)
+    if opt(kw("shuffle")).parse_next(input)?.is_some() {
+        return Ok(PermutationMode::Shuffle);
+    }
+
+    let mode = quoted_string.parse_next(input)?;
+    if mode == "shuffle" {
+        Ok(PermutationMode::Shuffle)
+    } else {
+        Err(winnow::error::ErrMode::Cut(
+            winnow::error::ContextError::new(),
+        ))
+    }
 }
 
 fn runs_val(input: &mut &str) -> ModalResult<usize> {

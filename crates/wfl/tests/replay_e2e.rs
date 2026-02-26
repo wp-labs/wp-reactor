@@ -359,3 +359,44 @@ rule conv_mixed {
     entity_ids.sort();
     assert_eq!(entity_ids, vec!["10.0.0.1", "10.0.0.2"]);
 }
+
+#[test]
+fn replay_pipeline_emits_only_final_rule_alerts() {
+    let schemas = vec![make_auth_events_schema(), make_security_alerts_schema()];
+
+    let wfl = r#"
+rule pipe_replay {
+    events { e : auth_events }
+    match<sip:5m> {
+        on event { s1: e | count >= 1; }
+    }
+    |> match<sip:5m> {
+        on event { s2: _in | count >= 2; }
+    } -> score(70.0)
+    entity(ip, _in.sip)
+    yield security_alerts (sip = _in.sip, fail_count = 2)
+}
+"#;
+
+    let base_nanos = 1_700_000_000_000_000_000i64;
+    let ndjson = format!(
+        r#"{{"sip":"10.0.0.1","action":"failed","user":"admin","event_time":{}}}"#,
+        base_nanos
+    ) + "\n"
+        + &format!(
+            r#"{{"sip":"10.0.0.1","action":"failed","user":"admin","event_time":{}}}"#,
+            base_nanos + 1_000_000_000
+        );
+    let reader = BufReader::new(ndjson.as_bytes());
+
+    let result = replay_events(wfl, &schemas, reader, "e", false).expect("replay should succeed");
+    assert_eq!(result.event_count, 2);
+    assert_eq!(result.match_count, 1);
+    assert_eq!(result.error_count, 0);
+    assert_eq!(result.alerts.len(), 1);
+    assert_eq!(result.alerts[0].rule_name, "pipe_replay");
+    assert!(
+        !result.alerts[0].rule_name.starts_with("__wf_pipe_"),
+        "replay must not output internal pipeline stage alerts"
+    );
+}

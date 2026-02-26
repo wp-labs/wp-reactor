@@ -201,6 +201,36 @@ test ct for r {
 }
 
 #[test]
+fn parse_contract_options_permutation_shuffle_string_literal() {
+    let input = r#"
+test ct for r {
+    input { row(e, x = 1); }
+    expect { hits == 1; }
+    options {
+        permutation = "shuffle";
+        runs = 3;
+    }
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let opts = file.tests[0].options.as_ref().unwrap();
+    assert_eq!(opts.permutation, Some(PermutationMode::Shuffle));
+    assert_eq!(opts.runs, Some(3));
+}
+
+#[test]
+fn parse_contract_options_runs_zero_rejected() {
+    let input = r#"
+test ct for r {
+    input { row(e, x = 1); }
+    expect { hits == 1; }
+    options { runs = 0; }
+}
+"#;
+    assert!(parse_wfl(input).is_err());
+}
+
+#[test]
 fn parse_contract_field_assert_expr() {
     let input = r#"
 test ct for r {

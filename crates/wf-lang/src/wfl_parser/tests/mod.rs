@@ -8,3 +8,4 @@ mod examples;
 mod expr;
 mod match_;
 mod pattern;
+mod pipeline;

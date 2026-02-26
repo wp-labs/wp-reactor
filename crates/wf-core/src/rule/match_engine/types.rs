@@ -214,7 +214,12 @@ impl RollingStats {
             return 0.0;
         }
         // Filter out NaN values to avoid panic in partial_cmp
-        let mut sorted: Vec<f64> = self.values.iter().copied().filter(|v| !v.is_nan()).collect();
+        let mut sorted: Vec<f64> = self
+            .values
+            .iter()
+            .copied()
+            .filter(|v| !v.is_nan())
+            .collect();
         if sorted.is_empty() {
             return 0.0;
         }
@@ -228,11 +233,7 @@ impl RollingStats {
     }
 
     fn ewma(&self) -> f64 {
-        if self.count == 0 {
-            0.0
-        } else {
-            self.ewma
-        }
+        if self.count == 0 { 0.0 } else { self.ewma }
     }
 
     /// Calculate deviation based on method.

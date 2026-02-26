@@ -202,13 +202,14 @@ fn execute_close_both_ok() {
         }],
         close_step_data: vec![],
         watermark_nanos: 0,
-        last_event_nanos: 0,
+        last_event_nanos: 123,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
     assert_eq!(alert.origin.as_str(), "close:timeout");
     assert!((alert.score - 70.0).abs() < f64::EPSILON);
     assert_eq!(alert.entity_id, "10.0.0.1");
+    assert_eq!(alert.event_time_nanos, 123);
 }
 
 // =========================================================================

@@ -45,7 +45,15 @@ pub struct UseDecl {
 // Rule
 // ---------------------------------------------------------------------------
 
-/// `rule name { meta events match->score [join...] entity yield [conv] [limits] }`
+/// One `match ... [-> score(...)] [join ...]*` segment in a pipeline.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct PipelineStage {
+    pub match_clause: MatchClause,
+    pub joins: Vec<JoinClause>,
+}
+
+/// `rule name { meta events stage_chain entity yield [conv] [limits] }`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct RuleDecl {
@@ -55,6 +63,7 @@ pub struct RuleDecl {
     pub match_clause: MatchClause,
     pub score: ScoreExpr,
     pub joins: Vec<JoinClause>,
+    pub pipeline_stages: Vec<PipelineStage>,
     pub entity: EntityClause,
     pub yield_clause: YieldClause,
     pub pattern_origin: Option<PatternOrigin>,

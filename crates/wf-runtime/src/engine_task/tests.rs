@@ -15,12 +15,12 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
-use wf_core::rule::{CepStateMachine, RuleExecutor};
-use wf_core::window::{Router, Window, WindowParams, WindowRegistry};
+use wf_core::rule::{CepStateMachine, RuleExecutor, batch_to_events};
+use wf_core::window::{Router, Window, WindowDef, WindowParams, WindowRegistry};
 use wf_lang::ast::{CloseMode, CmpOp, Expr, FieldRef, Measure};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
-    WindowSpec, YieldPlan,
+    WindowSpec, YieldField, YieldPlan,
 };
 
 use crate::tracing_init::DomainFormat;
@@ -53,6 +53,18 @@ fn test_schema() -> SchemaRef {
             DataType::Timestamp(TimeUnit::Nanosecond, None),
             true,
         ),
+    ]))
+}
+
+fn internal_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(
+            "__wf_pipe_ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("sip", DataType::Utf8, true),
+        Field::new("ev_count", DataType::Int64, true),
     ]))
 }
 
@@ -98,6 +110,26 @@ fn make_batch(schema: &SchemaRef, sips: &[&str], ts: i64) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+fn make_window_def(
+    name: &str,
+    schema: &SchemaRef,
+    streams: &[&str],
+    time_col: Option<usize>,
+) -> WindowDef {
+    let mut cfg = test_window_config(usize::MAX);
+    cfg.name = name.to_string();
+    WindowDef {
+        params: WindowParams {
+            name: name.to_string(),
+            schema: schema.clone(),
+            time_col_index: time_col,
+            over: Duration::from_secs(3600),
+        },
+        streams: streams.iter().map(|s| (*s).to_string()).collect(),
+        config: cfg,
+    }
 }
 
 /// Build a single-step count>=3 rule and return (task, alert_rx, window_arc, notify_arc).
@@ -214,6 +246,107 @@ fn make_task_with_window_bytes(
 
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
+}
+
+fn make_pipeline_stage_task() -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<wf_core::alert::OutputRecord>,
+    Arc<Router>,
+) {
+    let src_schema = test_schema();
+    let internal = internal_schema();
+    let source_name = "auth_events";
+    let target_name = "__wf_pipe_pipe_s1_w1";
+    let registry = WindowRegistry::build(vec![
+        make_window_def(source_name, &src_schema, &["syslog"], Some(1)),
+        make_window_def(target_name, &internal, &[target_name], Some(0)),
+    ])
+    .unwrap();
+    let router = Arc::new(Router::new(registry));
+
+    let source_window = Arc::clone(router.registry().get_window(source_name).unwrap());
+    let source_notify = Arc::clone(router.registry().get_notifier(source_name).unwrap());
+
+    let match_plan = MatchPlan {
+        keys: vec![FieldRef::Simple("sip".into())],
+        key_map: None,
+        window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
+        event_steps: vec![StepPlan {
+            branches: vec![BranchPlan {
+                label: Some("ev_count".into()),
+                source: "fail".into(),
+                field: None,
+                guard: None,
+                agg: AggPlan {
+                    transforms: vec![],
+                    measure: Measure::Count,
+                    cmp: CmpOp::Ge,
+                    threshold: Expr::Number(1.0),
+                },
+            }],
+        }],
+        close_steps: vec![],
+        close_mode: CloseMode::Or,
+    };
+    let rule_plan = RulePlan {
+        name: "__wf_pipe_pipe_s1".into(),
+        binds: vec![BindPlan {
+            alias: "fail".into(),
+            window: source_name.into(),
+            filter: None,
+        }],
+        match_plan: match_plan.clone(),
+        joins: vec![],
+        entity_plan: EntityPlan {
+            entity_type: "pipeline".into(),
+            entity_id_expr: Expr::Field(FieldRef::Simple("sip".into())),
+        },
+        yield_plan: YieldPlan {
+            target: target_name.into(),
+            version: None,
+            fields: vec![
+                YieldField {
+                    name: "sip".into(),
+                    value: Expr::Field(FieldRef::Simple("sip".into())),
+                },
+                YieldField {
+                    name: "ev_count".into(),
+                    value: Expr::Field(FieldRef::Simple("ev_count".into())),
+                },
+            ],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(0.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+
+    let machine = CepStateMachine::new(
+        "__wf_pipe_pipe_s1".into(),
+        match_plan,
+        Some("event_time".into()),
+    );
+    let executor = RuleExecutor::new(rule_plan);
+    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let config = task_types::RuleTaskConfig {
+        machine,
+        executor,
+        window_sources: vec![task_types::WindowSource {
+            window_name: source_name.into(),
+            window: source_window,
+            notify: source_notify,
+            stream_names: vec!["syslog".into()],
+        }],
+        stream_aliases: HashMap::from([("syslog".into(), vec!["fail".into()])]),
+        alert_tx,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout_scan_interval: Duration::from_secs(60),
+        router: Arc::clone(&router),
+    };
+    let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
+    (task, alert_rx, router)
 }
 
 // -- test cases ---------------------------------------------------------
@@ -360,5 +493,43 @@ async fn flush_closes_active_instances() {
     assert!(
         alert_rx.try_recv().is_err(),
         "flush of incomplete instance should not produce alert"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_stage_output_writes_internal_window_instead_of_alert_channel() {
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, mut alert_rx, router) = make_pipeline_stage_task();
+    let ts = 1_700_000_000_123_000_000i64;
+
+    let batch = make_batch(&schema, &["10.0.0.8"], ts);
+    let source = router.registry().get_window("auth_events").unwrap();
+    source.write().unwrap().append(batch).unwrap();
+    task.pull_and_advance().await;
+
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "internal pipeline stage must not emit sink alerts"
+    );
+
+    let out_batches = router
+        .registry()
+        .snapshot("__wf_pipe_pipe_s1_w1")
+        .expect("internal window missing");
+    assert_eq!(out_batches.len(), 1);
+    let rows = batch_to_events(&out_batches[0]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].fields.get("sip"),
+        Some(&wf_core::rule::Value::Str("10.0.0.8".into()))
+    );
+    assert_eq!(
+        rows[0].fields.get("ev_count"),
+        Some(&wf_core::rule::Value::Number(1.0))
+    );
+    assert_eq!(
+        rows[0].fields.get("__wf_pipe_ts"),
+        Some(&wf_core::rule::Value::Number(ts as f64))
     );
 }

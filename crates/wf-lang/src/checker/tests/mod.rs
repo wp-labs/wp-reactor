@@ -5,6 +5,7 @@ mod func_params;
 mod keys;
 mod labels;
 mod limits;
+mod pipeline;
 mod scope;
 mod t14_t51;
 mod t5_threshold;

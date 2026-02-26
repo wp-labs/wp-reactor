@@ -15,7 +15,8 @@ examples/
 ├── multi_step/               # 场景 4: 多步骤序列
 ├── avg/                      # 场景 5: avg 聚合 + 算术 score
 ├── close_modes/              # 场景 6: close trigger 三种模式
-└── conv/                     # 场景 7: conv 结果集变换 (M27, L3)
+├── conv/                     # 场景 7: conv 结果集变换 (M27, L3)
+└── pipeline/                 # 场景 8: 多级管道 |> (M28.5, L3)
 ```
 
 每个场景目录包含：
@@ -23,7 +24,7 @@ examples/
 | 子目录 | 说明 |
 |---|---|
 | `schemas/` | Window schema 定义 (`.wfs`) |
-| `rules/` | 规则文件，含内联测试 (`.wfl`) |
+| `rules/` | 规则文件（可含内联测试） (`.wfl`) |
 | `data/` | 用于 replay 的样本数据 (`.ndjson`) |
 | `out/` | replay 输出目录 |
 | `scenarios/` | 数据生成场景 (`.wfg`，部分场景有) |
@@ -131,7 +132,21 @@ cd examples/conv
 wfl test rules/top_scanners.wfl --schemas "schemas/*.wfs"
 ```
 
-## 运行全部测试
+### 8. pipeline/ — 多级管道 `|>` (M28.5)
+
+演示两级管道规则：第一阶段按 `(sip,username)` 固定 5 分钟窗口产出“失败突发”摘要（失败 >= 3），第二阶段按 `sip` 固定 30 分钟窗口统计 `_in` 的突发用户名数（>= 2）并在窗口关闭时告警。
+
+- **规则**: `repeated_fail_bursts.wfl` — `match<sip,username:5m:fixed> { ... and close { burst: e | count >= 3; } } |> match<sip:30m:fixed> { ... and close { users: _in.username | distinct | count >= 2; } }`
+- **Schema**: `security.wfs` — auth_events (syslog)
+- **Score**: 85.0
+- **特性**: `|>` + `_in` 隐式输入别名 (L3)
+
+```bash
+cd examples/pipeline
+wfl replay rules/repeated_fail_bursts.wfl --schemas "schemas/*.wfs" --input data/auth_events.ndjson --event e
+```
+
+## 运行全部示例验证
 
 ```bash
 cd examples/count       && wfl test rules/brute_force.wfl  --schemas "schemas/*.wfs" --var FAIL_THRESHOLD=3
@@ -141,6 +156,7 @@ cd examples/multi_step  && wfl test rules/chain_attack.wfl --schemas "schemas/*.
 cd examples/avg         && wfl test rules/dns_tunnel.wfl   --schemas "schemas/*.wfs"
 cd examples/close_modes && wfl test rules/close_demo.wfl   --schemas "schemas/*.wfs"
 cd examples/conv        && wfl test rules/top_scanners.wfl --schemas "schemas/*.wfs"
+cd examples/pipeline    && wfl replay rules/repeated_fail_bursts.wfl --schemas "schemas/*.wfs" --input data/auth_events.ndjson --event e
 ```
 
 ## Replay 示例

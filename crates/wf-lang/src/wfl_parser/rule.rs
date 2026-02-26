@@ -1,4 +1,4 @@
-use winnow::combinator::{alt, cut_err, opt, repeat, separated};
+use winnow::combinator::{cut_err, opt, repeat, separated};
 use winnow::error::{StrContext, StrContextValue};
 use winnow::prelude::*;
 use winnow::token::literal;
@@ -53,22 +53,78 @@ pub(super) fn rule_decl_with_patterns(
         )))
         .parse_next(input)?;
 
-    // Required match clause OR pattern invocation
+    // Parse either:
+    // 1) legacy/pattern single-stage rule, or
+    // 2) stage chain: stage {|> stage} with implicit _in between stages.
     ws_skip.parse_next(input)?;
-    let (match_clause, score, pattern_origin) = cut_err(alt((
-        // Standard: match<...> { ... } -> score(...)
-        match_p::match_with_score.map(|(m, s)| (m, s, None)),
-        // Pattern invocation: pattern_name(args...)
-        |input: &mut &str| pattern_invocation(input, patterns),
-    )))
-    .context(StrContext::Expected(StrContextValue::Description(
-        "match clause or pattern invocation",
-    )))
-    .parse_next(input)?;
+    let saved = *input;
+    let (match_clause, score, joins, pipeline_stages, pattern_origin) =
+        match pattern_invocation(input, patterns) {
+            Ok((match_clause, score, pattern_origin)) => {
+                ws_skip.parse_next(input)?;
+                let joins: Vec<JoinClause> = repeat(0.., clauses::join_clause).parse_next(input)?;
+                ws_skip.parse_next(input)?;
+                if opt(literal("|>")).parse_next(input)?.is_some() {
+                    return Err(winnow::error::ErrMode::Cut(
+                        winnow::error::ContextError::new(),
+                    ));
+                }
+                (match_clause, score, joins, Vec::new(), pattern_origin)
+            }
+            Err(winnow::error::ErrMode::Backtrack(_)) => {
+                *input = saved;
+                let mut parsed_stage = cut_err(stage_clause)
+                    .context(StrContext::Expected(StrContextValue::Description(
+                        "match clause",
+                    )))
+                    .parse_next(input)?;
+                let mut pipeline_stages: Vec<PipelineStage> = Vec::new();
 
-    // Optional join clauses (zero or more)
-    ws_skip.parse_next(input)?;
-    let joins: Vec<JoinClause> = repeat(0.., clauses::join_clause).parse_next(input)?;
+                loop {
+                    ws_skip.parse_next(input)?;
+                    if opt(literal("|>")).parse_next(input)?.is_none() {
+                        break;
+                    }
+
+                    // Non-final pipeline stage must not carry score.
+                    if parsed_stage.score.is_some() {
+                        return Err(winnow::error::ErrMode::Cut(
+                            winnow::error::ContextError::new(),
+                        ));
+                    }
+
+                    pipeline_stages.push(PipelineStage {
+                        match_clause: parsed_stage.match_clause,
+                        joins: parsed_stage.joins,
+                    });
+
+                    ws_skip.parse_next(input)?;
+                    parsed_stage = cut_err(stage_clause)
+                        .context(StrContext::Expected(StrContextValue::Description(
+                            "pipeline stage",
+                        )))
+                        .parse_next(input)?;
+                }
+
+                let score = match parsed_stage.score {
+                    Some(s) => s,
+                    None => {
+                        return Err(winnow::error::ErrMode::Cut(
+                            winnow::error::ContextError::new(),
+                        ));
+                    }
+                };
+
+                (
+                    parsed_stage.match_clause,
+                    score,
+                    parsed_stage.joins,
+                    pipeline_stages,
+                    None,
+                )
+            }
+            Err(e) => return Err(e),
+        };
 
     // Required entity clause
     ws_skip.parse_next(input)?;
@@ -108,11 +164,42 @@ pub(super) fn rule_decl_with_patterns(
         match_clause,
         score,
         joins,
+        pipeline_stages,
         entity,
         yield_clause,
         pattern_origin,
         conv,
         limits,
+    })
+}
+
+#[derive(Debug)]
+struct ParsedStage {
+    match_clause: MatchClause,
+    score: Option<ScoreExpr>,
+    joins: Vec<JoinClause>,
+}
+
+/// Parse one stage:
+/// `match<...> { ... } [-> score(...)] { join ... }*`
+fn stage_clause(input: &mut &str) -> ModalResult<ParsedStage> {
+    let match_clause = match_p::match_clause_only.parse_next(input)?;
+
+    ws_skip.parse_next(input)?;
+    let score = if opt(literal("->")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        Some(cut_err(match_p::score_expr_only).parse_next(input)?)
+    } else {
+        None
+    };
+
+    ws_skip.parse_next(input)?;
+    let joins: Vec<JoinClause> = repeat(0.., clauses::join_clause).parse_next(input)?;
+
+    Ok(ParsedStage {
+        match_clause,
+        score,
+        joins,
     })
 }
 

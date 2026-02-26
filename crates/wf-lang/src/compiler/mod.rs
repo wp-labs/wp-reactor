@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use crate::ast::{CloseMode, EntityTypeVal, FieldRef, RuleDecl, WflFile, WindowMode};
+use crate::ast::{
+    CloseMode, EntityClause, EntityTypeVal, EventsBlock, FieldRef, MatchClause, Measure, RuleDecl,
+    ScoreExpr, WflFile, WindowMode, YieldClause,
+};
 use crate::checker::check_wfl;
 use crate::plan::{
     AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, EntityPlan, ExceedAction,
@@ -31,33 +34,134 @@ pub fn compile_wfl(file: &WflFile, schemas: &[WindowSchema]) -> anyhow::Result<V
         let msgs: Vec<String> = hard_errors.iter().map(|e| e.to_string()).collect();
         anyhow::bail!("semantic errors:\n{}", msgs.join("\n"));
     }
-    file.rules.iter().map(compile_rule).collect()
+    let mut plans = Vec::new();
+    for rule in &file.rules {
+        plans.extend(compile_rule(rule)?);
+    }
+    Ok(plans)
 }
 
-fn compile_rule(rule: &RuleDecl) -> anyhow::Result<RulePlan> {
-    Ok(RulePlan {
+fn compile_rule(rule: &RuleDecl) -> anyhow::Result<Vec<RulePlan>> {
+    if rule.pipeline_stages.is_empty() {
+        return Ok(vec![compile_regular_rule(rule)]);
+    }
+    Ok(compile_pipeline_rule(rule))
+}
+
+fn compile_regular_rule(rule: &RuleDecl) -> RulePlan {
+    RulePlan {
         name: rule.name.clone(),
-        binds: compile_binds(rule),
-        match_plan: compile_match(rule),
+        binds: compile_binds(&rule.events),
+        match_plan: compile_match(&rule.match_clause, false),
         joins: compile_joins(&rule.joins),
-        entity_plan: compile_entity(rule),
-        yield_plan: compile_yield(rule),
-        score_plan: compile_score(rule),
+        entity_plan: compile_entity(&rule.entity),
+        yield_plan: compile_yield(&rule.yield_clause),
+        score_plan: compile_score(&rule.score),
         pattern_origin: rule.pattern_origin.as_ref().map(|po| PatternOriginPlan {
             pattern_name: po.pattern_name.clone(),
             args: po.args.clone(),
         }),
         conv_plan: compile_conv(&rule.conv),
         limits_plan: compile_limits(&rule.limits),
-    })
+    }
+}
+
+fn compile_pipeline_rule(rule: &RuleDecl) -> Vec<RulePlan> {
+    const PIPE_IN_ALIAS: &str = "_in";
+
+    let stage_count = rule.pipeline_stages.len() + 1;
+    let mut plans = Vec::with_capacity(stage_count);
+
+    for idx in 0..stage_count {
+        let is_final = idx + 1 == stage_count;
+        let (match_clause, joins) = if is_final {
+            (&rule.match_clause, rule.joins.as_slice())
+        } else {
+            let stage = &rule.pipeline_stages[idx];
+            (&stage.match_clause, stage.joins.as_slice())
+        };
+
+        let name = if is_final {
+            rule.name.clone()
+        } else {
+            pipeline_rule_name(&rule.name, idx + 1)
+        };
+
+        let binds = if idx == 0 {
+            compile_binds(&rule.events)
+        } else {
+            vec![BindPlan {
+                alias: PIPE_IN_ALIAS.to_string(),
+                window: pipeline_window_name(&rule.name, idx),
+                filter: None,
+            }]
+        };
+
+        let match_plan = compile_match(match_clause, !is_final);
+        let entity_plan = if is_final {
+            compile_entity(&rule.entity)
+        } else {
+            compile_pipeline_entity(&match_plan.keys)
+        };
+        let yield_plan = if is_final {
+            compile_yield(&rule.yield_clause)
+        } else {
+            compile_pipeline_stage_yield(match_clause, pipeline_window_name(&rule.name, idx + 1))
+        };
+        let score_plan = if is_final {
+            compile_score(&rule.score)
+        } else {
+            ScorePlan {
+                expr: crate::ast::Expr::Number(0.0),
+            }
+        };
+
+        plans.push(RulePlan {
+            name,
+            binds,
+            match_plan,
+            joins: compile_joins(joins),
+            entity_plan,
+            yield_plan,
+            score_plan,
+            pattern_origin: if is_final {
+                rule.pattern_origin.as_ref().map(|po| PatternOriginPlan {
+                    pattern_name: po.pattern_name.clone(),
+                    args: po.args.clone(),
+                })
+            } else {
+                None
+            },
+            conv_plan: if is_final {
+                compile_conv(&rule.conv)
+            } else {
+                None
+            },
+            limits_plan: if is_final {
+                compile_limits(&rule.limits)
+            } else {
+                None
+            },
+        });
+    }
+
+    plans
+}
+
+fn pipeline_rule_name(rule_name: &str, stage_index: usize) -> String {
+    format!("__wf_pipe_{}_s{}", rule_name, stage_index)
+}
+
+fn pipeline_window_name(rule_name: &str, stage_index: usize) -> String {
+    format!("__wf_pipe_{}_w{}", rule_name, stage_index)
 }
 
 // ---------------------------------------------------------------------------
 // Binds
 // ---------------------------------------------------------------------------
 
-fn compile_binds(rule: &RuleDecl) -> Vec<BindPlan> {
-    rule.events
+fn compile_binds(events: &EventsBlock) -> Vec<BindPlan> {
+    events
         .decls
         .iter()
         .map(|decl| BindPlan {
@@ -72,9 +176,7 @@ fn compile_binds(rule: &RuleDecl) -> Vec<BindPlan> {
 // Match
 // ---------------------------------------------------------------------------
 
-fn compile_match(rule: &RuleDecl) -> MatchPlan {
-    let mc = &rule.match_clause;
-
+fn compile_match(mc: &MatchClause, inject_implicit_stage_labels: bool) -> MatchPlan {
     let (keys, key_map) = if let Some(ref km) = mc.key_mapping {
         // When key mapping is present, use logical key names as keys
         let logical_names: Vec<FieldRef> = km
@@ -120,11 +222,20 @@ fn compile_match(rule: &RuleDecl) -> MatchPlan {
             WindowMode::Fixed => WindowSpec::Fixed(mc.duration),
             WindowMode::Session(gap) => WindowSpec::Session(gap),
         },
-        event_steps: mc.on_event.iter().map(compile_step).collect(),
+        event_steps: mc
+            .on_event
+            .iter()
+            .map(|s| compile_step(s, inject_implicit_stage_labels))
+            .collect(),
         close_steps: mc
             .on_close
             .as_ref()
-            .map(|cb| cb.steps.iter().map(compile_step).collect())
+            .map(|cb| {
+                cb.steps
+                    .iter()
+                    .map(|s| compile_step(s, inject_implicit_stage_labels))
+                    .collect()
+            })
             .unwrap_or_default(),
         close_mode: mc
             .on_close
@@ -134,15 +245,28 @@ fn compile_match(rule: &RuleDecl) -> MatchPlan {
     }
 }
 
-fn compile_step(step: &crate::ast::MatchStep) -> StepPlan {
+fn compile_step(step: &crate::ast::MatchStep, inject_implicit_stage_labels: bool) -> StepPlan {
     StepPlan {
-        branches: step.branches.iter().map(compile_branch).collect(),
+        branches: step
+            .branches
+            .iter()
+            .map(|b| compile_branch(b, inject_implicit_stage_labels))
+            .collect(),
     }
 }
 
-fn compile_branch(branch: &crate::ast::StepBranch) -> BranchPlan {
+fn compile_branch(
+    branch: &crate::ast::StepBranch,
+    inject_implicit_stage_labels: bool,
+) -> BranchPlan {
     BranchPlan {
-        label: branch.label.clone(),
+        label: branch.label.clone().or_else(|| {
+            if inject_implicit_stage_labels {
+                Some(measure_output_name(branch.pipe.measure).to_string())
+            } else {
+                None
+            }
+        }),
         source: branch.source.clone(),
         field: branch.field.clone(),
         guard: branch.guard.clone(),
@@ -159,13 +283,13 @@ fn compile_branch(branch: &crate::ast::StepBranch) -> BranchPlan {
 // Entity
 // ---------------------------------------------------------------------------
 
-fn compile_entity(rule: &RuleDecl) -> EntityPlan {
-    let raw = match &rule.entity.entity_type {
+fn compile_entity(entity: &EntityClause) -> EntityPlan {
+    let raw = match &entity.entity_type {
         EntityTypeVal::Ident(s) | EntityTypeVal::StringLit(s) => s.clone(),
     };
     EntityPlan {
         entity_type: raw.to_ascii_lowercase(),
-        entity_id_expr: rule.entity.id_expr.clone(),
+        entity_id_expr: entity.id_expr.clone(),
     }
 }
 
@@ -173,9 +297,9 @@ fn compile_entity(rule: &RuleDecl) -> EntityPlan {
 // Score
 // ---------------------------------------------------------------------------
 
-fn compile_score(rule: &RuleDecl) -> ScorePlan {
+fn compile_score(score: &ScoreExpr) -> ScorePlan {
     ScorePlan {
-        expr: rule.score.expr.clone(),
+        expr: score.expr.clone(),
     }
 }
 
@@ -183,12 +307,11 @@ fn compile_score(rule: &RuleDecl) -> ScorePlan {
 // Yield
 // ---------------------------------------------------------------------------
 
-fn compile_yield(rule: &RuleDecl) -> YieldPlan {
+fn compile_yield(yield_clause: &YieldClause) -> YieldPlan {
     YieldPlan {
-        target: rule.yield_clause.target.clone(),
-        version: rule.yield_clause.version,
-        fields: rule
-            .yield_clause
+        target: yield_clause.target.clone(),
+        version: yield_clause.version,
+        fields: yield_clause
             .args
             .iter()
             .map(|arg| YieldField {
@@ -196,6 +319,93 @@ fn compile_yield(rule: &RuleDecl) -> YieldPlan {
                 value: arg.value.clone(),
             })
             .collect(),
+    }
+}
+
+fn compile_pipeline_stage_yield(match_clause: &MatchClause, target: String) -> YieldPlan {
+    let mut fields = Vec::new();
+
+    if let Some(key_mapping) = &match_clause.key_mapping {
+        let mut seen = std::collections::HashSet::new();
+        for item in key_mapping {
+            let name = item.logical_name.clone();
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            fields.push(YieldField {
+                name: name.clone(),
+                value: crate::ast::Expr::Field(FieldRef::Simple(name)),
+            });
+        }
+    } else {
+        for key in &match_clause.keys {
+            let out_name = key_output_name(key);
+            fields.push(YieldField {
+                name: out_name.clone(),
+                value: crate::ast::Expr::Field(FieldRef::Simple(out_name)),
+            });
+        }
+    }
+
+    for step in &match_clause.on_event {
+        for branch in &step.branches {
+            let name = branch
+                .label
+                .clone()
+                .unwrap_or_else(|| measure_output_name(branch.pipe.measure).to_string());
+            fields.push(YieldField {
+                name: name.clone(),
+                value: crate::ast::Expr::Field(FieldRef::Simple(name)),
+            });
+        }
+    }
+    if let Some(close) = &match_clause.on_close {
+        for step in &close.steps {
+            for branch in &step.branches {
+                let name = branch
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| measure_output_name(branch.pipe.measure).to_string());
+                fields.push(YieldField {
+                    name: name.clone(),
+                    value: crate::ast::Expr::Field(FieldRef::Simple(name)),
+                });
+            }
+        }
+    }
+
+    YieldPlan {
+        target,
+        version: None,
+        fields,
+    }
+}
+
+fn compile_pipeline_entity(match_keys: &[FieldRef]) -> EntityPlan {
+    let entity_id_expr = match_keys
+        .first()
+        .map(|k| crate::ast::Expr::Field(FieldRef::Simple(key_output_name(k))))
+        .unwrap_or_else(|| crate::ast::Expr::StringLit("__pipeline".to_string()));
+    EntityPlan {
+        entity_type: "pipeline".to_string(),
+        entity_id_expr,
+    }
+}
+
+fn measure_output_name(measure: Measure) -> &'static str {
+    match measure {
+        Measure::Count => "count",
+        Measure::Sum => "sum",
+        Measure::Avg => "avg",
+        Measure::Min => "min",
+        Measure::Max => "max",
+    }
+}
+
+fn key_output_name(key: &FieldRef) -> String {
+    match key {
+        FieldRef::Simple(name) => name.clone(),
+        FieldRef::Qualified(_, field) | FieldRef::Bracketed(_, field) => field.clone(),
     }
 }
 

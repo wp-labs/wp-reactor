@@ -14,7 +14,7 @@ use super::expr;
 
 /// Parse `match<...> { ... } -> score(expr)`
 pub(super) fn match_with_score(input: &mut &str) -> ModalResult<(MatchClause, ScoreExpr)> {
-    let mc = match_clause.parse_next(input)?;
+    let mc = match_clause_only.parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal("->"))
         .context(StrContext::Expected(StrContextValue::Description(
@@ -22,7 +22,7 @@ pub(super) fn match_with_score(input: &mut &str) -> ModalResult<(MatchClause, Sc
         )))
         .parse_next(input)?;
     ws_skip.parse_next(input)?;
-    let score = cut_err(score_expr).parse_next(input)?;
+    let score = cut_err(score_expr_only).parse_next(input)?;
     Ok((mc, score))
 }
 
@@ -30,7 +30,7 @@ pub(super) fn match_with_score(input: &mut &str) -> ModalResult<(MatchClause, Sc
 // match clause
 // ---------------------------------------------------------------------------
 
-fn match_clause(input: &mut &str) -> ModalResult<MatchClause> {
+pub(super) fn match_clause_only(input: &mut &str) -> ModalResult<MatchClause> {
     kw("match").parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal("<")).parse_next(input)?;
@@ -413,7 +413,7 @@ fn cmp_op_step(input: &mut &str) -> ModalResult<CmpOp> {
 // ---------------------------------------------------------------------------
 
 /// `score(expr)`
-fn score_expr(input: &mut &str) -> ModalResult<ScoreExpr> {
+pub(super) fn score_expr_only(input: &mut &str) -> ModalResult<ScoreExpr> {
     kw("score").parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal("(")).parse_next(input)?;

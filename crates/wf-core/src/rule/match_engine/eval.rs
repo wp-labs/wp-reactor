@@ -134,15 +134,20 @@ fn eval_baseline(
     };
 
     // Parse optional method argument (default to "mean")
-    let method = args.get(2).and_then(|arg| match arg {
-        Expr::StringLit(s) => Some(s.as_str()),
-        _ => None,
-    }).unwrap_or("mean");
+    let method = args
+        .get(2)
+        .and_then(|arg| match arg {
+            Expr::StringLit(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .unwrap_or("mean");
 
     // Build a key to identify this baseline expression (including method)
     let key = format!("{:?}:{}", args[0], method);
 
-    let stats = baselines.entry(key).or_insert_with(|| RollingStats::new_with_method(method));
+    let stats = baselines
+        .entry(key)
+        .or_insert_with(|| RollingStats::new_with_method(method));
     let deviation = stats.deviation(current_val);
     stats.update(current_val);
     Some(Value::Number(deviation))

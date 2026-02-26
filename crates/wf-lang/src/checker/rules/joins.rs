@@ -1,17 +1,17 @@
-use crate::ast::{FieldRef, JoinMode, RuleDecl};
+use crate::ast::{FieldRef, JoinMode};
 use crate::schema::WindowSchema;
 
 use crate::checker::scope::Scope;
 use crate::checker::{CheckError, Severity};
 
-pub fn check_joins(
-    rule: &RuleDecl,
+pub fn check_joins_list(
+    joins: &[crate::ast::JoinClause],
     schemas: &[WindowSchema],
     scope: &Scope<'_>,
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
-    for join in &rule.joins {
+    for join in joins {
         // Target window must exist in schemas
         let target = schemas.iter().find(|s| s.name == join.target_window);
         match target {

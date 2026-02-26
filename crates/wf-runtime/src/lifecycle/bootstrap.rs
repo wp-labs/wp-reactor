@@ -13,7 +13,9 @@ use crate::schema_bridge::schemas_to_window_defs;
 use crate::sink_build::{SinkFactoryRegistry, build_sink_dispatcher};
 use crate::sink_factory::file::FileSinkFactory;
 
-use super::compile::{build_run_rules, compile_rules, load_schemas};
+use super::compile::{
+    build_pipeline_internal_windows, build_run_rules, compile_rules, load_schemas,
+};
 use super::types::BootstrapData;
 
 // ---------------------------------------------------------------------------
@@ -31,13 +33,19 @@ pub(super) async fn load_and_compile(
     // 2. Preprocess .wfl with config.vars → parse → compile → Vec<RulePlan>
     let all_rule_plans =
         compile_rules(&config.runtime.rules, base_dir, &config.vars, &all_schemas)?;
+    let (pipeline_schemas, pipeline_window_configs) =
+        build_pipeline_internal_windows(&all_rule_plans, &all_schemas, &config.window_defaults);
+    let mut runtime_schemas = all_schemas.clone();
+    runtime_schemas.extend(pipeline_schemas);
+    let mut runtime_window_configs = config.windows.clone();
+    runtime_window_configs.extend(pipeline_window_configs);
 
     // 3. Cross-validate over vs over_cap
-    let window_overs: HashMap<String, Duration> = all_schemas
+    let window_overs: HashMap<String, Duration> = runtime_schemas
         .iter()
         .map(|ws| (ws.name.clone(), ws.over))
         .collect();
-    wf_config::validate_over_vs_over_cap(&config.windows, &window_overs).owe_conf()?;
+    wf_config::validate_over_vs_over_cap(&runtime_window_configs, &window_overs).owe_conf()?;
     wf_debug!(
         conf,
         windows = config.windows.len(),
@@ -45,8 +53,8 @@ pub(super) async fn load_and_compile(
     );
 
     // 4. Schema bridge: WindowSchema × WindowConfig → Vec<WindowDef>
-    let window_defs =
-        schemas_to_window_defs(&all_schemas, &config.windows).owe(RuntimeReason::Bootstrap)?;
+    let window_defs = schemas_to_window_defs(&runtime_schemas, &runtime_window_configs)
+        .owe(RuntimeReason::Bootstrap)?;
 
     // 5. WindowRegistry::build → registry
     let registry = WindowRegistry::build(window_defs).err_conv()?;
@@ -55,7 +63,7 @@ pub(super) async fn load_and_compile(
     let router = Arc::new(Router::new(registry));
 
     // 7. Build RunRules (precompute stream_name → alias routing)
-    let rules = build_run_rules(&all_rule_plans, &all_schemas);
+    let rules = build_run_rules(&all_rule_plans, &runtime_schemas);
 
     // 8. Build connector-based sink dispatcher
     let sinks_dir = base_dir.join(&config.sinks);
@@ -74,12 +82,12 @@ pub(super) async fn load_and_compile(
             .owe(RuntimeReason::Bootstrap)?,
     );
 
-    let schema_count = all_schemas.len();
+    let schema_count = runtime_schemas.len();
     Ok(BootstrapData {
         rules,
         router,
         dispatcher,
         schema_count,
-        schemas: all_schemas,
+        schemas: runtime_schemas,
     })
 }
