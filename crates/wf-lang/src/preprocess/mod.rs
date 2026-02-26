@@ -3,9 +3,9 @@
 //! Performs `$VAR` / `${VAR:default}` text substitution as a preprocessing
 //! step before WFL parsing (compilation pipeline step 1).
 //!
-//! Context-aware: `$` references inside `# ...` comments and `"..."` string
-//! literals are passed through verbatim. Use `$$` to produce a literal `$`
-//! in code positions.
+//! Context-aware: `$` references inside line comments (`// ...`) and `"..."`
+//! string literals are passed through verbatim. Use `$$` to produce a literal
+//! `$` in code positions.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -44,8 +44,9 @@ impl std::error::Error for PreprocessError {}
 ///
 /// IDENT matches `[A-Za-z_][A-Za-z0-9_]*`.
 ///
-/// Variable references inside `# ...` line comments and `"..."` string
+/// Variable references inside `// ...` line comments and `"..."` string
 /// literals are **not** processed — the text is copied verbatim.
+/// Note: `#` is reserved for future annotation syntax and is not treated as a comment.
 ///
 /// A bare `$` not followed by IDENT, `{`, or `$` is left as-is.
 /// An unterminated `${...` (missing `}`) is an error.
@@ -80,7 +81,7 @@ fn preprocess_impl(
     while i < len {
         match bytes[i] {
             // --- Line comment: pass through until newline ---
-            b'#' => {
+            b'/' if i + 1 < len && bytes[i + 1] == b'/' => {
                 while i < len && bytes[i] != b'\n' {
                     out.push(bytes[i] as char);
                     i += 1;
@@ -322,8 +323,8 @@ fn try_skip_pattern_block(source: &str, pos: &mut usize, out: &mut String) -> bo
                 }
                 // k now points at closing '"' or end; the loop increment below handles it.
             }
-            b'#' => {
-                // Skip comment inside body.
+            b'/' if k + 1 < len && bytes[k + 1] == b'/' => {
+                // Skip // comment inside body.
                 while k < len && bytes[k] != b'\n' {
                     k += 1;
                 }

@@ -18,7 +18,7 @@ conv/
 
 **规则**: `top_port_scanners`
 
-```
+```wfl
 events { c : conn_events && action == "syn" }
 
 match<sip:1h:fixed> {

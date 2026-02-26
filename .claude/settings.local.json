@@ -98,7 +98,8 @@
       "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/avg && /Users/zuowenjian/devspace/wp-labs/wp-reactor/target/debug/wfl test rules/dns_tunnel.wfl -s schemas/dns.wfs 2>&1)",
       "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/sum && /Users/zuowenjian/devspace/wp-labs/wp-reactor/target/debug/wfl test rules/data_exfil.wfl -s schemas/network.wfs 2>&1)",
       "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/distinct && /Users/zuowenjian/devspace/wp-labs/wp-reactor/target/debug/wfl test rules/port_scan.wfl -s schemas/network.wfs 2>&1)",
-      "Bash(wfl test rules/chain_attack.wfl --schemas \"schemas/*.wfs\" 2>&1)"
+      "Bash(wfl test rules/chain_attack.wfl --schemas \"schemas/*.wfs\" 2>&1)",
+      "Bash(echo === $dir ===:*)"
     ]
   }
 }

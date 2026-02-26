@@ -1,6 +1,82 @@
 use crate::parse_wfl;
 
 // -----------------------------------------------------------------------
+// Comments
+// -----------------------------------------------------------------------
+
+#[test]
+fn parse_slash_slash_comments() {
+    let input = r#"
+// Header comment
+use "security.wfs"
+
+rule brute_force {
+    // Inside rule comment
+    events {
+        fail : auth_events && action == "failed"
+    }
+    match<sip:5m> {
+        // Inside match comment
+        on event {
+            fail | count >= 3; // end of line comment
+        }
+    } -> score(70.0)
+    entity(ip, fail.sip)
+    yield security_alerts (sip = fail.sip)
+}
+
+// Between rule and test
+test close_hit for brute_force {
+    // Inside test comment
+    input {
+        row(fail, sip = "10.0.0.1", action = "failed", event_time = "2026-01-01T00:00:00Z");
+    }
+    expect {
+        hits == 1;
+    }
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    assert_eq!(file.uses.len(), 1);
+    assert_eq!(file.rules.len(), 1);
+    assert_eq!(file.tests.len(), 1);
+}
+
+#[test]
+fn parse_comments_in_various_positions() {
+    let input = r#"
+// Header comment
+use "security.wfs"
+// Between use and rule
+
+rule test_rule {
+    // Inside rule
+    events { e : win }
+    match<:5m> {
+        // Inside match
+        on event { e | count >= 1; } // end of line
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+
+test close_hit for test_rule {
+    // Inside test
+    input {
+        row(e, sip = "10.0.0.1", event_time = "2026-01-01T00:00:00Z");
+    }
+    expect {
+        hits == 1;
+    }
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    assert_eq!(file.uses.len(), 1);
+    assert_eq!(file.rules.len(), 1);
+    assert_eq!(file.tests.len(), 1);
+}
+
+// -----------------------------------------------------------------------
 // use declarations
 // -----------------------------------------------------------------------
 

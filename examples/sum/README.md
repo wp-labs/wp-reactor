@@ -1,6 +1,6 @@
 # sum/ — 数据外泄检测
 
-sum 聚合 + `and close` 双阶段匹配。累计同一 IP 的传输字节数，事件阶段检测大流量，关闭阶段确认总量达标才触发告警。
+sum 聚合 + `on close` OR 双路径触发。演示两条独立告警路径：突发流量立即告警 + 窗口关闭时总量告警。
 
 ## 目录结构
 
@@ -22,8 +22,9 @@ sum/
 events { c : conn_events }
 
 match<sip:10m> {
-    on event  { c.bytes | sum >= 100000000; }      // 100MB
-    and close { total: c.bytes | sum >= 50000000; } // 50MB
+    // OR 模式：两条路径独立触发
+    on event  { burst: c.bytes | sum >= 100000000; }  // 100MB 立即告警
+    on close  { total: c.bytes | sum >= 50000000; }   // 50MB 关闭时告警
 } -> score(85.0)
 ```
 
@@ -32,9 +33,9 @@ match<sip:10m> {
 | 事件源 | `conn_events`（stream: netflow） |
 | 分组键 | `sip`（源 IP） |
 | 窗口 | 滑动窗口 10 分钟 |
-| 事件阶段 | 累计流量 >= 100MB（标记 event_ok） |
-| 关闭阶段 | 窗口关闭时总量 >= 50MB（close_ok） |
-| 命中条件 | `event_ok && close_ok`，AND 模式 |
+| **路径 1** | 突发流量 >= 100MB，**立即触发**（origin=`event`） |
+| **路径 2** | 窗口关闭时总量 >= 50MB，**关闭时触发**（origin=`close:timeout`） |
+| 命中条件 | OR 模式——任一条件满足即触发 |
 | Score | 85.0（高风险） |
 | Entity | `ip`, ID 为 `c.sip` |
 | Yield | `network_alerts`（sip, alert_type, detail） |
@@ -42,15 +43,17 @@ match<sip:10m> {
 ### 关键语法点
 
 - **`c.bytes | sum`**: 对 `bytes` 字段求和，统计总流量
-- **`and close`**: AND 模式——事件路径满足仅标记状态，不立即告警；窗口关闭时合并判定
-- **双阈值设计**: 事件阈值较高（100MB）用于早期标记，关闭阈值较低（50MB）确保最终判定
+- **`on close`**: OR 模式——事件路径与关闭路径**独立**触发，各自产生告警
+- **`burst:` / `total:`**: 给聚合结果加标签，便于区分触发路径
+- **双阈值设计**: 高阈值（100MB）用于即时告警，低阈值（50MB）用于窗口结束时兜底检查
 - **`tick()`**: 测试中使用 `tick(11m)` 推进时间触发窗口关闭
 
 ## 内联测试
 
 | 测试名 | 场景 | 预期 |
 |--------|------|------|
-| `exfil_close_timeout` | 5 条记录各 20MB，总计 100MB，tick 超时 | 1 hit, origin=close:timeout |
+| `exfil_close_timeout` | 5 条记录各 12MB，总计 60MB（满足 on close 50MB，不满足 on event 100MB），tick 超时 | 1 hit, origin=`close:timeout` |
+| `exfil_burst_immediate` | 4 条记录各 25MB，总计 100MB（满足 on event 立即触发，窗口关闭时 on close 也触发） | 2 hits: origin=`event` + `close:eos` |
 | `low_traffic` | 2 条记录共 3KB 流量 | 0 hits |
 
 ## 运行
@@ -96,6 +99,14 @@ wfl explain rules/data_exfil.wfl --schemas "schemas/*.wfs"
 - **数据外泄检测**: 监控大流量出站连接
 - **异常传输**: 识别短时间内大量数据传输
 - **带宽滥用**: 检测异常带宽消耗行为
+
+## 关闭模式对比
+
+| 模式 | 语法 | 触发条件 | 适用场景 |
+|------|------|----------|----------|
+| 仅事件 | 省略 close | 条件满足立即触发 | 实时检测，立即告警 |
+| **OR 模式** | `on close` | 事件/关闭**各自独立**触发 | 多路径兜底，本示例场景 |
+| AND 模式 | `and close` | 两路径**同时满足**才触发 | 必须完整窗口周期确认 |
 
 ## 对比 count 与 distinct
 

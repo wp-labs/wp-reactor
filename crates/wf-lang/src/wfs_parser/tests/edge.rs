@@ -15,7 +15,8 @@ fn parse_empty_file() {
 
 #[test]
 fn parse_comment_only_file() {
-    let schemas = parse_wfs("# just a comment\n# another\n").unwrap();
+    // Supports both // and # style comments
+    let schemas = parse_wfs("// just a comment\n// another\n").unwrap();
     assert!(schemas.is_empty());
 }
 

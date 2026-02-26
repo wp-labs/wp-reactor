@@ -58,7 +58,7 @@ wfl test rules/port_scan.wfl --schemas "schemas/*.wfs"
 
 ### 3. sum/ — 数据外泄检测
 
-sum 聚合 + on close + tick。累计同一 IP 的传输字节数，事件阶段和窗口关闭阶段分别设置不同阈值。
+sum 聚合 + on close + tick。累计同一 IP 的传输字节数，演示 OR 模式双路径触发：突发流量立即告警 + 窗口关闭总量告警。
 
 - **规则**: `data_exfil.wfl` — `on event { c.bytes | sum >= 100000000; }` + `on close { c.bytes | sum >= 50000000; }`
 - **Schema**: `network.wfs` — conn_events (netflow)

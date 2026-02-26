@@ -2,8 +2,10 @@ use "network.wfs"
 rule data_exfil {
   events { c : conn_events }
   match<sip:10m> {
-    on event { c.bytes | sum >= 100000000; }
-    and close { total: c.bytes | sum >= 50000000; }
+    // 路径 1：突发流量 >= 100MB 立即告警
+    on event { burst: c.bytes | sum >= 100000000; }
+    // 路径 2：窗口关闭时总量 >= 50MB 告警
+    on close { total: c.bytes | sum >= 50000000; }
   } -> score(85.0)
   entity(ip, c.sip)
   yield network_alerts (sip = c.sip, alert_type = "data_exfil", detail = "high volume")
@@ -11,11 +13,11 @@ rule data_exfil {
 
 test exfil_close_timeout for data_exfil {
   input {
-    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 20000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:00:00Z");
-    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 20000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:01:00Z");
-    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 20000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:02:00Z");
-    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 20000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:03:00Z");
-    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 20000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:04:00Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 12000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:00:00Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 12000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:01:00Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 12000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:02:00Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 12000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:03:00Z");
+    row(c, sip = "10.0.0.1", dip = "192.168.1.1", dport = "443", bytes = 12000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:04:00Z");
     tick(11m);
   }
   expect {
@@ -26,6 +28,22 @@ test exfil_close_timeout for data_exfil {
   }
   options {
     close_trigger = timeout;
+  }
+}
+
+test exfil_burst_immediate for data_exfil {
+  // OR 模式：on event 触发一次，窗口关闭时 on close 也会触发，共 2 次
+  input {
+    row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "443", bytes = 25000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:00:00Z");
+    row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "443", bytes = 25000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:00:01Z");
+    row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "443", bytes = 25000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:00:02Z");
+    row(c, sip = "10.0.0.2", dip = "192.168.1.1", dport = "443", bytes = 25000000, protocol = "tcp", action = "send", event_time = "2026-01-01T00:00:03Z");
+  }
+  expect {
+    hits == 2;
+    hit[0].score == 85.0;
+    hit[0].origin == "event";
+    hit[0].entity_id == "10.0.0.2";
   }
 }
 

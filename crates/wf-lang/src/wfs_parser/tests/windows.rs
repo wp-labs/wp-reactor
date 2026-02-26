@@ -94,12 +94,12 @@ window b {
 #[test]
 fn parse_with_comments() {
     let input = r#"
-# Security window definitions
+// Security window definitions
 window alerts {
-    # No stream — yield only
+    // No stream — yield only
     over = 0
     fields {
-        # Alert fields
+        // Alert fields
         rule_name: chars
         score: float
     }

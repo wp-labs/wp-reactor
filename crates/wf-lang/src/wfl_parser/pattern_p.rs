@@ -71,7 +71,7 @@ pub(super) fn pattern_decl(input: &mut &str) -> ModalResult<PatternDecl> {
 
 /// Capture everything up to the matching `}` (which is consumed but not
 /// included in the returned string). Handles nested `{}`, `"..."` strings,
-/// and `# ...` comments.
+/// and `// ...` comments.
 fn raw_balanced_body(input: &mut &str) -> ModalResult<String> {
     let bytes = input.as_bytes();
     let len = bytes.len();
@@ -100,7 +100,8 @@ fn raw_balanced_body(input: &mut &str) -> ModalResult<String> {
                     i += 1; // skip closing '"'
                 }
             }
-            b'#' => {
+            b'/' if i + 1 < len && bytes[i + 1] == b'/' => {
+                // Skip // comment
                 while i < len && bytes[i] != b'\n' {
                     i += 1;
                 }

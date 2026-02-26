@@ -87,8 +87,8 @@ fn no_vars_passthrough() {
 #[test]
 fn dollar_in_comment_ignored() {
     let v = HashMap::new();
-    let result = preprocess_vars("code # $HOME is fine\nnext", &v).unwrap();
-    assert_eq!(result, "code # $HOME is fine\nnext");
+    let result = preprocess_vars("code // $HOME is fine\nnext", &v).unwrap();
+    assert_eq!(result, "code // $HOME is fine\nnext");
 }
 
 #[test]
@@ -116,8 +116,8 @@ fn dollar_dollar_before_ident() {
 #[test]
 fn mixed_comment_and_var() {
     let v = vars(&[("THRESHOLD", "3")]);
-    let result = preprocess_vars("count >= $THRESHOLD # compare against $THRESHOLD\n", &v).unwrap();
-    assert_eq!(result, "count >= 3 # compare against $THRESHOLD\n");
+    let result = preprocess_vars("count >= $THRESHOLD // compare against $THRESHOLD\n", &v).unwrap();
+    assert_eq!(result, "count >= 3 // compare against $THRESHOLD\n");
 }
 
 #[test]

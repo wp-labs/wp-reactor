@@ -73,11 +73,12 @@ pub fn duration_value(input: &mut &str) -> ModalResult<Duration> {
 // Whitespace & comments
 // ---------------------------------------------------------------------------
 
-/// Skip whitespace and `# ...` line comments.
+/// Skip whitespace and `// ...` line comments.
 pub fn ws_skip(input: &mut &str) -> ModalResult<()> {
     loop {
         let _ = multispace0.parse_next(input)?;
-        if opt(literal("#")).parse_next(input)?.is_some() {
+        // Skip `// ...` comments
+        if opt(literal("//")).parse_next(input)?.is_some() {
             let _ = take_while(0.., |c: char| c != '\n').parse_next(input)?;
         } else {
             break;
