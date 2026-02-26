@@ -10,10 +10,12 @@ use super::eval::{eval_entity_id, eval_score};
 impl RuleExecutor {
     /// Produce an [`OutputRecord`] from an on-event match (L1 — no joins).
     pub fn execute_match(&self, matched: &MatchedContext) -> CoreResult<OutputRecord> {
+        let step_plans: Vec<_> = self.plan.match_plan.event_steps.iter().collect();
         let ctx = build_eval_context(
             &self.plan.match_plan.keys,
             &matched.scope_key,
             &matched.step_data,
+            &step_plans,
         );
         self.build_match_alert(matched, &ctx)
     }
@@ -27,10 +29,12 @@ impl RuleExecutor {
         matched: &MatchedContext,
         windows: &dyn WindowLookup,
     ) -> CoreResult<OutputRecord> {
+        let step_plans: Vec<_> = self.plan.match_plan.event_steps.iter().collect();
         let mut ctx = build_eval_context(
             &self.plan.match_plan.keys,
             &matched.scope_key,
             &matched.step_data,
+            &step_plans,
         );
         execute_joins(
             &self.plan.joins,

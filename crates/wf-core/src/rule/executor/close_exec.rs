@@ -32,7 +32,13 @@ impl RuleExecutor {
             return Ok(None);
         }
         let all_step_data = combine_step_data(close);
-        let ctx = build_eval_context(&self.plan.match_plan.keys, &close.scope_key, &all_step_data);
+        let step_plans = combine_step_plans(self, close);
+        let ctx = build_eval_context(
+            &self.plan.match_plan.keys,
+            &close.scope_key,
+            &all_step_data,
+            &step_plans,
+        );
         self.build_close_alert(close, &all_step_data, &ctx)
     }
 
@@ -46,8 +52,13 @@ impl RuleExecutor {
             return Ok(None);
         }
         let all_step_data = combine_step_data(close);
-        let mut ctx =
-            build_eval_context(&self.plan.match_plan.keys, &close.scope_key, &all_step_data);
+        let step_plans = combine_step_plans(self, close);
+        let mut ctx = build_eval_context(
+            &self.plan.match_plan.keys,
+            &close.scope_key,
+            &all_step_data,
+            &step_plans,
+        );
         execute_joins(&self.plan.joins, &mut ctx, windows, close.last_event_nanos);
         self.build_close_alert(close, &all_step_data, &ctx)
     }
@@ -102,5 +113,28 @@ fn combine_step_data(close: &CloseOutput) -> Vec<StepData> {
         .iter()
         .chain(close.close_step_data.iter())
         .cloned()
+        .collect()
+}
+
+fn combine_step_plans<'a>(
+    executor: &'a RuleExecutor,
+    close: &CloseOutput,
+) -> Vec<&'a wf_lang::plan::StepPlan> {
+    let event_count = close.event_step_data.len();
+    let close_count = close.close_step_data.len();
+    executor
+        .plan
+        .match_plan
+        .event_steps
+        .iter()
+        .take(event_count)
+        .chain(
+            executor
+                .plan
+                .match_plan
+                .close_steps
+                .iter()
+                .take(close_count),
+        )
         .collect()
 }

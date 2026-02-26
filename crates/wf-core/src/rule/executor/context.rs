@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use wf_lang::ast::{FieldRef, JoinMode};
-use wf_lang::plan::{JoinCondPlan, JoinPlan};
+use wf_lang::plan::{JoinCondPlan, JoinPlan, StepPlan};
 
 use crate::rule::match_engine::{
     Event, StepData, Value, WindowLookup, field_ref_name, values_equal,
@@ -17,6 +17,7 @@ pub(super) fn build_eval_context(
     keys: &[FieldRef],
     scope_key: &[Value],
     step_data: &[StepData],
+    step_plans: &[&StepPlan],
 ) -> Event {
     let mut fields = std::collections::HashMap::new();
 
@@ -38,6 +39,12 @@ pub(super) fn build_eval_context(
         let values_field = format!("_step_{}_values", step_idx);
         let values_array = Value::Array(sd.collected_values.clone());
         fields.insert(values_field, values_array);
+        if let Some(step_plan) = step_plans.get(step_idx)
+            && let Some(branch) = step_plan.branches.get(sd.satisfied_branch_index)
+        {
+            let source_field = format!("_step_{}_source", step_idx);
+            fields.insert(source_field, Value::Str(branch.source.clone()));
+        }
     }
 
     Event { fields }
