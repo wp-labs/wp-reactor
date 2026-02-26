@@ -279,6 +279,266 @@ pub fn check_func_call(
                 }
             }
         }
+        "abs" | "ceil" | "floor" => {
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() requires exactly 1 numeric argument", name),
+                });
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !is_numeric(&t)
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() argument must be numeric, got {:?}", name, t),
+                });
+            }
+        }
+        "round" => {
+            if args.len() != 1 && args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "round() requires 1 or 2 arguments: (value, [precision])".to_string(),
+                });
+            } else {
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("round() first argument must be numeric, got {:?}", t),
+                    });
+                }
+                if args.len() == 2
+                    && let Some(t) = infer_type(&args[1], scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("round() second argument must be numeric, got {:?}", t),
+                    });
+                }
+            }
+        }
+        "sqrt" | "exp" | "sign" | "trunc" | "is_finite" => {
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() requires exactly 1 numeric argument", name),
+                });
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !is_numeric(&t)
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() argument must be numeric, got {:?}", name, t),
+                });
+            }
+        }
+        "pow" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "pow() requires exactly 2 numeric arguments: (x, y)".to_string(),
+                });
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !is_numeric(&t)
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "pow() argument {} must be numeric, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        "log" => {
+            if args.len() != 1 && args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "log() requires 1 or 2 numeric arguments: (x, [base])".to_string(),
+                });
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !is_numeric(&t)
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "log() argument {} must be numeric, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        "clamp" => {
+            if args.len() != 3 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "clamp() requires exactly 3 numeric arguments: (x, min, max)"
+                        .to_string(),
+                });
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !is_numeric(&t)
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "clamp() argument {} must be numeric, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        "coalesce" => {
+            if args.is_empty() {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "coalesce() requires at least 1 argument".to_string(),
+                });
+            } else {
+                let mut first_type: Option<ValType> = None;
+                for (idx, arg) in args.iter().enumerate() {
+                    let Some(inferred) = infer_type(arg, scope) else {
+                        continue;
+                    };
+                    if let Some(existing) = &first_type {
+                        if !(compatible(existing, &inferred)
+                            || is_numeric(existing) && is_numeric(&inferred))
+                        {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                test: None,
+                                message: format!(
+                                    "coalesce() argument {} type {:?} is not compatible with {:?}",
+                                    idx + 1,
+                                    inferred,
+                                    existing
+                                ),
+                            });
+                        }
+                    } else {
+                        first_type = Some(inferred);
+                    }
+                }
+            }
+        }
+        "isnull" | "isnotnull" => {
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() requires exactly 1 argument", name),
+                });
+            }
+        }
+        "strftime" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "strftime() requires exactly 2 arguments: (time, format)".to_string(),
+                });
+            } else {
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Time))
+                    && !is_numeric(&t)
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "strftime() first argument must be time or numeric, got {:?}",
+                            t
+                        ),
+                    });
+                }
+                if let Some(t) = infer_type(&args[1], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("strftime() second argument must be chars, got {:?}", t),
+                    });
+                }
+            }
+        }
+        "strptime" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "strptime() requires exactly 2 arguments: (text, format)".to_string(),
+                });
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "strptime() argument {} must be chars, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         "contains" => {
             if args.len() != 2 {
                 errors.push(CheckError {
@@ -315,6 +575,37 @@ pub fn check_func_call(
                     test: None,
                     message: format!(
                         "{}() requires exactly 2 arguments: (text, prefix_or_suffix)",
+                        name
+                    ),
+                });
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "{}() argument {} must be chars, got {:?}",
+                                name,
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        "startswith_any" | "endswith_any" => {
+            if args.len() < 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "{}() requires at least 2 arguments: (text, prefix_or_suffix, ...)",
                         name
                     ),
                 });
@@ -436,6 +727,34 @@ pub fn check_func_call(
                 }
             }
         }
+        "replace_plain" => {
+            if args.len() != 3 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "replace_plain() requires exactly 3 arguments: (text, from, to)"
+                        .to_string(),
+                });
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "replace_plain() argument {} must be chars, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         "trim" => {
             if args.len() != 1 {
                 errors.push(CheckError {
@@ -453,6 +772,62 @@ pub fn check_func_call(
                     test: None,
                     message: format!("trim() argument must be chars, got {:?}", t),
                 });
+            }
+        }
+        "ltrim" | "rtrim" => {
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() requires exactly 1 argument", name),
+                });
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !compatible(&t, &ValType::Base(BaseType::Chars))
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() argument must be chars, got {:?}", name, t),
+                });
+            }
+        }
+        "concat" => {
+            if args.is_empty() {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "concat() requires at least 1 argument".to_string(),
+                });
+            }
+        }
+        "indexof" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "indexof() requires exactly 2 arguments: (text, needle)".to_string(),
+                });
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "indexof() argument {} must be chars, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
             }
         }
         "mvcount" => {
@@ -564,6 +939,28 @@ pub fn check_func_call(
                     message: format!(
                         "mvdedup() argument must be an array expression, got {:?}",
                         t
+                    ),
+                });
+            }
+        }
+        "mvsort" | "mvreverse" => {
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() requires exactly 1 argument", name),
+                });
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !matches!(t, ValType::Array(_))
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "{}() argument must be an array expression, got {:?}",
+                        name, t
                     ),
                 });
             }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use wf_lang::ast::{BinOp, CmpOp, Expr};
 
 use super::key::{field_ref_name, value_to_string};
@@ -12,7 +13,7 @@ use super::types::{Event, RollingStats, Value, WindowLookup};
 /// Evaluate an expression against an event, returning a [`Value`].
 ///
 /// Supports: literals, field refs, BinOp (And/Or/comparisons/arithmetic),
-/// Neg, InList, and basic FuncCall (contains, startswith, endswith, substr, replace, trim, lower, upper, len, mvcount, mvjoin, mvindex, mvappend, split, mvdedup, has, baseline).
+/// Neg, InList, and basic FuncCall (contains, startswith, endswith, substr, replace, trim, lower, upper, len, mvcount, mvjoin, mvindex, mvappend, split, mvdedup, abs, round, ceil, floor, sqrt, pow, log, exp, clamp, sign, trunc, is_finite, ltrim, rtrim, concat, indexof, replace_plain, startswith_any, endswith_any, coalesce, isnull, isnotnull, mvsort, mvreverse, strftime, strptime, has, baseline).
 pub(crate) fn eval_expr(expr: &Expr, event: &Event) -> Option<Value> {
     let mut empty = HashMap::new();
     eval_expr_ext(expr, event, None, &mut empty)
@@ -270,6 +271,32 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
 /// - `mvappend(v1, v2, ...)` → Array
 /// - `split(text, sep)` → Array<Str>
 /// - `mvdedup(arr)` → Array
+/// - `abs(x)` → Number
+/// - `round(x [, precision])` → Number
+/// - `ceil(x)` → Number
+/// - `floor(x)` → Number
+/// - `sqrt(x)` → Number
+/// - `pow(x, y)` → Number
+/// - `log(x [, base])` → Number
+/// - `exp(x)` → Number
+/// - `clamp(x, min, max)` → Number
+/// - `sign(x)` → Number
+/// - `trunc(x)` → Number
+/// - `is_finite(x)` → Bool
+/// - `ltrim(s)` → Str
+/// - `rtrim(s)` → Str
+/// - `concat(v1, v2, ...)` → Str
+/// - `indexof(text, needle)` → Number
+/// - `replace_plain(text, from, to)` → Str
+/// - `startswith_any(text, prefix1, prefix2, ...)` → Bool
+/// - `endswith_any(text, suffix1, suffix2, ...)` → Bool
+/// - `coalesce(v1, v2, ...)` → first non-null value
+/// - `isnull(expr)` → Bool
+/// - `isnotnull(expr)` → Bool
+/// - `mvsort(arr)` → Array
+/// - `mvreverse(arr)` → Array
+/// - `strftime(timestamp_nanos, format)` → Str
+/// - `strptime(text, format)` → Number (timestamp nanos)
 fn eval_func_call(
     name: &str,
     args: &[Expr],
@@ -543,6 +570,351 @@ fn eval_func_call(
             }
             Some(Value::Array(deduped))
         }
+        "abs" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) => Some(Value::Number(n.abs())),
+                _ => None,
+            }
+        }
+        "round" => {
+            if args.len() != 1 && args.len() != 2 {
+                return None;
+            }
+            let value = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let precision = if args.len() == 2 {
+                match eval_expr_ext(&args[1], event, windows, baselines)? {
+                    Value::Number(n) => f64_to_i64_trunc(n)?,
+                    _ => return None,
+                }
+            } else {
+                0
+            };
+            let rounded = round_with_precision(value, precision)?;
+            Some(Value::Number(rounded))
+        }
+        "ceil" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) => Some(Value::Number(n.ceil())),
+                _ => None,
+            }
+        }
+        "floor" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) => Some(Value::Number(n.floor())),
+                _ => None,
+            }
+        }
+        "sqrt" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) if n >= 0.0 => Some(Value::Number(n.sqrt())),
+                _ => None,
+            }
+        }
+        "pow" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let x = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let y = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let out = x.powf(y);
+            if out.is_finite() {
+                Some(Value::Number(out))
+            } else {
+                None
+            }
+        }
+        "log" => {
+            if args.len() != 1 && args.len() != 2 {
+                return None;
+            }
+            let x = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            if x <= 0.0 {
+                return None;
+            }
+            let out = if args.len() == 2 {
+                let base = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                    Value::Number(n) => n,
+                    _ => return None,
+                };
+                if base <= 0.0 || (base - 1.0).abs() < f64::EPSILON {
+                    return None;
+                }
+                x.log(base)
+            } else {
+                x.ln()
+            };
+            if out.is_finite() {
+                Some(Value::Number(out))
+            } else {
+                None
+            }
+        }
+        "exp" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let x = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let out = x.exp();
+            if out.is_finite() {
+                Some(Value::Number(out))
+            } else {
+                None
+            }
+        }
+        "clamp" => {
+            if args.len() != 3 {
+                return None;
+            }
+            let x = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let min = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let max = match eval_expr_ext(&args[2], event, windows, baselines)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            if min > max {
+                return None;
+            }
+            Some(Value::Number(x.clamp(min, max)))
+        }
+        "sign" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) if n.is_finite() => Some(Value::Number(n.signum())),
+                _ => None,
+            }
+        }
+        "trunc" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) => Some(Value::Number(n.trunc())),
+                _ => None,
+            }
+        }
+        "is_finite" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) => Some(Value::Bool(n.is_finite())),
+                _ => None,
+            }
+        }
+        "ltrim" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => Some(Value::Str(s.trim_start().to_string())),
+                _ => None,
+            }
+        }
+        "rtrim" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => Some(Value::Str(s.trim_end().to_string())),
+                _ => None,
+            }
+        }
+        "concat" => {
+            if args.is_empty() {
+                return None;
+            }
+            let mut out = String::new();
+            for arg in args {
+                let value = eval_expr_ext(arg, event, windows, baselines)?;
+                out.push_str(&value_to_string(&value));
+            }
+            Some(Value::Str(out))
+        }
+        "indexof" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let needle = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let idx = text.find(&needle).map(|x| x as f64).unwrap_or(-1.0);
+            Some(Value::Number(idx))
+        }
+        "replace_plain" => {
+            if args.len() != 3 {
+                return None;
+            }
+            let text = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let from = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let to = match eval_expr_ext(&args[2], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            Some(Value::Str(text.replace(&from, &to)))
+        }
+        "startswith_any" => {
+            if args.len() < 2 {
+                return None;
+            }
+            let text = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            for arg in &args[1..] {
+                let prefix = match eval_expr_ext(arg, event, windows, baselines)? {
+                    Value::Str(s) => s,
+                    _ => return None,
+                };
+                if text.starts_with(&prefix) {
+                    return Some(Value::Bool(true));
+                }
+            }
+            Some(Value::Bool(false))
+        }
+        "endswith_any" => {
+            if args.len() < 2 {
+                return None;
+            }
+            let text = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            for arg in &args[1..] {
+                let suffix = match eval_expr_ext(arg, event, windows, baselines)? {
+                    Value::Str(s) => s,
+                    _ => return None,
+                };
+                if text.ends_with(&suffix) {
+                    return Some(Value::Bool(true));
+                }
+            }
+            Some(Value::Bool(false))
+        }
+        "coalesce" => {
+            if args.is_empty() {
+                return None;
+            }
+            for arg in args {
+                if let Some(v) = eval_expr_ext(arg, event, windows, baselines) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        "isnull" => {
+            if args.len() != 1 {
+                return None;
+            }
+            Some(Value::Bool(
+                eval_expr_ext(&args[0], event, windows, baselines).is_none(),
+            ))
+        }
+        "isnotnull" => {
+            if args.len() != 1 {
+                return None;
+            }
+            Some(Value::Bool(
+                eval_expr_ext(&args[0], event, windows, baselines).is_some(),
+            ))
+        }
+        "mvsort" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let mut arr = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Array(arr) => arr,
+                _ => return None,
+            };
+            arr.sort_by(compare_sortable_values);
+            Some(Value::Array(arr))
+        }
+        "mvreverse" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let mut arr = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Array(arr) => arr,
+                _ => return None,
+            };
+            arr.reverse();
+            Some(Value::Array(arr))
+        }
+        "strftime" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let ts_nanos = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) => f64_to_i64_trunc(n)?,
+                _ => return None,
+            };
+            let fmt = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let dt = timestamp_nanos_to_utc(ts_nanos)?;
+            Some(Value::Str(dt.format(&fmt).to_string()))
+        }
+        "strptime" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let fmt = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let ts_nanos = parse_time_to_timestamp_nanos(&text, &fmt)?;
+            Some(Value::Number(ts_nanos as f64))
+        }
         "regex_match" => {
             if args.len() != 2 {
                 return None;
@@ -734,4 +1106,66 @@ fn normalize_index(index: i64, len: usize) -> Option<usize> {
     } else {
         Some(normalized as usize)
     }
+}
+
+fn compare_sortable_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        _ => value_to_string(a).cmp(&value_to_string(b)),
+    }
+}
+
+fn f64_to_i64_trunc(v: f64) -> Option<i64> {
+    if !v.is_finite() {
+        return None;
+    }
+    let truncated = v.trunc();
+    if truncated < i64::MIN as f64 || truncated > i64::MAX as f64 {
+        return None;
+    }
+    Some(truncated as i64)
+}
+
+fn round_with_precision(value: f64, precision: i64) -> Option<f64> {
+    if !value.is_finite() {
+        return None;
+    }
+    if precision >= 0 {
+        let p = i32::try_from(precision).ok()?;
+        let factor = 10_f64.powi(p);
+        if !factor.is_finite() || factor == 0.0 {
+            return None;
+        }
+        Some((value * factor).round() / factor)
+    } else {
+        let p = i32::try_from(-precision).ok()?;
+        let factor = 10_f64.powi(p);
+        if !factor.is_finite() || factor == 0.0 {
+            return None;
+        }
+        Some((value / factor).round() * factor)
+    }
+}
+
+fn timestamp_nanos_to_utc(timestamp_nanos: i64) -> Option<DateTime<Utc>> {
+    let secs = timestamp_nanos.div_euclid(1_000_000_000);
+    let nanos = timestamp_nanos.rem_euclid(1_000_000_000) as u32;
+    DateTime::<Utc>::from_timestamp(secs, nanos)
+}
+
+fn parse_time_to_timestamp_nanos(text: &str, fmt: &str) -> Option<i64> {
+    if let Ok(dt) = DateTime::parse_from_str(text, fmt) {
+        return dt.timestamp_nanos_opt();
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(text, fmt) {
+        return dt.and_utc().timestamp_nanos_opt();
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(text, fmt) {
+        return date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_nanos_opt();
+    }
+    None
 }

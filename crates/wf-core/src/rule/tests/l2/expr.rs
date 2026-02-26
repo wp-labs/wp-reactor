@@ -216,6 +216,265 @@ fn time_bucket_exact_boundary() {
 }
 
 // ===========================================================================
+// abs / round / ceil / floor / strftime / strptime
+// ===========================================================================
+
+#[test]
+fn math_functions_work() {
+    use crate::rule::match_engine::{Event, eval_expr};
+
+    let mut fields = HashMap::new();
+    fields.insert("n".to_string(), Value::Number(-12.345));
+    fields.insert("p".to_string(), Value::Number(16.0));
+    fields.insert("ts".to_string(), Value::Number(0.0));
+    fields.insert(
+        "msg".to_string(),
+        Value::Str("  failed_login_root  ".to_string()),
+    );
+    fields.insert(
+        "arr".to_string(),
+        Value::Array(vec![
+            Value::Str("b".to_string()),
+            Value::Str("a".to_string()),
+            Value::Str("c".to_string()),
+        ]),
+    );
+    let event = Event { fields };
+
+    let abs_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "abs".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+    };
+    let ceil_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "ceil".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+    };
+    let floor_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "floor".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+    };
+    let round_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "round".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("n".to_string())),
+            Expr::Number(2.0),
+        ],
+    };
+    let fmt_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "strftime".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("ts".to_string())),
+            Expr::StringLit("%Y-%m-%d".to_string()),
+        ],
+    };
+    let sqrt_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "sqrt".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("p".to_string()))],
+    };
+    let pow_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "pow".to_string(),
+        args: vec![Expr::Number(2.0), Expr::Number(8.0)],
+    };
+    let log_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "log".to_string(),
+        args: vec![Expr::Number(100.0), Expr::Number(10.0)],
+    };
+    let exp_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "exp".to_string(),
+        args: vec![Expr::Number(1.0)],
+    };
+    let clamp_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "clamp".to_string(),
+        args: vec![Expr::Number(120.0), Expr::Number(0.0), Expr::Number(100.0)],
+    };
+    let sign_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "sign".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+    };
+    let trunc_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "trunc".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+    };
+    let finite_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "is_finite".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+    };
+    let ltrim_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "ltrim".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+    };
+    let rtrim_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "rtrim".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+    };
+    let concat_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "concat".to_string(),
+        args: vec![
+            Expr::StringLit("ip=".to_string()),
+            Expr::StringLit("1.1.1.1".to_string()),
+        ],
+    };
+    let index_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "indexof".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("msg".to_string())),
+            Expr::StringLit("login".to_string()),
+        ],
+    };
+    let replace_plain_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "replace_plain".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("msg".to_string())),
+            Expr::StringLit("_".to_string()),
+            Expr::StringLit("-".to_string()),
+        ],
+    };
+    let sw_any_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "startswith_any".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("msg".to_string())),
+            Expr::StringLit("  fail".to_string()),
+            Expr::StringLit("deny".to_string()),
+        ],
+    };
+    let ew_any_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "endswith_any".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("msg".to_string())),
+            Expr::StringLit("root  ".to_string()),
+            Expr::StringLit("deny".to_string()),
+        ],
+    };
+    let coalesce_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "coalesce".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("missing".to_string())),
+            Expr::StringLit("fallback".to_string()),
+        ],
+    };
+    let isnull_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "isnull".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("missing".to_string()))],
+    };
+    let isnotnull_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "isnotnull".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+    };
+    let mvsort_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "mvsort".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("arr".to_string()))],
+    };
+    let mvreverse_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "mvreverse".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("arr".to_string()))],
+    };
+
+    assert_eq!(eval_expr(&abs_expr, &event), Some(Value::Number(12.345)));
+    assert_eq!(eval_expr(&ceil_expr, &event), Some(Value::Number(-12.0)));
+    assert_eq!(eval_expr(&floor_expr, &event), Some(Value::Number(-13.0)));
+    assert_eq!(eval_expr(&round_expr, &event), Some(Value::Number(-12.35)));
+    assert_eq!(
+        eval_expr(&fmt_expr, &event),
+        Some(Value::Str("1970-01-01".to_string()))
+    );
+    assert_eq!(eval_expr(&sqrt_expr, &event), Some(Value::Number(4.0)));
+    assert_eq!(eval_expr(&pow_expr, &event), Some(Value::Number(256.0)));
+    assert_eq!(eval_expr(&log_expr, &event), Some(Value::Number(2.0)));
+    assert_eq!(
+        eval_expr(&exp_expr, &event),
+        Some(Value::Number(std::f64::consts::E))
+    );
+    assert_eq!(eval_expr(&clamp_expr, &event), Some(Value::Number(100.0)));
+    assert_eq!(eval_expr(&sign_expr, &event), Some(Value::Number(-1.0)));
+    assert_eq!(eval_expr(&trunc_expr, &event), Some(Value::Number(-12.0)));
+    assert_eq!(eval_expr(&finite_expr, &event), Some(Value::Bool(true)));
+    assert_eq!(
+        eval_expr(&ltrim_expr, &event),
+        Some(Value::Str("failed_login_root  ".to_string()))
+    );
+    assert_eq!(
+        eval_expr(&rtrim_expr, &event),
+        Some(Value::Str("  failed_login_root".to_string()))
+    );
+    assert_eq!(
+        eval_expr(&concat_expr, &event),
+        Some(Value::Str("ip=1.1.1.1".to_string()))
+    );
+    assert_eq!(eval_expr(&index_expr, &event), Some(Value::Number(9.0)));
+    assert_eq!(
+        eval_expr(&replace_plain_expr, &event),
+        Some(Value::Str("  failed-login-root  ".to_string()))
+    );
+    assert_eq!(eval_expr(&sw_any_expr, &event), Some(Value::Bool(true)));
+    assert_eq!(eval_expr(&ew_any_expr, &event), Some(Value::Bool(true)));
+    assert_eq!(
+        eval_expr(&coalesce_expr, &event),
+        Some(Value::Str("fallback".to_string()))
+    );
+    assert_eq!(eval_expr(&isnull_expr, &event), Some(Value::Bool(true)));
+    assert_eq!(eval_expr(&isnotnull_expr, &event), Some(Value::Bool(true)));
+    assert_eq!(
+        eval_expr(&mvsort_expr, &event),
+        Some(Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str("c".to_string()),
+        ]))
+    );
+    assert_eq!(
+        eval_expr(&mvreverse_expr, &event),
+        Some(Value::Array(vec![
+            Value::Str("c".to_string()),
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+        ]))
+    );
+}
+
+#[test]
+fn strptime_parses_date() {
+    use crate::rule::match_engine::{Event, eval_expr};
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "strptime".to_string(),
+        args: vec![
+            Expr::StringLit("1970-01-01".to_string()),
+            Expr::StringLit("%Y-%m-%d".to_string()),
+        ],
+    };
+    let event = Event {
+        fields: HashMap::new(),
+    };
+    assert_eq!(eval_expr(&expr, &event), Some(Value::Number(0.0)));
+}
+
+// ===========================================================================
 // replace / trim / mvcount / mvjoin / mvindex / mvappend / split / mvdedup
 // ===========================================================================
 

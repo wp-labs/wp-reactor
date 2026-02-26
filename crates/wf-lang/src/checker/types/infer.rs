@@ -52,8 +52,14 @@ fn infer_func_call(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<ValTy
         "avg" => Some(ValType::Base(BaseType::Float)),
         "distinct" => Some(ValType::Base(BaseType::Digit)),
         "fmt" => Some(ValType::Base(BaseType::Chars)),
-        "has" | "contains" | "regex_match" | "startswith" | "endswith" => Some(ValType::Bool),
+        "has" | "contains" | "regex_match" | "startswith" | "endswith" | "startswith_any"
+        | "endswith_any" | "is_finite" | "isnull" | "isnotnull" => Some(ValType::Bool),
         "substr" => Some(ValType::Base(BaseType::Chars)),
+        "abs" => args.first().and_then(|a| infer_type(a, scope)),
+        "ceil" | "floor" | "round" => Some(ValType::Base(BaseType::Float)),
+        "sqrt" | "pow" | "log" | "exp" | "clamp" | "sign" | "trunc" => {
+            Some(ValType::Base(BaseType::Float))
+        }
         "mvcount" => Some(ValType::Base(BaseType::Digit)),
         "mvjoin" => Some(ValType::Base(BaseType::Chars)),
         "split" => Some(ValType::Array(BaseType::Chars)),
@@ -73,9 +79,19 @@ fn infer_func_call(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<ValTy
         }),
         "mvappend" => infer_mvappend_type(args, scope),
         "baseline" | "time_diff" => Some(ValType::Base(BaseType::Float)),
-        "lower" | "upper" | "replace" | "trim" => Some(ValType::Base(BaseType::Chars)),
+        "strftime" => Some(ValType::Base(BaseType::Chars)),
+        "strptime" => Some(ValType::Base(BaseType::Time)),
+        "lower" | "upper" | "replace" | "trim" | "ltrim" | "rtrim" | "concat" | "replace_plain" => {
+            Some(ValType::Base(BaseType::Chars))
+        }
+        "indexof" => Some(ValType::Base(BaseType::Digit)),
+        "coalesce" => args.first().and_then(|a| infer_type(a, scope)),
         "len" => Some(ValType::Base(BaseType::Digit)),
         "time_bucket" => Some(ValType::Base(BaseType::Time)),
+        "mvsort" | "mvreverse" => args.first().and_then(|a| match infer_type(a, scope) {
+            Some(ValType::Array(bt)) => Some(ValType::Array(bt)),
+            _ => None,
+        }),
         // L3 Collection functions (M28)
         "collect_set" | "collect_list" => {
             // Returns Array<T> where T is the field type

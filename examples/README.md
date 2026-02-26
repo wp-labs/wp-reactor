@@ -147,18 +147,23 @@ cd examples/pipeline
 wfl replay rules/repeated_fail_bursts.wfl --schemas "schemas/*.wfs" --input data/auth_events.ndjson --event e
 ```
 
-### 9. functions/ — 字符/集合函数组合
+### 9. functions/ — 函数组合与 Top50 函数示例
 
-演示在一个规则中组合使用 `trim`、`replace`、`split`、`mvcount`、`mvdedup`、`mvjoin`，用于把原始 action 文本标准化后再做集合汇总。
+包含两条规则：
 
-- **规则**: `action_string_set_ops.wfl` — `mvcount(split(replace(trim(e.action), " ", ""), ","))` + `mvjoin(mvdedup(split(replace(trim(e.action), " ", ""), ",")), "|")`
+- `action_string_set_ops.wfl`：演示 `trim`/`replace`/`split`/`mvcount`/`mvdedup`/`mvjoin` 链式组合
+- `top50_function_showcase.wfl`：演示 Top50 扩展中的 20 个新增函数（含数值、时间、字符串、空值、多值）
+
+- **规则**: `action_string_set_ops.wfl`、`top50_function_showcase.wfl`
 - **Schema**: `security.wfs` — auth_events (syslog)
-- **Score**: 72.0
-- **特性**: 字符处理 + 多值处理函数链式组合
+- **Score**: 72.0 / 88.0（Top50 示例数据）
+- **特性**: 字符处理 + 多值处理 + Top50 函数可验证样例
 
 ```bash
 cd examples/functions
+wfl test rules/top50_function_showcase.wfl --schemas "schemas/*.wfs"
 wfl replay rules/action_string_set_ops.wfl --schemas "schemas/*.wfs" --input data/auth_events.ndjson --event e
+wfl replay rules/top50_function_showcase.wfl --schemas "schemas/*.wfs" --input data/top50_functions.ndjson --event e
 ```
 
 ## 运行全部示例验证
@@ -172,7 +177,9 @@ cd examples/avg         && wfl test rules/dns_tunnel.wfl   --schemas "schemas/*.
 cd examples/close_modes && wfl test rules/close_demo.wfl   --schemas "schemas/*.wfs"
 cd examples/conv        && wfl test rules/top_scanners.wfl --schemas "schemas/*.wfs"
 cd examples/pipeline    && wfl replay rules/repeated_fail_bursts.wfl --schemas "schemas/*.wfs" --input data/auth_events.ndjson --event e
+cd examples/functions   && wfl test rules/top50_function_showcase.wfl --schemas "schemas/*.wfs"
 cd examples/functions   && wfl replay rules/action_string_set_ops.wfl --schemas "schemas/*.wfs" --input data/auth_events.ndjson --event e
+cd examples/functions   && wfl replay rules/top50_function_showcase.wfl --schemas "schemas/*.wfs" --input data/top50_functions.ndjson --event e
 ```
 
 ## Replay 示例

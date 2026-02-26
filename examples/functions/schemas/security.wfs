@@ -20,3 +20,39 @@ window security_alerts {
         message: chars
     }
 }
+
+window function_showcase_alerts {
+    over = 0
+    fields {
+        sip: ip
+        abs_v: float
+        round_v: float
+        ceil_v: float
+        floor_v: float
+        strftime_v: chars
+        strptime_v: time
+        sqrt_v: float
+        pow_v: float
+        log_v: float
+        exp_v: float
+        clamp_v: float
+        sign_v: float
+        trunc_v: float
+        is_finite_v: bool
+        ltrim_v: chars
+        rtrim_v: chars
+        concat_v: chars
+        indexof_v: digit
+        replace_plain_v: chars
+        startswith_any_v: bool
+        endswith_any_v: bool
+        coalesce_v: chars
+        isnull_v: bool
+        isnotnull_v: bool
+        mvsort_v: array/chars
+        mvsort_join_v: chars
+        mvreverse_v: array/chars
+        mvreverse_join_v: chars
+        message: chars
+    }
+}

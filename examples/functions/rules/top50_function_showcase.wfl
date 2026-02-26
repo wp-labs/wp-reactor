@@ -1,0 +1,101 @@
+use "security.wfs"
+
+// Top50 function showcase: math, string, time, null, multivalue helpers.
+rule top50_function_showcase {
+  events {
+    e : auth_events
+  }
+
+  match<sip:5m> {
+    on event {
+      e
+      && abs(-5.5) == 5.5
+      && round(12.3456, 2) == 12.35
+      && ceil(12.01) == round(13.001, 0)
+      && floor(12.99) == round(12.001, 0)
+      && sqrt(16) == round(4.001, 0)
+      && pow(2, 8) == round(256.001, 0)
+      && log(100, 10) == round(2.001, 0)
+      && exp(1) > 2.71
+      && exp(1) < 2.72
+      && clamp(150, 0, 100) == round(100.001, 0)
+      && sign(-42) == round(-1.001, 0)
+      && trunc(3.99) == round(3.001, 0)
+      && is_finite(exp(1))
+      && ltrim("  left") == "left"
+      && rtrim("right  ") == "right"
+      && concat("u=", trim(" carol ")) == "u=carol"
+      && indexof("failed_login_root", "login") == 7
+      && replace_plain("a_b_c", "_", "-") == "a-b-c"
+      && startswith_any(e.action, "failed", "deny")
+      && endswith_any(e.action, "root", "admin")
+      && coalesce(mvindex(split(e.action, "_"), 99), "fallback") == "fallback"
+      && isnull(mvindex(split(e.action, "_"), 99))
+      && isnotnull(e.action)
+      && mvjoin(mvsort(split("b,a,c", ",")), "|") == "a|b|c"
+      && mvjoin(mvreverse(split("b,a,c", ",")), "|") == "c|a|b"
+      && strftime(strptime("2026-02-26", "%Y-%m-%d"), "%Y") == "2026"
+      | count >= 1;
+    }
+  } -> score(88.0)
+
+  entity(ip, e.sip)
+
+  yield function_showcase_alerts (
+    sip = e.sip,
+    abs_v = abs(-5.5),
+    round_v = round(12.3456, 2),
+    ceil_v = ceil(12.01),
+    floor_v = floor(12.99),
+    strftime_v = strftime(strptime("2026-02-26 08:30:00", "%Y-%m-%d %H:%M:%S"), "%Y-%m-%d"),
+    strptime_v = strptime("2026-02-26", "%Y-%m-%d"),
+    sqrt_v = sqrt(16),
+    pow_v = pow(2, 8),
+    log_v = log(100, 10),
+    exp_v = round(exp(1), 3),
+    clamp_v = clamp(150, 0, 100),
+    sign_v = sign(-42),
+    trunc_v = trunc(3.99),
+    is_finite_v = is_finite(exp(1)),
+    ltrim_v = ltrim("  left"),
+    rtrim_v = rtrim("right  "),
+    concat_v = concat("user=", e.username, ",sip=", e.sip),
+    indexof_v = indexof("failed_login_root", "login"),
+    replace_plain_v = replace_plain("a_b_c", "_", "-"),
+    startswith_any_v = startswith_any(e.action, "failed", "deny"),
+    endswith_any_v = endswith_any(e.action, "root", "admin"),
+    coalesce_v = coalesce(mvindex(split(e.action, "_"), 99), "fallback"),
+    isnull_v = isnull(mvindex(split(e.action, "_"), 99)),
+    isnotnull_v = isnotnull(e.action),
+    mvsort_v = mvsort(split("b,a,c", ",")),
+    mvsort_join_v = mvjoin(mvsort(split("b,a,c", ",")), "|"),
+    mvreverse_v = mvreverse(split("b,a,c", ",")),
+    mvreverse_join_v = mvjoin(mvreverse(split("b,a,c", ",")), "|"),
+    message = fmt("Top50 showcase for {}", e.sip)
+  )
+}
+
+test top50_function_showcase_contract for top50_function_showcase {
+  input {
+    row(e,
+      sip = "10.0.9.9",
+      username = "carol",
+      action = "failed_login_root",
+      event_time = "2026-01-01T00:00:00Z"
+    );
+    row(e,
+      sip = "10.0.9.9",
+      username = "carol",
+      action = "failed_login_root",
+      event_time = "2026-01-01T00:01:00Z"
+    );
+  }
+  expect {
+    hits == 2;
+    hit[0].score == 88.0;
+    hit[1].score == 88.0;
+    hit[0].entity_type == "ip";
+    hit[0].entity_id == "10.0.9.9";
+  }
+  options { eval_mode = strict; }
+}

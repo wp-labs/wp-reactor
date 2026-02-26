@@ -1,3 +1,4 @@
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use orion_error::prelude::*;
 
 use crate::error::{CoreReason, CoreResult};
@@ -467,6 +468,347 @@ fn eval_builtin_func_with_l3(
             }
             Some(Value::Array(deduped))
         }
+        "abs" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) => Some(Value::Number(n.abs())),
+                _ => None,
+            }
+        }
+        "round" => {
+            if args.len() != 1 && args.len() != 2 {
+                return None;
+            }
+            let value = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let precision = if args.len() == 2 {
+                match eval_expr_with_l3(&args[1], ctx)? {
+                    Value::Number(n) => f64_to_i64_trunc(n)?,
+                    _ => return None,
+                }
+            } else {
+                0
+            };
+            let rounded = round_with_precision(value, precision)?;
+            Some(Value::Number(rounded))
+        }
+        "ceil" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) => Some(Value::Number(n.ceil())),
+                _ => None,
+            }
+        }
+        "floor" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) => Some(Value::Number(n.floor())),
+                _ => None,
+            }
+        }
+        "sqrt" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) if n >= 0.0 => Some(Value::Number(n.sqrt())),
+                _ => None,
+            }
+        }
+        "pow" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let x = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let y = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let out = x.powf(y);
+            if out.is_finite() {
+                Some(Value::Number(out))
+            } else {
+                None
+            }
+        }
+        "log" => {
+            if args.len() != 1 && args.len() != 2 {
+                return None;
+            }
+            let x = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            if x <= 0.0 {
+                return None;
+            }
+            let out = if args.len() == 2 {
+                let base = match eval_expr_with_l3(&args[1], ctx)? {
+                    Value::Number(n) => n,
+                    _ => return None,
+                };
+                if base <= 0.0 || (base - 1.0).abs() < f64::EPSILON {
+                    return None;
+                }
+                x.log(base)
+            } else {
+                x.ln()
+            };
+            if out.is_finite() {
+                Some(Value::Number(out))
+            } else {
+                None
+            }
+        }
+        "exp" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let x = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let out = x.exp();
+            if out.is_finite() {
+                Some(Value::Number(out))
+            } else {
+                None
+            }
+        }
+        "clamp" => {
+            if args.len() != 3 {
+                return None;
+            }
+            let x = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let min = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let max = match eval_expr_with_l3(&args[2], ctx)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            if min > max {
+                return None;
+            }
+            Some(Value::Number(x.clamp(min, max)))
+        }
+        "sign" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) if n.is_finite() => Some(Value::Number(n.signum())),
+                _ => None,
+            }
+        }
+        "trunc" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) => Some(Value::Number(n.trunc())),
+                _ => None,
+            }
+        }
+        "is_finite" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) => Some(Value::Bool(n.is_finite())),
+                _ => None,
+            }
+        }
+        "ltrim" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => Some(Value::Str(s.trim_start().to_string())),
+                _ => None,
+            }
+        }
+        "rtrim" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => Some(Value::Str(s.trim_end().to_string())),
+                _ => None,
+            }
+        }
+        "concat" => {
+            if args.is_empty() {
+                return None;
+            }
+            let mut out = String::new();
+            for arg in args {
+                let value = eval_expr_with_l3(arg, ctx)?;
+                out.push_str(&value_to_string(&value));
+            }
+            Some(Value::Str(out))
+        }
+        "indexof" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let needle = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let idx = text.find(&needle).map(|x| x as f64).unwrap_or(-1.0);
+            Some(Value::Number(idx))
+        }
+        "replace_plain" => {
+            if args.len() != 3 {
+                return None;
+            }
+            let text = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let from = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let to = match eval_expr_with_l3(&args[2], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            Some(Value::Str(text.replace(&from, &to)))
+        }
+        "startswith_any" => {
+            if args.len() < 2 {
+                return None;
+            }
+            let text = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            for arg in &args[1..] {
+                let prefix = match eval_expr_with_l3(arg, ctx)? {
+                    Value::Str(s) => s,
+                    _ => return None,
+                };
+                if text.starts_with(&prefix) {
+                    return Some(Value::Bool(true));
+                }
+            }
+            Some(Value::Bool(false))
+        }
+        "endswith_any" => {
+            if args.len() < 2 {
+                return None;
+            }
+            let text = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            for arg in &args[1..] {
+                let suffix = match eval_expr_with_l3(arg, ctx)? {
+                    Value::Str(s) => s,
+                    _ => return None,
+                };
+                if text.ends_with(&suffix) {
+                    return Some(Value::Bool(true));
+                }
+            }
+            Some(Value::Bool(false))
+        }
+        "coalesce" => {
+            if args.is_empty() {
+                return None;
+            }
+            for arg in args {
+                if let Some(v) = eval_expr_with_l3(arg, ctx) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        "isnull" => {
+            if args.len() != 1 {
+                return None;
+            }
+            Some(Value::Bool(eval_expr_with_l3(&args[0], ctx).is_none()))
+        }
+        "isnotnull" => {
+            if args.len() != 1 {
+                return None;
+            }
+            Some(Value::Bool(eval_expr_with_l3(&args[0], ctx).is_some()))
+        }
+        "mvsort" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let mut arr = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Array(arr) => arr,
+                _ => return None,
+            };
+            arr.sort_by(compare_sortable_values);
+            Some(Value::Array(arr))
+        }
+        "mvreverse" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let mut arr = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Array(arr) => arr,
+                _ => return None,
+            };
+            arr.reverse();
+            Some(Value::Array(arr))
+        }
+        "strftime" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let ts_nanos = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Number(n) => f64_to_i64_trunc(n)?,
+                _ => return None,
+            };
+            let fmt = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let dt = timestamp_nanos_to_utc(ts_nanos)?;
+            Some(Value::Str(dt.format(&fmt).to_string()))
+        }
+        "strptime" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_with_l3(&args[0], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let fmt = match eval_expr_with_l3(&args[1], ctx)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let ts_nanos = parse_time_to_timestamp_nanos(&text, &fmt)?;
+            Some(Value::Number(ts_nanos as f64))
+        }
         "regex_match" => {
             if args.len() != 2 {
                 return None;
@@ -674,6 +1016,68 @@ fn normalize_index(index: i64, len: usize) -> Option<usize> {
     } else {
         Some(normalized as usize)
     }
+}
+
+fn compare_sortable_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        _ => value_to_string(a).cmp(&value_to_string(b)),
+    }
+}
+
+fn f64_to_i64_trunc(v: f64) -> Option<i64> {
+    if !v.is_finite() {
+        return None;
+    }
+    let truncated = v.trunc();
+    if truncated < i64::MIN as f64 || truncated > i64::MAX as f64 {
+        return None;
+    }
+    Some(truncated as i64)
+}
+
+fn round_with_precision(value: f64, precision: i64) -> Option<f64> {
+    if !value.is_finite() {
+        return None;
+    }
+    if precision >= 0 {
+        let p = i32::try_from(precision).ok()?;
+        let factor = 10_f64.powi(p);
+        if !factor.is_finite() || factor == 0.0 {
+            return None;
+        }
+        Some((value * factor).round() / factor)
+    } else {
+        let p = i32::try_from(-precision).ok()?;
+        let factor = 10_f64.powi(p);
+        if !factor.is_finite() || factor == 0.0 {
+            return None;
+        }
+        Some((value / factor).round() * factor)
+    }
+}
+
+fn timestamp_nanos_to_utc(timestamp_nanos: i64) -> Option<DateTime<Utc>> {
+    let secs = timestamp_nanos.div_euclid(1_000_000_000);
+    let nanos = timestamp_nanos.rem_euclid(1_000_000_000) as u32;
+    DateTime::<Utc>::from_timestamp(secs, nanos)
+}
+
+fn parse_time_to_timestamp_nanos(text: &str, fmt: &str) -> Option<i64> {
+    if let Ok(dt) = DateTime::parse_from_str(text, fmt) {
+        return dt.timestamp_nanos_opt();
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(text, fmt) {
+        return dt.and_utc().timestamp_nanos_opt();
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(text, fmt) {
+        return date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_nanos_opt();
+    }
+    None
 }
 
 /// Evaluate the score expression and clamp to `[0, 100]`.
@@ -1164,6 +1568,274 @@ mod tests {
         };
         assert_eq!(eval_yield_expr(&starts_expr, &ctx), Some(Value::Bool(true)));
         assert_eq!(eval_yield_expr(&ends_expr, &ctx), Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_math_and_time_functions_in_yield_eval() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("n".to_string(), Value::Number(-12.345));
+        fields.insert("p".to_string(), Value::Number(16.0));
+        fields.insert("ts".to_string(), Value::Number(0.0));
+        fields.insert(
+            "msg".to_string(),
+            Value::Str("  failed_login_root  ".to_string()),
+        );
+        fields.insert(
+            "arr".to_string(),
+            Value::Array(vec![
+                Value::Str("b".to_string()),
+                Value::Str("a".to_string()),
+                Value::Str("c".to_string()),
+            ]),
+        );
+        let ctx = Event { fields };
+
+        let abs_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "abs".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+        };
+        let round_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "round".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("n".to_string())),
+                Expr::Number(2.0),
+            ],
+        };
+        let ceil_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "ceil".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+        };
+        let floor_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "floor".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+        };
+        let strftime_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "strftime".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("ts".to_string())),
+                Expr::StringLit("%Y-%m-%d".to_string()),
+            ],
+        };
+        let strptime_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "strptime".to_string(),
+            args: vec![
+                Expr::StringLit("1970-01-01".to_string()),
+                Expr::StringLit("%Y-%m-%d".to_string()),
+            ],
+        };
+        let sqrt_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "sqrt".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("p".to_string()))],
+        };
+        let pow_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "pow".to_string(),
+            args: vec![Expr::Number(2.0), Expr::Number(8.0)],
+        };
+        let log_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "log".to_string(),
+            args: vec![Expr::Number(100.0), Expr::Number(10.0)],
+        };
+        let exp_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "exp".to_string(),
+            args: vec![Expr::Number(1.0)],
+        };
+        let clamp_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "clamp".to_string(),
+            args: vec![Expr::Number(120.0), Expr::Number(0.0), Expr::Number(100.0)],
+        };
+        let sign_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "sign".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+        };
+        let trunc_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "trunc".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+        };
+        let finite_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "is_finite".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+        };
+        let ltrim_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "ltrim".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+        };
+        let rtrim_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "rtrim".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+        };
+        let concat_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "concat".to_string(),
+            args: vec![
+                Expr::StringLit("ip=".to_string()),
+                Expr::StringLit("1.1.1.1".to_string()),
+            ],
+        };
+        let index_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "indexof".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("msg".to_string())),
+                Expr::StringLit("login".to_string()),
+            ],
+        };
+        let replace_plain_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "replace_plain".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("msg".to_string())),
+                Expr::StringLit("_".to_string()),
+                Expr::StringLit("-".to_string()),
+            ],
+        };
+        let sw_any_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "startswith_any".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("msg".to_string())),
+                Expr::StringLit("  fail".to_string()),
+                Expr::StringLit("deny".to_string()),
+            ],
+        };
+        let ew_any_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "endswith_any".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("msg".to_string())),
+                Expr::StringLit("root  ".to_string()),
+                Expr::StringLit("deny".to_string()),
+            ],
+        };
+        let coalesce_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "coalesce".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("missing".to_string())),
+                Expr::StringLit("fallback".to_string()),
+            ],
+        };
+        let isnull_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "isnull".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("missing".to_string()))],
+        };
+        let isnotnull_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "isnotnull".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+        };
+        let mvsort_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "mvsort".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("arr".to_string()))],
+        };
+        let mvreverse_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "mvreverse".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("arr".to_string()))],
+        };
+
+        assert_eq!(
+            eval_yield_expr(&abs_expr, &ctx),
+            Some(Value::Number(12.345))
+        );
+        assert_eq!(
+            eval_yield_expr(&round_expr, &ctx),
+            Some(Value::Number(-12.35))
+        );
+        assert_eq!(
+            eval_yield_expr(&ceil_expr, &ctx),
+            Some(Value::Number(-12.0))
+        );
+        assert_eq!(
+            eval_yield_expr(&floor_expr, &ctx),
+            Some(Value::Number(-13.0))
+        );
+        assert_eq!(
+            eval_yield_expr(&strftime_expr, &ctx),
+            Some(Value::Str("1970-01-01".to_string()))
+        );
+        assert_eq!(
+            eval_yield_expr(&strptime_expr, &ctx),
+            Some(Value::Number(0.0))
+        );
+        assert_eq!(eval_yield_expr(&sqrt_expr, &ctx), Some(Value::Number(4.0)));
+        assert_eq!(eval_yield_expr(&pow_expr, &ctx), Some(Value::Number(256.0)));
+        assert_eq!(eval_yield_expr(&log_expr, &ctx), Some(Value::Number(2.0)));
+        assert_eq!(
+            eval_yield_expr(&exp_expr, &ctx),
+            Some(Value::Number(std::f64::consts::E))
+        );
+        assert_eq!(
+            eval_yield_expr(&clamp_expr, &ctx),
+            Some(Value::Number(100.0))
+        );
+        assert_eq!(eval_yield_expr(&sign_expr, &ctx), Some(Value::Number(-1.0)));
+        assert_eq!(
+            eval_yield_expr(&trunc_expr, &ctx),
+            Some(Value::Number(-12.0))
+        );
+        assert_eq!(eval_yield_expr(&finite_expr, &ctx), Some(Value::Bool(true)));
+        assert_eq!(
+            eval_yield_expr(&ltrim_expr, &ctx),
+            Some(Value::Str("failed_login_root  ".to_string()))
+        );
+        assert_eq!(
+            eval_yield_expr(&rtrim_expr, &ctx),
+            Some(Value::Str("  failed_login_root".to_string()))
+        );
+        assert_eq!(
+            eval_yield_expr(&concat_expr, &ctx),
+            Some(Value::Str("ip=1.1.1.1".to_string()))
+        );
+        assert_eq!(eval_yield_expr(&index_expr, &ctx), Some(Value::Number(9.0)));
+        assert_eq!(
+            eval_yield_expr(&replace_plain_expr, &ctx),
+            Some(Value::Str("  failed-login-root  ".to_string()))
+        );
+        assert_eq!(eval_yield_expr(&sw_any_expr, &ctx), Some(Value::Bool(true)));
+        assert_eq!(eval_yield_expr(&ew_any_expr, &ctx), Some(Value::Bool(true)));
+        assert_eq!(
+            eval_yield_expr(&coalesce_expr, &ctx),
+            Some(Value::Str("fallback".to_string()))
+        );
+        assert_eq!(eval_yield_expr(&isnull_expr, &ctx), Some(Value::Bool(true)));
+        assert_eq!(
+            eval_yield_expr(&isnotnull_expr, &ctx),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            eval_yield_expr(&mvsort_expr, &ctx),
+            Some(Value::Array(vec![
+                Value::Str("a".to_string()),
+                Value::Str("b".to_string()),
+                Value::Str("c".to_string()),
+            ]))
+        );
+        assert_eq!(
+            eval_yield_expr(&mvreverse_expr, &ctx),
+            Some(Value::Array(vec![
+                Value::Str("c".to_string()),
+                Value::Str("a".to_string()),
+                Value::Str("b".to_string()),
+            ]))
+        );
     }
 
     #[test]
