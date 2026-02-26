@@ -113,9 +113,7 @@ fn infer_mvappend_type(args: &[Expr], scope: &Scope<'_>) -> Option<ValType> {
         let Some(arg_type) = infer_type(arg, scope) else {
             continue;
         };
-        let Some(arg_element_type) = element_base_type(&arg_type) else {
-            return None;
-        };
+        let arg_element_type = element_base_type(&arg_type)?;
         if let Some(existing) = &element_type {
             if *existing != arg_element_type {
                 return None;
