@@ -5,6 +5,8 @@ use tokio_util::sync::CancellationToken;
 
 use wf_core::window::{Evictor, Router};
 
+use crate::metrics::RuntimeMetrics;
+
 /// Run the evictor periodically until cancelled.
 #[tracing::instrument(name = "evictor", skip_all)]
 pub async fn run_evictor(
@@ -12,6 +14,7 @@ pub async fn run_evictor(
     router: Arc<Router>,
     interval: Duration,
     cancel: CancellationToken,
+    metrics: Option<Arc<RuntimeMetrics>>,
 ) {
     // Use interval_at with an initial delay equal to the interval period.
     // tokio::time::interval() fires its first tick immediately, which can
@@ -23,6 +26,9 @@ pub async fn run_evictor(
             _ = tick.tick() => {
                 let now_nanos = now_epoch_nanos();
                 let report = evictor.run_once(router.registry(), now_nanos);
+                if let Some(metrics) = &metrics {
+                    metrics.add_evict_report(&report);
+                }
                 if report.batches_time_evicted > 0 || report.batches_memory_evicted > 0 {
                     wf_debug!(res,
                         scanned = report.windows_scanned,

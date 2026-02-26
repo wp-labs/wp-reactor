@@ -9,6 +9,8 @@ use wf_core::alert::OutputRecord;
 use wf_core::rule::{CepStateMachine, RuleExecutor};
 use wf_core::window::{Router, Window};
 
+use crate::metrics::RuntimeMetrics;
+
 // ---------------------------------------------------------------------------
 // WindowSource -- one window a rule task reads from
 // ---------------------------------------------------------------------------
@@ -36,4 +38,5 @@ pub(crate) struct RuleTaskConfig {
     pub timeout_scan_interval: Duration,
     /// Shared router for WindowLookup (joins + has()).
     pub router: Arc<Router>,
+    pub metrics: Option<Arc<RuntimeMetrics>>,
 }

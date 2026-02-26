@@ -106,6 +106,13 @@ async fn e2e_datagen_brute_force() {
     )
     .expect("oracle evaluation failed");
     let oracle_alerts = &oracle_result.alerts;
+    let tolerances = loaded
+        .wfg
+        .scenario
+        .oracle
+        .as_ref()
+        .map(wfgen::oracle::extract_oracle_tolerances)
+        .unwrap_or_default();
 
     // ---- Build FusionConfig (inline TOML, port=0, connector-based sinks) ----
     let toml_str = format!(
@@ -170,25 +177,56 @@ FAIL_THRESHOLD = "3"
             .expect("TCP write failed");
     }
     stream.flush().await.expect("TCP flush failed");
-
-    // ---- Wait for processing + shutdown ----
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    reactor.shutdown();
+    stream.shutdown().await.expect("TCP shutdown(write) failed");
     drop(stream);
+
+    // ---- Wait for processing to converge before shutdown ----
+    //
+    // A fixed sleep here is flaky: if we shutdown too early, windows flush as
+    // `close:eos`, which mismatches the oracle's expected `close:timeout`.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_report_md = String::new();
+    loop {
+        if alert_path.exists() {
+            match wfgen::output::jsonl::read_alerts_jsonl(&alert_path) {
+                Ok(actual_now) => {
+                    let report_now = wfgen::verify::verify(
+                        oracle_alerts,
+                        &actual_now,
+                        tolerances.score_tolerance,
+                        tolerances.time_tolerance_secs,
+                    );
+                    if report_now.status == "pass" {
+                        break;
+                    }
+                    last_report_md = report_now.to_markdown();
+                }
+                Err(_) => {
+                    // Sink may be writing the current line; retry on next poll.
+                }
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for runtime alerts to converge before shutdown.\n{}",
+                if last_report_md.is_empty() {
+                    "no verify report yet".to_string()
+                } else {
+                    format!("last verify report:\n{last_report_md}")
+                }
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // ---- Shutdown after we already matched oracle output ----
+    reactor.shutdown();
     reactor.wait().await.expect("reactor.wait failed");
 
     // ---- Read actual alerts (catch_all sink writes to alerts/all.jsonl) ----
     let actual = wfgen::output::jsonl::read_alerts_jsonl(&alert_path)
         .unwrap_or_else(|e| panic!("failed to read alerts from {}: {e}", alert_path.display()));
-
-    // ---- Extract oracle tolerances ----
-    let tolerances = loaded
-        .wfg
-        .scenario
-        .oracle
-        .as_ref()
-        .map(wfgen::oracle::extract_oracle_tolerances)
-        .unwrap_or_default();
 
     // ---- Run verify and write diagnostic report ----
     let report = wfgen::verify::verify(

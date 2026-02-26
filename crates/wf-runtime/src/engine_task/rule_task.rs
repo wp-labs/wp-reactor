@@ -15,6 +15,8 @@ use wf_core::rule::{CepStateMachine, CloseReason, RuleExecutor, StepResult, batc
 use wf_core::window::{AppendOutcome, Router};
 use wf_lang::plan::ConvPlan;
 
+use crate::metrics::RuntimeMetrics;
+
 use super::TASK_SEQ;
 use super::task_types::{RuleTaskConfig, WindowSource};
 use super::window_lookup::RegistryLookup;
@@ -42,6 +44,7 @@ pub(super) struct RuleTask {
     pub(super) cursors: HashMap<String, u64>,
     /// Shared router for WindowLookup (joins + has()).
     router: Arc<Router>,
+    metrics: Option<Arc<RuntimeMetrics>>,
 }
 
 impl RuleTask {
@@ -61,6 +64,7 @@ impl RuleTask {
             cancel,
             timeout_scan_interval,
             router,
+            metrics,
         } = config;
 
         // Pre-compute aliases per window: for each window, collect all
@@ -103,6 +107,7 @@ impl RuleTask {
             alert_tx,
             cursors,
             router,
+            metrics,
         };
         (task, cancel, timeout_scan_interval)
     }
@@ -135,6 +140,9 @@ impl RuleTask {
                     window = %source.window_name,
                     "cursor gap detected — some data was lost to eviction"
                 );
+                if let Some(metrics) = &self.metrics {
+                    metrics.inc_rule_cursor_gap(self.machine.rule_name(), &source.window_name);
+                }
             }
             self.cursors.insert(source.window_name.clone(), new_cursor);
 
@@ -144,12 +152,18 @@ impl RuleTask {
 
             for batch in &batches {
                 let events = batch_to_events(batch);
+                if let Some(metrics) = &self.metrics {
+                    metrics.add_rule_events(self.machine.rule_name(), events.len());
+                }
                 let lookup = RegistryLookup(&self.router);
                 for event in &events {
                     for alias in aliases {
                         if let StepResult::Matched(ctx) =
                             self.machine.advance_with(alias, event, Some(&lookup))
                         {
+                            if let Some(metrics) = &self.metrics {
+                                metrics.inc_rule_match(self.machine.rule_name());
+                            }
                             match self.executor.execute_match_with_joins(&ctx, &lookup) {
                                 Ok(record) => self.emit(record).await,
                                 Err(e) => {
@@ -160,6 +174,9 @@ impl RuleTask {
                     }
                 }
             }
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.set_rule_instances(self.machine.rule_name(), self.machine.instance_count());
         }
     }
 
@@ -179,6 +196,9 @@ impl RuleTask {
                     wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_close error")
                 }
             }
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.set_rule_instances(self.machine.rule_name(), self.machine.instance_count());
         }
     }
 
@@ -204,6 +224,9 @@ impl RuleTask {
         if emitted > 0 {
             wf_debug!(pipe, task_id = %self.task_id, alerts = emitted, "flush complete");
         }
+        if let Some(metrics) = &self.metrics {
+            metrics.set_rule_instances(self.machine.rule_name(), self.machine.instance_count());
+        }
     }
 
     // -- Alert emission -----------------------------------------------------
@@ -213,7 +236,13 @@ impl RuleTask {
             self.emit_pipeline_stage(record);
             return;
         }
+        if let Some(metrics) = &self.metrics {
+            metrics.inc_alert_emitted(&record.rule_name);
+        }
         if let Err(e) = self.alert_tx.send(record).await {
+            if let Some(metrics) = &self.metrics {
+                metrics.inc_alert_channel_send_failed();
+            }
             wf_warn!(pipe, error = %e, "alert channel closed");
         }
     }

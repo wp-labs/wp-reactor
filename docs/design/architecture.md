@@ -223,3 +223,16 @@ wait(): join infra (evictor)
 **两阶段关闭防丢数据**：如果 Receiver 和 Engine 同时收到 cancel，引擎的 final drain 可能在 Receiver 路由完最后一批数据之前执行，导致数据丢失。分离为两个 token 解决了这个竞态。
 
 **Alert sink 靠 channel 关闭退出**：不用 cancel token，避免引擎 flush 期间 alert sink 提前退出的竞态。`run_alert_dispatcher` 在 channel 关闭后调用 `SinkDispatcher::stop_all()` 优雅关闭所有 sink 实例。
+
+---
+
+## 观测与统计（评审草案）
+
+为支撑“处理性能 + 内存利用率”这两个核心指标，`wf-runtime` 增加指标子系统设计（见 [runtime-metrics-design.md](runtime-metrics-design.md)）。
+
+本轮结论：
+
+- 借鉴 `wp-motor` 的**阶段化统计**、**slice+total 双视图**、**单监控任务汇总**思路；
+- 不直接复用其 `ReportVariant::Stat` + `DataRecord` 报表模型（热路径开销偏高，且不直接对接 Prometheus）；
+- 监控通道采用**有界 + 丢弃计数**，避免大缓冲掩盖背压；
+- 指标埋点覆盖：`receiver` / `router` / `rule_task` / `alert_task` / `evictor` / `window`。

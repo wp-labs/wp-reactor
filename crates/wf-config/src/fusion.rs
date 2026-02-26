@@ -5,6 +5,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 
 use crate::logging::LoggingConfig;
+use crate::metrics::MetricsConfig;
 use crate::runtime::RuntimeConfig;
 use crate::server::ServerConfig;
 use crate::validate;
@@ -28,6 +29,8 @@ struct FusionConfigRaw {
     work_root: Option<String>,
     #[serde(default)]
     logging: LoggingConfig,
+    #[serde(default)]
+    metrics: MetricsConfig,
     /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
     #[serde(default)]
     vars: HashMap<String, String>,
@@ -48,6 +51,7 @@ pub struct FusionConfig {
     /// Optional working root for sink file-path resolution.
     pub work_root: Option<String>,
     pub logging: LoggingConfig,
+    pub metrics: MetricsConfig,
     /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
     pub vars: HashMap<String, String>,
 }
@@ -85,6 +89,7 @@ impl FromStr for FusionConfig {
             sinks: raw.sinks,
             work_root: raw.work_root,
             logging: raw.logging,
+            metrics: raw.metrics,
             vars: raw.vars,
         };
 
@@ -201,6 +206,12 @@ over_cap = "48h"
 
         // sinks
         assert_eq!(cfg.sinks, "sinks");
+        assert!(!cfg.metrics.enabled);
+        assert_eq!(
+            cfg.metrics.report_interval.as_duration(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(cfg.metrics.prometheus_listen, "127.0.0.1:9901");
     }
 
     #[test]
@@ -324,5 +335,46 @@ MAX_COUNT_2 = "99"
         let cfg: FusionConfig = toml.parse().unwrap();
         assert_eq!(cfg.vars["_PRIVATE"], "ok");
         assert_eq!(cfg.vars["MAX_COUNT_2"], "99");
+    }
+
+    #[test]
+    fn load_with_metrics_block() {
+        let toml = format!(
+            r#"{}
+[metrics]
+enabled = true
+report_interval = "5s"
+prometheus_listen = "127.0.0.1:19001"
+
+[metrics.topn]
+enabled = true
+max = 50
+queue_capacity = 8192
+"#,
+            FULL_TOML
+        );
+        let cfg: FusionConfig = toml.parse().unwrap();
+        assert!(cfg.metrics.enabled);
+        assert_eq!(
+            cfg.metrics.report_interval.as_duration(),
+            Duration::from_secs(5)
+        );
+        assert_eq!(cfg.metrics.prometheus_listen, "127.0.0.1:19001");
+        assert!(cfg.metrics.topn.enabled);
+        assert_eq!(cfg.metrics.topn.max, 50);
+        assert_eq!(cfg.metrics.topn.queue_capacity, 8192);
+    }
+
+    #[test]
+    fn reject_invalid_metrics_listen() {
+        let toml = format!(
+            r#"{}
+[metrics]
+enabled = true
+prometheus_listen = "not-a-socket"
+"#,
+            FULL_TOML
+        );
+        assert!(toml.parse::<FusionConfig>().is_err());
     }
 }

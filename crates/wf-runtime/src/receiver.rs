@@ -7,22 +7,30 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use wf_core::window::Router;
 
+use crate::metrics::RuntimeMetrics;
+
 /// TCP receiver that accepts connections, reads length-prefixed Arrow IPC
 /// frames, decodes them, and routes batches to the [`Router`].
 pub struct Receiver {
     listener: TcpListener,
     router: Arc<Router>,
+    metrics: Option<Arc<RuntimeMetrics>>,
     cancel: CancellationToken,
 }
 
 impl Receiver {
     /// Parse `"tcp://host:port"` and bind a TCP listener.
-    pub async fn bind(listen: &str, router: Arc<Router>) -> anyhow::Result<Self> {
+    pub async fn bind(
+        listen: &str,
+        router: Arc<Router>,
+        metrics: Option<Arc<RuntimeMetrics>>,
+    ) -> anyhow::Result<Self> {
         let addr = listen.strip_prefix("tcp://").unwrap_or(listen);
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
             listener,
             router,
+            metrics,
             cancel: CancellationToken::new(),
         })
     }
@@ -45,9 +53,13 @@ impl Receiver {
                 result = self.listener.accept() => {
                     let (stream, peer) = result?;
                     wf_debug!(conn, peer = %peer, "accepted connection");
+                    if let Some(metrics) = &self.metrics {
+                        metrics.inc_receiver_connection();
+                    }
                     let router = Arc::clone(&self.router);
+                    let metrics = self.metrics.clone();
                     let cancel = self.cancel.child_token();
-                    tokio::spawn(handle_connection(stream, router, cancel, peer));
+                    tokio::spawn(handle_connection(stream, router, metrics, cancel, peer));
                 }
                 _ = self.cancel.cancelled() => break,
             }
@@ -60,6 +72,7 @@ impl Receiver {
 async fn handle_connection(
     stream: TcpStream,
     router: Arc<Router>,
+    metrics: Option<Arc<RuntimeMetrics>>,
     cancel: CancellationToken,
     peer: SocketAddr,
 ) {
@@ -73,9 +86,18 @@ async fn handle_connection(
                     Ok(Some(payload)) => {
                         match wp_arrow::ipc::decode_ipc(&payload) {
                             Ok(frame) => {
+                                if let Some(metrics) = &metrics {
+                                    metrics.add_receiver_frame(frame.batch.num_rows());
+                                }
                                 wf_debug!(pipe, stream = &*frame.tag, rows = frame.batch.num_rows(), "frame decoded");
+                                if let Some(metrics) = &metrics {
+                                    metrics.inc_router_route_call();
+                                }
                                 match router.route(&frame.tag, frame.batch) {
                                     Ok(report) => {
+                                        if let Some(metrics) = &metrics {
+                                            metrics.add_route_report(&report);
+                                        }
                                         wf_debug!(pipe,
                                             delivered = report.delivered,
                                             dropped_late = report.dropped_late,
@@ -83,13 +105,26 @@ async fn handle_connection(
                                             "route report"
                                         );
                                     }
-                                    Err(e) => wf_warn!(pipe, error = %e, "route error"),
+                                    Err(e) => {
+                                        if let Some(metrics) = &metrics {
+                                            metrics.inc_route_error();
+                                        }
+                                        wf_warn!(pipe, error = %e, "route error")
+                                    }
                                 }
                             }
-                            Err(e) => wf_warn!(conn, error = %e, "IPC decode error"),
+                            Err(e) => {
+                                if let Some(metrics) = &metrics {
+                                    metrics.inc_receiver_decode_error();
+                                }
+                                wf_warn!(conn, error = %e, "IPC decode error")
+                            }
                         }
                     }
                     Err(e) => {
+                        if let Some(metrics) = &metrics {
+                            metrics.inc_receiver_read_error();
+                        }
                         wf_warn!(conn, error = %e, "connection read error");
                         break;
                     }
@@ -212,7 +247,7 @@ mod tests {
     #[tokio::test]
     async fn multi_connection_concurrent() {
         let router = make_router("events");
-        let receiver = Receiver::bind("tcp://127.0.0.1:0", Arc::clone(&router))
+        let receiver = Receiver::bind("tcp://127.0.0.1:0", Arc::clone(&router), None)
             .await
             .unwrap();
         let addr = receiver.local_addr().unwrap();
@@ -253,7 +288,7 @@ mod tests {
     #[tokio::test]
     async fn continuous_reception() {
         let router = make_router("stream");
-        let receiver = Receiver::bind("tcp://127.0.0.1:0", Arc::clone(&router))
+        let receiver = Receiver::bind("tcp://127.0.0.1:0", Arc::clone(&router), None)
             .await
             .unwrap();
         let addr = receiver.local_addr().unwrap();
@@ -284,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn connection_drop_no_impact() {
         let router = make_router("data");
-        let receiver = Receiver::bind("tcp://127.0.0.1:0", Arc::clone(&router))
+        let receiver = Receiver::bind("tcp://127.0.0.1:0", Arc::clone(&router), None)
             .await
             .unwrap();
         let addr = receiver.local_addr().unwrap();

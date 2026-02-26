@@ -5,6 +5,8 @@ use tokio::sync::mpsc;
 use wf_core::alert::OutputRecord;
 use wf_core::sink::SinkDispatcher;
 
+use crate::metrics::RuntimeMetrics;
+
 /// Bounded channel capacity for the alert pipeline.
 pub const ALERT_CHANNEL_CAPACITY: usize = 64;
 
@@ -18,16 +20,23 @@ pub const ALERT_CHANNEL_CAPACITY: usize = 64;
 pub async fn run_alert_dispatcher(
     mut rx: mpsc::Receiver<OutputRecord>,
     dispatcher: Arc<SinkDispatcher>,
+    metrics: Option<Arc<RuntimeMetrics>>,
 ) {
     while let Some(record) = rx.recv().await {
         let json = match serde_json::to_string(&record) {
             Ok(j) => j,
             Err(e) => {
+                if let Some(metrics) = &metrics {
+                    metrics.inc_alert_serialize_failed();
+                }
                 log::warn!("alert serialize error: {e}");
                 continue;
             }
         };
         dispatcher.dispatch(&record.yield_target, &json).await;
+        if let Some(metrics) = &metrics {
+            metrics.inc_alert_dispatch();
+        }
     }
     dispatcher.stop_all().await;
 }

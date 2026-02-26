@@ -242,6 +242,7 @@ fn make_task_with_window_bytes(
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router,
+        metrics: None,
     };
 
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
@@ -344,6 +345,7 @@ fn make_pipeline_stage_task() -> (
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router: Arc::clone(&router),
+        metrics: None,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)

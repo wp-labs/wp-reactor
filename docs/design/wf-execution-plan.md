@@ -287,6 +287,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 范围 | Prometheus metrics 暴露：窗口内存使用 / 各窗口行数 / 规则触发次数 / 告警产出数 / 事件处理延迟 / 连接断开次数 / 接收吞吐量；性能基准测试框架：固定规则 + 固定数据集 → 测量延迟 / 吞吐 / 内存 |
 | 依赖 | M20 |
 | 验收 | Prometheus metrics 端点可用（`/metrics`）；基准：1K EPS 下延迟 <1s，内存 <256MB |
+| 设计参考 | [runtime-metrics-design.md](runtime-metrics-design.md)（含 `wp-motor stat` 机制复用与不适配项分析） |
 
 ### M24：开发者工具链
 
@@ -506,5 +507,6 @@ M20 MVP 已完成，下一步两条路径可并行推进：
 - WarpFusion 设计方案 → [warp-fusion.md](warp-fusion.md)
 - WFL v2.1 设计方案 → [wfl-desion.md](wfl-desion.md)
 - WFL 与主流 DSL 对比分析 → [wfl-dsl-comparison.md](wfl-dsl-comparison.md)
+- 运行时指标与统计设计（评审草案）→ [runtime-metrics-design.md](runtime-metrics-design.md)
 - wfgen 测试数据生成方案 → [wfl-desion.md §18](wfl-desion.md)
 - 后续提案（P1/P2） → [wfl-desion.md §17](wfl-desion.md)

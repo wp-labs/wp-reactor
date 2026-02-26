@@ -16,6 +16,7 @@ use crate::alert_task;
 use crate::engine_task::{RuleTaskConfig, WindowSource, run_rule_task};
 use crate::error::RuntimeResult;
 use crate::evictor_task;
+use crate::metrics::{RuntimeMetrics, run_metrics_task};
 use crate::receiver::Receiver;
 
 use super::types::{RunRule, TaskGroup};
@@ -28,11 +29,12 @@ use super::types::{RunRule, TaskGroup};
 /// Returns (alert_tx, task_group).
 pub(super) fn spawn_alert_task(
     dispatcher: Arc<SinkDispatcher>,
+    metrics: Option<Arc<RuntimeMetrics>>,
 ) -> (mpsc::Sender<OutputRecord>, TaskGroup) {
     let (alert_tx, alert_rx) = mpsc::channel(alert_task::ALERT_CHANNEL_CAPACITY);
     let mut group = TaskGroup::new("alert");
     group.push(tokio::spawn(async move {
-        alert_task::run_alert_dispatcher(alert_rx, dispatcher).await;
+        alert_task::run_alert_dispatcher(alert_rx, dispatcher, metrics).await;
         Ok(())
     }));
     (alert_tx, group)
@@ -43,13 +45,14 @@ pub(super) fn spawn_evictor_task(
     config: &FusionConfig,
     router: &Arc<Router>,
     cancel: CancellationToken,
+    metrics: Option<Arc<RuntimeMetrics>>,
 ) -> TaskGroup {
     let evictor = Evictor::new(config.window_defaults.max_total_bytes.as_bytes());
     let evict_interval = config.window_defaults.evict_interval.as_duration();
     let router = Arc::clone(router);
     let mut group = TaskGroup::new("evictor");
     group.push(tokio::spawn(async move {
-        evictor_task::run_evictor(evictor, router, evict_interval, cancel).await;
+        evictor_task::run_evictor(evictor, router, evict_interval, cancel, metrics).await;
         Ok(())
     }));
     group
@@ -67,6 +70,7 @@ pub(super) fn spawn_rule_tasks(
     alert_tx: mpsc::Sender<OutputRecord>,
     _config: &FusionConfig,
     cancel: CancellationToken,
+    metrics: Option<Arc<RuntimeMetrics>>,
 ) -> TaskGroup {
     let mut group = TaskGroup::new("rules");
     let timeout_scan_interval = Duration::from_secs(1);
@@ -84,6 +88,7 @@ pub(super) fn spawn_rule_tasks(
             cancel: cancel.child_token(),
             timeout_scan_interval,
             router: Arc::clone(router),
+            metrics: metrics.clone(),
         };
 
         group.push(tokio::spawn(
@@ -149,8 +154,9 @@ pub(super) async fn spawn_receiver_task(
     config: &FusionConfig,
     router: Arc<Router>,
     cancel: CancellationToken,
+    metrics: Option<Arc<RuntimeMetrics>>,
 ) -> RuntimeResult<(SocketAddr, TaskGroup)> {
-    let receiver = Receiver::bind(&config.server.listen, router)
+    let receiver = Receiver::bind(&config.server.listen, router, metrics)
         .await
         .owe_sys()?;
     let listen_addr = receiver.local_addr().owe_sys()?;
@@ -162,4 +168,26 @@ pub(super) async fn spawn_receiver_task(
     let mut group = TaskGroup::new("receiver");
     group.push(tokio::spawn(async move { receiver.run().await }));
     Ok((listen_addr, group))
+}
+
+pub(super) fn spawn_metrics_task(
+    config: &FusionConfig,
+    router: &Arc<Router>,
+    cancel: CancellationToken,
+    metrics: Option<Arc<RuntimeMetrics>>,
+) -> TaskGroup {
+    let mut group = TaskGroup::new("metrics");
+    if !config.metrics.enabled {
+        return group;
+    }
+    let Some(metrics) = metrics else {
+        return group;
+    };
+    let router = Arc::clone(router);
+    let metrics_config = config.metrics.clone();
+    group.push(tokio::spawn(async move {
+        run_metrics_task(metrics, metrics_config, router, cancel).await?;
+        Ok(())
+    }));
+    group
 }

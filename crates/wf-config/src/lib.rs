@@ -1,5 +1,6 @@
 pub mod fusion;
 pub mod logging;
+pub mod metrics;
 pub mod project;
 pub mod runtime;
 pub mod server;
@@ -10,6 +11,7 @@ pub mod window;
 
 pub use fusion::FusionConfig;
 pub use logging::{LogFormat, LoggingConfig};
+pub use metrics::{MetricsConfig, MetricsTopNConfig};
 pub use project::{load_schemas, load_wfl, parse_vars};
 pub use runtime::{RuntimeConfig, resolve_glob};
 pub use server::ServerConfig;

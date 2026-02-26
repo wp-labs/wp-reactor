@@ -16,8 +16,8 @@ use crate::error::{RuntimeReason, RuntimeResult};
 /// Groups are assembled in *start order* and joined in *reverse order*
 /// (LIFO) during shutdown, mirroring the dependency graph:
 ///
-///   start:  alert → evictor → rules → receiver
-///   join:   receiver → rules → alert → evictor
+///   start:  alert → evictor → rules → receiver (→ metrics)
+///   join:   (metrics →) receiver → rules → alert → evictor
 ///
 /// This ensures upstream producers exit before downstream consumers,
 /// and consumers can drain all in-flight work before the reactor stops.

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use crate::fusion::FusionConfig;
@@ -45,6 +46,33 @@ pub(crate) fn validate(config: &FusionConfig) -> anyhow::Result<()> {
     // sinks path must be non-empty
     if config.sinks.is_empty() {
         anyhow::bail!("sinks must be a non-empty path to the sinks/ directory");
+    }
+
+    // metrics config sanity
+    if config.metrics.report_interval.as_duration().is_zero() {
+        anyhow::bail!("metrics.report_interval must be > 0");
+    }
+    if config.metrics.topn.max == 0 {
+        anyhow::bail!("metrics.topn.max must be > 0");
+    }
+    if config.metrics.topn.queue_capacity == 0 {
+        anyhow::bail!("metrics.topn.queue_capacity must be > 0");
+    }
+    if config.metrics.enabled {
+        if config.metrics.prometheus_listen.trim().is_empty() {
+            anyhow::bail!("metrics.prometheus_listen must be non-empty when metrics.enabled=true");
+        }
+        // Must be host:port (no scheme).
+        if config
+            .metrics
+            .prometheus_listen
+            .to_socket_addrs()
+            .map_err(|e| anyhow::anyhow!("metrics.prometheus_listen invalid: {e}"))?
+            .next()
+            .is_none()
+        {
+            anyhow::bail!("metrics.prometheus_listen resolved to no socket address");
+        }
     }
 
     Ok(())

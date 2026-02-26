@@ -1527,6 +1527,9 @@ retry_max_interval = "30s"                        # 最大重试间隔
 
 详细的里程碑执行计划已独立为专属文档，详见 → [wf-execution-plan.md](wf-execution-plan.md)
 
+运行时指标与统计的专项设计（含 `wp-motor stat` 复用评估），详见：
+→ [runtime-metrics-design.md](runtime-metrics-design.md)
+
 **已完成阶段（截至 M24）：**
 
 | 阶段 | 里程碑 | 阶段目标 | 状态 |
@@ -1581,6 +1584,10 @@ WFL 语言设计已独立为专属文档，详见：
 
 - **WFL 与主流 DSL 对比分析** → [wfl-dsl-comparison.md](wfl-dsl-comparison.md)
   - 与 YARA-L 2.0 / Elastic EQL / Sigma / Splunk SPL / KQL 的能力对比
+
+- **运行时指标与统计设计（评审草案）** → [runtime-metrics-design.md](runtime-metrics-design.md)
+  - `wf-runtime` 指标模型（性能/时延/内存）
+  - `wp-motor stat` 复用策略与不适配项分析
 
 
 

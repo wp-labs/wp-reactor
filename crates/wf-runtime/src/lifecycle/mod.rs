@@ -17,8 +17,11 @@ use crate::error::RuntimeResult;
 // Re-export public API
 pub use signal::wait_for_signal;
 
+use crate::metrics::maybe_build_metrics;
 use bootstrap::load_and_compile;
-use spawn::{spawn_alert_task, spawn_evictor_task, spawn_receiver_task, spawn_rule_tasks};
+use spawn::{
+    spawn_alert_task, spawn_evictor_task, spawn_metrics_task, spawn_receiver_task, spawn_rule_tasks,
+};
 use types::TaskGroup;
 
 // ---------------------------------------------------------------------------
@@ -31,7 +34,7 @@ use types::TaskGroup;
 /// Task groups are stored in start order and joined in reverse (LIFO)
 /// during [`wait`](Self::wait), ensuring correct drain sequencing:
 /// receiver stops first, then rule tasks drain and flush, then alert
-/// sink flushes to disk, and finally evictor stops.
+/// sink flushes to disk, and finally background tasks stop.
 pub struct Reactor {
     cancel: CancellationToken,
     /// Separate cancel token for rule tasks — triggered only after the
@@ -62,16 +65,30 @@ impl Reactor {
             "engine bootstrap complete"
         );
 
-        // Phase 2: Spawn task groups (start order: alert → evictor → rules → receiver)
-        let mut groups: Vec<TaskGroup> = Vec::with_capacity(4);
+        let rule_names: Vec<String> = data
+            .rules
+            .iter()
+            .map(|rule| rule.machine.rule_name().to_string())
+            .collect();
+        let window_names: Vec<String> = data
+            .router
+            .registry()
+            .window_names()
+            .map(str::to_string)
+            .collect();
+        let metrics = maybe_build_metrics(&config.metrics, &rule_names, &window_names);
 
-        let (alert_tx, alert_group) = spawn_alert_task(data.dispatcher);
+        // Phase 2: Spawn task groups (start order: alert → evictor → rules → receiver → metrics)
+        let mut groups: Vec<TaskGroup> = Vec::with_capacity(5);
+
+        let (alert_tx, alert_group) = spawn_alert_task(data.dispatcher, metrics.clone());
         groups.push(alert_group);
 
         groups.push(spawn_evictor_task(
             &config,
             &data.router,
             cancel.child_token(),
+            metrics.clone(),
         ));
 
         let rule_group = spawn_rule_tasks(
@@ -81,12 +98,24 @@ impl Reactor {
             alert_tx,
             &config,
             rule_cancel.child_token(),
+            metrics.clone(),
         );
         groups.push(rule_group);
 
-        let (listen_addr, receiver_group) =
-            spawn_receiver_task(&config, data.router, cancel.clone()).await?;
+        let (listen_addr, receiver_group) = spawn_receiver_task(
+            &config,
+            data.router.clone(),
+            cancel.clone(),
+            metrics.clone(),
+        )
+        .await?;
         groups.push(receiver_group);
+        groups.push(spawn_metrics_task(
+            &config,
+            &data.router,
+            cancel.child_token(),
+            metrics,
+        ));
 
         op.mark_suc();
         Ok(Self {
@@ -111,7 +140,7 @@ impl Reactor {
     /// Wait for all task groups to complete after shutdown.
     ///
     /// Groups are joined in LIFO order (reverse of start order):
-    /// receiver → rules → alert → evictor.
+    /// metrics → receiver → rules → alert → evictor.
     ///
     /// Two-phase shutdown: the receiver is joined first, ensuring all
     /// in-flight data has been routed to windows. Only then are the rule
