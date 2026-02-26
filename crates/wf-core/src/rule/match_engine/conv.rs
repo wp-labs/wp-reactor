@@ -133,10 +133,13 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         }
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        // Mixed types: Number < Str < Bool
+        (Value::Array(x), Value::Array(y)) => x.len().cmp(&y.len()),
+        // Mixed types: Number < Str < Bool < Array
         (Value::Number(_), _) => std::cmp::Ordering::Less,
         (_, Value::Number(_)) => std::cmp::Ordering::Greater,
-        (Value::Str(_), Value::Bool(_)) => std::cmp::Ordering::Less,
-        (Value::Bool(_), Value::Str(_)) => std::cmp::Ordering::Greater,
+        (Value::Str(_), Value::Bool(_) | Value::Array(_)) => std::cmp::Ordering::Less,
+        (Value::Bool(_) | Value::Array(_), Value::Str(_)) => std::cmp::Ordering::Greater,
+        (Value::Bool(_), Value::Array(_)) => std::cmp::Ordering::Less,
+        (Value::Array(_), Value::Bool(_)) => std::cmp::Ordering::Greater,
     }
 }

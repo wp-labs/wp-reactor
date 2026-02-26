@@ -29,6 +29,7 @@ fn labeled_step(label: &str, value: f64) -> StepData {
         satisfied_branch_index: 0,
         label: Some(label.to_string()),
         measure_value: value,
+        collected_values: Vec::new(),
     }
 }
 

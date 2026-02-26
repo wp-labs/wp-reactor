@@ -24,6 +24,7 @@ fn default_matched_context() -> MatchedContext {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: 0,
     }
@@ -124,6 +125,7 @@ fn execute_match_no_keys() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: 0,
     };
@@ -158,6 +160,7 @@ fn execute_match_composite_keys() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: 0,
     };
@@ -195,6 +198,7 @@ fn execute_close_both_ok() {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),
             measure_value: 3.0,
+            collected_values: Vec::new(),
         }],
         close_step_data: vec![],
         watermark_nanos: 0,
@@ -371,6 +375,7 @@ fn summary_format() {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),
             measure_value: 5.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: 0,
     };
@@ -414,6 +419,7 @@ fn numeric_key_preserves_type_in_eval_context() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: 0,
     };
@@ -451,6 +457,7 @@ fn label_cannot_overwrite_key_in_eval_context() {
             satisfied_branch_index: 0,
             label: Some("sip".to_string()),
             measure_value: 99.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: 0,
     };
@@ -485,6 +492,7 @@ fn wfx_id_hex_format() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: 0,
     };

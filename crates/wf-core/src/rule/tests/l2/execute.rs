@@ -44,6 +44,7 @@ fn execute_match_without_joins_still_works() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: 0,
     };

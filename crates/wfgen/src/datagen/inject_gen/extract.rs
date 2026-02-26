@@ -10,7 +10,7 @@ pub(super) fn extract_rule_structure(
     alias_map: &AliasMap,
 ) -> anyhow::Result<RuleStructure> {
     let window_dur = match rule_plan.match_plan.window_spec {
-        WindowSpec::Sliding(d) | WindowSpec::Fixed(d) => d,
+        WindowSpec::Sliding(d) | WindowSpec::Fixed(d) | WindowSpec::Session(d) => d,
     };
 
     let keys: Vec<String> = rule_plan

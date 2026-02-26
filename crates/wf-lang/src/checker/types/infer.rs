@@ -57,6 +57,33 @@ fn infer_func_call(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<ValTy
         "lower" | "upper" => Some(ValType::Base(BaseType::Chars)),
         "len" => Some(ValType::Base(BaseType::Digit)),
         "time_bucket" => Some(ValType::Base(BaseType::Time)),
+        // L3 Collection functions (M28)
+        "collect_set" | "collect_list" => {
+            // Returns Array<T> where T is the field type
+            args.first().and_then(|a| {
+                // Extract base type from field and wrap in Array
+                infer_type(a, scope).and_then(|t| match t {
+                    ValType::Base(bt) => Some(ValType::Array(bt)),
+                    _ => None,
+                })
+            })
+        }
+        "first" | "last" => {
+            // Returns the base field type (unwrap from Field ref)
+            args.first().and_then(|a| match a {
+                Expr::Field(_) => {
+                    // Get the type of the field, which should be BaseType
+                    infer_type(a, scope).and_then(|t| match t {
+                        ValType::Array(bt) => Some(ValType::Base(bt)),
+                        ValType::Base(_) => Some(t),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+        }
+        // L3 Statistical functions (M28)
+        "stddev" | "percentile" => Some(ValType::Base(BaseType::Float)),
         _ => None,
     }
 }

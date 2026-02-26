@@ -19,6 +19,8 @@ pub(super) struct BranchState {
     pub(super) avg_sum: f64,
     pub(super) avg_count: u64,
     pub(super) distinct_set: HashSet<String>,
+    // L3: collected values for collect_set/list, first/last, stddev/percentile
+    pub(super) collected_values: Vec<Value>,
 }
 
 impl BranchState {
@@ -33,6 +35,7 @@ impl BranchState {
             avg_sum: 0.0,
             avg_count: 0,
             distinct_set: HashSet::new(),
+            collected_values: Vec::new(),
         }
     }
 }
@@ -167,5 +170,8 @@ fn val_estimated_bytes(v: &Value) -> usize {
     match v {
         Value::Str(s) => s.len() + 24,
         Value::Number(_) | Value::Bool(_) => 8,
+        Value::Array(arr) => {
+            24 + arr.iter().map(val_estimated_bytes).sum::<usize>()
+        }
     }
 }

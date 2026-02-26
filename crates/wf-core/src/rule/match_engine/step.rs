@@ -106,6 +106,11 @@ pub(super) fn apply_transforms(
 pub(super) fn update_measure(measure: &Measure, field_value: &Option<Value>, bs: &mut BranchState) {
     let fval = field_value.as_ref().and_then(value_to_f64);
 
+    // Collect raw values for L3 functions (collect_set/list, first/last, stddev/percentile)
+    if let Some(val) = field_value {
+        bs.collected_values.push(val.clone());
+    }
+
     match measure {
         Measure::Count => {
             bs.count += 1;
@@ -244,7 +249,7 @@ fn compare(cmp: CmpOp, lhs: f64, rhs: f64) -> bool {
 }
 
 /// Ordering for Value (used by min/max on orderable fields).
-/// Number < Str < Bool for cross-type (shouldn't happen in practice).
+/// Number < Str < Bool < Array for cross-type (shouldn't happen in practice).
 fn value_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => {
@@ -252,11 +257,14 @@ fn value_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
         }
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        // Cross-type: shouldn't happen with well-typed rules
+        (Value::Array(x), Value::Array(y)) => x.len().cmp(&y.len()),
+        // Cross-type: Number < Str < Bool < Array
         (Value::Number(_), _) => std::cmp::Ordering::Less,
         (_, Value::Number(_)) => std::cmp::Ordering::Greater,
-        (Value::Str(_), Value::Bool(_)) => std::cmp::Ordering::Less,
-        (Value::Bool(_), Value::Str(_)) => std::cmp::Ordering::Greater,
+        (Value::Str(_), Value::Bool(_) | Value::Array(_)) => std::cmp::Ordering::Less,
+        (Value::Bool(_) | Value::Array(_), Value::Str(_)) => std::cmp::Ordering::Greater,
+        (Value::Bool(_), Value::Array(_)) => std::cmp::Ordering::Less,
+        (Value::Array(_), Value::Bool(_)) => std::cmp::Ordering::Greater,
     }
 }
 

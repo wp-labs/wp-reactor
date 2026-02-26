@@ -38,6 +38,9 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
     // Check match keys
     keys::check_match_keys(rule, &scope, name, errors);
 
+    // Check session gap constraint (S1)
+    keys::check_session_gap(rule, name, errors);
+
     // Check key mapping (K3, K4)
     keys::check_key_mapping(rule, &scope, name, errors);
 

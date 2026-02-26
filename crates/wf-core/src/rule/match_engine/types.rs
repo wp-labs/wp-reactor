@@ -19,6 +19,7 @@ pub enum Value {
     Number(f64),
     Str(String),
     Bool(bool),
+    Array(Vec<Value>),
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +52,8 @@ pub struct StepData {
     pub satisfied_branch_index: usize,
     pub label: Option<String>,
     pub measure_value: f64,
+    /// Collected values for L3 functions (collect_set/list, first/last, stddev/percentile)
+    pub collected_values: Vec<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,11 +128,18 @@ pub trait WindowLookup: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Cumulative statistics tracker for `baseline()` function.
+/// Supports three methods: mean (standard deviation), ewma (exponential weighted), median.
 #[derive(Debug, Clone)]
 pub(crate) struct RollingStats {
     count: u64,
     sum: f64,
     sum_sq: f64,
+    method: String,
+    // EWMA specific
+    ewma: f64,
+    ewma_alpha: f64, // smoothing factor (default 0.3)
+    // Median specific
+    values: Vec<f64>, // stores recent values for median calculation
 }
 
 impl RollingStats {
@@ -138,6 +148,22 @@ impl RollingStats {
             count: 0,
             sum: 0.0,
             sum_sq: 0.0,
+            method: "mean".to_string(),
+            ewma: 0.0,
+            ewma_alpha: 0.3,
+            values: Vec::new(),
+        }
+    }
+
+    pub(super) fn new_with_method(method: &str) -> Self {
+        Self {
+            count: 0,
+            sum: 0.0,
+            sum_sq: 0.0,
+            method: method.to_string(),
+            ewma: 0.0,
+            ewma_alpha: 0.3,
+            values: Vec::new(),
         }
     }
 
@@ -145,6 +171,25 @@ impl RollingStats {
         self.count += 1;
         self.sum += value;
         self.sum_sq += value * value;
+
+        // Update method-specific accumulators
+        match self.method.as_str() {
+            "ewma" => {
+                if self.count == 1 {
+                    self.ewma = value;
+                } else {
+                    self.ewma = self.ewma_alpha * value + (1.0 - self.ewma_alpha) * self.ewma;
+                }
+            }
+            "median" => {
+                self.values.push(value);
+                // Keep only last 1000 values to bound memory
+                if self.values.len() > 1000 {
+                    self.values.remove(0);
+                }
+            }
+            _ => {} // "mean" uses sum/count only
+        }
     }
 
     fn mean(&self) -> f64 {
@@ -164,13 +209,61 @@ impl RollingStats {
         if variance < 0.0 { 0.0 } else { variance.sqrt() }
     }
 
-    /// How many standard deviations the value is from the mean.
-    pub(super) fn deviation(&self, value: f64) -> f64 {
-        let std = self.stddev();
-        if std == 0.0 {
+    fn median(&self) -> f64 {
+        if self.values.is_empty() {
+            return 0.0;
+        }
+        // Filter out NaN values to avoid panic in partial_cmp
+        let mut sorted: Vec<f64> = self.values.iter().copied().filter(|v| !v.is_nan()).collect();
+        if sorted.is_empty() {
+            return 0.0;
+        }
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mid = sorted.len() / 2;
+        if sorted.len() % 2 == 0 {
+            (sorted[mid - 1] + sorted[mid]) / 2.0
+        } else {
+            sorted[mid]
+        }
+    }
+
+    fn ewma(&self) -> f64 {
+        if self.count == 0 {
             0.0
         } else {
-            (value - self.mean()) / std
+            self.ewma
+        }
+    }
+
+    /// Calculate deviation based on method.
+    /// Returns z-score for mean, relative deviation for ewma/median.
+    pub(super) fn deviation(&self, value: f64) -> f64 {
+        match self.method.as_str() {
+            "ewma" => {
+                let baseline = self.ewma();
+                if baseline == 0.0 {
+                    0.0
+                } else {
+                    (value - baseline) / baseline.abs()
+                }
+            }
+            "median" => {
+                let baseline = self.median();
+                if baseline == 0.0 {
+                    0.0
+                } else {
+                    (value - baseline) / baseline.abs()
+                }
+            }
+            _ => {
+                // default "mean" - use standard z-score
+                let std = self.stddev();
+                if std == 0.0 {
+                    0.0
+                } else {
+                    (value - self.mean()) / std
+                }
+            }
         }
     }
 }

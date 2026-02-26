@@ -92,10 +92,14 @@ fn evaluate_close_steps(
         match evaluate_close_step(step_plan, step_state, &synthetic_event) {
             Some((branch_idx, measure_value)) => {
                 let label = step_plan.branches[branch_idx].label.clone();
+                let collected_values = step_state.branch_states[branch_idx]
+                    .collected_values
+                    .clone();
                 close_step_data.push(StepData {
                     satisfied_branch_index: branch_idx,
                     label,
                     measure_value,
+                    collected_values,
                 });
             }
             None => {
@@ -105,6 +109,7 @@ fn evaluate_close_steps(
                     satisfied_branch_index: 0,
                     label: None,
                     measure_value: 0.0,
+                    collected_values: Vec::new(),
                 });
             }
         }

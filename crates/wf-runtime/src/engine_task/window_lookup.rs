@@ -29,6 +29,9 @@ impl WindowLookup for RegistryLookup<'_> {
                         Value::Bool(b) => {
                             values.insert(b.to_string());
                         }
+                        Value::Array(_) => {
+                            // Arrays are not supported for has() membership checks
+                        }
                     }
                 }
             }

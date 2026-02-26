@@ -1,8 +1,26 @@
-use crate::ast::{FieldRef, RuleDecl};
+use crate::ast::{FieldRef, RuleDecl, WindowMode};
 
 use crate::checker::scope::{self, Scope};
 use crate::checker::types::{ValType, compatible};
 use crate::checker::{CheckError, Severity};
+
+/// S1: session(gap) gap must be > 0
+pub fn check_session_gap(
+    rule: &RuleDecl,
+    rule_name: &str,
+    errors: &mut Vec<CheckError>,
+) {
+    if let WindowMode::Session(gap) = rule.match_clause.window_mode {
+        if gap.is_zero() {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: "session(gap) gap must be > 0".to_string(),
+            });
+        }
+    }
+}
 
 pub fn check_match_keys(
     rule: &RuleDecl,

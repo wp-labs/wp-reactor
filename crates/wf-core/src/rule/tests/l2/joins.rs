@@ -38,6 +38,7 @@ fn join_snapshot_enriches_context() {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: 0,
     };
@@ -85,6 +86,7 @@ fn join_entity_from_joined_field() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: 0,
     };
@@ -132,6 +134,7 @@ fn join_no_match_falls_through() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: 0,
     };
@@ -182,6 +185,7 @@ fn join_close_with_joins() {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),
             measure_value: 3.0,
+            collected_values: Vec::new(),
         }],
         close_step_data: vec![],
         watermark_nanos: 0,
@@ -246,6 +250,7 @@ fn join_asof_picks_latest_before_event_time() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: event_time,
     };
@@ -308,6 +313,7 @@ fn join_asof_within_filters_old_rows() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: event_time,
     };
@@ -349,6 +355,7 @@ fn join_asof_no_timestamp_support_skips() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         event_time_nanos: 1_000_000_000,
     };
@@ -417,6 +424,7 @@ fn join_asof_close_uses_last_event_nanos() {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),
             measure_value: 1.0,
+            collected_values: Vec::new(),
         }],
         close_step_data: vec![],
         watermark_nanos: watermark,

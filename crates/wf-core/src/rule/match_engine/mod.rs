@@ -158,7 +158,10 @@ impl CepStateMachine {
 
         // Build structured instance key
         let (instance_key, fixed_created_at) = match self.plan.window_spec {
-            WindowSpec::Sliding(_) => (InstanceKey::sliding(&scope_key), None),
+            WindowSpec::Sliding(_) | WindowSpec::Session(_) => {
+                // Session windows use sliding-style keys but with gap-based expiration
+                (InstanceKey::sliding(&scope_key), None)
+            }
             WindowSpec::Fixed(dur) => {
                 let dur_nanos = dur.as_nanos() as i64;
                 let bucket_start = (now_nanos / dur_nanos) * dur_nanos;
@@ -305,10 +308,15 @@ impl CepStateMachine {
             None => StepResult::Accumulate,
             Some((branch_idx, measure_value)) => {
                 let label = step_plan.branches[branch_idx].label.clone();
+                // Collect the values from the satisfied branch for L3 functions
+                let collected_values = step_state.branch_states[branch_idx]
+                    .collected_values
+                    .clone();
                 instance.completed_steps.push(StepData {
                     satisfied_branch_index: branch_idx,
                     label,
                     measure_value,
+                    collected_values,
                 });
                 instance.current_step += 1;
 
@@ -416,7 +424,7 @@ impl CepStateMachine {
         let scope_key_str = make_scope_key_str(scope_key);
 
         let instance_key = match self.plan.window_spec {
-            WindowSpec::Sliding(_) => InstanceKey::sliding(scope_key),
+            WindowSpec::Sliding(_) | WindowSpec::Session(_) => InstanceKey::sliding(scope_key),
             WindowSpec::Fixed(_) => self
                 .instances
                 .iter()
@@ -454,22 +462,38 @@ impl CepStateMachine {
     /// or scan frequency.
     pub fn scan_expired_at(&mut self, watermark_nanos: i64) -> Vec<CloseOutput> {
         let maxspan_nanos = match self.plan.window_spec {
-            WindowSpec::Sliding(d) | WindowSpec::Fixed(d) => d.as_nanos() as i64,
+            WindowSpec::Sliding(d) | WindowSpec::Fixed(d) | WindowSpec::Session(d) => d.as_nanos() as i64,
         };
-        let mut expired_keys: Vec<(InstanceKey, i64)> = Vec::new();
+        let is_session = matches!(self.plan.window_spec, WindowSpec::Session(_));
+        let mut expired_keys: Vec<(InstanceKey, i64, i64)> = Vec::new();
         for (key, inst) in &self.instances {
-            if watermark_nanos.saturating_sub(inst.created_at) >= maxspan_nanos {
-                expired_keys.push((key.clone(), inst.created_at));
+            // Session window: expire based on last_event_nanos (gap timeout)
+            // Sliding/Fixed window: expire based on created_at
+            let expiry_anchor = if is_session {
+                inst.last_event_nanos
+            } else {
+                inst.created_at
+            };
+            if watermark_nanos.saturating_sub(expiry_anchor) >= maxspan_nanos {
+                // For session: expire_time = last_event_nanos + gap
+                // For sliding/fixed: expire_time = created_at + duration
+                let logical_expire_time = if is_session {
+                    inst.last_event_nanos + maxspan_nanos
+                } else {
+                    inst.created_at + maxspan_nanos
+                };
+                // Sort key: created_at for sliding/fixed, last_event_nanos for session
+                let sort_key = if is_session { inst.last_event_nanos } else { inst.created_at };
+                expired_keys.push((key.clone(), sort_key, logical_expire_time));
             }
         }
-        // Sort by (created_at, key) so rate_limit_close sees a fully
+        // Sort by (sort_key, key) so rate_limit_close sees a fully
         // deterministic order regardless of HashMap iteration order.
-        expired_keys.sort_by(|(k1, t1), (k2, t2)| t1.cmp(t2).then_with(|| k1.cmp(k2)));
+        expired_keys.sort_by(|(k1, t1, _), (k2, t2, _)| t1.cmp(t2).then_with(|| k1.cmp(k2)));
         let mut results = Vec::with_capacity(expired_keys.len());
-        for (key, _) in expired_keys {
+        for (key, _, expire_time) in expired_keys {
             if let Some(instance) = self.instances.remove(&key) {
                 // Use the instance's logical expiry time for deterministic fired_at
-                let expire_time = instance.created_at + maxspan_nanos;
                 let mut output = evaluate_close(
                     &self.rule_name,
                     &self.plan,

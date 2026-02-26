@@ -138,5 +138,6 @@ pub(crate) fn value_to_string(v: &Value) -> String {
         Value::Number(n) => n.to_string(),
         Value::Str(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
+        Value::Array(_) => "[array]".to_string(),
     }
 }

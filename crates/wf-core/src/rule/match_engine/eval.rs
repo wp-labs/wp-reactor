@@ -71,7 +71,7 @@ pub(crate) fn eval_expr_ext(
                 return eval_window_has(window_name, args, event, windows);
             }
             // Handle baseline()
-            if name == "baseline" && args.len() == 2 {
+            if name == "baseline" && (args.len() == 2 || args.len() == 3) {
                 return eval_baseline(args, event, baselines);
             }
             eval_func_call(name, args, event, windows, baselines)
@@ -117,10 +117,12 @@ fn eval_window_has(
     Some(Value::Bool(values.contains(&lookup_str)))
 }
 
-/// Evaluate `baseline(expr, duration_seconds)`.
+/// Evaluate `baseline(expr, duration_seconds [, method])`.
 ///
 /// Computes the z-score (number of standard deviations from the running mean)
 /// of the current value, then updates the running statistics.
+///
+/// Supported methods: "mean" (default), "ewma", "median"
 fn eval_baseline(
     args: &[Expr],
     event: &Event,
@@ -131,10 +133,16 @@ fn eval_baseline(
         _ => return None,
     };
 
-    // Build a key to identify this baseline expression
-    let key = format!("{:?}", args[0]);
+    // Parse optional method argument (default to "mean")
+    let method = args.get(2).and_then(|arg| match arg {
+        Expr::StringLit(s) => Some(s.as_str()),
+        _ => None,
+    }).unwrap_or("mean");
 
-    let stats = baselines.entry(key).or_insert_with(RollingStats::new);
+    // Build a key to identify this baseline expression (including method)
+    let key = format!("{:?}:{}", args[0], method);
+
+    let stats = baselines.entry(key).or_insert_with(|| RollingStats::new_with_method(method));
     let deviation = stats.deviation(current_val);
     stats.update(current_val);
     Some(Value::Number(deviation))
@@ -342,6 +350,18 @@ fn eval_func_call(
             }
             let bucketed = (t / interval_nanos).floor() * interval_nanos;
             Some(Value::Number(bucketed))
+        }
+        // L3 Collection functions - require instance context, not supported in guard context
+        "collect_set" | "collect_list" | "first" | "last" => {
+            // These functions need access to the instance's collected events
+            // They are supported in yield/derive context via StepEvalContext
+            None
+        }
+        // L3 Statistical functions - require instance context
+        "stddev" | "percentile" => {
+            // These functions need access to the instance's numeric values
+            // They are supported in yield/derive context via StepEvalContext
+            None
         }
         _ => None, // unsupported function
     }

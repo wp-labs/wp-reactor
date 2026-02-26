@@ -12,6 +12,7 @@ use crate::rule::match_engine::{
 /// - Maps `keys[i]` field name → `scope_key[i]` value (original type preserved)
 /// - Adds step labels as fields → `label` → `Value::Number(measure_value)`
 /// - Labels that collide with key names are silently skipped (keys take priority)
+/// - Adds `_step_{i}_values` fields with collected values for L3 functions
 pub(super) fn build_eval_context(
     keys: &[FieldRef],
     scope_key: &[Value],
@@ -26,12 +27,17 @@ pub(super) fn build_eval_context(
     }
 
     // Step labels → measure values (skip if name collides with a key field)
-    for sd in step_data {
+    // Also store collected values for L3 functions
+    for (step_idx, sd) in step_data.iter().enumerate() {
         if let Some(label) = &sd.label
             && !fields.contains_key(label.as_str())
         {
             fields.insert(label.clone(), Value::Number(sd.measure_value));
         }
+        // Store collected values for L3 functions (collect_set/list, first/last, stddev/percentile)
+        let values_field = format!("_step_{}_values", step_idx);
+        let values_array = Value::Array(sd.collected_values.clone());
+        fields.insert(values_field, values_array);
     }
 
     Event { fields }
