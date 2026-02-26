@@ -6,11 +6,12 @@ use super::*;
 // Match clause
 // ---------------------------------------------------------------------------
 
-/// Window mode: sliding (default) or fixed (L3).
+/// Window mode: sliding (default), fixed (L3), or session (L3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowMode {
     Sliding,
     Fixed,
+    Session(std::time::Duration), // gap duration
 }
 
 /// Close block mode: OR (independent paths) or AND (both required).

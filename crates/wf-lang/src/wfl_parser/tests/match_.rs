@@ -4,7 +4,60 @@ use crate::ast::*;
 use crate::parse_wfl;
 
 // -----------------------------------------------------------------------
-// Match clause
+// Match clause - Session window (L3)
+// -----------------------------------------------------------------------
+
+#[test]
+fn parse_match_session_window() {
+    let input = r#"
+rule session_test {
+    events { e : win }
+    match<uid:session(30m)> {
+        on event { e | count >= 1; }
+        on close { e | count >= 1; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    assert_eq!(file.rules.len(), 1);
+    let match_clause = &file.rules[0].match_clause;
+    assert_eq!(match_clause.keys.len(), 1);
+    match match_clause.window_mode {
+        WindowMode::Session(gap) => {
+            assert_eq!(gap.as_secs(), 30 * 60);
+        }
+        _ => panic!("expected Session window mode"),
+    }
+}
+
+#[test]
+fn parse_match_session_window_no_keys() {
+    let input = r#"
+rule session_test {
+    events { e : win }
+    match<:session(5m)> {
+        on event { e | count >= 1; }
+        on close { e | count >= 1; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let match_clause = &file.rules[0].match_clause;
+    assert!(match_clause.keys.is_empty());
+    match match_clause.window_mode {
+        WindowMode::Session(gap) => {
+            assert_eq!(gap.as_secs(), 5 * 60);
+        }
+        _ => panic!("expected Session window mode"),
+    }
+}
+
+// -----------------------------------------------------------------------
+// Match clause - Sliding/Fixed window
 // -----------------------------------------------------------------------
 
 #[test]

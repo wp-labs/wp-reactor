@@ -118,6 +118,7 @@ fn compile_match(rule: &RuleDecl) -> MatchPlan {
         window_spec: match mc.window_mode {
             WindowMode::Sliding => WindowSpec::Sliding(mc.duration),
             WindowMode::Fixed => WindowSpec::Fixed(mc.duration),
+            WindowMode::Session(gap) => WindowSpec::Session(gap),
         },
         event_steps: mc.on_event.iter().map(compile_step).collect(),
         close_steps: mc

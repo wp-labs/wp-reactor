@@ -71,7 +71,10 @@ fn match_clause(input: &mut &str) -> ModalResult<MatchClause> {
     })
 }
 
-/// Parse match params: `[key, key, ...] : duration [:fixed]`
+/// Parse match params:
+///   `[key, key, ...] : duration`               (sliding window)
+///   `[key, key, ...] : duration : fixed`       (fixed window)
+///   `[key, key, ...] : session(gap)`           (session window, L3)
 fn match_params(input: &mut &str) -> ModalResult<(Vec<FieldRef>, std::time::Duration, WindowMode)> {
     ws_skip.parse_next(input)?;
 
@@ -88,6 +91,32 @@ fn match_params(input: &mut &str) -> ModalResult<(Vec<FieldRef>, std::time::Dura
     };
 
     ws_skip.parse_next(input)?;
+
+    // Check for session(gap) first (L3 session window)
+    if opt(kw("session")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        cut_err(literal("("))
+            .context(StrContext::Expected(StrContextValue::Description(
+                "'(' after 'session'",
+            )))
+            .parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        let gap = cut_err(duration_value)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "gap duration in session(gap)",
+            )))
+            .parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        cut_err(literal(")"))
+            .context(StrContext::Expected(StrContextValue::Description(
+                "')' after session gap",
+            )))
+            .parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        return Ok((keys, gap, WindowMode::Session(gap)));
+    }
+
+    // Parse duration for sliding/fixed window
     let dur = cut_err(duration_value)
         .context(StrContext::Expected(StrContextValue::Description(
             "duration value",

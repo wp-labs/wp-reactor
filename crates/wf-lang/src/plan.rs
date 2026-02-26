@@ -85,6 +85,8 @@ pub enum WindowSpec {
     Sliding(Duration),
     /// Fixed window with a fixed duration (non-overlapping buckets).
     Fixed(Duration),
+    /// Session window with gap duration (L3 behavior analysis).
+    Session(Duration),
 }
 
 /// One match step containing one or more OR branches.

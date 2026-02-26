@@ -44,6 +44,7 @@ pub(super) fn explain_match(mp: &MatchPlan) -> MatchExpl {
     let window_spec = match &mp.window_spec {
         WindowSpec::Sliding(d) => format!("sliding {}", format_duration(d)),
         WindowSpec::Fixed(d) => format!("fixed {}", format_duration(d)),
+        WindowSpec::Session(gap) => format!("session(gap={})", format_duration(gap)),
     };
 
     let event_steps = mp.event_steps.iter().map(format_step).collect();

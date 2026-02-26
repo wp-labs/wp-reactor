@@ -78,13 +78,13 @@ pub fn check_func_call(
             }
         }
         "baseline" => {
-            // T6: baseline(expr, duration)
-            if args.len() != 2 {
+            // T26: baseline(expr, dur) or baseline(expr, dur, method)
+            if args.len() != 2 && args.len() != 3 {
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     test: None,
-                    message: "baseline() requires exactly 2 arguments: (expr, duration)"
+                    message: "baseline() requires 2 or 3 arguments: (expr, duration, [method])"
                         .to_string(),
                 });
             } else {
@@ -110,6 +110,34 @@ pub fn check_func_call(
                             message: "baseline() second argument must be a positive duration"
                                 .to_string(),
                         });
+                    }
+                }
+                // Third argument (if present) must be a string literal: "mean", "ewma", or "median"
+                if args.len() == 3 {
+                    match &args[2] {
+                        Expr::StringLit(method) => {
+                            let valid_methods = ["mean", "ewma", "median"];
+                            if !valid_methods.contains(&method.as_str()) {
+                                errors.push(CheckError {
+                                    severity: Severity::Error,
+                                    rule: Some(rule_name.to_string()),
+                                    test: None,
+                                    message: format!(
+                                        "baseline() method must be one of: mean, ewma, median, got '{}'",
+                                        method
+                                    ),
+                                });
+                            }
+                        }
+                        _ => {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                test: None,
+                                message: "baseline() method must be a string literal: \"mean\", \"ewma\", or \"median\""
+                                    .to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -296,6 +324,126 @@ pub fn check_func_call(
                     test: None,
                     message: format!("len() argument must be chars, got {:?}", t),
                 });
+            }
+        }
+        // L3 Collection functions (M28.2)
+        "collect_set" | "collect_list" => {
+            // T22: argument must be Column projection (alias.field)
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() requires exactly 1 argument: alias.field", name),
+                });
+            } else if !matches!(args[0], Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..)))
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "{}() argument must be a column projection (alias.field)",
+                        name
+                    ),
+                });
+            }
+        }
+        "first" | "last" => {
+            // T23: argument must be Column projection (alias.field)
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() requires exactly 1 argument: alias.field", name),
+                });
+            } else if !matches!(args[0], Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..)))
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "{}() argument must be a column projection (alias.field)",
+                        name
+                    ),
+                });
+            }
+        }
+        // L3 Statistical functions (M28.3)
+        "stddev" => {
+            // T24: field must be digit or float
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "stddev() requires exactly 1 argument: alias.field".to_string(),
+                });
+            } else if let Some(arg) = args.first() {
+                if let Some(t) = infer_type(arg, scope) && !is_numeric(&t) {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("stddev() requires a numeric field, got {:?}", t),
+                    });
+                }
+                // Also check it's a column projection
+                if !matches!(args[0], Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..)))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: "stddev() argument must be a column projection (alias.field)"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        "percentile" => {
+            // T25: percentile(field, p) where field is numeric, p is 0-100
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "percentile() requires exactly 2 arguments: (field, p)".to_string(),
+                });
+            } else {
+                // First arg must be numeric column
+                if let Some(t) = infer_type(&args[0], scope) && !is_numeric(&t) {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("percentile() field must be numeric, got {:?}", t),
+                    });
+                }
+                if !matches!(args[0], Expr::Field(FieldRef::Qualified(..)) | Expr::Field(FieldRef::Bracketed(..)))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: "percentile() field must be a column projection (alias.field)"
+                            .to_string(),
+                    });
+                }
+                // Second arg must be digit literal 0-100
+                match &args[1] {
+                    Expr::Number(p) if *p >= 0.0 && *p <= 100.0 => {} // OK
+                    _ => {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: "percentile() p must be a number literal 0-100".to_string(),
+                        });
+                    }
+                }
             }
         }
         _ => {}
