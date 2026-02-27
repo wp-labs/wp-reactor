@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 
@@ -33,9 +34,11 @@ pub async fn run_alert_dispatcher(
                 continue;
             }
         };
+        let dispatch_started = Instant::now();
         dispatcher.dispatch(&record.yield_target, &json).await;
         if let Some(metrics) = &metrics {
             metrics.inc_alert_dispatch();
+            metrics.observe_alert_dispatch(dispatch_started.elapsed());
         }
     }
     dispatcher.stop_all().await;

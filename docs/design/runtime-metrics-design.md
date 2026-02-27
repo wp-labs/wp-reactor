@@ -152,6 +152,8 @@ queue_capacity = 4096
 - 引入关键 Histogram（decode/dispatch/flush）
 - 增加窗口/规则维度 Gauge 周期采样
 
+> 进展（2026-02-26）：已完成第一版实现（`wf_receiver_decode_seconds`、`wf_alert_dispatch_seconds`、`wf_rule_scan_timeout_seconds{rule}`、`wf_rule_flush_seconds{rule}`，以及窗口 Gauge 周期采样缓存）。
+
 ### Phase 3（可选增强）
 
 - 引入 TopN + LRU 维度聚合（按配置开关）

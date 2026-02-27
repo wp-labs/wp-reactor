@@ -158,6 +158,14 @@ wfusion run --config fusion.toml
 
 引擎启动后监听 `tcp://127.0.0.1:9800`，接收 Arrow IPC 格式的事件流，执行规则检测，输出告警到 `sinks/` 配置的目标文件。
 
+如需在运行时直接看到统计指标快照，可开启 CLI 指标开关：
+
+```bash
+wfusion run --config fusion.toml --metrics --metrics-interval 2s
+```
+
+启动后会周期输出 `metrics snapshot`，并暴露 `/metrics`（默认 `127.0.0.1:9901`，可用 `--metrics-listen` 覆盖）。
+
 ---
 
 ## 3. 三文件模型

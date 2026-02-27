@@ -1,6 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -84,8 +85,12 @@ async fn handle_connection(
                 match result {
                     Ok(None) => break,
                     Ok(Some(payload)) => {
+                        let decode_started = Instant::now();
                         match wp_arrow::ipc::decode_ipc(&payload) {
                             Ok(frame) => {
+                                if let Some(metrics) = &metrics {
+                                    metrics.observe_receiver_decode(decode_started.elapsed());
+                                }
                                 if let Some(metrics) = &metrics {
                                     metrics.add_receiver_frame(frame.batch.num_rows());
                                 }
@@ -114,6 +119,9 @@ async fn handle_connection(
                                 }
                             }
                             Err(e) => {
+                                if let Some(metrics) = &metrics {
+                                    metrics.observe_receiver_decode(decode_started.elapsed());
+                                }
                                 if let Some(metrics) = &metrics {
                                     metrics.inc_receiver_decode_error();
                                 }

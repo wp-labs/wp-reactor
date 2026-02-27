@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use arrow::array::{
     ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
@@ -184,6 +185,7 @@ impl RuleTask {
 
     /// Scan for expired state machine instances and emit alerts.
     pub(super) async fn scan_timeouts(&mut self) {
+        let started = Instant::now();
         let lookup = RegistryLookup(&self.router);
         for close in &self
             .machine
@@ -198,12 +200,14 @@ impl RuleTask {
             }
         }
         if let Some(metrics) = &self.metrics {
+            metrics.observe_rule_scan_timeout(self.machine.rule_name(), started.elapsed());
             metrics.set_rule_instances(self.machine.rule_name(), self.machine.instance_count());
         }
     }
 
     /// Close all active instances (shutdown flush) and emit alerts.
     pub(super) async fn flush(&mut self) {
+        let started = Instant::now();
         let mut emitted = 0usize;
         let lookup = RegistryLookup(&self.router);
         for close in &self
@@ -225,6 +229,7 @@ impl RuleTask {
             wf_debug!(pipe, task_id = %self.task_id, alerts = emitted, "flush complete");
         }
         if let Some(metrics) = &self.metrics {
+            metrics.observe_rule_flush(self.machine.rule_name(), started.elapsed());
             metrics.set_rule_instances(self.machine.rule_name(), self.machine.instance_count());
         }
     }

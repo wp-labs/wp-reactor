@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -9,6 +10,65 @@ use tokio_util::sync::CancellationToken;
 
 use wf_config::MetricsConfig;
 use wf_core::window::{EvictReport, RouteReport, Router};
+
+const DEFAULT_HISTOGRAM_BUCKETS_SECONDS: &[f64] = &[
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
+];
+
+/// Lock-free histogram with fixed buckets.
+///
+/// Each observation increments exactly one bucket (non-cumulative storage).
+struct Histogram {
+    upper_bounds_nanos: Vec<u64>,
+    bucket_counts: Vec<AtomicU64>,
+    sum_nanos: AtomicU64,
+}
+
+impl Histogram {
+    fn from_seconds_bounds(bounds: &[f64]) -> Self {
+        let upper_bounds_nanos = bounds
+            .iter()
+            .map(|sec| (*sec * 1_000_000_000.0) as u64)
+            .collect::<Vec<_>>();
+        let bucket_counts = (0..=upper_bounds_nanos.len())
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>();
+        Self {
+            upper_bounds_nanos,
+            bucket_counts,
+            sum_nanos: AtomicU64::new(0),
+        }
+    }
+
+    fn observe_duration(&self, elapsed: Duration) {
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
+        let idx = self
+            .upper_bounds_nanos
+            .iter()
+            .position(|bound| nanos <= *bound)
+            .unwrap_or(self.upper_bounds_nanos.len());
+        self.bucket_counts[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> HistogramSnapshot {
+        HistogramSnapshot {
+            upper_bounds_nanos: self.upper_bounds_nanos.clone(),
+            bucket_counts: self
+                .bucket_counts
+                .iter()
+                .map(|v| v.load(Ordering::Relaxed))
+                .collect(),
+            sum_seconds: self.sum_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+        }
+    }
+}
+
+struct HistogramSnapshot {
+    upper_bounds_nanos: Vec<u64>,
+    bucket_counts: Vec<u64>,
+    sum_seconds: f64,
+}
 
 /// Shared runtime metrics store.
 ///
@@ -40,12 +100,38 @@ pub struct RuntimeMetrics {
     evictor_sweeps_total: AtomicU64,
     evictor_time_evicted_total: AtomicU64,
     evictor_memory_evicted_total: AtomicU64,
+
+    window_memory_bytes: BTreeMap<String, AtomicU64>,
+    window_rows: BTreeMap<String, AtomicU64>,
+    window_batches: BTreeMap<String, AtomicU64>,
+
+    receiver_decode_seconds: Histogram,
+    alert_dispatch_seconds: Histogram,
+    rule_scan_timeout_seconds: BTreeMap<String, Histogram>,
+    rule_flush_seconds: BTreeMap<String, Histogram>,
 }
 
 impl RuntimeMetrics {
     pub fn new(rule_names: &[String], window_names: &[String]) -> Self {
         let make_rule_map = || {
             rule_names
+                .iter()
+                .map(|name| (name.clone(), AtomicU64::new(0)))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let make_rule_hist_map = || {
+            rule_names
+                .iter()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        Histogram::from_seconds_bounds(DEFAULT_HISTOGRAM_BUCKETS_SECONDS),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let make_window_map = || {
+            window_names
                 .iter()
                 .map(|name| (name.clone(), AtomicU64::new(0)))
                 .collect::<BTreeMap<_, _>>()
@@ -81,6 +167,17 @@ impl RuntimeMetrics {
             evictor_sweeps_total: AtomicU64::new(0),
             evictor_time_evicted_total: AtomicU64::new(0),
             evictor_memory_evicted_total: AtomicU64::new(0),
+            window_memory_bytes: make_window_map(),
+            window_rows: make_window_map(),
+            window_batches: make_window_map(),
+            receiver_decode_seconds: Histogram::from_seconds_bounds(
+                DEFAULT_HISTOGRAM_BUCKETS_SECONDS,
+            ),
+            alert_dispatch_seconds: Histogram::from_seconds_bounds(
+                DEFAULT_HISTOGRAM_BUCKETS_SECONDS,
+            ),
+            rule_scan_timeout_seconds: make_rule_hist_map(),
+            rule_flush_seconds: make_rule_hist_map(),
         }
     }
 
@@ -98,6 +195,10 @@ impl RuntimeMetrics {
     pub fn inc_receiver_decode_error(&self) {
         self.receiver_decode_errors_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn observe_receiver_decode(&self, elapsed: Duration) {
+        self.receiver_decode_seconds.observe_duration(elapsed);
     }
 
     pub fn inc_receiver_read_error(&self) {
@@ -170,6 +271,22 @@ impl RuntimeMetrics {
         self.alert_dispatch_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn observe_alert_dispatch(&self, elapsed: Duration) {
+        self.alert_dispatch_seconds.observe_duration(elapsed);
+    }
+
+    pub fn observe_rule_scan_timeout(&self, rule: &str, elapsed: Duration) {
+        if let Some(hist) = self.rule_scan_timeout_seconds.get(rule) {
+            hist.observe_duration(elapsed);
+        }
+    }
+
+    pub fn observe_rule_flush(&self, rule: &str, elapsed: Duration) {
+        if let Some(hist) = self.rule_flush_seconds.get(rule) {
+            hist.observe_duration(elapsed);
+        }
+    }
+
     pub fn add_evict_report(&self, report: &EvictReport) {
         self.evictor_sweeps_total.fetch_add(1, Ordering::Relaxed);
         self.evictor_time_evicted_total
@@ -178,7 +295,25 @@ impl RuntimeMetrics {
             .fetch_add(report.batches_memory_evicted as u64, Ordering::Relaxed);
     }
 
-    fn render_prometheus(&self, router: &Router) -> String {
+    /// Periodically sample expensive window gauges to keep scrape path light.
+    pub fn sample_windows(&self, router: &Router) {
+        for window_name in router.registry().window_names() {
+            if let Some(win_lock) = router.registry().get_window(window_name) {
+                let win = win_lock.read().expect("window lock poisoned");
+                if let Some(v) = self.window_memory_bytes.get(window_name) {
+                    v.store(win.memory_usage() as u64, Ordering::Relaxed);
+                }
+                if let Some(v) = self.window_rows.get(window_name) {
+                    v.store(win.total_rows() as u64, Ordering::Relaxed);
+                }
+                if let Some(v) = self.window_batches.get(window_name) {
+                    v.store(win.batch_count() as u64, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    fn render_prometheus(&self) -> String {
         let mut out = String::with_capacity(16 * 1024);
 
         self.render_counter(
@@ -205,6 +340,11 @@ impl RuntimeMetrics {
             &mut out,
             "wf_receiver_read_errors_total",
             self.receiver_read_errors_total.load(Ordering::Relaxed),
+        );
+        self.render_histogram(
+            &mut out,
+            "wf_receiver_decode_seconds",
+            &self.receiver_decode_seconds,
         );
 
         self.render_counter(
@@ -291,6 +431,11 @@ impl RuntimeMetrics {
             "wf_alert_dispatch_total",
             self.alert_dispatch_total.load(Ordering::Relaxed),
         );
+        self.render_histogram(
+            &mut out,
+            "wf_alert_dispatch_seconds",
+            &self.alert_dispatch_seconds,
+        );
 
         self.render_counter(
             &mut out,
@@ -308,28 +453,46 @@ impl RuntimeMetrics {
             self.evictor_memory_evicted_total.load(Ordering::Relaxed),
         );
 
-        for window_name in router.registry().window_names() {
-            if let Some(win_lock) = router.registry().get_window(window_name) {
-                let win = win_lock.read().expect("window lock poisoned");
-                self.render_gauge_labeled(
-                    &mut out,
-                    "wf_window_memory_bytes",
-                    &[("window", window_name)],
-                    win.memory_usage() as u64,
-                );
-                self.render_gauge_labeled(
-                    &mut out,
-                    "wf_window_rows",
-                    &[("window", window_name)],
-                    win.total_rows() as u64,
-                );
-                self.render_gauge_labeled(
-                    &mut out,
-                    "wf_window_batches",
-                    &[("window", window_name)],
-                    win.batch_count() as u64,
-                );
-            }
+        for (rule, histogram) in &self.rule_scan_timeout_seconds {
+            self.render_histogram_labeled(
+                &mut out,
+                "wf_rule_scan_timeout_seconds",
+                &[("rule", rule)],
+                histogram,
+            );
+        }
+        for (rule, histogram) in &self.rule_flush_seconds {
+            self.render_histogram_labeled(
+                &mut out,
+                "wf_rule_flush_seconds",
+                &[("rule", rule)],
+                histogram,
+            );
+        }
+
+        for (window, value) in &self.window_memory_bytes {
+            self.render_gauge_labeled(
+                &mut out,
+                "wf_window_memory_bytes",
+                &[("window", window)],
+                value.load(Ordering::Relaxed),
+            );
+        }
+        for (window, value) in &self.window_rows {
+            self.render_gauge_labeled(
+                &mut out,
+                "wf_window_rows",
+                &[("window", window)],
+                value.load(Ordering::Relaxed),
+            );
+        }
+        for (window, value) in &self.window_batches {
+            self.render_gauge_labeled(
+                &mut out,
+                "wf_window_batches",
+                &[("window", window)],
+                value.load(Ordering::Relaxed),
+            );
         }
 
         out
@@ -362,14 +525,59 @@ impl RuntimeMetrics {
         let _ = writeln!(out, "{name}{} {value}", format_labels(labels));
     }
 
-    fn summary_line(&self, router: &Router) -> String {
-        let mut total_window_bytes = 0usize;
-        for window_name in router.registry().window_names() {
-            if let Some(win_lock) = router.registry().get_window(window_name) {
-                let win = win_lock.read().expect("window lock poisoned");
-                total_window_bytes += win.memory_usage();
-            }
+    fn render_histogram(&self, out: &mut String, name: &str, histogram: &Histogram) {
+        self.render_histogram_labeled(out, name, &[], histogram);
+    }
+
+    fn render_histogram_labeled(
+        &self,
+        out: &mut String,
+        name: &str,
+        labels: &[(&str, &str)],
+        histogram: &Histogram,
+    ) {
+        let snapshot = histogram.snapshot();
+        let _ = writeln!(out, "# TYPE {name} histogram");
+        let mut cumulative = 0u64;
+        for (idx, upper_bound_nanos) in snapshot.upper_bounds_nanos.iter().enumerate() {
+            cumulative = cumulative.saturating_add(snapshot.bucket_counts[idx]);
+            let le = format!("{:.6}", *upper_bound_nanos as f64 / 1_000_000_000.0);
+            let mut all_labels = labels.to_vec();
+            all_labels.push(("le", le.as_str()));
+            let _ = writeln!(
+                out,
+                "{name}_bucket{} {cumulative}",
+                format_labels(&all_labels),
+            );
         }
+        cumulative = cumulative.saturating_add(
+            *snapshot
+                .bucket_counts
+                .last()
+                .expect("histogram must include +Inf bucket"),
+        );
+        let mut all_labels = labels.to_vec();
+        all_labels.push(("le", "+Inf"));
+        let _ = writeln!(
+            out,
+            "{name}_bucket{} {cumulative}",
+            format_labels(&all_labels),
+        );
+        let _ = writeln!(
+            out,
+            "{name}_sum{} {}",
+            format_labels(labels),
+            snapshot.sum_seconds
+        );
+        let _ = writeln!(out, "{name}_count{} {}", format_labels(labels), cumulative);
+    }
+
+    fn summary_line(&self) -> String {
+        let total_window_bytes: u64 = self
+            .window_memory_bytes
+            .values()
+            .map(|v| v.load(Ordering::Relaxed))
+            .sum();
         format!(
             "rx_rows={} routed={} dropped_late={} matches={} alerts={} window_bytes={}",
             self.receiver_rows_total.load(Ordering::Relaxed),
@@ -428,16 +636,18 @@ pub async fn run_metrics_task(
         "metrics exporter started"
     );
 
+    metrics.sample_windows(&router);
     let mut tick = tokio::time::interval(config.report_interval.as_duration());
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tick.tick() => {
-                wf_info!(res, summary = %metrics.summary_line(&router), "metrics snapshot");
+                metrics.sample_windows(&router);
+                wf_info!(res, summary = %metrics.summary_line(), "metrics snapshot");
             }
             result = listener.accept() => {
                 let (mut stream, _) = result?;
-                let body = metrics.render_prometheus(&router);
+                let body = metrics.render_prometheus();
                 let mut req_buf = [0u8; 512];
                 let req_n = stream.read(&mut req_buf).await.unwrap_or(0);
                 let is_metrics = req_n > 0
