@@ -15,6 +15,7 @@ use wfgen::validate::validate_wfg;
 use wfgen::wfg_parser::parse_wfg;
 
 use crate::cmd_helpers::{load_wfl_files, load_ws_files};
+use crate::tcp_send::send_events;
 
 pub(crate) fn run(
     scenario: PathBuf,
@@ -23,6 +24,8 @@ pub(crate) fn run(
     ws: Vec<PathBuf>,
     wfl: Vec<PathBuf>,
     no_oracle: bool,
+    send: bool,
+    addr: String,
 ) -> anyhow::Result<()> {
     let normalized_format = match format.as_str() {
         "jsonl" => "jsonl",
@@ -207,6 +210,16 @@ pub(crate) fn run(
             );
         }
         _ => unreachable!(),
+    }
+
+    if send {
+        let sent_frames = send_events(&output_events, &schemas, &addr)?;
+        println!(
+            "Sent {} events as {} frame(s) -> {}",
+            output_events.len(),
+            sent_frames,
+            addr
+        );
     }
 
     Ok(())

@@ -1400,7 +1400,7 @@ eos_emit_reason = "eos"          # 固定为 eos，供审计
 |------|------|------|
 | 单元测试 | `wfl test rules/*.wfl` | 规则逻辑正确性 |
 | 顺序扰动 | `wfl test rules/*.wfl --shuffle --runs 20` | 顺序/乱序不变性 |
-| 集成对拍 | `wfgen gen -> wf run --replay -> wfgen verify` | 引擎端到端一致性 |
+| 集成对拍 | `wfgen gen -> wfusion run + wfgen send -> wfgen verify` | 引擎端到端一致性 |
 
 **Reference Evaluator 约束：**
 
@@ -1772,7 +1772,7 @@ rollback_to: "risk_scores@v1"
 - **可复现**：同一 `seed + ws + wfl + scenario` 产出一致数据集。
 - **可验证**：生成 `events` 与 `oracle`，支持自动差异比对。
 - **可扰动**：支持乱序、迟到、重复、丢弃等时序扰动。
-- **可接入**：支持 `gen -> run -> verify` 标准流水线接入 CI。
+- **可接入**：支持 `gen -> send -> verify` 标准流水线接入 CI。
 
 ### 18.2 Scenario DSL（`.wfg`）
 
@@ -2070,31 +2070,33 @@ Oracle: 1234 alerts -> out/brute_force_load.oracle.jsonl
 }
 ```
 
-### 18.6 端到端数据流（gen -> run -> verify）
+### 18.6 端到端数据流（gen -> send -> verify）
 
 ```text
 *.wfg + *.wfs + *.wfl
          │
     wfgen gen
          │
-   ┌─────┴─────────────┐
-   │                    │
-out/events/*    out/oracle/alerts.jsonl
-   │                    │
-wf run --replay         │
-   │                    │
-actual_alerts.jsonl     │
-   │                    │
-   └──────┬─────────────┘
+   ┌─────┴──────────────┐
+   │                     │
+out/events/*.jsonl   out/oracle/*.jsonl
+   │                     │
+wfusion run --config ... │
+         │               │
+    wfgen send           │
+         │               │
+actual_alerts.jsonl      │
+   │                     │
+   └──────┬──────────────┘
           │
-   wfgen verify
+    wfgen verify
           │
-verify_report.json/.md
+ verify_report.json/.md
 ```
 
 说明：
-- 回放默认走 `wf run --replay` 文件输入路径（绕过 TCP）。
-- 若需覆盖 Receiver/TCP 链路，可启用 `wf-replay-sender --tcp` 模式发送 length-prefixed 帧。
+- 运行时通过 `wfusion run` 启动，数据通过 `wfgen send` 走 TCP + Arrow IPC 输入链路。
+- `actual_alerts.jsonl` 路径由 sinks 配置决定（例如 `examples/alerts/all.jsonl`）。
 
 ### 18.7 CLI 约定
 
@@ -2110,9 +2112,26 @@ wfgen gen \
 # 一致性校验（检查 .wfg 引用与 .wfs/.wfl 的一致性）
 wfgen lint tests/brute_force_load.wfg
 
+# 启动引擎（另一个终端）
+wfusion run --config examples/wfusion.toml
+
+# 生成事件并直接发送到运行时（TCP + Arrow IPC）
+wfgen gen \
+  --scenario tests/brute_force_load.wfg \
+  --format jsonl \
+  --out out/ \
+  --send \
+  --addr 127.0.0.1:9800
+
+# 若事件已生成，也可单独发送（可选）
+wfgen send \
+  --scenario tests/brute_force_load.wfg \
+  --input out/brute_force_load.jsonl \
+  --addr 127.0.0.1:9800
+
 # 对拍验证
 wfgen verify \
-  --actual out/actual_alerts.jsonl \
+  --actual examples/alerts/all.jsonl \
   --expected out/brute_force_load.oracle.jsonl \
   --meta out/brute_force_load.oracle.meta.json
 
@@ -2133,7 +2152,7 @@ wfgen gen \
 ### 18.8 CI 接入标准流程
 
 1. `wfgen gen` 生成 events；当 `.wfg` 存在 `oracle` 块且未指定 `--no-oracle` 时，同时生成 oracle。
-2. `wf run --replay out/events/*` 产出 `actual_alerts.jsonl`（可切换 TCP 回放模式）。
+2. 启动 `wfusion run --config ...`，执行 `wfgen gen --send ...`（或 `wfgen send --input ...`）产出 `actual_alerts.jsonl`。
 3. `wfgen verify` 输出差异报告。
 4. CI 阻断条件（默认）：`missing == 0 && unexpected == 0 && field_mismatch == 0`。
 

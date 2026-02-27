@@ -19,3 +19,4 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 arrow = { version = "54", default-features = false, features = ["ipc"] }
+wp-arrow = "0.1"

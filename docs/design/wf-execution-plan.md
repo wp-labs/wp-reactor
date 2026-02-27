@@ -2,7 +2,7 @@
 <!-- 角色：架构师 / 项目管理 | 状态：v2.2 M20 MVP 已完成 | 创建：2026-02-15 | 更新：2026-02-20 -->
 
 > 本文档将 WarpFusion 引擎基建（[warp-fusion.md](warp-fusion.md) P0–P7）与 WFL v2.1 语言实现（[wfl-desion.md](wfl-desion.md) Phase 0–4）统一为主干 30 个里程碑（M01–M30，十个阶段）。  
-> `wfgen` 的 M31–M33 保留为**支撑轨道**（已完成），用于 `gen -> run -> verify` 质量闭环。
+> `wfgen` 的 M31–M33 保留为**支撑轨道**（已完成），用于 `gen -> send -> verify` 质量闭环。
 
 ## 总览
 
@@ -384,7 +384,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | crate | `wfgen` |
 | 范围 | `.wfg` 场景 DSL 解析器（EBNF → AST，语法见 §18.2）；schema 驱动随机数据生成（从 `.wfs` 读取字段类型 → 按 gen 函数分布产出样本）；seed 可复现（固定 seed + 确定性 RNG）；输出格式 JSONL + Arrow IPC；CLI `wfgen gen --scenario ... --format ... --out ...`；`wfgen lint` 一致性校验（.wfg 引用与 .wfs/.wfl 的一致性） |
 | 依赖 | M07 ✅ |
-| 验收 | .wfg 文件解析为 AST 测试；同 seed 两次生成结果一致；JSONL / Arrow 输出可被 `wf run --replay` 消费；lint 检出引用缺失 |
+| 验收 | .wfg 文件解析为 AST 测试；同 seed 两次生成结果一致；JSONL / Arrow 输出可被 `wfgen send` 发送到运行时；lint 检出引用缺失 |
 | 状态 | **已完成** — `wfg_parser/` 解析器 + `datagen/` 生成器 + `output/` JSONL/Arrow IPC 输出，54 项测试通过 |
 
 ### M32：wfgen P1 — Rule-aware 生成 + Oracle + Verify ✅
@@ -396,7 +396,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | crate | `wfgen` |
 | 范围 | Rule-aware 数据生成：按 `.wfl` 编译产物驱动 hit / near_miss / non_hit 三类数据分布；Reference Evaluator 自动计算 oracle（期望告警）；oracle 输出为标准 JSONL（match key = `rule_name, entity_type, entity_id, close_reason`）；oracle 开关策略统一为“语法优先”（`.wfg` 存在 `oracle` 块即默认生成，CLI 仅允许 `--no-oracle` 临时关闭）；`wfgen verify` 对拍命令（actual vs oracle 差异报告）；CI 阻断条件（`missing == 0 && unexpected == 0 && field_mismatch == 0`） |
 | 依赖 | M13 ✅, M31；verify 端到端需 M20 |
-| 验收 | 生成的 hit 数据确实触发规则；near_miss 数据不触发规则；oracle 与 `wf run --replay` 实际告警对拍通过；verify 差异报告格式正确 |
+| 验收 | 生成的 hit 数据确实触发规则；near_miss 数据不触发规则；oracle 与 `wfusion run + wfgen send` 实际告警对拍通过；verify 差异报告格式正确 |
 | 状态 | **已完成** — `inject_gen.rs` rule-aware 生成 + `oracle/` Reference Evaluator + `verify/` 贪心配对报告 + `verify` CLI 子命令，60 项测试通过 |
 
 ### M33：wfgen P2 — 时序扰动 + 压测 ✅

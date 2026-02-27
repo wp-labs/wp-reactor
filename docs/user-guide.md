@@ -1662,17 +1662,34 @@ faults {
 wfgen gen \
     --scenario tests/brute_force_load.wfg \
     --format jsonl \
-    --out out/
+    --out out/ \
+    --send \
+    --addr 127.0.0.1:9800
 
 # 一致性校验
 wfgen lint tests/brute_force_load.wfg
+
+# 已有 JSONL 数据时也可单独发送（可选）
+wfgen send \
+  --scenario tests/brute_force_load.wfg \
+  --input out/brute_force_load.jsonl \
+  --addr 127.0.0.1:9800
 
 # 对拍验证
 wfgen verify \
     --actual out/actual_alerts.jsonl \
     --expected out/brute_force_load.oracle.jsonl \
     --meta out/brute_force_load.oracle.meta.json
+
+# 端到端持续压测（持续生成并发送 5 分钟）
+wfgen bench \
+    --scenario tests/brute_force_load.wfg \
+    --duration 5m \
+    --send \
+    --addr 127.0.0.1:9800
 ```
+
+说明：`wfgen gen --send` / `wfgen bench --send` 需要目标 `wfusion` 已在对应 `--addr` 上监听。
 
 ### 10.6 wfgen + wfusion 联合验证
 
@@ -1700,21 +1717,20 @@ cargo test -p wf-runtime e2e_datagen_brute_force -- --nocapture
 **方式 B：手工分步（适合调试）**
 
 ```bash
-# 1) 生成事件与 oracle
+# 1) 启动 runtime（另一个终端）
+wfusion run --config examples/wfusion.toml --metrics --metrics-interval 2s
+
+# 2) 生成事件与 oracle，并直接发送到 wfusion（推荐）
 wfgen gen \
   --scenario examples/count/scenarios/brute_force.wfg \
   --format jsonl \
-  --out out/
+  --out out/ \
+  --send \
+  --addr 127.0.0.1:9800
 
-# 2) 启动 runtime（另一个终端）
-wfusion run --config examples/fusion.toml --metrics --metrics-interval 2s
-
-# 3) 通过 TCP + Arrow IPC 发送事件到 wfusion
-#    （可用 wp-motor Arrow IPC sink，或自定义 sender）
-
-# 4) 对拍
+# 3) 对拍
 wfgen verify \
-  --actual out/actual_alerts.jsonl \
+  --actual examples/alerts/all.jsonl \
   --expected out/brute_force_detect.oracle.jsonl \
   --meta out/brute_force_detect.oracle.meta.json \
   --format markdown

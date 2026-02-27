@@ -36,4 +36,4 @@ level = "info"
 format = "plain"
 file = "logs/wf-engine.log"
 [logging.modules]
-"wf_runtime::receiver" = "debug"
+"wf_runtime::receiver" = "info"

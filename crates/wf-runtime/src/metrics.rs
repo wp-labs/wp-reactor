@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -71,6 +71,91 @@ struct HistogramSnapshot {
     sum_seconds: f64,
 }
 
+#[derive(Clone, Copy)]
+struct IntervalRates {
+    row_s: f64,
+    late_s: f64,
+    rules_s: f64,
+    sm_s: f64,
+    out_s: f64,
+    memory_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct IntervalSnapshot {
+    at: Instant,
+    rx_rows: u64,
+    dropped_late: u64,
+    rule_matches: u64,
+    rule_instances: u64,
+    alert_dispatch: u64,
+    window_bytes: u64,
+}
+
+#[derive(Default)]
+struct RunSummary {
+    interval_count: u64,
+    sum_row_s: f64,
+    sum_late_s: f64,
+    sum_rules_s: f64,
+    sum_sm_s: f64,
+    sum_out_s: f64,
+    sum_memory_bytes: f64,
+    max_row_s: f64,
+    max_late_s: f64,
+    max_rules_s: f64,
+    max_sm_s: f64,
+    max_out_s: f64,
+    max_memory_bytes: u64,
+}
+
+impl RunSummary {
+    fn observe(&mut self, rates: IntervalRates) {
+        self.interval_count += 1;
+        self.sum_row_s += rates.row_s;
+        self.sum_late_s += rates.late_s;
+        self.sum_rules_s += rates.rules_s;
+        self.sum_sm_s += rates.sm_s;
+        self.sum_out_s += rates.out_s;
+        self.sum_memory_bytes += rates.memory_bytes as f64;
+
+        self.max_row_s = self.max_row_s.max(rates.row_s);
+        self.max_late_s = self.max_late_s.max(rates.late_s);
+        self.max_rules_s = self.max_rules_s.max(rates.rules_s);
+        self.max_sm_s = self.max_sm_s.max(rates.sm_s);
+        self.max_out_s = self.max_out_s.max(rates.out_s);
+        self.max_memory_bytes = self.max_memory_bytes.max(rates.memory_bytes);
+    }
+
+    fn table(&self) -> Option<String> {
+        if self.interval_count == 0 {
+            return None;
+        }
+        let n = self.interval_count as f64;
+        let avg_row_s = self.sum_row_s / n;
+        let avg_late_s = self.sum_late_s / n;
+        let avg_rules_s = self.sum_rules_s / n;
+        let avg_sm_s = self.sum_sm_s / n;
+        let avg_out_s = self.sum_out_s / n;
+        let avg_mem = format_bytes((self.sum_memory_bytes / n).round() as u64);
+        let max_mem = format_bytes(self.max_memory_bytes);
+
+        Some(format!(
+            "\n+---------+-----------+-----------+-----------+-----------+-------------+-----------+\n\
+             | stat    | row/s     | late/s    | rules/s   | sm/s      | memory      | out/s     |\n\
+             +---------+-----------+-----------+-----------+-----------+-------------+-----------+\n\
+             | avg     | {avg_row_s:>9.1} | {avg_late_s:>9.1} | {avg_rules_s:>9.1} | {avg_sm_s:>9.1} | {avg_mem:>11} | {avg_out_s:>9.1} |\n\
+             | max     | {max_row_s:>9.1} | {max_late_s:>9.1} | {max_rules_s:>9.1} | {max_sm_s:>9.1} | {max_mem:>11} | {max_out_s:>9.1} |\n\
+             +---------+-----------+-----------+-----------+-----------+-------------+-----------+",
+            max_row_s = self.max_row_s,
+            max_late_s = self.max_late_s,
+            max_rules_s = self.max_rules_s,
+            max_sm_s = self.max_sm_s,
+            max_out_s = self.max_out_s,
+        ))
+    }
+}
+
 /// Shared runtime metrics store.
 ///
 /// Counters are lock-free atomics. Label sets (`rule`, `window`) are fixed at
@@ -113,6 +198,79 @@ pub struct RuntimeMetrics {
 }
 
 impl RuntimeMetrics {
+    fn total_rule_matches(&self) -> u64 {
+        self.rule_matches_total
+            .values()
+            .map(|v| v.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn total_rule_instances(&self) -> u64 {
+        self.rule_instances
+            .values()
+            .map(|v| v.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn total_alert_dispatch(&self) -> u64 {
+        self.alert_dispatch_total.load(Ordering::Relaxed)
+    }
+
+    fn total_window_bytes(&self) -> u64 {
+        self.window_memory_bytes
+            .values()
+            .map(|v| v.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn interval_snapshot(&self, at: Instant) -> IntervalSnapshot {
+        IntervalSnapshot {
+            at,
+            rx_rows: self.receiver_rows_total.load(Ordering::Relaxed),
+            dropped_late: self.router_dropped_late_total.load(Ordering::Relaxed),
+            rule_matches: self.total_rule_matches(),
+            rule_instances: self.total_rule_instances(),
+            alert_dispatch: self.total_alert_dispatch(),
+            window_bytes: self.total_window_bytes(),
+        }
+    }
+
+    fn interval_rates(
+        &self,
+        prev: IntervalSnapshot,
+        curr: IntervalSnapshot,
+    ) -> Option<IntervalRates> {
+        let secs = (curr.at - prev.at).as_secs_f64();
+        if secs <= 0.0 {
+            return None;
+        }
+
+        Some(IntervalRates {
+            row_s: curr.rx_rows.saturating_sub(prev.rx_rows) as f64 / secs,
+            late_s: curr.dropped_late.saturating_sub(prev.dropped_late) as f64 / secs,
+            rules_s: curr.rule_matches.saturating_sub(prev.rule_matches) as f64 / secs,
+            sm_s: (curr.rule_instances as f64 - prev.rule_instances as f64) / secs,
+            out_s: curr.alert_dispatch.saturating_sub(prev.alert_dispatch) as f64 / secs,
+            memory_bytes: curr.window_bytes,
+        })
+    }
+
+    fn interval_table(&self, rates: IntervalRates) -> String {
+        let mem = format_bytes(rates.memory_bytes);
+        format!(
+            "\n+-----------+-----------+-----------+-----------+-------------+-----------+\n\
+             | row/s     | late/s    | rules/s   | sm/s      | memory      | out/s     |\n\
+             +-----------+-----------+-----------+-----------+-------------+-----------+\n\
+             | {row_s:>9.1} | {late_s:>9.1} | {rules_s:>9.1} | {sm_s:>9.1} | {mem:>11} | {out_s:>9.1} |\n\
+             +-----------+-----------+-----------+-----------+-------------+-----------+",
+            row_s = rates.row_s,
+            late_s = rates.late_s,
+            rules_s = rates.rules_s,
+            sm_s = rates.sm_s,
+            out_s = rates.out_s,
+        )
+    }
+
     pub fn new(rule_names: &[String], window_names: &[String]) -> Self {
         let make_rule_map = || {
             rule_names
@@ -630,26 +788,33 @@ impl RuntimeMetrics {
     }
 
     fn summary_line(&self) -> String {
-        let total_window_bytes: u64 = self
-            .window_memory_bytes
-            .values()
-            .map(|v| v.load(Ordering::Relaxed))
-            .sum();
         format!(
             "rx_rows={} routed={} dropped_late={} matches={} alerts={} window_bytes={}",
             self.receiver_rows_total.load(Ordering::Relaxed),
             self.router_delivered_total.load(Ordering::Relaxed),
             self.router_dropped_late_total.load(Ordering::Relaxed),
-            self.rule_matches_total
-                .values()
-                .map(|v| v.load(Ordering::Relaxed))
-                .sum::<u64>(),
+            self.total_rule_matches(),
             self.alert_emitted_total
                 .values()
                 .map(|v| v.load(Ordering::Relaxed))
                 .sum::<u64>(),
-            total_window_bytes
+            self.total_window_bytes()
         )
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut idx = 0usize;
+    while value >= 1024.0 && idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        idx += 1;
+    }
+    if idx == 0 {
+        format!("{}{}", bytes, UNITS[idx])
+    } else {
+        format!("{value:.1}{}", UNITS[idx])
     }
 }
 
@@ -695,12 +860,22 @@ pub async fn run_metrics_task(
 
     metrics.sample_windows(&router);
     let mut tick = tokio::time::interval(config.report_interval.as_duration());
+    tick.tick().await;
+    let task_started = Instant::now();
+    let mut prev = metrics.interval_snapshot(Instant::now());
+    let mut run_summary = RunSummary::default();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tick.tick() => {
                 metrics.sample_windows(&router);
                 wf_info!(res, summary = %metrics.summary_line(), "metrics snapshot");
+                let curr = metrics.interval_snapshot(Instant::now());
+                if let Some(rates) = metrics.interval_rates(prev, curr) {
+                    run_summary.observe(rates);
+                    wf_info!(res, "{}", metrics.interval_table(rates));
+                }
+                prev = curr;
             }
             result = listener.accept() => {
                 let (stream, _) = result?;
@@ -712,6 +887,23 @@ pub async fn run_metrics_task(
                 });
             }
         }
+    }
+
+    // Include the last partial interval before shutdown in final stats.
+    metrics.sample_windows(&router);
+    let final_snap = metrics.interval_snapshot(Instant::now());
+    if let Some(rates) = metrics.interval_rates(prev, final_snap) {
+        run_summary.observe(rates);
+    }
+
+    if let Some(table) = run_summary.table() {
+        wf_info!(
+            res,
+            runtime = ?task_started.elapsed(),
+            intervals = run_summary.interval_count,
+            "{}",
+            table
+        );
     }
     Ok(())
 }

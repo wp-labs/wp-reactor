@@ -8,12 +8,15 @@ use wfgen::loader::load_from_uses;
 use wfgen::wfg_parser::parse_wfg;
 
 use crate::cmd_helpers::{load_wfl_files, load_ws_files};
+use crate::tcp_send::send_events;
 
 pub(crate) fn run(
     scenario: PathBuf,
     ws: Vec<PathBuf>,
     wfl: Vec<PathBuf>,
     bench_duration: Option<String>,
+    send: bool,
+    addr: String,
 ) -> anyhow::Result<()> {
     let wfg_content = std::fs::read_to_string(&scenario).context("reading .wfg file")?;
     let wfg = parse_wfg(&wfg_content).context("parsing .wfg file")?;
@@ -43,9 +46,13 @@ pub(crate) fn run(
             let wall_start = std::time::Instant::now();
             let mut iterations: u64 = 0;
             let mut total_events: u64 = 0;
+            let mut total_frames: u64 = 0;
 
             while wall_start.elapsed() < target_dur {
                 let result = generate(&wfg, &schemas, &rule_plans)?;
+                if send {
+                    total_frames += send_events(&result.events, &schemas, &addr)? as u64;
+                }
                 total_events += result.events.len() as u64;
                 iterations += 1;
             }
@@ -60,6 +67,9 @@ pub(crate) fn run(
 
             println!("Iterations: {}", iterations);
             println!("Events:     {}", total_events);
+            if send {
+                println!("Frames:     {}", total_frames);
+            }
             println!("Duration:   {:.3}s", secs);
             println!("Throughput: {:.0} events/sec", eps);
         }
@@ -67,6 +77,11 @@ pub(crate) fn run(
             // Single-shot bench (original behavior)
             let start = std::time::Instant::now();
             let result = generate(&wfg, &schemas, &rule_plans)?;
+            let sent_frames = if send {
+                Some(send_events(&result.events, &schemas, &addr)?)
+            } else {
+                None
+            };
             let elapsed = start.elapsed();
 
             let events = result.events.len();
@@ -78,6 +93,9 @@ pub(crate) fn run(
             };
 
             println!("Events:     {}", events);
+            if let Some(frames) = sent_frames {
+                println!("Frames:     {}", frames);
+            }
             println!("Duration:   {:.3}s", secs);
             println!("Throughput: {:.0} events/sec", eps);
         }
