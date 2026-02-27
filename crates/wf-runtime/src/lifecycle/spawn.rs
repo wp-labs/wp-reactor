@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use orion_error::prelude::*;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -170,24 +171,27 @@ pub(super) async fn spawn_receiver_task(
     Ok((listen_addr, group))
 }
 
-pub(super) fn spawn_metrics_task(
+pub(super) async fn spawn_metrics_task(
     config: &FusionConfig,
     router: &Arc<Router>,
     cancel: CancellationToken,
     metrics: Option<Arc<RuntimeMetrics>>,
-) -> TaskGroup {
+) -> RuntimeResult<TaskGroup> {
     let mut group = TaskGroup::new("metrics");
     if !config.metrics.enabled {
-        return group;
+        return Ok(group);
     }
     let Some(metrics) = metrics else {
-        return group;
+        return Ok(group);
     };
+    let listener = TcpListener::bind(&config.metrics.prometheus_listen)
+        .await
+        .owe_sys()?;
     let router = Arc::clone(router);
     let metrics_config = config.metrics.clone();
     group.push(tokio::spawn(async move {
-        run_metrics_task(metrics, metrics_config, router, cancel).await?;
+        run_metrics_task(metrics, metrics_config, listener, router, cancel).await?;
         Ok(())
     }));
-    group
+    Ok(group)
 }

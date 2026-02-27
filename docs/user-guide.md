@@ -1674,17 +1674,53 @@ wfgen verify \
     --meta out/brute_force_load.oracle.meta.json
 ```
 
-### 10.6 端到端流程
+### 10.6 wfgen + wfusion 联合验证
 
+`wfusion` 当前是 TCP + Arrow IPC 接入模式，没有 `--replay` 命令。  
+推荐使用下面两种方式做联合验证：
+
+**方式 A（推荐）：直接跑仓库内置 e2e 用例**
+
+```bash
+cargo test -p wf-runtime e2e_datagen_brute_force -- --nocapture
 ```
-.wfg + .wfs + .wfl
-       │
-  wfgen gen           → events.jsonl + oracle.jsonl
-       │
-  wfusion run --replay  → actual_alerts.jsonl
-       │
-  wfgen verify        → verify_report.json
+
+该用例会自动完成：
+
+1. 加载 `.wfg` 场景并生成事件（wfgen）
+2. 启动 `wfusion` runtime
+3. 通过 TCP 发送 Arrow IPC 数据到 runtime
+4. 将实际告警与 oracle 对拍（verify）
+
+产物目录：
+
+- `target/test-artifacts/e2e_datagen/alerts/all.jsonl`
+- `target/test-artifacts/e2e_datagen/verify_report.md`
+
+**方式 B：手工分步（适合调试）**
+
+```bash
+# 1) 生成事件与 oracle
+wfgen gen \
+  --scenario examples/count/scenarios/brute_force.wfg \
+  --format jsonl \
+  --out out/
+
+# 2) 启动 runtime（另一个终端）
+wfusion run --config examples/fusion.toml --metrics --metrics-interval 2s
+
+# 3) 通过 TCP + Arrow IPC 发送事件到 wfusion
+#    （可用 wp-motor Arrow IPC sink，或自定义 sender）
+
+# 4) 对拍
+wfgen verify \
+  --actual out/actual_alerts.jsonl \
+  --expected out/brute_force_detect.oracle.jsonl \
+  --meta out/brute_force_detect.oracle.meta.json \
+  --format markdown
 ```
+
+其中 `--actual` 路径应指向你在 `sinks/` 中配置的告警输出 JSONL 文件。
 
 ---
 

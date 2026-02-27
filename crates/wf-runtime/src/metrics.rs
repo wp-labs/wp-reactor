@@ -1,11 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use wf_config::MetricsConfig;
@@ -315,60 +316,72 @@ impl RuntimeMetrics {
 
     fn render_prometheus(&self) -> String {
         let mut out = String::with_capacity(16 * 1024);
+        let mut rendered_types = BTreeSet::new();
 
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_receiver_connections_total",
             self.receiver_connections_total.load(Ordering::Relaxed),
         );
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_receiver_frames_total",
             self.receiver_frames_total.load(Ordering::Relaxed),
         );
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_receiver_rows_total",
             self.receiver_rows_total.load(Ordering::Relaxed),
         );
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_receiver_decode_errors_total",
             self.receiver_decode_errors_total.load(Ordering::Relaxed),
         );
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_receiver_read_errors_total",
             self.receiver_read_errors_total.load(Ordering::Relaxed),
         );
         self.render_histogram(
             &mut out,
+            &mut rendered_types,
             "wf_receiver_decode_seconds",
             &self.receiver_decode_seconds,
         );
 
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_router_route_calls_total",
             self.router_route_calls_total.load(Ordering::Relaxed),
         );
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_router_delivered_total",
             self.router_delivered_total.load(Ordering::Relaxed),
         );
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_router_dropped_late_total",
             self.router_dropped_late_total.load(Ordering::Relaxed),
         );
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_router_skipped_non_local_total",
             self.router_skipped_non_local_total.load(Ordering::Relaxed),
         );
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_router_route_errors_total",
             self.router_route_errors_total.load(Ordering::Relaxed),
         );
@@ -376,6 +389,7 @@ impl RuntimeMetrics {
         for (rule, value) in &self.rule_events_total {
             self.render_counter_labeled(
                 &mut out,
+                &mut rendered_types,
                 "wf_rule_events_total",
                 &[("rule", rule)],
                 value.load(Ordering::Relaxed),
@@ -384,6 +398,7 @@ impl RuntimeMetrics {
         for (rule, value) in &self.rule_matches_total {
             self.render_counter_labeled(
                 &mut out,
+                &mut rendered_types,
                 "wf_rule_matches_total",
                 &[("rule", rule)],
                 value.load(Ordering::Relaxed),
@@ -392,6 +407,7 @@ impl RuntimeMetrics {
         for (rule, value) in &self.rule_instances {
             self.render_gauge_labeled(
                 &mut out,
+                &mut rendered_types,
                 "wf_rule_instances",
                 &[("rule", rule)],
                 value.load(Ordering::Relaxed),
@@ -401,6 +417,7 @@ impl RuntimeMetrics {
             for (window, value) in by_window {
                 self.render_counter_labeled(
                     &mut out,
+                    &mut rendered_types,
                     "wf_rule_cursor_gap_total",
                     &[("rule", rule), ("window", window)],
                     value.load(Ordering::Relaxed),
@@ -411,6 +428,7 @@ impl RuntimeMetrics {
         for (rule, value) in &self.alert_emitted_total {
             self.render_counter_labeled(
                 &mut out,
+                &mut rendered_types,
                 "wf_alert_emitted_total",
                 &[("rule", rule)],
                 value.load(Ordering::Relaxed),
@@ -418,37 +436,44 @@ impl RuntimeMetrics {
         }
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_alert_channel_send_failed_total",
             self.alert_channel_send_failed_total.load(Ordering::Relaxed),
         );
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_alert_serialize_failed_total",
             self.alert_serialize_failed_total.load(Ordering::Relaxed),
         );
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_alert_dispatch_total",
             self.alert_dispatch_total.load(Ordering::Relaxed),
         );
         self.render_histogram(
             &mut out,
+            &mut rendered_types,
             "wf_alert_dispatch_seconds",
             &self.alert_dispatch_seconds,
         );
 
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_evictor_sweeps_total",
             self.evictor_sweeps_total.load(Ordering::Relaxed),
         );
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_evictor_time_evicted_total",
             self.evictor_time_evicted_total.load(Ordering::Relaxed),
         );
         self.render_counter(
             &mut out,
+            &mut rendered_types,
             "wf_evictor_memory_evicted_total",
             self.evictor_memory_evicted_total.load(Ordering::Relaxed),
         );
@@ -456,6 +481,7 @@ impl RuntimeMetrics {
         for (rule, histogram) in &self.rule_scan_timeout_seconds {
             self.render_histogram_labeled(
                 &mut out,
+                &mut rendered_types,
                 "wf_rule_scan_timeout_seconds",
                 &[("rule", rule)],
                 histogram,
@@ -464,6 +490,7 @@ impl RuntimeMetrics {
         for (rule, histogram) in &self.rule_flush_seconds {
             self.render_histogram_labeled(
                 &mut out,
+                &mut rendered_types,
                 "wf_rule_flush_seconds",
                 &[("rule", rule)],
                 histogram,
@@ -473,6 +500,7 @@ impl RuntimeMetrics {
         for (window, value) in &self.window_memory_bytes {
             self.render_gauge_labeled(
                 &mut out,
+                &mut rendered_types,
                 "wf_window_memory_bytes",
                 &[("window", window)],
                 value.load(Ordering::Relaxed),
@@ -481,6 +509,7 @@ impl RuntimeMetrics {
         for (window, value) in &self.window_rows {
             self.render_gauge_labeled(
                 &mut out,
+                &mut rendered_types,
                 "wf_window_rows",
                 &[("window", window)],
                 value.load(Ordering::Relaxed),
@@ -489,6 +518,7 @@ impl RuntimeMetrics {
         for (window, value) in &self.window_batches {
             self.render_gauge_labeled(
                 &mut out,
+                &mut rendered_types,
                 "wf_window_batches",
                 &[("window", window)],
                 value.load(Ordering::Relaxed),
@@ -498,46 +528,61 @@ impl RuntimeMetrics {
         out
     }
 
-    fn render_counter(&self, out: &mut String, name: &str, value: u64) {
-        let _ = writeln!(out, "# TYPE {name} counter");
+    fn render_counter(
+        &self,
+        out: &mut String,
+        rendered_types: &mut BTreeSet<String>,
+        name: &str,
+        value: u64,
+    ) {
+        self.render_type_once(out, rendered_types, name, "counter");
         let _ = writeln!(out, "{name} {value}");
     }
 
     fn render_gauge_labeled(
         &self,
         out: &mut String,
+        rendered_types: &mut BTreeSet<String>,
         name: &str,
         labels: &[(&str, &str)],
         value: u64,
     ) {
-        let _ = writeln!(out, "# TYPE {name} gauge");
+        self.render_type_once(out, rendered_types, name, "gauge");
         let _ = writeln!(out, "{name}{} {value}", format_labels(labels));
     }
 
     fn render_counter_labeled(
         &self,
         out: &mut String,
+        rendered_types: &mut BTreeSet<String>,
         name: &str,
         labels: &[(&str, &str)],
         value: u64,
     ) {
-        let _ = writeln!(out, "# TYPE {name} counter");
+        self.render_type_once(out, rendered_types, name, "counter");
         let _ = writeln!(out, "{name}{} {value}", format_labels(labels));
     }
 
-    fn render_histogram(&self, out: &mut String, name: &str, histogram: &Histogram) {
-        self.render_histogram_labeled(out, name, &[], histogram);
+    fn render_histogram(
+        &self,
+        out: &mut String,
+        rendered_types: &mut BTreeSet<String>,
+        name: &str,
+        histogram: &Histogram,
+    ) {
+        self.render_histogram_labeled(out, rendered_types, name, &[], histogram);
     }
 
     fn render_histogram_labeled(
         &self,
         out: &mut String,
+        rendered_types: &mut BTreeSet<String>,
         name: &str,
         labels: &[(&str, &str)],
         histogram: &Histogram,
     ) {
         let snapshot = histogram.snapshot();
-        let _ = writeln!(out, "# TYPE {name} histogram");
+        self.render_type_once(out, rendered_types, name, "histogram");
         let mut cumulative = 0u64;
         for (idx, upper_bound_nanos) in snapshot.upper_bounds_nanos.iter().enumerate() {
             cumulative = cumulative.saturating_add(snapshot.bucket_counts[idx]);
@@ -570,6 +615,18 @@ impl RuntimeMetrics {
             snapshot.sum_seconds
         );
         let _ = writeln!(out, "{name}_count{} {}", format_labels(labels), cumulative);
+    }
+
+    fn render_type_once(
+        &self,
+        out: &mut String,
+        rendered_types: &mut BTreeSet<String>,
+        name: &str,
+        kind: &str,
+    ) {
+        if rendered_types.insert(name.to_string()) {
+            let _ = writeln!(out, "# TYPE {name} {kind}");
+        }
     }
 
     fn summary_line(&self) -> String {
@@ -625,10 +682,10 @@ fn format_labels(labels: &[(&str, &str)]) -> String {
 pub async fn run_metrics_task(
     metrics: Arc<RuntimeMetrics>,
     config: MetricsConfig,
+    listener: TcpListener,
     router: Arc<Router>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(&config.prometheus_listen).await?;
     wf_info!(
         sys,
         listen = %config.prometheus_listen,
@@ -646,28 +703,52 @@ pub async fn run_metrics_task(
                 wf_info!(res, summary = %metrics.summary_line(), "metrics snapshot");
             }
             result = listener.accept() => {
-                let (mut stream, _) = result?;
-                let body = metrics.render_prometheus();
-                let mut req_buf = [0u8; 512];
-                let req_n = stream.read(&mut req_buf).await.unwrap_or(0);
-                let is_metrics = req_n > 0
-                    && std::str::from_utf8(&req_buf[..req_n]).unwrap_or("").starts_with("GET /metrics");
-                if is_metrics {
-                    let header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    stream.write_all(header.as_bytes()).await?;
-                    stream.write_all(body.as_bytes()).await?;
-                } else {
-                    stream
-                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                        .await?;
-                }
-                stream.shutdown().await?;
+                let (stream, _) = result?;
+                let metrics = Arc::clone(&metrics);
+                tokio::spawn(async move {
+                    if let Err(e) = serve_metrics_connection(stream, metrics).await {
+                        wf_debug!(sys, error = %e, "metrics connection handling failed");
+                    }
+                });
             }
         }
     }
+    Ok(())
+}
+
+async fn serve_metrics_connection(
+    mut stream: TcpStream,
+    metrics: Arc<RuntimeMetrics>,
+) -> anyhow::Result<()> {
+    let mut req_buf = [0u8; 512];
+    let req_n = match timeout(Duration::from_secs(2), stream.read(&mut req_buf)).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Ok(()),
+    };
+    let is_metrics = req_n > 0
+        && std::str::from_utf8(&req_buf[..req_n])
+            .unwrap_or("")
+            .starts_with("GET /metrics");
+
+    if is_metrics {
+        let body = metrics.render_prometheus();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        timeout(Duration::from_secs(2), stream.write_all(header.as_bytes())).await??;
+        timeout(Duration::from_secs(2), stream.write_all(body.as_bytes())).await??;
+    } else {
+        timeout(
+            Duration::from_secs(2),
+            stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ),
+        )
+        .await??;
+    }
+    let _ = timeout(Duration::from_secs(1), stream.shutdown()).await;
     Ok(())
 }
 
@@ -680,4 +761,41 @@ pub fn maybe_build_metrics(
         return None;
     }
     Some(Arc::new(RuntimeMetrics::new(rule_names, window_names)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
+    }
+
+    #[test]
+    fn renders_type_line_once_per_metric_family() {
+        let metrics = RuntimeMetrics::new(
+            &["r1".to_string(), "r2".to_string()],
+            &["w1".to_string(), "w2".to_string()],
+        );
+        let text = metrics.render_prometheus();
+        assert_eq!(
+            count_occurrences(&text, "# TYPE wf_rule_events_total counter"),
+            1
+        );
+        assert_eq!(count_occurrences(&text, "# TYPE wf_window_rows gauge"), 1);
+        assert_eq!(
+            count_occurrences(&text, "# TYPE wf_rule_flush_seconds histogram"),
+            1
+        );
+    }
+
+    #[test]
+    fn histogram_count_matches_inf_bucket() {
+        let metrics = RuntimeMetrics::new(&["r1".to_string()], &["w1".to_string()]);
+        metrics.observe_receiver_decode(Duration::from_millis(3));
+        metrics.observe_receiver_decode(Duration::from_millis(7));
+        let text = metrics.render_prometheus();
+        assert!(text.contains("wf_receiver_decode_seconds_bucket{le=\"+Inf\"} 2"));
+        assert!(text.contains("wf_receiver_decode_seconds_count 2"));
+    }
 }

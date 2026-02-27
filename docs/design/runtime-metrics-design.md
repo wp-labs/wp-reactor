@@ -31,7 +31,7 @@
 
 - `wf_rule_scan_timeout_seconds{rule}`（Histogram）
 - `wf_rule_flush_seconds{rule}`（Histogram）
-- `wf_alert_dispatch_seconds{target}`（Histogram）
+- `wf_alert_dispatch_seconds`（Histogram）
 - `wf_receiver_decode_seconds`（Histogram）
 
 > 说明：第一阶段不做“每条事件端到端 latency”精确跟踪，避免高开销与高基数。

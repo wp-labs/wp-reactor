@@ -110,12 +110,8 @@ impl Reactor {
         )
         .await?;
         groups.push(receiver_group);
-        groups.push(spawn_metrics_task(
-            &config,
-            &data.router,
-            cancel.child_token(),
-            metrics,
-        ));
+        groups
+            .push(spawn_metrics_task(&config, &data.router, cancel.child_token(), metrics).await?);
 
         op.mark_suc();
         Ok(Self {
