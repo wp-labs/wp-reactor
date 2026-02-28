@@ -1568,20 +1568,26 @@ scenario brute_force_load seed 42 {
     total 200000
 
     // 基础流量
-    stream fail : auth_events 200/s {
+    stream fail from auth_events rate 200/s {
         sip    = ipv4(500)
         action = "failed"
     }
 
-    stream success : auth_events 400/s {
+    stream success from auth_events rate 400/s {
         sip    = ipv4(500)
         action = "success"
     }
 
     // 模式注入
     inject for brute_force on [fail] {
-        hit       5%  count_per_entity=5 within=2m;
-        near_miss 3%  count_per_entity=2 within=2m;
+        hit 5% {
+            count_per_entity = 5;
+            within = 2m;
+        };
+        near_miss 3% {
+            count_per_entity = 2;
+            within = 2m;
+        };
     }
 
     // 时序扰动
@@ -1600,15 +1606,71 @@ scenario brute_force_load seed 42 {
 }
 ```
 
-### 10.2 stream — 流定义
+### 10.1.1 新 DSL（方案 3，vNext）
+
+> 说明：这是新系统语法，不兼容旧 `.wfg`。目标是“规则映射显式 + 写法简洁”。
 
 ```wfg
-stream <别名> : <window名> <速率> {
+use "schemas/security.wfs"
+use "rules/brute_force.wfl"
+
+#[duration=30m]
+scenario brute_force_detect<seed=42> {
+
+  traffic {
+    stream auth_events gen 100/s
+    stream auth_events gen wave(base=80/s, amp=40/s, period=5m, shape=sine)
+  }
+
+  injection {
+    hit<30%> auth_events {
+      user seq {
+        use(login="failed") with(3,2m)
+        use(action="port_scan") with(1,1m)
+      }
+    }
+
+    near_miss<10%> auth_events {
+      user seq {
+        use(login="failed") with(2,2m)
+      }
+    }
+
+    miss<60%> auth_events {
+      user seq {
+        use(login="success") with(1,30s)
+      }
+    }
+  }
+
+  expect {
+    hit(brute_force_then_scan) >= 95%
+    near_miss(brute_force_then_scan) <= 1%
+    miss(brute_force_then_scan) <= 0.1%
+  }
+}
+```
+
+语义约定：
+
+示例文件：`examples/count/scenarios/brute_force_vnext.wfg`（设计草案）。
+
+- 只支持 `//` 注释，`#` 不作为注释；`#[]` 是元信息注解。
+- 生成是 `stream` 级别；窗口约束由 `.wfs/.wfl` 推导，不在场景中重复声明 `window/alias`。
+- `hit<30%> / near_miss<10%> / miss<60%>`：标签由关键字表达，仅显式声明占比。
+- `user seq` 显式按实体键串联步骤；`use(...) with(count,window)` 必须写清字段条件与计数窗口。
+- 多条 `use(...)` 默认按顺序生效：后一条发生在前一条之后。
+
+### 10.2 stream — 流定义（旧语法）
+
+```wfg
+stream <别名> from <window名> rate <速率> {
     <字段> = <生成表达式>
     ...
 }
 ```
 
+- 兼容旧写法：`stream <别名> : <window名> <速率>`.
 - `别名` 必须对应 `.wfl` 规则中 `events` 的别名。
 - `window名` 必须与规则中该别名绑定的 window 一致。
 - `速率` 格式：`N/s`、`N/m`、`N/h`。
@@ -1626,15 +1688,20 @@ stream <别名> : <window名> <速率> {
 
 未声明的字段按类型默认策略随机生成。
 
-### 10.3 inject — 模式注入
+### 10.3 inject — 模式注入（旧语法）
 
 ```wfg
 inject for <规则名> on [<流别名>, ...] {
-    hit       <百分比>  <参数>=<值> ...;
-    near_miss <百分比>  <参数>=<值> ...;
-    non_hit   <百分比>  <参数>=<值> ...;
+    hit <百分比> {
+        <参数>=<值>;
+        ...
+    };
+    near_miss <百分比> <参数>=<值> ...;
+    non_hit   <百分比> <参数>=<值> ...;
 }
 ```
+
+- 推荐块状参数写法（可读性更强）；同时兼容内联参数写法。
 
 | 模式 | 语义 | 期望输出 |
 |------|------|----------|
@@ -1642,7 +1709,7 @@ inject for <规则名> on [<流别名>, ...] {
 | `near_miss` | 构造"接近但不命中"事件序列 | 不应出现告警 |
 | `non_hit` | 无关事件 | 不应出现告警 |
 
-### 10.4 faults — 时序扰动
+### 10.4 faults — 时序扰动（旧语法）
 
 ```wfg
 faults {

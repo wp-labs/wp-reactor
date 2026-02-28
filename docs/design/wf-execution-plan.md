@@ -373,7 +373,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 
 ## 支撑轨道：测试数据生成（M31–M33）
 
-> 详细设计见 [wfl-desion.md §18](wfl-desion.md)。各阶段穿插在其依赖就绪的最早时机，可与其他阶段并行推进。
+> 详细设计见 [wfg-design.md](wfg-design.md)。各阶段穿插在其依赖就绪的最早时机，可与其他阶段并行推进。
 
 ### M31：wfgen P0 — .wfg Parser + Schema 驱动随机生成 ✅
 
@@ -508,5 +508,5 @@ M20 MVP 已完成，下一步两条路径可并行推进：
 - WFL v2.1 设计方案 → [wfl-desion.md](wfl-desion.md)
 - WFL 与主流 DSL 对比分析 → [wfl-dsl-comparison.md](wfl-dsl-comparison.md)
 - 运行时指标与统计设计（评审草案）→ [runtime-metrics-design.md](runtime-metrics-design.md)
-- wfgen 测试数据生成方案 → [wfl-desion.md §18](wfl-desion.md)
+- wfgen 测试数据生成方案 → [wfg-design.md](wfg-design.md)
 - 后续提案（P1/P2） → [wfl-desion.md §17](wfl-desion.md)

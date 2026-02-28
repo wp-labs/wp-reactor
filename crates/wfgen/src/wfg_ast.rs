@@ -80,7 +80,11 @@ impl Rate {
 // Stream
 // ---------------------------------------------------------------------------
 
-/// `stream ALIAS : WINDOW RATE { field_override* }`
+/// Stream declaration.
+///
+/// Supported forms:
+/// - `stream ALIAS : WINDOW RATE { field_override* }` (legacy)
+/// - `stream ALIAS from WINDOW rate RATE { field_override* }` (readable)
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct StreamBlock {
@@ -144,7 +148,11 @@ pub struct InjectBlock {
     pub lines: Vec<InjectLine>,
 }
 
-/// `MODE PERCENT% { param_assigns }`
+/// Inject line.
+///
+/// Supported forms:
+/// - inline params: `MODE PERCENT% key=value key2=value2;`
+/// - block params: `MODE PERCENT% { key=value; key2=value2; };`
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct InjectLine {

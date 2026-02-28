@@ -17,11 +17,16 @@ pub(super) fn stream_block(input: &mut &str) -> ModalResult<StreamBlock> {
     ws_skip(input)?;
     let alias = ident(input)?.to_string();
     ws_skip(input)?;
-    cut_err(literal(":"))
-        .context(StrContext::Expected(StrContextValue::Description(
-            "colon after stream alias",
-        )))
-        .parse_next(input)?;
+    // Backward-compatible separators:
+    // - legacy: `stream alias : window 100/s`
+    // - readable: `stream alias from window rate 100/s`
+    if opt(literal(":")).parse_next(input)?.is_none() {
+        cut_err(wf_lang::parse_utils::kw("from"))
+            .context(StrContext::Expected(StrContextValue::Description(
+                "':' or 'from' after stream alias",
+            )))
+            .parse_next(input)?;
+    }
     ws_skip(input)?;
     let window = cut_err(ident)
         .context(StrContext::Expected(StrContextValue::Description(
@@ -30,6 +35,13 @@ pub(super) fn stream_block(input: &mut &str) -> ModalResult<StreamBlock> {
         .parse_next(input)?
         .to_string();
     ws_skip(input)?;
+    // Optional readability keyword: `rate`.
+    if opt(wf_lang::parse_utils::kw("rate"))
+        .parse_next(input)?
+        .is_some()
+    {
+        ws_skip(input)?;
+    }
     let r = cut_err(rate)
         .context(StrContext::Expected(StrContextValue::Description("rate")))
         .parse_next(input)?;

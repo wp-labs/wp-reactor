@@ -94,6 +94,26 @@ scenario override_test seed 99 {
 }
 
 #[test]
+fn test_stream_readable_syntax() {
+    let input = r#"
+scenario readable_stream seed 99 {
+    time "2024-06-15T12:00:00Z" duration 2h
+    total 1000
+
+    stream s1 from LoginWindow rate 100/s {
+        src_ip = ipv4(500)
+    }
+}
+"#;
+    let wfg = parse_wfg(input).unwrap();
+    let stream = &wfg.scenario.streams[0];
+    assert_eq!(stream.alias, "s1");
+    assert_eq!(stream.window, "LoginWindow");
+    assert_eq!(stream.rate.count, 100);
+    assert_eq!(stream.rate.unit, RateUnit::PerSecond);
+}
+
+#[test]
 fn test_named_gen_args() {
     let input = r#"
 scenario named_args seed 1 {
@@ -242,7 +262,7 @@ scenario inject_flat seed 7 {
 }
 
 #[test]
-fn test_inject_block_params_rejected() {
+fn test_inject_block_params_supported() {
     let input = r#"
 scenario inject_block seed 7 {
     time "2024-01-01T00:00:00Z" duration 1h
@@ -252,10 +272,33 @@ scenario inject_block seed 7 {
 
     inject for brute_force on [s1] {
         hit 20% {
-            threshold = 5
-            window = 30m
-        }
+            threshold = 5;
+            window = 30m;
+        };
         near_miss 10%;
+    }
+}
+"#;
+    let wfg = parse_wfg(input).unwrap();
+    let inject = &wfg.scenario.injects[0];
+    assert_eq!(inject.lines[0].params.len(), 2);
+    assert_eq!(inject.lines[0].params[0].name, "threshold");
+    assert_eq!(inject.lines[0].params[1].name, "window");
+}
+
+#[test]
+fn test_inject_block_params_missing_semicolon_rejected() {
+    let input = r#"
+scenario inject_block_invalid seed 7 {
+    time "2024-01-01T00:00:00Z" duration 1h
+    total 500
+
+    stream s1 : LoginWindow 50/s
+
+    inject for brute_force on [s1] {
+        hit 20% {
+            threshold = 5
+        };
     }
 }
 "#;

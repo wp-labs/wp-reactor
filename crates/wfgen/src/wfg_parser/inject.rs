@@ -119,9 +119,28 @@ pub(super) fn inject_line(input: &mut &str) -> ModalResult<InjectLine> {
         .parse_next(input)?;
 
     ws_skip(input)?;
-    let mut params = Vec::new();
+    let params = if opt(literal("{")).parse_next(input)?.is_some() {
+        parse_inject_params_block(input)?
+    } else {
+        parse_inject_params_inline(input)?
+    };
 
-    // Flat params only: hit 20% key=value key2=value2;
+    ws_skip(input)?;
+    cut_err(semi)
+        .context(StrContext::Expected(StrContextValue::Description(
+            "trailing ';' after inject line",
+        )))
+        .parse_next(input)?;
+
+    Ok(InjectLine {
+        mode,
+        percent: pct,
+        params,
+    })
+}
+
+fn parse_inject_params_inline(input: &mut &str) -> ModalResult<Vec<ParamAssign>> {
+    let mut params = Vec::new();
     loop {
         let saved = *input;
         ws_skip(input)?;
@@ -151,17 +170,41 @@ pub(super) fn inject_line(input: &mut &str) -> ModalResult<InjectLine> {
         *input = saved;
         break;
     }
+    Ok(params)
+}
 
-    ws_skip(input)?;
-    cut_err(semi)
-        .context(StrContext::Expected(StrContextValue::Description(
-            "trailing ';' after inject line",
-        )))
-        .parse_next(input)?;
-
-    Ok(InjectLine {
-        mode,
-        percent: pct,
-        params,
-    })
+fn parse_inject_params_block(input: &mut &str) -> ModalResult<Vec<ParamAssign>> {
+    let mut params = Vec::new();
+    loop {
+        ws_skip(input)?;
+        if opt(literal("}")).parse_next(input)?.is_some() {
+            break;
+        }
+        let name = cut_err(ident)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "inject param name",
+            )))
+            .parse_next(input)?
+            .to_string();
+        ws_skip(input)?;
+        cut_err(literal("="))
+            .context(StrContext::Expected(StrContextValue::Description(
+                "'=' in inject param assignment",
+            )))
+            .parse_next(input)?;
+        ws_skip(input)?;
+        let value = cut_err(param_value)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "inject param value",
+            )))
+            .parse_next(input)?;
+        ws_skip(input)?;
+        cut_err(semi)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "trailing ';' after inject param assignment",
+            )))
+            .parse_next(input)?;
+        params.push(ParamAssign { name, value });
+    }
+    Ok(params)
 }
