@@ -2,6 +2,7 @@ mod field;
 mod inject;
 mod oracle;
 mod stream;
+mod syntax;
 
 use super::*;
 use crate::wfg_ast::*;
@@ -25,6 +26,7 @@ fn minimal_wfg(streams: Vec<StreamBlock>, injects: Vec<InjectBlock>) -> WfgFile 
             faults: None,
             oracle: None,
         },
+        syntax: None,
     }
 }
 

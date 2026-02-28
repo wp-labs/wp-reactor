@@ -49,7 +49,7 @@ pub(super) fn extract_rule_structure(
             .iter()
             .find(|b| b.alias == *bind_alias)
             .and_then(|b| b.filter.as_ref())
-            .map(|f| extract_filter_constraints(f))
+            .map(extract_filter_constraints)
             .unwrap_or_default();
 
         steps.push(StepInfo {
@@ -150,34 +150,31 @@ fn extract_filter_constraints_recursive(
     expr: &Expr,
     constraints: &mut HashMap<String, serde_json::Value>,
 ) {
-    match expr {
-        Expr::BinOp { op, left, right } => {
-            match op {
-                BinOp::And => {
-                    // Recursively handle AND-connected conditions
-                    extract_filter_constraints_recursive(left, constraints);
-                    extract_filter_constraints_recursive(right, constraints);
-                }
-                BinOp::Eq => {
-                    // Extract field == value
-                    if let Expr::Field(fr) = left.as_ref() {
-                        let field_name = field_ref_field_name(fr);
-                        if let Some(value) = expr_to_json_value(right.as_ref()) {
-                            constraints.insert(field_name.to_string(), value);
-                        }
-                    }
-                    // Also handle value == field
-                    if let Expr::Field(fr) = right.as_ref() {
-                        let field_name = field_ref_field_name(fr);
-                        if let Some(value) = expr_to_json_value(left.as_ref()) {
-                            constraints.insert(field_name.to_string(), value);
-                        }
-                    }
-                }
-                _ => {}
+    if let Expr::BinOp { op, left, right } = expr {
+        match op {
+            BinOp::And => {
+                // Recursively handle AND-connected conditions
+                extract_filter_constraints_recursive(left, constraints);
+                extract_filter_constraints_recursive(right, constraints);
             }
+            BinOp::Eq => {
+                // Extract field == value
+                if let Expr::Field(fr) = left.as_ref() {
+                    let field_name = field_ref_field_name(fr);
+                    if let Some(value) = expr_to_json_value(right.as_ref()) {
+                        constraints.insert(field_name.to_string(), value);
+                    }
+                }
+                // Also handle value == field
+                if let Expr::Field(fr) = right.as_ref() {
+                    let field_name = field_ref_field_name(fr);
+                    if let Some(value) = expr_to_json_value(left.as_ref()) {
+                        constraints.insert(field_name.to_string(), value);
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
 }
 

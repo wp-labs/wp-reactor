@@ -4,6 +4,7 @@ mod oracle;
 mod scenario;
 mod stream_rule;
 mod stream_schema;
+mod syntax;
 
 #[cfg(test)]
 mod tests;
@@ -34,6 +35,12 @@ pub fn validate_wfg(
     schemas: &[WindowSchema],
     wfl_files: &[WflFile],
 ) -> Vec<ValidationError> {
+    let all_rules: Vec<_> = wfl_files.iter().flat_map(|f| f.rules.iter()).collect();
+
+    if wfg.syntax.is_some() {
+        return syntax::validate_syntax(wfg, schemas, &all_rules);
+    }
+
     let mut errors = Vec::new();
     let scenario = &wfg.scenario;
 
@@ -41,8 +48,6 @@ pub fn validate_wfg(
     errors.extend(stream_schema::validate_streams_with_schemas(
         scenario, schemas,
     ));
-
-    let all_rules: Vec<_> = wfl_files.iter().flat_map(|f| f.rules.iter()).collect();
 
     errors.extend(stream_rule::validate_stream_rule_bindings(
         scenario, &all_rules,

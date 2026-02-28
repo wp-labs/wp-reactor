@@ -5,15 +5,17 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 fn make_clean_events(count: usize) -> Vec<super::super::stream_gen::GenEvent> {
+    let duration_secs = (count as u64 / 10).max(1);
     let input = format!(
         r#"
-scenario fault_helper seed 42 {{
-    time "2024-01-01T00:00:00Z" duration 1h
-    total {}
-    stream s1 : LoginWindow 10/s
+#[duration={}s]
+scenario fault_helper<seed=42> {{
+    traffic {{
+        stream LoginWindow gen 10/s
+    }}
 }}
 "#,
-        count
+        duration_secs
     );
     let wfg = parse_wfg(&input).unwrap();
     let schemas = vec![make_login_schema()];

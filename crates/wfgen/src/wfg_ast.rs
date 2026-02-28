@@ -10,6 +10,9 @@ use std::time::Duration;
 pub struct WfgFile {
     pub uses: Vec<UseDecl>,
     pub scenario: ScenarioDecl,
+    /// Parsed new syntax section when the file uses new stream-first syntax.
+    /// Legacy `.wfg` files keep this as `None`.
+    pub syntax: Option<SyntaxScenario>,
 }
 
 /// `use "path.wfs"` or `use "path.wfl"`
@@ -43,6 +46,200 @@ pub struct ScenarioDecl {
 pub struct TimeClause {
     pub start: String,
     pub duration: Duration,
+}
+
+// ---------------------------------------------------------------------------
+// new syntax (stream-first) extension
+// ---------------------------------------------------------------------------
+
+/// new syntax scenario data parsed from the new syntax.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct SyntaxScenario {
+    /// `#[key=value, ...]` attributes attached to this scenario.
+    pub attrs: Vec<ScenarioAttr>,
+    /// `scenario name<k=v, ...>` inline annotations.
+    pub inline_annos: Vec<ScenarioAttr>,
+    pub traffic: TrafficBlock,
+    pub injection: Option<SyntaxInjectionBlock>,
+    pub expect: Option<ExpectBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ScenarioAttr {
+    pub key: String,
+    pub value: AttrValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AttrValue {
+    Number(f64),
+    Duration(Duration),
+    String(String),
+    Bool(bool),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct TrafficBlock {
+    pub streams: Vec<SyntaxStreamDecl>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct SyntaxStreamDecl {
+    pub stream: String,
+    pub rate: RateExpr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum RateExpr {
+    Constant(Rate),
+    Wave {
+        base: Rate,
+        amp: Rate,
+        period: Duration,
+        shape: WaveShape,
+    },
+    Burst {
+        base: Rate,
+        peak: Rate,
+        every: Duration,
+        hold: Duration,
+    },
+    Timeline(Vec<TimelineSegment>),
+}
+
+impl RateExpr {
+    /// Fallback EPS approximation used while datagen still relies on legacy fields.
+    pub fn approx_eps(&self) -> f64 {
+        match self {
+            RateExpr::Constant(r) => r.events_per_second(),
+            RateExpr::Wave { base, .. } => base.events_per_second(),
+            RateExpr::Burst { base, .. } => base.events_per_second(),
+            RateExpr::Timeline(segments) => segments
+                .first()
+                .map(|s| s.rate.events_per_second())
+                .unwrap_or(0.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WaveShape {
+    Sine,
+    Triangle,
+    Square,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct TimelineSegment {
+    pub start: Duration,
+    pub end: Duration,
+    pub rate: Rate,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct SyntaxInjectionBlock {
+    pub cases: Vec<SyntaxInjectCase>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct SyntaxInjectCase {
+    pub mode: InjectCaseMode,
+    pub percent: f64,
+    pub stream: String,
+    pub seq: SeqBlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InjectCaseMode {
+    Hit,
+    NearMiss,
+    Miss,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct SeqBlock {
+    pub entity: String,
+    pub steps: Vec<SeqStep>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum SeqStep {
+    Use {
+        /// `true` when the step is explicitly prefixed with `then`.
+        then_from_prev: bool,
+        predicates: Vec<FieldPredicate>,
+        count: u64,
+        within: Duration,
+    },
+    Not {
+        predicates: Vec<FieldPredicate>,
+        within: Duration,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct FieldPredicate {
+    pub field: String,
+    pub value: AttrValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ExpectBlock {
+    pub checks: Vec<ExpectCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ExpectCheck {
+    pub metric: ExpectMetric,
+    pub rule: String,
+    pub op: CompareOp,
+    pub value: ExpectValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExpectMetric {
+    Hit,
+    NearMiss,
+    Miss,
+    Precision,
+    Recall,
+    Fpr,
+    LatencyP95,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CompareOp {
+    Gte,
+    Lte,
+    Gt,
+    Lt,
+    Eq,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ExpectValue {
+    Percent(f64),
+    Number(f64),
+    Duration(Duration),
 }
 
 // ---------------------------------------------------------------------------

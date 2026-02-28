@@ -29,12 +29,7 @@ pub struct ReplayResult {
 }
 
 /// CLI entry point: load files → replay → print output.
-pub fn run(
-    file: PathBuf,
-    schemas: Vec<String>,
-    input: PathBuf,
-    vars: Vec<String>,
-) -> Result<()> {
+pub fn run(file: PathBuf, schemas: Vec<String>, input: PathBuf, vars: Vec<String>) -> Result<()> {
     use wf_config::project::{load_schemas, load_wfl, parse_vars};
 
     let cwd = std::env::current_dir()?;
@@ -170,8 +165,7 @@ fn replay_with_plans<R: BufRead>(
 
     let mut engines: Vec<ReplayEngine> = plans
         .iter()
-        .enumerate()
-        .map(|(_engine_idx, plan)| {
+        .map(|plan| {
             let time_field = resolve_replay_time_field_auto(plan, schemas);
 
             let limits = plan.limits_plan.clone();
@@ -345,17 +339,17 @@ fn resolve_event_routes(
     let mut routes = Vec::new();
 
     // Get _stream from JSON
-    let stream_name = json
-        .get("_stream")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let stream_name = json.get("_stream").and_then(|v| v.as_str()).unwrap_or("");
 
     if stream_name.is_empty() {
         return routes;
     }
 
     // Find windows that subscribe to this stream
-    let windows = stream_to_windows.get(stream_name).cloned().unwrap_or_default();
+    let windows = stream_to_windows
+        .get(stream_name)
+        .cloned()
+        .unwrap_or_default();
 
     // Find binds for each window
     for window in windows {
@@ -368,26 +362,23 @@ fn resolve_event_routes(
     routes
 }
 
-fn resolve_replay_time_field_auto(
-    plan: &RulePlan,
-    schemas: &[WindowSchema],
-) -> Option<String> {
+fn resolve_replay_time_field_auto(plan: &RulePlan, schemas: &[WindowSchema]) -> Option<String> {
     // For multi-source rules, prefer the bind that's used in the first event step
     // This matches the most common case where events come from the primary source
-    if let Some(first_step) = plan.match_plan.event_steps.first() {
-        if let Some(first_branch) = first_step.branches.first() {
-            let source_alias = &first_branch.source;
-            if let Some(bind) = plan.binds.iter().find(|b| b.alias == *source_alias) {
-                if is_internal_window_name(&bind.window) {
-                    return Some(PIPE_EVENT_TIME_FIELD.to_string());
-                }
-                if let Some(tf) = schemas
-                    .iter()
-                    .find(|s| s.name == bind.window)
-                    .and_then(|s| s.time_field.clone())
-                {
-                    return Some(tf);
-                }
+    if let Some(first_step) = plan.match_plan.event_steps.first()
+        && let Some(first_branch) = first_step.branches.first()
+    {
+        let source_alias = &first_branch.source;
+        if let Some(bind) = plan.binds.iter().find(|b| b.alias == *source_alias) {
+            if is_internal_window_name(&bind.window) {
+                return Some(PIPE_EVENT_TIME_FIELD.to_string());
+            }
+            if let Some(tf) = schemas
+                .iter()
+                .find(|s| s.name == bind.window)
+                .and_then(|s| s.time_field.clone())
+            {
+                return Some(tf);
             }
         }
     }

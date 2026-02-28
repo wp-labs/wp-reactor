@@ -1,4 +1,4 @@
-# WFG 设计（vNext / 方案 3）
+# WFG 设计（新语法 / 方案 3）
 
 > 本文是 `.wfg` 场景 DSL 的独立设计文档。
 > 与 `WFL` 主规范解耦演进；不兼容旧 `.wfg` 语法。
@@ -63,7 +63,7 @@ scenario brute_force_detect<seed=42> {
 }
 ```
 
-## 4. EBNF（vNext）
+## 4. EBNF（新语法）
 
 ```ebnf
 scenario_file   = { use_decl } , [ scenario_attrs ] , scenario_decl ;
@@ -196,8 +196,8 @@ wfg + wfs + wfl
 
 ## 8. 迁移说明
 
-- 旧语法中的 `stream alias from window rate ...`、`inject for ...`、`oracle {...}` 不再作为 vNext 主规范。
-- vNext 仅保留本文件定义语法。
+- 旧语法中的 `stream alias from window rate ...`、`inject for ...`、`oracle {...}` 不再作为 新语法 主规范。
+- 新语法 仅保留本文件定义语法。
 
 ## 9. 扩展规划（建议）
 

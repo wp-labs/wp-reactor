@@ -13,8 +13,7 @@ count/
 ├── data/
 │   └── auth_events.ndjson   # replay 样本数据
 └── scenarios/
-    ├── brute_force.wfg       # 当前可运行场景（旧语法）
-    └── brute_force_vnext.wfg # 方案 3 设计草案（新语法）
+    └── brute_force.wfg       # 新语法场景（stream-first）
 ```
 
 ## 规则说明
@@ -106,12 +105,12 @@ wfl check rules/brute_force.wfl --schemas "schemas/*.wfs" --var FAIL_THRESHOLD=3
 
 ## 数据生成
 
-`scenarios/brute_force.wfg` 使用 wfgen 生成大规模测试数据（当前可运行）：
+`scenarios/brute_force.wfg` 使用 wfgen 生成大规模测试数据：
 
 ```bash
-wfgen generate scenarios/brute_force.wfg --output data/
+wfgen gen --scenario scenarios/brute_force.wfg --format jsonl --out data/
 ```
 
-场景参数：10 分钟时间跨度，500 条事件，100/s 速率，50 个 IP 池。注入策略：30% 命中（3 次/实体），10% 近似命中（2 次/实体）。
+场景参数：10 分钟时间跨度，基础速率约 180/s（`100/s + wave(base=80/s, ...)`），并注入 30% hit / 10% near_miss / 60% miss 样本。
 
-`scenarios/brute_force_vnext.wfg` 提供方案 3 的可读性语法草案（stream-first + profile + seq/use/with）。
+该场景采用新语法（stream-first + hit/near_miss/miss + seq/use/with）。

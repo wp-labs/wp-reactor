@@ -2,12 +2,13 @@ use super::*;
 
 #[test]
 fn test_no_inject_backward_compat() {
-    // Without inject blocks, generate() behaves identically with or without rule_plans
+    // Without injection blocks, generate() behaves identically with or without rule_plans.
     let input = r#"
-scenario compat seed 42 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 100
-    stream s1 : LoginWindow 10/s
+#[duration=10s]
+scenario compat<seed=42> {
+    traffic {
+        stream LoginWindow gen 10/s
+    }
 }
 "#;
     let wfg = parse_wfg(input).unwrap();

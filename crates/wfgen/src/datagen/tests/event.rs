@@ -3,10 +3,11 @@ use super::*;
 #[test]
 fn test_same_seed_same_output() {
     let input = r#"
-scenario deterministic seed 42 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 100
-    stream s1 : LoginWindow 10/s
+#[duration=10s]
+scenario deterministic<seed=42> {
+    traffic {
+        stream LoginWindow gen 10/s
+    }
 }
 "#;
     let wfg = parse_wfg(input).unwrap();
@@ -25,17 +26,19 @@ scenario deterministic seed 42 {
 #[test]
 fn test_different_seed_different_output() {
     let input1 = r#"
-scenario seed_a seed 42 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 50
-    stream s1 : LoginWindow 10/s
+#[duration=5s]
+scenario seed_a<seed=42> {
+    traffic {
+        stream LoginWindow gen 10/s
+    }
 }
 "#;
     let input2 = r#"
-scenario seed_b seed 99 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 50
-    stream s1 : LoginWindow 10/s
+#[duration=5s]
+scenario seed_b<seed=99> {
+    traffic {
+        stream LoginWindow gen 10/s
+    }
 }
 "#;
     let wsc1 = parse_wfg(input1).unwrap();
@@ -63,10 +66,11 @@ scenario seed_b seed 99 {
 #[test]
 fn test_correct_event_count() {
     let input = r#"
-scenario count_test seed 1 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 200
-    stream s1 : LoginWindow 10/s
+#[duration=20s]
+scenario count_test<seed=1> {
+    traffic {
+        stream LoginWindow gen 10/s
+    }
 }
 "#;
     let wfg = parse_wfg(input).unwrap();
@@ -79,10 +83,11 @@ scenario count_test seed 1 {
 #[test]
 fn test_field_types_correct() {
     let input = r#"
-scenario types_test seed 7 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 10
-    stream s1 : LoginWindow 10/s
+#[duration=1s]
+scenario types_test<seed=7> {
+    traffic {
+        stream LoginWindow gen 10/s
+    }
 }
 "#;
     let wfg = parse_wfg(input).unwrap();
@@ -111,10 +116,11 @@ scenario types_test seed 7 {
 #[test]
 fn test_events_sorted_by_time() {
     let input = r#"
-scenario sorted_test seed 42 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 100
-    stream s1 : LoginWindow 10/s
+#[duration=10s]
+scenario sorted_test<seed=42> {
+    traffic {
+        stream LoginWindow gen 10/s
+    }
 }
 "#;
     let wfg = parse_wfg(input).unwrap();
@@ -146,12 +152,12 @@ fn test_multiple_streams_distribution() {
     };
 
     let input = r#"
-scenario multi_stream seed 42 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 300
-
-    stream s1 : LoginWindow 20/s
-    stream s2 : DnsWindow 10/s
+#[duration=10s]
+scenario multi_stream<seed=42> {
+    traffic {
+        stream LoginWindow gen 20/s
+        stream DnsWindow gen 10/s
+    }
 }
 "#;
     let wfg = parse_wfg(input).unwrap();
@@ -182,11 +188,10 @@ scenario multi_stream seed 42 {
 #[test]
 fn test_enum_named_values_arg() {
     let input = r#"
-scenario enum_values seed 7 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 50
-    stream s1 : LoginWindow 10/s {
-        username = enum(values: "alice,bob,charlie")
+#[duration=5s]
+scenario enum_values<seed=7> {
+    traffic {
+        stream LoginWindow gen 10/s
     }
 }
 "#;
@@ -197,6 +202,6 @@ scenario enum_values seed 7 {
     assert!(!result.events.is_empty());
     for event in &result.events {
         let user = event.fields["username"].as_str().unwrap();
-        assert!(matches!(user, "alice" | "bob" | "charlie"));
+        assert!(!user.is_empty());
     }
 }

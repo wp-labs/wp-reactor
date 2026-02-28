@@ -4,12 +4,20 @@ use crate::oracle::run_oracle;
 #[test]
 fn test_inject_hit_cluster_correctness() {
     let input = r#"
-scenario inject_hit seed 42 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 1000
-    stream fail : LoginWindow 100/s
-    inject for brute_force on [fail] {
-        hit 50%;
+#[duration=10s]
+scenario inject_hit<seed=42> {
+    traffic {
+        stream LoginWindow gen 100/s
+    }
+    injection {
+        hit<50%> LoginWindow {
+            src_ip seq {
+                use(action="failed") with(5,2m)
+            }
+        }
+    }
+    expect {
+        hit(brute_force) >= 0%
     }
 }
 "#;
@@ -58,12 +66,20 @@ fn test_inject_filter_constraint_applied() {
     // Rule has filter: success == false
     // Generated inject events must have success = false
     let input = r#"
-scenario inject_filter seed 42 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 500
-    stream auth_fail : LoginWindow 100/s
-    inject for auth_fail_rule on [auth_fail] {
-        hit 30%;
+#[duration=5s]
+scenario inject_filter<seed=42> {
+    traffic {
+        stream LoginWindow gen 100/s
+    }
+    injection {
+        hit<30%> LoginWindow {
+            src_ip seq {
+                use(success=false) with(5,2m)
+            }
+        }
+    }
+    expect {
+        hit(auth_fail_rule) >= 0%
     }
 }
 "#;
@@ -118,7 +134,7 @@ scenario inject_filter seed 42 {
 
     // We expect alerts since hit events have the correct filter value
     assert!(
-        oracle.alerts.len() > 0,
+        !oracle.alerts.is_empty(),
         "expected alerts from hit events with filter, got {}",
         oracle.alerts.len()
     );
@@ -128,12 +144,20 @@ scenario inject_filter seed 42 {
 fn test_inject_near_miss_no_trigger() {
     // near-miss events should produce N-1 events per cluster (not enough to trigger)
     let input = r#"
-scenario inject_nm seed 42 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 1000
-    stream fail : LoginWindow 100/s
-    inject for brute_force on [fail] {
-        near_miss 40%;
+#[duration=10s]
+scenario inject_nm<seed=42> {
+    traffic {
+        stream LoginWindow gen 100/s
+    }
+    injection {
+        near_miss<40%> LoginWindow {
+            src_ip seq {
+                use(action="failed") with(5,2m)
+            }
+        }
+    }
+    expect {
+        hit(brute_force) >= 0%
     }
 }
 "#;
@@ -158,12 +182,20 @@ scenario inject_nm seed 42 {
 #[test]
 fn test_inject_hit_triggers_oracle() {
     let input = r#"
-scenario inject_oracle seed 42 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 1000
-    stream fail : LoginWindow 100/s
-    inject for brute_force on [fail] {
-        hit 50%;
+#[duration=10s]
+scenario inject_oracle<seed=42> {
+    traffic {
+        stream LoginWindow gen 100/s
+    }
+    injection {
+        hit<50%> LoginWindow {
+            src_ip seq {
+                use(action="failed") with(5,2m)
+            }
+        }
+    }
+    expect {
+        hit(brute_force) >= 0%
     }
 }
 "#;
@@ -198,14 +230,30 @@ scenario inject_oracle seed 42 {
 fn test_inject_budget_allocation() {
     // hit% + near_miss% + non_hit% should be accounted for; rest is background
     let input = r#"
-scenario inject_budget seed 42 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 1000
-    stream fail : LoginWindow 100/s
-    inject for brute_force on [fail] {
-        hit 30%;
-        near_miss 10%;
-        non_hit 20%;
+#[duration=10s]
+scenario inject_budget<seed=42> {
+    traffic {
+        stream LoginWindow gen 100/s
+    }
+    injection {
+        hit<30%> LoginWindow {
+            src_ip seq {
+                use(action="failed") with(5,2m)
+            }
+        }
+        near_miss<10%> LoginWindow {
+            src_ip seq {
+                use(action="failed") with(5,2m)
+            }
+        }
+        miss<20%> LoginWindow {
+            src_ip seq {
+                use(action="success") with(1,30s)
+            }
+        }
+    }
+    expect {
+        hit(brute_force) >= 0%
     }
 }
 "#;
@@ -221,12 +269,20 @@ scenario inject_budget seed 42 {
 #[test]
 fn test_inject_deterministic() {
     let input = r#"
-scenario inject_det seed 42 {
-    time "2024-01-01T00:00:00Z" duration 1h
-    total 500
-    stream fail : LoginWindow 100/s
-    inject for brute_force on [fail] {
-        hit 30%;
+#[duration=5s]
+scenario inject_det<seed=42> {
+    traffic {
+        stream LoginWindow gen 100/s
+    }
+    injection {
+        hit<30%> LoginWindow {
+            src_ip seq {
+                use(action="failed") with(5,2m)
+            }
+        }
+    }
+    expect {
+        hit(brute_force) >= 0%
     }
 }
 "#;

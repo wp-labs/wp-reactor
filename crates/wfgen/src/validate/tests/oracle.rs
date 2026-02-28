@@ -20,6 +20,7 @@ fn wfg_with_oracle(oracle: OracleBlock) -> WfgFile {
             faults: None,
             oracle: Some(oracle),
         },
+        syntax: None,
     }
 }
 

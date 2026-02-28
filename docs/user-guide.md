@@ -1559,86 +1559,32 @@ FAIL  edge_case_test (brute_force)
 ### 10.1 Scenario 文件 (.wfg)
 
 ```wfg
-use "windows/security.wfs"
-use "rules/brute_force.wfl"
-
-scenario brute_force_load seed 42 {
-
-    time "2026-02-18T00:00:00Z" duration 30m
-    total 200000
-
-    // 基础流量
-    stream fail from auth_events rate 200/s {
-        sip    = ipv4(500)
-        action = "failed"
-    }
-
-    stream success from auth_events rate 400/s {
-        sip    = ipv4(500)
-        action = "success"
-    }
-
-    // 模式注入
-    inject for brute_force on [fail] {
-        hit 5% {
-            count_per_entity = 5;
-            within = 2m;
-        };
-        near_miss 3% {
-            count_per_entity = 2;
-            within = 2m;
-        };
-    }
-
-    // 时序扰动
-    faults {
-        out_of_order 2%;
-        late         1%;
-        duplicate    0.5%;
-        drop         0.2%;
-    }
-
-    // 期望结果
-    oracle {
-        time_tolerance  = 1s;
-        score_tolerance = 0.01;
-    }
-}
-```
-
-### 10.1.1 新 DSL（方案 3，vNext）
-
-> 说明：这是新系统语法，不兼容旧 `.wfg`。目标是“规则映射显式 + 写法简洁”。
-
-```wfg
 use "schemas/security.wfs"
 use "rules/brute_force.wfl"
 
 #[duration=30m]
 scenario brute_force_detect<seed=42> {
-
   traffic {
-    stream auth_events gen 100/s
-    stream auth_events gen wave(base=80/s, amp=40/s, period=5m, shape=sine)
+    stream auth_events gen 200/s
+    stream auth_events gen wave(base=120/s, amp=60/s, period=5m, shape=sine)
   }
 
   injection {
     hit<30%> auth_events {
-      user seq {
-        use(login="failed") with(3,2m)
-        use(action="port_scan") with(1,1m)
+      sip seq {
+        use(action="failed") with(3,2m)
       }
     }
 
     near_miss<10%> auth_events {
-      user seq {
-        use(login="failed") with(2,2m)
+      sip seq {
+        use(action="failed") with(2,2m)
       }
     }
 
     miss<60%> auth_events {
-      user seq {
-        use(login="success") with(1,30s)
+      sip seq {
+        use(action="success") with(1,30s)
       }
     }
   }
@@ -1651,114 +1597,59 @@ scenario brute_force_detect<seed=42> {
 }
 ```
 
-语义约定：
+### 10.1.1 语义约定（新语法）
 
-示例文件：`examples/count/scenarios/brute_force_vnext.wfg`（设计草案）。
+> `.wfg` 已切换为新语法，不再兼容旧语法。
+
+示例文件：`examples/count/scenarios/brute_force.wfg`（设计草案）。
 
 - 只支持 `//` 注释，`#` 不作为注释；`#[]` 是元信息注解。
-- 生成是 `stream` 级别；窗口约束由 `.wfs/.wfl` 推导，不在场景中重复声明 `window/alias`。
+- 生成是 `stream` 级别；窗口约束由 `.wfs/.wfl` 推导。
 - `hit<30%> / near_miss<10%> / miss<60%>`：标签由关键字表达，仅显式声明占比。
-- `user seq` 显式按实体键串联步骤；`use(...) with(count,window)` 必须写清字段条件与计数窗口。
+- `<entity> seq` 显式按实体键串联步骤；`use(...) with(count,window)` 必须写清字段条件与计数窗口。
 - 多条 `use(...)` 默认按顺序生效：后一条发生在前一条之后。
 
-### 10.2 stream — 流定义（旧语法）
-
-```wfg
-stream <别名> from <window名> rate <速率> {
-    <字段> = <生成表达式>
-    ...
-}
-```
-
-- 兼容旧写法：`stream <别名> : <window名> <速率>`.
-- `别名` 必须对应 `.wfl` 规则中 `events` 的别名。
-- `window名` 必须与规则中该别名绑定的 window 一致。
-- `速率` 格式：`N/s`、`N/m`、`N/h`。
-
-**生成函数：**
-
-| 函数 | 参数 | 适用类型 | 说明 |
-|------|------|----------|------|
-| *(字面量)* | 直接写值 | 全部 | `action = "failed"` |
-| `ipv4` | `pool` | ip/chars | `ipv4(500)` — 从 500 个 IP 池随机取 |
-| `ipv6` | `pool` | ip/chars | `ipv6(100)` |
-| `pattern` | 模板 | chars | `pattern("user_{}")` — `{}` 递增 |
-| `enum` | 值列表 | chars | `enum("login", "logout")` |
-| `range` | `min, max` | digit/float | `range(0, 100)` |
-
-未声明的字段按类型默认策略随机生成。
-
-### 10.3 inject — 模式注入（旧语法）
-
-```wfg
-inject for <规则名> on [<流别名>, ...] {
-    hit <百分比> {
-        <参数>=<值>;
-        ...
-    };
-    near_miss <百分比> <参数>=<值> ...;
-    non_hit   <百分比> <参数>=<值> ...;
-}
-```
-
-- 推荐块状参数写法（可读性更强）；同时兼容内联参数写法。
-
-| 模式 | 语义 | 期望输出 |
-|------|------|----------|
-| `hit` | 构造"应命中"事件序列 | 必须出现告警 |
-| `near_miss` | 构造"接近但不命中"事件序列 | 不应出现告警 |
-| `non_hit` | 无关事件 | 不应出现告警 |
-
-### 10.4 faults — 时序扰动（旧语法）
-
-```wfg
-faults {
-    out_of_order 2%;    // 交换相邻事件到达顺序
-    late         1%;    // 推迟到 watermark 之后
-    duplicate    0.5%;  // 重复发送
-    drop         0.2%;  // 生成但不发送
-}
-```
-
-各项百分比之和不得超过 100%。
-
-### 10.5 CLI 命令
+### 10.2 CLI 命令
 
 ```bash
-# 生成测试数据
+# 生成并发送（推荐一步完成）
 wfgen gen \
-    --scenario tests/brute_force_load.wfg \
+    --scenario examples/count/scenarios/brute_force.wfg \
     --format jsonl \
     --out out/ \
     --send \
     --addr 127.0.0.1:9800
 
 # 一致性校验
-wfgen lint tests/brute_force_load.wfg
+wfgen lint examples/count/scenarios/brute_force.wfg
 
-# 已有 JSONL 数据时也可单独发送（可选）
+# 已有数据时可单独发送（可选）
 wfgen send \
-  --scenario tests/brute_force_load.wfg \
-  --input out/brute_force_load.jsonl \
+  --scenario examples/count/scenarios/brute_force.wfg \
+  --input out/brute_force_detect.jsonl \
   --addr 127.0.0.1:9800
 
 # 对拍验证
 wfgen verify \
-    --actual out/actual_alerts.jsonl \
-    --expected out/brute_force_load.oracle.jsonl \
-    --meta out/brute_force_load.oracle.meta.json
+  --actual out/actual_alerts.jsonl \
+  --expected out/brute_force_detect.oracle.jsonl \
+  --meta out/brute_force_detect.oracle.meta.json
 
 # 端到端持续压测（持续生成并发送 5 分钟）
 wfgen bench \
-    --scenario tests/brute_force_load.wfg \
+    --scenario examples/count/scenarios/brute_force.wfg \
     --duration 5m \
     --send \
     --addr 127.0.0.1:9800
 ```
 
-说明：`wfgen gen --send` / `wfgen bench --send` 需要目标 `wfusion` 已在对应 `--addr` 上监听。
+说明：
 
-### 10.6 wfgen + wfusion 联合验证
+- `wfgen gen --send` 与 `wfgen bench --send` 都可以“一步生成 + 发送”。
+- `wfgen send` 仅用于复用已有 JSONL 文件时的补充场景。
+- 发送前需确保 `wfusion` 已在对应 `--addr` 上监听。
+
+### 10.3 wfgen + wfusion 联合验证
 
 `wfusion` 当前是 TCP + Arrow IPC 接入模式，没有 `--replay` 命令。  
 推荐使用下面两种方式做联合验证：

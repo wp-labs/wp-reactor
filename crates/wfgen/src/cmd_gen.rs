@@ -17,6 +17,7 @@ use wfgen::wfg_parser::parse_wfg;
 use crate::cmd_helpers::{load_wfl_files, load_ws_files};
 use crate::tcp_send::send_events;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     scenario: PathBuf,
     format: String,

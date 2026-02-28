@@ -39,15 +39,7 @@ pub fn generate_inject_events(
     let mut inject_counts: HashMap<String, u64> = HashMap::new();
 
     for inject_block in &scenario.injects {
-        let rule_plan = rule_plans
-            .iter()
-            .find(|p| p.name == inject_block.rule)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "inject references rule '{}' not found in compiled plans",
-                    inject_block.rule
-                )
-            })?;
+        let rule_plan = resolve_rule_plan(&inject_block.rule, rule_plans)?;
 
         let alias_map = build_alias_map(&inject_block.streams, &scenario.streams, rule_plan)?;
         let rule_struct = extract_rule_structure(rule_plan, &alias_map)?;
@@ -72,4 +64,29 @@ pub fn generate_inject_events(
         events: all_events,
         inject_counts,
     })
+}
+
+fn resolve_rule_plan<'a>(
+    inject_rule: &str,
+    rule_plans: &'a [RulePlan],
+) -> anyhow::Result<&'a RulePlan> {
+    if inject_rule.is_empty() {
+        if rule_plans.len() == 1 {
+            return Ok(&rule_plans[0]);
+        }
+        anyhow::bail!(
+            "injection target rule is ambiguous: expect(...) is missing and {} rules are loaded",
+            rule_plans.len()
+        );
+    }
+
+    rule_plans
+        .iter()
+        .find(|p| p.name == inject_rule)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "inject references rule '{}' not found in compiled plans",
+                inject_rule
+            )
+        })
 }

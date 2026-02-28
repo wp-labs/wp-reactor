@@ -78,8 +78,7 @@ fn replay_five_events_one_match() {
     let ndjson = make_ndjson_events(5);
     let reader = BufReader::new(ndjson.as_bytes());
 
-    let result =
-        replay_events(WFL_RULE, &schemas, reader, false).expect("replay should succeed");
+    let result = replay_events(WFL_RULE, &schemas, reader, false).expect("replay should succeed");
     assert_eq!(result.event_count, 5);
     assert_eq!(result.match_count, 1);
     assert_eq!(result.error_count, 0);
@@ -98,8 +97,7 @@ fn replay_below_threshold_no_match() {
     let ndjson = make_ndjson_events(3);
     let reader = BufReader::new(ndjson.as_bytes());
 
-    let result =
-        replay_events(WFL_RULE, &schemas, reader, false).expect("replay should succeed");
+    let result = replay_events(WFL_RULE, &schemas, reader, false).expect("replay should succeed");
     assert_eq!(result.event_count, 3);
     assert_eq!(result.match_count, 0);
     assert_eq!(result.error_count, 0);
@@ -200,8 +198,10 @@ rule multi_src {
 
     let base_nanos = 1_700_000_000_000_000_000i64;
     // Events with _stream="b_stream" routed to b_win
-    let ndjson = format!(r#"{{"_stream":"b_stream","sip":"10.0.0.1","tb":{}}}"#, base_nanos)
-        + "\n"
+    let ndjson = format!(
+        r#"{{"_stream":"b_stream","sip":"10.0.0.1","tb":{}}}"#,
+        base_nanos
+    ) + "\n"
         + &format!(
             r#"{{"_stream":"b_stream","sip":"10.0.0.1","tb":{}}}"#,
             base_nanos + 1_000_000_000

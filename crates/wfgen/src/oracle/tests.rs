@@ -70,7 +70,7 @@ fn make_event(alias: &str, window: &str, sip: &str, ts: &str) -> GenEvent {
     );
 
     GenEvent {
-        stream_alias: alias.to_string(),
+        stream_name: alias.to_string(),
         window_name: window.to_string(),
         timestamp: ts.parse().unwrap(),
         fields,
@@ -298,7 +298,7 @@ fn make_scan_event(alias: &str, window: &str, sip: &str, dport: u16, ts: &str) -
     );
 
     GenEvent {
-        stream_alias: alias.to_string(),
+        stream_name: alias.to_string(),
         window_name: window.to_string(),
         timestamp: ts.parse().unwrap(),
         fields,

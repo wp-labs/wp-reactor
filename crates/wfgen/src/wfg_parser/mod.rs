@@ -1,9 +1,6 @@
-mod faults;
-mod inject;
-mod oracle;
 mod primitives;
 mod scenario;
-mod stream;
+mod syntax;
 #[cfg(test)]
 mod tests;
 
@@ -58,7 +55,11 @@ fn wfg_file(input: &mut &str) -> ModalResult<WfgFile> {
     }
 
     ws_skip(input)?;
-    let scenario = scenario_decl(input)?;
+    let parsed = scenario_decl(input)?;
 
-    Ok(WfgFile { uses, scenario })
+    Ok(WfgFile {
+        uses,
+        scenario: parsed.scenario,
+        syntax: parsed.syntax,
+    })
 }

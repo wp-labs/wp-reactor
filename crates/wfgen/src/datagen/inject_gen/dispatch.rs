@@ -54,31 +54,46 @@ pub(super) fn build_alias_map(
 ) -> anyhow::Result<AliasMap> {
     let mut bind_to_scenario = HashMap::new();
 
-    // Per SC6/SC2a, each inject stream alias IS the rule bind alias.
-    // The scenario stream declaration `stream fail: LoginWindow 100/s`
-    // declares alias "fail" which matches `events fail : LoginWindow`
-    // in the .wfl rule. Match directly by alias name.
-    for scenario_alias in inject_streams {
+    // New syntax uses stream names without exposing bind aliases.
+    // We first resolve scenario stream by name, then map to a rule bind by:
+    // 1) exact alias match, 2) unique bind on the same window.
+    for stream_name in inject_streams {
         let stream_block = scenario_streams
             .iter()
-            .find(|s| &s.alias == scenario_alias)
+            .find(|s| &s.alias == stream_name)
             .ok_or_else(|| {
-                anyhow::anyhow!("inject stream '{}' not found in scenario", scenario_alias)
+                anyhow::anyhow!("inject stream '{}' not found in scenario", stream_name)
             })?;
 
-        // Verify the alias exists in the rule's binds (SC6 should have
-        // caught this at validation time, but belt-and-suspenders).
-        if !rule_plan.binds.iter().any(|b| b.alias == *scenario_alias) {
-            anyhow::bail!(
-                "inject stream '{}' is not a bind alias in rule '{}'",
-                scenario_alias,
-                rule_plan.name
-            );
-        }
+        let bind_alias = if rule_plan.binds.iter().any(|b| b.alias == *stream_name) {
+            stream_name.clone()
+        } else {
+            let mut bind_iter = rule_plan
+                .binds
+                .iter()
+                .filter(|b| b.window == stream_block.window)
+                .map(|b| b.alias.clone());
+            let first = bind_iter.next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "inject stream '{}' cannot be mapped to any bind in rule '{}'",
+                    stream_name,
+                    rule_plan.name
+                )
+            })?;
+            if bind_iter.next().is_some() {
+                anyhow::bail!(
+                    "inject stream '{}' maps to multiple binds in rule '{}'; \
+                     use explicit bind aliases in .wfg",
+                    stream_name,
+                    rule_plan.name
+                );
+            }
+            first
+        };
 
         bind_to_scenario.insert(
-            scenario_alias.clone(),
-            (scenario_alias.clone(), stream_block.window.clone()),
+            bind_alias,
+            (stream_block.alias.clone(), stream_block.window.clone()),
         );
     }
 
