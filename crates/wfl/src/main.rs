@@ -71,10 +71,6 @@ enum Commands {
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Event name to replay as (matches events block declaration)
-        #[arg(long)]
-        event: String,
-
         /// Variable substitutions in KEY=VALUE format
         #[arg(long)]
         var: Vec<String>,
@@ -127,10 +123,9 @@ fn main() -> Result<()> {
             file,
             schemas,
             input,
-            event,
             var,
         } => {
-            wfl::cmd_replay::run(file, schemas, input, event, var)?;
+            wfl::cmd_replay::run(file, schemas, input, var)?;
         }
 
         Commands::Test {

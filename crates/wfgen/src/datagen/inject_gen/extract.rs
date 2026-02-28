@@ -1,4 +1,6 @@
-use wf_lang::ast::{Expr, FieldRef};
+use std::collections::HashMap;
+
+use wf_lang::ast::{BinOp, Expr, FieldRef};
 use wf_lang::plan::RulePlan;
 use wf_lang::plan::WindowSpec;
 
@@ -41,12 +43,22 @@ pub(super) fn extract_rule_structure(
             .ok_or_else(|| anyhow::anyhow!("cannot evaluate threshold as constant"))?
             as u64;
 
+        // Extract filter constraints from the corresponding bind
+        let filter_overrides = rule_plan
+            .binds
+            .iter()
+            .find(|b| b.alias == *bind_alias)
+            .and_then(|b| b.filter.as_ref())
+            .map(|f| extract_filter_constraints(f))
+            .unwrap_or_default();
+
         steps.push(StepInfo {
             bind_alias: bind_alias.clone(),
             scenario_alias: scenario_alias.clone(),
             window_name: window_name.clone(),
             measure: branch.agg.measure,
             threshold,
+            filter_overrides,
         });
     }
 
@@ -119,6 +131,61 @@ pub(super) fn extract_inject_overrides(inject_line: &InjectLine) -> InjectOverri
 fn extract_entity_id_field(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Field(fr) => Some(field_ref_field_name(fr).to_string()),
+        _ => None,
+    }
+}
+
+/// Extract field equality constraints from a filter expression.
+///
+/// Supports:
+/// - `field == "value"`, `field == number`, `field == bool`
+/// - `cond1 && cond2` (recursively extracts from both sides)
+pub(crate) fn extract_filter_constraints(filter: &Expr) -> HashMap<String, serde_json::Value> {
+    let mut constraints = HashMap::new();
+    extract_filter_constraints_recursive(filter, &mut constraints);
+    constraints
+}
+
+fn extract_filter_constraints_recursive(
+    expr: &Expr,
+    constraints: &mut HashMap<String, serde_json::Value>,
+) {
+    match expr {
+        Expr::BinOp { op, left, right } => {
+            match op {
+                BinOp::And => {
+                    // Recursively handle AND-connected conditions
+                    extract_filter_constraints_recursive(left, constraints);
+                    extract_filter_constraints_recursive(right, constraints);
+                }
+                BinOp::Eq => {
+                    // Extract field == value
+                    if let Expr::Field(fr) = left.as_ref() {
+                        let field_name = field_ref_field_name(fr);
+                        if let Some(value) = expr_to_json_value(right.as_ref()) {
+                            constraints.insert(field_name.to_string(), value);
+                        }
+                    }
+                    // Also handle value == field
+                    if let Expr::Field(fr) = right.as_ref() {
+                        let field_name = field_ref_field_name(fr);
+                        if let Some(value) = expr_to_json_value(left.as_ref()) {
+                            constraints.insert(field_name.to_string(), value);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+fn expr_to_json_value(expr: &Expr) -> Option<serde_json::Value> {
+    match expr {
+        Expr::StringLit(s) => Some(serde_json::Value::String(s.clone())),
+        Expr::Number(n) => Some(serde_json::json!(*n)),
+        Expr::Bool(b) => Some(serde_json::Value::Bool(*b)),
         _ => None,
     }
 }

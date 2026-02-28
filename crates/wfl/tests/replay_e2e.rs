@@ -65,7 +65,7 @@ fn make_ndjson_events(count: usize) -> String {
     let mut lines = Vec::with_capacity(count);
     for i in 0..count {
         lines.push(format!(
-            r#"{{"sip":"10.0.0.1","action":"failed","user":"admin","event_time":{}}}"#,
+            r#"{{"_stream":"auth_stream","sip":"10.0.0.1","action":"failed","user":"admin","event_time":{}}}"#,
             1_700_000_000_000_000_000i64 + (i as i64) * 1_000_000_000
         ));
     }
@@ -79,7 +79,7 @@ fn replay_five_events_one_match() {
     let reader = BufReader::new(ndjson.as_bytes());
 
     let result =
-        replay_events(WFL_RULE, &schemas, reader, "e", false).expect("replay should succeed");
+        replay_events(WFL_RULE, &schemas, reader, false).expect("replay should succeed");
     assert_eq!(result.event_count, 5);
     assert_eq!(result.match_count, 1);
     assert_eq!(result.error_count, 0);
@@ -99,7 +99,7 @@ fn replay_below_threshold_no_match() {
     let reader = BufReader::new(ndjson.as_bytes());
 
     let result =
-        replay_events(WFL_RULE, &schemas, reader, "e", false).expect("replay should succeed");
+        replay_events(WFL_RULE, &schemas, reader, false).expect("replay should succeed");
     assert_eq!(result.event_count, 3);
     assert_eq!(result.match_count, 0);
     assert_eq!(result.error_count, 0);
@@ -134,7 +134,7 @@ fn replay_eof_close_all_fires_alert() {
     let reader = BufReader::new(ndjson.as_bytes());
 
     let result =
-        replay_events(WFL_CLOSE_RULE, &schemas, reader, "e", false).expect("replay should succeed");
+        replay_events(WFL_CLOSE_RULE, &schemas, reader, false).expect("replay should succeed");
 
     assert_eq!(result.event_count, 2);
     assert_eq!(result.match_count, 1, "expected one alert from EOF close");
@@ -171,19 +171,18 @@ fn make_b_win_schema() -> WindowSchema {
     }
 }
 
-/// In a multi-source rule, the replay alias determines which schema's time_field
-/// is used. With --alias b, the engine should use "tb" (b_win's time_field),
-/// not "event_time" (auth_events' time_field). This test verifies fired_at
+/// In a multi-source rule, events are routed by _stream. The engine should
+/// use the time_field from the appropriate schema. This test verifies fired_at
 /// is in the expected range, not 1970.
 #[test]
-fn replay_multi_source_uses_alias_time_field() {
+fn replay_multi_source_time_field() {
     let schemas = vec![
         make_auth_events_schema(),
         make_b_win_schema(),
         make_security_alerts_schema(),
     ];
 
-    // Rule binds two sources; we replay on alias "b" which comes from b_win.
+    // Rule binds two sources; b_stream events go to b_win.
     // b_win's time_field is "tb".
     let wfl = r#"
 rule multi_src {
@@ -200,15 +199,16 @@ rule multi_src {
 "#;
 
     let base_nanos = 1_700_000_000_000_000_000i64;
-    let ndjson = format!(r#"{{"sip":"10.0.0.1","tb":{}}}"#, base_nanos)
+    // Events with _stream="b_stream" routed to b_win
+    let ndjson = format!(r#"{{"_stream":"b_stream","sip":"10.0.0.1","tb":{}}}"#, base_nanos)
         + "\n"
         + &format!(
-            r#"{{"sip":"10.0.0.1","tb":{}}}"#,
+            r#"{{"_stream":"b_stream","sip":"10.0.0.1","tb":{}}}"#,
             base_nanos + 1_000_000_000
         );
     let reader = BufReader::new(ndjson.as_bytes());
 
-    let result = replay_events(wfl, &schemas, reader, "b", false).expect("replay should succeed");
+    let result = replay_events(wfl, &schemas, reader, false).expect("replay should succeed");
 
     assert_eq!(result.event_count, 2);
     assert_eq!(result.match_count, 1);
@@ -221,7 +221,7 @@ rule multi_src {
     // Convert fired_at (ISO string) year to verify it's not 1970.
     assert!(
         !alert.fired_at.starts_with("1970"),
-        "fired_at should not be 1970 (got {}); time_field was not resolved from alias schema",
+        "fired_at should not be 1970 (got {}); time_field was not resolved from schema",
         alert.fired_at
     );
 }
@@ -309,7 +309,7 @@ rule conv_mixed {
     for port in [80, 443, 8080, 22, 3306] {
         t += 1;
         lines.push(format!(
-            r#"{{"sip":"10.0.0.1","dport":{},"action":"syn","event_time":{}}}"#,
+            r#"{{"_stream":"netflow","sip":"10.0.0.1","dport":{},"action":"syn","event_time":{}}}"#,
             port,
             base + t * sec
         ));
@@ -319,7 +319,7 @@ rule conv_mixed {
     for port in [80, 443, 8080, 22] {
         t += 1;
         lines.push(format!(
-            r#"{{"sip":"10.0.0.2","dport":{},"action":"syn","event_time":{}}}"#,
+            r#"{{"_stream":"netflow","sip":"10.0.0.2","dport":{},"action":"syn","event_time":{}}}"#,
             port,
             base + t * sec
         ));
@@ -329,7 +329,7 @@ rule conv_mixed {
     for port in [80, 443, 8080] {
         t += 1;
         lines.push(format!(
-            r#"{{"sip":"10.0.0.3","dport":{},"action":"syn","event_time":{}}}"#,
+            r#"{{"_stream":"netflow","sip":"10.0.0.3","dport":{},"action":"syn","event_time":{}}}"#,
             port,
             base + t * sec
         ));
@@ -339,7 +339,7 @@ rule conv_mixed {
     for port in [80, 443] {
         t += 1;
         lines.push(format!(
-            r#"{{"sip":"10.0.0.4","dport":{},"action":"syn","event_time":{}}}"#,
+            r#"{{"_stream":"netflow","sip":"10.0.0.4","dport":{},"action":"syn","event_time":{}}}"#,
             port,
             base + t * sec
         ));
@@ -348,7 +348,7 @@ rule conv_mixed {
     let ndjson = lines.join("\n");
     let reader = BufReader::new(ndjson.as_bytes());
 
-    let result = replay_events(wfl, &schemas, reader, "c", false).expect("replay should succeed");
+    let result = replay_events(wfl, &schemas, reader, false).expect("replay should succeed");
 
     // 3 qualifying outputs, conv top(2) keeps 2; IP-D non-qualifying → no alert
     assert_eq!(result.match_count, 2, "expected 2 alerts after conv top(2)");
@@ -380,16 +380,16 @@ rule pipe_replay {
 
     let base_nanos = 1_700_000_000_000_000_000i64;
     let ndjson = format!(
-        r#"{{"sip":"10.0.0.1","action":"failed","user":"admin","event_time":{}}}"#,
+        r#"{{"_stream":"auth_stream","sip":"10.0.0.1","action":"failed","user":"admin","event_time":{}}}"#,
         base_nanos
     ) + "\n"
         + &format!(
-            r#"{{"sip":"10.0.0.1","action":"failed","user":"admin","event_time":{}}}"#,
+            r#"{{"_stream":"auth_stream","sip":"10.0.0.1","action":"failed","user":"admin","event_time":{}}}"#,
             base_nanos + 1_000_000_000
         );
     let reader = BufReader::new(ndjson.as_bytes());
 
-    let result = replay_events(wfl, &schemas, reader, "e", false).expect("replay should succeed");
+    let result = replay_events(wfl, &schemas, reader, false).expect("replay should succeed");
     assert_eq!(result.event_count, 2);
     assert_eq!(result.match_count, 1);
     assert_eq!(result.error_count, 0);

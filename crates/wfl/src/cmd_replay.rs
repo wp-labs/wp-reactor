@@ -33,7 +33,6 @@ pub fn run(
     file: PathBuf,
     schemas: Vec<String>,
     input: PathBuf,
-    alias: String,
     vars: Vec<String>,
 ) -> Result<()> {
     use wf_config::project::{load_schemas, load_wfl, parse_vars};
@@ -50,7 +49,7 @@ pub fn run(
             .map_err(|e| anyhow::anyhow!("failed to open {}: {}", input.display(), e))?,
     );
 
-    let result = replay_events(&source, &all_schemas, reader, &alias, color)?;
+    let result = replay_events(&source, &all_schemas, reader, color)?;
 
     for alert in &result.alerts {
         match serde_json::to_string(alert) {
@@ -91,11 +90,13 @@ pub fn run(
 ///
 /// Returns all alerts plus statistics. This function is testable without
 /// filesystem access.
+///
+/// Events are automatically routed based on their `_stream` field and the
+/// rule's bind definitions. No manual event alias is required.
 pub fn replay_events<R: BufRead>(
     wfl_source: &str,
     schemas: &[WindowSchema],
     reader: R,
-    alias: &str,
     color: bool,
 ) -> Result<ReplayResult> {
     let wfl_file =
@@ -111,7 +112,7 @@ pub fn replay_events<R: BufRead>(
         });
     }
 
-    replay_with_plans(&plans, schemas, reader, alias, color)
+    replay_with_plans(&plans, schemas, reader, color)
 }
 
 /// Stub [`WindowLookup`] for replay mode.
@@ -147,17 +148,31 @@ struct ConsumerRoute {
 }
 
 /// Replay events against pre-compiled rule plans.
+///
+/// Events are automatically routed based on `_stream` field and rule definitions.
+/// The routing logic:
+/// 1. Read `_stream` from JSONL (e.g., "syslog")
+/// 2. Find which window subscribes to this stream (from schema)
+/// 3. Find which binds reference that window (from rule)
+/// 4. Apply each bind's filter to the event
+/// 5. Route matching events to the appropriate engine
 fn replay_with_plans<R: BufRead>(
     plans: &[RulePlan],
     schemas: &[WindowSchema],
     reader: R,
-    alias: &str,
     color: bool,
 ) -> Result<ReplayResult> {
+    // Build stream -> window mapping from schemas
+    let stream_to_windows: HashMap<String, Vec<String>> = build_stream_to_windows_map(schemas);
+
+    // Build window -> binds mapping from rules
+    let window_to_binds: HashMap<String, Vec<(usize, String)>> = build_window_to_binds_map(plans);
+
     let mut engines: Vec<ReplayEngine> = plans
         .iter()
-        .map(|plan| {
-            let time_field = resolve_replay_time_field(plan, schemas, alias);
+        .enumerate()
+        .map(|(_engine_idx, plan)| {
+            let time_field = resolve_replay_time_field_auto(plan, schemas);
 
             let limits = plan.limits_plan.clone();
             let sm = CepStateMachine::with_limits(
@@ -174,7 +189,9 @@ fn replay_with_plans<R: BufRead>(
             }
         })
         .collect();
-    let routes = build_replay_routes(plans);
+
+    // Build routes for all binds (external and internal)
+    let all_routes = build_all_routes(plans);
 
     let lookup = NullWindowLookup;
     let mut alerts = Vec::new();
@@ -214,10 +231,17 @@ fn replay_with_plans<R: BufRead>(
         let event = json_to_event(&json);
         event_count += 1;
 
-        let mut queue = VecDeque::from([(external_route_key(alias), event)]);
+        // Auto-route: find binds that should receive this event
+        let route_keys = resolve_event_routes(&json, &stream_to_windows, &window_to_binds);
+
+        let mut queue = VecDeque::new();
+        for route_key in route_keys {
+            queue.push_back((route_key, event.clone()));
+        }
+
         while let Some((route_key, route_event)) = queue.pop_front() {
             route_event_once(
-                &routes,
+                &all_routes,
                 &mut engines,
                 &lookup,
                 &route_key,
@@ -262,7 +286,7 @@ fn replay_with_plans<R: BufRead>(
         }
         while let Some((route_key, route_event)) = queue.pop_front() {
             route_event_once(
-                &routes,
+                &all_routes,
                 &mut engines,
                 &lookup,
                 &route_key,
@@ -284,12 +308,92 @@ fn replay_with_plans<R: BufRead>(
     })
 }
 
-fn resolve_replay_time_field(
+/// Build mapping from stream name to window names that subscribe to it.
+fn build_stream_to_windows_map(schemas: &[WindowSchema]) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for schema in schemas {
+        for stream in &schema.streams {
+            map.entry(stream.clone())
+                .or_default()
+                .push(schema.name.clone());
+        }
+    }
+    map
+}
+
+/// Build mapping from window name to (engine_idx, bind_alias) pairs.
+fn build_window_to_binds_map(plans: &[RulePlan]) -> HashMap<String, Vec<(usize, String)>> {
+    let mut map: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    for (engine_idx, plan) in plans.iter().enumerate() {
+        for bind in &plan.binds {
+            if !is_internal_window_name(&bind.window) {
+                map.entry(bind.window.clone())
+                    .or_default()
+                    .push((engine_idx, bind.alias.clone()));
+            }
+        }
+    }
+    map
+}
+
+/// Resolve which route keys an event should be sent to based on its `_stream` field.
+fn resolve_event_routes(
+    json: &serde_json::Value,
+    stream_to_windows: &HashMap<String, Vec<String>>,
+    window_to_binds: &HashMap<String, Vec<(usize, String)>>,
+) -> Vec<String> {
+    let mut routes = Vec::new();
+
+    // Get _stream from JSON
+    let stream_name = json
+        .get("_stream")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if stream_name.is_empty() {
+        return routes;
+    }
+
+    // Find windows that subscribe to this stream
+    let windows = stream_to_windows.get(stream_name).cloned().unwrap_or_default();
+
+    // Find binds for each window
+    for window in windows {
+        let binds = window_to_binds.get(&window).cloned().unwrap_or_default();
+        for (_engine_idx, bind_alias) in binds {
+            routes.push(external_route_key(&bind_alias));
+        }
+    }
+
+    routes
+}
+
+fn resolve_replay_time_field_auto(
     plan: &RulePlan,
     schemas: &[WindowSchema],
-    replay_alias: &str,
 ) -> Option<String> {
-    if let Some(bind) = plan.binds.iter().find(|b| b.alias == replay_alias) {
+    // For multi-source rules, prefer the bind that's used in the first event step
+    // This matches the most common case where events come from the primary source
+    if let Some(first_step) = plan.match_plan.event_steps.first() {
+        if let Some(first_branch) = first_step.branches.first() {
+            let source_alias = &first_branch.source;
+            if let Some(bind) = plan.binds.iter().find(|b| b.alias == *source_alias) {
+                if is_internal_window_name(&bind.window) {
+                    return Some(PIPE_EVENT_TIME_FIELD.to_string());
+                }
+                if let Some(tf) = schemas
+                    .iter()
+                    .find(|s| s.name == bind.window)
+                    .and_then(|s| s.time_field.clone())
+                {
+                    return Some(tf);
+                }
+            }
+        }
+    }
+
+    // Fallback: find the first bind with a non-internal window
+    for bind in &plan.binds {
         if is_internal_window_name(&bind.window) {
             return Some(PIPE_EVENT_TIME_FIELD.to_string());
         }
@@ -301,13 +405,15 @@ fn resolve_replay_time_field(
             return Some(tf);
         }
     }
+
+    // Final fallback: check for internal window
     plan.binds
         .iter()
         .find(|b| is_internal_window_name(&b.window))
         .map(|_| PIPE_EVENT_TIME_FIELD.to_string())
 }
 
-fn build_replay_routes(plans: &[RulePlan]) -> HashMap<String, Vec<ConsumerRoute>> {
+fn build_all_routes(plans: &[RulePlan]) -> HashMap<String, Vec<ConsumerRoute>> {
     let mut routes: HashMap<String, Vec<ConsumerRoute>> = HashMap::new();
     for (engine_idx, plan) in plans.iter().enumerate() {
         for bind in &plan.binds {

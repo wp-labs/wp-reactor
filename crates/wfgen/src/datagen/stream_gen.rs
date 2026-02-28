@@ -12,7 +12,9 @@ use super::field_gen::generate_field_value;
 /// A single generated event.
 #[derive(Debug, Clone)]
 pub struct GenEvent {
-    pub stream_alias: String,
+    /// The actual stream name from schema (e.g., "syslog"), used for `_stream` in output.
+    pub stream_name: String,
+    /// The window name (e.g., "auth_events").
     pub window_name: String,
     pub timestamp: DateTime<Utc>,
     pub fields: serde_json::Map<String, Value>,
@@ -28,6 +30,13 @@ pub fn generate_stream_events(
     rng: &mut StdRng,
 ) -> Vec<GenEvent> {
     let mut events = Vec::with_capacity(event_count as usize);
+
+    // Get the actual stream name from schema (e.g., "syslog")
+    let stream_name = schema
+        .streams
+        .first()
+        .cloned()
+        .unwrap_or_else(|| schema.name.clone());
 
     // Build field override lookup
     let overrides: HashMap<&str, &GenExpr> = stream
@@ -65,7 +74,7 @@ pub fn generate_stream_events(
         }
 
         events.push(GenEvent {
-            stream_alias: stream.alias.clone(),
+            stream_name: stream_name.clone(),
             window_name: stream.window.clone(),
             timestamp: ts,
             fields,

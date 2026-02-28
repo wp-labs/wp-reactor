@@ -22,7 +22,7 @@ pub fn write_jsonl(events: &[GenEvent], output_path: &Path) -> anyhow::Result<()
         let mut obj = serde_json::Map::new();
         obj.insert(
             "_stream".to_string(),
-            serde_json::Value::String(event.stream_alias.clone()),
+            serde_json::Value::String(event.stream_name.clone()),
         );
         obj.insert(
             "_window".to_string(),
@@ -81,7 +81,7 @@ pub fn read_events_jsonl(path: &Path) -> anyhow::Result<Vec<GenEvent>> {
 
         let obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&line)?;
 
-        let stream_alias = obj
+        let stream_name = obj
             .get("_stream")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -107,7 +107,7 @@ pub fn read_events_jsonl(path: &Path) -> anyhow::Result<Vec<GenEvent>> {
         }
 
         events.push(GenEvent {
-            stream_alias,
+            stream_name,
             window_name,
             timestamp,
             fields,

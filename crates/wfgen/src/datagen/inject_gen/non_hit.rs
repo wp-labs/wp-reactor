@@ -75,10 +75,24 @@ pub(super) fn generate_non_hit_events(
             };
             let ts = *start + ChronoDuration::nanoseconds(offset_nanos);
 
-            let fields = build_event_fields(schema, &overrides_map, &key_overrides, &ts, rng);
+            let fields = build_event_fields(
+                schema,
+                &overrides_map,
+                &key_overrides,
+                &step.filter_overrides,
+                &ts,
+                rng,
+            );
+
+            // Use the actual stream name from schema (e.g., "syslog")
+            let stream_name = schema
+                .streams
+                .first()
+                .cloned()
+                .unwrap_or_else(|| schema.name.clone());
 
             events.push(GenEvent {
-                stream_alias: step.scenario_alias.clone(),
+                stream_name,
                 window_name: step.window_name.clone(),
                 timestamp: ts,
                 fields,

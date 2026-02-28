@@ -125,10 +125,24 @@ pub(super) fn generate_cluster_events(
                 + (per_step_window * i as f64 / event_count.max(1) as f64);
             let ts = *start + ChronoDuration::nanoseconds((event_offset_secs * 1e9) as i64);
 
-            let fields = build_event_fields(schema, &overrides_map, key_overrides, &ts, rng);
+            let fields = build_event_fields(
+                schema,
+                &overrides_map,
+                key_overrides,
+                &step.filter_overrides,
+                &ts,
+                rng,
+            );
+
+            // Use the actual stream name from schema (e.g., "syslog")
+            let stream_name = schema
+                .streams
+                .first()
+                .cloned()
+                .unwrap_or_else(|| schema.name.clone());
 
             out.push(GenEvent {
-                stream_alias: step.scenario_alias.clone(),
+                stream_name,
                 window_name: step.window_name.clone(),
                 timestamp: ts,
                 fields,
@@ -141,24 +155,31 @@ pub(super) fn generate_cluster_events(
     Ok(())
 }
 
-/// Build event fields with key overrides applied.
+/// Build event fields with key and filter overrides applied.
 pub(super) fn build_event_fields(
     schema: &WindowSchema,
     overrides_map: &HashMap<&str, &crate::wfg_ast::GenExpr>,
     key_overrides: &HashMap<String, serde_json::Value>,
+    filter_overrides: &HashMap<String, serde_json::Value>,
     ts: &DateTime<Utc>,
     rng: &mut StdRng,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut fields = serde_json::Map::new();
 
     for field_def in &schema.fields {
-        // Key field override
+        // 1. Key field override (highest priority)
         if let Some(value) = key_overrides.get(&field_def.name) {
             fields.insert(field_def.name.clone(), value.clone());
             continue;
         }
 
-        // Time field
+        // 2. Filter override (bind filter constraints)
+        if let Some(value) = filter_overrides.get(&field_def.name) {
+            fields.insert(field_def.name.clone(), value.clone());
+            continue;
+        }
+
+        // 3. Time field
         if matches!(&field_def.field_type, FieldType::Base(BaseType::Time)) {
             let override_expr = overrides_map.get(field_def.name.as_str()).copied();
             if override_expr.is_none()
@@ -172,7 +193,7 @@ pub(super) fn build_event_fields(
             }
         }
 
-        // Normal field with possible stream override
+        // 4. Normal field with possible stream override
         let override_expr = overrides_map.get(field_def.name.as_str()).copied();
         let value = generate_field_value(&field_def.field_type, override_expr, rng);
         fields.insert(field_def.name.clone(), value);

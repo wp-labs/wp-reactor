@@ -30,6 +30,9 @@ pub(super) struct StepInfo {
     #[allow(dead_code)]
     pub(super) measure: Measure,
     pub(super) threshold: u64,
+    /// Field equality constraints extracted from bind filter.
+    /// These override randomly generated values for hit/near_miss events.
+    pub(super) filter_overrides: HashMap<String, serde_json::Value>,
 }
 
 /// Alias mapping between scenario streams and rule binds.

@@ -59,7 +59,7 @@ pub fn write_arrow_ipc(events: &[GenEvent], output_path: &Path) -> anyhow::Resul
         let values: Vec<Option<String>> = events
             .iter()
             .map(|event| match field_name.as_str() {
-                "_stream" => Some(event.stream_alias.clone()),
+                "_stream" => Some(event.stream_name.clone()),
                 "_window" => Some(event.window_name.clone()),
                 "_timestamp" => Some(event.timestamp.to_rfc3339()),
                 name => event.fields.get(name).map(|v| match v {

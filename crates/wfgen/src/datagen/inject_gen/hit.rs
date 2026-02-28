@@ -37,6 +37,7 @@ pub(super) fn generate_hit_clusters(
                 window_name: s.window_name.clone(),
                 measure: s.measure,
                 threshold: cpe, // override
+                filter_overrides: s.filter_overrides.clone(),
             })
             .collect()
     } else {

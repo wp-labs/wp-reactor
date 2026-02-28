@@ -99,7 +99,16 @@
       "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/sum && /Users/zuowenjian/devspace/wp-labs/wp-reactor/target/debug/wfl test rules/data_exfil.wfl -s schemas/network.wfs 2>&1)",
       "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/distinct && /Users/zuowenjian/devspace/wp-labs/wp-reactor/target/debug/wfl test rules/port_scan.wfl -s schemas/network.wfs 2>&1)",
       "Bash(wfl test rules/chain_attack.wfl --schemas \"schemas/*.wfs\" 2>&1)",
-      "Bash(echo === $dir ===:*)"
+      "Bash(echo === $dir ===:*)",
+      "Bash(cd /Users/zuowenjian/devspace/wp-labs/wp-reactor/examples/count && /Users/zuowenjian/devspace/wp-labs/wp-reactor/target/release/wfgen gen --scenario scenarios/brute_force.wfg --out ./data/ 2>&1)",
+      "Bash(/Users/zuowenjian/devspace/wp-labs/wp-reactor/target/release/wfgen gen --scenario scenarios/brute_force.wfg --out ./data/ 2>&1 | head -50)",
+      "Bash(/Users/zuowenjian/devspace/wp-labs/wp-reactor/target/release/wfgen gen --scenario scenarios/brute_force.wfg --out ./data/ 2>&1 | grep -c \"applying filter override\")",
+      "Bash(/Users/zuowenjian/devspace/wp-labs/wp-reactor/target/release/wfgen gen --scenario scenarios/brute_force.wfg --out ./data/ 2>&1 | tail -5)",
+      "Bash(/Users/zuowenjian/devspace/wp-labs/wp-reactor/target/release/wfgen gen --scenario scenarios/brute_force.wfg --out ./data/ 2>&1)",
+      "Bash(wfl replay --help 2>&1 | head -30)",
+      "Bash(wfl replay -i ./data/brute_force_detect.jsonl --event fail rules/brute_force.wfl 2>&1)",
+      "Bash(/Users/zuowenjian/devspace/wp-labs/wp-reactor/target/release/wfl replay -i ./data/brute_force_detect.jsonl rules/brute_force.wfl 2>&1 | head -10)",
+      "Bash(/Users/zuowenjian/devspace/wp-labs/wp-reactor/target/release/wfl replay -i ./data/brute_force_detect.jsonl rules/brute_force.wfl 2>&1 | tail -5)"
     ]
   }
 }
