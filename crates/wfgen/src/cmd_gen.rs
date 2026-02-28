@@ -68,17 +68,23 @@ pub(crate) fn run(
         }
     }
 
-    // When oracle is enabled (syntax-priority: .wfg has oracle block),
-    // WFL compilation failures are fatal — the user explicitly expects
-    // oracle output, so silently skipping it is wrong.
-    let oracle_requested = wfg.scenario.oracle.is_some() && !no_oracle;
+    // Expected output is requested by either:
+    // - legacy oracle block, or
+    // - new syntax expect block.
+    // If requested, WFL compile failures must be fatal.
+    let expect_requested = wfg
+        .syntax
+        .as_ref()
+        .and_then(|s| s.expect.as_ref())
+        .is_some();
+    let expected_requested = (wfg.scenario.oracle.is_some() || expect_requested) && !no_oracle;
     if !compile_errors.is_empty() {
-        if oracle_requested {
+        if expected_requested {
             for e in &compile_errors {
                 eprintln!("Error: WFL compilation failed: {}", e);
             }
             anyhow::bail!(
-                "WFL compilation failed and oracle block is present; \
+                "WFL compilation failed while expected output is enabled; \
                  fix the WFL errors or use --no-oracle"
             );
         } else {
@@ -91,11 +97,10 @@ pub(crate) fn run(
     // Generate clean events
     let result = generate(&wfg, &schemas, &rule_plans)?;
 
-    // Oracle evaluation (on CLEAN events, before faults)
-    // Syntax priority: oracle runs when .wfg has oracle block, unless --no-oracle
-    let oracle_enabled = oracle_requested && !rule_plans.is_empty();
-    let mut oracle_alert_count = 0;
-    if oracle_enabled {
+    // Expected alert generation (on CLEAN events, before faults).
+    let expected_enabled = expected_requested && !rule_plans.is_empty();
+    let mut expected_alert_count = 0;
+    if expected_enabled {
         let start = wfg.scenario.time_clause.start.parse().map_err(|e| {
             anyhow::anyhow!(
                 "invalid start time '{}': {}",
@@ -113,21 +118,21 @@ pub(crate) fn run(
             .map(|i| i.rule.clone())
             .collect();
 
-        let oracle_result = run_oracle(
+        let expected_result = run_oracle(
             &result.events,
             &rule_plans,
             &start,
             &duration,
             Some(&injected_rules),
         )?;
-        oracle_alert_count = oracle_result.alerts.len();
+        expected_alert_count = expected_result.alerts.len();
 
-        let oracle_file = out.join(format!("{}.oracle.jsonl", wfg.scenario.name));
-        write_oracle_jsonl(&oracle_result.alerts, &oracle_file)?;
+        let expected_file = out.join(format!("{}.except.jsonl", wfg.scenario.name));
+        write_oracle_jsonl(&expected_result.alerts, &expected_file)?;
         println!(
-            "Oracle: {} alerts -> {}",
-            oracle_result.alerts.len(),
-            oracle_file.display()
+            "Expected: {} alerts -> {}",
+            expected_result.alerts.len(),
+            expected_file.display()
         );
 
         // Write tolerances sidecar so `verify` can read them as defaults
@@ -137,11 +142,12 @@ pub(crate) fn run(
             .as_ref()
             .map(extract_oracle_tolerances)
             .unwrap_or_default();
-        let meta_file = out.join(format!("{}.oracle.meta.json", wfg.scenario.name));
-        let meta_json = serde_json::to_string_pretty(&tolerances)?;
+        let meta_file = out.join(format!("{}.except.meta.jsonl", wfg.scenario.name));
+        let meta_json = serde_json::to_string(&tolerances)?;
         std::fs::write(&meta_file, meta_json)?;
+        println!("Expected meta -> {}", meta_file.display());
     }
-    let _ = oracle_alert_count;
+    let _ = expected_alert_count;
 
     // Apply faults (after oracle, on clean events)
     let has_faults = wfg.scenario.faults.is_some();
@@ -154,9 +160,9 @@ pub(crate) fn run(
         result.events
     };
 
-    // Post-fault oracle (M33 P2): run oracle again on faulted events
+    // Post-fault expected generation (M33 P2): run oracle again on faulted events
     // so verify can compare clean vs faulted outcomes.
-    if oracle_enabled && has_faults {
+    if expected_enabled && has_faults {
         let start = wfg.scenario.time_clause.start.parse().map_err(|e| {
             anyhow::anyhow!(
                 "invalid start time '{}': {}",
@@ -173,7 +179,7 @@ pub(crate) fn run(
             .map(|i| i.rule.clone())
             .collect();
 
-        let faulted_oracle = run_oracle(
+        let faulted_expected = run_oracle(
             &output_events,
             &rule_plans,
             &start,
@@ -181,12 +187,12 @@ pub(crate) fn run(
             Some(&injected_rules),
         )?;
 
-        let faulted_oracle_file = out.join(format!("{}.faulted-oracle.jsonl", wfg.scenario.name));
-        write_oracle_jsonl(&faulted_oracle.alerts, &faulted_oracle_file)?;
+        let faulted_expected_file = out.join(format!("{}.faulted-except.jsonl", wfg.scenario.name));
+        write_oracle_jsonl(&faulted_expected.alerts, &faulted_expected_file)?;
         println!(
-            "Faulted oracle: {} alerts -> {}",
-            faulted_oracle.alerts.len(),
-            faulted_oracle_file.display()
+            "Faulted expected: {} alerts -> {}",
+            faulted_expected.alerts.len(),
+            faulted_expected_file.display()
         );
     }
 

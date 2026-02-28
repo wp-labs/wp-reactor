@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use rand::rngs::StdRng;
 use serde_json::Value;
 use wf_lang::{BaseType, FieldType, WindowSchema};
@@ -65,7 +65,10 @@ pub fn generate_stream_events(
                 && (override_expr.is_none()
                     || matches!(override_expr, Some(GenExpr::GenFunc { name, .. }) if name == "timestamp"))
             {
-                fields.insert(field_def.name.clone(), Value::String(ts.to_rfc3339()));
+                fields.insert(
+                    field_def.name.clone(),
+                    Value::String(ts.to_rfc3339_opts(SecondsFormat::Millis, true)),
+                );
                 continue;
             }
 

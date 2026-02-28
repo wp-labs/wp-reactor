@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::datagen::stream_gen::GenEvent;
 use crate::oracle::OracleAlert;
@@ -30,7 +30,7 @@ pub fn write_jsonl(events: &[GenEvent], output_path: &Path) -> anyhow::Result<()
         );
         obj.insert(
             "_timestamp".to_string(),
-            serde_json::Value::String(event.timestamp.to_rfc3339()),
+            serde_json::Value::String(event.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)),
         );
 
         // Merge event fields

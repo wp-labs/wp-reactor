@@ -76,6 +76,44 @@ enum Commands {
         var: Vec<String>,
     },
 
+    /// Replay NDJSON and verify against oracle expected alerts in one step
+    ReplayVerify {
+        /// Path to the .wfl rule file
+        file: PathBuf,
+
+        /// Schema file glob patterns (e.g. "schemas/*.wfs")
+        #[arg(short, long, default_value = "schemas/*.wfs")]
+        schemas: Vec<String>,
+
+        /// NDJSON input data file
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Variable substitutions in KEY=VALUE format
+        #[arg(long)]
+        var: Vec<String>,
+
+        /// Path to oracle (expected) JSONL file
+        #[arg(long)]
+        expected: PathBuf,
+
+        /// Score tolerance for matching (overrides meta if set)
+        #[arg(long)]
+        score_tolerance: Option<f64>,
+
+        /// Time tolerance for matching in seconds (overrides meta if set)
+        #[arg(long)]
+        time_tolerance: Option<f64>,
+
+        /// Path to oracle meta JSON with tolerances
+        #[arg(long)]
+        meta: Option<PathBuf>,
+
+        /// Output format: "json" or "markdown" (default: json)
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+
     /// Run contract tests against compiled rules
     Test {
         /// Path to the .wfl rule file (must contain contract blocks)
@@ -126,6 +164,30 @@ fn main() -> Result<()> {
             var,
         } => {
             wfl::cmd_replay::run(file, schemas, input, var)?;
+        }
+
+        Commands::ReplayVerify {
+            file,
+            schemas,
+            input,
+            var,
+            expected,
+            score_tolerance,
+            time_tolerance,
+            meta,
+            format,
+        } => {
+            wfl::cmd_replay_verify::run(
+                file,
+                schemas,
+                input,
+                var,
+                expected,
+                score_tolerance,
+                time_tolerance,
+                meta,
+                format,
+            )?;
         }
 
         Commands::Test {

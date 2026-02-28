@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use rand::rngs::StdRng;
 use wf_lang::{BaseType, FieldType, WindowSchema};
 
@@ -187,7 +187,7 @@ pub(super) fn build_event_fields(
             {
                 fields.insert(
                     field_def.name.clone(),
-                    serde_json::Value::String(ts.to_rfc3339()),
+                    serde_json::Value::String(ts.to_rfc3339_opts(SecondsFormat::Millis, true)),
                 );
                 continue;
             }

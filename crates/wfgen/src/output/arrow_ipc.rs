@@ -9,7 +9,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::writer::FileWriter;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 
 use wf_lang::{BaseType, FieldType, WindowSchema};
 
@@ -61,7 +61,7 @@ pub fn write_arrow_ipc(events: &[GenEvent], output_path: &Path) -> anyhow::Resul
             .map(|event| match field_name.as_str() {
                 "_stream" => Some(event.stream_name.clone()),
                 "_window" => Some(event.window_name.clone()),
-                "_timestamp" => Some(event.timestamp.to_rfc3339()),
+                "_timestamp" => Some(event.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)),
                 name => event.fields.get(name).map(|v| match v {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),

@@ -1550,6 +1550,23 @@ FAIL  edge_case_test (brute_force)
 - 有失败时退出码为 1，适合 CI 集成。
 - 无测试时输出 `No tests found.`。
 
+### 9.7 wfl replay-verify
+
+单命令完成「replay + verify」：
+
+```bash
+wfl replay-verify rules/brute_force.wfl \
+    --schemas "schemas/*.wfs" \
+    --input data/brute_force_detect.jsonl \
+    --expected data/brute_force_detect.except.jsonl \
+    --meta data/brute_force_detect.except.meta.jsonl \
+    --format markdown
+```
+
+- `--expected` 为 expected JSONL（`*.except.jsonl`）。
+- `--meta` 可选；用于读取 `time_tolerance` / `score_tolerance` 默认值。
+- 通过时退出码 `0`，失败时退出码 `1`。
+
 ---
 
 ## 10. 测试数据生成 (wfgen)
@@ -1632,8 +1649,8 @@ wfgen send \
 # 对拍验证
 wfgen verify \
   --actual out/actual_alerts.jsonl \
-  --expected out/brute_force_detect.oracle.jsonl \
-  --meta out/brute_force_detect.oracle.meta.json
+  --expected out/brute_force_detect.except.jsonl \
+  --meta out/brute_force_detect.except.meta.jsonl
 
 # 端到端持续压测（持续生成并发送 5 分钟）
 wfgen bench \
@@ -1665,7 +1682,7 @@ cargo test -p wf-runtime e2e_datagen_brute_force -- --nocapture
 1. 加载 `.wfg` 场景并生成事件（wfgen）
 2. 启动 `wfusion` runtime
 3. 通过 TCP 发送 Arrow IPC 数据到 runtime
-4. 将实际告警与 oracle 对拍（verify）
+4. 将实际告警与 expected 对拍（verify）
 
 产物目录：
 
@@ -1678,7 +1695,7 @@ cargo test -p wf-runtime e2e_datagen_brute_force -- --nocapture
 # 1) 启动 runtime（另一个终端）
 wfusion run --config examples/wfusion.toml --metrics --metrics-interval 2s
 
-# 2) 生成事件与 oracle，并直接发送到 wfusion（推荐）
+# 2) 生成事件与 expected，并直接发送到 wfusion（推荐）
 wfgen gen \
   --scenario examples/count/scenarios/brute_force.wfg \
   --format jsonl \
@@ -1689,8 +1706,8 @@ wfgen gen \
 # 3) 对拍
 wfgen verify \
   --actual examples/alerts/all.jsonl \
-  --expected out/brute_force_detect.oracle.jsonl \
-  --meta out/brute_force_detect.oracle.meta.json \
+  --expected out/brute_force_detect.except.jsonl \
+  --meta out/brute_force_detect.except.meta.jsonl \
   --format markdown
 ```
 
