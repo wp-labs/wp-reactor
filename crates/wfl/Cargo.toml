@@ -17,7 +17,7 @@ wf-config = { path = "../wf-config" }
 wf-lang = { path = "../wf-lang" }
 wf-core = { path = "../wf-core" }
 wfgen = { path = "../wfgen" }
-tree-sitter = "0.22"
+tree-sitter = "0.26"
 tree-sitter-wfl = { git = "https://github.com/wp-labs/tree-sitter-wfl.git", branch = "main"}
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
