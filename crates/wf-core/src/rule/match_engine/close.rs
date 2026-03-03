@@ -143,7 +143,7 @@ fn evaluate_close_step(
         // Check accumulated threshold (no new accumulation)
         let bs = &step_state.branch_states[branch_idx];
         if check_threshold(&branch.agg, bs) {
-            let measure_val = compute_measure(&branch.agg.measure, bs);
+            let measure_val = compute_measure(&branch.agg.measure, bs, &branch.agg.transforms);
             return Some((branch_idx, measure_val));
         }
     }

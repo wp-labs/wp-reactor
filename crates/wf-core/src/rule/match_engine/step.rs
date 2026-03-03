@@ -53,7 +53,7 @@ pub(super) fn evaluate_step(
         let satisfied = check_threshold(&branch.agg, bs);
 
         if satisfied {
-            let measure_val = compute_measure(&branch.agg.measure, bs);
+            let measure_val = compute_measure(&branch.agg.measure, bs, &branch.agg.transforms);
             return Some((branch_idx, measure_val));
         }
     }
@@ -163,7 +163,13 @@ fn update_extreme(
     }
 }
 
-pub(super) fn compute_measure(measure: &Measure, bs: &BranchState) -> f64 {
+pub(super) fn compute_measure(measure: &Measure, bs: &BranchState, transforms: &[Transform]) -> f64 {
+    // Handle Distinct transform: return distinct_set size instead of raw count
+    let has_distinct = transforms.iter().any(|t| *t == Transform::Distinct);
+    if has_distinct && matches!(measure, Measure::Count) {
+        return bs.distinct_set.len() as f64;
+    }
+    
     match measure {
         Measure::Count => bs.count as f64,
         Measure::Sum => bs.sum,
@@ -189,7 +195,14 @@ pub(super) fn compute_measure(measure: &Measure, bs: &BranchState) -> f64 {
 ///    OR the threshold is non-constant → fall back to Value-based comparison.
 /// 3. If neither path resolves, the check returns `false` (not satisfied).
 pub(super) fn check_threshold(agg: &AggPlan, bs: &BranchState) -> bool {
-    let measure_f64 = compute_measure(&agg.measure, bs);
+    // Handle Distinct transform: when transforms contains Distinct and measure is Count,
+    // use the distinct_set size instead of the raw count.
+    let has_distinct = agg.transforms.iter().any(|t| *t == Transform::Distinct);
+    let measure_f64 = if has_distinct && matches!(agg.measure, Measure::Count) {
+        bs.distinct_set.len() as f64
+    } else {
+        compute_measure(&agg.measure, bs, &agg.transforms)
+    };
 
     // Fast path: threshold is a constant numeric expression
     if let Some(threshold_f64) = try_eval_expr_to_f64(&agg.threshold) {

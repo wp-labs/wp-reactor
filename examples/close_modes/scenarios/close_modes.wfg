@@ -1,0 +1,30 @@
+use "../schemas/network.wfs"
+use "../rules/close_demo.wfl"
+
+#[duration=10m]
+scenario close_modes_detect<seed=42> {
+  traffic {
+    stream conn_events gen 50/s
+  }
+
+  injection {
+    // 命中场景：触发 close_demo 规则
+    hit<30%> conn_events {
+      sip seq {
+        use(action="syn") with(1,1m)
+      }
+    }
+
+    // 未命中场景：正常流量
+    miss<70%> conn_events {
+      sip seq {
+        use(action="ack") with(1,30s)
+      }
+    }
+  }
+
+  expect {
+    hit(close_demo) >= 95%
+    miss(close_demo) <= 0.1%
+  }
+}
