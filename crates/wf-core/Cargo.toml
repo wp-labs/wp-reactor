@@ -12,7 +12,7 @@ wf-config = { path = "../wf-config" }
 wf-lang = { path = "../wf-lang" }
 wp-connector-api = { workspace = true }
 wp-model-core = "0.8"
-arrow = { version = "54", default-features = false, features = ["ipc"] }
+arrow = { version = "58", default-features = false, features = ["ipc"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = "1.0"
@@ -27,4 +27,4 @@ regex = "1"
 chrono = "0.4"
 
 [dev-dependencies]
-arrow = { version = "54", default-features = false, features = ["ipc"] }
+arrow = { version = "58", default-features = false, features = ["ipc"] }
