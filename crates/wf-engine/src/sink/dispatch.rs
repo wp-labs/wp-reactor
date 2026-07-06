@@ -71,8 +71,10 @@ impl SinkDispatcher {
 
     /// Route alert records to matching sinks by yield-target window name.
     ///
-    /// Returns 1 if a pre-bound route was found, 0 if only default sinks were used.
-    pub async fn dispatch(&self, window_name: &str, alert_record: &DataRecord) -> usize {
+    /// Returns `(matched, had_error)` where `matched` is 1 if a pre-bound route
+    /// was found (0 if only default sinks were used), and `had_error` is true if
+    /// any sink send failed.
+    pub async fn dispatch(&self, window_name: &str, alert_record: &DataRecord) -> (usize, bool) {
         let (sinks, matched) = match self.routes.get(window_name) {
             Some(s) if !s.is_empty() => (s.as_slice(), 1),
             _ => (self.default_sinks.as_slice(), 0),
@@ -95,7 +97,7 @@ impl SinkDispatcher {
             }
         }
 
-        matched
+        (matched, had_error)
     }
 
     /// Check if any monitor sinks are configured.

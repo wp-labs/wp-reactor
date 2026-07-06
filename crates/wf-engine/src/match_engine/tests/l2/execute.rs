@@ -49,6 +49,7 @@ fn execute_match_without_joins_still_works() {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     // Old API still works

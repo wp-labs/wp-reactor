@@ -124,6 +124,9 @@ impl RuleExecutor {
             })
             .collect();
 
+        let machine_id = self.build_machine_id(&close.machine_id);
+        let scope_key = self.build_scope_key(&self.plan.match_plan.keys, &close.scope_key);
+
         Ok(Some(OutputRecord {
             wfx_id,
             rule_name: self.plan.name.clone(),
@@ -139,6 +142,8 @@ impl RuleExecutor {
             yield_fields,
             yield_field_types,
             event_time_nanos: close.last_event_nanos,
+            machine_id,
+            scope_key,
         }))
     }
 }

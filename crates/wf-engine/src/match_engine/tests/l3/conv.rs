@@ -21,6 +21,7 @@ fn make_close_output(
         close_step_data,
         bind_data: vec![],
         watermark_nanos: 0,
+        machine_id: String::new(),
         last_event_nanos: 0,
     }
 }

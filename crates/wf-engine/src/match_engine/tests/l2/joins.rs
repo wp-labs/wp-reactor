@@ -43,6 +43,7 @@ fn join_snapshot_enriches_context() {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     let alert = exec
@@ -96,6 +97,7 @@ fn join_entity_from_joined_field() {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     let alert = exec
@@ -149,6 +151,7 @@ fn join_no_match_falls_through() {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     // No join match — entity falls back to "sip" from keys
@@ -202,6 +205,7 @@ fn join_anti_excludes_matching_ip() {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     // Anti join matched whitelist entry — event should be silently dropped
@@ -251,6 +255,7 @@ fn join_anti_allows_non_matching_ip() {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     // Anti join found no match — event should proceed normally
@@ -308,6 +313,7 @@ fn join_close_with_joins() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        machine_id: String::new(),
         last_event_nanos: 0,
     };
 
@@ -374,6 +380,7 @@ fn join_asof_picks_latest_before_event_time() {
         }],
         bind_data: vec![],
         event_time_nanos: event_time,
+        machine_id: String::new(),
     };
 
     let alert = exec
@@ -442,6 +449,7 @@ fn join_asof_within_filters_old_rows() {
         }],
         bind_data: vec![],
         event_time_nanos: event_time,
+        machine_id: String::new(),
     };
 
     let alert = exec
@@ -489,6 +497,7 @@ fn join_asof_no_timestamp_support_skips() {
         }],
         bind_data: vec![],
         event_time_nanos: 1_000_000_000,
+        machine_id: String::new(),
     };
 
     // Join produces no match, but alert still works with score=42
@@ -564,6 +573,7 @@ fn join_asof_close_uses_last_event_nanos() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: watermark,
+        machine_id: String::new(),
         last_event_nanos: last_event,
     };
 

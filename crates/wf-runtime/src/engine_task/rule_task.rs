@@ -345,7 +345,7 @@ impl RuleTask {
             return;
         }
         if let Some(metrics) = &self.metrics {
-            metrics.inc_alert_emitted(&record.rule_name);
+            metrics.inc_alert_emitted(&record.rule_name, &record.machine_id, &record.scope_key);
             // E2E latency from event occurrence to alert emission
             let now_nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

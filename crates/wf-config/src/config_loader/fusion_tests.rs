@@ -88,7 +88,7 @@ rules   = "rules/*.wfl"
 
 #[test]
 fn load_full_toml() {
-    let cfg: FusionConfig = load_with_windows(&FULL_TOML, WINDOWS_TOML);
+    let cfg: FusionConfig = load_with_windows(FULL_TOML, WINDOWS_TOML);
 
     // mode
     assert_eq!(cfg.mode, FusionMode::Daemon);
@@ -219,7 +219,7 @@ rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules   = "rules/*.wfl"
 "#;
-    assert!(try_load_with_windows(&toml, WINDOWS_TOML).is_err());
+    assert!(try_load_with_windows(toml, WINDOWS_TOML).is_err());
 }
 
 #[test]
@@ -330,7 +330,7 @@ CASE_PATH = "/tmp/case-a"
 ENV = "dev"
 STREAM_NAME = "netflow"
 "#;
-    let cfg: FusionConfig = load_with_windows(&toml, WINDOWS_TOML);
+    let cfg: FusionConfig = load_with_windows(toml, WINDOWS_TOML);
     assert_eq!(cfg.sinks, "/tmp/case-a/sinks");
     assert_eq!(cfg.work_root.as_deref(), Some("/tmp/case-a"));
     assert_eq!(cfg.runtime.schemas, "/tmp/case-a/models/schemas/*.wfs");
@@ -378,7 +378,7 @@ rules = "${WF_CONFIG_TEST_CASE_PATH}/models/rules/*.wfl"
     unsafe {
         std::env::set_var("WF_CONFIG_TEST_CASE_PATH", "/tmp/case-env");
     }
-    let cfg: FusionConfig = load_with_windows(&toml, WINDOWS_TOML);
+    let cfg: FusionConfig = load_with_windows(toml, WINDOWS_TOML);
     unsafe {
         std::env::remove_var("WF_CONFIG_TEST_CASE_PATH");
     }

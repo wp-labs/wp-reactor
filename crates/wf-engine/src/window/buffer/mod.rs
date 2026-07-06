@@ -68,7 +68,13 @@ impl Window {
             return Ok(());
         }
 
-        if batch.schema() != self.schema {
+        // Accept batches that contain at least the window's fields (superset OK).
+        if !self.schema.fields().iter().all(|f| {
+            batch
+                .schema()
+                .field_with_name(f.name())
+                .is_ok_and(|bf| bf.data_type() == f.data_type())
+        }) {
             return CoreReason::DataFormat
                 .to_err()
                 .with_detail(format!(
@@ -123,6 +129,10 @@ impl Window {
 
     pub fn memory_usage(&self) -> usize {
         self.current_bytes
+    }
+
+    pub fn max_window_bytes(&self) -> usize {
+        self.config.max_window_bytes.as_bytes()
     }
 
     pub fn name(&self) -> &str {

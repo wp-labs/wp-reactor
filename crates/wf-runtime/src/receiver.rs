@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::reader::FileReader;
@@ -25,6 +25,7 @@ use crate::metrics::RuntimeMetrics;
 pub async fn replay_ndjson_file(
     path: &Path,
     stream_name: &str,
+    source_name: &str,
     schemas: &[WindowSchema],
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
@@ -82,9 +83,9 @@ pub async fn replay_ndjson_file(
                 if rows.len() >= FILE_BATCH_ROWS {
                     let batch = build_record_batch_from_json(&schema, &rows)?;
                     total_rows += batch.num_rows();
-                    if let Err(e) = route_batch(stream_name, batch, router.as_ref(), metrics.as_ref()) {
+                    if let Err(e) = route_batch(stream_name, source_name, batch, router.as_ref(), metrics.as_ref()) {
                         if let Some(metrics) = &metrics {
-                            metrics.inc_route_error();
+                            metrics.inc_route_error(source_name);
                         }
                         return Err(e);
                     }
@@ -97,9 +98,15 @@ pub async fn replay_ndjson_file(
     if !rows.is_empty() {
         let batch = build_record_batch_from_json(&schema, &rows)?;
         total_rows += batch.num_rows();
-        if let Err(e) = route_batch(stream_name, batch, router.as_ref(), metrics.as_ref()) {
+        if let Err(e) = route_batch(
+            stream_name,
+            source_name,
+            batch,
+            router.as_ref(),
+            metrics.as_ref(),
+        ) {
             if let Some(metrics) = &metrics {
-                metrics.inc_route_error();
+                metrics.inc_route_error(source_name);
             }
             return Err(e);
         }
@@ -122,6 +129,7 @@ pub async fn replay_ndjson_file(
 pub async fn replay_csv_file(
     path: &Path,
     stream_name: &str,
+    source_name: &str,
     schemas: &[WindowSchema],
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
@@ -195,9 +203,15 @@ pub async fn replay_csv_file(
 
         if rows.len() >= FILE_BATCH_ROWS_CSV {
             let batch = build_record_batch_from_json(&schema, &rows)?;
-            if let Err(e) = route_batch(&stream_name, batch, router.as_ref(), metrics.as_ref()) {
+            if let Err(e) = route_batch(
+                &stream_name,
+                source_name,
+                batch,
+                router.as_ref(),
+                metrics.as_ref(),
+            ) {
                 if let Some(metrics) = &metrics {
-                    metrics.inc_route_error();
+                    metrics.inc_route_error(source_name);
                 }
                 return Err(e);
             }
@@ -207,9 +221,15 @@ pub async fn replay_csv_file(
 
     if !rows.is_empty() {
         let batch = build_record_batch_from_json(&schema, &rows)?;
-        if let Err(e) = route_batch(&stream_name, batch, router.as_ref(), metrics.as_ref()) {
+        if let Err(e) = route_batch(
+            &stream_name,
+            source_name,
+            batch,
+            router.as_ref(),
+            metrics.as_ref(),
+        ) {
             if let Some(metrics) = &metrics {
-                metrics.inc_route_error();
+                metrics.inc_route_error(source_name);
             }
             return Err(e);
         }
@@ -230,6 +250,7 @@ pub async fn replay_csv_file(
 pub async fn replay_arrow_framed_file(
     path: &Path,
     stream_name: &str,
+    source_name: &str,
     schemas: &[WindowSchema],
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
@@ -274,9 +295,9 @@ pub async fn replay_arrow_framed_file(
                 validate_batch_schema_for_stream(schemas, stream, frame.batch.schema().as_ref())?;
 
                 total_rows += frame.batch.num_rows();
-                if let Err(e) = route_batch(stream, frame.batch, router.as_ref(), metrics.as_ref()) {
+                if let Err(e) = route_batch(stream, source_name, frame.batch, router.as_ref(), metrics.as_ref()) {
                     if let Some(metrics) = &metrics {
-                        metrics.inc_route_error();
+                        metrics.inc_route_error(source_name);
                     }
                     return Err(e);
                 }
@@ -299,6 +320,7 @@ pub async fn replay_arrow_framed_file(
 pub async fn replay_arrow_ipc_file(
     path: &Path,
     stream_name: &str,
+    source_name: &str,
     schemas: &[WindowSchema],
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
@@ -320,6 +342,7 @@ pub async fn replay_arrow_ipc_file(
 
     let path_for_read = path.clone();
     let stream_for_read = stream_name.clone();
+    let source_for_read = source_name.to_string();
     let routed_rows = tokio::task::spawn_blocking(move || -> RuntimeResult<usize> {
         let file = std::fs::File::open(&path_for_read).source_err(
             RuntimeReason::system_error(),
@@ -352,10 +375,15 @@ pub async fn replay_arrow_ipc_file(
                 format!("read arrow ipc batch from {}", path_for_read.display()),
             )?;
             total_rows += batch.num_rows();
-            if let Err(e) = route_batch(&stream_for_read, batch, router.as_ref(), metrics.as_ref())
-            {
+            if let Err(e) = route_batch(
+                &stream_for_read,
+                &source_for_read,
+                batch,
+                router.as_ref(),
+                metrics.as_ref(),
+            ) {
                 if let Some(metrics) = &metrics {
-                    metrics.inc_route_error();
+                    metrics.inc_route_error(&source_for_read);
                 }
                 return Err(e);
             }
@@ -455,14 +483,31 @@ fn base_type_to_arrow(base: &BaseType) -> DataType {
     }
 }
 
+fn batch_machine_id(batch: &RecordBatch) -> Option<String> {
+    let idx = batch
+        .schema()
+        .index_of(wf_engine::match_engine::MACHINE_ID)
+        .ok()?;
+    let col = batch.column(idx);
+    let arr = col.as_any().downcast_ref::<arrow::array::StringArray>()?;
+    if arr.is_empty() {
+        return None;
+    }
+    Some(arr.value(0).to_string())
+}
+
 pub(crate) fn route_batch(
     stream_name: &str,
+    source_name: &str,
     batch: RecordBatch,
     router: &Router,
     metrics: Option<&Arc<RuntimeMetrics>>,
 ) -> RuntimeResult<()> {
     if let Some(metrics) = metrics {
         metrics.add_receiver_frame(batch.num_rows());
+        metrics.add_receiver_source_frame(source_name, batch.num_rows());
+        let machine_id = batch_machine_id(&batch).unwrap_or_else(|| source_name.to_string());
+        metrics.add_receiver_source_machine_rows(source_name, &machine_id, batch.num_rows());
         metrics.inc_router_route_call();
     }
     wf_debug!(
@@ -522,8 +567,10 @@ fn project_batch_for_stream(
     };
 
     // Build columns matching the target schema order and types
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(target_schema.fields().len());
-    for field in target_schema.fields() {
+    let mut fields: Vec<Arc<arrow::datatypes::Field>> =
+        target_schema.fields().iter().cloned().collect();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+    for field in &fields {
         let col = match batch.column_by_name(field.name()) {
             Some(col) if col.data_type() == field.data_type() => col.clone(),
             Some(col) => coerce_column(col, field.data_type(), batch.num_rows()),
@@ -531,8 +578,22 @@ fn project_batch_for_stream(
         };
         columns.push(col);
     }
+    // Preserve machine_id from source batch if present but not in target schema
+    if target_schema
+        .index_of(wf_engine::match_engine::MACHINE_ID)
+        .is_err()
+        && let Some(col) = batch.column_by_name(wf_engine::match_engine::MACHINE_ID)
+    {
+        fields.push(Arc::new(arrow::datatypes::Field::new(
+            wf_engine::match_engine::MACHINE_ID,
+            col.data_type().clone(),
+            true,
+        )));
+        columns.push(col.clone());
+    }
 
-    arrow::record_batch::RecordBatch::try_new(target_schema, columns)
+    let schema = arrow::datatypes::Schema::new(fields);
+    arrow::record_batch::RecordBatch::try_new(Arc::new(schema), columns)
         .unwrap_or_else(|_| batch.clone())
 }
 
@@ -875,6 +936,7 @@ mod tests {
         replay_ndjson_file(
             &file_path,
             "events",
+            "test_source",
             &[wf_lang::WindowSchema {
                 name: "test_win".to_string(),
                 streams: vec!["events".to_string()],
@@ -924,6 +986,7 @@ mod tests {
         replay_arrow_framed_file(
             &file_path,
             "",
+            "test_source",
             &[wf_lang::WindowSchema {
                 name: "test_win".to_string(),
                 streams: vec!["events".to_string()],
@@ -970,6 +1033,7 @@ mod tests {
         replay_arrow_ipc_file(
             &file_path,
             "events",
+            "test_source",
             &[wf_lang::WindowSchema {
                 name: "test_win".to_string(),
                 streams: vec!["events".to_string()],
@@ -1075,5 +1139,39 @@ mod tests {
         let result = coerce_column(&arr, &DataType::Timestamp(TimeUnit::Nanosecond, None), 2);
         assert_eq!(result.len(), 2);
         // Unmatched type falls back to NullArray (null values for all rows)
+    }
+
+    fn machine_batch(cols: Vec<(&str, Vec<&str>)>) -> RecordBatch {
+        let fields: Vec<_> = cols
+            .iter()
+            .map(|(n, _)| Field::new(*n, DataType::Utf8, true))
+            .collect();
+        let arrays: Vec<ArrayRef> = cols
+            .iter()
+            .map(|(_, v)| {
+                Arc::new(StringArray::from(
+                    v.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
+                )) as ArrayRef
+            })
+            .collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+    }
+
+    #[test]
+    fn batch_machine_id() {
+        let b = machine_batch(vec![("msg", vec!["hello"])]);
+        assert_eq!(super::batch_machine_id(&b), None);
+
+        let b = machine_batch(vec![(
+            wf_engine::match_engine::MACHINE_ID,
+            vec!["10.0.0.1"],
+        )]);
+        assert_eq!(super::batch_machine_id(&b), Some("10.0.0.1".to_string()));
+
+        let b = machine_batch(vec![(
+            wf_engine::match_engine::MACHINE_ID,
+            vec!["10.0.0.1", "10.0.0.2"],
+        )]);
+        assert_eq!(super::batch_machine_id(&b), Some("10.0.0.1".to_string()));
     }
 }

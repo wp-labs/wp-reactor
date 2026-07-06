@@ -8,8 +8,8 @@ mod types;
 
 // Re-export public types
 pub use types::{
-    BindData, CloseOutput, CloseReason, Event, MatchedContext, StepData, StepResult, Value,
-    WindowLookup,
+    BindData, CloseOutput, CloseReason, Event, MACHINE_ID, MatchedContext, StepData, StepResult,
+    Value, WindowLookup,
 };
 
 // Re-export pub(crate) items
@@ -155,6 +155,18 @@ impl CepStateMachine {
         self.extract_event_time(event)
     }
 
+    /// Extract a string field from an event, returning empty string if not found.
+    pub(crate) fn extract_event_str(event: &Event, field: &str) -> String {
+        event
+            .fields
+            .get(field)
+            .and_then(|v| match v {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     /// Feed one event with explicit timestamp and optional window lookup.
     pub fn advance_at_with(
         &mut self,
@@ -280,7 +292,8 @@ impl CepStateMachine {
         }
         let mut instance = self.remove_instance(&instance_key).unwrap_or_else(|| {
             let created = fixed_created_at.unwrap_or(now_nanos);
-            Instance::new_at(&self.plan, scope_key.clone(), created)
+            let machine_id = Self::extract_event_str(event, MACHINE_ID);
+            Instance::new_at(&self.plan, scope_key.clone(), machine_id, created)
         });
         let plan = &self.plan;
 
@@ -398,6 +411,7 @@ impl CepStateMachine {
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(&instance.alias_states),
                     event_time_nanos: now_nanos,
+                    machine_id: instance.machine_id.clone(),
                 };
                 let reset_at = fixed_created_at.unwrap_or(now_nanos);
                 instance.reset(plan, reset_at);
@@ -434,6 +448,7 @@ impl CepStateMachine {
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(&instance.alias_states),
                     event_time_nanos: now_nanos,
+                    machine_id: instance.machine_id.clone(),
                 };
                 StepResult::Matched(ctx)
             } else {
@@ -712,4 +727,30 @@ fn apply_conv_filtered(
     let mut result = conv::apply_conv(conv, keys, qualifying);
     result.extend(non_qualifying);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_event(fields: Vec<(&str, Value)>) -> Event {
+        Event {
+            fields: fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn extract_event_str() {
+        let e = make_event(vec![
+            ("sip", Value::Str("10.0.0.1".into())),
+            ("n", Value::Number(5.0)),
+            ("flag", Value::Bool(true)),
+        ]);
+        assert_eq!(CepStateMachine::extract_event_str(&e, "sip"), "10.0.0.1");
+        let empty = make_event(vec![]);
+        assert_eq!(CepStateMachine::extract_event_str(&empty, "any"), "");
+    }
 }

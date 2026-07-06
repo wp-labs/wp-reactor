@@ -4,6 +4,10 @@ use std::collections::{HashMap, HashSet};
 // Public types — Event & Value
 // ---------------------------------------------------------------------------
 
+/// Field name for machine identifier carried in events and batches
+/// for per-machine metrics labeling.
+pub const MACHINE_ID: &str = "wp_src_ip";
+
 /// A thin event abstraction: named fields with heterogeneous values.
 ///
 /// M14 works exclusively with this type. Arrow RecordBatch bridging (M16)
@@ -49,6 +53,7 @@ pub struct MatchedContext {
     pub step_data: Vec<StepData>,
     pub bind_data: Vec<BindData>,
     pub event_time_nanos: i64,
+    pub machine_id: String,
 }
 
 /// Per-step snapshot captured when a step is satisfied.
@@ -112,6 +117,7 @@ pub struct CloseOutput {
     pub close_step_data: Vec<StepData>,
     pub bind_data: Vec<BindData>,
     pub watermark_nanos: i64,
+    pub machine_id: String,
     /// The timestamp of the last event processed by this instance.
     /// Used as the asof join time in the close path to avoid
     /// matching against right-table rows that appeared after the

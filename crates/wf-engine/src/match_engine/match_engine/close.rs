@@ -176,6 +176,7 @@ pub(super) fn evaluate_close(
     CloseOutput {
         rule_name: rule_name.to_string(),
         scope_key: instance.scope_key,
+        machine_id: instance.machine_id,
         close_reason: reason,
         event_ok: instance.event_ok,
         close_ok,

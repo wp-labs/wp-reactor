@@ -23,7 +23,15 @@ impl Window {
             return Ok(AppendOutcome::Appended);
         }
 
-        if batch.schema() != self.schema {
+        // Accept batches that contain at least the window's fields (superset OK).
+        // Extra metadata columns (e.g. machine_id) are allowed — they will be
+        // carried through to events so rule executors can use them for labeling.
+        if !self.schema.fields().iter().all(|f| {
+            batch
+                .schema()
+                .field_with_name(f.name())
+                .is_ok_and(|bf| bf.data_type() == f.data_type())
+        }) {
             return CoreReason::DataFormat
                 .to_err()
                 .with_detail(format!(

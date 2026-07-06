@@ -34,6 +34,7 @@ fn default_matched_context() -> MatchedContext {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     }
 }
 
@@ -336,6 +337,7 @@ fn execute_match_no_keys() {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -373,6 +375,7 @@ fn execute_match_composite_keys() {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -414,6 +417,7 @@ fn execute_close_both_ok() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        machine_id: String::new(),
         last_event_nanos: 123,
     };
 
@@ -450,6 +454,7 @@ fn execute_close_close_not_ok() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        machine_id: String::new(),
         last_event_nanos: 0,
     };
 
@@ -489,6 +494,7 @@ fn execute_close_yield_can_reference_score() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        machine_id: String::new(),
         last_event_nanos: 123,
     };
 
@@ -539,6 +545,7 @@ fn execute_close_score_can_use_count_alias() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        machine_id: String::new(),
         last_event_nanos: 123,
     };
 
@@ -609,6 +616,7 @@ fn execute_close_yield_can_use_count_label_inside_if_and_concat() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        machine_id: String::new(),
         last_event_nanos: 123,
     };
 
@@ -704,6 +712,7 @@ fn execute_close_yield_can_use_avg_on_field() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        machine_id: String::new(),
         last_event_nanos: 123,
     };
 
@@ -829,6 +838,7 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
             },
         ],
         watermark_nanos: 0,
+        machine_id: String::new(),
         last_event_nanos: 123,
     };
 
@@ -953,6 +963,7 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
             },
         ],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -1045,6 +1056,7 @@ fn execute_close_yield_can_use_fmt_with_count() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        machine_id: String::new(),
         last_event_nanos: 123,
     };
 
@@ -1086,6 +1098,7 @@ fn execute_close_event_not_ok() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        machine_id: String::new(),
         last_event_nanos: 0,
     };
 
@@ -1199,6 +1212,7 @@ fn summary_format() {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -1245,6 +1259,7 @@ fn numeric_key_preserves_type_in_eval_context() {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -1285,6 +1300,7 @@ fn label_cannot_overwrite_key_in_eval_context() {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -1322,6 +1338,7 @@ fn wfx_id_hex_format() {
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        machine_id: String::new(),
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -1611,5 +1628,34 @@ rule tracked_close {
                 Value::Str("probe".to_string())
             ])
         ))
+    );
+}
+
+// -- build_machine_id / build_scope_key ---------------------------------
+
+#[test]
+fn build_machine_id_and_scope_key() {
+    let plan = simple_rule_plan(
+        "test_rule",
+        default_match_plan(),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    let exec = RuleExecutor::new(plan);
+    assert_eq!(exec.build_machine_id(""), "test_rule");
+    assert_eq!(exec.build_machine_id("10.0.0.1"), "10.0.0.1");
+    assert_eq!(
+        exec.build_scope_key(
+            &[
+                FieldRef::Simple("sip".to_string()),
+                FieldRef::Simple("user".to_string())
+            ],
+            &[
+                Value::Str("10.0.0.1".to_string()),
+                Value::Str("admin".to_string())
+            ],
+        ),
+        "sip=10.0.0.1,user=admin"
     );
 }

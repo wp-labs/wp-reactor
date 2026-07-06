@@ -4,7 +4,7 @@ mod signal;
 mod spawn;
 pub(crate) mod types;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -301,7 +301,26 @@ impl Reactor {
             .map(|rule| rule.executor.plan().name.clone())
             .collect();
         let window_names: Vec<String> = data.router.registry().window_names();
-        let metrics = maybe_build_metrics(&config.metrics, &rule_names, &window_names);
+        let source_names: Vec<String> = config
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(i, s)| s.effective_name(i))
+            .collect();
+        let source_types: BTreeMap<String, String> = config
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.enabled)
+            .map(|(i, s)| (s.effective_name(i), s.kind().to_string()))
+            .collect();
+        let metrics = maybe_build_metrics(
+            &config.metrics,
+            &rule_names,
+            &window_names,
+            &source_names,
+            source_types,
+        );
 
         // Phase 2: Spawn task groups.
         //   head (start order): alert → evictor

@@ -44,9 +44,12 @@ pub async fn run_alert_dispatcher(
             }
         };
         let dispatch_started = Instant::now();
-        let matched = dispatcher
+        let (matched, had_error) = dispatcher
             .dispatch(&record.yield_target, &data_record)
             .await;
+        if had_error && let Some(metrics) = &metrics {
+            metrics.inc_sink_dispatch_failed();
+        }
         // Dispatch guard: warn once-per-target when a yield target has no sink
         // (route miss + no default sinks). Without this, alerts silently vanish.
         if matched == 0

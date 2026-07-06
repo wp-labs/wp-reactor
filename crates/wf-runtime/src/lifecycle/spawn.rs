@@ -153,10 +153,11 @@ pub(super) async fn spawn_receiver_task(
     let schema_catalog = Arc::new(schemas.to_vec());
     register_builtin_external_sources();
 
-    for source in &config.sources {
+    for (source_idx, source) in config.sources.iter().enumerate() {
         if !source.enabled {
             continue;
         }
+        let source_name = source.effective_name(source_idx);
         // Resolve connect → kind if needed
         let kind = if let Some(ref conn) = source.connect {
             resolve_connector_kind(conn).unwrap_or_else(|| {
@@ -180,12 +181,14 @@ pub(super) async fn spawn_receiver_task(
                     .cloned()
                     .unwrap_or_else(|| "ndjson".into());
                 let schemas = Arc::clone(&schema_catalog);
+                let source_name = source_name.clone();
                 group.push(tokio::spawn(async move {
                     match format.as_str() {
                         "ndjson" => {
                             replay_ndjson_file(
                                 &path,
                                 &stream,
+                                &source_name,
                                 schemas.as_slice(),
                                 router,
                                 metrics,
@@ -197,6 +200,7 @@ pub(super) async fn spawn_receiver_task(
                             replay_csv_file(
                                 &path,
                                 &stream,
+                                &source_name,
                                 schemas.as_slice(),
                                 router,
                                 metrics,
@@ -208,6 +212,7 @@ pub(super) async fn spawn_receiver_task(
                             replay_arrow_framed_file(
                                 &path,
                                 &stream,
+                                &source_name,
                                 schemas.as_slice(),
                                 router,
                                 metrics,
@@ -219,6 +224,7 @@ pub(super) async fn spawn_receiver_task(
                             replay_arrow_ipc_file(
                                 &path,
                                 &stream,
+                                &source_name,
                                 schemas.as_slice(),
                                 router,
                                 metrics,
@@ -374,6 +380,7 @@ async fn spawn_external_source_tasks(
         let metrics = metrics.clone();
         let cancel = cancel.child_token();
         let stream_name = stream_name.clone();
+        let source_name = source.effective_name(source_idx);
         let source_kind = source_kind.to_string();
         let schema = Arc::clone(&schema);
         group.push(tokio::spawn(async move {
@@ -411,12 +418,13 @@ async fn spawn_external_source_tasks(
                                     };
                                 if let Err(e) = crate::receiver::route_batch(
                                     &route_stream,
+                                    &source_name,
                                     rb,
                                     router.as_ref(),
                                     metrics.as_ref(),
                                 ) {
                                     if let Some(metrics) = &metrics {
-                                        metrics.inc_route_error();
+                                        metrics.inc_route_error(&source_name);
                                     }
                                     wf_warn!(
                                         conn,
@@ -451,6 +459,7 @@ async fn spawn_external_source_tasks(
                             }
                             if let Some(metrics) = &metrics {
                                 metrics.inc_receiver_decode_error();
+                                metrics.inc_receiver_source_decode_error(&source_name);
                             }
                             consecutive_errors = consecutive_errors.saturating_add(1);
                             let delay = if consecutive_errors <= 1 {

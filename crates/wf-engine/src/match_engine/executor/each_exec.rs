@@ -1,6 +1,7 @@
 use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::{CoreReason, CoreResult};
-use crate::match_engine::match_engine::{Event, StepData, WindowLookup};
+use crate::match_engine::MACHINE_ID;
+use crate::match_engine::match_engine::{CepStateMachine, Event, StepData, WindowLookup};
 
 use super::RuleExecutor;
 use super::alert::{build_each_wfx_id, build_summary, format_nanos_utc, format_now_utc};
@@ -89,6 +90,8 @@ impl RuleExecutor {
             })
             .collect();
 
+        let machine_id = CepStateMachine::extract_event_str(ctx, MACHINE_ID);
+
         Ok(Some(OutputRecord {
             wfx_id,
             rule_name: self.plan.name.clone(),
@@ -104,6 +107,8 @@ impl RuleExecutor {
             yield_fields,
             yield_field_types,
             event_time_nanos,
+            machine_id,
+            scope_key: self.plan.name.clone(),
         }))
     }
 }

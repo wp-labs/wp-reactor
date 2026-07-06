@@ -128,6 +128,12 @@ pub struct OutputRecord {
     /// Event-time for this output (nanos since epoch), used by internal windows.
     #[serde(skip)]
     pub event_time_nanos: i64,
+    /// Machine identifier extracted from matched event (metrics-only, not yielded).
+    #[serde(skip)]
+    pub machine_id: String,
+    /// State-machine scope key, formatted as `k1=v1,k2=v2` (metrics-only).
+    #[serde(skip)]
+    pub scope_key: String,
 }
 
 impl OutputRecord {
@@ -478,6 +484,8 @@ mod tests {
                 ("items".into(), FieldType::Array(BaseType::Chars)),
             ],
             event_time_nanos: 0,
+            machine_id: String::new(),
+            scope_key: String::new(),
         };
 
         let record = output.to_data_record().expect("record");
@@ -517,6 +525,8 @@ mod tests {
             yield_fields: vec![(format!("{WFU_PREFIX}bad"), Value::Str("x".into()))],
             yield_field_types: vec![],
             event_time_nanos: 0,
+            machine_id: String::new(),
+            scope_key: String::new(),
         };
 
         let err = output
@@ -553,6 +563,8 @@ mod tests {
                 ("sha".into(), FieldType::Base(BaseType::Hex)),
             ],
             event_time_nanos: 0,
+            machine_id: String::new(),
+            scope_key: String::new(),
         };
 
         let record = output.to_data_record().expect("record");

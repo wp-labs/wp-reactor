@@ -53,6 +53,32 @@ impl RuleExecutor {
         self.yield_field_types.get(name)
     }
 
+    pub(crate) fn build_machine_id(&self, machine_id: &str) -> String {
+        if machine_id.is_empty() {
+            self.plan.name.clone()
+        } else {
+            machine_id.to_string()
+        }
+    }
+
+    pub(crate) fn build_scope_key(
+        &self,
+        keys: &[wf_lang::ast::FieldRef],
+        scope_values: &[crate::match_engine::match_engine::Value],
+    ) -> String {
+        keys.iter()
+            .zip(scope_values.iter())
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    crate::match_engine::match_engine::field_ref_name(k),
+                    crate::match_engine::match_engine::value_to_string(v)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     pub fn event_matches_alias(
         &self,
         alias: &str,

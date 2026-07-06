@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -7,6 +8,10 @@ use crate::error::RuntimeResult;
 use tokio_util::sync::CancellationToken;
 use wf_config::MetricsConfig;
 use wf_engine::window::{EvictReport, RouteReport, Router};
+
+type AlertDetailCounts = BTreeMap<String, AtomicU64>;
+type AlertDetailByMachine = BTreeMap<String, AlertDetailCounts>;
+type AlertDetailByRule = BTreeMap<String, AlertDetailByMachine>;
 
 const DEFAULT_HISTOGRAM_BUCKETS_SECONDS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
@@ -87,22 +92,26 @@ pub struct MetricsRecord {
 }
 
 pub(crate) struct MetricsSnapshot {
+    source_types: BTreeMap<String, String>,
     receiver_connections: u64,
     receiver_frames: u64,
-    receiver_rows: u64,
-    receiver_decode_errors: u64,
-    receiver_read_errors: u64,
+    receiver_source_rows: BTreeMap<String, u64>,
+    receiver_source_machine_rows: BTreeMap<String, BTreeMap<String, u64>>,
+    receiver_source_decode_errors: BTreeMap<String, u64>,
+    receiver_source_read_errors: BTreeMap<String, u64>,
     router_route_calls: u64,
     router_delivered: u64,
     router_dropped_late: u64,
     router_skipped_non_local: u64,
-    router_route_errors: u64,
+    router_source_route_errors: BTreeMap<String, u64>,
     rule_events: BTreeMap<String, u64>,
     rule_matches: BTreeMap<String, u64>,
     rule_instances: BTreeMap<String, u64>,
     rule_cursor_gaps: BTreeMap<String, BTreeMap<String, u64>>,
     alert_emitted: BTreeMap<String, u64>,
+    alert_emitted_detail: BTreeMap<String, BTreeMap<String, BTreeMap<String, u64>>>,
     alert_channel_send_failed: u64,
+    alert_sink_dispatch_failed: u64,
     alert_channel_full: u64,
     alert_channel_depth: u64,
     alert_serialize_failed: u64,
@@ -111,6 +120,7 @@ pub(crate) struct MetricsSnapshot {
     evictor_time_evicted: u64,
     evictor_memory_evicted: u64,
     window_memory_bytes: BTreeMap<String, u64>,
+    window_capacity_bytes: BTreeMap<String, u64>,
     window_rows: BTreeMap<String, u64>,
     window_batches: BTreeMap<String, u64>,
     window_append: BTreeMap<String, u64>,
@@ -134,19 +144,40 @@ impl MetricsSnapshot {
             self.receiver_connections,
         ));
         out.push(metric("receiver", "frames_total", "", self.receiver_frames));
-        out.push(metric("receiver", "rows_total", "", self.receiver_rows));
-        out.push(metric(
-            "receiver",
-            "decode_errors_total",
-            "",
-            self.receiver_decode_errors,
-        ));
-        out.push(metric(
-            "receiver",
-            "read_errors_total",
-            "",
-            self.receiver_read_errors,
-        ));
+        for (source, v) in &self.receiver_source_rows {
+            // Skip per-source output when per-machine breakdown is available
+            if !self.receiver_source_machine_rows.contains_key(source) {
+                let source_type = self.source_types.get(source).cloned().unwrap_or_default();
+                out.push(metric_with_type(
+                    "receiver",
+                    "rows_total",
+                    source,
+                    &source_type,
+                    *v,
+                ));
+            }
+        }
+        for (source, by_machine) in &self.receiver_source_machine_rows {
+            let source_type = self.source_types.get(source).cloned().unwrap_or_default();
+            for (machine, v) in by_machine {
+                out.push(MetricsRecord {
+                    fields: vec![
+                        ("stage".into(), "receiver".into()),
+                        ("name".into(), "rows_total".into()),
+                        ("label".into(), source.clone()),
+                        ("source_type".into(), source_type.clone()),
+                        ("machine".into(), machine.clone()),
+                        ("value".into(), v.to_string()),
+                    ],
+                });
+            }
+        }
+        for (source, v) in &self.receiver_source_decode_errors {
+            out.push(metric("receiver", "decode_errors_total", source, *v));
+        }
+        for (source, v) in &self.receiver_source_read_errors {
+            out.push(metric("receiver", "read_errors_total", source, *v));
+        }
         out.push(metric(
             "router",
             "route_calls_total",
@@ -171,12 +202,9 @@ impl MetricsSnapshot {
             "",
             self.router_skipped_non_local,
         ));
-        out.push(metric(
-            "router",
-            "route_errors_total",
-            "",
-            self.router_route_errors,
-        ));
+        for (source, v) in &self.router_source_route_errors {
+            out.push(metric("router", "route_errors_total", source, *v));
+        }
         out.push(metric("evictor", "sweeps_total", "", self.evictor_sweeps));
         out.push(metric(
             "evictor",
@@ -195,6 +223,12 @@ impl MetricsSnapshot {
             "channel_send_failed_total",
             "",
             self.alert_channel_send_failed,
+        ));
+        out.push(metric(
+            "alert",
+            "sink_dispatch_failed_total",
+            "",
+            self.alert_sink_dispatch_failed,
         ));
         out.push(metric(
             "alert",
@@ -230,10 +264,31 @@ impl MetricsSnapshot {
             }
         }
         for (rule, v) in &self.alert_emitted {
-            out.push(metric("alert", "emitted_total", rule, *v));
+            if !self.alert_emitted_detail.contains_key(rule) {
+                out.push(metric("alert", "emitted_total", rule, *v));
+            }
+        }
+        for (rule, by_machine) in &self.alert_emitted_detail {
+            for (machine, by_scope) in by_machine {
+                for (scope, v) in by_scope {
+                    out.push(MetricsRecord {
+                        fields: vec![
+                            ("stage".into(), "alert".into()),
+                            ("name".into(), "emitted_total".into()),
+                            ("label".into(), rule.clone()),
+                            ("machine".into(), machine.clone()),
+                            ("scope_key".into(), scope.clone()),
+                            ("value".into(), v.to_string()),
+                        ],
+                    });
+                }
+            }
         }
         for (window, v) in &self.window_memory_bytes {
             out.push(metric("window", "memory_bytes", window, *v));
+        }
+        for (window, v) in &self.window_capacity_bytes {
+            out.push(metric("window", "window_capacity_bytes", window, *v));
         }
         for (window, v) in &self.window_rows {
             out.push(metric("window", "rows", window, *v));
@@ -302,6 +357,24 @@ fn metric(stage: &str, name: &str, label: &str, value: u64) -> MetricsRecord {
     let mut fields = vec![("stage".into(), stage.into()), ("name".into(), name.into())];
     if !label.is_empty() {
         fields.push(("label".into(), label.into()));
+    }
+    fields.push(("value".into(), value.to_string()));
+    MetricsRecord { fields }
+}
+
+fn metric_with_type(
+    stage: &str,
+    name: &str,
+    label: &str,
+    source_type: &str,
+    value: u64,
+) -> MetricsRecord {
+    let mut fields = vec![("stage".into(), stage.into()), ("name".into(), name.into())];
+    if !label.is_empty() {
+        fields.push(("label".into(), label.into()));
+    }
+    if !source_type.is_empty() {
+        fields.push(("source_type".into(), source_type.into()));
     }
     fields.push(("value".into(), value.to_string()));
     MetricsRecord { fields }
@@ -533,11 +606,18 @@ pub struct RuntimeMetrics {
     receiver_decode_errors_total: AtomicU64,
     receiver_read_errors_total: AtomicU64,
 
+    source_types: BTreeMap<String, String>,
+
+    receiver_source_rows_total: BTreeMap<String, AtomicU64>,
+    receiver_source_machine_rows: Mutex<BTreeMap<String, BTreeMap<String, AtomicU64>>>,
+    receiver_source_decode_errors_total: BTreeMap<String, AtomicU64>,
+    receiver_source_read_errors_total: BTreeMap<String, AtomicU64>,
+
     router_route_calls_total: AtomicU64,
     router_delivered_total: AtomicU64,
     router_dropped_late_total: AtomicU64,
     router_skipped_non_local_total: AtomicU64,
-    router_route_errors_total: AtomicU64,
+    router_source_route_errors_total: BTreeMap<String, AtomicU64>,
 
     rule_events_total: BTreeMap<String, AtomicU64>,
     rule_matches_total: BTreeMap<String, AtomicU64>,
@@ -545,7 +625,9 @@ pub struct RuntimeMetrics {
     rule_cursor_gap_total: BTreeMap<String, BTreeMap<String, AtomicU64>>,
 
     alert_emitted_total: BTreeMap<String, AtomicU64>,
+    alert_emitted_detail_total: Mutex<AlertDetailByRule>,
     alert_channel_send_failed_total: AtomicU64,
+    alert_sink_dispatch_failed_total: AtomicU64,
     alert_channel_full_total: AtomicU64,
     alert_channel_depth: AtomicU64,
     alert_serialize_failed_total: AtomicU64,
@@ -556,6 +638,7 @@ pub struct RuntimeMetrics {
     evictor_memory_evicted_total: AtomicU64,
 
     window_memory_bytes: BTreeMap<String, AtomicU64>,
+    window_capacity_bytes: BTreeMap<String, AtomicU64>,
     window_rows: BTreeMap<String, AtomicU64>,
     window_batches: BTreeMap<String, AtomicU64>,
     window_append_total: BTreeMap<String, AtomicU64>,
@@ -643,7 +726,12 @@ impl RuntimeMetrics {
         )
     }
 
-    pub fn new(rule_names: &[String], window_names: &[String]) -> Self {
+    pub fn new(
+        rule_names: &[String],
+        window_names: &[String],
+        source_names: &[String],
+        source_types: BTreeMap<String, String>,
+    ) -> Self {
         let make_rule_map = || {
             rule_names
                 .iter()
@@ -667,6 +755,12 @@ impl RuntimeMetrics {
                 .map(|name| (name.clone(), AtomicU64::new(0)))
                 .collect::<BTreeMap<_, _>>()
         };
+        let make_source_map = || {
+            source_names
+                .iter()
+                .map(|name| (name.clone(), AtomicU64::new(0)))
+                .collect::<BTreeMap<_, _>>()
+        };
         let mut gap_map = BTreeMap::new();
         for rule in rule_names {
             let mut by_window = BTreeMap::new();
@@ -682,17 +776,24 @@ impl RuntimeMetrics {
             receiver_rows_total: AtomicU64::new(0),
             receiver_decode_errors_total: AtomicU64::new(0),
             receiver_read_errors_total: AtomicU64::new(0),
+            source_types,
+            receiver_source_rows_total: make_source_map(),
+            receiver_source_machine_rows: Mutex::new(BTreeMap::new()),
+            receiver_source_decode_errors_total: make_source_map(),
+            receiver_source_read_errors_total: make_source_map(),
             router_route_calls_total: AtomicU64::new(0),
             router_delivered_total: AtomicU64::new(0),
             router_dropped_late_total: AtomicU64::new(0),
             router_skipped_non_local_total: AtomicU64::new(0),
-            router_route_errors_total: AtomicU64::new(0),
+            router_source_route_errors_total: make_source_map(),
             rule_events_total: make_rule_map(),
             rule_matches_total: make_rule_map(),
             rule_instances: make_rule_map(),
             rule_cursor_gap_total: gap_map,
             alert_emitted_total: make_rule_map(),
+            alert_emitted_detail_total: Mutex::new(BTreeMap::new()),
             alert_channel_send_failed_total: AtomicU64::new(0),
+            alert_sink_dispatch_failed_total: AtomicU64::new(0),
             alert_channel_full_total: AtomicU64::new(0),
             alert_channel_depth: AtomicU64::new(0),
             alert_serialize_failed_total: AtomicU64::new(0),
@@ -701,6 +802,7 @@ impl RuntimeMetrics {
             evictor_time_evicted_total: AtomicU64::new(0),
             evictor_memory_evicted_total: AtomicU64::new(0),
             window_memory_bytes: make_window_map(),
+            window_capacity_bytes: make_window_map(),
             window_rows: make_window_map(),
             window_batches: make_window_map(),
             window_append_total: make_window_map(),
@@ -731,9 +833,33 @@ impl RuntimeMetrics {
             .fetch_add(rows as u64, Ordering::Relaxed);
     }
 
+    pub fn add_receiver_source_frame(&self, source: &str, rows: usize) {
+        if let Some(v) = self.receiver_source_rows_total.get(source) {
+            v.fetch_add(rows as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn add_receiver_source_machine_rows(&self, source: &str, machine_id: &str, rows: usize) {
+        if machine_id.is_empty() {
+            return;
+        }
+        let mut map = self.receiver_source_machine_rows.lock().unwrap();
+        let by_machine = map.entry(source.to_string()).or_default();
+        let v = by_machine
+            .entry(machine_id.to_string())
+            .or_insert_with(|| AtomicU64::new(0));
+        v.fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
     pub fn inc_receiver_decode_error(&self) {
         self.receiver_decode_errors_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_receiver_source_decode_error(&self, source: &str) {
+        if let Some(v) = self.receiver_source_decode_errors_total.get(source) {
+            v.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn observe_receiver_decode(&self, elapsed: Duration) {
@@ -743,6 +869,12 @@ impl RuntimeMetrics {
     pub fn inc_receiver_read_error(&self) {
         self.receiver_read_errors_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_receiver_source_read_error(&self, source: &str) {
+        if let Some(v) = self.receiver_source_read_errors_total.get(source) {
+            v.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn inc_router_route_call(&self) {
@@ -766,9 +898,10 @@ impl RuntimeMetrics {
         }
     }
 
-    pub fn inc_route_error(&self) {
-        self.router_route_errors_total
-            .fetch_add(1, Ordering::Relaxed);
+    pub fn inc_route_error(&self, source: &str) {
+        if let Some(v) = self.router_source_route_errors_total.get(source) {
+            v.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn add_rule_events(&self, rule: &str, count: usize) {
@@ -797,14 +930,73 @@ impl RuntimeMetrics {
         }
     }
 
-    pub fn inc_alert_emitted(&self, rule: &str) {
+    pub fn inc_alert_emitted(&self, rule: &str, machine_id: &str, scope_key: &str) {
         if let Some(v) = self.alert_emitted_total.get(rule) {
             v.fetch_add(1, Ordering::Relaxed);
         }
+        if machine_id.is_empty() && scope_key.is_empty() {
+            return;
+        }
+        let machine = if machine_id.is_empty() {
+            "-"
+        } else {
+            machine_id
+        };
+        let scope = if scope_key.is_empty() { "-" } else { scope_key };
+        let mut map = self.alert_emitted_detail_total.lock().unwrap();
+        let by_machine = map.entry(rule.to_string()).or_default();
+        let by_scope = by_machine.entry(machine.to_string()).or_default();
+        let v = by_scope
+            .entry(scope.to_string())
+            .or_insert_with(|| AtomicU64::new(0));
+        v.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn drain_source_machine_rows(&self) -> BTreeMap<String, BTreeMap<String, u64>> {
+        let map = self.receiver_source_machine_rows.lock().unwrap();
+        let mut result = BTreeMap::new();
+        for (source, by_machine) in map.iter() {
+            let drained: BTreeMap<String, u64> = by_machine
+                .iter()
+                .map(|(machine, v)| (machine.clone(), v.swap(0, Ordering::Relaxed)))
+                .filter(|(_, v)| *v > 0)
+                .collect();
+            if !drained.is_empty() {
+                result.insert(source.clone(), drained);
+            }
+        }
+        result
+    }
+
+    fn drain_emitted_detail(&self) -> BTreeMap<String, BTreeMap<String, BTreeMap<String, u64>>> {
+        let map = self.alert_emitted_detail_total.lock().unwrap();
+        let mut result = BTreeMap::new();
+        for (rule, by_machine) in map.iter() {
+            let mut machine_map = BTreeMap::new();
+            for (machine, by_scope) in by_machine.iter() {
+                let drained: BTreeMap<String, u64> = by_scope
+                    .iter()
+                    .map(|(scope, v)| (scope.clone(), v.swap(0, Ordering::Relaxed)))
+                    .filter(|(_, v)| *v > 0)
+                    .collect();
+                if !drained.is_empty() {
+                    machine_map.insert(machine.clone(), drained);
+                }
+            }
+            if !machine_map.is_empty() {
+                result.insert(rule.clone(), machine_map);
+            }
+        }
+        result
     }
 
     pub fn inc_alert_channel_send_failed(&self) {
         self.alert_channel_send_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_sink_dispatch_failed(&self) {
+        self.alert_sink_dispatch_failed_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -858,23 +1050,29 @@ impl RuntimeMetrics {
         }
     }
     pub(crate) fn snapshot(&self) -> MetricsSnapshot {
+        let source_types = self.source_types.clone();
         MetricsSnapshot {
+            source_types,
             receiver_connections: self.drain_counter(&self.receiver_connections_total),
             receiver_frames: self.drain_counter(&self.receiver_frames_total),
-            receiver_rows: self.drain_counter(&self.receiver_rows_total),
-            receiver_decode_errors: self.drain_counter(&self.receiver_decode_errors_total),
-            receiver_read_errors: self.drain_counter(&self.receiver_read_errors_total),
+            receiver_source_rows: self.drain_map(&self.receiver_source_rows_total),
+            receiver_source_machine_rows: self.drain_source_machine_rows(),
+            receiver_source_decode_errors: self
+                .drain_map(&self.receiver_source_decode_errors_total),
+            receiver_source_read_errors: self.drain_map(&self.receiver_source_read_errors_total),
             router_route_calls: self.drain_counter(&self.router_route_calls_total),
             router_delivered: self.drain_counter(&self.router_delivered_total),
             router_dropped_late: self.drain_counter(&self.router_dropped_late_total),
             router_skipped_non_local: self.drain_counter(&self.router_skipped_non_local_total),
-            router_route_errors: self.drain_counter(&self.router_route_errors_total),
+            router_source_route_errors: self.drain_map(&self.router_source_route_errors_total),
             rule_events: self.drain_map(&self.rule_events_total),
             rule_matches: self.drain_map(&self.rule_matches_total),
             rule_instances: self.read_map(&self.rule_instances),
             rule_cursor_gaps: self.drain_gap_map(&self.rule_cursor_gap_total),
             alert_emitted: self.drain_map(&self.alert_emitted_total),
+            alert_emitted_detail: self.drain_emitted_detail(),
             alert_channel_send_failed: self.drain_counter(&self.alert_channel_send_failed_total),
+            alert_sink_dispatch_failed: self.drain_counter(&self.alert_sink_dispatch_failed_total),
             alert_channel_full: self.drain_counter(&self.alert_channel_full_total),
             alert_channel_depth: self.alert_channel_depth.load(Ordering::Relaxed),
             alert_serialize_failed: self.drain_counter(&self.alert_serialize_failed_total),
@@ -883,6 +1081,7 @@ impl RuntimeMetrics {
             evictor_time_evicted: self.drain_counter(&self.evictor_time_evicted_total),
             evictor_memory_evicted: self.drain_counter(&self.evictor_memory_evicted_total),
             window_memory_bytes: self.read_map(&self.window_memory_bytes),
+            window_capacity_bytes: self.read_map(&self.window_capacity_bytes),
             window_rows: self.read_map(&self.window_rows),
             window_batches: self.read_map(&self.window_batches),
             window_append: self.drain_map(&self.window_append_total),
@@ -951,6 +1150,9 @@ impl RuntimeMetrics {
                 let win = win_lock.read().expect("window lock poisoned");
                 if let Some(v) = self.window_memory_bytes.get(&window_name) {
                     v.store(win.memory_usage() as u64, Ordering::Relaxed);
+                }
+                if let Some(v) = self.window_capacity_bytes.get(&window_name) {
+                    v.store(win.max_window_bytes() as u64, Ordering::Relaxed);
                 }
                 if let Some(v) = self.window_rows.get(&window_name) {
                     v.store(win.total_rows() as u64, Ordering::Relaxed);
@@ -1073,11 +1275,18 @@ pub fn maybe_build_metrics(
     config: &MetricsConfig,
     rule_names: &[String],
     window_names: &[String],
+    source_names: &[String],
+    source_types: BTreeMap<String, String>,
 ) -> Option<Arc<RuntimeMetrics>> {
     if !config.enabled {
         return None;
     }
-    Some(Arc::new(RuntimeMetrics::new(rule_names, window_names)))
+    Some(Arc::new(RuntimeMetrics::new(
+        rule_names,
+        window_names,
+        source_names,
+        source_types,
+    )))
 }
 
 #[cfg(test)]
@@ -1150,7 +1359,12 @@ mod tests {
 
     #[test]
     fn snapshot_drains_counters_preserves_gauges() {
-        let metrics = RuntimeMetrics::new(&["r1".to_string()], &["w1".to_string()]);
+        let metrics = RuntimeMetrics::new(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &[],
+            BTreeMap::new(),
+        );
         metrics.inc_receiver_connection();
         metrics.inc_receiver_connection();
         metrics.inc_rule_match("r1");
@@ -1161,7 +1375,12 @@ mod tests {
 
     #[test]
     fn snapshot_window_append_resets() {
-        let metrics = RuntimeMetrics::new(&["r1".to_string()], &["w1".to_string()]);
+        let metrics = RuntimeMetrics::new(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &[],
+            BTreeMap::new(),
+        );
         metrics.add_window_append("w1", 100);
         metrics.add_window_append("w1", 200);
         assert_eq!(metrics.snapshot().window_append.get("w1"), Some(&300));
@@ -1173,7 +1392,12 @@ mod tests {
     #[test]
     fn add_route_report_tracks_per_window_append() {
         use wf_engine::window::WindowRouteOutcome;
-        let metrics = RuntimeMetrics::new(&["r1".to_string()], &["win_a".to_string()]);
+        let metrics = RuntimeMetrics::new(
+            &["r1".to_string()],
+            &["win_a".to_string()],
+            &[],
+            BTreeMap::new(),
+        );
         let report = RouteReport {
             delivered: 1,
             dropped_late: 0,
@@ -1191,7 +1415,12 @@ mod tests {
     #[test]
     fn add_route_report_tracks_per_window_late() {
         use wf_engine::window::WindowRouteOutcome;
-        let metrics = RuntimeMetrics::new(&["r1".to_string()], &["win_a".to_string()]);
+        let metrics = RuntimeMetrics::new(
+            &["r1".to_string()],
+            &["win_a".to_string()],
+            &[],
+            BTreeMap::new(),
+        );
         let report = RouteReport {
             delivered: 0,
             dropped_late: 1,
@@ -1211,7 +1440,12 @@ mod tests {
     #[test]
     fn add_evict_report_tracks_per_window_eviction() {
         use wf_engine::window::WindowEvictCount;
-        let metrics = RuntimeMetrics::new(&["r1".to_string()], &["win_a".to_string()]);
+        let metrics = RuntimeMetrics::new(
+            &["r1".to_string()],
+            &["win_a".to_string()],
+            &[],
+            BTreeMap::new(),
+        );
         let report = EvictReport {
             windows_scanned: 1,
             batches_time_evicted: 2,
@@ -1229,7 +1463,12 @@ mod tests {
 
     #[test]
     fn alert_channel_depth_reads_current() {
-        let metrics = RuntimeMetrics::new(&["r1".to_string()], &["w1".to_string()]);
+        let metrics = RuntimeMetrics::new(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &[],
+            BTreeMap::new(),
+        );
         metrics.set_alert_channel_depth(3);
         assert_eq!(metrics.snapshot().alert_channel_depth, 3);
         metrics.set_alert_channel_depth(0);
@@ -1238,7 +1477,12 @@ mod tests {
 
     #[test]
     fn alert_channel_full_increments() {
-        let metrics = RuntimeMetrics::new(&["r1".to_string()], &["w1".to_string()]);
+        let metrics = RuntimeMetrics::new(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &[],
+            BTreeMap::new(),
+        );
         metrics.inc_alert_channel_full();
         metrics.inc_alert_channel_full();
         assert_eq!(metrics.snapshot().alert_channel_full, 2);
@@ -1249,7 +1493,12 @@ mod tests {
 
     #[test]
     fn observe_event_e2e_latency_records() {
-        let metrics = RuntimeMetrics::new(&["r1".to_string()], &["w1".to_string()]);
+        let metrics = RuntimeMetrics::new(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &[],
+            BTreeMap::new(),
+        );
         metrics.observe_event_e2e_latency(Duration::from_secs(1));
         let snap = metrics.snapshot();
         // Should have one observation in the 1s bucket
@@ -1261,7 +1510,12 @@ mod tests {
 
     #[test]
     fn to_records_produces_expected_structure() {
-        let metrics = RuntimeMetrics::new(&["r1".to_string()], &["w1".to_string()]);
+        let metrics = RuntimeMetrics::new(
+            &["r1".to_string()],
+            &["w1".to_string()],
+            &[],
+            BTreeMap::new(),
+        );
         metrics.inc_rule_match("r1");
         metrics.add_window_append("w1", 100);
         let snap = metrics.snapshot();
@@ -1274,5 +1528,72 @@ mod tests {
             assert!(keys.contains(&"name"));
             assert!(keys.contains(&"value"));
         }
+    }
+
+    #[test]
+    fn receiver_source_machine_rows() {
+        let m = RuntimeMetrics::new(&[], &[], &["s1".to_string()], BTreeMap::new());
+        m.add_receiver_source_machine_rows("s1", "10.0.0.1", 100);
+        m.add_receiver_source_machine_rows("s1", "10.0.0.1", 50);
+        let snap = m.snapshot();
+        assert_eq!(
+            snap.receiver_source_machine_rows
+                .get("s1")
+                .unwrap()
+                .get("10.0.0.1"),
+            Some(&150)
+        );
+        // drain clears
+        assert!(m.snapshot().receiver_source_machine_rows.is_empty());
+        // empty machine_id is skipped
+        m.add_receiver_source_machine_rows("s1", "", 100);
+        assert!(m.snapshot().receiver_source_machine_rows.is_empty());
+    }
+
+    #[test]
+    fn alert_emitted_detail() {
+        let m = RuntimeMetrics::new(&["r1".to_string()], &[], &[], BTreeMap::new());
+        m.inc_alert_emitted("r1", "10.0.0.1", "sip=10.0.0.1");
+        m.inc_alert_emitted("r1", "10.0.0.1", "sip=10.0.0.1");
+        let snap = m.snapshot();
+        let detail = snap
+            .alert_emitted_detail
+            .get("r1")
+            .unwrap()
+            .get("10.0.0.1")
+            .unwrap();
+        assert_eq!(detail.get("sip=10.0.0.1"), Some(&2));
+        // drain clears
+        assert!(m.snapshot().alert_emitted_detail.is_empty());
+        // empty machine_id → "-"
+        m.inc_alert_emitted("r1", "", "key=val");
+        assert!(
+            m.snapshot()
+                .alert_emitted_detail
+                .get("r1")
+                .unwrap()
+                .contains_key("-")
+        );
+    }
+
+    #[test]
+    fn alert_counters() {
+        let m = RuntimeMetrics::new(&["r1".to_string()], &[], &[], BTreeMap::new());
+        m.inc_sink_dispatch_failed();
+        m.inc_sink_dispatch_failed();
+        assert_eq!(m.snapshot().alert_sink_dispatch_failed, 2);
+        assert_eq!(m.snapshot().alert_sink_dispatch_failed, 0);
+        // plain emitted_total when no detail
+        m.inc_alert_emitted("r1", "", "");
+        let records = m.snapshot().to_records();
+        let emitted: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                r.fields
+                    .iter()
+                    .any(|(k, v)| k == "name" && v == "emitted_total")
+            })
+            .collect();
+        assert_eq!(emitted.len(), 1);
     }
 }

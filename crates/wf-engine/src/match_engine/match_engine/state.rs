@@ -77,6 +77,7 @@ impl StepState {
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub(super) struct Instance {
     pub(super) scope_key: Vec<Value>,
+    pub(super) machine_id: String,
     pub(super) created_at: i64,
     pub(super) last_event_nanos: i64,
     pub(super) current_step: usize,
@@ -94,7 +95,12 @@ impl Instance {
     ///
     /// For sliding windows, `created_at` is the event time.
     /// For fixed windows, `created_at` is the bucket start.
-    pub(super) fn new_at(plan: &MatchPlan, scope_key: Vec<Value>, created_at: i64) -> Self {
+    pub(super) fn new_at(
+        plan: &MatchPlan,
+        scope_key: Vec<Value>,
+        machine_id: String,
+        created_at: i64,
+    ) -> Self {
         let step_states = plan
             .event_steps
             .iter()
@@ -107,6 +113,7 @@ impl Instance {
             .collect();
         Self {
             scope_key,
+            machine_id,
             created_at,
             last_event_nanos: created_at,
             current_step: 0,
