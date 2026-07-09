@@ -55,12 +55,13 @@ pub(crate) fn validate(config: &FusionConfig) -> ConfigResult<()> {
         if !names.insert(name.clone()) {
             return ConfigReason::Validation.fail(format!("duplicate source name: {name:?}"));
         }
+        if !source.enabled {
+            continue;
+        }
         match source.kind() {
             "tcp" => {
-                if source.enabled {
-                    enabled_count += 1;
-                    enabled_non_file += 1;
-                }
+                enabled_count += 1;
+                enabled_non_file += 1;
                 // Legacy inline format: requires listen = "tcp://..."
                 if source.connect.is_none() {
                     let listen = source
@@ -78,10 +79,8 @@ pub(crate) fn validate(config: &FusionConfig) -> ConfigResult<()> {
                 // connector-based format (addr + port): validated by SourceFactory::validate_spec
             }
             "file" => {
-                if source.enabled {
-                    enabled_count += 1;
-                    enabled_file += 1;
-                }
+                enabled_count += 1;
+                enabled_file += 1;
                 let path = source.params.get("path").map(|s| s.as_str()).unwrap_or("");
                 if path.trim().is_empty() {
                     return ConfigReason::Validation.fail(format!(
@@ -107,19 +106,17 @@ pub(crate) fn validate(config: &FusionConfig) -> ConfigResult<()> {
             _ => {
                 // External source types (e.g., kafka via wp-connectors registry).
                 // Parameter-level validation is delegated to each factory's validate_spec.
-                if source.enabled {
-                    enabled_count += 1;
-                    enabled_non_file += 1;
-                    let stream = source
-                        .params
-                        .get("stream")
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    if stream.trim().is_empty() {
-                        return ConfigReason::Validation.fail(format!(
-                            "sources[{idx}] ({name}): external source stream must be non-empty"
-                        ));
-                    }
+                enabled_count += 1;
+                enabled_non_file += 1;
+                let stream = source
+                    .params
+                    .get("stream")
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                if stream.trim().is_empty() {
+                    return ConfigReason::Validation.fail(format!(
+                        "sources[{idx}] ({name}): external source stream must be non-empty"
+                    ));
                 }
             }
         }
@@ -390,6 +387,47 @@ mod tests {
         let cfg = make_config(FusionMode::Batch, vec![file, src_enabled("kafka")]);
         let err = validate(&cfg).unwrap_err();
         assert!(err.to_string().contains("batch mode does not allow"));
+    }
+
+    #[test]
+    fn daemon_mode_ignores_disabled_source_params() {
+        let cfg = make_config(
+            FusionMode::Daemon,
+            vec![
+                src_disabled("tcp"),
+                src_disabled("file"),
+                src_enabled("kafka"),
+            ],
+        );
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn batch_mode_accepts_enabled_file_plus_disabled_external_source() {
+        let mut file = SourceConfig {
+            name: None,
+            connect: None,
+            source_type: Some("file".into()),
+            enabled: true,
+            params: BTreeMap::new(),
+        };
+        file.params
+            .insert("path".into(), "data/events.ndjson".into());
+        file.params.insert("stream".into(), "events".into());
+        file.params.insert("data_format".into(), "ndjson".into());
+
+        let cfg = make_config(FusionMode::Batch, vec![file, src_disabled("kafka")]);
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn batch_mode_rejects_all_disabled_file_sources() {
+        let cfg = make_config(FusionMode::Batch, vec![src_disabled("file")]);
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("batch mode requires at least one enabled file source")
+        );
     }
 
     #[test]

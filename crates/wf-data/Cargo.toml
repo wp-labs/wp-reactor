@@ -1,0 +1,12 @@
+[package]
+name = "wf-data"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "wf_data"
+
+[dependencies]
+chrono = { workspace = true }
+serde_json = { workspace = true }

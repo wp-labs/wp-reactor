@@ -326,7 +326,7 @@ fn make_task_with_window_bytes(
         limits_plan: None,
     };
 
-    let machine = CepStateMachine::new("test_rule".into(), match_plan, None);
+    let machine = CepStateMachine::new("test_rule".into(), match_plan, Some("event_time".into()));
     let executor = RuleExecutor::new(rule_plan);
 
     let (alert_tx, alert_rx) = mpsc::channel(64);
@@ -1828,8 +1828,8 @@ async fn pull_triggers_alert() {
     let schema = test_schema();
     let (mut task, mut alert_rx, win, _notify) = make_task();
 
-    let ts = 1_700_000_000_000_000_000i64;
-    let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.1", "10.0.0.1"], ts);
+    let ts_nanos = 1_700_000_000_000_000_000i64;
+    let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.1", "10.0.0.1"], ts_nanos);
     win.write().unwrap().append(batch).unwrap();
 
     task.pull_and_advance().await;
@@ -1839,6 +1839,23 @@ async fn pull_triggers_alert() {
     assert_eq!(alert.entity_type, "ip");
     assert_eq!(alert.entity_id, "10.0.0.1");
     assert!((alert.score - 70.0).abs() < f64::EPSILON);
+    assert_eq!(alert.event_time_nanos, ts_nanos);
+}
+
+#[tokio::test]
+async fn pull_keeps_normalized_nanos_event_time() {
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, mut alert_rx, win, _notify) = make_task();
+
+    let ts_nanos = 1_000_000_000i64;
+    let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.1", "10.0.0.1"], ts_nanos);
+    win.write().unwrap().append(batch).unwrap();
+
+    task.pull_and_advance().await;
+
+    let alert = alert_rx.try_recv().expect("should have produced an alert");
+    assert_eq!(alert.event_time_nanos, ts_nanos);
 }
 
 #[tokio::test]
@@ -2012,7 +2029,7 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
     init_tracing();
     let schema = test_schema();
     let (mut task, mut alert_rx, router) = make_intermediate_each_task();
-    let ts = 4_000_000_000_000_000i64;
+    let ts = 4_000_000_000_000_000_000i64;
 
     let batch = make_batch(&schema, &["10.0.0.8"], ts);
     let source = router.registry().get_window("auth_events").unwrap();
@@ -2226,8 +2243,8 @@ async fn on_each_emits_one_alert_per_matching_row() {
     init_tracing();
     let schema = test_schema();
     let (mut task, mut alert_rx, win, _notify) = make_each_task();
-    let ts = 4_000_000_000_000_000i64;
-    let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.2"], ts);
+    let ts_nanos = 1_700_000_000_000_000_000i64;
+    let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.2"], ts_nanos);
     win.write().unwrap().append(batch).unwrap();
 
     task.pull_and_advance().await;
@@ -2236,7 +2253,7 @@ async fn on_each_emits_one_alert_per_matching_row() {
     assert_eq!(alert.rule_name, "each_rule");
     assert_eq!(alert.entity_id, "10.0.0.1");
     assert_eq!(alert.origin, wf_engine::alert::AlertOrigin::Event);
-    assert_eq!(alert.event_time_nanos, ts);
+    assert_eq!(alert.event_time_nanos, ts_nanos);
     assert_eq!(
         alert.yield_fields,
         vec![(

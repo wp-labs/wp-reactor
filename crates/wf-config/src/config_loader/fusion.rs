@@ -141,6 +141,7 @@ impl FusionConfig {
             None => value.clone(),
         };
         let expanded = expand_value(&scoped, ctx).conv_err()?;
+        reject_invalid_source_fields(&expanded)?;
         let expanded_toml = toml::to_string(&expanded)
             .source_raw_err(ConfigReason::Parse, "serialize expanded fusion TOML")?;
         let mut raw: FusionConfigRaw = toml::from_str(&expanded_toml)
@@ -211,6 +212,30 @@ impl FusionConfig {
 
         Ok(config)
     }
+}
+
+fn reject_invalid_source_fields(value: &TomlValue) -> ConfigResult<()> {
+    let Some(sources) = value.get("sources").and_then(TomlValue::as_array) else {
+        return Ok(());
+    };
+    for (idx, source) in sources.iter().enumerate() {
+        let Some(table) = source.as_table() else {
+            continue;
+        };
+        if table.contains_key("enabled") {
+            return ConfigReason::Parse.fail(format!(
+                "sources[{idx}] uses `enable`, not `enabled`; replace `enabled = ...` with `enable = ...`"
+            ));
+        }
+        if let Some(vars) = table.get("vars")
+            && !vars.is_table()
+        {
+            return ConfigReason::Parse.fail(format!(
+                "sources[{idx}] field `vars` is reserved for config loading and cannot be used as a source parameter"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Load `SourceConfig` entries from `*.toml` files in a directory.

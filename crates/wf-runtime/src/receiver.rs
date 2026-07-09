@@ -11,6 +11,7 @@ use arrow::record_batch::RecordBatch;
 use orion_error::conversion::{SourceErr, SourceRawErr, ToStructError};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
+use wf_data::time::{parse_json_timestamp_nanos, parse_timestamp_str_nanos};
 use wf_engine::window::Router;
 use wf_lang::{BaseType, FieldType, WindowSchema};
 
@@ -643,15 +644,7 @@ fn coerce_column(col: &ArrayRef, target: &arrow::datatypes::DataType, num_rows: 
             let mut builder = TimestampNanosecondBuilder::with_capacity(num_rows);
             for i in 0..num_rows {
                 let v = strings.value(i);
-                let ns = chrono::DateTime::parse_from_rfc3339(v)
-                    .ok()
-                    .or_else(|| {
-                        chrono::NaiveDateTime::parse_from_str(v, "%Y-%m-%d %H:%M:%S")
-                            .ok()
-                            .map(|dt| dt.and_utc().fixed_offset())
-                    })
-                    .and_then(|dt| dt.timestamp_nanos_opt());
-                match ns {
+                match parse_timestamp_str_nanos(v) {
                     Some(v) => builder.append_value(v),
                     None => builder.append_null(),
                 }
@@ -770,7 +763,7 @@ impl ColumnBuilder {
             Self::Int64(col) => col.push(parse_i64(value)),
             Self::Float64(col) => col.push(parse_f64(value)),
             Self::Bool(col) => col.push(parse_bool(value)),
-            Self::TimeNanos(col) => col.push(parse_i64(value)),
+            Self::TimeNanos(col) => col.push(value.and_then(parse_json_timestamp_nanos)),
         }
         Ok(())
     }
@@ -963,6 +956,50 @@ mod tests {
         assert_eq!(snapshot_row_count(&router), 2);
     }
 
+    #[test]
+    fn json_time_column_accepts_epoch_millis() {
+        let rows = vec![
+            serde_json::json!({
+                "ts": 1_700_000_000_000i64,
+                "value": 1
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ];
+
+        let batch = build_record_batch_from_json(&test_schema(), &rows).unwrap();
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+
+        assert_eq!(ts.value(0), 1_700_000_000_000_000_000);
+    }
+
+    #[test]
+    fn json_time_column_accepts_rfc3339_string() {
+        let rows = vec![
+            serde_json::json!({
+                "ts": "2023-11-14T22:13:20Z",
+                "value": 1
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ];
+
+        let batch = build_record_batch_from_json(&test_schema(), &rows).unwrap();
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+
+        assert_eq!(ts.value(0), 1_700_000_000_000_000_000);
+    }
+
     #[tokio::test]
     async fn file_arrow_framed_replay_routes_rows() {
         let router = make_router("events");
@@ -1131,6 +1168,21 @@ mod tests {
         let strings = result.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(strings.value(0), "a");
         assert_eq!(strings.value(1), "b");
+    }
+
+    #[test]
+    fn coerce_utf8_to_timestamp_accepts_epoch_millis_and_rfc3339() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![
+            "1700000000000",
+            "2023-11-14T22:13:20Z",
+        ]));
+        let result = coerce_column(&arr, &DataType::Timestamp(TimeUnit::Nanosecond, None), 2);
+        let ts = result
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), 1_700_000_000_000_000_000);
+        assert_eq!(ts.value(1), 1_700_000_000_000_000_000);
     }
 
     #[test]

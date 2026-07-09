@@ -1006,6 +1006,161 @@ format = "ndjson"
 }
 
 #[test]
+fn sources_dir_disabled_sources_do_not_require_runtime_params() {
+    let root = make_temp_dir("sources-dir-enable");
+    let config_path = root.join("conf/wfusion.toml");
+    let work_dir = root.join("workspace");
+    let sources_dir = work_dir.join("sources.d");
+    let windows_path = work_dir.join("models/windows.toml");
+    std::fs::create_dir_all(&sources_dir).expect("failed to create sources dir");
+    write_file(
+        &config_path,
+        r#"
+mode = "batch"
+windows = "models/windows.toml"
+sinks = "sinks"
+sources_dir = "sources.d"
+
+[runtime]
+executor_parallelism = 2
+rule_exec_timeout = "30s"
+schemas = "models/schemas/*.wfs"
+rules = "rules/*.wfl"
+"#,
+    );
+    write_file(
+        &sources_dir.join("00-disabled-kafka.toml"),
+        r#"
+connect = "kafka_src"
+enable = false
+key = "disabled_kafka"
+"#,
+    );
+    write_file(
+        &sources_dir.join("10-file.toml"),
+        r#"
+connect = "file_src"
+enable = true
+key = "seed_file"
+path = "data/auth_events.ndjson"
+stream = "syslog"
+data_format = "ndjson"
+"#,
+    );
+    write_file(&windows_path, WINDOWS_TOML);
+
+    let cfg =
+        FusionConfig::load_with_context(&config_path, &ConfigVarContext::new(), Some(&work_dir))
+            .expect("load config with disabled source in sources_dir");
+
+    assert_eq!(cfg.sources.len(), 2);
+    assert!(!cfg.sources[0].enabled);
+    assert_eq!(cfg.sources[0].name.as_deref(), Some("disabled_kafka"));
+    assert!(cfg.sources[1].enabled);
+    assert_eq!(cfg.sources[1].name.as_deref(), Some("seed_file"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn sources_dir_accepts_nested_params() {
+    let root = make_temp_dir("sources-dir-nested-params");
+    let config_path = root.join("conf/wfusion.toml");
+    let work_dir = root.join("workspace");
+    let sources_dir = work_dir.join("sources.d");
+    let windows_path = work_dir.join("models/windows.toml");
+    std::fs::create_dir_all(&sources_dir).expect("failed to create sources dir");
+    write_file(
+        &config_path,
+        r#"
+mode = "batch"
+windows = "models/windows.toml"
+sinks = "sinks"
+sources_dir = "sources.d"
+
+[runtime]
+executor_parallelism = 2
+rule_exec_timeout = "30s"
+schemas = "models/schemas/*.wfs"
+rules = "rules/*.wfl"
+"#,
+    );
+    write_file(
+        &sources_dir.join("file.toml"),
+        r#"
+connect = "file_src"
+enable = true
+key = "seed_file"
+
+[params]
+path = "data/auth_events.ndjson"
+stream = "syslog"
+data_format = "ndjson"
+"#,
+    );
+    write_file(&windows_path, WINDOWS_TOML);
+
+    let cfg =
+        FusionConfig::load_with_context(&config_path, &ConfigVarContext::new(), Some(&work_dir))
+            .expect("load config with nested source params");
+
+    assert_eq!(cfg.sources.len(), 1);
+    assert_eq!(cfg.sources[0].name.as_deref(), Some("seed_file"));
+    assert_eq!(
+        cfg.sources[0].params.get("path").map(String::as_str),
+        Some("data/auth_events.ndjson")
+    );
+    assert_eq!(
+        cfg.sources[0].params.get("stream").map(String::as_str),
+        Some("syslog")
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn source_enabled_field_fails_fast() {
+    let toml = format!(
+        r#"{}
+[[sources]]
+type = "file"
+enabled = false
+path = "data/auth_events.ndjson"
+stream = "syslog"
+format = "ndjson"
+"#,
+        FULL_TOML
+    );
+    let err = try_load_with_windows(&toml, WINDOWS_TOML).unwrap_err();
+    assert!(
+        err.to_string().contains("source uses `enable`")
+            || err.to_string().contains("uses `enable`, not `enabled`"),
+        "error should mention enable field: {err}"
+    );
+}
+
+#[test]
+fn source_vars_scalar_field_fails_fast() {
+    let toml = format!(
+        r#"{}
+[[sources]]
+type = "file"
+vars = "not allowed"
+path = "data/auth_events.ndjson"
+stream = "syslog"
+format = "ndjson"
+"#,
+        FULL_TOML
+    );
+    let err = try_load_with_windows(&toml, WINDOWS_TOML).unwrap_err();
+    assert!(
+        err.to_string().contains("`vars` is reserved")
+            || err.to_string().contains("field `vars` is reserved"),
+        "error should mention reserved vars field: {err}"
+    );
+}
+
+#[test]
 fn missing_sources_dir_fails() {
     let root = make_temp_dir("missing-sources-dir");
     let config_path = root.join("conf/wfusion.toml");
@@ -1095,6 +1250,46 @@ format = "ndjson"
         }
         _ => {}
     }
+}
+
+#[test]
+fn load_inline_source_with_nested_params() {
+    let toml = r#"
+mode = "batch"
+windows = "models/windows.toml"
+sinks = "sinks"
+
+[[sources]]
+connect = "file_src"
+enable = true
+key = "seed_file"
+
+[sources.params]
+path = "data/auth_events.ndjson"
+stream = "syslog"
+data_format = "ndjson"
+
+[runtime]
+executor_parallelism = 2
+rule_exec_timeout = "30s"
+schemas = "schemas/*.wfs"
+rules = "rules/*.wfl"
+"#;
+    let cfg: FusionConfig = load_with_windows(toml, WINDOWS_TOML);
+    assert_eq!(cfg.sources.len(), 1);
+    assert_eq!(cfg.sources[0].name.as_deref(), Some("seed_file"));
+    assert_eq!(
+        cfg.sources[0].params.get("path").map(String::as_str),
+        Some("data/auth_events.ndjson")
+    );
+    assert_eq!(
+        cfg.sources[0].params.get("stream").map(String::as_str),
+        Some("syslog")
+    );
+    assert_eq!(
+        cfg.sources[0].params.get("data_format").map(String::as_str),
+        Some("ndjson")
+    );
 }
 
 // -----------------------------------------------------------------------

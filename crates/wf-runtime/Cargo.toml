@@ -10,6 +10,7 @@ name = "wf_runtime"
 [dependencies]
 wf-engine = { path = "../wf-engine" }
 wf-config = { path = "../wf-config" }
+wf-data = { path = "../wf-data" }
 wp-connector-api = { workspace = true }
 wf-connector-api = { workspace = true }
 wp-core-connectors = { workspace = true }

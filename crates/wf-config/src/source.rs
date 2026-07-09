@@ -1,5 +1,7 @@
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeError;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
+use toml::Value as TomlValue;
 
 /// A single `[[sources]]` entry.
 ///
@@ -9,7 +11,7 @@ use std::collections::BTreeMap;
 /// ```toml
 /// type = "file"
 /// key = "netflow_file"
-/// enabled = true
+/// enable = true
 /// path = "data/events.ndjson"
 /// stream = "netflow"
 /// ```
@@ -25,7 +27,7 @@ use std::collections::BTreeMap;
 ///
 /// When `connect` is set, `type` is optional — the kind is resolved from the
 /// connector registry at runtime via [`SourceConfig::resolve_kind`].
-#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Serialize)]
 #[moju(kind = "struct", domain = "Config", module = "Config.SourceConfig")]
 pub struct SourceConfig {
     #[serde(default, alias = "key")]
@@ -37,7 +39,7 @@ pub struct SourceConfig {
     /// Resolved to a kind via the connector registry.
     #[serde(default)]
     pub connect: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", rename = "enable")]
     pub enabled: bool,
     /// All other fields (flat or under `[sources.params]`) are captured here.
     #[serde(default, flatten)]
@@ -103,6 +105,77 @@ fn default_true() -> bool {
     true
 }
 
+impl<'de> Deserialize<'de> for SourceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawSourceConfig {
+            #[serde(default, alias = "key")]
+            name: Option<String>,
+            #[serde(rename = "type", default)]
+            source_type: Option<String>,
+            #[serde(default)]
+            connect: Option<String>,
+            #[serde(default = "default_true", rename = "enable")]
+            enabled: bool,
+            #[serde(default, alias = "params_override")]
+            params: BTreeMap<String, TomlValue>,
+            #[serde(default, flatten)]
+            flat_params: BTreeMap<String, TomlValue>,
+        }
+
+        let mut raw = RawSourceConfig::deserialize(deserializer)?;
+        if raw.flat_params.contains_key("enabled") {
+            return Err(D::Error::custom(
+                "source uses `enable`, not `enabled`; replace `enabled = ...` with `enable = ...`",
+            ));
+        }
+        if let Some(value) = raw.flat_params.remove("vars")
+            && !matches!(value, TomlValue::Table(_))
+        {
+            return Err(D::Error::custom(
+                "`vars` is a reserved source field and cannot be used as a source parameter",
+            ));
+        }
+
+        let mut params = BTreeMap::new();
+        for (key, value) in std::mem::take(&mut raw.params) {
+            let value = param_value_to_string("params", &key, value)?;
+            params.insert(key, value);
+        }
+        for (key, value) in raw.flat_params {
+            let value = param_value_to_string("source", &key, value)?;
+            params.insert(key, value);
+        }
+
+        Ok(SourceConfig {
+            name: raw.name,
+            source_type: raw.source_type,
+            connect: raw.connect,
+            enabled: raw.enabled,
+            params,
+        })
+    }
+}
+
+fn param_value_to_string<E>(scope: &str, key: &str, value: TomlValue) -> Result<String, E>
+where
+    E: DeError,
+{
+    match value {
+        TomlValue::String(value) => Ok(value),
+        TomlValue::Integer(value) => Ok(value.to_string()),
+        TomlValue::Float(value) => Ok(value.to_string()),
+        TomlValue::Boolean(value) => Ok(value.to_string()),
+        TomlValue::Datetime(value) => Ok(value.to_string()),
+        TomlValue::Array(_) | TomlValue::Table(_) => Err(E::custom(format!(
+            "{scope} field {key:?} must be a scalar value"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +213,72 @@ group_id = "wfusion"
         assert_eq!(s.params.get("brokers").unwrap(), "localhost:9092");
         assert_eq!(s.params.get("topic").unwrap(), "wp_nginx_logs");
         assert_eq!(s.params.get("stream").unwrap(), "nginx_access");
+    }
+
+    #[test]
+    fn parse_connector_format_with_nested_params() {
+        let toml = r#"
+key = "kafka_1"
+connect = "kafka_src"
+
+[params]
+stream = "nginx_access"
+brokers = "localhost:9092"
+topic = "wp_nginx_logs"
+group_id = "wfusion"
+"#;
+        let s: SourceConfig = toml::from_str(toml).unwrap();
+        assert_eq!(s.name.as_deref(), Some("kafka_1"));
+        assert_eq!(s.connect.as_deref(), Some("kafka_src"));
+        assert_eq!(s.params.get("brokers").unwrap(), "localhost:9092");
+        assert_eq!(s.params.get("topic").unwrap(), "wp_nginx_logs");
+        assert_eq!(s.params.get("stream").unwrap(), "nginx_access");
+    }
+
+    #[test]
+    fn parse_connector_params_override_alias() {
+        let toml = r#"
+key = "file_1"
+connect = "file_src"
+
+[params_override]
+path = "data/events.ndjson"
+stream = "events"
+"#;
+        let s: SourceConfig = toml::from_str(toml).unwrap();
+        assert_eq!(s.params.get("path").unwrap(), "data/events.ndjson");
+        assert_eq!(s.params.get("stream").unwrap(), "events");
+    }
+
+    #[test]
+    fn flat_params_override_nested_params() {
+        let toml = r#"
+key = "file_1"
+connect = "file_src"
+path = "data/flat.ndjson"
+
+[params]
+path = "data/nested.ndjson"
+stream = "events"
+"#;
+        let s: SourceConfig = toml::from_str(toml).unwrap();
+        assert_eq!(s.params.get("path").unwrap(), "data/flat.ndjson");
+        assert_eq!(s.params.get("stream").unwrap(), "events");
+    }
+
+    #[test]
+    fn parse_scalar_source_params_as_strings() {
+        let toml = r#"
+key = "tcp_1"
+connect = "tcp_src"
+port = 9800
+tls = false
+ratio = 1.5
+"#;
+        let s: SourceConfig = toml::from_str(toml).unwrap();
+        assert_eq!(s.params.get("port").unwrap(), "9800");
+        assert_eq!(s.params.get("tls").unwrap(), "false");
+        assert_eq!(s.params.get("ratio").unwrap(), "1.5");
     }
 
     #[test]
@@ -210,5 +349,96 @@ listen = "tcp://0.0.0.0:9800"
         let s: SourceConfig = toml::from_str(toml).unwrap();
         assert_eq!(s.kind(), "tcp");
         assert_eq!(s.params.get("listen").unwrap(), "tcp://0.0.0.0:9800");
+    }
+
+    #[test]
+    fn source_enable_defaults_to_true() {
+        let toml = r#"
+type = "file"
+path = "data/events.ndjson"
+stream = "events"
+"#;
+        let s: SourceConfig = toml::from_str(toml).unwrap();
+        assert!(s.enabled);
+    }
+
+    #[test]
+    fn parse_source_enable_false() {
+        let toml = r#"
+type = "file"
+enable = false
+path = "data/events.ndjson"
+stream = "events"
+"#;
+        let s: SourceConfig = toml::from_str(toml).unwrap();
+        assert!(!s.enabled);
+    }
+
+    #[test]
+    fn parse_source_rejects_enabled_field() {
+        let toml = r#"
+type = "file"
+enabled = false
+path = "data/events.ndjson"
+stream = "events"
+"#;
+        let err = toml::from_str::<SourceConfig>(toml).unwrap_err();
+        assert!(err.to_string().contains("source uses `enable`"));
+    }
+
+    #[test]
+    fn parse_source_ignores_loader_vars_table() {
+        let toml = r#"
+type = "file"
+path = "data/events.ndjson"
+stream = "events"
+
+[vars]
+WORK_DIR = "/tmp/work"
+"#;
+        let s: SourceConfig = toml::from_str(toml).unwrap();
+        assert!(!s.params.contains_key("vars"));
+    }
+
+    #[test]
+    fn parse_source_rejects_vars_scalar_param() {
+        let toml = r#"
+type = "file"
+vars = "not allowed"
+path = "data/events.ndjson"
+stream = "events"
+"#;
+        let err = toml::from_str::<SourceConfig>(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`vars` is a reserved source field")
+        );
+    }
+
+    #[test]
+    fn parse_source_rejects_vars_array_param() {
+        let toml = r#"
+type = "file"
+vars = ["not", "allowed"]
+path = "data/events.ndjson"
+stream = "events"
+"#;
+        let err = toml::from_str::<SourceConfig>(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`vars` is a reserved source field")
+        );
+    }
+
+    #[test]
+    fn serialize_source_uses_enable_key() {
+        let s = SourceConfig {
+            source_type: Some("file".into()),
+            enabled: false,
+            ..Default::default()
+        };
+        let out = toml::to_string(&s).unwrap();
+        assert!(out.contains("enable = false"));
+        assert!(!out.contains("enabled"));
     }
 }
