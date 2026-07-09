@@ -247,6 +247,55 @@ rule r {
 }
 
 #[test]
+fn now_functions_valid() {
+    let out = make_output_window(
+        "out",
+        vec![
+            ("x", bt(BaseType::Ip)),
+            ("created_time", bt(BaseType::Time)),
+            ("created_s", bt(BaseType::Digit)),
+            ("created_ms", bt(BaseType::Digit)),
+            ("created_us", bt(BaseType::Digit)),
+            ("created_ns", bt(BaseType::Digit)),
+            ("created_day", bt(BaseType::Chars)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        created_time = now(),
+        created_s = now_s(),
+        created_ms = now_ms(),
+        created_us = now_us(),
+        created_ns = now_ns(),
+        created_day = strftime(now(), "%Y-%m-%d")
+    )
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn now_functions_reject_arguments() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (n = now(1))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "now() requires no arguments",
+    );
+}
+
+#[test]
 fn top50_batch4_functions_valid() {
     use crate::schema::FieldType;
     let out = make_output_window(
@@ -308,6 +357,109 @@ rule r {
 }
 
 #[test]
+fn hash_and_id_functions_valid() {
+    let out = make_output_window(
+        "out",
+        vec![
+            ("x", bt(BaseType::Ip)),
+            ("md5_v", bt(BaseType::Chars)),
+            ("sha1_v", bt(BaseType::Chars)),
+            ("sha256_v", bt(BaseType::Chars)),
+            ("hex_v", bt(BaseType::Hex)),
+            ("short_v", bt(BaseType::Chars)),
+            ("stable_v", bt(BaseType::Chars)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        md5_v = md5(e.action),
+        sha1_v = sha1(e.action),
+        sha256_v = sha256(e.action),
+        hex_v = hex(e.action),
+        short_v = substr(sha256(e.action), 1, 16),
+        stable_v = stable_id("alert_", e.sip, e.count, e.event_time)
+    )
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn hash_functions_reject_wrong_types() {
+    let out = make_output_window(
+        "out",
+        vec![
+            ("md5_v", bt(BaseType::Chars)),
+            ("stable_v", bt(BaseType::Chars)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        md5_v = md5(e.count),
+        stable_v = stable_id(e.count, e.action)
+    )
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), out.clone()],
+        "md5() argument must be chars",
+    );
+    assert_has_error(
+        input,
+        &[auth_events_window(), out],
+        "stable_id() prefix must be chars",
+    );
+}
+
+#[test]
+fn hash_functions_reject_wrong_arg_counts() {
+    let out = make_output_window(
+        "out",
+        vec![
+            ("md5_v", bt(BaseType::Chars)),
+            ("hex_v", bt(BaseType::Hex)),
+            ("stable_v", bt(BaseType::Chars)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        md5_v = md5(),
+        hex_v = hex(e.action, e.user),
+        stable_v = stable_id("alert_")
+    )
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), out.clone()],
+        "md5() requires exactly 1 argument",
+    );
+    assert_has_error(
+        input,
+        &[auth_events_window(), out.clone()],
+        "hex() requires exactly 1 argument",
+    );
+    assert_has_error(
+        input,
+        &[auth_events_window(), out],
+        "stable_id() requires at least 2 arguments",
+    );
+}
+
+#[test]
 fn coalesce_incompatible_types_rejected() {
     let input = r#"
 rule r {
@@ -321,6 +473,68 @@ rule r {
         input,
         &[auth_events_window(), output_window()],
         "not compatible",
+    );
+}
+
+#[test]
+fn blank_functions_valid() {
+    let out = make_output_window(
+        "out",
+        vec![
+            ("x", bt(BaseType::Ip)),
+            ("blank_v", bt(BaseType::Bool)),
+            ("normalized_v", bt(BaseType::Chars)),
+            ("default_v", bt(BaseType::Chars)),
+            ("coalesced_v", bt(BaseType::Chars)),
+            ("trimmed_v", bt(BaseType::Chars)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        blank_v = is_blank(e.user),
+        normalized_v = null_if_blank(e.user),
+        default_v = default_if_blank(e.user, "unknown"),
+        coalesced_v = coalesce(null_if_blank(e.user), e.action, "unknown"),
+        trimmed_v = trim(e.action)
+    )
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn blank_functions_reject_wrong_types() {
+    let out = make_output_window(
+        "out",
+        vec![
+            ("is_blank_v", bt(BaseType::Bool)),
+            ("default_v", bt(BaseType::Chars)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        is_blank_v = is_blank(e.count),
+        default_v = default_if_blank(e.user, e.count)
+    )
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), out.clone()],
+        "is_blank() argument must be chars",
+    );
+    assert_has_error(
+        input,
+        &[auth_events_window(), out],
+        "default_if_blank() argument 2 must be chars",
     );
 }
 

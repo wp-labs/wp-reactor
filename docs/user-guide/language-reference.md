@@ -506,10 +506,12 @@ fmt("{} failed {} times from {}", fail.username, count(fail), fail.sip)
 
 当前代码里已接入并有 checker 支持的常见函数包括：
 
-- 字符串：`contains`、`regex_match`、`lower`、`upper`、`len`、`concat`
-- 数值：`round`
-- 空值合并：`coalesce`
+- 字符串：`contains`、`regex_match`、`startswith`、`endswith`、`lower`、`upper`、`len`、`concat`
+- 数值：`round`、`abs`、`ceil`、`floor`、`sqrt`、`pow`、`log`、`exp`、`clamp`
+- 空值 / 空白处理：`coalesce`、`isnull`、`isnotnull`、`is_blank`、`null_if_blank`、`default_if_blank`
 - 时间：`time_diff`、`time_bucket`
+- 当前引擎时间：`now`、`now_s`、`now_ms`、`now_us`、`now_ns`
+- 哈希 / 编码：`md5`、`sha1`、`sha256`、`hex`、`stable_id`
 - 画像 / 回看：`baseline`
 - 方法调用：`window.has(...)`
 
@@ -528,6 +530,112 @@ events {
     bad : endpoint_events && lower(status) in ("error", "failed", "failure")
 }
 ```
+
+#### 空值与空白字符串
+
+| 函数 | 返回类型 | 说明 |
+|------|----------|------|
+| `coalesce(v1, v2, ...)` | 首个非空参数的类型 | 返回第一个非 null / 可求值的参数 |
+| `isnull(expr)` | `bool` | 参数不可求值时返回 `true` |
+| `isnotnull(expr)` | `bool` | 参数可求值时返回 `true` |
+| `is_blank(text)` | `bool` | `text` 缺失、空字符串或全空白字符时返回 `true` |
+| `null_if_blank(text)` | `chars` 或 null | `text` 为空白时返回 null，否则返回原字符串 |
+| `default_if_blank(text, default)` | `chars` | `text` 缺失或为空白时返回 `default` |
+
+示例：
+
+```wfl
+yield out (
+    user = default_if_blank(e.user, "unknown"),
+    src = coalesce(null_if_blank(e.src), e.sip)
+)
+```
+
+`is_blank`、`null_if_blank`、`default_if_blank` 的参数必须是 `chars`。其中 `null_if_blank(...)` 常和 `coalesce(...)` 组合使用。
+
+#### 当前引擎时间
+
+| 函数 | 返回类型 | 说明 |
+|------|----------|------|
+| `now()` | `time` | 当前 UTC epoch nanoseconds；可直接传给 `strftime` |
+| `now_s()` | `digit` | 当前 UTC epoch seconds |
+| `now_ms()` | `digit` | 当前 UTC epoch milliseconds |
+| `now_us()` | `digit` | 当前 UTC epoch microseconds |
+| `now_ns()` | `digit` | 当前 UTC epoch nanoseconds |
+
+示例：
+
+```wfl
+yield security_alerts (
+    created_time = now(),
+    created_ms = now_ms(),
+    created_day = strftime(now(), "%Y-%m-%d")
+)
+```
+
+说明：
+
+- `now()` 表示规则输出时刻，不是事件发生时间。
+- 同一条输出记录的多个 `yield` 字段里调用 `now_*`，会复用同一个内部时间戳。
+- 当前运行时数值统一使用 `f64` 表示；`now_ns()` 可用于时间函数和比较，但不要把它当作可精确表达每一纳秒的整数序列号。
+
+#### 时间格式化与解析
+
+| 函数 | 返回类型 | 说明 |
+|------|----------|------|
+| `strftime(timestamp_nanos, format)` | `chars` | 按 chrono 格式字符串格式化 UTC 时间 |
+| `strptime(text, format)` | `time` | 按格式解析时间，返回 epoch nanoseconds |
+| `time_diff(t1, t2)` | `float` | 返回两个时间的秒级差值绝对值 |
+| `time_bucket(t, interval_seconds)` | `time` | 将时间向下取整到指定秒级窗口 |
+
+示例：
+
+```wfl
+yield out (
+    day = strftime(e.event_time, "%Y-%m-%d"),
+    age_seconds = time_diff(now(), e.event_time),
+    bucket = time_bucket(e.event_time, 300)
+)
+```
+
+#### 哈希、编码与稳定 ID
+
+| 函数 | 返回类型 | 说明 |
+|------|----------|------|
+| `md5(text)` | `chars` | 返回小写十六进制 MD5 字符串 |
+| `sha1(text)` | `chars` | 返回小写十六进制 SHA-1 字符串 |
+| `sha256(text)` | `chars` | 返回小写十六进制 SHA-256 字符串 |
+| `hex(text)` | `hex` | 返回字符串字节的小写十六进制编码 |
+| `stable_id(prefix, value, ...)` | `chars` | 返回 `prefix` + SHA-256 前 16 位 |
+
+示例：
+
+```wfl
+yield security_alerts (
+    cmd_sha256 = sha256(e.cmdline),
+    raw_hex = hex(e.raw),
+    alert_id = stable_id("alert_", e.sip, e.user, e.event_time)
+)
+```
+
+说明：
+
+- `md5`、`sha1`、`sha256`、`hex` 的参数必须是 `chars`。
+- `stable_id` 的第一个参数必须是 `chars` 前缀；后续参数必须是标量值，支持 `chars`、`digit`、`float`、`bool`、`time`、`ip`、`hex`。
+- `stable_id` 对后续值使用带类型和长度的稳定编码后再计算 SHA-256，避免简单拼接导致的歧义。
+
+#### 多值函数
+
+| 函数 | 说明 |
+|------|------|
+| `mvcount(arr)` | 返回数组长度 |
+| `mvjoin(arr, sep)` | 用分隔符拼接数组 |
+| `mvindex(arr, index)` / `mvindex(arr, start, end)` | 取单个元素或范围 |
+| `mvappend(v1, v2, ...)` | 合并标量或数组 |
+| `split(text, sep)` | 将字符串拆成数组 |
+| `mvdedup(arr)` | 数组去重，保留首次出现顺序 |
+| `mvsort(arr)` | 数组排序 |
+| `mvreverse(arr)` | 数组反转 |
 
 ## 规则测试
 

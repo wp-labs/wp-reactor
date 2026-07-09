@@ -2,6 +2,22 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [0.1.27 Unreleased]
+
+### Added
+
+- **wf-lang**: Added type checking and inference for new WFL helper functions: `now()`, `now_s()`, `now_ms()`, `now_us()`, `now_ns()`, `is_blank()`, `null_if_blank()`, `default_if_blank()`, `md5()`, `sha1()`, `sha256()`, `hex()`, and `stable_id()`.
+- **wf-engine**: Added runtime support for current engine time helpers, blank-string helpers, hash/hex helpers, and stable alert ID generation in both L2 expression evaluation and yield/L3 evaluation paths.
+
+### Fixed
+
+- **wf-engine**: `now_*` helpers now share one cached timestamp within a single expression and across all yield fields for one output record, preventing `created_time` / `created_ns` drift inside the same alert.
+- **wf-engine**: `stable_id()` now hashes typed, length-prefixed value segments instead of ambiguous separator-joined values, avoiding collisions when inputs contain separator-like bytes.
+
+### Documentation
+
+- **User guide**: Expanded the WFL language reference with current blank handling, current-time, time formatting/parsing, hash/encoding, stable ID, and multivalue function behavior.
+
 ## [0.1.25] — 2026-07-02
 
 ### Added

@@ -5,7 +5,7 @@ use crate::match_engine::match_engine::{Event, MatchedContext, WindowLookup};
 use super::RuleExecutor;
 use super::alert::{build_summary, build_wfx_id, format_nanos_utc, format_now_utc};
 use super::context::{build_eval_context, execute_joins};
-use super::eval::{eval_entity_id, eval_score, eval_yield_expr_with_score};
+use super::eval::{eval_entity_id, eval_score, eval_yield_expr_with_score, with_yield_eval_scope};
 
 impl RuleExecutor {
     /// Produce an [`OutputRecord`] from an on-event match (L1 — no joins).
@@ -70,23 +70,24 @@ impl RuleExecutor {
             &matched.step_data,
             &origin,
         );
-        let yield_fields = self
-            .plan
-            .yield_plan
-            .fields
-            .iter()
-            .map(|field| {
-                let Some(value) = eval_yield_expr_with_score(&field.value, ctx, Some(score)) else {
-                    return Err(
-                        orion_error::StructError::from(CoreReason::RuleExec).with_detail(format!(
-                            "match yield field {:?} expression evaluated to None",
-                            field.name
-                        )),
-                    );
-                };
-                Ok((field.name.clone(), value))
-            })
-            .collect::<CoreResult<Vec<_>>>()?;
+        let yield_fields = with_yield_eval_scope(|| {
+            self.plan
+                .yield_plan
+                .fields
+                .iter()
+                .map(|field| {
+                    let Some(value) = eval_yield_expr_with_score(&field.value, ctx, Some(score))
+                    else {
+                        return Err(orion_error::StructError::from(CoreReason::RuleExec)
+                            .with_detail(format!(
+                                "match yield field {:?} expression evaluated to None",
+                                field.name
+                            )));
+                    };
+                    Ok((field.name.clone(), value))
+                })
+                .collect::<CoreResult<Vec<_>>>()
+        })?;
         let yield_field_types = self
             .plan
             .yield_plan

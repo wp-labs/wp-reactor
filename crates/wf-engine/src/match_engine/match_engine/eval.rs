@@ -1,10 +1,46 @@
-use std::collections::HashMap;
+use std::{cell::Cell, collections::HashMap};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use md5::Digest as Md5Digest;
+use md5::Md5;
+use sha1::Digest as Sha1Digest;
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use wf_lang::ast::{BinOp, CmpOp, Expr};
 
 use super::key::{field_ref_name, value_to_string};
 use super::types::{Event, RollingStats, Value, WindowLookup};
+
+thread_local! {
+    static EVAL_TIME_NANOS: Cell<Option<i64>> = const { Cell::new(None) };
+    static EVAL_TIME_SCOPE_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct EvalTimeScope;
+
+impl EvalTimeScope {
+    fn enter() -> Self {
+        EVAL_TIME_SCOPE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for EvalTimeScope {
+    fn drop(&mut self) {
+        EVAL_TIME_SCOPE_DEPTH.with(|depth| {
+            let next_depth = depth.get().saturating_sub(1);
+            depth.set(next_depth);
+            if next_depth == 0 {
+                EVAL_TIME_NANOS.with(|time| time.set(None));
+            }
+        });
+    }
+}
+
+fn with_eval_time_scope<T>(f: impl FnOnce() -> T) -> T {
+    let _scope = EvalTimeScope::enter();
+    f()
+}
 
 // ---------------------------------------------------------------------------
 // Expression evaluator (L1)
@@ -13,10 +49,12 @@ use super::types::{Event, RollingStats, Value, WindowLookup};
 /// Evaluate an expression against an event, returning a [`Value`].
 ///
 /// Supports: literals, field refs, BinOp (And/Or/comparisons/arithmetic),
-/// Neg, InList, and basic FuncCall (contains, startswith, endswith, substr, replace, trim, lower, upper, len, mvcount, mvjoin, mvindex, mvappend, split, mvdedup, abs, round, ceil, floor, sqrt, pow, log, exp, clamp, sign, trunc, is_finite, ltrim, rtrim, concat, indexof, replace_plain, startswith_any, endswith_any, coalesce, isnull, isnotnull, mvsort, mvreverse, strftime, strptime, has, baseline).
+/// Neg, InList, and basic FuncCall (contains, startswith, endswith, substr, replace, trim, lower, upper, len, mvcount, mvjoin, mvindex, mvappend, split, mvdedup, abs, round, ceil, floor, sqrt, pow, log, exp, clamp, sign, trunc, is_finite, ltrim, rtrim, concat, indexof, replace_plain, startswith_any, endswith_any, coalesce, isnull, isnotnull, is_blank, null_if_blank, default_if_blank, md5, sha1, sha256, hex, stable_id, mvsort, mvreverse, now, now_s, now_ms, now_us, now_ns, strftime, strptime, has, baseline).
 pub(crate) fn eval_expr(expr: &Expr, event: &Event) -> Option<Value> {
-    let mut empty = HashMap::new();
-    eval_expr_ext(expr, event, None, &mut empty)
+    with_eval_time_scope(|| {
+        let mut empty = HashMap::new();
+        eval_expr_ext(expr, event, None, &mut empty)
+    })
 }
 
 /// Extended expression evaluator with window lookup and baseline store access.
@@ -29,6 +67,7 @@ pub(crate) fn eval_expr_ext(
     windows: Option<&dyn WindowLookup>,
     baselines: &mut HashMap<String, RollingStats>,
 ) -> Option<Value> {
+    let _time_scope = EvalTimeScope::enter();
     match expr {
         Expr::Number(n) => Some(Value::Number(*n)),
         Expr::StringLit(s) => Some(Value::Str(s.clone())),
@@ -294,8 +333,19 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
 /// - `coalesce(v1, v2, ...)` → first non-null value
 /// - `isnull(expr)` → Bool
 /// - `isnotnull(expr)` → Bool
+/// - `is_blank(expr)` → Bool
+/// - `null_if_blank(expr)` → Str or null
+/// - `default_if_blank(expr, default)` → Str
+/// - `md5(text)` / `sha1(text)` / `sha256(text)` → lowercase hex string
+/// - `hex(text)` → lowercase hex string
+/// - `stable_id(prefix, value, ...)` → `prefix` + first 16 chars of SHA-256 over typed, length-prefixed values
 /// - `mvsort(arr)` → Array
 /// - `mvreverse(arr)` → Array
+/// - `now()` → Number (timestamp nanos)
+/// - `now_s()` → Number (timestamp seconds)
+/// - `now_ms()` → Number (timestamp millis)
+/// - `now_us()` → Number (timestamp micros)
+/// - `now_ns()` → Number (timestamp nanos)
 /// - `strftime(timestamp_nanos, format)` → Str
 /// - `strptime(text, format)` → Number (timestamp nanos)
 fn eval_func_call(
@@ -878,6 +928,77 @@ fn eval_func_call(
                 eval_expr_ext(&args[0], event, windows, baselines).is_some(),
             ))
         }
+        "is_blank" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines) {
+                Some(Value::Str(s)) => Some(Value::Bool(is_blank_str(&s))),
+                None => Some(Value::Bool(true)),
+                Some(_) => None,
+            }
+        }
+        "null_if_blank" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) if is_blank_str(&s) => None,
+                Value::Str(s) => Some(Value::Str(s)),
+                _ => None,
+            }
+        }
+        "default_if_blank" => {
+            if args.len() != 2 {
+                return None;
+            }
+            match eval_expr_ext(&args[0], event, windows, baselines) {
+                Some(Value::Str(s)) if !is_blank_str(&s) => Some(Value::Str(s)),
+                Some(Value::Str(_)) | None => {
+                    match eval_expr_ext(&args[1], event, windows, baselines)? {
+                        Value::Str(s) => Some(Value::Str(s)),
+                        _ => None,
+                    }
+                }
+                Some(_) => None,
+            }
+        }
+        "md5" => {
+            let text = eval_single_string_arg(args, event, windows, baselines)?;
+            Some(Value::Str(hex::encode(<Md5 as Md5Digest>::digest(
+                text.as_bytes(),
+            ))))
+        }
+        "sha1" => {
+            let text = eval_single_string_arg(args, event, windows, baselines)?;
+            Some(Value::Str(hex::encode(<Sha1 as Sha1Digest>::digest(
+                text.as_bytes(),
+            ))))
+        }
+        "sha256" => {
+            let text = eval_single_string_arg(args, event, windows, baselines)?;
+            Some(Value::Str(hex::encode(Sha256::digest(text.as_bytes()))))
+        }
+        "hex" => {
+            let text = eval_single_string_arg(args, event, windows, baselines)?;
+            Some(Value::Str(hex::encode(text.as_bytes())))
+        }
+        "stable_id" => {
+            if args.len() < 2 {
+                return None;
+            }
+            let prefix = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let mut hasher = Sha256::new();
+            for arg in &args[1..] {
+                let value = eval_expr_ext(arg, event, windows, baselines)?;
+                update_stable_id_hash(&mut hasher, &value)?;
+            }
+            let digest = hex::encode(hasher.finalize());
+            Some(Value::Str(format!("{}{}", prefix, &digest[..16])))
+        }
         "mvsort" => {
             if args.len() != 1 {
                 return None;
@@ -899,6 +1020,32 @@ fn eval_func_call(
             };
             arr.reverse();
             Some(Value::Array(arr))
+        }
+        "now" | "now_ns" => {
+            if !args.is_empty() {
+                return None;
+            }
+            Some(Value::Number(current_time_nanos()? as f64))
+        }
+        "now_s" => {
+            if !args.is_empty() {
+                return None;
+            }
+            Some(Value::Number(
+                (current_time_nanos()? / 1_000_000_000) as f64,
+            ))
+        }
+        "now_ms" => {
+            if !args.is_empty() {
+                return None;
+            }
+            Some(Value::Number((current_time_nanos()? / 1_000_000) as f64))
+        }
+        "now_us" => {
+            if !args.is_empty() {
+                return None;
+            }
+            Some(Value::Number((current_time_nanos()? / 1_000) as f64))
         }
         "strftime" => {
             if args.len() != 2 {
@@ -1192,6 +1339,52 @@ fn parse_time_to_timestamp_nanos(text: &str, fmt: &str) -> Option<i64> {
         return date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_nanos_opt();
     }
     None
+}
+
+fn current_time_nanos() -> Option<i64> {
+    EVAL_TIME_NANOS.with(|time| {
+        if let Some(nanos) = time.get() {
+            return Some(nanos);
+        }
+        let nanos = Utc::now().timestamp_nanos_opt()?;
+        time.set(Some(nanos));
+        Some(nanos)
+    })
+}
+
+fn is_blank_str(value: &str) -> bool {
+    value.trim().is_empty()
+}
+
+fn eval_single_string_arg(
+    args: &[Expr],
+    event: &Event,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut HashMap<String, RollingStats>,
+) -> Option<String> {
+    if args.len() != 1 {
+        return None;
+    }
+    match eval_expr_ext(&args[0], event, windows, baselines)? {
+        Value::Str(s) => Some(s),
+        _ => None,
+    }
+}
+
+fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Option<()> {
+    let (tag, text) = match value {
+        Value::Number(_) => ("n", value_to_string(value)),
+        Value::Str(s) => ("s", s.clone()),
+        Value::Bool(_) => ("b", value_to_string(value)),
+        Value::Array(_) => return None,
+    };
+    hasher.update(tag.as_bytes());
+    hasher.update(b":");
+    hasher.update(text.len().to_string().as_bytes());
+    hasher.update(b":");
+    hasher.update(text.as_bytes());
+    hasher.update(b";");
+    Some(())
 }
 
 fn apply_fmt_template(template: &str, values: &[Value]) -> Option<String> {

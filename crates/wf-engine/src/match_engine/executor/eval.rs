@@ -1,5 +1,11 @@
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use md5::Digest as Md5Digest;
+use md5::Md5;
 use orion_error::prelude::*;
+use sha1::Digest as Sha1Digest;
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
+use std::cell::Cell;
 
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::match_engine::{
@@ -16,6 +22,37 @@ pub(super) fn eval_yield_expr(expr: &wf_lang::ast::Expr, ctx: &Event) -> Option<
     eval_yield_expr_with_score(expr, ctx, None)
 }
 
+thread_local! {
+    static EVAL_TIME_NANOS: Cell<Option<i64>> = const { Cell::new(None) };
+    static EVAL_TIME_SCOPE_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct EvalTimeScope;
+
+impl EvalTimeScope {
+    fn enter() -> Self {
+        EVAL_TIME_SCOPE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for EvalTimeScope {
+    fn drop(&mut self) {
+        EVAL_TIME_SCOPE_DEPTH.with(|depth| {
+            let next_depth = depth.get().saturating_sub(1);
+            depth.set(next_depth);
+            if next_depth == 0 {
+                EVAL_TIME_NANOS.with(|time| time.set(None));
+            }
+        });
+    }
+}
+
+pub(super) fn with_yield_eval_scope<T>(f: impl FnOnce() -> T) -> T {
+    let _scope = EvalTimeScope::enter();
+    f()
+}
+
 pub(super) fn eval_yield_expr_with_score(
     expr: &wf_lang::ast::Expr,
     ctx: &Event,
@@ -23,10 +60,10 @@ pub(super) fn eval_yield_expr_with_score(
 ) -> Option<Value> {
     // For yield expressions, fall back to empty string when a field is missing
     // (e.g., join window fields not available in test runner)
-    match eval_expr_with_l3(expr, ctx, score) {
+    with_yield_eval_scope(|| match eval_expr_with_l3(expr, ctx, score) {
         None => Some(Value::Str(String::new())),
         val => val,
-    }
+    })
 }
 
 pub(super) fn eval_bool_expr(expr: &wf_lang::ast::Expr, ctx: &Event) -> Option<bool> {
@@ -51,6 +88,7 @@ pub(super) fn eval_bool_expr_with_lookup(
 fn eval_expr_with_l3(expr: &wf_lang::ast::Expr, ctx: &Event, score: Option<f64>) -> Option<Value> {
     use wf_lang::ast::{BinOp, Expr, SystemVar};
 
+    let _time_scope = EvalTimeScope::enter();
     match expr {
         Expr::Number(n) => Some(Value::Number(*n)),
         Expr::StringLit(s) => Some(Value::Str(s.clone())),
@@ -137,8 +175,10 @@ fn eval_expr_with_l3(expr: &wf_lang::ast::Expr, ctx: &Event, score: Option<f64>)
                 return eval_l3_func(name, args, ctx, score);
             }
             if name == "external"
+                || is_eval_time_func(name)
                 || args.iter().any(contains_l3_func)
                 || args.iter().any(contains_aggregate_func)
+                || args.iter().any(contains_eval_time_func)
             {
                 // `external()` is implemented only in `eval_builtin_func_with_l3`
                 // (it dispatches to the global ExternalCallHandler / wp_knowledge
@@ -252,6 +292,36 @@ fn contains_l3_func(expr: &wf_lang::ast::Expr) -> bool {
             then_expr,
             else_expr,
         } => contains_l3_func(cond) || contains_l3_func(then_expr) || contains_l3_func(else_expr),
+        _ => false,
+    }
+}
+
+fn is_eval_time_func(name: &str) -> bool {
+    matches!(name, "now" | "now_s" | "now_ms" | "now_us" | "now_ns")
+}
+
+fn contains_eval_time_func(expr: &wf_lang::ast::Expr) -> bool {
+    use wf_lang::ast::Expr;
+    match expr {
+        Expr::FuncCall { name, args, .. } => {
+            is_eval_time_func(name) || args.iter().any(contains_eval_time_func)
+        }
+        Expr::BinOp { left, right, .. } => {
+            contains_eval_time_func(left) || contains_eval_time_func(right)
+        }
+        Expr::Neg(inner) => contains_eval_time_func(inner),
+        Expr::InList { expr, list, .. } => {
+            contains_eval_time_func(expr) || list.iter().any(contains_eval_time_func)
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            contains_eval_time_func(cond)
+                || contains_eval_time_func(then_expr)
+                || contains_eval_time_func(else_expr)
+        }
         _ => false,
     }
 }
@@ -939,6 +1009,75 @@ fn eval_builtin_func_with_l3(
                 eval_expr_with_l3(&args[0], ctx, score).is_some(),
             ))
         }
+        "is_blank" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx, score) {
+                Some(Value::Str(s)) => Some(Value::Bool(is_blank_str(&s))),
+                None => Some(Value::Bool(true)),
+                Some(_) => None,
+            }
+        }
+        "null_if_blank" => {
+            if args.len() != 1 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx, score)? {
+                Value::Str(s) if is_blank_str(&s) => None,
+                Value::Str(s) => Some(Value::Str(s)),
+                _ => None,
+            }
+        }
+        "default_if_blank" => {
+            if args.len() != 2 {
+                return None;
+            }
+            match eval_expr_with_l3(&args[0], ctx, score) {
+                Some(Value::Str(s)) if !is_blank_str(&s) => Some(Value::Str(s)),
+                Some(Value::Str(_)) | None => match eval_expr_with_l3(&args[1], ctx, score)? {
+                    Value::Str(s) => Some(Value::Str(s)),
+                    _ => None,
+                },
+                Some(_) => None,
+            }
+        }
+        "md5" => {
+            let text = eval_single_string_arg_with_l3(args, ctx, score)?;
+            Some(Value::Str(hex::encode(<Md5 as Md5Digest>::digest(
+                text.as_bytes(),
+            ))))
+        }
+        "sha1" => {
+            let text = eval_single_string_arg_with_l3(args, ctx, score)?;
+            Some(Value::Str(hex::encode(<Sha1 as Sha1Digest>::digest(
+                text.as_bytes(),
+            ))))
+        }
+        "sha256" => {
+            let text = eval_single_string_arg_with_l3(args, ctx, score)?;
+            Some(Value::Str(hex::encode(Sha256::digest(text.as_bytes()))))
+        }
+        "hex" => {
+            let text = eval_single_string_arg_with_l3(args, ctx, score)?;
+            Some(Value::Str(hex::encode(text.as_bytes())))
+        }
+        "stable_id" => {
+            if args.len() < 2 {
+                return None;
+            }
+            let prefix = match eval_expr_with_l3(&args[0], ctx, score)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let mut hasher = Sha256::new();
+            for arg in &args[1..] {
+                let value = eval_expr_with_l3(arg, ctx, score)?;
+                update_stable_id_hash(&mut hasher, &value)?;
+            }
+            let digest = hex::encode(hasher.finalize());
+            Some(Value::Str(format!("{}{}", prefix, &digest[..16])))
+        }
         "mvsort" => {
             if args.len() != 1 {
                 return None;
@@ -960,6 +1099,32 @@ fn eval_builtin_func_with_l3(
             };
             arr.reverse();
             Some(Value::Array(arr))
+        }
+        "now" | "now_ns" => {
+            if !args.is_empty() {
+                return None;
+            }
+            Some(Value::Number(current_time_nanos()? as f64))
+        }
+        "now_s" => {
+            if !args.is_empty() {
+                return None;
+            }
+            Some(Value::Number(
+                (current_time_nanos()? / 1_000_000_000) as f64,
+            ))
+        }
+        "now_ms" => {
+            if !args.is_empty() {
+                return None;
+            }
+            Some(Value::Number((current_time_nanos()? / 1_000_000) as f64))
+        }
+        "now_us" => {
+            if !args.is_empty() {
+                return None;
+            }
+            Some(Value::Number((current_time_nanos()? / 1_000) as f64))
         }
         "strftime" => {
             if args.len() != 2 {
@@ -1559,6 +1724,51 @@ fn parse_time_to_timestamp_nanos(text: &str, fmt: &str) -> Option<i64> {
     None
 }
 
+fn is_blank_str(value: &str) -> bool {
+    value.trim().is_empty()
+}
+
+fn current_time_nanos() -> Option<i64> {
+    EVAL_TIME_NANOS.with(|time| {
+        if let Some(nanos) = time.get() {
+            return Some(nanos);
+        }
+        let nanos = Utc::now().timestamp_nanos_opt()?;
+        time.set(Some(nanos));
+        Some(nanos)
+    })
+}
+
+fn eval_single_string_arg_with_l3(
+    args: &[wf_lang::ast::Expr],
+    ctx: &Event,
+    score: Option<f64>,
+) -> Option<String> {
+    if args.len() != 1 {
+        return None;
+    }
+    match eval_expr_with_l3(&args[0], ctx, score)? {
+        Value::Str(s) => Some(s),
+        _ => None,
+    }
+}
+
+fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Option<()> {
+    let (tag, text) = match value {
+        Value::Number(_) => ("n", value_to_string(value)),
+        Value::Str(s) => ("s", s.clone()),
+        Value::Bool(_) => ("b", value_to_string(value)),
+        Value::Array(_) => return None,
+    };
+    hasher.update(tag.as_bytes());
+    hasher.update(b":");
+    hasher.update(text.len().to_string().as_bytes());
+    hasher.update(b":");
+    hasher.update(text.as_bytes());
+    hasher.update(b";");
+    Some(())
+}
+
 /// Evaluate the score expression and clamp to `[0, 100]`.
 ///
 pub(super) fn eval_score(expr: &wf_lang::ast::Expr, ctx: &Event) -> CoreResult<f64> {
@@ -1928,6 +2138,286 @@ mod tests {
     }
 
     #[test]
+    fn test_blank_functions_work_in_yield_eval() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("empty".to_string(), Value::Str(String::new()));
+        fields.insert("spaces".to_string(), Value::Str(" \t\n ".to_string()));
+        fields.insert("host".to_string(), Value::Str("example.org".to_string()));
+        fields.insert("fallback".to_string(), Value::Str("fallback".to_string()));
+        fields.insert("n".to_string(), Value::Number(42.0));
+        let ctx = Event { fields };
+
+        let is_empty_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "is_blank".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("empty".to_string()))],
+        };
+        let is_spaces_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "is_blank".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("spaces".to_string()))],
+        };
+        let is_host_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "is_blank".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("host".to_string()))],
+        };
+        let is_missing_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "is_blank".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("missing".to_string()))],
+        };
+        let null_if_blank_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "null_if_blank".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("spaces".to_string()))],
+        };
+        let null_if_host_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "null_if_blank".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("host".to_string()))],
+        };
+        let default_blank_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "default_if_blank".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("spaces".to_string())),
+                Expr::Field(FieldRef::Simple("fallback".to_string())),
+            ],
+        };
+        let default_host_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "default_if_blank".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Simple("host".to_string())),
+                Expr::Field(FieldRef::Simple("fallback".to_string())),
+            ],
+        };
+        let coalesce_blank_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "coalesce".to_string(),
+            args: vec![
+                null_if_blank_expr.clone(),
+                Expr::Field(FieldRef::Simple("fallback".to_string())),
+            ],
+        };
+        let invalid_type_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "is_blank".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+        };
+
+        assert_eq!(
+            eval_yield_expr(&is_empty_expr, &ctx),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            eval_yield_expr(&is_spaces_expr, &ctx),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            eval_yield_expr(&is_host_expr, &ctx),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            eval_yield_expr(&is_missing_expr, &ctx),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            eval_yield_expr(&null_if_blank_expr, &ctx),
+            Some(Value::Str(String::new()))
+        );
+        assert_eq!(
+            eval_yield_expr(&null_if_host_expr, &ctx),
+            Some(Value::Str("example.org".to_string()))
+        );
+        assert_eq!(
+            eval_yield_expr(&default_blank_expr, &ctx),
+            Some(Value::Str("fallback".to_string()))
+        );
+        assert_eq!(
+            eval_yield_expr(&default_host_expr, &ctx),
+            Some(Value::Str("example.org".to_string()))
+        );
+        assert_eq!(
+            eval_yield_expr(&coalesce_blank_expr, &ctx),
+            Some(Value::Str("fallback".to_string()))
+        );
+        assert_eq!(
+            eval_yield_expr(&invalid_type_expr, &ctx),
+            Some(Value::Str(String::new()))
+        );
+    }
+
+    #[test]
+    fn test_hash_and_id_functions_work_in_yield_eval() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("msg".to_string(), Value::Str("hello".to_string()));
+        fields.insert("ip".to_string(), Value::Str("10.0.0.1".to_string()));
+        fields.insert("count".to_string(), Value::Number(3.0));
+        let ctx = Event { fields };
+
+        let md5_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "md5".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+        };
+        let sha1_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "sha1".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+        };
+        let sha256_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "sha256".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+        };
+        let hex_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "hex".to_string(),
+            args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+        };
+        let stable_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "stable_id".to_string(),
+            args: vec![
+                Expr::StringLit("alert_".to_string()),
+                Expr::Field(FieldRef::Simple("ip".to_string())),
+                Expr::Field(FieldRef::Simple("count".to_string())),
+            ],
+        };
+        let stable_changed_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "stable_id".to_string(),
+            args: vec![
+                Expr::StringLit("alert_".to_string()),
+                Expr::Field(FieldRef::Simple("ip".to_string())),
+                Expr::Number(4.0),
+            ],
+        };
+
+        assert_eq!(
+            eval_yield_expr(&md5_expr, &ctx),
+            Some(Value::Str("5d41402abc4b2a76b9719d911017c592".to_string()))
+        );
+        assert_eq!(
+            eval_yield_expr(&sha1_expr, &ctx),
+            Some(Value::Str(
+                "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string()
+            ))
+        );
+        assert_eq!(
+            eval_yield_expr(&sha256_expr, &ctx),
+            Some(Value::Str(
+                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string()
+            ))
+        );
+        assert_eq!(
+            eval_yield_expr(&hex_expr, &ctx),
+            Some(Value::Str("68656c6c6f".to_string()))
+        );
+        let Some(Value::Str(stable_id)) = eval_yield_expr(&stable_expr, &ctx) else {
+            panic!("stable_id() should return a string");
+        };
+        assert_eq!(stable_id, "alert_ba0dab7ccfb2a04c");
+        assert_eq!(
+            eval_yield_expr(&stable_expr, &ctx),
+            Some(Value::Str(stable_id.clone()))
+        );
+        let Some(Value::Str(changed_stable_id)) = eval_yield_expr(&stable_changed_expr, &ctx)
+        else {
+            panic!("stable_id() should return a string for changed input");
+        };
+        assert!(changed_stable_id.starts_with("alert_"));
+        assert_eq!(changed_stable_id.len(), "alert_".len() + 16);
+        assert_ne!(changed_stable_id, stable_id);
+    }
+
+    #[test]
+    fn test_stable_id_uses_unambiguous_segments_in_yield_eval() {
+        let ctx = Event {
+            fields: std::collections::HashMap::new(),
+        };
+        let first_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "stable_id".to_string(),
+            args: vec![
+                Expr::StringLit("id_".to_string()),
+                Expr::StringLit("a\x1fb".to_string()),
+                Expr::StringLit("c".to_string()),
+            ],
+        };
+        let second_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "stable_id".to_string(),
+            args: vec![
+                Expr::StringLit("id_".to_string()),
+                Expr::StringLit("a".to_string()),
+                Expr::StringLit("b\x1fc".to_string()),
+            ],
+        };
+
+        assert_eq!(
+            eval_yield_expr(&first_expr, &ctx),
+            Some(Value::Str("id_234c47ae916c73b0".to_string()))
+        );
+        assert_eq!(
+            eval_yield_expr(&second_expr, &ctx),
+            Some(Value::Str("id_1532803f7ab9f6de".to_string()))
+        );
+        assert_ne!(
+            eval_yield_expr(&first_expr, &ctx),
+            eval_yield_expr(&second_expr, &ctx)
+        );
+    }
+
+    #[test]
+    fn test_now_functions_share_timestamp_within_yield_expression() {
+        let ctx = Event {
+            fields: std::collections::HashMap::new(),
+        };
+        let expr = Expr::BinOp {
+            op: BinOp::Sub,
+            left: Box::new(Expr::FuncCall {
+                qualifier: None,
+                name: "now_ns".to_string(),
+                args: vec![],
+            }),
+            right: Box::new(Expr::FuncCall {
+                qualifier: None,
+                name: "now".to_string(),
+                args: vec![],
+            }),
+        };
+
+        assert_eq!(eval_yield_expr(&expr, &ctx), Some(Value::Number(0.0)));
+    }
+
+    #[test]
+    fn test_now_functions_share_timestamp_across_yield_scope() {
+        let ctx = Event {
+            fields: std::collections::HashMap::new(),
+        };
+        let now_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "now".to_string(),
+            args: vec![],
+        };
+        let now_ns_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "now_ns".to_string(),
+            args: vec![],
+        };
+
+        with_yield_eval_scope(|| {
+            assert_eq!(
+                eval_yield_expr(&now_expr, &ctx),
+                eval_yield_expr(&now_ns_expr, &ctx)
+            );
+        });
+    }
+
+    #[test]
     fn test_mvjoin_with_collect_list_nested_l3() {
         let ctx = make_test_event(vec![
             Value::Str("a".to_string()),
@@ -2109,6 +2599,36 @@ mod tests {
                 Expr::StringLit("%Y-%m-%d".to_string()),
             ],
         };
+        let now_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "now".to_string(),
+            args: vec![],
+        };
+        let now_s_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "now_s".to_string(),
+            args: vec![],
+        };
+        let now_ms_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "now_ms".to_string(),
+            args: vec![],
+        };
+        let now_us_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "now_us".to_string(),
+            args: vec![],
+        };
+        let now_ns_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "now_ns".to_string(),
+            args: vec![],
+        };
+        let now_fmt_expr = Expr::FuncCall {
+            qualifier: None,
+            name: "strftime".to_string(),
+            args: vec![now_expr.clone(), Expr::StringLit("%Y".to_string())],
+        };
         let sqrt_expr = Expr::FuncCall {
             qualifier: None,
             name: "sqrt".to_string(),
@@ -2255,6 +2775,30 @@ mod tests {
             eval_yield_expr(&strptime_expr, &ctx),
             Some(Value::Number(0.0))
         );
+        let Some(Value::Number(now_nanos)) = eval_yield_expr(&now_expr, &ctx) else {
+            panic!("now() should return a numeric timestamp");
+        };
+        let Some(Value::Number(now_s)) = eval_yield_expr(&now_s_expr, &ctx) else {
+            panic!("now_s() should return a numeric timestamp");
+        };
+        let Some(Value::Number(now_ms)) = eval_yield_expr(&now_ms_expr, &ctx) else {
+            panic!("now_ms() should return a numeric timestamp");
+        };
+        let Some(Value::Number(now_us)) = eval_yield_expr(&now_us_expr, &ctx) else {
+            panic!("now_us() should return a numeric timestamp");
+        };
+        let Some(Value::Number(now_ns)) = eval_yield_expr(&now_ns_expr, &ctx) else {
+            panic!("now_ns() should return a numeric timestamp");
+        };
+        let Some(Value::Str(year)) = eval_yield_expr(&now_fmt_expr, &ctx) else {
+            panic!("strftime(now(), ...) should format the current time");
+        };
+        assert!(now_nanos > 1_000_000_000_000_000_000.0);
+        assert!(now_ns > 1_000_000_000_000_000_000.0);
+        assert!(now_us > 1_000_000_000_000_000.0);
+        assert!(now_ms > 1_000_000_000_000.0);
+        assert!(now_s > 1_000_000_000.0);
+        assert!(year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()));
         assert_eq!(eval_yield_expr(&sqrt_expr, &ctx), Some(Value::Number(4.0)));
         assert_eq!(eval_yield_expr(&pow_expr, &ctx), Some(Value::Number(256.0)));
         assert_eq!(eval_yield_expr(&log_expr, &ctx), Some(Value::Number(2.0)));

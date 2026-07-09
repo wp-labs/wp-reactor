@@ -54,7 +54,7 @@ fn infer_func_call(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<ValTy
         "distinct" => Some(ValType::Base(BaseType::Digit)),
         "fmt" => Some(ValType::Base(BaseType::Chars)),
         "has" | "contains" | "regex_match" | "startswith" | "endswith" | "startswith_any"
-        | "endswith_any" | "is_finite" | "isnull" | "isnotnull" => Some(ValType::Bool),
+        | "endswith_any" | "is_finite" | "isnull" | "isnotnull" | "is_blank" => Some(ValType::Bool),
         "substr" => Some(ValType::Base(BaseType::Chars)),
         "abs" => args.first().and_then(|a| infer_type(a, scope)),
         "ceil" | "floor" | "round" => Some(ValType::Base(BaseType::Float)),
@@ -80,11 +80,15 @@ fn infer_func_call(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<ValTy
         }),
         "mvappend" => infer_mvappend_type(args, scope),
         "baseline" | "time_diff" => Some(ValType::Base(BaseType::Float)),
+        "now" => Some(ValType::Base(BaseType::Time)),
+        "now_s" | "now_ms" | "now_us" | "now_ns" => Some(ValType::Base(BaseType::Digit)),
         "strftime" => Some(ValType::Base(BaseType::Chars)),
         "strptime" => Some(ValType::Base(BaseType::Time)),
-        "lower" | "upper" | "replace" | "trim" | "ltrim" | "rtrim" | "concat" | "replace_plain" => {
+        "lower" | "upper" | "replace" | "trim" | "ltrim" | "rtrim" | "concat" | "replace_plain"
+        | "null_if_blank" | "default_if_blank" | "md5" | "sha1" | "sha256" | "stable_id" => {
             Some(ValType::Base(BaseType::Chars))
         }
+        "hex" => Some(ValType::Base(BaseType::Hex)),
         "indexof" => Some(ValType::Base(BaseType::Digit)),
         "coalesce" => args.first().and_then(|a| infer_type(a, scope)),
         "len" => Some(ValType::Base(BaseType::Digit)),

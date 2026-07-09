@@ -1,4 +1,5 @@
 use super::*;
+use wf_lang::ast::BinOp;
 
 // ===========================================================================
 // IfThenElse expression evaluation
@@ -453,6 +454,337 @@ fn math_functions_work() {
             Value::Str("a".to_string()),
             Value::Str("b".to_string()),
         ]))
+    );
+}
+
+#[test]
+fn now_functions_work() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let event = Event {
+        fields: HashMap::new(),
+    };
+    let now_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "now".to_string(),
+        args: vec![],
+    };
+    let now_s_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "now_s".to_string(),
+        args: vec![],
+    };
+    let now_ms_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "now_ms".to_string(),
+        args: vec![],
+    };
+    let now_us_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "now_us".to_string(),
+        args: vec![],
+    };
+    let now_ns_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "now_ns".to_string(),
+        args: vec![],
+    };
+    let fmt_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "strftime".to_string(),
+        args: vec![now_expr.clone(), Expr::StringLit("%Y".to_string())],
+    };
+    let invalid_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "now".to_string(),
+        args: vec![Expr::Number(1.0)],
+    };
+
+    let Some(Value::Number(now_nanos)) = eval_expr(&now_expr, &event) else {
+        panic!("now() should return a numeric timestamp");
+    };
+    let Some(Value::Number(now_s)) = eval_expr(&now_s_expr, &event) else {
+        panic!("now_s() should return a numeric timestamp");
+    };
+    let Some(Value::Number(now_ms)) = eval_expr(&now_ms_expr, &event) else {
+        panic!("now_ms() should return a numeric timestamp");
+    };
+    let Some(Value::Number(now_us)) = eval_expr(&now_us_expr, &event) else {
+        panic!("now_us() should return a numeric timestamp");
+    };
+    let Some(Value::Number(now_ns)) = eval_expr(&now_ns_expr, &event) else {
+        panic!("now_ns() should return a numeric timestamp");
+    };
+    let Some(Value::Str(year)) = eval_expr(&fmt_expr, &event) else {
+        panic!("strftime(now(), ...) should format the current time");
+    };
+
+    assert!(now_nanos > 1_000_000_000_000_000_000.0);
+    assert!(now_ns > 1_000_000_000_000_000_000.0);
+    assert!(now_us > 1_000_000_000_000_000.0);
+    assert!(now_ms > 1_000_000_000_000.0);
+    assert!(now_s > 1_000_000_000.0);
+    assert!(year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()));
+    assert_eq!(eval_expr(&invalid_expr, &event), None);
+}
+
+#[test]
+fn now_functions_share_timestamp_within_expression() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let event = Event {
+        fields: HashMap::new(),
+    };
+    let expr = Expr::BinOp {
+        op: BinOp::Sub,
+        left: Box::new(Expr::FuncCall {
+            qualifier: None,
+            name: "now_ns".to_string(),
+            args: vec![],
+        }),
+        right: Box::new(Expr::FuncCall {
+            qualifier: None,
+            name: "now".to_string(),
+            args: vec![],
+        }),
+    };
+
+    assert_eq!(eval_expr(&expr, &event), Some(Value::Number(0.0)));
+}
+
+#[test]
+fn blank_functions_work() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let mut fields = HashMap::new();
+    fields.insert("empty".to_string(), Value::Str(String::new()));
+    fields.insert("spaces".to_string(), Value::Str(" \t\n ".to_string()));
+    fields.insert("host".to_string(), Value::Str("example.org".to_string()));
+    fields.insert("fallback".to_string(), Value::Str("fallback".to_string()));
+    fields.insert("n".to_string(), Value::Number(42.0));
+    let event = Event { fields };
+
+    let is_empty_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "is_blank".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("empty".to_string()))],
+    };
+    let is_spaces_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "is_blank".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("spaces".to_string()))],
+    };
+    let is_host_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "is_blank".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("host".to_string()))],
+    };
+    let is_missing_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "is_blank".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("missing".to_string()))],
+    };
+    let null_if_blank_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "null_if_blank".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("spaces".to_string()))],
+    };
+    let null_if_host_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "null_if_blank".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("host".to_string()))],
+    };
+    let default_blank_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "default_if_blank".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("spaces".to_string())),
+            Expr::Field(FieldRef::Simple("fallback".to_string())),
+        ],
+    };
+    let default_host_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "default_if_blank".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("host".to_string())),
+            Expr::Field(FieldRef::Simple("fallback".to_string())),
+        ],
+    };
+    let coalesce_blank_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "coalesce".to_string(),
+        args: vec![
+            null_if_blank_expr.clone(),
+            Expr::Field(FieldRef::Simple("fallback".to_string())),
+        ],
+    };
+    let invalid_type_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "is_blank".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("n".to_string()))],
+    };
+
+    assert_eq!(eval_expr(&is_empty_expr, &event), Some(Value::Bool(true)));
+    assert_eq!(eval_expr(&is_spaces_expr, &event), Some(Value::Bool(true)));
+    assert_eq!(eval_expr(&is_host_expr, &event), Some(Value::Bool(false)));
+    assert_eq!(eval_expr(&is_missing_expr, &event), Some(Value::Bool(true)));
+    assert_eq!(eval_expr(&null_if_blank_expr, &event), None);
+    assert_eq!(
+        eval_expr(&null_if_host_expr, &event),
+        Some(Value::Str("example.org".to_string()))
+    );
+    assert_eq!(
+        eval_expr(&default_blank_expr, &event),
+        Some(Value::Str("fallback".to_string()))
+    );
+    assert_eq!(
+        eval_expr(&default_host_expr, &event),
+        Some(Value::Str("example.org".to_string()))
+    );
+    assert_eq!(
+        eval_expr(&coalesce_blank_expr, &event),
+        Some(Value::Str("fallback".to_string()))
+    );
+    assert_eq!(eval_expr(&invalid_type_expr, &event), None);
+}
+
+#[test]
+fn hash_and_id_functions_work() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let mut fields = HashMap::new();
+    fields.insert("msg".to_string(), Value::Str("hello".to_string()));
+    fields.insert("ip".to_string(), Value::Str("10.0.0.1".to_string()));
+    fields.insert("count".to_string(), Value::Number(3.0));
+    let event = Event { fields };
+
+    let md5_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "md5".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+    };
+    let sha1_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "sha1".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+    };
+    let sha256_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "sha256".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+    };
+    let hex_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "hex".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+    };
+    let short_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "substr".to_string(),
+        args: vec![sha256_expr.clone(), Expr::Number(1.0), Expr::Number(16.0)],
+    };
+    let stable_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "stable_id".to_string(),
+        args: vec![
+            Expr::StringLit("alert_".to_string()),
+            Expr::Field(FieldRef::Simple("ip".to_string())),
+            Expr::Field(FieldRef::Simple("count".to_string())),
+        ],
+    };
+    let stable_changed_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "stable_id".to_string(),
+        args: vec![
+            Expr::StringLit("alert_".to_string()),
+            Expr::Field(FieldRef::Simple("ip".to_string())),
+            Expr::Number(4.0),
+        ],
+    };
+    let invalid_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "md5".to_string(),
+        args: vec![Expr::Field(FieldRef::Simple("count".to_string()))],
+    };
+
+    assert_eq!(
+        eval_expr(&md5_expr, &event),
+        Some(Value::Str("5d41402abc4b2a76b9719d911017c592".to_string()))
+    );
+    assert_eq!(
+        eval_expr(&sha1_expr, &event),
+        Some(Value::Str(
+            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string()
+        ))
+    );
+    assert_eq!(
+        eval_expr(&sha256_expr, &event),
+        Some(Value::Str(
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string()
+        ))
+    );
+    assert_eq!(
+        eval_expr(&hex_expr, &event),
+        Some(Value::Str("68656c6c6f".to_string()))
+    );
+    assert_eq!(
+        eval_expr(&short_expr, &event),
+        Some(Value::Str("2cf24dba5fb0a30e".to_string()))
+    );
+    let Some(Value::Str(stable_id)) = eval_expr(&stable_expr, &event) else {
+        panic!("stable_id() should return a string");
+    };
+    assert_eq!(stable_id, "alert_ba0dab7ccfb2a04c");
+    assert_eq!(
+        eval_expr(&stable_expr, &event),
+        Some(Value::Str(stable_id.clone()))
+    );
+    let Some(Value::Str(changed_stable_id)) = eval_expr(&stable_changed_expr, &event) else {
+        panic!("stable_id() should return a string for changed input");
+    };
+    assert!(changed_stable_id.starts_with("alert_"));
+    assert_eq!(changed_stable_id.len(), "alert_".len() + 16);
+    assert_ne!(changed_stable_id, stable_id);
+    assert_eq!(eval_expr(&invalid_expr, &event), None);
+}
+
+#[test]
+fn stable_id_uses_unambiguous_segments() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let event = Event {
+        fields: HashMap::new(),
+    };
+    let first_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "stable_id".to_string(),
+        args: vec![
+            Expr::StringLit("id_".to_string()),
+            Expr::StringLit("a\x1fb".to_string()),
+            Expr::StringLit("c".to_string()),
+        ],
+    };
+    let second_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "stable_id".to_string(),
+        args: vec![
+            Expr::StringLit("id_".to_string()),
+            Expr::StringLit("a".to_string()),
+            Expr::StringLit("b\x1fc".to_string()),
+        ],
+    };
+
+    assert_eq!(
+        eval_expr(&first_expr, &event),
+        Some(Value::Str("id_234c47ae916c73b0".to_string()))
+    );
+    assert_eq!(
+        eval_expr(&second_expr, &event),
+        Some(Value::Str("id_1532803f7ab9f6de".to_string()))
+    );
+    assert_ne!(
+        eval_expr(&first_expr, &event),
+        eval_expr(&second_expr, &event)
     );
 }
 

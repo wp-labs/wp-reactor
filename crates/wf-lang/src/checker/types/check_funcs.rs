@@ -6,6 +6,22 @@ use super::{ValType, compatible, is_numeric, is_orderable};
 use crate::checker::scope::Scope;
 use crate::checker::{CheckError, Severity};
 
+fn is_stable_id_value_type(t: &ValType) -> bool {
+    matches!(
+        t,
+        ValType::Base(
+            BaseType::Chars
+                | BaseType::Digit
+                | BaseType::Float
+                | BaseType::Bool
+                | BaseType::Time
+                | BaseType::Ip
+                | BaseType::Hex
+        ) | ValType::Bool
+            | ValType::Numeric
+    )
+}
+
 pub fn check_func_call(
     name: &str,
     args: &[Expr],
@@ -510,6 +526,62 @@ pub fn check_func_call(
             });
         }
         "isnull" | "isnotnull" => {}
+        "is_blank" | "null_if_blank" => {
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() requires exactly 1 argument", name),
+                });
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !compatible(&t, &ValType::Base(BaseType::Chars))
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() argument must be chars, got {:?}", name, t),
+                });
+            }
+        }
+        "default_if_blank" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "default_if_blank() requires exactly 2 arguments: (text, default)"
+                        .to_string(),
+                });
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "default_if_blank() argument {} must be chars, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        "now" | "now_s" | "now_ms" | "now_us" | "now_ns" if !args.is_empty() => {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: format!("{}() requires no arguments", name),
+            });
+        }
+        "now" | "now_s" | "now_ms" | "now_us" | "now_ns" => {}
         "strftime" => {
             if args.len() != 2 {
                 errors.push(CheckError {
@@ -654,6 +726,63 @@ pub fn check_func_call(
                             message: format!(
                                 "{}() argument {} must be chars, got {:?}",
                                 name,
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        "md5" | "sha1" | "sha256" | "hex" => {
+            if args.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() requires exactly 1 argument", name),
+                });
+            } else if let Some(t) = infer_type(&args[0], scope)
+                && !compatible(&t, &ValType::Base(BaseType::Chars))
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("{}() argument must be chars, got {:?}", name, t),
+                });
+            }
+        }
+        "stable_id" => {
+            if args.len() < 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "stable_id() requires at least 2 arguments: (prefix, value, ...)"
+                        .to_string(),
+                });
+            } else {
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("stable_id() prefix must be chars, got {:?}", t),
+                    });
+                }
+                for (i, arg) in args.iter().enumerate().skip(1) {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !is_stable_id_value_type(&t)
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "stable_id() argument {} must be scalar, got {:?}",
                                 i + 1,
                                 t
                             ),
