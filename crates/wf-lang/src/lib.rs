@@ -1,6 +1,7 @@
 pub mod ast;
 mod checker;
 mod compiler;
+pub mod diagnostics;
 pub mod error;
 pub mod explain;
 pub mod parse_utils;
@@ -17,6 +18,9 @@ pub use checker::{
     CheckError, Severity, check_intermediate_target_graph, check_wfl, effective_schemas_for_rules,
 };
 pub use compiler::compile_wfl;
+pub use diagnostics::{
+    compile_wfl_with_diagnostics, parse_wfl_with_diagnostics, validate_wfl_with_diagnostics,
+};
 pub use error::{LangError, LangReason, LangResult};
 pub use preprocess::{preprocess_vars, preprocess_vars_with_env};
 pub use schema::{BaseType, FieldDef, FieldType, StaticWindowSchema, WindowSchema};

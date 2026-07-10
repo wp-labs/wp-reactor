@@ -39,6 +39,10 @@ pub fn compile_wfl(file: &WflFile, schemas: &[WindowSchema]) -> LangResult<Vec<R
             .with_detail(format!("semantic errors:\n{}", msgs.join("\n")))
             .err();
     }
+    compile_wfl_after_semantic_checks(file)
+}
+
+pub(crate) fn compile_wfl_after_semantic_checks(file: &WflFile) -> LangResult<Vec<RulePlan>> {
     let mut plans = Vec::new();
     for rule in &file.rules {
         plans.extend(compile_rule(rule)?);

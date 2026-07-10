@@ -28,7 +28,7 @@ pub fn parse_wfl(input: &str) -> LangResult<WflFile> {
     wfl_file.parse(input).map_err(|e| {
         LangReason::Parse
             .to_err()
-            .with_detail(format!("parse error: {e}"))
+            .with_detail(crate::diagnostics::parse_error_detail(input, &e))
     })
 }
 

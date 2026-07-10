@@ -23,6 +23,12 @@ use super::types::{RunRule, RunRuleKind};
 const PIPE_WINDOW_PREFIX: &str = "__wf_pipe_";
 const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
 
+struct ParsedRuleFile {
+    path: std::path::PathBuf,
+    source: String,
+    file: wf_lang::ast::WflFile,
+}
+
 // ---------------------------------------------------------------------------
 // Compile-phase helpers — pure data transforms extracted from start()
 // ---------------------------------------------------------------------------
@@ -65,21 +71,27 @@ pub(crate) fn compile_rules(
         let preprocessed = load_wfl_with_context(full_path, ctx, Some(base_dir))
             .source_err(RuntimeReason::data_error(), "load rule file")
             .position(full_path.display().to_string())?;
-        let wfl_file = wf_lang::parse_wfl(&preprocessed)
-            .source_err(RuntimeReason::Bootstrap, "parse rule file")
-            .position(full_path.display().to_string())?;
+        let wfl_file = wf_lang::parse_wfl_with_diagnostics(&preprocessed, full_path)
+            .map_err(lang_diagnostic)?;
         all_rules.extend(wfl_file.rules.iter().cloned());
-        parsed_files.push((full_path.clone(), wfl_file));
+        parsed_files.push(ParsedRuleFile {
+            path: full_path.clone(),
+            source: preprocessed,
+            file: wfl_file,
+        });
     }
 
     let effective_schemas = wf_lang::effective_schemas_for_rules(&all_rules, schemas);
     let mut topology_errors = Vec::new();
     wf_lang::check_intermediate_target_graph(&all_rules, &mut topology_errors);
-    if !topology_errors.is_empty() {
-        let msgs: Vec<String> = topology_errors
+    let topology_hard_errors: Vec<_> = topology_errors
+        .into_iter()
+        .filter(|error| error.severity == wf_lang::Severity::Error)
+        .collect();
+    if !topology_hard_errors.is_empty() {
+        let msgs: Vec<String> = topology_hard_errors
             .into_iter()
-            .filter(|error| error.severity == wf_lang::Severity::Error)
-            .map(|error| error.to_string())
+            .map(|error| format_topology_error(&error, &parsed_files))
             .collect();
         return RuntimeReason::Bootstrap
             .to_err()
@@ -88,13 +100,40 @@ pub(crate) fn compile_rules(
     }
 
     let mut all_rule_plans = Vec::new();
-    for (full_path, wfl_file) in &parsed_files {
-        let plans = wf_lang::compile_wfl(wfl_file, &effective_schemas)
-            .source_err(RuntimeReason::Bootstrap, "compile rule file")?;
-        wf_debug!(conf, file = %full_path.display(), rules = plans.len(), "compiled rule file");
+    for parsed in &parsed_files {
+        let plans = wf_lang::compile_wfl_with_diagnostics(
+            &parsed.file,
+            &effective_schemas,
+            &parsed.source,
+            &parsed.path,
+        )
+        .map_err(lang_diagnostic)?;
+        wf_debug!(conf, file = %parsed.path.display(), rules = plans.len(), "compiled rule file");
         all_rule_plans.extend(plans);
     }
     Ok((all_rule_plans, effective_schemas))
+}
+
+fn lang_diagnostic(error: wf_lang::LangError) -> crate::error::RuntimeError {
+    RuntimeReason::Bootstrap
+        .to_err()
+        .with_detail(error.detail().clone().unwrap_or_else(|| error.to_string()))
+}
+
+fn format_topology_error(error: &wf_lang::CheckError, parsed_files: &[ParsedRuleFile]) -> String {
+    if let Some(rule_name) = error.rule.as_deref()
+        && let Some(parsed) = parsed_files
+            .iter()
+            .find(|parsed| parsed.file.rules.iter().any(|rule| rule.name == rule_name))
+    {
+        return wf_lang::diagnostics::format_check_error_with_source(
+            error,
+            &parsed.file,
+            &parsed.source,
+            &parsed.path,
+        );
+    }
+    error.to_string()
 }
 
 pub(crate) fn build_runtime_var_context(
@@ -467,8 +506,10 @@ fn measure_output_name(measure: Measure) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::time::Duration;
 
+    use wf_config::ConfigVarContext;
     use wf_config::{ByteSize, EvictPolicy, HumanDuration, LatePolicy};
     use wf_lang::parse_wfl;
 
@@ -560,6 +601,133 @@ rule pipe {
         let cfg = &configs[0];
         assert_eq!(cfg.name, ws.name);
         assert_eq!(cfg.mode, DistMode::Local);
+    }
+
+    #[test]
+    fn compile_rules_reports_source_aware_rule_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let rule_path = dir.path().join("bad_rule.wfl");
+        std::fs::write(
+            &rule_path,
+            r#"
+rule bad_yield {
+  events { e: fw_events }
+  match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+  entity(ip, e.sip)
+  yield missing_alerts (sip = e.sip)
+}
+"#,
+        )
+        .unwrap();
+
+        let schemas = vec![WindowSchema {
+            name: "fw_events".into(),
+            streams: vec!["syslog".into()],
+            time_field: Some("event_time".into()),
+            over: Duration::from_secs(3600),
+            fields: vec![
+                FieldDef {
+                    name: "event_time".into(),
+                    field_type: FieldType::Base(BaseType::Time),
+                },
+                FieldDef {
+                    name: "sip".into(),
+                    field_type: FieldType::Base(BaseType::Ip),
+                },
+            ],
+        }];
+        let err = compile_rules(
+            "*.wfl",
+            dir.path(),
+            &ConfigVarContext::from_explicit_vars(HashMap::new()),
+            &schemas,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("bad_rule.wfl"), "{text}");
+        assert!(text.contains("category: yield"), "{text}");
+        assert!(text.contains("rule: bad_yield"), "{text}");
+        assert!(text.contains("location: line 6, column 9"), "{text}");
+        assert!(text.contains("yield missing_alerts"), "{text}");
+    }
+
+    #[test]
+    fn compile_rules_reports_source_aware_topology_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.wfl"),
+            r#"
+rule make_b {
+  events { e: win_a }
+  match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+  entity(ip, e.sip)
+  yield win_b (sip = e.sip)
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.wfl"),
+            r#"
+rule make_a {
+  events { e: win_b }
+  match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+  entity(ip, e.sip)
+  yield win_a (sip = e.sip)
+}
+"#,
+        )
+        .unwrap();
+
+        let schemas = vec![
+            WindowSchema {
+                name: "win_a".into(),
+                streams: vec!["a".into()],
+                time_field: Some("event_time".into()),
+                over: Duration::from_secs(3600),
+                fields: vec![
+                    FieldDef {
+                        name: "event_time".into(),
+                        field_type: FieldType::Base(BaseType::Time),
+                    },
+                    FieldDef {
+                        name: "sip".into(),
+                        field_type: FieldType::Base(BaseType::Ip),
+                    },
+                ],
+            },
+            WindowSchema {
+                name: "win_b".into(),
+                streams: vec![],
+                time_field: Some("event_time".into()),
+                over: Duration::from_secs(3600),
+                fields: vec![
+                    FieldDef {
+                        name: "event_time".into(),
+                        field_type: FieldType::Base(BaseType::Time),
+                    },
+                    FieldDef {
+                        name: "sip".into(),
+                        field_type: FieldType::Base(BaseType::Ip),
+                    },
+                ],
+            },
+        ];
+        let err = compile_rules(
+            "*.wfl",
+            dir.path(),
+            &ConfigVarContext::from_explicit_vars(HashMap::new()),
+            &schemas,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("category: topology"), "{text}");
+        assert!(text.contains("rule:"), "{text}");
+        assert!(text.contains("location: line 2, column 1"), "{text}");
+        assert!(
+            text.contains("rule make_a") || text.contains("rule make_b"),
+            "{text}"
+        );
     }
 }
 

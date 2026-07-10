@@ -44,6 +44,10 @@ pub fn check_intermediate_target_graph(
         .iter()
         .map(|rule| rule.yield_clause.target.as_str())
         .collect();
+    let producer_by_target: HashMap<&str, &str> = rules
+        .iter()
+        .map(|rule| (rule.yield_clause.target.as_str(), rule.name.as_str()))
+        .collect();
     let adjacency: HashMap<String, Vec<String>> =
         rules.iter().fold(HashMap::new(), |mut acc, rule| {
             let deps = acc.entry(rule.yield_clause.target.clone()).or_default();
@@ -63,9 +67,14 @@ pub fn check_intermediate_target_graph(
 
     for node in adjacency.keys() {
         if let Some(cycle) = detect_cycle(node, &adjacency, &mut visited, &mut active, &mut stack) {
+            let diagnostic_rule = rule_name.or_else(|| {
+                cycle
+                    .first()
+                    .and_then(|target| producer_by_target.get(target.as_str()).copied())
+            });
             errors.push(CheckError {
                 severity: Severity::Error,
-                rule: rule_name.map(str::to_string),
+                rule: diagnostic_rule.map(str::to_string),
                 test: None,
                 message: format!(
                     "yield targets consumed by downstream rules must be acyclic; found cycle: {}",

@@ -7,12 +7,15 @@ All notable changes to wp-reactor will be documented in this file.
 ### Added
 
 - **wf-lang**: Added type checking and inference for new WFL helper functions: `now()`, `now_s()`, `now_ms()`, `now_us()`, `now_ns()`, `is_blank()`, `null_if_blank()`, `default_if_blank()`, `md5()`, `sha1()`, `sha256()`, `hex()`, and `stable_id()`.
+- **wf-lang**: Added source-aware WFL diagnostics for parse and semantic compile failures, including file path, diagnostic category, rule/test context, line/column, and source snippets.
 - **wf-engine**: Added runtime support for current engine time helpers, blank-string helpers, hash/hex helpers, and stable alert ID generation in both L2 expression evaluation and yield/L3 evaluation paths.
+- **wf-runtime**: Rule bootstrap now surfaces source-aware WFL diagnostics for rule-file parse errors, semantic compile errors, and intermediate topology cycle errors.
 
 ### Fixed
 
 - **wf-engine**: `now_*` helpers now share one cached timestamp within a single expression and across all yield fields for one output record, preventing `created_time` / `created_ns` drift inside the same alert.
 - **wf-engine**: `stable_id()` now hashes typed, length-prefixed value segments instead of ambiguous separator-joined values, avoiding collisions when inputs contain separator-like bytes.
+- **wf-lang**: Improved WFL diagnostic location selection for `yield` errors so repeated tokens in `match`, `entity`, and `yield` clauses point to the failing `yield` argument, including inline single-line rules.
 
 ### Documentation
 
