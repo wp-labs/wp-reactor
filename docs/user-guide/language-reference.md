@@ -24,24 +24,26 @@ window <名称> {
 
 字段类型：
 
-| WFL 类型 | 底层映射 |
-|----------|----------|
-| `chars` | Utf8 |
-| `digit` | Int64 |
-| `float` | Float64 |
-| `bool` | Boolean |
-| `time` | Timestamp(Nanosecond) |
-| `ip` | Utf8 |
-| `hex` | Utf8 |
-| `array` | Utf8（结构化数组，sink 决定最终编码） |
-| `array/T` | List(T) |
-| `object` | Utf8（结构化对象，sink 决定最终编码） |
+| WFL 类型 | 使用场景 | 运行时存储 / 输出 |
+|----------|----------|-------------------|
+| `chars` | 输入、输出 | Utf8 |
+| `digit` | 输入、输出 | Int64 |
+| `float` | 输入、输出 | Float64 |
+| `bool` | 输入、输出 | Boolean |
+| `time` | 输入、输出 | Timestamp(Nanosecond) |
+| `ip` | 输入、输出 | Utf8 |
+| `hex` | 输入、输出 | Utf8 |
+| `object` | 输出 / 中间 window | 结构化对象；中间 window 内按 UTF-8 JSON 桥接，最终 sink 决定编码 |
+| `array` | 输出 / 中间 window | 结构化数组；中间 window 内按 UTF-8 JSON 桥接，最终 sink 决定编码 |
+| `array/T` | 输出 / 中间 window | 结构化 typed array；元素按 `T` 做类型检查，最终 sink 决定编码 |
 
 属性说明：
 
 - `stream`：数据流绑定；可省略，省略时该 window 只作为输出目标
 - `time`：事件时间字段；`over > 0` 时必填
 - `over`：保留时长；`0` 表示静态集合
+
+输入 window（包含 `stream = ...`）和 provider window 不允许声明 `object` / `array` / `array/T` 字段。若源数据里有 JSON object/array，先声明为 `chars` 接入；需要输出结构化对象或数组时，在 `yield` 中用 WFL 的 `object { ... }` / `array [ ... ]` 构造。
 
 带点字段名示例：
 
@@ -482,6 +484,9 @@ risk_context = object {
 - JSON、XML、文本、CSV 等最终编码由 sink 决定。
 - JSON sink 应把 `object` 输出为 JSON object，把 `array` 输出为 JSON array。
 - XML sink 可把 `object` 输出为元素树；文本/CSV sink 可选择序列化或 flatten。
+- 如果结构化字段写入下游中间 window，runtime 会把该值序列化为 UTF-8 JSON 字符串桥接；下游规则读取到的是 `chars` 表示。
+- `array/T` 会检查数组元素类型。`array/float` 允许 digit 元素提升为 float；空数组可写入任意 array 字段。
+- `mvcount`、`mvjoin`、`mvdedup`、`mvsort`、`mvreverse`、`mvindex`、`mvappend` 可处理 `array [...]` 字面量。`mvindex(array ["a", 1], 0)` 这种从异构数组取单个元素的写法会被拒绝，因为无法静态推断标量类型；使用三参数切片形式返回 array。
 - `json_object(...)` 不作为主语法；如后续提供，也应只是返回 `object` 的便捷函数。
 
 ### `conv`

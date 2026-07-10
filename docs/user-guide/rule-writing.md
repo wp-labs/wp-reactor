@@ -118,6 +118,48 @@ test brute_force_hit for brute_force {
 wfl test rules/brute_force.wfl
 ```
 
+### 1.4 输出结构化上下文
+
+如果 sink 需要收到结构化的风险上下文，不要把 JSON 当字符串拼出来。先在输出 window 中声明结构化字段：
+
+```wfs
+window security_alerts {
+    over = 0
+
+    fields {
+        sip: ip
+        fail_count: digit
+        risk_context: object
+        tags: array
+        scores: array/float
+    }
+}
+```
+
+然后在 `yield` 里构造 `object` / `array`：
+
+```wfl
+yield security_alerts (
+    sip = fail.sip,
+    fail_count = count(fail),
+    risk_context = object {
+        score: float = @score;
+        source = fail.sip;
+        username = fail.username;
+        tags: array = array ["bruteforce", "auth", fail.action];
+    },
+    tags = array ["bruteforce", "auth"],
+    scores = array [@score, 1]
+)
+```
+
+使用要点：
+
+- `object` / `array` 只用于输出 window 或中间 window；输入 stream/provider window 不允许声明结构化字段。
+- 源数据里的 JSON object/array 先按 `chars` 接入，需要输出时再用 `yield` 构造结构化值。
+- `array/float` 允许整数元素自动提升为 float；`array/chars` 只接受字符串元素。
+- 如果结构化字段写入中间 window，下游规则读取到的是 UTF-8 JSON 字符串桥接值；最终 sink 输出格式仍由 sink 决定。
+
 ---
 
 ## 2. 场景二：多步骤序列 — 扫描后爆破

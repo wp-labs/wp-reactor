@@ -69,7 +69,7 @@ window auth_events {
 每个 Window 回答三个问题：
 - **数据从哪来**：`stream` 声明订阅的数据流，支持多 stream
 - **数据保留多久**：`over` 定义窗口时间跨度。`over = 0` 表示静态集合（不入队，类似快照表）
-- **字段长什么样**：`fields` 定义 schema，类型包括 `chars`、`digit`、`ip`、`time`、`bool`、`hex`、`float`
+- **字段长什么样**：`fields` 定义 schema，输入字段使用 scalar 类型（`chars`、`digit`、`float`、`bool`、`time`、`ip`、`hex`）；输出和中间 window 还可以使用 `object`、`array`、`array/T` 承载结构化结果
 
 一个 Stream 可以被多个 Window 订阅。例如 `syslog` 流可以同时被 `auth_events`（5 分钟窗口）和 `auth_stats`（1 小时窗口）订阅，各自独立维护数据。
 
@@ -170,7 +170,21 @@ OutputRecord {
 }
 ```
 
-`OutputRecord` 序列化为 JSON 后，由 `SinkDispatcher` 按 `yield_target` 路由到配置的 sink 组。
+`yield` 字段可以是 scalar，也可以是结构化值。结构化值用 WFL 字面量构造：
+
+```wfl
+yield security_alerts (
+    risk_context = object {
+        score = @score;
+        source = e.sip;
+        tags = array ["bruteforce", "ssh", e.action];
+    }
+)
+```
+
+`object` / `array` 是 WFL 内部的结构化值，不是要求用户手写 JSON 字符串。最终 JSON、XML、文本或 CSV 如何表达由 sink 决定；中间 window 为了继续被下游规则消费，会把结构化值按 UTF-8 JSON 字符串桥接。
+
+`OutputRecord` 序列化后，由 `SinkDispatcher` 按 `yield_target` 路由到配置的 sink 组。
 
 ### 3.6 Sink 路由 — 告警发到哪里
 
