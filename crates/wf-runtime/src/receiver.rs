@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,14 +19,22 @@ use wf_lang::{BaseType, FieldType, WindowSchema};
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::metrics::RuntimeMetrics;
 
-/// Replay NDJSON events from file and route them into the runtime as one
-/// configured stream.
+pub const DEFAULT_STREAM_TAG_FIELD: &str = "wp_stream_tag";
+
+#[derive(Clone, Copy)]
+pub struct ReplayRoute<'a> {
+    pub stream_name: &'a str,
+    pub stream_tag_field: &'a str,
+}
+
+/// Replay NDJSON events from file and route them into the runtime.
 ///
-/// Each line must be a JSON object whose field names match the subscribed
-/// window schema for `stream_name`.
+/// If `stream_name` is set, all rows are routed as that configured stream.
+/// If it is empty, each JSON object must carry `stream_tag_field`, and rows are
+/// routed by that per-row logical stream.
 pub async fn replay_ndjson_file(
     path: &Path,
-    stream_name: &str,
+    route: ReplayRoute<'_>,
     source_name: &str,
     schemas: &[WindowSchema],
     router: Arc<Router>,
@@ -34,21 +43,29 @@ pub async fn replay_ndjson_file(
 ) -> RuntimeResult<()> {
     const FILE_BATCH_ROWS: usize = 2048;
 
-    let schema = resolve_stream_schema(schemas, stream_name)?;
+    let stream_name = route.stream_name;
+    let fixed_stream = !stream_name.trim().is_empty();
+    let fixed_schema = if fixed_stream {
+        Some(resolve_stream_schema(schemas, stream_name)?)
+    } else {
+        None
+    };
+    let stream_tag_field = normalize_stream_tag_field(route.stream_tag_field);
+    let mut schema_cache: HashMap<String, SchemaRef> = HashMap::new();
     let file = tokio::fs::File::open(path).await.source_err(
         RuntimeReason::system_error(),
         format!("open file source {}", path.display()),
     )?;
     let mut lines = BufReader::new(file).lines();
-    let mut rows: Vec<serde_json::Map<String, serde_json::Value>> =
-        Vec::with_capacity(FILE_BATCH_ROWS);
+    let mut rows_by_stream: HashMap<String, Vec<serde_json::Map<String, serde_json::Value>>> =
+        HashMap::new();
     let mut line_no = 0usize;
     let mut total_rows = 0usize;
 
     wf_info!(
         conn,
         source = %path.display(),
-        stream = stream_name,
+        stream = if fixed_stream { stream_name } else { "<row stream_tag_field>" },
         "starting file source replay"
     );
     if let Some(metrics) = &metrics {
@@ -80,47 +97,109 @@ pub async fn replay_ndjson_file(
                         ))
                         .err();
                 };
+                let route_stream = if fixed_stream {
+                    stream_name.to_string()
+                } else {
+                    obj.get(stream_tag_field)
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(ToString::to_string)
+                        .ok_or_else(|| {
+                            RuntimeReason::data_error()
+                                .to_err()
+                                .with_detail(format!(
+                                    "invalid NDJSON at {}:{}: missing string field `{}` for dynamic stream routing",
+                                    path.display(),
+                                    line_no,
+                                    stream_tag_field
+                                ))
+                        })?
+                };
+                let rows = rows_by_stream
+                    .entry(route_stream.clone())
+                    .or_insert_with(|| Vec::with_capacity(FILE_BATCH_ROWS));
                 rows.push(obj.clone());
                 if rows.len() >= FILE_BATCH_ROWS {
-                    let batch = build_record_batch_from_json(&schema, &rows)?;
-                    total_rows += batch.num_rows();
-                    if let Err(e) = route_batch(stream_name, source_name, batch, router.as_ref(), metrics.as_ref()) {
-                        if let Some(metrics) = &metrics {
-                            metrics.inc_route_error(source_name);
-                        }
-                        return Err(e);
-                    }
-                    rows.clear();
+                    let rows = rows_by_stream
+                        .get_mut(&route_stream)
+                        .map(std::mem::take)
+                        .unwrap_or_default();
+                    total_rows += flush_ndjson_rows(
+                        &route_stream,
+                        source_name,
+                        schemas,
+                        fixed_schema.as_ref(),
+                        &mut schema_cache,
+                        rows,
+                        router.as_ref(),
+                        metrics.as_ref(),
+                    )?;
                 }
             }
         }
     }
 
-    if !rows.is_empty() {
-        let batch = build_record_batch_from_json(&schema, &rows)?;
-        total_rows += batch.num_rows();
-        if let Err(e) = route_batch(
-            stream_name,
+    for (route_stream, rows) in rows_by_stream {
+        if rows.is_empty() {
+            continue;
+        }
+        total_rows += flush_ndjson_rows(
+            &route_stream,
             source_name,
-            batch,
+            schemas,
+            fixed_schema.as_ref(),
+            &mut schema_cache,
+            rows,
             router.as_ref(),
             metrics.as_ref(),
-        ) {
-            if let Some(metrics) = &metrics {
-                metrics.inc_route_error(source_name);
-            }
-            return Err(e);
-        }
+        )?;
     }
 
     wf_info!(
         conn,
         source = %path.display(),
-        stream = stream_name,
+        stream = if fixed_stream { stream_name } else { "<row stream_tag_field>" },
         rows = total_rows,
         "file source replay complete"
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_ndjson_rows(
+    stream_name: &str,
+    source_name: &str,
+    schemas: &[WindowSchema],
+    fixed_schema: Option<&SchemaRef>,
+    schema_cache: &mut HashMap<String, SchemaRef>,
+    rows: Vec<serde_json::Map<String, serde_json::Value>>,
+    router: &Router,
+    metrics: Option<&Arc<RuntimeMetrics>>,
+) -> RuntimeResult<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let schema = match fixed_schema {
+        Some(schema) => Arc::clone(schema),
+        None => {
+            if let Some(schema) = schema_cache.get(stream_name) {
+                Arc::clone(schema)
+            } else {
+                let schema = resolve_stream_schema(schemas, stream_name)?;
+                schema_cache.insert(stream_name.to_string(), Arc::clone(&schema));
+                schema
+            }
+        }
+    };
+    let batch = build_record_batch_from_json(&schema, &rows)?;
+    let row_count = batch.num_rows();
+    if let Err(e) = route_batch(stream_name, source_name, batch, router, metrics) {
+        if let Some(metrics) = metrics {
+            metrics.inc_route_error(source_name);
+        }
+        return Err(e);
+    }
+    Ok(row_count)
 }
 
 /// Replay CSV data from file and route into the runtime as one stream.
@@ -129,14 +208,22 @@ pub async fn replay_ndjson_file(
 /// RecordBatch using the same column builder as NDJSON.
 pub async fn replay_csv_file(
     path: &Path,
-    stream_name: &str,
+    route: ReplayRoute<'_>,
     source_name: &str,
     schemas: &[WindowSchema],
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
     cancel: CancellationToken,
 ) -> RuntimeResult<()> {
-    let schema = resolve_stream_schema(schemas, stream_name)?;
+    let stream_name = route.stream_name;
+    let fixed_stream = !stream_name.trim().is_empty();
+    let fixed_schema = if fixed_stream {
+        Some(resolve_stream_schema(schemas, stream_name)?)
+    } else {
+        None
+    };
+    let stream_tag_field = normalize_stream_tag_field(route.stream_tag_field);
+    let mut schema_cache: HashMap<String, SchemaRef> = HashMap::new();
     let file_path = path.to_path_buf();
     let stream_name = stream_name.to_string();
     const FILE_BATCH_ROWS_CSV: usize = 2048;
@@ -144,7 +231,7 @@ pub async fn replay_csv_file(
     wf_info!(
         conn,
         source = %path.display(),
-        stream = stream_name,
+        stream = if fixed_stream { stream_name.as_str() } else { "<row stream_tag_field>" },
         "starting csv file replay"
     );
 
@@ -174,8 +261,8 @@ pub async fn replay_csv_file(
         .collect();
 
     let mut total_rows = 0usize;
-    let mut rows: Vec<serde_json::Map<String, serde_json::Value>> =
-        Vec::with_capacity(FILE_BATCH_ROWS_CSV);
+    let mut rows_by_stream: HashMap<String, Vec<serde_json::Map<String, serde_json::Value>>> =
+        HashMap::new();
 
     for result in reader.records() {
         tokio::select! {
@@ -199,51 +286,76 @@ pub async fn replay_csv_file(
             map.insert(field, serde_json::Value::String(value.to_string()));
         }
 
+        let route_stream = if fixed_stream {
+            stream_name.clone()
+        } else {
+            map.get(stream_tag_field)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    RuntimeReason::data_error().to_err().with_detail(format!(
+                        "invalid CSV at {}: missing string column `{}` for dynamic stream routing",
+                        path.display(),
+                        stream_tag_field
+                    ))
+                })?
+        };
+        let rows = rows_by_stream
+            .entry(route_stream.clone())
+            .or_insert_with(|| Vec::with_capacity(FILE_BATCH_ROWS_CSV));
         rows.push(map);
-        total_rows += 1;
-
         if rows.len() >= FILE_BATCH_ROWS_CSV {
-            let batch = build_record_batch_from_json(&schema, &rows)?;
-            if let Err(e) = route_batch(
-                &stream_name,
+            let rows = rows_by_stream
+                .get_mut(&route_stream)
+                .map(std::mem::take)
+                .unwrap_or_default();
+            total_rows += flush_ndjson_rows(
+                &route_stream,
                 source_name,
-                batch,
+                schemas,
+                fixed_schema.as_ref(),
+                &mut schema_cache,
+                rows,
                 router.as_ref(),
                 metrics.as_ref(),
-            ) {
-                if let Some(metrics) = &metrics {
-                    metrics.inc_route_error(source_name);
-                }
-                return Err(e);
-            }
-            rows.clear();
+            )?;
         }
     }
 
-    if !rows.is_empty() {
-        let batch = build_record_batch_from_json(&schema, &rows)?;
-        if let Err(e) = route_batch(
-            &stream_name,
+    for (route_stream, rows) in rows_by_stream {
+        if rows.is_empty() {
+            continue;
+        }
+        total_rows += flush_ndjson_rows(
+            &route_stream,
             source_name,
-            batch,
+            schemas,
+            fixed_schema.as_ref(),
+            &mut schema_cache,
+            rows,
             router.as_ref(),
             metrics.as_ref(),
-        ) {
-            if let Some(metrics) = &metrics {
-                metrics.inc_route_error(source_name);
-            }
-            return Err(e);
-        }
+        )?;
     }
 
     wf_info!(
         conn,
         source = %path.display(),
-        stream = stream_name,
+        stream = if fixed_stream { stream_name.as_str() } else { "<row stream_tag_field>" },
         rows = total_rows,
         "csv file replay complete"
     );
     Ok(())
+}
+
+pub fn normalize_stream_tag_field(value: &str) -> &str {
+    let value = value.trim();
+    if value.is_empty() {
+        DEFAULT_STREAM_TAG_FIELD
+    } else {
+        value
+    }
 }
 
 /// Replay framed `wp_arrow` IPC records from file and route them into the
@@ -900,11 +1012,42 @@ mod tests {
         Arc::new(Router::new(reg))
     }
 
+    fn make_multi_stream_router() -> Arc<Router> {
+        let reg = WindowRegistry::build(vec![
+            WindowDef {
+                params: WindowParams {
+                    name: "win_a".into(),
+                    schema: test_schema(),
+                    time_col_index: Some(0),
+                    over: Duration::from_secs(3600),
+                },
+                streams: vec!["a".to_string()],
+                config: test_config(),
+            },
+            WindowDef {
+                params: WindowParams {
+                    name: "win_b".into(),
+                    schema: test_schema(),
+                    time_col_index: Some(0),
+                    over: Duration::from_secs(3600),
+                },
+                streams: vec!["b".to_string()],
+                config: test_config(),
+            },
+        ])
+        .unwrap();
+        Arc::new(Router::new(reg))
+    }
+
     /// Count total rows across all batches in the test window snapshot.
     fn snapshot_row_count(router: &Router) -> usize {
+        snapshot_row_count_for(router, "test_win")
+    }
+
+    fn snapshot_row_count_for(router: &Router, window: &str) -> usize {
         router
             .registry()
-            .snapshot("test_win")
+            .snapshot(window)
             .unwrap_or_default()
             .iter()
             .map(|b| b.num_rows())
@@ -926,7 +1069,10 @@ mod tests {
 
         replay_ndjson_file(
             &file_path,
-            "events",
+            ReplayRoute {
+                stream_name: "events",
+                stream_tag_field: DEFAULT_STREAM_TAG_FIELD,
+            },
             "test_source",
             &[wf_lang::WindowSchema {
                 name: "test_win".to_string(),
@@ -952,6 +1098,142 @@ mod tests {
         .unwrap();
 
         assert_eq!(snapshot_row_count(&router), 2);
+    }
+
+    #[tokio::test]
+    async fn file_ndjson_replay_routes_rows_by_row_stream() {
+        let router = make_multi_stream_router();
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("events.ndjson");
+        std::fs::write(
+            &file_path,
+            r#"{"wp_stream_tag":"a","ts":1000000000,"value":1}
+{"wp_stream_tag":"b","ts":"2000000000","value":"2"}
+{"wp_stream_tag":"a","ts":3000000000,"value":3}
+"#,
+        )
+        .unwrap();
+
+        let schemas = vec![
+            wf_lang::WindowSchema {
+                name: "win_a".to_string(),
+                streams: vec!["a".to_string()],
+                time_field: Some("ts".to_string()),
+                over: Duration::from_secs(3600),
+                fields: vec![
+                    wf_lang::FieldDef {
+                        name: "ts".to_string(),
+                        field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Time),
+                    },
+                    wf_lang::FieldDef {
+                        name: "value".to_string(),
+                        field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Digit),
+                    },
+                ],
+            },
+            wf_lang::WindowSchema {
+                name: "win_b".to_string(),
+                streams: vec!["b".to_string()],
+                time_field: Some("ts".to_string()),
+                over: Duration::from_secs(3600),
+                fields: vec![
+                    wf_lang::FieldDef {
+                        name: "ts".to_string(),
+                        field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Time),
+                    },
+                    wf_lang::FieldDef {
+                        name: "value".to_string(),
+                        field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Digit),
+                    },
+                ],
+            },
+        ];
+
+        replay_ndjson_file(
+            &file_path,
+            ReplayRoute {
+                stream_name: "",
+                stream_tag_field: DEFAULT_STREAM_TAG_FIELD,
+            },
+            "test_source",
+            &schemas,
+            Arc::clone(&router),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snapshot_row_count_for(&router, "win_a"), 2);
+        assert_eq!(snapshot_row_count_for(&router, "win_b"), 1);
+    }
+
+    #[tokio::test]
+    async fn file_csv_replay_routes_rows_by_stream_tag_field_column() {
+        let router = make_multi_stream_router();
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("events.csv");
+        std::fs::write(
+            &file_path,
+            "wp_stream_tag,ts,value\n\
+a,1000000000,1\n\
+b,2000000000,2\n\
+a,3000000000,3\n",
+        )
+        .unwrap();
+
+        let schemas = vec![
+            wf_lang::WindowSchema {
+                name: "win_a".to_string(),
+                streams: vec!["a".to_string()],
+                time_field: Some("ts".to_string()),
+                over: Duration::from_secs(3600),
+                fields: vec![
+                    wf_lang::FieldDef {
+                        name: "ts".to_string(),
+                        field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Time),
+                    },
+                    wf_lang::FieldDef {
+                        name: "value".to_string(),
+                        field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Digit),
+                    },
+                ],
+            },
+            wf_lang::WindowSchema {
+                name: "win_b".to_string(),
+                streams: vec!["b".to_string()],
+                time_field: Some("ts".to_string()),
+                over: Duration::from_secs(3600),
+                fields: vec![
+                    wf_lang::FieldDef {
+                        name: "ts".to_string(),
+                        field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Time),
+                    },
+                    wf_lang::FieldDef {
+                        name: "value".to_string(),
+                        field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Digit),
+                    },
+                ],
+            },
+        ];
+
+        replay_csv_file(
+            &file_path,
+            ReplayRoute {
+                stream_name: "",
+                stream_tag_field: DEFAULT_STREAM_TAG_FIELD,
+            },
+            "test_source",
+            &schemas,
+            Arc::clone(&router),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snapshot_row_count_for(&router, "win_a"), 2);
+        assert_eq!(snapshot_row_count_for(&router, "win_b"), 1);
     }
 
     #[test]

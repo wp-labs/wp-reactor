@@ -279,7 +279,7 @@ base_type     = "chars" | "digit" | "float" | "bool" | "time" | "ip" | "hex" ;
 - `over > 0` 时 `time` 必选且类型为 `time`。
 - `over = 0` 表示静态集合，可省略 stream/time。
 - 多 stream window 要求 schema 兼容。
-- 无 `stream` 属性的 window 仅作为 yield 目标（不订阅任何数据流）。
+- 无 `stream_tag` 属性的 window 仅作为 yield 目标（不订阅任何数据流）。
 
 ### 6.3 类型映射
 - `chars -> Utf8`
@@ -1043,7 +1043,7 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
   - 裸名：`field_name`（仅当 eval context 中不存在同名字段时写入，防止覆盖 key/label 字段）。
 
 ### 12.4 Yield
-- 目标 window 必须存在，且满足：`stream` 为空（纯输出 window）并且 `over > 0`。
+- 目标 window 必须存在，且满足：`stream_tag` 为空（纯输出 window）并且 `over > 0`。
 - v2.1 推荐显式版本目标：`yield target@vN (...)`；当前目标 window 必填，`@vN` 可选但一旦声明必须与 `meta.contract_version` 一致。
 - yield 命名参数 + 系统字段必须是目标 window fields 的**子集**（名称和类型匹配）。
 - yield 中不得出现 window 未定义的字段名；未覆盖的非系统字段值为 null。

@@ -18,7 +18,7 @@ data_format = "arrow_framed"              # ndjson | arrow_framed | arrow_ipc
 type = "file"
 name = "seed_auth"
 path = "data/auth_events.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 data_format = "ndjson"                     # ndjson | arrow_framed | arrow_ipc
 
 [[sources]]
@@ -31,7 +31,7 @@ data_format = "arrow_framed"               # wp_arrow 分帧格式
 type = "file"
 name = "seed_arrow_ipc"
 path = "data/auth_events.arrow"
-stream = "syslog"
+stream_tag = "syslog"
 data_format = "arrow_ipc"                  # 标准 Arrow IPC file
 
 [runtime]
@@ -84,16 +84,16 @@ name = "ingress_tcp"
 addr = "127.0.0.1"
 port = "9800"
 framing = "len"             # len | line | auto
-stream = ""                 # 可选：固定 stream 名；留空则用 ArrowFramed 的 tag
+stream_tag = ""                 # 可选：固定 stream tag；留空则用帧 tag 或 stream_tag_field
 ```
 
 `data_format` 取值：
 
-| 值 | 含义 | stream 来源 |
+| 值 | 含义 | stream tag 来源 |
 |------|------|-------------|
-| `ndjson` | JSON Lines 文本 | 必须配 `stream` |
-| `arrow_ipc` | 原始 Arrow IPC Stream | 必须配 `stream` |
-| `arrow_framed` | wp_arrow 帧 `[4B tag_len][tag][IPC Stream]` | 用帧内 tag，或配 `stream` 覆盖 |
+| `ndjson` | JSON Lines 文本 | 固定 `stream_tag`，或用 `stream_tag_field` 从 payload 读取 |
+| `arrow_ipc` | 原始 Arrow IPC Stream | 必须配 `stream_tag` |
+| `arrow_framed` | wp_arrow 帧 `[4B tag_len][tag][IPC Stream]` | 用帧内 tag，或配 `stream_tag` 覆盖 |
 
 说明：
 
@@ -106,9 +106,9 @@ stream = ""                 # 可选：固定 stream 名；留空则用 ArrowFra
 
 当前支持三种格式：
 
-| 格式 | 含义 | `stream` |
+| 格式 | 含义 | `stream_tag` |
 |------|------|----------|
-| `ndjson` | 逐行 JSON | 必填 |
+| `ndjson` | 逐行 JSON | 可用固定 `stream_tag`，也可用 `stream_tag_field` |
 | `arrow_framed` | 当前 `wp_arrow` 分帧文件格式 | 可省略 |
 | `arrow_ipc` | 标准 Arrow IPC file | 必填 |
 
@@ -118,8 +118,19 @@ stream = ""                 # 可选：固定 stream 名；留空则用 ArrowFra
 [[sources]]
 type = "file"
 path = "data/events.jsonl"
-stream = "syslog"
+stream_tag = "syslog"
 data_format = "ndjson"
+```
+
+如果一个 NDJSON source 混合多个逻辑流，可以不配置固定 `stream_tag`，改用
+`stream_tag_field` 指定承载 tag 的字段：
+
+```toml
+[[sources]]
+type = "file"
+path = "data/events.jsonl"
+data_format = "ndjson"
+stream_tag_field = "wp_stream_tag"
 ```
 
 #### `arrow_framed`
@@ -136,7 +147,7 @@ data_format = "arrow_framed"
 - 文件格式为当前 `wp_arrow` 分帧格式
 - 读取方式为 `[4B len][encode_ipc payload]...`
 - 默认按帧内 `tag` 路由
-- 如有需要，也可显式写 `stream` 覆盖
+- 如有需要，也可显式写 `stream_tag` 覆盖
 
 #### `arrow_ipc`
 
@@ -144,14 +155,14 @@ data_format = "arrow_framed"
 [[sources]]
 type = "file"
 path = "data/events.arrow"
-stream = "syslog"
+stream_tag = "syslog"
 data_format = "arrow_ipc"
 ```
 
 说明：
 
 - 标准 Arrow IPC file 不携带业务路由 tag
-- 因此必须显式配置 `stream`
+- 因此必须显式配置 `stream_tag`
 
 ### 为什么不用自动识别
 

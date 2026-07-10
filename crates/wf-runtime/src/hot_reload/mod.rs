@@ -572,7 +572,7 @@ over_cap = "1h"
     fn security_schema() -> &'static str {
         r#"
 window auth_events {
-    stream = "syslog"
+    stream_tag = "syslog"
     time = event_time
     over = 5m
 
@@ -876,7 +876,7 @@ rules = "../../rules/v2/*.wfl"
             &mod_dir.join("security.wfs"),
             r#"
 window auth_events {
-    stream = "syslog"
+    stream_tag = "syslog"
     time = event_time
     over = 5m
 
@@ -1025,7 +1025,7 @@ over_cap = "1h"
             &root.join("schemas/security.wfs"),
             r#"
 window auth_events {
-    stream = "syslog"
+    stream_tag = "syslog"
     time = event_time
     over = 5m
 
@@ -1113,7 +1113,7 @@ window security_alerts {
             &root.join("schemas/security.wfs"),
             r#"
 window auth_events {
-    stream = "syslog"
+    stream_tag = "syslog"
     time = event_time
     over = 5m
     fields {
@@ -1196,7 +1196,7 @@ window security_alerts {
             &root.join("schemas/security.wfs"),
             r#"
 window auth_events {
-    stream = "syslog"
+    stream_tag = "syslog"
     time = event_time
     over = 5m
     fields {

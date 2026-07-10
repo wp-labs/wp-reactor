@@ -73,7 +73,7 @@ mode = "batch"
 [[sources]]
 type = "file"
 path = "../data/seed.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -126,7 +126,7 @@ windows = "models/windows.toml"
 [[sources]]
 type = "file"
 path = "data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -304,7 +304,7 @@ windows = "@WINDOWS_PATH@"
 [[sources]]
 type = "file"
 path = "${CASE_PATH}/data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -363,7 +363,7 @@ windows = "models/windows.toml"
 [[sources]]
 type = "file"
 path = "data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -404,7 +404,7 @@ windows = "@WINDOWS_PATH@"
 [[sources]]
 type = "file"
 path = "${CASE_PATH}/data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -450,7 +450,7 @@ windows = "@WINDOWS_PATH@"
 [[sources]]
 type = "file"
 path = "${CASE_PATH}/data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -501,7 +501,7 @@ windows = "models/windows.toml"
 [[sources]]
 type = "file"
 path = "data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -566,7 +566,7 @@ windows = "models/windows.toml"
 [[sources]]
 type = "file"
 path = "${CASE_PATH}/data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]

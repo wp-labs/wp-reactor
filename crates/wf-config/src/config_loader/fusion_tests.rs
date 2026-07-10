@@ -2,13 +2,18 @@ use super::*;
 use crate::source::SourceConfig;
 use crate::types::{ByteSize, DistMode, EvictPolicy, HumanDuration, LatePolicy};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+static TEMP_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn make_temp_dir(name: &str) -> PathBuf {
+    let seq = TEMP_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
     let unique = format!(
-        "wf-config-fusion-{}-{}-{}",
+        "wf-config-fusion-{}-{}-{}-{}",
         name,
         std::process::id(),
+        seq,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time before unix epoch")
@@ -228,7 +233,7 @@ fn batch_mode_accepts_file_source() {
             .replace("mode = \"daemon\"", "mode = \"batch\"")
             .replace(
                 "[[sources]]\ntype = \"tcp\"\nkey = \"ingress\"\n\nlisten = \"tcp://127.0.0.1:9800\"\n",
-                "[[sources]]\ntype = \"file\"\nkey = \"seed_file\"\n\npath = \"data/auth_events.ndjson\"\nstream = \"syslog\"\nformat = \"ndjson\"\n",
+                "[[sources]]\ntype = \"file\"\nkey = \"seed_file\"\n\npath = \"data/auth_events.ndjson\"\nstream_tag = \"syslog\"\nformat = \"ndjson\"\n",
             );
     let cfg: FusionConfig = load_with_windows(&toml, WINDOWS_TOML);
     assert_eq!(cfg.mode, FusionMode::Batch);
@@ -246,7 +251,7 @@ fn batch_mode_accepts_file_source() {
                 params.get("path").unwrap().as_str(),
                 "data/auth_events.ndjson"
             );
-            assert_eq!(params.get("stream").unwrap().as_str(), "syslog");
+            assert_eq!(params.get("stream_tag").unwrap().as_str(), "syslog");
             assert_eq!(params.get("format").unwrap().as_str(), "ndjson");
         }
         _ => {}
@@ -263,7 +268,7 @@ fn batch_mode_rejects_tcp_source() {
 fn daemon_mode_accepts_file_source() {
     let toml = FULL_TOML.replace(
             "[[sources]]\ntype = \"tcp\"\nname = \"ingress\"\nlisten = \"tcp://127.0.0.1:9800\"\n",
-            "[[sources]]\ntype = \"file\"\nname = \"seed_file\"\npath = \"data/auth_events.ndjson\"\nstream = \"syslog\"\nformat = \"ndjson\"\n",
+            "[[sources]]\ntype = \"file\"\nname = \"seed_file\"\npath = \"data/auth_events.ndjson\"\nstream_tag = \"syslog\"\nformat = \"ndjson\"\n",
         );
     let cfg: FusionConfig = load_with_windows(&toml, WINDOWS_TOML);
     assert_eq!(cfg.mode, FusionMode::Daemon);
@@ -281,7 +286,7 @@ fn daemon_mode_accepts_file_source() {
                 params.get("path").unwrap().as_str(),
                 "data/auth_events.ndjson"
             );
-            assert_eq!(params.get("stream").unwrap().as_str(), "syslog");
+            assert_eq!(params.get("stream_tag").unwrap().as_str(), "syslog");
             assert_eq!(params.get("format").unwrap().as_str(), "ndjson");
         }
         _ => {}
@@ -316,7 +321,7 @@ work_root = "${CASE_PATH}"
 type = "file"
 name = "seed_${ENV}"
 path = "${CASE_PATH}/data/input.ndjson"
-stream = "${STREAM_NAME}"
+stream_tag = "${STREAM_NAME}"
 format = "ndjson"
 
 [runtime]
@@ -349,7 +354,7 @@ STREAM_NAME = "netflow"
                 params.get("path").unwrap().as_str(),
                 "/tmp/case-a/data/input.ndjson"
             );
-            assert_eq!(params.get("stream").unwrap().as_str(), "netflow");
+            assert_eq!(params.get("stream_tag").unwrap().as_str(), "netflow");
         }
         _ => {}
     }
@@ -366,7 +371,7 @@ sinks = "${WF_CONFIG_TEST_CASE_PATH}/sinks"
 type = "file"
 
 path = "${WF_CONFIG_TEST_CASE_PATH}/data/input.ndjson"
-stream = "netflow"
+stream_tag = "netflow"
 format = "ndjson"
 
 [runtime]
@@ -422,7 +427,7 @@ work_root = "${WORK_DIR}/out"
 type = "file"
 name = "seed"
 path = "${CONFIG_DIR}/data/input.ndjson"
-stream = "netflow"
+stream_tag = "netflow"
 format = "ndjson"
 
 [runtime]
@@ -525,7 +530,7 @@ mode = "batch"
 type = "file"
 name = "seed_file"
 path = "data/seed.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -580,7 +585,7 @@ over_cap = "48h"
             ..
         } if source_type.as_deref() == Some("file") => {
             assert_eq!(params.get("path").unwrap().as_str(), "data/seed.ndjson");
-            assert_eq!(params.get("stream").unwrap().as_str(), "syslog");
+            assert_eq!(params.get("stream_tag").unwrap().as_str(), "syslog");
         }
         _ => {}
     }
@@ -605,7 +610,7 @@ sinks = "${CASE_PATH}/sinks"
 type = "file"
 
 path = "${CASE_PATH}/data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -673,7 +678,7 @@ sinks = "sinks"
 type = "file"
 
 path = "data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -693,7 +698,7 @@ work_root = "../out/dev"
 type = "file"
 
 path = "../data/dev.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -762,7 +767,7 @@ sinks = "conf/sinks"
 type = "file"
 
 path = "conf/data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -781,7 +786,7 @@ sinks = "../sinks/dev"
 type = "file"
 
 path = "../data/dev.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -951,7 +956,7 @@ CASE_PATH = "/tmp/from-file"
 type = "file"
 key = "seed_${ENV}"
 path = "${CONFIG_DIR}/data/${NAME}.ndjson"
-stream = "${STREAM_NAME}"
+stream_tag = "${STREAM_NAME}"
 format = "ndjson"
 "#,
     );
@@ -996,7 +1001,7 @@ format = "ndjson"
                     .join("data/input.ndjson")
                     .to_string_lossy()
             );
-            assert_eq!(params.get("stream").unwrap().as_str(), "netflow");
+            assert_eq!(params.get("stream_tag").unwrap().as_str(), "netflow");
             assert_eq!(params.get("format").unwrap().as_str(), "ndjson");
         }
         other => panic!("unexpected source config: {other:?}"),
@@ -1043,7 +1048,7 @@ connect = "file_src"
 enable = true
 key = "seed_file"
 path = "data/auth_events.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 data_format = "ndjson"
 "#,
     );
@@ -1094,7 +1099,7 @@ key = "seed_file"
 
 [params]
 path = "data/auth_events.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 data_format = "ndjson"
 "#,
     );
@@ -1111,7 +1116,7 @@ data_format = "ndjson"
         Some("data/auth_events.ndjson")
     );
     assert_eq!(
-        cfg.sources[0].params.get("stream").map(String::as_str),
+        cfg.sources[0].params.get("stream_tag").map(String::as_str),
         Some("syslog")
     );
 
@@ -1126,7 +1131,7 @@ fn source_enabled_field_fails_fast() {
 type = "file"
 enabled = false
 path = "data/auth_events.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 "#,
         FULL_TOML
@@ -1147,7 +1152,7 @@ fn source_vars_scalar_field_fails_fast() {
 type = "file"
 vars = "not allowed"
 path = "data/auth_events.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 "#,
         FULL_TOML
@@ -1177,7 +1182,7 @@ sources_dir = "missing"
 type = "file"
 key = "seed_file"
 path = "data/auth_events.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -1209,7 +1214,7 @@ type = "file"
 key = "seed_file"
 
 path = "data/auth_events.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 "#,
         FULL_TOML
@@ -1245,7 +1250,7 @@ format = "ndjson"
                 params.get("path").unwrap().as_str(),
                 "data/auth_events.ndjson"
             );
-            assert_eq!(params.get("stream").unwrap().as_str(), "syslog");
+            assert_eq!(params.get("stream_tag").unwrap().as_str(), "syslog");
             assert_eq!(params.get("format").unwrap().as_str(), "ndjson");
         }
         _ => {}
@@ -1266,7 +1271,7 @@ key = "seed_file"
 
 [sources.params]
 path = "data/auth_events.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 data_format = "ndjson"
 
 [runtime]
@@ -1283,7 +1288,7 @@ rules = "rules/*.wfl"
         Some("data/auth_events.ndjson")
     );
     assert_eq!(
-        cfg.sources[0].params.get("stream").map(String::as_str),
+        cfg.sources[0].params.get("stream_tag").map(String::as_str),
         Some("syslog")
     );
     assert_eq!(
@@ -1312,7 +1317,7 @@ sinks = "sinks"
 type = "file"
 key = "seed"
 path = "seed.ndjson"
-stream = "events"
+stream_tag = "events"
 format = "ndjson"
 
 [runtime]
@@ -1369,7 +1374,7 @@ sinks = "sinks"
 type = "file"
 key = "seed"
 path = "seed.ndjson"
-stream = "events"
+stream_tag = "events"
 format = "ndjson"
 
 [runtime]

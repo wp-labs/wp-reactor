@@ -18,8 +18,8 @@ use crate::error::{RuntimeReason, RuntimeResult};
 use crate::evictor_task;
 use crate::metrics::{MetricsRecord, MonRecv, RuntimeMetrics, run_metrics_task};
 use crate::receiver::{
-    replay_arrow_framed_file, replay_arrow_ipc_file, replay_csv_file, replay_ndjson_file,
-    resolve_stream_schema,
+    DEFAULT_STREAM_TAG_FIELD, ReplayRoute, replay_arrow_framed_file, replay_arrow_ipc_file,
+    replay_csv_file, replay_ndjson_file, resolve_stream_schema,
 };
 use crate::source::DataSourceBatchSource;
 use wf_connector_api::BatchSource;
@@ -171,15 +171,16 @@ pub(super) async fn spawn_receiver_task(
             "file" => {
                 let path_str = source.params.get("path").map(|s| s.as_str()).unwrap_or("");
                 let path = resolve_source_path(base_dir, path_str);
-                let stream = source.params.get("stream").cloned().unwrap_or_default();
+                let stream = source_stream_tag(source).to_string();
+                let stream_tag_field = source
+                    .params
+                    .get("stream_tag_field")
+                    .cloned()
+                    .unwrap_or_else(|| DEFAULT_STREAM_TAG_FIELD.to_string());
                 let router = Arc::clone(&router);
                 let metrics = metrics.clone();
                 let cancel = cancel.child_token();
-                let format = source
-                    .params
-                    .get("data_format")
-                    .cloned()
-                    .unwrap_or_else(|| "ndjson".into());
+                let format = source_data_format(source).to_string();
                 let schemas = Arc::clone(&schema_catalog);
                 let source_name = source_name.clone();
                 group.push(tokio::spawn(async move {
@@ -187,7 +188,10 @@ pub(super) async fn spawn_receiver_task(
                         "ndjson" => {
                             replay_ndjson_file(
                                 &path,
-                                &stream,
+                                ReplayRoute {
+                                    stream_name: &stream,
+                                    stream_tag_field: &stream_tag_field,
+                                },
                                 &source_name,
                                 schemas.as_slice(),
                                 router,
@@ -199,7 +203,10 @@ pub(super) async fn spawn_receiver_task(
                         "csv" => {
                             replay_csv_file(
                                 &path,
-                                &stream,
+                                ReplayRoute {
+                                    stream_name: &stream,
+                                    stream_tag_field: &stream_tag_field,
+                                },
                                 &source_name,
                                 schemas.as_slice(),
                                 router,
@@ -278,6 +285,23 @@ fn resolve_source_path(base_dir: &Path, path: &str) -> PathBuf {
     }
 }
 
+fn source_data_format(source: &wf_config::SourceConfig) -> &str {
+    source
+        .params
+        .get("data_format")
+        .or_else(|| source.params.get("format"))
+        .map(|s| s.as_str())
+        .unwrap_or("ndjson")
+}
+
+fn source_stream_tag(source: &wf_config::SourceConfig) -> &str {
+    source
+        .params
+        .get("stream_tag")
+        .map(|s| s.as_str())
+        .unwrap_or("")
+}
+
 /// Resolve a connector id (e.g. `"kafka_src"`) to its kind (e.g. `"kafka"`)
 /// via the global connector registry.
 fn resolve_connector_kind(connector_id: &str) -> Option<String> {
@@ -317,8 +341,13 @@ async fn spawn_external_source_tasks(
             .err();
     };
 
-    let stream_name = source.params.get("stream").cloned().unwrap_or_default();
-    let format = WireFormat::from_data_format(source.params.get("data_format").map(|s| s.as_str()));
+    let stream_name = source_stream_tag(source).to_string();
+    let stream_tag_field = source
+        .params
+        .get("stream_tag_field")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_STREAM_TAG_FIELD.to_string());
+    let format = WireFormat::from_data_format(Some(source_data_format(source)));
 
     // Arrow formats carry their own schema in the IPC stream; only NDJSON
     // needs a pre-resolved window schema.
@@ -380,9 +409,11 @@ async fn spawn_external_source_tasks(
         let metrics = metrics.clone();
         let cancel = cancel.child_token();
         let stream_name = stream_name.clone();
+        let stream_tag_field = stream_tag_field.clone();
         let source_name = source.effective_name(source_idx);
         let source_kind = source_kind.to_string();
         let schema = Arc::clone(&schema);
+        let schemas = Arc::clone(schemas);
         group.push(tokio::spawn(async move {
             // Start the source if needed (e.g. TCP source checks started flag).
             let (_ctrl_tx, ctrl_rx) = async_broadcast::broadcast(1);
@@ -395,6 +426,9 @@ async fn spawn_external_source_tasks(
                 handle.source,
                 schema,
                 format,
+                schemas,
+                stream_tag_field,
+                matches!(format, WireFormat::Ndjson) && stream_name.trim().is_empty(),
             );
 
             let mut consecutive_errors: u32 = 0;
@@ -410,9 +444,8 @@ async fn spawn_external_source_tasks(
                                 let route_stream =
                                     if stream_name.is_empty() {
                                         batch_source
-                                            .last_stream_tag()
-                                            .unwrap_or(&stream_name)
-                                            .to_string()
+                                            .next_stream_tag()
+                                            .unwrap_or_else(|| stream_name.clone())
                                     } else {
                                         stream_name.clone()
                                     };

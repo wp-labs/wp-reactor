@@ -87,19 +87,15 @@ pub(crate) fn validate(config: &FusionConfig) -> ConfigResult<()> {
                         "sources[{idx}] ({name}): file path must be non-empty"
                     ));
                 }
-                let fmt = source
+                let fmt = source_data_format(source);
+                let stream_tag = source
                     .params
-                    .get("data_format")
-                    .map(|s| s.as_str())
-                    .unwrap_or("ndjson");
-                let stream = source
-                    .params
-                    .get("stream")
+                    .get("stream_tag")
                     .map(|s| s.as_str())
                     .unwrap_or("");
-                if (fmt == "ndjson" || fmt == "arrow_ipc") && stream.trim().is_empty() {
+                if fmt == "arrow_ipc" && stream_tag.trim().is_empty() {
                     return ConfigReason::Validation.fail(format!(
-                        "sources[{idx}] ({name}): file stream must be non-empty"
+                        "sources[{idx}] ({name}): file stream_tag must be non-empty"
                     ));
                 }
             }
@@ -108,14 +104,16 @@ pub(crate) fn validate(config: &FusionConfig) -> ConfigResult<()> {
                 // Parameter-level validation is delegated to each factory's validate_spec.
                 enabled_count += 1;
                 enabled_non_file += 1;
-                let stream = source
+                let fmt = source_data_format(source);
+                let stream_tag = source
                     .params
-                    .get("stream")
+                    .get("stream_tag")
                     .map(|s| s.as_str())
                     .unwrap_or("");
-                if stream.trim().is_empty() {
+                if stream_tag.trim().is_empty() && !matches!(fmt, "ndjson" | "arrow_framed" | "csv")
+                {
                     return ConfigReason::Validation.fail(format!(
-                        "sources[{idx}] ({name}): external source stream must be non-empty"
+                        "sources[{idx}] ({name}): external source stream_tag must be non-empty"
                     ));
                 }
             }
@@ -173,6 +171,15 @@ pub(crate) fn validate(config: &FusionConfig) -> ConfigResult<()> {
     }
 
     Ok(())
+}
+
+fn source_data_format(source: &crate::SourceConfig) -> &str {
+    source
+        .params
+        .get("data_format")
+        .or_else(|| source.params.get("format"))
+        .map(|s| s.as_str())
+        .unwrap_or("ndjson")
 }
 
 /// A valid variable name starts with ASCII letter or underscore, followed by
@@ -315,7 +322,7 @@ mod tests {
     fn src_enabled(kind: &str) -> SourceConfig {
         let mut params = BTreeMap::new();
         if kind != "tcp" && kind != "file" {
-            params.insert("stream".into(), "events".into());
+            params.insert("stream_tag".into(), "events".into());
         }
         SourceConfig {
             name: None,
@@ -382,7 +389,7 @@ mod tests {
         };
         file.params
             .insert("path".into(), "data/events.ndjson".into());
-        file.params.insert("stream".into(), "events".into());
+        file.params.insert("stream_tag".into(), "events".into());
         file.params.insert("format".into(), "ndjson".into());
         let cfg = make_config(FusionMode::Batch, vec![file, src_enabled("kafka")]);
         let err = validate(&cfg).unwrap_err();
@@ -413,7 +420,7 @@ mod tests {
         };
         file.params
             .insert("path".into(), "data/events.ndjson".into());
-        file.params.insert("stream".into(), "events".into());
+        file.params.insert("stream_tag".into(), "events".into());
         file.params.insert("data_format".into(), "ndjson".into());
 
         let cfg = make_config(FusionMode::Batch, vec![file, src_disabled("kafka")]);
@@ -431,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn external_source_requires_stream() {
+    fn external_arrow_ipc_source_requires_stream() {
         let cfg = make_config(
             FusionMode::Daemon,
             vec![SourceConfig {
@@ -439,11 +446,55 @@ mod tests {
                 connect: None,
                 source_type: Some("syslog".into()),
                 enabled: true,
-                params: BTreeMap::new(),
+                params: {
+                    let mut m = BTreeMap::new();
+                    m.insert("data_format".into(), "arrow_ipc".into());
+                    m
+                },
             }],
         );
         let err = validate(&cfg).unwrap_err();
         assert!(err.to_string().contains("external source stream"));
+    }
+
+    #[test]
+    fn daemon_mode_accepts_ndjson_external_source_without_fixed_stream() {
+        let cfg = make_config(
+            FusionMode::Daemon,
+            vec![SourceConfig {
+                name: None,
+                connect: None,
+                source_type: Some("syslog".into()),
+                enabled: true,
+                params: {
+                    let mut m = BTreeMap::new();
+                    m.insert("data_format".into(), "ndjson".into());
+                    m.insert("stream_tag_field".into(), "wp_stream_tag".into());
+                    m
+                },
+            }],
+        );
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn daemon_mode_accepts_arrow_framed_external_source_without_fixed_stream() {
+        let cfg = make_config(
+            FusionMode::Daemon,
+            vec![SourceConfig {
+                name: None,
+                connect: None,
+                source_type: Some("tcp".into()),
+                enabled: true,
+                params: {
+                    let mut m = BTreeMap::new();
+                    m.insert("listen".into(), "tcp://127.0.0.1:9800".into());
+                    m.insert("data_format".into(), "arrow_framed".into());
+                    m
+                },
+            }],
+        );
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]
@@ -458,12 +509,77 @@ mod tests {
                 params: {
                     let mut m = BTreeMap::new();
                     m.insert("path".into(), "data/events.ndjson".into());
-                    m.insert("stream".into(), "events".into());
+                    m.insert("stream_tag".into(), "events".into());
                     m.insert("format".into(), "ndjson".into());
                     m
                 },
             }],
         );
         assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn batch_mode_accepts_ndjson_file_source_without_fixed_stream() {
+        let cfg = make_config(
+            FusionMode::Batch,
+            vec![SourceConfig {
+                name: None,
+                connect: None,
+                source_type: Some("file".into()),
+                enabled: true,
+                params: {
+                    let mut m = BTreeMap::new();
+                    m.insert("path".into(), "data/events.ndjson".into());
+                    m.insert("data_format".into(), "ndjson".into());
+                    m
+                },
+            }],
+        );
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn batch_mode_accepts_csv_file_source_without_fixed_stream() {
+        let cfg = make_config(
+            FusionMode::Batch,
+            vec![SourceConfig {
+                name: None,
+                connect: None,
+                source_type: Some("file".into()),
+                enabled: true,
+                params: {
+                    let mut m = BTreeMap::new();
+                    m.insert("path".into(), "data/events.csv".into());
+                    m.insert("data_format".into(), "csv".into());
+                    m.insert("stream_tag_field".into(), "wp_stream_tag".into());
+                    m
+                },
+            }],
+        );
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn batch_mode_rejects_arrow_ipc_file_source_without_fixed_stream() {
+        let cfg = make_config(
+            FusionMode::Batch,
+            vec![SourceConfig {
+                name: None,
+                connect: None,
+                source_type: Some("file".into()),
+                enabled: true,
+                params: {
+                    let mut m = BTreeMap::new();
+                    m.insert("path".into(), "data/events.arrow".into());
+                    m.insert("data_format".into(), "arrow_ipc".into());
+                    m
+                },
+            }],
+        );
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("file stream_tag must be non-empty")
+        );
     }
 }

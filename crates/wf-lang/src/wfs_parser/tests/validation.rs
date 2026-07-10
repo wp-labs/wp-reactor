@@ -78,7 +78,7 @@ window static_table {
 fn reject_structured_object_field_in_stream_window() {
     let input = r#"
 window events {
-    stream = "auth"
+    stream_tag = "auth"
     over = 0
     fields {
         ctx: object
@@ -93,7 +93,7 @@ window events {
 fn reject_structured_array_field_in_stream_window() {
     let input = r#"
 window events {
-    stream = "auth"
+    stream_tag = "auth"
     over = 0
     fields {
         tags: array
@@ -108,7 +108,7 @@ window events {
 fn reject_typed_array_field_in_stream_window() {
     let input = r#"
 window events {
-    stream = "auth"
+    stream_tag = "auth"
     over = 0
     fields {
         ports: array/digit

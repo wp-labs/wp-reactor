@@ -13,14 +13,14 @@ use toml::Value as TomlValue;
 /// key = "netflow_file"
 /// enable = true
 /// path = "data/events.ndjson"
-/// stream = "netflow"
+/// stream_tag = "netflow"
 /// ```
 ///
 /// 2. Standard connector format:
 /// ```toml
 /// connect = "kafka_src"
 /// key = "kafka_1"
-/// stream = "nginx_access"
+/// stream_tag = "nginx_access"
 /// brokers = "localhost:9092"
 /// topic = "wp_nginx_logs"
 /// ```
@@ -186,7 +186,7 @@ mod tests {
 type = "file"
 key = "netflow_file"
 path = "data/events.ndjson"
-stream = "netflow"
+stream_tag = "netflow"
 format = "ndjson"
 "#;
         let s: SourceConfig = toml::from_str(toml).unwrap();
@@ -201,7 +201,7 @@ format = "ndjson"
         let toml = r#"
 key = "kafka_1"
 connect = "kafka_src"
-stream = "nginx_access"
+stream_tag = "nginx_access"
 brokers = "localhost:9092"
 topic = "wp_nginx_logs"
 group_id = "wfusion"
@@ -212,7 +212,7 @@ group_id = "wfusion"
         assert!(s.source_type.is_none());
         assert_eq!(s.params.get("brokers").unwrap(), "localhost:9092");
         assert_eq!(s.params.get("topic").unwrap(), "wp_nginx_logs");
-        assert_eq!(s.params.get("stream").unwrap(), "nginx_access");
+        assert_eq!(s.params.get("stream_tag").unwrap(), "nginx_access");
     }
 
     #[test]
@@ -222,7 +222,7 @@ key = "kafka_1"
 connect = "kafka_src"
 
 [params]
-stream = "nginx_access"
+stream_tag = "nginx_access"
 brokers = "localhost:9092"
 topic = "wp_nginx_logs"
 group_id = "wfusion"
@@ -232,7 +232,7 @@ group_id = "wfusion"
         assert_eq!(s.connect.as_deref(), Some("kafka_src"));
         assert_eq!(s.params.get("brokers").unwrap(), "localhost:9092");
         assert_eq!(s.params.get("topic").unwrap(), "wp_nginx_logs");
-        assert_eq!(s.params.get("stream").unwrap(), "nginx_access");
+        assert_eq!(s.params.get("stream_tag").unwrap(), "nginx_access");
     }
 
     #[test]
@@ -243,11 +243,11 @@ connect = "file_src"
 
 [params_override]
 path = "data/events.ndjson"
-stream = "events"
+stream_tag = "events"
 "#;
         let s: SourceConfig = toml::from_str(toml).unwrap();
         assert_eq!(s.params.get("path").unwrap(), "data/events.ndjson");
-        assert_eq!(s.params.get("stream").unwrap(), "events");
+        assert_eq!(s.params.get("stream_tag").unwrap(), "events");
     }
 
     #[test]
@@ -259,11 +259,11 @@ path = "data/flat.ndjson"
 
 [params]
 path = "data/nested.ndjson"
-stream = "events"
+stream_tag = "events"
 "#;
         let s: SourceConfig = toml::from_str(toml).unwrap();
         assert_eq!(s.params.get("path").unwrap(), "data/flat.ndjson");
-        assert_eq!(s.params.get("stream").unwrap(), "events");
+        assert_eq!(s.params.get("stream_tag").unwrap(), "events");
     }
 
     #[test]
@@ -356,7 +356,7 @@ listen = "tcp://0.0.0.0:9800"
         let toml = r#"
 type = "file"
 path = "data/events.ndjson"
-stream = "events"
+stream_tag = "events"
 "#;
         let s: SourceConfig = toml::from_str(toml).unwrap();
         assert!(s.enabled);
@@ -368,7 +368,7 @@ stream = "events"
 type = "file"
 enable = false
 path = "data/events.ndjson"
-stream = "events"
+stream_tag = "events"
 "#;
         let s: SourceConfig = toml::from_str(toml).unwrap();
         assert!(!s.enabled);
@@ -380,7 +380,7 @@ stream = "events"
 type = "file"
 enabled = false
 path = "data/events.ndjson"
-stream = "events"
+stream_tag = "events"
 "#;
         let err = toml::from_str::<SourceConfig>(toml).unwrap_err();
         assert!(err.to_string().contains("source uses `enable`"));
@@ -391,7 +391,7 @@ stream = "events"
         let toml = r#"
 type = "file"
 path = "data/events.ndjson"
-stream = "events"
+stream_tag = "events"
 
 [vars]
 WORK_DIR = "/tmp/work"
@@ -406,7 +406,7 @@ WORK_DIR = "/tmp/work"
 type = "file"
 vars = "not allowed"
 path = "data/events.ndjson"
-stream = "events"
+stream_tag = "events"
 "#;
         let err = toml::from_str::<SourceConfig>(toml).unwrap_err();
         assert!(
@@ -421,7 +421,7 @@ stream = "events"
 type = "file"
 vars = ["not", "allowed"]
 path = "data/events.ndjson"
-stream = "events"
+stream_tag = "events"
 "#;
         let err = toml::from_str::<SourceConfig>(toml).unwrap_err();
         assert!(

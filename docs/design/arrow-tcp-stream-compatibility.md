@@ -144,7 +144,7 @@ match detect_format(&event.payload) {
 # topology/sources/netflow_tcp.toml
 connect = "tcp_src"
 key = "nginx_tcp"
-stream = "nginx_access"
+stream_tag = "nginx_access"
 
 [sources.params]
 addr = "127.0.0.1"

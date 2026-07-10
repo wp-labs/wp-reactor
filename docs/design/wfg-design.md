@@ -210,7 +210,7 @@ literal         = STRING | NUMBER | "true" | "false" ;
 ## 6. 校验规则（最小集）
 
 - `use` 引用文件必须存在且可解析。
-- `stream` 名必须在 schema/rule 上下文中可解析。
+- `stream_tag` 名必须在 schema/rule 上下文中可解析。
 - 注入标签必须在 `{hit, near_miss, miss}` 中。
 - 注入占比必须在 `(0, 100]`。
 - 同一 `use(...)` step 内同一字段不得重复赋值（发现重复应报错）。

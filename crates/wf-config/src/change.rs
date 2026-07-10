@@ -195,7 +195,7 @@ sinks = "sinks"
 [[sources]]
 type = "file"
 path = "data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -288,7 +288,7 @@ sinks = "sinks"
 [[sources]]
 type = "file"
 path = "data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
@@ -318,7 +318,7 @@ over_cap = "30m"
 [[sources]]
 type = "file"
 path = "../data/v1.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 "#,
         );
@@ -328,7 +328,7 @@ format = "ndjson"
 [[sources]]
 type = "file"
 path = "../data/v2.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 "#,
         );
@@ -378,7 +378,7 @@ sinks = "sinks"
 [[sources]]
 type = "file"
 path = "data/base.ndjson"
-stream = "syslog"
+stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]

@@ -141,24 +141,24 @@ fn window_decl(input: &mut &str) -> ModalResult<WindowSchema> {
     let mut time_field: Option<String> = None;
     let mut over: Option<Duration> = None;
     let mut fields: Option<Vec<FieldDef>> = None;
-    let mut has_stream = false;
+    let mut has_stream_tag = false;
 
     loop {
         ws_skip.parse_next(input)?;
         if opt(literal("}")).parse_next(input)?.is_some() {
             break;
         }
-        if let Some(s) = opt(stream_attr).parse_next(input)? {
-            if has_stream {
+        if let Some(s) = opt(stream_tag_attr).parse_next(input)? {
+            if has_stream_tag {
                 return Err(ErrMode::Cut(ContextError::new().add_context(
                     input,
                     &input.checkpoint(),
                     StrContext::Expected(StrContextValue::Description(
-                        "duplicate 'stream' attribute",
+                        "duplicate 'stream_tag' attribute",
                     )),
                 )));
             }
-            has_stream = true;
+            has_stream_tag = true;
             streams.extend(s);
         } else if let Some(t) = opt(time_attr).parse_next(input)? {
             if time_field.is_some() {
@@ -196,7 +196,7 @@ fn window_decl(input: &mut &str) -> ModalResult<WindowSchema> {
                 input,
                 &input.checkpoint(),
                 StrContext::Expected(StrContextValue::Description(
-                    "stream, time, over, or fields",
+                    "stream_tag, time, over, or fields",
                 )),
             )));
         }
@@ -224,9 +224,9 @@ fn window_decl(input: &mut &str) -> ModalResult<WindowSchema> {
 // Attributes
 // ---------------------------------------------------------------------------
 
-/// `stream = "name"` or `stream = ["a", "b"]`
-fn stream_attr(input: &mut &str) -> ModalResult<Vec<String>> {
-    literal("stream").parse_next(input)?;
+/// `stream_tag = "name"` or `stream_tag = ["a", "b"]`
+fn stream_tag_attr(input: &mut &str) -> ModalResult<Vec<String>> {
+    literal("stream_tag").parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal("="))
         .context(StrContext::Expected(StrContextValue::Description("'='")))

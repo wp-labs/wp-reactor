@@ -2,7 +2,7 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [0.1.29 Unreleased]
+## [0.1.30 Unreleased]
 
 ### Added
 
@@ -14,6 +14,14 @@ All notable changes to wp-reactor will be documented in this file.
 - **wf-engine**: Added runtime evaluation and alert export support for structured object and array values, including nested model values and deterministic JSON rendering for structured string output.
 - **wf-runtime**: Added UTF-8 storage bridging for structured `object` / `array` fields so structured source values can be serialized into intermediate pipeline windows.
 - **wf-runtime**: Rule bootstrap now surfaces source-aware WFL diagnostics for rule-file parse errors, semantic compile errors, and intermediate topology cycle errors.
+- **wf-lang**: Added explicit WFS window subscription syntax with `stream_tag = ...` and `stream_tag = [...]`.
+- **wf-runtime**: Added dynamic stream-tag routing for file NDJSON/CSV replay and external NDJSON sources via `stream_tag_field`, defaulting to `wp_stream_tag`.
+- **wf-runtime**: Added per-batch Arrow framed tag tracking so multiple Arrow frames received in one source batch are routed by their own frame tags.
+
+### Changed
+
+- **wf-config / wf-runtime**: Renamed fixed source routing from `stream` to `stream_tag`, and renamed the dynamic payload carrier option from `arrow_tag` to `stream_tag_field`.
+- **wf-config**: Relaxed source validation so NDJSON/CSV sources can use dynamic `stream_tag_field` routing without a fixed `stream_tag`, while `arrow_ipc` sources still require an explicit `stream_tag`.
 
 ### Fixed
 
@@ -24,11 +32,13 @@ All notable changes to wp-reactor will be documented in this file.
 - **wf-lang**: `array/float` and `mvappend` type checks now consistently allow digit/float element promotion.
 - **wf-lang**: Improved WFL diagnostic location selection for `yield` errors so repeated tokens in `match`, `entity`, and `yield` clauses point to the failing `yield` argument, including inline single-line rules.
 - **wf-runtime**: Structured pipeline values now fail fast on non-finite numeric values instead of silently serializing invalid JSON.
+- **wf-config tests**: Updated fusion config tests for `stream_tag` and made temporary test directories unique for parallel execution.
 
 ### Documentation
 
 - **User guide**: Documented WFS `object`, `array`, and `array/T` field types and WFL `object { ... }` / `array [ ... ]` structured output syntax.
 - **User guide**: Expanded the WFL language reference with current blank handling, current-time, time formatting/parsing, hash/encoding, stable ID, and multivalue function behavior.
+- **User guide / design docs**: Documented `stream_tag`, `stream_tag_field`, and the `wp_stream_tag` JSON/CSV carrier field across runtime configuration and WFS usage.
 
 ## [0.1.25] — 2026-07-02
 

@@ -123,7 +123,7 @@ M31 .wfg Parser+随机生成   ✅    M32 Rule-aware+Oracle+Verify ✅   M33 时
 | 项目 | 内容 |
 |------|------|
 | crate | `wf-core/window` |
-| 范围 | WindowRegistry：`windows: HashMap<String, Arc<RwLock<Window>>>`；订阅注册：扫描 WindowSchema 构建 `subscriptions: HashMap<String, Vec<Subscription>>`；多流联合支持（stream = ["syslog", "winlog"]） |
+| 范围 | WindowRegistry：`windows: HashMap<String, Arc<RwLock<Window>>>`；订阅注册：扫描 WindowSchema 构建 `subscriptions: HashMap<String, Vec<Subscription>>`；多流联合支持（stream_tag = ["syslog", "winlog"]） |
 | 依赖 | M08 |
 | 验收 | 单流路由 + 多流联合路由测试；Window 名称查询测试 |
 | 状态 | **已完成** — `wf-core/src/window/registry.rs` 实现 |

@@ -32,7 +32,7 @@ my-project/
 
 ```wfs
 window auth_events {
-    stream = "syslog"
+    stream_tag = "syslog"
     time = event_time
     over = 5m
 

@@ -12,7 +12,7 @@ Window 是 WFL 的数据抽象层，定义事件流的逻辑结构。
 
 ```wfs
 window <名称> {
-    stream = <数据流名>
+    stream_tag = <逻辑流 tag>
     time = <时间字段>
     over = <保留时长>
 
@@ -39,17 +39,17 @@ window <名称> {
 
 属性说明：
 
-- `stream`：数据流绑定；可省略，省略时该 window 只作为输出目标
+- `stream_tag`：数据流绑定；可省略，省略时该 window 只作为输出目标
 - `time`：事件时间字段；`over > 0` 时必填
 - `over`：保留时长；`0` 表示静态集合
 
-输入 window（包含 `stream = ...`）和 provider window 不允许声明 `object` / `array` / `array/T` 字段。若源数据里有 JSON object/array，先声明为 `chars` 接入；需要输出结构化对象或数组时，在 `yield` 中用 WFL 的 `object { ... }` / `array [ ... ]` 构造。
+输入 window（包含 `stream_tag = ...`）和 provider window 不允许声明 `object` / `array` / `array/T` 字段。若源数据里有 JSON object/array，先声明为 `chars` 接入；需要输出结构化对象或数组时，在 `yield` 中用 WFL 的 `object { ... }` / `array [ ... ]` 构造。
 
 带点字段名示例：
 
 ```wfs
 window endpoint_events {
-    stream = "endpoint"
+    stream_tag = "endpoint"
     time = event_time
     over = 10m
 
@@ -783,7 +783,7 @@ On Each 约束：
 
 Yield 约束：
 
-- 目标 window 必须存在且 `stream` 为空
+- 目标 window 必须存在且 `stream_tag` 为空
 - 字段须为目标 window 的子集
 - 禁止手工赋值系统字段
 - 中间目标图必须无环

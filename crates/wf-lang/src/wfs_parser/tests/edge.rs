@@ -135,8 +135,8 @@ window bad {
 fn reject_duplicate_stream_attr() {
     let input = r#"
 window bad {
-    stream = "a"
-    stream = "b"
+    stream_tag = "a"
+    stream_tag = "b"
     over = 0
     fields { x: chars }
 }

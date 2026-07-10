@@ -5,9 +5,9 @@
 //! `data_format` spec parameter) and shared Arrow decode helpers. This module
 //! wraps a `DataSource` behind the [`BatchSource`] trait, delegating format
 //! dispatch to the connector's decode functions while adding stream-tag
-//! extraction for `ArrowFramed` frames (warp-fusion uses the tag as the
-//! routing stream name).
+//! extraction for `ArrowFramed` frames and dynamic NDJSON payloads.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use arrow::array::StringArray;
@@ -15,8 +15,11 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use wf_connector_api::{BatchSource, SourceError, SourceReason, SourceResult};
+use wf_lang::WindowSchema;
 use wp_connector_api::{DataSource, SourceBatch};
 use wp_core_connectors::sources::batch::arrow::WireFormat;
+
+use crate::receiver::{normalize_stream_tag_field, resolve_stream_schema};
 
 /// Adapter wrapping a [`wp_connector_api::DataSource`] as a
 /// [`wf_connector_api::BatchSource`].
@@ -31,8 +34,12 @@ pub struct DataSourceBatchSource {
     inner: Box<dyn DataSource>,
     schema: SchemaRef,
     format: WireFormat,
-    /// Stream tag extracted from the last decoded `ArrowFramed` frame.
-    last_tag: Option<String>,
+    schemas: Arc<Vec<WindowSchema>>,
+    schema_cache: HashMap<String, SchemaRef>,
+    stream_tag_field: String,
+    dynamic_ndjson: bool,
+    /// Stream tags aligned with the batches returned by the last decode.
+    batch_tags: VecDeque<Option<String>>,
 }
 
 impl DataSourceBatchSource {
@@ -46,26 +53,39 @@ impl DataSourceBatchSource {
         inner: Box<dyn DataSource>,
         schema: SchemaRef,
         format: WireFormat,
+        schemas: Arc<Vec<WindowSchema>>,
+        stream_tag_field: impl Into<String>,
+        dynamic_ndjson: bool,
     ) -> Self {
         Self {
             id: id.into(),
             inner,
             schema,
             format,
-            last_tag: None,
+            schemas,
+            schema_cache: HashMap::new(),
+            stream_tag_field: stream_tag_field.into(),
+            dynamic_ndjson,
+            batch_tags: VecDeque::new(),
         }
     }
 
-    /// Stream tag from the last decoded `ArrowFramed` frame.
+    /// Stream tag for the next batch returned by the previous
+    /// [`receive_batch`](BatchSource::receive_batch) call.
     ///
-    /// Returns `None` for non-framed formats — callers should use the
-    /// configured `stream` param in that case.
-    pub fn last_stream_tag(&self) -> Option<&str> {
-        self.last_tag.as_deref()
+    /// Returns `None` for formats that do not carry a per-batch tag.
+    pub fn next_stream_tag(&mut self) -> Option<String> {
+        self.batch_tags.pop_front().flatten()
+    }
+
+    /// Peek at the next stream tag without consuming it.
+    pub fn pending_stream_tag(&self) -> Option<&str> {
+        self.batch_tags.front().and_then(|tag| tag.as_deref())
     }
 
     /// Convert a batch of raw events into zero or more `RecordBatch`es.
     fn convert(&mut self, events: SourceBatch) -> SourceResult<Vec<RecordBatch>> {
+        self.batch_tags.clear();
         if events.is_empty() {
             return Ok(vec![]);
         }
@@ -78,7 +98,10 @@ impl DataSourceBatchSource {
                         wp_core_connectors::sources::batch::payload::payload_to_string(&e.payload)
                     })
                     .collect();
-                // For NDJSON we can peek into the raw JSON to find machine_id.
+                if self.dynamic_ndjson {
+                    return self.convert_dynamic_ndjson(lines);
+                }
+
                 let json_machine_id = lines
                     .first()
                     .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -91,7 +114,10 @@ impl DataSourceBatchSource {
                     &lines,
                     &self.schema,
                 ) {
-                    Ok(Some(rb)) => Ok(vec![ensure_machine_id_column(rb, machine_id)]),
+                    Ok(Some(rb)) => {
+                        self.batch_tags.push_back(None);
+                        Ok(vec![ensure_machine_id_column(rb, machine_id)])
+                    }
                     Ok(None) => Ok(vec![]),
                     Err(e) => Err(SourceReason::Decode.err_detail(e)),
                 }
@@ -101,7 +127,10 @@ impl DataSourceBatchSource {
                     wp_core_connectors::sources::batch::arrow::decode_arrow_ipc_batches(&events)?;
                 Ok(batches
                     .into_iter()
-                    .map(|rb| ensure_machine_id_column(rb, &self.id))
+                    .map(|rb| {
+                        self.batch_tags.push_back(None);
+                        ensure_machine_id_column(rb, &self.id)
+                    })
                     .collect())
             }
             WireFormat::ArrowFramed => {
@@ -111,7 +140,7 @@ impl DataSourceBatchSource {
                     let bytes = event.payload.as_bytes();
                     match wp_arrow::ipc::decode_ipc(bytes) {
                         Ok(frame) => {
-                            self.last_tag = Some(frame.tag);
+                            self.batch_tags.push_back(Some(frame.tag));
                             batches.push(ensure_machine_id_column(frame.batch, &self.id));
                         }
                         Err(e) => {
@@ -122,6 +151,62 @@ impl DataSourceBatchSource {
                 Ok(batches)
             }
         }
+    }
+
+    fn convert_dynamic_ndjson(&mut self, lines: Vec<String>) -> SourceResult<Vec<RecordBatch>> {
+        let stream_tag_field = normalize_stream_tag_field(&self.stream_tag_field);
+        let mut lines_by_stream: HashMap<String, Vec<String>> = HashMap::new();
+        for (line_idx, line) in lines.into_iter().enumerate() {
+            let value: serde_json::Value = serde_json::from_str(&line).map_err(|e| {
+                SourceReason::Decode.err_detail(format!(
+                    "invalid NDJSON event at row {}: {}",
+                    line_idx + 1,
+                    e
+                ))
+            })?;
+            let stream = value
+                .as_object()
+                .and_then(|obj| obj.get(stream_tag_field))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    SourceReason::Decode.err_detail(format!(
+                        "invalid NDJSON event at row {}: missing string field `{}` for dynamic stream routing",
+                        line_idx + 1,
+                        stream_tag_field
+                    ))
+                })?;
+            lines_by_stream.entry(stream).or_default().push(line);
+        }
+
+        let mut batches = Vec::new();
+        for (stream, stream_lines) in lines_by_stream {
+            let schema = self.schema_for_stream(&stream)?;
+            match wp_core_connectors::sources::batch::ndjson::ndjson_to_record_batch(
+                &stream_lines,
+                &schema,
+            ) {
+                Ok(Some(rb)) => {
+                    self.batch_tags.push_back(Some(stream));
+                    batches.push(ensure_machine_id_column(rb, &self.id));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(SourceReason::Decode.err_detail(e)),
+            }
+        }
+        Ok(batches)
+    }
+
+    fn schema_for_stream(&mut self, stream: &str) -> SourceResult<SchemaRef> {
+        if let Some(schema) = self.schema_cache.get(stream) {
+            return Ok(Arc::clone(schema));
+        }
+        let schema = resolve_stream_schema(self.schemas.as_slice(), stream)
+            .map_err(|e| SourceReason::Decode.err_detail(e.to_string()))?;
+        self.schema_cache
+            .insert(stream.to_string(), Arc::clone(&schema));
+        Ok(schema)
     }
 }
 
@@ -190,6 +275,7 @@ mod tests {
     use arrow::ipc::writer::StreamWriter;
     use async_trait::async_trait;
     use std::sync::Arc;
+    use std::time::Duration;
     use wp_connector_api::{SourceEvent, Tags};
     use wp_model_core::raw::RawData;
 
@@ -225,6 +311,29 @@ mod tests {
         ]))
     }
 
+    fn empty_window_schemas() -> Arc<Vec<WindowSchema>> {
+        Arc::new(Vec::new())
+    }
+
+    fn stream_schema(name: &str, stream: &str) -> WindowSchema {
+        WindowSchema {
+            name: name.to_string(),
+            streams: vec![stream.to_string()],
+            time_field: None,
+            over: Duration::from_secs(3600),
+            fields: vec![
+                wf_lang::FieldDef {
+                    name: "msg".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Chars),
+                },
+                wf_lang::FieldDef {
+                    name: "n".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Digit),
+                },
+            ],
+        }
+    }
+
     fn ndjson_event(json: &str) -> SourceEvent {
         SourceEvent::new(
             0,
@@ -252,10 +361,53 @@ mod tests {
             ]],
             idx: 0,
         };
-        let mut bs = DataSourceBatchSource::new("nd", Box::new(src), schema(), WireFormat::Ndjson);
+        let mut bs = DataSourceBatchSource::new(
+            "nd",
+            Box::new(src),
+            schema(),
+            WireFormat::Ndjson,
+            empty_window_schemas(),
+            crate::receiver::DEFAULT_STREAM_TAG_FIELD,
+            false,
+        );
         let batches = bs.receive_batch().await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn ndjson_dynamic_stream_tag_field_decode() {
+        let src = VecSource {
+            id: "nd".into(),
+            batches: vec![vec![
+                ndjson_event(r#"{"wp_stream_tag":"a","msg":"a1","n":1}"#),
+                ndjson_event(r#"{"wp_stream_tag":"b","msg":"b1","n":2}"#),
+                ndjson_event(r#"{"wp_stream_tag":"a","msg":"a2","n":3}"#),
+            ]],
+            idx: 0,
+        };
+        let schemas = Arc::new(vec![
+            stream_schema("win_a", "a"),
+            stream_schema("win_b", "b"),
+        ]);
+        let mut bs = DataSourceBatchSource::new(
+            "nd",
+            Box::new(src),
+            Arc::new(Schema::empty()),
+            WireFormat::Ndjson,
+            schemas,
+            crate::receiver::DEFAULT_STREAM_TAG_FIELD,
+            true,
+        );
+
+        let batches = bs.receive_batch().await.unwrap();
+        assert_eq!(batches.len(), 2);
+        let mut routed: Vec<(String, usize)> = batches
+            .iter()
+            .map(|batch| (bs.next_stream_tag().unwrap(), batch.num_rows()))
+            .collect();
+        routed.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(routed, vec![("a".to_string(), 2), ("b".to_string(), 1)]);
     }
 
     #[tokio::test]
@@ -274,7 +426,15 @@ mod tests {
             batches: vec![vec![arrow_ipc_event(&rb)]],
             idx: 0,
         };
-        let mut bs = DataSourceBatchSource::new("ipc", Box::new(src), sc, WireFormat::ArrowStream);
+        let mut bs = DataSourceBatchSource::new(
+            "ipc",
+            Box::new(src),
+            sc,
+            WireFormat::ArrowStream,
+            empty_window_schemas(),
+            crate::receiver::DEFAULT_STREAM_TAG_FIELD,
+            false,
+        );
         let batches = bs.receive_batch().await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
@@ -307,11 +467,68 @@ mod tests {
             Box::new(src),
             Arc::new(Schema::empty()),
             WireFormat::ArrowFramed,
+            empty_window_schemas(),
+            crate::receiver::DEFAULT_STREAM_TAG_FIELD,
+            false,
         );
         let batches = bs.receive_batch().await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
-        assert_eq!(bs.last_stream_tag(), Some("syslog"));
+        assert_eq!(bs.pending_stream_tag(), Some("syslog"));
+        assert_eq!(bs.next_stream_tag().as_deref(), Some("syslog"));
+    }
+
+    #[tokio::test]
+    async fn arrow_framed_decode_tracks_tag_per_batch() {
+        let sc = schema();
+        let rb_a = RecordBatch::try_new(
+            sc.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let rb_b = RecordBatch::try_new(
+            sc.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["b"])),
+                Arc::new(Int64Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+        let src = VecSource {
+            id: "framed".into(),
+            batches: vec![vec![
+                SourceEvent::new(
+                    0,
+                    "test",
+                    RawData::Bytes(wp_arrow::ipc::encode_ipc("stream_a", &rb_a).unwrap().into()),
+                    Arc::new(Tags::new()),
+                ),
+                SourceEvent::new(
+                    0,
+                    "test",
+                    RawData::Bytes(wp_arrow::ipc::encode_ipc("stream_b", &rb_b).unwrap().into()),
+                    Arc::new(Tags::new()),
+                ),
+            ]],
+            idx: 0,
+        };
+        let mut bs = DataSourceBatchSource::new(
+            "framed",
+            Box::new(src),
+            Arc::new(Schema::empty()),
+            WireFormat::ArrowFramed,
+            empty_window_schemas(),
+            crate::receiver::DEFAULT_STREAM_TAG_FIELD,
+            false,
+        );
+
+        let batches = bs.receive_batch().await.unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(bs.next_stream_tag().as_deref(), Some("stream_a"));
+        assert_eq!(bs.next_stream_tag().as_deref(), Some("stream_b"));
     }
 
     #[tokio::test]
@@ -321,7 +538,15 @@ mod tests {
             batches: vec![],
             idx: 0,
         };
-        let mut bs = DataSourceBatchSource::new("eof", Box::new(src), schema(), WireFormat::Ndjson);
+        let mut bs = DataSourceBatchSource::new(
+            "eof",
+            Box::new(src),
+            schema(),
+            WireFormat::Ndjson,
+            empty_window_schemas(),
+            crate::receiver::DEFAULT_STREAM_TAG_FIELD,
+            false,
+        );
         let err = bs.receive_batch().await.unwrap_err();
         assert_eq!(err.reason(), &SourceReason::EOF);
     }

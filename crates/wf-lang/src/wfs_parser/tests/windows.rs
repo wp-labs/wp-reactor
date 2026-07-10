@@ -32,7 +32,7 @@ window ip_blocklist {
 fn parse_window_with_stream_and_time() {
     let input = r#"
 window auth_events {
-    stream = "auth"
+    stream_tag = "auth"
     time = event_time
     over = 30m
 
@@ -78,7 +78,7 @@ window security_alerts {
 fn parse_window_multi_stream() {
     let input = r#"
 window fw_events {
-    stream = ["firewall", "netflow"]
+    stream_tag = ["firewall", "netflow"]
     time = event_time
     over = 30m
     fields {
@@ -140,7 +140,7 @@ window alerts {
 fn parse_security_ws() {
     let input = r#"
 window auth_events {
-    stream = "auth"
+    stream_tag = "auth"
     time = event_time
     over = 30m
     fields {
@@ -156,7 +156,7 @@ window auth_events {
 }
 
 window fw_events {
-    stream = ["firewall", "netflow"]
+    stream_tag = ["firewall", "netflow"]
     time = event_time
     over = 30m
     fields {

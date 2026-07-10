@@ -130,7 +130,7 @@ tracing::info!(domain = "sys", schemas = 1, rules = 2, "engine bootstrap complet
 
 | 字段 | 类型 | 语义 |
 |------|------|------|
-| `stream` | `&str` | 数据流名称 |
+| `stream_tag` | `&str` | 数据流名称 |
 | `rule` | `&str` | 规则名称 |
 | `rows` | `usize` | batch 行数 |
 | `alerts` | `usize` | 本次产出告警数 |

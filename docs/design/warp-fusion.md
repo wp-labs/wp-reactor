@@ -75,7 +75,7 @@ WarpFusion 的核心抽象是 **Window**——它不是被动的缓冲区，而�
 ```
 三文件架构：.wfs (数据定义) → .wfl (检测逻辑) → .toml (物理参数)
 
-Window Schema (.wfs)  定义 stream 来源、字段 schema、over 时长
+Window Schema (.wfs)  定义 stream tag 来源、字段 schema、over 时长
 WFL Rule (.wfl)      引用 window 名称，定义 events/match/join/yield
 TOML Config (.toml)  定义 mode(local/replicated/partitioned)、max_bytes、over_cap
 ```
@@ -620,7 +620,7 @@ Router 负责将 batch 写入 Window 缓冲区并通过 Notify 唤醒 RuleTask�
 .wfs 定义:                             wfusion.toml 配置:
 ┌──────────────────────┐              ┌─────────────────────┐
 │ window auth_events { │              │ [window.auth_events] │
-│   stream = "syslog"  │              │ mode = "local"       │
+│   stream_tag = "syslog"  │              │ mode = "local"       │
 │   time = event_time  │              │ over_cap = "30m"     │
 │   over = 5m          │              └──────────┬──────────┘
 │   fields { ... }     │                         │
@@ -1209,7 +1209,7 @@ file = "logs/wf-engine.log"                    # 日志文件路径
 
 | 层级 | 文件 | 内容 | 示例 |
 |------|------|------|------|
-| 数据定义 | `.wfs` | stream 来源、time 字段、over 时长、字段 schema | `over = 5m` |
+| 数据定义 | `.wfs` | stream tag 来源、time 字段、over 时长、字段 schema | `over = 5m` |
 | 检测逻辑 | `.wfl` | 事件绑定、模式匹配、条件、输出 | `yield security_alerts (...)` |
 | 物理约束 | `.toml` | mode、max_bytes、over_cap、watermark | `watermark = "5s"` |
 | 变量替换 | `.toml [vars]` | WFL `$VAR` 替换值（也支持环境变量回退） | `FAIL_THRESHOLD = "3"` |
@@ -1234,7 +1234,7 @@ WFL 规则中的数据源名称引用 **Window Schema (.wfs) 中定义的 window
 
 ```wfs
 window auth_events {
-    stream = "syslog"
+    stream_tag = "syslog"
     time = event_time
     over = 5m
 

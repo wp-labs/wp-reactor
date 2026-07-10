@@ -53,7 +53,7 @@ Window 是 WarpFusion 的核心抽象。它不是一个被动的缓冲区，而�
 
 ```wfs
 window auth_events {
-    stream = "syslog"       # 订阅的数据流
+    stream_tag = "syslog"       # 订阅的数据流
     time = event_time       # 事件时间字段
     over = 5m               # 数据保留时长
 
@@ -67,11 +67,11 @@ window auth_events {
 ```
 
 每个 Window 回答三个问题：
-- **数据从哪来**：`stream` 声明订阅的数据流，支持多 stream
+- **数据从哪来**：`stream_tag` 声明订阅的逻辑流 tag，支持多 stream tag
 - **数据保留多久**：`over` 定义窗口时间跨度。`over = 0` 表示静态集合（不入队，类似快照表）
 - **字段长什么样**：`fields` 定义 schema，输入字段使用 scalar 类型（`chars`、`digit`、`float`、`bool`、`time`、`ip`、`hex`）；输出和中间 window 还可以使用 `object`、`array`、`array/T` 承载结构化结果
 
-一个 Stream 可以被多个 Window 订阅。例如 `syslog` 流可以同时被 `auth_events`（5 分钟窗口）和 `auth_stats`（1 小时窗口）订阅，各自独立维护数据。
+一个 stream tag 可以被多个 Window 订阅。例如 `syslog` 可以同时被 `auth_events`（5 分钟窗口）和 `auth_stats`（1 小时窗口）订阅，各自独立维护数据。
 
 ### 3.2 事件时间与 Watermark
 
