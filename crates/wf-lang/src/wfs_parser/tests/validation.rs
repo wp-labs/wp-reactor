@@ -1,4 +1,4 @@
-use super::super::parse_wfs;
+use super::super::{parse_static_wfs, parse_wfs};
 
 // -----------------------------------------------------------------------
 // Semantic validation errors
@@ -72,4 +72,91 @@ window static_table {
     let schemas = parse_wfs(input).unwrap();
     assert_eq!(schemas.len(), 1);
     assert!(schemas[0].time_field.is_none());
+}
+
+#[test]
+fn reject_structured_object_field_in_stream_window() {
+    let input = r#"
+window events {
+    stream = "auth"
+    over = 0
+    fields {
+        ctx: object
+    }
+}
+"#;
+    let err = parse_wfs(input).unwrap_err();
+    assert!(err.to_string().contains("input object/array fields"));
+}
+
+#[test]
+fn reject_structured_array_field_in_stream_window() {
+    let input = r#"
+window events {
+    stream = "auth"
+    over = 0
+    fields {
+        tags: array
+    }
+}
+"#;
+    let err = parse_wfs(input).unwrap_err();
+    assert!(err.to_string().contains("input object/array fields"));
+}
+
+#[test]
+fn reject_typed_array_field_in_stream_window() {
+    let input = r#"
+window events {
+    stream = "auth"
+    over = 0
+    fields {
+        ports: array/digit
+    }
+}
+"#;
+    let err = parse_wfs(input).unwrap_err();
+    assert!(err.to_string().contains("input object/array fields"));
+}
+
+#[test]
+fn reject_structured_field_in_provider_window() {
+    let input = r#"
+window<provider> ip_reputation {
+    fields {
+        metadata: object
+    }
+}
+"#;
+    let err = parse_static_wfs(input).unwrap_err();
+    assert!(err.to_string().contains("input object/array fields"));
+}
+
+#[test]
+fn reject_structured_provider_field_through_flow_schema_entrypoint() {
+    let input = r#"
+window<provider> ip_reputation {
+    fields {
+        metadata: array
+    }
+}
+"#;
+    let err = parse_wfs(input).unwrap_err();
+    assert!(err.to_string().contains("input object/array fields"));
+}
+
+#[test]
+fn accept_structured_fields_in_yield_only_window() {
+    let input = r#"
+window alerts {
+    over = 0
+    fields {
+        ctx: object
+        tags: array
+        scores: array/float
+    }
+}
+"#;
+    let schemas = parse_wfs(input).unwrap();
+    assert_eq!(schemas.len(), 1);
 }

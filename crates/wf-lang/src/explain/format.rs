@@ -1,4 +1,5 @@
 use crate::ast::{BinOp, CmpOp, Expr, FieldRef, FieldSelector, Measure, SystemVar, Transform};
+use crate::schema::{BaseType, FieldType};
 
 // ---------------------------------------------------------------------------
 // Expression formatting
@@ -46,6 +47,26 @@ pub fn format_expr(expr: &Expr) -> String {
             let kw = if *negated { "not in" } else { "in" };
             format!("{} {} ({})", format_expr(inner), kw, items)
         }
+        Expr::Object(items) => {
+            let items = items
+                .iter()
+                .map(|item| {
+                    let targets = item.targets.join(", ");
+                    let type_hint = item
+                        .type_hint
+                        .as_ref()
+                        .map(|ty| format!(": {}", format_field_type(ty)))
+                        .unwrap_or_default();
+                    format!("{}{} = {}", targets, type_hint, format_expr(&item.value))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("object {{ {} }}", items)
+        }
+        Expr::Array(items) => {
+            let items = items.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            format!("array [{}]", items)
+        }
         Expr::IfThenElse {
             cond,
             then_expr,
@@ -58,6 +79,27 @@ pub fn format_expr(expr: &Expr) -> String {
                 format_expr(else_expr)
             )
         }
+    }
+}
+
+fn format_field_type(field_type: &FieldType) -> String {
+    match field_type {
+        FieldType::Base(base) => format_base_type(base).to_string(),
+        FieldType::ArrayAny => "array".to_string(),
+        FieldType::Array(base) => format!("array/{}", format_base_type(base)),
+        FieldType::Object => "object".to_string(),
+    }
+}
+
+fn format_base_type(base: &BaseType) -> &'static str {
+    match base {
+        BaseType::Chars => "chars",
+        BaseType::Digit => "digit",
+        BaseType::Float => "float",
+        BaseType::Bool => "bool",
+        BaseType::Time => "time",
+        BaseType::Ip => "ip",
+        BaseType::Hex => "hex",
     }
 }
 

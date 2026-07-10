@@ -2,7 +2,7 @@ use crate::ast::{Expr, FieldRef};
 use crate::schema::BaseType;
 
 use super::infer::infer_type;
-use super::{ValType, compatible, is_numeric, is_orderable};
+use super::{ValType, compatible, is_numeric, is_orderable, unify_array_element_type};
 use crate::checker::scope::Scope;
 use crate::checker::{CheckError, Severity};
 
@@ -20,6 +20,24 @@ fn is_stable_id_value_type(t: &ValType) -> bool {
         ) | ValType::Bool
             | ValType::Numeric
     )
+}
+
+fn is_array_like(t: &ValType) -> bool {
+    matches!(
+        t,
+        ValType::Array(_) | ValType::ArrayAny | ValType::EmptyArray
+    )
+}
+
+fn unify_mvappend_element_type(existing: &ValType, incoming: &ValType) -> Option<ValType> {
+    match (existing, incoming) {
+        (ValType::ArrayAny, _) | (_, ValType::ArrayAny) => Some(ValType::ArrayAny),
+        (ValType::Base(left), ValType::Base(right)) => {
+            unify_array_element_type(left, right).map(ValType::Base)
+        }
+        _ if compatible(existing, incoming) => Some(existing.clone()),
+        _ => None,
+    }
 }
 
 pub fn check_func_call(
@@ -1000,7 +1018,7 @@ pub fn check_func_call(
                     message: "mvcount() requires exactly 1 argument".to_string(),
                 });
             } else if let Some(t) = infer_type(&args[0], scope)
-                && !matches!(t, ValType::Array(_))
+                && !is_array_like(&t)
             {
                 errors.push(CheckError {
                     severity: Severity::Error,
@@ -1024,7 +1042,7 @@ pub fn check_func_call(
                 });
             } else {
                 if let Some(t) = infer_type(&args[0], scope)
-                    && !matches!(t, ValType::Array(_))
+                    && !is_array_like(&t)
                 {
                     errors.push(CheckError {
                         severity: Severity::Error,
@@ -1091,7 +1109,7 @@ pub fn check_func_call(
                     message: "mvdedup() requires exactly 1 argument".to_string(),
                 });
             } else if let Some(t) = infer_type(&args[0], scope)
-                && !matches!(t, ValType::Array(_))
+                && !is_array_like(&t)
             {
                 errors.push(CheckError {
                     severity: Severity::Error,
@@ -1113,7 +1131,7 @@ pub fn check_func_call(
                     message: format!("{}() requires exactly 1 argument", name),
                 });
             } else if let Some(t) = infer_type(&args[0], scope)
-                && !matches!(t, ValType::Array(_))
+                && !is_array_like(&t)
             {
                 errors.push(CheckError {
                     severity: Severity::Error,
@@ -1137,18 +1155,30 @@ pub fn check_func_call(
                             .to_string(),
                 });
             } else {
-                if let Some(t) = infer_type(&args[0], scope)
-                    && !matches!(t, ValType::Array(_))
-                {
-                    errors.push(CheckError {
-                        severity: Severity::Error,
-                        rule: Some(rule_name.to_string()),
-                        test: None,
-                        message: format!(
-                            "mvindex() first argument must be an array expression, got {:?}",
-                            t
-                        ),
-                    });
+                if let Some(t) = infer_type(&args[0], scope) {
+                    if !is_array_like(&t) {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "mvindex() first argument must be an array expression, got {:?}",
+                                t
+                            ),
+                        });
+                    } else if args.len() == 2
+                        && matches!(t, ValType::ArrayAny | ValType::EmptyArray)
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "mvindex() cannot infer scalar result type from {:?}; use a typed array or the 3-argument slice form",
+                                t
+                            ),
+                        });
+                    }
                 }
                 if let Some(t) = infer_type(&args[1], scope)
                     && !is_numeric(&t)
@@ -1195,6 +1225,8 @@ pub fn check_func_call(
                     };
                     let arg_element_type = match inferred {
                         ValType::Array(bt) | ValType::Base(bt) => ValType::Base(bt),
+                        ValType::ArrayAny => ValType::ArrayAny,
+                        ValType::EmptyArray => continue,
                         ValType::Bool => ValType::Base(BaseType::Bool),
                         other => {
                             errors.push(CheckError {
@@ -1211,7 +1243,11 @@ pub fn check_func_call(
                         }
                     };
                     if let Some(existing) = &element_type {
-                        if !compatible(existing, &arg_element_type) {
+                        if let Some(unified) =
+                            unify_mvappend_element_type(existing, &arg_element_type)
+                        {
+                            element_type = Some(unified);
+                        } else {
                             errors.push(CheckError {
                                 severity: Severity::Error,
                                 rule: Some(rule_name.to_string()),

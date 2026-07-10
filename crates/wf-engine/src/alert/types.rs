@@ -10,6 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use wf_lang::{BaseType, FieldType};
 use wp_model_core::model::{
     DataRecord, DataType, DateTimeValue, Field, FieldStorage, HexT, Value as ModelValue,
+    types::value::ObjectValue,
 };
 
 use crate::error::{CoreReason, CoreResult};
@@ -271,10 +272,9 @@ fn export_yield_value(
     field_type: Option<&FieldType>,
 ) -> CoreResult<(DataType, ModelValue)> {
     match field_type {
-        Some(FieldType::Array(_)) => Ok((
-            DataType::Chars,
-            ModelValue::from(array_json_string(value)?.as_str()),
-        )),
+        Some(FieldType::ArrayAny) => export_array_value(value, "auto"),
+        Some(FieldType::Array(base_type)) => export_typed_array_value(value, base_type),
+        Some(FieldType::Object) => export_object_value(value),
         Some(FieldType::Base(base_type)) => export_typed_value(base_type, value),
         None => export_untyped_value(value),
     }
@@ -329,10 +329,8 @@ fn export_untyped_value(value: &Value) -> CoreResult<(DataType, ModelValue)> {
         Value::Number(n) if n.is_finite() => Ok((DataType::Float, ModelValue::from(*n))),
         Value::Bool(b) => Ok((DataType::Bool, ModelValue::from(*b))),
         Value::Str(s) => Ok((DataType::Chars, ModelValue::from(s.as_str()))),
-        Value::Array(_) => Ok((
-            DataType::Chars,
-            ModelValue::from(array_json_string(value)?.as_str()),
-        )),
+        Value::Array(_) => export_array_value(value, "auto"),
+        Value::Object(_) => export_object_value(value),
         _ => CoreReason::DataFormat
             .to_err()
             .with_detail("unsupported untyped yield value")
@@ -345,14 +343,21 @@ fn render_value_as_string(value: &Value) -> CoreResult<String> {
         Value::Str(s) => Ok(s.clone()),
         Value::Number(n) => Ok(n.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
-        Value::Array(_) => array_json_string(value),
+        Value::Array(_) | Value::Object(_) => structured_json_string(value),
     }
 }
 
-fn array_json_string(value: &Value) -> CoreResult<String> {
+fn export_array_value(value: &Value, item_type: &str) -> CoreResult<(DataType, ModelValue)> {
     match value {
-        Value::Array(_) => serde_json::to_string(&rule_value_to_json(value))
-            .source_err(CoreReason::DataFormat, "serialize array yield value"),
+        Value::Array(items) => Ok((
+            DataType::Array(item_type.to_string()),
+            ModelValue::Array(
+                items
+                    .iter()
+                    .map(rule_value_to_array_item_storage)
+                    .collect::<CoreResult<Vec<_>>>()?,
+            ),
+        )),
         _ => CoreReason::DataFormat
             .to_err()
             .with_detail("array export expects an array value")
@@ -360,13 +365,150 @@ fn array_json_string(value: &Value) -> CoreResult<String> {
     }
 }
 
-fn rule_value_to_json(value: &Value) -> serde_json::Value {
+fn export_typed_array_value(
+    value: &Value,
+    base_type: &BaseType,
+) -> CoreResult<(DataType, ModelValue)> {
     match value {
-        Value::Number(n) => serde_json::Value::from(*n),
-        Value::Str(s) => serde_json::Value::from(s.clone()),
-        Value::Bool(b) => serde_json::Value::from(*b),
-        Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(rule_value_to_json).collect())
+        Value::Array(items) => Ok((
+            DataType::Array(base_type_name(base_type).to_string()),
+            ModelValue::Array(
+                items
+                    .iter()
+                    .map(|item| rule_value_to_typed_field_storage("item", base_type, item))
+                    .collect::<CoreResult<Vec<_>>>()?,
+            ),
+        )),
+        _ => CoreReason::DataFormat
+            .to_err()
+            .with_detail("array export expects an array value")
+            .err(),
+    }
+}
+
+fn export_object_value(value: &Value) -> CoreResult<(DataType, ModelValue)> {
+    match value {
+        Value::Object(items) => Ok((DataType::Obj, ModelValue::Obj(rule_object_to_model(items)?))),
+        _ => CoreReason::DataFormat
+            .to_err()
+            .with_detail("object export expects an object value")
+            .err(),
+    }
+}
+
+fn structured_json_string(value: &Value) -> CoreResult<String> {
+    match value {
+        Value::Array(_) | Value::Object(_) => serde_json::to_string(&rule_value_to_json(value)?)
+            .source_err(CoreReason::DataFormat, "serialize structured yield value"),
+        _ => CoreReason::DataFormat
+            .to_err()
+            .with_detail("structured string rendering expects an array or object value")
+            .err(),
+    }
+}
+
+fn rule_value_to_named_field_storage(name: &str, value: &Value) -> CoreResult<FieldStorage> {
+    let (meta, model_value) = rule_value_to_model_value(value)?;
+    Ok(FieldStorage::from_owned(Field::new(
+        meta,
+        name,
+        model_value,
+    )))
+}
+
+fn rule_value_to_array_item_storage(value: &Value) -> CoreResult<FieldStorage> {
+    rule_value_to_named_field_storage("item", value)
+}
+
+fn rule_value_to_typed_field_storage(
+    name: &str,
+    base_type: &BaseType,
+    value: &Value,
+) -> CoreResult<FieldStorage> {
+    let (meta, model_value) = export_typed_array_item_value(base_type, value)?;
+    Ok(FieldStorage::from_owned(Field::new(
+        meta,
+        name,
+        model_value,
+    )))
+}
+
+fn export_typed_array_item_value(
+    base_type: &BaseType,
+    value: &Value,
+) -> CoreResult<(DataType, ModelValue)> {
+    match base_type {
+        BaseType::Chars => match value {
+            Value::Str(s) => Ok((DataType::Chars, ModelValue::from(s.as_str()))),
+            _ => CoreReason::DataFormat
+                .to_err()
+                .with_detail("array/chars field requires string elements")
+                .err(),
+        },
+        _ => export_typed_value(base_type, value),
+    }
+}
+
+fn rule_value_to_model_value(value: &Value) -> CoreResult<(DataType, ModelValue)> {
+    match value {
+        Value::Number(n) if n.is_finite() && n.fract() == 0.0 => {
+            Ok((DataType::Digit, ModelValue::from(*n as i64)))
+        }
+        Value::Number(n) if n.is_finite() => Ok((DataType::Float, ModelValue::from(*n))),
+        Value::Str(s) => Ok((DataType::Chars, ModelValue::from(s.as_str()))),
+        Value::Bool(b) => Ok((DataType::Bool, ModelValue::from(*b))),
+        Value::Array(items) => Ok((
+            DataType::Array("auto".to_string()),
+            ModelValue::Array(
+                items
+                    .iter()
+                    .map(rule_value_to_array_item_storage)
+                    .collect::<CoreResult<Vec<_>>>()?,
+            ),
+        )),
+        Value::Object(items) => Ok((DataType::Obj, ModelValue::Obj(rule_object_to_model(items)?))),
+        Value::Number(_) => CoreReason::DataFormat
+            .to_err()
+            .with_detail("structured numeric value must be finite")
+            .err(),
+    }
+}
+
+fn rule_object_to_model(
+    items: &std::collections::HashMap<String, Value>,
+) -> CoreResult<ObjectValue> {
+    let mut object = ObjectValue::new();
+    for (key, value) in items {
+        object.insert(key.as_str(), rule_value_to_named_field_storage(key, value)?);
+    }
+    Ok(object)
+}
+
+fn rule_value_to_json(value: &Value) -> CoreResult<serde_json::Value> {
+    match value {
+        Value::Number(n) if n.is_finite() => Ok(serde_json::Value::from(*n)),
+        Value::Number(_) => CoreReason::DataFormat
+            .to_err()
+            .with_detail("structured numeric value must be finite")
+            .err(),
+        Value::Str(s) => Ok(serde_json::Value::from(s.clone())),
+        Value::Bool(b) => Ok(serde_json::Value::from(*b)),
+        Value::Array(items) => Ok(serde_json::Value::Array(
+            items
+                .iter()
+                .map(rule_value_to_json)
+                .collect::<CoreResult<Vec<_>>>()?,
+        )),
+        Value::Object(items) => {
+            let mut object = serde_json::Map::new();
+            let mut keys: Vec<_> = items.keys().collect();
+            keys.sort();
+            for key in keys {
+                if let Some(value) = items.get(key) {
+                    object.insert(key.clone(), rule_value_to_json(value)?);
+                }
+            }
+            Ok(serde_json::Value::Object(object))
         }
     }
 }
@@ -378,7 +520,30 @@ fn model_value_to_json(value: &ModelValue) -> serde_json::Value {
         ModelValue::Chars(v) => serde_json::Value::from(v.to_string()),
         ModelValue::Float(v) => serde_json::Value::from(*v),
         ModelValue::Digit(v) => serde_json::Value::from(*v),
+        ModelValue::Obj(v) => serde_json::Value::Object(
+            v.iter()
+                .map(|(key, field)| (key.to_string(), model_value_to_json(field.get_value())))
+                .collect(),
+        ),
+        ModelValue::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|field| model_value_to_json(field.get_value()))
+                .collect(),
+        ),
         other => serde_json::Value::from(other.to_string()),
+    }
+}
+
+fn base_type_name(base_type: &BaseType) -> &'static str {
+    match base_type {
+        BaseType::Digit => "digit",
+        BaseType::Float => "float",
+        BaseType::Bool => "bool",
+        BaseType::Chars => "chars",
+        BaseType::Time => "time",
+        BaseType::Ip => "ip",
+        BaseType::Hex => "hex",
     }
 }
 
@@ -476,12 +641,30 @@ mod tests {
                 ("count".into(), Value::Number(3.0)),
                 (
                     "items".into(),
-                    Value::Array(vec![Value::Str("a".into()), Value::Number(2.0)]),
+                    Value::Array(vec![Value::Str("a".into()), Value::Str("b".into())]),
+                ),
+                (
+                    "risk_context".into(),
+                    Value::Object(
+                        [
+                            ("score".into(), Value::Number(70.5)),
+                            (
+                                "tags".into(),
+                                Value::Array(vec![
+                                    Value::Str("bruteforce".into()),
+                                    Value::Str("ssh".into()),
+                                ]),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
                 ),
             ],
             yield_field_types: vec![
                 ("count".into(), FieldType::Base(BaseType::Digit)),
                 ("items".into(), FieldType::Array(BaseType::Chars)),
+                ("risk_context".into(), FieldType::Object),
             ],
             event_time_nanos: 0,
             machine_id: String::new(),
@@ -498,14 +681,24 @@ mod tests {
             Some(&ModelValue::from("timeout"))
         );
         assert_eq!(record.get_value("count"), Some(&ModelValue::from(3_i64)));
-        assert_eq!(
+        assert!(matches!(
             record.get_value("items"),
-            Some(&ModelValue::from("[\"a\",2.0]"))
-        );
+            Some(ModelValue::Array(_))
+        ));
+        assert!(matches!(
+            record.get_value("risk_context"),
+            Some(ModelValue::Obj(_))
+        ));
 
         let json = data_record_to_json_string(&record).expect("json");
-        assert!(json.contains("\"__wfu_rule_name\":\"rule-a\""));
-        assert!(json.contains("\"items\":\"[\\\"a\\\",2.0]\""));
+        let json: serde_json::Value = serde_json::from_str(&json).expect("json value");
+        assert_eq!(json["__wfu_rule_name"], "rule-a");
+        assert_eq!(json["items"], serde_json::json!(["a", "b"]));
+        assert_eq!(json["risk_context"]["score"], 70.5);
+        assert_eq!(
+            json["risk_context"]["tags"],
+            serde_json::json!(["bruteforce", "ssh"])
+        );
     }
 
     #[test]
@@ -533,6 +726,164 @@ mod tests {
             .to_data_record()
             .expect_err("reserved prefix should fail");
         assert!(err.to_string().contains(WFU_PREFIX));
+    }
+
+    #[test]
+    fn data_record_json_keeps_non_json_chars_as_strings() {
+        let mut record = DataRecord::default();
+        let mut exported = HashSet::new();
+        append_field(
+            &mut record,
+            &mut exported,
+            "text",
+            DataType::Chars,
+            ModelValue::from("{not-json}"),
+        )
+        .unwrap();
+        append_field(
+            &mut record,
+            &mut exported,
+            "json_array_text",
+            DataType::Chars,
+            ModelValue::from("[]"),
+        )
+        .unwrap();
+        append_field(
+            &mut record,
+            &mut exported,
+            "json_object_text",
+            DataType::Chars,
+            ModelValue::from(r#"{"raw":true}"#),
+        )
+        .unwrap();
+        append_field(
+            &mut record,
+            &mut exported,
+            "plain_array_text",
+            DataType::Chars,
+            ModelValue::from("[not-json]"),
+        )
+        .unwrap();
+
+        let json = data_record_to_json_string(&record).expect("json");
+        let json: serde_json::Value = serde_json::from_str(&json).expect("json value");
+
+        assert_eq!(json["text"], "{not-json}");
+        assert_eq!(json["json_array_text"], "[]");
+        assert_eq!(json["json_object_text"], r#"{"raw":true}"#);
+        assert_eq!(json["plain_array_text"], "[not-json]");
+    }
+
+    #[test]
+    fn structured_object_string_rendering_sorts_keys() {
+        let value = Value::Object(
+            [
+                ("z".into(), Value::Str("last".into())),
+                ("a".into(), Value::Str("first".into())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let rendered = structured_json_string(&value).expect("json string");
+        assert_eq!(rendered, r#"{"a":"first","z":"last"}"#);
+    }
+
+    #[test]
+    fn to_data_record_rejects_typed_array_element_mismatch() {
+        let output = OutputRecord {
+            wfx_id: "id-1".into(),
+            rule_name: "rule-a".into(),
+            score: 1.0,
+            entity_type: "ip".into(),
+            entity_id: "1.1.1.1".into(),
+            origin: AlertOrigin::Event,
+            fired_at: "2026-03-11T00:00:00.000Z".into(),
+            emit_time: "2026-03-11T00:00:01.000Z".into(),
+            matched_rows: vec![],
+            summary: "demo".into(),
+            yield_target: "out".into(),
+            yield_fields: vec![(
+                "scores".into(),
+                Value::Array(vec![Value::Number(1.0), Value::Str("high".into())]),
+            )],
+            yield_field_types: vec![("scores".into(), FieldType::Array(BaseType::Float))],
+            event_time_nanos: 0,
+            machine_id: String::new(),
+            scope_key: String::new(),
+        };
+
+        let err = output
+            .to_data_record()
+            .expect_err("typed array element mismatch should fail");
+        assert!(err.to_string().contains("float field requires"));
+    }
+
+    #[test]
+    fn to_data_record_rejects_array_chars_non_string_element() {
+        let output = OutputRecord {
+            wfx_id: "id-1".into(),
+            rule_name: "rule-a".into(),
+            score: 1.0,
+            entity_type: "ip".into(),
+            entity_id: "1.1.1.1".into(),
+            origin: AlertOrigin::Event,
+            fired_at: "2026-03-11T00:00:00.000Z".into(),
+            emit_time: "2026-03-11T00:00:01.000Z".into(),
+            matched_rows: vec![],
+            summary: "demo".into(),
+            yield_target: "out".into(),
+            yield_fields: vec![(
+                "tags".into(),
+                Value::Array(vec![Value::Str("ssh".into()), Value::Number(22.0)]),
+            )],
+            yield_field_types: vec![("tags".into(), FieldType::Array(BaseType::Chars))],
+            event_time_nanos: 0,
+            machine_id: String::new(),
+            scope_key: String::new(),
+        };
+
+        let err = output
+            .to_data_record()
+            .expect_err("array/chars should reject non-string elements");
+        assert!(err.to_string().contains("array/chars"));
+    }
+
+    #[test]
+    fn to_data_record_rejects_non_finite_number_inside_structured_value() {
+        let output = OutputRecord {
+            wfx_id: "id-1".into(),
+            rule_name: "rule-a".into(),
+            score: 1.0,
+            entity_type: "ip".into(),
+            entity_id: "1.1.1.1".into(),
+            origin: AlertOrigin::Event,
+            fired_at: "2026-03-11T00:00:00.000Z".into(),
+            emit_time: "2026-03-11T00:00:01.000Z".into(),
+            matched_rows: vec![],
+            summary: "demo".into(),
+            yield_target: "out".into(),
+            yield_fields: vec![(
+                "risk_context".into(),
+                Value::Object(
+                    [("score".into(), Value::Number(f64::NAN))]
+                        .into_iter()
+                        .collect(),
+                ),
+            )],
+            yield_field_types: vec![("risk_context".into(), FieldType::Object)],
+            event_time_nanos: 0,
+            machine_id: String::new(),
+            scope_key: String::new(),
+        };
+
+        let err = output
+            .to_data_record()
+            .expect_err("non-finite structured number should fail");
+        assert!(
+            err.to_string()
+                .contains("structured numeric value must be finite")
+        );
     }
 
     #[test]

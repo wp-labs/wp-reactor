@@ -850,6 +850,57 @@ rule r {
 }
 
 #[test]
+fn mv_functions_accept_array_any_and_empty_array_literals() {
+    use crate::schema::FieldType;
+    let out = make_output_window(
+        "out",
+        vec![
+            ("n", bt(BaseType::Digit)),
+            ("joined", bt(BaseType::Chars)),
+            ("uniq", FieldType::ArrayAny),
+            ("sorted", FieldType::ArrayAny),
+            ("reversed", FieldType::ArrayAny),
+            ("slice", FieldType::ArrayAny),
+            ("appended", FieldType::ArrayAny),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        n = mvcount(array []),
+        joined = mvjoin(array ["ssh", 22, e.action], ","),
+        uniq = mvdedup(array ["ssh", 22, e.action]),
+        sorted = mvsort(array ["ssh", 22, e.action]),
+        reversed = mvreverse(array ["ssh", 22, e.action]),
+        slice = mvindex(array ["ssh", 22, e.action], 0, 1),
+        appended = mvappend(array ["ssh", 22], e.action)
+    )
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn mvindex_rejects_scalar_pick_from_array_any_literal() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = mvindex(array ["ssh", 22], 0))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "cannot infer scalar result type",
+    );
+}
+
+#[test]
 fn mvappend_valid() {
     use crate::schema::FieldType;
     let out = make_output_window(
@@ -865,6 +916,30 @@ rule r {
     match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
     entity(ip, e.sip)
     yield out (vals = mvappend(collect_list(e.action), "tail"))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn mvappend_promotes_digit_and_float_elements() {
+    use crate::schema::FieldType;
+    let out = make_output_window(
+        "out",
+        vec![
+            ("scalar_vals", FieldType::Array(BaseType::Float)),
+            ("array_vals", FieldType::Array(BaseType::Float)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        scalar_vals = mvappend(1.5, 2),
+        array_vals = mvappend(array [1, 1.5], 2)
+    )
 }
 "#;
     assert_no_errors(input, &[auth_events_window(), out]);

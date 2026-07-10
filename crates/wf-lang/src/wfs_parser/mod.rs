@@ -7,7 +7,7 @@ use winnow::error::{AddContext, ContextError, ErrMode, StrContext, StrContextVal
 use winnow::prelude::*;
 use winnow::token::literal;
 
-mod primitives;
+pub(crate) mod primitives;
 mod validate;
 
 use crate::parse_utils::{ident, quoted_string, ws_skip};
@@ -38,18 +38,20 @@ pub fn parse_static_wfs(input: &str) -> LangResult<Vec<StaticWindowSchema>> {
             .to_err()
             .with_detail(format!("parse error: {e}"))
     })?;
+    validate::validate_static_schemas(&schemas)?;
     Ok(schemas)
 }
 
 pub fn parse_wfs(input: &str) -> LangResult<Vec<WindowSchema>> {
-    let windows: Vec<WindowSchema> = wfs_file.parse(input).map_err(|e| {
+    let parsed = wfs_file.parse(input).map_err(|e| {
         LangReason::Parse
             .to_err()
             .with_detail(format!("parse error: {e}"))
     })?;
 
-    validate::validate_schemas(&windows)?;
-    Ok(windows)
+    validate::validate_static_schemas(&parsed.static_windows)?;
+    validate::validate_schemas(&parsed.windows)?;
+    Ok(parsed.windows)
 }
 
 // ---------------------------------------------------------------------------
@@ -63,9 +65,15 @@ fn wfs_file_static(input: &mut &str) -> ModalResult<Vec<StaticWindowSchema>> {
     Ok(schemas)
 }
 
-fn wfs_file(input: &mut &str) -> ModalResult<Vec<WindowSchema>> {
+struct ParsedWfs {
+    windows: Vec<WindowSchema>,
+    static_windows: Vec<StaticWindowSchema>,
+}
+
+fn wfs_file(input: &mut &str) -> ModalResult<ParsedWfs> {
     ws_skip.parse_next(input)?;
     let mut windows = Vec::new();
+    let mut static_windows = Vec::new();
     loop {
         ws_skip.parse_next(input)?;
         if input.is_empty() {
@@ -80,11 +88,15 @@ fn wfs_file(input: &mut &str) -> ModalResult<Vec<WindowSchema>> {
         *input = saved;
         if let Ok(sw) = static_window_decl.parse_next(&mut *input) {
             windows.push(sw.to_flow_schema());
+            static_windows.push(sw);
             continue;
         }
         break;
     }
-    Ok(windows)
+    Ok(ParsedWfs {
+        windows,
+        static_windows,
+    })
 }
 
 /// Parse `window<provider> name { fields { ... } }`
@@ -311,14 +323,20 @@ fn field_name(input: &mut &str) -> ModalResult<String> {
 }
 
 fn field_type(input: &mut &str) -> ModalResult<FieldType> {
-    alt((array_type, base_type_parser.map(FieldType::Base))).parse_next(input)
+    alt((
+        array_type,
+        literal("object").value(FieldType::Object),
+        base_type_parser.map(FieldType::Base),
+    ))
+    .parse_next(input)
 }
 
 fn array_type(input: &mut &str) -> ModalResult<FieldType> {
     literal("array").parse_next(input)?;
-    cut_err(literal("/"))
-        .context(StrContext::Expected(StrContextValue::Description("'/'")))
-        .parse_next(input)?;
-    let bt = cut_err(base_type_parser).parse_next(input)?;
-    Ok(FieldType::Array(bt))
+    if opt(literal("/")).parse_next(input)?.is_some() {
+        let bt = cut_err(base_type_parser).parse_next(input)?;
+        Ok(FieldType::Array(bt))
+    } else {
+        Ok(FieldType::ArrayAny)
+    }
 }

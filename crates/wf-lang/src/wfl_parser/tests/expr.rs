@@ -91,8 +91,76 @@ rule r {
 }
 
 #[test]
-fn parse_expr_field_refs() {
+fn parse_structured_object_and_array_literals() {
     let input = r#"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        risk_context = object {
+            score: float = @score;
+            source = e.sip;
+            tags: array = array ["bruteforce", "ssh", e.action];
+            geo: object = object {
+                country = e.country;
+            };
+        }
+    )
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let value = &file.rules[0].yield_clause.args[0].value;
+    let Expr::Object(items) = value else {
+        panic!("expected object literal, got {value:?}");
+    };
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[0].targets, vec!["score"]);
+    assert!(matches!(
+        items[0].type_hint,
+        Some(crate::schema::FieldType::Base(
+            crate::schema::BaseType::Float
+        ))
+    ));
+    assert_eq!(items[1].targets, vec!["source"]);
+    assert!(matches!(
+        items[2].type_hint,
+        Some(crate::schema::FieldType::ArrayAny)
+    ));
+    assert!(matches!(items[2].value, Expr::Array(_)));
+    assert!(matches!(
+        items[3].type_hint,
+        Some(crate::schema::FieldType::Object)
+    ));
+    assert!(matches!(items[3].value, Expr::Object(_)));
+}
+
+#[test]
+fn parse_array_literal_allows_whitespace_around_commas_and_trailing_comma() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        tags = array [
+            "bruteforce" ,
+            e.action ,
+        ]
+    )
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let value = &file.rules[0].yield_clause.args[0].value;
+    let Expr::Array(items) = value else {
+        panic!("expected array literal, got {value:?}");
+    };
+    assert_eq!(items.len(), 2);
+}
+
+#[test]
+fn parse_expr_field_refs() {
+    let input = r##"
 rule r {
     events { e : win }
     match<:5m> { on event { e | count >= 1; } } -> score(50.0)
@@ -103,7 +171,7 @@ rule r {
         c = e["detail.sha256"]
     )
 }
-"#;
+"##;
     let file = parse_wfl(input).unwrap();
     let y = &file.rules[0].yield_clause;
     assert_eq!(y.args[0].value, Expr::Field(FieldRef::Simple("sip".into())));

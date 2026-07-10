@@ -468,9 +468,7 @@ fn window_schema_to_arrow(ws: &WindowSchema) -> RuntimeResult<SchemaRef> {
 fn field_type_to_arrow(ft: &FieldType) -> DataType {
     match ft {
         FieldType::Base(base) => base_type_to_arrow(base),
-        FieldType::Array(base) => {
-            DataType::List(Arc::new(Field::new("item", base_type_to_arrow(base), true)))
-        }
+        FieldType::ArrayAny | FieldType::Array(_) | FieldType::Object => DataType::Utf8,
     }
 }
 
@@ -998,6 +996,64 @@ mod tests {
             .unwrap();
 
         assert_eq!(ts.value(0), 1_700_000_000_000_000_000);
+    }
+
+    #[test]
+    fn json_object_and_array_columns_are_serialized_to_utf8() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ctx", DataType::Utf8, true),
+            Field::new("tags", DataType::Utf8, true),
+        ]));
+        let rows = vec![
+            serde_json::json!({
+                "ctx": {"score": 70.5, "source": "auth"},
+                "tags": ["bruteforce", "ssh"]
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ];
+
+        let batch = build_record_batch_from_json(&schema, &rows).unwrap();
+        let ctx = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let tags = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(ctx.value(0), r#"{"score":70.5,"source":"auth"}"#);
+        assert_eq!(tags.value(0), r#"["bruteforce","ssh"]"#);
+    }
+
+    #[test]
+    fn typed_array_schema_uses_utf8_storage_for_file_sources() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ports",
+            field_type_to_arrow(&FieldType::Array(BaseType::Digit)),
+            true,
+        )]));
+        let rows = vec![
+            serde_json::json!({
+                "ports": [22, 2222]
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ];
+
+        let batch = build_record_batch_from_json(&schema, &rows).unwrap();
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+        let ports = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(ports.value(0), r#"[22,2222]"#);
     }
 
     #[tokio::test]

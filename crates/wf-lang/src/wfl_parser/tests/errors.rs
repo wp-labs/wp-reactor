@@ -94,3 +94,20 @@ contract ct for r {
 "#;
     assert!(parse_wfl(input).is_err());
 }
+
+#[test]
+fn reject_unknown_object_array_item_type() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        risk_context = object {
+            tags: array/notatype = array ["ssh"];
+        }
+    )
+}
+"#;
+    assert!(parse_wfl(input).is_err());
+}

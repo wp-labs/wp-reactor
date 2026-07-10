@@ -64,6 +64,14 @@ pub enum SystemVar {
     Score,
 }
 
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangExpr")]
+pub struct ObjectItem {
+    pub targets: Vec<String>,
+    pub type_hint: Option<crate::schema::FieldType>,
+    pub value: Expr,
+}
+
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
@@ -96,6 +104,10 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// Structured object literal: `object { key = expr; }`.
+    Object(Vec<ObjectItem>),
+    /// Structured array literal: `array [expr, ...]`.
+    Array(Vec<Expr>),
     /// `expr in (v1, v2, ...)` or `expr not in (v1, v2, ...)`.
     InList {
         expr: Box<Expr>,

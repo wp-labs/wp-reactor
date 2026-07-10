@@ -26,6 +26,7 @@ pub enum Value {
     Str(String),
     Bool(bool),
     Array(Vec<Value>),
+    Object(HashMap<String, Value>),
 }
 
 // ---------------------------------------------------------------------------

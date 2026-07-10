@@ -349,7 +349,7 @@ fn compare(cmp: CmpOp, lhs: f64, rhs: f64) -> bool {
 }
 
 /// Ordering for Value (used by min/max on orderable fields).
-/// Number < Str < Bool < Array for cross-type (shouldn't happen in practice).
+/// Number < Str < Bool < Array < Object for cross-type (shouldn't happen in practice).
 fn value_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => {
@@ -358,13 +358,20 @@ fn value_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Array(x), Value::Array(y)) => x.len().cmp(&y.len()),
-        // Cross-type: Number < Str < Bool < Array
+        (Value::Object(x), Value::Object(y)) => x.len().cmp(&y.len()),
+        // Cross-type: Number < Str < Bool < Array < Object
         (Value::Number(_), _) => std::cmp::Ordering::Less,
         (_, Value::Number(_)) => std::cmp::Ordering::Greater,
-        (Value::Str(_), Value::Bool(_) | Value::Array(_)) => std::cmp::Ordering::Less,
-        (Value::Bool(_) | Value::Array(_), Value::Str(_)) => std::cmp::Ordering::Greater,
-        (Value::Bool(_), Value::Array(_)) => std::cmp::Ordering::Less,
-        (Value::Array(_), Value::Bool(_)) => std::cmp::Ordering::Greater,
+        (Value::Str(_), Value::Bool(_) | Value::Array(_) | Value::Object(_)) => {
+            std::cmp::Ordering::Less
+        }
+        (Value::Bool(_) | Value::Array(_) | Value::Object(_), Value::Str(_)) => {
+            std::cmp::Ordering::Greater
+        }
+        (Value::Bool(_), Value::Array(_) | Value::Object(_)) => std::cmp::Ordering::Less,
+        (Value::Array(_) | Value::Object(_), Value::Bool(_)) => std::cmp::Ordering::Greater,
+        (Value::Array(_), Value::Object(_)) => std::cmp::Ordering::Less,
+        (Value::Object(_), Value::Array(_)) => std::cmp::Ordering::Greater,
     }
 }
 

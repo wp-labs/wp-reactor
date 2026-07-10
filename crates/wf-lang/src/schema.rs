@@ -13,12 +13,15 @@ pub enum BaseType {
     Hex,
 }
 
-/// A field type: either a base type or an array of a base type.
+/// A field type: either a base type, a typed array, or a structured value.
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq)]
 #[moju(kind = "state", domain = "Lang", module = "Lang.LangSchema")]
 pub enum FieldType {
     Base(BaseType),
+    /// Heterogeneous structured array.
+    ArrayAny,
     Array(BaseType),
+    Object,
 }
 
 /// A single field definition within a window schema.

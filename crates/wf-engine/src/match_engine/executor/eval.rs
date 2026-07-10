@@ -95,6 +95,21 @@ fn eval_expr_with_l3(expr: &wf_lang::ast::Expr, ctx: &Event, score: Option<f64>)
         Expr::Bool(b) => Some(Value::Bool(*b)),
         Expr::SystemVar(SystemVar::Score) => score.map(Value::Number),
         Expr::Field(fr) => ctx.fields.get(field_ref_name(fr)).cloned(),
+        Expr::Object(items) => {
+            let mut map = std::collections::HashMap::new();
+            for item in items {
+                let value = eval_expr_with_l3(&item.value, ctx, score)?;
+                for target in &item.targets {
+                    map.insert(target.clone(), value.clone());
+                }
+            }
+            Some(Value::Object(map))
+        }
+        Expr::Array(items) => items
+            .iter()
+            .map(|item| eval_expr_with_l3(item, ctx, score))
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
         Expr::Neg(inner) => match eval_expr_with_l3(inner, ctx, score)? {
             Value::Number(n) => Some(Value::Number(-n)),
             _ => None,
@@ -284,6 +299,8 @@ fn contains_l3_func(expr: &wf_lang::ast::Expr) -> bool {
         Expr::FuncCall { name, args, .. } => is_l3_func(name) || args.iter().any(contains_l3_func),
         Expr::BinOp { left, right, .. } => contains_l3_func(left) || contains_l3_func(right),
         Expr::Neg(inner) => contains_l3_func(inner),
+        Expr::Object(items) => items.iter().any(|item| contains_l3_func(&item.value)),
+        Expr::Array(items) => items.iter().any(contains_l3_func),
         Expr::InList { expr, list, .. } => {
             contains_l3_func(expr) || list.iter().any(contains_l3_func)
         }
@@ -310,6 +327,10 @@ fn contains_eval_time_func(expr: &wf_lang::ast::Expr) -> bool {
             contains_eval_time_func(left) || contains_eval_time_func(right)
         }
         Expr::Neg(inner) => contains_eval_time_func(inner),
+        Expr::Object(items) => items
+            .iter()
+            .any(|item| contains_eval_time_func(&item.value)),
+        Expr::Array(items) => items.iter().any(contains_eval_time_func),
         Expr::InList { expr, list, .. } => {
             contains_eval_time_func(expr) || list.iter().any(contains_eval_time_func)
         }
@@ -336,6 +357,10 @@ fn contains_aggregate_func(expr: &wf_lang::ast::Expr) -> bool {
             contains_aggregate_func(left) || contains_aggregate_func(right)
         }
         Expr::Neg(inner) => contains_aggregate_func(inner),
+        Expr::Object(items) => items
+            .iter()
+            .any(|item| contains_aggregate_func(&item.value)),
+        Expr::Array(items) => items.iter().any(contains_aggregate_func),
         Expr::InList { expr, list, .. } => {
             contains_aggregate_func(expr) || list.iter().any(contains_aggregate_func)
         }
@@ -359,6 +384,8 @@ fn contains_system_var(expr: &wf_lang::ast::Expr) -> bool {
         Expr::BinOp { left, right, .. } => contains_system_var(left) || contains_system_var(right),
         Expr::Neg(inner) => contains_system_var(inner),
         Expr::FuncCall { args, .. } => args.iter().any(contains_system_var),
+        Expr::Object(items) => items.iter().any(|item| contains_system_var(&item.value)),
+        Expr::Array(items) => items.iter().any(contains_system_var),
         Expr::InList { expr, list, .. } => {
             contains_system_var(expr) || list.iter().any(contains_system_var)
         }
@@ -405,6 +432,24 @@ fn materialize_system_vars(
                 .map(|arg| materialize_system_vars(arg, score))
                 .collect::<Option<Vec<_>>>()?,
         }),
+        Expr::Object(items) => Some(Expr::Object(
+            items
+                .iter()
+                .map(|item| {
+                    Some(wf_lang::ast::ObjectItem {
+                        targets: item.targets.clone(),
+                        type_hint: item.type_hint.clone(),
+                        value: materialize_system_vars(&item.value, score)?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+        )),
+        Expr::Array(items) => Some(Expr::Array(
+            items
+                .iter()
+                .map(|item| materialize_system_vars(item, score))
+                .collect::<Option<Vec<_>>>()?,
+        )),
         Expr::InList {
             expr,
             list,
@@ -1758,7 +1803,7 @@ fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Option<()> {
         Value::Number(_) => ("n", value_to_string(value)),
         Value::Str(s) => ("s", s.clone()),
         Value::Bool(_) => ("b", value_to_string(value)),
-        Value::Array(_) => return None,
+        Value::Array(_) | Value::Object(_) => return None,
     };
     hasher.update(tag.as_bytes());
     hasher.update(b":");

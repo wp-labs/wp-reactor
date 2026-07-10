@@ -9,7 +9,7 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use orion_error::conversion::SourceRawErr;
+use orion_error::conversion::{SourceRawErr, ToStructError};
 use tokio::sync::mpsc;
 
 use wf_engine::alert::OutputRecord;
@@ -447,7 +447,7 @@ impl RuleTask {
     }
 }
 
-fn build_pipeline_batch(
+pub(super) fn build_pipeline_batch(
     schema: arrow::datatypes::SchemaRef,
     time_col_index: Option<usize>,
     event_time_nanos: i64,
@@ -461,17 +461,21 @@ fn build_pipeline_batch(
         .enumerate()
         .map(|(idx, field)| {
             if field.name() == PIPE_EVENT_TIME_FIELD {
-                return Arc::new(TimestampNanosecondArray::from(vec![Some(event_time_nanos)]))
-                    as ArrayRef;
+                return Ok(
+                    Arc::new(TimestampNanosecondArray::from(vec![Some(event_time_nanos)]))
+                        as ArrayRef,
+                );
             }
             let value = values.get(field.name().as_str()).copied();
             if time_col_index == Some(idx) && value.is_none() {
-                return Arc::new(TimestampNanosecondArray::from(vec![Some(event_time_nanos)]))
-                    as ArrayRef;
+                return Ok(
+                    Arc::new(TimestampNanosecondArray::from(vec![Some(event_time_nanos)]))
+                        as ArrayRef,
+                );
             }
             value_to_single_row_array(field.data_type(), value)
         })
-        .collect();
+        .collect::<RuntimeResult<Vec<_>>>()?;
     RecordBatch::try_new(schema, arrays)
         .source_raw_err(RuntimeReason::Bootstrap, "build internal pipeline batch")
 }
@@ -500,29 +504,76 @@ fn event_time_nanos(event: &wf_engine::match_engine::Event, time_field: Option<&
 fn value_to_single_row_array(
     data_type: &DataType,
     value: Option<&wf_engine::match_engine::Value>,
-) -> ArrayRef {
+) -> RuntimeResult<ArrayRef> {
     match (data_type, value) {
         (DataType::Int64, Some(wf_engine::match_engine::Value::Number(n))) => {
-            Arc::new(Int64Array::from(vec![Some(*n as i64)]))
+            Ok(Arc::new(Int64Array::from(vec![Some(*n as i64)])))
         }
         (DataType::Float64, Some(wf_engine::match_engine::Value::Number(n))) => {
-            Arc::new(Float64Array::from(vec![Some(*n)]))
+            Ok(Arc::new(Float64Array::from(vec![Some(*n)])))
         }
         (DataType::Boolean, Some(wf_engine::match_engine::Value::Bool(b))) => {
-            Arc::new(BooleanArray::from(vec![Some(*b)]))
+            Ok(Arc::new(BooleanArray::from(vec![Some(*b)])))
         }
         (DataType::Utf8, Some(wf_engine::match_engine::Value::Str(s))) => {
-            Arc::new(StringArray::from(vec![Some(s.as_str())]))
+            Ok(Arc::new(StringArray::from(vec![Some(s.as_str())])))
         }
         (DataType::Utf8, Some(wf_engine::match_engine::Value::Number(n))) => {
-            Arc::new(StringArray::from(vec![Some(n.to_string())]))
+            Ok(Arc::new(StringArray::from(vec![Some(n.to_string())])))
         }
         (DataType::Utf8, Some(wf_engine::match_engine::Value::Bool(b))) => {
-            Arc::new(StringArray::from(vec![Some(b.to_string())]))
+            Ok(Arc::new(StringArray::from(vec![Some(b.to_string())])))
         }
-        (DataType::Timestamp(_, _), Some(wf_engine::match_engine::Value::Number(n))) => {
-            Arc::new(TimestampNanosecondArray::from(vec![Some(*n as i64)]))
+        (
+            DataType::Utf8,
+            Some(
+                value @ (wf_engine::match_engine::Value::Array(_)
+                | wf_engine::match_engine::Value::Object(_)),
+            ),
+        ) => Ok(Arc::new(StringArray::from(vec![Some(
+            value_to_json_string(value)?,
+        )]))),
+        (DataType::Timestamp(_, _), Some(wf_engine::match_engine::Value::Number(n))) => Ok(
+            Arc::new(TimestampNanosecondArray::from(vec![Some(*n as i64)])),
+        ),
+        _ => Ok(new_null_array(data_type, 1)),
+    }
+}
+
+fn value_to_json_string(value: &wf_engine::match_engine::Value) -> RuntimeResult<String> {
+    serde_json::to_string(&value_to_json(value)?).source_raw_err(
+        RuntimeReason::Bootstrap,
+        "serialize structured pipeline value",
+    )
+}
+
+fn value_to_json(value: &wf_engine::match_engine::Value) -> RuntimeResult<serde_json::Value> {
+    match value {
+        wf_engine::match_engine::Value::Number(n) if n.is_finite() => {
+            Ok(serde_json::Value::from(*n))
         }
-        _ => new_null_array(data_type, 1),
+        wf_engine::match_engine::Value::Number(_) => RuntimeReason::Bootstrap
+            .to_err()
+            .with_detail("structured numeric value must be finite")
+            .err(),
+        wf_engine::match_engine::Value::Str(s) => Ok(serde_json::Value::from(s.clone())),
+        wf_engine::match_engine::Value::Bool(b) => Ok(serde_json::Value::from(*b)),
+        wf_engine::match_engine::Value::Array(items) => Ok(serde_json::Value::Array(
+            items
+                .iter()
+                .map(value_to_json)
+                .collect::<RuntimeResult<Vec<_>>>()?,
+        )),
+        wf_engine::match_engine::Value::Object(items) => {
+            let mut object = serde_json::Map::new();
+            let mut keys: Vec<_> = items.keys().collect();
+            keys.sort();
+            for key in keys {
+                if let Some(value) = items.get(key) {
+                    object.insert(key.clone(), value_to_json(value)?);
+                }
+            }
+            Ok(serde_json::Value::Object(object))
+        }
     }
 }

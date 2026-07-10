@@ -135,6 +135,16 @@ fn collect_expr_aliases<'a>(expr: &'a Expr, declared: &HashSet<&str>, used: &mut
             }
         }
         Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) | Expr::SystemVar(_) => {}
+        Expr::Object(items) => {
+            for item in items {
+                collect_expr_aliases(&item.value, declared, used);
+            }
+        }
+        Expr::Array(items) => {
+            for item in items {
+                collect_expr_aliases(item, declared, used);
+            }
+        }
         Expr::IfThenElse {
             cond,
             then_expr,

@@ -17,8 +17,14 @@ use crate::schema::BaseType;
 pub enum ValType {
     /// A known scalar base type (Chars, Digit, Float, Time, Ip, Hex).
     Base(BaseType),
+    /// Heterogeneous structured array.
+    ArrayAny,
     /// Array of a base type.
     Array(BaseType),
+    /// Structured object.
+    Object,
+    /// Empty array literal, compatible with any array field.
+    EmptyArray,
     /// Numeric literal — compatible with Digit and Float.
     Numeric,
     /// Boolean value.
@@ -32,7 +38,12 @@ pub enum ValType {
 pub fn compatible(expected: &ValType, actual: &ValType) -> bool {
     match (expected, actual) {
         (ValType::Base(a), ValType::Base(b)) => a == b,
+        (ValType::ArrayAny, ValType::ArrayAny) => true,
+        (ValType::ArrayAny, ValType::Array(_)) => true,
+        (ValType::ArrayAny | ValType::Array(_), ValType::EmptyArray) => true,
+        (ValType::Array(BaseType::Float), ValType::Array(BaseType::Digit)) => true,
         (ValType::Array(a), ValType::Array(b)) => a == b,
+        (ValType::Object, ValType::Object) => true,
         (ValType::Base(BaseType::Digit), ValType::Numeric)
         | (ValType::Numeric, ValType::Base(BaseType::Digit)) => true,
         (ValType::Base(BaseType::Float), ValType::Numeric)
@@ -43,6 +54,19 @@ pub fn compatible(expected: &ValType, actual: &ValType) -> bool {
         | (ValType::Base(BaseType::Bool), ValType::Bool) => true,
         _ => false,
     }
+}
+
+pub(super) fn unify_array_element_type(left: &BaseType, right: &BaseType) -> Option<BaseType> {
+    if left == right {
+        return Some(left.clone());
+    }
+    if matches!(
+        (left, right),
+        (BaseType::Digit, BaseType::Float) | (BaseType::Float, BaseType::Digit)
+    ) {
+        return Some(BaseType::Float);
+    }
+    None
 }
 
 pub fn is_numeric(t: &ValType) -> bool {

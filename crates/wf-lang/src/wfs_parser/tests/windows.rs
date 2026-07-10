@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use super::super::parse_wfs;
+use crate::schema::{BaseType, FieldType};
 
 // -----------------------------------------------------------------------
 // Window declarations
@@ -50,6 +51,27 @@ window auth_events {
     assert_eq!(w.time_field.as_deref(), Some("event_time"));
     assert_eq!(w.over, Duration::from_secs(30 * 60));
     assert_eq!(w.fields.len(), 3);
+}
+
+#[test]
+fn parse_window_structured_field_types() {
+    let input = r#"
+window security_alerts {
+    time = emit_time
+    over = 1h
+    fields {
+        risk_context: object
+        tags: array
+        ports: array/digit
+        emit_time: time
+    }
+}
+"#;
+    let schemas = parse_wfs(input).unwrap();
+    let fields = &schemas[0].fields;
+    assert_eq!(fields[0].field_type, FieldType::Object);
+    assert_eq!(fields[1].field_type, FieldType::ArrayAny);
+    assert_eq!(fields[2].field_type, FieldType::Array(BaseType::Digit));
 }
 
 #[test]

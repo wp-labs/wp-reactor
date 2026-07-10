@@ -13,6 +13,7 @@ pub(super) enum ValueKey {
     Str(String),
     Bool(bool),
     Array(Vec<ValueKey>),
+    Object(Vec<(String, ValueKey)>),
 }
 
 impl ValueKey {
@@ -22,6 +23,14 @@ impl ValueKey {
             Value::Str(s) => Self::Str(s.clone()),
             Value::Bool(b) => Self::Bool(*b),
             Value::Array(values) => Self::Array(values.iter().map(Self::from_value).collect()),
+            Value::Object(map) => {
+                let mut values: Vec<_> = map
+                    .iter()
+                    .map(|(key, value)| (key.clone(), Self::from_value(value)))
+                    .collect();
+                values.sort_by(|a, b| a.0.cmp(&b.0));
+                Self::Object(values)
+            }
         }
     }
 
@@ -30,6 +39,12 @@ impl ValueKey {
             Self::Number(_) | Self::Bool(_) => 8,
             Self::Str(s) => s.len() + 24,
             Self::Array(values) => 24 + values.iter().map(Self::estimated_bytes).sum::<usize>(),
+            Self::Object(values) => {
+                24 + values
+                    .iter()
+                    .map(|(key, value)| key.len() + value.estimated_bytes())
+                    .sum::<usize>()
+            }
         }
     }
 }
@@ -182,5 +197,6 @@ pub(crate) fn value_to_string(v: &Value) -> String {
         Value::Str(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
         Value::Array(_) => "[array]".to_string(),
+        Value::Object(_) => "[object]".to_string(),
     }
 }

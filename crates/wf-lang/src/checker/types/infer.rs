@@ -1,7 +1,7 @@
 use crate::ast::{BinOp, Expr};
 use crate::schema::BaseType;
 
-use super::{ValType, is_numeric, numeric_promote};
+use super::{ValType, is_numeric, numeric_promote, unify_array_element_type};
 use crate::checker::scope::Scope;
 
 /// Infer the type of an expression within the given scope.
@@ -19,6 +19,8 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
         Expr::Bool(_) => Some(ValType::Bool),
         Expr::SystemVar(_) => Some(ValType::Base(BaseType::Float)),
         Expr::Field(fref) => scope.resolve_field_ref(fref).ok().flatten(),
+        Expr::Object(_) => Some(ValType::Object),
+        Expr::Array(items) => infer_array_type(items, scope),
         Expr::BinOp { op, left, right } => infer_binop(*op, left, right, scope),
         Expr::Neg(inner) => {
             let t = infer_type(inner, scope)?;
@@ -28,6 +30,32 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
         Expr::InList { .. } => Some(ValType::Bool),
         Expr::IfThenElse { then_expr, .. } => infer_type(then_expr, scope),
     }
+}
+
+fn infer_array_type(items: &[Expr], scope: &Scope<'_>) -> Option<ValType> {
+    if items.is_empty() {
+        return Some(ValType::EmptyArray);
+    }
+
+    let mut element_type: Option<BaseType> = None;
+    for item in items {
+        let Some(item_type) = infer_type(item, scope) else {
+            return Some(ValType::ArrayAny);
+        };
+        let Some(base_type) = element_base_type(&item_type) else {
+            return Some(ValType::ArrayAny);
+        };
+        if let Some(existing) = &element_type {
+            if let Some(unified) = unify_array_element_type(existing, &base_type) {
+                element_type = Some(unified);
+            } else {
+                return Some(ValType::ArrayAny);
+            }
+        } else {
+            element_type = Some(base_type);
+        }
+    }
+    element_type.map(ValType::Array).or(Some(ValType::ArrayAny))
 }
 
 fn infer_binop(op: BinOp, left: &Expr, right: &Expr, scope: &Scope<'_>) -> Option<ValType> {
@@ -66,6 +94,8 @@ fn infer_func_call(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<ValTy
         "split" => Some(ValType::Array(BaseType::Chars)),
         "mvdedup" => args.first().and_then(|a| match infer_type(a, scope) {
             Some(ValType::Array(bt)) => Some(ValType::Array(bt)),
+            Some(ValType::ArrayAny) => Some(ValType::ArrayAny),
+            Some(ValType::EmptyArray) => Some(ValType::EmptyArray),
             _ => None,
         }),
         "mvindex" => args.first().and_then(|a| match infer_type(a, scope) {
@@ -74,6 +104,20 @@ fn infer_func_call(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<ValTy
                     Some(ValType::Array(bt))
                 } else {
                     Some(ValType::Base(bt))
+                }
+            }
+            Some(ValType::ArrayAny) => {
+                if args.len() == 3 {
+                    Some(ValType::ArrayAny)
+                } else {
+                    None
+                }
+            }
+            Some(ValType::EmptyArray) => {
+                if args.len() == 3 {
+                    Some(ValType::EmptyArray)
+                } else {
+                    None
                 }
             }
             _ => None,
@@ -95,6 +139,8 @@ fn infer_func_call(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<ValTy
         "time_bucket" => Some(ValType::Base(BaseType::Time)),
         "mvsort" | "mvreverse" => args.first().and_then(|a| match infer_type(a, scope) {
             Some(ValType::Array(bt)) => Some(ValType::Array(bt)),
+            Some(ValType::ArrayAny) => Some(ValType::ArrayAny),
+            Some(ValType::EmptyArray) => Some(ValType::EmptyArray),
             _ => None,
         }),
         // L3 Collection functions (M28)
@@ -130,25 +176,38 @@ fn infer_func_call(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<ValTy
 
 fn infer_mvappend_type(args: &[Expr], scope: &Scope<'_>) -> Option<ValType> {
     let mut element_type: Option<BaseType> = None;
+    let mut saw_empty_array = false;
     for arg in args {
         let Some(arg_type) = infer_type(arg, scope) else {
             continue;
         };
+        match arg_type {
+            ValType::ArrayAny => return Some(ValType::ArrayAny),
+            ValType::EmptyArray => {
+                saw_empty_array = true;
+                continue;
+            }
+            _ => {}
+        }
         let arg_element_type = element_base_type(&arg_type)?;
         if let Some(existing) = &element_type {
-            if *existing != arg_element_type {
+            if let Some(unified) = unify_array_element_type(existing, &arg_element_type) {
+                element_type = Some(unified);
+            } else {
                 return None;
             }
         } else {
             element_type = Some(arg_element_type);
         }
     }
-    element_type.map(ValType::Array)
+    element_type
+        .map(ValType::Array)
+        .or_else(|| saw_empty_array.then_some(ValType::EmptyArray))
 }
 
 fn element_base_type(t: &ValType) -> Option<BaseType> {
     match t {
-        ValType::Array(bt) | ValType::Base(bt) => Some(bt.clone()),
+        ValType::Base(bt) => Some(bt.clone()),
         ValType::Bool => Some(BaseType::Bool),
         _ => None,
     }

@@ -96,6 +96,19 @@ window bad {
 }
 
 #[test]
+fn reject_unknown_array_item_type() {
+    let input = r#"
+window bad {
+    over = 0
+    fields {
+        x: array/notatype
+    }
+}
+"#;
+    assert!(parse_wfs(input).is_err());
+}
+
+#[test]
 fn window_no_over_defaults_zero() {
     let input = r#"
 window defaults {

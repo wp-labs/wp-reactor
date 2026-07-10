@@ -61,10 +61,7 @@ fn base_type_to_wp(ft: &FieldType) -> WpDataType {
             BaseType::Ip => WpDataType::Ip,
             BaseType::Hex => WpDataType::Hex,
         },
-        FieldType::Array(bt) => {
-            let inner = base_type_to_wp(&FieldType::Base(bt.clone()));
-            WpDataType::Array(Box::new(inner))
-        }
+        FieldType::ArrayAny | FieldType::Array(_) | FieldType::Object => WpDataType::Chars,
     }
 }
 
@@ -165,6 +162,38 @@ mod tests {
         assert_eq!(schema.field(2).data_type(), &DataType::Int64);
         assert_eq!(schema.field(3).data_type(), &DataType::Boolean);
         assert_eq!(schema.field(4).data_type(), &DataType::Float64);
+    }
+
+    #[test]
+    fn structured_field_types_map_to_utf8_storage() {
+        let ws = WindowSchema {
+            name: "alerts".to_string(),
+            streams: vec![],
+            time_field: None,
+            over: Duration::ZERO,
+            fields: vec![
+                FieldDef {
+                    name: "risk_context".to_string(),
+                    field_type: FieldType::Object,
+                },
+                FieldDef {
+                    name: "tags".to_string(),
+                    field_type: FieldType::ArrayAny,
+                },
+                FieldDef {
+                    name: "ports".to_string(),
+                    field_type: FieldType::Array(BaseType::Digit),
+                },
+            ],
+        };
+
+        let config = test_config("alerts");
+        let def = schema_to_window_def(&ws, &config).unwrap();
+        let schema = def.params.schema;
+
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
     }
 
     #[test]

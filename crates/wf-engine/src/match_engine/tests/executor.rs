@@ -1,4 +1,4 @@
-use wf_lang::ast::{BinOp, CloseMode, Expr, FieldRef, SystemVar};
+use wf_lang::ast::{BinOp, CloseMode, Expr, FieldRef, ObjectItem, SystemVar};
 use wf_lang::plan::{BranchPlan, EachPlan, StepPlan, YieldField};
 use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
@@ -122,6 +122,76 @@ fn execute_each_yield_can_reference_score() {
             .find(|(name, _)| name == "risk_score")
             .map(|(_, value)| value.clone()),
         Some(num(10.0))
+    );
+}
+
+#[test]
+fn execute_each_yield_evaluates_structured_object_and_array_literals() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "risk_context".to_string(),
+        value: Expr::Object(vec![
+            ObjectItem {
+                targets: vec!["score".to_string()],
+                type_hint: None,
+                value: Expr::SystemVar(SystemVar::Score),
+            },
+            ObjectItem {
+                targets: vec!["source".to_string()],
+                type_hint: None,
+                value: Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+            },
+            ObjectItem {
+                targets: vec!["tags".to_string()],
+                type_hint: None,
+                value: Expr::Array(vec![
+                    Expr::StringLit("bruteforce".to_string()),
+                    Expr::Field(FieldRef::Qualified("e".to_string(), "action".to_string())),
+                ]),
+            },
+        ]),
+    }];
+    let exec = RuleExecutor::new(plan);
+
+    let alert = exec
+        .execute_each(
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("action", str_val("failed")),
+            ]),
+            1_000_000,
+        )
+        .unwrap()
+        .unwrap();
+
+    let value = alert
+        .yield_fields
+        .iter()
+        .find(|(name, _)| name == "risk_context")
+        .map(|(_, value)| value)
+        .expect("risk_context");
+    let Value::Object(fields) = value else {
+        panic!("expected object value, got {value:?}");
+    };
+    assert_eq!(fields.get("score"), Some(&num(10.0)));
+    assert_eq!(fields.get("source"), Some(&str_val("10.0.0.1")));
+    assert_eq!(
+        fields.get("tags"),
+        Some(&Value::Array(vec![
+            str_val("bruteforce"),
+            str_val("failed")
+        ]))
     );
 }
 

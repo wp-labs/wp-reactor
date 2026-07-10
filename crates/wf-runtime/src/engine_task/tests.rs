@@ -17,7 +17,7 @@ use tracing_subscriber::{EnvFilter, Layer, fmt};
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 use wf_engine::match_engine::{CepStateMachine, RuleExecutor, batch_to_events};
 use wf_engine::window::{Router, Window, WindowDef, WindowParams, WindowRegistry};
-use wf_lang::ast::{BinOp, CloseMode, CmpOp, Expr, FieldRef, Measure};
+use wf_lang::ast::{BinOp, CloseMode, CmpOp, Expr, FieldRef, Measure, ObjectItem};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EachPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
     WindowSpec, YieldField, YieldPlan,
@@ -100,6 +100,8 @@ fn intermediate_schema() -> SchemaRef {
         Field::new("__wfu_rule_name", DataType::Utf8, true),
         Field::new("__wfu_entity_type", DataType::Utf8, true),
         Field::new("__wfu_entity_id", DataType::Utf8, true),
+        Field::new("risk_context", DataType::Utf8, true),
+        Field::new("tags", DataType::Utf8, true),
     ]))
 }
 
@@ -879,10 +881,34 @@ fn make_intermediate_each_task() -> (
         yield_plan: YieldPlan {
             target: target_name.into(),
             version: None,
-            fields: vec![YieldField {
-                name: "sip".into(),
-                value: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
-            }],
+            fields: vec![
+                YieldField {
+                    name: "sip".into(),
+                    value: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+                },
+                YieldField {
+                    name: "risk_context".into(),
+                    value: Expr::Object(vec![
+                        ObjectItem {
+                            targets: vec!["score".into()],
+                            type_hint: None,
+                            value: Expr::SystemVar(wf_lang::ast::SystemVar::Score),
+                        },
+                        ObjectItem {
+                            targets: vec!["source".into()],
+                            type_hint: None,
+                            value: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+                        },
+                    ]),
+                },
+                YieldField {
+                    name: "tags".into(),
+                    value: Expr::Array(vec![
+                        Expr::StringLit("intermediate".into()),
+                        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+                    ]),
+                },
+            ],
         },
         score_plan: ScorePlan {
             expr: Expr::Number(7.0),
@@ -2065,6 +2091,41 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
     assert_eq!(
         rows[0].fields.get("event_time"),
         Some(&wf_engine::match_engine::Value::Number(ts as f64))
+    );
+    assert_eq!(
+        rows[0].fields.get("risk_context"),
+        Some(&wf_engine::match_engine::Value::Str(
+            r#"{"score":7.0,"source":"10.0.0.8"}"#.into()
+        ))
+    );
+    assert_eq!(
+        rows[0].fields.get("tags"),
+        Some(&wf_engine::match_engine::Value::Str(
+            r#"["intermediate","10.0.0.8"]"#.into()
+        ))
+    );
+}
+
+#[test]
+fn pipeline_batch_rejects_non_finite_number_inside_structured_value() {
+    let schema = intermediate_schema();
+    let fields = vec![(
+        "risk_context".to_string(),
+        wf_engine::match_engine::Value::Object(
+            [(
+                "score".to_string(),
+                wf_engine::match_engine::Value::Number(f64::NAN),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+    )];
+
+    let err = rule_task::build_pipeline_batch(schema, None, 0, &fields)
+        .expect_err("non-finite structured number should fail");
+    assert!(
+        err.to_string()
+            .contains("structured numeric value must be finite")
     );
 }
 

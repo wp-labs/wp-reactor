@@ -2,23 +2,32 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [0.1.27 Unreleased]
+## [0.1.29 Unreleased]
 
 ### Added
 
 - **wf-lang**: Added type checking and inference for new WFL helper functions: `now()`, `now_s()`, `now_ms()`, `now_us()`, `now_ns()`, `is_blank()`, `null_if_blank()`, `default_if_blank()`, `md5()`, `sha1()`, `sha256()`, `hex()`, and `stable_id()`.
 - **wf-lang**: Added source-aware WFL diagnostics for parse and semantic compile failures, including file path, diagnostic category, rule/test context, line/column, and source snippets.
+- **wf-lang**: Added structured WFL literals `object { ... }` and `array [ ... ]` for building nested output values in `yield`, including object field type hints and duplicate-field validation.
+- **wf-lang**: Added WFS schema support for output-only `object`, untyped `array`, and typed `array/T` fields.
 - **wf-engine**: Added runtime support for current engine time helpers, blank-string helpers, hash/hex helpers, and stable alert ID generation in both L2 expression evaluation and yield/L3 evaluation paths.
+- **wf-engine**: Added runtime evaluation and alert export support for structured object and array values, including nested model values and deterministic JSON rendering for structured string output.
+- **wf-runtime**: Added UTF-8 storage bridging for structured `object` / `array` fields so structured source values can be serialized into intermediate pipeline windows.
 - **wf-runtime**: Rule bootstrap now surfaces source-aware WFL diagnostics for rule-file parse errors, semantic compile errors, and intermediate topology cycle errors.
 
 ### Fixed
 
 - **wf-engine**: `now_*` helpers now share one cached timestamp within a single expression and across all yield fields for one output record, preventing `created_time` / `created_ns` drift inside the same alert.
 - **wf-engine**: `stable_id()` now hashes typed, length-prefixed value segments instead of ambiguous separator-joined values, avoiding collisions when inputs contain separator-like bytes.
+- **wf-lang**: Structured `object` / `array` field declarations are now rejected for stream and provider input windows; source JSON object/array values should be declared as `chars` and structured outputs built in `yield`.
+- **wf-lang**: `mvcount`, `mvjoin`, `mvdedup`, `mvsort`, `mvreverse`, `mvindex`, and `mvappend` now accept untyped and empty array literals where runtime behavior supports them.
+- **wf-lang**: `array/float` and `mvappend` type checks now consistently allow digit/float element promotion.
 - **wf-lang**: Improved WFL diagnostic location selection for `yield` errors so repeated tokens in `match`, `entity`, and `yield` clauses point to the failing `yield` argument, including inline single-line rules.
+- **wf-runtime**: Structured pipeline values now fail fast on non-finite numeric values instead of silently serializing invalid JSON.
 
 ### Documentation
 
+- **User guide**: Documented WFS `object`, `array`, and `array/T` field types and WFL `object { ... }` / `array [ ... ]` structured output syntax.
 - **User guide**: Expanded the WFL language reference with current blank handling, current-time, time formatting/parsing, hash/encoding, stable ID, and multivalue function behavior.
 
 ## [0.1.25] — 2026-07-02

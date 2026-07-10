@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::schema::{BaseType, FieldType, WindowSchema};
+use crate::schema::{BaseType, FieldDef, FieldType, StaticWindowSchema, WindowSchema};
 use crate::{LangReason, LangResult};
 use orion_error::conversion::ToStructError;
 
@@ -17,6 +17,10 @@ pub(super) fn validate_schemas(windows: &[WindowSchema]) -> LangResult<()> {
     }
 
     for w in windows {
+        if !w.streams.is_empty() {
+            validate_input_fields(&w.name, &w.fields)?;
+        }
+
         if w.over > Duration::ZERO {
             // time attribute is required
             let Some(time_field) = w.time_field.as_ref() else {
@@ -53,4 +57,40 @@ pub(super) fn validate_schemas(windows: &[WindowSchema]) -> LangResult<()> {
     }
 
     Ok(())
+}
+
+pub(super) fn validate_static_schemas(windows: &[StaticWindowSchema]) -> LangResult<()> {
+    let mut seen = std::collections::HashSet::new();
+    for w in windows {
+        if !seen.insert(&w.name) {
+            return LangReason::Validation
+                .to_err()
+                .with_detail(format!("duplicate window name: '{}'", w.name))
+                .err();
+        }
+        validate_input_fields(&w.name, &w.fields)?;
+    }
+    Ok(())
+}
+
+fn validate_input_fields(window_name: &str, fields: &[FieldDef]) -> LangResult<()> {
+    for field in fields {
+        if is_structured_type(&field.field_type) {
+            return LangReason::Validation
+                .to_err()
+                .with_detail(format!(
+                    "window '{}': input field '{}' uses structured type {:?}; input object/array fields must be declared as chars and structured values should be built in yield",
+                    window_name, field.name, field.field_type
+                ))
+                .err();
+        }
+    }
+    Ok(())
+}
+
+fn is_structured_type(field_type: &FieldType) -> bool {
+    matches!(
+        field_type,
+        FieldType::ArrayAny | FieldType::Array(_) | FieldType::Object
+    )
 }

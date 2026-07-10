@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::ast::{BinOp, Expr};
 
 use super::infer::infer_type;
@@ -212,6 +214,57 @@ fn check_expr_type_inner(
                 );
             }
             check_func_call(name, args, scope, rule_name, allow_l3_funcs, errors);
+        }
+        Expr::Object(items) => {
+            let mut seen = HashSet::new();
+            for item in items {
+                check_expr_type_inner(
+                    &item.value,
+                    scope,
+                    rule_name,
+                    allow_l3_funcs,
+                    allow_system_vars,
+                    errors,
+                );
+                if let Some(type_hint) = &item.type_hint {
+                    let expected = crate::checker::scope::field_type_to_val(type_hint);
+                    if let Some(actual) = infer_type(&item.value, scope)
+                        && !compatible(&expected, &actual)
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "object field type hint {:?} is incompatible with value type {:?}",
+                                type_hint, actual
+                            ),
+                        });
+                    }
+                }
+                for target in &item.targets {
+                    if !seen.insert(target) {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!("duplicate object field `{target}`"),
+                        });
+                    }
+                }
+            }
+        }
+        Expr::Array(items) => {
+            for item in items {
+                check_expr_type_inner(
+                    item,
+                    scope,
+                    rule_name,
+                    allow_l3_funcs,
+                    allow_system_vars,
+                    errors,
+                );
+            }
         }
         Expr::InList {
             expr: inner, list, ..

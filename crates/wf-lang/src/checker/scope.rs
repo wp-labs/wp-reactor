@@ -96,6 +96,8 @@ pub fn field_type_to_val(ft: &FieldType) -> ValType {
             BaseType::Bool => ValType::Bool,
             other => ValType::Base(other.clone()),
         },
+        FieldType::ArrayAny => ValType::ArrayAny,
         FieldType::Array(bt) => ValType::Array(bt.clone()),
+        FieldType::Object => ValType::Object,
     }
 }

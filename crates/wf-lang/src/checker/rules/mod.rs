@@ -507,7 +507,10 @@ fn measure_output_name(measure: Measure) -> &'static str {
 fn val_type_to_field_type(v: ValType) -> Option<FieldType> {
     match v {
         ValType::Base(bt) => Some(FieldType::Base(bt)),
+        ValType::ArrayAny => Some(FieldType::ArrayAny),
         ValType::Array(bt) => Some(FieldType::Array(bt)),
+        ValType::Object => Some(FieldType::Object),
+        ValType::EmptyArray => Some(FieldType::ArrayAny),
         ValType::Bool => Some(FieldType::Base(BaseType::Bool)),
         ValType::Numeric => Some(FieldType::Base(BaseType::Digit)),
     }

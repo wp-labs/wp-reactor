@@ -33,7 +33,9 @@ window <名称> {
 | `time` | Timestamp(Nanosecond) |
 | `ip` | Utf8 |
 | `hex` | Utf8 |
+| `array` | Utf8（结构化数组，sink 决定最终编码） |
 | `array/T` | List(T) |
+| `object` | Utf8（结构化对象，sink 决定最终编码） |
 
 属性说明：
 
@@ -417,6 +419,70 @@ yield security_alerts@v2 (
 `yield` 里也不能手工写 `__wfu_*` 字段名；这个前缀保留给运行时中间系统字段。
 
 若某个 `yield` 目标会被下游规则继续消费，则所有这类中间 window 必须构成无环依赖图；禁止自回写和 `A -> B -> A` 形式的循环。
+
+#### 结构化对象 / 数组输出
+
+当规则需要输出 `risk_context`、`extensions` 这类结构化字段时，可以在 WFS 中使用结构化类型：
+
+```wfs
+window security_alerts {
+    time = emit_time
+    over = 48h
+
+    fields {
+        sip: ip
+        risk_context: object
+        extensions: object
+        tags: array
+        scores: array/float
+        emit_time: time
+    }
+}
+```
+
+WFL 中采用与 OML 一致的对象块风格：`object { ... }` 使用字段赋值语句，字段之间用 `;` 分隔；数组字面量使用 `array [ ... ]`，与对象块保持结构化字面量的一致性。
+
+```wfl
+yield security_alerts (
+    sip = e.sip,
+    risk_context = object {
+        score = @score;
+        source = e.source;
+        tags = array ["bruteforce", "ssh", e.action];
+        geo = object {
+            country = e.country;
+            city = e.city;
+        };
+    }
+)
+```
+
+语法：
+
+```ebnf
+object_expr     = "object", "{", object_item, { object_item }, "}" ;
+object_item     = object_targets, "=", expr, [ ";" ] ;
+object_targets  = ident, { ",", ident }, [ ":", field_type ] ;
+
+array_expr      = "array", "[", [ expr, { ",", expr }, [ "," ] ], "]" ;
+```
+
+对象项右侧在 WFL 中应允许完整表达式，而不是只允许常量或字段读取；这样 `@score`、字段引用、函数调用、`if ... then ... else ...` 都可用于构造对象。
+
+```wfl
+risk_context = object {
+    score : float = round(@score, 1);
+    severity : chars = if @score >= 80.0 then "high" else "medium";
+}
+```
+
+语义边界：
+
+- `object` / `array` 是 WFL 的结构化值类型，不等同于 JSON。
+- JSON、XML、文本、CSV 等最终编码由 sink 决定。
+- JSON sink 应把 `object` 输出为 JSON object，把 `array` 输出为 JSON array。
+- XML sink 可把 `object` 输出为元素树；文本/CSV sink 可选择序列化或 flatten。
+- `json_object(...)` 不作为主语法；如后续提供，也应只是返回 `object` 的便捷函数。
 
 ### `conv`
 

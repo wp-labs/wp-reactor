@@ -263,6 +263,12 @@ fn val_estimated_bytes(v: &Value) -> usize {
         Value::Str(s) => s.len() + 24,
         Value::Number(_) | Value::Bool(_) => 8,
         Value::Array(arr) => 24 + arr.iter().map(val_estimated_bytes).sum::<usize>(),
+        Value::Object(map) => {
+            24 + map
+                .iter()
+                .map(|(key, value)| key.len() + val_estimated_bytes(value))
+                .sum::<usize>()
+        }
     }
 }
 

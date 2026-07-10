@@ -76,6 +76,21 @@ pub(crate) fn eval_expr_ext(
             let name = field_ref_name(fr);
             event.fields.get(name).cloned()
         }
+        Expr::Object(items) => {
+            let mut map = HashMap::new();
+            for item in items {
+                let value = eval_expr_ext(&item.value, event, windows, baselines)?;
+                for target in &item.targets {
+                    map.insert(target.clone(), value.clone());
+                }
+            }
+            Some(Value::Object(map))
+        }
+        Expr::Array(items) => items
+            .iter()
+            .map(|item| eval_expr_ext(item, event, windows, baselines))
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
         Expr::Neg(inner) => {
             let v = eval_expr_ext(inner, event, windows, baselines)?;
             match v {
@@ -1376,7 +1391,7 @@ fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Option<()> {
         Value::Number(_) => ("n", value_to_string(value)),
         Value::Str(s) => ("s", s.clone()),
         Value::Bool(_) => ("b", value_to_string(value)),
-        Value::Array(_) => return None,
+        Value::Array(_) | Value::Object(_) => return None,
     };
     hasher.update(tag.as_bytes());
     hasher.update(b":");

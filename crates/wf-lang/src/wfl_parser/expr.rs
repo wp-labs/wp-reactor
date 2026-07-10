@@ -5,6 +5,7 @@ use winnow::token::literal;
 
 use crate::ast::*;
 use crate::parse_utils::{duration_value, ident, kw, number_literal, quoted_string, ws_skip};
+use crate::schema::{BaseType, FieldType};
 
 // ---------------------------------------------------------------------------
 // Public entry: full expression
@@ -203,21 +204,14 @@ fn unary_expr(input: &mut &str) -> ModalResult<Expr> {
 
 fn primary(input: &mut &str) -> ModalResult<Expr> {
     alt((
-        // Number literal
-        number_literal.map(Expr::Number),
-        // String literal
-        quoted_string.map(Expr::StringLit),
-        // Boolean literals (keyword-checked)
-        kw("true").map(|_| Expr::Bool(true)),
-        kw("false").map(|_| Expr::Bool(false)),
-        // System variables
-        system_var,
-        // Conditional expression
-        if_expr,
-        // Parenthesized expression
-        paren_expr,
-        // Ident-based: field ref or function call
-        ident_primary,
+        alt((
+            number_literal.map(Expr::Number),
+            quoted_string.map(Expr::StringLit),
+            kw("true").map(|_| Expr::Bool(true)),
+            kw("false").map(|_| Expr::Bool(false)),
+            system_var,
+        )),
+        alt((if_expr, object_expr, array_expr, paren_expr, ident_primary)),
     ))
     .context(StrContext::Expected(StrContextValue::Description(
         "expression",
@@ -247,6 +241,112 @@ fn paren_expr(input: &mut &str) -> ModalResult<Expr> {
     ws_skip.parse_next(input)?;
     cut_err(literal(")")).parse_next(input)?;
     Ok(inner)
+}
+
+fn object_expr(input: &mut &str) -> ModalResult<Expr> {
+    kw("object").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(literal("{")).parse_next(input)?;
+
+    let mut items = Vec::new();
+    loop {
+        ws_skip.parse_next(input)?;
+        if opt(literal("}")).parse_next(input)?.is_some() {
+            break;
+        }
+        let item = cut_err(object_item)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "object item",
+            )))
+            .parse_next(input)?;
+        items.push(item);
+    }
+    Ok(Expr::Object(items))
+}
+
+fn object_item(input: &mut &str) -> ModalResult<ObjectItem> {
+    let targets: Vec<String> = separated(1.., preceded_ws_ident, comma_sep).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let type_hint = if opt(literal(":")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        Some(cut_err(object_field_type).parse_next(input)?)
+    } else {
+        None
+    };
+    ws_skip.parse_next(input)?;
+    cut_err(literal("=")).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let value = cut_err(parse_expr).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let _ = opt(literal(";")).parse_next(input)?;
+    Ok(ObjectItem {
+        targets,
+        type_hint,
+        value,
+    })
+}
+
+fn object_field_type(input: &mut &str) -> ModalResult<FieldType> {
+    alt((
+        array_field_type,
+        kw("object").value(FieldType::Object),
+        base_type_parser.map(FieldType::Base),
+    ))
+    .parse_next(input)
+}
+
+fn array_field_type(input: &mut &str) -> ModalResult<FieldType> {
+    kw("array").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    if opt(literal("/")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        let base = cut_err(base_type_parser).parse_next(input)?;
+        Ok(FieldType::Array(base))
+    } else {
+        Ok(FieldType::ArrayAny)
+    }
+}
+
+fn base_type_parser(input: &mut &str) -> ModalResult<BaseType> {
+    alt((
+        kw("chars").value(BaseType::Chars),
+        kw("digit").value(BaseType::Digit),
+        kw("float").value(BaseType::Float),
+        kw("bool").value(BaseType::Bool),
+        kw("time").value(BaseType::Time),
+        kw("ip").value(BaseType::Ip),
+        kw("hex").value(BaseType::Hex),
+    ))
+    .parse_next(input)
+}
+
+fn array_expr(input: &mut &str) -> ModalResult<Expr> {
+    kw("array").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(literal("[")).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    if opt(literal("]")).parse_next(input)?.is_some() {
+        return Ok(Expr::Array(Vec::new()));
+    }
+
+    let items: Vec<Expr> =
+        separated(1.., (ws_skip, parse_expr).map(|(_, e)| e), comma_sep).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let _ = opt(literal(",")).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(literal("]")).parse_next(input)?;
+    Ok(Expr::Array(items))
+}
+
+fn preceded_ws_ident(input: &mut &str) -> ModalResult<String> {
+    ws_skip.parse_next(input)?;
+    ident.map(ToString::to_string).parse_next(input)
+}
+
+fn comma_sep(input: &mut &str) -> ModalResult<()> {
+    ws_skip.parse_next(input)?;
+    literal(",").parse_next(input)?;
+    Ok(())
 }
 
 /// Parse an ident-based primary: function call or field reference.
