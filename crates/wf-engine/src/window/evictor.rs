@@ -266,7 +266,328 @@ mod tests {
         assert!(total <= one_batch_size * 2);
     }
 
-    // -- 3. evictor_empty_registry --------------------------------------------
+    // -- 3. evictor_long_running_memory_stabilization -------------------------
+
+    /// Simulates continuous data injection over a long period with periodic
+    /// eviction. Validates that window memory stabilizes (does not grow
+    /// unbounded) once the over-window fills up.
+    ///
+    /// Scenario:
+    ///   - window over = 10s, new batch every 2s (5 batches per over window)
+    ///   - run for 200 iterations (400s simulated time, 40 over-windows)
+    ///   - after warmup (10 iterations), memory should oscillate around
+    ///     ~5 batches' worth of data
+    #[test]
+    fn evictor_long_running_memory_stabilization() {
+        let schema = test_schema();
+        let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+        let one_batch_size = probe.get_array_memory_size();
+
+        let reg = WindowRegistry::build(vec![WindowDef {
+            params: WindowParams {
+                name: "data".into(),
+                schema: schema.clone(),
+                time_col_index: Some(0),
+                over: Duration::from_secs(10),
+            },
+            streams: vec![],
+            config: test_config(),
+        }])
+        .unwrap();
+
+        let evictor = Evictor::new(usize::MAX);
+
+        // Track memory samples across the run.
+        let mut memory_samples: Vec<usize> = Vec::new();
+        let mut batch_counts: Vec<usize> = Vec::new();
+
+        let total_iterations = 200;
+        let step_nanos = 2_000_000_000i64; // 2s per step
+        let over_nanos = 10_000_000_000i64; // 10s over window
+        let expected_batches_per_window = (over_nanos / step_nanos) as usize; // ~5
+
+        for i in 0..total_iterations {
+            let now = (i as i64 + 1) * step_nanos;
+
+            // Inject one batch at current time.
+            {
+                let win_lock = reg.get_window("data").unwrap();
+                let mut win = win_lock.write().unwrap();
+                let value = i as i64 * 10;
+                win.append(make_batch(&schema, &[now], &[value])).unwrap();
+            }
+
+            // Run eviction.
+            evictor.run_once(&reg, now);
+
+            // Sample metrics after every eviction.
+            {
+                let win_lock = reg.get_window("data").unwrap();
+                let win = win_lock.read().unwrap();
+                memory_samples.push(win.memory_usage());
+                batch_counts.push(win.batch_count());
+            }
+        }
+
+        // ---- Assertions ----
+
+        // 1. After warmup (first 10 iterations), memory should never exceed
+        //    ~6 batches (5 for over window + 1 grace for timing).
+        let warmup = 10;
+        let max_after_warmup = memory_samples[warmup..].iter().max().copied().unwrap();
+        assert!(
+            max_after_warmup <= one_batch_size * (expected_batches_per_window + 1),
+            "memory should stabilize after warmup: max={max_after_warmup} > {} ({} batches + 1 grace)",
+            one_batch_size * (expected_batches_per_window + 1),
+            expected_batches_per_window
+        );
+
+        // 2. Batch count should NOT grow unbounded.
+        let max_batches_after_warmup = batch_counts[warmup..].iter().max().copied().unwrap();
+        assert!(
+            max_batches_after_warmup <= expected_batches_per_window + 1,
+            "batch count should stabilize: max={max_batches_after_warmup} > {}",
+            expected_batches_per_window + 1
+        );
+
+        // 3. Memory samples in the LAST 50 iterations should oscillate within
+        //    a tight range (not trending up). The max in the second half
+        //    should be <= the max in a broader window after warmup.
+        let second_half = memory_samples.len() / 2;
+        let max_second_half = memory_samples[second_half..].iter().max().copied().unwrap();
+        assert!(
+            max_second_half <= one_batch_size * (expected_batches_per_window + 1),
+            "memory in second half should not grow: max={max_second_half}"
+        );
+
+        // 4. The final memory should be within the expected range (not
+        //    accumulating over time).
+        let final_memory = memory_samples.last().copied().unwrap();
+        assert!(
+            final_memory >= one_batch_size
+                && final_memory <= one_batch_size * (expected_batches_per_window + 1),
+            "final memory should be in range [1, {}] batches, got {final_memory} bytes (~{} batches)",
+            expected_batches_per_window + 1,
+            final_memory / one_batch_size
+        );
+
+        // 5. Batch count should NOT grow beyond the over window capacity.
+        //     After warmup, max batches should be <= expected + 2.
+        let max_batches = batch_counts[warmup..].iter().max().copied().unwrap();
+        assert!(
+            max_batches <= expected_batches_per_window + 2,
+            "batch count should not grow: max={max_batches} > {}",
+            expected_batches_per_window + 2
+        );
+
+        // 6. The final batch count should be in the expected range
+        //     (not accumulating over time).
+        let final_batches = batch_counts.last().copied().unwrap();
+        assert!(
+            final_batches >= 1 && final_batches <= expected_batches_per_window + 2,
+            "final batch count should be in range [1, {}], got {final_batches}",
+            expected_batches_per_window + 2
+        );
+    }
+
+    // -- 4. evictor_long_running_with_snapshots ---------------------------------
+
+    /// Similar to the long-running test above, but additionally simulates
+    /// rule-like snapshot reads on each iteration. The snapshots are
+    /// dropped before the next iteration — this verifies that Arc references
+    /// from snapshot() / read_since() are released and don't prevent
+    /// eviction memory from being reclaimed.
+    #[test]
+    fn evictor_long_running_with_snapshots() {
+        let schema = test_schema();
+        let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+        let one_batch_size = probe.get_array_memory_size();
+
+        let reg = WindowRegistry::build(vec![WindowDef {
+            params: WindowParams {
+                name: "data".into(),
+                schema: schema.clone(),
+                time_col_index: Some(0),
+                over: Duration::from_secs(10),
+            },
+            streams: vec![],
+            config: test_config(),
+        }])
+        .unwrap();
+
+        let evictor = Evictor::new(usize::MAX);
+        let step_nanos = 2_000_000_000i64;
+        let over_nanos = 10_000_000_000i64;
+        let expected_batches_per_window = (over_nanos / step_nanos) as usize;
+
+        let total_iterations = 200;
+        let mut memory_samples: Vec<usize> = Vec::new();
+
+        // Hold a cursor to simulate read_since behavior.
+        let mut cursor: u64 = 0;
+
+        for i in 0..total_iterations {
+            let now = (i as i64 + 1) * step_nanos;
+
+            // Inject.
+            {
+                let win_lock = reg.get_window("data").unwrap();
+                let mut win = win_lock.write().unwrap();
+                win.append(make_batch(&schema, &[now], &[(i * 10) as i64]))
+                    .unwrap();
+            }
+
+            // Simulate rule reading: take a snapshot, process, drop.
+            {
+                let win_lock = reg.get_window("data").unwrap();
+                let win = win_lock.read().unwrap();
+                let (_batches, new_cursor, _gap) = win.read_since(cursor);
+                cursor = new_cursor;
+                // _batches is dropped here — Arc refcount decremented.
+            }
+
+            // Evict.
+            evictor.run_once(&reg, now);
+
+            // Sample.
+            {
+                let win_lock = reg.get_window("data").unwrap();
+                let win = win_lock.read().unwrap();
+                memory_samples.push(win.memory_usage());
+            }
+        }
+
+        // Memory after warmup should stabilize — snapshots don't leak.
+        let warmup = 10;
+        let max_after_warmup = memory_samples[warmup..].iter().max().copied().unwrap();
+        assert!(
+            max_after_warmup <= one_batch_size * (expected_batches_per_window + 1),
+            "memory should stabilize with snapshots: max={max_after_warmup}"
+        );
+    }
+
+    // -- 5. evictor_long_running_multi_window ----------------------------------
+
+    /// Three windows with different over durations, running simultaneously.
+    /// Validates that per-window eviction works independently and global
+    /// memory doesn't leak.
+    #[test]
+    fn evictor_long_running_multi_window() {
+        let schema = test_schema();
+        let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+        let one_batch_size = probe.get_array_memory_size();
+
+        let reg = WindowRegistry::build(vec![
+            WindowDef {
+                params: WindowParams {
+                    name: "short".into(),
+                    schema: schema.clone(),
+                    time_col_index: Some(0),
+                    over: Duration::from_secs(5), // 5s over
+                },
+                streams: vec![],
+                config: test_config(),
+            },
+            WindowDef {
+                params: WindowParams {
+                    name: "medium".into(),
+                    schema: schema.clone(),
+                    time_col_index: Some(0),
+                    over: Duration::from_secs(20), // 20s over
+                },
+                streams: vec![],
+                config: test_config(),
+            },
+            WindowDef {
+                params: WindowParams {
+                    name: "alert".into(),
+                    schema: schema.clone(),
+                    time_col_index: None, // no time column → never time-evicted
+                    over: Duration::ZERO,
+                },
+                streams: vec![],
+                config: test_config(),
+            },
+        ])
+        .unwrap();
+
+        // Alert window needs memory eviction since it has no time col.
+        // Global cap = 10 batches' worth (shared across all windows).
+        let evictor = Evictor::new(one_batch_size * 10);
+        let step_nanos = 1_000_000_000i64; // 1s per step
+
+        let total_iterations = 300;
+        let warmup = 30;
+
+        let mut memory_short: Vec<usize> = Vec::new();
+        let mut memory_medium: Vec<usize> = Vec::new();
+        let mut memory_alert: Vec<usize> = Vec::new();
+
+        for i in 0..total_iterations {
+            let now = (i as i64 + 1) * step_nanos;
+
+            // Inject into all three windows.
+            for name in &["short", "medium", "alert"] {
+                let win_lock = reg.get_window(name).unwrap();
+                let mut win = win_lock.write().unwrap();
+                win.append(make_batch(&schema, &[now], &[(i * 10) as i64]))
+                    .unwrap();
+            }
+
+            evictor.run_once(&reg, now);
+
+            for (name, samples) in [
+                ("short", &mut memory_short),
+                ("medium", &mut memory_medium),
+                ("alert", &mut memory_alert),
+            ] {
+                let win_lock = reg.get_window(name).unwrap();
+                let win = win_lock.read().unwrap();
+                samples.push(win.memory_usage());
+            }
+        }
+
+        // 1. Short window (over=5s) — max ~5 batches after warmup.
+        let max_short = memory_short[warmup..].iter().max().copied().unwrap();
+        assert!(
+            max_short <= one_batch_size * 6,
+            "short window (over=5s) memory should stabilize: max={max_short}"
+        );
+
+        // 2. Medium window (over=20s) — max ~20 batches after warmup.
+        let max_medium = memory_medium[warmup..].iter().max().copied().unwrap();
+        assert!(
+            max_medium <= one_batch_size * 21,
+            "medium window (over=20s) memory should stabilize: max={max_medium}"
+        );
+
+        // 3. Alert window (no time eviction) — should be kept in check by
+        //    the global memory cap (10 batches).
+        let max_alert = memory_alert.iter().max().copied().unwrap();
+        let global_cap_batches = 10;
+        assert!(
+            max_alert <= one_batch_size * (global_cap_batches + 2),
+            "alert window memory should be bounded by global cap: max={max_alert}"
+        );
+
+        // 4. Total memory across all windows should not grow unbounded.
+        let final_total: usize = memory_short.last().copied().unwrap()
+            + memory_medium.last().copied().unwrap()
+            + memory_alert.last().copied().unwrap();
+        let max_total: usize = memory_short[warmup..]
+            .iter()
+            .zip(memory_medium[warmup..].iter())
+            .zip(memory_alert[warmup..].iter())
+            .map(|((s, m), a)| s + m + a)
+            .max()
+            .unwrap();
+        assert!(
+            final_total <= one_batch_size * 40,
+            "total memory should not grow unbounded: final={final_total}, max={max_total}"
+        );
+    }
+
+    // -- 6. evictor_empty_registry --------------------------------------------
 
     #[test]
     fn evictor_empty_registry() {
