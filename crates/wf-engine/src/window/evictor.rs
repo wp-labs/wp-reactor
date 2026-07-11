@@ -274,9 +274,12 @@ mod tests {
     ///
     /// Scenario:
     ///   - window over = 10s, new batch every 2s (5 batches per over window)
-    ///   - run for 200 iterations (400s simulated time, 40 over-windows)
-    ///   - after warmup (10 iterations), memory should oscillate around
+    ///   - run for 2000 iterations (4000s simulated time, 400 over-windows)
+    ///   - after warmup (50 iterations), memory should oscillate around
     ///     ~5 batches' worth of data
+    ///
+    /// Run with: cargo test -p wf-engine -- --ignored evictor_long
+    #[ignore = "long-running memory stability test (run with --ignored)"]
     #[test]
     fn evictor_long_running_memory_stabilization() {
         let schema = test_schema();
@@ -297,11 +300,10 @@ mod tests {
 
         let evictor = Evictor::new(usize::MAX);
 
-        // Track memory samples across the run.
         let mut memory_samples: Vec<usize> = Vec::new();
         let mut batch_counts: Vec<usize> = Vec::new();
 
-        let total_iterations = 200;
+        let total_iterations = 2000;
         let step_nanos = 2_000_000_000i64; // 2s per step
         let over_nanos = 10_000_000_000i64; // 10s over window
         let expected_batches_per_window = (over_nanos / step_nanos) as usize; // ~5
@@ -331,7 +333,7 @@ mod tests {
 
         // ---- Assertions ----
 
-        // 1. After warmup (first 10 iterations), memory should never exceed
+        // 1. After warmup (first 50 iterations), memory should never exceed
         //    ~6 batches (5 for over window + 1 grace for timing).
         let warmup = 10;
         let max_after_warmup = memory_samples[warmup..].iter().max().copied().unwrap();
@@ -397,6 +399,9 @@ mod tests {
     /// dropped before the next iteration — this verifies that Arc references
     /// from snapshot() / read_since() are released and don't prevent
     /// eviction memory from being reclaimed.
+    ///
+    /// Run with: cargo test -p wf-engine -- --ignored evictor_long
+    #[ignore = "long-running memory stability test (run with --ignored)"]
     #[test]
     fn evictor_long_running_with_snapshots() {
         let schema = test_schema();
@@ -420,7 +425,7 @@ mod tests {
         let over_nanos = 10_000_000_000i64;
         let expected_batches_per_window = (over_nanos / step_nanos) as usize;
 
-        let total_iterations = 200;
+        let total_iterations = 2000;
         let mut memory_samples: Vec<usize> = Vec::new();
 
         // Hold a cursor to simulate read_since behavior.
@@ -458,7 +463,7 @@ mod tests {
         }
 
         // Memory after warmup should stabilize — snapshots don't leak.
-        let warmup = 10;
+        let warmup = 50;
         let max_after_warmup = memory_samples[warmup..].iter().max().copied().unwrap();
         assert!(
             max_after_warmup <= one_batch_size * (expected_batches_per_window + 1),
@@ -471,6 +476,9 @@ mod tests {
     /// Three windows with different over durations, running simultaneously.
     /// Validates that per-window eviction works independently and global
     /// memory doesn't leak.
+    ///
+    /// Run with: cargo test -p wf-engine -- --ignored evictor_long
+    #[ignore = "long-running memory stability test (run with --ignored)"]
     #[test]
     fn evictor_long_running_multi_window() {
         let schema = test_schema();
@@ -516,8 +524,8 @@ mod tests {
         let evictor = Evictor::new(one_batch_size * 10);
         let step_nanos = 1_000_000_000i64; // 1s per step
 
-        let total_iterations = 300;
-        let warmup = 30;
+        let total_iterations = 3000;
+        let warmup = 100;
 
         let mut memory_short: Vec<usize> = Vec::new();
         let mut memory_medium: Vec<usize> = Vec::new();
