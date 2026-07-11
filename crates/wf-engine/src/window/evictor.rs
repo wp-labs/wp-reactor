@@ -595,7 +595,113 @@ mod tests {
         );
     }
 
-    // -- 6. evictor_empty_registry --------------------------------------------
+    // -- 6. evictor_burst_then_drain ------------------------------------------
+
+    /// Simulates a traffic burst followed by a quiet period. Validates that
+    /// memory is fully released after the over window expires.
+    ///
+    /// Scenario:
+    ///   - window over = 10s
+    ///   - Burst: 100 batches injected at t=0s → peak memory ≈ 100 batches
+    ///   - Drain: advance now from 0s → 20s in steps, evict each step
+    ///   - After t > 10s (over expired), memory should drop to 0
+    ///
+    /// This directly answers: "does the window release memory after a burst?"
+    ///
+    /// Run with: cargo test -p wf-engine --features mem_test evictor_burst
+    #[cfg(feature = "mem_test")]
+    #[test]
+    fn evictor_burst_then_drain() {
+        let schema = test_schema();
+        let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+        let one_batch_size = probe.get_array_memory_size();
+
+        let reg = WindowRegistry::build(vec![WindowDef {
+            params: WindowParams {
+                name: "data".into(),
+                schema: schema.clone(),
+                time_col_index: Some(0),
+                over: Duration::from_secs(10),
+            },
+            streams: vec![],
+            config: test_config(),
+        }])
+        .unwrap();
+
+        let evictor = Evictor::new(usize::MAX);
+
+        // Phase 1 — Burst: inject 100 batches, all at t = 1s
+        let burst_count = 100;
+        for i in 0..burst_count {
+            let win_lock = reg.get_window("data").unwrap();
+            let mut win = win_lock.write().unwrap();
+            win.append(make_batch(&schema, &[1_000_000_000], &[i as i64]))
+                .unwrap();
+        }
+
+        let win_lock = reg.get_window("data").unwrap();
+        let win = win_lock.read().unwrap();
+        let peak_memory = win.memory_usage();
+        let peak_batches = win.batch_count();
+        drop(win);
+
+        assert!(
+            peak_batches == burst_count as usize,
+            "after burst: expected {burst_count} batches, got {peak_batches}"
+        );
+        assert!(
+            peak_memory >= one_batch_size * (burst_count as usize),
+            "peak memory too low: {peak_memory} < {} * {burst_count}",
+            one_batch_size
+        );
+
+        // Phase 2 — Drain: advance now from 2s to 20s in 2s steps.
+        //   batches at t=1s expire when now > 1s + 10s = 11s.
+        //   So at now=12s, cutoff=2s → all batches evicted.
+        let mut memory_samples: Vec<usize> = vec![peak_memory];
+
+        for step in 1..=10 {
+            let now_nanos = (step + 1) * 2_000_000_000i64;
+            evictor.run_once(&reg, now_nanos);
+
+            let win_lock = reg.get_window("data").unwrap();
+            let win = win_lock.read().unwrap();
+            memory_samples.push(win.memory_usage());
+        }
+
+        // ---- Assertions ----
+
+        // 1. Final memory should be 0 (all batches expired).
+        let final_memory = memory_samples.last().copied().unwrap();
+        assert_eq!(
+            final_memory, 0,
+            "after drain, memory should be 0, got {final_memory}"
+        );
+
+        // 2. Window should be empty.
+        let win_lock = reg.get_window("data").unwrap();
+        let win = win_lock.read().unwrap();
+        assert!(
+            win.is_empty(),
+            "after drain, window should be empty, got {} batches",
+            win.batch_count()
+        );
+        assert_eq!(win.memory_usage(), 0, "memory_usage should be 0");
+        assert_eq!(win.total_rows(), 0, "total_rows should be 0");
+
+        // 3. Memory should monotonically decrease after the first step
+        //    (no spike during drain).
+        for i in 1..memory_samples.len() {
+            assert!(
+                memory_samples[i] <= memory_samples[i - 1],
+                "memory should not increase during drain: step {i}: {} > {}",
+                memory_samples[i],
+                memory_samples[i - 1]
+            );
+        }
+    }
+
+    // -- 7. evictor_empty_registry --------------------------------------------
 
     #[test]
     fn evictor_empty_registry() {
