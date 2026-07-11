@@ -26,7 +26,7 @@ while self.current_bytes > max_bytes {
 
 ## 全局控制 (`max_total_bytes`)
 
-`Evictor` 周期运行（`evict_interval`），分两阶段：
+`Evictor` 周期运行（`evict_interval`），遍历同一组窗口列表（`window_names()`），分两阶段：
 
 ### Phase 1 — 时间逐出
 
@@ -38,7 +38,11 @@ pub fn evict_expired(&mut self, now_nanos: i64) {
     let cutoff = now_nanos - self.over.as_nanos() as i64;
     while let Some(front) = self.batches.front() {
         if front.event_time_range.1 < cutoff {
-            self.batches.pop_front();
+            let evicted = self.batches.pop_front().unwrap();
+            self.current_bytes -= evicted.byte_size;
+            self.total_rows -= evicted.row_count;
+        } else {
+            break;
         }
     }
 }
@@ -46,7 +50,7 @@ pub fn evict_expired(&mut self, now_nanos: i64) {
 
 ### Phase 2 — 内存逐出
 
-计算所有窗口的 `memory_usage()` 总和。如果超过 `max_total_bytes`，找到内存占用最大的窗口，逐出其最老的 batch。重复此过程直到总内存回到限制以下。
+计算所有 buffer 窗口的 `memory_usage()` 总和（复用 Phase 1 的 `names` 列表）。如果超过 `max_total_bytes`，找到内存占用最大的窗口，逐出其最老的 batch。重复此过程直到总内存回到限制以下。
 
 ```rust
 // crates/wf-engine/src/window/evictor.rs
