@@ -31,3 +31,6 @@ moju-derive = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
+
+[features]
+mem_test = []

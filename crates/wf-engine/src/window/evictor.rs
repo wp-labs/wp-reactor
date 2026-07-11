@@ -278,8 +278,8 @@ mod tests {
     ///   - after warmup (50 iterations), memory should oscillate around
     ///     ~5 batches' worth of data
     ///
-    /// Run with: cargo test -p wf-engine -- --ignored evictor_long
-    #[ignore = "long-running memory stability test (run with --ignored)"]
+    /// Run with: cargo test -p wf-engine --features mem_test evictor_long
+    #[cfg(feature = "mem_test")]
     #[test]
     fn evictor_long_running_memory_stabilization() {
         let schema = test_schema();
@@ -400,8 +400,8 @@ mod tests {
     /// from snapshot() / read_since() are released and don't prevent
     /// eviction memory from being reclaimed.
     ///
-    /// Run with: cargo test -p wf-engine -- --ignored evictor_long
-    #[ignore = "long-running memory stability test (run with --ignored)"]
+    /// Run with: cargo test -p wf-engine --features mem_test evictor_long
+    #[cfg(feature = "mem_test")]
     #[test]
     fn evictor_long_running_with_snapshots() {
         let schema = test_schema();
@@ -477,8 +477,8 @@ mod tests {
     /// Validates that per-window eviction works independently and global
     /// memory doesn't leak.
     ///
-    /// Run with: cargo test -p wf-engine -- --ignored evictor_long
-    #[ignore = "long-running memory stability test (run with --ignored)"]
+    /// Run with: cargo test -p wf-engine --features mem_test evictor_long
+    #[cfg(feature = "mem_test")]
     #[test]
     fn evictor_long_running_multi_window() {
         let schema = test_schema();
