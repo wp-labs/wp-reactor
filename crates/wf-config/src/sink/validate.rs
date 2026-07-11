@@ -52,6 +52,7 @@ mod tests {
                 Some(FixedGroup {
                     name: "__default".into(),
                     expect: None,
+                    wf_meta_disable: vec![],
                     sinks: vec![],
                     parallel: 1,
                 })
@@ -69,6 +70,7 @@ mod tests {
             parallel: 1,
             windows: WildArray::new(&patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
             tags: vec![],
+            wf_meta_disable: vec![],
             expect: None,
             sinks: vec![],
         }

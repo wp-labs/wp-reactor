@@ -241,6 +241,9 @@ impl OutputRecord {
 pub fn data_record_to_json_string(record: &DataRecord) -> CoreResult<String> {
     let mut obj = serde_json::Map::new();
     for field in &record.items {
+        if field.get_meta() == &DataType::Ignore {
+            continue;
+        }
         obj.insert(
             field.get_name().to_string(),
             model_value_to_json(field.get_value()),
@@ -772,6 +775,27 @@ mod tests {
         assert_eq!(json["json_array_text"], "[]");
         assert_eq!(json["json_object_text"], r#"{"raw":true}"#);
         assert_eq!(json["plain_array_text"], "[not-json]");
+    }
+
+    #[test]
+    fn data_record_to_json_string_skips_ignore_fields() {
+        let mut record = DataRecord::default();
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Ignore,
+            "__wfu_rule_name",
+            ModelValue::from("rule-a"),
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
+            "message",
+            ModelValue::from("hello"),
+        )));
+
+        let json = data_record_to_json_string(&record).expect("json");
+        let json: serde_json::Value = serde_json::from_str(&json).expect("json value");
+
+        assert!(json.get("__wfu_rule_name").is_none());
+        assert_eq!(json["message"], "hello");
     }
 
     #[test]

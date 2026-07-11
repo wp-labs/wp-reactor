@@ -8,6 +8,8 @@ use super::route::{RouteGroup, RouteSink};
 use super::types::{ParamMap, WildArray};
 use crate::error::{ConfigReason, ConfigResult};
 
+const WFU_META_PREFIX: &str = "__wfu_";
+
 // ---------------------------------------------------------------------------
 // Parameter merging
 // ---------------------------------------------------------------------------
@@ -95,6 +97,8 @@ pub fn build_flex_group(
     connectors: &BTreeMap<String, ConnectorDef>,
     defaults: &DefaultsBody,
 ) -> ConfigResult<FlexGroup> {
+    validate_wf_meta_disable_fields(&route_group.wf_meta_disable)?;
+
     let parallel = route_group.parallel.unwrap_or(1).clamp(1, 10);
 
     let windows = match &route_group.windows {
@@ -124,6 +128,7 @@ pub fn build_flex_group(
         parallel,
         windows,
         tags: merged_tags,
+        wf_meta_disable: route_group.wf_meta_disable.clone(),
         expect: route_group.expect.clone(),
         sinks,
     })
@@ -135,6 +140,8 @@ pub fn build_fixed_group(
     connectors: &BTreeMap<String, ConnectorDef>,
     defaults: &DefaultsBody,
 ) -> ConfigResult<FixedGroup> {
+    validate_wf_meta_disable_fields(&route_group.wf_meta_disable)?;
+
     let parallel = route_group.parallel.unwrap_or(1).clamp(1, 10);
     let group_tags = route_group.tags.as_deref();
 
@@ -154,9 +161,22 @@ pub fn build_fixed_group(
     Ok(FixedGroup {
         name: route_group.name.clone(),
         expect: route_group.expect.clone(),
+        wf_meta_disable: route_group.wf_meta_disable.clone(),
         sinks,
         parallel,
     })
+}
+
+fn validate_wf_meta_disable_fields(fields: &[String]) -> ConfigResult<()> {
+    for field in fields {
+        if !field.starts_with(WFU_META_PREFIX) {
+            return ConfigReason::Sink.fail(format!(
+                "wf_meta_disable field {:?} must start with {:?}",
+                field, WFU_META_PREFIX
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +306,7 @@ mod tests {
             parallel: None,
             windows: Some(super::super::types::StringOrArray(vec!["sec_*".into()])),
             tags: None,
+            wf_meta_disable: vec!["__wfu_rule_name".into()],
             expect: None,
             sinks: vec![RouteSink {
                 connect: "file_json".into(),
@@ -309,6 +330,7 @@ mod tests {
 
         assert_eq!(group.name, "test_group");
         assert_eq!(group.parallel, 1);
+        assert_eq!(group.wf_meta_disable, vec!["__wfu_rule_name".to_string()]);
         assert!(group.windows.matches("sec_alerts"));
         assert!(!group.windows.matches("net_alerts"));
         assert_eq!(group.sinks.len(), 1);
@@ -336,6 +358,7 @@ mod tests {
             parallel: None,
             windows: None,
             tags: None,
+            wf_meta_disable: vec![],
             expect: None,
             sinks: vec![RouteSink {
                 connect: "missing".into(),
@@ -348,5 +371,31 @@ mod tests {
         };
         let defaults = DefaultsBody::default();
         assert!(build_flex_group(&route, &connectors, &defaults).is_err());
+    }
+
+    #[test]
+    fn build_flex_group_rejects_non_wfu_meta_disable_field() {
+        let mut connectors = BTreeMap::new();
+        connectors.insert("file_json".into(), sample_connector());
+
+        let route = RouteGroup {
+            name: "test".into(),
+            parallel: None,
+            windows: None,
+            tags: None,
+            wf_meta_disable: vec!["message".into()],
+            expect: None,
+            sinks: vec![RouteSink {
+                connect: "file_json".into(),
+                name: None,
+                fields: None,
+                params: ParamMap::new(),
+                tags: None,
+                expect: None,
+            }],
+        };
+        let defaults = DefaultsBody::default();
+        let err = build_flex_group(&route, &connectors, &defaults).unwrap_err();
+        assert!(err.to_string().contains("must start"));
     }
 }

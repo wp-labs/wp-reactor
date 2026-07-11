@@ -17,11 +17,13 @@ All notable changes to wp-reactor will be documented in this file.
 - **wf-lang**: Added explicit WFS window subscription syntax with `stream_tag = ...` and `stream_tag = [...]`.
 - **wf-runtime**: Added dynamic stream-tag routing for file NDJSON/CSV replay and external NDJSON sources via `stream_tag_field`, defaulting to `wp_stream_tag`.
 - **wf-runtime**: Added per-batch Arrow framed tag tracking so multiple Arrow frames received in one source batch are routed by their own frame tags.
+- **wf-config / wf-runtime**: Added sink-group scoped `wf_meta_disable = ["__wfu_*"]` output metadata control for disabling selected WarpFusion-managed alert fields per sink group.
 
 ### Changed
 
 - **wf-config / wf-runtime**: Renamed fixed source routing from `stream` to `stream_tag`, and renamed the dynamic payload carrier option from `arrow_tag` to `stream_tag_field`.
 - **wf-config**: Relaxed source validation so NDJSON/CSV sources can use dynamic `stream_tag_field` routing without a fixed `stream_tag`, while `arrow_ipc` sources still require an explicit `stream_tag`.
+- **wf-engine**: `wf_meta_disable` now marks configured metadata fields as `DataType::Ignore` before sink output, aligning with the wp-motor output suppression model while preserving fields inside the record.
 
 ### Fixed
 

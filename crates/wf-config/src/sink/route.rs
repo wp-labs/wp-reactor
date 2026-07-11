@@ -45,6 +45,9 @@ pub struct RouteGroup {
     /// Tags to attach to all alerts in this group.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// WarpFusion-managed `__wfu_*` metadata fields to disable in this group's output.
+    #[serde(default)]
+    pub wf_meta_disable: Vec<String>,
     /// Group-level expect specification.
     pub expect: Option<GroupExpectSpec>,
     /// Sinks within this group.
@@ -90,6 +93,7 @@ version = "1.0"
 [sink_group]
 name = "security_output"
 windows = ["security_*"]
+wf_meta_disable = ["__wfu_rule_name"]
 
 [[sink_group.sinks]]
 connect = "file_json"
@@ -100,6 +104,10 @@ file = "security_alerts.jsonl"
 "#;
         let file: RouteFile = toml::from_str(toml_str).unwrap();
         assert_eq!(file.sink_group.name, "security_output");
+        assert_eq!(
+            file.sink_group.wf_meta_disable,
+            vec!["__wfu_rule_name".to_string()]
+        );
         let windows = file.sink_group.windows.as_ref().unwrap();
         assert_eq!(windows.0, vec!["security_*"]);
         assert_eq!(file.sink_group.sinks.len(), 1);
@@ -121,6 +129,7 @@ file = "unrouted.jsonl"
 "#;
         let file: RouteFile = toml::from_str(toml_str).unwrap();
         assert_eq!(file.sink_group.name, "__default");
+        assert!(file.sink_group.wf_meta_disable.is_empty());
         assert!(file.sink_group.windows.is_none());
     }
 

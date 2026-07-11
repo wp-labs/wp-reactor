@@ -83,21 +83,28 @@ pub async fn build_sink_dispatcher(
     // Build business groups (name, compiled windows, sinks)
     let mut business: Vec<(String, WildArray, Vec<Arc<SinkRuntime>>)> = Vec::new();
     for flex in &bundle.business {
-        let sinks = build_sink_runtimes(&flex.sinks, &flex.tags, registry, &ctx).await?;
+        let sinks = build_sink_runtimes(
+            &flex.sinks,
+            &flex.tags,
+            &flex.wf_meta_disable,
+            registry,
+            &ctx,
+        )
+        .await?;
         let windows = WildArray::new(flex.windows.raw_patterns());
         business.push((flex.name.clone(), windows, sinks));
     }
 
     // Build infra default sinks
     let default_sinks = if let Some(ref fixed) = bundle.infra_default {
-        build_sink_runtimes(&fixed.sinks, &[], registry, &ctx).await?
+        build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, registry, &ctx).await?
     } else {
         Vec::new()
     };
 
     // Build infra error sinks
     let error_sinks = if let Some(ref fixed) = bundle.infra_error {
-        build_sink_runtimes(&fixed.sinks, &[], registry, &ctx).await?
+        build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, registry, &ctx).await?
     } else {
         Vec::new()
     };
@@ -115,7 +122,7 @@ pub async fn build_sink_dispatcher(
     }
 
     let monitor_sinks = if let Some(ref fixed) = bundle.infra_monitor {
-        build_sink_runtimes(&fixed.sinks, &[], registry, &ctx).await?
+        build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, registry, &ctx).await?
     } else {
         Vec::new()
     };
@@ -151,6 +158,7 @@ pub async fn build_sink_dispatcher(
 async fn build_sink_runtimes(
     specs: &[ResolvedRouteSink],
     tags: &[String],
+    wf_meta_disable: &[String],
     registry: &SinkFactoryRegistry,
     ctx: &SinkBuildCtx,
 ) -> RuntimeResult<Vec<Arc<SinkRuntime>>> {
@@ -195,6 +203,7 @@ async fn build_sink_runtimes(
             handle: tokio::sync::Mutex::new(handle),
             tags: tags.to_vec(),
             output_fields: resolved.fields.clone(),
+            wf_meta_disable: wf_meta_disable.to_vec(),
         }));
     }
 

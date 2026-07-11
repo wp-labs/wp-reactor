@@ -340,6 +340,21 @@ file = "${WF_CONFIG_SINK_ENV_OUT_FILE:alerts.jsonl}"
 "#
     }
 
+    fn sample_business_toml_with_wf_meta_disabled() -> &'static str {
+        r#"
+[sink_group]
+name = "catch_all"
+windows = ["*"]
+wf_meta_disable = ["__wfu_rule_name"]
+
+[[sink_group.sinks]]
+connect = "file_json"
+
+[sink_group.sinks.params]
+file = "all.jsonl"
+"#
+    }
+
     fn sample_connector_toml_with_file_vars() -> &'static str {
         r#"
 [vars]
@@ -391,6 +406,31 @@ file = "${OUT_FILE}"
         let bundle = load_sink_config(&sink_root).expect("load sink config");
         assert!(bundle.connectors.contains_key("file_json"));
         assert_eq!(bundle.business.len(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loads_wf_meta_disable_from_route_file() {
+        let root = make_temp_dir("sink-wf-meta-disable");
+        let sink_root = root.join("examples/sinks");
+
+        write_file(
+            &root.join("examples/connectors/sink.d/file_json.toml"),
+            sample_connector_toml(),
+        );
+        write_file(
+            &sink_root.join("business.d/catch_all.toml"),
+            sample_business_toml_with_wf_meta_disabled(),
+        );
+
+        let bundle = load_sink_config(&sink_root).expect("load sink config");
+
+        assert_eq!(bundle.business.len(), 1);
+        assert_eq!(
+            bundle.business[0].wf_meta_disable,
+            vec!["__wfu_rule_name".to_string()]
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
