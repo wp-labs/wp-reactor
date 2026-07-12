@@ -130,7 +130,7 @@ data_format = "ndjson"
 type = "file"
 path = "data/events.jsonl"
 data_format = "ndjson"
-stream_tag_field = "wp_stream_tag"
+stream_tag_field = "wp_oml_name"
 ```
 
 #### `arrow_framed`

@@ -2,45 +2,92 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [0.1.30 Unreleased]
+## [0.1.31 Unreleased]
+
+### Changed
+
+- **wf-runtime**: Changed the default dynamic stream-tag payload carrier from `wp_stream_tag` to `wp_oml_name`, matching warp-parse OML output naming.
+- **User guide**: Updated runtime source examples to use `stream_tag_field = "wp_oml_name"`.
+
+## [0.1.30] — 2026-07-11
 
 ### Added
 
-- **wf-lang**: Added type checking and inference for new WFL helper functions: `now()`, `now_s()`, `now_ms()`, `now_us()`, `now_ns()`, `is_blank()`, `null_if_blank()`, `default_if_blank()`, `md5()`, `sha1()`, `sha256()`, `hex()`, and `stable_id()`.
-- **wf-lang**: Added source-aware WFL diagnostics for parse and semantic compile failures, including file path, diagnostic category, rule/test context, line/column, and source snippets.
-- **wf-lang**: Added structured WFL literals `object { ... }` and `array [ ... ]` for building nested output values in `yield`, including object field type hints and duplicate-field validation.
-- **wf-lang**: Added WFS schema support for output-only `object`, untyped `array`, and typed `array/T` fields.
-- **wf-engine**: Added runtime support for current engine time helpers, blank-string helpers, hash/hex helpers, and stable alert ID generation in both L2 expression evaluation and yield/L3 evaluation paths.
-- **wf-engine**: Added runtime evaluation and alert export support for structured object and array values, including nested model values and deterministic JSON rendering for structured string output.
-- **wf-runtime**: Added UTF-8 storage bridging for structured `object` / `array` fields so structured source values can be serialized into intermediate pipeline windows.
-- **wf-runtime**: Rule bootstrap now surfaces source-aware WFL diagnostics for rule-file parse errors, semantic compile errors, and intermediate topology cycle errors.
 - **wf-lang**: Added explicit WFS window subscription syntax with `stream_tag = ...` and `stream_tag = [...]`.
-- **wf-runtime**: Added dynamic stream-tag routing for file NDJSON/CSV replay and external NDJSON sources via `stream_tag_field`, defaulting to `wp_stream_tag`.
+- **wf-runtime**: Added dynamic stream-tag routing for file NDJSON/CSV replay and external NDJSON sources via `stream_tag_field`, defaulting to `wp_stream_tag` in this release.
 - **wf-runtime**: Added per-batch Arrow framed tag tracking so multiple Arrow frames received in one source batch are routed by their own frame tags.
 - **wf-config / wf-runtime**: Added sink-group scoped `wf_meta_disable = ["__wfu_*"]` output metadata control for disabling selected WarpFusion-managed alert fields per sink group.
+- **wf-engine**: Added long-running and burst-then-drain tests for window memory eviction behavior.
 
 ### Changed
 
 - **wf-config / wf-runtime**: Renamed fixed source routing from `stream` to `stream_tag`, and renamed the dynamic payload carrier option from `arrow_tag` to `stream_tag_field`.
 - **wf-config**: Relaxed source validation so NDJSON/CSV sources can use dynamic `stream_tag_field` routing without a fixed `stream_tag`, while `arrow_ipc` sources still require an explicit `stream_tag`.
 - **wf-engine**: `wf_meta_disable` now marks configured metadata fields as `DataType::Ignore` before sink output, aligning with the wp-motor output suppression model while preserving fields inside the record.
+- **wf-engine tests**: Gated long-running memory tests behind the `mem_test` feature.
+
+### Documentation
+
+- **Design / user guide**: Documented `stream_tag`, `stream_tag_field`, Arrow framed tag routing, and JSON/CSV payload carrier routing.
+- **Design docs**: Added window memory control design notes and clarified `evict_expired` naming.
+
+## [0.1.29] — 2026-07-10
+
+### Added
+
+- **wf-lang**: Added structured WFL literals `object { ... }` and `array [ ... ]` for building nested output values in `yield`, including object field type hints and duplicate-field validation.
+- **wf-lang**: Added WFS schema support for output-only `object`, untyped `array`, and typed `array/T` fields.
+- **wf-engine**: Added runtime evaluation and alert export support for structured object and array values, including nested model values and deterministic JSON rendering for structured string output.
+- **wf-runtime**: Added UTF-8 storage bridging for structured `object` / `array` fields so structured source values can be serialized into intermediate pipeline windows.
+
+### Documentation
+
+- **User guide**: Documented WFS `object`, `array`, and `array/T` field types and WFL `object { ... }` / `array [ ... ]` structured output syntax.
+
+### Fixed
+
+- **wf-lang**: Structured `object` / `array` field declarations are now rejected for stream and provider input windows; source JSON object/array values should be declared as `chars` and structured outputs built in `yield`.
+- **wf-lang**: `mvcount`, `mvjoin`, `mvdedup`, `mvsort`, `mvreverse`, `mvindex`, and `mvappend` now accept untyped and empty array literals where runtime behavior supports them.
+- **wf-lang**: `array/float` and `mvappend` type checks now consistently allow digit/float element promotion.
+- **wf-runtime**: Structured pipeline values now fail fast on non-finite numeric values instead of silently serializing invalid JSON.
+
+## [0.1.28] — 2026-07-10
+
+### Added
+
+- **wf-lang**: Added source-aware WFL diagnostics for parse and semantic compile failures, including file path, diagnostic category, rule/test context, line/column, and source snippets.
+- **wf-runtime**: Rule bootstrap now surfaces source-aware WFL diagnostics for rule-file parse errors, semantic compile errors, and intermediate topology cycle errors.
+
+### Fixed
+
+- **wf-lang**: Improved WFL diagnostic location selection for `yield` errors so repeated tokens in `match`, `entity`, and `yield` clauses point to the failing `yield` argument, including inline single-line rules.
+
+## [0.1.27] — 2026-07-09
+
+### Added
+
+- **wf-lang**: Added type checking and inference for new WFL helper functions: `now()`, `now_s()`, `now_ms()`, `now_us()`, `now_ns()`, `is_blank()`, `null_if_blank()`, `default_if_blank()`, `md5()`, `sha1()`, `sha256()`, `hex()`, and `stable_id()`.
+- **wf-engine**: Added runtime support for current engine time helpers, blank-string helpers, hash/hex helpers, and stable alert ID generation in both L2 expression evaluation and yield/L3 evaluation paths.
 
 ### Fixed
 
 - **wf-engine**: `now_*` helpers now share one cached timestamp within a single expression and across all yield fields for one output record, preventing `created_time` / `created_ns` drift inside the same alert.
 - **wf-engine**: `stable_id()` now hashes typed, length-prefixed value segments instead of ambiguous separator-joined values, avoiding collisions when inputs contain separator-like bytes.
-- **wf-lang**: Structured `object` / `array` field declarations are now rejected for stream and provider input windows; source JSON object/array values should be declared as `chars` and structured outputs built in `yield`.
-- **wf-lang**: `mvcount`, `mvjoin`, `mvdedup`, `mvsort`, `mvreverse`, `mvindex`, and `mvappend` now accept untyped and empty array literals where runtime behavior supports them.
-- **wf-lang**: `array/float` and `mvappend` type checks now consistently allow digit/float element promotion.
-- **wf-lang**: Improved WFL diagnostic location selection for `yield` errors so repeated tokens in `match`, `entity`, and `yield` clauses point to the failing `yield` argument, including inline single-line rules.
-- **wf-runtime**: Structured pipeline values now fail fast on non-finite numeric values instead of silently serializing invalid JSON.
-- **wf-config tests**: Updated fusion config tests for `stream_tag` and made temporary test directories unique for parallel execution.
 
 ### Documentation
 
-- **User guide**: Documented WFS `object`, `array`, and `array/T` field types and WFL `object { ... }` / `array [ ... ]` structured output syntax.
 - **User guide**: Expanded the WFL language reference with current blank handling, current-time, time formatting/parsing, hash/encoding, stable ID, and multivalue function behavior.
-- **User guide / design docs**: Documented `stream_tag`, `stream_tag_field`, and the `wp_stream_tag` JSON/CSV carrier field across runtime configuration and WFS usage.
+
+## [0.1.26] — 2026-07-09
+
+### Added
+
+- **wf-config**: Added source-level `enable` support so disabled sources can stay in topology configuration without being started.
+- **wf-data / wf-runtime**: Added shared time parsing support for source ingestion and runtime timestamp conversion.
+
+### Fixed
+
+- **wf-config tests**: Updated fusion config tests for source enable handling and time parsing coverage.
 
 ## [0.1.25] — 2026-07-02
 

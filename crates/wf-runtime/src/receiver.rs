@@ -19,7 +19,7 @@ use wf_lang::{BaseType, FieldType, WindowSchema};
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::metrics::RuntimeMetrics;
 
-pub const DEFAULT_STREAM_TAG_FIELD: &str = "wp_stream_tag";
+pub const DEFAULT_STREAM_TAG_FIELD: &str = "wp_oml_name";
 
 #[derive(Clone, Copy)]
 pub struct ReplayRoute<'a> {
@@ -1107,9 +1107,9 @@ mod tests {
         let file_path = dir.path().join("events.ndjson");
         std::fs::write(
             &file_path,
-            r#"{"wp_stream_tag":"a","ts":1000000000,"value":1}
-{"wp_stream_tag":"b","ts":"2000000000","value":"2"}
-{"wp_stream_tag":"a","ts":3000000000,"value":3}
+            r#"{"wp_oml_name":"a","ts":1000000000,"value":1}
+{"wp_oml_name":"b","ts":"2000000000","value":"2"}
+{"wp_oml_name":"a","ts":3000000000,"value":3}
 "#,
         )
         .unwrap();
@@ -1175,7 +1175,7 @@ mod tests {
         let file_path = dir.path().join("events.csv");
         std::fs::write(
             &file_path,
-            "wp_stream_tag,ts,value\n\
+            "wp_oml_name,ts,value\n\
 a,1000000000,1\n\
 b,2000000000,2\n\
 a,3000000000,3\n",

@@ -469,7 +469,7 @@ mod tests {
                 params: {
                     let mut m = BTreeMap::new();
                     m.insert("data_format".into(), "ndjson".into());
-                    m.insert("stream_tag_field".into(), "wp_stream_tag".into());
+                    m.insert("stream_tag_field".into(), "wp_oml_name".into());
                     m
                 },
             }],
@@ -551,7 +551,7 @@ mod tests {
                     let mut m = BTreeMap::new();
                     m.insert("path".into(), "data/events.csv".into());
                     m.insert("data_format".into(), "csv".into());
-                    m.insert("stream_tag_field".into(), "wp_stream_tag".into());
+                    m.insert("stream_tag_field".into(), "wp_oml_name".into());
                     m
                 },
             }],

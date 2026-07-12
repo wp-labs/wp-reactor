@@ -380,9 +380,9 @@ mod tests {
         let src = VecSource {
             id: "nd".into(),
             batches: vec![vec![
-                ndjson_event(r#"{"wp_stream_tag":"a","msg":"a1","n":1}"#),
-                ndjson_event(r#"{"wp_stream_tag":"b","msg":"b1","n":2}"#),
-                ndjson_event(r#"{"wp_stream_tag":"a","msg":"a2","n":3}"#),
+                ndjson_event(r#"{"wp_oml_name":"a","msg":"a1","n":1}"#),
+                ndjson_event(r#"{"wp_oml_name":"b","msg":"b1","n":2}"#),
+                ndjson_event(r#"{"wp_oml_name":"a","msg":"a2","n":3}"#),
             ]],
             idx: 0,
         };
