@@ -1,15 +1,15 @@
 use std::collections::HashSet;
 
-use wf_config::{FusionReloadPlan, RawFusionConfigTree, FusionConfig, WindowConfig};
+use wf_config::{FusionConfig, FusionReloadPlan, RawFusionConfigTree, WindowConfig};
 use wf_lang::WindowSchema;
 
 use crate::lifecycle::types::RunRule;
 
 mod compile;
 mod prepare;
-mod topology;
 #[cfg(test)]
 mod tests;
+mod topology;
 
 // Re-exports for external consumers
 pub use prepare::{prepare_reload, prepare_reload_with_cached};

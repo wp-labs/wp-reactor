@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use orion_error::conversion::{SourceRawErr, ToStructError};
 use toml::Value as TomlValue;
 
-use crate::vars::{ConfigVarContext, ExpandedToml, SourceAtom, TracedValue, VarsReason, VarsResult};
+use crate::vars::{
+    ConfigVarContext, ExpandedToml, SourceAtom, TracedValue, VarsReason, VarsResult,
+};
 
 mod template;
 #[cfg(test)]

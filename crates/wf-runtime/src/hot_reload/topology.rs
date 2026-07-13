@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use wf_config::{
-    ClassifiedFusionConfigChange, FusionChangeKind, FusionReloadDisposition,
-    FusionReloadPlan, RawFusionConfigChange, WindowConfig,
+    ClassifiedFusionConfigChange, FusionChangeKind, FusionReloadDisposition, FusionReloadPlan,
+    RawFusionConfigChange, WindowConfig,
 };
 use wf_lang::WindowSchema;
 

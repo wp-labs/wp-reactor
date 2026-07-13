@@ -15,11 +15,9 @@ use wf_engine::window::{WindowDef, WindowParams, WindowRegistry};
 use super::arrow::{replay_arrow_framed_file, replay_arrow_ipc_file};
 use super::batch::build_record_batch_from_json;
 use super::csv::replay_csv_file;
-use super::ndjson::{normalize_stream_tag_field, replay_ndjson_file};
-use super::route::{batch_machine_id, coerce_column, route_batch};
-use super::schema::resolve_stream_schema;
+use super::ndjson::replay_ndjson_file;
+use super::route::{batch_machine_id, coerce_column};
 use super::{DEFAULT_STREAM_TAG_FIELD, ReplayRoute};
-use crate::receiver::schema::field_type_to_arrow;
 use wf_engine::window::Router;
 
 fn test_schema() -> SchemaRef {
