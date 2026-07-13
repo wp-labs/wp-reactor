@@ -3,8 +3,8 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use wf_lang::{BaseType, FieldType, WindowSchema};
 
-use orion_error::conversion::ToStructError;
 use crate::error::{RuntimeReason, RuntimeResult};
+use orion_error::conversion::ToStructError;
 
 pub(super) fn validate_batch_schema_for_stream(
     schemas: &[WindowSchema],
@@ -67,7 +67,7 @@ fn window_schema_to_arrow(ws: &WindowSchema) -> RuntimeResult<SchemaRef> {
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn field_type_to_arrow(ft: &FieldType) -> DataType {
+pub(crate) fn field_type_to_arrow(ft: &FieldType) -> DataType {
     match ft {
         FieldType::Base(base) => base_type_to_arrow(base),
         FieldType::ArrayAny | FieldType::Array(_) | FieldType::Object => DataType::Utf8,

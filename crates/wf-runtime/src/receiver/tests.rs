@@ -1,4 +1,3 @@
-use super::*;
 use arrow::array::{
     Array, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
 };
@@ -10,6 +9,18 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 use wf_engine::window::{WindowDef, WindowParams, WindowRegistry};
+
+// Items from the receiver module needed by tests.
+// Cannot use `use super::*;` because receiver::arrow shadows the arrow crate.
+use super::arrow::{replay_arrow_framed_file, replay_arrow_ipc_file};
+use super::batch::build_record_batch_from_json;
+use super::csv::replay_csv_file;
+use super::ndjson::{normalize_stream_tag_field, replay_ndjson_file};
+use super::route::{batch_machine_id, coerce_column, route_batch};
+use super::schema::resolve_stream_schema;
+use super::{DEFAULT_STREAM_TAG_FIELD, ReplayRoute};
+use crate::receiver::schema::field_type_to_arrow;
+use wf_engine::window::Router;
 
 fn test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
