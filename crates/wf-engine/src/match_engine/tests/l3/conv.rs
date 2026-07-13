@@ -21,6 +21,10 @@ fn make_close_output(
         close_step_data,
         bind_data: vec![],
         watermark_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 0,
     }
@@ -31,6 +35,8 @@ fn labeled_step(label: &str, value: f64) -> StepData {
         satisfied_branch_index: 0,
         label: Some(label.to_string()),
         measure_value: value,
+        event_first_time_nanos: None,
+        event_last_time_nanos: None,
         collected_values: Vec::new(),
         field_values: std::collections::HashMap::new(),
     }

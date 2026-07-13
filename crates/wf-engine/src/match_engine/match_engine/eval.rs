@@ -8,6 +8,11 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use wf_lang::ast::{BinOp, CmpOp, Expr};
 
+use crate::time::{
+    epoch_nanos_to_millis, normalize_epoch_timestamp_float_nanos,
+    positive_interval_seconds_to_nanos,
+};
+
 use super::key::{field_ref_name, value_to_string};
 use super::types::{Event, RollingStats, Value, WindowLookup};
 
@@ -356,13 +361,13 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
 /// - `stable_id(prefix, value, ...)` → `prefix` + first 16 chars of SHA-256 over typed, length-prefixed values
 /// - `mvsort(arr)` → Array
 /// - `mvreverse(arr)` → Array
-/// - `now()` → Number (timestamp nanos)
+/// - `now()` → Number (timestamp millis)
 /// - `now_s()` → Number (timestamp seconds)
 /// - `now_ms()` → Number (timestamp millis)
 /// - `now_us()` → Number (timestamp micros)
 /// - `now_ns()` → Number (timestamp nanos)
-/// - `strftime(timestamp_nanos, format)` → Str
-/// - `strptime(text, format)` → Number (timestamp nanos)
+/// - `strftime(timestamp, format)` → Str
+/// - `strptime(text, format)` → Number (timestamp millis)
 fn eval_func_call(
     name: &str,
     args: &[Expr],
@@ -1036,11 +1041,11 @@ fn eval_func_call(
             arr.reverse();
             Some(Value::Array(arr))
         }
-        "now" | "now_ns" => {
+        "now" | "now_ms" => {
             if !args.is_empty() {
                 return None;
             }
-            Some(Value::Number(current_time_nanos()? as f64))
+            Some(time_nanos_to_value(current_time_nanos()?))
         }
         "now_s" => {
             if !args.is_empty() {
@@ -1050,24 +1055,24 @@ fn eval_func_call(
                 (current_time_nanos()? / 1_000_000_000) as f64,
             ))
         }
-        "now_ms" => {
-            if !args.is_empty() {
-                return None;
-            }
-            Some(Value::Number((current_time_nanos()? / 1_000_000) as f64))
-        }
         "now_us" => {
             if !args.is_empty() {
                 return None;
             }
             Some(Value::Number((current_time_nanos()? / 1_000) as f64))
         }
+        "now_ns" => {
+            if !args.is_empty() {
+                return None;
+            }
+            Some(Value::Number(current_time_nanos()? as f64))
+        }
         "strftime" => {
             if args.len() != 2 {
                 return None;
             }
             let ts_nanos = match eval_expr_ext(&args[0], event, windows, baselines)? {
-                Value::Number(n) => f64_to_i64_trunc(n)?,
+                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
                 _ => return None,
             };
             let fmt = match eval_expr_ext(&args[1], event, windows, baselines)? {
@@ -1090,7 +1095,7 @@ fn eval_func_call(
                 _ => return None,
             };
             let ts_nanos = parse_time_to_timestamp_nanos(&text, &fmt)?;
-            Some(Value::Number(ts_nanos as f64))
+            Some(time_nanos_to_value(ts_nanos))
         }
         "regex_match" => {
             if args.len() != 2 {
@@ -1112,33 +1117,30 @@ fn eval_func_call(
                 return None;
             }
             let t1 = match eval_expr_ext(&args[0], event, windows, baselines)? {
-                Value::Number(n) => n,
+                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
                 _ => return None,
             };
             let t2 = match eval_expr_ext(&args[1], event, windows, baselines)? {
-                Value::Number(n) => n,
+                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
                 _ => return None,
             };
-            Some(Value::Number((t1 - t2).abs() / 1_000_000_000.0))
+            Some(Value::Number((t1 - t2).abs() as f64 / 1_000_000_000.0))
         }
         "time_bucket" => {
             if args.len() != 2 {
                 return None;
             }
             let t = match eval_expr_ext(&args[0], event, windows, baselines)? {
-                Value::Number(n) => n,
+                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
                 _ => return None,
             };
             let interval = match eval_expr_ext(&args[1], event, windows, baselines)? {
                 Value::Number(n) => n,
                 _ => return None,
             };
-            let interval_nanos = interval * 1_000_000_000.0;
-            if interval_nanos == 0.0 {
-                return None;
-            }
-            let bucketed = (t / interval_nanos).floor() * interval_nanos;
-            Some(Value::Number(bucketed))
+            let interval_nanos = positive_interval_seconds_to_nanos(interval)?;
+            let bucketed = t.div_euclid(interval_nanos) * interval_nanos;
+            Some(time_nanos_to_value(bucketed))
         }
         // L3 Collection functions - require instance context, not supported in guard context
         "collect_set" | "collect_list" | "first" | "last" => {
@@ -1341,6 +1343,10 @@ fn timestamp_nanos_to_utc(timestamp_nanos: i64) -> Option<DateTime<Utc>> {
     let secs = timestamp_nanos.div_euclid(1_000_000_000);
     let nanos = timestamp_nanos.rem_euclid(1_000_000_000) as u32;
     DateTime::<Utc>::from_timestamp(secs, nanos)
+}
+
+fn time_nanos_to_value(nanos: i64) -> Value {
+    Value::Number(epoch_nanos_to_millis(nanos) as f64)
 }
 
 fn parse_time_to_timestamp_nanos(text: &str, fmt: &str) -> Option<i64> {

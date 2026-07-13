@@ -30,13 +30,12 @@ pub(crate) fn format_nanos_utc(nanos: i64) -> String {
     )
 }
 
-pub(crate) fn format_now_utc() -> String {
+pub(crate) fn now_nanos() -> i64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let nanos = i64::try_from(nanos).unwrap_or(i64::MAX);
-    format_nanos_utc(nanos)
+    i64::try_from(nanos).unwrap_or(i64::MAX)
 }
 
 /// Hinnant civil_from_days: convert days since 1970-01-01 to (y, m, d).

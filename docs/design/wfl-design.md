@@ -34,6 +34,7 @@
 | `yield@vN` 与契约版本治理 | v2.1 强制能力 | ⚠️ 部分实现 | 已做 `@vN` 与 `meta.contract_version` 一致性检查；未做到“每条规则强制声明” |
 | `pattern name(...) { ... }` | 可组合规则片段 | ✅ 已实现 | 编译前文本展开，`wf explain` 可保留来源 |
 | `on each alias [where expr]` | 逐条无状态规则 | ✅ 已实现 | 不创建 match instance；不能作为 pipeline stage |
+| `yield` 时间系统变量 | 告警时间语义字段 | ✅ 已实现 | `@event_first_time` / `@event_last_time` / `@evidence_start_time` / `@evidence_end_time` / `@window_start_time` / `@window_end_time` / `@emit_time` |
 | `meta.lang` 强制 | v2.1 治理 | ❌ 未实现 | 当前 checker 未强制每条规则声明 `meta.lang` |
 | `derive { ... }` | L2 特征派生 | ❌ 未实现 | AST/解析/编译链路未接入 derive block |
 | `score { item = expr @ weight; ... }` | L2 可解释评分 | ❌ 未实现 | 当前仅支持 `score(expr)` |
@@ -174,7 +175,7 @@ runtime: runtime/wfusion.toml
 
 **时间函数**：
 - `time_diff(t1, t2)` → float：两时间戳间隔（秒），用于响应时延分析、会话间隔计算。
-- `time_bucket(field, interval)` → time：时间分桶，配合 `fixed` 做时间粒度归并。
+- `time_bucket(field, interval)` → time：时间分桶，返回 epoch milliseconds，配合 `fixed` 做时间粒度归并。
 
 **字符串函数**：
 - `contains(field, pattern)` → bool：子串包含判定。
@@ -245,6 +246,7 @@ WFL 采用固定主执行链，阶段顺序不可变（`entity(...)` 为 YIELD �
   - `and close { ... }`：AND 模式，事件路径与关闭路径**同时满足**才在关闭时触发单次告警。
 - `on each alias [where expr] -> score(...)` 为逐条无状态规则：对别名 `alias` 的每条输入独立求值一次，不创建 match instance，不参与窗口关闭/超时扫描。
 - `yield` 可引用当前规则的系统值 `@score`，用于把 `-> score(expr)` 的结果映射到业务字段；`@score` 仅在 `yield` 中合法，并且可像普通数值一样继续参与 `yield` 表达式计算。
+- `yield` 时间系统变量采用明确语义命名：`@event_first_time` / `@event_last_time` 表示本次命中证据事件的首尾时间；`@evidence_start_time` / `@evidence_end_time` 是对应语义别名；`@window_start_time` / `@window_end_time` 表示规则窗口边界；`@emit_time` 表示本次输出记录的稳定产出时间。它们类型均为 `time`，且只允许出现在 `yield` 表达式中。
 - `derive { ... }` 为规划中的特征派生块；当前解析器不接受该语法。
 - `entity(type, id_expr)` 为实体建模一等语法，禁止再依赖 `yield` 手工拼 `entity_type/entity_id`。
 - 推荐每条规则声明 `limits { ... }` 资源预算；省略时编译器发出 Warning（未来版本可能升级为错误）。当前运行时会执行声明的预算，但尚未产出独立 `CostPlan`。
@@ -402,7 +404,14 @@ primary       = NUMBER | STRING | "true" | "false"
               | if_expr
               | "(" , expr , ")" ;
 if_expr       = "if" , expr , "then" , expr , "else" , expr ;                  (* L2 行为分析：条件表达式 *)
-system_var    = "@score" ;
+system_var    = "@score"
+              | "@event_first_time"      (* 命中证据首条事件时间 *)
+              | "@event_last_time"       (* 命中证据末条事件时间 *)
+              | "@evidence_start_time"   (* @event_first_time 的语义别名 *)
+              | "@evidence_end_time"     (* @event_last_time 的语义别名 *)
+              | "@window_start_time"     (* 规则窗口开始时间 *)
+              | "@window_end_time"       (* 规则窗口结束时间 *)
+              | "@emit_time" ;           (* 稳定输出时间 *)
 close_reason_ref = "close_reason" ;
 func_call     = [ IDENT , "." ] , IDENT , "(" , [ expr , { "," , expr } ] , ")" ;
                 (* window.has 的第二参数为 STRING 字面量（目标字段名），语法上走 expr→primary→STRING，
@@ -425,6 +434,10 @@ ANY           = ? any unicode char ? ;
 ### 7.1 保留标识符
 - `_in`：`|>` 后续 stage 的隐式输入别名，编译器注入，用户必须以此名引用前级输出。
 - `@score`：当前规则 score 系统值，只能在允许系统变量的表达式上下文中使用。
+- `@event_first_time` / `@event_last_time`：命中证据首尾事件时间，只允许在 `yield` 中使用。
+- `@evidence_start_time` / `@evidence_end_time`：语义别名，分别等价于 `@event_first_time` / `@event_last_time`。
+- `@window_start_time` / `@window_end_time`：规则窗口边界时间，只允许在 `yield` 中使用。
+- `@emit_time`：稳定输出时间；同一条输出记录内多次引用必须取同一个值。
 - `@name`：规划中的 `derive` 派生项引用前缀；当前解析器除 `@score` 外不接受任意 `@name`。
 - `close_reason`：窗口关闭原因只读上下文字段（`timeout` / `flush` / `eos`）。
 
@@ -454,7 +467,7 @@ ANY           = ? any unicode char ? ;
 | `derive` | `derive { x = expr; ... }` | 规划 | 当前未实现 |
 | `score`（分项） | `score { item = expr @ weight; ... }` | 规划 | 当前未实现 |
 | `time_diff` | `time_diff(t1, t2)` → float | L2 | 两时间戳间隔（秒） |
-| `time_bucket` | `time_bucket(field, interval_seconds)` → time | L2 | 时间分桶；第二参数为秒数数值，函数参数中的 `5m` 会被解析为 `300` |
+| `time_bucket` | `time_bucket(field, interval_seconds)` → time | L2 | 时间分桶，返回 epoch milliseconds；第二参数为秒数数值，函数参数中的 `5m` 会被解析为 `300` |
 | `contains` | `contains(field, pattern)` → bool | L2 | 子串包含判定 |
 | `startswith` / `endswith` | `startswith(text, prefix)` / `endswith(text, suffix)` → bool | L2 | 前缀/后缀判定 |
 | `startswith_any` / `endswith_any` | `startswith_any(text, p1, ...)` / `endswith_any(text, s1, ...)` → bool | L2 | 多候选前缀/后缀判定 |

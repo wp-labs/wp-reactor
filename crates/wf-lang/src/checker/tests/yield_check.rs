@@ -109,6 +109,53 @@ rule r {
 }
 
 #[test]
+fn yield_allows_time_system_vars_for_time_fields() {
+    let out = make_output_window(
+        "out",
+        vec![
+            ("first_seen", bt(BaseType::Time)),
+            ("last_seen", bt(BaseType::Time)),
+            ("evidence_start_time", bt(BaseType::Time)),
+            ("evidence_end_time", bt(BaseType::Time)),
+            ("rule_window_start", bt(BaseType::Time)),
+            ("rule_window_end", bt(BaseType::Time)),
+            ("latest_analysis_time", bt(BaseType::Time)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        first_seen = @event_first_time,
+        last_seen = @event_last_time,
+        evidence_start_time = @evidence_start_time,
+        evidence_end_time = @evidence_end_time,
+        rule_window_start = @window_start_time,
+        rule_window_end = @window_end_time,
+        latest_analysis_time = @emit_time
+    )
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn yield_rejects_time_system_var_for_non_time_field() {
+    let out = make_output_window("out", vec![("first_seen", bt(BaseType::Chars))]);
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (first_seen = @event_first_time)
+}
+"#;
+    assert_has_error(input, &[auth_events_window(), out], "type mismatch");
+}
+
+#[test]
 fn yield_allows_structured_object_and_array_fields() {
     let out = make_output_window(
         "out",
@@ -318,7 +365,7 @@ rule r {
     assert_has_error(
         input,
         &[auth_events_window(), out],
-        "system variables like `@score` are only allowed in `yield` expressions",
+        "system variables are only allowed in `yield` expressions",
     );
 }
 

@@ -44,11 +44,17 @@ fn execute_match_without_joins_still_works() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
     };
 

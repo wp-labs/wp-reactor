@@ -109,7 +109,92 @@ fn fixed_on_close_fires_at_expiry() {
     assert_eq!(expired.len(), 1);
     assert!(expired[0].event_ok);
     assert!(expired[0].close_ok);
+    assert_eq!(expired[0].event_first_time_nanos, 1_000_000_000);
+    assert_eq!(expired[0].last_event_nanos, 5_000_000_000);
+    assert_eq!(expired[0].window_start_time_nanos, 0);
+    assert_eq!(expired[0].window_end_time_nanos, 10_000_000_000);
     assert_eq!(sm.instance_count(), 0);
+}
+
+#[test]
+fn fixed_close_evidence_time_ignores_guard_rejected_events() {
+    let dur = Duration::from_secs(10);
+    let close_guard = Expr::BinOp {
+        op: wf_lang::ast::BinOp::Eq,
+        left: Box::new(Expr::Field(wf_lang::ast::FieldRef::Simple(
+            "action".to_string(),
+        ))),
+        right: Box::new(Expr::StringLit("failed".to_string())),
+    };
+    let plan = fixed_plan_with_close(
+        vec![simple_key("sip")],
+        dur,
+        vec![step(vec![branch("req", count_ge(1.0))])],
+        vec![step(vec![wf_lang::plan::BranchPlan {
+            label: None,
+            source: "fail".to_string(),
+            field: None,
+            guard: Some(close_guard),
+            agg: count_ge(1.0),
+        }])],
+    );
+    let mut sm = CepStateMachine::new("r_fixed_close_times".to_string(), plan, None);
+
+    let req = event(vec![("sip", str_val("10.0.0.1"))]);
+    let success = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("action", str_val("success")),
+    ]);
+    let failed = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("action", str_val("failed")),
+    ]);
+
+    assert_eq!(
+        sm.advance_at("req", &req, 1_000_000_000),
+        StepResult::Advance
+    );
+    sm.advance_at("fail", &failed, 5_000_000_000);
+    sm.advance_at("fail", &success, 9_000_000_000);
+
+    let expired = sm.scan_expired_at(10_000_000_000);
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].event_first_time_nanos, 1_000_000_000);
+    assert_eq!(expired[0].event_last_time_nanos, 5_000_000_000);
+    assert_eq!(expired[0].last_event_nanos, 9_000_000_000);
+    assert_eq!(expired[0].window_end_time_nanos, 10_000_000_000);
+}
+
+#[test]
+fn fixed_or_close_evidence_time_uses_close_path_only() {
+    let dur = Duration::from_secs(10);
+    let mut plan = fixed_plan_with_close(
+        vec![simple_key("sip")],
+        dur,
+        vec![step(vec![branch("req", count_ge(1.0))])],
+        vec![step(vec![branch("fail", count_ge(1.0))])],
+    );
+    plan.close_mode = CloseMode::Or;
+    let mut sm = CepStateMachine::new("r_fixed_or_close_times".to_string(), plan, None);
+
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+
+    let StepResult::Matched(ctx) = sm.advance_at("req", &e, 1_000_000_000) else {
+        panic!("expected OR event-path match");
+    };
+    assert_eq!(ctx.event_first_time_nanos, 1_000_000_000);
+    assert_eq!(ctx.event_last_time_nanos, 1_000_000_000);
+
+    sm.advance_at("fail", &e, 8_000_000_000);
+
+    let expired = sm.scan_expired_at(10_000_000_000);
+    assert_eq!(expired.len(), 1);
+    assert!(expired[0].event_emitted);
+    assert!(expired[0].close_ok);
+    assert_eq!(expired[0].close_mode, CloseMode::Or);
+    assert_eq!(expired[0].event_first_time_nanos, 8_000_000_000);
+    assert_eq!(expired[0].event_last_time_nanos, 8_000_000_000);
+    assert_eq!(expired[0].last_event_nanos, 8_000_000_000);
 }
 
 // ===========================================================================
@@ -143,6 +228,33 @@ fn fixed_match_no_close() {
         sm.advance_at("fail", &e, 3_000_000_000),
         StepResult::Matched(_)
     ));
+}
+
+#[test]
+fn fixed_match_context_tracks_event_and_window_times() {
+    let dur = Duration::from_secs(10);
+    let plan = fixed_plan(
+        vec![simple_key("sip")],
+        dur,
+        vec![step(vec![branch("fail", count_ge(2.0))])],
+    );
+    let mut sm = CepStateMachine::new("r_fixed_times".to_string(), plan, None);
+
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+
+    assert_eq!(
+        sm.advance_at("fail", &e, 3_000_000_000),
+        StepResult::Accumulate
+    );
+    let StepResult::Matched(ctx) = sm.advance_at("fail", &e, 7_000_000_000) else {
+        panic!("expected fixed match");
+    };
+
+    assert_eq!(ctx.event_time_nanos, 7_000_000_000);
+    assert_eq!(ctx.event_first_time_nanos, 3_000_000_000);
+    assert_eq!(ctx.event_last_time_nanos, 7_000_000_000);
+    assert_eq!(ctx.window_start_time_nanos, 0);
+    assert_eq!(ctx.window_end_time_nanos, 10_000_000_000);
 }
 
 // ===========================================================================
@@ -214,6 +326,10 @@ fn fixed_reset_preserves_bucket_start() {
         1,
         "bucket should expire at bucket_start + dur = 10s"
     );
+    assert_eq!(expired[0].event_first_time_nanos, 8_000_000_000);
+    assert_eq!(expired[0].last_event_nanos, 8_000_000_000);
+    assert_eq!(expired[0].window_start_time_nanos, 0);
+    assert_eq!(expired[0].window_end_time_nanos, 10_000_000_000);
     assert_eq!(sm.instance_count(), 0);
 }
 

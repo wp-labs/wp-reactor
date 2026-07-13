@@ -12,6 +12,10 @@ use crate::match_engine::match_engine::{
     Event, Value, WindowLookup, eval_expr, eval_expr_ext, field_ref_name, value_to_string,
     values_equal,
 };
+use crate::time::{
+    epoch_nanos_to_millis, normalize_epoch_timestamp_float_nanos,
+    positive_interval_seconds_to_nanos,
+};
 
 /// Evaluate a yield/derive expression with L3 function support.
 ///
@@ -20,6 +24,16 @@ use crate::match_engine::match_engine::{
 /// stored in `_step_{i}_values` and `_step_{i}_source` fields in the eval context.
 pub(super) fn eval_yield_expr(expr: &wf_lang::ast::Expr, ctx: &Event) -> Option<Value> {
     eval_yield_expr_with_score(expr, ctx, None)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct YieldMeta {
+    pub(super) score: Option<f64>,
+    pub(super) event_first_time_nanos: Option<i64>,
+    pub(super) event_last_time_nanos: Option<i64>,
+    pub(super) window_start_time_nanos: Option<i64>,
+    pub(super) window_end_time_nanos: Option<i64>,
+    pub(super) emit_time_nanos: Option<i64>,
 }
 
 thread_local! {
@@ -58,16 +72,31 @@ pub(super) fn eval_yield_expr_with_score(
     ctx: &Event,
     score: Option<f64>,
 ) -> Option<Value> {
+    eval_yield_expr_with_meta(
+        expr,
+        ctx,
+        YieldMeta {
+            score,
+            ..YieldMeta::default()
+        },
+    )
+}
+
+pub(super) fn eval_yield_expr_with_meta(
+    expr: &wf_lang::ast::Expr,
+    ctx: &Event,
+    meta: YieldMeta,
+) -> Option<Value> {
     // For yield expressions, fall back to empty string when a field is missing
     // (e.g., join window fields not available in test runner)
-    with_yield_eval_scope(|| match eval_expr_with_l3(expr, ctx, score) {
+    with_yield_eval_scope(|| match eval_expr_with_l3(expr, ctx, meta) {
         None => Some(Value::Str(String::new())),
         val => val,
     })
 }
 
 pub(super) fn eval_bool_expr(expr: &wf_lang::ast::Expr, ctx: &Event) -> Option<bool> {
-    match eval_expr_with_l3(expr, ctx, None) {
+    match eval_expr_with_l3(expr, ctx, YieldMeta::default()) {
         Some(Value::Bool(result)) => Some(result),
         _ => None,
     }
@@ -85,15 +114,29 @@ pub(super) fn eval_bool_expr_with_lookup(
     }
 }
 
-fn eval_expr_with_l3(expr: &wf_lang::ast::Expr, ctx: &Event, score: Option<f64>) -> Option<Value> {
+fn eval_expr_with_l3(expr: &wf_lang::ast::Expr, ctx: &Event, meta: YieldMeta) -> Option<Value> {
     use wf_lang::ast::{BinOp, Expr, SystemVar};
 
     let _time_scope = EvalTimeScope::enter();
+    let score = meta;
     match expr {
         Expr::Number(n) => Some(Value::Number(*n)),
         Expr::StringLit(s) => Some(Value::Str(s.clone())),
         Expr::Bool(b) => Some(Value::Bool(*b)),
-        Expr::SystemVar(SystemVar::Score) => score.map(Value::Number),
+        Expr::SystemVar(SystemVar::Score) => meta.score.map(Value::Number),
+        Expr::SystemVar(SystemVar::EventFirstTime | SystemVar::EvidenceStartTime) => {
+            meta.event_first_time_nanos.map(time_nanos_to_value)
+        }
+        Expr::SystemVar(SystemVar::EventLastTime | SystemVar::EvidenceEndTime) => {
+            meta.event_last_time_nanos.map(time_nanos_to_value)
+        }
+        Expr::SystemVar(SystemVar::WindowStartTime) => {
+            meta.window_start_time_nanos.map(time_nanos_to_value)
+        }
+        Expr::SystemVar(SystemVar::WindowEndTime) => {
+            meta.window_end_time_nanos.map(time_nanos_to_value)
+        }
+        Expr::SystemVar(SystemVar::EmitTime) => meta.emit_time_nanos.map(time_nanos_to_value),
         Expr::Field(fr) => ctx.fields.get(field_ref_name(fr)).cloned(),
         Expr::Object(items) => {
             let mut map = std::collections::HashMap::new();
@@ -216,7 +259,7 @@ fn eval_logic_and_with_l3(
     left: &wf_lang::ast::Expr,
     right: &wf_lang::ast::Expr,
     ctx: &Event,
-    score: Option<f64>,
+    score: YieldMeta,
 ) -> Option<Value> {
     let lv = eval_expr_with_l3(left, ctx, score);
     let rv = eval_expr_with_l3(right, ctx, score);
@@ -231,7 +274,7 @@ fn eval_logic_or_with_l3(
     left: &wf_lang::ast::Expr,
     right: &wf_lang::ast::Expr,
     ctx: &Event,
-    score: Option<f64>,
+    score: YieldMeta,
 ) -> Option<Value> {
     let lv = eval_expr_with_l3(left, ctx, score);
     let rv = eval_expr_with_l3(right, ctx, score);
@@ -404,7 +447,7 @@ fn contains_system_var(expr: &wf_lang::ast::Expr) -> bool {
 
 fn materialize_system_vars(
     expr: &wf_lang::ast::Expr,
-    score: Option<f64>,
+    score: YieldMeta,
 ) -> Option<wf_lang::ast::Expr> {
     use wf_lang::ast::{Expr, SystemVar};
 
@@ -412,7 +455,20 @@ fn materialize_system_vars(
         Expr::Number(n) => Some(Expr::Number(*n)),
         Expr::StringLit(s) => Some(Expr::StringLit(s.clone())),
         Expr::Bool(b) => Some(Expr::Bool(*b)),
-        Expr::SystemVar(SystemVar::Score) => Some(Expr::Number(score?)),
+        Expr::SystemVar(SystemVar::Score) => Some(Expr::Number(score.score?)),
+        Expr::SystemVar(SystemVar::EventFirstTime | SystemVar::EvidenceStartTime) => {
+            Some(time_nanos_to_expr(score.event_first_time_nanos?))
+        }
+        Expr::SystemVar(SystemVar::EventLastTime | SystemVar::EvidenceEndTime) => {
+            Some(time_nanos_to_expr(score.event_last_time_nanos?))
+        }
+        Expr::SystemVar(SystemVar::WindowStartTime) => {
+            Some(time_nanos_to_expr(score.window_start_time_nanos?))
+        }
+        Expr::SystemVar(SystemVar::WindowEndTime) => {
+            Some(time_nanos_to_expr(score.window_end_time_nanos?))
+        }
+        Expr::SystemVar(SystemVar::EmitTime) => Some(time_nanos_to_expr(score.emit_time_nanos?)),
         Expr::Field(fr) => Some(Expr::Field(fr.clone())),
         Expr::BinOp { op, left, right } => Some(Expr::BinOp {
             op: *op,
@@ -479,7 +535,7 @@ fn eval_builtin_func_with_l3(
     name: &str,
     args: &[wf_lang::ast::Expr],
     ctx: &Event,
-    score: Option<f64>,
+    score: YieldMeta,
 ) -> Option<Value> {
     match name {
         "contains" => {
@@ -1145,11 +1201,11 @@ fn eval_builtin_func_with_l3(
             arr.reverse();
             Some(Value::Array(arr))
         }
-        "now" | "now_ns" => {
+        "now" | "now_ms" => {
             if !args.is_empty() {
                 return None;
             }
-            Some(Value::Number(current_time_nanos()? as f64))
+            Some(time_nanos_to_value(current_time_nanos()?))
         }
         "now_s" => {
             if !args.is_empty() {
@@ -1159,24 +1215,24 @@ fn eval_builtin_func_with_l3(
                 (current_time_nanos()? / 1_000_000_000) as f64,
             ))
         }
-        "now_ms" => {
-            if !args.is_empty() {
-                return None;
-            }
-            Some(Value::Number((current_time_nanos()? / 1_000_000) as f64))
-        }
         "now_us" => {
             if !args.is_empty() {
                 return None;
             }
             Some(Value::Number((current_time_nanos()? / 1_000) as f64))
         }
+        "now_ns" => {
+            if !args.is_empty() {
+                return None;
+            }
+            Some(Value::Number(current_time_nanos()? as f64))
+        }
         "strftime" => {
             if args.len() != 2 {
                 return None;
             }
             let ts_nanos = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => f64_to_i64_trunc(n)?,
+                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
                 _ => return None,
             };
             let fmt = match eval_expr_with_l3(&args[1], ctx, score)? {
@@ -1199,7 +1255,7 @@ fn eval_builtin_func_with_l3(
                 _ => return None,
             };
             let ts_nanos = parse_time_to_timestamp_nanos(&text, &fmt)?;
-            Some(Value::Number(ts_nanos as f64))
+            Some(time_nanos_to_value(ts_nanos))
         }
         "regex_match" => {
             if args.len() != 2 {
@@ -1221,33 +1277,30 @@ fn eval_builtin_func_with_l3(
                 return None;
             }
             let t1 = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => n,
+                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
                 _ => return None,
             };
             let t2 = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Number(n) => n,
+                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
                 _ => return None,
             };
-            Some(Value::Number((t1 - t2).abs() / 1_000_000_000.0))
+            Some(Value::Number((t1 - t2).abs() as f64 / 1_000_000_000.0))
         }
         "time_bucket" => {
             if args.len() != 2 {
                 return None;
             }
             let t = match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Number(n) => n,
+                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
                 _ => return None,
             };
             let interval = match eval_expr_with_l3(&args[1], ctx, score)? {
                 Value::Number(n) => n,
                 _ => return None,
             };
-            let interval_nanos = interval * 1_000_000_000.0;
-            if interval_nanos == 0.0 {
-                return None;
-            }
-            let bucketed = (t / interval_nanos).floor() * interval_nanos;
-            Some(Value::Number(bucketed))
+            let interval_nanos = positive_interval_seconds_to_nanos(interval)?;
+            let bucketed = t.div_euclid(interval_nanos) * interval_nanos;
+            Some(time_nanos_to_value(bucketed))
         }
         "external" => crate::external::eval_external(&args[0], &args[1..], |a| {
             eval_expr_with_l3(a, ctx, score)
@@ -1260,7 +1313,7 @@ fn eval_l3_func(
     name: &str,
     args: &[wf_lang::ast::Expr],
     ctx: &Event,
-    score: Option<f64>,
+    score: YieldMeta,
 ) -> Option<Value> {
     if args.is_empty() {
         return None;
@@ -1756,6 +1809,14 @@ fn timestamp_nanos_to_utc(timestamp_nanos: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(secs, nanos)
 }
 
+fn time_nanos_to_value(nanos: i64) -> Value {
+    Value::Number(epoch_nanos_to_millis(nanos) as f64)
+}
+
+fn time_nanos_to_expr(nanos: i64) -> wf_lang::ast::Expr {
+    wf_lang::ast::Expr::Number(epoch_nanos_to_millis(nanos) as f64)
+}
+
 fn parse_time_to_timestamp_nanos(text: &str, fmt: &str) -> Option<i64> {
     if let Ok(dt) = DateTime::parse_from_str(text, fmt) {
         return dt.timestamp_nanos_opt();
@@ -1787,7 +1848,7 @@ fn current_time_nanos() -> Option<i64> {
 fn eval_single_string_arg_with_l3(
     args: &[wf_lang::ast::Expr],
     ctx: &Event,
-    score: Option<f64>,
+    score: YieldMeta,
 ) -> Option<String> {
     if args.len() != 1 {
         return None;
@@ -2425,7 +2486,7 @@ mod tests {
             op: BinOp::Sub,
             left: Box::new(Expr::FuncCall {
                 qualifier: None,
-                name: "now_ns".to_string(),
+                name: "now_ms".to_string(),
                 args: vec![],
             }),
             right: Box::new(Expr::FuncCall {
@@ -2448,18 +2509,34 @@ mod tests {
             name: "now".to_string(),
             args: vec![],
         };
-        let now_ns_expr = Expr::FuncCall {
+        let now_ms_expr = Expr::FuncCall {
             qualifier: None,
-            name: "now_ns".to_string(),
+            name: "now_ms".to_string(),
             args: vec![],
         };
 
         with_yield_eval_scope(|| {
             assert_eq!(
                 eval_yield_expr(&now_expr, &ctx),
-                eval_yield_expr(&now_ns_expr, &ctx)
+                eval_yield_expr(&now_ms_expr, &ctx)
             );
         });
+    }
+
+    #[test]
+    fn test_time_bucket_rejects_invalid_interval_in_yield_eval() {
+        let ctx = Event {
+            fields: std::collections::HashMap::new(),
+        };
+
+        for interval in [0.0, -60.0, f64::INFINITY, f64::NAN] {
+            let expr = Expr::FuncCall {
+                qualifier: None,
+                name: "time_bucket".to_string(),
+                args: vec![Expr::Number(1_700_000_075_000.0), Expr::Number(interval)],
+            };
+            assert_eq!(eval_expr_with_l3(&expr, &ctx, YieldMeta::default()), None);
+        }
     }
 
     #[test]
@@ -2820,7 +2897,7 @@ mod tests {
             eval_yield_expr(&strptime_expr, &ctx),
             Some(Value::Number(0.0))
         );
-        let Some(Value::Number(now_nanos)) = eval_yield_expr(&now_expr, &ctx) else {
+        let Some(Value::Number(now_millis)) = eval_yield_expr(&now_expr, &ctx) else {
             panic!("now() should return a numeric timestamp");
         };
         let Some(Value::Number(now_s)) = eval_yield_expr(&now_s_expr, &ctx) else {
@@ -2838,7 +2915,7 @@ mod tests {
         let Some(Value::Str(year)) = eval_yield_expr(&now_fmt_expr, &ctx) else {
             panic!("strftime(now(), ...) should format the current time");
         };
-        assert!(now_nanos > 1_000_000_000_000_000_000.0);
+        assert!(now_millis > 1_000_000_000_000.0);
         assert!(now_ns > 1_000_000_000_000_000_000.0);
         assert!(now_us > 1_000_000_000_000_000.0);
         assert!(now_ms > 1_000_000_000_000.0);

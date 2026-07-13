@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
+use wf_lang::ast::CloseMode;
 use wf_lang::plan::{MatchPlan, StepPlan};
 
 use super::eval::{eval_expr, eval_expr_ext};
 use super::state::{Instance, StepState, snapshot_bind_data};
 use super::step::{
     apply_transforms, check_threshold, collect_event_fields, compute_measure, extract_branch_field,
-    update_measure,
+    record_evidence_time, update_measure,
 };
 use super::types::{CloseOutput, CloseReason, Event, RollingStats, StepData, Value, WindowLookup};
 
@@ -26,6 +27,7 @@ use super::types::{CloseOutput, CloseReason, Event, RollingStats, StepData, Valu
 pub(super) fn accumulate_close_steps(
     alias: &str,
     event: &Event,
+    event_time_nanos: i64,
     plan: &MatchPlan,
     close_step_states: &mut [StepState],
     windows: Option<&dyn WindowLookup>,
@@ -54,6 +56,8 @@ pub(super) fn accumulate_close_steps(
             if !apply_transforms(&branch.agg.transforms, &field_value, bs) {
                 continue;
             }
+
+            record_evidence_time(bs, event_time_nanos);
 
             collect_event_fields(
                 event,
@@ -110,6 +114,10 @@ fn evaluate_close_steps(
                     satisfied_branch_index: branch_idx,
                     label,
                     measure_value,
+                    event_first_time_nanos: step_state.branch_states[branch_idx]
+                        .event_first_time_nanos,
+                    event_last_time_nanos: step_state.branch_states[branch_idx]
+                        .event_last_time_nanos,
                     collected_values,
                     field_values: step_state.branch_states[branch_idx].field_values.clone(),
                 });
@@ -121,6 +129,8 @@ fn evaluate_close_steps(
                     satisfied_branch_index: 0,
                     label: None,
                     measure_value: 0.0,
+                    event_first_time_nanos: None,
+                    event_last_time_nanos: None,
                     collected_values: Vec::new(),
                     field_values: HashMap::new(),
                 });
@@ -173,6 +183,13 @@ pub(super) fn evaluate_close(
 ) -> CloseOutput {
     let (close_ok, close_step_data) =
         evaluate_close_steps(&plan.close_steps, &instance.close_step_states, reason);
+    let event_step_data = instance.completed_steps;
+    let evidence_range = match plan.close_mode {
+        CloseMode::And => evidence_time_range(event_step_data.iter().chain(close_step_data.iter())),
+        CloseMode::Or => evidence_time_range(close_step_data.iter()),
+    };
+    let (evidence_first, evidence_last) =
+        evidence_range.unwrap_or((instance.last_event_nanos, instance.last_event_nanos));
     CloseOutput {
         rule_name: rule_name.to_string(),
         scope_key: instance.scope_key,
@@ -182,10 +199,30 @@ pub(super) fn evaluate_close(
         close_ok,
         close_mode: plan.close_mode,
         event_emitted: instance.event_emitted,
-        event_step_data: instance.completed_steps,
+        event_step_data,
         close_step_data,
         bind_data: snapshot_bind_data(&instance.alias_states),
         watermark_nanos,
         last_event_nanos: instance.last_event_nanos,
+        event_first_time_nanos: evidence_first,
+        event_last_time_nanos: evidence_last,
+        window_start_time_nanos: instance.created_at,
+        window_end_time_nanos: watermark_nanos,
     }
+}
+
+pub(super) fn evidence_time_range<'a>(
+    steps: impl Iterator<Item = &'a StepData>,
+) -> Option<(i64, i64)> {
+    let mut first = None;
+    let mut last = None;
+    for step in steps {
+        if let Some(value) = step.event_first_time_nanos {
+            first = Some(first.map_or(value, |current: i64| current.min(value)));
+        }
+        if let Some(value) = step.event_last_time_nanos {
+            last = Some(last.map_or(value, |current: i64| current.max(value)));
+        }
+    }
+    Some((first?, last?))
 }

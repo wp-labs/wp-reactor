@@ -141,9 +141,9 @@ fn time_diff_returns_seconds() {
         ],
     };
     let mut fields = HashMap::new();
-    // 5 seconds apart in nanos
-    fields.insert("t1".to_string(), Value::Number(10_000_000_000.0)); // 10s in nanos
-    fields.insert("t2".to_string(), Value::Number(5_000_000_000.0)); // 5s in nanos
+    // 5 seconds apart in epoch milliseconds.
+    fields.insert("t1".to_string(), Value::Number(1_700_000_005_000.0));
+    fields.insert("t2".to_string(), Value::Number(1_700_000_000_000.0));
     let event = Event { fields };
     let result = eval_expr(&expr, &event);
     assert_eq!(result, Some(Value::Number(5.0)));
@@ -162,9 +162,9 @@ fn time_diff_absolute_value() {
         ],
     };
     let mut fields = HashMap::new();
-    // Reversed order: t1 < t2
-    fields.insert("t1".to_string(), Value::Number(5_000_000_000.0));
-    fields.insert("t2".to_string(), Value::Number(10_000_000_000.0));
+    // Reversed order: t1 < t2.
+    fields.insert("t1".to_string(), Value::Number(1_700_000_000_000.0));
+    fields.insert("t2".to_string(), Value::Number(1_700_000_005_000.0));
     let event = Event { fields };
     let result = eval_expr(&expr, &event);
     assert_eq!(result, Some(Value::Number(5.0)));
@@ -187,12 +187,11 @@ fn time_bucket_floors_to_interval() {
         ],
     };
     let mut fields = HashMap::new();
-    // 75 seconds in nanos
-    fields.insert("ts".to_string(), Value::Number(75_000_000_000.0));
+    // 75 seconds after an epoch millisecond timestamp.
+    fields.insert("ts".to_string(), Value::Number(1_700_000_075_000.0));
     let event = Event { fields };
     let result = eval_expr(&expr, &event);
-    // 75s / 60s = 1.25 → floor = 1 → 60s in nanos
-    assert_eq!(result, Some(Value::Number(60_000_000_000.0)));
+    assert_eq!(result, Some(Value::Number(1_700_000_040_000.0)));
 }
 
 #[test]
@@ -208,12 +207,28 @@ fn time_bucket_exact_boundary() {
         ],
     };
     let mut fields = HashMap::new();
-    // Exactly 600 seconds in nanos (2 * 300s)
-    fields.insert("ts".to_string(), Value::Number(600_000_000_000.0));
+    // Exact 5-minute bucket boundary in epoch milliseconds.
+    fields.insert("ts".to_string(), Value::Number(1_700_000_100_000.0));
     let event = Event { fields };
     let result = eval_expr(&expr, &event);
-    // Should stay at 600s
-    assert_eq!(result, Some(Value::Number(600_000_000_000.0)));
+    assert_eq!(result, Some(Value::Number(1_700_000_100_000.0)));
+}
+
+#[test]
+fn time_bucket_rejects_non_positive_or_non_finite_interval() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let event = Event {
+        fields: HashMap::new(),
+    };
+    for interval in [0.0, -60.0, f64::INFINITY, f64::NAN] {
+        let expr = Expr::FuncCall {
+            qualifier: None,
+            name: "time_bucket".to_string(),
+            args: vec![Expr::Number(1_700_000_075_000.0), Expr::Number(interval)],
+        };
+        assert_eq!(eval_expr(&expr, &event), None);
+    }
 }
 
 // ===========================================================================
@@ -500,7 +515,7 @@ fn now_functions_work() {
         args: vec![Expr::Number(1.0)],
     };
 
-    let Some(Value::Number(now_nanos)) = eval_expr(&now_expr, &event) else {
+    let Some(Value::Number(now_millis)) = eval_expr(&now_expr, &event) else {
         panic!("now() should return a numeric timestamp");
     };
     let Some(Value::Number(now_s)) = eval_expr(&now_s_expr, &event) else {
@@ -519,7 +534,7 @@ fn now_functions_work() {
         panic!("strftime(now(), ...) should format the current time");
     };
 
-    assert!(now_nanos > 1_000_000_000_000_000_000.0);
+    assert!(now_millis > 1_000_000_000_000.0);
     assert!(now_ns > 1_000_000_000_000_000_000.0);
     assert!(now_us > 1_000_000_000_000_000.0);
     assert!(now_ms > 1_000_000_000_000.0);
@@ -539,7 +554,7 @@ fn now_functions_share_timestamp_within_expression() {
         op: BinOp::Sub,
         left: Box::new(Expr::FuncCall {
             qualifier: None,
-            name: "now_ns".to_string(),
+            name: "now_ms".to_string(),
             args: vec![],
         }),
         right: Box::new(Expr::FuncCall {
@@ -804,6 +819,27 @@ fn strptime_parses_date() {
         fields: HashMap::new(),
     };
     assert_eq!(eval_expr(&expr, &event), Some(Value::Number(0.0)));
+}
+
+#[test]
+fn strptime_returns_epoch_milliseconds() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "strptime".to_string(),
+        args: vec![
+            Expr::StringLit("2024-03-11 00:00:00".to_string()),
+            Expr::StringLit("%Y-%m-%d %H:%M:%S".to_string()),
+        ],
+    };
+    let event = Event {
+        fields: HashMap::new(),
+    };
+    assert_eq!(
+        eval_expr(&expr, &event),
+        Some(Value::Number(1_710_115_200_000.0))
+    );
 }
 
 // ===========================================================================

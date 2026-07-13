@@ -62,6 +62,13 @@ pub enum BinOp {
 #[moju(kind = "state", domain = "Lang", module = "Lang.LangExpr")]
 pub enum SystemVar {
     Score,
+    EventFirstTime,
+    EventLastTime,
+    EvidenceStartTime,
+    EvidenceEndTime,
+    WindowStartTime,
+    WindowEndTime,
+    EmitTime,
 }
 
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]

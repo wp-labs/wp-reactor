@@ -4,10 +4,11 @@ use crate::match_engine::MACHINE_ID;
 use crate::match_engine::match_engine::{CepStateMachine, Event, StepData, WindowLookup};
 
 use super::RuleExecutor;
-use super::alert::{build_each_wfx_id, build_summary, format_nanos_utc, format_now_utc};
+use super::alert::{build_each_wfx_id, build_summary, format_nanos_utc, now_nanos};
 use super::context::execute_joins;
 use super::eval::{
-    eval_bool_expr, eval_entity_id, eval_score, eval_yield_expr_with_score, with_yield_eval_scope,
+    YieldMeta, eval_bool_expr, eval_entity_id, eval_score, eval_yield_expr_with_meta,
+    with_yield_eval_scope,
 };
 
 impl RuleExecutor {
@@ -59,17 +60,26 @@ impl RuleExecutor {
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
         let origin = AlertOrigin::Event;
         let fired_at = format_nanos_utc(event_time_nanos);
-        let emit_time = format_now_utc();
+        let emit_time_nanos = now_nanos();
+        let emit_time = format_nanos_utc(emit_time_nanos);
         let empty_steps: Vec<StepData> = Vec::new();
         let wfx_id = build_each_wfx_id(&self.plan.name, event_time_nanos, ctx, &origin);
         let summary = build_summary(&self.plan.name, &[], &[], &empty_steps, &origin);
         let yield_fields = with_yield_eval_scope(|| {
+            let yield_meta = YieldMeta {
+                score: Some(score),
+                event_first_time_nanos: Some(event_time_nanos),
+                event_last_time_nanos: Some(event_time_nanos),
+                window_start_time_nanos: Some(event_time_nanos),
+                window_end_time_nanos: Some(event_time_nanos),
+                emit_time_nanos: Some(emit_time_nanos),
+            };
             self.plan
                 .yield_plan
                 .fields
                 .iter()
                 .map(|field| {
-                    let Some(value) = eval_yield_expr_with_score(&field.value, ctx, Some(score))
+                    let Some(value) = eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
                     else {
                         return Err(orion_error::StructError::from(CoreReason::RuleExec)
                             .with_detail(format!(

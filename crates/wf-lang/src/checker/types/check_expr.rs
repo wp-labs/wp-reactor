@@ -293,8 +293,7 @@ fn check_expr_type_inner(
                 severity: Severity::Error,
                 rule: Some(rule_name.to_string()),
                 test: None,
-                message: "system variables like `@score` are only allowed in `yield` expressions"
-                    .to_string(),
+                message: "system variables are only allowed in `yield` expressions".to_string(),
             });
         }
         Expr::Field(fref) => {

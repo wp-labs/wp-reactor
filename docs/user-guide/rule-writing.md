@@ -160,6 +160,55 @@ yield security_alerts (
 - `array/float` 允许整数元素自动提升为 float；`array/chars` 只接受字符串元素。
 - 如果结构化字段写入中间 window，下游规则读取到的是 UTF-8 JSON 字符串桥接值；最终 sink 输出格式仍由 sink 决定。
 
+### 1.5 输出证据时间和窗口时间
+
+安全告警通常需要同时输出三类时间：
+
+- 证据时间：本次命中的首尾事件时间。
+- 窗口时间：规则窗口的开始和结束时间。
+- 分析时间：本次告警输出的时间。
+
+建议把这些字段作为业务字段写入输出 window：
+
+```wfs
+window security_alerts {
+    over = 0
+
+    fields {
+        sip: ip
+        first_seen: time
+        last_seen: time
+        evidence_start_time: time
+        evidence_end_time: time
+        rule_window_start: time
+        rule_window_end: time
+        latest_analysis_time: time
+    }
+}
+```
+
+规则中在 `yield` 里使用时间系统变量：
+
+```wfl
+yield security_alerts (
+    sip = fail.sip,
+    first_seen = @event_first_time,
+    last_seen = @event_last_time,
+    evidence_start_time = @evidence_start_time,
+    evidence_end_time = @evidence_end_time,
+    rule_window_start = @window_start_time,
+    rule_window_end = @window_end_time,
+    latest_analysis_time = @emit_time
+)
+```
+
+命名建议：
+
+- 对外字段使用 `first_seen` / `last_seen` 这类业务名时，右侧仍映射到明确语义的系统变量。
+- 时间系统变量在表达式里的数值表示为 epoch milliseconds；写入 `time` 字段时按时间类型输出。
+- 不使用 `event_fst_time` / `event_lst_time` 这类缩写，避免用户误解。
+- 不依赖 `__wfu_emit_time` 等内部元数据作为业务输出；需要业务字段时在 `yield` 中显式赋值。
+
 ---
 
 ## 2. 场景二：多步骤序列 — 扫描后爆破

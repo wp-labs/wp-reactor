@@ -31,6 +31,109 @@ fn single_step_threshold() {
 }
 
 #[test]
+fn sliding_match_context_tracks_event_and_window_times() {
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(3.0))])],
+    );
+    let mut sm = CepStateMachine::new("rule_time".to_string(), plan, None);
+
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    assert_eq!(
+        sm.advance_at("fail", &e, 1_000_000_000),
+        StepResult::Accumulate
+    );
+    assert_eq!(
+        sm.advance_at("fail", &e, 2_000_000_000),
+        StepResult::Accumulate
+    );
+
+    let StepResult::Matched(ctx) = sm.advance_at("fail", &e, 3_000_000_000) else {
+        panic!("expected sliding match");
+    };
+
+    assert_eq!(ctx.event_time_nanos, 3_000_000_000);
+    assert_eq!(ctx.event_first_time_nanos, 1_000_000_000);
+    assert_eq!(ctx.event_last_time_nanos, 3_000_000_000);
+    assert_eq!(ctx.window_start_time_nanos, 1_000_000_000);
+    assert_eq!(ctx.window_end_time_nanos, 301_000_000_000);
+}
+
+#[test]
+fn evidence_time_ignores_events_not_consumed_by_current_step() {
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![
+            step(vec![branch("fail", count_ge(1.0))]),
+            step(vec![branch("scan", count_ge(1.0))]),
+        ],
+    );
+    let mut sm = CepStateMachine::new("rule_time".to_string(), plan, None);
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+
+    assert_eq!(
+        sm.advance_at("scan", &e, 1_000_000_000),
+        StepResult::Accumulate
+    );
+    assert_eq!(
+        sm.advance_at("fail", &e, 10_000_000_000),
+        StepResult::Advance
+    );
+    let StepResult::Matched(ctx) = sm.advance_at("scan", &e, 20_000_000_000) else {
+        panic!("expected multi-step match");
+    };
+
+    assert_eq!(ctx.event_first_time_nanos, 10_000_000_000);
+    assert_eq!(ctx.event_last_time_nanos, 20_000_000_000);
+}
+
+#[test]
+fn evidence_time_ignores_guard_rejected_events() {
+    let guard = Expr::BinOp {
+        op: wf_lang::ast::BinOp::Eq,
+        left: Box::new(Expr::Field(wf_lang::ast::FieldRef::Simple(
+            "action".to_string(),
+        ))),
+        right: Box::new(Expr::StringLit("failed".to_string())),
+    };
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![BranchPlan {
+            label: None,
+            source: "auth".to_string(),
+            field: None,
+            guard: Some(guard),
+            agg: count_ge(2.0),
+        }])],
+    );
+    let mut sm = CepStateMachine::new("rule_time_guard".to_string(), plan, None);
+
+    let success = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("action", str_val("success")),
+    ]);
+    let failed = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("action", str_val("failed")),
+    ]);
+
+    assert_eq!(
+        sm.advance_at("auth", &success, 1_000_000_000),
+        StepResult::Accumulate
+    );
+    assert_eq!(
+        sm.advance_at("auth", &failed, 10_000_000_000),
+        StepResult::Accumulate
+    );
+    let StepResult::Matched(ctx) = sm.advance_at("auth", &failed, 20_000_000_000) else {
+        panic!("expected guarded match");
+    };
+
+    assert_eq!(ctx.event_first_time_nanos, 10_000_000_000);
+    assert_eq!(ctx.event_last_time_nanos, 20_000_000_000);
+}
+
+#[test]
 fn multi_step_sequential() {
     // step2 events before step1 don't match; step1 done → Advance; step2 done → Matched
     let plan = simple_plan(

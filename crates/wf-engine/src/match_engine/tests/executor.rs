@@ -29,11 +29,17 @@ fn default_matched_context() -> MatchedContext {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),
             measure_value: 1.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
     }
 }
@@ -123,6 +129,83 @@ fn execute_each_yield_can_reference_score() {
             .map(|(_, value)| value.clone()),
         Some(num(10.0))
     );
+}
+
+#[test]
+fn execute_each_yield_can_reference_time_system_vars() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "first_seen".to_string(),
+            value: Expr::SystemVar(SystemVar::EventFirstTime),
+        },
+        YieldField {
+            name: "last_seen".to_string(),
+            value: Expr::SystemVar(SystemVar::EventLastTime),
+        },
+        YieldField {
+            name: "evidence_start_time".to_string(),
+            value: Expr::SystemVar(SystemVar::EvidenceStartTime),
+        },
+        YieldField {
+            name: "evidence_end_time".to_string(),
+            value: Expr::SystemVar(SystemVar::EvidenceEndTime),
+        },
+        YieldField {
+            name: "rule_window_start".to_string(),
+            value: Expr::SystemVar(SystemVar::WindowStartTime),
+        },
+        YieldField {
+            name: "rule_window_end".to_string(),
+            value: Expr::SystemVar(SystemVar::WindowEndTime),
+        },
+        YieldField {
+            name: "latest_analysis_time".to_string(),
+            value: Expr::SystemVar(SystemVar::EmitTime),
+        },
+    ];
+    let exec = RuleExecutor::new(plan);
+    let event_time = 1_234_000_000;
+
+    let alert = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), event_time)
+        .unwrap()
+        .unwrap();
+
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+    let event_time_ms = event_time / 1_000_000;
+    assert_eq!(field("first_seen"), Some(num(event_time_ms as f64)));
+    assert_eq!(field("last_seen"), Some(num(event_time_ms as f64)));
+    assert_eq!(
+        field("evidence_start_time"),
+        Some(num(event_time_ms as f64))
+    );
+    assert_eq!(field("evidence_end_time"), Some(num(event_time_ms as f64)));
+    assert_eq!(field("rule_window_start"), Some(num(event_time_ms as f64)));
+    assert_eq!(field("rule_window_end"), Some(num(event_time_ms as f64)));
+
+    let Some(Value::Number(emit_time_ms)) = field("latest_analysis_time") else {
+        panic!("missing latest_analysis_time");
+    };
+    assert!(emit_time_ms > 0.0);
+    assert!(alert.emit_time.ends_with('Z'));
 }
 
 #[test]
@@ -282,6 +365,55 @@ fn execute_match_yield_can_reference_score() {
 }
 
 #[test]
+fn execute_match_yield_can_reference_time_system_vars() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".to_string())),
+    );
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "first_seen".to_string(),
+            value: Expr::SystemVar(SystemVar::EventFirstTime),
+        },
+        YieldField {
+            name: "last_seen".to_string(),
+            value: Expr::SystemVar(SystemVar::EventLastTime),
+        },
+        YieldField {
+            name: "rule_window_start".to_string(),
+            value: Expr::SystemVar(SystemVar::WindowStartTime),
+        },
+        YieldField {
+            name: "rule_window_end".to_string(),
+            value: Expr::SystemVar(SystemVar::WindowEndTime),
+        },
+    ];
+    let exec = RuleExecutor::new(plan);
+    let mut matched = default_matched_context();
+    matched.event_first_time_nanos = 1_000_000_000;
+    matched.event_last_time_nanos = 3_000_000_000;
+    matched.window_start_time_nanos = 500_000_000;
+    matched.window_end_time_nanos = 5_500_000_000;
+
+    let alert = exec.execute_match(&matched).unwrap();
+
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(field("first_seen"), Some(num(1_000.0)));
+    assert_eq!(field("last_seen"), Some(num(3_000.0)));
+    assert_eq!(field("rule_window_start"), Some(num(500.0)));
+    assert_eq!(field("rule_window_end"), Some(num(5_500.0)));
+}
+
+#[test]
 fn execute_match_yield_can_use_score_inside_builtin_expr() {
     let mut plan = simple_rule_plan(
         "r1",
@@ -402,11 +534,17 @@ fn execute_match_no_keys() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
     };
 
@@ -440,11 +578,17 @@ fn execute_match_composite_keys() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
     };
 
@@ -481,12 +625,18 @@ fn execute_close_both_ok() {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),
             measure_value: 3.0,
+            event_first_time_nanos: Some(1_000),
+            event_last_time_nanos: Some(3_000),
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
     };
@@ -524,6 +674,10 @@ fn execute_close_close_not_ok() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 0,
     };
@@ -558,12 +712,18 @@ fn execute_close_yield_can_reference_score() {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),
             measure_value: 3.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
     };
@@ -578,6 +738,87 @@ fn execute_close_yield_can_reference_score() {
             .map(|(_, value)| value.clone()),
         Some(num(70.0))
     );
+}
+
+#[test]
+fn execute_close_yield_can_reference_time_system_vars() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".to_string())),
+    );
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "first_seen".to_string(),
+            value: Expr::SystemVar(SystemVar::EventFirstTime),
+        },
+        YieldField {
+            name: "last_seen".to_string(),
+            value: Expr::SystemVar(SystemVar::EventLastTime),
+        },
+        YieldField {
+            name: "evidence_start_time".to_string(),
+            value: Expr::SystemVar(SystemVar::EvidenceStartTime),
+        },
+        YieldField {
+            name: "evidence_end_time".to_string(),
+            value: Expr::SystemVar(SystemVar::EvidenceEndTime),
+        },
+        YieldField {
+            name: "rule_window_start".to_string(),
+            value: Expr::SystemVar(SystemVar::WindowStartTime),
+        },
+        YieldField {
+            name: "rule_window_end".to_string(),
+            value: Expr::SystemVar(SystemVar::WindowEndTime),
+        },
+    ];
+    let exec = RuleExecutor::new(plan);
+    let close = CloseOutput {
+        rule_name: "r1".to_string(),
+        scope_key: vec![str_val("10.0.0.1")],
+        close_reason: CloseReason::Timeout,
+        event_ok: true,
+        close_ok: true,
+        close_mode: CloseMode::And,
+        event_emitted: false,
+        event_step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: Some("fail".to_string()),
+            measure_value: 3.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
+            collected_values: Vec::new(),
+            field_values: std::collections::HashMap::new(),
+        }],
+        close_step_data: vec![],
+        bind_data: vec![],
+        watermark_nanos: 10_000_000_000,
+        event_first_time_nanos: 1_000_000_000,
+        event_last_time_nanos: 3_000_000_000,
+        window_start_time_nanos: 500_000_000,
+        window_end_time_nanos: 10_000_000_000,
+        machine_id: String::new(),
+        last_event_nanos: 3_000_000_000,
+    };
+
+    let alert = exec.execute_close(&close).unwrap().unwrap();
+
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(field("first_seen"), Some(num(1_000.0)));
+    assert_eq!(field("last_seen"), Some(num(3_000.0)));
+    assert_eq!(field("evidence_start_time"), Some(num(1_000.0)));
+    assert_eq!(field("evidence_end_time"), Some(num(3_000.0)));
+    assert_eq!(field("rule_window_start"), Some(num(500.0)));
+    assert_eq!(field("rule_window_end"), Some(num(10_000.0)));
 }
 
 #[test]
@@ -609,12 +850,18 @@ fn execute_close_score_can_use_count_alias() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 3.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
     };
@@ -680,12 +927,18 @@ fn execute_close_yield_can_use_count_label_inside_if_and_concat() {
             satisfied_branch_index: 0,
             label: Some("hi".to_string()),
             measure_value: 2.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
     };
@@ -773,6 +1026,8 @@ fn execute_close_yield_can_use_avg_on_field() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 2.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::from([(
                 "risk_score".to_string(),
@@ -782,6 +1037,10 @@ fn execute_close_yield_can_use_avg_on_field() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
     };
@@ -874,6 +1133,8 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 2.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::from([(
                 "risk_score".to_string(),
@@ -908,6 +1169,10 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
             },
         ],
         watermark_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
     };
@@ -1003,6 +1268,8 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 2.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
@@ -1033,6 +1300,10 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
             },
         ],
         event_time_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
     };
 
@@ -1113,6 +1384,8 @@ fn execute_close_yield_can_use_fmt_with_count() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 3.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::from([(
                 "sip".to_string(),
@@ -1126,6 +1399,10 @@ fn execute_close_yield_can_use_fmt_with_count() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
     };
@@ -1168,6 +1445,10 @@ fn execute_close_event_not_ok() {
         close_step_data: vec![],
         bind_data: vec![],
         watermark_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 0,
     };
@@ -1277,11 +1558,17 @@ fn summary_format() {
             satisfied_branch_index: 0,
             label: Some("fail".to_string()),
             measure_value: 5.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
     };
 
@@ -1324,11 +1611,17 @@ fn numeric_key_preserves_type_in_eval_context() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
     };
 
@@ -1365,11 +1658,17 @@ fn label_cannot_overwrite_key_in_eval_context() {
             satisfied_branch_index: 0,
             label: Some("sip".to_string()),
             measure_value: 99.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
     };
 
@@ -1403,11 +1702,17 @@ fn wfx_id_hex_format() {
             satisfied_branch_index: 0,
             label: None,
             measure_value: 1.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::new(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
         machine_id: String::new(),
     };
 

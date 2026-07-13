@@ -3,9 +3,11 @@ use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::match_engine::{Event, MatchedContext, WindowLookup};
 
 use super::RuleExecutor;
-use super::alert::{build_summary, build_wfx_id, format_nanos_utc, format_now_utc};
+use super::alert::{build_summary, build_wfx_id, format_nanos_utc, now_nanos};
 use super::context::{build_eval_context, execute_joins};
-use super::eval::{eval_entity_id, eval_score, eval_yield_expr_with_score, with_yield_eval_scope};
+use super::eval::{
+    YieldMeta, eval_entity_id, eval_score, eval_yield_expr_with_meta, with_yield_eval_scope,
+};
 
 impl RuleExecutor {
     /// Produce an [`OutputRecord`] from an on-event match (L1 — no joins).
@@ -55,7 +57,8 @@ impl RuleExecutor {
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
         let origin = AlertOrigin::Event;
         let fired_at = format_nanos_utc(matched.event_time_nanos);
-        let emit_time = format_now_utc();
+        let emit_time_nanos = now_nanos();
+        let emit_time = format_nanos_utc(emit_time_nanos);
         let wfx_id = build_wfx_id(
             &self.plan.name,
             &matched.scope_key,
@@ -71,12 +74,20 @@ impl RuleExecutor {
             &origin,
         );
         let yield_fields = with_yield_eval_scope(|| {
+            let yield_meta = YieldMeta {
+                score: Some(score),
+                event_first_time_nanos: Some(matched.event_first_time_nanos),
+                event_last_time_nanos: Some(matched.event_last_time_nanos),
+                window_start_time_nanos: Some(matched.window_start_time_nanos),
+                window_end_time_nanos: Some(matched.window_end_time_nanos),
+                emit_time_nanos: Some(emit_time_nanos),
+            };
             self.plan
                 .yield_plan
                 .fields
                 .iter()
                 .map(|field| {
-                    let Some(value) = eval_yield_expr_with_score(&field.value, ctx, Some(score))
+                    let Some(value) = eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
                     else {
                         return Err(orion_error::StructError::from(CoreReason::RuleExec)
                             .with_detail(format!(

@@ -27,7 +27,7 @@ use std::collections::{BinaryHeap, HashMap};
 use wf_lang::ast::CloseMode;
 use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, WindowSpec};
 
-use close::{accumulate_close_steps, evaluate_close};
+use close::{accumulate_close_steps, evaluate_close, evidence_time_range};
 use key::{InstanceKey, extract_key, make_scope_key_str};
 use state::{AliasState, Instance, snapshot_bind_data};
 use step::{collect_alias_event, evaluate_step};
@@ -297,10 +297,7 @@ impl CepStateMachine {
         });
         let plan = &self.plan;
 
-        // Track the latest event time for this instance
-        if now_nanos > instance.last_event_nanos {
-            instance.last_event_nanos = now_nanos;
-        }
+        instance.observe_seen_event_time(now_nanos);
 
         if should_track_bind_alias(plan, alias) {
             let tracked_fields = plan.tracked_bind_fields.get(alias);
@@ -319,6 +316,7 @@ impl CepStateMachine {
             accumulate_close_steps(
                 alias,
                 event,
+                now_nanos,
                 plan,
                 &mut instance.close_step_states,
                 windows,
@@ -349,6 +347,7 @@ impl CepStateMachine {
             let Some((branch_idx, measure_value)) = evaluate_step(
                 alias,
                 event,
+                now_nanos,
                 step_plan,
                 step_state,
                 windows,
@@ -366,6 +365,8 @@ impl CepStateMachine {
                 satisfied_branch_index: branch_idx,
                 label,
                 measure_value,
+                event_first_time_nanos: step_state.branch_states[branch_idx].event_first_time_nanos,
+                event_last_time_nanos: step_state.branch_states[branch_idx].event_last_time_nanos,
                 collected_values,
                 field_values: step_state.branch_states[branch_idx].field_values.clone(),
             });
@@ -405,12 +406,19 @@ impl CepStateMachine {
                 }
 
                 // No close steps → M14 backward compat: Matched + reset
+                let (evidence_first, evidence_last) =
+                    evidence_time_range(instance.completed_steps.iter())
+                        .unwrap_or((now_nanos, now_nanos));
                 let ctx = MatchedContext {
                     rule_name: self.rule_name.clone(),
                     scope_key,
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(&instance.alias_states),
                     event_time_nanos: now_nanos,
+                    event_first_time_nanos: evidence_first,
+                    event_last_time_nanos: evidence_last,
+                    window_start_time_nanos: instance.created_at,
+                    window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
                 };
                 let reset_at = fixed_created_at.unwrap_or(now_nanos);
@@ -442,12 +450,19 @@ impl CepStateMachine {
                     self.emit_count += 1;
                 }
                 instance.event_emitted = true;
+                let (evidence_first, evidence_last) =
+                    evidence_time_range(instance.completed_steps.iter())
+                        .unwrap_or((now_nanos, now_nanos));
                 let ctx = MatchedContext {
                     rule_name: self.rule_name.clone(),
                     scope_key,
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(&instance.alias_states),
                     event_time_nanos: now_nanos,
+                    event_first_time_nanos: evidence_first,
+                    event_last_time_nanos: evidence_last,
+                    window_start_time_nanos: instance.created_at,
+                    window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
                 };
                 StepResult::Matched(ctx)

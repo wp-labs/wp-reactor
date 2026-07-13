@@ -8,6 +8,18 @@ All notable changes to wp-reactor will be documented in this file.
 
 - **wf-runtime**: Changed the default dynamic stream-tag payload carrier from `wp_stream_tag` to `wp_oml_name`, matching warp-parse OML output naming.
 - **User guide**: Updated runtime source examples to use `stream_tag_field = "wp_oml_name"`.
+- **wf-engine**: Unified WFL `time` expression values on epoch milliseconds: `now()` and `now_ms()` now return milliseconds, `strptime()` and `time_bucket()` return milliseconds, and `strftime()` / `time_diff()` accept epoch seconds, milliseconds, microseconds, or nanoseconds by timestamp width.
+
+### Added
+
+- **wf-lang / wf-engine**: Added yield-only time system variables `@event_first_time`, `@event_last_time`, `@evidence_start_time`, `@evidence_end_time`, `@window_start_time`, `@window_end_time`, and `@emit_time`.
+- **User guide / design**: Documented the time system variables and recommended business-field mappings such as `first_seen`, `last_seen`, `rule_window_start`, and `latest_analysis_time`.
+
+### Fixed
+
+- **wf-engine**: Reused a shared epoch timestamp normalization helper across alert export and both expression evaluators to keep second/millisecond/microsecond/nanosecond handling consistent.
+- **wf-engine**: `time_bucket()` now rejects zero, negative, and non-finite intervals instead of producing surprising bucket results.
+- **wf-engine tests**: Removed cross-evaluation exact equality checks for `now()` / `now_ms()` to avoid millisecond-boundary flakes while preserving same-expression timestamp stability coverage.
 
 ## [0.1.30] — 2026-07-11
 

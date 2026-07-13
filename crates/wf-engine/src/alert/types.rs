@@ -16,6 +16,7 @@ use wp_model_core::model::{
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::CloseReason;
 use crate::match_engine::Value;
+use crate::time::normalize_epoch_timestamp_float_nanos;
 
 pub const WFU_ID: &str = "__wfu_id";
 pub const WFU_RULE_NAME: &str = "__wfu_rule_name";
@@ -553,13 +554,16 @@ fn base_type_name(base_type: &BaseType) -> &'static str {
 fn parse_time_value(value: &Value) -> CoreResult<DateTimeValue> {
     match value {
         Value::Number(n) if n.is_finite() && n.fract() == 0.0 => {
-            let nanos = *n as i64;
+            let nanos = normalize_epoch_timestamp_float_nanos(*n).ok_or_else(|| {
+                orion_error::StructError::from(CoreReason::DataFormat)
+                    .with_detail("time field requires a finite epoch timestamp")
+            })?;
             Ok(DateTime::from_timestamp_nanos(nanos).naive_utc())
         }
         Value::Str(text) => parse_time_text(text),
         _ => CoreReason::DataFormat
             .to_err()
-            .with_detail("time field requires RFC3339 text or integer nanoseconds")
+            .with_detail("time field requires RFC3339 text or an epoch timestamp number")
             .err(),
     }
 }
@@ -729,6 +733,17 @@ mod tests {
             .to_data_record()
             .expect_err("reserved prefix should fail");
         assert!(err.to_string().contains(WFU_PREFIX));
+    }
+
+    #[test]
+    fn parse_time_value_accepts_epoch_milliseconds() {
+        let dt = parse_time_value(&Value::Number(1_710_115_200_123.0)).expect("time");
+        assert_eq!(
+            dt,
+            DateTime::from_timestamp_millis(1_710_115_200_123)
+                .expect("millis")
+                .naive_utc()
+        );
     }
 
     #[test]

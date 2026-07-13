@@ -21,6 +21,8 @@ pub(super) struct BranchState {
     pub(super) avg_sum: f64,
     pub(super) avg_count: u64,
     pub(super) distinct_set: HashSet<ValueKey>,
+    pub(super) event_first_time_nanos: Option<i64>,
+    pub(super) event_last_time_nanos: Option<i64>,
     // L3: collected values for collect_set/list, first/last, stddev/percentile
     pub(super) collected_values: Vec<Value>,
     pub(super) field_values: HashMap<String, Vec<Value>>,
@@ -38,6 +40,8 @@ impl BranchState {
             avg_sum: 0.0,
             avg_count: 0,
             distinct_set: HashSet::new(),
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: HashMap::new(),
         }
@@ -240,6 +244,12 @@ impl Instance {
             .collect();
         self.alias_states.clear();
         self.baselines.clear();
+    }
+
+    pub(super) fn observe_seen_event_time(&mut self, event_time_nanos: i64) {
+        if event_time_nanos > self.last_event_nanos {
+            self.last_event_nanos = event_time_nanos;
+        }
     }
 }
 

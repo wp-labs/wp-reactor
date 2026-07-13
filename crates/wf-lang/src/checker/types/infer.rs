@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, Expr};
+use crate::ast::{BinOp, Expr, SystemVar};
 use crate::schema::BaseType;
 
 use super::{ValType, is_numeric, numeric_promote, unify_array_element_type};
@@ -17,7 +17,16 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
         }
         Expr::StringLit(_) => Some(ValType::Base(BaseType::Chars)),
         Expr::Bool(_) => Some(ValType::Bool),
-        Expr::SystemVar(_) => Some(ValType::Base(BaseType::Float)),
+        Expr::SystemVar(SystemVar::Score) => Some(ValType::Base(BaseType::Float)),
+        Expr::SystemVar(
+            SystemVar::EventFirstTime
+            | SystemVar::EventLastTime
+            | SystemVar::EvidenceStartTime
+            | SystemVar::EvidenceEndTime
+            | SystemVar::WindowStartTime
+            | SystemVar::WindowEndTime
+            | SystemVar::EmitTime,
+        ) => Some(ValType::Base(BaseType::Time)),
         Expr::Field(fref) => scope.resolve_field_ref(fref).ok().flatten(),
         Expr::Object(_) => Some(ValType::Object),
         Expr::Array(items) => infer_array_type(items, scope),

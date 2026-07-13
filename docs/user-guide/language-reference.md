@@ -398,6 +398,59 @@ yield security_alerts@v2 (
 - 它引用的是当前规则的 score，不是上游中间记录里的 `__wfu_score`
 - 如果写了 `@vN`，checker 会校验它与 `meta { contract_version = "N" }` 一致
 
+#### 时间系统变量
+
+这些变量用于把规则命中时间、证据时间和窗口时间输出为业务字段，避免依赖运行时内部的 `__wfu_*` 元数据字段。它们与 `@score` 一样，只允许在 `yield` 表达式中使用。
+
+| 变量 | 类型 | 语义 |
+|------|------|------|
+| `@event_first_time` | `time` | 本次命中证据里的第一条事件时间 |
+| `@event_last_time` | `time` | 本次命中证据里的最后一条事件时间 |
+| `@evidence_start_time` | `time` | 语义别名，等价于 `@event_first_time` |
+| `@evidence_end_time` | `time` | 语义别名，等价于 `@event_last_time` |
+| `@window_start_time` | `time` | 规则窗口开始时间 |
+| `@window_end_time` | `time` | 规则窗口结束时间 |
+| `@emit_time` | `time` | 本次输出记录的稳定产出时间 |
+
+推荐在输出 window 中显式声明业务字段：
+
+```wfs
+window security_alerts {
+    over = 0
+
+    fields {
+        first_seen: time
+        last_seen: time
+        evidence_start_time: time
+        evidence_end_time: time
+        rule_window_start: time
+        rule_window_end: time
+        latest_analysis_time: time
+    }
+}
+```
+
+然后在 `yield` 中赋值：
+
+```wfl
+yield security_alerts (
+    first_seen = @event_first_time,
+    last_seen = @event_last_time,
+    evidence_start_time = @evidence_start_time,
+    evidence_end_time = @evidence_end_time,
+    rule_window_start = @window_start_time,
+    rule_window_end = @window_end_time,
+    latest_analysis_time = @emit_time
+)
+```
+
+约束：
+
+- 这些变量只允许在 `yield` 表达式里使用。
+- 这些变量在表达式里的数值表示为 epoch milliseconds；写入 `time` 字段时会按时间类型输出。
+- `@emit_time` 在同一条输出记录内必须保持稳定，多次引用取同一个值。
+- `@event_first_time` / `@event_last_time` 表达证据事件时间；`@window_start_time` / `@window_end_time` 表达规则窗口边界，不应混用。
+
 最终 alert 记录会自动注入：
 
 - `rule_name`
@@ -628,7 +681,7 @@ yield out (
 
 | 函数 | 返回类型 | 说明 |
 |------|----------|------|
-| `now()` | `time` | 当前 UTC epoch nanoseconds；可直接传给 `strftime` |
+| `now()` | `time` | 当前 UTC epoch milliseconds；可直接传给 `strftime` |
 | `now_s()` | `digit` | 当前 UTC epoch seconds |
 | `now_ms()` | `digit` | 当前 UTC epoch milliseconds |
 | `now_us()` | `digit` | 当前 UTC epoch microseconds |
@@ -648,16 +701,17 @@ yield security_alerts (
 
 - `now()` 表示规则输出时刻，不是事件发生时间。
 - 同一条输出记录的多个 `yield` 字段里调用 `now_*`，会复用同一个内部时间戳。
-- 当前运行时数值统一使用 `f64` 表示；`now_ns()` 可用于时间函数和比较，但不要把它当作可精确表达每一纳秒的整数序列号。
+- 默认 `time` 数值使用 epoch milliseconds；显式单位函数 `now_s()` / `now_us()` / `now_ns()` 按函数名返回对应单位。
+- 当前运行时数值统一使用 `f64` 表示；需要可精确持久化的业务时间，优先写入 `time` 字段。
 
 #### 时间格式化与解析
 
 | 函数 | 返回类型 | 说明 |
 |------|----------|------|
-| `strftime(timestamp_nanos, format)` | `chars` | 按 chrono 格式字符串格式化 UTC 时间 |
-| `strptime(text, format)` | `time` | 按格式解析时间，返回 epoch nanoseconds |
+| `strftime(timestamp, format)` | `chars` | 按 chrono 格式字符串格式化 UTC 时间；timestamp 可为秒/毫秒/微秒/纳秒 epoch 数值 |
+| `strptime(text, format)` | `time` | 按格式解析时间，返回 epoch milliseconds |
 | `time_diff(t1, t2)` | `float` | 返回两个时间的秒级差值绝对值 |
-| `time_bucket(t, interval_seconds)` | `time` | 将时间向下取整到指定秒级窗口 |
+| `time_bucket(t, interval_seconds)` | `time` | 将时间向下取整到指定秒级窗口，返回 epoch milliseconds |
 
 示例：
 

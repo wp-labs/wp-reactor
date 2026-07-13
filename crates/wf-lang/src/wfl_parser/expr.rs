@@ -228,6 +228,13 @@ fn system_var(input: &mut &str) -> ModalResult<Expr> {
         .parse_next(input)?;
     match name {
         "score" => Ok(Expr::SystemVar(SystemVar::Score)),
+        "event_first_time" => Ok(Expr::SystemVar(SystemVar::EventFirstTime)),
+        "event_last_time" => Ok(Expr::SystemVar(SystemVar::EventLastTime)),
+        "evidence_start_time" => Ok(Expr::SystemVar(SystemVar::EvidenceStartTime)),
+        "evidence_end_time" => Ok(Expr::SystemVar(SystemVar::EvidenceEndTime)),
+        "window_start_time" => Ok(Expr::SystemVar(SystemVar::WindowStartTime)),
+        "window_end_time" => Ok(Expr::SystemVar(SystemVar::WindowEndTime)),
+        "emit_time" => Ok(Expr::SystemVar(SystemVar::EmitTime)),
         _ => Err(winnow::error::ErrMode::Cut(
             winnow::error::ContextError::new(),
         )),

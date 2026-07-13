@@ -17,6 +17,7 @@ use super::types::{Event, RollingStats, Value, WindowLookup};
 pub(super) fn evaluate_step(
     alias: &str,
     event: &Event,
+    event_time_nanos: i64,
     step_plan: &StepPlan,
     step_state: &mut StepState,
     windows: Option<&dyn WindowLookup>,
@@ -46,6 +47,8 @@ pub(super) fn evaluate_step(
             continue; // filtered out by transform (e.g. duplicate in distinct)
         }
 
+        record_evidence_time(bs, event_time_nanos);
+
         // Update measure accumulators
         update_measure(&branch.agg.measure, &field_value, bs);
 
@@ -58,6 +61,17 @@ pub(super) fn evaluate_step(
         }
     }
     None
+}
+
+pub(super) fn record_evidence_time(bs: &mut BranchState, event_time_nanos: i64) {
+    match bs.event_first_time_nanos {
+        Some(first) if first <= event_time_nanos => {}
+        _ => bs.event_first_time_nanos = Some(event_time_nanos),
+    }
+    match bs.event_last_time_nanos {
+        Some(last) if last >= event_time_nanos => {}
+        _ => bs.event_last_time_nanos = Some(event_time_nanos),
+    }
 }
 
 pub(super) fn collect_event_fields(

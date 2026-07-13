@@ -16,7 +16,7 @@ pub fn format_expr(expr: &Expr) -> String {
         }
         Expr::StringLit(s) => format!("\"{}\"", s),
         Expr::Bool(b) => format!("{}", b),
-        Expr::SystemVar(SystemVar::Score) => "@score".to_string(),
+        Expr::SystemVar(var) => format_system_var(*var).to_string(),
         Expr::Field(fref) => format_field_ref(fref),
         Expr::BinOp { op, left, right } => {
             format!(
@@ -79,6 +79,19 @@ pub fn format_expr(expr: &Expr) -> String {
                 format_expr(else_expr)
             )
         }
+    }
+}
+
+fn format_system_var(var: SystemVar) -> &'static str {
+    match var {
+        SystemVar::Score => "@score",
+        SystemVar::EventFirstTime => "@event_first_time",
+        SystemVar::EventLastTime => "@event_last_time",
+        SystemVar::EvidenceStartTime => "@evidence_start_time",
+        SystemVar::EvidenceEndTime => "@evidence_end_time",
+        SystemVar::WindowStartTime => "@window_start_time",
+        SystemVar::WindowEndTime => "@window_end_time",
+        SystemVar::EmitTime => "@emit_time",
     }
 }
 

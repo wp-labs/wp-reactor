@@ -300,3 +300,42 @@ rule r {
         Expr::SystemVar(SystemVar::Score)
     );
 }
+
+#[test]
+fn parse_expr_time_system_vars() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        first_seen = @event_first_time,
+        last_seen = @event_last_time,
+        evidence_start_time = @evidence_start_time,
+        evidence_end_time = @evidence_end_time,
+        rule_window_start = @window_start_time,
+        rule_window_end = @window_end_time,
+        latest_analysis_time = @emit_time
+    )
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let vars: Vec<_> = file.rules[0]
+        .yield_clause
+        .args
+        .iter()
+        .map(|arg| &arg.value)
+        .collect();
+    assert_eq!(
+        vars,
+        vec![
+            &Expr::SystemVar(SystemVar::EventFirstTime),
+            &Expr::SystemVar(SystemVar::EventLastTime),
+            &Expr::SystemVar(SystemVar::EvidenceStartTime),
+            &Expr::SystemVar(SystemVar::EvidenceEndTime),
+            &Expr::SystemVar(SystemVar::WindowStartTime),
+            &Expr::SystemVar(SystemVar::WindowEndTime),
+            &Expr::SystemVar(SystemVar::EmitTime),
+        ]
+    );
+}

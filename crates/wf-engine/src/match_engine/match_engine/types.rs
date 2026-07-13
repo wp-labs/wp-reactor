@@ -54,6 +54,10 @@ pub struct MatchedContext {
     pub step_data: Vec<StepData>,
     pub bind_data: Vec<BindData>,
     pub event_time_nanos: i64,
+    pub event_first_time_nanos: i64,
+    pub event_last_time_nanos: i64,
+    pub window_start_time_nanos: i64,
+    pub window_end_time_nanos: i64,
     pub machine_id: String,
 }
 
@@ -64,6 +68,8 @@ pub struct StepData {
     pub satisfied_branch_index: usize,
     pub label: Option<String>,
     pub measure_value: f64,
+    pub event_first_time_nanos: Option<i64>,
+    pub event_last_time_nanos: Option<i64>,
     /// Collected values for L3 functions (collect_set/list, first/last, stddev/percentile)
     pub collected_values: Vec<Value>,
     /// All accepted field values seen for the satisfied branch, keyed by field name.
@@ -119,6 +125,10 @@ pub struct CloseOutput {
     pub bind_data: Vec<BindData>,
     pub watermark_nanos: i64,
     pub machine_id: String,
+    pub event_first_time_nanos: i64,
+    pub event_last_time_nanos: i64,
+    pub window_start_time_nanos: i64,
+    pub window_end_time_nanos: i64,
     /// The timestamp of the last event processed by this instance.
     /// Used as the asof join time in the close path to avoid
     /// matching against right-table rows that appeared after the
