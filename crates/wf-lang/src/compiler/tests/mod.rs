@@ -206,6 +206,27 @@ fn simple_field_ref_not_collected() {
 }
 
 #[test]
+fn stat_window_event_tracks_bind_alias_count() {
+    let src = r#"
+rule stat_tracking {
+    events { auth : auth_events }
+    match<sip:5m> { on event { fail: auth | count >= 1; } } -> score(50.0)
+    entity(ip, auth.sip)
+    yield out (n = stat.count(window_event(auth)))
+}
+"#;
+    let plans = compile_with(src, &[auth_events_window(), output_window()]);
+    let plan = plans
+        .iter()
+        .find(|plan| plan.name == "stat_tracking")
+        .expect("compiled rule should exist");
+    assert!(
+        plan.match_plan.tracked_bind_aliases.contains("auth"),
+        "stat.count(window_event(auth)) should track alias auth count"
+    );
+}
+
+#[test]
 fn yield_expression_collects_aliases() {
     let score_expr = crate::ast::Expr::Number(70.0);
     let entity_expr =

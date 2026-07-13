@@ -11,7 +11,7 @@ pub(crate) mod yield_version;
 use std::collections::HashSet;
 
 use crate::ast::{EachClause, Expr, FieldRef, MatchClause, Measure, PipelineStage, RuleDecl};
-use crate::checker::scope::Scope;
+use crate::checker::scope::{Scope, StatLabelInfo, StatLabelStage};
 use crate::checker::types::{ValType, check_expr_type, infer_type};
 use crate::schema::{BaseType, FieldDef, FieldType, WindowSchema};
 
@@ -48,7 +48,8 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
     }
 
     // Build scope from events block
-    let base_scope = scope_build::build_scope(rule, schemas, name, errors);
+    let mut base_scope = scope_build::build_scope(rule, schemas, name, errors);
+    populate_stat_labels(&mut base_scope, &rule.match_clause);
 
     if rule.each_clause.is_some() && !rule.pipeline_stages.is_empty() {
         errors.push(CheckError {
@@ -100,17 +101,21 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
 
         for (idx, stage) in rule.pipeline_stages.iter().enumerate() {
             if idx == 0 {
+                let mut stage_scope = Scope::new();
+                stage_scope.aliases = base_scope.aliases.clone();
+                stage_scope.join_windows = base_scope.join_windows.clone();
+                populate_stat_labels(&mut stage_scope, &stage.match_clause);
                 check_stage(
                     &stage.match_clause,
                     &stage.joins,
-                    &base_scope,
+                    &stage_scope,
                     schemas,
                     name,
                     errors,
                 );
                 stage_outputs.push(build_pipeline_stage_output_schema(
                     stage,
-                    &base_scope,
+                    &stage_scope,
                     name,
                     idx,
                     errors,
@@ -122,6 +127,7 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
             stage_scope
                 .aliases
                 .insert(PIPE_IN_ALIAS, &stage_outputs[idx - 1]);
+            populate_stat_labels(&mut stage_scope, &stage.match_clause);
             check_stage(
                 &stage.match_clause,
                 &stage.joins,
@@ -143,6 +149,7 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
         if let Some(prev) = stage_outputs.last() {
             final_scope.aliases.insert(PIPE_IN_ALIAS, prev);
         }
+        populate_stat_labels(&mut final_scope, &rule.match_clause);
         check_stage(
             &rule.match_clause,
             &rule.joins,
@@ -163,6 +170,46 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
 
     // Check conv (L3: requires fixed window)
     conv_check::check_conv(rule, name, errors);
+}
+
+fn populate_stat_labels(scope: &mut Scope<'_>, match_clause: &MatchClause) {
+    scope.stat_labels.clear();
+    for step in &match_clause.on_event {
+        for branch in &step.branches {
+            if let Some(label) = &branch.label {
+                scope.stat_labels.insert(
+                    label.clone(),
+                    StatLabelInfo {
+                        stage: StatLabelStage::Event,
+                        uses_distinct: branch
+                            .pipe
+                            .transforms
+                            .contains(&crate::ast::Transform::Distinct),
+                        measure: branch.pipe.measure,
+                    },
+                );
+            }
+        }
+    }
+    if let Some(close_block) = &match_clause.on_close {
+        for step in &close_block.steps {
+            for branch in &step.branches {
+                if let Some(label) = &branch.label {
+                    scope.stat_labels.insert(
+                        label.clone(),
+                        StatLabelInfo {
+                            stage: StatLabelStage::Close,
+                            uses_distinct: branch
+                                .pipe
+                                .transforms
+                                .contains(&crate::ast::Transform::Distinct),
+                            measure: branch.pipe.measure,
+                        },
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn check_stage(
@@ -303,7 +350,7 @@ fn check_on_each_expr(
             qualifier,
             name,
             args,
-        } if qualifier.is_none() && is_disallowed_on_each_func(name) => {
+        } if is_disallowed_on_each_func(qualifier.as_deref(), name) => {
             errors.push(CheckError {
                 severity: Severity::Error,
                 rule: Some(rule_name.to_string()),
@@ -344,23 +391,30 @@ fn check_on_each_expr(
     }
 }
 
-fn is_disallowed_on_each_func(name: &str) -> bool {
-    matches!(
-        name,
-        "count"
-            | "sum"
-            | "avg"
-            | "min"
-            | "max"
-            | "distinct"
-            | "baseline"
-            | "collect_set"
-            | "collect_list"
-            | "first"
-            | "last"
-            | "stddev"
-            | "percentile"
-    )
+fn is_disallowed_on_each_func(qualifier: Option<&str>, name: &str) -> bool {
+    (qualifier == Some("stat") && matches!(name, "count" | "value"))
+        || (qualifier.is_none()
+            && matches!(
+                name,
+                "count"
+                    | "sum"
+                    | "avg"
+                    | "min"
+                    | "max"
+                    | "distinct"
+                    | "baseline"
+                    | "collect_set"
+                    | "collect_list"
+                    | "first"
+                    | "last"
+                    | "stddev"
+                    | "percentile"
+                    | "window_event"
+                    | "match_event"
+                    | "match_distinct"
+                    | "trigger"
+                    | "final"
+            ))
 }
 
 fn build_pipeline_stage_output_schema(

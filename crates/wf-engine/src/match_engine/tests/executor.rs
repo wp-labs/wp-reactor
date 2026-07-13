@@ -1915,6 +1915,7 @@ rule tracked_close {
         actions = collect_set(c.action)
     )
 }
+
 "#;
     let file = wf_lang::parse_wfl(source).expect("parse should succeed");
     let plan = wf_lang::compile_wfl(&file, &[input_window, output_window])
@@ -2033,4 +2034,185 @@ fn build_machine_id_and_scope_key() {
         ),
         "sip=10.0.0.1,user=admin"
     );
+}
+
+#[test]
+fn execute_match_yield_can_use_stat_context_functions() {
+    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+
+    let input_window = WindowSchema {
+        name: "auth_events".to_string(),
+        streams: vec!["auth_stream".to_string()],
+        time_field: Some("event_time".to_string()),
+        over: std::time::Duration::from_secs(3600),
+        fields: vec![
+            FieldDef {
+                name: "sip".to_string(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "event_time".to_string(),
+                field_type: FieldType::Base(BaseType::Time),
+            },
+        ],
+    };
+    let output_window = WindowSchema {
+        name: "out".to_string(),
+        streams: vec![],
+        time_field: None,
+        over: std::time::Duration::from_secs(3600),
+        fields: vec![
+            FieldDef {
+                name: "sip".to_string(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "window_events".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "matched_events".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "trigger_count".to_string(),
+                field_type: FieldType::Base(BaseType::Float),
+            },
+        ],
+    };
+    let source = r#"
+rule stat_rule {
+    events { auth : auth_events }
+    match<sip:5m> {
+        on event { fail: auth | count >= 2; }
+    } -> score(70.0)
+    entity(ip, auth.sip)
+    yield out (
+        sip = auth.sip,
+        window_events = stat.count(window_event(auth)),
+        matched_events = stat.count(match_event(fail)),
+        trigger_count = stat.value(trigger(fail))
+    )
+}
+"#;
+    let file = wf_lang::parse_wfl(source).expect("parse should succeed");
+    let plan = wf_lang::compile_wfl(&file, &[input_window, output_window])
+        .expect("compile should succeed")
+        .into_iter()
+        .next()
+        .expect("rule plan should exist");
+    assert!(plan.match_plan.tracked_bind_aliases.contains("auth"));
+
+    let exec = RuleExecutor::new(plan.clone());
+    let mut sm = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), None);
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    assert_eq!(
+        sm.advance_at("auth", &e, 1_000_000_000),
+        StepResult::Accumulate
+    );
+    let StepResult::Matched(matched) = sm.advance_at("auth", &e, 2_000_000_000) else {
+        panic!("expected match");
+    };
+
+    let alert = exec.execute_match(&matched).expect("alert");
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+
+    assert_eq!(field("window_events"), Some(num(2.0)));
+    assert_eq!(field("matched_events"), Some(num(2.0)));
+    assert_eq!(field("trigger_count"), Some(num(2.0)));
+}
+
+#[test]
+fn execute_close_yield_can_use_stat_final_value() {
+    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+
+    let input_window = WindowSchema {
+        name: "auth_events".to_string(),
+        streams: vec!["auth_stream".to_string()],
+        time_field: Some("event_time".to_string()),
+        over: std::time::Duration::from_secs(3600),
+        fields: vec![
+            FieldDef {
+                name: "sip".to_string(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "event_time".to_string(),
+                field_type: FieldType::Base(BaseType::Time),
+            },
+        ],
+    };
+    let output_window = WindowSchema {
+        name: "out".to_string(),
+        streams: vec![],
+        time_field: None,
+        over: std::time::Duration::from_secs(3600),
+        fields: vec![
+            FieldDef {
+                name: "sip".to_string(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "final_hits".to_string(),
+                field_type: FieldType::Base(BaseType::Float),
+            },
+        ],
+    };
+    let source = r#"
+rule stat_close_rule {
+    events { req : auth_events  resp : auth_events }
+    match<sip:5m> {
+        on event { start: req | count >= 1; }
+        and close { final_hits: resp | count >= 2; }
+    } -> score(70.0)
+    entity(ip, req.sip)
+    yield out (
+        sip = req.sip,
+        final_hits = stat.value(final(final_hits))
+    )
+}
+"#;
+    let file = wf_lang::parse_wfl(source).expect("parse should succeed");
+    let plan = wf_lang::compile_wfl(&file, &[input_window, output_window])
+        .expect("compile should succeed")
+        .into_iter()
+        .next()
+        .expect("rule plan should exist");
+
+    let exec = RuleExecutor::new(plan.clone());
+    let mut sm = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), None);
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    assert_eq!(sm.advance_at("req", &e, 1_000_000_000), StepResult::Advance);
+    assert_eq!(
+        sm.advance_at("resp", &e, 2_000_000_000),
+        StepResult::Accumulate
+    );
+    assert_eq!(
+        sm.advance_at("resp", &e, 3_000_000_000),
+        StepResult::Accumulate
+    );
+
+    let close = sm
+        .close(&[str_val("10.0.0.1")], CloseReason::Flush)
+        .expect("close output");
+    assert!(close.event_ok);
+    assert!(close.close_ok);
+
+    let alert = exec
+        .execute_close(&close)
+        .expect("close should execute")
+        .expect("close should emit alert");
+    let final_hits = alert
+        .yield_fields
+        .iter()
+        .find(|(field_name, _)| field_name == "final_hits")
+        .map(|(_, value)| value.clone());
+
+    assert_eq!(final_hits, Some(num(2.0)));
 }

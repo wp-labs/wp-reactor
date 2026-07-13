@@ -44,7 +44,7 @@ fn check_expr_type_inner(
     scope: &Scope<'_>,
     rule_name: &str,
     allow_l3_funcs: bool,
-    allow_system_vars: bool,
+    allow_yield_context: bool,
     errors: &mut Vec<CheckError>,
 ) {
     match expr {
@@ -54,7 +54,7 @@ fn check_expr_type_inner(
                 scope,
                 rule_name,
                 allow_l3_funcs,
-                allow_system_vars,
+                allow_yield_context,
                 errors,
             );
             check_expr_type_inner(
@@ -62,7 +62,7 @@ fn check_expr_type_inner(
                 scope,
                 rule_name,
                 allow_l3_funcs,
-                allow_system_vars,
+                allow_yield_context,
                 errors,
             );
 
@@ -188,7 +188,7 @@ fn check_expr_type_inner(
                 scope,
                 rule_name,
                 allow_l3_funcs,
-                allow_system_vars,
+                allow_yield_context,
                 errors,
             );
             if let Some(ref t) = infer_type(inner, scope)
@@ -202,18 +202,44 @@ fn check_expr_type_inner(
                 });
             }
         }
-        Expr::FuncCall { name, args, .. } => {
-            for arg in args {
-                check_expr_type_inner(
-                    arg,
-                    scope,
-                    rule_name,
-                    allow_l3_funcs,
-                    allow_system_vars,
-                    errors,
-                );
+        Expr::FuncCall {
+            qualifier,
+            name,
+            args,
+        } => {
+            let is_stat = is_stat_func(qualifier.as_deref(), name);
+            let is_stat_selector = is_stat_selector_func(qualifier.as_deref(), name);
+            if (is_stat || is_stat_selector) && !allow_yield_context {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "stat functions are only allowed in `yield` expressions".to_string(),
+                });
+                return;
             }
-            check_func_call(name, args, scope, rule_name, allow_l3_funcs, errors);
+
+            if !is_stat && !is_stat_selector {
+                for arg in args {
+                    check_expr_type_inner(
+                        arg,
+                        scope,
+                        rule_name,
+                        allow_l3_funcs,
+                        allow_yield_context,
+                        errors,
+                    );
+                }
+            }
+            check_func_call(
+                qualifier.as_deref(),
+                name,
+                args,
+                scope,
+                rule_name,
+                allow_l3_funcs,
+                errors,
+            );
         }
         Expr::Object(items) => {
             let mut seen = HashSet::new();
@@ -223,7 +249,7 @@ fn check_expr_type_inner(
                     scope,
                     rule_name,
                     allow_l3_funcs,
-                    allow_system_vars,
+                    allow_yield_context,
                     errors,
                 );
                 if let Some(type_hint) = &item.type_hint {
@@ -261,7 +287,7 @@ fn check_expr_type_inner(
                     scope,
                     rule_name,
                     allow_l3_funcs,
-                    allow_system_vars,
+                    allow_yield_context,
                     errors,
                 );
             }
@@ -274,7 +300,7 @@ fn check_expr_type_inner(
                 scope,
                 rule_name,
                 allow_l3_funcs,
-                allow_system_vars,
+                allow_yield_context,
                 errors,
             );
             for item in list {
@@ -283,12 +309,12 @@ fn check_expr_type_inner(
                     scope,
                     rule_name,
                     allow_l3_funcs,
-                    allow_system_vars,
+                    allow_yield_context,
                     errors,
                 );
             }
         }
-        Expr::SystemVar(_) if !allow_system_vars => {
+        Expr::SystemVar(_) if !allow_yield_context => {
             errors.push(CheckError {
                 severity: Severity::Error,
                 rule: Some(rule_name.to_string()),
@@ -318,7 +344,7 @@ fn check_expr_type_inner(
                 scope,
                 rule_name,
                 allow_l3_funcs,
-                allow_system_vars,
+                allow_yield_context,
                 errors,
             );
             check_expr_type_inner(
@@ -326,7 +352,7 @@ fn check_expr_type_inner(
                 scope,
                 rule_name,
                 allow_l3_funcs,
-                allow_system_vars,
+                allow_yield_context,
                 errors,
             );
             check_expr_type_inner(
@@ -334,7 +360,7 @@ fn check_expr_type_inner(
                 scope,
                 rule_name,
                 allow_l3_funcs,
-                allow_system_vars,
+                allow_yield_context,
                 errors,
             );
 
@@ -367,4 +393,16 @@ fn check_expr_type_inner(
             }
         }
     }
+}
+
+fn is_stat_func(qualifier: Option<&str>, name: &str) -> bool {
+    qualifier == Some("stat") && matches!(name, "count" | "value")
+}
+
+fn is_stat_selector_func(qualifier: Option<&str>, name: &str) -> bool {
+    qualifier.is_none()
+        && matches!(
+            name,
+            "window_event" | "match_event" | "match_distinct" | "trigger" | "final"
+        )
 }

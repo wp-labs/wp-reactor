@@ -1,9 +1,9 @@
-use crate::ast::{Expr, FieldRef};
+use crate::ast::{Expr, FieldRef, Measure};
 use crate::schema::BaseType;
 
 use super::infer::infer_type;
 use super::{ValType, compatible, is_numeric, is_orderable, unify_array_element_type};
-use crate::checker::scope::Scope;
+use crate::checker::scope::{Scope, StatLabelStage};
 use crate::checker::{CheckError, Severity};
 
 fn is_stable_id_value_type(t: &ValType) -> bool {
@@ -41,6 +41,7 @@ fn unify_mvappend_element_type(existing: &ValType, incoming: &ValType) -> Option
 }
 
 pub fn check_func_call(
+    qualifier: Option<&str>,
     name: &str,
     args: &[Expr],
     scope: &Scope<'_>,
@@ -48,6 +49,22 @@ pub fn check_func_call(
     allow_l3_funcs: bool,
     errors: &mut Vec<CheckError>,
 ) {
+    if qualifier == Some("stat") && matches!(name, "count" | "value") {
+        check_stat_func(name, args, scope, rule_name, errors);
+        return;
+    }
+    if qualifier.is_none() && is_stat_selector_name(name) {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!(
+                "stat selector `{name}(...)` can only be used inside stat.count(...) or stat.value(...)"
+            ),
+        });
+        return;
+    }
+
     if !allow_l3_funcs
         && matches!(
             name,
@@ -1437,5 +1454,242 @@ pub fn check_func_call(
             }
         }
         _ => {}
+    }
+}
+
+fn is_stat_selector_name(name: &str) -> bool {
+    matches!(
+        name,
+        "window_event" | "match_event" | "match_distinct" | "trigger" | "final"
+    )
+}
+
+fn check_stat_func(
+    name: &str,
+    args: &[Expr],
+    scope: &Scope<'_>,
+    rule_name: &str,
+    errors: &mut Vec<CheckError>,
+) {
+    if args.len() != 1 {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!("stat.{name}() requires exactly 1 stat selector argument"),
+        });
+        return;
+    }
+
+    let Some((selector, symbol)) = parse_stat_selector(&args[0], rule_name, errors) else {
+        return;
+    };
+
+    match (name, selector) {
+        ("count", "window_event")
+            if !scope.aliases.contains_key(symbol)
+                || scope.join_windows.iter().any(|alias| alias == &symbol) =>
+        {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: format!(
+                    "stat.count(window_event({symbol})) references unknown event alias `{symbol}`"
+                ),
+            });
+        }
+        ("count", "window_event") => {}
+        ("count", "match_event") => {
+            check_label_stage(
+                scope,
+                rule_name,
+                symbol,
+                StatLabelStage::Event,
+                "stat.count(match_event(...))",
+                errors,
+            );
+        }
+        ("count", "match_distinct") => {
+            match scope.stat_labels.get(symbol) {
+                Some(info) if info.stage != StatLabelStage::Event => errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "stat.count(match_distinct({symbol})) requires step label `{symbol}` to come from on event"
+                    ),
+                }),
+                Some(info) if info.uses_distinct && matches!(info.measure, Measure::Count) => {}
+                Some(info) if info.uses_distinct => errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "stat.count(match_distinct({symbol})) requires step label `{symbol}` to use distinct | count"
+                    ),
+                }),
+                Some(_) => errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "stat.count(match_distinct({symbol})) requires step label `{symbol}` to use distinct"
+                    ),
+                }),
+                None => errors.push(unknown_label_error(
+                    rule_name,
+                    symbol,
+                    "stat.count(match_distinct(...))",
+                )),
+            }
+        }
+        ("value", "trigger") => {
+            check_label_stage(
+                scope,
+                rule_name,
+                symbol,
+                StatLabelStage::Event,
+                "stat.value(trigger(...))",
+                errors,
+            );
+        }
+        ("value", "final") => {
+            check_label_stage(
+                scope,
+                rule_name,
+                symbol,
+                StatLabelStage::Close,
+                "stat.value(final(...))",
+                errors,
+            );
+        }
+        ("count", _) => errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!(
+                "stat.count() accepts window_event(...), match_event(...), or match_distinct(...), got {selector}(...)"
+            ),
+        }),
+        ("value", _) => errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!(
+                "stat.value() accepts trigger(...) or final(...), got {selector}(...)"
+            ),
+        }),
+        _ => {}
+    }
+
+    if matches!((name, selector), ("count", "match_event"))
+        && let Some(info) = scope.stat_labels.get(symbol)
+        && !matches!(info.measure, Measure::Count)
+    {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!(
+                "stat.count(match_event({symbol})) requires step label `{symbol}` to use count"
+            ),
+        });
+    }
+}
+
+fn parse_stat_selector<'a>(
+    expr: &'a Expr,
+    rule_name: &str,
+    errors: &mut Vec<CheckError>,
+) -> Option<(&'a str, &'a str)> {
+    let Expr::FuncCall {
+        qualifier: None,
+        name,
+        args,
+    } = expr
+    else {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message:
+                "stat functions require a selector such as window_event(alias) or trigger(label)"
+                    .to_string(),
+        });
+        return None;
+    };
+
+    if !is_stat_selector_name(name) {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!("unknown stat selector `{name}(...)`"),
+        });
+        return None;
+    }
+
+    if args.len() != 1 {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!("stat selector `{name}(...)` requires exactly 1 symbol argument"),
+        });
+        return None;
+    }
+
+    let Expr::Field(FieldRef::Simple(symbol)) = &args[0] else {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!(
+                "stat selector `{name}(...)` requires a static symbol argument, without quotes"
+            ),
+        });
+        return None;
+    };
+
+    Some((name.as_str(), symbol.as_str()))
+}
+
+fn check_label_stage(
+    scope: &Scope<'_>,
+    rule_name: &str,
+    label: &str,
+    expected_stage: StatLabelStage,
+    context: &str,
+    errors: &mut Vec<CheckError>,
+) {
+    match scope.stat_labels.get(label) {
+        Some(info) if info.stage == expected_stage => {}
+        Some(_) => errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!(
+                "{context} requires step label `{label}` to come from {}",
+                stat_label_stage_name(expected_stage)
+            ),
+        }),
+        None => errors.push(unknown_label_error(rule_name, label, context)),
+    }
+}
+
+fn stat_label_stage_name(stage: StatLabelStage) -> &'static str {
+    match stage {
+        StatLabelStage::Event => "on event",
+        StatLabelStage::Close => "on close",
+    }
+}
+
+fn unknown_label_error(rule_name: &str, label: &str, context: &str) -> CheckError {
+    CheckError {
+        severity: Severity::Error,
+        rule: Some(rule_name.to_string()),
+        test: None,
+        message: format!("{context} references unknown step label `{label}`"),
     }
 }

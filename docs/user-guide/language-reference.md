@@ -451,6 +451,57 @@ yield security_alerts (
 - `@emit_time` 在同一条输出记录内必须保持稳定，多次引用取同一个值。
 - `@event_first_time` / `@event_last_time` 表达证据事件时间；`@window_start_time` / `@window_end_time` 表达规则窗口边界，不应混用。
 
+#### 稳定统计上下文
+
+告警输出有时需要稳定的统计语义，例如进入窗口的候选事件数、命中事件数、distinct 后数量、阈值触发时的聚合值，以及 close/flush 输出时的最终聚合值。当前 API 采用 `stat.count(...)` / `stat.value(...)` 加统计选择器的形式：
+
+```wfl
+yield security_alerts (
+    window_events = stat.count(window_event(auth)),
+    matched_events = stat.count(match_event(port_scan)),
+    distinct_ports = stat.count(match_distinct(port_scan)),
+    trigger_count = stat.value(trigger(port_scan)),
+    final_count = stat.value(final(final_ports))
+)
+```
+
+统计选择器不是普通运行时函数，只能作为 `stat.count(...)` 或 `stat.value(...)` 的参数使用：
+
+| 写法 | 返回类型 | 语义 |
+|------|----------|------|
+| `stat.count(window_event(alias))` | `digit` | 当前 rule instance/window 内，source alias `alias` 被纳入该窗口的候选事件总数 |
+| `stat.count(match_event(label))` | `digit` | `on event` step label `label` 接受为证据的命中事件数；要求该 branch 使用 `count` measure |
+| `stat.count(match_distinct(label))` | `digit` | `on event` step label `label` 的精确 distinct 数量；要求该 branch 使用 `distinct | count` |
+| `stat.value(trigger(label))` | `float` | `on event` step label `label` 第一次满足阈值时的 measure value |
+| `stat.value(final(label))` | `float` | `and close` step label `label` 在本次输出时的最终 measure value |
+
+`window_event(alias)` 的计数点是：
+
+- source alias 匹配。
+- bind/filter 通过。
+- scope key 提取成功。
+- 事件已进入当前 rule instance/window。
+
+它不要求 step guard 通过，不要求 distinct 后保留，不要求 threshold 触发，也不要求最终成为证据事件。
+
+静态校验规则：
+
+- 选择器参数使用静态符号，不加引号，例如 `window_event(auth)`、`match_event(port_scan)`。
+- `window_event(alias)` 中的 `alias` 必须是当前规则声明的 source alias。
+- `match_event(label)` / `match_distinct(label)` / `trigger(label)` / `final(label)` 中的 `label` 必须是当前规则中已命名的 match/close step label。
+- `stat.count(match_event(label))` 要求对应 branch 使用 `count` measure。
+- `match_distinct(label)` 要求对应 branch 使用 `distinct | count`，否则编译失败。
+- `match_event(label)` / `match_distinct(label)` / `trigger(label)` 只能引用 `on event` label；`final(label)` 只能引用 `and close` label。
+- 裸用 `window_event(...)`、`match_event(...)`、`trigger(...)` 等 selector 会编译失败。
+- `stat.count(...)` / `stat.value(...)` 只允许在 `yield` 表达式里使用。
+
+成本边界：
+
+- 第一版只读取规则执行过程中已经维护的窗口、branch、distinct 和 measure 快照。
+- 不支持 `stat.count(distinct(e.user_agent))` 这类任意字段统计。
+- 不从 capped field buffer 推导精确统计。
+- 所有统计仅在当前 rule instance/window 生命周期内有效。
+
 最终 alert 记录会自动注入：
 
 - `rule_name`

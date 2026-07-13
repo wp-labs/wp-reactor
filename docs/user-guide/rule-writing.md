@@ -209,6 +209,56 @@ yield security_alerts (
 - 不使用 `event_fst_time` / `event_lst_time` 这类缩写，避免用户误解。
 - 不依赖 `__wfu_emit_time` 等内部元数据作为业务输出；需要业务字段时在 `yield` 中显式赋值。
 
+### 1.6 输出稳定统计上下文
+
+告警通常还需要输出“为什么触发”的统计证据，例如窗口里总共看到了多少候选事件、命中了多少事件、distinct 后有多少端口、阈值触发时的计数以及 close 输出时的最终计数。当前写法使用 `stat.count(...)` / `stat.value(...)` 加统计选择器：
+
+```wfl
+rule port_scan {
+    events {
+        net : conn_events && action == "syn"
+    }
+
+    match<sip:5m> {
+        on event {
+            port_scan: net.dport | distinct | count >= 10;
+        }
+        and close {
+            final_ports: net.dport | distinct | count >= 1;
+        }
+    } -> score(85.0)
+
+    entity(ip, net.sip)
+    yield security_alerts (
+        sip = net.sip,
+        window_events = stat.count(window_event(net)),
+        matched_events = stat.count(match_event(port_scan)),
+        distinct_ports = stat.count(match_distinct(port_scan)),
+        trigger_count = stat.value(trigger(port_scan)),
+        final_count = stat.value(final(final_ports))
+    )
+}
+```
+
+语义说明：
+
+- `window_event(net)` 表示 alias `net` 进入当前 rule instance/window 的候选事件集合。
+- `match_event(port_scan)` 表示 `on event` label `port_scan` 接受为证据的事件集合。
+- `match_distinct(port_scan)` 表示 `on event` label `port_scan` 的精确 distinct 集合，要求该 branch 使用 `distinct | count`。
+- `trigger(port_scan)` 表示 `on event` label `port_scan` 第一次满足阈值时的 measure 快照。
+- `final(final_ports)` 表示 `and close` label `final_ports` 在本次输出时的最终 measure 快照。
+
+使用要点：
+
+- `net`、`port_scan`、`final_ports` 是静态符号，不加引号；checker 会在编译期校验 alias/label 是否存在。
+- selector 只能出现在 `stat.count(...)` 或 `stat.value(...)` 里，不能单独作为普通函数使用。
+- `stat.count(...)` / `stat.value(...)` 只能在 `yield` 表达式里使用。
+- `stat.count(match_event(label))` 要求对应 branch 使用 `count` measure。
+- `stat.count(match_distinct(label))` 要求对应 branch 使用 `distinct | count`。
+- `stat.count(match_event(label))` / `stat.count(match_distinct(label))` / `stat.value(trigger(label))` 只能引用 `on event` label；`stat.value(final(label))` 只能引用 `and close` label。
+- 第一版只读取规则本来已经维护的状态，不支持任意字段统计，避免无界内存成本。
+- 如果需要 close/flush 输出时的最终计数，需要在 `and close { ... }` 中用单独 label 显式建模。
+
 ---
 
 ## 2. 场景二：多步骤序列 — 扫描后爆破

@@ -1,4 +1,4 @@
-use crate::ast::RuleDecl;
+use crate::ast::{CloseMode, Expr, RuleDecl};
 use crate::schema::WindowSchema;
 
 use crate::checker::scope::{self, Scope};
@@ -15,6 +15,27 @@ pub fn check_yield(
 ) {
     let name = &rule.name;
     let yc = &rule.yield_clause;
+
+    if rule
+        .match_clause
+        .on_close
+        .as_ref()
+        .is_some_and(|close| close.mode == CloseMode::Or)
+    {
+        for arg in &yc.args {
+            if contains_stat_final_selector(&arg.value) {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(name.to_string()),
+                    test: None,
+                    message: format!(
+                        "yield argument `{}` uses stat.value(final(...)) with `on close`; use `and close` so the final close label is available for every output path",
+                        arg.name
+                    ),
+                });
+            }
+        }
+    }
 
     // Y1: target window must exist
     let target_schema = schemas.iter().find(|s| s.name == yc.target);
@@ -140,4 +161,51 @@ pub fn check_yield(
             }
         }
     }
+}
+
+fn contains_stat_final_selector(expr: &Expr) -> bool {
+    match expr {
+        Expr::FuncCall {
+            qualifier,
+            name,
+            args,
+        } => {
+            let is_stat_final_value = qualifier.as_deref() == Some("stat")
+                && name == "value"
+                && args.first().is_some_and(is_final_selector);
+            is_stat_final_value || args.iter().any(contains_stat_final_selector)
+        }
+        Expr::BinOp { left, right, .. } => {
+            contains_stat_final_selector(left) || contains_stat_final_selector(right)
+        }
+        Expr::Neg(inner) => contains_stat_final_selector(inner),
+        Expr::Object(items) => items
+            .iter()
+            .any(|item| contains_stat_final_selector(&item.value)),
+        Expr::Array(items) => items.iter().any(contains_stat_final_selector),
+        Expr::InList { expr, list, .. } => {
+            contains_stat_final_selector(expr) || list.iter().any(contains_stat_final_selector)
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            contains_stat_final_selector(cond)
+                || contains_stat_final_selector(then_expr)
+                || contains_stat_final_selector(else_expr)
+        }
+        _ => false,
+    }
+}
+
+fn is_final_selector(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::FuncCall {
+            qualifier: None,
+            name,
+            ..
+        } if name == "final"
+    )
 }

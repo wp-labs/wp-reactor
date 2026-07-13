@@ -351,6 +351,13 @@ pub(crate) fn collect_bind_tracking(expr: &Expr, tracking: &mut BindTracking) {
             name,
             args,
         } => {
+            if qualifier.as_deref() == Some("stat") {
+                collect_stat_bind_tracking(name, args, tracking);
+                return;
+            }
+            if qualifier.is_none() && is_stat_selector(name) {
+                return;
+            }
             if qualifier.is_none()
                 && is_series_func(name)
                 && let Some(Expr::Field(
@@ -391,6 +398,33 @@ pub(crate) fn collect_bind_tracking(expr: &Expr, tracking: &mut BindTracking) {
         }
         _ => {}
     }
+}
+
+fn collect_stat_bind_tracking(name: &str, args: &[Expr], tracking: &mut BindTracking) {
+    if name != "count" || args.len() != 1 {
+        return;
+    }
+    let Expr::FuncCall {
+        qualifier: None,
+        name: selector,
+        args: selector_args,
+    } = &args[0]
+    else {
+        return;
+    };
+    if selector != "window_event" || selector_args.len() != 1 {
+        return;
+    }
+    if let Expr::Field(FieldRef::Simple(alias)) = &selector_args[0] {
+        tracking.aliases.insert(alias.clone());
+    }
+}
+
+fn is_stat_selector(name: &str) -> bool {
+    matches!(
+        name,
+        "window_event" | "match_event" | "match_distinct" | "trigger" | "final"
+    )
 }
 
 fn track_bind_field(tracking: &mut BindTracking, alias: &str, field: &str) {

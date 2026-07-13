@@ -219,6 +219,12 @@ fn eval_expr_with_l3(expr: &wf_lang::ast::Expr, ctx: &Event, meta: YieldMeta) ->
             name,
             args,
         } => {
+            if qualifier.as_deref() == Some("stat") && matches!(name.as_str(), "count" | "value") {
+                return eval_stat_func(name, args, ctx);
+            }
+            if qualifier.is_none() && is_stat_selector_func(name) {
+                return None;
+            }
             if qualifier.is_some() {
                 if contains_system_var(expr) {
                     let rewritten = materialize_system_vars(expr, score)?;
@@ -1305,6 +1311,73 @@ fn eval_builtin_func_with_l3(
         "external" => crate::external::eval_external(&args[0], &args[1..], |a| {
             eval_expr_with_l3(a, ctx, score)
         }),
+        _ => None,
+    }
+}
+
+enum StatSelector<'a> {
+    WindowEvent(&'a str),
+    MatchEvent(&'a str),
+    MatchDistinct(&'a str),
+    Trigger(&'a str),
+    Final(&'a str),
+}
+
+fn is_stat_selector_func(name: &str) -> bool {
+    matches!(
+        name,
+        "window_event" | "match_event" | "match_distinct" | "trigger" | "final"
+    )
+}
+
+fn eval_stat_func(name: &str, args: &[wf_lang::ast::Expr], ctx: &Event) -> Option<Value> {
+    if args.len() != 1 {
+        return None;
+    }
+    let selector = parse_stat_selector(&args[0])?;
+    match (name, selector) {
+        ("count", StatSelector::WindowEvent(alias)) => ctx
+            .fields
+            .get(&format!("_bind_{alias}_count"))
+            .and_then(number_value),
+        ("count", StatSelector::MatchEvent(label) | StatSelector::MatchDistinct(label)) => {
+            ctx.fields.get(label).and_then(number_value)
+        }
+        ("value", StatSelector::Trigger(label) | StatSelector::Final(label)) => {
+            ctx.fields.get(label).and_then(number_value)
+        }
+        _ => None,
+    }
+}
+
+fn parse_stat_selector(expr: &wf_lang::ast::Expr) -> Option<StatSelector<'_>> {
+    let wf_lang::ast::Expr::FuncCall {
+        qualifier: None,
+        name,
+        args,
+    } = expr
+    else {
+        return None;
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    let wf_lang::ast::Expr::Field(wf_lang::ast::FieldRef::Simple(symbol)) = &args[0] else {
+        return None;
+    };
+    match name.as_str() {
+        "window_event" => Some(StatSelector::WindowEvent(symbol)),
+        "match_event" => Some(StatSelector::MatchEvent(symbol)),
+        "match_distinct" => Some(StatSelector::MatchDistinct(symbol)),
+        "trigger" => Some(StatSelector::Trigger(symbol)),
+        "final" => Some(StatSelector::Final(symbol)),
+        _ => None,
+    }
+}
+
+fn number_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Number(n) => Some(Value::Number(*n)),
         _ => None,
     }
 }

@@ -159,6 +159,7 @@ runtime: runtime/wfusion.toml
 | 集合函数（`collect_set`/`collect_list`/`first`/`last`） | | | ✓ |
 | `match<key:session(gap)>` 会话窗口 | | | ✓ |
 | 统计函数（`stddev`/`percentile`） | | | ✓ |
+| 稳定统计上下文（`stat.count(...)`/`stat.value(...)`） | | | ✓ |
 | 增强 `baseline(expr, dur, method)` | | | ✓ |
 | baseline 持久化 | | | 规划 |
 
@@ -199,6 +200,18 @@ runtime: runtime/wfusion.toml
 **统计函数**：
 - `stddev(alias.field)` → float：标准差（异常偏离检测）。
 - `percentile(alias.field, p)` → float：分位数（P50/P95/P99 分析），`p` 为 0~100 的 digit。
+
+**稳定统计上下文**：
+- `stat.count(window_event(alias))` → digit：当前 rule instance/window 内，source alias `alias` 进入窗口的候选事件总数。
+- `stat.count(match_event(label))` → digit：`on event` step label `label` 接受为证据的命中事件数；要求该 branch 使用 `count` measure。
+- `stat.count(match_distinct(label))` → digit：`on event` step label `label` 的精确 distinct 数量；要求该 branch 使用 `distinct | count`。
+- `stat.value(trigger(label))` → float：`on event` step label `label` 第一次满足阈值时的 measure value。
+- `stat.value(final(label))` → float：`and close` step label `label` 在本次输出时的最终 measure value。
+- `window_event(...)`、`match_event(...)`、`match_distinct(...)`、`trigger(...)`、`final(...)` 是统计 selector，只能作为 `stat.count(...)` / `stat.value(...)` 的参数使用。
+- selector 参数是静态符号，不加引号；`alias` 必须引用当前规则 source alias，`label` 必须引用当前规则已命名的 match/close step label，缺失时编译失败。
+- `match_event(label)` / `match_distinct(label)` / `trigger(label)` 只能引用 `on event` label；`final(label)` 只能引用 `and close` label。
+- `stat.count(...)` / `stat.value(...)` 只允许在 `yield` 表达式里使用。
+- 第一版只读取规则运行时已经维护的 window/event、branch、distinct、measure 快照，不支持任意字段统计，避免无界内存成本。
 
 **增强基线**：
 - `baseline(expr, dur, method)` 扩展 `method` 参数：`mean`（默认）/ `ewma`（指数加权） / `median`。

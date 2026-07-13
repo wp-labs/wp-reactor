@@ -35,7 +35,11 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
             let t = infer_type(inner, scope)?;
             if is_numeric(&t) { Some(t) } else { None }
         }
-        Expr::FuncCall { name, args, .. } => infer_func_call(name, args, scope),
+        Expr::FuncCall {
+            qualifier,
+            name,
+            args,
+        } => infer_func_call(qualifier.as_deref(), name, args, scope),
         Expr::InList { .. } => Some(ValType::Bool),
         Expr::IfThenElse { then_expr, .. } => infer_type(then_expr, scope),
     }
@@ -80,7 +84,19 @@ fn infer_binop(op: BinOp, left: &Expr, right: &Expr, scope: &Scope<'_>) -> Optio
     }
 }
 
-fn infer_func_call(name: &str, args: &[Expr], scope: &Scope<'_>) -> Option<ValType> {
+fn infer_func_call(
+    qualifier: Option<&str>,
+    name: &str,
+    args: &[Expr],
+    scope: &Scope<'_>,
+) -> Option<ValType> {
+    if qualifier == Some("stat") {
+        return match name {
+            "count" => Some(ValType::Base(BaseType::Digit)),
+            "value" => Some(ValType::Base(BaseType::Float)),
+            _ => None,
+        };
+    }
     match name {
         "count" => Some(ValType::Base(BaseType::Digit)),
         "sum" | "min" | "max" => {

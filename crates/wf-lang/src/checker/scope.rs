@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::ast::FieldRef;
+use crate::ast::{FieldRef, Measure};
 use crate::schema::{BaseType, FieldType, WindowSchema};
 
 use super::types::ValType;
@@ -11,6 +11,21 @@ pub struct Scope<'a> {
     pub aliases: HashMap<&'a str, &'a WindowSchema>,
     /// Join target window names (registered in aliases but not event sources).
     pub join_windows: Vec<&'a str>,
+    /// Match/close step label metadata for stat selector validation.
+    pub stat_labels: HashMap<String, StatLabelInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatLabelInfo {
+    pub stage: StatLabelStage,
+    pub uses_distinct: bool,
+    pub measure: Measure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatLabelStage {
+    Event,
+    Close,
 }
 
 impl<'a> Scope<'a> {
@@ -18,6 +33,7 @@ impl<'a> Scope<'a> {
         Scope {
             aliases: HashMap::new(),
             join_windows: Vec::new(),
+            stat_labels: HashMap::new(),
         }
     }
 

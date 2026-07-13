@@ -13,7 +13,8 @@ All notable changes to wp-reactor will be documented in this file.
 ### Added
 
 - **wf-lang / wf-engine**: Added yield-only time system variables `@event_first_time`, `@event_last_time`, `@evidence_start_time`, `@evidence_end_time`, `@window_start_time`, `@window_end_time`, and `@emit_time`.
-- **User guide / design**: Documented the time system variables and recommended business-field mappings such as `first_seen`, `last_seen`, `rule_window_start`, and `latest_analysis_time`.
+- **wf-lang / wf-engine**: Added yield-only stable stat context functions: `stat.count(window_event(alias))`, `stat.count(match_event(label))`, `stat.count(match_distinct(label))`, `stat.value(trigger(label))`, and `stat.value(final(label))`.
+- **User guide / design**: Documented the time system variables, stable stat context functions, and recommended business-field mappings such as `first_seen`, `last_seen`, `rule_window_start`, and `latest_analysis_time`.
 
 ### Fixed
 
