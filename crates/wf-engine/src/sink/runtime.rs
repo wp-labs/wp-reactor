@@ -1,10 +1,43 @@
 use orion_error::conversion::{SourceErr, ToStructError};
 use tokio::sync::Mutex;
+use wildmatch::WildMatch;
 use wp_connector_api::{SinkHandle, SinkSpec as ResolvedSinkSpec};
 use wp_model_core::model::{DataRecord, DataType};
 
 use crate::alert::WFU_PREFIX;
 use crate::error::{CoreReason, CoreResult};
+
+#[derive(Clone)]
+pub struct WfMetaDisableMatcher {
+    patterns: Vec<WildMatch>,
+}
+
+impl WfMetaDisableMatcher {
+    pub fn new(patterns: &[String]) -> Self {
+        Self {
+            patterns: patterns
+                .iter()
+                .map(|pattern| WildMatch::new(pattern))
+                .collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    pub fn matches(&self, name: &str) -> bool {
+        name.starts_with(WFU_PREFIX) && self.patterns.iter().any(|pattern| pattern.matches(name))
+    }
+}
+
+impl std::fmt::Debug for WfMetaDisableMatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WfMetaDisableMatcher")
+            .field("patterns", &self.patterns.len())
+            .finish()
+    }
+}
 
 /// Runtime state for a single sink instance.
 ///
@@ -19,6 +52,7 @@ pub struct SinkRuntime {
     pub tags: Vec<String>,
     pub output_fields: Option<Vec<String>>,
     pub wf_meta_disable: Vec<String>,
+    pub wf_meta_disable_matcher: WfMetaDisableMatcher,
 }
 
 impl SinkRuntime {
@@ -41,10 +75,10 @@ impl SinkRuntime {
         } else {
             data
         };
-        let data = if self.wf_meta_disable.is_empty() {
+        let data = if self.wf_meta_disable_matcher.is_empty() {
             data
         } else {
-            filtered = mark_wf_meta_fields_ignored(data, &self.wf_meta_disable);
+            filtered = mark_wf_meta_fields_ignored(data, &self.wf_meta_disable_matcher);
             &filtered
         };
         let mut handle = self.handle.lock().await;
@@ -91,11 +125,11 @@ fn project_record(data: &DataRecord, fields: &[String]) -> CoreResult<DataRecord
     Ok(record)
 }
 
-fn mark_wf_meta_fields_ignored(data: &DataRecord, disabled_fields: &[String]) -> DataRecord {
+fn mark_wf_meta_fields_ignored(data: &DataRecord, matcher: &WfMetaDisableMatcher) -> DataRecord {
     let mut record = data.clone();
     for field in record.items.iter_mut() {
         let name = field.get_name();
-        if name.starts_with(WFU_PREFIX) && disabled_fields.iter().any(|disabled| disabled == name) {
+        if matcher.matches(name) {
             field.as_field_mut().meta = DataType::Ignore;
         }
     }
@@ -105,7 +139,120 @@ fn mark_wf_meta_fields_ignored(data: &DataRecord, disabled_fields: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::task::{Context, Poll, Wake, Waker};
+    use wp_connector_api::{AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, SinkResult};
     use wp_model_core::model::{DataType, Field, FieldStorage, Value};
+
+    struct NoopWaker;
+
+    impl Wake for NoopWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CaptureSink {
+        record: Arc<StdMutex<Option<DataRecord>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncCtrl for CaptureSink {
+        async fn stop(&mut self) -> SinkResult<()> {
+            Ok(())
+        }
+
+        async fn reconnect(&mut self) -> SinkResult<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncRawDataSink for CaptureSink {
+        async fn sink_str(&mut self, _data: &str) -> SinkResult<()> {
+            Ok(())
+        }
+
+        async fn sink_bytes(&mut self, _data: &[u8]) -> SinkResult<()> {
+            Ok(())
+        }
+
+        async fn sink_str_batch(&mut self, _data: Vec<&str>) -> SinkResult<()> {
+            Ok(())
+        }
+
+        async fn sink_bytes_batch(&mut self, _data: Vec<&[u8]>) -> SinkResult<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncRecordSink for CaptureSink {
+        async fn sink_record(&mut self, data: &DataRecord) -> SinkResult<()> {
+            *self.record.lock().unwrap() = Some(data.clone());
+            Ok(())
+        }
+
+        async fn sink_records(&mut self, data: Vec<Arc<DataRecord>>) -> SinkResult<()> {
+            *self.record.lock().unwrap() = data.first().map(|record| record.as_ref().clone());
+            Ok(())
+        }
+    }
+
+    fn capture_runtime(
+        captured: Arc<StdMutex<Option<DataRecord>>>,
+        output_fields: Option<Vec<String>>,
+        wf_meta_disable: Vec<String>,
+    ) -> SinkRuntime {
+        SinkRuntime {
+            name: "capture".to_string(),
+            spec: ResolvedSinkSpec {
+                group: "test".to_string(),
+                name: "capture".to_string(),
+                kind: "capture".to_string(),
+                connector_id: "capture".to_string(),
+                params: Default::default(),
+                filter: None,
+            },
+            handle: Mutex::new(SinkHandle::new(Box::new(CaptureSink { record: captured }))),
+            tags: Vec::new(),
+            output_fields,
+            wf_meta_disable: wf_meta_disable.clone(),
+            wf_meta_disable_matcher: WfMetaDisableMatcher::new(&wf_meta_disable),
+        }
+    }
+
+    fn sample_wf_meta_record() -> DataRecord {
+        let mut record = DataRecord::default();
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
+            "__wfu_rule_name",
+            Value::from("r1"),
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
+            "__wfu_score",
+            Value::from("80"),
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
+            "message",
+            Value::from("hello"),
+        )));
+        record
+    }
 
     #[test]
     fn project_record_filters_and_reorders_fields() {
@@ -165,7 +312,8 @@ mod tests {
             Value::from("80"),
         )));
 
-        let marked = mark_wf_meta_fields_ignored(&record, &["__wfu_rule_name".to_string()]);
+        let matcher = WfMetaDisableMatcher::new(&["__wfu_rule_name".to_string()]);
+        let marked = mark_wf_meta_fields_ignored(&record, &matcher);
 
         assert_eq!(marked.items.len(), 3);
         assert_eq!(marked.items[0].get_name(), "__wfu_rule_name");
@@ -195,12 +343,69 @@ mod tests {
             &["__wfu_rule_name".to_string(), "message".to_string()],
         )
         .unwrap();
-        let marked = mark_wf_meta_fields_ignored(&projected, &["__wfu_rule_name".to_string()]);
+        let matcher = WfMetaDisableMatcher::new(&["__wfu_rule_name".to_string()]);
+        let marked = mark_wf_meta_fields_ignored(&projected, &matcher);
 
         assert_eq!(marked.items.len(), 2);
         assert_eq!(marked.items[0].get_name(), "__wfu_rule_name");
         assert_eq!(marked.items[0].get_meta(), &DataType::Ignore);
         assert_eq!(marked.items[1].get_name(), "message");
+    }
+
+    #[test]
+    fn mark_wf_meta_fields_ignored_supports_all_wfu_wildcard() {
+        let mut record = DataRecord::default();
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
+            "__wfu_rule_name",
+            Value::from("r1"),
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
+            "__wfu_score",
+            Value::from("80"),
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
+            "message",
+            Value::from("hello"),
+        )));
+
+        let matcher = WfMetaDisableMatcher::new(&["__wfu_*".to_string()]);
+        let marked = mark_wf_meta_fields_ignored(&record, &matcher);
+
+        assert_eq!(marked.items.len(), 3);
+        assert_eq!(marked.items[0].get_meta(), &DataType::Ignore);
+        assert_eq!(marked.items[1].get_meta(), &DataType::Ignore);
+        assert_eq!(marked.items[2].get_meta(), &DataType::Chars);
+    }
+
+    #[test]
+    fn mark_wf_meta_fields_ignored_supports_partial_wfu_wildcard() {
+        let mut record = DataRecord::default();
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
+            "__wfu_rule_name",
+            Value::from("r1"),
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
+            "__wfu_score",
+            Value::from("80"),
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
+            "message",
+            Value::from("hello"),
+        )));
+
+        let matcher = WfMetaDisableMatcher::new(&["__wfu_rule_*".to_string()]);
+        let marked = mark_wf_meta_fields_ignored(&record, &matcher);
+
+        assert_eq!(marked.items.len(), 3);
+        assert_eq!(marked.items[0].get_meta(), &DataType::Ignore);
+        assert_eq!(marked.items[1].get_meta(), &DataType::Chars);
+        assert_eq!(marked.items[2].get_meta(), &DataType::Chars);
     }
 
     #[test]
@@ -212,10 +417,51 @@ mod tests {
             Value::from("hello"),
         )));
 
-        let marked = mark_wf_meta_fields_ignored(&record, &["message".to_string()]);
+        let matcher = WfMetaDisableMatcher::new(&["message".to_string()]);
+        let marked = mark_wf_meta_fields_ignored(&record, &matcher);
 
         assert_eq!(marked.items.len(), 1);
         assert_eq!(marked.items[0].get_name(), "message");
         assert_eq!(marked.items[0].get_meta(), &DataType::Chars);
+    }
+
+    #[test]
+    fn send_record_applies_wf_meta_disable_wildmatch_before_sending() {
+        let captured = Arc::new(StdMutex::new(None));
+        let runtime = capture_runtime(Arc::clone(&captured), None, vec!["__wfu_*".to_string()]);
+
+        block_on(runtime.send_record(&sample_wf_meta_record())).unwrap();
+
+        let sent = captured.lock().unwrap().clone().expect("record captured");
+        assert_eq!(
+            sent.field("__wfu_rule_name").unwrap().get_meta(),
+            &DataType::Ignore
+        );
+        assert_eq!(
+            sent.field("__wfu_score").unwrap().get_meta(),
+            &DataType::Ignore
+        );
+        assert_eq!(sent.field("message").unwrap().get_meta(), &DataType::Chars);
+    }
+
+    #[test]
+    fn send_record_applies_wf_meta_disable_after_output_projection() {
+        let captured = Arc::new(StdMutex::new(None));
+        let runtime = capture_runtime(
+            Arc::clone(&captured),
+            Some(vec!["__wfu_rule_name".to_string(), "message".to_string()]),
+            vec!["__wfu_rule_*".to_string()],
+        );
+
+        block_on(runtime.send_record(&sample_wf_meta_record())).unwrap();
+
+        let sent = captured.lock().unwrap().clone().expect("record captured");
+        assert_eq!(sent.items.len(), 2);
+        assert!(sent.field("__wfu_score").is_none());
+        assert_eq!(
+            sent.field("__wfu_rule_name").unwrap().get_meta(),
+            &DataType::Ignore
+        );
+        assert_eq!(sent.field("message").unwrap().get_meta(), &DataType::Chars);
     }
 }

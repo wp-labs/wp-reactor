@@ -6,8 +6,8 @@ use orion_error::conversion::{SourceErr, ToStructError};
 use wp_connector_api::{SinkBuildCtx, SinkFactory};
 
 use crate::error::{RuntimeReason, RuntimeResult};
-use wf_config::sink::{ResolvedRouteSink, SinkConfigBundle, WildArray};
-use wf_engine::sink::{SinkDispatcher, SinkRuntime};
+use wf_config::sink::{ResolvedRouteSink, SinkConfigBundle};
+use wf_engine::sink::{SinkDispatcher, SinkRuntime, WfMetaDisableMatcher};
 
 // ---------------------------------------------------------------------------
 // SinkFactoryRegistry — maps sink kind → factory
@@ -68,10 +68,8 @@ impl SinkFactoryRegistry {
 /// For each `ResolvedSinkSpec` in the bundle, looks up the factory by kind,
 /// validates, builds a `SinkHandle`, and wraps it in a `SinkRuntime`.
 ///
-/// The `window_names` parameter lists all known window names from the config.
-/// Routes are pre-resolved at build time: each window name is matched against
-/// business group wildcard patterns, and the resulting window→sinks mapping
-/// is stored in a `HashMap` for O(1) dispatch lookup.
+/// Business group wildcard patterns are compiled into the dispatcher so routing
+/// can match yield targets that are not part of the startup window list.
 pub async fn build_sink_dispatcher(
     bundle: &SinkConfigBundle,
     registry: &SinkFactoryRegistry,
@@ -80,8 +78,9 @@ pub async fn build_sink_dispatcher(
 ) -> RuntimeResult<SinkDispatcher> {
     let ctx = SinkBuildCtx::new(work_root.to_path_buf());
 
-    // Build business groups (name, compiled windows, sinks)
-    let mut business: Vec<(String, WildArray, Vec<Arc<SinkRuntime>>)> = Vec::new();
+    // Build business routes (raw window patterns, sinks). The dispatcher owns
+    // the compiled wildmatch matchers.
+    let mut routes: Vec<(Vec<String>, Vec<Arc<SinkRuntime>>)> = Vec::new();
     for flex in &bundle.business {
         let sinks = build_sink_runtimes(
             &flex.sinks,
@@ -91,8 +90,7 @@ pub async fn build_sink_dispatcher(
             &ctx,
         )
         .await?;
-        let windows = WildArray::new(flex.windows.raw_patterns());
-        business.push((flex.name.clone(), windows, sinks));
+        routes.push((flex.windows.raw_patterns().to_vec(), sinks));
     }
 
     // Build infra default sinks
@@ -109,18 +107,6 @@ pub async fn build_sink_dispatcher(
         Vec::new()
     };
 
-    // Pre-resolve routes: window_name → matched sinks
-    let mut routes: HashMap<String, Vec<Arc<SinkRuntime>>> = HashMap::new();
-    for name in window_names {
-        let mut bound = Vec::new();
-        for (_group_name, windows, sinks) in &business {
-            if windows.matches(name) {
-                bound.extend(sinks.iter().cloned());
-            }
-        }
-        routes.insert(name.clone(), bound);
-    }
-
     let monitor_sinks = if let Some(ref fixed) = bundle.infra_monitor {
         build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, registry, &ctx).await?
     } else {
@@ -132,7 +118,11 @@ pub async fn build_sink_dispatcher(
     // so misconfiguration (e.g. wrong sinks/ layout) is caught immediately
     // instead of vanishing matches into the void. error_sinks / monitor_sinks
     // don't count — they only receive on other-sink failure / metrics.
-    let total_routes: usize = routes.values().map(|v| v.len()).sum();
+    let total_routes: usize = routes
+        .iter()
+        .filter(|(patterns, _)| !patterns.is_empty())
+        .map(|(_, sinks)| sinks.len())
+        .sum();
     if total_routes == 0 && default_sinks.is_empty() {
         return RuntimeReason::Bootstrap
             .to_err()
@@ -204,6 +194,7 @@ async fn build_sink_runtimes(
             tags: tags.to_vec(),
             output_fields: resolved.fields.clone(),
             wf_meta_disable: wf_meta_disable.to_vec(),
+            wf_meta_disable_matcher: WfMetaDisableMatcher::new(wf_meta_disable),
         }));
     }
 

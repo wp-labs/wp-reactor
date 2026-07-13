@@ -45,7 +45,9 @@ pub struct RouteGroup {
     /// Tags to attach to all alerts in this group.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
-    /// WarpFusion-managed `__wfu_*` metadata fields to disable in this group's output.
+    /// WarpFusion-managed metadata fields to disable in this group's output.
+    ///
+    /// Supports exact `__wfu_...` field names and `__wfu_`-prefixed wildmatch patterns.
     #[serde(default)]
     pub wf_meta_disable: Vec<String>,
     /// Group-level expect specification.

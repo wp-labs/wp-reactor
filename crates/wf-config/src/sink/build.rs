@@ -398,4 +398,56 @@ mod tests {
         let err = build_flex_group(&route, &connectors, &defaults).unwrap_err();
         assert!(err.to_string().contains("must start"));
     }
+
+    #[test]
+    fn build_flex_group_accepts_all_wfu_meta_disable_wildcard() {
+        let mut connectors = BTreeMap::new();
+        connectors.insert("file_json".into(), sample_connector());
+
+        let route = RouteGroup {
+            name: "test".into(),
+            parallel: None,
+            windows: None,
+            tags: None,
+            wf_meta_disable: vec!["__wfu_*".into()],
+            expect: None,
+            sinks: vec![RouteSink {
+                connect: "file_json".into(),
+                name: None,
+                fields: None,
+                params: ParamMap::new(),
+                tags: None,
+                expect: None,
+            }],
+        };
+        let defaults = DefaultsBody::default();
+        let group = build_flex_group(&route, &connectors, &defaults).unwrap();
+        assert_eq!(group.wf_meta_disable, vec!["__wfu_*".to_string()]);
+    }
+
+    #[test]
+    fn build_flex_group_accepts_partial_wf_meta_disable_wildcard() {
+        let mut connectors = BTreeMap::new();
+        connectors.insert("file_json".into(), sample_connector());
+
+        let route = RouteGroup {
+            name: "test".into(),
+            parallel: None,
+            windows: None,
+            tags: None,
+            wf_meta_disable: vec!["__wfu_rule_*".into()],
+            expect: None,
+            sinks: vec![RouteSink {
+                connect: "file_json".into(),
+                name: None,
+                fields: None,
+                params: ParamMap::new(),
+                tags: None,
+                expect: None,
+            }],
+        };
+        let defaults = DefaultsBody::default();
+        let group = build_flex_group(&route, &connectors, &defaults).unwrap();
+        assert_eq!(group.wf_meta_disable, vec!["__wfu_rule_*".to_string()]);
+    }
 }

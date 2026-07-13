@@ -28,7 +28,9 @@ pub struct FlexGroup {
     pub windows: WildArray,
     /// Merged tags (defaults + group + sink level).
     pub tags: Vec<String>,
-    /// WarpFusion-managed `__wfu_*` metadata fields to disable in this group's output.
+    /// WarpFusion-managed metadata fields to disable in this group's output.
+    ///
+    /// Supports exact `__wfu_...` field names and `__wfu_`-prefixed wildmatch patterns.
     pub wf_meta_disable: Vec<String>,
     /// Group-level expect specification.
     pub expect: Option<GroupExpectSpec>,
@@ -48,7 +50,9 @@ pub struct FixedGroup {
     pub name: String,
     /// Group-level expect specification.
     pub expect: Option<GroupExpectSpec>,
-    /// WarpFusion-managed `__wfu_*` metadata fields to disable in this group's output.
+    /// WarpFusion-managed metadata fields to disable in this group's output.
+    ///
+    /// Supports exact `__wfu_...` field names and `__wfu_`-prefixed wildmatch patterns.
     pub wf_meta_disable: Vec<String>,
     /// Resolved sink specifications.
     pub sinks: Vec<ResolvedRouteSink>,

@@ -14,7 +14,7 @@ toml = { workspace = true }
 orion-error = { workspace = true }
 glob = { workspace = true }
 wp-connector-api = { workspace = true }
-wildmatch = "2"
+wildmatch = { workspace = true }
 moju-derive = { workspace = true }
 
 [dev-dependencies]
