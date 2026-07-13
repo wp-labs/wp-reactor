@@ -26,7 +26,11 @@ use crate::wfl_parser::parse_wfl;
 // ---------------------------------------------------------------------------
 
 /// Create a minimal WindowSchema with given name, streams, and fields.
-fn make_window(name: &str, streams: Vec<&str>, fields: Vec<(&str, FieldType)>) -> WindowSchema {
+pub(super) fn make_window(
+    name: &str,
+    streams: Vec<&str>,
+    fields: Vec<(&str, FieldType)>,
+) -> WindowSchema {
     WindowSchema {
         name: name.to_string(),
         streams: streams.into_iter().map(String::from).collect(),
@@ -43,7 +47,7 @@ fn make_window(name: &str, streams: Vec<&str>, fields: Vec<(&str, FieldType)>) -
 }
 
 /// Create an output-only window (no streams).
-fn make_output_window(name: &str, fields: Vec<(&str, FieldType)>) -> WindowSchema {
+pub(super) fn make_output_window(name: &str, fields: Vec<(&str, FieldType)>) -> WindowSchema {
     WindowSchema {
         name: name.to_string(),
         streams: vec![],
@@ -59,12 +63,12 @@ fn make_output_window(name: &str, fields: Vec<(&str, FieldType)>) -> WindowSchem
     }
 }
 
-fn bt(b: BaseType) -> FieldType {
+pub(super) fn bt(b: BaseType) -> FieldType {
     FieldType::Base(b)
 }
 
 /// Standard auth_events window for tests.
-fn auth_events_window() -> WindowSchema {
+pub(super) fn auth_events_window() -> WindowSchema {
     make_window(
         "auth_events",
         vec!["auth_stream"],
@@ -80,7 +84,7 @@ fn auth_events_window() -> WindowSchema {
 }
 
 /// Standard fw_events window for tests.
-fn fw_events_window() -> WindowSchema {
+pub(super) fn fw_events_window() -> WindowSchema {
     make_window(
         "fw_events",
         vec!["fw_stream"],
@@ -94,7 +98,7 @@ fn fw_events_window() -> WindowSchema {
 }
 
 /// Standard output window for tests.
-fn output_window() -> WindowSchema {
+pub(super) fn output_window() -> WindowSchema {
     make_output_window(
         "out",
         vec![
@@ -106,7 +110,7 @@ fn output_window() -> WindowSchema {
 }
 
 /// Standard security_alerts output window.
-fn security_alerts_window() -> WindowSchema {
+pub(super) fn security_alerts_window() -> WindowSchema {
     make_output_window(
         "security_alerts",
         vec![
@@ -119,7 +123,7 @@ fn security_alerts_window() -> WindowSchema {
 }
 
 /// Helper: check and return only the error messages (not warnings) for readability.
-fn check_errors(input: &str, schemas: &[WindowSchema]) -> Vec<String> {
+pub(super) fn check_errors(input: &str, schemas: &[WindowSchema]) -> Vec<String> {
     let file = parse_wfl(input).expect("parse should succeed");
     let errs = check_wfl(&file, schemas);
     errs.into_iter()
@@ -129,13 +133,13 @@ fn check_errors(input: &str, schemas: &[WindowSchema]) -> Vec<String> {
 }
 
 /// Helper: assert that checking produces no errors.
-fn assert_no_errors(input: &str, schemas: &[WindowSchema]) {
+pub(super) fn assert_no_errors(input: &str, schemas: &[WindowSchema]) {
     let errs = check_errors(input, schemas);
     assert!(errs.is_empty(), "expected no errors, got: {:?}", errs);
 }
 
 /// Helper: assert that at least one error message contains the given substring.
-fn assert_has_error(input: &str, schemas: &[WindowSchema], substring: &str) {
+pub(super) fn assert_has_error(input: &str, schemas: &[WindowSchema], substring: &str) {
     let errs = check_errors(input, schemas);
     assert!(
         errs.iter().any(|e| e.contains(substring)),
