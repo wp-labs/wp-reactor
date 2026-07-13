@@ -176,5 +176,5 @@ rule tracked_close {
 }
 
 // Bring in CloseReason for the L3 test
-use crate::match_engine::match_engine::CloseReason;
 use crate::match_engine::Value;
+use crate::match_engine::match_engine::CloseReason;

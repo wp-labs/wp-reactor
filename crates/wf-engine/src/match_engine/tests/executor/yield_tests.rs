@@ -3,12 +3,10 @@ use wf_lang::plan::{EachPlan, StepPlan, YieldField};
 
 use crate::match_engine::RuleExecutor;
 use crate::match_engine::Value;
-use crate::match_engine::match_engine::{
-    BindData, CloseOutput, CloseReason, StepData,
-};
+use crate::match_engine::match_engine::{BindData, CloseOutput, CloseReason, StepData};
 
-use super::helpers::{default_match_plan, default_matched_context};
 use super::super::helpers::*;
+use super::helpers::{default_match_plan, default_matched_context};
 
 // =========================================================================
 // Each yield tests

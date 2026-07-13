@@ -3,8 +3,8 @@ use wf_lang::plan::EachPlan;
 
 use crate::match_engine::RuleExecutor;
 
-use super::helpers::{default_match_plan, default_matched_context};
 use super::super::helpers::*;
+use super::helpers::{default_match_plan, default_matched_context};
 
 // =========================================================================
 // Test 1: execute_match – static score
