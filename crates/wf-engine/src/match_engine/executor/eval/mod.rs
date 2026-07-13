@@ -1,0 +1,482 @@
+use std::cell::Cell;
+
+use crate::error::{CoreReason, CoreResult};
+use crate::match_engine::match_engine::{
+    Event, Value, WindowLookup, eval_expr, eval_expr_ext, field_ref_name, value_to_string,
+    values_equal,
+};
+
+mod builtins;
+mod step_data;
+#[cfg(test)]
+mod tests;
+mod utils;
+
+use self::builtins::{
+    contains_system_var, eval_aggregate_func, eval_builtin_func_with_l3, eval_l3_func,
+    eval_stat_func, is_stat_selector_func, materialize_system_vars,
+};
+use self::utils::time_nanos_to_value;
+
+/// Evaluate a yield/derive expression with L3 function support.
+///
+/// L3 functions (collect_set, collect_list, first, last, stddev, percentile)
+/// need access to the collected values from step execution. These values are
+/// stored in `_step_{i}_values` and `_step_{i}_source` fields in the eval context.
+pub(super) fn eval_yield_expr(expr: &wf_lang::ast::Expr, ctx: &Event) -> Option<Value> {
+    eval_yield_expr_with_score(expr, ctx, None)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct YieldMeta {
+    pub(super) score: Option<f64>,
+    pub(super) event_first_time_nanos: Option<i64>,
+    pub(super) event_last_time_nanos: Option<i64>,
+    pub(super) window_start_time_nanos: Option<i64>,
+    pub(super) window_end_time_nanos: Option<i64>,
+    pub(super) emit_time_nanos: Option<i64>,
+}
+
+thread_local! {
+    static EVAL_TIME_NANOS: Cell<Option<i64>> = const { Cell::new(None) };
+    static EVAL_TIME_SCOPE_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(super) fn get_or_init_eval_time_nanos() -> Option<i64> {
+    EVAL_TIME_NANOS.with(|time| {
+        if let Some(nanos) = time.get() {
+            return Some(nanos);
+        }
+        let nanos = chrono::Utc::now().timestamp_nanos_opt()?;
+        time.set(Some(nanos));
+        Some(nanos)
+    })
+}
+
+struct EvalTimeScope;
+
+impl EvalTimeScope {
+    fn enter() -> Self {
+        EVAL_TIME_SCOPE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for EvalTimeScope {
+    fn drop(&mut self) {
+        EVAL_TIME_SCOPE_DEPTH.with(|depth| {
+            let next_depth = depth.get().saturating_sub(1);
+            depth.set(next_depth);
+            if next_depth == 0 {
+                EVAL_TIME_NANOS.with(|time| time.set(None));
+            }
+        });
+    }
+}
+
+pub(super) fn with_yield_eval_scope<T>(f: impl FnOnce() -> T) -> T {
+    let _scope = EvalTimeScope::enter();
+    f()
+}
+
+pub(super) fn eval_yield_expr_with_score(
+    expr: &wf_lang::ast::Expr,
+    ctx: &Event,
+    score: Option<f64>,
+) -> Option<Value> {
+    eval_yield_expr_with_meta(
+        expr,
+        ctx,
+        YieldMeta {
+            score,
+            ..YieldMeta::default()
+        },
+    )
+}
+
+pub(super) fn eval_yield_expr_with_meta(
+    expr: &wf_lang::ast::Expr,
+    ctx: &Event,
+    meta: YieldMeta,
+) -> Option<Value> {
+    // For yield expressions, fall back to empty string when a field is missing
+    // (e.g., join window fields not available in test runner)
+    with_yield_eval_scope(|| match eval_expr_with_l3(expr, ctx, meta) {
+        None => Some(Value::Str(String::new())),
+        val => val,
+    })
+}
+
+pub(super) fn eval_bool_expr(expr: &wf_lang::ast::Expr, ctx: &Event) -> Option<bool> {
+    match eval_expr_with_l3(expr, ctx, YieldMeta::default()) {
+        Some(Value::Bool(result)) => Some(result),
+        _ => None,
+    }
+}
+
+pub(super) fn eval_bool_expr_with_lookup(
+    expr: &wf_lang::ast::Expr,
+    ctx: &Event,
+    windows: Option<&dyn WindowLookup>,
+) -> Option<bool> {
+    let mut baselines = std::collections::HashMap::new();
+    match eval_expr_ext(expr, ctx, windows, &mut baselines) {
+        Some(Value::Bool(result)) => Some(result),
+        _ => None,
+    }
+}
+
+pub(super) fn eval_expr_with_l3(
+    expr: &wf_lang::ast::Expr,
+    ctx: &Event,
+    meta: YieldMeta,
+) -> Option<Value> {
+    use wf_lang::ast::{BinOp, Expr, SystemVar};
+
+    let _time_scope = EvalTimeScope::enter();
+    let score = meta;
+    match expr {
+        Expr::Number(n) => Some(Value::Number(*n)),
+        Expr::StringLit(s) => Some(Value::Str(s.clone())),
+        Expr::Bool(b) => Some(Value::Bool(*b)),
+        Expr::SystemVar(SystemVar::Score) => meta.score.map(Value::Number),
+        Expr::SystemVar(SystemVar::EventFirstTime | SystemVar::EvidenceStartTime) => {
+            meta.event_first_time_nanos.map(time_nanos_to_value)
+        }
+        Expr::SystemVar(SystemVar::EventLastTime | SystemVar::EvidenceEndTime) => {
+            meta.event_last_time_nanos.map(time_nanos_to_value)
+        }
+        Expr::SystemVar(SystemVar::WindowStartTime) => {
+            meta.window_start_time_nanos.map(time_nanos_to_value)
+        }
+        Expr::SystemVar(SystemVar::WindowEndTime) => {
+            meta.window_end_time_nanos.map(time_nanos_to_value)
+        }
+        Expr::SystemVar(SystemVar::EmitTime) => meta.emit_time_nanos.map(time_nanos_to_value),
+        Expr::Field(fr) => ctx.fields.get(field_ref_name(fr)).cloned(),
+        Expr::Object(items) => {
+            let mut map = std::collections::HashMap::new();
+            for item in items {
+                let value = eval_expr_with_l3(&item.value, ctx, score)?;
+                for target in &item.targets {
+                    map.insert(target.clone(), value.clone());
+                }
+            }
+            Some(Value::Object(map))
+        }
+        Expr::Array(items) => items
+            .iter()
+            .map(|item| eval_expr_with_l3(item, ctx, score))
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
+        Expr::Neg(inner) => match eval_expr_with_l3(inner, ctx, score)? {
+            Value::Number(n) => Some(Value::Number(-n)),
+            _ => None,
+        },
+        Expr::BinOp { op, left, right } => match op {
+            BinOp::And => eval_logic_and_with_l3(left, right, ctx, score),
+            BinOp::Or => eval_logic_or_with_l3(left, right, ctx, score),
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                let lv = eval_expr_with_l3(left, ctx, score)?;
+                let rv = eval_expr_with_l3(right, ctx, score)?;
+                Some(Value::Bool(compare_values(*op, &lv, &rv)))
+            }
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                let lv = eval_expr_with_l3(left, ctx, score)?;
+                let rv = eval_expr_with_l3(right, ctx, score)?;
+                let ln = coerce_to_f64(&lv)?;
+                let rn = coerce_to_f64(&rv)?;
+                let out = match op {
+                    BinOp::Add => ln + rn,
+                    BinOp::Sub => ln - rn,
+                    BinOp::Mul => ln * rn,
+                    BinOp::Div => {
+                        if rn == 0.0 {
+                            return None;
+                        }
+                        ln / rn
+                    }
+                    BinOp::Mod => {
+                        if rn == 0.0 {
+                            return None;
+                        }
+                        ln % rn
+                    }
+                    _ => unreachable!(),
+                };
+                Some(Value::Number(out))
+            }
+            _ => None,
+        },
+        Expr::InList {
+            expr: target,
+            list,
+            negated,
+        } => {
+            let target_val = eval_expr_with_l3(target, ctx, score)?;
+            let found = list.iter().any(|item| {
+                eval_expr_with_l3(item, ctx, score)
+                    .map(|v| values_equal(&target_val, &v))
+                    .unwrap_or(false)
+            });
+            Some(Value::Bool(if *negated { !found } else { found }))
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => match eval_expr_with_l3(cond, ctx, score) {
+            Some(Value::Bool(true)) => eval_expr_with_l3(then_expr, ctx, score),
+            Some(Value::Bool(false)) => eval_expr_with_l3(else_expr, ctx, score),
+            _ => None,
+        },
+        Expr::FuncCall {
+            qualifier,
+            name,
+            args,
+        } => {
+            if qualifier.as_deref() == Some("stat") && matches!(name.as_str(), "count" | "value") {
+                return eval_stat_func(name, args, ctx);
+            }
+            if qualifier.is_none() && is_stat_selector_func(name) {
+                return None;
+            }
+            if qualifier.is_some() {
+                if contains_system_var(expr) {
+                    let rewritten = materialize_system_vars(expr, score)?;
+                    return eval_expr(&rewritten, ctx);
+                }
+                return eval_expr(expr, ctx);
+            }
+            if is_aggregate_func(name) {
+                return eval_aggregate_func(name, args, ctx);
+            }
+            if is_l3_func(name) {
+                return eval_l3_func(name, args, ctx, score);
+            }
+            if name == "external"
+                || is_eval_time_func(name)
+                || args.iter().any(contains_l3_func)
+                || args.iter().any(contains_aggregate_func)
+                || args.iter().any(contains_eval_time_func)
+            {
+                // `external()` is implemented only in `eval_builtin_func_with_l3`
+                // (it dispatches to the global ExternalCallHandler / wp_knowledge
+                // facade). Route it here even when its args are plain literals /
+                // fields, otherwise `on each where external(...)` filters silently
+                // evaluate to None and never query the backend.
+                return eval_builtin_func_with_l3(name, args, ctx, score);
+            }
+            if args.iter().any(contains_system_var) {
+                let rewritten = materialize_system_vars(expr, score)?;
+                return eval_expr(&rewritten, ctx);
+            }
+            eval_expr(expr, ctx)
+        }
+        _ => None,
+    }
+}
+
+fn eval_logic_and_with_l3(
+    left: &wf_lang::ast::Expr,
+    right: &wf_lang::ast::Expr,
+    ctx: &Event,
+    score: YieldMeta,
+) -> Option<Value> {
+    let lv = eval_expr_with_l3(left, ctx, score);
+    let rv = eval_expr_with_l3(right, ctx, score);
+    match (lv.as_ref(), rv.as_ref()) {
+        (Some(Value::Bool(false)), _) | (_, Some(Value::Bool(false))) => Some(Value::Bool(false)),
+        (Some(Value::Bool(true)), Some(Value::Bool(true))) => Some(Value::Bool(true)),
+        _ => None,
+    }
+}
+
+fn eval_logic_or_with_l3(
+    left: &wf_lang::ast::Expr,
+    right: &wf_lang::ast::Expr,
+    ctx: &Event,
+    score: YieldMeta,
+) -> Option<Value> {
+    let lv = eval_expr_with_l3(left, ctx, score);
+    let rv = eval_expr_with_l3(right, ctx, score);
+    match (lv.as_ref(), rv.as_ref()) {
+        (Some(Value::Bool(true)), _) | (_, Some(Value::Bool(true))) => Some(Value::Bool(true)),
+        (Some(Value::Bool(false)), Some(Value::Bool(false))) => Some(Value::Bool(false)),
+        _ => None,
+    }
+}
+
+fn compare_values(op: wf_lang::ast::BinOp, lv: &Value, rv: &Value) -> bool {
+    use wf_lang::ast::BinOp;
+    match op {
+        BinOp::Eq => values_equal(lv, rv),
+        BinOp::Ne => !values_equal(lv, rv),
+        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => match (lv, rv) {
+            (Value::Number(a), Value::Number(b)) => match op {
+                BinOp::Lt => a < b,
+                BinOp::Gt => a > b,
+                BinOp::Le => a <= b,
+                BinOp::Ge => a >= b,
+                _ => false,
+            },
+            (Value::Str(a), Value::Str(b)) => match op {
+                BinOp::Lt => a < b,
+                BinOp::Gt => a > b,
+                BinOp::Le => a <= b,
+                BinOp::Ge => a >= b,
+                _ => false,
+            },
+            (Value::Bool(a), Value::Bool(b)) => match op {
+                BinOp::Lt => a < b,
+                BinOp::Gt => a > b,
+                BinOp::Le => a <= b,
+                BinOp::Ge => a >= b,
+                _ => false,
+            },
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn coerce_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn is_l3_func(name: &str) -> bool {
+    matches!(
+        name,
+        "collect_set" | "collect_list" | "first" | "last" | "stddev" | "percentile"
+    )
+}
+
+fn is_aggregate_func(name: &str) -> bool {
+    matches!(name, "count" | "sum" | "avg" | "min" | "max")
+}
+
+fn contains_l3_func(expr: &wf_lang::ast::Expr) -> bool {
+    use wf_lang::ast::Expr;
+    match expr {
+        Expr::FuncCall { name, args, .. } => is_l3_func(name) || args.iter().any(contains_l3_func),
+        Expr::BinOp { left, right, .. } => contains_l3_func(left) || contains_l3_func(right),
+        Expr::Neg(inner) => contains_l3_func(inner),
+        Expr::Object(items) => items.iter().any(|item| contains_l3_func(&item.value)),
+        Expr::Array(items) => items.iter().any(contains_l3_func),
+        Expr::InList { expr, list, .. } => {
+            contains_l3_func(expr) || list.iter().any(contains_l3_func)
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => contains_l3_func(cond) || contains_l3_func(then_expr) || contains_l3_func(else_expr),
+        _ => false,
+    }
+}
+
+fn is_eval_time_func(name: &str) -> bool {
+    matches!(name, "now" | "now_s" | "now_ms" | "now_us" | "now_ns")
+}
+
+fn contains_eval_time_func(expr: &wf_lang::ast::Expr) -> bool {
+    use wf_lang::ast::Expr;
+    match expr {
+        Expr::FuncCall { name, args, .. } => {
+            is_eval_time_func(name) || args.iter().any(contains_eval_time_func)
+        }
+        Expr::BinOp { left, right, .. } => {
+            contains_eval_time_func(left) || contains_eval_time_func(right)
+        }
+        Expr::Neg(inner) => contains_eval_time_func(inner),
+        Expr::Object(items) => items
+            .iter()
+            .any(|item| contains_eval_time_func(&item.value)),
+        Expr::Array(items) => items.iter().any(contains_eval_time_func),
+        Expr::InList { expr, list, .. } => {
+            contains_eval_time_func(expr) || list.iter().any(contains_eval_time_func)
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            contains_eval_time_func(cond)
+                || contains_eval_time_func(then_expr)
+                || contains_eval_time_func(else_expr)
+        }
+        _ => false,
+    }
+}
+
+fn contains_aggregate_func(expr: &wf_lang::ast::Expr) -> bool {
+    use wf_lang::ast::Expr;
+    match expr {
+        Expr::FuncCall { name, args, .. } => {
+            is_aggregate_func(name) || args.iter().any(contains_aggregate_func)
+        }
+        Expr::BinOp { left, right, .. } => {
+            contains_aggregate_func(left) || contains_aggregate_func(right)
+        }
+        Expr::Neg(inner) => contains_aggregate_func(inner),
+        Expr::Object(items) => items
+            .iter()
+            .any(|item| contains_aggregate_func(&item.value)),
+        Expr::Array(items) => items.iter().any(contains_aggregate_func),
+        Expr::InList { expr, list, .. } => {
+            contains_aggregate_func(expr) || list.iter().any(contains_aggregate_func)
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            contains_aggregate_func(cond)
+                || contains_aggregate_func(then_expr)
+                || contains_aggregate_func(else_expr)
+        }
+        _ => false,
+    }
+}
+
+/// Evaluate the score expression and clamp to `[0, 100]`.
+///
+pub(super) fn eval_score(expr: &wf_lang::ast::Expr, ctx: &Event) -> CoreResult<f64> {
+    let val = eval_yield_expr(expr, ctx);
+    let raw = match val {
+        Some(Value::Number(n)) => n,
+        Some(other) => {
+            return orion_error::prelude::StructError::from(CoreReason::RuleExec)
+                .with_detail(format!(
+                    "score expression evaluated to non-numeric value: {:?}",
+                    other
+                ))
+                .err();
+        }
+        None => {
+            return orion_error::prelude::StructError::from(CoreReason::RuleExec)
+                .with_detail("score expression evaluated to None")
+                .err();
+        }
+    };
+    Ok(clamp_score(raw))
+}
+
+fn clamp_score(v: f64) -> f64 {
+    v.clamp(0.0, 100.0)
+}
+
+/// Evaluate the entity_id expression.
+///
+pub(super) fn eval_entity_id(expr: &wf_lang::ast::Expr, ctx: &Event) -> CoreResult<String> {
+    let val = eval_yield_expr(expr, ctx);
+    match val {
+        Some(v) => Ok(value_to_string(&v)),
+        None => orion_error::prelude::StructError::from(CoreReason::RuleExec)
+            .with_detail("entity_id expression evaluated to None")
+            .err(),
+    }
+}
