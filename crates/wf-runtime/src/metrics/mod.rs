@@ -4,10 +4,16 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::error::RuntimeResult;
-use tokio_util::sync::CancellationToken;
 use wf_config::MetricsConfig;
-use wf_engine::window::{EvictReport, RouteReport, Router};
+use wf_engine::window::{EvictReport, RouteReport};
+
+mod sampling;
+mod server;
+#[cfg(test)]
+mod tests;
+
+// Re-export pub items that were originally at crate::metrics::* level
+pub use self::server::run_metrics_task;
 
 type AlertDetailCounts = BTreeMap<String, AtomicU64>;
 type AlertDetailByMachine = BTreeMap<String, AlertDetailCounts>;
@@ -460,7 +466,7 @@ fn percentile(h: &HistogramSnapshot, p: f64) -> f64 {
     domain = "Orchestra",
     module = "Orchestra.RuntimeMetrics"
 )]
-struct IntervalRates {
+pub(crate) struct IntervalRates {
     row_s: f64,
     late_s: f64,
     rules_s: f64,
@@ -475,7 +481,7 @@ struct IntervalRates {
     domain = "Orchestra",
     module = "Orchestra.RuntimeMetrics"
 )]
-struct IntervalSnapshot {
+pub(crate) struct IntervalSnapshot {
     at: Instant,
     rx_rows: u64,
     dropped_late: u64,
@@ -491,7 +497,7 @@ struct IntervalSnapshot {
     domain = "Orchestra",
     module = "Orchestra.RuntimeMetrics"
 )]
-struct TotalCounts {
+pub(crate) struct TotalCounts {
     rows: u64,
     late: u64,
     rules: u64,
@@ -505,7 +511,7 @@ struct TotalCounts {
     domain = "Orchestra",
     module = "Orchestra.RuntimeMetrics"
 )]
-struct RunSummary {
+pub(crate) struct RunSummary {
     interval_count: u64,
     sum_row_s: f64,
     sum_late_s: f64,
@@ -678,7 +684,7 @@ impl RuntimeMetrics {
             .sum()
     }
 
-    fn interval_snapshot(&self, at: Instant) -> IntervalSnapshot {
+    pub(crate) fn interval_snapshot(&self, at: Instant) -> IntervalSnapshot {
         IntervalSnapshot {
             at,
             rx_rows: self.receiver_rows_total.load(Ordering::Relaxed),
@@ -690,7 +696,7 @@ impl RuntimeMetrics {
         }
     }
 
-    fn interval_rates(
+    pub(crate) fn interval_rates(
         &self,
         prev: IntervalSnapshot,
         curr: IntervalSnapshot,
@@ -710,7 +716,7 @@ impl RuntimeMetrics {
         })
     }
 
-    fn interval_table(&self, rates: IntervalRates) -> String {
+    pub(crate) fn interval_table(&self, rates: IntervalRates) -> String {
         let mem = format_bytes(rates.memory_bytes);
         format!(
             "\n+-----------+-----------+-----------+-----------+-------------+-----------+\n\
@@ -1143,28 +1149,7 @@ impl RuntimeMetrics {
         }
     }
 
-    /// Periodically sample expensive window gauges to keep scrape path light.
-    pub fn sample_windows(&self, router: &Router) {
-        for window_name in router.registry().window_names() {
-            if let Some(win_lock) = router.registry().get_window(&window_name) {
-                let win = win_lock.read().expect("window lock poisoned");
-                if let Some(v) = self.window_memory_bytes.get(&window_name) {
-                    v.store(win.memory_usage() as u64, Ordering::Relaxed);
-                }
-                if let Some(v) = self.window_capacity_bytes.get(&window_name) {
-                    v.store(win.max_window_bytes() as u64, Ordering::Relaxed);
-                }
-                if let Some(v) = self.window_rows.get(&window_name) {
-                    v.store(win.total_rows() as u64, Ordering::Relaxed);
-                }
-                if let Some(v) = self.window_batches.get(&window_name) {
-                    v.store(win.batch_count() as u64, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-
-    fn summary_line(&self) -> String {
+    pub(crate) fn summary_line(&self) -> String {
         format!(
             "rx_rows={} routed={} dropped_late={} matches={} alerts={} window_bytes={}",
             self.receiver_rows_total.load(Ordering::Relaxed),
@@ -1198,79 +1183,6 @@ fn format_bytes(bytes: u64) -> String {
 pub type MonSend = tokio::sync::mpsc::Sender<Vec<MetricsRecord>>;
 pub type MonRecv = tokio::sync::mpsc::Receiver<Vec<MetricsRecord>>;
 
-pub async fn run_metrics_task(
-    metrics: Arc<RuntimeMetrics>,
-    config: MetricsConfig,
-    router: Arc<Router>,
-    cancel: CancellationToken,
-    mon_send: Option<MonSend>,
-) -> RuntimeResult<()> {
-    wf_info!(
-        sys,
-        listen = %config.prometheus_listen,
-        interval = %config.report_interval,
-        "metrics exporter started"
-    );
-
-    metrics.sample_windows(&router);
-    let mut tick = tokio::time::interval(config.report_interval.as_duration());
-    tick.tick().await;
-    let task_started = Instant::now();
-    let mut prev = metrics.interval_snapshot(Instant::now());
-    let start = prev;
-    let mut run_summary = RunSummary::default();
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = tick.tick() => {
-                metrics.sample_windows(&router);
-                wf_info!(res, summary = %metrics.summary_line(), "metrics snapshot");
-                let curr = metrics.interval_snapshot(Instant::now());
-                if let Some(rates) = metrics.interval_rates(prev, curr) {
-                    run_summary.observe(rates);
-                    wf_info!(res, "{}", metrics.interval_table(rates));
-                }
-                prev = curr;
-
-                if let Some(ref sender) = mon_send {
-                    let snap = metrics.snapshot();
-                    let records = snap.to_records();
-                    if sender.try_send(records).is_err() {
-                        wf_debug!(sys, "monitor channel full, dropping metrics snapshot");
-                    }
-                }
-            }
-        }
-    }
-
-    // Include the last partial interval before shutdown in final stats.
-    metrics.sample_windows(&router);
-    let final_snap = metrics.interval_snapshot(Instant::now());
-    if let Some(rates) = metrics.interval_rates(prev, final_snap) {
-        run_summary.observe(rates);
-    }
-    let totals = TotalCounts {
-        rows: final_snap.rx_rows.saturating_sub(start.rx_rows),
-        late: final_snap.dropped_late.saturating_sub(start.dropped_late),
-        rules: final_snap.rule_matches.saturating_sub(start.rule_matches),
-        out: final_snap
-            .alert_dispatch
-            .saturating_sub(start.alert_dispatch),
-        sm_delta: final_snap.rule_instances as i64 - start.rule_instances as i64,
-    };
-
-    if let Some(table) = run_summary.table(Some(totals)) {
-        wf_info!(
-            res,
-            runtime = ?task_started.elapsed(),
-            intervals = run_summary.interval_count,
-            "{}",
-            table
-        );
-    }
-    Ok(())
-}
-
 pub fn maybe_build_metrics(
     config: &MetricsConfig,
     rule_names: &[String],
@@ -1287,313 +1199,4 @@ pub fn maybe_build_metrics(
         source_names,
         source_types,
     )))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn run_summary_table_includes_totals_when_provided() {
-        let mut summary = RunSummary::default();
-        summary.observe(IntervalRates {
-            row_s: 100.0,
-            late_s: 2.0,
-            rules_s: 10.0,
-            sm_s: 1.5,
-            out_s: 4.0,
-            memory_bytes: 1024,
-        });
-        let table = summary
-            .table(Some(TotalCounts {
-                rows: 500,
-                late: 10,
-                rules: 50,
-                out: 20,
-                sm_delta: -3,
-            }))
-            .expect("summary table should render");
-        assert!(table.contains("| avg     |"));
-        assert!(table.contains("| max     |"));
-        assert!(table.contains("| total   | rows"));
-        assert!(table.contains("| count   |        500"));
-        assert!(table.contains("        -3"));
-    }
-
-    // -- percentile -----------------------------------------------------------
-
-    #[test]
-    fn percentile_p50_returns_median() {
-        let hist = Histogram::from_seconds_bounds(&[0.001, 0.005, 0.01]);
-        hist.observe_duration(Duration::from_micros(500)); // 0.0005s → bucket 0
-        hist.observe_duration(Duration::from_micros(3000)); // 0.003s  → bucket 1
-        let snap = hist.snapshot();
-        let p50 = percentile(&snap, 0.50);
-        assert!(p50 > 0.0001 && p50 < 0.005);
-    }
-
-    #[test]
-    fn percentile_p99_returns_high_end() {
-        let hist = Histogram::from_seconds_bounds(&[0.001, 0.005, 0.01]);
-        // 85 fast, 15 slow → p99 should reach the slow bucket
-        for _ in 0..85 {
-            hist.observe_duration(Duration::from_micros(500));
-        }
-        for _ in 0..15 {
-            hist.observe_duration(Duration::from_millis(10));
-        }
-        let snap = hist.snapshot();
-        let p99 = percentile(&snap, 0.99);
-        assert!(p99 >= 0.005); // 15% in top bucket pulls p99 up
-    }
-
-    #[test]
-    fn percentile_empty_returns_zero() {
-        let hist = Histogram::from_seconds_bounds(&[0.001]);
-        let snap = hist.snapshot();
-        assert_eq!(percentile(&snap, 0.50), 0.0);
-        assert_eq!(percentile(&snap, 0.99), 0.0);
-    }
-
-    // -- snapshot drain -------------------------------------------------------
-
-    #[test]
-    fn snapshot_drains_counters_preserves_gauges() {
-        let metrics = RuntimeMetrics::new(
-            &["r1".to_string()],
-            &["w1".to_string()],
-            &[],
-            BTreeMap::new(),
-        );
-        metrics.inc_receiver_connection();
-        metrics.inc_receiver_connection();
-        metrics.inc_rule_match("r1");
-        assert_eq!(metrics.snapshot().receiver_connections, 2);
-        // After drain, counter resets to 0
-        assert_eq!(metrics.snapshot().receiver_connections, 0);
-    }
-
-    #[test]
-    fn snapshot_window_append_resets() {
-        let metrics = RuntimeMetrics::new(
-            &["r1".to_string()],
-            &["w1".to_string()],
-            &[],
-            BTreeMap::new(),
-        );
-        metrics.add_window_append("w1", 100);
-        metrics.add_window_append("w1", 200);
-        assert_eq!(metrics.snapshot().window_append.get("w1"), Some(&300));
-        assert_eq!(metrics.snapshot().window_append.get("w1"), Some(&0));
-    }
-
-    // -- per-window route counters --------------------------------------------
-
-    #[test]
-    fn add_route_report_tracks_per_window_append() {
-        use wf_engine::window::WindowRouteOutcome;
-        let metrics = RuntimeMetrics::new(
-            &["r1".to_string()],
-            &["win_a".to_string()],
-            &[],
-            BTreeMap::new(),
-        );
-        let report = RouteReport {
-            delivered: 1,
-            dropped_late: 0,
-            skipped_non_local: 0,
-            per_window: vec![WindowRouteOutcome {
-                window_name: "win_a".into(),
-                rows: 42,
-                late: false,
-            }],
-        };
-        metrics.add_route_report(&report);
-        assert_eq!(metrics.snapshot().window_append.get("win_a"), Some(&42));
-    }
-
-    #[test]
-    fn add_route_report_tracks_per_window_late() {
-        use wf_engine::window::WindowRouteOutcome;
-        let metrics = RuntimeMetrics::new(
-            &["r1".to_string()],
-            &["win_a".to_string()],
-            &[],
-            BTreeMap::new(),
-        );
-        let report = RouteReport {
-            delivered: 0,
-            dropped_late: 1,
-            skipped_non_local: 0,
-            per_window: vec![WindowRouteOutcome {
-                window_name: "win_a".into(),
-                rows: 10,
-                late: true,
-            }],
-        };
-        metrics.add_route_report(&report);
-        assert_eq!(metrics.snapshot().window_late.get("win_a"), Some(&10));
-    }
-
-    // -- per-window evict counters --------------------------------------------
-
-    #[test]
-    fn add_evict_report_tracks_per_window_eviction() {
-        use wf_engine::window::WindowEvictCount;
-        let metrics = RuntimeMetrics::new(
-            &["r1".to_string()],
-            &["win_a".to_string()],
-            &[],
-            BTreeMap::new(),
-        );
-        let report = EvictReport {
-            windows_scanned: 1,
-            batches_time_evicted: 2,
-            batches_memory_evicted: 1,
-            per_window_evicted: vec![WindowEvictCount {
-                window_name: "win_a".into(),
-                time_evicted: 2,
-            }],
-        };
-        metrics.add_evict_report(&report);
-        assert_eq!(metrics.snapshot().window_evict.get("win_a"), Some(&2));
-    }
-
-    // -- channel backpressure -------------------------------------------------
-
-    #[test]
-    fn alert_channel_depth_reads_current() {
-        let metrics = RuntimeMetrics::new(
-            &["r1".to_string()],
-            &["w1".to_string()],
-            &[],
-            BTreeMap::new(),
-        );
-        metrics.set_alert_channel_depth(3);
-        assert_eq!(metrics.snapshot().alert_channel_depth, 3);
-        metrics.set_alert_channel_depth(0);
-        assert_eq!(metrics.snapshot().alert_channel_depth, 0);
-    }
-
-    #[test]
-    fn alert_channel_full_increments() {
-        let metrics = RuntimeMetrics::new(
-            &["r1".to_string()],
-            &["w1".to_string()],
-            &[],
-            BTreeMap::new(),
-        );
-        metrics.inc_alert_channel_full();
-        metrics.inc_alert_channel_full();
-        assert_eq!(metrics.snapshot().alert_channel_full, 2);
-        assert_eq!(metrics.snapshot().alert_channel_full, 0);
-    }
-
-    // -- E2E latency ----------------------------------------------------------
-
-    #[test]
-    fn observe_event_e2e_latency_records() {
-        let metrics = RuntimeMetrics::new(
-            &["r1".to_string()],
-            &["w1".to_string()],
-            &[],
-            BTreeMap::new(),
-        );
-        metrics.observe_event_e2e_latency(Duration::from_secs(1));
-        let snap = metrics.snapshot();
-        // Should have one observation in the 1s bucket
-        let total: u64 = snap.event_e2e_latency.bucket_counts.iter().sum();
-        assert_eq!(total, 1);
-    }
-
-    // -- to_records -----------------------------------------------------------
-
-    #[test]
-    fn to_records_produces_expected_structure() {
-        let metrics = RuntimeMetrics::new(
-            &["r1".to_string()],
-            &["w1".to_string()],
-            &[],
-            BTreeMap::new(),
-        );
-        metrics.inc_rule_match("r1");
-        metrics.add_window_append("w1", 100);
-        let snap = metrics.snapshot();
-        let records = snap.to_records();
-        assert!(!records.is_empty());
-        // Each record should have stage, name, value fields
-        for r in &records {
-            let keys: Vec<&str> = r.fields.iter().map(|(k, _)| k.as_str()).collect();
-            assert!(keys.contains(&"stage"));
-            assert!(keys.contains(&"name"));
-            assert!(keys.contains(&"value"));
-        }
-    }
-
-    #[test]
-    fn receiver_source_machine_rows() {
-        let m = RuntimeMetrics::new(&[], &[], &["s1".to_string()], BTreeMap::new());
-        m.add_receiver_source_machine_rows("s1", "10.0.0.1", 100);
-        m.add_receiver_source_machine_rows("s1", "10.0.0.1", 50);
-        let snap = m.snapshot();
-        assert_eq!(
-            snap.receiver_source_machine_rows
-                .get("s1")
-                .unwrap()
-                .get("10.0.0.1"),
-            Some(&150)
-        );
-        // drain clears
-        assert!(m.snapshot().receiver_source_machine_rows.is_empty());
-        // empty machine_id is skipped
-        m.add_receiver_source_machine_rows("s1", "", 100);
-        assert!(m.snapshot().receiver_source_machine_rows.is_empty());
-    }
-
-    #[test]
-    fn alert_emitted_detail() {
-        let m = RuntimeMetrics::new(&["r1".to_string()], &[], &[], BTreeMap::new());
-        m.inc_alert_emitted("r1", "10.0.0.1", "sip=10.0.0.1");
-        m.inc_alert_emitted("r1", "10.0.0.1", "sip=10.0.0.1");
-        let snap = m.snapshot();
-        let detail = snap
-            .alert_emitted_detail
-            .get("r1")
-            .unwrap()
-            .get("10.0.0.1")
-            .unwrap();
-        assert_eq!(detail.get("sip=10.0.0.1"), Some(&2));
-        // drain clears
-        assert!(m.snapshot().alert_emitted_detail.is_empty());
-        // empty machine_id → "-"
-        m.inc_alert_emitted("r1", "", "key=val");
-        assert!(
-            m.snapshot()
-                .alert_emitted_detail
-                .get("r1")
-                .unwrap()
-                .contains_key("-")
-        );
-    }
-
-    #[test]
-    fn alert_counters() {
-        let m = RuntimeMetrics::new(&["r1".to_string()], &[], &[], BTreeMap::new());
-        m.inc_sink_dispatch_failed();
-        m.inc_sink_dispatch_failed();
-        assert_eq!(m.snapshot().alert_sink_dispatch_failed, 2);
-        assert_eq!(m.snapshot().alert_sink_dispatch_failed, 0);
-        // plain emitted_total when no detail
-        m.inc_alert_emitted("r1", "", "");
-        let records = m.snapshot().to_records();
-        let emitted: Vec<_> = records
-            .iter()
-            .filter(|r| {
-                r.fields
-                    .iter()
-                    .any(|(k, v)| k == "name" && v == "emitted_total")
-            })
-            .collect();
-        assert_eq!(emitted.len(), 1);
-    }
 }
