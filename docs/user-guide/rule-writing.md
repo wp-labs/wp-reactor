@@ -31,6 +31,7 @@ window security_alerts {
 
     fields {
         sip: ip
+        window_events: digit
         fail_count: digit
         message: chars
     }
@@ -51,7 +52,7 @@ rule brute_force {
 
     match<sip:5m> {
         on event {
-            fail | count >= 3;
+            failed_hits: fail | count >= 3;
         }
     } -> score(70.0)
 
@@ -59,7 +60,8 @@ rule brute_force {
 
     yield security_alerts (
         sip = fail.sip,
-        fail_count = count(fail),
+        window_events = stat.count(window_event(fail)),
+        fail_count = stat.count(match_event(failed_hits)),
         message = fmt("{} brute force detected", fail.sip)
     )
 }
@@ -75,9 +77,9 @@ rule brute_force {
 
 定义匹配窗口：按 `sip` 分组（不同 IP 独立计数），滑动窗口 5 分钟。`<sip:5m>` 读作"按 sip 分组的 5 分钟窗口"。
 
-**`on event { fail | count >= 3; }`**
+**`on event { failed_hits: fail | count >= 3; }`**
 
-事件触发条件。`fail` 引用 events 中绑定的别名，`|` 后是聚合条件：`fail` 事件的 `count`（累积计数）达到 3。
+事件触发条件。`failed_hits` 是 step label，用于在 `yield` 中稳定引用这一步的统计值；`fail` 引用 events 中绑定的别名，`|` 后是聚合条件：`fail` 事件的 `count`（累积计数）达到 3。
 
 **`-> score(70.0)`**
 
@@ -89,7 +91,7 @@ rule brute_force {
 
 **`yield security_alerts (...)`**
 
-输出到 `security_alerts` 窗口。字段赋值中可直接使用聚合函数（`count(fail)`）和格式化函数（`fmt(...)`）。
+输出到 `security_alerts` 窗口。`stat.count(window_event(fail))` 输出当前 rule instance/window 内进入窗口的候选失败事件数，`stat.count(match_event(failed_hits))` 输出 `failed_hits` 这一步接受为证据的命中事件数；格式化函数（`fmt(...)`）用于构造可读消息。
 
 ### 1.3 编写测试
 
@@ -141,7 +143,7 @@ window security_alerts {
 ```wfl
 yield security_alerts (
     sip = fail.sip,
-    fail_count = count(fail),
+    fail_count = stat.count(match_event(failed_hits)),
     risk_context = object {
         score: float = @score;
         source = fail.sip;

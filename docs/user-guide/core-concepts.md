@@ -184,6 +184,20 @@ yield security_alerts (
 
 `object` / `array` 是 WFL 内部的结构化值，不是要求用户手写 JSON 字符串。最终 JSON、XML、文本或 CSV 如何表达由 sink 决定；中间 window 为了继续被下游规则消费，会把结构化值按 UTF-8 JSON 字符串桥接。
 
+输出规则触发原因时，优先使用稳定统计上下文，而不是依赖内部字段名或临时聚合表达式：
+
+```wfl
+yield security_alerts (
+    window_events = stat.count(window_event(auth)),
+    matched_events = stat.count(match_event(failures)),
+    distinct_users = stat.count(match_distinct(user_spray)),
+    trigger_count = stat.value(trigger(user_spray)),
+    final_count = stat.value(final(final_users))
+)
+```
+
+这些 selector 只在 `yield` 中作为 `stat.count(...)` 或 `stat.value(...)` 参数使用。`window_event(alias)` 引用 source alias；`match_event(label)`、`match_distinct(label)`、`trigger(label)` 引用 `on event` label；`final(label)` 引用 `and close` label。参数是静态符号，不加引号，缺失或阶段不匹配会在编译期报错。
+
 `OutputRecord` 序列化后，由 `SinkDispatcher` 按 `yield_target` 路由到配置的 sink 组。
 
 ### 3.6 Sink 路由 — 告警发到哪里

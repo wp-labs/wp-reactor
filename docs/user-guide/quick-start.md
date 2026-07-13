@@ -48,6 +48,7 @@ window security_alerts {
     over = 0
     fields {
         sip: ip
+        window_events: digit
         fail_count: digit
         message: chars
     }
@@ -66,7 +67,7 @@ rule brute_force {
 
     match<sip:5m> {
         on event {
-            fail | count >= 3;
+            failed_hits: fail | count >= 3;
         }
     } -> score(70.0)
 
@@ -74,7 +75,8 @@ rule brute_force {
 
     yield security_alerts (
         sip = fail.sip,
-        fail_count = count(fail),
+        window_events = stat.count(window_event(fail)),
+        fail_count = stat.count(match_event(failed_hits)),
         message = fmt("{} brute force detected", fail.sip)
     )
 }
@@ -141,6 +143,18 @@ WFL 采用职责分离的三文件模型：
 - `.wfl` 仅能引用 `use` 导入的 window
 - `.toml` 只管物理参数，不写业务规则
 - `.wfs` 变更需要重启引擎
+
+## 输出统计字段
+
+在 `yield` 中输出规则触发原因时，优先使用稳定统计上下文：
+
+- `stat.count(window_event(alias))`：当前 rule instance/window 内，source alias 进入窗口的候选事件数
+- `stat.count(match_event(label))`：已命名 `on event` step label 接受为证据的命中事件数
+- `stat.count(match_distinct(label))`：`distinct | count` 分支的精确 distinct 数量
+- `stat.value(trigger(label))`：`on event` label 第一次满足阈值时的聚合值
+- `stat.value(final(label))`：`and close` label 在 close/flush 输出时的最终聚合值
+
+selector 参数是静态符号，不加引号。详细规则见 [规则编写指南](./rule-writing.md#16-输出稳定统计上下文) 和 [语言参考](./language-reference.md#稳定统计上下文)。
 
 ## 模式说明
 

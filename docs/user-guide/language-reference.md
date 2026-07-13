@@ -373,10 +373,13 @@ rule r_pipe {
 
 ### `yield`
 
+假设 `on event` 中定义了 `failed_hits: fail | count >= 3;`：
+
 ```wfl
 yield security_alerts (
     sip = fail.sip,
-    fail_count = count(fail),
+    window_events = stat.count(window_event(fail)),
+    fail_count = stat.count(match_event(failed_hits)),
     message = fmt("{} brute force detected, risk={}", fail.sip, @score),
     risk_score = round(@score, 1)
 )
