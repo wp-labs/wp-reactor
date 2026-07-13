@@ -33,6 +33,11 @@ window security_alerts {
         sip: ip
         window_events: digit
         fail_count: digit
+        first_seen: time
+        last_seen: time
+        rule_window_start: time
+        rule_window_end: time
+        latest_analysis_time: time
         message: chars
     }
 }
@@ -62,6 +67,11 @@ rule brute_force {
         sip = fail.sip,
         window_events = stat.count(window_event(fail)),
         fail_count = stat.count(match_event(failed_hits)),
+        first_seen = @event_first_time,
+        last_seen = @event_last_time,
+        rule_window_start = @window_start_time,
+        rule_window_end = @window_end_time,
+        latest_analysis_time = @emit_time,
         message = fmt("{} brute force detected", fail.sip)
     )
 }
@@ -91,7 +101,7 @@ rule brute_force {
 
 **`yield security_alerts (...)`**
 
-输出到 `security_alerts` 窗口。`stat.count(window_event(fail))` 输出当前 rule instance/window 内进入窗口的候选失败事件数，`stat.count(match_event(failed_hits))` 输出 `failed_hits` 这一步接受为证据的命中事件数；格式化函数（`fmt(...)`）用于构造可读消息。
+输出到 `security_alerts` 窗口。`stat.count(window_event(fail))` 输出当前 rule instance/window 内进入窗口的候选失败事件数，`stat.count(match_event(failed_hits))` 输出 `failed_hits` 这一步接受为证据的命中事件数；`@event_first_time` / `@event_last_time` / `@window_start_time` / `@window_end_time` / `@emit_time` 输出稳定时间语义；格式化函数（`fmt(...)`）用于构造可读消息。
 
 ### 1.3 编写测试
 

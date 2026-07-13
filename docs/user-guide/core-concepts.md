@@ -184,6 +184,22 @@ yield security_alerts (
 
 `object` / `array` 是 WFL 内部的结构化值，不是要求用户手写 JSON 字符串。最终 JSON、XML、文本或 CSV 如何表达由 sink 决定；中间 window 为了继续被下游规则消费，会把结构化值按 UTF-8 JSON 字符串桥接。
 
+输出业务时间时，优先把时间系统变量显式映射为普通业务字段，而不是依赖内部 `__wfu_*` 元数据字段：
+
+```wfl
+yield security_alerts (
+    first_seen = @event_first_time,
+    last_seen = @event_last_time,
+    evidence_start_time = @evidence_start_time,
+    evidence_end_time = @evidence_end_time,
+    rule_window_start = @window_start_time,
+    rule_window_end = @window_end_time,
+    latest_analysis_time = @emit_time
+)
+```
+
+这些字段通常在输出 window 中声明为 `time`。`@event_first_time` / `@event_last_time` 表达本次命中证据的首尾事件时间，`@window_start_time` / `@window_end_time` 表达规则窗口边界，`@emit_time` 表达本条输出记录的稳定产出时间。
+
 输出规则触发原因时，优先使用稳定统计上下文，而不是依赖内部字段名或临时聚合表达式：
 
 ```wfl

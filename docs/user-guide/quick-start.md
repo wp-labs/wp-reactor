@@ -50,6 +50,11 @@ window security_alerts {
         sip: ip
         window_events: digit
         fail_count: digit
+        first_seen: time
+        last_seen: time
+        rule_window_start: time
+        rule_window_end: time
+        latest_analysis_time: time
         message: chars
     }
 }
@@ -77,6 +82,11 @@ rule brute_force {
         sip = fail.sip,
         window_events = stat.count(window_event(fail)),
         fail_count = stat.count(match_event(failed_hits)),
+        first_seen = @event_first_time,
+        last_seen = @event_last_time,
+        rule_window_start = @window_start_time,
+        rule_window_end = @window_end_time,
+        latest_analysis_time = @emit_time,
         message = fmt("{} brute force detected", fail.sip)
     )
 }
@@ -155,6 +165,18 @@ WFL 采用职责分离的三文件模型：
 - `stat.value(final(label))`：`and close` label 在 close/flush 输出时的最终聚合值
 
 selector 参数是静态符号，不加引号。详细规则见 [规则编写指南](./rule-writing.md#16-输出稳定统计上下文) 和 [语言参考](./language-reference.md#稳定统计上下文)。
+
+## 输出时间字段
+
+告警输出不要依赖内部 `__wfu_*` 元字段来表达业务时间。需要首尾事件时间、窗口边界或分析时间时，在输出 window 中声明普通 `time` 字段，并在 `yield` 中显式赋值：
+
+- `first_seen = @event_first_time`：本次命中证据的第一条事件时间
+- `last_seen = @event_last_time`：本次命中证据的最后一条事件时间
+- `evidence_start_time = @evidence_start_time` / `evidence_end_time = @evidence_end_time`：证据范围起止时间
+- `rule_window_start = @window_start_time` / `rule_window_end = @window_end_time`：规则窗口边界
+- `latest_analysis_time = @emit_time`：本条输出记录的稳定产出时间
+
+时间变量只允许在 `yield` 表达式中使用。详细规则见 [规则编写指南](./rule-writing.md#15-输出证据时间和窗口时间) 和 [语言参考](./language-reference.md#时间系统变量)。
 
 ## 模式说明
 
