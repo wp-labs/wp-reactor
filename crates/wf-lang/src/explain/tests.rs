@@ -212,7 +212,7 @@ rule brute_force_then_scan {
         explanations[0].pattern_origin.is_none(),
         "standard rule should not have pattern_origin"
     );
-    let output = format!("{}", &explanations[0]);
+    let output = format!("{}", explanations[0]);
     assert!(
         !output.contains("Pattern:"),
         "standard rule should not show Pattern line"

@@ -216,11 +216,8 @@ fn infer_mvappend_type(args: &[Expr], scope: &Scope<'_>) -> Option<ValType> {
         }
         let arg_element_type = element_base_type(&arg_type)?;
         if let Some(existing) = &element_type {
-            if let Some(unified) = unify_array_element_type(existing, &arg_element_type) {
-                element_type = Some(unified);
-            } else {
-                return None;
-            }
+            let unified = unify_array_element_type(existing, &arg_element_type)?;
+            element_type = Some(unified);
         } else {
             element_type = Some(arg_element_type);
         }
