@@ -19,7 +19,9 @@ use wf_lang::WindowSchema;
 use wp_connector_api::{DataSource, SourceBatch};
 use wp_core_connectors::sources::batch::arrow::WireFormat;
 
-use crate::receiver::{normalize_stream_tag_field, resolve_stream_schema};
+use crate::receiver::{
+    WindowMiss, WindowMissReason, maybe_resolve_stream_schema, normalize_stream_tag_field,
+};
 
 /// Adapter wrapping a [`wp_connector_api::DataSource`] as a
 /// [`wf_connector_api::BatchSource`].
@@ -40,6 +42,8 @@ pub struct DataSourceBatchSource {
     dynamic_ndjson: bool,
     /// Stream tags aligned with the batches returned by the last decode.
     batch_tags: VecDeque<Option<String>>,
+    /// Recoverable input misses observed during the last decode.
+    window_misses: Vec<WindowMiss>,
 }
 
 impl DataSourceBatchSource {
@@ -67,6 +71,7 @@ impl DataSourceBatchSource {
             stream_tag_field: stream_tag_field.into(),
             dynamic_ndjson,
             batch_tags: VecDeque::new(),
+            window_misses: Vec::new(),
         }
     }
 
@@ -83,9 +88,16 @@ impl DataSourceBatchSource {
         self.batch_tags.front().and_then(|tag| tag.as_deref())
     }
 
+    /// Drain recoverable window misses observed by the previous
+    /// [`receive_batch`](BatchSource::receive_batch) call.
+    pub(crate) fn take_window_misses(&mut self) -> Vec<WindowMiss> {
+        std::mem::take(&mut self.window_misses)
+    }
+
     /// Convert a batch of raw events into zero or more `RecordBatch`es.
     fn convert(&mut self, events: SourceBatch) -> SourceResult<Vec<RecordBatch>> {
         self.batch_tags.clear();
+        self.window_misses.clear();
         if events.is_empty() {
             return Ok(vec![]);
         }
@@ -154,7 +166,7 @@ impl DataSourceBatchSource {
     }
 
     fn convert_dynamic_ndjson(&mut self, lines: Vec<String>) -> SourceResult<Vec<RecordBatch>> {
-        let stream_tag_field = normalize_stream_tag_field(&self.stream_tag_field);
+        let stream_tag_field = normalize_stream_tag_field(&self.stream_tag_field).to_string();
         let mut lines_by_stream: HashMap<String, Vec<String>> = HashMap::new();
         for (line_idx, line) in lines.into_iter().enumerate() {
             let value: serde_json::Value = serde_json::from_str(&line).map_err(|e| {
@@ -164,25 +176,41 @@ impl DataSourceBatchSource {
                     e
                 ))
             })?;
-            let stream = value
+            let stream = match value
                 .as_object()
-                .and_then(|obj| obj.get(stream_tag_field))
+                .and_then(|obj| obj.get(stream_tag_field.as_str()))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
                 .map(ToString::to_string)
-                .ok_or_else(|| {
-                    SourceReason::Decode.err_detail(format!(
-                        "invalid NDJSON event at row {}: missing string field `{}` for dynamic stream routing",
-                        line_idx + 1,
-                        stream_tag_field
-                    ))
-                })?;
+            {
+                Some(stream) => stream,
+                None => {
+                    self.window_misses.push(WindowMiss::new(
+                        stream_tag_field.as_str(),
+                        None,
+                        WindowMissReason::MissingStreamTagField,
+                        &line,
+                        1,
+                    ));
+                    continue;
+                }
+            };
             lines_by_stream.entry(stream).or_default().push(line);
         }
 
         let mut batches = Vec::new();
         for (stream, stream_lines) in lines_by_stream {
-            let schema = self.schema_for_stream(&stream)?;
+            let Some(schema) = self.schema_for_stream(&stream)? else {
+                let sample = stream_lines.first().map(String::as_str).unwrap_or_default();
+                self.window_misses.push(WindowMiss::new(
+                    stream_tag_field.as_str(),
+                    Some(stream),
+                    WindowMissReason::UnknownStreamSchema,
+                    sample,
+                    stream_lines.len(),
+                ));
+                continue;
+            };
             match wp_core_connectors::sources::batch::ndjson::ndjson_to_record_batch(
                 &stream_lines,
                 &schema,
@@ -198,15 +226,18 @@ impl DataSourceBatchSource {
         Ok(batches)
     }
 
-    fn schema_for_stream(&mut self, stream: &str) -> SourceResult<SchemaRef> {
+    fn schema_for_stream(&mut self, stream: &str) -> SourceResult<Option<SchemaRef>> {
         if let Some(schema) = self.schema_cache.get(stream) {
-            return Ok(Arc::clone(schema));
+            return Ok(Some(Arc::clone(schema)));
         }
-        let schema = resolve_stream_schema(self.schemas.as_slice(), stream)
+        let schema = maybe_resolve_stream_schema(self.schemas.as_slice(), stream)
             .map_err(|e| SourceReason::Decode.err_detail(e.to_string()))?;
+        let Some(schema) = schema else {
+            return Ok(None);
+        };
         self.schema_cache
             .insert(stream.to_string(), Arc::clone(&schema));
-        Ok(schema)
+        Ok(Some(schema))
     }
 }
 
@@ -408,6 +439,50 @@ mod tests {
             .collect();
         routed.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(routed, vec![("a".to_string(), 2), ("b".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn ndjson_dynamic_unknown_stream_is_window_miss() {
+        let src = VecSource {
+            id: "nd".into(),
+            batches: vec![vec![
+                ndjson_event(r#"{"wp_oml_name":"known","msg":"ok","n":1}"#),
+                ndjson_event(r#"{"wp_oml_name":"unknown","msg":"skip","n":2}"#),
+                ndjson_event(r#"{"msg":"missing","n":3}"#),
+            ]],
+            idx: 0,
+        };
+        let schemas = Arc::new(vec![stream_schema("win_known", "known")]);
+        let mut bs = DataSourceBatchSource::new(
+            "nd",
+            Box::new(src),
+            Arc::new(Schema::empty()),
+            WireFormat::Ndjson,
+            schemas,
+            crate::receiver::DEFAULT_STREAM_TAG_FIELD,
+            true,
+        );
+
+        let batches = bs.receive_batch().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(bs.next_stream_tag().as_deref(), Some("known"));
+
+        let mut misses = bs.take_window_misses();
+        misses.sort_by_key(|a| a.reason);
+        assert_eq!(misses.len(), 2);
+        assert_eq!(
+            misses[0].reason,
+            crate::receiver::WindowMissReason::UnknownStreamSchema
+        );
+        assert_eq!(misses[0].stream_tag.as_deref(), Some("unknown"));
+        assert_eq!(misses[0].rows, 1);
+        assert_eq!(
+            misses[1].reason,
+            crate::receiver::WindowMissReason::MissingStreamTagField
+        );
+        assert_eq!(misses[1].stream_tag, None);
+        assert_eq!(misses[1].rows, 1);
     }
 
     #[tokio::test]

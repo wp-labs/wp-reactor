@@ -10,6 +10,7 @@ use wf_lang::WindowSchema;
 
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::metrics::RuntimeMetrics;
+use crate::receiver::miss::{WindowMiss, WindowMissReason, report_window_miss};
 use crate::receiver::ndjson::{flush_ndjson_rows, normalize_stream_tag_field};
 use crate::receiver::schema::resolve_stream_schema;
 
@@ -102,17 +103,32 @@ pub async fn replay_csv_file(
         let route_stream = if fixed_stream {
             stream_name.clone()
         } else {
-            map.get(stream_tag_field)
+            match map
+                .get(stream_tag_field)
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
                 .map(ToString::to_string)
-                .ok_or_else(|| {
-                    RuntimeReason::data_error().to_err().with_detail(format!(
-                        "invalid CSV at {}: missing string column `{}` for dynamic stream routing",
-                        path.display(),
-                        stream_tag_field
-                    ))
-                })?
+            {
+                Some(stream) => stream,
+                None => {
+                    let sample = serde_json::Value::Object(map).to_string();
+                    let miss = WindowMiss::new(
+                        stream_tag_field,
+                        None,
+                        WindowMissReason::MissingStreamTagField,
+                        sample,
+                        1,
+                    );
+                    report_window_miss(
+                        source_name,
+                        "file",
+                        &miss,
+                        metrics.as_ref(),
+                        Some(router.as_ref()),
+                    );
+                    continue;
+                }
+            }
         };
         let rows = rows_by_stream
             .entry(route_stream.clone())
@@ -132,6 +148,8 @@ pub async fn replay_csv_file(
                 rows,
                 router.as_ref(),
                 metrics.as_ref(),
+                stream_tag_field,
+                "file",
             )?;
         }
     }
@@ -149,6 +167,8 @@ pub async fn replay_csv_file(
             rows,
             router.as_ref(),
             metrics.as_ref(),
+            stream_tag_field,
+            "file",
         )?;
     }
 

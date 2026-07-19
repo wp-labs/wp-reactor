@@ -11,6 +11,7 @@ All notable changes to wp-reactor will be documented in this file.
 - **wf-engine**: Unified WFL `time` expression values on epoch milliseconds: `now()` and `now_ms()` now return milliseconds, `strptime()` and `time_bucket()` return milliseconds, and `strftime()` / `time_diff()` accept epoch seconds, milliseconds, microseconds, or nanoseconds by timestamp width.
 - **wf-config / wf-engine / wf-runtime**: Changed `wf_meta_disable` handling to use compiled `wildmatch` matchers, supporting exact WarpFusion metadata field names and wildcard patterns such as `__wfu_*` and `__wfu_rule_*`.
 - **wf-engine / wf-runtime**: Changed sink business routing to compile window patterns into runtime `wildmatch` matchers instead of pre-resolving routes only for startup-known window names.
+- **wf-engine**: Replaced the broad `ProviderWindow::rows_mut()` escape hatch with scoped `ProviderWindow::update_rows()` for provider-row mutation.
 
 ### Added
 
@@ -21,12 +22,15 @@ All notable changes to wp-reactor will be documented in this file.
 - **User guide / design**: Documented the time system variables, stable stat context functions, and recommended business-field mappings such as `first_seen`, `last_seen`, `rule_window_start`, and `latest_analysis_time`.
 - **Design docs**: Documented wfusion-managed metadata field semantics, including `rule_name = @__wfu_rule_name`, reserved `__wfu_*` output targets, yield-only access, and sink-stage `wf_meta_disable` behavior.
 - **wf-engine tests**: Added sink-runtime send-path coverage for `wf_meta_disable` wildcard matching, including projection-before-disable behavior.
+- **wf-runtime**: Added the built-in `__window_miss` provider window for recoverable dynamic-routing misses, including `unknown_stream_schema` and `missing_stream_tag_field` diagnostics, bounded payload samples, and `wf_receiver_window_miss_total` metrics.
+- **wf-runtime tests**: Added NDJSON, CSV, Arrow framed, external source, metrics, and capacity-eviction coverage for window-miss handling.
 
 ### Fixed
 
 - **wf-engine**: Reused a shared epoch timestamp normalization helper across alert export and both expression evaluators to keep second/millisecond/microsecond/nanosecond handling consistent.
 - **wf-engine**: `time_bucket()` now rejects zero, negative, and non-finite intervals instead of producing surprising bucket results.
 - **wf-engine tests**: Removed cross-evaluation exact equality checks for `now()` / `now_ms()` to avoid millisecond-boundary flakes while preserving same-expression timestamp stability coverage.
+- **wf-runtime**: Window-miss snapshots now keep recently updated keys when the bounded `__window_miss` provider reaches capacity, instead of evicting rows only by original insertion order.
 
 ## [0.1.30] — 2026-07-11
 

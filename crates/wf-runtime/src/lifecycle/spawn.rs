@@ -427,7 +427,7 @@ async fn spawn_external_source_tasks(
                 schema,
                 format,
                 schemas,
-                stream_tag_field,
+                stream_tag_field.clone(),
                 matches!(format, WireFormat::Ndjson) && stream_name.trim().is_empty(),
             );
 
@@ -435,8 +435,20 @@ async fn spawn_external_source_tasks(
             loop {
                 tokio::select! {
                     result = batch_source.receive_batch() => match result {
-                        Ok(batches) if !batches.is_empty() => {
+                        Ok(batches) => {
                             consecutive_errors = 0;
+                            for miss in batch_source.take_window_misses() {
+                                crate::receiver::report_window_miss(
+                                    &source_name,
+                                    &source_kind,
+                                    &miss,
+                                    metrics.as_ref(),
+                                    Some(router.as_ref()),
+                                );
+                            }
+                            if batches.is_empty() {
+                                continue;
+                            }
                             for rb in batches {
                                 // For ArrowFramed, prefer the per-frame tag
                                 // (stream name embedded in the wp_arrow IPC header)
@@ -449,6 +461,25 @@ async fn spawn_external_source_tasks(
                                     } else {
                                         stream_name.clone()
                                     };
+                                if router.registry().subscribers_of(&route_stream).is_empty() {
+                                    let route_tag_field = if stream_name.is_empty()
+                                        && matches!(format, WireFormat::ArrowFramed)
+                                    {
+                                        "wp_arrow_tag"
+                                    } else {
+                                        stream_tag_field.as_str()
+                                    };
+                                    crate::receiver::record_batch_window_miss(
+                                        &source_name,
+                                        &source_kind,
+                                        route_tag_field,
+                                        &route_stream,
+                                        rb.num_rows(),
+                                        metrics.as_ref(),
+                                        Some(router.as_ref()),
+                                    );
+                                    continue;
+                                }
                                 if let Err(e) = crate::receiver::route_batch(
                                     &route_stream,
                                     &source_name,
@@ -469,7 +500,6 @@ async fn spawn_external_source_tasks(
                                 }
                             }
                         }
-                        Ok(_) => {}
                         Err(e) => {
                             // EOF: source has ended — stop the task.
                             if e.reason() == &wf_connector_api::SourceReason::EOF {

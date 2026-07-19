@@ -18,6 +18,8 @@ pub use self::server::run_metrics_task;
 type AlertDetailCounts = BTreeMap<String, AtomicU64>;
 type AlertDetailByMachine = BTreeMap<String, AlertDetailCounts>;
 type AlertDetailByRule = BTreeMap<String, AlertDetailByMachine>;
+type ReceiverMissCounts = BTreeMap<String, AtomicU64>;
+type ReceiverMissBySource = BTreeMap<String, ReceiverMissCounts>;
 
 const DEFAULT_HISTOGRAM_BUCKETS_SECONDS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
@@ -105,6 +107,7 @@ pub(crate) struct MetricsSnapshot {
     receiver_source_machine_rows: BTreeMap<String, BTreeMap<String, u64>>,
     receiver_source_decode_errors: BTreeMap<String, u64>,
     receiver_source_read_errors: BTreeMap<String, u64>,
+    receiver_window_misses: BTreeMap<String, BTreeMap<String, u64>>,
     router_route_calls: u64,
     router_delivered: u64,
     router_dropped_late: u64,
@@ -183,6 +186,19 @@ impl MetricsSnapshot {
         }
         for (source, v) in &self.receiver_source_read_errors {
             out.push(metric("receiver", "read_errors_total", source, *v));
+        }
+        for (source, by_reason) in &self.receiver_window_misses {
+            let source_type = self.source_types.get(source).cloned().unwrap_or_default();
+            for (reason, v) in by_reason {
+                out.push(metric_source_reason(
+                    "receiver",
+                    "window_miss_total",
+                    source,
+                    &source_type,
+                    reason,
+                    *v,
+                ));
+            }
         }
         out.push(metric(
             "router",
@@ -382,6 +398,27 @@ fn metric_with_type(
     if !source_type.is_empty() {
         fields.push(("source_type".into(), source_type.into()));
     }
+    fields.push(("value".into(), value.to_string()));
+    MetricsRecord { fields }
+}
+
+fn metric_source_reason(
+    stage: &str,
+    name: &str,
+    label: &str,
+    source_type: &str,
+    reason: &str,
+    value: u64,
+) -> MetricsRecord {
+    let mut fields = vec![
+        ("stage".into(), stage.into()),
+        ("name".into(), name.into()),
+        ("label".into(), label.into()),
+    ];
+    if !source_type.is_empty() {
+        fields.push(("source_type".into(), source_type.into()));
+    }
+    fields.push(("reason".into(), reason.into()));
     fields.push(("value".into(), value.to_string()));
     MetricsRecord { fields }
 }
@@ -618,6 +655,7 @@ pub struct RuntimeMetrics {
     receiver_source_machine_rows: Mutex<BTreeMap<String, BTreeMap<String, AtomicU64>>>,
     receiver_source_decode_errors_total: BTreeMap<String, AtomicU64>,
     receiver_source_read_errors_total: BTreeMap<String, AtomicU64>,
+    receiver_window_miss_total: Mutex<ReceiverMissBySource>,
 
     router_route_calls_total: AtomicU64,
     router_delivered_total: AtomicU64,
@@ -787,6 +825,7 @@ impl RuntimeMetrics {
             receiver_source_machine_rows: Mutex::new(BTreeMap::new()),
             receiver_source_decode_errors_total: make_source_map(),
             receiver_source_read_errors_total: make_source_map(),
+            receiver_window_miss_total: Mutex::new(BTreeMap::new()),
             router_route_calls_total: AtomicU64::new(0),
             router_delivered_total: AtomicU64::new(0),
             router_dropped_late_total: AtomicU64::new(0),
@@ -881,6 +920,18 @@ impl RuntimeMetrics {
         if let Some(v) = self.receiver_source_read_errors_total.get(source) {
             v.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub(crate) fn add_receiver_window_miss(&self, source: &str, reason: &str, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut map = self.receiver_window_miss_total.lock().unwrap();
+        let by_reason = map.entry(source.to_string()).or_default();
+        let v = by_reason
+            .entry(reason.to_string())
+            .or_insert_with(|| AtomicU64::new(0));
+        v.fetch_add(count as u64, Ordering::Relaxed);
     }
 
     pub fn inc_router_route_call(&self) {
@@ -996,6 +1047,22 @@ impl RuntimeMetrics {
         result
     }
 
+    fn drain_receiver_window_misses(&self) -> BTreeMap<String, BTreeMap<String, u64>> {
+        let map = self.receiver_window_miss_total.lock().unwrap();
+        let mut result = BTreeMap::new();
+        for (source, by_reason) in map.iter() {
+            let drained: BTreeMap<String, u64> = by_reason
+                .iter()
+                .map(|(reason, v)| (reason.clone(), v.swap(0, Ordering::Relaxed)))
+                .filter(|(_, v)| *v > 0)
+                .collect();
+            if !drained.is_empty() {
+                result.insert(source.clone(), drained);
+            }
+        }
+        result
+    }
+
     pub fn inc_alert_channel_send_failed(&self) {
         self.alert_channel_send_failed_total
             .fetch_add(1, Ordering::Relaxed);
@@ -1066,6 +1133,7 @@ impl RuntimeMetrics {
             receiver_source_decode_errors: self
                 .drain_map(&self.receiver_source_decode_errors_total),
             receiver_source_read_errors: self.drain_map(&self.receiver_source_read_errors_total),
+            receiver_window_misses: self.drain_receiver_window_misses(),
             router_route_calls: self.drain_counter(&self.router_route_calls_total),
             router_delivered: self.drain_counter(&self.router_delivered_total),
             router_dropped_late: self.drain_counter(&self.router_dropped_late_total),

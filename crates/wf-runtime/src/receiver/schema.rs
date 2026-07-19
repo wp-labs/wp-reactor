@@ -28,6 +28,17 @@ pub(crate) fn resolve_stream_schema(
     schemas: &[WindowSchema],
     stream_name: &str,
 ) -> RuntimeResult<SchemaRef> {
+    maybe_resolve_stream_schema(schemas, stream_name)?.ok_or_else(|| {
+        RuntimeReason::data_error()
+            .to_err()
+            .with_detail(format!("no schema subscribed for stream {:?}", stream_name))
+    })
+}
+
+pub(crate) fn maybe_resolve_stream_schema(
+    schemas: &[WindowSchema],
+    stream_name: &str,
+) -> RuntimeResult<Option<SchemaRef>> {
     let mut schema: Option<SchemaRef> = None;
     for ws in schemas {
         if !ws.streams.iter().any(|s| s == stream_name) {
@@ -48,11 +59,7 @@ pub(crate) fn resolve_stream_schema(
             schema = Some(candidate);
         }
     }
-    schema.ok_or_else(|| {
-        RuntimeReason::data_error()
-            .to_err()
-            .with_detail(format!("no schema subscribed for stream {:?}", stream_name))
-    })
+    Ok(schema)
 }
 
 fn window_schema_to_arrow(ws: &WindowSchema) -> RuntimeResult<SchemaRef> {

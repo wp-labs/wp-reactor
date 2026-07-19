@@ -13,8 +13,9 @@ use wf_lang::WindowSchema;
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::metrics::RuntimeMetrics;
 use crate::receiver::batch::build_record_batch_from_json;
+use crate::receiver::miss::{WindowMiss, WindowMissReason, report_window_miss};
 use crate::receiver::route::route_batch;
-use crate::receiver::schema::resolve_stream_schema;
+use crate::receiver::schema::{maybe_resolve_stream_schema, resolve_stream_schema};
 
 use super::DEFAULT_STREAM_TAG_FIELD;
 use super::ReplayRoute;
@@ -92,20 +93,30 @@ pub async fn replay_ndjson_file(
                 let route_stream = if fixed_stream {
                     stream_name.to_string()
                 } else {
-                    obj.get(stream_tag_field)
+                    match obj.get(stream_tag_field)
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.trim().is_empty())
                         .map(ToString::to_string)
-                        .ok_or_else(|| {
-                            RuntimeReason::data_error()
-                                .to_err()
-                                .with_detail(format!(
-                                    "invalid NDJSON at {}:{}: missing string field `{}` for dynamic stream routing",
-                                    path.display(),
-                                    line_no,
-                                    stream_tag_field
-                                ))
-                        })?
+                    {
+                        Some(stream) => stream,
+                        None => {
+                            let miss = WindowMiss::new(
+                                stream_tag_field,
+                                None,
+                                WindowMissReason::MissingStreamTagField,
+                                &line,
+                                1,
+                            );
+                            report_window_miss(
+                                source_name,
+                                "file",
+                                &miss,
+                                metrics.as_ref(),
+                                Some(router.as_ref()),
+                            );
+                            continue;
+                        }
+                    }
                 };
                 let rows = rows_by_stream
                     .entry(route_stream.clone())
@@ -125,6 +136,8 @@ pub async fn replay_ndjson_file(
                         rows,
                         router.as_ref(),
                         metrics.as_ref(),
+                        stream_tag_field,
+                        "file",
                     )?;
                 }
             }
@@ -144,6 +157,8 @@ pub async fn replay_ndjson_file(
             rows,
             router.as_ref(),
             metrics.as_ref(),
+            stream_tag_field,
+            "file",
         )?;
     }
 
@@ -167,6 +182,8 @@ pub(super) fn flush_ndjson_rows(
     rows: Vec<serde_json::Map<String, serde_json::Value>>,
     router: &Router,
     metrics: Option<&Arc<RuntimeMetrics>>,
+    stream_tag_field: &str,
+    source_kind: &str,
 ) -> RuntimeResult<usize> {
     if rows.is_empty() {
         return Ok(0);
@@ -177,7 +194,23 @@ pub(super) fn flush_ndjson_rows(
             if let Some(schema) = schema_cache.get(stream_name) {
                 Arc::clone(schema)
             } else {
-                let schema = resolve_stream_schema(schemas, stream_name)?;
+                let Some(schema) = maybe_resolve_stream_schema(schemas, stream_name)? else {
+                    let sample = rows
+                        .first()
+                        .cloned()
+                        .map(serde_json::Value::Object)
+                        .map(|value| value.to_string())
+                        .unwrap_or_default();
+                    let miss = WindowMiss::new(
+                        stream_tag_field,
+                        Some(stream_name.to_string()),
+                        WindowMissReason::UnknownStreamSchema,
+                        sample,
+                        rows.len(),
+                    );
+                    report_window_miss(source_name, source_kind, &miss, metrics, Some(router));
+                    return Ok(0);
+                };
                 schema_cache.insert(stream_name.to_string(), Arc::clone(&schema));
                 schema
             }

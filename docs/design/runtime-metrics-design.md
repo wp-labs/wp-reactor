@@ -20,6 +20,8 @@
 - `wf_receiver_connections_total`：接入连接数
 - `wf_receiver_frames_total`：接收帧数
 - `wf_receiver_rows_total`：接收行数
+- `wf_receiver_window_miss_total{source,reason}`：输入事件无法进入任何业务 window 的
+  可恢复 miss 数，例如未知 `log_type` / 未注册 stream schema
 - `wf_router_route_calls_total`：路由调用数
 - `wf_router_delivered_total` / `wf_router_dropped_late_total`
 - `wf_rule_events_total{rule}`：规则消费事件数
@@ -75,6 +77,9 @@ Metrics Aggregator Task
 3. **低基数优先**：label 仅允许 `rule/window/target/stream` 等有限集合，禁止 `entity_id`。
 4. **单调时钟**：时延使用 `Instant`，避免 wall-clock 跳变影响。
 5. **统计与告警分离**：运行态指标采集不依赖业务 sink 成败。
+6. **样本与指标分离**：`__window_miss` 可保留截断 payload 样本，但 metrics 只记录
+   source/reason 级计数，不把 raw payload 或任意 `log_type` 作为 Prometheus
+   label。
 
 ---
 
@@ -108,6 +113,8 @@ Metrics Aggregator Task
 ## 6. 对应到 `wf-runtime` 的埋点位置
 
 - `receiver`：连接、帧、解码耗时、解码失败、route report 聚合
+- `receiver window miss`：动态输入中未知 stream schema / 缺失 stream tag 字段等
+  可恢复数据质量问题；计数后跳过当前事件，不触发 source retry
 - `router`：delivered/dropped_late/skipped_non_local
 - `rule_task`：pull 批次数、事件数、match 数、close/flush 耗时、cursor gap
 - `alert_task`：dispatch 数、dispatch 耗时、序列化失败数、channel backlog

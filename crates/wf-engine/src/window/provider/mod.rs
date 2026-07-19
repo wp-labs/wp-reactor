@@ -44,6 +44,14 @@ impl ProviderWindow {
         self.rows.clone()
     }
 
+    /// Apply an in-place update to cached rows.
+    ///
+    /// The mutable rows reference is scoped to the callback so callers cannot
+    /// keep it beyond the update.
+    pub fn update_rows<R>(&mut self, f: impl FnOnce(&mut Vec<HashMap<String, Value>>) -> R) -> R {
+        f(&mut self.rows)
+    }
+
     /// Number of loaded rows.
     pub fn row_count(&self) -> usize {
         self.rows.len()

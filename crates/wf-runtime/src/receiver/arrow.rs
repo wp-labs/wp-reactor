@@ -11,8 +11,11 @@ use wf_lang::WindowSchema;
 
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::metrics::RuntimeMetrics;
+use crate::receiver::miss::record_batch_window_miss;
 use crate::receiver::route::route_batch;
-use crate::receiver::schema::{resolve_stream_schema, validate_batch_schema_for_stream};
+use crate::receiver::schema::{
+    maybe_resolve_stream_schema, resolve_stream_schema, validate_batch_schema_for_stream,
+};
 
 /// Replay framed `wp_arrow` IPC records from file and route them into the
 /// runtime.
@@ -61,6 +64,20 @@ pub async fn replay_arrow_framed_file(
                         format!("decode arrow frame from {}", path.display()),
                     )?;
                 let stream = stream_override.as_deref().unwrap_or(frame.tag.as_str());
+                if stream_override.is_none()
+                    && maybe_resolve_stream_schema(schemas, stream)?.is_none()
+                {
+                    record_batch_window_miss(
+                        source_name,
+                        "file",
+                        "wp_arrow_tag",
+                        stream,
+                        frame.batch.num_rows(),
+                        metrics.as_ref(),
+                        Some(router.as_ref()),
+                    );
+                    continue;
+                }
                 validate_batch_schema_for_stream(schemas, stream, frame.batch.schema().as_ref())?;
 
                 total_rows += frame.batch.num_rows();

@@ -73,6 +73,74 @@ TCP / file source factory 的 `validate_spec` 会校验 `data_format` 值是否�
 ArrowStream / Ndjson 的解码逻辑直接委托 connector 层的共享函数
 （`decode_arrow_ipc_batches` / `ndjson_to_record_batch`），不重复实现。
 
+### 内置 `__window_miss` 诊断窗口
+
+Kafka / TCP 等动态输入链路允许通过 `stream_tag_field`（默认
+`wp_oml_name`）从每条事件中提取逻辑 stream。生产环境中可能出现暂未注册 schema
+的新 `log_type` / stream tag。此类事件无法构造目标业务 window 的 typed
+`RecordBatch`，但它不是 source 级连接或解码故障，不能触发 receive retry 或阻塞
+同一 topic / partition 的后续合法事件。
+
+runtime 将这类情况定义为 **window miss**：
+
+- `unknown_stream_schema`：事件携带了非空 stream tag，但没有任何 window schema
+  订阅该 stream。
+- `missing_stream_tag_field`：动态路由模式下，事件缺少可用的 stream tag 字段。
+- 后续可扩展 `schema_mismatch` / `payload_decode_error`，但默认只把可恢复的数据质量
+  问题纳入 miss；连接错误、EOF、不可恢复的 wire format 错误仍按 source error
+  处理。
+
+处理语义：
+
+1. 对可恢复 miss，跳过当前事件或当前 stream 分组，不向外返回 `SourceError`。
+2. 同一批次中的合法 stream 继续转换为 `RecordBatch` 并正常进入 `route_batch`。
+3. 全批次均为 miss 时返回 `Ok(vec![])`，外层消费循环继续 receive。
+4. 首次观察到某个 `(source_name, stream_tag, reason)` 时记录 warning，至少包含
+   `source_name`、`source_kind`、`stream_tag_field`、`stream_tag`、`reason` 和一条
+   截断后的 payload sample；后续同 key 只更新计数和最近样本。
+5. 增加 metrics 计数，指标不携带 raw payload，避免高基数和敏感数据进入
+   Prometheus。
+6. Kafka connector 在成功读取该消息后应允许 offset 前进；未知 `log_type` 不应导致
+   同一分区重复消费同一条消息。
+
+`__window_miss` 是 runtime 启动时注册的内置 provider window，不是用户 WFS 中声明的
+业务 window，也不参与普通 stream 路由。它用于保留近期 miss 样本，辅助后续补 schema
+或排查上游数据质量问题。该名称为 runtime 保留名，用户不能声明同名 window。
+
+建议 schema：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `source_name` | chars | runtime source 实例名 |
+| `source_kind` | chars | source 类型，如 `kafka` / `tcp` / `file` |
+| `stream_tag_field` | chars | 用于动态路由的字段名 |
+| `stream_tag` | chars | 未命中的 tag；缺失时为空 |
+| `reason` | chars | miss 原因，如 `unknown_stream_schema` |
+| `raw_payload` | chars | 截断后的样本 payload |
+| `payload_bytes` | digit | 原始 payload 字节数 |
+| `first_seen` | time | 首次观察时间 |
+| `last_seen` | time | 最近观察时间 |
+| `count` | digit | 同一 key 聚合次数 |
+
+容量与聚合策略：
+
+- 按 `(source_name, stream_tag, reason)` 聚合，避免逐条保留导致内存不可控。
+- 当前每个 key 保留最近一条样本，并累加 `count`。
+- 当前全局上限为 1024 rows；达到上限时逐出最老 row。
+- 后续可扩展为每个 key 保留少量样本，默认 3 条，并补充 dropped sample 计数。
+
+落地顺序：
+
+1. 先在 `DataSourceBatchSource::convert_dynamic_ndjson` 和文件 replay 的动态
+   NDJSON / CSV flush 路径中，把未知 schema 从 `SourceError::Decode` 降级为
+   window miss + skip。
+2. 增加 receiver miss metrics 和单元测试，确保一批数据中 `known` 与 `unknown`
+   混合时，`known` 仍正常进入业务 window，`unknown` 不触发 retry。
+3. 引入 `__window_miss` 受限诊断存储，先通过 provider snapshot 可读，后续暴露给
+   CLI / debug endpoint 查询。
+4. 如后续确实需要规则消费 miss 数据，再以 provider window 形式暴露只读快照，而不是
+   让 miss payload 直接进入普通业务 window。
+
 ### 为什么 `BatchSource` trait 不定死 wire format
 
 `BatchSource::receive_batch()` 返回 `Vec<RecordBatch>`（已解码），不关心 payload

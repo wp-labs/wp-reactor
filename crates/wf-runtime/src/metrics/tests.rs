@@ -258,6 +258,42 @@ fn receiver_source_machine_rows() {
 }
 
 #[test]
+fn receiver_window_miss_metrics_are_grouped_by_source_and_reason() {
+    let m = RuntimeMetrics::new(&[], &[], &["s1".to_string()], BTreeMap::new());
+    m.add_receiver_window_miss("s1", "unknown_stream_schema", 2);
+    m.add_receiver_window_miss("s1", "missing_stream_tag_field", 1);
+
+    let records = m.snapshot().to_records();
+    let value_for = |reason: &str| -> u64 {
+        records
+            .iter()
+            .find(|record| {
+                record
+                    .fields
+                    .iter()
+                    .any(|(k, v)| k == "name" && v == "window_miss_total")
+                    && record.fields.iter().any(|(k, v)| k == "label" && v == "s1")
+                    && record
+                        .fields
+                        .iter()
+                        .any(|(k, v)| k == "reason" && v == reason)
+            })
+            .and_then(|record| {
+                record
+                    .fields
+                    .iter()
+                    .find(|(k, _)| k == "value")
+                    .and_then(|(_, v)| v.parse().ok())
+            })
+            .unwrap_or(0)
+    };
+
+    assert_eq!(value_for("unknown_stream_schema"), 2);
+    assert_eq!(value_for("missing_stream_tag_field"), 1);
+    assert!(m.snapshot().receiver_window_misses.is_empty());
+}
+
+#[test]
 fn alert_emitted_detail() {
     let m = RuntimeMetrics::new(&["r1".to_string()], &[], &[], BTreeMap::new());
     m.inc_alert_emitted("r1", "10.0.0.1", "sip=10.0.0.1");

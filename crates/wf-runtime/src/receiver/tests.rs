@@ -4,11 +4,13 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
-use wf_engine::window::{WindowDef, WindowParams, WindowRegistry};
+use wf_engine::match_engine::Value;
+use wf_engine::window::{ProviderWindow, WindowDef, WindowParams, WindowRegistry};
 
 // Items from the receiver module needed by tests.
 // Cannot use `use super::*;` because receiver::arrow shadows the arrow crate.
@@ -18,6 +20,7 @@ use super::csv::replay_csv_file;
 use super::ndjson::replay_ndjson_file;
 use super::route::{batch_machine_id, coerce_column};
 use super::{DEFAULT_STREAM_TAG_FIELD, ReplayRoute};
+use crate::metrics::{MetricsRecord, RuntimeMetrics};
 use wf_engine::window::Router;
 
 fn test_schema() -> SchemaRef {
@@ -53,7 +56,7 @@ fn test_config() -> WindowConfig {
 }
 
 fn make_router(stream_name: &str) -> Arc<Router> {
-    let reg = WindowRegistry::build(vec![WindowDef {
+    let mut reg = WindowRegistry::build(vec![WindowDef {
         params: WindowParams {
             name: "test_win".into(),
             schema: test_schema(),
@@ -64,11 +67,12 @@ fn make_router(stream_name: &str) -> Arc<Router> {
         config: test_config(),
     }])
     .unwrap();
+    register_miss_provider(&mut reg);
     Arc::new(Router::new(reg))
 }
 
 fn make_multi_stream_router() -> Arc<Router> {
-    let reg = WindowRegistry::build(vec![
+    let mut reg = WindowRegistry::build(vec![
         WindowDef {
             params: WindowParams {
                 name: "win_a".into(),
@@ -91,7 +95,21 @@ fn make_multi_stream_router() -> Arc<Router> {
         },
     ])
     .unwrap();
+    register_miss_provider(&mut reg);
     Arc::new(Router::new(reg))
+}
+
+fn register_miss_provider(registry: &mut WindowRegistry) {
+    registry
+        .register_provider(
+            crate::receiver::miss::WINDOW_MISS_WINDOW_NAME.to_string(),
+            ProviderWindow::new(
+                crate::receiver::miss::WINDOW_MISS_WINDOW_NAME.to_string(),
+                "internal://window_miss".to_string(),
+                None,
+            ),
+        )
+        .unwrap();
 }
 
 /// Count total rows across all batches in the test window snapshot.
@@ -107,6 +125,70 @@ fn snapshot_row_count_for(router: &Router, window: &str) -> usize {
         .iter()
         .map(|b| b.num_rows())
         .sum()
+}
+
+fn window_miss_metric_value(records: &[MetricsRecord], source: &str, reason: &str) -> u64 {
+    records
+        .iter()
+        .find(|record| {
+            record
+                .fields
+                .iter()
+                .any(|(k, v)| k == "name" && v == "window_miss_total")
+                && record
+                    .fields
+                    .iter()
+                    .any(|(k, v)| k == "label" && v == source)
+                && record
+                    .fields
+                    .iter()
+                    .any(|(k, v)| k == "reason" && v == reason)
+        })
+        .and_then(|record| {
+            record
+                .fields
+                .iter()
+                .find(|(k, _)| k == "value")
+                .and_then(|(_, v)| v.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+fn window_miss_snapshot_count(
+    router: &Router,
+    source: &str,
+    stream_tag: &str,
+    reason: &str,
+) -> u64 {
+    router
+        .registry()
+        .provider_snapshot(crate::receiver::miss::WINDOW_MISS_WINDOW_NAME)
+        .unwrap_or_default()
+        .iter()
+        .find(|row| {
+            string_value(row, "source_name") == Some(source)
+                && string_value(row, "stream_tag") == Some(stream_tag)
+                && string_value(row, "reason") == Some(reason)
+        })
+        .and_then(|row| number_value(row, "count"))
+        .unwrap_or(0.0) as u64
+}
+
+fn string_value<'a>(
+    row: &'a std::collections::HashMap<String, Value>,
+    key: &str,
+) -> Option<&'a str> {
+    match row.get(key) {
+        Some(Value::Str(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn number_value(row: &std::collections::HashMap<String, Value>, key: &str) -> Option<f64> {
+    match row.get(key) {
+        Some(Value::Number(value)) => Some(*value),
+        _ => None,
+    }
 }
 
 #[tokio::test]
@@ -224,6 +306,99 @@ async fn file_ndjson_replay_routes_rows_by_row_stream() {
 }
 
 #[tokio::test]
+async fn file_ndjson_dynamic_unknown_stream_is_window_miss() {
+    let router = make_multi_stream_router();
+    let metrics = Arc::new(RuntimeMetrics::new(
+        &[],
+        &["win_a".to_string(), "win_b".to_string()],
+        &["test_source".to_string()],
+        BTreeMap::new(),
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("events.ndjson");
+    std::fs::write(
+        &file_path,
+        r#"{"wp_oml_name":"a","ts":1000000000,"value":1}
+{"wp_oml_name":"unknown","ts":2000000000,"value":2}
+{"ts":3000000000,"value":3}
+{"wp_oml_name":"b","ts":4000000000,"value":4}
+"#,
+    )
+    .unwrap();
+
+    let schemas = vec![
+        wf_lang::WindowSchema {
+            name: "win_a".to_string(),
+            streams: vec!["a".to_string()],
+            time_field: Some("ts".to_string()),
+            over: Duration::from_secs(3600),
+            fields: vec![
+                wf_lang::FieldDef {
+                    name: "ts".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Time),
+                },
+                wf_lang::FieldDef {
+                    name: "value".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Digit),
+                },
+            ],
+        },
+        wf_lang::WindowSchema {
+            name: "win_b".to_string(),
+            streams: vec!["b".to_string()],
+            time_field: Some("ts".to_string()),
+            over: Duration::from_secs(3600),
+            fields: vec![
+                wf_lang::FieldDef {
+                    name: "ts".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Time),
+                },
+                wf_lang::FieldDef {
+                    name: "value".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Digit),
+                },
+            ],
+        },
+    ];
+
+    replay_ndjson_file(
+        &file_path,
+        ReplayRoute {
+            stream_name: "",
+            stream_tag_field: DEFAULT_STREAM_TAG_FIELD,
+        },
+        "test_source",
+        &schemas,
+        Arc::clone(&router),
+        Some(Arc::clone(&metrics)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(snapshot_row_count_for(&router, "win_a"), 1);
+    assert_eq!(snapshot_row_count_for(&router, "win_b"), 1);
+
+    let records = metrics.snapshot().to_records();
+    assert_eq!(
+        window_miss_metric_value(&records, "test_source", "unknown_stream_schema"),
+        1
+    );
+    assert_eq!(
+        window_miss_metric_value(&records, "test_source", "missing_stream_tag_field"),
+        1
+    );
+    assert_eq!(
+        window_miss_snapshot_count(&router, "test_source", "unknown", "unknown_stream_schema"),
+        1
+    );
+    assert_eq!(
+        window_miss_snapshot_count(&router, "test_source", "", "missing_stream_tag_field"),
+        1
+    );
+}
+
+#[tokio::test]
 async fn file_csv_replay_routes_rows_by_stream_tag_field_column() {
     let router = make_multi_stream_router();
     let dir = tempfile::tempdir().unwrap();
@@ -289,6 +464,99 @@ a,3000000000,3\n",
 
     assert_eq!(snapshot_row_count_for(&router, "win_a"), 2);
     assert_eq!(snapshot_row_count_for(&router, "win_b"), 1);
+}
+
+#[tokio::test]
+async fn file_csv_dynamic_unknown_stream_is_window_miss() {
+    let router = make_multi_stream_router();
+    let metrics = Arc::new(RuntimeMetrics::new(
+        &[],
+        &["win_a".to_string(), "win_b".to_string()],
+        &["test_source".to_string()],
+        BTreeMap::new(),
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("events.csv");
+    std::fs::write(
+        &file_path,
+        "wp_oml_name,ts,value\n\
+a,1000000000,1\n\
+unknown,2000000000,2\n\
+,3000000000,3\n\
+b,4000000000,4\n",
+    )
+    .unwrap();
+
+    let schemas = vec![
+        wf_lang::WindowSchema {
+            name: "win_a".to_string(),
+            streams: vec!["a".to_string()],
+            time_field: Some("ts".to_string()),
+            over: Duration::from_secs(3600),
+            fields: vec![
+                wf_lang::FieldDef {
+                    name: "ts".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Time),
+                },
+                wf_lang::FieldDef {
+                    name: "value".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Digit),
+                },
+            ],
+        },
+        wf_lang::WindowSchema {
+            name: "win_b".to_string(),
+            streams: vec!["b".to_string()],
+            time_field: Some("ts".to_string()),
+            over: Duration::from_secs(3600),
+            fields: vec![
+                wf_lang::FieldDef {
+                    name: "ts".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Time),
+                },
+                wf_lang::FieldDef {
+                    name: "value".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Digit),
+                },
+            ],
+        },
+    ];
+
+    replay_csv_file(
+        &file_path,
+        ReplayRoute {
+            stream_name: "",
+            stream_tag_field: DEFAULT_STREAM_TAG_FIELD,
+        },
+        "test_source",
+        &schemas,
+        Arc::clone(&router),
+        Some(Arc::clone(&metrics)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(snapshot_row_count_for(&router, "win_a"), 1);
+    assert_eq!(snapshot_row_count_for(&router, "win_b"), 1);
+
+    let records = metrics.snapshot().to_records();
+    assert_eq!(
+        window_miss_metric_value(&records, "test_source", "unknown_stream_schema"),
+        1
+    );
+    assert_eq!(
+        window_miss_metric_value(&records, "test_source", "missing_stream_tag_field"),
+        1
+    );
+    assert_eq!(
+        window_miss_snapshot_count(&router, "test_source", "unknown", "unknown_stream_schema"),
+        1
+    );
+    assert_eq!(
+        window_miss_snapshot_count(&router, "test_source", "", "missing_stream_tag_field"),
+        1
+    );
 }
 
 #[test]
@@ -443,6 +711,71 @@ async fn file_arrow_framed_replay_routes_rows() {
     .unwrap();
 
     assert_eq!(snapshot_row_count(&router), 2);
+}
+
+#[tokio::test]
+async fn file_arrow_framed_unknown_tag_is_window_miss() {
+    let router = make_router("events");
+    let metrics = Arc::new(RuntimeMetrics::new(
+        &[],
+        &["test_win".to_string()],
+        &["test_source".to_string()],
+        BTreeMap::new(),
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("events.arrow_framed");
+    let schema = test_schema();
+    let known = make_batch(&schema, &[1_000_000_000], &[1]);
+    let unknown = make_batch(&schema, &[2_000_000_000], &[2]);
+
+    {
+        let payload_known = wp_arrow::ipc::encode_ipc("events", &known).unwrap();
+        let payload_unknown = wp_arrow::ipc::encode_ipc("unknown", &unknown).unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&(payload_known.len() as u32).to_be_bytes());
+        body.extend_from_slice(&payload_known);
+        body.extend_from_slice(&(payload_unknown.len() as u32).to_be_bytes());
+        body.extend_from_slice(&payload_unknown);
+        std::fs::write(&file_path, body).unwrap();
+    }
+
+    replay_arrow_framed_file(
+        &file_path,
+        "",
+        "test_source",
+        &[wf_lang::WindowSchema {
+            name: "test_win".to_string(),
+            streams: vec!["events".to_string()],
+            time_field: Some("ts".to_string()),
+            over: Duration::from_secs(3600),
+            fields: vec![
+                wf_lang::FieldDef {
+                    name: "ts".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Time),
+                },
+                wf_lang::FieldDef {
+                    name: "value".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Digit),
+                },
+            ],
+        }],
+        Arc::clone(&router),
+        Some(Arc::clone(&metrics)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(snapshot_row_count(&router), 1);
+    let records = metrics.snapshot().to_records();
+    assert_eq!(
+        window_miss_metric_value(&records, "test_source", "unknown_stream_schema"),
+        1
+    );
+    assert_eq!(
+        window_miss_snapshot_count(&router, "test_source", "unknown", "unknown_stream_schema"),
+        1
+    );
 }
 
 #[tokio::test]

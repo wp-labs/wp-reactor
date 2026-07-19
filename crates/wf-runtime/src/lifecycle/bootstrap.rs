@@ -12,9 +12,10 @@ use wp_core_connectors::sinks::tcp::TcpFactory;
 
 use wf_config::ConfigVarContext;
 use wf_config::FusionConfig;
-use wf_engine::window::{Router, WindowRegistry};
+use wf_engine::window::{ProviderWindow, Router, WindowRegistry};
 
 use crate::error::{RuntimeReason, RuntimeResult};
+use crate::receiver::miss::WINDOW_MISS_WINDOW_NAME;
 use crate::schema_bridge::schemas_to_window_defs;
 use crate::sink_build::{SinkFactoryRegistry, build_sink_dispatcher};
 
@@ -88,6 +89,7 @@ pub(super) async fn load_and_compile(
 
     // 5. WindowRegistry::build → registry (buffer windows only)
     let mut registry = WindowRegistry::build(window_defs).conv_err()?;
+    register_window_miss_provider(&mut registry, &runtime_window_configs)?;
 
     // 5.5. Initialize wp_knowledge if knowdb.toml exists
     //      (Redis provider + [fun] registry for external(), CSV/DB tables for windows)
@@ -158,6 +160,39 @@ pub(super) async fn load_and_compile(
         intermediate_targets,
         external_runtime,
     })
+}
+
+fn register_window_miss_provider(
+    registry: &mut WindowRegistry,
+    window_configs: &[wf_config::WindowConfig],
+) -> RuntimeResult<()> {
+    if registry.contains(WINDOW_MISS_WINDOW_NAME)
+        || window_configs
+            .iter()
+            .any(|config| config.name == WINDOW_MISS_WINDOW_NAME)
+    {
+        return RuntimeReason::Bootstrap
+            .to_err()
+            .with_detail(format!(
+                "window name {WINDOW_MISS_WINDOW_NAME:?} is reserved for runtime diagnostics"
+            ))
+            .err();
+    }
+
+    registry
+        .register_provider(
+            WINDOW_MISS_WINDOW_NAME.to_string(),
+            ProviderWindow::new(
+                WINDOW_MISS_WINDOW_NAME.to_string(),
+                "internal://window_miss".to_string(),
+                None,
+            ),
+        )
+        .source_err(
+            RuntimeReason::Bootstrap,
+            "register __window_miss provider window",
+        )?;
+    Ok(())
 }
 
 /// Initialize wp_knowledge Redis provider and [fun] registry from knowdb.toml.
