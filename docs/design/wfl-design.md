@@ -35,6 +35,7 @@
 | `pattern name(...) { ... }` | 可组合规则片段 | ✅ 已实现 | 编译前文本展开，`wf explain` 可保留来源 |
 | `on each alias [where expr]` | 逐条无状态规则 | ✅ 已实现 | 不创建 match instance；不能作为 pipeline stage |
 | `yield` 时间系统变量 | 告警时间语义字段 | ✅ 已实现 | `@event_first_time` / `@event_last_time` / `@evidence_start_time` / `@evidence_end_time` / `@window_start_time` / `@window_end_time` / `@emit_time` |
+| `yield` 引用 wfusion 元字段 | 输出元字段映射为普通字段 | ✅ 已实现 | 支持 `rule_name = @__wfu_rule_name`；左侧仍禁止 `__wfu_*` |
 | `meta.lang` 强制 | v2.1 治理 | ❌ 未实现 | 当前 checker 未强制每条规则声明 `meta.lang` |
 | `derive { ... }` | L2 特征派生 | ❌ 未实现 | AST/解析/编译链路未接入 derive block |
 | `score { item = expr @ weight; ... }` | L2 可解释评分 | ❌ 未实现 | 当前仅支持 `score(expr)` |
@@ -59,6 +60,43 @@
 2. `Match`：按 key+duration 维护状态机并求值步骤。
 3. `Join`：对匹配上下文做 LEFT JOIN enrich。
 4. `Yield`：写入目标 window（含系统字段）。
+
+### 2.1.1 wfusion 管理元字段
+
+wfusion 告警输出包含一组由平台管理的元字段，字段名统一使用 `__wfu_` 前缀。它们不是业务字段，也不能由规则在 `yield` 左侧直接声明或覆盖。
+
+统一元字段目录是字段名、类型和可用范围的唯一来源。当前字段集：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `__wfu_id` | `chars` | 告警内容标识 |
+| `__wfu_rule_name` | `chars` | 触发规则名 |
+| `__wfu_score` | `float` | 规则评分 |
+| `__wfu_entity_type` | `chars` | 实体类型 |
+| `__wfu_entity_id` | `chars` | 实体标识 |
+| `__wfu_origin` | `chars` | 告警来源路径 |
+| `__wfu_close_reason` | `chars` | close 路径原因；非 close 路径为空字符串 |
+| `__wfu_fired_at` | `chars` | 告警触发时间，沿用当前导出格式 |
+| `__wfu_emit_time` | `chars` | 引擎发出时间，沿用当前导出格式 |
+| `__wfu_summary` | `chars` | 引擎生成的告警摘要 |
+
+WFL 的 `yield` 表达式允许读取这些元字段，并映射到普通输出字段：
+
+```wfl
+yield security_alerts (
+    rule_name = @__wfu_rule_name,
+    score = @__wfu_score
+)
+```
+
+语义约束：
+
+- 左侧 `rule_name` / `score` 是目标 output window 的普通字段，必须在 `.wfs` 中声明并通过类型检查。
+- 左侧仍禁止 `__wfu_* = ...`，避免规则覆盖平台管理字段。
+- 右侧 `@__wfu_*` 只在 `yield` 表达式上下文可用；`where`、`score(...)`、`entity(...)` 中不可用。
+- `@__wfu_*` 的类型来自统一元字段目录，例如 `@__wfu_rule_name: chars`、`@__wfu_score: float`。
+- 写入 intermediate window 的平台字段使用独立的受限目录，目前只自动注入 `__wfu_rule_name`、`__wfu_score`、`__wfu_entity_type`、`__wfu_entity_id`。
+- `wf_meta_disable` 仍只影响 sink 输出阶段，不影响规则内部将元字段映射为普通字段。
 
 ### 2.2 语法糖策略
 - `|>`、`conv`、隐式 window 都是语法糖。

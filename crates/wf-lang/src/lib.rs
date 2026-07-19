@@ -12,6 +12,7 @@ pub mod wfg_ast;
 pub mod wfg_parser;
 mod wfl_parser;
 mod wfs_parser;
+pub mod wfu_meta;
 
 pub use checker::lint::lint_wfl;
 pub use checker::{

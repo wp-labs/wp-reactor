@@ -322,6 +322,17 @@ fn check_expr_type_inner(
                 message: "system variables are only allowed in `yield` expressions".to_string(),
             });
         }
+        Expr::WfuMeta(field) if !allow_yield_context => {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: format!(
+                    "wfusion meta field `{}` is only allowed in `yield` expressions",
+                    field.name()
+                ),
+            });
+        }
         Expr::Field(fref) => {
             // Just verify the field resolves.
             if let Err(msg) = scope.resolve_field_ref(fref) {
@@ -333,7 +344,11 @@ fn check_expr_type_inner(
                 });
             }
         }
-        Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) | Expr::SystemVar(_) => {}
+        Expr::Number(_)
+        | Expr::StringLit(_)
+        | Expr::Bool(_)
+        | Expr::SystemVar(_)
+        | Expr::WfuMeta(_) => {}
         Expr::IfThenElse {
             cond,
             then_expr,

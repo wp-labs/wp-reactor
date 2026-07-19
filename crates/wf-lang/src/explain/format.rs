@@ -17,6 +17,7 @@ pub fn format_expr(expr: &Expr) -> String {
         Expr::StringLit(s) => format!("\"{}\"", s),
         Expr::Bool(b) => format!("{}", b),
         Expr::SystemVar(var) => format_system_var(*var).to_string(),
+        Expr::WfuMeta(field) => format!("@{}", field.name()),
         Expr::Field(fref) => format_field_ref(fref),
         Expr::BinOp { op, left, right } => {
             format!(

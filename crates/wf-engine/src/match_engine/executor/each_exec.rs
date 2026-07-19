@@ -68,6 +68,15 @@ impl RuleExecutor {
         let yield_fields = with_yield_eval_scope(|| {
             let yield_meta = YieldMeta {
                 score: Some(score),
+                wfx_id: Some(&wfx_id),
+                rule_name: Some(&self.plan.name),
+                entity_type: Some(&self.plan.entity_plan.entity_type),
+                entity_id: Some(&entity_id),
+                origin: Some(origin.as_str()),
+                close_reason: Some(""),
+                fired_at: Some(&fired_at),
+                emit_time: Some(&emit_time),
+                summary: Some(&summary),
                 event_first_time_nanos: Some(event_time_nanos),
                 event_last_time_nanos: Some(event_time_nanos),
                 window_start_time_nanos: Some(event_time_nanos),

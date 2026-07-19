@@ -8,8 +8,8 @@ use super::{CheckError, Severity};
 #[cfg(test)]
 mod tests;
 
-/// System field names that yield arguments must not shadow.
-const SYSTEM_FIELD_NAMES: &[&str] = &[
+/// Legacy bare meta aliases that can be confused with wfusion-managed metadata.
+const LEGACY_META_ALIAS_NAMES: &[&str] = &[
     "rule_name",
     "emit_time",
     "score",
@@ -43,7 +43,7 @@ pub fn lint_wfl(file: &WflFile, _schemas: &[WindowSchema]) -> Vec<CheckError> {
         // W005: score always zero
         lint_score_zero(rule, name, &mut warnings);
 
-        // W006: yield field name near-matches a system field
+        // W006: yield field name near-matches a legacy meta alias
         lint_yield_case_collision(rule, name, &mut warnings);
     }
 
@@ -134,7 +134,11 @@ fn collect_expr_aliases<'a>(expr: &'a Expr, declared: &HashSet<&str>, used: &mut
                 collect_expr_aliases(item, declared, used);
             }
         }
-        Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) | Expr::SystemVar(_) => {}
+        Expr::Number(_)
+        | Expr::StringLit(_)
+        | Expr::Bool(_)
+        | Expr::SystemVar(_)
+        | Expr::WfuMeta(_) => {}
         Expr::Object(items) => {
             for item in items {
                 collect_expr_aliases(&item.value, declared, used);
@@ -220,7 +224,7 @@ fn lint_score_zero(rule: &crate::ast::RuleDecl, rule_name: &str, warnings: &mut 
 }
 
 // ---------------------------------------------------------------------------
-// W006: yield field name case-collides with a system field
+// W006: yield field name case-collides with a legacy meta alias
 // ---------------------------------------------------------------------------
 
 fn lint_yield_case_collision(
@@ -230,16 +234,16 @@ fn lint_yield_case_collision(
 ) {
     for arg in &rule.yield_clause.args {
         let lower = arg.name.to_ascii_lowercase();
-        if SYSTEM_FIELD_NAMES.contains(&arg.name.as_str()) {
+        if LEGACY_META_ALIAS_NAMES.contains(&arg.name.as_str()) {
             continue;
         }
-        if SYSTEM_FIELD_NAMES.contains(&lower.as_str()) {
+        if LEGACY_META_ALIAS_NAMES.contains(&lower.as_str()) {
             warnings.push(CheckError {
                 severity: Severity::Warning,
                 rule: Some(rule_name.to_string()),
                 test: None,
                 message: format!(
-                    "[W006] yield field `{}` differs from system field `{}` only by case; this may cause confusion",
+                    "[W006] yield field `{}` differs from legacy wfusion meta alias `{}` only by case; prefer an exact schema field name or map from `@__wfu_*` explicitly",
                     arg.name, lower
                 ),
             });

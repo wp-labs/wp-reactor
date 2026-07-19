@@ -71,6 +71,8 @@ pub enum SystemVar {
     EmitTime,
 }
 
+pub use crate::wfu_meta::WfuMetaField;
+
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
 #[moju(kind = "struct", domain = "Lang", module = "Lang.LangExpr")]
 pub struct ObjectItem {
@@ -95,6 +97,8 @@ pub enum Expr {
     Bool(bool),
     /// System variable reference, e.g. `@score`.
     SystemVar(SystemVar),
+    /// wfusion-managed metadata field reference, e.g. `@__wfu_rule_name`.
+    WfuMeta(WfuMetaField),
     /// Field reference.
     Field(FieldRef),
     /// Binary operation.

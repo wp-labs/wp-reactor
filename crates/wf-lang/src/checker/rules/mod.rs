@@ -14,20 +14,9 @@ use crate::ast::{EachClause, Expr, FieldRef, MatchClause, Measure, PipelineStage
 use crate::checker::scope::{Scope, StatLabelInfo, StatLabelStage};
 use crate::checker::types::{ValType, check_expr_type, infer_type};
 use crate::schema::{BaseType, FieldDef, FieldType, WindowSchema};
+use crate::wfu_meta::WFU_PREFIX;
 
 use super::{CheckError, Severity};
-
-/// System fields that must not appear in yield named arguments.
-const SYSTEM_FIELDS: &[&str] = &[
-    "rule_name",
-    "emit_time",
-    "score",
-    "entity_type",
-    "entity_id",
-    "origin",
-    "score_contrib",
-];
-pub(crate) const WFU_PREFIX: &str = "__wfu_";
 
 const PIPE_IN_ALIAS: &str = "_in";
 
@@ -386,7 +375,7 @@ fn check_on_each_expr(
             check_on_each_expr(then_expr, scope, rule_name, errors);
             check_on_each_expr(else_expr, scope, rule_name, errors);
         }
-        Expr::SystemVar(_) => {}
+        Expr::SystemVar(_) | Expr::WfuMeta(_) => {}
         _ => {}
     }
 }

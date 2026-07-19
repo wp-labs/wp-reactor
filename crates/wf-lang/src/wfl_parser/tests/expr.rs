@@ -302,6 +302,30 @@ rule r {
 }
 
 #[test]
+fn parse_expr_wfu_meta_refs() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        rule_name = @__wfu_rule_name,
+        score = @__wfu_score
+    )
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    assert_eq!(
+        file.rules[0].yield_clause.args[0].value,
+        Expr::WfuMeta(crate::wfu_meta::WfuMetaField::RuleName)
+    );
+    assert_eq!(
+        file.rules[0].yield_clause.args[1].value,
+        Expr::WfuMeta(crate::wfu_meta::WfuMetaField::Score)
+    );
+}
+
+#[test]
 fn parse_expr_time_system_vars() {
     let input = r#"
 rule r {

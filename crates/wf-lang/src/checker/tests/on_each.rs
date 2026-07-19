@@ -103,6 +103,93 @@ rule final_risk {
 }
 
 #[test]
+fn on_each_downstream_can_use_all_auto_intermediate_wfu_fields() {
+    let enriched = make_output_window(
+        "enriched_events",
+        vec![
+            ("event_time", bt(BaseType::Time)),
+            ("sip", bt(BaseType::Ip)),
+        ],
+    );
+    let final_out = make_output_window(
+        "final_out",
+        vec![
+            ("rule_name", bt(BaseType::Chars)),
+            ("score", bt(BaseType::Float)),
+            ("entity_type", bt(BaseType::Chars)),
+            ("entity_id", bt(BaseType::Chars)),
+        ],
+    );
+    let input = r#"
+rule enrich_each_event {
+    events { e : auth_events }
+    on each e -> score(1.0)
+    entity(ip, e.sip)
+    yield enriched_events (
+        event_time = e.event_time,
+        sip = e.sip
+    )
+}
+
+rule final_risk {
+    events { x : enriched_events }
+    match<sip:5m> {
+        on event {
+            x | count >= 1;
+        }
+    } -> score(x.__wfu_score)
+    entity(ip, x.sip)
+    yield final_out (
+        rule_name = x.__wfu_rule_name,
+        score = x.__wfu_score,
+        entity_type = x.__wfu_entity_type,
+        entity_id = x.__wfu_entity_id
+    )
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), enriched, final_out]);
+}
+
+#[test]
+fn on_each_downstream_rejects_wfu_fields_outside_intermediate_directory() {
+    let enriched = make_output_window(
+        "enriched_events",
+        vec![
+            ("event_time", bt(BaseType::Time)),
+            ("sip", bt(BaseType::Ip)),
+        ],
+    );
+    let final_out = make_output_window("final_out", vec![("wfu_id", bt(BaseType::Chars))]);
+    let input = r#"
+rule enrich_each_event {
+    events { e : auth_events }
+    on each e -> score(1.0)
+    entity(ip, e.sip)
+    yield enriched_events (
+        event_time = e.event_time,
+        sip = e.sip
+    )
+}
+
+rule final_risk {
+    events { x : enriched_events }
+    match<sip:5m> {
+        on event {
+            x | count >= 1;
+        }
+    } -> score(1.0)
+    entity(ip, x.sip)
+    yield final_out (wfu_id = x.__wfu_id)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), enriched, final_out],
+        "__wfu_id",
+    );
+}
+
+#[test]
 fn on_each_rejects_intermediate_window_cycles() {
     let enriched = make_output_window(
         "enriched_events",

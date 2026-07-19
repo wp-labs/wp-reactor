@@ -28,13 +28,43 @@ pub(super) fn eval_yield_expr(expr: &wf_lang::ast::Expr, ctx: &Event) -> Option<
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct YieldMeta {
+pub(super) struct YieldMeta<'a> {
     pub(super) score: Option<f64>,
+    pub(super) wfx_id: Option<&'a str>,
+    pub(super) rule_name: Option<&'a str>,
+    pub(super) entity_type: Option<&'a str>,
+    pub(super) entity_id: Option<&'a str>,
+    pub(super) origin: Option<&'a str>,
+    pub(super) close_reason: Option<&'a str>,
+    pub(super) fired_at: Option<&'a str>,
+    pub(super) emit_time: Option<&'a str>,
+    pub(super) summary: Option<&'a str>,
     pub(super) event_first_time_nanos: Option<i64>,
     pub(super) event_last_time_nanos: Option<i64>,
     pub(super) window_start_time_nanos: Option<i64>,
     pub(super) window_end_time_nanos: Option<i64>,
     pub(super) emit_time_nanos: Option<i64>,
+}
+
+impl YieldMeta<'_> {
+    fn resolve_wfu_meta(self, field: wf_lang::wfu_meta::WfuMetaField) -> Option<Value> {
+        use wf_lang::wfu_meta::WfuMetaField;
+
+        match field {
+            WfuMetaField::Id => self.wfx_id.map(|value| Value::Str(value.to_string())),
+            WfuMetaField::RuleName => self.rule_name.map(|value| Value::Str(value.to_string())),
+            WfuMetaField::Score => self.score.map(Value::Number),
+            WfuMetaField::EntityType => self.entity_type.map(|value| Value::Str(value.to_string())),
+            WfuMetaField::EntityId => self.entity_id.map(|value| Value::Str(value.to_string())),
+            WfuMetaField::Origin => self.origin.map(|value| Value::Str(value.to_string())),
+            WfuMetaField::CloseReason => {
+                self.close_reason.map(|value| Value::Str(value.to_string()))
+            }
+            WfuMetaField::FiredAt => self.fired_at.map(|value| Value::Str(value.to_string())),
+            WfuMetaField::EmitTime => self.emit_time.map(|value| Value::Str(value.to_string())),
+            WfuMetaField::Summary => self.summary.map(|value| Value::Str(value.to_string())),
+        }
+    }
 }
 
 thread_local! {
@@ -129,7 +159,7 @@ pub(super) fn eval_bool_expr_with_lookup(
 pub(super) fn eval_expr_with_l3(
     expr: &wf_lang::ast::Expr,
     ctx: &Event,
-    meta: YieldMeta,
+    meta: YieldMeta<'_>,
 ) -> Option<Value> {
     use wf_lang::ast::{BinOp, Expr, SystemVar};
 
@@ -153,6 +183,7 @@ pub(super) fn eval_expr_with_l3(
             meta.window_end_time_nanos.map(time_nanos_to_value)
         }
         Expr::SystemVar(SystemVar::EmitTime) => meta.emit_time_nanos.map(time_nanos_to_value),
+        Expr::WfuMeta(field) => meta.resolve_wfu_meta(*field),
         Expr::Field(fr) => ctx.fields.get(field_ref_name(fr)).cloned(),
         Expr::Object(items) => {
             let mut map = std::collections::HashMap::new();

@@ -11,7 +11,7 @@ use crate::time::{normalize_epoch_timestamp_float_nanos, positive_interval_secon
 pub(super) fn contains_system_var(expr: &wf_lang::ast::Expr) -> bool {
     use wf_lang::ast::Expr;
     match expr {
-        Expr::SystemVar(_) => true,
+        Expr::SystemVar(_) | Expr::WfuMeta(_) => true,
         Expr::BinOp { left, right, .. } => contains_system_var(left) || contains_system_var(right),
         Expr::Neg(inner) => contains_system_var(inner),
         Expr::FuncCall { args, .. } => args.iter().any(contains_system_var),
@@ -59,6 +59,12 @@ pub(super) fn materialize_system_vars(
         Expr::SystemVar(SystemVar::EmitTime) => {
             Some(utils::time_nanos_to_expr(score.emit_time_nanos?))
         }
+        Expr::WfuMeta(field) => match score.resolve_wfu_meta(*field)? {
+            Value::Number(n) => Some(Expr::Number(n)),
+            Value::Str(s) => Some(Expr::StringLit(s)),
+            Value::Bool(b) => Some(Expr::Bool(b)),
+            _ => None,
+        },
         Expr::Field(fr) => Some(Expr::Field(fr.clone())),
         Expr::BinOp { op, left, right } => Some(Expr::BinOp {
             op: *op,

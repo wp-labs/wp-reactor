@@ -65,12 +65,12 @@ rule r {
 }
 
 #[test]
-fn yield_multiple_system_fields() {
+fn yield_multiple_wfu_reserved_fields() {
     let out = make_output_window(
         "out",
         vec![
-            ("entity_id", bt(BaseType::Chars)),
-            ("score_contrib", bt(BaseType::Chars)),
+            ("__wfu_entity_id", bt(BaseType::Chars)),
+            ("__wfu_score", bt(BaseType::Float)),
         ],
     );
     let input = r#"
@@ -78,15 +78,18 @@ rule r {
     events { e : auth_events }
     match<:5m> { on event { e | count >= 1; } } -> score(50.0)
     entity(ip, e.sip)
-    yield out (entity_id = "foo", score_contrib = "bar")
+    yield out (__wfu_entity_id = "foo", __wfu_score = 50.5)
 }
 "#;
     let errs = check_errors(input, &[auth_events_window(), out]);
-    let system_errors: Vec<_> = errs.iter().filter(|e| e.contains("system field")).collect();
+    let system_errors: Vec<_> = errs
+        .iter()
+        .filter(|e| e.contains("reserved prefix"))
+        .collect();
     assert_eq!(
         system_errors.len(),
         2,
-        "expected 2 system field errors, got: {:?}",
+        "expected 2 reserved prefix errors, got: {:?}",
         system_errors
     );
 }

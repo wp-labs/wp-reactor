@@ -5,7 +5,7 @@ use crate::checker::scope::{self, Scope};
 use crate::checker::types::{check_expr_type_with_system_vars, compatible, infer_type};
 use crate::checker::{CheckError, Severity};
 
-use super::{SYSTEM_FIELDS, WFU_PREFIX};
+use super::WFU_PREFIX;
 
 pub fn check_yield(
     rule: &RuleDecl,
@@ -99,19 +99,7 @@ pub fn check_yield(
             }
 
             for arg in &yc.args {
-                // T36/Y8: no system fields in yield arguments
-                if SYSTEM_FIELDS.contains(&arg.name.as_str()) {
-                    errors.push(CheckError {
-                        severity: Severity::Error,
-                        rule: Some(name.to_string()),
-                        test: None,
-                        message: format!(
-                            "yield argument `{}` is a system field and cannot be manually assigned",
-                            arg.name
-                        ),
-                    });
-                    continue;
-                }
+                // T36/Y8: no wfusion-managed fields in yield arguments.
                 if arg.name.starts_with(WFU_PREFIX) {
                     errors.push(CheckError {
                         severity: Severity::Error,

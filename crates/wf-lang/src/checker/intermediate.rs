@@ -2,14 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::RuleDecl;
 use crate::checker::{CheckError, Severity};
-use crate::schema::{BaseType, FieldDef, FieldType, WindowSchema};
-
-const INTERMEDIATE_SYSTEM_FIELDS: &[(&str, BaseType)] = &[
-    ("__wfu_score", BaseType::Float),
-    ("__wfu_rule_name", BaseType::Chars),
-    ("__wfu_entity_type", BaseType::Chars),
-    ("__wfu_entity_id", BaseType::Chars),
-];
+use crate::schema::{FieldDef, FieldType, WindowSchema};
+use crate::wfu_meta::WFU_INTERMEDIATE_META_FIELDS;
 
 pub fn effective_schemas_for_rules(
     rules: &[RuleDecl],
@@ -21,11 +15,11 @@ pub fn effective_schemas_for_rules(
         .cloned()
         .map(|mut schema| {
             if intermediate_targets.contains(schema.name.as_str()) {
-                for (name, base_type) in INTERMEDIATE_SYSTEM_FIELDS {
-                    if !schema.fields.iter().any(|field| field.name == *name) {
+                for field in WFU_INTERMEDIATE_META_FIELDS.iter().copied() {
+                    if !schema.fields.iter().any(|f| f.name == field.name()) {
                         schema.fields.push(FieldDef {
-                            name: (*name).to_string(),
-                            field_type: FieldType::Base(base_type.clone()),
+                            name: field.name().to_string(),
+                            field_type: FieldType::Base(field.base_type()),
                         });
                     }
                 }

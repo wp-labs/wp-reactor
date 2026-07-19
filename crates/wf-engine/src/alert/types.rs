@@ -18,17 +18,10 @@ use crate::match_engine::CloseReason;
 use crate::match_engine::Value;
 use crate::time::normalize_epoch_timestamp_float_nanos;
 
-pub const WFU_ID: &str = "__wfu_id";
-pub const WFU_RULE_NAME: &str = "__wfu_rule_name";
-pub const WFU_SCORE: &str = "__wfu_score";
-pub const WFU_ENTITY_TYPE: &str = "__wfu_entity_type";
-pub const WFU_ENTITY_ID: &str = "__wfu_entity_id";
-pub const WFU_ORIGIN: &str = "__wfu_origin";
-pub const WFU_CLOSE_REASON: &str = "__wfu_close_reason";
-pub const WFU_FIRED_AT: &str = "__wfu_fired_at";
-pub const WFU_EMIT_TIME: &str = "__wfu_emit_time";
-pub const WFU_SUMMARY: &str = "__wfu_summary";
-pub const WFU_PREFIX: &str = "__wfu_";
+pub use wf_lang::wfu_meta::{
+    WFU_CLOSE_REASON, WFU_EMIT_TIME, WFU_ENTITY_ID, WFU_ENTITY_TYPE, WFU_FIRED_AT, WFU_ID,
+    WFU_ORIGIN, WFU_PREFIX, WFU_RULE_NAME, WFU_SCORE, WFU_SUMMARY,
+};
 
 /// Which path produced this alert.
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq)]

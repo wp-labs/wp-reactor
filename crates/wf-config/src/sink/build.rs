@@ -7,8 +7,7 @@ use super::group::{FixedGroup, FlexGroup, ResolvedRouteSink};
 use super::route::{RouteGroup, RouteSink};
 use super::types::{ParamMap, WildArray};
 use crate::error::{ConfigReason, ConfigResult};
-
-const WFU_META_PREFIX: &str = "__wfu_";
+use wf_lang::wfu_meta::WFU_PREFIX;
 
 // ---------------------------------------------------------------------------
 // Parameter merging
@@ -169,10 +168,10 @@ pub fn build_fixed_group(
 
 fn validate_wf_meta_disable_fields(fields: &[String]) -> ConfigResult<()> {
     for field in fields {
-        if !field.starts_with(WFU_META_PREFIX) {
+        if !field.starts_with(WFU_PREFIX) {
             return ConfigReason::Sink.fail(format!(
                 "wf_meta_disable field {:?} must start with {:?}",
-                field, WFU_META_PREFIX
+                field, WFU_PREFIX
             ));
         }
     }

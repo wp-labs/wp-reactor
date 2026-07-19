@@ -32,17 +32,17 @@ rule r {
 }
 
 #[test]
-fn yield_system_field() {
+fn yield_allows_plain_score_field() {
     let out = make_output_window("out", vec![("score", bt(BaseType::Float))]);
     let input = r#"
 rule r {
     events { e : auth_events }
     match<:5m> { on event { e | count >= 1; } } -> score(50.0)
     entity(ip, e.sip)
-    yield out (score = 50.0)
+    yield out (score = 50.5)
 }
 "#;
-    assert_has_error(input, &[auth_events_window(), out], "system field");
+    assert_no_errors(input, &[auth_events_window(), out]);
 }
 
 #[test]
@@ -57,6 +57,61 @@ rule r {
 }
 "#;
     assert_has_error(input, &[auth_events_window(), out], "uses reserved prefix");
+}
+
+#[test]
+fn yield_allows_mapping_wfu_meta_to_plain_fields() {
+    let out = make_output_window(
+        "out",
+        vec![
+            ("rule_name", bt(BaseType::Chars)),
+            ("score", bt(BaseType::Float)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        rule_name = @__wfu_rule_name,
+        score = @__wfu_score
+    )
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn yield_checks_wfu_meta_type() {
+    let out = make_output_window("out", vec![("rule_name", bt(BaseType::Chars))]);
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (rule_name = @__wfu_score)
+}
+"#;
+    assert_has_error(input, &[auth_events_window(), out], "type mismatch");
+}
+
+#[test]
+fn wfu_meta_refs_are_yield_only() {
+    let out = make_output_window("out", vec![("x", bt(BaseType::Ip))]);
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(@__wfu_score)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), out],
+        "only allowed in `yield`",
+    );
 }
 
 #[test]

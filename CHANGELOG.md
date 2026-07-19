@@ -2,7 +2,7 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [0.1.32 Unreleased]
+## [0.1.33 Unreleased]
 
 ### Changed
 
@@ -14,9 +14,12 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Added
 
+- **wf-lang / wf-engine / wf-runtime**: Added yield-only wfusion metadata references such as `@__wfu_rule_name` and `@__wfu_score`, allowing rules to map engine-managed metadata into ordinary output fields while keeping `__wfu_*` yield targets reserved.
+- **wf-lang**: Added a centralized wfusion metadata field directory, including field names, types, yield availability, and a restricted intermediate-window metadata subset for automatic pipeline fields.
 - **wf-lang / wf-engine**: Added yield-only time system variables `@event_first_time`, `@event_last_time`, `@evidence_start_time`, `@evidence_end_time`, `@window_start_time`, `@window_end_time`, and `@emit_time`.
 - **wf-lang / wf-engine**: Added yield-only stable stat context functions: `stat.count(window_event(alias))`, `stat.count(match_event(label))`, `stat.count(match_distinct(label))`, `stat.value(trigger(label))`, and `stat.value(final(label))`.
 - **User guide / design**: Documented the time system variables, stable stat context functions, and recommended business-field mappings such as `first_seen`, `last_seen`, `rule_window_start`, and `latest_analysis_time`.
+- **Design docs**: Documented wfusion-managed metadata field semantics, including `rule_name = @__wfu_rule_name`, reserved `__wfu_*` output targets, yield-only access, and sink-stage `wf_meta_disable` behavior.
 - **wf-engine tests**: Added sink-runtime send-path coverage for `wf_meta_disable` wildcard matching, including projection-before-disable behavior.
 
 ### Fixed

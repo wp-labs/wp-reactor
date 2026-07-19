@@ -27,6 +27,7 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
             | SystemVar::WindowEndTime
             | SystemVar::EmitTime,
         ) => Some(ValType::Base(BaseType::Time)),
+        Expr::WfuMeta(field) => Some(ValType::Base(field.base_type())),
         Expr::Field(fref) => scope.resolve_field_ref(fref).ok().flatten(),
         Expr::Object(_) => Some(ValType::Object),
         Expr::Array(items) => infer_array_type(items, scope),

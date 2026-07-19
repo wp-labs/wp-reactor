@@ -18,6 +18,7 @@ use wf_engine::match_engine::{
 };
 use wf_engine::window::{AppendOutcome, Router};
 use wf_lang::plan::ConvPlan;
+use wf_lang::wfu_meta::{WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
 
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::metrics::RuntimeMetrics;
@@ -27,23 +28,6 @@ use super::task_types::{RuleTaskConfig, WindowSource};
 use super::window_lookup::RegistryLookup;
 
 const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
-type WindowSystemFieldGetter = fn(&OutputRecord) -> wf_engine::match_engine::Value;
-type WindowSystemField = (&'static str, WindowSystemFieldGetter);
-
-const WINDOW_SYSTEM_FIELDS: &[WindowSystemField] = &[
-    ("__wfu_score", |record| {
-        wf_engine::match_engine::Value::Number(record.score)
-    }),
-    ("__wfu_rule_name", |record| {
-        wf_engine::match_engine::Value::Str(record.rule_name.clone())
-    }),
-    ("__wfu_entity_type", |record| {
-        wf_engine::match_engine::Value::Str(record.entity_type.clone())
-    }),
-    ("__wfu_entity_id", |record| {
-        wf_engine::match_engine::Value::Str(record.entity_id.clone())
-    }),
-];
 
 // ---------------------------------------------------------------------------
 // RuleTask -- runtime state for a single rule
@@ -483,12 +467,30 @@ pub(super) fn build_pipeline_batch(
 fn record_window_fields(record: &OutputRecord) -> Vec<(String, wf_engine::match_engine::Value)> {
     let mut fields = record.yield_fields.clone();
     let existing: HashSet<String> = fields.iter().map(|(name, _)| name.clone()).collect();
-    for (name, builder) in WINDOW_SYSTEM_FIELDS {
-        if !existing.contains(*name) {
-            fields.push(((*name).to_string(), builder(record)));
+    for field in WFU_INTERMEDIATE_META_FIELDS.iter().copied() {
+        if !existing.contains(field.name()) {
+            fields.push((
+                field.name().to_string(),
+                record_wfu_intermediate_meta_value(record, field),
+            ));
         }
     }
     fields
+}
+
+fn record_wfu_intermediate_meta_value(
+    record: &OutputRecord,
+    field: WfuIntermediateMetaField,
+) -> wf_engine::match_engine::Value {
+    use wf_engine::match_engine::Value;
+    use wf_lang::wfu_meta::WfuIntermediateMetaField;
+
+    match field {
+        WfuIntermediateMetaField::RuleName => Value::Str(record.rule_name.clone()),
+        WfuIntermediateMetaField::Score => Value::Number(record.score),
+        WfuIntermediateMetaField::EntityType => Value::Str(record.entity_type.clone()),
+        WfuIntermediateMetaField::EntityId => Value::Str(record.entity_id.clone()),
+    }
 }
 
 fn event_time_nanos(event: &wf_engine::match_engine::Event, time_field: Option<&str>) -> i64 {

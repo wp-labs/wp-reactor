@@ -1,5 +1,6 @@
 use wf_lang::ast::{BinOp, Expr, FieldRef, ObjectItem, SystemVar};
 use wf_lang::plan::{EachPlan, StepPlan, YieldField};
+use wf_lang::wfu_meta::WfuMetaField;
 
 use crate::match_engine::RuleExecutor;
 use crate::match_engine::Value;
@@ -45,6 +46,48 @@ fn execute_each_yield_can_reference_score() {
             .map(|(_, value)| value.clone()),
         Some(num(10.0))
     );
+}
+
+#[test]
+fn execute_each_yield_can_map_wfu_meta_to_plain_fields() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "rule_name".to_string(),
+            value: Expr::WfuMeta(WfuMetaField::RuleName),
+        },
+        YieldField {
+            name: "score".to_string(),
+            value: Expr::WfuMeta(WfuMetaField::Score),
+        },
+    ];
+    let exec = RuleExecutor::new(plan);
+
+    let alert = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), 1_000_000)
+        .unwrap()
+        .unwrap();
+
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(field("rule_name"), Some(str_val("r1")));
+    assert_eq!(field("score"), Some(num(10.0)));
 }
 
 #[test]
@@ -337,6 +380,17 @@ fn execute_match_yield_can_use_score_inside_builtin_expr() {
                 ],
             },
         },
+        YieldField {
+            name: "rule_message".to_string(),
+            value: Expr::FuncCall {
+                qualifier: None,
+                name: "concat".to_string(),
+                args: vec![
+                    Expr::WfuMeta(WfuMetaField::RuleName),
+                    Expr::StringLit("-alert".to_string()),
+                ],
+            },
+        },
     ];
     let exec = RuleExecutor::new(plan);
 
@@ -357,6 +411,14 @@ fn execute_match_yield_can_use_score_inside_builtin_expr() {
             .find(|(name, _)| name == "message")
             .map(|(_, value)| value.clone()),
         Some(str_val("risk=70.126"))
+    );
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(name, _)| name == "rule_message")
+            .map(|(_, value)| value.clone()),
+        Some(str_val("r1-alert"))
     );
 }
 
@@ -399,10 +461,16 @@ fn execute_close_yield_can_reference_score() {
         "ip",
         Expr::Field(FieldRef::Simple("sip".to_string())),
     );
-    plan.yield_plan.fields = vec![YieldField {
-        name: "risk_score".to_string(),
-        value: Expr::SystemVar(SystemVar::Score),
-    }];
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "risk_score".to_string(),
+            value: Expr::SystemVar(SystemVar::Score),
+        },
+        YieldField {
+            name: "close_reason".to_string(),
+            value: Expr::WfuMeta(WfuMetaField::CloseReason),
+        },
+    ];
     let exec = RuleExecutor::new(plan);
     let close = CloseOutput {
         rule_name: "r1".to_string(),
@@ -441,6 +509,14 @@ fn execute_close_yield_can_reference_score() {
             .find(|(name, _)| name == "risk_score")
             .map(|(_, value)| value.clone()),
         Some(num(70.0))
+    );
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(name, _)| name == "close_reason")
+            .map(|(_, value)| value.clone()),
+        Some(str_val("timeout"))
     );
 }
 
