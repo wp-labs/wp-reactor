@@ -532,7 +532,7 @@ ANY           = ? any unicode char ? ;
 | `len` | `len(field)` → digit | L2 | 字符串长度 |
 | `lower` | `lower(field)` → chars | L2 | 转小写 |
 | `upper` | `upper(field)` → chars | L2 | 转大写 |
-| `coalesce` | `coalesce(expr, default)` → T | L2 | 局部空值兜底（优先于全局 lenient） |
+| `coalesce` | `coalesce(v1, v2, ...)` → T | L2 | 按顺序取第一个非 null 且非 blank 字符串的值 |
 | `isnull` / `isnotnull` | `isnull(expr)` / `isnotnull(expr)` → bool | L2 | 空值检查 |
 | `abs`/`ceil`/`floor`/`round`/`sqrt`/`exp`/`sign`/`trunc`/`pow`/`log`/`clamp`/`is_finite` | 数学函数 | L2 | 数值表达式辅助函数 |
 | `strftime` / `strptime` | 时间格式化/解析 | L2 | time/chars 转换 |
@@ -1240,7 +1240,7 @@ rule final_risk {
 | T44 | `close_reason` 类型为 `chars`，仅允许与字符串字面量 `"timeout"`/`"flush"`/`"eos"` 比较 |
 | T45 | 在 `on event` 中引用 `close_reason` 编译错误 |
 | T46 | `yield` 中引用 `close_reason` 时类型为 `chars?`（nullable），需与目标字段类型一致 |
-| T47 | `coalesce(a, b)` 中 `a` 与 `b` 类型必须一致；返回该类型 |
+| T47 | `coalesce(a, b, ...)` 至少需要 1 个参数；运行时按顺序跳过 null 和 blank 字符串。普通表达式要求参数类型兼容，直接作为 `yield` 赋值表达式时可由目标字段继续校验/转换混合标量类型 |
 | T48 | `try(expr, default)` 为规划函数，当前未实现 |
 | T49 | `join ... asof` 中 `asof` 右表必须具备版本时间列（由 window `time` 字段声明） |
 | T50 | `join ... asof within DURATION` 中 `within` 必须 > 0；省略 `within` 时使用运行时默认值 |

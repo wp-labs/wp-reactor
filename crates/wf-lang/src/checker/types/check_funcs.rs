@@ -47,6 +47,7 @@ pub fn check_func_call(
     scope: &Scope<'_>,
     rule_name: &str,
     allow_l3_funcs: bool,
+    allow_mixed_coalesce: bool,
     errors: &mut Vec<CheckError>,
 ) {
     if qualifier == Some("stat") && matches!(name, "count" | "value") {
@@ -524,7 +525,7 @@ pub fn check_func_call(
                     test: None,
                     message: "coalesce() requires at least 1 argument".to_string(),
                 });
-            } else {
+            } else if !allow_mixed_coalesce {
                 let mut first_type: Option<ValType> = None;
                 for (idx, arg) in args.iter().enumerate() {
                     let Some(inferred) = infer_type(arg, scope) else {

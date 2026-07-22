@@ -56,7 +56,7 @@ use super::{eval_expr_ext, values_equal};
 /// - `replace_plain(text, from, to)` → Str
 /// - `startswith_any(text, prefix1, prefix2, ...)` → Bool
 /// - `endswith_any(text, suffix1, suffix2, ...)` → Bool
-/// - `coalesce(v1, v2, ...)` → first non-null value
+/// - `coalesce(v1, v2, ...)` → first non-null and non-blank string value
 /// - `isnull(expr)` → Bool
 /// - `isnotnull(expr)` → Bool
 /// - `is_blank(expr)` → Bool
@@ -637,6 +637,9 @@ pub(super) fn eval_func_call(
             }
             for arg in args {
                 if let Some(v) = eval_expr_ext(arg, event, windows, baselines) {
+                    if matches!(&v, Value::Str(s) if is_blank_str(s)) {
+                        continue;
+                    }
                     return Some(v);
                 }
             }

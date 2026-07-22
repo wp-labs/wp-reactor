@@ -16,17 +16,18 @@ pub fn check_expr_type(
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
-    check_expr_type_inner(expr, scope, rule_name, true, false, errors);
+    check_expr_type_inner(expr, scope, rule_name, true, false, false, errors);
 }
 
-/// Type-check an expression while allowing system variables such as `@score`.
-pub fn check_expr_type_with_system_vars(
+/// Type-check a yield expression while allowing target-field coercion to
+/// resolve mixed `coalesce(...)` result types.
+pub fn check_yield_expr_type_with_system_vars(
     expr: &Expr,
     scope: &Scope<'_>,
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
-    check_expr_type_inner(expr, scope, rule_name, true, true, errors);
+    check_expr_type_inner(expr, scope, rule_name, true, true, true, errors);
 }
 
 /// Type-check a guard expression. Guard context does not allow L3 functions.
@@ -36,7 +37,7 @@ pub fn check_guard_expr_type(
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
-    check_expr_type_inner(expr, scope, rule_name, false, false, errors);
+    check_expr_type_inner(expr, scope, rule_name, false, false, false, errors);
 }
 
 fn check_expr_type_inner(
@@ -45,6 +46,7 @@ fn check_expr_type_inner(
     rule_name: &str,
     allow_l3_funcs: bool,
     allow_yield_context: bool,
+    allow_mixed_coalesce: bool,
     errors: &mut Vec<CheckError>,
 ) {
     match expr {
@@ -55,6 +57,7 @@ fn check_expr_type_inner(
                 rule_name,
                 allow_l3_funcs,
                 allow_yield_context,
+                false,
                 errors,
             );
             check_expr_type_inner(
@@ -63,6 +66,7 @@ fn check_expr_type_inner(
                 rule_name,
                 allow_l3_funcs,
                 allow_yield_context,
+                false,
                 errors,
             );
 
@@ -189,6 +193,7 @@ fn check_expr_type_inner(
                 rule_name,
                 allow_l3_funcs,
                 allow_yield_context,
+                false,
                 errors,
             );
             if let Some(ref t) = infer_type(inner, scope)
@@ -227,6 +232,7 @@ fn check_expr_type_inner(
                         rule_name,
                         allow_l3_funcs,
                         allow_yield_context,
+                        false,
                         errors,
                     );
                 }
@@ -238,6 +244,7 @@ fn check_expr_type_inner(
                 scope,
                 rule_name,
                 allow_l3_funcs,
+                allow_mixed_coalesce,
                 errors,
             );
         }
@@ -250,6 +257,7 @@ fn check_expr_type_inner(
                     rule_name,
                     allow_l3_funcs,
                     allow_yield_context,
+                    false,
                     errors,
                 );
                 if let Some(type_hint) = &item.type_hint {
@@ -288,6 +296,7 @@ fn check_expr_type_inner(
                     rule_name,
                     allow_l3_funcs,
                     allow_yield_context,
+                    false,
                     errors,
                 );
             }
@@ -301,6 +310,7 @@ fn check_expr_type_inner(
                 rule_name,
                 allow_l3_funcs,
                 allow_yield_context,
+                false,
                 errors,
             );
             for item in list {
@@ -310,6 +320,7 @@ fn check_expr_type_inner(
                     rule_name,
                     allow_l3_funcs,
                     allow_yield_context,
+                    false,
                     errors,
                 );
             }
@@ -360,6 +371,7 @@ fn check_expr_type_inner(
                 rule_name,
                 allow_l3_funcs,
                 allow_yield_context,
+                false,
                 errors,
             );
             check_expr_type_inner(
@@ -368,6 +380,7 @@ fn check_expr_type_inner(
                 rule_name,
                 allow_l3_funcs,
                 allow_yield_context,
+                false,
                 errors,
             );
             check_expr_type_inner(
@@ -376,6 +389,7 @@ fn check_expr_type_inner(
                 rule_name,
                 allow_l3_funcs,
                 allow_yield_context,
+                false,
                 errors,
             );
 

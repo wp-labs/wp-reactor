@@ -62,7 +62,7 @@ wfl explain rules/action_string_set_ops.wfl --schemas "schemas/*.wfs"
 
 - 数值：`abs` `round` `ceil` `floor` `sqrt` `pow` `log` `exp` `clamp` `sign` `trunc` `is_finite`
 - 字符串：`ltrim` `rtrim` `concat` `indexof` `replace_plain` `startswith_any` `endswith_any`
-- 空值：`coalesce` `isnull` `isnotnull`
+- 空值/空白：`coalesce` `isnull` `isnotnull`
 - 多值：`mvsort` `mvreverse`
 - 时间：`strftime` `strptime`
 
@@ -89,7 +89,7 @@ wfl replay rules/top50_function_showcase.wfl --schemas "schemas/*.wfs" \
 - `log_v = 2`
 - `clamp_v = 100`
 - `replace_plain_v = "a-b-c"`
-- `coalesce_v = "fallback"`
+- `coalesce_v = "fallback"`（`coalesce` 按顺序跳过 null 和 blank 字符串）
 - `isnull_v = true`
 - `mvsort_v = ["a","b","c"]`
 - `mvreverse_v = ["c","a","b"]`

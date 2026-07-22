@@ -2,7 +2,9 @@ use crate::ast::{CloseMode, Expr, RuleDecl};
 use crate::schema::WindowSchema;
 
 use crate::checker::scope::{self, Scope};
-use crate::checker::types::{check_expr_type_with_system_vars, infer_type, yield_assignable};
+use crate::checker::types::{
+    ValType, check_yield_expr_type_with_system_vars, infer_type, yield_assignable,
+};
 use crate::checker::{CheckError, Severity};
 
 use super::WFU_PREFIX;
@@ -129,25 +131,72 @@ pub fn check_yield(
                     }
                     Some(fd) => {
                         // T10: type must match
-                        check_expr_type_with_system_vars(&arg.value, scope, name, errors);
-                        if let Some(val_type) = infer_type(&arg.value, scope) {
-                            let expected = scope::field_type_to_val(&fd.field_type);
-                            if !yield_assignable(&expected, &val_type) {
-                                errors.push(CheckError {
-                                    severity: Severity::Error,
-                                    rule: Some(name.to_string()),
-                                    test: None,
-                                    message: format!(
-                                        "yield argument `{}` type mismatch: expected {:?}, got {:?}",
-                                        arg.name, expected, val_type
-                                    ),
-                                });
-                            }
-                        }
+                        check_yield_expr_type_with_system_vars(&arg.value, scope, name, errors);
+                        let expected = scope::field_type_to_val(&fd.field_type);
+                        check_yield_assignable(
+                            &arg.name, &arg.value, &expected, scope, name, errors,
+                        );
                     }
                 }
             }
         }
+    }
+}
+
+fn check_yield_assignable(
+    yield_arg_name: &str,
+    expr: &Expr,
+    expected: &ValType,
+    scope: &Scope<'_>,
+    rule_name: &str,
+    errors: &mut Vec<CheckError>,
+) {
+    if let Some(args) = direct_coalesce_args(expr) {
+        for (idx, arg) in args.iter().enumerate() {
+            let Some(val_type) = infer_type(arg, scope) else {
+                continue;
+            };
+            if !yield_assignable(expected, &val_type) {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "yield argument `{}` coalesce() argument {} type mismatch: expected {:?}, got {:?}",
+                        yield_arg_name,
+                        idx + 1,
+                        expected,
+                        val_type
+                    ),
+                });
+            }
+        }
+        return;
+    }
+
+    if let Some(val_type) = infer_type(expr, scope)
+        && !yield_assignable(expected, &val_type)
+    {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!(
+                "yield argument `{}` type mismatch: expected {:?}, got {:?}",
+                yield_arg_name, expected, val_type
+            ),
+        });
+    }
+}
+
+fn direct_coalesce_args(expr: &Expr) -> Option<&[Expr]> {
+    match expr {
+        Expr::FuncCall {
+            qualifier: None,
+            name,
+            args,
+        } if name == "coalesce" => Some(args),
+        _ => None,
     }
 }
 

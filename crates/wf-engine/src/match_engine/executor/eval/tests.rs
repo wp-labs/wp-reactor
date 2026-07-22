@@ -388,6 +388,23 @@ fn test_blank_functions_work_in_yield_eval() {
             Expr::Field(FieldRef::Simple("fallback".to_string())),
         ],
     };
+    let coalesce_direct_blank_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "coalesce".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("spaces".to_string())),
+            Expr::Field(FieldRef::Simple("host".to_string())),
+        ],
+    };
+    let coalesce_all_blank_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "coalesce".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("empty".to_string())),
+            Expr::Field(FieldRef::Simple("spaces".to_string())),
+            Expr::Field(FieldRef::Simple("missing".to_string())),
+        ],
+    };
     let invalid_type_expr = Expr::FuncCall {
         qualifier: None,
         name: "is_blank".to_string(),
@@ -429,6 +446,14 @@ fn test_blank_functions_work_in_yield_eval() {
     assert_eq!(
         eval_yield_expr(&coalesce_blank_expr, &ctx),
         Some(Value::Str("fallback".to_string()))
+    );
+    assert_eq!(
+        eval_yield_expr(&coalesce_direct_blank_expr, &ctx),
+        Some(Value::Str("example.org".to_string()))
+    );
+    assert_eq!(
+        eval_yield_expr(&coalesce_all_blank_expr, &ctx),
+        Some(Value::Str(String::new()))
     );
     assert_eq!(
         eval_yield_expr(&invalid_type_expr, &ctx),

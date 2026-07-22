@@ -512,7 +512,7 @@ WFL 在 `match` 条件和 `yield` 赋值中均可使用内置函数：
 | | `split(s, sep)` | 拆分为多值数组 |
 | **多值** | `mvindex(arr, i)`, `mvsort(arr)`, `mvreverse(arr)` | 数组操作 |
 | | `mvjoin(arr, sep)` | 数组拼接为字符串 |
-| **空值** | `coalesce(a, fallback)`, `isnull`, `isnotnull` | NULL 处理 |
+| **空值/空白** | `coalesce(a, b, ...)`, `isnull`, `isnotnull` | 按顺序取第一个非 null 且非 blank 字符串的值 |
 | **时间** | `strptime(s, fmt)`, `strftime(t, fmt)` | 时间解析与格式化 |
 | **条件** | `if cond then a else b` | 三目条件表达式 |
 

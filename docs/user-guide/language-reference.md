@@ -713,7 +713,7 @@ events {
 
 | 函数 | 返回类型 | 说明 |
 |------|----------|------|
-| `coalesce(v1, v2, ...)` | 首个非空参数的类型 | 返回第一个非 null / 可求值的参数 |
+| `coalesce(v1, v2, ...)` | 首个非空参数的类型 | 返回第一个非 null / 可求值且非 blank 字符串的参数 |
 | `isnull(expr)` | `bool` | 参数不可求值时返回 `true` |
 | `isnotnull(expr)` | `bool` | 参数可求值时返回 `true` |
 | `is_blank(text)` | `bool` | `text` 缺失、空字符串或全空白字符时返回 `true` |
@@ -725,11 +725,11 @@ events {
 ```wfl
 yield out (
     user = default_if_blank(e.user, "unknown"),
-    src = coalesce(null_if_blank(e.src), e.sip)
+    src = coalesce(e.source_host, e.target_host, e.sip)
 )
 ```
 
-`is_blank`、`null_if_blank`、`default_if_blank` 的参数必须是 `chars`。其中 `null_if_blank(...)` 常和 `coalesce(...)` 组合使用。
+`coalesce(...)` 会跳过缺失字段、空字符串和全空白字符串；其他类型的可求值参数视为非空，直接作为 `yield` 字段赋值表达式时可继续按目标字段类型转换。`is_blank`、`null_if_blank`、`default_if_blank` 的参数必须是 `chars`。
 
 #### 当前引擎时间
 

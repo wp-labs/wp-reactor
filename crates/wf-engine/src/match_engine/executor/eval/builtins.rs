@@ -685,6 +685,9 @@ pub(super) fn eval_builtin_func_with_l3(
             }
             for arg in args {
                 if let Some(v) = eval_expr_with_l3(arg, ctx, score) {
+                    if matches!(&v, Value::Str(s) if utils::is_blank_str(s)) {
+                        continue;
+                    }
                     return Some(v);
                 }
             }
