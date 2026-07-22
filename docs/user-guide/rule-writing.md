@@ -495,7 +495,33 @@ rule enrich_each {
 
 ---
 
-## 7. 内置函数速查
+## 7. 复用公共 Yield 字段
+
+`yield preset` 用于把多条规则都会输出的公共字段集中定义，再在具体 `yield` 中组合使用。
+
+```wfl
+yield preset base_alerts (
+    rule_name = @__wfu_rule_name,
+    score = @score,
+    source = "wfl"
+)
+
+rule scan {
+    ...
+    yield security_alerts : base_alerts (
+        alert_type = "scan",
+        ioc_value = e.dip
+    )
+}
+```
+
+组合规则为：从左到右展开 preset，后者覆盖前者，当前 `yield (...)` 覆盖所有 preset；最终字段集合仍按目标 output window 做强校验。
+
+未来可将项目级公共 preset 放入 `global.wfl` / project prelude；prelude 只承载公共声明，不应自动启用普通检测规则。
+
+---
+
+## 8. 内置函数速查
 
 WFL 在 `match` 条件和 `yield` 赋值中均可使用内置函数：
 
@@ -518,7 +544,7 @@ WFL 在 `match` 条件和 `yield` 赋值中均可使用内置函数：
 
 ---
 
-## 8. 规则编写 Checklist
+## 9. 规则编写 Checklist
 
 完成一条规则时，检查以下各项：
 

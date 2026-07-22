@@ -36,6 +36,8 @@
 | `on each alias [where expr]` | 逐条无状态规则 | ✅ 已实现 | 不创建 match instance；不能作为 pipeline stage |
 | `yield` 时间系统变量 | 告警时间语义字段 | ✅ 已实现 | `@event_first_time` / `@event_last_time` / `@evidence_start_time` / `@evidence_end_time` / `@window_start_time` / `@window_end_time` / `@emit_time` |
 | `yield` 引用 wfusion 元字段 | 输出元字段映射为普通字段 | ✅ 已实现 | 支持 `rule_name = @__wfu_rule_name`；左侧仍禁止 `__wfu_*` |
+| `yield preset` | 复用公共输出字段集合 | ✅ 已实现 | 支持 `yield preset name (...)` 与 `yield target : preset1, preset2 (...)` |
+| `global.wfl` / project prelude | 项目级公共声明入口 | ❌ 未实现 | 规划用于承载 `yield preset` 等公共声明，不自动引入可执行 rule |
 | `meta.lang` 强制 | v2.1 治理 | ❌ 未实现 | 当前 checker 未强制每条规则声明 `meta.lang` |
 | `derive { ... }` | L2 特征派生 | ❌ 未实现 | AST/解析/编译链路未接入 derive block |
 | `score { item = expr @ weight; ... }` | L2 可解释评分 | ❌ 未实现 | 当前仅支持 `score(expr)` |
@@ -397,8 +399,11 @@ score_expr    = "score" , "(" , expr , ")" ;                                   (
 entity_clause = "entity" , "(" , entity_type , "," , expr , ")" ;              (* L1：实体声明，规则必选 *)
 entity_type   = IDENT | STRING ;
 
-yield_clause  = "yield" , yield_target , "(" , [ named_arg , { "," , named_arg } , [ "," ] ] , ")" ;
+yield_preset_decl = "yield" , "preset" , IDENT , "(" , [ named_arg , { "," , named_arg } , [ "," ] ] , ")" ;
+yield_clause  = "yield" , yield_target , [ ":" , yield_preset_ref , { "," , yield_preset_ref } ] ,
+                "(" , [ named_arg , { "," , named_arg } , [ "," ] ] , ")" ;
 yield_target  = IDENT , [ "@" , "v" , INTEGER ] ;
+yield_preset_ref = IDENT ;
 named_arg     = yield_field , "=" , expr ;
 yield_field   = IDENT ;
 
@@ -1120,6 +1125,11 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 - `score`、`entity_type`、`entity_id` 为系统字段，禁止在 `yield` 命名参数中手工赋值；`score_contrib` 为规划系统字段。
 - `__wfu_*` 为中间输出保留前缀，禁止在 `yield` 命名参数中手工赋值。
 - `yield target[@vN] (...)` 为当前写法；`yield (...)` 隐式目标为规划项，当前解析器不接受。
+- `yield preset name (...)` 用于定义一组可复用的 yield 字段赋值；preset 不单独输出，也不绑定某个目标 window。
+- `yield target[@vN] : preset1, preset2 (...)` 用于组合 preset。展开顺序为从左到右应用 preset，后面的 preset 覆盖前面的同名字段，当前 `yield (...)` 覆盖所有 preset 同名字段；展开后的字段集合仍按 `target` window 做字段存在性、保留前缀和类型校验。
+- preset 中的表达式在使用点作用域解析。推荐 preset 只放常量、`@score`、`@__wfu_*`、时间系统变量和其他与事件 alias 无关的通用表达式；若引用事件 alias，则该 alias 必须在使用 preset 的规则中可解析。
+- preset 当前不支持嵌套引用；同一个 `yield` 中重复引用同名 preset 应报编译错误。
+- `global.wfl` / project prelude 为规划加载机制，可用于集中声明项目级 preset；prelude 不应自动启用普通 `rule`，避免全局文件隐式改变检测行为。
 - 最终 alert 输出与中间 enriched 输出应区分：
   - 最终 alert 记录可保留 `__wfu_fired_at` / `__wfu_emit_time` / `__wfu_origin` 等告警语义字段。
   - 中间 enriched 记录默认不应引入任何时间类 `__wfu_*` 字段，避免把“逐条评分事件”和“最终告警事件”混淆。
@@ -1248,6 +1258,9 @@ rule final_risk {
 | T52 | `meta.lang` 强制为规划治理项，当前未实现 |
 | T53 | `limits` 块省略时发出 Warning；块内 `max_memory/max_instances/max_throttle/on_exceed` 各项可省，省略默认 `None`（不限制）/ `on_exceed` 默认 `throttle`；`on_exceed` 仅允许 `throttle|drop_oldest|fail_rule`。`max_instances` 必须为正整数（> 0）；`max_throttle` 的 count 部分必须为正整数（> 0），unit 仅允许 `s|sec|m|min|h|hr|hour|d|day`；`max_memory` 数值前缀必须 > 0，单位仅允许 `KB|MB|GB`，且单位换算后不得溢出 `usize` |
 | T54 | `CostPlan` 与 `risk_level=high` 发布阻断为规划项，当前未实现 |
+| T55 | `yield preset name (...)` 中 preset 名称在同一文件或 project prelude 作用域内必须唯一 |
+| T56 | `yield target : preset1, preset2 (...)` 中每个 preset 必须已定义；重复引用同一 preset 为编译错误；preset 当前不支持嵌套引用 |
+| T57 | preset 展开后的 yield 字段集合仍必须满足 T10/T36/T51 等全部 yield 约束；preset 本身不绕过目标 window 字段校验 |
 
 **静态引用解析：**
 

@@ -42,6 +42,26 @@ pub(super) fn entity_clause(input: &mut &str) -> ModalResult<EntityClause> {
 // yield clause
 // ---------------------------------------------------------------------------
 
+pub(super) fn yield_preset_decl(input: &mut &str) -> ModalResult<YieldPresetDecl> {
+    ws_skip.parse_next(input)?;
+    kw("yield").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(kw("preset")).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+
+    let name = cut_err(ident)
+        .context(StrContext::Expected(StrContextValue::Description(
+            "yield preset name",
+        )))
+        .parse_next(input)?
+        .to_string();
+
+    ws_skip.parse_next(input)?;
+    let args = cut_err(named_args_parens).parse_next(input)?;
+
+    Ok(YieldPresetDecl { name, args })
+}
+
 pub(super) fn yield_clause(input: &mut &str) -> ModalResult<YieldClause> {
     kw("yield").parse_next(input)?;
     ws_skip.parse_next(input)?;
@@ -63,23 +83,39 @@ pub(super) fn yield_clause(input: &mut &str) -> ModalResult<YieldClause> {
     };
 
     ws_skip.parse_next(input)?;
+    let presets = if opt(literal(":")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        separated(1.., yield_preset_ref, (ws_skip, literal(","), ws_skip)).parse_next(input)?
+    } else {
+        Vec::new()
+    };
+
+    ws_skip.parse_next(input)?;
+    let args = cut_err(named_args_parens).parse_next(input)?;
+
+    Ok(YieldClause {
+        target,
+        version,
+        presets,
+        args,
+    })
+}
+
+fn named_args_parens(input: &mut &str) -> ModalResult<Vec<NamedArg>> {
     cut_err(literal("(")).parse_next(input)?;
     ws_skip.parse_next(input)?;
-
     let args: Vec<NamedArg> =
         separated(0.., named_arg, (ws_skip, literal(","), ws_skip)).parse_next(input)?;
-
     // Allow trailing comma
     ws_skip.parse_next(input)?;
     let _ = opt(literal(",")).parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(literal(")")).parse_next(input)?;
+    Ok(args)
+}
 
-    Ok(YieldClause {
-        target,
-        version,
-        args,
-    })
+fn yield_preset_ref(input: &mut &str) -> ModalResult<String> {
+    ident.map(str::to_string).parse_next(input)
 }
 
 fn named_arg(input: &mut &str) -> ModalResult<NamedArg> {

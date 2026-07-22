@@ -227,6 +227,37 @@ rule stat_tracking {
 }
 
 #[test]
+fn yield_preset_expression_tracks_bind_fields() {
+    let src = r#"
+yield preset base (
+    x = e.dip
+)
+
+rule preset_tracking {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, "static")
+    yield out : base (
+        y = "ok",
+        n = 1
+    )
+}
+"#;
+    let plans = compile_with(src, &[auth_events_window(), output_window()]);
+    let plan = plans
+        .iter()
+        .find(|plan| plan.name == "preset_tracking")
+        .expect("compiled rule should exist");
+    let fields = plan
+        .match_plan
+        .tracked_bind_fields
+        .get("e")
+        .expect("preset expression should track alias e");
+    assert!(fields.contains("dip"), "yield preset e.dip");
+    assert_eq!(fields.len(), 1, "only preset-referenced field is tracked");
+}
+
+#[test]
 fn yield_expression_collects_aliases() {
     let score_expr = crate::ast::Expr::Number(70.0);
     let entity_expr =

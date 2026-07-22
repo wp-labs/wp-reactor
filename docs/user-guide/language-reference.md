@@ -401,6 +401,45 @@ yield security_alerts@v2 (
 - 它引用的是当前规则的 score，不是上游中间记录里的 `__wfu_score`
 - 如果写了 `@vN`，checker 会校验它与 `meta { contract_version = "N" }` 一致
 
+#### `yield preset`
+
+`yield preset` 用于复用公共输出字段集合，降低每条规则重复填写通用告警字段的成本。
+
+```wfl
+yield preset base_alerts (
+    rule_name = @__wfu_rule_name,
+    score = @score,
+    source = "wfl"
+)
+
+rule scan {
+    ...
+    yield scan_alerts : base_alerts (
+        alert_type = "scan",
+        ioc_value = e.dip
+    )
+}
+```
+
+多个 preset 可按顺序组合：
+
+```wfl
+yield scan_alerts : base_alerts, ioc_fields (
+    alert_type = "scan"
+)
+```
+
+展开语义：
+
+- 从左到右展开 preset
+- 后面的 preset 覆盖前面的同名字段
+- 当前 `yield (...)` 覆盖所有 preset 同名字段
+- 展开后的字段仍按 `yield` 目标 window 做字段存在性、保留前缀和类型校验
+- preset 不单独输出，也不绑定某个目标 window
+- preset 中引用的事件 alias 在使用点解析；推荐 preset 优先放常量、`@score`、`@__wfu_*` 和时间系统变量
+
+未来可通过 `global.wfl` / project prelude 集中声明项目级 preset；prelude 不应自动启用普通 `rule`，避免全局文件隐式改变检测行为。
+
 #### 时间系统变量
 
 这些变量用于把规则命中时间、证据时间和窗口时间输出为业务字段，避免依赖运行时内部的 `__wfu_*` 元数据字段。它们与 `@score` 一样，只允许在 `yield` 表达式中使用。

@@ -148,7 +148,7 @@ pub fn format_check_error_with_source(
     if let Some(rule_name) = &error.rule {
         out.push('\n');
         out.push_str(&format!("rule: {rule_name}"));
-        if let Some(location) = find_rule_error_location(source, rule_name, error, category) {
+        if let Some(location) = find_rule_error_location(file, source, rule_name, error, category) {
             out.push('\n');
             out.push_str(&format!(
                 "location: line {}, column {}",
@@ -223,6 +223,7 @@ fn find_rule_location(source: &str, rule_name: &str) -> Option<SourceLocation> {
 }
 
 fn find_rule_error_location(
+    file: &WflFile,
     source: &str,
     rule_name: &str,
     error: &CheckError,
@@ -232,12 +233,37 @@ fn find_rule_error_location(
     let (start_idx, end_idx, rule_location) = find_rule_source_range(source, rule_name, &lines)?;
 
     let token_needles = primary_backtick_tokens(&error.message, category);
-    if category == "yield"
-        && let Some(yield_location) = find_keyword_location(&lines, start_idx, end_idx, "yield")
-        && let Some(location) =
-            find_token_location_after(&lines, yield_location, end_idx, &token_needles)
-    {
-        return Some(location);
+    if category == "yield" {
+        if let Some(argument) = extract_token_after_label(&error.message, "argument") {
+            if rule_has_explicit_yield_arg(file, rule_name, &argument) {
+                if let Some(yield_location) =
+                    find_keyword_location(&lines, start_idx, end_idx, "yield")
+                    && let Some(location) =
+                        find_named_arg_location_after(&lines, yield_location, end_idx, &argument)
+                {
+                    return Some(location);
+                }
+            } else if let Some(location) = find_referenced_yield_preset_location(
+                file,
+                source,
+                rule_name,
+                std::slice::from_ref(&argument),
+            ) {
+                return Some(location);
+            }
+        } else {
+            if let Some(yield_location) = find_keyword_location(&lines, start_idx, end_idx, "yield")
+                && let Some(location) =
+                    find_token_location_after(&lines, yield_location, end_idx, &token_needles)
+            {
+                return Some(location);
+            }
+            if let Some(location) =
+                find_referenced_yield_preset_location(file, source, rule_name, &token_needles)
+            {
+                return Some(location);
+            }
+        }
     }
 
     if let Some(location) = find_token_location(&lines, start_idx + 1, end_idx, &token_needles) {
@@ -280,6 +306,61 @@ fn find_token_location(
         }
     }
     None
+}
+
+fn find_named_arg_location_after(
+    lines: &[&str],
+    start: SourceLocation,
+    end_idx: usize,
+    arg_name: &str,
+) -> Option<SourceLocation> {
+    for (idx, line) in lines
+        .iter()
+        .enumerate()
+        .take(end_idx)
+        .skip(start.line.saturating_sub(1))
+    {
+        let search_start = if idx + 1 == start.line {
+            start.column.saturating_sub(1).min(line.len())
+        } else {
+            0
+        };
+        if let Some(column) = find_named_arg_column(&line[search_start..], arg_name) {
+            return Some(SourceLocation {
+                line: idx + 1,
+                column: search_start + column,
+            });
+        }
+    }
+    None
+}
+
+fn find_named_arg_column(line: &str, arg_name: &str) -> Option<usize> {
+    let mut rest = line;
+    let mut offset = 0usize;
+    while let Some(pos) = rest.find(arg_name) {
+        let absolute = offset + pos;
+        if is_named_arg_start(line, absolute, arg_name.len())
+            && line[absolute + arg_name.len()..]
+                .trim_start()
+                .starts_with('=')
+        {
+            return Some(absolute + 1);
+        }
+        let next = pos + arg_name.len();
+        offset += next;
+        rest = &rest[next..];
+    }
+    None
+}
+
+fn is_named_arg_start(line: &str, start: usize, len: usize) -> bool {
+    is_keyword_boundary(line, start, len)
+        && previous_non_ws_char(line, start).is_none_or(|ch| ch == '(' || ch == ',')
+}
+
+fn previous_non_ws_char(line: &str, start: usize) -> Option<char> {
+    line[..start].chars().rev().find(|ch| !ch.is_whitespace())
 }
 
 fn find_keyword_location(
@@ -406,6 +487,107 @@ fn extract_token_after_label(message: &str, label: &str) -> Option<String> {
     Some(after_start[..end].to_string())
 }
 
+fn find_referenced_yield_preset_location(
+    file: &WflFile,
+    source: &str,
+    rule_name: &str,
+    token_needles: &[String],
+) -> Option<SourceLocation> {
+    let rule = file.rules.iter().find(|rule| rule.name == rule_name)?;
+    let lines: Vec<&str> = source.lines().collect();
+    for preset_name in rule.yield_clause.presets.iter().rev() {
+        if let Some((start_idx, end_idx)) = find_yield_preset_source_range(&lines, preset_name)
+            && let Some(location) =
+                find_named_arg_location(&lines, start_idx, end_idx, token_needles)
+        {
+            return Some(location);
+        }
+    }
+    None
+}
+
+fn find_yield_preset_source_range(lines: &[&str], preset_name: &str) -> Option<(usize, usize)> {
+    let start_idx = lines
+        .iter()
+        .position(|line| line_declares_yield_preset(line, preset_name))?;
+    let end_idx = lines
+        .iter()
+        .enumerate()
+        .skip(start_idx + 1)
+        .find_map(|(idx, line)| {
+            let trimmed = line.trim_start();
+            (line_starts_yield_preset_decl(line)
+                || trimmed.starts_with("rule ")
+                || trimmed.starts_with("test ")
+                || trimmed.starts_with("pattern "))
+            .then_some(idx)
+        })
+        .unwrap_or(lines.len());
+    Some((start_idx, end_idx))
+}
+
+fn find_named_arg_location(
+    lines: &[&str],
+    start_idx: usize,
+    end_idx: usize,
+    arg_names: &[String],
+) -> Option<SourceLocation> {
+    for arg_name in arg_names.iter().filter(|arg_name| !arg_name.is_empty()) {
+        for (idx, line) in lines.iter().enumerate().take(end_idx).skip(start_idx) {
+            if let Some(column) = find_named_arg_column(line, arg_name) {
+                return Some(SourceLocation {
+                    line: idx + 1,
+                    column,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn line_declares_yield_preset(line: &str, preset_name: &str) -> bool {
+    let Some(rest) = yield_preset_decl_rest(line) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some(after_name) = rest.strip_prefix(preset_name) else {
+        return false;
+    };
+    !after_name.chars().next().is_some_and(is_ident_char)
+}
+
+fn line_starts_yield_preset_decl(line: &str) -> bool {
+    yield_preset_decl_rest(line)
+        .map(str::trim_start)
+        .is_some_and(|rest| rest.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_'))
+}
+
+fn yield_preset_decl_rest(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("yield")?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("preset")?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    Some(rest)
+}
+
+fn rule_has_explicit_yield_arg(file: &WflFile, rule_name: &str, arg_name: &str) -> bool {
+    file.rules
+        .iter()
+        .find(|rule| rule.name == rule_name)
+        .is_some_and(|rule| {
+            rule.yield_clause
+                .args
+                .iter()
+                .any(|arg| arg.name == arg_name)
+        })
+}
+
 fn heuristic_location_needles(error: &CheckError, category: &str) -> Vec<&'static str> {
     let msg = error.message.as_str();
     if msg.contains("not a declared event alias") {
@@ -470,7 +652,8 @@ fn find_rule_source_range(
             let trimmed = line.trim_start();
             (trimmed.starts_with("rule ")
                 || trimmed.starts_with("test ")
-                || trimmed.starts_with("pattern "))
+                || trimmed.starts_with("pattern ")
+                || line_starts_yield_preset_decl(line))
             .then_some(idx)
         })
         .unwrap_or(lines.len());
@@ -776,5 +959,104 @@ rule bad_field {
             format_check_error_with_source(&error, &file, source, "rules/bad_field.wfl".as_ref());
         assert!(text.contains("location: line 5, column 18"), "{text}");
         assert!(text.contains("entity(ip, e.missing)"), "{text}");
+    }
+
+    #[test]
+    fn yield_preset_error_location_falls_back_to_preset_definition() {
+        let source = r#"
+yield preset base_alerts (
+    n = "missing"
+)
+
+rule preset_rule {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base_alerts (
+        x = e.sip
+    )
+}
+"#;
+        let file = parse_wfl(source).unwrap();
+        let err = validate_wfl_with_diagnostics(
+            &file,
+            &[auth_events_window(), output_window()],
+            source,
+            "rules/preset_bad_type.wfl",
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("yield argument `n` is not a field in target window `out`"),
+            "{text}"
+        );
+        assert!(text.contains("location: line 3, column 5"), "{text}");
+        assert!(text.contains("n = \"missing\""), "{text}");
+    }
+
+    #[test]
+    fn yield_preset_short_arg_does_not_match_rule_yield_line_substring() {
+        let source = r#"
+yield preset reusable (
+    u = "missing"
+)
+
+rule preset_rule {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : reusable (
+        x = e.sip
+    )
+}
+"#;
+        let file = parse_wfl(source).unwrap();
+        let err = validate_wfl_with_diagnostics(
+            &file,
+            &[auth_events_window(), output_window()],
+            source,
+            "rules/preset_short_arg.wfl",
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("yield argument `u` is not a field in target window `out`"),
+            "{text}"
+        );
+        assert!(text.contains("location: line 3, column 5"), "{text}");
+        assert!(text.contains("u = \"missing\""), "{text}");
+        assert!(!text.contains("location: line 10"), "{text}");
+    }
+
+    #[test]
+    fn yield_preset_decl_line_allows_flexible_whitespace() {
+        assert!(line_starts_yield_preset_decl("yield preset base (x = 1)"));
+        assert!(line_starts_yield_preset_decl(
+            "  yield    preset\tbase (x = 1)"
+        ));
+        assert!(!line_starts_yield_preset_decl("yield preset (x = 1)"));
+        assert!(!line_starts_yield_preset_decl("yield preset1 base (x = 1)"));
+        assert!(line_declares_yield_preset(
+            "yield\tpreset base (x = 1)",
+            "base"
+        ));
+        assert!(!line_declares_yield_preset(
+            "yield preset base_extra (x = 1)",
+            "base"
+        ));
+    }
+
+    #[test]
+    fn named_arg_column_ignores_string_and_comment_matches() {
+        let line = r#"msg = "u =", u = "missing""#;
+        let column = find_named_arg_column(line, "u").unwrap();
+        assert_eq!(&line[column - 1..], r#"u = "missing""#);
+
+        assert_eq!(find_named_arg_column(r#"msg = "u =""#, "u"), None);
+        assert_eq!(find_named_arg_column("// u = commented", "u"), None);
+        assert_eq!(
+            find_named_arg_column(r#"msg = "ok", // u = commented"#, "u"),
+            None
+        );
     }
 }

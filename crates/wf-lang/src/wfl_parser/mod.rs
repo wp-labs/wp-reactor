@@ -1,4 +1,4 @@
-use winnow::combinator::{cut_err, repeat};
+use winnow::combinator::{alt, cut_err, repeat};
 use winnow::error::{StrContext, StrContextValue};
 use winnow::prelude::*;
 
@@ -39,7 +39,15 @@ pub fn parse_wfl(input: &str) -> LangResult<WflFile> {
 fn wfl_file(input: &mut &str) -> ModalResult<WflFile> {
     ws_skip.parse_next(input)?;
     let uses: Vec<UseDecl> = repeat(0.., use_decl).parse_next(input)?;
-    let patterns: Vec<PatternDecl> = repeat(0.., pattern_p::pattern_decl).parse_next(input)?;
+    let top_decls: Vec<TopDecl> = repeat(0.., top_decl).parse_next(input)?;
+    let mut patterns = Vec::new();
+    let mut yield_presets = Vec::new();
+    for decl in top_decls {
+        match decl {
+            TopDecl::Pattern(pattern) => patterns.push(pattern),
+            TopDecl::YieldPreset(preset) => yield_presets.push(preset),
+        }
+    }
     let rules: Vec<RuleDecl> = repeat(0.., |input: &mut &str| {
         rule::rule_decl_with_patterns(input, &patterns)
     })
@@ -49,9 +57,23 @@ fn wfl_file(input: &mut &str) -> ModalResult<WflFile> {
     Ok(WflFile {
         uses,
         patterns,
+        yield_presets,
         rules,
         tests,
     })
+}
+
+enum TopDecl {
+    Pattern(PatternDecl),
+    YieldPreset(YieldPresetDecl),
+}
+
+fn top_decl(input: &mut &str) -> ModalResult<TopDecl> {
+    alt((
+        pattern_p::pattern_decl.map(TopDecl::Pattern),
+        clauses::yield_preset_decl.map(TopDecl::YieldPreset),
+    ))
+    .parse_next(input)
 }
 
 // ---------------------------------------------------------------------------

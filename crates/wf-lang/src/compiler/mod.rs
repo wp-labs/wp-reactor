@@ -12,6 +12,7 @@ use crate::plan::{
     RateSpec, RulePlan, ScorePlan, SortKeyPlan, StepPlan, WindowSpec, YieldField, YieldPlan,
 };
 use crate::schema::WindowSchema;
+use crate::yield_preset::expand_yield_args;
 use crate::{LangReason, LangResult};
 use orion_error::conversion::ToStructError;
 
@@ -45,12 +46,12 @@ pub fn compile_wfl(file: &WflFile, schemas: &[WindowSchema]) -> LangResult<Vec<R
 pub(crate) fn compile_wfl_after_semantic_checks(file: &WflFile) -> LangResult<Vec<RulePlan>> {
     let mut plans = Vec::new();
     for rule in &file.rules {
-        plans.extend(compile_rule(rule)?);
+        plans.extend(compile_rule(rule, file)?);
     }
     Ok(plans)
 }
 
-fn compile_rule(rule: &RuleDecl) -> LangResult<Vec<RulePlan>> {
+fn compile_rule(rule: &RuleDecl, file: &WflFile) -> LangResult<Vec<RulePlan>> {
     if rule.each_clause.is_some() && !rule.pipeline_stages.is_empty() {
         return LangReason::Compile
             .to_err()
@@ -68,15 +69,15 @@ fn compile_rule(rule: &RuleDecl) -> LangResult<Vec<RulePlan>> {
             .err();
     }
     if rule.pipeline_stages.is_empty() {
-        return Ok(vec![compile_regular_rule(rule)]);
+        return Ok(vec![compile_regular_rule(rule, file)]);
     }
-    Ok(compile_pipeline_rule(rule))
+    Ok(compile_pipeline_rule(rule, file))
 }
 
-fn compile_regular_rule(rule: &RuleDecl) -> RulePlan {
+fn compile_regular_rule(rule: &RuleDecl, file: &WflFile) -> RulePlan {
     let score_plan = compile_score(&rule.score);
     let entity_plan = compile_entity(&rule.entity);
-    let yield_plan = compile_yield(&rule.yield_clause);
+    let yield_plan = compile_yield(&rule.yield_clause, file);
     let mut match_plan = compile_match(&rule.match_clause, false);
     let bind_tracking = collect_rule_bind_tracking(
         &score_plan.expr,
@@ -105,7 +106,7 @@ fn compile_regular_rule(rule: &RuleDecl) -> RulePlan {
     }
 }
 
-fn compile_pipeline_rule(rule: &RuleDecl) -> Vec<RulePlan> {
+fn compile_pipeline_rule(rule: &RuleDecl, file: &WflFile) -> Vec<RulePlan> {
     const PIPE_IN_ALIAS: &str = "_in";
 
     let stage_count = rule.pipeline_stages.len() + 1;
@@ -143,7 +144,7 @@ fn compile_pipeline_rule(rule: &RuleDecl) -> Vec<RulePlan> {
             compile_pipeline_entity(&match_plan.keys)
         };
         let yield_plan = if is_final {
-            compile_yield(&rule.yield_clause)
+            compile_yield(&rule.yield_clause, file)
         } else {
             compile_pipeline_stage_yield(match_clause, pipeline_window_name(&rule.name, idx + 1))
         };
@@ -515,12 +516,13 @@ fn compile_score(score: &ScoreExpr) -> ScorePlan {
 // Yield
 // ---------------------------------------------------------------------------
 
-fn compile_yield(yield_clause: &YieldClause) -> YieldPlan {
+fn compile_yield(yield_clause: &YieldClause, file: &WflFile) -> YieldPlan {
+    let args = expand_yield_args(&file.yield_presets, yield_clause)
+        .expect("yield presets should have been validated before compilation");
     YieldPlan {
         target: yield_clause.target.clone(),
         version: yield_clause.version,
-        fields: yield_clause
-            .args
+        fields: args
             .iter()
             .map(|arg| YieldField {
                 name: arg.name.clone(),

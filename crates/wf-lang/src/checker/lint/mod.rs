@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::ast::{CmpOp, Expr, MatchStep, WflFile};
 use crate::schema::WindowSchema;
+use crate::yield_preset::expand_rule_yield_presets;
 
 use super::{CheckError, Severity};
 
@@ -24,6 +25,14 @@ pub fn lint_wfl(file: &WflFile, _schemas: &[WindowSchema]) -> Vec<CheckError> {
     let mut warnings = Vec::new();
 
     for rule in &file.rules {
+        let expanded_rule;
+        let rule = match expand_rule_yield_presets(rule, &file.yield_presets) {
+            Ok(rule) => {
+                expanded_rule = rule;
+                &expanded_rule
+            }
+            Err(_) => rule,
+        };
         let name = &rule.name;
 
         // W001: unused event alias

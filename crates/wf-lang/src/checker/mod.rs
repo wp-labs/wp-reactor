@@ -7,6 +7,7 @@ mod types;
 
 use crate::ast::{RuleDecl, WflFile};
 use crate::schema::WindowSchema;
+use crate::yield_preset::{expand_rule_yield_presets, validate_yield_presets};
 
 /// Severity level for semantic check diagnostics.
 #[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,9 +46,27 @@ impl std::fmt::Display for CheckError {
 pub fn check_wfl(file: &WflFile, schemas: &[WindowSchema]) -> Vec<CheckError> {
     let mut errors = Vec::new();
     let effective_schemas = intermediate::effective_schemas_for_rules(&file.rules, schemas);
+    let preset_errors = validate_yield_presets(&file.yield_presets);
+
+    for error in preset_errors {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: None,
+            test: None,
+            message: error.message(),
+        });
+    }
 
     for rule in &file.rules {
-        rules::check_rule(rule, &effective_schemas, &mut errors);
+        match expand_rule_yield_presets(rule, &file.yield_presets) {
+            Ok(rule) => rules::check_rule(&rule, &effective_schemas, &mut errors),
+            Err(error) => errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule.name.clone()),
+                test: None,
+                message: error.message(),
+            }),
+        }
     }
 
     intermediate::check_intermediate_target_graph(&file.rules, &mut errors, None);

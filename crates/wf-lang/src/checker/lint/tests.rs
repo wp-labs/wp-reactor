@@ -123,6 +123,25 @@ rule r {
     assert_no_warning(input, &[auth_events_window(), output_window()], "W001");
 }
 
+#[test]
+fn w001_alias_used_by_yield_preset_no_warning() {
+    let input = r#"
+yield preset base (
+    x = e.sip
+)
+
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, "static")
+    yield out : base (
+        y = "ok"
+    )
+}
+"#;
+    assert_no_warning(input, &[auth_events_window(), output_window()], "W001");
+}
+
 // W003: high cardinality key
 #[test]
 fn w003_four_keys() {
@@ -223,6 +242,33 @@ rule r {
     match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
     entity(ip, e.sip)
     yield out (Score = 42.0)
+}
+"#;
+    assert_has_warning(input, &[auth_events_window(), out], "W006");
+}
+
+#[test]
+fn w006_case_collision_from_yield_preset() {
+    let out = WindowSchema {
+        name: "out".to_string(),
+        streams: vec![],
+        time_field: None,
+        over: Duration::from_secs(3600),
+        fields: vec![FieldDef {
+            name: "Score".to_string(),
+            field_type: bt(BaseType::Float),
+        }],
+    };
+    let input = r#"
+yield preset base (
+    Score = 42.0
+)
+
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base ()
 }
 "#;
     assert_has_warning(input, &[auth_events_window(), out], "W006");

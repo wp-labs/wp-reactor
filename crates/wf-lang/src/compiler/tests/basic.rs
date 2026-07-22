@@ -79,6 +79,72 @@ rule brute_force {
     assert!(p.conv_plan.is_none());
 }
 
+#[test]
+fn compile_yield_presets_expand_into_yield_plan() {
+    let schemas = [auth_events_window(), output_window()];
+    let plans = compile_with(
+        r#"
+yield preset base_alerts (
+    y = "base",
+    n = 1
+)
+
+yield preset override_fields (
+    y = "override"
+)
+
+rule preset_rule {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base_alerts, override_fields (
+        x = e.sip,
+        n = e.count
+    )
+}
+"#,
+        &schemas,
+    );
+    assert_eq!(plans.len(), 1);
+    let fields = &plans[0].yield_plan.fields;
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0].name, "y");
+    assert_eq!(fields[0].value, Expr::StringLit("override".into()));
+    assert_eq!(fields[1].name, "n");
+    assert_eq!(
+        fields[1].value,
+        Expr::Field(FieldRef::Qualified("e".into(), "count".into()))
+    );
+    assert_eq!(fields[2].name, "x");
+}
+
+#[test]
+fn compile_yield_preset_can_supply_empty_yield_body() {
+    let schemas = [auth_events_window(), output_window()];
+    let plans = compile_with(
+        r#"
+yield preset base_alerts (
+    x = e.sip,
+    y = "base",
+    n = e.count
+)
+
+rule preset_rule {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base_alerts ()
+}
+"#,
+        &schemas,
+    );
+    let fields = &plans[0].yield_plan.fields;
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0].name, "x");
+    assert_eq!(fields[1].name, "y");
+    assert_eq!(fields[2].name, "n");
+}
+
 // =========================================================================
 // 2. compile_multi_source_multi_step
 // =========================================================================

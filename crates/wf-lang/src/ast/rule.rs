@@ -11,8 +11,18 @@ use super::*;
 pub struct WflFile {
     pub uses: Vec<UseDecl>,
     pub patterns: Vec<PatternDecl>,
+    pub yield_presets: Vec<YieldPresetDecl>,
     pub rules: Vec<RuleDecl>,
     pub tests: Vec<TestBlock>,
+}
+
+/// A reusable yield field set: `yield preset name (...)`.
+#[non_exhaustive]
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+pub struct YieldPresetDecl {
+    pub name: String,
+    pub args: Vec<NamedArg>,
 }
 
 /// A pattern declaration: `pattern name(params) { body }`
