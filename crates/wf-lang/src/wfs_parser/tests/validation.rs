@@ -75,7 +75,7 @@ window static_table {
 }
 
 #[test]
-fn reject_structured_object_field_in_stream_window() {
+fn accept_structured_object_field_in_stream_window() {
     let input = r#"
 window events {
     stream_tag = "auth"
@@ -85,12 +85,12 @@ window events {
     }
 }
 "#;
-    let err = parse_wfs(input).unwrap_err();
-    assert!(err.to_string().contains("input object/array fields"));
+    let schemas = parse_wfs(input).unwrap();
+    assert_eq!(schemas[0].fields[0].field_type, crate::FieldType::Object);
 }
 
 #[test]
-fn reject_structured_array_field_in_stream_window() {
+fn accept_structured_array_field_in_stream_window() {
     let input = r#"
 window events {
     stream_tag = "auth"
@@ -100,12 +100,12 @@ window events {
     }
 }
 "#;
-    let err = parse_wfs(input).unwrap_err();
-    assert!(err.to_string().contains("input object/array fields"));
+    let schemas = parse_wfs(input).unwrap();
+    assert_eq!(schemas[0].fields[0].field_type, crate::FieldType::ArrayAny);
 }
 
 #[test]
-fn reject_typed_array_field_in_stream_window() {
+fn accept_typed_array_field_in_stream_window() {
     let input = r#"
 window events {
     stream_tag = "auth"
@@ -115,8 +115,11 @@ window events {
     }
 }
 "#;
-    let err = parse_wfs(input).unwrap_err();
-    assert!(err.to_string().contains("input object/array fields"));
+    let schemas = parse_wfs(input).unwrap();
+    assert_eq!(
+        schemas[0].fields[0].field_type,
+        crate::FieldType::Array(crate::BaseType::Digit)
+    );
 }
 
 #[test]
@@ -129,7 +132,7 @@ window<provider> ip_reputation {
 }
 "#;
     let err = parse_static_wfs(input).unwrap_err();
-    assert!(err.to_string().contains("input object/array fields"));
+    assert!(err.to_string().contains("provider object/array fields"));
 }
 
 #[test]
@@ -142,7 +145,7 @@ window<provider> ip_reputation {
 }
 "#;
     let err = parse_wfs(input).unwrap_err();
-    assert!(err.to_string().contains("input object/array fields"));
+    assert!(err.to_string().contains("provider object/array fields"));
 }
 
 #[test]

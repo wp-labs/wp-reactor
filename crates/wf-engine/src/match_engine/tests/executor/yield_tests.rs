@@ -408,6 +408,143 @@ fn execute_each_yield_evaluates_structured_object_and_array_literals() {
 }
 
 #[test]
+fn execute_each_yield_merges_input_object_with_extension() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "extensions".to_string(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "merge".to_string(),
+            args: vec![
+                Expr::Field(FieldRef::Qualified(
+                    "e".to_string(),
+                    "extension".to_string(),
+                )),
+                Expr::Object(vec![
+                    ObjectItem {
+                        targets: vec!["source".to_string()],
+                        type_hint: None,
+                        value: Expr::StringLit("wfl".to_string()),
+                    },
+                    ObjectItem {
+                        targets: vec!["severity".to_string()],
+                        type_hint: None,
+                        value: Expr::Number(10.0),
+                    },
+                ]),
+            ],
+        },
+    }];
+    let exec = RuleExecutor::new(plan);
+
+    let mut extension = HashMap::new();
+    extension.insert("severity".to_string(), num(3.0));
+    extension.insert("rules".to_string(), Value::Array(vec![str_val("webshell")]));
+    let alert = exec
+        .execute_each(
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("extension", Value::Object(extension)),
+            ]),
+            1_000_000,
+        )
+        .unwrap()
+        .unwrap();
+
+    let value = alert
+        .yield_fields
+        .iter()
+        .find(|(name, _)| name == "extensions")
+        .map(|(_, value)| value)
+        .expect("extensions");
+    let Value::Object(fields) = value else {
+        panic!("expected object value, got {value:?}");
+    };
+    assert_eq!(fields.get("source"), Some(&str_val("wfl")));
+    assert_eq!(fields.get("severity"), Some(&num(10.0)));
+    assert_eq!(
+        fields.get("rules"),
+        Some(&Value::Array(vec![str_val("webshell")]))
+    );
+}
+
+#[test]
+fn execute_each_yield_passes_input_object_through() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "extensions".to_string(),
+        value: Expr::Field(FieldRef::Qualified(
+            "e".to_string(),
+            "extension".to_string(),
+        )),
+    }];
+    let exec = RuleExecutor::new(plan);
+
+    let mut detection = HashMap::new();
+    detection.insert("severity".to_string(), num(10.0));
+    detection.insert(
+        "tags".to_string(),
+        Value::Array(vec![str_val("os:linux"), str_val("webshell")]),
+    );
+    let mut extension = HashMap::new();
+    extension.insert("detection".to_string(), Value::Object(detection));
+
+    let alert = exec
+        .execute_each(
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("extension", Value::Object(extension)),
+            ]),
+            1_000_000,
+        )
+        .unwrap()
+        .unwrap();
+
+    let value = alert
+        .yield_fields
+        .iter()
+        .find(|(name, _)| name == "extensions")
+        .map(|(_, value)| value)
+        .expect("extensions");
+    let Value::Object(fields) = value else {
+        panic!("expected object value, got {value:?}");
+    };
+    let Some(Value::Object(detection)) = fields.get("detection") else {
+        panic!("expected nested detection object, got {fields:?}");
+    };
+    assert_eq!(detection.get("severity"), Some(&num(10.0)));
+    assert_eq!(
+        detection.get("tags"),
+        Some(&Value::Array(vec![
+            str_val("os:linux"),
+            str_val("webshell")
+        ]))
+    );
+}
+
+#[test]
 fn execute_each_yield_failure_is_not_silent() {
     let mut plan = simple_rule_plan(
         "r1",

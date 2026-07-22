@@ -57,6 +57,7 @@ use super::{eval_expr_ext, values_equal};
 /// - `startswith_any(text, prefix1, prefix2, ...)` → Bool
 /// - `endswith_any(text, suffix1, suffix2, ...)` → Bool
 /// - `coalesce(v1, v2, ...)` → first non-null and non-blank string value
+/// - `merge(obj1, obj2, ...)` → shallow left-to-right object merge
 /// - `isnull(expr)` → Bool
 /// - `isnotnull(expr)` → Bool
 /// - `is_blank(expr)` → Bool
@@ -645,6 +646,21 @@ pub(super) fn eval_func_call(
             }
             None
         }
+        "merge" => {
+            if args.is_empty() {
+                return None;
+            }
+            let mut merged = HashMap::new();
+            for arg in args {
+                match eval_merge_arg(arg, event, windows, baselines) {
+                    Some(Value::Object(fields)) => merged.extend(fields),
+                    None if matches!(arg, Expr::Field(_)) => {}
+                    None => return None,
+                    Some(_) => return None,
+                }
+            }
+            Some(Value::Object(merged))
+        }
         "isnull" => {
             if args.len() != 1 {
                 return None;
@@ -882,4 +898,13 @@ pub(super) fn eval_func_call(
         }
         _ => None, // unsupported function
     }
+}
+
+fn eval_merge_arg(
+    arg: &Expr,
+    event: &Event,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut HashMap<String, RollingStats>,
+) -> Option<Value> {
+    eval_expr_ext(arg, event, windows, baselines)
 }

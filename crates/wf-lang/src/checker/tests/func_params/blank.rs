@@ -154,3 +154,80 @@ rule r {
         "default_if_blank() argument 2 must be chars",
     );
 }
+
+#[test]
+fn merge_allows_object_passthrough_and_extension() {
+    let events = make_window(
+        "events",
+        vec!["events"],
+        vec![
+            ("sip", bt(BaseType::Ip)),
+            ("extension", FieldType::Object),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let out = make_output_window("out", vec![("extensions", FieldType::Object)]);
+    let input = r#"
+rule r {
+    events { s : events }
+    match<sip:5m> { on event { s | count >= 1; } } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (
+        extensions = merge(
+            s.extension,
+            object {
+                source = "wfl";
+                ioc_value = s.sip;
+            }
+        )
+    )
+}
+"#;
+    assert_no_errors(input, &[events, out]);
+}
+
+#[test]
+fn object_input_can_be_assigned_directly_to_object_yield_target() {
+    let events = make_window(
+        "events",
+        vec!["events"],
+        vec![
+            ("sip", bt(BaseType::Ip)),
+            ("extension", FieldType::Object),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let out = make_output_window("out", vec![("extensions", FieldType::Object)]);
+    let input = r#"
+rule r {
+    events { s : events }
+    match<sip:5m> { on event { s | count >= 1; } } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (extensions = s.extension)
+}
+"#;
+    assert_no_errors(input, &[events, out]);
+}
+
+#[test]
+fn merge_rejects_non_object_args() {
+    let events = make_window(
+        "events",
+        vec!["events"],
+        vec![
+            ("sip", bt(BaseType::Ip)),
+            ("extension", FieldType::Object),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let out = make_output_window("out", vec![("extensions", FieldType::Object)]);
+    let input = r#"
+rule r {
+    events { s : events }
+    match<sip:5m> { on event { s | count >= 1; } } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (extensions = merge(s.extension, s.sip))
+}
+"#;
+    assert_has_error(input, &[events, out], "merge() argument 2 must be object");
+}

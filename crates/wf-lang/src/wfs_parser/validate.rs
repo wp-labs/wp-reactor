@@ -17,10 +17,6 @@ pub(super) fn validate_schemas(windows: &[WindowSchema]) -> LangResult<()> {
     }
 
     for w in windows {
-        if !w.streams.is_empty() {
-            validate_input_fields(&w.name, &w.fields)?;
-        }
-
         if w.over > Duration::ZERO {
             // time attribute is required
             let Some(time_field) = w.time_field.as_ref() else {
@@ -68,18 +64,18 @@ pub(super) fn validate_static_schemas(windows: &[StaticWindowSchema]) -> LangRes
                 .with_detail(format!("duplicate window name: '{}'", w.name))
                 .err();
         }
-        validate_input_fields(&w.name, &w.fields)?;
+        validate_provider_fields(&w.name, &w.fields)?;
     }
     Ok(())
 }
 
-fn validate_input_fields(window_name: &str, fields: &[FieldDef]) -> LangResult<()> {
+fn validate_provider_fields(window_name: &str, fields: &[FieldDef]) -> LangResult<()> {
     for field in fields {
         if is_structured_type(&field.field_type) {
             return LangReason::Validation
                 .to_err()
                 .with_detail(format!(
-                    "window '{}': input field '{}' uses structured type {:?}; input object/array fields must be declared as chars and structured values should be built in yield",
+                    "window '{}': provider field '{}' uses structured type {:?}; provider object/array fields are not supported yet",
                     window_name, field.name, field.field_type
                 ))
                 .err();

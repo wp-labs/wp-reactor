@@ -2,7 +2,7 @@ use super::{
     Event, Value, YieldMeta, eval_bool_expr, eval_expr_with_l3, eval_yield_expr,
     eval_yield_expr_with_score, with_yield_eval_scope,
 };
-use wf_lang::ast::{BinOp, Expr, FieldRef};
+use wf_lang::ast::{BinOp, Expr, FieldRef, ObjectItem};
 
 fn make_test_event(values: Vec<Value>) -> Event {
     let mut fields = std::collections::HashMap::new();
@@ -85,6 +85,74 @@ fn test_collect_set_returns_unique_values() {
     } else {
         panic!("Expected array result");
     }
+}
+
+#[test]
+fn test_merge_shallow_merges_objects_left_to_right() {
+    let mut base = std::collections::HashMap::new();
+    base.insert("severity".to_string(), Value::Number(3.0));
+    base.insert("existing".to_string(), Value::Str("kept".to_string()));
+
+    let mut fields = std::collections::HashMap::new();
+    fields.insert("extension".to_string(), Value::Object(base));
+    let ctx = Event { fields };
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "merge".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("missing_extension".to_string())),
+            Expr::Field(FieldRef::Simple("extension".to_string())),
+            Expr::Object(vec![
+                ObjectItem {
+                    targets: vec!["source".to_string()],
+                    type_hint: None,
+                    value: Expr::StringLit("wfl".to_string()),
+                },
+                ObjectItem {
+                    targets: vec!["severity".to_string()],
+                    type_hint: None,
+                    value: Expr::Number(10.0),
+                },
+            ]),
+        ],
+    };
+
+    let result = eval_yield_expr(&expr, &ctx);
+    let Some(Value::Object(object)) = result else {
+        panic!("expected object, got {result:?}");
+    };
+    assert_eq!(
+        object.get("existing"),
+        Some(&Value::Str("kept".to_string()))
+    );
+    assert_eq!(object.get("source"), Some(&Value::Str("wfl".to_string())));
+    assert_eq!(object.get("severity"), Some(&Value::Number(10.0)));
+}
+
+#[test]
+fn test_merge_fails_when_object_literal_value_is_missing() {
+    let ctx = Event {
+        fields: std::collections::HashMap::new(),
+    };
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "merge".to_string(),
+        args: vec![
+            Expr::Object(vec![ObjectItem {
+                targets: vec!["source".to_string()],
+                type_hint: None,
+                value: Expr::Field(FieldRef::Simple("missing".to_string())),
+            }]),
+            Expr::Object(vec![ObjectItem {
+                targets: vec!["severity".to_string()],
+                type_hint: None,
+                value: Expr::Number(10.0),
+            }]),
+        ],
+    };
+
+    assert_eq!(eval_expr_with_l3(&expr, &ctx, YieldMeta::default()), None);
 }
 
 #[test]

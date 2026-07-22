@@ -1,5 +1,5 @@
 use super::*;
-use wf_lang::ast::BinOp;
+use wf_lang::ast::{BinOp, ObjectItem};
 
 // ===========================================================================
 // IfThenElse expression evaluation
@@ -683,6 +683,102 @@ fn blank_functions_work() {
     );
     assert_eq!(eval_expr(&coalesce_all_blank_expr, &event), None);
     assert_eq!(eval_expr(&invalid_type_expr, &event), None);
+}
+
+#[test]
+fn merge_shallow_merges_objects_in_l2_eval() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let mut base = HashMap::new();
+    base.insert("severity".to_string(), Value::Number(3.0));
+    base.insert("rule".to_string(), Value::Str("webshell".to_string()));
+
+    let mut fields = HashMap::new();
+    fields.insert("extension".to_string(), Value::Object(base));
+    let event = Event { fields };
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "merge".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("extension".to_string())),
+            Expr::Object(vec![
+                ObjectItem {
+                    targets: vec!["source".to_string()],
+                    type_hint: None,
+                    value: Expr::StringLit("wfl".to_string()),
+                },
+                ObjectItem {
+                    targets: vec!["severity".to_string()],
+                    type_hint: None,
+                    value: Expr::Number(10.0),
+                },
+            ]),
+        ],
+    };
+
+    let Some(Value::Object(object)) = eval_expr(&expr, &event) else {
+        panic!("expected object");
+    };
+    assert_eq!(
+        object.get("rule"),
+        Some(&Value::Str("webshell".to_string()))
+    );
+    assert_eq!(object.get("source"), Some(&Value::Str("wfl".to_string())));
+    assert_eq!(object.get("severity"), Some(&Value::Number(10.0)));
+}
+
+#[test]
+fn merge_fails_when_object_literal_value_is_missing_in_l2_eval() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let event = Event {
+        fields: HashMap::new(),
+    };
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "merge".to_string(),
+        args: vec![
+            Expr::Object(vec![ObjectItem {
+                targets: vec!["source".to_string()],
+                type_hint: None,
+                value: Expr::Field(FieldRef::Simple("missing".to_string())),
+            }]),
+            Expr::Object(vec![ObjectItem {
+                targets: vec!["severity".to_string()],
+                type_hint: None,
+                value: Expr::Number(10.0),
+            }]),
+        ],
+    };
+
+    assert_eq!(eval_expr(&expr, &event), None);
+}
+
+#[test]
+fn merge_treats_missing_field_arg_as_empty_object_in_l2_eval() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let event = Event {
+        fields: HashMap::new(),
+    };
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "merge".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("missing_extension".to_string())),
+            Expr::Object(vec![ObjectItem {
+                targets: vec!["source".to_string()],
+                type_hint: None,
+                value: Expr::StringLit("wfl".to_string()),
+            }]),
+        ],
+    };
+
+    let Some(Value::Object(object)) = eval_expr(&expr, &event) else {
+        panic!("expected object");
+    };
+    assert_eq!(object.get("source"), Some(&Value::Str("wfl".to_string())));
 }
 
 #[test]

@@ -161,6 +161,7 @@ fn infer_func_call(
         "hex" => Some(ValType::Base(BaseType::Hex)),
         "indexof" => Some(ValType::Base(BaseType::Digit)),
         "coalesce" => args.first().and_then(|a| infer_type(a, scope)),
+        "merge" => Some(ValType::Object),
         "len" => Some(ValType::Base(BaseType::Digit)),
         "time_bucket" => Some(ValType::Base(BaseType::Time)),
         "mvsort" | "mvreverse" => args.first().and_then(|a| match infer_type(a, scope) {

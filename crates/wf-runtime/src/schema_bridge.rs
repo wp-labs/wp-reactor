@@ -1,32 +1,22 @@
 use std::sync::Arc;
 
-use orion_error::conversion::{SourceRawErr, ToStructError};
+use orion_error::conversion::ToStructError;
 
 use wf_config::WindowConfig;
 use wf_engine::window::{WindowDef, WindowParams};
-use wf_lang::{BaseType, FieldType, WindowSchema};
-use wp_arrow::schema::{FieldDef as WpFieldDef, WpDataType, to_arrow_schema};
+use wf_lang::WindowSchema;
 
 use crate::error::{RuntimeReason, RuntimeResult};
+use crate::receiver::schema::window_schema_to_arrow;
 
 /// Convert a [`WindowSchema`] (parsed from `.wfs`) together with its
 /// [`WindowConfig`] (resolved from `wfusion.toml`) into a [`WindowDef`]
 /// that can be fed to [`WindowRegistry::build`].
 pub fn schema_to_window_def(ws: &WindowSchema, config: &WindowConfig) -> RuntimeResult<WindowDef> {
-    // 1. Convert wf-lang FieldDef → wp-arrow FieldDef
-    let wp_fields: Vec<WpFieldDef> = ws
-        .fields
-        .iter()
-        .map(|f| WpFieldDef::new(&f.name, base_type_to_wp(&f.field_type)))
-        .collect();
+    // 1. Build Arrow Schema
+    let schema = window_schema_to_arrow(ws)?;
 
-    // 2. Build Arrow Schema
-    let schema = to_arrow_schema(&wp_fields).source_raw_err(
-        RuntimeReason::Bootstrap,
-        format!("schema conversion failed for {:?}", ws.name),
-    )?;
-
-    // 3. Find time column index
+    // 2. Find time column index
     let time_col_index = ws.time_field.as_ref().map(|tf| {
         schema
             .fields()
@@ -35,10 +25,10 @@ pub fn schema_to_window_def(ws: &WindowSchema, config: &WindowConfig) -> Runtime
             .expect("time_field not found in schema fields")
     });
 
-    // 4. Build WindowParams
+    // 3. Build WindowParams
     let params = WindowParams {
         name: ws.name.clone(),
-        schema: Arc::new(schema),
+        schema: Arc::clone(&schema),
         time_col_index,
         over: ws.over,
     };
@@ -48,21 +38,6 @@ pub fn schema_to_window_def(ws: &WindowSchema, config: &WindowConfig) -> Runtime
         streams: ws.streams.clone(),
         config: config.clone(),
     })
-}
-
-fn base_type_to_wp(ft: &FieldType) -> WpDataType {
-    match ft {
-        FieldType::Base(bt) => match bt {
-            BaseType::Chars => WpDataType::Chars,
-            BaseType::Digit => WpDataType::Digit,
-            BaseType::Float => WpDataType::Float,
-            BaseType::Bool => WpDataType::Bool,
-            BaseType::Time => WpDataType::Time,
-            BaseType::Ip => WpDataType::Ip,
-            BaseType::Hex => WpDataType::Hex,
-        },
-        FieldType::ArrayAny | FieldType::Array(_) | FieldType::Object => WpDataType::Chars,
-    }
 }
 
 /// Resolve each `WindowSchema` against the matching `WindowConfig` (by name).
@@ -98,7 +73,7 @@ mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
     use std::time::Duration;
     use wf_config::{DistMode, EvictPolicy, LatePolicy};
-    use wf_lang::FieldDef;
+    use wf_lang::{BaseType, FieldDef, FieldType};
 
     fn test_config(name: &str) -> WindowConfig {
         WindowConfig {
@@ -166,6 +141,10 @@ mod tests {
 
     #[test]
     fn structured_field_types_map_to_utf8_storage() {
+        use wf_engine::match_engine::{
+            WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY, WFL_FIELD_TYPE_OBJECT,
+        };
+
         let ws = WindowSchema {
             name: "alerts".to_string(),
             streams: vec![],
@@ -194,6 +173,18 @@ mod tests {
         assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
         assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
         assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field(0).metadata().get(WFL_FIELD_TYPE_METADATA_KEY),
+            Some(&WFL_FIELD_TYPE_OBJECT.to_string())
+        );
+        assert_eq!(
+            schema.field(1).metadata().get(WFL_FIELD_TYPE_METADATA_KEY),
+            Some(&WFL_FIELD_TYPE_ARRAY.to_string())
+        );
+        assert_eq!(
+            schema.field(2).metadata().get(WFL_FIELD_TYPE_METADATA_KEY),
+            Some(&WFL_FIELD_TYPE_ARRAY.to_string())
+        );
     }
 
     #[test]

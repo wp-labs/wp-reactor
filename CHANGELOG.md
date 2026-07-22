@@ -18,6 +18,7 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Added
 
+- **wf-lang / wf-engine**: Added structured stream-input object/array support and `merge(obj1, obj2, ...)` for shallow left-to-right object enrichment in WFL expressions and yield outputs.
 - **wf-lang**: Added `yield preset` declarations and `yield target : preset_a, preset_b (...)` references for composing reusable yield field sets with ordered override semantics; later presets override earlier fields, and explicit rule yield fields override presets.
 - **wf-config / wf-engine**: Added project-level `[output]` configuration with `time_format` and UTC `time_zone`, used as the default format for one-argument `strftime(time)` calls.
 - **wf-engine**: Added `RuleExecutorOptions` for passing output formatting and yield target type metadata without growing constructor argument lists.
@@ -30,6 +31,10 @@ All notable changes to wp-reactor will be documented in this file.
 - **wf-engine tests**: Added sink-runtime send-path coverage for `wf_meta_disable` wildcard matching, including projection-before-disable behavior.
 - **wf-runtime**: Added the built-in `__window_miss` provider window for recoverable dynamic-routing misses, including `unknown_stream_schema` and `missing_stream_tag_field` diagnostics, bounded payload samples, and `wf_receiver_window_miss_total` metrics.
 - **wf-runtime tests**: Added NDJSON, CSV, Arrow framed, external source, metrics, and capacity-eviction coverage for window-miss handling.
+
+### Documentation
+
+- **User guide / design**: Added `merge(obj1, obj2, ...)` usage examples for object passthrough and incremental enrichment, and documented its shallow override order plus fallback behavior for missing object field references versus hard evaluation failures.
 
 ### Fixed
 

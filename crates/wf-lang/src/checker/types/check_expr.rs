@@ -7,7 +7,7 @@ use super::{ValType, compatible, is_numeric, op_symbol};
 use crate::checker::scope::Scope;
 use crate::checker::{CheckError, Severity};
 
-use super::check_funcs::check_func_call;
+use super::check_funcs::{FuncCheckCtx, check_func_call};
 
 /// Type-check an expression, emitting errors into `errors`.
 pub fn check_expr_type(
@@ -241,10 +241,12 @@ fn check_expr_type_inner(
                 qualifier.as_deref(),
                 name,
                 args,
-                scope,
-                rule_name,
-                allow_l3_funcs,
-                allow_mixed_coalesce,
+                FuncCheckCtx {
+                    scope,
+                    rule_name,
+                    allow_l3_funcs,
+                    allow_mixed_coalesce,
+                },
                 errors,
             );
         }

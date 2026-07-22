@@ -14,7 +14,8 @@ use crate::metrics::RuntimeMetrics;
 use crate::receiver::miss::record_batch_window_miss;
 use crate::receiver::route::route_batch;
 use crate::receiver::schema::{
-    maybe_resolve_stream_schema, resolve_stream_schema, validate_batch_schema_for_stream,
+    maybe_resolve_stream_schema, resolve_stream_schema, schemas_are_compatible_for_stream,
+    validate_batch_schema_for_stream,
 };
 
 /// Replay framed `wp_arrow` IPC records from file and route them into the
@@ -140,7 +141,7 @@ pub async fn replay_arrow_ipc_file(
         )?;
 
         let file_schema = reader.schema();
-        if file_schema.as_ref() != expected_schema.as_ref() {
+        if !schemas_are_compatible_for_stream(expected_schema.as_ref(), file_schema.as_ref()) {
             return RuntimeReason::data_error()
                 .to_err()
                 .with_detail(format!(

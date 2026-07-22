@@ -7,7 +7,10 @@ mod match_engine;
 #[cfg(test)]
 mod tests;
 
-pub use event_bridge::{batch_to_events, batch_to_timestamped_rows};
+pub use event_bridge::{
+    WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY, WFL_FIELD_TYPE_OBJECT, batch_to_events,
+    batch_to_timestamped_rows, is_wfl_structured_field, wfl_structured_field_kind,
+};
 pub use executor::{RuleExecutor, RuleExecutorOptions};
 pub use match_engine::{
     CepStateMachine, CloseOutput, CloseReason, Event, MACHINE_ID, MatchedContext, StepData,

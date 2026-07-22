@@ -40,16 +40,25 @@ fn unify_mvappend_element_type(existing: &ValType, incoming: &ValType) -> Option
     }
 }
 
+pub(super) struct FuncCheckCtx<'a, 'scope> {
+    pub scope: &'a Scope<'scope>,
+    pub rule_name: &'a str,
+    pub allow_l3_funcs: bool,
+    pub allow_mixed_coalesce: bool,
+}
+
 pub fn check_func_call(
     qualifier: Option<&str>,
     name: &str,
     args: &[Expr],
-    scope: &Scope<'_>,
-    rule_name: &str,
-    allow_l3_funcs: bool,
-    allow_mixed_coalesce: bool,
+    ctx: FuncCheckCtx<'_, '_>,
     errors: &mut Vec<CheckError>,
 ) {
+    let scope = ctx.scope;
+    let rule_name = ctx.rule_name;
+    let allow_l3_funcs = ctx.allow_l3_funcs;
+    let allow_mixed_coalesce = ctx.allow_mixed_coalesce;
+
     if qualifier == Some("stat") && matches!(name, "count" | "value") {
         check_stat_func(name, args, scope, rule_name, errors);
         return;
@@ -549,6 +558,33 @@ pub fn check_func_call(
                         }
                     } else {
                         first_type = Some(inferred);
+                    }
+                }
+            }
+        }
+        "merge" => {
+            if args.is_empty() {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "merge() requires at least 1 argument".to_string(),
+                });
+            } else {
+                for (idx, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&ValType::Object, &t)
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "merge() argument {} must be object, got {:?}",
+                                idx + 1,
+                                t
+                            ),
+                        });
                     }
                 }
             }

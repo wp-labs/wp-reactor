@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef};
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use wf_data::time::parse_timestamp_str_nanos;
-use wf_engine::match_engine;
+use wf_engine::match_engine::{
+    self, WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_OBJECT, wfl_structured_field_kind,
+};
 use wf_engine::window::Router;
 
 use crate::error::{RuntimeReason, RuntimeResult};
@@ -31,8 +33,14 @@ pub(crate) fn route_batch(
         rows = batch.num_rows(),
         "frame decoded"
     );
+    let route_input = if needs_projection_for_stream(stream_name, &batch, router) {
+        project_batch_for_stream(stream_name, &batch, router)
+    } else {
+        batch.clone()
+    };
+
     // Try routing directly; if schema mismatch, attempt projection
-    let report = match router.route(stream_name, batch.clone()) {
+    let report = match router.route(stream_name, route_input) {
         Ok(report) => report,
         Err(_) => {
             // Project batch to match window schemas for this stream
@@ -98,7 +106,7 @@ fn project_batch_for_stream(
     for field in &fields {
         let col = match batch.column_by_name(field.name()) {
             Some(col) if col.data_type() == field.data_type() => col.clone(),
-            Some(col) => coerce_column(col, field.data_type(), batch.num_rows()),
+            Some(col) => coerce_column_for_field(col, field, batch.num_rows()),
             None => Arc::new(NullArray::new(batch.num_rows())),
         };
         columns.push(col);
@@ -118,6 +126,29 @@ fn project_batch_for_stream(
     let schema = arrow::datatypes::Schema::new(fields);
     arrow::record_batch::RecordBatch::try_new(Arc::new(schema), columns)
         .unwrap_or_else(|_| batch.clone())
+}
+
+fn needs_projection_for_stream(stream_name: &str, batch: &RecordBatch, router: &Router) -> bool {
+    let subs = router.registry().subscribers_of(stream_name);
+    subs.iter().any(|(window_name, _)| {
+        router
+            .registry()
+            .get_window(window_name)
+            .and_then(|w| w.read().ok().map(|win| win.schema().clone()))
+            .is_some_and(|schema| {
+                schema.fields().iter().any(|field| {
+                    let target_kind = wfl_structured_field_kind(field);
+                    target_kind.is_some()
+                        && batch
+                            .schema()
+                            .field_with_name(field.name())
+                            .is_ok_and(|source_field| {
+                                source_field.data_type() != field.data_type()
+                                    || wfl_structured_field_kind(source_field) != target_kind
+                            })
+                })
+            })
+    })
 }
 
 /// Coerce a column to the target Arrow type. Falls back to nulls if coercion fails.
@@ -212,6 +243,114 @@ pub(crate) fn coerce_column(col: &ArrayRef, target: &DataType, num_rows: usize) 
         // Fallback — nulls
         _ => Arc::new(NullArray::new(num_rows)),
     }
+}
+
+pub(crate) fn coerce_column_for_field(col: &ArrayRef, target: &Field, num_rows: usize) -> ArrayRef {
+    if matches!(target.data_type(), DataType::Utf8) {
+        match (wfl_structured_field_kind(target), col.data_type()) {
+            (Some(WFL_FIELD_TYPE_OBJECT), DataType::Struct(_))
+            | (
+                Some(WFL_FIELD_TYPE_ARRAY),
+                DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _),
+            ) => return structured_column_to_json_strings(col, num_rows),
+            _ => {}
+        }
+    }
+    coerce_column(col, target.data_type(), num_rows)
+}
+
+fn structured_column_to_json_strings(col: &ArrayRef, num_rows: usize) -> ArrayRef {
+    use arrow::array::StringBuilder;
+
+    let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
+    for row in 0..num_rows {
+        if col.is_null(row) {
+            builder.append_null();
+            continue;
+        }
+        match arrow_value_to_json(col.as_ref(), row)
+            .and_then(|value| serde_json::to_string(&value).ok())
+        {
+            Some(value) => builder.append_value(value),
+            None => builder.append_null(),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+fn arrow_value_to_json(col: &dyn Array, row: usize) -> Option<serde_json::Value> {
+    use arrow::array::{
+        BooleanArray, FixedSizeListArray, Float64Array, Int64Array, LargeListArray, ListArray,
+        StringArray, StructArray, TimestampNanosecondArray,
+    };
+
+    match col.data_type() {
+        DataType::Int64 => {
+            let arr = col.as_any().downcast_ref::<Int64Array>()?;
+            Some(serde_json::Value::Number(arr.value(row).into()))
+        }
+        DataType::Float64 => {
+            let arr = col.as_any().downcast_ref::<Float64Array>()?;
+            serde_json::Number::from_f64(arr.value(row)).map(serde_json::Value::Number)
+        }
+        DataType::Utf8 => {
+            let arr = col.as_any().downcast_ref::<StringArray>()?;
+            Some(serde_json::Value::String(arr.value(row).to_string()))
+        }
+        DataType::Boolean => {
+            let arr = col.as_any().downcast_ref::<BooleanArray>()?;
+            Some(serde_json::Value::Bool(arr.value(row)))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let arr = col.as_any().downcast_ref::<TimestampNanosecondArray>()?;
+            Some(serde_json::Value::Number(arr.value(row).into()))
+        }
+        DataType::Struct(_) => {
+            let arr = col.as_any().downcast_ref::<StructArray>()?;
+            let mut object = serde_json::Map::new();
+            for (field, child) in arr.fields().iter().zip(arr.columns()) {
+                if child.is_null(row) {
+                    continue;
+                }
+                if let Some(value) = arrow_value_to_json(child.as_ref(), row) {
+                    object.insert(field.name().clone(), value);
+                }
+            }
+            Some(serde_json::Value::Object(object))
+        }
+        DataType::List(_) => {
+            let arr = col.as_any().downcast_ref::<ListArray>()?;
+            Some(serde_json::Value::Array(arrow_list_values_to_json(
+                arr.value(row).as_ref(),
+            )))
+        }
+        DataType::LargeList(_) => {
+            let arr = col.as_any().downcast_ref::<LargeListArray>()?;
+            Some(serde_json::Value::Array(arrow_list_values_to_json(
+                arr.value(row).as_ref(),
+            )))
+        }
+        DataType::FixedSizeList(_, _) => {
+            let arr = col.as_any().downcast_ref::<FixedSizeListArray>()?;
+            Some(serde_json::Value::Array(arrow_list_values_to_json(
+                arr.value(row).as_ref(),
+            )))
+        }
+        _ => None,
+    }
+}
+
+fn arrow_list_values_to_json(values: &dyn Array) -> Vec<serde_json::Value> {
+    let mut out = Vec::with_capacity(values.len());
+    for idx in 0..values.len() {
+        if values.is_null(idx) {
+            continue;
+        }
+        if let Some(value) = arrow_value_to_json(values, idx) {
+            out.push(value);
+        }
+    }
+    out
 }
 
 #[allow(dead_code)]

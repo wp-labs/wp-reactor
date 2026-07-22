@@ -33,9 +33,9 @@ window <名称> {
 | `time` | 输入、输出 | Timestamp(Nanosecond) |
 | `ip` | 输入、输出 | Utf8 |
 | `hex` | 输入、输出 | Utf8 |
-| `object` | 输出 / 中间 window | 结构化对象；中间 window 内按 UTF-8 JSON 桥接，最终 sink 决定编码 |
-| `array` | 输出 / 中间 window | 结构化数组；中间 window 内按 UTF-8 JSON 桥接，最终 sink 决定编码 |
-| `array/T` | 输出 / 中间 window | 结构化 typed array；元素按 `T` 做类型检查，最终 sink 决定编码 |
+| `object` | 输入 stream、输出 / 中间 window | 结构化对象；中间 window 内按 UTF-8 JSON 桥接，最终 sink 决定编码 |
+| `array` | 输入 stream、输出 / 中间 window | 结构化数组；中间 window 内按 UTF-8 JSON 桥接，最终 sink 决定编码 |
+| `array/T` | 输入 stream、输出 / 中间 window | 结构化 typed array；元素按 `T` 做类型检查，最终 sink 决定编码 |
 
 属性说明：
 
@@ -43,7 +43,7 @@ window <名称> {
 - `time`：事件时间字段；`over > 0` 时必填
 - `over`：保留时长；`0` 表示静态集合
 
-输入 window（包含 `stream_tag = ...`）和 provider window 不允许声明 `object` / `array` / `array/T` 字段。若源数据里有 JSON object/array，先声明为 `chars` 接入；需要输出结构化对象或数组时，在 `yield` 中用 WFL 的 `object { ... }` / `array [ ... ]` 构造。
+输入 stream window（包含 `stream_tag = ...`）允许声明 `object` / `array` / `array/T` 字段，用于接收上游 Arrow Struct/List 等结构化列。provider window 暂不支持结构化字段。需要输出结构化对象或数组时，可直接透传输入结构化字段，也可在 `yield` 中用 WFL 的 `object { ... }` / `array [ ... ]` 构造。
 
 带点字段名示例：
 
@@ -605,6 +605,20 @@ yield security_alerts (
 )
 ```
 
+输入 stream 中已经是结构化对象的字段可以直接透传，也可以用 `merge(...)` 做浅合并富化：
+
+```wfl
+yield security_alerts (
+    extensions = merge(
+        e.extension,
+        object {
+            source = "wfl";
+            ioc_value = e.target_domain;
+        }
+    )
+)
+```
+
 语法：
 
 ```ebnf
@@ -627,6 +641,7 @@ risk_context = object {
 语义边界：
 
 - `object` / `array` 是 WFL 的结构化值类型，不等同于 JSON。
+- `merge(obj1, obj2, ...)` 对 object 做从左到右的浅合并；后面的同名 key 覆盖前面的 key。缺失的 object 字段引用按空对象处理；object 字面量内部表达式失败、函数失败或非 object 参数会使 `merge()` 求值失败。
 - JSON、XML、文本、CSV 等最终编码由 sink 决定。
 - JSON sink 应把 `object` 输出为 JSON object，把 `array` 输出为 JSON array。
 - XML sink 可把 `object` 输出为元素树；文本/CSV sink 可选择序列化或 flatten。
@@ -726,6 +741,7 @@ fmt("{} failed {} times from {}", fail.username, count(fail), fail.sip)
 - 字符串：`contains`、`regex_match`、`startswith`、`endswith`、`lower`、`upper`、`len`、`concat`
 - 数值：`round`、`abs`、`ceil`、`floor`、`sqrt`、`pow`、`log`、`exp`、`clamp`
 - 空值 / 空白处理：`coalesce`、`isnull`、`isnotnull`、`is_blank`、`null_if_blank`、`default_if_blank`
+- 结构化对象：`merge`
 - 时间：`time_diff`、`time_bucket`
 - 当前引擎时间：`now`、`now_s`、`now_ms`、`now_us`、`now_ns`
 - 哈希 / 编码：`md5`、`sha1`、`sha256`、`hex`、`stable_id`
@@ -753,6 +769,7 @@ events {
 | 函数 | 返回类型 | 说明 |
 |------|----------|------|
 | `coalesce(v1, v2, ...)` | 首个非空参数的类型 | 返回第一个非 null / 可求值且非 blank 字符串的参数 |
+| `merge(obj1, obj2, ...)` | `object` | 左到右浅合并 object，后面的同名 key 覆盖前面的 key；缺失的 object 字段引用按空对象处理，其他求值失败仍失败 |
 | `isnull(expr)` | `bool` | 参数不可求值时返回 `true` |
 | `isnotnull(expr)` | `bool` | 参数可求值时返回 `true` |
 | `is_blank(text)` | `bool` | `text` 缺失、空字符串或全空白字符时返回 `true` |

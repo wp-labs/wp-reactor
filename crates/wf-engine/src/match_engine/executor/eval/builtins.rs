@@ -176,6 +176,21 @@ pub(super) fn eval_builtin_func_with_l3(
             };
             Some(Value::Bool(text.ends_with(&suffix)))
         }
+        "merge" => {
+            if args.is_empty() {
+                return None;
+            }
+            let mut merged = std::collections::HashMap::new();
+            for arg in args {
+                match eval_merge_arg(arg, ctx, score) {
+                    Some(Value::Object(fields)) => merged.extend(fields),
+                    None if matches!(arg, wf_lang::ast::Expr::Field(_)) => {}
+                    None => return None,
+                    Some(_) => return None,
+                }
+            }
+            Some(Value::Object(merged))
+        }
         "substr" => {
             if args.len() != 2 && args.len() != 3 {
                 return None;
@@ -913,6 +928,10 @@ pub(super) fn eval_builtin_func_with_l3(
         }),
         _ => None,
     }
+}
+
+fn eval_merge_arg(arg: &wf_lang::ast::Expr, ctx: &Event, score: YieldMeta<'_>) -> Option<Value> {
+    eval_expr_with_l3(arg, ctx, score)
 }
 
 enum StatSelector<'a> {

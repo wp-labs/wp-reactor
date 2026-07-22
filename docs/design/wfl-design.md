@@ -325,7 +325,7 @@ field_decl    = field_name , ":" , field_type ;
 field_name    = IDENT | dotted_ident | quoted_ident ;
 dotted_ident  = IDENT , "." , IDENT , { "." , IDENT } ;   (* 兼容 WPL 产出的 detail.sha256 类字段 *)
 quoted_ident  = "`" , { ANY - "`" } , "`" ;               (* 包含特殊字符时使用反引号 *)
-field_type    = base_type | ("array" , "/" , base_type) ;
+field_type    = base_type | "object" | "array" | ("array" , "/" , base_type) ;
 base_type     = "chars" | "digit" | "float" | "bool" | "time" | "ip" | "hex" ;
 ```
 
@@ -343,6 +343,8 @@ base_type     = "chars" | "digit" | "float" | "bool" | "time" | "ip" | "hex" ;
 - `bool -> Boolean`
 - `time -> Timestamp(Nanosecond, None)`
 - `ip/hex -> Utf8`
+- `object -> Struct/Object`
+- `array -> List(Any)`
 - `array/T -> List(T)`
 
 ---
@@ -538,6 +540,7 @@ ANY           = ? any unicode char ? ;
 | `lower` | `lower(field)` → chars | L2 | 转小写 |
 | `upper` | `upper(field)` → chars | L2 | 转大写 |
 | `coalesce` | `coalesce(v1, v2, ...)` → T | L2 | 按顺序取第一个非 null 且非 blank 字符串的值 |
+| `merge` | `merge(obj1, obj2, ...)` → object | L2/L3 | 对 object 做左到右浅合并，后面的同名 key 覆盖前面的 key；缺失的 object 字段引用按空对象处理，其他求值失败仍失败 |
 | `isnull` / `isnotnull` | `isnull(expr)` / `isnotnull(expr)` → bool | L2 | 空值检查 |
 | `abs`/`ceil`/`floor`/`round`/`sqrt`/`exp`/`sign`/`trunc`/`pow`/`log`/`clamp`/`is_finite` | 数学函数 | L2 | 数值表达式辅助函数 |
 | `strftime` / `strptime` | 时间格式化/解析 | L2 | time/chars 转换 |
@@ -1251,6 +1254,7 @@ rule final_risk {
 | T45 | 在 `on event` 中引用 `close_reason` 编译错误 |
 | T46 | `yield` 中引用 `close_reason` 时类型为 `chars?`（nullable），需与目标字段类型一致 |
 | T47 | `coalesce(a, b, ...)` 至少需要 1 个参数；运行时按顺序跳过 null 和 blank 字符串。普通表达式要求参数类型兼容，直接作为 `yield` 赋值表达式时可由目标字段继续校验/转换混合标量类型 |
+| T47b | `merge(obj1, obj2, ...)` 至少需要 1 个参数；参数必须为 object；运行时执行左到右浅合并，后面的同名 key 覆盖前面的 key；缺失的 object 字段引用按空对象处理；object 字面量内部表达式失败、函数失败或非 object 参数会使 `merge()` 求值失败 |
 | T48 | `try(expr, default)` 为规划函数，当前未实现 |
 | T49 | `join ... asof` 中 `asof` 右表必须具备版本时间列（由 window `time` 字段声明） |
 | T50 | `join ... asof within DURATION` 中 `within` 必须 > 0；省略 `within` 时使用运行时默认值 |

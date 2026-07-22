@@ -18,9 +18,12 @@ use super::arrow::{replay_arrow_framed_file, replay_arrow_ipc_file};
 use super::batch::build_record_batch_from_json;
 use super::csv::replay_csv_file;
 use super::ndjson::replay_ndjson_file;
-use super::route::{batch_machine_id, coerce_column};
+use super::route::{batch_machine_id, coerce_column, coerce_column_for_field, route_batch};
 use super::{DEFAULT_STREAM_TAG_FIELD, ReplayRoute};
 use crate::metrics::{MetricsRecord, RuntimeMetrics};
+use wf_engine::match_engine::{
+    WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY, WFL_FIELD_TYPE_OBJECT,
+};
 use wf_engine::window::Router;
 
 fn test_schema() -> SchemaRef {
@@ -39,6 +42,13 @@ fn make_batch(schema: &SchemaRef, times: &[i64], values: &[i64]) -> RecordBatch 
         ],
     )
     .unwrap()
+}
+
+fn utf8_field_with_wfl_kind(name: &str, kind: &str) -> Field {
+    Field::new(name, DataType::Utf8, true).with_metadata(std::collections::HashMap::from([(
+        WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+        kind.to_string(),
+    )]))
 }
 
 fn test_config() -> WindowConfig {
@@ -663,6 +673,152 @@ fn typed_array_schema_uses_utf8_storage_for_file_sources() {
     assert_eq!(ports.value(0), r#"[22,2222]"#);
 }
 
+#[test]
+fn structured_stream_schema_accepts_arrow_struct_input() {
+    use crate::receiver::schema::validate_batch_schema_for_stream;
+    use arrow::array::StructArray;
+
+    let schemas = vec![wf_lang::WindowSchema {
+        name: "alerts".to_string(),
+        streams: vec!["events".to_string()],
+        time_field: None,
+        over: Duration::ZERO,
+        fields: vec![wf_lang::FieldDef {
+            name: "extension".to_string(),
+            field_type: wf_lang::FieldType::Object,
+        }],
+    }];
+    let extension = StructArray::from(vec![(
+        Arc::new(Field::new("severity", DataType::Int64, true)),
+        Arc::new(Int64Array::from(vec![10])) as arrow::array::ArrayRef,
+    )]);
+    let batch_schema = Schema::new(vec![Field::new(
+        "extension",
+        extension.data_type().clone(),
+        true,
+    )]);
+
+    validate_batch_schema_for_stream(&schemas, "events", &batch_schema).unwrap();
+}
+
+#[test]
+fn structured_array_stream_schema_accepts_arrow_list_input() {
+    use crate::receiver::schema::validate_batch_schema_for_stream;
+    use arrow::array::ListArray;
+    use arrow::datatypes::Int64Type;
+
+    let schemas = vec![wf_lang::WindowSchema {
+        name: "alerts".to_string(),
+        streams: vec!["events".to_string()],
+        time_field: None,
+        over: Duration::ZERO,
+        fields: vec![wf_lang::FieldDef {
+            name: "ports".to_string(),
+            field_type: wf_lang::FieldType::Array(wf_lang::BaseType::Digit),
+        }],
+    }];
+    let ports =
+        ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(22), Some(2222)])]);
+    let batch_schema = Schema::new(vec![Field::new("ports", ports.data_type().clone(), true)]);
+
+    validate_batch_schema_for_stream(&schemas, "events", &batch_schema).unwrap();
+}
+
+#[test]
+fn structured_object_stream_schema_rejects_arrow_list_input() {
+    use crate::receiver::schema::validate_batch_schema_for_stream;
+    use arrow::array::ListArray;
+    use arrow::datatypes::Int64Type;
+
+    let schemas = vec![wf_lang::WindowSchema {
+        name: "alerts".to_string(),
+        streams: vec!["events".to_string()],
+        time_field: None,
+        over: Duration::ZERO,
+        fields: vec![wf_lang::FieldDef {
+            name: "extension".to_string(),
+            field_type: wf_lang::FieldType::Object,
+        }],
+    }];
+    let extension =
+        ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(10), Some(20)])]);
+    let batch_schema = Schema::new(vec![Field::new(
+        "extension",
+        extension.data_type().clone(),
+        true,
+    )]);
+
+    assert!(validate_batch_schema_for_stream(&schemas, "events", &batch_schema).is_err());
+}
+
+#[test]
+fn structured_array_stream_schema_rejects_arrow_struct_input() {
+    use crate::receiver::schema::validate_batch_schema_for_stream;
+    use arrow::array::StructArray;
+
+    let schemas = vec![wf_lang::WindowSchema {
+        name: "alerts".to_string(),
+        streams: vec!["events".to_string()],
+        time_field: None,
+        over: Duration::ZERO,
+        fields: vec![wf_lang::FieldDef {
+            name: "tags".to_string(),
+            field_type: wf_lang::FieldType::ArrayAny,
+        }],
+    }];
+    let tags = StructArray::from(vec![(
+        Arc::new(Field::new("tag", DataType::Utf8, true)),
+        Arc::new(StringArray::from(vec!["ssh"])) as arrow::array::ArrayRef,
+    )]);
+    let batch_schema = Schema::new(vec![Field::new("tags", tags.data_type().clone(), true)]);
+
+    assert!(validate_batch_schema_for_stream(&schemas, "events", &batch_schema).is_err());
+}
+
+#[test]
+fn structured_object_stream_schema_rejects_utf8_array_metadata() {
+    use crate::receiver::schema::validate_batch_schema_for_stream;
+
+    let schemas = vec![wf_lang::WindowSchema {
+        name: "alerts".to_string(),
+        streams: vec!["events".to_string()],
+        time_field: None,
+        over: Duration::ZERO,
+        fields: vec![wf_lang::FieldDef {
+            name: "extension".to_string(),
+            field_type: wf_lang::FieldType::Object,
+        }],
+    }];
+    let batch_schema = Schema::new(vec![utf8_field_with_wfl_kind(
+        "extension",
+        WFL_FIELD_TYPE_ARRAY,
+    )]);
+
+    assert!(validate_batch_schema_for_stream(&schemas, "events", &batch_schema).is_err());
+}
+
+#[test]
+fn structured_array_stream_schema_rejects_utf8_object_metadata() {
+    use crate::receiver::schema::validate_batch_schema_for_stream;
+
+    let schemas = vec![wf_lang::WindowSchema {
+        name: "alerts".to_string(),
+        streams: vec!["events".to_string()],
+        time_field: None,
+        over: Duration::ZERO,
+        fields: vec![wf_lang::FieldDef {
+            name: "ports".to_string(),
+            field_type: wf_lang::FieldType::Array(wf_lang::BaseType::Digit),
+        }],
+    }];
+    let batch_schema = Schema::new(vec![utf8_field_with_wfl_kind(
+        "ports",
+        WFL_FIELD_TYPE_OBJECT,
+    )]);
+
+    assert!(validate_batch_schema_for_stream(&schemas, "events", &batch_schema).is_err());
+}
+
 #[tokio::test]
 async fn file_arrow_framed_replay_routes_rows() {
     let router = make_router("events");
@@ -887,6 +1043,52 @@ fn coerce_int64_to_utf8() {
 }
 
 #[test]
+fn coerce_structured_field_to_utf8_json() {
+    use crate::receiver::schema::field_to_arrow;
+    use arrow::array::{ArrayRef, StructArray};
+
+    let extension = StructArray::from(vec![
+        (
+            Arc::new(Field::new("severity", DataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![Some(10), None])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("source", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![Some("wfl"), Some("test")])) as ArrayRef,
+        ),
+    ]);
+    let col = Arc::new(extension) as ArrayRef;
+    let target = field_to_arrow("extension", &wf_lang::FieldType::Object);
+
+    let result = coerce_column_for_field(&col, &target, 2);
+    let strings = result.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(strings.value(0), r#"{"severity":10,"source":"wfl"}"#);
+    assert_eq!(strings.value(1), r#"{"source":"test"}"#);
+}
+
+#[test]
+fn coerce_structured_array_field_to_utf8_json() {
+    use crate::receiver::schema::field_to_arrow;
+    use arrow::array::{ArrayRef, ListArray};
+    use arrow::datatypes::Int64Type;
+
+    let ports = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+        Some(vec![Some(22), Some(2222)]),
+        Some(vec![Some(443)]),
+    ]);
+    let col = Arc::new(ports) as ArrayRef;
+    let target = field_to_arrow(
+        "ports",
+        &wf_lang::FieldType::Array(wf_lang::BaseType::Digit),
+    );
+
+    let result = coerce_column_for_field(&col, &target, 2);
+    let strings = result.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(strings.value(0), r#"[22,2222]"#);
+    assert_eq!(strings.value(1), r#"[443]"#);
+}
+
+#[test]
 fn coerce_same_type_noop() {
     let arr: arrow::array::ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
     let result = coerce_column(&arr, &DataType::Utf8, 2);
@@ -894,6 +1096,107 @@ fn coerce_same_type_noop() {
     let strings = result.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(strings.value(0), "a");
     assert_eq!(strings.value(1), "b");
+}
+
+#[test]
+fn route_projects_plain_utf8_json_into_structured_window_schema() {
+    use crate::receiver::schema::field_to_arrow;
+    use wf_engine::match_engine::batch_to_events;
+
+    let schema = Arc::new(Schema::new(vec![field_to_arrow(
+        "extension",
+        &wf_lang::FieldType::Object,
+    )]));
+    let mut reg = WindowRegistry::build(vec![WindowDef {
+        params: WindowParams {
+            name: "alerts".into(),
+            schema,
+            time_col_index: None,
+            over: Duration::ZERO,
+        },
+        streams: vec!["events".to_string()],
+        config: test_config(),
+    }])
+    .unwrap();
+    register_miss_provider(&mut reg);
+    let router = Router::new(reg);
+    let source_schema = Arc::new(Schema::new(vec![Field::new(
+        "extension",
+        DataType::Utf8,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        source_schema,
+        vec![Arc::new(StringArray::from(vec![r#"{"severity":10}"#])) as arrow::array::ArrayRef],
+    )
+    .unwrap();
+
+    route_batch("events", "test_source", batch, &router, None).unwrap();
+    let stored = router.registry().snapshot("alerts").unwrap();
+    assert_eq!(
+        stored[0]
+            .schema()
+            .field(0)
+            .metadata()
+            .get(WFL_FIELD_TYPE_METADATA_KEY)
+            .map(String::as_str),
+        Some("object")
+    );
+    let events = batch_to_events(&stored[0]);
+    let Value::Object(extension) = &events[0].fields["extension"] else {
+        panic!("expected extension object");
+    };
+    assert_eq!(extension.get("severity"), Some(&Value::Number(10.0)));
+}
+
+#[test]
+fn route_projects_wrong_structured_utf8_metadata_into_target_window_schema() {
+    use crate::receiver::schema::field_to_arrow;
+    use wf_engine::match_engine::batch_to_events;
+
+    let schema = Arc::new(Schema::new(vec![field_to_arrow(
+        "extension",
+        &wf_lang::FieldType::Object,
+    )]));
+    let mut reg = WindowRegistry::build(vec![WindowDef {
+        params: WindowParams {
+            name: "alerts".into(),
+            schema,
+            time_col_index: None,
+            over: Duration::ZERO,
+        },
+        streams: vec!["events".to_string()],
+        config: test_config(),
+    }])
+    .unwrap();
+    register_miss_provider(&mut reg);
+    let router = Router::new(reg);
+    let source_schema = Arc::new(Schema::new(vec![utf8_field_with_wfl_kind(
+        "extension",
+        WFL_FIELD_TYPE_ARRAY,
+    )]));
+    let batch = RecordBatch::try_new(
+        source_schema,
+        vec![Arc::new(StringArray::from(vec![r#"{"severity":10}"#])) as arrow::array::ArrayRef],
+    )
+    .unwrap();
+
+    route_batch("events", "test_source", batch, &router, None).unwrap();
+    let stored = router.registry().snapshot("alerts").unwrap();
+    assert_eq!(
+        stored[0]
+            .schema()
+            .field(0)
+            .metadata()
+            .get(WFL_FIELD_TYPE_METADATA_KEY)
+            .map(String::as_str),
+        Some(WFL_FIELD_TYPE_OBJECT)
+    );
+    let events = batch_to_events(&stored[0]);
+    let Value::Object(extension) = &events[0].fields["extension"] else {
+        panic!("expected extension object");
+    };
+    assert_eq!(extension.get("severity"), Some(&Value::Number(10.0)));
 }
 
 #[test]

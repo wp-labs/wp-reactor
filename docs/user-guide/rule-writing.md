@@ -148,7 +148,7 @@ window security_alerts {
 }
 ```
 
-然后在 `yield` 里构造 `object` / `array`：
+然后在 `yield` 里构造 `object` / `array`，或者透传输入 stream 中的结构化对象并增量合并字段：
 
 ```wfl
 yield security_alerts (
@@ -165,10 +165,23 @@ yield security_alerts (
 )
 ```
 
+```wfl
+yield security_alerts (
+    risk_context = merge(
+        fail.extension,
+        object {
+            source = "wfl";
+            ioc_value = fail.sip;
+        }
+    )
+)
+```
+
 使用要点：
 
-- `object` / `array` 只用于输出 window 或中间 window；输入 stream/provider window 不允许声明结构化字段。
-- 源数据里的 JSON object/array 先按 `chars` 接入，需要输出时再用 `yield` 构造结构化值。
+- `object` / `array` 可用于输入 stream、输出 window 或中间 window；provider window 暂不支持结构化字段。
+- 输入 stream 中的结构化字段可直接 `yield` 透传，也可用 `merge(obj1, obj2, ...)` 做浅合并富化；后面的同名 key 覆盖前面的 key。
+- `merge()` 中缺失的 object 字段引用会按空对象跳过；如果 object 字面量内部字段表达式不可求值，或参数不是 object，`merge()` 会失败。
 - `array/float` 允许整数元素自动提升为 float；`array/chars` 只接受字符串元素。
 - 如果结构化字段写入中间 window，下游规则读取到的是 UTF-8 JSON 字符串桥接值；最终 sink 输出格式仍由 sink 决定。
 

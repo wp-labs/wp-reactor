@@ -1,12 +1,35 @@
 use std::collections::HashMap;
 
 use arrow::array::{
-    Array, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
+    Array, BooleanArray, FixedSizeListArray, Float64Array, Int64Array, LargeListArray, ListArray,
+    StringArray, StructArray, TimestampNanosecondArray,
 };
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use super::match_engine::{Event, Value};
+
+pub const WFL_FIELD_TYPE_METADATA_KEY: &str = "wf.wfl.field_type";
+pub const WFL_FIELD_TYPE_OBJECT: &str = "object";
+pub const WFL_FIELD_TYPE_ARRAY: &str = "array";
+
+pub fn is_wfl_structured_field(field: &Field) -> bool {
+    wfl_structured_field_kind(field).is_some()
+}
+
+pub fn wfl_structured_field_kind(field: &Field) -> Option<&str> {
+    match field
+        .metadata()
+        .get(WFL_FIELD_TYPE_METADATA_KEY)
+        .map(String::as_str)
+    {
+        Some(WFL_FIELD_TYPE_OBJECT | WFL_FIELD_TYPE_ARRAY) => field
+            .metadata()
+            .get(WFL_FIELD_TYPE_METADATA_KEY)
+            .map(String::as_str),
+        _ => None,
+    }
+}
 
 /// Convert an Arrow [`RecordBatch`] into a `Vec<Event>`, one per row.
 ///
@@ -20,6 +43,8 @@ use super::match_engine::{Event, Value};
 /// | Utf8                 | → | Value::Str(s)           |
 /// | Boolean              | → | Value::Bool(b)          |
 /// | Timestamp(Ns, _)     | → | Value::Number(ns as f64)|
+/// | Struct               | → | Value::Object           |
+/// | List/LargeList       | → | Value::Array            |
 pub fn batch_to_events(batch: &RecordBatch) -> Vec<Event> {
     let num_rows = batch.num_rows();
     let schema = batch.schema();
@@ -32,7 +57,7 @@ pub fn batch_to_events(batch: &RecordBatch) -> Vec<Event> {
             if col.is_null(row) {
                 continue;
             }
-            if let Some(val) = extract_value(col.as_ref(), row) {
+            if let Some(val) = extract_field_value(field, col.as_ref(), row) {
                 fields.insert(field.name().clone(), val);
             }
         }
@@ -71,13 +96,25 @@ pub fn batch_to_timestamped_rows(
             if col.is_null(row) {
                 continue;
             }
-            if let Some(val) = extract_value(col.as_ref(), row) {
+            if let Some(val) = extract_field_value(field, col.as_ref(), row) {
                 fields.insert(field.name().clone(), val);
             }
         }
         rows.push((ts, fields));
     }
     rows
+}
+
+fn extract_field_value(field: &Field, col: &dyn Array, row: usize) -> Option<Value> {
+    if let Some(kind) = wfl_structured_field_kind(field)
+        && matches!(col.data_type(), DataType::Utf8)
+    {
+        let arr = col.as_any().downcast_ref::<StringArray>()?;
+        return serde_json::from_str::<serde_json::Value>(arr.value(row))
+            .ok()
+            .and_then(|value| json_to_structured_value(kind, value));
+    }
+    extract_value(col, row)
 }
 
 fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
@@ -102,8 +139,76 @@ fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
             let arr = col.as_any().downcast_ref::<TimestampNanosecondArray>()?;
             Some(Value::Number(arr.value(row) as f64))
         }
+        DataType::Struct(_) => {
+            let arr = col.as_any().downcast_ref::<StructArray>()?;
+            let mut fields = HashMap::new();
+            for (field, child) in arr.fields().iter().zip(arr.columns()) {
+                if child.is_null(row) {
+                    continue;
+                }
+                if let Some(value) = extract_value(child.as_ref(), row) {
+                    fields.insert(field.name().clone(), value);
+                }
+            }
+            Some(Value::Object(fields))
+        }
+        DataType::List(_) => {
+            let arr = col.as_any().downcast_ref::<ListArray>()?;
+            Some(Value::Array(extract_list_values(arr.value(row).as_ref())))
+        }
+        DataType::LargeList(_) => {
+            let arr = col.as_any().downcast_ref::<LargeListArray>()?;
+            Some(Value::Array(extract_list_values(arr.value(row).as_ref())))
+        }
+        DataType::FixedSizeList(_, _) => {
+            let arr = col.as_any().downcast_ref::<FixedSizeListArray>()?;
+            Some(Value::Array(extract_list_values(arr.value(row).as_ref())))
+        }
         _ => None,
     }
+}
+
+fn json_to_value(value: serde_json::Value) -> Option<Value> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(v) => Some(Value::Bool(v)),
+        serde_json::Value::Number(v) => v.as_f64().map(Value::Number),
+        serde_json::Value::String(v) => Some(Value::Str(v)),
+        serde_json::Value::Array(values) => Some(Value::Array(
+            values.into_iter().filter_map(json_to_value).collect(),
+        )),
+        serde_json::Value::Object(fields) => Some(Value::Object(
+            fields
+                .into_iter()
+                .filter_map(|(key, value)| json_to_value(value).map(|value| (key, value)))
+                .collect(),
+        )),
+    }
+}
+
+fn json_to_structured_value(kind: &str, value: serde_json::Value) -> Option<Value> {
+    match (kind, value) {
+        (WFL_FIELD_TYPE_OBJECT, serde_json::Value::Object(fields)) => {
+            json_to_value(serde_json::Value::Object(fields))
+        }
+        (WFL_FIELD_TYPE_ARRAY, serde_json::Value::Array(values)) => {
+            json_to_value(serde_json::Value::Array(values))
+        }
+        _ => None,
+    }
+}
+
+fn extract_list_values(values: &dyn Array) -> Vec<Value> {
+    let mut out = Vec::with_capacity(values.len());
+    for idx in 0..values.len() {
+        if values.is_null(idx) {
+            continue;
+        }
+        if let Some(value) = extract_value(values, idx) {
+            out.push(value);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +219,7 @@ fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
 mod tests {
     use super::*;
     use arrow::array::ArrayRef;
-    use arrow::datatypes::{Field, Schema};
+    use arrow::datatypes::{Field, Int64Type, Schema};
     use std::sync::Arc;
 
     fn make_schema(fields: Vec<Field>) -> Arc<Schema> {
@@ -222,5 +327,124 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].fields["score"], Value::Number(3.21));
         assert_eq!(events[1].fields["score"], Value::Number(9.87));
+    }
+
+    #[test]
+    fn test_batch_to_events_struct_and_list() {
+        let tags =
+            ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(10), Some(20)])]);
+        let detection = StructArray::from(vec![(
+            Arc::new(Field::new("severity", DataType::Int64, false)),
+            Arc::new(Int64Array::from(vec![10])) as ArrayRef,
+        )]);
+        let extension = StructArray::from(vec![
+            (
+                Arc::new(Field::new(
+                    "detection",
+                    detection.data_type().clone(),
+                    false,
+                )),
+                Arc::new(detection) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("tags", tags.data_type().clone(), true)),
+                Arc::new(tags) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("ignored", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+            ),
+        ]);
+        let schema = make_schema(vec![Field::new(
+            "extension",
+            extension.data_type().clone(),
+            false,
+        )]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(extension) as ArrayRef]).unwrap();
+
+        let events = batch_to_events(&batch);
+        let Value::Object(extension) = &events[0].fields["extension"] else {
+            panic!("expected extension object");
+        };
+        let Some(Value::Object(detection)) = extension.get("detection") else {
+            panic!("expected nested detection object, got {extension:?}");
+        };
+        assert_eq!(detection.get("severity"), Some(&Value::Number(10.0)));
+        assert_eq!(
+            extension.get("tags"),
+            Some(&Value::Array(vec![
+                Value::Number(10.0),
+                Value::Number(20.0)
+            ]))
+        );
+        assert!(!extension.contains_key("ignored"));
+    }
+
+    #[test]
+    fn test_batch_to_events_parses_structured_utf8_json_only_with_metadata() {
+        let structured_field = Field::new("extension", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                WFL_FIELD_TYPE_OBJECT.to_string(),
+            )]),
+        );
+        let schema = make_schema(vec![
+            structured_field,
+            Field::new("plain", DataType::Utf8, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![r#"{"severity":10,"tags":["ssh"]}"#])) as ArrayRef,
+                Arc::new(StringArray::from(vec![r#"{"severity":10}"#])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let events = batch_to_events(&batch);
+        let Value::Object(extension) = &events[0].fields["extension"] else {
+            panic!("expected extension object");
+        };
+        assert_eq!(extension.get("severity"), Some(&Value::Number(10.0)));
+        assert_eq!(
+            extension.get("tags"),
+            Some(&Value::Array(vec![Value::Str("ssh".to_string())]))
+        );
+        assert_eq!(
+            events[0].fields["plain"],
+            Value::Str(r#"{"severity":10}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_batch_to_events_parses_structured_array_utf8_json_with_metadata() {
+        let structured_field = Field::new("ports", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                WFL_FIELD_TYPE_ARRAY.to_string(),
+            )]),
+        );
+        let schema = make_schema(vec![
+            structured_field,
+            Field::new("plain", DataType::Utf8, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![r#"[22,2222]"#])) as ArrayRef,
+                Arc::new(StringArray::from(vec![r#"[22,2222]"#])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let events = batch_to_events(&batch);
+        assert_eq!(
+            events[0].fields["ports"],
+            Value::Array(vec![Value::Number(22.0), Value::Number(2222.0)])
+        );
+        assert_eq!(
+            events[0].fields["plain"],
+            Value::Str(r#"[22,2222]"#.to_string())
+        );
     }
 }
