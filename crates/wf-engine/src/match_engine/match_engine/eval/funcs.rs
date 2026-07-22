@@ -778,16 +778,20 @@ pub(super) fn eval_func_call(
             Some(Value::Number(current_time_nanos()? as f64))
         }
         "strftime" => {
-            if args.len() != 2 {
+            if args.len() != 1 && args.len() != 2 {
                 return None;
             }
             let ts_nanos = match eval_expr_ext(&args[0], event, windows, baselines)? {
                 Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
                 _ => return None,
             };
-            let fmt = match eval_expr_ext(&args[1], event, windows, baselines)? {
-                Value::Str(s) => s,
-                _ => return None,
+            let fmt = if let Some(fmt_expr) = args.get(1) {
+                match eval_expr_ext(fmt_expr, event, windows, baselines)? {
+                    Value::Str(s) => s,
+                    _ => return None,
+                }
+            } else {
+                wf_config::DEFAULT_OUTPUT_TIME_FORMAT.to_string()
             };
             let dt = timestamp_nanos_to_utc(ts_nanos)?;
             Some(Value::Str(dt.format(&fmt).to_string()))

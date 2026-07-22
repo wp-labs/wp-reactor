@@ -2,7 +2,7 @@ use crate::ast::{CloseMode, Expr, RuleDecl};
 use crate::schema::WindowSchema;
 
 use crate::checker::scope::{self, Scope};
-use crate::checker::types::{check_expr_type_with_system_vars, compatible, infer_type};
+use crate::checker::types::{check_expr_type_with_system_vars, infer_type, yield_assignable};
 use crate::checker::{CheckError, Severity};
 
 use super::WFU_PREFIX;
@@ -132,7 +132,7 @@ pub fn check_yield(
                         check_expr_type_with_system_vars(&arg.value, scope, name, errors);
                         if let Some(val_type) = infer_type(&arg.value, scope) {
                             let expected = scope::field_type_to_val(&fd.field_type);
-                            if !compatible(&expected, &val_type) {
+                            if !yield_assignable(&expected, &val_type) {
                                 errors.push(CheckError {
                                     severity: Severity::Error,
                                     rule: Some(name.to_string()),

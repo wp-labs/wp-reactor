@@ -9,6 +9,7 @@ pub enum FusionChangeKind {
     Sources,
     Windows,
     Sinks,
+    Output,
     Logging,
     Metrics,
     Mode,
@@ -109,6 +110,13 @@ fn classify_path(path: &str) -> (FusionChangeKind, FusionReloadDisposition, &'st
             FusionChangeKind::Runtime,
             FusionReloadDisposition::RequiresRestart,
             "runtime execution and schema settings are not hot-reloadable yet",
+        );
+    }
+    if path == "output" || path.starts_with("output.") {
+        return (
+            FusionChangeKind::Output,
+            FusionReloadDisposition::HotReloadSupported,
+            "output formatting changed; runtime can recompile and swap rule plans",
         );
     }
     if path == "sources" || path.starts_with("sources[") {
@@ -268,6 +276,91 @@ CASE_PATH = "/tmp/case-a"
             plan.hot_reload
                 .iter()
                 .any(|c| c.kind == FusionChangeKind::Vars)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reload_plan_marks_output_format_changes_as_hot_reloadable() {
+        let root = make_temp_dir("output-hot-reloadable");
+        let base_path = root.join("conf/base.toml");
+        let old_overlay = root.join("env/dev/old.toml");
+        let new_overlay = root.join("env/dev/new.toml");
+        write_file(
+            &base_path,
+            r#"
+mode = "batch"
+sinks = "sinks"
+
+[[sources]]
+type = "file"
+path = "data/base.ndjson"
+stream_tag = "syslog"
+format = "ndjson"
+
+[runtime]
+executor_parallelism = 2
+rule_exec_timeout = "30s"
+schemas = "schemas/base/*.wfs"
+rules = "rules/base/*.wfl"
+
+[window_defaults]
+evict_interval = "30s"
+max_window_bytes = "256MB"
+max_total_bytes = "2GB"
+evict_policy = "time_first"
+watermark = "5s"
+allowed_lateness = "0s"
+late_policy = "drop"
+
+[window.base_events]
+mode = "local"
+max_window_bytes = "256MB"
+over_cap = "30m"
+"#,
+        );
+        write_file(
+            &old_overlay,
+            r#"
+[output]
+time_format = "%Y-%m-%d %H:%M:%S%.3f"
+"#,
+        );
+        write_file(
+            &new_overlay,
+            r#"
+[output]
+time_format = "%Y-%m-%d"
+"#,
+        );
+
+        let old_raw = FusionConfigLoader::new(
+            &base_path,
+            std::slice::from_ref(&old_overlay),
+            &ConfigVarContext::new(),
+            None,
+        )
+        .load_raw()
+        .expect("load old raw");
+        let new_raw = FusionConfigLoader::new(
+            &base_path,
+            std::slice::from_ref(&new_overlay),
+            &ConfigVarContext::new(),
+            None,
+        )
+        .load_raw()
+        .expect("load new raw");
+
+        let plan = old_raw.build_reload_plan(&new_raw);
+        assert_eq!(plan.hot_reload.len(), 1);
+        assert!(plan.requires_restart.is_empty());
+        assert!(plan.unsupported.is_empty());
+        assert!(plan.can_hot_reload());
+        assert_eq!(plan.hot_reload[0].kind, FusionChangeKind::Output);
+        assert_eq!(
+            plan.hot_reload[0].disposition,
+            FusionReloadDisposition::HotReloadSupported
         );
 
         let _ = std::fs::remove_dir_all(root);

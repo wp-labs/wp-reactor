@@ -13,6 +13,7 @@ use crate::config_loader::validate;
 use crate::error::{ConfigReason, ConfigResult};
 use crate::logging_metrics::logging::LoggingConfig;
 use crate::logging_metrics::metrics::MetricsConfig;
+use crate::output::OutputConfig;
 use crate::source::SourceConfig;
 use crate::vars::inject_loader_scoped_vars;
 use crate::vars::{ConfigVarContext, expand_value};
@@ -54,6 +55,8 @@ struct FusionConfigRaw {
     logging: LoggingConfig,
     #[serde(default)]
     metrics: MetricsConfig,
+    #[serde(default)]
+    output: OutputConfig,
     /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
     #[serde(default)]
     vars: HashMap<String, String>,
@@ -86,6 +89,7 @@ pub struct FusionConfig {
     pub work_root: Option<String>,
     pub logging: LoggingConfig,
     pub metrics: MetricsConfig,
+    pub output: OutputConfig,
     /// User-defined variables for WFL `$VAR` / `${VAR:default}` preprocessing.
     pub vars: HashMap<String, String>,
     /// Resolved input source list.
@@ -202,6 +206,7 @@ impl FusionConfig {
             work_root: raw.work_root,
             logging: raw.logging,
             metrics: raw.metrics,
+            output: raw.output,
             vars: raw.vars,
             sources,
             admin_api: raw.admin_api,

@@ -83,7 +83,7 @@ rule r {
 }
 
 #[test]
-fn yield_checks_wfu_meta_type() {
+fn yield_allows_numeric_to_target_chars_field() {
     let out = make_output_window("out", vec![("rule_name", bt(BaseType::Chars))]);
     let input = r#"
 rule r {
@@ -93,7 +93,7 @@ rule r {
     yield out (rule_name = @__wfu_score)
 }
 "#;
-    assert_has_error(input, &[auth_events_window(), out], "type mismatch");
+    assert_no_errors(input, &[auth_events_window(), out]);
 }
 
 #[test]
@@ -197,7 +197,7 @@ rule r {
 }
 
 #[test]
-fn yield_rejects_time_system_var_for_non_time_field() {
+fn yield_allows_time_system_var_for_target_chars_field() {
     let out = make_output_window("out", vec![("first_seen", bt(BaseType::Chars))]);
     let input = r#"
 rule r {
@@ -205,6 +205,20 @@ rule r {
     match<:5m> { on event { e | count >= 1; } } -> score(50.0)
     entity(ip, e.sip)
     yield out (first_seen = @event_first_time)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
+fn yield_rejects_chars_to_time_field_without_explicit_parse() {
+    let out = make_output_window("out", vec![("first_seen", bt(BaseType::Time))]);
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (first_seen = "2026-07-21 07:30:22.838")
 }
 "#;
     assert_has_error(input, &[auth_events_window(), out], "type mismatch");

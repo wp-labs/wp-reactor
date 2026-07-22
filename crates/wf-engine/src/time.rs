@@ -2,7 +2,7 @@ pub(crate) fn epoch_nanos_to_millis(nanos: i64) -> i64 {
     nanos.div_euclid(1_000_000)
 }
 
-pub(crate) fn normalize_epoch_timestamp_float_nanos(raw: f64) -> Option<i64> {
+pub fn normalize_epoch_timestamp_float_nanos(raw: f64) -> Option<i64> {
     if !raw.is_finite() {
         return None;
     }

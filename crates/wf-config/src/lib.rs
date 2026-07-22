@@ -3,6 +3,7 @@ pub mod change;
 pub mod config_loader;
 pub mod error;
 pub mod logging_metrics;
+pub mod output;
 
 pub mod project;
 pub mod project_remote;
@@ -22,6 +23,7 @@ pub use config_loader::{
 };
 pub use error::{ConfigError, ConfigReason, ConfigResult};
 pub use logging_metrics::{LogFormat, LoggingConfig, MetricsConfig, MetricsTopNConfig};
+pub use output::{DEFAULT_OUTPUT_TIME_FORMAT, OutputConfig, OutputTimeZone};
 pub use project::{load_schemas, load_wfl, load_wfl_with_context, parse_vars};
 pub use source::SourceConfig;
 pub use types::{ByteSize, DistMode, EvictPolicy, HumanDuration, LatePolicy};

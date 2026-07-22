@@ -8,7 +8,7 @@ mod match_engine;
 mod tests;
 
 pub use event_bridge::{batch_to_events, batch_to_timestamped_rows};
-pub use executor::RuleExecutor;
+pub use executor::{RuleExecutor, RuleExecutorOptions};
 pub use match_engine::{
     CepStateMachine, CloseOutput, CloseReason, Event, MACHINE_ID, MatchedContext, StepData,
     StepResult, Value, WindowLookup,

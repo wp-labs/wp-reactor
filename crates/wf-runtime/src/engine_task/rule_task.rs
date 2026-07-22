@@ -16,6 +16,7 @@ use wf_engine::alert::OutputRecord;
 use wf_engine::match_engine::{
     CepStateMachine, CloseReason, RuleExecutor, StepResult, batch_to_events,
 };
+use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{AppendOutcome, Router};
 use wf_lang::plan::ConvPlan;
 use wf_lang::wfu_meta::{WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
@@ -535,9 +536,10 @@ fn value_to_single_row_array(
         ) => Ok(Arc::new(StringArray::from(vec![Some(
             value_to_json_string(value)?,
         )]))),
-        (DataType::Timestamp(_, _), Some(wf_engine::match_engine::Value::Number(n))) => Ok(
-            Arc::new(TimestampNanosecondArray::from(vec![Some(*n as i64)])),
-        ),
+        (DataType::Timestamp(_, _), Some(wf_engine::match_engine::Value::Number(n))) => {
+            let nanos = normalize_epoch_timestamp_float_nanos(*n);
+            Ok(Arc::new(TimestampNanosecondArray::from(vec![nanos])))
+        }
         _ => Ok(new_null_array(data_type, 1)),
     }
 }

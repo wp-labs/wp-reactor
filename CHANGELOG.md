@@ -2,10 +2,12 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [0.1.33 Unreleased]
+## [0.1.34 Unreleased]
 
 ### Changed
 
+- **wf-lang / wf-engine**: Added yield-target type coercion for common output mappings, including numeric and boolean values into `chars` fields and validated coercion for numeric, IP, hex, and time targets.
+- **wf-runtime**: Treat `[output]` formatting changes as hot-reloadable so rule executors are rebuilt with the latest project output settings.
 - **wf-runtime**: Changed the default dynamic stream-tag payload carrier from `wp_stream_tag` to `wp_oml_name`, matching warp-parse OML output naming.
 - **User guide**: Updated runtime source examples to use `stream_tag_field = "wp_oml_name"`.
 - **wf-engine**: Unified WFL `time` expression values on epoch milliseconds: `now()` and `now_ms()` now return milliseconds, `strptime()` and `time_bucket()` return milliseconds, and `strftime()` / `time_diff()` accept epoch seconds, milliseconds, microseconds, or nanoseconds by timestamp width.
@@ -15,6 +17,8 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Added
 
+- **wf-config / wf-engine**: Added project-level `[output]` configuration with `time_format` and UTC `time_zone`, used as the default format for one-argument `strftime(time)` calls.
+- **wf-engine**: Added `RuleExecutorOptions` for passing output formatting and yield target type metadata without growing constructor argument lists.
 - **wf-lang / wf-engine / wf-runtime**: Added yield-only wfusion metadata references such as `@__wfu_rule_name` and `@__wfu_score`, allowing rules to map engine-managed metadata into ordinary output fields while keeping `__wfu_*` yield targets reserved.
 - **wf-lang**: Added a centralized wfusion metadata field directory, including field names, types, yield availability, and a restricted intermediate-window metadata subset for automatic pipeline fields.
 - **wf-lang / wf-engine**: Added yield-only time system variables `@event_first_time`, `@event_last_time`, `@evidence_start_time`, `@evidence_end_time`, `@window_start_time`, `@window_end_time`, and `@emit_time`.
@@ -27,6 +31,8 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Fixed
 
+- **wf-lang / wf-engine**: Kept `chars` to `time` conversion explicit in both semantic checks and runtime yield coercion; string timestamps must be parsed with an explicit time expression.
+- **wf-runtime**: Normalized numeric time yields to Arrow `TimestampNanosecond` values when writing intermediate pipeline batches, preserving seconds/milliseconds/microseconds/nanoseconds inputs consistently.
 - **wf-engine**: Reused a shared epoch timestamp normalization helper across alert export and both expression evaluators to keep second/millisecond/microsecond/nanosecond handling consistent.
 - **wf-engine**: `time_bucket()` now rejects zero, negative, and non-finite intervals instead of producing surprising bucket results.
 - **wf-engine tests**: Removed cross-evaluation exact equality checks for `now()` / `now_ms()` to avoid millisecond-boundary flakes while preserving same-expression timestamp stability coverage.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::DEFAULT_OUTPUT_TIME_FORMAT;
 use crate::source::SourceConfig;
 use crate::types::{ByteSize, DistMode, EvictPolicy, HumanDuration, LatePolicy};
 use std::path::{Path, PathBuf};
@@ -106,6 +107,7 @@ fn load_full_toml() {
     );
     assert_eq!(cfg.runtime.schemas, "schemas/*.wfs");
     assert_eq!(cfg.runtime.rules, "rules/*.wfl");
+    assert_eq!(cfg.output.time_format, DEFAULT_OUTPUT_TIME_FORMAT);
 
     // window_defaults
     assert_eq!(
@@ -172,6 +174,64 @@ fn load_full_toml() {
         }
         _ => {}
     }
+}
+
+#[test]
+fn load_output_config() {
+    let cfg = load_with_windows(
+        r#"
+mode = "daemon"
+windows = "models/windows.toml"
+sinks = "sinks"
+
+[output]
+time_format = "%Y-%m-%d"
+time_zone = "utc"
+
+[[sources]]
+type = "tcp"
+key = "ingress"
+listen = "tcp://127.0.0.1:9800"
+
+[runtime]
+executor_parallelism = 2
+rule_exec_timeout = "30s"
+schemas = "schemas/*.wfs"
+rules = "rules/*.wfl"
+"#,
+        WINDOWS_TOML,
+    );
+
+    assert_eq!(cfg.output.time_format, "%Y-%m-%d");
+}
+
+#[test]
+fn reject_invalid_output_time_format() {
+    let err = try_load_with_windows(
+        r#"
+mode = "daemon"
+windows = "models/windows.toml"
+sinks = "sinks"
+
+[output]
+time_format = "%"
+
+[[sources]]
+type = "tcp"
+key = "ingress"
+listen = "tcp://127.0.0.1:9800"
+
+[runtime]
+executor_parallelism = 2
+rule_exec_timeout = "30s"
+schemas = "schemas/*.wfs"
+rules = "rules/*.wfl"
+"#,
+        WINDOWS_TOML,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("output.time_format"));
 }
 
 #[test]

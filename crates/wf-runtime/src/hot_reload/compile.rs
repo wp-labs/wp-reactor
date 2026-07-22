@@ -54,7 +54,7 @@ pub(super) fn compile_reload_artifacts(
         "validate window over vs over_cap",
     )?;
 
-    let run_rules = build_run_rules(&all_rule_plans, &runtime_schemas);
+    let run_rules = build_run_rules(&all_rule_plans, &runtime_schemas, &config.output);
     Ok(CompiledReloadArtifacts {
         run_rules,
         intermediate_targets,

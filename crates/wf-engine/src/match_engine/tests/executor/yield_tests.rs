@@ -1,10 +1,14 @@
+use std::collections::HashMap;
+
+use wf_config::OutputConfig;
 use wf_lang::ast::{BinOp, Expr, FieldRef, ObjectItem, SystemVar};
 use wf_lang::plan::{EachPlan, StepPlan, YieldField};
 use wf_lang::wfu_meta::WfuMetaField;
+use wf_lang::{BaseType, FieldType};
 
-use crate::match_engine::RuleExecutor;
 use crate::match_engine::Value;
 use crate::match_engine::match_engine::{BindData, CloseOutput, CloseReason, StepData};
+use crate::match_engine::{RuleExecutor, RuleExecutorOptions};
 
 use super::super::helpers::*;
 use super::helpers::{default_match_plan, default_matched_context};
@@ -45,6 +49,172 @@ fn execute_each_yield_can_reference_score() {
             .find(|(name, _)| name == "risk_score")
             .map(|(_, value)| value.clone()),
         Some(num(10.0))
+    );
+}
+
+#[test]
+fn execute_each_yield_coerces_score_to_target_chars_field() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "risk_score".to_string(),
+        value: Expr::SystemVar(SystemVar::Score),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("risk_score".to_string(), FieldType::Base(BaseType::Chars))]),
+    );
+
+    let alert = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), 1_000_000)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(name, _)| name == "risk_score")
+            .map(|(_, value)| value.clone()),
+        Some(str_val("10"))
+    );
+}
+
+#[test]
+fn execute_each_yield_validates_time_target_and_keeps_epoch_millis_value() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "first_seen".to_string(),
+        value: Expr::SystemVar(SystemVar::EventFirstTime),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("first_seen".to_string(), FieldType::Base(BaseType::Time))]),
+    );
+
+    let alert = exec
+        .execute_each(
+            &event(vec![("sip", str_val("10.0.0.1"))]),
+            1_700_000_000_123_000_000,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(name, _)| name == "first_seen")
+            .map(|(_, value)| value.clone()),
+        Some(num(1_700_000_000_123.0))
+    );
+}
+
+#[test]
+fn execute_each_yield_rejects_chars_to_time_target() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "first_seen".to_string(),
+        value: Expr::StringLit("2023-11-14 22:13:20".to_string()),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("first_seen".to_string(), FieldType::Base(BaseType::Time))]),
+    );
+
+    let err = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), 1_000_000)
+        .expect_err("chars to time must require explicit parsing");
+
+    assert!(
+        err.to_string().contains("explicit time expression"),
+        "{err}"
+    );
+}
+
+#[test]
+fn execute_each_strftime_uses_project_default_time_format() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "event_year".to_string(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "strftime".to_string(),
+            args: vec![Expr::SystemVar(SystemVar::EventFirstTime)],
+        },
+    }];
+    let exec = RuleExecutor::new_with_options(
+        plan,
+        RuleExecutorOptions {
+            yield_field_types: HashMap::from([(
+                "event_year".to_string(),
+                FieldType::Base(BaseType::Chars),
+            )]),
+            output: OutputConfig {
+                time_format: "%Y".to_string(),
+                ..OutputConfig::default()
+            },
+        },
+    );
+
+    let alert = exec
+        .execute_each(
+            &event(vec![("sip", str_val("10.0.0.1"))]),
+            1_700_000_000_123_000_000,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(name, _)| name == "event_year")
+            .map(|(_, value)| value.clone()),
+        Some(str_val("2023"))
     );
 }
 

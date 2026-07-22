@@ -5,3 +5,5 @@ pub mod match_engine;
 pub mod sink;
 pub(crate) mod time;
 pub mod window;
+
+pub use time::normalize_epoch_timestamp_float_nanos;

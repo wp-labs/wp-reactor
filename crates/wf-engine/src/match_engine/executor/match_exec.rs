@@ -90,6 +90,7 @@ impl RuleExecutor {
                 window_start_time_nanos: Some(matched.window_start_time_nanos),
                 window_end_time_nanos: Some(matched.window_end_time_nanos),
                 emit_time_nanos: Some(emit_time_nanos),
+                time_format: Some(self.output_config().time_format.as_str()),
             };
             self.plan
                 .yield_plan
@@ -104,6 +105,7 @@ impl RuleExecutor {
                                 field.name
                             )));
                     };
+                    let value = self.coerce_yield_field_value(&field.name, value)?;
                     Ok((field.name.clone(), value))
                 })
                 .collect::<CoreResult<Vec<_>>>()

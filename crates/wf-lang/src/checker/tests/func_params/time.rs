@@ -59,6 +59,20 @@ rule r {
 }
 
 #[test]
+fn strftime_accepts_project_default_format() {
+    let out = make_output_window("out", vec![("ts_text", bt(BaseType::Chars))]);
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (ts_text = strftime(e.event_time))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), out]);
+}
+
+#[test]
 fn now_functions_valid() {
     let out = make_output_window(
         "out",

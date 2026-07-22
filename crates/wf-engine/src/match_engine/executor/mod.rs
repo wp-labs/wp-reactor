@@ -6,13 +6,19 @@ mod eval;
 mod match_exec;
 
 use std::collections::HashMap;
+use std::net::IpAddr;
+use std::str::FromStr;
 
-use wf_lang::FieldType;
+use orion_error::conversion::{SourceRawErr, ToStructError};
+use wf_config::OutputConfig;
 use wf_lang::ast::Expr;
 use wf_lang::plan::RulePlan;
+use wf_lang::{BaseType, FieldType};
 
 use self::eval::eval_bool_expr_with_lookup;
-use crate::match_engine::match_engine::{Event, WindowLookup};
+use crate::error::{CoreReason, CoreResult};
+use crate::match_engine::match_engine::{Event, Value, WindowLookup};
+use crate::time::normalize_epoch_timestamp_float_nanos;
 
 /// Evaluates score/entity expressions from a [`RulePlan`] and produces
 /// [`OutputRecord`]s from CEP match/close outputs.
@@ -25,23 +31,52 @@ use crate::match_engine::match_engine::{Event, WindowLookup};
 pub struct RuleExecutor {
     plan: RulePlan,
     yield_field_types: HashMap<String, FieldType>,
+    output: OutputConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuleExecutorOptions {
+    pub yield_field_types: HashMap<String, FieldType>,
+    pub output: OutputConfig,
 }
 
 impl RuleExecutor {
     pub fn new(plan: RulePlan) -> Self {
-        Self {
-            plan,
-            yield_field_types: HashMap::new(),
-        }
+        Self::new_with_options(plan, RuleExecutorOptions::default())
     }
 
     pub fn new_with_yield_field_types(
         plan: RulePlan,
         yield_field_types: HashMap<String, FieldType>,
     ) -> Self {
+        Self::new_with_options(
+            plan,
+            RuleExecutorOptions {
+                yield_field_types,
+                output: OutputConfig::default(),
+            },
+        )
+    }
+
+    pub fn new_with_yield_field_types_and_output(
+        plan: RulePlan,
+        yield_field_types: HashMap<String, FieldType>,
+        output: OutputConfig,
+    ) -> Self {
+        Self::new_with_options(
+            plan,
+            RuleExecutorOptions {
+                yield_field_types,
+                output,
+            },
+        )
+    }
+
+    pub fn new_with_options(plan: RulePlan, options: RuleExecutorOptions) -> Self {
         Self {
             plan,
-            yield_field_types,
+            yield_field_types: options.yield_field_types,
+            output: options.output,
         }
     }
 
@@ -51,6 +86,17 @@ impl RuleExecutor {
 
     pub(crate) fn yield_field_type(&self, name: &str) -> Option<&FieldType> {
         self.yield_field_types.get(name)
+    }
+
+    pub(crate) fn output_config(&self) -> &OutputConfig {
+        &self.output
+    }
+
+    pub(crate) fn coerce_yield_field_value(&self, name: &str, value: Value) -> CoreResult<Value> {
+        let Some(field_type) = self.yield_field_type(name) else {
+            return Ok(value);
+        };
+        coerce_yield_value(name, field_type, value)
     }
 
     pub(crate) fn build_machine_id(&self, machine_id: &str) -> String {
@@ -103,6 +149,153 @@ impl RuleExecutor {
             .chain(self.plan.match_plan.close_steps.iter())
             .flat_map(|step| step.branches.iter())
             .any(|branch| branch.source == alias)
+    }
+}
+
+fn coerce_yield_value(name: &str, field_type: &FieldType, value: Value) -> CoreResult<Value> {
+    match field_type {
+        FieldType::Base(base_type) => coerce_yield_base_value(name, base_type, value),
+        FieldType::Array(_) | FieldType::ArrayAny => match value {
+            Value::Array(_) => Ok(value),
+            _ => CoreReason::DataFormat
+                .to_err()
+                .with_detail(format!("yield field {name:?} expects an array value"))
+                .err(),
+        },
+        FieldType::Object => match value {
+            Value::Object(_) => Ok(value),
+            _ => CoreReason::DataFormat
+                .to_err()
+                .with_detail(format!("yield field {name:?} expects an object value"))
+                .err(),
+        },
+    }
+}
+
+fn coerce_yield_base_value(name: &str, base_type: &BaseType, value: Value) -> CoreResult<Value> {
+    match base_type {
+        BaseType::Chars => render_yield_value_as_string(value).map(Value::Str),
+        BaseType::Digit => match value {
+            Value::Number(n) if n.is_finite() && n.fract() == 0.0 => Ok(Value::Number(n)),
+            _ => CoreReason::DataFormat
+                .to_err()
+                .with_detail(format!(
+                    "yield field {name:?} expects an integer-compatible number"
+                ))
+                .err(),
+        },
+        BaseType::Float => match value {
+            Value::Number(n) if n.is_finite() => Ok(Value::Number(n)),
+            _ => CoreReason::DataFormat
+                .to_err()
+                .with_detail(format!("yield field {name:?} expects a finite number"))
+                .err(),
+        },
+        BaseType::Bool => match value {
+            Value::Bool(_) => Ok(value),
+            _ => CoreReason::DataFormat
+                .to_err()
+                .with_detail(format!("yield field {name:?} expects a boolean value"))
+                .err(),
+        },
+        BaseType::Time => coerce_yield_time_value(name, value),
+        BaseType::Ip => match value {
+            Value::Str(text) => {
+                IpAddr::from_str(&text).source_raw_err(
+                    CoreReason::DataFormat,
+                    format!("yield field {name:?} has invalid ip literal {text:?}"),
+                )?;
+                Ok(Value::Str(text))
+            }
+            _ => CoreReason::DataFormat
+                .to_err()
+                .with_detail(format!("yield field {name:?} expects an ip string"))
+                .err(),
+        },
+        BaseType::Hex => match value {
+            Value::Number(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => {
+                Ok(Value::Number(n))
+            }
+            Value::Str(text) => {
+                let normalized = text
+                    .strip_prefix("0x")
+                    .or_else(|| text.strip_prefix("0X"))
+                    .unwrap_or(&text);
+                u128::from_str_radix(normalized, 16).source_raw_err(
+                    CoreReason::DataFormat,
+                    format!("yield field {name:?} has invalid hex literal {text:?}"),
+                )?;
+                Ok(Value::Str(text))
+            }
+            _ => CoreReason::DataFormat
+                .to_err()
+                .with_detail(format!(
+                    "yield field {name:?} expects a hex string or non-negative integer"
+                ))
+                .err(),
+        },
+    }
+}
+
+fn coerce_yield_time_value(name: &str, value: Value) -> CoreResult<Value> {
+    match value {
+        Value::Number(n) => {
+            normalize_epoch_timestamp_float_nanos(n).ok_or_else(|| {
+                orion_error::StructError::from(CoreReason::DataFormat).with_detail(format!(
+                    "yield field {name:?} expects a valid epoch timestamp"
+                ))
+            })?;
+            Ok(Value::Number(n))
+        }
+        _ => CoreReason::DataFormat
+            .to_err()
+            .with_detail(format!(
+                "yield field {name:?} expects an explicit time expression or epoch timestamp"
+            ))
+            .err(),
+    }
+}
+
+fn render_yield_value_as_string(value: Value) -> CoreResult<String> {
+    match value {
+        Value::Str(s) => Ok(s),
+        Value::Number(n) if n.is_finite() => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Array(_) | Value::Object(_) => serde_json::to_string(&yield_value_to_json(&value)?)
+            .source_raw_err(CoreReason::DataFormat, "serialize structured yield value"),
+        Value::Number(_) => CoreReason::DataFormat
+            .to_err()
+            .with_detail("yield string conversion requires finite numeric values")
+            .err(),
+    }
+}
+
+fn yield_value_to_json(value: &Value) -> CoreResult<serde_json::Value> {
+    match value {
+        Value::Number(n) if n.is_finite() => Ok(serde_json::Value::from(*n)),
+        Value::Number(_) => CoreReason::DataFormat
+            .to_err()
+            .with_detail("structured numeric value must be finite")
+            .err(),
+        Value::Str(s) => Ok(serde_json::Value::from(s.clone())),
+        Value::Bool(b) => Ok(serde_json::Value::from(*b)),
+        Value::Array(items) => Ok(serde_json::Value::Array(
+            items
+                .iter()
+                .map(yield_value_to_json)
+                .collect::<CoreResult<Vec<_>>>()?,
+        )),
+        Value::Object(items) => {
+            let mut object = serde_json::Map::new();
+            let mut keys: Vec<_> = items.keys().collect();
+            keys.sort();
+            for key in keys {
+                if let Some(value) = items.get(key) {
+                    object.insert(key.clone(), yield_value_to_json(value)?);
+                }
+            }
+            Ok(serde_json::Value::Object(object))
+        }
     }
 }
 

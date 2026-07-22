@@ -56,6 +56,33 @@ pub fn compatible(expected: &ValType, actual: &ValType) -> bool {
     }
 }
 
+pub fn yield_assignable(expected: &ValType, actual: &ValType) -> bool {
+    if compatible(expected, actual) {
+        return true;
+    }
+    match expected {
+        ValType::Base(BaseType::Chars) => matches!(
+            actual,
+            ValType::Base(
+                BaseType::Digit
+                    | BaseType::Float
+                    | BaseType::Bool
+                    | BaseType::Time
+                    | BaseType::Ip
+                    | BaseType::Hex
+            ) | ValType::Bool
+                | ValType::Numeric
+        ),
+        ValType::Base(BaseType::Float) => is_numeric(actual),
+        ValType::Base(BaseType::Time) => is_numeric(actual),
+        ValType::Base(BaseType::Ip) => matches!(actual, ValType::Base(BaseType::Chars)),
+        ValType::Base(BaseType::Hex) => {
+            is_numeric(actual) || matches!(actual, ValType::Base(BaseType::Chars))
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn unify_array_element_type(left: &BaseType, right: &BaseType) -> Option<BaseType> {
     if left == right {
         return Some(left.clone());

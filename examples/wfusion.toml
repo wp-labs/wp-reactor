@@ -1,6 +1,10 @@
 mode = "daemon"
 sinks = "sinks"
 
+[output]
+time_format = "%Y-%m-%d %H:%M:%S%.3f"
+time_zone = "utc"
+
 [[sources]]
 type = "tcp"
 name = "ingress_tcp"

@@ -228,13 +228,17 @@ pub(crate) fn build_pipeline_internal_windows(
 pub(crate) fn build_run_rules(
     plans: &[wf_lang::plan::RulePlan],
     schemas: &[wf_lang::WindowSchema],
+    output: &wf_config::OutputConfig,
 ) -> Vec<RunRule> {
     let mut rules = Vec::with_capacity(plans.len());
     for plan in plans {
         let window_aliases = build_window_aliases(&plan.binds);
-        let executor = RuleExecutor::new_with_yield_field_types(
+        let executor = RuleExecutor::new_with_options(
             plan.clone(),
-            resolve_yield_field_types(plan, schemas),
+            wf_engine::match_engine::RuleExecutorOptions {
+                yield_field_types: resolve_yield_field_types(plan, schemas),
+                output: output.clone(),
+            },
         );
         let kind = if let Some(each_plan) = &plan.each_plan {
             RunRuleKind::Each {

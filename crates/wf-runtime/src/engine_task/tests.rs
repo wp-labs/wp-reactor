@@ -994,7 +994,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
             fields: vec![
                 YieldField {
                     name: "event_time".into(),
-                    value: Expr::Number(1234.0),
+                    value: Expr::Number(10_000_000_000.0),
                 },
                 YieldField {
                     name: "sip".into(),
@@ -2129,6 +2129,30 @@ fn pipeline_batch_rejects_non_finite_number_inside_structured_value() {
     );
 }
 
+#[test]
+fn pipeline_batch_preserves_time_yield_as_epoch_nanos() {
+    let schema = intermediate_schema();
+    let ts = 1_700_000_000_123_000_000i64;
+    let fields = vec![
+        (
+            "event_time".to_string(),
+            wf_engine::match_engine::Value::Number(1_700_000_000_123.0),
+        ),
+        (
+            "sip".to_string(),
+            wf_engine::match_engine::Value::Str("10.0.0.8".into()),
+        ),
+    ];
+
+    let batch = rule_task::build_pipeline_batch(schema, None, 0, &fields).expect("pipeline batch");
+    let ts_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .expect("event_time should be timestamp nanos");
+    assert_eq!(ts_col.value(0), ts);
+}
+
 #[tokio::test]
 async fn intermediate_target_preserves_explicit_time_field() {
     init_tracing();
@@ -2147,11 +2171,12 @@ async fn intermediate_target_preserves_explicit_time_field() {
         .registry()
         .snapshot("enriched_events")
         .expect("intermediate window missing");
-    let rows = batch_to_events(&out_batches[0]);
-    assert_eq!(
-        rows[0].fields.get("event_time"),
-        Some(&wf_engine::match_engine::Value::Number(1234.0))
-    );
+    let ts_col = out_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .expect("event_time should be timestamp nanos");
+    assert_eq!(ts_col.value(0), 10_000_000_000_000_000);
 }
 
 #[tokio::test]

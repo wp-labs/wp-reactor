@@ -618,12 +618,12 @@ pub fn check_func_call(
         }
         "now" | "now_s" | "now_ms" | "now_us" | "now_ns" => {}
         "strftime" => {
-            if args.len() != 2 {
+            if args.len() != 1 && args.len() != 2 {
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     test: None,
-                    message: "strftime() requires exactly 2 arguments: (time, format)".to_string(),
+                    message: "strftime() requires 1 or 2 arguments: (time[, format])".to_string(),
                 });
             } else {
                 if let Some(t) = infer_type(&args[0], scope)
@@ -640,7 +640,8 @@ pub fn check_func_call(
                         ),
                     });
                 }
-                if let Some(t) = infer_type(&args[1], scope)
+                if args.len() == 2
+                    && let Some(t) = infer_type(&args[1], scope)
                     && !compatible(&t, &ValType::Base(BaseType::Chars))
                 {
                     errors.push(CheckError {

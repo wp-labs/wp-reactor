@@ -824,16 +824,23 @@ pub(super) fn eval_builtin_func_with_l3(
             Some(Value::Number(utils::current_time_nanos()? as f64))
         }
         "strftime" => {
-            if args.len() != 2 {
+            if args.len() != 1 && args.len() != 2 {
                 return None;
             }
             let ts_nanos = match eval_expr_with_l3(&args[0], ctx, score)? {
                 Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
                 _ => return None,
             };
-            let fmt = match eval_expr_with_l3(&args[1], ctx, score)? {
-                Value::Str(s) => s,
-                _ => return None,
+            let fmt = if let Some(fmt_expr) = args.get(1) {
+                match eval_expr_with_l3(fmt_expr, ctx, score)? {
+                    Value::Str(s) => s,
+                    _ => return None,
+                }
+            } else {
+                score
+                    .time_format
+                    .unwrap_or(wf_config::DEFAULT_OUTPUT_TIME_FORMAT)
+                    .to_string()
             };
             let dt = utils::timestamp_nanos_to_utc(ts_nanos)?;
             Some(Value::Str(dt.format(&fmt).to_string()))

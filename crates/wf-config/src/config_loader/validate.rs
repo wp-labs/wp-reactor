@@ -6,6 +6,7 @@ use orion_error::conversion::SourceErr;
 
 use crate::config_loader::fusion::{FusionConfig, FusionMode};
 use crate::error::{ConfigReason, ConfigResult};
+use crate::output::OutputTimeZone;
 use crate::window::WindowConfig;
 
 /// Internal validation, called automatically during `FusionConfig::from_str` / `load`.
@@ -14,6 +15,7 @@ pub(crate) fn validate(config: &FusionConfig) -> ConfigResult<()> {
     if config.runtime.executor_parallelism == 0 {
         return ConfigReason::Validation.fail("runtime.executor_parallelism must be > 0");
     }
+    validate_output_config(config)?;
 
     // Each window's max_window_bytes ≤ window_defaults.max_total_bytes
     let max_total = config.window_defaults.max_total_bytes.as_bytes();
@@ -173,6 +175,24 @@ pub(crate) fn validate(config: &FusionConfig) -> ConfigResult<()> {
     Ok(())
 }
 
+fn validate_output_config(config: &FusionConfig) -> ConfigResult<()> {
+    if config.output.time_format.trim().is_empty() {
+        return ConfigReason::Validation.fail("output.time_format must be non-empty");
+    }
+    for item in chrono::format::strftime::StrftimeItems::new(&config.output.time_format) {
+        if matches!(item, chrono::format::Item::Error) {
+            return ConfigReason::Validation.fail(format!(
+                "output.time_format contains an invalid strftime specifier: {:?}",
+                config.output.time_format
+            ));
+        }
+    }
+    match config.output.time_zone {
+        OutputTimeZone::Utc => {}
+    }
+    Ok(())
+}
+
 fn source_data_format(source: &crate::SourceConfig) -> &str {
     source
         .params
@@ -230,6 +250,7 @@ mod tests {
     use crate::SourceConfig;
     use crate::admin_api::AdminApiConf;
     use crate::config_loader::fusion::{FusionConfig, FusionMode};
+    use crate::output::OutputConfig;
     use crate::types::{ByteSize, DistMode, EvictPolicy, HumanDuration, LatePolicy};
     use crate::window::WindowConfig;
     use std::collections::{BTreeMap, HashMap};
@@ -312,6 +333,7 @@ mod tests {
             work_root: None,
             logging: Default::default(),
             metrics: Default::default(),
+            output: OutputConfig::default(),
             vars: HashMap::new(),
             sources,
             admin_api: AdminApiConf::default(),

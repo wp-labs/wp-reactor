@@ -6,6 +6,10 @@
 mode = "daemon"                              # daemon | batch
 sinks = "sinks"
 
+[output]
+time_format = "%Y-%m-%d %H:%M:%S%.3f"
+time_zone = "utc"
+
 [[sources]]
 type = "tcp"
 name = "ingress_tcp"
@@ -191,6 +195,22 @@ rules   = "rules/*.wfl"
 
 - `schemas` / `rules` 支持 glob
 - 可使用 `schemas/**/*.wfs` 递归扫描
+
+## 输出格式
+
+```toml
+[output]
+time_format = "%Y-%m-%d %H:%M:%S%.3f"
+time_zone = "utc"
+```
+
+说明：
+
+- `time_format` 是项目级默认时间输出格式，使用 chrono/strftime 格式语法
+- `strftime(@emit_time)` 等单参数调用使用该默认格式
+- `strftime(@emit_time, "%Y-%m-%d")` 显式传入格式时，以函数参数为准
+- 未配置 `[output]` 时，默认 `time_format = "%Y-%m-%d %H:%M:%S%.3f"`
+- 当前 `time_zone` 只支持 `utc`，保证多节点部署输出一致
 
 ## 窗口默认值与覆盖
 

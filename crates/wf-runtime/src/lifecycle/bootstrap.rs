@@ -109,7 +109,7 @@ pub(super) async fn load_and_compile(
     let router = Arc::new(Router::new(registry));
 
     // 7. Build RunRules (precompute stream_name → alias routing)
-    let rules = build_run_rules(&all_rule_plans, &runtime_schemas);
+    let rules = build_run_rules(&all_rule_plans, &runtime_schemas, &config.output);
 
     // 8. Build connector-based sink dispatcher
     let sinks_dir = base_dir.join(&config.sinks);

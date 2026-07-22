@@ -44,6 +44,7 @@ pub(super) struct YieldMeta<'a> {
     pub(super) window_start_time_nanos: Option<i64>,
     pub(super) window_end_time_nanos: Option<i64>,
     pub(super) emit_time_nanos: Option<i64>,
+    pub(super) time_format: Option<&'a str>,
 }
 
 impl YieldMeta<'_> {
@@ -286,6 +287,7 @@ pub(super) fn eval_expr_with_l3(
                 return eval_l3_func(name, args, ctx, score);
             }
             if name == "external"
+                || name == "strftime"
                 || is_eval_time_func(name)
                 || args.iter().any(contains_l3_func)
                 || args.iter().any(contains_aggregate_func)
