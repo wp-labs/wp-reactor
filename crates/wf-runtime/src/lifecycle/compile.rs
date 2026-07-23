@@ -1,7 +1,7 @@
 #![allow(clippy::items_after_test_module)]
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use orion_error::conversion::ToStructError;
@@ -22,9 +22,10 @@ use super::types::{RunRule, RunRuleKind};
 
 const PIPE_WINDOW_PREFIX: &str = "__wf_pipe_";
 const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
+const RULE_PRELUDE_FILE: &str = "_global.wfl";
 
 struct ParsedRuleFile {
-    path: std::path::PathBuf,
+    path: PathBuf,
     source: String,
     file: wf_lang::ast::WflFile,
 }
@@ -65,14 +66,21 @@ pub(crate) fn compile_rules(
 ) -> RuntimeResult<(Vec<wf_lang::plan::RulePlan>, Vec<wf_lang::WindowSchema>)> {
     let wfl_paths = resolve_glob(glob_pattern, base_dir)
         .source_err(RuntimeReason::core_conf(), "resolve rule glob")?;
+    let prelude_path = rule_prelude_path(glob_pattern, base_dir);
+    let prelude = load_rule_prelude(&prelude_path, ctx, base_dir)?;
     let mut parsed_files = Vec::new();
     let mut all_rules = Vec::new();
     for full_path in &wfl_paths {
+        if same_path(full_path, &prelude_path) {
+            continue;
+        }
         let preprocessed = load_wfl_with_context(full_path, ctx, Some(base_dir))
             .source_err(RuntimeReason::data_error(), "load rule file")
             .position(full_path.display().to_string())?;
-        let wfl_file = wf_lang::parse_wfl_with_diagnostics(&preprocessed, full_path)
+        let mut wfl_file = wf_lang::parse_wfl_with_diagnostics(&preprocessed, full_path)
             .map_err(lang_diagnostic)?;
+        validate_rule_prelude_conflicts(&wfl_file, &preprocessed, full_path, prelude.as_ref())?;
+        apply_rule_prelude(&mut wfl_file, prelude.as_ref());
         all_rules.extend(wfl_file.rules.iter().cloned());
         parsed_files.push(ParsedRuleFile {
             path: full_path.clone(),
@@ -101,17 +109,489 @@ pub(crate) fn compile_rules(
 
     let mut all_rule_plans = Vec::new();
     for parsed in &parsed_files {
-        let plans = wf_lang::compile_wfl_with_diagnostics(
-            &parsed.file,
+        let plans = compile_rule_file_with_prelude_diagnostics(
+            parsed,
+            prelude.as_ref(),
             &effective_schemas,
-            &parsed.source,
-            &parsed.path,
-        )
-        .map_err(lang_diagnostic)?;
+        )?;
         wf_debug!(conf, file = %parsed.path.display(), rules = plans.len(), "compiled rule file");
         all_rule_plans.extend(plans);
     }
     Ok((all_rule_plans, effective_schemas))
+}
+
+fn compile_rule_file_with_prelude_diagnostics(
+    parsed: &ParsedRuleFile,
+    prelude: Option<&ParsedRuleFile>,
+    schemas: &[wf_lang::WindowSchema],
+) -> RuntimeResult<Vec<wf_lang::plan::RulePlan>> {
+    let errors: Vec<_> = wf_lang::check_wfl(&parsed.file, schemas)
+        .into_iter()
+        .filter(|error| error.severity == wf_lang::Severity::Error)
+        .collect();
+    if !errors.is_empty() {
+        let diagnostics: Vec<String> = errors
+            .iter()
+            .map(|error| format_rule_check_error(error, parsed, prelude))
+            .collect();
+        return RuntimeReason::Bootstrap
+            .to_err()
+            .with_detail(format!("semantic errors:\n{}", diagnostics.join("\n\n")))
+            .err();
+    }
+
+    wf_lang::compile_wfl_with_diagnostics(&parsed.file, schemas, &parsed.source, &parsed.path)
+        .map_err(lang_diagnostic)
+}
+
+fn format_rule_check_error(
+    error: &wf_lang::CheckError,
+    parsed: &ParsedRuleFile,
+    prelude: Option<&ParsedRuleFile>,
+) -> String {
+    if let Some(prelude) = prelude
+        && let Some(diagnostic) = format_prelude_yield_preset_error(error, parsed, prelude)
+    {
+        return diagnostic;
+    }
+    wf_lang::diagnostics::format_check_error_with_source(
+        error,
+        &parsed.file,
+        &parsed.source,
+        &parsed.path,
+    )
+}
+
+fn format_prelude_yield_preset_error(
+    error: &wf_lang::CheckError,
+    parsed: &ParsedRuleFile,
+    prelude: &ParsedRuleFile,
+) -> Option<String> {
+    let rule_name = error.rule.as_deref()?;
+    let rule = parsed
+        .file
+        .rules
+        .iter()
+        .find(|rule| rule.name == rule_name)?;
+
+    let (line, column) = if let Some(arg_name) =
+        extract_backtick_token_after(&error.message, "argument")
+    {
+        if rule
+            .yield_clause
+            .args
+            .iter()
+            .any(|arg| arg.name == arg_name)
+        {
+            return None;
+        }
+        let preset_name = rule.yield_clause.presets.iter().rev().find(|preset_name| {
+            prelude.file.yield_presets.iter().any(|preset| {
+                preset.name == **preset_name && preset.args.iter().any(|arg| arg.name == arg_name)
+            })
+        })?;
+        find_prelude_yield_preset_arg_location(&prelude.source, preset_name, &arg_name)?
+    } else {
+        let tokens = backtick_tokens(&error.message);
+        if tokens.is_empty() {
+            return None;
+        }
+        find_referenced_prelude_yield_preset_token_location(
+            &prelude.source,
+            rule,
+            &prelude.file.yield_presets,
+            &tokens,
+        )?
+    };
+    let mut out = format!(
+        "file: {}\ncategory: yield\n{}\nrule: {}\nlocation: line {}, column {}",
+        prelude.path.display(),
+        error,
+        rule_name,
+        line,
+        column
+    );
+    let snippet = source_line_snippet(&prelude.source, line, column);
+    if !snippet.is_empty() {
+        out.push('\n');
+        out.push_str(&snippet);
+    }
+    Some(out)
+}
+
+fn backtick_tokens(message: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut rest = message;
+    while let Some(start) = rest.find('`') {
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('`') else {
+            break;
+        };
+        let token = &after_start[..end];
+        if !token.is_empty() {
+            tokens.push(token.to_string());
+        }
+        rest = &after_start[end + 1..];
+    }
+    tokens
+}
+
+fn extract_backtick_token_after(message: &str, label: &str) -> Option<String> {
+    let idx = message.find(label)?;
+    let after_label = &message[idx + label.len()..];
+    let start = after_label.find('`')?;
+    let after_start = &after_label[start + 1..];
+    let end = after_start.find('`')?;
+    Some(after_start[..end].to_string())
+}
+
+fn find_prelude_yield_preset_arg_location(
+    source: &str,
+    preset_name: &str,
+    arg_name: &str,
+) -> Option<(usize, usize)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let start_idx = lines
+        .iter()
+        .position(|line| line_declares_yield_preset(line, preset_name))?;
+    let end_idx = yield_preset_source_end(&lines, start_idx);
+    lines
+        .iter()
+        .enumerate()
+        .take(end_idx)
+        .skip(start_idx)
+        .find_map(|(idx, line)| {
+            find_named_arg_column(line, arg_name).map(|column| (idx + 1, column))
+        })
+}
+
+fn find_referenced_prelude_yield_preset_token_location(
+    source: &str,
+    rule: &wf_lang::ast::RuleDecl,
+    prelude_presets: &[wf_lang::ast::YieldPresetDecl],
+    tokens: &[String],
+) -> Option<(usize, usize)> {
+    for preset_name in rule.yield_clause.presets.iter().rev() {
+        if !prelude_presets
+            .iter()
+            .any(|preset| preset.name == *preset_name)
+        {
+            continue;
+        }
+        if let Some(location) =
+            find_prelude_yield_preset_token_location(source, preset_name, tokens)
+        {
+            return Some(location);
+        }
+    }
+    None
+}
+
+fn find_prelude_yield_preset_token_location(
+    source: &str,
+    preset_name: &str,
+    tokens: &[String],
+) -> Option<(usize, usize)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let start_idx = lines
+        .iter()
+        .position(|line| line_declares_yield_preset(line, preset_name))?;
+    let end_idx = yield_preset_source_end(&lines, start_idx);
+    for (idx, line) in lines.iter().enumerate().take(end_idx).skip(start_idx) {
+        if let Some(column) = tokens
+            .iter()
+            .find_map(|token| find_token_column(line, token))
+        {
+            return Some((idx + 1, column));
+        }
+    }
+    None
+}
+
+fn yield_preset_source_end(lines: &[&str], start_idx: usize) -> usize {
+    lines
+        .iter()
+        .enumerate()
+        .skip(start_idx + 1)
+        .find_map(|(idx, line)| {
+            let trimmed = line.trim_start();
+            (line_starts_yield_preset_decl(line)
+                || trimmed.starts_with("rule ")
+                || trimmed.starts_with("test ")
+                || trimmed.starts_with("pattern "))
+            .then_some(idx)
+        })
+        .unwrap_or(lines.len())
+}
+
+fn find_yield_preset_decl_location(source: &str, preset_name: &str) -> Option<(usize, usize)> {
+    find_nth_yield_preset_decl_location(source, preset_name, 1)
+}
+
+fn find_nth_yield_preset_decl_location(
+    source: &str,
+    preset_name: &str,
+    occurrence: usize,
+) -> Option<(usize, usize)> {
+    if occurrence == 0 {
+        return None;
+    }
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line_declares_yield_preset(line, preset_name))
+        .map(|(idx, line)| {
+            let column = line.find("yield").unwrap_or(0) + 1;
+            (idx + 1, column)
+        })
+        .nth(occurrence - 1)
+}
+
+fn line_declares_yield_preset(line: &str, preset_name: &str) -> bool {
+    let Some(rest) = yield_preset_decl_rest(line) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some(after_name) = rest.strip_prefix(preset_name) else {
+        return false;
+    };
+    !after_name.chars().next().is_some_and(is_ident_char)
+}
+
+fn line_starts_yield_preset_decl(line: &str) -> bool {
+    yield_preset_decl_rest(line)
+        .map(str::trim_start)
+        .is_some_and(|rest| rest.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_'))
+}
+
+fn yield_preset_decl_rest(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("yield")?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("preset")?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    Some(rest)
+}
+
+fn find_named_arg_column(line: &str, arg_name: &str) -> Option<usize> {
+    find_named_token_column(line, arg_name, true)
+}
+
+fn find_token_column(line: &str, token: &str) -> Option<usize> {
+    find_named_token_column(line, token, false)
+}
+
+fn find_named_token_column(line: &str, token: &str, require_assignment: bool) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(relative_idx) = line[search_from..].find(token) {
+        let idx = search_from + relative_idx;
+        let before_ok = line[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_ident_char(ch));
+        let after_name_idx = idx + token.len();
+        let after_name = &line[after_name_idx..];
+        let after_ok = after_name
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_ident_char(ch));
+        let has_equals = !require_assignment || after_name.trim_start().starts_with('=');
+        if before_ok && after_ok && has_equals {
+            return Some(idx + 1);
+        }
+        search_from = after_name_idx;
+    }
+    None
+}
+
+fn is_ident_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn source_line_snippet(source: &str, line: usize, column: usize) -> String {
+    let Some(text) = source.lines().nth(line.saturating_sub(1)) else {
+        return String::new();
+    };
+    format!("  {}\n  {}^", text, " ".repeat(column.saturating_sub(1)))
+}
+
+fn rule_prelude_path(glob_pattern: &str, base_dir: &Path) -> PathBuf {
+    rule_glob_root(glob_pattern, base_dir).join(RULE_PRELUDE_FILE)
+}
+
+fn rule_glob_root(glob_pattern: &str, base_dir: &Path) -> PathBuf {
+    if !contains_glob_meta(glob_pattern) {
+        return base_dir
+            .join(glob_pattern)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| base_dir.to_path_buf());
+    }
+
+    let mut root = base_dir.to_path_buf();
+    for component in Path::new(glob_pattern).components() {
+        match component {
+            Component::Normal(part) => {
+                if contains_glob_meta(&part.to_string_lossy()) {
+                    break;
+                }
+                root.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => root.push(".."),
+            Component::RootDir | Component::Prefix(_) => {
+                root.push(component.as_os_str());
+            }
+        }
+    }
+    root
+}
+
+fn contains_glob_meta(value: &str) -> bool {
+    value.contains('*') || value.contains('?') || value.contains('[')
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .canonicalize()
+            .ok()
+            .zip(right.canonicalize().ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn load_rule_prelude(
+    prelude_path: &Path,
+    ctx: &ConfigVarContext,
+    base_dir: &Path,
+) -> RuntimeResult<Option<ParsedRuleFile>> {
+    if !prelude_path.exists() {
+        return Ok(None);
+    }
+
+    let source = load_wfl_with_context(prelude_path, ctx, Some(base_dir))
+        .source_err(RuntimeReason::data_error(), "load rule prelude")
+        .position(prelude_path.display().to_string())?;
+    let file =
+        wf_lang::parse_wfl_with_diagnostics(&source, prelude_path).map_err(lang_diagnostic)?;
+    validate_rule_prelude(&file, &source, prelude_path)?;
+    Ok(Some(ParsedRuleFile {
+        path: prelude_path.to_path_buf(),
+        source,
+        file,
+    }))
+}
+
+fn validate_rule_prelude(
+    file: &wf_lang::ast::WflFile,
+    source: &str,
+    path: &Path,
+) -> RuntimeResult<()> {
+    let invalid = if !file.uses.is_empty() {
+        Some("use declarations")
+    } else if !file.patterns.is_empty() {
+        Some("pattern declarations")
+    } else if !file.rules.is_empty() {
+        Some("rule declarations")
+    } else if !file.tests.is_empty() {
+        Some("test blocks")
+    } else {
+        None
+    };
+
+    if let Some(kind) = invalid {
+        return RuntimeReason::Bootstrap
+            .to_err()
+            .with_detail(format!(
+                "{} is a rule prelude and only allows `yield preset` declarations; found {}",
+                path.display(),
+                kind
+            ))
+            .err();
+    }
+    validate_unique_yield_presets(file, source, path, "rule prelude")?;
+    Ok(())
+}
+
+fn validate_rule_prelude_conflicts(
+    file: &wf_lang::ast::WflFile,
+    source: &str,
+    path: &Path,
+    prelude: Option<&ParsedRuleFile>,
+) -> RuntimeResult<()> {
+    validate_unique_yield_presets(file, source, path, "rule file")?;
+    let Some(prelude) = prelude else {
+        return Ok(());
+    };
+
+    for preset in &file.yield_presets {
+        if prelude
+            .file
+            .yield_presets
+            .iter()
+            .any(|prelude_preset| prelude_preset.name == preset.name)
+        {
+            let (line, column) =
+                find_yield_preset_decl_location(source, &preset.name).unwrap_or((1, 1));
+            return RuntimeReason::Bootstrap
+                .to_err()
+                .with_detail(format!(
+                    "{} defines yield preset `{}` that already exists in prelude {}\nlocation: line {}, column {}\n{}",
+                    path.display(),
+                    preset.name,
+                    prelude.path.display(),
+                    line,
+                    column,
+                    source_line_snippet(source, line, column)
+                ))
+                .err();
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_yield_presets(
+    file: &wf_lang::ast::WflFile,
+    source: &str,
+    path: &Path,
+    scope: &str,
+) -> RuntimeResult<()> {
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for preset in &file.yield_presets {
+        let count = seen.entry(preset.name.as_str()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            let (line, column) =
+                find_nth_yield_preset_decl_location(source, &preset.name, *count).unwrap_or((1, 1));
+            return RuntimeReason::Bootstrap
+                .to_err()
+                .with_detail(format!(
+                    "{} duplicate yield preset `{}` in {}\nlocation: line {}, column {}\n{}",
+                    path.display(),
+                    preset.name,
+                    scope,
+                    line,
+                    column,
+                    source_line_snippet(source, line, column)
+                ))
+                .err();
+        }
+    }
+    Ok(())
+}
+
+fn apply_rule_prelude(file: &mut wf_lang::ast::WflFile, prelude: Option<&ParsedRuleFile>) {
+    let Some(prelude) = prelude else {
+        return;
+    };
+    let mut yield_presets = prelude.file.yield_presets.clone();
+    yield_presets.extend(file.yield_presets.clone());
+    file.yield_presets = yield_presets;
 }
 
 fn lang_diagnostic(error: wf_lang::LangError) -> crate::error::RuntimeError {
@@ -731,6 +1211,322 @@ rule make_a {
         assert!(
             text.contains("rule make_a") || text.contains("rule make_b"),
             "{text}"
+        );
+    }
+
+    fn prelude_test_schemas() -> Vec<WindowSchema> {
+        vec![
+            WindowSchema {
+                name: "fw_events".into(),
+                streams: vec!["syslog".into()],
+                time_field: Some("event_time".into()),
+                over: Duration::from_secs(3600),
+                fields: vec![
+                    FieldDef {
+                        name: "event_time".into(),
+                        field_type: FieldType::Base(BaseType::Time),
+                    },
+                    FieldDef {
+                        name: "sip".into(),
+                        field_type: FieldType::Base(BaseType::Ip),
+                    },
+                ],
+            },
+            WindowSchema {
+                name: "alerts".into(),
+                streams: vec![],
+                time_field: Some("event_time".into()),
+                over: Duration::from_secs(3600),
+                fields: vec![
+                    FieldDef {
+                        name: "event_time".into(),
+                        field_type: FieldType::Base(BaseType::Time),
+                    },
+                    FieldDef {
+                        name: "sip".into(),
+                        field_type: FieldType::Base(BaseType::Ip),
+                    },
+                    FieldDef {
+                        name: "severity".into(),
+                        field_type: FieldType::Base(BaseType::Chars),
+                    },
+                    FieldDef {
+                        name: "rule_name".into(),
+                        field_type: FieldType::Base(BaseType::Chars),
+                    },
+                ],
+            },
+        ]
+    }
+
+    #[test]
+    fn compile_rules_loads_global_prelude_yield_presets() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_dir = dir.path().join("rules");
+        std::fs::create_dir_all(rules_dir.join("detections")).unwrap();
+        std::fs::write(
+            rules_dir.join(RULE_PRELUDE_FILE),
+            r#"
+yield preset base_alerts (
+  severity = "medium",
+  rule_name = "global"
+)
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            rules_dir.join("detections/ssh.wfl"),
+            r#"
+rule ssh {
+  events { e: fw_events }
+  match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+  entity(ip, e.sip)
+  yield alerts : base_alerts (
+    event_time = e.event_time,
+    sip = e.sip
+  )
+}
+"#,
+        )
+        .unwrap();
+
+        let (plans, _) = compile_rules(
+            "rules/**/*.wfl",
+            dir.path(),
+            &ConfigVarContext::from_explicit_vars(HashMap::new()),
+            &prelude_test_schemas(),
+        )
+        .unwrap();
+
+        assert_eq!(plans.len(), 1);
+        let fields: HashSet<_> = plans[0]
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert!(fields.contains("severity"));
+        assert!(fields.contains("rule_name"));
+        assert!(fields.contains("event_time"));
+        assert!(fields.contains("sip"));
+    }
+
+    #[test]
+    fn compile_rules_rejects_rules_in_global_prelude() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(RULE_PRELUDE_FILE),
+            r#"
+rule hidden {
+  events { e: fw_events }
+  match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+  entity(ip, e.sip)
+  yield alerts (event_time = e.event_time, sip = e.sip)
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("visible.wfl"),
+            r#"
+rule visible {
+  events { e: fw_events }
+  match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+  entity(ip, e.sip)
+  yield alerts (event_time = e.event_time, sip = e.sip)
+}
+"#,
+        )
+        .unwrap();
+
+        let err = compile_rules(
+            "*.wfl",
+            dir.path(),
+            &ConfigVarContext::from_explicit_vars(HashMap::new()),
+            &prelude_test_schemas(),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("_global.wfl"), "{text}");
+        assert!(text.contains("only allows `yield preset`"), "{text}");
+        assert!(text.contains("rule declarations"), "{text}");
+    }
+
+    #[test]
+    fn compile_rules_reports_global_prelude_preset_field_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(RULE_PRELUDE_FILE),
+            r#"
+yield preset base_alerts (
+  event_time = "not-a-time",
+  severity = "medium"
+)
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("visible.wfl"),
+            r#"
+rule visible {
+  events { e: fw_events }
+  match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+  entity(ip, e.sip)
+  yield alerts : base_alerts (
+    sip = e.sip,
+    rule_name = "visible"
+  )
+}
+"#,
+        )
+        .unwrap();
+
+        let err = compile_rules(
+            "*.wfl",
+            dir.path(),
+            &ConfigVarContext::from_explicit_vars(HashMap::new()),
+            &prelude_test_schemas(),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("_global.wfl"), "{text}");
+        assert!(text.contains("location: line 3, column 3"), "{text}");
+        assert!(text.contains("event_time = \"not-a-time\""), "{text}");
+    }
+
+    #[test]
+    fn compile_rules_reports_global_prelude_expression_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(RULE_PRELUDE_FILE),
+            r#"
+yield preset base_alerts (
+  severity = e.missing,
+  rule_name = "global"
+)
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("visible.wfl"),
+            r#"
+rule visible {
+  events { e: fw_events }
+  match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+  entity(ip, e.sip)
+  yield alerts : base_alerts (
+    event_time = e.event_time,
+    sip = e.sip
+  )
+}
+"#,
+        )
+        .unwrap();
+
+        let err = compile_rules(
+            "*.wfl",
+            dir.path(),
+            &ConfigVarContext::from_explicit_vars(HashMap::new()),
+            &prelude_test_schemas(),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("_global.wfl"), "{text}");
+        assert!(text.contains("field `missing` not found"), "{text}");
+        assert!(text.contains("location: line 3, column 16"), "{text}");
+        assert!(text.contains("severity = e.missing"), "{text}");
+    }
+
+    #[test]
+    fn compile_rules_rejects_duplicate_presets_inside_global_prelude() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(RULE_PRELUDE_FILE),
+            r#"
+yield preset base_alerts (severity = "medium")
+yield preset base_alerts (severity = "high")
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("visible.wfl"),
+            r#"
+rule visible {
+  events { e: fw_events }
+  match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+  entity(ip, e.sip)
+  yield alerts (event_time = e.event_time, sip = e.sip, severity = "medium", rule_name = "visible")
+}
+"#,
+        )
+        .unwrap();
+
+        let err = compile_rules(
+            "*.wfl",
+            dir.path(),
+            &ConfigVarContext::from_explicit_vars(HashMap::new()),
+            &prelude_test_schemas(),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("_global.wfl"), "{text}");
+        assert!(
+            text.contains("duplicate yield preset `base_alerts`"),
+            "{text}"
+        );
+        assert!(text.contains("rule prelude"), "{text}");
+        assert!(text.contains("location: line 3, column 1"), "{text}");
+    }
+
+    #[test]
+    fn compile_rules_rejects_rule_file_preset_conflict_with_global_prelude() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(RULE_PRELUDE_FILE),
+            r#"
+yield preset base_alerts (severity = "medium")
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("visible.wfl"),
+            r#"
+yield preset base_alerts (severity = "local")
+
+rule visible {
+  events { e: fw_events }
+  match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+  entity(ip, e.sip)
+  yield alerts : base_alerts (event_time = e.event_time, sip = e.sip, rule_name = "visible")
+}
+"#,
+        )
+        .unwrap();
+
+        let err = compile_rules(
+            "*.wfl",
+            dir.path(),
+            &ConfigVarContext::from_explicit_vars(HashMap::new()),
+            &prelude_test_schemas(),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("visible.wfl"), "{text}");
+        assert!(text.contains("already exists in prelude"), "{text}");
+        assert!(text.contains("_global.wfl"), "{text}");
+        assert!(text.contains("location: line 2, column 1"), "{text}");
+    }
+
+    #[test]
+    fn rule_prelude_path_uses_non_glob_prefix_as_rule_root() {
+        let base = Path::new("/project");
+        assert_eq!(
+            rule_prelude_path("rules/current/*.wfl", base),
+            PathBuf::from("/project/rules/current/_global.wfl")
+        );
+        assert_eq!(
+            rule_prelude_path("rules/**/*.wfl", base),
+            PathBuf::from("/project/rules/_global.wfl")
         );
     }
 }

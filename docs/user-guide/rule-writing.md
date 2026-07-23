@@ -530,7 +530,7 @@ rule scan {
 
 组合规则为：从左到右展开 preset，后者覆盖前者，当前 `yield (...)` 覆盖所有 preset；最终字段集合仍按目标 output window 做强校验。
 
-未来可将项目级公共 preset 放入 `global.wfl` / project prelude；prelude 只承载公共声明，不应自动启用普通检测规则。
+项目级公共 preset 可放入规则根目录下的 `_global.wfl`。规则根目录由 `runtime.rules` glob 的非通配前缀推导，例如 `rules/**/*.wfl` 对应 `rules/_global.wfl`，`rules/current/*.wfl` 对应 `rules/current/_global.wfl`。运行时会自动把它作为 project prelude 加载，并从普通规则文件列表中排除；`_global.wfl` 只允许 `yield preset` 声明，不会自动启用普通检测规则。
 
 ---
 

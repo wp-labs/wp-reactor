@@ -438,7 +438,7 @@ yield scan_alerts : base_alerts, ioc_fields (
 - preset 不单独输出，也不绑定某个目标 window
 - preset 中引用的事件 alias 在使用点解析；推荐 preset 优先放常量、`@score`、`@__wfu_*` 和时间系统变量
 
-未来可通过 `global.wfl` / project prelude 集中声明项目级 preset；prelude 不应自动启用普通 `rule`，避免全局文件隐式改变检测行为。
+项目级公共 preset 可集中放入规则根目录下的 `_global.wfl`。规则根目录由 `runtime.rules` glob 的非通配前缀推导，例如 `rules/**/*.wfl` 对应 `rules/_global.wfl`，`rules/current/*.wfl` 对应 `rules/current/_global.wfl`。运行时会自动把它作为 project prelude 加载，并从普通规则文件列表中排除；`_global.wfl` 只允许 `yield preset` 声明，不会自动启用普通 `rule`。
 
 #### 时间系统变量
 

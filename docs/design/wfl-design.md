@@ -37,7 +37,7 @@
 | `yield` 时间系统变量 | 告警时间语义字段 | ✅ 已实现 | `@event_first_time` / `@event_last_time` / `@evidence_start_time` / `@evidence_end_time` / `@window_start_time` / `@window_end_time` / `@emit_time` |
 | `yield` 引用 wfusion 元字段 | 输出元字段映射为普通字段 | ✅ 已实现 | 支持 `rule_name = @__wfu_rule_name`；左侧仍禁止 `__wfu_*` |
 | `yield preset` | 复用公共输出字段集合 | ✅ 已实现 | 支持 `yield preset name (...)` 与 `yield target : preset1, preset2 (...)` |
-| `global.wfl` / project prelude | 项目级公共声明入口 | ❌ 未实现 | 规划用于承载 `yield preset` 等公共声明，不自动引入可执行 rule |
+| `_global.wfl` / project prelude | 项目级公共声明入口 | ✅ 已实现 | 从 `runtime.rules` glob 的非通配前缀目录自动加载，只承载 `yield preset` 声明，不自动引入可执行 rule |
 | `meta.lang` 强制 | v2.1 治理 | ❌ 未实现 | 当前 checker 未强制每条规则声明 `meta.lang` |
 | `derive { ... }` | L2 特征派生 | ❌ 未实现 | AST/解析/编译链路未接入 derive block |
 | `score { item = expr @ weight; ... }` | L2 可解释评分 | ❌ 未实现 | 当前仅支持 `score(expr)` |
@@ -1132,7 +1132,7 @@ window_emit_suppressed_ratio_crit = 0.40   # 抑制率严重运维告警
 - `yield target[@vN] : preset1, preset2 (...)` 用于组合 preset。展开顺序为从左到右应用 preset，后面的 preset 覆盖前面的同名字段，当前 `yield (...)` 覆盖所有 preset 同名字段；展开后的字段集合仍按 `target` window 做字段存在性、保留前缀和类型校验。
 - preset 中的表达式在使用点作用域解析。推荐 preset 只放常量、`@score`、`@__wfu_*`、时间系统变量和其他与事件 alias 无关的通用表达式；若引用事件 alias，则该 alias 必须在使用 preset 的规则中可解析。
 - preset 当前不支持嵌套引用；同一个 `yield` 中重复引用同名 preset 应报编译错误。
-- `global.wfl` / project prelude 为规划加载机制，可用于集中声明项目级 preset；prelude 不应自动启用普通 `rule`，避免全局文件隐式改变检测行为。
+- `_global.wfl` / project prelude 从 `runtime.rules` glob 的非通配前缀目录自动加载，可用于集中声明项目级 preset；例如 `rules/**/*.wfl` 对应 `rules/_global.wfl`，`rules/current/*.wfl` 对应 `rules/current/_global.wfl`。prelude 会从普通规则文件列表中排除，且只允许 `yield preset` 声明，避免全局文件隐式改变检测行为。
 - 最终 alert 输出与中间 enriched 输出应区分：
   - 最终 alert 记录可保留 `__wfu_fired_at` / `__wfu_emit_time` / `__wfu_origin` 等告警语义字段。
   - 中间 enriched 记录默认不应引入任何时间类 `__wfu_*` 字段，避免把“逐条评分事件”和“最终告警事件”混淆。
