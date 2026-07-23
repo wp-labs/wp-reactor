@@ -787,8 +787,11 @@ fn hash_and_id_functions_work() {
 
     let mut fields = HashMap::new();
     fields.insert("msg".to_string(), Value::Str("hello".to_string()));
+    fields.insert("empty".to_string(), Value::Str(String::new()));
     fields.insert("ip".to_string(), Value::Str("10.0.0.1".to_string()));
     fields.insert("count".to_string(), Value::Number(3.0));
+    fields.insert("special".to_string(), Value::Str("a|b".to_string()));
+    fields.insert("percent".to_string(), Value::Str("10%".to_string()));
     let event = Event { fields };
 
     let md5_expr = Expr::FuncCall {
@@ -800,6 +803,22 @@ fn hash_and_id_functions_work() {
         qualifier: None,
         name: "sha1".to_string(),
         args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+    };
+    let sha1_n_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "sha1_n".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("msg".to_string())),
+            Expr::Number(8.0),
+        ],
+    };
+    let sha1_n_empty_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "sha1_n".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("empty".to_string())),
+            Expr::Number(8.0),
+        ],
     };
     let sha256_expr = Expr::FuncCall {
         qualifier: None,
@@ -834,6 +853,90 @@ fn hash_and_id_functions_work() {
             Expr::Number(4.0),
         ],
     };
+    let join_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("special".to_string())),
+            Expr::Field(FieldRef::Simple("percent".to_string())),
+            Expr::Field(FieldRef::Simple("empty".to_string())),
+            Expr::Field(FieldRef::Simple("count".to_string())),
+        ],
+    };
+    let join_by_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join_by".to_string(),
+        args: vec![
+            Expr::StringLit("|".to_string()),
+            Expr::Field(FieldRef::Simple("special".to_string())),
+            Expr::Field(FieldRef::Simple("percent".to_string())),
+            Expr::Field(FieldRef::Simple("empty".to_string())),
+            Expr::Field(FieldRef::Simple("count".to_string())),
+        ],
+    };
+    let join_missing_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("special".to_string())),
+            Expr::Field(FieldRef::Simple("missing".to_string())),
+            Expr::Field(FieldRef::Simple("percent".to_string())),
+        ],
+    };
+    let join_by_missing_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join_by".to_string(),
+        args: vec![
+            Expr::StringLit("|".to_string()),
+            Expr::Field(FieldRef::Simple("special".to_string())),
+            Expr::Field(FieldRef::Simple("missing".to_string())),
+            Expr::Field(FieldRef::Simple("percent".to_string())),
+        ],
+    };
+    let join_array_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join".to_string(),
+        args: vec![Expr::Array(vec![Expr::StringLit("x".to_string())])],
+    };
+    let join_by_object_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join_by".to_string(),
+        args: vec![
+            Expr::StringLit("|".to_string()),
+            Expr::Object(vec![ObjectItem {
+                targets: vec!["x".to_string()],
+                type_hint: None,
+                value: Expr::StringLit("y".to_string()),
+            }]),
+        ],
+    };
+    let join_invalid_nested_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join".to_string(),
+        args: vec![
+            Expr::StringLit("a".to_string()),
+            Expr::FuncCall {
+                qualifier: None,
+                name: "sha1_n".to_string(),
+                args: vec![Expr::StringLit("x".to_string()), Expr::Number(0.0)],
+            },
+            Expr::StringLit("b".to_string()),
+        ],
+    };
+    let join_by_invalid_nested_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join_by".to_string(),
+        args: vec![
+            Expr::StringLit("|".to_string()),
+            Expr::StringLit("a".to_string()),
+            Expr::FuncCall {
+                qualifier: None,
+                name: "sha1_n".to_string(),
+                args: vec![Expr::StringLit("x".to_string()), Expr::Number(0.0)],
+            },
+            Expr::StringLit("b".to_string()),
+        ],
+    };
     let invalid_expr = Expr::FuncCall {
         qualifier: None,
         name: "md5".to_string(),
@@ -851,6 +954,14 @@ fn hash_and_id_functions_work() {
         ))
     );
     assert_eq!(
+        eval_expr(&sha1_n_expr, &event),
+        Some(Value::Str("aaf4c61d".to_string()))
+    );
+    assert_eq!(
+        eval_expr(&sha1_n_empty_expr, &event),
+        Some(Value::Str("da39a3ee".to_string()))
+    );
+    assert_eq!(
         eval_expr(&sha256_expr, &event),
         Some(Value::Str(
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string()
@@ -864,6 +975,26 @@ fn hash_and_id_functions_work() {
         eval_expr(&short_expr, &event),
         Some(Value::Str("2cf24dba5fb0a30e".to_string()))
     );
+    assert_eq!(
+        eval_expr(&join_expr, &event),
+        Some(Value::Str("a|b10%3".to_string()))
+    );
+    assert_eq!(
+        eval_expr(&join_by_expr, &event),
+        Some(Value::Str("a|b|10%||3".to_string()))
+    );
+    assert_eq!(
+        eval_expr(&join_missing_expr, &event),
+        Some(Value::Str("a|b10%".to_string()))
+    );
+    assert_eq!(
+        eval_expr(&join_by_missing_expr, &event),
+        Some(Value::Str("a|b||10%".to_string()))
+    );
+    assert_eq!(eval_expr(&join_array_expr, &event), None);
+    assert_eq!(eval_expr(&join_by_object_expr, &event), None);
+    assert_eq!(eval_expr(&join_invalid_nested_expr, &event), None);
+    assert_eq!(eval_expr(&join_by_invalid_nested_expr, &event), None);
     let Some(Value::Str(stable_id)) = eval_expr(&stable_expr, &event) else {
         panic!("stable_id() should return a string");
     };

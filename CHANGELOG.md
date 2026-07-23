@@ -8,6 +8,7 @@ All notable changes to wp-reactor will be documented in this file.
 
 - **wf-lang / wf-engine**: Added yield-target type coercion for common output mappings, including numeric and boolean values into `chars` fields and validated coercion for numeric, IP, hex, and time targets.
 - **wf-lang / wf-engine**: Changed `coalesce(...)` to skip blank strings as well as null values, and allow mixed scalar fallback types only when each candidate is assignable to the direct `yield` target field.
+- **wf-engine / docs**: Documented evidence output using `stat.count(window_event(alias))` with `collect_set(alias.event_id)`, keeping alias field collection bounded by the recent 1024-value cap.
 - **wf-runtime**: Treat `[output]` formatting changes as hot-reloadable so rule executors are rebuilt with the latest project output settings.
 - **wf-runtime**: Changed the default dynamic stream-tag payload carrier from `wp_stream_tag` to `wp_oml_name`, matching warp-parse OML output naming.
 - **User guide**: Updated runtime source examples to use `stream_tag_field = "wp_oml_name"`.
@@ -18,6 +19,7 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Added
 
+- **wf-lang / wf-engine**: Added WFL string helper functions `sha1_n(text, length)`, `join(value, ...)`, and `join_by(separator, value, ...)`; `join` concatenates scalar values without intervention, while `join_by` inserts the explicit separator without trimming, case folding, or escaping; missing field value arguments are treated as empty string segments, while non-field expression failures still fail the function.
 - **wf-lang / wf-engine**: Added structured stream-input object/array support and `merge(obj1, obj2, ...)` for shallow left-to-right object enrichment in WFL expressions and yield outputs.
 - **wf-lang**: Added `yield preset` declarations and `yield target : preset_a, preset_b (...)` references for composing reusable yield field sets with ordered override semantics; later presets override earlier fields, and explicit rule yield fields override presets.
 - **wf-runtime**: Added the `_global.wfl` project prelude convention for rule directories, automatically loading project-level `yield preset` declarations while excluding the prelude from ordinary rule compilation; duplicate preset names inside the prelude or between prelude and rule files are rejected during rule loading.

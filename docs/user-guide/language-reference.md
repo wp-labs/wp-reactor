@@ -738,13 +738,14 @@ fmt("{} failed {} times from {}", fail.username, count(fail), fail.sip)
 
 当前代码里已接入并有 checker 支持的常见函数包括：
 
-- 字符串：`contains`、`regex_match`、`startswith`、`endswith`、`lower`、`upper`、`len`、`concat`
+- 字符串：`contains`、`regex_match`、`startswith`、`endswith`、`lower`、`upper`、`len`、`concat`、`join`、`join_by`
 - 数值：`round`、`abs`、`ceil`、`floor`、`sqrt`、`pow`、`log`、`exp`、`clamp`
 - 空值 / 空白处理：`coalesce`、`isnull`、`isnotnull`、`is_blank`、`null_if_blank`、`default_if_blank`
 - 结构化对象：`merge`
 - 时间：`time_diff`、`time_bucket`
 - 当前引擎时间：`now`、`now_s`、`now_ms`、`now_us`、`now_ns`
-- 哈希 / 编码：`md5`、`sha1`、`sha256`、`hex`、`stable_id`
+- 哈希 / 编码：`md5`、`sha1`、`sha1_n`、`sha256`、`hex`、`stable_id`
+- 窗口集合：`collect_set`、`collect_list`、`first`、`last`
 - 画像 / 回看：`baseline`
 - 方法调用：`window.has(...)`
 
@@ -839,6 +840,7 @@ yield out (
 |------|----------|------|
 | `md5(text)` | `chars` | 返回小写十六进制 MD5 字符串 |
 | `sha1(text)` | `chars` | 返回小写十六进制 SHA-1 字符串 |
+| `sha1_n(text, length)` | `chars` | 返回 SHA-1 小写十六进制字符串前 `length` 位，`length` 必须是 1 到 40 的整数 |
 | `sha256(text)` | `chars` | 返回小写十六进制 SHA-256 字符串 |
 | `hex(text)` | `hex` | 返回字符串字节的小写十六进制编码 |
 | `stable_id(prefix, value, ...)` | `chars` | 返回 `prefix` + SHA-256 前 16 位 |
@@ -849,15 +851,42 @@ yield out (
 yield security_alerts (
     cmd_sha256 = sha256(e.cmdline),
     raw_hex = hex(e.raw),
-    alert_id = stable_id("alert_", e.sip, e.user, e.event_time)
+    alert_id = stable_id("alert_", e.sip, e.user, e.event_time),
+    compact_id = sha1_n(join_by("|", e.sip, e.user, e.event_time), 16)
 )
 ```
 
 说明：
 
 - `md5`、`sha1`、`sha256`、`hex` 的参数必须是 `chars`。
+- `sha1_n(text, length)` 只截取 SHA-1 结果前 `length` 位，不改变输入内容。
 - `stable_id` 的第一个参数必须是 `chars` 前缀；后续参数必须是标量值，支持 `chars`、`digit`、`float`、`bool`、`time`、`ip`、`hex`。
 - `stable_id` 对后续值使用带类型和长度的稳定编码后再计算 SHA-256，避免简单拼接导致的歧义。
+- 如果需要完全由规则作者控制拼接内容，可以使用 `sha1_n(join(...), n)` 或 `sha1_n(join_by(...), n)`。
+
+#### 字符串拼接
+
+| 函数 | 返回类型 | 说明 |
+|------|----------|------|
+| `join(value, ...)` | `chars` | 按参数顺序直接拼接，不加分隔符 |
+| `join_by(separator, value, ...)` | `chars` | 按参数顺序拼接，并在字段之间插入显式分隔符 |
+
+示例：
+
+```wfl
+yield security_alerts (
+    raw_key = join(e.sip, e.user, e.action),
+    readable_key = join_by("|", e.sip, e.user, e.action),
+    alert_hash = sha1_n(join_by("|", e.sip, e.user, e.action), 16)
+)
+```
+
+说明：
+
+- `join` / `join_by` 不 trim、不改大小写、不转义 `%`、不转义 `|`。
+- 空字符串按原样参与拼接，取不到的参数按空字符串片段处理。
+- `join_by` 的 separator 必须是 `chars`；separator 取不到或求值失败时，函数整体失败。
+- 参数支持标量值：`chars`、`digit`、`float`、`bool`、`time`、`ip`、`hex`；不接受 `array` / `object`。
 
 #### 多值函数
 
@@ -871,6 +900,36 @@ yield security_alerts (
 | `mvdedup(arr)` | 数组去重，保留首次出现顺序 |
 | `mvsort(arr)` | 数组排序 |
 | `mvreverse(arr)` | 数组反转 |
+
+#### 窗口集合函数
+
+| 函数 | 返回类型 | 说明 |
+|------|----------|------|
+| `collect_set(alias.field)` | `array/T` | 收集当前 rule instance 内 alias 事件集合最近最多 1024 个字段值，按首次出现顺序去重 |
+| `collect_list(alias.field)` | `array/T` | 收集当前 rule instance 内 alias 事件集合最近最多 1024 个字段值，保留出现顺序 |
+| `first(alias.field)` | `T` | 返回当前 rule instance 内 alias 最近字段样本中的首个字段值 |
+| `last(alias.field)` | `T` | 返回当前 rule instance 内 alias 最近字段样本中的末个字段值 |
+
+`collect_set(alias.field)` 和 `stat.count(window_event(alias))` 基于同一个 alias 事件集合。常见 evidence 输出写法：
+
+```wfs
+window security_alerts {
+    over = 0
+    fields {
+        event_count: digit
+        evidences: array/chars
+    }
+}
+```
+
+```wfl
+yield security_alerts (
+    event_count = stat.count(window_event(s)),
+    evidences = collect_set(s.event_id)
+)
+```
+
+如果某条事件缺少 `event_id`，它仍计入 `event_count`，但不会进入 `evidences`。alias 字段集合保留最近最多 1024 个字段值；`collect_set` / `collect_list` / `first` / `last` 均基于这组最近样本。大窗口或重复 `event_id` 场景下，`evidences` 数组长度可能小于 `event_count`。
 
 ## 规则测试
 

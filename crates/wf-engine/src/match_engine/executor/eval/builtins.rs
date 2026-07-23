@@ -623,6 +623,30 @@ pub(super) fn eval_builtin_func_with_l3(
             }
             Some(Value::Str(out))
         }
+        "join" => {
+            if args.is_empty() {
+                return None;
+            }
+            let mut out = String::new();
+            for arg in args {
+                out.push_str(&eval_join_arg_with_l3(arg, ctx, score)?);
+            }
+            Some(Value::Str(out))
+        }
+        "join_by" => {
+            if args.len() < 2 {
+                return None;
+            }
+            let sep = match eval_expr_with_l3(&args[0], ctx, score)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let mut parts = Vec::with_capacity(args.len() - 1);
+            for arg in &args[1..] {
+                parts.push(eval_join_arg_with_l3(arg, ctx, score)?);
+            }
+            Some(Value::Str(parts.join(&sep)))
+        }
         "indexof" => {
             if args.len() != 2 {
                 return None;
@@ -768,6 +792,24 @@ pub(super) fn eval_builtin_func_with_l3(
             Some(Value::Str(hex::encode(<Sha1 as Sha1Digest>::digest(
                 text.as_bytes(),
             ))))
+        }
+        "sha1_n" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_with_l3(&args[0], ctx, score)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let len = match eval_expr_with_l3(&args[1], ctx, score)? {
+                Value::Number(n) if n.is_finite() && n.fract() == 0.0 => n as usize,
+                _ => return None,
+            };
+            if !(1..=40).contains(&len) {
+                return None;
+            }
+            let digest = hex::encode(<Sha1 as Sha1Digest>::digest(text.as_bytes()));
+            Some(Value::Str(digest[..len].to_string()))
         }
         "sha256" => {
             let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;
@@ -1015,11 +1057,12 @@ pub(super) fn eval_l3_func(
         return None;
     }
     let step_indices = step_data::resolve_step_indices(ctx, args.first());
-    let step_values = step_data::flatten_step_series(ctx, &step_indices, args.first());
-    let values = if step_values.is_empty() {
+    let values = if let Some((alias, _)) = args.first().and_then(step_data::extract_bind_field_ref)
+        && step_data::get_bind_count(ctx, alias).is_some()
+    {
         step_data::flatten_bind_series(ctx, args.first())
     } else {
-        step_values
+        step_data::flatten_step_series(ctx, &step_indices, args.first())
     };
     match name {
         "collect_set" => {
@@ -1140,6 +1183,25 @@ pub(super) fn eval_aggregate_func(
             None
         }
         _ => None,
+    }
+}
+
+fn scalar_value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::Array(_) | Value::Object(_) => None,
+        _ => Some(value_to_string(value)),
+    }
+}
+
+fn eval_join_arg_with_l3(
+    arg: &wf_lang::ast::Expr,
+    ctx: &Event,
+    score: YieldMeta,
+) -> Option<String> {
+    match eval_expr_with_l3(arg, ctx, score) {
+        Some(value) => scalar_value_to_string(&value),
+        None if matches!(arg, wf_lang::ast::Expr::Field(_)) => Some(String::new()),
+        None => None,
     }
 }
 

@@ -6,7 +6,7 @@ use super::{ValType, compatible, is_numeric, is_orderable, unify_array_element_t
 use crate::checker::scope::{Scope, StatLabelStage};
 use crate::checker::{CheckError, Severity};
 
-fn is_stable_id_value_type(t: &ValType) -> bool {
+fn is_scalar_stringable_type(t: &ValType) -> bool {
     matches!(
         t,
         ValType::Base(
@@ -27,6 +27,28 @@ fn is_array_like(t: &ValType) -> bool {
         t,
         ValType::Array(_) | ValType::ArrayAny | ValType::EmptyArray
     )
+}
+
+fn check_join_values(
+    name: &str,
+    args: &[Expr],
+    start: usize,
+    scope: &Scope<'_>,
+    rule_name: &str,
+    errors: &mut Vec<CheckError>,
+) {
+    for (i, arg) in args.iter().enumerate().skip(start) {
+        if let Some(t) = infer_type(arg, scope)
+            && !is_scalar_stringable_type(&t)
+        {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: format!("{}() argument {} must be scalar, got {:?}", name, i + 1, t),
+            });
+        }
+    }
 }
 
 fn unify_mvappend_element_type(existing: &ValType, incoming: &ValType) -> Option<ValType> {
@@ -826,6 +848,48 @@ pub fn check_func_call(
                 });
             }
         }
+        "sha1_n" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "sha1_n() requires exactly 2 arguments: (text, length)".to_string(),
+                });
+            } else {
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("sha1_n() first argument must be chars, got {:?}", t),
+                    });
+                }
+                if let Some(t) = infer_type(&args[1], scope)
+                    && !is_numeric(&t)
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("sha1_n() second argument must be numeric, got {:?}", t),
+                    });
+                }
+                match &args[1] {
+                    Expr::Number(n)
+                        if n.is_finite() && n.fract() == 0.0 && *n >= 1.0 && *n <= 40.0 => {}
+                    Expr::Number(_) => errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: "sha1_n() length must be an integer from 1 to 40".to_string(),
+                    }),
+                    _ => {}
+                }
+            }
+        }
         "stable_id" => {
             if args.len() < 2 {
                 errors.push(CheckError {
@@ -848,7 +912,7 @@ pub fn check_func_call(
                 }
                 for (i, arg) in args.iter().enumerate().skip(1) {
                     if let Some(t) = infer_type(arg, scope)
-                        && !is_stable_id_value_type(&t)
+                        && !is_scalar_stringable_type(&t)
                     {
                         errors.push(CheckError {
                             severity: Severity::Error,
@@ -862,6 +926,41 @@ pub fn check_func_call(
                         });
                     }
                 }
+            }
+        }
+        "join" => {
+            if args.is_empty() {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "join() requires at least 1 argument".to_string(),
+                });
+            } else {
+                check_join_values("join", args, 0, scope, rule_name, errors);
+            }
+        }
+        "join_by" => {
+            if args.len() < 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "join_by() requires at least 2 arguments: (separator, value, ...)"
+                        .to_string(),
+                });
+            } else {
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("join_by() separator must be chars, got {:?}", t),
+                    });
+                }
+                check_join_values("join_by", args, 1, scope, rule_name, errors);
             }
         }
         "substr" => {

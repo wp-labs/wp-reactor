@@ -88,6 +88,29 @@ fn test_collect_set_returns_unique_values() {
 }
 
 #[test]
+fn test_collect_set_qualified_bind_field_missing_does_not_fallback_to_step_values() {
+    let mut fields = std::collections::HashMap::new();
+    fields.insert(
+        "_step_0_values".to_string(),
+        Value::Array(vec![Value::Str("10.0.0.1".to_string())]),
+    );
+    fields.insert("_step_0_source".to_string(), Value::Str("s".to_string()));
+    fields.insert("_bind_s_count".to_string(), Value::Number(6.0));
+    let ctx = Event { fields };
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "collect_set".to_string(),
+        args: vec![Expr::Field(FieldRef::Qualified(
+            "s".to_string(),
+            "event_id".to_string(),
+        ))],
+    };
+
+    let result = eval_yield_expr(&expr, &ctx);
+    assert_eq!(result, Some(Value::Array(vec![])));
+}
+
+#[test]
 fn test_merge_shallow_merges_objects_left_to_right() {
     let mut base = std::collections::HashMap::new();
     base.insert("severity".to_string(), Value::Number(3.0));
@@ -533,8 +556,11 @@ fn test_blank_functions_work_in_yield_eval() {
 fn test_hash_and_id_functions_work_in_yield_eval() {
     let mut fields = std::collections::HashMap::new();
     fields.insert("msg".to_string(), Value::Str("hello".to_string()));
+    fields.insert("empty".to_string(), Value::Str(String::new()));
     fields.insert("ip".to_string(), Value::Str("10.0.0.1".to_string()));
     fields.insert("count".to_string(), Value::Number(3.0));
+    fields.insert("special".to_string(), Value::Str("a|b".to_string()));
+    fields.insert("percent".to_string(), Value::Str("10%".to_string()));
     let ctx = Event { fields };
 
     let md5_expr = Expr::FuncCall {
@@ -546,6 +572,22 @@ fn test_hash_and_id_functions_work_in_yield_eval() {
         qualifier: None,
         name: "sha1".to_string(),
         args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
+    };
+    let sha1_n_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "sha1_n".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("msg".to_string())),
+            Expr::Number(8.0),
+        ],
+    };
+    let sha1_n_empty_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "sha1_n".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("empty".to_string())),
+            Expr::Number(8.0),
+        ],
     };
     let sha256_expr = Expr::FuncCall {
         qualifier: None,
@@ -575,6 +617,90 @@ fn test_hash_and_id_functions_work_in_yield_eval() {
             Expr::Number(4.0),
         ],
     };
+    let join_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("special".to_string())),
+            Expr::Field(FieldRef::Simple("percent".to_string())),
+            Expr::Field(FieldRef::Simple("empty".to_string())),
+            Expr::Field(FieldRef::Simple("count".to_string())),
+        ],
+    };
+    let join_by_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join_by".to_string(),
+        args: vec![
+            Expr::StringLit("|".to_string()),
+            Expr::Field(FieldRef::Simple("special".to_string())),
+            Expr::Field(FieldRef::Simple("percent".to_string())),
+            Expr::Field(FieldRef::Simple("empty".to_string())),
+            Expr::Field(FieldRef::Simple("count".to_string())),
+        ],
+    };
+    let join_missing_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("special".to_string())),
+            Expr::Field(FieldRef::Simple("missing".to_string())),
+            Expr::Field(FieldRef::Simple("percent".to_string())),
+        ],
+    };
+    let join_by_missing_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join_by".to_string(),
+        args: vec![
+            Expr::StringLit("|".to_string()),
+            Expr::Field(FieldRef::Simple("special".to_string())),
+            Expr::Field(FieldRef::Simple("missing".to_string())),
+            Expr::Field(FieldRef::Simple("percent".to_string())),
+        ],
+    };
+    let join_array_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join".to_string(),
+        args: vec![Expr::Array(vec![Expr::StringLit("x".to_string())])],
+    };
+    let join_by_object_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join_by".to_string(),
+        args: vec![
+            Expr::StringLit("|".to_string()),
+            Expr::Object(vec![ObjectItem {
+                targets: vec!["x".to_string()],
+                type_hint: None,
+                value: Expr::StringLit("y".to_string()),
+            }]),
+        ],
+    };
+    let join_invalid_nested_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join".to_string(),
+        args: vec![
+            Expr::StringLit("a".to_string()),
+            Expr::FuncCall {
+                qualifier: None,
+                name: "sha1_n".to_string(),
+                args: vec![Expr::StringLit("x".to_string()), Expr::Number(0.0)],
+            },
+            Expr::StringLit("b".to_string()),
+        ],
+    };
+    let join_by_invalid_nested_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "join_by".to_string(),
+        args: vec![
+            Expr::StringLit("|".to_string()),
+            Expr::StringLit("a".to_string()),
+            Expr::FuncCall {
+                qualifier: None,
+                name: "sha1_n".to_string(),
+                args: vec![Expr::StringLit("x".to_string()), Expr::Number(0.0)],
+            },
+            Expr::StringLit("b".to_string()),
+        ],
+    };
 
     assert_eq!(
         eval_yield_expr(&md5_expr, &ctx),
@@ -587,6 +713,14 @@ fn test_hash_and_id_functions_work_in_yield_eval() {
         ))
     );
     assert_eq!(
+        eval_yield_expr(&sha1_n_expr, &ctx),
+        Some(Value::Str("aaf4c61d".to_string()))
+    );
+    assert_eq!(
+        eval_yield_expr(&sha1_n_empty_expr, &ctx),
+        Some(Value::Str("da39a3ee".to_string()))
+    );
+    assert_eq!(
         eval_yield_expr(&sha256_expr, &ctx),
         Some(Value::Str(
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string()
@@ -595,6 +729,38 @@ fn test_hash_and_id_functions_work_in_yield_eval() {
     assert_eq!(
         eval_yield_expr(&hex_expr, &ctx),
         Some(Value::Str("68656c6c6f".to_string()))
+    );
+    assert_eq!(
+        eval_yield_expr(&join_expr, &ctx),
+        Some(Value::Str("a|b10%3".to_string()))
+    );
+    assert_eq!(
+        eval_yield_expr(&join_by_expr, &ctx),
+        Some(Value::Str("a|b|10%||3".to_string()))
+    );
+    assert_eq!(
+        eval_yield_expr(&join_missing_expr, &ctx),
+        Some(Value::Str("a|b10%".to_string()))
+    );
+    assert_eq!(
+        eval_yield_expr(&join_by_missing_expr, &ctx),
+        Some(Value::Str("a|b||10%".to_string()))
+    );
+    assert_eq!(
+        eval_expr_with_l3(&join_array_expr, &ctx, YieldMeta::default()),
+        None
+    );
+    assert_eq!(
+        eval_expr_with_l3(&join_by_object_expr, &ctx, YieldMeta::default()),
+        None
+    );
+    assert_eq!(
+        eval_expr_with_l3(&join_invalid_nested_expr, &ctx, YieldMeta::default()),
+        None
+    );
+    assert_eq!(
+        eval_expr_with_l3(&join_by_invalid_nested_expr, &ctx, YieldMeta::default()),
+        None
     );
     let Some(Value::Str(stable_id)) = eval_yield_expr(&stable_expr, &ctx) else {
         panic!("stable_id() should return a string");

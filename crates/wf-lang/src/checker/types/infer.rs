@@ -154,10 +154,9 @@ fn infer_func_call(
         "now_s" | "now_ms" | "now_us" | "now_ns" => Some(ValType::Base(BaseType::Digit)),
         "strftime" => Some(ValType::Base(BaseType::Chars)),
         "strptime" => Some(ValType::Base(BaseType::Time)),
-        "lower" | "upper" | "replace" | "trim" | "ltrim" | "rtrim" | "concat" | "replace_plain"
-        | "null_if_blank" | "default_if_blank" | "md5" | "sha1" | "sha256" | "stable_id" => {
-            Some(ValType::Base(BaseType::Chars))
-        }
+        "lower" | "upper" | "replace" | "trim" | "ltrim" | "rtrim" | "concat" | "join"
+        | "join_by" | "replace_plain" | "null_if_blank" | "default_if_blank" | "md5" | "sha1"
+        | "sha1_n" | "sha256" | "stable_id" => Some(ValType::Base(BaseType::Chars)),
         "hex" => Some(ValType::Base(BaseType::Hex)),
         "indexof" => Some(ValType::Base(BaseType::Digit)),
         "coalesce" => args.first().and_then(|a| infer_type(a, scope)),

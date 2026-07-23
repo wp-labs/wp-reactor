@@ -544,16 +544,37 @@ WFL 在 `match` 条件和 `yield` 赋值中均可使用内置函数：
 | | `clamp(v, lo, hi)`, `sign`, `trunc` | 值限制与截断 |
 | | `is_finite` | 浮点数校验 |
 | **字符串** | `ltrim`, `rtrim`, `trim` | 空白裁剪 |
-| | `concat(a, b, ...)`, `fmt("{} {}", a, b)` | 拼接与格式化 |
+| | `concat(a, b, ...)`, `join(a, b, ...)`, `join_by(sep, a, b, ...)`, `fmt("{} {}", a, b)` | 拼接与格式化 |
 | | `lower`, `upper`, `len` | 大小写与长度 |
 | | `contains`, `startswith_any`, `endswith_any` | 包含判断 |
 | | `indexof`, `replace_plain` | 搜索与替换 |
 | | `split(s, sep)` | 拆分为多值数组 |
 | **多值** | `mvindex(arr, i)`, `mvsort(arr)`, `mvreverse(arr)` | 数组操作 |
 | | `mvjoin(arr, sep)` | 数组拼接为字符串 |
+| | `collect_set(alias.field)`, `collect_list(alias.field)` | 窗口内最近字段样本收集 |
 | **空值/空白** | `coalesce(a, b, ...)`, `isnull`, `isnotnull` | 按顺序取第一个非 null 且非 blank 字符串的值 |
+| **Hash/ID** | `md5`, `sha1`, `sha1_n`, `sha256`, `hex`, `stable_id` | Hash、编码与稳定 ID |
 | **时间** | `strptime(s, fmt)`, `strftime(t, fmt)` | 时间解析与格式化 |
 | **条件** | `if cond then a else b` | 三目条件表达式 |
+
+需要规则作者完全控制拼接内容时，可以用 `join` / `join_by` 组合 `sha1_n` 生成短 ID：
+
+```wfl
+raw_key = join(e.sip, e.user, e.action),
+readable_key = join_by("|", e.sip, e.user, e.action),
+short_hash = sha1_n(join_by("|", e.sip, e.user, e.action), 16)
+```
+
+`join` / `join_by` 不做 trim、大小写转换、转义或长度前缀编码；取不到的字段参数按空字符串片段处理。
+
+输出 evidence 集合时，推荐让计数和 ID 集合引用同一个 alias：
+
+```wfl
+event_count = stat.count(window_event(s)),
+evidences = collect_set(s.event_id)
+```
+
+`collect_set(s.event_id)` 与 `stat.count(window_event(s))` 基于同一个 rule instance 内的 `s` 事件集合；`collect_set` 对字段值去重并保留首次出现顺序。
 
 ---
 

@@ -52,7 +52,7 @@ fn with_eval_time_scope<T>(f: impl FnOnce() -> T) -> T {
 /// Evaluate an expression against an event, returning a [`Value`].
 ///
 /// Supports: literals, field refs, BinOp (And/Or/comparisons/arithmetic),
-/// Neg, InList, and basic FuncCall (contains, startswith, endswith, substr, replace, trim, lower, upper, len, mvcount, mvjoin, mvindex, mvappend, split, mvdedup, abs, round, ceil, floor, sqrt, pow, log, exp, clamp, sign, trunc, is_finite, ltrim, rtrim, concat, indexof, replace_plain, startswith_any, endswith_any, coalesce, merge, isnull, isnotnull, is_blank, null_if_blank, default_if_blank, md5, sha1, sha256, hex, stable_id, mvsort, mvreverse, now, now_s, now_ms, now_us, now_ns, strftime, strptime, has, baseline).
+/// Neg, InList, and basic FuncCall (contains, startswith, endswith, substr, replace, trim, lower, upper, len, mvcount, mvjoin, mvindex, mvappend, split, mvdedup, abs, round, ceil, floor, sqrt, pow, log, exp, clamp, sign, trunc, is_finite, ltrim, rtrim, concat, join, join_by, indexof, replace_plain, startswith_any, endswith_any, coalesce, merge, isnull, isnotnull, is_blank, null_if_blank, default_if_blank, md5, sha1, sha1_n, sha256, hex, stable_id, mvsort, mvreverse, now, now_s, now_ms, now_us, now_ns, strftime, strptime, has, baseline).
 pub(crate) fn eval_expr(expr: &Expr, event: &Event) -> Option<Value> {
     with_eval_time_scope(|| {
         let mut empty = HashMap::new();

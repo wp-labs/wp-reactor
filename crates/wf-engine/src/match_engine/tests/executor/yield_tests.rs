@@ -4,7 +4,7 @@ use wf_config::OutputConfig;
 use wf_lang::ast::{BinOp, Expr, FieldRef, ObjectItem, SystemVar};
 use wf_lang::plan::{EachPlan, StepPlan, YieldField};
 use wf_lang::wfu_meta::WfuMetaField;
-use wf_lang::{BaseType, FieldType};
+use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
 use crate::match_engine::Value;
 use crate::match_engine::match_engine::{BindData, CloseOutput, CloseReason, StepData};
@@ -1662,6 +1662,412 @@ rule stat_rule {
     assert_eq!(field("window_events"), Some(num(2.0)));
     assert_eq!(field("matched_events"), Some(num(2.0)));
     assert_eq!(field("trigger_count"), Some(num(2.0)));
+}
+
+fn evidence_input_window() -> WindowSchema {
+    WindowSchema {
+        name: "auth_events".to_string(),
+        streams: vec!["auth_stream".to_string()],
+        time_field: Some("event_time".to_string()),
+        over: std::time::Duration::from_secs(3600),
+        fields: vec![
+            FieldDef {
+                name: "sip".to_string(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "event_id".to_string(),
+                field_type: FieldType::Base(BaseType::Chars),
+            },
+            FieldDef {
+                name: "event_time".to_string(),
+                field_type: FieldType::Base(BaseType::Time),
+            },
+            FieldDef {
+                name: "weight".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+        ],
+    }
+}
+
+fn evidence_output_window() -> WindowSchema {
+    WindowSchema {
+        name: "out".to_string(),
+        streams: vec![],
+        time_field: None,
+        over: std::time::Duration::from_secs(3600),
+        fields: vec![
+            FieldDef {
+                name: "sip".to_string(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "event_count".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "evidences".to_string(),
+                field_type: FieldType::Array(BaseType::Chars),
+            },
+        ],
+    }
+}
+
+fn evidence_event(event_id: &str) -> Value {
+    str_val(event_id)
+}
+
+#[test]
+fn execute_match_yield_collects_window_event_ids() {
+    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+
+    let source = r#"
+rule evidence_rule {
+    events { s : auth_events }
+    match<sip:5m> {
+        on event { hit: s | count >= 6; }
+    } -> score(70.0)
+    entity(ip, s.sip)
+    yield out (
+        sip = s.sip,
+        event_count = stat.count(window_event(s)),
+        evidences = collect_set(s.event_id)
+    )
+}
+"#;
+    let file = wf_lang::parse_wfl(source).expect("parse should succeed");
+    let plan = wf_lang::compile_wfl(&file, &[evidence_input_window(), evidence_output_window()])
+        .expect("compile should succeed")
+        .into_iter()
+        .next()
+        .expect("rule plan should exist");
+    assert!(
+        plan.match_plan
+            .tracked_bind_fields
+            .get("s")
+            .is_some_and(|fields| fields.contains("event_id"))
+    );
+
+    let exec = RuleExecutor::new(plan.clone());
+    let mut sm = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), None);
+    let mut matched = None;
+    for i in 0..6 {
+        let event_id = format!("evt_{:03}", i + 1);
+        let step = sm.advance_at(
+            "s",
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("event_id", evidence_event(&event_id)),
+            ]),
+            (i as i64 + 1) * 1_000_000_000,
+        );
+        if i < 5 {
+            assert_eq!(step, StepResult::Accumulate);
+        } else {
+            let StepResult::Matched(ctx) = step else {
+                panic!("sixth event should trigger");
+            };
+            matched = Some(ctx);
+        }
+    }
+
+    let alert = exec
+        .execute_match(&matched.expect("matched context"))
+        .expect("alert");
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+
+    assert_eq!(field("event_count"), Some(num(6.0)));
+    assert_eq!(
+        field("evidences"),
+        Some(Value::Array(vec![
+            str_val("evt_001"),
+            str_val("evt_002"),
+            str_val("evt_003"),
+            str_val("evt_004"),
+            str_val("evt_005"),
+            str_val("evt_006"),
+        ]))
+    );
+}
+
+#[test]
+fn execute_match_yield_dedups_window_event_ids() {
+    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+
+    let source = r#"
+rule evidence_rule {
+    events { s : auth_events }
+    match<sip:5m> {
+        on event { hit: s | count >= 6; }
+    } -> score(70.0)
+    entity(ip, s.sip)
+    yield out (
+        sip = s.sip,
+        event_count = stat.count(window_event(s)),
+        evidences = collect_set(s.event_id)
+    )
+}
+"#;
+    let file = wf_lang::parse_wfl(source).expect("parse should succeed");
+    let plan = wf_lang::compile_wfl(&file, &[evidence_input_window(), evidence_output_window()])
+        .expect("compile should succeed")
+        .into_iter()
+        .next()
+        .expect("rule plan should exist");
+
+    let exec = RuleExecutor::new(plan.clone());
+    let mut sm = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), None);
+    let ids = [
+        "evt_001", "evt_002", "evt_002", "evt_003", "evt_001", "evt_004",
+    ];
+    let mut matched = None;
+    for (i, event_id) in ids.iter().enumerate() {
+        let step = sm.advance_at(
+            "s",
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("event_id", evidence_event(event_id)),
+            ]),
+            (i as i64 + 1) * 1_000_000_000,
+        );
+        if i < 5 {
+            assert_eq!(step, StepResult::Accumulate);
+        } else {
+            let StepResult::Matched(ctx) = step else {
+                panic!("sixth event should trigger");
+            };
+            matched = Some(ctx);
+        }
+    }
+
+    let alert = exec
+        .execute_match(&matched.expect("matched context"))
+        .expect("alert");
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+
+    assert_eq!(field("event_count"), Some(num(6.0)));
+    assert_eq!(
+        field("evidences"),
+        Some(Value::Array(vec![
+            str_val("evt_001"),
+            str_val("evt_002"),
+            str_val("evt_003"),
+            str_val("evt_004"),
+        ]))
+    );
+}
+
+#[test]
+fn execute_match_yield_missing_window_event_ids_returns_empty_evidences() {
+    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+
+    let source = r#"
+rule evidence_rule {
+    events { s : auth_events }
+    match<sip:5m> {
+        on event { hit: s.weight | sum >= 6; }
+    } -> score(70.0)
+    entity(ip, s.sip)
+    yield out (
+        sip = s.sip,
+        event_count = stat.count(window_event(s)),
+        evidences = collect_set(s.event_id)
+    )
+}
+"#;
+    let file = wf_lang::parse_wfl(source).expect("parse should succeed");
+    let plan = wf_lang::compile_wfl(&file, &[evidence_input_window(), evidence_output_window()])
+        .expect("compile should succeed")
+        .into_iter()
+        .next()
+        .expect("rule plan should exist");
+    assert!(
+        plan.match_plan
+            .tracked_bind_fields
+            .get("s")
+            .is_some_and(|fields| fields.contains("event_id"))
+    );
+
+    let exec = RuleExecutor::new(plan.clone());
+    let mut sm = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), None);
+    let mut matched = None;
+    for i in 0..6 {
+        let step = sm.advance_at(
+            "s",
+            &event(vec![("sip", str_val("10.0.0.1")), ("weight", num(1.0))]),
+            (i as i64 + 1) * 1_000_000_000,
+        );
+        if i < 5 {
+            assert_eq!(step, StepResult::Accumulate);
+        } else {
+            let StepResult::Matched(ctx) = step else {
+                panic!("sixth event should trigger");
+            };
+            matched = Some(ctx);
+        }
+    }
+
+    let alert = exec
+        .execute_match(&matched.expect("matched context"))
+        .expect("alert");
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+
+    assert_eq!(field("event_count"), Some(num(6.0)));
+    assert_eq!(field("evidences"), Some(Value::Array(vec![])));
+}
+
+#[test]
+fn execute_match_yield_caps_window_event_ids_to_recent_sample() {
+    use crate::match_engine::match_engine::CepStateMachine;
+
+    let source = r#"
+rule evidence_rule {
+    events { s : auth_events }
+    match<sip:5m> {
+        on event { hit: s | count >= 2065; }
+    } -> score(70.0)
+    entity(ip, s.sip)
+    yield out (
+        sip = s.sip,
+        event_count = stat.count(window_event(s)),
+        evidences = collect_set(s.event_id)
+    )
+}
+"#;
+    let file = wf_lang::parse_wfl(source).expect("parse should succeed");
+    let plan = wf_lang::compile_wfl(&file, &[evidence_input_window(), evidence_output_window()])
+        .expect("compile should succeed")
+        .into_iter()
+        .next()
+        .expect("rule plan should exist");
+
+    let exec = RuleExecutor::new(plan.clone());
+    let mut sm = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), None);
+    let mut matched = None;
+    for i in 0..2065 {
+        let event_id = format!("evt_{:04}", i);
+        if let crate::match_engine::match_engine::StepResult::Matched(ctx) = sm.advance_at(
+            "s",
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("event_id", evidence_event(&event_id)),
+            ]),
+            (i as i64 + 1) * 1_000_000,
+        ) {
+            matched = Some(ctx);
+        }
+    }
+
+    let alert = exec
+        .execute_match(&matched.expect("matched context"))
+        .expect("alert");
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+
+    assert_eq!(field("event_count"), Some(num(2065.0)));
+    let Some(Value::Array(evidences)) = field("evidences") else {
+        panic!("evidences should be an array");
+    };
+    assert_eq!(evidences.len(), 1024);
+    assert_eq!(evidences.first(), Some(&str_val("evt_1041")));
+    assert_eq!(evidences.last(), Some(&str_val("evt_2064")));
+}
+
+#[test]
+fn execute_close_yield_collects_window_event_ids() {
+    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+
+    let source = r#"
+rule evidence_close_rule {
+    events { s : auth_events }
+    match<sip:5m> {
+        on event { hit: s | count >= 6; }
+        and close { final_hit: s | count >= 6; }
+    } -> score(70.0)
+    entity(ip, s.sip)
+    yield out (
+        sip = s.sip,
+        event_count = stat.count(window_event(s)),
+        evidences = collect_set(s.event_id)
+    )
+}
+"#;
+    let file = wf_lang::parse_wfl(source).expect("parse should succeed");
+    let plan = wf_lang::compile_wfl(&file, &[evidence_input_window(), evidence_output_window()])
+        .expect("compile should succeed")
+        .into_iter()
+        .next()
+        .expect("rule plan should exist");
+
+    let exec = RuleExecutor::new(plan.clone());
+    let mut sm = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), None);
+    for i in 0..6 {
+        let event_id = format!("evt_{:03}", i + 1);
+        let step = sm.advance_at(
+            "s",
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("event_id", evidence_event(&event_id)),
+            ]),
+            (i as i64 + 1) * 1_000_000_000,
+        );
+        if i < 5 {
+            assert_eq!(step, StepResult::Accumulate);
+        } else {
+            assert_eq!(step, StepResult::Advance);
+        }
+    }
+
+    let outputs = sm.close_all(CloseReason::Timeout);
+    assert_eq!(outputs.len(), 1);
+    let alert = exec
+        .execute_close(&outputs[0])
+        .expect("close should execute")
+        .expect("close should emit");
+    let field = |name: &str| {
+        alert
+            .yield_fields
+            .iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value.clone())
+    };
+
+    assert_eq!(field("event_count"), Some(num(6.0)));
+    assert_eq!(
+        field("evidences"),
+        Some(Value::Array(vec![
+            str_val("evt_001"),
+            str_val("evt_002"),
+            str_val("evt_003"),
+            str_val("evt_004"),
+            str_val("evt_005"),
+            str_val("evt_006"),
+        ]))
+    );
 }
 
 #[test]

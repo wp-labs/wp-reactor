@@ -116,32 +116,27 @@ fn selected_field_name(field: Option<&FieldSelector>) -> Option<&str> {
     }
 }
 
-/// Maximum number of values retained per field in the per-field value lists
-/// of both [`AliasState`] (tracked bind alias) and [`BranchState`] (close-step
-/// accumulation).
+/// Maximum number of values retained per field in alias/branch field history.
 ///
 /// `collect_alias_event` / `collect_event_fields` / `update_measure`
-/// accumulate field values across every matching event. Without a cap this
-/// grows unboundedly on high-volume windows (e.g. 30k events × N fields),
-/// risking OOM. We keep the most recent `MAX_TRACKED_FIELD_VALUES` entries per
-/// field, which:
+/// accumulate field values across matching events. Without a cap this grows
+/// unboundedly on high-volume windows (e.g. 30k events × N fields), risking OOM.
+/// We keep a recent sample per field, which:
 /// - preserves yield field resolution (`e.dip` reads `.last()`, always present)
-/// - keeps L3 aggregations (`collect_set(e.dip)`, `last(e.x)`, and the
-///   close-step equivalents) working on a bounded recent sample.
+/// - keeps L3 collection functions such as `collect_set(e.event_id)` bounded.
 ///
-/// `first(e.x)` / `stddev` / `percentile` become approximate over large windows
-/// — documented trade-off for bounded memory. Note: close-step threshold
-/// evaluation (count/sum/min/max/distinct) uses separate accumulators and is
-/// NOT affected by this cap.
+/// `stat.count(window_event(alias))` counts all accepted alias events. Collection
+/// functions over alias fields can therefore return fewer values than the count
+/// for large windows or duplicate field values. Close-step threshold evaluation
+/// (count/sum/min/max/distinct) uses separate accumulators and is not affected by
+/// this cap.
 const MAX_TRACKED_FIELD_VALUES: usize = 1024;
 
 /// Push `value` onto `values`, trimming to the most recent
-/// `MAX_TRACKED_FIELD_VALUES` entries when the soft limit (2× cap) is exceeded.
-/// Trimming only on overshoot keeps the common push O(1) amortized.
+/// `MAX_TRACKED_FIELD_VALUES` entries.
 fn push_capped(values: &mut Vec<Value>, value: Value) {
     values.push(value);
-    let soft_limit = MAX_TRACKED_FIELD_VALUES * 2;
-    if values.len() > soft_limit {
+    if values.len() > MAX_TRACKED_FIELD_VALUES {
         let keep_from = values.len() - MAX_TRACKED_FIELD_VALUES;
         values.drain(..keep_from);
     }
@@ -443,17 +438,30 @@ mod tests {
         }
 
         let values = state.field_values.get("dip").expect("dip collected");
-        // Bounded: never exceeds ~2× cap between trims, lands at exactly cap after one.
-        assert!(
-            values.len() <= MAX_TRACKED_FIELD_VALUES * 2,
-            "field_values grew to {}, expected <= {}",
-            values.len(),
-            MAX_TRACKED_FIELD_VALUES * 2
-        );
+        assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         // The retained window is the most recent entries; `.last()` is the latest event,
         // which is what yield field resolution (`e.dip`) reads.
         assert_eq!(values.last(), Some(&Value::Number((over - 1) as f64)));
         // count tracks every event regardless of the value cap.
+        assert_eq!(state.count, over as u64);
+    }
+
+    #[test]
+    fn collect_alias_event_caps_explicit_tracked_fields_and_keeps_most_recent() {
+        let mut state = AliasState::new();
+        let tracked = HashSet::from(["event_id".to_string()]);
+        let over = MAX_TRACKED_FIELD_VALUES * 2 + 17;
+        for i in 0..over as i64 {
+            collect_alias_event(&event_with("event_id", i), &mut state, Some(&tracked));
+        }
+
+        let values = state
+            .field_values
+            .get("event_id")
+            .expect("event_id collected");
+        assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
+        assert!(!values.contains(&Value::Number(0.0)));
+        assert_eq!(values.last(), Some(&Value::Number((over - 1) as f64)));
         assert_eq!(state.count, over as u64);
     }
 
@@ -475,12 +483,7 @@ mod tests {
         }
 
         let values = bs.field_values.get("dport").expect("dport collected");
-        assert!(
-            values.len() <= MAX_TRACKED_FIELD_VALUES * 2,
-            "branch field_values grew to {}, expected <= {}",
-            values.len(),
-            MAX_TRACKED_FIELD_VALUES * 2
-        );
+        assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         // `.last()` — the value yield field resolution reads — stays correct.
         assert_eq!(values.last(), Some(&Value::Number((over - 1) as f64)));
     }
@@ -555,12 +558,7 @@ mod tests {
             update_measure(&Measure::Count, &Some(Value::Number(i as f64)), &mut bs);
         }
 
-        assert!(
-            bs.collected_values.len() <= MAX_TRACKED_FIELD_VALUES * 2,
-            "collected_values grew to {}, expected <= {}",
-            bs.collected_values.len(),
-            MAX_TRACKED_FIELD_VALUES * 2
-        );
+        assert_eq!(bs.collected_values.len(), MAX_TRACKED_FIELD_VALUES);
         assert_eq!(
             bs.collected_values.last(),
             Some(&Value::Number((over - 1) as f64))

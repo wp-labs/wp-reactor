@@ -52,6 +52,8 @@ use super::{eval_expr_ext, values_equal};
 /// - `rtrim(s)` → Str
 /// - `fmt(template, v1, v2, ...)` → Str
 /// - `concat(v1, v2, ...)` → Str
+/// - `join(v1, v2, ...)` → Str
+/// - `join_by(separator, v1, v2, ...)` → Str
 /// - `indexof(text, needle)` → Number
 /// - `replace_plain(text, from, to)` → Str
 /// - `startswith_any(text, prefix1, prefix2, ...)` → Bool
@@ -63,7 +65,7 @@ use super::{eval_expr_ext, values_equal};
 /// - `is_blank(expr)` → Bool
 /// - `null_if_blank(expr)` → Str or null
 /// - `default_if_blank(expr, default)` → Str
-/// - `md5(text)` / `sha1(text)` / `sha256(text)` → lowercase hex string
+/// - `md5(text)` / `sha1(text)` / `sha1_n(text, length)` / `sha256(text)` → lowercase hex string
 /// - `hex(text)` → lowercase hex string
 /// - `stable_id(prefix, value, ...)` → `prefix` + first 16 chars of SHA-256 over typed, length-prefixed values
 /// - `mvsort(arr)` → Array
@@ -561,6 +563,30 @@ pub(super) fn eval_func_call(
             }
             Some(Value::Str(out))
         }
+        "join" => {
+            if args.is_empty() {
+                return None;
+            }
+            let mut out = String::new();
+            for arg in args {
+                out.push_str(&eval_join_arg(arg, event, windows, baselines)?);
+            }
+            Some(Value::Str(out))
+        }
+        "join_by" => {
+            if args.len() < 2 {
+                return None;
+            }
+            let sep = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let mut parts = Vec::with_capacity(args.len() - 1);
+            for arg in &args[1..] {
+                parts.push(eval_join_arg(arg, event, windows, baselines)?);
+            }
+            Some(Value::Str(parts.join(&sep)))
+        }
         "indexof" => {
             if args.len() != 2 {
                 return None;
@@ -723,6 +749,24 @@ pub(super) fn eval_func_call(
             Some(Value::Str(hex::encode(<Sha1 as Sha1Digest>::digest(
                 text.as_bytes(),
             ))))
+        }
+        "sha1_n" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let len = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Number(n) if n.is_finite() && n.fract() == 0.0 => n as usize,
+                _ => return None,
+            };
+            if !(1..=40).contains(&len) {
+                return None;
+            }
+            let digest = hex::encode(<Sha1 as Sha1Digest>::digest(text.as_bytes()));
+            Some(Value::Str(digest[..len].to_string()))
         }
         "sha256" => {
             let text = eval_single_string_arg(args, event, windows, baselines)?;
@@ -897,6 +941,26 @@ pub(super) fn eval_func_call(
             })
         }
         _ => None, // unsupported function
+    }
+}
+
+fn scalar_value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::Array(_) | Value::Object(_) => None,
+        _ => Some(value_to_string(value)),
+    }
+}
+
+fn eval_join_arg(
+    arg: &Expr,
+    event: &Event,
+    windows: Option<&dyn WindowLookup>,
+    baselines: &mut HashMap<String, RollingStats>,
+) -> Option<String> {
+    match eval_expr_ext(arg, event, windows, baselines) {
+        Some(value) => scalar_value_to_string(&value),
+        None if matches!(arg, Expr::Field(_)) => Some(String::new()),
+        None => None,
     }
 }
 
