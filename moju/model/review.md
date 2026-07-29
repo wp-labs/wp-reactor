@@ -80,3 +80,26 @@
 2. **合并** `EngineEntry` 和 `CliEntry` 为一个模块
 3. **确认** `RunRuleKind.Match/Each` 是否准确捕获了业务含义
 4. **确认** draft review 通过后执行: `cp -r moju/draft/domain/* moju/model/domain/`
+
+---
+
+## 2026-07-28 反向更新：crates → moju/model
+
+本轮按当前 `crates/*` 代码事实反向更新 `moju/model`，保留 actor/command/flow 等代码无法直接表达的设计概念。
+
+### 已接受的高置信度更新
+
+| Domain | 更新 |
+|--------|------|
+| Config | 同步 unified `SourceConfig`；新增 Admin API、project remote、output config、sink defaults/expect、wildcard route helper 类型；同步 sink group/route/bundle 字段；`FusionChangeKind` 增加 `Output`。 |
+| Engine | `AppendOutcome` 从统计 struct 调整为 `Appended/DroppedLate` state；同步 window route/evict report、provider window、match context、bind data、rolling stats、sink route binding 等结构。 |
+| Lang | 同步 `FieldRef`、`FieldSelector`、`ExpectStmt`、`HitAssert` 的 enum 形态；补充 WFG scenario AST；同步 match/expr/test/plan 的可选字段与新增状态。 |
+| Orchestra | `Command` 对齐为代码中的 `Commands`；新增 reload/run outcome、reload request、runtime control handle、rule task config、parsed rule file、replay route、window miss 类型。 |
+
+### 保留为未采纳实现细节
+
+以下代码类型暂不纳入模型：测试 mock、tracing 初始化结构、Redis backend、external runtime wrapper、内部 registry subscription、低层 eval scope、CLI wrapper `Cli`、receiver batch column builder 等。它们更像实现机制，不是当前业务模型契约。
+
+### 后续建议
+
+模型已更新并通过 `moju verify moju/model`。如果需要让 `moju-code diff` 进一步收敛，需要下一步把新增模型类型的 `#[moju(domain, module)]` 注解同步回代码，并人工处理 extractor 对无注解类型的误报噪声。

@@ -1,44 +1,58 @@
 use std::collections::{HashMap, HashSet};
 
-use wf_lang::ast::{CmpOp, FieldSelector, Measure, Transform};
+use wf_lang::ast::{BinOp, CmpOp, Expr, FieldSelector, Measure, Transform};
 use wf_lang::plan::{AggPlan, StepPlan};
 
 use super::eval::{eval_expr_ext, try_eval_expr_to_f64, try_eval_expr_to_value};
 use super::key::ValueKey;
 use super::state::{AliasState, BranchState, StepState};
-use super::types::{Event, RollingStats, Value, WindowLookup};
+use super::types::{Event, RollingStats, StepProgress, Value, WindowLookup};
 
 // ---------------------------------------------------------------------------
 // Step evaluation
 // ---------------------------------------------------------------------------
 
-/// Evaluate all branches in a step. Returns the first branch that is
-/// satisfied: `Some((branch_index, measure_value))`.
-pub(super) fn evaluate_step(
-    alias: &str,
-    event: &Event,
-    event_time_nanos: i64,
+pub(super) struct StepEvaluationInput<'a> {
+    pub alias: &'a str,
+    pub event: &'a Event,
+    pub event_time_nanos: i64,
+    pub windows: Option<&'a dyn WindowLookup>,
+    pub progress: Option<StepProgressCapture<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct StepProgressCapture<'a> {
+    pub rule_name: &'a str,
+    pub scope_key: &'a [Value],
+    pub machine_id: &'a str,
+    pub step_index: usize,
+}
+
+/// Evaluate all branches in a step and optionally capture progress details.
+pub(super) fn evaluate_step_with_progress(
+    input: StepEvaluationInput<'_>,
     step_plan: &StepPlan,
     step_state: &mut StepState,
-    windows: Option<&dyn WindowLookup>,
     baselines: &mut HashMap<String, RollingStats>,
-) -> Option<(usize, f64)> {
+) -> (Option<(usize, f64)>, Option<StepProgress>) {
+    let mut progress = None;
+    let mut threshold_checked_branches = 0usize;
     for (branch_idx, branch) in step_plan.branches.iter().enumerate() {
         // Source must match alias
-        if branch.source != alias {
+        if branch.source != input.alias {
             continue;
         }
 
         // Guard check
         if let Some(guard) = &branch.guard {
-            match eval_expr_ext(guard, event, windows, baselines) {
+            match eval_expr_ext(guard, input.event, input.windows, baselines) {
                 Some(Value::Bool(true)) => {} // guard passed
                 _ => continue,                // guard failed or non-bool
             }
         }
 
         // Extract field value (for aggregation)
-        let field_value = extract_branch_field(event, &branch.field);
+        let field_value = extract_branch_field(input.event, &branch.field);
 
         let bs = &mut step_state.branch_states[branch_idx];
 
@@ -46,21 +60,105 @@ pub(super) fn evaluate_step(
         if !apply_transforms(&branch.agg.transforms, &field_value, bs) {
             continue; // filtered out by transform (e.g. duplicate in distinct)
         }
+        threshold_checked_branches += 1;
 
-        record_evidence_time(bs, event_time_nanos);
+        record_evidence_time(bs, input.event_time_nanos);
 
         // Update measure accumulators
         update_measure(&branch.agg.measure, &field_value, bs);
 
         // Check threshold
         let satisfied = check_threshold(&branch.agg, bs);
+        let measure_val = if input.progress.is_some() || satisfied {
+            compute_measure(&branch.agg.measure, bs)
+        } else {
+            0.0
+        };
 
+        if let Some(progress_capture) = input.progress {
+            let branch_progress = StepProgress {
+                rule_name: progress_capture.rule_name.to_string(),
+                scope_key: progress_capture.scope_key.to_vec(),
+                machine_id: progress_capture.machine_id.to_string(),
+                step_index: progress_capture.step_index,
+                branch_index: branch_idx,
+                step_label: branch.label.clone(),
+                branch_source: branch.source.clone(),
+                threshold_checked_branches,
+                measure_value: measure_val,
+                cmp: cmp_symbol(branch.agg.cmp).to_string(),
+                threshold: expr_debug_string(&branch.agg.threshold),
+                satisfied,
+                instances: 0,
+            };
+            if satisfied {
+                return (Some((branch_idx, measure_val)), Some(branch_progress));
+            }
+            progress = Some(branch_progress);
+        }
         if satisfied {
-            let measure_val = compute_measure(&branch.agg.measure, bs);
-            return Some((branch_idx, measure_val));
+            return (Some((branch_idx, measure_val)), progress);
         }
     }
-    None
+    (None, progress)
+}
+
+fn expr_debug_string(expr: &Expr) -> String {
+    match expr {
+        Expr::Number(value) => value.to_string(),
+        Expr::StringLit(value) => format!("{value:?}"),
+        Expr::Bool(value) => value.to_string(),
+        Expr::Neg(inner) => format!("-{}", expr_debug_atom(inner)),
+        Expr::BinOp { op, left, right } if is_arithmetic(*op) => {
+            format!(
+                "{} {} {}",
+                expr_debug_atom(left),
+                binop_symbol(*op),
+                expr_debug_atom(right)
+            )
+        }
+        _ => format!("{expr:?}"),
+    }
+}
+
+fn expr_debug_atom(expr: &Expr) -> String {
+    match expr {
+        Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) | Expr::Neg(_) => {
+            expr_debug_string(expr)
+        }
+        Expr::BinOp { .. } => format!("({})", expr_debug_string(expr)),
+        _ => format!("{expr:?}"),
+    }
+}
+
+fn is_arithmetic(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+    )
+}
+
+fn binop_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        _ => "?",
+    }
+}
+
+fn cmp_symbol(cmp: wf_lang::ast::CmpOp) -> &'static str {
+    match cmp {
+        wf_lang::ast::CmpOp::Eq => "==",
+        wf_lang::ast::CmpOp::Ne => "!=",
+        wf_lang::ast::CmpOp::Lt => "<",
+        wf_lang::ast::CmpOp::Gt => ">",
+        wf_lang::ast::CmpOp::Le => "<=",
+        wf_lang::ast::CmpOp::Ge => ">=",
+        _ => "?",
+    }
 }
 
 pub(super) fn record_evidence_time(bs: &mut BranchState, event_time_nanos: i64) {

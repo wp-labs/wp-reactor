@@ -20,7 +20,7 @@ verify EvictWindowOk for flow EvictWindow {
   when MemoryPressure
 
   expect {
-    EvictReport.removed_rows == "auth_events"
+    EvictReport.windows_scanned == "auth_events"
   }
 }
 
@@ -32,6 +32,6 @@ verify StateMachineOk for flow StateMachineStep {
   when NewEvents
 
   expect {
-    MatchedContext.events == "e1"
+    MatchedContext.rule_name == "e1"
   }
 }

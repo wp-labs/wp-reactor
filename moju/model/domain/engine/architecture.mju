@@ -12,14 +12,16 @@ module EventIngress {
 
 module WindowManager {
   layer DataFusion
-  owns Window, WindowParams, AppendOutcome, TimedBatch, WindowRegistry, WindowDef, Router, RouteReport, EvictReport
+  owns Window, WindowParams, AppendOutcome, TimedBatch, WindowRegistry, WindowDef, Router, RouteReport, WindowRouteOutcome
+  owns EvictReport, WindowEvictCount, ProviderWindow
 
   responsible_for "Time-ordered event window buffer with eviction policy and stream-to-window routing"
 }
 
 module MatchEngine {
   layer DataFusion
-  owns Event, Value, RuleExecutor, CepStateMachine, InstanceKey, Instance, StepState, BranchState, StepData, StepResult, MatchedContext, CloseOutput, CloseReason, CoreReason
+  owns Event, Value, RuleExecutor, CepStateMachine, InstanceKey, Instance, StepState, BranchState, StepData, StepResult, StepProgress, StepOutcome, MatchedContext, CloseOutput, CloseReason, CoreReason
+  owns BindData, RollingStats, ValueKey, AliasState
 
   responsible_for "NFA-style state machine for sequential event pattern matching with close-mode lifecycle"
 }
@@ -33,7 +35,7 @@ module AlertOutput {
 
 module SinkDispatch {
   layer DataFusion
-  owns SinkDispatcher, SinkRuntime
+  owns SinkDispatcher, SinkRuntime, SinkRouteBinding
 
   responsible_for "Route OutputRecords to configured sinks with default and error fallback"
 }

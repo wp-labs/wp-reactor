@@ -110,7 +110,7 @@ struct ResolvedConfigLoad {
   config_ctx: ConfigVarContext
 }
 
-state Command {
+state Commands {
   Run
   Config
 }
@@ -128,6 +128,13 @@ struct Reactor {
   cancel: String
   watchers: List<String>
   listen_addr: String
+  rule_cancel: String
+  router: String
+  metrics: RuntimeMetrics?
+  intermediate_targets: List<String>
+  current_raw: RawFusionConfigTree
+  current_config: FusionConfig
+  base_dir: String
 }
 
 struct BootstrapData {
@@ -137,12 +144,14 @@ struct BootstrapData {
   schema_count: Int
   schemas: List<String>
   intermediate_targets: List<String>
+  window_configs: List<String>
+  external_runtime: String?
 }
 
 struct RunRule {
   kind: RunRuleKind
   executor: String
-  window_aliases: Map
+  window_aliases: Map<String, List<String>>
 }
 
 state RunRuleKind {
@@ -162,6 +171,27 @@ struct TaskGroup {
   handles: List<String>
 }
 
+struct WindowSource {
+  window_name: String
+  window: String
+  notify: String
+  aliases: List<String>
+}
+
+struct RuleTaskConfig {
+  machine: String?
+  each_alias: String?
+  each_time_field: String?
+  executor: RuleExecutor
+  window_sources: List<WindowSource>
+  alert_tx: String
+  cancel: String
+  timeout_scan_interval: Duration
+  router: String
+  metrics: RuntimeMetrics?
+  intermediate_targets: List<String>
+}
+
 // -- Reload ------------------------------------------------------------------
 
 struct PreparedRuleReload {
@@ -174,11 +204,56 @@ state ReloadPreparation {
   Blocked
 }
 
+state ReloadOutcome {
+  Applied
+  Blocked
+}
+
+state RunOutcome {
+  Normal
+  RestartRequested
+}
+
+state ReloadRequest {
+  Reload
+  Restart
+}
+
+struct RuntimeControlHandle {
+  tx: String
+  cancel: String
+}
+
+struct ParsedRuleFile {
+  path: String
+  source: String
+  file: WflFile
+}
+
 // -- Receiver ----------------------------------------------------------------
 
 struct Receiver {
   config: String
   bind_addr: String
+}
+
+struct ReplayRoute {
+  stream_name: String
+  stream_tag_field: String
+}
+
+state WindowMissReason {
+  UnknownStreamSchema
+  MissingStreamTagField
+}
+
+struct WindowMiss {
+  stream_tag_field: String
+  stream_tag: String?
+  reason: WindowMissReason
+  sample_payload: String
+  payload_bytes: Int
+  rows: Int
 }
 
 // -- Sink factory ------------------------------------------------------------

@@ -14,5 +14,5 @@ pub use event_bridge::{
 pub use executor::{RuleExecutor, RuleExecutorOptions};
 pub use match_engine::{
     CepStateMachine, CloseOutput, CloseReason, Event, MACHINE_ID, MatchedContext, StepData,
-    StepResult, Value, WindowLookup,
+    StepOutcome, StepProgress, StepResult, Value, WindowLookup,
 };

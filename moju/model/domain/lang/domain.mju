@@ -34,6 +34,8 @@ state BaseType {
 state FieldType {
   Base
   Array
+  ArrayAny
+  Object
 }
 
 // -- WFL File ---------------------------------------------------------------
@@ -43,10 +45,241 @@ struct WflFile {
   patterns: List<PatternDecl>
   rules: List<RuleDecl>
   tests: List<TestBlock>
+  yield_presets: List<YieldPresetDecl>
 }
 
 struct UseDecl {
   path: String
+}
+
+// -- WFG Scenario -----------------------------------------------------------
+
+struct WfgFile {
+  uses: List<UseDecl>
+  scenario: ScenarioDecl
+  syntax: SyntaxScenario?
+}
+
+struct ScenarioDecl {
+  name: String
+  seed: Int
+  time_clause: TimeClause
+  total: Int
+  streams: List<StreamBlock>
+  injects: List<InjectBlock>
+  faults: FaultsBlock?
+  oracle: OracleBlock?
+}
+
+struct TimeClause {
+  start: String
+  duration: Duration
+}
+
+struct SyntaxScenario {
+  attrs: List<ScenarioAttr>
+  inline_annos: List<ScenarioAttr>
+  traffic: TrafficBlock
+  injection: SyntaxInjectionBlock?
+  expect: ExpectBlock?
+}
+
+struct ScenarioAttr {
+  key: String
+  value: AttrValue
+}
+
+state AttrValue {
+  Number
+  Duration
+  String
+  Bool
+}
+
+struct TrafficBlock {
+  streams: List<SyntaxStreamDecl>
+}
+
+struct SyntaxStreamDecl {
+  stream: String
+  rate: RateExpr
+}
+
+state RateExpr {
+  Constant
+  Wave
+  Burst
+  Timeline
+}
+
+state WaveShape {
+  Sine
+  Triangle
+  Square
+}
+
+struct TimelineSegment {
+  start: Duration
+  end: Duration
+  rate: Rate
+}
+
+struct SyntaxInjectionBlock {
+  cases: List<SyntaxInjectCase>
+}
+
+struct SyntaxInjectCase {
+  mode: InjectCaseMode
+  percent: Float
+  target_rule: String?
+  stream: String
+  seq: SeqBlock
+}
+
+state InjectCaseMode {
+  Hit
+  NearMiss
+  Miss
+}
+
+struct SeqBlock {
+  entity: String
+  steps: List<SeqStep>
+}
+
+state SeqStep {
+  Use
+  Not
+}
+
+struct FieldPredicate {
+  field: String
+  value: AttrValue
+}
+
+struct ExpectBlock {
+  checks: List<ExpectCheck>
+}
+
+struct ExpectCheck {
+  metric: ExpectMetric
+  rule: String
+  op: CompareOp
+  value: ExpectValue
+}
+
+state ExpectMetric {
+  Hit
+  NearMiss
+  Miss
+  Precision
+  Recall
+  Fpr
+  LatencyP95
+}
+
+state CompareOp {
+  Gte
+  Lte
+  Gt
+  Lt
+  Eq
+}
+
+state ExpectValue {
+  Percent
+  Number
+  Duration
+}
+
+struct Rate {
+  count: Int
+  unit: RateUnit
+}
+
+state RateUnit {
+  PerSecond
+  PerMinute
+  PerHour
+}
+
+struct StreamBlock {
+  alias: String
+  window: String
+  rate: Rate
+  overrides: List<FieldOverride>
+}
+
+struct FieldOverride {
+  field_name: String
+  gen_expr: GenExpr
+}
+
+state GenExpr {
+  StringLit
+  NumberLit
+  BoolLit
+  GenFunc
+}
+
+struct GenArg {
+  name: String?
+  value: GenExpr
+}
+
+struct InjectBlock {
+  rule: String
+  streams: List<String>
+  lines: List<InjectLine>
+}
+
+struct InjectLine {
+  mode: InjectMode
+  percent: Float
+  params: List<ParamAssign>
+  use_steps: List<InjectUseStep>
+}
+
+struct InjectUseStep {
+  count: Int
+  predicates: List<FieldPredicate>
+}
+
+state InjectMode {
+  Hit
+  NearMiss
+  NonHit
+}
+
+struct FaultsBlock {
+  faults: List<FaultLine>
+}
+
+state FaultType {
+  OutOfOrder
+  Late
+  Duplicate
+  Drop
+}
+
+struct FaultLine {
+  fault_type: FaultType
+  percent: Float
+}
+
+struct OracleBlock {
+  params: List<ParamAssign>
+}
+
+struct ParamAssign {
+  key: String
+  value: ParamValue
+}
+
+state ParamValue {
+  Number
+  String
+  Bool
 }
 
 struct PatternDecl {
@@ -101,20 +334,22 @@ struct EventDecl {
 // -- Match ------------------------------------------------------------------
 
 struct MatchClause {
-  steps: List<MatchStep>
-  close: CloseBlock
-  key_map: List<KeyMapItem>
+  keys: List<FieldRef>
+  key_mapping: List<KeyMapItem>?
+  duration: Duration
+  window_mode: WindowMode
+  on_event: List<MatchStep>
+  on_close: CloseBlock?
 }
 
 struct EachClause {
   alias: String
-  expr: String
+  filter: Expr?
 }
 
 struct KeyMapItem {
   logical_name: String
-  alias: String
-  field: String
+  source_field: FieldRef
 }
 
 struct MatchStep {
@@ -122,21 +357,37 @@ struct MatchStep {
 }
 
 struct StepBranch {
-  label: String
+  label: String?
   source: String
-  field: String
-  guard: String
+  field: FieldSelector?
+  guard: Expr?
+  pipe: PipeChain
 }
 
 struct PipeChain {
-  stages: List<String>
+  transforms: List<Transform>
+  measure: Measure
+  cmp: CmpOp
+  threshold: Expr
+}
+
+state Transform {
+  Distinct
+}
+
+state Measure {
+  Count
+  Sum
+  Avg
+  Min
+  Max
 }
 
 // -- Close ------------------------------------------------------------------
 
 struct CloseBlock {
-  triggers: List<CloseTrigger>
   mode: CloseMode
+  steps: List<MatchStep>
 }
 
 state CloseMode {
@@ -158,13 +409,15 @@ state WindowMode {
 
 // -- Expression -------------------------------------------------------------
 
-struct FieldSelector {
-  path: String
+state FieldSelector {
+  Dot
+  Bracket
 }
 
-struct FieldRef {
-  alias: String
-  field: String
+state FieldRef {
+  Simple
+  Qualified
+  Bracketed
 }
 
 state CmpOp {
@@ -181,25 +434,62 @@ state BinOp {
   Sub
   Mul
   Div
+  Mod
   And
   Or
+  Eq
+  Ne
+  Lt
+  Gt
+  Le
+  Ge
 }
 
 state SystemVar {
   Score
+  EventFirstTime
+  EventLastTime
+  EvidenceStartTime
+  EvidenceEndTime
+  WindowStartTime
+  WindowEndTime
+  EmitTime
 }
 
 state Expr {
   Number
   StringLit
-  BoolVal
-  SystemVarRef
-  FieldRef
-  BinOpExpr
+  Bool
+  SystemVar
+  WfuMeta
+  Field
+  BinOp
   Neg
   FuncCall
   InList
   IfThenElse
+  Object
+  Array
+}
+
+state WfuMetaField {
+  Id
+  RuleName
+  Score
+  EntityType
+  EntityId
+  Origin
+  CloseReason
+  FiredAt
+  EmitTime
+  Summary
+}
+
+state WfuIntermediateMetaField {
+  RuleName
+  Score
+  EntityType
+  EntityId
 }
 
 // -- Clauses ----------------------------------------------------------------
@@ -209,14 +499,35 @@ struct ScoreExpr {
 }
 
 struct EntityClause {
-  entity_type: String
-  entity_id: String
+  entity_type: EntityTypeVal
+  id_expr: Expr
+}
+
+state EntityTypeVal {
+  Ident
+  StringLit
 }
 
 struct YieldClause {
   target: String
-  version: String
-  fields: List<YieldField>
+  version: Int?
+  presets: List<String>
+  args: List<NamedArg>
+}
+
+struct NamedArg {
+  name: String
+  value: Expr
+}
+
+struct YieldPresetDecl {
+  name: String
+  args: List<NamedArg>
+}
+
+struct PatternOrigin {
+  pattern: String
+  args: List<NamedArg>
 }
 
 struct YieldField {
@@ -227,7 +538,7 @@ struct YieldField {
 // -- Join -------------------------------------------------------------------
 
 struct JoinClause {
-  right_window: String
+  target_window: String
   mode: JoinMode
   conditions: List<JoinCondition>
 }
@@ -235,11 +546,12 @@ struct JoinClause {
 state JoinMode {
   Snapshot
   Asof
+  Anti
 }
 
 struct JoinCondition {
-  left: String
-  right: String
+  left: FieldRef
+  right: FieldRef
 }
 
 // -- Conv -------------------------------------------------------------------
@@ -271,19 +583,18 @@ struct LimitsBlock {
 }
 
 struct LimitItem {
-  limit_type: String
-  value: Int
-  per: String
-  action: String
+  key: String
+  value: String
 }
 
 // -- Contract / Test --------------------------------------------------------
 
 struct TestBlock {
   name: String
-  inputs: List<InputStmt>
-  expects: List<ExpectStmt>
-  options: Map
+  rule_name: String
+  input: List<InputStmt>
+  expect: List<ExpectStmt>
+  options: TestOptions?
 }
 
 state InputStmt {
@@ -292,21 +603,28 @@ state InputStmt {
 }
 
 struct FieldAssign {
-  field: String
-  value: String
+  name: String
+  value: Expr
 }
 
-struct ExpectStmt {
-  hits: List<HitAssert>
-  asserts: Map
+state ExpectStmt {
+  Hits
+  HitAssert
 }
 
-struct HitAssert {
-  score: Int
-  origin: String
-  entity_type: String
-  entity_id: String
-  field_match: Map
+state HitAssert {
+  Score
+  Origin
+  EntityType
+  EntityId
+  Field
+}
+
+struct TestOptions {
+  close_trigger: CloseTrigger?
+  eval_mode: EvalMode?
+  permutation: PermutationMode?
+  runs: Int?
 }
 
 state EvalMode {
@@ -324,28 +642,32 @@ struct RulePlan {
   name: String
   binds: List<BindPlan>
   match_plan: MatchPlan
-  each_plan: EachClause
+  each_plan: EachPlan?
   joins: List<JoinPlan>
   entity_plan: EntityPlan
   yield_plan: YieldPlan
   score_plan: ScorePlan
-  conv_plan: ConvPlan
-  limits_plan: LimitsPlan
+  conv_plan: ConvPlan?
+  limits_plan: LimitsPlan?
+  pattern_origin: PatternOriginPlan?
 }
 
 struct BindPlan {
   alias: String
   window: String
-  filter: String
+  filter: ExprPlan?
 }
 
 struct MatchPlan {
-  keys: List<String>
-  key_map: List<KeyMapPlan>
+  keys: List<FieldRef>
+  key_map: List<KeyMapPlan>?
   window_spec: WindowSpec
   event_steps: List<StepPlan>
   close_steps: List<StepPlan>
   close_mode: CloseMode
+  tracked_bind_aliases: List<String>
+  tracked_bind_fields: Map<String, List<String>>
+  tracked_plain_fields: List<String>
 }
 
 struct KeyMapPlan {
@@ -365,35 +687,45 @@ struct StepPlan {
 }
 
 struct BranchPlan {
-  label: String
+  label: String?
   source: String
-  field: String
-  guard: String
+  field: FieldSelector?
+  guard: ExprPlan?
   agg: AggPlan
 }
 
 struct AggPlan {
-  transforms: List<String>
-  measure: String
+  transforms: List<Transform>
+  measure: Measure
   cmp: CmpOp
-  threshold: Int
+  threshold: ExprPlan
+}
+
+struct EachPlan {
+  alias: String
+  filter: ExprPlan?
+}
+
+struct PatternOriginPlan {
+  pattern: String
+  args: List<NamedArg>
 }
 
 struct JoinPlan {
   right_window: String
   mode: JoinMode
-  conditions: List<JoinCondPlan>
+  conds: List<JoinCondPlan>
 }
 
 struct JoinCondPlan {
-  left_field: String
-  right_field: String
+  left: FieldRef
+  right: FieldRef
 }
 
 struct LimitsPlan {
-  max_memory_bytes: Int
-  max_instances: Int
-  max_throttle: RateSpec
+  max_memory_bytes: Int?
+  max_instances: Int?
+  max_throttle: RateSpec?
   on_exceed: ExceedAction
 }
 
@@ -405,21 +737,21 @@ state ExceedAction {
 
 struct RateSpec {
   count: Int
-  per: String
+  per: Duration
 }
 
 struct EntityPlan {
   entity_type: String
-  entity_id_expr: String
+  entity_id_expr: ExprPlan
 }
 
 struct ScorePlan {
-  expr: Expr
+  expr: ExprPlan
 }
 
 struct YieldPlan {
   target: String
-  version: String
+  version: Int?
   fields: List<YieldField>
 }
 
@@ -435,12 +767,19 @@ state ConvOpPlan {
   Sort
   Top
   Dedup
-  WhereExpr
+  Where
 }
 
 struct SortKeyPlan {
-  expr: String
+  expr: ExprPlan
   descending: Bool
+}
+
+state ExprPlan {
+  Const
+  Field
+  Binary
+  FuncCall
 }
 
 // -- Error types -------------------------------------------------------------
@@ -448,20 +787,18 @@ struct SortKeyPlan {
 struct CheckError {
   severity: Severity
   message: String
-  position: String
+  rule: String?
+  test: String?
 }
 
 state Severity {
   Error
   Warning
-  Note
 }
 
 state LangReason {
   Parse
-  Check
+  Validation
   Compile
-  Preprocess
-  Lint
   General
 }

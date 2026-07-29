@@ -15,8 +15,9 @@ pub struct WfgFile {
 }
 
 /// `use "path.wfs"` or `use "path.wfl"`
-#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, ::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct UseDecl {
     pub path: String,
 }

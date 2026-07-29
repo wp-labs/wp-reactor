@@ -49,8 +49,9 @@ flow DetectChanges {
 
   step Classify {
     create FusionReloadPlan {
-      can_reload = ConfigSnapshot.tree
-      detail = ConfigSnapshot.tree
+      hot_reload = ConfigSnapshot.tree
+      requires_restart = ConfigSnapshot.tree
+      unsupported = ConfigSnapshot.tree
     }
   }
 }

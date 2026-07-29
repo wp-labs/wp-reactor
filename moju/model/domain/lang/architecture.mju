@@ -12,28 +12,38 @@ module LangSchema {
 
 module LangRule {
   layer DataFusion
-  owns WflFile, UseDecl, PatternDecl, RuleDecl, MetaBlock, MetaEntry, PipelineStage, EventsBlock, EventDecl
+  owns WflFile, UseDecl, PatternDecl, RuleDecl, MetaBlock, MetaEntry, PipelineStage, EventsBlock, EventDecl, YieldPresetDecl, PatternOrigin
 
   responsible_for "WFL rule file structure — rule declarations, metadata, events, and pipeline stages"
 }
 
+module LangScenario {
+  layer DataFusion
+  owns WfgFile, ScenarioDecl, TimeClause, SyntaxScenario, ScenarioAttr, AttrValue, TrafficBlock, SyntaxStreamDecl
+  owns RateExpr, WaveShape, TimelineSegment, SyntaxInjectionBlock, SyntaxInjectCase, InjectCaseMode, SeqBlock, SeqStep
+  owns FieldPredicate, ExpectBlock, ExpectCheck, ExpectMetric, CompareOp, ExpectValue, Rate, RateUnit, StreamBlock
+  owns FieldOverride, GenExpr, GenArg, InjectBlock, InjectLine, InjectUseStep, InjectMode, FaultsBlock, FaultType, FaultLine, OracleBlock, ParamAssign, ParamValue
+
+  responsible_for "WFG scenario grammar — traffic generation, injections, faults, and oracle expectations"
+}
+
 module LangMatch {
   layer DataFusion
-  owns MatchClause, EachClause, KeyMapItem, MatchStep, StepBranch, PipeChain, CloseBlock, CloseMode, CloseTrigger, WindowMode
+  owns MatchClause, EachClause, KeyMapItem, MatchStep, StepBranch, PipeChain, Transform, Measure, CloseBlock, CloseMode, CloseTrigger, WindowMode
 
   responsible_for "WFL match clause AST — sequential pattern matching steps, close behavior, and window modes"
 }
 
 module LangExpr {
   layer DataFusion
-  owns FieldSelector, FieldRef, CmpOp, BinOp, SystemVar, Expr
+  owns FieldSelector, FieldRef, CmpOp, BinOp, SystemVar, Expr, WfuMetaField, WfuIntermediateMetaField, ExprPlan
 
   responsible_for "WFL expression language — field references, comparison/arithmetic operators, and expression tree nodes"
 }
 
 module LangClauses {
   layer DataFusion
-  owns ScoreExpr, EntityClause, YieldClause, YieldField, LimitsBlock, LimitItem
+  owns ScoreExpr, EntityClause, EntityTypeVal, YieldClause, YieldField, NamedArg, LimitsBlock, LimitItem
 
   responsible_for "WFL clause AST — scoring, entity extraction, yield output, and rate limiting"
 }
@@ -54,7 +64,7 @@ module LangConv {
 
 module LangTest {
   layer DataFusion
-  owns TestBlock, InputStmt, FieldAssign, ExpectStmt, HitAssert, EvalMode, PermutationMode
+  owns TestBlock, InputStmt, FieldAssign, ExpectStmt, HitAssert, TestOptions, EvalMode, PermutationMode
 
   responsible_for "WFL test contract — input/output assertions, evaluation modes, and permutation testing"
 }
@@ -68,7 +78,7 @@ module LangChecker {
 
 module LangCompile {
   layer DataFusion
-  owns CompileRequest, RulePlan, BindPlan, MatchPlan, KeyMapPlan, WindowSpec, StepPlan, BranchPlan, AggPlan
+  owns CompileRequest, RulePlan, BindPlan, MatchPlan, KeyMapPlan, WindowSpec, StepPlan, BranchPlan, AggPlan, EachPlan, PatternOriginPlan
 
   responsible_for "WFL compilation — parse and compile WFL rules into executable match plans"
 }
@@ -87,6 +97,7 @@ dependency_rule LangDeps {
   LangRule -> LangJoin
   LangRule -> LangConv
   LangRule -> LangTest
+  LangScenario -> LangRule
   LangCompile -> LangRule
   LangCompile -> LangMatch
   LangCompile -> LangSchema

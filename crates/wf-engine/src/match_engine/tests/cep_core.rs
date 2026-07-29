@@ -31,6 +31,61 @@ fn single_step_threshold() {
 }
 
 #[test]
+fn advance_with_progress_reports_unsatisfied_measure() {
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch_with_label(
+            "fail",
+            "failures",
+            count_ge(3.0),
+        )])],
+    );
+    let mut sm = CepStateMachine::new("rule_progress".to_string(), plan, None);
+
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    let outcome = sm.advance_at_with_progress("fail", &e, 1_000_000_000, None);
+
+    assert_eq!(outcome.result, StepResult::Accumulate);
+    let progress = outcome.progress.expect("progress should be captured");
+    assert_eq!(progress.rule_name, "rule_progress");
+    assert_eq!(progress.scope_key, vec![str_val("10.0.0.1")]);
+    assert_eq!(progress.step_index, 0);
+    assert_eq!(progress.step_label.as_deref(), Some("failures"));
+    assert_eq!(progress.branch_index, 0);
+    assert_eq!(progress.branch_source, "fail");
+    assert_eq!(progress.threshold_checked_branches, 1);
+    assert_eq!(progress.measure_value, 1.0);
+    assert_eq!(progress.cmp, ">=");
+    assert_eq!(progress.threshold, "3");
+    assert!(!progress.satisfied);
+    assert_eq!(progress.instances, 1);
+}
+
+#[test]
+fn advance_with_progress_reports_last_checked_unsatisfied_branch() {
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![
+            branch_with_label("fail", "first", count_ge(3.0)),
+            branch_with_label("fail", "second", count_ge(4.0)),
+        ])],
+    );
+    let mut sm = CepStateMachine::new("rule_progress_multi".to_string(), plan, None);
+
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    let outcome = sm.advance_at_with_progress("fail", &e, 1_000_000_000, None);
+
+    assert_eq!(outcome.result, StepResult::Accumulate);
+    let progress = outcome.progress.expect("progress should be captured");
+    assert_eq!(progress.step_label.as_deref(), Some("second"));
+    assert_eq!(progress.branch_index, 1);
+    assert_eq!(progress.threshold_checked_branches, 2);
+    assert_eq!(progress.measure_value, 1.0);
+    assert_eq!(progress.threshold, "4");
+    assert!(!progress.satisfied);
+}
+
+#[test]
 fn sliding_match_context_tracks_event_and_window_times() {
     let plan = simple_plan(
         vec![simple_key("sip")],

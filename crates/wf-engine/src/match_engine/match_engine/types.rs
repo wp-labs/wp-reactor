@@ -45,6 +45,33 @@ pub enum StepResult {
     Matched(MatchedContext),
 }
 
+/// Diagnostic progress produced while an event is evaluated against a step.
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+pub struct StepProgress {
+    pub rule_name: String,
+    pub scope_key: Vec<Value>,
+    pub machine_id: String,
+    pub step_index: usize,
+    pub step_label: Option<String>,
+    pub branch_index: usize,
+    pub branch_source: String,
+    pub threshold_checked_branches: usize,
+    pub measure_value: f64,
+    pub cmp: String,
+    pub threshold: String,
+    pub satisfied: bool,
+    pub instances: usize,
+}
+
+/// Result of feeding one event with optional diagnostic progress.
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
+pub struct StepOutcome {
+    pub result: StepResult,
+    pub progress: Option<StepProgress>,
+}
+
 /// Context returned when a full match fires.
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]

@@ -19,7 +19,7 @@ use wf_engine::match_engine::{
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{AppendOutcome, Router};
 use wf_lang::plan::ConvPlan;
-use wf_lang::wfu_meta::{WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
+use wf_lang::wfu_meta::{WFU_ID, WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
 
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::metrics::RuntimeMetrics;
@@ -29,6 +29,47 @@ use super::task_types::{RuleTaskConfig, WindowSource};
 use super::window_lookup::RegistryLookup;
 
 const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
+const DEBUG_DETAIL_LIMIT: usize = 20;
+
+#[derive(Debug, Default)]
+struct RuleBatchDebugStats {
+    input_events: usize,
+    alias_passed: usize,
+    alias_rejected: usize,
+    accumulated: usize,
+    advanced: usize,
+    matched: usize,
+    output_emitted: usize,
+    output_none: usize,
+    intermediate_emitted: usize,
+    errors: usize,
+    detail_logged: usize,
+    detail_suppressed: usize,
+}
+
+impl RuleBatchDebugStats {
+    fn can_log_detail(&self) -> bool {
+        self.detail_logged < DEBUG_DETAIL_LIMIT
+    }
+
+    fn allow_detail(&mut self) -> bool {
+        if self.detail_logged < DEBUG_DETAIL_LIMIT {
+            self.detail_logged += 1;
+            true
+        } else {
+            self.detail_suppressed += 1;
+            false
+        }
+    }
+
+    fn count_output(&mut self, record: &OutputRecord, intermediate_targets: &HashSet<String>) {
+        if intermediate_targets.contains(&record.yield_target) {
+            self.intermediate_emitted += 1;
+        } else {
+            self.output_emitted += 1;
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RuleTask -- runtime state for a single rule
@@ -47,6 +88,8 @@ pub(super) struct RuleTask {
     pub(super) sources: Vec<WindowSource>,
     /// window_name -> Vec<alias>: pre-computed from stream_aliases + window sources.
     aliases: HashMap<String, Vec<String>>,
+    /// window_name -> Vec<alias>: aux bind aliases first, then event aliases.
+    ordered_aliases: HashMap<String, Vec<String>>,
     alert_tx: mpsc::Sender<OutputRecord>,
     /// window_name -> cursor: tracks read position per window.
     pub(super) cursors: HashMap<String, u64>,
@@ -81,6 +124,22 @@ impl RuleTask {
             .iter()
             .map(|src| (src.window_name.clone(), src.aliases.clone()))
             .collect();
+        let ordered_aliases: HashMap<String, Vec<String>> = aliases
+            .iter()
+            .map(|(window_name, aliases)| {
+                let ordered = aliases
+                    .iter()
+                    .filter(|alias| executor.is_aux_bind_alias(alias.as_str()))
+                    .chain(
+                        aliases
+                            .iter()
+                            .filter(|alias| !executor.is_aux_bind_alias(alias.as_str())),
+                    )
+                    .cloned()
+                    .collect();
+                (window_name.clone(), ordered)
+            })
+            .collect();
 
         // Initialize cursors to current position (skip historical data).
         let cursors: HashMap<String, u64> = window_sources
@@ -105,6 +164,7 @@ impl RuleTask {
             conv_plan,
             sources: window_sources,
             aliases,
+            ordered_aliases,
             alert_tx,
             cursors,
             router,
@@ -112,6 +172,17 @@ impl RuleTask {
             intermediate_targets,
         };
         (task, cancel, timeout_scan_interval)
+    }
+
+    fn rule_name(&self) -> &str {
+        self.executor.plan().name.as_str()
+    }
+
+    fn instance_count(&self) -> usize {
+        self.machine
+            .as_ref()
+            .map(|machine| machine.instance_count())
+            .unwrap_or(0)
     }
 
     // -- Data processing ----------------------------------------------------
@@ -154,81 +225,406 @@ impl RuleTask {
             let Some(aliases) = self.aliases.get(&source.window_name) else {
                 continue;
             };
+            let Some(ordered_aliases) = self.ordered_aliases.get(&source.window_name) else {
+                continue;
+            };
 
-            for batch in &batches {
+            let first_batch_seq = new_cursor.saturating_sub(batches.len() as u64);
+            for (batch_index, batch) in batches.iter().enumerate() {
+                let batch_seq = first_batch_seq + batch_index as u64;
                 let events = batch_to_events(batch);
+                let mut stats = RuleBatchDebugStats {
+                    input_events: events.len(),
+                    ..RuleBatchDebugStats::default()
+                };
+                let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+                let rule_name = debug_enabled.then(|| self.rule_name().to_string());
+                let rule_name_for_log = rule_name.as_deref().unwrap_or("");
+                let aliases_for_log = if debug_enabled {
+                    Some(aliases.join(","))
+                } else {
+                    None
+                };
+                if debug_enabled {
+                    let instances_before = self.instance_count();
+                    wf_debug!(pipe,
+                        rule = %rule_name_for_log,
+                        stage = 0,
+                        window = %source.window_name,
+                        batch_seq = batch_seq,
+                        rows = batch.num_rows(),
+                        aliases = %aliases_for_log.as_deref().unwrap_or(""),
+                        instances_before = instances_before,
+                        "rule batch started"
+                    );
+                }
                 if let Some(metrics) = &self.metrics {
                     metrics.add_rule_events(self.executor.plan().name.as_str(), events.len());
                 }
                 let lookup = RegistryLookup(&self.router);
-                for event in &events {
+                for (row_index, event) in events.iter().enumerate() {
                     if let Some(machine) = &mut self.machine {
                         let event_nanos = machine.event_time_nanos(event);
                         let closes =
                             machine.scan_expired_at_with_conv(event_nanos, self.conv_plan.as_ref());
-                        let rule_name = machine.rule_name().to_string();
                         let mut matched = Vec::new();
-                        let ordered_aliases: Vec<&String> =
-                            aliases
-                                .iter()
-                                .filter(|alias| self.executor.is_aux_bind_alias(alias.as_str()))
-                                .chain(aliases.iter().filter(|alias| {
-                                    !self.executor.is_aux_bind_alias(alias.as_str())
-                                }))
-                                .collect();
                         for alias in ordered_aliases {
                             if !self
                                 .executor
                                 .event_matches_alias(alias, event, Some(&lookup))
                             {
+                                if debug_enabled {
+                                    stats.alias_rejected += 1;
+                                }
+                                if debug_enabled && stats.allow_detail() {
+                                    let event_ref = event_debug_ref(event, batch_seq, row_index);
+                                    wf_debug!(pipe,
+                                        rule = %rule_name_for_log,
+                                        stage = 0,
+                                        window = %source.window_name,
+                                        alias = %alias,
+                                        event_ref = %event_ref,
+                                        reason = "bind_filter_false",
+                                        "rule event rejected"
+                                    );
+                                }
                                 continue;
                             }
-                            if let StepResult::Matched(ctx) =
-                                machine.advance_at_with(alias, event, event_nanos, Some(&lookup))
-                            {
-                                matched.push(ctx);
+                            if debug_enabled {
+                                stats.alias_passed += 1;
+                            }
+                            let should_capture_progress = debug_enabled && stats.can_log_detail();
+                            let (step_result, progress) = if should_capture_progress {
+                                let outcome = machine.advance_at_with_progress(
+                                    alias,
+                                    event,
+                                    event_nanos,
+                                    Some(&lookup),
+                                );
+                                (outcome.result, outcome.progress)
+                            } else {
+                                (
+                                    machine.advance_at_with(
+                                        alias,
+                                        event,
+                                        event_nanos,
+                                        Some(&lookup),
+                                    ),
+                                    None,
+                                )
+                            };
+                            match step_result {
+                                StepResult::Accumulate => {
+                                    if debug_enabled {
+                                        stats.accumulated += 1;
+                                    }
+                                    if debug_enabled && stats.allow_detail() {
+                                        let instances = machine.instance_count();
+                                        let event_ref =
+                                            event_debug_ref(event, batch_seq, row_index);
+                                        if let Some(progress) = progress.as_ref() {
+                                            wf_debug!(pipe,
+                                                rule = %rule_name_for_log,
+                                                stage = 0,
+                                                window = %source.window_name,
+                                                alias = %alias,
+                                                event_ref = %event_ref,
+                                                scope_key = %debug_scope_key(&progress.scope_key),
+                                                machine_id = %progress.machine_id,
+                                                step_index = progress.step_index,
+                                                step_label = progress.step_label.as_deref().unwrap_or(""),
+                                                branch_index = progress.branch_index,
+                                                threshold_checked_branches = progress.threshold_checked_branches,
+                                                measure_value = progress.measure_value,
+                                                cmp = %progress.cmp,
+                                                threshold = %progress.threshold,
+                                                instances = instances,
+                                                "rule event accumulated"
+                                            );
+                                        } else {
+                                            wf_debug!(pipe,
+                                                rule = %rule_name_for_log,
+                                                stage = 0,
+                                                window = %source.window_name,
+                                                alias = %alias,
+                                                event_ref = %event_ref,
+                                                instances = instances,
+                                                "rule event accumulated"
+                                            );
+                                        }
+                                    }
+                                }
+                                StepResult::Advance => {
+                                    if debug_enabled {
+                                        stats.advanced += 1;
+                                    }
+                                    if debug_enabled && stats.allow_detail() {
+                                        let instances = machine.instance_count();
+                                        let event_ref =
+                                            event_debug_ref(event, batch_seq, row_index);
+                                        if let Some(progress) = progress.as_ref() {
+                                            wf_debug!(pipe,
+                                                rule = %rule_name_for_log,
+                                                stage = 0,
+                                                window = %source.window_name,
+                                                alias = %alias,
+                                                event_ref = %event_ref,
+                                                scope_key = %debug_scope_key(&progress.scope_key),
+                                                machine_id = %progress.machine_id,
+                                                step_index = progress.step_index,
+                                                step_label = progress.step_label.as_deref().unwrap_or(""),
+                                                branch_index = progress.branch_index,
+                                                threshold_checked_branches = progress.threshold_checked_branches,
+                                                measure_value = progress.measure_value,
+                                                cmp = %progress.cmp,
+                                                threshold = %progress.threshold,
+                                                instances = instances,
+                                                "rule step advanced"
+                                            );
+                                        } else {
+                                            wf_debug!(pipe,
+                                                rule = %rule_name_for_log,
+                                                stage = 0,
+                                                window = %source.window_name,
+                                                alias = %alias,
+                                                event_ref = %event_ref,
+                                                instances = instances,
+                                                "rule step advanced"
+                                            );
+                                        }
+                                    }
+                                }
+                                StepResult::Matched(ctx) => {
+                                    if debug_enabled {
+                                        stats.matched += 1;
+                                    }
+                                    if debug_enabled && stats.allow_detail() {
+                                        let event_ref =
+                                            event_debug_ref(event, batch_seq, row_index);
+                                        let step = ctx.step_data.last();
+                                        wf_debug!(pipe,
+                                            rule = %rule_name_for_log,
+                                            stage = 0,
+                                            window = %source.window_name,
+                                            alias = %alias,
+                                            event_ref = %event_ref,
+                                            scope_key = %debug_scope_key(&ctx.scope_key),
+                                            machine_id = %ctx.machine_id,
+                                            matched_steps = ctx.step_data.len(),
+                                            step_label = step.and_then(|s| s.label.as_deref()).unwrap_or(""),
+                                            measure_value = step.map(|s| s.measure_value).unwrap_or_default(),
+                                            "rule matched"
+                                        );
+                                    }
+                                    matched.push(ctx);
+                                }
                             }
                         }
 
                         for close in &closes {
                             match self.executor.execute_close_with_joins(close, &lookup) {
-                                Ok(Some(record)) => self.emit(record).await,
-                                Ok(None) => {}
+                                Ok(Some(record)) => {
+                                    if debug_enabled {
+                                        stats.count_output(&record, &self.intermediate_targets);
+                                    }
+                                    if debug_enabled && stats.allow_detail() {
+                                        log_output_emitted(
+                                            "execute_close",
+                                            "close",
+                                            output_kind(&record, &self.intermediate_targets),
+                                            &record,
+                                            close.scope_key.as_slice(),
+                                        );
+                                    }
+                                    self.emit(record).await;
+                                }
+                                Ok(None) => {
+                                    if debug_enabled {
+                                        stats.output_none += 1;
+                                    }
+                                    if debug_enabled && stats.allow_detail() {
+                                        log_output_suppressed(
+                                            rule_name_for_log,
+                                            "execute_close",
+                                            Some(close.scope_key.as_slice()),
+                                        );
+                                    }
+                                }
                                 Err(e) => {
-                                    wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_close error")
+                                    if debug_enabled {
+                                        stats.errors += 1;
+                                    }
+                                    wf_warn!(
+                                        pipe,
+                                        rule = %rule_name.as_deref().unwrap_or_else(|| self.rule_name()),
+                                        stage = 0,
+                                        phase = "execute_close",
+                                        scope_key = %debug_scope_key(&close.scope_key),
+                                        error = %e,
+                                        "rule output failed"
+                                    )
                                 }
                             }
                         }
 
                         for ctx in matched {
                             if let Some(metrics) = &self.metrics {
-                                metrics.inc_rule_match(&rule_name);
+                                metrics.inc_rule_match(self.rule_name());
                             }
                             match self.executor.execute_match_with_joins(&ctx, &lookup) {
-                                Ok(Some(record)) => self.emit(record).await,
-                                Ok(None) => {}
+                                Ok(Some(record)) => {
+                                    if debug_enabled {
+                                        stats.count_output(&record, &self.intermediate_targets);
+                                    }
+                                    if debug_enabled && stats.allow_detail() {
+                                        log_output_emitted(
+                                            "execute_match",
+                                            "event",
+                                            output_kind(&record, &self.intermediate_targets),
+                                            &record,
+                                            ctx.scope_key.as_slice(),
+                                        );
+                                    }
+                                    self.emit(record).await;
+                                }
+                                Ok(None) => {
+                                    if debug_enabled {
+                                        stats.output_none += 1;
+                                    }
+                                    if debug_enabled && stats.allow_detail() {
+                                        log_output_suppressed(
+                                            rule_name_for_log,
+                                            "execute_match",
+                                            Some(ctx.scope_key.as_slice()),
+                                        );
+                                    }
+                                }
                                 Err(e) => {
-                                    wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_match error")
+                                    if debug_enabled {
+                                        stats.errors += 1;
+                                    }
+                                    wf_warn!(
+                                        pipe,
+                                        rule = %rule_name.as_deref().unwrap_or_else(|| self.rule_name()),
+                                        stage = 0,
+                                        phase = "execute_match",
+                                        scope_key = %debug_scope_key(&ctx.scope_key),
+                                        error = %e,
+                                        "rule output failed"
+                                    )
                                 }
                             }
                         }
-                    } else if self.each_alias.as_ref().is_some_and(|alias| {
-                        aliases.iter().any(|candidate| candidate == alias)
-                            && self
-                                .executor
-                                .event_matches_alias(alias, event, Some(&lookup))
-                    }) {
-                        let event_nanos = event_time_nanos(event, self.each_time_field.as_deref());
-                        match self
+                    } else if let Some(alias) = self
+                        .each_alias
+                        .as_ref()
+                        .filter(|alias| aliases.iter().any(|candidate| candidate == *alias))
+                    {
+                        if self
                             .executor
-                            .execute_each_with_joins(event, event_nanos, &lookup)
+                            .event_matches_alias(alias, event, Some(&lookup))
                         {
-                            Ok(Some(record)) => self.emit(record).await,
-                            Ok(None) => {}
-                            Err(e) => {
-                                wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_each error")
+                            if debug_enabled {
+                                stats.alias_passed += 1;
+                            }
+                            let event_nanos =
+                                event_time_nanos(event, self.each_time_field.as_deref());
+                            match self
+                                .executor
+                                .execute_each_with_joins(event, event_nanos, &lookup)
+                            {
+                                Ok(Some(record)) => {
+                                    if debug_enabled {
+                                        stats.count_output(&record, &self.intermediate_targets);
+                                    }
+                                    if debug_enabled && stats.allow_detail() {
+                                        log_output_emitted(
+                                            "execute_each",
+                                            "event",
+                                            output_kind(&record, &self.intermediate_targets),
+                                            &record,
+                                            &[],
+                                        );
+                                    }
+                                    self.emit(record).await;
+                                }
+                                Ok(None) => {
+                                    if debug_enabled {
+                                        stats.output_none += 1;
+                                    }
+                                    if debug_enabled && stats.allow_detail() {
+                                        log_output_suppressed(
+                                            rule_name_for_log,
+                                            "execute_each",
+                                            None,
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    if debug_enabled {
+                                        stats.errors += 1;
+                                    }
+                                    wf_warn!(
+                                        pipe,
+                                        rule = %rule_name.as_deref().unwrap_or_else(|| self.rule_name()),
+                                        stage = 0,
+                                        phase = "execute_each",
+                                        error = %e,
+                                        "rule output failed"
+                                    )
+                                }
+                            }
+                        } else {
+                            if debug_enabled {
+                                stats.alias_rejected += 1;
+                            }
+                            if debug_enabled && stats.allow_detail() {
+                                let event_ref = event_debug_ref(event, batch_seq, row_index);
+                                wf_debug!(pipe,
+                                    rule = %rule_name_for_log,
+                                    stage = 0,
+                                    window = %source.window_name,
+                                    alias = %alias,
+                                    event_ref = %event_ref,
+                                    reason = "bind_filter_false",
+                                    "rule event rejected"
+                                );
                             }
                         }
+                    }
+                }
+                if debug_enabled {
+                    let instances_after = self.instance_count();
+                    wf_debug!(pipe,
+                        rule = %rule_name_for_log,
+                        stage = 0,
+                        window = %source.window_name,
+                        batch_seq = batch_seq,
+                        input = stats.input_events,
+                        alias_passed = stats.alias_passed,
+                        alias_rejected = stats.alias_rejected,
+                        accumulated = stats.accumulated,
+                        advanced = stats.advanced,
+                        matched = stats.matched,
+                        outputs = stats.output_emitted,
+                        output_none = stats.output_none,
+                        intermediate_outputs = stats.intermediate_emitted,
+                        errors = stats.errors,
+                        instances_after = instances_after,
+                        detail_logged = stats.detail_logged,
+                        detail_suppressed = stats.detail_suppressed,
+                        "rule batch summary"
+                    );
+                    if stats.detail_suppressed > 0 {
+                        wf_debug!(pipe,
+                            rule = %rule_name_for_log,
+                            stage = 0,
+                            window = %source.window_name,
+                            batch_seq = batch_seq,
+                            detail_logged = stats.detail_logged,
+                            detail_suppressed = stats.detail_suppressed,
+                            "rule event details suppressed"
+                        );
                     }
                 }
             }
@@ -261,13 +657,81 @@ impl RuleTask {
                     .scan_expired_at_with_conv(machine.watermark_nanos(), self.conv_plan.as_ref()),
             )
         };
+        let mut stats = RuleBatchDebugStats::default();
+        let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
         for close in &closes {
             match self.executor.execute_close_with_joins(close, &lookup) {
-                Ok(Some(record)) => self.emit(record).await,
-                Ok(None) => {}
-                Err(e) => {
-                    wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_close error")
+                Ok(Some(record)) => {
+                    if debug_enabled {
+                        stats.count_output(&record, &self.intermediate_targets);
+                    }
+                    if debug_enabled && stats.allow_detail() {
+                        log_output_emitted(
+                            "execute_close",
+                            "close",
+                            output_kind(&record, &self.intermediate_targets),
+                            &record,
+                            close.scope_key.as_slice(),
+                        );
+                    }
+                    self.emit(record).await;
                 }
+                Ok(None) => {
+                    if debug_enabled {
+                        stats.output_none += 1;
+                    }
+                    if debug_enabled && stats.allow_detail() {
+                        log_output_suppressed(
+                            &rule_name,
+                            "execute_close",
+                            Some(close.scope_key.as_slice()),
+                        );
+                    }
+                }
+                Err(e) => {
+                    if debug_enabled {
+                        stats.errors += 1;
+                    }
+                    wf_warn!(
+                        pipe,
+                        task_id = %self.task_id,
+                        rule = %rule_name,
+                        stage = 0,
+                        phase = "execute_close",
+                        scope_key = %debug_scope_key(&close.scope_key),
+                        error = %e,
+                        "rule output failed"
+                    )
+                }
+            }
+        }
+        if debug_enabled {
+            let instances_after = self.instance_count();
+            wf_debug!(
+                pipe,
+                task_id = %self.task_id,
+                rule = %rule_name,
+                stage = 0,
+                closes = closes.len(),
+                outputs = stats.output_emitted,
+                output_none = stats.output_none,
+                intermediate_outputs = stats.intermediate_emitted,
+                errors = stats.errors,
+                instances_after = instances_after,
+                detail_logged = stats.detail_logged,
+                detail_suppressed = stats.detail_suppressed,
+                "rule timeout scan summary"
+            );
+            if stats.detail_suppressed > 0 {
+                wf_debug!(
+                    pipe,
+                    task_id = %self.task_id,
+                    rule = %rule_name,
+                    stage = 0,
+                    detail_logged = stats.detail_logged,
+                    detail_suppressed = stats.detail_suppressed,
+                    "rule event details suppressed"
+                );
             }
         }
         if let Some(metrics) = &self.metrics {
@@ -287,7 +751,6 @@ impl RuleTask {
             return;
         };
         let started = Instant::now();
-        let mut emitted = 0usize;
         let lookup = RegistryLookup(&self.router);
         let (rule_name, closes) = {
             let machine = self.machine.as_mut().expect("checked above");
@@ -296,20 +759,82 @@ impl RuleTask {
                 machine.close_all_with_conv(CloseReason::Flush, self.conv_plan.as_ref()),
             )
         };
+        let mut stats = RuleBatchDebugStats::default();
+        let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
         for close in &closes {
             match self.executor.execute_close_with_joins(close, &lookup) {
                 Ok(Some(record)) => {
+                    if debug_enabled {
+                        stats.count_output(&record, &self.intermediate_targets);
+                    }
+                    if debug_enabled && stats.allow_detail() {
+                        log_output_emitted(
+                            "execute_close",
+                            "close",
+                            output_kind(&record, &self.intermediate_targets),
+                            &record,
+                            close.scope_key.as_slice(),
+                        );
+                    }
                     self.emit(record).await;
-                    emitted += 1;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if debug_enabled {
+                        stats.output_none += 1;
+                    }
+                    if debug_enabled && stats.allow_detail() {
+                        log_output_suppressed(
+                            &rule_name,
+                            "execute_close",
+                            Some(close.scope_key.as_slice()),
+                        );
+                    }
+                }
                 Err(e) => {
-                    wf_warn!(pipe, task_id = %self.task_id, error = %e, "execute_close flush error")
+                    if debug_enabled {
+                        stats.errors += 1;
+                    }
+                    wf_warn!(
+                        pipe,
+                        task_id = %self.task_id,
+                        rule = %rule_name,
+                        stage = 0,
+                        phase = "execute_close",
+                        scope_key = %debug_scope_key(&close.scope_key),
+                        error = %e,
+                        "rule output failed"
+                    )
                 }
             }
         }
-        if emitted > 0 {
-            wf_debug!(pipe, task_id = %self.task_id, alerts = emitted, "flush complete");
+        if debug_enabled {
+            let instances_after = self.instance_count();
+            wf_debug!(
+                pipe,
+                task_id = %self.task_id,
+                rule = %rule_name,
+                stage = 0,
+                closes = closes.len(),
+                outputs = stats.output_emitted,
+                output_none = stats.output_none,
+                intermediate_outputs = stats.intermediate_emitted,
+                errors = stats.errors,
+                instances_after = instances_after,
+                detail_logged = stats.detail_logged,
+                detail_suppressed = stats.detail_suppressed,
+                "rule flush summary"
+            );
+            if stats.detail_suppressed > 0 {
+                wf_debug!(
+                    pipe,
+                    task_id = %self.task_id,
+                    rule = %rule_name,
+                    stage = 0,
+                    detail_logged = stats.detail_logged,
+                    detail_suppressed = stats.detail_suppressed,
+                    "rule event details suppressed"
+                );
+            }
         }
         if let Some(metrics) = &self.metrics {
             let instances = self
@@ -368,7 +893,10 @@ impl RuleTask {
             wf_warn!(
                 pipe,
                 task_id = %self.task_id,
+                rule = %record.rule_name,
                 target = %record.yield_target,
+                output_kind = "intermediate",
+                reason = "missing_internal_window",
                 "missing internal pipeline window"
             );
             return;
@@ -389,7 +917,9 @@ impl RuleTask {
                 wf_warn!(
                     pipe,
                     task_id = %self.task_id,
+                    rule = %record.rule_name,
                     target = %record.yield_target,
+                    output_kind = "intermediate",
                     error = %e,
                     "build internal pipeline row failed"
                 );
@@ -405,7 +935,9 @@ impl RuleTask {
                     wf_warn!(
                         pipe,
                         task_id = %self.task_id,
+                        rule = %record.rule_name,
                         target = %record.yield_target,
+                        output_kind = "intermediate",
                         error = %e,
                         "append internal pipeline row failed"
                     );
@@ -416,6 +948,14 @@ impl RuleTask {
 
         match outcome {
             AppendOutcome::Appended => {
+                wf_debug!(
+                    pipe,
+                    task_id = %self.task_id,
+                    rule = %record.rule_name,
+                    target = %record.yield_target,
+                    output_kind = "intermediate",
+                    "internal pipeline row written"
+                );
                 if let Some(notify) = self.router.registry().get_notifier(&record.yield_target) {
                     notify.notify_waiters();
                 }
@@ -424,12 +964,94 @@ impl RuleTask {
                 wf_warn!(
                     pipe,
                     task_id = %self.task_id,
+                    rule = %record.rule_name,
                     target = %record.yield_target,
+                    output_kind = "intermediate",
+                    reason = "dropped_late",
                     "intermediate window row dropped as late data"
                 );
             }
         }
     }
+}
+
+fn event_debug_ref(
+    event: &wf_engine::match_engine::Event,
+    batch_seq: u64,
+    row_index: usize,
+) -> String {
+    event
+        .fields
+        .get("event_id")
+        .or_else(|| event.fields.get(WFU_ID))
+        .or_else(|| event.fields.get("id"))
+        .map(value_debug_string)
+        .unwrap_or_else(|| format!("batch:{batch_seq}/row:{row_index}"))
+}
+
+fn value_debug_string(value: &wf_engine::match_engine::Value) -> String {
+    match value {
+        wf_engine::match_engine::Value::Number(value) => value.to_string(),
+        wf_engine::match_engine::Value::Str(value) => value.clone(),
+        wf_engine::match_engine::Value::Bool(value) => value.to_string(),
+        wf_engine::match_engine::Value::Array(_) | wf_engine::match_engine::Value::Object(_) => {
+            "<structured>".to_string()
+        }
+    }
+}
+
+fn debug_scope_key(scope_key: &[wf_engine::match_engine::Value]) -> String {
+    scope_key
+        .iter()
+        .map(value_debug_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn log_output_emitted(
+    phase: &'static str,
+    origin: &'static str,
+    output_kind: &'static str,
+    record: &OutputRecord,
+    scope_key: &[wf_engine::match_engine::Value],
+) {
+    wf_debug!(
+        pipe,
+        rule = %record.rule_name,
+        stage = 0,
+        phase = phase,
+        origin = origin,
+        target = %record.yield_target,
+        scope_key = %debug_scope_key(scope_key),
+        output_kind = output_kind,
+        "rule output emitted"
+    );
+}
+
+fn output_kind(record: &OutputRecord, intermediate_targets: &HashSet<String>) -> &'static str {
+    if intermediate_targets.contains(&record.yield_target) {
+        "intermediate"
+    } else {
+        "alert"
+    }
+}
+
+fn log_output_suppressed(
+    rule_name: &str,
+    phase: &'static str,
+    scope_key: Option<&[wf_engine::match_engine::Value]>,
+) {
+    let scope_present = scope_key.is_some();
+    wf_debug!(
+        pipe,
+        rule = %rule_name,
+        stage = 0,
+        phase = phase,
+        scope_key = %scope_key.map(debug_scope_key).unwrap_or_else(|| "<none>".to_string()),
+        scope_present = scope_present,
+        reason = "executor_returned_none",
+        "rule output suppressed"
+    );
 }
 
 pub(super) fn build_pipeline_batch(
@@ -579,5 +1201,74 @@ fn value_to_json(value: &wf_engine::match_engine::Value) -> RuntimeResult<serde_
             }
             Ok(serde_json::Value::Object(object))
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_stats_tests {
+    use super::*;
+    use wf_engine::alert::AlertOrigin;
+
+    fn output_record(target: &str) -> OutputRecord {
+        OutputRecord {
+            wfx_id: "id".to_string(),
+            rule_name: "rule".to_string(),
+            score: 1.0,
+            entity_type: "ip".to_string(),
+            entity_id: "10.0.0.1".to_string(),
+            origin: AlertOrigin::Event,
+            fired_at: "2026-01-01T00:00:00Z".to_string(),
+            emit_time: "2026-01-01T00:00:00Z".to_string(),
+            matched_rows: Vec::new(),
+            summary: String::new(),
+            yield_target: target.to_string(),
+            yield_fields: Vec::new(),
+            yield_field_types: Vec::new(),
+            event_time_nanos: 0,
+            machine_id: String::new(),
+            scope_key: String::new(),
+        }
+    }
+
+    #[test]
+    fn detail_budget_caps_at_first_twenty_entries() {
+        let mut stats = RuleBatchDebugStats::default();
+
+        for _ in 0..DEBUG_DETAIL_LIMIT {
+            assert!(stats.allow_detail());
+        }
+
+        assert!(!stats.allow_detail());
+        assert!(!stats.allow_detail());
+        assert_eq!(stats.detail_logged, DEBUG_DETAIL_LIMIT);
+        assert_eq!(stats.detail_suppressed, 2);
+    }
+
+    #[test]
+    fn exhausted_detail_budget_still_counts_suppressed_entries() {
+        let mut stats = RuleBatchDebugStats::default();
+
+        for _ in 0..DEBUG_DETAIL_LIMIT {
+            assert!(stats.can_log_detail());
+            assert!(stats.allow_detail());
+        }
+
+        assert!(!stats.can_log_detail());
+        assert!(!stats.allow_detail());
+        assert_eq!(stats.detail_logged, DEBUG_DETAIL_LIMIT);
+        assert_eq!(stats.detail_suppressed, 1);
+    }
+
+    #[test]
+    fn output_counts_split_alert_and_intermediate_targets() {
+        let mut stats = RuleBatchDebugStats::default();
+        let intermediate_targets = HashSet::from(["internal_events".to_string()]);
+
+        stats.count_output(&output_record("alerts"), &intermediate_targets);
+        stats.count_output(&output_record("internal_events"), &intermediate_targets);
+        stats.count_output(&output_record("alerts"), &intermediate_targets);
+
+        assert_eq!(stats.output_emitted, 2);
+        assert_eq!(stats.intermediate_emitted, 1);
     }
 }

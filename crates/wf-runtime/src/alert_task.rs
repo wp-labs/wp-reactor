@@ -47,6 +47,14 @@ pub async fn run_alert_dispatcher(
         let (matched, had_error) = dispatcher
             .dispatch(&record.yield_target, &data_record)
             .await;
+        wf_debug!(
+            pipe,
+            rule = %record.rule_name,
+            target = %record.yield_target,
+            matched_sinks = matched,
+            had_error = had_error,
+            "alert dispatched"
+        );
         if had_error && let Some(metrics) = &metrics {
             metrics.inc_sink_dispatch_failed();
         }
@@ -56,12 +64,13 @@ pub async fn run_alert_dispatcher(
             && dispatcher.has_no_default_sinks()
             && warned_no_sink.insert(record.yield_target.clone())
         {
-            log::warn!(
-                "alert for rule {:?} yield_target={:?} matched no sink \
-                 (no route and no default sink configured) — further alerts \
-                 to this target will be dropped silently",
-                record.rule_name,
-                record.yield_target
+            wf_warn!(
+                pipe,
+                rule = %record.rule_name,
+                target = %record.yield_target,
+                matched_sinks = matched,
+                reason = "no_matching_sink",
+                "alert not dispatched"
             );
         }
         if let Some(metrics) = &metrics {

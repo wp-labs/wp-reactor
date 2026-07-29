@@ -52,11 +52,14 @@ struct FusionConfig {
   window_defaults: WindowDefaults
   windows: List<WindowConfig>
   sinks: String
-  work_root: String
+  work_root: String?
   logging: LoggingConfig
   metrics: MetricsConfig
-  vars: Map
+  output: OutputConfig
+  vars: Map<String, String>
   sources: List<SourceConfig>
+  admin_api: AdminApiConf
+  project_remote: ProjectRemoteConf
 }
 
 state FusionMode {
@@ -95,6 +98,48 @@ struct MetricsTopNConfig {
   queue_capacity: Int
 }
 
+state OutputTimeZone {
+  Utc
+}
+
+struct OutputConfig {
+  time_format: String
+  time_zone: OutputTimeZone
+}
+
+struct AdminApiTlsConf {
+  enabled: Bool
+  cert_file: String
+  key_file: String
+}
+
+struct AdminApiAuthConf {
+  mode: String
+  token_file: String
+}
+
+struct AdminApiConf {
+  enabled: Bool
+  bind: String
+  request_timeout_ms: Int
+  max_body_bytes: Int
+  tls: AdminApiTlsConf
+  auth: AdminApiAuthConf
+}
+
+struct RepoGroupConf {
+  repo: String
+  init_version: String
+}
+
+struct ProjectRemoteConf {
+  enabled: Bool
+  repo: String
+  init_version: String
+  models: RepoGroupConf?
+  infra: RepoGroupConf?
+}
+
 // -- Window configuration ----------------------------------------------------
 
 struct WindowDefaults {
@@ -131,28 +176,12 @@ struct WindowConfig {
 
 // -- Source configuration ----------------------------------------------------
 
-state SourceConfig {
-  Tcp
-  File
-}
-
-struct TcpSourceConfig {
-  name: String
-  listen: String
+struct SourceConfig {
+  name: String?
+  source_type: String?
+  connect: String?
   enabled: Bool
-}
-
-struct FileSourceConfig {
-  name: String
-  path: String
-  stream: String
-  format: FileInputFormat
-}
-
-state FileInputFormat {
-  Ndjson
-  ArrowFramed
-  ArrowIpc
+  params: Map<String, String>
 }
 
 // -- Custom types ------------------------------------------------------------
@@ -185,50 +214,91 @@ state LatePolicy {
 // -- Sink configuration ------------------------------------------------------
 
 struct SinkConfigBundle {
-  fixed_group: FixedGroup
-  flex_groups: List<FlexGroup>
+  connectors: Map<String, ConnectorDefRaw>
+  defaults: DefaultsBody
+  business: List<FlexGroup>
+  infra_default: FixedGroup?
+  infra_error: FixedGroup?
+  infra_monitor: FixedGroup?
 }
 
 struct FixedGroup {
-  default_sinks: List<ResolvedRouteSink>
-  error_sinks: List<ResolvedRouteSink>
+  name: String
+  expect: GroupExpectSpec?
+  wf_meta_disable: List<String>
+  sinks: List<ResolvedRouteSink>
+  parallel: Int
 }
 
 struct FlexGroup {
   name: String
-  windows: List<String>
+  parallel: Int
+  windows: WildArray
+  tags: List<String>
+  wf_meta_disable: List<String>
+  expect: GroupExpectSpec?
   sinks: List<ResolvedRouteSink>
 }
 
 struct ResolvedRouteSink {
-  kind: String
-  params: Map
-  tags: List<String>
+  spec: ResolvedSinkSpec
+  fields: List<String>?
 }
 
 struct RouteFile {
-  groups: List<RouteGroup>
+  version: String?
+  sink_group: RouteGroup
 }
 
 struct RouteGroup {
   name: String
-  tags: List<String>
+  tags: List<String>?
+  parallel: Int?
+  windows: StringOrArray?
+  wf_meta_disable: List<String>
+  expect: GroupExpectSpec?
   sinks: List<RouteSink>
 }
 
 struct RouteSink {
-  kind: String
+  connect: String
+  name: String?
   params: Map
-  window_match: String
+  fields: StringOrArray?
+  tags: List<String>?
+  expect: SinkExpectOverride?
 }
 
 struct ConnectorDefRaw {
+  id: String
   kind: String
-  params_schema: Map
+  allow_override: List<String>
+  params: String?
 }
 
 struct ConnectorTomlFile {
   connectors: List<ConnectorDefRaw>
+}
+
+struct StringOrArray {
+  values: List<String>
+}
+
+struct WildArray {
+  patterns: List<String>
+}
+
+struct GroupExpectSpec {
+  required: Bool
+}
+
+struct SinkExpectOverride {
+  required: Bool
+}
+
+struct DefaultsBody {
+  tags: List<String>
+  expect: GroupExpectSpec?
 }
 
 // -- Config loader (public API) ----------------------------------------------
@@ -271,6 +341,7 @@ state FusionChangeKind {
   Logging
   Metrics
   Mode
+  Output
   Unknown
 }
 
@@ -281,14 +352,16 @@ state FusionReloadDisposition {
 }
 
 struct ClassifiedFusionConfigChange {
-  changes: List<FusionChangeKind>
+  change: RawFusionConfigChange
+  kind: FusionChangeKind
   disposition: FusionReloadDisposition
+  reason: String
 }
 
 struct FusionReloadPlan {
-  can_reload: Bool
-  changes: List<FusionChangeKind>
-  detail: String
+  hot_reload: List<ClassifiedFusionConfigChange>
+  requires_restart: List<ClassifiedFusionConfigChange>
+  unsupported: List<ClassifiedFusionConfigChange>
 }
 
 // -- Error states ------------------------------------------------------------

@@ -8,8 +8,8 @@ mod types;
 
 // Re-export public types
 pub use types::{
-    BindData, CloseOutput, CloseReason, Event, MACHINE_ID, MatchedContext, StepData, StepResult,
-    Value, WindowLookup,
+    BindData, CloseOutput, CloseReason, Event, MACHINE_ID, MatchedContext, StepData, StepOutcome,
+    StepProgress, StepResult, Value, WindowLookup,
 };
 
 // Re-export pub(crate) items
@@ -30,7 +30,9 @@ use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, WindowSpec};
 use close::{accumulate_close_steps, evaluate_close, evidence_time_range};
 use key::{InstanceKey, extract_key, make_scope_key_str};
 use state::{AliasState, Instance, snapshot_bind_data};
-use step::{collect_alias_event, evaluate_step};
+use step::{
+    StepEvaluationInput, StepProgressCapture, collect_alias_event, evaluate_step_with_progress,
+};
 
 // ---------------------------------------------------------------------------
 // CepStateMachine — public API
@@ -175,9 +177,33 @@ impl CepStateMachine {
         now_nanos: i64,
         windows: Option<&dyn WindowLookup>,
     ) -> StepResult {
+        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, false)
+            .result
+    }
+
+    /// Feed one event and return both the state-machine result and diagnostic
+    /// progress for the evaluated step, when progress can be captured.
+    pub fn advance_at_with_progress(
+        &mut self,
+        alias: &str,
+        event: &Event,
+        now_nanos: i64,
+        windows: Option<&dyn WindowLookup>,
+    ) -> StepOutcome {
+        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, true)
+    }
+
+    fn advance_at_with_diagnostics(
+        &mut self,
+        alias: &str,
+        event: &Event,
+        now_nanos: i64,
+        windows: Option<&dyn WindowLookup>,
+        capture_progress: bool,
+    ) -> StepOutcome {
         // FailRule: once the rule has failed, reject all future events
         if self.failed {
-            return StepResult::Accumulate;
+            return step_outcome(StepResult::Accumulate, None);
         }
 
         // Update watermark
@@ -189,7 +215,7 @@ impl CepStateMachine {
         let scope_key =
             match extract_key(event, &self.plan.keys, self.plan.key_map.as_deref(), alias) {
                 Some(k) => k,
-                None => return StepResult::Accumulate, // missing key field → skip
+                None => return step_outcome(StepResult::Accumulate, None), // missing key field → skip
             };
 
         // Build structured instance key
@@ -216,7 +242,7 @@ impl CepStateMachine {
             && self.instances.len() >= max_inst
         {
             match limits.on_exceed {
-                ExceedAction::Throttle => return StepResult::Accumulate,
+                ExceedAction::Throttle => return step_outcome(StepResult::Accumulate, None),
                 ExceedAction::DropOldest => {
                     // Find and remove the oldest instance
                     if let Some(oldest_key) = self
@@ -230,7 +256,7 @@ impl CepStateMachine {
                 }
                 ExceedAction::FailRule => {
                     self.failed = true;
-                    return StepResult::Accumulate;
+                    return step_outcome(StepResult::Accumulate, None);
                 }
             }
         }
@@ -249,7 +275,7 @@ impl CepStateMachine {
             let mut total = self.estimated_memory_bytes + new_cost;
             if total >= max_bytes {
                 match limits.on_exceed {
-                    ExceedAction::Throttle => return StepResult::Accumulate,
+                    ExceedAction::Throttle => return step_outcome(StepResult::Accumulate, None),
                     ExceedAction::DropOldest => {
                         // Evict oldest instances in a loop until under limit or nothing left.
                         // If the current key is the oldest it gets evicted too — its
@@ -275,13 +301,13 @@ impl CepStateMachine {
                                 }
                             } else {
                                 // No instances to evict — cannot make room
-                                return StepResult::Accumulate;
+                                return step_outcome(StepResult::Accumulate, None);
                             }
                         }
                     }
                     ExceedAction::FailRule => {
                         self.failed = true;
-                        return StepResult::Accumulate;
+                        return step_outcome(StepResult::Accumulate, None);
                     }
                 }
             }
@@ -324,6 +350,7 @@ impl CepStateMachine {
             );
         }
 
+        let mut progress = None;
         let result = 'process: {
             // 4. If event already emitted (OR mode), just accumulate for close
             if instance.event_emitted {
@@ -341,22 +368,37 @@ impl CepStateMachine {
             }
             let step_idx = instance.current_step;
             let step_plan = &plan.event_steps[step_idx];
-            let step_state = &mut instance.step_states[step_idx];
 
             // 6. Evaluate step
-            let Some((branch_idx, measure_value)) = evaluate_step(
-                alias,
-                event,
-                now_nanos,
-                step_plan,
-                step_state,
-                windows,
-                &mut instance.baselines,
-            ) else {
+            let evaluation = {
+                let step_state = &mut instance.step_states[step_idx];
+                evaluate_step_with_progress(
+                    StepEvaluationInput {
+                        alias,
+                        event,
+                        event_time_nanos: now_nanos,
+                        windows,
+                        progress: capture_progress.then_some(StepProgressCapture {
+                            rule_name: &self.rule_name,
+                            scope_key: &scope_key,
+                            machine_id: &instance.machine_id,
+                            step_index: step_idx,
+                        }),
+                    },
+                    step_plan,
+                    step_state,
+                    &mut instance.baselines,
+                )
+            };
+            let (satisfied, evaluation_progress) = evaluation;
+            let Some((branch_idx, measure_value)) = satisfied else {
+                progress = evaluation_progress;
                 break 'process StepResult::Accumulate;
             };
+            progress = evaluation_progress;
 
             let label = step_plan.branches[branch_idx].label.clone();
+            let step_state = &instance.step_states[step_idx];
             // Collect the values from the satisfied branch for L3 functions
             let collected_values = step_state.branch_states[branch_idx]
                 .collected_values
@@ -473,7 +515,10 @@ impl CepStateMachine {
             }
         };
         self.insert_instance(instance_key, instance);
-        result
+        if let Some(progress) = &mut progress {
+            progress.instances = self.instances.len();
+        }
+        step_outcome(result, progress)
     }
 
     /// Number of active per-key instances.
@@ -705,6 +750,10 @@ fn should_track_bind_alias(plan: &MatchPlan, alias: &str) -> bool {
             .chain(plan.close_steps.iter())
             .flat_map(|step| step.branches.iter())
             .any(|branch| branch.source == alias)
+}
+
+fn step_outcome(result: StepResult, progress: Option<StepProgress>) -> StepOutcome {
+    StepOutcome { result, progress }
 }
 
 // ---------------------------------------------------------------------------

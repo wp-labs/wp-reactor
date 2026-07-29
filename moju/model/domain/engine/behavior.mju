@@ -33,15 +33,15 @@ flow ProcessEvents {
   step ResolveWindows {
     create Router {
       registry = IncomingBatch.stream_name
-      route_table = IncomingBatch.stream_name
     }
   }
 
   // 将事件分发到匹配的窗口，报告路由统计
   step Route {
     create RouteReport {
-      matched_windows = IncomingBatch.stream_name
-      events_routed = IncomingBatch.stream_name
+      delivered = IncomingBatch.stream_name
+      dropped_late = IncomingBatch.stream_name
+      skipped_non_local = IncomingBatch.stream_name
     }
   }
 
@@ -55,18 +55,14 @@ flow ProcessEvents {
 
   // 追加事件到窗口，应用 watermark / lateness 策略
   step Append {
-    create AppendOutcome {
-      rows_added = IncomingBatch.stream_name
-      rows_evicted = IncomingBatch.stream_name
-    }
   }
 
   // 将窗口事件送入 NFA 状态机
   step Match {
     create MatchedContext {
-      events = IncomingBatch.stream_name
+      rule_name = IncomingBatch.stream_name
       step_data = IncomingBatch.stream_name
-      close_output = IncomingBatch.stream_name
+      machine_id = IncomingBatch.stream_name
     }
   }
 
@@ -83,7 +79,7 @@ flow ProcessEvents {
   // 将告警路由到配置的 sink（file、syslog、tcp 等）
   step Dispatch {
     create SinkRuntime {
-      kind = IncomingBatch.stream_name
+      name = IncomingBatch.stream_name
       handle = IncomingBatch.stream_name
     }
   }
@@ -96,9 +92,9 @@ flow EvictWindow {
 
   step Purge {
     create EvictReport {
-      removed_rows = MemoryPressure.window_name
-      freed_bytes = MemoryPressure.window_name
-      remaining_rows = MemoryPressure.window_name
+      windows_scanned = MemoryPressure.window_name
+      batches_time_evicted = MemoryPressure.window_name
+      batches_memory_evicted = MemoryPressure.window_name
     }
   }
 }
@@ -110,15 +106,15 @@ flow StateMachineStep {
 
   step Evaluate {
     create StepState {
-      accumulated = NewEvents.events
-      branches = NewEvents.events
+      branch_states = NewEvents.events
     }
   }
 
   step Advance {
     create MatchedContext {
-      events = NewEvents.events
+      rule_name = NewEvents.events
       step_data = NewEvents.events
+      machine_id = NewEvents.events
     }
   }
 }

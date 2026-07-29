@@ -26,14 +26,14 @@ module WindowConfig {
 
 module SourceConfig {
   layer Application
-  owns SourceConfig, TcpSourceConfig, FileSourceConfig, FileInputFormat
+  owns SourceConfig
 
   responsible_for "Data source configuration — TCP listener and file ingest with format detection"
 }
 
 module LoggingMetrics {
   layer Application
-  owns LoggingConfig, LogFormat, MetricsConfig, MetricsTopNConfig
+  owns LoggingConfig, LogFormat, MetricsConfig, MetricsTopNConfig, OutputTimeZone, OutputConfig
 
   responsible_for "Logging and metrics configuration — log format/level, Prometheus export, and Top-N reporting"
 }
@@ -41,8 +41,16 @@ module LoggingMetrics {
 module SinkConfig {
   layer Application
   owns SinkConfigBundle, FixedGroup, FlexGroup, ResolvedRouteSink, RouteFile, RouteGroup, RouteSink, ConnectorDefRaw, ConnectorTomlFile
+  owns StringOrArray, WildArray, GroupExpectSpec, SinkExpectOverride, DefaultsBody
 
   responsible_for "Sink configuration — route file parsing, group resolution, and connector definitions"
+}
+
+module AdminProjectConfig {
+  layer Application
+  owns AdminApiTlsConf, AdminApiAuthConf, AdminApiConf, RepoGroupConf, ProjectRemoteConf
+
+  responsible_for "Administrative API and remote project synchronization configuration"
 }
 
 module ConfigChange {
@@ -59,4 +67,5 @@ dependency_rule ConfigDeps {
   ConfigLoader -> LoggingMetrics
   ConfigLoader -> SinkConfig
   ConfigLoader -> ConfigChange
+  ConfigLoader -> AdminProjectConfig
 }

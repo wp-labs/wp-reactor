@@ -52,6 +52,8 @@ struct Subscription {
 /// (router/rule/evictor) hold the `Arc<Router>` that owns this registry.
 /// Reads take a read lock for the duration of the access only (no `.await` is
 /// held across the guard), so the locks are `std::sync::RwLock`.
+#[derive(::moju_derive::MoJu)]
+#[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct WindowRegistry {
     windows: RwLock<HashMap<String, Arc<RwLock<Window>>>>,
     provider_windows: RwLock<HashMap<String, Arc<RwLock<ProviderWindow>>>>,
