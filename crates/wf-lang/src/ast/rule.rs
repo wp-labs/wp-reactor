@@ -16,13 +16,23 @@ pub struct WflFile {
     pub tests: Vec<TestBlock>,
 }
 
-/// A reusable yield field set: `yield preset name (...)`.
+/// A reusable yield field set: `yield preset name [<params...>] (...)`.
 #[non_exhaustive]
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
 #[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
 pub struct YieldPresetDecl {
     pub name: String,
+    pub params: Vec<YieldPresetParam>,
     pub args: Vec<NamedArg>,
+}
+
+/// One parameter declared by a parameterized yield preset.
+#[non_exhaustive]
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+pub struct YieldPresetParam {
+    pub name: String,
+    pub default: Option<Expr>,
 }
 
 /// A pattern declaration: `pattern name(params) { body }`

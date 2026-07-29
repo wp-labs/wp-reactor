@@ -185,12 +185,12 @@ fn format_prelude_yield_preset_error(
         {
             return None;
         }
-        let preset_name = rule.yield_clause.presets.iter().rev().find(|preset_name| {
+        let preset_ref = rule.yield_clause.presets.iter().rev().find(|preset_ref| {
             prelude.file.yield_presets.iter().any(|preset| {
-                preset.name == **preset_name && preset.args.iter().any(|arg| arg.name == arg_name)
+                preset.name == preset_ref.name && preset.args.iter().any(|arg| arg.name == arg_name)
             })
         })?;
-        find_prelude_yield_preset_arg_location(&prelude.source, preset_name, &arg_name)?
+        find_prelude_yield_preset_arg_location(&prelude.source, &preset_ref.name, &arg_name)?
     } else {
         let tokens = backtick_tokens(&error.message);
         if tokens.is_empty() {
@@ -251,10 +251,17 @@ fn find_prelude_yield_preset_arg_location(
     arg_name: &str,
 ) -> Option<(usize, usize)> {
     let lines: Vec<&str> = source.lines().collect();
-    let start_idx = lines
+    let decls = yield_preset_decl_locations(source);
+    let start_idx = decls
         .iter()
-        .position(|line| line_declares_yield_preset(line, preset_name))?;
-    let end_idx = yield_preset_source_end(&lines, start_idx);
+        .find(|decl| decl.name == preset_name)
+        .map(|decl| decl.line.saturating_sub(1))
+        .or_else(|| {
+            lines
+                .iter()
+                .position(|line| line_declares_yield_preset(line, preset_name))
+        })?;
+    let end_idx = yield_preset_source_end(&lines, &decls, start_idx);
     lines
         .iter()
         .enumerate()
@@ -271,15 +278,15 @@ fn find_referenced_prelude_yield_preset_token_location(
     prelude_presets: &[wf_lang::ast::YieldPresetDecl],
     tokens: &[String],
 ) -> Option<(usize, usize)> {
-    for preset_name in rule.yield_clause.presets.iter().rev() {
+    for preset_ref in rule.yield_clause.presets.iter().rev() {
         if !prelude_presets
             .iter()
-            .any(|preset| preset.name == *preset_name)
+            .any(|preset| preset.name == preset_ref.name)
         {
             continue;
         }
         if let Some(location) =
-            find_prelude_yield_preset_token_location(source, preset_name, tokens)
+            find_prelude_yield_preset_token_location(source, &preset_ref.name, tokens)
         {
             return Some(location);
         }
@@ -293,10 +300,17 @@ fn find_prelude_yield_preset_token_location(
     tokens: &[String],
 ) -> Option<(usize, usize)> {
     let lines: Vec<&str> = source.lines().collect();
-    let start_idx = lines
+    let decls = yield_preset_decl_locations(source);
+    let start_idx = decls
         .iter()
-        .position(|line| line_declares_yield_preset(line, preset_name))?;
-    let end_idx = yield_preset_source_end(&lines, start_idx);
+        .find(|decl| decl.name == preset_name)
+        .map(|decl| decl.line.saturating_sub(1))
+        .or_else(|| {
+            lines
+                .iter()
+                .position(|line| line_declares_yield_preset(line, preset_name))
+        })?;
+    let end_idx = yield_preset_source_end(&lines, &decls, start_idx);
     for (idx, line) in lines.iter().enumerate().take(end_idx).skip(start_idx) {
         if let Some(column) = tokens
             .iter()
@@ -308,14 +322,19 @@ fn find_prelude_yield_preset_token_location(
     None
 }
 
-fn yield_preset_source_end(lines: &[&str], start_idx: usize) -> usize {
+fn yield_preset_source_end(
+    lines: &[&str],
+    decls: &[YieldPresetDeclLocation],
+    start_idx: usize,
+) -> usize {
     lines
         .iter()
         .enumerate()
         .skip(start_idx + 1)
         .find_map(|(idx, line)| {
             let trimmed = line.trim_start();
-            (line_starts_yield_preset_decl(line)
+            (decls.iter().any(|decl| decl.line == idx + 1)
+                || line_starts_yield_preset_decl(line)
                 || trimmed.starts_with("rule ")
                 || trimmed.starts_with("test ")
                 || trimmed.starts_with("pattern "))
@@ -336,14 +355,10 @@ fn find_nth_yield_preset_decl_location(
     if occurrence == 0 {
         return None;
     }
-    source
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line_declares_yield_preset(line, preset_name))
-        .map(|(idx, line)| {
-            let column = line.find("yield").unwrap_or(0) + 1;
-            (idx + 1, column)
-        })
+    yield_preset_decl_locations(source)
+        .into_iter()
+        .filter(|decl| decl.name == preset_name)
+        .map(|decl| (decl.line, decl.column))
         .nth(occurrence - 1)
 }
 
@@ -376,6 +391,117 @@ fn yield_preset_decl_rest(line: &str) -> Option<&str> {
         return None;
     }
     Some(rest)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct YieldPresetDeclLocation {
+    name: String,
+    line: usize,
+    column: usize,
+}
+
+fn yield_preset_decl_locations(source: &str) -> Vec<YieldPresetDeclLocation> {
+    let bytes = source.as_bytes();
+    let mut locations = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = skip_quoted_string(source, i),
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                i = skip_line_comment(bytes, i);
+            }
+            b'y' => {
+                if let Some((name, _after_name)) = parse_yield_preset_decl_at(source, i) {
+                    let (line, column) = source_line_column(source, i);
+                    locations.push(YieldPresetDeclLocation { name, line, column });
+                    i += "yield".len();
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    locations
+}
+
+fn parse_yield_preset_decl_at(source: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = source.as_bytes();
+    let after_yield = keyword_at(bytes, start, b"yield")?;
+    let mut i = skip_ws_and_line_comments(bytes, after_yield);
+    i = keyword_at(bytes, i, b"preset")?;
+    i = skip_ws_and_line_comments(bytes, i);
+    if i >= bytes.len() || !is_ident_start_byte(bytes[i]) {
+        return None;
+    }
+    let name_start = i;
+    i += 1;
+    while i < bytes.len() && is_ident_byte(bytes[i]) {
+        i += 1;
+    }
+    Some((source[name_start..i].to_string(), i))
+}
+
+fn keyword_at(bytes: &[u8], start: usize, keyword: &[u8]) -> Option<usize> {
+    let end = start.checked_add(keyword.len())?;
+    if end > bytes.len() || &bytes[start..end] != keyword {
+        return None;
+    }
+    if (start > 0 && is_ident_byte(bytes[start - 1]))
+        || (end < bytes.len() && is_ident_byte(bytes[end]))
+    {
+        return None;
+    }
+    Some(end)
+}
+
+fn skip_ws_and_line_comments(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            i = skip_line_comment(bytes, i);
+        } else {
+            return i;
+        }
+    }
+}
+
+fn skip_quoted_string(source: &str, start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut i = start + 1;
+    while i < bytes.len() && bytes[i] != b'"' {
+        i += source[i..].chars().next().unwrap().len_utf8();
+    }
+    if i < bytes.len() { i + 1 } else { i }
+}
+
+fn skip_line_comment(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i] != b'\n' {
+        i += 1;
+    }
+    i
+}
+
+fn source_line_column(source: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut line_start = 0;
+    for (idx, byte) in source.bytes().enumerate().take(offset) {
+        if byte == b'\n' {
+            line += 1;
+            line_start = idx + 1;
+        }
+    }
+    (line, offset - line_start + 1)
+}
+
+fn is_ident_start_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn find_named_arg_column(line: &str, arg_name: &str) -> Option<usize> {
@@ -1312,6 +1438,65 @@ rule ssh {
     }
 
     #[test]
+    fn compile_rules_loads_parameterized_global_prelude_yield_presets() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_dir = dir.path().join("rules");
+        std::fs::create_dir_all(rules_dir.join("detections")).unwrap();
+        std::fs::write(
+            rules_dir.join(RULE_PRELUDE_FILE),
+            r#"
+yield preset base_alerts <severity, rule_name = "global"> (
+  severity = $severity,
+  rule_name = $rule_name
+)
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            rules_dir.join("detections/ssh.wfl"),
+            r#"
+rule ssh {
+  events { e: fw_events }
+  match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+  entity(ip, e.sip)
+  yield alerts : base_alerts<"high"> (
+    event_time = e.event_time,
+    sip = e.sip
+  )
+}
+"#,
+        )
+        .unwrap();
+
+        let (plans, _) = compile_rules(
+            "rules/**/*.wfl",
+            dir.path(),
+            &ConfigVarContext::from_explicit_vars(HashMap::new()),
+            &prelude_test_schemas(),
+        )
+        .unwrap();
+
+        assert_eq!(plans.len(), 1);
+        let field_value = |name: &str| {
+            &plans[0]
+                .yield_plan
+                .fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap()
+                .value
+        };
+        assert_eq!(
+            field_value("severity"),
+            &wf_lang::ast::Expr::StringLit("high".into())
+        );
+        assert_eq!(
+            field_value("rule_name"),
+            &wf_lang::ast::Expr::StringLit("global".into())
+        );
+    }
+
+    #[test]
     fn compile_rules_rejects_rules_in_global_prelude() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1434,6 +1619,51 @@ rule visible {
         assert!(text.contains("_global.wfl"), "{text}");
         assert!(text.contains("field `missing` not found"), "{text}");
         assert!(text.contains("location: line 3, column 16"), "{text}");
+        assert!(text.contains("severity = e.missing"), "{text}");
+    }
+
+    #[test]
+    fn compile_rules_reports_split_global_prelude_expression_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(RULE_PRELUDE_FILE),
+            r#"
+yield // split header
+preset
+base_alerts (
+  severity = e.missing,
+  rule_name = "global"
+)
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("visible.wfl"),
+            r#"
+rule visible {
+  events { e: fw_events }
+  match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+  entity(ip, e.sip)
+  yield alerts : base_alerts (
+    event_time = e.event_time,
+    sip = e.sip
+  )
+}
+"#,
+        )
+        .unwrap();
+
+        let err = compile_rules(
+            "*.wfl",
+            dir.path(),
+            &ConfigVarContext::from_explicit_vars(HashMap::new()),
+            &prelude_test_schemas(),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("_global.wfl"), "{text}");
+        assert!(text.contains("field `missing` not found"), "{text}");
+        assert!(text.contains("location: line 5, column 16"), "{text}");
         assert!(text.contains("severity = e.missing"), "{text}");
     }
 

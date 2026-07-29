@@ -210,6 +210,7 @@ fn primary(input: &mut &str) -> ModalResult<Expr> {
             kw("true").map(|_| Expr::Bool(true)),
             kw("false").map(|_| Expr::Bool(false)),
             system_var,
+            preset_param,
         )),
         alt((if_expr, object_expr, array_expr, paren_expr, ident_primary)),
     ))
@@ -217,6 +218,16 @@ fn primary(input: &mut &str) -> ModalResult<Expr> {
         "expression",
     )))
     .parse_next(input)
+}
+
+fn preset_param(input: &mut &str) -> ModalResult<Expr> {
+    literal("$").parse_next(input)?;
+    let name = cut_err(ident)
+        .context(StrContext::Expected(StrContextValue::Description(
+            "yield preset parameter name",
+        )))
+        .parse_next(input)?;
+    Ok(Expr::PresetParam(name.to_string()))
 }
 
 fn system_var(input: &mut &str) -> ModalResult<Expr> {

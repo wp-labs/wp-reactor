@@ -139,6 +139,118 @@ fn dollar_in_fmt_string_ignored() {
     );
 }
 
+#[test]
+fn yield_preset_params_are_not_preprocessed_as_vars() {
+    let v = HashMap::new();
+    let source = r#"
+yield preset base_alerts <severity, source = "wfusion"> (
+    severity = $severity,
+    source = $source
+)
+"#;
+    let result = preprocess_vars(source, &v).unwrap();
+    assert!(result.contains("severity = $severity"), "{result}");
+    assert!(result.contains("source = $source"), "{result}");
+}
+
+#[test]
+fn yield_preset_detection_allows_comments_between_header_tokens() {
+    let v = HashMap::new();
+    let source = r#"
+yield // comment after keyword
+    preset // comment after preset keyword
+    base_alerts // comment after name
+    <severity> // comment after params
+(
+    severity = $severity
+)
+"#;
+    let result = preprocess_vars(source, &v).unwrap();
+    assert!(result.contains("severity = $severity"), "{result}");
+}
+
+#[test]
+fn yield_preset_param_extraction_allows_comments_between_params() {
+    let v = HashMap::new();
+    let source = r#"
+yield preset base_alerts <
+    severity, // first preset parameter
+    source
+> (
+    severity = $severity,
+    source = $source
+)
+"#;
+    let result = preprocess_vars(source, &v).unwrap();
+    assert!(result.contains("severity = $severity"), "{result}");
+    assert!(result.contains("source = $source"), "{result}");
+}
+
+#[test]
+fn yield_preset_body_still_expands_non_param_vars() {
+    let v = vars(&[("DEFAULT_RULE", r#""global""#)]);
+    let source = r#"
+yield preset base_alerts <severity> (
+    severity = $severity,
+    rule_name = $DEFAULT_RULE
+)
+"#;
+    let result = preprocess_vars(source, &v).unwrap();
+    assert!(result.contains("severity = $severity"), "{result}");
+    assert!(result.contains(r#"rule_name = "global""#), "{result}");
+}
+
+#[test]
+fn yield_preset_param_defaults_with_greater_than_do_not_truncate_scan() {
+    let v = vars(&[("DEFAULT_RULE", r#""global""#)]);
+    let source = r#"
+yield preset base_alerts <severity, enabled = @score >= 50.0> (
+    severity = $severity,
+    enabled = $enabled,
+    rule_name = $DEFAULT_RULE
+)
+"#;
+    let result = preprocess_vars(source, &v).unwrap();
+    assert!(result.contains("enabled = @score >= 50.0"), "{result}");
+    assert!(result.contains("enabled = $enabled"), "{result}");
+    assert!(result.contains(r#"rule_name = "global""#), "{result}");
+}
+
+#[test]
+fn yield_preset_param_defaults_with_parenthesized_gt_rhs_do_not_truncate_scan() {
+    let v = vars(&[("DEFAULT_RULE", r#""global""#)]);
+    let source = r#"
+yield preset base_alerts <severity, enabled = @score > (50.0)> (
+    severity = $severity,
+    enabled = $enabled,
+    rule_name = $DEFAULT_RULE
+)
+"#;
+    let result = preprocess_vars(source, &v).unwrap();
+    assert!(result.contains("enabled = @score > (50.0)"), "{result}");
+    assert!(result.contains("enabled = $enabled"), "{result}");
+    assert!(result.contains(r#"rule_name = "global""#), "{result}");
+}
+
+#[test]
+fn multiple_yield_preset_decls_preserve_only_their_own_params() {
+    let v = vars(&[("DEFAULT_RULE", r#""global""#)]);
+    let source = r#"
+yield preset base_alerts <severity> (
+    severity = $severity,
+    rule_name = $DEFAULT_RULE
+)
+yield preset tag_fields <tag> (
+    tag = $tag,
+    rule_name = $DEFAULT_RULE
+)
+"#;
+    let result = preprocess_vars(source, &v).unwrap();
+    assert!(result.contains("severity = $severity"), "{result}");
+    assert!(result.contains("tag = $tag"), "{result}");
+    assert_eq!(result.matches(r#"rule_name = "global""#).count(), 2);
+}
+
 // --- Environment variable fallback ---
 
 #[test]
@@ -209,6 +321,37 @@ rule brute_force {
     );
     let file = parse_wfl(&processed).unwrap();
     assert_eq!(file.rules.len(), 1);
+}
+
+#[test]
+fn preprocess_then_parse_parameterized_yield_preset() {
+    use crate::parse_wfl;
+
+    let v = vars(&[("DEFAULT_SOURCE", r#""wfusion""#)]);
+    let source = r#"
+yield preset base_alerts <
+    severity, // preset parameter
+    source = $DEFAULT_SOURCE
+> (
+    severity = $severity,
+    source = $source
+)
+
+rule r {
+    events { fail : auth_events }
+    match<sip:5m> { on event { fail | count >= 3; } } -> score(70.0)
+    entity(ip, fail.sip)
+    yield out : base_alerts<"high"> (
+        x = fail.sip
+    )
+}
+"#;
+    let processed = preprocess_vars(source, &v).unwrap();
+    assert!(processed.contains(r#"source = "wfusion""#), "{processed}");
+    assert!(processed.contains("severity = $severity"), "{processed}");
+    let file = parse_wfl(&processed).unwrap();
+    assert_eq!(file.yield_presets[0].params.len(), 2);
+    assert_eq!(file.rules[0].yield_clause.presets[0].name, "base_alerts");
 }
 
 // --- Pattern block skipping ---

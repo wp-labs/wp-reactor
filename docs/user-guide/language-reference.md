@@ -403,18 +403,19 @@ yield security_alerts@v2 (
 
 #### `yield preset`
 
-`yield preset` 用于复用公共输出字段集合，降低每条规则重复填写通用告警字段的成本。
+`yield preset` 用于复用公共输出字段集合，降低每条规则重复填写通用告警字段的成本。preset 可声明参数；参数按位置传入，带默认值的参数可省略。
 
 ```wfl
-yield preset base_alerts (
+yield preset base_alerts <severity, source = "wfusion"> (
     rule_name = @__wfu_rule_name,
     score = @score,
-    source = "wfl"
+    severity = $severity,
+    source = $source
 )
 
 rule scan {
     ...
-    yield scan_alerts : base_alerts (
+    yield scan_alerts : base_alerts<"high"> (
         alert_type = "scan",
         ioc_value = e.dip
     )
@@ -436,6 +437,8 @@ yield scan_alerts : base_alerts, ioc_fields (
 - 当前 `yield (...)` 覆盖所有 preset 同名字段
 - 展开后的字段仍按 `yield` 目标 window 做字段存在性、保留前缀和类型校验
 - preset 不单独输出，也不绑定某个目标 window
+- `$param` 只在 `yield preset` 声明内部表示 preset 参数；普通规则表达式中的 `$VAR` 仍按预处理变量处理
+- 必填参数不能排在带默认值参数之后；缺少必填参数、实参数量过多、未知 `$param` 都是编译错误
 - preset 中引用的事件 alias 在使用点解析；推荐 preset 优先放常量、`@score`、`@__wfu_*` 和时间系统变量
 
 项目级公共 preset 可集中放入规则根目录下的 `_global.wfl`。规则根目录由 `runtime.rules` glob 的非通配前缀推导，例如 `rules/**/*.wfl` 对应 `rules/_global.wfl`，`rules/current/*.wfl` 对应 `rules/current/_global.wfl`。运行时会自动把它作为 project prelude 加载，并从普通规则文件列表中排除；`_global.wfl` 只允许 `yield preset` 声明，不会自动启用普通 `rule`。

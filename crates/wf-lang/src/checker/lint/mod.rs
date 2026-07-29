@@ -147,7 +147,8 @@ fn collect_expr_aliases<'a>(expr: &'a Expr, declared: &HashSet<&str>, used: &mut
         | Expr::StringLit(_)
         | Expr::Bool(_)
         | Expr::SystemVar(_)
-        | Expr::WfuMeta(_) => {}
+        | Expr::WfuMeta(_)
+        | Expr::PresetParam(_) => {}
         Expr::Object(items) => {
             for item in items {
                 collect_expr_aliases(&item.value, declared, used);

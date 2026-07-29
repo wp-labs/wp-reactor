@@ -1,5 +1,5 @@
 use winnow::combinator::{alt, cut_err, opt, separated};
-use winnow::error::{StrContext, StrContextValue};
+use winnow::error::{ContextError, ErrMode, StrContext, StrContextValue};
 use winnow::prelude::*;
 use winnow::token::literal;
 
@@ -57,9 +57,13 @@ pub(super) fn yield_preset_decl(input: &mut &str) -> ModalResult<YieldPresetDecl
         .to_string();
 
     ws_skip.parse_next(input)?;
+    let params = opt(yield_preset_params)
+        .parse_next(input)?
+        .unwrap_or_default();
+    ws_skip.parse_next(input)?;
     let args = cut_err(named_args_parens).parse_next(input)?;
 
-    Ok(YieldPresetDecl { name, args })
+    Ok(YieldPresetDecl { name, params, args })
 }
 
 pub(super) fn yield_clause(input: &mut &str) -> ModalResult<YieldClause> {
@@ -114,8 +118,219 @@ fn named_args_parens(input: &mut &str) -> ModalResult<Vec<NamedArg>> {
     Ok(args)
 }
 
-fn yield_preset_ref(input: &mut &str) -> ModalResult<String> {
-    ident.map(str::to_string).parse_next(input)
+fn yield_preset_params(input: &mut &str) -> ModalResult<Vec<YieldPresetParam>> {
+    let body = parse_angle_body(input, starts_named_args_parens)?;
+    parse_preset_param_items(body)
+}
+
+fn parse_angle_body<'a>(
+    input: &mut &'a str,
+    close_is_valid: impl Fn(&str) -> bool,
+) -> ModalResult<&'a str> {
+    literal("<").parse_next(input)?;
+    let body_start = *input;
+    let Some(close_idx) = find_angle_close(body_start, close_is_valid) else {
+        return Err(parse_cut_error());
+    };
+    let body = &body_start[..close_idx];
+    *input = &body_start[close_idx + 1..];
+    Ok(body)
+}
+
+fn parse_preset_param_items(body: &str) -> ModalResult<Vec<YieldPresetParam>> {
+    let mut rest = body;
+    ws_skip.parse_next(&mut rest)?;
+    if rest.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let params: Vec<YieldPresetParam> = separated(1.., preset_param_item, angle_comma_sep)
+        .parse_next(&mut rest)
+        .map_err(|_| parse_cut_error())?;
+    ws_skip.parse_next(&mut rest)?;
+    let _ = opt(angle_comma_sep).parse_next(&mut rest)?;
+    ws_skip.parse_next(&mut rest)?;
+    if rest.is_empty() {
+        Ok(params)
+    } else {
+        Err(parse_cut_error())
+    }
+}
+
+fn preset_param_item(input: &mut &str) -> ModalResult<YieldPresetParam> {
+    ws_skip.parse_next(input)?;
+    let name = ident.parse_next(input)?.to_string();
+    ws_skip.parse_next(input)?;
+    let default = if opt(literal("=")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        Some(cut_err(expr::parse_expr).parse_next(input)?)
+    } else {
+        None
+    };
+    Ok(YieldPresetParam { name, default })
+}
+
+fn parse_preset_ref_arg_items(body: &str) -> ModalResult<Vec<Expr>> {
+    let mut rest = body;
+    ws_skip.parse_next(&mut rest)?;
+    if rest.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let args: Vec<Expr> = separated(1.., preset_ref_arg_item, angle_comma_sep)
+        .parse_next(&mut rest)
+        .map_err(|_| parse_cut_error())?;
+    ws_skip.parse_next(&mut rest)?;
+    let _ = opt(angle_comma_sep).parse_next(&mut rest)?;
+    ws_skip.parse_next(&mut rest)?;
+    if rest.is_empty() {
+        Ok(args)
+    } else {
+        Err(parse_cut_error())
+    }
+}
+
+fn preset_ref_arg_item(input: &mut &str) -> ModalResult<Expr> {
+    ws_skip.parse_next(input)?;
+    expr::parse_expr.parse_next(input)
+}
+
+fn angle_comma_sep(input: &mut &str) -> ModalResult<()> {
+    ws_skip.parse_next(input)?;
+    literal(",").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    Ok(())
+}
+
+fn yield_preset_ref(input: &mut &str) -> ModalResult<YieldPresetRef> {
+    let name = ident.map(str::to_string).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let args = opt(yield_preset_ref_args)
+        .parse_next(input)?
+        .unwrap_or_default();
+    Ok(YieldPresetRef { name, args })
+}
+
+fn yield_preset_ref_args(input: &mut &str) -> ModalResult<Vec<Expr>> {
+    let body = parse_angle_body(input, |after| {
+        after.starts_with(',') || starts_named_args_parens(after)
+    })?;
+    parse_preset_ref_arg_items(body)
+}
+
+fn find_angle_close(body_start: &str, close_is_valid: impl Fn(&str) -> bool) -> Option<usize> {
+    let bytes = body_start.as_bytes();
+    let mut i = 0;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = skip_string(body_start, i),
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => i = skip_line_comment(bytes, i),
+            b'(' => {
+                paren_depth += 1;
+                i += 1;
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                i += 1;
+            }
+            b'[' => {
+                bracket_depth += 1;
+                i += 1;
+            }
+            b']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                i += 1;
+            }
+            b'{' => {
+                brace_depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                i += 1;
+            }
+            b'>' if paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && close_is_valid(skip_ws_and_line_comments_str(&body_start[i + 1..])) =>
+            {
+                return Some(i);
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn skip_ws_and_line_comments_str(value: &str) -> &str {
+    let i = skip_ws_and_line_comments(value.as_bytes(), 0);
+    &value[i..]
+}
+
+fn starts_named_args_parens(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut i = skip_ws_and_line_comments(bytes, 0);
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return false;
+    }
+    i += 1;
+    i = skip_ws_and_line_comments(bytes, i);
+    if i < bytes.len() && bytes[i] == b')' {
+        return true;
+    }
+    if i >= bytes.len() || !is_ident_start_byte(bytes[i]) {
+        return false;
+    }
+    while i < bytes.len() && is_ident_cont_byte(bytes[i]) {
+        i += 1;
+    }
+    i = skip_ws_and_line_comments(bytes, i);
+    i < bytes.len() && bytes[i] == b'='
+}
+
+fn skip_ws_and_line_comments(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            i = skip_line_comment(bytes, i);
+        } else {
+            return i;
+        }
+    }
+}
+
+fn is_ident_start_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_ident_cont_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn skip_string(source: &str, start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut i = start + 1;
+    while i < bytes.len() && bytes[i] != b'"' {
+        i += source[i..].chars().next().unwrap().len_utf8();
+    }
+    if i < bytes.len() { i + 1 } else { i }
+}
+
+fn skip_line_comment(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i] != b'\n' {
+        i += 1;
+    }
+    i
+}
+
+fn parse_cut_error() -> ErrMode<ContextError> {
+    ErrMode::Cut(ContextError::new())
 }
 
 fn named_arg(input: &mut &str) -> ModalResult<NamedArg> {

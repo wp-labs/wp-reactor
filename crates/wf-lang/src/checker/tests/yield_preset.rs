@@ -83,6 +83,185 @@ rule r {
 }
 
 #[test]
+fn parameterized_yield_preset_expands_args_and_defaults() {
+    let input = r#"
+yield preset base_alerts <severity, count = 1> (
+    x = e.sip,
+    y = $severity,
+    n = $count
+)
+
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base_alerts<"high"> ()
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
+}
+
+#[test]
+fn parameterized_yield_preset_accepts_field_expr_args() {
+    let input = r#"
+yield preset base_alerts <severity> (
+    x = e.sip,
+    y = $severity,
+    n = e.count
+)
+
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base_alerts<e.user> ()
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
+}
+
+#[test]
+fn parameterized_yield_preset_missing_required_arg_is_rejected() {
+    let input = r#"
+yield preset base_alerts <severity> (
+    y = $severity
+)
+
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base_alerts (
+        x = e.sip,
+        n = e.count
+    )
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "yield preset `base_alerts` missing required argument `severity`",
+    );
+}
+
+#[test]
+fn parameterized_yield_preset_too_many_args_is_rejected() {
+    let input = r#"
+yield preset base_alerts <severity, source = "wfusion"> (
+    y = $severity
+)
+
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base_alerts<"high", "sensor", "extra"> (
+        x = e.sip,
+        n = e.count
+    )
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "yield preset `base_alerts` expects 1..2 arguments, got 3",
+    );
+}
+
+#[test]
+fn parameterized_yield_preset_unknown_param_is_rejected() {
+    let input = r#"
+yield preset base_alerts <severity> (
+    y = $missing
+)
+
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base_alerts<"high"> (
+        x = e.sip,
+        n = e.count
+    )
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "unknown yield preset parameter `$missing` in `base_alerts`",
+    );
+}
+
+#[test]
+fn parameterized_yield_preset_duplicate_param_is_rejected() {
+    let input = r#"
+yield preset base_alerts <severity, severity = "low"> (
+    y = $severity
+)
+
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base_alerts<"high"> (
+        x = e.sip,
+        n = e.count
+    )
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "duplicate yield preset parameter `severity` in `base_alerts`",
+    );
+}
+
+#[test]
+fn parameterized_yield_preset_required_param_after_default_is_rejected() {
+    let input = r#"
+yield preset base_alerts <source = "wfusion", severity> (
+    y = $severity
+)
+
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base_alerts<"sensor", "high"> (
+        x = e.sip,
+        n = e.count
+    )
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "yield preset `base_alerts` required parameter `severity` cannot follow a defaulted parameter",
+    );
+}
+
+#[test]
+fn yield_preset_param_outside_preset_is_rejected() {
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        x = e.sip,
+        y = $severity,
+        n = e.count
+    )
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "yield preset parameter `$severity` can only be used inside a yield preset",
+    );
+}
+
+#[test]
 fn yield_preset_unknown_ref_is_rejected() {
     let input = r#"
 rule r {

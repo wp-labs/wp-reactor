@@ -36,15 +36,23 @@ pub enum EntityTypeVal {
 // Yield
 // ---------------------------------------------------------------------------
 
-/// `yield target[@vN] [: preset, ...] (name = expr, ...)`
+/// `yield target[@vN] [: preset[<args...>], ...] (name = expr, ...)`
 #[non_exhaustive]
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
 #[moju(kind = "struct", domain = "Lang", module = "Lang.LangClauses")]
 pub struct YieldClause {
     pub target: String,
     pub version: Option<u32>,
-    pub presets: Vec<String>,
+    pub presets: Vec<YieldPresetRef>,
     pub args: Vec<NamedArg>,
+}
+
+#[non_exhaustive]
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangClauses")]
+pub struct YieldPresetRef {
+    pub name: String,
+    pub args: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

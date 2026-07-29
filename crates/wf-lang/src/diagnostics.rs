@@ -495,8 +495,9 @@ fn find_referenced_yield_preset_location(
 ) -> Option<SourceLocation> {
     let rule = file.rules.iter().find(|rule| rule.name == rule_name)?;
     let lines: Vec<&str> = source.lines().collect();
-    for preset_name in rule.yield_clause.presets.iter().rev() {
-        if let Some((start_idx, end_idx)) = find_yield_preset_source_range(&lines, preset_name)
+    for preset_ref in rule.yield_clause.presets.iter().rev() {
+        if let Some((start_idx, end_idx)) =
+            find_yield_preset_source_range(source, &lines, &preset_ref.name)
             && let Some(location) =
                 find_named_arg_location(&lines, start_idx, end_idx, token_needles)
         {
@@ -506,17 +507,29 @@ fn find_referenced_yield_preset_location(
     None
 }
 
-fn find_yield_preset_source_range(lines: &[&str], preset_name: &str) -> Option<(usize, usize)> {
-    let start_idx = lines
+fn find_yield_preset_source_range(
+    source: &str,
+    lines: &[&str],
+    preset_name: &str,
+) -> Option<(usize, usize)> {
+    let decls = yield_preset_decl_locations(source);
+    let start_idx = decls
         .iter()
-        .position(|line| line_declares_yield_preset(line, preset_name))?;
+        .find(|decl| decl.name == preset_name)
+        .map(|decl| decl.line.saturating_sub(1))
+        .or_else(|| {
+            lines
+                .iter()
+                .position(|line| line_declares_yield_preset(line, preset_name))
+        })?;
     let end_idx = lines
         .iter()
         .enumerate()
         .skip(start_idx + 1)
         .find_map(|(idx, line)| {
             let trimmed = line.trim_start();
-            (line_starts_yield_preset_decl(line)
+            (decls.iter().any(|decl| decl.line == idx + 1)
+                || line_starts_yield_preset_decl(line)
                 || trimmed.starts_with("rule ")
                 || trimmed.starts_with("test ")
                 || trimmed.starts_with("pattern "))
@@ -574,6 +587,114 @@ fn yield_preset_decl_rest(line: &str) -> Option<&str> {
         return None;
     }
     Some(rest)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct YieldPresetDeclLocation {
+    name: String,
+    line: usize,
+}
+
+fn yield_preset_decl_locations(source: &str) -> Vec<YieldPresetDeclLocation> {
+    let bytes = source.as_bytes();
+    let mut locations = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = skip_quoted_string(source, i),
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                i = skip_line_comment(bytes, i);
+            }
+            b'y' => {
+                if let Some((name, _after_name)) = parse_yield_preset_decl_at(source, i) {
+                    let line = source_line(source, i);
+                    locations.push(YieldPresetDeclLocation { name, line });
+                    i += "yield".len();
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    locations
+}
+
+fn parse_yield_preset_decl_at(source: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = source.as_bytes();
+    let after_yield = keyword_at(bytes, start, b"yield")?;
+    let mut i = skip_ws_and_line_comments(bytes, after_yield);
+    i = keyword_at(bytes, i, b"preset")?;
+    i = skip_ws_and_line_comments(bytes, i);
+    if i >= bytes.len() || !is_ident_start_byte(bytes[i]) {
+        return None;
+    }
+    let name_start = i;
+    i += 1;
+    while i < bytes.len() && is_ident_byte(bytes[i]) {
+        i += 1;
+    }
+    Some((source[name_start..i].to_string(), i))
+}
+
+fn keyword_at(bytes: &[u8], start: usize, keyword: &[u8]) -> Option<usize> {
+    let end = start.checked_add(keyword.len())?;
+    if end > bytes.len() || &bytes[start..end] != keyword {
+        return None;
+    }
+    if (start > 0 && is_ident_byte(bytes[start - 1]))
+        || (end < bytes.len() && is_ident_byte(bytes[end]))
+    {
+        return None;
+    }
+    Some(end)
+}
+
+fn skip_ws_and_line_comments(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            i = skip_line_comment(bytes, i);
+        } else {
+            return i;
+        }
+    }
+}
+
+fn skip_quoted_string(source: &str, start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut i = start + 1;
+    while i < bytes.len() && bytes[i] != b'"' {
+        i += source[i..].chars().next().unwrap().len_utf8();
+    }
+    if i < bytes.len() { i + 1 } else { i }
+}
+
+fn skip_line_comment(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i] != b'\n' {
+        i += 1;
+    }
+    i
+}
+
+fn source_line(source: &str, offset: usize) -> usize {
+    let mut line = 1;
+    for byte in source.bytes().take(offset) {
+        if byte == b'\n' {
+            line += 1;
+        }
+    }
+    line
+}
+
+fn is_ident_start_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn rule_has_explicit_yield_arg(file: &WflFile, rule_name: &str, arg_name: &str) -> bool {
@@ -991,6 +1112,41 @@ rule preset_rule {
             "{text}"
         );
         assert!(text.contains("location: line 3, column 5"), "{text}");
+        assert!(text.contains("n = \"missing\""), "{text}");
+    }
+
+    #[test]
+    fn split_yield_preset_error_location_falls_back_to_preset_definition() {
+        let source = r#"
+yield // split header
+    preset
+    base_alerts (
+    n = "missing"
+)
+
+rule preset_rule {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base_alerts (
+        x = e.sip
+    )
+}
+"#;
+        let file = parse_wfl(source).unwrap();
+        let err = validate_wfl_with_diagnostics(
+            &file,
+            &[auth_events_window(), output_window()],
+            source,
+            "rules/preset_bad_type.wfl",
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("yield argument `n` is not a field in target window `out`"),
+            "{text}"
+        );
+        assert!(text.contains("location: line 5, column 5"), "{text}");
         assert!(text.contains("n = \"missing\""), "{text}");
     }
 

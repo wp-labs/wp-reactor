@@ -7,7 +7,7 @@
 //! string literals are passed through verbatim. Use `$$` to produce a literal
 //! `$` in code positions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[cfg(test)]
@@ -73,6 +73,16 @@ fn preprocess_impl(
     vars: &HashMap<String, String>,
     env_fallback: bool,
 ) -> Result<String, PreprocessError> {
+    preprocess_impl_with_preserved_bare_vars(source, vars, env_fallback, 0, None)
+}
+
+fn preprocess_impl_with_preserved_bare_vars(
+    source: &str,
+    vars: &HashMap<String, String>,
+    env_fallback: bool,
+    base_pos: usize,
+    preserve_bare_vars: Option<&HashSet<String>>,
+) -> Result<String, PreprocessError> {
     let bytes = source.as_bytes();
     let len = bytes.len();
     let mut out = String::with_capacity(len);
@@ -119,7 +129,7 @@ fn preprocess_impl(
                     // Read IDENT
                     if i >= len || !is_ident_start(bytes[i]) {
                         return Err(PreprocessError {
-                            position: dollar_pos,
+                            position: base_pos + dollar_pos,
                             message: "expected variable name after ${".to_string(),
                         });
                     }
@@ -143,7 +153,7 @@ fn preprocess_impl(
                     // Expect closing '}'
                     if i >= len || bytes[i] != b'}' {
                         return Err(PreprocessError {
-                            position: dollar_pos,
+                            position: base_pos + dollar_pos,
                             message: format!(
                                 "unterminated variable reference '${{{}' — missing '}}'",
                                 ident
@@ -162,7 +172,7 @@ fn preprocess_impl(
                             out.push_str(&val);
                         } else {
                             return Err(PreprocessError {
-                                position: dollar_pos,
+                                position: base_pos + dollar_pos,
                                 message: format!(
                                     "undefined variable '{}' (not in --var or environment)",
                                     ident
@@ -171,7 +181,7 @@ fn preprocess_impl(
                         }
                     } else {
                         return Err(PreprocessError {
-                            position: dollar_pos,
+                            position: base_pos + dollar_pos,
                             message: format!("undefined variable '{}'", ident),
                         });
                     }
@@ -183,14 +193,17 @@ fn preprocess_impl(
                     }
                     let ident = &source[ident_start..i];
 
-                    if let Some(val) = vars.get(ident) {
+                    if preserve_bare_vars.is_some_and(|names| names.contains(ident)) {
+                        out.push('$');
+                        out.push_str(ident);
+                    } else if let Some(val) = vars.get(ident) {
                         out.push_str(val);
                     } else if env_fallback {
                         if let Ok(val) = std::env::var(ident) {
                             out.push_str(&val);
                         } else {
                             return Err(PreprocessError {
-                                position: dollar_pos,
+                                position: base_pos + dollar_pos,
                                 message: format!(
                                     "undefined variable '{}' (not in --var or environment)",
                                     ident
@@ -199,7 +212,7 @@ fn preprocess_impl(
                         }
                     } else {
                         return Err(PreprocessError {
-                            position: dollar_pos,
+                            position: base_pos + dollar_pos,
                             message: format!("undefined variable '{}'", ident),
                         });
                     }
@@ -211,6 +224,20 @@ fn preprocess_impl(
 
             // --- Normal character ---
             _ => {
+                if preserve_bare_vars.is_none()
+                    && bytes[i] == b'y'
+                    && try_preprocess_yield_preset_decl(
+                        source,
+                        &mut i,
+                        &mut out,
+                        vars,
+                        env_fallback,
+                        base_pos,
+                    )?
+                {
+                    continue;
+                }
+
                 // --- Pattern block: skip verbatim (avoid ${param} conflict) ---
                 if bytes[i] == b'p' && try_skip_pattern_block(source, &mut i, &mut out) {
                     continue;
@@ -232,6 +259,292 @@ fn is_ident_start(b: u8) -> bool {
 
 fn is_ident_cont(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn try_preprocess_yield_preset_decl(
+    source: &str,
+    pos: &mut usize,
+    out: &mut String,
+    vars: &HashMap<String, String>,
+    env_fallback: bool,
+    base_pos: usize,
+) -> Result<bool, PreprocessError> {
+    let start = *pos;
+    let Some((params_start, params_end, body_end)) = yield_preset_decl_range(source, start) else {
+        return Ok(false);
+    };
+
+    let params = if let Some((params_start, params_end)) = params_start.zip(params_end) {
+        extract_yield_preset_param_names(&source[params_start..params_end])
+    } else {
+        HashSet::new()
+    };
+    let segment = &source[start..body_end];
+    let processed = preprocess_impl_with_preserved_bare_vars(
+        segment,
+        vars,
+        env_fallback,
+        base_pos + start,
+        Some(&params),
+    )?;
+    out.push_str(&processed);
+    *pos = body_end;
+    Ok(true)
+}
+
+fn yield_preset_decl_range(
+    source: &str,
+    start: usize,
+) -> Option<(Option<usize>, Option<usize>, usize)> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let yield_kw = b"yield";
+    let preset_kw = b"preset";
+
+    if start + yield_kw.len() > len || &bytes[start..start + yield_kw.len()] != yield_kw {
+        return None;
+    }
+    let after_yield = start + yield_kw.len();
+    if (start > 0 && is_ident_cont(bytes[start - 1]))
+        || (after_yield < len && is_ident_cont(bytes[after_yield]))
+    {
+        return None;
+    }
+    let mut i = after_yield;
+    i = skip_ws_and_line_comments(bytes, i);
+
+    if i + preset_kw.len() > len || &bytes[i..i + preset_kw.len()] != preset_kw {
+        return None;
+    }
+    let after_preset = i + preset_kw.len();
+    if after_preset < len && is_ident_cont(bytes[after_preset]) {
+        return None;
+    }
+    i = after_preset;
+    i = skip_ws_and_line_comments(bytes, i);
+
+    if i >= len || !is_ident_start(bytes[i]) {
+        return None;
+    }
+    while i < len && is_ident_cont(bytes[i]) {
+        i += 1;
+    }
+    i = skip_ws_and_line_comments(bytes, i);
+
+    let (params_start, params_end) = if i < len && bytes[i] == b'<' {
+        let inner_start = i + 1;
+        let inner_end = find_matching_angle(source, i)?;
+        i = skip_ws_and_line_comments(bytes, inner_end + 1);
+        (Some(inner_start), Some(inner_end))
+    } else {
+        (None, None)
+    };
+
+    if i >= len || bytes[i] != b'(' {
+        return None;
+    }
+    let body_end = find_matching_paren(source, i)? + 1;
+    Some((params_start, params_end, body_end))
+}
+
+fn extract_yield_preset_param_names(params: &str) -> HashSet<String> {
+    let bytes = params.as_bytes();
+    let mut names = HashSet::new();
+    let mut i = 0;
+    let len = bytes.len();
+
+    while i < len {
+        i = skip_ws_and_line_comments(bytes, i);
+        if i >= len {
+            break;
+        }
+        if is_ident_start(bytes[i]) {
+            let ident_start = i;
+            i += 1;
+            while i < len && is_ident_cont(bytes[i]) {
+                i += 1;
+            }
+            names.insert(params[ident_start..i].to_string());
+        }
+        i = skip_param_default_or_separator(params, i);
+        if i < len && bytes[i] == b',' {
+            i += 1;
+        }
+    }
+
+    names
+}
+
+fn skip_param_default_or_separator(source: &str, mut i: usize) -> usize {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+
+    while i < len {
+        match bytes[i] {
+            b'"' => i = skip_string(source, i),
+            b'/' if i + 1 < len && bytes[i + 1] == b'/' => i = skip_line_comment(bytes, i),
+            b'(' => {
+                paren_depth += 1;
+                i += 1;
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                i += 1;
+            }
+            b'[' => {
+                bracket_depth += 1;
+                i += 1;
+            }
+            b']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                i += 1;
+            }
+            b'{' => {
+                brace_depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                i += 1;
+            }
+            b',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => break,
+            _ => i += 1,
+        }
+    }
+
+    i
+}
+
+fn find_matching_angle(source: &str, open: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut i = open + 1;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    while i < len {
+        match bytes[i] {
+            b'"' => i = skip_string(source, i),
+            b'/' if i + 1 < len && bytes[i + 1] == b'/' => i = skip_line_comment(bytes, i),
+            b'(' => {
+                paren_depth += 1;
+                i += 1;
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                i += 1;
+            }
+            b'[' => {
+                bracket_depth += 1;
+                i += 1;
+            }
+            b']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                i += 1;
+            }
+            b'{' => {
+                brace_depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                i += 1;
+            }
+            b'>' if paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && starts_named_args_parens(&source[i + 1..]) =>
+            {
+                return Some(i);
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn find_matching_paren(source: &str, open: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut i = open + 1;
+    let mut depth = 1usize;
+    while i < len {
+        match bytes[i] {
+            b'"' => i = skip_string(source, i),
+            b'/' if i + 1 < len && bytes[i + 1] == b'/' => i = skip_line_comment(bytes, i),
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn skip_ws_and_line_comments(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        i = skip_ws(bytes, i);
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            i = skip_line_comment(bytes, i);
+        } else {
+            return i;
+        }
+    }
+}
+
+fn starts_named_args_parens(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut i = skip_ws_and_line_comments(bytes, 0);
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return false;
+    }
+    i += 1;
+    i = skip_ws_and_line_comments(bytes, i);
+    if i < bytes.len() && bytes[i] == b')' {
+        return true;
+    }
+    if i >= bytes.len() || !is_ident_start(bytes[i]) {
+        return false;
+    }
+    while i < bytes.len() && is_ident_cont(bytes[i]) {
+        i += 1;
+    }
+    i = skip_ws_and_line_comments(bytes, i);
+    i < bytes.len() && bytes[i] == b'='
+}
+
+fn skip_string(source: &str, start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut i = start + 1;
+    while i < bytes.len() && bytes[i] != b'"' {
+        i += source[i..].chars().next().unwrap().len_utf8();
+    }
+    if i < bytes.len() { i + 1 } else { i }
+}
+
+fn skip_line_comment(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i] != b'\n' {
+        i += 1;
+    }
+    i
 }
 
 /// Detect a `pattern name(...) { ... }` block at position `i`.

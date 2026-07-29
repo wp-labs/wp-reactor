@@ -101,6 +101,8 @@ pub enum Expr {
     WfuMeta(WfuMetaField),
     /// Field reference.
     Field(FieldRef),
+    /// Parameter reference inside a parameterized yield preset body, e.g. `$severity`.
+    PresetParam(String),
     /// Binary operation.
     BinOp {
         op: BinOp,

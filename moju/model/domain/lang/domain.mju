@@ -463,6 +463,7 @@ state Expr {
   SystemVar
   WfuMeta
   Field
+  PresetParam
   BinOp
   Neg
   FuncCall
@@ -511,8 +512,13 @@ state EntityTypeVal {
 struct YieldClause {
   target: String
   version: Int?
-  presets: List<String>
+  presets: List<YieldPresetRef>
   args: List<NamedArg>
+}
+
+struct YieldPresetRef {
+  name: String
+  args: List<Expr>
 }
 
 struct NamedArg {
@@ -522,7 +528,13 @@ struct NamedArg {
 
 struct YieldPresetDecl {
   name: String
+  params: List<YieldPresetParam>
   args: List<NamedArg>
+}
+
+struct YieldPresetParam {
+  name: String
+  default: Expr?
 }
 
 struct PatternOrigin {

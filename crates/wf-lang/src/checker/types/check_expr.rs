@@ -357,6 +357,16 @@ fn check_expr_type_inner(
                 });
             }
         }
+        Expr::PresetParam(name) => {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: format!(
+                    "yield preset parameter `${name}` can only be used inside a yield preset"
+                ),
+            });
+        }
         Expr::Number(_)
         | Expr::StringLit(_)
         | Expr::Bool(_)

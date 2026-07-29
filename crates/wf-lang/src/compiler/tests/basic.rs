@@ -119,6 +119,40 @@ rule preset_rule {
 }
 
 #[test]
+fn compile_parameterized_yield_preset_expands_args_and_defaults() {
+    let schemas = [auth_events_window(), output_window()];
+    let plans = compile_with(
+        r#"
+yield preset base_alerts <severity, count = 1> (
+    x = e.sip,
+    y = $severity,
+    n = $count
+)
+
+rule preset_rule {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out : base_alerts<"high"> ()
+}
+"#,
+        &schemas,
+    );
+    assert_eq!(plans.len(), 1);
+    let fields = &plans[0].yield_plan.fields;
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0].name, "x");
+    assert_eq!(
+        fields[0].value,
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))
+    );
+    assert_eq!(fields[1].name, "y");
+    assert_eq!(fields[1].value, Expr::StringLit("high".into()));
+    assert_eq!(fields[2].name, "n");
+    assert_eq!(fields[2].value, Expr::Number(1.0));
+}
+
+#[test]
 fn compile_yield_preset_can_supply_empty_yield_body() {
     let schemas = [auth_events_window(), output_window()];
     let plans = compile_with(

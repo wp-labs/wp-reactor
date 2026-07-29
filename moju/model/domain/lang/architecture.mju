@@ -12,7 +12,7 @@ module LangSchema {
 
 module LangRule {
   layer DataFusion
-  owns WflFile, UseDecl, PatternDecl, RuleDecl, MetaBlock, MetaEntry, PipelineStage, EventsBlock, EventDecl, YieldPresetDecl, PatternOrigin
+  owns WflFile, UseDecl, PatternDecl, RuleDecl, MetaBlock, MetaEntry, PipelineStage, EventsBlock, EventDecl, YieldPresetDecl, YieldPresetParam, PatternOrigin
 
   responsible_for "WFL rule file structure — rule declarations, metadata, events, and pipeline stages"
 }
@@ -43,7 +43,7 @@ module LangExpr {
 
 module LangClauses {
   layer DataFusion
-  owns ScoreExpr, EntityClause, EntityTypeVal, YieldClause, YieldField, NamedArg, LimitsBlock, LimitItem
+  owns ScoreExpr, EntityClause, EntityTypeVal, YieldClause, YieldPresetRef, YieldField, NamedArg, LimitsBlock, LimitItem
 
   responsible_for "WFL clause AST — scoring, entity extraction, yield output, and rate limiting"
 }
