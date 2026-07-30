@@ -243,27 +243,22 @@ impl Visit for DomainExtractor {
 /// Returns an optional [`WorkerGuard`] that **must** be held until the process
 /// exits — dropping it flushes and closes the non-blocking file writer.
 ///
-/// Precedence: `RUST_LOG` env-var overrides all config-driven directives.
+/// The `[logging]` config is the single source of truth for log level:
+/// `level` is the global floor and `modules` are per-target overrides.
+/// `RUST_LOG` is intentionally **not** consulted — a leaked/stale env var
+/// must not silently override the operator's configured level. Operators who
+/// need finer control should use `[logging].modules` (e.g.
+/// `wf_runtime::receiver = "debug"`).
 ///
 /// The `log` → `tracing` bridge is set up automatically by
 /// `tracing-subscriber`'s default `tracing-log` feature.
 pub fn init_tracing(config: &LoggingConfig, base_dir: &Path) -> RuntimeResult<Option<WorkerGuard>> {
-    // 1. Build EnvFilter ------------------------------------------------
-    let filter = if std::env::var("RUST_LOG").is_ok() {
-        EnvFilter::from_default_env()
-    } else {
-        let mut directives = config.level.clone();
-        for (module, level) in &config.modules {
-            directives.push(',');
-            directives.push_str(module);
-            directives.push('=');
-            directives.push_str(level);
-        }
-        EnvFilter::try_new(&directives).source_raw_err(
-            RuntimeReason::Bootstrap,
-            format!("invalid log filter '{directives}'"),
-        )?
-    };
+    // 1. Build EnvFilter from config (level + per-module overrides) --------
+    let directives = filter_directives(config);
+    let filter = EnvFilter::try_new(&directives).source_raw_err(
+        RuntimeReason::Bootstrap,
+        format!("invalid log filter '{directives}'"),
+    )?;
 
     // 2. stderr + optional file layer -----------------------------------
     let mut guard: Option<WorkerGuard> = None;
@@ -351,4 +346,67 @@ pub fn init_tracing(config: &LoggingConfig, base_dir: &Path) -> RuntimeResult<Op
     }
 
     Ok(guard)
+}
+
+/// Build the `EnvFilter` directive string from [`LoggingConfig`].
+///
+/// `<global level>[,<module>=<level>...]` — the global `level` first, then
+/// one `module=level` clause per `[logging].modules` entry. Pure so it can be
+/// unit-tested without touching global subscriber state.
+fn filter_directives(config: &LoggingConfig) -> String {
+    let mut directives = config.level.clone();
+    for (module, level) in &config.modules {
+        directives.push(',');
+        directives.push_str(module);
+        directives.push('=');
+        directives.push_str(level);
+    }
+    directives
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn cfg(level: &str, modules: &[(&str, &str)]) -> LoggingConfig {
+        LoggingConfig {
+            level: level.to_string(),
+            modules: modules
+                .iter()
+                .map(|(m, l)| (m.to_string(), l.to_string()))
+                .collect::<HashMap<_, _>>(),
+            file: None,
+            format: LogFormat::Plain,
+        }
+    }
+
+    #[test]
+    fn directives_global_level_only() {
+        assert_eq!(filter_directives(&cfg("info", &[])), "info");
+    }
+
+    #[test]
+    fn directives_append_module_overrides() {
+        // HashMap order is unspecified, so check both possible orderings.
+        let d = filter_directives(&cfg("info", &[("wf_runtime::receiver", "debug")]));
+        assert_eq!(d, "info,wf_runtime::receiver=debug");
+    }
+
+    #[test]
+    fn directives_multiple_modules_all_present() {
+        let d = filter_directives(&cfg("warn", &[("a", "debug"), ("b", "trace")]));
+        assert!(d.starts_with("warn,"));
+        assert!(d.contains("a=debug"));
+        assert!(d.contains("b=trace"));
+    }
+
+    /// Config is the authority: `init_tracing` must never read `RUST_LOG`.
+    /// The helper is purely a function of config, so the directives are
+    /// independent of the process environment.
+    #[test]
+    fn directives_ignore_rust_log_env() {
+        let d = filter_directives(&cfg("info", &[]));
+        assert_eq!(d, "info");
+    }
 }
