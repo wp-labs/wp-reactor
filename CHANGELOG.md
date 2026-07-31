@@ -2,6 +2,12 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [0.1.40 Unreleased]
+
+### Fixed
+
+- **wf-config / wf-runtime**: Added `[metrics] console_output` (default `true`) and gated the periodic `res`-domain metrics summary (`metrics snapshot`, interval table, and shutdown run-summary table) behind it. Previously `MetricsConfig` had no `console_output` field, so `console_output = false` was silently dropped by serde and the statistics log could not be disabled. Prometheus export, monitor-channel snapshots, and Top-N collection run regardless of the flag. (wp-labs/warp-fusion#61)
+
 ## [0.1.37 Unreleased]
 
 ### Changed

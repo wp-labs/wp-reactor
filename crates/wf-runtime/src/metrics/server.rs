@@ -33,11 +33,17 @@ pub async fn run_metrics_task(
             _ = cancel.cancelled() => break,
             _ = tick.tick() => {
                 metrics.sample_windows(&router);
-                wf_info!(res, summary = %metrics.summary_line(), "metrics snapshot");
+                // #61: console_output gates the periodic `res`-domain
+                // summary log. prometheus export + Top-N run regardless.
+                if config.console_output {
+                    wf_info!(res, summary = %metrics.summary_line(), "metrics snapshot");
+                }
                 let curr = metrics.interval_snapshot(Instant::now());
                 if let Some(rates) = metrics.interval_rates(prev, curr) {
                     run_summary.observe(rates);
-                    wf_info!(res, "{}", metrics.interval_table(rates));
+                    if config.console_output {
+                        wf_info!(res, "{}", metrics.interval_table(rates));
+                    }
                 }
                 prev = curr;
 
@@ -68,7 +74,9 @@ pub async fn run_metrics_task(
         sm_delta: final_snap.rule_instances as i64 - start.rule_instances as i64,
     };
 
-    if let Some(table) = run_summary.table(Some(totals)) {
+    if config.console_output
+        && let Some(table) = run_summary.table(Some(totals))
+    {
         wf_info!(
             res,
             runtime = ?task_started.elapsed(),
