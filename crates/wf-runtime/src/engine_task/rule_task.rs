@@ -97,6 +97,11 @@ pub(super) struct RuleTask {
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
     intermediate_targets: HashSet<String>,
+    /// Wall clock when events were last processed. When input goes idle, this
+    /// stays put so the periodic timeout scan can advance the effective watermark
+    /// by the elapsed wall time — letting instances expire per their window TTL
+    /// even without new events (window semantics, not just event-time).
+    last_activity_wall: std::time::Instant,
 }
 
 impl RuleTask {
@@ -170,6 +175,7 @@ impl RuleTask {
             router,
             metrics,
             intermediate_targets,
+            last_activity_wall: std::time::Instant::now(),
         };
         (task, cancel, timeout_scan_interval)
     }
@@ -260,6 +266,11 @@ impl RuleTask {
                 }
                 if let Some(metrics) = &self.metrics {
                     metrics.add_rule_events(self.executor.plan().name.as_str(), events.len());
+                }
+                // Track the last wall-clock moment events were processed, so the
+                // periodic timeout scan can advance the watermark across idle gaps.
+                if !events.is_empty() {
+                    self.last_activity_wall = std::time::Instant::now();
                 }
                 let lookup = RegistryLookup(&self.router);
                 for (row_index, event) in events.iter().enumerate() {
@@ -644,17 +655,22 @@ impl RuleTask {
 
     /// Scan for expired state machine instances and emit alerts.
     pub(super) async fn scan_timeouts(&mut self) {
-        let Some(_) = &self.machine else {
+        let Some(machine) = &self.machine else {
             return;
         };
+        // Advance the effective watermark by the wall-clock time elapsed since the
+        // last event was processed. This lets instances expire per their window TTL
+        // even when input is completely idle (window semantics, not just event-time).
+        let effective_watermark = machine
+            .watermark_nanos()
+            .saturating_add(self.last_activity_wall.elapsed().as_nanos() as i64);
         let started = Instant::now();
         let lookup = RegistryLookup(&self.router);
         let (rule_name, closes) = {
             let machine = self.machine.as_mut().expect("checked above");
             (
                 machine.rule_name().to_string(),
-                machine
-                    .scan_expired_at_with_conv(machine.watermark_nanos(), self.conv_plan.as_ref()),
+                machine.scan_expired_at_with_conv(effective_watermark, self.conv_plan.as_ref()),
             )
         };
         let mut stats = RuleBatchDebugStats::default();

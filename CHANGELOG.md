@@ -25,6 +25,7 @@ All notable changes to wp-reactor will be documented in this file.
 - **wf-engine**: A negative `within` gap (an out-of-order completion where a step completes before its predecessor) is now treated as a violation.
 - **wf-engine**: `consec`-break and `within`-violation resets preserve the negation-violation flag, so an in-window violation cannot be wiped and the chain re-fire.
 - **wf-engine**: `on event any` throttle handling now honors `on_exceed = fail_rule` (previously it was silently downgraded to throttle).
+- **wf-runtime**: The periodic timeout scan now advances the effective watermark by the wall-clock time elapsed since the last event was processed (`watermark + idle wall time`). Instances therefore expire per their window TTL even when input is completely idle, instead of lingering until a new event advances the watermark (conforms to the window's time-based semantics).
 
 ### Performance
 
