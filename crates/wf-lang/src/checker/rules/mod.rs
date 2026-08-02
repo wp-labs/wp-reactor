@@ -325,16 +325,16 @@ fn check_seq(
                 .to_string(),
         });
     }
-    if let Some(first) = seq.steps.first() {
-        if first.neg {
-            errors.push(CheckError {
-                severity: Severity::Warning,
-                rule: Some(rule_name.to_string()),
-                test: None,
-                message: "`not` as the first chain step anchors to the window start; verify intent"
-                    .to_string(),
-            });
-        }
+    if let Some(first) = seq.steps.first()
+        && first.neg
+    {
+        errors.push(CheckError {
+            severity: Severity::Warning,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: "`not` as the first chain step anchors to the window start; verify intent"
+                .to_string(),
+        });
     }
     for (i, step) in seq.steps.iter().enumerate() {
         if let Some(w) = step.within

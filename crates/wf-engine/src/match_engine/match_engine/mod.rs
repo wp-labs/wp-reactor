@@ -554,7 +554,7 @@ impl CepStateMachine {
                     .get(step_idx)
                     .copied()
                     .flatten()
-                    .map_or(false, |w| {
+                    .is_some_and(|w| {
                         // Completion time = the event that completed the step
                         // (`event_last_time_nanos`). For aggregate steps this differs
                         // from `event_first_time_nanos` (threshold-met time, not

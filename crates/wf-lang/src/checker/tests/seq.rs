@@ -7,7 +7,7 @@ fn chain_check(input: &str, schemas: &[WindowSchema]) -> Vec<crate::checker::Che
     check_wfl(&file, schemas)
 }
 
-fn all_errors<'a>(errs: &'a [crate::checker::CheckError]) -> impl Iterator<Item = &'a str> {
+fn all_errors(errs: &[crate::checker::CheckError]) -> impl Iterator<Item = &str> {
     errs.iter()
         .filter(|e| e.severity == Severity::Error)
         .map(|e| e.message.as_str())
