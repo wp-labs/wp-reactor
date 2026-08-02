@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::ast::{CloseMode, CmpOp, Expr, FieldRef, FieldSelector, JoinMode, MatchMode, Measure, Transform};
+use crate::ast::{
+    CloseMode, CmpOp, Expr, FieldRef, FieldSelector, JoinMode, MatchMode, Measure, Transform,
+};
 
 // ---------------------------------------------------------------------------
 // ExprPlan — L1 alias for ast::Expr

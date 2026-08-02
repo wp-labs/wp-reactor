@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use wf_lang::ast::MatchMode;
-use wf_lang::plan::{MatchPlan, SeqPlan, SeqSkipPlan, SeqStepPlan};
 use wf_lang::plan::WindowSpec;
+use wf_lang::plan::{MatchPlan, SeqPlan, SeqSkipPlan, SeqStepPlan};
 
 use crate::match_engine::match_engine::{CepStateMachine, StepResult};
 
@@ -23,8 +23,16 @@ fn chain_plan(login_within: Option<Duration>) -> MatchPlan {
         consec: false,
         skip: SeqSkipPlan::PastLast,
         steps: vec![
-            SeqStepPlan { neg: false, within: None, branch: branch("scan", count_ge(1.0)) },
-            SeqStepPlan { neg: false, within: login_within, branch: branch("login", count_ge(1.0)) },
+            SeqStepPlan {
+                neg: false,
+                within: None,
+                branch: branch("scan", count_ge(1.0)),
+            },
+            SeqStepPlan {
+                neg: false,
+                within: login_within,
+                branch: branch("login", count_ge(1.0)),
+            },
         ],
     });
     plan
@@ -70,9 +78,21 @@ fn neg_plan() -> MatchPlan {
         consec: false,
         skip: SeqSkipPlan::PastLast,
         steps: vec![
-            SeqStepPlan { neg: false, within: None, branch: branch("scan", count_ge(1.0)) },
-            SeqStepPlan { neg: true, within: Some(Duration::from_secs(300)), branch: branch("fail", count_ge(1.0)) },
-            SeqStepPlan { neg: false, within: None, branch: branch("login", count_ge(1.0)) },
+            SeqStepPlan {
+                neg: false,
+                within: None,
+                branch: branch("scan", count_ge(1.0)),
+            },
+            SeqStepPlan {
+                neg: true,
+                within: Some(Duration::from_secs(300)),
+                branch: branch("fail", count_ge(1.0)),
+            },
+            SeqStepPlan {
+                neg: false,
+                within: None,
+                branch: branch("login", count_ge(1.0)),
+            },
         ],
     });
     plan
@@ -85,7 +105,10 @@ fn negation_violated_suppresses() {
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
     assert_eq!(sm.advance_at("scan", &e, 0), StepResult::Advance);
     // fail within 5m of scan → violation
-    assert_eq!(sm.advance_at("fail", &e, 60_000_000_000), StepResult::Accumulate);
+    assert_eq!(
+        sm.advance_at("fail", &e, 60_000_000_000),
+        StepResult::Accumulate
+    );
     // login completes the chain → suppressed by negation
     assert_eq!(
         sm.advance_at("login", &e, 120_000_000_000),
@@ -120,8 +143,16 @@ fn consec_plan() -> MatchPlan {
         consec: true,
         skip: SeqSkipPlan::PastLast,
         steps: vec![
-            SeqStepPlan { neg: false, within: None, branch: branch("scan", count_ge(1.0)) },
-            SeqStepPlan { neg: false, within: None, branch: branch("login", count_ge(1.0)) },
+            SeqStepPlan {
+                neg: false,
+                within: None,
+                branch: branch("scan", count_ge(1.0)),
+            },
+            SeqStepPlan {
+                neg: false,
+                within: None,
+                branch: branch("login", count_ge(1.0)),
+            },
         ],
     });
     plan
@@ -175,8 +206,16 @@ fn consec_not_first_plan() -> MatchPlan {
         consec: true,
         skip: SeqSkipPlan::PastLast,
         steps: vec![
-            SeqStepPlan { neg: true, within: Some(Duration::from_secs(300)), branch: branch("a", count_ge(1.0)) },
-            SeqStepPlan { neg: false, within: None, branch: branch("b", count_ge(1.0)) },
+            SeqStepPlan {
+                neg: true,
+                within: Some(Duration::from_secs(300)),
+                branch: branch("a", count_ge(1.0)),
+            },
+            SeqStepPlan {
+                neg: false,
+                within: None,
+                branch: branch("b", count_ge(1.0)),
+            },
         ],
     });
     plan
@@ -220,9 +259,21 @@ fn within_neg_plan() -> MatchPlan {
         consec: false,
         skip: SeqSkipPlan::PastLast,
         steps: vec![
-            SeqStepPlan { neg: false, within: None, branch: branch("a", count_ge(1.0)) },
-            SeqStepPlan { neg: true, within: Some(Duration::from_secs(300)), branch: branch("c", count_ge(1.0)) },
-            SeqStepPlan { neg: false, within: Some(Duration::from_secs(600)), branch: branch("b", count_ge(1.0)) },
+            SeqStepPlan {
+                neg: false,
+                within: None,
+                branch: branch("a", count_ge(1.0)),
+            },
+            SeqStepPlan {
+                neg: true,
+                within: Some(Duration::from_secs(300)),
+                branch: branch("c", count_ge(1.0)),
+            },
+            SeqStepPlan {
+                neg: false,
+                within: Some(Duration::from_secs(600)),
+                branch: branch("b", count_ge(1.0)),
+            },
         ],
     });
     plan

@@ -112,7 +112,10 @@ fn seq_vs_any_throughput_ratio_bounded() {
         &events,
     );
     let ratio = any_time.as_secs_f64() / seq_time.as_secs_f64();
-    eprintln!("  seq={:?} any={:?} ratio={:.2}x", seq_time, any_time, ratio);
+    eprintln!(
+        "  seq={:?} any={:?} ratio={:.2}x",
+        seq_time, any_time, ratio
+    );
     assert!(
         ratio < 8.0,
         "any-mode overhead too high: {:.2}x (seq {:?} vs any {:?})",
@@ -171,8 +174,15 @@ fn plain_on_event_acts_as_seq() {
         &events,
     );
     let ratio = plain_time.as_secs_f64() / seq_time.as_secs_f64();
-    eprintln!("  bare-vs-seq={:?}/{:?}={:.2}x", plain_time, seq_time, ratio);
-    assert!(ratio < 3.0, "bare on event much slower than seq: {:.2}x", ratio);
+    eprintln!(
+        "  bare-vs-seq={:?}/{:?}={:.2}x",
+        plain_time, seq_time, ratio
+    );
+    assert!(
+        ratio < 3.0,
+        "bare on event much slower than seq: {:.2}x",
+        ratio
+    );
 }
 
 /// Build a plan where every step needs `threshold` matching events.
@@ -228,11 +238,19 @@ fn any_accumulating_steps_overhead_quantified() {
     let events = build_interleaved(n, rounds);
 
     let (_, seq_time) = feed(
-        &mut CepStateMachine::new("perf_acc_seq".into(), threshold_plan(n, 100.0, MatchMode::Seq), None),
+        &mut CepStateMachine::new(
+            "perf_acc_seq".into(),
+            threshold_plan(n, 100.0, MatchMode::Seq),
+            None,
+        ),
         &events,
     );
     let (_, any_time) = feed(
-        &mut CepStateMachine::new("perf_acc_any".into(), threshold_plan(n, 100.0, MatchMode::Any), None),
+        &mut CepStateMachine::new(
+            "perf_acc_any".into(),
+            threshold_plan(n, 100.0, MatchMode::Any),
+            None,
+        ),
         &events,
     );
     let ratio = any_time.as_secs_f64() / seq_time.as_secs_f64();
@@ -242,7 +260,11 @@ fn any_accumulating_steps_overhead_quantified() {
     );
     // Expected ~N=5x for the accumulating phase; bound generously to catch
     // accidental super-linear blowup (e.g. O(N^2)).
-    assert!(ratio < 15.0, "accumulating-phase any overhead too high: {:.2}x", ratio);
+    assert!(
+        ratio < 15.0,
+        "accumulating-phase any overhead too high: {:.2}x",
+        ratio
+    );
 }
 
 /// A RulePlan with `n` binds (aliases a0..a{n-1}), no filters.
@@ -344,7 +366,12 @@ fn bind_crossover_diagnosis() {
         // Linear
         let start = Instant::now();
         for _ in 0..rounds {
-            std::hint::black_box(plan.binds.iter().find(|b| b.alias == last).and_then(|b| b.filter.as_ref()));
+            std::hint::black_box(
+                plan.binds
+                    .iter()
+                    .find(|b| b.alias == last)
+                    .and_then(|b| b.filter.as_ref()),
+            );
         }
         let lin = start.elapsed();
         // Map
@@ -421,10 +448,10 @@ fn alert_build_throughput() {
 fn batch_to_events_ingest_throughput() {
     // Arrow RecordBatch → Vec<Event> conversion (the receiver/window ingest path).
     // Each event allocates a HashMap — quantifies the ingest cost per row.
-    use std::sync::Arc;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
     let rows = 10_000usize;
     let schema = Arc::new(Schema::new(vec![

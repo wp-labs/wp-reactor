@@ -1,4 +1,3 @@
-mod seq;
 mod contracts;
 mod conv;
 mod edge_cases;
@@ -9,6 +8,7 @@ mod limits;
 mod on_each;
 mod pipeline;
 mod scope;
+mod seq;
 mod t14_t51;
 mod t5_threshold;
 mod type_check;

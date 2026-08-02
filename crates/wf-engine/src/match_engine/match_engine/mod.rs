@@ -1,8 +1,8 @@
-mod seq;
 mod close;
 mod conv;
 mod eval;
 mod key;
+mod seq;
 mod state;
 mod step;
 mod types;
@@ -28,9 +28,9 @@ use std::collections::{BinaryHeap, HashMap};
 use wf_lang::ast::CloseMode;
 use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, WindowSpec};
 
-use seq::{SeqRuntime, consec_broken, scan_negations};
 use close::{accumulate_close_steps, evaluate_close, evidence_time_range};
 use key::{InstanceKey, extract_key, make_scope_key_str};
+use seq::{SeqRuntime, consec_broken, scan_negations};
 use state::{AliasState, Instance, snapshot_bind_data};
 use step::{
     StepEvaluationInput, StepProgressCapture, collect_alias_event, evaluate_step_with_progress,
@@ -574,7 +574,7 @@ impl CepStateMachine {
                         // The gap must be non-negative and within `w`: an
                         // out-of-order completion (this before prev) violates
                         // "within" just as a gap that is too large does.
-                                                let gap = this_last - prev_last;
+                        let gap = this_last - prev_last;
                         gap < 0 || gap > w.as_nanos() as i64
                     })
             } else {

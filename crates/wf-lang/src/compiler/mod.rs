@@ -283,7 +283,8 @@ fn compile_match(mc: &MatchClause, inject_implicit_stage_labels: bool) -> MatchP
             // Chain rules: emit ordered use-steps into event_steps so the existing
             // ordered progression + fire-and-reset machinery drives execution.
             // Negation steps are excluded here (enforced via SeqPlan in L2).
-            chain.steps
+            chain
+                .steps
                 .iter()
                 .filter(|s| !s.neg)
                 .map(|s| StepPlan {

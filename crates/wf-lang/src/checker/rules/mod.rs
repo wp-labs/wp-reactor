@@ -12,8 +12,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::ast::{
-    SeqClause, SeqSkip, EachClause, Expr, FieldRef, MatchClause, Measure, PipelineStage,
-    RuleDecl,
+    EachClause, Expr, FieldRef, MatchClause, Measure, PipelineStage, RuleDecl, SeqClause, SeqSkip,
 };
 use crate::checker::scope::{Scope, StatLabelInfo, StatLabelStage};
 use crate::checker::types::{ValType, check_expr_type, infer_type};

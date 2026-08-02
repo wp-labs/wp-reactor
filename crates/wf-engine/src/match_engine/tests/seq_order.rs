@@ -15,10 +15,7 @@ fn two_step_plan() -> Vec<wf_lang::plan::StepPlan> {
 
 #[test]
 fn existing_engine_is_sequential() {
-    let plan = simple_plan(
-        vec![simple_key("sip")],
-        two_step_plan(),
-    );
+    let plan = simple_plan(vec![simple_key("sip")], two_step_plan());
     let mut sm = CepStateMachine::new("seq_check".to_string(), plan, None);
 
     let login = event(vec![("sip", str_val("10.0.0.1"))]);
@@ -39,10 +36,7 @@ fn existing_engine_is_sequential() {
 
 #[test]
 fn scan_then_login_fires() {
-    let plan = simple_plan(
-        vec![simple_key("sip")],
-        two_step_plan(),
-    );
+    let plan = simple_plan(vec![simple_key("sip")], two_step_plan());
     let mut sm = CepStateMachine::new("seq_check2".to_string(), plan, None);
 
     let scan = event(vec![("sip", str_val("10.0.0.1"))]);

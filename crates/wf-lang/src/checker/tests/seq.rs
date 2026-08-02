@@ -33,7 +33,11 @@ rule chain_ok {
 "#;
     let errs = chain_check(
         src,
-        &[auth_events_window(), fw_events_window(), security_alerts_window()],
+        &[
+            auth_events_window(),
+            fw_events_window(),
+            security_alerts_window(),
+        ],
     );
     let errors: Vec<_> = all_errors(&errs).collect();
     assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
@@ -85,7 +89,11 @@ rule chain_within_too_big {
 "#;
     let errs = chain_check(
         src,
-        &[auth_events_window(), fw_events_window(), security_alerts_window()],
+        &[
+            auth_events_window(),
+            fw_events_window(),
+            security_alerts_window(),
+        ],
     );
     assert!(
         errs.iter().any(|e| {
@@ -146,7 +154,9 @@ rule chain_not_agg {
     let errs = chain_check(src, &[fw_events_window(), security_alerts_window()]);
     let errors: Vec<_> = all_errors(&errs).collect();
     assert!(
-        errors.iter().any(|m| m.contains("references a field aggregation")),
+        errors
+            .iter()
+            .any(|m| m.contains("references a field aggregation")),
         "expected aggregate-negation error, got: {:?}",
         errors
     );
@@ -170,7 +180,8 @@ rule chain_to_next {
 "#;
     let errs = chain_check(src, &[fw_events_window(), security_alerts_window()]);
     assert!(
-        errs.iter().any(|e| e.severity == Severity::Warning && e.message.contains("to_next")),
+        errs.iter()
+            .any(|e| e.severity == Severity::Warning && e.message.contains("to_next")),
         "expected to_next warning, got: {:?}",
         errs
     );

@@ -1,8 +1,8 @@
-mod seq_examples;
 mod any_l2;
-mod seq_l2;
 mod helpers;
 mod perf;
+mod seq_examples;
+mod seq_l2;
 
 mod cep_core;
 mod close;

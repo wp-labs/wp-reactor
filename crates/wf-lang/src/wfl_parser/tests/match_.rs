@@ -526,5 +526,8 @@ rule bad_any {
     yield out (x = "y")
 }
 "#;
-    assert!(parse_wfl(input).is_err(), "within in `on event any` should be a parse error");
+    assert!(
+        parse_wfl(input).is_err(),
+        "within in `on event any` should be a parse error"
+    );
 }

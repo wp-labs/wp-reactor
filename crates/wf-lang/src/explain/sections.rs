@@ -1,8 +1,7 @@
 use crate::ast::{Expr, FieldRef};
 use crate::plan::{
-    AggPlan, BindPlan, BranchPlan, SeqStepPlan, ConvOpPlan, ConvPlan, JoinPlan, LimitsPlan,
-    MatchPlan, StepPlan,
-    WindowSpec, YieldPlan,
+    AggPlan, BindPlan, BranchPlan, ConvOpPlan, ConvPlan, JoinPlan, LimitsPlan, MatchPlan,
+    SeqStepPlan, StepPlan, WindowSpec, YieldPlan,
 };
 use crate::schema::WindowSchema;
 
@@ -55,13 +54,10 @@ pub(super) fn explain_match(mp: &MatchPlan) -> MatchExpl {
     } else {
         Some(mp.close_mode)
     };
-    let seq = mp.seq.as_ref().map(|seq_plan| {
-        seq_plan
-            .steps
-            .iter()
-            .map(format_seq_step)
-            .collect()
-    });
+    let seq = mp
+        .seq
+        .as_ref()
+        .map(|seq_plan| seq_plan.steps.iter().map(format_seq_step).collect());
 
     MatchExpl {
         keys,

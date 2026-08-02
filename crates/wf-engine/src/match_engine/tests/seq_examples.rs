@@ -15,12 +15,30 @@ fn conn_events_schema() -> WindowSchema {
         time_field: Some("event_time".to_string()),
         over: Duration::from_secs(3600),
         fields: vec![
-            FieldDef { name: "sip".into(), field_type: FieldType::Base(BaseType::Ip) },
-            FieldDef { name: "dip".into(), field_type: FieldType::Base(BaseType::Ip) },
-            FieldDef { name: "dport".into(), field_type: FieldType::Base(BaseType::Digit) },
-            FieldDef { name: "bytes_out".into(), field_type: FieldType::Base(BaseType::Digit) },
-            FieldDef { name: "action".into(), field_type: FieldType::Base(BaseType::Chars) },
-            FieldDef { name: "event_time".into(), field_type: FieldType::Base(BaseType::Time) },
+            FieldDef {
+                name: "sip".into(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "dip".into(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "dport".into(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "bytes_out".into(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "action".into(),
+                field_type: FieldType::Base(BaseType::Chars),
+            },
+            FieldDef {
+                name: "event_time".into(),
+                field_type: FieldType::Base(BaseType::Time),
+            },
         ],
     }
 }
@@ -32,13 +50,34 @@ fn auth_events_schema() -> WindowSchema {
         time_field: Some("event_time".to_string()),
         over: Duration::from_secs(3600),
         fields: vec![
-            FieldDef { name: "sip".into(), field_type: FieldType::Base(BaseType::Ip) },
-            FieldDef { name: "dip".into(), field_type: FieldType::Base(BaseType::Ip) },
-            FieldDef { name: "result".into(), field_type: FieldType::Base(BaseType::Chars) },
-            FieldDef { name: "service".into(), field_type: FieldType::Base(BaseType::Chars) },
-            FieldDef { name: "user".into(), field_type: FieldType::Base(BaseType::Chars) },
-            FieldDef { name: "password_hash".into(), field_type: FieldType::Base(BaseType::Chars) },
-            FieldDef { name: "event_time".into(), field_type: FieldType::Base(BaseType::Time) },
+            FieldDef {
+                name: "sip".into(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "dip".into(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "result".into(),
+                field_type: FieldType::Base(BaseType::Chars),
+            },
+            FieldDef {
+                name: "service".into(),
+                field_type: FieldType::Base(BaseType::Chars),
+            },
+            FieldDef {
+                name: "user".into(),
+                field_type: FieldType::Base(BaseType::Chars),
+            },
+            FieldDef {
+                name: "password_hash".into(),
+                field_type: FieldType::Base(BaseType::Chars),
+            },
+            FieldDef {
+                name: "event_time".into(),
+                field_type: FieldType::Base(BaseType::Time),
+            },
         ],
     }
 }
@@ -50,21 +89,43 @@ fn security_alerts_schema() -> WindowSchema {
         time_field: None,
         over: Duration::from_secs(3600),
         fields: vec![
-            FieldDef { name: "sip".into(), field_type: FieldType::Base(BaseType::Ip) },
-            FieldDef { name: "dip".into(), field_type: FieldType::Base(BaseType::Ip) },
-            FieldDef { name: "user".into(), field_type: FieldType::Base(BaseType::Chars) },
-            FieldDef { name: "alert_type".into(), field_type: FieldType::Base(BaseType::Chars) },
-            FieldDef { name: "detail".into(), field_type: FieldType::Base(BaseType::Chars) },
+            FieldDef {
+                name: "sip".into(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "dip".into(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "user".into(),
+                field_type: FieldType::Base(BaseType::Chars),
+            },
+            FieldDef {
+                name: "alert_type".into(),
+                field_type: FieldType::Base(BaseType::Chars),
+            },
+            FieldDef {
+                name: "detail".into(),
+                field_type: FieldType::Base(BaseType::Chars),
+            },
         ],
     }
 }
 
 /// Parse + compile the source, then run EVERY inline test block and assert it passes.
 fn run_all_contracts(source: &str) {
-    let schemas = vec![conn_events_schema(), auth_events_schema(), security_alerts_schema()];
+    let schemas = vec![
+        conn_events_schema(),
+        auth_events_schema(),
+        security_alerts_schema(),
+    ];
     let wfl_file = wf_lang::parse_wfl(source).expect("parse should succeed");
     let plans = wf_lang::compile_wfl(&wfl_file, &schemas).expect("compile should succeed");
-    assert!(!wfl_file.tests.is_empty(), "expected at least one test block");
+    assert!(
+        !wfl_file.tests.is_empty(),
+        "expected at least one test block"
+    );
     for test in &wfl_file.tests {
         let plan = plans
             .iter()
@@ -78,8 +139,7 @@ fn run_all_contracts(source: &str) {
         assert!(
             result.passed,
             "test `{}` failed: {:?}",
-            result.test_name,
-            result.failures
+            result.test_name, result.failures
         );
     }
 }

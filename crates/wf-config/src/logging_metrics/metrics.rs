@@ -93,7 +93,10 @@ mod tests {
     #[test]
     fn console_output_defaults_true_when_omitted() {
         let cfg: MetricsConfig = toml::from_str("").unwrap();
-        assert!(cfg.console_output, "omitted console_output must default to true");
+        assert!(
+            cfg.console_output,
+            "omitted console_output must default to true"
+        );
     }
 
     #[test]

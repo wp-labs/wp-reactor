@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use wf_lang::plan::{BranchPlan, SeqStepPlan, MatchPlan};
+use wf_lang::plan::{BranchPlan, MatchPlan, SeqStepPlan};
 
 use super::eval::eval_expr_ext;
 use super::state::Instance;
@@ -83,7 +83,11 @@ pub(super) fn scan_negations(
         // event that arrives before it must not count as a violation.
         let anchor = match neg.prev_step_idx {
             Some(i) => {
-                match instance.completed_steps.get(i).and_then(|sd| sd.event_last_time_nanos) {
+                match instance
+                    .completed_steps
+                    .get(i)
+                    .and_then(|sd| sd.event_last_time_nanos)
+                {
                     Some(t) => t,
                     None => continue, // preceding step not yet completed → window inactive
                 }
@@ -117,7 +121,12 @@ pub(super) fn scan_negations(
 /// Strict adjacency: in `consec` mode, an event whose alias does not match the
 /// current step's branch breaks the chain. Returns `true` when the chain is
 /// broken and the event should be discarded.
-pub(super) fn consec_broken(meta: &SeqRuntime, instance: &Instance, plan: &MatchPlan, alias: &str) -> bool {
+pub(super) fn consec_broken(
+    meta: &SeqRuntime,
+    instance: &Instance,
+    plan: &MatchPlan,
+    alias: &str,
+) -> bool {
     if !meta.consec {
         return false;
     }

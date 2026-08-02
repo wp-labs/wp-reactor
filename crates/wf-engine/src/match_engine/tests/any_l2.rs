@@ -1,7 +1,7 @@
 //! `on event any` (unordered co-occurrence) engine tests.
 
-use wf_lang::ast::MatchMode;
 use std::time::Duration;
+use wf_lang::ast::MatchMode;
 use wf_lang::plan::{ExceedAction, LimitsPlan, MatchPlan, RateSpec};
 
 use crate::match_engine::match_engine::{CepStateMachine, StepResult};
@@ -64,7 +64,10 @@ fn any_mode_throttle_fail_rule_trips_failed() {
     let limits = LimitsPlan {
         max_memory_bytes: None,
         max_instances: None,
-        max_throttle: Some(RateSpec { count: 1, per: Duration::from_secs(60) }),
+        max_throttle: Some(RateSpec {
+            count: 1,
+            per: Duration::from_secs(60),
+        }),
         on_exceed: ExceedAction::FailRule,
     };
     let mut sm = CepStateMachine::with_limits("any_throttle".into(), plan, None, Some(limits));

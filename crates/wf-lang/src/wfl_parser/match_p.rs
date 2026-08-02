@@ -54,7 +54,9 @@ pub(super) fn match_clause_only(input: &mut &str) -> ModalResult<MatchClause> {
     kw("on").parse_next(input)?;
     ws_skip.parse_next(input)?;
     cut_err(kw("event"))
-        .context(StrContext::Expected(StrContextValue::Description("'event'")))
+        .context(StrContext::Expected(StrContextValue::Description(
+            "'event'",
+        )))
         .parse_next(input)?;
     ws_skip.parse_next(input)?;
 
@@ -543,7 +545,11 @@ fn seq_block_body(input: &mut &str) -> ModalResult<SeqClause> {
     ws_skip.parse_next(input)?;
     cut_err(literal("}")).parse_next(input)?;
 
-    Ok(SeqClause { consec, skip, steps })
+    Ok(SeqClause {
+        consec,
+        skip,
+        steps,
+    })
 }
 
 /// Parse one chain step: `[not] <body> [within dur] ;`
@@ -593,11 +599,13 @@ fn seq_step(input: &mut &str) -> ModalResult<SeqStep> {
     ws_skip.parse_next(input)?;
     let within = if opt(kw("within")).parse_next(input)?.is_some() {
         ws_skip.parse_next(input)?;
-        Some(cut_err(duration_value)
-            .context(StrContext::Expected(StrContextValue::Description(
-                "within duration",
-            )))
-            .parse_next(input)?)
+        Some(
+            cut_err(duration_value)
+                .context(StrContext::Expected(StrContextValue::Description(
+                    "within duration",
+                )))
+                .parse_next(input)?,
+        )
     } else {
         None
     };
@@ -609,7 +617,11 @@ fn seq_step(input: &mut &str) -> ModalResult<SeqStep> {
         )))
         .parse_next(input)?;
 
-    Ok(SeqStep { neg, within, branch })
+    Ok(SeqStep {
+        neg,
+        within,
+        branch,
+    })
 }
 
 // ---------------------------------------------------------------------------
