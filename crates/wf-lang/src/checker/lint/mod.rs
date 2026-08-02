@@ -78,6 +78,12 @@ fn lint_unused_alias(rule: &crate::ast::RuleDecl, rule_name: &str, warnings: &mu
         if let Some(ref close_block) = rule.match_clause.on_close {
             collect_step_sources(&close_block.steps, &mut used);
         }
+        // `on event seq` steps hold their sources in `seq.steps[].branch`.
+        if let Some(seq) = &rule.match_clause.seq {
+            for step in &seq.steps {
+                used.insert(&step.branch.source);
+            }
+        }
     }
 
     // Collect aliases referenced in score expression
