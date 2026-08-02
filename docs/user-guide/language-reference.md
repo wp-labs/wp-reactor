@@ -231,6 +231,48 @@ match<:5m> {
 }
 ```
 
+#### `on event seq` / `on event any` — 序列与共现
+
+`on event` 的 `seq` / `any` 修饰符声明步骤的**排序模式**。裸 `on event { ... }` 等价 `seq`，向后兼容。
+
+**`on event seq { ... }` — 有序序列（攻击链）**
+
+步骤按书写顺序完成（step i+1 只在 step i 完成后评估），并支持步间约束：
+
+```wfl
+match<sip,dip:30m> {
+    on event seq {
+        has scan;                  // 存在性步骤：scan 事件至少一次（隐式 count >= 1）
+        has login within 10m;      // login 必须在 scan 完成后的 10m 内
+        not has failed within 5m;  // 否定步：scan 后 5m 内不得出现失败登录
+        has xfer;                  // 总跨度由 match 窗口时长约束
+    }
+}
+```
+
+- `has <alias>` 存在性步骤，等价 `count >= 1`。
+- 聚合步骤复用 pipe：`spray.user | distinct | count >= 5`。
+- `within <dur>`：本步完成时刻 − 上一步完成时刻 ≤ dur。
+- `not has <alias> within <dur>`：否定步，自上一完成步骤起 dur 内不得出现匹配事件。
+- `consec`：严格相邻修饰符（默认允许步骤间夹带无关事件）。`skip = past_last | to_next`（to_next 延后 L3）。
+
+**`on event any { ... }` — 无序共现**
+
+所有 step 并行评估，全部满足即触发，顺序无关：
+
+```wfl
+match<sip,dip:10m> {
+    on event any {
+        scan | count >= 1;
+        login | count >= 1;
+        xfer | count >= 1;
+    }
+}
+```
+
+`login → scan → xfer` 的乱序序列也触发（弱相关性）。`any` 不支持 `within` / `not` / `consec` / `skip`
+（依赖顺序，编译期拒绝）。
+
 ### `on each`
 
 ```wfl
@@ -998,6 +1040,16 @@ Match 约束：
 - `close_reason` 仅可在 `on close` 中引用
 - `match` 与 `on each` 互斥
 - `conv` 仅允许与 fixed window 搭配
+
+Seq / Any 约束：
+
+- 裸 `on event { ... }` 等价 `on event seq { ... }`，向后兼容
+- `on event seq` 步骤按序完成，支持 `has` / `within` / `not` / `consec` / `skip`
+- `on event any` 并行评估，顺序无关，**不支持** `within` / `not` / `consec` / `skip`（编译期拒绝）
+- `not` 步骤不得引用字段聚合（编译期拒绝）；否定约束请用 `not has <alias> && <谓词>`
+- `skip = to_next` 延后到 L3，使用会收到警告
+- `on event seq` / `any` 不支持用于 pipeline stages（编译期拒绝）
+- `has <alias>` 存在性步骤，等价 `count >= 1`
 
 On Each 约束：
 
