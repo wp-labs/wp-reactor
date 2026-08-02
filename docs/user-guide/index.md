@@ -31,7 +31,7 @@ WFL 是 WarpFusion 的检测 DSL，用于编写安全关联检测、告警归并
 固定执行链为：
 
 ```text
-BIND -> SCOPE(match) -> JOIN -> ENTITY -> YIELD
+EVENTS -> SCOPE(match) -> JOIN -> ENTITY -> YIELD
 ```
 
 三文件模型如下：
@@ -39,15 +39,16 @@ BIND -> SCOPE(match) -> JOIN -> ENTITY -> YIELD
 | 文件 | 作用 |
 |------|------|
 | `.wfs` | 逻辑数据定义（window、field、time、over） |
-| `.wfl` | 检测逻辑（bind / match / join / yield） |
-| `fusion.toml` | 物理参数（mode、sources、runtime、sinks） |
+| `.wfl` | 检测逻辑（events / match / join / yield） |
+| `fusion.toml` | 物理参数（mode、sources、runtime、sinks、windows） |
 
 ## 当前运行时约定
 
 - `wfusion` 支持两种模式：`daemon`、`batch`
-- 基于 TCP 接收数据的入口是 `[[sources]] type = "tcp"`，不是 `[server]`
-- file source 当前支持三种格式：
+- 基于 TCP 接收数据的入口是 `[[sources]] connect = "tcp_src"`，不是 `[server]`
+- file source 当前支持四种格式：
   - `ndjson`
+  - `csv`
   - `arrow_framed`
   - `arrow_ipc`
 
@@ -55,4 +56,4 @@ BIND -> SCOPE(match) -> JOIN -> ENTITY -> YIELD
 
 - `arrow_framed` 表示当前 `wp_arrow` 分帧文件格式
 - `arrow_ipc` 表示标准 Arrow IPC file 格式
-- 不做自动识别，必须显式写 `format`
+- 不指定 `data_format` 时默认 `ndjson`；Arrow 相关格式必须显式写 `data_format`，不做自动识别

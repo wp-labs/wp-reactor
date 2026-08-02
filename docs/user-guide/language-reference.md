@@ -762,7 +762,7 @@ limits {
 | `avg(alias.field)` | 平均值 |
 | `min(alias.field)` | 最小值 |
 | `max(alias.field)` | 最大值 |
-| `distinct(alias.field)` | 去重计数 |
+| `distinct`（`alias.field \| distinct \| count`） | 去重计数；仅作为 match 步骤的 pipe 变换使用，不是独立函数 |
 
 示例：
 
@@ -1034,12 +1034,12 @@ Events 约束：
 
 Match 约束：
 
-- `duration > 0`
 - step 必须显式声明 source
 - `match` 至少需要有效的事件/关闭路径才能通过后续语义检查
 - `close_reason` 仅可在 `on close` 中引用
 - `match` 与 `on each` 互斥
 - `conv` 仅允许与 fixed window 搭配
+- session 窗口的 gap 与 `asof within` 的时长必须 `> 0`（当前检查器不强制 `match` 滑动/固定窗口的 `duration > 0`，`match<sip:0>` 可通过解析）
 
 Seq / Any 约束：
 

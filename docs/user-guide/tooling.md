@@ -2,127 +2,65 @@
 
 `wfusion`、`wfgen`、`wfl` 三个 CLI 现在由相邻仓库 `../warp-fusion` 产出；`wp-reactor` 继续承载核心库、示例和文档。
 
-## `wfusion config`
+## `wfadm conf`
 
-`wfusion` 提供了一组静态配置诊断命令，专门用于排查：
+配置诊断能力已从旧版 `wfusion config` 迁移到 `wfadm conf`（`wfadm` 由同级 `../warp-fusion` 仓库产出），用于排查：
 
 - overlay merge 后到底是什么
 - `${CASE_PATH}` / `${WORK_DIR}` 一类变量最终展开成什么
 - 某个字段到底来自 base 还是 overlay
 - 两组参数下配置哪里发生了变化
 
-### `wfusion config render`
+当前提供 `conf diff` 与 `conf update` 两个子命令。
 
-输出最终生效的 TOML：
+### `wfadm conf diff`
 
-```bash
-wfusion config render \
-    --config conf/wfusion.toml \
-    --overlay conf/dev.toml \
-    --var CASE_PATH=/tmp/case
-```
-
-如果想看“merge 后但未做变量展开”的结果：
+比较两组加载参数下的配置差异：
 
 ```bash
-wfusion config render \
-    --config conf/wfusion.toml \
-    --overlay conf/dev.toml \
-    --raw
-```
-
-### `wfusion config origins`
-
-列出每个最终配置路径来自哪个文件：
-
-```bash
-wfusion config origins \
-    --config conf/wfusion.toml \
-    --overlay conf/dev.toml
-```
-
-可用 `--path-prefix` 只看某个子树：
-
-```bash
-wfusion config origins \
-    --config conf/wfusion.toml \
-    --path-prefix runtime \
-    --path-prefix sources
-```
-
-### `wfusion config diff`
-
-比较两组加载参数下的 raw 配置差异：
-
-```bash
-wfusion config diff \
+wfadm conf diff \
     --config conf/wfusion.toml \
     --overlay conf/dev.toml \
     --to-overlay conf/batch.toml
 ```
 
+左侧加载参数：`--config` / `--overlay` / `--var` / `--work-dir`；右侧参数：`--to-config` / `--to-overlay` / `--to-var` / `--to-work-dir`。
+
 也可以比较不同变量输入：
 
 ```bash
-wfusion config diff \
+wfadm conf diff \
     --config conf/wfusion.toml \
     --var CASE_PATH=/tmp/case-a \
     --to-var CASE_PATH=/tmp/case-b
 ```
 
-如果要比较“变量展开后的最终 TOML 差异”，加 `--expanded`：
+比较“变量展开后的最终配置差异”，加 `--expanded`：
 
 ```bash
-wfusion config diff \
+wfadm conf diff \
     --config conf/wfusion.toml \
     --var CASE_PATH=/tmp/case-a \
     --to-var CASE_PATH=/tmp/case-b \
     --expanded
 ```
 
-`--expanded` 模式下，`old_origin` / `new_origin` 会尽量显示“最终展开值来自哪里”：
+`--expanded` 模式下，差异项的 `old_origin` / `new_origin` 会尽量显示“最终展开值来自哪里”：
 
 - 纯文件来源时仍显示文件路径
 - 变量驱动时显示 `<cli:CASE_PATH>` / `<env:HOME>` / `<builtin:WORK_DIR>` / `<default:FOO>`
 - 如果一个最终值同时由多个来源拼接而成，则显示 `<mixed:...>`
 
-`--path-prefix` 同样适用：
+`--path-prefix` 只看某个子树：
 
 ```bash
-wfusion config diff \
+wfadm conf diff \
     --config conf/wfusion.toml \
     --to-overlay conf/batch.toml \
     --path-prefix runtime
 ```
 
-### `wfusion config vars`
-
-输出当前最终可见的变量和值，并标明来源：
-
-```bash
-wfusion config vars \
-    --config conf/wfusion.toml \
-    --overlay conf/dev.toml \
-    --var CASE_PATH=/tmp/case
-```
-
-可用 `--var-prefix` 只看某一组变量：
-
-```bash
-wfusion config vars \
-    --config conf/wfusion.toml \
-    --var-prefix WORK \
-    --var-prefix CASE_
-```
-
-来源显示的是“最终取值来源”，不是“变量定义位置”：
-
-- `<cli:CASE_PATH>`：最终值来自 `--var CASE_PATH=...`
-- `<builtin:WORK_DIR>`：最终值来自当前 loader 注入的 scoped var
-- `<env:HOME>`：变量没有出现在 `[vars]`，但当前配置里确实引用了环境变量并参与了解析
-- `<default:FOO>`：值来自 `${FOO:...}` 的默认值
-- 文件路径：最终值完全来自合并后的 `[vars]` 文件值
-- `<mixed:...>`：最终值由多个来源共同组成，例如文件字面量加上 `--var`
+> 旧版 `wfusion config render / origins / vars` 子命令已移除。变量解析顺序与 scoped var 语义见 [运行时配置](./runtime-config.md)。
 
 ## `wfl`
 
@@ -174,7 +112,6 @@ wfl fmt --check rules/*.wfl
 wfl replay rules/brute_force.wfl \
     --schemas "schemas/*.wfs" \
     --input test_data/events.jsonl \
-    --alias fail \
     --var FAIL_THRESHOLD=3
 ```
 
@@ -228,7 +165,7 @@ scenario brute_force_detect<seed=42> {
   injection {
     hit<30%> auth_events {
       sip seq {
-        use(action="failed") with(3,2m)
+        use(action="failed") with(3)
       }
     }
   }
@@ -288,10 +225,10 @@ wfgen bench \
 
 ## 联合验证
 
-推荐直接运行仓库内置 e2e：
+推荐直接运行仓库内置 e2e（在 `../warp-fusion` 仓库中）：
 
 ```bash
-cargo test -p wf-runtime e2e_datagen_brute_force -- --nocapture
+cargo test -p wfgen e2e_datagen_brute_force -- --nocapture
 ```
 
 该用例会自动完成：
@@ -304,7 +241,7 @@ cargo test -p wf-runtime e2e_datagen_brute_force -- --nocapture
 手工分步调试：
 
 ```bash
-wfusion run \
+wfusion batch \
     --config conf/wfusion.toml \
     --overlay conf/batch.toml \
     --work-dir /path/to/project \

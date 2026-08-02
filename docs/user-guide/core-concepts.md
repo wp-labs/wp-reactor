@@ -35,7 +35,7 @@ my-project/
 |------|------|---------|
 | `.wfs` | 逻辑数据定义 | window 名、订阅的 stream、时间字段、保持时长(over)、字段 schema |
 | `.wfl` | 检测规则 | 事件绑定、匹配条件、评分、实体、输出 |
-| `.toml` | 物理约束 | 监听地址、内存上限、watermark 延迟、sink 路由 |
+| `.toml` | 物理约束 | 监听地址、内存上限、watermark 延迟、sink 路由；窗口默认值与按窗口覆盖放在独立 `windows.toml`（由顶层 `windows = ...` 引用） |
 
 依赖方向：`.wfs` ← `.wfl` ← `.toml`
 
@@ -87,16 +87,18 @@ Window 基于**事件时间**（event time）管理数据生命周期，而非�
 
 三个核心概念：
 
-| 概念 | 含义 | 默认值 |
+| 概念 | 含义 | 示例默认 |
 |------|------|--------|
-| **Watermark** | 当前认定"不会再收到更早数据"的时间点。计算方式：`max(已收到事件时间) - watermark_delay` | 5s |
-| **Allowed Lateness** | watermark 之后仍允许的迟到时间窗口 | 0（不接受迟到） |
+| **Watermark** | 当前认定"不会再收到更早数据"的时间点。计算方式：`max(已收到事件时间) - watermark_delay` | `5s` |
+| **Allowed Lateness** | watermark 之后仍允许的迟到时间窗口 | `0s`（不接受迟到） |
 | **Late Policy** | 超过允许范围的数据如何处理 | `drop`（丢弃） |
+
+这些值来自 `[window_defaults]` 配置（所有字段均为必填，无隐式默认）；上面列出的 `5s / 0s / drop` 是示例配置的取值。
 
 迟到策略选择：
 - `drop`：直接丢弃。适用于数据基本有序的场景（绝大多数）
 - `revise`：追加到窗口，可能触发规则重算。适用于乱序严重但精度要求高的场景
-- `side_output`：写入旁路，主窗口不受影响。适用于需要保留迟到数据做事后审计的场景
+- `side_output`：当前实现尚未落地，运行时等价于 `drop`（保留策略枚举用于前瞻）
 
 ### 3.3 Match — 模式匹配的核心
 
@@ -124,6 +126,31 @@ match<sip:5m> {
 
 **关闭触发三种方式**：Timeout（超过 `over` 时长）、Flush（引擎关闭时）、Eos（数据流结束）。
 
+**排序模式（`on event seq` / `on event any`）**：
+
+`on event` 的 `seq` / `any` 修饰符声明步骤的**排序模式**。裸 `on event { ... }` 等价 `seq`，向后兼容：
+
+- `on event seq { ... }` — 有序序列：步骤按书写顺序完成（step i+1 只在 step i 完成后评估），
+  支持 `has <alias>`（存在性，隐式 `count >= 1`）、`within <dur>`（步间时间 gap）、
+  `not has <alias> within <dur>`（否定步）、`consec`（严格相邻）。`skip` 可解析，
+  但运行时当前只实现默认的 `past_last`（失败后回退到上一步），`skip = to_next` 延后到 L3。
+- `on event any { ... }` — 无序共现：所有步骤并行评估，全部满足即触发，顺序无关
+  （不支持 `within` / `not` / `consec` / `skip`，编译期拒绝）。
+
+```wfl
+match<sip:30m> {
+    on event seq {
+        has scan;                    # 存在性：scan 至少一次
+        has login within 10m;        # login 必须在 scan 后 10m 内
+        not has failed within 5m;    # 否定：scan 后 5m 内无失败登录
+    }
+}
+```
+
+**实例过期（窗口 TTL）**：每条规则的实例按窗口时长保留（`match<sip:5m>` → 距最后事件 5m）。
+运行时周期扫描会按墙钟时间推进有效水位（`watermark + 距上次处理事件的墙钟时间`），因此
+**输入静默时实例也会按窗口 TTL 自动过期释放**，符合窗口的时间语义——无需新事件触发。
+
 ### 3.4 CEP 状态机 — 怎么执行 match
 
 每条规则编译为一个 `MatchPlan`，运行时由 `CepStateMachine` 驱动。状态机按 scope-key 维护独立的 `Instance`。
@@ -149,7 +176,7 @@ match<sip:5m> {
 
 `fail | count >= 3` 满足后推进一步，然后有两条可能的路径——`|| scan | count >= 1` 任一满足即命中。
 
-**聚合度量**：`count`、`sum`、`avg`、`min`、`max`、`distinct`。**变换**：`distinct` 在累积阶段去重。
+**聚合度量**：`count`、`sum`、`avg`、`min`、`max`。**变换**：`distinct` 在累积阶段去重（通过管道 `| distinct |` 使用，不是独立函数）。
 
 ### 3.5 OutputRecord — 告警输出
 
@@ -157,15 +184,16 @@ match<sip:5m> {
 
 ```
 OutputRecord {
-    id          # 幂等键: "rule_name|key1\x1fkey2|fired_at#seq"
+    wfx_id      # 确定性输出 ID：SHA-256 内容哈希（16 hex），非字面拼接
     rule_name   # 规则名
     score       # 风险评分 [0, 100]
     entity_type # 实体类型（来自 entity(type, ...) 声明）
     entity_id   # 实体 ID
-    origin      # Event | Close { reason }
-    close_reason# Timeout | Flush | Eos
-    fired_at    # 触发时间（ISO 8601）
+    origin      # Event | Close { reason }，reason 取 Timeout | Flush | Eos
+    fired_at    # 基于事件时间或 close 水位生成的业务时间
     emit_time   # 发出时间
+    summary     # 引擎生成的摘要
+    yield_target# yield 目标 window
     fields      # yield 字段
 }
 ```
@@ -221,24 +249,25 @@ yield security_alerts (
 告警通过 Connector 模式输出：
 
 ```
-OutputRecord → JSON → SinkDispatcher.dispatch(yield_target, json)
+OutputRecord → to_data_record() → DataRecord → SinkDispatcher.dispatch(yield_target, DataRecord)
                         ├─ 匹配 business group (按 yield_target 通配符)
                         ├─ 无匹配 → default group (兜底)
                         └─ 写入失败 → error group (容错)
 ```
 
-配置结构：
+配置结构（`sinks = "sinks"` 指向 `sinks/` 目录，Connector 定义放在同级 `connectors/` 目录下）：
 
 ```
 sinks/
 ├── defaults.toml       # 全局默认值
-├── sink.d/             # Connector 定义（type + 默认参数）
-│   └── file_json.toml
 ├── business.d/         # 业务路由组（window 通配符匹配）
 │   └── security.toml
 └── infra.d/            # 基础设施组
     ├── default.toml    # 兜底
     └── error.toml      # 容错
+connectors/
+└── sink.d/             # Connector 定义（type + 默认参数）
+    └── file_json.toml
 ```
 
 ---
@@ -324,7 +353,7 @@ RuleTask 主循环:
 2. select! 等待:
    ├─ Notify 触发 → 回到步骤 1
    ├─ timeout_scan_interval.tick() → scan_expired() → 处理超时关闭
-   └─ rule_cancel.cancel() → 最终 drain + close_all(Eos) → 退出
+   └─ rule_cancel.cancel() → 最终 drain + close_all(Flush) → 退出
 ```
 
 Cursor 机制：
@@ -341,13 +370,13 @@ RuleTask 初始化 cursor = `window.next_seq()`，只处理启动后新到达的
 ### 阶段 5：告警输出
 
 ```
-RuleTask.alert_tx.send(AlertRecord)
+RuleTask.alert_tx.send(OutputRecord)
         │
         ▼
 alert_dispatcher (mpsc channel 消费):
-  1. serde_json::to_string(AlertRecord) → JSON
-  2. SinkDispatcher.dispatch(yield_target, json)
-  3. 匹配到的 business group 中的所有 SinkRuntime 并行写入
+  1. OutputRecord → to_data_record() → DataRecord
+  2. SinkDispatcher.dispatch(yield_target, DataRecord)
+  3. 匹配到的 business group 中的所有 SinkRuntime 顺序写入（逐个 await）
   4. 无 business group 匹配 → default_group
   5. 写入失败 → error_group
 ```
@@ -364,11 +393,11 @@ Phase 2: 清空规则管道
   rule_cancel.cancel()
   → 每个 RuleTask:
     ① 最后一次 pull_and_advance()（处理 Window 剩余数据）
-    ② machine.close_all(Eos)（flush 所有状态机实例）
+    ② machine.close_all(Flush)（flush 所有状态机实例）
     ③ drop alert_tx（关闭 channel sender）
   → join rules
-  → alert channel 关闭 → alert dispatcher 自动退出 → join alert
   → join evictor
+  → alert channel 关闭 → alert dispatcher 自动退出 → join alert
 
 关闭顺序保证: 上游（receiver）先退出，下游（alert）最后退出 → 零告警丢失
 ```

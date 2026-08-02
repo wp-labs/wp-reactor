@@ -11,13 +11,13 @@
 生产环境的标准模式，启动后持续监听 TCP 端口接收数据：
 
 ```bash
-wfusion run --config wfusion.toml
+wfusion daemon --config wfusion.toml
 ```
 
-要求配置中至少有一个 `type = "tcp"` 的 source。带指标输出：
+要求配置中至少有一个启用的 source（任意类型）。带指标输出：
 
 ```bash
-wfusion run --config wfusion.toml --metrics --metrics-interval 2s
+wfusion daemon --config wfusion.toml --metrics --metrics-interval 2s
 ```
 
 ### 1.2 批处理模式（batch）
@@ -25,10 +25,10 @@ wfusion run --config wfusion.toml --metrics --metrics-interval 2s
 离线回放文件，处理完毕后自动退出：
 
 ```bash
-wfusion run --config wfusion.toml --overlay conf/batch.toml
+wfusion batch --config wfusion.toml --overlay conf/batch.toml
 ```
 
-要求至少有一个 `type = "file"` 的 source，不允许启用 tcp source。
+要求至少有一个 `type = "file"` 的 source，不允许启用任何非 `file` 类型的 source。
 
 ### 1.3 信号处理
 
@@ -43,74 +43,43 @@ wfusion run --config wfusion.toml --overlay conf/batch.toml
 
 ## 2. 配置诊断
 
-`wfusion config` 子命令用于排查配置问题，无需启动引擎。
+配置诊断能力已从 `wfusion config` 迁移到 `wfadm conf`（`wfadm` 是同级 `warp-fusion` 仓库产出的项目管理 CLI），当前提供 `conf diff` 与 `conf update`。
 
-### 2.1 查看最终配置
+### 2.1 配置差异对比
 
-```bash
-wfusion config render \
-    --config conf/wfusion.toml \
-    --overlay conf/dev.toml \
-    --var CASE_PATH=/tmp/case
-```
-
-输出 overlay 合并 + 变量展开后的最终 TOML。加 `--raw` 只看 merge 后但变量未展开的结果。
-
-### 2.2 追踪配置来源
+比较两组加载参数下的配置差异：
 
 ```bash
-wfusion config origins \
-    --config conf/wfusion.toml \
-    --overlay conf/dev.toml
-```
-
-输出每个最终配置路径来自哪个文件。可用 `--path-prefix` 只看某个子树。
-
-### 2.3 查看变量
-
-```bash
-wfusion config vars \
-    --config conf/wfusion.toml \
-    --var CASE_PATH=/tmp/case
-```
-
-输出所有最终可见的变量及其来源：
-
-| 来源标记 | 含义 |
-|----------|------|
-| `<cli:KEY>` | 命令行 `--var` 传入 |
-| `<builtin:KEY>` | 引擎内置（如 `WORK_DIR`） |
-| `<env:KEY>` | 环境变量 |
-| `<default:KEY>` | `${KEY:default}` 的默认值 |
-| 文件路径 | 来自 TOML 的 `[vars]` |
-
-可用 `--var-prefix` 过滤只看某组变量。
-
-### 2.4 配置差异对比
-
-比较两组配置参数下的差异：
-
-```bash
-wfusion config diff \
+wfadm conf diff \
     --config conf/wfusion.toml \
     --overlay conf/dev.toml \
     --to-overlay conf/batch.toml
 ```
 
-加 `--expanded` 比较变量展开后的差异。`--path-prefix` 只看某个子树。
+左侧参数：`--config` / `--overlay` / `--var` / `--work-dir`；右侧参数：`--to-config` / `--to-overlay` / `--to-var` / `--to-work-dir`。加 `--expanded` 比较变量展开后的差异；`--path-prefix` 只看某个子树。
 
-### 2.5 Overlay 叠加机制
+### 2.2 追踪配置来源
+
+`--expanded` 模式下，差异项的 `old_origin` / `new_origin` 显示“最终展开值来自哪里”：
+
+- 纯文件来源时仍显示文件路径
+- 变量驱动时显示 `<cli:KEY>` / `<env:KEY>` / `<builtin:WORK_DIR>` / `<default:FOO>`
+- 如果一个最终值同时由多个来源拼接而成，则显示 `<mixed:...>`
+
+### 2.3 Overlay 叠加机制
 
 `--overlay` 可以多次指定，后指定的覆盖先指定的：
 
 ```bash
-wfusion run \
+wfadm conf diff \
     --config conf/wfusion.toml \
     --overlay conf/dev.toml \
     --overlay conf/dev-jack.toml
 ```
 
 优先级：`dev-jack > dev > base`。
+
+> 旧版 `wfusion config render / origins / vars` 子命令已移除。变量解析顺序、scoped var（`CONFIG_DIR` / `WORK_DIR`）与路径语义仍见 [运行时配置](./runtime-config.md)。
 
 ---
 
@@ -144,8 +113,9 @@ wfl lint rules/brute_force.wfl \
 | 字段引用是否正确 | Error | alias.field 是否匹配 schema |
 | 类型兼容性 | Error | 比较操作两边类型是否匹配 |
 | 多 key 警告 | Warning | match key >= 4 个字段时警告高基数风险 |
-| 缺少 limits | Warning | L2 建议每条规则声明资源预算 |
-| 缺少 contract_version | Warning | 建议声明输出契约版本 |
+| 缺少 limits | Warning | 建议每条规则声明资源预算 |
+
+`contract_version` 不是 lint 警告：只有 `yield @vN` 存在且与 `meta { contract_version }` 不一致时，checker 会报 Error（T51）。
 
 ### 3.3 fmt — 代码格式化
 
@@ -177,11 +147,10 @@ wfl test rules/brute_force.wfl \
 wfl replay rules/brute_force.wfl \
     --schemas "schemas/*.wfs" \
     --input test_data/events.jsonl \
-    --alias fail \
     --var FAIL_THRESHOLD=3
 ```
 
-用 NDJSON 数据文件模拟事件注入。注意离线模式没有 window store，join 和 window.has() 不可用。
+用 NDJSON 数据文件模拟事件注入，不需要手动指定 alias（按 schema 自动匹配）。注意离线模式没有 window store，join 和 window.has() 不可用。
 
 ### 3.6 verify — 对拍验证
 
@@ -214,7 +183,7 @@ scenario brute_force_detect<seed=42> {
     injection {
         hit<30%> auth_events {              # 30% 概率注入命中流量
             sip seq {
-                use(action="failed") with(3, 2m)  # 2 分钟内注入 3 次失败
+                use(action="failed") with(3)     # 依次注入 3 次失败
             }
         }
     }
@@ -279,22 +248,23 @@ wfgen bench \
 启动时加 `--metrics` 参数：
 
 ```bash
-wfusion run --config wfusion.toml --metrics --metrics-interval 2s
+wfusion daemon --config wfusion.toml --metrics --metrics-interval 2s
 ```
 
-定期输出到日志的关键指标：
+定期输出到日志的关键指标（`summary_line`）：
 
 | 指标 | 含义 |
 |------|------|
-| `events_total` | 总事件数 |
-| `events_per_window` | 每窗口事件数 |
-| `rule_matches` | 规则命中数 |
-| `sink_errors` | sink 写入失败数 |
-| `histogram` | 时延分布 |
+| `rx_rows` | 已接收行数 |
+| `routed` | 已路由到窗口的行数 |
+| `dropped_late` | 迟到丢弃数 |
+| `matches` | 规则命中数 |
+| `alerts` | 告警输出数 |
+| `window_bytes` | 窗口内存占用 |
 
-### 5.2 Prometheus
+另有按周期的速率表（`interval_table`），列包括 `row/s`、`late/s`、`rules/s`、`sm/s`、`memory`、`out/s`。这些终端快照由 `[metrics] console_output`（默认 `true`）控制；Prometheus 导出和 monitor-channel 快照不受该开关影响。
 
-配置中指定 metrics 监听地址：
+### 5.2 指标导出（monitor sink NDJSON）
 
 ```toml
 [metrics]
@@ -303,38 +273,31 @@ prometheus_listen = "0.0.0.0:9091"
 report_interval = "15s"
 ```
 
-暴露的 Prometheus 指标（第一阶段）：
+当前实现通过 monitor sink 按 `report_interval` 周期导出 NDJSON 指标记录（每条记录带 `stage` / `name` / label / value），不暴露 Prometheus HTTP 端点；`prometheus_listen` 目前只写入日志。
 
-| 类别 | 指标 | 类型 |
-|------|------|------|
-| 接收 | `wf_receiver_connections_total` | Counter |
-| | `wf_receiver_frames_total` | Counter |
-| | `wf_receiver_rows_total` | Counter |
-| 路由 | `wf_router_route_calls_total` | Counter |
-| | `wf_router_delivered_total` | Counter |
-| | `wf_router_dropped_late_total` | Counter |
-| 规则 | `wf_rule_events_total{rule}` | Counter |
-| | `wf_rule_matches_total{rule}` | Counter |
-| | `wf_rule_instances{rule}` | Gauge |
-| 告警 | `wf_alert_emitted_total{rule}` | Counter |
-| | `wf_alert_channel_send_failed_total` | Counter |
-| 窗口 | `wf_window_memory_bytes{window}` | Gauge |
-| | `wf_window_rows{window}` | Gauge |
-| 驱逐 | `wf_evictor_time_evicted_total` | Counter |
-| | `wf_evictor_memory_evicted_total` | Counter |
-| 时延 | `wf_rule_scan_timeout_seconds` | Histogram |
-| | `wf_alert_dispatch_seconds` | Histogram |
+| stage | name | 含义 |
+|-------|------|------|
+| `receiver` | `connections_total` / `frames_total` / `rows_total` | 连接、帧、行计数 |
+| `receiver` | `decode_errors_total` / `read_errors_total` / `window_miss_total` | 解码/读取/窗口 miss 计数 |
+| `router` | `route_calls_total` / `delivered_total` / `dropped_late_total` / `skipped_non_local_total` | 路由与丢弃计数 |
+| `rule` | `events_total` / `matches_total` / `instances`（按 rule） | 规则事件/命中/实例数 |
+| `alert` | `dispatch_total` / `emitted_total` / `channel_send_failed_total` / `sink_dispatch_failed_total` / `channel_full_total` | 告警分发计数 |
+| `window` | `memory_bytes` / `window_capacity_bytes` / `rows` / `batches` / `append_total` / `evict_total` / `late_total`（按 window） | 窗口状态 |
+| `evictor` | `sweeps_total` / `time_evicted_total` / `memory_evicted_total` | 驱逐计数 |
+| 时延 | `rule.scan_timeout_seconds` / `rule.flush_seconds` / `receiver.decode_seconds` / `alert.dispatch_seconds` / `event.e2e_latency_seconds` | 直方图，按 `_p50` / `_p99` 两条记录导出 |
 
-### 5.3 查看规则执行摘要
+### 5.3 关闭时的 RunSummary
 
-`wfusion config` 的指标模式下可以检查 `RunSummary`：
+引擎关闭时，metrics 任务会打印 `RunSummary` 汇总表（不是某个 `config` 子命令的输出）：
 
 ```
-rule_name          matches   avg_latency_us
-brute_force        152       240
-chain_attack       38        520
-top_scanners       12        180
+stat     row/s  late/s  rules/s  sm/s  memory  out/s
+avg      ...    ...     ...      ...   ...     ...
+max      ...    ...     ...      ...   ...     ...
+total    rows / late / rules / sm_delta / out
 ```
+
+列包括 `row/s`、`late/s`、`rules/s`、`sm/s`、`memory`、`out/s`（avg/max）以及累计总量，没有按规则的明细行。
 
 ---
 
@@ -359,8 +322,8 @@ file = "logs/wf-engine.log"
 |----------|------|--------|
 | `WarpFusion reactor started` | 引擎启动成功 | listen 地址是否正确 |
 | `cursor gap detected` | RuleTask 的 cursor 落后于 eviction | 窗口数据被提前淘汰，可能丢失事件 |
-| `DroppedLate` | 迟到数据被丢弃 | 检查 watermark / allowed_lateness 配置 |
-| `sink write error` | sink 写入失败 | 检查磁盘空间、文件权限 |
+| `reason = "dropped_late"` | 迟到数据被丢弃 | 检查 watermark / allowed_lateness 配置 |
+| `sink dispatch error` | sink 写入失败 | 检查磁盘空间、文件权限 |
 
 ### 6.3 常见问题排查
 
@@ -374,26 +337,27 @@ wfl explain rules/my_rule.wfl --schemas "schemas/*.wfs"
 
 # 3. 用测试数据离线验证
 wfl replay rules/my_rule.wfl --schemas "schemas/*.wfs" \
-    --input test_events.jsonl --alias fail
+    --input test_events.jsonl
 ```
 
 **配置不生效？**
 ```bash
-# 1. 查看最终合并配置
-wfusion config render --config wfusion.toml --overlay dev.toml
+# 1. 对比最终合并配置（base + overlay）
+wfadm conf diff --config wfusion.toml --overlay dev.toml
 
-# 2. 追踪字段来源
-wfusion config origins --config wfusion.toml --path-prefix window
+# 2. 只看 window 子树（--path-prefix）
+wfadm conf diff --config wfusion.toml --path-prefix window
 
-# 3. 查看变量解析结果
-wfusion config vars --config wfusion.toml
+# 3. 查看变量展开后的差异（--expanded，含来源标记）
+wfadm conf diff --config wfusion.toml --var CASE_PATH=/tmp/a \
+    --to-var CASE_PATH=/tmp/b --expanded
 ```
 
 **内存增长过快？**
 - 检查 `max_window_bytes` 和 `max_total_bytes` 是否合理
 - 检查 `evict_interval` 是否太短导致驱逐来不及
 - 检查 scope key 基数——`match<sip,username,dport:5m>` 三字段组合可能产生大量实例
-- 查看 `wf_rule_instances{rule}` 判断是否有状态机膨胀
+- 查看 `rule.instances` 指标（monitor sink 按 rule 输出）判断是否有状态机膨胀
 
 **告警丢失？**
 - 检查 sink 路由：yield_target 是否被至少一个 business group 覆盖
@@ -408,7 +372,7 @@ wfusion config vars --config wfusion.toml
 
 ```bash
 # 1. 启动引擎（批处理模式）
-wfusion run --config conf/wfusion.toml --overlay conf/batch.toml \
+wfusion batch --config conf/wfusion.toml --overlay conf/batch.toml \
     --work-dir /path/to/project &
 
 # 2. 生成并发送测试数据
@@ -422,10 +386,10 @@ wfgen verify \
     --meta out/expected.meta.jsonl
 ```
 
-或直接运行内置 E2E 测试：
+或直接运行内置 E2E 测试（在 `../warp-fusion` 仓库中）：
 
 ```bash
-cargo test -p wf-runtime e2e_datagen_brute_force -- --nocapture
+cargo test -p wfgen e2e_datagen_brute_force -- --nocapture
 ```
 
 该测试自动完成：生成事件 → 启动 wfusion → TCP 发送 → 告警对拍。

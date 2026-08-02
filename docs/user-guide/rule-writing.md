@@ -293,14 +293,16 @@ rule port_scan {
 ```wfl
 rule chain_attack {
     events {
-        scan : conn_events && action == "syn"
-        login : conn_events && action == "login_fail"
+        scan    : conn_events && action == "syn"
+        login   : conn_events && action == "login_fail"
+        success : conn_events && action == "login_success"
     }
 
     match<sip:30m> {
-        on event {
-            scan | count >= 5;
-            login | count >= 3;
+        on event seq {
+            scan | count >= 5;               # 步骤 1：累积 5 次扫描
+            login | count >= 3 within 10m;   # 步骤 2：10m 内累积 3 次登录失败
+            not has success within 5m;       # 否定：步骤 2 后 5m 内无成功登录
         }
     } -> score(90.0)
 
@@ -308,32 +310,35 @@ rule chain_attack {
     yield network_alerts (
         sip = scan.sip,
         alert_type = "chain_attack",
-        detail = "scan then brute force"
+        detail = "scan then brute force, no success"
     )
 }
 ```
 
 **关键点**：
 
-`match` 中有两个步骤（分号分隔），必须**顺序满足**：
+`on event seq` 中的步骤（分号分隔）必须**顺序满足**，并支持步间约束：
 1. 先累积 5 次 `scan` 事件 → 推进到步骤 2
-2. 再累积 3 次 `login` 事件 → 命中
+2. `login | count >= 3 within 10m` —— 10m 内累积 3 次登录失败 → 推进
+3. `not has success within 5m` —— 否定步：上一步后 5m 内不得出现成功登录（爆破未得手）
 
 如果先来 3 次 `login` 再来 5 次 `scan`，不会命中——步骤 1 的 `scan` 还没满足，步骤 2 的 `login` 事件会被忽略。
 
+`within` 约束步间时间 gap；`not` 排除窗口内的否定事件。若不需要顺序/约束，可用 `on event any`
+做无序共现（全部满足即触发，顺序无关）。
+
 ### OR 分支
 
-可以在同一步骤中提供多条路径：
+可以在同一步骤中提供多条分支（用 `||` 分隔同一 `;` 终止步骤内的分支）：
 
 ```wfl
 on event {
     scan | count >= 5;
-    login : conn_events && action == "login_fail" | count >= 3;
-    exploit : conn_events && action == "exploit" | count >= 1;
+    login | count >= 3 || exploit | count >= 1;
 }
 ```
 
-步骤 1（`scan`）满足后，步骤 2 有两条路径——`login` 或 `exploit` 任一满足即命中。
+`login`、`exploit` 是 `events` 中声明的别名（例如 `login : conn_events && action == "login_fail"`）。步骤 1（`scan`）满足后，步骤 2 有两条分支——`login` 或 `exploit` 任一满足即命中。
 
 ---
 

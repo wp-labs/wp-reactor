@@ -19,6 +19,7 @@ WFL 不是通用流计算 SQL，也不是任意 DAG 引擎。
 ```text
 my-project/
 ├── fusion.toml
+├── windows.toml
 ├── schemas/
 │   └── security.wfs
 ├── rules/
@@ -97,11 +98,15 @@ rule brute_force {
 ```toml
 mode = "daemon"
 sinks = "sinks"
+windows = "windows.toml"
 
 [[sources]]
-type = "tcp"
+connect = "tcp_src"
 name = "ingress_tcp"
-listen = "tcp://127.0.0.1:9800"
+addr = "127.0.0.1"
+port = "9800"
+framing = "len"
+data_format = "arrow_framed"
 
 [runtime]
 executor_parallelism = 2
@@ -109,25 +114,34 @@ rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules   = "rules/*.wfl"
 
+[vars]
+FAIL_THRESHOLD = "3"
+```
+
+窗口默认值与覆盖不写在 `fusion.toml`，而是放在独立的 `windows.toml` 中，由顶层 `windows = "windows.toml"` 引用：
+
+```toml
+# windows.toml
 [window_defaults]
+evict_interval = "30s"
+max_window_bytes = "256MB"
+max_total_bytes = "2GB"
+evict_policy = "time_first"
 watermark = "5s"
 allowed_lateness = "0s"
 late_policy = "drop"
-
-[vars]
-FAIL_THRESHOLD = "3"
 ```
 
 第 4 步，启动引擎：
 
 ```bash
-wfusion run --config fusion.toml
+wfusion daemon --config fusion.toml
 ```
 
 如需直接看到指标快照：
 
 ```bash
-wfusion run --config fusion.toml --metrics --metrics-interval 2s
+wfusion daemon --config fusion.toml --metrics --metrics-interval 2s
 ```
 
 ## 三文件模型
@@ -137,8 +151,8 @@ WFL 采用职责分离的三文件模型：
 | 文件 | 扩展名 | 职责 | 热加载 |
 |------|--------|------|:------:|
 | Window Schema | `.wfs` | 逻辑数据定义（window、field、time、over） | 否 |
-| 检测规则 | `.wfl` | 检测逻辑（bind/match/join/yield） | 是 |
-| 运行时配置 | `.toml` | 物理参数（mode、sources、watermark、sinks） | 仅 `[vars]` |
+| 检测规则 | `.wfl` | 检测逻辑（events/match/join/yield） | 是 |
+| 运行时配置 | `.toml` | 物理参数（mode、sources、watermark、sinks） | 仅 `[vars]` 与 `[output]` |
 
 依赖关系如下：
 
@@ -180,15 +194,15 @@ selector 参数是静态符号，不加引号。详细规则见 [规则编写指
 
 ## 模式说明
 
-- `mode = "daemon"`：常驻运行，至少需要一个启用的 `tcp` source
-- `mode = "batch"`：批处理回放，至少需要一个启用的 `file` source，且不允许启用 `tcp` source
+- `mode = "daemon"`：常驻运行，至少需要一个启用的 source（任意类型）
+- `mode = "batch"`：批处理回放，至少需要一个启用的 `file` source，且不允许启用任何非 `file` 类型的 source
 
 ## Source 约定
 
 `wfusion` 的输入统一通过 `[[sources]]` 声明：
 
-- `type = "tcp"`：基于 TCP 接收数据
-- `type = "file"`：基于文件回放数据
+- `connect = "tcp_src"`：基于 TCP 接收数据（`addr` + `port`）
+- `connect = "file_src"` 或 `type = "file"`：基于文件回放数据
 
 不再使用 `[server]` 配置块。
 

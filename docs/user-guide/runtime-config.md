@@ -5,13 +5,14 @@
 ```toml
 mode = "daemon"                              # daemon | batch
 sinks = "sinks"
+windows = "windows.toml"                     # 窗口默认值与覆盖（外部文件）
 
 [output]
 time_format = "%Y-%m-%d %H:%M:%S%.3f"
 time_zone = "utc"
 
 [[sources]]
-type = "tcp"
+connect = "tcp_src"                          # TCP 接入（addr + port 由 connector 解析）
 name = "ingress_tcp"
 addr = "127.0.0.1"
 port = "9800"
@@ -23,7 +24,7 @@ type = "file"
 name = "seed_auth"
 path = "data/auth_events.ndjson"
 stream_tag = "syslog"
-data_format = "ndjson"                     # ndjson | arrow_framed | arrow_ipc
+data_format = "ndjson"                     # ndjson | csv | arrow_framed | arrow_ipc
 
 [[sources]]
 type = "file"
@@ -44,6 +45,15 @@ rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules   = "rules/*.wfl"
 
+[vars]
+FAIL_THRESHOLD = "3"
+SCAN_THRESHOLD = "10"
+```
+
+窗口默认值与按窗口覆盖不写在 `wfusion.toml`，而是放在独立文件（顶层 `windows = "windows.toml"` 引用）：
+
+```toml
+# windows.toml
 [window_defaults]
 evict_interval = "30s"
 max_window_bytes = "256MB"
@@ -62,16 +72,19 @@ over_cap = "30m"
 mode = "local"
 max_window_bytes = "64MB"
 over_cap = "1h"
-
-[vars]
-FAIL_THRESHOLD = "3"
-SCAN_THRESHOLD = "10"
 ```
+
+## 实例与状态过期（窗口 TTL）
+
+每条规则的实例（per-key 匹配状态）按 `match` 窗口时长保留（`match<sip:5m>` → 距最后事件 5m）。
+运行时**周期扫描**会按墙钟时间推进有效水位（`watermark + 距上次处理事件的墙钟时间`），因此
+**输入静默时实例也会按窗口 TTL 自动过期释放**，无需新事件触发。可通过
+`rule.instances` / `window.memory_bytes` 指标观察实例数与窗口内存。
 
 ## 模式
 
-- `mode = "daemon"`：常驻运行，要求至少一个启用的 `tcp` source
-- `mode = "batch"`：批处理回放，要求至少一个启用的 `file` source，且不允许启用 `tcp` source
+- `mode = "daemon"`：常驻运行，要求至少一个启用的 source（任意类型）
+- `mode = "batch"`：批处理回放，要求至少一个启用的 `file` source，且不允许启用任何非 `file` 类型的 source
 
 ## Sources
 
@@ -79,11 +92,11 @@ SCAN_THRESHOLD = "10"
 
 ### TCP Source
 
-通过 connector factory 构建，使用 `addr` + `port` + `framing` + `data_format` 参数：
+通过 connector factory 构建。使用 `connect = "tcp_src"` + `addr` + `port` + `framing` + `data_format` 参数：
 
 ```toml
 [[sources]]
-type = "tcp"
+connect = "tcp_src"
 name = "ingress_tcp"
 addr = "127.0.0.1"
 port = "9800"
@@ -108,11 +121,12 @@ stream_tag = ""                 # 可选：固定 stream tag；留空则用帧 t
 
 ### File Source
 
-当前支持三种格式：
+当前支持四种格式：
 
 | 格式 | 含义 | `stream_tag` |
 |------|------|----------|
 | `ndjson` | 逐行 JSON | 可用固定 `stream_tag`，也可用 `stream_tag_field` |
+| `csv` | 逗号分隔文本 | 可用固定 `stream_tag`，也可用 `stream_tag_field` |
 | `arrow_framed` | 当前 `wp_arrow` 分帧文件格式 | 可省略 |
 | `arrow_ipc` | 标准 Arrow IPC file | 必填 |
 
@@ -175,11 +189,10 @@ data_format = "arrow_ipc"
 - `arrow_framed` 自带逐帧边界和路由 tag
 - `arrow_ipc` 是标准文件格式，不包含该路由信息
 
-因此不做自动判别，直接显式写成：
+因此不做自动判别。不指定 `data_format` 时默认 `ndjson`；Arrow 相关格式必须显式写：
 
 - `arrow_framed`
 - `arrow_ipc`
-- `ndjson`
 
 ## Runtime
 
@@ -214,11 +227,15 @@ time_zone = "utc"
 
 ## 窗口默认值与覆盖
 
-全局默认：
+窗口配置放在 `windows = "..."` 指向的外部文件（例如 `windows.toml`），不在 `wfusion.toml` 内联。`[window_defaults]` 所有字段都是必填，无隐式默认：
 
 ```toml
+# windows.toml
 [window_defaults]
+evict_interval = "30s"
 max_window_bytes = "256MB"
+max_total_bytes = "2GB"
+evict_policy = "time_first"
 watermark = "5s"
 allowed_lateness = "0s"
 late_policy = "drop"
@@ -228,6 +245,7 @@ late_policy = "drop"
 
 ```toml
 [window.high_volume_events]
+mode = "local"
 max_window_bytes = "1GB"
 over_cap = "1h"
 ```
@@ -322,7 +340,7 @@ file = "${CONFIG_DIR}/logs/wfusion.log"
 `wfusion` 支持在 base config 之上叠加一个或多个 overlay 文件：
 
 ```bash
-wfusion run \
+wfusion daemon \
   --config conf/wfusion.toml \
   --overlay conf/batch.toml \
   --overlay conf/local-dev.toml
@@ -355,7 +373,7 @@ wfusion run \
 因此以下两种写法都成立：
 
 ```bash
-wfusion run --config conf/wfusion.toml --work-dir /path/to/project
+wfusion daemon --config conf/wfusion.toml --work-dir /path/to/project
 ```
 
 ```toml
@@ -416,7 +434,7 @@ CASE_PATH = "/tmp/case-a"
 如果需要临时改成相对于另一个目录运行，可以在 CLI 里传：
 
 ```bash
-wfusion run --config conf/wfusion.toml --work-dir ..
+wfusion daemon --config conf/wfusion.toml --work-dir ..
 ```
 
 此时上述相对路径会改为相对于 `--work-dir` 指定的目录解析。
@@ -429,12 +447,12 @@ wfusion run --config conf/wfusion.toml --work-dir ..
 sinks = "sinks"
 ```
 
-目录结构：
+目录结构（Connector 定义在 `sinks` 同级目录的 `connectors/sink.d/` 下）：
 
 - `defaults.toml`
-- `sink.d/`
 - `business.d/`
 - `infra.d/`
+- `../connectors/sink.d/`
 
 输出格式取决于 sink：
 
@@ -518,9 +536,9 @@ file = "security_alerts.jsonl"
 默认不应暴露：
 
 - `__wfu_fired_at`
-- `__wfu_scored_at`
 - `__wfu_emit_time`
 - `__wfu_origin`
+- `__wfu_summary`
 
 如果目标 window 定义了 `time` 列，runtime 会在用户未显式给该列赋值时，自动继承输入事件时间到该 time 列，供下游 `match<...>` 使用；这个时间不会额外生成新的 `__wfu_*` 字段。
 
@@ -535,13 +553,13 @@ file = "security_alerts.jsonl"
   - number -> `float`
   - bool -> `bool`
   - string -> `chars`
-- `array/*` 第一版统一退化为 JSON string，再以 `chars` 导出
+- `array/*` 与未类型化 `array` 导出为数组（Arrow `Array` 类型），JSON sink 渲染为 JSON 数组，不降级为字符串
 
 数组示例：
 
 ```json
 {
-  "ports": "[22,80,443]"
+  "ports": [22, 80, 443]
 }
 ```
 
@@ -550,12 +568,12 @@ file = "security_alerts.jsonl"
 启动：
 
 ```bash
-wfusion run --config fusion.toml
+wfusion daemon --config wfusion.toml
 ```
 
 启动流程：
 
-1. 加载并校验 `fusion.toml`
+1. 加载并校验 `wfusion.toml`
 2. 解析 `.wfs`
 3. 解析并编译 `.wfl`
 4. 创建窗口缓冲区和规则执行器
@@ -565,7 +583,7 @@ wfusion run --config fusion.toml
 执行链：
 
 ```text
-Source -> Router -> WindowStore -> MatchEngine -> YieldWriter -> AlertSink
+Source -> Router -> WindowRegistry -> RuleExecutor -> AlertDispatcher -> SinkDispatcher
 ```
 
 热加载约定：

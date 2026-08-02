@@ -178,9 +178,9 @@ rule final_risk {
 默认不透传：
 
 - `__wfu_fired_at`
-- `__wfu_scored_at`
 - `__wfu_emit_time`
 - `__wfu_origin`
+- `__wfu_summary`
 
 原因是中间层是“可继续计算的数据”，不是“最终告警结果”。
 

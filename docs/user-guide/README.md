@@ -18,7 +18,7 @@
 ## 推荐阅读顺序
 
 1. 先读 [快速开始](./quick-start.md)，跑通一个最小规则。
-2. 读 [核心概念与处理过程](./core-concepts.md)，理解固定执行链 `BIND -> SCOPE(match) -> JOIN -> ENTITY -> YIELD`。
+2. 读 [核心概念与处理过程](./core-concepts.md)，理解固定执行链 `EVENTS -> SCOPE(match) -> JOIN -> ENTITY -> YIELD`。
 3. 按 [规则编写指南](./rule-writing.md) 学习常见检测规则写法。
 4. 写规则时查 [语言参考](./language-reference.md)，尤其是 `yield`、时间变量、统计上下文和函数行为。
 5. 接入真实链路时读 [运行时配置](./runtime-config.md) 和 [运维指南](./operations.md)。
