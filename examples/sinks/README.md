@@ -1,173 +1,99 @@
 # sinks/ — 告警输出目标配置
 
-WarpFusion 支持将告警输出到多种目标（Sinks），包括文件、HTTP 端点、Syslog 等。本目录包含 Sink 配置的示例。
+WarpFusion 的告警输出采用 connector-based sink 路由。`sinks/` 目录存放路由组（business/infra），Connector 定义放在同级 `connectors/sink.d/` 下。
 
 ## 目录结构
 
 ```
 sinks/
-├── defaults.toml            # 全局默认配置
-├── business.d/              # 业务告警 sinks
-├── infra.d/                 # 基础设施告警 sinks
-└── sink.d/                  # 通用 sinks
+├── defaults.toml            # 全局默认标签
+├── business.d/              # 业务路由组（按 yield target window 通配符匹配）
+│   ├── security.toml        #   windows = ["security_*"] → 输出 security_alerts.jsonl
+│   └── catch_all.toml       #   windows = ["*"] → 兜底输出 all.jsonl
+└── infra.d/                 # 基础设施组
+    ├── default.toml         #   __default 兜底（未匹配任何业务组时）
+    └── error.toml           #   __error 容错（写入失败时）
+
+connectors/
+└── sink.d/                  # Connector 定义（id + type + 默认参数）
+    └── file_json.toml       #   id = "file_json"，type = "file"
 ```
 
-## 配置结构
+## 路由逻辑
 
-Sink 配置采用 TOML 格式，支持多目录组织：
-
-| 目录 | 用途 |
-|------|------|
-| `business.d/` | 业务风险告警（安全事件、用户行为等） |
-| `infra.d/` | 运维告警（系统状态、性能指标等） |
-| `sink.d/` | 通用输出目标 |
-
-## 默认配置
-
-`defaults.toml`:
-
-```toml
-tags = ["env:dev"]
+```
+OutputRecord → to_data_record() → SinkDispatcher.dispatch(yield_target, DataRecord)
+        ├─ 按 yield target window 通配符匹配 business group
+        ├─ 无匹配 → __default group（兜底）
+        └─ 写入失败 → __error group（容错）
 ```
 
-## Sink 类型
+`[[sink_group.sinks]]` 里的 `connect` 引用 `connectors/sink.d/` 中定义的 connector id。
 
-### File Sink（文件输出）
+## 业务路由组
+
+`business.d/security.toml`：
 
 ```toml
-[sink.security_alerts_file]
+[sink_group]
+name = "security_output"
+windows = ["security_*"]
+
+[[sink_group.sinks]]
+connect = "file_json"
+name = "sec_file"
+
+[sink_group.sinks.params]
+file = "security_alerts.jsonl"
+```
+
+- `windows` 是 yield target window 名的 wildmatch 模式，`security_*` 匹配所有 `security_` 开头的输出 window
+- 每个 sink 可写 `params` 覆盖 connector 默认参数（只有 connector `allow_override` 声明的 key 才能覆盖）
+
+## Connector 定义
+
+`connectors/sink.d/file_json.toml`：
+
+```toml
+[[connectors]]
+id = "file_json"
 type = "file"
-path = "/var/log/warpfusion/alerts.jsonl"
-format = "jsonl"           # jsonl | json | csv
+allow_override = ["base", "file", "sync"]
+
+[connectors.params]
+fmt = "json"
+base = "alerts"
+file = "default.jsonl"
+sync = false
 ```
 
-### HTTP Sink（Webhook）
+`id` 是规则/sink 引用名；`type` 决定输出编码（`file` 类型当前输出 JSON Lines）。
 
-```toml
-[sink.webhook]
-type = "http"
-url = "https://api.example.com/alerts"
-method = "POST"
-headers = { Authorization = "Bearer token" }
-timeout = "30s"
-retry = 3
-```
+## 输出记录
 
-### Syslog Sink
-
-```toml
-[sink.syslog]
-type = "syslog"
-host = "syslog.example.com"
-port = 514
-protocol = "udp"           # udp | tcp
-tls = false
-facility = "local0"
-severity = "info"
-```
-
-### Kafka Sink
-
-```toml
-[sink.kafka]
-type = "kafka"
-brokers = ["kafka1:9092", "kafka2:9092"]
-topic = "security-alerts"
-compression = "snappy"
-acks = "all"
-```
-
-## 路由配置
-
-在 `wfusion.toml` 中指定 sinks 目录：
-
-```toml
-sinks = "sinks"
-```
-
-在规则中指定输出目标：
-
-```wfl
-rule brute_force {
-    ...
-    yield security_alerts (
-        sip = fail.sip,
-        alert_type = "brute_force"
-    )
-}
-```
-
-`sink` 名称与 `yield` 目标 window 名称匹配。
-
-## 高级特性
-
-### 条件路由
-
-```toml
-[sink.critical_webhook]
-type = "http"
-url = "https://pagerduty.com/integration"
-condition = "severity >= 80"   # 仅高风险告警
-```
-
-### 多副本输出
-
-```toml
-[sink.multi_backup]
-type = "multi"
-sinks = ["file_primary", "file_backup", "webhook"]
-```
-
-### 批量与缓冲
-
-```toml
-[sink.buffered_file]
-type = "file"
-path = "/var/log/warpfusion/alerts.jsonl"
-batch_size = 100
-flush_interval = "5s"
-max_buffer = "10MB"
-```
-
-### 告警去重
-
-```toml
-[sink.dedup_webhook]
-type = "http"
-url = "https://api.example.com/alerts"
-dedup_window = "5m"        # 5 分钟内相同 alert_id 只发送一次
-```
-
-## 输出格式
-
-### JSON Lines（默认）
+进入 sink 的每条告警是结构化 `DataRecord`，系统字段带 `__wfu_` 前缀，`yield (...)` 里的业务字段按原名展开。JSON Lines 输出示例：
 
 ```json
-{"alert_id":"sha256-hash","rule_name":"brute_force","entity_type":"ip","entity_id":"10.0.0.1","score":70.0,"emit_time":"2026-01-01T00:05:00Z"}
+{"__wfu_id":"308a0bfb8ebc3787","__wfu_rule_name":"port_scan","__wfu_score":60.0,"__wfu_entity_type":"ip","__wfu_entity_id":"10.0.0.1","__wfu_origin":"event","__wfu_fired_at":"2026-01-01T00:00:09.000Z","__wfu_emit_time":"...","__wfu_summary":"rule=port_scan; scope=[sip=10.0.0.1]; step0=10.0; origin=event"}
 ```
 
-### 扩展字段
+如需按字段投影/排序输出，可在 `[[sink_group.sinks]]` 顶层写 `fields = [...]`：
 
 ```toml
-[sink.enriched]
-type = "file"
-path = "/var/log/alerts.jsonl"
-include_fields = ["rule_name", "entity_type", "entity_id", "score", "emit_time"]
-add_tags = ["datacenter:dc1", "team:security"]
+[[sink_group.sinks]]
+connect = "file_json"
+fields = ["__wfu_rule_name", "__wfu_score", "sip", "fail_count"]
+
+[sink_group.sinks.params]
+file = "security_alerts.jsonl"
 ```
 
-## 运维建议
-
-1. **分级输出**: 高风险告警 → PagerDuty/钉钉，中低风险 → 日志文件
-2. **本地缓冲**: 网络不稳定时使用文件缓冲，避免丢数据
-3. **监控指标**: 关注 `sink_drops_total`、`sink_latency_seconds` 等指标
-4. **权限控制**: Sink 目录设为只读，防止运行时修改配置
+未列出的字段不会发给该 sink；配置了不存在的字段运行时会报错。
 
 ## 故障排查
 
 | 问题 | 排查方向 |
 |------|----------|
-| 告警未输出 | 检查 sink 名称与 yield target 是否匹配 |
-| HTTP 失败 | 查看 `wf-engine.log` 中的网络错误 |
-| 磁盘满 | 检查文件 sink 的日志轮转配置 |
-| 格式错误 | 验证 TOML 语法和字段类型 |
+| 告警未输出 | 检查 yield target 是否被至少一个 business group 的 `windows` 匹配 |
+| 兜底/容错 | 确认 `infra.d/default.toml`（`__default`）与 `infra.d/error.toml`（`__error`）存在 |
+| 字段缺失 | 检查 `fields` 投影是否遗漏，或 connector `allow_override` 是否允许该参数覆盖 |

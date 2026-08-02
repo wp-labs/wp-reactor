@@ -7,7 +7,9 @@
 ```
 examples/
 ├── wfusion.toml              # WFusion 运行时配置
-├── sinks/                    # 输出 sink 配置
+├── windows.toml              # 窗口默认值与按窗口覆盖（由 `windows = ...` 引用）
+├── sinks/                    # 输出 sink 路由组配置
+├── connectors/               # Connector 定义（sink.d/）
 │
 ├── count/                    # 场景 1: count 阈值
 ├── distinct/                 # 场景 2: distinct 去重计数
@@ -29,7 +31,8 @@ examples/
 | `rules/` | 规则文件（可含内联测试） (`.wfl`) |
 | `data/` | 用于 replay 的样本数据 (`.ndjson`) |
 | `out/` | replay 输出目录 |
-| `scenarios/` | 数据生成场景 (`.wfg`，部分场景有) |
+
+> `.wfg` 数据生成场景不随本仓库示例附带；`wfgen` 示例见 `../warp-fusion/crates/wfgen/examples`。
 
 ## 场景说明
 
@@ -178,11 +181,8 @@ wfl replay rules/top50_function_showcase.wfl --schemas "schemas/*.wfs" --input d
 
 ```bash
 rm -f examples/file_input/alerts/all.jsonl
-cargo run --manifest-path ../warp-fusion/Cargo.toml --bin wfusion -- run --config examples/file_input/wfusion.toml &
-PID=$!
-sleep 2
-kill -INT "$PID"
-wait "$PID"
+cargo run --manifest-path ../warp-fusion/Cargo.toml --bin wfusion -- batch \
+    --config examples/file_input/wfusion.toml
 wc -l examples/file_input/alerts/all.jsonl
 ```
 

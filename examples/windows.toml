@@ -1,0 +1,19 @@
+# 窗口默认值与按窗口覆盖（由 wfusion.toml 顶层 `windows = "windows.toml"` 引用）
+[window_defaults]
+evict_interval = "30s"
+max_window_bytes = "256MB"
+max_total_bytes = "2GB"
+evict_policy = "time_first"
+watermark = "5s"
+allowed_lateness = "0s"
+late_policy = "drop"
+
+[window.auth_events]
+mode = "local"
+max_window_bytes = "256MB"
+over_cap = "30m"
+
+[window.security_alerts]
+mode = "local"
+max_window_bytes = "64MB"
+over_cap = "1h"
