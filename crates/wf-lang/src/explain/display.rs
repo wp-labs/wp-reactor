@@ -28,7 +28,9 @@ impl fmt::Display for RuleExplanation {
             "  Match <{}> {}:",
             self.match_expl.keys, self.match_expl.window_spec
         )?;
-        if !self.match_expl.event_steps.is_empty() {
+        // Seq-mode rules drive progression through `event_steps` too, so the steps
+        // appear twice unless we suppress the `on event:` section for them.
+        if self.match_expl.seq.is_none() && !self.match_expl.event_steps.is_empty() {
             writeln!(f, "    on event:")?;
             for (i, step) in self.match_expl.event_steps.iter().enumerate() {
                 writeln!(f, "      step {}: {}", i + 1, step)?;
@@ -41,6 +43,12 @@ impl fmt::Display for RuleExplanation {
             };
             writeln!(f, "    {}", label)?;
             for (i, step) in self.match_expl.close_steps.iter().enumerate() {
+                writeln!(f, "      step {}: {}", i + 1, step)?;
+            }
+        }
+        if let Some(chain_steps) = &self.match_expl.seq {
+            writeln!(f, "    seq:")?;
+            for (i, step) in chain_steps.iter().enumerate() {
                 writeln!(f, "      step {}: {}", i + 1, step)?;
             }
         }

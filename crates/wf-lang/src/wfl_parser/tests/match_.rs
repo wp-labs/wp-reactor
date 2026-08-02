@@ -341,3 +341,190 @@ rule r {
         })
     );
 }
+
+// -----------------------------------------------------------------------
+// Chain clause — ordered sequence matching (L1/L2)
+// -----------------------------------------------------------------------
+
+#[test]
+fn parse_seq_basic() {
+    let input = r#"
+rule rat_propagation {
+    events {
+        scan  : conn_events
+        login : auth_events
+        xfer  : conn_events
+    }
+    match<sip,dip:30m> {
+        on event seq {
+            has scan;
+            has login within 10m;
+            has xfer;
+        }
+    } -> score(95.0)
+    entity(ip, scan.sip)
+    yield out (x = scan.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let mc = &file.rules[0].match_clause;
+    let chain = mc.seq.as_ref().expect("expected chain clause");
+    assert!(!chain.consec, "default is gap (non-consec)");
+    assert_eq!(chain.skip, SeqSkip::PastLast, "default skip is past_last");
+    assert_eq!(chain.steps.len(), 3);
+    // step 1: has scan — synthesized count >= 1
+    let s0 = &chain.steps[0];
+    assert!(!s0.neg);
+    assert!(s0.within.is_none());
+    assert_eq!(s0.branch.source, "scan");
+    assert_eq!(s0.branch.pipe.transforms, vec![]);
+    assert_eq!(s0.branch.pipe.measure, Measure::Count);
+    assert_eq!(s0.branch.pipe.cmp, CmpOp::Ge);
+    // step 2: has login within 10m
+    let s1 = &chain.steps[1];
+    assert_eq!(s1.branch.source, "login");
+    assert_eq!(s1.within.unwrap().as_secs(), 10 * 60);
+    // step 3
+    assert_eq!(chain.steps[2].branch.source, "xfer");
+}
+
+#[test]
+fn parse_seq_modifiers_negation_aggregate() {
+    let input = r#"
+rule seq_mods {
+    events {
+        fail  : auth_events
+        ok    : auth_events
+        spray : auth_events
+    }
+    match<password_hash:10m> {
+        on event seq consec skip = to_next {
+            spray.user | distinct | count >= 5;
+            has ok within 5m;
+            not has fail within 5m;
+        }
+    } -> score(85.0)
+    entity(credential, spray.password_hash)
+    yield out (u = ok.user)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let mc = &file.rules[0].match_clause;
+    let chain = mc.seq.as_ref().expect("expected chain clause");
+    assert!(chain.consec);
+    assert_eq!(chain.skip, SeqSkip::ToNext);
+    assert_eq!(chain.steps.len(), 3);
+    // aggregate step: spray.user | distinct | count >= 5
+    let s0 = &chain.steps[0];
+    assert!(!s0.neg);
+    assert_eq!(s0.branch.source, "spray");
+    assert_eq!(s0.branch.pipe.transforms, vec![Transform::Distinct]);
+    assert_eq!(s0.branch.pipe.measure, Measure::Count);
+    assert_eq!(s0.branch.pipe.cmp, CmpOp::Ge);
+    assert!(s0.within.is_none());
+    // has ok within 5m
+    let s1 = &chain.steps[1];
+    assert!(!s1.neg);
+    assert_eq!(s1.branch.source, "ok");
+    assert_eq!(s1.within.unwrap().as_secs(), 5 * 60);
+    // not has fail within 5m
+    let s2 = &chain.steps[2];
+    assert!(s2.neg);
+    assert_eq!(s2.branch.source, "fail");
+    assert_eq!(s2.within.unwrap().as_secs(), 5 * 60);
+}
+
+#[test]
+fn parse_on_event_any_mode() {
+    let input = r#"
+rule any_mode {
+    events {
+        a : win1
+        b : win2
+    }
+    match<k:5m> {
+        on event any {
+            a | count >= 1;
+            b | count >= 1;
+        }
+    } -> score(50.0)
+    entity(ip, "x")
+    yield out (x = "y")
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let mc = &file.rules[0].match_clause;
+    assert_eq!(mc.match_mode, MatchMode::Any);
+    assert!(mc.seq.is_none());
+    assert_eq!(mc.on_event.len(), 2);
+}
+
+#[test]
+fn parse_on_event_seq_mode() {
+    let input = r#"
+rule seq_mode {
+    events {
+        a : win1
+        b : win2
+    }
+    match<k:5m> {
+        on event seq {
+            has a;
+            has b within 1m;
+        }
+    } -> score(50.0)
+    entity(ip, "x")
+    yield out (x = "y")
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let mc = &file.rules[0].match_clause;
+    assert_eq!(mc.match_mode, MatchMode::Seq);
+    let seq = mc.seq.as_ref().expect("expected seq clause");
+    assert_eq!(seq.steps.len(), 2);
+    assert!(mc.on_event.is_empty());
+}
+
+#[test]
+fn parse_has_in_any_mode() {
+    let input = r#"
+rule any_has {
+    events {
+        a : win1
+        b : win2
+    }
+    match<k:5m> {
+        on event any {
+            has a;
+            has b;
+        }
+    } -> score(50.0)
+    entity(ip, "x")
+    yield out (x = "y")
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let mc = &file.rules[0].match_clause;
+    assert_eq!(mc.match_mode, MatchMode::Any);
+    assert_eq!(mc.on_event.len(), 2);
+}
+
+#[test]
+fn within_in_any_mode_is_parse_error() {
+    let input = r#"
+rule bad_any {
+    events {
+        a : win1
+        b : win2
+    }
+    match<k:5m> {
+        on event any {
+            a | count >= 1 within 5s;
+        }
+    } -> score(50.0)
+    entity(ip, "x")
+    yield out (x = "y")
+}
+"#;
+    assert!(parse_wfl(input).is_err(), "within in `on event any` should be a parse error");
+}

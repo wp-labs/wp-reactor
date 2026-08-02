@@ -31,6 +31,8 @@ fn session_plan(gap_secs: u64) -> wf_lang::plan::MatchPlan {
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: std::collections::HashMap::new(),
         tracked_plain_fields: HashSet::new(),
+        seq: None,
+        match_mode: wf_lang::ast::MatchMode::Seq,
     }
 }
 

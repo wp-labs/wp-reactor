@@ -3,13 +3,14 @@ use std::time::Duration;
 
 use crate::ast::{
     CloseMode, EachClause, EntityClause, EntityTypeVal, EventsBlock, Expr, FieldRef, MatchClause,
-    Measure, RuleDecl, ScoreExpr, WflFile, WindowMode, YieldClause,
+    Measure, RuleDecl, ScoreExpr, SeqSkip, WflFile, WindowMode, YieldClause,
 };
 use crate::checker::check_wfl;
 use crate::plan::{
     AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, EachPlan, EntityPlan,
     ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, PatternOriginPlan,
-    RateSpec, RulePlan, ScorePlan, SortKeyPlan, StepPlan, WindowSpec, YieldField, YieldPlan,
+    RateSpec, RulePlan, ScorePlan, SeqPlan, SeqSkipPlan, SeqStepPlan, SortKeyPlan, StepPlan,
+    WindowSpec, YieldField, YieldPlan,
 };
 use crate::schema::WindowSchema;
 use crate::yield_preset::expand_yield_args;
@@ -278,11 +279,23 @@ fn compile_match(mc: &MatchClause, inject_implicit_stage_labels: bool) -> MatchP
             WindowMode::Fixed => WindowSpec::Fixed(mc.duration),
             WindowMode::Session(gap) => WindowSpec::Session(gap),
         },
-        event_steps: mc
-            .on_event
-            .iter()
-            .map(|s| compile_step(s, inject_implicit_stage_labels))
-            .collect(),
+        event_steps: if let Some(chain) = &mc.seq {
+            // Chain rules: emit ordered use-steps into event_steps so the existing
+            // ordered progression + fire-and-reset machinery drives execution.
+            // Negation steps are excluded here (enforced via SeqPlan in L2).
+            chain.steps
+                .iter()
+                .filter(|s| !s.neg)
+                .map(|s| StepPlan {
+                    branches: vec![compile_branch(&s.branch, inject_implicit_stage_labels)],
+                })
+                .collect()
+        } else {
+            mc.on_event
+                .iter()
+                .map(|s| compile_step(s, inject_implicit_stage_labels))
+                .collect()
+        },
         close_steps: mc
             .on_close
             .as_ref()
@@ -298,6 +311,23 @@ fn compile_match(mc: &MatchClause, inject_implicit_stage_labels: bool) -> MatchP
             .as_ref()
             .map(|cb| cb.mode)
             .unwrap_or(CloseMode::Or),
+        match_mode: mc.match_mode,
+        seq: mc.seq.as_ref().map(|chain| SeqPlan {
+            consec: chain.consec,
+            skip: match chain.skip {
+                SeqSkip::PastLast => SeqSkipPlan::PastLast,
+                SeqSkip::ToNext => SeqSkipPlan::ToNext,
+            },
+            steps: chain
+                .steps
+                .iter()
+                .map(|s| SeqStepPlan {
+                    neg: s.neg,
+                    within: s.within,
+                    branch: compile_branch(&s.branch, inject_implicit_stage_labels),
+                })
+                .collect(),
+        }),
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: std::collections::HashMap::new(),
         tracked_plain_fields: HashSet::new(),

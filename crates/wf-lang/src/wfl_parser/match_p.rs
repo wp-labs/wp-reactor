@@ -46,17 +46,44 @@ pub(super) fn match_clause_only(input: &mut &str) -> ModalResult<MatchClause> {
     ws_skip.parse_next(input)?;
     let key_mapping = opt(key_block).parse_next(input)?;
 
-    // on event block (required)
+    // Match body:
+    //   `on event { ... } [close]`        — ordered (default, backward compat)
+    //   `on event seq [mods] { ... }`     — ordered + within/not/consec/skip
+    //   `on event any { ... }`            — unordered co-occurrence
     ws_skip.parse_next(input)?;
-    let on_event = cut_err(on_event_block)
-        .context(StrContext::Expected(StrContextValue::Description(
-            "'on event' block",
-        )))
+    kw("on").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(kw("event"))
+        .context(StrContext::Expected(StrContextValue::Description("'event'")))
         .parse_next(input)?;
-
-    // close block: "on close {...}" (OR) or "and close {...}" (AND)
     ws_skip.parse_next(input)?;
-    let on_close = opt(close_block).parse_next(input)?;
+
+    let (on_event, on_close, seq, match_mode) = if opt(kw("seq")).parse_next(input)?.is_some() {
+        // `on event seq { ... }` — ordered + within/not/consec/skip
+        let seq = cut_err(seq_block_body)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "seq block body",
+            )))
+            .parse_next(input)?;
+        (Vec::new(), None, Some(seq), MatchMode::Seq)
+    } else if opt(kw("any")).parse_next(input)?.is_some() {
+        // `on event any { ... }` — unordered co-occurrence
+        ws_skip.parse_next(input)?;
+        cut_err(literal("{")).parse_next(input)?;
+        let steps = cut_err(match_steps).parse_next(input)?;
+        cut_err(literal("}")).parse_next(input)?;
+        (steps, None, None, MatchMode::Any)
+    } else {
+        // bare `on event { ... } [close]` — ordered (backward compat)
+        let on_event = cut_err(on_event_block)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "'on event' block",
+            )))
+            .parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        let on_close = opt(close_block).parse_next(input)?;
+        (on_event, on_close, None, MatchMode::Seq)
+    };
 
     ws_skip.parse_next(input)?;
     cut_err(literal("}")).parse_next(input)?;
@@ -68,6 +95,8 @@ pub(super) fn match_clause_only(input: &mut &str) -> ModalResult<MatchClause> {
         window_mode,
         on_event,
         on_close,
+        match_mode,
+        seq,
     })
 }
 
@@ -228,10 +257,6 @@ fn field_ref(input: &mut &str) -> ModalResult<FieldRef> {
 // ---------------------------------------------------------------------------
 
 fn on_event_block(input: &mut &str) -> ModalResult<Vec<MatchStep>> {
-    kw("on").parse_next(input)?;
-    ws_skip.parse_next(input)?;
-    cut_err(kw("event")).parse_next(input)?;
-    ws_skip.parse_next(input)?;
     cut_err(literal("{")).parse_next(input)?;
     let steps = match_steps(input)?;
     cut_err(literal("}")).parse_next(input)?;
@@ -305,8 +330,39 @@ fn match_step(input: &mut &str) -> ModalResult<MatchStep> {
 }
 
 /// `[label ":"] source [".field" | '["field"]'] ["&&" guard] pipe_chain`
+/// or `has <alias> [&& guard]` (existential, implicit `count >= 1`).
 fn step_branch(input: &mut &str) -> ModalResult<StepBranch> {
     ws_skip.parse_next(input)?;
+
+    // `has <alias> [&& guard]` — existential step, implicit `count >= 1`.
+    if opt(kw("has")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        let source = cut_err(ident)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "event alias after `has`",
+            )))
+            .parse_next(input)?
+            .to_string();
+        ws_skip.parse_next(input)?;
+        let guard = if opt(literal("&&")).parse_next(input)?.is_some() {
+            ws_skip.parse_next(input)?;
+            Some(cut_err(expr::parse_expr).parse_next(input)?)
+        } else {
+            None
+        };
+        return Ok(StepBranch {
+            label: None,
+            source,
+            field: None,
+            guard,
+            pipe: PipeChain {
+                transforms: Vec::new(),
+                measure: Measure::Count,
+                cmp: CmpOp::Ge,
+                threshold: Expr::Number(1.0),
+            },
+        });
+    }
 
     // Try label: source or just source
     let (label, source) = alt((
@@ -429,6 +485,131 @@ fn cmp_op_step(input: &mut &str) -> ModalResult<CmpOp> {
         literal(">").value(CmpOp::Gt),
     ))
     .parse_next(input)
+}
+
+// ---------------------------------------------------------------------------
+// chain block — ordered sequence matching (L1/L2)
+// ---------------------------------------------------------------------------
+
+/// Parse chain body after the `chain` keyword:
+///   `[consec] [skip = past_last|to_next] { seq_steps }`
+fn seq_block_body(input: &mut &str) -> ModalResult<SeqClause> {
+    let mut consec = false;
+    ws_skip.parse_next(input)?;
+    if opt(kw("consec")).parse_next(input)?.is_some() {
+        consec = true;
+        ws_skip.parse_next(input)?;
+    }
+
+    let skip = if opt(kw("skip")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        cut_err(literal("=")).parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        let s = cut_err(alt((
+            kw("past_last").value(SeqSkip::PastLast),
+            kw("to_next").value(SeqSkip::ToNext),
+        )))
+        .context(StrContext::Expected(StrContextValue::Description(
+            "skip policy (past_last|to_next)",
+        )))
+        .parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        s
+    } else {
+        SeqSkip::PastLast
+    };
+
+    cut_err(literal("{")).parse_next(input)?;
+
+    let mut steps = Vec::new();
+    loop {
+        ws_skip.parse_next(input)?;
+        if input.starts_with('}') {
+            break;
+        }
+        let step = cut_err(seq_step)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "chain step",
+            )))
+            .parse_next(input)?;
+        steps.push(step);
+    }
+    if steps.is_empty() {
+        return Err(winnow::error::ErrMode::Cut(
+            winnow::error::ContextError::new(),
+        ));
+    }
+
+    ws_skip.parse_next(input)?;
+    cut_err(literal("}")).parse_next(input)?;
+
+    Ok(SeqClause { consec, skip, steps })
+}
+
+/// Parse one chain step: `[not] <body> [within dur] ;`
+/// body := `has <alias> [&& guard]` (existential) | step_branch (aggregate).
+fn seq_step(input: &mut &str) -> ModalResult<SeqStep> {
+    ws_skip.parse_next(input)?;
+    let neg = opt(kw("not")).parse_next(input)?.is_some();
+    ws_skip.parse_next(input)?;
+
+    let branch = if opt(kw("has")).parse_next(input)?.is_some() {
+        // `has <alias> [&& guard]` — existential step, implicit `count >= 1`
+        ws_skip.parse_next(input)?;
+        let source = cut_err(ident)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "event alias after `has`",
+            )))
+            .parse_next(input)?
+            .to_string();
+        ws_skip.parse_next(input)?;
+        let guard = if opt(literal("&&")).parse_next(input)?.is_some() {
+            ws_skip.parse_next(input)?;
+            Some(cut_err(expr::parse_expr).parse_next(input)?)
+        } else {
+            None
+        };
+        StepBranch {
+            label: None,
+            source,
+            field: None,
+            guard,
+            pipe: PipeChain {
+                transforms: Vec::new(),
+                measure: Measure::Count,
+                cmp: CmpOp::Ge,
+                threshold: Expr::Number(1.0),
+            },
+        }
+    } else {
+        // Aggregate step: reuse existing step_branch (pipe required)
+        cut_err(step_branch)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "chain step (has <alias> | <alias>.<field> | distinct | count >= N)",
+            )))
+            .parse_next(input)?
+    };
+
+    ws_skip.parse_next(input)?;
+    let within = if opt(kw("within")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        Some(cut_err(duration_value)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "within duration",
+            )))
+            .parse_next(input)?)
+    } else {
+        None
+    };
+
+    ws_skip.parse_next(input)?;
+    cut_err(literal(";"))
+        .context(StrContext::Expected(StrContextValue::Description(
+            "';' after chain step",
+        )))
+        .parse_next(input)?;
+
+    Ok(SeqStep { neg, within, branch })
 }
 
 // ---------------------------------------------------------------------------

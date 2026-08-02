@@ -1,3 +1,4 @@
+mod seq;
 mod close;
 mod conv;
 mod eval;
@@ -27,6 +28,7 @@ use std::collections::{BinaryHeap, HashMap};
 use wf_lang::ast::CloseMode;
 use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, WindowSpec};
 
+use seq::{SeqRuntime, consec_broken, scan_negations};
 use close::{accumulate_close_steps, evaluate_close, evidence_time_range};
 use key::{InstanceKey, extract_key, make_scope_key_str};
 use state::{AliasState, Instance, snapshot_bind_data};
@@ -68,11 +70,17 @@ pub struct CepStateMachine {
     /// This keeps `limits.max_memory` checks O(1) for the common path instead
     /// of re-summing every instance for every incoming event.
     estimated_memory_bytes: usize,
+    /// Chain semantics (`within` / `not` / `consec`) precomputed from the plan.
+    seq_meta: Option<SeqRuntime>,
 }
 
 impl CepStateMachine {
     /// Create a new state machine for the given rule + plan.
     pub fn new(rule_name: String, plan: MatchPlan, time_field: Option<String>) -> Self {
+        let seq_meta = plan
+            .seq
+            .as_ref()
+            .map(|c| SeqRuntime::build(&c.steps, c.consec));
         Self {
             rule_name,
             plan,
@@ -85,6 +93,7 @@ impl CepStateMachine {
             emit_window_start: 0,
             expiry_heap: BinaryHeap::new(),
             estimated_memory_bytes: 0,
+            seq_meta,
         }
     }
 
@@ -95,6 +104,10 @@ impl CepStateMachine {
         time_field: Option<String>,
         limits: Option<LimitsPlan>,
     ) -> Self {
+        let seq_meta = plan
+            .seq
+            .as_ref()
+            .map(|c| SeqRuntime::build(&c.steps, c.consec));
         Self {
             rule_name,
             plan,
@@ -107,6 +120,7 @@ impl CepStateMachine {
             emit_window_start: 0,
             expiry_heap: BinaryHeap::new(),
             estimated_memory_bytes: 0,
+            seq_meta,
         }
     }
 
@@ -337,6 +351,25 @@ impl CepStateMachine {
             );
         }
 
+        // 2b. Chain semantics: negation scan + strict adjacency.
+        let seq_broken = if let Some(meta) = self.seq_meta.as_ref() {
+            scan_negations(meta, &mut instance, alias, event, now_nanos, windows);
+            consec_broken(meta, &instance, plan, alias)
+        } else {
+            false
+        };
+        if seq_broken {
+            let reset_at = fixed_created_at.unwrap_or(now_nanos);
+            // A negation violation must persist across a `consec` adjacency break;
+            // otherwise an in-window violation could be wiped and the chain re-fire.
+            let neg_violated = instance.neg_violated;
+            instance.reset(plan, reset_at);
+            instance.neg_violated = neg_violated;
+            self.push_expiry_candidate(&instance_key, reset_at);
+            self.insert_instance(instance_key, instance);
+            return step_outcome(StepResult::Accumulate, None);
+        }
+
         // 3. Accumulate close steps (if any) — happens on every event
         if !plan.close_steps.is_empty() {
             accumulate_close_steps(
@@ -348,6 +381,107 @@ impl CepStateMachine {
                 windows,
                 &mut instance.baselines,
             );
+        }
+
+        // 3b. Any-mode (unordered co-occurrence): evaluate all steps in parallel and
+        // fire once every step has satisfied its threshold, regardless of order.
+        if plan.match_mode == wf_lang::ast::MatchMode::Any {
+            for step_idx in 0..plan.event_steps.len() {
+                if instance.satisfied_flags[step_idx] {
+                    continue;
+                }
+                let step_plan = &plan.event_steps[step_idx];
+                let (satisfied, _) = {
+                    let step_state = &mut instance.step_states[step_idx];
+                    evaluate_step_with_progress(
+                        StepEvaluationInput {
+                            alias,
+                            event,
+                            event_time_nanos: now_nanos,
+                            windows,
+                            progress: None,
+                        },
+                        step_plan,
+                        step_state,
+                        &mut instance.baselines,
+                    )
+                };
+                if let Some((branch_idx, measure_value)) = satisfied {
+                    let label = step_plan.branches[branch_idx].label.clone();
+                    let (first, last, collected, field_vals) = {
+                        let bs = &instance.step_states[step_idx].branch_states[branch_idx];
+                        (
+                            bs.event_first_time_nanos,
+                            bs.event_last_time_nanos,
+                            bs.collected_values.clone(),
+                            bs.field_values.clone(),
+                        )
+                    };
+                    instance.completed_steps.push(StepData {
+                        satisfied_branch_index: branch_idx,
+                        label,
+                        measure_value,
+                        event_first_time_nanos: first,
+                        event_last_time_nanos: last,
+                        collected_values: collected,
+                        field_values: field_vals,
+                    });
+                    instance.satisfied_flags[step_idx] = true;
+                }
+            }
+
+            if instance.satisfied_flags.iter().all(|&f| f) {
+                // Rate limiting before emitting (mirror the no-close path).
+                if let Some(ref limits) = self.limits
+                    && let Some(ref rate) = limits.max_throttle
+                {
+                    let window_nanos = rate.per.as_nanos() as i64;
+                    if now_nanos - self.emit_window_start >= window_nanos {
+                        self.emit_count = 0;
+                        self.emit_window_start = now_nanos;
+                    }
+                    if self.emit_count >= rate.count {
+                        match limits.on_exceed {
+                            ExceedAction::Throttle | ExceedAction::DropOldest => {
+                                let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                                instance.reset(plan, reset_at);
+                                self.push_expiry_candidate(&instance_key, reset_at);
+                                self.insert_instance(instance_key, instance);
+                                return step_outcome(StepResult::Accumulate, None);
+                            }
+                            ExceedAction::FailRule => {
+                                self.failed = true;
+                                self.insert_instance(instance_key, instance);
+                                return step_outcome(StepResult::Accumulate, None);
+                            }
+                        }
+                    }
+                    self.emit_count += 1;
+                }
+                let (evidence_first, evidence_last) =
+                    evidence_time_range(instance.completed_steps.iter())
+                        .unwrap_or((now_nanos, now_nanos));
+                let ctx = MatchedContext {
+                    rule_name: self.rule_name.clone(),
+                    scope_key,
+                    step_data: instance.completed_steps.clone(),
+                    bind_data: snapshot_bind_data(&instance.alias_states),
+                    event_time_nanos: now_nanos,
+                    event_first_time_nanos: evidence_first,
+                    event_last_time_nanos: evidence_last,
+                    window_start_time_nanos: instance.created_at,
+                    window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
+                    machine_id: instance.machine_id.clone(),
+                };
+                let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                instance.reset(plan, reset_at);
+                self.push_expiry_candidate(&instance_key, reset_at);
+                self.insert_instance(instance_key, instance);
+                return step_outcome(StepResult::Matched(ctx), None);
+            }
+
+            self.insert_instance(instance_key, instance);
+            return step_outcome(StepResult::Accumulate, None);
         }
 
         let mut progress = None;
@@ -412,10 +546,63 @@ impl CepStateMachine {
                 collected_values,
                 field_values: step_state.branch_states[branch_idx].field_values.clone(),
             });
+
+            // Chain `within`: the completing step must land within its gap of the
+            // previous step's completion (window start for the first step).
+            let within_violated = if let Some(meta) = self.seq_meta.as_ref() {
+                meta.within
+                    .get(step_idx)
+                    .copied()
+                    .flatten()
+                    .map_or(false, |w| {
+                        // Completion time = the event that completed the step
+                        // (`event_last_time_nanos`). For aggregate steps this differs
+                        // from `event_first_time_nanos` (threshold-met time, not
+                        // first-event time).
+                        let this_last = step_state.branch_states[branch_idx]
+                            .event_last_time_nanos
+                            .unwrap_or(now_nanos);
+                        let prev_last = if step_idx == 0 {
+                            instance.created_at
+                        } else {
+                            instance
+                                .completed_steps
+                                .get(step_idx - 1)
+                                .and_then(|sd| sd.event_last_time_nanos)
+                                .unwrap_or(instance.created_at)
+                        };
+                        // The gap must be non-negative and within `w`: an
+                        // out-of-order completion (this before prev) violates
+                        // "within" just as a gap that is too large does.
+                                                let gap = this_last - prev_last;
+                        gap < 0 || gap > w.as_nanos() as i64
+                    })
+            } else {
+                false
+            };
+            if within_violated {
+                let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                // Preserve a negation violation across a `within` reset, matching the
+                // `consec`-break reset: an in-window violation must not be wiped so the
+                // chain can re-fire.
+                let neg_violated = instance.neg_violated;
+                instance.reset(plan, reset_at);
+                instance.neg_violated = neg_violated;
+                self.push_expiry_candidate(&instance_key, reset_at);
+                break 'process StepResult::Accumulate;
+            }
             instance.current_step += 1;
 
             if instance.current_step < plan.event_steps.len() {
                 break 'process StepResult::Advance;
+            }
+
+            // Chain negation: a violated negation step must suppress the emit.
+            if instance.neg_violated {
+                let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                instance.reset(plan, reset_at);
+                self.push_expiry_candidate(&instance_key, reset_at);
+                break 'process StepResult::Accumulate;
             }
 
             if plan.close_steps.is_empty() {

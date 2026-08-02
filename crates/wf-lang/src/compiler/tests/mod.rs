@@ -10,6 +10,7 @@ mod basic;
 mod edge;
 mod keys_entity;
 mod pipeline;
+mod seq;
 mod yield_score;
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,28 @@ All notable changes to wp-reactor will be documented in this file.
 
 - **wf-config / wf-runtime**: Added `[metrics] console_output` (default `true`) and gated the periodic `res`-domain metrics summary (`metrics snapshot`, interval table, and shutdown run-summary table) behind it. Previously `MetricsConfig` had no `console_output` field, so `console_output = false` was silently dropped by serde and the statistics log could not be disabled. Prometheus export, monitor-channel snapshots, and Top-N collection run regardless of the flag. (wp-labs/warp-fusion#61)
 
+### Added
+
+- **wf-lang / wf-engine / tree-sitter-wfl**: Added `on event seq { ... }` and `on event any { ... }` match bodies for ordered and unordered event correlation:
+  - `on event seq { ... }` — ordered event chains for attack-chain detection. The engine's existing `current_step` progression enforces order; the `seq` mode adds per-step `within <dur>` time gaps, `not has <alias> within <dur>` negation steps, and `consec` strict-adjacency / `skip = past_last|to_next` modifiers (`to_next` deferred to L3).
+  - `on event any { ... }` — unordered co-occurrence: all steps are evaluated in parallel and the rule fires once every step has satisfied its threshold, regardless of arrival order (a parallel-eval path in the state machine).
+  - Bare `on event { ... }` defaults to `seq`, preserving backward compatibility; `has <alias>` (implicit `count >= 1`) is accepted in `seq`, `any`, and bare `on event` steps.
+  - This replaces the earlier `chain { ... }` block syntax (removed). The tree-sitter grammar grew `on_event_mode_block` / `seq_rule_step`.
+- **wf-lang**: Added `MatchMode::{Seq, Any}` to the AST and `MatchPlan.match_mode`; seq-mode `within`/`not`/`consec`/`skip` compile into `SeqPlan`, and `on event any` steps compile into the parallel-evaluated `event_steps`.
+- **wf-lang**: Seq-mode step labels now register with the `stat.*` label registry, so a labeled seq step (e.g. `spam: a | count >= 5;`) can be referenced by `match_event(spam)` in yield.
+- **wf-lang**: Checker rejects `on event seq`/`any` in pipeline stages (intermediate stage output schemas derive from `on event` steps only) and rejects `not` steps that reference a field aggregation (unsupported); `skip = to_next` warns that it is deferred to L3.
+
+### Fixed
+
+- **wf-engine**: Negation windows are active only after the preceding use-step completes — an event arriving before it no longer counts as a violation.
+- **wf-engine**: A negative `within` gap (an out-of-order completion where a step completes before its predecessor) is now treated as a violation.
+- **wf-engine**: `consec`-break and `within`-violation resets preserve the negation-violation flag, so an in-window violation cannot be wiped and the chain re-fire.
+- **wf-engine**: `on event any` throttle handling now honors `on_exceed = fail_rule` (previously it was silently downgraded to throttle).
+
+### Performance
+
+- **wf-engine**: `RuleExecutor::event_matches_alias` uses a precomputed alias→filter map for rules with more than 24 binds, eliminating the O(binds) linear scan per (event × alias); rules with ≤24 binds keep the faster linear scan. The crossover was measured at ~24 binds (24: 5.1M vs 5.8M q/s; 16: linear still 1.3x faster).
+
 ## [0.1.37 Unreleased]
 
 ### Changed

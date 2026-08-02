@@ -50,6 +50,8 @@ pub fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: std::collections::HashMap::new(),
         tracked_plain_fields: HashSet::new(),
+        seq: None,
+        match_mode: wf_lang::ast::MatchMode::Seq,
     }
 }
 
@@ -93,6 +95,8 @@ pub fn plan_with_close(
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: std::collections::HashMap::new(),
         tracked_plain_fields: HashSet::new(),
+        seq: None,
+        match_mode: wf_lang::ast::MatchMode::Seq,
     }
 }
 
@@ -107,6 +111,8 @@ pub fn fixed_plan(keys: Vec<FieldRef>, dur: Duration, steps: Vec<StepPlan>) -> M
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: std::collections::HashMap::new(),
         tracked_plain_fields: HashSet::new(),
+        seq: None,
+        match_mode: wf_lang::ast::MatchMode::Seq,
     }
 }
 
@@ -126,6 +132,8 @@ pub fn fixed_plan_with_close(
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: std::collections::HashMap::new(),
         tracked_plain_fields: HashSet::new(),
+        seq: None,
+        match_mode: wf_lang::ast::MatchMode::Seq,
     }
 }
 

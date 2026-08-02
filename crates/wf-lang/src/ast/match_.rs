@@ -33,7 +33,17 @@ pub struct CloseBlock {
     pub steps: Vec<MatchStep>,
 }
 
-/// `match<keys:dur[:fixed]> { [key {...}] on event { ... } [on close|and close { ... }] }`
+/// Ordering mode of an `on event` block.
+#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
+pub enum MatchMode {
+    /// Ordered (default): step i+1 evaluates only after step i completes.
+    Seq,
+    /// Unordered co-occurrence: all steps must be satisfied, order irrelevant.
+    Any,
+}
+
+/// `match<keys:dur[:fixed]> { [key {...}] on event [seq|any] { ... } [on close|and close { ... }] }`
 #[non_exhaustive]
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
 #[moju(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
@@ -44,6 +54,11 @@ pub struct MatchClause {
     pub window_mode: WindowMode,
     pub on_event: Vec<MatchStep>,
     pub on_close: Option<CloseBlock>,
+    /// Ordering mode of the `on event` block. Default: `Seq`.
+    pub match_mode: MatchMode,
+    /// Ordered-sequence constraints (`on event seq { ... }`): `within` / `not` /
+    /// `consec` / `skip` on the steps. When present, `on_event` is empty.
+    pub seq: Option<SeqClause>,
 }
 
 impl MatchClause {
@@ -55,6 +70,8 @@ impl MatchClause {
             window_mode: WindowMode::Sliding,
             on_event: Vec::new(),
             on_close: None,
+            match_mode: MatchMode::Seq,
+            seq: None,
         }
     }
 }
@@ -122,4 +139,44 @@ pub enum Measure {
     Avg,
     Min,
     Max,
+}
+
+// ---------------------------------------------------------------------------
+// Chain clause — ordered sequence matching (L1/L2)
+// ---------------------------------------------------------------------------
+
+/// `chain [consec] [skip = past_last|to_next] { [not] step_body [within dur] ... }`
+#[non_exhaustive]
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
+pub struct SeqClause {
+    /// `consec` — strict adjacency (no other events between steps). Default: gap.
+    pub consec: bool,
+    /// After-match skip policy.
+    pub skip: SeqSkip,
+    /// Ordered sequence steps.
+    pub steps: Vec<SeqStep>,
+}
+
+/// After-match skip policy.
+#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
+pub enum SeqSkip {
+    /// Reset all step state after firing (default).
+    PastLast,
+    /// Keep non-first steps for overlapping matches (L3).
+    ToNext,
+}
+
+/// One ordered chain step: `[not] <body> [within dur]`.
+#[non_exhaustive]
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangMatch")]
+pub struct SeqStep {
+    /// `not` negation prefix.
+    pub neg: bool,
+    /// Time gap relative to the previous step's completion.
+    pub within: Option<Duration>,
+    /// Step body. For `has <alias>` existential steps, `pipe` is synthesized `count >= 1`.
+    pub branch: StepBranch,
 }

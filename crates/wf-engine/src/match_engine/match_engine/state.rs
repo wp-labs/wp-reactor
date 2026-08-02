@@ -92,6 +92,11 @@ pub(super) struct Instance {
     pub(super) close_step_states: Vec<StepState>,
     pub(super) alias_states: HashMap<String, AliasState>,
     pub(super) baselines: HashMap<String, RollingStats>,
+    /// Chain negation violated — chain must not fire.
+    pub(super) neg_violated: bool,
+    /// Per-step satisfaction flags for `on event any` (unordered) mode, aligned
+    /// with `event_steps`.
+    pub(super) satisfied_flags: Vec<bool>,
 }
 
 impl Instance {
@@ -128,6 +133,8 @@ impl Instance {
             close_step_states,
             alias_states: HashMap::new(),
             baselines: HashMap::new(),
+            neg_violated: false,
+            satisfied_flags: vec![false; plan.event_steps.len()],
         }
     }
 
@@ -244,6 +251,8 @@ impl Instance {
             .collect();
         self.alias_states.clear();
         self.baselines.clear();
+        self.neg_violated = false;
+        self.satisfied_flags = vec![false; plan.event_steps.len()];
     }
 
     pub(super) fn observe_seen_event_time(&mut self, event_time_nanos: i64) {

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::ast::{CloseMode, CmpOp, Expr, FieldRef, FieldSelector, JoinMode, Measure, Transform};
+use crate::ast::{CloseMode, CmpOp, Expr, FieldRef, FieldSelector, JoinMode, MatchMode, Measure, Transform};
 
 // ---------------------------------------------------------------------------
 // ExprPlan — L1 alias for ast::Expr
@@ -83,6 +83,10 @@ pub struct MatchPlan {
     pub tracked_bind_aliases: HashSet<String>,
     pub tracked_bind_fields: HashMap<String, HashSet<String>>,
     pub tracked_plain_fields: HashSet<String>,
+    /// Ordering mode of the `on event` block (`Seq` ordered, `Any` unordered).
+    pub match_mode: MatchMode,
+    /// Ordered sequence constraints (`on event seq { ... }`). When present, event/close steps are empty.
+    pub seq: Option<SeqPlan>,
 }
 
 /// Explicit key mapping entry: logical name → source alias + field.
@@ -132,6 +136,44 @@ pub struct AggPlan {
     pub measure: Measure,
     pub cmp: CmpOp,
     pub threshold: ExprPlan,
+}
+
+// ---------------------------------------------------------------------------
+// SeqPlan — ordered sequence matching (L1/L2)
+// ---------------------------------------------------------------------------
+
+/// Ordered sequence plan: steps complete in order within the match window.
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+pub struct SeqPlan {
+    /// `consec` — strict adjacency; default: gap.
+    pub consec: bool,
+    /// After-match skip policy.
+    pub skip: SeqSkipPlan,
+    /// Ordered steps.
+    pub steps: Vec<SeqStepPlan>,
+}
+
+/// After-match skip policy.
+#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
+pub enum SeqSkipPlan {
+    /// Reset all step state after firing (default).
+    PastLast,
+    /// Keep non-first steps for overlapping matches (L3).
+    ToNext,
+}
+
+/// One ordered chain step: `[not] <branch> [within]`.
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+pub struct SeqStepPlan {
+    /// `not` negation prefix.
+    pub neg: bool,
+    /// Time gap relative to the previous step's completion.
+    pub within: Option<Duration>,
+    /// Step body. For `has <alias>` steps, `agg` is `count >= 1`.
+    pub branch: BranchPlan,
 }
 
 // ---------------------------------------------------------------------------

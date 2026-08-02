@@ -47,6 +47,8 @@ pub struct MatchExpl {
     pub event_steps: Vec<String>,
     pub close_steps: Vec<String>,
     pub close_mode: Option<CloseMode>,
+    /// Chain steps (with `within` / `not` markers), when the rule uses `chain`.
+    pub seq: Option<Vec<String>>,
 }
 
 /// Build explanations for a set of compiled rules.

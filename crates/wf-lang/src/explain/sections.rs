@@ -1,6 +1,7 @@
 use crate::ast::{Expr, FieldRef};
 use crate::plan::{
-    AggPlan, BindPlan, BranchPlan, ConvOpPlan, ConvPlan, JoinPlan, LimitsPlan, MatchPlan, StepPlan,
+    AggPlan, BindPlan, BranchPlan, SeqStepPlan, ConvOpPlan, ConvPlan, JoinPlan, LimitsPlan,
+    MatchPlan, StepPlan,
     WindowSpec, YieldPlan,
 };
 use crate::schema::WindowSchema;
@@ -54,6 +55,13 @@ pub(super) fn explain_match(mp: &MatchPlan) -> MatchExpl {
     } else {
         Some(mp.close_mode)
     };
+    let seq = mp.seq.as_ref().map(|seq_plan| {
+        seq_plan
+            .steps
+            .iter()
+            .map(format_seq_step)
+            .collect()
+    });
 
     MatchExpl {
         keys,
@@ -61,6 +69,7 @@ pub(super) fn explain_match(mp: &MatchPlan) -> MatchExpl {
         event_steps,
         close_steps,
         close_mode,
+        seq,
     }
 }
 
@@ -70,6 +79,18 @@ fn format_step(step: &StepPlan) -> String {
         .map(format_branch)
         .collect::<Vec<_>>()
         .join(" || ")
+}
+
+fn format_seq_step(step: &SeqStepPlan) -> String {
+    let mut s = String::new();
+    if step.neg {
+        s.push_str("not ");
+    }
+    s.push_str(&format_branch(&step.branch));
+    if let Some(w) = &step.within {
+        s.push_str(&format!(" within {}", format_duration(w)));
+    }
+    s
 }
 
 fn format_branch(branch: &BranchPlan) -> String {

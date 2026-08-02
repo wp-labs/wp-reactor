@@ -1,3 +1,4 @@
+mod seq;
 mod contracts;
 mod conv;
 mod edge_cases;

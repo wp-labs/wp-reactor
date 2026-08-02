@@ -9,8 +9,12 @@ mod yield_check;
 pub(crate) mod yield_version;
 
 use std::collections::HashSet;
+use std::time::Duration;
 
-use crate::ast::{EachClause, Expr, FieldRef, MatchClause, Measure, PipelineStage, RuleDecl};
+use crate::ast::{
+    SeqClause, SeqSkip, EachClause, Expr, FieldRef, MatchClause, Measure, PipelineStage,
+    RuleDecl,
+};
 use crate::checker::scope::{Scope, StatLabelInfo, StatLabelStage};
 use crate::checker::types::{ValType, check_expr_type, infer_type};
 use crate::schema::{BaseType, FieldDef, FieldType, WindowSchema};
@@ -89,6 +93,23 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
         let mut stage_outputs: Vec<WindowSchema> = Vec::new();
 
         for (idx, stage) in rule.pipeline_stages.iter().enumerate() {
+            // Pipeline stages derive their intermediate output schema from `on event`
+            // steps; `on event seq`/`any` stages would produce an empty stage output
+            // and silently break downstream stages — reject them.
+            if stage.match_clause.seq.is_some()
+                || stage.match_clause.match_mode == crate::ast::MatchMode::Any
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(name.to_string()),
+                    test: None,
+                    message: format!(
+                        "pipeline stage {} uses `on event seq`/`any`, which is not supported in pipeline stages",
+                        idx + 1
+                    ),
+                });
+                continue;
+            }
             if idx == 0 {
                 let mut stage_scope = Scope::new();
                 stage_scope.aliases = base_scope.aliases.clone();
@@ -199,6 +220,24 @@ fn populate_stat_labels(scope: &mut Scope<'_>, match_clause: &MatchClause) {
             }
         }
     }
+    if let Some(seq) = &match_clause.seq {
+        for step in &seq.steps {
+            if let Some(label) = &step.branch.label {
+                scope.stat_labels.insert(
+                    label.clone(),
+                    StatLabelInfo {
+                        stage: StatLabelStage::Event,
+                        uses_distinct: step
+                            .branch
+                            .pipe
+                            .transforms
+                            .contains(&crate::ast::Transform::Distinct),
+                        measure: step.branch.pipe.measure,
+                    },
+                );
+            }
+        }
+    }
 }
 
 fn check_stage(
@@ -231,6 +270,21 @@ fn check_stage(
         );
     }
 
+    // Chain steps: reuse the match-step checks (alias / field / pipe) plus
+    // chain-specific checks. Chain rules never have `on event`/close steps.
+    if let Some(chain) = &match_clause.seq {
+        let chain_steps: Vec<crate::ast::MatchStep> = chain
+            .steps
+            .iter()
+            .map(|s| crate::ast::MatchStep {
+                branches: vec![s.branch.clone()],
+            })
+            .collect();
+        let mut chain_labels = HashSet::new();
+        steps::check_match_steps(&chain_steps, scope, rule_name, errors, &mut chain_labels);
+        check_seq(chain, match_clause.duration, rule_name, errors);
+    }
+
     for key in &match_clause.keys {
         let key_name = match key {
             FieldRef::Simple(n) | FieldRef::Qualified(_, n) | FieldRef::Bracketed(_, n) => {
@@ -253,6 +307,66 @@ fn check_stage(
     }
 
     joins::check_joins_list(joins_list, schemas, scope, rule_name, errors);
+}
+
+/// Chain-specific checks: `within` bounds vs window duration, `not` placement,
+/// and `not` applied to an aggregate step.
+fn check_seq(
+    seq: &SeqClause,
+    window_duration: Duration,
+    rule_name: &str,
+    errors: &mut Vec<CheckError>,
+) {
+    if seq.skip == SeqSkip::ToNext {
+        errors.push(CheckError {
+            severity: Severity::Warning,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: "`skip = to_next` is deferred to L3; P2 uses `past_last` (fire-and-reset)"
+                .to_string(),
+        });
+    }
+    if let Some(first) = seq.steps.first() {
+        if first.neg {
+            errors.push(CheckError {
+                severity: Severity::Warning,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: "`not` as the first chain step anchors to the window start; verify intent"
+                    .to_string(),
+            });
+        }
+    }
+    for (i, step) in seq.steps.iter().enumerate() {
+        if let Some(w) = step.within
+            && w > window_duration
+        {
+            errors.push(CheckError {
+                severity: Severity::Warning,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: format!(
+                    "chain step {} `within {}s` exceeds the match window duration ({}s); within is redundant",
+                    i + 1,
+                    w.as_secs(),
+                    window_duration.as_secs()
+                ),
+            });
+        }
+        if step.neg && step.branch.field.is_some() {
+            // The runtime treats a `not` step as "no event matching the alias", ignoring
+            // any field/aggregation on the branch. Reject rather than silently misbehave.
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: format!(
+                    "chain step {} is `not` but references a field aggregation (unsupported); negation must target an event alias (`has <alias>` step)",
+                    i + 1
+                ),
+            });
+        }
+    }
 }
 
 fn check_each_clause(
