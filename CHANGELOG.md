@@ -2,7 +2,7 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [0.1.40 Unreleased]
+## [0.1.41 Unreleased]
 
 ### Fixed
 
@@ -30,6 +30,15 @@ All notable changes to wp-reactor will be documented in this file.
 ### Performance
 
 - **wf-engine**: `RuleExecutor::event_matches_alias` uses a precomputed alias→filter map for rules with more than 24 binds, eliminating the O(binds) linear scan per (event × alias); rules with ≤24 binds keep the faster linear scan. The crossover was measured at ~24 binds (24: 5.1M vs 5.8M q/s; 16: linear still 1.3x faster).
+
+### Fixed
+
+- **wf-lang**: The unused-alias lint now counts `on event seq { ... }` step sources (`seq.steps[].branch.source`) as used, fixing a false-positive W001 when a rule referenced an alias only from seq-mode steps.
+
+### Documentation
+
+- **User guide**: Aligned `docs/user-guide` with the implementation — `.wfs` window subscription uses `stream_tag`; window defaults/overrides moved to an external `windows.toml` (the `windows` field is now required in `wfusion.toml`); TCP sources use `connect = "tcp_src"` with `addr`/`port`; file sources document the `csv` format; the removed `wfusion run` / `wfusion config` subcommands are replaced by `wfusion daemon` / `wfusion batch` and `wfadm conf diff`; metrics are documented as monitor-sink NDJSON records instead of a Prometheus HTTP endpoint.
+- **Examples**: Updated all examples to load with the current code — `.wfs` files switched from `stream` to `stream_tag`, `wfusion.toml` gained the required `windows = "windows.toml"` field with window config externalized, TCP sources use `connect = "tcp_src"`, and example READMEs (sinks / file_input) reflect the current sink-routing and CLI format.
 
 ## [0.1.37 Unreleased]
 
