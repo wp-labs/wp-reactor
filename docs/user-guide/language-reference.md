@@ -373,16 +373,18 @@ entity(host, e.host_id)
 
 ### `join`
 
-支持 `snapshot` / `asof` / `asof within`：
+支持 `snapshot` / `asof` / `asof within` / `anti`：
 
 ```wfl
 join geo_lookup snapshot on sip == geo_lookup.ip
 join conn_risk asof within 24h on sip == conn_risk.ip
+join blocked_list anti on sip == blocked_list.ip
 ```
 
 - `snapshot`：取右表当前快照
 - `asof`：按事件时间回看最近一条 `ts <= event_time`
 - `asof within`：在指定时间范围内回看
+- `anti`：排除式关联（白名单排除），仅保留右表无匹配的左记录
 - 支持多条件：`join t snapshot on sip == t.ip && dport == t.port`
 
 ### `|>` pipeline
