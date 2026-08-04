@@ -755,6 +755,42 @@ fn execute_match_yield_failure_is_not_silent() {
     assert_eq!(field_value, Some(Value::Str("".to_string())));
 }
 
+#[test]
+fn execute_match_missing_optional_float_field_is_omitted_not_fatal() {
+    // wp-labs/warp-fusion#62, match path: a typed optional float field that is
+    // missing from the event must be omitted, not fail the match output.
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".to_string())),
+    );
+    plan.yield_plan.fields = vec![YieldField {
+        name: "attacker_latitude".to_string(),
+        value: Expr::Field(FieldRef::Qualified(
+            "e".to_string(),
+            "attacker_latitude".to_string(),
+        )),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([(
+            "attacker_latitude".to_string(),
+            FieldType::Base(BaseType::Float),
+        )]),
+    );
+
+    let output = exec.execute_match(&default_matched_context()).unwrap();
+    assert!(
+        !output
+            .yield_fields
+            .iter()
+            .any(|(k, _)| k == "attacker_latitude"),
+        "missing typed float field should be omitted from match output"
+    );
+}
+
 // =========================================================================
 // Close yield tests
 // =========================================================================
@@ -2158,4 +2194,334 @@ rule stat_close_rule {
         .map(|(_, value)| value.clone());
 
     assert_eq!(final_hits, Some(num(2.0)));
+}
+
+// =========================================================================
+// Missing optional fields (wp-labs/warp-fusion#62)
+// =========================================================================
+
+#[test]
+fn execute_each_missing_optional_float_field_is_omitted_not_fatal() {
+    // A yield passthrough of an optional float field that is missing from the
+    // input must omit the field from the output record instead of failing the
+    // whole record. Explicit NaN/Infinity must still fail (handled in the
+    // coercion branch), but "absent" is not a data-format error.
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "attacker_latitude".to_string(),
+        value: Expr::Field(FieldRef::Qualified(
+            "e".to_string(),
+            "attacker_latitude".to_string(),
+        )),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([(
+            "attacker_latitude".to_string(),
+            FieldType::Base(BaseType::Float),
+        )]),
+    );
+
+    // Input event has no `attacker_latitude` field at all.
+    let alert = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), 1_000_000)
+        .expect("missing optional field must not fail the yield")
+        .expect("on each should still emit an output record");
+
+    assert!(
+        !alert
+            .yield_fields
+            .iter()
+            .any(|(name, _)| name == "attacker_latitude"),
+        "missing optional float field should be omitted from output"
+    );
+}
+
+// =========================================================================
+// Missing optional fields — present / explicit-NaN / other-fields cases
+// (wp-labs/warp-fusion#62)
+
+#[test]
+fn execute_each_present_float_field_outputs_normally() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "attacker_latitude".to_string(),
+        value: Expr::Field(FieldRef::Qualified(
+            "e".to_string(),
+            "attacker_latitude".to_string(),
+        )),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([(
+            "attacker_latitude".to_string(),
+            FieldType::Base(BaseType::Float),
+        )]),
+    );
+
+    // Present and finite → the field is output unchanged.
+    let alert = exec
+        .execute_each(
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("attacker_latitude", num(37.7749)),
+            ]),
+            1_000_000,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "attacker_latitude")
+            .map(|(_, v)| v.clone()),
+        Some(num(37.7749))
+    );
+}
+
+#[test]
+fn execute_each_explicit_nan_float_still_fails() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "attacker_latitude".to_string(),
+        value: Expr::Number(f64::NAN),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([(
+            "attacker_latitude".to_string(),
+            FieldType::Base(BaseType::Float),
+        )]),
+    );
+
+    // Explicit NaN is a genuine data-format error, not an absent value.
+    let result = exec.execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), 1_000_000);
+    assert!(result.is_err(), "explicit NaN must still fail the yield");
+}
+
+#[test]
+fn execute_each_missing_optional_field_keeps_other_fields() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "attacker_latitude".to_string(),
+            value: Expr::Field(FieldRef::Qualified(
+                "e".to_string(),
+                "attacker_latitude".to_string(),
+            )),
+        },
+        YieldField {
+            name: "sip".to_string(),
+            value: Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        },
+    ];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("attacker_latitude".to_string(), FieldType::Base(BaseType::Float)),
+            ("sip".to_string(), FieldType::Base(BaseType::Chars)),
+        ]),
+    );
+
+    // `attacker_latitude` missing; `sip` present. Only the missing one is
+    // omitted; `sip` still emits.
+    let alert = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), 1_000_000)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !alert
+            .yield_fields
+            .iter()
+            .any(|(n, _)| n == "attacker_latitude"),
+        "missing float field omitted"
+    );
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "sip")
+            .map(|(_, v)| v.clone()),
+        Some(str_val("10.0.0.1")),
+        "present sibling field still emitted"
+    );
+}
+
+#[test]
+fn execute_each_missing_optional_digit_field_is_omitted() {
+    // The empty-string guard applies to every non-chars base type, not just float.
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "fail_count".to_string(),
+        value: Expr::Field(FieldRef::Qualified("e".to_string(), "fail_count".to_string())),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("fail_count".to_string(), FieldType::Base(BaseType::Digit))]),
+    );
+
+    let alert = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), 1_000_000)
+        .unwrap()
+        .unwrap();
+    assert!(!alert.yield_fields.iter().any(|(n, _)| n == "fail_count"));
+}
+
+#[test]
+fn execute_each_missing_chars_field_degrades_to_empty_string() {
+    // Chars is exempt from the omit guard: a missing chars field still degrades
+    // to the empty-string fallback (unchanged behavior).
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "message".to_string(),
+        value: Expr::Field(FieldRef::Qualified("e".to_string(), "message".to_string())),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("message".to_string(), FieldType::Base(BaseType::Chars))]),
+    );
+
+    let alert = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), 1_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "message")
+            .map(|(_, v)| v.clone()),
+        Some(Value::Str(String::new()))
+    );
+}
+
+#[test]
+fn execute_close_missing_optional_float_field_is_omitted_not_fatal() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".to_string())),
+    );
+    plan.yield_plan.fields = vec![YieldField {
+        name: "attacker_latitude".to_string(),
+        value: Expr::Field(FieldRef::Qualified(
+            "e".to_string(),
+            "attacker_latitude".to_string(),
+        )),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([(
+            "attacker_latitude".to_string(),
+            FieldType::Base(BaseType::Float),
+        )]),
+    );
+    let close = CloseOutput {
+        rule_name: "r1".to_string(),
+        scope_key: vec![str_val("10.0.0.1")],
+        close_reason: CloseReason::Timeout,
+        event_ok: true,
+        close_ok: true,
+        close_mode: wf_lang::ast::CloseMode::And,
+        event_emitted: false,
+        event_step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: Some("fail".to_string()),
+            measure_value: 3.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
+            collected_values: Vec::new(),
+            field_values: std::collections::HashMap::new(),
+        }],
+        close_step_data: vec![],
+        bind_data: vec![],
+        watermark_nanos: 0,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 0,
+        machine_id: String::new(),
+        last_event_nanos: 123,
+    };
+
+    let alert = exec
+        .execute_close(&close)
+        .expect("close yield must not fail on a missing optional field")
+        .expect("close should emit an output record");
+    assert!(
+        !alert
+            .yield_fields
+            .iter()
+            .any(|(n, _)| n == "attacker_latitude"),
+        "missing typed float field should be omitted from close output"
+    );
 }

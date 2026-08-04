@@ -101,9 +101,17 @@ impl RuleExecutor {
         &self.output
     }
 
-    pub(crate) fn coerce_yield_field_value(&self, name: &str, value: Value) -> CoreResult<Value> {
+    /// Coerce a yield field value against its target type. Returns `Ok(None)`
+    /// when the field should be omitted from the output (an optional input
+    /// field that was missing at evaluation time), `Ok(Some(v))` on success,
+    /// and `Err` on genuine type/format errors.
+    pub(crate) fn coerce_yield_field_value(
+        &self,
+        name: &str,
+        value: Value,
+    ) -> CoreResult<Option<Value>> {
         let Some(field_type) = self.yield_field_type(name) else {
-            return Ok(value);
+            return Ok(Some(value));
         };
         coerce_yield_value(name, field_type, value)
     }
@@ -168,18 +176,28 @@ impl RuleExecutor {
     }
 }
 
-fn coerce_yield_value(name: &str, field_type: &FieldType, value: Value) -> CoreResult<Value> {
+fn coerce_yield_value(name: &str, field_type: &FieldType, value: Value) -> CoreResult<Option<Value>> {
+    // A yield expression referencing a missing input field evaluates to the
+    // empty-string fallback (see `eval_yield_expr_with_meta`). For targets that
+    // can never be a valid empty string, treat it as an absent/optional field:
+    // omit it from the output instead of failing the whole record
+    // (wp-labs/warp-fusion#62). Explicit NaN/Infinity values still fail below.
+    if matches!(&value, Value::Str(s) if s.is_empty())
+        && !matches!(field_type, FieldType::Base(BaseType::Chars))
+    {
+        return Ok(None);
+    }
     match field_type {
-        FieldType::Base(base_type) => coerce_yield_base_value(name, base_type, value),
+        FieldType::Base(base_type) => coerce_yield_base_value(name, base_type, value).map(Some),
         FieldType::Array(_) | FieldType::ArrayAny => match value {
-            Value::Array(_) => Ok(value),
+            Value::Array(_) => Ok(Some(value)),
             _ => CoreReason::DataFormat
                 .to_err()
                 .with_detail(format!("yield field {name:?} expects an array value"))
                 .err(),
         },
         FieldType::Object => match value {
-            Value::Object(_) => Ok(value),
+            Value::Object(_) => Ok(Some(value)),
             _ => CoreReason::DataFormat
                 .to_err()
                 .with_detail(format!("yield field {name:?} expects an object value"))

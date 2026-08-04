@@ -6,6 +6,8 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Fixed
 
+- **wf-engine**: A yield field that references an optional input field missing from the event no longer fails the whole output record. Missing passthrough fields previously evaluated to the empty-string fallback and were rejected by type coercion (e.g. `yield security_alerts (attacker_latitude = s.attacker_latitude)` errored with "yield field ... expects a finite number" when the input had no `attacker_latitude`). Such fields are now omitted from the output (the column renders as null in Arrow / is absent in JSON), while other fields of the same record still emit. Explicit NaN / Infinity / type mismatches remain hard errors. Applies to `on each`, match, and close yield paths. (wp-labs/warp-fusion#62)
+
 - **wf-config / wf-runtime**: Added `[metrics] console_output` (default `true`) and gated the periodic `res`-domain metrics summary (`metrics snapshot`, interval table, and shutdown run-summary table) behind it. Previously `MetricsConfig` had no `console_output` field, so `console_output = false` was silently dropped by serde and the statistics log could not be disabled. Prometheus export, monitor-channel snapshots, and Top-N collection run regardless of the flag. (wp-labs/warp-fusion#61)
 
 ### Added

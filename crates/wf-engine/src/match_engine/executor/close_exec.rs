@@ -130,9 +130,14 @@ impl RuleExecutor {
                                 field.name
                             )));
                     };
-                    let value = self.coerce_yield_field_value(&field.name, value)?;
-                    Ok((field.name.clone(), value))
+                    let Some(value) = self.coerce_yield_field_value(&field.name, value)? else {
+                        // Optional input field was missing → omit it from the
+                        // output record (wp-labs/warp-fusion#62).
+                        return Ok(None);
+                    };
+                    Ok(Some((field.name.clone(), value)))
                 })
+                .filter_map(Result::transpose)
                 .collect::<CoreResult<Vec<_>>>()
         })?;
         let yield_field_types = self
