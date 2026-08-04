@@ -2,7 +2,7 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [0.1.41 Unreleased]
+## [0.1.42 Unreleased]
 
 ### Fixed
 
@@ -41,6 +41,7 @@ All notable changes to wp-reactor will be documented in this file.
 
 - **User guide**: Aligned `docs/user-guide` with the implementation — `.wfs` window subscription uses `stream_tag`; window defaults/overrides moved to an external `windows.toml` (the `windows` field is now required in `wfusion.toml`); TCP sources use `connect = "tcp_src"` with `addr`/`port`; file sources document the `csv` format; the removed `wfusion run` / `wfusion config` subcommands are replaced by `wfusion daemon` / `wfusion batch` and `wfadm conf diff`; metrics are documented as monitor-sink NDJSON records instead of a Prometheus HTTP endpoint.
 - **Examples**: Updated all examples to load with the current code — `.wfs` files switched from `stream` to `stream_tag`, `wfusion.toml` gained the required `windows = "windows.toml"` field with window config externalized, TCP sources use `connect = "tcp_src"`, and example READMEs (sinks / file_input) reflect the current sink-routing and CLI format.
+- **Language reference**: Documented the `join ... anti` mode (whitelist exclusion) alongside `snapshot` / `asof` / `asof within` — e.g. `join blocked_list anti on sip == blocked_list.ip` — including multi-condition joins (`&&`).
 
 ## [0.1.37 Unreleased]
 
