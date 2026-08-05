@@ -255,6 +255,21 @@ impl Instance {
         self.satisfied_flags = vec![false; plan.event_steps.len()];
     }
 
+    /// `on event<accu>` — after firing, reset only the "fired" state so the step
+    /// re-evaluates on the next qualifying event, while KEEPING the accumulation
+    /// state (branch counters, collected values/evidence, bind counts, window
+    /// start) so the running cumulative values continue across fires.
+    pub(super) fn rearm(&mut self, plan: &MatchPlan) {
+        self.current_step = 0;
+        self.event_ok = false;
+        self.event_emitted = false;
+        self.completed_steps.clear();
+        self.neg_violated = false;
+        self.satisfied_flags = vec![false; plan.event_steps.len()];
+        // Kept: created_at, last_event_nanos, step_states, close_step_states,
+        // alias_states, baselines, machine_id.
+    }
+
     pub(super) fn observe_seen_event_time(&mut self, event_time_nanos: i64) {
         if event_time_nanos > self.last_event_nanos {
             self.last_event_nanos = event_time_nanos;

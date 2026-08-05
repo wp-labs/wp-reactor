@@ -52,6 +52,7 @@ pub fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
         tracked_plain_fields: HashSet::new(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     }
 }
 
@@ -97,6 +98,7 @@ pub fn plan_with_close(
         tracked_plain_fields: HashSet::new(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     }
 }
 
@@ -113,6 +115,7 @@ pub fn fixed_plan(keys: Vec<FieldRef>, dur: Duration, steps: Vec<StepPlan>) -> M
         tracked_plain_fields: HashSet::new(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     }
 }
 
@@ -134,6 +137,7 @@ pub fn fixed_plan_with_close(
         tracked_plain_fields: HashSet::new(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     }
 }
 

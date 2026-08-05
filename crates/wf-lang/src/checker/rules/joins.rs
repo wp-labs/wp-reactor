@@ -36,7 +36,8 @@ pub fn check_joins_list(
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
                             test: None,
-                            message: "nested field path not supported in join condition".to_string(),
+                            message: "nested field path not supported in join condition"
+                                .to_string(),
                         });
                     } else if let Err(msg) = scope.resolve_field_ref(&cond.left) {
                         errors.push(CheckError {
@@ -54,7 +55,8 @@ pub fn check_joins_list(
                                 severity: Severity::Error,
                                 rule: Some(rule_name.to_string()),
                                 test: None,
-                                message: "nested field path not supported in join condition".to_string(),
+                                message: "nested field path not supported in join condition"
+                                    .to_string(),
                             });
                         }
                         FieldRef::Qualified(qualifier, field) => {

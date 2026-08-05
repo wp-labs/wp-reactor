@@ -59,6 +59,11 @@ pub struct MatchClause {
     /// Ordered-sequence constraints (`on event seq { ... }`): `within` / `not` /
     /// `consec` / `skip` on the steps. When present, `on_event` is empty.
     pub seq: Option<SeqClause>,
+    /// `on event<accu>` — within-window accumulation: after the block fires the
+    /// count/evidence keep accumulating without reset, and each subsequent
+    /// qualifying event re-fires with the running cumulative values, until the
+    /// window expires. Orthogonal to `match_mode` / `seq`.
+    pub accu: bool,
 }
 
 impl MatchClause {
@@ -72,6 +77,7 @@ impl MatchClause {
             on_close: None,
             match_mode: MatchMode::Seq,
             seq: None,
+            accu: false,
         }
     }
 }

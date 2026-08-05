@@ -388,7 +388,10 @@ test nested_uid for brute_force {
 "#;
     let result = run_contract_from_source(source);
     assert!(result.passed, "failures: {:?}", result.failures);
-    assert_eq!(result.output_count, 1, "nested path must not suppress the alert");
+    assert_eq!(
+        result.output_count, 1,
+        "nested path must not suppress the alert"
+    );
 }
 
 #[test]
@@ -414,5 +417,79 @@ test missing_roles for brute_force {
 "#;
     let result = run_contract_from_source(source);
     assert!(result.passed, "failures: {:?}", result.failures);
-    assert_eq!(result.output_count, 1, "missing nested path must not suppress the alert");
+    assert_eq!(
+        result.output_count, 1,
+        "missing nested path must not suppress the alert"
+    );
+}
+
+// =========================================================================
+// on event<accu> — within-window accumulation (wp-labs/warp-fusion#65)
+// =========================================================================
+
+#[test]
+fn contract_accu_fires_every_subsequent_event() {
+    // 5 events in a 100s window, threshold 2: with accu the block fires on the
+    // 2nd, 3rd, 4th and 5th event (running count), instead of resetting after
+    // the 2nd (which would fire only on the 2nd and 4th).
+    let source = r#"
+rule accu_rule {
+    events { s : auth_events }
+    match<sip:100s> {
+        on event<accu> { s | count >= 2; }
+    } -> score(70.0)
+    entity(ip, s.sip)
+    yield security_alerts (sip = s.sip, fail_count = count(s))
+}
+
+test accu_five for accu_rule {
+    input {
+        row(s, sip = "10.0.0.1", action = "failed");
+        row(s, sip = "10.0.0.1", action = "failed");
+        row(s, sip = "10.0.0.1", action = "failed");
+        row(s, sip = "10.0.0.1", action = "failed");
+        row(s, sip = "10.0.0.1", action = "failed");
+    }
+    expect {
+        hits == 4;
+    }
+}
+"#;
+    let result = run_contract_from_source(source);
+    assert!(result.passed, "failures: {:?}", result.failures);
+    assert_eq!(result.output_count, 4, "accu must fire on events 2..5");
+}
+
+#[test]
+fn contract_default_resets_after_fire() {
+    // Same input without `<accu>`: fires on the 2nd and 4th event only.
+    let source = r#"
+rule reset_rule {
+    events { s : auth_events }
+    match<sip:100s> {
+        on event { s | count >= 2; }
+    } -> score(70.0)
+    entity(ip, s.sip)
+    yield security_alerts (sip = s.sip, fail_count = count(s))
+}
+
+test reset_five for reset_rule {
+    input {
+        row(s, sip = "10.0.0.1", action = "failed");
+        row(s, sip = "10.0.0.1", action = "failed");
+        row(s, sip = "10.0.0.1", action = "failed");
+        row(s, sip = "10.0.0.1", action = "failed");
+        row(s, sip = "10.0.0.1", action = "failed");
+    }
+    expect {
+        hits == 2;
+    }
+}
+"#;
+    let result = run_contract_from_source(source);
+    assert!(result.passed, "failures: {:?}", result.failures);
+    assert_eq!(
+        result.output_count, 2,
+        "default reset fires on events 2 and 4 only"
+    );
 }

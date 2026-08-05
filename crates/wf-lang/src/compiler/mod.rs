@@ -332,6 +332,7 @@ fn compile_match(mc: &MatchClause, inject_implicit_stage_labels: bool) -> MatchP
         tracked_bind_aliases: HashSet::new(),
         tracked_bind_fields: std::collections::HashMap::new(),
         tracked_plain_fields: HashSet::new(),
+        accu: mc.accu,
     }
 }
 

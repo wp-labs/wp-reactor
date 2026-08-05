@@ -36,6 +36,7 @@ fn key_map_extracts_from_alias_field() {
         tracked_plain_fields: std::collections::HashSet::new(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     };
 
     let mut sm = CepStateMachine::new("rule_km".to_string(), plan, None);

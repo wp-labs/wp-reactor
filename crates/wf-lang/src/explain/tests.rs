@@ -257,3 +257,29 @@ fn format_duration_preserves_milliseconds() {
     assert_eq!(format_duration(&Duration::from_millis(100)), "100ms");
     assert_eq!(format_duration(&Duration::from_millis(1500)), "1500ms");
 }
+
+#[test]
+fn explain_shows_on_event_accu() {
+    let input = r#"
+rule accu_rule {
+    events { s : auth_events }
+    match<sip:5m> {
+        on event<accu> { s | count >= 2; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield security_alerts (sip = s.sip, fail_count = 2)
+}
+"#;
+    let schemas = &[auth_events_window(), security_alerts_window()];
+    let file = parse_wfl(input).unwrap();
+    let plans = compile_wfl(&file, schemas).unwrap();
+    let explanations = explain_rules(&plans, schemas);
+    let expl = &explanations[0];
+
+    assert!(expl.match_expl.accu, "match explanation must carry accu");
+    let output = format!("{}", expl);
+    assert!(
+        output.contains("on event<accu>"),
+        "explain output must render <accu>, got:\n{output}"
+    );
+}

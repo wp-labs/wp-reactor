@@ -1834,6 +1834,99 @@ rule evidence_rule {
 }
 
 #[test]
+fn execute_match_accu_outputs_running_count_and_accumulating_evidence() {
+    // `on event<accu>` end-to-end (wp-labs/warp-fusion#65): 5 events, threshold
+    // 2 → 4 alerts with event_count 2,3,4,5 and evidence growing each fire.
+    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+
+    let source = r#"
+rule accu_evidence {
+    events { s : auth_events }
+    match<sip:100s> {
+        on event<accu> { hit: s | count >= 2; }
+    } -> score(70.0)
+    entity(ip, s.sip)
+    yield out (
+        sip = s.sip,
+        event_count = stat.count(window_event(s)),
+        evidences = collect_set(s.event_id)
+    )
+}
+"#;
+    let file = wf_lang::parse_wfl(source).expect("parse should succeed");
+    let plan = wf_lang::compile_wfl(&file, &[evidence_input_window(), evidence_output_window()])
+        .expect("compile should succeed")
+        .into_iter()
+        .next()
+        .expect("rule plan should exist");
+    assert!(plan.match_plan.accu, "on event<accu> must set plan.accu");
+
+    let exec = RuleExecutor::new(plan.clone());
+    let mut sm = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), None);
+    let mut counts = Vec::new();
+    let mut evidences = Vec::new();
+    for i in 0..5 {
+        let event_id = format!("evt_{:03}", i + 1);
+        let step = sm.advance_at(
+            "s",
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("event_id", evidence_event(&event_id)),
+            ]),
+            (i as i64 + 1) * 1_000_000_000,
+        );
+        if let StepResult::Matched(ctx) = step {
+            let alert = exec.execute_match(&ctx).expect("alert");
+            let field = |name: &str| {
+                alert
+                    .yield_fields
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, v)| v.clone())
+            };
+            counts.push(field("event_count"));
+            evidences.push(field("evidences"));
+        }
+    }
+
+    assert_eq!(
+        counts,
+        vec![
+            Some(num(2.0)),
+            Some(num(3.0)),
+            Some(num(4.0)),
+            Some(num(5.0)),
+        ],
+        "accu must output the running cumulative count"
+    );
+    assert_eq!(
+        evidences,
+        vec![
+            Some(Value::Array(vec![str_val("evt_001"), str_val("evt_002")])),
+            Some(Value::Array(vec![
+                str_val("evt_001"),
+                str_val("evt_002"),
+                str_val("evt_003"),
+            ])),
+            Some(Value::Array(vec![
+                str_val("evt_001"),
+                str_val("evt_002"),
+                str_val("evt_003"),
+                str_val("evt_004"),
+            ])),
+            Some(Value::Array(vec![
+                str_val("evt_001"),
+                str_val("evt_002"),
+                str_val("evt_003"),
+                str_val("evt_004"),
+                str_val("evt_005"),
+            ])),
+        ],
+        "accu evidence must accumulate across fires"
+    );
+}
+
+#[test]
 fn execute_match_yield_dedups_window_event_ids() {
     use crate::match_engine::match_engine::{CepStateMachine, StepResult};
 
@@ -2363,7 +2456,10 @@ fn execute_each_missing_optional_field_keeps_other_fields() {
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
         HashMap::from([
-            ("attacker_latitude".to_string(), FieldType::Base(BaseType::Float)),
+            (
+                "attacker_latitude".to_string(),
+                FieldType::Base(BaseType::Float),
+            ),
             ("sip".to_string(), FieldType::Base(BaseType::Chars)),
         ]),
     );
@@ -2409,7 +2505,10 @@ fn execute_each_missing_optional_digit_field_is_omitted() {
     });
     plan.yield_plan.fields = vec![YieldField {
         name: "fail_count".to_string(),
-        value: Expr::Field(FieldRef::Qualified("e".to_string(), "fail_count".to_string())),
+        value: Expr::Field(FieldRef::Qualified(
+            "e".to_string(),
+            "fail_count".to_string(),
+        )),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
@@ -2571,18 +2670,16 @@ fn nested_each_executor() -> RuleExecutor {
 }
 
 fn nested_roles_value() -> Value {
-    Value::Object(HashMap::from([
-        (
-            "source".to_string(),
+    Value::Object(HashMap::from([(
+        "source".to_string(),
+        Value::Object(HashMap::from([(
+            "process".to_string(),
             Value::Object(HashMap::from([(
-                "process".to_string(),
-                Value::Object(HashMap::from([(
-                    "uid".to_string(),
-                    str_val("d22b3fbcb9e77cb86834f6a18e2e0f68"),
-                )])),
+                "uid".to_string(),
+                str_val("d22b3fbcb9e77cb86834f6a18e2e0f68"),
             )])),
-        ),
-    ]))
+        )])),
+    )]))
 }
 
 #[test]
@@ -2719,10 +2816,7 @@ fn execute_each_yield_nested_array_index() {
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([(
-            "process_name".to_string(),
-            FieldType::Base(BaseType::Chars),
-        )]),
+        HashMap::from([("process_name".to_string(), FieldType::Base(BaseType::Chars))]),
     );
 
     let alert = exec
@@ -2733,12 +2827,8 @@ fn execute_each_yield_nested_array_index() {
                     "related".to_string(),
                     Value::Array(vec![Value::Object(HashMap::from([(
                         "process".to_string(),
-                        Value::Object(HashMap::from([(
-                            "name".to_string(),
-                            str_val("evil.exe"),
-                        )])),
-                    )])),
-                    ]),
+                        Value::Object(HashMap::from([("name".to_string(), str_val("evil.exe"))])),
+                    )]))]),
                 )])),
             )]),
             1_000_000,
@@ -2785,10 +2875,7 @@ fn execute_each_yield_nested_array_out_of_bounds_omits() {
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([(
-            "process_name".to_string(),
-            FieldType::Base(BaseType::Chars),
-        )]),
+        HashMap::from([("process_name".to_string(), FieldType::Base(BaseType::Chars))]),
     );
 
     let alert = exec
@@ -2849,10 +2936,7 @@ fn execute_each_yield_nested_path_in_arithmetic() {
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([(
-            "double_risk".to_string(),
-            FieldType::Base(BaseType::Float),
-        )]),
+        HashMap::from([("double_risk".to_string(), FieldType::Base(BaseType::Float))]),
     );
 
     let alert = exec
@@ -2996,10 +3080,7 @@ fn execute_each_bind_filter_nested_path() {
 
     // Matching nested value → alert fires with the extracted uid.
     let matching = exec
-        .execute_each(
-            &event(vec![("roles_obj", nested_roles_value())]),
-            1_000_000,
-        )
+        .execute_each(&event(vec![("roles_obj", nested_roles_value())]), 1_000_000)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -3020,17 +3101,17 @@ fn execute_each_bind_filter_nested_path() {
                     "source".to_string(),
                     Value::Object(HashMap::from([(
                         "process".to_string(),
-                        Value::Object(HashMap::from([(
-                            "uid".to_string(),
-                            str_val("other"),
-                        )])),
+                        Value::Object(HashMap::from([("uid".to_string(), str_val("other"))])),
                     )])),
                 )])),
             )]),
             1_000_000,
         )
         .unwrap();
-    assert!(skipped.is_none(), "filter must drop non-matching nested uid");
+    assert!(
+        skipped.is_none(),
+        "filter must drop non-matching nested uid"
+    );
 }
 
 #[test]
@@ -3232,4 +3313,3 @@ rule r {
         "object-literal nested path must extract in a match rule"
     );
 }
-

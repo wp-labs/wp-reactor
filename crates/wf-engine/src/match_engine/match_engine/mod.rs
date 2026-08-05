@@ -443,9 +443,15 @@ impl CepStateMachine {
                     if self.emit_count >= rate.count {
                         match limits.on_exceed {
                             ExceedAction::Throttle | ExceedAction::DropOldest => {
-                                let reset_at = fixed_created_at.unwrap_or(now_nanos);
-                                instance.reset(plan, reset_at);
-                                self.push_expiry_candidate(&instance_key, reset_at);
+                                // `on event<accu>`: a throttled re-fire suppresses the
+                                // alert but keeps the running accumulation.
+                                if plan.accu {
+                                    instance.rearm(plan);
+                                } else {
+                                    let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                                    instance.reset(plan, reset_at);
+                                    self.push_expiry_candidate(&instance_key, reset_at);
+                                }
                                 self.insert_instance(instance_key, instance);
                                 return step_outcome(StepResult::Accumulate, None);
                             }
@@ -473,9 +479,14 @@ impl CepStateMachine {
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
                 };
-                let reset_at = fixed_created_at.unwrap_or(now_nanos);
-                instance.reset(plan, reset_at);
-                self.push_expiry_candidate(&instance_key, reset_at);
+                if plan.accu {
+                    // `on event<accu>` — keep accumulating across fires.
+                    instance.rearm(plan);
+                } else {
+                    let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                    instance.reset(plan, reset_at);
+                    self.push_expiry_candidate(&instance_key, reset_at);
+                }
                 self.insert_instance(instance_key, instance);
                 return step_outcome(StepResult::Matched(ctx), None);
             }
@@ -619,10 +630,16 @@ impl CepStateMachine {
                     if self.emit_count >= rate.count {
                         match limits.on_exceed {
                             ExceedAction::Throttle | ExceedAction::DropOldest => {
-                                // Suppress the match — reset instance for future use
-                                let reset_at = fixed_created_at.unwrap_or(now_nanos);
-                                instance.reset(plan, reset_at);
-                                self.push_expiry_candidate(&instance_key, reset_at);
+                                // `on event<accu>`: a throttled re-fire suppresses the
+                                // alert but keeps the running accumulation.
+                                if plan.accu {
+                                    instance.rearm(plan);
+                                } else {
+                                    // Suppress the match — reset instance for future use
+                                    let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                                    instance.reset(plan, reset_at);
+                                    self.push_expiry_candidate(&instance_key, reset_at);
+                                }
                                 break 'process StepResult::Accumulate;
                             }
                             ExceedAction::FailRule => {
@@ -634,7 +651,8 @@ impl CepStateMachine {
                     self.emit_count += 1;
                 }
 
-                // No close steps → M14 backward compat: Matched + reset
+                // No close steps → M14 backward compat: Matched + reset, or
+                // `on event<accu>` rearm (keep accumulating across fires).
                 let (evidence_first, evidence_last) =
                     evidence_time_range(instance.completed_steps.iter())
                         .unwrap_or((now_nanos, now_nanos));
@@ -650,9 +668,14 @@ impl CepStateMachine {
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
                 };
-                let reset_at = fixed_created_at.unwrap_or(now_nanos);
-                instance.reset(plan, reset_at);
-                self.push_expiry_candidate(&instance_key, reset_at);
+                if plan.accu {
+                    // `on event<accu>` — keep accumulating across fires.
+                    instance.rearm(plan);
+                } else {
+                    let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                    instance.reset(plan, reset_at);
+                    self.push_expiry_candidate(&instance_key, reset_at);
+                }
                 StepResult::Matched(ctx)
             } else if plan.close_mode == CloseMode::Or {
                 // OR mode: emit from event path immediately, keep instance alive for close

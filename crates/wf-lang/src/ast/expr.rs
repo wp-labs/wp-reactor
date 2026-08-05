@@ -28,7 +28,10 @@ pub enum FieldRef {
     /// flat field map is keyed by field name, so the traversal starts from the
     /// root segment — `alias` is only used by the compiler for bind tracking and
     /// by the checker for root resolution.
-    Path { alias: String, segments: Vec<PathSegment> },
+    Path {
+        alias: String,
+        segments: Vec<PathSegment>,
+    },
 }
 
 /// One step of a nested field path: a member name or an array index.

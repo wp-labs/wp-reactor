@@ -301,6 +301,7 @@ fn make_task_with_window_bytes(
         tracked_plain_fields: empty_tracked_plain_fields(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     };
 
     let rule_plan = RulePlan {
@@ -406,6 +407,7 @@ fn make_pipeline_stage_task() -> (
         tracked_plain_fields: empty_tracked_plain_fields(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     };
     let rule_plan = RulePlan {
         name: "__wf_pipe_pipe_s1".into(),
@@ -499,6 +501,7 @@ fn make_each_task() -> (
             tracked_plain_fields: empty_tracked_plain_fields(),
             seq: None,
             match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -589,6 +592,7 @@ fn make_filtered_match_task() -> (
         tracked_plain_fields: empty_tracked_plain_fields(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     };
 
     let rule_plan = RulePlan {
@@ -700,6 +704,7 @@ fn make_filtered_close_task() -> (
         tracked_plain_fields: empty_tracked_plain_fields(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     };
 
     let rule_plan = RulePlan {
@@ -795,6 +800,7 @@ fn make_filtered_each_task() -> (
             tracked_plain_fields: empty_tracked_plain_fields(),
             seq: None,
             match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -882,6 +888,7 @@ fn make_intermediate_each_task() -> (
             tracked_plain_fields: empty_tracked_plain_fields(),
             seq: None,
             match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -994,6 +1001,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
             tracked_plain_fields: empty_tracked_plain_fields(),
             seq: None,
             match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -1091,6 +1099,7 @@ fn make_intermediate_score_tasks() -> (
             tracked_plain_fields: empty_tracked_plain_fields(),
             seq: None,
             match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -1187,6 +1196,7 @@ fn make_intermediate_score_tasks() -> (
         tracked_plain_fields: empty_tracked_plain_fields(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     };
 
     let downstream_plan = RulePlan {
@@ -1325,6 +1335,7 @@ fn make_intermediate_score_band_tasks() -> (
             tracked_plain_fields: empty_tracked_plain_fields(),
             seq: None,
             match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -1421,6 +1432,7 @@ fn make_intermediate_score_band_tasks() -> (
         tracked_plain_fields: empty_tracked_plain_fields(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     };
 
     let downstream_plan = RulePlan {
@@ -1615,6 +1627,7 @@ fn make_filtered_bind_alias_match_task() -> (
         tracked_plain_fields: empty_tracked_plain_fields(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     };
 
     let rule_plan = RulePlan {
@@ -1779,6 +1792,7 @@ fn make_window_has_match_task() -> (
         tracked_plain_fields: empty_tracked_plain_fields(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     };
 
     let rule_plan = RulePlan {
@@ -2572,6 +2586,7 @@ async fn port_scan_rule_triggers_close_alert() {
         tracked_plain_fields: empty_tracked_plain_fields(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     };
 
     let rule_plan = RulePlan {

@@ -93,3 +93,100 @@ rule r {
         system_errors
     );
 }
+
+// ---------------------------------------------------------------------------
+// on event<accu> — within-window accumulation constraints
+// ---------------------------------------------------------------------------
+
+#[test]
+fn accu_bare_single_step_passes() {
+    let input = r#"
+rule r {
+    events { s : auth_events }
+    match<:5m> {
+        on event<accu> { s | count >= 2; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
+}
+
+#[test]
+fn accu_with_close_block_rejected() {
+    let input = r#"
+rule r {
+    events { s : auth_events }
+    match<:5m> {
+        on event<accu> { s | count >= 2; }
+        on close { s | count >= 3; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "on event<accu> is not supported together with an `on close` / `and close` block",
+    );
+}
+
+#[test]
+fn accu_with_seq_chain_rejected() {
+    let input = r#"
+rule r {
+    events { s : auth_events }
+    match<:5m> {
+        on event<accu> seq { s | count >= 2; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "on event<accu> is not supported with `on event seq { ... }` chain syntax",
+    );
+}
+
+#[test]
+fn accu_multi_step_rejected() {
+    let input = r#"
+rule r {
+    events { a : auth_events  b : auth_events }
+    match<:5m> {
+        on event<accu> { a | count >= 1;  b | count >= 1; }
+    } -> score(50.0)
+    entity(ip, a.sip)
+    yield out (x = a.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "on event<accu> requires exactly one step",
+    );
+}
+
+#[test]
+fn accu_multi_branch_rejected() {
+    // A single step with multiple OR branches has undefined accu semantics.
+    let input = r#"
+rule r {
+    events { s : auth_events }
+    match<:5m> {
+        on event<accu> { s | count >= 2 || s | count >= 3; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "on event<accu> requires exactly one step with a single branch",
+    );
+}

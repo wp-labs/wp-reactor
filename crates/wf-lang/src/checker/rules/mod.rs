@@ -12,8 +12,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::ast::{
-    EachClause, Expr, FieldRef, MatchClause, Measure, PipelineStage, RuleDecl,
-    SeqClause, SeqSkip,
+    EachClause, Expr, FieldRef, MatchClause, Measure, PipelineStage, RuleDecl, SeqClause, SeqSkip,
 };
 use crate::checker::scope::{Scope, StatLabelInfo, StatLabelStage};
 use crate::checker::types::{ValType, check_expr_type, infer_type};
@@ -268,6 +267,44 @@ fn check_stage(
             errors,
             &mut labels_seen,
         );
+    }
+
+    // `on event<accu>` — within-window accumulation: scoped to a single `on event`
+    // step with no close block and no seq chain (multi-step accumulation and
+    // close interplay are not defined yet).
+    if match_clause.accu {
+        if match_clause.on_close.is_some() {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: "on event<accu> is not supported together with an `on close` / `and close` block"
+                    .to_string(),
+            });
+        }
+        if match_clause.seq.is_some() {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: "on event<accu> is not supported with `on event seq { ... }` chain syntax"
+                    .to_string(),
+            });
+        }
+        if match_clause.on_event.len() != 1
+            || match_clause
+                .on_event
+                .first()
+                .is_some_and(|step| step.branches.len() != 1)
+        {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: "on event<accu> requires exactly one step with a single branch"
+                    .to_string(),
+            });
+        }
     }
 
     // Chain steps: reuse the match-step checks (alias / field / pipe) plus

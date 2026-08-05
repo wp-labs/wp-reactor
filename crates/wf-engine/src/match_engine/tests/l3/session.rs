@@ -33,6 +33,7 @@ fn session_plan(gap_secs: u64) -> wf_lang::plan::MatchPlan {
         tracked_plain_fields: HashSet::new(),
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
     }
 }
 

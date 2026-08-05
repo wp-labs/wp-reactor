@@ -1,3 +1,4 @@
+mod accu;
 mod any_l2;
 mod helpers;
 mod perf;

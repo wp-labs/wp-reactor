@@ -1,4 +1,6 @@
-use crate::ast::{BinOp, CmpOp, Expr, FieldRef, FieldSelector, Measure, PathSegment, SystemVar, Transform};
+use crate::ast::{
+    BinOp, CmpOp, Expr, FieldRef, FieldSelector, Measure, PathSegment, SystemVar, Transform,
+};
 use crate::schema::{BaseType, FieldType};
 
 // ---------------------------------------------------------------------------

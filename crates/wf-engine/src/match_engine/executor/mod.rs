@@ -176,7 +176,11 @@ impl RuleExecutor {
     }
 }
 
-fn coerce_yield_value(name: &str, field_type: &FieldType, value: Value) -> CoreResult<Option<Value>> {
+fn coerce_yield_value(
+    name: &str,
+    field_type: &FieldType,
+    value: Value,
+) -> CoreResult<Option<Value>> {
     // A yield expression referencing a missing input field evaluates to the
     // empty-string fallback (see `eval_yield_expr_with_meta`). For targets that
     // can never be a valid empty string, treat it as an absent/optional field:

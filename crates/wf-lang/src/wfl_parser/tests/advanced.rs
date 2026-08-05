@@ -463,3 +463,81 @@ rule r {
     let file = parse_wfl(input).unwrap();
     assert_eq!(file.rules[0].yield_clause.version, None);
 }
+
+// -----------------------------------------------------------------------
+// `on event<accu>` — within-window accumulation
+// -----------------------------------------------------------------------
+
+#[test]
+fn parse_on_event_accu() {
+    let input = r#"
+rule r {
+    events { s : win }
+    match<log_type:100s> {
+        on event<accu> { s | count >= 2; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let mc = &file.rules[0].match_clause;
+    assert!(mc.accu, "on event<accu> should set accu");
+    assert_eq!(mc.on_event.len(), 1);
+    assert_eq!(mc.match_mode, MatchMode::Seq);
+    assert!(mc.on_close.is_none());
+    assert!(mc.seq.is_none());
+}
+
+#[test]
+fn parse_on_event_accu_with_any() {
+    let input = r#"
+rule r {
+    events { s : win }
+    match<log_type:100s> {
+        on event<accu> any { s | count >= 2; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let mc = &file.rules[0].match_clause;
+    assert!(mc.accu);
+    assert_eq!(mc.match_mode, MatchMode::Any);
+}
+
+#[test]
+fn parse_plain_on_event_accu_false() {
+    let input = r#"
+rule r {
+    events { s : win }
+    match<log_type:100s> {
+        on event { s | count >= 2; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    assert!(!file.rules[0].match_clause.accu);
+}
+
+#[test]
+fn parse_on_event_accu_with_seq_parses() {
+    // `accu` and `seq` coexist syntactically; the checker rejects the combo.
+    let input = r#"
+rule r {
+    events { s : win }
+    match<log_type:100s> {
+        on event<accu> seq { s | count >= 2; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield out (x = s.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let mc = &file.rules[0].match_clause;
+    assert!(mc.accu);
+    assert!(mc.seq.is_some());
+}

@@ -250,7 +250,11 @@ fn window_has_nested_path_infers_leaf_field() {
     // inferred from the path root ("roles_obj"), the lookup would miss and the
     // guard would fail.
     let mut lookup = MockWindowLookup::new();
-    lookup.add_field_values("threat_list", "uid", vec!["d22b3fbcb9e77cb86834f6a18e2e0f68"]);
+    lookup.add_field_values(
+        "threat_list",
+        "uid",
+        vec!["d22b3fbcb9e77cb86834f6a18e2e0f68"],
+    );
 
     let e = event(vec![
         ("sip", str_val("10.0.0.1")),

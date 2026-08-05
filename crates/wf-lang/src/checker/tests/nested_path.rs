@@ -87,8 +87,7 @@ rule r {
     yield out (x = a.sip)
 }
 "#;
-    let err = parse_wfl(input)
-        .expect_err("nested path in match key must fail to parse");
+    let err = parse_wfl(input).expect_err("nested path in match key must fail to parse");
     assert!(
         format!("{:?}", err).contains("match"),
         "expected a parse error mentioning the match clause, got: {:?}",
@@ -121,10 +120,22 @@ fn nested_path_as_sum_avg_min_max_arg_errors() {
     // sum/avg/min/max reject nested paths too (previously they passed the
     // checker and then silently omitted the field at runtime).
     for (func, message) in [
-        ("avg", "avg() argument must be a column projection (alias.field)"),
-        ("sum", "sum() argument must be a column projection (alias.field)"),
-        ("min", "min() argument must be a column projection (alias.field)"),
-        ("max", "max() argument must be a column projection (alias.field)"),
+        (
+            "avg",
+            "avg() argument must be a column projection (alias.field)",
+        ),
+        (
+            "sum",
+            "sum() argument must be a column projection (alias.field)",
+        ),
+        (
+            "min",
+            "min() argument must be a column projection (alias.field)",
+        ),
+        (
+            "max",
+            "max() argument must be a column projection (alias.field)",
+        ),
     ] {
         let input = format!(
             r#"
@@ -163,5 +174,3 @@ rule r {
         "count() expects a set-level argument (alias), not a field projection",
     );
 }
-
-

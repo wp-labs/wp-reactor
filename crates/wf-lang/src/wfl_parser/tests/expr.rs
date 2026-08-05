@@ -248,7 +248,10 @@ rule r {
     let file = parse_wfl(input).unwrap();
     let y = &file.rules[0].yield_clause;
     // Single-level: backward-compatible Qualified (no Path).
-    assert_eq!(y.args[0].value, Expr::Field(FieldRef::Qualified("e".into(), "sip".into())));
+    assert_eq!(
+        y.args[0].value,
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))
+    );
     // Quoted bracket: unchanged Bracketed (flat dotted name).
     assert_eq!(
         y.args[1].value,

@@ -89,6 +89,10 @@ pub struct MatchPlan {
     pub match_mode: MatchMode,
     /// Ordered sequence constraints (`on event seq { ... }`). When present, event/close steps are empty.
     pub seq: Option<SeqPlan>,
+    /// `on event<accu>` — within-window accumulation: after firing, count and
+    /// evidence keep accumulating without reset and each subsequent qualifying
+    /// event re-fires with the running cumulative values until the window expires.
+    pub accu: bool,
 }
 
 /// Explicit key mapping entry: logical name → source alias + field.

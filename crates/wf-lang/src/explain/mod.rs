@@ -8,8 +8,8 @@ use crate::plan::RulePlan;
 use crate::schema::WindowSchema;
 
 use crate::ast::CloseMode;
-pub use format::{format_cmp, format_expr, format_field_ref, format_measure};
 pub(crate) use format::format_path_segments;
+pub use format::{format_cmp, format_expr, format_field_ref, format_measure};
 
 use sections::{
     compute_lineage, explain_binds, explain_conv, explain_joins, explain_limits, explain_match,
@@ -50,6 +50,8 @@ pub struct MatchExpl {
     pub close_mode: Option<CloseMode>,
     /// Chain steps (with `within` / `not` markers), when the rule uses `chain`.
     pub seq: Option<Vec<String>>,
+    /// `on event<accu>` — within-window accumulation.
+    pub accu: bool,
 }
 
 /// Build explanations for a set of compiled rules.

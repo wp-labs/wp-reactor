@@ -121,9 +121,7 @@ pub fn check_func_call(
             // field projection — including nested paths, which have no column
             // to count (they would silently omit at runtime).
             if let Some(Expr::Field(
-                FieldRef::Qualified(..)
-                | FieldRef::Bracketed(..)
-                | FieldRef::Path { .. },
+                FieldRef::Qualified(..) | FieldRef::Bracketed(..) | FieldRef::Path { .. },
             )) = args.first()
             {
                 errors.push(CheckError {

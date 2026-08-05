@@ -66,6 +66,7 @@ pub(super) fn explain_match(mp: &MatchPlan) -> MatchExpl {
         close_steps,
         close_mode,
         seq,
+        accu: mp.accu,
     }
 }
 

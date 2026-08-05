@@ -60,6 +60,10 @@ pub(super) fn match_clause_only(input: &mut &str) -> ModalResult<MatchClause> {
         .parse_next(input)?;
     ws_skip.parse_next(input)?;
 
+    // `on event<accu>` — within-window accumulation (orthogonal to seq/any).
+    let accu = opt(accu_param).parse_next(input)?.is_some();
+    ws_skip.parse_next(input)?;
+
     let (on_event, on_close, seq, match_mode) = if opt(kw("seq")).parse_next(input)?.is_some() {
         // `on event seq { ... }` — ordered + within/not/consec/skip
         let seq = cut_err(seq_block_body)
@@ -99,7 +103,19 @@ pub(super) fn match_clause_only(input: &mut &str) -> ModalResult<MatchClause> {
         on_close,
         match_mode,
         seq,
+        accu,
     })
+}
+
+/// `on event<accu>` — the angle-bracket accumulation marker. The opening `<`
+/// must backtrack cleanly (no cut) so a plain `on event` parses normally.
+fn accu_param(input: &mut &str) -> ModalResult<bool> {
+    literal("<").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(kw("accu")).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(literal(">")).parse_next(input)?;
+    Ok(true)
 }
 
 pub(super) fn each_clause_only(input: &mut &str) -> ModalResult<EachClause> {

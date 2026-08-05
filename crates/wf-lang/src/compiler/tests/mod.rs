@@ -444,4 +444,3 @@ rule r {
         "root of an array-literal nested path must be tracked, got {fields:?}"
     );
 }
-

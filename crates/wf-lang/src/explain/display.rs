@@ -31,7 +31,11 @@ impl fmt::Display for RuleExplanation {
         // Seq-mode rules drive progression through `event_steps` too, so the steps
         // appear twice unless we suppress the `on event:` section for them.
         if self.match_expl.seq.is_none() && !self.match_expl.event_steps.is_empty() {
-            writeln!(f, "    on event:")?;
+            if self.match_expl.accu {
+                writeln!(f, "    on event<accu>:")?;
+            } else {
+                writeln!(f, "    on event:")?;
+            }
             for (i, step) in self.match_expl.event_steps.iter().enumerate() {
                 writeln!(f, "      step {}: {}", i + 1, step)?;
             }
