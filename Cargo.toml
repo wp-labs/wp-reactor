@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-version = "0.1.42" # @gxl:set(version)
+version = "0.3.0" # @gxl:set(version)
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -24,10 +24,10 @@ glob = "0.3"
 wildmatch = "2"
 tokio = { version = "1", features = ["sync"] }
 async-broadcast = "0.7"
-wp-connector-api =  "0.10"
+wp-connector-api =  "0.12"
 #wp-connectors = { git = "https://github.com/wp-labs/wp-connectors.git", tag = "0.15.4" }
-wp-core-connectors = "0.5"
-wp-model-core = "0.8"
+wp-core-connectors = "0.8"
+wp-model-core = "0.9"
 wf-connector-api = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
@@ -38,4 +38,11 @@ thiserror = "2.0"
 sha2 = "0.11"
 csv = "1.4"
 moju-derive = { git = "https://github.com/dayu-sec/moju-derive.git", branch = "main" }
-wp-knowledge =  "0.14.2"
+wp-knowledge =  "0.15"
+
+# Local override: crates.io 0.15.0 dropped the `[fun.<name>]` named-query layer
+# (external_exists/external_value) that wf-runtime's external() backend needs.
+# The local wp-knowledge (0.15.1) restored it. Replace with a git/registry dep
+# once 0.15.1 is published.
+[patch.crates-io]
+wp-knowledge = { path = "../../wparse/wp-knowledge" }
