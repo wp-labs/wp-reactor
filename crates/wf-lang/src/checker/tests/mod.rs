@@ -5,6 +5,7 @@ mod func_params;
 mod keys;
 mod labels;
 mod limits;
+mod nested_path;
 mod on_each;
 mod pipeline;
 mod scope;

@@ -1,4 +1,4 @@
-use wf_lang::ast::FieldRef;
+use wf_lang::ast::{FieldRef, PathSegment};
 
 use super::types::{Event, Value};
 
@@ -179,8 +179,64 @@ pub(crate) fn field_ref_name(fr: &FieldRef) -> &str {
     match fr {
         FieldRef::Simple(name) => name,
         FieldRef::Qualified(_, name) | FieldRef::Bracketed(_, name) => name,
+        // Flat-lookup fallback for non-expression consumers: use the root field.
+        FieldRef::Path { segments, .. } => match segments.first() {
+            Some(PathSegment::Field(root)) => root,
+            _ => "",
+        },
         _ => "",
     }
+}
+
+/// The leaf field name of a reference — for a `Path` this is the last member
+/// segment (used by `window.has` to infer the column to look up, matching how
+/// `e.sip` infers `sip`).
+pub(crate) fn field_ref_leaf_name(fr: &FieldRef) -> Option<&str> {
+    match fr {
+        FieldRef::Simple(name) => Some(name),
+        FieldRef::Qualified(_, field) | FieldRef::Bracketed(_, field) => Some(field),
+        FieldRef::Path { segments, .. } => segments
+            .iter()
+            .rev()
+            .find_map(|seg| match seg {
+                PathSegment::Field(name) => Some(name.as_str()),
+                PathSegment::Index(_) => None,
+                _ => None,
+            }),
+        _ => None,
+    }
+}
+
+/// Resolve a field reference against a flat field map. `FieldRef::Path` walks
+/// nested `object` / `array` values; any missing member, out-of-bounds index, or
+/// type mismatch yields `None` (which the yield layer degrades to an omitted
+/// field). Other variants use the existing flat lookup.
+pub(crate) fn eval_field_value(
+    fields: &std::collections::HashMap<String, Value>,
+    fr: &FieldRef,
+) -> Option<Value> {
+    let FieldRef::Path { segments, .. } = fr else {
+        return fields.get(field_ref_name(fr)).cloned();
+    };
+    let mut iter = segments.iter();
+    let Some(PathSegment::Field(root)) = iter.next() else {
+        return None;
+    };
+    let mut value = fields.get(root)?.clone();
+    for segment in iter {
+        match segment {
+            PathSegment::Field(name) => match value {
+                Value::Object(map) => value = map.get(name)?.clone(),
+                _ => return None,
+            },
+            PathSegment::Index(idx) => match value {
+                Value::Array(items) => value = items.get(*idx)?.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    Some(value)
 }
 
 pub(super) fn make_scope_key_str(scope_key: &[Value]) -> String {
@@ -198,5 +254,226 @@ pub(crate) fn value_to_string(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Array(_) => "[array]".to_string(),
         Value::Object(_) => "[object]".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use wf_lang::ast::PathSegment;
+
+    fn fields(pairs: &[(&str, Value)]) -> std::collections::HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    fn path(alias: &str, segments: &[PathSegment]) -> FieldRef {
+        FieldRef::Path {
+            alias: alias.to_string(),
+            segments: segments.to_vec(),
+        }
+    }
+
+    #[test]
+    fn eval_path_walks_object() {
+        let f = fields(&[(
+            "roles_obj",
+            Value::Object(HashMap::from([(
+                "source".to_string(),
+                Value::Object(HashMap::from([(
+                    "uid".to_string(),
+                    Value::Str("abc".to_string()),
+                )])),
+            )])),
+        )]);
+        let fr = path(
+            "e",
+            &[
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("source".into()),
+                PathSegment::Field("uid".into()),
+            ],
+        );
+        assert_eq!(eval_field_value(&f, &fr), Some(Value::Str("abc".into())));
+    }
+
+    #[test]
+    fn eval_path_walks_array_index() {
+        let f = fields(&[(
+            "arr",
+            Value::Array(vec![Value::Str("first".into()), Value::Str("second".into())]),
+        )]);
+        let fr = path("e", &[PathSegment::Field("arr".into()), PathSegment::Index(1)]);
+        assert_eq!(eval_field_value(&f, &fr), Some(Value::Str("second".into())));
+    }
+
+    #[test]
+    fn eval_path_missing_member_is_none() {
+        let f = fields(&[(
+            "roles_obj",
+            Value::Object(HashMap::from([(
+                "source".to_string(),
+                Value::Object(HashMap::new()),
+            )])),
+        )]);
+        let fr = path(
+            "e",
+            &[
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("missing".into()),
+            ],
+        );
+        assert_eq!(eval_field_value(&f, &fr), None);
+    }
+
+    #[test]
+    fn eval_path_out_of_bounds_is_none() {
+        let f = fields(&[("arr", Value::Array(vec![Value::Str("x".into())]))]);
+        let fr = path("e", &[PathSegment::Field("arr".into()), PathSegment::Index(5)]);
+        assert_eq!(eval_field_value(&f, &fr), None);
+    }
+
+    #[test]
+    fn eval_path_type_mismatch_is_none() {
+        let f = fields(&[(
+            "roles_obj",
+            Value::Object(HashMap::from([("source".to_string(), Value::Str("s".into()))])),
+        )]);
+        // `source` is a string, not an object → next member fails.
+        let fr = path(
+            "e",
+            &[
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("source".into()),
+                PathSegment::Field("x".into()),
+            ],
+        );
+        assert_eq!(eval_field_value(&f, &fr), None);
+    }
+
+    #[test]
+    fn eval_flat_ref_still_works() {
+        let f = fields(&[("sip", Value::Str("10.0.0.1".into()))]);
+        assert_eq!(
+            eval_field_value(&f, &FieldRef::Qualified("e".into(), "sip".into())),
+            Some(Value::Str("10.0.0.1".into()))
+        );
+    }
+
+    #[test]
+    fn eval_path_root_field_missing_is_none() {
+        // The root object field itself is absent from the flat map.
+        let f = fields(&[("sip", Value::Str("10.0.0.1".into()))]);
+        let fr = path(
+            "e",
+            &[
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("source".into()),
+            ],
+        );
+        assert_eq!(eval_field_value(&f, &fr), None);
+    }
+
+    #[test]
+    fn eval_path_index_on_object_is_none() {
+        // An index segment applied to a non-array value is a type mismatch.
+        let f = fields(&[(
+            "roles_obj",
+            Value::Object(HashMap::from([("x".to_string(), Value::Str("s".into()))])),
+        )]);
+        let fr = path("e", &[
+            PathSegment::Field("roles_obj".into()),
+            PathSegment::Index(0),
+        ]);
+        assert_eq!(eval_field_value(&f, &fr), None);
+    }
+
+    #[test]
+    fn eval_path_member_on_array_is_none() {
+        // A member segment applied to a non-object value is a type mismatch.
+        let f = fields(&[("arr", Value::Array(vec![Value::Str("x".into())]))]);
+        let fr = path("e", &[
+            PathSegment::Field("arr".into()),
+            PathSegment::Field("name".into()),
+        ]);
+        assert_eq!(eval_field_value(&f, &fr), None);
+    }
+
+    #[test]
+    fn eval_path_empty_segments_is_none() {
+        // Defensive: a Path with no segments resolves to nothing.
+        let f = fields(&[("x", Value::Str("s".into()))]);
+        let fr = FieldRef::Path {
+            alias: "e".to_string(),
+            segments: vec![],
+        };
+        assert_eq!(eval_field_value(&f, &fr), None);
+    }
+
+    #[test]
+    fn eval_path_deep_mixed_walk() {
+        // object → array → index → object → member.
+        let f = fields(&[(
+            "roles_obj",
+            Value::Object(HashMap::from([(
+                "related".to_string(),
+                Value::Array(vec![Value::Object(HashMap::from([(
+                    "process".to_string(),
+                    Value::Object(HashMap::from([(
+                        "name".to_string(),
+                        Value::Str("evil.exe".into()),
+                    )])),
+                )])),
+                ]),
+            )])),
+        )]);
+        let fr = path(
+            "e",
+            &[
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("related".into()),
+                PathSegment::Index(0),
+                PathSegment::Field("process".into()),
+                PathSegment::Field("name".into()),
+            ],
+        );
+        assert_eq!(eval_field_value(&f, &fr), Some(Value::Str("evil.exe".into())));
+    }
+
+    #[test]
+    fn leaf_name_matches_flat_refs_and_paths() {
+        // Leaf inference for window.has: flat refs use their field, nested paths
+        // use their last member segment.
+        assert_eq!(field_ref_leaf_name(&FieldRef::Simple("sip".into())), Some("sip"));
+        assert_eq!(
+            field_ref_leaf_name(&FieldRef::Qualified("e".into(), "sip".into())),
+            Some("sip")
+        );
+        assert_eq!(
+            field_ref_leaf_name(&FieldRef::Bracketed("e".into(), "detail.sha256".into())),
+            Some("detail.sha256")
+        );
+        assert_eq!(
+            field_ref_leaf_name(&path("e", &[
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("source".into()),
+                PathSegment::Field("process".into()),
+                PathSegment::Field("uid".into()),
+            ])),
+            Some("uid")
+        );
+        // A path that ends in an index has no leaf member → falls back to the
+        // last member before it ("related").
+        assert_eq!(
+            field_ref_leaf_name(&path("e", &[
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("related".into()),
+                PathSegment::Index(0),
+            ])),
+            Some("related")
+        );
     }
 }

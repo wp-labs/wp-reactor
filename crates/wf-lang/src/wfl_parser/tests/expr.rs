@@ -186,6 +186,114 @@ rule r {
 }
 
 #[test]
+fn parse_expr_nested_field_paths() {
+    let input = r##"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        a = e.roles_obj.source.process.uid,
+        b = e.roles_obj.related[0].process.name
+    )
+}
+"##;
+    let file = parse_wfl(input).unwrap();
+    let y = &file.rules[0].yield_clause;
+    assert_eq!(
+        y.args[0].value,
+        Expr::Field(FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("source".into()),
+                PathSegment::Field("process".into()),
+                PathSegment::Field("uid".into()),
+            ],
+        })
+    );
+    assert_eq!(
+        y.args[1].value,
+        Expr::Field(FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("related".into()),
+                PathSegment::Index(0),
+                PathSegment::Field("process".into()),
+                PathSegment::Field("name".into()),
+            ],
+        })
+    );
+}
+
+#[test]
+fn parse_expr_nested_path_shapes() {
+    // FieldRef shape matrix: single-level stays Qualified, quoted bracket stays
+    // Bracketed, and only multi-level dot/index access becomes Path.
+    let input = r##"
+rule r {
+    events { e : win }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (
+        a = e.sip,
+        b = e["detail.sha256"],
+        c = e.roles_obj.related[0],
+        d = e.a[0][1],
+        e = e.a.b[0].c
+    )
+}
+"##;
+    let file = parse_wfl(input).unwrap();
+    let y = &file.rules[0].yield_clause;
+    // Single-level: backward-compatible Qualified (no Path).
+    assert_eq!(y.args[0].value, Expr::Field(FieldRef::Qualified("e".into(), "sip".into())));
+    // Quoted bracket: unchanged Bracketed (flat dotted name).
+    assert_eq!(
+        y.args[1].value,
+        Expr::Field(FieldRef::Bracketed("e".into(), "detail.sha256".into()))
+    );
+    // member + index → Path.
+    assert_eq!(
+        y.args[2].value,
+        Expr::Field(FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("related".into()),
+                PathSegment::Index(0),
+            ],
+        })
+    );
+    // consecutive indices.
+    assert_eq!(
+        y.args[3].value,
+        Expr::Field(FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![
+                PathSegment::Field("a".into()),
+                PathSegment::Index(0),
+                PathSegment::Index(1),
+            ],
+        })
+    );
+    // mixed members and indices.
+    assert_eq!(
+        y.args[4].value,
+        Expr::Field(FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![
+                PathSegment::Field("a".into()),
+                PathSegment::Field("b".into()),
+                PathSegment::Index(0),
+                PathSegment::Field("c".into()),
+            ],
+        })
+    );
+}
+
+#[test]
 fn parse_expr_unary_neg() {
     let input = r#"
 rule r {

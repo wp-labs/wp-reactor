@@ -2,7 +2,7 @@ use std::cell::Cell;
 
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::match_engine::{
-    Event, Value, WindowLookup, eval_expr, eval_expr_ext, field_ref_name, value_to_string,
+    Event, Value, WindowLookup, eval_expr, eval_expr_ext, eval_field_value, value_to_string,
     values_equal,
 };
 
@@ -185,7 +185,7 @@ pub(super) fn eval_expr_with_l3(
         }
         Expr::SystemVar(SystemVar::EmitTime) => meta.emit_time_nanos.map(time_nanos_to_value),
         Expr::WfuMeta(field) => meta.resolve_wfu_meta(*field),
-        Expr::Field(fr) => ctx.fields.get(field_ref_name(fr)).cloned(),
+        Expr::Field(fr) => eval_field_value(&ctx.fields, fr),
         Expr::Object(items) => {
             let mut map = std::collections::HashMap::new();
             for item in items {

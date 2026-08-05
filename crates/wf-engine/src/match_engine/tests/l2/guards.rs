@@ -205,3 +205,73 @@ fn window_has_numeric_field() {
         result
     );
 }
+
+/// window.has() infers the column from a nested path's leaf member, not its root
+/// object field — so `has(e.roles_obj.source.process.uid)` looks up the `uid`
+/// column (wp-labs/warp-fusion#64).
+#[test]
+fn window_has_nested_path_infers_leaf_field() {
+    use wf_lang::ast::{CmpOp, Expr, FieldRef, Measure, PathSegment};
+    use wf_lang::plan::{AggPlan, BranchPlan};
+
+    let guard = Expr::FuncCall {
+        qualifier: Some("threat_list".to_string()),
+        name: "has".to_string(),
+        args: vec![Expr::Field(FieldRef::Path {
+            alias: "fail".to_string(),
+            segments: vec![
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("source".into()),
+                PathSegment::Field("process".into()),
+                PathSegment::Field("uid".into()),
+            ],
+        })],
+    };
+
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![BranchPlan {
+            label: None,
+            source: "fail".to_string(),
+            field: None,
+            guard: Some(guard),
+            agg: AggPlan {
+                transforms: vec![],
+                measure: Measure::Count,
+                cmp: CmpOp::Ge,
+                threshold: Expr::Number(1.0),
+            },
+        }])],
+    );
+
+    let mut sm = CepStateMachine::new("has_nested".into(), plan, None);
+
+    // Window's "uid" column contains the nested value. If the column were
+    // inferred from the path root ("roles_obj"), the lookup would miss and the
+    // guard would fail.
+    let mut lookup = MockWindowLookup::new();
+    lookup.add_field_values("threat_list", "uid", vec!["d22b3fbcb9e77cb86834f6a18e2e0f68"]);
+
+    let e = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        (
+            "roles_obj",
+            Value::Object(HashMap::from([(
+                "source".to_string(),
+                Value::Object(HashMap::from([(
+                    "process".to_string(),
+                    Value::Object(HashMap::from([(
+                        "uid".to_string(),
+                        str_val("d22b3fbcb9e77cb86834f6a18e2e0f68"),
+                    )])),
+                )])),
+            )])),
+        ),
+    ]);
+    let result = sm.advance_with("fail", &e, Some(&lookup));
+    assert!(
+        matches!(result, StepResult::Matched(_)),
+        "window.has(nested path) must infer the leaf column 'uid'; got {:?}",
+        result
+    );
+}

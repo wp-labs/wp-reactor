@@ -1,3 +1,4 @@
+use winnow::ascii::dec_uint;
 use winnow::combinator::{alt, cut_err, opt, separated};
 use winnow::error::{StrContext, StrContextValue};
 use winnow::prelude::*;
@@ -380,7 +381,8 @@ fn ident_primary(input: &mut &str) -> ModalResult<Expr> {
         return parse_func_call_args(None, first.to_string(), input);
     }
 
-    // Case 2: first.second → either qualified func call or field ref
+    // Case 2: first.second → either qualified func call, field ref, or a
+    // multi-level nested path (`s.roles_obj.source.process.uid`, `s.roles_obj.related[0].name`).
     if opt(literal(".")).parse_next(input)?.is_some() {
         ws_skip.parse_next(input)?;
         let second = cut_err(ident).parse_next(input)?;
@@ -391,11 +393,39 @@ fn ident_primary(input: &mut &str) -> ModalResult<Expr> {
             return parse_func_call_args(Some(first.to_string()), second.to_string(), input);
         }
 
-        // first.second → qualified field ref
-        return Ok(Expr::Field(FieldRef::Qualified(
-            first.to_string(),
-            second.to_string(),
-        )));
+        // Consume further segments: `.ident` members and `[integer]` indices.
+        let mut segments = vec![PathSegment::Field(second.to_string())];
+        loop {
+            if opt(literal(".")).parse_next(input)?.is_some() {
+                ws_skip.parse_next(input)?;
+                let seg = cut_err(ident).parse_next(input)?;
+                ws_skip.parse_next(input)?;
+                segments.push(PathSegment::Field(seg.to_string()));
+            } else if opt(literal("[")).parse_next(input)?.is_some() {
+                ws_skip.parse_next(input)?;
+                // Parse directly as `usize` so an index that overflows the
+                // platform width is a parse error, not a silent truncation.
+                let idx: usize = cut_err(dec_uint).parse_next(input)?;
+                ws_skip.parse_next(input)?;
+                cut_err(literal("]")).parse_next(input)?;
+                ws_skip.parse_next(input)?;
+                segments.push(PathSegment::Index(idx));
+            } else {
+                break;
+            }
+        }
+
+        // Single level → backward-compatible Qualified; deeper → Path.
+        if segments.len() == 1 {
+            return Ok(Expr::Field(FieldRef::Qualified(
+                first.to_string(),
+                second.to_string(),
+            )));
+        }
+        return Ok(Expr::Field(FieldRef::Path {
+            alias: first.to_string(),
+            segments,
+        }));
     }
 
     // Case 3: first["key"] → bracket field ref

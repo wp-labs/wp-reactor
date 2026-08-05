@@ -117,9 +117,14 @@ pub fn check_func_call(
 
     match name {
         "count" => {
-            // T4: argument should be a set-level reference (bare alias), not a field projection
-            if let Some(Expr::Field(FieldRef::Qualified(..)))
-            | Some(Expr::Field(FieldRef::Bracketed(..))) = args.first()
+            // T4: argument should be a set-level reference (bare alias), not a
+            // field projection — including nested paths, which have no column
+            // to count (they would silently omit at runtime).
+            if let Some(Expr::Field(
+                FieldRef::Qualified(..)
+                | FieldRef::Bracketed(..)
+                | FieldRef::Path { .. },
+            )) = args.first()
             {
                 errors.push(CheckError {
                     severity: Severity::Error,
@@ -131,6 +136,19 @@ pub fn check_func_call(
             }
         }
         "sum" | "avg" => {
+            // Nested paths are not aggregateable as flat columns → reject them
+            // (consistent with first/last/collect_*, which also reject Path).
+            if matches!(args.first(), Some(Expr::Field(FieldRef::Path { .. }))) {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "{}() argument must be a column projection (alias.field)",
+                        name
+                    ),
+                });
+            }
             if let Some(Expr::Field(FieldRef::Simple(alias_name))) = args.first()
                 && matches!(
                     scope.resolve_field_ref(&FieldRef::Simple(alias_name.clone())),
@@ -162,6 +180,18 @@ pub fn check_func_call(
             }
         }
         "min" | "max" => {
+            // Nested paths are not aggregateable as flat columns → reject them.
+            if matches!(args.first(), Some(Expr::Field(FieldRef::Path { .. }))) {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "{}() argument must be a column projection (alias.field)",
+                        name
+                    ),
+                });
+            }
             if let Some(Expr::Field(FieldRef::Simple(alias_name))) = args.first()
                 && matches!(
                     scope.resolve_field_ref(&FieldRef::Simple(alias_name.clone())),

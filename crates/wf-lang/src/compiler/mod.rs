@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::ast::{
     CloseMode, EachClause, EntityClause, EntityTypeVal, EventsBlock, Expr, FieldRef, MatchClause,
-    Measure, RuleDecl, ScoreExpr, SeqSkip, WflFile, WindowMode, YieldClause,
+    Measure, PathSegment, RuleDecl, ScoreExpr, SeqSkip, WflFile, WindowMode, YieldClause,
 };
 use crate::checker::check_wfl;
 use crate::plan::{
@@ -425,8 +425,27 @@ pub(crate) fn collect_bind_tracking(expr: &Expr, tracking: &mut BindTracking) {
         Expr::Field(FieldRef::Qualified(alias, field) | FieldRef::Bracketed(alias, field)) => {
             track_bind_field(tracking, alias, field);
         }
+        Expr::Field(FieldRef::Path { alias, segments }) => {
+            // Track the root object/array field so it reaches the match/close
+            // yield context; nested traversal happens at evaluation time.
+            if let Some(PathSegment::Field(root)) = segments.first() {
+                track_bind_field(tracking, alias, root);
+            }
+        }
         Expr::Field(FieldRef::Simple(field)) => {
             tracking.plain_fields.insert(field.clone());
+        }
+        Expr::Object(items) => {
+            // Structured yields recurse so that field references inside
+            // `object { ... }` members reach the match/close eval context too.
+            for item in items {
+                collect_bind_tracking(&item.value, tracking);
+            }
+        }
+        Expr::Array(items) => {
+            for item in items {
+                collect_bind_tracking(item, tracking);
+            }
         }
         _ => {}
     }
@@ -647,6 +666,7 @@ fn key_output_name(key: &FieldRef) -> String {
     match key {
         FieldRef::Simple(name) => name.clone(),
         FieldRef::Qualified(_, field) | FieldRef::Bracketed(_, field) => field.clone(),
+        FieldRef::Path { segments, .. } => crate::explain::format_path_segments(segments),
     }
 }
 

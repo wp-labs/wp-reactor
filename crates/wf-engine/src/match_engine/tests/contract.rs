@@ -29,6 +29,10 @@ fn auth_events_schema() -> WindowSchema {
                 field_type: FieldType::Base(BaseType::Digit),
             },
             FieldDef {
+                name: "roles_obj".to_string(),
+                field_type: FieldType::Object,
+            },
+            FieldDef {
                 name: "event_time".to_string(),
                 field_type: FieldType::Base(BaseType::Time),
             },
@@ -50,6 +54,10 @@ fn security_alerts_schema() -> WindowSchema {
             FieldDef {
                 name: "fail_count".to_string(),
                 field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "uid".to_string(),
+                field_type: FieldType::Base(BaseType::Chars),
             },
         ],
     }
@@ -347,4 +355,64 @@ test shuffle_order_check for ordered_ab {
         "expected run-scoped failure messages, got: {:?}",
         result.failures
     );
+}
+
+// =========================================================================
+// Nested field paths (wp-labs/warp-fusion#64)
+// =========================================================================
+
+#[test]
+fn contract_yield_nested_path_with_nested_input() {
+    let source = r#"
+rule brute_force {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(70.0)
+    entity(ip, e.sip)
+    yield security_alerts (sip = e.sip, fail_count = 1, uid = e.roles_obj.source.process.uid)
+}
+
+test nested_uid for brute_force {
+    input {
+        row(e, sip = "10.0.0.1", roles_obj = object {
+            source = object {
+                process = object {
+                    uid = "d22b3fbcb9e77cb86834f6a18e2e0f68";
+                };
+            };
+        });
+    }
+    expect {
+        hits == 1;
+    }
+}
+"#;
+    let result = run_contract_from_source(source);
+    assert!(result.passed, "failures: {:?}", result.failures);
+    assert_eq!(result.output_count, 1, "nested path must not suppress the alert");
+}
+
+#[test]
+fn contract_yield_nested_path_missing_input_still_fires() {
+    // Without `roles_obj` in the input, the nested path degrades to an omitted
+    // field and the alert still fires (issue #64).
+    let source = r#"
+rule brute_force {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(70.0)
+    entity(ip, e.sip)
+    yield security_alerts (sip = e.sip, fail_count = 1, uid = e.roles_obj.source.process.uid)
+}
+
+test missing_roles for brute_force {
+    input {
+        row(e, sip = "10.0.0.1", action = "failed");
+    }
+    expect {
+        hits == 1;
+    }
+}
+"#;
+    let result = run_contract_from_source(source);
+    assert!(result.passed, "failures: {:?}", result.failures);
+    assert_eq!(result.output_count, 1, "missing nested path must not suppress the alert");
 }

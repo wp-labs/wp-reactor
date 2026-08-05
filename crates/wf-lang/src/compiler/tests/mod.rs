@@ -371,3 +371,77 @@ rule tracked_fields {
         "plain yield field should be tracked for close-step field collection"
     );
 }
+
+#[test]
+fn yield_object_literal_path_tracks_root_field() {
+    // Issue #64: a nested path inside a structured `object { }` yield must still
+    // reach the match/close eval context, so its root field is tracked.
+    let w = make_window(
+        "auth_events",
+        vec!["auth_stream"],
+        vec![
+            ("sip", bt(BaseType::Ip)),
+            ("roles_obj", FieldType::Object),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let out = make_output_window("out", vec![("ctx", FieldType::Object)]);
+    let src = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (ctx = object { uid = e.roles_obj.source.process.uid; })
+}
+"#;
+    let plans = compile_with(src, &[w, out]);
+    let plan = plans.iter().find(|p| p.name == "r").expect("rule r");
+    let fields = plan
+        .match_plan
+        .tracked_bind_fields
+        .get("e")
+        .expect("alias e should be tracked");
+    assert!(
+        fields.contains("roles_obj"),
+        "root of an object-literal nested path must be tracked, got {fields:?}"
+    );
+    assert!(
+        fields.contains("sip"),
+        "entity key field still tracked, got {fields:?}"
+    );
+}
+
+#[test]
+fn yield_array_literal_path_tracks_root_field() {
+    // `array [ ... ]` members recurse into bind tracking too.
+    let w = make_window(
+        "auth_events",
+        vec!["auth_stream"],
+        vec![
+            ("sip", bt(BaseType::Ip)),
+            ("roles_obj", FieldType::Object),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let out = make_output_window("out", vec![("ctx", FieldType::ArrayAny)]);
+    let src = r#"
+rule r {
+    events { e : auth_events }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (ctx = array [ e.roles_obj.source.process.uid ])
+}
+"#;
+    let plans = compile_with(src, &[w, out]);
+    let plan = plans.iter().find(|p| p.name == "r").expect("rule r");
+    let fields = plan
+        .match_plan
+        .tracked_bind_fields
+        .get("e")
+        .expect("alias e should be tracked");
+    assert!(
+        fields.contains("roles_obj"),
+        "root of an array-literal nested path must be tracked, got {fields:?}"
+    );
+}
+

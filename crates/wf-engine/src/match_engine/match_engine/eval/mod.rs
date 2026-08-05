@@ -2,7 +2,7 @@ use std::{cell::Cell, collections::HashMap};
 
 use wf_lang::ast::{BinOp, Expr};
 
-use super::key::{field_ref_name, value_to_string};
+use super::key::{eval_field_value, field_ref_leaf_name, value_to_string};
 use super::types::{Event, RollingStats, Value, WindowLookup};
 
 mod cmp;
@@ -75,10 +75,7 @@ pub(crate) fn eval_expr_ext(
         Expr::Number(n) => Some(Value::Number(*n)),
         Expr::StringLit(s) => Some(Value::Str(s.clone())),
         Expr::Bool(b) => Some(Value::Bool(*b)),
-        Expr::Field(fr) => {
-            let name = field_ref_name(fr);
-            event.fields.get(name).cloned()
-        }
+        Expr::Field(fr) => eval_field_value(&event.fields, fr),
         Expr::Object(items) => {
             let mut map = HashMap::new();
             for item in items {
@@ -161,12 +158,14 @@ fn eval_window_has(
     let lookup_val = eval_expr(&args[0], event)?;
     let lookup_str = value_to_string(&lookup_val);
 
-    // Explicit field name from 2nd arg, or infer from the field ref in 1st arg
+    // Explicit field name from 2nd arg, or infer from the field ref in 1st arg.
+    // For a nested path the inferred column is the leaf member (mirroring how
+    // `e.sip` infers `sip`), not the root object field.
     let field_name = match args.get(1) {
         Some(Expr::StringLit(f)) => f.clone(),
         Some(_) => return None,
         None => match &args[0] {
-            Expr::Field(fr) => field_ref_name(fr).to_string(),
+            Expr::Field(fr) => field_ref_leaf_name(fr)?.to_string(),
             _ => return None,
         },
     };

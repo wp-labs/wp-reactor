@@ -12,7 +12,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::ast::{
-    EachClause, Expr, FieldRef, MatchClause, Measure, PipelineStage, RuleDecl, SeqClause, SeqSkip,
+    EachClause, Expr, FieldRef, MatchClause, Measure, PipelineStage, RuleDecl,
+    SeqClause, SeqSkip,
 };
 use crate::checker::scope::{Scope, StatLabelInfo, StatLabelStage};
 use crate::checker::types::{ValType, check_expr_type, infer_type};
@@ -647,6 +648,7 @@ fn key_output_name(key: &FieldRef) -> String {
     match key {
         FieldRef::Simple(name) => name.clone(),
         FieldRef::Qualified(_, field) | FieldRef::Bracketed(_, field) => field.clone(),
+        FieldRef::Path { segments, .. } => crate::explain::format_path_segments(segments),
     }
 }
 

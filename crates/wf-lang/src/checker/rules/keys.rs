@@ -97,6 +97,14 @@ pub fn check_match_keys_clause(
                     });
                 }
             }
+            FieldRef::Path { .. } => {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "nested field path not supported in match key".to_string(),
+                });
+            }
         }
     }
 }

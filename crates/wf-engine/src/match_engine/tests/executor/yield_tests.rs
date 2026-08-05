@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use wf_config::OutputConfig;
-use wf_lang::ast::{BinOp, Expr, FieldRef, ObjectItem, SystemVar};
+use wf_lang::ast::{BinOp, Expr, FieldRef, ObjectItem, PathSegment, SystemVar};
 use wf_lang::plan::{EachPlan, StepPlan, YieldField};
 use wf_lang::wfu_meta::WfuMetaField;
 use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
@@ -2525,3 +2525,711 @@ fn execute_close_missing_optional_float_field_is_omitted_not_fatal() {
         "missing typed float field should be omitted from close output"
     );
 }
+
+// =========================================================================
+// Nested field paths (wp-labs/warp-fusion#64)
+// =========================================================================
+
+fn nested_each_executor() -> RuleExecutor {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "uid".to_string(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "e".to_string(),
+                segments: vec![
+                    PathSegment::Field("roles_obj".to_string()),
+                    PathSegment::Field("source".to_string()),
+                    PathSegment::Field("process".to_string()),
+                    PathSegment::Field("uid".to_string()),
+                ],
+            }),
+        },
+        YieldField {
+            name: "sip".to_string(),
+            value: Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        },
+    ];
+    RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("uid".to_string(), FieldType::Base(BaseType::Chars)),
+            ("sip".to_string(), FieldType::Base(BaseType::Chars)),
+        ]),
+    )
+}
+
+fn nested_roles_value() -> Value {
+    Value::Object(HashMap::from([
+        (
+            "source".to_string(),
+            Value::Object(HashMap::from([(
+                "process".to_string(),
+                Value::Object(HashMap::from([(
+                    "uid".to_string(),
+                    str_val("d22b3fbcb9e77cb86834f6a18e2e0f68"),
+                )])),
+            )])),
+        ),
+    ]))
+}
+
+#[test]
+fn execute_each_yield_nested_object_path() {
+    let exec = nested_each_executor();
+    let alert = exec
+        .execute_each(
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("roles_obj", nested_roles_value()),
+            ]),
+            1_000_000,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "uid")
+            .map(|(_, v)| v.clone()),
+        Some(str_val("d22b3fbcb9e77cb86834f6a18e2e0f68")),
+        "nested path leaf must be extracted"
+    );
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "sip")
+            .map(|(_, v)| v.clone()),
+        Some(str_val("10.0.0.1")),
+        "sibling field still emitted"
+    );
+}
+
+#[test]
+fn execute_each_yield_nested_path_missing_yields_empty() {
+    let exec = nested_each_executor();
+    // No `roles_obj` field in the input event.
+    let alert = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), 1_000_000)
+        .unwrap()
+        .unwrap();
+
+    // A chars-targeted missing nested path degrades to the empty string (same
+    // convention as missing scalar chars fields) and must not fail the record.
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "uid")
+            .map(|(_, v)| v.clone()),
+        Some(Value::Str(String::new())),
+        "missing nested path must not fail the record"
+    );
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "sip")
+            .map(|(_, v)| v.clone()),
+        Some(str_val("10.0.0.1"))
+    );
+}
+
+#[test]
+fn execute_each_yield_nested_missing_numeric_omits_field() {
+    // A non-chars target omits a missing nested path entirely (issue #64).
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "risk_score".to_string(),
+        value: Expr::Field(FieldRef::Path {
+            alias: "e".to_string(),
+            segments: vec![
+                PathSegment::Field("roles_obj".to_string()),
+                PathSegment::Field("risk".to_string()),
+            ],
+        }),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("risk_score".to_string(), FieldType::Base(BaseType::Float))]),
+    );
+
+    let alert = exec
+        .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), 1_000_000)
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        !alert.yield_fields.iter().any(|(n, _)| n == "risk_score"),
+        "missing nested path into a float target must be omitted, not fail the record"
+    );
+}
+
+#[test]
+fn execute_each_yield_nested_array_index() {
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "process_name".to_string(),
+        value: Expr::Field(FieldRef::Path {
+            alias: "e".to_string(),
+            segments: vec![
+                PathSegment::Field("roles_obj".to_string()),
+                PathSegment::Field("related".to_string()),
+                PathSegment::Index(0),
+                PathSegment::Field("process".to_string()),
+                PathSegment::Field("name".to_string()),
+            ],
+        }),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([(
+            "process_name".to_string(),
+            FieldType::Base(BaseType::Chars),
+        )]),
+    );
+
+    let alert = exec
+        .execute_each(
+            &event(vec![(
+                "roles_obj",
+                Value::Object(HashMap::from([(
+                    "related".to_string(),
+                    Value::Array(vec![Value::Object(HashMap::from([(
+                        "process".to_string(),
+                        Value::Object(HashMap::from([(
+                            "name".to_string(),
+                            str_val("evil.exe"),
+                        )])),
+                    )])),
+                    ]),
+                )])),
+            )]),
+            1_000_000,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "process_name")
+            .map(|(_, v)| v.clone()),
+        Some(str_val("evil.exe"))
+    );
+}
+
+#[test]
+fn execute_each_yield_nested_array_out_of_bounds_omits() {
+    // Same array-index plan; index 5 is out of bounds on a 1-element array.
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "process_name".to_string(),
+        value: Expr::Field(FieldRef::Path {
+            alias: "e".to_string(),
+            segments: vec![
+                PathSegment::Field("roles_obj".to_string()),
+                PathSegment::Field("related".to_string()),
+                PathSegment::Index(5),
+                PathSegment::Field("name".to_string()),
+            ],
+        }),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([(
+            "process_name".to_string(),
+            FieldType::Base(BaseType::Chars),
+        )]),
+    );
+
+    let alert = exec
+        .execute_each(
+            &event(vec![(
+                "roles_obj",
+                Value::Object(HashMap::from([(
+                    "related".to_string(),
+                    Value::Array(vec![str_val("x")]),
+                )])),
+            )]),
+            1_000_000,
+        )
+        .unwrap()
+        .unwrap();
+
+    // Chars-targeted out-of-bounds degrades to the empty string; it must not
+    // fail the record.
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "process_name")
+            .map(|(_, v)| v.clone()),
+        Some(Value::Str(String::new())),
+        "out-of-bounds array index must not fail the record"
+    );
+}
+
+#[test]
+fn execute_each_yield_nested_path_in_arithmetic() {
+    // The nested path is a normal sub-expression: usable inside arithmetic.
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "double_risk".to_string(),
+        value: Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Field(FieldRef::Path {
+                alias: "e".to_string(),
+                segments: vec![
+                    PathSegment::Field("roles_obj".to_string()),
+                    PathSegment::Field("risk".to_string()),
+                ],
+            })),
+            right: Box::new(Expr::Number(2.0)),
+        },
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([(
+            "double_risk".to_string(),
+            FieldType::Base(BaseType::Float),
+        )]),
+    );
+
+    let alert = exec
+        .execute_each(
+            &event(vec![(
+                "roles_obj",
+                Value::Object(HashMap::from([("risk".to_string(), num(21.0))])),
+            )]),
+            1_000_000,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "double_risk")
+            .map(|(_, v)| v.clone()),
+        Some(num(42.0)),
+        "nested path must compose inside arithmetic"
+    );
+}
+
+#[test]
+fn execute_each_yield_nested_path_inside_object_literal() {
+    // Structured yields compose: a nested path can feed an object literal member.
+    let mut plan = simple_rule_plan(
+        "r1",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".to_string(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "ctx".to_string(),
+        value: Expr::Object(vec![
+            ObjectItem {
+                targets: vec!["uid".to_string()],
+                type_hint: None,
+                value: Expr::Field(FieldRef::Path {
+                    alias: "e".to_string(),
+                    segments: vec![
+                        PathSegment::Field("roles_obj".to_string()),
+                        PathSegment::Field("source".to_string()),
+                        PathSegment::Field("process".to_string()),
+                        PathSegment::Field("uid".to_string()),
+                    ],
+                }),
+            },
+            ObjectItem {
+                targets: vec!["sip".to_string()],
+                type_hint: None,
+                value: Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+            },
+        ]),
+    }];
+    let exec = RuleExecutor::new(plan);
+
+    let alert = exec
+        .execute_each(
+            &event(vec![
+                ("sip", str_val("10.0.0.1")),
+                ("roles_obj", nested_roles_value()),
+            ]),
+            1_000_000,
+        )
+        .unwrap()
+        .unwrap();
+
+    let Value::Object(fields) = alert
+        .yield_fields
+        .iter()
+        .find(|(n, _)| n == "ctx")
+        .map(|(_, v)| v)
+        .expect("ctx yield field")
+    else {
+        panic!("expected object value");
+    };
+    assert_eq!(
+        fields.get("uid"),
+        Some(&str_val("d22b3fbcb9e77cb86834f6a18e2e0f68"))
+    );
+    assert_eq!(fields.get("sip"), Some(&str_val("10.0.0.1")));
+}
+
+#[test]
+fn execute_each_bind_filter_nested_path() {
+    // Each-plan filters evaluate via the expression layer, so a nested path
+    // guards whether an event produces an alert.
+    fn plan_with_filter(filter: Expr) -> RuleExecutor {
+        let mut plan = simple_rule_plan(
+            "r1",
+            simple_plan(vec![], vec![]),
+            Expr::Number(10.0),
+            "ip",
+            Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        );
+        plan.binds[0].alias = "e".to_string();
+        plan.each_plan = Some(EachPlan {
+            alias: "e".to_string(),
+            filter: Some(filter),
+        });
+        plan.yield_plan.fields = vec![YieldField {
+            name: "uid".to_string(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "e".to_string(),
+                segments: vec![
+                    PathSegment::Field("roles_obj".to_string()),
+                    PathSegment::Field("source".to_string()),
+                    PathSegment::Field("process".to_string()),
+                    PathSegment::Field("uid".to_string()),
+                ],
+            }),
+        }];
+        RuleExecutor::new_with_yield_field_types(
+            plan,
+            HashMap::from([("uid".to_string(), FieldType::Base(BaseType::Chars))]),
+        )
+    }
+
+    let target = "d22b3fbcb9e77cb86834f6a18e2e0f68";
+    let filter = Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Path {
+            alias: "e".to_string(),
+            segments: vec![
+                PathSegment::Field("roles_obj".to_string()),
+                PathSegment::Field("source".to_string()),
+                PathSegment::Field("process".to_string()),
+                PathSegment::Field("uid".to_string()),
+            ],
+        })),
+        right: Box::new(Expr::StringLit(target.to_string())),
+    };
+    let exec = plan_with_filter(filter);
+
+    // Matching nested value → alert fires with the extracted uid.
+    let matching = exec
+        .execute_each(
+            &event(vec![("roles_obj", nested_roles_value())]),
+            1_000_000,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        matching
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "uid")
+            .map(|(_, v)| v.clone()),
+        Some(str_val(target))
+    );
+
+    // Different nested value → filtered out, no alert.
+    let skipped = exec
+        .execute_each(
+            &event(vec![(
+                "roles_obj",
+                Value::Object(HashMap::from([(
+                    "source".to_string(),
+                    Value::Object(HashMap::from([(
+                        "process".to_string(),
+                        Value::Object(HashMap::from([(
+                            "uid".to_string(),
+                            str_val("other"),
+                        )])),
+                    )])),
+                )])),
+            )]),
+            1_000_000,
+        )
+        .unwrap();
+    assert!(skipped.is_none(), "filter must drop non-matching nested uid");
+}
+
+#[test]
+fn execute_match_yield_nested_path_via_bind_tracking() {
+    // Match-rule path (issue #64): the compiler tracks the root object field per
+    // bind, so the match context carries `roles_obj` and the nested path extracts.
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("fail".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.match_plan.tracked_bind_fields.insert(
+        "e".to_string(),
+        std::collections::HashSet::from(["roles_obj".to_string()]),
+    );
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "uid".to_string(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "e".to_string(),
+                segments: vec![
+                    PathSegment::Field("roles_obj".to_string()),
+                    PathSegment::Field("source".to_string()),
+                    PathSegment::Field("process".to_string()),
+                    PathSegment::Field("uid".to_string()),
+                ],
+            }),
+        },
+        YieldField {
+            name: "sip".to_string(),
+            value: Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        },
+    ];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("uid".to_string(), FieldType::Base(BaseType::Chars)),
+            ("sip".to_string(), FieldType::Base(BaseType::Chars)),
+        ]),
+    );
+
+    let mut matched = default_matched_context();
+    matched.bind_data = vec![BindData {
+        alias: "e".to_string(),
+        count: 1,
+        field_values: HashMap::from([("roles_obj".to_string(), vec![nested_roles_value()])]),
+    }];
+    let alert = exec.execute_match(&matched).unwrap();
+
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "uid")
+            .map(|(_, v)| v.clone()),
+        Some(str_val("d22b3fbcb9e77cb86834f6a18e2e0f68")),
+        "match-rule nested path leaf must be extracted from tracked bind field"
+    );
+    assert_eq!(
+        alert
+            .yield_fields
+            .iter()
+            .find(|(n, _)| n == "sip")
+            .map(|(_, v)| v.clone()),
+        Some(str_val("10.0.0.1"))
+    );
+}
+
+#[test]
+fn execute_match_yield_nested_path_missing_bind_omits() {
+    // Bind state without `roles_obj`: a numeric-targeted nested path is omitted
+    // and the alert still fires (issue #64).
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("fail".to_string(), "sip".to_string())),
+    );
+    plan.binds[0].alias = "e".to_string();
+    plan.match_plan.tracked_bind_fields.insert(
+        "e".to_string(),
+        std::collections::HashSet::from(["roles_obj".to_string()]),
+    );
+    plan.yield_plan.fields = vec![YieldField {
+        name: "risk_score".to_string(),
+        value: Expr::Field(FieldRef::Path {
+            alias: "e".to_string(),
+            segments: vec![
+                PathSegment::Field("roles_obj".to_string()),
+                PathSegment::Field("risk".to_string()),
+            ],
+        }),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("risk_score".to_string(), FieldType::Base(BaseType::Float))]),
+    );
+
+    let matched = default_matched_context(); // empty bind_data → no roles_obj
+    let alert = exec.execute_match(&matched).unwrap();
+
+    assert!(
+        !alert.yield_fields.iter().any(|(n, _)| n == "risk_score"),
+        "missing nested path into a float target must be omitted in match yield"
+    );
+}
+
+#[test]
+fn execute_match_yield_nested_path_inside_object_literal_full_pipeline() {
+    // End-to-end: the WFL compiler tracks the root of a path nested inside an
+    // `object { }` yield member, so the match context carries `roles_obj` and
+    // the structured yield extracts it (wp-labs/warp-fusion#64).
+    use crate::match_engine::match_engine::{CepStateMachine, StepResult};
+
+    let input_window = WindowSchema {
+        name: "auth_events".to_string(),
+        streams: vec!["auth_stream".to_string()],
+        time_field: Some("event_time".to_string()),
+        over: std::time::Duration::from_secs(3600),
+        fields: vec![
+            FieldDef {
+                name: "sip".to_string(),
+                field_type: FieldType::Base(BaseType::Ip),
+            },
+            FieldDef {
+                name: "roles_obj".to_string(),
+                field_type: FieldType::Object,
+            },
+            FieldDef {
+                name: "event_time".to_string(),
+                field_type: FieldType::Base(BaseType::Time),
+            },
+        ],
+    };
+    let output_window = WindowSchema {
+        name: "out".to_string(),
+        streams: vec![],
+        time_field: None,
+        over: std::time::Duration::from_secs(3600),
+        fields: vec![FieldDef {
+            name: "ctx".to_string(),
+            field_type: FieldType::Object,
+        }],
+    };
+
+    let source = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(70.0)
+    entity(ip, e.sip)
+    yield out (ctx = object { uid = e.roles_obj.source.process.uid; })
+}
+"#;
+    let file = wf_lang::parse_wfl(source).expect("parse should succeed");
+    let plan = wf_lang::compile_wfl(&file, &[input_window, output_window])
+        .expect("compile should succeed")
+        .into_iter()
+        .next()
+        .expect("rule plan should exist");
+    assert!(
+        plan.match_plan
+            .tracked_bind_fields
+            .get("e")
+            .is_some_and(|fields| fields.contains("roles_obj")),
+        "compiler must track the root of an object-literal nested path"
+    );
+
+    let exec = RuleExecutor::new(plan.clone());
+    let mut sm = CepStateMachine::new(plan.name.clone(), plan.match_plan.clone(), None);
+    let step = sm.advance_at(
+        "e",
+        &event(vec![
+            ("sip", str_val("10.0.0.1")),
+            ("roles_obj", nested_roles_value()),
+        ]),
+        1_000_000_000,
+    );
+    let StepResult::Matched(ctx) = step else {
+        panic!("single event with count >= 1 should trigger a match");
+    };
+    let alert = exec.execute_match(&ctx).expect("alert");
+
+    let Value::Object(fields) = alert
+        .yield_fields
+        .iter()
+        .find(|(n, _)| n == "ctx")
+        .map(|(_, v)| v)
+        .expect("ctx yield field")
+    else {
+        panic!("expected object value");
+    };
+    assert_eq!(
+        fields.get("uid"),
+        Some(&str_val("d22b3fbcb9e77cb86834f6a18e2e0f68")),
+        "object-literal nested path must extract in a match rule"
+    );
+}
+

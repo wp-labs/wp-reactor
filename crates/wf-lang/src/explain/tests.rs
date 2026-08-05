@@ -135,6 +135,39 @@ fn format_expr_variants() {
 }
 
 #[test]
+fn format_path_segments_renders_without_stray_dots() {
+    use crate::ast::PathSegment;
+
+    // `.member` is dot-joined; `[index]` is not — no `.[0]`-style artifacts.
+    let segments = vec![
+        PathSegment::Field("roles_obj".into()),
+        PathSegment::Field("related".into()),
+        PathSegment::Index(0),
+        PathSegment::Field("process".into()),
+        PathSegment::Field("name".into()),
+    ];
+    assert_eq!(
+        super::format::format_path_segments(&segments),
+        "roles_obj.related[0].process.name"
+    );
+    // Single member renders bare; empty path renders empty.
+    assert_eq!(
+        super::format::format_path_segments(&[PathSegment::Field("uid".into())]),
+        "uid"
+    );
+    assert_eq!(super::format::format_path_segments(&[]), "");
+
+    // format_field_ref prefixes the alias.
+    assert_eq!(
+        super::format::format_field_ref(&FieldRef::Path {
+            alias: "e".into(),
+            segments,
+        }),
+        "e.roles_obj.related[0].process.name"
+    );
+}
+
+#[test]
 fn explain_shows_pattern_origin() {
     let input = r#"
 pattern burst(alias, key, win, threshold) {

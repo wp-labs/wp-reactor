@@ -128,7 +128,8 @@ fn collect_expr_aliases<'a>(expr: &'a Expr, declared: &HashSet<&str>, used: &mut
             }
         }
         Expr::Field(crate::ast::FieldRef::Qualified(alias, _))
-        | Expr::Field(crate::ast::FieldRef::Bracketed(alias, _)) => {
+        | Expr::Field(crate::ast::FieldRef::Bracketed(alias, _))
+        | Expr::Field(crate::ast::FieldRef::Path { alias, .. }) => {
             used.insert(alias);
         }
         Expr::BinOp { left, right, .. } => {

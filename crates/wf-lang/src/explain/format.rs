@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, CmpOp, Expr, FieldRef, FieldSelector, Measure, SystemVar, Transform};
+use crate::ast::{BinOp, CmpOp, Expr, FieldRef, FieldSelector, Measure, PathSegment, SystemVar, Transform};
 use crate::schema::{BaseType, FieldType};
 
 // ---------------------------------------------------------------------------
@@ -118,11 +118,38 @@ fn format_base_type(base: &BaseType) -> &'static str {
     }
 }
 
+/// Render a nested path's segments as `member[0].member` — a `.member` step is
+/// dot-joined, an `[index]` step is not, so there is no stray dot before a
+/// bracket. Shared by explain, key-output naming, and the compiler.
+pub(crate) fn format_path_segments(segments: &[PathSegment]) -> String {
+    let mut s = String::new();
+    for seg in segments {
+        match seg {
+            PathSegment::Field(name) => {
+                if !s.is_empty() {
+                    s.push('.');
+                }
+                s.push_str(name);
+            }
+            PathSegment::Index(idx) => s.push_str(&format!("[{idx}]")),
+        }
+    }
+    s
+}
+
 pub fn format_field_ref(fref: &FieldRef) -> String {
     match fref {
         FieldRef::Simple(name) => name.clone(),
         FieldRef::Qualified(alias, field) => format!("{}.{}", alias, field),
         FieldRef::Bracketed(alias, key) => format!("{}[\"{}\"]", alias, key),
+        FieldRef::Path { alias, segments } => {
+            let segs = format_path_segments(segments);
+            if segs.is_empty() {
+                alias.clone()
+            } else {
+                format!("{}.{}", alias, segs)
+            }
+        }
     }
 }
 

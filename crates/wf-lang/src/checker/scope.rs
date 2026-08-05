@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::ast::{FieldRef, Measure};
+use crate::ast::{FieldRef, Measure, PathSegment};
 use crate::schema::{BaseType, FieldType, WindowSchema};
 
 use super::types::ValType;
@@ -45,6 +45,15 @@ impl<'a> Scope<'a> {
             FieldRef::Simple(name) => self.resolve_simple(name),
             FieldRef::Qualified(alias, field) => self.resolve_qualified(alias, field).map(Some),
             FieldRef::Bracketed(alias, key) => self.resolve_qualified(alias, key).map(Some),
+            FieldRef::Path { alias, segments } => {
+                // Nested paths validate the root field only; deep segments have
+                // no schema (object/array carry no nested type), so the leaf type
+                // is determined at runtime.
+                let Some(PathSegment::Field(root)) = segments.first() else {
+                    return Err("nested field path must start with a member name".to_string());
+                };
+                self.resolve_qualified(alias, root).map(Some)
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, Expr, SystemVar};
+use crate::ast::{BinOp, Expr, FieldRef, SystemVar};
 use crate::schema::BaseType;
 
 use super::{ValType, is_numeric, numeric_promote, unify_array_element_type};
@@ -28,7 +28,12 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
             | SystemVar::EmitTime,
         ) => Some(ValType::Base(BaseType::Time)),
         Expr::WfuMeta(field) => Some(ValType::Base(field.base_type())),
-        Expr::Field(fref) => scope.resolve_field_ref(fref).ok().flatten(),
+        Expr::Field(fref) => match fref {
+            // Nested path leaf type is runtime-determined (object/array carry no
+            // nested schema), so treat as unknown → yield assignability is relaxed.
+            FieldRef::Path { .. } => None,
+            _ => scope.resolve_field_ref(fref).ok().flatten(),
+        },
         Expr::PresetParam(_) => None,
         Expr::Object(_) => Some(ValType::Object),
         Expr::Array(items) => infer_array_type(items, scope),

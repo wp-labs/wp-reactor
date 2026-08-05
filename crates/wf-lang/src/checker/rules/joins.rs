@@ -29,8 +29,16 @@ pub fn check_joins_list(
             Some(target_schema) => {
                 // Validate conditions
                 for cond in &join.conditions {
-                    // Left side must resolve in scope
-                    if let Err(msg) = scope.resolve_field_ref(&cond.left) {
+                    // Left side must resolve in scope; nested paths are not
+                    // supported in join conditions (runtime extracts flat keys).
+                    if matches!(cond.left, FieldRef::Path { .. }) {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: "nested field path not supported in join condition".to_string(),
+                        });
+                    } else if let Err(msg) = scope.resolve_field_ref(&cond.left) {
                         errors.push(CheckError {
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
@@ -41,6 +49,14 @@ pub fn check_joins_list(
 
                     // Right side must be qualified with target window name
                     match &cond.right {
+                        FieldRef::Path { .. } => {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                test: None,
+                                message: "nested field path not supported in join condition".to_string(),
+                            });
+                        }
                         FieldRef::Qualified(qualifier, field) => {
                             if qualifier != &join.target_window {
                                 errors.push(CheckError {

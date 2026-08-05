@@ -18,8 +18,25 @@ pub enum FieldRef {
     Simple(String),
     /// Qualified, e.g. `fail.sip`.
     Qualified(String, String),
-    /// Bracket notation, e.g. `fail["detail.sha256"]`.
+    /// Bracket notation, e.g. `fail["detail.sha256"]` (flat dotted field name).
     Bracketed(String, String),
+    /// Multi-level nested access into `object` / `array` fields,
+    /// e.g. `s.roles_obj.source.process.uid` or `s.roles_obj.related[0].name`.
+    ///
+    /// Invariant: `alias` names the event/set alias whose schema contains
+    /// `segments[0]` (always a [`PathSegment::Field`]). At evaluation time the
+    /// flat field map is keyed by field name, so the traversal starts from the
+    /// root segment — `alias` is only used by the compiler for bind tracking and
+    /// by the checker for root resolution.
+    Path { alias: String, segments: Vec<PathSegment> },
+}
+
+/// One step of a nested field path: a member name or an array index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PathSegment {
+    Field(String),
+    Index(usize),
 }
 
 // ---------------------------------------------------------------------------

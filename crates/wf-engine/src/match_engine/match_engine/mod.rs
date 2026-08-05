@@ -15,7 +15,7 @@ pub use types::{
 
 // Re-export pub(crate) items
 pub(crate) use eval::{eval_expr, values_equal};
-pub(crate) use key::{field_ref_name, value_to_string};
+pub(crate) use key::{eval_field_value, field_ref_name, value_to_string};
 
 #[cfg(test)]
 pub(crate) use conv::apply_conv;

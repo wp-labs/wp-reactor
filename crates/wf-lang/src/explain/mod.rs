@@ -9,6 +9,7 @@ use crate::schema::WindowSchema;
 
 use crate::ast::CloseMode;
 pub use format::{format_cmp, format_expr, format_field_ref, format_measure};
+pub(crate) use format::format_path_segments;
 
 use sections::{
     compute_lineage, explain_binds, explain_conv, explain_joins, explain_limits, explain_match,
