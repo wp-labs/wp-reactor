@@ -2,16 +2,31 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [0.1.42 Unreleased]
+## [0.4.0 Unreleased]
+
+### Added
+
+- **wf-lang / wf-engine**: Added multi-level nested field extraction from `object` / `array` fields in yield expressions (`s.roles_obj.source.process.uid`, `s.roles_obj.related[0].process.name`). A `FieldRef::Path` validates the root field statically and walks nested members / integer indices at runtime; any missing member, out-of-bounds index, or intermediate type mismatch yields an omitted yield field (chars targets degrade to the empty string) without failing the record. Nested paths work inside structured `object { }` / `array [ ]` yield members in match/close rules too (their root fields are tracked into the eval context). Match keys and join conditions stay single-level — nested paths there are rejected by the checker, and `count` / `sum` / `avg` / `min` / `max` / `first` / `last` / `collect_*` reject nested paths as arguments (no column to aggregate); `window.has(nested.path)` infers the lookup column from the leaf member. (wp-labs/warp-fusion#64)
+
+## [0.3.0] — 2026-08-05
+
+- Aligned the version scheme to `0.3.x` and upgraded dependencies (`wp-connector-api` 0.12, `wp-core-connectors` 0.8, `wp-model-core` 0.9, `wp-knowledge` 0.15). No language or runtime behavior changes beyond the 0.1.42 release notes below.
+
+## [0.1.42] — 2026-08-04
 
 ### Fixed
 
 - **wf-engine**: A yield field that references an optional input field missing from the event no longer fails the whole output record. Missing passthrough fields previously evaluated to the empty-string fallback and were rejected by type coercion (e.g. `yield security_alerts (attacker_latitude = s.attacker_latitude)` errored with "yield field ... expects a finite number" when the input had no `attacker_latitude`). Such fields are now omitted from the output (the column renders as null in Arrow / is absent in JSON), while other fields of the same record still emit. Explicit NaN / Infinity / type mismatches remain hard errors. Applies to `on each`, match, and close yield paths. (wp-labs/warp-fusion#62)
 
-- **wf-config / wf-runtime**: Added `[metrics] console_output` (default `true`) and gated the periodic `res`-domain metrics summary (`metrics snapshot`, interval table, and shutdown run-summary table) behind it. Previously `MetricsConfig` had no `console_output` field, so `console_output = false` was silently dropped by serde and the statistics log could not be disabled. Prometheus export, monitor-channel snapshots, and Top-N collection run regardless of the flag. (wp-labs/warp-fusion#61)
+### Documentation
+
+- **Language reference**: Documented the `join ... anti` mode (whitelist exclusion) alongside `snapshot` / `asof` / `asof within` — e.g. `join blocked_list anti on sip == blocked_list.ip` — including multi-condition joins (`&&`).
+
+## [0.1.41] — 2026-08-02
 
 ### Added
 
+- **wf-config / wf-runtime**: Added `[metrics] console_output` (default `true`) and gated the periodic `res`-domain metrics summary (`metrics snapshot`, interval table, and shutdown run-summary table) behind it. Previously `MetricsConfig` had no `console_output` field, so `console_output = false` was silently dropped by serde and the statistics log could not be disabled. Prometheus export, monitor-channel snapshots, and Top-N collection run regardless of the flag. (wp-labs/warp-fusion#61)
 - **wf-lang / wf-engine / tree-sitter-wfl**: Added `on event seq { ... }` and `on event any { ... }` match bodies for ordered and unordered event correlation:
   - `on event seq { ... }` — ordered event chains for attack-chain detection. The engine's existing `current_step` progression enforces order; the `seq` mode adds per-step `within <dur>` time gaps, `not has <alias> within <dur>` negation steps, and `consec` strict-adjacency / `skip = past_last|to_next` modifiers (`to_next` deferred to L3).
   - `on event any { ... }` — unordered co-occurrence: all steps are evaluated in parallel and the rule fires once every step has satisfied its threshold, regardless of arrival order (a parallel-eval path in the state machine).
@@ -28,74 +43,134 @@ All notable changes to wp-reactor will be documented in this file.
 - **wf-engine**: `consec`-break and `within`-violation resets preserve the negation-violation flag, so an in-window violation cannot be wiped and the chain re-fire.
 - **wf-engine**: `on event any` throttle handling now honors `on_exceed = fail_rule` (previously it was silently downgraded to throttle).
 - **wf-runtime**: The periodic timeout scan now advances the effective watermark by the wall-clock time elapsed since the last event was processed (`watermark + idle wall time`). Instances therefore expire per their window TTL even when input is completely idle, instead of lingering until a new event advances the watermark (conforms to the window's time-based semantics).
+- **wf-lang**: The unused-alias lint now counts `on event seq { ... }` step sources (`seq.steps[].branch.source`) as used, fixing a false-positive W001 when a rule referenced an alias only from seq-mode steps.
 
 ### Performance
 
 - **wf-engine**: `RuleExecutor::event_matches_alias` uses a precomputed alias→filter map for rules with more than 24 binds, eliminating the O(binds) linear scan per (event × alias); rules with ≤24 binds keep the faster linear scan. The crossover was measured at ~24 binds (24: 5.1M vs 5.8M q/s; 16: linear still 1.3x faster).
 
-### Fixed
-
-- **wf-lang**: The unused-alias lint now counts `on event seq { ... }` step sources (`seq.steps[].branch.source`) as used, fixing a false-positive W001 when a rule referenced an alias only from seq-mode steps.
-
 ### Documentation
 
 - **User guide**: Aligned `docs/user-guide` with the implementation — `.wfs` window subscription uses `stream_tag`; window defaults/overrides moved to an external `windows.toml` (the `windows` field is now required in `wfusion.toml`); TCP sources use `connect = "tcp_src"` with `addr`/`port`; file sources document the `csv` format; the removed `wfusion run` / `wfusion config` subcommands are replaced by `wfusion daemon` / `wfusion batch` and `wfadm conf diff`; metrics are documented as monitor-sink NDJSON records instead of a Prometheus HTTP endpoint.
 - **Examples**: Updated all examples to load with the current code — `.wfs` files switched from `stream` to `stream_tag`, `wfusion.toml` gained the required `windows = "windows.toml"` field with window config externalized, TCP sources use `connect = "tcp_src"`, and example READMEs (sinks / file_input) reflect the current sink-routing and CLI format.
-- **Language reference**: Documented the `join ... anti` mode (whitelist exclusion) alongside `snapshot` / `asof` / `asof within` — e.g. `join blocked_list anti on sip == blocked_list.ip` — including multi-condition joins (`&&`).
 
-## [0.1.37 Unreleased]
+## [0.1.39] — 2026-07-30
+
+- Log-initialization updates only; no notable changelog entries.
+
+## [0.1.38] — 2026-07-29
+
+### Added
+
+- **wf-lang / wf-runtime**: Added parameterized `yield preset` support with positional reference arguments, defaulted parameters, `$param` substitution inside preset bodies, and `_global.wfl` prelude loading without conflicting with `$VAR` preprocessing.
+
+### Fixed
+
+- **wf-lang / wf-runtime**: Improved `yield preset` diagnostic source lookup to handle declarations split across whitespace or `//` comments, matching the parser and preprocessor behavior for parameterized presets.
+
+## [0.1.37] — 2026-07-29
+
+### Changed
+
+- **wf-runtime**: Changed DEBUG rule execution logging to use a bounded detail budget per batch/scan, with batch summaries preserving aggregate counts while suppressing high-cardinality per-event detail logs after the first 20 entries.
+- **wf-runtime**: Pre-computed rule alias execution order and gated debug-only counters, output classification, event references, scope-key formatting, and instance counts behind DEBUG/detail checks to keep logging disabled paths lightweight.
+
+### Added
+
+- **wf-engine / wf-runtime**: Added state-machine progress diagnostics for DEBUG rule execution logs, including scope key, machine id, step/branch labels, threshold comparison details, measured values, and active instance counts.
+- **wf-runtime**: Added rule execution funnel logs for bind rejects, accumulate/advance/match outcomes, close/match/each executor output paths, timeout/flush scans, internal pipeline writes/drops/errors, and alert sink dispatch/no-sink outcomes.
+
+## [0.1.36] — 2026-07-24
+
+### Added
+
+- **wf-engine / docs**: Documented evidence output using `stat.count(window_event(alias))` with `collect_set(alias.event_id)`, keeping alias field collection bounded by the recent 1024-value cap.
+- **wf-lang / wf-engine**: Added WFL string helper functions `sha1_n(text, length)`, `join(value, ...)`, and `join_by(separator, value, ...)`; `join` concatenates scalar values without intervention, while `join_by` inserts the explicit separator without trimming, case folding, or escaping; missing field value arguments are treated as empty string segments, while non-field expression failures still fail the function.
+
+## [0.1.35] — 2026-07-23
+
+### Added
+
+- **wf-runtime**: Added the `_global.wfl` project prelude convention for rule directories, automatically loading project-level `yield preset` declarations while excluding the prelude from ordinary rule compilation; duplicate preset names inside the prelude or between prelude and rule files are rejected during rule loading.
+
+### Fixed
+
+- **wf-runtime**: Improved `_global.wfl` prelude diagnostics so preset field and expression errors point at the prelude source instead of the rule file that references the preset.
+
+## [0.1.34] — 2026-07-22
 
 ### Changed
 
 - **wf-lang / wf-engine**: Added yield-target type coercion for common output mappings, including numeric and boolean values into `chars` fields and validated coercion for numeric, IP, hex, and time targets.
 - **wf-lang / wf-engine**: Changed `coalesce(...)` to skip blank strings as well as null values, and allow mixed scalar fallback types only when each candidate is assignable to the direct `yield` target field.
-- **wf-engine / docs**: Documented evidence output using `stat.count(window_event(alias))` with `collect_set(alias.event_id)`, keeping alias field collection bounded by the recent 1024-value cap.
 - **wf-runtime**: Treat `[output]` formatting changes as hot-reloadable so rule executors are rebuilt with the latest project output settings.
-- **wf-runtime**: Changed the default dynamic stream-tag payload carrier from `wp_stream_tag` to `wp_oml_name`, matching warp-parse OML output naming.
-- **User guide**: Updated runtime source examples to use `stream_tag_field = "wp_oml_name"`.
-- **wf-runtime**: Changed DEBUG rule execution logging to use a bounded detail budget per batch/scan, with batch summaries preserving aggregate counts while suppressing high-cardinality per-event detail logs after the first 20 entries.
-- **wf-runtime**: Pre-computed rule alias execution order and gated debug-only counters, output classification, event references, scope-key formatting, and instance counts behind DEBUG/detail checks to keep logging disabled paths lightweight.
-- **wf-engine**: Unified WFL `time` expression values on epoch milliseconds: `now()` and `now_ms()` now return milliseconds, `strptime()` and `time_bucket()` return milliseconds, and `strftime()` / `time_diff()` accept epoch seconds, milliseconds, microseconds, or nanoseconds by timestamp width.
-- **wf-config / wf-engine / wf-runtime**: Changed `wf_meta_disable` handling to use compiled `wildmatch` matchers, supporting exact WarpFusion metadata field names and wildcard patterns such as `__wfu_*` and `__wfu_rule_*`.
-- **wf-engine / wf-runtime**: Changed sink business routing to compile window patterns into runtime `wildmatch` matchers instead of pre-resolving routes only for startup-known window names.
-- **wf-engine**: Replaced the broad `ProviderWindow::rows_mut()` escape hatch with scoped `ProviderWindow::update_rows()` for provider-row mutation.
+- **wf-lang / wf-engine**: Kept `chars` to `time` conversion explicit in both semantic checks and runtime yield coercion; string timestamps must be parsed with an explicit time expression.
+- **wf-lang**: Improved source-aware diagnostics for `yield preset` errors so preset field errors point at the preset definition, while explicit rule yield fields still point at the rule's yield clause.
+- **wf-runtime**: Normalized numeric time yields to Arrow `TimestampNanosecond` values when writing intermediate pipeline batches, preserving seconds/milliseconds/microseconds/nanoseconds inputs consistently.
 
 ### Added
 
-- **wf-lang / wf-engine**: Added WFL string helper functions `sha1_n(text, length)`, `join(value, ...)`, and `join_by(separator, value, ...)`; `join` concatenates scalar values without intervention, while `join_by` inserts the explicit separator without trimming, case folding, or escaping; missing field value arguments are treated as empty string segments, while non-field expression failures still fail the function.
 - **wf-lang / wf-engine**: Added structured stream-input object/array support and `merge(obj1, obj2, ...)` for shallow left-to-right object enrichment in WFL expressions and yield outputs.
 - **wf-lang**: Added `yield preset` declarations and `yield target : preset_a, preset_b (...)` references for composing reusable yield field sets with ordered override semantics; later presets override earlier fields, and explicit rule yield fields override presets.
-- **wf-lang / wf-runtime**: Added parameterized `yield preset` support with positional reference arguments, defaulted parameters, `$param` substitution inside preset bodies, and `_global.wfl` prelude loading without conflicting with `$VAR` preprocessing.
-- **wf-runtime**: Added the `_global.wfl` project prelude convention for rule directories, automatically loading project-level `yield preset` declarations while excluding the prelude from ordinary rule compilation; duplicate preset names inside the prelude or between prelude and rule files are rejected during rule loading.
 - **wf-config / wf-engine**: Added project-level `[output]` configuration with `time_format` and UTC `time_zone`, used as the default format for one-argument `strftime(time)` calls.
 - **wf-engine**: Added `RuleExecutorOptions` for passing output formatting and yield target type metadata without growing constructor argument lists.
-- **wf-lang / wf-engine / wf-runtime**: Added yield-only wfusion metadata references such as `@__wfu_rule_name` and `@__wfu_score`, allowing rules to map engine-managed metadata into ordinary output fields while keeping `__wfu_*` yield targets reserved.
-- **wf-lang**: Added a centralized wfusion metadata field directory, including field names, types, yield availability, and a restricted intermediate-window metadata subset for automatic pipeline fields.
-- **wf-lang / wf-engine**: Added yield-only time system variables `@event_first_time`, `@event_last_time`, `@evidence_start_time`, `@evidence_end_time`, `@window_start_time`, `@window_end_time`, and `@emit_time`.
-- **wf-lang / wf-engine**: Added yield-only stable stat context functions: `stat.count(window_event(alias))`, `stat.count(match_event(label))`, `stat.count(match_distinct(label))`, `stat.value(trigger(label))`, and `stat.value(final(label))`.
-- **User guide / design**: Documented the time system variables, stable stat context functions, and recommended business-field mappings such as `first_seen`, `last_seen`, `rule_window_start`, and `latest_analysis_time`.
-- **Design docs**: Documented wfusion-managed metadata field semantics, including `rule_name = @__wfu_rule_name`, reserved `__wfu_*` output targets, yield-only access, and sink-stage `wf_meta_disable` behavior.
-- **wf-engine / wf-runtime**: Added state-machine progress diagnostics for DEBUG rule execution logs, including scope key, machine id, step/branch labels, threshold comparison details, measured values, and active instance counts.
-- **wf-runtime**: Added rule execution funnel logs for bind rejects, accumulate/advance/match outcomes, close/match/each executor output paths, timeout/flush scans, internal pipeline writes/drops/errors, and alert sink dispatch/no-sink outcomes.
-- **wf-engine tests**: Added sink-runtime send-path coverage for `wf_meta_disable` wildcard matching, including projection-before-disable behavior.
-- **wf-runtime**: Added the built-in `__window_miss` provider window for recoverable dynamic-routing misses, including `unknown_stream_schema` and `missing_stream_tag_field` diagnostics, bounded payload samples, and `wf_receiver_window_miss_total` metrics.
-- **wf-runtime tests**: Added NDJSON, CSV, Arrow framed, external source, metrics, and capacity-eviction coverage for window-miss handling.
 
 ### Documentation
 
 - **User guide / design**: Added `merge(obj1, obj2, ...)` usage examples for object passthrough and incremental enrichment, and documented its shallow override order plus fallback behavior for missing object field references versus hard evaluation failures.
 
+## [0.1.33] — 2026-07-19
+
+### Changed
+
+- **wf-engine**: Replaced the broad `ProviderWindow::rows_mut()` escape hatch with scoped `ProviderWindow::update_rows()` for provider-row mutation.
+
+### Added
+
+- **wf-lang / wf-engine / wf-runtime**: Added yield-only wfusion metadata references such as `@__wfu_rule_name` and `@__wfu_score`, allowing rules to map engine-managed metadata into ordinary output fields while keeping `__wfu_*` yield targets reserved.
+- **wf-lang**: Added a centralized wfusion metadata field directory, including field names, types, yield availability, and a restricted intermediate-window metadata subset for automatic pipeline fields.
+- **wf-runtime**: Added the built-in `__window_miss` provider window for recoverable dynamic-routing misses, including `unknown_stream_schema` and `missing_stream_tag_field` diagnostics, bounded payload samples, and `wf_receiver_window_miss_total` metrics.
+- **wf-runtime**: Window-miss snapshots now keep recently updated keys when the bounded `__window_miss` provider reaches capacity, instead of evicting rows only by original insertion order.
+
+### Documentation
+
+- **Design docs**: Documented wfusion-managed metadata field semantics, including `rule_name = @__wfu_rule_name`, reserved `__wfu_*` output targets, yield-only access, and sink-stage `wf_meta_disable` behavior.
+
 ### Fixed
 
-- **wf-lang / wf-engine**: Kept `chars` to `time` conversion explicit in both semantic checks and runtime yield coercion; string timestamps must be parsed with an explicit time expression.
-- **wf-lang**: Improved source-aware diagnostics for `yield preset` errors so preset field errors point at the preset definition, while explicit rule yield fields still point at the rule's yield clause.
-- **wf-runtime**: Improved `_global.wfl` prelude diagnostics so preset field and expression errors point at the prelude source instead of the rule file that references the preset.
-- **wf-lang / wf-runtime**: Improved `yield preset` diagnostic source lookup to handle declarations split across whitespace or `//` comments, matching the parser and preprocessor behavior for parameterized presets.
-- **wf-runtime**: Normalized numeric time yields to Arrow `TimestampNanosecond` values when writing intermediate pipeline batches, preserving seconds/milliseconds/microseconds/nanoseconds inputs consistently.
+- **wf-runtime tests**: Added NDJSON, CSV, Arrow framed, external source, metrics, and capacity-eviction coverage for window-miss handling.
+
+## [0.1.32] — 2026-07-14
+
+### Changed
+
+- **wf-engine**: Unified WFL `time` expression values on epoch milliseconds: `now()` and `now_ms()` now return milliseconds, `strptime()` and `time_bucket()` return milliseconds, and `strftime()` / `time_diff()` accept epoch seconds, milliseconds, microseconds, or nanoseconds by timestamp width.
+- **wf-config / wf-engine / wf-runtime**: Changed `wf_meta_disable` handling to use compiled `wildmatch` matchers, supporting exact WarpFusion metadata field names and wildcard patterns such as `__wfu_*` and `__wfu_rule_*`.
+- **wf-engine / wf-runtime**: Changed sink business routing to compile window patterns into runtime `wildmatch` matchers instead of pre-resolving routes only for startup-known window names.
 - **wf-engine**: Reused a shared epoch timestamp normalization helper across alert export and both expression evaluators to keep second/millisecond/microsecond/nanosecond handling consistent.
 - **wf-engine**: `time_bucket()` now rejects zero, negative, and non-finite intervals instead of producing surprising bucket results.
+
+### Added
+
+- **wf-lang / wf-engine**: Added yield-only time system variables `@event_first_time`, `@event_last_time`, `@evidence_start_time`, `@evidence_end_time`, `@window_start_time`, `@window_end_time`, and `@emit_time`.
+- **wf-lang / wf-engine**: Added yield-only stable stat context functions: `stat.count(window_event(alias))`, `stat.count(match_event(label))`, `stat.count(match_distinct(label))`, `stat.value(trigger(label))`, and `stat.value(final(label))`.
+- **wf-engine tests**: Added sink-runtime send-path coverage for `wf_meta_disable` wildcard matching, including projection-before-disable behavior.
 - **wf-engine tests**: Removed cross-evaluation exact equality checks for `now()` / `now_ms()` to avoid millisecond-boundary flakes while preserving same-expression timestamp stability coverage.
-- **wf-runtime**: Window-miss snapshots now keep recently updated keys when the bounded `__window_miss` provider reaches capacity, instead of evicting rows only by original insertion order.
+
+### Documentation
+
+- **User guide / design**: Documented the time system variables, stable stat context functions, and recommended business-field mappings such as `first_seen`, `last_seen`, `rule_window_start`, and `latest_analysis_time`.
+
+## [0.1.31] — 2026-07-12
+
+### Changed
+
+- **wf-runtime**: Changed the default dynamic stream-tag payload carrier from `wp_stream_tag` to `wp_oml_name`, matching warp-parse OML output naming.
+
+### Documentation
+
+- **User guide**: Updated runtime source examples to use `stream_tag_field = "wp_oml_name"`.
+
 
 ## [0.1.30] — 2026-07-11
 
