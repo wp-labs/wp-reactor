@@ -109,7 +109,9 @@ fn evaluate_close_steps(
                 let label = step_plan.branches[branch_idx].label.clone();
                 let collected_values = step_state.branch_states[branch_idx]
                     .collected_values
-                    .clone();
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_default();
                 close_step_data.push(StepData {
                     satisfied_branch_index: branch_idx,
                     label,
@@ -119,7 +121,7 @@ fn evaluate_close_steps(
                     event_last_time_nanos: step_state.branch_states[branch_idx]
                         .event_last_time_nanos,
                     collected_values,
-                    field_values: step_state.branch_states[branch_idx].field_values.clone(),
+                    field_values: step_state.branch_states[branch_idx].field_values.as_deref().cloned().unwrap_or_default(),
                 });
             }
             None => {

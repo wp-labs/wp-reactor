@@ -194,7 +194,7 @@ pub(super) fn collect_event_fields(
         }
     } else {
         for (field_name, value) in &event.fields {
-            let values = bs.field_values.entry(field_name.clone()).or_default();
+            let values = bs.field_values_mut().entry(field_name.clone()).or_default();
             push_capped(values, value.clone());
         }
     }
@@ -202,7 +202,7 @@ pub(super) fn collect_event_fields(
 
 fn push_event_field(event: &Event, bs: &mut BranchState, field_name: &str) {
     if let Some(value) = event.fields.get(field_name) {
-        let values = bs.field_values.entry(field_name.to_string()).or_default();
+        let values = bs.field_values_mut().entry(field_name.to_string()).or_default();
         push_capped(values, value.clone());
     }
 }
@@ -250,7 +250,7 @@ pub(super) fn collect_alias_event(
         for field_name in fields {
             if let Some(value) = event.fields.get(field_name) {
                 let values = alias_state
-                    .field_values
+                    .field_values_mut()
                     .entry(field_name.clone())
                     .or_default();
                 push_capped(values, value.clone());
@@ -259,7 +259,7 @@ pub(super) fn collect_alias_event(
     } else {
         for (field_name, value) in &event.fields {
             let values = alias_state
-                .field_values
+                .field_values_mut()
                 .entry(field_name.clone())
                 .or_default();
             push_capped(values, value.clone());
@@ -315,7 +315,7 @@ pub(super) fn update_measure(measure: &Measure, field_value: &Option<Value>, bs:
 
     // Collect raw values for L3 functions (collect_set/list, first/last, stddev/percentile)
     if let Some(val) = field_value {
-        push_capped(&mut bs.collected_values, val.clone());
+        push_capped(bs.collected_values_mut(), val.clone());
     }
 
     match measure {
@@ -535,7 +535,7 @@ mod tests {
             collect_alias_event(&event_with("dip", i), &mut state, None);
         }
 
-        let values = state.field_values.get("dip").expect("dip collected");
+        let values = state.field_values.as_deref().and_then(|m| m.get("dip")).expect("dip collected");
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         // The retained window is the most recent entries; `.last()` is the latest event,
         // which is what yield field resolution (`e.dip`) reads.
@@ -555,7 +555,8 @@ mod tests {
 
         let values = state
             .field_values
-            .get("event_id")
+            .as_deref()
+            .and_then(|m| m.get("event_id"))
             .expect("event_id collected");
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         assert!(!values.contains(&Value::Number(0.0)));
@@ -580,7 +581,7 @@ mod tests {
             );
         }
 
-        let values = bs.field_values.get("dport").expect("dport collected");
+        let values = bs.field_values.as_deref().and_then(|m| m.get("dport")).expect("dport collected");
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         // `.last()` — the value yield field resolution reads — stays correct.
         assert_eq!(values.last(), Some(&Value::Number((over - 1) as f64)));
@@ -598,8 +599,8 @@ mod tests {
         collect_alias_event(&event, &mut state, Some(&tracked));
 
         assert_eq!(state.count, 1);
-        assert!(state.field_values.contains_key("sip"));
-        assert!(!state.field_values.contains_key("dport"));
+        assert!(state.field_values.as_deref().map_or(false, |m| m.contains_key("sip")));
+        assert!(!state.field_values.as_deref().map_or(false, |m| m.contains_key("dport")));
     }
 
     #[test]
@@ -621,9 +622,9 @@ mod tests {
             Some(&branch_field),
         );
 
-        assert!(bs.field_values.contains_key("sip"));
-        assert!(bs.field_values.contains_key("dport"));
-        assert!(!bs.field_values.contains_key("bytes"));
+        assert!(bs.field_values.as_deref().map_or(false, |m| m.contains_key("sip")));
+        assert!(bs.field_values.as_deref().map_or(false, |m| m.contains_key("dport")));
+        assert!(!bs.field_values.as_deref().map_or(false, |m| m.contains_key("bytes")));
     }
 
     #[test]
@@ -644,8 +645,8 @@ mod tests {
             None,
         );
 
-        assert!(bs.field_values.contains_key("sip"));
-        assert!(bs.field_values.contains_key("dport"));
+        assert!(bs.field_values.as_deref().map_or(false, |m| m.contains_key("sip")));
+        assert!(bs.field_values.as_deref().map_or(false, |m| m.contains_key("dport")));
     }
 
     #[test]
@@ -656,9 +657,9 @@ mod tests {
             update_measure(&Measure::Count, &Some(Value::Number(i as f64)), &mut bs);
         }
 
-        assert_eq!(bs.collected_values.len(), MAX_TRACKED_FIELD_VALUES);
+        assert_eq!(bs.collected_values.as_deref().map(|v| v.len()).unwrap_or(0), MAX_TRACKED_FIELD_VALUES);
         assert_eq!(
-            bs.collected_values.last(),
+            bs.collected_values.as_deref().and_then(|v| v.last()),
             Some(&Value::Number((over - 1) as f64))
         );
         // Threshold accumulators still see every event; only the raw value list is capped.

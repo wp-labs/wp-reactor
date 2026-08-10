@@ -414,8 +414,8 @@ impl CepStateMachine {
                         (
                             bs.event_first_time_nanos,
                             bs.event_last_time_nanos,
-                            bs.collected_values.clone(),
-                            bs.field_values.clone(),
+                            bs.collected_values.as_deref().cloned().unwrap_or_default(),
+                            bs.field_values.as_deref().cloned().unwrap_or_default(),
                         )
                     };
                     instance.completed_steps.push(StepData {
@@ -548,7 +548,9 @@ impl CepStateMachine {
             // Collect the values from the satisfied branch for L3 functions
             let collected_values = step_state.branch_states[branch_idx]
                 .collected_values
-                .clone();
+                .as_deref()
+                .cloned()
+                .unwrap_or_default();
             instance.completed_steps.push(StepData {
                 satisfied_branch_index: branch_idx,
                 label,
@@ -556,7 +558,7 @@ impl CepStateMachine {
                 event_first_time_nanos: step_state.branch_states[branch_idx].event_first_time_nanos,
                 event_last_time_nanos: step_state.branch_states[branch_idx].event_last_time_nanos,
                 collected_values,
-                field_values: step_state.branch_states[branch_idx].field_values.clone(),
+                field_values: step_state.branch_states[branch_idx].field_values.as_deref().cloned().unwrap_or_default(),
             });
 
             // Chain `within`: the completing step must land within its gap of the

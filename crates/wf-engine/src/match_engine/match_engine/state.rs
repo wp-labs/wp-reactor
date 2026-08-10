@@ -26,9 +26,12 @@ pub(super) struct BranchState {
     pub(super) distinct_set: Option<Box<HashSet<ValueKey>>>,
     pub(super) event_first_time_nanos: Option<i64>,
     pub(super) event_last_time_nanos: Option<i64>,
-    // L3: collected values for collect_set/list, first/last, stddev/percentile
-    pub(super) collected_values: Vec<Value>,
-    pub(super) field_values: HashMap<String, Vec<Value>>,
+    // L3: collected values for collect_set/list, first/last, stddev/percentile.
+    // Lazy, boxed — only L3 collection measures allocate.
+    pub(super) collected_values: Option<Box<Vec<Value>>>,
+    /// Per-field value history for yield / L3 collection. Lazy, boxed — a
+    /// count rule never allocates this.
+    pub(super) field_values: Option<Box<HashMap<String, Vec<Value>>>>,
 }
 
 impl BranchState {
@@ -45,24 +48,39 @@ impl BranchState {
             distinct_set: None,
             event_first_time_nanos: None,
             event_last_time_nanos: None,
-            collected_values: Vec::new(),
-            field_values: HashMap::new(),
+            collected_values: None,
+            field_values: None,
         }
+    }
+
+    /// Mutable access to the field-value history, allocating lazily.
+    pub(super) fn field_values_mut(&mut self) -> &mut HashMap<String, Vec<Value>> {
+        self.field_values.get_or_insert_with(|| Box::new(HashMap::new()))
+    }
+
+    /// Mutable access to the L3 collected-values list, allocating lazily.
+    pub(super) fn collected_values_mut(&mut self) -> &mut Vec<Value> {
+        self.collected_values.get_or_insert_with(|| Box::new(Vec::new()))
     }
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct AliasState {
     pub(super) count: u64,
-    pub(super) field_values: HashMap<String, Vec<Value>>,
+    /// Lazy, boxed — only aliases with tracked bind fields allocate.
+    pub(super) field_values: Option<Box<HashMap<String, Vec<Value>>>>,
 }
 
 impl AliasState {
     pub(super) fn new() -> Self {
         Self {
             count: 0,
-            field_values: HashMap::new(),
+            field_values: None,
         }
+    }
+
+    pub(super) fn field_values_mut(&mut self) -> &mut HashMap<String, Vec<Value>> {
+        self.field_values.get_or_insert_with(|| Box::new(HashMap::new()))
     }
 }
 
@@ -157,11 +175,15 @@ impl Instance {
                         .unwrap_or(0);
                 size += bs
                     .field_values
-                    .iter()
-                    .map(|(field, values)| {
-                        field.len() + 24 + values.iter().map(val_estimated_bytes).sum::<usize>()
+                    .as_deref()
+                    .map(|fv| {
+                        fv.iter()
+                            .map(|(field, values)| {
+                                field.len() + 24 + values.iter().map(val_estimated_bytes).sum::<usize>()
+                            })
+                            .sum::<usize>()
                     })
-                    .sum::<usize>();
+                    .unwrap_or(0);
             }
         }
 
@@ -176,11 +198,16 @@ impl Instance {
                     + 8
                     + state
                         .field_values
-                        .iter()
-                        .map(|(field, values)| {
-                            field.len() + 24 + values.iter().map(val_estimated_bytes).sum::<usize>()
+                        .as_deref()
+                        .map(|fv| {
+                            fv.iter()
+                                .map(|(field, values)| {
+                                    field.len() + 24
+                                        + values.iter().map(val_estimated_bytes).sum::<usize>()
+                                })
+                                .sum::<usize>()
                         })
-                        .sum::<usize>();
+                        .unwrap_or(0);
             }
         }
 
@@ -284,7 +311,7 @@ pub(super) fn snapshot_bind_data(alias_states: Option<&HashMap<String, AliasStat
             alias_states.get(&alias).map(|state| BindData {
                 alias,
                 count: state.count,
-                field_values: state.field_values.clone(),
+                field_values: state.field_values.as_deref().cloned().unwrap_or_default(),
             })
         })
         .collect()
