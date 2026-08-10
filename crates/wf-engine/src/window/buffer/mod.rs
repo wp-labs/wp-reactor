@@ -107,6 +107,7 @@ impl Window {
             row_count,
             byte_size,
             seq,
+            parsed_events: std::sync::OnceLock::new(),
         });
 
         self.current_bytes += byte_size;

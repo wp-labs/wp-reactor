@@ -8,7 +8,6 @@ use crate::wfl_parser::parse_wfl;
 
 mod basic;
 mod edge;
-mod keep_fields;
 mod keys_entity;
 mod pipeline;
 mod seq;

@@ -19,7 +19,7 @@ pub use checker::lint::lint_wfl;
 pub use checker::{
     CheckError, Severity, check_intermediate_target_graph, check_wfl, effective_schemas_for_rules,
 };
-pub use compiler::{compile_wfl, expr_field_refs, rule_keep_fields};
+pub use compiler::compile_wfl;
 pub use diagnostics::{
     compile_wfl_with_diagnostics, parse_wfl_with_diagnostics, validate_wfl_with_diagnostics,
 };

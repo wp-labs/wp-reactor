@@ -1,4 +1,8 @@
+use std::sync::Arc;
+
 use arrow::record_batch::RecordBatch;
+
+use crate::match_engine::Event;
 
 use super::Window;
 
@@ -26,6 +30,33 @@ impl Window {
             .map(|tb| tb.batch.clone()) // Arc clone, zero data copy
             .collect();
         (batches, newest_seq + 1, gap)
+    }
+
+    /// Read the *shared parsed events* of batches since the given cursor.
+    ///
+    /// Like [`Window::read_since`], but returns the lazily-parsed events cached
+    /// on each batch — the same `Arc` for every consuming rule, so a window
+    /// batch is parsed exactly once instead of once per rule (wp-reactor#19).
+    ///
+    /// Returns `(events_per_batch, new_cursor, gap_detected)`.
+    pub fn events_since(&self, cursor: u64) -> (Vec<Arc<Vec<Event>>>, u64, bool) {
+        if self.batches.is_empty() {
+            return (Vec::new(), cursor, false);
+        }
+        let oldest_seq = self.batches.front().unwrap().seq;
+        let newest_seq = self.batches.back().unwrap().seq;
+        if cursor > newest_seq {
+            return (Vec::new(), cursor, false);
+        }
+        let gap = cursor < oldest_seq;
+        let effective_start = if gap { oldest_seq } else { cursor };
+        let events: Vec<Arc<Vec<Event>>> = self
+            .batches
+            .iter()
+            .filter(|tb| tb.seq >= effective_start)
+            .map(|tb| tb.events())
+            .collect();
+        (events, newest_seq + 1, gap)
     }
 
     /// Next sequence number that will be assigned to the next appended batch.

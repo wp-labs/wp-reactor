@@ -13,14 +13,10 @@ use orion_error::conversion::{SourceRawErr, ToStructError};
 use tokio::sync::mpsc;
 
 use wf_engine::alert::OutputRecord;
-use wf_engine::match_engine::{
-    CepStateMachine, CloseReason, RuleExecutor, StepResult, batch_to_events,
-    batch_to_events_filtered,
-};
+use wf_engine::match_engine::{CepStateMachine, CloseReason, RuleExecutor, StepResult};
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{AppendOutcome, Router};
 use wf_lang::plan::ConvPlan;
-use wf_lang::rule_keep_fields;
 use wf_lang::wfu_meta::{WFU_ID, WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
 
 use crate::error::{RuntimeReason, RuntimeResult};
@@ -90,11 +86,6 @@ pub(super) struct RuleTask {
     pub(super) sources: Vec<WindowSource>,
     /// window_name -> Vec<alias>: pre-computed from stream_aliases + window sources.
     aliases: HashMap<String, Vec<String>>,
-    /// window_name -> structured (object/array) fields the rule reads. Used to
-    /// filter `batch_to_events` so unreferenced object fields are not parsed
-    /// into events (wp-reactor#19). Empty when the rule uses features we cannot
-    /// enumerate (each/joins/conv) — then all fields are kept.
-    structured_keep_fields: HashMap<String, HashSet<String>>,
     /// window_name -> Vec<alias>: aux bind aliases first, then event aliases.
     ordered_aliases: HashMap<String, Vec<String>>,
     alert_tx: mpsc::Sender<OutputRecord>,
@@ -166,8 +157,6 @@ impl RuleTask {
         let rule_name = executor.plan().name.clone();
         let task_id = format!("{}#{}", rule_name, seq);
         let conv_plan = executor.plan().conv_plan.clone();
-        // Structured fields each window must keep (None → no filtering).
-        let structured_keep_fields = rule_keep_fields(executor.plan()).unwrap_or_default();
 
         let task = Self {
             task_id,
@@ -179,7 +168,6 @@ impl RuleTask {
             sources: window_sources,
             aliases,
             ordered_aliases,
-            structured_keep_fields,
             alert_tx,
             cursors,
             router,
@@ -208,9 +196,11 @@ impl RuleTask {
     pub(super) async fn pull_and_advance(&mut self) {
         for source in &self.sources {
             let cursor = self.cursors.get(&source.window_name).copied().unwrap_or(0);
-            let (batches, new_cursor, gap) = {
+            let (events_list, new_cursor, gap) = {
                 let win = source.window.read().expect("lock poisoned");
-                let result = win.read_since(cursor);
+                // Shared parsed events: the window parses each batch once and
+                // hands every rule the same Arc (wp-reactor#19).
+                let result = win.events_since(cursor);
                 wf_debug!(pipe,
                     task_id = %self.task_id,
                     window = %source.window_name,
@@ -218,7 +208,7 @@ impl RuleTask {
                     new_cursor = result.1,
                     batches = result.0.len(),
                     gap = result.2,
-                    "read_since"
+                    "events_since"
                 );
                 result
             };
@@ -245,15 +235,9 @@ impl RuleTask {
                 continue;
             };
 
-            let first_batch_seq = new_cursor.saturating_sub(batches.len() as u64);
-            for (batch_index, batch) in batches.iter().enumerate() {
+            let first_batch_seq = new_cursor.saturating_sub(events_list.len() as u64);
+            for (batch_index, events) in events_list.iter().enumerate() {
                 let batch_seq = first_batch_seq + batch_index as u64;
-                // Skip structured (object/array) fields this rule never reads —
-                // the dominant per-event allocation (wp-reactor#19).
-                let events = match self.structured_keep_fields.get(&source.window_name) {
-                    Some(keep) if !keep.is_empty() => batch_to_events_filtered(batch, keep),
-                    _ => batch_to_events(batch),
-                };
                 let mut stats = RuleBatchDebugStats {
                     input_events: events.len(),
                     ..RuleBatchDebugStats::default()
@@ -273,7 +257,7 @@ impl RuleTask {
                         stage = 0,
                         window = %source.window_name,
                         batch_seq = batch_seq,
-                        rows = batch.num_rows(),
+                        rows = events.len(),
                         aliases = %aliases_for_log.as_deref().unwrap_or(""),
                         instances_before = instances_before,
                         "rule batch started"
