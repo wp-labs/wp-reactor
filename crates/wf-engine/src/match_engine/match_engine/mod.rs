@@ -333,7 +333,7 @@ impl CepStateMachine {
         let mut instance = self.remove_instance(&instance_key).unwrap_or_else(|| {
             let created = fixed_created_at.unwrap_or(now_nanos);
             let machine_id = Self::extract_event_str(event, MACHINE_ID);
-            Instance::new_at(&self.plan, scope_key.clone(), machine_id, created)
+            Instance::new_at(&self.plan, machine_id, created)
         });
         let plan = &self.plan;
 
@@ -768,6 +768,7 @@ impl CepStateMachine {
             &self.rule_name,
             &self.plan,
             instance,
+            instance_key.scope_key_values(),
             reason,
             self.watermark_nanos,
         );
@@ -815,6 +816,7 @@ impl CepStateMachine {
                     &self.rule_name,
                     &self.plan,
                     instance,
+                    key.scope_key_values(),
                     CloseReason::Timeout,
                     current_expire,
                 );
@@ -868,7 +870,14 @@ impl CepStateMachine {
         let wm = self.watermark_nanos;
         for (key, _) in keys {
             if let Some(instance) = self.remove_instance(&key) {
-                let mut output = evaluate_close(&self.rule_name, &self.plan, instance, reason, wm);
+                let mut output = evaluate_close(
+                    &self.rule_name,
+                    &self.plan,
+                    instance,
+                    key.scope_key_values(),
+                    reason,
+                    wm,
+                );
                 self.rate_limit_close(&mut output, wm);
                 results.push(output);
             }

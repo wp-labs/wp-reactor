@@ -83,7 +83,11 @@ impl StepState {
 #[derive(::moju_derive::MoJu, Debug, Clone)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub(super) struct Instance {
-    pub(super) scope_key: Vec<Value>,
+    // Note: no `scope_key` here — the instance key (String form) lives in the
+    // `InstanceKey` that keys the instance map and the expiry heap. Storing a
+    // `Vec<Value>` copy here duplicated the key for every instance, the dominant
+    // per-instance memory at high entity cardinality (wp-reactor#19). The close
+    // output reconstructs it from the `InstanceKey` on demand.
     pub(super) machine_id: String,
     pub(super) created_at: i64,
     pub(super) last_event_nanos: i64,
@@ -109,12 +113,7 @@ impl Instance {
     ///
     /// For sliding windows, `created_at` is the event time.
     /// For fixed windows, `created_at` is the bucket start.
-    pub(super) fn new_at(
-        plan: &MatchPlan,
-        scope_key: Vec<Value>,
-        machine_id: String,
-        created_at: i64,
-    ) -> Self {
+    pub(super) fn new_at(plan: &MatchPlan, machine_id: String, created_at: i64) -> Self {
         let step_states = plan
             .event_steps
             .iter()
@@ -126,7 +125,6 @@ impl Instance {
             .map(|sp| StepState::new(sp.branches.len()))
             .collect();
         Self {
-            scope_key,
             machine_id,
             created_at,
             last_event_nanos: created_at,
@@ -145,11 +143,7 @@ impl Instance {
 
     pub(super) fn estimated_bytes(&self) -> usize {
         let mut size: usize = 128; // base struct overhead
-
-        // scope_key
-        for val in &self.scope_key {
-            size += val_estimated_bytes(val);
-        }
+        size += 32; // InstanceKey string (short ip key), per instance
 
         // step_states + close_step_states
         for ss in self.step_states.iter().chain(self.close_step_states.iter()) {
@@ -202,15 +196,12 @@ impl Instance {
     /// from the plan (same layout as `Instance::new` would produce).
     pub(super) fn base_estimated_bytes(
         plan: &MatchPlan,
-        scope_key: &[Value],
+        _scope_key: &[Value],
         alias: &str,
         event: &Event,
     ) -> usize {
         let mut size: usize = 128; // base struct overhead
-
-        for val in scope_key {
-            size += val_estimated_bytes(val);
-        }
+        size += 32; // InstanceKey string (short ip key), per instance
 
         // empty branch states: 80 bytes each
         let branch_count: usize = plan

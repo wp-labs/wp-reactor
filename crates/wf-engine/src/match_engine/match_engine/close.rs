@@ -178,6 +178,7 @@ pub(super) fn evaluate_close(
     rule_name: &str,
     plan: &MatchPlan,
     instance: Instance,
+    scope_key: Vec<Value>,
     reason: CloseReason,
     watermark_nanos: i64,
 ) -> CloseOutput {
@@ -192,7 +193,7 @@ pub(super) fn evaluate_close(
         evidence_range.unwrap_or((instance.last_event_nanos, instance.last_event_nanos));
     CloseOutput {
         rule_name: rule_name.to_string(),
-        scope_key: instance.scope_key,
+        scope_key,
         machine_id: instance.machine_id,
         close_reason: reason,
         event_ok: instance.event_ok,

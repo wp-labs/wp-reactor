@@ -94,6 +94,19 @@ impl InstanceKey {
     pub fn matches_scope(&self, scope_key_str: &str) -> bool {
         self.scope_key_str == scope_key_str
     }
+
+    /// Rebuild the scope-key `Value`s from the stored string form.
+    ///
+    /// The instance no longer stores its own `Vec<Value>` scope_key (it is
+    /// redundant with this key's string), so close/match output reconstructs it
+    /// here on demand. Key components are `\x1f`-joined by [`make_scope_key_str`].
+    /// Note: type is not preserved — numeric key components come back as `Str`.
+    pub fn scope_key_values(&self) -> Vec<Value> {
+        self.scope_key_str
+            .split('\x1f')
+            .map(|s| Value::Str(s.to_string()))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
