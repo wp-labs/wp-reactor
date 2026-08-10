@@ -345,6 +345,7 @@ impl CepStateMachine {
                 event,
                 instance
                     .alias_states
+                    .get_or_insert_with(|| Box::new(HashMap::new()))
                     .entry(alias.to_string())
                     .or_insert_with(AliasState::new),
                 tracked_fields,
@@ -471,7 +472,7 @@ impl CepStateMachine {
                     rule_name: self.rule_name.clone(),
                     scope_key,
                     step_data: instance.completed_steps.clone(),
-                    bind_data: snapshot_bind_data(&instance.alias_states),
+                    bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
                     event_time_nanos: now_nanos,
                     event_first_time_nanos: evidence_first,
                     event_last_time_nanos: evidence_last,
@@ -660,7 +661,7 @@ impl CepStateMachine {
                     rule_name: self.rule_name.clone(),
                     scope_key,
                     step_data: instance.completed_steps.clone(),
-                    bind_data: snapshot_bind_data(&instance.alias_states),
+                    bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
                     event_time_nanos: now_nanos,
                     event_first_time_nanos: evidence_first,
                     event_last_time_nanos: evidence_last,
@@ -709,7 +710,7 @@ impl CepStateMachine {
                     rule_name: self.rule_name.clone(),
                     scope_key,
                     step_data: instance.completed_steps.clone(),
-                    bind_data: snapshot_bind_data(&instance.alias_states),
+                    bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
                     event_time_nanos: now_nanos,
                     event_first_time_nanos: evidence_first,
                     event_last_time_nanos: evidence_last,

@@ -201,7 +201,7 @@ pub(super) fn evaluate_close(
         event_emitted: instance.event_emitted,
         event_step_data,
         close_step_data,
-        bind_data: snapshot_bind_data(&instance.alias_states),
+        bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
         watermark_nanos,
         last_event_nanos: instance.last_event_nanos,
         event_first_time_nanos: evidence_first,

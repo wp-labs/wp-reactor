@@ -16,11 +16,14 @@ pub(super) struct BranchState {
     pub(super) sum: f64,
     pub(super) min: f64,
     pub(super) max: f64,
-    pub(super) min_val: Option<Value>,
-    pub(super) max_val: Option<Value>,
+    // Values at which min/max were reached (for yield). Boxed so count/sum
+    // rules carry ~16B instead of ~112B (wp-reactor#19 instance state).
+    pub(super) min_val: Option<Box<Value>>,
+    pub(super) max_val: Option<Box<Value>>,
     pub(super) avg_sum: f64,
     pub(super) avg_count: u64,
-    pub(super) distinct_set: HashSet<ValueKey>,
+    /// Lazy, boxed (None = 8B vs HashSet 48B): only `distinct` transforms allocate.
+    pub(super) distinct_set: Option<Box<HashSet<ValueKey>>>,
     pub(super) event_first_time_nanos: Option<i64>,
     pub(super) event_last_time_nanos: Option<i64>,
     // L3: collected values for collect_set/list, first/last, stddev/percentile
@@ -39,7 +42,7 @@ impl BranchState {
             max_val: None,
             avg_sum: 0.0,
             avg_count: 0,
-            distinct_set: HashSet::new(),
+            distinct_set: None,
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
@@ -90,7 +93,9 @@ pub(super) struct Instance {
     pub(super) step_states: Vec<StepState>,
     pub(super) completed_steps: Vec<super::types::StepData>,
     pub(super) close_step_states: Vec<StepState>,
-    pub(super) alias_states: HashMap<String, AliasState>,
+    /// Lazy, boxed (None = 8B vs HashMap 48B): rules that never track alias
+    /// bind fields don't allocate this.
+    pub(super) alias_states: Option<Box<HashMap<String, AliasState>>>,
     pub(super) baselines: HashMap<String, RollingStats>,
     /// Chain negation violated — chain must not fire.
     pub(super) neg_violated: bool,
@@ -131,7 +136,7 @@ impl Instance {
             step_states,
             completed_steps: Vec::new(),
             close_step_states,
-            alias_states: HashMap::new(),
+            alias_states: None,
             baselines: HashMap::new(),
             neg_violated: false,
             satisfied_flags: vec![false; plan.event_steps.len()],
@@ -151,10 +156,11 @@ impl Instance {
             for bs in &ss.branch_states {
                 // base branch fields (~80 bytes) + distinct_set
                 size += 80
-                    + bs.distinct_set
-                        .iter()
-                        .map(|value| value.estimated_bytes() + 24)
-                        .sum::<usize>();
+                    + bs
+                        .distinct_set
+                        .as_deref()
+                        .map(|set| set.iter().map(|value| value.estimated_bytes() + 24).sum::<usize>())
+                        .unwrap_or(0);
                 size += bs
                     .field_values
                     .iter()
@@ -169,11 +175,9 @@ impl Instance {
         size += self.completed_steps.len() * 64;
 
         // alias_states
-        size += self
-            .alias_states
-            .iter()
-            .map(|(alias, state)| {
-                alias.len()
+        if let Some(alias_states) = &self.alias_states {
+            for (alias, state) in &**alias_states {
+                size += alias.len()
                     + 24
                     + 8
                     + state
@@ -182,9 +186,9 @@ impl Instance {
                         .map(|(field, values)| {
                             field.len() + 24 + values.iter().map(val_estimated_bytes).sum::<usize>()
                         })
-                        .sum::<usize>()
-            })
-            .sum::<usize>();
+                        .sum::<usize>();
+            }
+        }
 
         // baselines
         size += self.baselines.len() * 128;
@@ -249,7 +253,7 @@ impl Instance {
             .iter()
             .map(|sp| StepState::new(sp.branches.len()))
             .collect();
-        self.alias_states.clear();
+        self.alias_states = None;
         self.baselines.clear();
         self.neg_violated = false;
         self.satisfied_flags = vec![false; plan.event_steps.len()];
@@ -277,7 +281,10 @@ impl Instance {
     }
 }
 
-pub(super) fn snapshot_bind_data(alias_states: &HashMap<String, AliasState>) -> Vec<BindData> {
+pub(super) fn snapshot_bind_data(alias_states: Option<&HashMap<String, AliasState>>) -> Vec<BindData> {
+    let Some(alias_states) = alias_states else {
+        return Vec::new();
+    };
     let mut aliases: Vec<_> = alias_states.keys().cloned().collect();
     aliases.sort();
     aliases

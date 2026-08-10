@@ -298,7 +298,7 @@ pub(super) fn apply_transforms(
                 Some(v) => ValueKey::from_value(v),
                 None => return false,
             };
-            if !bs.distinct_set.insert(key) {
+            if !bs.distinct_set.get_or_insert_with(|| Box::new(HashSet::new())).insert(key) {
                 return false; // duplicate
             }
         }
@@ -348,7 +348,7 @@ fn update_extreme(
     fval: Option<f64>,
     field_value: &Option<Value>,
     num_acc: &mut f64,
-    val_acc: &mut Option<Value>,
+    val_acc: &mut Option<Box<Value>>,
     is_min: bool,
 ) {
     if let Some(v) = fval
@@ -357,7 +357,7 @@ fn update_extreme(
         *num_acc = v;
     }
     if let Some(val) = field_value {
-        let replace = match val_acc.as_ref() {
+        let replace = match val_acc.as_deref() {
             None => true,
             Some(cur) => {
                 let ord = value_ordering(val, cur);
@@ -365,7 +365,7 @@ fn update_extreme(
             }
         };
         if replace {
-            *val_acc = Some(val.clone());
+            *val_acc = Some(Box::new(val.clone()));
         }
     }
 }
@@ -414,7 +414,7 @@ pub(super) fn check_threshold(agg: &AggPlan, bs: &BranchState) -> bool {
     match agg.measure {
         Measure::Min => {
             if let (Some(val), Some(threshold_val)) =
-                (&bs.min_val, try_eval_expr_to_value(&agg.threshold))
+                (bs.min_val.as_deref(), try_eval_expr_to_value(&agg.threshold))
             {
                 compare_value_threshold(agg.cmp, val, &threshold_val)
             } else {
@@ -423,7 +423,7 @@ pub(super) fn check_threshold(agg: &AggPlan, bs: &BranchState) -> bool {
         }
         Measure::Max => {
             if let (Some(val), Some(threshold_val)) =
-                (&bs.max_val, try_eval_expr_to_value(&agg.threshold))
+                (bs.max_val.as_deref(), try_eval_expr_to_value(&agg.threshold))
             {
                 compare_value_threshold(agg.cmp, val, &threshold_val)
             } else {
