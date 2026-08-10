@@ -106,13 +106,32 @@ impl Window {
 
         // Memory eviction: pop oldest batches while over budget.
         let max_bytes = self.config.max_window_bytes.as_bytes();
+        let mut evicted_bytes = 0usize;
+        let mut evicted_rows = 0usize;
         while self.current_bytes > max_bytes {
             if let Some(evicted) = self.batches.pop_front() {
                 self.current_bytes -= evicted.byte_size;
                 self.total_rows -= evicted.row_count;
+                evicted_bytes += evicted.byte_size;
+                evicted_rows += evicted.row_count;
             } else {
                 break;
             }
+        }
+        if evicted_rows > 0 {
+            // The incoming batch was dropped (in whole or part) because it pushed
+            // the window over max_window_bytes — e.g. a single oversized Arrow
+            // frame exceeds the cap and is silently discarded. Log it so rules
+            // that stop seeing events aren't a mystery.
+            log::warn!(
+                "window `{}` dropped {} row(s) / {} bytes in memory eviction (max_window_bytes={} bytes, incoming batch = {} rows / {} bytes)",
+                self.name,
+                evicted_rows,
+                evicted_bytes,
+                max_bytes,
+                row_count,
+                byte_size,
+            );
         }
 
         Ok(())
