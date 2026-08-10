@@ -118,6 +118,7 @@ impl Evictor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::window::buffer::content_bytes;
     use crate::window::{WindowDef, WindowParams};
     use arrow::array::{Int64Array, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -205,7 +206,7 @@ mod tests {
     fn evictor_global_memory_cap() {
         let schema = test_schema();
         let probe = make_batch(&schema, &[1_000_000_000], &[100]);
-        let one_batch_size = probe.get_array_memory_size();
+        let one_batch_size = content_bytes(&probe);
 
         let reg = WindowRegistry::build(vec![
             WindowDef {
@@ -284,7 +285,7 @@ mod tests {
     fn evictor_long_running_memory_stabilization() {
         let schema = test_schema();
         let probe = make_batch(&schema, &[1_000_000_000], &[100]);
-        let one_batch_size = probe.get_array_memory_size();
+        let one_batch_size = content_bytes(&probe);
 
         let reg = WindowRegistry::build(vec![WindowDef {
             params: WindowParams {
@@ -406,7 +407,7 @@ mod tests {
     fn evictor_long_running_with_snapshots() {
         let schema = test_schema();
         let probe = make_batch(&schema, &[1_000_000_000], &[100]);
-        let one_batch_size = probe.get_array_memory_size();
+        let one_batch_size = content_bytes(&probe);
 
         let reg = WindowRegistry::build(vec![WindowDef {
             params: WindowParams {
@@ -483,7 +484,7 @@ mod tests {
     fn evictor_long_running_multi_window() {
         let schema = test_schema();
         let probe = make_batch(&schema, &[1_000_000_000], &[100]);
-        let one_batch_size = probe.get_array_memory_size();
+        let one_batch_size = content_bytes(&probe);
 
         let reg = WindowRegistry::build(vec![
             WindowDef {
@@ -614,7 +615,7 @@ mod tests {
     fn evictor_burst_then_drain() {
         let schema = test_schema();
         let probe = make_batch(&schema, &[1_000_000_000], &[100]);
-        let one_batch_size = probe.get_array_memory_size();
+        let one_batch_size = content_bytes(&probe);
 
         let reg = WindowRegistry::build(vec![WindowDef {
             params: WindowParams {

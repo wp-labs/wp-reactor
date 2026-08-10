@@ -16,7 +16,7 @@ use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 use wf_engine::match_engine::{CepStateMachine, RuleExecutor, batch_to_events};
-use wf_engine::window::{Router, Window, WindowDef, WindowParams, WindowRegistry};
+use wf_engine::window::{content_bytes, Router, Window, WindowDef, WindowParams, WindowRegistry};
 use wf_lang::ast::{BinOp, CloseMode, CmpOp, Expr, FieldRef, Measure, ObjectItem};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EachPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
@@ -2001,7 +2001,7 @@ async fn pull_detects_gap() {
     let schema = test_schema();
     let batch_size = {
         let tmp = make_batch(&schema, &["10.0.0.1"], 1_000_000_000);
-        tmp.get_array_memory_size()
+        content_bytes(&tmp)
     };
     let (mut task, _alert_rx, win, _notify) = make_task_with_window_bytes(batch_size);
 

@@ -1,9 +1,13 @@
+use crate::window::buffer::content_bytes;
 use crate::window::buffer::Window;
 use crate::window::buffer::types::AppendOutcome;
 use crate::window::buffer::types::WindowParams;
-use arrow::array::{Int64Array, TimestampNanosecondArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::array::{ArrayRef, Int64Array, StringArray, StructArray, TimestampNanosecondArray};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 use wf_config::WindowConfig;
@@ -164,7 +168,7 @@ fn memory_eviction_on_append() {
 
     // Measure the size of one batch.
     let probe = make_batch(&schema, &[1_000_000_000], &[100]);
-    let one_batch_size = probe.get_array_memory_size();
+    let one_batch_size = content_bytes(&probe);
 
     // Allow room for exactly 2 batches.
     let max_bytes = one_batch_size * 2;
@@ -236,12 +240,12 @@ fn memory_usage_tracks_correctly() {
     assert_eq!(win.memory_usage(), 0);
 
     let b1 = make_batch(&schema, &[1_000_000_000], &[100]);
-    let b1_size = b1.get_array_memory_size();
+    let b1_size = content_bytes(&b1);
     win.append(b1).unwrap();
     assert_eq!(win.memory_usage(), b1_size);
 
     let b2 = make_batch(&schema, &[2_000_000_000, 3_000_000_000], &[200, 300]);
-    let b2_size = b2.get_array_memory_size();
+    let b2_size = content_bytes(&b2);
     win.append(b2).unwrap();
     assert_eq!(win.memory_usage(), b1_size + b2_size);
 }
@@ -400,7 +404,7 @@ fn read_since_normal() {
 fn read_since_gap_detection() {
     let schema = test_schema();
     let probe = make_batch(&schema, &[1_000_000_000], &[100]);
-    let one_batch_size = probe.get_array_memory_size();
+    let one_batch_size = content_bytes(&probe);
     // Allow room for exactly 2 batches → oldest evicted when 3rd arrives.
     let max_bytes = one_batch_size * 2;
     let mut win = Window::new(
@@ -451,4 +455,62 @@ fn read_since_cursor_ahead() {
     assert!(batches.is_empty());
     assert_eq!(cursor, 999);
     assert!(!gap);
+}
+
+// -- 18. content_bytes_ipc_roundtrip_does_not_inflate -----------------------
+
+/// #18 regression: an object/struct-heavy batch that Arrow IPC decode inflates
+/// to several times its content (padded buffer allocations) must be accounted
+/// by *content* bytes, so a single big frame doesn't blow past `max_window_bytes`
+/// and get silently dropped by window memory eviction.
+#[test]
+fn content_bytes_ipc_roundtrip_does_not_inflate() {
+    let n = 100_000usize;
+    let obj_field = Field::new(
+        "obj",
+        DataType::Struct(Fields::from(vec![
+            Field::new("sip", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+        ])),
+        false,
+    );
+    let schema = Arc::new(Schema::new(vec![obj_field]));
+
+    let sip: StringArray = (0..n).map(|_| Some("10.0.0.1")).collect();
+    let score: Int64Array = (0..n).map(|_| Some(42)).collect();
+    let obj = StructArray::from(vec![
+        (Arc::new(Field::new("sip", DataType::Utf8, false)), Arc::new(sip) as ArrayRef),
+        (
+            Arc::new(Field::new("score", DataType::Int64, false)),
+            Arc::new(score) as ArrayRef,
+        ),
+    ]);
+
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(obj)]).unwrap();
+
+    // Round-trip through Arrow IPC — the same path the engine uses between the
+    // producer and the rule window.
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+    }
+    let mut reader = StreamReader::try_new(Cursor::new(&buf), None).unwrap();
+    let decoded = reader.next().unwrap().expect("one decoded batch");
+
+    let content = content_bytes(&decoded);
+    let inflated = decoded.get_array_memory_size();
+
+    // Content ≈ 100k rows × (8 utf8 + 4 offset + 8 int64) = 2.0MB. It must
+    // track the actual data, not the padded allocations IPC decode produces.
+    let expected = n * (8 + 4 + 8);
+    assert!(
+        content.abs_diff(expected) <= expected / 10,
+        "content bytes {content} should track actual data (~{expected}), got inflated allocation {inflated}"
+    );
+    assert!(
+        inflated > content * 3,
+        "IPC decode should inflate well beyond content bytes: inflated={inflated}, content={content}"
+    );
 }

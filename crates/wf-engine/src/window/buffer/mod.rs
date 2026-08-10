@@ -11,8 +11,12 @@ pub use types::{AppendOutcome, WindowParams};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, TimestampNanosecondArray};
-use arrow::datatypes::SchemaRef;
+use arrow::array::{
+    Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, LargeBinaryArray,
+    LargeListArray, LargeStringArray, ListArray, StringArray, StructArray,
+    TimestampNanosecondArray,
+};
+use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use orion_error::conversion::ToStructError;
 use wf_config::WindowConfig;
@@ -88,7 +92,11 @@ impl Window {
 
         let event_time_range = self.extract_time_range(&batch);
         let row_count = batch.num_rows();
-        let byte_size = batch.get_array_memory_size();
+        // Account by *content* bytes, not Arrow buffer allocations: IPC decode
+        // inflates `get_array_memory_size` with padding (~7x for decoded arrays),
+        // so a single padded frame can exceed max_window_bytes and be silently
+        // dropped even though its data is small (wp-labs/wp-reactor#18).
+        let byte_size = content_bytes(&batch);
         let seq = self.next_seq;
         self.next_seq += 1;
 
@@ -214,4 +222,114 @@ impl Window {
             (i64::MIN, i64::MAX)
         }
     }
+}
+
+/// Estimate the retained *content* bytes of a batch — the actual data size, not
+/// the Arrow buffer allocations (which IPC decode inflates with padding).
+///
+/// Used for window memory accounting so a single padded frame doesn't exceed
+/// `max_window_bytes` and get dropped by memory eviction even though its data
+/// is small (wp-labs/wp-reactor#18).
+pub fn content_bytes(batch: &RecordBatch) -> usize {
+    batch.columns().iter().map(|col| column_content_bytes(col.as_ref())).sum()
+}
+
+fn column_content_bytes(col: &dyn Array) -> usize {
+    let n = col.len();
+    match col.data_type() {
+        DataType::Null => 0,
+        DataType::Boolean => bitmap_bytes(n) * 2, // data + validity bitmaps
+        // Fixed-width values: width × rows.
+        DataType::Int8 | DataType::UInt8 => n,
+        DataType::Int16 | DataType::UInt16 => n * 2,
+        DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32
+        | DataType::Time32(_) => n * 4,
+        DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Date64
+        | DataType::Time64(_) | DataType::Timestamp(..) | DataType::Duration(_) => n * 8,
+        DataType::Interval(unit) => match unit {
+            IntervalUnit::MonthDayNano => n * 16,
+            _ => n * 8,
+        },
+        DataType::Decimal128(..) => n * 16,
+        DataType::Decimal256(..) => n * 32,
+        DataType::Utf8 => {
+            utf8_content(n, col.as_any().downcast_ref::<StringArray>().expect("utf8 column"))
+        }
+        DataType::LargeUtf8 => large_utf8_content(
+            n,
+            col.as_any().downcast_ref::<LargeStringArray>().expect("large utf8 column"),
+        ),
+        DataType::Binary => {
+            binary_content(n, col.as_any().downcast_ref::<BinaryArray>().expect("binary column"))
+        }
+        DataType::LargeBinary => large_binary_content(
+            n,
+            col.as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .expect("large binary column"),
+        ),
+        DataType::FixedSizeBinary(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .expect("fixed-size binary column");
+            n * arr.value_length() as usize
+        }
+        DataType::Struct(_) => {
+            let arr = col.as_any().downcast_ref::<StructArray>().expect("struct column");
+            arr.columns().iter().map(|c| column_content_bytes(c.as_ref())).sum()
+        }
+        DataType::List(_) => {
+            let arr = col.as_any().downcast_ref::<ListArray>().expect("list column");
+            // value(i) slices the child; a null row yields an empty slice → 0 bytes.
+            offsets_bytes(n, 4)
+                + (0..n).map(|i| column_content_bytes(arr.value(i).as_ref())).sum::<usize>()
+        }
+        DataType::LargeList(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .expect("large list column");
+            offsets_bytes(n, 8)
+                + (0..n).map(|i| column_content_bytes(arr.value(i).as_ref())).sum::<usize>()
+        }
+        DataType::FixedSizeList(_, _) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("fixed-size list column");
+            (0..n).map(|i| column_content_bytes(arr.value(i).as_ref())).sum()
+        }
+        // Dictionary and anything else: upper-bound estimate (dictionary values
+        // are shared, so this overcounts — the safe direction for eviction).
+        _ => n * 8,
+    }
+}
+
+/// Bytes for a bit-packed bitmap over `n` rows.
+fn bitmap_bytes(n: usize) -> usize {
+    n.div_ceil(8)
+}
+
+/// Bytes for an offset buffer of `(n + 1)` entries, `width` bytes each.
+fn offsets_bytes(n: usize, width: usize) -> usize {
+    (n + 1) * width
+}
+
+/// Content bytes of a utf8 column: `(n + 1)` i32 offsets + string payload.
+fn utf8_content(n: usize, arr: &StringArray) -> usize {
+    offsets_bytes(n, 4) + arr.iter().flatten().map(str::len).sum::<usize>()
+}
+
+fn large_utf8_content(n: usize, arr: &LargeStringArray) -> usize {
+    offsets_bytes(n, 8) + arr.iter().flatten().map(str::len).sum::<usize>()
+}
+
+/// Content bytes of a binary column: `(n + 1)` i32 offsets + payload.
+fn binary_content(n: usize, arr: &BinaryArray) -> usize {
+    offsets_bytes(n, 4) + arr.iter().flatten().map(|b| b.len()).sum::<usize>()
+}
+
+fn large_binary_content(n: usize, arr: &LargeBinaryArray) -> usize {
+    offsets_bytes(n, 8) + arr.iter().flatten().map(|b| b.len()).sum::<usize>()
 }
