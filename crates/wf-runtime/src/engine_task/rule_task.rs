@@ -15,10 +15,12 @@ use tokio::sync::mpsc;
 use wf_engine::alert::OutputRecord;
 use wf_engine::match_engine::{
     CepStateMachine, CloseReason, RuleExecutor, StepResult, batch_to_events,
+    batch_to_events_filtered,
 };
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{AppendOutcome, Router};
 use wf_lang::plan::ConvPlan;
+use wf_lang::rule_keep_fields;
 use wf_lang::wfu_meta::{WFU_ID, WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
 
 use crate::error::{RuntimeReason, RuntimeResult};
@@ -88,6 +90,11 @@ pub(super) struct RuleTask {
     pub(super) sources: Vec<WindowSource>,
     /// window_name -> Vec<alias>: pre-computed from stream_aliases + window sources.
     aliases: HashMap<String, Vec<String>>,
+    /// window_name -> structured (object/array) fields the rule reads. Used to
+    /// filter `batch_to_events` so unreferenced object fields are not parsed
+    /// into events (wp-reactor#19). Empty when the rule uses features we cannot
+    /// enumerate (each/joins/conv) — then all fields are kept.
+    structured_keep_fields: HashMap<String, HashSet<String>>,
     /// window_name -> Vec<alias>: aux bind aliases first, then event aliases.
     ordered_aliases: HashMap<String, Vec<String>>,
     alert_tx: mpsc::Sender<OutputRecord>,
@@ -159,6 +166,8 @@ impl RuleTask {
         let rule_name = executor.plan().name.clone();
         let task_id = format!("{}#{}", rule_name, seq);
         let conv_plan = executor.plan().conv_plan.clone();
+        // Structured fields each window must keep (None → no filtering).
+        let structured_keep_fields = rule_keep_fields(executor.plan()).unwrap_or_default();
 
         let task = Self {
             task_id,
@@ -170,6 +179,7 @@ impl RuleTask {
             sources: window_sources,
             aliases,
             ordered_aliases,
+            structured_keep_fields,
             alert_tx,
             cursors,
             router,
@@ -238,7 +248,12 @@ impl RuleTask {
             let first_batch_seq = new_cursor.saturating_sub(batches.len() as u64);
             for (batch_index, batch) in batches.iter().enumerate() {
                 let batch_seq = first_batch_seq + batch_index as u64;
-                let events = batch_to_events(batch);
+                // Skip structured (object/array) fields this rule never reads —
+                // the dominant per-event allocation (wp-reactor#19).
+                let events = match self.structured_keep_fields.get(&source.window_name) {
+                    Some(keep) if !keep.is_empty() => batch_to_events_filtered(batch, keep),
+                    _ => batch_to_events(batch),
+                };
                 let mut stats = RuleBatchDebugStats {
                     input_events: events.len(),
                     ..RuleBatchDebugStats::default()

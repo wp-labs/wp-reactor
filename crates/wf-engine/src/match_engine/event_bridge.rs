@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use arrow::array::{
     Array, BooleanArray, FixedSizeListArray, Float64Array, Int64Array, LargeListArray, ListArray,
@@ -46,6 +46,18 @@ pub fn wfl_structured_field_kind(field: &Field) -> Option<&str> {
 /// | Struct               | → | Value::Object           |
 /// | List/LargeList       | → | Value::Array            |
 pub fn batch_to_events(batch: &RecordBatch) -> Vec<Event> {
+    build_events(batch, None)
+}
+
+/// Like [`batch_to_events`], but skips *structured* (object/array) fields that
+/// are not in `keep`. Scalar fields are always parsed. A rule that never reads
+/// a large `object` field thus avoids materializing its parsed [`Value::Object`]
+/// — the dominant per-event allocation on high-volume windows (wp-reactor#19).
+pub fn batch_to_events_filtered(batch: &RecordBatch, keep: &HashSet<String>) -> Vec<Event> {
+    build_events(batch, Some(keep))
+}
+
+fn build_events(batch: &RecordBatch, keep: Option<&HashSet<String>>) -> Vec<Event> {
     let num_rows = batch.num_rows();
     let schema = batch.schema();
     let mut events = Vec::with_capacity(num_rows);
@@ -53,6 +65,14 @@ pub fn batch_to_events(batch: &RecordBatch) -> Vec<Event> {
     for row in 0..num_rows {
         let mut fields = HashMap::new();
         for (col_idx, field) in schema.fields().iter().enumerate() {
+            // Structured (object/array) columns are the expensive parsed Values.
+            // Skip them unless the caller asked to keep this field.
+            if let Some(keep) = keep
+                && wfl_structured_field_kind(field).is_some()
+                && !keep.contains(field.name())
+            {
+                continue;
+            }
             let col = batch.column(col_idx);
             if col.is_null(row) {
                 continue;

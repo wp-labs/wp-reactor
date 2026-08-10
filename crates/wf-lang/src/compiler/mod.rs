@@ -1,9 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::ast::{
-    CloseMode, EachClause, EntityClause, EntityTypeVal, EventsBlock, Expr, FieldRef, MatchClause,
-    Measure, PathSegment, RuleDecl, ScoreExpr, SeqSkip, WflFile, WindowMode, YieldClause,
+    CloseMode, EachClause, EntityClause, EntityTypeVal, EventsBlock, Expr, FieldRef, FieldSelector,
+    MatchClause, Measure, PathSegment, RuleDecl, ScoreExpr, SeqSkip, WflFile, WindowMode,
+    YieldClause,
 };
 use crate::checker::check_wfl;
 use crate::plan::{
@@ -450,6 +451,158 @@ pub(crate) fn collect_bind_tracking(expr: &Expr, tracking: &mut BindTracking) {
         }
         _ => {}
     }
+}
+
+/// Collect `(alias → fields)` referenced by an expression, plus unqualified
+/// plain fields. Public wrapper over the internal [`collect_bind_tracking`].
+pub fn expr_field_refs(expr: &Expr) -> (HashMap<String, HashSet<String>>, HashSet<String>) {
+    let mut t = BindTracking::default();
+    collect_bind_tracking(expr, &mut t);
+    (t.fields, t.plain_fields)
+}
+
+fn field_selector_name(fsel: &FieldSelector) -> Option<String> {
+    match fsel {
+        FieldSelector::Dot(n) | FieldSelector::Bracket(n) => Some(n.clone()),
+    }
+}
+
+/// Whether an expression contains a `stat.*` function call other than plain
+/// `count`. Such calls may read fields the bind tracking does not record.
+fn expr_has_stat_func(expr: &Expr) -> bool {
+    match expr {
+        Expr::FuncCall { qualifier, name, args } => {
+            if qualifier.as_deref() == Some("stat") && name != "count" {
+                return true;
+            }
+            args.iter().any(expr_has_stat_func)
+        }
+        Expr::BinOp { left, right, .. } => {
+            expr_has_stat_func(left) || expr_has_stat_func(right)
+        }
+        Expr::Neg(inner) => expr_has_stat_func(inner),
+        Expr::InList { expr, list, .. } => {
+            expr_has_stat_func(expr) || list.iter().any(expr_has_stat_func)
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_has_stat_func(cond)
+                || expr_has_stat_func(then_expr)
+                || expr_has_stat_func(else_expr)
+        }
+        Expr::Object(items) => items.iter().any(|i| expr_has_stat_func(&i.value)),
+        Expr::Array(items) => items.iter().any(expr_has_stat_func),
+        _ => false,
+    }
+}
+
+/// Collect the event fields a rule reads, keyed by bound window.
+///
+/// The engine uses this to avoid materializing unreferenced *structured*
+/// (object/array) fields when converting a window batch into per-rule events:
+/// a large `object` field a rule never reads is the dominant per-event
+/// allocation on high-volume windows (wp-reactor#19).
+///
+/// Returns `None` for rules using features not enumerated conservatively
+/// (`on each` / joins / conv) — callers should then keep all fields.
+pub fn rule_keep_fields(plan: &RulePlan) -> Option<HashMap<String, HashSet<String>>> {
+    if plan.each_plan.is_some() || !plan.joins.is_empty() || plan.conv_plan.is_some() {
+        return None;
+    }
+    // `stat.*` functions other than plain `count` can read fields the bind
+    // tracking does not record (e.g. `stat.collect_set(window_event(c).tags)`),
+    // so a filtered event would drop them. Be conservative: keep all fields.
+    if expr_has_stat_func(&plan.score_plan.expr)
+        || plan.yield_plan.fields.iter().any(|f| expr_has_stat_func(&f.value))
+    {
+        return None;
+    }
+    let mut keep: HashMap<String, HashSet<String>> = HashMap::new();
+    let window_of: HashMap<&str, &str> = plan
+        .binds
+        .iter()
+        .map(|b| (b.alias.as_str(), b.window.as_str()))
+        .collect();
+
+    // Fields referenced in score / entity / yield (per alias).
+    for (alias, fields) in &plan.match_plan.tracked_bind_fields {
+        if let Some(w) = window_of.get(alias.as_str()) {
+            keep.entry(w.to_string()).or_default().extend(fields.iter().cloned());
+        }
+    }
+    // Bind filters (event guards).
+    for bind in &plan.binds {
+        let entry = keep.entry(bind.window.clone()).or_default();
+        if let Some(filter) = &bind.filter {
+            let (fields, plain) = expr_field_refs(filter);
+            if let Some(fs) = fields.get(&bind.alias) {
+                entry.extend(fs.iter().cloned());
+            }
+            entry.extend(plain.iter().cloned());
+        }
+    }
+    // Match / close / seq step branches: field selector + guard.
+    let walk_branch = |keep: &mut HashMap<String, HashSet<String>>, branch: &BranchPlan| {
+        let Some(w) = window_of.get(branch.source.as_str()) else {
+            return;
+        };
+        let entry = keep.entry(w.to_string()).or_default();
+        if let Some(fsel) = &branch.field {
+            if let Some(f) = field_selector_name(fsel) {
+                entry.insert(f);
+            }
+        }
+        if let Some(guard) = &branch.guard {
+            let (fields, plain) = expr_field_refs(guard);
+            if let Some(fs) = fields.get(&branch.source) {
+                entry.extend(fs.iter().cloned());
+            }
+            entry.extend(plain.iter().cloned());
+        }
+    };
+    for step in &plan.match_plan.event_steps {
+        for branch in &step.branches {
+            walk_branch(&mut keep, branch);
+        }
+    }
+    for step in &plan.match_plan.close_steps {
+        for branch in &step.branches {
+            walk_branch(&mut keep, branch);
+        }
+    }
+    if let Some(seq) = &plan.match_plan.seq {
+        for step in &seq.steps {
+            walk_branch(&mut keep, &step.branch);
+        }
+    }
+    // Match keys.
+    for key in &plan.match_plan.keys {
+        match key {
+            FieldRef::Qualified(a, f) | FieldRef::Bracketed(a, f) => {
+                if let Some(w) = window_of.get(a.as_str()) {
+                    keep.entry(w.to_string()).or_default().insert(f.clone());
+                }
+            }
+            FieldRef::Path { alias, segments } => {
+                if let Some(w) = window_of.get(alias.as_str())
+                    && let Some(PathSegment::Field(root)) = segments.first()
+                {
+                    keep.entry(w.to_string()).or_default().insert(root.clone());
+                }
+            }
+            FieldRef::Simple(_) => {}
+        }
+    }
+    // Unqualified tracked fields apply to every window conservatively.
+    if !plan.match_plan.tracked_plain_fields.is_empty() {
+        for entry in keep.values_mut() {
+            entry.extend(plan.match_plan.tracked_plain_fields.iter().cloned());
+        }
+    }
+    Some(keep)
 }
 
 fn collect_stat_bind_tracking(name: &str, args: &[Expr], tracking: &mut BindTracking) {
