@@ -23,7 +23,7 @@ pub(crate) use conv::apply_conv;
 pub(crate) use eval::eval_expr_ext;
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use wf_lang::ast::CloseMode;
 use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, WindowSpec};
@@ -65,6 +65,10 @@ pub struct CepStateMachine {
     /// Stale candidates are filtered out when popped by checking the current
     /// instance state in `self.instances`.
     expiry_heap: BinaryHeap<Reverse<(i64, InstanceKey)>>,
+    /// Keys with a pending expiry candidate. Prevents per-event/reset
+    /// `push_expiry_candidate` from stacking duplicate heap entries (the
+    /// dominant leak on high-fire rules like pass-through count).
+    pending_expiry: HashSet<InstanceKey>,
     /// Cached estimated memory across active instances.
     ///
     /// This keeps `limits.max_memory` checks O(1) for the common path instead
@@ -85,6 +89,7 @@ impl CepStateMachine {
             rule_name,
             plan,
             instances: HashMap::new(),
+            pending_expiry: HashSet::new(),
             time_field,
             watermark_nanos: 0,
             limits: None,
@@ -112,6 +117,7 @@ impl CepStateMachine {
             rule_name,
             plan,
             instances: HashMap::new(),
+            pending_expiry: HashSet::new(),
             time_field,
             watermark_nanos: 0,
             limits,
@@ -800,6 +806,7 @@ impl CepStateMachine {
                 break;
             }
             self.expiry_heap.pop();
+            self.pending_expiry.remove(&key);
 
             let current_expire = match self.instances.get(&key) {
                 Some(instance) => Self::expire_time_for(&self.plan.window_spec, instance),
@@ -809,6 +816,7 @@ impl CepStateMachine {
             if current_expire > watermark_nanos {
                 // Session windows refresh expiry as events arrive. Re-queue
                 // this key with the up-to-date expiry and continue.
+                self.pending_expiry.insert(key.clone());
                 self.expiry_heap.push(Reverse((current_expire, key)));
                 continue;
             }
@@ -885,6 +893,7 @@ impl CepStateMachine {
             }
         }
         self.expiry_heap.clear();
+        self.pending_expiry.clear();
         results
     }
 
@@ -931,6 +940,13 @@ impl CepStateMachine {
         }
     }
     fn push_expiry_candidate(&mut self, key: &InstanceKey, created_at: i64) {
+        // Only schedule one pending candidate per key. Per-event/reset pushes
+        // (high-fire rules) would otherwise stack duplicate heap entries that
+        // never get deduplicated — the dominant memory leak on pass-through
+        // rules (wp-reactor leak investigation).
+        if !self.pending_expiry.insert(key.clone()) {
+            return;
+        }
         let expire_time = match self.plan.window_spec {
             WindowSpec::Sliding(d) | WindowSpec::Fixed(d) | WindowSpec::Session(d) => {
                 created_at + d.as_nanos() as i64
