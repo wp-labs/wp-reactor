@@ -18,7 +18,7 @@ impl RedisBackend {
 
     pub(crate) fn call_value(&self, service: &str, arg: &str) -> Result<Option<Value>, String> {
         wp_knowledge::facade::external_value(service, arg)
-            .map(|v| v.map(Value::Str))
+            .map(|v| v.map(|s| Value::Str(s.into())))
             .map_err(|e| format!("external_value '{}': {}", service, e))
     }
 }

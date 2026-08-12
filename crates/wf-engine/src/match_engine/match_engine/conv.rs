@@ -97,7 +97,7 @@ fn build_eval_context(output: &CloseOutput, keys: &[FieldRef]) -> Event {
     for (i, key) in keys.iter().enumerate() {
         if let Some(val) = output.scope_key.get(i) {
             let name = field_ref_name(key).to_string();
-            fields.insert(name, val.clone());
+            fields.insert(name.into(), val.clone());
         }
     }
 
@@ -108,7 +108,7 @@ fn build_eval_context(output: &CloseOutput, keys: &[FieldRef]) -> Event {
         .chain(output.close_step_data.iter())
     {
         if let Some(ref label) = step.label {
-            fields.insert(label.clone(), Value::Number(step.measure_value));
+            fields.insert(label.clone().into(), Value::Number(step.measure_value));
         }
     }
 

@@ -230,8 +230,8 @@ fn annotate_close_step_stages(mut ctx: Event, event_step_count: usize) -> Event 
             "close"
         };
         ctx.fields.insert(
-            format!("_step_{}_stage", step_idx),
-            crate::match_engine::match_engine::Value::Str(stage.to_string()),
+            format!("_step_{}_stage", step_idx).into(),
+            crate::match_engine::match_engine::Value::Str(stage.into()),
         );
     }
     ctx

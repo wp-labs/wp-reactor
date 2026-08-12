@@ -194,7 +194,10 @@ pub(super) fn collect_event_fields(
         }
     } else {
         for (field_name, value) in &event.fields {
-            let values = bs.field_values_mut().entry(field_name.clone()).or_default();
+            let values = bs
+                .field_values_mut()
+                .entry(field_name.to_string())
+                .or_default();
             push_capped(values, value.clone());
         }
     }
@@ -248,7 +251,7 @@ pub(super) fn collect_alias_event(
     alias_state.count += 1;
     if let Some(fields) = tracked_fields {
         for field_name in fields {
-            if let Some(value) = event.fields.get(field_name) {
+            if let Some(value) = event.fields.get(field_name.as_str()) {
                 let values = alias_state
                     .field_values_mut()
                     .entry(field_name.clone())
@@ -260,7 +263,7 @@ pub(super) fn collect_alias_event(
         for (field_name, value) in &event.fields {
             let values = alias_state
                 .field_values_mut()
-                .entry(field_name.clone())
+                .entry(field_name.to_string())
                 .or_default();
             push_capped(values, value.clone());
         }
@@ -274,7 +277,7 @@ pub(super) fn collect_alias_event(
 pub(super) fn extract_branch_field(event: &Event, field: &Option<FieldSelector>) -> Option<Value> {
     match field {
         Some(FieldSelector::Dot(name)) | Some(FieldSelector::Bracket(name)) => {
-            event.fields.get(name).cloned()
+            event.fields.get(name.as_str()).cloned()
         }
         Some(_) => None,
         None => None,
@@ -522,7 +525,7 @@ mod tests {
 
     fn event_with(field: &str, value: i64) -> Event {
         let mut fields = std::collections::HashMap::new();
-        fields.insert(field.to_string(), Value::Number(value as f64));
+        fields.insert(field.to_string().into(), Value::Number(value as f64));
         Event { fields }
     }
 
@@ -591,8 +594,8 @@ mod tests {
     fn collect_alias_event_tracks_only_requested_fields() {
         let mut state = AliasState::new();
         let mut fields = std::collections::HashMap::new();
-        fields.insert("sip".to_string(), Value::Str("10.0.0.1".to_string()));
-        fields.insert("dport".to_string(), Value::Number(443.0));
+        fields.insert("sip".into(), Value::Str("10.0.0.1".into()));
+        fields.insert("dport".into(), Value::Number(443.0));
         let event = Event { fields };
         let tracked = HashSet::from(["sip".to_string()]);
 
@@ -607,9 +610,9 @@ mod tests {
     fn collect_event_fields_tracks_requested_fields_and_branch_field() {
         let mut bs = BranchState::new();
         let mut fields = std::collections::HashMap::new();
-        fields.insert("sip".to_string(), Value::Str("10.0.0.1".to_string()));
-        fields.insert("dport".to_string(), Value::Number(443.0));
-        fields.insert("bytes".to_string(), Value::Number(100.0));
+        fields.insert("sip".into(), Value::Str("10.0.0.1".into()));
+        fields.insert("dport".into(), Value::Number(443.0));
+        fields.insert("bytes".into(), Value::Number(100.0));
         let event = Event { fields };
         let tracked = HashSet::from(["sip".to_string()]);
         let branch_field = FieldSelector::Dot("dport".to_string());
@@ -631,8 +634,8 @@ mod tests {
     fn collect_event_fields_tracks_plain_fields() {
         let mut bs = BranchState::new();
         let mut fields = std::collections::HashMap::new();
-        fields.insert("sip".to_string(), Value::Str("10.0.0.1".to_string()));
-        fields.insert("dport".to_string(), Value::Number(443.0));
+        fields.insert("sip".into(), Value::Str("10.0.0.1".into()));
+        fields.insert("dport".into(), Value::Number(443.0));
         let event = Event { fields };
         let tracked_alias_fields = HashSet::from(["sip".to_string()]);
         let tracked_plain_fields = HashSet::from(["dport".to_string()]);
@@ -677,7 +680,7 @@ mod tests {
         ));
         assert!(apply_transforms(
             &[Transform::Distinct],
-            &Some(Value::Str("1".to_string())),
+            &Some(Value::Str("1".into())),
             &mut bs
         ));
         assert!(!apply_transforms(

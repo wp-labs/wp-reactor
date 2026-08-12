@@ -14,6 +14,12 @@ use crate::metrics::RuntimeMetrics;
 /// than buffering infinitely.
 pub const ALERT_CHANNEL_CAPACITY: usize = 2048;
 
+/// Number of parallel alert consumer tasks. Each consumer owns its own bounded
+/// channel; rule tasks round-robin their emits across all senders so the
+/// per-alert output work (record conversion + dispatch) parallelizes across
+/// cores instead of being capped by a single consumer.
+pub const ALERT_CONSUMERS: usize = 2;
+
 /// Consume alert records from the channel and route them via the connector-based
 /// `SinkDispatcher`.
 ///

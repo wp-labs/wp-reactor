@@ -74,12 +74,12 @@ fn if_then_else_with_field_condition() {
     };
 
     let mut fields = HashMap::new();
-    fields.insert("action".to_string(), Value::Str("failed".to_string()));
+    fields.insert("action".into(), Value::Str("failed".into()));
     let event = Event { fields };
     assert_eq!(eval_expr(&expr, &event), Some(Value::Number(80.0)));
 
     let mut fields2 = HashMap::new();
-    fields2.insert("action".to_string(), Value::Str("success".to_string()));
+    fields2.insert("action".into(), Value::Str("success".into()));
     let event2 = Event { fields: fields2 };
     assert_eq!(eval_expr(&expr, &event2), Some(Value::Number(40.0)));
 }
@@ -101,7 +101,7 @@ fn regex_match_matches() {
         ],
     };
     let mut fields = HashMap::new();
-    fields.insert("action".to_string(), Value::Str("failed_login".to_string()));
+    fields.insert("action".into(), Value::Str("failed_login".into()));
     let event = Event { fields };
     assert_eq!(eval_expr(&expr, &event), Some(Value::Bool(true)));
 }
@@ -119,7 +119,7 @@ fn regex_match_no_match() {
         ],
     };
     let mut fields = HashMap::new();
-    fields.insert("action".to_string(), Value::Str("failed".to_string()));
+    fields.insert("action".into(), Value::Str("failed".into()));
     let event = Event { fields };
     assert_eq!(eval_expr(&expr, &event), Some(Value::Bool(false)));
 }
@@ -142,8 +142,8 @@ fn time_diff_returns_seconds() {
     };
     let mut fields = HashMap::new();
     // 5 seconds apart in epoch milliseconds.
-    fields.insert("t1".to_string(), Value::Number(1_700_000_005_000.0));
-    fields.insert("t2".to_string(), Value::Number(1_700_000_000_000.0));
+    fields.insert("t1".into(), Value::Number(1_700_000_005_000.0));
+    fields.insert("t2".into(), Value::Number(1_700_000_000_000.0));
     let event = Event { fields };
     let result = eval_expr(&expr, &event);
     assert_eq!(result, Some(Value::Number(5.0)));
@@ -163,8 +163,8 @@ fn time_diff_absolute_value() {
     };
     let mut fields = HashMap::new();
     // Reversed order: t1 < t2.
-    fields.insert("t1".to_string(), Value::Number(1_700_000_000_000.0));
-    fields.insert("t2".to_string(), Value::Number(1_700_000_005_000.0));
+    fields.insert("t1".into(), Value::Number(1_700_000_000_000.0));
+    fields.insert("t2".into(), Value::Number(1_700_000_005_000.0));
     let event = Event { fields };
     let result = eval_expr(&expr, &event);
     assert_eq!(result, Some(Value::Number(5.0)));
@@ -188,7 +188,7 @@ fn time_bucket_floors_to_interval() {
     };
     let mut fields = HashMap::new();
     // 75 seconds after an epoch millisecond timestamp.
-    fields.insert("ts".to_string(), Value::Number(1_700_000_075_000.0));
+    fields.insert("ts".into(), Value::Number(1_700_000_075_000.0));
     let event = Event { fields };
     let result = eval_expr(&expr, &event);
     assert_eq!(result, Some(Value::Number(1_700_000_040_000.0)));
@@ -208,7 +208,7 @@ fn time_bucket_exact_boundary() {
     };
     let mut fields = HashMap::new();
     // Exact 5-minute bucket boundary in epoch milliseconds.
-    fields.insert("ts".to_string(), Value::Number(1_700_000_100_000.0));
+    fields.insert("ts".into(), Value::Number(1_700_000_100_000.0));
     let event = Event { fields };
     let result = eval_expr(&expr, &event);
     assert_eq!(result, Some(Value::Number(1_700_000_100_000.0)));
@@ -240,19 +240,19 @@ fn math_functions_work() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
     let mut fields = HashMap::new();
-    fields.insert("n".to_string(), Value::Number(-12.345));
-    fields.insert("p".to_string(), Value::Number(16.0));
-    fields.insert("ts".to_string(), Value::Number(0.0));
+    fields.insert("n".into(), Value::Number(-12.345));
+    fields.insert("p".into(), Value::Number(16.0));
+    fields.insert("ts".into(), Value::Number(0.0));
     fields.insert(
-        "msg".to_string(),
-        Value::Str("  failed_login_root  ".to_string()),
+        "msg".into(),
+        Value::Str("  failed_login_root  ".into()),
     );
     fields.insert(
-        "arr".to_string(),
+        "arr".into(),
         Value::Array(vec![
-            Value::Str("b".to_string()),
-            Value::Str("a".to_string()),
-            Value::Str("c".to_string()),
+            Value::Str("b".into()),
+            Value::Str("a".into()),
+            Value::Str("c".into()),
         ]),
     );
     let event = Event { fields };
@@ -416,7 +416,7 @@ fn math_functions_work() {
     assert_eq!(eval_expr(&round_expr, &event), Some(Value::Number(-12.35)));
     assert_eq!(
         eval_expr(&fmt_expr, &event),
-        Some(Value::Str("1970-01-01".to_string()))
+        Some(Value::Str("1970-01-01".into()))
     );
     assert_eq!(eval_expr(&sqrt_expr, &event), Some(Value::Number(4.0)));
     assert_eq!(eval_expr(&pow_expr, &event), Some(Value::Number(256.0)));
@@ -431,43 +431,43 @@ fn math_functions_work() {
     assert_eq!(eval_expr(&finite_expr, &event), Some(Value::Bool(true)));
     assert_eq!(
         eval_expr(&ltrim_expr, &event),
-        Some(Value::Str("failed_login_root  ".to_string()))
+        Some(Value::Str("failed_login_root  ".into()))
     );
     assert_eq!(
         eval_expr(&rtrim_expr, &event),
-        Some(Value::Str("  failed_login_root".to_string()))
+        Some(Value::Str("  failed_login_root".into()))
     );
     assert_eq!(
         eval_expr(&concat_expr, &event),
-        Some(Value::Str("ip=1.1.1.1".to_string()))
+        Some(Value::Str("ip=1.1.1.1".into()))
     );
     assert_eq!(eval_expr(&index_expr, &event), Some(Value::Number(9.0)));
     assert_eq!(
         eval_expr(&replace_plain_expr, &event),
-        Some(Value::Str("  failed-login-root  ".to_string()))
+        Some(Value::Str("  failed-login-root  ".into()))
     );
     assert_eq!(eval_expr(&sw_any_expr, &event), Some(Value::Bool(true)));
     assert_eq!(eval_expr(&ew_any_expr, &event), Some(Value::Bool(true)));
     assert_eq!(
         eval_expr(&coalesce_expr, &event),
-        Some(Value::Str("fallback".to_string()))
+        Some(Value::Str("fallback".into()))
     );
     assert_eq!(eval_expr(&isnull_expr, &event), Some(Value::Bool(true)));
     assert_eq!(eval_expr(&isnotnull_expr, &event), Some(Value::Bool(true)));
     assert_eq!(
         eval_expr(&mvsort_expr, &event),
         Some(Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
-            Value::Str("c".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str("c".into()),
         ]))
     );
     assert_eq!(
         eval_expr(&mvreverse_expr, &event),
         Some(Value::Array(vec![
-            Value::Str("c".to_string()),
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
+            Value::Str("c".into()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
         ]))
     );
 }
@@ -572,11 +572,11 @@ fn blank_functions_work() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
     let mut fields = HashMap::new();
-    fields.insert("empty".to_string(), Value::Str(String::new()));
-    fields.insert("spaces".to_string(), Value::Str(" \t\n ".to_string()));
-    fields.insert("host".to_string(), Value::Str("example.org".to_string()));
-    fields.insert("fallback".to_string(), Value::Str("fallback".to_string()));
-    fields.insert("n".to_string(), Value::Number(42.0));
+    fields.insert("empty".into(), Value::Str(String::new().into()));
+    fields.insert("spaces".into(), Value::Str(" \t\n ".into()));
+    fields.insert("host".into(), Value::Str("example.org".into()));
+    fields.insert("fallback".into(), Value::Str("fallback".into()));
+    fields.insert("n".into(), Value::Number(42.0));
     let event = Event { fields };
 
     let is_empty_expr = Expr::FuncCall {
@@ -663,23 +663,23 @@ fn blank_functions_work() {
     assert_eq!(eval_expr(&null_if_blank_expr, &event), None);
     assert_eq!(
         eval_expr(&null_if_host_expr, &event),
-        Some(Value::Str("example.org".to_string()))
+        Some(Value::Str("example.org".into()))
     );
     assert_eq!(
         eval_expr(&default_blank_expr, &event),
-        Some(Value::Str("fallback".to_string()))
+        Some(Value::Str("fallback".into()))
     );
     assert_eq!(
         eval_expr(&default_host_expr, &event),
-        Some(Value::Str("example.org".to_string()))
+        Some(Value::Str("example.org".into()))
     );
     assert_eq!(
         eval_expr(&coalesce_blank_expr, &event),
-        Some(Value::Str("fallback".to_string()))
+        Some(Value::Str("fallback".into()))
     );
     assert_eq!(
         eval_expr(&coalesce_direct_blank_expr, &event),
-        Some(Value::Str("example.org".to_string()))
+        Some(Value::Str("example.org".into()))
     );
     assert_eq!(eval_expr(&coalesce_all_blank_expr, &event), None);
     assert_eq!(eval_expr(&invalid_type_expr, &event), None);
@@ -690,11 +690,11 @@ fn merge_shallow_merges_objects_in_l2_eval() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
     let mut base = HashMap::new();
-    base.insert("severity".to_string(), Value::Number(3.0));
-    base.insert("rule".to_string(), Value::Str("webshell".to_string()));
+    base.insert("severity".into(), Value::Number(3.0));
+    base.insert("rule".into(), Value::Str("webshell".into()));
 
     let mut fields = HashMap::new();
-    fields.insert("extension".to_string(), Value::Object(base));
+    fields.insert("extension".into(), Value::Object(base));
     let event = Event { fields };
 
     let expr = Expr::FuncCall {
@@ -722,9 +722,9 @@ fn merge_shallow_merges_objects_in_l2_eval() {
     };
     assert_eq!(
         object.get("rule"),
-        Some(&Value::Str("webshell".to_string()))
+        Some(&Value::Str("webshell".into()))
     );
-    assert_eq!(object.get("source"), Some(&Value::Str("wfl".to_string())));
+    assert_eq!(object.get("source"), Some(&Value::Str("wfl".into())));
     assert_eq!(object.get("severity"), Some(&Value::Number(10.0)));
 }
 
@@ -778,7 +778,7 @@ fn merge_treats_missing_field_arg_as_empty_object_in_l2_eval() {
     let Some(Value::Object(object)) = eval_expr(&expr, &event) else {
         panic!("expected object");
     };
-    assert_eq!(object.get("source"), Some(&Value::Str("wfl".to_string())));
+    assert_eq!(object.get("source"), Some(&Value::Str("wfl".into())));
 }
 
 #[test]
@@ -786,12 +786,12 @@ fn hash_and_id_functions_work() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
     let mut fields = HashMap::new();
-    fields.insert("msg".to_string(), Value::Str("hello".to_string()));
-    fields.insert("empty".to_string(), Value::Str(String::new()));
-    fields.insert("ip".to_string(), Value::Str("10.0.0.1".to_string()));
-    fields.insert("count".to_string(), Value::Number(3.0));
-    fields.insert("special".to_string(), Value::Str("a|b".to_string()));
-    fields.insert("percent".to_string(), Value::Str("10%".to_string()));
+    fields.insert("msg".into(), Value::Str("hello".into()));
+    fields.insert("empty".into(), Value::Str(String::new().into()));
+    fields.insert("ip".into(), Value::Str("10.0.0.1".into()));
+    fields.insert("count".into(), Value::Number(3.0));
+    fields.insert("special".into(), Value::Str("a|b".into()));
+    fields.insert("percent".into(), Value::Str("10%".into()));
     let event = Event { fields };
 
     let md5_expr = Expr::FuncCall {
@@ -945,51 +945,51 @@ fn hash_and_id_functions_work() {
 
     assert_eq!(
         eval_expr(&md5_expr, &event),
-        Some(Value::Str("5d41402abc4b2a76b9719d911017c592".to_string()))
+        Some(Value::Str("5d41402abc4b2a76b9719d911017c592".into()))
     );
     assert_eq!(
         eval_expr(&sha1_expr, &event),
         Some(Value::Str(
-            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string()
+            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".into()
         ))
     );
     assert_eq!(
         eval_expr(&sha1_n_expr, &event),
-        Some(Value::Str("aaf4c61d".to_string()))
+        Some(Value::Str("aaf4c61d".into()))
     );
     assert_eq!(
         eval_expr(&sha1_n_empty_expr, &event),
-        Some(Value::Str("da39a3ee".to_string()))
+        Some(Value::Str("da39a3ee".into()))
     );
     assert_eq!(
         eval_expr(&sha256_expr, &event),
         Some(Value::Str(
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string()
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into()
         ))
     );
     assert_eq!(
         eval_expr(&hex_expr, &event),
-        Some(Value::Str("68656c6c6f".to_string()))
+        Some(Value::Str("68656c6c6f".into()))
     );
     assert_eq!(
         eval_expr(&short_expr, &event),
-        Some(Value::Str("2cf24dba5fb0a30e".to_string()))
+        Some(Value::Str("2cf24dba5fb0a30e".into()))
     );
     assert_eq!(
         eval_expr(&join_expr, &event),
-        Some(Value::Str("a|b10%3".to_string()))
+        Some(Value::Str("a|b10%3".into()))
     );
     assert_eq!(
         eval_expr(&join_by_expr, &event),
-        Some(Value::Str("a|b|10%||3".to_string()))
+        Some(Value::Str("a|b|10%||3".into()))
     );
     assert_eq!(
         eval_expr(&join_missing_expr, &event),
-        Some(Value::Str("a|b10%".to_string()))
+        Some(Value::Str("a|b10%".into()))
     );
     assert_eq!(
         eval_expr(&join_by_missing_expr, &event),
-        Some(Value::Str("a|b||10%".to_string()))
+        Some(Value::Str("a|b||10%".into()))
     );
     assert_eq!(eval_expr(&join_array_expr, &event), None);
     assert_eq!(eval_expr(&join_by_object_expr, &event), None);
@@ -1001,7 +1001,7 @@ fn hash_and_id_functions_work() {
     assert_eq!(stable_id, "alert_ba0dab7ccfb2a04c");
     assert_eq!(
         eval_expr(&stable_expr, &event),
-        Some(Value::Str(stable_id.clone()))
+        Some(Value::Str(stable_id.clone().into()))
     );
     let Some(Value::Str(changed_stable_id)) = eval_expr(&stable_changed_expr, &event) else {
         panic!("stable_id() should return a string for changed input");
@@ -1040,11 +1040,11 @@ fn stable_id_uses_unambiguous_segments() {
 
     assert_eq!(
         eval_expr(&first_expr, &event),
-        Some(Value::Str("id_234c47ae916c73b0".to_string()))
+        Some(Value::Str("id_234c47ae916c73b0".into()))
     );
     assert_eq!(
         eval_expr(&second_expr, &event),
-        Some(Value::Str("id_1532803f7ab9f6de".to_string()))
+        Some(Value::Str("id_1532803f7ab9f6de".into()))
     );
     assert_ne!(
         eval_expr(&first_expr, &event),
@@ -1109,11 +1109,11 @@ fn replace_regex_substitution() {
         ],
     };
     let mut fields = HashMap::new();
-    fields.insert("action".to_string(), Value::Str("failed_login".to_string()));
+    fields.insert("action".into(), Value::Str("failed_login".into()));
     let event = Event { fields };
     assert_eq!(
         eval_expr(&expr, &event),
-        Some(Value::Str("blocked".to_string()))
+        Some(Value::Str("blocked".into()))
     );
 }
 
@@ -1139,8 +1139,8 @@ fn startswith_and_endswith_work() {
     };
     let mut fields = HashMap::new();
     fields.insert(
-        "msg".to_string(),
-        Value::Str("failed_login_root".to_string()),
+        "msg".into(),
+        Value::Str("failed_login_root".into()),
     );
     let event = Event { fields };
     assert_eq!(eval_expr(&starts, &event), Some(Value::Bool(true)));
@@ -1152,7 +1152,7 @@ fn substr_supports_one_based_and_negative_start() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
     let mut fields = HashMap::new();
-    fields.insert("msg".to_string(), Value::Str("abcdef".to_string()));
+    fields.insert("msg".into(), Value::Str("abcdef".into()));
     let event = Event { fields };
 
     let one_based = Expr::FuncCall {
@@ -1166,7 +1166,7 @@ fn substr_supports_one_based_and_negative_start() {
     };
     assert_eq!(
         eval_expr(&one_based, &event),
-        Some(Value::Str("bcd".to_string()))
+        Some(Value::Str("bcd".into()))
     );
 
     let negative = Expr::FuncCall {
@@ -1179,7 +1179,7 @@ fn substr_supports_one_based_and_negative_start() {
     };
     assert_eq!(
         eval_expr(&negative, &event),
-        Some(Value::Str("ef".to_string()))
+        Some(Value::Str("ef".into()))
     );
 }
 
@@ -1193,11 +1193,11 @@ fn trim_removes_surrounding_whitespace() {
         args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
     };
     let mut fields = HashMap::new();
-    fields.insert("msg".to_string(), Value::Str("  hello\t".to_string()));
+    fields.insert("msg".into(), Value::Str("  hello\t".into()));
     let event = Event { fields };
     assert_eq!(
         eval_expr(&expr, &event),
-        Some(Value::Str("hello".to_string()))
+        Some(Value::Str("hello".into()))
     );
 }
 
@@ -1212,11 +1212,11 @@ fn mvcount_array_returns_length() {
     };
     let mut fields = HashMap::new();
     fields.insert(
-        "vals".to_string(),
+        "vals".into(),
         Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
-            Value::Str("c".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str("c".into()),
         ]),
     );
     let event = Event { fields };
@@ -1237,17 +1237,17 @@ fn mvjoin_array_with_separator() {
     };
     let mut fields = HashMap::new();
     fields.insert(
-        "vals".to_string(),
+        "vals".into(),
         Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
-            Value::Str("c".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str("c".into()),
         ]),
     );
     let event = Event { fields };
     assert_eq!(
         eval_expr(&expr, &event),
-        Some(Value::Str("a|b|c".to_string()))
+        Some(Value::Str("a|b|c".into()))
     );
 }
 
@@ -1257,12 +1257,12 @@ fn mvindex_single_and_range() {
 
     let mut fields = HashMap::new();
     fields.insert(
-        "vals".to_string(),
+        "vals".into(),
         Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
-            Value::Str("c".to_string()),
-            Value::Str("d".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str("c".into()),
+            Value::Str("d".into()),
         ]),
     );
     let event = Event { fields };
@@ -1277,7 +1277,7 @@ fn mvindex_single_and_range() {
     };
     assert_eq!(
         eval_expr(&single, &event),
-        Some(Value::Str("d".to_string()))
+        Some(Value::Str("d".into()))
     );
 
     let range = Expr::FuncCall {
@@ -1292,8 +1292,8 @@ fn mvindex_single_and_range() {
     assert_eq!(
         eval_expr(&range, &event),
         Some(Value::Array(vec![
-            Value::Str("b".to_string()),
-            Value::Str("c".to_string()),
+            Value::Str("b".into()),
+            Value::Str("c".into()),
         ]))
     );
 }
@@ -1304,10 +1304,10 @@ fn mvappend_flattens_arrays_and_scalars() {
 
     let mut fields = HashMap::new();
     fields.insert(
-        "vals".to_string(),
+        "vals".into(),
         Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
         ]),
     );
     let event = Event { fields };
@@ -1330,11 +1330,11 @@ fn mvappend_flattens_arrays_and_scalars() {
     assert_eq!(
         eval_expr(&expr, &event),
         Some(Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
-            Value::Str("c".to_string()),
-            Value::Str("d".to_string()),
-            Value::Str("e".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str("c".into()),
+            Value::Str("d".into()),
+            Value::Str("e".into()),
         ]))
     );
 }
@@ -1352,15 +1352,15 @@ fn split_text_to_array() {
         ],
     };
     let mut fields = HashMap::new();
-    fields.insert("csv".to_string(), Value::Str("a,b,,c".to_string()));
+    fields.insert("csv".into(), Value::Str("a,b,,c".into()));
     let event = Event { fields };
     assert_eq!(
         eval_expr(&expr, &event),
         Some(Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
-            Value::Str(String::new()),
-            Value::Str("c".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str(String::new().into()),
+            Value::Str("c".into()),
         ]))
     );
 }
@@ -1376,22 +1376,22 @@ fn mvdedup_removes_duplicates_keep_order() {
     };
     let mut fields = HashMap::new();
     fields.insert(
-        "vals".to_string(),
+        "vals".into(),
         Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
-            Value::Str("a".to_string()),
-            Value::Str("c".to_string()),
-            Value::Str("b".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str("a".into()),
+            Value::Str("c".into()),
+            Value::Str("b".into()),
         ]),
     );
     let event = Event { fields };
     assert_eq!(
         eval_expr(&expr, &event),
         Some(Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
-            Value::Str("c".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str("c".into()),
         ]))
     );
 }
@@ -1436,13 +1436,13 @@ fn external_func_call_dispatches_to_handler() {
     };
 
     // weak password -> handler returns true
-    let hit = event(vec![("chars", Value::Str("welcome".to_string()))]);
+    let hit = event(vec![("chars", Value::Str("welcome".into()))]);
     assert_eq!(eval_expr(&expr, &hit), Some(Value::Bool(true)));
 
     // non-weak password -> handler returns false
     let miss = event(vec![(
         "chars",
-        Value::Str("not-a-weak-password".to_string()),
+        Value::Str("not-a-weak-password".into()),
     )]);
     assert_eq!(eval_expr(&expr, &miss), Some(Value::Bool(false)));
 }

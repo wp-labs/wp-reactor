@@ -136,7 +136,7 @@ fn conv_top_n() {
     let outputs: Vec<CloseOutput> = (0..5)
         .map(|i| {
             make_close_output(
-                vec![Value::Str(format!("ip{}", i))],
+                vec![Value::Str(format!("ip{}", i).into())],
                 vec![labeled_step("count", i as f64)],
                 vec![],
             )
@@ -236,7 +236,7 @@ fn conv_chain_pipeline_sort_top() {
     let outputs: Vec<CloseOutput> = (0..10)
         .map(|i| {
             make_close_output(
-                vec![Value::Str(format!("ip{}", i))],
+                vec![Value::Str(format!("ip{}", i).into())],
                 vec![labeled_step("score", i as f64)],
                 vec![],
             )
@@ -270,7 +270,7 @@ fn conv_multiple_chains_sequential() {
     let outputs: Vec<CloseOutput> = (0..5)
         .map(|i| {
             make_close_output(
-                vec![Value::Str(format!("ip{}", i))],
+                vec![Value::Str(format!("ip{}", i).into())],
                 vec![labeled_step("score", i as f64)],
                 vec![],
             )

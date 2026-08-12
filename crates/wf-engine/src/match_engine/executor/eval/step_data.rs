@@ -119,7 +119,7 @@ fn parse_step_field_index(key: &str, suffix: &str) -> Option<usize> {
 
 pub(super) fn get_step_values(ctx: &Event, step_idx: usize) -> Option<&[Value]> {
     let field_name = format!("_step_{}_values", step_idx);
-    match ctx.fields.get(&field_name) {
+    match ctx.fields.get(field_name.as_str()) {
         Some(Value::Array(arr)) => Some(arr.as_slice()),
         _ => None,
     }
@@ -131,7 +131,7 @@ pub(super) fn get_step_field_values<'a>(
     field_name: &str,
 ) -> Option<&'a [Value]> {
     let field_name = format!("_step_{}_field_{}", step_idx, field_name);
-    match ctx.fields.get(&field_name) {
+    match ctx.fields.get(field_name.as_str()) {
         Some(Value::Array(arr)) => Some(arr.as_slice()),
         _ => None,
     }
@@ -139,7 +139,7 @@ pub(super) fn get_step_field_values<'a>(
 
 pub(super) fn get_step_source(ctx: &Event, step_idx: usize) -> Option<&str> {
     let field_name = format!("_step_{}_source", step_idx);
-    match ctx.fields.get(&field_name) {
+    match ctx.fields.get(field_name.as_str()) {
         Some(Value::Str(s)) => Some(s.as_str()),
         _ => None,
     }
@@ -147,7 +147,7 @@ pub(super) fn get_step_source(ctx: &Event, step_idx: usize) -> Option<&str> {
 
 pub(super) fn get_step_label(ctx: &Event, step_idx: usize) -> Option<&str> {
     let field_name = format!("_step_{}_label", step_idx);
-    match ctx.fields.get(&field_name) {
+    match ctx.fields.get(field_name.as_str()) {
         Some(Value::Str(s)) => Some(s.as_str()),
         _ => None,
     }
@@ -155,7 +155,7 @@ pub(super) fn get_step_label(ctx: &Event, step_idx: usize) -> Option<&str> {
 
 pub(super) fn get_step_measure(ctx: &Event, step_idx: usize) -> Option<f64> {
     let field_name = format!("_step_{}_measure", step_idx);
-    match ctx.fields.get(&field_name) {
+    match ctx.fields.get(field_name.as_str()) {
         Some(Value::Number(n)) => Some(*n),
         _ => None,
     }
@@ -163,7 +163,7 @@ pub(super) fn get_step_measure(ctx: &Event, step_idx: usize) -> Option<f64> {
 
 pub(super) fn get_step_stage(ctx: &Event, step_idx: usize) -> Option<&str> {
     let field_name = format!("_step_{}_stage", step_idx);
-    match ctx.fields.get(&field_name) {
+    match ctx.fields.get(field_name.as_str()) {
         Some(Value::Str(s)) => Some(s.as_str()),
         _ => None,
     }
@@ -171,7 +171,7 @@ pub(super) fn get_step_stage(ctx: &Event, step_idx: usize) -> Option<&str> {
 
 pub(super) fn get_bind_count(ctx: &Event, alias: &str) -> Option<f64> {
     let field_name = format!("_bind_{}_count", alias);
-    match ctx.fields.get(&field_name) {
+    match ctx.fields.get(field_name.as_str()) {
         Some(Value::Number(n)) => Some(*n),
         _ => None,
     }
@@ -183,7 +183,7 @@ pub(super) fn get_bind_field_values<'a>(
     field_name: &str,
 ) -> Option<&'a [Value]> {
     let field_name = format!("_bind_{}_field_{}", alias, field_name);
-    match ctx.fields.get(&field_name) {
+    match ctx.fields.get(field_name.as_str()) {
         Some(Value::Array(arr)) => Some(arr.as_slice()),
         _ => None,
     }

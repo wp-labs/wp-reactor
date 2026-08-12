@@ -157,7 +157,7 @@ impl CepStateMachine {
     fn extract_event_time(&self, event: &Event) -> i64 {
         self.time_field
             .as_ref()
-            .and_then(|tf| event.fields.get(tf))
+            .and_then(|tf| event.fields.get(tf.as_str()))
             .and_then(|v| match v {
                 Value::Number(n) => Some(*n as i64),
                 _ => None,
@@ -183,7 +183,7 @@ impl CepStateMachine {
             .fields
             .get(field)
             .and_then(|v| match v {
-                Value::Str(s) => Some(s.clone()),
+                Value::Str(s) => Some(s.to_string()),
                 _ => None,
             })
             .unwrap_or_default()
@@ -281,17 +281,22 @@ impl CepStateMachine {
             }
         }
 
+        // New-instance base cost: reused for the max_memory check below and for
+        // O(1) per-instance accounting in insert/remove (exact state growth is
+        // corrected by periodic `recalibrate_memory`).
+        let new_base = if is_new && self.tracks_memory_bytes() {
+            Some(Instance::base_estimated_bytes(&self.plan, &scope_key, alias, event))
+        } else {
+            None
+        };
+
         // max_memory_bytes: total estimated memory across all instances.
         // Runs on every event to catch both new instance creation and
         // existing instance growth (e.g. distinct_set expansion).
         if let Some(ref limits) = self.limits
             && let Some(max_bytes) = limits.max_memory_bytes
         {
-            let new_cost = if is_new {
-                Instance::base_estimated_bytes(&self.plan, &scope_key, alias, event)
-            } else {
-                0
-            };
+            let new_cost = new_base.unwrap_or(0);
             let mut total = self.estimated_memory_bytes + new_cost;
             if total >= max_bytes {
                 match limits.on_exceed {
@@ -339,7 +344,9 @@ impl CepStateMachine {
         let mut instance = self.remove_instance(&instance_key).unwrap_or_else(|| {
             let created = fixed_created_at.unwrap_or(now_nanos);
             let machine_id = Self::extract_event_str(event, MACHINE_ID);
-            Instance::new_at(&self.plan, machine_id, created)
+            let mut inst = Instance::new_at(&self.plan, machine_id, created);
+            inst.base_cost = new_base.unwrap_or(0);
+            inst
         });
         let plan = &self.plan;
 
@@ -956,18 +963,56 @@ impl CepStateMachine {
     }
 
     fn insert_instance(&mut self, key: InstanceKey, instance: Instance) {
-        self.estimated_memory_bytes = self
-            .estimated_memory_bytes
-            .saturating_add(instance.estimated_bytes());
+        if self.tracks_memory_bytes() {
+            self.estimated_memory_bytes = self
+                .estimated_memory_bytes
+                .saturating_add(instance.base_cost);
+        }
         self.instances.insert(key, instance);
     }
 
     fn remove_instance(&mut self, key: &InstanceKey) -> Option<Instance> {
         let instance = self.instances.remove(key)?;
-        self.estimated_memory_bytes = self
-            .estimated_memory_bytes
-            .saturating_sub(instance.estimated_bytes());
+        if self.tracks_memory_bytes() {
+            self.estimated_memory_bytes = self
+                .estimated_memory_bytes
+                .saturating_sub(instance.base_cost);
+        }
         Some(instance)
+    }
+
+    /// Whether the per-instance memory accounting cache is needed.
+    ///
+    /// `estimated_memory_bytes` is only read when a `max_memory_bytes` limit is
+    /// configured; maintaining it otherwise is pure per-event overhead.
+    fn tracks_memory_bytes(&self) -> bool {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.max_memory_bytes)
+            .is_some()
+    }
+
+    /// Recompute the exact per-instance memory estimate across all active
+    /// instances.
+    ///
+    /// `insert/remove_instance` track only the fixed per-instance `base_cost`
+    /// (O(1)), so the running estimate drifts below true usage as instances
+    /// accumulate state (field_values, distinct_set, …). Calling this
+    /// periodically (e.g. per timeout scan) re-anchors it to the exact sum.
+    pub fn recalibrate_memory(&mut self) {
+        if !self.tracks_memory_bytes() {
+            return;
+        }
+        self.estimated_memory_bytes = self
+            .instances
+            .values()
+            .map(|instance| instance.estimated_bytes())
+            .sum();
+    }
+
+    #[cfg(test)]
+    pub fn estimated_memory_bytes_for_test(&self) -> usize {
+        self.estimated_memory_bytes
     }
 
     fn expire_time_for(window_spec: &WindowSpec, instance: &Instance) -> i64 {
@@ -1039,7 +1084,7 @@ mod tests {
         Event {
             fields: fields
                 .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
+                .map(|(k, v)| (k.into(), v))
                 .collect(),
         }
     }

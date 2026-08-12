@@ -33,7 +33,9 @@ pub(crate) struct RuleTaskConfig {
     pub each_time_field: Option<String>,
     pub executor: RuleExecutor,
     pub window_sources: Vec<WindowSource>,
-    pub alert_tx: mpsc::Sender<OutputRecord>,
+    /// All alert consumer senders; the rule task round-robins emits across them
+    /// so output processing is not capped by a single consumer task.
+    pub alert_txs: Vec<mpsc::Sender<OutputRecord>>,
     pub cancel: CancellationToken,
     pub timeout_scan_interval: Duration,
     /// Shared router for WindowLookup (joins + has()).

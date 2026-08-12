@@ -116,7 +116,7 @@ pub(crate) fn try_eval_expr_to_f64(expr: &Expr) -> Option<f64> {
 pub(crate) fn try_eval_expr_to_value(expr: &Expr) -> Option<Value> {
     match expr {
         Expr::Number(n) => Some(Value::Number(*n)),
-        Expr::StringLit(s) => Some(Value::Str(s.clone())),
+        Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
         Expr::Bool(b) => Some(Value::Bool(*b)),
         _ => try_eval_expr_to_f64(expr).map(Value::Number),
     }
@@ -230,7 +230,7 @@ pub(super) fn eval_single_string_arg(
         return None;
     }
     match eval_expr_ext(&args[0], event, windows, baselines)? {
-        Value::Str(s) => Some(s),
+        Value::Str(s) => Some(s.to_string()),
         _ => None,
     }
 }
@@ -238,7 +238,7 @@ pub(super) fn eval_single_string_arg(
 pub(super) fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Option<()> {
     let (tag, text) = match value {
         Value::Number(_) => ("n", value_to_string(value)),
-        Value::Str(s) => ("s", s.clone()),
+        Value::Str(s) => ("s", s.to_string()),
         Value::Bool(_) => ("b", value_to_string(value)),
         Value::Array(_) | Value::Object(_) => return None,
     };

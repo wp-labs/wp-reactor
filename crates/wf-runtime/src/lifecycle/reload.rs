@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 use wf_config::{FusionConfig, RawFusionConfigTree};
 use wf_engine::alert::OutputRecord;
 
+use crate::alert_task;
 use crate::error::RuntimeResult;
 use crate::hot_reload::{ReloadPreparation, prepare_reload};
 use crate::lifecycle::spawn::spawn_rule_tasks;
@@ -148,13 +149,17 @@ impl Reactor {
             new_rules,
             &self.router,
             &new_intermediate_targets,
-            self.alert_tx.clone().unwrap_or_else(|| {
-                // Reactor is shutting down (alert_tx already taken in `wait`).
-                // Create a closed channel so the new rule generation's emits
+            self.alert_txs.clone().unwrap_or_else(|| {
+                // Reactor is shutting down (alert_txs already taken in `wait`).
+                // Create closed channels so the new rule generation's emits
                 // are dropped rather than blocking a real reload.
-                let (_tx, rx) = mpsc::channel::<OutputRecord>(1);
-                drop(rx);
-                _tx
+                (0..alert_task::ALERT_CONSUMERS)
+                    .map(|_| {
+                        let (_tx, rx) = mpsc::channel::<OutputRecord>(1);
+                        drop(rx);
+                        _tx
+                    })
+                    .collect()
             }),
             self.rule_cancel.clone(),
             self.metrics.clone(),

@@ -357,7 +357,7 @@ fn load_knowledge_into_windows(
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("col_{}", i));
-                map.insert(field, EngineValue::Str(value.to_string()));
+                map.insert(field, EngineValue::Str(value.to_string().into()));
             }
             rows.push(map);
         }
@@ -427,7 +427,7 @@ fn load_from_postgres(
             for field in row.iter() {
                 map.insert(
                     field.name.to_string(),
-                    EngineValue::Str(field.value.to_string()),
+                    EngineValue::Str(field.value.to_string().into()),
                 );
             }
             rows.push(map);

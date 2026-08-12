@@ -21,7 +21,7 @@ impl WindowLookup for RegistryLookup<'_> {
                     // Convert all value types to string for set membership
                     match val {
                         Value::Str(s) => {
-                            values.insert(s.clone());
+                            values.insert(s.to_string());
                         }
                         Value::Number(n) => {
                             values.insert(n.to_string());
@@ -49,7 +49,13 @@ impl WindowLookup for RegistryLookup<'_> {
         let mut rows = Vec::new();
         for batch in &batches {
             for event in batch_to_events(batch) {
-                rows.push(event.fields);
+                rows.push(
+                    event
+                        .fields
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                );
             }
         }
         Some(rows)

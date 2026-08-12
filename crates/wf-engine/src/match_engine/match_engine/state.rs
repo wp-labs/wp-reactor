@@ -124,6 +124,11 @@ pub(super) struct Instance {
     /// Per-step satisfaction flags for `on event any` (unordered) mode, aligned
     /// with `event_steps`.
     pub(super) satisfied_flags: Vec<bool>,
+    /// Estimated size of this instance at creation time (fixed per the plan +
+    /// tracked bind fields). Used for O(1) memory accounting in
+    /// `insert/remove_instance`; exact state growth is corrected by periodic
+    /// `recalibrate_memory()`.
+    pub(super) base_cost: usize,
 }
 
 impl Instance {
@@ -156,6 +161,7 @@ impl Instance {
             baselines: HashMap::new(),
             neg_violated: false,
             satisfied_flags: vec![false; plan.event_steps.len()],
+            base_cost: 0,
         }
     }
 
@@ -338,7 +344,7 @@ fn estimated_tracked_event_fields_bytes(plan: &MatchPlan, alias: &str, event: &E
             .filter_map(|field| {
                 event
                     .fields
-                    .get(field)
+                    .get(field.as_str())
                     .map(|value| field.len() + 24 + val_estimated_bytes(value))
             })
             .sum(),

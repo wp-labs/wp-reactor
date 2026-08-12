@@ -414,22 +414,22 @@ fn execute_each_yield_merges_input_object_with_extension() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "extensions".to_string(),
+        name: "extensions".into(),
         value: Expr::FuncCall {
             qualifier: None,
-            name: "merge".to_string(),
+            name: "merge".into(),
             args: vec![
                 Expr::Field(FieldRef::Qualified(
-                    "e".to_string(),
-                    "extension".to_string(),
+                    "e".into(),
+                    "extension".into(),
                 )),
                 Expr::Object(vec![
                     ObjectItem {
@@ -449,8 +449,8 @@ fn execute_each_yield_merges_input_object_with_extension() {
     let exec = RuleExecutor::new(plan);
 
     let mut extension = HashMap::new();
-    extension.insert("severity".to_string(), num(3.0));
-    extension.insert("rules".to_string(), Value::Array(vec![str_val("webshell")]));
+    extension.insert("severity".into(), num(3.0));
+    extension.insert("rules".into(), Value::Array(vec![str_val("webshell")]));
     let alert = exec
         .execute_each(
             &event(vec![
@@ -486,30 +486,30 @@ fn execute_each_yield_passes_input_object_through() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "extensions".to_string(),
+        name: "extensions".into(),
         value: Expr::Field(FieldRef::Qualified(
-            "e".to_string(),
-            "extension".to_string(),
+            "e".into(),
+            "extension".into(),
         )),
     }];
     let exec = RuleExecutor::new(plan);
 
     let mut detection = HashMap::new();
-    detection.insert("severity".to_string(), num(10.0));
+    detection.insert("severity".into(), num(10.0));
     detection.insert(
-        "tags".to_string(),
+        "tags".into(),
         Value::Array(vec![str_val("os:linux"), str_val("webshell")]),
     );
     let mut extension = HashMap::new();
-    extension.insert("detection".to_string(), Value::Object(detection));
+    extension.insert("detection".into(), Value::Object(detection));
 
     let alert = exec
         .execute_each(
@@ -551,16 +551,16 @@ fn execute_each_yield_failure_is_not_silent() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "missing".to_string(),
-        value: Expr::Field(FieldRef::Simple("does_not_exist".to_string())),
+        name: "missing".into(),
+        value: Expr::Field(FieldRef::Simple("does_not_exist".into())),
     }];
     let exec = RuleExecutor::new(plan);
 
@@ -575,7 +575,7 @@ fn execute_each_yield_failure_is_not_silent() {
         .iter()
         .find(|(k, _)| k == "missing")
         .map(|(_, v)| v.clone());
-    assert_eq!(field_value, Some(Value::Str("".to_string())));
+    assert_eq!(field_value, Some(Value::Str("".into())));
 }
 
 // =========================================================================
@@ -589,10 +589,10 @@ fn execute_match_yield_can_reference_score() {
         default_match_plan(),
         Expr::Number(70.0),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     plan.yield_plan.fields = vec![YieldField {
-        name: "risk_score".to_string(),
+        name: "risk_score".into(),
         value: Expr::SystemVar(SystemVar::Score),
     }];
     let exec = RuleExecutor::new(plan);
@@ -616,23 +616,23 @@ fn execute_match_yield_can_reference_time_system_vars() {
         default_match_plan(),
         Expr::Number(70.0),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     plan.yield_plan.fields = vec![
         YieldField {
-            name: "first_seen".to_string(),
+            name: "first_seen".into(),
             value: Expr::SystemVar(SystemVar::EventFirstTime),
         },
         YieldField {
-            name: "last_seen".to_string(),
+            name: "last_seen".into(),
             value: Expr::SystemVar(SystemVar::EventLastTime),
         },
         YieldField {
-            name: "rule_window_start".to_string(),
+            name: "rule_window_start".into(),
             value: Expr::SystemVar(SystemVar::WindowStartTime),
         },
         YieldField {
-            name: "rule_window_end".to_string(),
+            name: "rule_window_end".into(),
             value: Expr::SystemVar(SystemVar::WindowEndTime),
         },
     ];
@@ -665,22 +665,22 @@ fn execute_match_yield_can_use_score_inside_builtin_expr() {
         default_match_plan(),
         Expr::Number(70.126),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     plan.yield_plan.fields = vec![
         YieldField {
-            name: "rounded".to_string(),
+            name: "rounded".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "round".to_string(),
+                name: "round".into(),
                 args: vec![Expr::SystemVar(SystemVar::Score), Expr::Number(1.0)],
             },
         },
         YieldField {
-            name: "message".to_string(),
+            name: "message".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "concat".to_string(),
+                name: "concat".into(),
                 args: vec![
                     Expr::StringLit("risk=".to_string()),
                     Expr::SystemVar(SystemVar::Score),
@@ -688,10 +688,10 @@ fn execute_match_yield_can_use_score_inside_builtin_expr() {
             },
         },
         YieldField {
-            name: "rule_message".to_string(),
+            name: "rule_message".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "concat".to_string(),
+                name: "concat".into(),
                 args: vec![
                     Expr::WfuMeta(WfuMetaField::RuleName),
                     Expr::StringLit("-alert".to_string()),
@@ -736,11 +736,11 @@ fn execute_match_yield_failure_is_not_silent() {
         default_match_plan(),
         Expr::Number(70.0),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     plan.yield_plan.fields = vec![YieldField {
-        name: "missing".to_string(),
-        value: Expr::Field(FieldRef::Simple("does_not_exist".to_string())),
+        name: "missing".into(),
+        value: Expr::Field(FieldRef::Simple("does_not_exist".into())),
     }];
     let exec = RuleExecutor::new(plan);
 
@@ -752,7 +752,7 @@ fn execute_match_yield_failure_is_not_silent() {
         .iter()
         .find(|(k, _)| k == "missing")
         .map(|(_, v)| v.clone());
-    assert_eq!(field_value, Some(Value::Str("".to_string())));
+    assert_eq!(field_value, Some(Value::Str("".into())));
 }
 
 #[test]
@@ -764,19 +764,19 @@ fn execute_match_missing_optional_float_field_is_omitted_not_fatal() {
         default_match_plan(),
         Expr::Number(70.0),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     plan.yield_plan.fields = vec![YieldField {
-        name: "attacker_latitude".to_string(),
+        name: "attacker_latitude".into(),
         value: Expr::Field(FieldRef::Qualified(
-            "e".to_string(),
-            "attacker_latitude".to_string(),
+            "e".into(),
+            "attacker_latitude".into(),
         )),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
         HashMap::from([(
-            "attacker_latitude".to_string(),
+            "attacker_latitude".into(),
             FieldType::Base(BaseType::Float),
         )]),
     );
@@ -802,21 +802,21 @@ fn execute_close_yield_can_reference_score() {
         default_match_plan(),
         Expr::Number(70.0),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     plan.yield_plan.fields = vec![
         YieldField {
-            name: "risk_score".to_string(),
+            name: "risk_score".into(),
             value: Expr::SystemVar(SystemVar::Score),
         },
         YieldField {
-            name: "close_reason".to_string(),
+            name: "close_reason".into(),
             value: Expr::WfuMeta(WfuMetaField::CloseReason),
         },
     ];
     let exec = RuleExecutor::new(plan);
     let close = CloseOutput {
-        rule_name: "r1".to_string(),
+        rule_name: "r1".into(),
         scope_key: vec![str_val("10.0.0.1")],
         close_reason: CloseReason::Timeout,
         event_ok: true,
@@ -825,7 +825,7 @@ fn execute_close_yield_can_reference_score() {
         event_emitted: false,
         event_step_data: vec![StepData {
             satisfied_branch_index: 0,
-            label: Some("fail".to_string()),
+            label: Some("fail".into()),
             measure_value: 3.0,
             event_first_time_nanos: None,
             event_last_time_nanos: None,
@@ -870,37 +870,37 @@ fn execute_close_yield_can_reference_time_system_vars() {
         default_match_plan(),
         Expr::Number(70.0),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     plan.yield_plan.fields = vec![
         YieldField {
-            name: "first_seen".to_string(),
+            name: "first_seen".into(),
             value: Expr::SystemVar(SystemVar::EventFirstTime),
         },
         YieldField {
-            name: "last_seen".to_string(),
+            name: "last_seen".into(),
             value: Expr::SystemVar(SystemVar::EventLastTime),
         },
         YieldField {
-            name: "evidence_start_time".to_string(),
+            name: "evidence_start_time".into(),
             value: Expr::SystemVar(SystemVar::EvidenceStartTime),
         },
         YieldField {
-            name: "evidence_end_time".to_string(),
+            name: "evidence_end_time".into(),
             value: Expr::SystemVar(SystemVar::EvidenceEndTime),
         },
         YieldField {
-            name: "rule_window_start".to_string(),
+            name: "rule_window_start".into(),
             value: Expr::SystemVar(SystemVar::WindowStartTime),
         },
         YieldField {
-            name: "rule_window_end".to_string(),
+            name: "rule_window_end".into(),
             value: Expr::SystemVar(SystemVar::WindowEndTime),
         },
     ];
     let exec = RuleExecutor::new(plan);
     let close = CloseOutput {
-        rule_name: "r1".to_string(),
+        rule_name: "r1".into(),
         scope_key: vec![str_val("10.0.0.1")],
         close_reason: CloseReason::Timeout,
         event_ok: true,
@@ -909,7 +909,7 @@ fn execute_close_yield_can_reference_time_system_vars() {
         event_emitted: false,
         event_step_data: vec![StepData {
             satisfied_branch_index: 0,
-            label: Some("fail".to_string()),
+            label: Some("fail".into()),
             measure_value: 3.0,
             event_first_time_nanos: None,
             event_last_time_nanos: None,
@@ -954,20 +954,20 @@ fn execute_close_yield_can_use_count_label_inside_if_and_concat() {
         ),
         Expr::Number(50.0),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     let count_hi = Expr::FuncCall {
         qualifier: None,
-        name: "count".to_string(),
-        args: vec![Expr::Field(FieldRef::Simple("hi".to_string()))],
+        name: "count".into(),
+        args: vec![Expr::Field(FieldRef::Simple("hi".into()))],
     };
     plan.yield_plan.fields = vec![
         YieldField {
-            name: "high_event_count".to_string(),
+            name: "high_event_count".into(),
             value: count_hi.clone(),
         },
         YieldField {
-            name: "status".to_string(),
+            name: "status".into(),
             value: Expr::IfThenElse {
                 cond: Box::new(Expr::BinOp {
                     op: BinOp::Ge,
@@ -979,17 +979,17 @@ fn execute_close_yield_can_use_count_label_inside_if_and_concat() {
             },
         },
         YieldField {
-            name: "message".to_string(),
+            name: "message".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "concat".to_string(),
+                name: "concat".into(),
                 args: vec![Expr::StringLit("cnt=".to_string()), count_hi],
             },
         },
     ];
     let exec = RuleExecutor::new(plan);
     let close = CloseOutput {
-        rule_name: "r1".to_string(),
+        rule_name: "r1".into(),
         scope_key: vec![str_val("10.0.0.1")],
         close_reason: CloseReason::Timeout,
         event_ok: true,
@@ -998,7 +998,7 @@ fn execute_close_yield_can_use_count_label_inside_if_and_concat() {
         event_emitted: false,
         event_step_data: vec![StepData {
             satisfied_branch_index: 0,
-            label: Some("hi".to_string()),
+            label: Some("hi".into()),
             measure_value: 2.0,
             event_first_time_nanos: None,
             event_last_time_nanos: None,
@@ -1055,7 +1055,7 @@ fn execute_close_yield_can_use_avg_on_field() {
             vec![StepPlan {
                 branches: vec![BranchPlan {
                     label: None,
-                    source: "x".to_string(),
+                    source: "x".into(),
                     field: None,
                     guard: None,
                     agg: count_ge(1.0),
@@ -1064,33 +1064,33 @@ fn execute_close_yield_can_use_avg_on_field() {
         ),
         Expr::Number(50.0),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     let avg_risk = Expr::FuncCall {
         qualifier: None,
-        name: "avg".to_string(),
+        name: "avg".into(),
         args: vec![Expr::Field(FieldRef::Qualified(
-            "x".to_string(),
-            "risk_score".to_string(),
+            "x".into(),
+            "risk_score".into(),
         ))],
     };
     plan.yield_plan.fields = vec![
         YieldField {
-            name: "avg_risk_score".to_string(),
+            name: "avg_risk_score".into(),
             value: avg_risk.clone(),
         },
         YieldField {
-            name: "message".to_string(),
+            name: "message".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "concat".to_string(),
+                name: "concat".into(),
                 args: vec![Expr::StringLit("avg=".to_string()), avg_risk],
             },
         },
     ];
     let exec = RuleExecutor::new(plan);
     let close = CloseOutput {
-        rule_name: "r1".to_string(),
+        rule_name: "r1".into(),
         scope_key: vec![str_val("10.0.0.1")],
         close_reason: CloseReason::Timeout,
         event_ok: true,
@@ -1105,7 +1105,7 @@ fn execute_close_yield_can_use_avg_on_field() {
             event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::from([(
-                "risk_score".to_string(),
+                "risk_score".into(),
                 vec![num(20.0), num(40.0)],
             )]),
         }],
@@ -1150,54 +1150,54 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
         ),
         Expr::Number(50.0),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     plan.yield_plan.fields = vec![
         YieldField {
-            name: "source_avg".to_string(),
+            name: "source_avg".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "avg".to_string(),
+                name: "avg".into(),
                 args: vec![Expr::Field(FieldRef::Qualified(
-                    "x".to_string(),
-                    "risk_score".to_string(),
+                    "x".into(),
+                    "risk_score".into(),
                 ))],
             },
         },
         YieldField {
-            name: "high_event_count".to_string(),
+            name: "high_event_count".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "count".to_string(),
-                args: vec![Expr::Field(FieldRef::Simple("hi".to_string()))],
+                name: "count".into(),
+                args: vec![Expr::Field(FieldRef::Simple("hi".into()))],
             },
         },
         YieldField {
-            name: "elevated_avg".to_string(),
+            name: "elevated_avg".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "avg".to_string(),
+                name: "avg".into(),
                 args: vec![Expr::Field(FieldRef::Qualified(
-                    "elevated".to_string(),
-                    "risk_score".to_string(),
+                    "elevated".into(),
+                    "risk_score".into(),
                 ))],
             },
         },
         YieldField {
-            name: "first_high_action".to_string(),
+            name: "first_high_action".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "first".to_string(),
+                name: "first".into(),
                 args: vec![Expr::Field(FieldRef::Qualified(
-                    "hi".to_string(),
-                    "action".to_string(),
+                    "hi".into(),
+                    "action".into(),
                 ))],
             },
         },
     ];
     let exec = RuleExecutor::new(plan);
     let close = CloseOutput {
-        rule_name: "r1".to_string(),
+        rule_name: "r1".into(),
         scope_key: vec![str_val("10.0.0.1")],
         close_reason: CloseReason::Timeout,
         event_ok: true,
@@ -1212,33 +1212,33 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
             event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::from([(
-                "risk_score".to_string(),
+                "risk_score".into(),
                 vec![num(90.0), num(70.0)],
             )]),
         }],
         close_step_data: vec![],
         bind_data: vec![
             BindData {
-                alias: "x".to_string(),
+                alias: "x".into(),
                 count: 2,
                 field_values: std::collections::HashMap::from([(
-                    "risk_score".to_string(),
+                    "risk_score".into(),
                     vec![num(90.0), num(70.0)],
                 )]),
             },
             BindData {
-                alias: "hi".to_string(),
+                alias: "hi".into(),
                 count: 1,
                 field_values: std::collections::HashMap::from([(
-                    "action".to_string(),
+                    "action".into(),
                     vec![str_val("block")],
                 )]),
             },
             BindData {
-                alias: "elevated".to_string(),
+                alias: "elevated".into(),
                 count: 2,
                 field_values: std::collections::HashMap::from([(
-                    "risk_score".to_string(),
+                    "risk_score".into(),
                     vec![num(90.0), num(70.0)],
                 )]),
             },
@@ -1292,54 +1292,54 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
         ),
         Expr::Number(50.0),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     plan.yield_plan.fields = vec![
         YieldField {
-            name: "source_avg".to_string(),
+            name: "source_avg".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "avg".to_string(),
+                name: "avg".into(),
                 args: vec![Expr::Field(FieldRef::Qualified(
-                    "x".to_string(),
-                    "risk_score".to_string(),
+                    "x".into(),
+                    "risk_score".into(),
                 ))],
             },
         },
         YieldField {
-            name: "high_event_count".to_string(),
+            name: "high_event_count".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "count".to_string(),
-                args: vec![Expr::Field(FieldRef::Simple("hi".to_string()))],
+                name: "count".into(),
+                args: vec![Expr::Field(FieldRef::Simple("hi".into()))],
             },
         },
         YieldField {
-            name: "elevated_avg".to_string(),
+            name: "elevated_avg".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "avg".to_string(),
+                name: "avg".into(),
                 args: vec![Expr::Field(FieldRef::Qualified(
-                    "elevated".to_string(),
-                    "risk_score".to_string(),
+                    "elevated".into(),
+                    "risk_score".into(),
                 ))],
             },
         },
         YieldField {
-            name: "last_high_action".to_string(),
+            name: "last_high_action".into(),
             value: Expr::FuncCall {
                 qualifier: None,
-                name: "last".to_string(),
+                name: "last".into(),
                 args: vec![Expr::Field(FieldRef::Qualified(
-                    "hi".to_string(),
-                    "action".to_string(),
+                    "hi".into(),
+                    "action".into(),
                 ))],
             },
         },
     ];
     let exec = RuleExecutor::new(plan);
     let matched = MatchedContext {
-        rule_name: "r1".to_string(),
+        rule_name: "r1".into(),
         scope_key: vec![str_val("10.0.0.1")],
         step_data: vec![StepData {
             satisfied_branch_index: 0,
@@ -1352,26 +1352,26 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
         }],
         bind_data: vec![
             BindData {
-                alias: "x".to_string(),
+                alias: "x".into(),
                 count: 2,
                 field_values: std::collections::HashMap::from([(
-                    "risk_score".to_string(),
+                    "risk_score".into(),
                     vec![num(90.0), num(70.0)],
                 )]),
             },
             BindData {
-                alias: "hi".to_string(),
+                alias: "hi".into(),
                 count: 1,
                 field_values: std::collections::HashMap::from([(
-                    "action".to_string(),
+                    "action".into(),
                     vec![str_val("block")],
                 )]),
             },
             BindData {
-                alias: "elevated".to_string(),
+                alias: "elevated".into(),
                 count: 2,
                 field_values: std::collections::HashMap::from([(
-                    "risk_score".to_string(),
+                    "risk_score".into(),
                     vec![num(90.0), num(70.0)],
                 )]),
             },
@@ -1430,27 +1430,27 @@ fn execute_close_yield_can_use_fmt_with_count() {
         ),
         Expr::Number(50.0),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     plan.yield_plan.fields = vec![YieldField {
-        name: "message".to_string(),
+        name: "message".into(),
         value: Expr::FuncCall {
             qualifier: None,
-            name: "fmt".to_string(),
+            name: "fmt".into(),
             args: vec![
                 Expr::StringLit("{} failed {} times".to_string()),
-                Expr::Field(FieldRef::Qualified("fail".to_string(), "sip".to_string())),
+                Expr::Field(FieldRef::Qualified("fail".into(), "sip".into())),
                 Expr::FuncCall {
                     qualifier: None,
-                    name: "count".to_string(),
-                    args: vec![Expr::Field(FieldRef::Simple("fail".to_string()))],
+                    name: "count".into(),
+                    args: vec![Expr::Field(FieldRef::Simple("fail".into()))],
                 },
             ],
         },
     }];
     let exec = RuleExecutor::new(plan);
     let close = CloseOutput {
-        rule_name: "r1".to_string(),
+        rule_name: "r1".into(),
         scope_key: vec![str_val("10.0.0.1")],
         close_reason: CloseReason::Timeout,
         event_ok: true,
@@ -1465,7 +1465,7 @@ fn execute_close_yield_can_use_fmt_with_count() {
             event_last_time_nanos: None,
             collected_values: Vec::new(),
             field_values: std::collections::HashMap::from([(
-                "sip".to_string(),
+                "sip".into(),
                 vec![
                     str_val("10.0.0.1"),
                     str_val("10.0.0.1"),
@@ -1521,30 +1521,30 @@ fn execute_close_yield_resolves_tracked_bind_alias_field() {
     );
     // Compiler fix: tracked_bind_aliases must contain "c" so
     // collect_alias_event populates field_values (including sip).
-    match_plan.tracked_bind_aliases = HashSet::from(["c".to_string()]);
+    match_plan.tracked_bind_aliases = HashSet::from(["c".into()]);
 
     let rule_plan = RulePlan {
-        name: "port_scan".to_string(),
+        name: "port_scan".into(),
         binds: vec![BindPlan {
-            alias: "c".to_string(),
-            window: "conn_events".to_string(),
+            alias: "c".into(),
+            window: "conn_events".into(),
             filter: None,
         }],
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],
         entity_plan: EntityPlan {
-            entity_type: "ip".to_string(),
+            entity_type: "ip".into(),
             entity_id_expr: Expr::Field(wf_lang::ast::FieldRef::Qualified(
                 "c".into(),
                 "sip".into(),
             )),
         },
         yield_plan: YieldPlan {
-            target: "network_alerts".to_string(),
+            target: "network_alerts".into(),
             version: None,
             fields: vec![YieldField {
-                name: "sip".to_string(),
+                name: "sip".into(),
                 value: Expr::Field(wf_lang::ast::FieldRef::Qualified("c".into(), "sip".into())),
             }],
         },
@@ -1557,7 +1557,7 @@ fn execute_close_yield_resolves_tracked_bind_alias_field() {
     };
 
     let exec = RuleExecutor::new(rule_plan);
-    let mut sm = CepStateMachine::new("port_scan".to_string(), match_plan, None);
+    let mut sm = CepStateMachine::new("port_scan".into(), match_plan, None);
 
     let base: i64 = 1_700_000_000 * 1_000_000_000i64;
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
@@ -1613,41 +1613,41 @@ fn execute_match_yield_can_use_stat_context_functions() {
     use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
     let input_window = WindowSchema {
-        name: "auth_events".to_string(),
-        streams: vec!["auth_stream".to_string()],
-        time_field: Some("event_time".to_string()),
+        name: "auth_events".into(),
+        streams: vec!["auth_stream".into()],
+        time_field: Some("event_time".into()),
         over: std::time::Duration::from_secs(3600),
         fields: vec![
             FieldDef {
-                name: "sip".to_string(),
+                name: "sip".into(),
                 field_type: FieldType::Base(BaseType::Ip),
             },
             FieldDef {
-                name: "event_time".to_string(),
+                name: "event_time".into(),
                 field_type: FieldType::Base(BaseType::Time),
             },
         ],
     };
     let output_window = WindowSchema {
-        name: "out".to_string(),
+        name: "out".into(),
         streams: vec![],
         time_field: None,
         over: std::time::Duration::from_secs(3600),
         fields: vec![
             FieldDef {
-                name: "sip".to_string(),
+                name: "sip".into(),
                 field_type: FieldType::Base(BaseType::Ip),
             },
             FieldDef {
-                name: "window_events".to_string(),
+                name: "window_events".into(),
                 field_type: FieldType::Base(BaseType::Digit),
             },
             FieldDef {
-                name: "matched_events".to_string(),
+                name: "matched_events".into(),
                 field_type: FieldType::Base(BaseType::Digit),
             },
             FieldDef {
-                name: "trigger_count".to_string(),
+                name: "trigger_count".into(),
                 field_type: FieldType::Base(BaseType::Float),
             },
         ],
@@ -1702,25 +1702,25 @@ rule stat_rule {
 
 fn evidence_input_window() -> WindowSchema {
     WindowSchema {
-        name: "auth_events".to_string(),
-        streams: vec!["auth_stream".to_string()],
-        time_field: Some("event_time".to_string()),
+        name: "auth_events".into(),
+        streams: vec!["auth_stream".into()],
+        time_field: Some("event_time".into()),
         over: std::time::Duration::from_secs(3600),
         fields: vec![
             FieldDef {
-                name: "sip".to_string(),
+                name: "sip".into(),
                 field_type: FieldType::Base(BaseType::Ip),
             },
             FieldDef {
-                name: "event_id".to_string(),
+                name: "event_id".into(),
                 field_type: FieldType::Base(BaseType::Chars),
             },
             FieldDef {
-                name: "event_time".to_string(),
+                name: "event_time".into(),
                 field_type: FieldType::Base(BaseType::Time),
             },
             FieldDef {
-                name: "weight".to_string(),
+                name: "weight".into(),
                 field_type: FieldType::Base(BaseType::Digit),
             },
         ],
@@ -1729,21 +1729,21 @@ fn evidence_input_window() -> WindowSchema {
 
 fn evidence_output_window() -> WindowSchema {
     WindowSchema {
-        name: "out".to_string(),
+        name: "out".into(),
         streams: vec![],
         time_field: None,
         over: std::time::Duration::from_secs(3600),
         fields: vec![
             FieldDef {
-                name: "sip".to_string(),
+                name: "sip".into(),
                 field_type: FieldType::Base(BaseType::Ip),
             },
             FieldDef {
-                name: "event_count".to_string(),
+                name: "event_count".into(),
                 field_type: FieldType::Base(BaseType::Digit),
             },
             FieldDef {
-                name: "evidences".to_string(),
+                name: "evidences".into(),
                 field_type: FieldType::Array(BaseType::Chars),
             },
         ],
@@ -2205,33 +2205,33 @@ fn execute_close_yield_can_use_stat_final_value() {
     use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
     let input_window = WindowSchema {
-        name: "auth_events".to_string(),
-        streams: vec!["auth_stream".to_string()],
-        time_field: Some("event_time".to_string()),
+        name: "auth_events".into(),
+        streams: vec!["auth_stream".into()],
+        time_field: Some("event_time".into()),
         over: std::time::Duration::from_secs(3600),
         fields: vec![
             FieldDef {
-                name: "sip".to_string(),
+                name: "sip".into(),
                 field_type: FieldType::Base(BaseType::Ip),
             },
             FieldDef {
-                name: "event_time".to_string(),
+                name: "event_time".into(),
                 field_type: FieldType::Base(BaseType::Time),
             },
         ],
     };
     let output_window = WindowSchema {
-        name: "out".to_string(),
+        name: "out".into(),
         streams: vec![],
         time_field: None,
         over: std::time::Duration::from_secs(3600),
         fields: vec![
             FieldDef {
-                name: "sip".to_string(),
+                name: "sip".into(),
                 field_type: FieldType::Base(BaseType::Ip),
             },
             FieldDef {
-                name: "final_hits".to_string(),
+                name: "final_hits".into(),
                 field_type: FieldType::Base(BaseType::Float),
             },
         ],
@@ -2304,24 +2304,24 @@ fn execute_each_missing_optional_float_field_is_omitted_not_fatal() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "attacker_latitude".to_string(),
+        name: "attacker_latitude".into(),
         value: Expr::Field(FieldRef::Qualified(
-            "e".to_string(),
-            "attacker_latitude".to_string(),
+            "e".into(),
+            "attacker_latitude".into(),
         )),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
         HashMap::from([(
-            "attacker_latitude".to_string(),
+            "attacker_latitude".into(),
             FieldType::Base(BaseType::Float),
         )]),
     );
@@ -2352,24 +2352,24 @@ fn execute_each_present_float_field_outputs_normally() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "attacker_latitude".to_string(),
+        name: "attacker_latitude".into(),
         value: Expr::Field(FieldRef::Qualified(
-            "e".to_string(),
-            "attacker_latitude".to_string(),
+            "e".into(),
+            "attacker_latitude".into(),
         )),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
         HashMap::from([(
-            "attacker_latitude".to_string(),
+            "attacker_latitude".into(),
             FieldType::Base(BaseType::Float),
         )]),
     );
@@ -2402,21 +2402,21 @@ fn execute_each_explicit_nan_float_still_fails() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "attacker_latitude".to_string(),
+        name: "attacker_latitude".into(),
         value: Expr::Number(f64::NAN),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
         HashMap::from([(
-            "attacker_latitude".to_string(),
+            "attacker_latitude".into(),
             FieldType::Base(BaseType::Float),
         )]),
     );
@@ -2433,34 +2433,34 @@ fn execute_each_missing_optional_field_keeps_other_fields() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![
         YieldField {
-            name: "attacker_latitude".to_string(),
+            name: "attacker_latitude".into(),
             value: Expr::Field(FieldRef::Qualified(
-                "e".to_string(),
-                "attacker_latitude".to_string(),
+                "e".into(),
+                "attacker_latitude".into(),
             )),
         },
         YieldField {
-            name: "sip".to_string(),
-            value: Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+            name: "sip".into(),
+            value: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
         },
     ];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
         HashMap::from([
             (
-                "attacker_latitude".to_string(),
+                "attacker_latitude".into(),
                 FieldType::Base(BaseType::Float),
             ),
-            ("sip".to_string(), FieldType::Base(BaseType::Chars)),
+            ("sip".into(), FieldType::Base(BaseType::Chars)),
         ]),
     );
 
@@ -2496,23 +2496,23 @@ fn execute_each_missing_optional_digit_field_is_omitted() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "fail_count".to_string(),
+        name: "fail_count".into(),
         value: Expr::Field(FieldRef::Qualified(
-            "e".to_string(),
-            "fail_count".to_string(),
+            "e".into(),
+            "fail_count".into(),
         )),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([("fail_count".to_string(), FieldType::Base(BaseType::Digit))]),
+        HashMap::from([("fail_count".into(), FieldType::Base(BaseType::Digit))]),
     );
 
     let alert = exec
@@ -2531,20 +2531,20 @@ fn execute_each_missing_chars_field_degrades_to_empty_string() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "message".to_string(),
-        value: Expr::Field(FieldRef::Qualified("e".to_string(), "message".to_string())),
+        name: "message".into(),
+        value: Expr::Field(FieldRef::Qualified("e".into(), "message".into())),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([("message".to_string(), FieldType::Base(BaseType::Chars))]),
+        HashMap::from([("message".into(), FieldType::Base(BaseType::Chars))]),
     );
 
     let alert = exec
@@ -2557,7 +2557,7 @@ fn execute_each_missing_chars_field_degrades_to_empty_string() {
             .iter()
             .find(|(n, _)| n == "message")
             .map(|(_, v)| v.clone()),
-        Some(Value::Str(String::new()))
+        Some(Value::Str(String::new().into()))
     );
 }
 
@@ -2568,24 +2568,24 @@ fn execute_close_missing_optional_float_field_is_omitted_not_fatal() {
         default_match_plan(),
         Expr::Number(70.0),
         "ip",
-        Expr::Field(FieldRef::Simple("sip".to_string())),
+        Expr::Field(FieldRef::Simple("sip".into())),
     );
     plan.yield_plan.fields = vec![YieldField {
-        name: "attacker_latitude".to_string(),
+        name: "attacker_latitude".into(),
         value: Expr::Field(FieldRef::Qualified(
-            "e".to_string(),
-            "attacker_latitude".to_string(),
+            "e".into(),
+            "attacker_latitude".into(),
         )),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
         HashMap::from([(
-            "attacker_latitude".to_string(),
+            "attacker_latitude".into(),
             FieldType::Base(BaseType::Float),
         )]),
     );
     let close = CloseOutput {
-        rule_name: "r1".to_string(),
+        rule_name: "r1".into(),
         scope_key: vec![str_val("10.0.0.1")],
         close_reason: CloseReason::Timeout,
         event_ok: true,
@@ -2594,7 +2594,7 @@ fn execute_close_missing_optional_float_field_is_omitted_not_fatal() {
         event_emitted: false,
         event_step_data: vec![StepData {
             satisfied_branch_index: 0,
-            label: Some("fail".to_string()),
+            label: Some("fail".into()),
             measure_value: 3.0,
             event_first_time_nanos: None,
             event_last_time_nanos: None,
@@ -2635,47 +2635,47 @@ fn nested_each_executor() -> RuleExecutor {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![
         YieldField {
-            name: "uid".to_string(),
+            name: "uid".into(),
             value: Expr::Field(FieldRef::Path {
-                alias: "e".to_string(),
+                alias: "e".into(),
                 segments: vec![
-                    PathSegment::Field("roles_obj".to_string()),
-                    PathSegment::Field("source".to_string()),
-                    PathSegment::Field("process".to_string()),
-                    PathSegment::Field("uid".to_string()),
+                    PathSegment::Field("roles_obj".into()),
+                    PathSegment::Field("source".into()),
+                    PathSegment::Field("process".into()),
+                    PathSegment::Field("uid".into()),
                 ],
             }),
         },
         YieldField {
-            name: "sip".to_string(),
-            value: Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+            name: "sip".into(),
+            value: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
         },
     ];
     RuleExecutor::new_with_yield_field_types(
         plan,
         HashMap::from([
-            ("uid".to_string(), FieldType::Base(BaseType::Chars)),
-            ("sip".to_string(), FieldType::Base(BaseType::Chars)),
+            ("uid".into(), FieldType::Base(BaseType::Chars)),
+            ("sip".into(), FieldType::Base(BaseType::Chars)),
         ]),
     )
 }
 
 fn nested_roles_value() -> Value {
     Value::Object(HashMap::from([(
-        "source".to_string(),
+        "source".into(),
         Value::Object(HashMap::from([(
-            "process".to_string(),
+            "process".into(),
             Value::Object(HashMap::from([(
-                "uid".to_string(),
+                "uid".into(),
                 str_val("d22b3fbcb9e77cb86834f6a18e2e0f68"),
             )])),
         )])),
@@ -2733,7 +2733,7 @@ fn execute_each_yield_nested_path_missing_yields_empty() {
             .iter()
             .find(|(n, _)| n == "uid")
             .map(|(_, v)| v.clone()),
-        Some(Value::Str(String::new())),
+        Some(Value::Str(String::new().into())),
         "missing nested path must not fail the record"
     );
     assert_eq!(
@@ -2754,26 +2754,26 @@ fn execute_each_yield_nested_missing_numeric_omits_field() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "risk_score".to_string(),
+        name: "risk_score".into(),
         value: Expr::Field(FieldRef::Path {
-            alias: "e".to_string(),
+            alias: "e".into(),
             segments: vec![
-                PathSegment::Field("roles_obj".to_string()),
-                PathSegment::Field("risk".to_string()),
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("risk".into()),
             ],
         }),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([("risk_score".to_string(), FieldType::Base(BaseType::Float))]),
+        HashMap::from([("risk_score".into(), FieldType::Base(BaseType::Float))]),
     );
 
     let alert = exec
@@ -2794,29 +2794,29 @@ fn execute_each_yield_nested_array_index() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "process_name".to_string(),
+        name: "process_name".into(),
         value: Expr::Field(FieldRef::Path {
-            alias: "e".to_string(),
+            alias: "e".into(),
             segments: vec![
-                PathSegment::Field("roles_obj".to_string()),
-                PathSegment::Field("related".to_string()),
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("related".into()),
                 PathSegment::Index(0),
-                PathSegment::Field("process".to_string()),
-                PathSegment::Field("name".to_string()),
+                PathSegment::Field("process".into()),
+                PathSegment::Field("name".into()),
             ],
         }),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([("process_name".to_string(), FieldType::Base(BaseType::Chars))]),
+        HashMap::from([("process_name".into(), FieldType::Base(BaseType::Chars))]),
     );
 
     let alert = exec
@@ -2824,10 +2824,10 @@ fn execute_each_yield_nested_array_index() {
             &event(vec![(
                 "roles_obj",
                 Value::Object(HashMap::from([(
-                    "related".to_string(),
+                    "related".into(),
                     Value::Array(vec![Value::Object(HashMap::from([(
-                        "process".to_string(),
-                        Value::Object(HashMap::from([("name".to_string(), str_val("evil.exe"))])),
+                        "process".into(),
+                        Value::Object(HashMap::from([("name".into(), str_val("evil.exe"))])),
                     )]))]),
                 )])),
             )]),
@@ -2854,28 +2854,28 @@ fn execute_each_yield_nested_array_out_of_bounds_omits() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "process_name".to_string(),
+        name: "process_name".into(),
         value: Expr::Field(FieldRef::Path {
-            alias: "e".to_string(),
+            alias: "e".into(),
             segments: vec![
-                PathSegment::Field("roles_obj".to_string()),
-                PathSegment::Field("related".to_string()),
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("related".into()),
                 PathSegment::Index(5),
-                PathSegment::Field("name".to_string()),
+                PathSegment::Field("name".into()),
             ],
         }),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([("process_name".to_string(), FieldType::Base(BaseType::Chars))]),
+        HashMap::from([("process_name".into(), FieldType::Base(BaseType::Chars))]),
     );
 
     let alert = exec
@@ -2883,7 +2883,7 @@ fn execute_each_yield_nested_array_out_of_bounds_omits() {
             &event(vec![(
                 "roles_obj",
                 Value::Object(HashMap::from([(
-                    "related".to_string(),
+                    "related".into(),
                     Value::Array(vec![str_val("x")]),
                 )])),
             )]),
@@ -2900,7 +2900,7 @@ fn execute_each_yield_nested_array_out_of_bounds_omits() {
             .iter()
             .find(|(n, _)| n == "process_name")
             .map(|(_, v)| v.clone()),
-        Some(Value::Str(String::new())),
+        Some(Value::Str(String::new().into())),
         "out-of-bounds array index must not fail the record"
     );
 }
@@ -2913,22 +2913,22 @@ fn execute_each_yield_nested_path_in_arithmetic() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "double_risk".to_string(),
+        name: "double_risk".into(),
         value: Expr::BinOp {
             op: BinOp::Mul,
             left: Box::new(Expr::Field(FieldRef::Path {
-                alias: "e".to_string(),
+                alias: "e".into(),
                 segments: vec![
-                    PathSegment::Field("roles_obj".to_string()),
-                    PathSegment::Field("risk".to_string()),
+                    PathSegment::Field("roles_obj".into()),
+                    PathSegment::Field("risk".into()),
                 ],
             })),
             right: Box::new(Expr::Number(2.0)),
@@ -2936,14 +2936,14 @@ fn execute_each_yield_nested_path_in_arithmetic() {
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([("double_risk".to_string(), FieldType::Base(BaseType::Float))]),
+        HashMap::from([("double_risk".into(), FieldType::Base(BaseType::Float))]),
     );
 
     let alert = exec
         .execute_each(
             &event(vec![(
                 "roles_obj",
-                Value::Object(HashMap::from([("risk".to_string(), num(21.0))])),
+                Value::Object(HashMap::from([("risk".into(), num(21.0))])),
             )]),
             1_000_000,
         )
@@ -2968,33 +2968,33 @@ fn execute_each_yield_nested_path_inside_object_literal() {
         simple_plan(vec![], vec![]),
         Expr::Number(10.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.each_plan = Some(EachPlan {
-        alias: "e".to_string(),
+        alias: "e".into(),
         filter: None,
     });
     plan.yield_plan.fields = vec![YieldField {
-        name: "ctx".to_string(),
+        name: "ctx".into(),
         value: Expr::Object(vec![
             ObjectItem {
                 targets: vec!["uid".to_string()],
                 type_hint: None,
                 value: Expr::Field(FieldRef::Path {
-                    alias: "e".to_string(),
+                    alias: "e".into(),
                     segments: vec![
-                        PathSegment::Field("roles_obj".to_string()),
-                        PathSegment::Field("source".to_string()),
-                        PathSegment::Field("process".to_string()),
-                        PathSegment::Field("uid".to_string()),
+                        PathSegment::Field("roles_obj".into()),
+                        PathSegment::Field("source".into()),
+                        PathSegment::Field("process".into()),
+                        PathSegment::Field("uid".into()),
                     ],
                 }),
             },
             ObjectItem {
                 targets: vec!["sip".to_string()],
                 type_hint: None,
-                value: Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+                value: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
             },
         ]),
     }];
@@ -3037,28 +3037,28 @@ fn execute_each_bind_filter_nested_path() {
             simple_plan(vec![], vec![]),
             Expr::Number(10.0),
             "ip",
-            Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+            Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
         );
-        plan.binds[0].alias = "e".to_string();
+        plan.binds[0].alias = "e".into();
         plan.each_plan = Some(EachPlan {
-            alias: "e".to_string(),
+            alias: "e".into(),
             filter: Some(filter),
         });
         plan.yield_plan.fields = vec![YieldField {
-            name: "uid".to_string(),
+            name: "uid".into(),
             value: Expr::Field(FieldRef::Path {
-                alias: "e".to_string(),
+                alias: "e".into(),
                 segments: vec![
-                    PathSegment::Field("roles_obj".to_string()),
-                    PathSegment::Field("source".to_string()),
-                    PathSegment::Field("process".to_string()),
-                    PathSegment::Field("uid".to_string()),
+                    PathSegment::Field("roles_obj".into()),
+                    PathSegment::Field("source".into()),
+                    PathSegment::Field("process".into()),
+                    PathSegment::Field("uid".into()),
                 ],
             }),
         }];
         RuleExecutor::new_with_yield_field_types(
             plan,
-            HashMap::from([("uid".to_string(), FieldType::Base(BaseType::Chars))]),
+            HashMap::from([("uid".into(), FieldType::Base(BaseType::Chars))]),
         )
     }
 
@@ -3066,12 +3066,12 @@ fn execute_each_bind_filter_nested_path() {
     let filter = Expr::BinOp {
         op: BinOp::Eq,
         left: Box::new(Expr::Field(FieldRef::Path {
-            alias: "e".to_string(),
+            alias: "e".into(),
             segments: vec![
-                PathSegment::Field("roles_obj".to_string()),
-                PathSegment::Field("source".to_string()),
-                PathSegment::Field("process".to_string()),
-                PathSegment::Field("uid".to_string()),
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("source".into()),
+                PathSegment::Field("process".into()),
+                PathSegment::Field("uid".into()),
             ],
         })),
         right: Box::new(Expr::StringLit(target.to_string())),
@@ -3098,10 +3098,10 @@ fn execute_each_bind_filter_nested_path() {
             &event(vec![(
                 "roles_obj",
                 Value::Object(HashMap::from([(
-                    "source".to_string(),
+                    "source".into(),
                     Value::Object(HashMap::from([(
-                        "process".to_string(),
-                        Value::Object(HashMap::from([("uid".to_string(), str_val("other"))])),
+                        "process".into(),
+                        Value::Object(HashMap::from([("uid".into(), str_val("other"))])),
                     )])),
                 )])),
             )]),
@@ -3123,44 +3123,44 @@ fn execute_match_yield_nested_path_via_bind_tracking() {
         default_match_plan(),
         Expr::Number(70.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("fail".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("fail".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.match_plan.tracked_bind_fields.insert(
-        "e".to_string(),
-        std::collections::HashSet::from(["roles_obj".to_string()]),
+        "e".into(),
+        std::collections::HashSet::from(["roles_obj".into()]),
     );
     plan.yield_plan.fields = vec![
         YieldField {
-            name: "uid".to_string(),
+            name: "uid".into(),
             value: Expr::Field(FieldRef::Path {
-                alias: "e".to_string(),
+                alias: "e".into(),
                 segments: vec![
-                    PathSegment::Field("roles_obj".to_string()),
-                    PathSegment::Field("source".to_string()),
-                    PathSegment::Field("process".to_string()),
-                    PathSegment::Field("uid".to_string()),
+                    PathSegment::Field("roles_obj".into()),
+                    PathSegment::Field("source".into()),
+                    PathSegment::Field("process".into()),
+                    PathSegment::Field("uid".into()),
                 ],
             }),
         },
         YieldField {
-            name: "sip".to_string(),
-            value: Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
+            name: "sip".into(),
+            value: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
         },
     ];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
         HashMap::from([
-            ("uid".to_string(), FieldType::Base(BaseType::Chars)),
-            ("sip".to_string(), FieldType::Base(BaseType::Chars)),
+            ("uid".into(), FieldType::Base(BaseType::Chars)),
+            ("sip".into(), FieldType::Base(BaseType::Chars)),
         ]),
     );
 
     let mut matched = default_matched_context();
     matched.bind_data = vec![BindData {
-        alias: "e".to_string(),
+        alias: "e".into(),
         count: 1,
-        field_values: HashMap::from([("roles_obj".to_string(), vec![nested_roles_value()])]),
+        field_values: HashMap::from([("roles_obj".into(), vec![nested_roles_value()])]),
     }];
     let alert = exec.execute_match(&matched).unwrap();
 
@@ -3192,26 +3192,26 @@ fn execute_match_yield_nested_path_missing_bind_omits() {
         default_match_plan(),
         Expr::Number(70.0),
         "ip",
-        Expr::Field(FieldRef::Qualified("fail".to_string(), "sip".to_string())),
+        Expr::Field(FieldRef::Qualified("fail".into(), "sip".into())),
     );
-    plan.binds[0].alias = "e".to_string();
+    plan.binds[0].alias = "e".into();
     plan.match_plan.tracked_bind_fields.insert(
-        "e".to_string(),
-        std::collections::HashSet::from(["roles_obj".to_string()]),
+        "e".into(),
+        std::collections::HashSet::from(["roles_obj".into()]),
     );
     plan.yield_plan.fields = vec![YieldField {
-        name: "risk_score".to_string(),
+        name: "risk_score".into(),
         value: Expr::Field(FieldRef::Path {
-            alias: "e".to_string(),
+            alias: "e".into(),
             segments: vec![
-                PathSegment::Field("roles_obj".to_string()),
-                PathSegment::Field("risk".to_string()),
+                PathSegment::Field("roles_obj".into()),
+                PathSegment::Field("risk".into()),
             ],
         }),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([("risk_score".to_string(), FieldType::Base(BaseType::Float))]),
+        HashMap::from([("risk_score".into(), FieldType::Base(BaseType::Float))]),
     );
 
     let matched = default_matched_context(); // empty bind_data → no roles_obj
@@ -3231,32 +3231,32 @@ fn execute_match_yield_nested_path_inside_object_literal_full_pipeline() {
     use crate::match_engine::match_engine::{CepStateMachine, StepResult};
 
     let input_window = WindowSchema {
-        name: "auth_events".to_string(),
-        streams: vec!["auth_stream".to_string()],
-        time_field: Some("event_time".to_string()),
+        name: "auth_events".into(),
+        streams: vec!["auth_stream".into()],
+        time_field: Some("event_time".into()),
         over: std::time::Duration::from_secs(3600),
         fields: vec![
             FieldDef {
-                name: "sip".to_string(),
+                name: "sip".into(),
                 field_type: FieldType::Base(BaseType::Ip),
             },
             FieldDef {
-                name: "roles_obj".to_string(),
+                name: "roles_obj".into(),
                 field_type: FieldType::Object,
             },
             FieldDef {
-                name: "event_time".to_string(),
+                name: "event_time".into(),
                 field_type: FieldType::Base(BaseType::Time),
             },
         ],
     };
     let output_window = WindowSchema {
-        name: "out".to_string(),
+        name: "out".into(),
         streams: vec![],
         time_field: None,
         over: std::time::Duration::from_secs(3600),
         fields: vec![FieldDef {
-            name: "ctx".to_string(),
+            name: "ctx".into(),
             field_type: FieldType::Object,
         }],
     };

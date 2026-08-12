@@ -300,8 +300,8 @@ fn build_machine_id_and_scope_key() {
                 FieldRef::Simple("user".to_string())
             ],
             &[
-                Value::Str("10.0.0.1".to_string()),
-                Value::Str("admin".to_string())
+                Value::Str("10.0.0.1".into()),
+                Value::Str("admin".into())
             ],
         ),
         "sip=10.0.0.1,user=admin"

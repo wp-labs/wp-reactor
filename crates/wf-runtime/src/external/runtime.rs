@@ -74,7 +74,7 @@ impl ExternalCallHandler for ExternalRuntime {
 
 fn value_to_str(v: &Value) -> Option<String> {
     match v {
-        Value::Str(s) => Some(s.clone()),
+        Value::Str(s) => Some(s.to_string()),
         Value::Number(n) => Some(n.to_string()),
         _ => None,
     }

@@ -261,11 +261,11 @@ fn window_has_nested_path_infers_leaf_field() {
         (
             "roles_obj",
             Value::Object(HashMap::from([(
-                "source".to_string(),
+                "source".into(),
                 Value::Object(HashMap::from([(
-                    "process".to_string(),
+                    "process".into(),
                     Value::Object(HashMap::from([(
-                        "uid".to_string(),
+                        "uid".into(),
                         str_val("d22b3fbcb9e77cb86834f6a18e2e0f68"),
                     )])),
                 )])),

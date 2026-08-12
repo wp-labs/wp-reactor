@@ -61,7 +61,7 @@ pub(super) fn materialize_system_vars(
         }
         Expr::WfuMeta(field) => match score.resolve_wfu_meta(*field)? {
             Value::Number(n) => Some(Expr::Number(n)),
-            Value::Str(s) => Some(Expr::StringLit(s)),
+            Value::Str(s) => Some(Expr::StringLit(s.to_string())),
             Value::Bool(b) => Some(Expr::Bool(b)),
             _ => None,
         },
@@ -146,7 +146,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 Value::Str(s) => s,
                 _ => return None,
             };
-            Some(Value::Bool(haystack.contains(&needle)))
+            Some(Value::Bool(haystack.contains(needle.as_str())))
         }
         "startswith" => {
             if args.len() != 2 {
@@ -160,7 +160,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 Value::Str(s) => s,
                 _ => return None,
             };
-            Some(Value::Bool(text.starts_with(&prefix)))
+            Some(Value::Bool(text.starts_with(prefix.as_str())))
         }
         "endswith" => {
             if args.len() != 2 {
@@ -174,7 +174,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 Value::Str(s) => s,
                 _ => return None,
             };
-            Some(Value::Bool(text.ends_with(&suffix)))
+            Some(Value::Bool(text.ends_with(suffix.as_str())))
         }
         "merge" => {
             if args.is_empty() {
@@ -216,7 +216,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 start_idx = 0;
             }
             if start_idx >= len {
-                return Some(Value::Str(String::new()));
+                return Some(Value::Str(String::new().into()));
             }
             let mut end_idx = len;
             if args.len() == 3 {
@@ -225,14 +225,14 @@ pub(super) fn eval_builtin_func_with_l3(
                     _ => return None,
                 };
                 if length <= 0 {
-                    return Some(Value::Str(String::new()));
+                    return Some(Value::Str(String::new().into()));
                 }
                 end_idx = (start_idx + length).min(len);
             }
             let sub = chars[start_idx as usize..end_idx as usize]
                 .iter()
                 .collect::<String>();
-            Some(Value::Str(sub))
+            Some(Value::Str(sub.into()))
         }
         "replace" => {
             if args.len() != 3 {
@@ -252,7 +252,9 @@ pub(super) fn eval_builtin_func_with_l3(
             };
             let re = regex::Regex::new(&pattern).ok()?;
             Some(Value::Str(
-                re.replace_all(&text, replacement.as_str()).into_owned(),
+                re.replace_all(text.as_str(), replacement.as_str())
+                    .into_owned()
+                    .into(),
             ))
         }
         "trim" => {
@@ -260,7 +262,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 return None;
             }
             match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => Some(Value::Str(s.trim().to_string())),
+                Value::Str(s) => Some(Value::Str(s.trim().to_string().into())),
                 _ => None,
             }
         }
@@ -269,7 +271,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 return None;
             }
             match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => Some(Value::Str(s.to_lowercase())),
+                Value::Str(s) => Some(Value::Str(s.to_lowercase().into())),
                 _ => None,
             }
         }
@@ -278,7 +280,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 return None;
             }
             match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => Some(Value::Str(s.to_uppercase())),
+                Value::Str(s) => Some(Value::Str(s.to_uppercase().into())),
                 _ => None,
             }
         }
@@ -317,7 +319,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 .map(|v| value_to_string(&v))
                 .collect::<Vec<_>>()
                 .join(&sep);
-            Some(Value::Str(joined))
+            Some(Value::Str(joined.into()))
         }
         "mvindex" => {
             if args.len() != 2 && args.len() != 3 {
@@ -390,10 +392,12 @@ pub(super) fn eval_builtin_func_with_l3(
                 _ => return None,
             };
             let parts = if sep.is_empty() {
-                text.chars().map(|c| Value::Str(c.to_string())).collect()
+                text.chars()
+                    .map(|c| Value::Str(c.to_string().into()))
+                    .collect()
             } else {
-                text.split(&sep)
-                    .map(|s| Value::Str(s.to_string()))
+                text.split(sep.as_str())
+                    .map(|s| Value::Str(s.to_string().into()))
                     .collect()
             };
             Some(Value::Array(parts))
@@ -585,7 +589,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 return None;
             }
             match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => Some(Value::Str(s.trim_start().to_string())),
+                Value::Str(s) => Some(Value::Str(s.trim_start().to_string().into())),
                 _ => None,
             }
         }
@@ -594,7 +598,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 return None;
             }
             match eval_expr_with_l3(&args[0], ctx, score)? {
-                Value::Str(s) => Some(Value::Str(s.trim_end().to_string())),
+                Value::Str(s) => Some(Value::Str(s.trim_end().to_string().into())),
                 _ => None,
             }
         }
@@ -610,7 +614,9 @@ pub(super) fn eval_builtin_func_with_l3(
                 .iter()
                 .map(|arg| eval_expr_with_l3(arg, ctx, score))
                 .collect::<Option<Vec<_>>>()?;
-            Some(Value::Str(utils::apply_fmt_template(&template, &values)?))
+            Some(Value::Str(
+                utils::apply_fmt_template(template.as_str(), &values)?.into(),
+            ))
         }
         "concat" => {
             if args.is_empty() {
@@ -621,7 +627,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 let value = eval_expr_with_l3(arg, ctx, score)?;
                 out.push_str(&value_to_string(&value));
             }
-            Some(Value::Str(out))
+            Some(Value::Str(out.into()))
         }
         "join" => {
             if args.is_empty() {
@@ -631,7 +637,7 @@ pub(super) fn eval_builtin_func_with_l3(
             for arg in args {
                 out.push_str(&eval_join_arg_with_l3(arg, ctx, score)?);
             }
-            Some(Value::Str(out))
+            Some(Value::Str(out.into()))
         }
         "join_by" => {
             if args.len() < 2 {
@@ -645,7 +651,7 @@ pub(super) fn eval_builtin_func_with_l3(
             for arg in &args[1..] {
                 parts.push(eval_join_arg_with_l3(arg, ctx, score)?);
             }
-            Some(Value::Str(parts.join(&sep)))
+            Some(Value::Str(parts.join(&sep).into()))
         }
         "indexof" => {
             if args.len() != 2 {
@@ -659,7 +665,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 Value::Str(s) => s,
                 _ => return None,
             };
-            let idx = text.find(&needle).map(|x| x as f64).unwrap_or(-1.0);
+            let idx = text.find(needle.as_str()).map(|x| x as f64).unwrap_or(-1.0);
             Some(Value::Number(idx))
         }
         "replace_plain" => {
@@ -678,7 +684,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 Value::Str(s) => s,
                 _ => return None,
             };
-            Some(Value::Str(text.replace(&from, &to)))
+            Some(Value::Str(text.replace(from.as_str(), to.as_str()).into()))
         }
         "startswith_any" => {
             if args.len() < 2 {
@@ -693,7 +699,7 @@ pub(super) fn eval_builtin_func_with_l3(
                     Value::Str(s) => s,
                     _ => return None,
                 };
-                if text.starts_with(&prefix) {
+                if text.starts_with(prefix.as_str()) {
                     return Some(Value::Bool(true));
                 }
             }
@@ -712,7 +718,7 @@ pub(super) fn eval_builtin_func_with_l3(
                     Value::Str(s) => s,
                     _ => return None,
                 };
-                if text.ends_with(&suffix) {
+                if text.ends_with(suffix.as_str()) {
                     return Some(Value::Bool(true));
                 }
             }
@@ -785,13 +791,15 @@ pub(super) fn eval_builtin_func_with_l3(
             let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;
             Some(Value::Str(hex::encode(<Md5 as Md5Digest>::digest(
                 text.as_bytes(),
-            ))))
+            ))
+            .into()))
         }
         "sha1" => {
             let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;
             Some(Value::Str(hex::encode(<Sha1 as Sha1Digest>::digest(
                 text.as_bytes(),
-            ))))
+            ))
+            .into()))
         }
         "sha1_n" => {
             if args.len() != 2 {
@@ -809,15 +817,15 @@ pub(super) fn eval_builtin_func_with_l3(
                 return None;
             }
             let digest = hex::encode(<Sha1 as Sha1Digest>::digest(text.as_bytes()));
-            Some(Value::Str(digest[..len].to_string()))
+            Some(Value::Str(digest[..len].to_string().into()))
         }
         "sha256" => {
             let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;
-            Some(Value::Str(hex::encode(Sha256::digest(text.as_bytes()))))
+            Some(Value::Str(hex::encode(Sha256::digest(text.as_bytes())).into()))
         }
         "hex" => {
             let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;
-            Some(Value::Str(hex::encode(text.as_bytes())))
+            Some(Value::Str(hex::encode(text.as_bytes()).into()))
         }
         "stable_id" => {
             if args.len() < 2 {
@@ -833,7 +841,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 utils::update_stable_id_hash(&mut hasher, &value)?;
             }
             let digest = hex::encode(hasher.finalize());
-            Some(Value::Str(format!("{}{}", prefix, &digest[..16])))
+            Some(Value::Str(format!("{}{}", prefix, &digest[..16]).into()))
         }
         "mvsort" => {
             if args.len() != 1 {
@@ -893,7 +901,7 @@ pub(super) fn eval_builtin_func_with_l3(
             };
             let fmt = if let Some(fmt_expr) = args.get(1) {
                 match eval_expr_with_l3(fmt_expr, ctx, score)? {
-                    Value::Str(s) => s,
+                    Value::Str(s) => s.to_string(),
                     _ => return None,
                 }
             } else {
@@ -903,7 +911,7 @@ pub(super) fn eval_builtin_func_with_l3(
                     .to_string()
             };
             let dt = utils::timestamp_nanos_to_utc(ts_nanos)?;
-            Some(Value::Str(dt.format(&fmt).to_string()))
+            Some(Value::Str(dt.format(&fmt).to_string().into()))
         }
         "strptime" => {
             if args.len() != 2 {
@@ -1003,7 +1011,7 @@ pub(super) fn eval_stat_func(
     match (name, selector) {
         ("count", StatSelector::WindowEvent(alias)) => ctx
             .fields
-            .get(&format!("_bind_{alias}_count"))
+            .get(format!("_bind_{alias}_count").as_str())
             .and_then(number_value),
         ("count", StatSelector::MatchEvent(label) | StatSelector::MatchDistinct(label)) => {
             ctx.fields.get(label).and_then(number_value)

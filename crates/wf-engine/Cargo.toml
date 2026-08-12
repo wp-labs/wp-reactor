@@ -15,6 +15,7 @@ wp-model-core = { workspace = true }
 arrow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+smol_str = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }

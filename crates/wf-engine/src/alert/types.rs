@@ -337,7 +337,7 @@ fn export_untyped_value(value: &Value) -> CoreResult<(DataType, ModelValue)> {
 
 fn render_value_as_string(value: &Value) -> CoreResult<String> {
     match value {
-        Value::Str(s) => Ok(s.clone()),
+        Value::Str(s) => Ok(s.to_string()),
         Value::Number(n) => Ok(n.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
         Value::Array(_) | Value::Object(_) => structured_json_string(value),
@@ -472,7 +472,7 @@ fn rule_value_to_model_value(value: &Value) -> CoreResult<(DataType, ModelValue)
 }
 
 fn rule_object_to_model(
-    items: &std::collections::HashMap<String, Value>,
+    items: &std::collections::HashMap<smol_str::SmolStr, Value>,
 ) -> CoreResult<ObjectValue> {
     let mut object = ObjectValue::new();
     for (key, value) in items {
@@ -488,7 +488,7 @@ fn rule_value_to_json(value: &Value) -> CoreResult<serde_json::Value> {
             .to_err()
             .with_detail("structured numeric value must be finite")
             .err(),
-        Value::Str(s) => Ok(serde_json::Value::from(s.clone())),
+        Value::Str(s) => Ok(serde_json::Value::from(s.as_str())),
         Value::Bool(b) => Ok(serde_json::Value::from(*b)),
         Value::Array(items) => Ok(serde_json::Value::Array(
             items
@@ -502,7 +502,7 @@ fn rule_value_to_json(value: &Value) -> CoreResult<serde_json::Value> {
             keys.sort();
             for key in keys {
                 if let Some(value) = items.get(key) {
-                    object.insert(key.clone(), rule_value_to_json(value)?);
+                    object.insert(key.to_string(), rule_value_to_json(value)?);
                 }
             }
             Ok(serde_json::Value::Object(object))

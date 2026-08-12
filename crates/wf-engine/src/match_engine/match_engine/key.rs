@@ -20,13 +20,13 @@ impl ValueKey {
     pub(super) fn from_value(value: &Value) -> Self {
         match value {
             Value::Number(n) => Self::Number(canonical_f64_bits(*n)),
-            Value::Str(s) => Self::Str(s.clone()),
+            Value::Str(s) => Self::Str(s.to_string()),
             Value::Bool(b) => Self::Bool(*b),
             Value::Array(values) => Self::Array(values.iter().map(Self::from_value).collect()),
             Value::Object(map) => {
                 let mut values: Vec<_> = map
                     .iter()
-                    .map(|(key, value)| (key.clone(), Self::from_value(value)))
+                    .map(|(key, value)| (key.to_string(), Self::from_value(value)))
                     .collect();
                 values.sort_by(|a, b| a.0.cmp(&b.0));
                 Self::Object(values)
@@ -104,7 +104,7 @@ impl InstanceKey {
     pub fn scope_key_values(&self) -> Vec<Value> {
         self.scope_key_str
             .split('\x1f')
-            .map(|s| Value::Str(s.to_string()))
+            .map(|s| Value::Str(s.into()))
             .collect()
     }
 }
@@ -152,7 +152,7 @@ pub(super) fn extract_key(
         let mapped = km
             .iter()
             .find(|e| e.logical_name == *logical && e.source_alias == alias)
-            .and_then(|e| event.fields.get(&e.source_field));
+            .and_then(|e| event.fields.get(e.source_field.as_str()));
 
         if let Some(val) = mapped {
             result.push(val.clone());
@@ -222,7 +222,7 @@ pub(crate) fn field_ref_leaf_name(fr: &FieldRef) -> Option<&str> {
 /// type mismatch yields `None` (which the yield layer degrades to an omitted
 /// field). Other variants use the existing flat lookup.
 pub(crate) fn eval_field_value(
-    fields: &std::collections::HashMap<String, Value>,
+    fields: &std::collections::HashMap<smol_str::SmolStr, Value>,
     fr: &FieldRef,
 ) -> Option<Value> {
     let FieldRef::Path { segments, .. } = fr else {
@@ -232,11 +232,11 @@ pub(crate) fn eval_field_value(
     let Some(PathSegment::Field(root)) = iter.next() else {
         return None;
     };
-    let mut value = fields.get(root)?.clone();
+    let mut value = fields.get(root.as_str())?.clone();
     for segment in iter {
         match segment {
             PathSegment::Field(name) => match value {
-                Value::Object(map) => value = map.get(name)?.clone(),
+                Value::Object(map) => value = map.get(name.as_str())?.clone(),
                 _ => return None,
             },
             PathSegment::Index(idx) => match value {
@@ -260,7 +260,7 @@ pub(super) fn make_scope_key_str(scope_key: &[Value]) -> String {
 pub(crate) fn value_to_string(v: &Value) -> String {
     match v {
         Value::Number(n) => n.to_string(),
-        Value::Str(s) => s.clone(),
+        Value::Str(s) => s.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Array(_) => "[array]".to_string(),
         Value::Object(_) => "[object]".to_string(),
@@ -273,10 +273,10 @@ mod tests {
     use std::collections::HashMap;
     use wf_lang::ast::PathSegment;
 
-    fn fields(pairs: &[(&str, Value)]) -> std::collections::HashMap<String, Value> {
+    fn fields(pairs: &[(&str, Value)]) -> std::collections::HashMap<smol_str::SmolStr, Value> {
         pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.clone()))
+            .map(|(k, v)| ((*k).into(), v.clone()))
             .collect()
     }
 
@@ -292,11 +292,8 @@ mod tests {
         let f = fields(&[(
             "roles_obj",
             Value::Object(HashMap::from([(
-                "source".to_string(),
-                Value::Object(HashMap::from([(
-                    "uid".to_string(),
-                    Value::Str("abc".to_string()),
-                )])),
+                "source".into(),
+                Value::Object(HashMap::from([("uid".into(), Value::Str("abc".into()))])),
             )])),
         )]);
         let fr = path(
@@ -331,7 +328,7 @@ mod tests {
         let f = fields(&[(
             "roles_obj",
             Value::Object(HashMap::from([(
-                "source".to_string(),
+                "source".into(),
                 Value::Object(HashMap::new()),
             )])),
         )]);
@@ -359,10 +356,7 @@ mod tests {
     fn eval_path_type_mismatch_is_none() {
         let f = fields(&[(
             "roles_obj",
-            Value::Object(HashMap::from([(
-                "source".to_string(),
-                Value::Str("s".into()),
-            )])),
+            Value::Object(HashMap::from([("source".into(), Value::Str("s".into()))])),
         )]);
         // `source` is a string, not an object → next member fails.
         let fr = path(
@@ -404,7 +398,7 @@ mod tests {
         // An index segment applied to a non-array value is a type mismatch.
         let f = fields(&[(
             "roles_obj",
-            Value::Object(HashMap::from([("x".to_string(), Value::Str("s".into()))])),
+            Value::Object(HashMap::from([("x".into(), Value::Str("s".into()))])),
         )]);
         let fr = path(
             "e",
@@ -447,11 +441,11 @@ mod tests {
         let f = fields(&[(
             "roles_obj",
             Value::Object(HashMap::from([(
-                "related".to_string(),
+                "related".into(),
                 Value::Array(vec![Value::Object(HashMap::from([(
-                    "process".to_string(),
+                    "process".into(),
                     Value::Object(HashMap::from([(
-                        "name".to_string(),
+                        "name".into(),
                         Value::Str("evil.exe".into()),
                     )])),
                 )]))]),

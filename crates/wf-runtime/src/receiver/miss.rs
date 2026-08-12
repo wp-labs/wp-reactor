@@ -157,7 +157,7 @@ fn record_window_miss_row(
         if !miss.sample_payload.is_empty() {
             existing.insert(
                 "raw_payload".into(),
-                Value::Str(miss.sample_payload.clone()),
+                Value::Str(miss.sample_payload.clone().into()),
             );
         }
         rows.push(existing);
@@ -165,17 +165,26 @@ fn record_window_miss_row(
     }
 
     let mut row = HashMap::new();
-    row.insert("source_name".into(), Value::Str(source_name.to_string()));
-    row.insert("source_kind".into(), Value::Str(source_kind.to_string()));
+    row.insert(
+        "source_name".into(),
+        Value::Str(source_name.to_string().into()),
+    );
+    row.insert(
+        "source_kind".into(),
+        Value::Str(source_kind.to_string().into()),
+    );
     row.insert(
         "stream_tag_field".into(),
-        Value::Str(miss.stream_tag_field.clone()),
+        Value::Str(miss.stream_tag_field.clone().into()),
     );
-    row.insert("stream_tag".into(), Value::Str(stream_tag.to_string()));
-    row.insert("reason".into(), Value::Str(reason.to_string()));
+    row.insert(
+        "stream_tag".into(),
+        Value::Str(stream_tag.to_string().into()),
+    );
+    row.insert("reason".into(), Value::Str(reason.to_string().into()));
     row.insert(
         "raw_payload".into(),
-        Value::Str(miss.sample_payload.clone()),
+        Value::Str(miss.sample_payload.clone().into()),
     );
     row.insert(
         "payload_bytes".into(),
@@ -275,7 +284,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].get("stream_tag"),
-            Some(&Value::Str("unknown".to_string()))
+            Some(&Value::Str("unknown".into()))
         );
         assert_eq!(rows[0].get("count"), Some(&Value::Number(4.0)));
     }

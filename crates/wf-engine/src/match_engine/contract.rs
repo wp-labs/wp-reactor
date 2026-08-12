@@ -283,7 +283,7 @@ fn fields_to_event(fields: &[FieldAssign]) -> Event {
     let mut map = HashMap::new();
     for f in fields {
         if let Some(v) = expr_to_value(&f.value) {
-            map.insert(f.name.clone(), v);
+            map.insert(f.name.clone().into(), v);
         }
     }
     Event { fields: map }

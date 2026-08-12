@@ -21,6 +21,28 @@ type AlertDetailByRule = BTreeMap<String, AlertDetailByMachine>;
 type ReceiverMissCounts = BTreeMap<String, AtomicU64>;
 type ReceiverMissBySource = BTreeMap<String, ReceiverMissCounts>;
 
+/// Shard count for the `alert_emitted_detail` map. Each rule hashes to exactly
+/// one shard, so the per-alert update lock is uncontended across rule tasks
+/// (previously all rules fought over a single global `Mutex`, and the 1s metric
+/// drain held that same lock while iterating the whole scope space).
+const ALERT_DETAIL_SHARDS: usize = 64;
+/// Per-rule cap on distinct scope keys tracked in alert detail. Beyond this,
+/// new scopes count only toward `alert_emitted_total` (the authoritative per-
+/// rule total). Bounds both memory and per-interval ndjson volume on
+/// high-cardinality rules (e.g. a pass-through rule keyed on a wide id space).
+const ALERT_DETAIL_MAX_SCOPES_PER_RULE: usize = 1024;
+
+/// FNV-1a over the rule name → shard index. Cheap, deterministic within a
+/// process, and keeps one rule pinned to one shard.
+fn alert_detail_shard(rule: &str) -> usize {
+    let mut hash: usize = 0xcbf2_9ce4_8422_2325;
+    for byte in rule.bytes() {
+        hash ^= byte as usize;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash % ALERT_DETAIL_SHARDS
+}
+
 const DEFAULT_HISTOGRAM_BUCKETS_SECONDS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
 ];
@@ -669,7 +691,7 @@ pub struct RuntimeMetrics {
     rule_cursor_gap_total: BTreeMap<String, BTreeMap<String, AtomicU64>>,
 
     alert_emitted_total: BTreeMap<String, AtomicU64>,
-    alert_emitted_detail_total: Mutex<AlertDetailByRule>,
+    alert_emitted_detail_shards: Vec<Mutex<AlertDetailByRule>>,
     alert_channel_send_failed_total: AtomicU64,
     alert_sink_dispatch_failed_total: AtomicU64,
     alert_channel_full_total: AtomicU64,
@@ -836,7 +858,9 @@ impl RuntimeMetrics {
             rule_instances: make_rule_map(),
             rule_cursor_gap_total: gap_map,
             alert_emitted_total: make_rule_map(),
-            alert_emitted_detail_total: Mutex::new(BTreeMap::new()),
+            alert_emitted_detail_shards: (0..ALERT_DETAIL_SHARDS)
+                .map(|_| Mutex::new(BTreeMap::new()))
+                .collect(),
             alert_channel_send_failed_total: AtomicU64::new(0),
             alert_sink_dispatch_failed_total: AtomicU64::new(0),
             alert_channel_full_total: AtomicU64::new(0),
@@ -1000,9 +1024,18 @@ impl RuntimeMetrics {
             machine_id
         };
         let scope = if scope_key.is_empty() { "-" } else { scope_key };
-        let mut map = self.alert_emitted_detail_total.lock().unwrap();
+        // Sharded by rule: only this rule's task contends on its own shard.
+        let mut map = self.alert_emitted_detail_shards[alert_detail_shard(rule)]
+            .lock()
+            .unwrap();
         let by_machine = map.entry(rule.to_string()).or_default();
         let by_scope = by_machine.entry(machine.to_string()).or_default();
+        if by_scope.len() >= ALERT_DETAIL_MAX_SCOPES_PER_RULE
+            && !by_scope.contains_key(scope)
+        {
+            // Bounded: count only in alert_emitted_total for new scopes.
+            return;
+        }
         let v = by_scope
             .entry(scope.to_string())
             .or_insert_with(|| AtomicU64::new(0));
@@ -1026,22 +1059,30 @@ impl RuntimeMetrics {
     }
 
     fn drain_emitted_detail(&self) -> BTreeMap<String, BTreeMap<String, BTreeMap<String, u64>>> {
-        let map = self.alert_emitted_detail_total.lock().unwrap();
         let mut result = BTreeMap::new();
-        for (rule, by_machine) in map.iter() {
-            let mut machine_map = BTreeMap::new();
-            for (machine, by_scope) in by_machine.iter() {
-                let drained: BTreeMap<String, u64> = by_scope
-                    .iter()
-                    .map(|(scope, v)| (scope.clone(), v.swap(0, Ordering::Relaxed)))
-                    .filter(|(_, v)| *v > 0)
-                    .collect();
-                if !drained.is_empty() {
-                    machine_map.insert(machine.clone(), drained);
+        for shard in &self.alert_emitted_detail_shards {
+            // Swap the whole shard out so the lock is held only for the O(1)
+            // `take`, never while iterating a large scope space (the previous
+            // global lock was held across the full drain every interval).
+            let taken = {
+                let mut map = shard.lock().unwrap();
+                std::mem::take(&mut *map)
+            };
+            for (rule, by_machine) in taken {
+                let mut machine_map = BTreeMap::new();
+                for (machine, by_scope) in by_machine {
+                    let drained: BTreeMap<String, u64> = by_scope
+                        .into_iter()
+                        .map(|(scope, v)| (scope, v.into_inner()))
+                        .filter(|(_, v)| *v > 0)
+                        .collect();
+                    if !drained.is_empty() {
+                        machine_map.insert(machine, drained);
+                    }
                 }
-            }
-            if !machine_map.is_empty() {
-                result.insert(rule.clone(), machine_map);
+                if !machine_map.is_empty() {
+                    result.insert(rule, machine_map);
+                }
             }
         }
         result

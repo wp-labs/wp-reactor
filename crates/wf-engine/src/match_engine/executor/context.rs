@@ -26,7 +26,7 @@ pub(super) fn build_eval_context(
     // Key fields — preserve original Value type
     for (fr, val) in keys.iter().zip(scope_key.iter()) {
         let name = field_ref_name(fr).to_string();
-        fields.insert(name, val.clone());
+        fields.insert(name.into(), val.clone());
     }
 
     // Step labels → measure values (skip if name collides with a key field)
@@ -35,49 +35,49 @@ pub(super) fn build_eval_context(
         if let Some(label) = &sd.label
             && !fields.contains_key(label.as_str())
         {
-            fields.insert(label.clone(), Value::Number(sd.measure_value));
+            fields.insert(label.clone().into(), Value::Number(sd.measure_value));
         }
         // Store collected values for L3 functions (collect_set/list, first/last, stddev/percentile)
         let values_field = format!("_step_{}_values", step_idx);
         let values_array = Value::Array(sd.collected_values.clone());
-        fields.insert(values_field, values_array);
+        fields.insert(values_field.into(), values_array);
         for (field_name, values) in &sd.field_values {
             let step_field = format!("_step_{}_field_{}", step_idx, field_name);
-            fields.insert(step_field, Value::Array(values.clone()));
+            fields.insert(step_field.into(), Value::Array(values.clone()));
             if let Some(last_val) = values.last()
                 && !fields.contains_key(field_name.as_str())
             {
-                fields.insert(field_name.clone(), last_val.clone());
+                fields.insert(field_name.clone().into(), last_val.clone());
             }
         }
         let measure_field = format!("_step_{}_measure", step_idx);
-        fields.insert(measure_field, Value::Number(sd.measure_value));
+        fields.insert(measure_field.into(), Value::Number(sd.measure_value));
         if let Some(label) = &sd.label {
             let label_field = format!("_step_{}_label", step_idx);
-            fields.insert(label_field, Value::Str(label.clone()));
+            fields.insert(label_field.into(), Value::Str(label.clone().into()));
         }
         if let Some(step_plan) = step_plans.get(step_idx)
             && let Some(branch) = step_plan.branches.get(sd.satisfied_branch_index)
         {
             let source_field = format!("_step_{}_source", step_idx);
-            fields.insert(source_field, Value::Str(branch.source.clone()));
+            fields.insert(source_field.into(), Value::Str(branch.source.clone().into()));
         }
     }
 
     for bd in bind_data {
         fields.insert(
-            format!("_bind_{}_count", bd.alias),
+            format!("_bind_{}_count", bd.alias).into(),
             Value::Number(bd.count as f64),
         );
         for (field_name, values) in &bd.field_values {
             fields.insert(
-                format!("_bind_{}_field_{}", bd.alias, field_name),
+                format!("_bind_{}_field_{}", bd.alias, field_name).into(),
                 Value::Array(values.clone()),
             );
             if let Some(last_val) = values.last()
                 && !fields.contains_key(field_name.as_str())
             {
-                fields.insert(field_name.to_string(), last_val.clone());
+                fields.insert(field_name.clone().into(), last_val.clone());
             }
         }
     }
@@ -138,9 +138,9 @@ pub(super) fn execute_joins(
 
         for (field_name, value) in &row {
             let qualified = format!("{}.{}", join.right_window, field_name);
-            ctx.fields.insert(qualified, value.clone());
+            ctx.fields.insert(qualified.into(), value.clone());
             ctx.fields
-                .entry(field_name.clone())
+                .entry(field_name.clone().into())
                 .or_insert_with(|| value.clone());
         }
     }

@@ -119,7 +119,7 @@ pub(super) fn eval_single_string_arg_with_l3(
         return None;
     }
     match eval_expr_with_l3(&args[0], ctx, score)? {
-        Value::Str(s) => Some(s),
+        Value::Str(s) => Some(s.to_string()),
         _ => None,
     }
 }
@@ -127,7 +127,7 @@ pub(super) fn eval_single_string_arg_with_l3(
 pub(super) fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Option<()> {
     let (tag, text) = match value {
         Value::Number(_) => ("n", value_to_string(value)),
-        Value::Str(s) => ("s", s.clone()),
+        Value::Str(s) => ("s", s.to_string()),
         Value::Bool(_) => ("b", value_to_string(value)),
         Value::Array(_) | Value::Object(_) => return None,
     };

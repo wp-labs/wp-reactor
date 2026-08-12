@@ -32,19 +32,27 @@ use super::types::{RunRule, RunRuleKind, TaskGroup};
 // Phase 2: task spawn helpers — each creates channel + spawns task
 // ---------------------------------------------------------------------------
 
-/// Spawn the alert pipeline: build channel, spawn consumer task.
-/// Returns (alert_tx, task_group).
+/// Spawn the alert pipeline: one bounded channel + consumer task per
+/// [`alert_task::ALERT_CONSUMERS`]. Rule tasks round-robin their emits across
+/// the returned senders so output processing is not capped by a single
+/// consumer. Returns (alert_txs, task_group).
 pub(super) fn spawn_alert_task(
     dispatcher: Arc<SinkDispatcher>,
     metrics: Option<Arc<RuntimeMetrics>>,
-) -> (mpsc::Sender<OutputRecord>, TaskGroup) {
-    let (alert_tx, alert_rx) = mpsc::channel(alert_task::ALERT_CHANNEL_CAPACITY);
+) -> (Vec<mpsc::Sender<OutputRecord>>, TaskGroup) {
     let mut group = TaskGroup::new("alert");
-    group.push(tokio::spawn(async move {
-        alert_task::run_alert_dispatcher(alert_rx, dispatcher, metrics).await;
-        Ok(())
-    }));
-    (alert_tx, group)
+    let mut txs = Vec::with_capacity(alert_task::ALERT_CONSUMERS);
+    for _ in 0..alert_task::ALERT_CONSUMERS {
+        let (alert_tx, alert_rx) = mpsc::channel(alert_task::ALERT_CHANNEL_CAPACITY);
+        txs.push(alert_tx);
+        let dispatcher = Arc::clone(&dispatcher);
+        let metrics = metrics.clone();
+        group.push(tokio::spawn(async move {
+            alert_task::run_alert_dispatcher(alert_rx, dispatcher, metrics).await;
+            Ok(())
+        }));
+    }
+    (txs, group)
 }
 
 /// Spawn the periodic window evictor task.
@@ -74,7 +82,7 @@ pub(super) fn spawn_rule_tasks(
     rules: Vec<RunRule>,
     router: &Arc<Router>,
     intermediate_targets: &HashSet<String>,
-    alert_tx: mpsc::Sender<OutputRecord>,
+    alert_txs: Vec<mpsc::Sender<OutputRecord>>,
     cancel: CancellationToken,
     metrics: Option<Arc<RuntimeMetrics>>,
     eos_tx: watch::Sender<u64>,
@@ -95,7 +103,7 @@ pub(super) fn spawn_rule_tasks(
             each_time_field,
             executor: rule.executor,
             window_sources,
-            alert_tx: alert_tx.clone(),
+            alert_txs: alert_txs.clone(),
             cancel: cancel.child_token(),
             timeout_scan_interval,
             router: Arc::clone(router),
@@ -109,9 +117,10 @@ pub(super) fn spawn_rule_tasks(
         ));
     }
 
-    // Drop our copy of alert_tx so the alert channel closes when all rule
-    // tasks finish.
-    drop(alert_tx);
+    // Drop our copy of the senders so the alert channels close when all rule
+    // tasks finish (the Reactor holds the master senders for the run's
+    // lifetime).
+    drop(alert_txs);
 
     group
 }

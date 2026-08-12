@@ -52,18 +52,18 @@ impl YieldMeta<'_> {
         use wf_lang::wfu_meta::WfuMetaField;
 
         match field {
-            WfuMetaField::Id => self.wfx_id.map(|value| Value::Str(value.to_string())),
-            WfuMetaField::RuleName => self.rule_name.map(|value| Value::Str(value.to_string())),
+            WfuMetaField::Id => self.wfx_id.map(|value| Value::Str(value.into())),
+            WfuMetaField::RuleName => self.rule_name.map(|value| Value::Str(value.into())),
             WfuMetaField::Score => self.score.map(Value::Number),
-            WfuMetaField::EntityType => self.entity_type.map(|value| Value::Str(value.to_string())),
-            WfuMetaField::EntityId => self.entity_id.map(|value| Value::Str(value.to_string())),
-            WfuMetaField::Origin => self.origin.map(|value| Value::Str(value.to_string())),
+            WfuMetaField::EntityType => self.entity_type.map(|value| Value::Str(value.into())),
+            WfuMetaField::EntityId => self.entity_id.map(|value| Value::Str(value.into())),
+            WfuMetaField::Origin => self.origin.map(|value| Value::Str(value.into())),
             WfuMetaField::CloseReason => {
-                self.close_reason.map(|value| Value::Str(value.to_string()))
+                self.close_reason.map(|value| Value::Str(value.into()))
             }
-            WfuMetaField::FiredAt => self.fired_at.map(|value| Value::Str(value.to_string())),
-            WfuMetaField::EmitTime => self.emit_time.map(|value| Value::Str(value.to_string())),
-            WfuMetaField::Summary => self.summary.map(|value| Value::Str(value.to_string())),
+            WfuMetaField::FiredAt => self.fired_at.map(|value| Value::Str(value.into())),
+            WfuMetaField::EmitTime => self.emit_time.map(|value| Value::Str(value.into())),
+            WfuMetaField::Summary => self.summary.map(|value| Value::Str(value.into())),
         }
     }
 }
@@ -133,7 +133,7 @@ pub(super) fn eval_yield_expr_with_meta(
     // For yield expressions, fall back to empty string when a field is missing
     // (e.g., join window fields not available in test runner)
     with_yield_eval_scope(|| match eval_expr_with_l3(expr, ctx, meta) {
-        None => Some(Value::Str(String::new())),
+        None => Some(Value::Str(String::new().into())),
         val => val,
     })
 }
@@ -168,7 +168,7 @@ pub(super) fn eval_expr_with_l3(
     let score = meta;
     match expr {
         Expr::Number(n) => Some(Value::Number(*n)),
-        Expr::StringLit(s) => Some(Value::Str(s.clone())),
+        Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
         Expr::Bool(b) => Some(Value::Bool(*b)),
         Expr::SystemVar(SystemVar::Score) => meta.score.map(Value::Number),
         Expr::SystemVar(SystemVar::EventFirstTime | SystemVar::EvidenceStartTime) => {
@@ -191,7 +191,7 @@ pub(super) fn eval_expr_with_l3(
             for item in items {
                 let value = eval_expr_with_l3(&item.value, ctx, score)?;
                 for target in &item.targets {
-                    map.insert(target.clone(), value.clone());
+                    map.insert(target.clone().into(), value.clone());
                 }
             }
             Some(Value::Object(map))

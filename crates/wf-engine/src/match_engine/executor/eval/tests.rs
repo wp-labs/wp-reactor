@@ -6,8 +6,8 @@ use wf_lang::ast::{BinOp, Expr, FieldRef, ObjectItem};
 
 fn make_test_event(values: Vec<Value>) -> Event {
     let mut fields = std::collections::HashMap::new();
-    fields.insert("_step_0_values".to_string(), Value::Array(values));
-    fields.insert("_step_0_source".to_string(), Value::Str("e".to_string()));
+    fields.insert("_step_0_values".into(), Value::Array(values));
+    fields.insert("_step_0_source".into(), Value::Str("e".into()));
     Event { fields }
 }
 
@@ -69,10 +69,10 @@ fn test_collect_list_returns_all_values() {
 #[test]
 fn test_collect_set_returns_unique_values() {
     let ctx = make_test_event(vec![
-        Value::Str("a".to_string()),
-        Value::Str("b".to_string()),
-        Value::Str("a".to_string()),
-        Value::Str("c".to_string()),
+        Value::Str("a".into()),
+        Value::Str("b".into()),
+        Value::Str("a".into()),
+        Value::Str("c".into()),
     ]);
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -91,11 +91,11 @@ fn test_collect_set_returns_unique_values() {
 fn test_collect_set_qualified_bind_field_missing_does_not_fallback_to_step_values() {
     let mut fields = std::collections::HashMap::new();
     fields.insert(
-        "_step_0_values".to_string(),
-        Value::Array(vec![Value::Str("10.0.0.1".to_string())]),
+        "_step_0_values".into(),
+        Value::Array(vec![Value::Str("10.0.0.1".into())]),
     );
-    fields.insert("_step_0_source".to_string(), Value::Str("s".to_string()));
-    fields.insert("_bind_s_count".to_string(), Value::Number(6.0));
+    fields.insert("_step_0_source".into(), Value::Str("s".into()));
+    fields.insert("_bind_s_count".into(), Value::Number(6.0));
     let ctx = Event { fields };
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -113,11 +113,11 @@ fn test_collect_set_qualified_bind_field_missing_does_not_fallback_to_step_value
 #[test]
 fn test_merge_shallow_merges_objects_left_to_right() {
     let mut base = std::collections::HashMap::new();
-    base.insert("severity".to_string(), Value::Number(3.0));
-    base.insert("existing".to_string(), Value::Str("kept".to_string()));
+    base.insert("severity".into(), Value::Number(3.0));
+    base.insert("existing".into(), Value::Str("kept".into()));
 
     let mut fields = std::collections::HashMap::new();
-    fields.insert("extension".to_string(), Value::Object(base));
+    fields.insert("extension".into(), Value::Object(base));
     let ctx = Event { fields };
 
     let expr = Expr::FuncCall {
@@ -147,9 +147,9 @@ fn test_merge_shallow_merges_objects_left_to_right() {
     };
     assert_eq!(
         object.get("existing"),
-        Some(&Value::Str("kept".to_string()))
+        Some(&Value::Str("kept".into()))
     );
-    assert_eq!(object.get("source"), Some(&Value::Str("wfl".to_string())));
+    assert_eq!(object.get("source"), Some(&Value::Str("wfl".into())));
     assert_eq!(object.get("severity"), Some(&Value::Number(10.0)));
 }
 
@@ -316,15 +316,15 @@ fn test_nested_l3_in_arithmetic() {
 fn test_qualified_alias_selects_matching_step() {
     let mut fields = std::collections::HashMap::new();
     fields.insert(
-        "_step_0_values".to_string(),
+        "_step_0_values".into(),
         Value::Array(vec![Value::Number(10.0)]),
     );
-    fields.insert("_step_0_source".to_string(), Value::Str("a".to_string()));
+    fields.insert("_step_0_source".into(), Value::Str("a".into()));
     fields.insert(
-        "_step_1_values".to_string(),
+        "_step_1_values".into(),
         Value::Array(vec![Value::Number(99.0)]),
     );
-    fields.insert("_step_1_source".to_string(), Value::Str("b".to_string()));
+    fields.insert("_step_1_source".into(), Value::Str("b".into()));
     let ctx = Event { fields };
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -342,10 +342,10 @@ fn test_qualified_alias_selects_matching_step() {
 fn test_qualified_alias_without_match_returns_none_for_first() {
     let mut fields = std::collections::HashMap::new();
     fields.insert(
-        "_step_0_values".to_string(),
+        "_step_0_values".into(),
         Value::Array(vec![Value::Number(10.0)]),
     );
-    fields.insert("_step_0_source".to_string(), Value::Str("a".to_string()));
+    fields.insert("_step_0_source".into(), Value::Str("a".into()));
     let ctx = Event { fields };
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -357,15 +357,15 @@ fn test_qualified_alias_without_match_returns_none_for_first() {
     };
     let result = eval_yield_expr(&expr, &ctx);
     // fallback: missing join data returns empty string instead of None
-    assert_eq!(result, Some(Value::Str("".to_string())));
+    assert_eq!(result, Some(Value::Str("".into())));
 }
 
 #[test]
 fn test_replace_works_in_yield_eval() {
     let mut fields = std::collections::HashMap::new();
     fields.insert(
-        "msg".to_string(),
-        Value::Str("failed_login_from_root".to_string()),
+        "msg".into(),
+        Value::Str("failed_login_from_root".into()),
     );
     let ctx = Event { fields };
     let expr = Expr::FuncCall {
@@ -378,15 +378,15 @@ fn test_replace_works_in_yield_eval() {
         ],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    assert_eq!(result, Some(Value::Str("suspicious".to_string())));
+    assert_eq!(result, Some(Value::Str("suspicious".into())));
 }
 
 #[test]
 fn test_mvcount_with_collect_set_nested_l3() {
     let ctx = make_test_event(vec![
-        Value::Str("a".to_string()),
-        Value::Str("b".to_string()),
-        Value::Str("a".to_string()),
+        Value::Str("a".into()),
+        Value::Str("b".into()),
+        Value::Str("a".into()),
     ]);
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -404,7 +404,7 @@ fn test_mvcount_with_collect_set_nested_l3() {
 #[test]
 fn test_trim_works_in_yield_eval() {
     let mut fields = std::collections::HashMap::new();
-    fields.insert("msg".to_string(), Value::Str("  hello  ".to_string()));
+    fields.insert("msg".into(), Value::Str("  hello  ".into()));
     let ctx = Event { fields };
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -412,17 +412,17 @@ fn test_trim_works_in_yield_eval() {
         args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    assert_eq!(result, Some(Value::Str("hello".to_string())));
+    assert_eq!(result, Some(Value::Str("hello".into())));
 }
 
 #[test]
 fn test_blank_functions_work_in_yield_eval() {
     let mut fields = std::collections::HashMap::new();
-    fields.insert("empty".to_string(), Value::Str(String::new()));
-    fields.insert("spaces".to_string(), Value::Str(" \t\n ".to_string()));
-    fields.insert("host".to_string(), Value::Str("example.org".to_string()));
-    fields.insert("fallback".to_string(), Value::Str("fallback".to_string()));
-    fields.insert("n".to_string(), Value::Number(42.0));
+    fields.insert("empty".into(), Value::Str(String::new().into()));
+    fields.insert("spaces".into(), Value::Str(" \t\n ".into()));
+    fields.insert("host".into(), Value::Str("example.org".into()));
+    fields.insert("fallback".into(), Value::Str("fallback".into()));
+    fields.insert("n".into(), Value::Number(42.0));
     let ctx = Event { fields };
 
     let is_empty_expr = Expr::FuncCall {
@@ -520,47 +520,47 @@ fn test_blank_functions_work_in_yield_eval() {
     );
     assert_eq!(
         eval_yield_expr(&null_if_blank_expr, &ctx),
-        Some(Value::Str(String::new()))
+        Some(Value::Str(String::new().into()))
     );
     assert_eq!(
         eval_yield_expr(&null_if_host_expr, &ctx),
-        Some(Value::Str("example.org".to_string()))
+        Some(Value::Str("example.org".into()))
     );
     assert_eq!(
         eval_yield_expr(&default_blank_expr, &ctx),
-        Some(Value::Str("fallback".to_string()))
+        Some(Value::Str("fallback".into()))
     );
     assert_eq!(
         eval_yield_expr(&default_host_expr, &ctx),
-        Some(Value::Str("example.org".to_string()))
+        Some(Value::Str("example.org".into()))
     );
     assert_eq!(
         eval_yield_expr(&coalesce_blank_expr, &ctx),
-        Some(Value::Str("fallback".to_string()))
+        Some(Value::Str("fallback".into()))
     );
     assert_eq!(
         eval_yield_expr(&coalesce_direct_blank_expr, &ctx),
-        Some(Value::Str("example.org".to_string()))
+        Some(Value::Str("example.org".into()))
     );
     assert_eq!(
         eval_yield_expr(&coalesce_all_blank_expr, &ctx),
-        Some(Value::Str(String::new()))
+        Some(Value::Str(String::new().into()))
     );
     assert_eq!(
         eval_yield_expr(&invalid_type_expr, &ctx),
-        Some(Value::Str(String::new()))
+        Some(Value::Str(String::new().into()))
     );
 }
 
 #[test]
 fn test_hash_and_id_functions_work_in_yield_eval() {
     let mut fields = std::collections::HashMap::new();
-    fields.insert("msg".to_string(), Value::Str("hello".to_string()));
-    fields.insert("empty".to_string(), Value::Str(String::new()));
-    fields.insert("ip".to_string(), Value::Str("10.0.0.1".to_string()));
-    fields.insert("count".to_string(), Value::Number(3.0));
-    fields.insert("special".to_string(), Value::Str("a|b".to_string()));
-    fields.insert("percent".to_string(), Value::Str("10%".to_string()));
+    fields.insert("msg".into(), Value::Str("hello".into()));
+    fields.insert("empty".into(), Value::Str(String::new().into()));
+    fields.insert("ip".into(), Value::Str("10.0.0.1".into()));
+    fields.insert("count".into(), Value::Number(3.0));
+    fields.insert("special".into(), Value::Str("a|b".into()));
+    fields.insert("percent".into(), Value::Str("10%".into()));
     let ctx = Event { fields };
 
     let md5_expr = Expr::FuncCall {
@@ -704,47 +704,47 @@ fn test_hash_and_id_functions_work_in_yield_eval() {
 
     assert_eq!(
         eval_yield_expr(&md5_expr, &ctx),
-        Some(Value::Str("5d41402abc4b2a76b9719d911017c592".to_string()))
+        Some(Value::Str("5d41402abc4b2a76b9719d911017c592".into()))
     );
     assert_eq!(
         eval_yield_expr(&sha1_expr, &ctx),
         Some(Value::Str(
-            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string()
+            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".into()
         ))
     );
     assert_eq!(
         eval_yield_expr(&sha1_n_expr, &ctx),
-        Some(Value::Str("aaf4c61d".to_string()))
+        Some(Value::Str("aaf4c61d".into()))
     );
     assert_eq!(
         eval_yield_expr(&sha1_n_empty_expr, &ctx),
-        Some(Value::Str("da39a3ee".to_string()))
+        Some(Value::Str("da39a3ee".into()))
     );
     assert_eq!(
         eval_yield_expr(&sha256_expr, &ctx),
         Some(Value::Str(
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string()
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into()
         ))
     );
     assert_eq!(
         eval_yield_expr(&hex_expr, &ctx),
-        Some(Value::Str("68656c6c6f".to_string()))
+        Some(Value::Str("68656c6c6f".into()))
     );
     assert_eq!(
         eval_yield_expr(&join_expr, &ctx),
-        Some(Value::Str("a|b10%3".to_string()))
+        Some(Value::Str("a|b10%3".into()))
     );
     assert_eq!(
         eval_yield_expr(&join_by_expr, &ctx),
-        Some(Value::Str("a|b|10%||3".to_string()))
+        Some(Value::Str("a|b|10%||3".into()))
     );
     assert_eq!(
         eval_yield_expr(&join_missing_expr, &ctx),
-        Some(Value::Str("a|b10%".to_string()))
+        Some(Value::Str("a|b10%".into()))
     );
     assert_eq!(
         eval_yield_expr(&join_by_missing_expr, &ctx),
-        Some(Value::Str("a|b||10%".to_string()))
+        Some(Value::Str("a|b||10%".into()))
     );
     assert_eq!(
         eval_expr_with_l3(&join_array_expr, &ctx, YieldMeta::default()),
@@ -768,7 +768,7 @@ fn test_hash_and_id_functions_work_in_yield_eval() {
     assert_eq!(stable_id, "alert_ba0dab7ccfb2a04c");
     assert_eq!(
         eval_yield_expr(&stable_expr, &ctx),
-        Some(Value::Str(stable_id.clone()))
+        Some(Value::Str(stable_id.clone().into()))
     );
     let Some(Value::Str(changed_stable_id)) = eval_yield_expr(&stable_changed_expr, &ctx) else {
         panic!("stable_id() should return a string for changed input");
@@ -804,11 +804,11 @@ fn test_stable_id_uses_unambiguous_segments_in_yield_eval() {
 
     assert_eq!(
         eval_yield_expr(&first_expr, &ctx),
-        Some(Value::Str("id_234c47ae916c73b0".to_string()))
+        Some(Value::Str("id_234c47ae916c73b0".into()))
     );
     assert_eq!(
         eval_yield_expr(&second_expr, &ctx),
-        Some(Value::Str("id_1532803f7ab9f6de".to_string()))
+        Some(Value::Str("id_1532803f7ab9f6de".into()))
     );
     assert_ne!(
         eval_yield_expr(&first_expr, &ctx),
@@ -881,9 +881,9 @@ fn test_time_bucket_rejects_invalid_interval_in_yield_eval() {
 #[test]
 fn test_mvjoin_with_collect_list_nested_l3() {
     let ctx = make_test_event(vec![
-        Value::Str("a".to_string()),
-        Value::Str("b".to_string()),
-        Value::Str("c".to_string()),
+        Value::Str("a".into()),
+        Value::Str("b".into()),
+        Value::Str("c".into()),
     ]);
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -898,13 +898,13 @@ fn test_mvjoin_with_collect_list_nested_l3() {
         ],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    assert_eq!(result, Some(Value::Str("a,b,c".to_string())));
+    assert_eq!(result, Some(Value::Str("a,b,c".into())));
 }
 
 #[test]
 fn test_split_works_in_yield_eval() {
     let mut fields = std::collections::HashMap::new();
-    fields.insert("csv".to_string(), Value::Str("a,b,,c".to_string()));
+    fields.insert("csv".into(), Value::Str("a,b,,c".into()));
     let ctx = Event { fields };
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -918,10 +918,10 @@ fn test_split_works_in_yield_eval() {
     assert_eq!(
         result,
         Some(Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
-            Value::Str(String::new()),
-            Value::Str("c".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str(String::new().into()),
+            Value::Str("c".into()),
         ]))
     );
 }
@@ -929,11 +929,11 @@ fn test_split_works_in_yield_eval() {
 #[test]
 fn test_mvdedup_with_collect_list_nested_l3() {
     let ctx = make_test_event(vec![
-        Value::Str("a".to_string()),
-        Value::Str("b".to_string()),
-        Value::Str("a".to_string()),
-        Value::Str("c".to_string()),
-        Value::Str("b".to_string()),
+        Value::Str("a".into()),
+        Value::Str("b".into()),
+        Value::Str("a".into()),
+        Value::Str("c".into()),
+        Value::Str("b".into()),
     ]);
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -948,9 +948,9 @@ fn test_mvdedup_with_collect_list_nested_l3() {
     assert_eq!(
         result,
         Some(Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
-            Value::Str("c".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str("c".into()),
         ]))
     );
 }
@@ -958,7 +958,7 @@ fn test_mvdedup_with_collect_list_nested_l3() {
 #[test]
 fn test_substr_works_in_yield_eval() {
     let mut fields = std::collections::HashMap::new();
-    fields.insert("msg".to_string(), Value::Str("abcdef".to_string()));
+    fields.insert("msg".into(), Value::Str("abcdef".into()));
     let ctx = Event { fields };
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -970,15 +970,15 @@ fn test_substr_works_in_yield_eval() {
         ],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    assert_eq!(result, Some(Value::Str("bcd".to_string())));
+    assert_eq!(result, Some(Value::Str("bcd".into())));
 }
 
 #[test]
 fn test_startswith_and_endswith_in_yield_eval() {
     let mut fields = std::collections::HashMap::new();
     fields.insert(
-        "msg".to_string(),
-        Value::Str("failed_login_root".to_string()),
+        "msg".into(),
+        Value::Str("failed_login_root".into()),
     );
     let ctx = Event { fields };
     let starts_expr = Expr::FuncCall {
@@ -1004,19 +1004,19 @@ fn test_startswith_and_endswith_in_yield_eval() {
 #[test]
 fn test_math_and_time_functions_in_yield_eval() {
     let mut fields = std::collections::HashMap::new();
-    fields.insert("n".to_string(), Value::Number(-12.345));
-    fields.insert("p".to_string(), Value::Number(16.0));
-    fields.insert("ts".to_string(), Value::Number(0.0));
+    fields.insert("n".into(), Value::Number(-12.345));
+    fields.insert("p".into(), Value::Number(16.0));
+    fields.insert("ts".into(), Value::Number(0.0));
     fields.insert(
-        "msg".to_string(),
-        Value::Str("  failed_login_root  ".to_string()),
+        "msg".into(),
+        Value::Str("  failed_login_root  ".into()),
     );
     fields.insert(
-        "arr".to_string(),
+        "arr".into(),
         Value::Array(vec![
-            Value::Str("b".to_string()),
-            Value::Str("a".to_string()),
-            Value::Str("c".to_string()),
+            Value::Str("b".into()),
+            Value::Str("a".into()),
+            Value::Str("c".into()),
         ]),
     );
     let ctx = Event { fields };
@@ -1230,7 +1230,7 @@ fn test_math_and_time_functions_in_yield_eval() {
     );
     assert_eq!(
         eval_yield_expr(&strftime_expr, &ctx),
-        Some(Value::Str("1970-01-01".to_string()))
+        Some(Value::Str("1970-01-01".into()))
     );
     assert_eq!(
         eval_yield_expr(&strptime_expr, &ctx),
@@ -1279,26 +1279,26 @@ fn test_math_and_time_functions_in_yield_eval() {
     assert_eq!(eval_yield_expr(&finite_expr, &ctx), Some(Value::Bool(true)));
     assert_eq!(
         eval_yield_expr(&ltrim_expr, &ctx),
-        Some(Value::Str("failed_login_root  ".to_string()))
+        Some(Value::Str("failed_login_root  ".into()))
     );
     assert_eq!(
         eval_yield_expr(&rtrim_expr, &ctx),
-        Some(Value::Str("  failed_login_root".to_string()))
+        Some(Value::Str("  failed_login_root".into()))
     );
     assert_eq!(
         eval_yield_expr(&concat_expr, &ctx),
-        Some(Value::Str("ip=1.1.1.1".to_string()))
+        Some(Value::Str("ip=1.1.1.1".into()))
     );
     assert_eq!(eval_yield_expr(&index_expr, &ctx), Some(Value::Number(9.0)));
     assert_eq!(
         eval_yield_expr(&replace_plain_expr, &ctx),
-        Some(Value::Str("  failed-login-root  ".to_string()))
+        Some(Value::Str("  failed-login-root  ".into()))
     );
     assert_eq!(eval_yield_expr(&sw_any_expr, &ctx), Some(Value::Bool(true)));
     assert_eq!(eval_yield_expr(&ew_any_expr, &ctx), Some(Value::Bool(true)));
     assert_eq!(
         eval_yield_expr(&coalesce_expr, &ctx),
-        Some(Value::Str("fallback".to_string()))
+        Some(Value::Str("fallback".into()))
     );
     assert_eq!(eval_yield_expr(&isnull_expr, &ctx), Some(Value::Bool(true)));
     assert_eq!(
@@ -1308,17 +1308,17 @@ fn test_math_and_time_functions_in_yield_eval() {
     assert_eq!(
         eval_yield_expr(&mvsort_expr, &ctx),
         Some(Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
-            Value::Str("c".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str("c".into()),
         ]))
     );
     assert_eq!(
         eval_yield_expr(&mvreverse_expr, &ctx),
         Some(Value::Array(vec![
-            Value::Str("c".to_string()),
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
+            Value::Str("c".into()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
         ]))
     );
 }
@@ -1351,16 +1351,16 @@ fn test_system_score_var_works_inside_builtin_functions() {
     );
     assert_eq!(
         eval_yield_expr_with_score(&concat_expr, &ctx, Some(70.126)),
-        Some(Value::Str("risk=70.126".to_string()))
+        Some(Value::Str("risk=70.126".into()))
     );
 }
 
 #[test]
 fn test_mvindex_with_collect_list_nested_l3() {
     let ctx = make_test_event(vec![
-        Value::Str("a".to_string()),
-        Value::Str("b".to_string()),
-        Value::Str("c".to_string()),
+        Value::Str("a".into()),
+        Value::Str("b".into()),
+        Value::Str("c".into()),
     ]);
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -1375,14 +1375,14 @@ fn test_mvindex_with_collect_list_nested_l3() {
         ],
     };
     let result = eval_yield_expr(&expr, &ctx);
-    assert_eq!(result, Some(Value::Str("b".to_string())));
+    assert_eq!(result, Some(Value::Str("b".into())));
 }
 
 #[test]
 fn test_mvappend_with_collect_list_nested_l3() {
     let ctx = make_test_event(vec![
-        Value::Str("a".to_string()),
-        Value::Str("b".to_string()),
+        Value::Str("a".into()),
+        Value::Str("b".into()),
     ]);
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -1400,9 +1400,9 @@ fn test_mvappend_with_collect_list_nested_l3() {
     assert_eq!(
         result,
         Some(Value::Array(vec![
-            Value::Str("a".to_string()),
-            Value::Str("b".to_string()),
-            Value::Str("c".to_string()),
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str("c".into()),
         ]))
     );
 }

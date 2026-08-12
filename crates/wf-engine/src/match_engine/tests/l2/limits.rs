@@ -436,11 +436,11 @@ fn limits_scan_expired_rate_limit_deterministic() {
 #[test]
 fn limits_max_memory_bytes_drop_oldest_evicts_current_key() {
     // Use a 2-step plan: each step needs count >= 1.
-    // After step1 completes, completed_steps grows and estimated_bytes
-    // increases from ~320 (base for 2-step) to ~384 bytes per instance.
-    // With 2 grown instances: 384 + 384 = 768. Set limit=750 so the check
-    // triggers only when both instances have grown, not during creation.
-    // (During B's creation: A.384 + B.base.320 = 704 < 750 → OK.)
+    // `estimated_memory_bytes` tracks only the O(1) per-instance base cost on
+    // insert/remove; state growth (completed_steps after step1) is invisible
+    // until `recalibrate_memory()` re-anchors to the exact sum. So: create the
+    // two instances, re-anchor (A+B grow to ~384 each = 768), then a further
+    // event exceeds the 750 limit and exercises DropOldest.
     let plan = simple_plan(
         vec![simple_key("sip")],
         vec![
@@ -460,12 +460,13 @@ fn limits_max_memory_bytes_drop_oldest_evicts_current_key() {
     let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
     let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
 
-    // Event 1 for A: step1 completes (count=1 >= 1). A grows to ~384 bytes.
+    // Event 1 for A: step1 completes (count=1 >= 1).
     assert_eq!(sm.advance_at("fail", &e1, 100), StepResult::Advance);
-    // Event 2 for B: step1 completes. B grows to ~384 bytes.
+    // Event 2 for B: step1 completes.
     assert_eq!(sm.advance_at("fail", &e2, 200), StepResult::Advance);
     assert_eq!(sm.instance_count(), 2);
-    // Total = 384 + 384 = 768 >= 750. Next event for existing key triggers check.
+    // Re-anchor to exact: each instance grew to ~384 bytes, 384 + 384 = 768.
+    sm.recalibrate_memory();
 
     // Event 3 for A (oldest key, created_at=100):
     // Memory check: 768 >= 750 → DropOldest.
@@ -481,6 +482,41 @@ fn limits_max_memory_bytes_drop_oldest_evicts_current_key() {
     );
     // B (384 bytes) + fresh A (320 base) = 704: both instances alive.
     assert_eq!(sm.instance_count(), 2);
+}
+
+#[test]
+fn recalibrate_memory_reanchors_after_state_growth() {
+    // base×N accounting tracks only creation-time cost; instance state growth
+    // (completed_steps) is invisible until recalibrate_memory() re-anchors to
+    // the exact sum of live instance state.
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![
+            step(vec![branch("fail", count_ge(1.0))]),
+            step(vec![branch("fail", count_ge(1.0))]),
+        ],
+    );
+    let limits = LimitsPlan {
+        max_memory_bytes: Some(100_000),
+        max_instances: None,
+        max_throttle: None,
+        on_exceed: ExceedAction::Throttle,
+    };
+    let mut sm =
+        CepStateMachine::with_limits("rule_recal".to_string(), plan, None, Some(limits));
+
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    // Instance created (base ~320) then step1 completes (grows to ~384).
+    assert_eq!(sm.advance_at("fail", &e, 100), StepResult::Advance);
+
+    // Running estimate is the O(1) base cost only — below the exact size.
+    let base_estimate = sm.estimated_memory_bytes_for_test();
+    sm.recalibrate_memory();
+    let exact = sm.estimated_memory_bytes_for_test();
+    assert!(
+        exact >= base_estimate,
+        "exact estimate ({exact}) should be >= base-only estimate ({base_estimate}) after growth"
+    );
 }
 
 // ===========================================================================

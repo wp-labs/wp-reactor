@@ -92,8 +92,8 @@ fn evaluate_close_steps(
         fields: {
             let mut m = HashMap::new();
             m.insert(
-                "close_reason".to_string(),
-                Value::Str(reason.as_str().to_string()),
+                "close_reason".into(),
+                Value::Str(reason.as_str().into()),
             );
             m
         },

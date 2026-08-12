@@ -251,7 +251,7 @@ pub struct Reactor {
     pub(crate) detached_rule_watchers: Vec<JoinHandle<RuntimeResult<()>>>,
     /// Shared artifacts reused across rule generations.
     pub(crate) router: Arc<Router>,
-    pub(crate) alert_tx: Option<mpsc::Sender<OutputRecord>>,
+    pub(crate) alert_txs: Option<Vec<mpsc::Sender<OutputRecord>>>,
     pub(crate) metrics: Option<Arc<RuntimeMetrics>>,
     pub(crate) intermediate_targets: HashSet<String>,
     /// EOS sender shared with rule generations (reload keeps it).
@@ -335,7 +335,7 @@ impl Reactor {
         let mut head_watchers: Vec<JoinHandle<RuntimeResult<()>>> = Vec::with_capacity(2);
         let mut tail_watchers: Vec<JoinHandle<RuntimeResult<()>>> = Vec::with_capacity(2);
 
-        let (alert_tx, alert_group) = spawn_alert_task(data.dispatcher.clone(), metrics.clone());
+        let (alert_txs, alert_group) = spawn_alert_task(data.dispatcher.clone(), metrics.clone());
         head_watchers.push(watch_group(alert_group, cancel.clone()));
 
         head_watchers.push(watch_group(
@@ -353,7 +353,7 @@ impl Reactor {
             data.rules,
             &data.router,
             &data.intermediate_targets,
-            alert_tx.clone(),
+            alert_txs.clone(),
             rule_cancel.clone(),
             metrics.clone(),
             eos_tx.clone(),
@@ -399,7 +399,7 @@ impl Reactor {
             rule_watch,
             detached_rule_watchers: Vec::new(),
             router: data.router,
-            alert_tx: Some(alert_tx),
+            alert_txs: Some(alert_txs),
             metrics,
             intermediate_targets: data.intermediate_targets,
             eos_tx,
@@ -531,7 +531,7 @@ impl Reactor {
         // longer needed. The rule tasks (joined below, before head/alert) still
         // hold their own clones, so they can finish flushing before the channel
         // closes and the alert task drains & exits last.
-        self.alert_tx.take();
+        self.alert_txs.take();
 
         // tail: metrics → receiver, then rule, then head: evictor → alert.
         while let Some(handle) = self.tail_watchers.pop() {

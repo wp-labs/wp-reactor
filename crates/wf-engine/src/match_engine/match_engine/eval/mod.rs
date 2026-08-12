@@ -73,7 +73,7 @@ pub(crate) fn eval_expr_ext(
     let _time_scope = EvalTimeScope::enter();
     match expr {
         Expr::Number(n) => Some(Value::Number(*n)),
-        Expr::StringLit(s) => Some(Value::Str(s.clone())),
+        Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
         Expr::Bool(b) => Some(Value::Bool(*b)),
         Expr::Field(fr) => eval_field_value(&event.fields, fr),
         Expr::Object(items) => {
@@ -81,7 +81,7 @@ pub(crate) fn eval_expr_ext(
             for item in items {
                 let value = eval_expr_ext(&item.value, event, windows, baselines)?;
                 for target in &item.targets {
-                    map.insert(target.clone(), value.clone());
+                    map.insert(target.clone().into(), value.clone());
                 }
             }
             Some(Value::Object(map))

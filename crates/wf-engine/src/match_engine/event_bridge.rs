@@ -82,7 +82,7 @@ fn batch_to_events_with(
                 continue;
             }
             if let Some(val) = extract_field_value(field, col.as_ref(), row) {
-                fields.insert(field.name().clone(), val);
+                fields.insert(field.name().into(), val);
             }
         }
         events.push(Event { fields });
@@ -153,7 +153,7 @@ fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
         }
         DataType::Utf8 => {
             let arr = col.as_any().downcast_ref::<StringArray>()?;
-            Some(Value::Str(arr.value(row).to_string()))
+            Some(Value::Str(arr.value(row).into()))
         }
         DataType::Boolean => {
             let arr = col.as_any().downcast_ref::<BooleanArray>()?;
@@ -171,7 +171,7 @@ fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
                     continue;
                 }
                 if let Some(value) = extract_value(child.as_ref(), row) {
-                    fields.insert(field.name().clone(), value);
+                    fields.insert(field.name().into(), value);
                 }
             }
             Some(Value::Object(fields))
@@ -197,14 +197,14 @@ fn json_to_value(value: serde_json::Value) -> Option<Value> {
         serde_json::Value::Null => None,
         serde_json::Value::Bool(v) => Some(Value::Bool(v)),
         serde_json::Value::Number(v) => v.as_f64().map(Value::Number),
-        serde_json::Value::String(v) => Some(Value::Str(v)),
+        serde_json::Value::String(v) => Some(Value::Str(v.into())),
         serde_json::Value::Array(values) => Some(Value::Array(
             values.into_iter().filter_map(json_to_value).collect(),
         )),
         serde_json::Value::Object(fields) => Some(Value::Object(
             fields
                 .into_iter()
-                .filter_map(|(key, value)| json_to_value(value).map(|value| (key, value)))
+                .filter_map(|(key, value)| json_to_value(value).map(|value| (key.into(), value)))
                 .collect(),
         )),
     }
@@ -271,11 +271,11 @@ mod tests {
         assert_eq!(events.len(), 2);
 
         assert_eq!(events[0].fields["id"], Value::Number(42.0));
-        assert_eq!(events[0].fields["name"], Value::Str("alice".to_string()));
+        assert_eq!(events[0].fields["name"], Value::Str("alice".into()));
         assert_eq!(events[0].fields["active"], Value::Bool(true));
 
         assert_eq!(events[1].fields["id"], Value::Number(99.0));
-        assert_eq!(events[1].fields["name"], Value::Str("bob".to_string()));
+        assert_eq!(events[1].fields["name"], Value::Str("bob".into()));
         assert_eq!(events[1].fields["active"], Value::Bool(false));
     }
 
@@ -322,7 +322,7 @@ mod tests {
 
         // Row 1: id is null (skipped), name="bob"
         assert!(!events[1].fields.contains_key("id"));
-        assert_eq!(events[1].fields["name"], Value::Str("bob".to_string()));
+        assert_eq!(events[1].fields["name"], Value::Str("bob".into()));
     }
 
     #[test]
@@ -432,11 +432,11 @@ mod tests {
         assert_eq!(extension.get("severity"), Some(&Value::Number(10.0)));
         assert_eq!(
             extension.get("tags"),
-            Some(&Value::Array(vec![Value::Str("ssh".to_string())]))
+            Some(&Value::Array(vec![Value::Str("ssh".into())]))
         );
         assert_eq!(
             events[0].fields["plain"],
-            Value::Str(r#"{"severity":10}"#.to_string())
+            Value::Str(r#"{"severity":10}"#.into())
         );
     }
 
@@ -468,7 +468,7 @@ mod tests {
         );
         assert_eq!(
             events[0].fields["plain"],
-            Value::Str(r#"[22,2222]"#.to_string())
+            Value::Str(r#"[22,2222]"#.into())
         );
     }
 }

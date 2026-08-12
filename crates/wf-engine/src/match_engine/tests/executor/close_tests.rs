@@ -263,11 +263,11 @@ fn execute_close_yield_nested_path_via_bind_data() {
             field_values: HashMap::from([(
                 "roles_obj".to_string(),
                 vec![Value::Object(HashMap::from([(
-                    "source".to_string(),
+                    "source".into(),
                     Value::Object(HashMap::from([(
-                        "process".to_string(),
+                        "process".into(),
                         Value::Object(HashMap::from([(
-                            "uid".to_string(),
+                            "uid".into(),
                             str_val("d22b3fbcb9e77cb86834f6a18e2e0f68"),
                         )])),
                     )])),

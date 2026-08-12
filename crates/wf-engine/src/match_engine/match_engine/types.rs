@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use smol_str::SmolStr;
+
 // ---------------------------------------------------------------------------
 // Public types — Event & Value
 // ---------------------------------------------------------------------------
@@ -15,7 +17,7 @@ pub const MACHINE_ID: &str = "wp_src_ip";
 #[derive(::moju_derive::MoJu, Debug, Clone)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct Event {
-    pub fields: HashMap<String, Value>,
+    pub fields: HashMap<SmolStr, Value>,
 }
 
 /// Scalar value carried inside an [`Event`].
@@ -23,10 +25,10 @@ pub struct Event {
 #[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
 pub enum Value {
     Number(f64),
-    Str(String),
+    Str(SmolStr),
     Bool(bool),
     Array(Vec<Value>),
-    Object(HashMap<String, Value>),
+    Object(HashMap<SmolStr, Value>),
 }
 
 // ---------------------------------------------------------------------------

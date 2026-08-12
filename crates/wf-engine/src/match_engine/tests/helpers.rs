@@ -13,7 +13,7 @@ pub fn event(fields: Vec<(&str, Value)>) -> Event {
     Event {
         fields: fields
             .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
+            .map(|(k, v)| (k.into(), v))
             .collect(),
     }
 }
@@ -23,7 +23,7 @@ pub fn num(n: f64) -> Value {
 }
 
 pub fn str_val(s: &str) -> Value {
-    Value::Str(s.to_string())
+    Value::Str(s.to_string().into())
 }
 
 pub fn count_ge(n: f64) -> AggPlan {

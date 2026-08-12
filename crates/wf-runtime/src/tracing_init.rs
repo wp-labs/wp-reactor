@@ -294,13 +294,14 @@ pub fn init_tracing(config: &LoggingConfig, base_dir: &Path) -> RuntimeResult<Op
                 .json()
                 .with_target(false)
                 .with_writer(std::io::stderr)
-                .with_filter(filter);
+                .with_filter(filter.clone());
             let file_layer = fmt::layer()
                 .json()
                 .fmt_fields(FileFields::default())
                 .with_target(false)
                 .with_ansi(false)
-                .with_writer(non_blocking);
+                .with_writer(non_blocking)
+                .with_filter(filter);
             tracing_subscriber::registry()
                 .with(stderr_layer)
                 .with(file_layer)
@@ -310,12 +311,13 @@ pub fn init_tracing(config: &LoggingConfig, base_dir: &Path) -> RuntimeResult<Op
             let stderr_layer = fmt::layer()
                 .event_format(DomainFormat::new())
                 .with_writer(std::io::stderr)
-                .with_filter(filter);
+                .with_filter(filter.clone());
             let file_layer = fmt::layer()
                 .event_format(DomainFormat::new())
                 .fmt_fields(FileFields::default())
                 .with_ansi(false)
-                .with_writer(non_blocking);
+                .with_writer(non_blocking)
+                .with_filter(filter);
             tracing_subscriber::registry()
                 .with(stderr_layer)
                 .with(file_layer)

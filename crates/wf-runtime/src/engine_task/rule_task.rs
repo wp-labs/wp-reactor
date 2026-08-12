@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
@@ -88,9 +88,12 @@ pub(super) struct RuleTask {
     aliases: HashMap<String, Vec<String>>,
     /// window_name -> Vec<alias>: aux bind aliases first, then event aliases.
     ordered_aliases: HashMap<String, Vec<String>>,
-    alert_tx: mpsc::Sender<OutputRecord>,
     /// window_name -> cursor: tracks read position per window.
     pub(super) cursors: HashMap<String, u64>,
+    /// All alert consumer senders; emits are round-robined across them.
+    alert_txs: Vec<mpsc::Sender<OutputRecord>>,
+    /// Round-robin cursor for `alert_txs`.
+    alert_round: AtomicUsize,
     /// Shared router for WindowLookup (joins + has()).
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
@@ -120,7 +123,7 @@ impl RuleTask {
             each_time_field,
             executor,
             window_sources,
-            alert_tx,
+            alert_txs,
             cancel,
             timeout_scan_interval,
             router,
@@ -173,7 +176,8 @@ impl RuleTask {
             sources: window_sources,
             aliases,
             ordered_aliases,
-            alert_tx,
+            alert_txs,
+            alert_round: AtomicUsize::new(0),
             cursors,
             router,
             metrics,
@@ -755,6 +759,12 @@ impl RuleTask {
                 );
             }
         }
+        // Re-anchor the O(1) per-instance base-cost memory estimate to the exact
+        // sum of live instance state (accumulated field_values / distinct_set
+        // growth is otherwise invisible to the running estimate).
+        if let Some(machine) = self.machine.as_mut() {
+            machine.recalibrate_memory();
+        }
         if let Some(metrics) = &self.metrics {
             let instances = self
                 .machine
@@ -885,14 +895,17 @@ impl RuleTask {
             let e2e_nanos = now_nanos.saturating_sub(record.event_time_nanos.max(0) as u64);
             metrics.observe_event_e2e_latency(Duration::from_nanos(e2e_nanos));
         }
-        match self.alert_tx.try_send(record) {
+        // Round-robin across the alert consumer senders so output processing
+        // is not capped by a single consumer task.
+        let tx = &self.alert_txs[self.alert_round.fetch_add(1, Ordering::Relaxed) % self.alert_txs.len()];
+        match tx.try_send(record) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(record)) => {
                 if let Some(metrics) = &self.metrics {
                     metrics.inc_alert_channel_full();
                 }
                 // Fall back to blocking send
-                if let Err(e) = self.alert_tx.send(record).await {
+                if let Err(e) = tx.send(record).await {
                     if let Some(metrics) = &self.metrics {
                         metrics.inc_alert_channel_send_failed();
                     }
@@ -1013,7 +1026,7 @@ fn event_debug_ref(
 fn value_debug_string(value: &wf_engine::match_engine::Value) -> String {
     match value {
         wf_engine::match_engine::Value::Number(value) => value.to_string(),
-        wf_engine::match_engine::Value::Str(value) => value.clone(),
+        wf_engine::match_engine::Value::Str(value) => value.to_string(),
         wf_engine::match_engine::Value::Bool(value) => value.to_string(),
         wf_engine::match_engine::Value::Array(_) | wf_engine::match_engine::Value::Object(_) => {
             "<structured>".to_string()
@@ -1130,10 +1143,10 @@ fn record_wfu_intermediate_meta_value(
     use wf_lang::wfu_meta::WfuIntermediateMetaField;
 
     match field {
-        WfuIntermediateMetaField::RuleName => Value::Str(record.rule_name.clone()),
+        WfuIntermediateMetaField::RuleName => Value::Str(record.rule_name.clone().into()),
         WfuIntermediateMetaField::Score => Value::Number(record.score),
-        WfuIntermediateMetaField::EntityType => Value::Str(record.entity_type.clone()),
-        WfuIntermediateMetaField::EntityId => Value::Str(record.entity_id.clone()),
+        WfuIntermediateMetaField::EntityType => Value::Str(record.entity_type.clone().into()),
+        WfuIntermediateMetaField::EntityId => Value::Str(record.entity_id.clone().into()),
     }
 }
 
@@ -1203,7 +1216,7 @@ fn value_to_json(value: &wf_engine::match_engine::Value) -> RuntimeResult<serde_
             .to_err()
             .with_detail("structured numeric value must be finite")
             .err(),
-        wf_engine::match_engine::Value::Str(s) => Ok(serde_json::Value::from(s.clone())),
+        wf_engine::match_engine::Value::Str(s) => Ok(serde_json::Value::from(s.as_str())),
         wf_engine::match_engine::Value::Bool(b) => Ok(serde_json::Value::from(*b)),
         wf_engine::match_engine::Value::Array(items) => Ok(serde_json::Value::Array(
             items
@@ -1217,7 +1230,7 @@ fn value_to_json(value: &wf_engine::match_engine::Value) -> RuntimeResult<serde_
             keys.sort();
             for key in keys {
                 if let Some(value) = items.get(key) {
-                    object.insert(key.clone(), value_to_json(value)?);
+                    object.insert(key.to_string(), value_to_json(value)?);
                 }
             }
             Ok(serde_json::Value::Object(object))
