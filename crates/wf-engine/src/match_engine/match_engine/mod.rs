@@ -745,17 +745,6 @@ impl CepStateMachine {
         self.instances.len()
     }
 
-    /// Match window duration (nanoseconds). Used to advance the idle watermark
-    /// to the natural end of the last window so instances expire promptly
-    /// instead of waiting out wall-clock time.
-    pub fn window_duration_nanos(&self) -> i64 {
-        match self.plan.window_spec {
-            WindowSpec::Sliding(d) | WindowSpec::Fixed(d) | WindowSpec::Session(d) => {
-                d.as_nanos() as i64
-            }
-        }
-    }
-
     /// Borrow the underlying plan.
     pub fn plan(&self) -> &MatchPlan {
         &self.plan
