@@ -228,6 +228,15 @@ wait(): join infra (evictor)
 
 ## 候选任务（性能演进）
 
+### Window → Rule 推送模型（Push Consumer）
+
+> 状态：Proposal（暂不实施）· [window-push-consumer-model.md](window-push-consumer-model.md)
+
+Nexmark 压测暴露规则侧 `OnceLock` 懒解析 + 窗口读锁竞争（`semaphore_wait_trap`
+≈10000 样本）。候选 B（push：window append 后直接推给订阅规则）更符合订阅者
+语义，但属架构级改造；候选 A（route 侧锁外预解析）小改动即可消除 OnceLock
+竞争。详见 [window-push-consumer-model.md](window-push-consumer-model.md)。
+
 ### 单规则多分片并行（接入 `executor_parallelism`）
 
 > 状态：候选（暂不实现）
