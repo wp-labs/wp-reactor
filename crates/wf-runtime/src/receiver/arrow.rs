@@ -190,6 +190,13 @@ pub async fn replay_arrow_ipc_file(
     Ok(())
 }
 
+/// Max digits in the ASCII length prefix (covers any realistic byte count;
+/// usize is ≤ 20 digits on 64-bit, but 16 is far beyond any valid frame).
+const MAX_FRAME_PREFIX_DIGITS: usize = 16;
+/// Safety cap on a single replayed frame, so a malformed length prefix cannot
+/// trigger an unbounded allocation.
+const MAX_FRAME_BYTES: usize = 1 << 30; // 1 GiB
+
 /// Read a single length-prefixed frame: `<ascii digits> <payload>`.
 ///
 /// This matches the wire framing produced by the TCP sink's `len` mode
@@ -197,7 +204,7 @@ pub async fn replay_arrow_ipc_file(
 /// captured by `wfgen dump-frames` / `send` can be replayed byte-for-byte.
 /// Returns `Ok(None)` on clean EOF (end of file).
 async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> io::Result<Option<Vec<u8>>> {
-    let mut len_buf: Vec<u8> = Vec::with_capacity(16);
+    let mut len_buf: Vec<u8> = Vec::with_capacity(MAX_FRAME_PREFIX_DIGITS);
     loop {
         let mut byte = [0u8; 1];
         match reader.read_exact(&mut byte).await {
@@ -218,12 +225,24 @@ async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> io::Result<Opti
             ));
         }
         len_buf.push(byte[0]);
+        if len_buf.len() > MAX_FRAME_PREFIX_DIGITS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame length prefix too long",
+            ));
+        }
     }
     let len_str = std::str::from_utf8(&len_buf)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad frame length"))?;
     let frame_len: usize = len_str.parse().map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidData, format!("bad frame length '{len_str}'"))
     })?;
+    if frame_len == 0 || frame_len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unreasonable frame length {frame_len}"),
+        ));
+    }
     let mut payload = vec![0u8; frame_len];
     reader.read_exact(&mut payload).await?;
     Ok(Some(payload))
