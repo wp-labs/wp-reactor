@@ -49,7 +49,15 @@ impl WindowFieldUsage {
             .filter(|f| schema.contains(f.as_str()))
             .cloned()
             .collect();
-        if subset.is_empty() || subset.len() == schema.len() {
+        if subset.is_empty() {
+            // No rule reads any field from this window (e.g. an intermediate /
+            // output-only window): materialize nothing. The window's time column
+            // is appended by the caller (`schema_bridge`) so event-time
+            // extraction still works. Falls back to full only when a wholesale
+            // scan is possible (`needs_all`, checked above).
+            Some(HashSet::new())
+        } else if subset.len() == schema.len() {
+            // Every schema field is referenced — no reduction.
             None
         } else {
             Some(subset)
