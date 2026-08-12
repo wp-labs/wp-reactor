@@ -14,9 +14,7 @@ fn if_then_else_true_branch() {
         then_expr: Box::new(Expr::Number(80.0)),
         else_expr: Box::new(Expr::Number(40.0)),
     };
-    let event = Event {
-        fields: HashMap::new(),
-    };
+    let event = Event { fields: EngineHashMap::default() };
     let result = eval_expr(&expr, &event);
     assert_eq!(result, Some(Value::Number(80.0)));
 }
@@ -30,9 +28,7 @@ fn if_then_else_false_branch() {
         then_expr: Box::new(Expr::Number(80.0)),
         else_expr: Box::new(Expr::Number(40.0)),
     };
-    let event = Event {
-        fields: HashMap::new(),
-    };
+    let event = Event { fields: EngineHashMap::default() };
     let result = eval_expr(&expr, &event);
     assert_eq!(result, Some(Value::Number(40.0)));
 }
@@ -51,9 +47,7 @@ fn if_then_else_nested() {
         }),
         else_expr: Box::new(Expr::Number(3.0)),
     };
-    let event = Event {
-        fields: HashMap::new(),
-    };
+    let event = Event { fields: EngineHashMap::default() };
     let result = eval_expr(&expr, &event);
     assert_eq!(result, Some(Value::Number(2.0)));
 }
@@ -73,12 +67,12 @@ fn if_then_else_with_field_condition() {
         else_expr: Box::new(Expr::Number(40.0)),
     };
 
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("action".into(), Value::Str("failed".into()));
     let event = Event { fields };
     assert_eq!(eval_expr(&expr, &event), Some(Value::Number(80.0)));
 
-    let mut fields2 = HashMap::new();
+    let mut fields2 = EngineHashMap::default();
     fields2.insert("action".into(), Value::Str("success".into()));
     let event2 = Event { fields: fields2 };
     assert_eq!(eval_expr(&expr, &event2), Some(Value::Number(40.0)));
@@ -100,7 +94,7 @@ fn regex_match_matches() {
             Expr::StringLit("fail.*".to_string()),
         ],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("action".into(), Value::Str("failed_login".into()));
     let event = Event { fields };
     assert_eq!(eval_expr(&expr, &event), Some(Value::Bool(true)));
@@ -118,7 +112,7 @@ fn regex_match_no_match() {
             Expr::StringLit("^success$".to_string()),
         ],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("action".into(), Value::Str("failed".into()));
     let event = Event { fields };
     assert_eq!(eval_expr(&expr, &event), Some(Value::Bool(false)));
@@ -140,7 +134,7 @@ fn time_diff_returns_seconds() {
             Expr::Field(FieldRef::Simple("t2".to_string())),
         ],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     // 5 seconds apart in epoch milliseconds.
     fields.insert("t1".into(), Value::Number(1_700_000_005_000.0));
     fields.insert("t2".into(), Value::Number(1_700_000_000_000.0));
@@ -161,7 +155,7 @@ fn time_diff_absolute_value() {
             Expr::Field(FieldRef::Simple("t2".to_string())),
         ],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     // Reversed order: t1 < t2.
     fields.insert("t1".into(), Value::Number(1_700_000_000_000.0));
     fields.insert("t2".into(), Value::Number(1_700_000_005_000.0));
@@ -186,7 +180,7 @@ fn time_bucket_floors_to_interval() {
             Expr::Number(60.0), // 60 second interval
         ],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     // 75 seconds after an epoch millisecond timestamp.
     fields.insert("ts".into(), Value::Number(1_700_000_075_000.0));
     let event = Event { fields };
@@ -206,7 +200,7 @@ fn time_bucket_exact_boundary() {
             Expr::Number(300.0), // 5 minute interval
         ],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     // Exact 5-minute bucket boundary in epoch milliseconds.
     fields.insert("ts".into(), Value::Number(1_700_000_100_000.0));
     let event = Event { fields };
@@ -218,9 +212,7 @@ fn time_bucket_exact_boundary() {
 fn time_bucket_rejects_non_positive_or_non_finite_interval() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let event = Event {
-        fields: HashMap::new(),
-    };
+    let event = Event { fields: EngineHashMap::default() };
     for interval in [0.0, -60.0, f64::INFINITY, f64::NAN] {
         let expr = Expr::FuncCall {
             qualifier: None,
@@ -239,7 +231,7 @@ fn time_bucket_rejects_non_positive_or_non_finite_interval() {
 fn math_functions_work() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("n".into(), Value::Number(-12.345));
     fields.insert("p".into(), Value::Number(16.0));
     fields.insert("ts".into(), Value::Number(0.0));
@@ -476,9 +468,7 @@ fn math_functions_work() {
 fn now_functions_work() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let event = Event {
-        fields: HashMap::new(),
-    };
+    let event = Event { fields: EngineHashMap::default() };
     let now_expr = Expr::FuncCall {
         qualifier: None,
         name: "now".to_string(),
@@ -547,9 +537,7 @@ fn now_functions_work() {
 fn now_functions_share_timestamp_within_expression() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let event = Event {
-        fields: HashMap::new(),
-    };
+    let event = Event { fields: EngineHashMap::default() };
     let expr = Expr::BinOp {
         op: BinOp::Sub,
         left: Box::new(Expr::FuncCall {
@@ -571,7 +559,7 @@ fn now_functions_share_timestamp_within_expression() {
 fn blank_functions_work() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("empty".into(), Value::Str(String::new().into()));
     fields.insert("spaces".into(), Value::Str(" \t\n ".into()));
     fields.insert("host".into(), Value::Str("example.org".into()));
@@ -689,11 +677,11 @@ fn blank_functions_work() {
 fn merge_shallow_merges_objects_in_l2_eval() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let mut base = HashMap::new();
+    let mut base = EngineHashMap::default();
     base.insert("severity".into(), Value::Number(3.0));
     base.insert("rule".into(), Value::Str("webshell".into()));
 
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("extension".into(), Value::Object(base));
     let event = Event { fields };
 
@@ -732,9 +720,7 @@ fn merge_shallow_merges_objects_in_l2_eval() {
 fn merge_fails_when_object_literal_value_is_missing_in_l2_eval() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let event = Event {
-        fields: HashMap::new(),
-    };
+    let event = Event { fields: EngineHashMap::default() };
     let expr = Expr::FuncCall {
         qualifier: None,
         name: "merge".to_string(),
@@ -759,9 +745,7 @@ fn merge_fails_when_object_literal_value_is_missing_in_l2_eval() {
 fn merge_treats_missing_field_arg_as_empty_object_in_l2_eval() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let event = Event {
-        fields: HashMap::new(),
-    };
+    let event = Event { fields: EngineHashMap::default() };
     let expr = Expr::FuncCall {
         qualifier: None,
         name: "merge".to_string(),
@@ -785,7 +769,7 @@ fn merge_treats_missing_field_arg_as_empty_object_in_l2_eval() {
 fn hash_and_id_functions_work() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("msg".into(), Value::Str("hello".into()));
     fields.insert("empty".into(), Value::Str(String::new().into()));
     fields.insert("ip".into(), Value::Str("10.0.0.1".into()));
@@ -1016,9 +1000,7 @@ fn hash_and_id_functions_work() {
 fn stable_id_uses_unambiguous_segments() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let event = Event {
-        fields: HashMap::new(),
-    };
+    let event = Event { fields: EngineHashMap::default() };
     let first_expr = Expr::FuncCall {
         qualifier: None,
         name: "stable_id".to_string(),
@@ -1064,9 +1046,7 @@ fn strptime_parses_date() {
             Expr::StringLit("%Y-%m-%d".to_string()),
         ],
     };
-    let event = Event {
-        fields: HashMap::new(),
-    };
+    let event = Event { fields: EngineHashMap::default() };
     assert_eq!(eval_expr(&expr, &event), Some(Value::Number(0.0)));
 }
 
@@ -1082,9 +1062,7 @@ fn strptime_returns_epoch_milliseconds() {
             Expr::StringLit("%Y-%m-%d %H:%M:%S".to_string()),
         ],
     };
-    let event = Event {
-        fields: HashMap::new(),
-    };
+    let event = Event { fields: EngineHashMap::default() };
     assert_eq!(
         eval_expr(&expr, &event),
         Some(Value::Number(1_710_115_200_000.0))
@@ -1108,7 +1086,7 @@ fn replace_regex_substitution() {
             Expr::StringLit("blocked".to_string()),
         ],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("action".into(), Value::Str("failed_login".into()));
     let event = Event { fields };
     assert_eq!(
@@ -1137,7 +1115,7 @@ fn startswith_and_endswith_work() {
             Expr::StringLit("root".to_string()),
         ],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert(
         "msg".into(),
         Value::Str("failed_login_root".into()),
@@ -1151,7 +1129,7 @@ fn startswith_and_endswith_work() {
 fn substr_supports_one_based_and_negative_start() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("msg".into(), Value::Str("abcdef".into()));
     let event = Event { fields };
 
@@ -1192,7 +1170,7 @@ fn trim_removes_surrounding_whitespace() {
         name: "trim".to_string(),
         args: vec![Expr::Field(FieldRef::Simple("msg".to_string()))],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("msg".into(), Value::Str("  hello\t".into()));
     let event = Event { fields };
     assert_eq!(
@@ -1210,7 +1188,7 @@ fn mvcount_array_returns_length() {
         name: "mvcount".to_string(),
         args: vec![Expr::Field(FieldRef::Simple("vals".to_string()))],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert(
         "vals".into(),
         Value::Array(vec![
@@ -1235,7 +1213,7 @@ fn mvjoin_array_with_separator() {
             Expr::StringLit("|".to_string()),
         ],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert(
         "vals".into(),
         Value::Array(vec![
@@ -1255,7 +1233,7 @@ fn mvjoin_array_with_separator() {
 fn mvindex_single_and_range() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert(
         "vals".into(),
         Value::Array(vec![
@@ -1302,7 +1280,7 @@ fn mvindex_single_and_range() {
 fn mvappend_flattens_arrays_and_scalars() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert(
         "vals".into(),
         Value::Array(vec![
@@ -1351,7 +1329,7 @@ fn split_text_to_array() {
             Expr::StringLit(",".to_string()),
         ],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("csv".into(), Value::Str("a,b,,c".into()));
     let event = Event { fields };
     assert_eq!(
@@ -1374,7 +1352,7 @@ fn mvdedup_removes_duplicates_keep_order() {
         name: "mvdedup".to_string(),
         args: vec![Expr::Field(FieldRef::Simple("vals".to_string()))],
     };
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert(
         "vals".into(),
         Value::Array(vec![

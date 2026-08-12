@@ -7,7 +7,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use super::match_engine::{Event, Value};
+use super::match_engine::{EngineHashMap, Event, Value};
 
 pub const WFL_FIELD_TYPE_METADATA_KEY: &str = "wf.wfl.field_type";
 pub const WFL_FIELD_TYPE_OBJECT: &str = "object";
@@ -70,7 +70,7 @@ fn batch_to_events_with(
     let mut events = Vec::with_capacity(num_rows);
 
     for row in 0..num_rows {
-        let mut fields = HashMap::new();
+        let mut fields = EngineHashMap::default();
         for (col_idx, field) in schema.fields().iter().enumerate() {
             if let Some(only) = only_fields
                 && !only.contains(field.name())
@@ -165,7 +165,7 @@ fn extract_value(col: &dyn Array, row: usize) -> Option<Value> {
         }
         DataType::Struct(_) => {
             let arr = col.as_any().downcast_ref::<StructArray>()?;
-            let mut fields = HashMap::new();
+            let mut fields = EngineHashMap::default();
             for (field, child) in arr.fields().iter().zip(arr.columns()) {
                 if child.is_null(row) {
                     continue;

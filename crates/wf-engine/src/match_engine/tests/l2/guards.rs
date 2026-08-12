@@ -118,7 +118,7 @@ fn compound_expr_and_window_has_no_match() {
 /// context through the BinOp evaluation.
 #[test]
 fn compound_expr_baseline_in_comparison() {
-    use std::collections::HashMap as Map;
+    use crate::match_engine::EngineHashMap as Map;
     use wf_lang::ast::BinOp;
 
     // Expression: baseline(x, 300) > 2.0
@@ -137,7 +137,7 @@ fn compound_expr_baseline_in_comparison() {
 
     // Use eval_expr_ext directly with a baselines store to verify context flows
     use crate::match_engine::match_engine::eval_expr_ext;
-    let mut baselines = Map::new();
+    let mut baselines = Map::default();
 
     // Feed varying values to build baseline with nonzero stddev.
     // Alternating 45 and 55 gives mean=50, stddev=5.
@@ -260,11 +260,11 @@ fn window_has_nested_path_infers_leaf_field() {
         ("sip", str_val("10.0.0.1")),
         (
             "roles_obj",
-            Value::Object(HashMap::from([(
+            Value::Object(EngineHashMap::from_iter([(
                 "source".into(),
-                Value::Object(HashMap::from([(
+                Value::Object(EngineHashMap::from_iter([(
                     "process".into(),
-                    Value::Object(HashMap::from([(
+                    Value::Object(EngineHashMap::from_iter([(
                         "uid".into(),
                         str_val("d22b3fbcb9e77cb86834f6a18e2e0f68"),
                     )])),

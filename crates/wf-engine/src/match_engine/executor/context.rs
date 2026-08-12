@@ -4,7 +4,7 @@ use wf_lang::ast::{FieldRef, JoinMode};
 use wf_lang::plan::{JoinCondPlan, JoinPlan, StepPlan};
 
 use crate::match_engine::match_engine::{
-    BindData, Event, StepData, Value, WindowLookup, field_ref_name, values_equal,
+    BindData, EngineHashMap, Event, StepData, Value, WindowLookup, field_ref_name, values_equal,
 };
 
 /// Build a synthetic [`Event`] from match context for expression evaluation.
@@ -21,7 +21,7 @@ pub(super) fn build_eval_context(
     bind_data: &[BindData],
     step_plans: &[&StepPlan],
 ) -> Event {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
 
     // Key fields — preserve original Value type
     for (fr, val) in keys.iter().zip(scope_key.iter()) {
@@ -200,11 +200,10 @@ fn row_matches_conds(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn plain_field_names_from_bind_data() {
-        let mut field_values = HashMap::new();
+        let mut field_values = EngineHashMap::default();
         field_values.insert("dip".to_string(), vec![Value::Str("7.180.78.236".into())]);
         field_values.insert("user".to_string(), vec![Value::Str("root".into())]);
         let bind_data = vec![BindData {

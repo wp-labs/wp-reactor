@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use wf_lang::plan::MatchPlan;
 
 use super::key::ValueKey;
-use super::types::{BindData, Event, RollingStats, Value};
+use super::types::{BindData, EngineHashMap, Event, RollingStats, Value};
 
 // ---------------------------------------------------------------------------
 // Internal — per-branch / per-step / per-instance state
@@ -31,7 +31,7 @@ pub(super) struct BranchState {
     pub(super) collected_values: Option<Box<Vec<Value>>>,
     /// Per-field value history for yield / L3 collection. Lazy, boxed — a
     /// count rule never allocates this.
-    pub(super) field_values: Option<Box<HashMap<String, Vec<Value>>>>,
+    pub(super) field_values: Option<Box<EngineHashMap<String, Vec<Value>>>>,
 }
 
 impl BranchState {
@@ -54,8 +54,9 @@ impl BranchState {
     }
 
     /// Mutable access to the field-value history, allocating lazily.
-    pub(super) fn field_values_mut(&mut self) -> &mut HashMap<String, Vec<Value>> {
-        self.field_values.get_or_insert_with(|| Box::new(HashMap::new()))
+    pub(super) fn field_values_mut(&mut self) -> &mut EngineHashMap<String, Vec<Value>> {
+        self.field_values
+            .get_or_insert_with(|| Box::new(EngineHashMap::default()))
     }
 
     /// Mutable access to the L3 collected-values list, allocating lazily.
@@ -68,7 +69,7 @@ impl BranchState {
 pub(super) struct AliasState {
     pub(super) count: u64,
     /// Lazy, boxed — only aliases with tracked bind fields allocate.
-    pub(super) field_values: Option<Box<HashMap<String, Vec<Value>>>>,
+    pub(super) field_values: Option<Box<EngineHashMap<String, Vec<Value>>>>,
 }
 
 impl AliasState {
@@ -79,8 +80,9 @@ impl AliasState {
         }
     }
 
-    pub(super) fn field_values_mut(&mut self) -> &mut HashMap<String, Vec<Value>> {
-        self.field_values.get_or_insert_with(|| Box::new(HashMap::new()))
+    pub(super) fn field_values_mut(&mut self) -> &mut EngineHashMap<String, Vec<Value>> {
+        self.field_values
+            .get_or_insert_with(|| Box::new(EngineHashMap::default()))
     }
 }
 
@@ -117,8 +119,8 @@ pub(super) struct Instance {
     pub(super) close_step_states: Vec<StepState>,
     /// Lazy, boxed (None = 8B vs HashMap 48B): rules that never track alias
     /// bind fields don't allocate this.
-    pub(super) alias_states: Option<Box<HashMap<String, AliasState>>>,
-    pub(super) baselines: HashMap<String, RollingStats>,
+    pub(super) alias_states: Option<Box<EngineHashMap<String, AliasState>>>,
+    pub(super) baselines: EngineHashMap<String, RollingStats>,
     /// Chain negation violated — chain must not fire.
     pub(super) neg_violated: bool,
     /// Per-step satisfaction flags for `on event any` (unordered) mode, aligned
@@ -158,7 +160,7 @@ impl Instance {
             completed_steps: Vec::new(),
             close_step_states,
             alias_states: None,
-            baselines: HashMap::new(),
+            baselines: EngineHashMap::default(),
             neg_violated: false,
             satisfied_flags: vec![false; plan.event_steps.len()],
             base_cost: 0,
@@ -305,7 +307,9 @@ impl Instance {
     }
 }
 
-pub(super) fn snapshot_bind_data(alias_states: Option<&HashMap<String, AliasState>>) -> Vec<BindData> {
+pub(super) fn snapshot_bind_data(
+    alias_states: Option<&EngineHashMap<String, AliasState>>,
+) -> Vec<BindData> {
     let Some(alias_states) = alias_states else {
         return Vec::new();
     };

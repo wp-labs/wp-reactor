@@ -1,9 +1,9 @@
-use std::{cell::Cell, collections::HashMap};
+use std::cell::Cell;
 
 use wf_lang::ast::{BinOp, Expr};
 
 use super::key::{eval_field_value, field_ref_leaf_name, value_to_string};
-use super::types::{Event, RollingStats, Value, WindowLookup};
+use super::types::{EngineHashMap, Event, RollingStats, Value, WindowLookup};
 
 mod cmp;
 mod funcs;
@@ -55,7 +55,7 @@ fn with_eval_time_scope<T>(f: impl FnOnce() -> T) -> T {
 /// Neg, InList, and basic FuncCall (contains, startswith, endswith, substr, replace, trim, lower, upper, len, mvcount, mvjoin, mvindex, mvappend, split, mvdedup, abs, round, ceil, floor, sqrt, pow, log, exp, clamp, sign, trunc, is_finite, ltrim, rtrim, concat, join, join_by, indexof, replace_plain, startswith_any, endswith_any, coalesce, merge, isnull, isnotnull, is_blank, null_if_blank, default_if_blank, md5, sha1, sha1_n, sha256, hex, stable_id, mvsort, mvreverse, now, now_s, now_ms, now_us, now_ns, strftime, strptime, has, baseline).
 pub(crate) fn eval_expr(expr: &Expr, event: &Event) -> Option<Value> {
     with_eval_time_scope(|| {
-        let mut empty = HashMap::new();
+        let mut empty = EngineHashMap::default();
         eval_expr_ext(expr, event, None, &mut empty)
     })
 }
@@ -68,7 +68,7 @@ pub(crate) fn eval_expr_ext(
     expr: &Expr,
     event: &Event,
     windows: Option<&dyn WindowLookup>,
-    baselines: &mut HashMap<String, RollingStats>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<Value> {
     let _time_scope = EvalTimeScope::enter();
     match expr {
@@ -77,7 +77,7 @@ pub(crate) fn eval_expr_ext(
         Expr::Bool(b) => Some(Value::Bool(*b)),
         Expr::Field(fr) => eval_field_value(&event.fields, fr),
         Expr::Object(items) => {
-            let mut map = HashMap::new();
+            let mut map = EngineHashMap::default();
             for item in items {
                 let value = eval_expr_ext(&item.value, event, windows, baselines)?;
                 for target in &item.targets {
@@ -183,7 +183,7 @@ fn eval_window_has(
 fn eval_baseline(
     args: &[Expr],
     event: &Event,
-    baselines: &mut HashMap<String, RollingStats>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<Value> {
     let current_val = match eval_expr(&args[0], event)? {
         Value::Number(n) => n,
@@ -216,7 +216,7 @@ fn eval_binop(
     right: &Expr,
     event: &Event,
     windows: Option<&dyn WindowLookup>,
-    baselines: &mut HashMap<String, RollingStats>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<Value> {
     match op {
         BinOp::And => eval_logic_and(left, right, event, windows, baselines),
@@ -248,7 +248,7 @@ fn eval_logic_and(
     right: &Expr,
     event: &Event,
     windows: Option<&dyn WindowLookup>,
-    baselines: &mut HashMap<String, RollingStats>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<Value> {
     let lv = eval_expr_ext(left, event, windows, baselines);
     let rv = eval_expr_ext(right, event, windows, baselines);
@@ -265,7 +265,7 @@ fn eval_logic_or(
     right: &Expr,
     event: &Event,
     windows: Option<&dyn WindowLookup>,
-    baselines: &mut HashMap<String, RollingStats>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<Value> {
     let lv = eval_expr_ext(left, event, windows, baselines);
     let rv = eval_expr_ext(right, event, windows, baselines);

@@ -1,5 +1,6 @@
 use wf_lang::ast::{Expr, FieldRef};
 
+use crate::match_engine::EngineHashMap;
 use crate::match_engine::RuleExecutor;
 use crate::match_engine::match_engine::{CloseOutput, CloseReason};
 
@@ -38,7 +39,7 @@ fn execute_close_both_ok() {
             event_first_time_nanos: Some(1_000),
             event_last_time_nanos: Some(3_000),
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         close_step_data: vec![],
         bind_data: vec![],
@@ -173,7 +174,7 @@ fn execute_close_score_can_use_count_alias() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         close_step_data: vec![],
         bind_data: vec![],
@@ -254,19 +255,19 @@ fn execute_close_yield_nested_path_via_bind_data() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         close_step_data: vec![],
         bind_data: vec![BindData {
             alias: "e".to_string(),
             count: 3,
-            field_values: HashMap::from([(
+            field_values: EngineHashMap::from_iter([(
                 "roles_obj".to_string(),
-                vec![Value::Object(HashMap::from([(
+                vec![Value::Object(EngineHashMap::from_iter([(
                     "source".into(),
-                    Value::Object(HashMap::from([(
+                    Value::Object(EngineHashMap::from_iter([(
                         "process".into(),
-                        Value::Object(HashMap::from([(
+                        Value::Object(EngineHashMap::from_iter([(
                             "uid".into(),
                             str_val("d22b3fbcb9e77cb86834f6a18e2e0f68"),
                         )])),
@@ -344,7 +345,7 @@ fn execute_close_yield_nested_path_missing_bind_omits() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         close_step_data: vec![],
         bind_data: vec![], // no roles_obj collected

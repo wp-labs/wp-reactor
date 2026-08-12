@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-
 use wf_lang::ast::FieldRef;
 use wf_lang::plan::{ConvChainPlan, ConvOpPlan, ConvPlan};
 
 use super::eval::eval_expr;
 use super::key::{field_ref_name, value_to_string};
-use super::types::{CloseOutput, Event, Value};
+use super::types::{CloseOutput, EngineHashMap, Event, Value};
 
 /// Apply conv transformations to a batch of close outputs.
 ///
@@ -91,7 +89,7 @@ fn apply_op(op: &ConvOpPlan, keys: &[FieldRef], mut outputs: Vec<CloseOutput>) -
 /// - Scope key fields: key names mapped to their values
 /// - Step labels: label names mapped to their measure values (from both event and close steps)
 fn build_eval_context(output: &CloseOutput, keys: &[FieldRef]) -> Event {
-    let mut fields = HashMap::new();
+    let mut fields = EngineHashMap::default();
 
     // Map scope key values to their field names
     for (i, key) in keys.iter().enumerate() {

@@ -1,6 +1,6 @@
 use wf_lang::ast::{FieldRef, PathSegment};
 
-use super::types::{Event, Value};
+use super::types::{EngineHashMap, Event, Value};
 
 // ---------------------------------------------------------------------------
 // Value key — typed, hashable key for distinct-like state
@@ -222,7 +222,7 @@ pub(crate) fn field_ref_leaf_name(fr: &FieldRef) -> Option<&str> {
 /// type mismatch yields `None` (which the yield layer degrades to an omitted
 /// field). Other variants use the existing flat lookup.
 pub(crate) fn eval_field_value(
-    fields: &std::collections::HashMap<smol_str::SmolStr, Value>,
+    fields: &EngineHashMap<smol_str::SmolStr, Value>,
     fr: &FieldRef,
 ) -> Option<Value> {
     let FieldRef::Path { segments, .. } = fr else {
@@ -270,10 +270,9 @@ pub(crate) fn value_to_string(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use wf_lang::ast::PathSegment;
 
-    fn fields(pairs: &[(&str, Value)]) -> std::collections::HashMap<smol_str::SmolStr, Value> {
+    fn fields(pairs: &[(&str, Value)]) -> EngineHashMap<smol_str::SmolStr, Value> {
         pairs
             .iter()
             .map(|(k, v)| ((*k).into(), v.clone()))
@@ -291,9 +290,9 @@ mod tests {
     fn eval_path_walks_object() {
         let f = fields(&[(
             "roles_obj",
-            Value::Object(HashMap::from([(
+            Value::Object(EngineHashMap::from_iter([(
                 "source".into(),
-                Value::Object(HashMap::from([("uid".into(), Value::Str("abc".into()))])),
+                Value::Object(EngineHashMap::from_iter([("uid".into(), Value::Str("abc".into()))])),
             )])),
         )]);
         let fr = path(
@@ -327,9 +326,9 @@ mod tests {
     fn eval_path_missing_member_is_none() {
         let f = fields(&[(
             "roles_obj",
-            Value::Object(HashMap::from([(
+            Value::Object(EngineHashMap::from_iter([(
                 "source".into(),
-                Value::Object(HashMap::new()),
+                Value::Object(EngineHashMap::default()),
             )])),
         )]);
         let fr = path(
@@ -356,7 +355,7 @@ mod tests {
     fn eval_path_type_mismatch_is_none() {
         let f = fields(&[(
             "roles_obj",
-            Value::Object(HashMap::from([("source".into(), Value::Str("s".into()))])),
+            Value::Object(EngineHashMap::from_iter([("source".into(), Value::Str("s".into()))])),
         )]);
         // `source` is a string, not an object → next member fails.
         let fr = path(
@@ -398,7 +397,7 @@ mod tests {
         // An index segment applied to a non-array value is a type mismatch.
         let f = fields(&[(
             "roles_obj",
-            Value::Object(HashMap::from([("x".into(), Value::Str("s".into()))])),
+            Value::Object(EngineHashMap::from_iter([("x".into(), Value::Str("s".into()))])),
         )]);
         let fr = path(
             "e",
@@ -440,11 +439,11 @@ mod tests {
         // object → array → index → object → member.
         let f = fields(&[(
             "roles_obj",
-            Value::Object(HashMap::from([(
+            Value::Object(EngineHashMap::from_iter([(
                 "related".into(),
-                Value::Array(vec![Value::Object(HashMap::from([(
+                Value::Array(vec![Value::Object(EngineHashMap::from_iter([(
                     "process".into(),
-                    Value::Object(HashMap::from([(
+                    Value::Object(EngineHashMap::from_iter([(
                         "name".into(),
                         Value::Str("evil.exe".into()),
                     )])),

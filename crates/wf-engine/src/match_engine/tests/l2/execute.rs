@@ -47,7 +47,7 @@ fn execute_match_without_joins_still_works() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,

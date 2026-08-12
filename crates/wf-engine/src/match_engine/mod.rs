@@ -13,6 +13,7 @@ pub use event_bridge::{
     wfl_structured_field_kind,
 };
 pub use executor::{RuleExecutor, RuleExecutorOptions};
+pub use match_engine::{EngineHashMap, EngineHashSet};
 pub use match_engine::{
     CepStateMachine, CloseOutput, CloseReason, Event, MACHINE_ID, MatchedContext, StepData,
     StepOutcome, StepProgress, StepResult, Value, WindowLookup,

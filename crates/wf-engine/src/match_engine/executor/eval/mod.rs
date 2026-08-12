@@ -2,8 +2,8 @@ use std::cell::Cell;
 
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::match_engine::{
-    Event, Value, WindowLookup, eval_expr, eval_expr_ext, eval_field_value, value_to_string,
-    values_equal,
+    EngineHashMap, Event, Value, WindowLookup, eval_expr, eval_expr_ext, eval_field_value,
+    value_to_string, values_equal,
 };
 
 mod builtins;
@@ -150,7 +150,7 @@ pub(super) fn eval_bool_expr_with_lookup(
     ctx: &Event,
     windows: Option<&dyn WindowLookup>,
 ) -> Option<bool> {
-    let mut baselines = std::collections::HashMap::new();
+    let mut baselines = EngineHashMap::default();
     match eval_expr_ext(expr, ctx, windows, &mut baselines) {
         Some(Value::Bool(result)) => Some(result),
         _ => None,
@@ -187,7 +187,7 @@ pub(super) fn eval_expr_with_l3(
         Expr::WfuMeta(field) => meta.resolve_wfu_meta(*field),
         Expr::Field(fr) => eval_field_value(&ctx.fields, fr),
         Expr::Object(items) => {
-            let mut map = std::collections::HashMap::new();
+            let mut map = EngineHashMap::default();
             for item in items {
                 let value = eval_expr_with_l3(&item.value, ctx, score)?;
                 for target in &item.targets {

@@ -5,7 +5,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use super::{Event, Value, YieldMeta, eval_expr_with_l3, step_data, utils};
-use crate::match_engine::match_engine::{value_to_string, values_equal};
+use crate::match_engine::match_engine::{EngineHashMap, value_to_string, values_equal};
 use crate::time::{normalize_epoch_timestamp_float_nanos, positive_interval_seconds_to_nanos};
 
 pub(super) fn contains_system_var(expr: &wf_lang::ast::Expr) -> bool {
@@ -180,7 +180,7 @@ pub(super) fn eval_builtin_func_with_l3(
             if args.is_empty() {
                 return None;
             }
-            let mut merged = std::collections::HashMap::new();
+            let mut merged = EngineHashMap::default();
             for arg in args {
                 match eval_merge_arg(arg, ctx, score) {
                     Some(Value::Object(fields)) => merged.extend(fields),

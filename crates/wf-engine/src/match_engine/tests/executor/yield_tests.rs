@@ -6,6 +6,7 @@ use wf_lang::plan::{EachPlan, StepPlan, YieldField};
 use wf_lang::wfu_meta::WfuMetaField;
 use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
+use crate::match_engine::EngineHashMap;
 use crate::match_engine::Value;
 use crate::match_engine::match_engine::{BindData, CloseOutput, CloseReason, StepData};
 use crate::match_engine::{RuleExecutor, RuleExecutorOptions};
@@ -448,7 +449,7 @@ fn execute_each_yield_merges_input_object_with_extension() {
     }];
     let exec = RuleExecutor::new(plan);
 
-    let mut extension = HashMap::new();
+    let mut extension = EngineHashMap::default();
     extension.insert("severity".into(), num(3.0));
     extension.insert("rules".into(), Value::Array(vec![str_val("webshell")]));
     let alert = exec
@@ -502,13 +503,13 @@ fn execute_each_yield_passes_input_object_through() {
     }];
     let exec = RuleExecutor::new(plan);
 
-    let mut detection = HashMap::new();
+    let mut detection = EngineHashMap::default();
     detection.insert("severity".into(), num(10.0));
     detection.insert(
         "tags".into(),
         Value::Array(vec![str_val("os:linux"), str_val("webshell")]),
     );
-    let mut extension = HashMap::new();
+    let mut extension = EngineHashMap::default();
     extension.insert("detection".into(), Value::Object(detection));
 
     let alert = exec
@@ -830,7 +831,7 @@ fn execute_close_yield_can_reference_score() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         close_step_data: vec![],
         bind_data: vec![],
@@ -914,7 +915,7 @@ fn execute_close_yield_can_reference_time_system_vars() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         close_step_data: vec![],
         bind_data: vec![],
@@ -1003,7 +1004,7 @@ fn execute_close_yield_can_use_count_label_inside_if_and_concat() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         close_step_data: vec![],
         bind_data: vec![],
@@ -1104,7 +1105,7 @@ fn execute_close_yield_can_use_avg_on_field() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::from([(
+            field_values: EngineHashMap::from_iter([(
                 "risk_score".into(),
                 vec![num(20.0), num(40.0)],
             )]),
@@ -1211,7 +1212,7 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::from([(
+            field_values: EngineHashMap::from_iter([(
                 "risk_score".into(),
                 vec![num(90.0), num(70.0)],
             )]),
@@ -1221,7 +1222,7 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
             BindData {
                 alias: "x".into(),
                 count: 2,
-                field_values: std::collections::HashMap::from([(
+                field_values: EngineHashMap::from_iter([(
                     "risk_score".into(),
                     vec![num(90.0), num(70.0)],
                 )]),
@@ -1229,7 +1230,7 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
             BindData {
                 alias: "hi".into(),
                 count: 1,
-                field_values: std::collections::HashMap::from([(
+                field_values: EngineHashMap::from_iter([(
                     "action".into(),
                     vec![str_val("block")],
                 )]),
@@ -1237,7 +1238,7 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
             BindData {
                 alias: "elevated".into(),
                 count: 2,
-                field_values: std::collections::HashMap::from([(
+                field_values: EngineHashMap::from_iter([(
                     "risk_score".into(),
                     vec![num(90.0), num(70.0)],
                 )]),
@@ -1348,13 +1349,13 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         bind_data: vec![
             BindData {
                 alias: "x".into(),
                 count: 2,
-                field_values: std::collections::HashMap::from([(
+                field_values: EngineHashMap::from_iter([(
                     "risk_score".into(),
                     vec![num(90.0), num(70.0)],
                 )]),
@@ -1362,7 +1363,7 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
             BindData {
                 alias: "hi".into(),
                 count: 1,
-                field_values: std::collections::HashMap::from([(
+                field_values: EngineHashMap::from_iter([(
                     "action".into(),
                     vec![str_val("block")],
                 )]),
@@ -1370,7 +1371,7 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
             BindData {
                 alias: "elevated".into(),
                 count: 2,
-                field_values: std::collections::HashMap::from([(
+                field_values: EngineHashMap::from_iter([(
                     "risk_score".into(),
                     vec![num(90.0), num(70.0)],
                 )]),
@@ -1464,7 +1465,7 @@ fn execute_close_yield_can_use_fmt_with_count() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::from([(
+            field_values: EngineHashMap::from_iter([(
                 "sip".into(),
                 vec![
                     str_val("10.0.0.1"),
@@ -2599,7 +2600,7 @@ fn execute_close_missing_optional_float_field_is_omitted_not_fatal() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         close_step_data: vec![],
         bind_data: vec![],
@@ -2670,11 +2671,11 @@ fn nested_each_executor() -> RuleExecutor {
 }
 
 fn nested_roles_value() -> Value {
-    Value::Object(HashMap::from([(
+    Value::Object(EngineHashMap::from_iter([(
         "source".into(),
-        Value::Object(HashMap::from([(
+        Value::Object(EngineHashMap::from_iter([(
             "process".into(),
-            Value::Object(HashMap::from([(
+            Value::Object(EngineHashMap::from_iter([(
                 "uid".into(),
                 str_val("d22b3fbcb9e77cb86834f6a18e2e0f68"),
             )])),
@@ -2823,11 +2824,11 @@ fn execute_each_yield_nested_array_index() {
         .execute_each(
             &event(vec![(
                 "roles_obj",
-                Value::Object(HashMap::from([(
+                Value::Object(EngineHashMap::from_iter([(
                     "related".into(),
-                    Value::Array(vec![Value::Object(HashMap::from([(
+                    Value::Array(vec![Value::Object(EngineHashMap::from_iter([(
                         "process".into(),
-                        Value::Object(HashMap::from([("name".into(), str_val("evil.exe"))])),
+                        Value::Object(EngineHashMap::from_iter([("name".into(), str_val("evil.exe"))])),
                     )]))]),
                 )])),
             )]),
@@ -2882,7 +2883,7 @@ fn execute_each_yield_nested_array_out_of_bounds_omits() {
         .execute_each(
             &event(vec![(
                 "roles_obj",
-                Value::Object(HashMap::from([(
+                Value::Object(EngineHashMap::from_iter([(
                     "related".into(),
                     Value::Array(vec![str_val("x")]),
                 )])),
@@ -2943,7 +2944,7 @@ fn execute_each_yield_nested_path_in_arithmetic() {
         .execute_each(
             &event(vec![(
                 "roles_obj",
-                Value::Object(HashMap::from([("risk".into(), num(21.0))])),
+                Value::Object(EngineHashMap::from_iter([("risk".into(), num(21.0))])),
             )]),
             1_000_000,
         )
@@ -3097,11 +3098,11 @@ fn execute_each_bind_filter_nested_path() {
         .execute_each(
             &event(vec![(
                 "roles_obj",
-                Value::Object(HashMap::from([(
+                Value::Object(EngineHashMap::from_iter([(
                     "source".into(),
-                    Value::Object(HashMap::from([(
+                    Value::Object(EngineHashMap::from_iter([(
                         "process".into(),
-                        Value::Object(HashMap::from([("uid".into(), str_val("other"))])),
+                        Value::Object(EngineHashMap::from_iter([("uid".into(), str_val("other"))])),
                     )])),
                 )])),
             )]),
@@ -3160,7 +3161,7 @@ fn execute_match_yield_nested_path_via_bind_tracking() {
     matched.bind_data = vec![BindData {
         alias: "e".into(),
         count: 1,
-        field_values: HashMap::from([("roles_obj".into(), vec![nested_roles_value()])]),
+        field_values: EngineHashMap::from_iter([("roles_obj".into(), vec![nested_roles_value()])]),
     }];
     let alert = exec.execute_match(&matched).unwrap();
 

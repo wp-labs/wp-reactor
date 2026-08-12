@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use wf_lang::ast::{BinOp, CmpOp, Expr, FieldSelector, Measure, Transform};
 use wf_lang::plan::{AggPlan, StepPlan};
@@ -6,7 +6,7 @@ use wf_lang::plan::{AggPlan, StepPlan};
 use super::eval::{eval_expr_ext, try_eval_expr_to_f64, try_eval_expr_to_value};
 use super::key::ValueKey;
 use super::state::{AliasState, BranchState, StepState};
-use super::types::{Event, RollingStats, StepProgress, Value, WindowLookup};
+use super::types::{EngineHashMap, Event, RollingStats, StepProgress, Value, WindowLookup};
 
 // ---------------------------------------------------------------------------
 // Step evaluation
@@ -33,7 +33,7 @@ pub(super) fn evaluate_step_with_progress(
     input: StepEvaluationInput<'_>,
     step_plan: &StepPlan,
     step_state: &mut StepState,
-    baselines: &mut HashMap<String, RollingStats>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> (Option<(usize, f64)>, Option<StepProgress>) {
     let mut progress = None;
     let mut threshold_checked_branches = 0usize;
@@ -524,7 +524,7 @@ mod tests {
     use super::*;
 
     fn event_with(field: &str, value: i64) -> Event {
-        let mut fields = std::collections::HashMap::new();
+        let mut fields = EngineHashMap::default();
         fields.insert(field.to_string().into(), Value::Number(value as f64));
         Event { fields }
     }
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn collect_alias_event_tracks_only_requested_fields() {
         let mut state = AliasState::new();
-        let mut fields = std::collections::HashMap::new();
+        let mut fields = EngineHashMap::default();
         fields.insert("sip".into(), Value::Str("10.0.0.1".into()));
         fields.insert("dport".into(), Value::Number(443.0));
         let event = Event { fields };
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn collect_event_fields_tracks_requested_fields_and_branch_field() {
         let mut bs = BranchState::new();
-        let mut fields = std::collections::HashMap::new();
+        let mut fields = EngineHashMap::default();
         fields.insert("sip".into(), Value::Str("10.0.0.1".into()));
         fields.insert("dport".into(), Value::Number(443.0));
         fields.insert("bytes".into(), Value::Number(100.0));
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn collect_event_fields_tracks_plain_fields() {
         let mut bs = BranchState::new();
-        let mut fields = std::collections::HashMap::new();
+        let mut fields = EngineHashMap::default();
         fields.insert("sip".into(), Value::Str("10.0.0.1".into()));
         fields.insert("dport".into(), Value::Number(443.0));
         let event = Event { fields };

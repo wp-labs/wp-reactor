@@ -38,7 +38,7 @@ fn labeled_step(label: &str, value: f64) -> StepData {
         event_first_time_nanos: None,
         event_last_time_nanos: None,
         collected_values: Vec::new(),
-        field_values: std::collections::HashMap::new(),
+        field_values: EngineHashMap::default(),
     }
 }
 

@@ -1,5 +1,6 @@
 use wf_lang::ast::{BinOp, Expr, FieldRef};
 
+use crate::match_engine::EngineHashMap;
 use crate::match_engine::RuleExecutor;
 use crate::match_engine::Value;
 use crate::match_engine::match_engine::{MatchedContext, StepData};
@@ -111,7 +112,7 @@ fn summary_format() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,
@@ -164,7 +165,7 @@ fn numeric_key_preserves_type_in_eval_context() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,
@@ -211,7 +212,7 @@ fn label_cannot_overwrite_key_in_eval_context() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,
@@ -255,7 +256,7 @@ fn wfx_id_hex_format() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,

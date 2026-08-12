@@ -1,6 +1,7 @@
 use wf_lang::ast::{BinOp, Expr, FieldRef};
 use wf_lang::plan::EachPlan;
 
+use crate::match_engine::EngineHashMap;
 use crate::match_engine::RuleExecutor;
 
 use super::super::helpers::*;
@@ -131,7 +132,7 @@ fn execute_match_no_keys() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,
@@ -177,7 +178,7 @@ fn execute_match_composite_keys() {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,

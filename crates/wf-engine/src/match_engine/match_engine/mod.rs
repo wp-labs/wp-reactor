@@ -12,6 +12,7 @@ pub use types::{
     BindData, CloseOutput, CloseReason, Event, MACHINE_ID, MatchedContext, StepData, StepOutcome,
     StepProgress, StepResult, Value, WindowLookup,
 };
+pub use types::{EngineHashMap, EngineHashSet};
 
 // Re-export pub(crate) items
 pub(crate) use eval::{eval_expr, values_equal};
@@ -23,7 +24,7 @@ pub(crate) use conv::apply_conv;
 pub(crate) use eval::eval_expr_ext;
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
 
 use wf_lang::ast::CloseMode;
 use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, WindowSpec};
@@ -51,7 +52,7 @@ use step::{
 pub struct CepStateMachine {
     rule_name: String,
     plan: MatchPlan,
-    instances: HashMap<InstanceKey, Instance>,
+    instances: EngineHashMap<InstanceKey, Instance>,
     time_field: Option<String>,
     watermark_nanos: i64,
     limits: Option<LimitsPlan>,
@@ -68,7 +69,7 @@ pub struct CepStateMachine {
     /// Keys with a pending expiry candidate. Prevents per-event/reset
     /// `push_expiry_candidate` from stacking duplicate heap entries (the
     /// dominant leak on high-fire rules like pass-through count).
-    pending_expiry: HashSet<InstanceKey>,
+    pending_expiry: EngineHashSet<InstanceKey>,
     /// Cached estimated memory across active instances.
     ///
     /// This keeps `limits.max_memory` checks O(1) for the common path instead
@@ -88,8 +89,8 @@ impl CepStateMachine {
         Self {
             rule_name,
             plan,
-            instances: HashMap::new(),
-            pending_expiry: HashSet::new(),
+            instances: EngineHashMap::default(),
+            pending_expiry: EngineHashSet::default(),
             time_field,
             watermark_nanos: 0,
             limits: None,
@@ -116,8 +117,8 @@ impl CepStateMachine {
         Self {
             rule_name,
             plan,
-            instances: HashMap::new(),
-            pending_expiry: HashSet::new(),
+            instances: EngineHashMap::default(),
+            pending_expiry: EngineHashSet::default(),
             time_field,
             watermark_nanos: 0,
             limits,
@@ -358,7 +359,7 @@ impl CepStateMachine {
                 event,
                 instance
                     .alias_states
-                    .get_or_insert_with(|| Box::new(HashMap::new()))
+                    .get_or_insert_with(|| Box::new(EngineHashMap::default()))
                     .entry(alias.to_string())
                     .or_insert_with(AliasState::new),
                 tracked_fields,

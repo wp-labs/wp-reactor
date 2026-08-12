@@ -2,10 +2,11 @@ use super::{
     Event, Value, YieldMeta, eval_bool_expr, eval_expr_with_l3, eval_yield_expr,
     eval_yield_expr_with_score, with_yield_eval_scope,
 };
+use crate::match_engine::EngineHashMap;
 use wf_lang::ast::{BinOp, Expr, FieldRef, ObjectItem};
 
 fn make_test_event(values: Vec<Value>) -> Event {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("_step_0_values".into(), Value::Array(values));
     fields.insert("_step_0_source".into(), Value::Str("e".into()));
     Event { fields }
@@ -89,7 +90,7 @@ fn test_collect_set_returns_unique_values() {
 
 #[test]
 fn test_collect_set_qualified_bind_field_missing_does_not_fallback_to_step_values() {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert(
         "_step_0_values".into(),
         Value::Array(vec![Value::Str("10.0.0.1".into())]),
@@ -112,11 +113,11 @@ fn test_collect_set_qualified_bind_field_missing_does_not_fallback_to_step_value
 
 #[test]
 fn test_merge_shallow_merges_objects_left_to_right() {
-    let mut base = std::collections::HashMap::new();
+    let mut base = EngineHashMap::default();
     base.insert("severity".into(), Value::Number(3.0));
     base.insert("existing".into(), Value::Str("kept".into()));
 
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("extension".into(), Value::Object(base));
     let ctx = Event { fields };
 
@@ -155,9 +156,7 @@ fn test_merge_shallow_merges_objects_left_to_right() {
 
 #[test]
 fn test_merge_fails_when_object_literal_value_is_missing() {
-    let ctx = Event {
-        fields: std::collections::HashMap::new(),
-    };
+    let ctx = Event { fields: EngineHashMap::default() };
     let expr = Expr::FuncCall {
         qualifier: None,
         name: "merge".to_string(),
@@ -314,7 +313,7 @@ fn test_nested_l3_in_arithmetic() {
 
 #[test]
 fn test_qualified_alias_selects_matching_step() {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert(
         "_step_0_values".into(),
         Value::Array(vec![Value::Number(10.0)]),
@@ -340,7 +339,7 @@ fn test_qualified_alias_selects_matching_step() {
 
 #[test]
 fn test_qualified_alias_without_match_returns_none_for_first() {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert(
         "_step_0_values".into(),
         Value::Array(vec![Value::Number(10.0)]),
@@ -362,7 +361,7 @@ fn test_qualified_alias_without_match_returns_none_for_first() {
 
 #[test]
 fn test_replace_works_in_yield_eval() {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert(
         "msg".into(),
         Value::Str("failed_login_from_root".into()),
@@ -403,7 +402,7 @@ fn test_mvcount_with_collect_set_nested_l3() {
 
 #[test]
 fn test_trim_works_in_yield_eval() {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("msg".into(), Value::Str("  hello  ".into()));
     let ctx = Event { fields };
     let expr = Expr::FuncCall {
@@ -417,7 +416,7 @@ fn test_trim_works_in_yield_eval() {
 
 #[test]
 fn test_blank_functions_work_in_yield_eval() {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("empty".into(), Value::Str(String::new().into()));
     fields.insert("spaces".into(), Value::Str(" \t\n ".into()));
     fields.insert("host".into(), Value::Str("example.org".into()));
@@ -554,7 +553,7 @@ fn test_blank_functions_work_in_yield_eval() {
 
 #[test]
 fn test_hash_and_id_functions_work_in_yield_eval() {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("msg".into(), Value::Str("hello".into()));
     fields.insert("empty".into(), Value::Str(String::new().into()));
     fields.insert("ip".into(), Value::Str("10.0.0.1".into()));
@@ -780,9 +779,7 @@ fn test_hash_and_id_functions_work_in_yield_eval() {
 
 #[test]
 fn test_stable_id_uses_unambiguous_segments_in_yield_eval() {
-    let ctx = Event {
-        fields: std::collections::HashMap::new(),
-    };
+    let ctx = Event { fields: EngineHashMap::default() };
     let first_expr = Expr::FuncCall {
         qualifier: None,
         name: "stable_id".to_string(),
@@ -818,9 +815,7 @@ fn test_stable_id_uses_unambiguous_segments_in_yield_eval() {
 
 #[test]
 fn test_now_functions_share_timestamp_within_yield_expression() {
-    let ctx = Event {
-        fields: std::collections::HashMap::new(),
-    };
+    let ctx = Event { fields: EngineHashMap::default() };
     let expr = Expr::BinOp {
         op: BinOp::Sub,
         left: Box::new(Expr::FuncCall {
@@ -840,9 +835,7 @@ fn test_now_functions_share_timestamp_within_yield_expression() {
 
 #[test]
 fn test_now_functions_share_timestamp_across_yield_scope() {
-    let ctx = Event {
-        fields: std::collections::HashMap::new(),
-    };
+    let ctx = Event { fields: EngineHashMap::default() };
     let now_expr = Expr::FuncCall {
         qualifier: None,
         name: "now".to_string(),
@@ -864,9 +857,7 @@ fn test_now_functions_share_timestamp_across_yield_scope() {
 
 #[test]
 fn test_time_bucket_rejects_invalid_interval_in_yield_eval() {
-    let ctx = Event {
-        fields: std::collections::HashMap::new(),
-    };
+    let ctx = Event { fields: EngineHashMap::default() };
 
     for interval in [0.0, -60.0, f64::INFINITY, f64::NAN] {
         let expr = Expr::FuncCall {
@@ -903,7 +894,7 @@ fn test_mvjoin_with_collect_list_nested_l3() {
 
 #[test]
 fn test_split_works_in_yield_eval() {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("csv".into(), Value::Str("a,b,,c".into()));
     let ctx = Event { fields };
     let expr = Expr::FuncCall {
@@ -957,7 +948,7 @@ fn test_mvdedup_with_collect_list_nested_l3() {
 
 #[test]
 fn test_substr_works_in_yield_eval() {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("msg".into(), Value::Str("abcdef".into()));
     let ctx = Event { fields };
     let expr = Expr::FuncCall {
@@ -975,7 +966,7 @@ fn test_substr_works_in_yield_eval() {
 
 #[test]
 fn test_startswith_and_endswith_in_yield_eval() {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert(
         "msg".into(),
         Value::Str("failed_login_root".into()),
@@ -1003,7 +994,7 @@ fn test_startswith_and_endswith_in_yield_eval() {
 
 #[test]
 fn test_math_and_time_functions_in_yield_eval() {
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = EngineHashMap::default();
     fields.insert("n".into(), Value::Number(-12.345));
     fields.insert("p".into(), Value::Number(16.0));
     fields.insert("ts".into(), Value::Number(0.0));
@@ -1325,9 +1316,7 @@ fn test_math_and_time_functions_in_yield_eval() {
 
 #[test]
 fn test_system_score_var_works_inside_builtin_functions() {
-    let ctx = Event {
-        fields: std::collections::HashMap::new(),
-    };
+    let ctx = Event { fields: EngineHashMap::default() };
     let round_expr = Expr::FuncCall {
         qualifier: None,
         name: "round".to_string(),
@@ -1425,9 +1414,7 @@ fn external_without_handler_returns_none() {
 
 #[test]
 fn external_requires_at_least_two_args() {
-    let ctx = Event {
-        fields: std::collections::HashMap::new(),
-    };
+    let ctx = Event { fields: EngineHashMap::default() };
     let expr = Expr::FuncCall {
         qualifier: None,
         name: "external".to_string(),
@@ -1439,9 +1426,7 @@ fn external_requires_at_least_two_args() {
 
 #[test]
 fn external_service_must_be_string_literal() {
-    let ctx = Event {
-        fields: std::collections::HashMap::new(),
-    };
+    let ctx = Event { fields: EngineHashMap::default() };
     let expr = Expr::FuncCall {
         qualifier: None,
         name: "external".to_string(),

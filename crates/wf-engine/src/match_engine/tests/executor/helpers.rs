@@ -1,3 +1,4 @@
+use crate::match_engine::EngineHashMap;
 use crate::match_engine::match_engine::{MatchedContext, StepData};
 
 use super::super::helpers::*;
@@ -20,7 +21,7 @@ pub fn default_matched_context() -> MatchedContext {
             event_first_time_nanos: None,
             event_last_time_nanos: None,
             collected_values: Vec::new(),
-            field_values: std::collections::HashMap::new(),
+            field_values: EngineHashMap::default(),
         }],
         bind_data: vec![],
         event_time_nanos: 0,

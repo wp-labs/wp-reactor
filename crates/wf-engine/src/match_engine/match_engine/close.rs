@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use wf_lang::ast::CloseMode;
 use wf_lang::plan::{MatchPlan, StepPlan};
 
@@ -9,7 +7,9 @@ use super::step::{
     apply_transforms, check_threshold, collect_event_fields, compute_measure, extract_branch_field,
     record_evidence_time, update_measure,
 };
-use super::types::{CloseOutput, CloseReason, Event, RollingStats, StepData, Value, WindowLookup};
+use super::types::{
+    CloseOutput, CloseReason, EngineHashMap, Event, RollingStats, StepData, Value, WindowLookup,
+};
 
 // ---------------------------------------------------------------------------
 // Close-step accumulation (during advance)
@@ -31,7 +31,7 @@ pub(super) fn accumulate_close_steps(
     plan: &MatchPlan,
     close_step_states: &mut [StepState],
     windows: Option<&dyn WindowLookup>,
-    baselines: &mut HashMap<String, RollingStats>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
 ) {
     let close_steps = &plan.close_steps;
     let tracked_fields = plan.tracked_bind_fields.get(alias);
@@ -90,7 +90,7 @@ fn evaluate_close_steps(
     // Synthetic event for guard evaluation
     let synthetic_event = Event {
         fields: {
-            let mut m = HashMap::new();
+            let mut m = EngineHashMap::default();
             m.insert(
                 "close_reason".into(),
                 Value::Str(reason.as_str().into()),
@@ -134,7 +134,7 @@ fn evaluate_close_steps(
                     event_first_time_nanos: None,
                     event_last_time_nanos: None,
                     collected_values: Vec::new(),
-                    field_values: HashMap::new(),
+                    field_values: EngineHashMap::default(),
                 });
             }
         }

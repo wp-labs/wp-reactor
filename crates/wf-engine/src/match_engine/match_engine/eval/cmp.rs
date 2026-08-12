@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use sha2::{Digest, Sha256};
 use wf_lang::ast::{BinOp, CmpOp, Expr};
@@ -7,7 +5,7 @@ use wf_lang::ast::{BinOp, CmpOp, Expr};
 use crate::time::epoch_nanos_to_millis;
 
 use super::super::key::value_to_string;
-use super::super::types::{Event, RollingStats, Value, WindowLookup};
+use super::super::types::{EngineHashMap, Event, RollingStats, Value, WindowLookup};
 use super::eval_expr_ext;
 
 pub(super) fn compare_values(op: BinOp, lv: &Value, rv: &Value) -> bool {
@@ -224,7 +222,7 @@ pub(super) fn eval_single_string_arg(
     args: &[Expr],
     event: &Event,
     windows: Option<&dyn WindowLookup>,
-    baselines: &mut HashMap<String, RollingStats>,
+    baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<String> {
     if args.len() != 1 {
         return None;

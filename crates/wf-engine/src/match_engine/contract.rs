@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use wf_lang::ast::{
     CloseTrigger, CmpOp, ExpectStmt, Expr, FieldAssign, HitAssert, InputStmt, PermutationMode,
     TestBlock,
@@ -9,6 +7,7 @@ use wf_lang::plan::RulePlan;
 use crate::alert::OutputRecord;
 use crate::error::CoreResult;
 use crate::match_engine::match_engine::eval_expr;
+use crate::match_engine::match_engine::EngineHashMap;
 use crate::match_engine::{CepStateMachine, CloseReason, Event, RuleExecutor, StepResult, Value};
 
 /// Result of running a single test block against a rule.
@@ -280,7 +279,7 @@ fn validate_hit_assert(
 
 /// Convert field assignments to an Event.
 fn fields_to_event(fields: &[FieldAssign]) -> Event {
-    let mut map = HashMap::new();
+    let mut map = EngineHashMap::default();
     for f in fields {
         if let Some(v) = expr_to_value(&f.value) {
             map.insert(f.name.clone().into(), v);
@@ -292,7 +291,7 @@ fn fields_to_event(fields: &[FieldAssign]) -> Event {
 /// Convert a literal expression to a Value.
 fn expr_to_value(expr: &Expr) -> Option<Value> {
     let empty_event = Event {
-        fields: HashMap::new(),
+        fields: EngineHashMap::default(),
     };
     eval_expr(expr, &empty_event)
 }

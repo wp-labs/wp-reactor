@@ -1,6 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
+use foldhash::fast::RandomState as FoldRandomState;
 use smol_str::SmolStr;
+
+/// HashMap/HashSet over hot-path keys (InstanceKey, field names, event field
+/// keys) using foldhash's fast, minimally-DoS-resistant hasher instead of the
+/// default SipHash. SipHash was ~3k samples of the match-engine profile; field
+/// names / rule keys are internal, and InstanceKey values carry a random seed
+/// via `FoldRandomState` so collision attacks stay hard.
+pub type EngineHashMap<K, V> = HashMap<K, V, FoldRandomState>;
+pub type EngineHashSet<K> = HashSet<K, FoldRandomState>;
 
 // ---------------------------------------------------------------------------
 // Public types — Event & Value
@@ -17,7 +26,7 @@ pub const MACHINE_ID: &str = "wp_src_ip";
 #[derive(::moju_derive::MoJu, Debug, Clone)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct Event {
-    pub fields: HashMap<SmolStr, Value>,
+    pub fields: EngineHashMap<SmolStr, Value>,
 }
 
 /// Scalar value carried inside an [`Event`].
@@ -28,7 +37,7 @@ pub enum Value {
     Str(SmolStr),
     Bool(bool),
     Array(Vec<Value>),
-    Object(HashMap<SmolStr, Value>),
+    Object(EngineHashMap<SmolStr, Value>),
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +111,7 @@ pub struct StepData {
     /// Collected values for L3 functions (collect_set/list, first/last, stddev/percentile)
     pub collected_values: Vec<Value>,
     /// All accepted field values seen for the satisfied branch, keyed by field name.
-    pub field_values: HashMap<String, Vec<Value>>,
+    pub field_values: EngineHashMap<String, Vec<Value>>,
 }
 
 /// Snapshot of all events accepted by a bound alias within the current instance.
@@ -110,7 +119,7 @@ pub struct StepData {
 pub struct BindData {
     pub alias: String,
     pub count: u64,
-    pub field_values: HashMap<String, Vec<Value>>,
+    pub field_values: EngineHashMap<String, Vec<Value>>,
 }
 
 // ---------------------------------------------------------------------------

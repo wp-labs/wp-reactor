@@ -15,6 +15,7 @@ use wp_model_core::model::{
 
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::CloseReason;
+use crate::match_engine::EngineHashMap;
 use crate::match_engine::Value;
 use crate::time::normalize_epoch_timestamp_float_nanos;
 
@@ -472,7 +473,7 @@ fn rule_value_to_model_value(value: &Value) -> CoreResult<(DataType, ModelValue)
 }
 
 fn rule_object_to_model(
-    items: &std::collections::HashMap<smol_str::SmolStr, Value>,
+    items: &EngineHashMap<smol_str::SmolStr, Value>,
 ) -> CoreResult<ObjectValue> {
     let mut object = ObjectValue::new();
     for (key, value) in items {
