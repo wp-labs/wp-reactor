@@ -33,6 +33,7 @@ pub(crate) async fn run_rule_task(config: RuleTaskConfig) -> RuntimeResult<()> {
     let (mut task, cancel, timeout_scan_interval) = rule_task::RuleTask::new(config);
     let task_id = task.task_id.clone();
     let mut timeout_tick = tokio::time::interval(timeout_scan_interval);
+    let mut eos = task.eos_flush.clone();
 
     // Clone Arc<Notify> handles outside the struct so that notification
     // registration borrows `notifiers` (not `task`), allowing `&mut task`
@@ -50,6 +51,16 @@ pub(crate) async fn run_rule_task(config: RuleTaskConfig) -> RuntimeResult<()> {
                 task.flush().await;
                 wf_debug!(pipe, task_id = %task_id, "rule task shutdown complete");
                 break;
+            }
+            // End-of-stream: input sources reported the stream ended. Flush the
+            // trailing instances (EOS-driven finalization) but keep running so a
+            // daemon can accept a subsequent finite input.
+            _ = eos.changed() => {
+                if *eos.borrow() {
+                    task.pull_and_advance().await;
+                    task.flush().await;
+                    wf_debug!(pipe, task_id = %task_id, "rule task EOS flush complete");
+                }
             }
             _ = timeout_tick.tick() => task.scan_timeouts().await,
             _ = wait_any(&mut notifications) => {}

@@ -4,7 +4,7 @@ use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use orion_error::conversion::{SourceErr, ToStructError};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use wf_config::FusionConfig;
@@ -77,6 +77,7 @@ pub(super) fn spawn_rule_tasks(
     alert_tx: mpsc::Sender<OutputRecord>,
     cancel: CancellationToken,
     metrics: Option<Arc<RuntimeMetrics>>,
+    eos_tx: watch::Sender<bool>,
 ) -> TaskGroup {
     let mut group = TaskGroup::new("rules");
     let timeout_scan_interval = Duration::from_secs(1);
@@ -100,6 +101,7 @@ pub(super) fn spawn_rule_tasks(
             router: Arc::clone(router),
             metrics: metrics.clone(),
             intermediate_targets: intermediate_targets.clone(),
+            eos_flush: eos_tx.subscribe(),
         };
 
         group.push(tokio::spawn(

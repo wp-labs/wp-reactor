@@ -359,6 +359,7 @@ fn make_task_with_window_bytes(
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
 
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
@@ -471,6 +472,7 @@ fn make_pipeline_stage_task() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -555,6 +557,7 @@ fn make_each_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -654,6 +657,7 @@ fn make_filtered_match_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -766,6 +770,7 @@ fn make_filtered_close_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -847,6 +852,7 @@ fn make_filtered_each_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -960,6 +966,7 @@ fn make_intermediate_each_task() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1055,6 +1062,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1157,6 +1165,7 @@ fn make_intermediate_score_tasks() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (upstream_task, _cancel, _interval) = rule_task::RuleTask::new(upstream_config);
 
@@ -1290,6 +1299,7 @@ fn make_intermediate_score_tasks() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::new(),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (downstream_task, _cancel, _interval) = rule_task::RuleTask::new(downstream_config);
 
@@ -1393,6 +1403,7 @@ fn make_intermediate_score_band_tasks() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (upstream_task, _cancel, _interval) = rule_task::RuleTask::new(upstream_config);
 
@@ -1579,6 +1590,7 @@ fn make_intermediate_score_band_tasks() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::new(),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (downstream_task, _cancel, _interval) = rule_task::RuleTask::new(downstream_config);
 
@@ -1746,6 +1758,7 @@ fn make_filtered_bind_alias_match_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, window, notify)
@@ -1852,6 +1865,7 @@ fn make_window_has_match_task() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::new(),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -2653,6 +2667,7 @@ async fn port_scan_rule_triggers_close_alert() {
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+        eos_flush: tokio::sync::watch::channel(false).1,
     };
 
     let (mut task, _cancel, _interval) = rule_task::RuleTask::new(config);

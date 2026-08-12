@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use wf_engine::alert::OutputRecord;
@@ -41,4 +41,8 @@ pub(crate) struct RuleTaskConfig {
     pub metrics: Option<Arc<RuntimeMetrics>>,
     /// Yield targets that should be written back into windows for downstream rules.
     pub intermediate_targets: HashSet<String>,
+    /// End-of-stream signal (set true when the input sources report the stream
+    /// ended). The rule task flushes its instances on EOS but keeps running so
+    /// a daemon can accept subsequent finite inputs.
+    pub eos_flush: watch::Receiver<bool>,
 }

@@ -16,7 +16,7 @@ use std::time::Duration;
 use orion_error::conversion::ToStructError;
 use orion_error::op_context;
 use orion_error::prelude::*;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -254,6 +254,8 @@ pub struct Reactor {
     pub(crate) alert_tx: Option<mpsc::Sender<OutputRecord>>,
     pub(crate) metrics: Option<Arc<RuntimeMetrics>>,
     pub(crate) intermediate_targets: HashSet<String>,
+    /// EOS sender shared with rule generations (reload keeps it).
+    pub(crate) eos_tx: watch::Sender<bool>,
     /// Reload baseline: the raw + effective config currently running, plus the
     /// base dir used to resolve rule/schema files.
     pub(crate) current_raw: RawFusionConfigTree,
@@ -341,6 +343,11 @@ impl Reactor {
             cancel.clone(),
         ));
 
+        // End-of-stream signal shared with the rule tasks: set true when the
+        // input sources report the stream ended (EOS-driven finalization).
+        // Rules flush trailing instances on EOS but keep running.
+        let (eos_tx, _) = tokio::sync::watch::channel(false);
+
         let rule_group = spawn_rule_tasks(
             data.rules,
             &data.router,
@@ -348,6 +355,7 @@ impl Reactor {
             alert_tx.clone(),
             rule_cancel.clone(),
             metrics.clone(),
+            eos_tx.clone(),
         );
         let rule_watch = watch_group(rule_group, cancel.clone());
 
@@ -363,8 +371,8 @@ impl Reactor {
         tail_watchers.push(watch_receiver_group(
             receiver_group,
             cancel.clone(),
-            rule_cancel.clone(),
             config.mode == wf_config::FusionMode::Batch,
+            eos_tx.clone(),
         ));
         tail_watchers.push(watch_group(
             spawn_metrics_task(
@@ -393,6 +401,7 @@ impl Reactor {
             alert_tx: Some(alert_tx),
             metrics,
             intermediate_targets: data.intermediate_targets,
+            eos_tx,
             current_raw: raw,
             current_config: config,
             base_dir: base_dir.to_path_buf(),
@@ -593,14 +602,21 @@ fn watch_group(group: TaskGroup, cancel: CancellationToken) -> JoinHandle<Runtim
 fn watch_receiver_group(
     receiver_group: TaskGroup,
     cancel: CancellationToken,
-    rule_cancel: CancellationToken,
     auto_shutdown: bool,
+    eos_tx: watch::Sender<bool>,
 ) -> JoinHandle<RuntimeResult<()>> {
     let name = receiver_group.name;
     tokio::spawn(async move {
         wf_debug!(sys, task_group = name, "watching task group");
         let result = receiver_group.wait().await;
-        rule_cancel.cancel();
+        if result.is_ok() {
+            // EOS-driven finalization: input sources reported the stream ended.
+            // Rules flush their trailing instances but keep running (a daemon
+            // can accept a subsequent finite input). Shutdown still flows
+            // through `rule_cancel` / `cancel` below.
+            wf_info!(sys, task_group = name, "receiver completed; signaling EOS flush");
+            let _ = eos_tx.send(true);
+        }
         if result.is_err() && !cancel.is_cancelled() {
             cancel.cancel();
         } else if auto_shutdown && result.is_ok() && !cancel.is_cancelled() {
