@@ -54,9 +54,10 @@ pub(crate) async fn run_rule_task(config: RuleTaskConfig) -> RuntimeResult<()> {
             }
             // End-of-stream: input sources reported the stream ended. Flush the
             // trailing instances (EOS-driven finalization) but keep running so a
-            // daemon can accept a subsequent finite input.
+            // daemon can accept a subsequent finite input. The counter is
+            // incremented per EOS event; 0 means no EOS yet.
             _ = eos.changed() => {
-                if *eos.borrow() {
+                if *eos.borrow() > 0 {
                     task.pull_and_advance().await;
                     task.flush().await;
                     wf_debug!(pipe, task_id = %task_id, "rule task EOS flush complete");

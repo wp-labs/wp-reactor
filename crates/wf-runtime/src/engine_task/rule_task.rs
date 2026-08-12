@@ -95,10 +95,10 @@ pub(super) struct RuleTask {
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
     intermediate_targets: HashSet<String>,
-    /// End-of-stream signal (set true when input sources report the stream
-    /// ended). The task flushes instances on EOS but keeps running so a daemon
-    /// can accept subsequent finite inputs.
-    pub(super) eos_flush: tokio::sync::watch::Receiver<bool>,
+    /// End-of-stream counter (incremented on each EOS event). The task flushes
+    /// instances on every EOS but keeps running so a daemon can accept
+    /// multiple finite inputs.
+    pub(super) eos_flush: tokio::sync::watch::Receiver<u64>,
     /// Wall clock when events were last processed. When input goes idle, this
     /// stays put so the periodic timeout scan can advance the effective watermark
     /// by the elapsed wall time — letting instances expire per their window TTL

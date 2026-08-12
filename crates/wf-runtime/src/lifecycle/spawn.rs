@@ -77,7 +77,7 @@ pub(super) fn spawn_rule_tasks(
     alert_tx: mpsc::Sender<OutputRecord>,
     cancel: CancellationToken,
     metrics: Option<Arc<RuntimeMetrics>>,
-    eos_tx: watch::Sender<bool>,
+    eos_tx: watch::Sender<u64>,
 ) -> TaskGroup {
     let mut group = TaskGroup::new("rules");
     let timeout_scan_interval = Duration::from_secs(1);

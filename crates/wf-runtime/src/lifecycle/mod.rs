@@ -255,7 +255,7 @@ pub struct Reactor {
     pub(crate) metrics: Option<Arc<RuntimeMetrics>>,
     pub(crate) intermediate_targets: HashSet<String>,
     /// EOS sender shared with rule generations (reload keeps it).
-    pub(crate) eos_tx: watch::Sender<bool>,
+    pub(crate) eos_tx: watch::Sender<u64>,
     /// Reload baseline: the raw + effective config currently running, plus the
     /// base dir used to resolve rule/schema files.
     pub(crate) current_raw: RawFusionConfigTree,
@@ -343,10 +343,11 @@ impl Reactor {
             cancel.clone(),
         ));
 
-        // End-of-stream signal shared with the rule tasks: set true when the
-        // input sources report the stream ended (EOS-driven finalization).
-        // Rules flush trailing instances on EOS but keep running.
-        let (eos_tx, _) = tokio::sync::watch::channel(false);
+        // End-of-stream counter shared with the rule tasks: incremented each
+        // time the input sources report the stream ended (EOS-driven
+        // finalization). Rules flush trailing instances on every EOS but keep
+        // running.
+        let (eos_tx, _) = tokio::sync::watch::channel(0u64);
 
         let rule_group = spawn_rule_tasks(
             data.rules,
@@ -603,7 +604,7 @@ fn watch_receiver_group(
     receiver_group: TaskGroup,
     cancel: CancellationToken,
     auto_shutdown: bool,
-    eos_tx: watch::Sender<bool>,
+    eos_tx: watch::Sender<u64>,
 ) -> JoinHandle<RuntimeResult<()>> {
     let name = receiver_group.name;
     tokio::spawn(async move {
@@ -612,10 +613,11 @@ fn watch_receiver_group(
         if result.is_ok() {
             // EOS-driven finalization: input sources reported the stream ended.
             // Rules flush their trailing instances but keep running (a daemon
-            // can accept a subsequent finite input). Shutdown still flows
-            // through `rule_cancel` / `cancel` below.
+            // can accept a subsequent finite input). The counter increments per
+            // EOS so multiple finite inputs each trigger a flush.
             wf_info!(sys, task_group = name, "receiver completed; signaling EOS flush");
-            let _ = eos_tx.send(true);
+            let n = *eos_tx.borrow();
+            let _ = eos_tx.send(n + 1);
         }
         if result.is_err() && !cancel.is_cancelled() {
             cancel.cancel();

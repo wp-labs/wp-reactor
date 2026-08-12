@@ -41,8 +41,9 @@ pub(crate) struct RuleTaskConfig {
     pub metrics: Option<Arc<RuntimeMetrics>>,
     /// Yield targets that should be written back into windows for downstream rules.
     pub intermediate_targets: HashSet<String>,
-    /// End-of-stream signal (set true when the input sources report the stream
-    /// ended). The rule task flushes its instances on EOS but keeps running so
-    /// a daemon can accept subsequent finite inputs.
-    pub eos_flush: watch::Receiver<bool>,
+    /// End-of-stream counter: incremented each time the input sources report
+    /// the stream ended. The rule task flushes its instances on every EOS
+    /// (counter change) but keeps running so a daemon can accept multiple
+    /// finite inputs.
+    pub eos_flush: watch::Receiver<u64>,
 }
