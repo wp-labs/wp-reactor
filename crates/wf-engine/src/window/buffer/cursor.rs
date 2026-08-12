@@ -54,7 +54,7 @@ impl Window {
             .batches
             .iter()
             .filter(|tb| tb.seq >= effective_start)
-            .map(|tb| tb.events())
+            .map(|tb| tb.events(self.materialize_fields.as_deref()))
             .collect();
         (events, newest_seq + 1, gap)
     }

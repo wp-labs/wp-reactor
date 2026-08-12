@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use crate::match_engine::{Event, batch_to_events};
+use crate::match_engine::{Event, batch_to_events, batch_to_events_filtered};
 
 /// Result of a watermark-aware append.
 pub enum AppendOutcome {
@@ -22,6 +23,12 @@ pub struct WindowParams {
     pub time_col_index: Option<usize>,
     /// Retention duration from the `.wfs` file.
     pub over: Duration,
+    /// Optional whitelist of fields to materialize into per-event
+    /// `HashMap<String, Value>` (wp-lang `field_usage`). `None` = all fields.
+    /// Rules that wholesale-scan events keep `None`; everything else only
+    /// materializes the fields rules actually read — the dominant peak RSS
+    /// win on wide windows.
+    pub materialize_fields: Option<Arc<HashSet<String>>>,
 }
 
 #[derive(::moju_derive::MoJu)]
@@ -47,9 +54,20 @@ pub(in crate::window) struct TimedBatch {
 
 impl TimedBatch {
     /// Full parsed events for this batch, parsed once and shared.
-    pub(super) fn events(&self) -> Arc<Vec<Event>> {
+    ///
+    /// `materialize` optionally restricts the field set per event (from
+    /// `WindowParams::materialize_fields`); `None` materializes every schema
+    /// field. The set is fixed per window, so the `OnceLock` cache stays
+    /// consistent.
+    pub(super) fn events(&self, materialize: Option<&HashSet<String>>) -> Arc<Vec<Event>> {
         self.parsed_events
-            .get_or_init(|| Arc::new(batch_to_events(&self.batch)))
+            .get_or_init(|| {
+                let events = match materialize {
+                    Some(fields) => batch_to_events_filtered(&self.batch, fields),
+                    None => batch_to_events(&self.batch),
+                };
+                Arc::new(events)
+            })
             .clone()
     }
 }

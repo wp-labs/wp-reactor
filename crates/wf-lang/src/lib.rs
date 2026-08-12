@@ -4,6 +4,7 @@ mod compiler;
 pub mod diagnostics;
 pub mod error;
 pub mod explain;
+pub mod field_usage;
 pub mod parse_utils;
 pub mod plan;
 pub mod preprocess;

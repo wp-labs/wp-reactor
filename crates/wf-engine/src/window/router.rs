@@ -161,6 +161,7 @@ mod tests {
                 schema: test_schema(),
                 time_col_index: Some(0),
                 over: Duration::from_secs(3600),
+                materialize_fields: None,
             },
             streams: streams.into_iter().map(String::from).collect(),
             config: test_config(mode),

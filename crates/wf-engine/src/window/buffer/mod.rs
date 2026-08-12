@@ -8,7 +8,8 @@ mod tests;
 
 pub use types::{AppendOutcome, WindowParams};
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{
@@ -43,11 +44,14 @@ pub struct Window {
     pub(super) watermark_nanos: i64,
     /// Next sequence number to assign to an appended batch.
     pub(super) next_seq: u64,
+    /// Optional per-event field whitelist (see `WindowParams`).
+    pub(super) materialize_fields: Option<Arc<HashSet<String>>>,
 }
 
 impl Window {
     /// Create a new empty window.
     pub fn new(params: WindowParams, config: WindowConfig) -> Self {
+        let materialize_fields = params.materialize_fields.clone();
         Self {
             name: params.name,
             schema: params.schema,
@@ -59,6 +63,7 @@ impl Window {
             total_rows: 0,
             watermark_nanos: i64::MIN,
             next_seq: 0,
+            materialize_fields,
         }
     }
 

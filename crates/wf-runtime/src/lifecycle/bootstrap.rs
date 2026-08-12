@@ -84,7 +84,10 @@ pub(super) async fn load_and_compile(
         .partition(|c| c.table.is_none());
 
     // 4a. Build buffer windows
-    let window_defs = schemas_to_window_defs(&buffer_schemas, &buffer_configs)
+    // Field-usage analysis: only materialize the event fields rules actually
+    // read (per window), cutting the dominant peak RSS on wide windows.
+    let field_usage = wf_lang::field_usage::compute_window_field_usage(&all_rule_plans);
+    let window_defs = schemas_to_window_defs(&buffer_schemas, &buffer_configs, &field_usage)
         .source_err(RuntimeReason::Bootstrap, "build window definitions")?;
 
     // 5. WindowRegistry::build → registry (buffer windows only)

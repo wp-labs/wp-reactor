@@ -5,6 +5,7 @@ use orion_error::conversion::ToStructError;
 use wf_config::WindowConfig;
 use wf_engine::window::{WindowDef, WindowParams};
 use wf_lang::WindowSchema;
+use wf_lang::field_usage::WindowFieldUsage;
 
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::receiver::schema::window_schema_to_arrow;
@@ -12,7 +13,16 @@ use crate::receiver::schema::window_schema_to_arrow;
 /// Convert a [`WindowSchema`] (parsed from `.wfs`) together with its
 /// [`WindowConfig`] (resolved from `wfusion.toml`) into a [`WindowDef`]
 /// that can be fed to [`WindowRegistry::build`].
-pub fn schema_to_window_def(ws: &WindowSchema, config: &WindowConfig) -> RuntimeResult<WindowDef> {
+///
+/// `usage` supplies the per-window event field whitelist computed from all
+/// compiled rules (see `wf_lang::field_usage`). Windows whose rules may scan
+/// all fields keep `materialize_fields = None` (full materialization); the
+/// rest materialize only the fields rules actually read.
+pub fn schema_to_window_def(
+    ws: &WindowSchema,
+    config: &WindowConfig,
+    usage: &WindowFieldUsage,
+) -> RuntimeResult<WindowDef> {
     // 1. Build Arrow Schema
     let schema = window_schema_to_arrow(ws)?;
 
@@ -26,11 +36,15 @@ pub fn schema_to_window_def(ws: &WindowSchema, config: &WindowConfig) -> Runtime
     });
 
     // 3. Build WindowParams
+    let materialize_fields = usage
+        .filter_for(&ws.name, ws.fields.iter().map(|f| f.name.as_str()))
+        .map(Arc::new);
     let params = WindowParams {
         name: ws.name.clone(),
         schema: Arc::clone(&schema),
         time_col_index,
         over: ws.over,
+        materialize_fields,
     };
 
     Ok(WindowDef {
@@ -46,6 +60,7 @@ pub fn schema_to_window_def(ws: &WindowSchema, config: &WindowConfig) -> Runtime
 pub fn schemas_to_window_defs(
     schemas: &[WindowSchema],
     configs: &[WindowConfig],
+    usage: &WindowFieldUsage,
 ) -> RuntimeResult<Vec<WindowDef>> {
     let mut defs = Vec::with_capacity(schemas.len());
     for ws in schemas {
@@ -58,7 +73,7 @@ pub fn schemas_to_window_defs(
                 ))
                 .err();
         };
-        defs.push(schema_to_window_def(ws, config)?);
+        defs.push(schema_to_window_def(ws, config, usage)?);
     }
     Ok(defs)
 }
@@ -121,7 +136,7 @@ mod tests {
         };
 
         let config = test_config("auth_events");
-        let def = schema_to_window_def(&ws, &config).unwrap();
+        let def = schema_to_window_def(&ws, &config, &WindowFieldUsage::default()).unwrap();
 
         assert_eq!(def.params.name, "auth_events");
         assert_eq!(def.streams, vec!["syslog"]);
@@ -167,7 +182,7 @@ mod tests {
         };
 
         let config = test_config("alerts");
-        let def = schema_to_window_def(&ws, &config).unwrap();
+        let def = schema_to_window_def(&ws, &config, &WindowFieldUsage::default()).unwrap();
         let schema = def.params.schema;
 
         assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
@@ -211,7 +226,7 @@ mod tests {
         };
 
         let config = test_config("win");
-        let def = schema_to_window_def(&ws, &config).unwrap();
+        let def = schema_to_window_def(&ws, &config, &WindowFieldUsage::default()).unwrap();
         assert_eq!(def.params.time_col_index, Some(1));
     }
 
@@ -229,7 +244,7 @@ mod tests {
         };
 
         let config = test_config("static_win");
-        let def = schema_to_window_def(&ws, &config).unwrap();
+        let def = schema_to_window_def(&ws, &config, &WindowFieldUsage::default()).unwrap();
         assert_eq!(def.params.time_col_index, None);
     }
 }

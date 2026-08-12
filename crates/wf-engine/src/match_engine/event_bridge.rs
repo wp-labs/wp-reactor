@@ -46,6 +46,25 @@ pub fn wfl_structured_field_kind(field: &Field) -> Option<&str> {
 /// | Struct               | → | Value::Object           |
 /// | List/LargeList       | → | Value::Array            |
 pub fn batch_to_events(batch: &RecordBatch) -> Vec<Event> {
+    batch_to_events_with(batch, None)
+}
+
+/// Like [`batch_to_events`], but only materializes the listed field names.
+///
+/// Used by the window layer to avoid materializing schema fields no rule
+/// reads (see wf-lang `field_usage`), the dominant peak RSS on wide windows.
+/// Fields absent from the batch schema are ignored.
+pub fn batch_to_events_filtered(
+    batch: &RecordBatch,
+    fields: &std::collections::HashSet<String>,
+) -> Vec<Event> {
+    batch_to_events_with(batch, Some(fields))
+}
+
+fn batch_to_events_with(
+    batch: &RecordBatch,
+    only_fields: Option<&std::collections::HashSet<String>>,
+) -> Vec<Event> {
     let num_rows = batch.num_rows();
     let schema = batch.schema();
     let mut events = Vec::with_capacity(num_rows);
@@ -53,6 +72,11 @@ pub fn batch_to_events(batch: &RecordBatch) -> Vec<Event> {
     for row in 0..num_rows {
         let mut fields = HashMap::new();
         for (col_idx, field) in schema.fields().iter().enumerate() {
+            if let Some(only) = only_fields
+                && !only.contains(field.name())
+            {
+                continue;
+            }
             let col = batch.column(col_idx);
             if col.is_null(row) {
                 continue;

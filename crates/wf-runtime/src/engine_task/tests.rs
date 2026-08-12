@@ -158,6 +158,7 @@ fn make_window(
             schema: schema.clone(),
             time_col_index: Some(1), // event_time is the second column
             over: Duration::from_secs(3600),
+        materialize_fields: None,
         },
         test_window_config(max_bytes),
     );
@@ -231,6 +232,7 @@ fn make_window_def(
             schema: schema.clone(),
             time_col_index: time_col,
             over: Duration::from_secs(3600),
+        materialize_fields: None,
         },
         streams: streams.iter().map(|s| (*s).to_string()).collect(),
         config: cfg,
@@ -2510,6 +2512,7 @@ fn make_conn_events_window(max_bytes: usize) -> (Arc<RwLock<Window>>, Arc<Notify
             schema: schema.clone(),
             time_col_index: Some(5), // event_time is the 6th column (0-based: 5)
             over: Duration::from_secs(3600),
+        materialize_fields: None,
         },
         cfg,
     );
