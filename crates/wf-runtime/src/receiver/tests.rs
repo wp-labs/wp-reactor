@@ -835,9 +835,11 @@ async fn file_arrow_framed_replay_routes_rows() {
         let payload_a = wp_arrow::ipc::encode_ipc("events", &batch_a).unwrap();
         let payload_b = wp_arrow::ipc::encode_ipc("events", &batch_b).unwrap();
         let mut body = Vec::new();
-        body.extend_from_slice(&(payload_a.len() as u32).to_be_bytes());
+        // `len` framing: `<ascii digits> <payload>` (matches the TCP sink /
+        // dump-frames wire format read by `read_frame`).
+        body.extend_from_slice(format!("{} ", payload_a.len()).as_bytes());
         body.extend_from_slice(&payload_a);
-        body.extend_from_slice(&(payload_b.len() as u32).to_be_bytes());
+        body.extend_from_slice(format!("{} ", payload_b.len()).as_bytes());
         body.extend_from_slice(&payload_b);
         std::fs::write(&file_path, body).unwrap();
     }
@@ -891,9 +893,9 @@ async fn file_arrow_framed_unknown_tag_is_window_miss() {
         let payload_known = wp_arrow::ipc::encode_ipc("events", &known).unwrap();
         let payload_unknown = wp_arrow::ipc::encode_ipc("unknown", &unknown).unwrap();
         let mut body = Vec::new();
-        body.extend_from_slice(&(payload_known.len() as u32).to_be_bytes());
+        body.extend_from_slice(format!("{} ", payload_known.len()).as_bytes());
         body.extend_from_slice(&payload_known);
-        body.extend_from_slice(&(payload_unknown.len() as u32).to_be_bytes());
+        body.extend_from_slice(format!("{} ", payload_unknown.len()).as_bytes());
         body.extend_from_slice(&payload_unknown);
         std::fs::write(&file_path, body).unwrap();
     }
