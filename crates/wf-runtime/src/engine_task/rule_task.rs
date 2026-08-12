@@ -660,9 +660,20 @@ impl RuleTask {
         // Advance the effective watermark by the wall-clock time elapsed since the
         // last event was processed. This lets instances expire per their window TTL
         // even when input is completely idle (window semantics, not just event-time).
-        let effective_watermark = machine
-            .watermark_nanos()
-            .saturating_add(self.last_activity_wall.elapsed().as_nanos() as i64);
+        //
+        // When input has been idle beyond a threshold we assume the stream has
+        // ended (burst data fully delivered): jump the watermark to the natural
+        // end of the last window (`max event time + window duration`) so the
+        // trailing-window instances expire promptly instead of over wall-clock
+        // time (which for a 30-min burst with a 10-min window takes 10 minutes).
+        const IDLE_WATERMARK_ADVANCE_SECS: u64 = 10;
+        let idle = self.last_activity_wall.elapsed();
+        let base_wm = machine.watermark_nanos();
+        let effective_watermark = if idle.as_secs() >= IDLE_WATERMARK_ADVANCE_SECS {
+            base_wm.saturating_add(machine.window_duration_nanos())
+        } else {
+            base_wm.saturating_add(idle.as_nanos() as i64)
+        };
         let started = Instant::now();
         let lookup = RegistryLookup(&self.router);
         let (rule_name, closes) = {
