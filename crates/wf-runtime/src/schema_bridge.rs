@@ -36,8 +36,17 @@ pub fn schema_to_window_def(
     });
 
     // 3. Build WindowParams
+    // The window's time column must always be materialized: rule event-time
+    // extraction reads it from the event (`event_time_nanos`). Excluding it
+    // zeroes the watermark and breaks instance expiry / window semantics.
     let materialize_fields = usage
         .filter_for(&ws.name, ws.fields.iter().map(|f| f.name.as_str()))
+        .map(|mut set| {
+            if let Some(time_field) = &ws.time_field {
+                set.insert(time_field.clone());
+            }
+            set
+        })
         .map(Arc::new);
     let params = WindowParams {
         name: ws.name.clone(),
