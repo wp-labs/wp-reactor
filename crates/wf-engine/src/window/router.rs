@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use arrow::record_batch::RecordBatch;
 use wf_config::DistMode;
 
 use crate::error::CoreResult;
+use crate::match_engine::{Event, batch_to_events, batch_to_events_filtered};
 
 use super::buffer::AppendOutcome;
 use super::registry::WindowRegistry;
@@ -71,9 +74,22 @@ impl Router {
                 .registry
                 .get_window(&window_name)
                 .expect("subscription references non-existent window");
+            // Parse the batch to events *outside* the window lock. The read lock
+            // is held only for an O(1) Arc clone of the materialize-fields set
+            // (it never changes after construction); parsing itself happens with
+            // no window lock held. Rule tasks reading this batch later hit the
+            // already-set OnceLock with zero contention.
+            let materialize = {
+                let win = win_lock.read().expect("window lock poisoned");
+                win.materialize_fields.clone()
+            };
+            let parsed = Arc::new(match materialize.as_deref() {
+                Some(fields) => batch_to_events_filtered(&batch, fields),
+                None => batch_to_events(&batch),
+            });
             let outcome = {
                 let mut win = win_lock.write().expect("window lock poisoned");
-                win.append_with_watermark(batch.clone())?
+                win.append_with_watermark_parsed(batch.clone(), parsed)?
             };
 
             match outcome {

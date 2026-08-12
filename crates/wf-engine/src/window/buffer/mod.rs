@@ -23,6 +23,7 @@ use orion_error::conversion::ToStructError;
 use wf_config::WindowConfig;
 
 use crate::error::{CoreReason, CoreResult};
+use crate::match_engine::Event;
 
 use types::TimedBatch;
 
@@ -73,6 +74,21 @@ impl Window {
     /// schema does not match the window schema. After appending, memory
     /// eviction runs if `current_bytes > max_window_bytes`.
     pub fn append(&mut self, batch: RecordBatch) -> CoreResult<()> {
+        self.append_inner(batch, None)
+    }
+
+    /// Append a RecordBatch whose events were already parsed *outside* the
+    /// window lock (by the router). Rule tasks then read the pre-parsed `Arc`
+    /// with no `OnceLock` contention among the concurrent rule tasks.
+    pub fn append_parsed(&mut self, batch: RecordBatch, parsed_events: Arc<Vec<Event>>) -> CoreResult<()> {
+        self.append_inner(batch, Some(parsed_events))
+    }
+
+    fn append_inner(
+        &mut self,
+        batch: RecordBatch,
+        parsed_events: Option<Arc<Vec<Event>>>,
+    ) -> CoreResult<()> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -105,6 +121,11 @@ impl Window {
         let seq = self.next_seq;
         self.next_seq += 1;
 
+        let parsed_lock = std::sync::OnceLock::new();
+        if let Some(events) = parsed_events {
+            // Ignore the error: a freshly-created OnceLock is always empty.
+            let _ = parsed_lock.set(events);
+        }
         self.batches.push_back(TimedBatch {
             batch,
             event_time_range,
@@ -112,7 +133,7 @@ impl Window {
             row_count,
             byte_size,
             seq,
-            parsed_events: std::sync::OnceLock::new(),
+            parsed_events: parsed_lock,
         });
 
         self.current_bytes += byte_size;

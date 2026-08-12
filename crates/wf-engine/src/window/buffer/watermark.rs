@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use arrow::record_batch::RecordBatch;
 use orion_error::conversion::ToStructError;
 use wf_config::LatePolicy;
 
 use crate::error::{CoreReason, CoreResult};
+use crate::match_engine::Event;
 
 use super::Window;
 use super::types::AppendOutcome;
@@ -19,6 +22,25 @@ impl Window {
     /// Windows without a time column never advance the watermark and never
     /// reject data as late.
     pub fn append_with_watermark(&mut self, batch: RecordBatch) -> CoreResult<AppendOutcome> {
+        self.append_with_watermark_inner(batch, None)
+    }
+
+    /// Like [`Self::append_with_watermark`], but stores already-parsed events
+    /// (produced outside the window lock by the router) so rule reads never
+    /// contend on the batch's `OnceLock`.
+    pub fn append_with_watermark_parsed(
+        &mut self,
+        batch: RecordBatch,
+        parsed_events: Arc<Vec<Event>>,
+    ) -> CoreResult<AppendOutcome> {
+        self.append_with_watermark_inner(batch, Some(parsed_events))
+    }
+
+    fn append_with_watermark_inner(
+        &mut self,
+        batch: RecordBatch,
+        parsed_events: Option<Arc<Vec<Event>>>,
+    ) -> CoreResult<AppendOutcome> {
         if batch.num_rows() == 0 {
             return Ok(AppendOutcome::Appended);
         }
@@ -69,7 +91,10 @@ impl Window {
             self.watermark_nanos = self.watermark_nanos.max(candidate);
         }
 
-        self.append(batch)?;
+        match parsed_events {
+            Some(events) => self.append_parsed(batch, events)?,
+            None => self.append(batch)?,
+        }
         Ok(AppendOutcome::Appended)
     }
 
