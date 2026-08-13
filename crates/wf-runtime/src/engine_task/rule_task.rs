@@ -1022,9 +1022,9 @@ impl RuleTask {
                     .store(sample - 1, Ordering::Relaxed);
             }
         }
-        // Broadcast to the per-sink channels resolved by yield_target.
-        let senders = self.sink_fanout.resolve(&record.yield_target);
-        if senders.is_empty() {
+        // Resolve the per-sink writer groups for yield_target.
+        let sink_groups = self.sink_fanout.resolve(&record.yield_target);
+        if sink_groups.is_empty() {
             self.sink_fanout.warn_if_no_sink(&record.yield_target);
             return;
         }
@@ -1044,7 +1044,10 @@ impl RuleTask {
         self.serialize_nanos
             .fetch_add(_ser_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let _fan_start = Instant::now();
-        for tx in senders.iter() {
+        for (sink_ptr, channels) in sink_groups.iter() {
+            // Round-robin across this sink's parallel writers.
+            let idx = self.sink_fanout.next_index(*sink_ptr, channels.len());
+            let tx = &channels[idx];
             match tx.try_send(Arc::clone(&data)) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {

@@ -86,6 +86,7 @@ pub async fn build_sink_dispatcher(
             &flex.sinks,
             &flex.tags,
             &flex.wf_meta_disable,
+            flex.parallel,
             registry,
             &ctx,
         )
@@ -95,20 +96,20 @@ pub async fn build_sink_dispatcher(
 
     // Build infra default sinks
     let default_sinks = if let Some(ref fixed) = bundle.infra_default {
-        build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, registry, &ctx).await?
+        build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, fixed.parallel, registry, &ctx).await?
     } else {
         Vec::new()
     };
 
     // Build infra error sinks
     let error_sinks = if let Some(ref fixed) = bundle.infra_error {
-        build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, registry, &ctx).await?
+        build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, fixed.parallel, registry, &ctx).await?
     } else {
         Vec::new()
     };
 
     let monitor_sinks = if let Some(ref fixed) = bundle.infra_monitor {
-        build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, registry, &ctx).await?
+        build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, fixed.parallel, registry, &ctx).await?
     } else {
         Vec::new()
     };
@@ -145,10 +146,12 @@ pub async fn build_sink_dispatcher(
 }
 
 /// Build `SinkRuntime` instances from resolved specs.
+#[allow(clippy::too_many_arguments)]
 async fn build_sink_runtimes(
     specs: &[ResolvedRouteSink],
     tags: &[String],
     wf_meta_disable: &[String],
+    parallel: usize,
     registry: &SinkFactoryRegistry,
     ctx: &SinkBuildCtx,
 ) -> RuntimeResult<Vec<Arc<SinkRuntime>>> {
@@ -195,6 +198,7 @@ async fn build_sink_runtimes(
             output_fields: resolved.fields.clone(),
             wf_meta_disable: wf_meta_disable.to_vec(),
             wf_meta_disable_matcher: WfMetaDisableMatcher::new(wf_meta_disable),
+            parallel,
         }));
     }
 

@@ -76,15 +76,23 @@ pub(super) fn spawn_alert_task(
         if error_ptrs.contains(&ptr) || monitor_ptrs.contains(&ptr) {
             continue;
         }
-        let (tx, rx) = mpsc::channel(alert_task::SINK_CHANNEL_CAPACITY);
-        by_sink.insert(ptr, tx);
-        let sink = Arc::clone(sink);
-        let error_txs = Arc::clone(&error_txs);
-        let metrics = metrics.clone();
-        group.push(tokio::spawn(async move {
-            alert_task::run_sink_consumer(rx, sink, error_txs, metrics).await;
-            Ok(())
-        }));
+        // Parallel writers (sink group `parallel`): one bounded channel + one
+        // consumer per writer, so the alert fan-out is not capped by a single
+        // consumer draining every record serially.
+        let writers = sink.parallel.max(1);
+        let mut senders = Vec::with_capacity(writers);
+        for _ in 0..writers {
+            let (tx, rx) = mpsc::channel(alert_task::SINK_CHANNEL_CAPACITY);
+            senders.push(tx);
+            let sink = Arc::clone(sink);
+            let error_txs = Arc::clone(&error_txs);
+            let metrics = metrics.clone();
+            group.push(tokio::spawn(async move {
+                alert_task::run_sink_consumer(rx, sink, error_txs, metrics).await;
+                Ok(())
+            }));
+        }
+        by_sink.insert(ptr, senders);
     }
 
     let fanout = Arc::new(alert_task::SinkFanout::new(by_sink, dispatcher));

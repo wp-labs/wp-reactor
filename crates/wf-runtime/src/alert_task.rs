@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
@@ -19,11 +20,17 @@ pub const SINK_CHANNEL_CAPACITY: usize = 2048;
 /// Replaces the fixed two-consumer alert pipeline + per-alert wildcard routing:
 /// each sink owns a bounded channel + a consumer task, and the wildcard routes
 /// are resolved once per yield_target (cached) at delivery time.
+/// Resolved per-sink channel groups for a yield target: each entry is
+/// `(sink_ptr, channels)` where `channels` are the sink's `parallel` writers.
+type ResolvedChannels = Arc<Vec<(usize, Arc<Vec<mpsc::Sender<Arc<DataRecord>>>>)>>;
+
 pub struct SinkFanout {
-    /// `Arc<SinkRuntime>` pointer identity → sender.
-    pub(crate) by_sink: HashMap<usize, mpsc::Sender<Arc<DataRecord>>>,
-    /// yield_target → resolved senders (cache).
-    cache: RwLock<HashMap<String, Arc<Vec<mpsc::Sender<Arc<DataRecord>>>>>>,
+    /// `Arc<SinkRuntime>` pointer identity → its parallel writers.
+    pub(crate) by_sink: HashMap<usize, Vec<mpsc::Sender<Arc<DataRecord>>>>,
+    /// Per-sink round-robin index (across the sink's parallel writers).
+    rr: HashMap<usize, std::sync::atomic::AtomicUsize>,
+    /// yield_target → resolved channel groups (cache).
+    cache: RwLock<HashMap<String, ResolvedChannels>>,
     /// On-demand resolver (wildcard routes + default fallback). `None` for a
     /// closed/empty fanout (e.g. the reload-during-shutdown fallback).
     dispatcher: Option<Arc<SinkDispatcher>>,
@@ -32,13 +39,15 @@ pub struct SinkFanout {
 }
 
 impl SinkFanout {
-    /// Build a fanout from the resolved sink→sender map.
+    /// Build a fanout from the resolved sink→writers map.
     pub(crate) fn new(
-        by_sink: HashMap<usize, mpsc::Sender<Arc<DataRecord>>>,
+        by_sink: HashMap<usize, Vec<mpsc::Sender<Arc<DataRecord>>>>,
         dispatcher: Arc<SinkDispatcher>,
     ) -> Self {
+        let rr = by_sink.keys().map(|&k| (k, std::sync::atomic::AtomicUsize::new(0))).collect();
         Self {
             by_sink,
+            rr,
             cache: RwLock::new(HashMap::new()),
             dispatcher: Some(dispatcher),
             warned_no_sink: Mutex::new(HashSet::new()),
@@ -50,43 +59,63 @@ impl SinkFanout {
         Self::from_resolved(HashMap::new())
     }
 
-    /// Build a fanout from a pre-resolved target→senders map (no on-demand
-    /// resolver). Used by the reload fallback and by tests.
+    /// Build a fanout from a pre-resolved target→channel-groups map (no
+    /// on-demand resolver). Used by the reload fallback and by tests.
     pub(crate) fn from_resolved(
-        cache: HashMap<String, Arc<Vec<mpsc::Sender<Arc<DataRecord>>>>>,
+        cache: HashMap<String, ResolvedChannels>,
     ) -> Arc<Self> {
         Arc::new(Self {
             by_sink: HashMap::new(),
+            rr: HashMap::new(),
             cache: RwLock::new(cache),
             dispatcher: None,
             warned_no_sink: Mutex::new(HashSet::new()),
         })
     }
 
-    /// Resolve the sink senders for a yield_target, caching the result.
-    pub fn resolve(&self, window_name: &str) -> Arc<Vec<mpsc::Sender<Arc<DataRecord>>>> {
-        if let Some(senders) = self
+    /// Resolve the per-sink channel groups for a yield_target, caching.
+    ///
+    /// Each entry is `(sink_ptr, channels)` where `channels` are that sink's
+    /// `parallel` writers — the emit path round-robins across them.
+    pub fn resolve(&self, window_name: &str) -> ResolvedChannels {
+        if let Some(groups) = self
             .cache
             .read()
             .expect("sink fanout cache lock poisoned")
             .get(window_name)
         {
-            return Arc::clone(senders);
+            return Arc::clone(groups);
         }
         let sinks = match &self.dispatcher {
             Some(dispatcher) => dispatcher.resolve_sinks(window_name),
             None => Vec::new(),
         };
-        let senders: Vec<_> = sinks
+        let groups: Vec<_> = sinks
             .iter()
-            .filter_map(|sink| self.by_sink.get(&(Arc::as_ptr(sink) as usize)).cloned())
+            .filter_map(|sink| {
+                let ptr = Arc::as_ptr(sink) as usize;
+                self.by_sink
+                    .get(&ptr)
+                    .map(|channels| (ptr, Arc::new(channels.clone())))
+            })
             .collect();
-        let senders = Arc::new(senders);
+        let groups = Arc::new(groups);
         self.cache
             .write()
             .expect("sink fanout cache lock poisoned")
-            .insert(window_name.to_string(), Arc::clone(&senders));
-        senders
+            .insert(window_name.to_string(), Arc::clone(&groups));
+        groups
+    }
+
+    /// Next round-robin writer index for a sink's parallel channels.
+    pub fn next_index(&self, sink_ptr: usize, writer_count: usize) -> usize {
+        if writer_count <= 1 {
+            return 0;
+        }
+        self.rr
+            .get(&sink_ptr)
+            .map(|idx| idx.fetch_add(1, Ordering::Relaxed) % writer_count)
+            .unwrap_or(0)
     }
 
     /// Warn once-per-target when a yield_target has no sink at all.

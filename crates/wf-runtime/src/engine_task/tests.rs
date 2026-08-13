@@ -56,9 +56,10 @@ fn empty_tracked_bind_fields() -> std::collections::HashMap<String, HashSet<Stri
 /// targets (the sink targets used across the tests) to `tx`.
 fn make_test_fanout(tx: mpsc::Sender<Arc<wp_model_core::model::DataRecord>>) -> Arc<SinkFanout> {
     let mut cache = std::collections::HashMap::new();
-    let senders = Arc::new(vec![tx]);
-    cache.insert("alerts".to_string(), Arc::clone(&senders));
-    cache.insert("network_alerts".to_string(), senders);
+    // One sink (ptr=0) with a single writer channel.
+    let groups = Arc::new(vec![(0usize, Arc::new(vec![tx]))]);
+    cache.insert("alerts".to_string(), Arc::clone(&groups));
+    cache.insert("network_alerts".to_string(), groups);
     SinkFanout::from_resolved(cache)
 }
 

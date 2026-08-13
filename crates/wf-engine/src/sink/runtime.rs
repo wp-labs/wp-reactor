@@ -53,6 +53,10 @@ pub struct SinkRuntime {
     pub output_fields: Option<Vec<String>>,
     pub wf_meta_disable: Vec<String>,
     pub wf_meta_disable_matcher: WfMetaDisableMatcher,
+    /// Max parallel writers (1..=10, from the sink group's `parallel`). The
+    /// runtime spawns this many consumers per sink to parallelize the alert
+    /// delivery fan-out.
+    pub parallel: usize,
 }
 
 impl SinkRuntime {
@@ -224,6 +228,7 @@ mod tests {
             output_fields,
             wf_meta_disable: wf_meta_disable.clone(),
             wf_meta_disable_matcher: WfMetaDisableMatcher::new(&wf_meta_disable),
+            parallel: 1,
         }
     }
 
