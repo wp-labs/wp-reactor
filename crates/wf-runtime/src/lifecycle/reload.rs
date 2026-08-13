@@ -156,6 +156,7 @@ impl Reactor {
             self.rule_cancel.clone(),
             self.metrics.clone(),
             self.eos_tx.clone(),
+            self.current_config.runtime.executor_parallelism,
         );
         self.rule_watch = watch_group(group, self.cancel.clone());
         Ok(())

@@ -16,7 +16,10 @@ pub use types::{EngineHashMap, EngineHashSet};
 
 // Re-export pub(crate) items
 pub(crate) use eval::{eval_expr, values_equal};
-pub(crate) use key::{eval_field_value, field_ref_name, value_to_string};
+pub(crate) use key::{
+    eval_field_value, extract_key_simple, field_ref_name, make_scope_key_str, shard_index,
+    value_to_string,
+};
 
 #[cfg(test)]
 pub(crate) use conv::apply_conv;
@@ -30,7 +33,7 @@ use wf_lang::ast::CloseMode;
 use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, WindowSpec};
 
 use close::{accumulate_close_steps, evaluate_close, evidence_time_range};
-use key::{InstanceKey, extract_key, make_scope_key_str};
+use key::{InstanceKey, extract_key};
 use seq::{SeqRuntime, consec_broken, scan_negations};
 use state::{AliasState, Instance, snapshot_bind_data};
 use step::{

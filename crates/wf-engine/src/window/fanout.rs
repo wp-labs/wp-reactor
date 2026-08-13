@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
+use wf_lang::ast::FieldRef;
 
-use crate::match_engine::Event;
+use crate::match_engine::{Event, extract_key_simple, shard_index};
 
 /// A batch of parsed events pushed from one window to its subscribing rules.
 ///
@@ -13,6 +14,17 @@ use crate::match_engine::Event;
 pub struct RulePush {
     pub window_name: Arc<str>,
     pub events: Arc<Vec<Event>>,
+}
+
+/// A subscription for one window: either a single (unsharded) rule channel, or
+/// N shard channels with a key partition (rule sharding, P2a).
+#[derive(Clone)]
+enum Subscription {
+    Single(mpsc::UnboundedSender<RulePush>),
+    Sharded {
+        shards: Vec<mpsc::UnboundedSender<RulePush>>,
+        keys: Arc<[FieldRef]>,
+    },
 }
 
 /// Fan-out table mapping window names to per-rule channels.
@@ -25,7 +37,7 @@ pub struct RulePush {
 /// broadcast.
 #[derive(Default)]
 pub struct RuleFanout {
-    table: RwLock<HashMap<String, Vec<mpsc::UnboundedSender<RulePush>>>>,
+    table: RwLock<HashMap<String, Vec<Subscription>>>,
 }
 
 impl RuleFanout {
@@ -34,46 +46,83 @@ impl RuleFanout {
         Arc::new(Self::default())
     }
 
-    /// Register a rule channel for `window_name`.
+    /// Register a single (unsharded) rule channel for `window_name`.
     pub fn register(&self, window_name: &str, tx: mpsc::UnboundedSender<RulePush>) {
         let mut table = self.table.write().expect("fanout lock poisoned");
-        table.entry(window_name.to_string()).or_default().push(tx);
+        table
+            .entry(window_name.to_string())
+            .or_default()
+            .push(Subscription::Single(tx));
+    }
+
+    /// Register N shard channels for `window_name`, partitioned by `keys`.
+    ///
+    /// Each broadcast batch is split by `hash(extract_key(event)) % shards.len()`
+    /// so every event with the same match key lands on the same shard.
+    pub fn register_sharded(
+        &self,
+        window_name: &str,
+        shards: Vec<mpsc::UnboundedSender<RulePush>>,
+        keys: Arc<[FieldRef]>,
+    ) {
+        debug_assert!(!shards.is_empty());
+        let mut table = self.table.write().expect("fanout lock poisoned");
+        table
+            .entry(window_name.to_string())
+            .or_default()
+            .push(Subscription::Sharded { shards, keys });
     }
 
     /// Broadcast `events` to every rule channel registered for `window_name`.
     ///
-    /// Uses an unbounded channel so a slow consumer never blocks the router.
-    /// This is R1's "block to preserve correctness" formulation expressed as
-    /// "never drop" — dropping under backpressure (with an explicit gap metric)
-    /// is deferred to a follow-up. Channels whose receiver has been dropped
-    /// (cancelled/drained rule) are pruned lazily here.
+    /// Unsharded subscriptions receive the whole batch; sharded subscriptions
+    /// partition it by match key. Uses unbounded channels so a slow consumer
+    /// never blocks the router. Closed channels are pruned lazily here.
     pub fn broadcast(&self, window_name: &str, events: &Arc<Vec<Event>>) {
-        let push = RulePush {
-            window_name: window_name.into(),
-            events: Arc::clone(events),
+        let subs: Vec<Subscription> = {
+            let table = self.table.read().expect("fanout lock poisoned");
+            table.get(window_name).cloned().unwrap_or_default()
         };
 
-        let any_closed = {
-            let table = self.table.read().expect("fanout lock poisoned");
-            let Some(senders) = table.get(window_name) else {
-                return;
-            };
-            let mut any_closed = false;
-            for tx in senders {
-                // Unbounded send never blocks; only fails once the receiver is
-                // gone, which we then prune below.
-                if tx.send(push.clone()).is_err() {
-                    any_closed = true;
+        let mut any_closed = false;
+        for sub in &subs {
+            match sub {
+                Subscription::Single(tx) => {
+                    let push = RulePush {
+                        window_name: window_name.into(),
+                        events: Arc::clone(events),
+                    };
+                    if tx.send(push).is_err() {
+                        any_closed = true;
+                    }
+                }
+                Subscription::Sharded { shards, keys } => {
+                    if broadcast_sharded(shards, keys, window_name, events) {
+                        any_closed = true;
+                    }
                 }
             }
-            any_closed
-        };
+        }
 
         if any_closed {
             let mut table = self.table.write().expect("fanout lock poisoned");
-            if let Some(senders) = table.get_mut(window_name) {
-                senders.retain(|tx| !tx.is_closed());
-                if senders.is_empty() {
+            if let Some(subs) = table.get_mut(window_name) {
+                for sub in subs.iter_mut() {
+                    match sub {
+                        Subscription::Single(tx) => {
+                            // handled by retain below
+                            let _ = tx;
+                        }
+                        Subscription::Sharded { shards, .. } => {
+                            shards.retain(|tx| !tx.is_closed());
+                        }
+                    }
+                }
+                subs.retain(|sub| match sub {
+                    Subscription::Single(tx) => !tx.is_closed(),
+                    Subscription::Sharded { shards, .. } => !shards.is_empty(),
+                });
+                if subs.is_empty() {
                     table.remove(window_name);
                 }
             }
@@ -81,9 +130,54 @@ impl RuleFanout {
     }
 }
 
+/// Partition a batch by match key and send each sub-batch to its shard.
+/// Returns `true` if any shard channel was closed.
+fn broadcast_sharded(
+    shards: &[mpsc::UnboundedSender<RulePush>],
+    keys: &[FieldRef],
+    window_name: &str,
+    events: &Arc<Vec<Event>>,
+) -> bool {
+    let n = shards.len();
+    let mut sub_batches: Vec<Vec<Event>> = (0..n).map(|_| Vec::new()).collect();
+    for event in events.iter() {
+        // Missing key → shard 0; the rule's state machine skips it anyway.
+        let idx = extract_key_simple(event, keys)
+            .map(|scope_key| shard_index(&scope_key, n))
+            .unwrap_or(0);
+        sub_batches[idx].push(event.clone());
+    }
+
+    let mut any_closed = false;
+    for (i, sub) in sub_batches.into_iter().enumerate() {
+        if sub.is_empty() {
+            continue;
+        }
+        let push = RulePush {
+            window_name: window_name.into(),
+            events: Arc::new(sub),
+        };
+        if shards[i].send(push).is_err() {
+            any_closed = true;
+        }
+    }
+    any_closed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::match_engine::{EngineHashMap, Value};
+
+    fn event(id: &str) -> Event {
+        let mut fields = EngineHashMap::default();
+        fields.insert("id".into(), Value::Str(id.into()));
+        Event { fields }
+    }
+
+    fn keys() -> Vec<FieldRef> {
+        vec![FieldRef::Simple("id".into())]
+    }
 
     #[test]
     fn broadcast_delivers_same_arc_to_registered_channels() {
@@ -94,14 +188,9 @@ mod tests {
         let events: Arc<Vec<Event>> = Arc::new(Vec::new());
         fanout.broadcast("win_a", &events);
 
-        let push = rx
-            .try_recv()
-            .expect("registered channel should receive a push");
+        let push = rx.try_recv().expect("registered channel should receive a push");
         assert_eq!(&*push.window_name, "win_a");
-        assert!(
-            Arc::ptr_eq(&push.events, &events),
-            "should share the same Arc"
-        );
+        assert!(Arc::ptr_eq(&push.events, &events), "should share the same Arc");
     }
 
     #[test]
@@ -119,5 +208,69 @@ mod tests {
             !table.contains_key("win_a"),
             "closed channel should be pruned on broadcast"
         );
+    }
+
+    #[test]
+    fn sharded_broadcast_partitions_by_key_and_routes_same_key_together() {
+        let fanout = RuleFanout::new();
+        let (tx0, mut rx0) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        fanout.register_sharded("win_a", vec![tx0, tx1], Arc::from(keys().into_boxed_slice()));
+
+        // Two distinct keys; each should land on a single (deterministic) shard.
+        let events: Arc<Vec<Event>> = Arc::new(vec![event("k1"), event("k2"), event("k1")]);
+        fanout.broadcast("win_a", &events);
+
+        let mut received = Vec::new();
+        while let Ok(push) = rx0.try_recv() {
+            received.extend(push.events.iter().map(|e| e.fields["id"].clone()));
+        }
+        while let Ok(push) = rx1.try_recv() {
+            received.extend(push.events.iter().map(|e| e.fields["id"].clone()));
+        }
+
+        // Union of the shards == the original batch (no loss, no dup).
+        let mut ids: Vec<String> = received
+            .into_iter()
+            .map(|v| match v {
+                Value::Str(s) => s.to_string(),
+                _ => panic!("expected str"),
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["k1", "k1", "k2"]);
+
+        // Same key (`k1`) must land on the SAME shard across broadcasts.
+        let idx = shard_index(&[Value::Str("k1".into())], 2);
+        let again: Arc<Vec<Event>> = Arc::new(vec![event("k1")]);
+        fanout.broadcast("win_a", &again);
+        let got0 = rx0.try_recv().map(|p| p.events.len()).unwrap_or(0);
+        let got1 = rx1.try_recv().map(|p| p.events.len()).unwrap_or(0);
+        if idx == 0 {
+            assert_eq!(got0, 1);
+            assert_eq!(got1, 0);
+        } else {
+            assert_eq!(got0, 0);
+            assert_eq!(got1, 1);
+        }
+    }
+
+    #[test]
+    fn shard_index_is_deterministic_and_in_range() {
+        let n = 4;
+        for id in ["a", "b", "c", "same", "same"] {
+            let idx = shard_index(&[Value::Str(id.into())], n);
+            assert!(idx < n);
+        }
+        // Same key → same index, across repeated calls.
+        assert_eq!(
+            shard_index(&[Value::Str("same".into())], n),
+            shard_index(&[Value::Str("same".into())], n)
+        );
+    }
+
+    #[test]
+    fn shard_index_single_shard_is_zero() {
+        assert_eq!(shard_index(&[Value::Str("anything".into())], 1), 0);
     }
 }

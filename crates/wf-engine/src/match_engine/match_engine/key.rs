@@ -178,7 +178,7 @@ pub(super) fn extract_key(
     Some(result)
 }
 
-fn extract_key_simple(event: &Event, keys: &[FieldRef]) -> Option<Vec<Value>> {
+pub(crate) fn extract_key_simple(event: &Event, keys: &[FieldRef]) -> Option<Vec<Value>> {
     let mut result = Vec::with_capacity(keys.len());
     for key in keys {
         let field_name = field_ref_name(key);
@@ -249,12 +249,27 @@ pub(crate) fn eval_field_value(
     Some(value)
 }
 
-pub(super) fn make_scope_key_str(scope_key: &[Value]) -> String {
+pub(crate) fn make_scope_key_str(scope_key: &[Value]) -> String {
     scope_key
         .iter()
         .map(value_to_string)
         .collect::<Vec<_>>()
         .join("\x1f")
+}
+
+/// Deterministic shard index for a scope key (FNV-1a over the key's string
+/// form). Used by the partitioned fan-out so the same key always lands on the
+/// same shard — independent of `HashMap`'s random seed.
+pub(crate) fn shard_index(scope_key: &[Value], shard_count: usize) -> usize {
+    if shard_count <= 1 {
+        return 0;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in make_scope_key_str(scope_key).as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash as usize) % shard_count
 }
 
 pub(crate) fn value_to_string(v: &Value) -> String {

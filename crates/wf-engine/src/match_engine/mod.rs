@@ -18,3 +18,4 @@ pub use match_engine::{
     CepStateMachine, CloseOutput, CloseReason, Event, MACHINE_ID, MatchedContext, StepData,
     StepOutcome, StepProgress, StepResult, Value, WindowLookup,
 };
+pub(crate) use match_engine::{extract_key_simple, shard_index};

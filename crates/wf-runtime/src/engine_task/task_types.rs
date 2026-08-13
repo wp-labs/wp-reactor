@@ -15,6 +15,7 @@ use crate::metrics::RuntimeMetrics;
 // WindowSource -- one window a rule task reads from
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub(crate) struct WindowSource {
     pub window_name: String,
     pub window: Arc<RwLock<Window>>,

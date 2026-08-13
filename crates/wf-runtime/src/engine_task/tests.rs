@@ -1980,6 +1980,72 @@ async fn push_triggers_alert() {
     assert_eq!(alert.event_time_nanos, ts_nanos);
 }
 
+fn drain_alert_entity_ids(
+    rx: &mut mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    while let Ok(alert) = rx.try_recv() {
+        ids.push(alert.entity_id.clone());
+    }
+    ids
+}
+
+#[tokio::test]
+async fn sharded_rule_produces_same_alerts_as_single_worker() {
+    init_tracing();
+    let schema = test_schema();
+    let ts = 1_700_000_000_000_000_000i64;
+    // 6 events: 3 for "10.0.0.1", 3 for "10.0.0.2" → each triggers count>=3.
+    let batch = make_batch(
+        &schema,
+        &[
+            "10.0.0.1", "10.0.0.2", "10.0.0.1", "10.0.0.2", "10.0.0.1", "10.0.0.2",
+        ],
+        ts,
+    );
+    let events = Arc::new(batch_to_events(&batch));
+
+    // Single worker: feed the whole batch.
+    let (mut single, mut single_rx, _w, _n) = make_task();
+    single
+        .process_push(RulePush {
+            window_name: "auth_events".into(),
+            events: Arc::clone(&events),
+        })
+        .await;
+    let mut single_ids = drain_alert_entity_ids(&mut single_rx);
+
+    // Sharded: partition via the router fan-out (2 shards), then two machines.
+    let registry = WindowRegistry::build(vec![]).unwrap();
+    let router = Arc::new(Router::new(registry));
+    let (s0_tx, mut s0_rx) = mpsc::unbounded_channel();
+    let (s1_tx, mut s1_rx) = mpsc::unbounded_channel();
+    let keys: Arc<[FieldRef]> =
+        Arc::from(vec![FieldRef::Simple("sip".into())].into_boxed_slice());
+    router
+        .fanout()
+        .register_sharded("auth_events", vec![s0_tx, s1_tx], keys);
+    router.fanout().broadcast("auth_events", &events);
+
+    let (mut t0, mut rx0, _w0, _n0) = make_task();
+    let (mut t1, mut rx1, _w1, _n1) = make_task();
+    while let Ok(push) = s0_rx.try_recv() {
+        t0.process_push(push).await;
+    }
+    while let Ok(push) = s1_rx.try_recv() {
+        t1.process_push(push).await;
+    }
+    let mut sharded_ids = drain_alert_entity_ids(&mut rx0);
+    sharded_ids.extend(drain_alert_entity_ids(&mut rx1));
+
+    single_ids.sort();
+    sharded_ids.sort();
+    assert_eq!(
+        single_ids, sharded_ids,
+        "sharded rule must produce identical alerts to the single worker"
+    );
+}
+
 #[tokio::test]
 async fn pull_keeps_normalized_nanos_event_time() {
     init_tracing();

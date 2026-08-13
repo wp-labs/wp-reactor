@@ -26,7 +26,7 @@ use crate::time::normalize_epoch_timestamp_float_nanos;
 /// L1 rules use `execute_match` / `execute_close` (no joins).
 /// L2 rules with joins use `execute_match_with_joins` / `execute_close_with_joins`
 /// which accept a [`WindowLookup`] for resolving join data.
-#[derive(::moju_derive::MoJu)]
+#[derive(::moju_derive::MoJu, Clone)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct RuleExecutor {
     plan: RulePlan,

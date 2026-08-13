@@ -12,7 +12,7 @@ use wf_config::project::load_wfl_with_context;
 use wf_config::resolve_glob;
 use wf_config::window::WindowDefaults;
 use wf_config::{DistMode, FusionConfig, WindowConfig};
-use wf_engine::match_engine::{CepStateMachine, RuleExecutor};
+use wf_engine::match_engine::RuleExecutor;
 use wf_lang::ast::{FieldRef, Measure};
 use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
@@ -852,15 +852,11 @@ pub(crate) fn build_run_rules(
                 time_field: resolve_alias_time_field(&plan.binds, schemas, &each_plan.alias),
             }
         } else {
-            let time_field = resolve_time_field(&plan.binds, schemas);
-            let limits = plan.limits_plan.clone();
-            let machine = CepStateMachine::with_limits(
-                plan.name.clone(),
-                plan.match_plan.clone(),
-                time_field,
-                limits,
-            );
-            RunRuleKind::Match(Box::new(machine))
+            RunRuleKind::Match {
+                match_plan: plan.match_plan.clone(),
+                time_field: resolve_time_field(&plan.binds, schemas),
+                limits: plan.limits_plan.clone(),
+            }
         };
         rules.push(RunRule {
             kind,

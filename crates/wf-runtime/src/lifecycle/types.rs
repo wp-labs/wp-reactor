@@ -4,7 +4,8 @@ use tokio::task::JoinHandle;
 
 use orion_error::conversion::{SourceErr, ToStructError};
 use orion_error::prelude::*;
-use wf_engine::match_engine::{CepStateMachine, RuleExecutor};
+use wf_engine::match_engine::RuleExecutor;
+use wf_lang::plan::{LimitsPlan, MatchPlan};
 
 use crate::error::{RuntimeReason, RuntimeResult};
 
@@ -81,7 +82,11 @@ impl TaskGroup {
     module = "Orchestra.ReactorLifecycle"
 )]
 pub(crate) enum RunRuleKind {
-    Match(Box<CepStateMachine>),
+    Match {
+        match_plan: MatchPlan,
+        time_field: Option<String>,
+        limits: Option<LimitsPlan>,
+    },
     Each {
         alias: String,
         time_field: Option<String>,
