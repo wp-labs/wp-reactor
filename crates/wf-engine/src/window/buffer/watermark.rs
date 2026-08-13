@@ -48,6 +48,18 @@ impl Window {
         self.append_with_watermark_inner(batch, Some(parsed_events), Some(byte_size))
     }
 
+    /// Like [`Self::append_with_watermark_parsed_sized`], but without pre-parsed
+    /// events: the batch is stored with an *uninitialized* `parsed_events`, so a
+    /// consumer reading via `events_since()` still gets the lazily-parsed events.
+    /// Used by the router's fast path for windows no rule currently consumes.
+    pub fn append_with_watermark_sized(
+        &mut self,
+        batch: RecordBatch,
+        byte_size: usize,
+    ) -> CoreResult<AppendOutcome> {
+        self.append_with_watermark_inner(batch, None, Some(byte_size))
+    }
+
     fn append_with_watermark_inner(
         &mut self,
         batch: RecordBatch,

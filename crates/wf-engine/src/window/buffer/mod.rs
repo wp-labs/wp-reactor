@@ -9,21 +9,23 @@ mod tests;
 pub use types::{AppendOutcome, WindowParams};
 
 use std::collections::{HashSet, VecDeque};
+use std::mem::size_of;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{
     Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, LargeBinaryArray,
-    LargeListArray, LargeStringArray, ListArray, StringArray, StructArray,
+    LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
     TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use orion_error::conversion::ToStructError;
+use smol_str::SmolStr;
 use wf_config::WindowConfig;
 
 use crate::error::{CoreReason, CoreResult};
-use crate::match_engine::Event;
+use crate::match_engine::{Event, Value};
 
 use types::TimedBatch;
 
@@ -317,12 +319,14 @@ fn column_content_bytes(col: &dyn Array) -> usize {
         }
         DataType::Struct(_) => {
             let arr = col.as_any().downcast_ref::<StructArray>().expect("struct column");
-            arr.columns().iter().map(|c| column_content_bytes(c.as_ref())).sum()
+            // The struct's own validity bitmap plus children.
+            bitmap_bytes(n) + arr.columns().iter().map(|c| column_content_bytes(c.as_ref())).sum::<usize>()
         }
         DataType::List(_) => {
             let arr = col.as_any().downcast_ref::<ListArray>().expect("list column");
             // value(i) slices the child; a null row yields an empty slice → 0 bytes.
-            offsets_bytes(n, 4)
+            bitmap_bytes(n)
+                + offsets_bytes(n, 4)
                 + (0..n).map(|i| column_content_bytes(arr.value(i).as_ref())).sum::<usize>()
         }
         DataType::LargeList(_) => {
@@ -330,7 +334,8 @@ fn column_content_bytes(col: &dyn Array) -> usize {
                 .as_any()
                 .downcast_ref::<LargeListArray>()
                 .expect("large list column");
-            offsets_bytes(n, 8)
+            bitmap_bytes(n)
+                + offsets_bytes(n, 8)
                 + (0..n).map(|i| column_content_bytes(arr.value(i).as_ref())).sum::<usize>()
         }
         DataType::FixedSizeList(_, _) => {
@@ -338,7 +343,17 @@ fn column_content_bytes(col: &dyn Array) -> usize {
                 .as_any()
                 .downcast_ref::<FixedSizeListArray>()
                 .expect("fixed-size list column");
-            (0..n).map(|i| column_content_bytes(arr.value(i).as_ref())).sum()
+            bitmap_bytes(n)
+                + (0..n).map(|i| column_content_bytes(arr.value(i).as_ref())).sum::<usize>()
+        }
+        DataType::Map(..) => {
+            let arr = col.as_any().downcast_ref::<MapArray>().expect("map column");
+            // Offsets + validity, plus the full key/value entries (unreferenced
+            // entry slots are included — conservative).
+            bitmap_bytes(n)
+                + offsets_bytes(n, 4)
+                + column_content_bytes(arr.keys().as_ref())
+                + column_content_bytes(arr.values().as_ref())
         }
         // Dictionary and anything else: upper-bound estimate (dictionary values
         // are shared, so this overcounts — the safe direction for eviction).
@@ -372,4 +387,73 @@ fn binary_content(n: usize, arr: &BinaryArray) -> usize {
 
 fn large_binary_content(n: usize, arr: &LargeBinaryArray) -> usize {
     offsets_bytes(n, 8) + arr.iter().flatten().map(|b| b.len()).sum::<usize>()
+}
+
+// ---------------------------------------------------------------------------
+// Parsed-event memory accounting
+// ---------------------------------------------------------------------------
+
+/// Estimate the retained bytes of parsed events: each event is an
+/// `HashMap<SmolStr, Value>` (a foldhash table). Structured `object` fields
+/// decoded from JSON become nested `EngineHashMap`/`Vec` allocations with
+/// fixed per-entry overhead (key struct + bucket + hash/ctrl), so a window
+/// that also retains these events holds several× the JSON string bytes it
+/// accounts for via [`content_bytes`] — memory eviction then fires far past
+/// the real water level (wp-labs/wp-reactor#20: `current_bytes` ≈ cap while
+/// RSS ran to 2× max).
+///
+/// The estimate errs toward overcount (safe direction for eviction): it uses
+/// `capacity()`-based table sizes and a per-entry hash/ctrl allowance, so a
+/// window never retains *more* real memory than its accounting reports.
+pub fn events_bytes(events: &[Arc<Event>]) -> usize {
+    events.iter().map(|e| event_bytes(e)).sum()
+}
+
+/// Retained bytes of one parsed [`Event`]: the `Event`/`HashMap` header, the
+/// bucket table, and every nested value's heap payload.
+fn event_bytes(e: &Event) -> usize {
+    // size_of::<Event>() covers the foldhash table header itself.
+    size_of::<Event>()
+        + map_heap_bytes(e.fields.capacity(), size_of::<SmolStr>(), size_of::<Value>())
+        + e.fields
+            .iter()
+            .map(|(k, v)| smol_str_heap_bytes(k) + value_heap_bytes(v))
+            .sum::<usize>()
+}
+
+/// Extra heap bytes of a [`Value`] *beyond* the enum's inline storage (the enum
+/// struct — including an inline `Vec`/`HashMap` header — is already charged by
+/// the containing bucket via `map_heap_bytes`). Recurses into nested containers.
+fn value_heap_bytes(v: &Value) -> usize {
+    match v {
+        Value::Number(_) | Value::Bool(_) => 0,
+        Value::Str(s) => smol_str_heap_bytes(s),
+        Value::Array(items) => {
+            items.capacity() * size_of::<Value>()
+                + items.iter().map(value_heap_bytes).sum::<usize>()
+        }
+        Value::Object(fields) => {
+            map_heap_bytes(fields.capacity(), size_of::<SmolStr>(), size_of::<Value>())
+                + fields
+                    .iter()
+                    .map(|(k, v)| smol_str_heap_bytes(k) + value_heap_bytes(v))
+                    .sum::<usize>()
+        }
+    }
+}
+
+/// Heap allocation of a `HashMap` bucket table + control bytes.
+///
+/// std's swiss-table layout stores one `u64` hash plus key+value per bucket,
+/// one control byte per bucket (SIMD-group padded), and keeps some growth
+/// slack. The flat `+ 16` per entry covers control bytes + padding + slack and
+/// errs conservative (overcount).
+fn map_heap_bytes(capacity: usize, key_size: usize, value_size: usize) -> usize {
+    capacity * (size_of::<usize>() + key_size + value_size + 16)
+}
+
+/// Heap bytes of a `SmolStr` beyond its inline struct: only strings that
+/// outgrew the inline buffer allocate (payload + NUL).
+fn smol_str_heap_bytes(s: &SmolStr) -> usize {
+    if s.is_heap_allocated() { s.len() + 1 } else { 0 }
 }

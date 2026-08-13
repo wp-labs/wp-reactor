@@ -1,4 +1,4 @@
-use crate::window::buffer::content_bytes;
+use crate::window::buffer::{content_bytes, events_bytes};
 use crate::window::buffer::Window;
 use crate::window::buffer::types::AppendOutcome;
 use crate::window::buffer::types::WindowParams;
@@ -10,7 +10,7 @@ use arrow::record_batch::RecordBatch;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
-use wf_config::WindowConfig;
+use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 
 fn test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -517,4 +517,286 @@ fn content_bytes_ipc_roundtrip_does_not_inflate() {
         inflated > content * 3,
         "IPC decode should inflate well beyond content bytes: inflated={inflated}, content={content}"
     );
+}
+
+// -- events_bytes: parsed-event memory accounting ----------------------------
+
+/// An `object` field is a JSON-encoded Utf8 column; parsing it into
+/// `Value::Object(HashMap)` allocates per-entry key/bucket/hash overhead, so
+/// the retained footprint is many× the JSON string for small objects. The
+/// window retains both the Arrow batch and these parsed events, so
+/// `events_bytes` must push the window's byte accounting well past
+/// `content_bytes` or eviction fires at the wrong water level
+/// (wp-labs/wp-reactor#20).
+#[test]
+fn events_bytes_tracks_object_field_footprint() {
+    use crate::match_engine::batch_to_events;
+
+    let n = 10_000usize;
+    let obj_field = Field::new("conn_info", DataType::Utf8, false).with_metadata(
+        std::collections::HashMap::from([(
+            "wf.wfl.field_type".to_string(),
+            "object".to_string(),
+        )]),
+    );
+    let schema = Arc::new(Schema::new(vec![obj_field]));
+
+    let short_json = r#"{"sip":"10.0.0.1","detail":"a","nested":{"k":1,"s":"b"}}"#;
+    // Same key set, only the `detail` value lengthens → same table capacities,
+    // so any estimate increase is strictly the heap string bytes.
+    let long_json = format!(
+        r#"{{"sip":"10.0.0.1","detail":"{}","nested":{{"k":1,"s":"b"}}}}"#,
+        "x".repeat(200)
+    );
+
+    let json_bytes = short_json.len();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(
+            (0..n).map(|_| Some(short_json.to_string())).collect::<StringArray>(),
+        )],
+    )
+    .unwrap();
+    let parsed: Vec<Arc<crate::match_engine::Event>> =
+        batch_to_events(&batch).into_iter().map(Arc::new).collect();
+    let est = events_bytes(&parsed);
+
+    // The parsed HashMap representation must exceed the raw JSON content (the
+    // #20 undercount: content_bytes alone reports only the string bytes)...
+    assert!(
+        est > n * json_bytes,
+        "events_bytes {est} should exceed JSON content {} (~{} bytes/event)",
+        n * json_bytes,
+        est / n
+    );
+    // ...and each small-object event carries a bounded per-key overhead — a
+    // sane per-event cap (well under the 256MB window caps in the eps_obj
+    // scenario) without drifting into IPC-style multi-hundred× inflation.
+    let per_event = est / n;
+    assert!(
+        (100..4096).contains(&per_event),
+        "per-event estimate {per_event} should be sane for a ~{json_bytes}B JSON object"
+    );
+
+    // Heap-allocated (long) strings must be charged, so a long detail field
+    // raises the per-event estimate.
+    let batch_long = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(
+            (0..n).map(|_| Some(long_json.clone())).collect::<StringArray>(),
+        )],
+    )
+    .unwrap();
+    let parsed_long: Vec<Arc<crate::match_engine::Event>> =
+        batch_to_events(&batch_long).into_iter().map(Arc::new).collect();
+    let est_long = events_bytes(&parsed_long);
+    assert!(
+        est_long > est,
+        "long nested string should raise the estimate: long={est_long} short={est}"
+    );
+}
+
+/// `Value::Array` must be charged recursively: an object field carrying a long
+/// array costs more than the same field with a short array (same key set, so
+/// the map-table capacity is identical and any increase is the array itself).
+#[test]
+fn events_bytes_recurses_into_nested_arrays() {
+    use crate::match_engine::batch_to_events;
+
+    let n = 100usize;
+    let obj_field = Field::new("conn_info", DataType::Utf8, false).with_metadata(
+        std::collections::HashMap::from([(
+            "wf.wfl.field_type".to_string(),
+            "object".to_string(),
+        )]),
+    );
+    let schema = Arc::new(Schema::new(vec![obj_field]));
+
+    let short = r#"{"tags":["a","b"]}"#;
+    let long = format!(
+        r#"{{"tags":[{}]}}"#,
+        (0..50).map(|_| "\"x\"").collect::<Vec<_>>().join(",")
+    );
+
+    let est_short = events_bytes(
+        &batch_to_events(&RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new((0..n).map(|_| Some(short)).collect::<StringArray>())],
+        )
+        .unwrap())
+        .into_iter()
+        .map(Arc::new)
+        .collect::<Vec<_>>(),
+    );
+    let est_long = events_bytes(
+        &batch_to_events(&RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new((0..n).map(|_| Some(long.clone())).collect::<StringArray>())],
+        )
+        .unwrap())
+        .into_iter()
+        .map(Arc::new)
+        .collect::<Vec<_>>(),
+    );
+
+    assert!(est_short > 0, "array-bearing event must be charged");
+    assert!(
+        est_long > est_short,
+        "longer nested array should raise the estimate: long={est_long} short={est_short}"
+    );
+}
+
+/// #20 regression: a window's byte accounting must include the parsed-event
+/// footprint (`content_bytes` + `events_bytes`), not just the Arrow content.
+///
+/// Two windows with the *same* cap that fits exactly one batch's real footprint
+/// (content + parsed events). The content-only accounting path retains **both**
+/// batches — claiming 2×content bytes while actually holding 2×(content+events)
+/// real memory (the undercount that let RSS run away). The accurate path evicts
+/// down to one batch, keeping the window at or under the cap.
+#[test]
+fn window_evicts_on_parsed_event_footprint_not_content() {
+    use crate::match_engine::batch_to_events;
+
+    let n = 100usize;
+    let obj_field = Field::new("conn_info", DataType::Utf8, false).with_metadata(
+        std::collections::HashMap::from([(
+            "wf.wfl.field_type".to_string(),
+            "object".to_string(),
+        )]),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        obj_field,
+    ]));
+
+    let json = r#"{"sip":"10.0.0.1","dip":"172.16.5.9","nested":{"k":1}}"#;
+    let times: TimestampNanosecondArray =
+        (0..n).map(|i| Some(1_000_000_000i64 + i as i64)).collect();
+    let objs: StringArray = (0..n).map(|_| Some(json)).collect();
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(times), Arc::new(objs)]).unwrap();
+    let parsed: Vec<Arc<crate::match_engine::Event>> =
+        batch_to_events(&batch).into_iter().map(Arc::new).collect();
+
+    let content = content_bytes(&batch);
+    let events = events_bytes(&parsed);
+    assert!(events > content, "object fields must dominate the footprint");
+
+    // Cap fits exactly one batch's *combined* footprint. Content-only accounting
+    // for two batches stays under it (the undercount); combined accounting does not.
+    let cap = content + events + 10;
+    assert!(2 * content <= cap, "content-only accounting should stay under cap");
+    assert!(content + events <= cap, "one batch's real footprint fits");
+    assert!(2 * (content + events) > cap, "two batches' real footprint exceeds cap");
+
+    let make = |name: &str, cap: usize| {
+        Window::new(
+            WindowParams {
+                name: name.into(),
+                schema: schema.clone(),
+                time_col_index: Some(0),
+                over: Duration::from_secs(3600),
+                materialize_fields: None,
+            },
+            WindowConfig {
+                name: name.into(),
+                mode: DistMode::Local,
+                max_window_bytes: cap.into(),
+                over_cap: Duration::from_secs(3600).into(),
+                evict_policy: EvictPolicy::TimeFirst,
+                watermark: Duration::from_secs(0).into(),
+                // Wide lateness so the second batch (same timestamp window,
+                // min < first batch's advanced watermark) is not dropped as late.
+                allowed_lateness: Duration::from_secs(3600).into(),
+                late_policy: LatePolicy::Drop,
+                table: None,
+            },
+        )
+    };
+
+    // Old behavior: append_parsed computes content_bytes only → undercounts →
+    // retains both batches even though the real footprint is 2× the cap.
+    let mut content_only = make("content_only", cap);
+    for _ in 0..2 {
+        content_only
+            .append_with_watermark_parsed(batch.clone(), Arc::new(parsed.clone()))
+            .unwrap();
+    }
+    assert_eq!(
+        content_only.total_rows(),
+        2 * n,
+        "content-only accounting must retain both batches (the #20 undercount)"
+    );
+    assert!(
+        content_only.memory_usage() <= cap,
+        "content-only accounting reports {} <= cap (but real footprint is 2× that)",
+        content_only.memory_usage()
+    );
+
+    // New behavior: byte_size includes the parsed events → eviction fires on the
+    // real footprint → the window holds exactly one batch.
+    let mut accurate = make("accurate", cap);
+    for _ in 0..2 {
+        accurate
+            .append_with_watermark_parsed_sized(
+                batch.clone(),
+                Arc::new(parsed.clone()),
+                content + events,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        accurate.total_rows(),
+        n,
+        "accurate accounting must evict the oldest batch to stay under the cap"
+    );
+    assert!(accurate.memory_usage() <= cap);
+}
+
+/// Fast-path append (`append_with_watermark_sized`, no pre-parsed events) must
+/// leave the batch's `parsed_events` *uninitialized*, so a consumer reading via
+/// `events_since()` still lazily parses the real events — a later subscriber
+/// (hot reload) must not see empty events for batches that arrived while the
+/// window had no rule consumers.
+#[test]
+fn sized_append_keeps_events_lazily_parseable() {
+    let schema = test_schema();
+    let batch = make_batch(&schema, &[1_000_000_000, 2_000_000_000], &[42, 99]);
+    let content = content_bytes(&batch);
+    let cap = content + 10;
+
+    let mut win = Window::new(
+        WindowParams {
+            name: "lazy".into(),
+            schema: schema.clone(),
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+        },
+        WindowConfig {
+            name: "lazy".into(),
+            mode: DistMode::Local,
+            max_window_bytes: cap.into(),
+            over_cap: Duration::from_secs(3600).into(),
+            evict_policy: EvictPolicy::TimeFirst,
+            watermark: Duration::from_secs(0).into(),
+            allowed_lateness: Duration::from_secs(3600).into(),
+            late_policy: LatePolicy::Drop,
+            table: None,
+        },
+    );
+    win.append_with_watermark_sized(batch, content).unwrap();
+
+    // events_since lazily parses the batch → real events, not empty.
+    let (events_list, cursor, gap) = win.events_since(0);
+    assert!(!gap, "no cursor gap");
+    assert_eq!(events_list.len(), 1, "one batch of events");
+    assert_eq!(
+        events_list[0].len(),
+        2,
+        "both rows must be lazily parsed into events"
+    );
+    assert_eq!(cursor, 1, "cursor advances past the batch");
 }

@@ -5,7 +5,7 @@ pub mod provider;
 mod registry;
 mod router;
 
-pub use buffer::{AppendOutcome, Window, WindowParams, content_bytes};
+pub use buffer::{AppendOutcome, Window, WindowParams, content_bytes, events_bytes};
 pub use evictor::{EvictReport, Evictor, WindowEvictCount};
 pub use fanout::{RuleFanout, RulePush};
 pub use provider::ProviderWindow;

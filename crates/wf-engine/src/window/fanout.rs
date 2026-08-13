@@ -46,6 +46,19 @@ impl RuleFanout {
         Arc::new(Self::default())
     }
 
+    /// Whether any rule channel is registered for `window_name`.
+    ///
+    /// `route_parse` uses this to skip event materialization (and its
+    /// accounting) for windows no rule consumes — the dominant parse-side
+    /// cost when a window has no subscribers.
+    pub fn has_subscribers(&self, window_name: &str) -> bool {
+        self.table
+            .read()
+            .expect("fanout lock poisoned")
+            .get(window_name)
+            .is_some_and(|subs| !subs.is_empty())
+    }
+
     /// Register a single (unsharded) rule channel for `window_name`.
     pub fn register(&self, window_name: &str, tx: mpsc::UnboundedSender<RulePush>) {
         let mut table = self.table.write().expect("fanout lock poisoned");

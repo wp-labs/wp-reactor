@@ -6,7 +6,7 @@ use wf_config::DistMode;
 use crate::error::CoreResult;
 use crate::match_engine::{Event, batch_to_events, batch_to_events_filtered};
 
-use super::buffer::{AppendOutcome, content_bytes};
+use super::buffer::{AppendOutcome, content_bytes, events_bytes};
 use super::fanout::RuleFanout;
 use super::registry::WindowRegistry;
 
@@ -37,7 +37,17 @@ pub struct RouteReport {
 #[derive(Clone)]
 pub struct ParsedWindow {
     pub window_name: String,
-    pub events: Arc<Vec<Arc<Event>>>,
+    /// Pre-parsed events. `Some` when a rule consumes this window; `None` for
+    /// windows no rule reads — the events are not materialized (the parse-side
+    /// dominant cost) and the window's `parsed_events` stays uninitialized so a
+    /// *future* subscriber still gets real events via the lazy `OnceLock`.
+    pub events: Option<Arc<Vec<Arc<Event>>>>,
+    /// Retained bytes of `events` (the `HashMap<SmolStr, Value>` representation),
+    /// computed here so the ordered commit path skips the O(rows×cols) accounting.
+    /// The window holds this footprint alongside the Arrow batch, so it must be
+    /// part of the window's byte accounting or memory eviction fires far past the
+    /// real water level (wp-labs/wp-reactor#20).
+    pub events_bytes: usize,
 }
 
 /// Parsed events for every local window of a stream.
@@ -47,9 +57,10 @@ pub struct ParsedWindow {
 pub struct ParsedRoute {
     pub windows: Vec<ParsedWindow>,
     pub skipped_non_local: usize,
-    /// Content byte size of the batch, computed once in the parallel parse
-    /// stage so the ordered commit path skips the O(rows×cols) accounting.
-    pub byte_size: usize,
+    /// Arrow *content* byte size of the batch, computed once in the parallel
+    /// parse stage. The per-window `events_bytes` is added in `route_commit`,
+    /// so each window is charged its own retained footprint.
+    pub content_bytes: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +122,21 @@ impl Router {
                 continue;
             }
 
+            // No rule consumes this window (no fanout channel registered) →
+            // skip event materialization + its accounting entirely. Event
+            // HashMap materialization is allocation-heavy and dominated the
+            // parse side on windows no rule reads. Events stay `None` so the
+            // window's lazy OnceLock is left uninitialized — a later subscriber
+            // (hot reload) still gets real events via `events_since()`.
+            if !self.rule_fanout.has_subscribers(&window_name) {
+                windows.push(ParsedWindow {
+                    events_bytes: 0,
+                    window_name,
+                    events: None,
+                });
+                continue;
+            }
+
             let win_lock = self
                 .registry
                 .get_window(&window_name)
@@ -133,15 +159,19 @@ impl Router {
                 .collect::<Vec<_>>(),
             );
             windows.push(ParsedWindow {
+                events_bytes: events_bytes(&events),
                 window_name,
-                events,
+                events: Some(events),
             });
         }
 
         ParsedRoute {
+            // Arrow content is shared (Arc) across every window subscribed to
+            // this stream, so it is charged once here; each window adds its own
+            // parsed-event footprint in `route_commit`.
+            content_bytes: if windows.is_empty() { 0 } else { content_bytes(batch) },
             windows,
             skipped_non_local,
-            byte_size: content_bytes(batch),
         }
     }
 
@@ -157,7 +187,7 @@ impl Router {
         parsed: ParsedRoute,
     ) -> CoreResult<RouteReport> {
         let rows = batch.num_rows();
-        let byte_size = parsed.byte_size;
+        let content_bytes = parsed.content_bytes;
         let mut report = RouteReport {
             delivered: 0,
             dropped_late: 0,
@@ -170,13 +200,23 @@ impl Router {
                 .registry
                 .get_window(&window.window_name)
                 .expect("subscription references non-existent window");
-            let outcome = {
-                let mut win = win_lock.write().expect("window lock poisoned");
-                win.append_with_watermark_parsed_sized(
-                    batch.clone(),
-                    Arc::clone(&window.events),
-                    byte_size,
-                )?
+            // Materialized windows hand the pre-parsed events to the append;
+            // fast-path windows (no rule subscriber) pass `None` so the batch's
+            // `parsed_events` stays uninitialized (lazily parsed if a rule ever
+            // subscribes later).
+            let outcome = match &window.events {
+                Some(events) => {
+                    let mut win = win_lock.write().expect("window lock poisoned");
+                    win.append_with_watermark_parsed_sized(
+                        batch.clone(),
+                        Arc::clone(events),
+                        content_bytes + window.events_bytes,
+                    )?
+                }
+                None => {
+                    let mut win = win_lock.write().expect("window lock poisoned");
+                    win.append_with_watermark_sized(batch.clone(), content_bytes)?
+                }
             };
 
             match outcome {
@@ -189,9 +229,11 @@ impl Router {
                     });
                     // Push the shared parsed Arc to every rule subscribed to
                     // this window (R1 bridge: rules consume via channel instead
-                    // of `window.read()`).
-                    self.rule_fanout
-                        .broadcast(&window.window_name, &window.events);
+                    // of `window.read()`). Fast-path windows have no subscribers
+                    // (the events are `None`), so broadcast is skipped.
+                    if let Some(events) = &window.events {
+                        self.rule_fanout.broadcast(&window.window_name, events);
+                    }
                     if let Some(notify) = self.registry.get_notifier(&window.window_name) {
                         notify.notify_waiters();
                     }
@@ -242,7 +284,11 @@ impl Router {
         );
         let outcome = {
             let mut win = win_lock.write().expect("window lock poisoned");
-            win.append_with_watermark_parsed(batch, Arc::clone(&parsed))?
+            // Rule-emitted (intermediate) batches are small, so the O(rows×cols)
+            // accounting can run inline; include the parsed-event footprint so
+            // intermediate windows evict at the same water level as source ones.
+            let byte_size = content_bytes(&batch) + events_bytes(&parsed);
+            win.append_with_watermark_parsed_sized(batch, Arc::clone(&parsed), byte_size)?
         };
         if matches!(outcome, AppendOutcome::Appended) {
             self.rule_fanout.broadcast(window_name, &parsed);
@@ -263,9 +309,12 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::match_engine::{Event, batch_to_events, batch_to_events_filtered};
+    use crate::window::buffer::{content_bytes, events_bytes};
     use crate::window::{WindowDef, WindowParams};
-    use arrow::array::{Int64Array, TimestampNanosecondArray};
+    use arrow::array::{Int64Array, StringArray, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
     use wf_config::{EvictPolicy, LatePolicy, WindowConfig};
@@ -432,5 +481,204 @@ mod tests {
             .expect("intermediate append should broadcast parsed events");
         assert_eq!(&*push.window_name, "win_pipe");
         assert_eq!(push.events.len(), 1);
+    }
+
+    // -- 6. route_charges_events_bytes_per_window ----------------------------
+
+    /// A batch with a JSON `object` field, 100 rows, ts + conn_info columns.
+    fn object_batch() -> (SchemaRef, RecordBatch) {
+        let obj_field = Field::new("conn_info", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::from([(
+                "wf.wfl.field_type".to_string(),
+                "object".to_string(),
+            )]),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            obj_field,
+        ]));
+        let json = r#"{"sip":"10.0.0.1","dip":"172.16.5.9","nested":{"k":1}}"#;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(
+                    (0..100)
+                        .map(|i| Some(1_000_000_000i64 + i as i64))
+                        .collect::<TimestampNanosecondArray>(),
+                ),
+                Arc::new((0..100).map(|_| Some(json)).collect::<StringArray>()),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    /// Each window must be charged its own parsed-event footprint: a window that
+    /// materializes the object field reports `content_bytes + events_bytes`; one
+    /// that skips it reports content plus only the materialized fields' events.
+    #[test]
+    fn route_charges_events_bytes_per_window() {
+        let (schema, batch) = object_batch();
+
+        let all_events: Vec<Arc<Event>> =
+            batch_to_events(&batch).into_iter().map(Arc::new).collect();
+        let ts_events: Vec<Arc<Event>> = batch_to_events_filtered(
+            &batch,
+            &HashSet::from(["ts".to_string()]),
+        )
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+        let all_bytes = events_bytes(&all_events);
+        let ts_bytes = events_bytes(&ts_events);
+        assert!(
+            all_bytes > ts_bytes,
+            "materializing the object field must dominate the event footprint"
+        );
+
+        let reg = WindowRegistry::build(vec![
+            WindowDef {
+                params: WindowParams {
+                    name: "win_all".into(),
+                    schema: schema.clone(),
+                    time_col_index: Some(0),
+                    over: Duration::from_secs(3600),
+                    materialize_fields: None,
+                },
+                streams: vec!["events".into()],
+                config: test_config(DistMode::Local),
+            },
+            WindowDef {
+                params: WindowParams {
+                    name: "win_ts".into(),
+                    schema: schema.clone(),
+                    time_col_index: Some(0),
+                    over: Duration::from_secs(3600),
+                    materialize_fields: Some(Arc::new(HashSet::from(["ts".to_string()]))),
+                },
+                streams: vec!["events".into()],
+                config: test_config(DistMode::Local),
+            },
+        ])
+        .unwrap();
+        let router = Router::new(reg);
+        // Register rule subscribers so the fast path (skip materialization for
+        // windows without rule consumers) does not fire — these windows are read.
+        let (tx_all, _rx_all) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_ts, _rx_ts) = tokio::sync::mpsc::unbounded_channel();
+        router.fanout().register("win_all", tx_all);
+        router.fanout().register("win_ts", tx_ts);
+        router.route("events", batch).unwrap();
+
+        let mem_all = router
+            .registry()
+            .get_window("win_all")
+            .unwrap()
+            .read()
+            .unwrap()
+            .memory_usage();
+        let mem_ts = router
+            .registry()
+            .get_window("win_ts")
+            .unwrap()
+            .read()
+            .unwrap()
+            .memory_usage();
+
+        let content = content_bytes(
+            &router
+                .registry()
+                .snapshot("win_all")
+                .unwrap()
+                .pop()
+                .expect("batch retained"),
+        );
+        assert_eq!(
+            mem_all,
+            content + all_bytes,
+            "all-fields window must be charged content + full event footprint"
+        );
+        assert_eq!(
+            mem_ts,
+            content + ts_bytes,
+            "materialized-subset window must be charged content + subset footprint"
+        );
+        assert!(mem_all > mem_ts);
+    }
+
+    // -- 7. route_evicts_on_combined_footprint --------------------------------
+
+    /// #20 fix end-to-end: the router charges `content_bytes + events_bytes`, so
+    /// a window capped just above the content-only size drops the batch, while a
+    /// cap that fits the combined footprint retains it. Before the fix the first
+    /// window would have retained the batch (content ≤ cap) even though its real
+    /// footprint ran past the cap.
+    #[test]
+    fn route_evicts_on_combined_footprint() {
+        let (schema, batch) = object_batch();
+
+        let content = content_bytes(&batch);
+        let all_events: Vec<Arc<Event>> =
+            batch_to_events(&batch).into_iter().map(Arc::new).collect();
+        let all_bytes = events_bytes(&all_events);
+        assert!(content + all_bytes > content + 1);
+
+        let config = |cap: usize| WindowConfig {
+            name: "w".into(),
+            mode: DistMode::Local,
+            max_window_bytes: cap.into(),
+            over_cap: Duration::from_secs(3600).into(),
+            evict_policy: EvictPolicy::TimeFirst,
+            watermark: Duration::from_secs(0).into(),
+            allowed_lateness: Duration::from_secs(0).into(),
+            late_policy: LatePolicy::Drop,
+            table: None,
+        };
+        let reg = WindowRegistry::build(vec![
+            WindowDef {
+                params: WindowParams {
+                    name: "under_real".into(),
+                    schema: schema.clone(),
+                    time_col_index: Some(0),
+                    over: Duration::from_secs(3600),
+                    materialize_fields: None,
+                },
+                streams: vec!["events".into()],
+                config: config(content + 1),
+            },
+            WindowDef {
+                params: WindowParams {
+                    name: "fits_real".into(),
+                    schema: schema.clone(),
+                    time_col_index: Some(0),
+                    over: Duration::from_secs(3600),
+                    materialize_fields: None,
+                },
+                streams: vec!["events".into()],
+                config: config(content + all_bytes + 10),
+            },
+        ])
+        .unwrap();
+        let router = Router::new(reg);
+        // Register rule subscribers so events are materialized (the fast path
+        // would otherwise skip them and the windows would not be evicted).
+        let (tx_under, _rx_under) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_fits, _rx_fits) = tokio::sync::mpsc::unbounded_channel();
+        router.fanout().register("under_real", tx_under);
+        router.fanout().register("fits_real", tx_fits);
+        router.route("events", batch).unwrap();
+
+        let under = router.registry().get_window("under_real").unwrap();
+        assert_eq!(
+            under.read().unwrap().total_rows(),
+            0,
+            "real footprint (content+events) > cap → batch dropped"
+        );
+        let fits = router.registry().get_window("fits_real").unwrap();
+        assert_eq!(
+            fits.read().unwrap().total_rows(),
+            100,
+            "combined footprint fits → batch retained"
+        );
     }
 }
