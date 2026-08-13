@@ -1,10 +1,21 @@
 # 方案 B 实施计划（Push + 解析 Worker 池）· 从后往前改造
 
-> **状态：Plan（待评审后开工）**
+> **状态：R1 / R2 已合入**（`c5932e7` R1、`2c38a9a` R2、`bc73ef7` 优化、`c60a82f` 配置改名）；
+> **R3 / R4 待办**
 >
 > 2026-08-13 · 关联 [window-push-model-design.md](window-push-model-design.md)（架构设计）、
 > [window-push-consumer-model.md](window-push-consumer-model.md)（候选分析）、
 > [architecture.md](architecture.md)（现行 pull 模型）
+>
+> **实施记录（2026-08-13 更新）**：
+> - R1（`c5932e7`）：规则 worker 走 push channel，`run_push_loop` 消费 `Arc<Vec<Arc<Event>>>`。
+> - R2（`2c38a9a`）：`Router::route` 拆 `route_parse`（并行解析）+ `route_commit`（单 worker 按 seq 有序
+>   append + 广播）；`lifecycle/parse_pool.rs` 有界通道 + N 解析 worker + 1 commit worker。比文档原设计
+>   更优：用 BTreeMap 重排序保证 watermark/广播顺序性。
+> - 正确性（R2 提交内，N=200000 vs R1）：matches_total 一致（269383），dropped_late=0，delivered=200000；
+>   1182 tests 通过。
+> - **配置改名**（`c60a82f`）：`executor_parallelism` → `parse_parallelism`（解析池，默认 2）/ `rule_parallelism`
+>   （P2a 规则分片，默认 6）。旧键 `executor_parallelism` 已移除，serde 静默忽略——**旧 conf 里的该键不再生效**。
 
 ---
 
@@ -62,10 +73,10 @@ source 解码 RecordBatch  →  解析（→Event）  →  广播 Arc  →  规�
 
 ### 成功判据（明确）
 
-- [ ] 全量测试通过
-- [ ] **正确性一致**：规则触发计数 + alert 输出与基线完全相同（消费端切换无误）
-- [ ] 规则读路径确认不再 `window.read()`（代码层面可查）
-- [ ] 吞吐允许略降（桥接用方案 A，有已知负效应），**只要正确性成立即成功**
+- [x] 全量测试通过（`c5932e7` 后 1182 tests；当前 wf-engine 392 + wf-runtime 127）
+- [x] **正确性一致**：规则触发计数 + alert 输出与基线完全相同（`c5932e7` 对比基线一致）
+- [x] 规则读路径确认不再 `window.read()`（push 模式规则走 channel，`run_push_loop`）
+- [x] 吞吐允许略降（桥接用方案 A，有已知负效应），**只要正确性成立即成功**
 
 ### 回退
 
@@ -88,10 +99,11 @@ source 解码 RecordBatch  →  解析（→Event）  →  广播 Arc  →  规�
 
 ### 成功判据
 
-- [ ] 全量测试通过；正确性与 R1 一致（解析移 worker 不改变数据）
-- [ ] **source task 不再解析**（代码可查），receiver 解耦
-- [ ] 吞吐 ≥ R1（解析并行，A 的负效应消除）→ **≥ 基线 10.6s**
-- [ ] 剖面：`batch_to_events` 从 source task 移到解析 worker
+- [x] 全量测试通过；正确性与 R1 一致（`2c38a9a`：N=200000 matches_total 一致 269383，dropped_late=0）
+- [x] **source task 不再解析**（代码可查：source 只 decode + `prepare_batch` projection → 推 parse channel），receiver 解耦
+- [ ] 吞吐 ≥ R1（解析并行，A 的负效应消除）→ **≥ 基线 10.6s**（需对当前基线复测；注意
+      实测 conf 曾用已移除的 `executor_parallelism`，实际 `parse_parallelism=2`，见实施记录）
+- [x] 剖面：`batch_to_events` 从 source task 移到解析 worker（`route_parse` 内，且窗口锁外解析）
 
 ### 回退
 
