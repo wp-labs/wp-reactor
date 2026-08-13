@@ -1,18 +1,20 @@
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use arrow::ipc::reader::FileReader;
 use orion_error::conversion::{SourceErr, SourceRawErr, ToStructError};
 use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wf_engine::window::Router;
 use wf_lang::WindowSchema;
 
 use crate::error::{RuntimeReason, RuntimeResult};
+use crate::lifecycle::parse_pool::{ParseItem, build_parse_item, push_decoded_batch};
 use crate::metrics::RuntimeMetrics;
 use crate::receiver::miss::record_batch_window_miss;
-use crate::receiver::route::route_batch;
 use crate::receiver::schema::{
     maybe_resolve_stream_schema, resolve_stream_schema, schemas_are_compatible_for_stream,
     validate_batch_schema_for_stream,
@@ -20,13 +22,16 @@ use crate::receiver::schema::{
 
 /// Replay framed `wp_arrow` IPC records from file and route them into the
 /// runtime.
-pub async fn replay_arrow_framed_file(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn replay_arrow_framed_file(
     path: &Path,
     stream_name: &str,
     source_name: &str,
     schemas: &[WindowSchema],
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
+    parse_tx: mpsc::Sender<ParseItem>,
+    parse_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) -> RuntimeResult<()> {
     let path = path.to_path_buf();
@@ -82,11 +87,21 @@ pub async fn replay_arrow_framed_file(
                 validate_batch_schema_for_stream(schemas, stream, frame.batch.schema().as_ref())?;
 
                 total_rows += frame.batch.num_rows();
-                if let Err(e) = route_batch(stream, source_name, frame.batch, router.as_ref(), metrics.as_ref()) {
-                    if let Some(metrics) = &metrics {
-                        metrics.inc_route_error(source_name);
-                    }
-                    return Err(e);
+                if !push_decoded_batch(
+                    &parse_tx,
+                    &parse_seq,
+                    source_name,
+                    stream,
+                    frame.batch,
+                    router.as_ref(),
+                    metrics.as_ref(),
+                )
+                .await
+                {
+                    return RuntimeReason::system_error()
+                        .to_err()
+                        .with_detail("parse worker pool shut down during file replay")
+                        .err();
                 }
             }
         }
@@ -104,13 +119,16 @@ pub async fn replay_arrow_framed_file(
 
 /// Replay standard Arrow IPC file batches and route them into the runtime as
 /// one configured stream.
-pub async fn replay_arrow_ipc_file(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn replay_arrow_ipc_file(
     path: &Path,
     stream_name: &str,
     source_name: &str,
     schemas: &[WindowSchema],
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
+    parse_tx: mpsc::Sender<ParseItem>,
+    parse_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) -> RuntimeResult<()> {
     let path = path.to_path_buf();
@@ -162,17 +180,19 @@ pub async fn replay_arrow_ipc_file(
                 format!("read arrow ipc batch from {}", path_for_read.display()),
             )?;
             total_rows += batch.num_rows();
-            if let Err(e) = route_batch(
-                &stream_for_read,
+            let item = build_parse_item(
+                &parse_seq,
                 &source_for_read,
+                &stream_for_read,
                 batch,
                 router.as_ref(),
                 metrics.as_ref(),
-            ) {
-                if let Some(metrics) = &metrics {
-                    metrics.inc_route_error(&source_for_read);
-                }
-                return Err(e);
+            );
+            if parse_tx.blocking_send(item).is_err() {
+                return RuntimeReason::system_error()
+                    .to_err()
+                    .with_detail("parse worker pool shut down during file replay")
+                    .err();
             }
         }
         Ok(total_rows)

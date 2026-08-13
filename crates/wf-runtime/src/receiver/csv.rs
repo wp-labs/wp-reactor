@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use arrow::datatypes::SchemaRef;
 use orion_error::conversion::ToStructError;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wf_engine::window::Router;
 use wf_lang::WindowSchema;
 
 use crate::error::{RuntimeReason, RuntimeResult};
+use crate::lifecycle::parse_pool::ParseItem;
 use crate::metrics::RuntimeMetrics;
 use crate::receiver::miss::{WindowMiss, WindowMissReason, report_window_miss};
 use crate::receiver::ndjson::{flush_ndjson_rows, normalize_stream_tag_field};
@@ -20,13 +23,16 @@ use super::ReplayRoute;
 ///
 /// CSV headers must match schema field names. Each row is converted to a
 /// RecordBatch using the same column builder as NDJSON.
-pub async fn replay_csv_file(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn replay_csv_file(
     path: &Path,
     route: ReplayRoute<'_>,
     source_name: &str,
     schemas: &[WindowSchema],
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
+    parse_tx: mpsc::Sender<ParseItem>,
+    parse_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) -> RuntimeResult<()> {
     let stream_name = route.stream_name;
@@ -148,9 +154,12 @@ pub async fn replay_csv_file(
                 rows,
                 router.as_ref(),
                 metrics.as_ref(),
+                &parse_tx,
+                &parse_seq,
                 stream_tag_field,
                 "file",
-            )?;
+            )
+            .await?;
         }
     }
 
@@ -167,9 +176,12 @@ pub async fn replay_csv_file(
             rows,
             router.as_ref(),
             metrics.as_ref(),
+            &parse_tx,
+            &parse_seq,
             stream_tag_field,
             "file",
-        )?;
+        )
+        .await?;
     }
 
     wf_info!(

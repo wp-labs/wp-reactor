@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use orion_error::conversion::{SourceErr, ToStructError};
@@ -28,7 +28,7 @@ use wf_connector_api::BatchSource;
 use wp_core_connectors::sources::batch::arrow::WireFormat;
 use wp_model_core::model::{DataRecord, DataType, Field, FieldStorage, Value};
 
-use super::parse_pool::{ParseItem, spawn_parse_pool};
+use super::parse_pool::{ParseItem, push_decoded_batch, spawn_parse_pool};
 use super::types::{RunRule, RunRuleKind, TaskGroup};
 
 // ---------------------------------------------------------------------------
@@ -317,6 +317,8 @@ pub(super) async fn spawn_receiver_task(
                     .unwrap_or_else(|| DEFAULT_STREAM_TAG_FIELD.to_string());
                 let router = Arc::clone(&router);
                 let metrics = metrics.clone();
+                let parse_tx = parse_tx.clone();
+                let parse_seq = Arc::clone(&parse_seq);
                 let cancel = cancel.child_token();
                 let format = source_data_format(source).to_string();
                 let schemas = Arc::clone(&schema_catalog);
@@ -334,6 +336,8 @@ pub(super) async fn spawn_receiver_task(
                                 schemas.as_slice(),
                                 router,
                                 metrics,
+                                parse_tx.clone(),
+                                Arc::clone(&parse_seq),
                                 cancel,
                             )
                             .await?
@@ -349,6 +353,8 @@ pub(super) async fn spawn_receiver_task(
                                 schemas.as_slice(),
                                 router,
                                 metrics,
+                                parse_tx.clone(),
+                                Arc::clone(&parse_seq),
                                 cancel,
                             )
                             .await?
@@ -361,6 +367,8 @@ pub(super) async fn spawn_receiver_task(
                                 schemas.as_slice(),
                                 router,
                                 metrics,
+                                parse_tx.clone(),
+                                Arc::clone(&parse_seq),
                                 cancel,
                             )
                             .await?
@@ -373,6 +381,8 @@ pub(super) async fn spawn_receiver_task(
                                 schemas.as_slice(),
                                 router,
                                 metrics,
+                                parse_tx.clone(),
+                                Arc::clone(&parse_seq),
                                 cancel,
                             )
                             .await?
@@ -624,29 +634,20 @@ async fn spawn_external_source_tasks(
                                     );
                                     continue;
                                 }
-                                // Receiver metrics (counts a decoded frame), then
-                                // project + hand off to the parse worker pool.
+                                // Project + hand off to the parse worker pool.
                                 // The source no longer parses (batch_to_events);
-                                // it only decodes, projects, and pushes.
-                                if let Some(metrics) = &metrics {
-                                    metrics.add_receiver_frame(rb.num_rows());
-                                    metrics.add_receiver_source_frame(&source_name, rb.num_rows());
-                                    let machine_id = crate::receiver::batch_machine_id(&rb)
-                                        .unwrap_or_else(|| source_name.clone());
-                                    metrics.add_receiver_source_machine_rows(
-                                        &source_name,
-                                        &machine_id,
-                                        rb.num_rows(),
-                                    );
-                                }
-                                let projected =
-                                    crate::receiver::prepare_batch(&route_stream, &rb, router.as_ref());
-                                let item = ParseItem {
-                                    seq: parse_seq.fetch_add(1, Ordering::Relaxed),
-                                    stream_name: route_stream,
-                                    batch: projected,
-                                };
-                                if parse_tx.send(item).await.is_err() {
+                                // it only decodes, projects, and pushes (R2/R3).
+                                if !push_decoded_batch(
+                                    &parse_tx,
+                                    &parse_seq,
+                                    &source_name,
+                                    &route_stream,
+                                    rb,
+                                    router.as_ref(),
+                                    metrics.as_ref(),
+                                )
+                                .await
+                                {
                                     // Parse pool shut down.
                                     break 'outer;
                                 }

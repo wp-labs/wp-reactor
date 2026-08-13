@@ -35,7 +35,7 @@ pub(crate) struct TaskGroup {
 }
 
 impl TaskGroup {
-    pub(super) fn new(name: &'static str) -> Self {
+    pub(crate) fn new(name: &'static str) -> Self {
         Self {
             name,
             handles: Vec::new(),

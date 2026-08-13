@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc;
@@ -20,15 +21,66 @@ const COMMIT_CHANNEL_CAPACITY: usize = 1024;
 /// `seq` is a monotonically increasing sequence assigned by the source, so the
 /// single commit worker can re-assemble batches in source order even though N
 /// parse workers finish out of order.
-pub(super) struct ParseItem {
+pub(crate) struct ParseItem {
     pub seq: u64,
+    pub source_name: String,
     pub stream_name: String,
     pub batch: RecordBatch,
+}
+
+/// Build a projected, sequenced `ParseItem` for one decoded batch (R2/R3).
+///
+/// Receiver frame metrics, projection (the parse pool's `route_parse`/
+/// `route_commit` do **not** project, so the batch must be conformant before it
+/// is pushed), then an ordered `ParseItem` on the shared seq. Synchronous so it
+/// is reusable both from async push ([`push_decoded_batch`]) and from the
+/// arrow-IPC replay's `spawn_blocking` closure ([`Sender::blocking_send`]).
+pub(crate) fn build_parse_item(
+    parse_seq: &AtomicU64,
+    source_name: &str,
+    stream_name: &str,
+    batch: RecordBatch,
+    router: &Router,
+    metrics: Option<&Arc<RuntimeMetrics>>,
+) -> ParseItem {
+    if let Some(metrics) = metrics {
+        metrics.add_receiver_frame(batch.num_rows());
+        metrics.add_receiver_source_frame(source_name, batch.num_rows());
+        let machine_id = crate::receiver::batch_machine_id(&batch)
+            .unwrap_or_else(|| source_name.to_string());
+        metrics.add_receiver_source_machine_rows(source_name, &machine_id, batch.num_rows());
+    }
+    let projected = crate::receiver::prepare_batch(stream_name, &batch, router);
+    ParseItem {
+        seq: parse_seq.fetch_add(1, Ordering::Relaxed),
+        source_name: source_name.to_string(),
+        stream_name: stream_name.to_string(),
+        batch: projected,
+    }
+}
+
+/// Project + push one decoded batch to the parse worker pool.
+///
+/// Used by streaming sources and file-replay sources alike, so every source
+/// flows through the same parse → ordered-commit → broadcast chain. Returns
+/// `false` when the parse pool has shut down (channel closed).
+pub(crate) async fn push_decoded_batch(
+    parse_tx: &mpsc::Sender<ParseItem>,
+    parse_seq: &AtomicU64,
+    source_name: &str,
+    stream_name: &str,
+    batch: RecordBatch,
+    router: &Router,
+    metrics: Option<&Arc<RuntimeMetrics>>,
+) -> bool {
+    let item = build_parse_item(parse_seq, source_name, stream_name, batch, router, metrics);
+    parse_tx.send(item).await.is_ok()
 }
 
 /// A parsed batch handed from a parse worker to the (ordered) commit worker.
 struct ParsedItem {
     seq: u64,
+    source_name: String,
     batch: RecordBatch,
     parsed: ParsedRoute,
 }
@@ -39,7 +91,7 @@ struct ParsedItem {
 /// Parse workers run [`Router::route_parse`] in parallel; the single commit
 /// worker runs [`Router::route_commit`] in `seq` order so watermark advancement
 /// and rule broadcast stay in source order.
-pub(super) fn spawn_parse_pool(
+pub(crate) fn spawn_parse_pool(
     router: &Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
     worker_count: usize,
@@ -95,6 +147,7 @@ async fn run_parse_worker(
         if commit_tx
             .send(ParsedItem {
                 seq: item.seq,
+                source_name: item.source_name,
                 batch: item.batch,
                 parsed,
             })
@@ -157,6 +210,11 @@ fn commit(router: &Router, metrics: &Option<Arc<RuntimeMetrics>>, item: ParsedIt
             }
         }
         Err(e) => {
+            // Preserve the per-source route_error telemetry that route_batch used
+            // to report on the inline path.
+            if let Some(metrics) = metrics {
+                metrics.inc_route_error(&item.source_name);
+            }
             wf_warn!(pipe, error = %e, "parse commit failed");
         }
     }

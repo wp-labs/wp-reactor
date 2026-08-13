@@ -9,56 +9,6 @@ use wf_engine::match_engine::{
 };
 use wf_engine::window::Router;
 
-use crate::error::{RuntimeReason, RuntimeResult};
-use crate::metrics::RuntimeMetrics;
-use orion_error::conversion::ToStructError;
-
-pub(crate) fn route_batch(
-    stream_name: &str,
-    source_name: &str,
-    batch: RecordBatch,
-    router: &Router,
-    metrics: Option<&Arc<RuntimeMetrics>>,
-) -> RuntimeResult<()> {
-    if let Some(metrics) = metrics {
-        metrics.add_receiver_frame(batch.num_rows());
-        metrics.add_receiver_source_frame(source_name, batch.num_rows());
-        let machine_id = batch_machine_id(&batch).unwrap_or_else(|| source_name.to_string());
-        metrics.add_receiver_source_machine_rows(source_name, &machine_id, batch.num_rows());
-        metrics.inc_router_route_call();
-    }
-    wf_debug!(
-        pipe,
-        stream = stream_name,
-        rows = batch.num_rows(),
-        "frame decoded"
-    );
-    let route_input = prepare_batch(stream_name, &batch, router);
-
-    // Try routing directly; if schema mismatch, attempt projection
-    let report = match router.route(stream_name, route_input) {
-        Ok(report) => report,
-        Err(_) => {
-            // Project batch to match window schemas for this stream
-            let projected = project_batch_for_stream(stream_name, &batch, router);
-            router
-                .route(stream_name, projected)
-                .map_err(|e| RuntimeReason::data_error().to_err().with_source(e))?
-        }
-    };
-    if let Some(metrics) = metrics {
-        metrics.add_route_report(&report);
-    }
-    wf_debug!(
-        pipe,
-        delivered = report.delivered,
-        dropped_late = report.dropped_late,
-        skipped = report.skipped_non_local,
-        "route report"
-    );
-    Ok(())
-}
-
 pub(crate) fn batch_machine_id(batch: &RecordBatch) -> Option<String> {
     let idx = batch.schema().index_of(match_engine::MACHINE_ID).ok()?;
     let col = batch.column(idx);

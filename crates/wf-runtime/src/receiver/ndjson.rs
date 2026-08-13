@@ -1,20 +1,22 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use arrow::datatypes::SchemaRef;
 
 use orion_error::conversion::{SourceErr, ToStructError};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wf_engine::window::Router;
 use wf_lang::WindowSchema;
 
 use crate::error::{RuntimeReason, RuntimeResult};
+use crate::lifecycle::parse_pool::{ParseItem, push_decoded_batch};
 use crate::metrics::RuntimeMetrics;
 use crate::receiver::batch::build_record_batch_from_json;
 use crate::receiver::miss::{WindowMiss, WindowMissReason, report_window_miss};
-use crate::receiver::route::route_batch;
 use crate::receiver::schema::{maybe_resolve_stream_schema, resolve_stream_schema};
 
 use super::DEFAULT_STREAM_TAG_FIELD;
@@ -25,13 +27,16 @@ use super::ReplayRoute;
 /// If `stream_name` is set, all rows are routed as that configured stream.
 /// If it is empty, each JSON object must carry `stream_tag_field`, and rows are
 /// routed by that per-row logical stream.
-pub async fn replay_ndjson_file(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn replay_ndjson_file(
     path: &Path,
     route: ReplayRoute<'_>,
     source_name: &str,
     schemas: &[WindowSchema],
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
+    parse_tx: mpsc::Sender<ParseItem>,
+    parse_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) -> RuntimeResult<()> {
     const FILE_BATCH_ROWS: usize = 2048;
@@ -136,9 +141,12 @@ pub async fn replay_ndjson_file(
                         rows,
                         router.as_ref(),
                         metrics.as_ref(),
+                        &parse_tx,
+                        &parse_seq,
                         stream_tag_field,
                         "file",
-                    )?;
+                    )
+                    .await?;
                 }
             }
         }
@@ -157,9 +165,12 @@ pub async fn replay_ndjson_file(
             rows,
             router.as_ref(),
             metrics.as_ref(),
+            &parse_tx,
+            &parse_seq,
             stream_tag_field,
             "file",
-        )?;
+        )
+        .await?;
     }
 
     wf_info!(
@@ -173,7 +184,7 @@ pub async fn replay_ndjson_file(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn flush_ndjson_rows(
+pub(super) async fn flush_ndjson_rows(
     stream_name: &str,
     source_name: &str,
     schemas: &[WindowSchema],
@@ -182,6 +193,8 @@ pub(super) fn flush_ndjson_rows(
     rows: Vec<serde_json::Map<String, serde_json::Value>>,
     router: &Router,
     metrics: Option<&Arc<RuntimeMetrics>>,
+    parse_tx: &mpsc::Sender<ParseItem>,
+    parse_seq: &AtomicU64,
     stream_tag_field: &str,
     source_kind: &str,
 ) -> RuntimeResult<usize> {
@@ -218,11 +231,16 @@ pub(super) fn flush_ndjson_rows(
     };
     let batch = build_record_batch_from_json(&schema, &rows)?;
     let row_count = batch.num_rows();
-    if let Err(e) = route_batch(stream_name, source_name, batch, router, metrics) {
-        if let Some(metrics) = metrics {
-            metrics.inc_route_error(source_name);
-        }
-        return Err(e);
+    // Push to the parse worker pool (R3) instead of routing inline: the commit
+    // worker applies `route_commit` in order and logs route errors (aligned with
+    // the streaming-source path).
+    if !push_decoded_batch(parse_tx, parse_seq, source_name, stream_name, batch, router, metrics)
+        .await
+    {
+        return RuntimeReason::system_error()
+            .to_err()
+            .with_detail("parse worker pool shut down during file replay")
+            .err();
     }
     Ok(row_count)
 }
