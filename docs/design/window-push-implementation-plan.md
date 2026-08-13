@@ -1,7 +1,7 @@
 # 方案 B 实施计划（Push + 解析 Worker 池）· 从后往前改造
 
-> **状态：R1 / R2 已合入**（`c5932e7` R1、`2c38a9a` R2、`bc73ef7` 优化、`c60a82f` 配置改名）；
-> **R3 / R4 待办**
+> **状态：R1 / R2 / R3 已合入**（`c5932e7` R1、`2c38a9a` R2、R3 见下实施记录）；
+> **R4 待办**
 >
 > 2026-08-13 · 关联 [window-push-model-design.md](window-push-model-design.md)（架构设计）、
 > [window-push-consumer-model.md](window-push-consumer-model.md)（候选分析）、
@@ -116,17 +116,48 @@ source 解码 RecordBatch  →  解析（→Event）  →  广播 Arc  →  规�
 **目标**：确认 source 解码 → 解析 channel → 整链的正确性与吞吐。R2 已含 source 推
 channel，此步为整链验证 + 清理。
 
+**实施记录（2026-08-13）**：
+- 4 个文件源 replay（ndjson/csv/arrow_framed/arrow_ipc）从 inline `route_batch` →
+  `Router::route` 收进 parse 池：`parse_pool.rs` 新增 `push_decoded_batch` / `build_parse_item`
+  共享 helper（流式源与文件源统一走同一条 parse → 有序 commit → 广播链）。
+- `route_batch` 及其投影兜底重试删除（parse 池依赖 `prepare_batch` 在 push 前投影）；
+  2 个投影测试改为直接单测 `prepare_batch`。
+- 语义变化（与流式一致）：文件源 route 错误由 commit worker `wf_warn` 记录，不再
+  propagate；window-miss 在 push 前处理，语义不变。
+
 ### 成功判据
 
-- [ ] 全链正确性 = 基线；吞吐 ≥ 基线
-- [ ] semaphore 变化记录（此时规则数据面已无窗口读锁，应主要剩控制面写锁）
+- [x] 全链正确性 = 基线；吞吐 ≥ 基线
+  - wf-engine 392 + wf-runtime 127 全过（含文件源 replay 经 parse 池的用例）
+  - 文件源端到端：daemon 起 file source，`file source replay complete rows=200000`，
+    告警 76569 条落盘（N=200k，与基线一致）
+  - 吞吐无回归：eps_obj blackhole N=2.68M match 追平 **24.18s**（基线 24.1s）
+- [x] semaphore 变化记录：macOS `sample` 显示规则读路径**无窗口读锁等待**——剩余
+  semaphore 主要是 tokio worker park（空闲）+ blocking 线程池 dispatch（控制面/写侧），
+  符合「规则数据面已脱离窗口读锁」预期
 
 ---
 
 ## 5. R4：窗口控制面化（清理）
 
-**目标**：窗口只留 watermark/timeout/eviction/join/中间窗口；确认规则数据面彻底脱离
-窗口锁。
+**目标**：按管道设计（[rule-sharding-and-aggregation-window.md](rule-sharding-and-aggregation-window.md)）
+把「窗口」收敛为两类，规则数据面彻底脱离窗口锁：
+
+- **输入窗口**（stream → window）：只留 watermark / timeout / eviction / join——供
+  match 时间窗与 join 查询（control-plane，规则数据面不读）。
+- **管道（Pipe）**（yield 目标 / `|>` 中间 / conv）：`over=0` 纯透传（跳过 buffer 存储、
+  只广播到订阅者），`over>0` 保留供下游 match；订阅者（规则 / sink / 变换算子）统一走
+  `PipeFanout`（替代仅挂规则的 `RuleFanout`）。
+
+> **注**：`over=0` 纯透传是 R4 的核心前置——当前 `append_inner` 对 `over=0` 仍照常
+> `push_back` 存储、`evict_expired` 对 `over=0` 直接 return（永不时间驱逐），只靠
+> `max_window_bytes` 内存 cap 兜底（见 `window/buffer/eviction.rs`）。R4 需先实现
+> 「`over=0` 跳过 buffer 存储、只广播」，管道才会真正纯透传。
+
+### 前置（over=0 纯透传 + PipeFanout 落地）
+
+- [ ] over=0 窗口/管道跳过 buffer 存储，只广播到订阅者
+- [ ] PipeFanout 扩展：规则 / sink / 变换算子同挂一个 fanout
 
 ### 成功判据
 
