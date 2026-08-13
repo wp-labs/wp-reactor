@@ -4,9 +4,10 @@ use arrow::record_batch::RecordBatch;
 use wf_config::DistMode;
 
 use crate::error::CoreResult;
-use crate::match_engine::{Event, batch_to_events, batch_to_events_filtered};
+use crate::match_engine::{batch_to_events, batch_to_events_filtered};
 
 use super::buffer::AppendOutcome;
+use super::fanout::RuleFanout;
 use super::registry::WindowRegistry;
 
 // ---------------------------------------------------------------------------
@@ -45,11 +46,24 @@ pub struct RouteReport {
 #[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct Router {
     registry: WindowRegistry,
+    /// Rule-channel fan-out: after each successful append, the router broadcasts
+    /// the parsed `Arc<Vec<Event>>` to every rule subscribed to that window.
+    /// Kept alongside the registry (not inside it) so the MoJu model surface is
+    /// unchanged.
+    rule_fanout: Arc<RuleFanout>,
 }
 
 impl Router {
     pub fn new(registry: WindowRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            rule_fanout: RuleFanout::new(),
+        }
+    }
+
+    /// Borrow the rule-channel fan-out table (for rule-task registration).
+    pub fn fanout(&self) -> &Arc<RuleFanout> {
+        &self.rule_fanout
     }
 
     /// Route a batch to all windows subscribed to `stream_name`.
@@ -89,7 +103,7 @@ impl Router {
             });
             let outcome = {
                 let mut win = win_lock.write().expect("window lock poisoned");
-                win.append_with_watermark_parsed(batch.clone(), parsed)?
+                win.append_with_watermark_parsed(batch.clone(), Arc::clone(&parsed))?
             };
 
             match outcome {
@@ -100,6 +114,10 @@ impl Router {
                         rows,
                         late: false,
                     });
+                    // Push the shared parsed Arc to every rule subscribed to
+                    // this window (R1 bridge: rules consume via channel instead
+                    // of `window.read()`).
+                    self.rule_fanout.broadcast(&window_name, &parsed);
                     if let Some(notify) = self.registry.get_notifier(&window_name) {
                         notify.notify_waiters();
                     }

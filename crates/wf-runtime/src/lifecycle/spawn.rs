@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use wf_config::FusionConfig;
 use wf_engine::alert::OutputRecord;
 use wf_engine::sink::SinkDispatcher;
-use wf_engine::window::{Evictor, Router, WindowRegistry};
+use wf_engine::window::{Evictor, Router, RulePush, WindowRegistry};
 
 use crate::alert_task;
 use crate::engine_task::{RuleTaskConfig, WindowSource, run_rule_task};
@@ -97,6 +97,15 @@ pub(super) fn spawn_rule_tasks(
         };
         let window_sources = resolve_window_sources(&rule.window_aliases, router.registry());
 
+        // R1: one unbounded channel per rule, registered with the router's
+        // fan-out for every window this rule subscribes to. The router then
+        // broadcasts each parsed `Arc<Vec<Event>>` to the rule's channel; the
+        // rule consumes it without taking the window read lock.
+        let (push_tx, push_rx) = mpsc::unbounded_channel::<RulePush>();
+        for source in &window_sources {
+            router.fanout().register(&source.window_name, push_tx.clone());
+        }
+
         let task_config = RuleTaskConfig {
             machine,
             each_alias,
@@ -110,6 +119,7 @@ pub(super) fn spawn_rule_tasks(
             metrics: metrics.clone(),
             intermediate_targets: intermediate_targets.clone(),
             eos_flush: eos_tx.subscribe(),
+            push_rx: Some(push_rx),
         };
 
         group.push(tokio::spawn(

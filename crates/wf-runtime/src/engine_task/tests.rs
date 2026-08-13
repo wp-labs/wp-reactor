@@ -16,7 +16,7 @@ use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 use wf_engine::match_engine::{CepStateMachine, RuleExecutor, batch_to_events};
-use wf_engine::window::{content_bytes, Router, Window, WindowDef, WindowParams, WindowRegistry};
+use wf_engine::window::{RulePush, content_bytes, Router, Window, WindowDef, WindowParams, WindowRegistry};
 use wf_lang::ast::{BinOp, CloseMode, CmpOp, Expr, FieldRef, Measure, ObjectItem};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EachPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
@@ -360,6 +360,7 @@ fn make_task_with_window_bytes(
         metrics: None,
         intermediate_targets: HashSet::new(),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
 
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
@@ -473,6 +474,7 @@ fn make_pipeline_stage_task() -> (
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -558,6 +560,7 @@ fn make_each_task() -> (
         metrics: None,
         intermediate_targets: HashSet::new(),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -658,6 +661,7 @@ fn make_filtered_match_task() -> (
         metrics: None,
         intermediate_targets: HashSet::new(),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -771,6 +775,7 @@ fn make_filtered_close_task() -> (
         metrics: None,
         intermediate_targets: HashSet::new(),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -853,6 +858,7 @@ fn make_filtered_each_task() -> (
         metrics: None,
         intermediate_targets: HashSet::new(),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -967,6 +973,7 @@ fn make_intermediate_each_task() -> (
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1063,6 +1070,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1166,6 +1174,7 @@ fn make_intermediate_score_tasks() -> (
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (upstream_task, _cancel, _interval) = rule_task::RuleTask::new(upstream_config);
 
@@ -1300,6 +1309,7 @@ fn make_intermediate_score_tasks() -> (
         metrics: None,
         intermediate_targets: HashSet::new(),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (downstream_task, _cancel, _interval) = rule_task::RuleTask::new(downstream_config);
 
@@ -1404,6 +1414,7 @@ fn make_intermediate_score_band_tasks() -> (
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (upstream_task, _cancel, _interval) = rule_task::RuleTask::new(upstream_config);
 
@@ -1591,6 +1602,7 @@ fn make_intermediate_score_band_tasks() -> (
         metrics: None,
         intermediate_targets: HashSet::new(),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (downstream_task, _cancel, _interval) = rule_task::RuleTask::new(downstream_config);
 
@@ -1759,6 +1771,7 @@ fn make_filtered_bind_alias_match_task() -> (
         metrics: None,
         intermediate_targets: HashSet::new(),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, window, notify)
@@ -1866,6 +1879,7 @@ fn make_window_has_match_task() -> (
         metrics: None,
         intermediate_targets: HashSet::new(),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1919,6 +1933,31 @@ async fn pull_triggers_alert() {
     task.pull_and_advance().await;
 
     let alert = alert_rx.try_recv().expect("should have produced an alert");
+    assert_eq!(alert.rule_name, "test_rule");
+    assert_eq!(alert.entity_type, "ip");
+    assert_eq!(alert.entity_id, "10.0.0.1");
+    assert!((alert.score - 70.0).abs() < f64::EPSILON);
+    assert_eq!(alert.event_time_nanos, ts_nanos);
+}
+
+#[tokio::test]
+async fn push_triggers_alert() {
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, mut alert_rx, _win, _notify) = make_task();
+
+    let ts_nanos = 1_700_000_000_000_000_000i64;
+    let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.1", "10.0.0.1"], ts_nanos);
+
+    // Feed the same parsed events the router would broadcast into the rule's
+    // push channel, and advance the state machine through the push path.
+    let push = RulePush {
+        window_name: "auth_events".into(),
+        events: Arc::new(batch_to_events(&batch)),
+    };
+    task.process_push(push).await;
+
+    let alert = alert_rx.try_recv().expect("push path should produce an alert");
     assert_eq!(alert.rule_name, "test_rule");
     assert_eq!(alert.entity_type, "ip");
     assert_eq!(alert.entity_id, "10.0.0.1");
@@ -2668,6 +2707,7 @@ async fn port_scan_rule_triggers_close_alert() {
         metrics: None,
         intermediate_targets: HashSet::new(),
         eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
     };
 
     let (mut task, _cancel, _interval) = rule_task::RuleTask::new(config);

@@ -13,9 +13,9 @@ use orion_error::conversion::{SourceRawErr, ToStructError};
 use tokio::sync::mpsc;
 
 use wf_engine::alert::OutputRecord;
-use wf_engine::match_engine::{CepStateMachine, CloseReason, RuleExecutor, StepResult};
+use wf_engine::match_engine::{CepStateMachine, CloseReason, Event, RuleExecutor, StepResult};
 use wf_engine::normalize_epoch_timestamp_float_nanos;
-use wf_engine::window::{AppendOutcome, Router};
+use wf_engine::window::{AppendOutcome, Router, RulePush};
 use wf_lang::plan::ConvPlan;
 use wf_lang::wfu_meta::{WFU_ID, WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
 
@@ -107,6 +107,13 @@ pub(super) struct RuleTask {
     /// by the elapsed wall time — letting instances expire per their window TTL
     /// even without new events (window semantics, not just event-time).
     last_activity_wall: std::time::Instant,
+    /// Push-mode input channel (R1). When `Some`, the rule consumes pushed
+    /// `Arc<Vec<Event>>` instead of pulling from the window read lock; when
+    /// `None`, the task falls back to the legacy notify + pull loop. Consumed
+    /// once by `run_rule_task`.
+    pub(super) push_rx: Option<mpsc::UnboundedReceiver<RulePush>>,
+    /// Monotonic batch sequence for pushed batches (debug event refs only).
+    pushed_seq: u64,
 }
 
 impl RuleTask {
@@ -130,6 +137,7 @@ impl RuleTask {
             metrics,
             intermediate_targets,
             eos_flush,
+            push_rx,
         } = config;
         let aliases: HashMap<String, Vec<String>> = window_sources
             .iter()
@@ -184,6 +192,8 @@ impl RuleTask {
             intermediate_targets,
             eos_flush,
             last_activity_wall: std::time::Instant::now(),
+            push_rx,
+            pushed_seq: 0,
         };
         (task, cancel, timeout_scan_interval)
     }
@@ -204,6 +214,10 @@ impl RuleTask {
     /// Read new batches from all windows, convert to events, and advance
     /// the state machine.
     pub(super) async fn pull_and_advance(&mut self) {
+        // Collect new events per window first (this phase only takes disjoint
+        // field borrows), then process each batch — which needs `&mut self` and
+        // would otherwise conflict with the `&self.sources` iteration.
+        let mut pending: Vec<(String, u64, Vec<Arc<Vec<Event>>>)> = Vec::new();
         for source in &self.sources {
             let cursor = self.cursors.get(&source.window_name).copied().unwrap_or(0);
             let (events_list, new_cursor, gap) = {
@@ -238,51 +252,71 @@ impl RuleTask {
             }
             self.cursors.insert(source.window_name.clone(), new_cursor);
 
-            let Some(aliases) = self.aliases.get(&source.window_name) else {
-                continue;
-            };
-            let Some(ordered_aliases) = self.ordered_aliases.get(&source.window_name) else {
-                continue;
-            };
-
             let first_batch_seq = new_cursor.saturating_sub(events_list.len() as u64);
+            pending.push((source.window_name.clone(), first_batch_seq, events_list));
+        }
+
+        for (window_name, first_batch_seq, events_list) in pending {
             for (batch_index, events) in events_list.iter().enumerate() {
                 let batch_seq = first_batch_seq + batch_index as u64;
-                let mut stats = RuleBatchDebugStats {
-                    input_events: events.len(),
-                    ..RuleBatchDebugStats::default()
-                };
-                let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
-                let rule_name = debug_enabled.then(|| self.rule_name().to_string());
-                let rule_name_for_log = rule_name.as_deref().unwrap_or("");
-                let aliases_for_log = if debug_enabled {
-                    Some(aliases.join(","))
-                } else {
-                    None
-                };
-                if debug_enabled {
-                    let instances_before = self.instance_count();
-                    wf_debug!(pipe,
-                        rule = %rule_name_for_log,
-                        stage = 0,
-                        window = %source.window_name,
-                        batch_seq = batch_seq,
-                        rows = events.len(),
-                        aliases = %aliases_for_log.as_deref().unwrap_or(""),
-                        instances_before = instances_before,
-                        "rule batch started"
-                    );
-                }
-                if let Some(metrics) = &self.metrics {
-                    metrics.add_rule_events(self.executor.plan().name.as_str(), events.len());
-                }
-                // Track the last wall-clock moment events were processed, so the
-                // periodic timeout scan can advance the watermark across idle gaps.
-                if !events.is_empty() {
-                    self.last_activity_wall = std::time::Instant::now();
-                }
-                let lookup = RegistryLookup(&self.router);
-                for (row_index, event) in events.iter().enumerate() {
+                self.process_batch(&window_name, batch_seq, events).await;
+            }
+        }
+        self.update_rule_instances_metric();
+    }
+
+    /// Process a single parsed batch (shared `Arc`) against the state machine.
+    ///
+    /// This is the per-batch body shared by the legacy pull path
+    /// ([`Self::pull_and_advance`]) and the push path (channel recv). `batch_seq`
+    /// is used only for debug event references.
+    pub(super) async fn process_batch(
+        &mut self,
+        window_name: &str,
+        batch_seq: u64,
+        events: &Arc<Vec<Event>>,
+    ) {
+        let Some(aliases) = self.aliases.get(window_name) else {
+            return;
+        };
+        let Some(ordered_aliases) = self.ordered_aliases.get(window_name) else {
+            return;
+        };
+        let mut stats = RuleBatchDebugStats {
+            input_events: events.len(),
+            ..RuleBatchDebugStats::default()
+        };
+        let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        let rule_name = debug_enabled.then(|| self.rule_name().to_string());
+        let rule_name_for_log = rule_name.as_deref().unwrap_or("");
+        let aliases_for_log = if debug_enabled {
+            Some(aliases.join(","))
+        } else {
+            None
+        };
+        if debug_enabled {
+            let instances_before = self.instance_count();
+            wf_debug!(pipe,
+                rule = %rule_name_for_log,
+                stage = 0,
+                window = %window_name,
+                batch_seq = batch_seq,
+                rows = events.len(),
+                aliases = %aliases_for_log.as_deref().unwrap_or(""),
+                instances_before = instances_before,
+                "rule batch started"
+            );
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.add_rule_events(self.executor.plan().name.as_str(), events.len());
+        }
+        // Track the last wall-clock moment events were processed, so the
+        // periodic timeout scan can advance the watermark across idle gaps.
+        if !events.is_empty() {
+            self.last_activity_wall = std::time::Instant::now();
+        }
+        let lookup = RegistryLookup(&self.router);
+        for (row_index, event) in events.iter().enumerate() {
                     if let Some(machine) = &mut self.machine {
                         let event_nanos = machine.event_time_nanos(event);
                         let closes =
@@ -301,7 +335,7 @@ impl RuleTask {
                                     wf_debug!(pipe,
                                         rule = %rule_name_for_log,
                                         stage = 0,
-                                        window = %source.window_name,
+                                        window = %window_name,
                                         alias = %alias,
                                         event_ref = %event_ref,
                                         reason = "bind_filter_false",
@@ -346,7 +380,7 @@ impl RuleTask {
                                             wf_debug!(pipe,
                                                 rule = %rule_name_for_log,
                                                 stage = 0,
-                                                window = %source.window_name,
+                                                window = %window_name,
                                                 alias = %alias,
                                                 event_ref = %event_ref,
                                                 scope_key = %debug_scope_key(&progress.scope_key),
@@ -365,7 +399,7 @@ impl RuleTask {
                                             wf_debug!(pipe,
                                                 rule = %rule_name_for_log,
                                                 stage = 0,
-                                                window = %source.window_name,
+                                                window = %window_name,
                                                 alias = %alias,
                                                 event_ref = %event_ref,
                                                 instances = instances,
@@ -386,7 +420,7 @@ impl RuleTask {
                                             wf_debug!(pipe,
                                                 rule = %rule_name_for_log,
                                                 stage = 0,
-                                                window = %source.window_name,
+                                                window = %window_name,
                                                 alias = %alias,
                                                 event_ref = %event_ref,
                                                 scope_key = %debug_scope_key(&progress.scope_key),
@@ -405,7 +439,7 @@ impl RuleTask {
                                             wf_debug!(pipe,
                                                 rule = %rule_name_for_log,
                                                 stage = 0,
-                                                window = %source.window_name,
+                                                window = %window_name,
                                                 alias = %alias,
                                                 event_ref = %event_ref,
                                                 instances = instances,
@@ -425,7 +459,7 @@ impl RuleTask {
                                         wf_debug!(pipe,
                                             rule = %rule_name_for_log,
                                             stage = 0,
-                                            window = %source.window_name,
+                                            window = %window_name,
                                             alias = %alias,
                                             event_ref = %event_ref,
                                             scope_key = %debug_scope_key(&ctx.scope_key),
@@ -603,7 +637,7 @@ impl RuleTask {
                                 wf_debug!(pipe,
                                     rule = %rule_name_for_log,
                                     stage = 0,
-                                    window = %source.window_name,
+                                    window = %window_name,
                                     alias = %alias,
                                     event_ref = %event_ref,
                                     reason = "bind_filter_false",
@@ -618,7 +652,7 @@ impl RuleTask {
                     wf_debug!(pipe,
                         rule = %rule_name_for_log,
                         stage = 0,
-                        window = %source.window_name,
+                        window = %window_name,
                         batch_seq = batch_seq,
                         input = stats.input_events,
                         alias_passed = stats.alias_passed,
@@ -639,7 +673,7 @@ impl RuleTask {
                         wf_debug!(pipe,
                             rule = %rule_name_for_log,
                             stage = 0,
-                            window = %source.window_name,
+                            window = %window_name,
                             batch_seq = batch_seq,
                             detail_logged = stats.detail_logged,
                             detail_suppressed = stats.detail_suppressed,
@@ -647,8 +681,10 @@ impl RuleTask {
                         );
                     }
                 }
-            }
-        }
+    }
+
+    /// Update the periodic per-rule instance-count metric.
+    fn update_rule_instances_metric(&self) {
         if let Some(metrics) = &self.metrics {
             let rule_name = self.executor.plan().name.as_str();
             let instances = self
@@ -658,6 +694,26 @@ impl RuleTask {
                 .unwrap_or(0);
             metrics.set_rule_instances(rule_name, instances);
         }
+    }
+
+    /// Process a single pushed batch, advancing the per-task push sequence.
+    pub(super) async fn process_push(&mut self, push: RulePush) {
+        let seq = self.pushed_seq;
+        self.pushed_seq += 1;
+        self.process_batch(push.window_name.as_ref(), seq, &push.events)
+            .await;
+    }
+
+    /// Consume and process all currently-buffered pushed batches.
+    ///
+    /// Used by the push loop to drain the channel before a flush (EOS/cancel).
+    /// After the source reports EOS no further pushes arrive, so draining via
+    /// `try_recv` until empty is complete.
+    pub(super) async fn drain_push_channel(&mut self, rx: &mut mpsc::UnboundedReceiver<RulePush>) {
+        while let Ok(push) = rx.try_recv() {
+            self.process_push(push).await;
+        }
+        self.update_rule_instances_metric();
     }
 
     // -- Timeout & shutdown -------------------------------------------------

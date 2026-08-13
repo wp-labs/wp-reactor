@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use wf_engine::alert::OutputRecord;
 use wf_engine::match_engine::{CepStateMachine, RuleExecutor};
-use wf_engine::window::{Router, Window};
+use wf_engine::window::{Router, RulePush, Window};
 
 use crate::metrics::RuntimeMetrics;
 
@@ -48,4 +48,8 @@ pub(crate) struct RuleTaskConfig {
     /// (counter change) but keeps running so a daemon can accept multiple
     /// finite inputs.
     pub eos_flush: watch::Receiver<u64>,
+    /// Push-mode input channel. When `Some`, the rule task consumes pushed
+    /// `Arc<Vec<Event>>` from it instead of pulling from the window read lock
+    /// (R1). When `None`, the task falls back to the legacy notify + pull loop.
+    pub push_rx: Option<mpsc::UnboundedReceiver<RulePush>>,
 }

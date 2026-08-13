@@ -10,11 +10,15 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::task::Poll;
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc, watch};
+use tokio_util::sync::CancellationToken;
+use wf_engine::window::RulePush;
 
 pub(crate) use task_types::{RuleTaskConfig, WindowSource};
 
 use crate::error::RuntimeResult;
+
+use rule_task::RuleTask;
 
 static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -24,17 +28,84 @@ static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Run a single rule task until cancelled.
 ///
-/// Wakes on window notifications, reads new batches via cursor-based
-/// `read_since()`, converts them to events, and advances the state machine.
+/// Two data paths are supported, selected by whether the config carries a push
+/// channel (`RuleTaskConfig::push_rx`):
 ///
-/// Uses `Notified::enable()` to register waiters before reading data,
-/// ensuring no notifications are lost between data checks and waits.
+/// * **push** (R1, `Some`): the rule consumes `Arc<Vec<Event>>` from its channel
+///   and advances the state machine — no window read lock on the data path.
+/// * **pull** (legacy, `None`): wakes on window notifications and reads new
+///   batches via cursor-based `events_since()`.
+///
+/// Both paths keep the periodic timeout scan, EOS flush, and shutdown flush.
 pub(crate) async fn run_rule_task(config: RuleTaskConfig) -> RuntimeResult<()> {
     let (mut task, cancel, timeout_scan_interval) = rule_task::RuleTask::new(config);
     let task_id = task.task_id.clone();
     let mut timeout_tick = tokio::time::interval(timeout_scan_interval);
     let mut eos = task.eos_flush.clone();
 
+    if let Some(rx) = task.push_rx.take() {
+        run_push_loop(&mut task, rx, cancel, &mut eos, &mut timeout_tick, &task_id).await
+    } else {
+        run_pull_loop(&mut task, cancel, &mut eos, &mut timeout_tick, &task_id).await
+    }
+}
+
+/// Push data path: consume `Arc<Vec<Event>>` from the rule's channel.
+async fn run_push_loop(
+    task: &mut RuleTask,
+    mut rx: mpsc::UnboundedReceiver<RulePush>,
+    cancel: CancellationToken,
+    eos: &mut watch::Receiver<u64>,
+    timeout_tick: &mut tokio::time::Interval,
+    task_id: &str,
+) -> RuntimeResult<()> {
+    loop {
+        tokio::select! {
+            biased;
+            push = rx.recv() => {
+                match push {
+                    Some(push) => task.process_push(push).await,
+                    // All producers dropped (channel closed): drain + flush.
+                    None => {
+                        task.drain_push_channel(&mut rx).await;
+                        task.flush().await;
+                        break;
+                    }
+                }
+            }
+            _ = cancel.cancelled() => {
+                task.drain_push_channel(&mut rx).await;
+                task.flush().await;
+                wf_debug!(pipe, task_id = %task_id, "rule task shutdown complete");
+                break;
+            }
+            // End-of-stream: input sources reported the stream ended. Flush the
+            // trailing instances but keep running so a daemon can accept a
+            // subsequent finite input.
+            _ = eos.changed() => {
+                if *eos.borrow() > 0 {
+                    task.drain_push_channel(&mut rx).await;
+                    task.flush().await;
+                    wf_debug!(pipe, task_id = %task_id, "rule task EOS flush complete");
+                }
+            }
+            _ = timeout_tick.tick() => task.scan_timeouts().await,
+        }
+    }
+    Ok(())
+}
+
+/// Legacy pull data path: notify + cursor-based `events_since()`.
+///
+/// Uses `Notified::enable()` to register waiters before reading data,
+/// ensuring no notifications are lost between data checks and waits.
+async fn run_pull_loop(
+    task: &mut RuleTask,
+    cancel: CancellationToken,
+    eos: &mut watch::Receiver<u64>,
+    timeout_tick: &mut tokio::time::Interval,
+    task_id: &str,
+) -> RuntimeResult<()> {
     // Clone Arc<Notify> handles outside the struct so that notification
     // registration borrows `notifiers` (not `task`), allowing `&mut task`
     // for processing in the same loop iteration.
