@@ -27,12 +27,17 @@ use arrow::datatypes::SchemaRef;
 ///   against this pipe's data with a time window).
 ///
 /// The schema is used to crop / type the output row (the role the output
-/// "window" previously served).
+/// "window" previously served); `time_col_index` is the position of the time
+/// field in `schema`, so the relay can place the event time on the right column.
 #[derive(Debug, Clone)]
 pub struct Pipe {
     pub name: String,
     pub schema: SchemaRef,
     pub over: Duration,
+    /// Position of the time field in `schema` (from the target window's
+    /// `time_field`), so the pipeline relay can place event time on the right
+    /// column even for user-named intermediates (not just `__wf_pipe_*`).
+    pub time_col_index: Option<usize>,
 }
 
 /// Registry of pipes by name. Built at bootstrap from the compiled yield
@@ -91,6 +96,7 @@ mod tests {
             name: "alerts".into(),
             schema: schema(),
             over: Duration::ZERO,
+            time_col_index: None,
         });
         assert!(reg.contains("alerts"));
         let pipe = reg.get("alerts").expect("pipe present");
@@ -105,11 +111,13 @@ mod tests {
             name: "a".into(),
             schema: schema(),
             over: Duration::ZERO,
+            time_col_index: None,
         });
         reg.register(Pipe {
             name: "b".into(),
             schema: schema(),
             over: Duration::from_secs(60),
+            time_col_index: None,
         });
         let mut names: Vec<_> = reg.iter().into_iter().map(|p| p.name).collect();
         names.sort();

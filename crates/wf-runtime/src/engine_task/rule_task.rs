@@ -1077,15 +1077,14 @@ impl RuleTask {
         // registry's schema (decouples the relay from the window); fall back to
         // the window for legacy/tests where the pipe isn't registered.
         let (schema, time_col_index) = match self.pipe_registry.get(&record.yield_target) {
-            Some(pipe) => {
-                let time_col_index = pipe
-                    .schema
-                    .fields()
-                    .iter()
-                    .position(|f| f.name() == PIPE_EVENT_TIME_FIELD);
-                (pipe.schema, time_col_index)
+            // Pipe registered with a real schema (normal boot) → use it.
+            Some(pipe) if !pipe.schema.fields().is_empty() => {
+                (pipe.schema, pipe.time_col_index)
             }
-            None => {
+            // Pipe absent or built without schemas (e.g. the reload path builds
+            // the registry with no window schemas) → fall back to the window,
+            // which is always populated with the correct schema + time column.
+            _ => {
                 let Some(win_lock) = self.router.registry().get_window(&record.yield_target) else {
                     wf_warn!(
                         pipe,

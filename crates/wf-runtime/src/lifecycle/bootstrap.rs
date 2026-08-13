@@ -185,7 +185,7 @@ pub(crate) fn build_pipe_registry(
         if registry.contains(target) {
             continue;
         }
-        let (schema, over) = runtime_schemas
+        let (schema, over, time_col_index) = runtime_schemas
             .iter()
             .find(|ws| ws.name == *target)
             .map(|ws| {
@@ -194,13 +194,22 @@ pub(crate) fn build_pipe_registry(
                     .iter()
                     .map(|f| field_to_arrow(&f.name, &f.field_type))
                     .collect();
-                (Arc::new(Schema::new(fields)) as SchemaRef, ws.over)
+                let time_col_index = ws
+                    .time_field
+                    .as_ref()
+                    .and_then(|tf| fields.iter().position(|f| f.name() == tf));
+                (
+                    Arc::new(Schema::new(fields)) as SchemaRef,
+                    ws.over,
+                    time_col_index,
+                )
             })
-            .unwrap_or_else(|| (Arc::new(Schema::empty()), std::time::Duration::ZERO));
+            .unwrap_or_else(|| (Arc::new(Schema::empty()), std::time::Duration::ZERO, None));
         registry.register(Pipe {
             name: target.clone(),
             schema,
             over,
+            time_col_index,
         });
     }
     Arc::new(registry)
@@ -538,7 +547,7 @@ mod tests {
         wf_lang::WindowSchema {
             name: name.into(),
             streams: vec![],
-            time_field: None,
+            time_field: Some(field.into()),
             over,
             fields: vec![wf_lang::FieldDef {
                 name: field.into(),
@@ -567,6 +576,8 @@ mod tests {
         let pipe_x = reg.get("__wf_pipe_x").expect("pipeline pipe");
         assert_eq!(pipe_x.over, Duration::from_secs(60));
         assert_eq!(pipe_x.schema.fields()[0].name(), "ev_count");
+        // time_field → time_col_index points at it (user-named intermediates too).
+        assert_eq!(pipe_x.time_col_index, Some(0));
     }
 
     #[test]
