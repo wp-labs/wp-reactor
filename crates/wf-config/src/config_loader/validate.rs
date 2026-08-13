@@ -315,6 +315,7 @@ mod tests {
             mode,
             runtime: crate::config_loader::runtime::RuntimeConfig {
                 executor_parallelism: 2,
+                rule_shards: 1,
                 rule_exec_timeout: "30s".parse().unwrap(),
                 schemas: "schemas/*.wfs".into(),
                 rules: "rules/*.wfl".into(),

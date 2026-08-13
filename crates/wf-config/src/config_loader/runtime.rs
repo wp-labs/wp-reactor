@@ -9,14 +9,23 @@ use crate::types::HumanDuration;
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[moju(kind = "struct", domain = "Config", module = "Config.ConfigLoader")]
 pub struct RuntimeConfig {
-    /// Rule execution parallelism (Semaphore upper limit).
+    /// Parse worker pool parallelism (R2).
     pub executor_parallelism: usize,
+    /// Number of shard workers per shardable rule (P2a). `1` = single worker
+    /// (no sharding); `>1` partitions each rule's match key across this many
+    /// shard workers. Defaults to `1`.
+    #[serde(default = "default_rule_shards")]
+    pub rule_shards: usize,
     /// Single rule execution timeout.
     pub rule_exec_timeout: HumanDuration,
     /// Glob pattern for Window Schema (.wfs) files, relative to config dir.
     pub schemas: String,
     /// Glob pattern for WFL rule (.wfl) files, relative to config dir.
     pub rules: String,
+}
+
+fn default_rule_shards() -> usize {
+    1
 }
 
 /// Expand a glob `pattern` relative to `base_dir` and return matched paths
