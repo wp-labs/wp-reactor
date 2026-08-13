@@ -1,9 +1,19 @@
 # 规则分片 + 管道（Pipe）/ 变换算子 设计
 
-> 状态：Design（草案，待评审）
+> 状态：Design（草案）；**Pipe 落地进展：P1a/P1b/P1c 已实施**（见「Pipe 落地」一节）
 >
 > 2026-08-13 · 关联 [window-push-model-design.md](window-push-model-design.md)（push 架构）、
 > [window-push-implementation-plan.md](window-push-implementation-plan.md)（实施计划，P2 规则分片）
+
+## Pipe 落地（2026-08-13）
+
+- **P1a**：`wf-engine/src/pipe/` — `Pipe`（name/schema/over）+ `PipeRegistry`。
+- **P1b**：bootstrap 从 yield 拓扑构建 PipeRegistry，接线进 rule task；emit 的中间 schema
+  优先取 pipe registry。
+- **P1c**：**中间 Pipe 纯 relay**——`emit_window_record` 不再 `append_intermediate`（不存窗口），
+  直接 `fanout().broadcast(events)` 给下游规则；下游规则的 match 时间窗由自己的
+  `CepStateMachine` 承担（水位来自事件时间戳）。测试已从 pull 迁移到 push。
+- **待办**：输出/中间窗口从 WindowRegistry 移除（需下游规则 WindowSource 改指 pipe）；变换算子。
 
 ---
 
@@ -14,8 +24,14 @@
 | **源数据流** | stream（保留） | 输入侧，`stream_tag` → window |
 | **管道** | Pipe | 规则 `yield` 目标 → 订阅者，`\|>` 即管道 |
 | **管道订阅者** | 规则 / sink / 变换算子 | 挂在同一 `PipeFanout` 上 |
-| 管道属性 | `over` | `>0` 保留（供 match 时间窗），`=0` 纯透传 |
+| 管道属性 | `over` | 见下「over 语义修正」——push 模型下 Pipe 是纯透传 relay，下游 match 由下游规则自己的 `CepStateMachine` 承担 |
 | **变换算子** | Transform Operator | 轻量订阅者，攒批 + conv + emit |
+
+> **over 语义修正（2026-08-13）**：原「`over>0` 保留（供 match 时间窗）」在 push 模型下**不成立**。
+> 下游规则 `|>` 的 match 时间窗靠自己的 `CepStateMachine`（per-key 实例 + 机器水位来自事件
+> 时间戳），**push 模式不读中间窗口 buffer**。中间窗口的 `over`（=下游 match 时长）只服务
+> legacy pull / join——push 下冗余。**Pipe = 纯透传 relay**（无 buffer/watermark/eviction）。
+> 唯一例外：若下游规则 join/has() 中间 Pipe 才需保留（`|>` 链当前不 join，可编译期拒绝）。
 
 > 之前「输出流 / 聚合流」两个概念合并为**一个「管道」**：conv（聚合）是挂在管道
 > 上游的一个**变换算子**预处理，不是第二条流。
