@@ -13,7 +13,7 @@ pub use arrow::{replay_arrow_framed_file, replay_arrow_ipc_file};
 pub use csv::replay_csv_file;
 pub(crate) use miss::{WindowMiss, WindowMissReason, record_batch_window_miss, report_window_miss};
 pub use ndjson::{normalize_stream_tag_field, replay_ndjson_file};
-pub(crate) use route::route_batch;
+pub(crate) use route::{batch_machine_id, prepare_batch};
 pub(crate) use schema::{maybe_resolve_stream_schema, resolve_stream_schema};
 
 pub const DEFAULT_STREAM_TAG_FIELD: &str = "wp_oml_name";

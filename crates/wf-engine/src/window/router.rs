@@ -4,7 +4,7 @@ use arrow::record_batch::RecordBatch;
 use wf_config::DistMode;
 
 use crate::error::CoreResult;
-use crate::match_engine::{batch_to_events, batch_to_events_filtered};
+use crate::match_engine::{Event, batch_to_events, batch_to_events_filtered};
 
 use super::buffer::AppendOutcome;
 use super::fanout::RuleFanout;
@@ -31,6 +31,22 @@ pub struct RouteReport {
     pub dropped_late: usize,
     pub skipped_non_local: usize,
     pub per_window: Vec<WindowRouteOutcome>,
+}
+
+/// Parsed events for one local window, produced by the parallel parse stage.
+#[derive(Clone)]
+pub struct ParsedWindow {
+    pub window_name: String,
+    pub events: Arc<Vec<Event>>,
+}
+
+/// Parsed events for every local window of a stream.
+///
+/// Produced by [`Router::route_parse`] (the parallelizable half of routing) and
+/// consumed by [`Router::route_commit`] (the ordered, watermark-aware half).
+pub struct ParsedRoute {
+    pub windows: Vec<ParsedWindow>,
+    pub skipped_non_local: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -67,20 +83,28 @@ impl Router {
     }
 
     /// Route a batch to all windows subscribed to `stream_name`.
+    ///
+    /// Equivalent to [`Self::route_parse`] followed by [`Self::route_commit`];
+    /// kept for callers that parse + commit in one place (file sources, tests,
+    /// and the R2 rollback path).
     pub fn route(&self, stream_name: &str, batch: RecordBatch) -> CoreResult<RouteReport> {
-        let rows = batch.num_rows();
-        let mut report = RouteReport {
-            delivered: 0,
-            dropped_late: 0,
-            skipped_non_local: 0,
-            per_window: Vec::new(),
-        };
+        let parsed = self.route_parse(stream_name, &batch);
+        self.route_commit(batch, parsed)
+    }
 
-        let subs = self.registry.subscribers_of(stream_name);
+    /// Parse a batch into per-window events without mutating any window.
+    ///
+    /// This is the parallelizable half of routing: it only reads window metadata
+    /// (the materialize-fields whitelist) and parses the Arrow batch once per
+    /// local window. The result is passed to [`Self::route_commit`], which does
+    /// the ordered, watermark-aware append + broadcast.
+    pub fn route_parse(&self, stream_name: &str, batch: &RecordBatch) -> ParsedRoute {
+        let mut windows = Vec::new();
+        let mut skipped_non_local = 0;
 
-        for (window_name, mode) in subs {
+        for (window_name, mode) in self.registry.subscribers_of(stream_name) {
             if !matches!(mode, DistMode::Local) {
-                report.skipped_non_local += 1;
+                skipped_non_local += 1;
                 continue;
             }
 
@@ -91,41 +115,77 @@ impl Router {
             // Parse the batch to events *outside* the window lock. The read lock
             // is held only for an O(1) Arc clone of the materialize-fields set
             // (it never changes after construction); parsing itself happens with
-            // no window lock held. Rule tasks reading this batch later hit the
-            // already-set OnceLock with zero contention.
+            // no window lock held.
             let materialize = {
                 let win = win_lock.read().expect("window lock poisoned");
                 win.materialize_fields.clone()
             };
-            let parsed = Arc::new(match materialize.as_deref() {
-                Some(fields) => batch_to_events_filtered(&batch, fields),
-                None => batch_to_events(&batch),
+            let events = Arc::new(match materialize.as_deref() {
+                Some(fields) => batch_to_events_filtered(batch, fields),
+                None => batch_to_events(batch),
             });
+            windows.push(ParsedWindow {
+                window_name,
+                events,
+            });
+        }
+
+        ParsedRoute {
+            windows,
+            skipped_non_local,
+        }
+    }
+
+    /// Append a pre-parsed batch to its windows (watermark-aware) and broadcast
+    /// to rule channels, in the order given.
+    ///
+    /// This is the ordered half of routing; the parse workers run it via a
+    /// single commit worker that re-sequences batches, so watermark advancement
+    /// and rule delivery stay in source order even though parsing is parallel.
+    pub fn route_commit(
+        &self,
+        batch: RecordBatch,
+        parsed: ParsedRoute,
+    ) -> CoreResult<RouteReport> {
+        let rows = batch.num_rows();
+        let mut report = RouteReport {
+            delivered: 0,
+            dropped_late: 0,
+            skipped_non_local: parsed.skipped_non_local,
+            per_window: Vec::new(),
+        };
+
+        for window in parsed.windows {
+            let win_lock = self
+                .registry
+                .get_window(&window.window_name)
+                .expect("subscription references non-existent window");
             let outcome = {
                 let mut win = win_lock.write().expect("window lock poisoned");
-                win.append_with_watermark_parsed(batch.clone(), Arc::clone(&parsed))?
+                win.append_with_watermark_parsed(batch.clone(), Arc::clone(&window.events))?
             };
 
             match outcome {
                 AppendOutcome::Appended => {
                     report.delivered += 1;
                     report.per_window.push(WindowRouteOutcome {
-                        window_name: window_name.to_string(),
+                        window_name: window.window_name.clone(),
                         rows,
                         late: false,
                     });
                     // Push the shared parsed Arc to every rule subscribed to
                     // this window (R1 bridge: rules consume via channel instead
                     // of `window.read()`).
-                    self.rule_fanout.broadcast(&window_name, &parsed);
-                    if let Some(notify) = self.registry.get_notifier(&window_name) {
+                    self.rule_fanout
+                        .broadcast(&window.window_name, &window.events);
+                    if let Some(notify) = self.registry.get_notifier(&window.window_name) {
                         notify.notify_waiters();
                     }
                 }
                 AppendOutcome::DroppedLate => {
                     report.dropped_late += 1;
                     report.per_window.push(WindowRouteOutcome {
-                        window_name: window_name.to_string(),
+                        window_name: window.window_name.clone(),
                         rows,
                         late: true,
                     });

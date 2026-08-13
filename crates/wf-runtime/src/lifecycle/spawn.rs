@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use orion_error::conversion::{SourceErr, ToStructError};
@@ -26,6 +27,7 @@ use wf_connector_api::BatchSource;
 use wp_core_connectors::sources::batch::arrow::WireFormat;
 use wp_model_core::model::{DataRecord, DataType, Field, FieldStorage, Value};
 
+use super::parse_pool::{ParseItem, spawn_parse_pool};
 use super::types::{RunRule, RunRuleKind, TaskGroup};
 
 // ---------------------------------------------------------------------------
@@ -176,6 +178,18 @@ pub(super) async fn spawn_receiver_task(
     let schema_catalog = Arc::new(schemas.to_vec());
     register_builtin_external_sources();
 
+    // R2: parse worker pool — external sources push decoded batches here, N
+    // parallel parse workers run `route_parse`, and one commit worker runs
+    // `route_commit` in source order. Shared seq counter keeps batches ordered
+    // across all source connections.
+    let parse_tx = spawn_parse_pool(
+        &router,
+        metrics.clone(),
+        config.runtime.executor_parallelism,
+        &mut group,
+    );
+    let parse_seq = Arc::new(AtomicU64::new(0));
+
     for (source_idx, source) in config.sources.iter().enumerate() {
         if !source.enabled {
             continue;
@@ -283,6 +297,8 @@ pub(super) async fn spawn_receiver_task(
                     metrics.clone(),
                     cancel.child_token(),
                     &mut group,
+                    parse_tx.clone(),
+                    Arc::clone(&parse_seq),
                 )
                 .await?;
             }
@@ -354,6 +370,8 @@ async fn spawn_external_source_tasks(
     metrics: Option<Arc<RuntimeMetrics>>,
     cancel: CancellationToken,
     group: &mut TaskGroup,
+    parse_tx: tokio::sync::mpsc::Sender<ParseItem>,
+    parse_seq: Arc<AtomicU64>,
 ) -> RuntimeResult<usize> {
     let Some(factory) = wp_core_connectors::registry::get_source_factory(source_kind) else {
         return RuntimeReason::Bootstrap
@@ -437,6 +455,8 @@ async fn spawn_external_source_tasks(
         let source_kind = source_kind.to_string();
         let schema = Arc::clone(&schema);
         let schemas = Arc::clone(schemas);
+        let parse_tx = parse_tx.clone();
+        let parse_seq = Arc::clone(&parse_seq);
         group.push(tokio::spawn(async move {
             // Start the source if needed (e.g. TCP source checks started flag).
             let (_ctrl_tx, ctrl_rx) = async_broadcast::broadcast(1);
@@ -455,7 +475,7 @@ async fn spawn_external_source_tasks(
             );
 
             let mut consecutive_errors: u32 = 0;
-            loop {
+            'outer: loop {
                 tokio::select! {
                     result = batch_source.receive_batch() => match result {
                         Ok(batches) => {
@@ -503,23 +523,31 @@ async fn spawn_external_source_tasks(
                                     );
                                     continue;
                                 }
-                                if let Err(e) = crate::receiver::route_batch(
-                                    &route_stream,
-                                    &source_name,
-                                    rb,
-                                    router.as_ref(),
-                                    metrics.as_ref(),
-                                ) {
-                                    if let Some(metrics) = &metrics {
-                                        metrics.inc_route_error(&source_name);
-                                    }
-                                    wf_warn!(
-                                        conn,
-                                        kind = %source_kind,
-                                        stream = %stream_name,
-                                        error = %e,
-                                        "external source route error"
+                                // Receiver metrics (counts a decoded frame), then
+                                // project + hand off to the parse worker pool.
+                                // The source no longer parses (batch_to_events);
+                                // it only decodes, projects, and pushes.
+                                if let Some(metrics) = &metrics {
+                                    metrics.add_receiver_frame(rb.num_rows());
+                                    metrics.add_receiver_source_frame(&source_name, rb.num_rows());
+                                    let machine_id = crate::receiver::batch_machine_id(&rb)
+                                        .unwrap_or_else(|| source_name.clone());
+                                    metrics.add_receiver_source_machine_rows(
+                                        &source_name,
+                                        &machine_id,
+                                        rb.num_rows(),
                                     );
+                                }
+                                let projected =
+                                    crate::receiver::prepare_batch(&route_stream, &rb, router.as_ref());
+                                let item = ParseItem {
+                                    seq: parse_seq.fetch_add(1, Ordering::Relaxed),
+                                    stream_name: route_stream,
+                                    batch: projected,
+                                };
+                                if parse_tx.send(item).await.is_err() {
+                                    // Parse pool shut down.
+                                    break 'outer;
                                 }
                             }
                         }

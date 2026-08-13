@@ -33,11 +33,7 @@ pub(crate) fn route_batch(
         rows = batch.num_rows(),
         "frame decoded"
     );
-    let route_input = if needs_projection_for_stream(stream_name, &batch, router) {
-        project_batch_for_stream(stream_name, &batch, router)
-    } else {
-        batch.clone()
-    };
+    let route_input = prepare_batch(stream_name, &batch, router);
 
     // Try routing directly; if schema mismatch, attempt projection
     let report = match router.route(stream_name, route_input) {
@@ -71,6 +67,21 @@ pub(crate) fn batch_machine_id(batch: &RecordBatch) -> Option<String> {
         return None;
     }
     Some(arr.value(0).to_string())
+}
+
+/// Prepare a batch for routing: coerce columns to the target window schema when
+/// the stream carries structured fields that need projection (otherwise a cheap
+/// clone). Shared by the direct `route_batch` path and the R2 parse pool.
+pub(crate) fn prepare_batch(
+    stream_name: &str,
+    batch: &RecordBatch,
+    router: &Router,
+) -> RecordBatch {
+    if needs_projection_for_stream(stream_name, batch, router) {
+        project_batch_for_stream(stream_name, batch, router)
+    } else {
+        batch.clone()
+    }
 }
 
 /// Project a RecordBatch to match the first window's schema for the given stream.
