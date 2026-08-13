@@ -252,22 +252,32 @@ pub(super) fn collect_alias_event(
     if let Some(fields) = tracked_fields {
         for field_name in fields {
             if let Some(value) = event.fields.get(field_name.as_str()) {
-                let values = alias_state
-                    .field_values_mut()
-                    .entry(field_name.clone())
-                    .or_default();
+                let values = field_values_for(alias_state, field_name.as_str());
                 push_capped(values, value.clone());
             }
         }
     } else {
         for (field_name, value) in &event.fields {
-            let values = alias_state
-                .field_values_mut()
-                .entry(field_name.to_string())
-                .or_default();
+            let values = field_values_for(alias_state, field_name.as_str());
             push_capped(values, value.clone());
         }
     }
+}
+
+/// `&mut Vec<Value>` for `field_name`, creating the map entry only on first
+/// use. Previously every event cloned the field-name `String` just to do the
+/// lookup (`entry(field_name.clone())`) — the dominant per-event allocation on
+/// count-only rules, which re-collect the same fields every event. Now the
+/// common path (key already present) is a lookup + `get_mut`, no allocation.
+fn field_values_for<'a>(
+    alias_state: &'a mut AliasState,
+    field_name: &str,
+) -> &'a mut Vec<Value> {
+    let fvm = alias_state.field_values_mut();
+    if !fvm.contains_key(field_name) {
+        fvm.insert(field_name.to_string(), Vec::new());
+    }
+    fvm.get_mut(field_name).expect("just inserted")
 }
 
 // ---------------------------------------------------------------------------
