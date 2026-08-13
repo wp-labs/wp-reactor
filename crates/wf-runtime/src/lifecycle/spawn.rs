@@ -47,9 +47,9 @@ pub(super) fn spawn_alert_task(
     let mut by_sink = HashMap::new();
 
     // Error sinks first: their senders feed the escalation list.
-    let mut error_txs: Vec<mpsc::Sender<Arc<DataRecord>>> = Vec::new();
+    let mut error_txs: Vec<mpsc::Sender<alert_task::AlertBatch>> = Vec::new();
     for sink in dispatcher.error_sinks() {
-        let (tx, rx) = mpsc::channel(alert_task::SINK_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel::<alert_task::AlertBatch>(alert_task::SINK_CHANNEL_CAPACITY);
         error_txs.push(tx);
         let sink = Arc::clone(sink);
         let metrics = metrics.clone();
@@ -82,7 +82,7 @@ pub(super) fn spawn_alert_task(
         let writers = sink.parallel.max(1);
         let mut senders = Vec::with_capacity(writers);
         for _ in 0..writers {
-            let (tx, rx) = mpsc::channel(alert_task::SINK_CHANNEL_CAPACITY);
+            let (tx, rx) = mpsc::channel::<alert_task::AlertBatch>(alert_task::SINK_CHANNEL_CAPACITY);
             senders.push(tx);
             let sink = Arc::clone(sink);
             let error_txs = Arc::clone(&error_txs);

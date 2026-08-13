@@ -54,9 +54,25 @@ fn empty_tracked_bind_fields() -> std::collections::HashMap<String, HashSet<Stri
 
 /// A test sink fanout that resolves the `"alerts"` and `"network_alerts"` yield
 /// targets (the sink targets used across the tests) to `tx`.
-fn make_test_fanout(tx: mpsc::Sender<Arc<wp_model_core::model::DataRecord>>) -> Arc<SinkFanout> {
+
+/// Extract the first record from the next alert batch (tests deliver batches).
+fn take_alert(rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>) -> Arc<wp_model_core::model::DataRecord> {
+    let batch = rx.try_recv().expect("expected an alert batch");
+    batch.first().cloned().expect("alert batch must not be empty")
+}
+
+/// Async variant of [`take_alert`] for `recv().await` based assertions.
+async fn take_alert_recv(
+    rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>,
+) -> Arc<wp_model_core::model::DataRecord> {
+    let batch = rx.recv().await.expect("expected an alert batch");
+    batch.first().cloned().expect("alert batch must not be empty")
+}
+
+fn make_test_fanout(tx: mpsc::Sender<crate::alert_task::AlertBatch>) -> Arc<SinkFanout> {
     let mut cache = std::collections::HashMap::new();
-    // One sink (ptr=0) with a single writer channel.
+    // One sink (ptr=0) with a single writer channel (batches); the cache type is
+    // inferred from `SinkFanout::from_resolved`.
     let groups = Arc::new(vec![(0usize, Arc::new(vec![tx]))]);
     cache.insert("alerts".to_string(), Arc::clone(&groups));
     cache.insert("network_alerts".to_string(), groups);
@@ -272,7 +288,7 @@ fn make_window_def(
 /// Build a single-step count>=3 rule and return (task, alert_rx, window_arc, notify_arc).
 fn make_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -301,7 +317,7 @@ fn make_task_with_window_bytes(
     max_bytes: usize,
 ) -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -366,7 +382,7 @@ fn make_task_with_window_bytes(
     let machine = CepStateMachine::new("test_rule".into(), match_plan, Some("event_time".into()));
     let executor = RuleExecutor::new(rule_plan);
 
-    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
 
     // Empty registry for tests (no joins or has() usage).
     let registry = WindowRegistry::build(vec![]).unwrap();
@@ -400,7 +416,7 @@ fn make_task_with_window_bytes(
 
 fn make_pipeline_stage_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<Router>,
 ) {
     let src_schema = test_schema();
@@ -486,7 +502,7 @@ fn make_pipeline_stage_task() -> (
         Some("event_time".into()),
     );
     let executor = RuleExecutor::new(rule_plan);
-    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
         machine: Some(machine),
         each_alias: None,
@@ -514,7 +530,7 @@ fn make_pipeline_stage_task() -> (
 
 fn make_each_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -571,7 +587,7 @@ fn make_each_task() -> (
     };
 
     let executor = RuleExecutor::new(rule_plan);
-    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let registry = WindowRegistry::build(vec![]).unwrap();
     let router = Arc::new(Router::new(registry));
     let config = task_types::RuleTaskConfig {
@@ -601,7 +617,7 @@ fn make_each_task() -> (
 
 fn make_filtered_match_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -673,7 +689,7 @@ fn make_filtered_match_task() -> (
         Some("event_time".into()),
     );
     let executor = RuleExecutor::new(rule_plan);
-    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let registry = WindowRegistry::build(vec![]).unwrap();
     let router = Arc::new(Router::new(registry));
     let config = task_types::RuleTaskConfig {
@@ -703,7 +719,7 @@ fn make_filtered_match_task() -> (
 
 fn make_filtered_close_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -788,7 +804,7 @@ fn make_filtered_close_task() -> (
         Some("event_time".into()),
     );
     let executor = RuleExecutor::new(rule_plan);
-    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let registry = WindowRegistry::build(vec![]).unwrap();
     let router = Arc::new(Router::new(registry));
     let config = task_types::RuleTaskConfig {
@@ -818,7 +834,7 @@ fn make_filtered_close_task() -> (
 
 fn make_filtered_each_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -872,7 +888,7 @@ fn make_filtered_each_task() -> (
     };
 
     let executor = RuleExecutor::new(rule_plan);
-    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let registry = WindowRegistry::build(vec![]).unwrap();
     let router = Arc::new(Router::new(registry));
     let config = task_types::RuleTaskConfig {
@@ -902,7 +918,7 @@ fn make_filtered_each_task() -> (
 
 fn make_intermediate_each_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<Router>,
 ) {
     let src_schema = test_schema();
@@ -990,7 +1006,7 @@ fn make_intermediate_each_task() -> (
     };
 
     let executor = RuleExecutor::new(rule_plan);
-    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
         machine: None,
         each_alias: Some("e".into()),
@@ -1018,7 +1034,7 @@ fn make_intermediate_each_task() -> (
 
 fn make_intermediate_each_task_with_explicit_time() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<Router>,
 ) {
     let src_schema = test_schema();
@@ -1088,7 +1104,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
     };
 
     let executor = RuleExecutor::new(rule_plan);
-    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
         machine: None,
         each_alias: Some("e".into()),
@@ -1117,7 +1133,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
 fn make_intermediate_score_tasks() -> (
     rule_task::RuleTask,
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<Router>,
 ) {
     let src_schema = scored_source_schema();
@@ -1193,7 +1209,7 @@ fn make_intermediate_score_tasks() -> (
     };
 
     let upstream_executor = RuleExecutor::new(upstream_plan);
-    let (upstream_alert_tx, _upstream_alert_rx) = mpsc::channel(64);
+    let (upstream_alert_tx, _upstream_alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let upstream_config = task_types::RuleTaskConfig {
         machine: None,
         each_alias: Some("e".into()),
@@ -1324,7 +1340,7 @@ fn make_intermediate_score_tasks() -> (
     };
 
     let downstream_executor = RuleExecutor::new(downstream_plan);
-    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let downstream_machine = CepStateMachine::new(
         "window_risk".into(),
         downstream_match,
@@ -1359,7 +1375,7 @@ fn make_intermediate_score_tasks() -> (
 fn make_intermediate_score_band_tasks() -> (
     rule_task::RuleTask,
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<Router>,
 ) {
     let src_schema = scored_source_schema();
@@ -1435,7 +1451,7 @@ fn make_intermediate_score_band_tasks() -> (
     };
 
     let upstream_executor = RuleExecutor::new(upstream_plan);
-    let (upstream_alert_tx, _upstream_alert_rx) = mpsc::channel(64);
+    let (upstream_alert_tx, _upstream_alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let upstream_config = task_types::RuleTaskConfig {
         machine: None,
         each_alias: Some("e".into()),
@@ -1619,7 +1635,7 @@ fn make_intermediate_score_band_tasks() -> (
     };
 
     let downstream_executor = RuleExecutor::new(downstream_plan);
-    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let downstream_machine = CepStateMachine::new(
         "window_risk".into(),
         downstream_match,
@@ -1653,7 +1669,7 @@ fn make_intermediate_score_band_tasks() -> (
 
 fn make_filtered_bind_alias_match_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -1794,7 +1810,7 @@ fn make_filtered_bind_alias_match_task() -> (
         Some("event_time".into()),
     );
     let executor = RuleExecutor::new(rule_plan);
-    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
         machine: Some(machine),
         each_alias: None,
@@ -1822,7 +1838,7 @@ fn make_filtered_bind_alias_match_task() -> (
 
 fn make_window_has_match_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<Router>,
 ) {
     let schema = test_schema();
@@ -1903,7 +1919,7 @@ fn make_window_has_match_task() -> (
         Some("event_time".into()),
     );
     let executor = RuleExecutor::new(rule_plan);
-    let (alert_tx, alert_rx) = mpsc::channel(64);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
         machine: Some(machine),
         each_alias: None,
@@ -1976,7 +1992,7 @@ async fn pull_triggers_alert() {
 
     task.pull_and_advance().await;
 
-    let alert = alert_rx.try_recv().expect("should have produced an alert");
+    let alert = take_alert(&mut alert_rx);
     assert_eq!(field_str(&alert, "__wfu_rule_name"), "test_rule");
     assert_eq!(field_str(&alert, "__wfu_entity_type"), "ip");
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
@@ -2001,9 +2017,7 @@ async fn push_triggers_alert() {
     };
     task.process_push(push).await;
 
-    let alert = alert_rx
-        .try_recv()
-        .expect("push path should produce an alert");
+    let alert = take_alert(&mut alert_rx);
     assert_eq!(field_str(&alert, "__wfu_rule_name"), "test_rule");
     assert_eq!(field_str(&alert, "__wfu_entity_type"), "ip");
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
@@ -2012,11 +2026,13 @@ async fn push_triggers_alert() {
 }
 
 fn drain_alert_entity_ids(
-    rx: &mut mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
+    rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>,
 ) -> Vec<String> {
     let mut ids = Vec::new();
-    while let Ok(alert) = rx.try_recv() {
-        ids.push(field_str(&alert, "__wfu_entity_id").clone());
+    while let Ok(batch) = rx.try_recv() {
+        for record in batch.iter() {
+            ids.push(field_str(record, "__wfu_entity_id"));
+        }
     }
     ids
 }
@@ -2089,7 +2105,7 @@ async fn pull_keeps_normalized_nanos_event_time() {
 
     task.pull_and_advance().await;
 
-    let alert = alert_rx.try_recv().expect("should have produced an alert");
+    let alert = take_alert(&mut alert_rx);
     assert!(!field_str(&alert, "__wfu_fired_at").is_empty());
 }
 
@@ -2119,9 +2135,7 @@ async fn flush_emits_close_alert_for_completed_and_close_rule() {
 
     task.flush().await;
 
-    let alert = alert_rx
-        .try_recv()
-        .expect("flush should emit one close alert");
+    let alert = take_alert(&mut alert_rx);
     assert_eq!(field_str(&alert, "__wfu_rule_name"), "filtered_close");
     assert_eq!(field_str(&alert, "__wfu_entity_type"), "ip");
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
@@ -2151,9 +2165,7 @@ async fn pull_multiple_keys_isolated() {
     win.write().unwrap().append(batch2).unwrap();
     task.pull_and_advance().await;
 
-    let alert = alert_rx
-        .try_recv()
-        .expect("sip=10.0.0.1 should trigger at count=3");
+    let alert = take_alert(&mut alert_rx);
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
 
     assert!(
@@ -2436,7 +2448,7 @@ async fn downstream_close_aggregates_intermediate_float_fields() {
     }
     downstream_task.flush().await;
 
-    let alert = alert_rx.recv().await.expect("expected downstream alert");
+    let alert = take_alert_recv(&mut alert_rx).await;
     assert!((field_f64(&alert, "__wfu_score") - 20.0).abs() < f64::EPSILON);
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.8");
     assert_eq!(
@@ -2476,7 +2488,7 @@ async fn downstream_close_counts_filtered_bind_aliases() {
     }
     downstream_task.flush().await;
 
-    let alert = alert_rx.recv().await.expect("expected downstream alert");
+    let alert = take_alert_recv(&mut alert_rx).await;
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.9");
     assert_eq!(
         field_f64(&alert, "event_count"),
@@ -2511,7 +2523,7 @@ async fn match_event_path_counts_filtered_bind_aliases() {
 
     task.pull_and_advance().await;
 
-    let alert = alert_rx.try_recv().expect("expected match alert");
+    let alert = take_alert(&mut alert_rx);
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.7");
     assert_eq!(field_f64(&alert, "__wfu_score"), 1.0);
     assert_eq!(
@@ -2539,7 +2551,7 @@ async fn on_each_emits_one_alert_per_matching_row() {
 
     task.pull_and_advance().await;
 
-    let alert = alert_rx.try_recv().expect("matching row should emit alert");
+    let alert = take_alert(&mut alert_rx);
     assert_eq!(field_str(&alert, "__wfu_rule_name"), "each_rule");
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
     assert_eq!(field_str(&alert, "__wfu_origin"), "event");
@@ -2577,9 +2589,7 @@ async fn match_respects_events_bind_filter() {
     let batch2 = make_filtered_batch(&schema, &["10.0.0.1"], &["failed"], ts + 1);
     win.write().unwrap().append(batch2).unwrap();
     task.pull_and_advance().await;
-    let alert = alert_rx
-        .try_recv()
-        .expect("second failed row should trigger");
+    let alert = take_alert(&mut alert_rx);
     assert_eq!(field_str(&alert, "__wfu_rule_name"), "filtered_match");
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
 }
@@ -2601,9 +2611,7 @@ async fn match_bind_filter_supports_window_has_lookup() {
 
     task.pull_and_advance().await;
 
-    let alert = alert_rx
-        .try_recv()
-        .expect("lookup-matching row should satisfy bind filter");
+    let alert = take_alert(&mut alert_rx);
     assert_eq!(field_str(&alert, "__wfu_rule_name"), "window_has_match");
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
     assert!(
@@ -2628,9 +2636,7 @@ async fn on_each_respects_events_bind_filter() {
 
     task.pull_and_advance().await;
 
-    let alert = alert_rx
-        .try_recv()
-        .expect("matching bind-filter row should emit");
+    let alert = take_alert(&mut alert_rx);
     assert_eq!(field_str(&alert, "__wfu_rule_name"), "filtered_each");
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
     assert!(
@@ -2788,7 +2794,7 @@ async fn port_scan_rule_triggers_close_alert() {
     let machine = CepStateMachine::new("port_scan".into(), match_plan, Some("event_time".into()));
     let executor = RuleExecutor::new(rule_plan);
 
-    let (alert_tx, mut alert_rx) = mpsc::channel(64);
+    let (alert_tx, mut alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let registry = WindowRegistry::build(vec![]).unwrap();
     let router = Arc::new(Router::new(registry));
 
@@ -2837,9 +2843,7 @@ async fn port_scan_rule_triggers_close_alert() {
     task.pull_and_advance().await;
 
     // Should have a close alert now
-    let alert = alert_rx
-        .try_recv()
-        .expect("port_scan should produce close alert after window expiry");
+    let alert = take_alert(&mut alert_rx);
     assert_eq!(field_str(&alert, "__wfu_rule_name"), "port_scan");
     assert_eq!(field_str(&alert, "__wfu_entity_type"), "ip");
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use orion_error::conversion::{SourceErr, ToStructError};
 use tokio::sync::Mutex;
 use wildmatch::WildMatch;
@@ -89,6 +91,38 @@ impl SinkRuntime {
         handle.sink.sink_record(data).await.source_err(
             CoreReason::Sink,
             format!("sink {:?} send record", self.name),
+        )
+    }
+
+    /// Send a batch of structured records via `AsyncRecordSink::sink_records`.
+    ///
+    /// Projection / wf_meta_disable are applied per record (same as
+    /// [`Self::send_record`]), then the batch is handed to the sink once —
+    /// amortizing the per-record write for file sinks and matching the
+    /// wp-motor batch delivery model.
+    pub async fn send_records(&self, records: &[Arc<DataRecord>]) -> CoreResult<()> {
+        let mut batch: Vec<Arc<DataRecord>> = Vec::with_capacity(records.len());
+        for record in records {
+            let projected;
+            let filtered;
+            let data = if let Some(fields) = &self.output_fields {
+                projected = project_record(record, fields)?;
+                &projected
+            } else {
+                record
+            };
+            let data = if self.wf_meta_disable_matcher.is_empty() {
+                data
+            } else {
+                filtered = mark_wf_meta_fields_ignored(data, &self.wf_meta_disable_matcher);
+                &filtered
+            };
+            batch.push(Arc::new(data.clone()));
+        }
+        let mut handle = self.handle.lock().await;
+        handle.sink.sink_records(batch).await.source_err(
+            CoreReason::Sink,
+            format!("sink {:?} send records", self.name),
         )
     }
 

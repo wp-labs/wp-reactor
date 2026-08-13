@@ -13,6 +13,7 @@ use orion_error::conversion::{SourceRawErr, ToStructError};
 use tokio::sync::mpsc;
 
 use wf_engine::alert::OutputRecord;
+use wp_model_core::model::DataRecord;
 use wf_engine::match_engine::{CepStateMachine, CloseReason, Event, RuleExecutor, StepResult};
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
@@ -33,6 +34,8 @@ const DEBUG_DETAIL_LIMIT: usize = 20;
 /// histogram): only 1 in N emitted alerts updates those, the exact total is
 /// always counted.
 const EMIT_METRIC_SAMPLE_INTERVAL: u32 = 64;
+/// Flush size for the batched alert sink delivery (amortizes per-alert fan-out).
+const ALERT_BATCH_SIZE: usize = 256;
 
 /// Current wall-clock epoch nanos.
 fn wall_nanos() -> u64 {
@@ -144,6 +147,10 @@ pub(super) struct RuleTask {
     cached_wall_nanos: AtomicU64,
     /// Countdown for sampling the allocation-heavy per-alert telemetry.
     emit_sample_remaining: AtomicU32,
+    /// Batched alert delivery: accumulated (yield_target, serialized record)
+    /// pairs flushed to the sink writers when the batch fills / at EOS.
+    /// `Mutex` so emit can stay `&self` while RuleTask stays `Sync`.
+    pending_alerts: std::sync::Mutex<Vec<(String, Arc<DataRecord>)>>,
 }
 
 impl RuleTask {
@@ -234,6 +241,7 @@ impl RuleTask {
             last_profile_dump: std::time::Instant::now(),
             cached_wall_nanos: AtomicU64::new(wall_nanos()),
             emit_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
+            pending_alerts: std::sync::Mutex::new(Vec::new()),
         };
         (task, cancel, timeout_scan_interval)
     }
@@ -719,6 +727,9 @@ impl RuleTask {
             }
         }
         self.dump_profiling();
+        // Deliver any accumulated alert batch (bounds delivery latency to one
+        // event batch and flushes test expectations without an explicit EOS).
+        self.flush_alerts().await;
     }
 
     /// Log the cumulative advance/scan/emit profiler accumulators once per
@@ -992,6 +1003,8 @@ impl RuleTask {
             metrics.observe_rule_flush(&rule_name, started.elapsed());
             metrics.set_rule_instances(&rule_name, instances);
         }
+        // Drain the batched alert delivery after close emissions.
+        self.flush_alerts().await;
     }
 
     // -- Alert emission -----------------------------------------------------
@@ -1022,14 +1035,9 @@ impl RuleTask {
                     .store(sample - 1, Ordering::Relaxed);
             }
         }
-        // Resolve the per-sink writer groups for yield_target.
-        let sink_groups = self.sink_fanout.resolve(&record.yield_target);
-        if sink_groups.is_empty() {
-            self.sink_fanout.warn_if_no_sink(&record.yield_target);
-            return;
-        }
-        // Serialize once (parallel across rule/shard workers), then broadcast
-        // the shared DataRecord; each sink crops to its own output_fields.
+        // Serialize once, then accumulate into the per-rule alert batch. The
+        // batch is flushed to the sink writers when it fills (amortizing the
+        // per-alert fan-out mechanics, matching the wp-motor batch model).
         let _ser_start = Instant::now();
         let data = match record.to_data_record() {
             Ok(data) => Arc::new(data),
@@ -1043,31 +1051,61 @@ impl RuleTask {
         };
         self.serialize_nanos
             .fetch_add(_ser_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.pending_alerts
+            .lock()
+            .unwrap()
+            .push((record.yield_target.clone(), data));
+        if self.pending_alerts.lock().unwrap().len() >= ALERT_BATCH_SIZE {
+            self.flush_alerts().await;
+        }
+    }
+
+    /// Flush the accumulated alert batch to the sink writers, grouped by
+    /// yield_target. Each sink receives one `AlertBatch` (a single channel send),
+    /// amortizing the per-alert resolve / try_send / blocking that dominated the
+    /// q1 pass-through emit path.
+    async fn flush_alerts(&self) {
+        if self.pending_alerts.lock().unwrap().is_empty() {
+            return;
+        }
         let _fan_start = Instant::now();
-        for (sink_ptr, channels) in sink_groups.iter() {
-            // Round-robin across this sink's parallel writers.
-            let idx = self.sink_fanout.next_index(*sink_ptr, channels.len());
-            let tx = &channels[idx];
-            match tx.try_send(Arc::clone(&data)) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
-                    if let Some(metrics) = &self.metrics {
-                        metrics.inc_alert_channel_full();
+        let pending = std::mem::take(&mut *self.pending_alerts.lock().unwrap());
+        let mut by_target: HashMap<String, Vec<Arc<DataRecord>>> = HashMap::new();
+        for (target, record) in pending {
+            by_target.entry(target).or_default().push(record);
+        }
+        for (target, records) in by_target {
+            let sink_groups = self.sink_fanout.resolve(&target);
+            if sink_groups.is_empty() {
+                self.sink_fanout.warn_if_no_sink(&target);
+                continue;
+            }
+            let batch: crate::alert_task::AlertBatch = Arc::new(records);
+            for (sink_ptr, channels) in sink_groups.iter() {
+                // Round-robin across this sink's parallel writers.
+                let idx = self.sink_fanout.next_index(*sink_ptr, channels.len());
+                let tx = &channels[idx];
+                match tx.try_send(Arc::clone(&batch)) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.inc_alert_channel_full();
+                        }
+                        // Fall back to blocking send
+                        if let Err(e) = tx.send(batch).await {
+                            if let Some(metrics) = &self.metrics {
+                                metrics.inc_alert_channel_send_failed();
+                            }
+                            wf_warn!(pipe, error = %e, "alert channel closed");
+                        }
                     }
-                    // Fall back to blocking send
-                    if let Err(e) = tx.send(data).await {
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        // Channel is closed — drop the batch
                         if let Some(metrics) = &self.metrics {
                             metrics.inc_alert_channel_send_failed();
                         }
-                        wf_warn!(pipe, error = %e, "alert channel closed");
+                        wf_warn!(pipe, rule = %target, "alert channel closed, dropping alert batch");
                     }
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    // Channel is closed — drop the record
-                    if let Some(metrics) = &self.metrics {
-                        metrics.inc_alert_channel_send_failed();
-                    }
-                    wf_warn!(pipe, rule = %record.rule_name, "alert channel closed, dropping alert");
                 }
             }
         }

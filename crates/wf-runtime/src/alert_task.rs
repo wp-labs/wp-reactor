@@ -20,13 +20,15 @@ pub const SINK_CHANNEL_CAPACITY: usize = 2048;
 /// Replaces the fixed two-consumer alert pipeline + per-alert wildcard routing:
 /// each sink owns a bounded channel + a consumer task, and the wildcard routes
 /// are resolved once per yield_target (cached) at delivery time.
+/// A batch of serialized alert records delivered to a sink writer.
+pub type AlertBatch = Arc<Vec<Arc<DataRecord>>>;
 /// Resolved per-sink channel groups for a yield target: each entry is
 /// `(sink_ptr, channels)` where `channels` are the sink's `parallel` writers.
-type ResolvedChannels = Arc<Vec<(usize, Arc<Vec<mpsc::Sender<Arc<DataRecord>>>>)>>;
+type ResolvedChannels = Arc<Vec<(usize, Arc<Vec<mpsc::Sender<AlertBatch>>>)>>;
 
 pub struct SinkFanout {
     /// `Arc<SinkRuntime>` pointer identity → its parallel writers.
-    pub(crate) by_sink: HashMap<usize, Vec<mpsc::Sender<Arc<DataRecord>>>>,
+    pub(crate) by_sink: HashMap<usize, Vec<mpsc::Sender<AlertBatch>>>,
     /// Per-sink round-robin index (across the sink's parallel writers).
     rr: HashMap<usize, std::sync::atomic::AtomicUsize>,
     /// yield_target → resolved channel groups (cache).
@@ -41,7 +43,7 @@ pub struct SinkFanout {
 impl SinkFanout {
     /// Build a fanout from the resolved sink→writers map.
     pub(crate) fn new(
-        by_sink: HashMap<usize, Vec<mpsc::Sender<Arc<DataRecord>>>>,
+        by_sink: HashMap<usize, Vec<mpsc::Sender<AlertBatch>>>,
         dispatcher: Arc<SinkDispatcher>,
     ) -> Self {
         let rr = by_sink.keys().map(|&k| (k, std::sync::atomic::AtomicUsize::new(0))).collect();
@@ -137,24 +139,24 @@ impl SinkFanout {
 /// Each sink owns one of these, so a slow sink only backpressures its own
 /// channel (and the rules emitting to that target), not every other sink.
 pub async fn run_sink_consumer(
-    mut rx: mpsc::Receiver<Arc<DataRecord>>,
+    mut rx: mpsc::Receiver<AlertBatch>,
     sink: Arc<SinkRuntime>,
-    error_txs: Arc<Vec<mpsc::Sender<Arc<DataRecord>>>>,
+    error_txs: Arc<Vec<mpsc::Sender<AlertBatch>>>,
     metrics: Option<Arc<RuntimeMetrics>>,
 ) {
-    while let Some(data) = rx.recv().await {
+    while let Some(batch) = rx.recv().await {
         if let Some(metrics) = &metrics {
             metrics.set_alert_channel_depth(rx.len() as u64);
         }
         let dispatch_started = Instant::now();
-        if let Err(e) = sink.send_record(&data).await {
+        if let Err(e) = sink.send_records(batch.as_slice()).await {
             log::warn!("sink {:?} dispatch error: {e}", sink.name);
             if let Some(metrics) = &metrics {
                 metrics.inc_sink_dispatch_failed();
             }
             // Escalate to error sinks (best-effort, no error-of-error loop).
             for tx in error_txs.iter() {
-                if tx.send(Arc::clone(&data)).await.is_err() {
+                if tx.send(Arc::clone(&batch)).await.is_err() {
                     break;
                 }
             }
