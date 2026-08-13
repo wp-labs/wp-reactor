@@ -177,6 +177,51 @@ impl SinkDispatcher {
         !self.monitor_sinks.is_empty()
     }
 
+    /// Resolve the sinks a yield target routes to — business routes that match,
+    /// falling back to the default sinks when none match. Deduplicated by sink
+    /// identity. Pure routing (no send); the delivery layer maps these to
+    /// per-sink channels.
+    pub fn resolve_sinks(&self, window_name: &str) -> Vec<Arc<SinkRuntime>> {
+        let mut matched = false;
+        let mut sinks: Vec<Arc<SinkRuntime>> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for route in &self.routes {
+            if route.matches(window_name) {
+                matched = true;
+                for sink in &route.sinks {
+                    let ptr = Arc::as_ptr(sink) as usize;
+                    if seen.insert(ptr) {
+                        sinks.push(Arc::clone(sink));
+                    }
+                }
+            }
+        }
+        if !matched {
+            for sink in &self.default_sinks {
+                let ptr = Arc::as_ptr(sink) as usize;
+                if seen.insert(ptr) {
+                    sinks.push(Arc::clone(sink));
+                }
+            }
+        }
+        sinks
+    }
+
+    /// Error-escalation sinks (sent to on any regular-sink send failure).
+    pub fn error_sinks(&self) -> &[Arc<SinkRuntime>] {
+        &self.error_sinks
+    }
+
+    /// Monitor sinks (metrics telemetry, a separate delivery path).
+    pub fn monitor_sinks(&self) -> &[Arc<SinkRuntime>] {
+        &self.monitor_sinks
+    }
+
+    /// All unique sink runtimes (for building per-sink delivery channels).
+    pub fn all_sinks(&self) -> &[Arc<SinkRuntime>] {
+        &self.all_sinks
+    }
+
     /// Returns true when there are no default sinks to fall back to.
     /// Combined with a route miss (`dispatch` returning 0), this means the
     /// alert had nowhere to go.
@@ -198,6 +243,15 @@ impl SinkDispatcher {
         for sink in &self.all_sinks {
             if let Err(e) = sink.stop().await {
                 log::warn!("sink stop error: {e}");
+            }
+        }
+    }
+
+    /// Gracefully stop only the monitor sinks (metrics telemetry).
+    pub async fn stop_monitor_sinks(&self) {
+        for sink in &self.monitor_sinks {
+            if let Err(e) = sink.stop().await {
+                log::warn!("monitor sink stop error: {e}");
             }
         }
     }

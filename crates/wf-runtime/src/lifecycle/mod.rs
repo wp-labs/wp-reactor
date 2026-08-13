@@ -22,7 +22,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use wf_config::{FusionConfig, FusionReloadPlan, RawFusionConfigTree};
-use wf_engine::alert::OutputRecord;
 use wf_engine::window::Router;
 
 use crate::error::{RuntimeReason, RuntimeResult};
@@ -252,7 +251,7 @@ pub struct Reactor {
     pub(crate) detached_rule_watchers: Vec<JoinHandle<RuntimeResult<()>>>,
     /// Shared artifacts reused across rule generations.
     pub(crate) router: Arc<Router>,
-    pub(crate) alert_txs: Option<Vec<mpsc::Sender<OutputRecord>>>,
+    pub(crate) sink_fanout: Option<Arc<crate::alert_task::SinkFanout>>,
     pub(crate) metrics: Option<Arc<RuntimeMetrics>>,
     pub(crate) intermediate_targets: HashSet<String>,
     /// EOS sender shared with rule generations (reload keeps it).
@@ -336,7 +335,7 @@ impl Reactor {
         let mut head_watchers: Vec<JoinHandle<RuntimeResult<()>>> = Vec::with_capacity(2);
         let mut tail_watchers: Vec<JoinHandle<RuntimeResult<()>>> = Vec::with_capacity(2);
 
-        let (alert_txs, alert_group) = spawn_alert_task(data.dispatcher.clone(), metrics.clone());
+        let (sink_fanout, alert_group) = spawn_alert_task(data.dispatcher.clone(), metrics.clone());
         head_watchers.push(watch_group(alert_group, cancel.clone()));
 
         head_watchers.push(watch_group(
@@ -354,7 +353,7 @@ impl Reactor {
             data.rules,
             &data.router,
             &data.intermediate_targets,
-            alert_txs.clone(),
+            sink_fanout.clone(),
             rule_cancel.clone(),
             metrics.clone(),
             eos_tx.clone(),
@@ -400,7 +399,7 @@ impl Reactor {
             rule_watch,
             detached_rule_watchers: Vec::new(),
             router: data.router,
-            alert_txs: Some(alert_txs),
+            sink_fanout: Some(sink_fanout),
             metrics,
             intermediate_targets: data.intermediate_targets,
             eos_tx,
@@ -532,7 +531,7 @@ impl Reactor {
         // longer needed. The rule tasks (joined below, before head/alert) still
         // hold their own clones, so they can finish flushing before the channel
         // closes and the alert task drains & exits last.
-        self.alert_txs.take();
+        self.sink_fanout.take();
 
         // tail: metrics → receiver, then rule, then head: evictor → alert.
         while let Some(handle) = self.tail_watchers.pop() {

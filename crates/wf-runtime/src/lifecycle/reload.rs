@@ -1,8 +1,6 @@
 use std::collections::HashSet;
 
-use tokio::sync::mpsc;
 use wf_config::{FusionConfig, RawFusionConfigTree};
-use wf_engine::alert::OutputRecord;
 
 use crate::alert_task;
 use crate::error::RuntimeResult;
@@ -149,17 +147,11 @@ impl Reactor {
             new_rules,
             &self.router,
             &new_intermediate_targets,
-            self.alert_txs.clone().unwrap_or_else(|| {
-                // Reactor is shutting down (alert_txs already taken in `wait`).
-                // Create closed channels so the new rule generation's emits
-                // are dropped rather than blocking a real reload.
-                (0..alert_task::ALERT_CONSUMERS)
-                    .map(|_| {
-                        let (_tx, rx) = mpsc::channel::<OutputRecord>(1);
-                        drop(rx);
-                        _tx
-                    })
-                    .collect()
+            self.sink_fanout.clone().unwrap_or_else(|| {
+                // Reactor is shutting down (sink_fanout already taken in `wait`).
+                // Use a closed fanout so the new rule generation's emits are
+                // dropped rather than blocking a real reload.
+                alert_task::SinkFanout::closed()
             }),
             self.rule_cancel.clone(),
             self.metrics.clone(),

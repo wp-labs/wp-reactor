@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
@@ -19,6 +19,7 @@ use wf_engine::window::{AppendOutcome, Router, RulePush};
 use wf_lang::plan::ConvPlan;
 use wf_lang::wfu_meta::{WFU_ID, WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
 
+use crate::alert_task::SinkFanout;
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::metrics::RuntimeMetrics;
 
@@ -90,10 +91,9 @@ pub(super) struct RuleTask {
     ordered_aliases: HashMap<String, Vec<String>>,
     /// window_name -> cursor: tracks read position per window.
     pub(super) cursors: HashMap<String, u64>,
-    /// All alert consumer senders; emits are round-robined across them.
-    alert_txs: Vec<mpsc::Sender<OutputRecord>>,
-    /// Round-robin cursor for `alert_txs`.
-    alert_round: AtomicUsize,
+    /// Sink delivery fanout: each emitted alert is broadcast to the per-sink
+    /// channels resolved by yield_target.
+    sink_fanout: Arc<SinkFanout>,
     /// Shared router for WindowLookup (joins + has()).
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
@@ -130,7 +130,7 @@ impl RuleTask {
             each_time_field,
             executor,
             window_sources,
-            alert_txs,
+            sink_fanout,
             cancel,
             timeout_scan_interval,
             router,
@@ -184,8 +184,7 @@ impl RuleTask {
             sources: window_sources,
             aliases,
             ordered_aliases,
-            alert_txs,
-            alert_round: AtomicUsize::new(0),
+            sink_fanout,
             cursors,
             router,
             metrics,
@@ -938,30 +937,35 @@ impl RuleTask {
             let e2e_nanos = now_nanos.saturating_sub(record.event_time_nanos.max(0) as u64);
             metrics.observe_event_e2e_latency(Duration::from_nanos(e2e_nanos));
         }
-        // Round-robin across the alert consumer senders so output processing
-        // is not capped by a single consumer task.
-        let tx = &self.alert_txs
-            [self.alert_round.fetch_add(1, Ordering::Relaxed) % self.alert_txs.len()];
-        match tx.try_send(record) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(record)) => {
-                if let Some(metrics) = &self.metrics {
-                    metrics.inc_alert_channel_full();
+        // Broadcast to the per-sink channels resolved by yield_target.
+        let senders = self.sink_fanout.resolve(&record.yield_target);
+        if senders.is_empty() {
+            self.sink_fanout.warn_if_no_sink(&record.yield_target);
+            return;
+        }
+        let record = Arc::new(record);
+        for tx in senders.iter() {
+            match tx.try_send(Arc::clone(&record)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(record)) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.inc_alert_channel_full();
+                    }
+                    // Fall back to blocking send
+                    if let Err(e) = tx.send(record).await {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.inc_alert_channel_send_failed();
+                        }
+                        wf_warn!(pipe, error = %e, "alert channel closed");
+                    }
                 }
-                // Fall back to blocking send
-                if let Err(e) = tx.send(record).await {
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Channel is closed — drop the record
                     if let Some(metrics) = &self.metrics {
                         metrics.inc_alert_channel_send_failed();
                     }
-                    wf_warn!(pipe, error = %e, "alert channel closed");
+                    wf_warn!(pipe, rule = %record.rule_name, "alert channel closed, dropping alert");
                 }
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(record)) => {
-                // Channel is closed — drop the record
-                if let Some(metrics) = &self.metrics {
-                    metrics.inc_alert_channel_send_failed();
-                }
-                wf_warn!(pipe, rule = %record.rule_name, "alert channel closed, dropping alert");
             }
         }
     }

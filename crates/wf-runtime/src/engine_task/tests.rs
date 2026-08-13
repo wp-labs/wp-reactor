@@ -25,6 +25,7 @@ use wf_lang::plan::{
     WindowSpec, YieldField, YieldPlan,
 };
 
+use crate::alert_task::SinkFanout;
 use crate::tracing_init::DomainFormat;
 
 // -- helpers ------------------------------------------------------------
@@ -49,6 +50,16 @@ fn init_tracing() {
 
 fn empty_tracked_bind_fields() -> std::collections::HashMap<String, HashSet<String>> {
     std::collections::HashMap::new()
+}
+
+/// A test sink fanout that resolves the `"alerts"` and `"network_alerts"` yield
+/// targets (the sink targets used across the tests) to `tx`.
+fn make_test_fanout(tx: mpsc::Sender<Arc<wf_engine::alert::OutputRecord>>) -> Arc<SinkFanout> {
+    let mut cache = std::collections::HashMap::new();
+    let senders = Arc::new(vec![tx]);
+    cache.insert("alerts".to_string(), Arc::clone(&senders));
+    cache.insert("network_alerts".to_string(), senders);
+    SinkFanout::from_resolved(cache)
 }
 
 fn empty_tracked_plain_fields() -> HashSet<String> {
@@ -244,7 +255,7 @@ fn make_window_def(
 /// Build a single-step count>=3 rule and return (task, alert_rx, window_arc, notify_arc).
 fn make_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -273,7 +284,7 @@ fn make_task_with_window_bytes(
     max_bytes: usize,
 ) -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -355,7 +366,7 @@ fn make_task_with_window_bytes(
             notify: Arc::clone(&notify_arc),
             aliases: vec!["fail".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router,
@@ -371,7 +382,7 @@ fn make_task_with_window_bytes(
 
 fn make_pipeline_stage_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<Router>,
 ) {
     let src_schema = test_schema();
@@ -469,7 +480,7 @@ fn make_pipeline_stage_task() -> (
             notify: source_notify,
             aliases: vec!["fail".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router: Arc::clone(&router),
@@ -484,7 +495,7 @@ fn make_pipeline_stage_task() -> (
 
 fn make_each_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -555,7 +566,7 @@ fn make_each_task() -> (
             notify: Arc::clone(&notify_arc),
             aliases: vec!["e".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router,
@@ -570,7 +581,7 @@ fn make_each_task() -> (
 
 fn make_filtered_match_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -656,7 +667,7 @@ fn make_filtered_match_task() -> (
             notify: Arc::clone(&notify_arc),
             aliases: vec!["fail".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router,
@@ -671,7 +682,7 @@ fn make_filtered_match_task() -> (
 
 fn make_filtered_close_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -770,7 +781,7 @@ fn make_filtered_close_task() -> (
             notify: Arc::clone(&notify_arc),
             aliases: vec!["fail".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router,
@@ -785,7 +796,7 @@ fn make_filtered_close_task() -> (
 
 fn make_filtered_each_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -853,7 +864,7 @@ fn make_filtered_each_task() -> (
             notify: Arc::clone(&notify_arc),
             aliases: vec!["e".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router,
@@ -868,7 +879,7 @@ fn make_filtered_each_task() -> (
 
 fn make_intermediate_each_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<Router>,
 ) {
     let src_schema = test_schema();
@@ -968,7 +979,7 @@ fn make_intermediate_each_task() -> (
             notify: source_notify,
             aliases: vec!["e".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router: Arc::clone(&router),
@@ -983,7 +994,7 @@ fn make_intermediate_each_task() -> (
 
 fn make_intermediate_each_task_with_explicit_time() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<Router>,
 ) {
     let src_schema = test_schema();
@@ -1065,7 +1076,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
             notify: source_notify,
             aliases: vec!["e".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router: Arc::clone(&router),
@@ -1081,7 +1092,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
 fn make_intermediate_score_tasks() -> (
     rule_task::RuleTask,
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<Router>,
 ) {
     let src_schema = scored_source_schema();
@@ -1169,7 +1180,7 @@ fn make_intermediate_score_tasks() -> (
             notify: source_notify,
             aliases: vec!["e".into()],
         }],
-        alert_txs: vec![upstream_alert_tx],
+        sink_fanout: make_test_fanout(upstream_alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router: Arc::clone(&router),
@@ -1304,7 +1315,7 @@ fn make_intermediate_score_tasks() -> (
             notify: intermediate_notify,
             aliases: vec!["x".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router: Arc::clone(&router),
@@ -1321,7 +1332,7 @@ fn make_intermediate_score_tasks() -> (
 fn make_intermediate_score_band_tasks() -> (
     rule_task::RuleTask,
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<Router>,
 ) {
     let src_schema = scored_source_schema();
@@ -1409,7 +1420,7 @@ fn make_intermediate_score_band_tasks() -> (
             notify: source_notify,
             aliases: vec!["e".into()],
         }],
-        alert_txs: vec![upstream_alert_tx],
+        sink_fanout: make_test_fanout(upstream_alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router: Arc::clone(&router),
@@ -1597,7 +1608,7 @@ fn make_intermediate_score_band_tasks() -> (
             notify: intermediate_notify,
             aliases: vec!["x".into(), "hi".into(), "elevated".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router: Arc::clone(&router),
@@ -1613,7 +1624,7 @@ fn make_intermediate_score_band_tasks() -> (
 
 fn make_filtered_bind_alias_match_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -1766,7 +1777,7 @@ fn make_filtered_bind_alias_match_task() -> (
             notify: Arc::clone(&notify),
             aliases: vec!["x".into(), "hi".into(), "elevated".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router,
@@ -1781,7 +1792,7 @@ fn make_filtered_bind_alias_match_task() -> (
 
 fn make_window_has_match_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<wf_engine::alert::OutputRecord>,
+    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
     Arc<Router>,
 ) {
     let schema = test_schema();
@@ -1874,7 +1885,7 @@ fn make_window_has_match_task() -> (
             notify: source_notify,
             aliases: vec!["fail".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router: Arc::clone(&router),
@@ -2704,7 +2715,7 @@ async fn port_scan_rule_triggers_close_alert() {
             notify: Arc::clone(&notify_arc),
             aliases: vec!["c".into()],
         }],
-        alert_txs: vec![alert_tx],
+        sink_fanout: make_test_fanout(alert_tx),
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout_scan_interval: Duration::from_secs(60),
         router,

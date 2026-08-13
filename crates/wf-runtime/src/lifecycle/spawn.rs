@@ -41,20 +41,53 @@ use super::types::{RunRule, RunRuleKind, TaskGroup};
 pub(super) fn spawn_alert_task(
     dispatcher: Arc<SinkDispatcher>,
     metrics: Option<Arc<RuntimeMetrics>>,
-) -> (Vec<mpsc::Sender<OutputRecord>>, TaskGroup) {
+) -> (Arc<alert_task::SinkFanout>, TaskGroup) {
     let mut group = TaskGroup::new("alert");
-    let mut txs = Vec::with_capacity(alert_task::ALERT_CONSUMERS);
-    for _ in 0..alert_task::ALERT_CONSUMERS {
-        let (alert_tx, alert_rx) = mpsc::channel(alert_task::ALERT_CHANNEL_CAPACITY);
-        txs.push(alert_tx);
-        let dispatcher = Arc::clone(&dispatcher);
+    let mut by_sink = HashMap::new();
+
+    // Error sinks first: their senders feed the escalation list.
+    let mut error_txs: Vec<mpsc::Sender<Arc<OutputRecord>>> = Vec::new();
+    for sink in dispatcher.error_sinks() {
+        let (tx, rx) = mpsc::channel(alert_task::SINK_CHANNEL_CAPACITY);
+        error_txs.push(tx);
+        let sink = Arc::clone(sink);
         let metrics = metrics.clone();
         group.push(tokio::spawn(async move {
-            alert_task::run_alert_dispatcher(alert_rx, dispatcher, metrics).await;
+            alert_task::run_sink_consumer(rx, sink, Arc::new(Vec::new()), metrics).await;
             Ok(())
         }));
     }
-    (txs, group)
+    let error_txs = Arc::new(error_txs);
+
+    // Regular + default sinks (everything except error and monitor).
+    let error_ptrs: HashSet<usize> = dispatcher
+        .error_sinks()
+        .iter()
+        .map(|s| Arc::as_ptr(s) as usize)
+        .collect();
+    let monitor_ptrs: HashSet<usize> = dispatcher
+        .monitor_sinks()
+        .iter()
+        .map(|s| Arc::as_ptr(s) as usize)
+        .collect();
+    for sink in dispatcher.all_sinks() {
+        let ptr = Arc::as_ptr(sink) as usize;
+        if error_ptrs.contains(&ptr) || monitor_ptrs.contains(&ptr) {
+            continue;
+        }
+        let (tx, rx) = mpsc::channel(alert_task::SINK_CHANNEL_CAPACITY);
+        by_sink.insert(ptr, tx);
+        let sink = Arc::clone(sink);
+        let error_txs = Arc::clone(&error_txs);
+        let metrics = metrics.clone();
+        group.push(tokio::spawn(async move {
+            alert_task::run_sink_consumer(rx, sink, error_txs, metrics).await;
+            Ok(())
+        }));
+    }
+
+    let fanout = Arc::new(alert_task::SinkFanout::new(by_sink, dispatcher));
+    (fanout, group)
 }
 
 /// Spawn the periodic window evictor task.
@@ -84,7 +117,7 @@ pub(super) fn spawn_rule_tasks(
     rules: Vec<RunRule>,
     router: &Arc<Router>,
     intermediate_targets: &HashSet<String>,
-    alert_txs: Vec<mpsc::Sender<OutputRecord>>,
+    sink_fanout: Arc<alert_task::SinkFanout>,
     cancel: CancellationToken,
     metrics: Option<Arc<RuntimeMetrics>>,
     eos_tx: watch::Sender<u64>,
@@ -116,7 +149,7 @@ pub(super) fn spawn_rule_tasks(
             each_time_field,
             executor: rule.executor,
             window_sources,
-            alert_txs: alert_txs.clone(),
+            sink_fanout: Arc::clone(&sink_fanout),
             cancel: cancel.child_token(),
             timeout_scan_interval,
             router: Arc::clone(router),
@@ -131,10 +164,9 @@ pub(super) fn spawn_rule_tasks(
         ));
     }
 
-    // Drop our copy of the senders so the alert channels close when all rule
-    // tasks finish (the Reactor holds the master senders for the run's
-    // lifetime).
-    drop(alert_txs);
+    // Drop our copy; the Reactor holds the master fanout so the sink channels
+    // stay open until shutdown.
+    drop(sink_fanout);
 
     group
 }
@@ -669,6 +701,8 @@ async fn run_monitor_consumer(mut rx: MonRecv, dispatcher: Arc<SinkDispatcher>) 
             dispatcher.dispatch_to_monitor(&data).await;
         }
     }
+    // Monitor channel closed: stop the monitor sinks.
+    dispatcher.stop_monitor_sinks().await;
 }
 
 fn metrics_record_to_data_record(record: &MetricsRecord) -> DataRecord {

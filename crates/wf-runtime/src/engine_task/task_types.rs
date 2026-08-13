@@ -5,10 +5,10 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use wf_engine::alert::OutputRecord;
 use wf_engine::match_engine::{CepStateMachine, RuleExecutor};
 use wf_engine::window::{Router, RulePush, Window};
 
+use crate::alert_task::SinkFanout;
 use crate::metrics::RuntimeMetrics;
 
 // ---------------------------------------------------------------------------
@@ -33,9 +33,9 @@ pub(crate) struct RuleTaskConfig {
     pub each_time_field: Option<String>,
     pub executor: RuleExecutor,
     pub window_sources: Vec<WindowSource>,
-    /// All alert consumer senders; the rule task round-robins emits across them
-    /// so output processing is not capped by a single consumer task.
-    pub alert_txs: Vec<mpsc::Sender<OutputRecord>>,
+    /// Sink delivery fanout: the rule task broadcasts each emitted alert to the
+    /// per-sink channels (resolved by yield_target).
+    pub sink_fanout: Arc<SinkFanout>,
     pub cancel: CancellationToken,
     pub timeout_scan_interval: Duration,
     /// Shared router for WindowLookup (joins + has()).
