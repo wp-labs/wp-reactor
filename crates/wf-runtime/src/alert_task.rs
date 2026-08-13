@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
-use wf_engine::alert::OutputRecord;
+use wp_model_core::model::DataRecord;
 use wf_engine::sink::{SinkDispatcher, SinkRuntime};
 
 use crate::metrics::RuntimeMetrics;
@@ -21,9 +21,9 @@ pub const SINK_CHANNEL_CAPACITY: usize = 2048;
 /// are resolved once per yield_target (cached) at delivery time.
 pub struct SinkFanout {
     /// `Arc<SinkRuntime>` pointer identity → sender.
-    pub(crate) by_sink: HashMap<usize, mpsc::Sender<Arc<OutputRecord>>>,
+    pub(crate) by_sink: HashMap<usize, mpsc::Sender<Arc<DataRecord>>>,
     /// yield_target → resolved senders (cache).
-    cache: RwLock<HashMap<String, Arc<Vec<mpsc::Sender<Arc<OutputRecord>>>>>>,
+    cache: RwLock<HashMap<String, Arc<Vec<mpsc::Sender<Arc<DataRecord>>>>>>,
     /// On-demand resolver (wildcard routes + default fallback). `None` for a
     /// closed/empty fanout (e.g. the reload-during-shutdown fallback).
     dispatcher: Option<Arc<SinkDispatcher>>,
@@ -34,7 +34,7 @@ pub struct SinkFanout {
 impl SinkFanout {
     /// Build a fanout from the resolved sink→sender map.
     pub(crate) fn new(
-        by_sink: HashMap<usize, mpsc::Sender<Arc<OutputRecord>>>,
+        by_sink: HashMap<usize, mpsc::Sender<Arc<DataRecord>>>,
         dispatcher: Arc<SinkDispatcher>,
     ) -> Self {
         Self {
@@ -53,7 +53,7 @@ impl SinkFanout {
     /// Build a fanout from a pre-resolved target→senders map (no on-demand
     /// resolver). Used by the reload fallback and by tests.
     pub(crate) fn from_resolved(
-        cache: HashMap<String, Arc<Vec<mpsc::Sender<Arc<OutputRecord>>>>>,
+        cache: HashMap<String, Arc<Vec<mpsc::Sender<Arc<DataRecord>>>>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             by_sink: HashMap::new(),
@@ -64,7 +64,7 @@ impl SinkFanout {
     }
 
     /// Resolve the sink senders for a yield_target, caching the result.
-    pub fn resolve(&self, window_name: &str) -> Arc<Vec<mpsc::Sender<Arc<OutputRecord>>>> {
+    pub fn resolve(&self, window_name: &str) -> Arc<Vec<mpsc::Sender<Arc<DataRecord>>>> {
         if let Some(senders) = self
             .cache
             .read()
@@ -108,25 +108,15 @@ impl SinkFanout {
 /// Each sink owns one of these, so a slow sink only backpressures its own
 /// channel (and the rules emitting to that target), not every other sink.
 pub async fn run_sink_consumer(
-    mut rx: mpsc::Receiver<Arc<OutputRecord>>,
+    mut rx: mpsc::Receiver<Arc<DataRecord>>,
     sink: Arc<SinkRuntime>,
-    error_txs: Arc<Vec<mpsc::Sender<Arc<OutputRecord>>>>,
+    error_txs: Arc<Vec<mpsc::Sender<Arc<DataRecord>>>>,
     metrics: Option<Arc<RuntimeMetrics>>,
 ) {
-    while let Some(record) = rx.recv().await {
+    while let Some(data) = rx.recv().await {
         if let Some(metrics) = &metrics {
             metrics.set_alert_channel_depth(rx.len() as u64);
         }
-        let data = match record.to_data_record() {
-            Ok(data) => data,
-            Err(e) => {
-                if let Some(metrics) = &metrics {
-                    metrics.inc_alert_serialize_failed();
-                }
-                log::warn!("alert export error: {e}");
-                continue;
-            }
-        };
         let dispatch_started = Instant::now();
         if let Err(e) = sink.send_record(&data).await {
             log::warn!("sink {:?} dispatch error: {e}", sink.name);
@@ -135,7 +125,7 @@ pub async fn run_sink_consumer(
             }
             // Escalate to error sinks (best-effort, no error-of-error loop).
             for tx in error_txs.iter() {
-                if tx.send(Arc::clone(&record)).await.is_err() {
+                if tx.send(Arc::clone(&data)).await.is_err() {
                     break;
                 }
             }

@@ -54,12 +54,28 @@ fn empty_tracked_bind_fields() -> std::collections::HashMap<String, HashSet<Stri
 
 /// A test sink fanout that resolves the `"alerts"` and `"network_alerts"` yield
 /// targets (the sink targets used across the tests) to `tx`.
-fn make_test_fanout(tx: mpsc::Sender<Arc<wf_engine::alert::OutputRecord>>) -> Arc<SinkFanout> {
+fn make_test_fanout(tx: mpsc::Sender<Arc<wp_model_core::model::DataRecord>>) -> Arc<SinkFanout> {
     let mut cache = std::collections::HashMap::new();
     let senders = Arc::new(vec![tx]);
     cache.insert("alerts".to_string(), Arc::clone(&senders));
     cache.insert("network_alerts".to_string(), senders);
     SinkFanout::from_resolved(cache)
+}
+
+/// Extract a `__wfu_*` field's string form from a sink `DataRecord`.
+fn field_str(record: &wp_model_core::model::DataRecord, name: &str) -> String {
+    record
+        .field(name)
+        .map(|f| f.get_value().to_string())
+        .unwrap_or_default()
+}
+
+/// Extract a `__wfu_*` float field from a sink `DataRecord`.
+fn field_f64(record: &wp_model_core::model::DataRecord, name: &str) -> f64 {
+    record
+        .field(name)
+        .map(|f| f.get_value().to_string().parse::<f64>().unwrap_or(f64::NAN))
+        .unwrap_or(f64::NAN)
 }
 
 fn empty_tracked_plain_fields() -> HashSet<String> {
@@ -255,7 +271,7 @@ fn make_window_def(
 /// Build a single-step count>=3 rule and return (task, alert_rx, window_arc, notify_arc).
 fn make_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -284,7 +300,7 @@ fn make_task_with_window_bytes(
     max_bytes: usize,
 ) -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -382,7 +398,7 @@ fn make_task_with_window_bytes(
 
 fn make_pipeline_stage_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<Router>,
 ) {
     let src_schema = test_schema();
@@ -495,7 +511,7 @@ fn make_pipeline_stage_task() -> (
 
 fn make_each_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -581,7 +597,7 @@ fn make_each_task() -> (
 
 fn make_filtered_match_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -682,7 +698,7 @@ fn make_filtered_match_task() -> (
 
 fn make_filtered_close_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -796,7 +812,7 @@ fn make_filtered_close_task() -> (
 
 fn make_filtered_each_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -879,7 +895,7 @@ fn make_filtered_each_task() -> (
 
 fn make_intermediate_each_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<Router>,
 ) {
     let src_schema = test_schema();
@@ -994,7 +1010,7 @@ fn make_intermediate_each_task() -> (
 
 fn make_intermediate_each_task_with_explicit_time() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<Router>,
 ) {
     let src_schema = test_schema();
@@ -1092,7 +1108,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
 fn make_intermediate_score_tasks() -> (
     rule_task::RuleTask,
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<Router>,
 ) {
     let src_schema = scored_source_schema();
@@ -1332,7 +1348,7 @@ fn make_intermediate_score_tasks() -> (
 fn make_intermediate_score_band_tasks() -> (
     rule_task::RuleTask,
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<Router>,
 ) {
     let src_schema = scored_source_schema();
@@ -1624,7 +1640,7 @@ fn make_intermediate_score_band_tasks() -> (
 
 fn make_filtered_bind_alias_match_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<RwLock<Window>>,
     Arc<Notify>,
 ) {
@@ -1792,7 +1808,7 @@ fn make_filtered_bind_alias_match_task() -> (
 
 fn make_window_has_match_task() -> (
     rule_task::RuleTask,
-    mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
     Arc<Router>,
 ) {
     let schema = test_schema();
@@ -1946,11 +1962,11 @@ async fn pull_triggers_alert() {
     task.pull_and_advance().await;
 
     let alert = alert_rx.try_recv().expect("should have produced an alert");
-    assert_eq!(alert.rule_name, "test_rule");
-    assert_eq!(alert.entity_type, "ip");
-    assert_eq!(alert.entity_id, "10.0.0.1");
-    assert!((alert.score - 70.0).abs() < f64::EPSILON);
-    assert_eq!(alert.event_time_nanos, ts_nanos);
+    assert_eq!(field_str(&alert, "__wfu_rule_name"), "test_rule");
+    assert_eq!(field_str(&alert, "__wfu_entity_type"), "ip");
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
+    assert!((field_f64(&alert, "__wfu_score") - 70.0).abs() < f64::EPSILON);
+    assert!(!field_str(&alert, "__wfu_fired_at").is_empty());
 }
 
 #[tokio::test]
@@ -1973,19 +1989,19 @@ async fn push_triggers_alert() {
     let alert = alert_rx
         .try_recv()
         .expect("push path should produce an alert");
-    assert_eq!(alert.rule_name, "test_rule");
-    assert_eq!(alert.entity_type, "ip");
-    assert_eq!(alert.entity_id, "10.0.0.1");
-    assert!((alert.score - 70.0).abs() < f64::EPSILON);
-    assert_eq!(alert.event_time_nanos, ts_nanos);
+    assert_eq!(field_str(&alert, "__wfu_rule_name"), "test_rule");
+    assert_eq!(field_str(&alert, "__wfu_entity_type"), "ip");
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
+    assert!((field_f64(&alert, "__wfu_score") - 70.0).abs() < f64::EPSILON);
+    assert!(!field_str(&alert, "__wfu_fired_at").is_empty());
 }
 
 fn drain_alert_entity_ids(
-    rx: &mut mpsc::Receiver<Arc<wf_engine::alert::OutputRecord>>,
+    rx: &mut mpsc::Receiver<Arc<wp_model_core::model::DataRecord>>,
 ) -> Vec<String> {
     let mut ids = Vec::new();
     while let Ok(alert) = rx.try_recv() {
-        ids.push(alert.entity_id.clone());
+        ids.push(field_str(&alert, "__wfu_entity_id").clone());
     }
     ids
 }
@@ -2059,7 +2075,7 @@ async fn pull_keeps_normalized_nanos_event_time() {
     task.pull_and_advance().await;
 
     let alert = alert_rx.try_recv().expect("should have produced an alert");
-    assert_eq!(alert.event_time_nanos, ts_nanos);
+    assert!(!field_str(&alert, "__wfu_fired_at").is_empty());
 }
 
 #[tokio::test]
@@ -2091,10 +2107,10 @@ async fn flush_emits_close_alert_for_completed_and_close_rule() {
     let alert = alert_rx
         .try_recv()
         .expect("flush should emit one close alert");
-    assert_eq!(alert.rule_name, "filtered_close");
-    assert_eq!(alert.entity_type, "ip");
-    assert_eq!(alert.entity_id, "10.0.0.1");
-    assert_eq!(alert.origin.as_str(), "close:flush");
+    assert_eq!(field_str(&alert, "__wfu_rule_name"), "filtered_close");
+    assert_eq!(field_str(&alert, "__wfu_entity_type"), "ip");
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
+    assert_eq!(field_str(&alert, "__wfu_origin"), "close:flush");
 }
 
 #[tokio::test]
@@ -2123,7 +2139,7 @@ async fn pull_multiple_keys_isolated() {
     let alert = alert_rx
         .try_recv()
         .expect("sip=10.0.0.1 should trigger at count=3");
-    assert_eq!(alert.entity_id, "10.0.0.1");
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
 
     assert!(
         alert_rx.try_recv().is_err(),
@@ -2374,31 +2390,19 @@ async fn downstream_close_aggregates_intermediate_float_fields() {
     downstream_task.flush().await;
 
     let alert = alert_rx.recv().await.expect("expected downstream alert");
-    assert!((alert.score - 20.0).abs() < f64::EPSILON);
-    assert_eq!(alert.entity_id, "10.0.0.8");
+    assert!((field_f64(&alert, "__wfu_score") - 20.0).abs() < f64::EPSILON);
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.8");
     assert_eq!(
-        alert
-            .yield_fields
-            .iter()
-            .find(|(name, _)| name == "avg_score")
-            .map(|(_, value)| value.clone()),
-        Some(wf_engine::match_engine::Value::Number(20.0))
+        field_f64(&alert, "avg_score"),
+        20.0
     );
     assert_eq!(
-        alert
-            .yield_fields
-            .iter()
-            .find(|(name, _)| name == "avg_risk")
-            .map(|(_, value)| value.clone()),
-        Some(wf_engine::match_engine::Value::Number(20.0))
+        field_f64(&alert, "avg_risk"),
+        20.0
     );
     assert_eq!(
-        alert
-            .yield_fields
-            .iter()
-            .find(|(name, _)| name == "event_count")
-            .map(|(_, value)| value.clone()),
-        Some(wf_engine::match_engine::Value::Number(2.0))
+        field_f64(&alert, "event_count"),
+        2.0
     );
 }
 
@@ -2419,46 +2423,26 @@ async fn downstream_close_counts_filtered_bind_aliases() {
     downstream_task.flush().await;
 
     let alert = alert_rx.recv().await.expect("expected downstream alert");
-    assert_eq!(alert.entity_id, "10.0.0.9");
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.9");
     assert_eq!(
-        alert
-            .yield_fields
-            .iter()
-            .find(|(name, _)| name == "event_count")
-            .map(|(_, value)| value.clone()),
-        Some(wf_engine::match_engine::Value::Number(2.0))
+        field_f64(&alert, "event_count"),
+        2.0
     );
     assert_eq!(
-        alert
-            .yield_fields
-            .iter()
-            .find(|(name, _)| name == "source_avg")
-            .map(|(_, value)| value.clone()),
-        Some(wf_engine::match_engine::Value::Number(80.0))
+        field_f64(&alert, "source_avg"),
+        80.0
     );
     assert_eq!(
-        alert
-            .yield_fields
-            .iter()
-            .find(|(name, _)| name == "high_event_count")
-            .map(|(_, value)| value.clone()),
-        Some(wf_engine::match_engine::Value::Number(1.0))
+        field_f64(&alert, "high_event_count"),
+        1.0
     );
     assert_eq!(
-        alert
-            .yield_fields
-            .iter()
-            .find(|(name, _)| name == "elevated_event_count")
-            .map(|(_, value)| value.clone()),
-        Some(wf_engine::match_engine::Value::Number(2.0))
+        field_f64(&alert, "elevated_event_count"),
+        2.0
     );
     assert_eq!(
-        alert
-            .yield_fields
-            .iter()
-            .find(|(name, _)| name == "status")
-            .map(|(_, value)| value.clone()),
-        Some(wf_engine::match_engine::Value::Str("high".into()))
+        field_str(&alert, "status"),
+        "high"
     );
 }
 
@@ -2474,31 +2458,19 @@ async fn match_event_path_counts_filtered_bind_aliases() {
     task.pull_and_advance().await;
 
     let alert = alert_rx.try_recv().expect("expected match alert");
-    assert_eq!(alert.entity_id, "10.0.0.7");
-    assert_eq!(alert.score, 1.0);
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.7");
+    assert_eq!(field_f64(&alert, "__wfu_score"), 1.0);
     assert_eq!(
-        alert
-            .yield_fields
-            .iter()
-            .find(|(name, _)| name == "high_event_count")
-            .map(|(_, value)| value.clone()),
-        Some(wf_engine::match_engine::Value::Number(1.0))
+        field_f64(&alert, "high_event_count"),
+        1.0
     );
     assert_eq!(
-        alert
-            .yield_fields
-            .iter()
-            .find(|(name, _)| name == "elevated_avg")
-            .map(|(_, value)| value.clone()),
-        Some(wf_engine::match_engine::Value::Number(80.0))
+        field_f64(&alert, "elevated_avg"),
+        80.0
     );
     assert_eq!(
-        alert
-            .yield_fields
-            .iter()
-            .find(|(name, _)| name == "last_high_sip")
-            .map(|(_, value)| value.clone()),
-        Some(wf_engine::match_engine::Value::Str("10.0.0.7".into()))
+        field_str(&alert, "last_high_sip"),
+        "10.0.0.7"
     );
 }
 
@@ -2514,18 +2486,14 @@ async fn on_each_emits_one_alert_per_matching_row() {
     task.pull_and_advance().await;
 
     let alert = alert_rx.try_recv().expect("matching row should emit alert");
-    assert_eq!(alert.rule_name, "each_rule");
-    assert_eq!(alert.entity_id, "10.0.0.1");
-    assert_eq!(alert.origin, wf_engine::alert::AlertOrigin::Event);
-    assert_eq!(alert.event_time_nanos, ts_nanos);
+    assert_eq!(field_str(&alert, "__wfu_rule_name"), "each_rule");
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
+    assert_eq!(field_str(&alert, "__wfu_origin"), "event");
+    assert!(!field_str(&alert, "__wfu_fired_at").is_empty());
     assert_eq!(
-        alert.yield_fields,
-        vec![(
-            "x".into(),
-            wf_engine::match_engine::Value::Str("10.0.0.1".into())
-        )]
+        field_str(&alert, "x"),
+        "10.0.0.1"
     );
-    assert!(alert.matched_rows.is_empty());
     assert!(
         alert_rx.try_recv().is_err(),
         "non-matching rows must not emit alerts"
@@ -2558,8 +2526,8 @@ async fn match_respects_events_bind_filter() {
     let alert = alert_rx
         .try_recv()
         .expect("second failed row should trigger");
-    assert_eq!(alert.rule_name, "filtered_match");
-    assert_eq!(alert.entity_id, "10.0.0.1");
+    assert_eq!(field_str(&alert, "__wfu_rule_name"), "filtered_match");
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
 }
 
 #[tokio::test]
@@ -2582,8 +2550,8 @@ async fn match_bind_filter_supports_window_has_lookup() {
     let alert = alert_rx
         .try_recv()
         .expect("lookup-matching row should satisfy bind filter");
-    assert_eq!(alert.rule_name, "window_has_match");
-    assert_eq!(alert.entity_id, "10.0.0.1");
+    assert_eq!(field_str(&alert, "__wfu_rule_name"), "window_has_match");
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
     assert!(
         alert_rx.try_recv().is_err(),
         "rows rejected by window.has bind filter must not match"
@@ -2609,8 +2577,8 @@ async fn on_each_respects_events_bind_filter() {
     let alert = alert_rx
         .try_recv()
         .expect("matching bind-filter row should emit");
-    assert_eq!(alert.rule_name, "filtered_each");
-    assert_eq!(alert.entity_id, "10.0.0.1");
+    assert_eq!(field_str(&alert, "__wfu_rule_name"), "filtered_each");
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
     assert!(
         alert_rx.try_recv().is_err(),
         "rows rejected by bind filter must not emit alerts"
@@ -2817,7 +2785,7 @@ async fn port_scan_rule_triggers_close_alert() {
     let alert = alert_rx
         .try_recv()
         .expect("port_scan should produce close alert after window expiry");
-    assert_eq!(alert.rule_name, "port_scan");
-    assert_eq!(alert.entity_type, "ip");
-    assert_eq!(alert.entity_id, "10.0.0.1");
+    assert_eq!(field_str(&alert, "__wfu_rule_name"), "port_scan");
+    assert_eq!(field_str(&alert, "__wfu_entity_type"), "ip");
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
 }

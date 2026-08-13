@@ -943,16 +943,27 @@ impl RuleTask {
             self.sink_fanout.warn_if_no_sink(&record.yield_target);
             return;
         }
-        let record = Arc::new(record);
+        // Serialize once (parallel across rule/shard workers), then broadcast
+        // the shared DataRecord; each sink crops to its own output_fields.
+        let data = match record.to_data_record() {
+            Ok(data) => Arc::new(data),
+            Err(e) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.inc_alert_serialize_failed();
+                }
+                log::warn!("alert export error: {e}");
+                return;
+            }
+        };
         for tx in senders.iter() {
-            match tx.try_send(Arc::clone(&record)) {
+            match tx.try_send(Arc::clone(&data)) {
                 Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(record)) => {
+                Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
                     if let Some(metrics) = &self.metrics {
                         metrics.inc_alert_channel_full();
                     }
                     // Fall back to blocking send
-                    if let Err(e) = tx.send(record).await {
+                    if let Err(e) = tx.send(data).await {
                         if let Some(metrics) = &self.metrics {
                             metrics.inc_alert_channel_send_failed();
                         }

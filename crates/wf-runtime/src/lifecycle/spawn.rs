@@ -9,7 +9,6 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use wf_config::FusionConfig;
-use wf_engine::alert::OutputRecord;
 use wf_engine::match_engine::CepStateMachine;
 use wf_engine::sink::SinkDispatcher;
 use wf_engine::window::{Evictor, Router, RulePush, WindowRegistry};
@@ -48,7 +47,7 @@ pub(super) fn spawn_alert_task(
     let mut by_sink = HashMap::new();
 
     // Error sinks first: their senders feed the escalation list.
-    let mut error_txs: Vec<mpsc::Sender<Arc<OutputRecord>>> = Vec::new();
+    let mut error_txs: Vec<mpsc::Sender<Arc<DataRecord>>> = Vec::new();
     for sink in dispatcher.error_sinks() {
         let (tx, rx) = mpsc::channel(alert_task::SINK_CHANNEL_CAPACITY);
         error_txs.push(tx);
