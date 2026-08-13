@@ -74,20 +74,33 @@ impl Window {
     /// schema does not match the window schema. After appending, memory
     /// eviction runs if `current_bytes > max_window_bytes`.
     pub fn append(&mut self, batch: RecordBatch) -> CoreResult<()> {
-        self.append_inner(batch, None)
+        self.append_inner(batch, None, None)
     }
 
     /// Append a RecordBatch whose events were already parsed *outside* the
     /// window lock (by the router). Rule tasks then read the pre-parsed `Arc`
     /// with no `OnceLock` contention among the concurrent rule tasks.
     pub fn append_parsed(&mut self, batch: RecordBatch, parsed_events: Arc<Vec<Event>>) -> CoreResult<()> {
-        self.append_inner(batch, Some(parsed_events))
+        self.append_inner(batch, Some(parsed_events), None)
+    }
+
+    /// Append a RecordBatch whose events *and content byte size* were precomputed
+    /// by the caller (the R2 parse worker), so the O(rows×cols) accounting runs
+    /// in parallel rather than on the ordered commit path.
+    pub fn append_parsed_sized(
+        &mut self,
+        batch: RecordBatch,
+        parsed_events: Arc<Vec<Event>>,
+        byte_size: usize,
+    ) -> CoreResult<()> {
+        self.append_inner(batch, Some(parsed_events), Some(byte_size))
     }
 
     fn append_inner(
         &mut self,
         batch: RecordBatch,
         parsed_events: Option<Arc<Vec<Event>>>,
+        byte_size: Option<usize>,
     ) -> CoreResult<()> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -117,7 +130,7 @@ impl Window {
         // inflates `get_array_memory_size` with padding (~7x for decoded arrays),
         // so a single padded frame can exceed max_window_bytes and be silently
         // dropped even though its data is small (wp-labs/wp-reactor#18).
-        let byte_size = content_bytes(&batch);
+        let byte_size = byte_size.unwrap_or_else(|| content_bytes(&batch));
         let seq = self.next_seq;
         self.next_seq += 1;
 

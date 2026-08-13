@@ -22,7 +22,7 @@ impl Window {
     /// Windows without a time column never advance the watermark and never
     /// reject data as late.
     pub fn append_with_watermark(&mut self, batch: RecordBatch) -> CoreResult<AppendOutcome> {
-        self.append_with_watermark_inner(batch, None)
+        self.append_with_watermark_inner(batch, None, None)
     }
 
     /// Like [`Self::append_with_watermark`], but stores already-parsed events
@@ -33,13 +33,26 @@ impl Window {
         batch: RecordBatch,
         parsed_events: Arc<Vec<Event>>,
     ) -> CoreResult<AppendOutcome> {
-        self.append_with_watermark_inner(batch, Some(parsed_events))
+        self.append_with_watermark_inner(batch, Some(parsed_events), None)
+    }
+
+    /// Like [`Self::append_with_watermark_parsed`], but with a precomputed
+    /// content byte size (R2: computed in the parallel parse worker, so the
+    /// O(rows×cols) accounting stays off the ordered commit path).
+    pub fn append_with_watermark_parsed_sized(
+        &mut self,
+        batch: RecordBatch,
+        parsed_events: Arc<Vec<Event>>,
+        byte_size: usize,
+    ) -> CoreResult<AppendOutcome> {
+        self.append_with_watermark_inner(batch, Some(parsed_events), Some(byte_size))
     }
 
     fn append_with_watermark_inner(
         &mut self,
         batch: RecordBatch,
         parsed_events: Option<Arc<Vec<Event>>>,
+        byte_size: Option<usize>,
     ) -> CoreResult<AppendOutcome> {
         if batch.num_rows() == 0 {
             return Ok(AppendOutcome::Appended);
@@ -91,9 +104,10 @@ impl Window {
             self.watermark_nanos = self.watermark_nanos.max(candidate);
         }
 
-        match parsed_events {
-            Some(events) => self.append_parsed(batch, events)?,
-            None => self.append(batch)?,
+        match (parsed_events, byte_size) {
+            (Some(events), Some(size)) => self.append_parsed_sized(batch, events, size)?,
+            (Some(events), None) => self.append_parsed(batch, events)?,
+            (None, _) => self.append(batch)?,
         }
         Ok(AppendOutcome::Appended)
     }

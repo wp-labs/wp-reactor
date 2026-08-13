@@ -6,7 +6,7 @@ use wf_config::DistMode;
 use crate::error::CoreResult;
 use crate::match_engine::{Event, batch_to_events, batch_to_events_filtered};
 
-use super::buffer::AppendOutcome;
+use super::buffer::{AppendOutcome, content_bytes};
 use super::fanout::RuleFanout;
 use super::registry::WindowRegistry;
 
@@ -47,6 +47,9 @@ pub struct ParsedWindow {
 pub struct ParsedRoute {
     pub windows: Vec<ParsedWindow>,
     pub skipped_non_local: usize,
+    /// Content byte size of the batch, computed once in the parallel parse
+    /// stage so the ordered commit path skips the O(rows×cols) accounting.
+    pub byte_size: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +136,7 @@ impl Router {
         ParsedRoute {
             windows,
             skipped_non_local,
+            byte_size: content_bytes(batch),
         }
     }
 
@@ -148,6 +152,7 @@ impl Router {
         parsed: ParsedRoute,
     ) -> CoreResult<RouteReport> {
         let rows = batch.num_rows();
+        let byte_size = parsed.byte_size;
         let mut report = RouteReport {
             delivered: 0,
             dropped_late: 0,
@@ -162,7 +167,11 @@ impl Router {
                 .expect("subscription references non-existent window");
             let outcome = {
                 let mut win = win_lock.write().expect("window lock poisoned");
-                win.append_with_watermark_parsed(batch.clone(), Arc::clone(&window.events))?
+                win.append_with_watermark_parsed_sized(
+                    batch.clone(),
+                    Arc::clone(&window.events),
+                    byte_size,
+                )?
             };
 
             match outcome {
