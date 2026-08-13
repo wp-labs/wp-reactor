@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
@@ -29,6 +29,18 @@ use super::window_lookup::RegistryLookup;
 
 const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
 const DEBUG_DETAIL_LIMIT: usize = 20;
+/// Batch the allocation-heavy per-alert telemetry (detail map + e2e latency
+/// histogram): only 1 in N emitted alerts updates those, the exact total is
+/// always counted.
+const EMIT_METRIC_SAMPLE_INTERVAL: u32 = 64;
+
+/// Current wall-clock epoch nanos.
+fn wall_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
 
 #[derive(Debug, Default)]
 struct RuleBatchDebugStats {
@@ -114,6 +126,21 @@ pub(super) struct RuleTask {
     pub(super) push_rx: Option<mpsc::UnboundedReceiver<RulePush>>,
     /// Monotonic batch sequence for pushed batches (debug event refs only).
     pushed_seq: u64,
+    /// Profiling accumulators (nanos) for locating the rule-task bottleneck.
+    advance_nanos: u64,
+    scan_nanos: u64,
+    emit_nanos: u64,
+    /// Finer emit split: execute_match / to_data_record / fanout handoff.
+    exec_nanos: u64,
+    serialize_nanos: std::sync::atomic::AtomicU64,
+    fanout_nanos: std::sync::atomic::AtomicU64,
+    /// Last wall-clock dump of the profiling accumulators (throttled log).
+    last_profile_dump: std::time::Instant,
+    /// Wall-clock nanos cached once per batch — avoids a `SystemTime::now()`
+    /// syscall on every emitted alert.
+    cached_wall_nanos: AtomicU64,
+    /// Countdown for sampling the allocation-heavy per-alert telemetry.
+    emit_sample_remaining: AtomicU32,
 }
 
 impl RuleTask {
@@ -193,6 +220,15 @@ impl RuleTask {
             last_activity_wall: std::time::Instant::now(),
             push_rx,
             pushed_seq: 0,
+            advance_nanos: 0,
+            scan_nanos: 0,
+            emit_nanos: 0,
+            exec_nanos: 0,
+            serialize_nanos: std::sync::atomic::AtomicU64::new(0),
+            fanout_nanos: std::sync::atomic::AtomicU64::new(0),
+            last_profile_dump: std::time::Instant::now(),
+            cached_wall_nanos: AtomicU64::new(wall_nanos()),
+            emit_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
         };
         (task, cancel, timeout_scan_interval)
     }
@@ -313,13 +349,18 @@ impl RuleTask {
         // periodic timeout scan can advance the watermark across idle gaps.
         if !events.is_empty() {
             self.last_activity_wall = std::time::Instant::now();
+            // Cache wall time for the emit path's e2e-latency sample.
+            self.cached_wall_nanos.store(wall_nanos(), Ordering::Relaxed);
         }
         let lookup = RegistryLookup(&self.router);
         for (row_index, event) in events.iter().enumerate() {
             if let Some(machine) = &mut self.machine {
                 let event_nanos = machine.event_time_nanos(event);
+                let _scan_start = Instant::now();
                 let closes =
                     machine.scan_expired_at_with_conv(event_nanos, self.conv_plan.as_ref());
+                self.scan_nanos += _scan_start.elapsed().as_nanos() as u64;
+                let _advance_start = Instant::now();
                 let mut matched = Vec::new();
                 for alias in ordered_aliases {
                     if !self
@@ -465,6 +506,8 @@ impl RuleTask {
                         }
                     }
                 }
+                self.advance_nanos += _advance_start.elapsed().as_nanos() as u64;
+                let _emit_start = Instant::now();
 
                 for close in &closes {
                     match self.executor.execute_close_with_joins(close, &lookup) {
@@ -516,8 +559,10 @@ impl RuleTask {
                     if let Some(metrics) = &self.metrics {
                         metrics.inc_rule_match(self.rule_name());
                     }
+                    let _exec_start = Instant::now();
                     match self.executor.execute_match_with_joins(&ctx, &lookup) {
                         Ok(Some(record)) => {
+                            self.exec_nanos += _exec_start.elapsed().as_nanos() as u64;
                             if debug_enabled {
                                 stats.count_output(&record, &self.intermediate_targets);
                             }
@@ -560,6 +605,7 @@ impl RuleTask {
                         }
                     }
                 }
+                self.emit_nanos += _emit_start.elapsed().as_nanos() as u64;
             } else if let Some(alias) = self
                 .each_alias
                 .as_ref()
@@ -667,6 +713,27 @@ impl RuleTask {
                 );
             }
         }
+        self.dump_profiling();
+    }
+
+    /// Log the cumulative advance/scan/emit profiler accumulators once per
+    /// second (throttled) so a run's phase split can be read from the log.
+    fn dump_profiling(&mut self) {
+        if self.last_profile_dump.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_profile_dump = std::time::Instant::now();
+        wf_info!(pipe,
+            rule = %self.rule_name(),
+            phase = "profile",
+            scan_nanos = self.scan_nanos,
+            advance_nanos = self.advance_nanos,
+            exec_nanos = self.exec_nanos,
+            serialize_nanos = self.serialize_nanos.load(Ordering::Relaxed),
+            fanout_nanos = self.fanout_nanos.load(Ordering::Relaxed),
+            emit_nanos = self.emit_nanos,
+            "rule profiling"
+        );
     }
 
     /// Update the periodic per-rule instance-count metric.
@@ -709,6 +776,7 @@ impl RuleTask {
         let Some(machine) = &self.machine else {
             return;
         };
+        self.cached_wall_nanos.store(wall_nanos(), Ordering::Relaxed);
         // Advance the effective watermark by the wall-clock time elapsed since the
         // last event was processed. This lets instances expire per their window TTL
         // even when input is completely idle (window semantics, not just event-time).
@@ -823,6 +891,7 @@ impl RuleTask {
         let Some(_) = &self.machine else {
             return;
         };
+        self.cached_wall_nanos.store(wall_nanos(), Ordering::Relaxed);
         let started = Instant::now();
         let lookup = RegistryLookup(&self.router);
         let (rule_name, closes) = {
@@ -928,14 +997,25 @@ impl RuleTask {
             return;
         }
         if let Some(metrics) = &self.metrics {
-            metrics.inc_alert_emitted(&record.rule_name, &record.machine_id, &record.scope_key);
-            // E2E latency from event occurrence to alert emission
-            let now_nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            let e2e_nanos = now_nanos.saturating_sub(record.event_time_nanos.max(0) as u64);
-            metrics.observe_event_e2e_latency(Duration::from_nanos(e2e_nanos));
+            // Exact total is cheap (one relaxed atomic); the allocation-heavy
+            // detail map + e2e histogram are sampled 1-in-N (batch).
+            metrics.inc_alert_emitted_total(&record.rule_name);
+            let now_nanos = self.cached_wall_nanos.load(Ordering::Relaxed);
+            let sample = self.emit_sample_remaining.load(Ordering::Relaxed);
+            if sample == 0 {
+                self.emit_sample_remaining
+                    .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
+                metrics.inc_alert_emitted_detail(
+                    &record.rule_name,
+                    &record.machine_id,
+                    &record.scope_key,
+                );
+                let e2e_nanos = now_nanos.saturating_sub(record.event_time_nanos.max(0) as u64);
+                metrics.observe_event_e2e_latency(Duration::from_nanos(e2e_nanos));
+            } else {
+                self.emit_sample_remaining
+                    .store(sample - 1, Ordering::Relaxed);
+            }
         }
         // Broadcast to the per-sink channels resolved by yield_target.
         let senders = self.sink_fanout.resolve(&record.yield_target);
@@ -945,6 +1025,7 @@ impl RuleTask {
         }
         // Serialize once (parallel across rule/shard workers), then broadcast
         // the shared DataRecord; each sink crops to its own output_fields.
+        let _ser_start = Instant::now();
         let data = match record.to_data_record() {
             Ok(data) => Arc::new(data),
             Err(e) => {
@@ -955,6 +1036,9 @@ impl RuleTask {
                 return;
             }
         };
+        self.serialize_nanos
+            .fetch_add(_ser_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let _fan_start = Instant::now();
         for tx in senders.iter() {
             match tx.try_send(Arc::clone(&data)) {
                 Ok(()) => {}
@@ -979,6 +1063,8 @@ impl RuleTask {
                 }
             }
         }
+        self.fanout_nanos
+            .fetch_add(_fan_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     fn emit_window_record(&self, record: OutputRecord) {

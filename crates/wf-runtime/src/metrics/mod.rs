@@ -1012,9 +1012,20 @@ impl RuntimeMetrics {
     }
 
     pub fn inc_alert_emitted(&self, rule: &str, machine_id: &str, scope_key: &str) {
+        self.inc_alert_emitted_total(rule);
+        self.inc_alert_emitted_detail(rule, machine_id, scope_key);
+    }
+
+    /// Cheap exact total: one relaxed atomic increment, no allocation.
+    pub fn inc_alert_emitted_total(&self, rule: &str) {
         if let Some(v) = self.alert_emitted_total.get(rule) {
             v.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Per-machine/per-scope detail — allocation + sharded mutex per call.
+    /// Callers on hot alert paths should sample this (see rule_task emit).
+    pub fn inc_alert_emitted_detail(&self, rule: &str, machine_id: &str, scope_key: &str) {
         if machine_id.is_empty() && scope_key.is_empty() {
             return;
         }
