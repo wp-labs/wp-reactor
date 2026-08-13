@@ -6,7 +6,9 @@ use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 use wf_engine::match_engine::Value;
@@ -18,8 +20,10 @@ use super::arrow::{replay_arrow_framed_file, replay_arrow_ipc_file};
 use super::batch::build_record_batch_from_json;
 use super::csv::replay_csv_file;
 use super::ndjson::replay_ndjson_file;
-use super::route::{batch_machine_id, coerce_column, coerce_column_for_field, route_batch};
+use super::route::{batch_machine_id, coerce_column, coerce_column_for_field, prepare_batch};
 use super::{DEFAULT_STREAM_TAG_FIELD, ReplayRoute};
+use crate::lifecycle::parse_pool::{ParseItem, build_parse_item, push_decoded_batch, spawn_parse_pool};
+use crate::lifecycle::types::TaskGroup;
 use crate::metrics::{MetricsRecord, RuntimeMetrics};
 use wf_engine::match_engine::{
     WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY, WFL_FIELD_TYPE_OBJECT,
@@ -125,9 +129,46 @@ fn register_miss_provider(registry: &mut WindowRegistry) {
         .unwrap();
 }
 
-/// Count total rows across all batches in the test window snapshot.
-fn snapshot_row_count(router: &Router) -> usize {
-    snapshot_row_count_for(router, "test_win")
+/// Build a router + a real parse worker pool (R2/R3), returning the router, the
+/// parse channel sender, and the shared seq counter the replay functions push
+/// through. The parse workers run on the test's tokio runtime, so tests poll
+/// the window with [`wait_for_rows`] instead of asserting synchronously.
+fn make_parse_router(stream_name: &str) -> (Arc<Router>, mpsc::Sender<ParseItem>, Arc<AtomicU64>) {
+    attach_parse_pool(make_router(stream_name))
+}
+
+fn make_multi_parse_router() -> (Arc<Router>, mpsc::Sender<ParseItem>, Arc<AtomicU64>) {
+    attach_parse_pool(make_multi_stream_router())
+}
+
+fn attach_parse_pool(router: Arc<Router>) -> (Arc<Router>, mpsc::Sender<ParseItem>, Arc<AtomicU64>) {
+    let mut group = TaskGroup::new("test_parse");
+    let parse_tx = spawn_parse_pool(&router, None, 1, &mut group);
+    (router, parse_tx, Arc::new(AtomicU64::new(0)))
+}
+
+/// Poll the test window until it holds at least `expected` rows, yielding to the
+/// tokio runtime so the parse/commit workers can drain the pushed batches.
+async fn wait_for_rows(router: &Router, expected: usize) {
+    wait_for_rows_for(router, "test_win", expected).await;
+}
+
+/// [`wait_for_rows`] for a named window.
+async fn wait_for_rows_for(router: &Router, window: &str, expected: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if snapshot_row_count_for(router, window) >= expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {} rows in {} (have {})",
+            expected,
+            window,
+            snapshot_row_count_for(router, window)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn snapshot_row_count_for(router: &Router, window: &str) -> usize {
@@ -206,7 +247,7 @@ fn number_value(row: &std::collections::HashMap<String, Value>, key: &str) -> Op
 
 #[tokio::test]
 async fn file_ndjson_replay_routes_rows() {
-    let router = make_router("events");
+    let (router, parse_tx, parse_seq) = make_parse_router("events");
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.ndjson");
     std::fs::write(
@@ -242,17 +283,19 @@ async fn file_ndjson_replay_routes_rows() {
         }],
         Arc::clone(&router),
         None,
+        parse_tx.clone(),
+        Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
     .await
     .unwrap();
 
-    assert_eq!(snapshot_row_count(&router), 2);
+    wait_for_rows(&router, 2).await;
 }
 
 #[tokio::test]
 async fn file_ndjson_replay_routes_rows_by_row_stream() {
-    let router = make_multi_stream_router();
+    let (router, parse_tx, parse_seq) = make_multi_parse_router();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.ndjson");
     std::fs::write(
@@ -309,18 +352,20 @@ async fn file_ndjson_replay_routes_rows_by_row_stream() {
         &schemas,
         Arc::clone(&router),
         None,
+        parse_tx.clone(),
+        Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
     .await
     .unwrap();
 
-    assert_eq!(snapshot_row_count_for(&router, "win_a"), 2);
-    assert_eq!(snapshot_row_count_for(&router, "win_b"), 1);
+    wait_for_rows_for(&router, "win_a", 2).await;
+    wait_for_rows_for(&router, "win_b", 1).await;
 }
 
 #[tokio::test]
 async fn file_ndjson_dynamic_unknown_stream_is_window_miss() {
-    let router = make_multi_stream_router();
+    let (router, parse_tx, parse_seq) = make_multi_parse_router();
     let metrics = Arc::new(RuntimeMetrics::new(
         &[],
         &["win_a".to_string(), "win_b".to_string()],
@@ -384,13 +429,15 @@ async fn file_ndjson_dynamic_unknown_stream_is_window_miss() {
         &schemas,
         Arc::clone(&router),
         Some(Arc::clone(&metrics)),
+        parse_tx.clone(),
+        Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
     .await
     .unwrap();
 
-    assert_eq!(snapshot_row_count_for(&router, "win_a"), 1);
-    assert_eq!(snapshot_row_count_for(&router, "win_b"), 1);
+    wait_for_rows_for(&router, "win_a", 1).await;
+    wait_for_rows_for(&router, "win_b", 1).await;
 
     let records = metrics.snapshot().to_records();
     assert_eq!(
@@ -413,7 +460,7 @@ async fn file_ndjson_dynamic_unknown_stream_is_window_miss() {
 
 #[tokio::test]
 async fn file_csv_replay_routes_rows_by_stream_tag_field_column() {
-    let router = make_multi_stream_router();
+    let (router, parse_tx, parse_seq) = make_multi_parse_router();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.csv");
     std::fs::write(
@@ -470,18 +517,20 @@ a,3000000000,3\n",
         &schemas,
         Arc::clone(&router),
         None,
+        parse_tx.clone(),
+        Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
     .await
     .unwrap();
 
-    assert_eq!(snapshot_row_count_for(&router, "win_a"), 2);
-    assert_eq!(snapshot_row_count_for(&router, "win_b"), 1);
+    wait_for_rows_for(&router, "win_a", 2).await;
+    wait_for_rows_for(&router, "win_b", 1).await;
 }
 
 #[tokio::test]
 async fn file_csv_dynamic_unknown_stream_is_window_miss() {
-    let router = make_multi_stream_router();
+    let (router, parse_tx, parse_seq) = make_multi_parse_router();
     let metrics = Arc::new(RuntimeMetrics::new(
         &[],
         &["win_a".to_string(), "win_b".to_string()],
@@ -545,13 +594,15 @@ b,4000000000,4\n",
         &schemas,
         Arc::clone(&router),
         Some(Arc::clone(&metrics)),
+        parse_tx.clone(),
+        Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
     .await
     .unwrap();
 
-    assert_eq!(snapshot_row_count_for(&router, "win_a"), 1);
-    assert_eq!(snapshot_row_count_for(&router, "win_b"), 1);
+    wait_for_rows_for(&router, "win_a", 1).await;
+    wait_for_rows_for(&router, "win_b", 1).await;
 
     let records = metrics.snapshot().to_records();
     assert_eq!(
@@ -824,7 +875,7 @@ fn structured_array_stream_schema_rejects_utf8_object_metadata() {
 
 #[tokio::test]
 async fn file_arrow_framed_replay_routes_rows() {
-    let router = make_router("events");
+    let (router, parse_tx, parse_seq) = make_parse_router("events");
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.arrow_framed");
     let schema = test_schema();
@@ -866,17 +917,19 @@ async fn file_arrow_framed_replay_routes_rows() {
         }],
         Arc::clone(&router),
         None,
+        parse_tx.clone(),
+        Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
     .await
     .unwrap();
 
-    assert_eq!(snapshot_row_count(&router), 2);
+    wait_for_rows(&router, 2).await;
 }
 
 #[tokio::test]
 async fn file_arrow_framed_unknown_tag_is_window_miss() {
-    let router = make_router("events");
+    let (router, parse_tx, parse_seq) = make_parse_router("events");
     let metrics = Arc::new(RuntimeMetrics::new(
         &[],
         &["test_win".to_string()],
@@ -922,12 +975,14 @@ async fn file_arrow_framed_unknown_tag_is_window_miss() {
         }],
         Arc::clone(&router),
         Some(Arc::clone(&metrics)),
+        parse_tx.clone(),
+        Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
     .await
     .unwrap();
 
-    assert_eq!(snapshot_row_count(&router), 1);
+    wait_for_rows(&router, 1).await;
     let records = metrics.snapshot().to_records();
     assert_eq!(
         window_miss_metric_value(&records, "test_source", "unknown_stream_schema"),
@@ -941,7 +996,7 @@ async fn file_arrow_framed_unknown_tag_is_window_miss() {
 
 #[tokio::test]
 async fn file_arrow_ipc_replay_routes_rows() {
-    let router = make_router("events");
+    let (router, parse_tx, parse_seq) = make_parse_router("events");
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.arrow_ipc");
     let schema = test_schema();
@@ -978,12 +1033,14 @@ async fn file_arrow_ipc_replay_routes_rows() {
         }],
         Arc::clone(&router),
         None,
+        parse_tx.clone(),
+        Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
     .await
     .unwrap();
 
-    assert_eq!(snapshot_row_count(&router), 2);
+    wait_for_rows(&router, 2).await;
 }
 
 // ---- coerce_column ----
@@ -1137,10 +1194,12 @@ fn route_projects_plain_utf8_json_into_structured_window_schema() {
     )
     .unwrap();
 
-    route_batch("events", "test_source", batch, &router, None).unwrap();
-    let stored = router.registry().snapshot("alerts").unwrap();
+    // R3: routing now goes through the parse pool, whose route_parse/route_commit
+    // do not project — `prepare_batch` must produce the schema-conformant batch
+    // before push. Verify the projection directly.
+    let projected = prepare_batch("events", &batch, &router);
     assert_eq!(
-        stored[0]
+        projected
             .schema()
             .field(0)
             .metadata()
@@ -1148,7 +1207,7 @@ fn route_projects_plain_utf8_json_into_structured_window_schema() {
             .map(String::as_str),
         Some("object")
     );
-    let events = batch_to_events(&stored[0]);
+    let events = batch_to_events(&projected);
     let Value::Object(extension) = &events[0].fields["extension"] else {
         panic!("expected extension object");
     };
@@ -1188,10 +1247,11 @@ fn route_projects_wrong_structured_utf8_metadata_into_target_window_schema() {
     )
     .unwrap();
 
-    route_batch("events", "test_source", batch, &router, None).unwrap();
-    let stored = router.registry().snapshot("alerts").unwrap();
+    // R3: routing goes through the parse pool — `prepare_batch` must coerce the
+    // Utf8 field (carrying array metadata) to the target Object schema.
+    let projected = prepare_batch("events", &batch, &router);
     assert_eq!(
-        stored[0]
+        projected
             .schema()
             .field(0)
             .metadata()
@@ -1199,7 +1259,7 @@ fn route_projects_wrong_structured_utf8_metadata_into_target_window_schema() {
             .map(String::as_str),
         Some(WFL_FIELD_TYPE_OBJECT)
     );
-    let events = batch_to_events(&stored[0]);
+    let events = batch_to_events(&projected);
     let Value::Object(extension) = &events[0].fields["extension"] else {
         panic!("expected extension object");
     };
@@ -1263,4 +1323,118 @@ fn test_batch_machine_id() {
         vec!["10.0.0.1", "10.0.0.2"],
     )]);
     assert_eq!(batch_machine_id(&b), Some("10.0.0.1".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// R3: parse-pool push helpers (build_parse_item / push_decoded_batch)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn build_parse_item_assigns_monotonic_seq_and_stream() {
+    let router = make_router("events");
+    let seq = Arc::new(AtomicU64::new(0));
+    let batch = make_batch(&test_schema(), &[1_000_000_000, 2_000_000_000], &[1, 2]);
+    let item0 = build_parse_item(&seq, "src", "events", batch.clone(), &router, None);
+    let item1 = build_parse_item(&seq, "src", "events", batch, &router, None);
+    assert_eq!(item0.seq, 0);
+    assert_eq!(item1.seq, 1);
+    assert_eq!(item0.source_name, "src");
+    assert_eq!(item0.stream_name, "events");
+    assert_eq!(item0.batch.num_rows(), 2);
+}
+
+#[test]
+fn build_parse_item_records_receiver_metrics() {
+    let router = make_router("events");
+    let metrics = Arc::new(RuntimeMetrics::new(
+        &[],
+        &["test_win".to_string()],
+        &["src".to_string()],
+        BTreeMap::new(),
+    ));
+    let seq = Arc::new(AtomicU64::new(0));
+    let batch = make_batch(&test_schema(), &[1_000_000_000], &[1]);
+    let _ = build_parse_item(&seq, "src", "events", batch, &router, Some(&metrics));
+
+    let records = metrics.snapshot().to_records();
+    let rows = records.iter().find(|r| {
+        r.fields
+            .iter()
+            .any(|(k, v)| k == "name" && v == "rows_total")
+            && r.fields.iter().any(|(k, v)| k == "label" && v == "src")
+    });
+    let Some(rows) = rows else {
+        panic!("expected receiver rows_total metric for source 'src'");
+    };
+    let value: u64 = rows
+        .fields
+        .iter()
+        .find(|(k, _)| k == "value")
+        .expect("value field")
+        .1
+        .parse()
+        .expect("numeric value");
+    assert_eq!(value, 1);
+}
+
+#[tokio::test]
+async fn push_decoded_batch_commits_through_parse_pool() {
+    let (router, parse_tx, parse_seq) = make_parse_router("events");
+    let batch = make_batch(&test_schema(), &[1_000_000_000, 2_000_000_000], &[1, 2]);
+    let ok = push_decoded_batch(&parse_tx, &parse_seq, "src", "events", batch, &router, None).await;
+    assert!(ok, "push should succeed");
+    wait_for_rows(&router, 2).await;
+}
+
+#[tokio::test]
+async fn push_decoded_batch_returns_false_when_channel_closed() {
+    let router = make_router("events");
+    let seq = Arc::new(AtomicU64::new(0));
+    let (tx, rx) = mpsc::channel::<ParseItem>(1);
+    drop(rx); // receiver gone → send fails
+    let batch = make_batch(&test_schema(), &[1_000_000_000], &[1]);
+    let ok = push_decoded_batch(&tx, &seq, "src", "events", batch, &router, None).await;
+    assert!(!ok, "push to a closed parse channel must report failure");
+}
+
+#[tokio::test]
+async fn file_ndjson_replay_fails_when_parse_pool_closed() {
+    let router = make_router("events");
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("events.ndjson");
+    std::fs::write(&file_path, "{\"ts\":1000000000,\"value\":1}\n").unwrap();
+    let (tx, rx) = mpsc::channel::<ParseItem>(1);
+    drop(rx);
+
+    let result = replay_ndjson_file(
+        &file_path,
+        ReplayRoute {
+            stream_name: "events",
+            stream_tag_field: DEFAULT_STREAM_TAG_FIELD,
+        },
+        "test_source",
+        &[wf_lang::WindowSchema {
+            name: "test_win".to_string(),
+            streams: vec!["events".to_string()],
+            time_field: Some("ts".to_string()),
+            over: Duration::from_secs(3600),
+            fields: vec![
+                wf_lang::FieldDef {
+                    name: "ts".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Time),
+                },
+                wf_lang::FieldDef {
+                    name: "value".to_string(),
+                    field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Digit),
+                },
+            ],
+        }],
+        Arc::clone(&router),
+        None,
+        tx,
+        Arc::new(AtomicU64::new(0)),
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(result.is_err(), "replay must fail when the parse pool is gone");
 }
