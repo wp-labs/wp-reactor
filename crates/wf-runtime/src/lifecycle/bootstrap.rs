@@ -487,3 +487,109 @@ fn load_from_postgres(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    use wf_lang::ast::{CloseMode, Expr, MatchMode};
+    use wf_lang::plan::{EntityPlan, MatchPlan, RulePlan, ScorePlan, WindowSpec, YieldPlan};
+
+    fn minimal_plan(name: &str, target: &str) -> RulePlan {
+        RulePlan {
+            name: name.into(),
+            binds: vec![],
+            match_plan: MatchPlan {
+                keys: vec![],
+                key_map: None,
+                window_spec: WindowSpec::Sliding(Duration::from_secs(60)),
+                event_steps: vec![],
+                close_steps: vec![],
+                close_mode: CloseMode::Or,
+                tracked_bind_aliases: HashSet::new(),
+                tracked_bind_fields: HashMap::new(),
+                tracked_plain_fields: HashSet::new(),
+                seq: None,
+                match_mode: MatchMode::Seq,
+                accu: false,
+            },
+            each_plan: None,
+            joins: vec![],
+            entity_plan: EntityPlan {
+                entity_type: "ip".into(),
+                entity_id_expr: Expr::Bool(false),
+            },
+            yield_plan: YieldPlan {
+                target: target.into(),
+                version: None,
+                fields: vec![],
+            },
+            score_plan: ScorePlan {
+                expr: Expr::Number(1.0),
+            },
+            pattern_origin: None,
+            conv_plan: None,
+            limits_plan: None,
+        }
+    }
+
+    fn window_schema(name: &str, over: Duration, field: &str) -> wf_lang::WindowSchema {
+        wf_lang::WindowSchema {
+            name: name.into(),
+            streams: vec![],
+            time_field: None,
+            over,
+            fields: vec![wf_lang::FieldDef {
+                name: field.into(),
+                field_type: wf_lang::FieldType::Base(wf_lang::BaseType::Chars),
+            }],
+        }
+    }
+
+    #[test]
+    fn build_pipe_registry_extracts_schema_and_over() {
+        let plans = vec![minimal_plan("r1", "alerts"), minimal_plan("r2", "__wf_pipe_x")];
+        let plans_ref: Vec<_> = plans.iter().collect();
+        let schemas = vec![
+            window_schema("alerts", Duration::ZERO, "sip"),
+            window_schema("__wf_pipe_x", Duration::from_secs(60), "ev_count"),
+        ];
+
+        let reg = build_pipe_registry(&plans_ref, &schemas);
+
+        assert!(reg.contains("alerts"));
+        let alerts = reg.get("alerts").expect("alerts pipe");
+        assert_eq!(alerts.over, Duration::ZERO);
+        assert_eq!(alerts.schema.fields().len(), 1);
+        assert_eq!(alerts.schema.fields()[0].name(), "sip");
+
+        let pipe_x = reg.get("__wf_pipe_x").expect("pipeline pipe");
+        assert_eq!(pipe_x.over, Duration::from_secs(60));
+        assert_eq!(pipe_x.schema.fields()[0].name(), "ev_count");
+    }
+
+    #[test]
+    fn build_pipe_registry_dedups_yield_targets() {
+        // Two rules yielding the same target → the pipe is registered once.
+        let plans = vec![minimal_plan("r1", "alerts"), minimal_plan("r2", "alerts")];
+        let plans_ref: Vec<_> = plans.iter().collect();
+        let reg = build_pipe_registry(&plans_ref, &[]);
+
+        assert!(reg.contains("alerts"));
+        assert_eq!(reg.iter().len(), 1, "duplicate yield targets must dedup to one pipe");
+    }
+
+    #[test]
+    fn build_pipe_registry_unknown_target_gets_empty_schema() {
+        // A yield target with no matching window schema falls back to an empty
+        // schema + zero over (not a hard failure).
+        let plans = vec![minimal_plan("r1", "orphan_target")];
+        let plans_ref: Vec<_> = plans.iter().collect();
+        let reg = build_pipe_registry(&plans_ref, &[]);
+
+        let pipe = reg.get("orphan_target").expect("orphan pipe");
+        assert_eq!(pipe.over, Duration::ZERO);
+        assert!(pipe.schema.fields().is_empty());
+    }
+}

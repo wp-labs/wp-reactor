@@ -2843,3 +2843,46 @@ async fn port_scan_rule_triggers_close_alert() {
     assert_eq!(field_str(&alert, "__wfu_entity_type"), "ip");
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
 }
+
+#[tokio::test]
+async fn pure_relay_broadcasts_to_sharded_downstream() {
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, _alert_rx, router) = make_pipeline_stage_task();
+    // Two shards keyed by sip (P2a sharding on the intermediate pipe).
+    let (shard_a_tx, mut shard_a_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    let (shard_b_tx, mut shard_b_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    router.fanout().register_sharded(
+        "__wf_pipe_pipe_s1_w1",
+        vec![shard_a_tx, shard_b_tx],
+        std::sync::Arc::from([FieldRef::Simple("sip".into())]),
+    );
+
+    let ts = 1_700_000_000_123_000_000i64;
+    // Two events with the SAME key → the pure-relay broadcast must keep them on
+    // the same shard (deterministic key hash), even though nothing is stored.
+    let batch = make_batch(&schema, &["10.0.0.8", "10.0.0.8"], ts);
+    let source = router.registry().get_window("auth_events").unwrap();
+    source.write().unwrap().append(batch).unwrap();
+    task.pull_and_advance().await;
+
+    // Pure relay: nothing stored in the intermediate window.
+    assert!(
+        router
+            .registry()
+            .snapshot("__wf_pipe_pipe_s1_w1")
+            .unwrap_or_default()
+            .is_empty(),
+        "pure relay: sharded intermediate pipe must not be stored"
+    );
+
+    let a: Vec<_> = std::iter::from_fn(|| shard_a_rx.try_recv().ok()).collect();
+    let b: Vec<_> = std::iter::from_fn(|| shard_b_rx.try_recv().ok()).collect();
+    let (full, empty) = if a.len() > b.len() { (a, b) } else { (b, a) };
+    assert_eq!(full.len(), 2, "same-key events must land on the same shard");
+    assert!(empty.is_empty(), "the other shard must stay empty for the same key");
+    assert_eq!(
+        full[0].events[0].fields.get("sip"),
+        Some(&wf_engine::match_engine::Value::Str("10.0.0.8".into()))
+    );
+}
