@@ -1,4 +1,3 @@
-use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wf_lang::ast::FieldRef;
 
@@ -54,10 +53,37 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// Build a content-addressed output ID (16 hex chars from SHA-256).
+/// FNV-1a 64-bit — cheap content hash for the per-alert output ID. The ID only
+/// needs to be stable + collision-resistant enough for record identity; a
+/// cryptographic hash here is pure overhead on high-throughput alert paths
+/// (wfusion: 每 match 一次 SHA-256 曾是执行路径的最大单点)。
+struct Fnv1a {
+    state: u64,
+}
+
+impl Fnv1a {
+    fn new() -> Self {
+        Self {
+            state: 0xcbf2_9ce4_8422_2325,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.state ^= b as u64;
+            self.state = self.state.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finalize(self) -> u64 {
+        self.state
+    }
+}
+
+/// Build a content-addressed output ID (16 hex chars).
 ///
 /// Feeds rule_name, scope_key, fired_at, step_data, and origin
-/// into a SHA-256 hasher, then takes the first 8 bytes as 16 hex characters.
+/// through FNV-1a, then hex-encodes the 8-byte hash as 16 hex characters.
 pub(super) fn build_wfx_id(
     rule_name: &str,
     scope_key: &[Value],
@@ -65,7 +91,7 @@ pub(super) fn build_wfx_id(
     step_data: &[StepData],
     origin: &AlertOrigin,
 ) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = Fnv1a::new();
     hasher.update(rule_name.as_bytes());
     hasher.update(b"\x00");
     for v in scope_key {
@@ -80,14 +106,14 @@ pub(super) fn build_wfx_id(
             hasher.update(label.as_bytes());
         }
         hasher.update(b"\x1e");
-        hasher.update(sd.measure_value.to_bits().to_le_bytes());
+        hasher.update(&sd.measure_value.to_bits().to_le_bytes());
         hasher.update(b"\x1f");
     }
     hasher.update(b"\x00");
     hasher.update(origin.as_str().as_bytes());
     let hash = hasher.finalize();
-    // First 8 bytes → 16 hex characters
-    hex_encode(&hash[..8])
+    // 8 bytes → 16 hex characters
+    hex_encode(&hash.to_le_bytes())
 }
 
 pub(super) fn build_each_wfx_id(
@@ -96,10 +122,10 @@ pub(super) fn build_each_wfx_id(
     ctx: &crate::match_engine::match_engine::Event,
     origin: &AlertOrigin,
 ) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = Fnv1a::new();
     hasher.update(rule_name.as_bytes());
     hasher.update(b"\x00");
-    hasher.update(event_time_nanos.to_le_bytes());
+    hasher.update(&event_time_nanos.to_le_bytes());
     hasher.update(b"\x00");
 
     let mut fields: Vec<_> = ctx.fields.iter().collect();
@@ -114,7 +140,7 @@ pub(super) fn build_each_wfx_id(
     hasher.update(b"\x00");
     hasher.update(origin.as_str().as_bytes());
     let hash = hasher.finalize();
-    hex_encode(&hash[..8])
+    hex_encode(&hash.to_le_bytes())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
