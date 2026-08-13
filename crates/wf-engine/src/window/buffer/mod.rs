@@ -80,7 +80,7 @@ impl Window {
     /// Append a RecordBatch whose events were already parsed *outside* the
     /// window lock (by the router). Rule tasks then read the pre-parsed `Arc`
     /// with no `OnceLock` contention among the concurrent rule tasks.
-    pub fn append_parsed(&mut self, batch: RecordBatch, parsed_events: Arc<Vec<Event>>) -> CoreResult<()> {
+    pub fn append_parsed(&mut self, batch: RecordBatch, parsed_events: Arc<Vec<Arc<Event>>>) -> CoreResult<()> {
         self.append_inner(batch, Some(parsed_events), None)
     }
 
@@ -90,7 +90,7 @@ impl Window {
     pub fn append_parsed_sized(
         &mut self,
         batch: RecordBatch,
-        parsed_events: Arc<Vec<Event>>,
+        parsed_events: Arc<Vec<Arc<Event>>>,
         byte_size: usize,
     ) -> CoreResult<()> {
         self.append_inner(batch, Some(parsed_events), Some(byte_size))
@@ -99,7 +99,7 @@ impl Window {
     fn append_inner(
         &mut self,
         batch: RecordBatch,
-        parsed_events: Option<Arc<Vec<Event>>>,
+        parsed_events: Option<Arc<Vec<Arc<Event>>>>,
         byte_size: Option<usize>,
     ) -> CoreResult<()> {
         if batch.num_rows() == 0 {

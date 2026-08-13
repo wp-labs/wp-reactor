@@ -49,7 +49,7 @@ pub(in crate::window) struct TimedBatch {
     /// per rule), materializing the same `Value`s N times — the dominant RSS
     /// on object-heavy windows (wp-reactor#19). Parsing once here and sharing
     /// the `Arc` drops that to one copy for all rules.
-    pub(super) parsed_events: OnceLock<Arc<Vec<Event>>>,
+    pub(super) parsed_events: OnceLock<Arc<Vec<Arc<Event>>>>,
 }
 
 impl TimedBatch {
@@ -59,14 +59,14 @@ impl TimedBatch {
     /// `WindowParams::materialize_fields`); `None` materializes every schema
     /// field. The set is fixed per window, so the `OnceLock` cache stays
     /// consistent.
-    pub(super) fn events(&self, materialize: Option<&HashSet<String>>) -> Arc<Vec<Event>> {
+    pub(super) fn events(&self, materialize: Option<&HashSet<String>>) -> Arc<Vec<Arc<Event>>> {
         self.parsed_events
             .get_or_init(|| {
                 let events = match materialize {
                     Some(fields) => batch_to_events_filtered(&self.batch, fields),
                     None => batch_to_events(&self.batch),
                 };
-                Arc::new(events)
+                Arc::new(events.into_iter().map(Arc::new).collect())
             })
             .clone()
     }

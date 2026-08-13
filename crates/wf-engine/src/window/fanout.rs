@@ -13,7 +13,7 @@ use crate::match_engine::{Event, extract_key_simple, shard_index};
 #[derive(Clone)]
 pub struct RulePush {
     pub window_name: Arc<str>,
-    pub events: Arc<Vec<Event>>,
+    pub events: Arc<Vec<Arc<Event>>>,
 }
 
 /// A subscription for one window: either a single (unsharded) rule channel, or
@@ -29,7 +29,7 @@ enum Subscription {
 
 /// Fan-out table mapping window names to per-rule channels.
 ///
-/// The router (producer) broadcasts each parsed `Arc<Vec<Event>>` to every
+/// The router (producer) broadcasts each parsed `Arc<Vec<Arc<Event>>>` to every
 /// channel registered for the window it was appended to; rule tasks (consumers)
 /// receive those `Arc`s and advance their state machines without taking the
 /// window read lock. Registration happens at rule-task spawn time; closed
@@ -78,7 +78,7 @@ impl RuleFanout {
     /// Unsharded subscriptions receive the whole batch; sharded subscriptions
     /// partition it by match key. Uses unbounded channels so a slow consumer
     /// never blocks the router. Closed channels are pruned lazily here.
-    pub fn broadcast(&self, window_name: &str, events: &Arc<Vec<Event>>) {
+    pub fn broadcast(&self, window_name: &str, events: &Arc<Vec<Arc<Event>>>) {
         let subs: Vec<Subscription> = {
             let table = self.table.read().expect("fanout lock poisoned");
             table.get(window_name).cloned().unwrap_or_default()
@@ -136,16 +136,16 @@ fn broadcast_sharded(
     shards: &[mpsc::UnboundedSender<RulePush>],
     keys: &[FieldRef],
     window_name: &str,
-    events: &Arc<Vec<Event>>,
+    events: &Arc<Vec<Arc<Event>>>,
 ) -> bool {
     let n = shards.len();
-    let mut sub_batches: Vec<Vec<Event>> = (0..n).map(|_| Vec::new()).collect();
+    let mut sub_batches: Vec<Vec<Arc<Event>>> = (0..n).map(|_| Vec::new()).collect();
     for event in events.iter() {
         // Missing key → shard 0; the rule's state machine skips it anyway.
         let idx = extract_key_simple(event, keys)
             .map(|scope_key| shard_index(&scope_key, n))
             .unwrap_or(0);
-        sub_batches[idx].push(event.clone());
+        sub_batches[idx].push(Arc::clone(event));
     }
 
     let mut any_closed = false;
@@ -185,7 +185,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         fanout.register("win_a", tx);
 
-        let events: Arc<Vec<Event>> = Arc::new(Vec::new());
+        let events: Arc<Vec<Arc<Event>>> = Arc::new(Vec::new());
         fanout.broadcast("win_a", &events);
 
         let push = rx.try_recv().expect("registered channel should receive a push");
@@ -200,7 +200,7 @@ mod tests {
         fanout.register("win_a", tx);
         drop(rx); // close the channel
 
-        let events: Arc<Vec<Event>> = Arc::new(Vec::new());
+        let events: Arc<Vec<Arc<Event>>> = Arc::new(Vec::new());
         fanout.broadcast("win_a", &events);
 
         let table = fanout.table.read().expect("fanout lock poisoned");
@@ -218,7 +218,8 @@ mod tests {
         fanout.register_sharded("win_a", vec![tx0, tx1], Arc::from(keys().into_boxed_slice()));
 
         // Two distinct keys; each should land on a single (deterministic) shard.
-        let events: Arc<Vec<Event>> = Arc::new(vec![event("k1"), event("k2"), event("k1")]);
+        let events: Arc<Vec<Arc<Event>>> =
+            Arc::new(vec![Arc::new(event("k1")), Arc::new(event("k2")), Arc::new(event("k1"))]);
         fanout.broadcast("win_a", &events);
 
         let mut received = Vec::new();
@@ -242,7 +243,7 @@ mod tests {
 
         // Same key (`k1`) must land on the SAME shard across broadcasts.
         let idx = shard_index(&[Value::Str("k1".into())], 2);
-        let again: Arc<Vec<Event>> = Arc::new(vec![event("k1")]);
+        let again: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(event("k1"))]);
         fanout.broadcast("win_a", &again);
         let got0 = rx0.try_recv().map(|p| p.events.len()).unwrap_or(0);
         let got1 = rx1.try_recv().map(|p| p.events.len()).unwrap_or(0);

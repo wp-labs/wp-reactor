@@ -31,7 +31,7 @@ static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Two data paths are supported, selected by whether the config carries a push
 /// channel (`RuleTaskConfig::push_rx`):
 ///
-/// * **push** (R1, `Some`): the rule consumes `Arc<Vec<Event>>` from its channel
+/// * **push** (R1, `Some`): the rule consumes `Arc<Vec<Arc<Event>>>` from its channel
 ///   and advances the state machine — no window read lock on the data path.
 /// * **pull** (legacy, `None`): wakes on window notifications and reads new
 ///   batches via cursor-based `events_since()`.
@@ -50,7 +50,7 @@ pub(crate) async fn run_rule_task(config: RuleTaskConfig) -> RuntimeResult<()> {
     }
 }
 
-/// Push data path: consume `Arc<Vec<Event>>` from the rule's channel.
+/// Push data path: consume `Arc<Vec<Arc<Event>>>` from the rule's channel.
 async fn run_push_loop(
     task: &mut RuleTask,
     mut rx: mpsc::UnboundedReceiver<RulePush>,

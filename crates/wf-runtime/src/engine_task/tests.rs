@@ -1966,7 +1966,7 @@ async fn push_triggers_alert() {
     // push channel, and advance the state machine through the push path.
     let push = RulePush {
         window_name: "auth_events".into(),
-        events: Arc::new(batch_to_events(&batch)),
+        events: Arc::new(batch_to_events(&batch).into_iter().map(Arc::new).collect::<Vec<_>>()),
     };
     task.process_push(push).await;
 
@@ -2003,7 +2003,7 @@ async fn sharded_rule_produces_same_alerts_as_single_worker() {
         ],
         ts,
     );
-    let events = Arc::new(batch_to_events(&batch));
+    let events = Arc::new(batch_to_events(&batch).into_iter().map(Arc::new).collect::<Vec<_>>());
 
     // Single worker: feed the whole batch.
     let (mut single, mut single_rx, _w, _n) = make_task();

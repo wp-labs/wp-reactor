@@ -108,7 +108,7 @@ pub(super) struct RuleTask {
     /// even without new events (window semantics, not just event-time).
     last_activity_wall: std::time::Instant,
     /// Push-mode input channel (R1). When `Some`, the rule consumes pushed
-    /// `Arc<Vec<Event>>` instead of pulling from the window read lock; when
+    /// `Arc<Vec<Arc<Event>>>` instead of pulling from the window read lock; when
     /// `None`, the task falls back to the legacy notify + pull loop. Consumed
     /// once by `run_rule_task`.
     pub(super) push_rx: Option<mpsc::UnboundedReceiver<RulePush>>,
@@ -216,7 +216,7 @@ impl RuleTask {
         // Collect new events per window first (this phase only takes disjoint
         // field borrows), then process each batch — which needs `&mut self` and
         // would otherwise conflict with the `&self.sources` iteration.
-        let mut pending: Vec<(String, u64, Vec<Arc<Vec<Event>>>)> = Vec::new();
+        let mut pending: Vec<(String, u64, Vec<Arc<Vec<Arc<Event>>>>)> = Vec::new();
         for source in &self.sources {
             let cursor = self.cursors.get(&source.window_name).copied().unwrap_or(0);
             let (events_list, new_cursor, gap) = {
@@ -273,7 +273,7 @@ impl RuleTask {
         &mut self,
         window_name: &str,
         batch_seq: u64,
-        events: &Arc<Vec<Event>>,
+        events: &Arc<Vec<Arc<Event>>>,
     ) {
         let Some(aliases) = self.aliases.get(window_name) else {
             return;

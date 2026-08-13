@@ -31,7 +31,7 @@ impl Window {
     pub fn append_with_watermark_parsed(
         &mut self,
         batch: RecordBatch,
-        parsed_events: Arc<Vec<Event>>,
+        parsed_events: Arc<Vec<Arc<Event>>>,
     ) -> CoreResult<AppendOutcome> {
         self.append_with_watermark_inner(batch, Some(parsed_events), None)
     }
@@ -42,7 +42,7 @@ impl Window {
     pub fn append_with_watermark_parsed_sized(
         &mut self,
         batch: RecordBatch,
-        parsed_events: Arc<Vec<Event>>,
+        parsed_events: Arc<Vec<Arc<Event>>>,
         byte_size: usize,
     ) -> CoreResult<AppendOutcome> {
         self.append_with_watermark_inner(batch, Some(parsed_events), Some(byte_size))
@@ -51,7 +51,7 @@ impl Window {
     fn append_with_watermark_inner(
         &mut self,
         batch: RecordBatch,
-        parsed_events: Option<Arc<Vec<Event>>>,
+        parsed_events: Option<Arc<Vec<Arc<Event>>>>,
         byte_size: Option<usize>,
     ) -> CoreResult<AppendOutcome> {
         if batch.num_rows() == 0 {

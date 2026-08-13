@@ -50,7 +50,7 @@ pub(crate) struct RuleTaskConfig {
     /// finite inputs.
     pub eos_flush: watch::Receiver<u64>,
     /// Push-mode input channel. When `Some`, the rule task consumes pushed
-    /// `Arc<Vec<Event>>` from it instead of pulling from the window read lock
+    /// `Arc<Vec<Arc<Event>>>` from it instead of pulling from the window read lock
     /// (R1). When `None`, the task falls back to the legacy notify + pull loop.
     pub push_rx: Option<mpsc::UnboundedReceiver<RulePush>>,
 }

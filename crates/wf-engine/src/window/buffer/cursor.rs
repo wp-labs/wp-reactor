@@ -39,7 +39,7 @@ impl Window {
     /// batch is parsed exactly once instead of once per rule (wp-reactor#19).
     ///
     /// Returns `(events_per_batch, new_cursor, gap_detected)`.
-    pub fn events_since(&self, cursor: u64) -> (Vec<Arc<Vec<Event>>>, u64, bool) {
+    pub fn events_since(&self, cursor: u64) -> (Vec<Arc<Vec<Arc<Event>>>>, u64, bool) {
         if self.batches.is_empty() {
             return (Vec::new(), cursor, false);
         }
@@ -50,7 +50,7 @@ impl Window {
         }
         let gap = cursor < oldest_seq;
         let effective_start = if gap { oldest_seq } else { cursor };
-        let events: Vec<Arc<Vec<Event>>> = self
+        let events: Vec<Arc<Vec<Arc<Event>>>> = self
             .batches
             .iter()
             .filter(|tb| tb.seq >= effective_start)

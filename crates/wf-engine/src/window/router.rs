@@ -37,7 +37,7 @@ pub struct RouteReport {
 #[derive(Clone)]
 pub struct ParsedWindow {
     pub window_name: String,
-    pub events: Arc<Vec<Event>>,
+    pub events: Arc<Vec<Arc<Event>>>,
 }
 
 /// Parsed events for every local window of a stream.
@@ -66,7 +66,7 @@ pub struct ParsedRoute {
 pub struct Router {
     registry: WindowRegistry,
     /// Rule-channel fan-out: after each successful append, the router broadcasts
-    /// the parsed `Arc<Vec<Event>>` to every rule subscribed to that window.
+    /// the parsed `Arc<Vec<Arc<Event>>>` to every rule subscribed to that window.
     /// Kept alongside the registry (not inside it) so the MoJu model surface is
     /// unchanged.
     rule_fanout: Arc<RuleFanout>,
@@ -123,10 +123,15 @@ impl Router {
                 let win = win_lock.read().expect("window lock poisoned");
                 win.materialize_fields.clone()
             };
-            let events = Arc::new(match materialize.as_deref() {
-                Some(fields) => batch_to_events_filtered(batch, fields),
-                None => batch_to_events(batch),
-            });
+            let events = Arc::new(
+                match materialize.as_deref() {
+                    Some(fields) => batch_to_events_filtered(batch, fields),
+                    None => batch_to_events(batch),
+                }
+                .into_iter()
+                .map(Arc::new)
+                .collect::<Vec<_>>(),
+            );
             windows.push(ParsedWindow {
                 window_name,
                 events,
@@ -226,10 +231,15 @@ impl Router {
             let win = win_lock.read().expect("window lock poisoned");
             win.materialize_fields.clone()
         };
-        let parsed = Arc::new(match materialize.as_deref() {
-            Some(fields) => batch_to_events_filtered(&batch, fields),
-            None => batch_to_events(&batch),
-        });
+        let parsed = Arc::new(
+            match materialize.as_deref() {
+                Some(fields) => batch_to_events_filtered(&batch, fields),
+                None => batch_to_events(&batch),
+            }
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>(),
+        );
         let outcome = {
             let mut win = win_lock.write().expect("window lock poisoned");
             win.append_with_watermark_parsed(batch, Arc::clone(&parsed))?
