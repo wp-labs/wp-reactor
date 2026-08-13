@@ -287,7 +287,7 @@ pub(super) async fn spawn_receiver_task(
     let parse_tx = spawn_parse_pool(
         &router,
         metrics.clone(),
-        config.runtime.executor_parallelism,
+        config.runtime.parse_parallelism,
         &mut group,
     );
     let parse_seq = Arc::new(AtomicU64::new(0));

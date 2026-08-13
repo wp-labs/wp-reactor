@@ -59,7 +59,7 @@ name = "ingress"
 listen = "tcp://127.0.0.1:9800"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/base/*.wfs"
 rules = "rules/base/*.wfl"
@@ -130,7 +130,7 @@ stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/base/*.wfs"
 rules = "rules/base/*.wfl"
@@ -198,7 +198,7 @@ name = "ingress"
 listen = "tcp://127.0.0.1:9800"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/base/*.wfs"
 rules = "rules/base/*.wfl"
@@ -308,7 +308,7 @@ stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "${CASE_PATH}/schemas/base/*.wfs"
 rules = "${CASE_PATH}/rules/base/*.wfl"
@@ -367,7 +367,7 @@ stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/base/*.wfs"
 rules = "rules/base/*.wfl"
@@ -408,7 +408,7 @@ stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "${CASE_PATH}/schemas/base/*.wfs"
 rules = "${CASE_PATH}/rules/base/*.wfl"
@@ -454,7 +454,7 @@ stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "${CASE_PATH}/schemas/base/*.wfs"
 rules = "${CASE_PATH}/rules/base/*.wfl"
@@ -505,7 +505,7 @@ stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/base/*.wfs"
 rules = "rules/base/*.wfl"
@@ -570,7 +570,7 @@ stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/base/*.wfs"
 rules = "rules/base/*.wfl"

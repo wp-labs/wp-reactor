@@ -86,7 +86,7 @@ key = "ingress"
 listen = "tcp://127.0.0.1:9800"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules   = "rules/*.wfl"
@@ -100,7 +100,7 @@ fn load_full_toml() {
     assert_eq!(cfg.mode, FusionMode::Daemon);
 
     // runtime
-    assert_eq!(cfg.runtime.executor_parallelism, 2);
+    assert_eq!(cfg.runtime.parse_parallelism, 2);
     assert_eq!(
         cfg.runtime.rule_exec_timeout.as_duration(),
         Duration::from_secs(30),
@@ -194,7 +194,7 @@ key = "ingress"
 listen = "tcp://127.0.0.1:9800"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules = "rules/*.wfl"
@@ -222,7 +222,7 @@ key = "ingress"
 listen = "tcp://127.0.0.1:9800"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules = "rules/*.wfl"
@@ -242,7 +242,7 @@ fn reject_invalid_tcp_source_listen() {
 
 #[test]
 fn reject_zero_parallelism() {
-    let toml = FULL_TOML.replace("executor_parallelism = 2", "executor_parallelism = 0");
+    let toml = FULL_TOML.replace("parse_parallelism = 2", "parse_parallelism = 0");
     assert!(try_load_with_windows(&toml, WINDOWS_TOML).is_err());
 }
 
@@ -279,7 +279,7 @@ windows = "models/windows.toml"
 sinks = "sinks"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules   = "rules/*.wfl"
@@ -385,7 +385,7 @@ stream_tag = "${STREAM_NAME}"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "${CASE_PATH}/models/schemas/*.wfs"
 rules = "${CASE_PATH}/models/rules/*.wfl"
@@ -435,7 +435,7 @@ stream_tag = "netflow"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "${WF_CONFIG_TEST_CASE_PATH}/models/schemas/*.wfs"
 rules = "${WF_CONFIG_TEST_CASE_PATH}/models/rules/*.wfl"
@@ -491,7 +491,7 @@ stream_tag = "netflow"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "${CONFIG_DIR}/models/schemas/*.wfs"
 rules = "${WORK_DIR}/rules/*.wfl"
@@ -574,7 +574,7 @@ key = "ingress"
 listen = "tcp://127.0.0.1:9800"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/base/*.wfs"
 rules = "rules/base/*.wfl"
@@ -674,7 +674,7 @@ stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "${CASE_PATH}/schemas/*.wfs"
 rules = "${CASE_PATH}/rules/*.wfl"
@@ -742,7 +742,7 @@ stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/base/*.wfs"
 rules = "rules/base/*.wfl"
@@ -831,7 +831,7 @@ stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "conf/schemas/base/*.wfs"
 rules = "conf/rules/base/*.wfl"
@@ -1001,7 +1001,7 @@ sinks = "${CASE_PATH}/sinks"
 sources_dir = "sources.d"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "${CONFIG_DIR}/models/schemas/*.wfs"
 rules = "${WORK_DIR}/rules/*.wfl"
@@ -1087,7 +1087,7 @@ sinks = "sinks"
 sources_dir = "sources.d"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "models/schemas/*.wfs"
 rules = "rules/*.wfl"
@@ -1144,7 +1144,7 @@ sinks = "sinks"
 sources_dir = "sources.d"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "models/schemas/*.wfs"
 rules = "rules/*.wfl"
@@ -1246,7 +1246,7 @@ stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules = "rules/*.wfl"
@@ -1335,7 +1335,7 @@ stream_tag = "syslog"
 data_format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules = "rules/*.wfl"
@@ -1381,7 +1381,7 @@ stream_tag = "events"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules = "rules/*.wfl"
@@ -1438,7 +1438,7 @@ stream_tag = "events"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "schemas/*.wfs"
 rules = "rules/*.wfl"

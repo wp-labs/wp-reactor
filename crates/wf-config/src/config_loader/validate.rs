@@ -11,9 +11,9 @@ use crate::window::WindowConfig;
 
 /// Internal validation, called automatically during `FusionConfig::from_str` / `load`.
 pub(crate) fn validate(config: &FusionConfig) -> ConfigResult<()> {
-    // runtime.executor_parallelism > 0
-    if config.runtime.executor_parallelism == 0 {
-        return ConfigReason::Validation.fail("runtime.executor_parallelism must be > 0");
+    // runtime.parse_parallelism > 0
+    if config.runtime.parse_parallelism == 0 {
+        return ConfigReason::Validation.fail("runtime.parse_parallelism must be > 0");
     }
     validate_output_config(config)?;
 
@@ -314,8 +314,8 @@ mod tests {
         FusionConfig {
             mode,
             runtime: crate::config_loader::runtime::RuntimeConfig {
-                executor_parallelism: 2,
-                rule_shards: 1,
+                parse_parallelism: 2,
+                rule_parallelism: 1,
                 rule_exec_timeout: "30s".parse().unwrap(),
                 schemas: "schemas/*.wfs".into(),
                 rules: "rules/*.wfl".into(),

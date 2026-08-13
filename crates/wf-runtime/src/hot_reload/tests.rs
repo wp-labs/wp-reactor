@@ -47,7 +47,7 @@ name = "ingress"
 listen = "tcp://127.0.0.1:0"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "{runtime_schemas}"
 rules = "{runtime_rules}"

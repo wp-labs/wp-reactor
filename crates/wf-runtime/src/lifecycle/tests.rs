@@ -50,7 +50,7 @@ stream_tag = "syslog"
 data_format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "{schemas}"
 rules = "{rules}"

@@ -40,7 +40,7 @@ stream_tag = "syslog"
 format = "ndjson"
 
 [runtime]
-executor_parallelism = 2
+parse_parallelism = 2
 rule_exec_timeout = "30s"
 schemas = "${CASE_PATH}/schemas/base/*.wfs"
 rules = "${CASE_PATH}/rules/base/*.wfl"
