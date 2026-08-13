@@ -388,6 +388,7 @@ fn make_task_with_window_bytes(
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -502,6 +503,7 @@ fn make_pipeline_stage_task() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -588,6 +590,7 @@ fn make_each_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -689,6 +692,7 @@ fn make_filtered_match_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -803,6 +807,7 @@ fn make_filtered_close_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -886,6 +891,7 @@ fn make_filtered_each_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1001,6 +1007,7 @@ fn make_intermediate_each_task() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1098,6 +1105,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1202,6 +1210,7 @@ fn make_intermediate_score_tasks() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1337,6 +1346,7 @@ fn make_intermediate_score_tasks() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::new(),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1442,6 +1452,7 @@ fn make_intermediate_score_band_tasks() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1630,6 +1641,7 @@ fn make_intermediate_score_band_tasks() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::new(),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1799,6 +1811,7 @@ fn make_filtered_bind_alias_match_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1907,6 +1920,7 @@ fn make_window_has_match_task() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::new(),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -2212,6 +2226,9 @@ async fn pipeline_stage_output_writes_internal_window_instead_of_alert_channel()
     let schema = test_schema();
     let (mut task, mut alert_rx, router) = make_pipeline_stage_task();
     let ts = 1_700_000_000_123_000_000i64;
+    // Pure relay (P1c): register a downstream rule subscriber; no window storage.
+    let (down_tx, mut down_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    router.fanout().register("__wf_pipe_pipe_s1_w1", down_tx);
 
     let batch = make_batch(&schema, &["10.0.0.8"], ts);
     let source = router.registry().get_window("auth_events").unwrap();
@@ -2223,12 +2240,17 @@ async fn pipeline_stage_output_writes_internal_window_instead_of_alert_channel()
         "internal pipeline stage must not emit sink alerts"
     );
 
-    let out_batches = router
-        .registry()
-        .snapshot("__wf_pipe_pipe_s1_w1")
-        .expect("internal window missing");
-    assert_eq!(out_batches.len(), 1);
-    let rows = batch_to_events(&out_batches[0]);
+    // Pure relay: the internal pipe is NOT stored — events broadcast downstream.
+    assert!(
+        router
+            .registry()
+            .snapshot("__wf_pipe_pipe_s1_w1")
+            .unwrap_or_default()
+            .is_empty(),
+        "pure relay: internal pipe must not be stored in a window"
+    );
+    let push = down_rx.try_recv().expect("downstream rule received pipeline events");
+    let rows = push.events;
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].fields.get("sip"),
@@ -2250,6 +2272,9 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
     let schema = test_schema();
     let (mut task, mut alert_rx, router) = make_intermediate_each_task();
     let ts = 4_000_000_000_000_000_000i64;
+    // Pure relay (P1c): register a downstream rule subscriber; no window storage.
+    let (down_tx, mut down_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    router.fanout().register("enriched_events", down_tx);
 
     let batch = make_batch(&schema, &["10.0.0.8"], ts);
     let source = router.registry().get_window("auth_events").unwrap();
@@ -2261,12 +2286,17 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
         "intermediate targets must not emit sink alerts"
     );
 
-    let out_batches = router
-        .registry()
-        .snapshot("enriched_events")
-        .expect("intermediate window missing");
-    assert_eq!(out_batches.len(), 1);
-    let rows = batch_to_events(&out_batches[0]);
+    // Pure relay: no window storage; events broadcast to downstream rules.
+    assert!(
+        router
+            .registry()
+            .snapshot("enriched_events")
+            .unwrap_or_default()
+            .is_empty(),
+        "pure relay: intermediate pipe must not be stored in a window"
+    );
+    let push = down_rx.try_recv().expect("downstream rule received intermediate events");
+    let rows = push.events;
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].fields.get("sip"),
@@ -2353,6 +2383,9 @@ async fn intermediate_target_preserves_explicit_time_field() {
     let schema = test_schema();
     let (mut task, mut alert_rx, router) = make_intermediate_each_task_with_explicit_time();
     let ts = 4_000_000_000_000_000i64;
+    // Pure relay (P1c): register a downstream rule subscriber; no window storage.
+    let (down_tx, mut down_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    router.fanout().register("enriched_events", down_tx);
 
     let batch = make_batch(&schema, &["10.0.0.8"], ts);
     let source = router.registry().get_window("auth_events").unwrap();
@@ -2361,16 +2394,22 @@ async fn intermediate_target_preserves_explicit_time_field() {
 
     assert!(alert_rx.try_recv().is_err());
 
-    let out_batches = router
-        .registry()
-        .snapshot("enriched_events")
-        .expect("intermediate window missing");
-    let ts_col = out_batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-        .expect("event_time should be timestamp nanos");
-    assert_eq!(ts_col.value(0), 10_000_000_000_000_000);
+    // Pure relay: no window storage; the broadcast event preserves the explicit
+    // time field as epoch nanos.
+    assert!(
+        router
+            .registry()
+            .snapshot("enriched_events")
+            .unwrap_or_default()
+            .is_empty(),
+        "pure relay: intermediate pipe must not be stored in a window"
+    );
+    let push = down_rx.try_recv().expect("downstream rule received intermediate events");
+    let event = &push.events[0];
+    assert_eq!(
+        event.fields.get("event_time"),
+        Some(&wf_engine::match_engine::Value::Number(10_000_000_000_000_000.0))
+    );
 }
 
 #[tokio::test]
@@ -2385,8 +2424,15 @@ async fn downstream_close_aggregates_intermediate_float_fields() {
     let source = router.registry().get_window("auth_events").unwrap();
     source.write().unwrap().append(batch).unwrap();
 
+    // Pure relay (P1c): the intermediate pipe is not stored in a window; the
+    // downstream rule consumes the broadcast via push.
+    let (down_tx, mut down_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    router.fanout().register("semantic_events", down_tx);
+
     upstream_task.pull_and_advance().await;
-    downstream_task.pull_and_advance().await;
+    while let Ok(push) = down_rx.try_recv() {
+        downstream_task.process_push(push).await;
+    }
     downstream_task.flush().await;
 
     let alert = alert_rx.recv().await.expect("expected downstream alert");
@@ -2418,8 +2464,15 @@ async fn downstream_close_counts_filtered_bind_aliases() {
     let source = router.registry().get_window("auth_events").unwrap();
     source.write().unwrap().append(batch).unwrap();
 
+    // Pure relay (P1c): the intermediate pipe is not stored in a window; the
+    // downstream rule consumes the broadcast via push.
+    let (down_tx, mut down_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    router.fanout().register("semantic_events", down_tx);
+
     upstream_task.pull_and_advance().await;
-    downstream_task.pull_and_advance().await;
+    while let Ok(push) = down_rx.try_recv() {
+        downstream_task.process_push(push).await;
+    }
     downstream_task.flush().await;
 
     let alert = alert_rx.recv().await.expect("expected downstream alert");
@@ -2755,6 +2808,7 @@ async fn port_scan_rule_triggers_close_alert() {
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
+                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
