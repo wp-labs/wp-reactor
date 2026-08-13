@@ -118,6 +118,7 @@ pub(super) fn spawn_rule_tasks(
     rules: Vec<RunRule>,
     router: &Arc<Router>,
     intermediate_targets: &HashSet<String>,
+    pipe_registry: std::sync::Arc<wf_engine::pipe::PipeRegistry>,
     sink_fanout: Arc<alert_task::SinkFanout>,
     cancel: CancellationToken,
     metrics: Option<Arc<RuntimeMetrics>>,
@@ -152,6 +153,7 @@ pub(super) fn spawn_rule_tasks(
                     router: Arc::clone(router),
                     metrics: metrics.clone(),
                     intermediate_targets: intermediate_targets.clone(),
+                    pipe_registry: Arc::clone(&pipe_registry),
                     eos_flush: eos_tx.subscribe(),
                     push_rx: Some(push_rx),
                 };
@@ -191,6 +193,7 @@ pub(super) fn spawn_rule_tasks(
                             router: Arc::clone(router),
                             metrics: metrics.clone(),
                             intermediate_targets: intermediate_targets.clone(),
+                    pipe_registry: Arc::clone(&pipe_registry),
                             eos_flush: eos_tx.subscribe(),
                             push_rx: Some(push_rx),
                         };
@@ -224,6 +227,7 @@ pub(super) fn spawn_rule_tasks(
                         router: Arc::clone(router),
                         metrics: metrics.clone(),
                         intermediate_targets: intermediate_targets.clone(),
+                    pipe_registry: Arc::clone(&pipe_registry),
                         eos_flush: eos_tx.subscribe(),
                         push_rx: Some(push_rx),
                     };

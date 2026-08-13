@@ -165,6 +165,47 @@ pub(super) async fn load_and_compile(
     })
 }
 
+/// Build the pipe registry from the yield topology: every rule's `yield` target
+/// (output or intermediate) becomes a [`wf_engine::pipe::Pipe`], carrying the
+/// target window's schema (for output cropping) and retention `over`. Pipes are
+/// the output/intermediate relay abstraction (pipe design, P1); input match
+/// windows stay in `window/`.
+pub(crate) fn build_pipe_registry(
+    all_rule_plans: &[&wf_lang::plan::RulePlan],
+    runtime_schemas: &[wf_lang::WindowSchema],
+) -> std::sync::Arc<wf_engine::pipe::PipeRegistry> {
+    use arrow::datatypes::{Schema, SchemaRef};
+    use wf_engine::pipe::{Pipe, PipeRegistry};
+
+    use crate::receiver::schema::field_to_arrow;
+
+    let registry = PipeRegistry::new();
+    for plan in all_rule_plans {
+        let target = &plan.yield_plan.target;
+        if registry.contains(target) {
+            continue;
+        }
+        let (schema, over) = runtime_schemas
+            .iter()
+            .find(|ws| ws.name == *target)
+            .map(|ws| {
+                let fields: Vec<arrow::datatypes::Field> = ws
+                    .fields
+                    .iter()
+                    .map(|f| field_to_arrow(&f.name, &f.field_type))
+                    .collect();
+                (Arc::new(Schema::new(fields)) as SchemaRef, ws.over)
+            })
+            .unwrap_or_else(|| (Arc::new(Schema::empty()), std::time::Duration::ZERO));
+        registry.register(Pipe {
+            name: target.clone(),
+            schema,
+            over,
+        });
+    }
+    Arc::new(registry)
+}
+
 fn register_window_miss_provider(
     registry: &mut WindowRegistry,
     window_configs: &[wf_config::WindowConfig],

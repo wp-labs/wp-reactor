@@ -143,10 +143,17 @@ impl Reactor {
 
         // (d) Spawn the new rule generation, reusing the shared
         //     router/alert_tx/metrics so window state is preserved.
+        // Pipe registry mirrors the new yield topology (schemas filled from the
+        // boot-time registry; the reload path has no fresh schemas here, and the
+        // pipe schema is only used for output cropping which the existing window
+        // schema covers).
+        let plans: Vec<_> = new_rules.iter().map(|r| r.executor.plan()).collect();
+        let pipe_registry = super::bootstrap::build_pipe_registry(&plans, &[]);
         let group = spawn_rule_tasks(
             new_rules,
             &self.router,
             &new_intermediate_targets,
+            pipe_registry,
             self.sink_fanout.clone().unwrap_or_else(|| {
                 // Reactor is shutting down (sink_fanout already taken in `wait`).
                 // Use a closed fanout so the new rule generation's emits are

@@ -14,7 +14,7 @@
 //! Reference: `docs/design/rule-sharding-and-aggregation-window.md`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
@@ -76,6 +76,7 @@ impl PipeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use arrow::datatypes::{DataType, Field, Schema};
 
     fn schema() -> SchemaRef {

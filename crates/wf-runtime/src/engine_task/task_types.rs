@@ -44,6 +44,9 @@ pub(crate) struct RuleTaskConfig {
     pub metrics: Option<Arc<RuntimeMetrics>>,
     /// Yield targets that should be written back into windows for downstream rules.
     pub intermediate_targets: HashSet<String>,
+    /// Output/intermediate relay targets (pipe design): every rule's yield target
+    /// as a pipe. Used by the emit path to route through the pipe abstraction.
+    pub pipe_registry: std::sync::Arc<wf_engine::pipe::PipeRegistry>,
     /// End-of-stream counter: incremented each time the input sources report
     /// the stream ended. The rule task flushes its instances on every EOS
     /// (counter change) but keeps running so a daemon can accept multiple

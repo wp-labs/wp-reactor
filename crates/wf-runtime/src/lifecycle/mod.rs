@@ -349,10 +349,17 @@ impl Reactor {
         // running.
         let (eos_tx, _) = tokio::sync::watch::channel(0u64);
 
+        // Pipe registry: every rule's yield target (output / `|>` intermediate)
+        // is a pipe (pipe design, P1b). Built from the compiled rule plans so the
+        // rule task can route emits through the pipe abstraction.
+        let plans: Vec<_> = data.rules.iter().map(|r| r.executor.plan()).collect();
+        let pipe_registry = bootstrap::build_pipe_registry(&plans, &data.schemas);
+
         let rule_group = spawn_rule_tasks(
             data.rules,
             &data.router,
             &data.intermediate_targets,
+            pipe_registry,
             sink_fanout.clone(),
             rule_cancel.clone(),
             metrics.clone(),

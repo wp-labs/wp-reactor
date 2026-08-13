@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use wf_engine::alert::OutputRecord;
 use wf_engine::match_engine::{CepStateMachine, CloseReason, Event, RuleExecutor, StepResult};
 use wf_engine::normalize_epoch_timestamp_float_nanos;
-use wf_engine::window::{AppendOutcome, Router, RulePush};
+use wf_engine::window::{Router, RulePush};
 use wf_lang::plan::ConvPlan;
 use wf_lang::wfu_meta::{WFU_ID, WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
 
@@ -110,6 +110,9 @@ pub(super) struct RuleTask {
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
     intermediate_targets: HashSet<String>,
+    /// Output/intermediate relay targets (pipe design). The emit path uses this
+    /// to identify pipes and route emits through the pipe abstraction.
+    pipe_registry: Arc<wf_engine::pipe::PipeRegistry>,
     /// End-of-stream counter (incremented on each EOS event). The task flushes
     /// instances on every EOS but keeps running so a daemon can accept
     /// multiple finite inputs.
@@ -163,6 +166,7 @@ impl RuleTask {
             router,
             metrics,
             intermediate_targets,
+            pipe_registry,
             eos_flush,
             push_rx,
         } = config;
@@ -216,6 +220,7 @@ impl RuleTask {
             router,
             metrics,
             intermediate_targets,
+            pipe_registry,
             eos_flush,
             last_activity_wall: std::time::Instant::now(),
             push_rx,
@@ -1068,22 +1073,34 @@ impl RuleTask {
     }
 
     fn emit_window_record(&self, record: OutputRecord) {
-        let Some(win_lock) = self.router.registry().get_window(&record.yield_target) else {
-            wf_warn!(
-                pipe,
-                task_id = %self.task_id,
-                rule = %record.rule_name,
-                target = %record.yield_target,
-                output_kind = "intermediate",
-                reason = "missing_internal_window",
-                "missing internal pipeline window"
-            );
-            return;
-        };
-
-        let (schema, time_col_index) = {
-            let win = win_lock.read().expect("lock poisoned");
-            (win.schema().clone(), win.time_col_index())
+        // Pipe design (P1b): intermediate targets are pipes. Prefer the pipe
+        // registry's schema (decouples the relay from the window); fall back to
+        // the window for legacy/tests where the pipe isn't registered.
+        let (schema, time_col_index) = match self.pipe_registry.get(&record.yield_target) {
+            Some(pipe) => {
+                let time_col_index = pipe
+                    .schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == PIPE_EVENT_TIME_FIELD);
+                (pipe.schema, time_col_index)
+            }
+            None => {
+                let Some(win_lock) = self.router.registry().get_window(&record.yield_target) else {
+                    wf_warn!(
+                        pipe,
+                        task_id = %self.task_id,
+                        rule = %record.rule_name,
+                        target = %record.yield_target,
+                        output_kind = "intermediate",
+                        reason = "missing_internal_window",
+                        "missing internal pipeline window"
+                    );
+                    return;
+                };
+                let win = win_lock.read().expect("lock poisoned");
+                (win.schema().clone(), win.time_col_index())
+            }
         };
         let batch = match build_pipeline_batch(
             schema,
@@ -1106,51 +1123,19 @@ impl RuleTask {
             }
         };
 
-        // Append via the router so the parsed events are also broadcast to the
-        // intermediate window's rule channels (push path); the legacy notify
-        // below keeps the pull path working.
-        let outcome = match self.router.append_intermediate(&record.yield_target, batch) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                wf_warn!(
-                    pipe,
-                    task_id = %self.task_id,
-                    rule = %record.rule_name,
-                    target = %record.yield_target,
-                    output_kind = "intermediate",
-                    error = %e,
-                    "append internal pipeline row failed"
-                );
-                return;
-            }
-        };
-
-        match outcome {
-            AppendOutcome::Appended => {
-                wf_debug!(
-                    pipe,
-                    task_id = %self.task_id,
-                    rule = %record.rule_name,
-                    target = %record.yield_target,
-                    output_kind = "intermediate",
-                    "internal pipeline row written"
-                );
-                if let Some(notify) = self.router.registry().get_notifier(&record.yield_target) {
-                    notify.notify_waiters();
-                }
-            }
-            AppendOutcome::DroppedLate => {
-                wf_warn!(
-                    pipe,
-                    task_id = %self.task_id,
-                    rule = %record.rule_name,
-                    target = %record.yield_target,
-                    output_kind = "intermediate",
-                    reason = "dropped_late",
-                    "intermediate window row dropped as late data"
-                );
-            }
-        }
+        // Pure relay (pipe design, P1c): parse the pipeline row to events and
+        // broadcast them to the intermediate pipe's downstream-rule subscribers
+        // WITHOUT storing them in a window. The downstream rule's CepStateMachine
+        // retains its own per-key match state (watermark from event timestamps),
+        // so the window buffer / watermark / lateness is redundant on the push
+        // path.
+        let events: Arc<Vec<Arc<Event>>> = Arc::new(
+            wf_engine::match_engine::batch_to_events(&batch)
+                .into_iter()
+                .map(Arc::new)
+                .collect(),
+        );
+        self.router.fanout().broadcast(&record.yield_target, &events);
     }
 }
 
