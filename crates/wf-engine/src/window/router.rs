@@ -136,6 +136,41 @@ impl Router {
         Ok(report)
     }
 
+    /// Append a rule-emitted batch to an intermediate (pipeline) window and
+    /// broadcast its parsed events to subscribing rules.
+    ///
+    /// This is the `|>` counterpart of [`Self::route`]: external sources reach
+    /// windows via `route`, while intermediate windows are written by upstream
+    /// rule tasks (`emit_window_record`). Keeping the parse + append + broadcast
+    /// together here means downstream rules on the push path receive the events
+    /// without a window read, and the pull path keeps working via the notifier.
+    pub fn append_intermediate(
+        &self,
+        window_name: &str,
+        batch: RecordBatch,
+    ) -> CoreResult<AppendOutcome> {
+        let win_lock = self
+            .registry
+            .get_window(window_name)
+            .expect("intermediate window must exist");
+        let materialize = {
+            let win = win_lock.read().expect("window lock poisoned");
+            win.materialize_fields.clone()
+        };
+        let parsed = Arc::new(match materialize.as_deref() {
+            Some(fields) => batch_to_events_filtered(&batch, fields),
+            None => batch_to_events(&batch),
+        });
+        let outcome = {
+            let mut win = win_lock.write().expect("window lock poisoned");
+            win.append_with_watermark_parsed(batch, Arc::clone(&parsed))?
+        };
+        if matches!(outcome, AppendOutcome::Appended) {
+            self.rule_fanout.broadcast(window_name, &parsed);
+        }
+        Ok(outcome)
+    }
+
     /// Borrow the inner registry.
     pub fn registry(&self) -> &WindowRegistry {
         &self.registry
@@ -294,5 +329,29 @@ mod tests {
         assert_eq!(report.delivered, 0);
         assert_eq!(report.dropped_late, 0);
         assert_eq!(report.skipped_non_local, 0);
+    }
+
+    // -- 5. append_intermediate_broadcasts_to_rule_channels -------------------
+
+    #[test]
+    fn append_intermediate_broadcasts_to_rule_channels() {
+        let reg = WindowRegistry::build(vec![make_def("win_pipe", vec![], DistMode::Local)])
+            .unwrap();
+        let router = Router::new(reg);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        router.fanout().register("win_pipe", tx);
+
+        let schema = test_schema();
+        let outcome = router
+            .append_intermediate("win_pipe", make_batch(&schema, &[10_000_000_000], &[42]))
+            .unwrap();
+        assert!(matches!(outcome, AppendOutcome::Appended));
+
+        let push = rx
+            .try_recv()
+            .expect("intermediate append should broadcast parsed events");
+        assert_eq!(&*push.window_name, "win_pipe");
+        assert_eq!(push.events.len(), 1);
     }
 }

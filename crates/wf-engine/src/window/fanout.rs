@@ -94,9 +94,14 @@ mod tests {
         let events: Arc<Vec<Event>> = Arc::new(Vec::new());
         fanout.broadcast("win_a", &events);
 
-        let push = rx.try_recv().expect("registered channel should receive a push");
+        let push = rx
+            .try_recv()
+            .expect("registered channel should receive a push");
         assert_eq!(&*push.window_name, "win_a");
-        assert!(Arc::ptr_eq(&push.events, &events), "should share the same Arc");
+        assert!(
+            Arc::ptr_eq(&push.events, &events),
+            "should share the same Arc"
+        );
     }
 
     #[test]

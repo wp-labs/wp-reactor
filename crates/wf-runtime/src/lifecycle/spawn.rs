@@ -103,7 +103,9 @@ pub(super) fn spawn_rule_tasks(
         // rule consumes it without taking the window read lock.
         let (push_tx, push_rx) = mpsc::unbounded_channel::<RulePush>();
         for source in &window_sources {
-            router.fanout().register(&source.window_name, push_tx.clone());
+            router
+                .fanout()
+                .register(&source.window_name, push_tx.clone());
         }
 
         let task_config = RuleTaskConfig {

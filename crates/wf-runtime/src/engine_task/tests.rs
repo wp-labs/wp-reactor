@@ -16,7 +16,9 @@ use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 use wf_engine::match_engine::{CepStateMachine, RuleExecutor, batch_to_events};
-use wf_engine::window::{RulePush, content_bytes, Router, Window, WindowDef, WindowParams, WindowRegistry};
+use wf_engine::window::{
+    Router, RulePush, Window, WindowDef, WindowParams, WindowRegistry, content_bytes,
+};
 use wf_lang::ast::{BinOp, CloseMode, CmpOp, Expr, FieldRef, Measure, ObjectItem};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EachPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,
@@ -158,7 +160,7 @@ fn make_window(
             schema: schema.clone(),
             time_col_index: Some(1), // event_time is the second column
             over: Duration::from_secs(3600),
-        materialize_fields: None,
+            materialize_fields: None,
         },
         test_window_config(max_bytes),
     );
@@ -232,7 +234,7 @@ fn make_window_def(
             schema: schema.clone(),
             time_col_index: time_col,
             over: Duration::from_secs(3600),
-        materialize_fields: None,
+            materialize_fields: None,
         },
         streams: streams.iter().map(|s| (*s).to_string()).collect(),
         config: cfg,
@@ -1957,7 +1959,9 @@ async fn push_triggers_alert() {
     };
     task.process_push(push).await;
 
-    let alert = alert_rx.try_recv().expect("push path should produce an alert");
+    let alert = alert_rx
+        .try_recv()
+        .expect("push path should produce an alert");
     assert_eq!(alert.rule_name, "test_rule");
     assert_eq!(alert.entity_type, "ip");
     assert_eq!(alert.entity_id, "10.0.0.1");
@@ -2565,7 +2569,7 @@ fn make_conn_events_window(max_bytes: usize) -> (Arc<RwLock<Window>>, Arc<Notify
             schema: schema.clone(),
             time_col_index: Some(5), // event_time is the 6th column (0-based: 5)
             over: Duration::from_secs(3600),
-        materialize_fields: None,
+            materialize_fields: None,
         },
         cfg,
     );
