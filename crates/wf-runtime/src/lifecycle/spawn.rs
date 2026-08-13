@@ -114,6 +114,7 @@ pub(super) fn spawn_evictor_task(
 /// Each rule task owns its `CepStateMachine` exclusively (no `Arc<Mutex>`).
 /// It subscribes to window notifications and uses cursor-based `read_since()`
 /// to pull new batches.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_rule_tasks(
     rules: Vec<RunRule>,
     router: &Arc<Router>,
