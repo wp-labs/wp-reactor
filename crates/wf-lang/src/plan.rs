@@ -93,6 +93,17 @@ pub struct MatchPlan {
     /// evidence keep accumulating without reset and each subsequent qualifying
     /// event re-fires with the running cumulative values until the window expires.
     pub accu: bool,
+    /// Whether any alias needs the per-field value **history** (`field_values`).
+    ///
+    /// True when a close step fires (no triggering event to read fields from),
+    /// the rule binds multiple events (yield may read a non-trigger alias's
+    /// field), joins are present, or a yield/score/entity expression uses an L3
+    /// series function (collect_set/list, first/last, stddev, percentile) that
+    /// reads the `_step_field` array. False for single-bind on-event rules whose
+    /// yield reads scalar fields — those read the scalar from the triggering
+    /// event instead, so `collect_alias_event` can be skipped entirely (avoids
+    /// per-instance field_values allocation under churn → RSS growth).
+    pub needs_field_history: bool,
 }
 
 /// Explicit key mapping entry: logical name → source alias + field.

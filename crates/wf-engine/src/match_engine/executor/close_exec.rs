@@ -41,6 +41,7 @@ impl RuleExecutor {
             &all_step_data,
             &close.bind_data,
             &step_plans,
+            None,
         );
         let ctx = annotate_close_step_stages(ctx, close.event_step_data.len());
         self.build_close_alert(close, &all_step_data, &ctx)
@@ -63,6 +64,7 @@ impl RuleExecutor {
             &all_step_data,
             &close.bind_data,
             &step_plans,
+            None,
         );
         ctx = annotate_close_step_stages(ctx, close.event_step_data.len());
         execute_joins(&self.plan.joins, &mut ctx, windows, close.last_event_nanos);

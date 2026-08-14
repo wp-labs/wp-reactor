@@ -88,13 +88,23 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile) -> RulePlan {
     match_plan.tracked_bind_aliases = bind_tracking.aliases;
     match_plan.tracked_bind_fields = bind_tracking.fields;
     match_plan.tracked_plain_fields = bind_tracking.plain_fields;
+    let binds = compile_binds(&rule.events);
+    let joins = compile_joins(&rule.joins);
+    match_plan.needs_field_history = compute_needs_field_history(
+        &match_plan,
+        &binds,
+        &joins,
+        &score_plan.expr,
+        &entity_plan.entity_id_expr,
+        &yield_plan.fields,
+    );
 
     RulePlan {
         name: rule.name.clone(),
-        binds: compile_binds(&rule.events),
+        binds,
         match_plan,
         each_plan: rule.each_clause.as_ref().map(compile_each),
-        joins: compile_joins(&rule.joins),
+        joins,
         entity_plan,
         yield_plan,
         score_plan,
@@ -164,13 +174,22 @@ fn compile_pipeline_rule(rule: &RuleDecl, file: &WflFile) -> Vec<RulePlan> {
         match_plan.tracked_bind_aliases = bind_tracking.aliases;
         match_plan.tracked_bind_fields = bind_tracking.fields;
         match_plan.tracked_plain_fields = bind_tracking.plain_fields;
+        let stage_joins = compile_joins(joins);
+        match_plan.needs_field_history = compute_needs_field_history(
+            &match_plan,
+            &binds,
+            &stage_joins,
+            &score_plan.expr,
+            &entity_plan.entity_id_expr,
+            &yield_plan.fields,
+        );
 
         plans.push(RulePlan {
             name,
             binds,
             match_plan,
             each_plan: None,
-            joins: compile_joins(joins),
+            joins: stage_joins,
             entity_plan,
             yield_plan,
             score_plan,
@@ -333,6 +352,8 @@ fn compile_match(mc: &MatchClause, inject_implicit_stage_labels: bool) -> MatchP
         tracked_bind_fields: std::collections::HashMap::new(),
         tracked_plain_fields: HashSet::new(),
         accu: mc.accu,
+        needs_field_history: false, // set by the caller after binds/joins/yield are known
+
     }
 }
 
@@ -503,6 +524,87 @@ fn is_series_func(name: &str) -> bool {
             | "stddev"
             | "percentile"
     )
+}
+
+/// L3 series functions that read the `_step_field` array of collected values —
+/// they require the per-field value *history*, not just the triggering event.
+fn is_l3_series_func(name: &str) -> bool {
+    matches!(
+        name,
+        "collect_set" | "collect_list" | "first" | "last" | "stddev" | "percentile"
+    )
+}
+
+/// Event-accessor stat functions (`match_event`, `window_event`, `trigger`, …)
+/// that read the step's collected event data — also require the history.
+fn is_event_accessor(name: &str) -> bool {
+    matches!(
+        name,
+        "window_event" | "match_event" | "match_distinct" | "trigger" | "final"
+    )
+}
+
+/// Whether an expression references an L3 series or event-accessor function
+/// anywhere (recursive) — either way the per-field value *history* is needed.
+fn expr_uses_l3_series(e: &Expr) -> bool {
+    match e {
+        Expr::Number(_)
+        | Expr::StringLit(_)
+        | Expr::Bool(_)
+        | Expr::SystemVar(_)
+        | Expr::WfuMeta(_)
+        | Expr::Field(_)
+        | Expr::PresetParam(_) => false,
+        Expr::BinOp { left, right, .. } => expr_uses_l3_series(left) || expr_uses_l3_series(right),
+        Expr::Neg(inner) => expr_uses_l3_series(inner),
+        Expr::FuncCall { name, args, .. } => {
+            is_l3_series_func(name) || is_event_accessor(name) || args.iter().any(expr_uses_l3_series)
+        }
+        Expr::Object(items) => items.iter().any(|i| expr_uses_l3_series(&i.value)),
+        Expr::Array(items) => items.iter().any(expr_uses_l3_series),
+        Expr::InList { expr, list, .. } => {
+            expr_uses_l3_series(expr) || list.iter().any(expr_uses_l3_series)
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_uses_l3_series(cond)
+                || expr_uses_l3_series(then_expr)
+                || expr_uses_l3_series(else_expr)
+        }
+    }
+}
+
+/// Whether the rule needs the per-field value *history* (`field_values`).
+///
+/// A single-bind on-event rule whose yield reads scalar fields can instead read
+/// them from the triggering event (passed through `MatchedContext`), so it needs
+/// no history and `collect_alias_event` can be skipped. Everything else — close
+/// steps (fire with no event), multi-bind (yield may read a non-trigger alias),
+/// joins, or L3 series in yield/score/entity — keeps collecting the history.
+pub(crate) fn compute_needs_field_history(
+    match_plan: &MatchPlan,
+    binds: &[BindPlan],
+    joins: &[JoinPlan],
+    score_expr: &Expr,
+    entity_expr: &Expr,
+    yield_fields: &[YieldField],
+) -> bool {
+    if !match_plan.close_steps.is_empty() {
+        return true;
+    }
+    if binds.len() > 1 || !joins.is_empty() {
+        return true;
+    }
+    if expr_uses_l3_series(score_expr)
+        || expr_uses_l3_series(entity_expr)
+        || yield_fields.iter().any(|f| expr_uses_l3_series(&f.value))
+    {
+        return true;
+    }
+    false
 }
 
 fn compile_step(step: &crate::ast::MatchStep, inject_implicit_stage_labels: bool) -> StepPlan {

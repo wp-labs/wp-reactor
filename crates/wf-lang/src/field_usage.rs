@@ -293,6 +293,7 @@ mod tests {
             match_mode: crate::ast::MatchMode::Any,
             seq: None,
             accu: false,
+            needs_field_history: false,
         };
         let plans = vec![make_rule(vec![bind], match_plan)];
         let usage = compute_window_field_usage(&plans);
@@ -322,6 +323,7 @@ mod tests {
             match_mode: crate::ast::MatchMode::Any,
             seq: None,
             accu: false,
+            needs_field_history: false,
         };
         let plans = vec![make_rule(vec![bind], match_plan)];
         let usage = compute_window_field_usage(&plans);

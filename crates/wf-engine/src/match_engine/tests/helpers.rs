@@ -53,6 +53,7 @@ pub fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: false,
     }
 }
 
@@ -99,6 +100,7 @@ pub fn plan_with_close(
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: false,
     }
 }
 
@@ -116,6 +118,7 @@ pub fn fixed_plan(keys: Vec<FieldRef>, dur: Duration, steps: Vec<StepPlan>) -> M
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: false,
     }
 }
 
@@ -138,6 +141,7 @@ pub fn fixed_plan_with_close(
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: false,
     }
 }
 

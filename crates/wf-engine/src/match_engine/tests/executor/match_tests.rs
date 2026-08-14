@@ -141,6 +141,7 @@ fn execute_match_no_keys() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
+            trigger_event: None,
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -187,6 +188,7 @@ fn execute_match_composite_keys() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
+            trigger_event: None,
     };
 
     let alert = exec.execute_match(&matched).unwrap();

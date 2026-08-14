@@ -50,6 +50,7 @@ fn join_snapshot_enriches_context() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
+            trigger_event: None,
     };
 
     let alert = exec
@@ -110,6 +111,7 @@ fn join_entity_from_joined_field() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
+            trigger_event: None,
     };
 
     let alert = exec
@@ -170,6 +172,7 @@ fn join_no_match_falls_through() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
+            trigger_event: None,
     };
 
     // No join match — entity falls back to "sip" from keys
@@ -230,6 +233,7 @@ fn join_anti_excludes_matching_ip() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
+            trigger_event: None,
     };
 
     // Anti join matched whitelist entry — event should be silently dropped
@@ -286,6 +290,7 @@ fn join_anti_allows_non_matching_ip() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
+            trigger_event: None,
     };
 
     // Anti join found no match — event should proceed normally
@@ -423,6 +428,7 @@ fn join_asof_picks_latest_before_event_time() {
         window_start_time_nanos: event_time,
         window_end_time_nanos: event_time,
         machine_id: String::new(),
+            trigger_event: None,
     };
 
     let alert = exec
@@ -498,6 +504,7 @@ fn join_asof_within_filters_old_rows() {
         window_start_time_nanos: event_time,
         window_end_time_nanos: event_time,
         machine_id: String::new(),
+            trigger_event: None,
     };
 
     let alert = exec
@@ -552,6 +559,7 @@ fn join_asof_no_timestamp_support_skips() {
         window_start_time_nanos: 1_000_000_000,
         window_end_time_nanos: 1_000_000_000,
         machine_id: String::new(),
+            trigger_event: None,
     };
 
     // Join produces no match, but alert still works with score=42

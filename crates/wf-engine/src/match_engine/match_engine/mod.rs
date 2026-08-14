@@ -496,6 +496,7 @@ impl CepStateMachine {
                     window_start_time_nanos: instance.created_at,
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
+                    trigger_event: Some(std::sync::Arc::new(event.clone())),
                 };
                 if plan.accu {
                     // `on event<accu>` — keep accumulating across fires.
@@ -687,6 +688,7 @@ impl CepStateMachine {
                     window_start_time_nanos: instance.created_at,
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
+                    trigger_event: Some(std::sync::Arc::new(event.clone())),
                 };
                 if plan.accu {
                     // `on event<accu>` — keep accumulating across fires.
@@ -736,6 +738,7 @@ impl CepStateMachine {
                     window_start_time_nanos: instance.created_at,
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
+                    trigger_event: Some(std::sync::Arc::new(event.clone())),
                 };
                 StepResult::Matched(ctx)
             } else {
@@ -1029,14 +1032,14 @@ impl CepStateMachine {
     }
 }
 
-fn should_track_bind_alias(plan: &MatchPlan, alias: &str) -> bool {
-    plan.tracked_bind_aliases.contains(alias)
-        || !plan
-            .event_steps
-            .iter()
-            .chain(plan.close_steps.iter())
-            .flat_map(|step| step.branches.iter())
-            .any(|branch| branch.source == alias)
+fn should_track_bind_alias(plan: &MatchPlan, _alias: &str) -> bool {
+    // Collect the per-field value *history* only when the rule needs it (close
+    // steps, multi-bind, joins, or L3 series in yield/score/entity). A
+    // single-bind on-event rule whose yield reads scalar fields resolves them
+    // from the triggering event (`MatchedContext::trigger_event`) instead, so
+    // skipping collection here avoids the per-instance field_values allocation
+    // under churn that drove RSS unbounded on sustained inject.
+    plan.needs_field_history
 }
 
 fn step_outcome(result: StepResult, progress: Option<StepProgress>) -> StepOutcome {

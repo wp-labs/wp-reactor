@@ -20,6 +20,7 @@ pub(super) fn build_eval_context(
     step_data: &[StepData],
     bind_data: &[BindData],
     step_plans: &[&StepPlan],
+    trigger_event: Option<&Event>,
 ) -> Event {
     let mut fields = EngineHashMap::default();
 
@@ -27,6 +28,20 @@ pub(super) fn build_eval_context(
     for (fr, val) in keys.iter().zip(scope_key.iter()) {
         let name = field_ref_name(fr).to_string();
         fields.insert(name.into(), val.clone());
+    }
+
+    // Scalar fields from the triggering event (on-event fires): yields like
+    // `b.auction` resolve from it directly. Rules that don't collect the
+    // `field_values` history (needs_field_history=false) rely on this; the
+    // step_data loop below skips a field already present (`contains_key`), so
+    // the history never overrides the event's value. Close fires pass `None`
+    // and keep reading from `field_values`.
+    if let Some(ev) = trigger_event {
+        for (name, value) in &ev.fields {
+            if !fields.contains_key(name.as_str()) {
+                fields.insert(name.clone(), value.clone());
+            }
+        }
     }
 
     // Step labels → measure values (skip if name collides with a key field)
@@ -216,7 +231,7 @@ mod tests {
         let step_data: Vec<StepData> = vec![];
         let step_plans: Vec<&StepPlan> = vec![];
 
-        let event = build_eval_context(&keys, &scope_key, &step_data, &bind_data, &step_plans);
+        let event = build_eval_context(&keys, &scope_key, &step_data, &bind_data, &step_plans, None);
         assert_eq!(
             event.fields.get("sip"),
             Some(&Value::Str("10.0.0.1".into()))

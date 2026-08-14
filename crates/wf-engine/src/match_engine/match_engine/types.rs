@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use foldhash::fast::RandomState as FoldRandomState;
 use smol_str::SmolStr;
@@ -23,7 +24,7 @@ pub const MACHINE_ID: &str = "wp_src_ip";
 ///
 /// M14 works exclusively with this type. Arrow RecordBatch bridging (M16)
 /// will provide a zero-copy adapter later.
-#[derive(::moju_derive::MoJu, Debug, Clone)]
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct Event {
     pub fields: EngineHashMap<SmolStr, Value>,
@@ -97,6 +98,11 @@ pub struct MatchedContext {
     pub window_start_time_nanos: i64,
     pub window_end_time_nanos: i64,
     pub machine_id: String,
+    /// The event that triggered this match (on-event fire). Yield's scalar
+    /// field reads resolve from it, so rules that don't need the full
+    /// `field_values` history can skip collecting it. `None` for fires without
+    /// a triggering event (close) — those keep reading from `field_values`.
+    pub trigger_event: Option<Arc<Event>>,
 }
 
 /// Per-step snapshot captured when a step is satisfied.
