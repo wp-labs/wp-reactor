@@ -129,7 +129,7 @@ pub(super) struct RuleTask {
     /// `Arc<Vec<Arc<Event>>>` instead of pulling from the window read lock; when
     /// `None`, the task falls back to the legacy notify + pull loop. Consumed
     /// once by `run_rule_task`.
-    pub(super) push_rx: Option<mpsc::UnboundedReceiver<RulePush>>,
+    pub(super) push_rx: Option<mpsc::Receiver<RulePush>>,
     /// Monotonic batch sequence for pushed batches (debug event refs only).
     pushed_seq: u64,
     /// Profiling accumulators (nanos) for locating the rule-task bottleneck.
@@ -778,7 +778,7 @@ impl RuleTask {
     /// Used by the push loop to drain the channel before a flush (EOS/cancel).
     /// After the source reports EOS no further pushes arrive, so draining via
     /// `try_recv` until empty is complete.
-    pub(super) async fn drain_push_channel(&mut self, rx: &mut mpsc::UnboundedReceiver<RulePush>) {
+    pub(super) async fn drain_push_channel(&mut self, rx: &mut mpsc::Receiver<RulePush>) {
         while let Ok(push) = rx.try_recv() {
             self.process_push(push).await;
         }
@@ -1011,7 +1011,7 @@ impl RuleTask {
 
     async fn emit(&self, record: OutputRecord) {
         if self.intermediate_targets.contains(&record.yield_target) {
-            self.emit_window_record(record);
+            self.emit_window_record(record).await;
             return;
         }
         if let Some(metrics) = &self.metrics {
@@ -1113,7 +1113,7 @@ impl RuleTask {
             .fetch_add(_fan_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
-    fn emit_window_record(&self, record: OutputRecord) {
+    async fn emit_window_record(&self, record: OutputRecord) {
         // Pipe design (P1b): intermediate targets are pipes. Prefer the pipe
         // registry's schema (decouples the relay from the window); fall back to
         // the window for legacy/tests where the pipe isn't registered.
@@ -1175,7 +1175,7 @@ impl RuleTask {
                 .map(Arc::new)
                 .collect(),
         );
-        self.router.fanout().broadcast(&record.yield_target, &events);
+        self.router.fanout().broadcast(&record.yield_target, &events).await;
     }
 }
 

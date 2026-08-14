@@ -101,9 +101,9 @@ impl Router {
     /// Equivalent to [`Self::route_parse`] followed by [`Self::route_commit`];
     /// kept for callers that parse + commit in one place (file sources, tests,
     /// and the R2 rollback path).
-    pub fn route(&self, stream_name: &str, batch: RecordBatch) -> CoreResult<RouteReport> {
+    pub async fn route(&self, stream_name: &str, batch: RecordBatch) -> CoreResult<RouteReport> {
         let parsed = self.route_parse(stream_name, &batch);
-        self.route_commit(batch, parsed)
+        self.route_commit(batch, parsed).await
     }
 
     /// Parse a batch into per-window events without mutating any window.
@@ -181,7 +181,7 @@ impl Router {
     /// This is the ordered half of routing; the parse workers run it via a
     /// single commit worker that re-sequences batches, so watermark advancement
     /// and rule delivery stay in source order even though parsing is parallel.
-    pub fn route_commit(
+    pub async fn route_commit(
         &self,
         batch: RecordBatch,
         parsed: ParsedRoute,
@@ -232,7 +232,7 @@ impl Router {
                     // of `window.read()`). Fast-path windows have no subscribers
                     // (the events are `None`), so broadcast is skipped.
                     if let Some(events) = &window.events {
-                        self.rule_fanout.broadcast(&window.window_name, events);
+                        self.rule_fanout.broadcast(&window.window_name, events).await;
                     }
                     if let Some(notify) = self.registry.get_notifier(&window.window_name) {
                         notify.notify_waiters();
@@ -260,7 +260,7 @@ impl Router {
     /// rule tasks (`emit_window_record`). Keeping the parse + append + broadcast
     /// together here means downstream rules on the push path receive the events
     /// without a window read, and the pull path keeps working via the notifier.
-    pub fn append_intermediate(
+    pub async fn append_intermediate(
         &self,
         window_name: &str,
         batch: RecordBatch,
@@ -291,7 +291,7 @@ impl Router {
             win.append_with_watermark_parsed_sized(batch, Arc::clone(&parsed), byte_size)?
         };
         if matches!(outcome, AppendOutcome::Appended) {
-            self.rule_fanout.broadcast(window_name, &parsed);
+            self.rule_fanout.broadcast(window_name, &parsed).await;
         }
         Ok(outcome)
     }
@@ -367,15 +367,15 @@ mod tests {
 
     // -- 1. route_delivers_to_local_windows -----------------------------------
 
-    #[test]
-    fn route_delivers_to_local_windows() {
+    #[tokio::test]
+    async fn route_delivers_to_local_windows() {
         let reg = WindowRegistry::build(vec![make_def("win_a", vec!["events"], DistMode::Local)])
             .unwrap();
         let router = Router::new(reg);
 
         let schema = test_schema();
         let report = router
-            .route("events", make_batch(&schema, &[10_000_000_000], &[42]))
+            .route("events", make_batch(&schema, &[10_000_000_000], &[42])).await
             .unwrap();
 
         assert_eq!(report.delivered, 1);
@@ -389,8 +389,8 @@ mod tests {
 
     // -- 2. route_skips_non_local ---------------------------------------------
 
-    #[test]
-    fn route_skips_non_local() {
+    #[tokio::test]
+    async fn route_skips_non_local() {
         let reg = WindowRegistry::build(vec![make_def(
             "win_rep",
             vec!["data"],
@@ -401,7 +401,7 @@ mod tests {
 
         let schema = test_schema();
         let report = router
-            .route("data", make_batch(&schema, &[10_000_000_000], &[1]))
+            .route("data", make_batch(&schema, &[10_000_000_000], &[1])).await
             .unwrap();
 
         assert_eq!(report.delivered, 0);
@@ -414,8 +414,8 @@ mod tests {
 
     // -- 3. route_drops_late_data ---------------------------------------------
 
-    #[test]
-    fn route_drops_late_data() {
+    #[tokio::test]
+    async fn route_drops_late_data() {
         let reg =
             WindowRegistry::build(vec![make_def("win_late", vec!["stream"], DistMode::Local)])
                 .unwrap();
@@ -425,13 +425,13 @@ mod tests {
 
         // First batch at 20s → watermark = 15s, delivered.
         let r1 = router
-            .route("stream", make_batch(&schema, &[20_000_000_000], &[1]))
+            .route("stream", make_batch(&schema, &[20_000_000_000], &[1])).await
             .unwrap();
         assert_eq!(r1.delivered, 1);
 
         // Late batch at 5s → 5s < 15s → DroppedLate.
         let r2 = router
-            .route("stream", make_batch(&schema, &[5_000_000_000], &[2]))
+            .route("stream", make_batch(&schema, &[5_000_000_000], &[2])).await
             .unwrap();
         assert_eq!(r2.dropped_late, 1);
         assert_eq!(r2.delivered, 0);
@@ -443,15 +443,15 @@ mod tests {
 
     // -- 4. route_unknown_stream_noop -----------------------------------------
 
-    #[test]
-    fn route_unknown_stream_noop() {
+    #[tokio::test]
+    async fn route_unknown_stream_noop() {
         let reg =
             WindowRegistry::build(vec![make_def("win_x", vec!["known"], DistMode::Local)]).unwrap();
         let router = Router::new(reg);
 
         let schema = test_schema();
         let report = router
-            .route("unknown", make_batch(&schema, &[10_000_000_000], &[1]))
+            .route("unknown", make_batch(&schema, &[10_000_000_000], &[1])).await
             .unwrap();
 
         assert_eq!(report.delivered, 0);
@@ -461,18 +461,18 @@ mod tests {
 
     // -- 5. append_intermediate_broadcasts_to_rule_channels -------------------
 
-    #[test]
-    fn append_intermediate_broadcasts_to_rule_channels() {
+    #[tokio::test]
+    async fn append_intermediate_broadcasts_to_rule_channels() {
         let reg = WindowRegistry::build(vec![make_def("win_pipe", vec![], DistMode::Local)])
             .unwrap();
         let router = Router::new(reg);
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         router.fanout().register("win_pipe", tx);
 
         let schema = test_schema();
         let outcome = router
-            .append_intermediate("win_pipe", make_batch(&schema, &[10_000_000_000], &[42]))
+            .append_intermediate("win_pipe", make_batch(&schema, &[10_000_000_000], &[42])).await
             .unwrap();
         assert!(matches!(outcome, AppendOutcome::Appended));
 
@@ -516,8 +516,8 @@ mod tests {
     /// Each window must be charged its own parsed-event footprint: a window that
     /// materializes the object field reports `content_bytes + events_bytes`; one
     /// that skips it reports content plus only the materialized fields' events.
-    #[test]
-    fn route_charges_events_bytes_per_window() {
+    #[tokio::test]
+    async fn route_charges_events_bytes_per_window() {
         let (schema, batch) = object_batch();
 
         let all_events: Vec<Arc<Event>> =
@@ -564,11 +564,11 @@ mod tests {
         let router = Router::new(reg);
         // Register rule subscribers so the fast path (skip materialization for
         // windows without rule consumers) does not fire — these windows are read.
-        let (tx_all, _rx_all) = tokio::sync::mpsc::unbounded_channel();
-        let (tx_ts, _rx_ts) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_all, _rx_all) = tokio::sync::mpsc::channel(8);
+        let (tx_ts, _rx_ts) = tokio::sync::mpsc::channel(8);
         router.fanout().register("win_all", tx_all);
         router.fanout().register("win_ts", tx_ts);
-        router.route("events", batch).unwrap();
+        router.route("events", batch).await.unwrap();
 
         let mem_all = router
             .registry()
@@ -613,8 +613,8 @@ mod tests {
     /// cap that fits the combined footprint retains it. Before the fix the first
     /// window would have retained the batch (content ≤ cap) even though its real
     /// footprint ran past the cap.
-    #[test]
-    fn route_evicts_on_combined_footprint() {
+    #[tokio::test]
+    async fn route_evicts_on_combined_footprint() {
         let (schema, batch) = object_batch();
 
         let content = content_bytes(&batch);
@@ -662,11 +662,11 @@ mod tests {
         let router = Router::new(reg);
         // Register rule subscribers so events are materialized (the fast path
         // would otherwise skip them and the windows would not be evicted).
-        let (tx_under, _rx_under) = tokio::sync::mpsc::unbounded_channel();
-        let (tx_fits, _rx_fits) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_under, _rx_under) = tokio::sync::mpsc::channel(8);
+        let (tx_fits, _rx_fits) = tokio::sync::mpsc::channel(8);
         router.fanout().register("under_real", tx_under);
         router.fanout().register("fits_real", tx_fits);
-        router.route("events", batch).unwrap();
+        router.route("events", batch).await.unwrap();
 
         let under = router.registry().get_window("under_real").unwrap();
         assert_eq!(

@@ -18,11 +18,16 @@ pub struct RulePush {
 
 /// A subscription for one window: either a single (unsharded) rule channel, or
 /// N shard channels with a key partition (rule sharding, P2a).
+///
+/// Channels are **bounded** so a slow rule consumer backpressures the producer
+/// (the commit worker's broadcast awaits a full channel) instead of buffering
+/// unboundedly — 50M sustained inject with unbounded channels let RSS grow to
+/// ~13GB (wp-labs/wp-reactor long-run test, 2026-08-14).
 #[derive(Clone)]
 enum Subscription {
-    Single(mpsc::UnboundedSender<RulePush>),
+    Single(mpsc::Sender<RulePush>),
     Sharded {
-        shards: Vec<mpsc::UnboundedSender<RulePush>>,
+        shards: Vec<mpsc::Sender<RulePush>>,
         keys: Arc<[FieldRef]>,
     },
 }
@@ -60,7 +65,7 @@ impl RuleFanout {
     }
 
     /// Register a single (unsharded) rule channel for `window_name`.
-    pub fn register(&self, window_name: &str, tx: mpsc::UnboundedSender<RulePush>) {
+    pub fn register(&self, window_name: &str, tx: mpsc::Sender<RulePush>) {
         let mut table = self.table.write().expect("fanout lock poisoned");
         table
             .entry(window_name.to_string())
@@ -75,7 +80,7 @@ impl RuleFanout {
     pub fn register_sharded(
         &self,
         window_name: &str,
-        shards: Vec<mpsc::UnboundedSender<RulePush>>,
+        shards: Vec<mpsc::Sender<RulePush>>,
         keys: Arc<[FieldRef]>,
     ) {
         debug_assert!(!shards.is_empty());
@@ -89,9 +94,11 @@ impl RuleFanout {
     /// Broadcast `events` to every rule channel registered for `window_name`.
     ///
     /// Unsharded subscriptions receive the whole batch; sharded subscriptions
-    /// partition it by match key. Uses unbounded channels so a slow consumer
-    /// never blocks the router. Closed channels are pruned lazily here.
-    pub fn broadcast(&self, window_name: &str, events: &Arc<Vec<Arc<Event>>>) {
+    /// partition it by match key. Bounded channels: a full channel blocks the
+    /// producer (`.await` on send) — backpressure instead of unbounded buffering,
+    /// so a slow rule consumer stalls the ingest rather than growing RSS.
+    /// Closed channels are pruned lazily here.
+    pub async fn broadcast(&self, window_name: &str, events: &Arc<Vec<Arc<Event>>>) {
         let subs: Vec<Subscription> = {
             let table = self.table.read().expect("fanout lock poisoned");
             table.get(window_name).cloned().unwrap_or_default()
@@ -105,12 +112,12 @@ impl RuleFanout {
                         window_name: window_name.into(),
                         events: Arc::clone(events),
                     };
-                    if tx.send(push).is_err() {
+                    if tx.send(push).await.is_err() {
                         any_closed = true;
                     }
                 }
                 Subscription::Sharded { shards, keys } => {
-                    if broadcast_sharded(shards, keys, window_name, events) {
+                    if broadcast_sharded(shards, keys, window_name, events).await {
                         any_closed = true;
                     }
                 }
@@ -144,9 +151,10 @@ impl RuleFanout {
 }
 
 /// Partition a batch by match key and send each sub-batch to its shard.
-/// Returns `true` if any shard channel was closed.
-fn broadcast_sharded(
-    shards: &[mpsc::UnboundedSender<RulePush>],
+/// Returns `true` if any shard channel was closed. Awaits full shard channels
+/// (backpressure).
+async fn broadcast_sharded(
+    shards: &[mpsc::Sender<RulePush>],
     keys: &[FieldRef],
     window_name: &str,
     events: &Arc<Vec<Arc<Event>>>,
@@ -170,7 +178,7 @@ fn broadcast_sharded(
             window_name: window_name.into(),
             events: Arc::new(sub),
         };
-        if shards[i].send(push).is_err() {
+        if shards[i].send(push).await.is_err() {
             any_closed = true;
         }
     }
@@ -192,29 +200,29 @@ mod tests {
         vec![FieldRef::Simple("id".into())]
     }
 
-    #[test]
-    fn broadcast_delivers_same_arc_to_registered_channels() {
+    #[tokio::test]
+    async fn broadcast_delivers_same_arc_to_registered_channels() {
         let fanout = RuleFanout::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(8);
         fanout.register("win_a", tx);
 
         let events: Arc<Vec<Arc<Event>>> = Arc::new(Vec::new());
-        fanout.broadcast("win_a", &events);
+        fanout.broadcast("win_a", &events).await;
 
         let push = rx.try_recv().expect("registered channel should receive a push");
         assert_eq!(&*push.window_name, "win_a");
         assert!(Arc::ptr_eq(&push.events, &events), "should share the same Arc");
     }
 
-    #[test]
-    fn broadcast_prunes_closed_channels() {
+    #[tokio::test]
+    async fn broadcast_prunes_closed_channels() {
         let fanout = RuleFanout::new();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(8);
         fanout.register("win_a", tx);
         drop(rx); // close the channel
 
         let events: Arc<Vec<Arc<Event>>> = Arc::new(Vec::new());
-        fanout.broadcast("win_a", &events);
+        fanout.broadcast("win_a", &events).await;
 
         let table = fanout.table.read().expect("fanout lock poisoned");
         assert!(
@@ -223,17 +231,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sharded_broadcast_partitions_by_key_and_routes_same_key_together() {
+    #[tokio::test]
+    async fn sharded_broadcast_partitions_by_key_and_routes_same_key_together() {
         let fanout = RuleFanout::new();
-        let (tx0, mut rx0) = mpsc::unbounded_channel();
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx0, mut rx0) = mpsc::channel(8);
+        let (tx1, mut rx1) = mpsc::channel(8);
         fanout.register_sharded("win_a", vec![tx0, tx1], Arc::from(keys().into_boxed_slice()));
 
         // Two distinct keys; each should land on a single (deterministic) shard.
         let events: Arc<Vec<Arc<Event>>> =
             Arc::new(vec![Arc::new(event("k1")), Arc::new(event("k2")), Arc::new(event("k1"))]);
-        fanout.broadcast("win_a", &events);
+        fanout.broadcast("win_a", &events).await;
 
         let mut received = Vec::new();
         while let Ok(push) = rx0.try_recv() {
@@ -257,7 +265,7 @@ mod tests {
         // Same key (`k1`) must land on the SAME shard across broadcasts.
         let idx = shard_index(&[Value::Str("k1".into())], 2);
         let again: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(event("k1"))]);
-        fanout.broadcast("win_a", &again);
+        fanout.broadcast("win_a", &again).await;
         let got0 = rx0.try_recv().map(|p| p.events.len()).unwrap_or(0);
         let got1 = rx1.try_recv().map(|p| p.events.len()).unwrap_or(0);
         if idx == 0 {

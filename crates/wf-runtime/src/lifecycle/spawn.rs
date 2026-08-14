@@ -12,6 +12,12 @@ use wf_config::FusionConfig;
 use wf_engine::match_engine::CepStateMachine;
 use wf_engine::sink::SinkDispatcher;
 use wf_engine::window::{Evictor, Router, RulePush, WindowRegistry};
+
+/// Bounded capacity of each rule push channel (a channel carries whole batches
+/// of parsed events, `Arc<Vec<Arc<Event>>>`). A full channel blocks the
+/// commit worker's broadcast — backpressure — instead of buffering unboundedly
+/// (50M sustained inject grew RSS to ~13GB with unbounded channels).
+pub(crate) const RULE_CHANNEL_CAPACITY: usize = 32;
 use wf_lang::ast::FieldRef;
 
 use crate::alert_task;
@@ -144,7 +150,7 @@ pub(super) fn spawn_rule_tasks(
         match rule.kind {
             RunRuleKind::Each { alias, time_field } => {
                 // Stateless each rule: single worker (no key to shard on).
-                let (push_tx, push_rx) = mpsc::unbounded_channel::<RulePush>();
+                let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                 for source in &window_sources {
                     router
                         .fanout()
@@ -188,7 +194,7 @@ pub(super) fn spawn_rule_tasks(
                             time_field.clone(),
                             limits.clone(),
                         );
-                        let (push_tx, push_rx) = mpsc::unbounded_channel::<RulePush>();
+                        let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                         shard_txs.push(push_tx);
                         let task_config = RuleTaskConfig {
                             machine: Some(machine),
@@ -218,7 +224,7 @@ pub(super) fn spawn_rule_tasks(
                 } else {
                     let machine =
                         CepStateMachine::with_limits(name, match_plan, time_field, limits);
-                    let (push_tx, push_rx) = mpsc::unbounded_channel::<RulePush>();
+                    let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                     for source in &window_sources {
                         router
                             .fanout()

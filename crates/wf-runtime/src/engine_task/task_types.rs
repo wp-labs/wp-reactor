@@ -55,5 +55,5 @@ pub(crate) struct RuleTaskConfig {
     /// Push-mode input channel. When `Some`, the rule task consumes pushed
     /// `Arc<Vec<Arc<Event>>>` from it instead of pulling from the window read lock
     /// (R1). When `None`, the task falls back to the legacy notify + pull loop.
-    pub push_rx: Option<mpsc::UnboundedReceiver<RulePush>>,
+    pub push_rx: Option<mpsc::Receiver<RulePush>>,
 }

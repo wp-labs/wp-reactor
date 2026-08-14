@@ -173,7 +173,7 @@ async fn run_commit_worker(
         let seq = item.seq;
         pending.insert(seq, item);
         while let Some(item) = pending.remove(&next_seq) {
-            commit(&router, &metrics, item);
+            commit(&router, &metrics, item).await;
             next_seq += 1;
         }
     }
@@ -193,17 +193,17 @@ async fn run_commit_worker(
             );
         }
         while let Some(item) = pending.remove(&next_seq) {
-            commit(&router, &metrics, item);
+            commit(&router, &metrics, item).await;
             next_seq += 1;
         }
     }
 }
 
-fn commit(router: &Router, metrics: &Option<Arc<RuntimeMetrics>>, item: ParsedItem) {
+async fn commit(router: &Router, metrics: &Option<Arc<RuntimeMetrics>>, item: ParsedItem) {
     if let Some(metrics) = metrics {
         metrics.inc_router_route_call();
     }
-    match router.route_commit(item.batch, item.parsed) {
+    match router.route_commit(item.batch, item.parsed).await {
         Ok(report) => {
             if let Some(metrics) = metrics {
                 metrics.add_route_report(&report);

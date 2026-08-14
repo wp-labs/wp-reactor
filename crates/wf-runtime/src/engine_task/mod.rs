@@ -53,7 +53,7 @@ pub(crate) async fn run_rule_task(config: RuleTaskConfig) -> RuntimeResult<()> {
 /// Push data path: consume `Arc<Vec<Arc<Event>>>` from the rule's channel.
 async fn run_push_loop(
     task: &mut RuleTask,
-    mut rx: mpsc::UnboundedReceiver<RulePush>,
+    mut rx: mpsc::Receiver<RulePush>,
     cancel: CancellationToken,
     eos: &mut watch::Receiver<u64>,
     timeout_tick: &mut tokio::time::Interval,

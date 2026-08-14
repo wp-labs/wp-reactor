@@ -34,6 +34,7 @@ moju-derive = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 [features]
 mem_test = []

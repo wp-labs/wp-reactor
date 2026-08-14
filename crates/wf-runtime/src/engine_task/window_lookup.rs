@@ -128,8 +128,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn snapshot_with_timestamps_returns_correct_rows() {
+    #[tokio::test]
+    async fn snapshot_with_timestamps_returns_correct_rows() {
         let schema = ts_schema();
         let reg = WindowRegistry::build(vec![make_def("threat_intel", vec!["feed"])]).unwrap();
         let router = Router::new(reg);
@@ -146,7 +146,7 @@ mod tests {
         )
         .unwrap();
 
-        router.route("feed", batch).unwrap();
+        router.route("feed", batch).await.unwrap();
 
         let lookup = RegistryLookup(&router);
         let rows = lookup
@@ -177,8 +177,8 @@ mod tests {
         assert!(lookup.snapshot_with_timestamps("nonexistent").is_none());
     }
 
-    #[test]
-    fn snapshot_with_timestamps_none_for_no_time_column() {
+    #[tokio::test]
+    async fn snapshot_with_timestamps_none_for_no_time_column() {
         // Schema without a time column
         let schema = Arc::new(Schema::new(vec![
             Field::new("ip", DataType::Utf8, false),
@@ -206,7 +206,7 @@ mod tests {
             ],
         )
         .unwrap();
-        router.route("data", batch).unwrap();
+        router.route("data", batch).await.unwrap();
 
         let lookup = RegistryLookup(&router);
         // time_col_index is None → snapshot_with_timestamps returns None

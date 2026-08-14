@@ -350,6 +350,7 @@ fn make_task_with_window_bytes(
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: true,
     };
 
     let rule_plan = RulePlan {
@@ -459,6 +460,7 @@ fn make_pipeline_stage_task() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: true,
     };
     let rule_plan = RulePlan {
         name: "__wf_pipe_pipe_s1".into(),
@@ -556,6 +558,7 @@ fn make_each_task() -> (
             seq: None,
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
+            needs_field_history: true,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -650,6 +653,7 @@ fn make_filtered_match_task() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: true,
     };
 
     let rule_plan = RulePlan {
@@ -765,6 +769,7 @@ fn make_filtered_close_task() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: true,
     };
 
     let rule_plan = RulePlan {
@@ -864,6 +869,7 @@ fn make_filtered_each_task() -> (
             seq: None,
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
+            needs_field_history: true,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -955,6 +961,7 @@ fn make_intermediate_each_task() -> (
             seq: None,
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
+            needs_field_history: true,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -1071,6 +1078,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
             seq: None,
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
+            needs_field_history: true,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -1172,6 +1180,7 @@ fn make_intermediate_score_tasks() -> (
             seq: None,
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
+            needs_field_history: true,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -1272,6 +1281,7 @@ fn make_intermediate_score_tasks() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: true,
     };
 
     let downstream_plan = RulePlan {
@@ -1414,6 +1424,7 @@ fn make_intermediate_score_band_tasks() -> (
             seq: None,
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
+            needs_field_history: true,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -1514,6 +1525,7 @@ fn make_intermediate_score_band_tasks() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: true,
     };
 
     let downstream_plan = RulePlan {
@@ -1712,6 +1724,7 @@ fn make_filtered_bind_alias_match_task() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: true,
     };
 
     let rule_plan = RulePlan {
@@ -1880,6 +1893,7 @@ fn make_window_has_match_task() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: true,
     };
 
     let rule_plan = RulePlan {
@@ -2065,14 +2079,14 @@ async fn sharded_rule_produces_same_alerts_as_single_worker() {
     // Sharded: partition via the router fan-out (2 shards), then two machines.
     let registry = WindowRegistry::build(vec![]).unwrap();
     let router = Arc::new(Router::new(registry));
-    let (s0_tx, mut s0_rx) = mpsc::unbounded_channel();
-    let (s1_tx, mut s1_rx) = mpsc::unbounded_channel();
+    let (s0_tx, mut s0_rx) = mpsc::channel(8);
+    let (s1_tx, mut s1_rx) = mpsc::channel(8);
     let keys: Arc<[FieldRef]> =
         Arc::from(vec![FieldRef::Simple("sip".into())].into_boxed_slice());
     router
         .fanout()
         .register_sharded("auth_events", vec![s0_tx, s1_tx], keys);
-    router.fanout().broadcast("auth_events", &events);
+    router.fanout().broadcast("auth_events", &events).await;
 
     let (mut t0, mut rx0, _w0, _n0) = make_task();
     let (mut t1, mut rx1, _w1, _n1) = make_task();
@@ -2240,7 +2254,7 @@ async fn pipeline_stage_output_writes_internal_window_instead_of_alert_channel()
     let (mut task, mut alert_rx, router) = make_pipeline_stage_task();
     let ts = 1_700_000_000_123_000_000i64;
     // Pure relay (P1c): register a downstream rule subscriber; no window storage.
-    let (down_tx, mut down_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    let (down_tx, mut down_rx) = mpsc::channel::<wf_engine::window::RulePush>(8);
     router.fanout().register("__wf_pipe_pipe_s1_w1", down_tx);
 
     let batch = make_batch(&schema, &["10.0.0.8"], ts);
@@ -2286,7 +2300,7 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
     let (mut task, mut alert_rx, router) = make_intermediate_each_task();
     let ts = 4_000_000_000_000_000_000i64;
     // Pure relay (P1c): register a downstream rule subscriber; no window storage.
-    let (down_tx, mut down_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    let (down_tx, mut down_rx) = mpsc::channel::<wf_engine::window::RulePush>(8);
     router.fanout().register("enriched_events", down_tx);
 
     let batch = make_batch(&schema, &["10.0.0.8"], ts);
@@ -2397,7 +2411,7 @@ async fn intermediate_target_preserves_explicit_time_field() {
     let (mut task, mut alert_rx, router) = make_intermediate_each_task_with_explicit_time();
     let ts = 4_000_000_000_000_000i64;
     // Pure relay (P1c): register a downstream rule subscriber; no window storage.
-    let (down_tx, mut down_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    let (down_tx, mut down_rx) = mpsc::channel::<wf_engine::window::RulePush>(8);
     router.fanout().register("enriched_events", down_tx);
 
     let batch = make_batch(&schema, &["10.0.0.8"], ts);
@@ -2439,7 +2453,7 @@ async fn downstream_close_aggregates_intermediate_float_fields() {
 
     // Pure relay (P1c): the intermediate pipe is not stored in a window; the
     // downstream rule consumes the broadcast via push.
-    let (down_tx, mut down_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    let (down_tx, mut down_rx) = mpsc::channel::<wf_engine::window::RulePush>(8);
     router.fanout().register("semantic_events", down_tx);
 
     upstream_task.pull_and_advance().await;
@@ -2479,7 +2493,7 @@ async fn downstream_close_counts_filtered_bind_aliases() {
 
     // Pure relay (P1c): the intermediate pipe is not stored in a window; the
     // downstream rule consumes the broadcast via push.
-    let (down_tx, mut down_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    let (down_tx, mut down_rx) = mpsc::channel::<wf_engine::window::RulePush>(8);
     router.fanout().register("semantic_events", down_tx);
 
     upstream_task.pull_and_advance().await;
@@ -2752,6 +2766,7 @@ async fn port_scan_rule_triggers_close_alert() {
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
+            needs_field_history: true,
     };
 
     let rule_plan = RulePlan {
@@ -2855,8 +2870,8 @@ async fn pure_relay_broadcasts_to_sharded_downstream() {
     let schema = test_schema();
     let (mut task, _alert_rx, router) = make_pipeline_stage_task();
     // Two shards keyed by sip (P2a sharding on the intermediate pipe).
-    let (shard_a_tx, mut shard_a_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
-    let (shard_b_tx, mut shard_b_rx) = mpsc::unbounded_channel::<wf_engine::window::RulePush>();
+    let (shard_a_tx, mut shard_a_rx) = mpsc::channel::<wf_engine::window::RulePush>(8);
+    let (shard_b_tx, mut shard_b_rx) = mpsc::channel::<wf_engine::window::RulePush>(8);
     router.fanout().register_sharded(
         "__wf_pipe_pipe_s1_w1",
         vec![shard_a_tx, shard_b_tx],
