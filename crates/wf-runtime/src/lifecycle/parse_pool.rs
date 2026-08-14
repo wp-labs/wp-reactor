@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc;
@@ -10,6 +11,56 @@ use wf_engine::window::{ParsedRoute, Router};
 use crate::metrics::RuntimeMetrics;
 
 use super::types::TaskGroup;
+
+/// Token-bucket ingest rate limiter (events/sec), learned from warp-parse's
+/// `DynamicRateLimiter`. Tokens refill at `rate`; `acquire(events)` consumes
+/// them and sleeps when exhausted, so the engine never ingests faster than the
+/// configured cap even when a client sends flat-out — bounding the
+/// allocation-throughput-driven RSS peak.
+pub(crate) struct IngestLimiter {
+    rate_per_sec: f64,
+    tokens: Mutex<f64>,
+    last_refill: Mutex<Instant>,
+}
+
+impl IngestLimiter {
+    pub fn new(rate_per_sec: usize) -> Arc<Self> {
+        Arc::new(Self {
+            rate_per_sec: rate_per_sec as f64,
+            tokens: Mutex::new(rate_per_sec as f64),
+            last_refill: Mutex::new(Instant::now()),
+        })
+    }
+
+    /// Consume `events` tokens, sleeping as needed to keep the long-run rate ≤
+    /// `rate_per_sec`. Guards are scoped to a block so no `MutexGuard` crosses
+    /// the `.await` (std guards are not `Send`).
+    pub async fn acquire(&self, events: usize) {
+        let n = events.max(1) as f64;
+        let wait = {
+            let mut tokens = self.tokens.lock().unwrap();
+            let mut last = self.last_refill.lock().unwrap();
+            let now = Instant::now();
+            let elapsed = now.duration_since(*last).as_secs_f64();
+            *tokens = (*tokens + elapsed * self.rate_per_sec).min(self.rate_per_sec);
+            *last = now;
+            if *tokens >= n {
+                *tokens -= n;
+                0.0
+            } else {
+                let need = n - *tokens;
+                need / self.rate_per_sec
+            }
+        };
+        if wait > 0.0 {
+            tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+            let mut tokens = self.tokens.lock().unwrap();
+            let mut last = self.last_refill.lock().unwrap();
+            *tokens = 0.0;
+            *last = Instant::now();
+        }
+    }
+}
 
 /// Bounded buffer for the source → parse-worker channel.
 pub(super) const PARSE_CHANNEL_CAPACITY: usize = 1024;
@@ -64,6 +115,10 @@ pub(crate) fn build_parse_item(
 /// Used by streaming sources and file-replay sources alike, so every source
 /// flows through the same parse → ordered-commit → broadcast chain. Returns
 /// `false` when the parse pool has shut down (channel closed).
+///
+/// When `limiter` is `Some`, the batch is token-bucketed first (engine-side
+/// ingest rate cap), so a flat-out client cannot drive the engine's
+/// allocation throughput (and RSS peak) beyond the configured rate.
 pub(crate) async fn push_decoded_batch(
     parse_tx: &mpsc::Sender<ParseItem>,
     parse_seq: &AtomicU64,
@@ -72,7 +127,11 @@ pub(crate) async fn push_decoded_batch(
     batch: RecordBatch,
     router: &Router,
     metrics: Option<&Arc<RuntimeMetrics>>,
+    limiter: Option<&IngestLimiter>,
 ) -> bool {
+    if let Some(limiter) = limiter {
+        limiter.acquire(batch.num_rows()).await;
+    }
     let item = build_parse_item(parse_seq, source_name, stream_name, batch, router, metrics);
     parse_tx.send(item).await.is_ok()
 }

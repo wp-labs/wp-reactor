@@ -317,6 +317,7 @@ mod tests {
                 parse_parallelism: 2,
                 rule_parallelism: 1,
                 rule_exec_timeout: "30s".parse().unwrap(),
+                max_ingest_rate: None,
                 schemas: "schemas/*.wfs".into(),
                 rules: "rules/*.wfl".into(),
             },

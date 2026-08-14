@@ -12,7 +12,7 @@ use wf_engine::window::Router;
 use wf_lang::WindowSchema;
 
 use crate::error::{RuntimeReason, RuntimeResult};
-use crate::lifecycle::parse_pool::{ParseItem, build_parse_item, push_decoded_batch};
+use crate::lifecycle::parse_pool::{IngestLimiter, ParseItem, build_parse_item, push_decoded_batch};
 use crate::metrics::RuntimeMetrics;
 use crate::receiver::miss::record_batch_window_miss;
 use crate::receiver::schema::{
@@ -33,6 +33,7 @@ pub(crate) async fn replay_arrow_framed_file(
     parse_tx: mpsc::Sender<ParseItem>,
     parse_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
+    limiter: Option<Arc<IngestLimiter>>,
 ) -> RuntimeResult<()> {
     let path = path.to_path_buf();
     let stream_override = (!stream_name.trim().is_empty()).then(|| stream_name.to_string());
@@ -95,6 +96,7 @@ pub(crate) async fn replay_arrow_framed_file(
                     frame.batch,
                     router.as_ref(),
                     metrics.as_ref(),
+                    limiter.as_deref(),
                 )
                 .await
                 {

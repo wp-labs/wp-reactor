@@ -19,6 +19,13 @@ pub struct RuntimeConfig {
     pub rule_parallelism: usize,
     /// Single rule execution timeout.
     pub rule_exec_timeout: HumanDuration,
+    /// Optional engine-side ingest rate cap (events/sec). When set, the source
+    /// task token-buckets decoded batches so the engine never ingests faster
+    /// than this — bounding the allocation-throughput-driven RSS peak even when
+    /// a client sends flat-out (learned from warp-parse DynamicRateLimiter).
+    /// `None` = unlimited.
+    #[serde(default)]
+    pub max_ingest_rate: Option<usize>,
     /// Glob pattern for Window Schema (.wfs) files, relative to config dir.
     pub schemas: String,
     /// Glob pattern for WFL rule (.wfl) files, relative to config dir.

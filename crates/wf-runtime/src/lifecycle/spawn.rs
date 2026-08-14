@@ -34,7 +34,7 @@ use wf_connector_api::BatchSource;
 use wp_core_connectors::sources::batch::arrow::WireFormat;
 use wp_model_core::model::{DataRecord, DataType, Field, FieldStorage, Value};
 
-use super::parse_pool::{ParseItem, push_decoded_batch, spawn_parse_pool};
+use super::parse_pool::{IngestLimiter, ParseItem, push_decoded_batch, spawn_parse_pool};
 use super::types::{RunRule, RunRuleKind, TaskGroup};
 
 // ---------------------------------------------------------------------------
@@ -309,6 +309,7 @@ pub(super) async fn spawn_receiver_task(
         &mut group,
     );
     let parse_seq = Arc::new(AtomicU64::new(0));
+    let ingest_limiter = config.runtime.max_ingest_rate.map(IngestLimiter::new);
 
     for (source_idx, source) in config.sources.iter().enumerate() {
         if !source.enabled {
@@ -338,6 +339,7 @@ pub(super) async fn spawn_receiver_task(
                 let metrics = metrics.clone();
                 let parse_tx = parse_tx.clone();
                 let parse_seq = Arc::clone(&parse_seq);
+                let limiter = ingest_limiter.clone();
                 let cancel = cancel.child_token();
                 let format = source_data_format(source).to_string();
                 let schemas = Arc::clone(&schema_catalog);
@@ -389,6 +391,7 @@ pub(super) async fn spawn_receiver_task(
                                 parse_tx.clone(),
                                 Arc::clone(&parse_seq),
                                 cancel,
+                                limiter,
                             )
                             .await?
                         }
@@ -429,6 +432,7 @@ pub(super) async fn spawn_receiver_task(
                     &mut group,
                     parse_tx.clone(),
                     Arc::clone(&parse_seq),
+                    ingest_limiter.clone(),
                 )
                 .await?;
             }
@@ -502,6 +506,7 @@ async fn spawn_external_source_tasks(
     group: &mut TaskGroup,
     parse_tx: tokio::sync::mpsc::Sender<ParseItem>,
     parse_seq: Arc<AtomicU64>,
+    ingest_limiter: Option<Arc<IngestLimiter>>,
 ) -> RuntimeResult<usize> {
     let Some(factory) = wp_core_connectors::registry::get_source_factory(source_kind) else {
         return RuntimeReason::Bootstrap
@@ -587,6 +592,7 @@ async fn spawn_external_source_tasks(
         let schemas = Arc::clone(schemas);
         let parse_tx = parse_tx.clone();
         let parse_seq = Arc::clone(&parse_seq);
+        let limiter = ingest_limiter.clone();
         group.push(tokio::spawn(async move {
             // Start the source if needed (e.g. TCP source checks started flag).
             let (_ctrl_tx, ctrl_rx) = async_broadcast::broadcast(1);
@@ -664,6 +670,7 @@ async fn spawn_external_source_tasks(
                                     rb,
                                     router.as_ref(),
                                     metrics.as_ref(),
+                                    limiter.as_deref(),
                                 )
                                 .await
                                 {

@@ -920,6 +920,7 @@ async fn file_arrow_framed_replay_routes_rows() {
         parse_tx.clone(),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
+            None,
     )
     .await
     .unwrap();
@@ -978,6 +979,7 @@ async fn file_arrow_framed_unknown_tag_is_window_miss() {
         parse_tx.clone(),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
+            None,
     )
     .await
     .unwrap();
@@ -1381,7 +1383,7 @@ fn build_parse_item_records_receiver_metrics() {
 async fn push_decoded_batch_commits_through_parse_pool() {
     let (router, parse_tx, parse_seq) = make_parse_router("events");
     let batch = make_batch(&test_schema(), &[1_000_000_000, 2_000_000_000], &[1, 2]);
-    let ok = push_decoded_batch(&parse_tx, &parse_seq, "src", "events", batch, &router, None).await;
+    let ok = push_decoded_batch(&parse_tx, &parse_seq, "src", "events", batch, &router, None, None).await;
     assert!(ok, "push should succeed");
     wait_for_rows(&router, 2).await;
 }
@@ -1393,7 +1395,7 @@ async fn push_decoded_batch_returns_false_when_channel_closed() {
     let (tx, rx) = mpsc::channel::<ParseItem>(1);
     drop(rx); // receiver gone → send fails
     let batch = make_batch(&test_schema(), &[1_000_000_000], &[1]);
-    let ok = push_decoded_batch(&tx, &seq, "src", "events", batch, &router, None).await;
+    let ok = push_decoded_batch(&tx, &seq, "src", "events", batch, &router, None, None).await;
     assert!(!ok, "push to a closed parse channel must report failure");
 }
 
