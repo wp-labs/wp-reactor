@@ -1,3 +1,4 @@
+use smol_str::SmolStr;
 use wf_lang::ast::{FieldRef, PathSegment};
 
 use super::types::{EngineHashMap, Event, Value};
@@ -71,7 +72,10 @@ fn canonical_f64_bits(value: f64) -> u64 {
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub(super) struct InstanceKey {
-    pub scope_key_str: String,
+    /// SmolStr: a single-key scope (auction id, ip, …) is ≤22 bytes and stores
+    /// inline — the old `String` allocated on the heap for every event's
+    /// instance lookup, the dominant per-event allocation in `advance_at`.
+    pub scope_key_str: SmolStr,
     pub bucket_start: Option<i64>,
 }
 
@@ -107,6 +111,31 @@ impl InstanceKey {
             .map(|s| Value::Str(s.into()))
             .collect()
     }
+}
+
+pub(crate) fn make_scope_key_str(scope_key: &[Value]) -> SmolStr {
+    // Write each key value straight into a SmolStrBuilder — no intermediate
+    // String per key field, no Vec<String>, and short single-field keys (the
+    // common case: auction id, ip, …) stay inline in the 24B SmolStr with zero
+    // heap allocation. Byte-for-byte identical to `value_to_string` joined by
+    // \x1f (Number via Display, Bool "true"/"false", Str verbatim).
+    use std::fmt::Write;
+    let mut b = smol_str::SmolStrBuilder::new();
+    for (i, v) in scope_key.iter().enumerate() {
+        if i > 0 {
+            b.push('\x1f');
+        }
+        match v {
+            Value::Number(n) => {
+                let _ = write!(b, "{n}");
+            }
+            Value::Str(st) => b.push_str(st),
+            Value::Bool(bv) => b.push_str(if *bv { "true" } else { "false" }),
+            Value::Array(_) => b.push_str("[array]"),
+            Value::Object(_) => b.push_str("[object]"),
+        }
+    }
+    b.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -247,14 +276,6 @@ pub(crate) fn eval_field_value(
         }
     }
     Some(value)
-}
-
-pub(crate) fn make_scope_key_str(scope_key: &[Value]) -> String {
-    scope_key
-        .iter()
-        .map(value_to_string)
-        .collect::<Vec<_>>()
-        .join("\x1f")
 }
 
 /// Deterministic shard index for a scope key (FNV-1a over the key's string
