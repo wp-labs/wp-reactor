@@ -23,10 +23,40 @@ pub(crate) fn format_nanos_utc(nanos: i64) -> String {
     let minute = (secs_of_day % 3600) / 60;
     let second = secs_of_day % 60;
 
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        year, month, day, hour, minute, second, millis
-    )
+    // Byte-direct write of the fixed "YYYY-MM-DDTHH:MM:SS.mmmZ" layout into a
+    // right-sized String — no format! machinery on the per-event hot path.
+    // Byte-identical to the previous format!("{:04}-{:02}...") output.
+    let mut s = String::with_capacity(24);
+    push_digits(&mut s, year as u32, 4);
+    s.push('-');
+    push_digits(&mut s, month as u32, 2);
+    s.push('-');
+    push_digits(&mut s, day as u32, 2);
+    s.push('T');
+    push_digits(&mut s, hour as u32, 2);
+    s.push(':');
+    push_digits(&mut s, minute as u32, 2);
+    s.push(':');
+    push_digits(&mut s, second as u32, 2);
+    s.push('.');
+    push_digits(&mut s, millis, 3);
+    s.push('Z');
+    s
+}
+
+/// Push `v` as `width` zero-padded ASCII decimal digits.
+fn push_digits(s: &mut String, v: u32, width: usize) {
+    let mut digits = [b'0'; 8];
+    let mut i = width;
+    let mut v = v;
+    while i > 0 {
+        i -= 1;
+        digits[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    for &d in &digits[..width] {
+        s.push(d as char);
+    }
 }
 
 pub(crate) fn now_nanos() -> i64 {
@@ -230,4 +260,79 @@ pub(super) fn build_summary(
     parts.push(format!("origin={}", origin.as_str()));
 
     parts.join("; ")
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    /// Reference implementation: the previous `format!`-based output.
+    fn reference(nanos: i64) -> String {
+        if nanos <= 0 {
+            return "1970-01-01T00:00:00.000Z".to_string();
+        }
+        let total_secs = (nanos / 1_000_000_000) as u64;
+        let millis = ((nanos % 1_000_000_000) / 1_000_000) as u32;
+        let secs_of_day = total_secs % 86400;
+        let days_since_epoch = (total_secs / 86400) as i64;
+        let (year, month, day) = civil_from_days(days_since_epoch);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            year,
+            month,
+            day,
+            secs_of_day / 3600,
+            (secs_of_day % 3600) / 60,
+            secs_of_day % 60,
+            millis
+        )
+    }
+
+    #[test]
+    fn format_nanos_utc_matches_reference_on_edges() {
+        let edges = [
+            0i64,
+            -1,
+            1,
+            999_999,
+            1_000_000,
+            999_999_999,
+            1_000_000_000,
+            86_399_999_999_999_999, // last ms of 1970-01-01
+            86_400_000_000_000_000, // 1970-01-02T00:00:00
+            1_583_020_800_000_000_000, // 2020-03-01 (leap year boundary)
+            1_609_459_200_000_000_000, // 2021-01-01
+            4_102_444_800_000_000_000, // 2100-01-01 (non-leap century)
+            i64::MAX,
+        ];
+        for n in edges {
+            assert_eq!(format_nanos_utc(n), reference(n), "edge nanos={n}");
+        }
+    }
+
+    #[test]
+    fn format_nanos_utc_matches_reference_on_pseudorandom_samples() {
+        // Deterministic LCG so failures reproduce.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut nanos: i64 = 1;
+        for _ in 0..10_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let pick = state % 100;
+            let n = if pick < 60 {
+                // Recent-ish wall-clock range (2010-2100).
+                1_262_304_000_000_000_000 + (state % 2_817_484_800) as i64 * 1_000_000
+            } else if pick < 90 {
+                // Early epoch.
+                (state % 86_400_000_000) as i64
+            } else {
+                // Full positive i64 span (up to year 2262).
+                ((state >> 12) as i64).abs()
+            };
+            assert_eq!(format_nanos_utc(n), reference(n), "random nanos={n}");
+            nanos += 1;
+        }
+        let _ = nanos;
+    }
 }

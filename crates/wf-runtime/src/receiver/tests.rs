@@ -1353,9 +1353,9 @@ fn build_parse_item_assigns_monotonic_seq_and_stream() {
     let seq = Arc::new(AtomicU64::new(0));
     let batch = make_batch(&test_schema(), &[1_000_000_000, 2_000_000_000], &[1, 2]);
     let item0 = build_parse_item(
-        &seq, "src", "events", batch.clone(), &router, None, 0, Vec::new(),
+        &seq, "src", "events", batch.clone(), &router, None, Vec::new(),
     );
-    let item1 = build_parse_item(&seq, "src", "events", batch, &router, None, 0, Vec::new());
+    let item1 = build_parse_item(&seq, "src", "events", batch, &router, None, Vec::new());
     assert_eq!(item0.seq, 0);
     assert_eq!(item1.seq, 1);
     assert_eq!(item0.source_name, "src");
@@ -1375,7 +1375,7 @@ fn build_parse_item_records_receiver_metrics() {
     let seq = Arc::new(AtomicU64::new(0));
     let batch = make_batch(&test_schema(), &[1_000_000_000], &[1]);
     let _ = build_parse_item(
-        &seq, "src", "events", batch, &router, Some(&metrics), 0, Vec::new(),
+        &seq, "src", "events", batch, &router, Some(&metrics), Vec::new(),
     );
 
     let records = metrics.snapshot().to_records();

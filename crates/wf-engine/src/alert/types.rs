@@ -112,7 +112,9 @@ pub struct OutputRecord {
     /// ISO 8601 UTC timestamp (`SystemTime`-based, no chrono).
     pub fired_at: String,
     /// ISO 8601 UTC timestamp when the engine emitted the record.
-    pub emit_time: String,
+    /// `Arc<str>`: batch-level shared (rule_task caches the wall clock per
+    /// batch), so all events in a batch share one allocation.
+    pub emit_time: Arc<str>,
     /// Matched rows — always `vec![]` for L1 (placeholder for M25 join).
     #[serde(skip)]
     pub matched_rows: Vec<RecordBatch>,
@@ -208,7 +210,7 @@ impl OutputRecord {
             &mut exported,
             WFU_EMIT_TIME,
             DataType::Chars,
-            ModelValue::from(self.emit_time.as_str()),
+            ModelValue::from(&*self.emit_time),
         )?;
         append_field(
             &mut record,

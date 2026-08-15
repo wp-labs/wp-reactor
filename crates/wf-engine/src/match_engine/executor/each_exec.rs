@@ -31,7 +31,7 @@ impl RuleExecutor {
         if !passes_each_filter(each_plan.filter.as_ref(), event) {
             return Ok(None);
         }
-        self.build_each_alert(event, event_time_nanos, &[])
+        self.build_each_alert(event, event_time_nanos, &[], now_nanos())
     }
 
     /// Produce an [`OutputRecord`] from a single event in `on each` mode with
@@ -40,12 +40,17 @@ impl RuleExecutor {
     /// `field_order` is the event schema's field names in sorted order,
     /// precomputed once per batch by the caller (events within one batch share
     /// the window schema). Pass `&[]` to compute the order per event instead.
+    ///
+    /// `emit_time_nanos` is the record's emit timestamp. The runtime passes a
+    /// batch-level cached wall clock so `emit_time` formats once per batch
+    /// (see [`RuleExecutor::cached_emit_time`]).
     pub fn execute_each_with_joins(
         &self,
         event: &Event,
         event_time_nanos: i64,
         windows: &dyn WindowLookup,
         field_order: &[&SmolStr],
+        emit_time_nanos: i64,
     ) -> CoreResult<Option<OutputRecord>> {
         let Some(each_plan) = &self.plan.each_plan else {
             return Err(orion_error::StructError::from(CoreReason::RuleExec)
@@ -58,7 +63,7 @@ impl RuleExecutor {
         if !execute_joins(&self.plan.joins, &mut ctx, windows, event_time_nanos) {
             return Ok(None);
         }
-        self.build_each_alert(&ctx, event_time_nanos, field_order)
+        self.build_each_alert(&ctx, event_time_nanos, field_order, emit_time_nanos)
     }
 
     fn build_each_alert(
@@ -66,14 +71,14 @@ impl RuleExecutor {
         ctx: &Event,
         event_time_nanos: i64,
         field_order: &[&SmolStr],
+        emit_time_nanos: i64,
     ) -> CoreResult<Option<OutputRecord>> {
         let statics = self.output_static();
         let score = eval_score(&self.plan.score_plan.expr, ctx)?;
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
         let origin = AlertOrigin::Event;
         let fired_at = format_nanos_utc(event_time_nanos);
-        let emit_time_nanos = now_nanos();
-        let emit_time = format_nanos_utc(emit_time_nanos);
+        let emit_time = self.cached_emit_time(emit_time_nanos);
         let wfx_id =
             build_each_wfx_id(&self.plan.name, event_time_nanos, ctx, &origin, field_order);
         // Summary is a plan constant on this path (empty scope + empty steps)
@@ -91,7 +96,7 @@ impl RuleExecutor {
                 origin: Some(origin.as_str()),
                 close_reason: Some(""),
                 fired_at: Some(&fired_at),
-                emit_time: Some(&emit_time),
+                emit_time: Some(&*emit_time),
                 summary: Some(&summary),
                 event_first_time_nanos: Some(event_time_nanos),
                 event_last_time_nanos: Some(event_time_nanos),

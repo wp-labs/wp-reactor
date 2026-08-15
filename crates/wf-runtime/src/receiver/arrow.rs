@@ -197,7 +197,6 @@ pub(crate) async fn replay_arrow_ipc_file(
                 batch,
                 router.as_ref(),
                 metrics.as_ref(),
-                mem_bytes,
                 permits,
             );
             if parse_tx.blocking_send(item).is_err() {

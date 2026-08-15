@@ -380,6 +380,10 @@ impl RuleTask {
             }
             _ => Vec::new(),
         };
+        // Batch-level emit timestamp: all events in this batch share one
+        // (nanos, formatted) pair — the executor caches the formatted string
+        // and Arc-shares it across every record it builds this batch.
+        let batch_emit_nanos = self.cached_wall_nanos.load(Ordering::Relaxed) as i64;
         for (row_index, event) in events.iter().enumerate() {
             if let Some(machine) = &mut self.machine {
                 let event_nanos = machine.event_time_nanos(event);
@@ -651,6 +655,7 @@ impl RuleTask {
                         event_nanos,
                         &lookup,
                         &each_field_order,
+                        batch_emit_nanos,
                     ) {
                         Ok(Some(record)) => {
                             if debug_enabled {
@@ -1443,7 +1448,7 @@ mod debug_stats_tests {
             entity_id: "10.0.0.1".to_string(),
             origin: AlertOrigin::Event,
             fired_at: "2026-01-01T00:00:00Z".to_string(),
-            emit_time: "2026-01-01T00:00:00Z".to_string(),
+            emit_time: "2026-01-01T00:00:00Z".into(),
             matched_rows: Vec::new(),
             summary: "".into(),
             yield_target: target.into(),

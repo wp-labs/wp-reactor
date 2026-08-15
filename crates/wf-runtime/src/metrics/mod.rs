@@ -307,18 +307,22 @@ impl MetricsSnapshot {
                 out.push(metric_double("rule", "cursor_gap_total", rule, window, *v));
             }
         }
+        // Exact per-rule emitted totals are always exported. (Previously the
+        // exact total was dropped when the rule had detail rows, and the
+        // 1-in-64 sampled per-scope counts were exported under the same
+        // `emitted_total` name — making emission look ~64x lower than it was.)
         for (rule, v) in &self.alert_emitted {
-            if !self.alert_emitted_detail.contains_key(rule) {
-                out.push(metric("alert", "emitted_total", rule, *v));
-            }
+            out.push(metric("alert", "emitted_total", rule, *v));
         }
+        // Sampled (1/64) per-machine/per-scope breakdown, exported under its
+        // own name so it can never be mistaken for the authoritative total.
         for (rule, by_machine) in &self.alert_emitted_detail {
             for (machine, by_scope) in by_machine {
                 for (scope, v) in by_scope {
                     out.push(MetricsRecord {
                         fields: vec![
                             ("stage".into(), "alert".into()),
-                            ("name".into(), "emitted_total".into()),
+                            ("name".into(), "emitted_detail".into()),
                             ("label".into(), rule.clone()),
                             ("machine".into(), machine.clone()),
                             ("scope_key".into(), scope.clone()),

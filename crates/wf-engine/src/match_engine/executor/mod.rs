@@ -8,7 +8,7 @@ mod match_exec;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use orion_error::conversion::{SourceRawErr, ToStructError};
 use wf_config::OutputConfig;
@@ -62,6 +62,12 @@ pub struct RuleExecutor {
     /// instead of a linear scan of `plan.binds` on every (event × alias).
     bind_filters: HashMap<String, Option<Expr>>,
     output_static: OutputStatic,
+    /// Last (nanos, formatted) emit time. The runtime feeds a batch-level
+    /// cached wall clock into the on-each path, so all events in a batch
+    /// share one timestamp — format it once and Arc-share it instead of one
+    /// String per event. `Arc`-wrapped so `RuleExecutor: Clone` holds; clones
+    /// share the cache harmlessly (it is keyed by nanos).
+    emit_time_cache: Arc<Mutex<(i64, Arc<str>)>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -152,7 +158,19 @@ impl RuleExecutor {
             yield_field_types: options.yield_field_types,
             output: options.output,
             bind_filters,
+            emit_time_cache: Arc::new(Mutex::new((0, Arc::from("")))),
         }
+    }
+
+    /// Formatted emit time for `nanos`, cached: consecutive calls with the
+    /// same nanos (the batch-shared wall clock) return the same `Arc<str>`
+    /// with no re-formatting.
+    pub(crate) fn cached_emit_time(&self, nanos: i64) -> Arc<str> {
+        let mut cache = self.emit_time_cache.lock().unwrap();
+        if cache.0 != nanos || cache.1.is_empty() {
+            *cache = (nanos, Arc::from(alert::format_nanos_utc(nanos)));
+        }
+        Arc::clone(&cache.1)
     }
 
     pub fn plan(&self) -> &RulePlan {

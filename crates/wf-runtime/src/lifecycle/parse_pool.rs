@@ -70,6 +70,7 @@ const COMMIT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Default byte budget for in-flight decoded batches across the
 /// source → parse → commit chain (see [`spawn_parse_pool_with_preread`]).
+#[cfg(test)]
 pub(crate) const DEFAULT_PARSE_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 /// Floor for the configured byte budget — smaller values would starve the
 /// pipeline's pipelining depth for even modest batch sizes.
@@ -148,7 +149,6 @@ pub(crate) struct ParseItem {
     pub stream_name: String,
     pub batch: RecordBatch,
     /// Arrow memory size of `batch`, charged against the preread budget.
-    pub mem_bytes: usize,
     /// Budget permits held while this batch is in flight; released when the
     /// commit worker finishes (or the item is dropped on shutdown).
     pub permits: Vec<OwnedSemaphorePermit>,
@@ -168,7 +168,6 @@ pub(crate) fn build_parse_item(
     batch: RecordBatch,
     router: &Router,
     metrics: Option<&Arc<RuntimeMetrics>>,
-    mem_bytes: usize,
     permits: Vec<OwnedSemaphorePermit>,
 ) -> ParseItem {
     if let Some(metrics) = metrics {
@@ -184,7 +183,6 @@ pub(crate) fn build_parse_item(
         source_name: source_name.to_string(),
         stream_name: stream_name.to_string(),
         batch: projected,
-        mem_bytes,
         permits,
     }
 }
@@ -223,7 +221,6 @@ pub(crate) async fn push_decoded_batch(
         batch,
         router,
         metrics,
-        mem_bytes,
         permits,
     );
     parse_tx.send(item).await.is_ok()
@@ -247,6 +244,9 @@ struct ParsedItem {
 /// Parse workers run [`Router::route_parse`] in parallel; the single commit
 /// worker runs [`Router::route_commit`] in `seq` order so watermark advancement
 /// and rule broadcast stay in source order.
+/// Legacy entry point with the default budget (tests; the runtime passes the
+/// configured budget via [`spawn_parse_pool_with_preread`]).
+#[cfg(test)]
 pub(crate) fn spawn_parse_pool(
     router: &Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,

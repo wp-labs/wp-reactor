@@ -62,7 +62,7 @@ impl RuleExecutor {
         let origin = AlertOrigin::Event;
         let fired_at = format_nanos_utc(matched.event_time_nanos);
         let emit_time_nanos = now_nanos();
-        let emit_time = format_nanos_utc(emit_time_nanos);
+        let emit_time = Arc::from(format_nanos_utc(emit_time_nanos));
         let wfx_id = build_wfx_id(
             &self.plan.name,
             &matched.scope_key,
