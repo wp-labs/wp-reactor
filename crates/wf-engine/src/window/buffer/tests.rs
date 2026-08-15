@@ -1,3 +1,4 @@
+use crate::match_engine::{JoinKey, Value};
 use crate::window::buffer::{content_bytes, events_bytes};
 use crate::window::buffer::Window;
 use crate::window::buffer::types::AppendOutcome;
@@ -799,4 +800,151 @@ fn sized_append_keeps_events_lazily_parseable() {
         "both rows must be lazily parsed into events"
     );
     assert_eq!(cursor, 1, "cursor advances past the batch");
+}
+
+// -- join index ------------------------------------------------------------
+
+#[test]
+fn join_index_maintained_on_append_and_evict() {
+    let mut win = test_window(3600, usize::MAX);
+    win.set_join_key("value".into());
+
+    // Append two batches with overlapping key values.
+    win.append(make_batch(&test_schema(), &[1_000_000, 2_000_000], &[42, 43]))
+        .unwrap();
+    win.append(make_batch(&test_schema(), &[3_000_000, 4_000_000], &[42, 44]))
+        .unwrap();
+
+    // Lookup by key: value 42 has 2 rows, 44 has 1, 999 has none.
+    assert_eq!(
+        win.join_lookup(&JoinKey::Int(42)).map(|v| v.len()),
+        Some(2),
+        "two rows with value 42 indexed"
+    );
+    assert_eq!(
+        win.join_lookup(&JoinKey::Int(44)).map(|v| v.len()),
+        Some(1),
+        "one row with value 44 indexed"
+    );
+    assert!(
+        win.join_lookup(&JoinKey::Int(999)).is_none(),
+        "no match → None"
+    );
+
+    // Expire all batches: over=3600s, now=4000s → cutoff=400s >> event times
+    // (1-4ms), so all batches are time-evicted and index entries removed.
+    win.evict_expired(4_000_000_000_000);
+    assert!(
+        win.join_lookup(&JoinKey::Int(42)).is_none_or(|v| v.is_empty()),
+        "index cleared after eviction"
+    );
+}
+
+#[test]
+fn join_key_from_value_conversion() {
+    use crate::match_engine::EngineHashMap;
+    assert_eq!(
+        JoinKey::from_value(&Value::Number(42.0)),
+        Some(JoinKey::Int(42)),
+        "number → Int"
+    );
+    assert_eq!(
+        JoinKey::from_value(&Value::Str("abc".into())),
+        Some(JoinKey::Str("abc".into())),
+        "string → Str"
+    );
+    assert_eq!(
+        JoinKey::from_value(&Value::Bool(true)),
+        Some(JoinKey::Bool(true)),
+        "bool → Bool"
+    );
+    assert_eq!(
+        JoinKey::from_value(&Value::Array(vec![])),
+        None,
+        "array → None (rejected at compile time)"
+    );
+    assert_eq!(
+        JoinKey::from_value(&Value::Object(EngineHashMap::default())),
+        None,
+        "object → None"
+    );
+}
+
+#[test]
+fn join_index_absent_without_set_join_key() {
+    let win = test_window(3600, usize::MAX);
+    assert!(
+        win.join_lookup(&JoinKey::Int(1)).is_none(),
+        "no join index → None (caller falls back to scan)"
+    );
+}
+
+#[test]
+fn join_index_built_for_existing_batches_on_set_join_key() {
+    let mut win = test_window(3600, usize::MAX);
+    // Data appended before the window is configured as a join target.
+    win.append(make_batch(&test_schema(), &[1_000_000, 2_000_000], &[42, 43]))
+        .unwrap();
+    win.append(make_batch(&test_schema(), &[3_000_000], &[44]))
+        .unwrap();
+    win.set_join_key("value".into());
+    assert_eq!(
+        win.join_lookup(&JoinKey::Int(42)).map(|v| v.len()),
+        Some(1),
+        "existing rows indexed by set_join_key"
+    );
+    assert_eq!(
+        win.join_lookup(&JoinKey::Int(44)).map(|v| v.len()),
+        Some(1),
+        "rows from a later batch indexed"
+    );
+}
+
+#[test]
+fn join_index_updated_on_oldest_eviction() {
+    let mut win = test_window(3600, usize::MAX);
+    win.set_join_key("value".into());
+    win.append(make_batch(&test_schema(), &[1_000_000, 2_000_000], &[42, 43]))
+        .unwrap();
+    win.append(make_batch(&test_schema(), &[3_000_000, 4_000_000], &[44, 45]))
+        .unwrap();
+
+    // evict_oldest (memory-pressure path) must drop the first batch's keys.
+    assert!(win.evict_oldest().is_some(), "evict_oldest returns byte size");
+    assert!(
+        win.join_lookup(&JoinKey::Int(42)).is_none_or(|v| v.is_empty()),
+        "key 42 (first batch) removed after evict_oldest"
+    );
+    assert!(
+        win.join_lookup(&JoinKey::Int(43)).is_none_or(|v| v.is_empty()),
+        "key 43 (first batch) removed after evict_oldest"
+    );
+    assert_eq!(
+        win.join_lookup(&JoinKey::Int(44)).map(|v| v.len()),
+        Some(1),
+        "key 44 (second batch) still indexed"
+    );
+}
+
+#[test]
+fn join_index_duplicate_key_keeps_all_rows() {
+    let mut win = test_window(3600, usize::MAX);
+    win.set_join_key("value".into());
+    // Two rows with the same key 42 in different batches.
+    win.append(make_batch(&test_schema(), &[1_000_000], &[42]))
+        .unwrap();
+    win.append(make_batch(&test_schema(), &[2_000_000], &[42]))
+        .unwrap();
+    assert_eq!(
+        win.join_lookup(&JoinKey::Int(42)).map(|v| v.len()),
+        Some(2),
+        "both rows with key 42 kept"
+    );
+    // Evict one batch → one row remains.
+    win.evict_oldest();
+    assert_eq!(
+        win.join_lookup(&JoinKey::Int(42)).map(|v| v.len()),
+        Some(1),
+        "one row removed on evict, one kept"
+    );
 }

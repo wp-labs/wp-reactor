@@ -41,6 +41,30 @@ pub enum Value {
     Object(EngineHashMap<SmolStr, Value>),
 }
 
+/// Hashable scalar key for join indexes. `Value` itself is not reliably
+/// hashable (f64/recursive), so join lookups convert the key field to this
+/// concrete scalar form. Object/array values map to `None` (rejected at
+/// compile time — see checker join key constraint).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum JoinKey {
+    Int(i64),
+    Str(String),
+    Bool(bool),
+}
+
+impl JoinKey {
+    /// Convert a [`Value`] to a hashable scalar key, or `None` for structured
+    /// (object/array) values.
+    pub fn from_value(v: &Value) -> Option<JoinKey> {
+        match v {
+            Value::Number(n) => Some(JoinKey::Int(*n as i64)),
+            Value::Str(s) => Some(JoinKey::Str(s.to_string())),
+            Value::Bool(b) => Some(JoinKey::Bool(*b)),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public types — result of advance()
 // ---------------------------------------------------------------------------
@@ -200,6 +224,27 @@ pub trait WindowLookup: Send + Sync {
     fn snapshot_with_timestamps(&self, window: &str) -> Option<Vec<(i64, HashMap<String, Value>)>> {
         let _ = window;
         None
+    }
+
+    /// Indexed join lookup: return rows of `window` whose `key_field` equals `key`.
+    ///
+    /// Default implementation falls back to a full snapshot + linear filter
+    /// (O(rows)); a window with a maintained hash index overrides this to O(1).
+    fn join_lookup(
+        &self,
+        window: &str,
+        key_field: &str,
+        key: &Value,
+    ) -> Option<Vec<HashMap<String, Value>>> {
+        let rows = self.snapshot(window)?;
+        Some(
+            rows.into_iter()
+                .filter(|row| {
+                    row.get(key_field)
+                        .is_some_and(|v| crate::match_engine::match_engine::values_equal(v, key))
+                })
+                .collect(),
+        )
     }
 }
 

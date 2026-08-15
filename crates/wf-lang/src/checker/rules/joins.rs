@@ -1,5 +1,5 @@
 use crate::ast::{FieldRef, JoinMode};
-use crate::schema::WindowSchema;
+use crate::schema::{FieldType, WindowSchema};
 
 use crate::checker::scope::Scope;
 use crate::checker::{CheckError, Severity};
@@ -70,7 +70,39 @@ pub fn check_joins_list(
                                         qualifier, field, join.target_window
                                     ),
                                 });
-                            } else if !target_schema.fields.iter().any(|f| f.name == *field) {
+                            } else if let Some(field_def) =
+                                target_schema.fields.iter().find(|f| f.name == *field)
+                            {
+                                // Hash-join index requires a scalar base-type key
+                                // (object/array values are not reliably hashable).
+                                // Float is excluded: JoinKey::Int truncates f64,
+                                // so 42.5 and 42.4 would collide (false match).
+                                let scalar_ok = matches!(
+                                    field_def.field_type,
+                                    FieldType::Base(
+                                        crate::schema::BaseType::Digit
+                                            | crate::schema::BaseType::Chars
+                                            | crate::schema::BaseType::Bool
+                                            | crate::schema::BaseType::Time
+                                            | crate::schema::BaseType::Ip
+                                            | crate::schema::BaseType::Hex
+                                    )
+                                );
+                                if !scalar_ok {
+                                    errors.push(CheckError {
+                                        severity: Severity::Error,
+                                        rule: Some(rule_name.to_string()),
+                                        test: None,
+                                        message: format!(
+                                            "join key `{}.{}` must be a scalar base type \
+                                             (digit/chars/bool/time/ip/hex; float excluded — \
+                                             f64 truncation would false-match); got a structured \
+                                             type (object/array) or float",
+                                            qualifier, field
+                                        ),
+                                    });
+                                }
+                            } else {
                                 errors.push(CheckError {
                                     severity: Severity::Error,
                                     rule: Some(rule_name.to_string()),

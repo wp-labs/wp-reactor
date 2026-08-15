@@ -214,6 +214,20 @@ pub struct JoinCondPlan {
     pub right: FieldRef,
 }
 
+impl JoinCondPlan {
+    /// The right-side (target-window) key field name, if it is a flat
+    /// (non-nested) reference. Join keys are validated as flat scalars by the
+    /// checker, so this is `Some` for compiled joins.
+    pub fn right_field_name(&self) -> Option<&str> {
+        match &self.right {
+            FieldRef::Simple(f) | FieldRef::Qualified(_, f) | FieldRef::Bracketed(_, f) => {
+                Some(f.as_str())
+            }
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LimitsPlan — resource budget enforcement
 // ---------------------------------------------------------------------------

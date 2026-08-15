@@ -119,19 +119,29 @@ pub(super) fn execute_joins(
     for join in joins {
         let matched_row = match &join.mode {
             JoinMode::Snapshot => {
-                let Some(rows) = windows.snapshot(&join.right_window) else {
+                let Some((key_field, key_val)) = first_join_key(ctx, &join.conds) else {
+                    continue;
+                };
+                let Some(rows) = windows.join_lookup(&join.right_window, &key_field, &key_val)
+                else {
                     continue;
                 };
                 find_matching_row(&rows, &join.conds, ctx)
             }
             JoinMode::Asof { within } => {
+                // asof still uses the timestamped scan path (the hash index is
+                // not timestamp-aware yet).
                 let Some(rows) = windows.snapshot_with_timestamps(&join.right_window) else {
                     continue;
                 };
                 find_asof_row(&rows, &join.conds, ctx, event_time_nanos, within.as_ref())
             }
             JoinMode::Anti => {
-                let Some(rows) = windows.snapshot(&join.right_window) else {
+                let Some((key_field, key_val)) = first_join_key(ctx, &join.conds) else {
+                    continue;
+                };
+                let Some(rows) = windows.join_lookup(&join.right_window, &key_field, &key_val)
+                else {
                     // No anti-join window data yet — keep event
                     continue;
                 };
@@ -160,6 +170,16 @@ pub(super) fn execute_joins(
         }
     }
     true
+}
+
+/// Extract the first join condition's `(right key field, left value)`, so the
+/// join can use a hash-index lookup for the primary key condition before
+/// filtering by any remaining conditions.
+fn first_join_key(ctx: &Event, conds: &[JoinCondPlan]) -> Option<(String, Value)> {
+    let cond = conds.first()?;
+    let left_name = field_ref_name(&cond.left);
+    let val = ctx.fields.get(left_name)?.clone();
+    Some((field_ref_name(&cond.right).to_string(), val))
 }
 
 /// Find the first row matching all join conditions.

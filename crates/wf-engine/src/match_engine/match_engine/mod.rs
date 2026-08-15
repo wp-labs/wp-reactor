@@ -9,8 +9,8 @@ mod types;
 
 // Re-export public types
 pub use types::{
-    BindData, CloseOutput, CloseReason, Event, MACHINE_ID, MatchedContext, StepData, StepOutcome,
-    StepProgress, StepResult, Value, WindowLookup,
+    BindData, CloseOutput, CloseReason, Event, JoinKey, MACHINE_ID, MatchedContext, StepData,
+    StepOutcome, StepProgress, StepResult, Value, WindowLookup,
 };
 pub use types::{EngineHashMap, EngineHashSet};
 

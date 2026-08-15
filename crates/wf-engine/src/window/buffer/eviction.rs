@@ -19,6 +19,7 @@ impl Window {
                 let evicted = self.batches.pop_front().unwrap();
                 self.current_bytes -= evicted.byte_size;
                 self.total_rows -= evicted.row_count;
+                self.remove_batch_from_index(&evicted);
             } else {
                 break;
             }
@@ -32,6 +33,15 @@ impl Window {
         let evicted = self.batches.pop_front()?;
         self.current_bytes -= evicted.byte_size;
         self.total_rows -= evicted.row_count;
+        self.remove_batch_from_index(&evicted);
         Some(evicted.byte_size)
+    }
+
+    /// Remove an evicted batch's rows from the join index (if configured).
+    fn remove_batch_from_index(&mut self, evicted: &super::TimedBatch) {
+        if let Some(idx) = &mut self.join_index {
+            let events = evicted.events(self.materialize_fields.as_deref());
+            idx.remove_batch(&events);
+        }
     }
 }

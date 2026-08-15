@@ -8,7 +8,7 @@ mod tests;
 
 pub use types::{AppendOutcome, WindowParams};
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,9 +25,49 @@ use smol_str::SmolStr;
 use wf_config::WindowConfig;
 
 use crate::error::{CoreReason, CoreResult};
-use crate::match_engine::{Event, Value};
+use crate::match_engine::{Event, JoinKey, Value};
 
 use types::TimedBatch;
+
+/// Hash index for join lookups: maps a scalar key value to the parsed events
+/// holding it. Maintained incrementally on append/evict/expire. Only present on
+/// windows configured as join targets (`set_join_key`).
+pub(super) struct JoinIndex {
+    key_field: SmolStr,
+    by_key: crate::match_engine::EngineHashMap<JoinKey, Vec<Arc<Event>>>,
+}
+
+impl JoinIndex {
+    fn index_event(&mut self, ev: &Arc<Event>) {
+        if let Some(key) = ev.fields.get(&self.key_field).and_then(JoinKey::from_value) {
+            self.by_key.entry(key).or_default().push(Arc::clone(ev));
+        }
+    }
+
+    fn remove_event(&mut self, ev: &Arc<Event>) {
+        if let Some(key) = ev.fields.get(&self.key_field).and_then(JoinKey::from_value) {
+            if let Some(v) = self.by_key.get_mut(&key) {
+                v.retain(|e| !Arc::ptr_eq(e, ev));
+            }
+        }
+    }
+
+    fn index_batch(&mut self, events: &[Arc<Event>]) {
+        for ev in events {
+            self.index_event(ev);
+        }
+    }
+
+    fn remove_batch(&mut self, events: &[Arc<Event>]) {
+        for ev in events {
+            self.remove_event(ev);
+        }
+    }
+
+    fn lookup(&self, key: &JoinKey) -> Option<Vec<Arc<Event>>> {
+        self.by_key.get(key).cloned()
+    }
+}
 
 /// A time-ordered buffer of Arrow RecordBatches with eviction support.
 ///
@@ -49,6 +89,8 @@ pub struct Window {
     pub(super) next_seq: u64,
     /// Optional per-event field whitelist (see `WindowParams`).
     pub(super) materialize_fields: Option<Arc<HashSet<String>>>,
+    /// Optional hash index for join lookups (see `set_join_key`).
+    pub(super) join_index: Option<JoinIndex>,
 }
 
 impl Window {
@@ -67,7 +109,49 @@ impl Window {
             watermark_nanos: i64::MIN,
             next_seq: 0,
             materialize_fields,
+            join_index: None,
         }
+    }
+
+    /// Configure this window as a join target: build a hash index on `key_field`
+    /// and index any rows already buffered. Called by the runtime after rules
+    /// are loaded (join target windows are only known from rule plans).
+    pub fn set_join_key(&mut self, key_field: String) {
+        let key_field = SmolStr::new(&key_field);
+        let mut index = JoinIndex {
+            key_field,
+            by_key: crate::match_engine::EngineHashMap::default(),
+        };
+        for batch in &self.batches {
+            let events = batch.events(self.materialize_fields.as_deref());
+            index.index_batch(&events);
+        }
+        self.join_index = Some(index);
+    }
+
+    /// O(1) lookup of parsed events whose `key_field` equals `key`. Returns
+    /// `None` if this window has no join index (not a join target).
+    pub fn join_lookup(&self, key: &JoinKey) -> Option<Vec<Arc<Event>>> {
+        self.join_index.as_ref()?.lookup(key)
+    }
+
+    /// Indexed join rows as `HashMap<String, Value>` (matching `WindowLookup`
+    /// row shape). `Some(empty)` if indexed but no row matches; `None` if this
+    /// window has no join index (caller falls back to a snapshot scan).
+    pub fn join_rows(&self, key: &JoinKey) -> Option<Vec<HashMap<String, Value>>> {
+        let idx = self.join_index.as_ref()?;
+        let events = idx.lookup(key).unwrap_or_default();
+        Some(
+            events
+                .into_iter()
+                .map(|ev| {
+                    ev.fields
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.clone()))
+                        .collect()
+                })
+                .collect(),
+        )
     }
 
     /// Append a RecordBatch to this window.
@@ -164,8 +248,22 @@ impl Window {
                 self.total_rows -= evicted.row_count;
                 evicted_bytes += evicted.byte_size;
                 evicted_rows += evicted.row_count;
+                // Remove evicted rows from the join index (if any).
+                if let Some(idx) = &mut self.join_index {
+                    let events = evicted.events(self.materialize_fields.as_deref());
+                    idx.remove_batch(&events);
+                }
             } else {
                 break;
+            }
+        }
+
+        // Index the newly appended batch (after eviction, so rows evicted by the
+        // incoming batch aren't kept in the index).
+        if let Some(idx) = &mut self.join_index {
+            if let Some(last) = self.batches.back() {
+                let events = last.events(self.materialize_fields.as_deref());
+                idx.index_batch(&events);
             }
         }
         if evicted_rows > 0 {

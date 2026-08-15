@@ -110,6 +110,9 @@ pub(super) async fn load_and_compile(
 
     // 6. Router::new(registry)
     let router = Arc::new(Router::new(registry));
+    // 6a. Configure hash-join indexes on windows targeted by rule joins, so
+    //     join lookups are O(1) instead of O(rows) snapshot scans.
+    configure_join_indexes(&router, &all_rule_plans);
 
     // 7. Build RunRules (precompute stream_name → alias routing)
     let rules = build_run_rules(&all_rule_plans, &runtime_schemas, &config.output);
@@ -213,6 +216,31 @@ pub(crate) fn build_pipe_registry(
         });
     }
     Arc::new(registry)
+}
+
+/// Configure hash-join indexes on buffer windows targeted by rule joins, so
+/// join lookups are O(1) hash lookups instead of O(rows) snapshot scans.
+/// Each join's first condition's right field becomes the window's join key.
+fn configure_join_indexes(router: &Router, plans: &[wf_lang::plan::RulePlan]) {
+    let mut keys_by_window: HashMap<String, String> = HashMap::new();
+    for plan in plans {
+        for join in &plan.joins {
+            if let Some(cond) = join.conds.first()
+                && let Some(field) = cond.right_field_name()
+            {
+                keys_by_window
+                    .entry(join.right_window.clone())
+                    .or_insert_with(|| field.to_string());
+            }
+        }
+    }
+    for (window, key_field) in keys_by_window {
+        if let Some(win_lock) = router.registry().get_window(&window)
+            && let Ok(mut win) = win_lock.write()
+        {
+            win.set_join_key(key_field);
+        }
+    }
 }
 
 fn register_window_miss_provider(

@@ -1,4 +1,76 @@
 use super::*;
+use crate::schema::FieldType;
+
+#[test]
+fn on_each_join_key_object_rejected() {
+    // Hash-join index needs a scalar key; object/array join keys are rejected.
+    let lookup = make_window(
+        "lookup_table",
+        vec!["lookup_stream"],
+        vec![
+            ("ip", bt(BaseType::Ip)),
+            ("payload", FieldType::Object),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    on each e -> score(1.0)
+    join lookup_table snapshot on e.sip == lookup_table.payload
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), lookup, output_window()],
+        "join key `lookup_table.payload` must be a scalar base type",
+    );
+}
+
+#[test]
+fn on_each_join_key_float_rejected() {
+    // Float join keys would truncate in JoinKey::Int (42.5 → 42), false-matching
+    // distinct values — so they are rejected like structured types.
+    let lookup = make_window(
+        "lookup_table",
+        vec!["lookup_stream"],
+        vec![("score", bt(BaseType::Float))],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    on each e -> score(1.0)
+    join lookup_table snapshot on e.count == lookup_table.score
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), lookup, output_window()],
+        "float excluded",
+    );
+}
+
+#[test]
+fn on_each_join_key_scalar_ok() {
+    let lookup = make_window(
+        "lookup_table",
+        vec!["lookup_stream"],
+        vec![("ip", bt(BaseType::Ip))],
+    );
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    on each e -> score(1.0)
+    join lookup_table snapshot on e.sip == lookup_table.ip
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), lookup, output_window()]);
+}
 
 #[test]
 fn on_each_allows_scalar_expressions() {

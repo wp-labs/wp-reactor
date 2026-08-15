@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use wf_engine::match_engine::{Value, WindowLookup, batch_to_events, batch_to_timestamped_rows};
+use wf_engine::match_engine::{
+    JoinKey, Value, WindowLookup, batch_to_events, batch_to_timestamped_rows,
+};
 use wf_engine::window::Router;
 
 // ---------------------------------------------------------------------------
@@ -73,6 +75,34 @@ impl WindowLookup for RegistryLookup<'_> {
             rows.extend(batch_to_timestamped_rows(batch, time_col));
         }
         Some(rows)
+    }
+
+    fn join_lookup(
+        &self,
+        window: &str,
+        key_field: &str,
+        key: &Value,
+    ) -> Option<Vec<HashMap<String, Value>>> {
+        let win_lock = self.0.registry().get_window(window)?;
+        let win = win_lock.read().ok()?;
+        let Some(key) = JoinKey::from_value(key) else {
+            return None;
+        };
+        // Indexed lookup if the window has a maintained join index; otherwise
+        // fall back to the trait's snapshot scan.
+        if let Some(rows) = win.join_rows(&key) {
+            return Some(rows);
+        }
+        WindowLookup::join_lookup(self, window, key_field, &key_converted_back(&key)?)
+    }
+}
+
+/// Convert a [`JoinKey`] back to a [`Value`] for the scan fallback.
+fn key_converted_back(key: &JoinKey) -> Option<Value> {
+    match key {
+        JoinKey::Int(i) => Some(Value::Number(*i as f64)),
+        JoinKey::Str(s) => Some(Value::Str(s.as_str().into())),
+        JoinKey::Bool(b) => Some(Value::Bool(*b)),
     }
 }
 
@@ -166,6 +196,46 @@ mod tests {
         assert_eq!(rows[1].0, ts2);
         assert_eq!(rows[1].1["ip"], Value::Str("10.0.0.2".into()));
         assert_eq!(rows[1].1["score"], Value::Number(95.0));
+    }
+
+    #[tokio::test]
+    async fn join_lookup_uses_window_index() {
+        let schema = ts_schema();
+        let reg = WindowRegistry::build(vec![make_def("threat_intel", vec!["feed"])]).unwrap();
+        let router = Router::new(reg);
+        // Configure the window as a join target keyed on `ip`.
+        router
+            .registry()
+            .get_window("threat_intel")
+            .unwrap()
+            .write()
+            .unwrap()
+            .set_join_key("ip".into());
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000_000_000, 2_000_000_000])),
+                Arc::new(StringArray::from(vec!["10.0.0.1", "10.0.0.2"])),
+                Arc::new(Int64Array::from(vec![80, 95])),
+            ],
+        )
+        .unwrap();
+        router.route("feed", batch).await.unwrap();
+
+        let lookup = RegistryLookup(&router);
+        let rows = lookup
+            .join_lookup("threat_intel", "ip", &Value::Str("10.0.0.1".into()))
+            .expect("indexed window should return rows");
+        assert_eq!(rows.len(), 1, "one row matches key ip=10.0.0.1");
+        assert_eq!(rows[0]["ip"], Value::Str("10.0.0.1".into()));
+        assert_eq!(rows[0]["score"], Value::Number(80.0));
+
+        // No match → empty (not None — the window IS indexed).
+        let none = lookup
+            .join_lookup("threat_intel", "ip", &Value::Str("9.9.9.9".into()))
+            .expect("indexed window exists");
+        assert!(none.is_empty(), "unknown key → empty rows");
     }
 
     #[test]
