@@ -12,7 +12,10 @@ use wf_engine::window::Router;
 use wf_lang::WindowSchema;
 
 use crate::error::{RuntimeReason, RuntimeResult};
-use crate::lifecycle::parse_pool::{IngestLimiter, ParseItem, build_parse_item, push_decoded_batch};
+use crate::lifecycle::parse_pool::{
+    IngestLimiter, ParseItem, PrereadBudget, acquire_preread_blocking, build_parse_item,
+    push_decoded_batch,
+};
 use crate::metrics::RuntimeMetrics;
 use crate::receiver::miss::record_batch_window_miss;
 use crate::receiver::schema::{
@@ -31,6 +34,7 @@ pub(crate) async fn replay_arrow_framed_file(
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
     parse_tx: mpsc::Sender<ParseItem>,
+    preread: PrereadBudget,
     parse_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
     limiter: Option<Arc<IngestLimiter>>,
@@ -90,6 +94,7 @@ pub(crate) async fn replay_arrow_framed_file(
                 total_rows += frame.batch.num_rows();
                 if !push_decoded_batch(
                     &parse_tx,
+                    &preread,
                     &parse_seq,
                     source_name,
                     stream,
@@ -130,6 +135,7 @@ pub(crate) async fn replay_arrow_ipc_file(
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
     parse_tx: mpsc::Sender<ParseItem>,
+    preread: PrereadBudget,
     parse_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) -> RuntimeResult<()> {
@@ -182,6 +188,8 @@ pub(crate) async fn replay_arrow_ipc_file(
                 format!("read arrow ipc batch from {}", path_for_read.display()),
             )?;
             total_rows += batch.num_rows();
+            let mem_bytes = batch.get_array_memory_size();
+            let permits = acquire_preread_blocking(&preread, mem_bytes);
             let item = build_parse_item(
                 &parse_seq,
                 &source_for_read,
@@ -189,6 +197,8 @@ pub(crate) async fn replay_arrow_ipc_file(
                 batch,
                 router.as_ref(),
                 metrics.as_ref(),
+                mem_bytes,
+                permits,
             );
             if parse_tx.blocking_send(item).is_err() {
                 return RuntimeReason::system_error()

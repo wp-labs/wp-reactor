@@ -13,7 +13,7 @@ use wf_engine::window::Router;
 use wf_lang::WindowSchema;
 
 use crate::error::{RuntimeReason, RuntimeResult};
-use crate::lifecycle::parse_pool::{ParseItem, push_decoded_batch};
+use crate::lifecycle::parse_pool::{ParseItem, PrereadBudget, push_decoded_batch};
 use crate::metrics::RuntimeMetrics;
 use crate::receiver::batch::build_record_batch_from_json;
 use crate::receiver::miss::{WindowMiss, WindowMissReason, report_window_miss};
@@ -36,6 +36,7 @@ pub(crate) async fn replay_ndjson_file(
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
     parse_tx: mpsc::Sender<ParseItem>,
+    preread: PrereadBudget,
     parse_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) -> RuntimeResult<()> {
@@ -142,6 +143,7 @@ pub(crate) async fn replay_ndjson_file(
                         router.as_ref(),
                         metrics.as_ref(),
                         &parse_tx,
+                        &preread,
                         &parse_seq,
                         stream_tag_field,
                         "file",
@@ -166,6 +168,7 @@ pub(crate) async fn replay_ndjson_file(
             router.as_ref(),
             metrics.as_ref(),
             &parse_tx,
+            &preread,
             &parse_seq,
             stream_tag_field,
             "file",
@@ -194,6 +197,7 @@ pub(super) async fn flush_ndjson_rows(
     router: &Router,
     metrics: Option<&Arc<RuntimeMetrics>>,
     parse_tx: &mpsc::Sender<ParseItem>,
+    preread: &PrereadBudget,
     parse_seq: &AtomicU64,
     stream_tag_field: &str,
     source_kind: &str,
@@ -234,7 +238,7 @@ pub(super) async fn flush_ndjson_rows(
     // Push to the parse worker pool (R3) instead of routing inline: the commit
     // worker applies `route_commit` in order and logs route errors (aligned with
     // the streaming-source path).
-    if !push_decoded_batch(parse_tx, parse_seq, source_name, stream_name, batch, router, metrics, None)
+    if !push_decoded_batch(parse_tx, preread, parse_seq, source_name, stream_name, batch, router, metrics, None)
         .await
     {
         return RuntimeReason::system_error()

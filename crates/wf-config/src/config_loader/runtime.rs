@@ -26,6 +26,14 @@ pub struct RuntimeConfig {
     /// `None` = unlimited.
     #[serde(default)]
     pub max_ingest_rate: Option<usize>,
+    /// Byte budget for decoded batches in flight across the source → parse →
+    /// commit chain. A batch holds permits equal to its arrow memory size from
+    /// source push until commit completes, so pipeline residency is bounded in
+    /// bytes regardless of frame size (item-count channel caps alone would let
+    /// big frames park multiple GiB in the channels). Defaults to 256 MiB;
+    /// values below 16 MiB are clamped up.
+    #[serde(default = "default_parse_buffer_bytes")]
+    pub parse_buffer_bytes: usize,
     /// Glob pattern for Window Schema (.wfs) files, relative to config dir.
     pub schemas: String,
     /// Glob pattern for WFL rule (.wfl) files, relative to config dir.
@@ -34,6 +42,10 @@ pub struct RuntimeConfig {
 
 fn default_parse_parallelism() -> usize {
     2
+}
+
+fn default_parse_buffer_bytes() -> usize {
+    256 * 1024 * 1024
 }
 
 fn default_rule_parallelism() -> usize {

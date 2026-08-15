@@ -11,7 +11,7 @@ use wf_engine::window::Router;
 use wf_lang::WindowSchema;
 
 use crate::error::{RuntimeReason, RuntimeResult};
-use crate::lifecycle::parse_pool::ParseItem;
+use crate::lifecycle::parse_pool::{ParseItem, PrereadBudget};
 use crate::metrics::RuntimeMetrics;
 use crate::receiver::miss::{WindowMiss, WindowMissReason, report_window_miss};
 use crate::receiver::ndjson::{flush_ndjson_rows, normalize_stream_tag_field};
@@ -32,6 +32,7 @@ pub(crate) async fn replay_csv_file(
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
     parse_tx: mpsc::Sender<ParseItem>,
+    preread: PrereadBudget,
     parse_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) -> RuntimeResult<()> {
@@ -155,6 +156,7 @@ pub(crate) async fn replay_csv_file(
                 router.as_ref(),
                 metrics.as_ref(),
                 &parse_tx,
+                &preread,
                 &parse_seq,
                 stream_tag_field,
                 "file",
@@ -177,6 +179,7 @@ pub(crate) async fn replay_csv_file(
             router.as_ref(),
             metrics.as_ref(),
             &parse_tx,
+            &preread,
             &parse_seq,
             stream_tag_field,
             "file",

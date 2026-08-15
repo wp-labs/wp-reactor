@@ -22,7 +22,10 @@ use super::csv::replay_csv_file;
 use super::ndjson::replay_ndjson_file;
 use super::route::{batch_machine_id, coerce_column, coerce_column_for_field, prepare_batch};
 use super::{DEFAULT_STREAM_TAG_FIELD, ReplayRoute};
-use crate::lifecycle::parse_pool::{ParseItem, build_parse_item, push_decoded_batch, spawn_parse_pool};
+use crate::lifecycle::parse_pool::{
+    ParseItem, PrereadBudget, build_parse_item, push_decoded_batch, spawn_parse_pool,
+    spawn_parse_pool_with_preread,
+};
 use crate::lifecycle::types::TaskGroup;
 use crate::metrics::{MetricsRecord, RuntimeMetrics};
 use wf_engine::match_engine::{
@@ -133,18 +136,23 @@ fn register_miss_provider(registry: &mut WindowRegistry) {
 /// parse channel sender, and the shared seq counter the replay functions push
 /// through. The parse workers run on the test's tokio runtime, so tests poll
 /// the window with [`wait_for_rows`] instead of asserting synchronously.
-fn make_parse_router(stream_name: &str) -> (Arc<Router>, mpsc::Sender<ParseItem>, Arc<AtomicU64>) {
+fn make_parse_router(
+    stream_name: &str,
+) -> (Arc<Router>, mpsc::Sender<ParseItem>, PrereadBudget, Arc<AtomicU64>) {
     attach_parse_pool(make_router(stream_name))
 }
 
-fn make_multi_parse_router() -> (Arc<Router>, mpsc::Sender<ParseItem>, Arc<AtomicU64>) {
+fn make_multi_parse_router(
+) -> (Arc<Router>, mpsc::Sender<ParseItem>, PrereadBudget, Arc<AtomicU64>) {
     attach_parse_pool(make_multi_stream_router())
 }
 
-fn attach_parse_pool(router: Arc<Router>) -> (Arc<Router>, mpsc::Sender<ParseItem>, Arc<AtomicU64>) {
+fn attach_parse_pool(
+    router: Arc<Router>,
+) -> (Arc<Router>, mpsc::Sender<ParseItem>, PrereadBudget, Arc<AtomicU64>) {
     let mut group = TaskGroup::new("test_parse");
-    let parse_tx = spawn_parse_pool(&router, None, 1, &mut group);
-    (router, parse_tx, Arc::new(AtomicU64::new(0)))
+    let (parse_tx, preread) = spawn_parse_pool(&router, None, 1, &mut group);
+    (router, parse_tx, preread, Arc::new(AtomicU64::new(0)))
 }
 
 /// Poll the test window until it holds at least `expected` rows, yielding to the
@@ -247,7 +255,7 @@ fn number_value(row: &std::collections::HashMap<String, Value>, key: &str) -> Op
 
 #[tokio::test]
 async fn file_ndjson_replay_routes_rows() {
-    let (router, parse_tx, parse_seq) = make_parse_router("events");
+    let (router, parse_tx, preread, parse_seq) = make_parse_router("events");
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.ndjson");
     std::fs::write(
@@ -284,6 +292,7 @@ async fn file_ndjson_replay_routes_rows() {
         Arc::clone(&router),
         None,
         parse_tx.clone(),
+        Arc::clone(&preread),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
@@ -295,7 +304,7 @@ async fn file_ndjson_replay_routes_rows() {
 
 #[tokio::test]
 async fn file_ndjson_replay_routes_rows_by_row_stream() {
-    let (router, parse_tx, parse_seq) = make_multi_parse_router();
+    let (router, parse_tx, preread, parse_seq) = make_multi_parse_router();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.ndjson");
     std::fs::write(
@@ -353,6 +362,7 @@ async fn file_ndjson_replay_routes_rows_by_row_stream() {
         Arc::clone(&router),
         None,
         parse_tx.clone(),
+        Arc::clone(&preread),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
@@ -365,7 +375,7 @@ async fn file_ndjson_replay_routes_rows_by_row_stream() {
 
 #[tokio::test]
 async fn file_ndjson_dynamic_unknown_stream_is_window_miss() {
-    let (router, parse_tx, parse_seq) = make_multi_parse_router();
+    let (router, parse_tx, preread, parse_seq) = make_multi_parse_router();
     let metrics = Arc::new(RuntimeMetrics::new(
         &[],
         &["win_a".to_string(), "win_b".to_string()],
@@ -430,6 +440,7 @@ async fn file_ndjson_dynamic_unknown_stream_is_window_miss() {
         Arc::clone(&router),
         Some(Arc::clone(&metrics)),
         parse_tx.clone(),
+        Arc::clone(&preread),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
@@ -460,7 +471,7 @@ async fn file_ndjson_dynamic_unknown_stream_is_window_miss() {
 
 #[tokio::test]
 async fn file_csv_replay_routes_rows_by_stream_tag_field_column() {
-    let (router, parse_tx, parse_seq) = make_multi_parse_router();
+    let (router, parse_tx, preread, parse_seq) = make_multi_parse_router();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.csv");
     std::fs::write(
@@ -518,6 +529,7 @@ a,3000000000,3\n",
         Arc::clone(&router),
         None,
         parse_tx.clone(),
+        Arc::clone(&preread),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
@@ -530,7 +542,7 @@ a,3000000000,3\n",
 
 #[tokio::test]
 async fn file_csv_dynamic_unknown_stream_is_window_miss() {
-    let (router, parse_tx, parse_seq) = make_multi_parse_router();
+    let (router, parse_tx, preread, parse_seq) = make_multi_parse_router();
     let metrics = Arc::new(RuntimeMetrics::new(
         &[],
         &["win_a".to_string(), "win_b".to_string()],
@@ -595,6 +607,7 @@ b,4000000000,4\n",
         Arc::clone(&router),
         Some(Arc::clone(&metrics)),
         parse_tx.clone(),
+        Arc::clone(&preread),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
@@ -875,7 +888,7 @@ fn structured_array_stream_schema_rejects_utf8_object_metadata() {
 
 #[tokio::test]
 async fn file_arrow_framed_replay_routes_rows() {
-    let (router, parse_tx, parse_seq) = make_parse_router("events");
+    let (router, parse_tx, preread, parse_seq) = make_parse_router("events");
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.arrow_framed");
     let schema = test_schema();
@@ -918,6 +931,7 @@ async fn file_arrow_framed_replay_routes_rows() {
         Arc::clone(&router),
         None,
         parse_tx.clone(),
+        Arc::clone(&preread),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
             None,
@@ -930,7 +944,7 @@ async fn file_arrow_framed_replay_routes_rows() {
 
 #[tokio::test]
 async fn file_arrow_framed_unknown_tag_is_window_miss() {
-    let (router, parse_tx, parse_seq) = make_parse_router("events");
+    let (router, parse_tx, preread, parse_seq) = make_parse_router("events");
     let metrics = Arc::new(RuntimeMetrics::new(
         &[],
         &["test_win".to_string()],
@@ -977,6 +991,7 @@ async fn file_arrow_framed_unknown_tag_is_window_miss() {
         Arc::clone(&router),
         Some(Arc::clone(&metrics)),
         parse_tx.clone(),
+        Arc::clone(&preread),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
             None,
@@ -998,7 +1013,7 @@ async fn file_arrow_framed_unknown_tag_is_window_miss() {
 
 #[tokio::test]
 async fn file_arrow_ipc_replay_routes_rows() {
-    let (router, parse_tx, parse_seq) = make_parse_router("events");
+    let (router, parse_tx, preread, parse_seq) = make_parse_router("events");
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("events.arrow_ipc");
     let schema = test_schema();
@@ -1036,6 +1051,7 @@ async fn file_arrow_ipc_replay_routes_rows() {
         Arc::clone(&router),
         None,
         parse_tx.clone(),
+        Arc::clone(&preread),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
@@ -1336,8 +1352,10 @@ fn build_parse_item_assigns_monotonic_seq_and_stream() {
     let router = make_router("events");
     let seq = Arc::new(AtomicU64::new(0));
     let batch = make_batch(&test_schema(), &[1_000_000_000, 2_000_000_000], &[1, 2]);
-    let item0 = build_parse_item(&seq, "src", "events", batch.clone(), &router, None);
-    let item1 = build_parse_item(&seq, "src", "events", batch, &router, None);
+    let item0 = build_parse_item(
+        &seq, "src", "events", batch.clone(), &router, None, 0, Vec::new(),
+    );
+    let item1 = build_parse_item(&seq, "src", "events", batch, &router, None, 0, Vec::new());
     assert_eq!(item0.seq, 0);
     assert_eq!(item1.seq, 1);
     assert_eq!(item0.source_name, "src");
@@ -1356,7 +1374,9 @@ fn build_parse_item_records_receiver_metrics() {
     ));
     let seq = Arc::new(AtomicU64::new(0));
     let batch = make_batch(&test_schema(), &[1_000_000_000], &[1]);
-    let _ = build_parse_item(&seq, "src", "events", batch, &router, Some(&metrics));
+    let _ = build_parse_item(
+        &seq, "src", "events", batch, &router, Some(&metrics), 0, Vec::new(),
+    );
 
     let records = metrics.snapshot().to_records();
     let rows = records.iter().find(|r| {
@@ -1381,9 +1401,11 @@ fn build_parse_item_records_receiver_metrics() {
 
 #[tokio::test]
 async fn push_decoded_batch_commits_through_parse_pool() {
-    let (router, parse_tx, parse_seq) = make_parse_router("events");
+    let (router, parse_tx, preread, parse_seq) = make_parse_router("events");
     let batch = make_batch(&test_schema(), &[1_000_000_000, 2_000_000_000], &[1, 2]);
-    let ok = push_decoded_batch(&parse_tx, &parse_seq, "src", "events", batch, &router, None, None).await;
+    let ok =
+        push_decoded_batch(&parse_tx, &preread, &parse_seq, "src", "events", batch, &router, None, None)
+            .await;
     assert!(ok, "push should succeed");
     wait_for_rows(&router, 2).await;
 }
@@ -1394,9 +1416,49 @@ async fn push_decoded_batch_returns_false_when_channel_closed() {
     let seq = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::channel::<ParseItem>(1);
     drop(rx); // receiver gone → send fails
+    let preread: PrereadBudget = Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024));
     let batch = make_batch(&test_schema(), &[1_000_000_000], &[1]);
-    let ok = push_decoded_batch(&tx, &seq, "src", "events", batch, &router, None, None).await;
+    let ok = push_decoded_batch(&tx, &preread, &seq, "src", "events", batch, &router, None, None).await;
     assert!(!ok, "push to a closed parse channel must report failure");
+}
+
+/// The preread byte budget must block a source pushing more decoded batches
+/// than the budget admits while nothing downstream commits, and unblock once
+/// permits are released — this is the backpressure that keeps pipeline RSS
+/// bounded regardless of frame size.
+#[tokio::test]
+async fn preread_budget_applies_backpressure_until_commit_releases() {
+    use crate::lifecycle::parse_pool::acquire_preread;
+
+    let router = make_router("events");
+    let mut group = TaskGroup::new("test_parse_bp");
+    // Tiny budget request — clamped to the 16 MiB floor by the pool.
+    let (tx, preread) = spawn_parse_pool_with_preread(&router, None, 1, &mut group, 1);
+    let seq = Arc::new(AtomicU64::new(0));
+    assert_eq!(preread.available_permits(), 16 * 1024 * 1024);
+
+    // Simulate an in-flight batch holding the whole budget (acquired but not
+    // yet committed).
+    let held = acquire_preread(&preread, 16 * 1024 * 1024).await;
+    assert_eq!(preread.available_permits(), 0);
+
+    let batch = make_batch(&test_schema(), &[1_000_000_000], &[1]);
+    let mut push = std::pin::pin!(push_decoded_batch(
+        &tx, &preread, &seq, "src", "events", batch, &router, None, None,
+    ));
+
+    // The push must stay pending while the budget is exhausted.
+    tokio::select! {
+        _ = &mut push => panic!("push must block while preread budget is exhausted"),
+        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+
+    // Commit finished (simulated): permits released → the push completes and
+    // the batch lands in the window.
+    drop(held);
+    assert!(push.await, "push must succeed after budget release");
+    wait_for_rows(&router, 1).await;
+    drop(group);
 }
 
 #[tokio::test]
@@ -1434,6 +1496,7 @@ async fn file_ndjson_replay_fails_when_parse_pool_closed() {
         Arc::clone(&router),
         None,
         tx,
+        Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024)) as PrereadBudget,
         Arc::new(AtomicU64::new(0)),
         CancellationToken::new(),
     )

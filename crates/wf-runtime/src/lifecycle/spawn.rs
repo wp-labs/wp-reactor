@@ -34,7 +34,9 @@ use wf_connector_api::BatchSource;
 use wp_core_connectors::sources::batch::arrow::WireFormat;
 use wp_model_core::model::{DataRecord, DataType, Field, FieldStorage, Value};
 
-use super::parse_pool::{IngestLimiter, ParseItem, push_decoded_batch, spawn_parse_pool};
+use super::parse_pool::{
+    IngestLimiter, ParseItem, push_decoded_batch, spawn_parse_pool_with_preread,
+};
 use super::types::{RunRule, RunRuleKind, TaskGroup};
 
 // ---------------------------------------------------------------------------
@@ -48,6 +50,7 @@ use super::types::{RunRule, RunRuleKind, TaskGroup};
 pub(super) fn spawn_alert_task(
     dispatcher: Arc<SinkDispatcher>,
     metrics: Option<Arc<RuntimeMetrics>>,
+    cancel: CancellationToken,
 ) -> (Arc<alert_task::SinkFanout>, TaskGroup) {
     let mut group = TaskGroup::new("alert");
     let mut by_sink = HashMap::new();
@@ -59,8 +62,9 @@ pub(super) fn spawn_alert_task(
         error_txs.push(tx);
         let sink = Arc::clone(sink);
         let metrics = metrics.clone();
+        let cancel = cancel.child_token();
         group.push(tokio::spawn(async move {
-            alert_task::run_sink_consumer(rx, sink, Arc::new(Vec::new()), metrics).await;
+            alert_task::run_sink_consumer(rx, sink, Arc::new(Vec::new()), metrics, cancel).await;
             Ok(())
         }));
     }
@@ -93,8 +97,9 @@ pub(super) fn spawn_alert_task(
             let sink = Arc::clone(sink);
             let error_txs = Arc::clone(&error_txs);
             let metrics = metrics.clone();
+            let cancel = cancel.child_token();
             group.push(tokio::spawn(async move {
-                alert_task::run_sink_consumer(rx, sink, error_txs, metrics).await;
+                alert_task::run_sink_consumer(rx, sink, error_txs, metrics, cancel).await;
                 Ok(())
             }));
         }
@@ -301,12 +306,14 @@ pub(super) async fn spawn_receiver_task(
     // R2: parse worker pool — external sources push decoded batches here, N
     // parallel parse workers run `route_parse`, and one commit worker runs
     // `route_commit` in source order. Shared seq counter keeps batches ordered
-    // across all source connections.
-    let parse_tx = spawn_parse_pool(
+    // across all source connections. The preread byte budget bounds total
+    // decoded-batch residency in the pipeline regardless of frame size.
+    let (parse_tx, preread) = spawn_parse_pool_with_preread(
         &router,
         metrics.clone(),
         config.runtime.parse_parallelism,
         &mut group,
+        config.runtime.parse_buffer_bytes,
     );
     let parse_seq = Arc::new(AtomicU64::new(0));
     let ingest_limiter = config.runtime.max_ingest_rate.map(IngestLimiter::new);
@@ -338,6 +345,7 @@ pub(super) async fn spawn_receiver_task(
                 let router = Arc::clone(&router);
                 let metrics = metrics.clone();
                 let parse_tx = parse_tx.clone();
+                let preread = Arc::clone(&preread);
                 let parse_seq = Arc::clone(&parse_seq);
                 let limiter = ingest_limiter.clone();
                 let cancel = cancel.child_token();
@@ -358,6 +366,7 @@ pub(super) async fn spawn_receiver_task(
                                 router,
                                 metrics,
                                 parse_tx.clone(),
+                                Arc::clone(&preread),
                                 Arc::clone(&parse_seq),
                                 cancel,
                             )
@@ -375,6 +384,7 @@ pub(super) async fn spawn_receiver_task(
                                 router,
                                 metrics,
                                 parse_tx.clone(),
+                                Arc::clone(&preread),
                                 Arc::clone(&parse_seq),
                                 cancel,
                             )
@@ -389,6 +399,7 @@ pub(super) async fn spawn_receiver_task(
                                 router,
                                 metrics,
                                 parse_tx.clone(),
+                                Arc::clone(&preread),
                                 Arc::clone(&parse_seq),
                                 cancel,
                                 limiter,
@@ -404,6 +415,7 @@ pub(super) async fn spawn_receiver_task(
                                 router,
                                 metrics,
                                 parse_tx.clone(),
+                                Arc::clone(&preread),
                                 Arc::clone(&parse_seq),
                                 cancel,
                             )
@@ -431,6 +443,7 @@ pub(super) async fn spawn_receiver_task(
                     cancel.child_token(),
                     &mut group,
                     parse_tx.clone(),
+                    Arc::clone(&preread),
                     Arc::clone(&parse_seq),
                     ingest_limiter.clone(),
                 )
@@ -505,6 +518,7 @@ async fn spawn_external_source_tasks(
     cancel: CancellationToken,
     group: &mut TaskGroup,
     parse_tx: tokio::sync::mpsc::Sender<ParseItem>,
+    preread: super::parse_pool::PrereadBudget,
     parse_seq: Arc<AtomicU64>,
     ingest_limiter: Option<Arc<IngestLimiter>>,
 ) -> RuntimeResult<usize> {
@@ -591,6 +605,7 @@ async fn spawn_external_source_tasks(
         let schema = Arc::clone(&schema);
         let schemas = Arc::clone(schemas);
         let parse_tx = parse_tx.clone();
+        let preread = Arc::clone(&preread);
         let parse_seq = Arc::clone(&parse_seq);
         let limiter = ingest_limiter.clone();
         group.push(tokio::spawn(async move {
@@ -664,6 +679,7 @@ async fn spawn_external_source_tasks(
                                 // it only decodes, projects, and pushes (R2/R3).
                                 if !push_decoded_batch(
                                     &parse_tx,
+                                    &preread,
                                     &parse_seq,
                                     &source_name,
                                     &route_stream,
