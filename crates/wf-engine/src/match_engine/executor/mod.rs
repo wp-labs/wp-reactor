@@ -52,7 +52,7 @@ pub(crate) struct OutputStatic {
 /// L1 rules use `execute_match` / `execute_close` (no joins).
 /// L2 rules with joins use `execute_match_with_joins` / `execute_close_with_joins`
 /// which accept a [`WindowLookup`] for resolving join data.
-#[derive(::moju_derive::MoJu, Clone)]
+#[derive(::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct RuleExecutor {
     plan: RulePlan,
@@ -65,9 +65,31 @@ pub struct RuleExecutor {
     /// Last (nanos, formatted) emit time. The runtime feeds a batch-level
     /// cached wall clock into the on-each path, so all events in a batch
     /// share one timestamp — format it once and Arc-share it instead of one
-    /// String per event. `Arc`-wrapped so `RuleExecutor: Clone` holds; clones
-    /// share the cache harmlessly (it is keyed by nanos).
-    emit_time_cache: Arc<Mutex<(i64, Arc<str>)>>,
+    /// String per event.
+    ///
+    /// The cache is a pure memo (value fully determined by the nanos key),
+    /// so clones get their OWN cache (reset to empty). It must NOT be
+    /// shared behind an `Arc`: sharded on-each workers lock it per event,
+    /// and a shared `Mutex` ping-pongs a cache line across worker threads —
+    /// 6 workers on one lock dropped per-worker throughput ~20x (nexmark
+    /// q1 30M, 2026-08-16).
+    emit_time_cache: Mutex<(i64, Arc<str>)>,
+}
+
+// Manual impl: `Mutex` is not `Clone`. `emit_time_cache` is a pure memo
+// keyed by nanos, so the clone simply starts with an empty cache instead of
+// sharing the lock — each sharded on-each worker locks only its own cache.
+impl Clone for RuleExecutor {
+    fn clone(&self) -> Self {
+        Self {
+            plan: self.plan.clone(),
+            yield_field_types: self.yield_field_types.clone(),
+            output: self.output.clone(),
+            bind_filters: self.bind_filters.clone(),
+            output_static: self.output_static.clone(),
+            emit_time_cache: Mutex::new((0, Arc::from(""))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,7 +180,7 @@ impl RuleExecutor {
             yield_field_types: options.yield_field_types,
             output: options.output,
             bind_filters,
-            emit_time_cache: Arc::new(Mutex::new((0, Arc::from("")))),
+            emit_time_cache: Mutex::new((0, Arc::from(""))),
         }
     }
 

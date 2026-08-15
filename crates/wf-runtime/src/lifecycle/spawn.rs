@@ -154,30 +154,70 @@ pub(super) fn spawn_rule_tasks(
 
         match rule.kind {
             RunRuleKind::Each { alias, time_field } => {
-                // Stateless each rule: single worker (no key to shard on).
-                let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
-                for source in &window_sources {
-                    router
-                        .fanout()
-                        .register(&source.window_name, push_tx.clone());
+                // Stateless each rule. Terminal-output rules (yield target is
+                // NOT an intermediate pipe) shard across `shard_count` workers
+                // via whole-batch round-robin: no per-event state, so batch
+                // reordering is harmless and each `Arc` batch goes to exactly
+                // one worker (zero copy, exact metrics, unique wfx_id). Rules
+                // feeding an intermediate pipe stay single-worker — a
+                // downstream state machine must not see same-key events out
+                // of order.
+                let target = rule.executor.plan().yield_plan.target.clone();
+                let shardable = shard_count > 1 && !intermediate_targets.contains(&target);
+
+                if shardable {
+                    let mut shard_txs = Vec::with_capacity(shard_count);
+                    for _ in 0..shard_count {
+                        let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
+                        shard_txs.push(push_tx);
+                        let task_config = RuleTaskConfig {
+                            machine: None,
+                            each_alias: Some(alias.clone()),
+                            each_time_field: time_field.clone(),
+                            executor: rule.executor.clone(),
+                            window_sources: window_sources.clone(),
+                            sink_fanout: Arc::clone(&sink_fanout),
+                            cancel: cancel.child_token(),
+                            timeout_scan_interval,
+                            router: Arc::clone(router),
+                            metrics: metrics.clone(),
+                            intermediate_targets: intermediate_targets.clone(),
+                            pipe_registry: Arc::clone(&pipe_registry),
+                            eos_flush: eos_tx.subscribe(),
+                            push_rx: Some(push_rx),
+                        };
+                        group.push(tokio::spawn(async move { run_rule_task(task_config).await }));
+                    }
+                    for source in &window_sources {
+                        router
+                            .fanout()
+                            .register_round_robin(&source.window_name, shard_txs.clone());
+                    }
+                } else {
+                    let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
+                    for source in &window_sources {
+                        router
+                            .fanout()
+                            .register(&source.window_name, push_tx.clone());
+                    }
+                    let task_config = RuleTaskConfig {
+                        machine: None,
+                        each_alias: Some(alias),
+                        each_time_field: time_field,
+                        executor: rule.executor,
+                        window_sources,
+                        sink_fanout: Arc::clone(&sink_fanout),
+                        cancel: cancel.child_token(),
+                        timeout_scan_interval,
+                        router: Arc::clone(router),
+                        metrics: metrics.clone(),
+                        intermediate_targets: intermediate_targets.clone(),
+                        pipe_registry: Arc::clone(&pipe_registry),
+                        eos_flush: eos_tx.subscribe(),
+                        push_rx: Some(push_rx),
+                    };
+                    group.push(tokio::spawn(async move { run_rule_task(task_config).await }));
                 }
-                let task_config = RuleTaskConfig {
-                    machine: None,
-                    each_alias: Some(alias),
-                    each_time_field: time_field,
-                    executor: rule.executor,
-                    window_sources,
-                    sink_fanout: Arc::clone(&sink_fanout),
-                    cancel: cancel.child_token(),
-                    timeout_scan_interval,
-                    router: Arc::clone(router),
-                    metrics: metrics.clone(),
-                    intermediate_targets: intermediate_targets.clone(),
-                    pipe_registry: Arc::clone(&pipe_registry),
-                    eos_flush: eos_tx.subscribe(),
-                    push_rx: Some(push_rx),
-                };
-                group.push(tokio::spawn(async move { run_rule_task(task_config).await }));
             }
             RunRuleKind::Match {
                 match_plan,

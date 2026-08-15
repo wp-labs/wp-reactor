@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
@@ -16,20 +17,44 @@ pub struct RulePush {
     pub events: Arc<Vec<Arc<Event>>>,
 }
 
-/// A subscription for one window: either a single (unsharded) rule channel, or
-/// N shard channels with a key partition (rule sharding, P2a).
+/// A subscription for one window: a single (unsharded) rule channel, N shard
+/// channels with a key partition (rule sharding, P2a), or N worker channels
+/// with whole-batch round-robin (stateless `on each` sharding, R4).
 ///
 /// Channels are **bounded** so a slow rule consumer backpressures the producer
 /// (the commit worker's broadcast awaits a full channel) instead of buffering
 /// unboundedly — 50M sustained inject with unbounded channels let RSS grow to
 /// ~13GB (wp-labs/wp-reactor long-run test, 2026-08-14).
-#[derive(Clone)]
 enum Subscription {
     Single(mpsc::Sender<RulePush>),
     Sharded {
         shards: Vec<mpsc::Sender<RulePush>>,
         keys: Arc<[FieldRef]>,
     },
+    RoundRobin {
+        shards: Vec<mpsc::Sender<RulePush>>,
+        /// Next shard index (wraps via modulo on take). Shared across clones
+        /// of this subscription so every broadcast advances the same cursor.
+        next: Arc<AtomicUsize>,
+    },
+}
+
+// Manual impl: `AtomicUsize` is not `Clone`, the round-robin cursor is shared
+// behind its `Arc` instead.
+impl Clone for Subscription {
+    fn clone(&self) -> Self {
+        match self {
+            Subscription::Single(tx) => Subscription::Single(tx.clone()),
+            Subscription::Sharded { shards, keys } => Subscription::Sharded {
+                shards: shards.clone(),
+                keys: Arc::clone(keys),
+            },
+            Subscription::RoundRobin { shards, next } => Subscription::RoundRobin {
+                shards: shards.clone(),
+                next: Arc::clone(next),
+            },
+        }
+    }
 }
 
 /// Fan-out table mapping window names to per-rule channels.
@@ -91,6 +116,29 @@ impl RuleFanout {
             .push(Subscription::Sharded { shards, keys });
     }
 
+    /// Register N worker channels for `window_name` served whole batches in
+    /// round-robin order (stateless `on each` sharding).
+    ///
+    /// Each broadcast sends the **entire** `Arc<Vec<Arc<Event>>>` to the next
+    /// worker — zero per-event partitioning cost, zero copies. This is only
+    /// correct for stateless consumers (no cross-event rule state): event
+    /// ordering across batches is no longer preserved.
+    pub fn register_round_robin(
+        &self,
+        window_name: &str,
+        shards: Vec<mpsc::Sender<RulePush>>,
+    ) {
+        debug_assert!(!shards.is_empty());
+        let mut table = self.table.write().expect("fanout lock poisoned");
+        table
+            .entry(window_name.to_string())
+            .or_default()
+            .push(Subscription::RoundRobin {
+                shards,
+                next: Arc::new(AtomicUsize::new(0)),
+            });
+    }
+
     /// Broadcast `events` to every rule channel registered for `window_name`.
     ///
     /// Unsharded subscriptions receive the whole batch; sharded subscriptions
@@ -121,6 +169,17 @@ impl RuleFanout {
                         any_closed = true;
                     }
                 }
+                Subscription::RoundRobin { shards, next } => {
+                    let n = shards.len();
+                    let idx = next.fetch_add(1, Ordering::Relaxed) % n;
+                    let push = RulePush {
+                        window_name: window_name.into(),
+                        events: Arc::clone(events),
+                    };
+                    if shards[idx].send(push).await.is_err() {
+                        any_closed = true;
+                    }
+                }
             }
         }
 
@@ -136,11 +195,15 @@ impl RuleFanout {
                         Subscription::Sharded { shards, .. } => {
                             shards.retain(|tx| !tx.is_closed());
                         }
+                        Subscription::RoundRobin { shards, .. } => {
+                            shards.retain(|tx| !tx.is_closed());
+                        }
                     }
                 }
                 subs.retain(|sub| match sub {
                     Subscription::Single(tx) => !tx.is_closed(),
                     Subscription::Sharded { shards, .. } => !shards.is_empty(),
+                    Subscription::RoundRobin { shards, .. } => !shards.is_empty(),
                 });
                 if subs.is_empty() {
                     table.remove(window_name);
@@ -294,5 +357,75 @@ mod tests {
     #[test]
     fn shard_index_single_shard_is_zero() {
         assert_eq!(shard_index(&[Value::Str("anything".into())], 1), 0);
+    }
+
+    #[tokio::test]
+    async fn round_robin_broadcast_delivers_whole_batches_and_shares_arcs() {
+        let fanout = RuleFanout::new();
+        let (tx0, mut rx0) = mpsc::channel(8);
+        let (tx1, mut rx1) = mpsc::channel(8);
+        fanout.register_round_robin("win_rr", vec![tx0, tx1]);
+
+        // Four distinct batches; round-robin must send each WHOLE batch (same
+        // Arc) to alternating workers with no loss / no duplication.
+        let mut sent = Vec::new();
+        for i in 0..4 {
+            let events: Arc<Vec<Arc<Event>>> =
+                Arc::new(vec![Arc::new(event(&format!("e{i}a"))), Arc::new(event(&format!("e{i}b")))]);
+            sent.push(Arc::clone(&events));
+            fanout.broadcast("win_rr", &events).await;
+        }
+
+        let mut got0 = Vec::new();
+        while let Ok(push) = rx0.try_recv() {
+            got0.push(push);
+        }
+        let mut got1 = Vec::new();
+        while let Ok(push) = rx1.try_recv() {
+            got1.push(push);
+        }
+
+        // Exactly one worker per batch, alternating.
+        assert_eq!(got0.len(), 2, "worker 0 receives 2 batches");
+        assert_eq!(got1.len(), 2, "worker 1 receives 2 batches");
+        // Whole batch preserved: 2 events per delivered push, same Arc as sent.
+        let all: Vec<&RulePush> = got0.iter().chain(got1.iter()).collect();
+        assert!(all.iter().all(|p| p.events.len() == 2));
+        for push in &all {
+            assert!(
+                sent.iter().any(|s| Arc::ptr_eq(s, &push.events)),
+                "delivered batch must be one of the sent Arcs (zero copy)"
+            );
+        }
+        assert_eq!(&*all[0].window_name, "win_rr");
+    }
+
+    #[tokio::test]
+    async fn round_robin_broadcast_prunes_closed_shards() {
+        let fanout = RuleFanout::new();
+        let (tx0, mut rx0) = mpsc::channel(8);
+        let (tx1, rx1) = mpsc::channel(8);
+        fanout.register_round_robin("win_rr2", vec![tx0, tx1]);
+        drop(rx1); // worker 1 shut down
+
+        let events: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(event("x"))]);
+        // Broadcast enough times to hit the closed shard and trigger pruning.
+        for _ in 0..2 {
+            fanout.broadcast("win_rr2", &events).await;
+        }
+
+        // Surviving shard still receives (at least) one delivery.
+        let mut delivered = 0;
+        while rx0.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert!(delivered >= 1, "open shard must still receive batches");
+
+        let table = fanout.table.read().expect("fanout lock poisoned");
+        let subs = table.get("win_rr2").expect("subscription survives");
+        assert!(
+            !subs.is_empty(),
+            "subscription with one open shard must not be pruned entirely"
+        );
     }
 }
