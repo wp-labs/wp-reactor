@@ -121,6 +121,7 @@ pub(super) fn build_each_wfx_id(
     event_time_nanos: i64,
     ctx: &crate::match_engine::match_engine::Event,
     origin: &AlertOrigin,
+    field_order: &[&smol_str::SmolStr],
 ) -> String {
     let mut hasher = Fnv1a::new();
     hasher.update(rule_name.as_bytes());
@@ -128,13 +129,36 @@ pub(super) fn build_each_wfx_id(
     hasher.update(&event_time_nanos.to_le_bytes());
     hasher.update(b"\x00");
 
-    let mut fields: Vec<_> = ctx.fields.iter().collect();
-    fields.sort_by_key(|(name, _)| *name);
-    for (name, value) in fields {
-        hasher.update(name.as_bytes());
-        hasher.update(b"\x1e");
-        hasher.update(value_to_string(value).as_bytes());
-        hasher.update(b"\x1f");
+    // Field values are hashed through their `value_to_string` rendering, but
+    // written into one scratch `String` reused across fields instead of one
+    // heap allocation per field (the byte stream is identical — wfx_id values
+    // are stable against the pre-optimization path).
+    let mut scratch = String::new();
+    let ordered = field_order.len() == ctx.fields.len();
+    if ordered {
+        // Schema order precomputed once per batch (same window → same
+        // columns): skip the per-event collect + sort entirely.
+        for name in field_order {
+            if let Some(value) = ctx.fields.get(*name) {
+                hasher.update(name.as_bytes());
+                hasher.update(b"\x1e");
+                write_value_scratch(value, &mut scratch);
+                hasher.update(scratch.as_bytes());
+                hasher.update(b"\x1f");
+            }
+        }
+    } else {
+        // No order supplied (single-event call sites / schema drift within a
+        // batch) — fall back to the original per-event collect + sort.
+        let mut fields: Vec<_> = ctx.fields.iter().collect();
+        fields.sort_by_key(|(name, _)| *name);
+        for (name, value) in fields {
+            hasher.update(name.as_bytes());
+            hasher.update(b"\x1e");
+            write_value_scratch(value, &mut scratch);
+            hasher.update(scratch.as_bytes());
+            hasher.update(b"\x1f");
+        }
     }
 
     hasher.update(b"\x00");
@@ -143,11 +167,31 @@ pub(super) fn build_each_wfx_id(
     hex_encode(&hash.to_le_bytes())
 }
 
+/// Render a [`Value`] into `out` byte-identically to `value_to_string`, but
+/// reusing the caller's buffer (clear + rewrite) instead of allocating.
+fn write_value_scratch(v: &Value, out: &mut String) {
+    out.clear();
+    match v {
+        Value::Number(n) => {
+            use std::fmt::Write;
+            let _ = write!(out, "{n}");
+        }
+        Value::Str(s) => out.push_str(s),
+        Value::Bool(b) => {
+            use std::fmt::Write;
+            let _ = write!(out, "{b}");
+        }
+        Value::Array(_) => out.push_str("[array]"),
+        Value::Object(_) => out.push_str("[object]"),
+    }
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{:02x}", b);
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
 }

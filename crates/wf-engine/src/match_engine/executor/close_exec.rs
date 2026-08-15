@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use wf_lang::ast::CloseMode;
 
 use crate::alert::{AlertOrigin, OutputRecord};
@@ -119,11 +121,14 @@ impl RuleExecutor {
                 emit_time_nanos: Some(emit_time_nanos),
                 time_format: Some(self.output_config().time_format.as_str()),
             };
+            // Plan fields and precomputed specs are index-aligned (see
+            // `OutputStatic`) — no per-field name clone or type-map lookup.
             self.plan
                 .yield_plan
                 .fields
                 .iter()
-                .map(|field| {
+                .zip(self.output_static().yield_specs.iter())
+                .map(|(field, (name, field_type))| {
                     let Some(value) = eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
                     else {
                         return Err(orion_error::StructError::from(CoreReason::RuleExec)
@@ -132,48 +137,40 @@ impl RuleExecutor {
                                 field.name
                             )));
                     };
-                    let Some(value) = self.coerce_yield_field_value(&field.name, value)? else {
+                    let Some(value) =
+                        RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)?
+                    else {
                         // Optional input field was missing → omit it from the
                         // output record (wp-labs/warp-fusion#62).
                         return Ok(None);
                     };
-                    Ok(Some((field.name.clone(), value)))
+                    Ok(Some((Arc::clone(name), value)))
                 })
                 .filter_map(Result::transpose)
                 .collect::<CoreResult<Vec<_>>>()
         })?;
-        let yield_field_types = self
-            .plan
-            .yield_plan
-            .fields
-            .iter()
-            .filter_map(|field| {
-                self.yield_field_type(&field.name)
-                    .cloned()
-                    .map(|field_type| (field.name.clone(), field_type))
-            })
-            .collect();
 
         let machine_id = self.build_machine_id(&close.machine_id);
         let scope_key = self.build_scope_key(&self.plan.match_plan.keys, &close.scope_key);
+        let statics = self.output_static();
 
         Ok(Some(OutputRecord {
             wfx_id,
-            rule_name: self.plan.name.clone(),
+            rule_name: Arc::clone(&statics.rule_name),
             score,
-            entity_type: self.plan.entity_plan.entity_type.clone(),
+            entity_type: Arc::clone(&statics.entity_type),
             entity_id,
             origin,
             fired_at,
             emit_time,
             matched_rows: vec![],
-            summary,
-            yield_target: self.plan.yield_plan.target.clone(),
+            summary: Arc::from(summary),
+            yield_target: Arc::clone(&statics.yield_target),
             yield_fields,
-            yield_field_types,
+            yield_field_types: Arc::clone(&statics.yield_field_types),
             event_time_nanos: close.last_event_nanos,
             machine_id,
-            scope_key,
+            scope_key: Arc::from(scope_key),
         }))
     }
 }

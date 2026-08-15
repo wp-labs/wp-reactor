@@ -57,7 +57,7 @@ fn join_snapshot_enriches_context() {
         .execute_match_with_joins(&matched, &wl)
         .unwrap()
         .unwrap();
-    assert_eq!(alert.rule_name, "r_join");
+    assert_eq!(&*alert.rule_name, "r_join");
     assert!((alert.score - 70.0).abs() < f64::EPSILON);
 }
 

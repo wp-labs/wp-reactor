@@ -47,7 +47,7 @@ fn execute_each_yield_can_reference_score() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "risk_score")
+            .find(|(name, _)| &**name == "risk_score")
             .map(|(_, value)| value.clone()),
         Some(num(10.0))
     );
@@ -85,7 +85,7 @@ fn execute_each_yield_coerces_score_to_target_chars_field() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "risk_score")
+            .find(|(name, _)| &**name == "risk_score")
             .map(|(_, value)| value.clone()),
         Some(str_val("10"))
     );
@@ -126,7 +126,7 @@ fn execute_each_yield_validates_time_target_and_keeps_epoch_millis_value() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "first_seen")
+            .find(|(name, _)| &**name == "first_seen")
             .map(|(_, value)| value.clone()),
         Some(num(1_700_000_000_123.0))
     );
@@ -213,7 +213,7 @@ fn execute_each_strftime_uses_project_default_time_format() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "event_year")
+            .find(|(name, _)| &**name == "event_year")
             .map(|(_, value)| value.clone()),
         Some(str_val("2023"))
     );
@@ -254,7 +254,7 @@ fn execute_each_yield_can_map_wfu_meta_to_plain_fields() {
         alert
             .yield_fields
             .iter()
-            .find(|(field_name, _)| field_name == name)
+            .find(|(field_name, _)| &**field_name == name)
             .map(|(_, value)| value.clone())
     };
     assert_eq!(field("rule_name"), Some(str_val("r1")));
@@ -317,7 +317,7 @@ fn execute_each_yield_can_reference_time_system_vars() {
         alert
             .yield_fields
             .iter()
-            .find(|(field_name, _)| field_name == name)
+            .find(|(field_name, _)| &**field_name == name)
             .map(|(_, value)| value.clone())
     };
     let event_time_ms = event_time / 1_000_000;
@@ -391,7 +391,7 @@ fn execute_each_yield_evaluates_structured_object_and_array_literals() {
     let value = alert
         .yield_fields
         .iter()
-        .find(|(name, _)| name == "risk_context")
+        .find(|(name, _)| &**name == "risk_context")
         .map(|(_, value)| value)
         .expect("risk_context");
     let Value::Object(fields) = value else {
@@ -466,7 +466,7 @@ fn execute_each_yield_merges_input_object_with_extension() {
     let value = alert
         .yield_fields
         .iter()
-        .find(|(name, _)| name == "extensions")
+        .find(|(name, _)| &**name == "extensions")
         .map(|(_, value)| value)
         .expect("extensions");
     let Value::Object(fields) = value else {
@@ -526,7 +526,7 @@ fn execute_each_yield_passes_input_object_through() {
     let value = alert
         .yield_fields
         .iter()
-        .find(|(name, _)| name == "extensions")
+        .find(|(name, _)| &**name == "extensions")
         .map(|(_, value)| value)
         .expect("extensions");
     let Value::Object(fields) = value else {
@@ -574,7 +574,7 @@ fn execute_each_yield_failure_is_not_silent() {
     let field_value = output
         .yield_fields
         .iter()
-        .find(|(k, _)| k == "missing")
+        .find(|(k, _)| &**k == "missing")
         .map(|(_, v)| v.clone());
     assert_eq!(field_value, Some(Value::Str("".into())));
 }
@@ -604,7 +604,7 @@ fn execute_match_yield_can_reference_score() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "risk_score")
+            .find(|(name, _)| &**name == "risk_score")
             .map(|(_, value)| value.clone()),
         Some(num(70.0))
     );
@@ -650,7 +650,7 @@ fn execute_match_yield_can_reference_time_system_vars() {
         alert
             .yield_fields
             .iter()
-            .find(|(field_name, _)| field_name == name)
+            .find(|(field_name, _)| &**field_name == name)
             .map(|(_, value)| value.clone())
     };
     assert_eq!(field("first_seen"), Some(num(1_000.0)));
@@ -708,7 +708,7 @@ fn execute_match_yield_can_use_score_inside_builtin_expr() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "rounded")
+            .find(|(name, _)| &**name == "rounded")
             .map(|(_, value)| value.clone()),
         Some(num(70.1))
     );
@@ -716,7 +716,7 @@ fn execute_match_yield_can_use_score_inside_builtin_expr() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "message")
+            .find(|(name, _)| &**name == "message")
             .map(|(_, value)| value.clone()),
         Some(str_val("risk=70.126"))
     );
@@ -724,7 +724,7 @@ fn execute_match_yield_can_use_score_inside_builtin_expr() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "rule_message")
+            .find(|(name, _)| &**name == "rule_message")
             .map(|(_, value)| value.clone()),
         Some(str_val("r1-alert"))
     );
@@ -751,7 +751,7 @@ fn execute_match_yield_failure_is_not_silent() {
     let field_value = output
         .yield_fields
         .iter()
-        .find(|(k, _)| k == "missing")
+        .find(|(k, _)| &**k == "missing")
         .map(|(_, v)| v.clone());
     assert_eq!(field_value, Some(Value::Str("".into())));
 }
@@ -787,7 +787,7 @@ fn execute_match_missing_optional_float_field_is_omitted_not_fatal() {
         !output
             .yield_fields
             .iter()
-            .any(|(k, _)| k == "attacker_latitude"),
+            .any(|(k, _)| &**k == "attacker_latitude"),
         "missing typed float field should be omitted from match output"
     );
 }
@@ -850,7 +850,7 @@ fn execute_close_yield_can_reference_score() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "risk_score")
+            .find(|(name, _)| &**name == "risk_score")
             .map(|(_, value)| value.clone()),
         Some(num(70.0))
     );
@@ -858,7 +858,7 @@ fn execute_close_yield_can_reference_score() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "close_reason")
+            .find(|(name, _)| &**name == "close_reason")
             .map(|(_, value)| value.clone()),
         Some(str_val("timeout"))
     );
@@ -934,7 +934,7 @@ fn execute_close_yield_can_reference_time_system_vars() {
         alert
             .yield_fields
             .iter()
-            .find(|(field_name, _)| field_name == name)
+            .find(|(field_name, _)| &**field_name == name)
             .map(|(_, value)| value.clone())
     };
     assert_eq!(field("first_seen"), Some(num(1_000.0)));
@@ -1023,7 +1023,7 @@ fn execute_close_yield_can_use_count_label_inside_if_and_concat() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "high_event_count")
+            .find(|(name, _)| &**name == "high_event_count")
             .map(|(_, value)| value.clone()),
         Some(num(2.0))
     );
@@ -1031,7 +1031,7 @@ fn execute_close_yield_can_use_count_label_inside_if_and_concat() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "status")
+            .find(|(name, _)| &**name == "status")
             .map(|(_, value)| value.clone()),
         Some(str_val("high"))
     );
@@ -1039,7 +1039,7 @@ fn execute_close_yield_can_use_count_label_inside_if_and_concat() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "message")
+            .find(|(name, _)| &**name == "message")
             .map(|(_, value)| value.clone()),
         Some(str_val("cnt=2"))
     );
@@ -1127,7 +1127,7 @@ fn execute_close_yield_can_use_avg_on_field() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "avg_risk_score")
+            .find(|(name, _)| &**name == "avg_risk_score")
             .map(|(_, value)| value.clone()),
         Some(num(30.0))
     );
@@ -1135,7 +1135,7 @@ fn execute_close_yield_can_use_avg_on_field() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "message")
+            .find(|(name, _)| &**name == "message")
             .map(|(_, value)| value.clone()),
         Some(str_val("avg=30"))
     );
@@ -1259,7 +1259,7 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "high_event_count")
+            .find(|(name, _)| &**name == "high_event_count")
             .map(|(_, value)| value.clone()),
         Some(num(1.0))
     );
@@ -1267,7 +1267,7 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "elevated_avg")
+            .find(|(name, _)| &**name == "elevated_avg")
             .map(|(_, value)| value.clone()),
         Some(num(80.0))
     );
@@ -1275,7 +1275,7 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "first_high_action")
+            .find(|(name, _)| &**name == "first_high_action")
             .map(|(_, value)| value.clone()),
         Some(str_val("block"))
     );
@@ -1392,7 +1392,7 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "source_avg")
+            .find(|(name, _)| &**name == "source_avg")
             .map(|(_, value)| value.clone()),
         Some(num(80.0))
     );
@@ -1400,7 +1400,7 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "high_event_count")
+            .find(|(name, _)| &**name == "high_event_count")
             .map(|(_, value)| value.clone()),
         Some(num(1.0))
     );
@@ -1408,7 +1408,7 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "elevated_avg")
+            .find(|(name, _)| &**name == "elevated_avg")
             .map(|(_, value)| value.clone()),
         Some(num(80.0))
     );
@@ -1416,7 +1416,7 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "last_high_action")
+            .find(|(name, _)| &**name == "last_high_action")
             .map(|(_, value)| value.clone()),
         Some(str_val("block"))
     );
@@ -1492,7 +1492,7 @@ fn execute_close_yield_can_use_fmt_with_count() {
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "message")
+            .find(|(name, _)| &**name == "message")
             .map(|(_, value)| value.clone()),
         Some(str_val("10.0.0.1 failed 3 times"))
     );
@@ -1589,14 +1589,14 @@ fn execute_close_yield_resolves_tracked_bind_alias_field() {
     );
 
     let alert = result.unwrap();
-    assert_eq!(alert.rule_name, "port_scan");
+    assert_eq!(&*alert.rule_name, "port_scan");
     assert_eq!(alert.entity_id, "10.0.0.1");
 
     // The yield field c.sip must be resolved from the tracked bind alias
     let sip = alert
         .yield_fields
         .iter()
-        .find(|(k, _)| k == "sip")
+        .find(|(k, _)| &**k == "sip")
         .map(|(_, v)| v);
     assert_eq!(
         sip,
@@ -1693,7 +1693,7 @@ rule stat_rule {
         alert
             .yield_fields
             .iter()
-            .find(|(field_name, _)| field_name == name)
+            .find(|(field_name, _)| &**field_name == name)
             .map(|(_, value)| value.clone())
     };
 
@@ -1817,7 +1817,7 @@ rule evidence_rule {
         alert
             .yield_fields
             .iter()
-            .find(|(field_name, _)| field_name == name)
+            .find(|(field_name, _)| &**field_name == name)
             .map(|(_, value)| value.clone())
     };
 
@@ -1883,7 +1883,7 @@ rule accu_evidence {
                 alert
                     .yield_fields
                     .iter()
-                    .find(|(n, _)| n == name)
+                    .find(|(n, _)| &**n == name)
                     .map(|(_, v)| v.clone())
             };
             counts.push(field("event_count"));
@@ -1985,7 +1985,7 @@ rule evidence_rule {
         alert
             .yield_fields
             .iter()
-            .find(|(field_name, _)| field_name == name)
+            .find(|(field_name, _)| &**field_name == name)
             .map(|(_, value)| value.clone())
     };
 
@@ -2058,7 +2058,7 @@ rule evidence_rule {
         alert
             .yield_fields
             .iter()
-            .find(|(field_name, _)| field_name == name)
+            .find(|(field_name, _)| &**field_name == name)
             .map(|(_, value)| value.clone())
     };
 
@@ -2115,7 +2115,7 @@ rule evidence_rule {
         alert
             .yield_fields
             .iter()
-            .find(|(field_name, _)| field_name == name)
+            .find(|(field_name, _)| &**field_name == name)
             .map(|(_, value)| value.clone())
     };
 
@@ -2183,7 +2183,7 @@ rule evidence_close_rule {
         alert
             .yield_fields
             .iter()
-            .find(|(field_name, _)| field_name == name)
+            .find(|(field_name, _)| &**field_name == name)
             .map(|(_, value)| value.clone())
     };
 
@@ -2285,7 +2285,7 @@ rule stat_close_rule {
     let final_hits = alert
         .yield_fields
         .iter()
-        .find(|(field_name, _)| field_name == "final_hits")
+        .find(|(field_name, _)| &**field_name == "final_hits")
         .map(|(_, value)| value.clone());
 
     assert_eq!(final_hits, Some(num(2.0)));
@@ -2338,7 +2338,7 @@ fn execute_each_missing_optional_float_field_is_omitted_not_fatal() {
         !alert
             .yield_fields
             .iter()
-            .any(|(name, _)| name == "attacker_latitude"),
+            .any(|(name, _)| &**name == "attacker_latitude"),
         "missing optional float field should be omitted from output"
     );
 }
@@ -2391,7 +2391,7 @@ fn execute_each_present_float_field_outputs_normally() {
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "attacker_latitude")
+            .find(|(n, _)| &**n == "attacker_latitude")
             .map(|(_, v)| v.clone()),
         Some(num(37.7749))
     );
@@ -2476,14 +2476,14 @@ fn execute_each_missing_optional_field_keeps_other_fields() {
         !alert
             .yield_fields
             .iter()
-            .any(|(n, _)| n == "attacker_latitude"),
+            .any(|(n, _)| &**n == "attacker_latitude"),
         "missing float field omitted"
     );
     assert_eq!(
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "sip")
+            .find(|(n, _)| &**n == "sip")
             .map(|(_, v)| v.clone()),
         Some(str_val("10.0.0.1")),
         "present sibling field still emitted"
@@ -2521,7 +2521,7 @@ fn execute_each_missing_optional_digit_field_is_omitted() {
         .execute_each(&event(vec![("sip", str_val("10.0.0.1"))]), 1_000_000)
         .unwrap()
         .unwrap();
-    assert!(!alert.yield_fields.iter().any(|(n, _)| n == "fail_count"));
+    assert!(!alert.yield_fields.iter().any(|(n, _)| &**n == "fail_count"));
 }
 
 #[test]
@@ -2557,7 +2557,7 @@ fn execute_each_missing_chars_field_degrades_to_empty_string() {
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "message")
+            .find(|(n, _)| &**n == "message")
             .map(|(_, v)| v.clone()),
         Some(Value::Str(String::new().into()))
     );
@@ -2622,7 +2622,7 @@ fn execute_close_missing_optional_float_field_is_omitted_not_fatal() {
         !alert
             .yield_fields
             .iter()
-            .any(|(n, _)| n == "attacker_latitude"),
+            .any(|(n, _)| &**n == "attacker_latitude"),
         "missing typed float field should be omitted from close output"
     );
 }
@@ -2702,7 +2702,7 @@ fn execute_each_yield_nested_object_path() {
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "uid")
+            .find(|(n, _)| &**n == "uid")
             .map(|(_, v)| v.clone()),
         Some(str_val("d22b3fbcb9e77cb86834f6a18e2e0f68")),
         "nested path leaf must be extracted"
@@ -2711,7 +2711,7 @@ fn execute_each_yield_nested_object_path() {
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "sip")
+            .find(|(n, _)| &**n == "sip")
             .map(|(_, v)| v.clone()),
         Some(str_val("10.0.0.1")),
         "sibling field still emitted"
@@ -2733,7 +2733,7 @@ fn execute_each_yield_nested_path_missing_yields_empty() {
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "uid")
+            .find(|(n, _)| &**n == "uid")
             .map(|(_, v)| v.clone()),
         Some(Value::Str(String::new().into())),
         "missing nested path must not fail the record"
@@ -2742,7 +2742,7 @@ fn execute_each_yield_nested_path_missing_yields_empty() {
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "sip")
+            .find(|(n, _)| &**n == "sip")
             .map(|(_, v)| v.clone()),
         Some(str_val("10.0.0.1"))
     );
@@ -2784,7 +2784,7 @@ fn execute_each_yield_nested_missing_numeric_omits_field() {
         .unwrap();
 
     assert!(
-        !alert.yield_fields.iter().any(|(n, _)| n == "risk_score"),
+        !alert.yield_fields.iter().any(|(n, _)| &**n == "risk_score"),
         "missing nested path into a float target must be omitted, not fail the record"
     );
 }
@@ -2842,7 +2842,7 @@ fn execute_each_yield_nested_array_index() {
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "process_name")
+            .find(|(n, _)| &**n == "process_name")
             .map(|(_, v)| v.clone()),
         Some(str_val("evil.exe"))
     );
@@ -2900,7 +2900,7 @@ fn execute_each_yield_nested_array_out_of_bounds_omits() {
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "process_name")
+            .find(|(n, _)| &**n == "process_name")
             .map(|(_, v)| v.clone()),
         Some(Value::Str(String::new().into())),
         "out-of-bounds array index must not fail the record"
@@ -2955,7 +2955,7 @@ fn execute_each_yield_nested_path_in_arithmetic() {
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "double_risk")
+            .find(|(n, _)| &**n == "double_risk")
             .map(|(_, v)| v.clone()),
         Some(num(42.0)),
         "nested path must compose inside arithmetic"
@@ -3016,7 +3016,7 @@ fn execute_each_yield_nested_path_inside_object_literal() {
     let Value::Object(fields) = alert
         .yield_fields
         .iter()
-        .find(|(n, _)| n == "ctx")
+        .find(|(n, _)| &**n == "ctx")
         .map(|(_, v)| v)
         .expect("ctx yield field")
     else {
@@ -3089,7 +3089,7 @@ fn execute_each_bind_filter_nested_path() {
         matching
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "uid")
+            .find(|(n, _)| &**n == "uid")
             .map(|(_, v)| v.clone()),
         Some(str_val(target))
     );
@@ -3170,7 +3170,7 @@ fn execute_match_yield_nested_path_via_bind_tracking() {
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "uid")
+            .find(|(n, _)| &**n == "uid")
             .map(|(_, v)| v.clone()),
         Some(str_val("d22b3fbcb9e77cb86834f6a18e2e0f68")),
         "match-rule nested path leaf must be extracted from tracked bind field"
@@ -3179,7 +3179,7 @@ fn execute_match_yield_nested_path_via_bind_tracking() {
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "sip")
+            .find(|(n, _)| &**n == "sip")
             .map(|(_, v)| v.clone()),
         Some(str_val("10.0.0.1"))
     );
@@ -3220,7 +3220,7 @@ fn execute_match_yield_nested_path_missing_bind_omits() {
     let alert = exec.execute_match(&matched).unwrap();
 
     assert!(
-        !alert.yield_fields.iter().any(|(n, _)| n == "risk_score"),
+        !alert.yield_fields.iter().any(|(n, _)| &**n == "risk_score"),
         "missing nested path into a float target must be omitted in match yield"
     );
 }
@@ -3303,7 +3303,7 @@ rule r {
     let Value::Object(fields) = alert
         .yield_fields
         .iter()
-        .find(|(n, _)| n == "ctx")
+        .find(|(n, _)| &**n == "ctx")
         .map(|(_, v)| v)
         .expect("ctx yield field")
     else {

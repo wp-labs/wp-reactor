@@ -143,30 +143,30 @@ rule tracked_close {
     assert_eq!(alert.entity_id, "alice");
     assert!((alert.score - 20.0).abs() < f64::EPSILON);
     assert_eq!(
-        alert.yield_fields.iter().find(|(name, _)| name == "sip"),
-        Some(&("sip".to_string(), Value::Str("10.0.0.11".into())))
+        alert.yield_fields.iter().find(|(name, _)| &**name == "sip"),
+        Some(&("sip".into(), Value::Str("10.0.0.11".into())))
     );
     assert_eq!(
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "plain_sip"),
-        Some(&("plain_sip".to_string(), Value::Str("10.0.0.1".into())))
+            .find(|(name, _)| &**name == "plain_sip"),
+        Some(&("plain_sip".into(), Value::Str("10.0.0.1".into())))
     );
     assert_eq!(
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "avg_count"),
-        Some(&("avg_count".to_string(), Value::Number(20.0)))
+            .find(|(name, _)| &**name == "avg_count"),
+        Some(&("avg_count".into(), Value::Number(20.0)))
     );
     assert_eq!(
         alert
             .yield_fields
             .iter()
-            .find(|(name, _)| name == "actions"),
+            .find(|(name, _)| &**name == "actions"),
         Some(&(
-            "actions".to_string(),
+            "actions".into(),
             Value::Array(vec![
                 Value::Str("scan".into()),
                 Value::Str("probe".into())

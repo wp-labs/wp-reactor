@@ -2361,7 +2361,7 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
 fn pipeline_batch_rejects_non_finite_number_inside_structured_value() {
     let schema = intermediate_schema();
     let fields = vec![(
-        "risk_context".to_string(),
+        "risk_context".into(),
         wf_engine::match_engine::Value::Object(
             [(
                 "score".into(),
@@ -2386,11 +2386,11 @@ fn pipeline_batch_preserves_time_yield_as_epoch_nanos() {
     let ts = 1_700_000_000_123_000_000i64;
     let fields = vec![
         (
-            "event_time".to_string(),
+            "event_time".into(),
             wf_engine::match_engine::Value::Number(1_700_000_000_123.0),
         ),
         (
-            "sip".to_string(),
+            "sip".into(),
             wf_engine::match_engine::Value::Str("10.0.0.8".into()),
         ),
     ];

@@ -1,10 +1,14 @@
+use std::sync::Arc;
+
+use smol_str::SmolStr;
+
 use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::MACHINE_ID;
-use crate::match_engine::match_engine::{CepStateMachine, Event, StepData, WindowLookup};
+use crate::match_engine::match_engine::{CepStateMachine, Event, WindowLookup};
 
 use super::RuleExecutor;
-use super::alert::{build_each_wfx_id, build_summary, format_nanos_utc, now_nanos};
+use super::alert::{build_each_wfx_id, format_nanos_utc, now_nanos};
 use super::context::execute_joins;
 use super::eval::{
     YieldMeta, eval_bool_expr, eval_entity_id, eval_score, eval_yield_expr_with_meta,
@@ -27,15 +31,21 @@ impl RuleExecutor {
         if !passes_each_filter(each_plan.filter.as_ref(), event) {
             return Ok(None);
         }
-        self.build_each_alert(event, event_time_nanos)
+        self.build_each_alert(event, event_time_nanos, &[])
     }
 
-    /// Produce an [`OutputRecord`] from a single event in `on each` mode with join support.
+    /// Produce an [`OutputRecord`] from a single event in `on each` mode with
+    /// join support.
+    ///
+    /// `field_order` is the event schema's field names in sorted order,
+    /// precomputed once per batch by the caller (events within one batch share
+    /// the window schema). Pass `&[]` to compute the order per event instead.
     pub fn execute_each_with_joins(
         &self,
         event: &Event,
         event_time_nanos: i64,
         windows: &dyn WindowLookup,
+        field_order: &[&SmolStr],
     ) -> CoreResult<Option<OutputRecord>> {
         let Some(each_plan) = &self.plan.each_plan else {
             return Err(orion_error::StructError::from(CoreReason::RuleExec)
@@ -48,23 +58,29 @@ impl RuleExecutor {
         if !execute_joins(&self.plan.joins, &mut ctx, windows, event_time_nanos) {
             return Ok(None);
         }
-        self.build_each_alert(&ctx, event_time_nanos)
+        self.build_each_alert(&ctx, event_time_nanos, field_order)
     }
 
     fn build_each_alert(
         &self,
         ctx: &Event,
         event_time_nanos: i64,
+        field_order: &[&SmolStr],
     ) -> CoreResult<Option<OutputRecord>> {
+        let statics = self.output_static();
         let score = eval_score(&self.plan.score_plan.expr, ctx)?;
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
         let origin = AlertOrigin::Event;
         let fired_at = format_nanos_utc(event_time_nanos);
         let emit_time_nanos = now_nanos();
         let emit_time = format_nanos_utc(emit_time_nanos);
-        let empty_steps: Vec<StepData> = Vec::new();
-        let wfx_id = build_each_wfx_id(&self.plan.name, event_time_nanos, ctx, &origin);
-        let summary = build_summary(&self.plan.name, &[], &[], &empty_steps, &origin);
+        let wfx_id =
+            build_each_wfx_id(&self.plan.name, event_time_nanos, ctx, &origin, field_order);
+        // Summary is a plan constant on this path (empty scope + empty steps)
+        // — precomputed in `OutputStatic`, no per-event formatting.
+        let summary = Arc::clone(statics.each_summary.as_ref().expect(
+            "on-each rule missing precomputed summary",
+        ));
         let yield_fields = with_yield_eval_scope(|| {
             let yield_meta = YieldMeta {
                 score: Some(score),
@@ -84,11 +100,14 @@ impl RuleExecutor {
                 emit_time_nanos: Some(emit_time_nanos),
                 time_format: Some(self.output_config().time_format.as_str()),
             };
+            // Plan fields and precomputed specs are index-aligned; iterate
+            // both at once — no per-field name clone or type-map lookup.
             self.plan
                 .yield_plan
                 .fields
                 .iter()
-                .map(|field| {
+                .zip(statics.yield_specs.iter())
+                .map(|(field, (name, field_type))| {
                     let Some(value) = eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
                     else {
                         return Err(orion_error::StructError::from(CoreReason::RuleExec)
@@ -97,47 +116,38 @@ impl RuleExecutor {
                                 field.name
                             )));
                     };
-                    let Some(value) = self.coerce_yield_field_value(&field.name, value)? else {
+                    let Some(value) =
+                        RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)?
+                    else {
                         // Optional input field was missing → omit it from the
                         // output record (wp-labs/warp-fusion#62).
                         return Ok(None);
                     };
-                    Ok(Some((field.name.clone(), value)))
+                    Ok(Some((Arc::clone(name), value)))
                 })
                 .filter_map(Result::transpose)
                 .collect::<CoreResult<Vec<_>>>()
         })?;
-        let yield_field_types = self
-            .plan
-            .yield_plan
-            .fields
-            .iter()
-            .filter_map(|field| {
-                self.yield_field_type(&field.name)
-                    .cloned()
-                    .map(|field_type| (field.name.clone(), field_type))
-            })
-            .collect();
 
         let machine_id = CepStateMachine::extract_event_str(ctx, MACHINE_ID);
 
         Ok(Some(OutputRecord {
             wfx_id,
-            rule_name: self.plan.name.clone(),
+            rule_name: Arc::clone(&statics.rule_name),
             score,
-            entity_type: self.plan.entity_plan.entity_type.clone(),
+            entity_type: Arc::clone(&statics.entity_type),
             entity_id,
             origin,
             fired_at,
             emit_time,
             matched_rows: vec![],
             summary,
-            yield_target: self.plan.yield_plan.target.clone(),
+            yield_target: Arc::clone(&statics.yield_target),
             yield_fields,
-            yield_field_types,
+            yield_field_types: Arc::clone(&statics.yield_field_types),
             event_time_nanos,
             machine_id,
-            scope_key: self.plan.name.clone(),
+            scope_key: Arc::clone(&statics.rule_name),
         }))
     }
 }

@@ -17,6 +17,7 @@ wp-core-connectors = { workspace = true }
 async-trait = { workspace = true }
 wp-arrow = "0.2"
 wf-lang = { path = "../wf-lang" }
+smol_str = { workspace = true }
 arrow = { workspace = true }
 chrono = { workspace = true }
 async-broadcast = { workspace = true }

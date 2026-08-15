@@ -77,7 +77,7 @@ impl RuleBatchDebugStats {
     }
 
     fn count_output(&mut self, record: &OutputRecord, intermediate_targets: &HashSet<String>) {
-        if intermediate_targets.contains(&record.yield_target) {
+        if intermediate_targets.contains(&*record.yield_target) {
             self.intermediate_emitted += 1;
         } else {
             self.output_emitted += 1;
@@ -150,7 +150,7 @@ pub(super) struct RuleTask {
     /// Batched alert delivery: accumulated (yield_target, serialized record)
     /// pairs flushed to the sink writers when the batch fills / at EOS.
     /// `Mutex` so emit can stay `&self` while RuleTask stays `Sync`.
-    pending_alerts: std::sync::Mutex<Vec<(String, Arc<DataRecord>)>>,
+    pending_alerts: std::sync::Mutex<Vec<(std::sync::Arc<str>, Arc<DataRecord>)>>,
 }
 
 impl RuleTask {
@@ -366,6 +366,20 @@ impl RuleTask {
             self.cached_wall_nanos.store(wall_nanos(), Ordering::Relaxed);
         }
         let lookup = RegistryLookup(&self.router);
+        // on-each: events within a batch share the window schema, so the
+        // sorted field order used for wfx_id hashing is computed once per
+        // batch instead of collected + sorted per event.
+        let each_field_order: Vec<&smol_str::SmolStr> = match (
+            self.executor.plan().each_plan.is_some(),
+            events.first(),
+        ) {
+            (true, Some(first)) => {
+                let mut names: Vec<&smol_str::SmolStr> = first.fields.keys().collect();
+                names.sort_unstable();
+                names
+            }
+            _ => Vec::new(),
+        };
         for (row_index, event) in events.iter().enumerate() {
             if let Some(machine) = &mut self.machine {
                 let event_nanos = machine.event_time_nanos(event);
@@ -632,10 +646,12 @@ impl RuleTask {
                         stats.alias_passed += 1;
                     }
                     let event_nanos = event_time_nanos(event, self.each_time_field.as_deref());
-                    match self
-                        .executor
-                        .execute_each_with_joins(event, event_nanos, &lookup)
-                    {
+                    match self.executor.execute_each_with_joins(
+                        event,
+                        event_nanos,
+                        &lookup,
+                        &each_field_order,
+                    ) {
                         Ok(Some(record)) => {
                             if debug_enabled {
                                 stats.count_output(&record, &self.intermediate_targets);
@@ -1010,7 +1026,7 @@ impl RuleTask {
     // -- Alert emission -----------------------------------------------------
 
     async fn emit(&self, record: OutputRecord) {
-        if self.intermediate_targets.contains(&record.yield_target) {
+        if self.intermediate_targets.contains(&*record.yield_target) {
             self.emit_window_record(record).await;
             return;
         }
@@ -1070,7 +1086,7 @@ impl RuleTask {
         }
         let _fan_start = Instant::now();
         let pending = std::mem::take(&mut *self.pending_alerts.lock().unwrap());
-        let mut by_target: HashMap<String, Vec<Arc<DataRecord>>> = HashMap::new();
+        let mut by_target: HashMap<std::sync::Arc<str>, Vec<Arc<DataRecord>>> = HashMap::new();
         for (target, record) in pending {
             by_target.entry(target).or_default().push(record);
         }
@@ -1091,7 +1107,7 @@ impl RuleTask {
                         if let Some(metrics) = &self.metrics {
                             metrics.inc_alert_channel_full();
                         }
-                        // Fall back to blocking send
+                        // Fall back to blocking send (backpressure).
                         if let Err(e) = tx.send(batch).await {
                             if let Some(metrics) = &self.metrics {
                                 metrics.inc_alert_channel_send_failed();
@@ -1233,7 +1249,7 @@ fn log_output_emitted(
 }
 
 fn output_kind(record: &OutputRecord, intermediate_targets: &HashSet<String>) -> &'static str {
-    if intermediate_targets.contains(&record.yield_target) {
+    if intermediate_targets.contains(&*record.yield_target) {
         "intermediate"
     } else {
         "alert"
@@ -1262,10 +1278,10 @@ pub(super) fn build_pipeline_batch(
     schema: arrow::datatypes::SchemaRef,
     time_col_index: Option<usize>,
     event_time_nanos: i64,
-    yield_fields: &[(String, wf_engine::match_engine::Value)],
+    yield_fields: &[(std::sync::Arc<str>, wf_engine::match_engine::Value)],
 ) -> RuntimeResult<RecordBatch> {
     let values: HashMap<&str, &wf_engine::match_engine::Value> =
-        yield_fields.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        yield_fields.iter().map(|(k, v)| (&**k, v)).collect();
     let arrays: Vec<ArrayRef> = schema
         .fields()
         .iter()
@@ -1291,16 +1307,21 @@ pub(super) fn build_pipeline_batch(
         .source_raw_err(RuntimeReason::Bootstrap, "build internal pipeline batch")
 }
 
-fn record_window_fields(record: &OutputRecord) -> Vec<(String, wf_engine::match_engine::Value)> {
+fn record_window_fields(
+    record: &OutputRecord,
+) -> Vec<(std::sync::Arc<str>, wf_engine::match_engine::Value)> {
     let mut fields = record.yield_fields.clone();
-    let existing: HashSet<String> = fields.iter().map(|(name, _)| name.clone()).collect();
-    for field in WFU_INTERMEDIATE_META_FIELDS.iter().copied() {
-        if !existing.contains(field.name()) {
-            fields.push((
-                field.name().to_string(),
-                record_wfu_intermediate_meta_value(record, field),
-            ));
-        }
+    let existing: HashSet<&str> = fields.iter().map(|(name, _)| &**name).collect();
+    let missing_meta: Vec<WfuIntermediateMetaField> = WFU_INTERMEDIATE_META_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| !existing.contains(field.name()))
+        .collect();
+    for field in missing_meta {
+        fields.push((
+            std::sync::Arc::from(field.name()),
+            record_wfu_intermediate_meta_value(record, field),
+        ));
     }
     fields
 }
@@ -1416,21 +1437,21 @@ mod debug_stats_tests {
     fn output_record(target: &str) -> OutputRecord {
         OutputRecord {
             wfx_id: "id".to_string(),
-            rule_name: "rule".to_string(),
+            rule_name: "rule".into(),
             score: 1.0,
-            entity_type: "ip".to_string(),
+            entity_type: "ip".into(),
             entity_id: "10.0.0.1".to_string(),
             origin: AlertOrigin::Event,
             fired_at: "2026-01-01T00:00:00Z".to_string(),
             emit_time: "2026-01-01T00:00:00Z".to_string(),
             matched_rows: Vec::new(),
-            summary: String::new(),
-            yield_target: target.to_string(),
+            summary: "".into(),
+            yield_target: target.into(),
             yield_fields: Vec::new(),
-            yield_field_types: Vec::new(),
+            yield_field_types: Vec::new().into(),
             event_time_nanos: 0,
             machine_id: String::new(),
-            scope_key: String::new(),
+            scope_key: "".into(),
         }
     }
 

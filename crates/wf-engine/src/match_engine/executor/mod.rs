@@ -8,6 +8,7 @@ mod match_exec;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use orion_error::conversion::{SourceRawErr, ToStructError};
 use wf_config::OutputConfig;
@@ -15,10 +16,35 @@ use wf_lang::ast::Expr;
 use wf_lang::plan::RulePlan;
 use wf_lang::{BaseType, FieldType};
 
+use self::alert::build_summary;
 use self::eval::eval_bool_expr_with_lookup;
+use crate::alert::AlertOrigin;
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::match_engine::{Event, Value, WindowLookup};
 use crate::time::normalize_epoch_timestamp_float_nanos;
+
+/// Plan-level output constants, precomputed once at executor construction.
+///
+/// These are identical for every event/match a rule produces. The hot path
+/// previously re-derived them per event — `String` clones of rule/entity/
+/// target names, per-field `HashMap` type lookups, per-event summary
+/// formatting — roughly a dozen heap allocations per output record that
+/// existed only to reproduce plan constants.
+#[derive(Clone)]
+pub(crate) struct OutputStatic {
+    pub(crate) rule_name: Arc<str>,
+    pub(crate) entity_type: Arc<str>,
+    pub(crate) yield_target: Arc<str>,
+    /// `(field name, resolved type)` aligned by index with
+    /// `plan.yield_plan.fields` — kills the per-field type lookup + name
+    /// clone on every output.
+    pub(crate) yield_specs: Arc<[(Arc<str>, Option<FieldType>)]>,
+    /// Typed field list carried by every `OutputRecord` (plan constant).
+    pub(crate) yield_field_types: Arc<[(Arc<str>, FieldType)]>,
+    /// `on each` constant summary — scope key and step data are always empty
+    /// on that path, so the whole summary string is a plan constant.
+    pub(crate) each_summary: Option<Arc<str>>,
+}
 
 /// Evaluates score/entity expressions from a [`RulePlan`] and produces
 /// [`OutputRecord`]s from CEP match/close outputs.
@@ -35,6 +61,7 @@ pub struct RuleExecutor {
     /// alias → bind filter, precomputed so per-event alias matching is O(1)
     /// instead of a linear scan of `plan.binds` on every (event × alias).
     bind_filters: HashMap<String, Option<Expr>>,
+    output_static: OutputStatic,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,7 +108,46 @@ impl RuleExecutor {
             .iter()
             .map(|b| (b.alias.clone(), b.filter.clone()))
             .collect();
+        // Precompute plan-level output constants (see `OutputStatic`). The
+        // yield field types map comes from runtime schema knowledge, which is
+        // exactly what `new_with_options` receives.
+        let yield_specs: Vec<(Arc<str>, Option<FieldType>)> = plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| {
+                (
+                    Arc::from(field.name.as_str()),
+                    options.yield_field_types.get(&field.name).cloned(),
+                )
+            })
+            .collect();
+        let typed_fields: Vec<(Arc<str>, FieldType)> = yield_specs
+            .iter()
+            .filter_map(|(name, field_type)| {
+                field_type
+                    .clone()
+                    .map(|field_type| (Arc::clone(name), field_type))
+            })
+            .collect();
+        let each_summary = plan.each_plan.as_ref().map(|_| {
+            Arc::from(build_summary(
+                &plan.name,
+                &[],
+                &[],
+                &[],
+                &AlertOrigin::Event,
+            ))
+        });
         Self {
+            output_static: OutputStatic {
+                rule_name: Arc::from(plan.name.as_str()),
+                entity_type: Arc::from(plan.entity_plan.entity_type.as_str()),
+                yield_target: Arc::from(plan.yield_plan.target.as_str()),
+                yield_specs: Arc::from(yield_specs),
+                yield_field_types: Arc::from(typed_fields),
+                each_summary,
+            },
             plan,
             yield_field_types: options.yield_field_types,
             output: options.output,
@@ -97,8 +163,27 @@ impl RuleExecutor {
         self.yield_field_types.get(name)
     }
 
+    /// Precomputed plan-level output constants (see [`OutputStatic`]).
+    pub(crate) fn output_static(&self) -> &OutputStatic {
+        &self.output_static
+    }
+
     pub(crate) fn output_config(&self) -> &OutputConfig {
         &self.output
+    }
+
+    /// Coerce a yield field value against a precomputed type (from
+    /// `output_static().yield_specs`) — avoids the per-field `HashMap`
+    /// lookup on the hot path.
+    pub(crate) fn coerce_yield_field_value_with(
+        name: &str,
+        field_type: Option<&FieldType>,
+        value: Value,
+    ) -> CoreResult<Option<Value>> {
+        let Some(field_type) = field_type else {
+            return Ok(Some(value));
+        };
+        coerce_yield_value(name, field_type, value)
     }
 
     /// Coerce a yield field value against its target type. Returns `Ok(None)`

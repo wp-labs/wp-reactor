@@ -248,7 +248,7 @@ fn validate_hit_assert(
                 ));
             }
         }
-        HitAssert::EntityType { value } if output.entity_type != *value => {
+        HitAssert::EntityType { value } if &*output.entity_type != value.as_str() => {
             failures.push(format!(
                 "hit[{}].entity_type: expected {:?}, got {:?}",
                 index, value, output.entity_type

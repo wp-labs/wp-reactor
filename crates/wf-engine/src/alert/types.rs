@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, NaiveDateTime};
@@ -88,17 +89,22 @@ impl<'de> Deserialize<'de> for AlertOrigin {
 
 /// An output record produced by [`RuleExecutor`](crate::match_engine::RuleExecutor)
 /// when the CEP state machine signals a match or close.
+///
+/// Plan-constant strings (`rule_name` / `entity_type` / `summary` on the
+/// `on each` path / `yield_target` / `scope_key` on the `on each` path) and
+/// the typed yield field list are shared via `Arc` — producing a record
+/// clones references, not heap strings.
 #[derive(::moju_derive::MoJu, Debug, Clone, serde::Serialize)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.AlertOutput")]
 pub struct OutputRecord {
     /// SHA-256 content hash (16 hex).
     pub wfx_id: String,
     /// Name of the rule that fired.
-    pub rule_name: String,
+    pub rule_name: Arc<str>,
     /// Score in `[0, 100]`, clamped.
     pub score: f64,
     /// Entity type from `EntityPlan` (e.g. `"ip"`).
-    pub entity_type: String,
+    pub entity_type: Arc<str>,
     /// Entity id evaluated from `entity_id_expr`.
     pub entity_id: String,
     /// Which path produced this alert.
@@ -111,16 +117,16 @@ pub struct OutputRecord {
     #[serde(skip)]
     pub matched_rows: Vec<RecordBatch>,
     /// Human-readable summary of the alert.
-    pub summary: String,
+    pub summary: Arc<str>,
     /// Yield target window name, used for sink routing.
     #[serde(skip)]
-    pub yield_target: String,
+    pub yield_target: Arc<str>,
     /// Evaluated `yield (...)` fields, used by internal pipeline stages.
     #[serde(skip)]
-    pub yield_fields: Vec<(String, Value)>,
+    pub yield_fields: Vec<(Arc<str>, Value)>,
     /// Resolved types for `yield_fields`, aligned by field name when available.
     #[serde(skip)]
-    pub yield_field_types: Vec<(String, FieldType)>,
+    pub yield_field_types: Arc<[(Arc<str>, FieldType)]>,
     /// Event-time for this output (nanos since epoch), used by internal windows.
     #[serde(skip)]
     pub event_time_nanos: i64,
@@ -129,7 +135,7 @@ pub struct OutputRecord {
     pub machine_id: String,
     /// State-machine scope key, formatted as `k1=v1,k2=v2` (metrics-only).
     #[serde(skip)]
-    pub scope_key: String,
+    pub scope_key: Arc<str>,
 }
 
 impl OutputRecord {
@@ -149,7 +155,7 @@ impl OutputRecord {
             &mut exported,
             WFU_RULE_NAME,
             DataType::Chars,
-            ModelValue::from(self.rule_name.as_str()),
+            ModelValue::from(&*self.rule_name),
         )?;
         append_field(
             &mut record,
@@ -163,7 +169,7 @@ impl OutputRecord {
             &mut exported,
             WFU_ENTITY_TYPE,
             DataType::Chars,
-            ModelValue::from(self.entity_type.as_str()),
+            ModelValue::from(&*self.entity_type),
         )?;
         append_field(
             &mut record,
@@ -209,7 +215,7 @@ impl OutputRecord {
             &mut exported,
             WFU_SUMMARY,
             DataType::Chars,
-            ModelValue::from(self.summary.as_str()),
+            ModelValue::from(&*self.summary),
         )?;
 
         for (name, value) in &self.yield_fields {
@@ -662,14 +668,14 @@ mod tests {
                     ),
                 ),
             ],
-            yield_field_types: vec![
+            yield_field_types: std::sync::Arc::from(vec![
                 ("count".into(), FieldType::Base(BaseType::Digit)),
                 ("items".into(), FieldType::Array(BaseType::Chars)),
                 ("risk_context".into(), FieldType::Object),
-            ],
+            ]),
             event_time_nanos: 0,
             machine_id: String::new(),
-            scope_key: String::new(),
+            scope_key: "".into(),
         };
 
         let record = output.to_data_record().expect("record");
@@ -716,11 +722,11 @@ mod tests {
             matched_rows: vec![],
             summary: "demo".into(),
             yield_target: "out".into(),
-            yield_fields: vec![(format!("{WFU_PREFIX}bad"), Value::Str("x".into()))],
-            yield_field_types: vec![],
+            yield_fields: vec![(std::sync::Arc::from(format!("{WFU_PREFIX}bad").as_str()), Value::Str("x".into()))],
+            yield_field_types: Vec::new().into(),
             event_time_nanos: 0,
             machine_id: String::new(),
-            scope_key: String::new(),
+            scope_key: "".into(),
         };
 
         let err = output
@@ -840,10 +846,10 @@ mod tests {
                 "scores".into(),
                 Value::Array(vec![Value::Number(1.0), Value::Str("high".into())]),
             )],
-            yield_field_types: vec![("scores".into(), FieldType::Array(BaseType::Float))],
+            yield_field_types: std::sync::Arc::from(vec![("scores".into(), FieldType::Array(BaseType::Float))]),
             event_time_nanos: 0,
             machine_id: String::new(),
-            scope_key: String::new(),
+            scope_key: "".into(),
         };
 
         let err = output
@@ -870,10 +876,10 @@ mod tests {
                 "tags".into(),
                 Value::Array(vec![Value::Str("ssh".into()), Value::Number(22.0)]),
             )],
-            yield_field_types: vec![("tags".into(), FieldType::Array(BaseType::Chars))],
+            yield_field_types: std::sync::Arc::from(vec![("tags".into(), FieldType::Array(BaseType::Chars))]),
             event_time_nanos: 0,
             machine_id: String::new(),
-            scope_key: String::new(),
+            scope_key: "".into(),
         };
 
         let err = output
@@ -904,10 +910,10 @@ mod tests {
                         .collect(),
                 ),
             )],
-            yield_field_types: vec![("risk_context".into(), FieldType::Object)],
+            yield_field_types: std::sync::Arc::from(vec![("risk_context".into(), FieldType::Object)]),
             event_time_nanos: 0,
             machine_id: String::new(),
-            scope_key: String::new(),
+            scope_key: "".into(),
         };
 
         let err = output
@@ -941,14 +947,14 @@ mod tests {
                 ),
                 ("sha".into(), Value::Str("0xFF".into())),
             ],
-            yield_field_types: vec![
+            yield_field_types: std::sync::Arc::from(vec![
                 ("src_ip".into(), FieldType::Base(BaseType::Ip)),
                 ("seen_at".into(), FieldType::Base(BaseType::Time)),
                 ("sha".into(), FieldType::Base(BaseType::Hex)),
-            ],
+            ]),
             event_time_nanos: 0,
             machine_id: String::new(),
-            scope_key: String::new(),
+            scope_key: "".into(),
         };
 
         let record = output.to_data_record().expect("record");

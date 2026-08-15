@@ -290,7 +290,7 @@ fn execute_close_yield_nested_path_via_bind_data() {
         alert
             .yield_fields
             .iter()
-            .find(|(n, _)| n == "uid")
+            .find(|(n, _)| &**n == "uid")
             .map(|(_, v)| v.clone()),
         Some(str_val("d22b3fbcb9e77cb86834f6a18e2e0f68")),
         "close-rule nested path leaf must be extracted from tracked bind field"
@@ -361,7 +361,7 @@ fn execute_close_yield_nested_path_missing_bind_omits() {
     let alert = exec.execute_close(&close).unwrap().unwrap();
 
     assert!(
-        !alert.yield_fields.iter().any(|(n, _)| n == "risk_score"),
+        !alert.yield_fields.iter().any(|(n, _)| &**n == "risk_score"),
         "missing nested path into a float target must be omitted in close yield"
     );
 }

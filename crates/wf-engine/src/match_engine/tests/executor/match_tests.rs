@@ -25,9 +25,9 @@ fn execute_match_static_score() {
 
     let alert = exec.execute_match(&matched).unwrap();
 
-    assert_eq!(alert.rule_name, "r1");
+    assert_eq!(&*alert.rule_name, "r1");
     assert!((alert.score - 70.0).abs() < f64::EPSILON);
-    assert_eq!(alert.entity_type, "ip");
+    assert_eq!(&*alert.entity_type, "ip");
     assert_eq!(alert.entity_id, "10.0.0.1");
     assert_eq!(alert.origin, crate::alert::AlertOrigin::Event);
     assert!(alert.matched_rows.is_empty());
