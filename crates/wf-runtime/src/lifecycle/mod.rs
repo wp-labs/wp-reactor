@@ -335,7 +335,8 @@ impl Reactor {
         let mut head_watchers: Vec<JoinHandle<RuntimeResult<()>>> = Vec::with_capacity(2);
         let mut tail_watchers: Vec<JoinHandle<RuntimeResult<()>>> = Vec::with_capacity(2);
 
-        let (sink_fanout, alert_group) = spawn_alert_task(data.dispatcher.clone(), metrics.clone());
+        let (sink_fanout, alert_group) =
+            spawn_alert_task(data.dispatcher.clone(), metrics.clone(), cancel.clone());
         head_watchers.push(watch_group(alert_group, cancel.clone()));
 
         head_watchers.push(watch_group(
@@ -509,6 +510,7 @@ impl Reactor {
         self.cancel.cancel();
         signal_task.abort();
         self.wait().await?;
+        wf_info!(sys, "reactor shutdown complete: all task groups joined");
 
         if restart_requested {
             Ok(RunOutcome::RestartRequested)
@@ -598,7 +600,7 @@ fn watch_group(group: TaskGroup, cancel: CancellationToken) -> JoinHandle<Runtim
     let name = group.name;
     tokio::spawn(async move {
         wf_debug!(sys, task_group = name, "watching task group");
-        let result = group.wait().await;
+        let result = group.wait(cancel.clone()).await;
         if result.is_err() && !cancel.is_cancelled() {
             cancel.cancel();
         }
@@ -617,7 +619,7 @@ fn watch_receiver_group(
     let name = receiver_group.name;
     tokio::spawn(async move {
         wf_debug!(sys, task_group = name, "watching task group");
-        let result = receiver_group.wait().await;
+        let result = receiver_group.wait(cancel.clone()).await;
         if result.is_ok() {
             // EOS-driven finalization: input sources reported the stream ended.
             // Rules flush their trailing instances but keep running (a daemon

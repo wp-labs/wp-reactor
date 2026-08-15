@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use wp_model_core::model::DataRecord;
 use wf_engine::sink::{SinkDispatcher, SinkRuntime};
@@ -14,6 +15,11 @@ use crate::metrics::RuntimeMetrics;
 /// Sized to absorb brief sink slowdowns; under sustained backlog the sender
 /// blocks (backpressure) rather than buffering infinitely.
 pub const SINK_CHANNEL_CAPACITY: usize = 2048;
+
+/// Max wall time the sink consumers may keep flushing a buffered alert
+/// backlog after cancel before dropping the rest. Matches the rule-task
+/// shutdown drain budget so graceful shutdown stays bounded.
+const SINK_DRAIN_BUDGET: Duration = Duration::from_secs(1);
 
 /// Resolved delivery fanout: `yield_target → sink senders`.
 ///
@@ -138,34 +144,80 @@ impl SinkFanout {
 ///
 /// Each sink owns one of these, so a slow sink only backpressures its own
 /// channel (and the rules emitting to that target), not every other sink.
+///
+/// Shutdown: on cancel the consumer flushes the buffered backlog for at most
+/// [`SINK_DRAIN_BUDGET`], then drops the rest and stops the sink — a large
+/// alert backlog can't extend graceful shutdown indefinitely (the
+/// wait_grace_down_with_timeout pattern).
 pub async fn run_sink_consumer(
     mut rx: mpsc::Receiver<AlertBatch>,
     sink: Arc<SinkRuntime>,
     error_txs: Arc<Vec<mpsc::Sender<AlertBatch>>>,
     metrics: Option<Arc<RuntimeMetrics>>,
+    cancel: CancellationToken,
 ) {
-    while let Some(batch) = rx.recv().await {
-        if let Some(metrics) = &metrics {
-            metrics.set_alert_channel_depth(rx.len() as u64);
-        }
-        let dispatch_started = Instant::now();
-        if let Err(e) = sink.send_records(batch.as_slice()).await {
-            log::warn!("sink {:?} dispatch error: {e}", sink.name);
-            if let Some(metrics) = &metrics {
-                metrics.inc_sink_dispatch_failed();
-            }
-            // Escalate to error sinks (best-effort, no error-of-error loop).
-            for tx in error_txs.iter() {
-                if tx.send(Arc::clone(&batch)).await.is_err() {
-                    break;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // Shutdown: flush what's buffered within a budget, then stop.
+                let deadline = Instant::now() + SINK_DRAIN_BUDGET;
+                while let Ok(batch) = rx.try_recv() {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    dispatch_batch(&sink, &error_txs, &metrics, batch).await;
                 }
+                let mut dropped = 0usize;
+                while rx.try_recv().is_ok() {
+                    dropped += 1;
+                }
+                if dropped > 0 {
+                    log::warn!(
+                        "sink {:?} shutdown drain budget exceeded, dropped {dropped} buffered alert batches",
+                        sink.name
+                    );
+                }
+                break;
             }
-        }
-        if let Some(metrics) = &metrics {
-            metrics.inc_alert_dispatch();
-            metrics.observe_alert_dispatch(dispatch_started.elapsed());
+            batch = rx.recv() => match batch {
+                Some(batch) => {
+                    if let Some(metrics) = &metrics {
+                        metrics.set_alert_channel_depth(rx.len() as u64);
+                    }
+                    dispatch_batch(&sink, &error_txs, &metrics, batch).await;
+                }
+                // Channel closed (all producers dropped): stop the sink.
+                None => break,
+            },
         }
     }
-    // Channel closed (all producers dropped): stop the sink.
     let _ = sink.stop().await;
+}
+
+/// Serialize + send one alert batch to a sink, escalating failures to the
+/// error sinks. Shared by the normal and shutdown-drain paths.
+async fn dispatch_batch(
+    sink: &Arc<SinkRuntime>,
+    error_txs: &Arc<Vec<mpsc::Sender<AlertBatch>>>,
+    metrics: &Option<Arc<RuntimeMetrics>>,
+    batch: AlertBatch,
+) {
+    let dispatch_started = Instant::now();
+    if let Err(e) = sink.send_records(batch.as_slice()).await {
+        log::warn!("sink {:?} dispatch error: {e}", sink.name);
+        if let Some(metrics) = metrics {
+            metrics.inc_sink_dispatch_failed();
+        }
+        // Escalate to error sinks (best-effort, no error-of-error loop).
+        for tx in error_txs.iter() {
+            if tx.send(Arc::clone(&batch)).await.is_err() {
+                break;
+            }
+        }
+    }
+    if let Some(metrics) = metrics {
+        metrics.inc_alert_dispatch();
+        metrics.observe_alert_dispatch(dispatch_started.elapsed());
+    }
 }

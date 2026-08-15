@@ -62,6 +62,16 @@ async fn run_push_loop(
     loop {
         tokio::select! {
             biased;
+            // Shutdown has top priority: once cancelled we stop accepting new
+            // pushes and drain what's buffered. With the channel kept full by
+            // an ingest burst, `rx.recv()` would otherwise starve the cancel
+            // branch and extend shutdown by the whole backlog.
+            _ = cancel.cancelled() => {
+                task.drain_push_channel(&mut rx).await;
+                task.flush().await;
+                wf_debug!(pipe, task_id = %task_id, "rule task shutdown complete");
+                break;
+            }
             push = rx.recv() => {
                 match push {
                     Some(push) => task.process_push(push).await,
@@ -72,12 +82,6 @@ async fn run_push_loop(
                         break;
                     }
                 }
-            }
-            _ = cancel.cancelled() => {
-                task.drain_push_channel(&mut rx).await;
-                task.flush().await;
-                wf_debug!(pipe, task_id = %task_id, "rule task shutdown complete");
-                break;
             }
             // End-of-stream: input sources reported the stream ended. Flush the
             // trailing instances but keep running so a daemon can accept a
