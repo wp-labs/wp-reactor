@@ -204,18 +204,21 @@ impl Router {
             // fast-path windows (no rule subscriber) pass `None` so the batch's
             // `parsed_events` stays uninitialized (lazily parsed if a rule ever
             // subscribes later).
-            let outcome = match &window.events {
+            let (outcome, batch_seq) = match &window.events {
                 Some(events) => {
                     let mut win = win_lock.write().expect("window lock poisoned");
-                    win.append_with_watermark_parsed_sized(
+                    let outcome = win.append_with_watermark_parsed_sized(
                         batch.clone(),
                         Arc::clone(events),
                         content_bytes + window.events_bytes,
-                    )?
+                    )?;
+                    // The just-appended batch's seq (consumers ack seq+1).
+                    (outcome, win.next_seq() - 1)
                 }
                 None => {
                     let mut win = win_lock.write().expect("window lock poisoned");
-                    win.append_with_watermark_sized(batch.clone(), content_bytes)?
+                    let outcome = win.append_with_watermark_sized(batch.clone(), content_bytes)?;
+                    (outcome, win.next_seq() - 1)
                 }
             };
 
@@ -232,7 +235,9 @@ impl Router {
                     // of `window.read()`). Fast-path windows have no subscribers
                     // (the events are `None`), so broadcast is skipped.
                     if let Some(events) = &window.events {
-                        self.rule_fanout.broadcast(&window.window_name, events).await;
+                        self.rule_fanout
+                            .broadcast(&window.window_name, events, batch_seq)
+                            .await;
                     }
                     if let Some(notify) = self.registry.get_notifier(&window.window_name) {
                         notify.notify_waiters();
@@ -282,16 +287,18 @@ impl Router {
             .map(Arc::new)
             .collect::<Vec<_>>(),
         );
-        let outcome = {
+        let (outcome, batch_seq) = {
             let mut win = win_lock.write().expect("window lock poisoned");
             // Rule-emitted (intermediate) batches are small, so the O(rows×cols)
             // accounting can run inline; include the parsed-event footprint so
             // intermediate windows evict at the same water level as source ones.
             let byte_size = content_bytes(&batch) + events_bytes(&parsed);
-            win.append_with_watermark_parsed_sized(batch, Arc::clone(&parsed), byte_size)?
+            let outcome =
+                win.append_with_watermark_parsed_sized(batch, Arc::clone(&parsed), byte_size)?;
+            (outcome, win.next_seq() - 1)
         };
         if matches!(outcome, AppendOutcome::Appended) {
-            self.rule_fanout.broadcast(window_name, &parsed).await;
+            self.rule_fanout.broadcast(window_name, &parsed, batch_seq).await;
         }
         Ok(outcome)
     }

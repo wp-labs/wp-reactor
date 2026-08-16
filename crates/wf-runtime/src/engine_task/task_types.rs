@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -56,4 +57,8 @@ pub(crate) struct RuleTaskConfig {
     /// `Arc<Vec<Arc<Event>>>` from it instead of pulling from the window read lock
     /// (R1). When `None`, the task falls back to the legacy notify + pull loop.
     pub push_rx: Option<mpsc::Receiver<RulePush>>,
+    /// Consumption-progress slots by window name. The task acks `seq + 1`
+    /// after fully processing a batch; on drop the slots are released so a
+    /// shutdown task cannot pin window memory. Gates time-based eviction.
+    pub progress: std::collections::HashMap<String, Arc<AtomicU64>>,
 }

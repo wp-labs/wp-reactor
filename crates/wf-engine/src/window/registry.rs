@@ -11,6 +11,7 @@ use wf_config::{DistMode, WindowConfig};
 use crate::error::{CoreReason, CoreResult};
 
 use super::buffer::{Window, WindowParams};
+use super::progress::WindowProgress;
 use super::provider::ProviderWindow;
 
 // ---------------------------------------------------------------------------
@@ -59,6 +60,7 @@ pub struct WindowRegistry {
     provider_windows: RwLock<HashMap<String, Arc<RwLock<ProviderWindow>>>>,
     subscriptions: RwLock<HashMap<String, Vec<Subscription>>>,
     notifiers: RwLock<HashMap<String, Arc<Notify>>>,
+    progress: RwLock<HashMap<String, Arc<WindowProgress>>>,
 }
 
 impl std::fmt::Debug for WindowRegistry {
@@ -97,6 +99,7 @@ impl WindowRegistry {
         let mut windows = HashMap::with_capacity(defs.len());
         let mut subscriptions: HashMap<String, Vec<Subscription>> = HashMap::new();
         let mut notifiers = HashMap::with_capacity(defs.len());
+        let mut progress = HashMap::with_capacity(defs.len());
 
         for def in defs {
             let name = def.params.name.clone();
@@ -111,6 +114,7 @@ impl WindowRegistry {
             let window = Window::new(def.params, def.config);
             windows.insert(name.clone(), Arc::new(RwLock::new(window)));
             notifiers.insert(name.clone(), Arc::new(Notify::new()));
+            progress.insert(name.clone(), Arc::new(WindowProgress::new()));
 
             for stream_name in def.streams {
                 subscriptions
@@ -128,7 +132,20 @@ impl WindowRegistry {
             provider_windows: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(subscriptions),
             notifiers: RwLock::new(notifiers),
+            progress: RwLock::new(progress),
         })
+    }
+
+    /// Consumption-progress table for the named window.
+    ///
+    /// Rule tasks register slots here at spawn time; the evictor reads
+    /// [`WindowProgress::min_acked`] as the eviction floor.
+    pub fn progress(&self, name: &str) -> Option<Arc<WindowProgress>> {
+        self.progress
+            .read()
+            .expect("progress lock poisoned")
+            .get(name)
+            .cloned()
     }
 
     /// Register a provider window.
@@ -321,6 +338,13 @@ impl WindowRegistry {
             .expect("notifiers lock poisoned")
             .insert(name.clone(), Arc::new(Notify::new()));
 
+        // (2b) progress table (fresh — old consumers of a replaced window
+        // re-register when their tasks re-spawn).
+        self.progress
+            .write()
+            .expect("progress lock poisoned")
+            .insert(name.clone(), Arc::new(WindowProgress::new()));
+
         // (3) subscriptions — append, never overwrite existing entries.
         {
             let mut subs = self
@@ -378,6 +402,14 @@ impl WindowRegistry {
             .write()
             .expect("notifiers lock poisoned")
             .insert(name.clone(), Arc::new(Notify::new()));
+
+        // (2b) progress table — replace with a fresh one (re-spawned tasks
+        // re-register; stale slots from the old task generation must not pin
+        // the rebuilt window).
+        self.progress
+            .write()
+            .expect("progress lock poisoned")
+            .insert(name.clone(), Arc::new(WindowProgress::new()));
 
         // (3) subscriptions — remove old entries for this window, then
         //     insert the new stream subscriptions.

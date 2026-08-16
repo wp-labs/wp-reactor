@@ -390,6 +390,7 @@ fn make_task_with_window_bytes(
     let router = Arc::new(Router::new(registry));
 
     let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -506,6 +507,7 @@ fn make_pipeline_stage_task() -> (
     let executor = RuleExecutor::new(rule_plan);
     let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -594,6 +596,7 @@ fn make_each_task() -> (
     let registry = WindowRegistry::build(vec![]).unwrap();
     let router = Arc::new(Router::new(registry));
     let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: None,
         each_alias: Some("e".into()),
         each_time_field: Some("event_time".into()),
@@ -697,6 +700,7 @@ fn make_filtered_match_task() -> (
     let registry = WindowRegistry::build(vec![]).unwrap();
     let router = Arc::new(Router::new(registry));
     let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -813,6 +817,7 @@ fn make_filtered_close_task() -> (
     let registry = WindowRegistry::build(vec![]).unwrap();
     let router = Arc::new(Router::new(registry));
     let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -898,6 +903,7 @@ fn make_filtered_each_task() -> (
     let registry = WindowRegistry::build(vec![]).unwrap();
     let router = Arc::new(Router::new(registry));
     let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: None,
         each_alias: Some("e".into()),
         each_time_field: Some("event_time".into()),
@@ -1015,6 +1021,7 @@ fn make_intermediate_each_task() -> (
     let executor = RuleExecutor::new(rule_plan);
     let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: None,
         each_alias: Some("e".into()),
         each_time_field: Some("event_time".into()),
@@ -1114,6 +1121,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
     let executor = RuleExecutor::new(rule_plan);
     let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: None,
         each_alias: Some("e".into()),
         each_time_field: Some("event_time".into()),
@@ -1220,6 +1228,7 @@ fn make_intermediate_score_tasks() -> (
     let upstream_executor = RuleExecutor::new(upstream_plan);
     let (upstream_alert_tx, _upstream_alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let upstream_config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: None,
         each_alias: Some("e".into()),
         each_time_field: Some("event_time".into()),
@@ -1357,6 +1366,7 @@ fn make_intermediate_score_tasks() -> (
         Some("event_time".into()),
     );
     let downstream_config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: Some(downstream_machine),
         each_alias: None,
         each_time_field: None,
@@ -1464,6 +1474,7 @@ fn make_intermediate_score_band_tasks() -> (
     let upstream_executor = RuleExecutor::new(upstream_plan);
     let (upstream_alert_tx, _upstream_alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let upstream_config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: None,
         each_alias: Some("e".into()),
         each_time_field: Some("event_time".into()),
@@ -1654,6 +1665,7 @@ fn make_intermediate_score_band_tasks() -> (
         Some("event_time".into()),
     );
     let downstream_config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: Some(downstream_machine),
         each_alias: None,
         each_time_field: None,
@@ -1825,6 +1837,7 @@ fn make_filtered_bind_alias_match_task() -> (
     let executor = RuleExecutor::new(rule_plan);
     let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -1935,6 +1948,7 @@ fn make_window_has_match_task() -> (
     let executor = RuleExecutor::new(rule_plan);
     let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -2028,6 +2042,7 @@ async fn push_triggers_alert() {
     let push = RulePush {
         window_name: "auth_events".into(),
         events: Arc::new(batch_to_events(&batch).into_iter().map(Arc::new).collect::<Vec<_>>()),
+        seq: u64::MAX,
     };
     task.process_push(push).await;
 
@@ -2072,6 +2087,7 @@ async fn sharded_rule_produces_same_alerts_as_single_worker() {
         .process_push(RulePush {
             window_name: "auth_events".into(),
             events: Arc::clone(&events),
+            seq: u64::MAX,
         })
         .await;
     let mut single_ids = drain_alert_entity_ids(&mut single_rx);
@@ -2086,7 +2102,7 @@ async fn sharded_rule_produces_same_alerts_as_single_worker() {
     router
         .fanout()
         .register_sharded("auth_events", vec![s0_tx, s1_tx], keys);
-    router.fanout().broadcast("auth_events", &events).await;
+    router.fanout().broadcast("auth_events", &events, 0).await;
 
     let (mut t0, mut rx0, _w0, _n0) = make_task();
     let (mut t1, mut rx1, _w1, _n1) = make_task();
@@ -2814,6 +2830,7 @@ async fn port_scan_rule_triggers_close_alert() {
     let router = Arc::new(Router::new(registry));
 
     let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,

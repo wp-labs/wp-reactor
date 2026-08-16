@@ -41,11 +41,13 @@ impl Evictor {
     ///
     /// **Phase 1 — time eviction**: calls [`Window::evict_expired`] on every
     /// window, removing batches whose max event time is older than
-    /// `now_nanos - over`.
+    /// `now_nanos - over` **and** which every live consumer has acked
+    /// (consumption floor from the registry's `WindowProgress`).
     ///
     /// **Phase 2 — memory eviction**: while the aggregate memory across all
     /// windows exceeds `max_total_bytes`, evicts the oldest batch from the
-    /// window with the most memory.
+    /// window with the most memory. This phase is the explicit lossy
+    /// backstop and deliberately ignores the consumption floor.
     pub fn run_once(&self, registry: &WindowRegistry, now_nanos: i64) -> EvictReport {
         let mut report = EvictReport {
             windows_scanned: 0,
@@ -54,15 +56,19 @@ impl Evictor {
             per_window_evicted: Vec::new(),
         };
 
-        // Phase 1: time eviction
+        // Phase 1: time eviction (gated by consumption progress)
         let names: Vec<String> = registry.window_names();
 
         for name in &names {
             report.windows_scanned += 1;
+            let floor = registry
+                .progress(name)
+                .map(|progress| progress.min_acked())
+                .unwrap_or(u64::MAX);
             let win_lock = registry.get_window(name).unwrap();
             let mut win = win_lock.write().expect("window lock poisoned");
             let before = win.batch_count();
-            win.evict_expired(now_nanos);
+            win.evict_expired(now_nanos, floor);
             let evicted = before - win.batch_count();
             report.batches_time_evicted += evicted;
             if evicted > 0 {

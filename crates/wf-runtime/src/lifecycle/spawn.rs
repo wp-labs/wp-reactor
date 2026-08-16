@@ -128,6 +128,29 @@ pub(super) fn spawn_evictor_task(
     group
 }
 
+/// Register one consumption-progress slot per consumed window for a rule
+/// task (see [`wf_engine::window::WindowProgress`]).
+///
+/// The task acks `seq + 1` per processed batch; time-based eviction only
+/// removes batches every live consumer has acked, so sweeps can no longer
+/// drop unconsumed data.
+fn register_progress(
+    router: &Arc<Router>,
+    window_sources: &[WindowSource],
+) -> HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>> {
+    window_sources
+        .iter()
+        .map(|src| {
+            let slot = router
+                .registry()
+                .progress(&src.window_name)
+                .expect("progress table exists for every window")
+                .register();
+            (src.window_name.clone(), slot)
+        })
+        .collect()
+}
+
 /// Spawn one independent task per compiled rule.
 ///
 /// Each rule task owns its `CepStateMachine` exclusively (no `Arc<Mutex>`).
@@ -170,7 +193,8 @@ pub(super) fn spawn_rule_tasks(
                     for _ in 0..shard_count {
                         let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                         shard_txs.push(push_tx);
-                        let task_config = RuleTaskConfig {
+                        let progress = register_progress(router, &window_sources);
+                    let task_config = RuleTaskConfig {
                             machine: None,
                             each_alias: Some(alias.clone()),
                             each_time_field: time_field.clone(),
@@ -185,6 +209,7 @@ pub(super) fn spawn_rule_tasks(
                             pipe_registry: Arc::clone(&pipe_registry),
                             eos_flush: eos_tx.subscribe(),
                             push_rx: Some(push_rx),
+                            progress: progress.clone(),
                         };
                         group.push(tokio::spawn(async move { run_rule_task(task_config).await }));
                     }
@@ -200,6 +225,7 @@ pub(super) fn spawn_rule_tasks(
                             .fanout()
                             .register(&source.window_name, push_tx.clone());
                     }
+                    let progress = register_progress(router, &window_sources);
                     let task_config = RuleTaskConfig {
                         machine: None,
                         each_alias: Some(alias),
@@ -215,6 +241,7 @@ pub(super) fn spawn_rule_tasks(
                         pipe_registry: Arc::clone(&pipe_registry),
                         eos_flush: eos_tx.subscribe(),
                         push_rx: Some(push_rx),
+                        progress: progress.clone(),
                     };
                     group.push(tokio::spawn(async move { run_rule_task(task_config).await }));
                 }
@@ -241,7 +268,8 @@ pub(super) fn spawn_rule_tasks(
                         );
                         let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                         shard_txs.push(push_tx);
-                        let task_config = RuleTaskConfig {
+                        let progress = register_progress(router, &window_sources);
+                    let task_config = RuleTaskConfig {
                             machine: Some(machine),
                             each_alias: None,
                             each_time_field: None,
@@ -256,6 +284,7 @@ pub(super) fn spawn_rule_tasks(
                     pipe_registry: Arc::clone(&pipe_registry),
                             eos_flush: eos_tx.subscribe(),
                             push_rx: Some(push_rx),
+                            progress: progress.clone(),
                         };
                         group.push(tokio::spawn(async move { run_rule_task(task_config).await }));
                     }
@@ -275,6 +304,7 @@ pub(super) fn spawn_rule_tasks(
                             .fanout()
                             .register(&source.window_name, push_tx.clone());
                     }
+                    let progress = register_progress(router, &window_sources);
                     let task_config = RuleTaskConfig {
                         machine: Some(machine),
                         each_alias: None,
@@ -290,6 +320,7 @@ pub(super) fn spawn_rule_tasks(
                     pipe_registry: Arc::clone(&pipe_registry),
                         eos_flush: eos_tx.subscribe(),
                         push_rx: Some(push_rx),
+                        progress: progress.clone(),
                     };
                     group.push(tokio::spawn(async move { run_rule_task(task_config).await }));
                 }

@@ -147,6 +147,12 @@ pub(super) struct RuleTask {
     /// Wall-clock nanos cached once per batch — avoids a `SystemTime::now()`
     /// syscall on every emitted alert.
     cached_wall_nanos: AtomicU64,
+    /// Consumption-progress slots by window name. After fully processing a
+    /// batch the task acks `seq + 1` (push path: `RulePush.seq`; pull path:
+    /// the window batch seq). The evictor uses the minimum over all slots as
+    /// the time-eviction floor, so sweeps can never drop unconsumed data.
+    /// Released to `u64::MAX` on drop.
+    progress: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Countdown for sampling the allocation-heavy per-alert telemetry.
     emit_sample_remaining: AtomicU32,
     /// Batched alert delivery: accumulated (yield_target, exported record)
@@ -154,6 +160,16 @@ pub(super) struct RuleTask {
     /// DataRecord conversion runs on this thread by design — see [`Self::emit`].
     /// `Mutex` so emit can stay `&self` while RuleTask stays `Sync`.
     pending_alerts: std::sync::Mutex<Vec<(std::sync::Arc<str>, Arc<DataRecord>)>>,
+}
+
+impl Drop for RuleTask {
+    fn drop(&mut self) {
+        // Release the consumption-progress slots so a task going away does
+        // not pin its windows' time-eviction floor forever.
+        for slot in self.progress.values() {
+            wf_engine::window::WindowProgress::release(slot);
+        }
+    }
 }
 
 impl RuleTask {
@@ -179,6 +195,7 @@ impl RuleTask {
             pipe_registry,
             eos_flush,
             push_rx,
+            progress,
         } = config;
         let aliases: HashMap<String, Vec<String>> = window_sources
             .iter()
@@ -235,6 +252,7 @@ impl RuleTask {
             last_activity_wall: std::time::Instant::now(),
             push_rx,
             pushed_seq: 0,
+            progress,
             advance_nanos: 0,
             scan_nanos: 0,
             emit_nanos: 0,
@@ -311,6 +329,10 @@ impl RuleTask {
             for (batch_index, events) in events_list.iter().enumerate() {
                 let batch_seq = first_batch_seq + batch_index as u64;
                 self.process_batch(&window_name, batch_seq, events).await;
+                // Ack consumption so time eviction may reclaim this batch.
+                if let Some(slot) = self.progress.get(&window_name) {
+                    slot.store(batch_seq + 1, std::sync::atomic::Ordering::Release);
+                }
             }
         }
         self.update_rule_instances_metric();
@@ -793,8 +815,17 @@ impl RuleTask {
     pub(super) async fn process_push(&mut self, push: RulePush) {
         let seq = self.pushed_seq;
         self.pushed_seq += 1;
-        self.process_batch(push.window_name.as_ref(), seq, &push.events)
+        let window_name = push.window_name.clone();
+        let push_seq = push.seq;
+        self.process_batch(window_name.as_ref(), seq, &push.events)
             .await;
+        // Ack the window batch seq so time eviction may reclaim it (the
+        // `seq` above is only a per-task debug counter).
+        if let Some(slot) = self.progress.get(window_name.as_ref()) {
+            // saturating: relay pushes carry seq = u64::MAX (no window batch
+            // behind them) — MAX + 1 would overflow and wrap to 0.
+            slot.store(push_seq.saturating_add(1), std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Consume and process all currently-buffered pushed batches.
@@ -1209,7 +1240,13 @@ impl RuleTask {
                 .map(Arc::new)
                 .collect(),
         );
-        self.router.fanout().broadcast(&record.yield_target, &events).await;
+        // Pure-relay batches are never stored in a window, so there is no
+        // window batch seq to ack — pass `u64::MAX` (consumers ack past
+        // everything; the relay target window holds no batches anyway).
+        self.router
+            .fanout()
+            .broadcast(&record.yield_target, &events, u64::MAX)
+            .await;
     }
 }
 

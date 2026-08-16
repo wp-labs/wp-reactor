@@ -11,10 +11,14 @@ use crate::match_engine::{Event, extract_key_simple, shard_index};
 ///
 /// The `window_name` tags which window the events were appended to, so a rule
 /// subscribed to multiple windows can map the batch to the correct aliases.
+/// `seq` is the window-assigned batch sequence number; consumers ack
+/// `seq + 1` on the window's [`WindowProgress`](crate::window::WindowProgress)
+/// slot after processing, which gates time-based eviction.
 #[derive(Clone)]
 pub struct RulePush {
     pub window_name: Arc<str>,
     pub events: Arc<Vec<Arc<Event>>>,
+    pub seq: u64,
 }
 
 /// A subscription for one window: a single (unsharded) rule channel, N shard
@@ -139,14 +143,15 @@ impl RuleFanout {
             });
     }
 
-    /// Broadcast `events` to every rule channel registered for `window_name`.
+    /// Broadcast `events` (window batch with sequence `seq`) to every rule
+    /// channel registered for `window_name`.
     ///
     /// Unsharded subscriptions receive the whole batch; sharded subscriptions
     /// partition it by match key. Bounded channels: a full channel blocks the
     /// producer (`.await` on send) — backpressure instead of unbounded buffering,
     /// so a slow rule consumer stalls the ingest rather than growing RSS.
     /// Closed channels are pruned lazily here.
-    pub async fn broadcast(&self, window_name: &str, events: &Arc<Vec<Arc<Event>>>) {
+    pub async fn broadcast(&self, window_name: &str, events: &Arc<Vec<Arc<Event>>>, seq: u64) {
         let subs: Vec<Subscription> = {
             let table = self.table.read().expect("fanout lock poisoned");
             table.get(window_name).cloned().unwrap_or_default()
@@ -159,13 +164,14 @@ impl RuleFanout {
                     let push = RulePush {
                         window_name: window_name.into(),
                         events: Arc::clone(events),
+                        seq,
                     };
                     if tx.send(push).await.is_err() {
                         any_closed = true;
                     }
                 }
                 Subscription::Sharded { shards, keys } => {
-                    if broadcast_sharded(shards, keys, window_name, events).await {
+                    if broadcast_sharded(shards, keys, window_name, events, seq).await {
                         any_closed = true;
                     }
                 }
@@ -175,6 +181,7 @@ impl RuleFanout {
                     let push = RulePush {
                         window_name: window_name.into(),
                         events: Arc::clone(events),
+                        seq,
                     };
                     if shards[idx].send(push).await.is_err() {
                         any_closed = true;
@@ -221,6 +228,7 @@ async fn broadcast_sharded(
     keys: &[FieldRef],
     window_name: &str,
     events: &Arc<Vec<Arc<Event>>>,
+    seq: u64,
 ) -> bool {
     let n = shards.len();
     let mut sub_batches: Vec<Vec<Arc<Event>>> = (0..n).map(|_| Vec::new()).collect();
@@ -240,6 +248,7 @@ async fn broadcast_sharded(
         let push = RulePush {
             window_name: window_name.into(),
             events: Arc::new(sub),
+            seq,
         };
         if shards[i].send(push).await.is_err() {
             any_closed = true;
@@ -270,7 +279,7 @@ mod tests {
         fanout.register("win_a", tx);
 
         let events: Arc<Vec<Arc<Event>>> = Arc::new(Vec::new());
-        fanout.broadcast("win_a", &events).await;
+        fanout.broadcast("win_a", &events, 0).await;
 
         let push = rx.try_recv().expect("registered channel should receive a push");
         assert_eq!(&*push.window_name, "win_a");
@@ -285,7 +294,7 @@ mod tests {
         drop(rx); // close the channel
 
         let events: Arc<Vec<Arc<Event>>> = Arc::new(Vec::new());
-        fanout.broadcast("win_a", &events).await;
+        fanout.broadcast("win_a", &events, 0).await;
 
         let table = fanout.table.read().expect("fanout lock poisoned");
         assert!(
@@ -304,7 +313,7 @@ mod tests {
         // Two distinct keys; each should land on a single (deterministic) shard.
         let events: Arc<Vec<Arc<Event>>> =
             Arc::new(vec![Arc::new(event("k1")), Arc::new(event("k2")), Arc::new(event("k1"))]);
-        fanout.broadcast("win_a", &events).await;
+        fanout.broadcast("win_a", &events, 0).await;
 
         let mut received = Vec::new();
         while let Ok(push) = rx0.try_recv() {
@@ -328,7 +337,7 @@ mod tests {
         // Same key (`k1`) must land on the SAME shard across broadcasts.
         let idx = shard_index(&[Value::Str("k1".into())], 2);
         let again: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(event("k1"))]);
-        fanout.broadcast("win_a", &again).await;
+        fanout.broadcast("win_a", &again, 1).await;
         let got0 = rx0.try_recv().map(|p| p.events.len()).unwrap_or(0);
         let got1 = rx1.try_recv().map(|p| p.events.len()).unwrap_or(0);
         if idx == 0 {
@@ -373,7 +382,7 @@ mod tests {
             let events: Arc<Vec<Arc<Event>>> =
                 Arc::new(vec![Arc::new(event(&format!("e{i}a"))), Arc::new(event(&format!("e{i}b")))]);
             sent.push(Arc::clone(&events));
-            fanout.broadcast("win_rr", &events).await;
+            fanout.broadcast("win_rr", &events, 0).await;
         }
 
         let mut got0 = Vec::new();
@@ -411,7 +420,7 @@ mod tests {
         let events: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(event("x"))]);
         // Broadcast enough times to hit the closed shard and trigger pruning.
         for _ in 0..2 {
-            fanout.broadcast("win_rr2", &events).await;
+            fanout.broadcast("win_rr2", &events, 0).await;
         }
 
         // Surviving shard still receives (at least) one delivery.

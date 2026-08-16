@@ -93,12 +93,12 @@ fn append_and_evict_expired() {
     assert_eq!(win.total_rows(), 3);
 
     // cutoff = 12s - 10s = 2s → batch1 (max=1s) < 2s → evicted
-    win.evict_expired(12_000_000_000);
+    win.evict_expired(12_000_000_000, u64::MAX);
     assert_eq!(win.batch_count(), 2);
     assert_eq!(win.total_rows(), 2);
 
     // cutoff = 16s - 10s = 6s → batch2 (max=5s) < 6s → evicted
-    win.evict_expired(16_000_000_000);
+    win.evict_expired(16_000_000_000, u64::MAX);
     assert_eq!(win.batch_count(), 1);
     assert_eq!(win.total_rows(), 1);
 }
@@ -221,7 +221,7 @@ fn no_time_col_window() {
     assert_eq!(win.total_rows(), 2);
 
     // evict_expired is no-op for no-time-column windows.
-    win.evict_expired(i64::MAX);
+    win.evict_expired(i64::MAX, u64::MAX);
     assert_eq!(win.batch_count(), 1);
     assert_eq!(win.total_rows(), 2);
 }
@@ -231,7 +231,7 @@ fn no_time_col_window() {
 #[test]
 fn evict_on_empty_window_is_noop() {
     let mut win = test_window(60, usize::MAX);
-    win.evict_expired(i64::MAX);
+    win.evict_expired(i64::MAX, u64::MAX);
     assert!(win.is_empty());
 }
 
@@ -271,11 +271,11 @@ fn multi_row_batch_time_range() {
     assert_eq!(win.batch_count(), 1);
 
     // cutoff = 15s - 10s = 5s → batch max=8s >= 5s → NOT evicted
-    win.evict_expired(15_000_000_000);
+    win.evict_expired(15_000_000_000, u64::MAX);
     assert_eq!(win.batch_count(), 1);
 
     // cutoff = 19s - 10s = 9s → batch max=8s < 9s → evicted
-    win.evict_expired(19_000_000_000);
+    win.evict_expired(19_000_000_000, u64::MAX);
     assert_eq!(win.batch_count(), 0);
 }
 
@@ -833,7 +833,7 @@ fn join_index_maintained_on_append_and_evict() {
 
     // Expire all batches: over=3600s, now=4000s → cutoff=400s >> event times
     // (1-4ms), so all batches are time-evicted and index entries removed.
-    win.evict_expired(4_000_000_000_000);
+    win.evict_expired(4_000_000_000_000, u64::MAX);
     assert!(
         win.join_lookup(&JoinKey::Int(42)).is_none_or(|v| v.is_empty()),
         "index cleared after eviction"
