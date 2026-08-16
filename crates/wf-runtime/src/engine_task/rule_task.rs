@@ -184,6 +184,12 @@ pub(super) struct RuleTask {
     /// append runs on this thread by design — see [`Self::emit`].
     /// `Mutex` so emit can stay `&self` while RuleTask stays `Sync`.
     pending_alerts: std::sync::Mutex<PendingAlertColumns>,
+    /// On-each rules emitting to a plain sink target use the direct-write
+    /// column path (plan C2): the executor appends straight into the
+    /// columnar builder with no per-record `OutputRecord`. Intermediate
+    /// pipe targets keep the record path (`build_pipeline_batch` needs the
+    /// full row). Constant for the task's lifetime — decided once here.
+    each_direct: bool,
 }
 
 impl Drop for RuleTask {
@@ -255,6 +261,10 @@ impl RuleTask {
         let rule_name = executor.plan().name.clone();
         let task_id = format!("{}#{}", rule_name, seq);
         let conv_plan = executor.plan().conv_plan.clone();
+        // Direct-write on-each emit only when the target is a sink target:
+        // intermediate pipes still consume full `OutputRecord` rows.
+        let each_direct = executor.plan().each_plan.is_some()
+            && !intermediate_targets.contains(executor.plan().yield_plan.target.as_str());
 
         let task = Self {
             task_id,
@@ -288,6 +298,7 @@ impl RuleTask {
             emit_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
             serialize_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
             pending_alerts: std::sync::Mutex::new(PendingAlertColumns::default()),
+            each_direct,
         };
         (task, cancel, timeout_scan_interval)
     }
@@ -700,48 +711,100 @@ impl RuleTask {
                         stats.alias_passed += 1;
                     }
                     let event_nanos = event_time_nanos(event, self.each_time_field.as_deref());
-                    match self.executor.execute_each_with_joins(
-                        event,
-                        event_nanos,
-                        &lookup,
-                        &each_field_order,
-                        batch_emit_nanos,
-                    ) {
-                        Ok(Some(record)) => {
-                            if debug_enabled {
-                                stats.count_output(&record, &self.intermediate_targets);
-                            }
-                            if debug_enabled && stats.allow_detail() {
-                                log_output_emitted(
-                                    "execute_each",
-                                    "event",
-                                    output_kind(&record, &self.intermediate_targets),
-                                    &record,
-                                    &[],
-                                );
-                            }
-                            self.emit(record).await;
-                        }
-                        Ok(None) => {
-                            if debug_enabled {
-                                stats.output_none += 1;
-                            }
-                            if debug_enabled && stats.allow_detail() {
-                                log_output_suppressed(rule_name_for_log, "execute_each", None);
-                            }
-                        }
-                        Err(e) => {
-                            if debug_enabled {
-                                stats.errors += 1;
-                            }
-                            wf_warn!(
-                                pipe,
-                                rule = %rule_name.as_deref().unwrap_or_else(|| self.rule_name()),
-                                stage = 0,
-                                phase = "execute_each",
-                                error = %e,
-                                "rule output failed"
+                    if self.each_direct {
+                        // Plan C2: the executor appends straight into the
+                        // columnar builder — no per-record OutputRecord.
+                        match self
+                            .emit_each_direct(
+                                event,
+                                event_nanos,
+                                &lookup,
+                                &each_field_order,
+                                batch_emit_nanos,
                             )
+                            .await
+                        {
+                            Ok(true) => {
+                                if debug_enabled {
+                                    stats.output_emitted += 1;
+                                }
+                                if debug_enabled && stats.allow_detail() {
+                                    wf_debug!(pipe,
+                                        rule = %rule_name_for_log,
+                                        stage = 0,
+                                        phase = "execute_each",
+                                        target = %self.executor.static_yield_target(),
+                                        output_kind = "alert",
+                                        "rule output emitted (direct)"
+                                    );
+                                }
+                            }
+                            Ok(false) => {
+                                if debug_enabled {
+                                    stats.output_none += 1;
+                                }
+                                if debug_enabled && stats.allow_detail() {
+                                    log_output_suppressed(rule_name_for_log, "execute_each", None);
+                                }
+                            }
+                            Err(e) => {
+                                if debug_enabled {
+                                    stats.errors += 1;
+                                }
+                                wf_warn!(
+                                    pipe,
+                                    rule = %rule_name.as_deref().unwrap_or_else(|| self.rule_name()),
+                                    stage = 0,
+                                    phase = "execute_each",
+                                    error = %e,
+                                    "rule output failed"
+                                )
+                            }
+                        }
+                    } else {
+                        match self.executor.execute_each_with_joins(
+                            event,
+                            event_nanos,
+                            &lookup,
+                            &each_field_order,
+                            batch_emit_nanos,
+                        ) {
+                            Ok(Some(record)) => {
+                                if debug_enabled {
+                                    stats.count_output(&record, &self.intermediate_targets);
+                                }
+                                if debug_enabled && stats.allow_detail() {
+                                    log_output_emitted(
+                                        "execute_each",
+                                        "event",
+                                        output_kind(&record, &self.intermediate_targets),
+                                        &record,
+                                        &[],
+                                    );
+                                }
+                                self.emit(record).await;
+                            }
+                            Ok(None) => {
+                                if debug_enabled {
+                                    stats.output_none += 1;
+                                }
+                                if debug_enabled && stats.allow_detail() {
+                                    log_output_suppressed(rule_name_for_log, "execute_each", None);
+                                }
+                            }
+                            Err(e) => {
+                                if debug_enabled {
+                                    stats.errors += 1;
+                                }
+                                wf_warn!(
+                                    pipe,
+                                    rule = %rule_name.as_deref().unwrap_or_else(|| self.rule_name()),
+                                    stage = 0,
+                                    phase = "execute_each",
+                                    error = %e,
+                                    "rule output failed"
+                                )
+                            }
                         }
                     }
                 } else {
@@ -1181,6 +1244,111 @@ impl RuleTask {
         if should_flush {
             self.flush_alerts().await;
         }
+    }
+
+    /// Direct-write on-each emit (plan C2): the executor evaluates the event
+    /// and appends the row straight into the per-target columnar builder —
+    /// no per-record `OutputRecord` materialization. Mirrors [`Self::emit`]'s
+    /// telemetry (exact totals, 1-in-N sampled detail/e2e, sampled serialize
+    /// timing) and batch-flush trigger.
+    ///
+    /// One diagnostic difference from the record path: the sampled detail's
+    /// machine id is extracted from the pre-join event (joins that rebind
+    /// the machine-id field would show a different label). Only affects the
+    /// metric label, not semantics.
+    async fn emit_each_direct(
+        &self,
+        event: &Event,
+        event_nanos: i64,
+        lookup: &RegistryLookup<'_>,
+        field_order: &[&smol_str::SmolStr],
+        batch_emit_nanos: i64,
+    ) -> wf_engine::error::CoreResult<bool> {
+        // Serialize timing is sampled 1-in-N and scaled back up (same
+        // pattern as `emit`; covers the eval + column append).
+        let time_this = {
+            let rem = self.serialize_sample_remaining.fetch_sub(1, Ordering::Relaxed);
+            if rem == 1 {
+                self.serialize_sample_remaining
+                    .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        };
+        let _ser_start = time_this.then(Instant::now);
+        let (result, should_flush) = {
+            let mut pending = self.pending_alerts.lock().unwrap();
+            // Linear target lookup via the plan-constant Arc (targets are
+            // few); first append creates the builder.
+            let target = self.executor.static_yield_target();
+            let slot = pending
+                .by_target
+                .iter_mut()
+                .find(|(existing, _)| **existing == **target);
+            let builder = match slot {
+                Some((_, builder)) => builder,
+                None => {
+                    pending
+                        .by_target
+                        .push((std::sync::Arc::clone(target), AlertColumnBuilder::new(std::sync::Arc::clone(target))));
+                    let last = pending.by_target.len() - 1;
+                    &mut pending.by_target[last].1
+                }
+            };
+            let result = self.executor.execute_each_direct(
+                event,
+                event_nanos,
+                lookup,
+                field_order,
+                batch_emit_nanos,
+                builder,
+            );
+            if let Ok(true) = &result {
+                pending.count += 1;
+            }
+            (result, pending.count >= ALERT_BATCH_SIZE)
+        };
+        if let Ok(true) = &result {
+            if let Some(metrics) = &self.metrics {
+                // Exact total is cheap; the allocation-heavy detail map +
+                // e2e histogram are sampled 1-in-N.
+                metrics.inc_alert_emitted_total(self.rule_name());
+                let now_nanos = self.cached_wall_nanos.load(Ordering::Relaxed);
+                let sample = self.emit_sample_remaining.load(Ordering::Relaxed);
+                if sample == 0 {
+                    self.emit_sample_remaining
+                        .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
+                    metrics.inc_alert_emitted_detail(
+                        self.rule_name(),
+                        &RuleExecutor::machine_id_of(event),
+                        self.rule_name(),
+                    );
+                    let e2e_nanos = now_nanos.saturating_sub(event_nanos.max(0) as u64);
+                    metrics.observe_event_e2e_latency(Duration::from_nanos(e2e_nanos));
+                } else {
+                    self.emit_sample_remaining
+                        .store(sample - 1, Ordering::Relaxed);
+                }
+            }
+        } else if let Err(e) = &result {
+            if let Some(metrics) = &self.metrics {
+                metrics.inc_alert_serialize_failed();
+            }
+            log::warn!("alert export error: {e}");
+        }
+        if let Some(start) = _ser_start {
+            let elapsed = start.elapsed().as_nanos() as u64;
+            let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64;
+            self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
+            if let Some(metrics) = &self.metrics {
+                metrics.add_alert_serialize_nanos(scaled);
+            }
+        }
+        if should_flush {
+            self.flush_alerts().await;
+        }
+        result
     }
 
     /// Flush the accumulated columnar alert batches to the sink writers,

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use smol_str::SmolStr;
 
+use crate::alert::{AlertColumnBuilder, EachRowCells};
 use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::MACHINE_ID;
@@ -72,6 +73,125 @@ impl RuleExecutor {
         self.build_each_alert(&ctx, event_time_nanos, field_order, emit_time_nanos)
     }
 
+    /// On-each direct-write emit (plan C2): evaluates the event and appends
+    /// the row straight into `builder`'s columns, skipping the per-record
+    /// `OutputRecord` materialization entirely (record struct + yield-field
+    /// `Vec` + per-record `String`→`Arc` copies of the constant system
+    /// fields were the dominant remaining build/drop cost after C1).
+    ///
+    /// Semantics are identical to [`Self::execute_each_with_joins`] followed
+    /// by `AlertColumnBuilder::append_record` — locked by unit test. Returns
+    /// `Ok(false)` when the optional `where` filter rejects the event (or a
+    /// join rejects it), in which case nothing was appended.
+    ///
+    /// Only for rules whose yield target is a sink (not an intermediate
+    /// pipe) — the pipe path needs the full row record
+    /// (`build_pipeline_batch`), so callers keep the record path there.
+    pub fn execute_each_direct(
+        &self,
+        event: &Event,
+        event_time_nanos: i64,
+        windows: &dyn WindowLookup,
+        field_order: &[&SmolStr],
+        emit_time_nanos: i64,
+        builder: &mut AlertColumnBuilder,
+    ) -> CoreResult<bool> {
+        let Some(each_plan) = &self.plan.each_plan else {
+            return Err(orion_error::StructError::from(CoreReason::RuleExec)
+                .with_detail("execute_each_direct called for non-`on each` rule"));
+        };
+        if !passes_each_filter(each_plan.filter.as_ref(), event) {
+            return Ok(false);
+        }
+        // Rules without joins never mutate the event — skip the per-event
+        // `fields` HashMap clone (same optimization as the record path).
+        if self.plan.joins.is_empty() {
+            self.build_each_direct(event, event_time_nanos, field_order, emit_time_nanos, builder)?;
+            return Ok(true);
+        }
+        let mut ctx = event.clone();
+        if !execute_joins(&self.plan.joins, &mut ctx, windows, event_time_nanos) {
+            return Ok(false);
+        }
+        self.build_each_direct(&ctx, event_time_nanos, field_order, emit_time_nanos, builder)?;
+        Ok(true)
+    }
+
+    fn build_each_direct(
+        &self,
+        ctx: &Event,
+        event_time_nanos: i64,
+        field_order: &[&SmolStr],
+        emit_time_nanos: i64,
+        builder: &mut AlertColumnBuilder,
+    ) -> CoreResult<()> {
+        let statics = self.output_static();
+        let score = eval_score(&self.plan.score_plan.expr, ctx)?;
+        let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
+        let origin = AlertOrigin::Event;
+        let fired_at = format_nanos_utc(event_time_nanos);
+        let emit_time = self.cached_emit_time(emit_time_nanos);
+        let wfx_id =
+            build_each_wfx_id(&self.plan.name, event_time_nanos, ctx, &origin, field_order);
+        let summary = Arc::clone(statics.each_summary.as_ref().expect(
+            "on-each rule missing precomputed summary",
+        ));
+        let yield_meta = self.each_yield_meta(
+            &wfx_id,
+            &fired_at,
+            &emit_time,
+            &summary,
+            score,
+            &entity_id,
+            &origin,
+            event_time_nanos,
+            emit_time_nanos,
+        );
+        // All fallible work (eval + coerce + typed conversion + name
+        // validation) happens while staging; commit is pure column pushes.
+        builder.begin_row();
+        with_yield_eval_scope(|| {
+            for (field, (name, field_type)) in self
+                .plan
+                .yield_plan
+                .fields
+                .iter()
+                .zip(statics.yield_specs.iter())
+            {
+                let Some(value) = eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
+                else {
+                    return Err(orion_error::StructError::from(CoreReason::RuleExec)
+                        .with_detail(format!(
+                            "on each yield field {:?} expression evaluated to None",
+                            field.name
+                        )));
+                };
+                let Some(value) =
+                    RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)?
+                else {
+                    // Optional input field was missing → omit it from the
+                    // output row (wp-labs/warp-fusion#62).
+                    continue;
+                };
+                builder.stage_yield_cell(name, field_type.as_ref(), &value)?;
+            }
+            Ok(())
+        })?;
+        builder.commit_each_row(EachRowCells {
+            wfx_id,
+            score,
+            entity_id,
+            fired_at,
+            rule_name: &statics.rule_name,
+            entity_type: &statics.entity_type,
+            origin: &statics.each_origin,
+            close_reason: &statics.each_close_reason,
+            emit_time: &emit_time,
+            summary: &summary,
+        });
+        Ok(())
+    }
+
     fn build_each_alert(
         &self,
         ctx: &Event,
@@ -92,25 +212,18 @@ impl RuleExecutor {
         let summary = Arc::clone(statics.each_summary.as_ref().expect(
             "on-each rule missing precomputed summary",
         ));
+        let yield_meta = self.each_yield_meta(
+            &wfx_id,
+            &fired_at,
+            &emit_time,
+            &summary,
+            score,
+            &entity_id,
+            &origin,
+            event_time_nanos,
+            emit_time_nanos,
+        );
         let yield_fields = with_yield_eval_scope(|| {
-            let yield_meta = YieldMeta {
-                score: Some(score),
-                wfx_id: Some(&wfx_id),
-                rule_name: Some(&self.plan.name),
-                entity_type: Some(&self.plan.entity_plan.entity_type),
-                entity_id: Some(&entity_id),
-                origin: Some(origin.as_str()),
-                close_reason: Some(""),
-                fired_at: Some(&fired_at),
-                emit_time: Some(&*emit_time),
-                summary: Some(&summary),
-                event_first_time_nanos: Some(event_time_nanos),
-                event_last_time_nanos: Some(event_time_nanos),
-                window_start_time_nanos: Some(event_time_nanos),
-                window_end_time_nanos: Some(event_time_nanos),
-                emit_time_nanos: Some(emit_time_nanos),
-                time_format: Some(self.output_config().time_format.as_str()),
-            };
             // Plan fields and precomputed specs are index-aligned; iterate
             // both at once — no per-field name clone or type-map lookup.
             self.plan
@@ -160,6 +273,52 @@ impl RuleExecutor {
             machine_id,
             scope_key: Arc::clone(&statics.rule_name),
         }))
+    }
+
+    /// The `YieldMeta` for an `on each` output — shared by the record path
+    /// ([`Self::build_each_alert`]) and the direct-write path
+    /// ([`Self::execute_each_direct`]) so both evaluate yield expressions
+    /// against identical meta values.
+    #[allow(clippy::too_many_arguments)]
+    fn each_yield_meta<'a>(
+        &'a self,
+        wfx_id: &'a str,
+        fired_at: &'a str,
+        emit_time: &'a Arc<str>,
+        summary: &'a Arc<str>,
+        score: f64,
+        entity_id: &'a str,
+        origin: &'a AlertOrigin,
+        event_time_nanos: i64,
+        emit_time_nanos: i64,
+    ) -> YieldMeta<'a> {
+        YieldMeta {
+            score: Some(score),
+            wfx_id: Some(wfx_id),
+            rule_name: Some(&self.plan.name),
+            entity_type: Some(&self.plan.entity_plan.entity_type),
+            entity_id: Some(entity_id),
+            origin: Some(origin.as_str()),
+            close_reason: Some(""),
+            fired_at: Some(fired_at),
+            emit_time: Some(&**emit_time),
+            summary: Some(&**summary),
+            event_first_time_nanos: Some(event_time_nanos),
+            event_last_time_nanos: Some(event_time_nanos),
+            window_start_time_nanos: Some(event_time_nanos),
+            window_end_time_nanos: Some(event_time_nanos),
+            emit_time_nanos: Some(emit_time_nanos),
+            time_format: Some(self.output_config().time_format.as_str()),
+        }
+    }
+
+    /// Machine id of an event, as carried by `OutputRecord::machine_id` on
+    /// the on-each path. Exposed for the runtime's sampled per-alert
+    /// telemetry on the direct-write path (which no longer materializes the
+    /// record); extracting only on the 1-in-N sample avoids the per-event
+    /// `String` clone.
+    pub fn machine_id_of(event: &Event) -> String {
+        CepStateMachine::extract_event_str(event, MACHINE_ID)
     }
 }
 

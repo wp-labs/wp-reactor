@@ -44,6 +44,12 @@ pub(crate) struct OutputStatic {
     /// `on each` constant summary — scope key and step data are always empty
     /// on that path, so the whole summary string is a plan constant.
     pub(crate) each_summary: Option<Arc<str>>,
+    /// `on each` constant origin string (`"event"`) — direct-write emit
+    /// (plan C2) shares this `Arc` instead of copying per record.
+    pub(crate) each_origin: Arc<str>,
+    /// `on each` constant close reason (`""` — the event origin never has a
+    /// close reason).
+    pub(crate) each_close_reason: Arc<str>,
 }
 
 /// Evaluates score/entity expressions from a [`RulePlan`] and produces
@@ -175,6 +181,8 @@ impl RuleExecutor {
                 yield_specs: Arc::from(yield_specs),
                 yield_field_types: Arc::from(typed_fields),
                 each_summary,
+                each_origin: Arc::from(AlertOrigin::Event.as_str()),
+                each_close_reason: Arc::from(""),
             },
             plan,
             yield_field_types: options.yield_field_types,
@@ -202,6 +210,13 @@ impl RuleExecutor {
     /// Precomputed plan-level output constants (see [`OutputStatic`]).
     pub(crate) fn output_static(&self) -> &OutputStatic {
         &self.output_static
+    }
+
+    /// Plan-constant yield target as the precomputed `Arc` — used by the
+    /// runtime's direct-write on-each emit (plan C2) to locate the columnar
+    /// builder without re-deriving or re-allocating the target string.
+    pub fn static_yield_target(&self) -> &Arc<str> {
+        &self.output_static().yield_target
     }
 
     pub(crate) fn output_config(&self) -> &OutputConfig {

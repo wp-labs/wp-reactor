@@ -25,8 +25,10 @@ use std::sync::Arc;
 
 use orion_error::conversion::ToStructError;
 use wp_model_core::model::{DataRecord, DataType, Field, FieldStorage, Value as ModelValue};
+use wf_lang::FieldType;
 
 use crate::error::{CoreReason, CoreResult};
+use crate::match_engine::Value;
 
 use super::types::{OutputRecord, WFU_PREFIX};
 use super::types as alert_types;
@@ -149,6 +151,25 @@ impl AlertColumnBatch {
     }
 }
 
+/// System-field values for one `on each` row on the direct-write path
+/// ([`AlertColumnBuilder::commit_each_row`]). The `&Arc<str>` borrows are
+/// plan constants (`OutputStatic`) or batch-shared (`emit_time`); the owned
+/// `String`s are the per-record values whose `Arc` conversion happens once
+/// at commit (instead of a `String` build followed by a second copy, as the
+/// record-based path paid).
+pub struct EachRowCells<'a> {
+    pub wfx_id: String,
+    pub score: f64,
+    pub entity_id: String,
+    pub fired_at: String,
+    pub rule_name: &'a Arc<str>,
+    pub entity_type: &'a Arc<str>,
+    pub origin: &'a Arc<str>,
+    pub close_reason: &'a Arc<str>,
+    pub emit_time: &'a Arc<str>,
+    pub summary: &'a Arc<str>,
+}
+
 /// Accumulates records into columns for one yield target; `finish()` produces
 /// the immutable batch handed to the sink channel.
 pub struct AlertColumnBuilder {
@@ -176,6 +197,11 @@ pub struct AlertColumnBuilder {
     /// Scratch buffer for the fallible yield-conversion pass, reused across
     /// appends (one allocation per builder instead of per record).
     scratch: Vec<(usize, DataType, ModelValue)>,
+    /// Staging buffer for the C2 direct-write path (`begin_row` /
+    /// `stage_yield_cell` / `commit_each_row`): converted yield cells of the
+    /// row currently being built. Kept separate from `scratch` so the
+    /// record-based `append_record` path stays independent.
+    staged: Vec<(usize, DataType, ModelValue)>,
 }
 
 impl AlertColumnBuilder {
@@ -196,6 +222,7 @@ impl AlertColumnBuilder {
             yield_cols: Vec::new(),
             layout_cache: Vec::new(),
             scratch: Vec::new(),
+            staged: Vec::new(),
         }
     }
 
@@ -244,10 +271,9 @@ impl AlertColumnBuilder {
             col.metas.push(meta);
             col.values.push(value);
         }
-        debug_assert!(self
-            .yield_cols
-            .iter()
-            .all(|col| col.values.len() == self.len + 1));
+        // Optional fields omitted by this record leave their columns one
+        // cell short — backfill a gap cell so columns stay row-aligned.
+        self.fill_row_gaps();
         self.len += 1;
         self.scratch = scratch;
         Ok(())
@@ -334,6 +360,131 @@ impl AlertColumnBuilder {
             scratch.push((col_idx, meta, model_value));
         }
         Ok(())
+    }
+
+    // -- C2 direct-write staging API --------------------------------------
+
+    /// Begin staging a new row for the on-each direct path: clears the cells
+    /// staged for the previous row (e.g. after a mid-row error).
+    pub fn begin_row(&mut self) {
+        self.staged.clear();
+    }
+
+    /// Stage one yield cell for the row being built (fallible: reserved-name
+    /// validation, duplicate detection and typed conversion — identical rules
+    /// to `append_record`). `field_type` is the plan-side spec of this field
+    /// (from `output_static().yield_specs`), so no type lookup happens here.
+    ///
+    /// Column resolution uses the layout cache: the plan field names are
+    /// `Arc` clones of the same slots on every record, so the common case is
+    /// one pointer comparison per field. The slow path resolves by name and
+    /// refreshes the cache entry at this row position.
+    pub fn stage_yield_cell(
+        &mut self,
+        name: &Arc<str>,
+        field_type: Option<&FieldType>,
+        value: &Value,
+    ) -> CoreResult<()> {
+        let pos = self.staged.len();
+        // Fast path: same plan slot as the last row at this position.
+        if let Some((cached_name, col_idx, _cached_ft)) = self.layout_cache.get(pos) {
+            if Arc::ptr_eq(cached_name, name) {
+                let (meta, model_value) =
+                    alert_types::export_yield_value(value, field_type)?;
+                self.staged.push((*col_idx, meta, model_value));
+                return Ok(());
+            }
+        }
+        // Slow path: validate, resolve the column, refresh the cache entry.
+        if name.starts_with(WFU_PREFIX) {
+            return CoreReason::DataFormat
+                .to_err()
+                .with_detail(format!(
+                    "yield field {name:?} uses reserved prefix {WFU_PREFIX}"
+                ))
+                .err();
+        }
+        let col_idx = match self.yield_cols.iter().position(|c| c.name == *name) {
+            Some(i) => i,
+            None => {
+                self.yield_cols.push(YieldCol {
+                    name: Arc::clone(name),
+                    metas: Vec::new(),
+                    values: Vec::new(),
+                });
+                let col = self.yield_cols.last_mut().unwrap();
+                // Backfill rows that predate this column so every column
+                // stays row-aligned (sparse cells read back as Ignore).
+                for _ in 0..self.len {
+                    col.metas.push(DataType::Ignore);
+                    col.values.push(ModelValue::Null);
+                }
+                self.yield_cols.len() - 1
+            }
+        };
+        // Duplicate within this row: equal names resolve to the same column,
+        // so a repeated column index among the staged cells is the duplicate.
+        if self.staged.iter().any(|(ci, _, _)| *ci == col_idx) {
+            return CoreReason::DataFormat
+                .to_err()
+                .with_detail(format!("duplicate exported field {name:?}"))
+                .err();
+        }
+        let (meta, model_value) = alert_types::export_yield_value(value, field_type)?;
+        let cache_entry = (Arc::clone(name), col_idx, field_type.cloned());
+        if pos < self.layout_cache.len() {
+            self.layout_cache[pos] = cache_entry;
+        } else {
+            self.layout_cache.push(cache_entry);
+        }
+        self.staged.push((col_idx, meta, model_value));
+        Ok(())
+    }
+
+    /// Commit the staged row with the system fields (infallible column
+    /// pushes; all fallible work happened in `stage_yield_cell`).
+    ///
+    /// `origin` / `close_reason` are plan constants on the `on each` path
+    /// (`"event"` / `""`) — pass the precomputed `Arc`s from `OutputStatic`
+    /// so no per-record string copy happens for them.
+    pub fn commit_each_row(&mut self, cells: EachRowCells<'_>) {
+        self.wfx_id.push(Arc::from(cells.wfx_id));
+        self.rule_name.push(Arc::clone(cells.rule_name));
+        self.score.push(cells.score);
+        self.entity_type.push(Arc::clone(cells.entity_type));
+        self.entity_id.push(Arc::from(cells.entity_id));
+        self.origin.push(Arc::clone(cells.origin));
+        self.close_reason.push(Arc::clone(cells.close_reason));
+        self.fired_at.push(Arc::from(cells.fired_at));
+        self.emit_time.push(Arc::clone(cells.emit_time));
+        self.summary.push(Arc::clone(cells.summary));
+        for (col_idx, meta, value) in self.staged.drain(..) {
+            let col = &mut self.yield_cols[col_idx];
+            col.metas.push(meta);
+            col.values.push(value);
+        }
+        self.fill_row_gaps();
+        self.len += 1;
+    }
+
+    /// Fill gap cells for yield columns that received no staged cell this
+    /// row (optional input field missing → field omitted, wp-labs#62). Every
+    /// column must stay row-aligned; gap cells read back as `(Ignore, Null)`.
+    ///
+    /// This also repairs the record-based `append_record` path, which had
+    /// the same latent misalignment when a later record omitted a field an
+    /// earlier record had yielded (caught by the C2 equivalence test).
+    fn fill_row_gaps(&mut self) {
+        for col in &mut self.yield_cols {
+            if col.values.len() == self.len {
+                col.metas.push(DataType::Ignore);
+                col.values.push(ModelValue::Null);
+            }
+        }
+        debug_assert!(self
+            .yield_cols
+            .iter()
+            .all(|col| col.values.len() == self.len + 1));
     }
 
     /// Seal the builder into an immutable batch. The builder is left empty
@@ -485,5 +636,160 @@ mod tests {
             .unwrap();
         let _ = builder.finish();
         assert!(builder.is_empty());
+    }
+
+    fn commit_staged(
+        builder: &mut AlertColumnBuilder,
+        wfx_id: &str,
+        entity_id: &str,
+        fired_at: &str,
+    ) {
+        builder.commit_each_row(EachRowCells {
+            wfx_id: wfx_id.to_string(),
+            score: 42.5,
+            entity_id: entity_id.to_string(),
+            fired_at: fired_at.to_string(),
+            rule_name: &Arc::from("q1_pass"),
+            entity_type: &Arc::from("ip"),
+            origin: &Arc::from("event"),
+            close_reason: &Arc::from(""),
+            emit_time: &Arc::from("2026-08-16T00:00:01Z"),
+            summary: &Arc::from("summary text"),
+        });
+    }
+
+    #[test]
+    fn staged_rows_match_record_appended_rows() {
+        // Same three records through both paths must yield identical
+        // DataRecord row views (system fields included).
+        let rows_spec = [
+            ("a1b2c3d4e5f60718", "10.0.0.1", "2026-08-16T00:00:00Z"),
+            ("b2c3d4e5f60718a1", "10.0.0.2", "2026-08-16T00:00:01Z"),
+            ("c3d4e5f60718a1b2", "10.0.0.3", "2026-08-16T00:00:02Z"),
+        ];
+        let values = [
+            (Value::Number(1000.0), Value::Number(99.5)),
+            (Value::Number(1001.0), Value::Number(79.25)),
+            (Value::Number(1002.0), Value::Number(10.0)),
+        ];
+
+        // Record path: one OutputRecord per row, appended via append_record.
+        let mut via_records = AlertColumnBuilder::new(Arc::from("alerts"));
+        for ((wfx_id, entity_id, fired_at), vals) in rows_spec.iter().zip(values.iter()) {
+            let mut record = sample_record(vec![
+                (Arc::from("auction_id"), vals.0.clone()),
+                (Arc::from("price"), vals.1.clone()),
+            ]);
+            record.wfx_id = wfx_id.to_string();
+            record.entity_id = entity_id.to_string();
+            record.fired_at = fired_at.to_string();
+            via_records.append_record(&record).unwrap();
+        }
+
+        // Staging path (reuses one Arc per field name, like plan slots).
+        let names: [Arc<str>; 2] = [Arc::from("auction_id"), Arc::from("price")];
+        let ft = Some(FieldType::Base(wf_lang::BaseType::Float));
+        let mut via_staging = AlertColumnBuilder::new(Arc::from("alerts"));
+        for ((wfx_id, entity_id, fired_at), vals) in rows_spec.iter().zip(values.iter()) {
+            via_staging.begin_row();
+            via_staging
+                .stage_yield_cell(&names[0], ft.as_ref(), &vals.0)
+                .unwrap();
+            via_staging
+                .stage_yield_cell(&names[1], ft.as_ref(), &vals.1)
+                .unwrap();
+            commit_staged(&mut via_staging, wfx_id, entity_id, fired_at);
+        }
+
+        let record_batch = via_records.finish();
+        let staged_batch = via_staging.finish();
+        assert_eq!(record_batch.len(), staged_batch.len());
+        for row in 0..record_batch.len() {
+            let a = record_batch.iter_data_records().nth(row).unwrap().unwrap();
+            let b = staged_batch.iter_data_records().nth(row).unwrap().unwrap();
+            assert_records_equal(&a, &b);
+        }
+    }
+
+    #[test]
+    fn staged_optional_omission_creates_sparse_cells() {
+        // Row 1 omits the middle field (optional input missing, #62): the
+        // later column must backfill an Ignore/Null cell for that row.
+        let names: [Arc<str>; 3] = [
+            Arc::from("a"),
+            Arc::from("b"),
+            Arc::from("c"),
+        ];
+        let ft = Some(FieldType::Base(wf_lang::BaseType::Float));
+        let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+
+        // Row 0: a, c (b omitted).
+        builder.begin_row();
+        builder.stage_yield_cell(&names[0], ft.as_ref(), &Value::Number(1.0)).unwrap();
+        builder.stage_yield_cell(&names[2], ft.as_ref(), &Value::Number(3.0)).unwrap();
+        commit_staged(&mut builder, "id0", "e0", "t0");
+
+        // Row 1: full a, b, c.
+        builder.begin_row();
+        builder.stage_yield_cell(&names[0], ft.as_ref(), &Value::Number(4.0)).unwrap();
+        builder.stage_yield_cell(&names[1], ft.as_ref(), &Value::Number(5.0)).unwrap();
+        builder.stage_yield_cell(&names[2], ft.as_ref(), &Value::Number(6.0)).unwrap();
+        commit_staged(&mut builder, "id1", "e1", "t1");
+
+        let batch = builder.finish();
+        let rows: Vec<_> = batch.iter_data_records().collect();
+        let row0 = rows[0].as_ref().unwrap();
+        let b_cell = row0.field("b").expect("sparse cell present");
+        assert_eq!(b_cell.get_meta(), &DataType::Ignore);
+        let row1 = rows[1].as_ref().unwrap();
+        match row1.field("b").unwrap().get_value() {
+            ModelValue::Float(n) => assert_eq!(*n, 5.0),
+            other => panic!("unexpected value for b: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage_rejects_reserved_prefix_and_duplicates_and_keeps_row_clean() {
+        let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+        let bad = Arc::from("__wfu_evil");
+        builder.begin_row();
+        assert!(builder
+            .stage_yield_cell(&bad, None, &Value::Number(1.0))
+            .is_err());
+
+        let a = Arc::from("dup");
+        let a2 = Arc::from("dup");
+        builder.begin_row();
+        builder.stage_yield_cell(&a, None, &Value::Number(1.0)).unwrap();
+        // Same name again (different Arc, equal string) → duplicate error.
+        assert!(builder
+            .stage_yield_cell(&a2, None, &Value::Number(2.0))
+            .is_err());
+        assert_eq!(builder.len(), 0, "failed rows must not touch columns");
+    }
+
+    #[test]
+    fn failed_staging_then_successful_row_is_consistent() {
+        // A row that errors mid-staging leaves no partial state; the next
+        // row commits cleanly.
+        let n = Arc::from("x");
+        let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+        builder.begin_row();
+        builder.stage_yield_cell(&n, None, &Value::Number(1.0)).unwrap();
+        let bad = Arc::from("__wfu_bad");
+        assert!(builder
+            .stage_yield_cell(&bad, None, &Value::Number(2.0))
+            .is_err());
+        // begin_row clears the staged cells; commit must still be balanced.
+        builder.begin_row();
+        builder.stage_yield_cell(&n, None, &Value::Number(3.0)).unwrap();
+        commit_staged(&mut builder, "id", "e", "t");
+        let batch = builder.finish();
+        assert_eq!(batch.len(), 1);
+        let row = batch.iter_data_records().next().unwrap().unwrap();
+        match row.field("x").unwrap().get_value() {
+            ModelValue::Float(n) => assert_eq!(*n, 3.0),
+            other => panic!("unexpected value for x: {other:?}"),
+        }
     }
 }
