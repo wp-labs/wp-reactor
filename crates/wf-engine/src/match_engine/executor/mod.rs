@@ -199,10 +199,6 @@ impl RuleExecutor {
         &self.plan
     }
 
-    pub(crate) fn yield_field_type(&self, name: &str) -> Option<&FieldType> {
-        self.yield_field_types.get(name)
-    }
-
     /// Precomputed plan-level output constants (see [`OutputStatic`]).
     pub(crate) fn output_static(&self) -> &OutputStatic {
         &self.output_static
@@ -221,21 +217,6 @@ impl RuleExecutor {
         value: Value,
     ) -> CoreResult<Option<Value>> {
         let Some(field_type) = field_type else {
-            return Ok(Some(value));
-        };
-        coerce_yield_value(name, field_type, value)
-    }
-
-    /// Coerce a yield field value against its target type. Returns `Ok(None)`
-    /// when the field should be omitted from the output (an optional input
-    /// field that was missing at evaluation time), `Ok(Some(v))` on success,
-    /// and `Err` on genuine type/format errors.
-    pub(crate) fn coerce_yield_field_value(
-        &self,
-        name: &str,
-        value: Value,
-    ) -> CoreResult<Option<Value>> {
-        let Some(field_type) = self.yield_field_type(name) else {
             return Ok(Some(value));
         };
         coerce_yield_value(name, field_type, value)
