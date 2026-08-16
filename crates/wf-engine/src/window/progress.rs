@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
 /// Consumption progress for one window, shared between rule tasks and the
 /// evictor.
@@ -10,16 +10,23 @@ use std::sync::{Arc, RwLock};
 /// time-based eviction may only remove batches every live consumer has
 /// acknowledged, so a slow rule can never lose unconsumed data to a sweep.
 ///
-/// Windows with no registered consumers report `u64::MAX` (everything is
-/// evictable by time). A task going away must release its slot as "done"
-/// (see [`WindowProgress::release`]); `RuleTask`'s Drop does this so a
-/// shutdown task cannot pin window memory forever.
+/// Slots are held as [`Weak`] handles: a task going away drops its last
+/// strong reference and the slot stops counting automatically — hot reload
+/// replaces rule tasks wholesale, and strong references would accumulate
+/// dead slots (each only pinned to `u64::MAX`) on every reload cycle.
+/// Dead entries are swept lazily on `register`/`min_acked` (amortized O(1)
+/// per call, no background task).
+///
+/// Windows with no live consumers report `u64::MAX` (everything is
+/// evictable by time). [`WindowProgress::release`] exists as an explicit
+/// belt-and-braces for graceful shutdown paths that want the slot
+/// deactivated before the task struct itself drops.
 ///
 /// Memory-pressure eviction (`Evictor` phase 2) deliberately ignores this
 /// floor — it is the explicit lossy backstop when the global byte cap is
 /// exceeded.
 pub struct WindowProgress {
-    slots: RwLock<Vec<Arc<AtomicU64>>>,
+    slots: RwLock<Vec<Weak<AtomicU64>>>,
 }
 
 impl WindowProgress {
@@ -29,22 +36,28 @@ impl WindowProgress {
         }
     }
 
-    /// Register a new consumer slot, starting at 0 (nothing acked).
+    /// Register a new consumer slot, starting at 0 (nothing acked). Sweeps
+    /// slots whose consumers have gone away while holding the write lock.
     pub fn register(&self) -> Arc<AtomicU64> {
         let slot = Arc::new(AtomicU64::new(0));
-        self.slots.write().expect("progress lock poisoned").push(Arc::clone(&slot));
+        let mut slots = self.slots.write().expect("progress lock poisoned");
+        // Amortized sweep: drop Weak entries whose consumers are gone so the
+        // table does not grow across reload cycles.
+        slots.retain(|w| w.strong_count() > 0);
+        slots.push(Arc::downgrade(&slot));
         slot
     }
 
     /// Minimum acked position over all live consumers.
     ///
-    /// `u64::MAX` when no consumer is registered: a window nobody reads is
+    /// `u64::MAX` when no consumer is alive: a window nobody reads is
     /// fully evictable by time.
     pub fn min_acked(&self) -> u64 {
         self.slots
             .read()
             .expect("progress lock poisoned")
             .iter()
+            .filter_map(|w| w.upgrade())
             .map(|slot| slot.load(Ordering::Acquire))
             .min()
             .unwrap_or(u64::MAX)
@@ -52,8 +65,9 @@ impl WindowProgress {
 
     /// Detach a consumer slot by marking it fully consumed.
     ///
-    /// Called when a rule task goes away (Drop); the slot is kept in the
-    /// table (cheap) but no longer holds the floor down.
+    /// Optional: the slot also stops counting once the task drops its last
+    /// strong reference (the table holds only a `Weak`). Kept for shutdown
+    /// paths that release explicitly before the task struct goes away.
     pub fn release(slot: &Arc<AtomicU64>) {
         slot.fetch_max(u64::MAX, Ordering::AcqRel);
     }
@@ -92,5 +106,46 @@ mod tests {
 
         WindowProgress::release(&a);
         assert_eq!(progress.min_acked(), u64::MAX);
+    }
+
+    /// Reload cycles must not accumulate slots: registering N consumers,
+    /// dropping them all, and registering one more leaves exactly one live
+    /// slot in the table (dead Weak entries swept on register).
+    #[test]
+    fn dead_slots_do_not_accumulate_across_reload_cycles() {
+        let progress = WindowProgress::new();
+        for _ in 0..100 {
+            let slot = progress.register();
+            slot.store(7, Ordering::Release);
+            drop(slot);
+        }
+        let live = progress.register();
+        live.store(5, Ordering::Release);
+
+        let table_len = progress.slots.read().unwrap().len();
+        assert_eq!(
+            table_len, 1,
+            "sweep on register must drop dead entries, got {table_len}"
+        );
+        assert_eq!(progress.min_acked(), 5);
+    }
+
+    /// A dropped consumer stops gating eviction even without `release`:
+    /// the Weak table must not see it anymore.
+    #[test]
+    fn dropped_consumer_stops_counting_without_release() {
+        let progress = WindowProgress::new();
+        let slow = progress.register();
+        slow.store(1, Ordering::Release);
+        let fast = progress.register();
+        fast.store(42, Ordering::Release);
+        assert_eq!(progress.min_acked(), 1);
+
+        drop(slow);
+        assert_eq!(
+            progress.min_acked(),
+            42,
+            "dropped consumer's slot must not hold the floor"
+        );
     }
 }

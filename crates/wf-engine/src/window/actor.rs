@@ -167,14 +167,24 @@ pub async fn run_window_actor(
                                 *cursor += 1;
                             }
                         } else {
-                            // Future seq for this source: park it (gap or
-                            // cross-source interleaving); keep dequeuing.
                             if seq < *cursor {
+                                // Stale (already-processed) seq: a duplicate
+                                // delivery, reachable only via the hot-add
+                                // fallback seq in `dispatch_parsed`. Parking
+                                // it would strand the message in `pending`
+                                // forever — the cursor has moved past it, so
+                                // no drain path can ever flush it (a pure
+                                // memory leak). Drop it; dropping also
+                                // releases its budget permits.
                                 log::warn!(
-                                    "window actor {:?}: stale seq {} <= cursor {} (source {:?})",
+                                    "window actor {:?}: dropping stale seq {} <= cursor {} (source {:?})",
                                     name, seq, cursor, source
                                 );
+                                drop(m);
+                                continue;
                             }
+                            // Future seq for this source: park it (gap or
+                            // cross-source interleaving); keep dequeuing.
                             // Release the parked message's budget permits
                             // *before* parking: parse workers dispatch
                             // concurrently, so arrival order is not seq
@@ -206,11 +216,14 @@ pub async fn run_window_actor(
         for source in sources {
             let cursor = next_seq.entry(Arc::clone(&source)).or_insert(0);
             if let Some(first) = pending.range((Arc::clone(&source), 0)..).next() {
-                let first_seq = first.0 .1;
+                let first_seq = first.0.1;
                 if first_seq != *cursor {
                     log::warn!(
                         "window actor {:?}: source {:?} sequence gap at shutdown: next={}, first_pending={}",
-                        name, source, cursor, first_seq
+                        name,
+                        source,
+                        cursor,
+                        first_seq
                     );
                 }
             }
@@ -247,9 +260,16 @@ async fn commit_append(
         permits: _,
     } = msg;
     let rows = batch.num_rows();
-    let result =
-        super::commit::commit_appended_batch(win, fanout, Some(notify), name, batch, events, byte_size)
-            .await;
+    let result = super::commit::commit_appended_batch(
+        win,
+        fanout,
+        Some(notify),
+        name,
+        batch,
+        events,
+        byte_size,
+    )
+    .await;
     match result {
         Ok((AppendOutcome::Appended, _)) => {
             if let Some(report) = report {
@@ -349,9 +369,7 @@ mod tests {
             .collect()
     }
 
-    async fn spawn_actor(
-        win: Arc<Window>,
-    ) -> (mpsc::Sender<WindowMsg>, CancellationToken) {
+    async fn spawn_actor(win: Arc<Window>) -> (mpsc::Sender<WindowMsg>, CancellationToken) {
         let (tx, rx) = mpsc::channel::<WindowMsg>(WINDOW_CHANNEL_DEPTH);
         let cancel = CancellationToken::new();
         let name: Arc<str> = Arc::from("w");
@@ -416,6 +434,43 @@ mod tests {
     }
 
     // -- 3. independent per-source cursors -------------------------------------
+
+    /// Stale (already-processed) seq must be dropped, not parked: parking a
+    /// duplicate would strand it in `pending` forever (the cursor has moved
+    /// past it, no drain path can flush it) — a pure leak. The duplicate must
+    /// also not append a second time.
+    #[tokio::test]
+    async fn stale_seq_is_dropped_not_parked() {
+        let win = make_window("w");
+        let (tx, _cancel) = spawn_actor(Arc::clone(&win)).await;
+
+        tx.send(msg("s", 0, 10_000_000_000, 0)).await.unwrap();
+        for _ in 0..50 {
+            if win.total_rows() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(win.total_rows(), 1);
+
+        // Duplicate seq 0 arrives after the cursor advanced to 1.
+        tx.send(msg("s", 0, 10_000_000_000, 99)).await.unwrap();
+        // A later in-order batch must still flow through (the stale entry
+        // must not clog the reorder path).
+        tx.send(msg("s", 1, 20_000_000_000, 1)).await.unwrap();
+
+        for _ in 0..50 {
+            if win.total_rows() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            appended_values(&win),
+            vec![0, 1],
+            "duplicate dropped, order kept"
+        );
+    }
 
     #[tokio::test]
     async fn two_sources_reorder_independently() {
@@ -522,7 +577,11 @@ mod tests {
 
         // seq=1 arrives first and exhausts the whole budget; it must park
         // and give the permits back without waiting for seq=0.
-        let permits = budget.clone().acquire_many_owned(capacity as u32).await.unwrap();
+        let permits = budget
+            .clone()
+            .acquire_many_owned(capacity as u32)
+            .await
+            .unwrap();
         tx.send(WindowMsg::Append {
             source: Arc::from("s"),
             seq: 1,
@@ -621,14 +680,11 @@ mod tests {
                 .unwrap();
         }
 
-        let deadline = tokio::time::timeout(
-            Duration::from_millis(500),
-            async {
-                while win.total_rows() < 3 {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            },
-        )
+        let deadline = tokio::time::timeout(Duration::from_millis(500), async {
+            while win.total_rows() < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
         .await;
         assert!(
             deadline.is_ok(),

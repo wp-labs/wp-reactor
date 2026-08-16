@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use std::task::{Context, Poll};
 
 use tokio::sync::mpsc;
 use wf_lang::ast::FieldRef;
@@ -127,11 +130,7 @@ impl RuleFanout {
     /// worker — zero per-event partitioning cost, zero copies. This is only
     /// correct for stateless consumers (no cross-event rule state): event
     /// ordering across batches is no longer preserved.
-    pub fn register_round_robin(
-        &self,
-        window_name: &str,
-        shards: Vec<mpsc::Sender<RulePush>>,
-    ) {
+    pub fn register_round_robin(&self, window_name: &str, shards: Vec<mpsc::Sender<RulePush>>) {
         debug_assert!(!shards.is_empty());
         let mut table = self.table.write().expect("fanout lock poisoned");
         table
@@ -154,54 +153,60 @@ impl RuleFanout {
     ///
     /// Slow-consumer semantics: each rule's *compute* is independent (own
     /// channel, shared `Arc` batches — a fast rule is not slowed by a slow
-    /// one), but two things are gated by the slowest subscriber: (a) the
+    /// one), and two things are gated by the slowest subscriber: (a) the
     /// window's eviction floor (`WindowProgress::min_acked`, so retained
-    /// memory waits for the slowest rule) and (b) this broadcast loop itself —
-    /// sends are awaited sequentially in registration order, so a full channel
-    /// head-of-line blocks the sends to later subscriptions (and with them the
-    /// window actor's appends) until it drains.
+    /// memory waits for the slowest rule) and (b) this broadcast itself — a
+    /// full channel blocks the batch's completion (and with it the window
+    /// actor's next append) until it drains. Sends to *independent*
+    /// subscriptions run concurrently, though, so one full channel only
+    /// backpressures its own stream, never the deliveries to the other
+    /// subscribers (P1-② head-of-line fix). Per-channel FIFO is unaffected:
+    /// each channel receives from exactly one send future per broadcast, and
+    /// broadcasts themselves are serialized by the single-writer commit path.
     pub async fn broadcast(&self, window_name: &str, events: &Arc<Vec<Arc<Event>>>, seq: u64) {
         let subs: Vec<Subscription> = {
             let table = self.table.read().expect("fanout lock poisoned");
             table.get(window_name).cloned().unwrap_or_default()
         };
+        if subs.is_empty() {
+            return;
+        }
+        // One shared allocation per broadcast (not per subscription × shard).
+        let window_name: Arc<str> = window_name.into();
 
-        let mut any_closed = false;
+        let mut sends: Vec<Pin<Box<dyn Future<Output = bool> + Send>>> = Vec::new();
         for sub in &subs {
             match sub {
                 Subscription::Single(tx) => {
                     let push = RulePush {
-                        window_name: window_name.into(),
+                        window_name: Arc::clone(&window_name),
                         events: Arc::clone(events),
                         seq,
                     };
-                    if tx.send(push).await.is_err() {
-                        any_closed = true;
-                    }
+                    let tx = tx.clone();
+                    sends.push(Box::pin(async move { tx.send(push).await.is_err() }));
                 }
                 Subscription::Sharded { shards, keys } => {
-                    if broadcast_sharded(shards, keys, window_name, events, seq).await {
-                        any_closed = true;
-                    }
+                    sharded_sends(shards, keys, &window_name, events, seq, &mut sends);
                 }
                 Subscription::RoundRobin { shards, next } => {
                     let n = shards.len();
                     let idx = next.fetch_add(1, Ordering::Relaxed) % n;
                     let push = RulePush {
-                        window_name: window_name.into(),
+                        window_name: Arc::clone(&window_name),
                         events: Arc::clone(events),
                         seq,
                     };
-                    if shards[idx].send(push).await.is_err() {
-                        any_closed = true;
-                    }
+                    let tx = shards[idx].clone();
+                    sends.push(Box::pin(async move { tx.send(push).await.is_err() }));
                 }
             }
         }
 
+        let any_closed = join_sends(sends).await;
         if any_closed {
             let mut table = self.table.write().expect("fanout lock poisoned");
-            if let Some(subs) = table.get_mut(window_name) {
+            if let Some(subs) = table.get_mut(window_name.as_ref()) {
                 for sub in subs.iter_mut() {
                     match sub {
                         Subscription::Single(tx) => {
@@ -222,23 +227,52 @@ impl RuleFanout {
                     Subscription::RoundRobin { shards, .. } => !shards.is_empty(),
                 });
                 if subs.is_empty() {
-                    table.remove(window_name);
+                    table.remove(window_name.as_ref());
                 }
             }
         }
     }
 }
 
-/// Partition a batch by match key and send each sub-batch to its shard.
-/// Returns `true` if any shard channel was closed. Awaits full shard channels
+/// Poll every send future to completion, concurrently (each gets polled on
+/// every wake; none waits for an earlier one to finish). Returns whether any
+/// channel was closed. Hand-rolled instead of pulling in `futures` — this is
+/// the only combinator needed.
+async fn join_sends(mut sends: Vec<Pin<Box<dyn Future<Output = bool> + Send>>>) -> bool {
+    let mut any_closed = false;
+    if sends.is_empty() {
+        return any_closed;
+    }
+    std::future::poll_fn(move |cx: &mut Context<'_>| {
+        let mut still: Vec<Pin<Box<dyn Future<Output = bool> + Send>>> =
+            Vec::with_capacity(sends.len());
+        for mut fut in sends.drain(..) {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(closed) => any_closed |= closed,
+                Poll::Pending => still.push(fut),
+            }
+        }
+        sends = still;
+        if sends.is_empty() {
+            Poll::Ready(any_closed)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+/// Partition a batch by match key and push one send future per non-empty
+/// shard into `sends`. Awaits full shard channels via the caller's join
 /// (backpressure).
-async fn broadcast_sharded(
+fn sharded_sends(
     shards: &[mpsc::Sender<RulePush>],
     keys: &[FieldRef],
-    window_name: &str,
+    window_name: &Arc<str>,
     events: &Arc<Vec<Arc<Event>>>,
     seq: u64,
-) -> bool {
+    sends: &mut Vec<Pin<Box<dyn Future<Output = bool> + Send>>>,
+) {
     let n = shards.len();
     let mut sub_batches: Vec<Vec<Arc<Event>>> = (0..n).map(|_| Vec::new()).collect();
     for event in events.iter() {
@@ -249,21 +283,18 @@ async fn broadcast_sharded(
         sub_batches[idx].push(Arc::clone(event));
     }
 
-    let mut any_closed = false;
     for (i, sub) in sub_batches.into_iter().enumerate() {
         if sub.is_empty() {
             continue;
         }
         let push = RulePush {
-            window_name: window_name.into(),
+            window_name: Arc::clone(window_name),
             events: Arc::new(sub),
             seq,
         };
-        if shards[i].send(push).await.is_err() {
-            any_closed = true;
-        }
+        let tx = shards[i].clone();
+        sends.push(Box::pin(async move { tx.send(push).await.is_err() }));
     }
-    any_closed
 }
 
 #[cfg(test)]
@@ -290,9 +321,14 @@ mod tests {
         let events: Arc<Vec<Arc<Event>>> = Arc::new(Vec::new());
         fanout.broadcast("win_a", &events, 0).await;
 
-        let push = rx.try_recv().expect("registered channel should receive a push");
+        let push = rx
+            .try_recv()
+            .expect("registered channel should receive a push");
         assert_eq!(&*push.window_name, "win_a");
-        assert!(Arc::ptr_eq(&push.events, &events), "should share the same Arc");
+        assert!(
+            Arc::ptr_eq(&push.events, &events),
+            "should share the same Arc"
+        );
     }
 
     #[tokio::test]
@@ -317,11 +353,18 @@ mod tests {
         let fanout = RuleFanout::new();
         let (tx0, mut rx0) = mpsc::channel(8);
         let (tx1, mut rx1) = mpsc::channel(8);
-        fanout.register_sharded("win_a", vec![tx0, tx1], Arc::from(keys().into_boxed_slice()));
+        fanout.register_sharded(
+            "win_a",
+            vec![tx0, tx1],
+            Arc::from(keys().into_boxed_slice()),
+        );
 
         // Two distinct keys; each should land on a single (deterministic) shard.
-        let events: Arc<Vec<Arc<Event>>> =
-            Arc::new(vec![Arc::new(event("k1")), Arc::new(event("k2")), Arc::new(event("k1"))]);
+        let events: Arc<Vec<Arc<Event>>> = Arc::new(vec![
+            Arc::new(event("k1")),
+            Arc::new(event("k2")),
+            Arc::new(event("k1")),
+        ]);
         fanout.broadcast("win_a", &events, 0).await;
 
         let mut received = Vec::new();
@@ -388,8 +431,10 @@ mod tests {
         // Arc) to alternating workers with no loss / no duplication.
         let mut sent = Vec::new();
         for i in 0..4 {
-            let events: Arc<Vec<Arc<Event>>> =
-                Arc::new(vec![Arc::new(event(&format!("e{i}a"))), Arc::new(event(&format!("e{i}b")))]);
+            let events: Arc<Vec<Arc<Event>>> = Arc::new(vec![
+                Arc::new(event(&format!("e{i}a"))),
+                Arc::new(event(&format!("e{i}b"))),
+            ]);
             sent.push(Arc::clone(&events));
             fanout.broadcast("win_rr", &events, 0).await;
         }
@@ -445,5 +490,90 @@ mod tests {
             !subs.is_empty(),
             "subscription with one open shard must not be pruned entirely"
         );
+    }
+
+    /// P1-② regression: a full (slow-consumer) channel must not head-of-line
+    /// block the deliveries to the *other* subscriptions of the same window.
+    /// The sends run concurrently, so the fast subscriber receives its copy
+    /// immediately even while the slow one's send is still parked.
+    #[tokio::test]
+    async fn slow_consumer_does_not_block_other_subscribers() {
+        let fanout = RuleFanout::new();
+        // Slow consumer: capacity 1, never recv'd → its send parks after the
+        // first broadcast fills the channel.
+        let (slow_tx, _slow_rx_keep) = mpsc::channel::<RulePush>(1);
+        // Fast consumer: capacity 8, drained immediately.
+        let (fast_tx, mut fast_rx) = mpsc::channel::<RulePush>(8);
+        fanout.register("win_hol", slow_tx);
+        fanout.register("win_hol", fast_tx);
+
+        let events: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(event("e1"))]);
+        fanout.broadcast("win_hol", &events, 0).await;
+
+        // Second broadcast: the slow channel is full and would block a serial
+        // send loop before the fast subscriber's delivery. Drive the
+        // broadcast future concurrently with the fast recv — the broadcast
+        // stays parked on the slow channel, the fast delivery must not wait.
+        let events2: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(event("e2"))]);
+        let broadcast = fanout.broadcast("win_hol", &events2, 1);
+        tokio::pin!(broadcast);
+        let got = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            tokio::select! {
+                biased;
+                r = fast_rx.recv() => r,
+                // If the broadcast ever completes while the slow channel is
+                // still full and undrained, something is wrong; ignore and
+                // let the outer timeout fail the test.
+                _ = &mut broadcast => fast_rx.try_recv().ok(),
+            }
+        })
+        .await
+        .expect("fast subscriber must receive within timeout")
+        .expect("fast channel open");
+        assert_eq!(got.events.len(), 1, "fast subscriber got the second batch");
+    }
+
+    /// Same property for sharded subscriptions: a full shard must not block
+    /// the other shards' deliveries of the same broadcast.
+    #[tokio::test]
+    async fn slow_shard_does_not_block_other_shards() {
+        let fanout = RuleFanout::new();
+        let (slow_tx, _slow_rx_keep) = mpsc::channel::<RulePush>(1);
+        let (fast_tx, mut fast_rx) = mpsc::channel::<RulePush>(8);
+        // Two shards partitioned by "id"; keys k1/k2 deterministically split.
+        fanout.register_sharded(
+            "win_sh",
+            vec![slow_tx, fast_tx],
+            Arc::from(keys().into_boxed_slice()),
+        );
+
+        let idx_k1 = shard_index(&[Value::Str("k1".into())], 2);
+        let (slow_key, fast_key) = if idx_k1 == 0 {
+            ("k1", "k2")
+        } else {
+            ("k2", "k1")
+        };
+
+        let events: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(event(slow_key))]);
+        fanout.broadcast("win_sh", &events, 0).await;
+
+        // Second broadcast: the slow shard's channel is full; the fast shard
+        // must still receive its sub-batch without waiting for it. Drive the
+        // broadcast future concurrently with the fast shard's recv.
+        let events2: Arc<Vec<Arc<Event>>> =
+            Arc::new(vec![Arc::new(event(slow_key)), Arc::new(event(fast_key))]);
+        let broadcast = fanout.broadcast("win_sh", &events2, 1);
+        tokio::pin!(broadcast);
+        let got = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            tokio::select! {
+                biased;
+                r = fast_rx.recv() => r,
+                _ = &mut broadcast => fast_rx.try_recv().ok(),
+            }
+        })
+        .await
+        .expect("fast shard must receive within timeout")
+        .expect("fast shard channel open");
+        assert_eq!(got.events.len(), 1, "fast shard got its sub-batch");
     }
 }

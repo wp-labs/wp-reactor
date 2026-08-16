@@ -226,9 +226,16 @@ impl Router {
                     };
                     let send_result = mailbox.tx.send(msg).await;
                     if send_result.is_err() {
-                        // Actor gone (shutdown). Dropping the message releases
-                        // its budget permits; remaining windows are skipped.
-                        break;
+                        // Actor gone (shutdown or panic). Dropping the message
+                        // releases its budget permits; the remaining windows
+                        // still get their own copies — one dead actor must
+                        // not silently starve unrelated windows of this batch.
+                        log::warn!(
+                            "router: window actor {:?} gone, dropping its copy of a batch ({} bytes)",
+                            window.window_name,
+                            byte_size
+                        );
+                        continue;
                     }
                 }
                 None => {
@@ -315,7 +322,11 @@ impl Router {
             // Arrow content is shared (Arc) across every window subscribed to
             // this stream, so it is charged once here; each window adds its own
             // parsed-event footprint in `route_commit`.
-            content_bytes: if windows.is_empty() { 0 } else { content_bytes(batch) },
+            content_bytes: if windows.is_empty() {
+                0
+            } else {
+                content_bytes(batch)
+            },
             windows,
             skipped_non_local,
         }
@@ -468,7 +479,8 @@ mod tests {
 
         let schema = test_schema();
         let report = router
-            .route("events", make_batch(&schema, &[10_000_000_000], &[42])).await
+            .route("events", make_batch(&schema, &[10_000_000_000], &[42]))
+            .await
             .unwrap();
 
         assert_eq!(report.delivered, 1);
@@ -494,7 +506,8 @@ mod tests {
 
         let schema = test_schema();
         let report = router
-            .route("data", make_batch(&schema, &[10_000_000_000], &[1])).await
+            .route("data", make_batch(&schema, &[10_000_000_000], &[1]))
+            .await
             .unwrap();
 
         assert_eq!(report.delivered, 0);
@@ -518,13 +531,15 @@ mod tests {
 
         // First batch at 20s → watermark = 15s, delivered.
         let r1 = router
-            .route("stream", make_batch(&schema, &[20_000_000_000], &[1])).await
+            .route("stream", make_batch(&schema, &[20_000_000_000], &[1]))
+            .await
             .unwrap();
         assert_eq!(r1.delivered, 1);
 
         // Late batch at 5s → 5s < 15s → DroppedLate.
         let r2 = router
-            .route("stream", make_batch(&schema, &[5_000_000_000], &[2])).await
+            .route("stream", make_batch(&schema, &[5_000_000_000], &[2]))
+            .await
             .unwrap();
         assert_eq!(r2.dropped_late, 1);
         assert_eq!(r2.delivered, 0);
@@ -544,7 +559,8 @@ mod tests {
 
         let schema = test_schema();
         let report = router
-            .route("unknown", make_batch(&schema, &[10_000_000_000], &[1])).await
+            .route("unknown", make_batch(&schema, &[10_000_000_000], &[1]))
+            .await
             .unwrap();
 
         assert_eq!(report.delivered, 0);
@@ -591,13 +607,11 @@ mod tests {
 
         let all_events: Vec<Arc<Event>> =
             batch_to_events(&batch).into_iter().map(Arc::new).collect();
-        let ts_events: Vec<Arc<Event>> = batch_to_events_filtered(
-            &batch,
-            &HashSet::from(["ts".to_string()]),
-        )
-        .into_iter()
-        .map(Arc::new)
-        .collect();
+        let ts_events: Vec<Arc<Event>> =
+            batch_to_events_filtered(&batch, &HashSet::from(["ts".to_string()]))
+                .into_iter()
+                .map(Arc::new)
+                .collect();
         let all_bytes = events_bytes(&all_events);
         let ts_bytes = events_bytes(&ts_events);
         assert!(
@@ -756,7 +770,7 @@ mod tests {
     /// allocate a gap-free 0,1,2,… per window even when streams interleave.
     #[test]
     fn next_window_seqs_contiguous_per_window_across_interleaved_streams() {
-        use tokio::sync::{mpsc, Semaphore};
+        use tokio::sync::{Semaphore, mpsc};
 
         use crate::window::WINDOW_CHANNEL_DEPTH;
 
@@ -805,5 +819,98 @@ mod tests {
         // A second source gets independent cursors.
         let b1 = router.next_window_seqs("other", "stream_a");
         assert_eq!(b1, vec![("win_a".to_string(), 0)]);
+    }
+
+    /// One dead window actor must not starve the other windows of a batch:
+    /// `dispatch_parsed` continues past a closed mailbox instead of aborting
+    /// the whole dispatch loop.
+    #[tokio::test]
+    async fn dispatch_continues_past_dead_actor() {
+        use tokio::sync::{Semaphore, mpsc};
+        use tokio_util::sync::CancellationToken;
+
+        use crate::window::WINDOW_CHANNEL_DEPTH;
+        use crate::window::run_window_actor;
+
+        let reg = WindowRegistry::build(vec![
+            make_def("win_dead", vec!["s"], DistMode::Local),
+            make_def("win_live", vec!["s"], DistMode::Local),
+        ])
+        .unwrap();
+        let router = Router::new(reg);
+
+        // Dead actor: mailbox registered, receiver dropped → send fails.
+        let (dead_tx, dead_rx) = mpsc::channel::<WindowMsg>(WINDOW_CHANNEL_DEPTH);
+        drop(dead_rx);
+        router.register_mailbox(
+            "win_dead",
+            WindowMailbox {
+                tx: dead_tx,
+                budget: Arc::new(Semaphore::new(1024)),
+                budget_bytes: 1024,
+            },
+        );
+        // Live actor: a real running window actor.
+        let (live_tx, live_rx) = mpsc::channel::<WindowMsg>(WINDOW_CHANNEL_DEPTH);
+        router.register_mailbox(
+            "win_live",
+            WindowMailbox {
+                tx: live_tx,
+                budget: Arc::new(Semaphore::new(1024)),
+                budget_bytes: 1024,
+            },
+        );
+        let live_win = router.registry().get_window("win_live").unwrap().clone();
+        let fanout = Arc::clone(router.fanout());
+        let name: Arc<str> = Arc::from("win_live");
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            run_window_actor(name, live_win, fanout, notify, live_rx, cancel2, None).await;
+        });
+
+        let schema = test_schema();
+        let batch = make_batch(&schema, &[10_000_000_000], &[42]);
+        let parsed = router.route_parse("s", &batch);
+        router
+            .dispatch_parsed(
+                Arc::from("src"),
+                0,
+                vec![("win_dead".to_string(), 0), ("win_live".to_string(), 0)],
+                batch,
+                parsed,
+            )
+            .await;
+
+        for _ in 0..50 {
+            if router
+                .registry()
+                .get_window("win_live")
+                .unwrap()
+                .total_rows()
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            router
+                .registry()
+                .get_window("win_live")
+                .unwrap()
+                .total_rows(),
+            1,
+            "live window must receive the batch despite the dead actor"
+        );
+        assert_eq!(
+            router
+                .registry()
+                .get_window("win_dead")
+                .unwrap()
+                .total_rows(),
+            0
+        );
     }
 }
