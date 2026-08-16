@@ -59,6 +59,12 @@ impl RuleExecutor {
         if !passes_each_filter(each_plan.filter.as_ref(), event) {
             return Ok(None);
         }
+        // Rules without joins never mutate the event — skip the per-event
+        // `fields` HashMap clone entirely (profile: the clone + its drop were
+        // ~3% of on-CPU samples on pass-through rules).
+        if self.plan.joins.is_empty() {
+            return self.build_each_alert(event, event_time_nanos, field_order, emit_time_nanos);
+        }
         let mut ctx = event.clone();
         if !execute_joins(&self.plan.joins, &mut ctx, windows, event_time_nanos) {
             return Ok(None);

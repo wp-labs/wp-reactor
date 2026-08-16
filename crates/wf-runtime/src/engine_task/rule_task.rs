@@ -155,6 +155,9 @@ pub(super) struct RuleTask {
     progress: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Countdown for sampling the allocation-heavy per-alert telemetry.
     emit_sample_remaining: AtomicU32,
+    /// Serialize-timing sampler state (1-in-`EMIT_METRIC_SAMPLE_INTERVAL`),
+    /// see `emit`.
+    serialize_sample_remaining: AtomicU32,
     /// Batched alert delivery: accumulated (yield_target, exported record)
     /// pairs flushed to the sink writers when the batch fills / at EOS. The
     /// DataRecord conversion runs on this thread by design — see [`Self::emit`].
@@ -262,6 +265,7 @@ impl RuleTask {
             last_profile_dump: std::time::Instant::now(),
             cached_wall_nanos: AtomicU64::new(wall_nanos()),
             emit_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
+            serialize_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
             pending_alerts: std::sync::Mutex::new(Vec::new()),
         };
         (task, cancel, timeout_scan_interval)
@@ -1096,7 +1100,22 @@ impl RuleTask {
         // The conversion stays on this thread on purpose: OutputRecords
         // allocated here and freed on a sink thread drive mimalloc into its
         // abandoned-page reclaim path — measured ~2x rule-throughput loss.
-        let _ser_start = Instant::now();
+        //
+        // Serialize timing is sampled 1-in-`EMIT_METRIC_SAMPLE_INTERVAL` and
+        // scaled back up (same sampling pattern as the e2e metrics): two
+        // clock_gettime calls per record measured ~2.5% of on-CPU samples,
+        // and the per-record timing only feeds diagnostics, not semantics.
+        let time_this = {
+            let rem = self.serialize_sample_remaining.fetch_sub(1, Ordering::Relaxed);
+            if rem == 1 {
+                self.serialize_sample_remaining
+                    .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        };
+        let _ser_start = time_this.then(Instant::now);
         let data = match record.to_data_record() {
             Ok(data) => Arc::new(data),
             Err(e) => {
@@ -1107,17 +1126,20 @@ impl RuleTask {
                 return;
             }
         };
-        let _ser_elapsed = _ser_start.elapsed();
-        self.serialize_nanos
-            .fetch_add(_ser_elapsed.as_nanos() as u64, Ordering::Relaxed);
-        if let Some(metrics) = &self.metrics {
-            metrics.add_alert_serialize_nanos(_ser_elapsed.as_nanos() as u64);
+        if let Some(start) = _ser_start {
+            let elapsed = start.elapsed().as_nanos() as u64;
+            let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64;
+            self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
+            if let Some(metrics) = &self.metrics {
+                metrics.add_alert_serialize_nanos(scaled);
+            }
         }
-        self.pending_alerts
-            .lock()
-            .unwrap()
-            .push((record.yield_target.clone(), data));
-        if self.pending_alerts.lock().unwrap().len() >= ALERT_BATCH_SIZE {
+        let should_flush = {
+            let mut pending = self.pending_alerts.lock().unwrap();
+            pending.push((record.yield_target.clone(), data));
+            pending.len() >= ALERT_BATCH_SIZE
+        };
+        if should_flush {
             self.flush_alerts().await;
         }
     }
