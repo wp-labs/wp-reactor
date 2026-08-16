@@ -34,6 +34,14 @@ pub struct RuntimeConfig {
     /// values below 16 MiB are clamped up.
     #[serde(default = "default_parse_buffer_bytes")]
     pub parse_buffer_bytes: usize,
+    /// Byte budget per window actor channel (subscription model): a batch
+    /// holds permits from parse-worker dispatch until the window actor
+    /// appends (or drops) it, so per-window in-flight residency is bounded
+    /// in bytes — the explicit backpressure that replaces the removed window
+    /// write lock's implicit serialization. Defaults to 64 MiB; values below
+    /// 4 MiB are clamped up.
+    #[serde(default = "default_window_buffer_bytes")]
+    pub window_buffer_bytes: usize,
     /// Glob pattern for Window Schema (.wfs) files, relative to config dir.
     pub schemas: String,
     /// Glob pattern for WFL rule (.wfl) files, relative to config dir.
@@ -46,6 +54,10 @@ fn default_parse_parallelism() -> usize {
 
 fn default_parse_buffer_bytes() -> usize {
     256 * 1024 * 1024
+}
+
+fn default_window_buffer_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 fn default_rule_parallelism() -> usize {

@@ -1,3 +1,4 @@
+mod actor;
 mod buffer;
 mod evictor;
 mod fanout;
@@ -6,6 +7,10 @@ mod progress;
 mod registry;
 mod router;
 
+pub use actor::{
+    WINDOW_CHANNEL_DEPTH, WindowAppendReport, WindowMailbox, WindowMsg, acquire_window_budget,
+    run_window_actor,
+};
 pub use buffer::{AppendOutcome, Window, WindowParams, content_bytes, events_bytes};
 pub use evictor::{EvictReport, Evictor, WindowEvictCount};
 pub use fanout::{RuleFanout, RulePush};

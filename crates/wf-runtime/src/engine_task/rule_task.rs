@@ -252,7 +252,7 @@ impl RuleTask {
         let cursors: HashMap<String, u64> = window_sources
             .iter()
             .map(|src| {
-                let seq = src.window.read().expect("lock poisoned").next_seq();
+                let seq = src.window.next_seq();
                 (src.window_name.clone(), seq)
             })
             .collect();
@@ -326,9 +326,10 @@ impl RuleTask {
         for source in &self.sources {
             let cursor = self.cursors.get(&source.window_name).copied().unwrap_or(0);
             let (events_list, new_cursor, gap) = {
-                let win = source.window.read().expect("lock poisoned");
                 // Shared parsed events: the window parses each batch once and
-                // hands every rule the same Arc (wp-reactor#19).
+                // hands every rule the same Arc (wp-reactor#19). Lock-free
+                // cursor read — no window lock involved.
+                let win = &source.window;
                 let result = win.events_since(cursor);
                 wf_debug!(pipe,
                     task_id = %self.task_id,
@@ -1432,8 +1433,7 @@ impl RuleTask {
                     );
                     return;
                 };
-                let win = win_lock.read().expect("lock poisoned");
-                (win.schema().clone(), win.time_col_index())
+                (win_lock.schema().clone(), win_lock.time_col_index())
             }
         };
         let batch = match build_pipeline_batch(

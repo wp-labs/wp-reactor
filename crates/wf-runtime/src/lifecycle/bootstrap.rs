@@ -235,9 +235,7 @@ fn configure_join_indexes(router: &Router, plans: &[wf_lang::plan::RulePlan]) {
         }
     }
     for (window, key_field) in keys_by_window {
-        if let Some(win_lock) = router.registry().get_window(&window)
-            && let Ok(mut win) = win_lock.write()
-        {
+        if let Some(win) = router.registry().get_window(&window) {
             win.set_join_key(key_field);
         }
     }

@@ -38,6 +38,7 @@ pub use signal::{ShutdownTrigger, wait_for_signal};
 use bootstrap::load_and_compile;
 use spawn::{
     spawn_alert_task, spawn_evictor_task, spawn_metrics_task, spawn_receiver_task, spawn_rule_tasks,
+    spawn_window_actors,
 };
 use types::TaskGroup;
 
@@ -238,6 +239,10 @@ pub struct Reactor {
     pub(crate) rule_cancel: CancellationToken,
     /// Non-reloadable groups in start order: `[alert, evictor]`.
     head_watchers: Vec<JoinHandle<RuntimeResult<()>>>,
+    /// Window actors (single writers). Joined after the receiver (parse pool)
+    /// but **before** the rule group, so the actor drain's final broadcasts
+    /// still reach living rule consumers.
+    actor_watch: JoinHandle<RuntimeResult<()>>,
     /// Non-reloadable groups in start order: `[receiver, metrics]`.
     tail_watchers: Vec<JoinHandle<RuntimeResult<()>>>,
     /// Rule group supervisor handle — hot-swappable.
@@ -344,6 +349,15 @@ impl Reactor {
             cancel.clone(),
         ));
 
+        // Window actors: spawned (and their mailboxes registered) before the
+        // rule tasks and the receiver/parse pool, so direct dispatch is
+        // active from the first decoded batch. Joined between the receiver
+        // and the rules (see `actor_watch`).
+        let actor_watch = watch_group(
+            spawn_window_actors(&config, &data.router, cancel.clone(), metrics.clone()),
+            cancel.clone(),
+        );
+
         // End-of-stream counter shared with the rule tasks: incremented each
         // time the input sources report the stream ended (EOS-driven
         // finalization). Rules flush trailing instances on every EOS but keep
@@ -404,6 +418,7 @@ impl Reactor {
             cancel,
             rule_cancel,
             head_watchers,
+            actor_watch,
             tail_watchers,
             rule_watch,
             detached_rule_watchers: Vec::new(),
@@ -543,13 +558,22 @@ impl Reactor {
         // closes and the alert task drains & exits last.
         self.sink_fanout.take();
 
-        // tail: metrics → receiver, then rule, then head: evictor → alert.
+        // tail: metrics → receiver, then window actors, then rule, then
+        // head: evictor → alert. Actors join after the parse pool has fully
+        // drained and before the rules exit, so their queued tail is appended
+        // and its rule broadcasts still find living consumers.
         while let Some(handle) = self.tail_watchers.pop() {
             if let Err(err) = join_supervisor(handle).await
                 && first_error.is_none()
             {
                 first_error = Some(err);
             }
+        }
+        let actor_watch = std::mem::replace(&mut self.actor_watch, tokio::spawn(async { Ok(()) }));
+        if let Err(err) = join_supervisor(actor_watch).await
+            && first_error.is_none()
+        {
+            first_error = Some(err);
         }
         let rule_watch = std::mem::replace(&mut self.rule_watch, tokio::spawn(async { Ok(()) }));
         if let Err(err) = join_supervisor(rule_watch).await

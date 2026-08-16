@@ -1,7 +1,7 @@
 use super::*;
 
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Int64Array, StringArray, TimestampNanosecondArray};
@@ -213,7 +213,7 @@ fn make_window(
     name: &str,
     schema: &SchemaRef,
     max_bytes: usize,
-) -> (Arc<RwLock<Window>>, Arc<Notify>) {
+) -> (Arc<Window>, Arc<Notify>) {
     let win = Window::new(
         WindowParams {
             name: name.into(),
@@ -224,7 +224,7 @@ fn make_window(
         },
         test_window_config(max_bytes),
     );
-    (Arc::new(RwLock::new(win)), Arc::new(Notify::new()))
+    (Arc::new(win), Arc::new(Notify::new()))
 }
 
 fn make_batch(schema: &SchemaRef, sips: &[&str], ts: i64) -> RecordBatch {
@@ -305,7 +305,7 @@ fn make_window_def(
 fn make_task() -> (
     rule_task::RuleTask,
     mpsc::Receiver<crate::alert_task::AlertBatch>,
-    Arc<RwLock<Window>>,
+    Arc<Window>,
     Arc<Notify>,
 ) {
     make_task_with_window_bytes(usize::MAX)
@@ -334,7 +334,7 @@ fn make_task_with_window_bytes(
 ) -> (
     rule_task::RuleTask,
     mpsc::Receiver<crate::alert_task::AlertBatch>,
-    Arc<RwLock<Window>>,
+    Arc<Window>,
     Arc<Notify>,
 ) {
     let schema = test_schema();
@@ -551,7 +551,7 @@ fn make_pipeline_stage_task() -> (
 fn make_each_task() -> (
     rule_task::RuleTask,
     mpsc::Receiver<crate::alert_task::AlertBatch>,
-    Arc<RwLock<Window>>,
+    Arc<Window>,
     Arc<Notify>,
 ) {
     let schema = test_schema();
@@ -640,7 +640,7 @@ fn make_each_task() -> (
 fn make_filtered_match_task() -> (
     rule_task::RuleTask,
     mpsc::Receiver<crate::alert_task::AlertBatch>,
-    Arc<RwLock<Window>>,
+    Arc<Window>,
     Arc<Notify>,
 ) {
     let schema = filtered_schema();
@@ -744,7 +744,7 @@ fn make_filtered_match_task() -> (
 fn make_filtered_close_task() -> (
     rule_task::RuleTask,
     mpsc::Receiver<crate::alert_task::AlertBatch>,
-    Arc<RwLock<Window>>,
+    Arc<Window>,
     Arc<Notify>,
 ) {
     let schema = filtered_schema();
@@ -861,7 +861,7 @@ fn make_filtered_close_task() -> (
 fn make_filtered_each_task() -> (
     rule_task::RuleTask,
     mpsc::Receiver<crate::alert_task::AlertBatch>,
-    Arc<RwLock<Window>>,
+    Arc<Window>,
     Arc<Notify>,
 ) {
     let schema = filtered_schema();
@@ -1710,7 +1710,7 @@ fn make_intermediate_score_band_tasks() -> (
 fn make_filtered_bind_alias_match_task() -> (
     rule_task::RuleTask,
     mpsc::Receiver<crate::alert_task::AlertBatch>,
-    Arc<RwLock<Window>>,
+    Arc<Window>,
     Arc<Notify>,
 ) {
     let schema = scored_source_schema();
@@ -2010,7 +2010,7 @@ async fn pull_advances_cursor() {
 
     let ts = 1_700_000_000_000_000_000i64;
     let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.2"], ts);
-    win.write().unwrap().append(batch).unwrap();
+    win.append(batch).unwrap();
 
     task.pull_and_advance().await;
     let cursor = task.cursors["auth_events"];
@@ -2032,7 +2032,7 @@ async fn pull_triggers_alert() {
 
     let ts_nanos = 1_700_000_000_000_000_000i64;
     let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.1", "10.0.0.1"], ts_nanos);
-    win.write().unwrap().append(batch).unwrap();
+    win.append(batch).unwrap();
 
     task.pull_and_advance().await;
 
@@ -2156,7 +2156,7 @@ async fn pull_keeps_normalized_nanos_event_time() {
 
     let ts_nanos = 1_000_000_000i64;
     let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.1", "10.0.0.1"], ts_nanos);
-    win.write().unwrap().append(batch).unwrap();
+    win.append(batch).unwrap();
 
     task.pull_and_advance().await;
 
@@ -2180,7 +2180,7 @@ async fn flush_emits_close_alert_for_completed_and_close_rule() {
         ],
     )
     .unwrap();
-    win.write().unwrap().append(batch).unwrap();
+    win.append(batch).unwrap();
 
     task.pull_and_advance().await;
     assert!(
@@ -2209,7 +2209,7 @@ async fn pull_multiple_keys_isolated() {
         &["10.0.0.1", "10.0.0.1", "10.0.0.2", "10.0.0.2"],
         ts,
     );
-    win.write().unwrap().append(batch1).unwrap();
+    win.append(batch1).unwrap();
     task.pull_and_advance().await;
     assert!(
         alert_rx.try_recv().is_err(),
@@ -2217,7 +2217,7 @@ async fn pull_multiple_keys_isolated() {
     );
 
     let batch2 = make_batch(&schema, &["10.0.0.1"], ts + 1_000_000_000);
-    win.write().unwrap().append(batch2).unwrap();
+    win.append(batch2).unwrap();
     task.pull_and_advance().await;
 
     let alert = take_alert(&mut alert_rx);
@@ -2244,13 +2244,13 @@ async fn pull_detects_gap() {
     task.cursors.insert("auth_events".into(), 0);
 
     let batch0 = make_batch(&schema, &["10.0.0.1"], ts);
-    win.write().unwrap().append(batch0).unwrap();
+    win.append(batch0).unwrap();
 
     let batch1 = make_batch(&schema, &["10.0.0.2"], ts + 1_000_000_000);
-    win.write().unwrap().append(batch1).unwrap();
+    win.append(batch1).unwrap();
 
     assert_eq!(
-        win.read().unwrap().batch_count(),
+        win.batch_count(),
         1,
         "only 1 batch should remain after eviction"
     );
@@ -2272,7 +2272,7 @@ async fn flush_closes_active_instances() {
 
     let ts = 1_700_000_000_000_000_000i64;
     let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.1"], ts);
-    win.write().unwrap().append(batch).unwrap();
+    win.append(batch).unwrap();
     task.pull_and_advance().await;
 
     assert!(
@@ -2300,7 +2300,7 @@ async fn pipeline_stage_output_writes_internal_window_instead_of_alert_channel()
 
     let batch = make_batch(&schema, &["10.0.0.8"], ts);
     let source = router.registry().get_window("auth_events").unwrap();
-    source.write().unwrap().append(batch).unwrap();
+    source.append(batch).unwrap();
     task.pull_and_advance().await;
 
     assert!(
@@ -2346,7 +2346,7 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
 
     let batch = make_batch(&schema, &["10.0.0.8"], ts);
     let source = router.registry().get_window("auth_events").unwrap();
-    source.write().unwrap().append(batch).unwrap();
+    source.append(batch).unwrap();
     task.pull_and_advance().await;
 
     assert!(
@@ -2457,7 +2457,7 @@ async fn intermediate_target_preserves_explicit_time_field() {
 
     let batch = make_batch(&schema, &["10.0.0.8"], ts);
     let source = router.registry().get_window("auth_events").unwrap();
-    source.write().unwrap().append(batch).unwrap();
+    source.append(batch).unwrap();
     task.pull_and_advance().await;
 
     assert!(alert_rx.try_recv().is_err());
@@ -2490,7 +2490,7 @@ async fn downstream_close_aggregates_intermediate_float_fields() {
 
     let batch = make_scored_batch(&schema, &["10.0.0.8", "10.0.0.8"], &[10.0, 30.0], ts);
     let source = router.registry().get_window("auth_events").unwrap();
-    source.write().unwrap().append(batch).unwrap();
+    source.append(batch).unwrap();
 
     // Pure relay (P1c): the intermediate pipe is not stored in a window; the
     // downstream rule consumes the broadcast via push.
@@ -2530,7 +2530,7 @@ async fn downstream_close_counts_filtered_bind_aliases() {
 
     let batch = make_scored_batch(&schema, &["10.0.0.9", "10.0.0.9"], &[90.0, 70.0], ts);
     let source = router.registry().get_window("auth_events").unwrap();
-    source.write().unwrap().append(batch).unwrap();
+    source.append(batch).unwrap();
 
     // Pure relay (P1c): the intermediate pipe is not stored in a window; the
     // downstream rule consumes the broadcast via push.
@@ -2574,7 +2574,7 @@ async fn match_event_path_counts_filtered_bind_aliases() {
     let (mut task, mut alert_rx, win, _notify) = make_filtered_bind_alias_match_task();
     let ts = 4_000_000_000_000_000i64;
     let batch = make_scored_batch(&schema, &["10.0.0.7", "10.0.0.7"], &[90.0, 70.0], ts);
-    win.write().unwrap().append(batch).unwrap();
+    win.append(batch).unwrap();
 
     task.pull_and_advance().await;
 
@@ -2602,7 +2602,7 @@ async fn on_each_emits_one_alert_per_matching_row() {
     let (mut task, mut alert_rx, win, _notify) = make_each_task();
     let ts_nanos = 1_700_000_000_000_000_000i64;
     let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.2"], ts_nanos);
-    win.write().unwrap().append(batch).unwrap();
+    win.append(batch).unwrap();
 
     task.pull_and_advance().await;
 
@@ -2634,7 +2634,7 @@ async fn match_respects_events_bind_filter() {
         &["failed", "success"],
         ts,
     );
-    win.write().unwrap().append(batch1).unwrap();
+    win.append(batch1).unwrap();
     task.pull_and_advance().await;
     assert!(
         alert_rx.try_recv().is_err(),
@@ -2642,7 +2642,7 @@ async fn match_respects_events_bind_filter() {
     );
 
     let batch2 = make_filtered_batch(&schema, &["10.0.0.1"], &["failed"], ts + 1);
-    win.write().unwrap().append(batch2).unwrap();
+    win.append(batch2).unwrap();
     task.pull_and_advance().await;
     let alert = take_alert(&mut alert_rx);
     assert_eq!(field_str(&alert, "__wfu_rule_name"), "filtered_match");
@@ -2658,11 +2658,11 @@ async fn match_bind_filter_supports_window_has_lookup() {
 
     let lookup_batch = make_batch(&schema, &["10.0.0.1"], ts - 1);
     let lookup = router.registry().get_window("threat_list").unwrap();
-    lookup.write().unwrap().append(lookup_batch).unwrap();
+    lookup.append(lookup_batch).unwrap();
 
     let source_batch = make_batch(&schema, &["10.0.0.1", "10.0.0.2"], ts);
     let source = router.registry().get_window("auth_events").unwrap();
-    source.write().unwrap().append(source_batch).unwrap();
+    source.append(source_batch).unwrap();
 
     task.pull_and_advance().await;
 
@@ -2687,7 +2687,7 @@ async fn on_each_respects_events_bind_filter() {
         &["failed", "success"],
         ts,
     );
-    win.write().unwrap().append(batch).unwrap();
+    win.append(batch).unwrap();
 
     task.pull_and_advance().await;
 
@@ -2719,7 +2719,7 @@ fn conn_events_schema() -> SchemaRef {
 }
 
 /// Build a window with the conn_events schema.
-fn make_conn_events_window(max_bytes: usize) -> (Arc<RwLock<Window>>, Arc<Notify>) {
+fn make_conn_events_window(max_bytes: usize) -> (Arc<Window>, Arc<Notify>) {
     let schema = conn_events_schema();
     let mut cfg = test_window_config(max_bytes);
     cfg.name = "conn_events".to_string();
@@ -2733,7 +2733,7 @@ fn make_conn_events_window(max_bytes: usize) -> (Arc<RwLock<Window>>, Arc<Notify
         },
         cfg,
     );
-    let win_arc = Arc::new(RwLock::new(win));
+    let win_arc = Arc::new(win);
     let notify_arc = Arc::new(Notify::new());
     (win_arc, notify_arc)
 }
@@ -2882,7 +2882,7 @@ async fn port_scan_rule_triggers_close_alert() {
     // Feed batch: 5 events with same sip, action=syn
     let ts = 1_700_000_000_000_000_000i64;
     let batch = make_port_scan_batch("10.0.0.1", &[80, 443, 22, 8080, 3306], ts);
-    win_arc.write().unwrap().append(batch).unwrap();
+    win_arc.append(batch).unwrap();
 
     task.pull_and_advance().await;
 
@@ -2895,7 +2895,7 @@ async fn port_scan_rule_triggers_close_alert() {
     // Feed second batch with later timestamps to trigger expiry (ts + 11s > created_at + 10s)
     let nanos_per_sec: i64 = 1_000_000_000;
     let batch2 = make_port_scan_batch("10.0.0.1", &[21, 25, 53], ts + 11 * nanos_per_sec);
-    win_arc.write().unwrap().append(batch2).unwrap();
+    win_arc.append(batch2).unwrap();
 
     task.pull_and_advance().await;
 
@@ -2925,7 +2925,7 @@ async fn pure_relay_broadcasts_to_sharded_downstream() {
     // the same shard (deterministic key hash), even though nothing is stored.
     let batch = make_batch(&schema, &["10.0.0.8", "10.0.0.8"], ts);
     let source = router.registry().get_window("auth_events").unwrap();
-    source.write().unwrap().append(batch).unwrap();
+    source.append(batch).unwrap();
     task.pull_and_advance().await;
 
     // Pure relay: nothing stored in the intermediate window.

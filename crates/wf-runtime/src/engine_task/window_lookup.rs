@@ -64,11 +64,9 @@ impl WindowLookup for RegistryLookup<'_> {
     }
 
     fn snapshot_with_timestamps(&self, window: &str) -> Option<Vec<(i64, HashMap<String, Value>)>> {
-        let win_lock = self.0.registry().get_window(window)?;
-        let win = win_lock.read().expect("window lock poisoned");
+        let win = self.0.registry().get_window(window)?;
         let time_col = win.time_col_index()?;
         let batches = win.snapshot();
-        drop(win);
 
         let mut rows = Vec::new();
         for batch in &batches {
@@ -83,8 +81,7 @@ impl WindowLookup for RegistryLookup<'_> {
         key_field: &str,
         key: &Value,
     ) -> Option<Vec<HashMap<String, Value>>> {
-        let win_lock = self.0.registry().get_window(window)?;
-        let win = win_lock.read().ok()?;
+        let win = self.0.registry().get_window(window)?;
         let Some(key) = JoinKey::from_value(key) else {
             return None;
         };
@@ -207,8 +204,6 @@ mod tests {
         router
             .registry()
             .get_window("threat_intel")
-            .unwrap()
-            .write()
             .unwrap()
             .set_join_key("ip".into());
 

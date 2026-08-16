@@ -65,8 +65,7 @@ impl Evictor {
                 .progress(name)
                 .map(|progress| progress.min_acked())
                 .unwrap_or(u64::MAX);
-            let win_lock = registry.get_window(name).unwrap();
-            let mut win = win_lock.write().expect("window lock poisoned");
+            let win = registry.get_window(name).unwrap();
             let before = win.batch_count();
             win.evict_expired(now_nanos, floor);
             let evicted = before - win.batch_count();
@@ -86,8 +85,7 @@ impl Evictor {
             let mut largest_mem = 0usize;
 
             for name in &names {
-                let win_lock = registry.get_window(name).unwrap();
-                let win = win_lock.read().expect("window lock poisoned");
+                let win = registry.get_window(name).unwrap();
                 let mem = win.memory_usage();
                 total += mem;
                 if mem > largest_mem {
@@ -102,8 +100,7 @@ impl Evictor {
 
             match largest_name {
                 Some(name) => {
-                    let win_lock = registry.get_window(name).unwrap();
-                    let mut win = win_lock.write().expect("window lock poisoned");
+                    let win = registry.get_window(name).unwrap();
                     if win.evict_oldest().is_none() {
                         break;
                     }
@@ -185,8 +182,7 @@ mod tests {
 
         // Manually append two batches at 1s and 5s.
         {
-            let win_lock = reg.get_window("win_a").unwrap();
-            let mut win = win_lock.write().unwrap();
+            let win = reg.get_window("win_a").unwrap();
             win.append(make_batch(&schema, &[1_000_000_000], &[100]))
                 .unwrap();
             win.append(make_batch(&schema, &[5_000_000_000], &[200]))
@@ -202,8 +198,7 @@ mod tests {
         assert_eq!(report.batches_time_evicted, 2);
         assert_eq!(report.batches_memory_evicted, 0);
 
-        let win_lock = reg.get_window("win_a").unwrap();
-        let win = win_lock.read().unwrap();
+        let win = reg.get_window("win_a").unwrap();
         assert!(win.is_empty());
     }
 
@@ -243,16 +238,14 @@ mod tests {
 
         // win_a gets 2 batches, win_b gets 1 → total = 3 * one_batch_size
         {
-            let lock = reg.get_window("win_a").unwrap();
-            let mut w = lock.write().unwrap();
+            let w = reg.get_window("win_a").unwrap();
             w.append(make_batch(&schema, &[1_000_000_000], &[100]))
                 .unwrap();
             w.append(make_batch(&schema, &[2_000_000_000], &[200]))
                 .unwrap();
         }
         {
-            let lock = reg.get_window("win_b").unwrap();
-            let mut w = lock.write().unwrap();
+            let w = reg.get_window("win_b").unwrap();
             w.append(make_batch(&schema, &[3_000_000_000], &[300]))
                 .unwrap();
         }
@@ -268,8 +261,7 @@ mod tests {
         let total: usize = ["win_a", "win_b"]
             .iter()
             .map(|n| {
-                let lock = reg.get_window(n).unwrap();
-                let w = lock.read().unwrap();
+                let w = reg.get_window(n).unwrap();
                 w.memory_usage()
             })
             .sum();
@@ -324,8 +316,7 @@ mod tests {
 
             // Inject one batch at current time.
             {
-                let win_lock = reg.get_window("data").unwrap();
-                let mut win = win_lock.write().unwrap();
+                let win = reg.get_window("data").unwrap();
                 let value = i as i64 * 10;
                 win.append(make_batch(&schema, &[now], &[value])).unwrap();
             }
@@ -335,8 +326,7 @@ mod tests {
 
             // Sample metrics after every eviction.
             {
-                let win_lock = reg.get_window("data").unwrap();
-                let win = win_lock.read().unwrap();
+                let win = reg.get_window("data").unwrap();
                 memory_samples.push(win.memory_usage());
                 batch_counts.push(win.batch_count());
             }
@@ -448,16 +438,14 @@ mod tests {
 
             // Inject.
             {
-                let win_lock = reg.get_window("data").unwrap();
-                let mut win = win_lock.write().unwrap();
+                let win = reg.get_window("data").unwrap();
                 win.append(make_batch(&schema, &[now], &[(i * 10) as i64]))
                     .unwrap();
             }
 
             // Simulate rule reading: take a snapshot, process, drop.
             {
-                let win_lock = reg.get_window("data").unwrap();
-                let win = win_lock.read().unwrap();
+                let win = reg.get_window("data").unwrap();
                 let (_batches, new_cursor, _gap) = win.read_since(cursor);
                 cursor = new_cursor;
                 // _batches is dropped here — Arc refcount decremented.
@@ -468,8 +456,7 @@ mod tests {
 
             // Sample.
             {
-                let win_lock = reg.get_window("data").unwrap();
-                let win = win_lock.read().unwrap();
+                let win = reg.get_window("data").unwrap();
                 memory_samples.push(win.memory_usage());
             }
         }
@@ -551,8 +538,7 @@ mod tests {
 
             // Inject into all three windows.
             for name in &["short", "medium", "alert"] {
-                let win_lock = reg.get_window(name).unwrap();
-                let mut win = win_lock.write().unwrap();
+                let win = reg.get_window(name).unwrap();
                 win.append(make_batch(&schema, &[now], &[(i * 10) as i64]))
                     .unwrap();
             }
@@ -564,8 +550,7 @@ mod tests {
                 ("medium", &mut memory_medium),
                 ("alert", &mut memory_alert),
             ] {
-                let win_lock = reg.get_window(name).unwrap();
-                let win = win_lock.read().unwrap();
+                let win = reg.get_window(name).unwrap();
                 samples.push(win.memory_usage());
             }
         }
@@ -649,17 +634,14 @@ mod tests {
         // Phase 1 — Burst: inject 100 batches, all at t = 1s
         let burst_count = 100;
         for i in 0..burst_count {
-            let win_lock = reg.get_window("data").unwrap();
-            let mut win = win_lock.write().unwrap();
+            let win = reg.get_window("data").unwrap();
             win.append(make_batch(&schema, &[1_000_000_000], &[i as i64]))
                 .unwrap();
         }
 
-        let win_lock = reg.get_window("data").unwrap();
-        let win = win_lock.read().unwrap();
+        let win = reg.get_window("data").unwrap();
         let peak_memory = win.memory_usage();
         let peak_batches = win.batch_count();
-        drop(win);
 
         assert!(
             peak_batches == burst_count as usize,
@@ -680,8 +662,7 @@ mod tests {
             let now_nanos = (step + 1) * 2_000_000_000i64;
             evictor.run_once(&reg, now_nanos);
 
-            let win_lock = reg.get_window("data").unwrap();
-            let win = win_lock.read().unwrap();
+            let win = reg.get_window("data").unwrap();
             memory_samples.push(win.memory_usage());
         }
 
@@ -695,8 +676,7 @@ mod tests {
         );
 
         // 2. Window should be empty.
-        let win_lock = reg.get_window("data").unwrap();
-        let win = win_lock.read().unwrap();
+        let win = reg.get_window("data").unwrap();
         assert!(
             win.is_empty(),
             "after drain, window should be empty, got {} batches",

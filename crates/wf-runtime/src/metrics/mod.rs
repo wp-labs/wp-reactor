@@ -1003,6 +1003,27 @@ impl RuntimeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Window-actor path report for one appended window batch (the actor-side
+    /// equivalent of folding one `WindowRouteOutcome` into the route totals).
+    pub fn report_window_append(&self, window: &str, rows: usize, late: bool) {
+        if late {
+            self.router_dropped_late_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.add_window_late(window, rows as u64);
+        } else {
+            self.router_delivered_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.add_window_append(window, rows as u64);
+        }
+    }
+
+    /// Skip count for non-local subscribers, reported by the parse worker on
+    /// the direct-dispatch path.
+    pub fn add_router_skipped(&self, count: usize) {
+        self.router_skipped_non_local_total
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
     pub fn add_route_report(&self, report: &RouteReport) {
         self.router_delivered_total
             .fetch_add(report.delivered as u64, Ordering::Relaxed);

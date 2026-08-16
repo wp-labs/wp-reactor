@@ -18,7 +18,8 @@ serde_json = { workspace = true }
 smol_str = { workspace = true }
 foldhash = { workspace = true }
 async-trait = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 log = { workspace = true }
 orion-error = { workspace = true }
 derive_more = { workspace = true }
@@ -31,10 +32,11 @@ regex = { workspace = true }
 wildmatch = { workspace = true }
 chrono = { workspace = true }
 moju-derive = { workspace = true }
+crossbeam-skiplist = "0.1"
 
 [dev-dependencies]
 arrow = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
 
 [features]
 mem_test = []

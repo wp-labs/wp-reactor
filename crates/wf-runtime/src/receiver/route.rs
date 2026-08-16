@@ -53,7 +53,7 @@ fn project_batch_for_stream(
         router
             .registry()
             .get_window(window_name)
-            .and_then(|w| w.read().ok().map(|win| win.schema().clone()))
+            .map(|win| win.schema().clone())
     });
 
     let Some(target_schema) = target_schema else {
@@ -95,7 +95,7 @@ fn needs_projection_for_stream(stream_name: &str, batch: &RecordBatch, router: &
         router
             .registry()
             .get_window(window_name)
-            .and_then(|w| w.read().ok().map(|win| win.schema().clone()))
+            .map(|win| win.schema().clone())
             .is_some_and(|schema| {
                 schema.fields().iter().any(|field| {
                     let target_kind = wfl_structured_field_kind(field);

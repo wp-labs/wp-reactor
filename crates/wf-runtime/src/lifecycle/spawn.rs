@@ -11,7 +11,10 @@ use tokio_util::sync::CancellationToken;
 use wf_config::FusionConfig;
 use wf_engine::match_engine::CepStateMachine;
 use wf_engine::sink::SinkDispatcher;
-use wf_engine::window::{Evictor, Router, RulePush, WindowRegistry};
+use wf_engine::window::{
+    Evictor, Router, RulePush, WindowAppendReport, WindowMailbox, WindowMsg, WindowRegistry,
+    WINDOW_CHANNEL_DEPTH, run_window_actor,
+};
 
 /// Bounded capacity of each rule push channel (a channel carries whole batches
 /// of parsed events, `Arc<Vec<Arc<Event>>>`). A full channel blocks the
@@ -108,6 +111,71 @@ pub(super) fn spawn_alert_task(
 
     let fanout = Arc::new(alert_task::SinkFanout::new(by_sink, dispatcher));
     (fanout, group)
+}
+
+/// Floor for the per-window actor channel byte budget — smaller values would
+/// stall the pipeline on even one modest batch.
+const MIN_WINDOW_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// Spawn one single-writer actor per window plus its bounded mailbox, and
+/// register the mailboxes on the router (subscription model: each window
+/// "subscribes" to its stream's parse output via the channel).
+///
+/// Must run **before** the parse pool and rule tasks spawn: the parse pool
+/// switches to direct dispatch as soon as any mailbox is registered, and rule
+/// emits must find the mailboxes in place.
+///
+/// The per-window byte budget (`runtime.window_buffer_bytes`, default
+/// 64 MiB) is the explicit backpressure that replaces the removed window
+/// write lock's implicit serialization: in-flight bytes per window are
+/// bounded by construction instead of by lock queueing.
+pub(super) fn spawn_window_actors(
+    config: &FusionConfig,
+    router: &Arc<Router>,
+    cancel: CancellationToken,
+    metrics: Option<Arc<RuntimeMetrics>>,
+) -> TaskGroup {
+    let buffer_bytes = config
+        .runtime
+        .window_buffer_bytes
+        .max(MIN_WINDOW_BUFFER_BYTES);
+    let mut group = TaskGroup::new("window_actors");
+
+    let report: WindowAppendReport = match &metrics {
+        Some(m) => {
+            let m = Arc::clone(m);
+            Arc::new(move |window, rows, late| m.report_window_append(window, rows, late))
+        }
+        None => Arc::new(|_, _, _| {}),
+    };
+
+    let fanout = Arc::clone(router.fanout());
+    for name in router.registry().window_names() {
+        let Some(win) = router.registry().get_window(&name) else {
+            continue;
+        };
+        let Some(notify) = router.registry().get_notifier(&name) else {
+            continue;
+        };
+        let (tx, rx) = mpsc::channel::<WindowMsg>(WINDOW_CHANNEL_DEPTH);
+        router.register_mailbox(
+            &name,
+            WindowMailbox {
+                tx,
+                budget: Arc::new(tokio::sync::Semaphore::new(buffer_bytes)),
+            },
+        );
+        let name: Arc<str> = Arc::from(name.as_str());
+        let report = Arc::clone(&report);
+        let fanout = Arc::clone(&fanout);
+        let cancel = cancel.child_token();
+        group.push(tokio::spawn(async move {
+            run_window_actor(name, win, fanout, notify, rx, cancel, Some(report)).await;
+            Ok(())
+        }));
+    }
+
+    group
 }
 
 /// Spawn the periodic window evictor task.
@@ -374,11 +442,14 @@ pub(super) async fn spawn_receiver_task(
     let schema_catalog = Arc::new(schemas.to_vec());
     register_builtin_external_sources();
 
-    // R2: parse worker pool — external sources push decoded batches here, N
-    // parallel parse workers run `route_parse`, and one commit worker runs
-    // `route_commit` in source order. Shared seq counter keeps batches ordered
-    // across all source connections. The preread byte budget bounds total
-    // decoded-batch residency in the pipeline regardless of frame size.
+    // R2/actor: parse worker pool — external sources push decoded batches
+    // here and N parallel parse workers run `route_parse`, then dispatch each
+    // window's batch directly to its window actor mailbox (registered by
+    // `spawn_window_actors` before this call). Ordering is per-source: each
+    // source config entry owns a seq counter assigned serially in its receive
+    // loop(s), and the window actor re-orders per source. The preread byte
+    // budget bounds total decoded-batch residency in the pipeline regardless
+    // of frame size.
     let (parse_tx, preread) = spawn_parse_pool_with_preread(
         &router,
         metrics.clone(),
@@ -386,7 +457,6 @@ pub(super) async fn spawn_receiver_task(
         &mut group,
         config.runtime.parse_buffer_bytes,
     );
-    let parse_seq = Arc::new(AtomicU64::new(0));
     let ingest_limiter = config.runtime.max_ingest_rate.map(IngestLimiter::new);
 
     for (source_idx, source) in config.sources.iter().enumerate() {
@@ -417,7 +487,10 @@ pub(super) async fn spawn_receiver_task(
                 let metrics = metrics.clone();
                 let parse_tx = parse_tx.clone();
                 let preread = Arc::clone(&preread);
-                let parse_seq = Arc::clone(&parse_seq);
+                // Per-source seq: serial assignment inside this source's
+                // replay loop keeps batches ordered for the window actor's
+                // per-source reorder cursor.
+                let parse_seq = Arc::new(AtomicU64::new(0));
                 let limiter = ingest_limiter.clone();
                 let cancel = cancel.child_token();
                 let format = source_data_format(source).to_string();
@@ -503,6 +576,9 @@ pub(super) async fn spawn_receiver_task(
                 spawned += 1;
             }
             _ => {
+                // Per-source seq counter (see the file branch above): one
+                // counter shared by all handles of this source entry.
+                let parse_seq = Arc::new(AtomicU64::new(0));
                 spawned += spawn_external_source_tasks(
                     source,
                     &kind,
@@ -515,7 +591,7 @@ pub(super) async fn spawn_receiver_task(
                     &mut group,
                     parse_tx.clone(),
                     Arc::clone(&preread),
-                    Arc::clone(&parse_seq),
+                    parse_seq,
                     ingest_limiter.clone(),
                 )
                 .await?;

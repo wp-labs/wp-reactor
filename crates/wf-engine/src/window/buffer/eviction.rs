@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::Window;
@@ -12,7 +13,7 @@ impl Window {
     /// slow rule has not yet read. Windows without consumers get `u64::MAX`.
     ///
     /// No-op for windows without a time column or with `over == Duration::ZERO`.
-    pub fn evict_expired(&mut self, now_nanos: i64, acked_floor: u64) {
+    pub fn evict_expired(&self, now_nanos: i64, acked_floor: u64) {
         if self.time_col_index.is_none() || self.over == Duration::ZERO {
             return;
         }
@@ -20,16 +21,33 @@ impl Window {
         let over_nanos = self.over.as_nanos() as i64;
         let cutoff = now_nanos - over_nanos;
 
-        while let Some(front) = self.batches.front() {
-            let expired = front.event_time_range.1 < cutoff;
-            let consumed = front.seq + 1 <= acked_floor;
-            if expired && consumed {
-                let evicted = self.batches.pop_front().unwrap();
-                self.current_bytes -= evicted.byte_size;
-                self.total_rows -= evicted.row_count;
-                self.remove_batch_from_index(&evicted);
-            } else {
+        loop {
+            let removable = {
+                let Some(front) = self.log.front() else {
+                    break;
+                };
+                let tb = front.value();
+                let expired = tb.event_time_range.1 < cutoff;
+                let consumed = tb.seq + 1 <= acked_floor;
+                expired && consumed
+            };
+            if !removable {
                 break;
+            }
+            // Remove by key: a concurrent evictor that wins the race makes
+            // `remove` return None and we simply retry on the new front.
+            // `remove` hands back an `Entry` (the node is already unlinked);
+            // read the accounting fields through it before dropping it.
+            let key = *self.log.front().expect("front vanished").key();
+            if let Some(evicted) = self.log.remove(&key) {
+                let tb = evicted.value();
+                let byte_size = tb.byte_size;
+                let row_count = tb.row_count;
+                self.remove_batch_from_index(tb);
+                drop(evicted);
+                self.current_bytes.fetch_sub(byte_size, Ordering::Relaxed);
+                self.total_rows.fetch_sub(row_count, Ordering::Relaxed);
+                self.batch_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
@@ -37,19 +55,18 @@ impl Window {
     /// Pop the oldest (front) batch, returning its byte size.
     ///
     /// Returns `None` if the window is empty.
-    pub fn evict_oldest(&mut self) -> Option<usize> {
-        let evicted = self.batches.pop_front()?;
-        self.current_bytes -= evicted.byte_size;
-        self.total_rows -= evicted.row_count;
-        self.remove_batch_from_index(&evicted);
-        Some(evicted.byte_size)
-    }
-
-    /// Remove an evicted batch's rows from the join index (if configured).
-    fn remove_batch_from_index(&mut self, evicted: &super::TimedBatch) {
-        if let Some(idx) = &mut self.join_index {
-            let events = evicted.events(self.materialize_fields.as_deref());
-            idx.remove_batch(&events);
-        }
+    pub fn evict_oldest(&self) -> Option<usize> {
+        let key = *self.log.front()?.key();
+        let evicted = self.log.remove(&key)?;
+        let tb = evicted.value();
+        let byte_size = tb.byte_size;
+        let row_count = tb.row_count;
+        self.remove_batch_from_index(tb);
+        drop(evicted);
+        self.current_bytes
+            .fetch_sub(byte_size, Ordering::Relaxed);
+        self.total_rows.fetch_sub(row_count, Ordering::Relaxed);
+        self.batch_count.fetch_sub(1, Ordering::Relaxed);
+        Some(byte_size)
     }
 }

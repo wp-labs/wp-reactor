@@ -51,12 +51,13 @@ struct Subscription {
 /// All maps are wrapped in `RwLock` so windows can be **added at runtime**
 /// (incremental reload, L2) via [`try_add_window`] while reader tasks
 /// (router/rule/evictor) hold the `Arc<Router>` that owns this registry.
-/// Reads take a read lock for the duration of the access only (no `.await` is
-/// held across the guard), so the locks are `std::sync::RwLock`.
+/// The registry maps keep `std::sync::RwLock` (cold — registration and reload
+/// only); the windows themselves are internally synchronized and lock-free on
+/// the data path (see [`Window`]).
 #[derive(::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct WindowRegistry {
-    windows: RwLock<HashMap<String, Arc<RwLock<Window>>>>,
+    windows: RwLock<HashMap<String, Arc<Window>>>,
     provider_windows: RwLock<HashMap<String, Arc<RwLock<ProviderWindow>>>>,
     subscriptions: RwLock<HashMap<String, Vec<Subscription>>>,
     notifiers: RwLock<HashMap<String, Arc<Notify>>>,
@@ -112,7 +113,7 @@ impl WindowRegistry {
 
             let mode = def.config.mode.clone();
             let window = Window::new(def.params, def.config);
-            windows.insert(name.clone(), Arc::new(RwLock::new(window)));
+            windows.insert(name.clone(), Arc::new(window));
             notifiers.insert(name.clone(), Arc::new(Notify::new()));
             progress.insert(name.clone(), Arc::new(WindowProgress::new()));
 
@@ -174,7 +175,7 @@ impl WindowRegistry {
     /// Returns an owned `Arc` so the borrow does not tie to the registry's read
     /// lock guard, letting callers hold it across `.await` / lock the window
     /// independently.
-    pub fn get_window(&self, name: &str) -> Option<Arc<RwLock<Window>>> {
+    pub fn get_window(&self, name: &str) -> Option<Arc<Window>> {
         self.windows
             .read()
             .expect("windows lock poisoned")
@@ -227,10 +228,9 @@ impl WindowRegistry {
 
         let windows = self.windows.read().expect("windows lock poisoned");
         for sub in local {
-            let win_lock = windows
+            let win = windows
                 .get(&sub.window_name)
                 .expect("subscription references non-existent window");
-            let mut win = win_lock.write().expect("window lock poisoned");
             win.append_with_watermark(batch.clone())
                 .map(|_| ())
                 .source_err(CoreReason::WindowBuild, "append batch to window")?;
@@ -243,8 +243,7 @@ impl WindowRegistry {
     /// snapshot.
     pub fn snapshot(&self, name: &str) -> Option<Vec<RecordBatch>> {
         let windows = self.windows.read().expect("windows lock poisoned");
-        let win_lock = windows.get(name)?;
-        let win = win_lock.read().expect("window lock poisoned");
+        let win = windows.get(name)?;
         Some(win.snapshot())
     }
 
@@ -329,7 +328,7 @@ impl WindowRegistry {
                     .err();
             }
             let window = Window::new(def.params, def.config);
-            wins.insert(name.clone(), Arc::new(RwLock::new(window)));
+            wins.insert(name.clone(), Arc::new(window));
         }
 
         // (2) notifiers
@@ -394,7 +393,7 @@ impl WindowRegistry {
                     .err();
             }
             let window = Window::new(def.params, def.config);
-            wins.insert(name.clone(), Arc::new(RwLock::new(window)));
+            wins.insert(name.clone(), Arc::new(window));
         }
 
         // (2) notifiers — replace.

@@ -142,12 +142,18 @@ pub(crate) fn acquire_preread_blocking(
 ///
 /// `seq` is a monotonically increasing sequence assigned by the source, so the
 /// single commit worker can re-assemble batches in source order even though N
-/// parse workers finish out of order.
+/// parse workers finish out of order. `window_seqs` carries the per-(source,
+/// window) contiguous sequences allocated in the same serialized step (actor
+/// mode only) — see [`Router::next_window_seqs`].
 pub(crate) struct ParseItem {
     pub seq: u64,
     pub source_name: String,
     pub stream_name: String,
     pub batch: RecordBatch,
+    /// Per-(source, window) contiguous seqs for the actor dispatch path.
+    /// Allocated here — the last point where the source's frames are still
+    /// strictly ordered — so parallel parse workers cannot permute them.
+    pub window_seqs: Vec<(String, u64)>,
     /// Arrow memory size of `batch`, charged against the preread budget.
     /// Budget permits held while this batch is in flight; released when the
     /// commit worker finishes (or the item is dropped on shutdown).
@@ -178,11 +184,17 @@ pub(crate) fn build_parse_item(
         metrics.add_receiver_source_machine_rows(source_name, &machine_id, batch.num_rows());
     }
     let projected = crate::receiver::prepare_batch(stream_name, &batch, router);
+    // Per-(source, window) seq allocation MUST happen at this serialized
+    // point (source order still guaranteed): the window actors' reorder
+    // cursors expect a gap-free sequence per window, and parallel parse
+    // workers would otherwise assign seqs in completion order.
+    let window_seqs = router.next_window_seqs(source_name, stream_name);
     ParseItem {
         seq: parse_seq.fetch_add(1, Ordering::Relaxed),
         source_name: source_name.to_string(),
         stream_name: stream_name.to_string(),
         batch: projected,
+        window_seqs,
         permits,
     }
 }
@@ -236,14 +248,23 @@ struct ParsedItem {
     permits: Vec<OwnedSemaphorePermit>,
 }
 
-/// Spawn the parse worker pool into `group`: N parallel parsers + one ordered
-/// commit worker. Returns the sender the source tasks push decoded batches
-/// into, plus the shared preread byte budget sources must charge batches
-/// against (see [`push_decoded_batch`]).
+/// Spawn the parse worker pool into `group`: N parallel parsers plus either
+/// (actor mode) direct dispatch to the per-window actors, or (sync mode) one
+/// ordered commit worker. Returns the sender the source tasks push decoded
+/// batches into, plus the shared preread byte budget sources must charge
+/// batches against (see [`push_decoded_batch`]).
 ///
-/// Parse workers run [`Router::route_parse`] in parallel; the single commit
-/// worker runs [`Router::route_commit`] in `seq` order so watermark advancement
-/// and rule broadcast stay in source order.
+/// **Actor mode** (window mailboxes registered on the router before this
+/// call — production boot): parse workers run [`Router::route_parse`] in
+/// parallel and hand each parsed window batch directly to the window's actor
+/// mailbox ([`Router::dispatch_parsed`]). Ordering is preserved without a
+/// global serialization point: per-(source, window) seqs are allocated at
+/// the source-side frame builder and the window actor re-orders arrivals.
+///
+/// **Sync mode** (no mailboxes — tests, embedded): parse workers forward to
+/// a single commit worker that runs [`Router::route_commit`] in per-source
+/// `seq` order so watermark advancement and rule broadcast stay in source
+/// order.
 /// Legacy entry point with the default budget (tests; the runtime passes the
 /// configured budget via [`spawn_parse_pool_with_preread`]).
 #[cfg(test)]
@@ -273,25 +294,40 @@ pub(crate) fn spawn_parse_pool_with_preread(
     let worker_count = worker_count.max(1);
     let preread_bytes = preread_bytes.max(MIN_PARSE_BUFFER_BYTES);
     let (parse_tx, parse_rx) = mpsc::channel::<ParseItem>(PARSE_CHANNEL_CAPACITY);
-    let (commit_tx, commit_rx) = mpsc::channel::<ParsedItem>(COMMIT_CHANNEL_CAPACITY);
     let parse_rx = Arc::new(tokio::sync::Mutex::new(parse_rx));
     let preread: PrereadBudget = Arc::new(Semaphore::new(preread_bytes));
 
-    // Ordered commit worker (single).
-    let commit_router = Arc::clone(router);
-    let commit_metrics = metrics.clone();
-    group.push(tokio::spawn(async move {
-        run_commit_worker(commit_rx, commit_router, commit_metrics).await;
-        Ok(())
-    }));
+    let direct = router.has_mailboxes();
+
+    // Sync mode only: ordered commit worker (single).
+    let commit_tx = if direct {
+        None
+    } else {
+        let (commit_tx, commit_rx) = mpsc::channel::<ParsedItem>(COMMIT_CHANNEL_CAPACITY);
+        let commit_router = Arc::clone(router);
+        let commit_metrics = metrics.clone();
+        group.push(tokio::spawn(async move {
+            run_commit_worker(commit_rx, commit_router, commit_metrics).await;
+            Ok(())
+        }));
+        Some(commit_tx)
+    };
 
     // Parallel parse workers.
     for _ in 0..worker_count {
         let parse_rx = Arc::clone(&parse_rx);
-        let commit_tx = commit_tx.clone();
         let router = Arc::clone(router);
+        let metrics = metrics.clone();
+        let commit_tx = commit_tx.clone();
         group.push(tokio::spawn(async move {
-            run_parse_worker(parse_rx, commit_tx, router).await;
+            match commit_tx {
+                Some(commit_tx) => {
+                    run_parse_worker(parse_rx, commit_tx, router).await;
+                }
+                None => {
+                    run_parse_worker_direct(parse_rx, router, metrics).await;
+                }
+            }
             Ok(())
         }));
     }
@@ -337,42 +373,107 @@ async fn run_parse_worker(
     }
 }
 
-/// Re-assemble parsed batches in `seq` order and commit them.
+/// Actor mode: parse in parallel, then hand each window's batch directly to
+/// its window actor mailbox.
+async fn run_parse_worker_direct(
+    rx: Arc<tokio::sync::Mutex<mpsc::Receiver<ParseItem>>>,
+    router: Arc<Router>,
+    metrics: Option<Arc<RuntimeMetrics>>,
+) {
+    loop {
+        let item = {
+            let mut guard = rx.lock().await;
+            guard.recv().await
+        };
+        let Some(item) = item else {
+            break;
+        };
+        let ParseItem {
+            seq,
+            source_name,
+            stream_name,
+            batch,
+            window_seqs,
+            permits,
+        } = item;
+        if let Some(metrics) = &metrics {
+            metrics.inc_router_route_call();
+        }
+        let parsed = router.route_parse(&stream_name, &batch);
+        if let Some(metrics) = &metrics {
+            metrics.add_router_skipped(parsed.skipped_non_local);
+        }
+        router
+            .dispatch_parsed(Arc::from(source_name.as_str()), seq, window_seqs, batch, parsed)
+            .await;
+        // Every subscribed window's channel has received the batch: the
+        // in-flight bytes are now accounted by the window byte budgets.
+        // Release the preread permits (dropping them returns the budget).
+        drop(permits);
+    }
+}
+
+/// Re-assemble parsed batches in per-source `seq` order and commit them.
 async fn run_commit_worker(
     mut rx: mpsc::Receiver<ParsedItem>,
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
 ) {
-    let mut next_seq: u64 = 0;
-    let mut pending: BTreeMap<u64, ParsedItem> = BTreeMap::new();
+    let mut next_seq: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    let mut pending: BTreeMap<(String, u64), ParsedItem> = BTreeMap::new();
 
     while let Some(item) = rx.recv().await {
-        let seq = item.seq;
-        pending.insert(seq, item);
-        while let Some(item) = pending.remove(&next_seq) {
-            commit(&router, &metrics, item).await;
-            next_seq += 1;
-        }
+        let key = (item.source_name.clone(), item.seq);
+        pending.insert(key, item);
+        drain_pending(&mut pending, &mut next_seq, &router, &metrics).await;
     }
 
     // Commit channel closed (all parse workers done): flush what remains, in
     // order. A missing `next_seq` would indicate a dropped batch (parse worker
     // aborted) — surface it rather than silently skipping.
     if !pending.is_empty() {
-        let first = *pending.keys().next().expect("pending non-empty");
-        if first != next_seq {
-            wf_warn!(
-                pipe,
-                next_seq = next_seq,
-                first_pending = first,
-                pending = pending.len(),
-                "parse commit sequence gap detected"
-            );
+        for (source, next) in next_seq.iter_mut() {
+            let first = pending
+                .range((source.clone(), 0)..)
+                .next()
+                .map(|((_, seq), _)| *seq);
+            if let Some(first) = first
+                && first != *next
+            {
+                wf_warn!(
+                    pipe,
+                    source = %source,
+                    next_seq = *next,
+                    first_pending = first,
+                    "parse commit sequence gap detected"
+                );
+            }
         }
-        while let Some(item) = pending.remove(&next_seq) {
-            commit(&router, &metrics, item).await;
-            next_seq += 1;
-        }
+        drain_pending(&mut pending, &mut next_seq, &router, &metrics).await;
+    }
+}
+
+/// Commit every consecutively-sequenced pending item, per source.
+async fn drain_pending(
+    pending: &mut BTreeMap<(String, u64), ParsedItem>,
+    next_seq: &mut std::collections::HashMap<String, u64>,
+    router: &Arc<Router>,
+    metrics: &Option<Arc<RuntimeMetrics>>,
+) {
+    loop {
+        // Find any (source, seq) matching its cursor. A source not yet in the
+        // map starts at seq 0 (per-source counters begin at 0).
+        let hit = pending
+            .keys()
+            .find(|(source, seq)| {
+                next_seq.get(source.as_str()).copied().unwrap_or(0) == *seq
+            })
+            .cloned();
+        let Some((source, seq)) = hit else { break };
+        let Some(item) = pending.remove(&(source.clone(), seq)) else { break };
+        commit(router, metrics, item).await;
+        next_seq.insert(source, seq.wrapping_add(1));
     }
 }
 

@@ -1410,6 +1410,79 @@ async fn push_decoded_batch_commits_through_parse_pool() {
     wait_for_rows(&router, 2).await;
 }
 
+/// Actor-mode regression for the full-speed pipeline deadlock: a *global*
+/// per-source frame seq leaves permanent holes in each window's mailbox
+/// sequence (a window only receives its own stream's frames), so the window
+/// actor's reorder cursor parked every frame after the first hole and the
+/// parked messages' byte-budget permits were never released. With two
+/// interleaved streams the second stream's window never appended a single
+/// row (and under sustained load the whole pipeline froze). The fix
+/// allocates per-(source, window) contiguous seqs at the serialized
+/// source-side frame builder.
+///
+/// Before the fix this test timed out waiting for win_b's rows.
+#[tokio::test]
+async fn actor_mode_interleaved_streams_append_without_deadlock() {
+    use tokio_util::sync::CancellationToken;
+    use wf_engine::window::{
+        WindowMailbox, WindowMsg, WINDOW_CHANNEL_DEPTH, run_window_actor,
+    };
+
+    let router = make_multi_stream_router();
+    for name in ["win_a", "win_b"] {
+        let win = router.registry().get_window(name).unwrap();
+        let notify = router.registry().get_notifier(name).unwrap();
+        let (tx, rx) = mpsc::channel::<WindowMsg>(WINDOW_CHANNEL_DEPTH);
+        router.register_mailbox(
+            name,
+            WindowMailbox {
+                tx,
+                budget: Arc::new(tokio::sync::Semaphore::new(4 * 1024 * 1024)),
+            },
+        );
+        let name: Arc<str> = Arc::from(name);
+        let fanout = Arc::clone(router.fanout());
+        let cancel = CancellationToken::new();
+        let cancel = cancel.child_token();
+        // Leak the actor task handle: the test runtime reaps it at teardown.
+        tokio::spawn(async move {
+            run_window_actor(name, win, fanout, notify, rx, cancel, None).await;
+        });
+    }
+
+    // Interleave the two streams like the nexmark generator (several frames
+    // of one stream, then the other, repeatedly) — enough frames to blow
+    // past any single-window seq hole.
+    let (parse_tx, preread) = {
+        let mut group = TaskGroup::new("test_parse_actors");
+        spawn_parse_pool(&router, None, 2, &mut group)
+    };
+    let parse_seq = Arc::new(AtomicU64::new(0));
+    let schema = test_schema();
+    for round in 0..8u64 {
+        for stream in ["a", "b"] {
+            let batch = make_batch(
+                &schema,
+                &[(1_000_000_000 + round * 1_000_000) as i64; 2],
+                &[round as i64, round as i64],
+            );
+            assert!(
+                push_decoded_batch(
+                    &parse_tx, &preread, &parse_seq, "src", stream, batch, &router, None, None,
+                )
+                .await,
+                "push to {} must succeed",
+                stream
+            );
+        }
+    }
+    // Both windows must receive every one of their 8 frames. Before the fix
+    // win_b's actor parked its first frame (global seq 1 ≠ expected 0) and
+    // this timed out with 0 rows.
+    wait_for_rows_for(&router, "win_a", 16).await;
+    wait_for_rows_for(&router, "win_b", 16).await;
+}
+
 #[tokio::test]
 async fn push_decoded_batch_returns_false_when_channel_closed() {
     let router = make_router("events");

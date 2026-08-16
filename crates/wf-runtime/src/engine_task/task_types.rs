@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Notify, mpsc, watch};
@@ -19,7 +19,7 @@ use crate::metrics::RuntimeMetrics;
 #[derive(Clone)]
 pub(crate) struct WindowSource {
     pub window_name: String,
-    pub window: Arc<RwLock<Window>>,
+    pub window: Arc<Window>,
     pub notify: Arc<Notify>,
     /// Rule aliases that consume rows from this window.
     pub aliases: Vec<String>,

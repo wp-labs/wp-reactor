@@ -8,9 +8,10 @@ mod tests;
 
 pub use types::{AppendOutcome, WindowParams};
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::{
@@ -20,6 +21,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use crossbeam_skiplist::SkipMap;
 use orion_error::conversion::ToStructError;
 use smol_str::SmolStr;
 use wf_config::WindowConfig;
@@ -71,8 +73,18 @@ impl JoinIndex {
 
 /// A time-ordered buffer of Arrow RecordBatches with eviction support.
 ///
-/// Batches are appended to the back and evicted from the front, either by
-/// time expiry or memory pressure.
+/// Batches are appended by sequence number and evicted from the front, either
+/// by time expiry or memory pressure. The whole data plane is **lock-free**:
+/// the ordered log is a `crossbeam_skiplist::SkipMap<u64, TimedBatch>`
+/// (lock-free insert / ordered iteration / front removal) and every counter
+/// (watermark, bytes, rows, seq) is an atomic. Append, cursor reads, snapshots
+/// and eviction never block each other.
+///
+/// The optional join index (only present on windows configured as join
+/// targets via [`Self::set_join_key`]) is a hash map that needs interior
+/// mutability on both insert and eviction, so it keeps a dedicated fine-grained
+/// lock behind an `AtomicBool` fast path — windows that are not join targets
+/// (the common case) never touch it.
 #[derive(::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct Window {
@@ -81,16 +93,31 @@ pub struct Window {
     pub(super) time_col_index: Option<usize>,
     pub(super) over: Duration,
     pub(super) config: WindowConfig,
-    pub(super) batches: VecDeque<TimedBatch>,
-    pub(super) current_bytes: usize,
-    pub(super) total_rows: usize,
-    pub(super) watermark_nanos: i64,
+    /// Lock-free ordered append log: batch sequence number → batch. Insert
+    /// (append), ordered iteration (cursor reads / snapshots) and front
+    /// removal (eviction) are all lock-free.
+    log: SkipMap<u64, TimedBatch>,
     /// Next sequence number to assign to an appended batch.
-    pub(super) next_seq: u64,
-    /// Optional per-event field whitelist (see `WindowParams`).
+    next_seq: AtomicU64,
+    /// Monotonic event-time watermark (`fetch_max` on append).
+    watermark_nanos: AtomicI64,
+    /// Aggregate retained content bytes (approximate under concurrency —
+    /// exact in the single-writer steady state).
+    current_bytes: AtomicUsize,
+    /// Aggregate row count (approximate under concurrency).
+    total_rows: AtomicUsize,
+    /// Number of batches currently in the log.
+    batch_count: AtomicUsize,
+    /// Fast path: whether a join index has been configured. Non-join windows
+    /// (the common case) skip the join-index lock entirely.
+    join_enabled: AtomicBool,
+    /// Optional hash index for join lookups (see `set_join_key`). Only
+    /// mutated while `join_enabled` is true.
+    join_index: RwLock<Option<JoinIndex>>,
+    /// Optional per-event field whitelist (see `WindowParams`). Immutable
+    /// after construction — readers (`Router::route_parse`) access it with no
+    /// synchronization at all.
     pub(super) materialize_fields: Option<Arc<HashSet<String>>>,
-    /// Optional hash index for join lookups (see `set_join_key`).
-    pub(super) join_index: Option<JoinIndex>,
 }
 
 impl Window {
@@ -103,44 +130,62 @@ impl Window {
             time_col_index: params.time_col_index,
             over: params.over,
             config,
-            batches: VecDeque::new(),
-            current_bytes: 0,
-            total_rows: 0,
-            watermark_nanos: i64::MIN,
-            next_seq: 0,
+            log: SkipMap::new(),
+            next_seq: AtomicU64::new(0),
+            watermark_nanos: AtomicI64::new(i64::MIN),
+            current_bytes: AtomicUsize::new(0),
+            total_rows: AtomicUsize::new(0),
+            batch_count: AtomicUsize::new(0),
+            join_enabled: AtomicBool::new(false),
+            join_index: RwLock::new(None),
             materialize_fields,
-            join_index: None,
         }
     }
 
     /// Configure this window as a join target: build a hash index on `key_field`
     /// and index any rows already buffered. Called by the runtime after rules
     /// are loaded (join target windows are only known from rule plans).
-    pub fn set_join_key(&mut self, key_field: String) {
+    pub fn set_join_key(&self, key_field: String) {
         let key_field = SmolStr::new(&key_field);
         let mut index = JoinIndex {
             key_field,
             by_key: crate::match_engine::EngineHashMap::default(),
         };
-        for batch in &self.batches {
-            let events = batch.events(self.materialize_fields.as_deref());
+        for entry in self.log.iter() {
+            let events = entry.value().events(self.materialize_fields.as_deref());
             index.index_batch(&events);
         }
-        self.join_index = Some(index);
+        self.join_enabled.store(true, Ordering::Release);
+        *self.join_index.write().expect("join index lock poisoned") = Some(index);
     }
 
     /// O(1) lookup of parsed events whose `key_field` equals `key`. Returns
     /// `None` if this window has no join index (not a join target).
     pub fn join_lookup(&self, key: &JoinKey) -> Option<Vec<Arc<Event>>> {
-        self.join_index.as_ref()?.lookup(key)
+        if !self.join_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        self.join_index
+            .read()
+            .expect("join index lock poisoned")
+            .as_ref()?
+            .lookup(key)
     }
 
     /// Indexed join rows as `HashMap<String, Value>` (matching `WindowLookup`
     /// row shape). `Some(empty)` if indexed but no row matches; `None` if this
     /// window has no join index (caller falls back to a snapshot scan).
     pub fn join_rows(&self, key: &JoinKey) -> Option<Vec<HashMap<String, Value>>> {
-        let idx = self.join_index.as_ref()?;
-        let events = idx.lookup(key).unwrap_or_default();
+        if !self.join_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        let events = self
+            .join_index
+            .read()
+            .expect("join index lock poisoned")
+            .as_ref()?
+            .lookup(key)
+            .unwrap_or_default();
         Some(
             events
                 .into_iter()
@@ -159,37 +204,42 @@ impl Window {
     /// Empty batches are silently skipped. Returns an error if the batch
     /// schema does not match the window schema. After appending, memory
     /// eviction runs if `current_bytes > max_window_bytes`.
-    pub fn append(&mut self, batch: RecordBatch) -> CoreResult<()> {
-        self.append_inner(batch, None, None)
+    pub fn append(&self, batch: RecordBatch) -> CoreResult<()> {
+        self.append_inner(batch, None, None).map(|_| ())
     }
 
     /// Append a RecordBatch whose events were already parsed *outside* the
-    /// window lock (by the router). Rule tasks then read the pre-parsed `Arc`
+    /// window (by the router). Rule tasks then read the pre-parsed `Arc`
     /// with no `OnceLock` contention among the concurrent rule tasks.
-    pub fn append_parsed(&mut self, batch: RecordBatch, parsed_events: Arc<Vec<Arc<Event>>>) -> CoreResult<()> {
-        self.append_inner(batch, Some(parsed_events), None)
+    pub fn append_parsed(
+        &self,
+        batch: RecordBatch,
+        parsed_events: Arc<Vec<Arc<Event>>>,
+    ) -> CoreResult<()> {
+        self.append_inner(batch, Some(parsed_events), None).map(|_| ())
     }
 
     /// Append a RecordBatch whose events *and content byte size* were precomputed
     /// by the caller (the R2 parse worker), so the O(rows×cols) accounting runs
-    /// in parallel rather than on the ordered commit path.
+    /// in parallel rather than on the ordered commit path. Returns the sequence
+    /// number assigned to the appended batch.
     pub fn append_parsed_sized(
-        &mut self,
+        &self,
         batch: RecordBatch,
         parsed_events: Arc<Vec<Arc<Event>>>,
         byte_size: usize,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<u64> {
         self.append_inner(batch, Some(parsed_events), Some(byte_size))
     }
 
     fn append_inner(
-        &mut self,
+        &self,
         batch: RecordBatch,
         parsed_events: Option<Arc<Vec<Arc<Event>>>>,
         byte_size: Option<usize>,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<u64> {
         if batch.num_rows() == 0 {
-            return Ok(());
+            return Ok(0);
         }
 
         // Accept batches that contain at least the window's fields (superset OK).
@@ -217,53 +267,72 @@ impl Window {
         // so a single padded frame can exceed max_window_bytes and be silently
         // dropped even though its data is small (wp-labs/wp-reactor#18).
         let byte_size = byte_size.unwrap_or_else(|| content_bytes(&batch));
-        let seq = self.next_seq;
-        self.next_seq += 1;
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
         let parsed_lock = std::sync::OnceLock::new();
         if let Some(events) = parsed_events {
             // Ignore the error: a freshly-created OnceLock is always empty.
             let _ = parsed_lock.set(events);
         }
-        self.batches.push_back(TimedBatch {
-            batch,
-            event_time_range,
-            ingested_at: Instant::now(),
-            row_count,
-            byte_size,
+        self.log.insert(
             seq,
-            parsed_events: parsed_lock,
-        });
+            TimedBatch {
+                batch,
+                event_time_range,
+                ingested_at: Instant::now(),
+                row_count,
+                byte_size,
+                seq,
+                parsed_events: parsed_lock,
+            },
+        );
 
-        self.current_bytes += byte_size;
-        self.total_rows += row_count;
+        self.current_bytes.fetch_add(byte_size, Ordering::Relaxed);
+        self.total_rows.fetch_add(row_count, Ordering::Relaxed);
+        self.batch_count.fetch_add(1, Ordering::Relaxed);
 
         // Memory eviction: pop oldest batches while over budget.
         let max_bytes = self.config.max_window_bytes.as_bytes();
         let mut evicted_bytes = 0usize;
         let mut evicted_rows = 0usize;
-        while self.current_bytes > max_bytes {
-            if let Some(evicted) = self.batches.pop_front() {
-                self.current_bytes -= evicted.byte_size;
-                self.total_rows -= evicted.row_count;
-                evicted_bytes += evicted.byte_size;
-                evicted_rows += evicted.row_count;
-                // Remove evicted rows from the join index (if any).
-                if let Some(idx) = &mut self.join_index {
-                    let events = evicted.events(self.materialize_fields.as_deref());
-                    idx.remove_batch(&events);
-                }
-            } else {
+        while self.current_bytes.load(Ordering::Relaxed) > max_bytes {
+            let Some(front) = self.log.front() else {
                 break;
-            }
+            };
+            let key = *front.key();
+            drop(front);
+            // `remove` is keyed, so a concurrent evictor racing us on the same
+            // front batch simply loses this iteration and we retry.
+            let Some(evicted_entry) = self.log.remove(&key) else {
+                continue;
+            };
+            // The node is already unlinked; read the accounting fields through
+            // the returned entry before dropping it.
+            let tb = evicted_entry.value();
+            let byte_size = tb.byte_size;
+            let row_count = tb.row_count;
+            self.remove_batch_from_index(tb);
+            drop(evicted_entry);
+            self.current_bytes.fetch_sub(byte_size, Ordering::Relaxed);
+            self.total_rows.fetch_sub(row_count, Ordering::Relaxed);
+            self.batch_count.fetch_sub(1, Ordering::Relaxed);
+            evicted_bytes += byte_size;
+            evicted_rows += row_count;
         }
 
         // Index the newly appended batch (after eviction, so rows evicted by the
         // incoming batch aren't kept in the index).
-        if let Some(idx) = &mut self.join_index {
-            if let Some(last) = self.batches.back() {
-                let events = last.events(self.materialize_fields.as_deref());
-                idx.index_batch(&events);
+        if self.join_enabled.load(Ordering::Acquire) {
+            if let Some(entry) = self.log.get(&seq) {
+                let events = entry.value().events(self.materialize_fields.as_deref());
+                if let Some(idx) = self
+                    .join_index
+                    .write()
+                    .expect("join index lock poisoned")
+                    .as_mut()
+                {
+                    idx.index_batch(&events);
+                }
             }
         }
         if evicted_rows > 0 {
@@ -282,7 +351,23 @@ impl Window {
             );
         }
 
-        Ok(())
+        Ok(seq)
+    }
+
+    /// Remove an evicted batch's rows from the join index (if configured).
+    fn remove_batch_from_index(&self, evicted: &TimedBatch) {
+        if !self.join_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(idx) = self
+            .join_index
+            .write()
+            .expect("join index lock poisoned")
+            .as_mut()
+        {
+            let events = evicted.events(self.materialize_fields.as_deref());
+            idx.remove_batch(&events);
+        }
     }
 
     /// Return a snapshot of all current batches.
@@ -291,11 +376,11 @@ impl Window {
     /// The returned `Vec` remains valid even if the window is subsequently
     /// mutated.
     pub fn snapshot(&self) -> Vec<RecordBatch> {
-        self.batches.iter().map(|tb| tb.batch.clone()).collect()
+        self.log.iter().map(|e| e.value().batch.clone()).collect()
     }
 
     pub fn memory_usage(&self) -> usize {
-        self.current_bytes
+        self.current_bytes.load(Ordering::Relaxed)
     }
 
     pub fn max_window_bytes(&self) -> usize {
@@ -311,15 +396,15 @@ impl Window {
     }
 
     pub fn total_rows(&self) -> usize {
-        self.total_rows
+        self.total_rows.load(Ordering::Relaxed)
     }
 
     pub fn batch_count(&self) -> usize {
-        self.batches.len()
+        self.batch_count.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.batches.is_empty()
+        self.batch_count() == 0
     }
 
     /// Index of the time column in the schema, if present.
