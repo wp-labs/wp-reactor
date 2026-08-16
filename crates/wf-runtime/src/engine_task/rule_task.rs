@@ -453,6 +453,10 @@ impl RuleTask {
         // (nanos, formatted) pair — the executor caches the formatted string
         // and Arc-shares it across every record it builds this batch.
         let batch_emit_nanos = self.cached_wall_nanos.load(Ordering::Relaxed) as i64;
+        // Plan C2 batching: when the per-event detail logs are off, collect
+        // the each-direct rows and emit them in one vectorized pass after
+        // the loop (debug runs keep the per-event path for exact detail).
+        let mut each_direct_rows: Vec<(&wf_engine::match_engine::Event, i64)> = Vec::new();
         for (row_index, event) in events.iter().enumerate() {
             if let Some(machine) = &mut self.machine {
                 let event_nanos = machine.event_time_nanos(event);
@@ -720,8 +724,15 @@ impl RuleTask {
                     }
                     let event_nanos = event_time_nanos(event, self.each_time_field.as_deref());
                     if self.each_direct {
-                        // Plan C2: the executor appends straight into the
-                        // columnar builder — no per-record OutputRecord.
+                        if !debug_enabled {
+                            // Plan C2 batched: defer to the vectorized pass
+                            // after the loop (same rows, same flush cadence).
+                            each_direct_rows.push((event.as_ref(), event_nanos));
+                            continue;
+                        }
+                        // Plan C2 per-event path (debug detail on): the
+                        // executor appends straight into the columnar
+                        // builder — no per-record OutputRecord.
                         match self
                             .emit_each_direct(
                                 event,
@@ -833,6 +844,18 @@ impl RuleTask {
                     }
                 }
             }
+        }
+        // Vectorized on-each direct emit for the collected rows. Segment
+        // size = ALERT_BATCH_SIZE keeps the flush cadence and the pending
+        // memory bound of the per-event path.
+        if !each_direct_rows.is_empty() {
+            self.emit_each_direct_batch(
+                &each_direct_rows,
+                &lookup,
+                &each_field_order,
+                batch_emit_nanos,
+            )
+            .await;
         }
         if debug_enabled {
             let instances_after = self.instance_count();
@@ -1365,6 +1388,120 @@ impl RuleTask {
             self.flush_alerts().await;
         }
         result
+    }
+
+    /// Batched direct-write on-each emit (build_each_direct vectorization):
+    /// runs [`RuleExecutor::execute_each_direct_batch`] over the events the
+    /// main loop collected for this rule, in segments of `ALERT_BATCH_SIZE`
+    /// events so the flush cadence and the pending-alerts memory bound stay
+    /// identical to the per-event path.
+    ///
+    /// Telemetry mirrors [`Self::emit_each_direct`]: exact `emitted_total`
+    /// per appended row (via the appended-index list, outside the builder
+    /// lock), 1-in-N sampled detail/e2e per appended row, and serialize
+    /// timing sampled per segment and scaled by the per-call average (a
+    /// segment covers many "calls", so the scaled estimate stays comparable
+    /// to the per-event path's accounting).
+    async fn emit_each_direct_batch(
+        &self,
+        rows: &[(&wf_engine::match_engine::Event, i64)],
+        lookup: &RegistryLookup<'_>,
+        field_order: &[&smol_str::SmolStr],
+        batch_emit_nanos: i64,
+    ) {
+        let mut appended_idx: Vec<usize> = Vec::new();
+        let mut start = 0;
+        while start < rows.len() {
+            let end = (start + ALERT_BATCH_SIZE).min(rows.len());
+            let segment = &rows[start..end];
+            let calls = segment.len();
+            let time_this = {
+                let rem = self.serialize_sample_remaining.fetch_sub(1, Ordering::Relaxed);
+                if rem == 1 {
+                    self.serialize_sample_remaining
+                        .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                }
+            };
+            let _ser_start = time_this.then(Instant::now);
+            let (outcome, should_flush) = {
+                let mut pending = self.pending_alerts.lock().unwrap();
+                // Linear target lookup via the plan-constant Arc — same as
+                // the per-event path.
+                let target = self.executor.static_yield_target();
+                let slot = pending
+                    .by_target
+                    .iter_mut()
+                    .find(|(existing, _)| **existing == **target);
+                let builder = match slot {
+                    Some((_, builder)) => builder,
+                    None => {
+                        pending.by_target.push((
+                            std::sync::Arc::clone(target),
+                            AlertColumnBuilder::new(std::sync::Arc::clone(target)),
+                        ));
+                        let last = pending.by_target.len() - 1;
+                        &mut pending.by_target[last].1
+                    }
+                };
+                let outcome = self.executor.execute_each_direct_batch(
+                    segment,
+                    lookup,
+                    field_order,
+                    batch_emit_nanos,
+                    builder,
+                    &mut appended_idx,
+                );
+                pending.count += outcome.appended;
+                (outcome, pending.count >= ALERT_BATCH_SIZE)
+            };
+            // Per-row telemetry outside the builder lock (exact totals,
+            // 1-in-N sampled detail/e2e — same accounting as the per-event
+            // path).
+            if let Some(metrics) = &self.metrics {
+                for &idx in appended_idx.iter() {
+                    metrics.inc_alert_emitted_total(self.rule_name());
+                    let (event, event_nanos) = segment[idx];
+                    let now_nanos = self.cached_wall_nanos.load(Ordering::Relaxed);
+                    let sample = self.emit_sample_remaining.load(Ordering::Relaxed);
+                    if sample == 0 {
+                        self.emit_sample_remaining
+                            .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
+                        metrics.inc_alert_emitted_detail(
+                            self.rule_name(),
+                            &RuleExecutor::machine_id_of(event),
+                            self.rule_name(),
+                        );
+                        let e2e_nanos = now_nanos.saturating_sub(event_nanos.max(0) as u64);
+                        metrics.observe_event_e2e_latency(Duration::from_nanos(e2e_nanos));
+                    } else {
+                        self.emit_sample_remaining
+                            .store(sample - 1, Ordering::Relaxed);
+                    }
+                }
+                for _ in 0..outcome.failed {
+                    metrics.inc_alert_serialize_failed();
+                }
+            }
+            if let Some(ser_start) = _ser_start {
+                let elapsed = ser_start.elapsed().as_nanos() as u64;
+                // A segment covers `calls` per-event "calls"; scale the
+                // sampled segment time back to the per-call average × the
+                // sample interval so the accumulator stays comparable with
+                // the per-event path's accounting.
+                let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64 / calls.max(1) as u64;
+                self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
+                if let Some(metrics) = &self.metrics {
+                    metrics.add_alert_serialize_nanos(scaled);
+                }
+            }
+            if should_flush {
+                self.flush_alerts().await;
+            }
+            start = end;
+        }
     }
 
     /// Flush the accumulated columnar alert batches to the sink writers,

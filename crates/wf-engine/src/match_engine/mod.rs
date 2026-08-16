@@ -12,7 +12,7 @@ pub use event_bridge::{
     batch_to_events_filtered, batch_to_timestamped_rows, is_wfl_structured_field,
     wfl_structured_field_kind,
 };
-pub use executor::{RuleExecutor, RuleExecutorOptions};
+pub use executor::{EachDirectBatchStats, RuleExecutor, RuleExecutorOptions};
 pub use match_engine::{EngineHashMap, EngineHashSet};
 pub use match_engine::{
     CepStateMachine, CloseOutput, CloseReason, Event, JoinKey, MACHINE_ID, MatchedContext,

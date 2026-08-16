@@ -153,6 +153,30 @@ pub(super) fn build_each_wfx_id(
     origin: &AlertOrigin,
     field_order: &[&smol_str::SmolStr],
 ) -> String {
+    let mut scratch = String::new();
+    build_each_wfx_id_reusing(
+        rule_name,
+        event_time_nanos,
+        ctx,
+        origin,
+        field_order,
+        &mut scratch,
+    )
+}
+
+/// [`build_each_wfx_id`] with a caller-provided value-rendering scratch
+/// buffer. The batched on-each direct path reuses one buffer across a whole
+/// event batch — `clear()` keeps the capacity, so per-row rendering stops
+/// re-allocating. The hashed byte stream is identical to the allocating
+/// version.
+pub(super) fn build_each_wfx_id_reusing(
+    rule_name: &str,
+    event_time_nanos: i64,
+    ctx: &crate::match_engine::match_engine::Event,
+    origin: &AlertOrigin,
+    field_order: &[&smol_str::SmolStr],
+    scratch: &mut String,
+) -> String {
     let mut hasher = Fnv1a::new();
     hasher.update(rule_name.as_bytes());
     hasher.update(b"\x00");
@@ -163,7 +187,6 @@ pub(super) fn build_each_wfx_id(
     // written into one scratch `String` reused across fields instead of one
     // heap allocation per field (the byte stream is identical — wfx_id values
     // are stable against the pre-optimization path).
-    let mut scratch = String::new();
     let ordered = field_order.len() == ctx.fields.len();
     if ordered {
         // Schema order precomputed once per batch (same window → same
@@ -172,7 +195,7 @@ pub(super) fn build_each_wfx_id(
             if let Some(value) = ctx.fields.get(*name) {
                 hasher.update(name.as_bytes());
                 hasher.update(b"\x1e");
-                write_value_scratch(value, &mut scratch);
+                write_value_scratch(value, scratch);
                 hasher.update(scratch.as_bytes());
                 hasher.update(b"\x1f");
             }
@@ -185,7 +208,7 @@ pub(super) fn build_each_wfx_id(
         for (name, value) in fields {
             hasher.update(name.as_bytes());
             hasher.update(b"\x1e");
-            write_value_scratch(value, &mut scratch);
+            write_value_scratch(value, scratch);
             hasher.update(scratch.as_bytes());
             hasher.update(b"\x1f");
         }

@@ -5,6 +5,8 @@ mod each_exec;
 mod eval;
 mod match_exec;
 
+pub use each_exec::EachDirectBatchStats;
+
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;

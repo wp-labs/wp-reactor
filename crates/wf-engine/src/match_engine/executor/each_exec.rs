@@ -1,15 +1,19 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use smol_str::SmolStr;
+use wf_lang::ast::Expr;
 
 use crate::alert::{AlertColumnBuilder, EachRowCells};
 use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::MACHINE_ID;
-use crate::match_engine::match_engine::{CepStateMachine, Event, WindowLookup};
+use crate::match_engine::match_engine::{
+    CepStateMachine, Event, Value, WindowLookup, eval_field_value,
+};
 
 use super::RuleExecutor;
-use super::alert::{build_each_wfx_id, format_nanos_utc, now_nanos};
+use super::alert::{build_each_wfx_id, build_each_wfx_id_reusing, format_nanos_utc, now_nanos};
 use super::context::execute_joins;
 use super::eval::{
     YieldMeta, eval_bool_expr, eval_entity_id, eval_score, eval_yield_expr_with_meta,
@@ -116,6 +120,220 @@ impl RuleExecutor {
         }
         self.build_each_direct(&ctx, event_time_nanos, field_order, emit_time_nanos, builder)?;
         Ok(true)
+    }
+
+    /// Batch form of [`Self::execute_each_direct`] (build_each_direct
+    /// vectorization): appends rows for a whole event batch, hoisting the
+    /// plan-constant work out of the per-row loop.
+    ///
+    /// What is hoisted (vs. calling `execute_each_direct` per event):
+    /// - constant expressions evaluate once per call: a literal score
+    ///   (`Number`) is clamped once, a literal entity id / literal yield
+    ///   values are built once and cloned per row;
+    /// - `Expr::Field` yields resolve through `eval_field_value` directly,
+    ///   skipping the recursive expression interpreter and its per-node
+    ///   eval-time scope traffic;
+    /// - the wfx_id rendering scratch `String` and the hex buffer are reused
+    ///   across rows (byte stream identical — the scratch is cleared per
+    ///   field, exactly as within one call);
+    /// - the builder's columns are reserved up front.
+    ///
+    /// Semantics per row are identical to `execute_each_direct` — filter and
+    /// join rejections skip the row, an evaluation/conversion failure skips
+    /// the row (counted in `failed`, logged) without touching any column,
+    /// and optional-field omission leaves sparse cells. The per-row eval-time
+    /// scope is still entered per row, so `now()`-style functions observe the
+    /// same per-event time they would on the per-event path. Locked by unit
+    /// test against the per-event path.
+    ///
+    /// `appended_out` (cleared) receives the indices into `rows` that were
+    /// appended, so callers can run per-row telemetry without holding the
+    /// builder lock.
+    pub fn execute_each_direct_batch(
+        &self,
+        rows: &[(&Event, i64)],
+        windows: &dyn WindowLookup,
+        field_order: &[&SmolStr],
+        emit_time_nanos: i64,
+        builder: &mut AlertColumnBuilder,
+        appended_out: &mut Vec<usize>,
+    ) -> EachDirectBatchStats {
+        appended_out.clear();
+        let mut stats = EachDirectBatchStats::default();
+        let Some(each_plan) = &self.plan.each_plan else {
+            log::warn!(
+                "execute_each_direct_batch called for non-`on each` rule {}; skipping {} rows",
+                self.plan.name,
+                rows.len()
+            );
+            stats.failed = rows.len();
+            return stats;
+        };
+        let filter = each_plan.filter.as_ref();
+        let statics = self.output_static();
+        let emit_time = self.cached_emit_time(emit_time_nanos);
+        let summary = Arc::clone(statics.each_summary.as_ref().expect(
+            "on-each rule missing precomputed summary",
+        ));
+        let origin = AlertOrigin::Event;
+
+        // -- Plan-constant specialization (evaluated once per batch) -------
+        let score_const = match &self.plan.score_plan.expr {
+            // eval_score on a Number literal is clamp(n), independent of ctx.
+            Expr::Number(n) => Some(n.clamp(0.0, 100.0)),
+            _ => None,
+        };
+        let entity_const = match &self.plan.entity_plan.entity_id_expr {
+            // eval_entity_id on a String literal is the string itself.
+            Expr::StringLit(s) => Some(s.to_string()),
+            _ => None,
+        };
+        // Literal yield values are built once; Field refs take the direct
+        // lookup; everything else goes through the full interpreter with the
+        // per-row meta.
+        let yield_kinds: Vec<YieldKind> = self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| match &field.value {
+                Expr::Number(n) => YieldKind::Lit(Value::Number(*n)),
+                Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
+                Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
+                Expr::Field(_) => YieldKind::Field,
+                _ => YieldKind::General,
+            })
+            .collect();
+
+        builder.reserve_rows(rows.len());
+        let mut wfx_scratch = String::new();
+
+        for (idx, (event, event_time_nanos)) in rows.iter().enumerate() {
+            if !passes_each_filter(filter, event) {
+                stats.rejected += 1;
+                continue;
+            }
+            // Rules without joins never mutate the event — borrow instead of
+            // cloning (same optimization as the per-event path).
+            let ctx: Cow<'_, Event> = if self.plan.joins.is_empty() {
+                Cow::Borrowed::<Event>(*event)
+            } else {
+                let mut ctx = Cow::<Event>::Owned((**event).clone());
+                if !execute_joins(&self.plan.joins, ctx.to_mut(), windows, *event_time_nanos) {
+                    stats.rejected += 1;
+                    continue;
+                }
+                ctx
+            };
+            let ctx = &*ctx;
+
+            // -- Per-row system values --------------------------------------
+            let score = match score_const {
+                Some(s) => s,
+                None => match eval_score(&self.plan.score_plan.expr, ctx) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("alert export error: {e}");
+                        stats.failed += 1;
+                        continue;
+                    }
+                },
+            };
+            let entity_id = match entity_const.as_deref() {
+                Some(s) => s.to_string(),
+                None => match eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("alert export error: {e}");
+                        stats.failed += 1;
+                        continue;
+                    }
+                },
+            };
+            let fired_at = format_nanos_utc(*event_time_nanos);
+            let wfx_id = build_each_wfx_id_reusing(
+                &self.plan.name,
+                *event_time_nanos,
+                ctx,
+                &origin,
+                field_order,
+                &mut wfx_scratch,
+            );
+            let yield_meta = self.each_yield_meta(
+                &wfx_id,
+                &fired_at,
+                &emit_time,
+                &summary,
+                score,
+                &entity_id,
+                &origin,
+                *event_time_nanos,
+                emit_time_nanos,
+            );
+
+            // -- Yield staging (fallible work before any column push) ------
+            builder.begin_row();
+            let staged: CoreResult<()> = with_yield_eval_scope(|| {
+                for ((field, (name, field_type)), kind) in self
+                    .plan
+                    .yield_plan
+                    .fields
+                    .iter()
+                    .zip(statics.yield_specs.iter())
+                    .zip(yield_kinds.iter())
+                {
+                    let value = match kind {
+                        YieldKind::Lit(v) => v.clone(),
+                        YieldKind::Field => {
+                            let Expr::Field(fr) = &field.value else {
+                                unreachable!("YieldKind::Field implies an Expr::Field value")
+                            };
+                            // Missing field falls back to an empty string,
+                            // exactly like the interpreter path's wrapper.
+                            eval_field_value(&ctx.fields, fr)
+                                .unwrap_or_else(|| Value::Str(SmolStr::default()))
+                        }
+                        // Same fallback as the per-event path: a general
+                        // expression never yields None here (the wrapper
+                        // substitutes an empty string).
+                        YieldKind::General => {
+                            eval_yield_expr_with_meta(&field.value, ctx, yield_meta).expect(
+                                "eval_yield_expr_with_meta never returns None",
+                            )
+                        }
+                    };
+                    let Some(value) =
+                        RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)?
+                    else {
+                        // Optional input field was missing → omit it from
+                        // the output row (wp-labs/warp-fusion#62).
+                        continue;
+                    };
+                    builder.stage_yield_cell(name, field_type.as_ref(), &value)?;
+                }
+                Ok(())
+            });
+            if let Err(e) = staged {
+                log::warn!("alert export error: {e}");
+                stats.failed += 1;
+                continue;
+            }
+            builder.commit_each_row(EachRowCells {
+                wfx_id,
+                score,
+                entity_id,
+                fired_at,
+                rule_name: &statics.rule_name,
+                entity_type: &statics.entity_type,
+                origin: &statics.each_origin,
+                close_reason: &statics.each_close_reason,
+                emit_time: &emit_time,
+                summary: &summary,
+            });
+            stats.appended += 1;
+            appended_out.push(idx);
+        }
+        stats
     }
 
     fn build_each_direct(
@@ -328,4 +546,26 @@ fn passes_each_filter(filter: Option<&wf_lang::ast::Expr>, event: &Event) -> boo
         Some(result) => result,
         None => filter.is_none(),
     }
+}
+
+/// Outcome of [`RuleExecutor::execute_each_direct_batch`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EachDirectBatchStats {
+    /// Rows appended to the builder.
+    pub appended: usize,
+    /// Rows skipped by the `where` filter or a join rejection.
+    pub rejected: usize,
+    /// Rows skipped by an evaluation/conversion error (logged; no partial
+    /// row was committed).
+    pub failed: usize,
+}
+
+/// Per-yield-field evaluation strategy for the batched on-each direct path.
+enum YieldKind {
+    /// Literal expression — value built once per batch, cloned per row.
+    Lit(Value),
+    /// `Expr::Field` — direct field lookup, skipping the interpreter.
+    Field,
+    /// Anything else — full interpreter evaluation with the per-row meta.
+    General,
 }

@@ -234,6 +234,27 @@ impl AlertColumnBuilder {
         self.len == 0
     }
 
+    /// Pre-size every column for `additional` more rows (system columns and
+    /// the yield columns created so far). The batched on-each direct path
+    /// calls this once per event-batch segment so the per-row commits stop
+    /// paying amortized vector growth.
+    pub fn reserve_rows(&mut self, additional: usize) {
+        self.wfx_id.reserve(additional);
+        self.rule_name.reserve(additional);
+        self.score.reserve(additional);
+        self.entity_type.reserve(additional);
+        self.entity_id.reserve(additional);
+        self.origin.reserve(additional);
+        self.close_reason.reserve(additional);
+        self.fired_at.reserve(additional);
+        self.emit_time.reserve(additional);
+        self.summary.reserve(additional);
+        for col in &mut self.yield_cols {
+            col.metas.reserve(additional);
+            col.values.reserve(additional);
+        }
+    }
+
     /// Append one record's exported fields to the columns. Applies exactly
     /// the validation and conversion of `to_data_record`; on error nothing
     /// is appended (all fallible work happens before any column push).

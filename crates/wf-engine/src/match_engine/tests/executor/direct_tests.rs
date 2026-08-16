@@ -231,3 +231,268 @@ fn direct_path_wfx_id_matches_record_path() {
         .unwrap();
     assert_eq!(direct_id.get_value(), record_id.get_value());
 }
+
+// -- Batched direct path (build_each_direct vectorization) ------------------
+
+/// Row-view comparison helper: two finished batches must expose identical
+/// `DataRecord` row views.
+fn assert_batches_equal_rows(a: &crate::alert::AlertColumnBatch, b: &crate::alert::AlertColumnBatch) {
+    assert_eq!(a.len(), b.len(), "row count");
+    for row in 0..a.len() {
+        let ra = a.iter_data_records().nth(row).unwrap().unwrap();
+        let rb = b.iter_data_records().nth(row).unwrap().unwrap();
+        assert_eq!(ra.items.len(), rb.items.len(), "row {row} field count");
+        for (fa, fb) in ra.items.iter().zip(rb.items.iter()) {
+            assert_eq!(fa.get_name(), fb.get_name(), "row {row} field name");
+            assert_eq!(fa.get_meta(), fb.get_meta(), "row {row} field meta");
+            assert_eq!(fa.get_value(), fb.get_value(), "row {row} field value");
+        }
+    }
+}
+
+#[test]
+fn execute_each_direct_batch_matches_per_event_path_rows() {
+    // Same mixed event batch (one with a missing optional field) through the
+    // per-event direct path and the batched direct path must produce
+    // identical rows, appended counts, and appended-index bookkeeping.
+    let exec = each_plan_rule();
+    let events = sample_events();
+    let lookup = EmptyLookup;
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+
+    // Per-event path.
+    let mut via_per_event = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut per_event_appended = 0usize;
+    for (i, ev) in events.iter().enumerate() {
+        let appended = exec
+            .execute_each_direct(ev, NANOS + i as i64, &lookup, &[], NANOS, &mut via_per_event)
+            .expect("per-event direct path must succeed");
+        if appended {
+            per_event_appended += 1;
+        }
+    }
+
+    // Batched path.
+    let rows: Vec<(&Event, i64)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut via_batch = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_idx = Vec::new();
+    let stats = exec.execute_each_direct_batch(
+        &rows,
+        &lookup,
+        &[],
+        NANOS,
+        &mut via_batch,
+        &mut appended_idx,
+    );
+    assert_eq!(stats.appended, per_event_appended);
+    assert_eq!(stats.rejected, 0);
+    assert_eq!(stats.failed, 0);
+    assert_eq!(appended_idx, (0..events.len()).collect::<Vec<_>>());
+
+    assert_batches_equal_rows(&via_per_event.finish(), &via_batch.finish());
+}
+
+#[test]
+fn execute_each_direct_batch_lit_and_general_specs_match_record_path() {
+    // Const score + StringLit entity + literal/field/general (WfuMeta) yields:
+    // every specialization lane must stay row-equivalent to the record path.
+    use wf_lang::wfu_meta::WfuMetaField;
+
+    let mut plan = simple_rule_plan(
+        "lit_rule",
+        simple_plan(vec![], vec![]),
+        Expr::Number(7.5),
+        "ip",
+        Expr::StringLit("fixed-entity".into()),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "const_str".into(),
+            value: Expr::StringLit("const-value".into()),
+        },
+        YieldField {
+            name: "const_num".into(),
+            value: Expr::Number(1.25),
+        },
+        YieldField {
+            name: "const_bool".into(),
+            value: Expr::Bool(true),
+        },
+        YieldField {
+            name: "sip".into(),
+            value: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+        },
+        YieldField {
+            name: "fired_at".into(),
+            value: Expr::WfuMeta(WfuMetaField::FiredAt),
+        },
+    ];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("const_str".into(), FieldType::Base(BaseType::Chars)),
+            ("const_num".into(), FieldType::Base(BaseType::Float)),
+            ("const_bool".into(), FieldType::Base(BaseType::Bool)),
+            ("sip".into(), FieldType::Base(BaseType::Chars)),
+            ("fired_at".into(), FieldType::Base(BaseType::Chars)),
+        ]),
+    );
+    let events = sample_events();
+    let lookup = EmptyLookup;
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+
+    // Record path.
+    let mut via_records = AlertColumnBuilder::new(Arc::from("alerts"));
+    for (i, ev) in events.iter().enumerate() {
+        let record = exec
+            .execute_each_with_joins(ev, NANOS + i as i64, &lookup, &[], NANOS)
+            .unwrap()
+            .unwrap();
+        via_records.append_record(&record).unwrap();
+    }
+
+    // Batched path.
+    let rows: Vec<(&Event, i64)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut via_batch = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_idx = Vec::new();
+    let stats = exec.execute_each_direct_batch(
+        &rows,
+        &lookup,
+        &[],
+        NANOS,
+        &mut via_batch,
+        &mut appended_idx,
+    );
+    assert_eq!(stats.appended, events.len());
+    assert_eq!(stats.failed, 0);
+    assert_batches_equal_rows(&via_records.finish(), &via_batch.finish());
+}
+
+#[test]
+fn execute_each_direct_batch_mid_batch_failure_skips_only_that_row() {
+    // Row 2's sip is a non-empty string against a Float yield → conversion
+    // error; rows 1/3 lack sip entirely → optional omission. The batch must
+    // append 2 rows, fail 1, and match the per-event loop exactly.
+    let mut plan = simple_rule_plan(
+        "mixed_rule",
+        simple_plan(vec![], vec![]),
+        Expr::Number(1.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "auction_id".into(),
+            value: Expr::Field(FieldRef::Qualified("e".into(), "auction_id".into())),
+        },
+        YieldField {
+            name: "sip_f".into(),
+            value: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+        },
+    ];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("auction_id".into(), FieldType::Base(BaseType::Float)),
+            ("sip_f".into(), FieldType::Base(BaseType::Float)),
+        ]),
+    );
+    let events = vec![
+        event(vec![("auction_id", num(1.0))]),
+        event(vec![("sip", str_val("10.0.0.2")), ("auction_id", num(2.0))]),
+        event(vec![("auction_id", num(3.0))]),
+    ];
+    let lookup = EmptyLookup;
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+
+    // Per-event path: row 2 errors, rows 1/3 append.
+    let mut via_per_event = AlertColumnBuilder::new(Arc::from("alerts"));
+    for (i, ev) in events.iter().enumerate() {
+        let _ = exec.execute_each_direct(ev, NANOS + i as i64, &lookup, &[], NANOS, &mut via_per_event);
+    }
+
+    // Batched path.
+    let rows: Vec<(&Event, i64)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut via_batch = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_idx = Vec::new();
+    let stats = exec.execute_each_direct_batch(
+        &rows,
+        &lookup,
+        &[],
+        NANOS,
+        &mut via_batch,
+        &mut appended_idx,
+    );
+    assert_eq!(stats.appended, 2, "rows 1 and 3 append");
+    assert_eq!(stats.failed, 1, "row 2 conversion error");
+    assert_eq!(appended_idx, vec![0, 2]);
+    assert_batches_equal_rows(&via_per_event.finish(), &via_batch.finish());
+}
+
+#[test]
+fn execute_each_direct_batch_filter_rejections_match_per_event_path() {
+    // Where-filter rejects must be counted as rejected and produce no rows —
+    // identical to the per-event path.
+    let mut plan = simple_rule_plan(
+        "filtered_batch",
+        simple_plan(vec![], vec![]),
+        Expr::Number(1.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: Some(Expr::BinOp {
+            op: wf_lang::ast::BinOp::Eq,
+            left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
+            right: Box::new(Expr::StringLit("10.0.0.1".into())),
+        }),
+    });
+    let exec = RuleExecutor::new(plan);
+    let events = vec![
+        event(vec![("sip", str_val("10.0.0.1")), ("auction_id", num(1.0))]),
+        event(vec![("sip", str_val("10.9.9.9")), ("auction_id", num(2.0))]),
+        event(vec![("sip", str_val("10.0.0.1")), ("auction_id", num(3.0))]),
+    ];
+    let lookup = EmptyLookup;
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+
+    let rows: Vec<(&Event, i64)> = events.iter().map(|ev| (ev, NANOS)).collect();
+    let mut via_batch = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_idx = Vec::new();
+    let stats = exec.execute_each_direct_batch(
+        &rows,
+        &lookup,
+        &[],
+        NANOS,
+        &mut via_batch,
+        &mut appended_idx,
+    );
+    assert_eq!(stats.appended, 2);
+    assert_eq!(stats.rejected, 1);
+    assert_eq!(appended_idx, vec![0, 2]);
+    assert_eq!(via_batch.len(), 2);
+}
