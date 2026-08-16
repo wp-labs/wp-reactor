@@ -353,11 +353,12 @@ impl Router {
         Ok(report)
     }
 
-    /// Append one pre-parsed window batch (watermark-aware) and broadcast to
-    /// rule subscribers. Shared by the ordered commit path
-    /// ([`Self::route_commit`]) and the inline fallback of
-    /// [`Self::dispatch_parsed`]. `content_bytes` is the Arrow content size
-    /// computed once by `route_parse` (shared across windows of one stream).
+    /// Append one pre-parsed window batch and broadcast to rule subscribers,
+    /// via the shared [`commit_appended_batch`] primitive. Shared by the
+    /// ordered commit path ([`Self::route_commit`]) and the inline fallback
+    /// of [`Self::dispatch_parsed`] (windows without an actor mailbox).
+    /// `content_bytes` is the Arrow content size computed once by
+    /// `route_parse` (shared across windows of one stream).
     async fn commit_window(
         &self,
         batch: &RecordBatch,
@@ -369,85 +370,23 @@ impl Router {
             .registry
             .get_window(&window.window_name)
             .expect("subscription references non-existent window");
-        // Lock-free append. Materialized windows hand the pre-parsed events
-        // to the append; fast-path windows (no rule subscriber) pass `None`
-        // so the batch's `parsed_events` stays uninitialized (lazily parsed
-        // if a rule ever subscribes later). The append returns the assigned
-        // batch seq (consumers ack seq+1).
-        let (outcome, batch_seq) = match &window.events {
-            Some(events) => win.append_with_watermark_parsed_sized(
-                batch.clone(),
-                Arc::clone(events),
-                content_bytes + window.events_bytes,
-            )?,
-            None => win.append_with_watermark_sized(batch.clone(), content_bytes)?,
-        };
-
-        match outcome {
-            AppendOutcome::Appended => {
-                // Push the shared parsed Arc to every rule subscribed to
-                // this window (R1 bridge: rules consume via channel instead
-                // of `window.read()`). Fast-path windows have no subscribers
-                // (the events are `None`), so broadcast is skipped.
-                if let Some(events) = &window.events {
-                    self.rule_fanout
-                        .broadcast(&window.window_name, events, batch_seq)
-                        .await;
-                }
-                if let Some(notify) = self.registry.get_notifier(&window.window_name) {
-                    notify.notify_waiters();
-                }
-                Ok(WindowRouteOutcome {
-                    window_name: window.window_name.clone(),
-                    rows,
-                    late: false,
-                })
-            }
-            AppendOutcome::DroppedLate => Ok(WindowRouteOutcome {
-                window_name: window.window_name.clone(),
-                rows,
-                late: true,
-            }),
-        }
-    }
-
-    /// Append a rule-emitted batch to an intermediate (pipeline) window and
-    /// broadcast its parsed events to subscribing rules.
-    ///
-    /// This is the `|>` counterpart of [`Self::route`]: external sources reach
-    /// windows via `route`, while intermediate windows are written by upstream
-    /// rule tasks (`emit_window_record`). Keeping the parse + append + broadcast
-    /// together here means downstream rules on the push path receive the events
-    /// without a window read, and the pull path keeps working via the notifier.
-    pub async fn append_intermediate(
-        &self,
-        window_name: &str,
-        batch: RecordBatch,
-    ) -> CoreResult<AppendOutcome> {
-        let win = self
-            .registry
-            .get_window(window_name)
-            .expect("intermediate window must exist");
-        let materialize = win.materialize_fields.clone();
-        let parsed = Arc::new(
-            match materialize.as_deref() {
-                Some(fields) => batch_to_events_filtered(&batch, fields),
-                None => batch_to_events(&batch),
-            }
-            .into_iter()
-            .map(Arc::new)
-            .collect::<Vec<_>>(),
-        );
-        // Rule-emitted (intermediate) batches are small, so the O(rows×cols)
-        // accounting can run inline; include the parsed-event footprint so
-        // intermediate windows evict at the same water level as source ones.
-        let byte_size = content_bytes(&batch) + events_bytes(&parsed);
-        let (outcome, batch_seq) =
-            win.append_with_watermark_parsed_sized(batch, Arc::clone(&parsed), byte_size)?;
-        if matches!(outcome, AppendOutcome::Appended) {
-            self.rule_fanout.broadcast(window_name, &parsed, batch_seq).await;
-        }
-        Ok(outcome)
+        let notify = self.registry.get_notifier(&window.window_name);
+        let byte_size = content_bytes + window.events_bytes;
+        let (outcome, _) = super::commit::commit_appended_batch(
+            &win,
+            &self.rule_fanout,
+            notify.as_deref(),
+            &window.window_name,
+            batch.clone(),
+            window.events,
+            byte_size,
+        )
+        .await?;
+        Ok(WindowRouteOutcome {
+            window_name: window.window_name.clone(),
+            rows,
+            late: matches!(outcome, AppendOutcome::DroppedLate),
+        })
     }
 
     /// Borrow the inner registry.
@@ -613,31 +552,7 @@ mod tests {
         assert_eq!(report.skipped_non_local, 0);
     }
 
-    // -- 5. append_intermediate_broadcasts_to_rule_channels -------------------
-
-    #[tokio::test]
-    async fn append_intermediate_broadcasts_to_rule_channels() {
-        let reg = WindowRegistry::build(vec![make_def("win_pipe", vec![], DistMode::Local)])
-            .unwrap();
-        let router = Router::new(reg);
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        router.fanout().register("win_pipe", tx);
-
-        let schema = test_schema();
-        let outcome = router
-            .append_intermediate("win_pipe", make_batch(&schema, &[10_000_000_000], &[42])).await
-            .unwrap();
-        assert!(matches!(outcome, AppendOutcome::Appended));
-
-        let push = rx
-            .try_recv()
-            .expect("intermediate append should broadcast parsed events");
-        assert_eq!(&*push.window_name, "win_pipe");
-        assert_eq!(push.events.len(), 1);
-    }
-
-    // -- 6. route_charges_events_bytes_per_window ----------------------------
+    // -- 5. route_charges_events_bytes_per_window ----------------------------
 
     /// A batch with a JSON `object` field, 100 rows, ts + conn_info columns.
     fn object_batch() -> (SchemaRef, RecordBatch) {
@@ -756,7 +671,7 @@ mod tests {
         assert!(mem_all > mem_ts);
     }
 
-    // -- 7. route_evicts_on_combined_footprint --------------------------------
+    // -- 6. route_evicts_on_combined_footprint --------------------------------
 
     /// #20 fix end-to-end: the router charges `content_bytes + events_bytes`, so
     /// a window capped just above the content-only size drops the batch, while a
@@ -832,7 +747,7 @@ mod tests {
         );
     }
 
-    // -- 8. next_window_seqs is contiguous per (source, window) ---------------
+    // -- 7. next_window_seqs is contiguous per (source, window) ---------------
 
     /// Regression for the actor-path deadlock: a *global* per-source frame
     /// seq has holes from any single window's perspective (a window only

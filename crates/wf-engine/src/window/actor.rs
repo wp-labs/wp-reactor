@@ -186,9 +186,10 @@ pub async fn run_window_actor(
                             // batch sum in flight) exhausts the budget.
                             // Parked bytes stay bounded by the parse-side
                             // in-flight budget instead.
-                            if let WindowMsg::Append { permits, .. } = &mut m {
-                                permits.clear();
-                            }
+                            // `WindowMsg` has a single variant, so this
+                            // destructures unconditionally.
+                            let WindowMsg::Append { permits, .. } = &mut m;
+                            permits.clear();
                             pending.insert((Arc::clone(&source), seq), m);
                         }
                     }
@@ -223,9 +224,12 @@ pub async fn run_window_actor(
     }
 }
 
-/// Append one message's batch to the window (watermark-aware) and broadcast
-/// to rule subscribers. Consumes the message — dropping it releases the
-/// window byte-budget permits whether the batch was appended or dropped late.
+/// Commit one message's batch via the shared primitive (append + broadcast +
+/// notify) and report the outcome. Consumes the message — dropping it
+/// releases the window byte-budget permits whether the batch was appended or
+/// dropped late. Entry-point specifics (report callback, error logging) stay
+/// here; the ordering-sensitive core lives in
+/// [`commit_appended_batch`](super::commit::commit_appended_batch).
 async fn commit_append(
     name: &Arc<str>,
     win: &Arc<Window>,
@@ -243,19 +247,11 @@ async fn commit_append(
         permits: _,
     } = msg;
     let rows = batch.num_rows();
-    let result = if let Some(events) = events.as_ref() {
-        win.append_with_watermark_parsed_sized(batch, Arc::clone(events), byte_size)
-    } else {
-        win.append_with_watermark_sized(batch, byte_size)
-    };
+    let result =
+        super::commit::commit_appended_batch(win, fanout, Some(notify), name, batch, events, byte_size)
+            .await;
     match result {
-        Ok((AppendOutcome::Appended, batch_seq)) => {
-            // Fast-path windows (events == None) have no rule subscribers;
-            // broadcast is skipped exactly as on the commit-worker path.
-            if let Some(events) = &events {
-                fanout.broadcast(name, events, batch_seq).await;
-            }
-            notify.notify_waiters();
+        Ok((AppendOutcome::Appended, _)) => {
             if let Some(report) = report {
                 report(name, rows, false);
             }

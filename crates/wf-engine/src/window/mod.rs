@@ -1,5 +1,6 @@
 mod actor;
 mod buffer;
+mod commit;
 mod evictor;
 mod fanout;
 pub mod provider;
