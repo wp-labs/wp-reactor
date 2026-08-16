@@ -115,7 +115,7 @@ wp-motor 每个 batch 只到一个 worker（无共享）；wp-reactor 的 **12 �
 | 4 | **watermark/lateness** | route/append 到窗口必须按序（watermark 按 append 推进）。解析 worker 并行但**提交到窗口按 seq 重排**，或窗口接受乱序（按时间列排序） |
 | 5 | **timeout/close** | 规则 worker 保留 timeout 扫描（现有 `scan_timeouts`），窗口水位经 channel 或共享水位推给规则 |
 | 6 | **中间窗口** | 规则输出 → 中间 window → 下游规则：中间窗口作为「生产者」，走同一 push 链（append 后广播） |
-| 7 | **hot reload** | 规则重建时，其 channel 重新绑定（解析 worker 广播目标更新，`ParseDispatchRouter.replace` 模式） |
+| 7 | **hot reload** | 规则重建时，其 channel 重新绑定（解析 worker 广播目标更新，`ParseDispatchRouter.replace` 模式）。语义：reload = 重新开始匹配，存量不回放（见 `wfl-design.md` §11.1） |
 | 8 | **shutdown** | 保证 channel 排空 + 规则 flush（现有两阶段 cancel 语义不变） |
 
 ## 5. 与 wp-motor 的差异（不可照搬处）

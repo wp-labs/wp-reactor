@@ -885,6 +885,22 @@ restore = "latest"             # latest | clean
 - `.wfs` 与运行时物理参数变更需重启。
 - reload 采用 Drop 策略：丢弃在途状态机，立即切新规则。
 
+### 11.1 匹配语义：reload = 重新开始匹配（2026-08-16 拍板）
+
+reload 生效时刻是匹配语义的**硬边界**：
+
+- 新规则世代只对 reload 之后**新到达窗口的事件**开始匹配；
+- 窗口内已驻留的存量数据（reload 前已 append 的批次）**不回放、不重扫**：
+  push 模式下规则经有界 channel 只收到新的广播，存量对新规则不可见；
+- 旧规则世代的在途部分匹配状态被丢弃，不产出部分结果；横跨 reload 边界的
+  匹配（如 reload 时尚未闭合的窗口聚合）不保证完整；
+- 窗口本身（数据、watermark、schema）跨 reload 保留；拓扑变更（schema/window
+  集合）被 `ReloadOutcome::Blocked` 拒绝，需重启（L4）后才清零。
+
+该语义与 Drop 策略一致（旧状态丢弃 + 新状态从零），是当前实现的最简一致读法。
+若未来业务要求"reload 后对存量重扫"，需引入回放通道或快照扫描，属架构级变更，
+不在当前契约内。
+
 ```text
 wf reload
   -> 读取新 .wfl + [vars]
