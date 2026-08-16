@@ -1,5 +1,13 @@
 # Window 内存控制机制
 
+> **状态更新（2026-08-16）：本文 Phase 1（时间驱逐）已被消费感知驱逐取代**——
+> 旧实现用墙钟对比事件时间且 evict_interval 过长导致 bench 期从未 tick / 调小
+> 又会清空未消费窗口。现行机制为 **WindowProgress ack floor**（batch 可驱逐 ⇔
+> 事件时间过期 && 所有消费者已 ack），见
+> [window-log-eviction-design.md](window-log-eviction-design.md) §2。Phase 2
+> （内存驱逐）与 `current_bytes` 统计口径、provider window 不受控的局限仍然
+> 有效。单窗口 `max_window_bytes` 控制保持不变。
+
 ## 概述
 
 wf-engine 的 window 内存控制分两层：

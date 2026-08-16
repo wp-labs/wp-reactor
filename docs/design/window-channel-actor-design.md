@@ -1,5 +1,12 @@
 # 窗口通道化设计：单写者 Window Actor（订阅模型）
 
+> **状态更新（2026-08-16 晚）：拓扑已落地**（A.1/A.2，commit 5c354fb；q1 30M
+> 4.18M/s）。**log 结构最终未采用本文的 LF SkipMap 变体**——RSS 回归 11-12GB 的
+> 根因是 crossbeam-epoch 延迟析构（本文 §1 诊断链正是它的发现过程），最终方案
+> 为 `RwLock<BTreeMap<u64, TimedBatch>>`，见
+> [window-log-eviction-design.md](window-log-eviction-design.md)。通道拓扑、
+> 有序性不变量、内存上界账本（§2-§6）仍然有效。
+
 状态：草案 v2（待评审）
 日期：2026-08-16
 分支基线：columnar-emit（C2, 40ba71d）之上

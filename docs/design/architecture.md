@@ -1,5 +1,12 @@
 # wp-reactor 并发架构
 
+> **状态更新（2026-08-16）：本文描述的 Cursor+Notify pull 模型已演进为 push
+> 模型**——window 生命周期收敛为单写者 actor，规则经通道消费（RulePush 带
+> window seq + ack floor），pull 路径仅测试在用。现行设计见
+> [window-channel-actor-design.md](window-channel-actor-design.md)（拓扑）、
+> [window-log-eviction-design.md](window-log-eviction-design.md)（log 与驱逐）。
+> 本文保留为 pull 时代的架构记录，图中 receiver/router/window 锁边界已过时。
+>
 > Window-Centric Cursor+Notify 模型
 >
 > 2026-02-24

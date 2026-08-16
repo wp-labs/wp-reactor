@@ -1,6 +1,14 @@
 # 方案 B 设计稿：Window → Rule 推送模型（Push + 解析 Worker 池）
 
-> **状态：Design（待评审）**
+> **状态更新（2026-08-16）：已落地**——P0/P1（解析 worker 池 + 规则通道化）与
+> window actor 化在 commit 5c354fb 合入（q1 30M 4.18M/s，semaphore 等待消失）。
+> 落地细节与 v2 拓扑见
+> [window-channel-actor-design.md](window-channel-actor-design.md)（实现版）；
+> log 结构与驱逐见
+> [window-log-eviction-design.md](window-log-eviction-design.md)。本文保留为
+> 设计推理与 wp-motor 对照的原始记录。
+>
+> **原状态：Design（待评审）**
 >
 > 2026-08-13 · 参考实现：[wp-motor](https://github.com/wp-labs/wp-motor)
 > （连接级 picker + pending 缓冲 + 解析 worker 池 round-robin 分发）
