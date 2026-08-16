@@ -33,6 +33,9 @@ wildmatch = { workspace = true }
 chrono = { workspace = true }
 moju-derive = { workspace = true }
 crossbeam-skiplist = "0.1"
+# Same version crossbeam-skiplist defers its unlinked nodes into; the window
+# eviction paths drive its collector so evicted batches are destroyed now.
+crossbeam-epoch = "0.9"
 
 [dev-dependencies]
 arrow = { workspace = true }

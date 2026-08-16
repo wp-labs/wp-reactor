@@ -1,5 +1,5 @@
 use crate::match_engine::{JoinKey, Value};
-use crate::window::buffer::{content_bytes, events_bytes};
+use crate::window::buffer::{content_bytes, events_bytes, reclaim_evicted_nodes};
 use crate::window::buffer::Window;
 use crate::window::buffer::types::AppendOutcome;
 use crate::window::buffer::types::WindowParams;
@@ -947,4 +947,127 @@ fn join_index_duplicate_key_keeps_all_rows() {
         Some(1),
         "one row removed on evict, one kept"
     );
+}
+
+// -- Deferred-drop regression (SkipMap epoch garbage) ---------------------
+//
+// A.1 replaced the `VecDeque<TimedBatch>` window log with a lock-free
+// `SkipMap<u64, TimedBatch>`. Removing a batch from a skip list only unlinks
+// the node; the value's destructor is deferred through crossbeam-epoch's
+// garbage bags and runs only when the global epoch advances twice past the
+// bag's sealing epoch. A window eviction that removed the batch from the log
+// (and from `current_bytes` accounting) can therefore leave the batch —
+// including its pre-parsed `Arc<Vec<Arc<Event>>>` — fully alive in the
+// allocator. In the nexmark q1 run this retained ~6M evicted events
+// (~2.3 GiB): window gauges looked healthy while the heap grew linearly
+// (wp-reactor RSS regression, 2026-08-16; attributed via MallocStackLogging
+// + malloc_history: 8.96M live `HashMap<SmolStr, Value>` tables and
+// `Arc<Event>` boxes allocated in `Router::route_parse`).
+//
+// The contract under test: once a batch has been evicted (gone from
+// `batch_count`/`total_rows`), the engine must not keep its parsed events
+// referenced beyond the eviction call.
+
+fn parsed_events(n: usize) -> Arc<Vec<Arc<crate::match_engine::Event>>> {
+    Arc::new(
+        (0..n)
+            .map(|_| {
+                Arc::new(crate::match_engine::Event {
+                    fields: Default::default(),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Wait (bounded) until the given events `Arc` is only referenced by the test.
+///
+/// Collection is bounded-lag under concurrency: a participant pinned in an
+/// older epoch defers the epoch advance, so the assertion spins the collector
+/// for a while instead of demanding a single synchronous call to succeed.
+/// Without the eviction-path fix this never converges (the deferral bags are
+/// only flushed by `reclaim_evicted_nodes`, not by the normal pin cadence).
+fn assert_events_released(events: &Arc<Vec<Arc<crate::match_engine::Event>>>) {
+    for _ in 0..500 {
+        if Arc::strong_count(events) == 1 {
+            return;
+        }
+        reclaim_evicted_nodes();
+        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(
+        Arc::strong_count(events),
+        1,
+        "evicted batch's parsed events must be dropped with the eviction, \
+         not retained in deferred (epoch-GC) skiplist nodes"
+    );
+}
+
+/// Time eviction must release the evicted batch's parsed events.
+#[test]
+fn time_evicted_batch_releases_parsed_events() {
+    let win = test_window(10, usize::MAX);
+    let schema = win.schema().clone();
+
+    let first = parsed_events(3);
+    win.append_parsed_sized(make_batch(&schema, &[1_000_000_000], &[100]), Arc::clone(&first), 4096)
+        .unwrap();
+    win.append_parsed_sized(
+        make_batch(&schema, &[12_000_000_000], &[300]),
+        parsed_events(3),
+        4096,
+    )
+    .unwrap();
+    assert_eq!(win.batch_count(), 2);
+
+    // cutoff = 12s - 10s = 2s → batch1 (max=1s) evicted.
+    win.evict_expired(12_000_000_000, u64::MAX);
+    assert_eq!(win.batch_count(), 1);
+
+    assert_events_released(&first);
+}
+
+/// Memory eviction (append-side pressure) must release them too.
+#[test]
+fn memory_evicted_batch_releases_parsed_events() {
+    let win = test_window(3600, 6144);
+    let schema = win.schema().clone();
+
+    let first = parsed_events(2);
+    win.append_parsed_sized(make_batch(&schema, &[1_000_000_000], &[100]), Arc::clone(&first), 4096)
+        .unwrap();
+    // Second 4KiB batch pushes current_bytes (8192) over max (6144) → first
+    // evicted; the remaining 4096 is back under the cap so eviction stops.
+    win.append_parsed_sized(
+        make_batch(&schema, &[2_000_000_000], &[200]),
+        parsed_events(2),
+        4096,
+    )
+    .unwrap();
+    assert_eq!(win.batch_count(), 1);
+
+    assert_events_released(&first);
+}
+
+/// `evict_oldest` (explicit memory-pressure path) must release them too.
+#[test]
+fn evict_oldest_releases_parsed_events() {
+    let win = test_window(3600, usize::MAX);
+    let schema = win.schema().clone();
+
+    let first = parsed_events(2);
+    win.append_parsed_sized(make_batch(&schema, &[1_000_000], &[42]), Arc::clone(&first), 4096)
+        .unwrap();
+    win.append_parsed_sized(
+        make_batch(&schema, &[2_000_000], &[43]),
+        parsed_events(2),
+        4096,
+    )
+    .unwrap();
+
+    win.evict_oldest();
+    assert_eq!(win.batch_count(), 1);
+
+    assert_events_released(&first);
 }

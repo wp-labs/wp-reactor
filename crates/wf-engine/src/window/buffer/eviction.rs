@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use super::Window;
+use super::{Window, reclaim_evicted_nodes};
 
 impl Window {
     /// Remove front batches whose max event time is older than `now_nanos - over`.
@@ -21,6 +21,7 @@ impl Window {
         let over_nanos = self.over.as_nanos() as i64;
         let cutoff = now_nanos - over_nanos;
 
+        let mut removed = 0usize;
         loop {
             let removable = {
                 let Some(front) = self.log.front() else {
@@ -48,7 +49,13 @@ impl Window {
                 self.current_bytes.fetch_sub(byte_size, Ordering::Relaxed);
                 self.total_rows.fetch_sub(row_count, Ordering::Relaxed);
                 self.batch_count.fetch_sub(1, Ordering::Relaxed);
+                removed += 1;
             }
+        }
+        if removed > 0 {
+            // Destroy the unlinked nodes' values (batches + parsed events)
+            // instead of leaving them in the epoch-GC deferral bags.
+            reclaim_evicted_nodes();
         }
     }
 
@@ -67,6 +74,7 @@ impl Window {
             .fetch_sub(byte_size, Ordering::Relaxed);
         self.total_rows.fetch_sub(row_count, Ordering::Relaxed);
         self.batch_count.fetch_sub(1, Ordering::Relaxed);
+        reclaim_evicted_nodes();
         Some(byte_size)
     }
 }

@@ -349,14 +349,17 @@ impl Window {
                 row_count,
                 byte_size,
             );
+            // The unlinked nodes' values (including the parsed events) are
+            // deferred into this thread's crossbeam-epoch bag — drive the
+            // collector so they are destroyed instead of lingering.
+            reclaim_evicted_nodes();
         }
 
         Ok(seq)
     }
 
     /// Remove an evicted batch's rows from the join index (if configured).
-    fn remove_batch_from_index(&self, evicted: &TimedBatch) {
-        if !self.join_enabled.load(Ordering::Acquire) {
+    fn remove_batch_from_index(&self, evicted: &TimedBatch) {        if !self.join_enabled.load(Ordering::Acquire) {
             return;
         }
         if let Some(idx) = self
@@ -639,4 +642,34 @@ fn map_heap_bytes(capacity: usize, key_size: usize, value_size: usize) -> usize 
 /// outgrew the inline buffer allocate (payload + NUL).
 fn smol_str_heap_bytes(s: &SmolStr) -> usize {
     if s.is_heap_allocated() { s.len() + 1 } else { 0 }
+}
+
+/// Drive crossbeam-epoch's collector so skiplist nodes unlinked by an eviction
+/// have their `TimedBatch` values destroyed **now**, not whenever some future
+/// unrelated `pin()` happens to advance the epoch.
+///
+/// `SkipMap::remove` only unlinks a node; `Node::finalize` — which drops the
+/// key and the value (the Arrow `RecordBatch` and the pre-parsed
+/// `Arc<Vec<Arc<Event>>>`) — is deferred into the removing thread's
+/// crossbeam-epoch garbage bag. Without this call that memory stays fully
+/// referenced after eviction while the window's byte/row accounting already
+/// shows it gone: in the nexmark q1 10M run ~6M evicted events (~2.3 GiB)
+/// were retained this way while the window gauges read ~270 MiB
+/// (wp-reactor RSS regression, 2026-08-16).
+///
+/// A bag sealed at epoch `E` is only droppable once the global epoch reaches
+/// `E + 2`. Each `flush` seals the calling thread's local bag and attempts one
+/// epoch advance, so the sequence below expires freshly sealed garbage:
+/// flush (seal at `E`, advance to `E + 1`), `repin` (move our own participant
+/// to `E + 1` — a guard still pinned in `E` would itself block the next
+/// advance), flush (advance to `E + 2`, drop the expired bag).
+///
+/// The advance is best-effort: a concurrent participant pinned in an older
+/// epoch defers collection to a later call (the periodic evictor retries every
+/// sweep), so reclamation is bounded-lag, not unconditional, under contention.
+pub(crate) fn reclaim_evicted_nodes() {
+    let mut guard = crossbeam_epoch::pin();
+    guard.flush();
+    guard.repin();
+    guard.flush();
 }
