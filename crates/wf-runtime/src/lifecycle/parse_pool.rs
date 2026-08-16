@@ -75,11 +75,6 @@ pub(crate) const DEFAULT_PARSE_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 /// Floor for the configured byte budget — smaller values would starve the
 /// pipeline's pipelining depth for even modest batch sizes.
 const MIN_PARSE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
-/// Largest number of semaphore permits acquired in one call. Batching the
-/// acquisition in chunks keeps a single oversized batch from deadlocking a
-/// budget smaller than itself (each chunk is ≤ budget, so it always
-/// completes once earlier batches commit and release their permits).
-const ACQUIRE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Byte budget shared by every source task pushing into the parse pool.
 ///
@@ -89,29 +84,54 @@ const ACQUIRE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 /// commit channel) is bounded in **bytes** regardless of batch/frame size —
 /// the item-count channel caps alone scale with frame size and let a flat-out
 /// client park multiple GiB in the channels with big frames.
-pub(crate) type PrereadBudget = Arc<Semaphore>;
+///
+/// Carries the budget **capacity** alongside the semaphore so acquisition can
+/// clamp oversized requests to the full capacity (see [`acquire_preread`]).
+#[derive(Clone)]
+pub(crate) struct PrereadBudget {
+    semaphore: Arc<Semaphore>,
+    capacity: usize,
+}
 
-/// Acquire `bytes` permits from the preread budget, in chunks so any batch
-/// size can be admitted once budget frees up (no deadlock when a single batch
-/// exceeds the total budget). Permits are returned as owned handles; dropping
-/// them (or the item carrying them) releases the budget.
+impl PrereadBudget {
+    pub(crate) fn new(bytes: usize) -> Self {
+        let bytes = bytes.max(MIN_PARSE_BUFFER_BYTES);
+        Self {
+            semaphore: Arc::new(Semaphore::new(bytes)),
+            capacity: bytes,
+        }
+    }
+
+    pub(crate) fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+}
+
+/// Acquire `bytes` permits from the preread budget.
+///
+/// Requests larger than the budget capacity are clamped to the full capacity
+/// (the clamp only under-accounts for frames bigger than the whole budget —
+/// a pathological configuration), and the clamped amount is acquired in a
+/// *single* semaphore call. Chunked acquisition used to let several concurrent
+/// sources each hold a fraction of the budget while each waited for the rest
+/// — the dining-philosophers deadlock (with the 16 MiB floor, two sources
+/// pushing >8 MiB frames deadlocked deterministically); this matches the clamp
+/// discipline already used by `acquire_window_budget`. A single request is
+/// always satisfiable once earlier batches commit and release their permits:
+/// permit release never depends on acquiring more budget, so there is no
+/// circular wait. Permits are returned as owned handles; dropping them (or
+/// the item carrying them) releases the budget.
 pub(crate) async fn acquire_preread(
     budget: &PrereadBudget,
     bytes: usize,
 ) -> Vec<OwnedSemaphorePermit> {
-    let mut permits = Vec::new();
-    let mut remaining = bytes.max(1);
-    while remaining > 0 {
-        let chunk = remaining.min(ACQUIRE_CHUNK_BYTES);
-        match budget.clone().acquire_many_owned(chunk as u32).await {
-            Ok(permit) => permits.push(permit),
-            // Semaphore closed (engine shutting down): stop waiting; the
-            // following channel send will fail and unwind the source anyway.
-            Err(_) => break,
-        }
-        remaining -= chunk;
+    let target = bytes.max(1).min(budget.capacity.max(1)) as u32;
+    match budget.semaphore.clone().acquire_many_owned(target).await {
+        Ok(permit) => vec![permit],
+        // Semaphore closed (engine shutting down): stop waiting; the
+        // following channel send will fail and unwind the source anyway.
+        Err(_) => Vec::new(),
     }
-    permits
 }
 
 /// Blocking flavour of [`acquire_preread`] for `spawn_blocking` replay paths.
@@ -119,23 +139,14 @@ pub(crate) fn acquire_preread_blocking(
     budget: &PrereadBudget,
     bytes: usize,
 ) -> Vec<OwnedSemaphorePermit> {
-    let mut permits = Vec::new();
-    let mut remaining = bytes.max(1);
-    while remaining > 0 {
-        let chunk = remaining.min(ACQUIRE_CHUNK_BYTES);
-        match budget.clone().try_acquire_many_owned(chunk as u32) {
-            Ok(permit) => permits.push(permit),
-            Err(_) => {
-                if budget.is_closed() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
-            }
+    let target = bytes.max(1).min(budget.capacity.max(1)) as u32;
+    loop {
+        match budget.semaphore.clone().try_acquire_many_owned(target) {
+            Ok(permit) => return vec![permit],
+            Err(_) if budget.semaphore.is_closed() => return Vec::new(),
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
         }
-        remaining -= chunk;
     }
-    permits
 }
 
 /// A decoded batch handed from a source task to the parse worker pool.
@@ -292,10 +303,9 @@ pub(crate) fn spawn_parse_pool_with_preread(
     preread_bytes: usize,
 ) -> (mpsc::Sender<ParseItem>, PrereadBudget) {
     let worker_count = worker_count.max(1);
-    let preread_bytes = preread_bytes.max(MIN_PARSE_BUFFER_BYTES);
     let (parse_tx, parse_rx) = mpsc::channel::<ParseItem>(PARSE_CHANNEL_CAPACITY);
     let parse_rx = Arc::new(tokio::sync::Mutex::new(parse_rx));
-    let preread: PrereadBudget = Arc::new(Semaphore::new(preread_bytes));
+    let preread: PrereadBudget = PrereadBudget::new(preread_bytes);
 
     let direct = router.has_mailboxes();
 

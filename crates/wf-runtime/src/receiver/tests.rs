@@ -292,7 +292,7 @@ async fn file_ndjson_replay_routes_rows() {
         Arc::clone(&router),
         None,
         parse_tx.clone(),
-        Arc::clone(&preread),
+        preread.clone(),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
@@ -362,7 +362,7 @@ async fn file_ndjson_replay_routes_rows_by_row_stream() {
         Arc::clone(&router),
         None,
         parse_tx.clone(),
-        Arc::clone(&preread),
+        preread.clone(),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
@@ -440,7 +440,7 @@ async fn file_ndjson_dynamic_unknown_stream_is_window_miss() {
         Arc::clone(&router),
         Some(Arc::clone(&metrics)),
         parse_tx.clone(),
-        Arc::clone(&preread),
+        preread.clone(),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
@@ -529,7 +529,7 @@ a,3000000000,3\n",
         Arc::clone(&router),
         None,
         parse_tx.clone(),
-        Arc::clone(&preread),
+        preread.clone(),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
@@ -607,7 +607,7 @@ b,4000000000,4\n",
         Arc::clone(&router),
         Some(Arc::clone(&metrics)),
         parse_tx.clone(),
-        Arc::clone(&preread),
+        preread.clone(),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
@@ -931,7 +931,7 @@ async fn file_arrow_framed_replay_routes_rows() {
         Arc::clone(&router),
         None,
         parse_tx.clone(),
-        Arc::clone(&preread),
+        preread.clone(),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
             None,
@@ -991,7 +991,7 @@ async fn file_arrow_framed_unknown_tag_is_window_miss() {
         Arc::clone(&router),
         Some(Arc::clone(&metrics)),
         parse_tx.clone(),
-        Arc::clone(&preread),
+        preread.clone(),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
             None,
@@ -1051,7 +1051,7 @@ async fn file_arrow_ipc_replay_routes_rows() {
         Arc::clone(&router),
         None,
         parse_tx.clone(),
-        Arc::clone(&preread),
+        preread.clone(),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
     )
@@ -1490,7 +1490,7 @@ async fn push_decoded_batch_returns_false_when_channel_closed() {
     let seq = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::channel::<ParseItem>(1);
     drop(rx); // receiver gone → send fails
-    let preread: PrereadBudget = Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024));
+    let preread = PrereadBudget::new(16 * 1024 * 1024);
     let batch = make_batch(&test_schema(), &[1_000_000_000], &[1]);
     let ok = push_decoded_batch(&tx, &preread, &seq, "src", "events", batch, &router, None, None).await;
     assert!(!ok, "push to a closed parse channel must report failure");
@@ -1535,6 +1535,43 @@ async fn preread_budget_applies_backpressure_until_commit_releases() {
     drop(group);
 }
 
+/// Two concurrent sources each acquiring **more than the total budget** must
+/// both terminate. With chunked acquisition each source held part of the
+/// budget while waiting for the rest — the dining-philosophers deadlock,
+/// identical to the window-budget bug already fixed (see
+/// [`crate::lifecycle`]`::parse_pool::acquire_preread` and the clamp discipline
+/// in `acquire_window_budget`). The fix acquires the (capacity-clamped) amount
+/// in a *single* semaphore call, so no requester ever holds a fraction while
+/// waiting for the remainder.
+#[tokio::test]
+async fn preread_budget_concurrent_oversized_acquires_terminate() {
+    use crate::lifecycle::parse_pool::acquire_preread;
+
+    let budget = PrereadBudget::new(16 * 1024 * 1024);
+    let mk = |bytes: usize| {
+        let budget = budget.clone();
+        tokio::spawn(async move { acquire_preread(&budget, bytes).await })
+    };
+    let a = mk(20 * 1024 * 1024);
+    let b = mk(20 * 1024 * 1024);
+    // Consume A, release its permits (a real source's permits are released
+    // after its batch commits), then B must complete: each request is a
+    // single capacity-clamped acquire, so no one holds a fraction while
+    // waiting. Under the old chunked acquisition A itself never finishes
+    // (it holds 16 MiB across two chunks while waiting for the last 4 MiB
+    // that B's first chunk already holds) and the timeout fires.
+    let a = tokio::time::timeout(Duration::from_secs(10), a)
+        .await
+        .expect("oversized acquire A deadlocked")
+        .expect("acquire task A panicked");
+    drop(a);
+    let b = tokio::time::timeout(Duration::from_secs(10), b)
+        .await
+        .expect("oversized acquire B deadlocked")
+        .expect("acquire task B panicked");
+    drop((b, budget));
+}
+
 #[tokio::test]
 async fn file_ndjson_replay_fails_when_parse_pool_closed() {
     let router = make_router("events");
@@ -1570,7 +1607,7 @@ async fn file_ndjson_replay_fails_when_parse_pool_closed() {
         Arc::clone(&router),
         None,
         tx,
-        Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024)) as PrereadBudget,
+        PrereadBudget::new(16 * 1024 * 1024),
         Arc::new(AtomicU64::new(0)),
         CancellationToken::new(),
     )

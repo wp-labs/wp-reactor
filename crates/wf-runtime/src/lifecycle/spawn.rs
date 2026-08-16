@@ -487,7 +487,7 @@ pub(super) async fn spawn_receiver_task(
                 let router = Arc::clone(&router);
                 let metrics = metrics.clone();
                 let parse_tx = parse_tx.clone();
-                let preread = Arc::clone(&preread);
+                let preread = preread.clone();
                 // Per-source seq: serial assignment inside this source's
                 // replay loop keeps batches ordered for the window actor's
                 // per-source reorder cursor.
@@ -511,7 +511,7 @@ pub(super) async fn spawn_receiver_task(
                                 router,
                                 metrics,
                                 parse_tx.clone(),
-                                Arc::clone(&preread),
+                                preread.clone(),
                                 Arc::clone(&parse_seq),
                                 cancel,
                             )
@@ -529,7 +529,7 @@ pub(super) async fn spawn_receiver_task(
                                 router,
                                 metrics,
                                 parse_tx.clone(),
-                                Arc::clone(&preread),
+                                preread.clone(),
                                 Arc::clone(&parse_seq),
                                 cancel,
                             )
@@ -544,7 +544,7 @@ pub(super) async fn spawn_receiver_task(
                                 router,
                                 metrics,
                                 parse_tx.clone(),
-                                Arc::clone(&preread),
+                                preread.clone(),
                                 Arc::clone(&parse_seq),
                                 cancel,
                                 limiter,
@@ -560,7 +560,7 @@ pub(super) async fn spawn_receiver_task(
                                 router,
                                 metrics,
                                 parse_tx.clone(),
-                                Arc::clone(&preread),
+                                preread.clone(),
                                 Arc::clone(&parse_seq),
                                 cancel,
                             )
@@ -591,7 +591,7 @@ pub(super) async fn spawn_receiver_task(
                     cancel.child_token(),
                     &mut group,
                     parse_tx.clone(),
-                    Arc::clone(&preread),
+                    preread.clone(),
                     parse_seq,
                     ingest_limiter.clone(),
                 )
@@ -753,7 +753,7 @@ async fn spawn_external_source_tasks(
         let schema = Arc::clone(&schema);
         let schemas = Arc::clone(schemas);
         let parse_tx = parse_tx.clone();
-        let preread = Arc::clone(&preread);
+        let preread = preread.clone();
         let parse_seq = Arc::clone(&parse_seq);
         let limiter = ingest_limiter.clone();
         group.push(tokio::spawn(async move {
