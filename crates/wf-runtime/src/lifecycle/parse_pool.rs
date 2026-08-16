@@ -102,6 +102,9 @@ impl PrereadBudget {
         }
     }
 
+    /// Test-only introspection (used by budget regression tests to assert
+    /// acquisition/release behaviour).
+    #[cfg(test)]
     pub(crate) fn available_permits(&self) -> usize {
         self.semaphore.available_permits()
     }

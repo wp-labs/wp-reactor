@@ -3,10 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
-    new_null_array,
-};
+use arrow::array::new_null_array;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use orion_error::conversion::{SourceRawErr, ToStructError};
@@ -1807,39 +1804,6 @@ struct PipeBatchStager {
     rows: usize,
 }
 
-pub(super) fn build_pipeline_batch(
-    schema: arrow::datatypes::SchemaRef,
-    time_col_index: Option<usize>,
-    event_time_nanos: i64,
-    yield_fields: &[(std::sync::Arc<str>, wf_engine::match_engine::Value)],
-) -> RuntimeResult<RecordBatch> {
-    let values: HashMap<&str, &wf_engine::match_engine::Value> =
-        yield_fields.iter().map(|(k, v)| (&**k, v)).collect();
-    let arrays: Vec<ArrayRef> = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(idx, field)| {
-            if field.name() == PIPE_EVENT_TIME_FIELD {
-                return Ok(
-                    Arc::new(TimestampNanosecondArray::from(vec![Some(event_time_nanos)]))
-                        as ArrayRef,
-                );
-            }
-            let value = values.get(field.name().as_str()).copied();
-            if time_col_index == Some(idx) && value.is_none() {
-                return Ok(
-                    Arc::new(TimestampNanosecondArray::from(vec![Some(event_time_nanos)]))
-                        as ArrayRef,
-                );
-            }
-            value_to_single_row_array(field.data_type(), value)
-        })
-        .collect::<RuntimeResult<Vec<_>>>()?;
-    RecordBatch::try_new(schema, arrays)
-        .source_raw_err(RuntimeReason::Bootstrap, "build internal pipeline batch")
-}
-
 fn record_window_fields(
     record: &OutputRecord,
 ) -> Vec<(std::sync::Arc<str>, wf_engine::match_engine::Value)> {
@@ -1882,46 +1846,6 @@ fn event_time_nanos(event: &wf_engine::match_engine::Event, time_field: Option<&
             _ => None,
         })
         .unwrap_or(0)
-}
-
-fn value_to_single_row_array(
-    data_type: &DataType,
-    value: Option<&wf_engine::match_engine::Value>,
-) -> RuntimeResult<ArrayRef> {
-    match (data_type, value) {
-        (DataType::Int64, Some(wf_engine::match_engine::Value::Number(n))) => {
-            Ok(Arc::new(Int64Array::from(vec![Some(*n as i64)])))
-        }
-        (DataType::Float64, Some(wf_engine::match_engine::Value::Number(n))) => {
-            Ok(Arc::new(Float64Array::from(vec![Some(*n)])))
-        }
-        (DataType::Boolean, Some(wf_engine::match_engine::Value::Bool(b))) => {
-            Ok(Arc::new(BooleanArray::from(vec![Some(*b)])))
-        }
-        (DataType::Utf8, Some(wf_engine::match_engine::Value::Str(s))) => {
-            Ok(Arc::new(StringArray::from(vec![Some(s.as_str())])))
-        }
-        (DataType::Utf8, Some(wf_engine::match_engine::Value::Number(n))) => {
-            Ok(Arc::new(StringArray::from(vec![Some(n.to_string())])))
-        }
-        (DataType::Utf8, Some(wf_engine::match_engine::Value::Bool(b))) => {
-            Ok(Arc::new(StringArray::from(vec![Some(b.to_string())])))
-        }
-        (
-            DataType::Utf8,
-            Some(
-                value @ (wf_engine::match_engine::Value::Array(_)
-                | wf_engine::match_engine::Value::Object(_)),
-            ),
-        ) => Ok(Arc::new(StringArray::from(vec![Some(
-            value_to_json_string(value)?,
-        )]))),
-        (DataType::Timestamp(_, _), Some(wf_engine::match_engine::Value::Number(n))) => {
-            let nanos = normalize_epoch_timestamp_float_nanos(*n);
-            Ok(Arc::new(TimestampNanosecondArray::from(vec![nanos])))
-        }
-        _ => Ok(new_null_array(data_type, 1)),
-    }
 }
 
 fn value_to_json_string(value: &wf_engine::match_engine::Value) -> RuntimeResult<String> {
@@ -2129,10 +2053,11 @@ mod pipe_stager_tests {
         ]
     }
 
-    /// The flushed column batch must be relay-equivalent to concatenating
-    /// the per-row batches of the old path: same events, same field maps.
+    /// Direct semantic assertions on the staging coercion matrix (the old
+    /// per-row `build_pipeline_batch` path is gone; its behaviour lives on
+    /// exactly in `push_record`).
     #[test]
-    fn staged_batch_matches_per_row_relay_batches() {
+    fn staged_batch_coercion_matrix() {
         let schema = stager_schema();
         let records = varied_records();
         let mut stager = PipeBatchStager::new("t".into(), Arc::clone(&schema), Some(1));
@@ -2142,57 +2067,88 @@ mod pipe_stager_tests {
         let (_, staged) = stager.take_events().unwrap().expect("rows staged");
         assert_eq!(staged.len(), records.len());
 
-        for (idx, record) in records.iter().enumerate() {
-            let old_batch = build_pipeline_batch(
-                Arc::clone(&schema),
-                Some(1),
-                record.event_time_nanos,
-                &record_window_fields(record),
-            )
-            .expect("old-path batch");
-            let old_event = &batch_to_events(&old_batch)[0];
-            assert_eq!(
-                staged[idx].fields, old_event.fields,
-                "row {idx}: staged event must equal the old per-row relay event"
-            );
-        }
+        // Row 0 — every field present, happy path.
+        let f = &staged[0].fields;
+        assert_eq!(f.get(PIPE_EVENT_TIME_FIELD), Some(&Value::Number(1_000.0)));
+        assert_eq!(f.get("event_time"), Some(&Value::Number(1_700_000_000_000_000_000.0)));
+        assert_eq!(f.get("n_i"), Some(&Value::Number(7.0)));
+        assert_eq!(f.get("n_f"), Some(&Value::Number(1.5)));
+        assert_eq!(f.get("flag"), Some(&Value::Bool(true)));
+        assert_eq!(f.get("label"), Some(&Value::Str("x".into())));
+        assert_eq!(f.get("blob"), Some(&Value::Str(r#"[1.0,"a"]"#.into())));
+        assert_eq!(f.get("unsupported"), None, "Date32 column stages as null");
 
-        // Focused semantics on top of the parity check: the time column
-        // falls back to the record event time, and an explicit value wins.
+        // Row 1 — missing scalars -> null (field absent); Utf8 coercion of
+        // Number; the time column falls back to the record event time.
+        let f = &staged[1].fields;
+        assert_eq!(f.get(PIPE_EVENT_TIME_FIELD), Some(&Value::Number(2_000.0)));
         assert_eq!(
-            staged[1].fields.get("event_time"),
+            f.get("event_time"),
             Some(&Value::Number(2_000.0)),
             "missing time-col value must fall back to event_time_nanos"
         );
-        assert_eq!(
-            staged[2].fields.get("event_time"),
-            Some(&Value::Number(3_000.0)),
-            "row without any time value gets its own event_time_nanos"
+        assert_eq!(f.get("n_i"), None);
+        assert_eq!(f.get("n_f"), Some(&Value::Number(2.0)));
+        assert_eq!(f.get("flag"), None);
+        assert_eq!(f.get("label"), Some(&Value::Str("42".into())));
+        assert_eq!(f.get("blob"), None);
+
+        // Row 2 — type mismatches -> null; Utf8 coercion of Bool; a row
+        // without any time value gets its own event_time_nanos.
+        let f = &staged[2].fields;
+        assert_eq!(f.get(PIPE_EVENT_TIME_FIELD), Some(&Value::Number(3_000.0)));
+        assert_eq!(f.get("event_time"), Some(&Value::Number(3_000.0)));
+        assert_eq!(f.get("n_i"), None, "Str into Int64 stages as null");
+        assert_eq!(f.get("flag"), None, "Number into Bool stages as null");
+        assert_eq!(f.get("label"), Some(&Value::Str("true".into())));
+    }
+
+    /// A non-finite number inside a structured (Array/Object) value must
+    /// fail the row instead of serializing `NaN` into JSON.
+    #[test]
+    fn staged_row_rejects_non_finite_number_inside_structured_value() {
+        let schema = stager_schema();
+        let mut stager = PipeBatchStager::new("t".into(), schema, Some(1));
+        let record = record_with(
+            "t",
+            0,
+            vec![(
+                "blob".into(),
+                Value::Object(
+                    [("score".into(), Value::Number(f64::NAN))]
+                        .into_iter()
+                        .collect(),
+                ),
+            )],
         );
-        // Mismatched scalar types stage as null on both paths; the pipe
-        // event-time field is always the record event time.
-        assert_eq!(
-            staged[2].fields.get("n_i"),
-            old_null_probe(&schema, &records[2], "n_i").as_ref(),
-            "type-mismatch row must stage the same value the old path produced"
+        let err = stager
+            .push_record(&record)
+            .expect_err("non-finite structured number should fail");
+        assert!(
+            err.to_string()
+                .contains("structured numeric value must be finite")
         );
     }
 
-    /// What the old single-row path produced for one field (null probe).
-    fn old_null_probe(
-        schema: &arrow::datatypes::SchemaRef,
-        record: &OutputRecord,
-        field: &str,
-    ) -> Option<Value> {
-        let batch = build_pipeline_batch(
-            Arc::clone(schema),
-            Some(1),
-            record.event_time_nanos,
-            &record_window_fields(record),
-        )
-        .expect("old-path batch");
-        let event = &batch_to_events(&batch)[0];
-        event.fields.get(field).cloned()
+    /// An explicit epoch-seconds/millis float yield for a Timestamp column
+    /// is normalized to epoch nanos.
+    #[test]
+    fn staged_timestamp_preserves_time_yield_as_epoch_nanos() {
+        let schema = stager_schema();
+        let mut stager = PipeBatchStager::new("t".into(), schema, Some(1));
+        let ts = 1_700_000_000_123_000_000i64;
+        let record = record_with(
+            "t",
+            0,
+            vec![("event_time".into(), Value::Number(1_700_000_000_123.0))],
+        );
+        stager.push_record(&record).expect("stage row");
+        let (_, staged) = stager.take_events().unwrap().expect("rows staged");
+        assert_eq!(
+            staged[0].fields.get("event_time"),
+            Some(&Value::Number(ts as f64)),
+            "float epoch yield must normalize to exact epoch nanos"
+        );
     }
 
     /// Flushing empties the buffers: a second flush is a no-op and later

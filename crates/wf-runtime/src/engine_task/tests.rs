@@ -2412,53 +2412,6 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
     );
 }
 
-#[test]
-fn pipeline_batch_rejects_non_finite_number_inside_structured_value() {
-    let schema = intermediate_schema();
-    let fields = vec![(
-        "risk_context".into(),
-        wf_engine::match_engine::Value::Object(
-            [(
-                "score".into(),
-                wf_engine::match_engine::Value::Number(f64::NAN),
-            )]
-            .into_iter()
-            .collect(),
-        ),
-    )];
-
-    let err = rule_task::build_pipeline_batch(schema, None, 0, &fields)
-        .expect_err("non-finite structured number should fail");
-    assert!(
-        err.to_string()
-            .contains("structured numeric value must be finite")
-    );
-}
-
-#[test]
-fn pipeline_batch_preserves_time_yield_as_epoch_nanos() {
-    let schema = intermediate_schema();
-    let ts = 1_700_000_000_123_000_000i64;
-    let fields = vec![
-        (
-            "event_time".into(),
-            wf_engine::match_engine::Value::Number(1_700_000_000_123.0),
-        ),
-        (
-            "sip".into(),
-            wf_engine::match_engine::Value::Str("10.0.0.8".into()),
-        ),
-    ];
-
-    let batch = rule_task::build_pipeline_batch(schema, None, 0, &fields).expect("pipeline batch");
-    let ts_col = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-        .expect("event_time should be timestamp nanos");
-    assert_eq!(ts_col.value(0), ts);
-}
-
 #[tokio::test]
 async fn intermediate_target_preserves_explicit_time_field() {
     init_tracing();

@@ -85,8 +85,9 @@ impl RuleExecutor {
     /// join rejects it), in which case nothing was appended.
     ///
     /// Only for rules whose yield target is a sink (not an intermediate
-    /// pipe) — the pipe path needs the full row record
-    /// (`build_pipeline_batch`), so callers keep the record path there.
+    /// pipe) — the pipe path stages full row records column-wise
+    /// (`PipeBatchStager` in wf-runtime), so callers keep the record path
+    /// there.
     pub fn execute_each_direct(
         &self,
         event: &Event,
