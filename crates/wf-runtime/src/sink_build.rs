@@ -199,8 +199,19 @@ async fn build_sink_runtimes(
             wf_meta_disable: wf_meta_disable.to_vec(),
             wf_meta_disable_matcher: WfMetaDisableMatcher::new(wf_meta_disable),
             parallel,
+            payload_blind: is_payload_blind_kind(&spec.kind),
         }));
     }
 
     Ok(runtimes)
+}
+
+/// Payload-blind connector kinds: the sink discards payloads without reading
+/// them, so columnar alert batches are confirmed without materializing rows
+/// (the Flink discarding-sink contract). Kind-based until wp-connector-api
+/// grows a capability query.
+fn is_payload_blind_kind(kind: &str) -> bool {
+    kind.eq_ignore_ascii_case("blackhole")
+        || kind.eq_ignore_ascii_case("discard")
+        || kind.eq_ignore_ascii_case("devnull")
 }

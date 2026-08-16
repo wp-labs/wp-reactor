@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use wp_model_core::model::DataRecord;
+use wf_engine::alert::AlertColumnBatch;
 use wf_engine::sink::{SinkDispatcher, SinkRuntime};
 
 use crate::metrics::RuntimeMetrics;
@@ -26,14 +27,45 @@ const SINK_DRAIN_BUDGET: Duration = Duration::from_secs(1);
 /// Replaces the fixed two-consumer alert pipeline + per-alert wildcard routing:
 /// each sink owns a bounded channel + a consumer task, and the wildcard routes
 /// are resolved once per yield_target (cached) at delivery time.
-/// A batch of serialized alert records delivered to a sink writer. Records are
-/// converted to DataRecords on the rule worker (same thread that allocated
-/// them): sample profiling showed that handing OutputRecords to the sink
-/// consumers — allocating on the rule thread, freeing on the sink thread —
-/// drove mimalloc into its abandoned-page reclaim path (~2x throughput loss,
-/// mi_abandoned_page_try_reclaim / mi_free_try_collect_mt dominating the
-/// leaf profile). Keep the record lifecycle on one thread.
-pub type AlertBatch = Arc<Vec<Arc<DataRecord>>>;
+/// A batch of alert records delivered to a sink writer.
+///
+/// Two payload forms:
+/// - `Columns` (the emit path): records stored as per-field columns (see
+///   `AlertColumnBatch`). Row structs are never materialized on this path;
+///   payload-blind sinks confirm without reading the payload and
+///   row-oriented sinks reconstruct `DataRecord`s lazily via the row view.
+/// - `Rows`: exported `DataRecord`s (escalation / tests / legacy callers).
+///
+/// Records were historically converted on the rule worker (same thread that
+/// allocated them): sample profiling showed that handing OutputRecords to
+/// the sink consumers — allocating on the rule thread, freeing on the sink
+/// thread — drove mimalloc into its abandoned-page reclaim path (~2x
+/// throughput loss). The columnar form keeps that property: dropping a
+/// column batch frees a handful of contiguous buffers instead of millions
+/// of small per-row allocations.
+#[derive(Clone)]
+pub enum AlertBatch {
+    /// Row-oriented payload (escalation forwards whatever form it received;
+    /// also the test/legacy call form). Not constructed by the emit path.
+    #[allow(dead_code)]
+    Rows(Arc<Vec<Arc<DataRecord>>>),
+    Columns(Arc<AlertColumnBatch>),
+}
+
+impl AlertBatch {
+    pub fn len(&self) -> usize {
+        match self {
+            AlertBatch::Rows(rows) => rows.len(),
+            AlertBatch::Columns(cols) => cols.len(),
+        }
+    }
+
+    #[allow(dead_code)]
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 /// Resolved per-sink channel groups for a yield target: each entry is
 /// `(sink_ptr, channels)` where `channels` are the sink's `parallel` writers.
 type ResolvedChannels = Arc<Vec<(usize, Arc<Vec<mpsc::Sender<AlertBatch>>>)>>;
@@ -217,14 +249,18 @@ async fn dispatch_batch(
     batch: AlertBatch,
 ) {
     let dispatch_started = Instant::now();
-    if let Err(e) = sink.send_records(batch.as_slice()).await {
+    let send_result = match &batch {
+        AlertBatch::Rows(rows) => sink.send_records(rows).await,
+        AlertBatch::Columns(cols) => sink.send_column_batch(cols).await,
+    };
+    if let Err(e) = send_result {
         log::warn!("sink {:?} dispatch error: {e}", sink.name);
         if let Some(metrics) = metrics {
             metrics.inc_sink_dispatch_failed();
         }
         // Escalate to error sinks (best-effort, no error-of-error loop).
         for tx in error_txs.iter() {
-            if tx.send(Arc::clone(&batch)).await.is_err() {
+            if tx.send(batch.clone()).await.is_err() {
                 if let Some(metrics) = metrics {
                     metrics.inc_alert_escalate_failed();
                 }

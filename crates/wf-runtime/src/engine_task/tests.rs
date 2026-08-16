@@ -58,7 +58,7 @@ fn empty_tracked_bind_fields() -> std::collections::HashMap<String, HashSet<Stri
 /// Extract the first record from the next alert batch (tests deliver batches).
 fn take_alert(rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>) -> Arc<wp_model_core::model::DataRecord> {
     let batch = rx.try_recv().expect("expected an alert batch");
-    batch.first().cloned().expect("alert batch must not be empty")
+    first_record(&batch)
 }
 
 /// Async variant of [`take_alert`] for `recv().await` based assertions.
@@ -66,7 +66,23 @@ async fn take_alert_recv(
     rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>,
 ) -> Arc<wp_model_core::model::DataRecord> {
     let batch = rx.recv().await.expect("expected an alert batch");
-    batch.first().cloned().expect("alert batch must not be empty")
+    first_record(&batch)
+}
+
+/// First record of a batch in either payload form (columns go through the
+/// row view, which is field-identical to `to_data_record`).
+fn first_record(batch: &crate::alert_task::AlertBatch) -> Arc<wp_model_core::model::DataRecord> {
+    match batch {
+        crate::alert_task::AlertBatch::Rows(rows) => {
+            Arc::clone(rows.first().expect("alert batch must not be empty"))
+        }
+        crate::alert_task::AlertBatch::Columns(cols) => Arc::new(
+            cols.iter_data_records()
+                .next()
+                .expect("alert batch must not be empty")
+                .expect("columnar row view conversion"),
+        ),
+    }
 }
 
 fn make_test_fanout(tx: mpsc::Sender<crate::alert_task::AlertBatch>) -> Arc<SinkFanout> {
@@ -2059,7 +2075,16 @@ fn drain_alert_entity_ids(
 ) -> Vec<String> {
     let mut ids = Vec::new();
     while let Ok(batch) = rx.try_recv() {
-        for record in batch.iter() {
+        let records: Vec<wp_model_core::model::DataRecord> = match &batch {
+            crate::alert_task::AlertBatch::Rows(rows) => {
+                rows.iter().map(|r| r.as_ref().clone()).collect()
+            }
+            crate::alert_task::AlertBatch::Columns(cols) => cols
+                .iter_data_records()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("columnar row view conversion"),
+        };
+        for record in &records {
             ids.push(field_str(record, "__wfu_entity_id"));
         }
     }

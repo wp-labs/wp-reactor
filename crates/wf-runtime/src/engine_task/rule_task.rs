@@ -12,8 +12,7 @@ use arrow::record_batch::RecordBatch;
 use orion_error::conversion::{SourceRawErr, ToStructError};
 use tokio::sync::mpsc;
 
-use wf_engine::alert::OutputRecord;
-use wp_model_core::model::DataRecord;
+use wf_engine::alert::{AlertColumnBuilder, OutputRecord};
 use wf_engine::match_engine::{CepStateMachine, CloseReason, Event, RuleExecutor, StepResult};
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
@@ -36,6 +35,28 @@ const DEBUG_DETAIL_LIMIT: usize = 20;
 const EMIT_METRIC_SAMPLE_INTERVAL: u32 = 64;
 /// Flush size for the batched alert sink delivery (amortizes per-alert fan-out).
 const ALERT_BATCH_SIZE: usize = 256;
+
+/// Columnar accumulation of pending alerts, grouped by yield target.
+///
+/// Records go straight from `OutputRecord` into per-field columns (no
+/// per-row `DataRecord` materialization on the emit path); `flush_alerts`
+/// seals each target's builder into one `AlertColumnBatch` for the sink
+/// channel. See `AlertColumnBatch` for the memory rationale.
+struct PendingAlertColumns {
+    /// Yield targets are few (typically 1-2 per rule) — a linear scan beats
+    /// hashing the target string on every append.
+    by_target: Vec<(std::sync::Arc<str>, AlertColumnBuilder)>,
+    count: usize,
+}
+
+impl Default for PendingAlertColumns {
+    fn default() -> Self {
+        Self {
+            by_target: Vec::new(),
+            count: 0,
+        }
+    }
+}
 
 /// Current wall-clock epoch nanos.
 fn wall_nanos() -> u64 {
@@ -158,11 +179,11 @@ pub(super) struct RuleTask {
     /// Serialize-timing sampler state (1-in-`EMIT_METRIC_SAMPLE_INTERVAL`),
     /// see `emit`.
     serialize_sample_remaining: AtomicU32,
-    /// Batched alert delivery: accumulated (yield_target, exported record)
-    /// pairs flushed to the sink writers when the batch fills / at EOS. The
-    /// DataRecord conversion runs on this thread by design — see [`Self::emit`].
+    /// Batched alert delivery: per-yield-target columnar builders flushed to
+    /// the sink writers when the batch fills / at EOS. The record→columns
+    /// append runs on this thread by design — see [`Self::emit`].
     /// `Mutex` so emit can stay `&self` while RuleTask stays `Sync`.
-    pending_alerts: std::sync::Mutex<Vec<(std::sync::Arc<str>, Arc<DataRecord>)>>,
+    pending_alerts: std::sync::Mutex<PendingAlertColumns>,
 }
 
 impl Drop for RuleTask {
@@ -266,7 +287,7 @@ impl RuleTask {
             cached_wall_nanos: AtomicU64::new(wall_nanos()),
             emit_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
             serialize_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
-            pending_alerts: std::sync::Mutex::new(Vec::new()),
+            pending_alerts: std::sync::Mutex::new(PendingAlertColumns::default()),
         };
         (task, cancel, timeout_scan_interval)
     }
@@ -1094,17 +1115,19 @@ impl RuleTask {
                     .store(sample - 1, Ordering::Relaxed);
             }
         }
-        // Serialize once, then accumulate into the per-rule alert batch. The
-        // batch is flushed to the sink writers when it fills (amortizing the
+        // Append straight into the per-target columnar batch, sealed and
+        // flushed to the sink writers when it fills (amortizing the
         // per-alert fan-out mechanics, matching the wp-motor batch model).
-        // The conversion stays on this thread on purpose: OutputRecords
-        // allocated here and freed on a sink thread drive mimalloc into its
+        // The conversion stays on this thread on purpose: records allocated
+        // here and freed on a sink thread drive mimalloc into its
         // abandoned-page reclaim path — measured ~2x rule-throughput loss.
         //
         // Serialize timing is sampled 1-in-`EMIT_METRIC_SAMPLE_INTERVAL` and
         // scaled back up (same sampling pattern as the e2e metrics): two
         // clock_gettime calls per record measured ~2.5% of on-CPU samples,
         // and the per-record timing only feeds diagnostics, not semantics.
+        // (The metric covers the record→columns append, the successor of the
+        // old to_data_record conversion.)
         let time_this = {
             let rem = self.serialize_sample_remaining.fetch_sub(1, Ordering::Relaxed);
             if rem == 1 {
@@ -1116,16 +1139,37 @@ impl RuleTask {
             }
         };
         let _ser_start = time_this.then(Instant::now);
-        let data = match record.to_data_record() {
-            Ok(data) => Arc::new(data),
-            Err(e) => {
-                if let Some(metrics) = &self.metrics {
-                    metrics.inc_alert_serialize_failed();
+        let (append_result, should_flush) = {
+            let mut pending = self.pending_alerts.lock().unwrap();
+            // Linear target lookup (targets are few); avoids hashing the
+            // target string for every appended record.
+            let slot = pending
+                .by_target
+                .iter_mut()
+                .find(|(target, _)| *target == record.yield_target);
+            let builder = match slot {
+                Some((_, builder)) => builder,
+                None => {
+                    pending
+                        .by_target
+                        .push((std::sync::Arc::clone(&record.yield_target), AlertColumnBuilder::new(std::sync::Arc::clone(&record.yield_target))));
+                    let last = pending.by_target.len() - 1;
+                    &mut pending.by_target[last].1
                 }
-                log::warn!("alert export error: {e}");
-                return;
+            };
+            let result = builder.append_record(&record);
+            if result.is_ok() {
+                pending.count += 1;
             }
+            (result, pending.count >= ALERT_BATCH_SIZE)
         };
+        if let Err(e) = append_result {
+            if let Some(metrics) = &self.metrics {
+                metrics.inc_alert_serialize_failed();
+            }
+            log::warn!("alert export error: {e}");
+            return;
+        }
         if let Some(start) = _ser_start {
             let elapsed = start.elapsed().as_nanos() as u64;
             let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64;
@@ -1134,45 +1178,40 @@ impl RuleTask {
                 metrics.add_alert_serialize_nanos(scaled);
             }
         }
-        let should_flush = {
-            let mut pending = self.pending_alerts.lock().unwrap();
-            pending.push((record.yield_target.clone(), data));
-            pending.len() >= ALERT_BATCH_SIZE
-        };
         if should_flush {
             self.flush_alerts().await;
         }
     }
 
-    /// Flush the accumulated alert batch to the sink writers, grouped by
-    /// yield_target. Each sink receives one `AlertBatch` (a single channel send)
-    /// of exported DataRecords, amortizing the per-alert resolve / try_send /
-    /// blocking that dominated the q1 pass-through emit path.
+    /// Flush the accumulated columnar alert batches to the sink writers,
+    /// grouped by yield_target. Each sink receives one `AlertBatch` (a single
+    /// channel send) of columnar records, amortizing the per-alert resolve /
+    /// try_send / blocking that dominated the q1 pass-through emit path.
     async fn flush_alerts(&self) {
-        if self.pending_alerts.lock().unwrap().is_empty() {
-            return;
-        }
+        let pending = {
+            let mut guarded = self.pending_alerts.lock().unwrap();
+            if guarded.count == 0 {
+                return;
+            }
+            std::mem::take(&mut *guarded)
+        };
         let _fan_start = Instant::now();
-        let pending = std::mem::take(&mut *self.pending_alerts.lock().unwrap());
-        let mut by_target: HashMap<std::sync::Arc<str>, Vec<Arc<DataRecord>>> = HashMap::new();
-        for (target, record) in pending {
-            by_target.entry(target).or_default().push(record);
-        }
-        for (target, records) in by_target {
+        for (target, mut builder) in pending.by_target {
+            let records_len = builder.len();
             let sink_groups = self.sink_fanout.resolve(&target);
             if sink_groups.is_empty() {
                 if let Some(metrics) = &self.metrics {
-                    metrics.add_alert_no_sink_records(records.len() as u64);
+                    metrics.add_alert_no_sink_records(records_len as u64);
                 }
                 self.sink_fanout.warn_if_no_sink(&target);
                 continue;
             }
-            let batch: crate::alert_task::AlertBatch = Arc::new(records);
+            let batch = crate::alert_task::AlertBatch::Columns(Arc::new(builder.finish()));
             for (sink_ptr, channels) in sink_groups.iter() {
                 // Round-robin across this sink's parallel writers.
                 let idx = self.sink_fanout.next_index(*sink_ptr, channels.len());
                 let tx = &channels[idx];
-                match tx.try_send(Arc::clone(&batch)) {
+                match tx.try_send(batch.clone()) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
                         if let Some(metrics) = &self.metrics {

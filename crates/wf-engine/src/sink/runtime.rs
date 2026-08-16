@@ -6,7 +6,7 @@ use wildmatch::WildMatch;
 use wp_connector_api::{SinkHandle, SinkSpec as ResolvedSinkSpec};
 use wp_model_core::model::{DataRecord, DataType};
 
-use crate::alert::WFU_PREFIX;
+use crate::alert::{AlertColumnBatch, WFU_PREFIX};
 use crate::error::{CoreReason, CoreResult};
 
 #[derive(Clone)]
@@ -59,6 +59,12 @@ pub struct SinkRuntime {
     /// runtime spawns this many consumers per sink to parallelize the alert
     /// delivery fan-out.
     pub parallel: usize,
+    /// Payload-blind contract: this sink discards payloads without reading
+    /// them (blackhole / discarding sinks). Columnar batches are confirmed
+    /// without materializing rows — the Flink discarding-sink equivalent.
+    /// Derived from the connector kind until wp-connector-api grows a
+    /// capability query.
+    pub payload_blind: bool,
 }
 
 impl SinkRuntime {
@@ -123,6 +129,23 @@ impl SinkRuntime {
             CoreReason::Sink,
             format!("sink {:?} send records", self.name),
         )
+    }
+
+    /// Send a columnar batch. Payload-blind sinks confirm without touching
+    /// the payload; row-oriented sinks reconstruct `DataRecord`s via the
+    /// column batch's row view (same field order as `to_data_record`) and
+    /// take the existing [`Self::send_records`] path.
+    pub async fn send_column_batch(&self, batch: &AlertColumnBatch) -> CoreResult<()> {
+        if self.payload_blind {
+            return Ok(());
+        }
+        let records: Vec<Arc<DataRecord>> = batch
+            .iter_data_records()
+            .collect::<CoreResult<Vec<_>>>()?
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        self.send_records(&records).await
     }
 
     /// Gracefully stop the sink.
@@ -262,6 +285,7 @@ mod tests {
             wf_meta_disable: wf_meta_disable.clone(),
             wf_meta_disable_matcher: WfMetaDisableMatcher::new(&wf_meta_disable),
             parallel: 1,
+            payload_blind: false,
         }
     }
 

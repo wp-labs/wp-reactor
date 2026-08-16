@@ -250,7 +250,7 @@ pub fn data_record_to_json_string(record: &DataRecord) -> CoreResult<String> {
         .source_err(CoreReason::DataFormat, "serialize alert record to json")
 }
 
-fn export_yield_value(
+pub(crate) fn export_yield_value(
     value: &Value,
     field_type: Option<&FieldType>,
 ) -> CoreResult<(DataType, ModelValue)> {
