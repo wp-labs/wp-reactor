@@ -602,6 +602,41 @@ mod tests {
 
     // -- 5. appended batches broadcast to rule subscribers ---------------------
 
+    // -- 6. batched inbox must not wait to fill -------------------------------
+
+    /// Latency contract for the mailbox consumer, whatever receive strategy
+    /// it uses (`recv` today, `recv_many` batching if ever revisited): a
+    /// partial inbox — fewer messages than any batch limit — must still be
+    /// processed immediately, never accumulated while waiting for more.
+    /// Guards against a future "batch up then process" regression.
+    #[tokio::test]
+    async fn partial_inbox_processes_without_waiting_for_fill() {
+        let win = make_window("w");
+        let (tx, _cancel) = spawn_actor(Arc::clone(&win)).await;
+
+        // Fewer messages than the inbox capacity (16): all must land promptly.
+        for seq in 0..3u64 {
+            tx.send(msg("s", seq, (seq as i64) * 10_000_000_000, seq as i64))
+                .await
+                .unwrap();
+        }
+
+        let deadline = tokio::time::timeout(
+            Duration::from_millis(500),
+            async {
+                while win.total_rows() < 3 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            },
+        )
+        .await;
+        assert!(
+            deadline.is_ok(),
+            "partial inbox (3 < limit) must process without waiting for more messages"
+        );
+        assert_eq!(appended_values(&win), vec![0, 1, 2]);
+    }
+
     #[tokio::test]
     async fn appended_batch_broadcasts_to_subscribers() {
         use crate::window::RulePush;
