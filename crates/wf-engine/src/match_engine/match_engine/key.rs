@@ -328,7 +328,10 @@ mod tests {
             "roles_obj",
             Value::Object(EngineHashMap::from_iter([(
                 "source".into(),
-                Value::Object(EngineHashMap::from_iter([("uid".into(), Value::Str("abc".into()))])),
+                Value::Object(EngineHashMap::from_iter([(
+                    "uid".into(),
+                    Value::Str("abc".into()),
+                )])),
             )])),
         )]);
         let fr = path(
@@ -391,7 +394,10 @@ mod tests {
     fn eval_path_type_mismatch_is_none() {
         let f = fields(&[(
             "roles_obj",
-            Value::Object(EngineHashMap::from_iter([("source".into(), Value::Str("s".into()))])),
+            Value::Object(EngineHashMap::from_iter([(
+                "source".into(),
+                Value::Str("s".into()),
+            )])),
         )]);
         // `source` is a string, not an object → next member fails.
         let fr = path(
@@ -433,7 +439,10 @@ mod tests {
         // An index segment applied to a non-array value is a type mismatch.
         let f = fields(&[(
             "roles_obj",
-            Value::Object(EngineHashMap::from_iter([("x".into(), Value::Str("s".into()))])),
+            Value::Object(EngineHashMap::from_iter([(
+                "x".into(),
+                Value::Str("s".into()),
+            )])),
         )]);
         let fr = path(
             "e",

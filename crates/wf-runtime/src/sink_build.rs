@@ -96,20 +96,44 @@ pub async fn build_sink_dispatcher(
 
     // Build infra default sinks
     let default_sinks = if let Some(ref fixed) = bundle.infra_default {
-        build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, fixed.parallel, registry, &ctx).await?
+        build_sink_runtimes(
+            &fixed.sinks,
+            &[],
+            &fixed.wf_meta_disable,
+            fixed.parallel,
+            registry,
+            &ctx,
+        )
+        .await?
     } else {
         Vec::new()
     };
 
     // Build infra error sinks
     let error_sinks = if let Some(ref fixed) = bundle.infra_error {
-        build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, fixed.parallel, registry, &ctx).await?
+        build_sink_runtimes(
+            &fixed.sinks,
+            &[],
+            &fixed.wf_meta_disable,
+            fixed.parallel,
+            registry,
+            &ctx,
+        )
+        .await?
     } else {
         Vec::new()
     };
 
     let monitor_sinks = if let Some(ref fixed) = bundle.infra_monitor {
-        build_sink_runtimes(&fixed.sinks, &[], &fixed.wf_meta_disable, fixed.parallel, registry, &ctx).await?
+        build_sink_runtimes(
+            &fixed.sinks,
+            &[],
+            &fixed.wf_meta_disable,
+            fixed.parallel,
+            registry,
+            &ctx,
+        )
+        .await?
     } else {
         Vec::new()
     };

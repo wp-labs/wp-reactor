@@ -75,7 +75,10 @@ pub(super) fn build_eval_context(
             && let Some(branch) = step_plan.branches.get(sd.satisfied_branch_index)
         {
             let source_field = format!("_step_{}_source", step_idx);
-            fields.insert(source_field.into(), Value::Str(branch.source.clone().into()));
+            fields.insert(
+                source_field.into(),
+                Value::Str(branch.source.clone().into()),
+            );
         }
     }
 
@@ -251,7 +254,8 @@ mod tests {
         let step_data: Vec<StepData> = vec![];
         let step_plans: Vec<&StepPlan> = vec![];
 
-        let event = build_eval_context(&keys, &scope_key, &step_data, &bind_data, &step_plans, None);
+        let event =
+            build_eval_context(&keys, &scope_key, &step_data, &bind_data, &step_plans, None);
         assert_eq!(
             event.fields.get("sip"),
             Some(&Value::Str("10.0.0.1".into()))

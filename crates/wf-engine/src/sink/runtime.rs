@@ -120,7 +120,10 @@ impl SinkRuntime {
                 data = Arc::new(project_record(record, fields)?);
             }
             if !self.wf_meta_disable_matcher.is_empty() {
-                data = Arc::new(mark_wf_meta_fields_ignored(&data, &self.wf_meta_disable_matcher));
+                data = Arc::new(mark_wf_meta_fields_ignored(
+                    &data,
+                    &self.wf_meta_disable_matcher,
+                ));
             }
             batch.push(data);
         }

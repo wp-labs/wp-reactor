@@ -522,7 +522,7 @@ mod tests {
         )
         .await
         .expect("oversized acquisition must not deadlock");
-        let held: usize = permits.iter().map(|p| p.num_permits() as usize).sum();
+        let held: usize = permits.iter().map(|p| p.num_permits()).sum();
         assert_eq!(held, capacity, "charge clamps to the full budget");
         assert_eq!(budget.available_permits(), 0);
         drop(permits);
@@ -551,7 +551,7 @@ mod tests {
                     .await
                     .expect("oversized acquisition must not deadlock");
                     for p in permits.iter() {
-                        assert_eq!(p.num_permits() as usize, capacity);
+                        assert_eq!(p.num_permits(), capacity);
                     }
                     drop(permits);
                     tokio::task::yield_now().await;

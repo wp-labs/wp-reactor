@@ -7,10 +7,10 @@ use crate::ast::{
 };
 use crate::checker::check_wfl;
 use crate::plan::{
-    AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, EachPlan, EntityPlan,
-    ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, PatternOriginPlan,
-    RateSpec, RulePlan, ScorePlan, SeqPlan, SeqSkipPlan, SeqStepPlan, SortKeyPlan, StepPlan,
-    WindowSpec, YieldField, YieldPlan,
+    AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, ConvWindowPlan, EachPlan,
+    EntityPlan, ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan,
+    PatternOriginPlan, RateSpec, RulePlan, ScorePlan, SeqPlan, SeqSkipPlan, SeqStepPlan,
+    SortKeyPlan, StepPlan, WindowSpec, YieldField, YieldPlan,
 };
 use crate::schema::WindowSchema;
 use crate::yield_preset::expand_yield_args;
@@ -99,6 +99,16 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile) -> RulePlan {
         &yield_plan.fields,
     );
 
+    let conv_plan = compile_conv(&rule.conv);
+    // P2c: fixed-window conv rules get an auto-generated conv aggregation
+    // window (shardable); sliding/session conv stays inline (not shardable).
+    let conv_window = conv_plan
+        .as_ref()
+        .and_then(|_| match match_plan.window_spec.clone() {
+            WindowSpec::Fixed(over) => Some(build_conv_window_plan(&match_plan, over)),
+            _ => None,
+        });
+
     RulePlan {
         name: rule.name.clone(),
         binds,
@@ -112,8 +122,26 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile) -> RulePlan {
             pattern_name: po.pattern_name.clone(),
             args: po.args.clone(),
         }),
-        conv_plan: compile_conv(&rule.conv),
+        conv_plan,
         limits_plan: compile_limits(&rule.limits),
+        conv_window,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conv aggregation window (P2c)
+// ---------------------------------------------------------------------------
+
+/// Build the auto-generated conv aggregation window descriptor for a
+/// fixed-window conv rule.
+///
+/// Only `over` and `keys` are consumed at runtime (the conv stage buckets by
+/// `over`); there is no materialized aggregation window, so no window schema
+/// fields are derived here (P3-A).
+fn build_conv_window_plan(match_plan: &MatchPlan, over: Duration) -> ConvWindowPlan {
+    ConvWindowPlan {
+        over,
+        keys: match_plan.keys.clone(),
     }
 }
 
@@ -211,6 +239,7 @@ fn compile_pipeline_rule(rule: &RuleDecl, file: &WflFile) -> Vec<RulePlan> {
             } else {
                 None
             },
+            conv_window: None,
         });
     }
 
@@ -353,7 +382,6 @@ fn compile_match(mc: &MatchClause, inject_implicit_stage_labels: bool) -> MatchP
         tracked_plain_fields: HashSet::new(),
         accu: mc.accu,
         needs_field_history: false, // set by the caller after binds/joins/yield are known
-
     }
 }
 
@@ -558,7 +586,9 @@ fn expr_uses_l3_series(e: &Expr) -> bool {
         Expr::BinOp { left, right, .. } => expr_uses_l3_series(left) || expr_uses_l3_series(right),
         Expr::Neg(inner) => expr_uses_l3_series(inner),
         Expr::FuncCall { name, args, .. } => {
-            is_l3_series_func(name) || is_event_accessor(name) || args.iter().any(expr_uses_l3_series)
+            is_l3_series_func(name)
+                || is_event_accessor(name)
+                || args.iter().any(expr_uses_l3_series)
         }
         Expr::Object(items) => items.iter().any(|i| expr_uses_l3_series(&i.value)),
         Expr::Array(items) => items.iter().any(expr_uses_l3_series),

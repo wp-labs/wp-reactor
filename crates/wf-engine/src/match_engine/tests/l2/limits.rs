@@ -502,8 +502,7 @@ fn recalibrate_memory_reanchors_after_state_growth() {
         max_throttle: None,
         on_exceed: ExceedAction::Throttle,
     };
-    let mut sm =
-        CepStateMachine::with_limits("rule_recal".to_string(), plan, None, Some(limits));
+    let mut sm = CepStateMachine::with_limits("rule_recal".to_string(), plan, None, Some(limits));
 
     let e = event(vec![("sip", str_val("10.0.0.1"))]);
     // Instance created (base ~320) then step1 completes (grows to ~384).
@@ -577,4 +576,265 @@ fn limits_close_all_rate_limit_deterministic() {
         vec![true, true],
         "earliest-created instances should get alerts"
     );
+}
+
+// ===========================================================================
+// P2b: shared limits across shards (with_limits_shared)
+// ===========================================================================
+
+#[test]
+fn shared_max_instances_capped_collectively_across_shards() {
+    // count >= 2 so instances stay alive after the first event.
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(2.0))])],
+    );
+    let limits = LimitsPlan {
+        max_memory_bytes: None,
+        max_instances: Some(2),
+        max_throttle: None,
+        on_exceed: ExceedAction::Throttle,
+    };
+    let shared = SharedLimits::new();
+    let mut sm1 = CepStateMachine::with_limits_shared(
+        "rule_lim".to_string(),
+        plan.clone(),
+        None,
+        Some(limits.clone()),
+        std::sync::Arc::clone(&shared),
+    );
+    let mut sm2 = CepStateMachine::with_limits_shared(
+        "rule_lim".to_string(),
+        plan,
+        None,
+        Some(limits),
+        std::sync::Arc::clone(&shared),
+    );
+
+    let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
+    let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
+    let e3 = event(vec![("sip", str_val("10.0.0.3"))]);
+
+    // Two shards collectively hold 2 instances (1 each).
+    assert_eq!(sm1.advance("fail", &e1), StepResult::Accumulate);
+    assert_eq!(sm2.advance("fail", &e2), StepResult::Accumulate);
+    assert_eq!(shared.instance_count(), 2);
+
+    // The collective cap of 2 is reached — shard2's third key is throttled
+    // even though shard2 alone has only 1 local instance.
+    assert_eq!(sm2.advance("fail", &e3), StepResult::Accumulate);
+    assert_eq!(shared.instance_count(), 2);
+    assert_eq!(sm1.instance_count(), 1);
+    assert_eq!(sm2.instance_count(), 1);
+
+    // Existing keys still advance normally (collective budget is not frozen).
+    assert!(matches!(sm1.advance("fail", &e1), StepResult::Matched(_)));
+}
+
+#[test]
+fn shared_throttle_capped_collectively_across_shards() {
+    // count >= 1 so every event for a key triggers a match.
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(1.0))])],
+    );
+    let limits = LimitsPlan {
+        max_memory_bytes: None,
+        max_instances: None,
+        max_throttle: Some(RateSpec {
+            count: 2,
+            per: Duration::from_secs(60),
+        }),
+        on_exceed: ExceedAction::Throttle,
+    };
+    let shared = SharedLimits::new();
+    let mut sm1 = CepStateMachine::with_limits_shared(
+        "rule_rate".to_string(),
+        plan.clone(),
+        None,
+        Some(limits.clone()),
+        std::sync::Arc::clone(&shared),
+    );
+    let mut sm2 = CepStateMachine::with_limits_shared(
+        "rule_rate".to_string(),
+        plan,
+        None,
+        Some(limits),
+        std::sync::Arc::clone(&shared),
+    );
+
+    let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
+
+    // Two shards collectively get 2 emits per window (previously 2×2 = 4).
+    assert!(matches!(
+        sm1.advance_at("fail", &e1, 1_000_000_000),
+        StepResult::Matched(_)
+    ));
+    assert!(matches!(
+        sm2.advance_at("fail", &e1, 2_000_000_000),
+        StepResult::Matched(_)
+    ));
+    // Third collective emit is throttled.
+    assert_eq!(
+        sm1.advance_at("fail", &e1, 3_000_000_000),
+        StepResult::Accumulate
+    );
+}
+
+#[test]
+fn shared_fail_rule_latches_all_shards() {
+    // One shard exceeding the instance cap with FailRule fails the whole rule:
+    // the other shard must reject events too (shared failed latch).
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(2.0))])],
+    );
+    let limits = LimitsPlan {
+        max_memory_bytes: None,
+        max_instances: Some(1),
+        max_throttle: None,
+        on_exceed: ExceedAction::FailRule,
+    };
+    let shared = SharedLimits::new();
+    let mut sm1 = CepStateMachine::with_limits_shared(
+        "rule_fail".to_string(),
+        plan.clone(),
+        None,
+        Some(limits.clone()),
+        std::sync::Arc::clone(&shared),
+    );
+    let mut sm2 = CepStateMachine::with_limits_shared(
+        "rule_fail".to_string(),
+        plan,
+        None,
+        Some(limits),
+        std::sync::Arc::clone(&shared),
+    );
+
+    let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
+    let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
+
+    // shard1 fills the single slot; shard2's key exceeds → FailRule latches.
+    assert_eq!(sm1.advance("fail", &e1), StepResult::Accumulate);
+    assert_eq!(sm2.advance("fail", &e2), StepResult::Accumulate);
+    assert!(shared.is_failed());
+
+    // Both shards reject all further events.
+    assert_eq!(sm1.advance("fail", &e1), StepResult::Accumulate);
+    assert_eq!(sm2.advance("fail", &e1), StepResult::Accumulate);
+}
+
+// ===========================================================================
+// P1②: exact max_instances reservation across shards (DropOldest paths)
+// ===========================================================================
+
+#[test]
+fn shared_max_instances_drop_oldest_evicts_local_and_rereserves() {
+    // max=1, DropOldest: a shard with a local instance evicts it and re-reserves
+    // so the shared count stays exactly 1 (the new key swaps in).
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(2.0))])],
+    );
+    let limits = LimitsPlan {
+        max_memory_bytes: None,
+        max_instances: Some(1),
+        max_throttle: None,
+        on_exceed: ExceedAction::DropOldest,
+    };
+    let shared = SharedLimits::new();
+    let mut sm = CepStateMachine::with_limits_shared(
+        "rule_drop".to_string(),
+        plan,
+        None,
+        Some(limits),
+        std::sync::Arc::clone(&shared),
+    );
+    let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
+    let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
+
+    assert_eq!(sm.advance("fail", &e1), StepResult::Accumulate);
+    assert_eq!(shared.instance_count(), 1);
+    // New key exceeds the shared cap: DropOldest evicts the local oldest and
+    // re-reserves, so the count stays exactly 1 and the new key is created.
+    assert_eq!(sm.advance("fail", &e2), StepResult::Accumulate);
+    assert_eq!(shared.instance_count(), 1);
+    assert_eq!(sm.instance_count(), 1);
+}
+
+#[test]
+fn shared_max_instances_drop_oldest_rejects_when_no_local_to_evict() {
+    // max=1, DropOldest, two shards. Shard1 holds the only slot; shard2 has no
+    // local instance to evict, so its new key must be REJECTED (shared budget
+    // held by the other shard) — the previous check-then-act would have created
+    // it and overshot the cap.
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(2.0))])],
+    );
+    let limits = LimitsPlan {
+        max_memory_bytes: None,
+        max_instances: Some(1),
+        max_throttle: None,
+        on_exceed: ExceedAction::DropOldest,
+    };
+    let shared = SharedLimits::new();
+    let mut sm1 = CepStateMachine::with_limits_shared(
+        "rule_drop".to_string(),
+        plan.clone(),
+        None,
+        Some(limits.clone()),
+        std::sync::Arc::clone(&shared),
+    );
+    let mut sm2 = CepStateMachine::with_limits_shared(
+        "rule_drop".to_string(),
+        plan,
+        None,
+        Some(limits),
+        std::sync::Arc::clone(&shared),
+    );
+    let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
+    let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
+
+    // Shard1 reserves the single slot.
+    assert_eq!(sm1.advance("fail", &e1), StepResult::Accumulate);
+    assert_eq!(shared.instance_count(), 1);
+    // Shard2's new key: shared cap reached, no local instance to evict →
+    // rejected (no overshoot).
+    assert_eq!(sm2.advance("fail", &e2), StepResult::Accumulate);
+    assert_eq!(shared.instance_count(), 1);
+    assert_eq!(sm2.instance_count(), 0);
+}
+
+#[test]
+fn shared_max_instances_released_on_close_all() {
+    // Instances closed (permanent remove) release their shared slots, so the
+    // count returns to zero exactly.
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(2.0))])],
+    );
+    let limits = LimitsPlan {
+        max_memory_bytes: None,
+        max_instances: Some(3),
+        max_throttle: None,
+        on_exceed: ExceedAction::Throttle,
+    };
+    let shared = SharedLimits::new();
+    let mut sm = CepStateMachine::with_limits_shared(
+        "rule_close".to_string(),
+        plan,
+        None,
+        Some(limits),
+        std::sync::Arc::clone(&shared),
+    );
+    let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
+    let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
+    assert_eq!(sm.advance("fail", &e1), StepResult::Accumulate);
+    assert_eq!(sm.advance("fail", &e2), StepResult::Accumulate);
+    assert_eq!(shared.instance_count(), 2);
+    // close_all permanently removes both → shared count back to zero.
+    let closes = sm.close_all(CloseReason::Flush);
+    assert_eq!(closes.len(), 2);
+    assert_eq!(shared.instance_count(), 0);
 }

@@ -552,7 +552,9 @@ pub(super) fn eval_func_call(
                 .iter()
                 .map(|arg| eval_expr_ext(arg, event, windows, baselines))
                 .collect::<Option<Vec<_>>>()?;
-            Some(Value::Str(apply_fmt_template(template.as_str(), &values)?.into()))
+            Some(Value::Str(
+                apply_fmt_template(template.as_str(), &values)?.into(),
+            ))
         }
         "concat" => {
             if args.is_empty() {
@@ -742,17 +744,15 @@ pub(super) fn eval_func_call(
         }
         "md5" => {
             let text = eval_single_string_arg(args, event, windows, baselines)?;
-            Some(Value::Str(hex::encode(<Md5 as Md5Digest>::digest(
-                text.as_bytes(),
+            Some(Value::Str(
+                hex::encode(<Md5 as Md5Digest>::digest(text.as_bytes())).into(),
             ))
-            .into()))
         }
         "sha1" => {
             let text = eval_single_string_arg(args, event, windows, baselines)?;
-            Some(Value::Str(hex::encode(<Sha1 as Sha1Digest>::digest(
-                text.as_bytes(),
+            Some(Value::Str(
+                hex::encode(<Sha1 as Sha1Digest>::digest(text.as_bytes())).into(),
             ))
-            .into()))
         }
         "sha1_n" => {
             if args.len() != 2 {
@@ -774,7 +774,9 @@ pub(super) fn eval_func_call(
         }
         "sha256" => {
             let text = eval_single_string_arg(args, event, windows, baselines)?;
-            Some(Value::Str(hex::encode(Sha256::digest(text.as_bytes())).into()))
+            Some(Value::Str(
+                hex::encode(Sha256::digest(text.as_bytes())).into(),
+            ))
         }
         "hex" => {
             let text = eval_single_string_arg(args, event, windows, baselines)?;

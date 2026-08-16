@@ -37,8 +37,8 @@ pub use signal::{ShutdownTrigger, wait_for_signal};
 
 use bootstrap::load_and_compile;
 use spawn::{
-    spawn_alert_task, spawn_evictor_task, spawn_metrics_task, spawn_receiver_task, spawn_rule_tasks,
-    spawn_window_actors,
+    spawn_alert_task, spawn_evictor_task, spawn_metrics_task, spawn_receiver_task,
+    spawn_rule_tasks, spawn_window_actors,
 };
 use types::TaskGroup;
 
@@ -649,7 +649,11 @@ fn watch_receiver_group(
             // Rules flush their trailing instances but keep running (a daemon
             // can accept a subsequent finite input). The counter increments per
             // EOS so multiple finite inputs each trigger a flush.
-            wf_info!(sys, task_group = name, "receiver completed; signaling EOS flush");
+            wf_info!(
+                sys,
+                task_group = name,
+                "receiver completed; signaling EOS flush"
+            );
             let n = *eos_tx.borrow();
             let _ = eos_tx.send(n + 1);
         }

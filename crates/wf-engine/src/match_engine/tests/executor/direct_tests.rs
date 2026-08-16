@@ -30,8 +30,10 @@ impl WindowLookup for EmptyLookup {
     fn snapshot(&self, _window: &str) -> Option<Vec<HashMap<String, Value>>> {
         None
     }
-    fn snapshot_with_timestamps(&self, _window: &str) -> Option<Vec<(i64, HashMap<String, Value>)>>
-    {
+    fn snapshot_with_timestamps(
+        &self,
+        _window: &str,
+    ) -> Option<Vec<(i64, HashMap<String, Value>)>> {
         None
     }
 }
@@ -82,7 +84,10 @@ fn sample_events() -> Vec<Event> {
         ]),
         // Missing optional `price` → the field must be omitted (#62),
         // exercising the sparse-column layout drift on the direct path.
-        event(vec![("sip", str_val("10.0.0.3")), ("auction_id", num(1002.0))]),
+        event(vec![
+            ("sip", str_val("10.0.0.3")),
+            ("auction_id", num(1002.0)),
+        ]),
     ]
 }
 
@@ -236,7 +241,10 @@ fn direct_path_wfx_id_matches_record_path() {
 
 /// Row-view comparison helper: two finished batches must expose identical
 /// `DataRecord` row views.
-fn assert_batches_equal_rows(a: &crate::alert::AlertColumnBatch, b: &crate::alert::AlertColumnBatch) {
+fn assert_batches_equal_rows(
+    a: &crate::alert::AlertColumnBatch,
+    b: &crate::alert::AlertColumnBatch,
+) {
     assert_eq!(a.len(), b.len(), "row count");
     for row in 0..a.len() {
         let ra = a.iter_data_records().nth(row).unwrap().unwrap();
@@ -265,7 +273,14 @@ fn execute_each_direct_batch_matches_per_event_path_rows() {
     let mut per_event_appended = 0usize;
     for (i, ev) in events.iter().enumerate() {
         let appended = exec
-            .execute_each_direct(ev, NANOS + i as i64, &lookup, &[], NANOS, &mut via_per_event)
+            .execute_each_direct(
+                ev,
+                NANOS + i as i64,
+                &lookup,
+                &[],
+                NANOS,
+                &mut via_per_event,
+            )
             .expect("per-event direct path must succeed");
         if appended {
             per_event_appended += 1;
@@ -415,7 +430,7 @@ fn execute_each_direct_batch_mid_batch_failure_skips_only_that_row() {
             ("sip_f".into(), FieldType::Base(BaseType::Float)),
         ]),
     );
-    let events = vec![
+    let events = [
         event(vec![("auction_id", num(1.0))]),
         event(vec![("sip", str_val("10.0.0.2")), ("auction_id", num(2.0))]),
         event(vec![("auction_id", num(3.0))]),
@@ -426,7 +441,14 @@ fn execute_each_direct_batch_mid_batch_failure_skips_only_that_row() {
     // Per-event path: row 2 errors, rows 1/3 append.
     let mut via_per_event = AlertColumnBuilder::new(Arc::from("alerts"));
     for (i, ev) in events.iter().enumerate() {
-        let _ = exec.execute_each_direct(ev, NANOS + i as i64, &lookup, &[], NANOS, &mut via_per_event);
+        let _ = exec.execute_each_direct(
+            ev,
+            NANOS + i as i64,
+            &lookup,
+            &[],
+            NANOS,
+            &mut via_per_event,
+        );
     }
 
     // Batched path.
@@ -472,7 +494,7 @@ fn execute_each_direct_batch_filter_rejections_match_per_event_path() {
         }),
     });
     let exec = RuleExecutor::new(plan);
-    let events = vec![
+    let events = [
         event(vec![("sip", str_val("10.0.0.1")), ("auction_id", num(1.0))]),
         event(vec![("sip", str_val("10.9.9.9")), ("auction_id", num(2.0))]),
         event(vec![("sip", str_val("10.0.0.1")), ("auction_id", num(3.0))]),

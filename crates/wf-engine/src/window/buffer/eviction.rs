@@ -28,13 +28,15 @@ impl Window {
                     break;
                 };
                 let expired = tb.event_time_range.1 < cutoff;
-                let consumed = tb.seq + 1 <= acked_floor;
+                let consumed = tb.seq < acked_floor;
                 expired && consumed
             };
             if !removable {
                 break;
             }
-            let (_, tb) = log.pop_first().expect("front vanished between check and remove");
+            let (_, tb) = log
+                .pop_first()
+                .expect("front vanished between check and remove");
             let byte_size = tb.byte_size;
             let row_count = tb.row_count;
             self.remove_batch_from_index(&tb);
@@ -57,8 +59,7 @@ impl Window {
         let row_count = tb.row_count;
         self.remove_batch_from_index(&tb);
         drop(tb);
-        self.current_bytes
-            .fetch_sub(byte_size, Ordering::Relaxed);
+        self.current_bytes.fetch_sub(byte_size, Ordering::Relaxed);
         self.total_rows.fetch_sub(row_count, Ordering::Relaxed);
         self.batch_count.fetch_sub(1, Ordering::Relaxed);
         Some(byte_size)

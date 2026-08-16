@@ -35,6 +35,27 @@ pub struct RulePlan {
     pub pattern_origin: Option<PatternOriginPlan>,
     pub conv_plan: Option<ConvPlan>,
     pub limits_plan: Option<LimitsPlan>,
+    /// P2c: when a fixed-window rule carries `conv`, the compiler auto-generates
+    /// a conv aggregation window + conv stage. `Some` only for such rules; the
+    /// rule is then shardable and closes are aggregated cross-shard. Sliding /
+    /// session conv rules keep `None` and stay on the legacy inline path.
+    pub conv_window: Option<ConvWindowPlan>,
+}
+
+/// Auto-generated conv aggregation descriptor (P2c).
+///
+/// Marks a fixed-window conv rule as shardable and carries the runtime
+/// bucketing parameters for the conv stage. `over` = fixed bucket length (the
+/// rule's match window duration); `keys` = scope keys. (The runtime aggregates
+/// closes inside the conv stage — a dedicated aggregation window is not
+/// materialized.)
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangExePlan")]
+pub struct ConvWindowPlan {
+    /// Fixed bucket length = the rule's match window duration.
+    pub over: Duration,
+    /// Scope-key fields (same as `MatchPlan.keys`).
+    pub keys: Vec<FieldRef>,
 }
 
 /// Stateless per-event trigger: `on each alias [where expr] -> score(...)`.

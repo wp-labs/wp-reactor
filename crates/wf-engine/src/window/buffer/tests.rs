@@ -1,8 +1,8 @@
 use crate::match_engine::{JoinKey, Value};
-use crate::window::buffer::{content_bytes, events_bytes};
 use crate::window::buffer::Window;
 use crate::window::buffer::types::AppendOutcome;
 use crate::window::buffer::types::WindowParams;
+use crate::window::buffer::{content_bytes, events_bytes};
 use arrow::array::{ArrayRef, Int64Array, StringArray, StructArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::reader::StreamReader;
@@ -79,7 +79,7 @@ fn test_window(over_secs: u64, max_bytes: usize) -> Window {
 
 #[test]
 fn append_and_evict_expired() {
-    let mut win = test_window(10, usize::MAX);
+    let win = test_window(10, usize::MAX);
     let schema = win.schema().clone();
 
     let t1 = 1_000_000_000; // 1 s
@@ -107,7 +107,7 @@ fn append_and_evict_expired() {
 
 #[test]
 fn snapshot_is_independent_of_mutations() {
-    let mut win = test_window(60, usize::MAX);
+    let win = test_window(60, usize::MAX);
     let schema = win.schema().clone();
 
     win.append(make_batch(&schema, &[1_000_000_000], &[100]))
@@ -133,7 +133,7 @@ fn snapshot_is_independent_of_mutations() {
 
 #[test]
 fn empty_batch_is_skipped() {
-    let mut win = test_window(60, usize::MAX);
+    let win = test_window(60, usize::MAX);
     let schema = win.schema().clone();
 
     win.append(make_batch(&schema, &[], &[])).unwrap();
@@ -146,7 +146,7 @@ fn empty_batch_is_skipped() {
 
 #[test]
 fn schema_mismatch_rejected() {
-    let mut win = test_window(60, usize::MAX);
+    let win = test_window(60, usize::MAX);
 
     let wrong_schema = Arc::new(Schema::new(vec![Field::new(
         "different",
@@ -174,7 +174,7 @@ fn memory_eviction_on_append() {
 
     // Allow room for exactly 2 batches.
     let max_bytes = one_batch_size * 2;
-    let mut win = Window::new(
+    let win = Window::new(
         WindowParams {
             name: "mem_win".into(),
             schema,
@@ -204,7 +204,7 @@ fn memory_eviction_on_append() {
 #[test]
 fn no_time_col_window() {
     let schema = test_schema_no_time();
-    let mut win = Window::new(
+    let win = Window::new(
         WindowParams {
             name: "output_win".into(),
             schema: schema.clone(),
@@ -230,7 +230,7 @@ fn no_time_col_window() {
 
 #[test]
 fn evict_on_empty_window_is_noop() {
-    let mut win = test_window(60, usize::MAX);
+    let win = test_window(60, usize::MAX);
     win.evict_expired(i64::MAX, u64::MAX);
     assert!(win.is_empty());
 }
@@ -239,7 +239,7 @@ fn evict_on_empty_window_is_noop() {
 
 #[test]
 fn memory_usage_tracks_correctly() {
-    let mut win = test_window(3600, usize::MAX);
+    let win = test_window(3600, usize::MAX);
     let schema = win.schema().clone();
     assert_eq!(win.memory_usage(), 0);
 
@@ -258,7 +258,7 @@ fn memory_usage_tracks_correctly() {
 
 #[test]
 fn multi_row_batch_time_range() {
-    let mut win = test_window(10, usize::MAX);
+    let win = test_window(10, usize::MAX);
     let schema = win.schema().clone();
 
     // Rows at 1s, 5s, 8s — batch max time is 8s.
@@ -284,7 +284,7 @@ fn multi_row_batch_time_range() {
 #[test]
 fn append_with_watermark_on_time() {
     // watermark delay = 5s, allowed_lateness = 0s
-    let mut win = test_window(3600, usize::MAX);
+    let win = test_window(3600, usize::MAX);
     let schema = win.schema().clone();
 
     // Initial watermark is i64::MIN. Batch at 10s:
@@ -303,7 +303,7 @@ fn append_with_watermark_on_time() {
 #[test]
 fn append_with_watermark_drop_late() {
     // watermark delay = 5s, allowed_lateness = 0s, late_policy = Drop
-    let mut win = test_window(3600, usize::MAX);
+    let win = test_window(3600, usize::MAX);
     let schema = win.schema().clone();
 
     // Send fresh batch at 20s → watermark = 15s
@@ -324,7 +324,7 @@ fn append_with_watermark_drop_late() {
 
 #[test]
 fn watermark_advances_monotonically() {
-    let mut win = test_window(3600, usize::MAX);
+    let win = test_window(3600, usize::MAX);
     let schema = win.schema().clone();
 
     // Batch at 20s → watermark = 15s
@@ -350,7 +350,7 @@ fn watermark_advances_monotonically() {
 
 #[test]
 fn append_with_watermark_schema_mismatch_rejected() {
-    let mut win = test_window(3600, usize::MAX);
+    let win = test_window(3600, usize::MAX);
 
     let wrong_schema = Arc::new(Schema::new(vec![Field::new(
         "different",
@@ -371,7 +371,7 @@ fn append_with_watermark_schema_mismatch_rejected() {
 
 #[test]
 fn read_since_normal() {
-    let mut win = test_window(3600, usize::MAX);
+    let win = test_window(3600, usize::MAX);
     let schema = win.schema().clone();
 
     assert_eq!(win.next_seq(), 0);
@@ -411,7 +411,7 @@ fn read_since_gap_detection() {
     let one_batch_size = content_bytes(&probe);
     // Allow room for exactly 2 batches → oldest evicted when 3rd arrives.
     let max_bytes = one_batch_size * 2;
-    let mut win = Window::new(
+    let win = Window::new(
         WindowParams {
             name: "gap_win".into(),
             schema,
@@ -450,7 +450,7 @@ fn read_since_empty_window() {
 
 #[test]
 fn read_since_cursor_ahead() {
-    let mut win = test_window(3600, usize::MAX);
+    let win = test_window(3600, usize::MAX);
     let schema = win.schema().clone();
     win.append(make_batch(&schema, &[1_000_000_000], &[100]))
         .unwrap();
@@ -484,7 +484,10 @@ fn content_bytes_ipc_roundtrip_does_not_inflate() {
     let sip: StringArray = (0..n).map(|_| Some("10.0.0.1")).collect();
     let score: Int64Array = (0..n).map(|_| Some(42)).collect();
     let obj = StructArray::from(vec![
-        (Arc::new(Field::new("sip", DataType::Utf8, false)), Arc::new(sip) as ArrayRef),
+        (
+            Arc::new(Field::new("sip", DataType::Utf8, false)),
+            Arc::new(sip) as ArrayRef,
+        ),
         (
             Arc::new(Field::new("score", DataType::Int64, false)),
             Arc::new(score) as ArrayRef,
@@ -535,10 +538,7 @@ fn events_bytes_tracks_object_field_footprint() {
 
     let n = 10_000usize;
     let obj_field = Field::new("conn_info", DataType::Utf8, false).with_metadata(
-        std::collections::HashMap::from([(
-            "wf.wfl.field_type".to_string(),
-            "object".to_string(),
-        )]),
+        std::collections::HashMap::from([("wf.wfl.field_type".to_string(), "object".to_string())]),
     );
     let schema = Arc::new(Schema::new(vec![obj_field]));
 
@@ -555,7 +555,9 @@ fn events_bytes_tracks_object_field_footprint() {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(
-            (0..n).map(|_| Some(short_json.to_string())).collect::<StringArray>(),
+            (0..n)
+                .map(|_| Some(short_json.to_string()))
+                .collect::<StringArray>(),
         )],
     )
     .unwrap();
@@ -585,12 +587,16 @@ fn events_bytes_tracks_object_field_footprint() {
     let batch_long = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(
-            (0..n).map(|_| Some(long_json.clone())).collect::<StringArray>(),
+            (0..n)
+                .map(|_| Some(long_json.clone()))
+                .collect::<StringArray>(),
         )],
     )
     .unwrap();
-    let parsed_long: Vec<Arc<crate::match_engine::Event>> =
-        batch_to_events(&batch_long).into_iter().map(Arc::new).collect();
+    let parsed_long: Vec<Arc<crate::match_engine::Event>> = batch_to_events(&batch_long)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
     let est_long = events_bytes(&parsed_long);
     assert!(
         est_long > est,
@@ -607,10 +613,7 @@ fn events_bytes_recurses_into_nested_arrays() {
 
     let n = 100usize;
     let obj_field = Field::new("conn_info", DataType::Utf8, false).with_metadata(
-        std::collections::HashMap::from([(
-            "wf.wfl.field_type".to_string(),
-            "object".to_string(),
-        )]),
+        std::collections::HashMap::from([("wf.wfl.field_type".to_string(), "object".to_string())]),
     );
     let schema = Arc::new(Schema::new(vec![obj_field]));
 
@@ -621,21 +624,29 @@ fn events_bytes_recurses_into_nested_arrays() {
     );
 
     let est_short = events_bytes(
-        &batch_to_events(&RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new((0..n).map(|_| Some(short)).collect::<StringArray>())],
+        &batch_to_events(
+            &RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(
+                    (0..n).map(|_| Some(short)).collect::<StringArray>(),
+                )],
+            )
+            .unwrap(),
         )
-        .unwrap())
         .into_iter()
         .map(Arc::new)
         .collect::<Vec<_>>(),
     );
     let est_long = events_bytes(
-        &batch_to_events(&RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new((0..n).map(|_| Some(long.clone())).collect::<StringArray>())],
+        &batch_to_events(
+            &RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(
+                    (0..n).map(|_| Some(long.clone())).collect::<StringArray>(),
+                )],
+            )
+            .unwrap(),
         )
-        .unwrap())
         .into_iter()
         .map(Arc::new)
         .collect::<Vec<_>>(),
@@ -662,10 +673,7 @@ fn window_evicts_on_parsed_event_footprint_not_content() {
 
     let n = 100usize;
     let obj_field = Field::new("conn_info", DataType::Utf8, false).with_metadata(
-        std::collections::HashMap::from([(
-            "wf.wfl.field_type".to_string(),
-            "object".to_string(),
-        )]),
+        std::collections::HashMap::from([("wf.wfl.field_type".to_string(), "object".to_string())]),
     );
     let schema = Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
@@ -683,14 +691,23 @@ fn window_evicts_on_parsed_event_footprint_not_content() {
 
     let content = content_bytes(&batch);
     let events = events_bytes(&parsed);
-    assert!(events > content, "object fields must dominate the footprint");
+    assert!(
+        events > content,
+        "object fields must dominate the footprint"
+    );
 
     // Cap fits exactly one batch's *combined* footprint. Content-only accounting
     // for two batches stays under it (the undercount); combined accounting does not.
     let cap = content + events + 10;
-    assert!(2 * content <= cap, "content-only accounting should stay under cap");
+    assert!(
+        2 * content <= cap,
+        "content-only accounting should stay under cap"
+    );
     assert!(content + events <= cap, "one batch's real footprint fits");
-    assert!(2 * (content + events) > cap, "two batches' real footprint exceeds cap");
+    assert!(
+        2 * (content + events) > cap,
+        "two batches' real footprint exceeds cap"
+    );
 
     let make = |name: &str, cap: usize| {
         Window::new(
@@ -719,7 +736,7 @@ fn window_evicts_on_parsed_event_footprint_not_content() {
 
     // Old behavior: append_parsed computes content_bytes only → undercounts →
     // retains both batches even though the real footprint is 2× the cap.
-    let mut content_only = make("content_only", cap);
+    let content_only = make("content_only", cap);
     for _ in 0..2 {
         content_only
             .append_with_watermark_parsed(batch.clone(), Arc::new(parsed.clone()))
@@ -738,7 +755,7 @@ fn window_evicts_on_parsed_event_footprint_not_content() {
 
     // New behavior: byte_size includes the parsed events → eviction fires on the
     // real footprint → the window holds exactly one batch.
-    let mut accurate = make("accurate", cap);
+    let accurate = make("accurate", cap);
     for _ in 0..2 {
         accurate
             .append_with_watermark_parsed_sized(
@@ -768,7 +785,7 @@ fn sized_append_keeps_events_lazily_parseable() {
     let content = content_bytes(&batch);
     let cap = content + 10;
 
-    let mut win = Window::new(
+    let win = Window::new(
         WindowParams {
             name: "lazy".into(),
             schema: schema.clone(),
@@ -806,14 +823,22 @@ fn sized_append_keeps_events_lazily_parseable() {
 
 #[test]
 fn join_index_maintained_on_append_and_evict() {
-    let mut win = test_window(3600, usize::MAX);
+    let win = test_window(3600, usize::MAX);
     win.set_join_key("value".into());
 
     // Append two batches with overlapping key values.
-    win.append(make_batch(&test_schema(), &[1_000_000, 2_000_000], &[42, 43]))
-        .unwrap();
-    win.append(make_batch(&test_schema(), &[3_000_000, 4_000_000], &[42, 44]))
-        .unwrap();
+    win.append(make_batch(
+        &test_schema(),
+        &[1_000_000, 2_000_000],
+        &[42, 43],
+    ))
+    .unwrap();
+    win.append(make_batch(
+        &test_schema(),
+        &[3_000_000, 4_000_000],
+        &[42, 44],
+    ))
+    .unwrap();
 
     // Lookup by key: value 42 has 2 rows, 44 has 1, 999 has none.
     assert_eq!(
@@ -835,7 +860,8 @@ fn join_index_maintained_on_append_and_evict() {
     // (1-4ms), so all batches are time-evicted and index entries removed.
     win.evict_expired(4_000_000_000_000, u64::MAX);
     assert!(
-        win.join_lookup(&JoinKey::Int(42)).is_none_or(|v| v.is_empty()),
+        win.join_lookup(&JoinKey::Int(42))
+            .is_none_or(|v| v.is_empty()),
         "index cleared after eviction"
     );
 }
@@ -881,10 +907,14 @@ fn join_index_absent_without_set_join_key() {
 
 #[test]
 fn join_index_built_for_existing_batches_on_set_join_key() {
-    let mut win = test_window(3600, usize::MAX);
+    let win = test_window(3600, usize::MAX);
     // Data appended before the window is configured as a join target.
-    win.append(make_batch(&test_schema(), &[1_000_000, 2_000_000], &[42, 43]))
-        .unwrap();
+    win.append(make_batch(
+        &test_schema(),
+        &[1_000_000, 2_000_000],
+        &[42, 43],
+    ))
+    .unwrap();
     win.append(make_batch(&test_schema(), &[3_000_000], &[44]))
         .unwrap();
     win.set_join_key("value".into());
@@ -902,21 +932,34 @@ fn join_index_built_for_existing_batches_on_set_join_key() {
 
 #[test]
 fn join_index_updated_on_oldest_eviction() {
-    let mut win = test_window(3600, usize::MAX);
+    let win = test_window(3600, usize::MAX);
     win.set_join_key("value".into());
-    win.append(make_batch(&test_schema(), &[1_000_000, 2_000_000], &[42, 43]))
-        .unwrap();
-    win.append(make_batch(&test_schema(), &[3_000_000, 4_000_000], &[44, 45]))
-        .unwrap();
+    win.append(make_batch(
+        &test_schema(),
+        &[1_000_000, 2_000_000],
+        &[42, 43],
+    ))
+    .unwrap();
+    win.append(make_batch(
+        &test_schema(),
+        &[3_000_000, 4_000_000],
+        &[44, 45],
+    ))
+    .unwrap();
 
     // evict_oldest (memory-pressure path) must drop the first batch's keys.
-    assert!(win.evict_oldest().is_some(), "evict_oldest returns byte size");
     assert!(
-        win.join_lookup(&JoinKey::Int(42)).is_none_or(|v| v.is_empty()),
+        win.evict_oldest().is_some(),
+        "evict_oldest returns byte size"
+    );
+    assert!(
+        win.join_lookup(&JoinKey::Int(42))
+            .is_none_or(|v| v.is_empty()),
         "key 42 (first batch) removed after evict_oldest"
     );
     assert!(
-        win.join_lookup(&JoinKey::Int(43)).is_none_or(|v| v.is_empty()),
+        win.join_lookup(&JoinKey::Int(43))
+            .is_none_or(|v| v.is_empty()),
         "key 43 (first batch) removed after evict_oldest"
     );
     assert_eq!(
@@ -928,7 +971,7 @@ fn join_index_updated_on_oldest_eviction() {
 
 #[test]
 fn join_index_duplicate_key_keeps_all_rows() {
-    let mut win = test_window(3600, usize::MAX);
+    let win = test_window(3600, usize::MAX);
     win.set_join_key("value".into());
     // Two rows with the same key 42 in different batches.
     win.append(make_batch(&test_schema(), &[1_000_000], &[42]))
@@ -997,8 +1040,12 @@ fn time_evicted_batch_releases_parsed_events() {
     let schema = win.schema().clone();
 
     let first = parsed_events(3);
-    win.append_parsed_sized(make_batch(&schema, &[1_000_000_000], &[100]), Arc::clone(&first), 4096)
-        .unwrap();
+    win.append_parsed_sized(
+        make_batch(&schema, &[1_000_000_000], &[100]),
+        Arc::clone(&first),
+        4096,
+    )
+    .unwrap();
     win.append_parsed_sized(
         make_batch(&schema, &[12_000_000_000], &[300]),
         parsed_events(3),
@@ -1021,8 +1068,12 @@ fn memory_evicted_batch_releases_parsed_events() {
     let schema = win.schema().clone();
 
     let first = parsed_events(2);
-    win.append_parsed_sized(make_batch(&schema, &[1_000_000_000], &[100]), Arc::clone(&first), 4096)
-        .unwrap();
+    win.append_parsed_sized(
+        make_batch(&schema, &[1_000_000_000], &[100]),
+        Arc::clone(&first),
+        4096,
+    )
+    .unwrap();
     // Second 4KiB batch pushes current_bytes (8192) over max (6144) → first
     // evicted; the remaining 4096 is back under the cap so eviction stops.
     win.append_parsed_sized(
@@ -1043,8 +1094,12 @@ fn evict_oldest_releases_parsed_events() {
     let schema = win.schema().clone();
 
     let first = parsed_events(2);
-    win.append_parsed_sized(make_batch(&schema, &[1_000_000], &[42]), Arc::clone(&first), 4096)
-        .unwrap();
+    win.append_parsed_sized(
+        make_batch(&schema, &[1_000_000], &[42]),
+        Arc::clone(&first),
+        4096,
+    )
+    .unwrap();
     win.append_parsed_sized(
         make_batch(&schema, &[2_000_000], &[43]),
         parsed_events(2),

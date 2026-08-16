@@ -58,9 +58,7 @@ impl YieldMeta<'_> {
             WfuMetaField::EntityType => self.entity_type.map(|value| Value::Str(value.into())),
             WfuMetaField::EntityId => self.entity_id.map(|value| Value::Str(value.into())),
             WfuMetaField::Origin => self.origin.map(|value| Value::Str(value.into())),
-            WfuMetaField::CloseReason => {
-                self.close_reason.map(|value| Value::Str(value.into()))
-            }
+            WfuMetaField::CloseReason => self.close_reason.map(|value| Value::Str(value.into())),
             WfuMetaField::FiredAt => self.fired_at.map(|value| Value::Str(value.into())),
             WfuMetaField::EmitTime => self.emit_time.map(|value| Value::Str(value.into())),
             WfuMetaField::Summary => self.summary.map(|value| Value::Str(value.into())),

@@ -10,7 +10,7 @@ use super::types::{CloseOutput, EngineHashMap, Event, Value};
 /// Iterates through each chain sequentially; within a chain, each operation
 /// is applied left-to-right (pipeline). This produces the final transformed
 /// batch, e.g. `sort(-count) | top(10)` sorts descending then truncates.
-pub(crate) fn apply_conv(
+pub fn apply_conv(
     plan: &ConvPlan,
     keys: &[FieldRef],
     mut outputs: Vec<CloseOutput>,

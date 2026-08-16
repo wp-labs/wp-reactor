@@ -2,12 +2,14 @@ mod close;
 mod conv;
 mod eval;
 mod key;
+mod limits;
 mod seq;
 mod state;
 mod step;
 mod types;
 
 // Re-export public types
+pub use limits::SharedLimits;
 pub use types::{
     BindData, CloseOutput, CloseReason, Event, JoinKey, MACHINE_ID, MatchedContext, StepData,
     StepOutcome, StepProgress, StepResult, Value, WindowLookup,
@@ -21,8 +23,7 @@ pub(crate) use key::{
     value_to_string,
 };
 
-#[cfg(test)]
-pub(crate) use conv::apply_conv;
+pub use conv::apply_conv;
 
 pub(crate) use eval::eval_expr_ext;
 
@@ -30,7 +31,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use wf_lang::ast::CloseMode;
-use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, WindowSpec};
+use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, RateSpec, WindowSpec};
 
 use close::{accumulate_close_steps, evaluate_close, evidence_time_range};
 use key::{InstanceKey, extract_key};
@@ -64,6 +65,15 @@ pub struct CepStateMachine {
     failed: bool,
     emit_count: u64,
     emit_window_start: i64,
+    /// Shared rate-limit / budget atomics across the rule's shards (P2b).
+    ///
+    /// `Some` only when the machine is a shard of a sharded rule with limits;
+    /// the per-machine `emit_count`/`estimated_memory_bytes` fields are then
+    /// unused in favor of the shared atomics.
+    shared: Option<std::sync::Arc<SharedLimits>>,
+    /// When true, close output bypasses inline conv/throttle and is emitted raw
+    /// to the conv aggregation window (P2c). Only set on shards of a conv rule.
+    raw_conv_mode: bool,
     /// Expiry candidates ordered by `(expire_time, instance_key)`.
     ///
     /// Stale candidates are filtered out when popped by checking the current
@@ -100,6 +110,8 @@ impl CepStateMachine {
             failed: false,
             emit_count: 0,
             emit_window_start: 0,
+            shared: None,
+            raw_conv_mode: false,
             expiry_heap: BinaryHeap::new(),
             estimated_memory_bytes: 0,
             seq_meta,
@@ -128,10 +140,55 @@ impl CepStateMachine {
             failed: false,
             emit_count: 0,
             emit_window_start: 0,
+            shared: None,
+            raw_conv_mode: false,
             expiry_heap: BinaryHeap::new(),
             estimated_memory_bytes: 0,
             seq_meta,
         }
+    }
+
+    /// Create a shard of a sharded rule with limits enforcement that shares
+    /// rate-limit / budget atomics across all shards (P2b).
+    pub fn with_limits_shared(
+        rule_name: String,
+        plan: MatchPlan,
+        time_field: Option<String>,
+        limits: Option<LimitsPlan>,
+        shared: std::sync::Arc<SharedLimits>,
+    ) -> Self {
+        let seq_meta = plan
+            .seq
+            .as_ref()
+            .map(|c| SeqRuntime::build(&c.steps, c.consec));
+        Self {
+            rule_name,
+            plan,
+            instances: EngineHashMap::default(),
+            pending_expiry: EngineHashSet::default(),
+            time_field,
+            watermark_nanos: 0,
+            limits,
+            failed: false,
+            emit_count: 0,
+            emit_window_start: 0,
+            shared: Some(shared),
+            raw_conv_mode: false,
+            expiry_heap: BinaryHeap::new(),
+            estimated_memory_bytes: 0,
+            seq_meta,
+        }
+    }
+
+    /// Switch this shard to raw-conv mode (P2c): close output is emitted raw to
+    /// the conv aggregation window instead of inline conv/throttle.
+    pub fn set_raw_conv_mode(&mut self) {
+        self.raw_conv_mode = true;
+    }
+
+    /// Whether this shard emits raw closes for the conv aggregation window.
+    pub fn raw_conv_mode(&self) -> bool {
+        self.raw_conv_mode
     }
 
     /// Returns the rule name this state machine was created for.
@@ -225,8 +282,9 @@ impl CepStateMachine {
         windows: Option<&dyn WindowLookup>,
         capture_progress: bool,
     ) -> StepOutcome {
-        // FailRule: once the rule has failed, reject all future events
-        if self.failed {
+        // FailRule: once the rule has failed, reject all future events.
+        // P2b: with shared limits, a FailRule latch on any shard fails the rule.
+        if self.failed || self.shared.as_ref().is_some_and(|s| s.is_failed()) {
             return step_outcome(StepResult::Accumulate, None);
         }
 
@@ -263,24 +321,50 @@ impl CepStateMachine {
         if is_new
             && let Some(ref limits) = self.limits
             && let Some(max_inst) = limits.max_instances
-            && self.instances.len() >= max_inst
         {
-            match limits.on_exceed {
-                ExceedAction::Throttle => return step_outcome(StepResult::Accumulate, None),
-                ExceedAction::DropOldest => {
-                    // Find and remove the oldest instance
-                    if let Some(oldest_key) = self
-                        .instances
-                        .iter()
-                        .min_by_key(|(_, inst)| inst.created_at)
-                        .map(|(k, _)| k.clone())
-                    {
-                        self.remove_instance(&oldest_key);
+            // P2b: with shared limits the budget is the cross-shard instance total.
+            // Use an exact CAS reservation (`try_reserve_instance`) instead of a
+            // read-then-act check — two shards can no longer both pass a stale
+            // count and overshoot the cap (P1②).
+            let reserved = match &self.shared {
+                Some(shared) => shared.try_reserve_instance(max_inst),
+                None => self.instances.len() < max_inst,
+            };
+            if !reserved {
+                match limits.on_exceed {
+                    ExceedAction::Throttle => return step_outcome(StepResult::Accumulate, None),
+                    // P3-B: under shared limits this evicts this shard's LOCAL
+                    // oldest instance, not the global oldest across shards (a
+                    // cross-shard priority queue is out of scope). The shared
+                    // count stays exact either way; eviction fairness is
+                    // per-shard.
+                    ExceedAction::DropOldest => {
+                        // Evict the local oldest instance, releasing its shared
+                        // slot, then re-reserve so the new instance is counted
+                        // exactly. If this shard has no local instance to evict
+                        // (budget held by other shards), reject the new key.
+                        if let Some(oldest_key) = self
+                            .instances
+                            .iter()
+                            .min_by_key(|(_, inst)| inst.created_at)
+                            .map(|(k, _)| k.clone())
+                            && self.remove_instance(&oldest_key).is_some()
+                            && let Some(shared) = &self.shared
+                        {
+                            shared.release_instance();
+                        }
+                        let re_reserved = match &self.shared {
+                            Some(shared) => shared.try_reserve_instance(max_inst),
+                            None => self.instances.len() < max_inst,
+                        };
+                        if !re_reserved {
+                            return step_outcome(StepResult::Accumulate, None);
+                        }
                     }
-                }
-                ExceedAction::FailRule => {
-                    self.failed = true;
-                    return step_outcome(StepResult::Accumulate, None);
+                    ExceedAction::FailRule => {
+                        fail_rule(&mut self.failed, &self.shared);
+                        return step_outcome(StepResult::Accumulate, None);
+                    }
                 }
             }
         }
@@ -289,7 +373,9 @@ impl CepStateMachine {
         // O(1) per-instance accounting in insert/remove (exact state growth is
         // corrected by periodic `recalibrate_memory`).
         let new_base = if is_new && self.tracks_memory_bytes() {
-            Some(Instance::base_estimated_bytes(&self.plan, &scope_key, alias, event))
+            Some(Instance::base_estimated_bytes(
+                &self.plan, &scope_key, alias, event,
+            ))
         } else {
             None
         };
@@ -297,11 +383,25 @@ impl CepStateMachine {
         // max_memory_bytes: total estimated memory across all instances.
         // Runs on every event to catch both new instance creation and
         // existing instance growth (e.g. distinct_set expansion).
+        //
+        // P1②: under sharding this is an *approximate* budget — the shared total
+        // is a check-then-act read plus per-insert base-cost deltas, so concurrent
+        // shards may transiently overshoot by ≤ shard_count-1 new instances, and
+        // per-instance state growth (distinct_set etc.) is only corrected by the
+        // periodic `recalibrate_memory`. The eviction loop + recalibrate keep it
+        // bounded; an exact CAS reserve is impractical for memory (grows
+        // non-atomically). `max_instances` above IS exact.
         if let Some(ref limits) = self.limits
             && let Some(max_bytes) = limits.max_memory_bytes
         {
             let new_cost = new_base.unwrap_or(0);
-            let mut total = self.estimated_memory_bytes + new_cost;
+            // P2b: with shared limits the budget is the cross-shard memory total.
+            let shared_total = self
+                .shared
+                .as_ref()
+                .map(|s| s.memory_bytes())
+                .unwrap_or(self.estimated_memory_bytes);
+            let mut total = shared_total + new_cost;
             if total >= max_bytes {
                 match limits.on_exceed {
                     ExceedAction::Throttle => return step_outcome(StepResult::Accumulate, None),
@@ -321,6 +421,8 @@ impl CepStateMachine {
                                 let evicting_current = oldest_key == instance_key;
                                 if let Some(removed) = self.remove_instance(&oldest_key) {
                                     total = total.saturating_sub(removed.estimated_bytes());
+                                    // P1②: permanent eviction releases the shared slot.
+                                    self.release_shared_instance();
                                 }
                                 // Current key will be re-created — account for base cost
                                 if evicting_current && !is_new {
@@ -335,7 +437,7 @@ impl CepStateMachine {
                         }
                     }
                     ExceedAction::FailRule => {
-                        self.failed = true;
+                        fail_rule(&mut self.failed, &self.shared);
                         return step_outcome(StepResult::Accumulate, None);
                     }
                 }
@@ -450,37 +552,40 @@ impl CepStateMachine {
 
             if instance.satisfied_flags.iter().all(|&f| f) {
                 // Rate limiting before emitting (mirror the no-close path).
-                if let Some(ref limits) = self.limits
-                    && let Some(ref rate) = limits.max_throttle
+                if let Some(rate) = self.limits.as_ref().and_then(|l| l.max_throttle.clone())
+                    && !throttle_allows(
+                        &self.shared,
+                        &mut self.emit_count,
+                        &mut self.emit_window_start,
+                        now_nanos,
+                        &rate,
+                    )
                 {
-                    let window_nanos = rate.per.as_nanos() as i64;
-                    if now_nanos - self.emit_window_start >= window_nanos {
-                        self.emit_count = 0;
-                        self.emit_window_start = now_nanos;
-                    }
-                    if self.emit_count >= rate.count {
-                        match limits.on_exceed {
-                            ExceedAction::Throttle | ExceedAction::DropOldest => {
-                                // `on event<accu>`: a throttled re-fire suppresses the
-                                // alert but keeps the running accumulation.
-                                if plan.accu {
-                                    instance.rearm(plan);
-                                } else {
-                                    let reset_at = fixed_created_at.unwrap_or(now_nanos);
-                                    instance.reset(plan, reset_at);
-                                    self.push_expiry_candidate(&instance_key, reset_at);
-                                }
-                                self.insert_instance(instance_key, instance);
-                                return step_outcome(StepResult::Accumulate, None);
+                    let on_exceed = self
+                        .limits
+                        .as_ref()
+                        .map(|l| l.on_exceed.clone())
+                        .unwrap_or(ExceedAction::Throttle);
+                    match on_exceed {
+                        ExceedAction::Throttle | ExceedAction::DropOldest => {
+                            // `on event<accu>`: a throttled re-fire suppresses the
+                            // alert but keeps the running accumulation.
+                            if plan.accu {
+                                instance.rearm(plan);
+                            } else {
+                                let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                                instance.reset(plan, reset_at);
+                                self.push_expiry_candidate(&instance_key, reset_at);
                             }
-                            ExceedAction::FailRule => {
-                                self.failed = true;
-                                self.insert_instance(instance_key, instance);
-                                return step_outcome(StepResult::Accumulate, None);
-                            }
+                            self.insert_instance(instance_key, instance);
+                            return step_outcome(StepResult::Accumulate, None);
+                        }
+                        ExceedAction::FailRule => {
+                            fail_rule(&mut self.failed, &self.shared);
+                            self.insert_instance(instance_key, instance);
+                            return step_outcome(StepResult::Accumulate, None);
                         }
                     }
-                    self.emit_count += 1;
                 }
                 let (evidence_first, evidence_last) =
                     evidence_time_range(instance.completed_steps.iter())
@@ -576,7 +681,11 @@ impl CepStateMachine {
                 event_first_time_nanos: step_state.branch_states[branch_idx].event_first_time_nanos,
                 event_last_time_nanos: step_state.branch_states[branch_idx].event_last_time_nanos,
                 collected_values,
-                field_values: step_state.branch_states[branch_idx].field_values.as_deref().cloned().unwrap_or_default(),
+                field_values: step_state.branch_states[branch_idx]
+                    .field_values
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_default(),
             });
 
             // Chain `within`: the completing step must land within its gap of the
@@ -639,37 +748,39 @@ impl CepStateMachine {
 
             if plan.close_steps.is_empty() {
                 // Rate limiting check before emitting
-                if let Some(ref limits) = self.limits
-                    && let Some(ref rate) = limits.max_throttle
+                if let Some(rate) = self.limits.as_ref().and_then(|l| l.max_throttle.clone())
+                    && !throttle_allows(
+                        &self.shared,
+                        &mut self.emit_count,
+                        &mut self.emit_window_start,
+                        now_nanos,
+                        &rate,
+                    )
                 {
-                    let window_nanos = rate.per.as_nanos() as i64;
-                    // Rotate window if expired
-                    if now_nanos - self.emit_window_start >= window_nanos {
-                        self.emit_count = 0;
-                        self.emit_window_start = now_nanos;
-                    }
-                    if self.emit_count >= rate.count {
-                        match limits.on_exceed {
-                            ExceedAction::Throttle | ExceedAction::DropOldest => {
-                                // `on event<accu>`: a throttled re-fire suppresses the
-                                // alert but keeps the running accumulation.
-                                if plan.accu {
-                                    instance.rearm(plan);
-                                } else {
-                                    // Suppress the match — reset instance for future use
-                                    let reset_at = fixed_created_at.unwrap_or(now_nanos);
-                                    instance.reset(plan, reset_at);
-                                    self.push_expiry_candidate(&instance_key, reset_at);
-                                }
-                                break 'process StepResult::Accumulate;
+                    let on_exceed = self
+                        .limits
+                        .as_ref()
+                        .map(|l| l.on_exceed.clone())
+                        .unwrap_or(ExceedAction::Throttle);
+                    match on_exceed {
+                        ExceedAction::Throttle | ExceedAction::DropOldest => {
+                            // `on event<accu>`: a throttled re-fire suppresses the
+                            // alert but keeps the running accumulation.
+                            if plan.accu {
+                                instance.rearm(plan);
+                            } else {
+                                // Suppress the match — reset instance for future use
+                                let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                                instance.reset(plan, reset_at);
+                                self.push_expiry_candidate(&instance_key, reset_at);
                             }
-                            ExceedAction::FailRule => {
-                                self.failed = true;
-                                break 'process StepResult::Accumulate;
-                            }
+                            break 'process StepResult::Accumulate;
+                        }
+                        ExceedAction::FailRule => {
+                            fail_rule(&mut self.failed, &self.shared);
+                            break 'process StepResult::Accumulate;
                         }
                     }
-                    self.emit_count += 1;
                 }
 
                 // No close steps → M14 backward compat: Matched + reset, or
@@ -701,27 +812,30 @@ impl CepStateMachine {
                 StepResult::Matched(ctx)
             } else if plan.close_mode == CloseMode::Or {
                 // OR mode: emit from event path immediately, keep instance alive for close
-                if let Some(ref limits) = self.limits
-                    && let Some(ref rate) = limits.max_throttle
+                if let Some(rate) = self.limits.as_ref().and_then(|l| l.max_throttle.clone())
+                    && !throttle_allows(
+                        &self.shared,
+                        &mut self.emit_count,
+                        &mut self.emit_window_start,
+                        now_nanos,
+                        &rate,
+                    )
                 {
-                    let window_nanos = rate.per.as_nanos() as i64;
-                    if now_nanos - self.emit_window_start >= window_nanos {
-                        self.emit_count = 0;
-                        self.emit_window_start = now_nanos;
-                    }
-                    if self.emit_count >= rate.count {
-                        match limits.on_exceed {
-                            ExceedAction::Throttle | ExceedAction::DropOldest => {
-                                instance.event_emitted = true;
-                                break 'process StepResult::Accumulate;
-                            }
-                            ExceedAction::FailRule => {
-                                self.failed = true;
-                                break 'process StepResult::Accumulate;
-                            }
+                    let on_exceed = self
+                        .limits
+                        .as_ref()
+                        .map(|l| l.on_exceed.clone())
+                        .unwrap_or(ExceedAction::Throttle);
+                    match on_exceed {
+                        ExceedAction::Throttle | ExceedAction::DropOldest => {
+                            instance.event_emitted = true;
+                            break 'process StepResult::Accumulate;
+                        }
+                        ExceedAction::FailRule => {
+                            fail_rule(&mut self.failed, &self.shared);
+                            break 'process StepResult::Accumulate;
                         }
                     }
-                    self.emit_count += 1;
                 }
                 instance.event_emitted = true;
                 let (evidence_first, evidence_last) =
@@ -786,6 +900,8 @@ impl CepStateMachine {
         };
 
         let instance = self.remove_instance(&instance_key)?;
+        // P1②: closing an instance is a permanent remove — release its slot.
+        self.release_shared_instance();
         let mut output = evaluate_close(
             &self.rule_name,
             &self.plan,
@@ -836,6 +952,8 @@ impl CepStateMachine {
             }
 
             if let Some(instance) = self.remove_instance(&key) {
+                // P1②: expiry is a permanent remove — release its slot.
+                self.release_shared_instance();
                 let mut output = evaluate_close(
                     &self.rule_name,
                     &self.plan,
@@ -894,6 +1012,8 @@ impl CepStateMachine {
         let wm = self.watermark_nanos;
         for (key, _) in keys {
             if let Some(instance) = self.remove_instance(&key) {
+                // P1②: close_all is a permanent remove — release each slot.
+                self.release_shared_instance();
                 let mut output = evaluate_close(
                     &self.rule_name,
                     &self.plan,
@@ -922,6 +1042,11 @@ impl CepStateMachine {
     /// is exceeded, suppresses emission by clearing `close_ok`. This shares
     /// the same sliding-window counter used by the match path.
     fn rate_limit_close(&mut self, output: &mut CloseOutput, now_nanos: i64) {
+        // P2c: shards in raw-conv mode skip inline throttle — the conv stage
+        // applies the (shared) rate limit on the aggregated batch.
+        if self.raw_conv_mode {
+            return;
+        }
         // Check if this output would emit based on close mode
         let would_emit = match output.close_mode {
             CloseMode::And => output.event_ok && output.close_ok,
@@ -930,27 +1055,29 @@ impl CepStateMachine {
         if !would_emit {
             return; // won't emit an alert anyway
         }
-        if let Some(ref limits) = self.limits
-            && let Some(ref rate) = limits.max_throttle
+        if let Some(rate) = self.limits.as_ref().and_then(|l| l.max_throttle.clone())
+            && !throttle_allows(
+                &self.shared,
+                &mut self.emit_count,
+                &mut self.emit_window_start,
+                now_nanos,
+                &rate,
+            )
         {
-            let window_nanos = rate.per.as_nanos() as i64;
-            if now_nanos - self.emit_window_start >= window_nanos {
-                self.emit_count = 0;
-                self.emit_window_start = now_nanos;
-            }
-            if self.emit_count >= rate.count {
-                match limits.on_exceed {
-                    ExceedAction::Throttle | ExceedAction::DropOldest => {
-                        output.close_ok = false;
-                    }
-                    ExceedAction::FailRule => {
-                        self.failed = true;
-                        output.close_ok = false;
-                    }
+            let on_exceed = self
+                .limits
+                .as_ref()
+                .map(|l| l.on_exceed.clone())
+                .unwrap_or(ExceedAction::Throttle);
+            match on_exceed {
+                ExceedAction::Throttle | ExceedAction::DropOldest => {
+                    output.close_ok = false;
                 }
-                return;
+                ExceedAction::FailRule => {
+                    fail_rule(&mut self.failed, &self.shared);
+                    output.close_ok = false;
+                }
             }
-            self.emit_count += 1;
         }
     }
     fn push_expiry_candidate(&mut self, key: &InstanceKey, created_at: i64) {
@@ -975,6 +1102,17 @@ impl CepStateMachine {
                 .estimated_memory_bytes
                 .saturating_add(instance.base_cost);
         }
+        // P1②: the shared instance count is maintained by the exact CAS
+        // reservation at admission (new instances) and explicit releases at
+        // permanent removes (evict / close / expiry) — NOT by a per-insert
+        // mirror, which double-counts a reserved new instance. Memory is still
+        // mirrored here (base-cost delta) because it is inherently approximate
+        // (recalibrate corrects drift).
+        if self.tracks_memory_bytes()
+            && let Some(shared) = &self.shared
+        {
+            shared.add_memory(instance.base_cost);
+        }
         self.instances.insert(key, instance);
     }
 
@@ -984,8 +1122,21 @@ impl CepStateMachine {
             self.estimated_memory_bytes = self
                 .estimated_memory_bytes
                 .saturating_sub(instance.base_cost);
+            if let Some(shared) = &self.shared {
+                shared.sub_memory(instance.base_cost);
+            }
         }
         Some(instance)
+    }
+
+    /// Release this machine's shared instance slot after a *permanent* remove
+    /// (close / expiry / eviction). The get-or-create remove in the advance
+    /// path is temporary (re-inserted) and must NOT release — it never calls
+    /// this.
+    fn release_shared_instance(&self) {
+        if let Some(shared) = &self.shared {
+            shared.release_instance();
+        }
     }
 
     /// Whether the per-instance memory accounting cache is needed.
@@ -1010,11 +1161,17 @@ impl CepStateMachine {
         if !self.tracks_memory_bytes() {
             return;
         }
-        self.estimated_memory_bytes = self
+        let exact: usize = self
             .instances
             .values()
             .map(|instance| instance.estimated_bytes())
             .sum();
+        // P2b: adjust the shared total by this shard's recalibration delta, then
+        // re-anchor the local cache.
+        if let Some(shared) = &self.shared {
+            shared.recalibrate_memory(self.estimated_memory_bytes, exact);
+        }
+        self.estimated_memory_bytes = exact;
     }
 
     #[cfg(test)]
@@ -1069,10 +1226,7 @@ fn apply_conv_filtered(
     };
 
     let (qualifying, non_qualifying): (Vec<_>, Vec<_>) =
-        outputs.into_iter().partition(|o| match o.close_mode {
-            CloseMode::And => o.event_ok && o.close_ok,
-            CloseMode::Or => o.close_ok && !o.close_step_data.is_empty(),
-        });
+        outputs.into_iter().partition(close_is_qualified);
 
     if qualifying.is_empty() {
         return non_qualifying;
@@ -1083,16 +1237,69 @@ fn apply_conv_filtered(
     result
 }
 
+/// Whether a close output qualifies to produce an alert.
+///
+/// Exposed for the P2c conv stage: shards emit raw closes and the conv stage
+/// filters to qualifying ones before applying conv / emitting.
+pub fn close_is_qualified(close: &CloseOutput) -> bool {
+    match close.close_mode {
+        CloseMode::And => close.event_ok && close.close_ok,
+        CloseMode::Or => close.close_ok && !close.close_step_data.is_empty(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rate-limit / fail helpers (free functions)
+//
+// These take disjoint field refs (`&self.shared`, `&mut self.emit_count`, …)
+// instead of `&mut self`, because the advance body holds `let plan = &self.plan`
+// for its whole extent — a `&mut self` method call would conflict with that
+// immutable borrow of `self`.
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if this emit is within the rate budget.
+///
+/// Uses the shared throttle atomics when the machine is a shard of a sharded
+/// rule (P2b), otherwise the legacy per-machine sliding window.
+fn throttle_allows(
+    shared: &Option<std::sync::Arc<SharedLimits>>,
+    emit_count: &mut u64,
+    emit_window_start: &mut i64,
+    now_nanos: i64,
+    rate: &RateSpec,
+) -> bool {
+    match shared {
+        Some(shared) => shared.try_acquire_throttle(now_nanos, rate),
+        None => {
+            let window = rate.per.as_nanos() as i64;
+            if now_nanos - *emit_window_start >= window {
+                *emit_count = 0;
+                *emit_window_start = now_nanos;
+            }
+            if *emit_count >= rate.count {
+                return false;
+            }
+            *emit_count += 1;
+            true
+        }
+    }
+}
+
+/// Latch the rule as failed (`FailRule`); propagates to shared state.
+fn fail_rule(failed: &mut bool, shared: &Option<std::sync::Arc<SharedLimits>>) {
+    *failed = true;
+    if let Some(shared) = shared {
+        shared.fail();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn make_event(fields: Vec<(&str, Value)>) -> Event {
         Event {
-            fields: fields
-                .into_iter()
-                .map(|(k, v)| (k.into(), v))
-                .collect(),
+            fields: fields.into_iter().map(|(k, v)| (k.into(), v)).collect(),
         }
     }
 

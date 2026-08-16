@@ -116,10 +116,10 @@ pub fn compute_window_field_usage(plans: &[RulePlan]) -> WindowFieldUsage {
         global.extend(m.tracked_plain_fields.iter().cloned());
 
         // Stateless each-rule filter.
-        if let Some(each) = &plan.each_plan {
-            if let Some(filter) = &each.filter {
-                collect_expr_fields(filter, &mut global);
-            }
+        if let Some(each) = &plan.each_plan
+            && let Some(filter) = &each.filter
+        {
+            collect_expr_fields(filter, &mut global);
         }
 
         // Entity key / score / yield expressions are evaluated (mostly against
@@ -143,10 +143,10 @@ pub fn compute_window_field_usage(plans: &[RulePlan]) -> WindowFieldUsage {
         // `tracked_bind_fields` makes the close path iterate every field of
         // the event, which requires full materialization.
         for bind in &plan.binds {
-            if !m.tracked_bind_fields.contains_key(bind.alias.as_str()) {
-                if let Some(w) = binds.get(bind.alias.as_str()) {
-                    needs_all.insert((*w).to_string());
-                }
+            if !m.tracked_bind_fields.contains_key(bind.alias.as_str())
+                && let Some(w) = binds.get(bind.alias.as_str())
+            {
+                needs_all.insert((*w).to_string());
             }
         }
     }
@@ -247,6 +247,7 @@ mod tests {
 
     fn make_rule(binds: Vec<BindPlan>, match_plan: MatchPlan) -> RulePlan {
         RulePlan {
+            conv_window: None,
             name: "t".into(),
             binds,
             match_plan,

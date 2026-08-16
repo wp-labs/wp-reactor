@@ -1,5 +1,5 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use arrow::record_batch::RecordBatch;
 use orion_error::conversion::ToStructError;

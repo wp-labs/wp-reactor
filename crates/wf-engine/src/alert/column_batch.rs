@@ -24,14 +24,14 @@
 use std::sync::Arc;
 
 use orion_error::conversion::ToStructError;
-use wp_model_core::model::{DataRecord, DataType, Field, FieldStorage, Value as ModelValue};
 use wf_lang::FieldType;
+use wp_model_core::model::{DataRecord, DataType, Field, FieldStorage, Value as ModelValue};
 
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::Value;
 
-use super::types::{OutputRecord, WFU_PREFIX};
 use super::types as alert_types;
+use super::types::{OutputRecord, WFU_PREFIX};
 use wf_lang::wfu_meta::{
     WFU_CLOSE_REASON, WFU_EMIT_TIME, WFU_ENTITY_ID, WFU_ENTITY_TYPE, WFU_FIRED_AT, WFU_ID,
     WFU_ORIGIN, WFU_RULE_NAME, WFU_SCORE, WFU_SUMMARY,
@@ -276,8 +276,7 @@ impl AlertColumnBuilder {
         self.score.push(record.score);
         self.entity_type.push(Arc::clone(&record.entity_type));
         self.entity_id.push(Arc::from(record.entity_id.as_str()));
-        self.origin
-            .push(Arc::from(record.origin.as_str()));
+        self.origin.push(Arc::from(record.origin.as_str()));
         self.close_reason.push(Arc::from(
             record
                 .origin
@@ -343,7 +342,10 @@ impl AlertColumnBuilder {
                     ))
                     .err();
             }
-            if record.yield_fields[..idx].iter().any(|(prev, _)| prev == name) {
+            if record.yield_fields[..idx]
+                .iter()
+                .any(|(prev, _)| prev == name)
+            {
                 return CoreReason::DataFormat
                     .to_err()
                     .with_detail(format!("duplicate exported field {name:?}"))
@@ -352,9 +354,7 @@ impl AlertColumnBuilder {
             let field_type = record
                 .yield_field_types
                 .iter()
-                .find_map(|(field_name, field_type)| {
-                    (field_name == name).then_some(field_type)
-                });
+                .find_map(|(field_name, field_type)| (field_name == name).then_some(field_type));
             let (meta, model_value) = alert_types::export_yield_value(value, field_type)?;
             // Resolve the column index (linear scan; yield layouts are tiny
             // and stable per rule).
@@ -408,13 +408,12 @@ impl AlertColumnBuilder {
     ) -> CoreResult<()> {
         let pos = self.staged.len();
         // Fast path: same plan slot as the last row at this position.
-        if let Some((cached_name, col_idx, _cached_ft)) = self.layout_cache.get(pos) {
-            if Arc::ptr_eq(cached_name, name) {
-                let (meta, model_value) =
-                    alert_types::export_yield_value(value, field_type)?;
-                self.staged.push((*col_idx, meta, model_value));
-                return Ok(());
-            }
+        if let Some((cached_name, col_idx, _cached_ft)) = self.layout_cache.get(pos)
+            && Arc::ptr_eq(cached_name, name)
+        {
+            let (meta, model_value) = alert_types::export_yield_value(value, field_type)?;
+            self.staged.push((*col_idx, meta, model_value));
+            return Ok(());
         }
         // Slow path: validate, resolve the column, refresh the cache entry.
         if name.starts_with(WFU_PREFIX) {
@@ -502,10 +501,11 @@ impl AlertColumnBuilder {
                 col.values.push(ModelValue::Null);
             }
         }
-        debug_assert!(self
-            .yield_cols
-            .iter()
-            .all(|col| col.values.len() == self.len + 1));
+        debug_assert!(
+            self.yield_cols
+                .iter()
+                .all(|col| col.values.len() == self.len + 1)
+        );
     }
 
     /// Seal the builder into an immutable batch. The builder is left empty
@@ -551,8 +551,14 @@ mod tests {
             yield_target: Arc::from("alerts"),
             yield_fields,
             yield_field_types: Arc::from(vec![
-                (Arc::from("auction_id"), FieldType::Base(wf_lang::BaseType::Float)),
-                (Arc::from("price"), FieldType::Base(wf_lang::BaseType::Float)),
+                (
+                    Arc::from("auction_id"),
+                    FieldType::Base(wf_lang::BaseType::Float),
+                ),
+                (
+                    Arc::from("price"),
+                    FieldType::Base(wf_lang::BaseType::Float),
+                ),
             ]),
             event_time_nanos: 0,
             machine_id: String::new(),
@@ -596,11 +602,7 @@ mod tests {
         let batch = builder.finish();
         assert_eq!(batch.len(), 3);
         for (row, record) in records.iter().enumerate() {
-            let via_columns = batch
-                .iter_data_records()
-                .nth(row)
-                .unwrap()
-                .unwrap();
+            let via_columns = batch.iter_data_records().nth(row).unwrap().unwrap();
             let via_rows = record.to_data_record().unwrap();
             assert_records_equal(&via_columns, &via_rows);
         }
@@ -736,25 +738,31 @@ mod tests {
     fn staged_optional_omission_creates_sparse_cells() {
         // Row 1 omits the middle field (optional input missing, #62): the
         // later column must backfill an Ignore/Null cell for that row.
-        let names: [Arc<str>; 3] = [
-            Arc::from("a"),
-            Arc::from("b"),
-            Arc::from("c"),
-        ];
+        let names: [Arc<str>; 3] = [Arc::from("a"), Arc::from("b"), Arc::from("c")];
         let ft = Some(FieldType::Base(wf_lang::BaseType::Float));
         let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
 
         // Row 0: a, c (b omitted).
         builder.begin_row();
-        builder.stage_yield_cell(&names[0], ft.as_ref(), &Value::Number(1.0)).unwrap();
-        builder.stage_yield_cell(&names[2], ft.as_ref(), &Value::Number(3.0)).unwrap();
+        builder
+            .stage_yield_cell(&names[0], ft.as_ref(), &Value::Number(1.0))
+            .unwrap();
+        builder
+            .stage_yield_cell(&names[2], ft.as_ref(), &Value::Number(3.0))
+            .unwrap();
         commit_staged(&mut builder, "id0", "e0", "t0");
 
         // Row 1: full a, b, c.
         builder.begin_row();
-        builder.stage_yield_cell(&names[0], ft.as_ref(), &Value::Number(4.0)).unwrap();
-        builder.stage_yield_cell(&names[1], ft.as_ref(), &Value::Number(5.0)).unwrap();
-        builder.stage_yield_cell(&names[2], ft.as_ref(), &Value::Number(6.0)).unwrap();
+        builder
+            .stage_yield_cell(&names[0], ft.as_ref(), &Value::Number(4.0))
+            .unwrap();
+        builder
+            .stage_yield_cell(&names[1], ft.as_ref(), &Value::Number(5.0))
+            .unwrap();
+        builder
+            .stage_yield_cell(&names[2], ft.as_ref(), &Value::Number(6.0))
+            .unwrap();
         commit_staged(&mut builder, "id1", "e1", "t1");
 
         let batch = builder.finish();
@@ -774,18 +782,24 @@ mod tests {
         let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
         let bad = Arc::from("__wfu_evil");
         builder.begin_row();
-        assert!(builder
-            .stage_yield_cell(&bad, None, &Value::Number(1.0))
-            .is_err());
+        assert!(
+            builder
+                .stage_yield_cell(&bad, None, &Value::Number(1.0))
+                .is_err()
+        );
 
         let a = Arc::from("dup");
         let a2 = Arc::from("dup");
         builder.begin_row();
-        builder.stage_yield_cell(&a, None, &Value::Number(1.0)).unwrap();
+        builder
+            .stage_yield_cell(&a, None, &Value::Number(1.0))
+            .unwrap();
         // Same name again (different Arc, equal string) → duplicate error.
-        assert!(builder
-            .stage_yield_cell(&a2, None, &Value::Number(2.0))
-            .is_err());
+        assert!(
+            builder
+                .stage_yield_cell(&a2, None, &Value::Number(2.0))
+                .is_err()
+        );
         assert_eq!(builder.len(), 0, "failed rows must not touch columns");
     }
 
@@ -796,14 +810,20 @@ mod tests {
         let n = Arc::from("x");
         let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
         builder.begin_row();
-        builder.stage_yield_cell(&n, None, &Value::Number(1.0)).unwrap();
+        builder
+            .stage_yield_cell(&n, None, &Value::Number(1.0))
+            .unwrap();
         let bad = Arc::from("__wfu_bad");
-        assert!(builder
-            .stage_yield_cell(&bad, None, &Value::Number(2.0))
-            .is_err());
+        assert!(
+            builder
+                .stage_yield_cell(&bad, None, &Value::Number(2.0))
+                .is_err()
+        );
         // begin_row clears the staged cells; commit must still be balanced.
         builder.begin_row();
-        builder.stage_yield_cell(&n, None, &Value::Number(3.0)).unwrap();
+        builder
+            .stage_yield_cell(&n, None, &Value::Number(3.0))
+            .unwrap();
         commit_staged(&mut builder, "id", "e", "t");
         let batch = builder.finish();
         assert_eq!(batch.len(), 1);

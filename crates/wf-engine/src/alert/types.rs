@@ -213,7 +213,10 @@ impl OutputRecord {
                     ))
                     .err();
             }
-            if self.yield_fields[..idx].iter().any(|(prev, _)| prev == name) {
+            if self.yield_fields[..idx]
+                .iter()
+                .any(|(prev, _)| prev == name)
+            {
                 return CoreReason::DataFormat
                     .to_err()
                     .with_detail(format!("duplicate exported field {name:?}"))
@@ -701,7 +704,10 @@ mod tests {
             matched_rows: vec![],
             summary: "demo".into(),
             yield_target: "out".into(),
-            yield_fields: vec![(std::sync::Arc::from(format!("{WFU_PREFIX}bad").as_str()), Value::Str("x".into()))],
+            yield_fields: vec![(
+                std::sync::Arc::from(format!("{WFU_PREFIX}bad").as_str()),
+                Value::Str("x".into()),
+            )],
             yield_field_types: Vec::new().into(),
             event_time_nanos: 0,
             machine_id: String::new(),
@@ -759,7 +765,7 @@ mod tests {
     #[test]
     fn data_record_json_keeps_non_json_chars_as_strings() {
         let mut record = DataRecord::default();
-        let mut push = |record: &mut DataRecord, name: &str, value: &str| {
+        let push = |record: &mut DataRecord, name: &str, value: &str| {
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
                 name,
@@ -834,7 +840,10 @@ mod tests {
                 "scores".into(),
                 Value::Array(vec![Value::Number(1.0), Value::Str("high".into())]),
             )],
-            yield_field_types: std::sync::Arc::from(vec![("scores".into(), FieldType::Array(BaseType::Float))]),
+            yield_field_types: std::sync::Arc::from(vec![(
+                "scores".into(),
+                FieldType::Array(BaseType::Float),
+            )]),
             event_time_nanos: 0,
             machine_id: String::new(),
             scope_key: "".into(),
@@ -864,7 +873,10 @@ mod tests {
                 "tags".into(),
                 Value::Array(vec![Value::Str("ssh".into()), Value::Number(22.0)]),
             )],
-            yield_field_types: std::sync::Arc::from(vec![("tags".into(), FieldType::Array(BaseType::Chars))]),
+            yield_field_types: std::sync::Arc::from(vec![(
+                "tags".into(),
+                FieldType::Array(BaseType::Chars),
+            )]),
             event_time_nanos: 0,
             machine_id: String::new(),
             scope_key: "".into(),
@@ -898,7 +910,10 @@ mod tests {
                         .collect(),
                 ),
             )],
-            yield_field_types: std::sync::Arc::from(vec![("risk_context".into(), FieldType::Object)]),
+            yield_field_types: std::sync::Arc::from(vec![(
+                "risk_context".into(),
+                FieldType::Object,
+            )]),
             event_time_nanos: 0,
             machine_id: String::new(),
             scope_key: "".into(),

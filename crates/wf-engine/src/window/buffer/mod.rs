@@ -15,9 +15,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::{
-    Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, LargeBinaryArray,
-    LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
-    TimestampNanosecondArray,
+    Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, LargeBinaryArray, LargeListArray,
+    LargeStringArray, ListArray, MapArray, StringArray, StructArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -46,10 +45,10 @@ impl JoinIndex {
     }
 
     fn remove_event(&mut self, ev: &Arc<Event>) {
-        if let Some(key) = ev.fields.get(&self.key_field).and_then(JoinKey::from_value) {
-            if let Some(v) = self.by_key.get_mut(&key) {
-                v.retain(|e| !Arc::ptr_eq(e, ev));
-            }
+        if let Some(key) = ev.fields.get(&self.key_field).and_then(JoinKey::from_value)
+            && let Some(v) = self.by_key.get_mut(&key)
+        {
+            v.retain(|e| !Arc::ptr_eq(e, ev));
         }
     }
 
@@ -239,7 +238,8 @@ impl Window {
         batch: RecordBatch,
         parsed_events: Arc<Vec<Arc<Event>>>,
     ) -> CoreResult<()> {
-        self.append_inner(batch, Some(parsed_events), None).map(|_| ())
+        self.append_inner(batch, Some(parsed_events), None)
+            .map(|_| ())
     }
 
     /// Append a RecordBatch whose events *and content byte size* were precomputed
@@ -343,17 +343,17 @@ impl Window {
 
             // Index the newly appended batch (after eviction, so rows evicted
             // by the incoming batch aren't kept in the index).
-            if self.join_enabled.load(Ordering::Acquire) {
-                if let Some(tb) = log.get(&seq) {
-                    let events = tb.events(self.materialize_fields.as_deref());
-                    if let Some(idx) = self
-                        .join_index
-                        .write()
-                        .expect("join index lock poisoned")
-                        .as_mut()
-                    {
-                        idx.index_batch(&events);
-                    }
+            if self.join_enabled.load(Ordering::Acquire)
+                && let Some(tb) = log.get(&seq)
+            {
+                let events = tb.events(self.materialize_fields.as_deref());
+                if let Some(idx) = self
+                    .join_index
+                    .write()
+                    .expect("join index lock poisoned")
+                    .as_mut()
+                {
+                    idx.index_batch(&events);
                 }
             }
         }
@@ -377,7 +377,8 @@ impl Window {
     }
 
     /// Remove an evicted batch's rows from the join index (if configured).
-    fn remove_batch_from_index(&self, evicted: &TimedBatch) {        if !self.join_enabled.load(Ordering::Acquire) {
+    fn remove_batch_from_index(&self, evicted: &TimedBatch) {
+        if !self.join_enabled.load(Ordering::Acquire) {
             return;
         }
         if let Some(idx) = self
@@ -478,7 +479,11 @@ impl Window {
 /// `max_window_bytes` and get dropped by memory eviction even though its data
 /// is small (wp-labs/wp-reactor#18).
 pub fn content_bytes(batch: &RecordBatch) -> usize {
-    batch.columns().iter().map(|col| column_content_bytes(col.as_ref())).sum()
+    batch
+        .columns()
+        .iter()
+        .map(|col| column_content_bytes(col.as_ref()))
+        .sum()
 }
 
 fn column_content_bytes(col: &dyn Array) -> usize {
@@ -489,26 +494,40 @@ fn column_content_bytes(col: &dyn Array) -> usize {
         // Fixed-width values: width × rows.
         DataType::Int8 | DataType::UInt8 => n,
         DataType::Int16 | DataType::UInt16 => n * 2,
-        DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32
+        DataType::Int32
+        | DataType::UInt32
+        | DataType::Float32
+        | DataType::Date32
         | DataType::Time32(_) => n * 4,
-        DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Date64
-        | DataType::Time64(_) | DataType::Timestamp(..) | DataType::Duration(_) => n * 8,
-        DataType::Interval(unit) => match unit {
-            IntervalUnit::MonthDayNano => n * 16,
-            _ => n * 8,
-        },
+        DataType::Int64
+        | DataType::UInt64
+        | DataType::Float64
+        | DataType::Date64
+        | DataType::Time64(_)
+        | DataType::Timestamp(..)
+        | DataType::Duration(_) => n * 8,
+        DataType::Interval(IntervalUnit::MonthDayNano) => n * 16,
+        DataType::Interval(_) => n * 8,
         DataType::Decimal128(..) => n * 16,
         DataType::Decimal256(..) => n * 32,
-        DataType::Utf8 => {
-            utf8_content(n, col.as_any().downcast_ref::<StringArray>().expect("utf8 column"))
-        }
+        DataType::Utf8 => utf8_content(
+            n,
+            col.as_any()
+                .downcast_ref::<StringArray>()
+                .expect("utf8 column"),
+        ),
         DataType::LargeUtf8 => large_utf8_content(
             n,
-            col.as_any().downcast_ref::<LargeStringArray>().expect("large utf8 column"),
+            col.as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("large utf8 column"),
         ),
-        DataType::Binary => {
-            binary_content(n, col.as_any().downcast_ref::<BinaryArray>().expect("binary column"))
-        }
+        DataType::Binary => binary_content(
+            n,
+            col.as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("binary column"),
+        ),
         DataType::LargeBinary => large_binary_content(
             n,
             col.as_any()
@@ -523,16 +542,29 @@ fn column_content_bytes(col: &dyn Array) -> usize {
             n * arr.value_length() as usize
         }
         DataType::Struct(_) => {
-            let arr = col.as_any().downcast_ref::<StructArray>().expect("struct column");
+            let arr = col
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("struct column");
             // The struct's own validity bitmap plus children.
-            bitmap_bytes(n) + arr.columns().iter().map(|c| column_content_bytes(c.as_ref())).sum::<usize>()
+            bitmap_bytes(n)
+                + arr
+                    .columns()
+                    .iter()
+                    .map(|c| column_content_bytes(c.as_ref()))
+                    .sum::<usize>()
         }
         DataType::List(_) => {
-            let arr = col.as_any().downcast_ref::<ListArray>().expect("list column");
+            let arr = col
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("list column");
             // value(i) slices the child; a null row yields an empty slice → 0 bytes.
             bitmap_bytes(n)
                 + offsets_bytes(n, 4)
-                + (0..n).map(|i| column_content_bytes(arr.value(i).as_ref())).sum::<usize>()
+                + (0..n)
+                    .map(|i| column_content_bytes(arr.value(i).as_ref()))
+                    .sum::<usize>()
         }
         DataType::LargeList(_) => {
             let arr = col
@@ -541,7 +573,9 @@ fn column_content_bytes(col: &dyn Array) -> usize {
                 .expect("large list column");
             bitmap_bytes(n)
                 + offsets_bytes(n, 8)
-                + (0..n).map(|i| column_content_bytes(arr.value(i).as_ref())).sum::<usize>()
+                + (0..n)
+                    .map(|i| column_content_bytes(arr.value(i).as_ref()))
+                    .sum::<usize>()
         }
         DataType::FixedSizeList(_, _) => {
             let arr = col
@@ -549,7 +583,9 @@ fn column_content_bytes(col: &dyn Array) -> usize {
                 .downcast_ref::<FixedSizeListArray>()
                 .expect("fixed-size list column");
             bitmap_bytes(n)
-                + (0..n).map(|i| column_content_bytes(arr.value(i).as_ref())).sum::<usize>()
+                + (0..n)
+                    .map(|i| column_content_bytes(arr.value(i).as_ref()))
+                    .sum::<usize>()
         }
         DataType::Map(..) => {
             let arr = col.as_any().downcast_ref::<MapArray>().expect("map column");
@@ -619,7 +655,11 @@ pub fn events_bytes(events: &[Arc<Event>]) -> usize {
 fn event_bytes(e: &Event) -> usize {
     // size_of::<Event>() covers the foldhash table header itself.
     size_of::<Event>()
-        + map_heap_bytes(e.fields.capacity(), size_of::<SmolStr>(), size_of::<Value>())
+        + map_heap_bytes(
+            e.fields.capacity(),
+            size_of::<SmolStr>(),
+            size_of::<Value>(),
+        )
         + e.fields
             .iter()
             .map(|(k, v)| smol_str_heap_bytes(k) + value_heap_bytes(v))
@@ -660,5 +700,9 @@ fn map_heap_bytes(capacity: usize, key_size: usize, value_size: usize) -> usize 
 /// Heap bytes of a `SmolStr` beyond its inline struct: only strings that
 /// outgrew the inline buffer allocate (payload + NUL).
 fn smol_str_heap_bytes(s: &SmolStr) -> usize {
-    if s.is_heap_allocated() { s.len() + 1 } else { 0 }
+    if s.is_heap_allocated() {
+        s.len() + 1
+    } else {
+        0
+    }
 }

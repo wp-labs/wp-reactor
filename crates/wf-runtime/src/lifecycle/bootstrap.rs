@@ -533,6 +533,7 @@ mod tests {
 
     fn minimal_plan(name: &str, target: &str) -> RulePlan {
         RulePlan {
+            conv_window: None,
             name: name.into(),
             binds: vec![],
             match_plan: MatchPlan {
@@ -548,7 +549,7 @@ mod tests {
                 seq: None,
                 match_mode: MatchMode::Seq,
                 accu: false,
-            needs_field_history: false,
+                needs_field_history: false,
             },
             each_plan: None,
             joins: vec![],
@@ -585,7 +586,10 @@ mod tests {
 
     #[test]
     fn build_pipe_registry_extracts_schema_and_over() {
-        let plans = vec![minimal_plan("r1", "alerts"), minimal_plan("r2", "__wf_pipe_x")];
+        let plans = [
+            minimal_plan("r1", "alerts"),
+            minimal_plan("r2", "__wf_pipe_x"),
+        ];
         let plans_ref: Vec<_> = plans.iter().collect();
         let schemas = vec![
             window_schema("alerts", Duration::ZERO, "sip"),
@@ -610,19 +614,23 @@ mod tests {
     #[test]
     fn build_pipe_registry_dedups_yield_targets() {
         // Two rules yielding the same target → the pipe is registered once.
-        let plans = vec![minimal_plan("r1", "alerts"), minimal_plan("r2", "alerts")];
+        let plans = [minimal_plan("r1", "alerts"), minimal_plan("r2", "alerts")];
         let plans_ref: Vec<_> = plans.iter().collect();
         let reg = build_pipe_registry(&plans_ref, &[]);
 
         assert!(reg.contains("alerts"));
-        assert_eq!(reg.iter().len(), 1, "duplicate yield targets must dedup to one pipe");
+        assert_eq!(
+            reg.iter().len(),
+            1,
+            "duplicate yield targets must dedup to one pipe"
+        );
     }
 
     #[test]
     fn build_pipe_registry_unknown_target_gets_empty_schema() {
         // A yield target with no matching window schema falls back to an empty
         // schema + zero over (not a hard failure).
-        let plans = vec![minimal_plan("r1", "orphan_target")];
+        let plans = [minimal_plan("r1", "orphan_target")];
         let plans_ref: Vec<_> = plans.iter().collect();
         let reg = build_pipe_registry(&plans_ref, &[]);
 

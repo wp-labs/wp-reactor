@@ -112,8 +112,11 @@ impl RuleExecutor {
                                 field.name
                             )));
                     };
-                    let Some(value) =
-                        RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)?
+                    let Some(value) = RuleExecutor::coerce_yield_field_value_with(
+                        name,
+                        field_type.as_ref(),
+                        value,
+                    )?
                     else {
                         // Optional input field was missing → omit it from the
                         // output record (wp-labs/warp-fusion#62).

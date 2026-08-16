@@ -30,6 +30,6 @@ pub fn default_matched_context() -> MatchedContext {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
-            trigger_event: None,
+        trigger_event: None,
     }
 }

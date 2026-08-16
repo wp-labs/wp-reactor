@@ -79,7 +79,7 @@ fn make_router(stream_name: &str) -> Arc<Router> {
             schema: test_schema(),
             time_col_index: Some(0),
             over: Duration::from_secs(3600),
-        materialize_fields: None,
+            materialize_fields: None,
         },
         streams: vec![stream_name.to_string()],
         config: test_config(),
@@ -97,7 +97,7 @@ fn make_multi_stream_router() -> Arc<Router> {
                 schema: test_schema(),
                 time_col_index: Some(0),
                 over: Duration::from_secs(3600),
-            materialize_fields: None,
+                materialize_fields: None,
             },
             streams: vec!["a".to_string()],
             config: test_config(),
@@ -108,7 +108,7 @@ fn make_multi_stream_router() -> Arc<Router> {
                 schema: test_schema(),
                 time_col_index: Some(0),
                 over: Duration::from_secs(3600),
-            materialize_fields: None,
+                materialize_fields: None,
             },
             streams: vec!["b".to_string()],
             config: test_config(),
@@ -138,18 +138,32 @@ fn register_miss_provider(registry: &mut WindowRegistry) {
 /// the window with [`wait_for_rows`] instead of asserting synchronously.
 fn make_parse_router(
     stream_name: &str,
-) -> (Arc<Router>, mpsc::Sender<ParseItem>, PrereadBudget, Arc<AtomicU64>) {
+) -> (
+    Arc<Router>,
+    mpsc::Sender<ParseItem>,
+    PrereadBudget,
+    Arc<AtomicU64>,
+) {
     attach_parse_pool(make_router(stream_name))
 }
 
-fn make_multi_parse_router(
-) -> (Arc<Router>, mpsc::Sender<ParseItem>, PrereadBudget, Arc<AtomicU64>) {
+fn make_multi_parse_router() -> (
+    Arc<Router>,
+    mpsc::Sender<ParseItem>,
+    PrereadBudget,
+    Arc<AtomicU64>,
+) {
     attach_parse_pool(make_multi_stream_router())
 }
 
 fn attach_parse_pool(
     router: Arc<Router>,
-) -> (Arc<Router>, mpsc::Sender<ParseItem>, PrereadBudget, Arc<AtomicU64>) {
+) -> (
+    Arc<Router>,
+    mpsc::Sender<ParseItem>,
+    PrereadBudget,
+    Arc<AtomicU64>,
+) {
     let mut group = TaskGroup::new("test_parse");
     let (parse_tx, preread) = spawn_parse_pool(&router, None, 1, &mut group);
     (router, parse_tx, preread, Arc::new(AtomicU64::new(0)))
@@ -934,7 +948,7 @@ async fn file_arrow_framed_replay_routes_rows() {
         preread.clone(),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
-            None,
+        None,
     )
     .await
     .unwrap();
@@ -994,7 +1008,7 @@ async fn file_arrow_framed_unknown_tag_is_window_miss() {
         preread.clone(),
         Arc::clone(&parse_seq),
         CancellationToken::new(),
-            None,
+        None,
     )
     .await
     .unwrap();
@@ -1193,7 +1207,7 @@ fn route_projects_plain_utf8_json_into_structured_window_schema() {
             schema,
             time_col_index: None,
             over: Duration::ZERO,
-        materialize_fields: None,
+            materialize_fields: None,
         },
         streams: vec!["events".to_string()],
         config: test_config(),
@@ -1247,7 +1261,7 @@ fn route_projects_wrong_structured_utf8_metadata_into_target_window_schema() {
             schema,
             time_col_index: None,
             over: Duration::ZERO,
-        materialize_fields: None,
+            materialize_fields: None,
         },
         streams: vec!["events".to_string()],
         config: test_config(),
@@ -1353,7 +1367,13 @@ fn build_parse_item_assigns_monotonic_seq_and_stream() {
     let seq = Arc::new(AtomicU64::new(0));
     let batch = make_batch(&test_schema(), &[1_000_000_000, 2_000_000_000], &[1, 2]);
     let item0 = build_parse_item(
-        &seq, "src", "events", batch.clone(), &router, None, Vec::new(),
+        &seq,
+        "src",
+        "events",
+        batch.clone(),
+        &router,
+        None,
+        Vec::new(),
     );
     let item1 = build_parse_item(&seq, "src", "events", batch, &router, None, Vec::new());
     assert_eq!(item0.seq, 0);
@@ -1375,7 +1395,13 @@ fn build_parse_item_records_receiver_metrics() {
     let seq = Arc::new(AtomicU64::new(0));
     let batch = make_batch(&test_schema(), &[1_000_000_000], &[1]);
     let _ = build_parse_item(
-        &seq, "src", "events", batch, &router, Some(&metrics), Vec::new(),
+        &seq,
+        "src",
+        "events",
+        batch,
+        &router,
+        Some(&metrics),
+        Vec::new(),
     );
 
     let records = metrics.snapshot().to_records();
@@ -1403,9 +1429,10 @@ fn build_parse_item_records_receiver_metrics() {
 async fn push_decoded_batch_commits_through_parse_pool() {
     let (router, parse_tx, preread, parse_seq) = make_parse_router("events");
     let batch = make_batch(&test_schema(), &[1_000_000_000, 2_000_000_000], &[1, 2]);
-    let ok =
-        push_decoded_batch(&parse_tx, &preread, &parse_seq, "src", "events", batch, &router, None, None)
-            .await;
+    let ok = push_decoded_batch(
+        &parse_tx, &preread, &parse_seq, "src", "events", batch, &router, None, None,
+    )
+    .await;
     assert!(ok, "push should succeed");
     wait_for_rows(&router, 2).await;
 }
@@ -1424,9 +1451,7 @@ async fn push_decoded_batch_commits_through_parse_pool() {
 #[tokio::test]
 async fn actor_mode_interleaved_streams_append_without_deadlock() {
     use tokio_util::sync::CancellationToken;
-    use wf_engine::window::{
-        WindowMailbox, WindowMsg, WINDOW_CHANNEL_DEPTH, run_window_actor,
-    };
+    use wf_engine::window::{WINDOW_CHANNEL_DEPTH, WindowMailbox, WindowMsg, run_window_actor};
 
     let router = make_multi_stream_router();
     for name in ["win_a", "win_b"] {
@@ -1492,7 +1517,10 @@ async fn push_decoded_batch_returns_false_when_channel_closed() {
     drop(rx); // receiver gone → send fails
     let preread = PrereadBudget::new(16 * 1024 * 1024);
     let batch = make_batch(&test_schema(), &[1_000_000_000], &[1]);
-    let ok = push_decoded_batch(&tx, &preread, &seq, "src", "events", batch, &router, None, None).await;
+    let ok = push_decoded_batch(
+        &tx, &preread, &seq, "src", "events", batch, &router, None, None,
+    )
+    .await;
     assert!(!ok, "push to a closed parse channel must report failure");
 }
 
@@ -1612,5 +1640,8 @@ async fn file_ndjson_replay_fails_when_parse_pool_closed() {
         CancellationToken::new(),
     )
     .await;
-    assert!(result.is_err(), "replay must fail when the parse pool is gone");
+    assert!(
+        result.is_err(),
+        "replay must fail when the parse pool is gone"
+    );
 }

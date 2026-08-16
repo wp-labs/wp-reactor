@@ -23,14 +23,17 @@ pub(super) struct BranchState {
     pub(super) avg_sum: f64,
     pub(super) avg_count: u64,
     /// Lazy, boxed (None = 8B vs HashSet 48B): only `distinct` transforms allocate.
+    #[allow(clippy::box_collection)] // intentional per-instance memory saving (wp-reactor#19)
     pub(super) distinct_set: Option<Box<HashSet<ValueKey>>>,
     pub(super) event_first_time_nanos: Option<i64>,
     pub(super) event_last_time_nanos: Option<i64>,
     // L3: collected values for collect_set/list, first/last, stddev/percentile.
     // Lazy, boxed — only L3 collection measures allocate.
+    #[allow(clippy::box_collection)] // intentional per-instance memory saving (wp-reactor#19)
     pub(super) collected_values: Option<Box<Vec<Value>>>,
     /// Per-field value history for yield / L3 collection. Lazy, boxed — a
     /// count rule never allocates this.
+    #[allow(clippy::box_collection)] // intentional per-instance memory saving (wp-reactor#19)
     pub(super) field_values: Option<Box<EngineHashMap<String, Vec<Value>>>>,
 }
 
@@ -61,7 +64,8 @@ impl BranchState {
 
     /// Mutable access to the L3 collected-values list, allocating lazily.
     pub(super) fn collected_values_mut(&mut self) -> &mut Vec<Value> {
-        self.collected_values.get_or_insert_with(|| Box::new(Vec::new()))
+        self.collected_values
+            .get_or_insert_with(|| Box::new(Vec::new()))
     }
 }
 
@@ -176,10 +180,13 @@ impl Instance {
             for bs in &ss.branch_states {
                 // base branch fields (~80 bytes) + distinct_set
                 size += 80
-                    + bs
-                        .distinct_set
+                    + bs.distinct_set
                         .as_deref()
-                        .map(|set| set.iter().map(|value| value.estimated_bytes() + 24).sum::<usize>())
+                        .map(|set| {
+                            set.iter()
+                                .map(|value| value.estimated_bytes() + 24)
+                                .sum::<usize>()
+                        })
                         .unwrap_or(0);
                 size += bs
                     .field_values
@@ -187,7 +194,9 @@ impl Instance {
                     .map(|fv| {
                         fv.iter()
                             .map(|(field, values)| {
-                                field.len() + 24 + values.iter().map(val_estimated_bytes).sum::<usize>()
+                                field.len()
+                                    + 24
+                                    + values.iter().map(val_estimated_bytes).sum::<usize>()
                             })
                             .sum::<usize>()
                     })
@@ -210,7 +219,8 @@ impl Instance {
                         .map(|fv| {
                             fv.iter()
                                 .map(|(field, values)| {
-                                    field.len() + 24
+                                    field.len()
+                                        + 24
                                         + values.iter().map(val_estimated_bytes).sum::<usize>()
                                 })
                                 .sum::<usize>()

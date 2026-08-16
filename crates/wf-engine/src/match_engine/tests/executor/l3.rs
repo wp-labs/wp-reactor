@@ -167,10 +167,7 @@ rule tracked_close {
             .find(|(name, _)| &**name == "actions"),
         Some(&(
             "actions".into(),
-            Value::Array(vec![
-                Value::Str("scan".into()),
-                Value::Str("probe".into())
-            ])
+            Value::Array(vec![Value::Str("scan".into()), Value::Str("probe".into())])
         ))
     );
 }

@@ -34,7 +34,7 @@ fn session_plan(gap_secs: u64) -> wf_lang::plan::MatchPlan {
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: false,
+        needs_field_history: false,
     }
 }
 

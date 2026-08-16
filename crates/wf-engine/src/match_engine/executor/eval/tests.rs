@@ -146,17 +146,16 @@ fn test_merge_shallow_merges_objects_left_to_right() {
     let Some(Value::Object(object)) = result else {
         panic!("expected object, got {result:?}");
     };
-    assert_eq!(
-        object.get("existing"),
-        Some(&Value::Str("kept".into()))
-    );
+    assert_eq!(object.get("existing"), Some(&Value::Str("kept".into())));
     assert_eq!(object.get("source"), Some(&Value::Str("wfl".into())));
     assert_eq!(object.get("severity"), Some(&Value::Number(10.0)));
 }
 
 #[test]
 fn test_merge_fails_when_object_literal_value_is_missing() {
-    let ctx = Event { fields: EngineHashMap::default() };
+    let ctx = Event {
+        fields: EngineHashMap::default(),
+    };
     let expr = Expr::FuncCall {
         qualifier: None,
         name: "merge".to_string(),
@@ -362,10 +361,7 @@ fn test_qualified_alias_without_match_returns_none_for_first() {
 #[test]
 fn test_replace_works_in_yield_eval() {
     let mut fields = EngineHashMap::default();
-    fields.insert(
-        "msg".into(),
-        Value::Str("failed_login_from_root".into()),
-    );
+    fields.insert("msg".into(), Value::Str("failed_login_from_root".into()));
     let ctx = Event { fields };
     let expr = Expr::FuncCall {
         qualifier: None,
@@ -767,7 +763,7 @@ fn test_hash_and_id_functions_work_in_yield_eval() {
     assert_eq!(stable_id, "alert_ba0dab7ccfb2a04c");
     assert_eq!(
         eval_yield_expr(&stable_expr, &ctx),
-        Some(Value::Str(stable_id.clone().into()))
+        Some(Value::Str(stable_id.clone()))
     );
     let Some(Value::Str(changed_stable_id)) = eval_yield_expr(&stable_changed_expr, &ctx) else {
         panic!("stable_id() should return a string for changed input");
@@ -779,7 +775,9 @@ fn test_hash_and_id_functions_work_in_yield_eval() {
 
 #[test]
 fn test_stable_id_uses_unambiguous_segments_in_yield_eval() {
-    let ctx = Event { fields: EngineHashMap::default() };
+    let ctx = Event {
+        fields: EngineHashMap::default(),
+    };
     let first_expr = Expr::FuncCall {
         qualifier: None,
         name: "stable_id".to_string(),
@@ -815,7 +813,9 @@ fn test_stable_id_uses_unambiguous_segments_in_yield_eval() {
 
 #[test]
 fn test_now_functions_share_timestamp_within_yield_expression() {
-    let ctx = Event { fields: EngineHashMap::default() };
+    let ctx = Event {
+        fields: EngineHashMap::default(),
+    };
     let expr = Expr::BinOp {
         op: BinOp::Sub,
         left: Box::new(Expr::FuncCall {
@@ -835,7 +835,9 @@ fn test_now_functions_share_timestamp_within_yield_expression() {
 
 #[test]
 fn test_now_functions_share_timestamp_across_yield_scope() {
-    let ctx = Event { fields: EngineHashMap::default() };
+    let ctx = Event {
+        fields: EngineHashMap::default(),
+    };
     let now_expr = Expr::FuncCall {
         qualifier: None,
         name: "now".to_string(),
@@ -857,7 +859,9 @@ fn test_now_functions_share_timestamp_across_yield_scope() {
 
 #[test]
 fn test_time_bucket_rejects_invalid_interval_in_yield_eval() {
-    let ctx = Event { fields: EngineHashMap::default() };
+    let ctx = Event {
+        fields: EngineHashMap::default(),
+    };
 
     for interval in [0.0, -60.0, f64::INFINITY, f64::NAN] {
         let expr = Expr::FuncCall {
@@ -967,10 +971,7 @@ fn test_substr_works_in_yield_eval() {
 #[test]
 fn test_startswith_and_endswith_in_yield_eval() {
     let mut fields = EngineHashMap::default();
-    fields.insert(
-        "msg".into(),
-        Value::Str("failed_login_root".into()),
-    );
+    fields.insert("msg".into(), Value::Str("failed_login_root".into()));
     let ctx = Event { fields };
     let starts_expr = Expr::FuncCall {
         qualifier: None,
@@ -998,10 +999,7 @@ fn test_math_and_time_functions_in_yield_eval() {
     fields.insert("n".into(), Value::Number(-12.345));
     fields.insert("p".into(), Value::Number(16.0));
     fields.insert("ts".into(), Value::Number(0.0));
-    fields.insert(
-        "msg".into(),
-        Value::Str("  failed_login_root  ".into()),
-    );
+    fields.insert("msg".into(), Value::Str("  failed_login_root  ".into()));
     fields.insert(
         "arr".into(),
         Value::Array(vec![
@@ -1316,7 +1314,9 @@ fn test_math_and_time_functions_in_yield_eval() {
 
 #[test]
 fn test_system_score_var_works_inside_builtin_functions() {
-    let ctx = Event { fields: EngineHashMap::default() };
+    let ctx = Event {
+        fields: EngineHashMap::default(),
+    };
     let round_expr = Expr::FuncCall {
         qualifier: None,
         name: "round".to_string(),
@@ -1369,10 +1369,7 @@ fn test_mvindex_with_collect_list_nested_l3() {
 
 #[test]
 fn test_mvappend_with_collect_list_nested_l3() {
-    let ctx = make_test_event(vec![
-        Value::Str("a".into()),
-        Value::Str("b".into()),
-    ]);
+    let ctx = make_test_event(vec![Value::Str("a".into()), Value::Str("b".into())]);
     let expr = Expr::FuncCall {
         qualifier: None,
         name: "mvappend".to_string(),
@@ -1414,7 +1411,9 @@ fn external_without_handler_returns_none() {
 
 #[test]
 fn external_requires_at_least_two_args() {
-    let ctx = Event { fields: EngineHashMap::default() };
+    let ctx = Event {
+        fields: EngineHashMap::default(),
+    };
     let expr = Expr::FuncCall {
         qualifier: None,
         name: "external".to_string(),
@@ -1426,7 +1425,9 @@ fn external_requires_at_least_two_args() {
 
 #[test]
 fn external_service_must_be_string_literal() {
-    let ctx = Event { fields: EngineHashMap::default() };
+    let ctx = Event {
+        fields: EngineHashMap::default(),
+    };
     let expr = Expr::FuncCall {
         qualifier: None,
         name: "external".to_string(),

@@ -428,10 +428,7 @@ fn execute_each_yield_merges_input_object_with_extension() {
             qualifier: None,
             name: "merge".into(),
             args: vec![
-                Expr::Field(FieldRef::Qualified(
-                    "e".into(),
-                    "extension".into(),
-                )),
+                Expr::Field(FieldRef::Qualified("e".into(), "extension".into())),
                 Expr::Object(vec![
                     ObjectItem {
                         targets: vec!["source".to_string()],
@@ -496,10 +493,7 @@ fn execute_each_yield_passes_input_object_through() {
     });
     plan.yield_plan.fields = vec![YieldField {
         name: "extensions".into(),
-        value: Expr::Field(FieldRef::Qualified(
-            "e".into(),
-            "extension".into(),
-        )),
+        value: Expr::Field(FieldRef::Qualified("e".into(), "extension".into())),
     }];
     let exec = RuleExecutor::new(plan);
 
@@ -769,17 +763,11 @@ fn execute_match_missing_optional_float_field_is_omitted_not_fatal() {
     );
     plan.yield_plan.fields = vec![YieldField {
         name: "attacker_latitude".into(),
-        value: Expr::Field(FieldRef::Qualified(
-            "e".into(),
-            "attacker_latitude".into(),
-        )),
+        value: Expr::Field(FieldRef::Qualified("e".into(), "attacker_latitude".into())),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([(
-            "attacker_latitude".into(),
-            FieldType::Base(BaseType::Float),
-        )]),
+        HashMap::from([("attacker_latitude".into(), FieldType::Base(BaseType::Float))]),
     );
 
     let output = exec.execute_match(&default_matched_context()).unwrap();
@@ -1230,10 +1218,7 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
             BindData {
                 alias: "hi".into(),
                 count: 1,
-                field_values: EngineHashMap::from_iter([(
-                    "action".into(),
-                    vec![str_val("block")],
-                )]),
+                field_values: EngineHashMap::from_iter([("action".into(), vec![str_val("block")])]),
             },
             BindData {
                 alias: "elevated".into(),
@@ -1363,10 +1348,7 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
             BindData {
                 alias: "hi".into(),
                 count: 1,
-                field_values: EngineHashMap::from_iter([(
-                    "action".into(),
-                    vec![str_val("block")],
-                )]),
+                field_values: EngineHashMap::from_iter([("action".into(), vec![str_val("block")])]),
             },
             BindData {
                 alias: "elevated".into(),
@@ -1383,7 +1365,7 @@ fn execute_match_yield_can_use_bind_alias_aggregates() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
-            trigger_event: None,
+        trigger_event: None,
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -1526,6 +1508,7 @@ fn execute_close_yield_resolves_tracked_bind_alias_field() {
     match_plan.tracked_bind_aliases = HashSet::from(["c".into()]);
 
     let rule_plan = RulePlan {
+        conv_window: None,
         name: "port_scan".into(),
         binds: vec![BindPlan {
             alias: "c".into(),
@@ -2315,17 +2298,11 @@ fn execute_each_missing_optional_float_field_is_omitted_not_fatal() {
     });
     plan.yield_plan.fields = vec![YieldField {
         name: "attacker_latitude".into(),
-        value: Expr::Field(FieldRef::Qualified(
-            "e".into(),
-            "attacker_latitude".into(),
-        )),
+        value: Expr::Field(FieldRef::Qualified("e".into(), "attacker_latitude".into())),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([(
-            "attacker_latitude".into(),
-            FieldType::Base(BaseType::Float),
-        )]),
+        HashMap::from([("attacker_latitude".into(), FieldType::Base(BaseType::Float))]),
     );
 
     // Input event has no `attacker_latitude` field at all.
@@ -2363,17 +2340,11 @@ fn execute_each_present_float_field_outputs_normally() {
     });
     plan.yield_plan.fields = vec![YieldField {
         name: "attacker_latitude".into(),
-        value: Expr::Field(FieldRef::Qualified(
-            "e".into(),
-            "attacker_latitude".into(),
-        )),
+        value: Expr::Field(FieldRef::Qualified("e".into(), "attacker_latitude".into())),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([(
-            "attacker_latitude".into(),
-            FieldType::Base(BaseType::Float),
-        )]),
+        HashMap::from([("attacker_latitude".into(), FieldType::Base(BaseType::Float))]),
     );
 
     // Present and finite → the field is output unchanged.
@@ -2417,10 +2388,7 @@ fn execute_each_explicit_nan_float_still_fails() {
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([(
-            "attacker_latitude".into(),
-            FieldType::Base(BaseType::Float),
-        )]),
+        HashMap::from([("attacker_latitude".into(), FieldType::Base(BaseType::Float))]),
     );
 
     // Explicit NaN is a genuine data-format error, not an absent value.
@@ -2445,10 +2413,7 @@ fn execute_each_missing_optional_field_keeps_other_fields() {
     plan.yield_plan.fields = vec![
         YieldField {
             name: "attacker_latitude".into(),
-            value: Expr::Field(FieldRef::Qualified(
-                "e".into(),
-                "attacker_latitude".into(),
-            )),
+            value: Expr::Field(FieldRef::Qualified("e".into(), "attacker_latitude".into())),
         },
         YieldField {
             name: "sip".into(),
@@ -2458,10 +2423,7 @@ fn execute_each_missing_optional_field_keeps_other_fields() {
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
         HashMap::from([
-            (
-                "attacker_latitude".into(),
-                FieldType::Base(BaseType::Float),
-            ),
+            ("attacker_latitude".into(), FieldType::Base(BaseType::Float)),
             ("sip".into(), FieldType::Base(BaseType::Chars)),
         ]),
     );
@@ -2507,10 +2469,7 @@ fn execute_each_missing_optional_digit_field_is_omitted() {
     });
     plan.yield_plan.fields = vec![YieldField {
         name: "fail_count".into(),
-        value: Expr::Field(FieldRef::Qualified(
-            "e".into(),
-            "fail_count".into(),
-        )),
+        value: Expr::Field(FieldRef::Qualified("e".into(), "fail_count".into())),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
@@ -2574,17 +2533,11 @@ fn execute_close_missing_optional_float_field_is_omitted_not_fatal() {
     );
     plan.yield_plan.fields = vec![YieldField {
         name: "attacker_latitude".into(),
-        value: Expr::Field(FieldRef::Qualified(
-            "e".into(),
-            "attacker_latitude".into(),
-        )),
+        value: Expr::Field(FieldRef::Qualified("e".into(), "attacker_latitude".into())),
     }];
     let exec = RuleExecutor::new_with_yield_field_types(
         plan,
-        HashMap::from([(
-            "attacker_latitude".into(),
-            FieldType::Base(BaseType::Float),
-        )]),
+        HashMap::from([("attacker_latitude".into(), FieldType::Base(BaseType::Float))]),
     );
     let close = CloseOutput {
         rule_name: "r1".into(),
@@ -2829,7 +2782,10 @@ fn execute_each_yield_nested_array_index() {
                     "related".into(),
                     Value::Array(vec![Value::Object(EngineHashMap::from_iter([(
                         "process".into(),
-                        Value::Object(EngineHashMap::from_iter([("name".into(), str_val("evil.exe"))])),
+                        Value::Object(EngineHashMap::from_iter([(
+                            "name".into(),
+                            str_val("evil.exe"),
+                        )])),
                     )]))]),
                 )])),
             )]),

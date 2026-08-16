@@ -238,8 +238,18 @@ pub(super) async fn flush_ndjson_rows(
     // Push to the parse worker pool (R3) instead of routing inline: the commit
     // worker applies `route_commit` in order and logs route errors (aligned with
     // the streaming-source path).
-    if !push_decoded_batch(parse_tx, preread, parse_seq, source_name, stream_name, batch, router, metrics, None)
-        .await
+    if !push_decoded_batch(
+        parse_tx,
+        preread,
+        parse_seq,
+        source_name,
+        stream_name,
+        batch,
+        router,
+        metrics,
+        None,
+    )
+    .await
     {
         return RuntimeReason::system_error()
             .to_err()

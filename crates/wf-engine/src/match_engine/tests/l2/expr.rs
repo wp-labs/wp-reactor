@@ -14,7 +14,9 @@ fn if_then_else_true_branch() {
         then_expr: Box::new(Expr::Number(80.0)),
         else_expr: Box::new(Expr::Number(40.0)),
     };
-    let event = Event { fields: EngineHashMap::default() };
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
     let result = eval_expr(&expr, &event);
     assert_eq!(result, Some(Value::Number(80.0)));
 }
@@ -28,7 +30,9 @@ fn if_then_else_false_branch() {
         then_expr: Box::new(Expr::Number(80.0)),
         else_expr: Box::new(Expr::Number(40.0)),
     };
-    let event = Event { fields: EngineHashMap::default() };
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
     let result = eval_expr(&expr, &event);
     assert_eq!(result, Some(Value::Number(40.0)));
 }
@@ -47,7 +51,9 @@ fn if_then_else_nested() {
         }),
         else_expr: Box::new(Expr::Number(3.0)),
     };
-    let event = Event { fields: EngineHashMap::default() };
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
     let result = eval_expr(&expr, &event);
     assert_eq!(result, Some(Value::Number(2.0)));
 }
@@ -212,7 +218,9 @@ fn time_bucket_exact_boundary() {
 fn time_bucket_rejects_non_positive_or_non_finite_interval() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let event = Event { fields: EngineHashMap::default() };
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
     for interval in [0.0, -60.0, f64::INFINITY, f64::NAN] {
         let expr = Expr::FuncCall {
             qualifier: None,
@@ -235,10 +243,7 @@ fn math_functions_work() {
     fields.insert("n".into(), Value::Number(-12.345));
     fields.insert("p".into(), Value::Number(16.0));
     fields.insert("ts".into(), Value::Number(0.0));
-    fields.insert(
-        "msg".into(),
-        Value::Str("  failed_login_root  ".into()),
-    );
+    fields.insert("msg".into(), Value::Str("  failed_login_root  ".into()));
     fields.insert(
         "arr".into(),
         Value::Array(vec![
@@ -468,7 +473,9 @@ fn math_functions_work() {
 fn now_functions_work() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let event = Event { fields: EngineHashMap::default() };
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
     let now_expr = Expr::FuncCall {
         qualifier: None,
         name: "now".to_string(),
@@ -537,7 +544,9 @@ fn now_functions_work() {
 fn now_functions_share_timestamp_within_expression() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let event = Event { fields: EngineHashMap::default() };
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
     let expr = Expr::BinOp {
         op: BinOp::Sub,
         left: Box::new(Expr::FuncCall {
@@ -708,10 +717,7 @@ fn merge_shallow_merges_objects_in_l2_eval() {
     let Some(Value::Object(object)) = eval_expr(&expr, &event) else {
         panic!("expected object");
     };
-    assert_eq!(
-        object.get("rule"),
-        Some(&Value::Str("webshell".into()))
-    );
+    assert_eq!(object.get("rule"), Some(&Value::Str("webshell".into())));
     assert_eq!(object.get("source"), Some(&Value::Str("wfl".into())));
     assert_eq!(object.get("severity"), Some(&Value::Number(10.0)));
 }
@@ -720,7 +726,9 @@ fn merge_shallow_merges_objects_in_l2_eval() {
 fn merge_fails_when_object_literal_value_is_missing_in_l2_eval() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let event = Event { fields: EngineHashMap::default() };
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
     let expr = Expr::FuncCall {
         qualifier: None,
         name: "merge".to_string(),
@@ -745,7 +753,9 @@ fn merge_fails_when_object_literal_value_is_missing_in_l2_eval() {
 fn merge_treats_missing_field_arg_as_empty_object_in_l2_eval() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let event = Event { fields: EngineHashMap::default() };
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
     let expr = Expr::FuncCall {
         qualifier: None,
         name: "merge".to_string(),
@@ -985,7 +995,7 @@ fn hash_and_id_functions_work() {
     assert_eq!(stable_id, "alert_ba0dab7ccfb2a04c");
     assert_eq!(
         eval_expr(&stable_expr, &event),
-        Some(Value::Str(stable_id.clone().into()))
+        Some(Value::Str(stable_id.clone()))
     );
     let Some(Value::Str(changed_stable_id)) = eval_expr(&stable_changed_expr, &event) else {
         panic!("stable_id() should return a string for changed input");
@@ -1000,7 +1010,9 @@ fn hash_and_id_functions_work() {
 fn stable_id_uses_unambiguous_segments() {
     use crate::match_engine::match_engine::{Event, eval_expr};
 
-    let event = Event { fields: EngineHashMap::default() };
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
     let first_expr = Expr::FuncCall {
         qualifier: None,
         name: "stable_id".to_string(),
@@ -1046,7 +1058,9 @@ fn strptime_parses_date() {
             Expr::StringLit("%Y-%m-%d".to_string()),
         ],
     };
-    let event = Event { fields: EngineHashMap::default() };
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
     assert_eq!(eval_expr(&expr, &event), Some(Value::Number(0.0)));
 }
 
@@ -1062,7 +1076,9 @@ fn strptime_returns_epoch_milliseconds() {
             Expr::StringLit("%Y-%m-%d %H:%M:%S".to_string()),
         ],
     };
-    let event = Event { fields: EngineHashMap::default() };
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
     assert_eq!(
         eval_expr(&expr, &event),
         Some(Value::Number(1_710_115_200_000.0))
@@ -1089,10 +1105,7 @@ fn replace_regex_substitution() {
     let mut fields = EngineHashMap::default();
     fields.insert("action".into(), Value::Str("failed_login".into()));
     let event = Event { fields };
-    assert_eq!(
-        eval_expr(&expr, &event),
-        Some(Value::Str("blocked".into()))
-    );
+    assert_eq!(eval_expr(&expr, &event), Some(Value::Str("blocked".into())));
 }
 
 #[test]
@@ -1116,10 +1129,7 @@ fn startswith_and_endswith_work() {
         ],
     };
     let mut fields = EngineHashMap::default();
-    fields.insert(
-        "msg".into(),
-        Value::Str("failed_login_root".into()),
-    );
+    fields.insert("msg".into(), Value::Str("failed_login_root".into()));
     let event = Event { fields };
     assert_eq!(eval_expr(&starts, &event), Some(Value::Bool(true)));
     assert_eq!(eval_expr(&ends, &event), Some(Value::Bool(true)));
@@ -1155,10 +1165,7 @@ fn substr_supports_one_based_and_negative_start() {
             Expr::Neg(Box::new(Expr::Number(2.0))),
         ],
     };
-    assert_eq!(
-        eval_expr(&negative, &event),
-        Some(Value::Str("ef".into()))
-    );
+    assert_eq!(eval_expr(&negative, &event), Some(Value::Str("ef".into())));
 }
 
 #[test]
@@ -1173,10 +1180,7 @@ fn trim_removes_surrounding_whitespace() {
     let mut fields = EngineHashMap::default();
     fields.insert("msg".into(), Value::Str("  hello\t".into()));
     let event = Event { fields };
-    assert_eq!(
-        eval_expr(&expr, &event),
-        Some(Value::Str("hello".into()))
-    );
+    assert_eq!(eval_expr(&expr, &event), Some(Value::Str("hello".into())));
 }
 
 #[test]
@@ -1223,10 +1227,7 @@ fn mvjoin_array_with_separator() {
         ]),
     );
     let event = Event { fields };
-    assert_eq!(
-        eval_expr(&expr, &event),
-        Some(Value::Str("a|b|c".into()))
-    );
+    assert_eq!(eval_expr(&expr, &event), Some(Value::Str("a|b|c".into())));
 }
 
 #[test]
@@ -1253,10 +1254,7 @@ fn mvindex_single_and_range() {
             Expr::Neg(Box::new(Expr::Number(1.0))),
         ],
     };
-    assert_eq!(
-        eval_expr(&single, &event),
-        Some(Value::Str("d".into()))
-    );
+    assert_eq!(eval_expr(&single, &event), Some(Value::Str("d".into())));
 
     let range = Expr::FuncCall {
         qualifier: None,
@@ -1283,10 +1281,7 @@ fn mvappend_flattens_arrays_and_scalars() {
     let mut fields = EngineHashMap::default();
     fields.insert(
         "vals".into(),
-        Value::Array(vec![
-            Value::Str("a".into()),
-            Value::Str("b".into()),
-        ]),
+        Value::Array(vec![Value::Str("a".into()), Value::Str("b".into())]),
     );
     let event = Event { fields };
     let expr = Expr::FuncCall {
@@ -1418,9 +1413,6 @@ fn external_func_call_dispatches_to_handler() {
     assert_eq!(eval_expr(&expr, &hit), Some(Value::Bool(true)));
 
     // non-weak password -> handler returns false
-    let miss = event(vec![(
-        "chars",
-        Value::Str("not-a-weak-password".into()),
-    )]);
+    let miss = event(vec![("chars", Value::Str("not-a-weak-password".into()))]);
     assert_eq!(eval_expr(&expr, &miss), Some(Value::Bool(false)));
 }

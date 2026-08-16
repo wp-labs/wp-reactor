@@ -219,7 +219,9 @@ mod tests {
         );
         // Let it finish naturally (still no cancel) — wait returns Ok.
         tokio::time::advance(GROUP_JOIN_TIMEOUT * 2).await;
-        let result = wait.await.expect("wait should finish on natural completion");
+        let result = wait
+            .await
+            .expect("wait should finish on natural completion");
         assert!(result.is_ok());
         assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -244,6 +246,7 @@ mod tests {
     domain = "Orchestra",
     module = "Orchestra.ReactorLifecycle"
 )]
+#[allow(clippy::large_enum_variant)] // Match carries the compiled MatchPlan; boxing it would churn the hot path
 pub(crate) enum RunRuleKind {
     Match {
         match_plan: MatchPlan,

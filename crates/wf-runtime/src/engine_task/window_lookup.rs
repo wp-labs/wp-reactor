@@ -75,6 +75,8 @@ impl WindowLookup for RegistryLookup<'_> {
         Some(rows)
     }
 
+    // `key_field` is only used when forwarding to the trait's scan fallback.
+    #[allow(clippy::only_used_in_recursion)]
     fn join_lookup(
         &self,
         window: &str,
@@ -82,9 +84,7 @@ impl WindowLookup for RegistryLookup<'_> {
         key: &Value,
     ) -> Option<Vec<HashMap<String, Value>>> {
         let win = self.0.registry().get_window(window)?;
-        let Some(key) = JoinKey::from_value(key) else {
-            return None;
-        };
+        let key = JoinKey::from_value(key)?;
         // Indexed lookup if the window has a maintained join index; otherwise
         // fall back to the trait's snapshot scan.
         if let Some(rows) = win.join_rows(&key) {
@@ -210,7 +210,10 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(TimestampNanosecondArray::from(vec![1_000_000_000, 2_000_000_000])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_000_000_000,
+                    2_000_000_000,
+                ])),
                 Arc::new(StringArray::from(vec!["10.0.0.1", "10.0.0.2"])),
                 Arc::new(Int64Array::from(vec![80, 95])),
             ],

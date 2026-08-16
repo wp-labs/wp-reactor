@@ -7,10 +7,7 @@ fn on_each_join_key_object_rejected() {
     let lookup = make_window(
         "lookup_table",
         vec!["lookup_stream"],
-        vec![
-            ("ip", bt(BaseType::Ip)),
-            ("payload", FieldType::Object),
-        ],
+        vec![("ip", bt(BaseType::Ip)), ("payload", FieldType::Object)],
     );
     let input = r#"
 rule r {

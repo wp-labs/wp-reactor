@@ -1,6 +1,6 @@
 use std::collections::HashSet;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use tokio::sync::{Notify, mpsc, watch};
@@ -10,6 +10,7 @@ use wf_engine::match_engine::{CepStateMachine, RuleExecutor};
 use wf_engine::window::{Router, RulePush, Window};
 
 use crate::alert_task::SinkFanout;
+use crate::engine_task::conv_stage::ConvShardSink;
 use crate::metrics::RuntimeMetrics;
 
 // ---------------------------------------------------------------------------
@@ -61,4 +62,8 @@ pub(crate) struct RuleTaskConfig {
     /// after fully processing a batch; on drop the slots are released so a
     /// shutdown task cannot pin window memory. Gates time-based eviction.
     pub progress: std::collections::HashMap<String, Arc<AtomicU64>>,
+    /// P2c: when the rule is a shard of a sharded conv rule, this sink carries
+    /// raw qualifying closes to the conv stage (aggregation window). `None`
+    /// otherwise (inline conv path).
+    pub conv_sink: Option<ConvShardSink>,
 }

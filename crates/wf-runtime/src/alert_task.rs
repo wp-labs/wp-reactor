@@ -1,14 +1,14 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use wp_model_core::model::DataRecord;
 use wf_engine::alert::AlertColumnBatch;
 use wf_engine::sink::{SinkDispatcher, SinkRuntime};
+use wp_model_core::model::DataRecord;
 
 use crate::metrics::RuntimeMetrics;
 
@@ -90,7 +90,10 @@ impl SinkFanout {
         by_sink: HashMap<usize, Vec<mpsc::Sender<AlertBatch>>>,
         dispatcher: Arc<SinkDispatcher>,
     ) -> Self {
-        let rr = by_sink.keys().map(|&k| (k, std::sync::atomic::AtomicUsize::new(0))).collect();
+        let rr = by_sink
+            .keys()
+            .map(|&k| (k, std::sync::atomic::AtomicUsize::new(0)))
+            .collect();
         Self {
             by_sink,
             rr,
@@ -107,9 +110,7 @@ impl SinkFanout {
 
     /// Build a fanout from a pre-resolved target→channel-groups map (no
     /// on-demand resolver). Used by the reload fallback and by tests.
-    pub(crate) fn from_resolved(
-        cache: HashMap<String, ResolvedChannels>,
-    ) -> Arc<Self> {
+    pub(crate) fn from_resolved(cache: HashMap<String, ResolvedChannels>) -> Arc<Self> {
         Arc::new(Self {
             by_sink: HashMap::new(),
             rr: HashMap::new(),

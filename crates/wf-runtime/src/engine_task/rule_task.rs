@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::new_null_array;
@@ -10,13 +10,16 @@ use orion_error::conversion::{SourceRawErr, ToStructError};
 use tokio::sync::mpsc;
 
 use wf_engine::alert::{AlertColumnBuilder, OutputRecord};
-use wf_engine::match_engine::{CepStateMachine, CloseReason, Event, RuleExecutor, StepResult};
+use wf_engine::match_engine::{
+    CepStateMachine, CloseReason, Event, RuleExecutor, StepResult, close_is_qualified,
+};
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
 use wf_lang::plan::ConvPlan;
 use wf_lang::wfu_meta::{WFU_ID, WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
 
 use crate::alert_task::SinkFanout;
+use crate::engine_task::conv_stage::{ConvCloseBatch, ConvShardSink};
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::metrics::RuntimeMetrics;
 
@@ -26,6 +29,11 @@ use super::window_lookup::RegistryLookup;
 
 const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
 const DEBUG_DETAIL_LIMIT: usize = 20;
+
+/// Pull-path pending rows: (alias, cursor, event arcs) per source window.
+type PendingAliasRows = Vec<(String, u64, Vec<Arc<Vec<Arc<Event>>>>)>;
+/// Staged pipe batch: (window name, events) or `None` when nothing staged.
+type PendingEventBatch = Option<(Arc<str>, Arc<Vec<Arc<Event>>>)>;
 /// Batch the allocation-heavy per-alert telemetry (detail map + e2e latency
 /// histogram): only 1 in N emitted alerts updates those, the exact total is
 /// always counted.
@@ -39,20 +47,12 @@ const ALERT_BATCH_SIZE: usize = 256;
 /// per-row `DataRecord` materialization on the emit path); `flush_alerts`
 /// seals each target's builder into one `AlertColumnBatch` for the sink
 /// channel. See `AlertColumnBatch` for the memory rationale.
+#[derive(Default)]
 struct PendingAlertColumns {
     /// Yield targets are few (typically 1-2 per rule) — a linear scan beats
     /// hashing the target string on every append.
     by_target: Vec<(std::sync::Arc<str>, AlertColumnBuilder)>,
     count: usize,
-}
-
-impl Default for PendingAlertColumns {
-    fn default() -> Self {
-        Self {
-            by_target: Vec::new(),
-            count: 0,
-        }
-    }
 }
 
 /// Current wall-clock epoch nanos.
@@ -117,6 +117,8 @@ pub(super) struct RuleTask {
     each_time_field: Option<String>,
     executor: RuleExecutor,
     conv_plan: Option<ConvPlan>,
+    /// P2c: raw-close routing to the conv stage (sharded conv rules).
+    conv_sink: Option<ConvShardSink>,
     pub(super) sources: Vec<WindowSource>,
     /// window_name -> Vec<alias>: pre-computed from stream_aliases + window sources.
     aliases: HashMap<String, Vec<String>>,
@@ -176,6 +178,10 @@ pub(super) struct RuleTask {
     /// Serialize-timing sampler state (1-in-`EMIT_METRIC_SAMPLE_INTERVAL`),
     /// see `emit`.
     serialize_sample_remaining: AtomicU32,
+    /// Last value reported to the `rule_instances` gauge. The gauge is the sum
+    /// across a rule's shards, so each shard reports the delta since its last
+    /// report (P2b).
+    last_reported_instances: AtomicI64,
     /// Batched alert delivery: per-yield-target columnar builders flushed to
     /// the sink writers when the batch fills / at EOS. The record→columns
     /// append runs on this thread by design — see [`Self::emit`].
@@ -232,6 +238,7 @@ impl RuleTask {
             eos_flush,
             push_rx,
             progress,
+            conv_sink,
         } = config;
         let aliases: HashMap<String, Vec<String>> = window_sources
             .iter()
@@ -279,6 +286,7 @@ impl RuleTask {
             each_time_field,
             executor,
             conv_plan,
+            conv_sink,
             sources: window_sources,
             aliases,
             ordered_aliases,
@@ -303,6 +311,7 @@ impl RuleTask {
             cached_wall_nanos: AtomicU64::new(wall_nanos()),
             emit_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
             serialize_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
+            last_reported_instances: AtomicI64::new(0),
             pending_alerts: std::sync::Mutex::new(PendingAlertColumns::default()),
             pipe_state: std::sync::Mutex::new(PipeState::Uninit),
             each_direct,
@@ -329,7 +338,7 @@ impl RuleTask {
         // Collect new events per window first (this phase only takes disjoint
         // field borrows), then process each batch — which needs `&mut self` and
         // would otherwise conflict with the `&self.sources` iteration.
-        let mut pending: Vec<(String, u64, Vec<Arc<Vec<Arc<Event>>>>)> = Vec::new();
+        let mut pending: PendingAliasRows = Vec::new();
         for source in &self.sources {
             let cursor = self.cursors.get(&source.window_name).copied().unwrap_or(0);
             let (events_list, new_cursor, gap) = {
@@ -432,23 +441,22 @@ impl RuleTask {
         if !events.is_empty() {
             self.last_activity_wall = std::time::Instant::now();
             // Cache wall time for the emit path's e2e-latency sample.
-            self.cached_wall_nanos.store(wall_nanos(), Ordering::Relaxed);
+            self.cached_wall_nanos
+                .store(wall_nanos(), Ordering::Relaxed);
         }
         let lookup = RegistryLookup(&self.router);
         // on-each: events within a batch share the window schema, so the
         // sorted field order used for wfx_id hashing is computed once per
         // batch instead of collected + sorted per event.
-        let each_field_order: Vec<&smol_str::SmolStr> = match (
-            self.executor.plan().each_plan.is_some(),
-            events.first(),
-        ) {
-            (true, Some(first)) => {
-                let mut names: Vec<&smol_str::SmolStr> = first.fields.keys().collect();
-                names.sort_unstable();
-                names
-            }
-            _ => Vec::new(),
-        };
+        let each_field_order: Vec<&smol_str::SmolStr> =
+            match (self.executor.plan().each_plan.is_some(), events.first()) {
+                (true, Some(first)) => {
+                    let mut names: Vec<&smol_str::SmolStr> = first.fields.keys().collect();
+                    names.sort_unstable();
+                    names
+                }
+                _ => Vec::new(),
+            };
         // Batch-level emit timestamp: all events in this batch share one
         // (nanos, formatted) pair — the executor caches the formatted string
         // and Arc-shares it across every record it builds this batch.
@@ -457,12 +465,32 @@ impl RuleTask {
         // the each-direct rows and emit them in one vectorized pass after
         // the loop (debug runs keep the per-event path for exact detail).
         let mut each_direct_rows: Vec<(&wf_engine::match_engine::Event, i64)> = Vec::new();
+        // P2③: for conv-sink shards, aggregate raw closes across the whole batch
+        // and send ONE ConvCloseBatch (with the max event-time watermark) after
+        // the loop — avoids a per-event bounded(32) channel send on the hot path.
+        let mut conv_closes: Vec<wf_engine::match_engine::CloseOutput> = Vec::new();
+        let mut conv_max_wm: i64 = 0;
         for (row_index, event) in events.iter().enumerate() {
             if let Some(machine) = &mut self.machine {
                 let event_nanos = machine.event_time_nanos(event);
                 let _scan_start = Instant::now();
-                let closes =
-                    machine.scan_expired_at_with_conv(event_nanos, self.conv_plan.as_ref());
+                // P2c: shards of a conv rule emit raw closes to the conv stage
+                // (aggregation window); inline conv is applied only on the
+                // legacy single-machine path.
+                let (routed, closes) = if self.conv_sink.is_some() {
+                    let raw = machine.scan_expired_at(event_nanos);
+                    // Barrier watermark must reflect the scan's watermark (the
+                    // event time) — the machine's cached watermark only advances
+                    // during `advance`, which runs after the scan.
+                    conv_max_wm = conv_max_wm.max(event_nanos);
+                    conv_closes.extend(raw.into_iter().filter(close_is_qualified));
+                    (true, Vec::new())
+                } else {
+                    (
+                        false,
+                        machine.scan_expired_at_with_conv(event_nanos, self.conv_plan.as_ref()),
+                    )
+                };
                 self.scan_nanos += _scan_start.elapsed().as_nanos() as u64;
                 let _advance_start = Instant::now();
                 let mut matched = Vec::new();
@@ -613,48 +641,52 @@ impl RuleTask {
                 self.advance_nanos += _advance_start.elapsed().as_nanos() as u64;
                 let _emit_start = Instant::now();
 
-                for close in &closes {
-                    match self.executor.execute_close_with_joins(close, &lookup) {
-                        Ok(Some(record)) => {
-                            if debug_enabled {
-                                stats.count_output(&record, &self.intermediate_targets);
+                // When routed to the conv stage, the inline close processing is
+                // skipped (the closes were already sent in the scan step).
+                if !routed {
+                    for close in &closes {
+                        match self.executor.execute_close_with_joins(close, &lookup) {
+                            Ok(Some(record)) => {
+                                if debug_enabled {
+                                    stats.count_output(&record, &self.intermediate_targets);
+                                }
+                                if debug_enabled && stats.allow_detail() {
+                                    log_output_emitted(
+                                        "execute_close",
+                                        "close",
+                                        output_kind(&record, &self.intermediate_targets),
+                                        &record,
+                                        close.scope_key.as_slice(),
+                                    );
+                                }
+                                self.emit(record).await;
                             }
-                            if debug_enabled && stats.allow_detail() {
-                                log_output_emitted(
-                                    "execute_close",
-                                    "close",
-                                    output_kind(&record, &self.intermediate_targets),
-                                    &record,
-                                    close.scope_key.as_slice(),
-                                );
+                            Ok(None) => {
+                                if debug_enabled {
+                                    stats.output_none += 1;
+                                }
+                                if debug_enabled && stats.allow_detail() {
+                                    log_output_suppressed(
+                                        rule_name_for_log,
+                                        "execute_close",
+                                        Some(close.scope_key.as_slice()),
+                                    );
+                                }
                             }
-                            self.emit(record).await;
-                        }
-                        Ok(None) => {
-                            if debug_enabled {
-                                stats.output_none += 1;
+                            Err(e) => {
+                                if debug_enabled {
+                                    stats.errors += 1;
+                                }
+                                wf_warn!(
+                                    pipe,
+                                    rule = %rule_name.as_deref().unwrap_or_else(|| self.rule_name()),
+                                    stage = 0,
+                                    phase = "execute_close",
+                                    scope_key = %debug_scope_key(&close.scope_key),
+                                    error = %e,
+                                    "rule output failed"
+                                )
                             }
-                            if debug_enabled && stats.allow_detail() {
-                                log_output_suppressed(
-                                    rule_name_for_log,
-                                    "execute_close",
-                                    Some(close.scope_key.as_slice()),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if debug_enabled {
-                                stats.errors += 1;
-                            }
-                            wf_warn!(
-                                pipe,
-                                rule = %rule_name.as_deref().unwrap_or_else(|| self.rule_name()),
-                                stage = 0,
-                                phase = "execute_close",
-                                scope_key = %debug_scope_key(&close.scope_key),
-                                error = %e,
-                                "rule output failed"
-                            )
                         }
                     }
                 }
@@ -845,6 +877,27 @@ impl RuleTask {
                 }
             }
         }
+        // P2③: one aggregated ConvCloseBatch per batch for conv-sink shards,
+        // using the max event-time watermark as the barrier. (Replaces per-event
+        // sends — the per-event path saturated the bounded(32) channel.)
+        if self.conv_sink.is_some()
+            && let Some(sink) = self.conv_sink.as_ref()
+        {
+            // P3-D: if the conv stage is gone (channel closed), the closes are
+            // dropped — log it rather than fail silently.
+            let sent = sink
+                .tx
+                .send(ConvCloseBatch {
+                    closes: std::mem::take(&mut conv_closes),
+                    watermark: conv_max_wm,
+                    drained: false,
+                    barrier_index: sink.barrier_index,
+                })
+                .await;
+            if sent.is_err() {
+                log::debug!("conv sink channel closed — conv batch dropped");
+            }
+        }
         // Vectorized on-each direct emit for the collected rows. Segment
         // size = ALERT_BATCH_SIZE keeps the flush cadence and the pending
         // memory bound of the per-event path.
@@ -919,16 +972,24 @@ impl RuleTask {
         );
     }
 
-    /// Update the periodic per-rule instance-count metric.
+    /// Update the periodic per-rule instance-count gauge.
+    ///
+    /// P2b: the gauge is the sum across a rule's shards, so each shard reports
+    /// the delta since its last report. On drain (flush/EOS) the count drops to
+    /// zero and the final delta reconciles the shard's contribution to zero.
     fn update_rule_instances_metric(&self) {
         if let Some(metrics) = &self.metrics {
             let rule_name = self.executor.plan().name.as_str();
-            let instances = self
+            let cur = self
                 .machine
                 .as_ref()
-                .map(|machine| machine.instance_count())
+                .map(|machine| machine.instance_count() as i64)
                 .unwrap_or(0);
-            metrics.set_rule_instances(rule_name, instances);
+            let last = self.last_reported_instances.swap(cur, Ordering::Relaxed);
+            let delta = cur - last;
+            if delta != 0 {
+                metrics.adjust_rule_instances(rule_name, delta);
+            }
         }
     }
 
@@ -945,7 +1006,10 @@ impl RuleTask {
         if let Some(slot) = self.progress.get(window_name.as_ref()) {
             // saturating: relay pushes carry seq = u64::MAX (no window batch
             // behind them) — MAX + 1 would overflow and wrap to 0.
-            slot.store(push_seq.saturating_add(1), std::sync::atomic::Ordering::Release);
+            slot.store(
+                push_seq.saturating_add(1),
+                std::sync::atomic::Ordering::Release,
+            );
         }
     }
 
@@ -968,7 +1032,8 @@ impl RuleTask {
         let Some(machine) = &self.machine else {
             return;
         };
-        self.cached_wall_nanos.store(wall_nanos(), Ordering::Relaxed);
+        self.cached_wall_nanos
+            .store(wall_nanos(), Ordering::Relaxed);
         // Advance the effective watermark by the wall-clock time elapsed since the
         // last event was processed. This lets instances expire per their window TTL
         // even when input is completely idle (window semantics, not just event-time).
@@ -977,58 +1042,91 @@ impl RuleTask {
             .saturating_add(self.last_activity_wall.elapsed().as_nanos() as i64);
         let started = Instant::now();
         let lookup = RegistryLookup(&self.router);
-        let (rule_name, closes) = {
+        // P2c: shards of a conv rule route raw closes to the conv stage.
+        let (rule_name, closes, routed) = {
             let machine = self.machine.as_mut().expect("checked above");
-            (
-                machine.rule_name().to_string(),
-                machine.scan_expired_at_with_conv(effective_watermark, self.conv_plan.as_ref()),
-            )
+            let rule_name = machine.rule_name().to_string();
+            if self.conv_sink.is_some() {
+                let raw = machine.scan_expired_at(effective_watermark);
+                // Barrier watermark = the effective (wall-clock advanced) scan
+                // watermark, so an idle shard still advances its barrier and the
+                // conv stage can seal buckets for the whole rule (without this,
+                // an idle shard's stale barrier starves sealing forever).
+                let watermark = effective_watermark;
+                let qualifying: Vec<_> = raw.into_iter().filter(close_is_qualified).collect();
+                if let Some(sink) = self.conv_sink.as_ref() {
+                    // P3-D: log when the conv stage is gone (closes dropped).
+                    if sink
+                        .tx
+                        .send(ConvCloseBatch {
+                            closes: qualifying,
+                            watermark,
+                            drained: false,
+                            barrier_index: sink.barrier_index,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        log::debug!("conv sink channel closed — scan batch dropped");
+                    }
+                }
+                (rule_name, Vec::new(), true)
+            } else {
+                (
+                    rule_name,
+                    machine.scan_expired_at_with_conv(effective_watermark, self.conv_plan.as_ref()),
+                    false,
+                )
+            }
         };
         let mut stats = RuleBatchDebugStats::default();
         let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
-        for close in &closes {
-            match self.executor.execute_close_with_joins(close, &lookup) {
-                Ok(Some(record)) => {
-                    if debug_enabled {
-                        stats.count_output(&record, &self.intermediate_targets);
+        // When routed to the conv stage, skip inline close processing.
+        if !routed {
+            for close in &closes {
+                match self.executor.execute_close_with_joins(close, &lookup) {
+                    Ok(Some(record)) => {
+                        if debug_enabled {
+                            stats.count_output(&record, &self.intermediate_targets);
+                        }
+                        if debug_enabled && stats.allow_detail() {
+                            log_output_emitted(
+                                "execute_close",
+                                "close",
+                                output_kind(&record, &self.intermediate_targets),
+                                &record,
+                                close.scope_key.as_slice(),
+                            );
+                        }
+                        self.emit(record).await;
                     }
-                    if debug_enabled && stats.allow_detail() {
-                        log_output_emitted(
-                            "execute_close",
-                            "close",
-                            output_kind(&record, &self.intermediate_targets),
-                            &record,
-                            close.scope_key.as_slice(),
-                        );
+                    Ok(None) => {
+                        if debug_enabled {
+                            stats.output_none += 1;
+                        }
+                        if debug_enabled && stats.allow_detail() {
+                            log_output_suppressed(
+                                &rule_name,
+                                "execute_close",
+                                Some(close.scope_key.as_slice()),
+                            );
+                        }
                     }
-                    self.emit(record).await;
-                }
-                Ok(None) => {
-                    if debug_enabled {
-                        stats.output_none += 1;
+                    Err(e) => {
+                        if debug_enabled {
+                            stats.errors += 1;
+                        }
+                        wf_warn!(
+                            pipe,
+                            task_id = %self.task_id,
+                            rule = %rule_name,
+                            stage = 0,
+                            phase = "execute_close",
+                            scope_key = %debug_scope_key(&close.scope_key),
+                            error = %e,
+                            "rule output failed"
+                        )
                     }
-                    if debug_enabled && stats.allow_detail() {
-                        log_output_suppressed(
-                            &rule_name,
-                            "execute_close",
-                            Some(close.scope_key.as_slice()),
-                        );
-                    }
-                }
-                Err(e) => {
-                    if debug_enabled {
-                        stats.errors += 1;
-                    }
-                    wf_warn!(
-                        pipe,
-                        task_id = %self.task_id,
-                        rule = %rule_name,
-                        stage = 0,
-                        phase = "execute_close",
-                        scope_key = %debug_scope_key(&close.scope_key),
-                        error = %e,
-                        "rule output failed"
-                    )
                 }
             }
         }
@@ -1068,13 +1166,8 @@ impl RuleTask {
             machine.recalibrate_memory();
         }
         if let Some(metrics) = &self.metrics {
-            let instances = self
-                .machine
-                .as_ref()
-                .map(|machine| machine.instance_count())
-                .unwrap_or(0);
             metrics.observe_rule_scan_timeout(&rule_name, started.elapsed());
-            metrics.set_rule_instances(&rule_name, instances);
+            self.update_rule_instances_metric();
         }
         // Timeout closes may have staged intermediate rows — deliver them.
         self.flush_pipes().await;
@@ -1085,61 +1178,92 @@ impl RuleTask {
         let Some(_) = &self.machine else {
             return;
         };
-        self.cached_wall_nanos.store(wall_nanos(), Ordering::Relaxed);
+        self.cached_wall_nanos
+            .store(wall_nanos(), Ordering::Relaxed);
         let started = Instant::now();
         let lookup = RegistryLookup(&self.router);
-        let (rule_name, closes) = {
+        // P2c: on flush a conv-rule shard routes ALL remaining raw closes to the
+        // conv stage and publishes a drained barrier (i64::MAX via the batch).
+        let (rule_name, closes, routed) = {
             let machine = self.machine.as_mut().expect("checked above");
-            (
-                machine.rule_name().to_string(),
-                machine.close_all_with_conv(CloseReason::Flush, self.conv_plan.as_ref()),
-            )
+            let rule_name = machine.rule_name().to_string();
+            if self.conv_sink.is_some() {
+                let raw = machine.close_all(CloseReason::Flush);
+                let watermark = machine.watermark_nanos();
+                let qualifying: Vec<_> = raw.into_iter().filter(close_is_qualified).collect();
+                if let Some(sink) = self.conv_sink.as_ref() {
+                    // P3-D: log when the conv stage is gone (drained closes dropped).
+                    if sink
+                        .tx
+                        .send(ConvCloseBatch {
+                            closes: qualifying,
+                            watermark,
+                            drained: true,
+                            barrier_index: sink.barrier_index,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        log::debug!("conv sink channel closed — drained flush dropped");
+                    }
+                }
+                (rule_name, Vec::new(), true)
+            } else {
+                (
+                    rule_name,
+                    machine.close_all_with_conv(CloseReason::Flush, self.conv_plan.as_ref()),
+                    false,
+                )
+            }
         };
         let mut stats = RuleBatchDebugStats::default();
         let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
-        for close in &closes {
-            match self.executor.execute_close_with_joins(close, &lookup) {
-                Ok(Some(record)) => {
-                    if debug_enabled {
-                        stats.count_output(&record, &self.intermediate_targets);
+        // When routed to the conv stage, skip inline close processing.
+        if !routed {
+            for close in &closes {
+                match self.executor.execute_close_with_joins(close, &lookup) {
+                    Ok(Some(record)) => {
+                        if debug_enabled {
+                            stats.count_output(&record, &self.intermediate_targets);
+                        }
+                        if debug_enabled && stats.allow_detail() {
+                            log_output_emitted(
+                                "execute_close",
+                                "close",
+                                output_kind(&record, &self.intermediate_targets),
+                                &record,
+                                close.scope_key.as_slice(),
+                            );
+                        }
+                        self.emit(record).await;
                     }
-                    if debug_enabled && stats.allow_detail() {
-                        log_output_emitted(
-                            "execute_close",
-                            "close",
-                            output_kind(&record, &self.intermediate_targets),
-                            &record,
-                            close.scope_key.as_slice(),
-                        );
+                    Ok(None) => {
+                        if debug_enabled {
+                            stats.output_none += 1;
+                        }
+                        if debug_enabled && stats.allow_detail() {
+                            log_output_suppressed(
+                                &rule_name,
+                                "execute_close",
+                                Some(close.scope_key.as_slice()),
+                            );
+                        }
                     }
-                    self.emit(record).await;
-                }
-                Ok(None) => {
-                    if debug_enabled {
-                        stats.output_none += 1;
+                    Err(e) => {
+                        if debug_enabled {
+                            stats.errors += 1;
+                        }
+                        wf_warn!(
+                            pipe,
+                            task_id = %self.task_id,
+                            rule = %rule_name,
+                            stage = 0,
+                            phase = "execute_close",
+                            scope_key = %debug_scope_key(&close.scope_key),
+                            error = %e,
+                            "rule output failed"
+                        )
                     }
-                    if debug_enabled && stats.allow_detail() {
-                        log_output_suppressed(
-                            &rule_name,
-                            "execute_close",
-                            Some(close.scope_key.as_slice()),
-                        );
-                    }
-                }
-                Err(e) => {
-                    if debug_enabled {
-                        stats.errors += 1;
-                    }
-                    wf_warn!(
-                        pipe,
-                        task_id = %self.task_id,
-                        rule = %rule_name,
-                        stage = 0,
-                        phase = "execute_close",
-                        scope_key = %debug_scope_key(&close.scope_key),
-                        error = %e,
-                        "rule output failed"
-                    )
                 }
             }
         }
@@ -1173,13 +1297,8 @@ impl RuleTask {
             }
         }
         if let Some(metrics) = &self.metrics {
-            let instances = self
-                .machine
-                .as_ref()
-                .map(|machine| machine.instance_count())
-                .unwrap_or(0);
             metrics.observe_rule_flush(&rule_name, started.elapsed());
-            metrics.set_rule_instances(&rule_name, instances);
+            self.update_rule_instances_metric();
         }
         // Drain the batched alert delivery after close emissions.
         self.flush_alerts().await;
@@ -1231,7 +1350,9 @@ impl RuleTask {
         // (The metric covers the record→columns append, the successor of the
         // old to_data_record conversion.)
         let time_this = {
-            let rem = self.serialize_sample_remaining.fetch_sub(1, Ordering::Relaxed);
+            let rem = self
+                .serialize_sample_remaining
+                .fetch_sub(1, Ordering::Relaxed);
             if rem == 1 {
                 self.serialize_sample_remaining
                     .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
@@ -1252,9 +1373,10 @@ impl RuleTask {
             let builder = match slot {
                 Some((_, builder)) => builder,
                 None => {
-                    pending
-                        .by_target
-                        .push((std::sync::Arc::clone(&record.yield_target), AlertColumnBuilder::new(std::sync::Arc::clone(&record.yield_target))));
+                    pending.by_target.push((
+                        std::sync::Arc::clone(&record.yield_target),
+                        AlertColumnBuilder::new(std::sync::Arc::clone(&record.yield_target)),
+                    ));
                     let last = pending.by_target.len() - 1;
                     &mut pending.by_target[last].1
                 }
@@ -1306,7 +1428,9 @@ impl RuleTask {
         // Serialize timing is sampled 1-in-N and scaled back up (same
         // pattern as `emit`; covers the eval + column append).
         let time_this = {
-            let rem = self.serialize_sample_remaining.fetch_sub(1, Ordering::Relaxed);
+            let rem = self
+                .serialize_sample_remaining
+                .fetch_sub(1, Ordering::Relaxed);
             if rem == 1 {
                 self.serialize_sample_remaining
                     .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
@@ -1328,9 +1452,10 @@ impl RuleTask {
             let builder = match slot {
                 Some((_, builder)) => builder,
                 None => {
-                    pending
-                        .by_target
-                        .push((std::sync::Arc::clone(target), AlertColumnBuilder::new(std::sync::Arc::clone(target))));
+                    pending.by_target.push((
+                        std::sync::Arc::clone(target),
+                        AlertColumnBuilder::new(std::sync::Arc::clone(target)),
+                    ));
                     let last = pending.by_target.len() - 1;
                     &mut pending.by_target[last].1
                 }
@@ -1416,7 +1541,9 @@ impl RuleTask {
             let segment = &rows[start..end];
             let calls = segment.len();
             let time_this = {
-                let rem = self.serialize_sample_remaining.fetch_sub(1, Ordering::Relaxed);
+                let rem = self
+                    .serialize_sample_remaining
+                    .fetch_sub(1, Ordering::Relaxed);
                 if rem == 1 {
                     self.serialize_sample_remaining
                         .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
@@ -1590,8 +1717,7 @@ impl RuleTask {
                 let target = Arc::clone(&record.yield_target);
                 match resolve_pipe_shape(&self.pipe_registry, &self.router, &target) {
                     Some((schema, time_col_index)) => {
-                        let mut stager =
-                            PipeBatchStager::new(target, schema, time_col_index);
+                        let mut stager = PipeBatchStager::new(target, schema, time_col_index);
                         if let Err(e) = stager.push_record(&record) {
                             wf_warn!(
                                 pipe,
@@ -1761,7 +1887,10 @@ enum PipeCol {
     Timestamp(Vec<Option<i64>>),
     /// Column types outside the supported coercion matrix stage as null —
     /// same fallback arm as `value_to_single_row_array`.
-    Null { data_type: DataType, len: usize },
+    Null {
+        data_type: DataType,
+        len: usize,
+    },
 }
 
 /// Resolved shape of an intermediate pipe target: the relay schema and its
@@ -1773,9 +1902,7 @@ fn resolve_pipe_shape(
 ) -> Option<(arrow::datatypes::SchemaRef, Option<usize>)> {
     match pipe_registry.get(target) {
         // Pipe registered with a real schema (normal boot) → use it.
-        Some(pipe) if !pipe.schema.fields().is_empty() => {
-            Some((pipe.schema, pipe.time_col_index))
-        }
+        Some(pipe) if !pipe.schema.fields().is_empty() => Some((pipe.schema, pipe.time_col_index)),
         // Pipe absent or built without schemas (e.g. the reload path builds
         // the registry with no window schemas) → fall back to the window,
         // which is always populated with the correct schema + time column.
@@ -1854,12 +1981,8 @@ impl PipeBatchStager {
                 PipeCol::Utf8(v) => {
                     v.push(match value {
                         Some(wf_engine::match_engine::Value::Str(s)) => Some(s.to_string()),
-                        Some(wf_engine::match_engine::Value::Number(n)) => {
-                            Some(n.to_string())
-                        }
-                        Some(wf_engine::match_engine::Value::Bool(b)) => {
-                            Some(b.to_string())
-                        }
+                        Some(wf_engine::match_engine::Value::Number(n)) => Some(n.to_string()),
+                        Some(wf_engine::match_engine::Value::Bool(b)) => Some(b.to_string()),
                         Some(
                             value @ (wf_engine::match_engine::Value::Array(_)
                             | wf_engine::match_engine::Value::Object(_)),
@@ -1885,7 +2008,7 @@ impl PipeBatchStager {
 
     /// Build the staged rows into one batch and parse it to events,
     /// resetting the buffers. Returns `None` when nothing is staged.
-    fn take_events(&mut self) -> RuntimeResult<Option<(Arc<str>, Arc<Vec<Arc<Event>>>)>> {
+    fn take_events(&mut self) -> RuntimeResult<PendingEventBatch> {
         if self.rows == 0 {
             return Ok(None);
         }
@@ -1893,16 +2016,12 @@ impl PipeBatchStager {
             .cols
             .iter_mut()
             .map(|col| match col {
-                PipeCol::Int64(v) => {
-                    Ok(std::sync::Arc::new(arrow::array::Int64Array::from(std::mem::take(v)))
-                        as arrow::array::ArrayRef)
-                }
-                PipeCol::Float64(v) => {
-                    Ok(
-                        std::sync::Arc::new(arrow::array::Float64Array::from(std::mem::take(v)))
-                            as arrow::array::ArrayRef,
-                    )
-                }
+                PipeCol::Int64(v) => Ok(std::sync::Arc::new(arrow::array::Int64Array::from(
+                    std::mem::take(v),
+                )) as arrow::array::ArrayRef),
+                PipeCol::Float64(v) => Ok(std::sync::Arc::new(arrow::array::Float64Array::from(
+                    std::mem::take(v),
+                )) as arrow::array::ArrayRef),
                 PipeCol::Bool(v) => Ok(std::sync::Arc::new(arrow::array::BooleanArray::from(
                     std::mem::take(v),
                 )) as arrow::array::ArrayRef),
@@ -1911,8 +2030,7 @@ impl PipeBatchStager {
                 )) as arrow::array::ArrayRef),
                 PipeCol::Timestamp(v) => Ok(std::sync::Arc::new(
                     arrow::array::TimestampNanosecondArray::from(std::mem::take(v)),
-                )
-                    as arrow::array::ArrayRef),
+                ) as arrow::array::ArrayRef),
                 PipeCol::Null { data_type, len } => {
                     let array = new_null_array(data_type, *len);
                     *len = 0;
@@ -2097,7 +2215,7 @@ mod pipe_stager_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use wf_engine::alert::AlertOrigin;
-    use wf_engine::match_engine::{batch_to_events, Value};
+    use wf_engine::match_engine::Value;
 
     fn record_with(
         target: &str,
@@ -2156,7 +2274,10 @@ mod pipe_stager_tests {
                 "t",
                 1_000,
                 vec![
-                    ("event_time".into(), Value::Number(1_700_000_000_000_000_000.0)),
+                    (
+                        "event_time".into(),
+                        Value::Number(1_700_000_000_000_000_000.0),
+                    ),
                     ("n_i".into(), Value::Number(7.0)),
                     ("n_f".into(), Value::Number(1.5)),
                     ("flag".into(), Value::Bool(true)),
@@ -2207,7 +2328,10 @@ mod pipe_stager_tests {
         // Row 0 — every field present, happy path.
         let f = &staged[0].fields;
         assert_eq!(f.get(PIPE_EVENT_TIME_FIELD), Some(&Value::Number(1_000.0)));
-        assert_eq!(f.get("event_time"), Some(&Value::Number(1_700_000_000_000_000_000.0)));
+        assert_eq!(
+            f.get("event_time"),
+            Some(&Value::Number(1_700_000_000_000_000_000.0))
+        );
         assert_eq!(f.get("n_i"), Some(&Value::Number(7.0)));
         assert_eq!(f.get("n_f"), Some(&Value::Number(1.5)));
         assert_eq!(f.get("flag"), Some(&Value::Bool(true)));
@@ -2301,10 +2425,18 @@ mod pipe_stager_tests {
         );
 
         stager
-            .push_record(&record_with("t", 5, vec![("label".into(), Value::Str("a".into()))]))
+            .push_record(&record_with(
+                "t",
+                5,
+                vec![("label".into(), Value::Str("a".into()))],
+            ))
             .unwrap();
         stager
-            .push_record(&record_with("t", 6, vec![("label".into(), Value::Str("b".into()))]))
+            .push_record(&record_with(
+                "t",
+                6,
+                vec![("label".into(), Value::Str("b".into()))],
+            ))
             .unwrap();
         let first = stager.take_events().unwrap().expect("rows staged");
         assert_eq!(first.1.len(), 2);
@@ -2315,9 +2447,16 @@ mod pipe_stager_tests {
         );
 
         stager
-            .push_record(&record_with("t", 7, vec![("label".into(), Value::Str("c".into()))]))
+            .push_record(&record_with(
+                "t",
+                7,
+                vec![("label".into(), Value::Str("c".into()))],
+            ))
             .unwrap();
-        let second = stager.take_events().unwrap().expect("row staged after reset");
+        let second = stager
+            .take_events()
+            .unwrap()
+            .expect("row staged after reset");
         assert_eq!(second.1.len(), 1);
         assert_eq!(
             second.1[0].fields.get("label"),

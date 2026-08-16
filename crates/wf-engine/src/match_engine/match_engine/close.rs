@@ -91,10 +91,7 @@ fn evaluate_close_steps(
     let synthetic_event = Event {
         fields: {
             let mut m = EngineHashMap::default();
-            m.insert(
-                "close_reason".into(),
-                Value::Str(reason.as_str().into()),
-            );
+            m.insert("close_reason".into(), Value::Str(reason.as_str().into()));
             m
         },
     };
@@ -121,7 +118,11 @@ fn evaluate_close_steps(
                     event_last_time_nanos: step_state.branch_states[branch_idx]
                         .event_last_time_nanos,
                     collected_values,
-                    field_values: step_state.branch_states[branch_idx].field_values.as_deref().cloned().unwrap_or_default(),
+                    field_values: step_state.branch_states[branch_idx]
+                        .field_values
+                        .as_deref()
+                        .cloned()
+                        .unwrap_or_default(),
                 });
             }
             None => {

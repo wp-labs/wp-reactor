@@ -111,14 +111,26 @@ impl RuleExecutor {
         // Rules without joins never mutate the event — skip the per-event
         // `fields` HashMap clone (same optimization as the record path).
         if self.plan.joins.is_empty() {
-            self.build_each_direct(event, event_time_nanos, field_order, emit_time_nanos, builder)?;
+            self.build_each_direct(
+                event,
+                event_time_nanos,
+                field_order,
+                emit_time_nanos,
+                builder,
+            )?;
             return Ok(true);
         }
         let mut ctx = event.clone();
         if !execute_joins(&self.plan.joins, &mut ctx, windows, event_time_nanos) {
             return Ok(false);
         }
-        self.build_each_direct(&ctx, event_time_nanos, field_order, emit_time_nanos, builder)?;
+        self.build_each_direct(
+            &ctx,
+            event_time_nanos,
+            field_order,
+            emit_time_nanos,
+            builder,
+        )?;
         Ok(true)
     }
 
@@ -172,9 +184,12 @@ impl RuleExecutor {
         let filter = each_plan.filter.as_ref();
         let statics = self.output_static();
         let emit_time = self.cached_emit_time(emit_time_nanos);
-        let summary = Arc::clone(statics.each_summary.as_ref().expect(
-            "on-each rule missing precomputed summary",
-        ));
+        let summary = Arc::clone(
+            statics
+                .each_summary
+                .as_ref()
+                .expect("on-each rule missing precomputed summary"),
+        );
         let origin = AlertOrigin::Event;
 
         // -- Plan-constant specialization (evaluated once per batch) -------
@@ -297,13 +312,15 @@ impl RuleExecutor {
                         // expression never yields None here (the wrapper
                         // substitutes an empty string).
                         YieldKind::General => {
-                            eval_yield_expr_with_meta(&field.value, ctx, yield_meta).expect(
-                                "eval_yield_expr_with_meta never returns None",
-                            )
+                            eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
+                                .expect("eval_yield_expr_with_meta never returns None")
                         }
                     };
-                    let Some(value) =
-                        RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)?
+                    let Some(value) = RuleExecutor::coerce_yield_field_value_with(
+                        name,
+                        field_type.as_ref(),
+                        value,
+                    )?
                     else {
                         // Optional input field was missing → omit it from
                         // the output row (wp-labs/warp-fusion#62).
@@ -352,9 +369,12 @@ impl RuleExecutor {
         let emit_time = self.cached_emit_time(emit_time_nanos);
         let wfx_id =
             build_each_wfx_id(&self.plan.name, event_time_nanos, ctx, &origin, field_order);
-        let summary = Arc::clone(statics.each_summary.as_ref().expect(
-            "on-each rule missing precomputed summary",
-        ));
+        let summary = Arc::clone(
+            statics
+                .each_summary
+                .as_ref()
+                .expect("on-each rule missing precomputed summary"),
+        );
         let yield_meta = self.each_yield_meta(
             &wfx_id,
             &fired_at,
@@ -377,13 +397,13 @@ impl RuleExecutor {
                 .iter()
                 .zip(statics.yield_specs.iter())
             {
-                let Some(value) = eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
-                else {
-                    return Err(orion_error::StructError::from(CoreReason::RuleExec)
-                        .with_detail(format!(
+                let Some(value) = eval_yield_expr_with_meta(&field.value, ctx, yield_meta) else {
+                    return Err(
+                        orion_error::StructError::from(CoreReason::RuleExec).with_detail(format!(
                             "on each yield field {:?} expression evaluated to None",
                             field.name
-                        )));
+                        )),
+                    );
                 };
                 let Some(value) =
                     RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)?
@@ -428,9 +448,12 @@ impl RuleExecutor {
             build_each_wfx_id(&self.plan.name, event_time_nanos, ctx, &origin, field_order);
         // Summary is a plan constant on this path (empty scope + empty steps)
         // — precomputed in `OutputStatic`, no per-event formatting.
-        let summary = Arc::clone(statics.each_summary.as_ref().expect(
-            "on-each rule missing precomputed summary",
-        ));
+        let summary = Arc::clone(
+            statics
+                .each_summary
+                .as_ref()
+                .expect("on-each rule missing precomputed summary"),
+        );
         let yield_meta = self.each_yield_meta(
             &wfx_id,
             &fired_at,
@@ -459,8 +482,11 @@ impl RuleExecutor {
                                 field.name
                             )));
                     };
-                    let Some(value) =
-                        RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)?
+                    let Some(value) = RuleExecutor::coerce_yield_field_value_with(
+                        name,
+                        field_type.as_ref(),
+                        value,
+                    )?
                     else {
                         // Optional input field was missing → omit it from the
                         // output record (wp-labs/warp-fusion#62).

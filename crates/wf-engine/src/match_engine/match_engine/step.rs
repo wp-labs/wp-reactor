@@ -205,7 +205,10 @@ pub(super) fn collect_event_fields(
 
 fn push_event_field(event: &Event, bs: &mut BranchState, field_name: &str) {
     if let Some(value) = event.fields.get(field_name) {
-        let values = bs.field_values_mut().entry(field_name.to_string()).or_default();
+        let values = bs
+            .field_values_mut()
+            .entry(field_name.to_string())
+            .or_default();
         push_capped(values, value.clone());
     }
 }
@@ -269,10 +272,7 @@ pub(super) fn collect_alias_event(
 /// lookup (`entry(field_name.clone())`) — the dominant per-event allocation on
 /// count-only rules, which re-collect the same fields every event. Now the
 /// common path (key already present) is a lookup + `get_mut`, no allocation.
-fn field_values_for<'a>(
-    alias_state: &'a mut AliasState,
-    field_name: &str,
-) -> &'a mut Vec<Value> {
+fn field_values_for<'a>(alias_state: &'a mut AliasState, field_name: &str) -> &'a mut Vec<Value> {
     let fvm = alias_state.field_values_mut();
     if !fvm.contains_key(field_name) {
         fvm.insert(field_name.to_string(), Vec::new());
@@ -311,7 +311,11 @@ pub(super) fn apply_transforms(
                 Some(v) => ValueKey::from_value(v),
                 None => return false,
             };
-            if !bs.distinct_set.get_or_insert_with(|| Box::new(HashSet::new())).insert(key) {
+            if !bs
+                .distinct_set
+                .get_or_insert_with(|| Box::new(HashSet::new()))
+                .insert(key)
+            {
                 return false; // duplicate
             }
         }
@@ -426,18 +430,20 @@ pub(super) fn check_threshold(agg: &AggPlan, bs: &BranchState) -> bool {
     // or when threshold expression is non-constant.
     match agg.measure {
         Measure::Min => {
-            if let (Some(val), Some(threshold_val)) =
-                (bs.min_val.as_deref(), try_eval_expr_to_value(&agg.threshold))
-            {
+            if let (Some(val), Some(threshold_val)) = (
+                bs.min_val.as_deref(),
+                try_eval_expr_to_value(&agg.threshold),
+            ) {
                 compare_value_threshold(agg.cmp, val, &threshold_val)
             } else {
                 false
             }
         }
         Measure::Max => {
-            if let (Some(val), Some(threshold_val)) =
-                (bs.max_val.as_deref(), try_eval_expr_to_value(&agg.threshold))
-            {
+            if let (Some(val), Some(threshold_val)) = (
+                bs.max_val.as_deref(),
+                try_eval_expr_to_value(&agg.threshold),
+            ) {
                 compare_value_threshold(agg.cmp, val, &threshold_val)
             } else {
                 false
@@ -548,7 +554,11 @@ mod tests {
             collect_alias_event(&event_with("dip", i), &mut state, None);
         }
 
-        let values = state.field_values.as_deref().and_then(|m| m.get("dip")).expect("dip collected");
+        let values = state
+            .field_values
+            .as_deref()
+            .and_then(|m| m.get("dip"))
+            .expect("dip collected");
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         // The retained window is the most recent entries; `.last()` is the latest event,
         // which is what yield field resolution (`e.dip`) reads.
@@ -594,7 +604,11 @@ mod tests {
             );
         }
 
-        let values = bs.field_values.as_deref().and_then(|m| m.get("dport")).expect("dport collected");
+        let values = bs
+            .field_values
+            .as_deref()
+            .and_then(|m| m.get("dport"))
+            .expect("dport collected");
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         // `.last()` — the value yield field resolution reads — stays correct.
         assert_eq!(values.last(), Some(&Value::Number((over - 1) as f64)));
@@ -612,8 +626,18 @@ mod tests {
         collect_alias_event(&event, &mut state, Some(&tracked));
 
         assert_eq!(state.count, 1);
-        assert!(state.field_values.as_deref().map_or(false, |m| m.contains_key("sip")));
-        assert!(!state.field_values.as_deref().map_or(false, |m| m.contains_key("dport")));
+        assert!(
+            state
+                .field_values
+                .as_deref()
+                .is_some_and(|m| m.contains_key("sip"))
+        );
+        assert!(
+            !state
+                .field_values
+                .as_deref()
+                .is_some_and(|m| m.contains_key("dport"))
+        );
     }
 
     #[test]
@@ -635,9 +659,21 @@ mod tests {
             Some(&branch_field),
         );
 
-        assert!(bs.field_values.as_deref().map_or(false, |m| m.contains_key("sip")));
-        assert!(bs.field_values.as_deref().map_or(false, |m| m.contains_key("dport")));
-        assert!(!bs.field_values.as_deref().map_or(false, |m| m.contains_key("bytes")));
+        assert!(
+            bs.field_values
+                .as_deref()
+                .is_some_and(|m| m.contains_key("sip"))
+        );
+        assert!(
+            bs.field_values
+                .as_deref()
+                .is_some_and(|m| m.contains_key("dport"))
+        );
+        assert!(
+            !bs.field_values
+                .as_deref()
+                .is_some_and(|m| m.contains_key("bytes"))
+        );
     }
 
     #[test]
@@ -658,8 +694,16 @@ mod tests {
             None,
         );
 
-        assert!(bs.field_values.as_deref().map_or(false, |m| m.contains_key("sip")));
-        assert!(bs.field_values.as_deref().map_or(false, |m| m.contains_key("dport")));
+        assert!(
+            bs.field_values
+                .as_deref()
+                .is_some_and(|m| m.contains_key("sip"))
+        );
+        assert!(
+            bs.field_values
+                .as_deref()
+                .is_some_and(|m| m.contains_key("dport"))
+        );
     }
 
     #[test]
@@ -670,7 +714,10 @@ mod tests {
             update_measure(&Measure::Count, &Some(Value::Number(i as f64)), &mut bs);
         }
 
-        assert_eq!(bs.collected_values.as_deref().map(|v| v.len()).unwrap_or(0), MAX_TRACKED_FIELD_VALUES);
+        assert_eq!(
+            bs.collected_values.as_deref().map(|v| v.len()).unwrap_or(0),
+            MAX_TRACKED_FIELD_VALUES
+        );
         assert_eq!(
             bs.collected_values.as_deref().and_then(|v| v.last()),
             Some(&Value::Number((over - 1) as f64))

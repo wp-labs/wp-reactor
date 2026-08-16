@@ -2,12 +2,30 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
-## [0.4.0 Unreleased]
+## [1.0.0] — 2026-08-17
 
 ### Added
 
 - **wf-lang / wf-engine**: Added multi-level nested field extraction from `object` / `array` fields in yield expressions (`s.roles_obj.source.process.uid`, `s.roles_obj.related[0].process.name`). A `FieldRef::Path` validates the root field statically and walks nested members / integer indices at runtime; any missing member, out-of-bounds index, or intermediate type mismatch yields an omitted yield field (chars targets degrade to the empty string) without failing the record. Nested paths work inside structured `object { }` / `array [ ]` yield members in match/close rules too (their root fields are tracked into the eval context). Match keys and join conditions stay single-level — nested paths there are rejected by the checker, and `count` / `sum` / `avg` / `min` / `max` / `first` / `last` / `collect_*` reject nested paths as arguments (no column to aggregate); `window.has(nested.path)` infers the lookup column from the leaf member. (wp-labs/warp-fusion#64)
 - **wf-lang / wf-engine**: Added `on event<accu>` — within-window accumulation. After the block fires, count and evidence keep accumulating without reset, and each subsequent qualifying event re-fires with the running cumulative values (`count 2, 3, 4, 5 …` with full evidence), until the window expires. Orthogonal to `seq` / `any`; scoped to a single `on event` step with no close block (the checker rejects `accu` with `on close` / `and close`, `on event seq` chain syntax, or multiple steps). A `max_throttle`-suppressed re-fire drops the alert but keeps the running accumulation (it does not reset the count). `wfl explain` renders the block as `on event<accu>`. (wp-labs/warp-fusion#65)
+- **wf-engine**: Added cross-shard rate-limit / budget atomics (`SharedLimits`) for rule sharding (rule-sharding design P2b): a sharded rule's `max_throttle`, `max_instances`, and `max_memory_bytes` are enforced **collectively** across all shards via shared `Arc<Atomic…>` state — a shared sliding-window throttle (collective emits ≤ `count` per window), an exact CAS instance reservation, and a rule-wide fail-rule latch — instead of per-shard limits that multiplied the budget by the shard count. `CepStateMachine::with_limits_shared` builds a shard sharing one `SharedLimits`; `with_limits` / `new` are unchanged so `shards=1` keeps the exact per-machine path. `rule_instances` is now a delta-summed gauge across shards.
+- **wf-lang**: Fixed-window `conv` rules now compile a `RulePlan.conv_window` (`ConvWindowPlan` — fixed bucket length `over` + scope keys), marking them shardable; sliding/session conv stays inline and non-shardable. (rule-sharding P2c)
+- **wf-engine / wf-runtime**: Sharded `conv` rules aggregate raw close outputs **across shards** in a new `ConvStageTask` (transform operator): each shard routes raw qualifying closes (one aggregated batch per processed batch, max event-time watermark barrier) to the stage; the stage buckets by the fixed window `over`, seals a bucket only once every shard's watermark passes its end (a slow shard never loses closes), applies `apply_conv` over the merged batch (global top-N / sort), applies the shared rate limit, and emits to the sink. EOS / drained flush is the correct exit for complete data; cancel drops unsealed (partial) buckets instead of emitting wrong top(N)/sort results; a stalled barrier (30s without advance) drops stuck buckets with a warning to bound memory after a panicked shard. `close_is_qualified` / `apply_conv` are exported for the stage. (rule-sharding P2c)
+
+### Fixed
+
+- **wf-engine**: `max_instances` under sharding is now exact — admission uses a CAS reservation (`try_reserve_instance`) instead of a read-then-act check that could overshoot by up to `shard_count-1`; `DropOldest` evicts the local oldest and re-reserves, rejecting new keys when the shared budget is held by other shards. `max_memory_bytes` stays approximate under sharding (documented: memory grows non-atomically).
+- **wf-runtime**: The conv stage now honors `on_exceed` when the shared throttle is exceeded — `FailRule` latches the shared rule (previously it silently degraded to Throttle), and a failed rule stops emitting.
+- **wf-runtime**: The `rule_instances` gauge now sums across a rule's shards via delta reports (previously last-writer-wins) and reconciles to zero on drain.
+
+### Performance
+
+- **wf-runtime**: Conv-sink shards send one aggregated `ConvCloseBatch` per processed batch (max event-time watermark) instead of one per event — removing a per-event bounded(32) channel send + `.await` from the hot path.
+
+### Chore
+
+- **Tests**: Added SharedLimits unit + cross-shard integration coverage (collective `max_instances` / throttle / FailRule latch, exact DropOldest paths), conv-stage regression tests (FailRule, per-batch send, cancel-drops-unsealed, barrier watermark), and rule_instances delta-gauge coverage.
+- **Clippy**: Workspace now passes `cargo clippy --all-targets --all-features -- -D warnings` (cleared pre-existing toolchain-version lints; intentional `Box`ed instance-state collections are `#[allow]`ed).
 
 ## [0.3.0] — 2026-08-05
 

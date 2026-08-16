@@ -52,11 +52,10 @@ fn empty_tracked_bind_fields() -> std::collections::HashMap<String, HashSet<Stri
     std::collections::HashMap::new()
 }
 
-/// A test sink fanout that resolves the `"alerts"` and `"network_alerts"` yield
-/// targets (the sink targets used across the tests) to `tx`.
-
 /// Extract the first record from the next alert batch (tests deliver batches).
-fn take_alert(rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>) -> Arc<wp_model_core::model::DataRecord> {
+fn take_alert(
+    rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>,
+) -> Arc<wp_model_core::model::DataRecord> {
     let batch = rx.try_recv().expect("expected an alert batch");
     first_record(&batch)
 }
@@ -209,11 +208,7 @@ fn test_window_config(max_bytes: usize) -> WindowConfig {
     }
 }
 
-fn make_window(
-    name: &str,
-    schema: &SchemaRef,
-    max_bytes: usize,
-) -> (Arc<Window>, Arc<Notify>) {
+fn make_window(name: &str, schema: &SchemaRef, max_bytes: usize) -> (Arc<Window>, Arc<Notify>) {
     let win = Window::new(
         WindowParams {
             name: name.into(),
@@ -366,10 +361,11 @@ fn make_task_with_window_bytes(
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: true,
+        needs_field_history: true,
     };
 
     let rule_plan = RulePlan {
+        conv_window: None,
         name: "test_rule".into(),
         binds: vec![BindPlan {
             alias: "fail".into(),
@@ -407,6 +403,7 @@ fn make_task_with_window_bytes(
 
     let config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -423,7 +420,7 @@ fn make_task_with_window_bytes(
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -454,10 +451,19 @@ fn make_pipeline_stage_task_opts(
     let internal = internal_schema();
     let source_name = "auth_events";
     let target_name = "__wf_pipe_pipe_s1_w1";
-    let mut window_defs =
-        vec![make_window_def(source_name, &src_schema, &["syslog"], Some(1))];
+    let mut window_defs = vec![make_window_def(
+        source_name,
+        &src_schema,
+        &["syslog"],
+        Some(1),
+    )];
     if include_target_window {
-        window_defs.push(make_window_def(target_name, &internal, &[target_name], Some(0)));
+        window_defs.push(make_window_def(
+            target_name,
+            &internal,
+            &[target_name],
+            Some(0),
+        ));
     }
     let registry = WindowRegistry::build(window_defs).unwrap();
     let router = Arc::new(Router::new(registry));
@@ -491,9 +497,10 @@ fn make_pipeline_stage_task_opts(
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: true,
+        needs_field_history: true,
     };
     let rule_plan = RulePlan {
+        conv_window: None,
         name: "__wf_pipe_pipe_s1".into(),
         binds: vec![BindPlan {
             alias: "fail".into(),
@@ -538,6 +545,7 @@ fn make_pipeline_stage_task_opts(
     let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -554,7 +562,7 @@ fn make_pipeline_stage_task_opts(
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -571,6 +579,7 @@ fn make_each_task() -> (
     let schema = test_schema();
     let (win_arc, notify_arc) = make_window("auth_events", &schema, usize::MAX);
     let rule_plan = RulePlan {
+        conv_window: None,
         name: "each_rule".into(),
         binds: vec![BindPlan {
             alias: "e".into(),
@@ -627,6 +636,7 @@ fn make_each_task() -> (
     let router = Arc::new(Router::new(registry));
     let config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: None,
         each_alias: Some("e".into()),
         each_time_field: Some("event_time".into()),
@@ -643,7 +653,7 @@ fn make_each_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -686,10 +696,11 @@ fn make_filtered_match_task() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: true,
+        needs_field_history: true,
     };
 
     let rule_plan = RulePlan {
+        conv_window: None,
         name: "filtered_match".into(),
         binds: vec![BindPlan {
             alias: "fail".into(),
@@ -731,6 +742,7 @@ fn make_filtered_match_task() -> (
     let router = Arc::new(Router::new(registry));
     let config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -747,7 +759,7 @@ fn make_filtered_match_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -803,10 +815,11 @@ fn make_filtered_close_task() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: true,
+        needs_field_history: true,
     };
 
     let rule_plan = RulePlan {
+        conv_window: None,
         name: "filtered_close".into(),
         binds: vec![BindPlan {
             alias: "fail".into(),
@@ -848,6 +861,7 @@ fn make_filtered_close_task() -> (
     let router = Arc::new(Router::new(registry));
     let config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -864,7 +878,7 @@ fn make_filtered_close_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -881,6 +895,7 @@ fn make_filtered_each_task() -> (
     let schema = filtered_schema();
     let (win_arc, notify_arc) = make_window("auth_events", &schema, usize::MAX);
     let rule_plan = RulePlan {
+        conv_window: None,
         name: "filtered_each".into(),
         binds: vec![BindPlan {
             alias: "e".into(),
@@ -934,6 +949,7 @@ fn make_filtered_each_task() -> (
     let router = Arc::new(Router::new(registry));
     let config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: None,
         each_alias: Some("e".into()),
         each_time_field: Some("event_time".into()),
@@ -950,7 +966,7 @@ fn make_filtered_each_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -978,6 +994,7 @@ fn make_intermediate_each_task() -> (
     let source_notify = router.registry().get_notifier(source_name).unwrap();
 
     let rule_plan = RulePlan {
+        conv_window: None,
         name: "intermediate_each".into(),
         binds: vec![BindPlan {
             alias: "e".into(),
@@ -1052,6 +1069,7 @@ fn make_intermediate_each_task() -> (
     let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: None,
         each_alias: Some("e".into()),
         each_time_field: Some("event_time".into()),
@@ -1068,7 +1086,7 @@ fn make_intermediate_each_task() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1096,6 +1114,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
     let source_notify = router.registry().get_notifier(source_name).unwrap();
 
     let rule_plan = RulePlan {
+        conv_window: None,
         name: "intermediate_each_explicit_time".into(),
         binds: vec![BindPlan {
             alias: "e".into(),
@@ -1152,6 +1171,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
     let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: None,
         each_alias: Some("e".into()),
         each_time_field: Some("event_time".into()),
@@ -1168,7 +1188,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1199,6 +1219,7 @@ fn make_intermediate_score_tasks() -> (
     let intermediate_notify = router.registry().get_notifier(target_name).unwrap();
 
     let upstream_plan = RulePlan {
+        conv_window: None,
         name: "semantic_project".into(),
         binds: vec![BindPlan {
             alias: "e".into(),
@@ -1256,9 +1277,11 @@ fn make_intermediate_score_tasks() -> (
     };
 
     let upstream_executor = RuleExecutor::new(upstream_plan);
-    let (upstream_alert_tx, _upstream_alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let (upstream_alert_tx, _upstream_alert_rx) =
+        mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let upstream_config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: None,
         each_alias: Some("e".into()),
         each_time_field: Some("event_time".into()),
@@ -1275,7 +1298,7 @@ fn make_intermediate_score_tasks() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1320,10 +1343,11 @@ fn make_intermediate_score_tasks() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: true,
+        needs_field_history: true,
     };
 
     let downstream_plan = RulePlan {
+        conv_window: None,
         name: "window_risk".into(),
         binds: vec![BindPlan {
             alias: "x".into(),
@@ -1397,6 +1421,7 @@ fn make_intermediate_score_tasks() -> (
     );
     let downstream_config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: Some(downstream_machine),
         each_alias: None,
         each_time_field: None,
@@ -1413,7 +1438,7 @@ fn make_intermediate_score_tasks() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::new(),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1445,6 +1470,7 @@ fn make_intermediate_score_band_tasks() -> (
     let intermediate_notify = router.registry().get_notifier(target_name).unwrap();
 
     let upstream_plan = RulePlan {
+        conv_window: None,
         name: "semantic_project".into(),
         binds: vec![BindPlan {
             alias: "e".into(),
@@ -1502,9 +1528,11 @@ fn make_intermediate_score_band_tasks() -> (
     };
 
     let upstream_executor = RuleExecutor::new(upstream_plan);
-    let (upstream_alert_tx, _upstream_alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let (upstream_alert_tx, _upstream_alert_rx) =
+        mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let upstream_config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: None,
         each_alias: Some("e".into()),
         each_time_field: Some("event_time".into()),
@@ -1521,7 +1549,7 @@ fn make_intermediate_score_band_tasks() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::from([target_name.into()]),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1566,10 +1594,11 @@ fn make_intermediate_score_band_tasks() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: true,
+        needs_field_history: true,
     };
 
     let downstream_plan = RulePlan {
+        conv_window: None,
         name: "window_risk".into(),
         binds: vec![
             BindPlan {
@@ -1696,6 +1725,7 @@ fn make_intermediate_score_band_tasks() -> (
     );
     let downstream_config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: Some(downstream_machine),
         each_alias: None,
         each_time_field: None,
@@ -1712,7 +1742,7 @@ fn make_intermediate_score_band_tasks() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::new(),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1766,10 +1796,11 @@ fn make_filtered_bind_alias_match_task() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: true,
+        needs_field_history: true,
     };
 
     let rule_plan = RulePlan {
+        conv_window: None,
         name: "bind_alias_match".into(),
         binds: vec![
             BindPlan {
@@ -1868,6 +1899,7 @@ fn make_filtered_bind_alias_match_task() -> (
     let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -1884,7 +1916,7 @@ fn make_filtered_bind_alias_match_task() -> (
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -1936,10 +1968,11 @@ fn make_window_has_match_task() -> (
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: true,
+        needs_field_history: true,
     };
 
     let rule_plan = RulePlan {
+        conv_window: None,
         name: "window_has_match".into(),
         binds: vec![BindPlan {
             alias: "fail".into(),
@@ -1979,6 +2012,7 @@ fn make_window_has_match_task() -> (
     let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -1995,7 +2029,7 @@ fn make_window_has_match_task() -> (
         router: Arc::clone(&router),
         metrics: None,
         intermediate_targets: HashSet::new(),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -2071,7 +2105,12 @@ async fn push_triggers_alert() {
     // push channel, and advance the state machine through the push path.
     let push = RulePush {
         window_name: "auth_events".into(),
-        events: Arc::new(batch_to_events(&batch).into_iter().map(Arc::new).collect::<Vec<_>>()),
+        events: Arc::new(
+            batch_to_events(&batch)
+                .into_iter()
+                .map(Arc::new)
+                .collect::<Vec<_>>(),
+        ),
         seq: u64::MAX,
     };
     task.process_push(push).await;
@@ -2084,9 +2123,7 @@ async fn push_triggers_alert() {
     assert!(!field_str(&alert, "__wfu_fired_at").is_empty());
 }
 
-fn drain_alert_entity_ids(
-    rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>,
-) -> Vec<String> {
+fn drain_alert_entity_ids(rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>) -> Vec<String> {
     let mut ids = Vec::new();
     while let Ok(batch) = rx.try_recv() {
         let records: Vec<wp_model_core::model::DataRecord> = match &batch {
@@ -2118,7 +2155,12 @@ async fn sharded_rule_produces_same_alerts_as_single_worker() {
         ],
         ts,
     );
-    let events = Arc::new(batch_to_events(&batch).into_iter().map(Arc::new).collect::<Vec<_>>());
+    let events = Arc::new(
+        batch_to_events(&batch)
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>(),
+    );
 
     // Single worker: feed the whole batch.
     let (mut single, mut single_rx, _w, _n) = make_task();
@@ -2136,8 +2178,7 @@ async fn sharded_rule_produces_same_alerts_as_single_worker() {
     let router = Arc::new(Router::new(registry));
     let (s0_tx, mut s0_rx) = mpsc::channel(8);
     let (s1_tx, mut s1_rx) = mpsc::channel(8);
-    let keys: Arc<[FieldRef]> =
-        Arc::from(vec![FieldRef::Simple("sip".into())].into_boxed_slice());
+    let keys: Arc<[FieldRef]> = Arc::from(vec![FieldRef::Simple("sip".into())].into_boxed_slice());
     router
         .fanout()
         .register_sharded("auth_events", vec![s0_tx, s1_tx], keys);
@@ -2331,7 +2372,9 @@ async fn pipeline_stage_output_writes_internal_window_instead_of_alert_channel()
             .is_empty(),
         "pure relay: internal pipe must not be stored in a window"
     );
-    let push = down_rx.try_recv().expect("downstream rule received pipeline events");
+    let push = down_rx
+        .try_recv()
+        .expect("downstream rule received pipeline events");
     let rows = push.events;
     assert_eq!(rows.len(), 1);
     assert_eq!(
@@ -2377,7 +2420,9 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
             .is_empty(),
         "pure relay: intermediate pipe must not be stored in a window"
     );
-    let push = down_rx.try_recv().expect("downstream rule received intermediate events");
+    let push = down_rx
+        .try_recv()
+        .expect("downstream rule received intermediate events");
     let rows = push.events;
     assert_eq!(rows.len(), 1);
     assert_eq!(
@@ -2439,11 +2484,15 @@ async fn intermediate_target_preserves_explicit_time_field() {
             .is_empty(),
         "pure relay: intermediate pipe must not be stored in a window"
     );
-    let push = down_rx.try_recv().expect("downstream rule received intermediate events");
+    let push = down_rx
+        .try_recv()
+        .expect("downstream rule received intermediate events");
     let event = &push.events[0];
     assert_eq!(
         event.fields.get("event_time"),
-        Some(&wf_engine::match_engine::Value::Number(10_000_000_000_000_000.0))
+        Some(&wf_engine::match_engine::Value::Number(
+            10_000_000_000_000_000.0
+        ))
     );
 }
 
@@ -2473,18 +2522,9 @@ async fn downstream_close_aggregates_intermediate_float_fields() {
     let alert = take_alert_recv(&mut alert_rx).await;
     assert!((field_f64(&alert, "__wfu_score") - 20.0).abs() < f64::EPSILON);
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.8");
-    assert_eq!(
-        field_f64(&alert, "avg_score"),
-        20.0
-    );
-    assert_eq!(
-        field_f64(&alert, "avg_risk"),
-        20.0
-    );
-    assert_eq!(
-        field_f64(&alert, "event_count"),
-        2.0
-    );
+    assert_eq!(field_f64(&alert, "avg_score"), 20.0);
+    assert_eq!(field_f64(&alert, "avg_risk"), 20.0);
+    assert_eq!(field_f64(&alert, "event_count"), 2.0);
 }
 
 #[tokio::test]
@@ -2512,26 +2552,11 @@ async fn downstream_close_counts_filtered_bind_aliases() {
 
     let alert = take_alert_recv(&mut alert_rx).await;
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.9");
-    assert_eq!(
-        field_f64(&alert, "event_count"),
-        2.0
-    );
-    assert_eq!(
-        field_f64(&alert, "source_avg"),
-        80.0
-    );
-    assert_eq!(
-        field_f64(&alert, "high_event_count"),
-        1.0
-    );
-    assert_eq!(
-        field_f64(&alert, "elevated_event_count"),
-        2.0
-    );
-    assert_eq!(
-        field_str(&alert, "status"),
-        "high"
-    );
+    assert_eq!(field_f64(&alert, "event_count"), 2.0);
+    assert_eq!(field_f64(&alert, "source_avg"), 80.0);
+    assert_eq!(field_f64(&alert, "high_event_count"), 1.0);
+    assert_eq!(field_f64(&alert, "elevated_event_count"), 2.0);
+    assert_eq!(field_str(&alert, "status"), "high");
 }
 
 #[tokio::test]
@@ -2548,18 +2573,9 @@ async fn match_event_path_counts_filtered_bind_aliases() {
     let alert = take_alert(&mut alert_rx);
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.7");
     assert_eq!(field_f64(&alert, "__wfu_score"), 1.0);
-    assert_eq!(
-        field_f64(&alert, "high_event_count"),
-        1.0
-    );
-    assert_eq!(
-        field_f64(&alert, "elevated_avg"),
-        80.0
-    );
-    assert_eq!(
-        field_str(&alert, "last_high_sip"),
-        "10.0.0.7"
-    );
+    assert_eq!(field_f64(&alert, "high_event_count"), 1.0);
+    assert_eq!(field_f64(&alert, "elevated_avg"), 80.0);
+    assert_eq!(field_str(&alert, "last_high_sip"), "10.0.0.7");
 }
 
 #[tokio::test]
@@ -2578,10 +2594,7 @@ async fn on_each_emits_one_alert_per_matching_row() {
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
     assert_eq!(field_str(&alert, "__wfu_origin"), "event");
     assert!(!field_str(&alert, "__wfu_fired_at").is_empty());
-    assert_eq!(
-        field_str(&alert, "x"),
-        "10.0.0.1"
-    );
+    assert_eq!(field_str(&alert, "x"), "10.0.0.1");
     assert!(
         alert_rx.try_recv().is_err(),
         "non-matching rows must not emit alerts"
@@ -2774,10 +2787,11 @@ async fn port_scan_rule_triggers_close_alert() {
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: true,
+        needs_field_history: true,
     };
 
     let rule_plan = RulePlan {
+        conv_window: None,
         name: "port_scan".into(),
         binds: vec![BindPlan {
             alias: "c".into(),
@@ -2823,6 +2837,7 @@ async fn port_scan_rule_triggers_close_alert() {
 
     let config = task_types::RuleTaskConfig {
         progress: std::collections::HashMap::new(),
+        conv_sink: None,
         machine: Some(machine),
         each_alias: None,
         each_time_field: None,
@@ -2839,7 +2854,7 @@ async fn port_scan_rule_triggers_close_alert() {
         router,
         metrics: None,
         intermediate_targets: HashSet::new(),
-                    pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
     };
@@ -2915,7 +2930,10 @@ async fn pure_relay_broadcasts_to_sharded_downstream() {
         "same-key events must land together on the same shard (one batched push), got {} pushes",
         full.len()
     );
-    assert!(empty.is_empty(), "the other shard must stay empty for the same key");
+    assert!(
+        empty.is_empty(),
+        "the other shard must stay empty for the same key"
+    );
     // Pure relay carries the no-window sentinel seq (there is no window
     // batch behind these events; consumers saturating-ack it).
     assert_eq!(full[0].seq, u64::MAX, "relay pushes carry seq = u64::MAX");
@@ -2941,7 +2959,11 @@ async fn pure_relay_broadcasts_to_sharded_downstream() {
         1,
         "second input batch relays as exactly one more push"
     );
-    let (second, _) = if !a2.is_empty() { (&a2[0], ()) } else { (&b2[0], ()) };
+    let (second, _) = if !a2.is_empty() {
+        (&a2[0], ())
+    } else {
+        (&b2[0], ())
+    };
     assert_eq!(
         second.events[0].fields.get("sip"),
         Some(&wf_engine::match_engine::Value::Str("10.0.0.8".into()))
@@ -3025,8 +3047,7 @@ async fn pipe_flush_backpressures_until_downstream_drains() {
         .append(make_batch(&schema, &["10.0.0.9"], ts + 1_000_000))
         .unwrap();
     let mut pending = std::pin::pin!(task.pull_and_advance());
-    let blocked =
-        tokio::time::timeout(std::time::Duration::from_millis(150), &mut pending).await;
+    let blocked = tokio::time::timeout(std::time::Duration::from_millis(150), &mut pending).await;
     assert!(
         blocked.is_err(),
         "pipe flush must block while the subscriber channel is full"
@@ -3037,10 +3058,560 @@ async fn pipe_flush_backpressures_until_downstream_drains() {
     let first = down_rx.recv().await.expect("first push");
     assert_eq!(first.events.len(), 2);
     pending.await;
-    let second = down_rx.recv().await.expect("second push after backpressure");
+    let second = down_rx
+        .recv()
+        .await
+        .expect("second push after backpressure");
     assert_eq!(second.events.len(), 1);
     assert_eq!(
         second.events[0].fields.get("sip"),
         Some(&wf_engine::match_engine::Value::Str("10.0.0.9".into()))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2c regression: conv-sink barrier watermark
+// ---------------------------------------------------------------------------
+
+/// Build a RuleTask for a raw-conv-mode shard whose closes (and barrier
+/// watermarks) land in the returned conv channel.
+fn make_conv_sink_task() -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<crate::engine_task::ConvCloseBatch>,
+) {
+    let schema = test_schema();
+    let (win_arc, notify_arc) = make_window("auth_events", &schema, usize::MAX);
+    let match_plan = MatchPlan {
+        keys: vec![FieldRef::Simple("sip".into())],
+        key_map: None,
+        window_spec: WindowSpec::Fixed(Duration::from_secs(60)),
+        event_steps: vec![StepPlan {
+            branches: vec![BranchPlan {
+                label: Some("fail".into()),
+                source: "fail".into(),
+                field: None,
+                guard: None,
+                agg: AggPlan {
+                    transforms: vec![],
+                    measure: Measure::Count,
+                    cmp: CmpOp::Ge,
+                    threshold: Expr::Number(1.0),
+                },
+            }],
+        }],
+        close_steps: vec![],
+        close_mode: CloseMode::Or,
+        tracked_bind_aliases: HashSet::new(),
+        tracked_bind_fields: std::collections::HashMap::new(),
+        tracked_plain_fields: HashSet::new(),
+        seq: None,
+        match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
+        needs_field_history: false,
+    };
+    let rule_plan = RulePlan {
+        conv_window: None,
+        name: "conv_sink_rule".into(),
+        binds: vec![BindPlan {
+            alias: "fail".into(),
+            window: "auth_events".into(),
+            filter: None,
+        }],
+        match_plan: match_plan.clone(),
+        each_plan: None,
+        joins: vec![],
+        entity_plan: EntityPlan {
+            entity_type: "ip".into(),
+            entity_id_expr: Expr::Field(FieldRef::Qualified("fail".into(), "sip".into())),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(70.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+    let mut machine = CepStateMachine::new(
+        "conv_sink_rule".into(),
+        match_plan,
+        Some("event_time".into()),
+    );
+    machine.set_raw_conv_mode();
+    let executor = RuleExecutor::new(rule_plan);
+    let (alert_tx, _alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let (conv_tx, conv_rx) = mpsc::channel::<crate::engine_task::ConvCloseBatch>(4);
+    let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
+        conv_sink: Some(crate::engine_task::ConvShardSink {
+            tx: conv_tx,
+            barrier_index: 0,
+        }),
+        machine: Some(machine),
+        each_alias: None,
+        each_time_field: None,
+        executor,
+        window_sources: vec![task_types::WindowSource {
+            window_name: "auth_events".into(),
+            window: win_arc,
+            notify: notify_arc,
+            aliases: vec!["fail".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout_scan_interval: Duration::from_secs(60),
+        router: Arc::new(Router::new(WindowRegistry::build(vec![]).unwrap())),
+        metrics: None,
+        intermediate_targets: HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+    };
+    let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
+    (task, conv_rx)
+}
+
+#[tokio::test]
+async fn conv_sink_process_batch_barrier_tracks_event_time() {
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, mut conv_rx) = make_conv_sink_task();
+    let ts = 1_700_000_000_000_000_000i64;
+    let batch = make_batch(&schema, &["10.0.0.1"], ts);
+    let push = RulePush {
+        window_name: "auth_events".into(),
+        events: Arc::new(
+            batch_to_events(&batch)
+                .into_iter()
+                .map(Arc::new)
+                .collect::<Vec<_>>(),
+        ),
+        seq: u64::MAX,
+    };
+    task.process_push(push).await;
+    let b = conv_rx
+        .try_recv()
+        .expect("conv stage should receive a barrier batch");
+    // Regression: the barrier must be the scan (event-time) watermark, not the
+    // machine's cached watermark (which only advances during `advance`, after
+    // the scan).
+    assert_eq!(
+        b.watermark, ts,
+        "barrier watermark must equal the event time (scan watermark)"
+    );
+}
+
+#[tokio::test]
+async fn conv_sink_scan_timeouts_advances_barrier_by_wall_clock() {
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, mut conv_rx) = make_conv_sink_task();
+    let ts = 1_700_000_000_000_000_000i64;
+    let batch = make_batch(&schema, &["10.0.0.1"], ts);
+    let push = RulePush {
+        window_name: "auth_events".into(),
+        events: Arc::new(
+            batch_to_events(&batch)
+                .into_iter()
+                .map(Arc::new)
+                .collect::<Vec<_>>(),
+        ),
+        seq: u64::MAX,
+    };
+    task.process_push(push).await;
+    let _ = conv_rx.try_recv(); // drain the process_batch barrier batch
+
+    // Simulate an idle shard: wall clock advances with no new events.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    task.scan_timeouts().await;
+
+    let b = conv_rx
+        .try_recv()
+        .expect("scan_timeouts should send a barrier batch");
+    // Regression: an idle shard's barrier must advance with wall-clock (the
+    // effective scan watermark), otherwise the conv stage never seals buckets
+    // for the whole rule (starvation).
+    assert!(
+        b.watermark > ts,
+        "idle shard barrier must advance by wall-clock, got {} (stale machine watermark)",
+        b.watermark
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2c: conv stage end-to-end emit (regression for drop-on-full delivery path)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn conv_stage_emits_sealed_close_to_sink() {
+    init_tracing();
+    let match_plan = MatchPlan {
+        keys: vec![FieldRef::Simple("sip".into())],
+        key_map: None,
+        window_spec: WindowSpec::Fixed(Duration::from_secs(60)),
+        event_steps: vec![StepPlan {
+            branches: vec![BranchPlan {
+                label: Some("count".into()),
+                source: "fail".into(),
+                field: None,
+                guard: None,
+                agg: AggPlan {
+                    transforms: vec![],
+                    measure: Measure::Count,
+                    cmp: CmpOp::Ge,
+                    threshold: Expr::Number(1.0),
+                },
+            }],
+        }],
+        close_steps: vec![],
+        close_mode: CloseMode::And,
+        tracked_bind_aliases: HashSet::new(),
+        tracked_bind_fields: std::collections::HashMap::new(),
+        tracked_plain_fields: HashSet::new(),
+        seq: None,
+        match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
+        needs_field_history: false,
+    };
+    let rule_plan = RulePlan {
+        conv_window: None,
+        name: "conv_stage_rule".into(),
+        binds: vec![],
+        match_plan: match_plan.clone(),
+        each_plan: None,
+        joins: vec![],
+        entity_plan: EntityPlan {
+            entity_type: "ip".into(),
+            entity_id_expr: Expr::Field(FieldRef::Simple("sip".into())),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(70.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+    let executor = RuleExecutor::new(rule_plan);
+
+    let (alert_tx, mut alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let (conv_tx, conv_rx) = mpsc::channel::<crate::engine_task::ConvCloseBatch>(4);
+    let barrier: Arc<Vec<std::sync::atomic::AtomicI64>> =
+        Arc::new(vec![std::sync::atomic::AtomicI64::new(i64::MIN)]);
+    let config = crate::engine_task::ConvStageConfig {
+        executor,
+        conv_plan: None,
+        keys: Arc::new([FieldRef::Simple("sip".into())]),
+        over: Duration::from_secs(60),
+        limits: None,
+        shared_limits: None,
+        barrier,
+        sink_fanout: make_test_fanout(alert_tx),
+        router: Arc::new(Router::new(WindowRegistry::build(vec![]).unwrap())),
+        metrics: None,
+        rx: conv_rx,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        eos: tokio::sync::watch::channel(0u64).1,
+        timeout_scan_interval: Duration::from_secs(60),
+    };
+    let _stage = tokio::spawn(async move { crate::engine_task::run_conv_stage_task(config).await });
+
+    // A qualified close in bucket 0; `drained` lifts the barrier so the bucket
+    // is sealed and the close is emitted to the sink.
+    let close = wf_engine::match_engine::CloseOutput {
+        rule_name: "conv_stage_rule".into(),
+        scope_key: vec![wf_engine::match_engine::Value::Str("10.0.0.1".into())],
+        close_reason: wf_engine::match_engine::CloseReason::Timeout,
+        event_ok: true,
+        close_ok: true,
+        close_mode: CloseMode::And,
+        event_emitted: false,
+        event_step_data: vec![wf_engine::match_engine::StepData {
+            satisfied_branch_index: 0,
+            label: Some("count".into()),
+            measure_value: 1.0,
+            event_first_time_nanos: Some(0),
+            event_last_time_nanos: Some(0),
+            collected_values: vec![],
+            field_values: Default::default(),
+        }],
+        close_step_data: vec![],
+        bind_data: vec![],
+        watermark_nanos: 0,
+        machine_id: "m".into(),
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 60_000_000_000,
+        last_event_nanos: 0,
+    };
+    conv_tx
+        .send(crate::engine_task::ConvCloseBatch {
+            closes: vec![close],
+            watermark: 0,
+            drained: true,
+            barrier_index: 0,
+        })
+        .await
+        .unwrap();
+    // Drop the sender so the stage drains and exits after sealing.
+    drop(conv_tx);
+
+    let alert = take_alert_recv(&mut alert_rx).await;
+    assert_eq!(field_str(&alert, "__wfu_rule_name"), "conv_stage_rule");
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
+    assert!((field_f64(&alert, "__wfu_score") - 70.0).abs() < f64::EPSILON);
+}
+
+// ---------------------------------------------------------------------------
+// P1① / P2③ / P2④ — conv stage regression tests
+// ---------------------------------------------------------------------------
+
+/// Build the RuleExecutor used by the conv-stage tests (yields `alerts`,
+/// entity `ip`, score 70).
+fn conv_stage_test_executor() -> RuleExecutor {
+    let match_plan = MatchPlan {
+        keys: vec![FieldRef::Simple("sip".into())],
+        key_map: None,
+        window_spec: WindowSpec::Fixed(Duration::from_secs(60)),
+        event_steps: vec![StepPlan {
+            branches: vec![BranchPlan {
+                label: Some("count".into()),
+                source: "fail".into(),
+                field: None,
+                guard: None,
+                agg: AggPlan {
+                    transforms: vec![],
+                    measure: Measure::Count,
+                    cmp: CmpOp::Ge,
+                    threshold: Expr::Number(1.0),
+                },
+            }],
+        }],
+        close_steps: vec![],
+        close_mode: CloseMode::And,
+        tracked_bind_aliases: HashSet::new(),
+        tracked_bind_fields: std::collections::HashMap::new(),
+        tracked_plain_fields: HashSet::new(),
+        seq: None,
+        match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
+        needs_field_history: false,
+    };
+    let rule_plan = RulePlan {
+        conv_window: None,
+        name: "conv_stage_rule".into(),
+        binds: vec![],
+        match_plan: match_plan.clone(),
+        each_plan: None,
+        joins: vec![],
+        entity_plan: EntityPlan {
+            entity_type: "ip".into(),
+            entity_id_expr: Expr::Field(FieldRef::Simple("sip".into())),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(70.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+    RuleExecutor::new(rule_plan)
+}
+
+/// A qualified close for bucket 0.
+fn conv_stage_test_close() -> wf_engine::match_engine::CloseOutput {
+    wf_engine::match_engine::CloseOutput {
+        rule_name: "conv_stage_rule".into(),
+        scope_key: vec![wf_engine::match_engine::Value::Str("10.0.0.1".into())],
+        close_reason: wf_engine::match_engine::CloseReason::Timeout,
+        event_ok: true,
+        close_ok: true,
+        close_mode: CloseMode::And,
+        event_emitted: false,
+        event_step_data: vec![wf_engine::match_engine::StepData {
+            satisfied_branch_index: 0,
+            label: Some("count".into()),
+            measure_value: 1.0,
+            event_first_time_nanos: Some(0),
+            event_last_time_nanos: Some(0),
+            collected_values: vec![],
+            field_values: Default::default(),
+        }],
+        close_step_data: vec![],
+        bind_data: vec![],
+        watermark_nanos: 0,
+        machine_id: "m".into(),
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 60_000_000_000,
+        last_event_nanos: 0,
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn make_conv_stage_config(
+    limits: Option<wf_lang::plan::LimitsPlan>,
+    shared_limits: Option<std::sync::Arc<wf_engine::match_engine::SharedLimits>>,
+    barrier: Arc<Vec<std::sync::atomic::AtomicI64>>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> (
+    crate::engine_task::ConvStageConfig,
+    mpsc::Sender<crate::engine_task::ConvCloseBatch>,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
+) {
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let (conv_tx, conv_rx) = mpsc::channel::<crate::engine_task::ConvCloseBatch>(4);
+    let config = crate::engine_task::ConvStageConfig {
+        executor: conv_stage_test_executor(),
+        conv_plan: None,
+        keys: Arc::new([FieldRef::Simple("sip".into())]),
+        over: Duration::from_secs(60),
+        limits,
+        shared_limits,
+        barrier,
+        sink_fanout: make_test_fanout(alert_tx),
+        router: Arc::new(Router::new(WindowRegistry::build(vec![]).unwrap())),
+        metrics: None,
+        rx: conv_rx,
+        cancel,
+        eos: tokio::sync::watch::channel(0u64).1,
+        timeout_scan_interval: Duration::from_secs(60),
+    };
+    (config, conv_tx, alert_rx)
+}
+
+// P1①: conv-stage throttle over-limit must dispatch on_exceed — FailRule
+// latches the shared rule (matching the inline close path), and later batches
+// are not emitted.
+#[tokio::test]
+async fn conv_stage_throttle_failrule_latches_shared() {
+    init_tracing();
+    let shared = wf_engine::match_engine::SharedLimits::new();
+    let limits = wf_lang::plan::LimitsPlan {
+        max_memory_bytes: None,
+        max_instances: None,
+        max_throttle: Some(wf_lang::plan::RateSpec {
+            count: 1,
+            per: Duration::from_secs(60),
+        }),
+        on_exceed: wf_lang::plan::ExceedAction::FailRule,
+    };
+    let barrier: Arc<Vec<std::sync::atomic::AtomicI64>> =
+        Arc::new(vec![std::sync::atomic::AtomicI64::new(i64::MIN)]);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (config, conv_tx, mut alert_rx) = make_conv_stage_config(
+        Some(limits),
+        Some(std::sync::Arc::clone(&shared)),
+        barrier,
+        cancel.clone(),
+    );
+    let _stage = tokio::spawn(async move { crate::engine_task::run_conv_stage_task(config).await });
+
+    // Two qualified closes at the same watermark: the 1st is within the shared
+    // budget (count=1), the 2nd is throttled → FailRule must latch.
+    let close = conv_stage_test_close();
+    conv_tx
+        .send(crate::engine_task::ConvCloseBatch {
+            closes: vec![close.clone(), close],
+            watermark: 0,
+            drained: true,
+            barrier_index: 0,
+        })
+        .await
+        .unwrap();
+    drop(conv_tx);
+
+    let alert = take_alert_recv(&mut alert_rx).await;
+    assert_eq!(field_str(&alert, "__wfu_rule_name"), "conv_stage_rule");
+    assert!(alert_rx.try_recv().is_err(), "2nd close must be throttled");
+    assert!(
+        shared.is_failed(),
+        "FailRule must latch the shared rule (not silently degrade to Throttle)"
+    );
+    cancel.cancel();
+}
+
+// P2③: one ConvCloseBatch per process_batch (max event-time watermark), not
+// one per event.
+#[tokio::test]
+async fn conv_sink_sends_one_batch_per_process_batch() {
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, mut conv_rx) = make_conv_sink_task();
+    let ts = 1_700_000_000_000_000_000i64;
+    // 3 events in one pushed batch.
+    let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.2", "10.0.0.1"], ts);
+    let push = RulePush {
+        window_name: "auth_events".into(),
+        events: Arc::new(
+            batch_to_events(&batch)
+                .into_iter()
+                .map(Arc::new)
+                .collect::<Vec<_>>(),
+        ),
+        seq: u64::MAX,
+    };
+    task.process_push(push).await;
+
+    let b = conv_rx
+        .try_recv()
+        .expect("process_batch must send exactly one ConvCloseBatch");
+    assert!(
+        conv_rx.try_recv().is_err(),
+        "per-batch aggregation must send ONE batch, not one per event"
+    );
+    assert!(
+        b.watermark >= ts,
+        "barrier watermark must be the max event-time in the batch, got {}",
+        b.watermark
+    );
+}
+
+// P2④: unsealed (partial) buckets are DROPPED on cancel — never emitted as
+// wrong top(N)/sort results.
+#[tokio::test]
+async fn conv_stage_cancel_drops_unsealed_buckets() {
+    init_tracing();
+    // Barrier stuck at 0: bucket 0 needs min watermark >= 60s to seal.
+    let barrier: Arc<Vec<std::sync::atomic::AtomicI64>> =
+        Arc::new(vec![std::sync::atomic::AtomicI64::new(0)]);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (config, conv_tx, mut alert_rx) =
+        make_conv_stage_config(None, None, barrier, cancel.clone());
+    let _stage = tokio::spawn(async move { crate::engine_task::run_conv_stage_task(config).await });
+
+    // A qualified close in bucket 0, NOT drained (barrier stays 0 → never seals).
+    conv_tx
+        .send(crate::engine_task::ConvCloseBatch {
+            closes: vec![conv_stage_test_close()],
+            watermark: 0,
+            drained: false,
+            barrier_index: 0,
+        })
+        .await
+        .unwrap();
+    // Give the stage a beat to receive the batch, then cancel.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancel.cancel();
+    drop(conv_tx);
+
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "cancel must DROP unsealed (partial) buckets, not emit them"
     );
 }

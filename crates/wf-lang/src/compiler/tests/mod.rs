@@ -444,3 +444,47 @@ rule r {
         "root of an array-literal nested path must be tracked, got {fields:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P2c: auto conv aggregation window
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fixed_conv_rule_generates_conv_window() {
+    let plans = compile_with(
+        r#"
+rule r {
+    events { e : auth_events }
+    match<sip:1h:fixed> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    conv { sort(-count) | top(10) ; }
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let cw = plans[0]
+        .conv_window
+        .as_ref()
+        .expect("fixed-window conv rule should generate a conv window");
+    // P3-A: only `over` (bucket length) and `keys` are carried — no window
+    // schema / step-labels dead fields.
+    assert_eq!(cw.over, Duration::from_secs(3600));
+    assert_eq!(cw.keys, plans[0].match_plan.keys);
+}
+
+#[test]
+fn non_conv_rule_has_no_conv_window() {
+    let plans = compile_with(
+        r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    assert!(plans[0].conv_window.is_none());
+}

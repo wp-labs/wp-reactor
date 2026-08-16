@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use wf_config::MetricsConfig;
@@ -719,7 +719,8 @@ pub struct RuntimeMetrics {
 
     rule_events_total: BTreeMap<String, AtomicU64>,
     rule_matches_total: BTreeMap<String, AtomicU64>,
-    rule_instances: BTreeMap<String, AtomicU64>,
+    /// Gauge, summed across a rule's shards via delta reports (P2b).
+    rule_instances: BTreeMap<String, AtomicI64>,
     rule_cursor_gap_total: BTreeMap<String, BTreeMap<String, AtomicU64>>,
 
     alert_emitted_total: BTreeMap<String, AtomicU64>,
@@ -766,6 +767,7 @@ impl RuntimeMetrics {
         self.rule_instances
             .values()
             .map(|v| v.load(Ordering::Relaxed))
+            .map(|v| v.max(0) as u64)
             .sum()
     }
 
@@ -840,6 +842,13 @@ impl RuntimeMetrics {
                 .map(|name| (name.clone(), AtomicU64::new(0)))
                 .collect::<BTreeMap<_, _>>()
         };
+        // Signed gauge map for `rule_instances` (sum across shards, P2b).
+        let make_rule_map_i64 = || {
+            rule_names
+                .iter()
+                .map(|name| (name.clone(), AtomicI64::new(0)))
+                .collect::<BTreeMap<_, _>>()
+        };
         let make_rule_hist_map = || {
             rule_names
                 .iter()
@@ -891,7 +900,7 @@ impl RuntimeMetrics {
             router_source_route_errors_total: make_source_map(),
             rule_events_total: make_rule_map(),
             rule_matches_total: make_rule_map(),
-            rule_instances: make_rule_map(),
+            rule_instances: make_rule_map_i64(),
             rule_cursor_gap_total: gap_map,
             alert_emitted_total: make_rule_map(),
             alert_emitted_detail_shards: (0..ALERT_DETAIL_SHARDS)
@@ -1011,8 +1020,7 @@ impl RuntimeMetrics {
                 .fetch_add(1, Ordering::Relaxed);
             self.add_window_late(window, rows as u64);
         } else {
-            self.router_delivered_total
-                .fetch_add(1, Ordering::Relaxed);
+            self.router_delivered_total.fetch_add(1, Ordering::Relaxed);
             self.add_window_append(window, rows as u64);
         }
     }
@@ -1058,9 +1066,14 @@ impl RuntimeMetrics {
         }
     }
 
-    pub fn set_rule_instances(&self, rule: &str, count: usize) {
+    /// Adjust the `rule_instances` gauge by a signed delta.
+    ///
+    /// Each shard of a sharded rule reports `current_count - last_reported`
+    /// so the gauge is the *sum* across shards (P2b). A single reporter
+    /// (shards=1) yields the same numeric value as the old overwriting store.
+    pub fn adjust_rule_instances(&self, rule: &str, delta: i64) {
         if let Some(v) = self.rule_instances.get(rule) {
-            v.store(count as u64, Ordering::Relaxed);
+            v.fetch_add(delta, Ordering::Relaxed);
         }
     }
 
@@ -1102,9 +1115,7 @@ impl RuntimeMetrics {
             .unwrap();
         let by_machine = map.entry(rule.to_string()).or_default();
         let by_scope = by_machine.entry(machine.to_string()).or_default();
-        if by_scope.len() >= ALERT_DETAIL_MAX_SCOPES_PER_RULE
-            && !by_scope.contains_key(scope)
-        {
+        if by_scope.len() >= ALERT_DETAIL_MAX_SCOPES_PER_RULE && !by_scope.contains_key(scope) {
             // Bounded: count only in alert_emitted_total for new scopes.
             return;
         }
@@ -1281,7 +1292,7 @@ impl RuntimeMetrics {
             router_source_route_errors: self.drain_map(&self.router_source_route_errors_total),
             rule_events: self.drain_map(&self.rule_events_total),
             rule_matches: self.drain_map(&self.rule_matches_total),
-            rule_instances: self.read_map(&self.rule_instances),
+            rule_instances: self.read_gauge_map(&self.rule_instances),
             rule_cursor_gaps: self.drain_gap_map(&self.rule_cursor_gap_total),
             alert_emitted: self.drain_map(&self.alert_emitted_total),
             alert_emitted_detail: self.drain_emitted_detail(),
@@ -1348,6 +1359,13 @@ impl RuntimeMetrics {
     fn read_map(&self, m: &BTreeMap<String, AtomicU64>) -> BTreeMap<String, u64> {
         m.iter()
             .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    /// Read the signed `rule_instances` gauge, clamping negatives to zero.
+    fn read_gauge_map(&self, m: &BTreeMap<String, AtomicI64>) -> BTreeMap<String, u64> {
+        m.iter()
+            .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed).max(0) as u64))
             .collect()
     }
 

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
@@ -193,8 +193,8 @@ pub(crate) fn build_parse_item(
     if let Some(metrics) = metrics {
         metrics.add_receiver_frame(batch.num_rows());
         metrics.add_receiver_source_frame(source_name, batch.num_rows());
-        let machine_id = crate::receiver::batch_machine_id(&batch)
-            .unwrap_or_else(|| source_name.to_string());
+        let machine_id =
+            crate::receiver::batch_machine_id(&batch).unwrap_or_else(|| source_name.to_string());
         metrics.add_receiver_source_machine_rows(source_name, &machine_id, batch.num_rows());
     }
     let projected = crate::receiver::prepare_batch(stream_name, &batch, router);
@@ -222,6 +222,7 @@ pub(crate) fn build_parse_item(
 /// When `limiter` is `Some`, the batch is token-bucketed first (engine-side
 /// ingest rate cap), so a flat-out client cannot drive the engine's
 /// allocation throughput (and RSS peak) beyond the configured rate.
+#[allow(clippy::too_many_arguments)] // low-level batch pipeline: params are the shared budget/handles
 pub(crate) async fn push_decoded_batch(
     parse_tx: &mpsc::Sender<ParseItem>,
     preread: &PrereadBudget,
@@ -417,7 +418,13 @@ async fn run_parse_worker_direct(
             metrics.add_router_skipped(parsed.skipped_non_local);
         }
         router
-            .dispatch_parsed(Arc::from(source_name.as_str()), seq, window_seqs, batch, parsed)
+            .dispatch_parsed(
+                Arc::from(source_name.as_str()),
+                seq,
+                window_seqs,
+                batch,
+                parsed,
+            )
             .await;
         // Every subscribed window's channel has received the batch: the
         // in-flight bytes are now accounted by the window byte budgets.
@@ -432,8 +439,7 @@ async fn run_commit_worker(
     router: Arc<Router>,
     metrics: Option<Arc<RuntimeMetrics>>,
 ) {
-    let mut next_seq: std::collections::HashMap<String, u64> =
-        std::collections::HashMap::new();
+    let mut next_seq: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut pending: BTreeMap<(String, u64), ParsedItem> = BTreeMap::new();
 
     while let Some(item) = rx.recv().await {
@@ -479,12 +485,12 @@ async fn drain_pending(
         // map starts at seq 0 (per-source counters begin at 0).
         let hit = pending
             .keys()
-            .find(|(source, seq)| {
-                next_seq.get(source.as_str()).copied().unwrap_or(0) == *seq
-            })
+            .find(|(source, seq)| next_seq.get(source.as_str()).copied().unwrap_or(0) == *seq)
             .cloned();
         let Some((source, seq)) = hit else { break };
-        let Some(item) = pending.remove(&(source.clone(), seq)) else { break };
+        let Some(item) = pending.remove(&(source.clone(), seq)) else {
+            break;
+        };
         commit(router, metrics, item).await;
         next_seq.insert(source, seq.wrapping_add(1));
     }

@@ -466,9 +466,6 @@ mod tests {
             events[0].fields["ports"],
             Value::Array(vec![Value::Number(22.0), Value::Number(2222.0)])
         );
-        assert_eq!(
-            events[0].fields["plain"],
-            Value::Str(r#"[22,2222]"#.into())
-        );
+        assert_eq!(events[0].fields["plain"], Value::Str(r#"[22,2222]"#.into()));
     }
 }

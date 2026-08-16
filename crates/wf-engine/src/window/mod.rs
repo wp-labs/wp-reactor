@@ -3,8 +3,8 @@ mod buffer;
 mod commit;
 mod evictor;
 mod fanout;
-pub mod provider;
 mod progress;
+pub mod provider;
 mod registry;
 mod router;
 

@@ -81,8 +81,8 @@ impl PipeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("sip", DataType::Utf8, true)]))

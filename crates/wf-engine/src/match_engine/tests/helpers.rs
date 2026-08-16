@@ -11,10 +11,7 @@ use crate::match_engine::match_engine::{Event, Value};
 
 pub fn event(fields: Vec<(&str, Value)>) -> Event {
     Event {
-        fields: fields
-            .into_iter()
-            .map(|(k, v)| (k.into(), v))
-            .collect(),
+        fields: fields.into_iter().map(|(k, v)| (k.into(), v)).collect(),
     }
 }
 
@@ -53,7 +50,7 @@ pub fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: false,
+        needs_field_history: false,
     }
 }
 
@@ -100,7 +97,7 @@ pub fn plan_with_close(
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: false,
+        needs_field_history: false,
     }
 }
 
@@ -118,7 +115,7 @@ pub fn fixed_plan(keys: Vec<FieldRef>, dur: Duration, steps: Vec<StepPlan>) -> M
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: false,
+        needs_field_history: false,
     }
 }
 
@@ -141,7 +138,7 @@ pub fn fixed_plan_with_close(
         seq: None,
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
-            needs_field_history: false,
+        needs_field_history: false,
     }
 }
 
@@ -168,6 +165,7 @@ pub fn simple_rule_plan(
     entity_id_expr: Expr,
 ) -> RulePlan {
     RulePlan {
+        conv_window: None,
         name: name.to_string(),
         binds: vec![BindPlan {
             alias: "fail".to_string(),

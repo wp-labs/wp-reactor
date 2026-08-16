@@ -29,9 +29,9 @@ pub(crate) fn format_nanos_utc(nanos: i64) -> String {
     let mut s = String::with_capacity(24);
     push_digits(&mut s, year as u32, 4);
     s.push('-');
-    push_digits(&mut s, month as u32, 2);
+    push_digits(&mut s, month, 2);
     s.push('-');
-    push_digits(&mut s, day as u32, 2);
+    push_digits(&mut s, day, 2);
     s.push('T');
     push_digits(&mut s, hour as u32, 2);
     s.push(':');
@@ -321,8 +321,8 @@ mod format_tests {
             1_000_000,
             999_999_999,
             1_000_000_000,
-            86_399_999_999_999_999, // last ms of 1970-01-01
-            86_400_000_000_000_000, // 1970-01-02T00:00:00
+            86_399_999_999_999_999,    // last ms of 1970-01-01
+            86_400_000_000_000_000,    // 1970-01-02T00:00:00
             1_583_020_800_000_000_000, // 2020-03-01 (leap year boundary)
             1_609_459_200_000_000_000, // 2021-01-01
             4_102_444_800_000_000_000, // 2100-01-01 (non-leap century)

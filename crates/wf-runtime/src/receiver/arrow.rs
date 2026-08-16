@@ -266,7 +266,10 @@ async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> io::Result<Opti
     let len_str = std::str::from_utf8(&len_buf)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad frame length"))?;
     let frame_len: usize = len_str.parse().map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("bad frame length '{len_str}'"))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad frame length '{len_str}'"),
+        )
     })?;
     if frame_len == 0 || frame_len > MAX_FRAME_BYTES {
         return Err(io::Error::new(

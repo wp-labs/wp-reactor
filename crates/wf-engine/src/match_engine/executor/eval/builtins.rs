@@ -789,17 +789,15 @@ pub(super) fn eval_builtin_func_with_l3(
         }
         "md5" => {
             let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;
-            Some(Value::Str(hex::encode(<Md5 as Md5Digest>::digest(
-                text.as_bytes(),
+            Some(Value::Str(
+                hex::encode(<Md5 as Md5Digest>::digest(text.as_bytes())).into(),
             ))
-            .into()))
         }
         "sha1" => {
             let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;
-            Some(Value::Str(hex::encode(<Sha1 as Sha1Digest>::digest(
-                text.as_bytes(),
+            Some(Value::Str(
+                hex::encode(<Sha1 as Sha1Digest>::digest(text.as_bytes())).into(),
             ))
-            .into()))
         }
         "sha1_n" => {
             if args.len() != 2 {
@@ -821,7 +819,9 @@ pub(super) fn eval_builtin_func_with_l3(
         }
         "sha256" => {
             let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;
-            Some(Value::Str(hex::encode(Sha256::digest(text.as_bytes())).into()))
+            Some(Value::Str(
+                hex::encode(Sha256::digest(text.as_bytes())).into(),
+            ))
         }
         "hex" => {
             let text = utils::eval_single_string_arg_with_l3(args, ctx, score)?;

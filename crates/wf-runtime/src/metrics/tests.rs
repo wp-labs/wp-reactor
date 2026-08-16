@@ -339,3 +339,21 @@ fn alert_counters() {
         .collect();
     assert_eq!(emitted.len(), 1);
 }
+
+#[test]
+fn rule_instances_gauge_sums_deltas_across_shards() {
+    let m = RuntimeMetrics::new(&["r1".to_string()], &[], &[], BTreeMap::new());
+    // Two shards report their live counts as deltas (P2b): 3 + 2 = 5.
+    m.adjust_rule_instances("r1", 3);
+    m.adjust_rule_instances("r1", 2);
+    assert_eq!(m.snapshot().rule_instances["r1"], 5);
+    // Shard1's count drops to 1 → delta -2.
+    m.adjust_rule_instances("r1", -2);
+    assert_eq!(m.snapshot().rule_instances["r1"], 3);
+    // Shutdown reconcile: both drain to 0.
+    m.adjust_rule_instances("r1", -3);
+    assert_eq!(m.snapshot().rule_instances["r1"], 0);
+    // Overshoot below zero clamps to zero (gauge never goes negative).
+    m.adjust_rule_instances("r1", -5);
+    assert_eq!(m.snapshot().rule_instances["r1"], 0);
+}

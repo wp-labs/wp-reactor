@@ -56,7 +56,7 @@ fn execute_match_without_joins_still_works() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
-            trigger_event: None,
+        trigger_event: None,
     };
 
     // Old API still works

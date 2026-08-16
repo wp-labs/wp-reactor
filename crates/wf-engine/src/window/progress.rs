@@ -29,6 +29,12 @@ pub struct WindowProgress {
     slots: RwLock<Vec<Weak<AtomicU64>>>,
 }
 
+impl Default for WindowProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WindowProgress {
     pub fn new() -> Self {
         Self {

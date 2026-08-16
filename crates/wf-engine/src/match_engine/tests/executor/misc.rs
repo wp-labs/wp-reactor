@@ -121,7 +121,7 @@ fn summary_format() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
-            trigger_event: None,
+        trigger_event: None,
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -175,7 +175,7 @@ fn numeric_key_preserves_type_in_eval_context() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
-            trigger_event: None,
+        trigger_event: None,
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -223,7 +223,7 @@ fn label_cannot_overwrite_key_in_eval_context() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
-            trigger_event: None,
+        trigger_event: None,
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -268,7 +268,7 @@ fn wfx_id_hex_format() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         machine_id: String::new(),
-            trigger_event: None,
+        trigger_event: None,
     };
 
     let alert = exec.execute_match(&matched).unwrap();
@@ -304,10 +304,7 @@ fn build_machine_id_and_scope_key() {
                 FieldRef::Simple("sip".to_string()),
                 FieldRef::Simple("user".to_string())
             ],
-            &[
-                Value::Str("10.0.0.1".into()),
-                Value::Str("admin".into())
-            ],
+            &[Value::Str("10.0.0.1".into()), Value::Str("admin".into())],
         ),
         "sip=10.0.0.1,user=admin"
     );

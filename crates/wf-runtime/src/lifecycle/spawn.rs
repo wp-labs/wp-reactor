@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::{Arc, Once};
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use orion_error::conversion::{SourceErr, ToStructError};
@@ -9,11 +9,11 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use wf_config::FusionConfig;
-use wf_engine::match_engine::CepStateMachine;
+use wf_engine::match_engine::{CepStateMachine, SharedLimits};
 use wf_engine::sink::SinkDispatcher;
 use wf_engine::window::{
-    Evictor, Router, RulePush, WindowAppendReport, WindowMailbox, WindowMsg, WindowRegistry,
-    WINDOW_CHANNEL_DEPTH, run_window_actor,
+    Evictor, Router, RulePush, WINDOW_CHANNEL_DEPTH, WindowAppendReport, WindowMailbox, WindowMsg,
+    WindowRegistry, run_window_actor,
 };
 
 /// Bounded capacity of each rule push channel (a channel carries whole batches
@@ -24,7 +24,10 @@ pub(crate) const RULE_CHANNEL_CAPACITY: usize = 32;
 use wf_lang::ast::FieldRef;
 
 use crate::alert_task;
-use crate::engine_task::{RuleTaskConfig, WindowSource, run_rule_task};
+use crate::engine_task::{
+    ConvCloseBatch, ConvShardSink, ConvStageConfig, RuleTaskConfig, WindowSource,
+    run_conv_stage_task, run_rule_task,
+};
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::evictor_task;
 use crate::metrics::{MetricsRecord, MonRecv, RuntimeMetrics, run_metrics_task};
@@ -95,7 +98,8 @@ pub(super) fn spawn_alert_task(
         let writers = sink.parallel.max(1);
         let mut senders = Vec::with_capacity(writers);
         for _ in 0..writers {
-            let (tx, rx) = mpsc::channel::<alert_task::AlertBatch>(alert_task::SINK_CHANNEL_CAPACITY);
+            let (tx, rx) =
+                mpsc::channel::<alert_task::AlertBatch>(alert_task::SINK_CHANNEL_CAPACITY);
             senders.push(tx);
             let sink = Arc::clone(sink);
             let error_txs = Arc::clone(&error_txs);
@@ -163,7 +167,7 @@ pub(super) fn spawn_window_actors(
             WindowMailbox {
                 tx,
                 budget: Arc::new(tokio::sync::Semaphore::new(buffer_bytes)),
-                budget_bytes: buffer_bytes as usize,
+                budget_bytes: buffer_bytes,
             },
         );
         let name: Arc<str> = Arc::from(name.as_str());
@@ -263,7 +267,7 @@ pub(super) fn spawn_rule_tasks(
                         let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                         shard_txs.push(push_tx);
                         let progress = register_progress(router, &window_sources);
-                    let task_config = RuleTaskConfig {
+                        let task_config = RuleTaskConfig {
                             machine: None,
                             each_alias: Some(alias.clone()),
                             each_time_field: time_field.clone(),
@@ -279,8 +283,11 @@ pub(super) fn spawn_rule_tasks(
                             eos_flush: eos_tx.subscribe(),
                             push_rx: Some(push_rx),
                             progress: progress.clone(),
+                            conv_sink: None,
                         };
-                        group.push(tokio::spawn(async move { run_rule_task(task_config).await }));
+                        group.push(tokio::spawn(
+                            async move { run_rule_task(task_config).await },
+                        ));
                     }
                     for source in &window_sources {
                         router
@@ -311,8 +318,11 @@ pub(super) fn spawn_rule_tasks(
                         eos_flush: eos_tx.subscribe(),
                         push_rx: Some(push_rx),
                         progress: progress.clone(),
+                        conv_sink: None,
                     };
-                    group.push(tokio::spawn(async move { run_rule_task(task_config).await }));
+                    group.push(tokio::spawn(
+                        async move { run_rule_task(task_config).await },
+                    ));
                 }
             }
             RunRuleKind::Match {
@@ -321,24 +331,87 @@ pub(super) fn spawn_rule_tasks(
                 limits,
             } => {
                 let name = rule.executor.plan().name.clone();
-                let has_conv = rule.executor.plan().conv_plan.is_some();
-                // P2a: shard only rules with a match key and no conv.
-                let shardable = !match_plan.keys.is_empty() && !has_conv && shard_count > 1;
+                let conv_plan = rule.executor.plan().conv_plan.clone();
+                let conv_window = rule.executor.plan().conv_window.clone();
+                let yield_target = rule.executor.plan().yield_plan.target.clone();
+                // P2a + P2c: shard rules with a match key and no *inline* conv.
+                // A fixed-window conv rule with a generated conv window becomes
+                // shardable; sliding/session conv stays inline. Conv rules that
+                // yield to an intermediate pipe stay inline too (the conv stage
+                // emits final sink output only).
+                let has_inline_conv = conv_plan.is_some() && conv_window.is_none();
+                let conv_to_pipe =
+                    conv_window.is_some() && intermediate_targets.contains(yield_target.as_str());
+                let shardable = !match_plan.keys.is_empty()
+                    && !has_inline_conv
+                    && !conv_to_pipe
+                    && shard_count > 1;
 
                 if shardable {
                     let keys: Arc<[FieldRef]> = match_plan.keys.clone().into();
+                    // P2b: one shared rate-limit/budget handle across all shards
+                    // (only when the rule carries limits).
+                    let shared_limits = limits.as_ref().map(|_| SharedLimits::new());
+                    // P2c: a sharded conv rule gets a shared watermark barrier and
+                    // one conv-stage task that aggregates raw closes across shards.
+                    let conv_ctx = match &conv_window {
+                        Some(cw) => {
+                            let (tx, rx) = mpsc::channel::<ConvCloseBatch>(RULE_CHANNEL_CAPACITY);
+                            let barrier: Arc<Vec<AtomicI64>> = Arc::new(
+                                (0..shard_count).map(|_| AtomicI64::new(i64::MIN)).collect(),
+                            );
+                            let stage_config = ConvStageConfig {
+                                executor: rule.executor.clone(),
+                                conv_plan: conv_plan.clone(),
+                                keys: Arc::clone(&keys),
+                                over: cw.over,
+                                limits: limits.clone(),
+                                shared_limits: shared_limits.clone(),
+                                barrier: Arc::clone(&barrier),
+                                sink_fanout: Arc::clone(&sink_fanout),
+                                router: Arc::clone(router),
+                                metrics: metrics.clone(),
+                                rx,
+                                cancel: cancel.child_token(),
+                                eos: eos_tx.subscribe(),
+                                timeout_scan_interval,
+                            };
+                            group.push(tokio::spawn(async move {
+                                run_conv_stage_task(stage_config).await
+                            }));
+                            Some((tx, barrier))
+                        }
+                        None => None,
+                    };
                     let mut shard_txs = Vec::with_capacity(shard_count);
-                    for _ in 0..shard_count {
-                        let machine = CepStateMachine::with_limits(
-                            name.clone(),
-                            match_plan.clone(),
-                            time_field.clone(),
-                            limits.clone(),
-                        );
+                    for shard_idx in 0..shard_count {
+                        let mut machine = match &shared_limits {
+                            Some(shared) => CepStateMachine::with_limits_shared(
+                                name.clone(),
+                                match_plan.clone(),
+                                time_field.clone(),
+                                limits.clone(),
+                                Arc::clone(shared),
+                            ),
+                            None => CepStateMachine::with_limits(
+                                name.clone(),
+                                match_plan.clone(),
+                                time_field.clone(),
+                                limits.clone(),
+                            ),
+                        };
+                        if conv_ctx.is_some() {
+                            // Emit raw closes to the conv stage (aggregation window).
+                            machine.set_raw_conv_mode();
+                        }
                         let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                         shard_txs.push(push_tx);
                         let progress = register_progress(router, &window_sources);
-                    let task_config = RuleTaskConfig {
+                        let conv_sink = conv_ctx.as_ref().map(|(tx, _barrier)| ConvShardSink {
+                            tx: tx.clone(),
+                            barrier_index: shard_idx,
+                        });
+                        let task_config = RuleTaskConfig {
                             machine: Some(machine),
                             each_alias: None,
                             each_time_field: None,
@@ -350,12 +423,15 @@ pub(super) fn spawn_rule_tasks(
                             router: Arc::clone(router),
                             metrics: metrics.clone(),
                             intermediate_targets: intermediate_targets.clone(),
-                    pipe_registry: Arc::clone(&pipe_registry),
+                            pipe_registry: Arc::clone(&pipe_registry),
                             eos_flush: eos_tx.subscribe(),
                             push_rx: Some(push_rx),
                             progress: progress.clone(),
+                            conv_sink,
                         };
-                        group.push(tokio::spawn(async move { run_rule_task(task_config).await }));
+                        group.push(tokio::spawn(
+                            async move { run_rule_task(task_config).await },
+                        ));
                     }
                     for source in &window_sources {
                         router.fanout().register_sharded(
@@ -386,12 +462,15 @@ pub(super) fn spawn_rule_tasks(
                         router: Arc::clone(router),
                         metrics: metrics.clone(),
                         intermediate_targets: intermediate_targets.clone(),
-                    pipe_registry: Arc::clone(&pipe_registry),
+                        pipe_registry: Arc::clone(&pipe_registry),
                         eos_flush: eos_tx.subscribe(),
                         push_rx: Some(push_rx),
                         progress: progress.clone(),
+                        conv_sink: None,
                     };
-                    group.push(tokio::spawn(async move { run_rule_task(task_config).await }));
+                    group.push(tokio::spawn(
+                        async move { run_rule_task(task_config).await },
+                    ));
                 }
             }
         }

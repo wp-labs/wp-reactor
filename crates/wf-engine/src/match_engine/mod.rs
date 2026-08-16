@@ -13,9 +13,11 @@ pub use event_bridge::{
     wfl_structured_field_kind,
 };
 pub use executor::{EachDirectBatchStats, RuleExecutor, RuleExecutorOptions};
-pub use match_engine::{EngineHashMap, EngineHashSet};
+pub use match_engine::apply_conv;
+pub use match_engine::close_is_qualified;
 pub use match_engine::{
     CepStateMachine, CloseOutput, CloseReason, Event, JoinKey, MACHINE_ID, MatchedContext,
-    StepData, StepOutcome, StepProgress, StepResult, Value, WindowLookup,
+    SharedLimits, StepData, StepOutcome, StepProgress, StepResult, Value, WindowLookup,
 };
+pub use match_engine::{EngineHashMap, EngineHashSet};
 pub(crate) use match_engine::{extract_key_simple, shard_index};

@@ -399,3 +399,66 @@ fn conv_sort_by_scope_key() {
     assert_eq!(result[1].scope_key[0], Value::Str("bravo".into()));
     assert_eq!(result[2].scope_key[0], Value::Str("charlie".into()));
 }
+
+// ===========================================================================
+// P2c: conv must aggregate across shards (merged batch), not per-shard
+// ===========================================================================
+
+#[test]
+fn conv_top_n_must_aggregate_across_shards() {
+    // Shard A: closes with count 100, 90. Shard B: count 95, 10.
+    // Applying `sort(-count) | top(2)` per-shard lets shard B emit its local
+    // top-2 [95, 10] — the 10 would leak into the final output. Merging the
+    // shards first (the P2c conv stage) gives the global top-2 [100, 95].
+    let plan = make_conv_plan(vec![vec![
+        ConvOpPlan::Sort(vec![SortKeyPlan {
+            expr: Expr::Field(FieldRef::Simple("count".into())),
+            descending: true,
+        }]),
+        ConvOpPlan::Top(2),
+    ]]);
+    let keys = vec![FieldRef::Simple("sip".into())];
+
+    let shard_a = vec![
+        make_close_output(
+            vec![Value::Str("a1".into())],
+            vec![labeled_step("count", 100.0)],
+            vec![],
+        ),
+        make_close_output(
+            vec![Value::Str("a2".into())],
+            vec![labeled_step("count", 90.0)],
+            vec![],
+        ),
+    ];
+    let shard_b = vec![
+        make_close_output(
+            vec![Value::Str("b1".into())],
+            vec![labeled_step("count", 95.0)],
+            vec![],
+        ),
+        make_close_output(
+            vec![Value::Str("b2".into())],
+            vec![labeled_step("count", 10.0)],
+            vec![],
+        ),
+    ];
+
+    // Per-shard conv: shard B's local top-2 wrongly keeps the 10.
+    let per_shard = crate::match_engine::match_engine::apply_conv(&plan, &keys, shard_b.clone());
+    let per_shard_vals: Vec<f64> = per_shard
+        .iter()
+        .map(|o| o.event_step_data[0].measure_value)
+        .collect();
+    assert_eq!(per_shard_vals, vec![95.0, 10.0]);
+
+    // Merged conv (the P2c conv stage): global top-2 = [100, 95].
+    let mut merged = shard_a;
+    merged.extend(shard_b);
+    let aggregated = crate::match_engine::match_engine::apply_conv(&plan, &keys, merged);
+    let agg_vals: Vec<f64> = aggregated
+        .iter()
+        .map(|o| o.event_step_data[0].measure_value)
+        .collect();
+    assert_eq!(agg_vals, vec![100.0, 95.0]);
+}
