@@ -103,21 +103,20 @@ impl SinkRuntime {
     pub async fn send_records(&self, records: &[Arc<DataRecord>]) -> CoreResult<()> {
         let mut batch: Vec<Arc<DataRecord>> = Vec::with_capacity(records.len());
         for record in records {
-            let projected;
-            let filtered;
-            let data = if let Some(fields) = &self.output_fields {
-                projected = project_record(record, fields)?;
-                &projected
-            } else {
-                record
-            };
-            let data = if self.wf_meta_disable_matcher.is_empty() {
-                data
-            } else {
-                filtered = mark_wf_meta_fields_ignored(data, &self.wf_meta_disable_matcher);
-                &filtered
-            };
-            batch.push(Arc::new(data.clone()));
+            // Only materialize a new record when projection / wf_meta
+            // filtering actually applies; the passthrough case shares the
+            // caller's Arc. The previous unconditional `data.clone()` made
+            // every dispatch deep-copy every record inside the serialized
+            // sink-handle section — a hidden bottleneck once the DataRecord
+            // conversion moved onto the sink consumers (3.4).
+            let mut data: Arc<DataRecord> = Arc::clone(record);
+            if let Some(fields) = &self.output_fields {
+                data = Arc::new(project_record(record, fields)?);
+            }
+            if !self.wf_meta_disable_matcher.is_empty() {
+                data = Arc::new(mark_wf_meta_fields_ignored(&data, &self.wf_meta_disable_matcher));
+            }
+            batch.push(data);
         }
         let mut handle = self.handle.lock().await;
         handle.sink.sink_records(batch).await.source_err(
