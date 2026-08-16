@@ -137,6 +137,8 @@ pub(super) struct RuleTask {
     scan_nanos: u64,
     emit_nanos: u64,
     /// Finer emit split: execute_match / to_data_record / fanout handoff.
+    /// The to_data_record time is also exported as the `alert.serialize_nanos`
+    /// metric (summed across the run).
     exec_nanos: u64,
     serialize_nanos: std::sync::atomic::AtomicU64,
     fanout_nanos: std::sync::atomic::AtomicU64,
@@ -147,8 +149,9 @@ pub(super) struct RuleTask {
     cached_wall_nanos: AtomicU64,
     /// Countdown for sampling the allocation-heavy per-alert telemetry.
     emit_sample_remaining: AtomicU32,
-    /// Batched alert delivery: accumulated (yield_target, serialized record)
-    /// pairs flushed to the sink writers when the batch fills / at EOS.
+    /// Batched alert delivery: accumulated (yield_target, exported record)
+    /// pairs flushed to the sink writers when the batch fills / at EOS. The
+    /// DataRecord conversion runs on this thread by design — see [`Self::emit`].
     /// `Mutex` so emit can stay `&self` while RuleTask stays `Sync`.
     pending_alerts: std::sync::Mutex<Vec<(std::sync::Arc<str>, Arc<DataRecord>)>>,
 }
@@ -1059,6 +1062,9 @@ impl RuleTask {
         // Serialize once, then accumulate into the per-rule alert batch. The
         // batch is flushed to the sink writers when it fills (amortizing the
         // per-alert fan-out mechanics, matching the wp-motor batch model).
+        // The conversion stays on this thread on purpose: OutputRecords
+        // allocated here and freed on a sink thread drive mimalloc into its
+        // abandoned-page reclaim path — measured ~2x rule-throughput loss.
         let _ser_start = Instant::now();
         let data = match record.to_data_record() {
             Ok(data) => Arc::new(data),
@@ -1070,8 +1076,12 @@ impl RuleTask {
                 return;
             }
         };
+        let _ser_elapsed = _ser_start.elapsed();
         self.serialize_nanos
-            .fetch_add(_ser_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            .fetch_add(_ser_elapsed.as_nanos() as u64, Ordering::Relaxed);
+        if let Some(metrics) = &self.metrics {
+            metrics.add_alert_serialize_nanos(_ser_elapsed.as_nanos() as u64);
+        }
         self.pending_alerts
             .lock()
             .unwrap()
@@ -1082,9 +1092,9 @@ impl RuleTask {
     }
 
     /// Flush the accumulated alert batch to the sink writers, grouped by
-    /// yield_target. Each sink receives one `AlertBatch` (a single channel send),
-    /// amortizing the per-alert resolve / try_send / blocking that dominated the
-    /// q1 pass-through emit path.
+    /// yield_target. Each sink receives one `AlertBatch` (a single channel send)
+    /// of exported DataRecords, amortizing the per-alert resolve / try_send /
+    /// blocking that dominated the q1 pass-through emit path.
     async fn flush_alerts(&self) {
         if self.pending_alerts.lock().unwrap().is_empty() {
             return;
@@ -1098,6 +1108,9 @@ impl RuleTask {
         for (target, records) in by_target {
             let sink_groups = self.sink_fanout.resolve(&target);
             if sink_groups.is_empty() {
+                if let Some(metrics) = &self.metrics {
+                    metrics.add_alert_no_sink_records(records.len() as u64);
+                }
                 self.sink_fanout.warn_if_no_sink(&target);
                 continue;
             }

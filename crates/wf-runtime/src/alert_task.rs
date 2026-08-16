@@ -26,7 +26,13 @@ const SINK_DRAIN_BUDGET: Duration = Duration::from_secs(1);
 /// Replaces the fixed two-consumer alert pipeline + per-alert wildcard routing:
 /// each sink owns a bounded channel + a consumer task, and the wildcard routes
 /// are resolved once per yield_target (cached) at delivery time.
-/// A batch of serialized alert records delivered to a sink writer.
+/// A batch of serialized alert records delivered to a sink writer. Records are
+/// converted to DataRecords on the rule worker (same thread that allocated
+/// them): sample profiling showed that handing OutputRecords to the sink
+/// consumers — allocating on the rule thread, freeing on the sink thread —
+/// drove mimalloc into its abandoned-page reclaim path (~2x throughput loss,
+/// mi_abandoned_page_try_reclaim / mi_free_try_collect_mt dominating the
+/// leaf profile). Keep the record lifecycle on one thread.
 pub type AlertBatch = Arc<Vec<Arc<DataRecord>>>;
 /// Resolved per-sink channel groups for a yield target: each entry is
 /// `(sink_ptr, channels)` where `channels` are the sink's `parallel` writers.
@@ -168,13 +174,18 @@ pub async fn run_sink_consumer(
                     }
                     dispatch_batch(&sink, &error_txs, &metrics, batch).await;
                 }
-                let mut dropped = 0usize;
-                while rx.try_recv().is_ok() {
-                    dropped += 1;
+                let mut dropped_batches = 0usize;
+                let mut dropped_records = 0u64;
+                while let Ok(batch) = rx.try_recv() {
+                    dropped_batches += 1;
+                    dropped_records += batch.len() as u64;
                 }
-                if dropped > 0 {
+                if dropped_batches > 0 {
+                    if let Some(metrics) = &metrics {
+                        metrics.add_sink_drain_dropped_records(dropped_records);
+                    }
                     log::warn!(
-                        "sink {:?} shutdown drain budget exceeded, dropped {dropped} buffered alert batches",
+                        "sink {:?} shutdown drain budget exceeded, dropped {dropped_batches} buffered alert batches ({dropped_records} records)",
                         sink.name
                     );
                 }
@@ -195,8 +206,10 @@ pub async fn run_sink_consumer(
     let _ = sink.stop().await;
 }
 
-/// Serialize + send one alert batch to a sink, escalating failures to the
-/// error sinks. Shared by the normal and shutdown-drain paths.
+/// Send one alert batch to a sink, escalating failures to the error sinks.
+/// Shared by the normal and shutdown-drain paths. The DataRecord conversion
+/// stays on the rule worker (see [`AlertBatch`] — cross-thread record drops
+/// cost more than the conversion itself under mimalloc).
 async fn dispatch_batch(
     sink: &Arc<SinkRuntime>,
     error_txs: &Arc<Vec<mpsc::Sender<AlertBatch>>>,
@@ -212,6 +225,9 @@ async fn dispatch_batch(
         // Escalate to error sinks (best-effort, no error-of-error loop).
         for tx in error_txs.iter() {
             if tx.send(Arc::clone(&batch)).await.is_err() {
+                if let Some(metrics) = metrics {
+                    metrics.inc_alert_escalate_failed();
+                }
                 break;
             }
         }
