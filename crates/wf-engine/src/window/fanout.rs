@@ -26,7 +26,7 @@ pub struct RulePush {
 /// with whole-batch round-robin (stateless `on each` sharding, R4).
 ///
 /// Channels are **bounded** so a slow rule consumer backpressures the producer
-/// (the commit worker's broadcast awaits a full channel) instead of buffering
+/// (the window actor's broadcast awaits a full channel) instead of buffering
 /// unboundedly — 50M sustained inject with unbounded channels let RSS grow to
 /// ~13GB (wp-labs/wp-reactor long-run test, 2026-08-14).
 enum Subscription {
@@ -63,12 +63,12 @@ impl Clone for Subscription {
 
 /// Fan-out table mapping window names to per-rule channels.
 ///
-/// The router (producer) broadcasts each parsed `Arc<Vec<Arc<Event>>>` to every
-/// channel registered for the window it was appended to; rule tasks (consumers)
-/// receive those `Arc`s and advance their state machines without taking the
-/// window read lock. Registration happens at rule-task spawn time; closed
-/// channels (from a drained/cancelled rule) are pruned lazily on the next
-/// broadcast.
+/// The window actor (producer) broadcasts each parsed `Arc<Vec<Arc<Event>>>`
+/// to every channel registered for the window it was appended to; rule tasks
+/// (consumers) receive those `Arc`s and advance their state machines without
+/// taking the window log lock. Registration happens at rule-task spawn time;
+/// closed channels (from a drained/cancelled rule) are pruned lazily on the
+/// next broadcast.
 #[derive(Default)]
 pub struct RuleFanout {
     table: RwLock<HashMap<String, Vec<Subscription>>>,
@@ -148,9 +148,18 @@ impl RuleFanout {
     ///
     /// Unsharded subscriptions receive the whole batch; sharded subscriptions
     /// partition it by match key. Bounded channels: a full channel blocks the
-    /// producer (`.await` on send) — backpressure instead of unbounded buffering,
-    /// so a slow rule consumer stalls the ingest rather than growing RSS.
-    /// Closed channels are pruned lazily here.
+    /// producer (`.await` on send) — backpressure instead of unbounded
+    /// buffering, so a slow rule consumer stalls the ingest rather than
+    /// growing RSS. Closed channels are pruned lazily here.
+    ///
+    /// Slow-consumer semantics: each rule's *compute* is independent (own
+    /// channel, shared `Arc` batches — a fast rule is not slowed by a slow
+    /// one), but two things are gated by the slowest subscriber: (a) the
+    /// window's eviction floor (`WindowProgress::min_acked`, so retained
+    /// memory waits for the slowest rule) and (b) this broadcast loop itself —
+    /// sends are awaited sequentially in registration order, so a full channel
+    /// head-of-line blocks the sends to later subscriptions (and with them the
+    /// window actor's appends) until it drains.
     pub async fn broadcast(&self, window_name: &str, events: &Arc<Vec<Arc<Event>>>, seq: u64) {
         let subs: Vec<Subscription> = {
             let table = self.table.read().expect("fanout lock poisoned");

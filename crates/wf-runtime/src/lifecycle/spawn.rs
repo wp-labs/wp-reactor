@@ -18,7 +18,7 @@ use wf_engine::window::{
 
 /// Bounded capacity of each rule push channel (a channel carries whole batches
 /// of parsed events, `Arc<Vec<Arc<Event>>>`). A full channel blocks the
-/// commit worker's broadcast — backpressure — instead of buffering unboundedly
+/// window actor's broadcast — backpressure — instead of buffering unboundedly
 /// (50M sustained inject grew RSS to ~13GB with unbounded channels).
 pub(crate) const RULE_CHANNEL_CAPACITY: usize = 32;
 use wf_lang::ast::FieldRef;

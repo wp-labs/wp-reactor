@@ -1,8 +1,11 @@
 //! Window actor: the single writer per window (subscription model).
 //!
 //! Each window owns one actor task that is the **only** writer of its data
-//! plane; readers (rule pull / join / snapshot / metrics sampling) access the
-//! `Arc<Window>` concurrently and lock-free (SkipMap + atomics). Upstream
+//! plane; readers (`events_since`/`snapshot`, join-index setup, metrics
+//! sampling) take the window's log **read lock** just long enough to clone
+//! `Arc` handles out — and in the production push wiring no reader touches
+//! the log on the hot path at all (rules receive broadcasts through their
+//! channels). Upstream
 //! producers (parse workers) hand batches to the actor over a bounded channel
 //! with an explicit byte budget, so backpressure is structural instead of
 //! relying on a write lock's implicit serialization (the LF regression root
@@ -106,7 +109,8 @@ pub async fn acquire_window_budget(
 /// sender drops — embedded/test mode).
 ///
 /// The actor is the only caller of append-path methods on `win`; all other
-/// access is concurrent lock-free reading. On cancellation it commits
+/// access is concurrent reading under the log read lock (see [`Window`]'s
+/// concurrency contract). On cancellation it commits
 /// whatever is already queued (bounded, non-blocking drain) so a graceful
 /// shutdown does not lose the queued tail, then stops.
 pub async fn run_window_actor(

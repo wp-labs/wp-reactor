@@ -52,8 +52,8 @@ struct Subscription {
 /// (incremental reload, L2) via [`try_add_window`] while reader tasks
 /// (router/rule/evictor) hold the `Arc<Router>` that owns this registry.
 /// The registry maps keep `std::sync::RwLock` (cold — registration and reload
-/// only); the windows themselves are internally synchronized and lock-free on
-/// the data path (see [`Window`]).
+/// only); the windows themselves are internally synchronized (single writer
+/// via the window actor, `RwLock`-guarded batch log — see [`Window`]).
 #[derive(::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub struct WindowRegistry {

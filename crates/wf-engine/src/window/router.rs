@@ -291,8 +291,9 @@ impl Router {
                 .get_window(&window_name)
                 .expect("subscription references non-existent window");
             // Parse the batch to events with no window synchronization at all:
-            // `materialize_fields` is immutable after construction, and the
-            // window's data plane is lock-free (nothing to wait on here).
+            // `materialize_fields` is immutable after construction, and
+            // parsing never touches the window's log lock (readers only clone
+            // `Arc` handles under it).
             let materialize = win.materialize_fields.clone();
             let events = Arc::new(
                 match materialize.as_deref() {
