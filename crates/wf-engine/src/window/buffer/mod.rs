@@ -8,7 +8,7 @@ mod tests;
 
 pub use types::{AppendOutcome, WindowParams};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -21,7 +21,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use crossbeam_skiplist::SkipMap;
 use orion_error::conversion::ToStructError;
 use smol_str::SmolStr;
 use wf_config::WindowConfig;
@@ -74,11 +73,27 @@ impl JoinIndex {
 /// A time-ordered buffer of Arrow RecordBatches with eviction support.
 ///
 /// Batches are appended by sequence number and evicted from the front, either
-/// by time expiry or memory pressure. The whole data plane is **lock-free**:
-/// the ordered log is a `crossbeam_skiplist::SkipMap<u64, TimedBatch>`
-/// (lock-free insert / ordered iteration / front removal) and every counter
-/// (watermark, bytes, rows, seq) is an atomic. Append, cursor reads, snapshots
-/// and eviction never block each other.
+/// by time expiry or memory pressure. The ordered log is a
+/// `RwLock<BTreeMap<u64, TimedBatch>>`:
+///
+/// * **Writers** (the window actor's append path, the periodic evictor, and
+///   the inline commit path used by file sources / tests) take the write
+///   lock. Removal from a `BTreeMap` drops the `TimedBatch` — and its Arrow
+///   batch plus pre-parsed events — **eagerly**, unlike the lock-free
+///   `crossbeam-skiplist` log this replaced, whose `remove` only unlinked
+///   the node and deferred the value's destructor into crossbeam-epoch
+///   garbage bags (a quiet system never advanced the epoch, so ~6M evicted
+///   events stayed resident — the 2026-08-16 RSS regression).
+/// * **Readers** (cursor-based `events_since`/`read_since`, `snapshot`,
+///   join-index setup) take the read lock and clone `Arc` handles out; the
+///   lock is held only for the clone, never for downstream processing.
+/// * In the production wiring (push-mode rules) no reader touches the log on
+///   the hot path at all — the window actor broadcasts parsed events through
+///   rule channels — so the write lock is effectively uncontended.
+///
+/// Lock ordering: a path may hold the log lock and then take `join_index`;
+/// the reverse order never occurs (`set_join_key` releases the log lock
+/// before indexing into `join_index`).
 ///
 /// The optional join index (only present on windows configured as join
 /// targets via [`Self::set_join_key`]) is a hash map that needs interior
@@ -93,10 +108,10 @@ pub struct Window {
     pub(super) time_col_index: Option<usize>,
     pub(super) over: Duration,
     pub(super) config: WindowConfig,
-    /// Lock-free ordered append log: batch sequence number → batch. Insert
-    /// (append), ordered iteration (cursor reads / snapshots) and front
-    /// removal (eviction) are all lock-free.
-    log: SkipMap<u64, TimedBatch>,
+    /// Time-ordered append log: batch sequence number → batch. Guarded by an
+    /// `RwLock` — see the struct docs for the concurrency contract. Removal
+    /// drops the value eagerly (no deferred reclamation).
+    log: RwLock<BTreeMap<u64, TimedBatch>>,
     /// Next sequence number to assign to an appended batch.
     next_seq: AtomicU64,
     /// Monotonic event-time watermark (`fetch_max` on append).
@@ -130,7 +145,7 @@ impl Window {
             time_col_index: params.time_col_index,
             over: params.over,
             config,
-            log: SkipMap::new(),
+            log: RwLock::new(BTreeMap::new()),
             next_seq: AtomicU64::new(0),
             watermark_nanos: AtomicI64::new(i64::MIN),
             current_bytes: AtomicUsize::new(0),
@@ -151,9 +166,17 @@ impl Window {
             key_field,
             by_key: crate::match_engine::EngineHashMap::default(),
         };
-        for entry in self.log.iter() {
-            let events = entry.value().events(self.materialize_fields.as_deref());
-            index.index_batch(&events);
+        // Read the log under its read lock; the guard is released before the
+        // join-index write lock is taken (lock ordering: log → join_index,
+        // never the reverse).
+        let existing: Vec<Arc<Vec<Arc<Event>>>> = {
+            let log = self.log.read().expect("window log lock poisoned");
+            log.values()
+                .map(|tb| tb.events(self.materialize_fields.as_deref()))
+                .collect()
+        };
+        for events in &existing {
+            index.index_batch(events);
         }
         self.join_enabled.store(true, Ordering::Release);
         *self.join_index.write().expect("join index lock poisoned") = Some(index);
@@ -274,18 +297,6 @@ impl Window {
             // Ignore the error: a freshly-created OnceLock is always empty.
             let _ = parsed_lock.set(events);
         }
-        self.log.insert(
-            seq,
-            TimedBatch {
-                batch,
-                event_time_range,
-                ingested_at: Instant::now(),
-                row_count,
-                byte_size,
-                seq,
-                parsed_events: parsed_lock,
-            },
-        );
 
         self.current_bytes.fetch_add(byte_size, Ordering::Relaxed);
         self.total_rows.fetch_add(row_count, Ordering::Relaxed);
@@ -295,43 +306,54 @@ impl Window {
         let max_bytes = self.config.max_window_bytes.as_bytes();
         let mut evicted_bytes = 0usize;
         let mut evicted_rows = 0usize;
-        while self.current_bytes.load(Ordering::Relaxed) > max_bytes {
-            let Some(front) = self.log.front() else {
-                break;
-            };
-            let key = *front.key();
-            drop(front);
-            // `remove` is keyed, so a concurrent evictor racing us on the same
-            // front batch simply loses this iteration and we retry.
-            let Some(evicted_entry) = self.log.remove(&key) else {
-                continue;
-            };
-            // The node is already unlinked; read the accounting fields through
-            // the returned entry before dropping it.
-            let tb = evicted_entry.value();
-            let byte_size = tb.byte_size;
-            let row_count = tb.row_count;
-            self.remove_batch_from_index(tb);
-            drop(evicted_entry);
-            self.current_bytes.fetch_sub(byte_size, Ordering::Relaxed);
-            self.total_rows.fetch_sub(row_count, Ordering::Relaxed);
-            self.batch_count.fetch_sub(1, Ordering::Relaxed);
-            evicted_bytes += byte_size;
-            evicted_rows += row_count;
-        }
+        {
+            let mut log = self.log.write().expect("window log lock poisoned");
+            log.insert(
+                seq,
+                TimedBatch {
+                    batch,
+                    event_time_range,
+                    ingested_at: Instant::now(),
+                    row_count,
+                    byte_size,
+                    seq,
+                    parsed_events: parsed_lock,
+                },
+            );
+            while self.current_bytes.load(Ordering::Relaxed) > max_bytes {
+                let Some((&key, _)) = log.first_key_value() else {
+                    break;
+                };
+                // `BTreeMap::remove` returns the owned value: dropping it
+                // destroys the Arrow batch and parsed events eagerly — no
+                // deferred (epoch-GC) reclamation to drive.
+                let Some(tb) = log.remove(&key) else {
+                    continue;
+                };
+                let byte_size = tb.byte_size;
+                let row_count = tb.row_count;
+                self.remove_batch_from_index(&tb);
+                drop(tb);
+                self.current_bytes.fetch_sub(byte_size, Ordering::Relaxed);
+                self.total_rows.fetch_sub(row_count, Ordering::Relaxed);
+                self.batch_count.fetch_sub(1, Ordering::Relaxed);
+                evicted_bytes += byte_size;
+                evicted_rows += row_count;
+            }
 
-        // Index the newly appended batch (after eviction, so rows evicted by the
-        // incoming batch aren't kept in the index).
-        if self.join_enabled.load(Ordering::Acquire) {
-            if let Some(entry) = self.log.get(&seq) {
-                let events = entry.value().events(self.materialize_fields.as_deref());
-                if let Some(idx) = self
-                    .join_index
-                    .write()
-                    .expect("join index lock poisoned")
-                    .as_mut()
-                {
-                    idx.index_batch(&events);
+            // Index the newly appended batch (after eviction, so rows evicted
+            // by the incoming batch aren't kept in the index).
+            if self.join_enabled.load(Ordering::Acquire) {
+                if let Some(tb) = log.get(&seq) {
+                    let events = tb.events(self.materialize_fields.as_deref());
+                    if let Some(idx) = self
+                        .join_index
+                        .write()
+                        .expect("join index lock poisoned")
+                        .as_mut()
+                    {
+                        idx.index_batch(&events);
+                    }
                 }
             }
         }
@@ -349,10 +371,6 @@ impl Window {
                 row_count,
                 byte_size,
             );
-            // The unlinked nodes' values (including the parsed events) are
-            // deferred into this thread's crossbeam-epoch bag — drive the
-            // collector so they are destroyed instead of lingering.
-            reclaim_evicted_nodes();
         }
 
         Ok(seq)
@@ -379,7 +397,8 @@ impl Window {
     /// The returned `Vec` remains valid even if the window is subsequently
     /// mutated.
     pub fn snapshot(&self) -> Vec<RecordBatch> {
-        self.log.iter().map(|e| e.value().batch.clone()).collect()
+        let log = self.log.read().expect("window log lock poisoned");
+        log.values().map(|tb| tb.batch.clone()).collect()
     }
 
     pub fn memory_usage(&self) -> usize {
@@ -642,34 +661,4 @@ fn map_heap_bytes(capacity: usize, key_size: usize, value_size: usize) -> usize 
 /// outgrew the inline buffer allocate (payload + NUL).
 fn smol_str_heap_bytes(s: &SmolStr) -> usize {
     if s.is_heap_allocated() { s.len() + 1 } else { 0 }
-}
-
-/// Drive crossbeam-epoch's collector so skiplist nodes unlinked by an eviction
-/// have their `TimedBatch` values destroyed **now**, not whenever some future
-/// unrelated `pin()` happens to advance the epoch.
-///
-/// `SkipMap::remove` only unlinks a node; `Node::finalize` — which drops the
-/// key and the value (the Arrow `RecordBatch` and the pre-parsed
-/// `Arc<Vec<Arc<Event>>>`) — is deferred into the removing thread's
-/// crossbeam-epoch garbage bag. Without this call that memory stays fully
-/// referenced after eviction while the window's byte/row accounting already
-/// shows it gone: in the nexmark q1 10M run ~6M evicted events (~2.3 GiB)
-/// were retained this way while the window gauges read ~270 MiB
-/// (wp-reactor RSS regression, 2026-08-16).
-///
-/// A bag sealed at epoch `E` is only droppable once the global epoch reaches
-/// `E + 2`. Each `flush` seals the calling thread's local bag and attempts one
-/// epoch advance, so the sequence below expires freshly sealed garbage:
-/// flush (seal at `E`, advance to `E + 1`), `repin` (move our own participant
-/// to `E + 1` — a guard still pinned in `E` would itself block the next
-/// advance), flush (advance to `E + 2`, drop the expired bag).
-///
-/// The advance is best-effort: a concurrent participant pinned in an older
-/// epoch defers collection to a later call (the periodic evictor retries every
-/// sweep), so reclamation is bounded-lag, not unconditional, under contention.
-pub(crate) fn reclaim_evicted_nodes() {
-    let mut guard = crossbeam_epoch::pin();
-    guard.flush();
-    guard.repin();
-    guard.flush();
 }

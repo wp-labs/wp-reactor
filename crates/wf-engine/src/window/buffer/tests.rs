@@ -1,5 +1,5 @@
 use crate::match_engine::{JoinKey, Value};
-use crate::window::buffer::{content_bytes, events_bytes, reclaim_evicted_nodes};
+use crate::window::buffer::{content_bytes, events_bytes};
 use crate::window::buffer::Window;
 use crate::window::buffer::types::AppendOutcome;
 use crate::window::buffer::types::WindowParams;
@@ -949,24 +949,22 @@ fn join_index_duplicate_key_keeps_all_rows() {
     );
 }
 
-// -- Deferred-drop regression (SkipMap epoch garbage) ---------------------
+// -- Eager-drop regression (window log reclamation) ------------------------
 //
-// A.1 replaced the `VecDeque<TimedBatch>` window log with a lock-free
-// `SkipMap<u64, TimedBatch>`. Removing a batch from a skip list only unlinks
-// the node; the value's destructor is deferred through crossbeam-epoch's
-// garbage bags and runs only when the global epoch advances twice past the
-// bag's sealing epoch. A window eviction that removed the batch from the log
-// (and from `current_bytes` accounting) can therefore leave the batch —
-// including its pre-parsed `Arc<Vec<Arc<Event>>>` — fully alive in the
-// allocator. In the nexmark q1 run this retained ~6M evicted events
-// (~2.3 GiB): window gauges looked healthy while the heap grew linearly
-// (wp-reactor RSS regression, 2026-08-16; attributed via MallocStackLogging
-// + malloc_history: 8.96M live `HashMap<SmolStr, Value>` tables and
-// `Arc<Event>` boxes allocated in `Router::route_parse`).
+// History: A.1 replaced the `VecDeque<TimedBatch>` window log with a lock-free
+// `SkipMap<u64, TimedBatch>`, whose `remove` only unlinks the node and defers
+// the value's destructor into crossbeam-epoch garbage bags. A quiet system
+// never advanced the epoch, so evicted batches — including their pre-parsed
+// `Arc<Vec<Arc<Event>>>` — stayed resident while window gauges read healthy
+// (the 2026-08-16 RSS regression: ~6M evicted events / ~2.3 GiB retained).
+//
+// The log is now a `RwLock<BTreeMap<u64, TimedBatch>>`: removal returns the
+// owned value and dropping it destroys the batch eagerly, with no collector
+// to drive.
 //
 // The contract under test: once a batch has been evicted (gone from
-// `batch_count`/`total_rows`), the engine must not keep its parsed events
-// referenced beyond the eviction call.
+// `batch_count`/`total_rows`), the engine holds no reference to its parsed
+// events the moment the eviction call returns.
 
 fn parsed_events(n: usize) -> Arc<Vec<Arc<crate::match_engine::Event>>> {
     Arc::new(
@@ -980,27 +978,15 @@ fn parsed_events(n: usize) -> Arc<Vec<Arc<crate::match_engine::Event>>> {
     )
 }
 
-/// Wait (bounded) until the given events `Arc` is only referenced by the test.
-///
-/// Collection is bounded-lag under concurrency: a participant pinned in an
-/// older epoch defers the epoch advance, so the assertion spins the collector
-/// for a while instead of demanding a single synchronous call to succeed.
-/// Without the eviction-path fix this never converges (the deferral bags are
-/// only flushed by `reclaim_evicted_nodes`, not by the normal pin cadence).
+/// Eviction drops the batch synchronously: by the time the eviction call
+/// returns, the given events `Arc` must be referenced by the test alone.
+/// No spins, no collector — a strict immediate assertion.
 fn assert_events_released(events: &Arc<Vec<Arc<crate::match_engine::Event>>>) {
-    for _ in 0..500 {
-        if Arc::strong_count(events) == 1 {
-            return;
-        }
-        reclaim_evicted_nodes();
-        std::thread::yield_now();
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
     assert_eq!(
         Arc::strong_count(events),
         1,
-        "evicted batch's parsed events must be dropped with the eviction, \
-         not retained in deferred (epoch-GC) skiplist nodes"
+        "evicted batch's parsed events must be dropped by the eviction call \
+         itself, not retained (deferred reclamation regression)"
     );
 }
 

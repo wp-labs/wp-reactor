@@ -270,7 +270,7 @@ async fn commit_append(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::window::{WindowDef, WindowParams};
+    use crate::window::WindowParams;
     use arrow::array::{Int64Array, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
     use std::time::Duration;
