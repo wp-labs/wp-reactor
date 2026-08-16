@@ -437,15 +437,29 @@ fn make_pipeline_stage_task() -> (
     mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<Router>,
 ) {
+    make_pipeline_stage_task_opts(true)
+}
+
+/// `include_target_window: false` builds the stage task without the pipe
+/// target window (and an empty pipe registry), exercising the
+/// `PipeState::Uninit -> Dead` degradation path.
+fn make_pipeline_stage_task_opts(
+    include_target_window: bool,
+) -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
+    Arc<Router>,
+) {
     let src_schema = test_schema();
     let internal = internal_schema();
     let source_name = "auth_events";
     let target_name = "__wf_pipe_pipe_s1_w1";
-    let registry = WindowRegistry::build(vec![
-        make_window_def(source_name, &src_schema, &["syslog"], Some(1)),
-        make_window_def(target_name, &internal, &[target_name], Some(0)),
-    ])
-    .unwrap();
+    let mut window_defs =
+        vec![make_window_def(source_name, &src_schema, &["syslog"], Some(1))];
+    if include_target_window {
+        window_defs.push(make_window_def(target_name, &internal, &[target_name], Some(0)));
+    }
+    let registry = WindowRegistry::build(window_defs).unwrap();
     let router = Arc::new(Router::new(registry));
 
     let source_window = router.registry().get_window(source_name).unwrap();
@@ -2941,10 +2955,139 @@ async fn pure_relay_broadcasts_to_sharded_downstream() {
     let a: Vec<_> = std::iter::from_fn(|| shard_a_rx.try_recv().ok()).collect();
     let b: Vec<_> = std::iter::from_fn(|| shard_b_rx.try_recv().ok()).collect();
     let (full, empty) = if a.len() > b.len() { (a, b) } else { (b, a) };
-    assert_eq!(full.len(), 2, "same-key events must land on the same shard");
+    // Rule-side channelization: rows of one input batch relay as a single
+    // pushed batch (all same-key events together, in emit order).
+    assert!(
+        full.len() == 1 && full[0].events.len() == 2,
+        "same-key events must land together on the same shard (one batched push), got {} pushes",
+        full.len()
+    );
     assert!(empty.is_empty(), "the other shard must stay empty for the same key");
+    // Pure relay carries the no-window sentinel seq (there is no window
+    // batch behind these events; consumers saturating-ack it).
+    assert_eq!(full[0].seq, u64::MAX, "relay pushes carry seq = u64::MAX");
     assert_eq!(
         full[0].events[0].fields.get("sip"),
         Some(&wf_engine::match_engine::Value::Str("10.0.0.8".into()))
+    );
+    assert_eq!(
+        full[0].events[1].fields.get("sip"),
+        Some(&wf_engine::match_engine::Value::Str("10.0.0.8".into()))
+    );
+
+    // Flush boundary: rows of a SECOND input batch relay as their own push
+    // (per-input-batch flush), in order, on the same shard.
+    let batch2 = make_batch(&schema, &["10.0.0.8"], ts + 1_000_000);
+    source.append(batch2).unwrap();
+    task.pull_and_advance().await;
+    // Re-drain both shards; the new row must appear as one extra push.
+    let a2: Vec<_> = std::iter::from_fn(|| shard_a_rx.try_recv().ok()).collect();
+    let b2: Vec<_> = std::iter::from_fn(|| shard_b_rx.try_recv().ok()).collect();
+    assert_eq!(
+        a2.len() + b2.len(),
+        1,
+        "second input batch relays as exactly one more push"
+    );
+    let (second, _) = if !a2.is_empty() { (&a2[0], ()) } else { (&b2[0], ()) };
+    assert_eq!(
+        second.events[0].fields.get("sip"),
+        Some(&wf_engine::match_engine::Value::Str("10.0.0.8".into()))
+    );
+}
+
+/// An input batch that produces no intermediate rows must not broadcast:
+/// flushing an empty stager is a no-op on the pipe channel.
+#[tokio::test]
+async fn pipe_relay_empty_input_batch_sends_nothing() {
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, _alert_rx, router) = make_pipeline_stage_task();
+    let (down_tx, mut down_rx) = mpsc::channel::<wf_engine::window::RulePush>(8);
+    router.fanout().register("__wf_pipe_pipe_s1_w1", down_tx);
+
+    let source = router.registry().get_window("auth_events").unwrap();
+    let ts = 1_700_000_000_123_000_000i64;
+    source.append(make_batch(&schema, &[], ts)).unwrap();
+    task.pull_and_advance().await;
+
+    assert!(
+        down_rx.try_recv().is_err(),
+        "empty flush must not broadcast anything"
+    );
+}
+
+/// A pipe target with no window and no pipe-registry entry degrades to
+/// `PipeState::Dead`: rows are dropped with a warning, the task keeps
+/// running (no panic, no hang), and nothing reaches sink or pipe channel.
+#[tokio::test]
+async fn pipe_missing_target_degrades_to_dead_without_panic() {
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, mut alert_rx, router) = make_pipeline_stage_task_opts(false);
+    let (down_tx, mut down_rx) = mpsc::channel::<wf_engine::window::RulePush>(8);
+    router.fanout().register("__wf_pipe_pipe_s1_w1", down_tx);
+
+    let source = router.registry().get_window("auth_events").unwrap();
+    let ts = 1_700_000_000_123_000_000i64;
+    source
+        .append(make_batch(&schema, &["10.0.0.8", "10.0.0.9"], ts))
+        .unwrap();
+    // Uninit -> resolve fails -> Dead; must complete instead of hanging.
+    task.pull_and_advance().await;
+    assert!(down_rx.try_recv().is_err(), "dead pipe must not broadcast");
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "intermediate emit must not fall through to the sink"
+    );
+
+    // Second batch exercises the Dead fast path (silent drop).
+    source
+        .append(make_batch(&schema, &["10.0.0.8"], ts + 1_000_000))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(down_rx.try_recv().is_err());
+}
+
+/// Backpressure: while the downstream subscriber channel is full, the
+/// end-of-batch pipe flush blocks the rule task; once a slot frees up the
+/// pending flush completes and delivers its batch in order.
+#[tokio::test]
+async fn pipe_flush_backpressures_until_downstream_drains() {
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, _alert_rx, router) = make_pipeline_stage_task();
+    let (down_tx, mut down_rx) = mpsc::channel::<wf_engine::window::RulePush>(1);
+    router.fanout().register("__wf_pipe_pipe_s1_w1", down_tx);
+
+    let source = router.registry().get_window("auth_events").unwrap();
+    let ts = 1_700_000_000_123_000_000i64;
+    // Batch 1: one staged flush fills (and stays in) the single-slot channel.
+    source
+        .append(make_batch(&schema, &["10.0.0.8", "10.0.0.8"], ts))
+        .unwrap();
+    task.pull_and_advance().await;
+
+    // Batch 2: flush blocks on the full channel (backpressure on emit).
+    source
+        .append(make_batch(&schema, &["10.0.0.9"], ts + 1_000_000))
+        .unwrap();
+    let mut pending = std::pin::pin!(task.pull_and_advance());
+    let blocked =
+        tokio::time::timeout(std::time::Duration::from_millis(150), &mut pending).await;
+    assert!(
+        blocked.is_err(),
+        "pipe flush must block while the subscriber channel is full"
+    );
+
+    // Drain the first push; the blocked flush must then complete and
+    // deliver batch 2 in order.
+    let first = down_rx.recv().await.expect("first push");
+    assert_eq!(first.events.len(), 2);
+    pending.await;
+    let second = down_rx.recv().await.expect("second push after backpressure");
+    assert_eq!(second.events.len(), 1);
+    assert_eq!(
+        second.events[0].fields.get("sip"),
+        Some(&wf_engine::match_engine::Value::Str("10.0.0.9".into()))
     );
 }

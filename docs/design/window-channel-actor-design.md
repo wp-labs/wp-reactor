@@ -240,20 +240,35 @@ v2 将其整体取消：
 **内存总量对照**（q1 三窗口）：原锁版隐性 in-flight（锁队列深度不可控，
 实测膨胀 ~8GB）→ 显式上界 3 × 64MiB = 192MiB。
 
-### 4.4 中间窗口（pipe）
+### 4.4 中间窗口（pipe）——rule 侧通道化（A.2 as-built）
 
-现状：多个 rule task 直接调 `append_intermediate`（RwLock 写互斥）。
+现状（C2 基线）：rule 对 pipe 的 emit 走逐行路径——每行
+`build_pipeline_batch`（单行 RecordBatch）+ `batch_to_events` +
+一次 fanout channel send（每行一次 await）。
 
-改法：pipe 窗口同样起 actor；`Router::append_intermediate` 变为
-parse 后投递 `WindowMsg::Intermediate`。
+改法（as-built，已实现）：**pipe 不起窗口 actor、不落窗口存储**，
+保持纯中继语义；emit 侧改为列批暂存 + 单广播：
 
-- **顺序语义**：per-emitter FIFO（tokio mpsc 保序），跨 emitter 交错
-  ——与现状锁下的交错语义一致，不减弱；
-- **`AppendOutcome` 返回值**：改为 fire-and-forget，late 计数由 actor
-  写 metrics（label=窗口名）。调用方（emit_window_record）目前只用它
-  做遥测，不参与控制流，语义无损；
-- emit 侧的 pipe 通道同样受 `window_buffer_bytes` 约束（规则 emit
-  反压窗口，窗口反压规则，链路闭合）。
+- `PipeState{Uninit/Staging/Dead}`（std::Mutex，emit 保持 `&self`；
+  形状解析失败 → warn + Dead，与旧路径失败语义一致）；
+- `PipeBatchStager`：per schema 字段的类型化列缓冲
+  （Int64/Float64/Bool/Utf8/Timestamp/Null），coercion 矩阵与
+  `value_to_single_row_array` 完全一致（含 `PIPE_EVENT_TIME_FIELD`、
+  time_col 回退、optional 字段缺省 null）；
+- flush 挂点与 sink alert 批交付同界：`process_batch` 末尾、
+  `scan_timeouts` 末尾、`flush()` 末尾——交付延迟上界不变；
+- flush = 一个 N 行 RecordBatch + 一次 `batch_to_events` + 一次
+  `fanout.broadcast(target, events, seq=u64::MAX)`（纯中继语义，
+  消费侧 `saturating_add` ack 不回退游标）；sharded 订阅下
+  `broadcast_sharded` 按 key 分区、每 shard 单次整批 send；
+- 背压：broadcast await 满 shard 通道（RULE_CHANNEL_CAPACITY=32），
+  规则 emit 反压进既有通道容量语义；
+- 锁纪律：stager 的 Mutex 只覆盖同步暂存/取批，broadcast await
+  在锁外——锁内无 await，无跨任务死锁面。
+
+原"pipe 窗口起 actor + `WindowMsg::Intermediate`"方案搁置：pipe 数据
+无窗口驻留需求（无 join/agg 读、无驱逐语义），actor 化只增加一跳
+与一份存储；如 Phase B 需要 pipe 侧聚合再评估。
 
 ### 4.5 驱逐与 ack floor
 
@@ -328,7 +343,7 @@ pull 路径收缩为 bootstrap 补拉。收益是归属更纯净，代价是内�
 
 ## 7. 迁移步骤（增量提交）
 
-### A.1 actor 化 + parse 直发（核心，单提交）
+### A.1 actor 化 + parse 直发（✅ 已完成，commit 46b99bb）
 
 - 新增 `WindowActor` + `WindowMsg` + 窗口通道/字节预算 + per-source
   seq/reorder；
@@ -339,13 +354,29 @@ pull 路径收缩为 bootstrap 补拉。收益是归属更纯净，代价是内�
   （先关 parse，窗口通道 drain 完毕后 actor 自然退出——复用
   graceful-shutdown.md 的 join 框架）。
 
-**预期：RSS 回到 ~3GB，EPS ≥4M（全局漏斗消失，可能更高）。**
+**结果：q1 30M 6 轮交错 A/B 打平 C2 基线（3.641M vs 3.643M EPS，
+-0.06%），RSS ~2.3GB，alerts 27.6M 一致，cursor_gap=0。**
 
-### A.2 驱逐入 actor（单提交）
+### A.2 rule 侧通道化（pipe 列批暂存）（实现完成，集成验证进行中）
 
-- 删独立 evictor 任务，ticker 分支接管；evict_interval 语义不变。
+- §4.4 as-built：`PipeBatchStager` 列暂存 + 每输入批一次 broadcast；
+- 局部正确性：workspace 全量 **1244 测试全绿**（`pure_relay` 用例
+  更新为"单 push 含多事件"批语义断言 + 第二批 flush 边界断言）；
+- 集成验证（提交门槛，均未过）：
+  - q1p（管道压测查询，`models/queries/q1p.wfl`）在新二进制上
+    确定性停滞——已定位停滞点在 rule 侧**上游**（rx_rows 冻结
+    2,714,786 / routed=0 / 零 P-DIAG，process_batch 从未被调用），
+    根因待查，见 §8 Q4；
+  - q1 单轮回归（确认无回退）；
+- 提交前移除 P-DIAG 诊断面包屑（rule_task.rs 三处 wf_warn）。
 
-### A.3 观测补强（单提交，可并入 A.1）
+### A.3 驱逐入 actor（未排期）
+
+- 现状仍为独立 evictor 任务（`wf-runtime/src/evictor_task.rs`）；
+  正确性已由消费感知驱逐 + ack floor（2563b8a）保证，此项仅为
+  归属纯净化，非阻塞项。
+
+### A.4 观测补强（未排期，原 A.3）
 
 - 新 gauge：窗口通道深度/字节水位、actor reorder pending 深度、
   actor 循环延迟（p50/p99）；
@@ -370,16 +401,24 @@ aborted=0 限速口径）。
 | Q1 | rule 通道（32 批）是否也改字节有界？ | 暂不改：RulePush 是 Arc，实际内存由窗口 ack floor 钉住，双计无益。8MiB 帧下如需再评估 |
 | Q2 | `append_intermediate` 返回值改 fire-and-forget 可接受？ | 调用方仅遥测用途，建议接受 |
 | Q3 | Phase B（join 归属 rule）是否排期 | 暂不排期，本设计 Phase A 已达成目标 |
+| Q4 | **q1p 确定性停滞（已定位并修复，2026-08-16）**：A.1 窗口字节预算的 **acquire 侧两处死锁**，与 A.2 pipe 改动无关（q1p 只是首个触发者：bid 单窗批 117MB > 64MiB 预算）。① 超预算批 chunk 式分批获取 → dispatcher 自持部分许可等剩余，actor 等永不出现的消息（首份大消息无 earlier releases）；② 修复①引入钳制后并发 dispatcher 交错瓜分预算（哲学家就餐）；③ reorder pending 持预算许可停车，而持缺口 seq 的 dispatcher 正卡在 acquire 等该预算。修复：acquire 一次原子获取 min(bytes, capacity)（超限批独占整个预算直至 actor 消费），消息进 pending 前释放许可（pending 字节由 parse 侧在途预算天然有界）。回归测试 3 个：oversized_batch_acquisition_clamps_to_capacity / concurrent_oversized_acquisitions_do_not_interleave / parked_out_of_order_message_releases_budget | 已解决：q1p 865K→1.32M EPS(+53%)、RSS -24%；q1 无回退 |
 
 ---
 
 ## 9. 验证计划
 
-1. **单元/集成**：现有 1237 测试全绿；新增：
+1. **单元/集成**：workspace 全量 **1244 测试全绿**（A.1+A.2 当前
+   工作区实测）；新增：
    - actor per-source reorder 测试（乱序投递 → 按序落账；双 source 独立游标）；
    - 窗口预算背压测试（占满预算 → send 挂起 → append 释放）；
    - 无死锁验证：缺口期持续投递后续批次（pending 吸收、通道不堵死）；
-   - pipe 多写者 FIFO 测试、shutdown drain 测试。
+   - pipe 多写者 FIFO 测试、shutdown drain 测试；
+   - A.2 补充：pipe 列批单广播语义（单 push 含多事件、第二批
+     flush 边界）——已落（`pure_relay_broadcasts_to_sharded_downstream`）。
+2b. **A.2 集成门槛（提交前）**：
+   - q1p 30M A/B：新二进制显著快于 C2 基线 865K EPS，且无停滞
+     （已通过，见 §8 Q4）；
+   - q1 30M 单轮：与 A.1 基线（3.64M EPS）无回退。
 2. **A/B 口径**：q1 30M 8MiB 帧（bench 默认）不限速，3 对交错，
    `/tmp/wfusion.c2` vs 新二进制。**验收：EPS ≥ 4.0M 且
    RSS_peak ≤ 4GB，emitted/cursor_gap/aborted 与 C2 持平。**

@@ -213,7 +213,9 @@ impl Router {
                         .find(|(name, _)| *name == window.window_name)
                         .map(|(_, s)| *s)
                         .unwrap_or(seq);
-                    let permits = acquire_window_budget(&mailbox.budget, byte_size).await;
+                    let permits =
+                        acquire_window_budget(&mailbox.budget, mailbox.budget_bytes, byte_size)
+                            .await;
                     let msg = WindowMsg::Append {
                         source: Arc::clone(&source),
                         seq: wseq,
@@ -222,7 +224,8 @@ impl Router {
                         byte_size,
                         permits,
                     };
-                    if mailbox.tx.send(msg).await.is_err() {
+                    let send_result = mailbox.tx.send(msg).await;
+                    if send_result.is_err() {
                         // Actor gone (shutdown). Dropping the message releases
                         // its budget permits; remaining windows are skipped.
                         break;
@@ -859,6 +862,7 @@ mod tests {
                 WindowMailbox {
                     tx,
                     budget: Arc::new(Semaphore::new(1024)),
+                    budget_bytes: 1024,
                 },
             );
         }

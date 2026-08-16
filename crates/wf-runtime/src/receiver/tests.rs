@@ -1438,6 +1438,7 @@ async fn actor_mode_interleaved_streams_append_without_deadlock() {
             WindowMailbox {
                 tx,
                 budget: Arc::new(tokio::sync::Semaphore::new(4 * 1024 * 1024)),
+                budget_bytes: 4 * 1024 * 1024,
             },
         );
         let name: Arc<str> = Arc::from(name);

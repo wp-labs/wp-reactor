@@ -163,6 +163,7 @@ pub(super) fn spawn_window_actors(
             WindowMailbox {
                 tx,
                 budget: Arc::new(tokio::sync::Semaphore::new(buffer_bytes)),
+                budget_bytes: buffer_bytes as usize,
             },
         );
         let name: Arc<str> = Arc::from(name.as_str());

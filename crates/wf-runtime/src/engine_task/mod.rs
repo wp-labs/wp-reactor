@@ -74,7 +74,9 @@ async fn run_push_loop(
             }
             push = rx.recv() => {
                 match push {
-                    Some(push) => task.process_push(push).await,
+                    Some(push) => {
+                        task.process_push(push).await;
+                    }
                     // All producers dropped (channel closed): drain + flush.
                     None => {
                         task.drain_push_channel(&mut rx).await;

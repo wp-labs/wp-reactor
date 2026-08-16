@@ -184,11 +184,20 @@ pub(super) struct RuleTask {
     /// append runs on this thread by design — see [`Self::emit`].
     /// `Mutex` so emit can stay `&self` while RuleTask stays `Sync`.
     pending_alerts: std::sync::Mutex<PendingAlertColumns>,
+    /// Intermediate (pipe) relay staging (rule-side channelization): rows
+    /// emitted to an intermediate target accumulate in typed column buffers
+    /// and are flushed once per input batch — one N-row `RecordBatch`, one
+    /// `batch_to_events`, one fanout broadcast — instead of a single-row
+    /// Arrow batch + channel send per row. Same relay semantics as the old
+    /// per-row `emit_window_record` (pure relay, no window store, seq
+    /// `u64::MAX`). `Mutex` so emit can stay `&self`.
+    pipe_state: std::sync::Mutex<PipeState>,
     /// On-each rules emitting to a plain sink target use the direct-write
     /// column path (plan C2): the executor appends straight into the
     /// columnar builder with no per-record `OutputRecord`. Intermediate
-    /// pipe targets keep the record path (`build_pipeline_batch` needs the
-    /// full row). Constant for the task's lifetime — decided once here.
+    /// pipe targets keep the record path for evaluation but stage the rows
+    /// columnar-ly for batched relay ([`Self::flush_pipes`]). Constant for
+    /// the task's lifetime — decided once here.
     each_direct: bool,
 }
 
@@ -298,6 +307,7 @@ impl RuleTask {
             emit_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
             serialize_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
             pending_alerts: std::sync::Mutex::new(PendingAlertColumns::default()),
+            pipe_state: std::sync::Mutex::new(PipeState::Uninit),
             each_direct,
         };
         (task, cancel, timeout_scan_interval)
@@ -865,6 +875,8 @@ impl RuleTask {
         // Deliver any accumulated alert batch (bounds delivery latency to one
         // event batch and flushes test expectations without an explicit EOS).
         self.flush_alerts().await;
+        // Same latency bound for staged intermediate (pipe) rows.
+        self.flush_pipes().await;
     }
 
     /// Log the cumulative advance/scan/emit profiler accumulators once per
@@ -1044,6 +1056,8 @@ impl RuleTask {
             metrics.observe_rule_scan_timeout(&rule_name, started.elapsed());
             metrics.set_rule_instances(&rule_name, instances);
         }
+        // Timeout closes may have staged intermediate rows — deliver them.
+        self.flush_pipes().await;
     }
 
     /// Close all active instances (shutdown flush) and emit alerts.
@@ -1149,13 +1163,17 @@ impl RuleTask {
         }
         // Drain the batched alert delivery after close emissions.
         self.flush_alerts().await;
+        // Drain staged intermediate rows after close emissions (each rules
+        // early-return above — their rows are covered by the per-batch
+        // flush in `process_batch`).
+        self.flush_pipes().await;
     }
 
     // -- Alert emission -----------------------------------------------------
 
     async fn emit(&self, record: OutputRecord) {
         if self.intermediate_targets.contains(&*record.yield_target) {
-            self.emit_window_record(record).await;
+            self.stage_pipe_record(record);
             return;
         }
         if let Some(metrics) = &self.metrics {
@@ -1408,74 +1426,101 @@ impl RuleTask {
             .fetch_add(_fan_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
-    async fn emit_window_record(&self, record: OutputRecord) {
-        // Pipe design (P1b): intermediate targets are pipes. Prefer the pipe
-        // registry's schema (decouples the relay from the window); fall back to
-        // the window for legacy/tests where the pipe isn't registered.
-        let (schema, time_col_index) = match self.pipe_registry.get(&record.yield_target) {
-            // Pipe registered with a real schema (normal boot) → use it.
-            Some(pipe) if !pipe.schema.fields().is_empty() => {
-                (pipe.schema, pipe.time_col_index)
-            }
-            // Pipe absent or built without schemas (e.g. the reload path builds
-            // the registry with no window schemas) → fall back to the window,
-            // which is always populated with the correct schema + time column.
-            _ => {
-                let Some(win_lock) = self.router.registry().get_window(&record.yield_target) else {
+    /// Stage an intermediate-target row into the columnar pipe buffer
+    /// (rule-side channelization). [`Self::flush_pipes`] turns the staged
+    /// rows into one batch + one fanout broadcast at the end of the input
+    /// batch — the relay semantics of the old per-row `emit_window_record`
+    /// (pure relay, no window store, seq `u64::MAX`) with the per-row Arrow
+    /// assembly and channel sends amortized away.
+    fn stage_pipe_record(&self, record: OutputRecord) {
+        let mut guard = self.pipe_state.lock().unwrap();
+        match &mut *guard {
+            PipeState::Dead => {}
+            PipeState::Staging(stager) => {
+                if let Err(e) = stager.push_record(&record) {
                     wf_warn!(
                         pipe,
                         task_id = %self.task_id,
                         rule = %record.rule_name,
                         target = %record.yield_target,
                         output_kind = "intermediate",
-                        reason = "missing_internal_window",
-                        "missing internal pipeline window"
+                        error = %e,
+                        "stage internal pipeline row failed"
                     );
-                    return;
-                };
-                (win_lock.schema().clone(), win_lock.time_col_index())
+                }
             }
-        };
-        let batch = match build_pipeline_batch(
-            schema,
-            time_col_index,
-            record.event_time_nanos,
-            &record_window_fields(&record),
-        ) {
-            Ok(batch) => batch,
-            Err(e) => {
-                wf_warn!(
-                    pipe,
-                    task_id = %self.task_id,
-                    rule = %record.rule_name,
-                    target = %record.yield_target,
-                    output_kind = "intermediate",
-                    error = %e,
-                    "build internal pipeline row failed"
-                );
-                return;
+            PipeState::Uninit => {
+                // Resolve the pipe shape once, lazily (pipe registry schema
+                // first, window fallback — same resolution order and failure
+                // semantics as the old per-row path).
+                let target = Arc::clone(&record.yield_target);
+                match resolve_pipe_shape(&self.pipe_registry, &self.router, &target) {
+                    Some((schema, time_col_index)) => {
+                        let mut stager =
+                            PipeBatchStager::new(target, schema, time_col_index);
+                        if let Err(e) = stager.push_record(&record) {
+                            wf_warn!(
+                                pipe,
+                                task_id = %self.task_id,
+                                rule = %record.rule_name,
+                                output_kind = "intermediate",
+                                error = %e,
+                                "stage internal pipeline row failed"
+                            );
+                        }
+                        *guard = PipeState::Staging(stager);
+                    }
+                    None => {
+                        wf_warn!(
+                            pipe,
+                            task_id = %self.task_id,
+                            rule = %record.rule_name,
+                            target = %target,
+                            output_kind = "intermediate",
+                            reason = "missing_internal_window",
+                            "missing internal pipeline window"
+                        );
+                        *guard = PipeState::Dead;
+                    }
+                }
             }
-        };
+        }
+    }
 
-        // Pure relay (pipe design, P1c): parse the pipeline row to events and
-        // broadcast them to the intermediate pipe's downstream-rule subscribers
-        // WITHOUT storing them in a window. The downstream rule's CepStateMachine
-        // retains its own per-key match state (watermark from event timestamps),
-        // so the window buffer / watermark / lateness is redundant on the push
-        // path.
-        let events: Arc<Vec<Arc<Event>>> = Arc::new(
-            wf_engine::match_engine::batch_to_events(&batch)
-                .into_iter()
-                .map(Arc::new)
-                .collect(),
-        );
-        // Pure-relay batches are never stored in a window, so there is no
-        // window batch seq to ack — pass `u64::MAX` (consumers ack past
-        // everything; the relay target window holds no batches anyway).
-        self.router
-            .fanout()
-            .broadcast(&record.yield_target, &events, u64::MAX)
-            .await;
+    /// Flush staged intermediate rows: build one N-row `RecordBatch`, parse
+    /// it to events once, and hand it to the pipe's downstream-rule
+    /// subscribers with a single broadcast. Called at the end of every
+    /// input batch (and on timeout/flush emissions), so delivery latency is
+    /// bounded exactly like the batched sink-alert delivery.
+    async fn flush_pipes(&self) {
+        let built = {
+            let mut guard = self.pipe_state.lock().unwrap();
+            match &mut *guard {
+                PipeState::Staging(stager) => match stager.take_events() {
+                    Ok(built) => built,
+                    Err(e) => {
+                        wf_warn!(
+                            pipe,
+                            task_id = %self.task_id,
+                            output_kind = "intermediate",
+                            error = %e,
+                            "build internal pipeline batch failed, dropping staged rows"
+                        );
+                        None
+                    }
+                },
+                _ => None,
+            }
+        };
+        if let Some((target, events)) = built {
+            let fan_start = Instant::now();
+            self.router
+                .fanout()
+                .broadcast(&target, &events, u64::MAX)
+                .await;
+            self.fanout_nanos
+                .fetch_add(fan_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1556,6 +1601,210 @@ fn log_output_suppressed(
         reason = "executor_returned_none",
         "rule output suppressed"
     );
+}
+
+/// Columnar staging state for the intermediate-target emit path
+/// (rule-side channelization).
+enum PipeState {
+    /// No intermediate row emitted yet; the pipe shape resolves lazily on
+    /// first use (the pipe registry may still be populating at boot).
+    Uninit,
+    /// Shape resolved; rows accumulate in the column buffers until the next
+    /// [`RuleTask::flush_pipes`].
+    Staging(PipeBatchStager),
+    /// Target window/pipe missing (warned once); rows are dropped — the
+    /// same terminal behavior as the old per-row fallback.
+    Dead,
+}
+
+/// Per-column staging buffer. The variant is chosen once from the pipe
+/// schema; every row appends exactly one value (or null).
+enum PipeCol {
+    Int64(Vec<Option<i64>>),
+    Float64(Vec<Option<f64>>),
+    Bool(Vec<Option<bool>>),
+    Utf8(Vec<Option<String>>),
+    Timestamp(Vec<Option<i64>>),
+    /// Column types outside the supported coercion matrix stage as null —
+    /// same fallback arm as `value_to_single_row_array`.
+    Null { data_type: DataType, len: usize },
+}
+
+/// Resolved shape of an intermediate pipe target: the relay schema and its
+/// time column (pipe registry first, window fallback).
+fn resolve_pipe_shape(
+    pipe_registry: &Arc<wf_engine::pipe::PipeRegistry>,
+    router: &Arc<Router>,
+    target: &Arc<str>,
+) -> Option<(arrow::datatypes::SchemaRef, Option<usize>)> {
+    match pipe_registry.get(target) {
+        // Pipe registered with a real schema (normal boot) → use it.
+        Some(pipe) if !pipe.schema.fields().is_empty() => {
+            Some((pipe.schema, pipe.time_col_index))
+        }
+        // Pipe absent or built without schemas (e.g. the reload path builds
+        // the registry with no window schemas) → fall back to the window,
+        // which is always populated with the correct schema + time column.
+        _ => router
+            .registry()
+            .get_window(target)
+            .map(|win| (win.schema().clone(), win.time_col_index())),
+    }
+}
+
+impl PipeBatchStager {
+    fn new(
+        target: Arc<str>,
+        schema: arrow::datatypes::SchemaRef,
+        time_col_index: Option<usize>,
+    ) -> Self {
+        let cols = schema
+            .fields()
+            .iter()
+            .map(|field| match field.data_type() {
+                DataType::Int64 => PipeCol::Int64(Vec::new()),
+                DataType::Float64 => PipeCol::Float64(Vec::new()),
+                DataType::Boolean => PipeCol::Bool(Vec::new()),
+                DataType::Utf8 => PipeCol::Utf8(Vec::new()),
+                DataType::Timestamp(_, _) => PipeCol::Timestamp(Vec::new()),
+                other => PipeCol::Null {
+                    data_type: other.clone(),
+                    len: 0,
+                },
+            })
+            .collect();
+        Self {
+            target,
+            schema,
+            time_col_index,
+            cols,
+            rows: 0,
+        }
+    }
+
+    /// Stage one emitted row. The coercion matrix mirrors
+    /// `value_to_single_row_array` exactly (including the event-time
+    /// fallbacks for the pipe event-time field and the schema's time
+    /// column), so a flushed batch is byte-identical to concatenating the
+    /// per-row batches the old path produced.
+    fn push_record(&mut self, record: &OutputRecord) -> RuntimeResult<()> {
+        let event_time_nanos = record.event_time_nanos;
+        let fields = record_window_fields(record);
+        for (idx, field) in self.schema.fields().iter().enumerate() {
+            let value = fields
+                .iter()
+                .find(|(name, _)| **name == *field.name())
+                .map(|(_, value)| value);
+            if field.name() == PIPE_EVENT_TIME_FIELD {
+                match &mut self.cols[idx] {
+                    PipeCol::Timestamp(v) => v.push(Some(event_time_nanos)),
+                    PipeCol::Null { len, .. } => *len += 1,
+                    _ => unreachable!("event-time field must be Timestamp"),
+                }
+                continue;
+            }
+            let col = &mut self.cols[idx];
+            match col {
+                PipeCol::Int64(v) => v.push(match value {
+                    Some(wf_engine::match_engine::Value::Number(n)) => Some(*n as i64),
+                    _ => None,
+                }),
+                PipeCol::Float64(v) => v.push(match value {
+                    Some(wf_engine::match_engine::Value::Number(n)) => Some(*n),
+                    _ => None,
+                }),
+                PipeCol::Bool(v) => v.push(match value {
+                    Some(wf_engine::match_engine::Value::Bool(b)) => Some(*b),
+                    _ => None,
+                }),
+                PipeCol::Utf8(v) => {
+                    v.push(match value {
+                        Some(wf_engine::match_engine::Value::Str(s)) => Some(s.to_string()),
+                        Some(wf_engine::match_engine::Value::Number(n)) => {
+                            Some(n.to_string())
+                        }
+                        Some(wf_engine::match_engine::Value::Bool(b)) => {
+                            Some(b.to_string())
+                        }
+                        Some(
+                            value @ (wf_engine::match_engine::Value::Array(_)
+                            | wf_engine::match_engine::Value::Object(_)),
+                        ) => Some(value_to_json_string(value)?),
+                        _ => None,
+                    });
+                }
+                PipeCol::Timestamp(v) => v.push(match value {
+                    Some(wf_engine::match_engine::Value::Number(n)) => {
+                        normalize_epoch_timestamp_float_nanos(*n)
+                    }
+                    // The schema's time column falls back to the row's event
+                    // time when the yield did not provide one.
+                    None if self.time_col_index == Some(idx) => Some(event_time_nanos),
+                    _ => None,
+                }),
+                PipeCol::Null { len, .. } => *len += 1,
+            }
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// Build the staged rows into one batch and parse it to events,
+    /// resetting the buffers. Returns `None` when nothing is staged.
+    fn take_events(&mut self) -> RuntimeResult<Option<(Arc<str>, Arc<Vec<Arc<Event>>>)>> {
+        if self.rows == 0 {
+            return Ok(None);
+        }
+        let arrays: Vec<arrow::array::ArrayRef> = self
+            .cols
+            .iter_mut()
+            .map(|col| match col {
+                PipeCol::Int64(v) => {
+                    Ok(std::sync::Arc::new(arrow::array::Int64Array::from(std::mem::take(v)))
+                        as arrow::array::ArrayRef)
+                }
+                PipeCol::Float64(v) => {
+                    Ok(
+                        std::sync::Arc::new(arrow::array::Float64Array::from(std::mem::take(v)))
+                            as arrow::array::ArrayRef,
+                    )
+                }
+                PipeCol::Bool(v) => Ok(std::sync::Arc::new(arrow::array::BooleanArray::from(
+                    std::mem::take(v),
+                )) as arrow::array::ArrayRef),
+                PipeCol::Utf8(v) => Ok(std::sync::Arc::new(arrow::array::StringArray::from(
+                    std::mem::take(v),
+                )) as arrow::array::ArrayRef),
+                PipeCol::Timestamp(v) => Ok(std::sync::Arc::new(
+                    arrow::array::TimestampNanosecondArray::from(std::mem::take(v)),
+                )
+                    as arrow::array::ArrayRef),
+                PipeCol::Null { data_type, len } => {
+                    let array = new_null_array(data_type, *len);
+                    *len = 0;
+                    Ok(array)
+                }
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        let batch = RecordBatch::try_new(std::sync::Arc::clone(&self.schema), arrays)
+            .source_raw_err(RuntimeReason::Bootstrap, "build internal pipeline batch")?;
+        self.rows = 0;
+        let events: Arc<Vec<Arc<Event>>> = Arc::new(
+            wf_engine::match_engine::batch_to_events(&batch)
+                .into_iter()
+                .map(Arc::new)
+                .collect(),
+        );
+        Ok(Some((Arc::clone(&self.target), events)))
+    }
+}
+
+struct PipeBatchStager {
+    target: Arc<str>,
+    schema: arrow::datatypes::SchemaRef,
+    time_col_index: Option<usize>,
+    cols: Vec<PipeCol>,
+    rows: usize,
 }
 
 pub(super) fn build_pipeline_batch(
@@ -1779,5 +2028,239 @@ mod debug_stats_tests {
 
         assert_eq!(stats.output_emitted, 2);
         assert_eq!(stats.intermediate_emitted, 1);
+    }
+}
+
+#[cfg(test)]
+mod pipe_stager_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use wf_engine::alert::AlertOrigin;
+    use wf_engine::match_engine::{batch_to_events, Value};
+
+    fn record_with(
+        target: &str,
+        event_time_nanos: i64,
+        yield_fields: Vec<(Arc<str>, Value)>,
+    ) -> OutputRecord {
+        OutputRecord {
+            wfx_id: format!("id-{event_time_nanos}"),
+            rule_name: "pipe_s1".into(),
+            score: 1.0,
+            entity_type: "ip".into(),
+            entity_id: "10.0.0.1".to_string(),
+            origin: AlertOrigin::Event,
+            fired_at: "2026-01-01T00:00:00Z".to_string(),
+            emit_time: "2026-01-01T00:00:00Z".into(),
+            matched_rows: Vec::new(),
+            summary: "".into(),
+            yield_target: target.into(),
+            yield_fields,
+            yield_field_types: Vec::new().into(),
+            event_time_nanos,
+            machine_id: String::new(),
+            scope_key: "".into(),
+        }
+    }
+
+    /// Covers every arm of the coercion matrix: the pipe event-time field,
+    /// the time column (with and without an explicit value), all supported
+    /// scalar columns, Utf8 coercions of non-string values, type-mismatch
+    /// rows (-> null), and an unsupported column type (Date32 -> null).
+    fn stager_schema() -> arrow::datatypes::SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(
+                PIPE_EVENT_TIME_FIELD,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+            Field::new("n_i", DataType::Int64, true),
+            Field::new("n_f", DataType::Float64, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("label", DataType::Utf8, true),
+            Field::new("blob", DataType::Utf8, true),
+            Field::new("unsupported", DataType::Date32, true),
+        ]))
+    }
+
+    fn varied_records() -> Vec<OutputRecord> {
+        vec![
+            // All fields present, happy path.
+            record_with(
+                "t",
+                1_000,
+                vec![
+                    ("event_time".into(), Value::Number(1_700_000_000_000_000_000.0)),
+                    ("n_i".into(), Value::Number(7.0)),
+                    ("n_f".into(), Value::Number(1.5)),
+                    ("flag".into(), Value::Bool(true)),
+                    ("label".into(), Value::Str("x".into())),
+                    (
+                        "blob".into(),
+                        Value::Array(vec![Value::Number(1.0), Value::Str("a".into())]),
+                    ),
+                ],
+            ),
+            // Missing scalars -> null; time column absent -> event-time
+            // fallback; Utf8 coercion of Number.
+            record_with(
+                "t",
+                2_000,
+                vec![
+                    ("n_f".into(), Value::Number(2.0)),
+                    ("label".into(), Value::Number(42.0)),
+                ],
+            ),
+            // Type mismatches -> null; Utf8 coercion of Bool.
+            record_with(
+                "t",
+                3_000,
+                vec![
+                    ("n_i".into(), Value::Str("zz".into())),
+                    ("flag".into(), Value::Number(1.0)),
+                    ("label".into(), Value::Bool(true)),
+                ],
+            ),
+        ]
+    }
+
+    /// The flushed column batch must be relay-equivalent to concatenating
+    /// the per-row batches of the old path: same events, same field maps.
+    #[test]
+    fn staged_batch_matches_per_row_relay_batches() {
+        let schema = stager_schema();
+        let records = varied_records();
+        let mut stager = PipeBatchStager::new("t".into(), Arc::clone(&schema), Some(1));
+        for record in &records {
+            stager.push_record(record).expect("stage row");
+        }
+        let (_, staged) = stager.take_events().unwrap().expect("rows staged");
+        assert_eq!(staged.len(), records.len());
+
+        for (idx, record) in records.iter().enumerate() {
+            let old_batch = build_pipeline_batch(
+                Arc::clone(&schema),
+                Some(1),
+                record.event_time_nanos,
+                &record_window_fields(record),
+            )
+            .expect("old-path batch");
+            let old_event = &batch_to_events(&old_batch)[0];
+            assert_eq!(
+                staged[idx].fields, old_event.fields,
+                "row {idx}: staged event must equal the old per-row relay event"
+            );
+        }
+
+        // Focused semantics on top of the parity check: the time column
+        // falls back to the record event time, and an explicit value wins.
+        assert_eq!(
+            staged[1].fields.get("event_time"),
+            Some(&Value::Number(2_000.0)),
+            "missing time-col value must fall back to event_time_nanos"
+        );
+        assert_eq!(
+            staged[2].fields.get("event_time"),
+            Some(&Value::Number(3_000.0)),
+            "row without any time value gets its own event_time_nanos"
+        );
+        // Mismatched scalar types stage as null on both paths; the pipe
+        // event-time field is always the record event time.
+        assert_eq!(
+            staged[2].fields.get("n_i"),
+            old_null_probe(&schema, &records[2], "n_i").as_ref(),
+            "type-mismatch row must stage the same value the old path produced"
+        );
+    }
+
+    /// What the old single-row path produced for one field (null probe).
+    fn old_null_probe(
+        schema: &arrow::datatypes::SchemaRef,
+        record: &OutputRecord,
+        field: &str,
+    ) -> Option<Value> {
+        let batch = build_pipeline_batch(
+            Arc::clone(schema),
+            Some(1),
+            record.event_time_nanos,
+            &record_window_fields(record),
+        )
+        .expect("old-path batch");
+        let event = &batch_to_events(&batch)[0];
+        event.fields.get(field).cloned()
+    }
+
+    /// Flushing empties the buffers: a second flush is a no-op and later
+    /// rows start a fresh batch (per-input-batch flush boundary).
+    #[test]
+    fn stager_take_resets_buffers_between_flushes() {
+        let schema = stager_schema();
+        let mut stager = PipeBatchStager::new("t".into(), schema, Some(1));
+
+        assert!(
+            stager.take_events().unwrap().is_none(),
+            "fresh stager flush is a no-op"
+        );
+
+        stager
+            .push_record(&record_with("t", 5, vec![("label".into(), Value::Str("a".into()))]))
+            .unwrap();
+        stager
+            .push_record(&record_with("t", 6, vec![("label".into(), Value::Str("b".into()))]))
+            .unwrap();
+        let first = stager.take_events().unwrap().expect("rows staged");
+        assert_eq!(first.1.len(), 2);
+
+        assert!(
+            stager.take_events().unwrap().is_none(),
+            "buffers must reset after take"
+        );
+
+        stager
+            .push_record(&record_with("t", 7, vec![("label".into(), Value::Str("c".into()))]))
+            .unwrap();
+        let second = stager.take_events().unwrap().expect("row staged after reset");
+        assert_eq!(second.1.len(), 1);
+        assert_eq!(
+            second.1[0].fields.get("label"),
+            Some(&Value::Str("c".into()))
+        );
+    }
+
+    /// Rows across MANY input batches coalesce only up to the flush point:
+    /// a long run keeps column alignment (no drift, no cross-contamination).
+    #[test]
+    fn stager_column_alignment_holds_over_many_rows() {
+        let schema = stager_schema();
+        let mut stager = PipeBatchStager::new("t".into(), schema, Some(1));
+        let rows = 500usize;
+        for i in 0..rows {
+            stager
+                .push_record(&record_with(
+                    "t",
+                    i as i64,
+                    vec![
+                        ("n_i".into(), Value::Number(i as f64)),
+                        ("label".into(), Value::Str(format!("row-{i}").into())),
+                        ("flag".into(), Value::Bool(i % 2 == 0)),
+                    ],
+                ))
+                .unwrap();
+        }
+        let (_, events) = stager.take_events().unwrap().expect("rows staged");
+        assert_eq!(events.len(), rows);
+        for (i, event) in events.iter().enumerate() {
+            assert_eq!(event.fields.get("n_i"), Some(&Value::Number(i as f64)));
+            assert_eq!(
+                event.fields.get("label"),
+                Some(&Value::Str(format!("row-{i}").into()))
+            );
+            assert_eq!(event.fields.get("flag"), Some(&Value::Bool(i % 2 == 0)));
+        }
     }
 }

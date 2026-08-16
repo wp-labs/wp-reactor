@@ -39,13 +39,6 @@ use crate::match_engine::Event;
 /// primary bound; depth just caps message-count overhead for tiny batches.
 pub const WINDOW_CHANNEL_DEPTH: usize = 16;
 
-/// Largest number of byte-budget permits acquired in one call. Chunking keeps
-/// a single oversized batch from deadlocking a budget smaller than itself
-/// (each chunk is ≤ budget, so acquisition completes once earlier messages
-/// are appended and their permits released) — same argument as the parse
-/// preread budget.
-const WINDOW_BUDGET_CHUNK_BYTES: usize = 8 * 1024 * 1024;
-
 /// A message for a window actor.
 pub enum WindowMsg {
     /// One source batch dispatched directly by a parse worker after
@@ -73,6 +66,10 @@ pub enum WindowMsg {
 pub struct WindowMailbox {
     pub tx: mpsc::Sender<WindowMsg>,
     pub budget: Arc<Semaphore>,
+    /// Total budget capacity in bytes (the semaphore's initial permit count).
+    /// Kept alongside the semaphore so acquisition can clamp oversized
+    /// requests (see [`acquire_window_budget`]).
+    pub budget_bytes: usize,
 }
 
 /// Per-window append outcome reporter: `(window_name, rows, late)`. Wired by
@@ -80,26 +77,29 @@ pub struct WindowMailbox {
 /// (`window_append_total`) is unchanged by the actor path.
 pub type WindowAppendReport = Arc<dyn Fn(&str, usize, bool) + Send + Sync>;
 
-/// Acquire `bytes` permits from a window budget, in chunks (see
-/// [`WINDOW_BUDGET_CHUNK_BYTES`]). Permits are returned as owned handles;
-/// dropping them releases the budget.
+/// Acquire `bytes` permits from a window budget. Requests larger than the
+/// budget capacity are clamped to the full capacity: the resulting message
+/// exclusively owns the window budget until the actor consumes it, which
+/// keeps acquisition terminating (without the clamp, a dispatcher holding
+/// part of the budget while waiting for the rest would wait on the actor,
+/// and the actor on the message that was never sent — a deterministic
+/// deadlock for any batch bigger than the budget). The clamped amount is
+/// acquired in a *single* semaphore call: chunked acquisition let several
+/// concurrent oversized dispatchers each hold a fraction of the budget while
+/// each waited for the rest — the dining-philosophers deadlock again.
+/// Permits are returned as owned handles; dropping them releases the budget.
 pub async fn acquire_window_budget(
     budget: &Arc<Semaphore>,
+    capacity: usize,
     bytes: usize,
 ) -> Vec<OwnedSemaphorePermit> {
-    let mut permits = Vec::new();
-    let mut remaining = bytes.max(1);
-    while remaining > 0 {
-        let chunk = remaining.min(WINDOW_BUDGET_CHUNK_BYTES);
-        match budget.clone().acquire_many_owned(chunk as u32).await {
-            Ok(permit) => permits.push(permit),
-            // Semaphore closed (shutdown): stop waiting; the channel send
-            // will fail and unwind the producer anyway.
-            Err(_) => break,
-        }
-        remaining -= chunk;
+    let target = bytes.max(1).min(capacity.max(1)) as u32;
+    match budget.clone().acquire_many_owned(target).await {
+        Ok(permit) => vec![permit],
+        // Semaphore closed (shutdown): stop waiting; the channel send
+        // will fail and unwind the producer anyway.
+        Err(_) => Vec::new(),
     }
-    permits
 }
 
 /// Run the single-writer actor for one window until cancelled (or every
@@ -144,7 +144,7 @@ pub async fn run_window_actor(
                         log::warn!("window actor {:?}: mailbox closed (all senders dropped), exiting", name);
                         break;
                     }
-                    Some(m) => {
+                    Some(mut m) => {
                         let (source, seq) = match &m {
                             WindowMsg::Append { source, seq, .. } => (Arc::clone(source), *seq),
                         };
@@ -170,6 +170,20 @@ pub async fn run_window_actor(
                                     "window actor {:?}: stale seq {} <= cursor {} (source {:?})",
                                     name, seq, cursor, source
                                 );
+                            }
+                            // Release the parked message's budget permits
+                            // *before* parking: parse workers dispatch
+                            // concurrently, so arrival order is not seq
+                            // order, and the dispatcher holding the missing
+                            // seq may itself be blocked in
+                            // `acquire_window_budget` waiting for this very
+                            // budget — parking with the permits held is a
+                            // deterministic deadlock whenever a batch (or a
+                            // batch sum in flight) exhausts the budget.
+                            // Parked bytes stay bounded by the parse-side
+                            // in-flight budget instead.
+                            if let WindowMsg::Append { permits, .. } = &mut m {
+                                permits.clear();
                             }
                             pending.insert((Arc::clone(&source), seq), m);
                         }
@@ -433,6 +447,123 @@ mod tests {
 
     // -- 4. budget permits are released after append ---------------------------
 
+    /// Regression (q1p stall, 2026-08-16): a dispatch batch larger than the
+    /// whole window budget used to deadlock — the dispatcher held part of
+    /// the budget waiting for the rest, while the actor waited for a message
+    /// that was never sent. The capacity clamp makes acquisition terminate:
+    /// an oversized request is charged at most the full budget.
+    #[tokio::test]
+    async fn oversized_batch_acquisition_clamps_to_capacity() {
+        let capacity = 64usize;
+        let budget = Arc::new(Semaphore::new(capacity));
+
+        // Request far larger than the budget: acquisition must complete on
+        // its own (no actor consumption needed) and hold exactly the full
+        // capacity, leaving zero permits for competing dispatchers until
+        // the message is consumed and the permits dropped.
+        let permits = tokio::time::timeout(
+            Duration::from_millis(500),
+            acquire_window_budget(&budget, capacity, 10 * capacity),
+        )
+        .await
+        .expect("oversized acquisition must not deadlock");
+        let held: usize = permits.iter().map(|p| p.num_permits() as usize).sum();
+        assert_eq!(held, capacity, "charge clamps to the full budget");
+        assert_eq!(budget.available_permits(), 0);
+        drop(permits);
+        assert_eq!(budget.available_permits(), capacity);
+    }
+
+    /// Concurrent oversized dispatchers must not interleave partial
+    /// acquisitions of the budget (the chunked variant let two dispatchers
+    /// each hold a fraction while each waited for the rest — deadlock).
+    /// Each request is served atomically: whole-budget or nothing; a
+    /// burst of acquirers cycling acquire→consume→release must always
+    /// make progress.
+    #[tokio::test]
+    async fn concurrent_oversized_acquisitions_do_not_interleave() {
+        let capacity = 64usize;
+        let budget = Arc::new(Semaphore::new(capacity));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let b = Arc::clone(&budget);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..50 {
+                    let permits = tokio::time::timeout(
+                        Duration::from_millis(2_000),
+                        acquire_window_budget(&b, capacity, 10 * capacity),
+                    )
+                    .await
+                    .expect("oversized acquisition must not deadlock");
+                    for p in permits.iter() {
+                        assert_eq!(p.num_permits() as usize, capacity);
+                    }
+                    drop(permits);
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    /// Regression (q1p stall, 2026-08-16): a message that arrives out of seq
+    /// order used to park in the reorder buffer holding its full-budget
+    /// permits, while the dispatcher holding the missing seq was blocked in
+    /// `acquire_window_budget` waiting for that budget — deadlock. Parking
+    /// must release the permits so the gap-filling dispatcher can proceed.
+    #[tokio::test]
+    async fn parked_out_of_order_message_releases_budget() {
+        let capacity = 4usize;
+        let budget = Arc::new(Semaphore::new(capacity));
+        let win = make_window("w");
+        let (tx, _cancel) = spawn_actor(Arc::clone(&win)).await;
+
+        // seq=1 arrives first and exhausts the whole budget; it must park
+        // and give the permits back without waiting for seq=0.
+        let permits = budget.clone().acquire_many_owned(capacity as u32).await.unwrap();
+        tx.send(WindowMsg::Append {
+            source: Arc::from("s"),
+            seq: 1,
+            batch: make_batch(&test_schema(), 20_000_000_000, 1),
+            events: None,
+            byte_size: capacity,
+            permits: vec![permits],
+        })
+        .await
+        .unwrap();
+
+        // The dispatcher for the missing seq=0 can now acquire the budget
+        // (this is exactly where the deadlock used to bite).
+        let gap_permits = tokio::time::timeout(
+            Duration::from_millis(500),
+            budget.clone().acquire_many_owned(capacity as u32),
+        )
+        .await
+        .expect("parked message must not hold the budget")
+        .unwrap();
+        tx.send(WindowMsg::Append {
+            source: Arc::from("s"),
+            seq: 0,
+            batch: make_batch(&test_schema(), 10_000_000_000, 0),
+            events: None,
+            byte_size: capacity,
+            permits: vec![gap_permits],
+        })
+        .await
+        .unwrap();
+
+        // Both rows land, in seq order (0 before 1).
+        for _ in 0..100 {
+            if win.total_rows() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(appended_values(&win), vec![0, 1]);
+    }
+
     #[tokio::test]
     async fn budget_permits_release_after_append() {
         let budget = Arc::new(Semaphore::new(128));
@@ -442,7 +573,7 @@ mod tests {
         // Acquire, send, and verify the budget drains then refills as the
         // actor finishes each message.
         for seq in 0..4u64 {
-            let permits = acquire_window_budget(&budget, 64).await;
+            let permits = acquire_window_budget(&budget, 128, 64).await;
             assert_eq!(permits.len(), 1);
             tx.send(WindowMsg::Append {
                 source: Arc::from("s"),
