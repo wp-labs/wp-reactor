@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -143,84 +142,69 @@ pub struct OutputRecord {
 impl OutputRecord {
     pub fn to_data_record(&self) -> CoreResult<DataRecord> {
         let mut record = DataRecord::default();
-        let mut exported = HashSet::new();
 
-        append_field(
-            &mut record,
-            &mut exported,
+        // The system fields are distinct compile-time constants and yield
+        // fields are rejected below when they use the reserved `__wfu_`
+        // prefix, so the only duplicate check that can ever fire is
+        // yield-vs-yield — handled with a short linear scan below. (This used
+        // to be a `HashSet<String>` that allocated and SipHashed every field
+        // of every emitted record, which profiled hot at ~3M records/s.)
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
             WFU_ID,
-            DataType::Chars,
             ModelValue::from(self.wfx_id.as_str()),
-        )?;
-        append_field(
-            &mut record,
-            &mut exported,
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
             WFU_RULE_NAME,
-            DataType::Chars,
             ModelValue::from(&*self.rule_name),
-        )?;
-        append_field(
-            &mut record,
-            &mut exported,
-            WFU_SCORE,
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
             DataType::Float,
+            WFU_SCORE,
             ModelValue::from(self.score),
-        )?;
-        append_field(
-            &mut record,
-            &mut exported,
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
             WFU_ENTITY_TYPE,
-            DataType::Chars,
             ModelValue::from(&*self.entity_type),
-        )?;
-        append_field(
-            &mut record,
-            &mut exported,
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
             WFU_ENTITY_ID,
-            DataType::Chars,
             ModelValue::from(self.entity_id.as_str()),
-        )?;
-        append_field(
-            &mut record,
-            &mut exported,
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
             WFU_ORIGIN,
-            DataType::Chars,
             ModelValue::from(self.origin.as_str()),
-        )?;
-        append_field(
-            &mut record,
-            &mut exported,
-            WFU_CLOSE_REASON,
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
             DataType::Chars,
+            WFU_CLOSE_REASON,
             ModelValue::from(
                 self.origin
                     .close_reason()
                     .map_or("", |reason| reason.as_str()),
             ),
-        )?;
-        append_field(
-            &mut record,
-            &mut exported,
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
             WFU_FIRED_AT,
-            DataType::Chars,
             ModelValue::from(self.fired_at.as_str()),
-        )?;
-        append_field(
-            &mut record,
-            &mut exported,
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
+            DataType::Chars,
             WFU_EMIT_TIME,
-            DataType::Chars,
             ModelValue::from(&*self.emit_time),
-        )?;
-        append_field(
-            &mut record,
-            &mut exported,
-            WFU_SUMMARY,
+        )));
+        record.push(FieldStorage::from_owned(Field::new(
             DataType::Chars,
+            WFU_SUMMARY,
             ModelValue::from(&*self.summary),
-        )?;
+        )));
 
-        for (name, value) in &self.yield_fields {
+        for (idx, (name, value)) in self.yield_fields.iter().enumerate() {
             if name.starts_with(WFU_PREFIX) {
                 return CoreReason::DataFormat
                     .to_err()
@@ -229,12 +213,22 @@ impl OutputRecord {
                     ))
                     .err();
             }
+            if self.yield_fields[..idx].iter().any(|(prev, _)| prev == name) {
+                return CoreReason::DataFormat
+                    .to_err()
+                    .with_detail(format!("duplicate exported field {name:?}"))
+                    .err();
+            }
             let field_type = self
                 .yield_field_types
                 .iter()
                 .find_map(|(field_name, field_type)| (field_name == name).then_some(field_type));
             let (meta, model_value) = export_yield_value(value, field_type)?;
-            append_field(&mut record, &mut exported, name, meta, model_value)?;
+            record.push(FieldStorage::from_owned(Field::new(
+                meta,
+                name.as_ref(),
+                model_value,
+            )));
         }
 
         Ok(record)
@@ -254,23 +248,6 @@ pub fn data_record_to_json_string(record: &DataRecord) -> CoreResult<String> {
     }
     serde_json::to_string(&serde_json::Value::Object(obj))
         .source_err(CoreReason::DataFormat, "serialize alert record to json")
-}
-
-fn append_field(
-    record: &mut DataRecord,
-    exported: &mut HashSet<String>,
-    name: &str,
-    meta: DataType,
-    value: ModelValue,
-) -> CoreResult<()> {
-    if !exported.insert(name.to_string()) {
-        return CoreReason::DataFormat
-            .to_err()
-            .with_detail(format!("duplicate exported field {name:?}"))
-            .err();
-    }
-    record.push(FieldStorage::from_owned(Field::new(meta, name, value)));
-    Ok(())
 }
 
 fn export_yield_value(
@@ -738,6 +715,37 @@ mod tests {
     }
 
     #[test]
+    fn to_data_record_rejects_duplicate_yield_fields() {
+        let output = OutputRecord {
+            wfx_id: "id-1".into(),
+            rule_name: "rule-a".into(),
+            score: 1.0,
+            entity_type: "ip".into(),
+            entity_id: "1.1.1.1".into(),
+            origin: AlertOrigin::Event,
+            fired_at: "2026-03-11T00:00:00.000Z".into(),
+            emit_time: "2026-03-11T00:00:01.000Z".into(),
+            matched_rows: vec![],
+            summary: "demo".into(),
+            yield_target: "out".into(),
+            yield_fields: vec![
+                ("count".into(), Value::Number(1.0)),
+                ("other".into(), Value::Number(2.0)),
+                ("count".into(), Value::Number(3.0)),
+            ],
+            yield_field_types: Vec::new().into(),
+            event_time_nanos: 0,
+            machine_id: String::new(),
+            scope_key: "".into(),
+        };
+
+        let err = output
+            .to_data_record()
+            .expect_err("duplicate yield field should fail");
+        assert!(err.to_string().contains("duplicate exported field"));
+    }
+
+    #[test]
     fn parse_time_value_accepts_epoch_milliseconds() {
         let dt = parse_time_value(&Value::Number(1_710_115_200_123.0)).expect("time");
         assert_eq!(
@@ -751,39 +759,17 @@ mod tests {
     #[test]
     fn data_record_json_keeps_non_json_chars_as_strings() {
         let mut record = DataRecord::default();
-        let mut exported = HashSet::new();
-        append_field(
-            &mut record,
-            &mut exported,
-            "text",
-            DataType::Chars,
-            ModelValue::from("{not-json}"),
-        )
-        .unwrap();
-        append_field(
-            &mut record,
-            &mut exported,
-            "json_array_text",
-            DataType::Chars,
-            ModelValue::from("[]"),
-        )
-        .unwrap();
-        append_field(
-            &mut record,
-            &mut exported,
-            "json_object_text",
-            DataType::Chars,
-            ModelValue::from(r#"{"raw":true}"#),
-        )
-        .unwrap();
-        append_field(
-            &mut record,
-            &mut exported,
-            "plain_array_text",
-            DataType::Chars,
-            ModelValue::from("[not-json]"),
-        )
-        .unwrap();
+        let mut push = |record: &mut DataRecord, name: &str, value: &str| {
+            record.push(FieldStorage::from_owned(Field::new(
+                DataType::Chars,
+                name,
+                ModelValue::from(value),
+            )));
+        };
+        push(&mut record, "text", "{not-json}");
+        push(&mut record, "json_array_text", "[]");
+        push(&mut record, "json_object_text", r#"{"raw":true}"#);
+        push(&mut record, "plain_array_text", "[not-json]");
 
         let json = data_record_to_json_string(&record).expect("json");
         let json: serde_json::Value = serde_json::from_str(&json).expect("json value");
