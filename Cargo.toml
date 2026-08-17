@@ -45,6 +45,3 @@ moju-derive = { git = "https://github.com/dayu-sec/moju-derive.git", branch = "m
 # below silently falls back to crates.io 0.15.1 (and pins lru 0.16.x —
 # RUSTSEC-2026-0253). Bump together with ../../wparse/wp-knowledge.
 wp-knowledge = "0.16"
-
-[patch.crates-io]
-wp-knowledge = { path = "../../wparse/wp-knowledge" }
