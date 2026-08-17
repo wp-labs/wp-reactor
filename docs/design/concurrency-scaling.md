@@ -194,6 +194,12 @@ EPS 11.5M,CPU 3 核,RSS 0.75GB。下一个能抬吞吐的杠杆是**减少单实
   window(64MB)的内存 eviction 时序,非键闭包破坏。
 - 注意:`bench.sh` 分片文件缓存 key(`data/shard_${TOTAL}_c${CONNECTIONS}`)
   已加 shard-keys 指纹(2026-08-17)——换 SHARD_KEYS 不再静默复用旧分片文件。
+- **基准参考(q1 100M 稳定口径,2026-08-17 四轮复测)**:默认配置
+  (CONNECTIONS=4 / SHARD_KEYS=bid_events:auction / instances=4 / p=10 r=10 /
+  100k 帧)下 **EPS = 5.93M ± 0.01M**(5.92~5.94M,波动 ±0.2%)、
+  **RSS 峰值 ≈ 4.4GB**、**CPU 均值 ≈ 714~723%(16 核用 ~7.2 核)**、
+  evict 55~62,全部 `appended=100M/100M` + clean。早前 5.57~5.75M 的波动
+  全部来自实验配置(批大小/预算/屏蔽输出),非机器噪声。
 - 待办(引擎级,非基准参数):规则输出列**批量构建**(commit_each_row 逐行
   Arc 分配/格式化,占规则计算 ~57%)与生产侧解码并行——q1 双层墙的突破点。
 
