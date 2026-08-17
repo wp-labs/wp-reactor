@@ -94,10 +94,12 @@ EPS 11.5M,CPU 3 核,RSS 0.75GB。下一个能抬吞吐的杠杆是**减少单实
 
 ### 3.1 入流侧(P0,零代码可用)
 
-- **C-UCP**:上游每流一个连接,并发 16~32+(实测未饱和,上限在 acceptor
-  `max_connections=1000`)。
-- **W-RDP**:`instances = 8~16`(wp-core-connectors 已有参数,1..=16,连接 round-robin
-  分发,零引擎代码)。生产配置示例:
+- **C-UCP**:连接数 4 即甜点(2026-08-17 实测 100m q1:单连接 4.50M →
+  c2 5.56M → **c4 5.91M** → c16 5.93M,4 之后纯开销)。上限在 acceptor
+  `max_connections=1000`。
+- **W-RDP**:`instances = 4` 即够(实测 q1@16 连接 i=4=4.95M ≈ i=16=4.98M,
+  实例数不是瓶颈;连接 round-robin 分发,每实例多连接无并行度损失)。
+  生产配置示例:
 
   ```toml
   # topology/sources/ingress.toml
@@ -106,7 +108,7 @@ EPS 11.5M,CPU 3 核,RSS 0.75GB。下一个能抬吞吐的杠杆是**减少单实
   port = "9800"
   framing = "len"
   data_format = "arrow_framed"
-  instances = 16        # 配套:上游并发连接 ≥16
+  instances = 4        # W-RDP=4 即够(实测 4/8/16 无差异);上游并发连接 4
   ```
 
 - **基准注入工具(`wfgen`,三层流水线)**:
@@ -116,12 +118,17 @@ EPS 11.5M,CPU 3 核,RSS 0.75GB。下一个能抬吞吐的杠杆是**减少单实
      保持分片帧大小 ≈ 原始帧(实测:小帧分片 376KB → q1 掉到 5.2M,攒批后 7.7MB);
   3. `send-arrow --connections=N`(无状态,纯 copy)或 `--shard-files f0,f1,...`
      (生成时已分片,纯 copy 多连接,零解码)。
-  实测(q1 100M 16 连接):纯 copy = **18.2~19.8M**(单连接 4.7M 的 ~4×);
-  q2(stateful)16 分片文件注入 emitted 与单连接**逐位一致**(74698 == 74698);
+  实测(q1 100M):**4 分片 5.91M ≈ 16 分片 5.93M > 单连接 4.5M**(+31%);
+  q2(stateful)分片文件注入 emitted 与单连接**逐位一致**(74698 == 74698);
   发送时动态 `--shard-keys`(decode 分桶)有 ~6% 丢数缺陷,不推荐——
   **生成时分片(`shard-frames`)+ `--shard-files` 是正确形态**;
-  `bench.sh` 一键:`CONNECTIONS=16 SHARD_KEYS="bid_events:auction" ./bench.sh all cont 100m`
-  (自动 shard-frames + 分片文件缓存复用)。
+  `bench.sh` 一键:`./bench.sh all cont 100m`(默认 CONNECTIONS=4 +
+  SHARD_KEYS="bid_events:auction" 即 4 分片,自动 shard-frames + 缓存复用;
+  纯 copy 天花板:`SHARD_KEYS="" CONNECTIONS=16 ./bench.sh q1 cont 100m`)。
+
+  **基准口径注意**:30m 小总量下固定开销(~2s 发送器启动/append 滞后/轮询
+  粒度)会稀释 EPS,且 c2/c4 因每条连接数据量小被稀释更狠(30m 下曾出现
+  "拆 4=3.85M < 单连接 4.25M" 的假象)——**稳态吞吐统一用 100m 口径**。
 
   **实测修正(2026-08-17,含一次推翻)**:
 
@@ -146,7 +153,9 @@ EPS 11.5M,CPU 3 核,RSS 0.75GB。下一个能抬吞吐的杠杆是**减少单实
     1.24×——窗口 append 才是真正瓶颈,连接数不能线性扩展吞吐**。
     C-UCP 的 "19.8M 天花板" 结论修正为:重复注入+低内存条件下的乐观数字,
     真实唯一负载稳态 ~5.8M。差距 ~3× 的最可能机制是窗口积累后的 append
-    路径变重(内存/evict),待 profiling 证实。
+    路径变重(内存/evict),待 profiling 证实。**CPU 侧佐证:4 连接 100m q1
+    cpu_avg 仅 710~728%(16 核),远未饱和——瓶颈在共享窗口 append 路径的
+    等待/锁,不是算力。**
   - **均衡键的正确性已验证(规则零改动)**:30m 单连接对照,q2=224,289 /
     q3=1,800,000 / q4=27,600,000 / q7=10,350,961 / q9=1,800,000 全部**逐位
     一致**,q5 差 235 条(0.014%,count>=10 边界对 state eviction 敏感)。
