@@ -7,7 +7,7 @@ use arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use wf_engine::window::{ParsedRoute, Router};
+use wf_engine::window::{ParsedRoute, Router, content_bytes};
 
 use crate::metrics::RuntimeMetrics;
 
@@ -70,20 +70,33 @@ const COMMIT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Default byte budget for in-flight decoded batches across the
 /// source → parse → commit chain (see [`spawn_parse_pool_with_preread`]).
+/// Mirrors the runtime default (128 MiB ≈ 18 slots).
 #[cfg(test)]
-pub(crate) const DEFAULT_PARSE_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const DEFAULT_PARSE_BUFFER_BYTES: usize = 128 * 1024 * 1024;
 /// Floor for the configured byte budget — smaller values would starve the
 /// pipeline's pipelining depth for even modest batch sizes.
 const MIN_PARSE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 /// Byte budget shared by every source task pushing into the parse pool.
 ///
-/// Each in-flight decoded batch holds permits equal to its arrow memory size
+/// Each in-flight decoded batch holds permits equal to its **content size**
+/// ([`content_bytes`] — the actual data bytes, excluding Arrow buffer padding)
 /// from the moment the source pushes it until the commit worker finishes
 /// committing it, so total pipeline residency (parse channel + parse workers +
 /// commit channel) is bounded in **bytes** regardless of batch/frame size —
 /// the item-count channel caps alone scale with frame size and let a flat-out
 /// client park multiple GiB in the channels with big frames.
+///
+/// Charging *content* (≈ wire) bytes rather than [`RecordBatch::get_array_memory_size`]
+/// aligns this budget with the window mailbox accounting and with the original
+/// pre-read design intent: `get_array_memory_size` on an IPC-decoded batch
+/// structurally over-counts the real footprint (~10× measured on bid-like
+/// streams, independent of field width — IPC reader buffer-view sharing), so
+/// decoded-size accounting starves the pipeline to only a handful of slots for
+/// ordinary frame sizes (2026-08-17 §2.3 wall ①). NB the budget then bounds
+/// *content* bytes in flight — the decoded in-flight footprint is the budget ×
+/// the IPC decode inflation (~10× measured), so RSS under a downstream stall
+/// can approach ~10× the configured value.
 ///
 /// Carries the budget **capacity** alongside the semaphore so acquisition can
 /// clamp oversized requests to the full capacity (see [`acquire_preread`]).
@@ -168,9 +181,10 @@ pub(crate) struct ParseItem {
     /// Allocated here — the last point where the source's frames are still
     /// strictly ordered — so parallel parse workers cannot permute them.
     pub window_seqs: Vec<(String, u64)>,
-    /// Arrow memory size of `batch`, charged against the preread budget.
-    /// Budget permits held while this batch is in flight; released when the
-    /// commit worker finishes (or the item is dropped on shutdown).
+    /// Content bytes of `batch` ([`content_bytes`]), charged against the
+    /// preread budget. Budget permits held while this batch is in flight;
+    /// released when the commit worker finishes (or the item is dropped on
+    /// shutdown).
     pub permits: Vec<OwnedSemaphorePermit>,
 }
 
@@ -239,8 +253,13 @@ pub(crate) async fn push_decoded_batch(
     }
     // Charge the decoded batch against the byte budget *before* entering the
     // pipeline; permits travel with the item and are released after commit.
-    let mem_bytes = batch.get_array_memory_size();
-    let permits = acquire_preread(preread, mem_bytes).await;
+    // The charge is the batch's *content* size (≈ wire bytes), not
+    // `get_array_memory_size`: the latter structurally over-counts IPC-decoded
+    // batches (~10× measured, independent of field width), starving the
+    // pipeline to a handful of slots (2026-08-17 §2.3 wall ①). Aligned with
+    // the window mailbox accounting.
+    let content = content_bytes(&batch);
+    let permits = acquire_preread(preread, content).await;
     let item = build_parse_item(
         parse_seq,
         source_name,

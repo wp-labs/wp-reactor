@@ -1600,6 +1600,82 @@ async fn preread_budget_concurrent_oversized_acquires_terminate() {
     drop((b, budget));
 }
 
+/// P0-② regression: the preread budget must charge a batch's **content** bytes
+/// (≈ wire size), not `get_array_memory_size`. Arrow IPC decode inflates the
+/// latter with a structural over-count — measured 2026-08-17: a bid-like batch
+/// of 71 B/row content accounts as ~718 B/row decoded regardless of field
+/// width (~10×, buffer-view sharing in the IPC reader) — so decoded-size
+/// accounting starved the pipeline to a handful of slots (concurrency-scaling
+/// §2.3 wall ①) even though the real in-flight footprint is wire-sized.
+/// A batch whose inflated size exceeds the whole (16 MiB-floored) budget but
+/// whose content fits must be admitted when exactly its content is free.
+#[tokio::test]
+async fn preread_budget_charges_content_bytes_not_decoded_inflation() {
+    use crate::lifecycle::parse_pool::acquire_preread;
+    use wf_engine::window::content_bytes;
+
+    let n = 100_000usize;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("bidder", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+        Field::new("channel", DataType::Utf8, false),
+        Field::new("url", DataType::Utf8, false),
+        Field::new("dateTime", DataType::Int64, false),
+        Field::new("extra", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![42i64; n])),
+            Arc::new(Int64Array::from(vec![1i64; n])),
+            Arc::new(Int64Array::from(vec![7i64; n])),
+            Arc::new(StringArray::from(vec![Some("mobile"); n])),
+            Arc::new(StringArray::from(vec![Some("http://example.com/1"); n])),
+            Arc::new(Int64Array::from(vec![1_700_000_000_000i64; n])),
+            Arc::new(StringArray::from(vec![Some("x"); n])),
+        ],
+    )
+    .unwrap();
+    // Round-trip through the same Arrow IPC path producers use — decoding is
+    // what inflates the allocation accounting.
+    let decoded = wp_arrow::ipc::decode_ipc(&wp_arrow::ipc::encode_ipc("events", &batch).unwrap())
+        .unwrap()
+        .batch;
+
+    let content = content_bytes(&decoded);
+    let inflated = decoded.get_array_memory_size();
+    let capacity = 16 * 1024 * 1024; // budget floor
+    assert!(
+        content < capacity && inflated > capacity,
+        "test premise: content ({content}) must fit the floor while the inflated \
+         accounting ({inflated}) must not — content={content}, inflated={inflated}"
+    );
+
+    let router = make_router("events");
+    let mut group = TaskGroup::new("test_charge_content");
+    let (tx, preread) = spawn_parse_pool_with_preread(&router, None, 1, &mut group, 1);
+    assert_eq!(preread.available_permits(), capacity);
+
+    // Leave exactly `content` permits free: a content-charged push fits, an
+    // inflated-charged push would block on the (capacity-clamped) acquire.
+    let held = acquire_preread(&preread, capacity - content).await;
+    assert_eq!(preread.available_permits(), content);
+
+    let seq = Arc::new(AtomicU64::new(0));
+    let mut push = std::pin::pin!(push_decoded_batch(
+        &tx, &preread, &seq, "src", "events", decoded, &router, None, None,
+    ));
+    tokio::select! {
+        result = &mut push => assert!(result, "content-charged push must be admitted"),
+        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!(
+            "push blocked: budget charged the decoded allocation ({inflated}) instead of content ({content})"
+        ),
+    }
+    drop(held);
+    drop(group);
+}
+
 #[tokio::test]
 async fn file_ndjson_replay_fails_when_parse_pool_closed() {
     let router = make_router("events");

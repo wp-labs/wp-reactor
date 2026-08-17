@@ -188,8 +188,12 @@ pub(crate) async fn replay_arrow_ipc_file(
                 format!("read arrow ipc batch from {}", path_for_read.display()),
             )?;
             total_rows += batch.num_rows();
-            let mem_bytes = batch.get_array_memory_size();
-            let permits = acquire_preread_blocking(&preread, mem_bytes);
+            // Content bytes (≈ wire), not decoded arrow allocations: the
+            // latter structurally over-counts IPC-decoded batches (~10×),
+            // starving the preread budget to a few slots (see
+            // `push_decoded_batch`).
+            let content = wf_engine::window::content_bytes(&batch);
+            let permits = acquire_preread_blocking(&preread, content);
             let item = build_parse_item(
                 &parse_seq,
                 &source_for_read,

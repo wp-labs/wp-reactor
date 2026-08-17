@@ -318,7 +318,7 @@ mod tests {
                 rule_parallelism: 1,
                 rule_exec_timeout: "30s".parse().unwrap(),
                 max_ingest_rate: None,
-                parse_buffer_bytes: 256 * 1024 * 1024,
+                parse_buffer_bytes: 128 * 1024 * 1024,
                 window_buffer_bytes: 64 * 1024 * 1024,
                 schemas: "schemas/*.wfs".into(),
                 rules: "rules/*.wfl".into(),

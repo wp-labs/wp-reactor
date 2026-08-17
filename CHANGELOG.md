@@ -2,6 +2,22 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [1.0.2] — 2026-08-17
+
+### Changed
+
+- **wf-runtime / wf-config**: The preread parse budget (`parse_buffer_bytes`) now charges a batch's **content** bytes — `wf_engine::window::content_bytes`, ≈ wire size, Arrow buffer padding excluded — instead of `get_array_memory_size`. Arrow IPC decode structurally over-counts the latter ~10× (measured 2026-08-17: a bid-like batch of 71 B/row wire content accounts as ~718 B/row, independent of field width — IPC reader buffer-view sharing), which starved the source → parse → commit pipeline to a handful of slots (the first wall) even though the real in-flight footprint is wire-sized. Charging content aligns the budget with the window mailbox accounting (`content_bytes + events_bytes`). Applies to `push_decoded_batch` and the Arrow IPC file-replay path. NB the budget now bounds *content* bytes in flight — decoded RSS under a downstream stall can approach ~10× the configured value.
+- **wf-config**: Default `parse_buffer_bytes` lowered 256 MiB → 128 MiB (≈ 18 slots for 8 MiB frames). Under content accounting, 256 MiB (~36 slots) lifts q1 100M EPS to 6.25–6.66M but raises RSS to 12–14.5 GB (from 4.4 GB under the old decoded-accounting default), while 128 MiB lands at 6.13M / 5.88 GB — a small throughput gain at a modest RSS step-up, short of the plateau. Raise explicitly for more throughput (256 MiB ≈ 6.3–6.7M / 12–14 GB, 512 MiB ≈ 7.0M, 1–2 GiB ≈ 7.5M+; 4 GiB over-deepens and regresses).
+
+### Fixed
+
+- **wf-runtime**: The preread budget charged decoded Arrow allocation size rather than content bytes, structurally under-admitting batches by ~10× and collapsing the default budget to ~2 slots (P0-② first wall). A batch whose inflated accounting exceeds the whole (floored) budget but whose content fits is now admitted when exactly its content is free (regression: `preread_budget_charges_content_bytes_not_decoded_inflation`).
+
+### Documentation
+
+- **Design**: Reworked `docs/design/concurrency-scaling.md` around the stable double-wall model — P0-② resolves the first wall (decoded-size accounting) and recasts the budget as a pipeline-depth throttle (1–2 GiB content sweet spot; 4 GiB over-deepens window reorder and regresses to ~5.9M); corrected the decode-inflation coefficient (40× → ~15× for 100k frames: ~7.7 MB wire → ~116 MB decoded; ~10× per-batch accounting over-count); reclassified the pure-copy 18.2M probe as sustained-rate but non-steady-state; settled C-UCP=4 / W-RDP=4 with 100m resource curves and the 30m accounting trap; recorded the q1 100M stable baseline (EPS 5.93M ± 0.01M / RSS 4.4 GB / CPU 714–723%); showed balanced sharding is orthogonal to EPS (overturning the s0-straggler hypothesis); merged P0-① into P0-② in the priority table.
+- **Design**: Added the P0-② experiment record to `docs/design/preread-budget-design.md` §6 (content-accounting budget curves: 256 MiB → 6.25–6.66M, 512 MiB → 7.02M, 1 GiB → 7.56M, 2 GiB → 7.58M q1 / 7.23M q2 (RSS 7.6 GB, half the old 14.8 GB), 4 GiB → 5.9M overshoot) and the 256 → 128 MiB default decision.
+
 ## [1.0.1] — 2026-08-17
 
 ### Fixed

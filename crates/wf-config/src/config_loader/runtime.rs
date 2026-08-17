@@ -27,11 +27,24 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub max_ingest_rate: Option<usize>,
     /// Byte budget for decoded batches in flight across the source → parse →
-    /// commit chain. A batch holds permits equal to its arrow memory size from
-    /// source push until commit completes, so pipeline residency is bounded in
-    /// bytes regardless of frame size (item-count channel caps alone would let
-    /// big frames park multiple GiB in the channels). Defaults to 256 MiB;
-    /// values below 16 MiB are clamped up.
+    /// commit chain. A batch holds permits equal to its **content** byte size
+    /// (the actual data bytes — ≈ wire size, Arrow buffer padding excluded),
+    /// from source push until commit completes, so pipeline residency is
+    /// bounded in bytes regardless of frame size (item-count channel caps
+    /// alone would let big frames park multiple GiB in the channels). Charging
+    /// content rather than `get_array_memory_size` matches the window mailbox
+    /// accounting and keeps ordinary frames at many slots (decoded-size
+    /// accounting structurally over-counts IPC-decoded batches ~10× — see
+    /// concurrency-scaling.md §2.3 wall ①). Defaults to 128 MiB (≈ 18 slots
+    /// for 8 MiB frames): measured q1 100M 6.13M / RSS 5.9GB vs pre-P0-②
+    /// default 5.93M / 4.4GB — a small throughput gain at a modest RSS
+    /// step-up, short of the 12-14GB plateau that 256 MiB (36 slots) hits
+    /// (concurrency-scaling.md §3.1 默认值决策). Values below 16 MiB are
+    /// clamped up. NB the budget bounds *content* bytes in flight: the
+    /// decoded in-flight footprint is the budget × the IPC decode inflation
+    /// (~10× measured), so RSS under a downstream stall can approach ~10×
+    /// this value. Raise for throughput (512 MiB ≈ 7.0M, 1–2 GiB ≈ 7.5M+;
+    /// 4 GiB overshoots — see preread-budget-design.md §6).
     #[serde(default = "default_parse_buffer_bytes")]
     pub parse_buffer_bytes: usize,
     /// Byte budget per window actor channel (subscription model): a batch
@@ -53,7 +66,7 @@ fn default_parse_parallelism() -> usize {
 }
 
 fn default_parse_buffer_bytes() -> usize {
-    256 * 1024 * 1024
+    128 * 1024 * 1024
 }
 
 fn default_window_buffer_bytes() -> usize {
