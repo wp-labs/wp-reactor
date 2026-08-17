@@ -10,4 +10,11 @@ ignore = [
     # apply to wp-knowledge's Redis usage (not MySQL). Re-evaluate when a
     # patched `rsa` release is published.
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0253: lru — potential use-after-free due to lack of panic
+    # safety in `LruCache::pop()` (informational = "unsound", not a reachable
+    # vulnerability). wp-knowledge 0.16.0 (crates.io) pins lru ^0.16; the panic
+    # requires a key comparison / Drop panic during `pop()`, which wp-knowledge's
+    # cache usage does not trigger. Re-evaluate when a fixed lru (0.18.x) is
+    # permitted by the wp-knowledge dependency range.
+    "RUSTSEC-2026-0253",
 ]
