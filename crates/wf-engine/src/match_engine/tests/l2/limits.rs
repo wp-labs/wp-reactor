@@ -838,3 +838,163 @@ fn shared_max_instances_released_on_close_all() {
     assert_eq!(closes.len(), 2);
     assert_eq!(shared.instance_count(), 0);
 }
+
+#[test]
+fn shared_slot_released_when_memory_throttle_rejects_new_key() {
+    // N1 regression: with BOTH max_instances and max_memory_bytes configured,
+    // admission's CAS reservation must be released when the memory check
+    // throttles the new key. Before the fix each throttled key leaked one
+    // shared slot until the whole budget was burnt (all shards then rejected
+    // every new key).
+    // Instance ≈ 240 bytes: limit 500 admits 2 instances; a 3rd key sees
+    // 480 + 240 = 720 >= 500 and is throttled by the memory check.
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(2.0))])],
+    );
+    let limits = LimitsPlan {
+        max_memory_bytes: Some(500),
+        max_instances: Some(10),
+        max_throttle: None,
+        on_exceed: ExceedAction::Throttle,
+    };
+    let shared = SharedLimits::new();
+    let mut sm = CepStateMachine::with_limits_shared(
+        "rule_n1".to_string(),
+        plan,
+        None,
+        Some(limits),
+        std::sync::Arc::clone(&shared),
+    );
+
+    assert_eq!(
+        sm.advance("fail", &event(vec![("sip", str_val("10.0.0.1"))])),
+        StepResult::Accumulate
+    );
+    assert_eq!(
+        sm.advance("fail", &event(vec![("sip", str_val("10.0.0.2"))])),
+        StepResult::Accumulate
+    );
+    assert_eq!(shared.instance_count(), 2);
+
+    // 8 distinct new keys: each passes the (generous) instance admission —
+    // reserving a shared slot — then hits the memory Throttle and returns.
+    // All 8 reservations must be released: without the fix the shared count
+    // would climb to 2 + 8 = 10 and burn the entire instance budget.
+    for i in 3..11 {
+        let e = event(vec![("sip", str_val(&format!("10.0.0.{}", i)))]);
+        assert_eq!(sm.advance("fail", &e), StepResult::Accumulate);
+    }
+    assert_eq!(sm.instance_count(), 2);
+    assert_eq!(
+        shared.instance_count(),
+        2,
+        "throttled new keys must not leak shared instance slots"
+    );
+
+    // Budget intact: after closing both instances a new key fits again.
+    let closes = sm.close_all(CloseReason::Flush);
+    assert_eq!(closes.len(), 2);
+    assert_eq!(shared.instance_count(), 0);
+    assert_eq!(
+        sm.advance("fail", &event(vec![("sip", str_val("10.0.0.9"))])),
+        StepResult::Accumulate
+    );
+    assert_eq!(shared.instance_count(), 1);
+}
+
+#[test]
+fn shared_slot_released_when_memory_fail_rule_rejects_new_key() {
+    // N1 regression, FailRule variant: the memory check's FailRule arm must
+    // also release the un-consumed admission reservation before latching.
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(2.0))])],
+    );
+    let limits = LimitsPlan {
+        max_memory_bytes: Some(500),
+        max_instances: Some(10),
+        max_throttle: None,
+        on_exceed: ExceedAction::FailRule,
+    };
+    let shared = SharedLimits::new();
+    let mut sm = CepStateMachine::with_limits_shared(
+        "rule_n1f".to_string(),
+        plan,
+        None,
+        Some(limits),
+        std::sync::Arc::clone(&shared),
+    );
+
+    assert_eq!(
+        sm.advance("fail", &event(vec![("sip", str_val("10.0.0.1"))])),
+        StepResult::Accumulate
+    );
+    assert_eq!(
+        sm.advance("fail", &event(vec![("sip", str_val("10.0.0.2"))])),
+        StepResult::Accumulate
+    );
+    assert_eq!(shared.instance_count(), 2);
+
+    // Third key trips the memory FailRule: latch set AND slot released.
+    assert_eq!(
+        sm.advance("fail", &event(vec![("sip", str_val("10.0.0.3"))])),
+        StepResult::Accumulate
+    );
+    assert!(shared.is_failed());
+    assert_eq!(
+        shared.instance_count(),
+        2,
+        "FailRule must release the un-consumed reservation"
+    );
+}
+
+#[test]
+fn shared_slot_inherited_when_memory_drop_oldest_recreates_current() {
+    // N2 regression: when the memory DropOldest loop evicts the incoming key's
+    // OWN instance, the re-created fresh instance inherits its shared slot.
+    // Releasing it (old behavior) under-counted by one and over-admitted
+    // later keys.
+    // Mirror of limits_max_memory_bytes_drop_oldest_evicts_current_key with
+    // shared limits: 2 instances re-anchored to ~384 each = 768 >= 750 →
+    // DropOldest evicts the oldest, which IS the current key (A).
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![
+            step(vec![branch("fail", count_ge(1.0))]),
+            step(vec![branch("fail", count_ge(1.0))]),
+        ],
+    );
+    let limits = LimitsPlan {
+        max_memory_bytes: Some(750),
+        max_instances: Some(10),
+        max_throttle: None,
+        on_exceed: ExceedAction::DropOldest,
+    };
+    let shared = SharedLimits::new();
+    let mut sm = CepStateMachine::with_limits_shared(
+        "rule_n2".to_string(),
+        plan,
+        None,
+        Some(limits),
+        std::sync::Arc::clone(&shared),
+    );
+
+    let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
+    let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
+    assert_eq!(sm.advance_at("fail", &e1, 100), StepResult::Advance);
+    assert_eq!(sm.advance_at("fail", &e2, 200), StepResult::Advance);
+    assert_eq!(shared.instance_count(), 2);
+    sm.recalibrate_memory();
+
+    // A (oldest, current) evicted and re-created: local count 2, shared
+    // count must still be 2 — the fresh A inherited the evicted slot.
+    let result = sm.advance_at("fail", &e1, 300);
+    assert_eq!(result, StepResult::Advance);
+    assert_eq!(sm.instance_count(), 2);
+    assert_eq!(
+        shared.instance_count(),
+        2,
+        "re-created current-key instance must inherit its shared slot"
+    );
+}

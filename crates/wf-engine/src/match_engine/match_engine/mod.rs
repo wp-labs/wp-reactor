@@ -318,6 +318,11 @@ impl CepStateMachine {
 
         // 2. Get or create instance (with limits check)
         let is_new = !self.instances.contains_key(&instance_key);
+        // N1: whether THIS call holds a shared instance-slot reservation for the
+        // incoming key. Every early return between the reservation and the
+        // actual instance insert below must release it, or the shared budget
+        // leaks one slot per throttled/failing new key until it is exhausted.
+        let mut shared_slot_reserved = false;
         if is_new
             && let Some(ref limits) = self.limits
             && let Some(max_inst) = limits.max_instances
@@ -327,7 +332,11 @@ impl CepStateMachine {
             // read-then-act check — two shards can no longer both pass a stale
             // count and overshoot the cap (P1②).
             let reserved = match &self.shared {
-                Some(shared) => shared.try_reserve_instance(max_inst),
+                Some(shared) => {
+                    let ok = shared.try_reserve_instance(max_inst);
+                    shared_slot_reserved = ok;
+                    ok
+                }
                 None => self.instances.len() < max_inst,
             };
             if !reserved {
@@ -354,7 +363,11 @@ impl CepStateMachine {
                             shared.release_instance();
                         }
                         let re_reserved = match &self.shared {
-                            Some(shared) => shared.try_reserve_instance(max_inst),
+                            Some(shared) => {
+                                let ok = shared.try_reserve_instance(max_inst);
+                                shared_slot_reserved = ok;
+                                ok
+                            }
                             None => self.instances.len() < max_inst,
                         };
                         if !re_reserved {
@@ -404,13 +417,26 @@ impl CepStateMachine {
             let mut total = shared_total + new_cost;
             if total >= max_bytes {
                 match limits.on_exceed {
-                    ExceedAction::Throttle => return step_outcome(StepResult::Accumulate, None),
+                    ExceedAction::Throttle => {
+                        // N1: admission reserved a shared slot for this new key
+                        // but we return before inserting — release or it leaks.
+                        if shared_slot_reserved {
+                            self.release_shared_instance();
+                        }
+                        return step_outcome(StepResult::Accumulate, None);
+                    }
                     ExceedAction::DropOldest => {
                         // Evict oldest instances in a loop until under limit or nothing left.
                         // If the current key is the oldest it gets evicted too — its
                         // accumulated state is lost and entry() re-creates a fresh instance.
                         // We add the re-creation base cost to the budget so the loop
                         // keeps evicting until the fresh instance actually fits.
+                        // N2: when the incoming key's own instance is evicted here, the
+                        // re-creation below inherits its shared slot — releasing it now
+                        // would under-count and over-admit later keys. The flag lets an
+                        // early return still give the slot back if the re-creation
+                        // never happens.
+                        let mut slot_inherited_for_incoming = false;
                         while total >= max_bytes {
                             if let Some(oldest_key) = self
                                 .instances
@@ -421,8 +447,14 @@ impl CepStateMachine {
                                 let evicting_current = oldest_key == instance_key;
                                 if let Some(removed) = self.remove_instance(&oldest_key) {
                                     total = total.saturating_sub(removed.estimated_bytes());
-                                    // P1②: permanent eviction releases the shared slot.
-                                    self.release_shared_instance();
+                                    if evicting_current {
+                                        // N2: the fresh instance created below takes
+                                        // over this slot; shared count stays exact.
+                                        slot_inherited_for_incoming = true;
+                                    } else {
+                                        // P1②: permanent eviction releases the shared slot.
+                                        self.release_shared_instance();
+                                    }
                                 }
                                 // Current key will be re-created — account for base cost
                                 if evicting_current && !is_new {
@@ -431,13 +463,22 @@ impl CepStateMachine {
                                     );
                                 }
                             } else {
-                                // No instances to evict — cannot make room
+                                // No instances to evict — cannot make room. The
+                                // re-creation will not happen, so a held/inherited
+                                // slot must go back (N1/N2).
+                                if shared_slot_reserved || slot_inherited_for_incoming {
+                                    self.release_shared_instance();
+                                }
                                 return step_outcome(StepResult::Accumulate, None);
                             }
                         }
                     }
                     ExceedAction::FailRule => {
                         fail_rule(&mut self.failed, &self.shared);
+                        // N1: release the un-consumed reservation (see Throttle arm).
+                        if shared_slot_reserved {
+                            self.release_shared_instance();
+                        }
                         return step_outcome(StepResult::Accumulate, None);
                     }
                 }

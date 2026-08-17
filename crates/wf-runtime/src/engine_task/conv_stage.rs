@@ -274,7 +274,13 @@ impl ConvStageTask {
                         .map(|l| matches!(l.on_exceed, ExceedAction::FailRule))
                         .unwrap_or(false);
                     if fail {
+                        // N3: FailRule latches the rule permanently — stop
+                        // processing the rest of this bucket too. Without the
+                        // break, a later close whose watermark falls into a
+                        // fresh throttle window would pass try_acquire_throttle
+                        // and emit after the latch.
                         shared.fail();
+                        break;
                     }
                     continue;
                 }

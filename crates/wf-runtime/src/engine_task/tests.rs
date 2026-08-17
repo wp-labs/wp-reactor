@@ -3546,6 +3546,63 @@ async fn conv_stage_throttle_failrule_latches_shared() {
     cancel.cancel();
 }
 
+// N3: after a FailRule latch fires mid-bucket, the REST of the bucket must be
+// suppressed too — a later close whose watermark falls into a fresh throttle
+// window would otherwise pass try_acquire_throttle and emit after the latch.
+#[tokio::test]
+async fn conv_stage_failrule_latch_suppresses_rest_of_bucket() {
+    init_tracing();
+    let shared = wf_engine::match_engine::SharedLimits::new();
+    let limits = wf_lang::plan::LimitsPlan {
+        max_memory_bytes: None,
+        max_instances: None,
+        max_throttle: Some(wf_lang::plan::RateSpec {
+            count: 1,
+            per: Duration::from_secs(60),
+        }),
+        on_exceed: wf_lang::plan::ExceedAction::FailRule,
+    };
+    let barrier: Arc<Vec<std::sync::atomic::AtomicI64>> =
+        Arc::new(vec![std::sync::atomic::AtomicI64::new(i64::MIN)]);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (config, conv_tx, mut alert_rx) = make_conv_stage_config(
+        Some(limits),
+        Some(std::sync::Arc::clone(&shared)),
+        barrier,
+        cancel.clone(),
+    );
+    let _stage = tokio::spawn(async move { crate::engine_task::run_conv_stage_task(config).await });
+
+    // close1 @wm=0: within budget → emits. close2 @wm=0: throttled → FailRule
+    // latches. close3 @wm=61s: FRESH throttle window — without the mid-bucket
+    // break it would acquire the new window's budget and emit after the latch.
+    let mut close_fresh_window = conv_stage_test_close();
+    close_fresh_window.watermark_nanos = 61_000_000_000;
+    conv_tx
+        .send(crate::engine_task::ConvCloseBatch {
+            closes: vec![
+                conv_stage_test_close(),
+                conv_stage_test_close(),
+                close_fresh_window,
+            ],
+            watermark: 61_000_000_000,
+            drained: true,
+            barrier_index: 0,
+        })
+        .await
+        .unwrap();
+    drop(conv_tx);
+
+    let alert = take_alert_recv(&mut alert_rx).await;
+    assert_eq!(field_str(&alert, "__wfu_rule_name"), "conv_stage_rule");
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "close3 (fresh throttle window) must be suppressed by the FailRule latch"
+    );
+    assert!(shared.is_failed());
+    cancel.cancel();
+}
+
 // P2③: one ConvCloseBatch per process_batch (max event-time watermark), not
 // one per event.
 #[tokio::test]
