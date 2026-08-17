@@ -123,26 +123,39 @@ EPS 11.5M,CPU 3 核,RSS 0.75GB。下一个能抬吞吐的杠杆是**减少单实
   `bench.sh` 一键:`CONNECTIONS=16 SHARD_KEYS="bid_events:auction" ./bench.sh all cont 100m`
   (自动 shard-frames + 分片文件缓存复用)。
 
-  **两个重要的实测修正(2026-08-17)**：
+  **实测修正(2026-08-17,含一次推翻)**:
 
-  - **q1 的 shard-files 上限是 s0 straggler,不是帧大小**。攒批把帧恢复到大帧后,
-    q1 shard-files 仍只有 ~5.9M——瓶颈在连接 0:未列入 `--shard-keys` 的流
-    (nexmark 的 auction_events 6M + person_events 2M)整帧全部走 s0,s0 共
-    13.75M 行(其他连接 5.75M,2.4× 不均衡),且该实例还背着 auction window
-    eviction 开销。这是结构性约束:auction_events 不能被拆散(q3 按 `id`、q9
-    按 `seller` 做 stateful match,两个 key 冲突,无法一致分片)。因此:
-    **q1(无状态)的天花板测量应走纯 copy(不设 SHARD_KEYS)→ 18~19.8M**;
-    shard-files 路径面向有状态负载(全部 clean,见下)。
-  - **tail-tag bug(曾导致 bench "卡死")**：攒批尾部 flush 一度把不足一帧的
+  - **tail-tag bug(曾导致 bench "卡死")**:攒批尾部 flush 一度把不足一帧的
     行打成 `tail` 标签,引擎按 tag 路由时整帧丢弃(100M − 1.4M = rx 停在
     98.6M),`engine_appended` 永远追不平 → bench 等待循环空转到超时(1600s)。
     修复:flush 沿用原流 tag,同分片内按 (tag, schema) 分组。
+  - **分片均衡与 EPS 无关(推翻了早先的 s0 straggler 假设)**:未列入
+    `--shard-keys` 的流(auction_events 6M + person_events 2M)整帧全走 s0,
+    s0 达 13.75M 行(其他 5.75M,2.4× 不均衡)。但改用均衡键
+    (`bid_events:auction,auction_events:seller,person_events:id`,16 文件
+    全部 ~463MB)复测 100m:q1 5.93M(旧 5.95)、q3 11.3M(旧 12.0)、
+    q4 5.3M(旧 5.0)、q9 11.3M(旧 11.2)——全部在 ±5% 噪声内。
+    **文件均衡与否不改变任何查询的 EPS**。
+  - **q1 shard-files 的真实上限是 window append 稳态 ~5.8M**(daemon 逐秒
+    row/s:首秒 10.5M 后立刻回落到 5.6~5.9M,与分片均衡无关);纯 copy 的
+    18.2M 是 kill-early 瞬态测量(RSS 仅 848MB,receiver 无界预读、窗口未
+    饱和)。q1(无状态)天花板测量仍走纯 copy;shard-files 面向有状态负载。
+  - **均衡键的正确性已验证(规则零改动)**:30m 单连接对照,q2=224,289 /
+    q3=1,800,000 / q4=27,600,000 / q7=10,350,961 / q9=1,800,000 全部**逐位
+    一致**,q5 差 235 条(0.014%,count>=10 边界对 state eviction 敏感)。
+    auction_events 按 `seller` 分片可行,因为:①q3 的 key 是 `id`,而该
+    数据集每个 auction id 只出现一次(单事件),天然单连接;②snapshot join
+    走共享窗口(q4 的 bid→auction 跨分片 join 100% 命中证明)。
+    若未来数据集出现同 id 多事件,q3 语义会被破坏——均衡键是数据性质依赖。
 
-  全量复测(100M,16 连接 shard-files,2026-08-17):q1=5.9M / q2=5.84M /
+  全量复测(100m,16 连接 shard-files,2026-08-17):q1=5.9M / q2=5.84M /
   q3=12.0M / q4=5.0M / q5=3.7M / q7=3.55M / q9=11.2M,全部 `appended=100M/100M`
   + SUMMARY clean(无 dropped_late / serialize_failed)。q2 与单连接基线逐位一致;
   q3/q4/q5/q7 的 EMIT 计数有 run 间波动,来自 rule-state(512MB)与 auction
   window(64MB)的内存 eviction 时序,非键闭包破坏。
+- 注意:`bench.sh` 分片文件缓存 key(`data/shard_${TOTAL}_c${CONNECTIONS}`)
+  不含 shard-keys 指纹——**换 SHARD_KEYS 会静默复用旧分片文件**,缓存 key 需
+  加上键指纹(见 bench.sh)。
 - 待办(P0-②):TCP `read_batch` 每批固定开销(组批参数/大帧透传)——当前 11.5M 只
   用 3 核,瓶颈在读循环等待,不是算力。
 
