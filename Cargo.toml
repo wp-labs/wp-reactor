@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-version = "1.0.0" # @gxl:set(version)
+version = "1.0.1" # @gxl:set(version)
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

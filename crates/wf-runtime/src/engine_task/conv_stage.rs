@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -44,6 +44,11 @@ use crate::metrics::RuntimeMetrics;
 /// pending) is considered stalled — a shard died or is blocked. Drop the stuck
 /// buckets to bound memory.
 const STALE_BARRIER_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+/// Max wall time the conv stage keeps draining its close channel during
+/// shutdown. Shards flush their final closes as part of shutdown, so the stage
+/// must keep consuming until all shard senders drop the channel — otherwise a
+/// late flush batch is lost (same bug family as the sink consumer drain).
+const CONV_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A batch of raw qualifying closes sent from one shard to the conv stage.
 pub(crate) struct ConvCloseBatch {
@@ -136,10 +141,24 @@ impl ConvStageTask {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => {
-                    // P2④: drain any batches already in flight (the shards'
-                    // flush), then DROP unsealed buckets — partial top(N)/sort
-                    // results are never emitted. EOS/drained flush is the
-                    // correct exit for complete data.
+                    // P2④: shards flush their final closes as part of
+                    // shutdown, so keep consuming until all shard senders drop
+                    // the channel (channel closed) or the drain budget
+                    // expires — otherwise a late flush ConvCloseBatch arrives
+                    // at an exited stage and is lost. Unsealed buckets are
+                    // still dropped afterwards (partial top(N)/sort results
+                    // are never emitted).
+                    let deadline = Instant::now() + CONV_DRAIN_BUDGET;
+                    loop {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        match self.rx.recv().await {
+                            Some(b) => self.on_batch(b).await,
+                            // All shard senders dropped: flush done.
+                            None => break,
+                        }
+                    }
                     self.drain_and_drop().await;
                     self.check_all_drained();
                     break;

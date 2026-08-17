@@ -199,19 +199,29 @@ pub async fn run_sink_consumer(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                // Shutdown: flush what's buffered within a budget, then stop.
+                // Shutdown: rule tasks flush their final alerts as part of
+                // shutdown, so keep consuming until all producers drop the
+                // channel (channel closed) or the drain budget expires —
+                // otherwise alerts emitted by the shutdown flush are dropped.
                 let deadline = Instant::now() + SINK_DRAIN_BUDGET;
-                while let Ok(batch) = rx.try_recv() {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    dispatch_batch(&sink, &error_txs, &metrics, batch).await;
-                }
                 let mut dropped_batches = 0usize;
                 let mut dropped_records = 0u64;
-                while let Ok(batch) = rx.try_recv() {
-                    dropped_batches += 1;
-                    dropped_records += batch.len() as u64;
+                loop {
+                    if Instant::now() >= deadline {
+                        // Budget exhausted: drop whatever remains and stop.
+                        while let Ok(batch) = rx.try_recv() {
+                            dropped_batches += 1;
+                            dropped_records += batch.len() as u64;
+                        }
+                        break;
+                    }
+                    match rx.recv().await {
+                        Some(batch) => {
+                            dispatch_batch(&sink, &error_txs, &metrics, batch).await;
+                        }
+                        // All producers dropped the channel: graceful end.
+                        None => break,
+                    }
                 }
                 if dropped_batches > 0 {
                     if let Some(metrics) = &metrics {

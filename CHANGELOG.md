@@ -2,6 +2,13 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [1.0.1] — 2026-08-17
+
+### Fixed
+
+- **wf-runtime**: Fixed a shutdown flush race in the alert/sink pipeline. `run_sink_consumer` previously exited after a single `try_recv` drain when the cancel token fired, dropping alerts emitted by rule tasks during the shutdown flush — rule tasks evaluate closes and emit their final alerts as part of graceful shutdown, after the sink consumer had already stopped. The sink consumer now keeps consuming the alert channel until all producers drop it (channel closed) or the `SINK_DRAIN_BUDGET` (1s) expires, so alerts produced by the shutdown flush reach the sinks. Reproducible with TCP source + manual shutdown (the previous `e2e_mvp`-style run lost the close alert while the same rule fired via window timeout in file+batch mode).
+- **wf-runtime**: Fixed the same shutdown flush race in the sharded conv stage. `ConvStageTask`'s cancel path called `drain_and_drop` (a single `try_recv` drain) and exited before shards flushed their final `ConvCloseBatch`, losing complete buckets for rules with `conv_window` (rule-sharding P2c). The cancel path now consumes the close channel until all shard senders drop it (channel closed) or `CONV_DRAIN_BUDGET` (1s) expires, then drops still-unsealed (partial) buckets as before — P2④ semantics are preserved (partial top(N)/sort results are never emitted).
+
 ## [1.0.0] — 2026-08-17
 
 ### Added
