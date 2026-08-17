@@ -26,6 +26,7 @@ All notable changes to wp-reactor will be documented in this file.
 
 - **Tests**: Added SharedLimits unit + cross-shard integration coverage (collective `max_instances` / throttle / FailRule latch, exact DropOldest paths), conv-stage regression tests (FailRule, per-batch send, cancel-drops-unsealed, barrier watermark), and rule_instances delta-gauge coverage.
 - **Clippy**: Workspace now passes `cargo clippy --all-targets --all-features -- -D warnings` (cleared pre-existing toolchain-version lints; intentional `Box`ed instance-state collections are `#[allow]`ed).
+- **Dependencies**: Restored the `[patch.crates-io] wp-knowledge = { path = "../../wparse/wp-knowledge" }` override (it had been dropped) and bumped the `wp-knowledge` requirement to `0.16` so the local crate — which carries the `[fun.<name>]` named-query layer and requires `lru ^0.18` — is actually used. This resolves lru 0.16.4 → **0.18.2** and clears `cargo audit` RUSTSEC-2026-0253 (`LruCache::pop()` panic safety); `cargo audit` is now clean (0 vulnerabilities / 0 warnings).
 
 ## [0.3.0] — 2026-08-05
 

@@ -39,4 +39,12 @@ thiserror = "2.0"
 sha2 = "0.11"
 csv = "1.4"
 moju-derive = { git = "https://github.com/dayu-sec/moju-derive.git", branch = "main" }
-wp-knowledge =  "0.15"
+# Local override: the local wp-knowledge (0.16.0) carries the [fun.<name>]
+# named-query layer that the published 0.15.x dropped (external()/external_exists
+# backend). Requirement must track the local version or the [patch.crates-io]
+# below silently falls back to crates.io 0.15.1 (and pins lru 0.16.x —
+# RUSTSEC-2026-0253). Bump together with ../../wparse/wp-knowledge.
+wp-knowledge = "0.16"
+
+[patch.crates-io]
+wp-knowledge = { path = "../../wparse/wp-knowledge" }
