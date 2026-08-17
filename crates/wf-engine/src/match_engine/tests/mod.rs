@@ -1,5 +1,6 @@
 mod accu;
 mod any_l2;
+mod guard_bench;
 mod helpers;
 mod perf;
 mod seq_examples;
