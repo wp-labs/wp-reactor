@@ -2,8 +2,8 @@
 
 > 状态：Plan（待开工）
 >
-> 2026-08-13 · 关联 [rule-sharding-and-aggregation-window.md](rule-sharding-and-aggregation-window.md)
-> （设计定案）。本步只做**无 conv** 规则的 key 分片；conv（P2c）、共享原子（P2b）另行。
+> 2026-08-13 · 关联 [concurrency-scaling.md](concurrency-scaling.md) §3.2
+> （规则分片设计定案）。本步只做**无 conv** 规则的 key 分片；conv（P2c）、共享原子（P2b）另行。
 
 ---
 

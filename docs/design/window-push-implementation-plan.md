@@ -140,8 +140,8 @@ channel，此步为整链验证 + 清理。
 
 ## 5. R4：窗口控制面化（清理）
 
-**目标**：按管道设计（[rule-sharding-and-aggregation-window.md](rule-sharding-and-aggregation-window.md)）
-把「窗口」收敛为两类，规则数据面彻底脱离窗口锁：
+**目标**：按管道设计（[concurrency-scaling.md](concurrency-scaling.md) §3.2 规则分片 +
+管道机制）把「窗口」收敛为两类，规则数据面彻底脱离窗口锁：
 
 - **输入窗口**（stream → window）：只留 watermark / timeout / eviction / join——供
   match 时间窗与 join 查询（control-plane，规则数据面不读）。
