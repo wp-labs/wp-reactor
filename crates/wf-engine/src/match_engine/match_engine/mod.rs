@@ -33,6 +33,7 @@ use std::collections::BinaryHeap;
 use wf_lang::ast::CloseMode;
 use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, RateSpec, WindowSpec};
 
+use crate::match_engine::columnar::GuardMasks;
 use close::{accumulate_close_steps, evaluate_close, evidence_time_range};
 use key::{InstanceKey, extract_key};
 use seq::{SeqRuntime, consec_broken, scan_negations};
@@ -238,6 +239,11 @@ impl CepStateMachine {
         self.extract_event_time(event)
     }
 
+    /// The configured event-time field name, if any.
+    pub fn time_field(&self) -> Option<&str> {
+        self.time_field.as_deref()
+    }
+
     /// Extract a string field from an event, returning empty string if not found.
     pub(crate) fn extract_event_str(event: &Event, field: &str) -> String {
         event
@@ -258,7 +264,22 @@ impl CepStateMachine {
         now_nanos: i64,
         windows: Option<&dyn WindowLookup>,
     ) -> StepResult {
-        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, false)
+        self.advance_at_with_masks(alias, event, now_nanos, windows, 0, None)
+    }
+
+    /// Like [`Self::advance_at_with`], but with batch-level columnar branch-guard
+    /// masks and the row index within the current batch. `masks` may be `None`
+    /// (interpreted fallback for every branch).
+    pub fn advance_at_with_masks(
+        &mut self,
+        alias: &str,
+        event: &Event,
+        now_nanos: i64,
+        windows: Option<&dyn WindowLookup>,
+        row: usize,
+        masks: Option<&GuardMasks>,
+    ) -> StepResult {
+        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, row, masks, false)
             .result
     }
 
@@ -271,7 +292,7 @@ impl CepStateMachine {
         now_nanos: i64,
         windows: Option<&dyn WindowLookup>,
     ) -> StepOutcome {
-        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, true)
+        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, 0, None, true)
     }
 
     fn advance_at_with_diagnostics(
@@ -280,6 +301,8 @@ impl CepStateMachine {
         event: &Event,
         now_nanos: i64,
         windows: Option<&dyn WindowLookup>,
+        row: usize,
+        masks: Option<&GuardMasks>,
         capture_progress: bool,
     ) -> StepOutcome {
         // FailRule: once the rule has failed, reject all future events.
@@ -514,7 +537,16 @@ impl CepStateMachine {
 
         // 2b. Chain semantics: negation scan + strict adjacency.
         let seq_broken = if let Some(meta) = self.seq_meta.as_ref() {
-            scan_negations(meta, &mut instance, alias, event, now_nanos, windows);
+            scan_negations(
+                meta,
+                &mut instance,
+                alias,
+                event,
+                now_nanos,
+                windows,
+                row,
+                masks,
+            );
             consec_broken(meta, &instance, plan, alias)
         } else {
             false
@@ -541,6 +573,8 @@ impl CepStateMachine {
                 &mut instance.close_step_states,
                 windows,
                 &mut instance.baselines,
+                row,
+                masks,
             );
         }
 
@@ -561,6 +595,9 @@ impl CepStateMachine {
                             event_time_nanos: now_nanos,
                             windows,
                             progress: None,
+                            step_index: step_idx,
+                            row,
+                            masks,
                         },
                         step_plan,
                         step_state,
@@ -694,6 +731,9 @@ impl CepStateMachine {
                             machine_id: &instance.machine_id,
                             step_index: step_idx,
                         }),
+                        step_index: step_idx,
+                        row,
+                        masks,
                     },
                     step_plan,
                     step_state,

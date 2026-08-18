@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use wf_lang::ast::FieldRef;
 
 use crate::match_engine::{Event, extract_key_simple, shard_index};
+use arrow::record_batch::RecordBatch;
 
 /// A batch of parsed events pushed from one window to its subscribing rules.
 ///
@@ -20,7 +21,14 @@ use crate::match_engine::{Event, extract_key_simple, shard_index};
 #[derive(Clone)]
 pub struct RulePush {
     pub window_name: Arc<str>,
-    pub events: Arc<Vec<Arc<Event>>>,
+    /// Pre-parsed events, when the producer materialized them. `None` means the
+    /// rule task defers materialization and parses only the rows its bind filter
+    /// accepts (L2).
+    pub events: Option<Arc<Vec<Arc<Event>>>>,
+    /// The raw batch these events were parsed from, when the producer has it.
+    /// Rule tasks use it for columnar guard evaluation (zero-copy); `None` for
+    /// relay pushes (intermediate pipes) that only carry parsed events.
+    pub batch: Option<Arc<RecordBatch>>,
     pub seq: u64,
 }
 
@@ -96,6 +104,20 @@ impl RuleFanout {
             .is_some_and(|subs| !subs.is_empty())
     }
 
+    /// Whether `window_name` has any sharded subscription (L2 deferral is only
+    /// safe for non-sharded windows — sharded subscriptions partition rows, so
+    /// their indices no longer match the whole raw batch).
+    pub fn has_sharded_subscribers(&self, window_name: &str) -> bool {
+        self.table
+            .read()
+            .expect("fanout lock poisoned")
+            .get(window_name)
+            .is_some_and(|subs| {
+                subs.iter()
+                    .any(|s| matches!(s, Subscription::Sharded { .. }))
+            })
+    }
+
     /// Register a single (unsharded) rule channel for `window_name`.
     pub fn register(&self, window_name: &str, tx: mpsc::Sender<RulePush>) {
         let mut table = self.table.write().expect("fanout lock poisoned");
@@ -164,6 +186,39 @@ impl RuleFanout {
     /// each channel receives from exactly one send future per broadcast, and
     /// broadcasts themselves are serialized by the single-writer commit path.
     pub async fn broadcast(&self, window_name: &str, events: &Arc<Vec<Arc<Event>>>, seq: u64) {
+        self.broadcast_inner(window_name, Some(events), None, seq)
+            .await;
+    }
+
+    /// Like [`Self::broadcast`], but also forwards the raw [`RecordBatch`] the
+    /// events were parsed from, so rule tasks can evaluate columnar guards
+    /// zero-copy instead of materializing every row first.
+    pub async fn broadcast_with_batch(
+        &self,
+        window_name: &str,
+        events: &Arc<Vec<Arc<Event>>>,
+        batch: &RecordBatch,
+        seq: u64,
+    ) {
+        self.broadcast_inner(window_name, Some(events), Some(batch), seq)
+            .await;
+    }
+
+    /// Broadcast only the raw [`RecordBatch`] (L2 deferred materialization):
+    /// each rule task materializes only the rows its bind filter accepts.
+    /// Only valid for non-sharded subscriptions (deferral excludes sharded).
+    pub async fn broadcast_batch_only(&self, window_name: &str, batch: &RecordBatch, seq: u64) {
+        self.broadcast_inner(window_name, None, Some(batch), seq)
+            .await;
+    }
+
+    async fn broadcast_inner(
+        &self,
+        window_name: &str,
+        events: Option<&Arc<Vec<Arc<Event>>>>,
+        batch: Option<&RecordBatch>,
+        seq: u64,
+    ) {
         let subs: Vec<Subscription> = {
             let table = self.table.read().expect("fanout lock poisoned");
             table.get(window_name).cloned().unwrap_or_default()
@@ -173,6 +228,10 @@ impl RuleFanout {
         }
         // One shared allocation per broadcast (not per subscription × shard).
         let window_name: Arc<str> = window_name.into();
+        // Raw batch shared by non-sharded subscriptions; sharded subscriptions
+        // partition events (so their row indices no longer match the whole
+        // batch) and get `None` (interpreted fallback).
+        let batch_arc: Option<Arc<RecordBatch>> = batch.map(|b| Arc::new(b.clone()));
 
         let mut sends: Vec<Pin<Box<dyn Future<Output = bool> + Send>>> = Vec::new();
         for sub in &subs {
@@ -180,13 +239,19 @@ impl RuleFanout {
                 Subscription::Single(tx) => {
                     let push = RulePush {
                         window_name: Arc::clone(&window_name),
-                        events: Arc::clone(events),
+                        events: events.map(Arc::clone),
+                        batch: batch_arc.clone(),
                         seq,
                     };
                     let tx = tx.clone();
                     sends.push(Box::pin(async move { tx.send(push).await.is_err() }));
                 }
                 Subscription::Sharded { shards, keys } => {
+                    // Deferral excludes sharded windows, so `events` must be Some.
+                    let Some(events) = events else {
+                        debug_assert!(false, "broadcast_batch_only on a sharded window");
+                        continue;
+                    };
                     sharded_sends(shards, keys, &window_name, events, seq, &mut sends);
                 }
                 Subscription::RoundRobin { shards, next } => {
@@ -194,7 +259,8 @@ impl RuleFanout {
                     let idx = next.fetch_add(1, Ordering::Relaxed) % n;
                     let push = RulePush {
                         window_name: Arc::clone(&window_name),
-                        events: Arc::clone(events),
+                        events: events.map(Arc::clone),
+                        batch: batch_arc.clone(),
                         seq,
                     };
                     let tx = shards[idx].clone();
@@ -289,7 +355,8 @@ fn sharded_sends(
         }
         let push = RulePush {
             window_name: Arc::clone(window_name),
-            events: Arc::new(sub),
+            events: Some(Arc::new(sub)),
+            batch: None,
             seq,
         };
         let tx = shards[i].clone();
@@ -326,7 +393,9 @@ mod tests {
             .expect("registered channel should receive a push");
         assert_eq!(&*push.window_name, "win_a");
         assert!(
-            Arc::ptr_eq(&push.events, &events),
+            push.events
+                .as_ref()
+                .is_some_and(|e| Arc::ptr_eq(e, &events)),
             "should share the same Arc"
         );
     }
@@ -369,10 +438,22 @@ mod tests {
 
         let mut received = Vec::new();
         while let Ok(push) = rx0.try_recv() {
-            received.extend(push.events.iter().map(|e| e.fields["id"].clone()));
+            received.extend(
+                push.events
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.fields["id"].clone()),
+            );
         }
         while let Ok(push) = rx1.try_recv() {
-            received.extend(push.events.iter().map(|e| e.fields["id"].clone()));
+            received.extend(
+                push.events
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.fields["id"].clone()),
+            );
         }
 
         // Union of the shards == the original batch (no loss, no dup).
@@ -390,8 +471,14 @@ mod tests {
         let idx = shard_index(&[Value::Str("k1".into())], 2);
         let again: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(event("k1"))]);
         fanout.broadcast("win_a", &again, 1).await;
-        let got0 = rx0.try_recv().map(|p| p.events.len()).unwrap_or(0);
-        let got1 = rx1.try_recv().map(|p| p.events.len()).unwrap_or(0);
+        let got0 = rx0
+            .try_recv()
+            .map(|p| p.events.as_ref().map(|e| e.len()).unwrap_or(0))
+            .unwrap_or(0);
+        let got1 = rx1
+            .try_recv()
+            .map(|p| p.events.as_ref().map(|e| e.len()).unwrap_or(0))
+            .unwrap_or(0);
         if idx == 0 {
             assert_eq!(got0, 1);
             assert_eq!(got1, 0);
@@ -453,10 +540,14 @@ mod tests {
         assert_eq!(got1.len(), 2, "worker 1 receives 2 batches");
         // Whole batch preserved: 2 events per delivered push, same Arc as sent.
         let all: Vec<&RulePush> = got0.iter().chain(got1.iter()).collect();
-        assert!(all.iter().all(|p| p.events.len() == 2));
+        assert!(
+            all.iter()
+                .all(|p| p.events.as_ref().map(|e| e.len()).unwrap_or(0) == 2)
+        );
         for push in &all {
             assert!(
-                sent.iter().any(|s| Arc::ptr_eq(s, &push.events)),
+                sent.iter()
+                    .any(|s| push.events.as_ref().is_some_and(|e| Arc::ptr_eq(s, e))),
                 "delivered batch must be one of the sent Arcs (zero copy)"
             );
         }
@@ -530,7 +621,11 @@ mod tests {
         .await
         .expect("fast subscriber must receive within timeout")
         .expect("fast channel open");
-        assert_eq!(got.events.len(), 1, "fast subscriber got the second batch");
+        assert_eq!(
+            got.events.as_ref().map(|e| e.len()).unwrap_or(0),
+            1,
+            "fast subscriber got the second batch"
+        );
     }
 
     /// Same property for sharded subscriptions: a full shard must not block
@@ -574,6 +669,10 @@ mod tests {
         .await
         .expect("fast shard must receive within timeout")
         .expect("fast shard channel open");
-        assert_eq!(got.events.len(), 1, "fast shard got its sub-batch");
+        assert_eq!(
+            got.events.as_ref().map(|e| e.len()).unwrap_or(0),
+            1,
+            "fast shard got its sub-batch"
+        );
     }
 }

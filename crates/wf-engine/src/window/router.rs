@@ -297,6 +297,19 @@ impl Router {
                 .registry
                 .get_window(&window_name)
                 .expect("subscription references non-existent window");
+            // L2 deferred materialization: every bound rule has a columnar bind
+            // filter, so rule tasks materialize only the rows their filter
+            // accepts (from the raw batch). Leave `events` uninitialized here.
+            if win.defer_materialization()
+                && !self.rule_fanout.has_sharded_subscribers(&window_name)
+            {
+                windows.push(ParsedWindow {
+                    events_bytes: 0,
+                    window_name,
+                    events: None,
+                });
+                continue;
+            }
             // Parse the batch to events with no window synchronization at all:
             // `materialize_fields` is immutable after construction, and
             // parsing never touches the window's log lock (readers only clone
@@ -463,6 +476,7 @@ mod tests {
                 time_col_index: Some(0),
                 over: Duration::from_secs(3600),
                 materialize_fields: None,
+                defer_materialization: false,
             },
             streams: streams.into_iter().map(String::from).collect(),
             config: test_config(mode),
@@ -627,6 +641,7 @@ mod tests {
                     time_col_index: Some(0),
                     over: Duration::from_secs(3600),
                     materialize_fields: None,
+                    defer_materialization: false,
                 },
                 streams: vec!["events".into()],
                 config: test_config(DistMode::Local),
@@ -638,6 +653,7 @@ mod tests {
                     time_col_index: Some(0),
                     over: Duration::from_secs(3600),
                     materialize_fields: Some(Arc::new(HashSet::from(["ts".to_string()]))),
+                    defer_materialization: false,
                 },
                 streams: vec!["events".into()],
                 config: test_config(DistMode::Local),
@@ -721,6 +737,7 @@ mod tests {
                     time_col_index: Some(0),
                     over: Duration::from_secs(3600),
                     materialize_fields: None,
+                    defer_materialization: false,
                 },
                 streams: vec!["events".into()],
                 config: config(content + 1),
@@ -732,6 +749,7 @@ mod tests {
                     time_col_index: Some(0),
                     over: Duration::from_secs(3600),
                     materialize_fields: None,
+                    defer_materialization: false,
                 },
                 streams: vec!["events".into()],
                 config: config(content + all_bytes + 10),

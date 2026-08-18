@@ -336,6 +336,7 @@ mod tests {
                 time_col_index: Some(0),
                 over: Duration::from_secs(3600),
                 materialize_fields: None,
+                defer_materialization: false,
             },
             test_config(),
         ))
@@ -729,7 +730,7 @@ mod tests {
             .expect("broadcast within timeout")
             .expect("rule channel open");
         assert_eq!(&*push.window_name, "w");
-        assert_eq!(push.events.len(), 1);
+        assert_eq!(push.events.as_ref().map(|e| e.len()).unwrap_or(0), 1);
         assert_eq!(win.total_rows(), 1);
     }
 }

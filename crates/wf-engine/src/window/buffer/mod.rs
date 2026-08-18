@@ -132,12 +132,16 @@ pub struct Window {
     /// after construction — readers (`Router::route_parse`) access it with no
     /// synchronization at all.
     pub(super) materialize_fields: Option<Arc<HashSet<String>>>,
+    /// L2 deferred materialization (see `WindowParams`). Immutable after
+    /// construction.
+    pub(super) defer_materialization: bool,
 }
 
 impl Window {
     /// Create a new empty window.
     pub fn new(params: WindowParams, config: WindowConfig) -> Self {
         let materialize_fields = params.materialize_fields.clone();
+        let defer_materialization = params.defer_materialization;
         Self {
             name: params.name,
             schema: params.schema,
@@ -153,6 +157,7 @@ impl Window {
             join_enabled: AtomicBool::new(false),
             join_index: RwLock::new(None),
             materialize_fields,
+            defer_materialization,
         }
     }
 
@@ -433,6 +438,11 @@ impl Window {
     /// Index of the time column in the schema, if present.
     pub fn time_col_index(&self) -> Option<usize> {
         self.time_col_index
+    }
+
+    /// Whether rule tasks defer per-row event materialization (L2).
+    pub fn defer_materialization(&self) -> bool {
+        self.defer_materialization
     }
 
     // -- private helpers ----------------------------------------------------

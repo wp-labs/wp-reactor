@@ -29,6 +29,10 @@ pub struct WindowParams {
     /// materializes the fields rules actually read — the dominant peak RSS
     /// win on wide windows.
     pub materialize_fields: Option<Arc<HashSet<String>>>,
+    /// L2 deferred materialization: every bound rule has a columnar bind filter,
+    /// so rule tasks materialize only the rows their filter accepts (instead of
+    /// the whole batch in `route_parse`).
+    pub defer_materialization: bool,
 }
 
 #[derive(::moju_derive::MoJu)]

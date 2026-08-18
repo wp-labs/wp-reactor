@@ -22,8 +22,11 @@ use self::alert::build_summary;
 use self::eval::eval_bool_expr_with_lookup;
 use crate::alert::AlertOrigin;
 use crate::error::{CoreReason, CoreResult};
+use crate::match_engine::columnar::{ColumnarBatch, GuardMasks, eval_guard_columnar};
 use crate::match_engine::match_engine::{Event, Value, WindowLookup};
 use crate::time::normalize_epoch_timestamp_float_nanos;
+use arrow::array::BooleanArray;
+use arrow::record_batch::RecordBatch;
 
 /// Plan-level output constants, precomputed once at executor construction.
 ///
@@ -271,11 +274,17 @@ impl RuleExecutor {
         event: &Event,
         windows: Option<&dyn WindowLookup>,
     ) -> bool {
-        // Few binds: a linear scan is cheaper than hashing the alias. Many binds:
-        // the precomputed map keeps this O(1) instead of O(binds) per event.
-        // Measured crossover: the map wins from ~24 binds (24: 5.1M vs 5.8M q/s;
-        // 16: linear still 1.3x faster).
-        let filter = if self.plan.binds.len() <= 24 {
+        passes_bind_filter(self.bind_filter(alias), event, windows)
+    }
+
+    /// The bind filter for `alias`, if any.
+    ///
+    /// Few binds: a linear scan is cheaper than hashing the alias. Many binds:
+    /// the precomputed map keeps this O(1) instead of O(binds) per event.
+    /// Measured crossover: the map wins from ~24 binds (24: 5.1M vs 5.8M q/s;
+    /// 16: linear still 1.3x faster).
+    fn bind_filter(&self, alias: &str) -> Option<&Expr> {
+        if self.plan.binds.len() <= 24 {
             self.plan
                 .binds
                 .iter()
@@ -283,8 +292,86 @@ impl RuleExecutor {
                 .and_then(|b| b.filter.as_ref())
         } else {
             self.bind_filters.get(alias).and_then(|f| f.as_ref())
-        };
-        passes_bind_filter(filter, event, windows)
+        }
+    }
+
+    /// Columnar evaluation of `alias`'s bind filter over a whole batch.
+    ///
+    /// Returns `None` when there is no filter (nothing to reject) or the filter
+    /// is not columnar (caller falls back to per-event [`Self::event_matches_alias`]).
+    /// `Some(mask)` has one boolean per row; `false` = bind filter rejected that
+    /// row, matching `event_matches_alias`'s `false`.
+    pub fn bind_filter_columnar_mask(
+        &self,
+        alias: &str,
+        batch: &RecordBatch,
+    ) -> Option<BooleanArray> {
+        let filter = self.bind_filter(alias)?;
+        if !wf_lang::columnar::expr_is_columnar(filter) {
+            return None;
+        }
+        let view = ColumnarBatch::from_all_fields(batch);
+        Some(eval_guard_columnar(filter, &view))
+    }
+
+    /// Columnar evaluation of the `on each` filter over a whole batch.
+    ///
+    /// Same `None` / `Some(mask)` contract as [`Self::bind_filter_columnar_mask`],
+    /// but for `plan.each_plan.filter`.
+    pub fn each_filter_columnar_mask(&self, batch: &RecordBatch) -> Option<BooleanArray> {
+        let filter = self.plan.each_plan.as_ref()?.filter.as_ref()?;
+        if !wf_lang::columnar::expr_is_columnar(filter) {
+            return None;
+        }
+        let view = ColumnarBatch::from_all_fields(batch);
+        Some(eval_guard_columnar(filter, &view))
+    }
+
+    /// Columnar branch-guard masks for the three per-event guard sites:
+    ///
+    /// - event steps, keyed `(event_step_idx, branch_idx)`;
+    /// - close-step accumulation guards, keyed `(close_step_idx, branch_idx)`;
+    /// - seq negation guards, keyed `(neg_idx, 0)`.
+    ///
+    /// Non-columnar / absent guards are simply not inserted, so the state
+    /// machine falls back to interpreted evaluation for those branches.
+    pub fn branch_guard_masks(&self, batch: &RecordBatch) -> GuardMasks {
+        let view = ColumnarBatch::from_all_fields(batch);
+        let mut masks = GuardMasks::default();
+        for (step_idx, step) in self.plan.match_plan.event_steps.iter().enumerate() {
+            for (branch_idx, branch) in step.branches.iter().enumerate() {
+                if let Some(guard) = &branch.guard
+                    && wf_lang::columnar::expr_is_columnar(guard)
+                {
+                    masks.insert_event(step_idx, branch_idx, eval_guard_columnar(guard, &view));
+                }
+            }
+        }
+        for (step_idx, step) in self.plan.match_plan.close_steps.iter().enumerate() {
+            for (branch_idx, branch) in step.branches.iter().enumerate() {
+                if let Some(guard) = &branch.guard
+                    && wf_lang::columnar::expr_is_columnar(guard)
+                {
+                    masks.insert_close(step_idx, branch_idx, eval_guard_columnar(guard, &view));
+                }
+            }
+        }
+        if let Some(seq) = &self.plan.match_plan.seq {
+            // Negation steps only, in the same order `SeqRuntime::build` emits
+            // them (so `neg_idx` lines up with `meta.negs`).
+            let mut neg_idx = 0usize;
+            for step in &seq.steps {
+                if step.neg {
+                    if let Some(guard) = &step.branch.guard
+                        && wf_lang::columnar::expr_is_columnar(guard)
+                    {
+                        masks.insert_neg(neg_idx, 0, eval_guard_columnar(guard, &view));
+                    }
+                    neg_idx += 1;
+                }
+            }
+        }
+        masks
     }
 
     pub fn is_aux_bind_alias(&self, alias: &str) -> bool {

@@ -10,6 +10,7 @@ use super::step::{
 use super::types::{
     CloseOutput, CloseReason, EngineHashMap, Event, RollingStats, StepData, Value, WindowLookup,
 };
+use crate::match_engine::columnar::GuardMasks;
 
 // ---------------------------------------------------------------------------
 // Close-step accumulation (during advance)
@@ -32,6 +33,8 @@ pub(super) fn accumulate_close_steps(
     close_step_states: &mut [StepState],
     windows: Option<&dyn WindowLookup>,
     baselines: &mut EngineHashMap<String, RollingStats>,
+    row: usize,
+    masks: Option<&GuardMasks>,
 ) {
     let close_steps = &plan.close_steps;
     let tracked_fields = plan.tracked_bind_fields.get(alias);
@@ -42,11 +45,21 @@ pub(super) fn accumulate_close_steps(
                 continue;
             }
 
-            // Permissive guard: only explicit false blocks accumulation
-            if let Some(guard) = &branch.guard
-                && let Some(Value::Bool(false)) = eval_expr_ext(guard, event, windows, baselines)
-            {
-                continue;
+            // Permissive guard: only explicit false blocks accumulation. The
+            // null-aware columnar mask mirrors this — null (missing field) is
+            // permissive, and only an explicit `false` blocks.
+            if let Some(guard) = &branch.guard {
+                let blocks = match masks.and_then(|m| m.close_value(step_idx, branch_idx, row)) {
+                    Some(Some(false)) => true,
+                    Some(_) => false,
+                    None => matches!(
+                        eval_expr_ext(guard, event, windows, baselines),
+                        Some(Value::Bool(false))
+                    ),
+                };
+                if blocks {
+                    continue;
+                }
             }
 
             let field_value = extract_branch_field(event, &branch.field);

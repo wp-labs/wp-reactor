@@ -481,3 +481,44 @@ fn batch_to_events_ingest_throughput() {
     );
     assert_eq!(total, rows * rounds);
 }
+
+#[test]
+fn deferred_materialization_throughput() {
+    // L2: materialize only the hit rows (0.81% for dport % 123 == 0) instead of
+    // every row — quantifies the materialization cost saved by deferred
+    // materialization on a Q2-shaped filter.
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let rows = 10_000usize;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("sip", DataType::Utf8, false),
+        Field::new("dport", DataType::Int64, false),
+    ]));
+    let sips: Vec<String> = (0..rows).map(|i| format!("10.0.0.{}", i % 250)).collect();
+    let sip: StringArray = StringArray::from(sips);
+    let dport: Int64Array = (0..rows).map(|i| i as i64).collect();
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(sip), Arc::new(dport)]).unwrap();
+
+    let indices: Vec<u32> = (0..rows as u32).filter(|i| i % 123 == 0).collect();
+    let rounds = 50usize;
+    let start = Instant::now();
+    let mut total = 0usize;
+    for _ in 0..rounds {
+        total += crate::match_engine::materialize_rows(&batch, &indices).len();
+    }
+    let el = start.elapsed();
+    let hits = indices.len() * rounds;
+    eprintln!(
+        "  materialize_rows ({} / {} = {:.2}%): {} events in {:?} ({:.0} ev/s)",
+        indices.len(),
+        rows,
+        indices.len() as f64 / rows as f64 * 100.0,
+        total,
+        el,
+        hits as f64 / el.as_secs_f64()
+    );
+    assert_eq!(total, hits);
+}

@@ -489,6 +489,7 @@ mod tests {
                 time_col_index: Some(0),
                 over: Duration::from_secs(60),
                 materialize_fields: None,
+                defer_materialization: false,
             },
             streams: streams.into_iter().map(String::from).collect(),
             config,

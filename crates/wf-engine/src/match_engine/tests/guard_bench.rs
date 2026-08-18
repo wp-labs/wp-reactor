@@ -12,8 +12,12 @@
 //!   - field_lookup：仅 HashMap 字段提取（guard 内 `auction` 读取的裸成本）
 //! delta = q2_filter − no_filter 即 guard 表达式的增量开销。
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{BinOp, Expr, FieldRef};
 use wf_lang::plan::{BindPlan, RulePlan};
 
@@ -132,4 +136,56 @@ fn q2_field_lookup_per_event() {
         n as f64 / el.as_secs_f64() / 1e6
     );
     assert!(acc > 0.0);
+}
+
+/// `auction` 单列 Int64 批（与 `bid_event` 的 auction 列同构，guard 只读该列）。
+fn auction_batch(n: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "auction",
+        DataType::Int64,
+        false,
+    )]));
+    let values: Vec<i64> = (0..n as i64).collect();
+    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef]).unwrap()
+}
+
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine q2_guard -- --ignored --nocapture"]
+fn q2_guard_columnar_vs_interpreted() {
+    // 列式批 guard vs 逐行 interpreted guard：同一 Q2 bind filter 的两种口径。
+    // 列式路径：一次 `bind_filter_columnar_mask` 编译 + 逐行原生列读取（免 HashMap/Value）。
+    // interpreted 路径：逐事件 `event_matches_alias`（HashMap<SmolStr, Value> 查找 + 克隆）。
+    let executor = RuleExecutor::new(q2_plan(Some(q2_guard_expr())));
+    let n = 1_000_000usize;
+    let batch = auction_batch(n);
+    let events: Vec<Event> = (0..n).map(|i| bid_event(i as i64)).collect();
+
+    let start = Instant::now();
+    let mask = executor
+        .bind_filter_columnar_mask("b", &batch)
+        .expect("columnar mask");
+    let el = start.elapsed();
+    let per = el.as_secs_f64() * 1e9 / n as f64;
+    let passed = (0..mask.len()).filter(|&r| mask.value(r)).count();
+    eprintln!(
+        "[guard-bench] columnar_batch(auction%123==0): {per:7.1} ns/event  ({:5.1}M ev/s)  passed={passed}",
+        n as f64 / el.as_secs_f64() / 1e6
+    );
+
+    let start = Instant::now();
+    let mut passed_interpreted = 0usize;
+    for ev in &events {
+        if executor.event_matches_alias("b", ev, None) {
+            passed_interpreted += 1;
+        }
+    }
+    let el = start.elapsed();
+    let per_interpreted = el.as_secs_f64() * 1e9 / n as f64;
+    eprintln!(
+        "[guard-bench] interpreted_per_event: {per_interpreted:7.1} ns/event  ({:5.1}M ev/s)  passed={passed_interpreted}",
+        n as f64 / el.as_secs_f64() / 1e6
+    );
+
+    // 语义一致：两轨命中数相同。
+    assert_eq!(passed, passed_interpreted);
 }

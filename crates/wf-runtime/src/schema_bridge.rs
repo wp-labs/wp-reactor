@@ -54,6 +54,7 @@ pub fn schema_to_window_def(
         time_col_index,
         over: ws.over,
         materialize_fields,
+        defer_materialization: usage.defer_materialization.contains(&ws.name),
     };
 
     Ok(WindowDef {

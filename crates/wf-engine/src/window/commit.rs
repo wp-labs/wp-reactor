@@ -46,6 +46,9 @@ pub(super) async fn commit_appended_batch(
     events: Option<Arc<Vec<Arc<Event>>>>,
     byte_size: usize,
 ) -> CoreResult<(AppendOutcome, u64)> {
+    // Clone the raw batch for the columnar rule push; the append below moves
+    // the original into the window. `RecordBatch` clone is O(columns) Arc bumps.
+    let broadcast_batch = batch.clone();
     let result = if let Some(events) = events.as_ref() {
         win.append_with_watermark_parsed_sized(batch, Arc::clone(events), byte_size)
     } else {
@@ -54,7 +57,15 @@ pub(super) async fn commit_appended_batch(
     let (outcome, batch_seq) = result?;
     if matches!(outcome, AppendOutcome::Appended) {
         if let Some(events) = &events {
-            fanout.broadcast(window_name, events, batch_seq).await;
+            fanout
+                .broadcast_with_batch(window_name, events, &broadcast_batch, batch_seq)
+                .await;
+        } else if fanout.has_subscribers(window_name) {
+            // L2 deferred materialization: broadcast only the raw batch; rule
+            // tasks materialize the rows their bind filter accepts.
+            fanout
+                .broadcast_batch_only(window_name, &broadcast_batch, batch_seq)
+                .await;
         }
         if let Some(notify) = notify {
             notify.notify_waiters();

@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Expr, FieldRef, FieldSelector, ObjectItem, PathSegment};
+use crate::columnar::expr_is_columnar;
 use crate::plan::{BranchPlan, RulePlan, StepPlan};
 
 /// Field name carrying the machine/source identifier. The match engine reads
@@ -26,6 +27,10 @@ pub struct WindowFieldUsage {
     pub global_fields: HashSet<String>,
     /// Window names that must materialize every field (wholesale scans).
     pub needs_all: HashSet<String>,
+    /// Window names where **every** bound rule has a columnar bind filter, so
+    /// the window can defer per-row event materialization to the rule tasks
+    /// (they materialize only the rows their bind filter accepts).
+    pub defer_materialization: HashSet<String>,
 }
 
 impl WindowFieldUsage {
@@ -69,6 +74,8 @@ impl WindowFieldUsage {
 pub fn compute_window_field_usage(plans: &[RulePlan]) -> WindowFieldUsage {
     let mut global: HashSet<String> = HashSet::new();
     let mut needs_all: HashSet<String> = HashSet::new();
+    // window -> whether every bind seen so far has a columnar filter (L2 defer).
+    let mut defer_candidates: HashMap<&str, bool> = HashMap::new();
     // The match engine reads MACHINE_ID from every event it processes.
     global.insert(MACHINE_ID.to_string());
 
@@ -96,6 +103,11 @@ pub fn compute_window_field_usage(plans: &[RulePlan]) -> WindowFieldUsage {
             if let Some(filter) = &bind.filter {
                 collect_expr_fields(filter, &mut global);
             }
+            let columnar = bind.filter.as_ref().is_some_and(expr_is_columnar);
+            defer_candidates
+                .entry(bind.window.as_str())
+                .and_modify(|all| *all &= columnar)
+                .or_insert(columnar);
         }
 
         // Event / close steps and sequence branches — read the source alias's
@@ -151,9 +163,16 @@ pub fn compute_window_field_usage(plans: &[RulePlan]) -> WindowFieldUsage {
         }
     }
 
+    let defer_materialization: HashSet<String> = defer_candidates
+        .into_iter()
+        .filter(|(_, all)| *all)
+        .map(|(w, _)| w.to_string())
+        .collect();
+
     WindowFieldUsage {
         global_fields: global,
         needs_all,
+        defer_materialization,
     }
 }
 
@@ -337,6 +356,7 @@ mod tests {
         let usage = WindowFieldUsage {
             global_fields: HashSet::from(["auction".into(), "price".into(), "missing".into()]),
             needs_all: HashSet::new(),
+            defer_materialization: HashSet::new(),
         };
         let f = usage.filter_for("bid_events", ["auction", "price", "channel"]);
         let f = f.expect("should produce a filter");
@@ -344,5 +364,67 @@ mod tests {
         assert!(f.contains("price"));
         assert!(!f.contains("missing"));
         assert!(!f.contains("channel"));
+    }
+
+    #[test]
+    fn defer_materialization_only_when_every_bind_is_columnar() {
+        use crate::ast::BinOp;
+
+        let columnar = Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(Expr::BinOp {
+                op: BinOp::Mod,
+                left: Box::new(Expr::Field(FieldRef::Simple("auction".into()))),
+                right: Box::new(Expr::Number(123.0)),
+            }),
+            right: Box::new(Expr::Number(0.0)),
+        };
+        let func = Expr::FuncCall {
+            qualifier: None,
+            name: "length".into(),
+            args: vec![Expr::Field(FieldRef::Simple("auction".into()))],
+        };
+
+        let col_bind = BindPlan {
+            alias: "b".into(),
+            window: "bid_events".into(),
+            filter: Some(columnar),
+        };
+        let no_filter_bind = BindPlan {
+            alias: "b".into(),
+            window: "no_filter".into(),
+            filter: None,
+        };
+        let func_bind = BindPlan {
+            alias: "b".into(),
+            window: "func".into(),
+            filter: Some(func),
+        };
+
+        let match_plan = MatchPlan {
+            keys: vec![field_ref("auction")],
+            key_map: None,
+            window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
+            event_steps: vec![],
+            close_steps: vec![],
+            close_mode: crate::ast::CloseMode::Or,
+            tracked_bind_aliases: std::collections::HashSet::new(),
+            tracked_bind_fields: std::collections::HashMap::new(),
+            tracked_plain_fields: std::collections::HashSet::new(),
+            match_mode: crate::ast::MatchMode::Any,
+            seq: None,
+            accu: false,
+            needs_field_history: false,
+        };
+
+        let plans = vec![
+            make_rule(vec![col_bind], match_plan.clone()),
+            make_rule(vec![no_filter_bind], match_plan.clone()),
+            make_rule(vec![func_bind], match_plan),
+        ];
+        let usage = compute_window_field_usage(&plans);
+        assert!(usage.defer_materialization.contains("bid_events"));
+        assert!(!usage.defer_materialization.contains("no_filter"));
+        assert!(!usage.defer_materialization.contains("func"));
     }
 }

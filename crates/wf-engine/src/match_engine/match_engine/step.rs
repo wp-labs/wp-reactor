@@ -7,6 +7,7 @@ use super::eval::{eval_expr_ext, try_eval_expr_to_f64, try_eval_expr_to_value};
 use super::key::ValueKey;
 use super::state::{AliasState, BranchState, StepState};
 use super::types::{EngineHashMap, Event, RollingStats, StepProgress, Value, WindowLookup};
+use crate::match_engine::columnar::GuardMasks;
 
 // ---------------------------------------------------------------------------
 // Step evaluation
@@ -18,6 +19,12 @@ pub(super) struct StepEvaluationInput<'a> {
     pub event_time_nanos: i64,
     pub windows: Option<&'a dyn WindowLookup>,
     pub progress: Option<StepProgressCapture<'a>>,
+    /// Index of the step within `match_plan.event_steps` (for guard-mask lookup).
+    pub step_index: usize,
+    /// Row index within the current batch (for guard-mask lookup).
+    pub row: usize,
+    /// Precomputed columnar branch-guard masks, when the runtime supplied them.
+    pub masks: Option<&'a GuardMasks>,
 }
 
 #[derive(Clone, Copy)]
@@ -45,9 +52,18 @@ pub(super) fn evaluate_step_with_progress(
 
         // Guard check
         if let Some(guard) = &branch.guard {
-            match eval_expr_ext(guard, input.event, input.windows, baselines) {
-                Some(Value::Bool(true)) => {} // guard passed
-                _ => continue,                // guard failed or non-bool
+            let guard_ok = match input
+                .masks
+                .and_then(|m| m.event_value(input.step_index, branch_idx, input.row))
+            {
+                Some(ok) => ok,
+                None => matches!(
+                    eval_expr_ext(guard, input.event, input.windows, baselines),
+                    Some(Value::Bool(true))
+                ),
+            };
+            if !guard_ok {
+                continue;
             }
         }
 

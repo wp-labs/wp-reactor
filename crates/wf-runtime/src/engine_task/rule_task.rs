@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::array::new_null_array;
+use arrow::array::{BooleanArray, new_null_array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use orion_error::conversion::{SourceRawErr, ToStructError};
@@ -11,7 +11,9 @@ use tokio::sync::mpsc;
 
 use wf_engine::alert::{AlertColumnBuilder, OutputRecord};
 use wf_engine::match_engine::{
-    CepStateMachine, CloseReason, Event, RuleExecutor, StepResult, close_is_qualified,
+    CepStateMachine, CloseReason, Event, GuardMasks, RuleExecutor, StepResult,
+    batch_event_time_nanos_at, batch_time_col_index, batch_to_events, close_is_qualified,
+    materialize_rows,
 };
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
@@ -40,6 +42,15 @@ type PendingEventBatch = Option<(Arc<str>, Arc<Vec<Arc<Event>>>)>;
 const EMIT_METRIC_SAMPLE_INTERVAL: u32 = 64;
 /// Flush size for the batched alert sink delivery (amortizes per-alert fan-out).
 const ALERT_BATCH_SIZE: usize = 256;
+
+/// Deferred-materialization row source for one batch (L2): the event time of
+/// every row (for the watermark/expiry scan) plus the pre-materialized
+/// bind-filter hit rows in ascending batch-row order.
+struct DeferredRows {
+    times: Vec<i64>,
+    hit_indices: Vec<u32>,
+    hit_events: Vec<Arc<Event>>,
+}
 
 /// Columnar accumulation of pending alerts, grouped by yield target.
 ///
@@ -381,7 +392,8 @@ impl RuleTask {
         for (window_name, first_batch_seq, events_list) in pending {
             for (batch_index, events) in events_list.iter().enumerate() {
                 let batch_seq = first_batch_seq + batch_index as u64;
-                self.process_batch(&window_name, batch_seq, events).await;
+                self.process_batch(&window_name, batch_seq, Some(events), None)
+                    .await;
                 // Ack consumption so time eviction may reclaim this batch.
                 if let Some(slot) = self.progress.get(&window_name) {
                     slot.store(batch_seq + 1, std::sync::atomic::Ordering::Release);
@@ -400,7 +412,8 @@ impl RuleTask {
         &mut self,
         window_name: &str,
         batch_seq: u64,
-        events: &Arc<Vec<Arc<Event>>>,
+        events: Option<&Arc<Vec<Arc<Event>>>>,
+        batch: Option<&RecordBatch>,
     ) {
         let Some(aliases) = self.aliases.get(window_name) else {
             return;
@@ -408,11 +421,113 @@ impl RuleTask {
         let Some(ordered_aliases) = self.ordered_aliases.get(window_name) else {
             return;
         };
+        // L2 deferred materialization: when the producer broadcast only the raw
+        // batch, materialize only the rows the bind filter accepts. The time
+        // column is still scanned over every row (watermark/expiry), but the
+        // per-row Event is only built for hit rows (Q2 hit ~0.8%).
+        let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+
+        // Columnar bind-filter masks, one per alias, computed once per batch
+        // from the raw `RecordBatch` (zero-copy). `None` (the inner) means the
+        // alias has no filter or a non-columnar filter → fall back to the
+        // per-event interpreted path at each row.
+        let columnar_masks: HashMap<String, Option<BooleanArray>> = match batch {
+            Some(batch) => aliases
+                .iter()
+                .map(|alias| {
+                    (
+                        alias.clone(),
+                        self.executor.bind_filter_columnar_mask(alias, batch),
+                    )
+                })
+                .collect(),
+            None => HashMap::new(),
+        };
+        // Columnar branch-guard masks for the state machine's event steps.
+        let branch_masks = match batch {
+            Some(batch) => self.executor.branch_guard_masks(batch),
+            None => GuardMasks::default(),
+        };
+
+        // Deferral is safe only for the state-machine path when the producer
+        // broadcast the raw batch without events and debug detail logging is
+        // off (rejected rows have no Event to render a debug ref from).
+        let defer_materialize =
+            events.is_none() && batch.is_some() && self.machine.is_some() && !debug_enabled;
+
+        let deferred: Option<DeferredRows> = if defer_materialize {
+            let batch = batch.expect("deferral requires the raw batch");
+            let num_rows = batch.num_rows();
+            let time_field = self.machine.as_ref().and_then(|m| m.time_field());
+            // Scan needs the event time for every row (watermark/expiry); read
+            // it straight from the time column with the same f64 round-trip the
+            // eager path uses (`extract_event_time`). Resolve the column once,
+            // then read per row.
+            let time_col_index = batch_time_col_index(batch, time_field);
+            let times: Vec<i64> = match time_col_index {
+                Some(col_idx) => (0..num_rows)
+                    .map(|row| batch_event_time_nanos_at(batch, col_idx, row))
+                    .collect(),
+                None => vec![0; num_rows],
+            };
+            // Hit = any alias's columnar bind filter accepts this row. The
+            // window-level defer flag guarantees every alias here is columnar;
+            // a missing mask is a defensive fallback that materializes all rows.
+            let mut hit = vec![false; num_rows];
+            for alias in aliases.iter() {
+                match columnar_masks.get(alias) {
+                    Some(Some(mask)) => {
+                        for row in 0..num_rows {
+                            hit[row] |= mask.value(row);
+                        }
+                    }
+                    _ => {
+                        for row in 0..num_rows {
+                            hit[row] = true;
+                        }
+                    }
+                }
+            }
+            let hit_indices: Vec<u32> = (0..num_rows)
+                .filter(|&row| hit[row])
+                .map(|row| row as u32)
+                .collect();
+            let hit_events: Vec<Arc<Event>> = materialize_rows(batch, &hit_indices)
+                .into_iter()
+                .map(Arc::new)
+                .collect();
+            Some(DeferredRows {
+                times,
+                hit_indices,
+                hit_events,
+            })
+        } else {
+            None
+        };
+
+        // Eager events (full materialization), used by the non-deferred machine
+        // path and the `on each` path.
+        let eager_events: Option<Arc<Vec<Arc<Event>>>> = if defer_materialize {
+            None
+        } else {
+            Some(match events {
+                Some(events) => Arc::clone(events),
+                None => {
+                    let batch = batch.expect("deferred materialization requires the raw batch");
+                    Arc::new(batch_to_events(batch).into_iter().map(Arc::new).collect())
+                }
+            })
+        };
+
+        let input_events = deferred
+            .as_ref()
+            .map(|d| d.times.len())
+            .unwrap_or_else(|| eager_events.as_ref().map_or(0, |e| e.len()));
+
         let mut stats = RuleBatchDebugStats {
-            input_events: events.len(),
+            input_events,
             ..RuleBatchDebugStats::default()
         };
-        let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
         let rule_name = debug_enabled.then(|| self.rule_name().to_string());
         let rule_name_for_log = rule_name.as_deref().unwrap_or("");
         let aliases_for_log = if debug_enabled {
@@ -427,18 +542,18 @@ impl RuleTask {
                 stage = 0,
                 window = %window_name,
                 batch_seq = batch_seq,
-                rows = events.len(),
+                rows = input_events,
                 aliases = %aliases_for_log.as_deref().unwrap_or(""),
                 instances_before = instances_before,
                 "rule batch started"
             );
         }
         if let Some(metrics) = &self.metrics {
-            metrics.add_rule_events(self.executor.plan().name.as_str(), events.len());
+            metrics.add_rule_events(self.executor.plan().name.as_str(), input_events);
         }
         // Track the last wall-clock moment events were processed, so the
         // periodic timeout scan can advance the watermark across idle gaps.
-        if !events.is_empty() {
+        if input_events > 0 {
             self.last_activity_wall = std::time::Instant::now();
             // Cache wall time for the emit path's e2e-latency sample.
             self.cached_wall_nanos
@@ -448,15 +563,17 @@ impl RuleTask {
         // on-each: events within a batch share the window schema, so the
         // sorted field order used for wfx_id hashing is computed once per
         // batch instead of collected + sorted per event.
-        let each_field_order: Vec<&smol_str::SmolStr> =
-            match (self.executor.plan().each_plan.is_some(), events.first()) {
-                (true, Some(first)) => {
-                    let mut names: Vec<&smol_str::SmolStr> = first.fields.keys().collect();
-                    names.sort_unstable();
-                    names
-                }
-                _ => Vec::new(),
-            };
+        let each_field_order: Vec<&smol_str::SmolStr> = match (
+            self.executor.plan().each_plan.is_some(),
+            eager_events.as_ref().and_then(|events| events.first()),
+        ) {
+            (true, Some(first)) => {
+                let mut names: Vec<&smol_str::SmolStr> = first.fields.keys().collect();
+                names.sort_unstable();
+                names
+            }
+            _ => Vec::new(),
+        };
         // Batch-level emit timestamp: all events in this batch share one
         // (nanos, formatted) pair — the executor caches the formatted string
         // and Arc-shares it across every record it builds this batch.
@@ -470,9 +587,36 @@ impl RuleTask {
         // the loop — avoids a per-event bounded(32) channel send on the hot path.
         let mut conv_closes: Vec<wf_engine::match_engine::CloseOutput> = Vec::new();
         let mut conv_max_wm: i64 = 0;
-        for (row_index, event) in events.iter().enumerate() {
+        // Resolve the row count and a cursor into the deferred hit rows.
+        let num_rows = deferred
+            .as_ref()
+            .map(|d| d.times.len())
+            .unwrap_or_else(|| eager_events.as_ref().map_or(0, |e| e.len()));
+        let mut hit_cursor = 0usize;
+        for row_index in 0..num_rows {
+            let event: Option<&Arc<Event>> = match (&deferred, &eager_events) {
+                (Some(d), _) => {
+                    if hit_cursor < d.hit_indices.len()
+                        && d.hit_indices[hit_cursor] as usize == row_index
+                    {
+                        let event = &d.hit_events[hit_cursor];
+                        hit_cursor += 1;
+                        Some(event)
+                    } else {
+                        None
+                    }
+                }
+                (None, Some(events)) => Some(&events[row_index]),
+                (None, None) => None,
+            };
             if let Some(machine) = &mut self.machine {
-                let event_nanos = machine.event_time_nanos(event);
+                let event_nanos = match (&deferred, event) {
+                    (Some(d), _) => d.times[row_index],
+                    (None, Some(event)) => machine.event_time_nanos(event),
+                    (None, None) => {
+                        unreachable!("machine rows are always materialized when eager")
+                    }
+                };
                 let _scan_start = Instant::now();
                 // P2c: shards of a conv rule emit raw closes to the conv stage
                 // (aggregation window); inline conv is applied only on the
@@ -492,13 +636,23 @@ impl RuleTask {
                     )
                 };
                 self.scan_nanos += _scan_start.elapsed().as_nanos() as u64;
+                // Non-hit rows only need the time-column scan above (watermark /
+                // expiry); there is no Event to advance and no bind filter would
+                // accept them, so skip the state-machine step entirely.
+                let Some(event) = event else {
+                    continue;
+                };
                 let _advance_start = Instant::now();
                 let mut matched = Vec::new();
                 for alias in ordered_aliases {
-                    if !self
-                        .executor
-                        .event_matches_alias(alias, event, Some(&lookup))
-                    {
+                    if !alias_accepts(
+                        &self.executor,
+                        &columnar_masks,
+                        alias,
+                        row_index,
+                        event,
+                        &lookup,
+                    ) {
                         if debug_enabled {
                             stats.alias_rejected += 1;
                         }
@@ -530,7 +684,14 @@ impl RuleTask {
                         (outcome.result, outcome.progress)
                     } else {
                         (
-                            machine.advance_at_with(alias, event, event_nanos, Some(&lookup)),
+                            machine.advance_at_with_masks(
+                                alias,
+                                event,
+                                event_nanos,
+                                Some(&lookup),
+                                row_index,
+                                Some(&branch_masks),
+                            ),
                             None,
                         )
                     };
@@ -747,10 +908,17 @@ impl RuleTask {
                 .as_ref()
                 .filter(|alias| aliases.iter().any(|candidate| candidate == *alias))
             {
-                if self
-                    .executor
-                    .event_matches_alias(alias, event, Some(&lookup))
-                {
+                // The each path never defers materialization — `event` is always
+                // present for these rows.
+                let event = event.expect("each path is always eager");
+                if alias_accepts(
+                    &self.executor,
+                    &columnar_masks,
+                    alias,
+                    row_index,
+                    event,
+                    &lookup,
+                ) {
                     if debug_enabled {
                         stats.alias_passed += 1;
                     }
@@ -999,8 +1167,13 @@ impl RuleTask {
         self.pushed_seq += 1;
         let window_name = push.window_name.clone();
         let push_seq = push.seq;
-        self.process_batch(window_name.as_ref(), seq, &push.events)
-            .await;
+        self.process_batch(
+            window_name.as_ref(),
+            seq,
+            push.events.as_ref(),
+            push.batch.as_deref(),
+        )
+        .await;
         // Ack the window batch seq so time eviction may reclaim it (the
         // `seq` above is only a per-task debug counter).
         if let Some(slot) = self.progress.get(window_name.as_ref()) {
@@ -1781,6 +1954,23 @@ impl RuleTask {
             self.fanout_nanos
                 .fetch_add(fan_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
+    }
+}
+
+/// Whether `alias`'s bind filter accepts `row` of the current batch, using the
+/// precomputed columnar mask when available and falling back to the per-event
+/// interpreted path otherwise.
+fn alias_accepts(
+    executor: &RuleExecutor,
+    masks: &HashMap<String, Option<BooleanArray>>,
+    alias: &str,
+    row: usize,
+    event: &Event,
+    lookup: &RegistryLookup<'_>,
+) -> bool {
+    match masks.get(alias) {
+        Some(Some(mask)) => mask.value(row),
+        _ => executor.event_matches_alias(alias, event, Some(lookup)),
     }
 }
 

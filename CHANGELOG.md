@@ -2,6 +2,30 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [1.1.0] — 2026-08-18
+
+### Added
+
+- **wf-lang**: Added `expr_is_columnar` — a static, conservative columnar-expression gate. It classifies the pure field-arithmetic / comparison / constant subset (literals, flat `Simple`/`Qualified`/`Bracketed` field refs, `!`, and arithmetic / comparison / logic binary ops) as columnar; nested `FieldRef::Path`, `FuncCall`, structured literals, `InList`, `IfThenElse`, and meta/system/preset vars fall back to the interpreted path. It is a pure AST predicate (no per-row work), evaluated against a rule's immutable expressions.
+- **wf-lang**: Added `defer_materialization` to the window field-usage analysis — a window is marked deferable only when every rule bound to it has a **columnar** bind filter.
+- **wf-engine**: Added the columnar guard evaluator (`ColumnarBatch`, precompiled `ColumnExpr`, `eval_guard_columnar`, `GuardMasks`, `mask_to_indices`) — reads native Arrow columns directly (no per-row `HashMap`/`Value` materialization) and produces one boolean per row. `%` and comparison over two `Int64`/`Timestamp(Ns)` operands use native `i64`; `+ - * /` and any mixed `i64`/`f64` operand stay f64 (matching interpreted). `==`/`!=` over floats keep the interpreted epsilon comparison. Null / missing / non-boolean rows are emitted as **null slots**, so two-valued (`must be true`) and three-valued (`permissive`) consumers both get correct semantics.
+- **wf-engine**: Added `RuleExecutor::branch_guard_masks` — precomputes columnar branch-guard masks for **event steps, close steps, and seq negation steps** keyed by `(step, branch)`, consumed by `advance_at_with_masks`.
+- **wf-engine**: Added L2 deferred-materialization primitives — `materialize_rows` / `materialize_rows_filtered` (materialize only the listed row indices) and `batch_time_col_index` / `batch_event_time_nanos_at` / `batch_event_time_nanos` (read event time straight from the time column with the same f64 round-trip as the interpreted `extract_event_time` path).
+
+### Changed
+
+- **wf-engine / wf-runtime**: End-to-end L2 deferred materialization. `route_parse` broadcasts the raw `RecordBatch` (zero-copy) for deferable non-sharded windows instead of always materializing `Vec<Event>`; `RuleTask::process_batch` scans the time column over **every** row (watermark / expiry) but materializes only the bind-filter hit rows and advances only those — preserving the per-row scan-then-advance interleaving for short windows that expire within a batch. Deferral applies only to state-machine rules with debug detail logging off (rejected rows have no `Event` for debug refs); `on each` and sharded windows keep the eager path.
+- **wf-engine**: `RulePush.events` is now `Option<Arc<Vec<Arc<Event>>>>`, and `RuleFanout` gains `broadcast_batch_only` (raw-batch broadcast; sharded subscriptions whose row indices no longer match the whole batch are excluded). `WindowParams` / `Window` carry `defer_materialization`.
+- **wf-engine**: Columnar `Int64` / `Timestamp(Ns)` `%` and comparison are now native `i64` — **more precise than the interpreted f64 path for `>2^53` integers and nanosecond timestamps** (e.g. `2^53 == 2^53+1` is now `false`). This is a documented semantic divergence (§3.4 of the design doc), not a regression; below `2^53` the two paths are bit-for-bit identical.
+
+### Performance
+
+- **wf-engine**: Columnar guard evaluation is ~15× faster than interpreted per-event (14.3 ns/event vs 216.9 ns/event on the `guard_bench` micro-benchmark, release, 1M rows). End-to-end Q2 EPS is unchanged (the throughput gate is the window-actor single-writer wall, not guard cost), so the gain is per-event CPU, not EPS.
+
+### Documentation
+
+- **Design**: Added `docs/design/columnar-execution-design.md` (overall columnar execution plan, L0–L5 layering, type-mapping / semantic-equivalence contract) and `docs/design/columnar-execution-progress.md` (step-by-step implementation log, guard coverage 85.3%, Q2 baseline and re-test data).
+
 ## [1.0.2] — 2026-08-17
 
 ### Changed

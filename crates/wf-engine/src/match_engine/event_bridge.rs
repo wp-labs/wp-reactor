@@ -31,6 +31,54 @@ pub fn wfl_structured_field_kind(field: &Field) -> Option<&str> {
     }
 }
 
+/// Resolve the batch column index of the event-time field.
+pub fn batch_time_col_index(batch: &RecordBatch, time_field: Option<&str>) -> Option<usize> {
+    let tf = time_field?;
+    batch.schema().fields().iter().position(|f| f.name() == tf)
+}
+
+/// Read event-time nanos from a resolved time column at `row`, mirroring
+/// [`super::match_engine::CepStateMachine::event_time_nanos`] exactly (including
+/// the f64 round-trip that the eager `extract_event_time` path uses).
+///
+/// Returns 0 when the column is null or non-numeric.
+pub fn batch_event_time_nanos_at(batch: &RecordBatch, time_col_index: usize, row: usize) -> i64 {
+    let col = batch.column(time_col_index);
+    if col.is_null(row) {
+        return 0;
+    }
+    match col.data_type() {
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|a| a.value(row) as f64 as i64)
+            .unwrap_or(0),
+        DataType::Float64 => col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|a| a.value(row) as i64)
+            .unwrap_or(0),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => col
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .map(|a| a.value(row) as f64 as i64)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Extract the event-time nanos for `row` straight from the batch time column.
+///
+/// Returns 0 when the time field is absent, non-numeric, or null. Prefer
+/// [`batch_time_col_index`] + [`batch_event_time_nanos_at`] when reading many
+/// rows, to resolve the column only once.
+pub fn batch_event_time_nanos(batch: &RecordBatch, time_field: Option<&str>, row: usize) -> i64 {
+    match batch_time_col_index(batch, time_field) {
+        Some(idx) => batch_event_time_nanos_at(batch, idx, row),
+        None => 0,
+    }
+}
+
 /// Convert an Arrow [`RecordBatch`] into a `Vec<Event>`, one per row.
 ///
 /// Each column is mapped to an [`Event`] field by column name. Null values
@@ -70,6 +118,60 @@ fn batch_to_events_with(
     let mut events = Vec::with_capacity(num_rows);
 
     for row in 0..num_rows {
+        let mut fields = EngineHashMap::default();
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            if let Some(only) = only_fields
+                && !only.contains(field.name())
+            {
+                continue;
+            }
+            let col = batch.column(col_idx);
+            if col.is_null(row) {
+                continue;
+            }
+            if let Some(val) = extract_field_value(field, col.as_ref(), row) {
+                fields.insert(field.name().into(), val);
+            }
+        }
+        events.push(Event { fields });
+    }
+    events
+}
+
+/// Materialize only the given row indices into events (L2 deferred
+/// materialization primitive).
+///
+/// `indices` must be ascending (the columnar mask → indices step preserves
+/// batch row order). Rows out of range are skipped. This is the counterpart to
+/// [`batch_to_events`] that avoids materializing the ~99% of rows a columnar
+/// guard rejects (Q2 hit 0.81%).
+pub fn materialize_rows(batch: &RecordBatch, indices: &[u32]) -> Vec<Event> {
+    materialize_rows_with(batch, indices, None)
+}
+
+/// Like [`materialize_rows`], but only materializes the listed field names.
+pub fn materialize_rows_filtered(
+    batch: &RecordBatch,
+    indices: &[u32],
+    fields: &std::collections::HashSet<String>,
+) -> Vec<Event> {
+    materialize_rows_with(batch, indices, Some(fields))
+}
+
+fn materialize_rows_with(
+    batch: &RecordBatch,
+    indices: &[u32],
+    only_fields: Option<&std::collections::HashSet<String>>,
+) -> Vec<Event> {
+    let num_rows = batch.num_rows();
+    let schema = batch.schema();
+    let mut events = Vec::with_capacity(indices.len());
+
+    for &row_u32 in indices {
+        let row = row_u32 as usize;
+        if row >= num_rows {
+            continue;
+        }
         let mut fields = EngineHashMap::default();
         for (col_idx, field) in schema.fields().iter().enumerate() {
             if let Some(only) = only_fields
@@ -296,6 +398,55 @@ mod tests {
         let events = batch_to_events(&batch);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].fields["ts"], Value::Number(nanos as f64));
+    }
+
+    #[test]
+    fn test_batch_event_time_nanos_matches_extract_event_time_roundtrip() {
+        // Int64 / Timestamp(Ns) go through an f64 round-trip exactly like the
+        // eager `extract_event_time` (Value::Number(n as f64) → `as i64`); only
+        // Float64 is a direct `as i64` cast. This is the correctness contract
+        // for the L2 deferred scan reading time straight from the column.
+        let schema = make_schema(vec![
+            Field::new("i", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("t", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+        ]);
+        // 2^53 + 1 is not representable in f64 — the round-trip collapses it.
+        let big: i64 = (1i64 << 53) + 1;
+        let nanos: i64 = 1_700_000_000_000_000_000;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(big), None])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![Some(1.9), None])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(nanos), None])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let i_idx = batch_time_col_index(&batch, Some("i")).unwrap();
+        let f_idx = batch_time_col_index(&batch, Some("f")).unwrap();
+        let t_idx = batch_time_col_index(&batch, Some("t")).unwrap();
+
+        // Int64: (value as f64) as i64.
+        assert_eq!(
+            batch_event_time_nanos_at(&batch, i_idx, 0),
+            (big as f64) as i64
+        );
+        // Float64: direct cast.
+        assert_eq!(batch_event_time_nanos_at(&batch, f_idx, 0), 1);
+        // Timestamp(Ns): (value as f64) as i64.
+        assert_eq!(
+            batch_event_time_nanos_at(&batch, t_idx, 0),
+            (nanos as f64) as i64
+        );
+        // Null time → 0 (matching `extract_event_time`'s missing-field fallback).
+        assert_eq!(batch_event_time_nanos_at(&batch, i_idx, 1), 0);
+        assert_eq!(batch_event_time_nanos_at(&batch, f_idx, 1), 0);
+        assert_eq!(batch_event_time_nanos_at(&batch, t_idx, 1), 0);
+        // Absent field → 0.
+        assert_eq!(batch_event_time_nanos(&batch, Some("missing"), 0), 0);
+        assert_eq!(batch_event_time_nanos(&batch, None, 0), 0);
     }
 
     #[test]

@@ -216,6 +216,7 @@ fn make_window(name: &str, schema: &SchemaRef, max_bytes: usize) -> (Arc<Window>
             time_col_index: Some(1), // event_time is the second column
             over: Duration::from_secs(3600),
             materialize_fields: None,
+            defer_materialization: false,
         },
         test_window_config(max_bytes),
     );
@@ -290,6 +291,7 @@ fn make_window_def(
             time_col_index: time_col,
             over: Duration::from_secs(3600),
             materialize_fields: None,
+            defer_materialization: false,
         },
         streams: streams.iter().map(|s| (*s).to_string()).collect(),
         config: cfg,
@@ -324,7 +326,9 @@ fn make_task() -> (
 /// ```
 ///
 /// `max_bytes` controls the window's `max_window_bytes` for memory-pressure tests.
-fn make_task_with_window_bytes(
+fn make_task_inner(
+    filter: Option<Expr>,
+    branch_guard: Option<Expr>,
     max_bytes: usize,
 ) -> (
     rule_task::RuleTask,
@@ -344,7 +348,7 @@ fn make_task_with_window_bytes(
                 label: Some("fail".into()),
                 source: "fail".into(),
                 field: None,
-                guard: None,
+                guard: branch_guard,
                 agg: AggPlan {
                     transforms: vec![],
                     measure: Measure::Count,
@@ -370,7 +374,7 @@ fn make_task_with_window_bytes(
         binds: vec![BindPlan {
             alias: "fail".into(),
             window: "auth_events".into(),
-            filter: None,
+            filter,
         }],
         match_plan: match_plan.clone(),
         each_plan: None,
@@ -427,6 +431,39 @@ fn make_task_with_window_bytes(
 
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
+}
+
+fn make_task_with_window_bytes(
+    max_bytes: usize,
+) -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
+    Arc<Window>,
+    Arc<Notify>,
+) {
+    make_task_inner(None, None, max_bytes)
+}
+
+fn make_filter_task(
+    filter: Expr,
+) -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
+    Arc<Window>,
+    Arc<Notify>,
+) {
+    make_task_inner(Some(filter), None, usize::MAX)
+}
+
+fn make_branch_guard_task(
+    branch_guard: Expr,
+) -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
+    Arc<Window>,
+    Arc<Notify>,
+) {
+    make_task_inner(None, Some(branch_guard), usize::MAX)
 }
 
 fn make_pipeline_stage_task() -> (
@@ -2105,12 +2142,13 @@ async fn push_triggers_alert() {
     // push channel, and advance the state machine through the push path.
     let push = RulePush {
         window_name: "auth_events".into(),
-        events: Arc::new(
+        events: Some(Arc::new(
             batch_to_events(&batch)
                 .into_iter()
                 .map(Arc::new)
                 .collect::<Vec<_>>(),
-        ),
+        )),
+        batch: None,
         seq: u64::MAX,
     };
     task.process_push(push).await;
@@ -2143,6 +2181,221 @@ fn drain_alert_entity_ids(rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>
 }
 
 #[tokio::test]
+async fn columnar_bind_filter_matches_interpreted_path() {
+    init_tracing();
+    let filter = Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Simple("sip".into()))),
+        right: Box::new(Expr::StringLit("10.0.0.1".into())),
+    };
+    let schema = test_schema();
+    let ts = 1_700_000_000_000_000_000i64;
+    // 3× "10.0.0.1" (count>=3 fires once) + 1× "10.0.0.2" (filtered out).
+    let batch = make_batch(
+        &schema,
+        &["10.0.0.1", "10.0.0.2", "10.0.0.1", "10.0.0.1"],
+        ts,
+    );
+    assert!(wf_lang::columnar::expr_is_columnar(&filter));
+    let events = Arc::new(
+        batch_to_events(&batch)
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>(),
+    );
+
+    // Columnar path: the push carries the raw batch → bind filter is a mask.
+    let (mut task, mut alert_rx, _win, _notify) = make_filter_task(filter.clone());
+    task.process_push(RulePush {
+        window_name: "auth_events".into(),
+        events: Some(Arc::clone(&events)),
+        batch: Some(Arc::new(batch.clone())),
+        seq: u64::MAX,
+    })
+    .await;
+    let columnar_ids = drain_alert_entity_ids(&mut alert_rx);
+
+    // Interpreted path: no raw batch → per-event `event_matches_alias`.
+    let (mut task2, mut alert_rx2, _win2, _notify2) = make_filter_task(filter);
+    task2
+        .process_push(RulePush {
+            window_name: "auth_events".into(),
+            events: Some(events),
+            batch: None,
+            seq: u64::MAX,
+        })
+        .await;
+    let interpreted_ids = drain_alert_entity_ids(&mut alert_rx2);
+
+    assert_eq!(columnar_ids, interpreted_ids);
+    // Only sip == "10.0.0.1" passes the filter; 3 of them reach count>=3 → one fire.
+    assert_eq!(columnar_ids, vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn columnar_branch_guard_matches_interpreted_path() {
+    init_tracing();
+    let guard = Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Simple("sip".into()))),
+        right: Box::new(Expr::StringLit("10.0.0.1".into())),
+    };
+    let schema = test_schema();
+    let ts = 1_700_000_000_000_000_000i64;
+    let batch = make_batch(
+        &schema,
+        &["10.0.0.1", "10.0.0.2", "10.0.0.1", "10.0.0.1"],
+        ts,
+    );
+    assert!(wf_lang::columnar::expr_is_columnar(&guard));
+    let events = Arc::new(
+        batch_to_events(&batch)
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>(),
+    );
+
+    // Columnar branch guard: push carries the raw batch → guard is a mask.
+    let (mut task, mut alert_rx, _win, _notify) = make_branch_guard_task(guard.clone());
+    task.process_push(RulePush {
+        window_name: "auth_events".into(),
+        events: Some(Arc::clone(&events)),
+        batch: Some(Arc::new(batch.clone())),
+        seq: u64::MAX,
+    })
+    .await;
+    let columnar_ids = drain_alert_entity_ids(&mut alert_rx);
+
+    // Interpreted branch guard: no raw batch → per-event guard in the state machine.
+    let (mut task2, mut alert_rx2, _win2, _notify2) = make_branch_guard_task(guard);
+    task2
+        .process_push(RulePush {
+            window_name: "auth_events".into(),
+            events: Some(events),
+            batch: None,
+            seq: u64::MAX,
+        })
+        .await;
+    let interpreted_ids = drain_alert_entity_ids(&mut alert_rx2);
+
+    assert_eq!(columnar_ids, interpreted_ids);
+    assert_eq!(columnar_ids, vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn deferred_materialization_matches_eager_path() {
+    init_tracing();
+    let filter = Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Simple("sip".into()))),
+        right: Box::new(Expr::StringLit("10.0.0.1".into())),
+    };
+    let schema = test_schema();
+    let ts = 1_700_000_000_000_000_000i64;
+    let batch = make_batch(
+        &schema,
+        &["10.0.0.1", "10.0.0.2", "10.0.0.1", "10.0.0.1"],
+        ts,
+    );
+
+    // Deferred: no pre-parsed events → the rule task materializes from the raw batch.
+    let (mut task, mut alert_rx, _win, _notify) = make_filter_task(filter.clone());
+    task.process_push(RulePush {
+        window_name: "auth_events".into(),
+        events: None,
+        batch: Some(Arc::new(batch.clone())),
+        seq: u64::MAX,
+    })
+    .await;
+    let deferred_ids = drain_alert_entity_ids(&mut alert_rx);
+
+    // Eager: pre-parsed events (as `route_parse` would broadcast).
+    let events = Arc::new(
+        batch_to_events(&batch)
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>(),
+    );
+    let (mut task2, mut alert_rx2, _win2, _notify2) = make_filter_task(filter);
+    task2
+        .process_push(RulePush {
+            window_name: "auth_events".into(),
+            events: Some(events),
+            batch: None,
+            seq: u64::MAX,
+        })
+        .await;
+    let eager_ids = drain_alert_entity_ids(&mut alert_rx2);
+
+    assert_eq!(deferred_ids, eager_ids);
+    assert_eq!(deferred_ids, vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn deferred_materialization_scans_every_row_for_intra_batch_expiry() {
+    init_tracing();
+    // `sip == "10.0.0.1"` is a columnar bind filter, so the deferred path
+    // skips materializing the rejected "10.0.0.2" row. The rejected row's
+    // event time (400s) must still drive the watermark/expiry scan: the
+    // 300s sliding window instance created at T=0 must expire at T=400s,
+    // before the next accepted row starts a fresh instance (count=1).
+    let filter = Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Simple("sip".into()))),
+        right: Box::new(Expr::StringLit("10.0.0.1".into())),
+    };
+    let schema = test_schema();
+    let sips = ["10.0.0.1", "10.0.0.1", "10.0.0.2", "10.0.0.1"];
+    let times = [0i64, 100_000_000_000, 400_000_000_000, 400_000_000_000];
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                sips.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
+            )),
+            Arc::new(TimestampNanosecondArray::from(times.to_vec())),
+        ],
+    )
+    .unwrap();
+    assert!(wf_lang::columnar::expr_is_columnar(&filter));
+
+    // Deferred: no pre-parsed events → only the bind-filter hit rows are
+    // materialized; the rejected row is still scanned for expiry.
+    let (mut task, mut alert_rx, _win, _notify) = make_filter_task(filter.clone());
+    task.process_push(RulePush {
+        window_name: "auth_events".into(),
+        events: None,
+        batch: Some(Arc::new(batch.clone())),
+        seq: u64::MAX,
+    })
+    .await;
+    let deferred_ids = drain_alert_entity_ids(&mut alert_rx);
+
+    // Eager: pre-parsed events (full materialization).
+    let events = Arc::new(
+        batch_to_events(&batch)
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>(),
+    );
+    let (mut task2, mut alert_rx2, _win2, _notify2) = make_filter_task(filter);
+    task2
+        .process_push(RulePush {
+            window_name: "auth_events".into(),
+            events: Some(events),
+            batch: None,
+            seq: u64::MAX,
+        })
+        .await;
+    let eager_ids = drain_alert_entity_ids(&mut alert_rx2);
+
+    // The 300s window expires the T=0 instance at the rejected row's T=400s,
+    // so the final accepted row starts over at count=1 — no `count>=3` fire.
+    assert_eq!(deferred_ids, eager_ids);
+    assert!(deferred_ids.is_empty());
+}
+
+#[tokio::test]
 async fn sharded_rule_produces_same_alerts_as_single_worker() {
     init_tracing();
     let schema = test_schema();
@@ -2167,7 +2420,8 @@ async fn sharded_rule_produces_same_alerts_as_single_worker() {
     single
         .process_push(RulePush {
             window_name: "auth_events".into(),
-            events: Arc::clone(&events),
+            events: Some(Arc::clone(&events)),
+            batch: None,
             seq: u64::MAX,
         })
         .await;
@@ -2375,7 +2629,7 @@ async fn pipeline_stage_output_writes_internal_window_instead_of_alert_channel()
     let push = down_rx
         .try_recv()
         .expect("downstream rule received pipeline events");
-    let rows = push.events;
+    let rows = push.events.expect("push carries events");
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].fields.get("sip"),
@@ -2423,7 +2677,7 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
     let push = down_rx
         .try_recv()
         .expect("downstream rule received intermediate events");
-    let rows = push.events;
+    let rows = push.events.expect("push carries events");
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].fields.get("sip"),
@@ -2487,7 +2741,7 @@ async fn intermediate_target_preserves_explicit_time_field() {
     let push = down_rx
         .try_recv()
         .expect("downstream rule received intermediate events");
-    let event = &push.events[0];
+    let event = &push.events.as_ref().unwrap()[0];
     assert_eq!(
         event.fields.get("event_time"),
         Some(&wf_engine::match_engine::Value::Number(
@@ -2710,6 +2964,7 @@ fn make_conn_events_window(max_bytes: usize) -> (Arc<Window>, Arc<Notify>) {
             time_col_index: Some(5), // event_time is the 6th column (0-based: 5)
             over: Duration::from_secs(3600),
             materialize_fields: None,
+            defer_materialization: false,
         },
         cfg,
     );
@@ -2926,7 +3181,7 @@ async fn pure_relay_broadcasts_to_sharded_downstream() {
     // Rule-side channelization: rows of one input batch relay as a single
     // pushed batch (all same-key events together, in emit order).
     assert!(
-        full.len() == 1 && full[0].events.len() == 2,
+        full.len() == 1 && full[0].events.as_ref().unwrap().len() == 2,
         "same-key events must land together on the same shard (one batched push), got {} pushes",
         full.len()
     );
@@ -2938,11 +3193,11 @@ async fn pure_relay_broadcasts_to_sharded_downstream() {
     // batch behind these events; consumers saturating-ack it).
     assert_eq!(full[0].seq, u64::MAX, "relay pushes carry seq = u64::MAX");
     assert_eq!(
-        full[0].events[0].fields.get("sip"),
+        full[0].events.as_ref().unwrap()[0].fields.get("sip"),
         Some(&wf_engine::match_engine::Value::Str("10.0.0.8".into()))
     );
     assert_eq!(
-        full[0].events[1].fields.get("sip"),
+        full[0].events.as_ref().unwrap()[1].fields.get("sip"),
         Some(&wf_engine::match_engine::Value::Str("10.0.0.8".into()))
     );
 
@@ -2965,7 +3220,7 @@ async fn pure_relay_broadcasts_to_sharded_downstream() {
         (&b2[0], ())
     };
     assert_eq!(
-        second.events[0].fields.get("sip"),
+        second.events.as_ref().unwrap()[0].fields.get("sip"),
         Some(&wf_engine::match_engine::Value::Str("10.0.0.8".into()))
     );
 }
@@ -3056,15 +3311,15 @@ async fn pipe_flush_backpressures_until_downstream_drains() {
     // Drain the first push; the blocked flush must then complete and
     // deliver batch 2 in order.
     let first = down_rx.recv().await.expect("first push");
-    assert_eq!(first.events.len(), 2);
+    assert_eq!(first.events.as_ref().unwrap().len(), 2);
     pending.await;
     let second = down_rx
         .recv()
         .await
         .expect("second push after backpressure");
-    assert_eq!(second.events.len(), 1);
+    assert_eq!(second.events.as_ref().unwrap().len(), 1);
     assert_eq!(
-        second.events[0].fields.get("sip"),
+        second.events.as_ref().unwrap()[0].fields.get("sip"),
         Some(&wf_engine::match_engine::Value::Str("10.0.0.9".into()))
     );
 }
@@ -3184,12 +3439,13 @@ async fn conv_sink_process_batch_barrier_tracks_event_time() {
     let batch = make_batch(&schema, &["10.0.0.1"], ts);
     let push = RulePush {
         window_name: "auth_events".into(),
-        events: Arc::new(
+        events: Some(Arc::new(
             batch_to_events(&batch)
                 .into_iter()
                 .map(Arc::new)
                 .collect::<Vec<_>>(),
-        ),
+        )),
+        batch: None,
         seq: u64::MAX,
     };
     task.process_push(push).await;
@@ -3214,12 +3470,13 @@ async fn conv_sink_scan_timeouts_advances_barrier_by_wall_clock() {
     let batch = make_batch(&schema, &["10.0.0.1"], ts);
     let push = RulePush {
         window_name: "auth_events".into(),
-        events: Arc::new(
+        events: Some(Arc::new(
             batch_to_events(&batch)
                 .into_iter()
                 .map(Arc::new)
                 .collect::<Vec<_>>(),
-        ),
+        )),
+        batch: None,
         seq: u64::MAX,
     };
     task.process_push(push).await;
@@ -3615,12 +3872,13 @@ async fn conv_sink_sends_one_batch_per_process_batch() {
     let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.2", "10.0.0.1"], ts);
     let push = RulePush {
         window_name: "auth_events".into(),
-        events: Arc::new(
+        events: Some(Arc::new(
             batch_to_events(&batch)
                 .into_iter()
                 .map(Arc::new)
                 .collect::<Vec<_>>(),
-        ),
+        )),
+        batch: None,
         seq: u64::MAX,
     };
     task.process_push(push).await;

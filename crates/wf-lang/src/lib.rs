@@ -1,5 +1,6 @@
 pub mod ast;
 mod checker;
+pub mod columnar;
 mod compiler;
 pub mod diagnostics;
 pub mod error;

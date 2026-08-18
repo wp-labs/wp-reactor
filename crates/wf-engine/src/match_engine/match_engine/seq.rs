@@ -12,6 +12,7 @@ use wf_lang::plan::{BranchPlan, MatchPlan, SeqStepPlan};
 use super::eval::eval_expr_ext;
 use super::state::Instance;
 use super::types::{Event, Value, WindowLookup};
+use crate::match_engine::columnar::GuardMasks;
 
 /// A negation step: the event must NOT match within its window.
 pub(super) struct NegCheck {
@@ -70,11 +71,13 @@ pub(super) fn scan_negations(
     event: &Event,
     now_nanos: i64,
     windows: Option<&dyn WindowLookup>,
+    row: usize,
+    masks: Option<&GuardMasks>,
 ) {
     if meta.negs.is_empty() {
         return;
     }
-    for neg in &meta.negs {
+    for (neg_idx, neg) in meta.negs.iter().enumerate() {
         if neg.branch.source != alias {
             continue;
         }
@@ -104,13 +107,17 @@ pub(super) fn scan_negations(
         {
             continue;
         }
-        // Guard must pass for the event to count as a violation.
-        let guard_ok = match &neg.branch.guard {
-            Some(g) => matches!(
-                eval_expr_ext(g, event, windows, &mut instance.baselines),
-                Some(Value::Bool(true))
-            ),
-            None => true,
+        // Guard must pass for the event to count as a violation ("must be true"
+        // semantics — a null / missing field reads false in the two-valued mask).
+        let guard_ok = match masks.and_then(|m| m.neg_value(neg_idx, 0, row)) {
+            Some(ok) => ok,
+            None => match &neg.branch.guard {
+                Some(g) => matches!(
+                    eval_expr_ext(g, event, windows, &mut instance.baselines),
+                    Some(Value::Bool(true))
+                ),
+                None => true,
+            },
         };
         if guard_ok {
             instance.neg_violated = true;

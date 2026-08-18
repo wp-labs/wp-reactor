@@ -70,6 +70,7 @@ fn test_window(over_secs: u64, max_bytes: usize) -> Window {
             time_col_index: Some(0),
             over: Duration::from_secs(over_secs),
             materialize_fields: None,
+            defer_materialization: false,
         },
         test_config(max_bytes),
     )
@@ -181,6 +182,7 @@ fn memory_eviction_on_append() {
             time_col_index: Some(0),
             over: Duration::from_secs(3600),
             materialize_fields: None,
+            defer_materialization: false,
         },
         test_config(max_bytes),
     );
@@ -211,6 +213,7 @@ fn no_time_col_window() {
             time_col_index: None,
             over: Duration::from_secs(60),
             materialize_fields: None,
+            defer_materialization: false,
         },
         test_config(usize::MAX),
     );
@@ -418,6 +421,7 @@ fn read_since_gap_detection() {
             time_col_index: Some(0),
             over: Duration::from_secs(3600),
             materialize_fields: None,
+            defer_materialization: false,
         },
         test_config(max_bytes),
     );
@@ -717,6 +721,7 @@ fn window_evicts_on_parsed_event_footprint_not_content() {
                 time_col_index: Some(0),
                 over: Duration::from_secs(3600),
                 materialize_fields: None,
+                defer_materialization: false,
             },
             WindowConfig {
                 name: name.into(),
@@ -792,6 +797,7 @@ fn sized_append_keeps_events_lazily_parseable() {
             time_col_index: Some(0),
             over: Duration::from_secs(3600),
             materialize_fields: None,
+            defer_materialization: false,
         },
         WindowConfig {
             name: "lazy".into(),
