@@ -337,6 +337,7 @@ cargo test -p wf-runtime --lib → 165 passed
 6. ~~**Q1 旁路窗口 actor**~~ 🔬 已探明（未合入）：无状态 `on each` 窗口的 actor 是纯开销，
    把 raw batch 直接广播到规则任务（跳过 append/reorder/evict）确实把 **append/广播速率** 从
    ~7.17M 拉到 **~10.16M**；但用**滞后口径**（规则任务处理完才记 append，EMIT 精确=92M）
-   复测端到端只有 **~3.83M**——规则任务 CPU 仅 ~14%，真正的墙在 **alert sink/flush**
-   （`flush_alerts`/`flush_pipes` 异步阻塞），不是窗口 actor。**结论：Q1 端到端天花板是输出
-   sink，不是窗口；旁路已回退，下一步应二分 sink 交付路径。**
+   端到端仅 **~3.83M**——这是**并发广播**（10 parse worker 直推规则通道）导致的退化，不是
+   sink。切掉 sink 单独复测（`flush_alerts` 直接 drop）：EPS 7.52M/8.18M（vs 基线 7.17M），
+   **sink 只占 ~5-10%**。**结论：Q1 端到端天花板仍是管线深度（preread 2GB / Little's law），
+   sink 与窗口 actor 都不是主墙；旁路与 sink 切均已回退。**
