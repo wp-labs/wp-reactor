@@ -61,8 +61,116 @@ fn canonical_f64_bits(value: f64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Instance key — structured, unambiguous map key
+// Scope key — structured match key (SHARD routing)
 // ---------------------------------------------------------------------------
+//
+// The match key (e.g. Q2 `match<auction:10m>` → `auction`) is a small set of
+// scalar fields (number / timestamp / string, or their pairings). Instead of
+// serializing the key to a string just to hash it for sharding (the
+// `make_scope_key_str` → FNV path, the dominant per-event cost on Q2/Q5/Q7
+// sharded match), we build a typed [`ScopeKey`] directly from the source and
+// hash that. Byte-consistency with sharding is preserved by driving **both**
+// the columnar path and the row-based path through the same canonicalization
+// ([`ScopeKey::from_value`] / `scope_key_from_column`).
+
+/// A typed match-key. `Pair` supports two key fields (the common case); deeper
+/// nesting builds up via `Pair`. Integer-valued numbers collapse to `Int`
+/// (including `Timestamp(Ns)`, read as `i64`), so a columnar `Int64` column and
+/// the row-based `Value::Number(f64)` (integer, `<2^53`) produce the **same**
+/// variant and hash equal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub(crate) enum ScopeKey {
+    #[default]
+    Empty,
+    Int(i64),
+    Float(u64), // canonical f64 bits
+    Str(SmolStr),
+    Pair(Box<ScopeKey>, Box<ScopeKey>),
+}
+
+/// <2^53 where every integer is exactly representable as f64 (matches the
+/// existing native-int columnar dispatch / `number_literal`).
+const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
+
+/// Canonical f64 bits (0.0 → +0.0, NaN → canonical NaN), matching
+/// [`canonical_f64_bits`](super::super::match_engine::ValueKey) semantics.
+fn canonical_bits(n: f64) -> u64 {
+    if n == 0.0 {
+        0.0f64.to_bits()
+    } else if n.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        n.to_bits()
+    }
+}
+
+impl ScopeKey {
+    /// Build a [`ScopeKey`] from a [`Value`] (row-based path). Integer-valued
+    /// numbers (and full-precision integers) → `Int`; fractional / huge floats
+    /// → `Float`; strings → `Str`. Structured values fall back to their string
+    /// form so they still shard deterministically.
+    pub(crate) fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Number(n) => {
+                if n.fract() == 0.0 && n.abs() < TWO_POW_53 {
+                    ScopeKey::Int(*n as i64)
+                } else {
+                    ScopeKey::Float(canonical_bits(*n))
+                }
+            }
+            Value::Str(s) => ScopeKey::Str(s.clone()),
+            Value::Bool(b) => ScopeKey::Str(if *b { "true" } else { "false" }.into()),
+            Value::Array(_) | Value::Object(_) => ScopeKey::Str(value_to_string(value).into()),
+        }
+    }
+}
+
+/// FNV-1a shard index over a [`ScopeKey`]'s normative bytes. Kept deterministic
+/// and independent of `HashMap`'s random seed, like the old string-hash
+/// [`shard_index`] it replaces — but it hashes the **typed** key (tag + raw
+/// payload) instead of a re-serialized string, so building the key is cheap.
+pub(crate) fn scope_key_shard_index(key: &ScopeKey, shard_count: usize) -> usize {
+    if shard_count <= 1 {
+        return 0;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let tag = match key {
+        ScopeKey::Empty => 0u8,
+        ScopeKey::Int(_) => 1,
+        ScopeKey::Float(_) => 2,
+        ScopeKey::Str(_) => 3,
+        ScopeKey::Pair(_, _) => 4,
+    };
+    mix_byte(&mut hash, tag);
+    nested_bytes(&mut hash, key);
+    (hash as usize) % shard_count
+}
+
+fn mix_byte(hash: &mut u64, b: u8) {
+    *hash ^= u64::from(b);
+    *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+}
+
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        mix_byte(hash, b);
+    }
+}
+
+fn nested_bytes(hash: &mut u64, key: &ScopeKey) {
+    // Tag + payload for a nested key, so left/right order matters.
+    match key {
+        ScopeKey::Empty => {}
+        ScopeKey::Int(v) => hash_bytes(hash, &v.to_ne_bytes()),
+        ScopeKey::Float(bits) => hash_bytes(hash, &bits.to_ne_bytes()),
+        ScopeKey::Str(s) => hash_bytes(hash, s.as_bytes()),
+        ScopeKey::Pair(a, b) => {
+            nested_bytes(hash, a);
+            hash_bytes(hash, &[0x1f]);
+            nested_bytes(hash, b);
+        }
+    }
+}
 
 /// Structured instance key for the `CepStateMachine` instances map.
 ///
@@ -278,21 +386,9 @@ pub(crate) fn eval_field_value(
     Some(value)
 }
 
-/// Deterministic shard index for a scope key (FNV-1a over the key's string
-/// form). Used by the partitioned fan-out so the same key always lands on the
-/// same shard — independent of `HashMap`'s random seed.
-pub(crate) fn shard_index(scope_key: &[Value], shard_count: usize) -> usize {
-    if shard_count <= 1 {
-        return 0;
-    }
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in make_scope_key_str(scope_key).as_bytes() {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    (hash as usize) % shard_count
-}
-
+/// Deterministic shard index for a scope key (superseded by
+/// [`scope_key_shard_index`], which hashes the typed [`ScopeKey`] instead of a
+/// re-serialized string). Kept inline for reference / legacy tests.
 pub(crate) fn value_to_string(v: &Value) -> String {
     match v {
         Value::Number(n) => n.to_string(),

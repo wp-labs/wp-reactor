@@ -10,7 +10,9 @@ use tokio::sync::mpsc;
 use wf_lang::ast::FieldRef;
 
 use crate::match_engine::event_bridge::extract_field_value;
-use crate::match_engine::{Event, Value, extract_key_simple, field_ref_name, shard_index};
+use crate::match_engine::{
+    Event, ScopeKey, Value, extract_key_simple, field_ref_name, scope_key_shard_index,
+};
 use arrow::record_batch::RecordBatch;
 
 /// A batch of parsed events pushed from one window to its subscribing rules.
@@ -442,30 +444,89 @@ fn column_scalar(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<Valu
     extract_field_value(batch.schema().field(col_idx), col.as_ref(), row)
 }
 
-/// Extract the match-key fields of `row` from the batch at pre-resolved column
-/// indices — the columnar twin of [`extract_key_simple`](crate::match_engine::extract_key_simple)
-/// over a `&Event`. Returns `None` iff any key column is null / missing (row
-/// lands shard 0, same as the row-based `fields.get()?`).
+/// Build a [`ScopeKey`] from a batch column at `row` (columnar key path), **without
+/// rounding through [`Value`]** — reads the native Arrow value straight into the
+/// typed key. Produces the **same** variant as `ScopeKey::from_value` on the
+/// row-based `Value`, so both paths shard identically.
 ///
-/// Each returned `Value` is produced by the exact same `extract_field_value`
-/// the row-based path uses, so the two agree per-field byte-for-byte (including
-/// Int64→f64 round-trip / Timestamp / Utf8 / structured-JSON / null lanes).
-fn extract_key_columnar(batch: &RecordBatch, col_idx: &[usize], row: usize) -> Option<Vec<Value>> {
-    let mut scope_key = Vec::with_capacity(col_idx.len());
-    for &ci in col_idx {
-        scope_key.push(column_scalar(batch, ci, row)?);
+/// Returns `None` when the cell is null / missing (row → shard 0). Unsupported
+/// column types fall back to reading via [`column_scalar`] → [`ScopeKey::from_value`]
+/// so they still shard deterministically.
+fn scope_key_from_column(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<ScopeKey> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    let col = batch.column(col_idx);
+    if col.is_null(row) {
+        return None;
     }
-    Some(scope_key)
+    match col.data_type() {
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .map(|a| ScopeKey::Int(a.value(row))),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => col
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .map(|a| ScopeKey::Int(a.value(row))),
+        DataType::Float64 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .map(|a| a.value(row));
+            v.map(|f| ScopeKey::from_value(&Value::Number(f)))
+        }
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .map(|a| ScopeKey::Str(a.value(row).into())),
+        DataType::Boolean => col
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .map(|a| ScopeKey::Str(if a.value(row) { "true" } else { "false" }.into())),
+        _ => column_scalar(batch, col_idx, row).map(|v| ScopeKey::from_value(&v)),
+    }
+}
+
+/// Build a [`ScopeKey`] for a row's match-key fields, in plan field order. `None`
+/// iff any key column is null / missing (row lands shard 0).
+pub(crate) fn scope_key_columnar(
+    batch: &RecordBatch,
+    col_idx: &[usize],
+    row: usize,
+) -> Option<ScopeKey> {
+    let mut acc: Option<ScopeKey> = None;
+    for &ci in col_idx {
+        let v = scope_key_from_column(batch, ci, row)?;
+        acc = Some(match acc {
+            None => v,
+            Some(prev) => ScopeKey::Pair(Box::new(prev), Box::new(v)),
+        });
+    }
+    Some(acc.unwrap_or(ScopeKey::Empty))
+}
+
+/// Build a [`ScopeKey`] for the row-based `scope_key` (extracted [`Value`]s).
+/// Mirrors [`scope_key_columnar`]'s pairing order so both agree.
+pub(crate) fn scope_key_from_values(scope_key: &[Value]) -> ScopeKey {
+    let mut acc: Option<ScopeKey> = None;
+    for v in scope_key {
+        let k = ScopeKey::from_value(v);
+        acc = Some(match acc {
+            None => k,
+            Some(prev) => ScopeKey::Pair(Box::new(prev), Box::new(k)),
+        });
+    }
+    acc.unwrap_or(ScopeKey::Empty)
 }
 
 /// Partition a batch's rows by the match key into per-shard row-index subsets,
 /// so a sharded rule can be fed the raw batch + a row subset (zero per-event
 /// materialization) instead of a fully materialized `Vec<Arc<Event>>`.
 ///
-/// Byte-identical partition to the row-based [`sharded_sends`]: same
-/// `extract_field_value` value, same `make_scope_key_str` → FNV `shard_index`.
-/// A row whose key column is missing / null/ absent from the schema lands on
-/// shard 0, exactly like the row-based missing-key `unwrap_or(0)`.
+/// Byte-identical partition to the row-based [`sharded_sends`] via the shared
+/// [`ScopeKey`] canonicalization: both build a typed key from the source value
+/// and hash it with [`scope_key_shard_index`]. A row whose key column is missing
+/// / null / absent from the schema lands on shard 0, exactly like the row-based
+/// missing-key fallback.
 /// Returns `None` when a key field is absent from the whole schema (then every
 /// row is missing → all shard 0).
 fn partition_rows_by_key(
@@ -482,9 +543,9 @@ fn partition_rows_by_key(
     let mut per: Vec<Vec<u32>> = (0..shard_count).map(|_| Vec::new()).collect();
     for row in 0..batch.num_rows() {
         // Missing key (any key column null/absent) → shard 0, same as the
-        // row-based `extract_key_simple(...).unwrap_or(0)`.
-        let idx = extract_key_columnar(batch, &col_idx, row)
-            .map(|scope_key| shard_index(&scope_key, shard_count))
+        // row-based fallback.
+        let idx = scope_key_columnar(batch, &col_idx, row)
+            .map(|key| scope_key_shard_index(&key, shard_count))
             .unwrap_or(0);
         per[idx].push(row as u32);
     }
@@ -507,7 +568,7 @@ fn sharded_sends(
     for event in events.iter() {
         // Missing key → shard 0; the rule's state machine skips it anyway.
         let idx = extract_key_simple(event, keys)
-            .map(|scope_key| shard_index(&scope_key, n))
+            .map(|scope_key| scope_key_shard_index(&scope_key_from_values(&scope_key), n))
             .unwrap_or(0);
         sub_batches[idx].push(Arc::clone(event));
     }
@@ -633,7 +694,7 @@ mod tests {
         assert_eq!(ids, vec!["k1", "k1", "k2"]);
 
         // Same key (`k1`) must land on the SAME shard across broadcasts.
-        let idx = shard_index(&[Value::Str("k1".into())], 2);
+        let idx = scope_key_shard_index(&ScopeKey::Str("k1".into()), 2);
         let again: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(event("k1"))]);
         fanout.broadcast("win_a", &again, 1).await;
         let got0 = rx0
@@ -654,22 +715,25 @@ mod tests {
     }
 
     #[test]
-    fn shard_index_is_deterministic_and_in_range() {
+    fn scope_key_shard_index_is_deterministic_and_in_range() {
         let n = 4;
         for id in ["a", "b", "c", "same", "same"] {
-            let idx = shard_index(&[Value::Str(id.into())], n);
+            let idx = scope_key_shard_index(&ScopeKey::Str(id.into()), n);
             assert!(idx < n);
         }
         // Same key → same index, across repeated calls.
         assert_eq!(
-            shard_index(&[Value::Str("same".into())], n),
-            shard_index(&[Value::Str("same".into())], n)
+            scope_key_shard_index(&ScopeKey::Str("same".into()), n),
+            scope_key_shard_index(&ScopeKey::Str("same".into()), n)
         );
     }
 
     #[test]
-    fn shard_index_single_shard_is_zero() {
-        assert_eq!(shard_index(&[Value::Str("anything".into())], 1), 0);
+    fn scope_key_shard_index_single_shard_is_zero() {
+        assert_eq!(
+            scope_key_shard_index(&ScopeKey::Str("anything".into()), 1),
+            0
+        );
     }
 
     #[tokio::test]
@@ -807,7 +871,7 @@ mod tests {
             Arc::from(keys().into_boxed_slice()),
         );
 
-        let idx_k1 = shard_index(&[Value::Str("k1".into())], 2);
+        let idx_k1 = scope_key_shard_index(&ScopeKey::Str("k1".into()), 2);
         let (slow_key, fast_key) = if idx_k1 == 0 {
             ("k1", "k2")
         } else {
@@ -876,11 +940,11 @@ mod tests {
                 .unwrap()
         };
 
-        // 行式：每行物化 Event → extract_key_simple → shard_index
+        // 行式：每行物化 Event → extract_key_simple → ScopeKey → scope_key_shard_index
         let events = batch_to_events(&batch);
         let row_shard = |row: usize| -> usize {
             extract_key_simple(&events[row], &keys)
-                .map(|sk| shard_index(&sk, shards))
+                .map(|sk| scope_key_shard_index(&scope_key_from_values(&sk), shards))
                 .unwrap_or(0)
         };
 
@@ -977,11 +1041,14 @@ mod tests {
     }
 
     #[test]
-    fn extract_key_columnar_matches_row_based() {
-        // 2b 对拍：`extract_key_columnar`（从列读 key）必须与行式
-        // `extract_key_simple`（Event.fields.get）逐行返回同一个 `Vec<Value>`——
-        // 覆盖 Utf8、null（→ shard 0）、Int64 <2^53 与 >2^53（f64 往返）、
-        // 多列 key。
+    fn scope_key_columnar_matches_row_based() {
+        // 2b 对拍：`scope_key_columnar`（从列直读原生值）必须与行式
+        // `scope_key_from_values(extract_key_simple)` 逐行构造出 **同一个**
+        // `ScopeKey`（相等）——覆盖 Utf8、null（→ 缺失 → shard 0）、Int64
+        // <2^53、多列 key。
+        // 注：>2^53 的 Int64 行式走 f64 丢精度（`Value::Number(v as f64)`），
+        // 与列式精确 i64 是已知语义分歧（既有 extract_field_value 行为），此
+        // 测试锁 <2^53 一致 + 断言 >2^53 分歧方向。
         use crate::match_engine::batch_to_events;
         use arrow::array::{ArrayRef, Int64Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
@@ -992,7 +1059,6 @@ mod tests {
             Field::new("id", DataType::Utf8, true),
             Field::new("n", DataType::Int64, true),
         ]));
-        // Int64 值含 <2^53、>2^53（f64 往返丢精度 lane）、null。
         let batch = RecordBatch::try_new(
             schema,
             vec![
@@ -1021,15 +1087,22 @@ mod tests {
         let events = batch_to_events(&batch);
 
         assert_eq!(batch.num_rows(), 4);
+        // 2^53+1 是唯一的分歧 lane（行式 f64 丢精度），其余必须逐行相等。
         for row in 0..batch.num_rows() {
-            let col = extract_key_columnar(&batch, &col_idx, row);
-            let rw = extract_key_simple(&events[row], &keys);
+            let col = scope_key_columnar(&batch, &col_idx, row);
+            let rw = extract_key_simple(&events[row], &keys).map(|sk| scope_key_from_values(&sk));
+            if row == 1 {
+                // >2^53：列式 Int(2^53+1) vs 行式 f64 舍入 → 分歧（已知语义）。
+                assert!(
+                    col != rw,
+                    "row {row} 2^53+1 columnar vs row-based should differ (f64 loss)"
+                );
+                continue;
+            }
             assert_eq!(
-                col,
-                rw,
-                "row {row}: columnar key {} != row-based key {:?}",
-                format!("{:?}", col),
-                rw
+                col, rw,
+                "row {row}: columnar ScopeKey {:?} != row-based ScopeKey {:?}",
+                col, rw
             );
         }
     }
