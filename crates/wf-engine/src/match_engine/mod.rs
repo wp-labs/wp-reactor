@@ -24,5 +24,5 @@ pub use match_engine::{
 };
 pub use match_engine::{EngineHashMap, EngineHashSet};
 pub(crate) use match_engine::{
-    ScopeKey, extract_key_simple, field_ref_name, scope_key_shard_index,
+    ScopeKey, extract_key_simple, field_ref_name, scope_key_from_values, scope_key_shard_index,
 };

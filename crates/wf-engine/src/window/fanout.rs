@@ -11,7 +11,8 @@ use wf_lang::ast::FieldRef;
 
 use crate::match_engine::event_bridge::extract_field_value;
 use crate::match_engine::{
-    Event, ScopeKey, Value, extract_key_simple, field_ref_name, scope_key_shard_index,
+    Event, ScopeKey, Value, extract_key_simple, field_ref_name, scope_key_from_values,
+    scope_key_shard_index,
 };
 use arrow::record_batch::RecordBatch;
 
@@ -502,20 +503,6 @@ pub(crate) fn scope_key_columnar(
         });
     }
     Some(acc.unwrap_or(ScopeKey::Empty))
-}
-
-/// Build a [`ScopeKey`] for the row-based `scope_key` (extracted [`Value`]s).
-/// Mirrors [`scope_key_columnar`]'s pairing order so both agree.
-pub(crate) fn scope_key_from_values(scope_key: &[Value]) -> ScopeKey {
-    let mut acc: Option<ScopeKey> = None;
-    for v in scope_key {
-        let k = ScopeKey::from_value(v);
-        acc = Some(match acc {
-            None => k,
-            Some(prev) => ScopeKey::Pair(Box::new(prev), Box::new(k)),
-        });
-    }
-    acc.unwrap_or(ScopeKey::Empty)
 }
 
 /// Partition a batch's rows by the match key into per-shard row-index subsets,

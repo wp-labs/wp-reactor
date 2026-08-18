@@ -19,7 +19,7 @@ pub use types::{EngineHashMap, EngineHashSet};
 // Re-export pub(crate) items
 pub(crate) use eval::{eval_expr, values_equal};
 pub(crate) use key::{
-    ScopeKey, eval_field_value, extract_key_simple, field_ref_name, make_scope_key_str,
+    ScopeKey, eval_field_value, extract_key_simple, field_ref_name, scope_key_from_values,
     scope_key_shard_index, value_to_string,
 };
 
@@ -327,15 +327,16 @@ impl CepStateMachine {
         let (instance_key, fixed_created_at) = match self.plan.window_spec {
             WindowSpec::Sliding(_) | WindowSpec::Session(_) => {
                 // Session windows use sliding-style keys but with gap-based expiration
-                (InstanceKey::sliding(&scope_key), None)
+                (
+                    InstanceKey::sliding(&scope_key_from_values(&scope_key)),
+                    None,
+                )
             }
             WindowSpec::Fixed(dur) => {
                 let dur_nanos = dur.as_nanos() as i64;
                 let bucket_start = (now_nanos / dur_nanos) * dur_nanos;
-                (
-                    InstanceKey::fixed(&scope_key, bucket_start),
-                    Some(bucket_start),
-                )
+                let skey = scope_key_from_values(&scope_key);
+                (InstanceKey::fixed(&skey, bucket_start), Some(bucket_start))
             }
         };
 
@@ -968,14 +969,14 @@ impl CepStateMachine {
     /// scope key. This method closes the **oldest** bucket instance (by
     /// `created_at`). Call repeatedly to drain all buckets.
     pub fn close(&mut self, scope_key: &[Value], reason: CloseReason) -> Option<CloseOutput> {
-        let scope_key_str = make_scope_key_str(scope_key);
+        let skey = scope_key_from_values(scope_key);
 
         let instance_key = match self.plan.window_spec {
-            WindowSpec::Sliding(_) | WindowSpec::Session(_) => InstanceKey::sliding(scope_key),
+            WindowSpec::Sliding(_) | WindowSpec::Session(_) => InstanceKey::sliding(&skey),
             WindowSpec::Fixed(_) => self
                 .instances
                 .iter()
-                .filter(|(k, _)| k.matches_scope(&scope_key_str))
+                .filter(|(k, _)| k.matches_scope(&skey))
                 .min_by_key(|(_, inst)| inst.created_at)
                 .map(|(k, _)| k.clone())?,
         };

@@ -125,6 +125,22 @@ impl ScopeKey {
     }
 }
 
+/// Build a [`ScopeKey`] for a sequence of extracted [`Value`]s (row-based
+/// `extract_key_simple` output), in plan field order. Mirrors
+/// [`crate::window::fanout::scope_key_columnar`]'s pairing order so both
+/// columnar and row-based paths produce the same key.
+pub(crate) fn scope_key_from_values(scope_key: &[Value]) -> ScopeKey {
+    let mut acc: Option<ScopeKey> = None;
+    for v in scope_key {
+        let k = ScopeKey::from_value(v);
+        acc = Some(match acc {
+            None => k,
+            Some(prev) => ScopeKey::Pair(Box::new(prev), Box::new(k)),
+        });
+    }
+    acc.unwrap_or(ScopeKey::Empty)
+}
+
 /// FNV-1a shard index over a [`ScopeKey`]'s normative bytes. Kept deterministic
 /// and independent of `HashMap`'s random seed, like the old string-hash
 /// [`shard_index`] it replaces — but it hashes the **typed** key (tag + raw
@@ -176,74 +192,58 @@ fn nested_bytes(hash: &mut u64, key: &ScopeKey) {
 ///
 /// For sliding windows: `scope_key` identifies the instance, `bucket_start`
 /// is `None`. For fixed windows: each `(scope_key, bucket_start)` pair is
-/// a separate instance.
+/// a separate instance. The scope is a typed [`ScopeKey`] (not a re-serialized
+/// string), so building the key for the per-event lookup is cheap — no
+/// number-to-string formatting on the hot path.
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub(super) struct InstanceKey {
-    /// SmolStr: a single-key scope (auction id, ip, …) is ≤22 bytes and stores
-    /// inline — the old `String` allocated on the heap for every event's
-    /// instance lookup, the dominant per-event allocation in `advance_at`.
-    pub scope_key_str: SmolStr,
+    pub scope_key: ScopeKey,
     pub bucket_start: Option<i64>,
 }
 
 impl InstanceKey {
-    pub fn sliding(scope_key: &[Value]) -> Self {
+    pub fn sliding(scope_key: &ScopeKey) -> Self {
         Self {
-            scope_key_str: make_scope_key_str(scope_key),
+            scope_key: scope_key.clone(),
             bucket_start: None,
         }
     }
 
-    pub fn fixed(scope_key: &[Value], bucket_start: i64) -> Self {
+    pub fn fixed(scope_key: &ScopeKey, bucket_start: i64) -> Self {
         Self {
-            scope_key_str: make_scope_key_str(scope_key),
+            scope_key: scope_key.clone(),
             bucket_start: Some(bucket_start),
         }
     }
 
     /// Check if this key belongs to the given scope (ignoring bucket).
-    pub fn matches_scope(&self, scope_key_str: &str) -> bool {
-        self.scope_key_str == scope_key_str
+    pub fn matches_scope(&self, scope_key: &ScopeKey) -> bool {
+        &self.scope_key == scope_key
     }
 
-    /// Rebuild the scope-key `Value`s from the stored string form.
-    ///
-    /// The instance no longer stores its own `Vec<Value>` scope_key (it is
-    /// redundant with this key's string), so close/match output reconstructs it
-    /// here on demand. Key components are `\x1f`-joined by [`make_scope_key_str`].
-    /// Note: type is not preserved — numeric key components come back as `Str`.
+    /// Rebuild the scope-key `Value`s from the typed key, for close/match
+    /// output. Numeric components come back as `Str` (their Display form),
+    /// preserving the pre-refactor type-erased behaviour of the old string key.
     pub fn scope_key_values(&self) -> Vec<Value> {
-        self.scope_key_str
-            .split('\x1f')
-            .map(|s| Value::Str(s.into()))
-            .collect()
+        flatten_scope_values(&self.scope_key)
     }
 }
 
-pub(crate) fn make_scope_key_str(scope_key: &[Value]) -> SmolStr {
-    // Write each key value straight into a SmolStrBuilder — no intermediate
-    // String per key field, no Vec<String>, and short single-field keys (the
-    // common case: auction id, ip, …) stay inline in the 24B SmolStr with zero
-    // heap allocation. Byte-for-byte identical to `value_to_string` joined by
-    // \x1f (Number via Display, Bool "true"/"false", Str verbatim).
-    use std::fmt::Write;
-    let mut b = smol_str::SmolStrBuilder::new();
-    for (i, v) in scope_key.iter().enumerate() {
-        if i > 0 {
-            b.push('\x1f');
-        }
-        match v {
-            Value::Number(n) => {
-                let _ = write!(b, "{n}");
-            }
-            Value::Str(st) => b.push_str(st),
-            Value::Bool(bv) => b.push_str(if *bv { "true" } else { "false" }),
-            Value::Array(_) => b.push_str("[array]"),
-            Value::Object(_) => b.push_str("[object]"),
+/// Flatten a possibly-`Pair`ed [`ScopeKey`] into its leaf [`Value`]s (all `Str`),
+/// matching the old `\x1f`-split string reconstruction.
+fn flatten_scope_values(key: &ScopeKey) -> Vec<Value> {
+    match key {
+        ScopeKey::Empty => vec![],
+        ScopeKey::Int(v) => vec![Value::Str(v.to_string().into())],
+        ScopeKey::Float(bits) => vec![Value::Str(f64::from_bits(*bits).to_string().into())],
+        ScopeKey::Str(s) => vec![Value::Str(s.clone())],
+        ScopeKey::Pair(a, b) => {
+            let mut out = flatten_scope_values(a);
+            out.extend(flatten_scope_values(b));
+            out
         }
     }
-    b.finish()
 }
 
 // ---------------------------------------------------------------------------
