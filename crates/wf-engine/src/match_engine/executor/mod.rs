@@ -424,7 +424,13 @@ fn coerce_yield_value(
 
 fn coerce_yield_base_value(name: &str, base_type: &BaseType, value: Value) -> CoreResult<Value> {
     match base_type {
-        BaseType::Chars => render_yield_value_as_string(value).map(|s| Value::Str(s.into())),
+        BaseType::Chars => match value {
+            // Already a string: pass through without re-rendering — saves one
+            // `String` allocation per cell on the hot path and is
+            // byte-identical to `render_yield_value_as_string`.
+            Value::Str(_) => Ok(value),
+            _ => render_yield_value_as_string(value).map(|s| Value::Str(s.into())),
+        },
         BaseType::Digit => match value {
             Value::Number(n) if n.is_finite() && n.fract() == 0.0 => Ok(Value::Number(n)),
             _ => CoreReason::DataFormat

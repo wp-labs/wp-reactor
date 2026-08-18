@@ -41,15 +41,20 @@ use wf_lang::wfu_meta::{
 pub struct AlertColumnBatch {
     target: Arc<str>,
     len: usize,
-    /// Fixed system-field columns, in `to_data_record` order.
-    wfx_id: Vec<Arc<str>>,
+    /// Fixed system-field columns, in `to_data_record` order. `wfx_id` /
+    /// `entity_id` / `fired_at` are per-row owned strings — stored as `String`
+    /// so the columnar direct path moves them in with zero extra allocation
+    /// (an `Arc` would pay a fresh allocation + memcpy per row for a value
+    /// that is never shared). The remaining six are plan/batch constants and
+    /// stay `Arc<str>` (refcount-shared).
+    wfx_id: Vec<String>,
     rule_name: Vec<Arc<str>>,
     score: Vec<f64>,
     entity_type: Vec<Arc<str>>,
-    entity_id: Vec<Arc<str>>,
+    entity_id: Vec<String>,
     origin: Vec<Arc<str>>,
     close_reason: Vec<Arc<str>>,
-    fired_at: Vec<Arc<str>>,
+    fired_at: Vec<String>,
     emit_time: Vec<Arc<str>>,
     summary: Vec<Arc<str>>,
     /// Yield columns (layout follows the first appended record).
@@ -83,7 +88,7 @@ impl AlertColumnBatch {
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
                 WFU_ID,
-                ModelValue::from(self.wfx_id[row].as_ref()),
+                ModelValue::from(self.wfx_id[row].as_str()),
             )));
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
@@ -103,7 +108,7 @@ impl AlertColumnBatch {
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
                 WFU_ENTITY_ID,
-                ModelValue::from(self.entity_id[row].as_ref()),
+                ModelValue::from(self.entity_id[row].as_str()),
             )));
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
@@ -118,7 +123,7 @@ impl AlertColumnBatch {
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
                 WFU_FIRED_AT,
-                ModelValue::from(self.fired_at[row].as_ref()),
+                ModelValue::from(self.fired_at[row].as_str()),
             )));
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
@@ -175,14 +180,14 @@ pub struct EachRowCells<'a> {
 pub struct AlertColumnBuilder {
     target: Arc<str>,
     len: usize,
-    wfx_id: Vec<Arc<str>>,
+    wfx_id: Vec<String>,
     rule_name: Vec<Arc<str>>,
     score: Vec<f64>,
     entity_type: Vec<Arc<str>>,
-    entity_id: Vec<Arc<str>>,
+    entity_id: Vec<String>,
     origin: Vec<Arc<str>>,
     close_reason: Vec<Arc<str>>,
-    fired_at: Vec<Arc<str>>,
+    fired_at: Vec<String>,
     emit_time: Vec<Arc<str>>,
     summary: Vec<Arc<str>>,
     yield_cols: Vec<YieldCol>,
@@ -203,7 +208,6 @@ pub struct AlertColumnBuilder {
     /// record-based `append_record` path stays independent.
     staged: Vec<(usize, DataType, ModelValue)>,
 }
-
 impl AlertColumnBuilder {
     pub fn new(target: Arc<str>) -> Self {
         Self {
@@ -270,12 +274,12 @@ impl AlertColumnBuilder {
             return Err(e);
         }
 
-        // Infallible column pushes (system fields, then yield cells).
-        self.wfx_id.push(Arc::from(record.wfx_id.as_str()));
+        /// Infallible column pushes (system fields, then yield cells).
+        self.wfx_id.push(record.wfx_id.clone());
         self.rule_name.push(Arc::clone(&record.rule_name));
         self.score.push(record.score);
         self.entity_type.push(Arc::clone(&record.entity_type));
-        self.entity_id.push(Arc::from(record.entity_id.as_str()));
+        self.entity_id.push(record.entity_id.clone());
         self.origin.push(Arc::from(record.origin.as_str()));
         self.close_reason.push(Arc::from(
             record
@@ -283,7 +287,7 @@ impl AlertColumnBuilder {
                 .close_reason()
                 .map_or("", |reason| reason.as_str()),
         ));
-        self.fired_at.push(Arc::from(record.fired_at.as_str()));
+        self.fired_at.push(record.fired_at.clone());
         self.emit_time.push(Arc::clone(&record.emit_time));
         self.summary.push(Arc::clone(&record.summary));
         for (col_idx, meta, value) in scratch.drain(..) {
@@ -468,14 +472,14 @@ impl AlertColumnBuilder {
     /// (`"event"` / `""`) — pass the precomputed `Arc`s from `OutputStatic`
     /// so no per-record string copy happens for them.
     pub fn commit_each_row(&mut self, cells: EachRowCells<'_>) {
-        self.wfx_id.push(Arc::from(cells.wfx_id));
+        self.wfx_id.push(cells.wfx_id);
         self.rule_name.push(Arc::clone(cells.rule_name));
         self.score.push(cells.score);
         self.entity_type.push(Arc::clone(cells.entity_type));
-        self.entity_id.push(Arc::from(cells.entity_id));
+        self.entity_id.push(cells.entity_id);
         self.origin.push(Arc::clone(cells.origin));
         self.close_reason.push(Arc::clone(cells.close_reason));
-        self.fired_at.push(Arc::from(cells.fired_at));
+        self.fired_at.push(cells.fired_at);
         self.emit_time.push(Arc::clone(cells.emit_time));
         self.summary.push(Arc::clone(cells.summary));
         for (col_idx, meta, value) in self.staged.drain(..) {

@@ -291,10 +291,16 @@ fn export_typed_value(base_type: &BaseType, value: &Value) -> CoreResult<(DataTy
                 .with_detail("bool field requires a boolean")
                 .err(),
         },
-        BaseType::Chars => Ok((
-            DataType::Chars,
-            ModelValue::from(render_value_as_string(value)?.as_str()),
-        )),
+        BaseType::Chars => match value {
+            // Already a string: take the bytes directly — saves one `String`
+            // allocation per cell and is byte-identical to
+            // `render_value_as_string`.
+            Value::Str(s) => Ok((DataType::Chars, ModelValue::from(s.as_str()))),
+            _ => Ok((
+                DataType::Chars,
+                ModelValue::from(render_value_as_string(value)?.as_str()),
+            )),
+        },
         BaseType::Time => {
             let dt = parse_time_value(value)?;
             Ok((DataType::Time, ModelValue::from(dt)))

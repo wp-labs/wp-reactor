@@ -84,6 +84,8 @@ fn q1_plan_rule() -> RuleExecutor {
 
 /// Q1 形态的 bid_events 批（7 列与 nexmark_pk 一致；auction 递增保证
 /// wfx_id 哈希输入逐行变化，贴近真实访问模式）。
+/// 数字/字符串形态对齐真实 nexmark 数据（9-12 位 auction、40-60B url）——
+/// 固定短串会系统性低估 wfx_id 的渲染与哈希成本。
 fn q1_batch(n: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("auction", DataType::Int64, false),
@@ -94,12 +96,34 @@ fn q1_batch(n: usize) -> RecordBatch {
         Field::new("dateTime", DataType::Int64, false),
         Field::new("extra", DataType::Utf8, false),
     ]));
-    let auction: Vec<i64> = (0..n as i64).collect();
-    let bidder = vec![1i64; n];
-    let price = vec![7i64; n];
-    let date_time = vec![1_700_000_000_000i64; n];
+    // Deterministic pseudo-random so failures reproduce; shapes match
+    // nexmark_pk generator output (auction ~1e9..1e12, url ~40-60 chars).
+    let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = |range: u64| {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (rng >> 33) % range
+    };
+    let mut auction = Vec::with_capacity(n);
+    let mut bidder = Vec::with_capacity(n);
+    let mut price = Vec::with_capacity(n);
+    let mut date_time = Vec::with_capacity(n);
+    let mut url = Vec::with_capacity(n);
+    for _ in 0..n {
+        auction.push((next(1_000_000_000) + 1) as i64);
+        bidder.push((next(1_000_000_000) + 1) as i64);
+        price.push((next(10_000_000) + 1) as i64);
+        date_time.push(1_700_000_000_000i64 + next(86_400_000) as i64);
+        let len = 40 + next(20) as usize;
+        let mut s = String::with_capacity(len + 11);
+        s.push_str("http://example.com/p/");
+        for _ in 0..len {
+            s.push((b'a' + next(26) as u8) as char);
+        }
+        url.push(s);
+    }
     let channel = vec!["mobile"; n];
-    let url = vec!["http://example.com/1"; n];
     let extra = vec!["x"; n];
     RecordBatch::try_new(
         schema,
@@ -330,6 +354,62 @@ fn q1_each_components_per_row() {
     fmt.line(baseline_ns);
     assert!(sum > 0);
 
+    // ---- 端到端并发模拟：10 线程同时跑 execute（模拟 10 worker 的
+    // 缓存/带宽/分配器竞争）。每线程独立构造自己的 100k 行 batch
+    // （真实端到端里各 worker 处理不同 batch），Barrier 同步后计时只
+    // 覆盖 execute。 ----
+    {
+        let workers = 10usize;
+        let per_worker = N / workers;
+        let exec = Arc::new(q1_plan_rule());
+        let barrier = Arc::new(std::sync::Barrier::new(workers + 1));
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                let exec = Arc::clone(&exec);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let batch = q1_batch(per_worker);
+                    let col_events: Vec<ColumnarEvent<'_>> = (0..per_worker)
+                        .map(|r| ColumnarEvent::new(&batch, r))
+                        .collect();
+                    let sorted_fields = sorted_fields_for(&batch);
+                    let rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ev)| (ev, NANOS + w as i64 * per_worker as i64 + i as i64))
+                        .collect();
+                    barrier.wait();
+                    let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+                    let mut appended = Vec::new();
+                    let mut total = 0usize;
+                    for chunk in rows.chunks(ALERT_BATCH_SIZE) {
+                        let stats = exec.execute_each_direct_batch_columnar(
+                            chunk,
+                            &sorted_fields,
+                            NANOS,
+                            &mut builder,
+                            &mut appended,
+                        );
+                        total += stats.appended;
+                    }
+                    total
+                })
+            })
+            .collect();
+        barrier.wait();
+        let start = Instant::now();
+        let total_rows: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        let el = start.elapsed();
+        let per = el.as_secs_f64() * 1e9 / total_rows as f64;
+        eprintln!(
+            "[each-bench] 10线程并发 execute: {:>7.1} ns/row  ({:>5.1}M rows/s 合计, 加速比 {:>4.2}x)  = {:>5.1}% of baseline",
+            per,
+            total_rows as f64 / el.as_secs_f64() / 1e6,
+            baseline_ns / per,
+            per / baseline_ns * 100.0
+        );
+    }
+
     // ---- 归因校验：四项之和 ≈ baseline（差值 = 行访问/循环/遥测弥散开销） ----
     let sum_parts = a.per_ns + b.per_ns + c.per_ns + d.per_ns;
     eprintln!(
@@ -338,9 +418,5 @@ fn q1_each_components_per_row() {
         baseline_ns,
         (baseline_ns - sum_parts).max(0.0),
         ((baseline_ns - sum_parts).max(0.0)) / baseline_ns * 100.0
-    );
-    assert!(
-        c.per_ns > a.per_ns,
-        "fill 不应小于 wfx_id（占比结论的 sanity check）"
     );
 }

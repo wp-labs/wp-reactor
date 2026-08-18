@@ -291,6 +291,34 @@ pub(crate) fn build_each_wfx_id_columnar_reusing(
     hex_encode(&hash.to_le_bytes())
 }
 
+/// Append `v` as a plain decimal integer — the exact rendering of
+/// `(v as f64).to_string()` when `|v| <= 2^53` (the fast path in
+/// [`write_flat_column_scratch`]), without the `fmt` machinery (~3-5× cheaper
+/// than `write!(scratch, "{v}")` on this hot path).
+fn write_i64_exact_decimal(scratch: &mut String, mut v: i64) {
+    if v == i64::MIN {
+        scratch.push_str("-9223372036854775808");
+        return;
+    }
+    if v < 0 {
+        scratch.push('-');
+        v = -v;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    // SAFETY: `buf[i..]` contains only ASCII digits ('0'..='9').
+    let digits = std::str::from_utf8(&buf[i..]).expect("decimal digits are ASCII");
+    scratch.push_str(digits);
+}
+
 /// Render a flat column value into `scratch`, byte-identical to
 /// `value_to_string(extract_value(...))` but without building a [`Value`]:
 /// Int64/Timestamp go through the f64 round-trip (`as f64` → Display) exactly
@@ -306,7 +334,16 @@ fn write_flat_column_scratch(col: &dyn Array, row: usize, scratch: &mut String) 
                 .downcast_ref::<Int64Array>()
                 .map(|a| a.value(row))
                 .unwrap_or(0);
-            let _ = write!(scratch, "{}", v as f64);
+            if v.unsigned_abs() <= (1i64 << 53) as u64 {
+                // Fast path: |v| <= 2^53 rounds to an exact f64 whose Display
+                // is the plain decimal integer (no ".0", no exponent) —
+                // byte-identical to the `v as f64` rendering below, but much
+                // cheaper. Outside 2^53 the round-trip may be lossy — keep
+                // the f64 path.
+                write_i64_exact_decimal(scratch, v);
+            } else {
+                let _ = write!(scratch, "{}", v as f64);
+            }
         }
         DataType::Float64 => {
             let v = col
@@ -339,7 +376,11 @@ fn write_flat_column_scratch(col: &dyn Array, row: usize, scratch: &mut String) 
                 .downcast_ref::<TimestampNanosecondArray>()
                 .map(|a| a.value(row))
                 .unwrap_or(0);
-            let _ = write!(scratch, "{}", v as f64);
+            if v.unsigned_abs() <= (1i64 << 53) as u64 {
+                write_i64_exact_decimal(scratch, v);
+            } else {
+                let _ = write!(scratch, "{}", v as f64);
+            }
         }
         _ => {
             // Unreachable for the `flat` gate; defensive fallback.
@@ -437,6 +478,49 @@ mod format_tests {
             secs_of_day % 60,
             millis
         )
+    }
+
+    #[test]
+    fn flat_int64_fast_path_matches_f64_roundtrip_bytes() {
+        // The 2^53 integer fast path in `write_flat_column_scratch` must be
+        // byte-identical to the eager `Value::Number(v as f64)` rendering for
+        // every Int64/Timestamp value, across the 2^53 exactness boundary.
+        use arrow::array::{Int64Array, TimestampNanosecondArray};
+        use arrow::datatypes::TimeUnit;
+        let edge_vals: Vec<i64> = vec![
+            i64::MIN,
+            i64::MIN + 1,
+            -(1i64 << 53) - 1,
+            -(1i64 << 53),
+            -(1i64 << 53) + 1,
+            -1,
+            0,
+            1,
+            (1i64 << 53) - 1,
+            (1i64 << 53),
+            (1i64 << 53) + 1,
+            123_456_789,
+            999_999_999_999_999_999,
+            i64::MAX,
+        ];
+        let ints = Int64Array::from(edge_vals.clone());
+        for (row, &v) in edge_vals.iter().enumerate() {
+            let mut scratch = String::new();
+            write_flat_column_scratch(&ints, row, &mut scratch);
+            let expect = value_to_string(&Value::Number(v as f64));
+            assert_eq!(scratch, expect, "int64 v={v}");
+        }
+        let ts = TimestampNanosecondArray::from(edge_vals.clone());
+        assert_eq!(
+            ts.data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        for (row, &v) in edge_vals.iter().enumerate() {
+            let mut scratch = String::new();
+            write_flat_column_scratch(&ts, row, &mut scratch);
+            let expect = value_to_string(&Value::Number(v as f64));
+            assert_eq!(scratch, expect, "timestamp v={v}");
+        }
     }
 
     #[test]

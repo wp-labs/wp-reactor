@@ -654,3 +654,58 @@ execute 内联上下文的差异，占比数字应向下修正该量级。
 3. entity（9.8%）与 fired_at（4.4%）单线程占比小，端到端更小，不单独优化。
 4. 端到端「单独切 A/D 无效」≠「无成本」——全链路瓶颈会接棒，微基准才是
    单线程成本的干净口径；两者结合才是完整归因。
+
+## 17. 三项实现优化 + 并发膨胀归因（2026-08-18 晚）
+
+### 17.1 实现（三个小步，均保持字节一致）
+
+1. **wfx_id Int64/Timestamp 2^53 快路径**（alert.rs `write_flat_column_scratch`）：
+   `|v| <= 2^53` 的整数用**手写十进制 itoa**（`write_i64_exact_decimal`，无 fmt
+   机器），否则走原 `v as f64` Display——2^53 内 i64→f64 精确，字节一致。
+   边界测试 `flat_int64_fast_path_matches_f64_roundtrip_bytes` 锁定（含
+   i64::MIN/MAX、±2^53±1、大数）。
+2. **变值系统列 Vec<String> 化**（column_batch.rs）：`wfx_id` / `entity_id` /
+   `fired_at` 列从 `Vec<Arc<str>>` 改为 `Vec<String>`——每行 3 次
+   `Arc::from(String)`（新分配 + memcpy）变成 move（零分配）；这三列本就
+   每行独有不共享，Arc 是纯浪费。6 个批内常量列保持 `Arc<str>`。
+3. **Chars 值透传**（executor/mod.rs coerce + types.rs export）：对已是
+   `Value::Str` 的值跳过 `render_*_as_string` 的 `s.to_string()` 再分配——
+   每行省 2 次 String 分配（Q1 的 alert_type/detail 两个 Chars 字段）。
+
+### 17.2 微基准结果（真实形态：9-12 位数字、40-60B 随机 url，1M 行）
+
+| 分量 | 优化前（短串） | 优化后（真实形态） |
+|---|---|---|
+| baseline | 621.6 ns | **518 ns**（fill 207 / wfx_id 261 / entity 60 / fired_at 28） |
+| fill（cut C） | 369.1 | 207.0（40%） |
+| wfx_id（cut A） | 220.5 | 260.7（50%） |
+
+- 短串口径优化 -31%；真实形态下 **wfx_id 反超 fill**（长 url 使哈希渲染贵）。
+- 测试全绿：wf-engine 482（含新边界测试）+ wf-runtime 165 + wf-config 159。
+
+### 17.3 端到端验证：单线程优化被并发膨胀稀释（关键）
+
+端到端 r=10 复测 **11.6M vs 基线 12.1M（无提升）**，cpu_avg 仍 ~11 核。
+探针链定位（全部还原）：
+
+| 探针 | EPS | 结论 |
+|---|---|---|
+| sink 旁路（drop batch 不发送） | 10.4M | sink 不是瓶颈（略降=load） |
+| **切 execute（只计数）** | **58.7 / 78.6M**，cpu 只剩 1.4 核 | **execute 是瓶颈实锤**；caller 全路径仅 ~130-170ns/行 |
+| RULE_PARALLELISM=2 | 2.7M（每任务 740ns） | 每任务成本与并行度弱相关（r=2: 740 / r=10: 847ns） |
+| **10 线程并发微基准**（Barrier 同步，各线程独立 batch） | 合计 5.9M rows/s，**加速比仅 3.06×** | **每线程 per-row 从 518ns 膨胀到 ~1.7μs（3.3×）**——并发竞争 |
+
+**结论**：端到端规则任务每行 ~860ns 中，单线程 execute 只 518ns——并发下每
+线程膨胀 ~1.7-3.3×（内存带宽 / 分配器竞争）是主墙。因此：
+- 单线程优化（-31%）在端到端被稀释到 ~0；
+- 下一步主攻**并发膨胀**：减每行内存流量（写列字节、分配次数）或消除
+  竞争热点，而非继续压单线程 ns。
+
+### 17.4 未提交改动清单（本次 5 文件）
+
+- `wf-engine/src/match_engine/executor/alert.rs`：itoa 快路径 + 边界测试
+- `wf-engine/src/alert/column_batch.rs`：3 个变值系统列 Vec<String> 化
+- `wf-engine/src/match_engine/executor/mod.rs`：Chars coerce 透传
+- `wf-engine/src/alert/types.rs`：Chars export 透传
+- `wf-engine/src/match_engine/tests/each_bench.rs`：真实形态数据 + 10 线程
+  并发模拟段（Barrier 同步，构造不计时）
