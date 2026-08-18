@@ -230,7 +230,7 @@ pub(super) fn build_each_wfx_id_reusing(
 /// exactly — flat columns render straight from the Arrow column (no per-row
 /// Value build / string clone), structured/other columns go through the full
 /// extraction (absent on failure, mirroring `Event.fields`).
-pub(super) fn build_each_wfx_id_columnar_reusing(
+pub(crate) fn build_each_wfx_id_columnar_reusing(
     rule_name: &str,
     event_time_nanos: i64,
     event: &crate::match_engine::event_bridge::ColumnarEvent<'_>,

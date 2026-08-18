@@ -595,3 +595,62 @@ index（=HEAD，无列式实现）整体回滚，不是「还原切刀」——�
 2. 还原切刀用**手动反向编辑**（撤销 TEMP 标注的几行），或 `git show
    <checkpoint>:<path> > <path>` 恢复；
 3. 禁用 `git checkout -- <path>`（未 add 文件会被静默回滚到 HEAD）。
+
+## 16. 微基准归因：each_bench（2026-08-18 晚，数据版）
+
+### 16.1 方法与口径
+
+端到端切刀受 load / 全链路其他环节干扰，为拿到每个分量的单线程绝对成本，新增
+`each_bench.rs`（wf-engine tests，release-only `#[ignore]`）：
+
+```
+cargo test --release -p wf-engine each_bench -- --ignored --nocapture
+```
+
+构造 Q1 真实形状（`q1_bid_passthrough`：score=1.0、entity=b.auction、yield
+4 字段 id/alert_type/detail/request_count、7 列 bid_events 批、1M 行、
+256 行分段同生产 ALERT_BATCH_SIZE），同一进程内依次测每个分量的 ns/行：
+
+| 分量 | ns/row | 占 baseline | 备注 |
+|---|---|---|---|
+| baseline（完整列式） | 621.6 | 100% | `execute_each_direct_batch_columnar` 全量 |
+| fill（cut C） | 369.1 | 59.4% | begin_row + 4×stage + commit（常量 wfx_id/entity/fired_at） |
+| wfx_id（cut A） | 220.5 | 35.5% | `build_each_wfx_id_columnar_reusing` 全字段列直渲 |
+| entity（cut D） | 60.8 | 9.8% | 取列 + `value_to_string` |
+| fired_at（cut B） | 27.5 | 4.4% | `format_nanos_utc` |
+| string_alloc 裸 | 16.3 | 2.6% | 每行一次 40B hex String 分配（black_box 防优化） |
+| f64_format 裸 | 26.4 | 4.3% | 单次 f64 Display（wfx_id 对 4 个数字列各做一次） |
+
+三轮稳定（baseline 594/611/622；fill 57-60%；wfx_id 35%；entity 10%；fired_at 4.4%）。
+wfx_id 的 220ns 分解：4×f64 格式化（≈106ns）+ 3×Utf8 push + FNV 哈希 + 列 downcast + hex。
+
+### 16.2 与端到端切刀的对照（重要）
+
+| 分量 | 微基准（单线程） | 端到端切刀（8 并行全链路） | 一致？ |
+|---|---|---|---|
+| fill | 59.4% | cut C：+167%（≈63%） | ✓ |
+| fired_at | 4.4% | cut B：~2-5% | ✓ |
+| wfx_id | 35.5% | 单独 cut A：~0%；**A+C 同切比 C 高 21%** | 矛盾→已解释 |
+| entity | 9.8% | 单独 cut D：~0% | 矛盾（待解释） |
+
+**决定性实验**（A+C 同切，18:34，load 7.0-7.4）：36.5 / 41.4M（均值 ~39M）
+vs cut C 单独 32.3M → **端到端下 wfx_id 真实贡献 ~21%，不是 0**。
+
+**单独 cut A 无效的机制**：fill 仍在时每行 10 个 Arc 分配 + 列写产生的内存
+带宽/分配器竞争掩盖了 wfx_id 的纯 CPU 成本；A+C 同时切掉 fill 后 wfx_id 的
+成本才显现。cpu_avg 佐证：C 单独 693-832%（~7-8 核）→ A+C 556-584%
+（~5.5-6 核）——规则任务释放的 CPU 没有全部转化为 EPS，**parse/窗口/sink/
+分配竞争在全链路中接棒成为新瓶颈**。
+
+微基准单独段系统性偏高 ~9%（分量之和 678 vs baseline 622）——单独循环 vs
+execute 内联上下文的差异，占比数字应向下修正该量级。
+
+### 16.3 行动结论（两种口径交叉验证后）
+
+1. **L3 输出列式化（fill）仍是第一目标**：两种口径一致 ~60%（微基准 59.4% /
+   端到端 cut C 63%）。
+2. **wfx_id 列渲染第二**：微基准 35.5%，端到端 A+C 差值 ~21%。其中 4×f64
+   格式化 ≈106ns（占 wfx_id 一半）——L3 批量化时优先做数字列批量格式化。
+3. entity（9.8%）与 fired_at（4.4%）单线程占比小，端到端更小，不单独优化。
+4. 端到端「单独切 A/D 无效」≠「无成本」——全链路瓶颈会接棒，微基准才是
+   单线程成本的干净口径；两者结合才是完整归因。

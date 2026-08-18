@@ -2,6 +2,7 @@ mod accu;
 mod any_l2;
 mod columnar_close_seq;
 mod columnar_wiring;
+mod each_bench;
 mod guard_bench;
 mod helpers;
 mod perf;
