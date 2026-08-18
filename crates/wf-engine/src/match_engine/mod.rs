@@ -13,7 +13,7 @@ pub use event_bridge::{
     ColumnarEvent, WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY, WFL_FIELD_TYPE_OBJECT,
     batch_event_time_nanos, batch_event_time_nanos_at, batch_time_col_index, batch_to_events,
     batch_to_events_filtered, batch_to_timestamped_rows, is_wfl_structured_field, materialize_rows,
-    materialize_rows_filtered, sorted_fields_for, wfl_structured_field_kind,
+    materialize_rows_filtered, wfl_structured_field_kind,
 };
 pub use executor::{EachDirectBatchStats, RuleExecutor, RuleExecutorOptions};
 pub use match_engine::apply_conv;

@@ -1,11 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use wf_lang::ast::FieldRef;
 
-use arrow::array::Array;
-use arrow::datatypes::{DataType, TimeUnit};
-
 use crate::alert::AlertOrigin;
-use crate::match_engine::event_bridge::extract_field_value;
 use crate::match_engine::match_engine::{StepData, Value, field_ref_name, value_to_string};
 
 /// Format nanoseconds since epoch as ISO 8601 UTC string.
@@ -193,19 +189,37 @@ pub(super) fn build_each_wfx_id_reusing(
     wfx_id_from_rule_and_time(rule_name, event_time_nanos, origin)
 }
 
-/// Columnar twin of [`build_each_wfx_id_reusing`] over a [`ColumnarEvent`]
-/// (no per-row `Event` materialization). Fields no longer participate in the
-/// hash (same decision as the eager path); the signature keeps the column
-/// references for call-site compatibility.
-pub(crate) fn build_each_wfx_id_columnar_reusing(
-    rule_name: &str,
-    event_time_nanos: i64,
-    _event: &crate::match_engine::event_bridge::ColumnarEvent<'_>,
-    _sorted_fields: &[(String, usize)],
-    origin: &AlertOrigin,
-    _scratch: &mut String,
-) -> String {
-    wfx_id_from_rule_and_time(rule_name, event_time_nanos, origin)
+/// Batch-constant FNV-1a prefix state for the on-each wfx_id byte stream:
+/// the hasher state after `rule_name \x00`. Rule names are constant per rule
+/// (tens of bytes on real rule sets) and were previously re-hashed per row;
+/// with the prefix hoisted, the per-row suffix is only
+/// `time LE \x00 \x00 origin` (~14 bytes).
+pub(crate) struct EachWfxPrefix {
+    state: u64,
+}
+
+impl EachWfxPrefix {
+    pub(crate) fn new(rule_name: &str) -> Self {
+        let mut hasher = Fnv1a::new();
+        hasher.update(rule_name.as_bytes());
+        hasher.update(b"\x00");
+        Self {
+            state: hasher.state,
+        }
+    }
+
+    /// Per-row finish — byte stream identical to
+    /// [`wfx_id_from_rule_and_time`] (locked by unit test).
+    pub(crate) fn wfx_id(&self, event_time_nanos: i64, origin: &AlertOrigin) -> String {
+        let mut hasher = Fnv1a {
+            state: self.state,
+        };
+        hasher.update(&event_time_nanos.to_le_bytes());
+        hasher.update(b"\x00");
+        hasher.update(b"\x00");
+        hasher.update(origin.as_str().as_bytes());
+        hex_encode(&hasher.finalize().to_le_bytes())
+    }
 }
 
 /// Append `v` as a plain decimal integer — the exact rendering of
@@ -236,92 +250,19 @@ fn write_i64_exact_decimal(scratch: &mut String, mut v: i64) {
     scratch.push_str(digits);
 }
 
-/// Render a flat column value into `scratch`, byte-identical to
-/// `value_to_string(extract_value(...))` but without building a [`Value`]:
-/// Int64/Timestamp go through the f64 round-trip (`as f64` → Display) exactly
-/// like `Value::Number(i as f64)`, Utf8 pushes the string directly.
-fn write_flat_column_scratch(col: &dyn Array, row: usize, scratch: &mut String) {
-    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+/// Append `v` exactly as `value_to_string(&Value::Number(v as f64))` renders
+/// it: `|v| <= 2^53` takes the itoa fast path (the exact f64 Display of such
+/// an integer is the plain decimal — no ".0", no exponent), larger magnitudes
+/// keep the lossy f64 round-trip Display for byte-identity with the eager
+/// path. Single source of the 2^53 rendering rule — used by the batch-typed
+/// entity column read in the columnar on-each path (locked by
+/// `flat_int64_fast_path_matches_f64_roundtrip_bytes`).
+pub(crate) fn write_int64_value(scratch: &mut String, v: i64) {
     use std::fmt::Write;
-    scratch.clear();
-    match col.data_type() {
-        DataType::Int64 => {
-            let v = col
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .map(|a| a.value(row))
-                .unwrap_or(0);
-            if v.unsigned_abs() <= (1i64 << 53) as u64 {
-                // Fast path: |v| <= 2^53 rounds to an exact f64 whose Display
-                // is the plain decimal integer (no ".0", no exponent) —
-                // byte-identical to the `v as f64` rendering below, but much
-                // cheaper. Outside 2^53 the round-trip may be lossy — keep
-                // the f64 path.
-                write_i64_exact_decimal(scratch, v);
-            } else {
-                let _ = write!(scratch, "{}", v as f64);
-            }
-        }
-        DataType::Float64 => {
-            let v = col
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .map(|a| a.value(row))
-                .unwrap_or(0.0);
-            let _ = write!(scratch, "{v}");
-        }
-        DataType::Utf8 => {
-            let s = col
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .map(|a| a.value(row))
-                .unwrap_or("");
-            scratch.push_str(s);
-        }
-        DataType::Boolean => {
-            let v = col
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .map(|a| a.value(row))
-                .unwrap_or(false);
-            let _ = write!(scratch, "{v}");
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            use arrow::array::TimestampNanosecondArray;
-            let v = col
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .map(|a| a.value(row))
-                .unwrap_or(0);
-            if v.unsigned_abs() <= (1i64 << 53) as u64 {
-                write_i64_exact_decimal(scratch, v);
-            } else {
-                let _ = write!(scratch, "{}", v as f64);
-            }
-        }
-        _ => {
-            // Unreachable for the `flat` gate; defensive fallback.
-            scratch.push_str("[array]");
-        }
-    }
-}
-
-/// Render a [`Value`] into `out` byte-identically to `value_to_string`, but
-/// reusing the caller's buffer (clear + rewrite) instead of allocating.
-fn write_value_scratch(v: &Value, out: &mut String) {
-    out.clear();
-    match v {
-        Value::Number(n) => {
-            use std::fmt::Write;
-            let _ = write!(out, "{n}");
-        }
-        Value::Str(s) => out.push_str(s),
-        Value::Bool(b) => {
-            use std::fmt::Write;
-            let _ = write!(out, "{b}");
-        }
-        Value::Array(_) => out.push_str("[array]"),
-        Value::Object(_) => out.push_str("[object]"),
+    if v.unsigned_abs() <= (1i64 << 53) as u64 {
+        write_i64_exact_decimal(scratch, v);
+    } else {
+        let _ = write!(scratch, "{}", v as f64);
     }
 }
 
@@ -399,11 +340,11 @@ mod format_tests {
 
     #[test]
     fn flat_int64_fast_path_matches_f64_roundtrip_bytes() {
-        // The 2^53 integer fast path in `write_flat_column_scratch` must be
-        // byte-identical to the eager `Value::Number(v as f64)` rendering for
-        // every Int64/Timestamp value, across the 2^53 exactness boundary.
-        use arrow::array::{Int64Array, TimestampNanosecondArray};
-        use arrow::datatypes::TimeUnit;
+        // The 2^53 integer fast path in `write_int64_value` (the single
+        // rendering source for Int64 / Timestamp(ns) entity columns on the
+        // columnar on-each path) must be byte-identical to the eager
+        // `Value::Number(v as f64)` rendering for every value, across the
+        // 2^53 exactness boundary.
         let edge_vals: Vec<i64> = vec![
             i64::MIN,
             i64::MIN + 1,
@@ -420,23 +361,35 @@ mod format_tests {
             999_999_999_999_999_999,
             i64::MAX,
         ];
-        let ints = Int64Array::from(edge_vals.clone());
-        for (row, &v) in edge_vals.iter().enumerate() {
+        for &v in edge_vals.iter() {
             let mut scratch = String::new();
-            write_flat_column_scratch(&ints, row, &mut scratch);
+            write_int64_value(&mut scratch, v);
             let expect = value_to_string(&Value::Number(v as f64));
             assert_eq!(scratch, expect, "int64 v={v}");
         }
-        let ts = TimestampNanosecondArray::from(edge_vals.clone());
-        assert_eq!(
-            ts.data_type(),
-            &DataType::Timestamp(TimeUnit::Nanosecond, None)
-        );
-        for (row, &v) in edge_vals.iter().enumerate() {
-            let mut scratch = String::new();
-            write_flat_column_scratch(&ts, row, &mut scratch);
-            let expect = value_to_string(&Value::Number(v as f64));
-            assert_eq!(scratch, expect, "timestamp v={v}");
+    }
+
+    #[test]
+    fn each_wfx_prefix_matches_scalar_per_row_hash() {
+        // The batch-hoisted FNV prefix must produce byte-identical wfx_ids
+        // to the per-row scalar hash for every (rule, time) pair.
+        let cases: &[(&str, i64)] = &[
+            ("q1_bid_passthrough", 1_750_000_000_000_000_000),
+            (
+                "qradar_rule_with_a_long_name_for_prefix_hoisting_check",
+                86_400_000_000_000_000,
+            ),
+            ("r", 1),
+            ("empty_time", 0),
+            ("negative", -1),
+            ("i64::MAX", i64::MAX),
+        ];
+        for &(rule, t) in cases {
+            assert_eq!(
+                EachWfxPrefix::new(rule).wfx_id(t, &AlertOrigin::Event),
+                wfx_id_from_rule_and_time(rule, t, &AlertOrigin::Event),
+                "rule={rule} t={t}"
+            );
         }
     }
 

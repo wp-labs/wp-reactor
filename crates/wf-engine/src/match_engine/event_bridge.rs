@@ -653,6 +653,15 @@ impl<'a> ColumnarEvent<'a> {
     /// fails extraction — mirrors `Event.fields.get(name)`.
     pub fn field_value(&self, name: &str) -> Option<Value> {
         let idx = self.batch.schema().index_of(name).ok()?;
+        self.value_at(idx)
+    }
+
+    /// Field value by a **pre-resolved** column index — byte-identical to
+    /// [`Self::field_value`] for the same column, but skips the per-call
+    /// `schema().index_of(name)` lookup. The index is stable for the lifetime
+    /// of a batch (the schema is `Arc`-shared and immutable), so callers
+    /// resolve it once per batch (hot-path Q1 bisection).
+    pub fn value_at(&self, idx: usize) -> Option<Value> {
         let col = self.batch.column(idx);
         if col.is_null(self.row) {
             return None;
@@ -670,17 +679,3 @@ impl<'a> ColumnarEvent<'a> {
     }
 }
 
-/// (field name, column index) pairs sorted by name — the eager wfx_id hash's
-/// per-row collect+sort, hoisted once per batch. Build once and share across
-/// every row of the batch.
-pub fn sorted_fields_for(batch: &RecordBatch) -> Vec<(String, usize)> {
-    let mut out: Vec<(String, usize)> = batch
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(idx, f)| (f.name().clone(), idx))
-        .collect();
-    out.sort_by_key(|(name, _)| name.clone());
-    out
-}

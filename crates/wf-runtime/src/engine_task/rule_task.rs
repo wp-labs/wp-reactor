@@ -13,7 +13,7 @@ use wf_engine::alert::{AlertColumnBatch, AlertColumnBuilder, OutputRecord};
 use wf_engine::match_engine::{
     CepStateMachine, CloseReason, ColumnarEvent, Event, GuardMasks, RuleExecutor, StepResult,
     batch_event_time_nanos_at, batch_time_col_index, batch_to_events, batch_to_events_filtered,
-    close_is_qualified, materialize_rows, sorted_fields_for,
+    close_is_qualified, materialize_rows,
 };
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
@@ -629,7 +629,6 @@ impl RuleTask {
                 .map(|row| row as u32)
                 .collect();
             let time_col_index = batch_time_col_index(batch, self.each_time_field.as_deref());
-            let sorted_fields = sorted_fields_for(batch);
             let col_events: Vec<ColumnarEvent<'_>> = hit_indices
                 .iter()
                 .map(|&row| ColumnarEvent::new(batch, row as usize))
@@ -651,7 +650,7 @@ impl RuleTask {
             if let Some(metrics) = &self.metrics {
                 metrics.add_rule_events(self.executor.plan().name.as_str(), rows.len());
             }
-            self.emit_each_direct_batch_columnar(&rows, &sorted_fields, batch_emit_nanos)
+            self.emit_each_direct_batch_columnar(&rows, batch_emit_nanos)
                 .await;
             return;
         }
@@ -1890,7 +1889,6 @@ impl RuleTask {
     async fn emit_each_direct_batch_columnar(
         &self,
         rows: &[(&ColumnarEvent<'_>, i64)],
-        sorted_fields: &[(String, usize)],
         batch_emit_nanos: i64,
     ) {
         let mut appended_idx: Vec<usize> = Vec::new();
@@ -1932,7 +1930,6 @@ impl RuleTask {
                 };
                 let outcome = self.executor.execute_each_direct_batch_columnar(
                     segment,
-                    sorted_fields,
                     batch_emit_nanos,
                     builder,
                     &mut appended_idx,

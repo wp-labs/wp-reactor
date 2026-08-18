@@ -526,7 +526,7 @@ fn execute_each_direct_batch_columnar_matches_event_path_rows() {
     // byte-identical rows to the eager `materialize_rows` + batch path —
     // including the missing-field (null) lane and the 2^53 f64 round-trip
     // lane in the wfx_id hash.
-    use crate::match_engine::event_bridge::{ColumnarEvent, materialize_rows, sorted_fields_for};
+    use crate::match_engine::event_bridge::{ColumnarEvent, materialize_rows};
     use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -594,7 +594,6 @@ fn execute_each_direct_batch_columnar_matches_event_path_rows() {
     let mut appended_idx_c = Vec::new();
     let stats_c = exec.execute_each_direct_batch_columnar(
         &col_rows,
-        &sorted_fields_for(&batch),
         NANOS,
         &mut via_columnar,
         &mut appended_idx_c,
@@ -602,6 +601,111 @@ fn execute_each_direct_batch_columnar_matches_event_path_rows() {
     assert_eq!(stats_c, stats);
     assert_eq!(appended_idx_c, appended_idx);
 
+    assert_batches_equal_rows(&via_events.finish(), &via_columnar.finish());
+}
+
+#[test]
+fn columnar_utf8_entity_null_lane_matches_event_path_rows() {
+    // P2 Utf8 entity fast lane (the qradar shape: sip / source_ip / user):
+    // entity on a non-structured Utf8 column, a yield field sharing the same
+    // column (entity_val reuse), and a null-entity row — the columnar path
+    // must fail that row exactly like the Event path (same stats, same
+    // appended indices, byte-identical rows).
+    use crate::match_engine::event_bridge::{ColumnarEvent, materialize_rows};
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    let mut plan = simple_rule_plan(
+        "q_utf8_entity",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "chars",
+        Expr::Field(FieldRef::Qualified("e".into(), "user".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "user".into(),
+            value: Expr::Field(FieldRef::Qualified("e".into(), "user".into())),
+        },
+        YieldField {
+            name: "cnt".into(),
+            value: Expr::Number(1.0),
+        },
+    ];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("user".into(), FieldType::Base(BaseType::Chars)),
+            ("cnt".into(), FieldType::Base(BaseType::Float)),
+        ]),
+    );
+    assert!(exec.each_plan_columnar_safe());
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("user", DataType::Utf8, true),
+        Field::new("n", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("alice"),
+                None, // null entity → both paths must fail this row identically
+                Some("bob"),
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+        ],
+    )
+    .unwrap();
+
+    // Reference: eager materialization + the Event-based batch path.
+    let events: Vec<Event> = materialize_rows(&batch, &[0, 1, 2]);
+    let rows: Vec<(&Event, i64)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut via_events = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_idx = Vec::new();
+    let stats = exec.execute_each_direct_batch(
+        &rows,
+        &EmptyLookup,
+        &[],
+        NANOS,
+        &mut via_events,
+        &mut appended_idx,
+    );
+
+    // Columnar fast path (Utf8 entity lane + shared-column yield reuse).
+    let col_events: Vec<ColumnarEvent<'_>> =
+        (0..3).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut via_columnar = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_idx_c = Vec::new();
+    let stats_c = exec.execute_each_direct_batch_columnar(
+        &col_rows,
+        NANOS,
+        &mut via_columnar,
+        &mut appended_idx_c,
+    );
+    assert_eq!(stats_c, stats);
+    assert_eq!(appended_idx_c, appended_idx);
+    // The null-entity row appends on BOTH paths with entity_id = "" (the
+    // yield missing-field fallback routes the entity read to Str("")) —
+    // no failures on either side.
+    assert_eq!(stats.appended, 3);
+    assert_eq!(stats.failed, 0);
     assert_batches_equal_rows(&via_events.finish(), &via_columnar.finish());
 }
 
@@ -655,8 +759,8 @@ fn q1_lit_shape_rule() -> RuleExecutor {
 fn columnar_const_yield_literals_match_event_path_rows() {
     // 常量 yield 批级缓存（register_yield_column + fill_row_gaps 填常量）
     // 必须与 eager 路径逐字节一致——含 null→字段缺失 lane 与 2^53 lane。
-    use crate::match_engine::event_bridge::{ColumnarEvent, materialize_rows, sorted_fields_for};
-    use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+    use crate::match_engine::event_bridge::{ColumnarEvent, materialize_rows};
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
@@ -726,7 +830,6 @@ fn columnar_const_yield_literals_match_event_path_rows() {
     let mut appended_idx_c = Vec::new();
     let stats_c = exec.execute_each_direct_batch_columnar(
         &col_rows,
-        &sorted_fields_for(&batch),
         NANOS,
         &mut via_columnar,
         &mut appended_idx_c,

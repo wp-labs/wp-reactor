@@ -9,7 +9,7 @@
 //! 测量对象（Q1 `q1_bid_passthrough` 真实形状：score=1.0、entity=b.auction、
 //! yield 4 字段 id/alert_type/detail/request_count）：
 //!   baseline : `execute_each_direct_batch_columnar` 完整路径（256 行分段，同生产）
-//!   wfx_id   : `build_each_wfx_id_columnar_reusing`（cut A：FNV 哈希 + 列渲染）
+//!   wfx_id   : `EachWfxPrefix::wfx_id`（cut A：批级 FNV 前缀 + 每行时间后缀哈希）
 //!   fired_at : `format_nanos_utc`（cut B：UTC 格式化）
 //!   entity   : `ColumnarEvent::field_value` + `value_to_string`（cut D）
 //!   fill     : `begin_row` + 4×`stage_yield_cell` + `commit_each_row`（cut C）
@@ -27,8 +27,8 @@ use wf_lang::plan::{EachPlan, YieldField};
 use wf_lang::{BaseType, FieldType};
 
 use crate::alert::{AlertColumnBuilder, AlertOrigin, EachRowCells};
-use crate::match_engine::event_bridge::{ColumnarEvent, sorted_fields_for};
-use crate::match_engine::executor::{build_each_wfx_id_columnar_reusing, format_nanos_utc};
+use crate::match_engine::event_bridge::ColumnarEvent;
+use crate::match_engine::executor::{EachWfxPrefix, format_nanos_utc};
 use crate::match_engine::match_engine::{field_ref_name, value_to_string};
 use crate::match_engine::{RuleExecutor, Value};
 
@@ -174,7 +174,6 @@ fn q1_each_components_per_row() {
         .enumerate()
         .map(|(i, ev)| (ev, NANOS + i as i64))
         .collect();
-    let sorted_fields = sorted_fields_for(&batch);
 
     // ---- baseline：完整列式路径（256 行分段，同生产 ALERT_BATCH_SIZE） ----
     let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
@@ -184,7 +183,6 @@ fn q1_each_components_per_row() {
     for chunk in rows.chunks(ALERT_BATCH_SIZE) {
         let stats = exec.execute_each_direct_batch_columnar(
             chunk,
-            &sorted_fields,
             NANOS,
             &mut builder,
             &mut appended,
@@ -200,20 +198,13 @@ fn q1_each_components_per_row() {
     };
     baseline.line(baseline_ns);
 
-    // ---- cut A：wfx_id 哈希 + 列渲染 ----
+    // ---- cut A：wfx_id（批级 FNV 前缀 + 每行时间后缀哈希） ----
     let origin = AlertOrigin::Event;
-    let mut scratch = String::new();
+    let wfx_prefix = EachWfxPrefix::new("q1_bid_passthrough");
     let start = Instant::now();
     let mut sum = 0usize;
-    for (i, ev) in col_events.iter().enumerate() {
-        let wfx = build_each_wfx_id_columnar_reusing(
-            "q1_bid_passthrough",
-            NANOS + i as i64,
-            ev,
-            &sorted_fields,
-            &origin,
-            &mut scratch,
-        );
+    for i in 0..N {
+        let wfx = wfx_prefix.wfx_id(NANOS + i as i64, &origin);
         sum += wfx.len();
     }
     let a = Report {
@@ -456,7 +447,6 @@ fn q1_each_components_per_row() {
                     let col_events: Vec<ColumnarEvent<'_>> = (0..per_worker)
                         .map(|r| ColumnarEvent::new(&batch, r))
                         .collect();
-                    let sorted_fields = sorted_fields_for(&batch);
                     let rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
                         .iter()
                         .enumerate()
@@ -469,7 +459,6 @@ fn q1_each_components_per_row() {
                     for chunk in rows.chunks(ALERT_BATCH_SIZE) {
                         let stats = exec.execute_each_direct_batch_columnar(
                             chunk,
-                            &sorted_fields,
                             NANOS,
                             &mut builder,
                             &mut appended,

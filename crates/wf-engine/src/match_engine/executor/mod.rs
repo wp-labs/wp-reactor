@@ -1,6 +1,6 @@
 mod alert;
 #[cfg(test)]
-pub(crate) use alert::{build_each_wfx_id_columnar_reusing, format_nanos_utc};
+pub(crate) use alert::{EachWfxPrefix, format_nanos_utc};
 mod close_exec;
 mod context;
 mod each_exec;

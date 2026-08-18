@@ -1,6 +1,10 @@
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Instant;
 
+use arrow::array::{Array, ArrayAccessor, Int64Array, StringArray, TimestampNanosecondArray};
+use arrow::datatypes::{DataType, TimeUnit};
 use smol_str::SmolStr;
 use wf_lang::ast::{Expr, FieldRef};
 
@@ -15,8 +19,8 @@ use crate::match_engine::match_engine::{
 
 use super::RuleExecutor;
 use super::alert::{
-    build_each_wfx_id, build_each_wfx_id_columnar_reusing, build_each_wfx_id_reusing,
-    format_nanos_utc, now_nanos,
+    EachWfxPrefix, build_each_wfx_id, build_each_wfx_id_reusing, format_nanos_utc, now_nanos,
+    write_int64_value,
 };
 use super::context::execute_joins;
 use super::eval::{
@@ -414,13 +418,14 @@ impl RuleExecutor {
     pub fn execute_each_direct_batch_columnar(
         &self,
         rows: &[(&ColumnarEvent<'_>, i64)],
-        sorted_fields: &[(String, usize)],
         emit_time_nanos: i64,
         builder: &mut AlertColumnBuilder,
         appended_out: &mut Vec<usize>,
     ) -> EachDirectBatchStats {
         appended_out.clear();
         let mut stats = EachDirectBatchStats::default();
+        let mut prof = E1Profiler::maybe();
+        let _ = &mut prof;
         let Some(each_plan) = &self.plan.each_plan else {
             log::warn!(
                 "execute_each_direct_batch_columnar called for non-`on each` rule {}; skipping {} rows",
@@ -480,8 +485,10 @@ impl RuleExecutor {
             })
             .collect();
 
-        builder.reserve_rows(rows.len());
-        let mut wfx_scratch = String::new();
+        // Batch-constant wfx_id FNV prefix: `rule_name \x00` hashed once per
+        // batch (rule names run tens of bytes and were previously re-hashed
+        // per row); the per-row suffix is only time LE + separators + origin.
+        let wfx_prefix = EachWfxPrefix::new(&self.plan.name);
 
         // Batch-level constant-yield caching: literal fields (alert_type /
         // detail / request_count in Q1) are coerced + exported once here and
@@ -526,43 +533,158 @@ impl RuleExecutor {
             }
         }
 
+        // Reserve AFTER registration: `register_yield_column` above may have
+        // (re)created yield columns — the first call after a flush finds them
+        // empty (`finish()` drops capacities) — and those columns must receive
+        // this segment's capacity here. Reserving before registration left
+        // them growing 0→N amortized, every ALERT_BATCH_SIZE segment.
+        builder.reserve_rows(rows.len());
+
+        // Batch-level column-index resolution: hoist the per-row `index_of`
+        // schema lookups (Q1 entity and the variable yield id both read the
+        // `auction` column — previously 2 `index_of` + column re-reads per row).
+        // Column indices are stable for the batch lifetime (the schema is
+        // Arc-shared and immutable), so resolve once here and read via
+        // `ColumnarEvent::value_at` in the loop.
+        let batch0 = rows.first().map(|(ev, _)| ev.batch());
+        let resolve = |name: Option<&str>| -> Option<usize> {
+            name.and_then(|n| batch0.and_then(|b| b.schema().index_of(n).ok()))
+        };
+        let entity_idx: Option<usize> = if entity_const.is_some() {
+            None
+        } else {
+            resolve(entity_field.map(field_ref_name))
+        };
+        let yield_field_idxs: Vec<Option<usize>> = yield_field_refs
+            .iter()
+            .map(|fr| resolve(fr.map(field_ref_name)))
+            .collect();
+        // Batch-level typed entity column (P2): ONE downcast per batch — all
+        // rows share `batch0` (the caller builds every ColumnarEvent from one
+        // batch; the index resolution above already relies on this), so the
+        // row loop reads the column with zero `&dyn Array` dispatch. Int64 /
+        // Timestamp(ns) share the i64 rendering (`write_int64_value`,
+        // byte-identical to the old value_at + value_to_string lane); plain
+        // (non-structured) Utf8 reads `&str` directly — that is the qradar
+        // entity shape (sip/source_ip/user). Structured Utf8 columns stay
+        // Generic: `extract_field_value` must JSON-parse them, which the fast
+        // lanes must not skip.
+        let entity_col: EntityCol<'_> = match (entity_idx, batch0) {
+            (Some(idx), Some(b)) => {
+                let schema = b.schema();
+                let field = schema.field(idx);
+                let col = b.column(idx);
+                match field.data_type() {
+                    DataType::Int64 => col
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .map_or(EntityCol::Generic, |a| EntityCol::I64(I64Col::Int64(a))),
+                    DataType::Timestamp(TimeUnit::Nanosecond, _) => col
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .map_or(EntityCol::Generic, |a| EntityCol::I64(I64Col::TsNanos(a))),
+                    DataType::Utf8
+                        if !crate::match_engine::is_wfl_structured_field(field) =>
+                    {
+                        col.as_any()
+                            .downcast_ref::<StringArray>()
+                            .map_or(EntityCol::Generic, EntityCol::Utf8)
+                    }
+                    _ => EntityCol::Generic,
+                }
+            }
+            _ => EntityCol::Generic,
+        };
+
         for (idx, (event, event_time_nanos)) in rows.iter().enumerate() {
             // -- Per-row system values (identical to the Event-based path) ---
+            let t_entity = if prof.enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let score = score_const;
-            let entity_id = match &entity_const {
-                Some(s) => s.clone(),
-                None => match entity_field
-                    .and_then(|fr| event.field_value(field_ref_name(fr)))
-                    .as_ref()
-                    .map(value_to_string)
-                {
-                    Some(s) => s,
-                    None => {
-                        // eval_entity_id on None is an error → failed row.
-                        log::warn!("alert export error: entity_id expression evaluated to None");
-                        stats.failed += 1;
-                        continue;
+            // For a field-entity (Q1: `entity(digit, b.auction)`), hold the read
+            // `Value` so a yield field referencing the same column (id=b.auction)
+            // reuses it instead of re-reading the column per row.
+            let (entity_id, entity_val): (String, Option<Value>) = match &entity_const {
+                Some(s) => (s.clone(), None),
+                None => {
+                    // Typed fast lanes (P2): one typed read per row, zero dyn
+                    // dispatch. Generic keeps `value_at` + `value_to_string`
+                    // exactly as before. Null / missing column fall back to
+                    // the EMPTY-STRING entity (row still appends) on every
+                    // lane — matching the Event path, where `eval_entity_id`
+                    // routes through the yield missing-field fallback
+                    // (`eval_yield_expr_with_meta`: None → Str("")). The old
+                    // columnar behavior failed such rows, silently diverging
+                    // from the reference path (caught by the Utf8 null-lane
+                    // 对拍 test).
+                    match &entity_col {
+                        EntityCol::I64(i64col) => match i64col.read(event.row()) {
+                            Some(v) => {
+                                let mut es = String::with_capacity(20);
+                                write_int64_value(&mut es, v);
+                                (es, Some(Value::Number(v as f64)))
+                            }
+                            None => empty_entity_pair(),
+                        },
+                        EntityCol::Utf8(arr) => {
+                            let row = event.row();
+                            if arr.is_null(row) {
+                                empty_entity_pair()
+                            } else {
+                                let s = arr.value(row);
+                                (String::from(s), Some(Value::Str(s.into())))
+                            }
+                        }
+                        EntityCol::Generic => match entity_idx.and_then(|idx| event.value_at(idx))
+                        {
+                            Some(v) => (value_to_string(&v), Some(v)),
+                            None => empty_entity_pair(),
+                        },
                     }
-                },
+                }
+            };
+            if let Some(t) = t_entity {
+                prof.add(e1_bucket_entity(), t);
+            }
+            let t_fired = if prof.enabled() {
+                Some(Instant::now())
+            } else {
+                None
             };
             let fired_at = format_nanos_utc(*event_time_nanos);
-            let wfx_id = build_each_wfx_id_columnar_reusing(
-                &self.plan.name,
-                *event_time_nanos,
-                event,
-                sorted_fields,
-                &origin,
-                &mut wfx_scratch,
-            );
+            if let Some(t) = t_fired {
+                prof.add(e1_bucket_fired(), t);
+            }
+            let t_wfx = if prof.enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let wfx_id = wfx_prefix.wfx_id(*event_time_nanos, &origin);
+            if let Some(t) = t_wfx {
+                prof.add(e1_bucket_wfx(), t);
+            }
             // (yield_meta is only consumed by General yield exprs — excluded
             // by the columnar gate, so it is not built here.)
 
             // -- Yield staging (fallible work before any column push) ------
             // Literal fields were registered batch-level above and are filled
             // by `fill_row_gaps` — only field (per-row value) yields stage.
+            let t_stage = if prof.enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            // No `with_yield_eval_scope` here: the columnar gate excludes
+            // General yield exprs, so nothing in this loop reads the
+            // eval-time scope (`now()`) — the per-row TLS enter/leave was
+            // pure overhead on this path.
             builder.begin_row();
-            let staged: CoreResult<()> = with_yield_eval_scope(|| {
-                for (((_field, (name, field_type)), kind), field_ref) in self
+            let staged: CoreResult<()> = (|| {
+                for ((((_field, (name, field_type)), kind), _field_ref), field_idx_opt) in self
                     .plan
                     .yield_plan
                     .fields
@@ -570,6 +692,7 @@ impl RuleExecutor {
                     .zip(statics.yield_specs.iter())
                     .zip(yield_kinds.iter())
                     .zip(yield_field_refs.iter())
+                    .zip(yield_field_idxs.iter().copied())
                 {
                     let value = match kind {
                         YieldKind::Lit(_) => {
@@ -577,13 +700,23 @@ impl RuleExecutor {
                             continue;
                         }
                         YieldKind::Field => {
-                            // Missing field falls back to an empty string,
-                            // exactly like the interpreter path's wrapper.
-                            event
-                                .field_value(field_ref_name(
-                                    field_ref.expect("Field kind implies a field ref"),
-                                ))
-                                .unwrap_or_else(|| Value::Str(SmolStr::default()))
+                            // Read by pre-resolved column index, skipping the
+                            // per-row `index_of`; when the field is the same
+                            // column as the field-entity (Q1: id=b.auction ==
+                            // entity auction), reuse the value already read for
+                            // entity_id instead of re-reading the column.
+                            // A `None` index (column absent from the batch
+                            // schema) falls back to empty string, exactly like
+                            // `field_value(name).unwrap_or_else(default)` originally.
+                            match (field_idx_opt, entity_idx) {
+                                (Some(idx), Some(e_idx)) if idx == e_idx => entity_val
+                                    .clone()
+                                    .unwrap_or_else(|| Value::Str(SmolStr::default())),
+                                (Some(idx), _) => event
+                                    .value_at(idx)
+                                    .unwrap_or_else(|| Value::Str(SmolStr::default())),
+                                (None, _) => Value::Str(SmolStr::default()),
+                            }
                         }
                         YieldKind::General => {
                             unreachable!("columnar gate excludes general yield exprs")
@@ -602,12 +735,20 @@ impl RuleExecutor {
                     builder.stage_yield_cell(name, field_type.as_ref(), &value)?;
                 }
                 Ok(())
-            });
+            })();
             if let Err(e) = staged {
                 log::warn!("alert export error: {e}");
                 stats.failed += 1;
                 continue;
             }
+            if let Some(t) = t_stage {
+                prof.add(e1_bucket_stage(), t);
+            }
+            let t_commit = if prof.enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            };
             builder.commit_each_row(EachRowCells {
                 wfx_id,
                 score,
@@ -620,9 +761,13 @@ impl RuleExecutor {
                 emit_time: &emit_time,
                 summary: &summary,
             });
+            if let Some(t) = t_commit {
+                prof.add(e1_bucket_commit(), t);
+            }
             stats.appended += 1;
             appended_out.push(idx);
         }
+        prof.report(rows.len());
         stats
     }
 
@@ -859,6 +1004,90 @@ pub struct EachDirectBatchStats {
     pub failed: usize,
 }
 
+/// Env-gated per-row segment profiler for the columnar on-each execute path
+/// (Q1 bisection). Defaults to off with one `OnceLock`-cached `Instant`-free
+/// check; `E1_TIMER=1` breaks the per-row budget into entity / fired_at /
+/// wfx_id / begin+stage / commit buckets and prints ns/row after the batch.
+/// Intended for `each_bench` and end-to-end profiling, never shipped hot-path.
+struct E1Profiler {
+    on: bool,
+    buckets: [u64; 5],
+}
+
+#[inline(always)]
+fn e1_bucket_entity() -> usize {
+    0
+}
+#[inline(always)]
+fn e1_bucket_fired() -> usize {
+    1
+}
+#[inline(always)]
+fn e1_bucket_wfx() -> usize {
+    2
+}
+#[inline(always)]
+fn e1_bucket_stage() -> usize {
+    3
+}
+#[inline(always)]
+fn e1_bucket_commit() -> usize {
+    4
+}
+
+impl E1Profiler {
+    fn maybe() -> Self {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let on = *ENABLED.get_or_init(|| {
+            std::env::var("E1_TIMER").is_ok() && std::env::var("E1_TIMER").as_deref() != Ok("0")
+        });
+        E1Profiler {
+            on,
+            buckets: [0; 5],
+        }
+    }
+    #[inline(always)]
+    fn enabled(&self) -> bool {
+        self.on
+    }
+    #[inline(always)]
+    fn add(&mut self, bucket: usize, start: Instant) {
+        if self.on {
+            self.buckets[bucket] += start.elapsed().as_nanos() as u64;
+        }
+    }
+    fn report(&self, rows: usize) {
+        if !self.on || rows == 0 {
+            return;
+        }
+        let total: u64 = self.buckets.iter().sum();
+        let n = rows as f64;
+        eprintln!(
+            "[E1-profiler] rows={rows} total={:.1}ns/row",
+            total as f64 / n
+        );
+        let names = [
+            "\u{7c} entity  ",
+            "\u{7c} fired_at",
+            "\u{7c} wfx_id  ",
+            "\u{7c} stage   ",
+            "\u{7c} commit  ",
+        ];
+        for (name, ns) in names.iter().zip(self.buckets.iter()) {
+            eprintln!(
+                "  {} {:>7.1} ns/row  ({:>4.1}% of segment total)\n",
+                name,
+                *ns as f64 / n,
+                if total > 0 {
+                    *ns as f64 / total as f64 * 100.0
+                } else {
+                    0.0
+                }
+            );
+        }
+    }
+}
+
 /// Per-yield-field evaluation strategy for the batched on-each direct path.
 enum YieldKind {
     /// Literal expression — value built once per batch, cloned per row.
@@ -867,4 +1096,60 @@ enum YieldKind {
     Field,
     /// Anything else — full interpreter evaluation with the per-row meta.
     General,
+}
+
+/// The null / missing-column entity fallback on the columnar on-each path:
+/// the Event reference path routes a missing entity field through the yield
+/// empty-string fallback, so the row still appends with `entity_id = ""` and
+/// a shared-column yield reads the empty string too.
+#[inline(always)]
+fn empty_entity_pair() -> (String, Option<Value>) {
+    (String::new(), Some(Value::Str(SmolStr::default())))
+}
+
+/// Batch-resolved typed entity column (P2): ONE downcast per batch, direct
+/// typed reads per row — replaces the per-row `value_at` +
+/// `write_flat_column_scratch` double dynamic dispatch on the entity path.
+enum EntityCol<'a> {
+    /// Int64 / Timestamp(ns) — physically i64 arrays; one typed read feeds
+    /// both the `write_int64_value` rendering and the `Value` held for
+    /// shared-column yield reuse.
+    I64(I64Col<'a>),
+    /// Plain (non-structured) Utf8 — `&str` read pushed directly (the qradar
+    /// entity shape: sip / source_ip / user). Structured Utf8 columns must
+    /// stay [`EntityCol::Generic`] — their values JSON-parse in
+    /// `extract_field_value`.
+    Utf8(&'a StringArray),
+    /// Everything else keeps the existing `value_at` + `value_to_string` lane.
+    Generic,
+}
+
+/// The two physically-i64 column flavors an [`EntityCol::I64`] can hold.
+enum I64Col<'a> {
+    Int64(&'a Int64Array),
+    TsNanos(&'a TimestampNanosecondArray),
+}
+
+impl I64Col<'_> {
+    /// Typed read with the same null gate as `ColumnarEvent::value_at`
+    /// (`None` on a null slot → the shared entity-failure branch).
+    #[inline(always)]
+    fn read(&self, row: usize) -> Option<i64> {
+        match self {
+            I64Col::Int64(a) => {
+                if a.is_null(row) {
+                    None
+                } else {
+                    Some(a.value(row))
+                }
+            }
+            I64Col::TsNanos(a) => {
+                if a.is_null(row) {
+                    None
+                } else {
+                    Some(a.value(row))
+                }
+            }
+        }
+    }
 }
