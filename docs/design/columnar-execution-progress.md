@@ -334,6 +334,9 @@ cargo test -p wf-runtime --lib → 165 passed
    暖相 6.67M/6.70M、EMIT 747816 精确一致，EPS 无回归（受「两道墙」限无增益，见 Step 8）。
 5. ~~**Q1 `on each` 懒物化（defer）**~~ ✅ 已完成（Step 12）：解除 mailbox 争抢（dispatch 65.5%→7.4%）
    并降 RSS（~14GB→~8.9GB），但 **EPS 中性**——Q1 天花板是管线深度，不是物化。
-6. **Q1 旁路窗口 actor**（下一步）：无状态 `on each` 窗口是纯开销，把 raw batch 直接广播到
-   规则任务、跳过窗口 append/reorder/evict，才可能突破 ~7.17M 高相天花板（见
-   `concurrency-scaling.md` §2.3 / 两道墙模型）。
+6. ~~**Q1 旁路窗口 actor**~~ 🔬 已探明（未合入）：无状态 `on each` 窗口的 actor 是纯开销，
+   把 raw batch 直接广播到规则任务（跳过 append/reorder/evict）确实把 **append/广播速率** 从
+   ~7.17M 拉到 **~10.16M**；但用**滞后口径**（规则任务处理完才记 append，EMIT 精确=92M）
+   复测端到端只有 **~3.83M**——规则任务 CPU 仅 ~14%，真正的墙在 **alert sink/flush**
+   （`flush_alerts`/`flush_pipes` 异步阻塞），不是窗口 actor。**结论：Q1 端到端天花板是输出
+   sink，不是窗口；旁路已回退，下一步应二分 sink 交付路径。**
