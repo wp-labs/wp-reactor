@@ -605,6 +605,109 @@ fn execute_each_direct_batch_columnar_matches_event_path_rows() {
 }
 
 #[test]
+fn columnar_numeric_entity_yield_fast_path_matches_event_path() {
+    // last-materialization fast path: a numeric field-entity (Q1
+    // `entity(digit, b.auction)`) whose yield field references the *same*
+    // column (id=b.auction) stages the raw f64 directly via
+    // `stage_yield_cell_f64` instead of constructing + coercing a `Value` per
+    // row. Must be byte-identical to the Event path for every numeric declare
+    // target (digit / float / chars / untyped), including a null-entity row.
+    use crate::match_engine::event_bridge::{ColumnarEvent, materialize_rows};
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+    for declare in [
+        Some(FieldType::Base(BaseType::Digit)),
+        Some(FieldType::Base(BaseType::Float)),
+        Some(FieldType::Base(BaseType::Chars)),
+        None, // untyped
+    ] {
+        let mut plan = simple_rule_plan(
+            "q_num_entity",
+            simple_plan(vec![], vec![]),
+            Expr::Number(5.0),
+            "digit",
+            Expr::Field(FieldRef::Qualified("e".into(), "auction".into())),
+        );
+        plan.binds[0].alias = "e".into();
+        plan.each_plan = Some(EachPlan {
+            alias: "e".into(),
+            filter: None,
+        });
+        plan.yield_plan.fields = vec![
+            YieldField {
+                name: "id".into(),
+                value: Expr::Field(FieldRef::Qualified("e".into(), "auction".into())),
+            },
+            YieldField {
+                name: "c".into(),
+                value: Expr::Number(1.0),
+            },
+        ];
+        let types: HashMap<String, FieldType> = match &declare {
+            Some(ft) => HashMap::from([("id".into(), ft.clone()), ("c".into(), ft.clone())]),
+            None => HashMap::from([("c".into(), FieldType::Base(BaseType::Float))]),
+        };
+        let exec = RuleExecutor::new_with_yield_field_types(plan, types);
+        assert!(exec.each_plan_columnar_safe());
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "auction",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![
+                Some(123),
+                Some(1_000_000),
+                None, // null entity → same failure semantics both paths
+                Some(7),
+            ])) as ArrayRef],
+        )
+        .unwrap();
+
+        let events: Vec<Event> = materialize_rows(&batch, &[0, 1, 2, 3]);
+        let rows: Vec<(&Event, i64)> = events
+            .iter()
+            .enumerate()
+            .map(|(i, ev)| (ev, NANOS + i as i64))
+            .collect();
+        let mut via_events = AlertColumnBuilder::new(Arc::from("alerts"));
+        let mut appended_idx = Vec::new();
+        let stats = exec.execute_each_direct_batch(
+            &rows,
+            &EmptyLookup,
+            &[],
+            NANOS,
+            &mut via_events,
+            &mut appended_idx,
+        );
+
+        let col_events: Vec<ColumnarEvent<'_>> =
+            (0..4).map(|r| ColumnarEvent::new(&batch, r)).collect();
+        let col_rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+            .iter()
+            .enumerate()
+            .map(|(i, ev)| (ev, NANOS + i as i64))
+            .collect();
+        let mut via_columnar = AlertColumnBuilder::new(Arc::from("alerts"));
+        let mut appended_idx_c = Vec::new();
+        let stats_c = exec.execute_each_direct_batch_columnar(
+            &col_rows,
+            NANOS,
+            &mut via_columnar,
+            &mut appended_idx_c,
+        );
+        assert_eq!(stats_c, stats, "declare={declare:?}");
+        assert_eq!(appended_idx_c, appended_idx);
+        assert_batches_equal_rows(&via_events.finish(), &via_columnar.finish());
+    }
+}
+
+#[test]
 fn columnar_utf8_entity_null_lane_matches_event_path_rows() {
     // P2 Utf8 entity fast lane (the qradar shape: sip / source_ip / user):
     // entity on a non-structured Utf8 column, a yield field sharing the same

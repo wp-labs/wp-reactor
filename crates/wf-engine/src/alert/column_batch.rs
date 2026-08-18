@@ -515,6 +515,67 @@ impl AlertColumnBuilder {
         Ok(())
     }
 
+    /// Percent of [`Self::stage_yield_cell`] for the numeric fast lane (Q1
+    /// entity==yield `id=b.auction`): stages a raw `f64` without constructing a
+    /// [`Value`] per cell. Column resolution / duplicate logic is identical;
+    /// export uses [`export_yield_f64`] (byte-identical to the `Value` path,
+    /// with a fallback for non-numeric target types).
+    pub fn stage_yield_cell_f64(
+        &mut self,
+        name: &Arc<str>,
+        field_type: Option<&FieldType>,
+        n: f64,
+    ) -> CoreResult<()> {
+        let pos = self.staged.len();
+        if let Some((cached_name, col_idx, _cached_ft)) = self.layout_cache.get(pos)
+            && Arc::ptr_eq(cached_name, name)
+        {
+            let (meta, model_value) = crate::alert::export_yield_f64(n, field_type)?;
+            self.staged.push((*col_idx, meta, model_value));
+            return Ok(());
+        }
+        if name.starts_with(WFU_PREFIX) {
+            return CoreReason::DataFormat
+                .to_err()
+                .with_detail(format!(
+                    "yield field {name:?} uses reserved prefix {WFU_PREFIX}"
+                ))
+                .err();
+        }
+        let col_idx = match self.yield_cols.iter().position(|c| c.name == *name) {
+            Some(i) => i,
+            None => {
+                self.yield_cols.push(YieldCol {
+                    name: Arc::clone(name),
+                    metas: Vec::new(),
+                    values: Vec::new(),
+                    const_value: None,
+                });
+                let col = self.yield_cols.last_mut().unwrap();
+                for _ in 0..self.len {
+                    col.metas.push(DataType::Ignore);
+                    col.values.push(ModelValue::Null);
+                }
+                self.yield_cols.len() - 1
+            }
+        };
+        if self.staged.iter().any(|(ci, _, _)| *ci == col_idx) {
+            return CoreReason::DataFormat
+                .to_err()
+                .with_detail(format!("duplicate exported field {name:?}"))
+                .err();
+        }
+        let (meta, model_value) = crate::alert::export_yield_f64(n, field_type)?;
+        let cache_entry = (Arc::clone(name), col_idx, field_type.cloned());
+        if pos < self.layout_cache.len() {
+            self.layout_cache[pos] = cache_entry;
+        } else {
+            self.layout_cache.push(cache_entry);
+        }
+        self.staged.push((col_idx, meta, model_value));
+        Ok(())
+    }
+
     /// Commit the staged row with the system fields (infallible column
     /// pushes; all fallible work happened in `stage_yield_cell`).
     ///

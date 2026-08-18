@@ -583,13 +583,10 @@ impl RuleExecutor {
                         .as_any()
                         .downcast_ref::<TimestampNanosecondArray>()
                         .map_or(EntityCol::Generic, |a| EntityCol::I64(I64Col::TsNanos(a))),
-                    DataType::Utf8
-                        if !crate::match_engine::is_wfl_structured_field(field) =>
-                    {
-                        col.as_any()
-                            .downcast_ref::<StringArray>()
-                            .map_or(EntityCol::Generic, EntityCol::Utf8)
-                    }
+                    DataType::Utf8 if !crate::match_engine::is_wfl_structured_field(field) => col
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .map_or(EntityCol::Generic, EntityCol::Utf8),
                     _ => EntityCol::Generic,
                 }
             }
@@ -606,46 +603,45 @@ impl RuleExecutor {
             let score = score_const;
             // For a field-entity (Q1: `entity(digit, b.auction)`), hold the read
             // `Value` so a yield field referencing the same column (id=b.auction)
-            // reuses it instead of re-reading the column per row.
-            let (entity_id, entity_val): (String, Option<Value>) = match &entity_const {
-                Some(s) => (s.clone(), None),
-                None => {
-                    // Typed fast lanes (P2): one typed read per row, zero dyn
-                    // dispatch. Generic keeps `value_at` + `value_to_string`
-                    // exactly as before. Null / missing column fall back to
-                    // the EMPTY-STRING entity (row still appends) on every
-                    // lane — matching the Event path, where `eval_entity_id`
-                    // routes through the yield missing-field fallback
-                    // (`eval_yield_expr_with_meta`: None → Str("")). The old
-                    // columnar behavior failed such rows, silently diverging
-                    // from the reference path (caught by the Utf8 null-lane
-                    // 对拍 test).
-                    match &entity_col {
+            // reuses it instead of re-reading the column per row. `entity_f64`
+            // is the raw number on typed numeric lanes, letting that same yield
+            // stage directly without constructing a `Value` (last materialization).
+            let (entity_id, entity_val, entity_f64): (String, Option<Value>, Option<f64>) =
+                match &entity_const {
+                    Some(s) => (s.clone(), None, None),
+                    None => match &entity_col {
                         EntityCol::I64(i64col) => match i64col.read(event.row()) {
                             Some(v) => {
                                 let mut es = String::with_capacity(20);
                                 write_int64_value(&mut es, v);
-                                (es, Some(Value::Number(v as f64)))
+                                (es, Some(Value::Number(v as f64)), Some(v as f64))
                             }
-                            None => empty_entity_pair(),
+                            None => {
+                                let (eid, eval) = empty_entity_pair();
+                                (eid, eval, None)
+                            }
                         },
                         EntityCol::Utf8(arr) => {
                             let row = event.row();
                             if arr.is_null(row) {
-                                empty_entity_pair()
+                                let (eid, eval) = empty_entity_pair();
+                                (eid, eval, None)
                             } else {
                                 let s = arr.value(row);
-                                (String::from(s), Some(Value::Str(s.into())))
+                                (String::from(s), Some(Value::Str(s.into())), None)
                             }
                         }
-                        EntityCol::Generic => match entity_idx.and_then(|idx| event.value_at(idx))
-                        {
-                            Some(v) => (value_to_string(&v), Some(v)),
-                            None => empty_entity_pair(),
-                        },
-                    }
-                }
-            };
+                        EntityCol::Generic => {
+                            match entity_idx.and_then(|idx| event.value_at(idx)) {
+                                Some(v) => (value_to_string(&v), Some(v), None),
+                                None => {
+                                    let (eid, eval) = empty_entity_pair();
+                                    (eid, eval, None)
+                                }
+                            }
+                        }
+                    },
+                };
             if let Some(t) = t_entity {
                 prof.add(e1_bucket_entity(), t);
             }
@@ -700,6 +696,22 @@ impl RuleExecutor {
                             continue;
                         }
                         YieldKind::Field => {
+                            // last-materialization fast path: when this field
+                            // is the same column as a typed-numeric entity (Q1
+                            // id=b.auction) and the target type is numeric
+                            // (digit/float/chars/untyped), stage the raw f64
+                            // directly — no per-row `Value` construction, no
+                            // `coerce` round-trip. `export_yield_f64` replicates
+                            // the coerce+export byte-for-byte for these targets;
+                            // other targets fall back below.
+                            if let (Some(idx), Some(e_idx)) = (field_idx_opt, entity_idx)
+                                && idx == e_idx
+                                && let Some(n) = entity_f64
+                                && is_numeric_yield_type(field_type.as_ref())
+                            {
+                                builder.stage_yield_cell_f64(name, field_type.as_ref(), n)?;
+                                continue;
+                            }
                             // Read by pre-resolved column index, skipping the
                             // per-row `index_of`; when the field is the same
                             // column as the field-entity (Q1: id=b.auction ==
@@ -1105,6 +1117,19 @@ enum YieldKind {
 #[inline(always)]
 fn empty_entity_pair() -> (String, Option<Value>) {
     (String::new(), Some(Value::Str(SmolStr::default())))
+}
+
+/// Whether `export_yield_f64` handles the target type natively (no `Value`
+/// fallback), so the entity==yield numeric fast lane can stage the raw number
+/// directly and stay byte-identical to the `Value::Number` coerce+export path.
+#[inline(always)]
+fn is_numeric_yield_type(field_type: Option<&wf_lang::FieldType>) -> bool {
+    matches!(
+        field_type,
+        None | Some(wf_lang::FieldType::Base(wf_lang::BaseType::Digit))
+            | Some(wf_lang::FieldType::Base(wf_lang::BaseType::Float))
+            | Some(wf_lang::FieldType::Base(wf_lang::BaseType::Chars))
+    )
 }
 
 /// Batch-resolved typed entity column (P2): ONE downcast per batch, direct

@@ -266,6 +266,34 @@ pub(crate) fn export_yield_value(
     }
 }
 
+/// Like [`export_yield_value`] for the common numeric fast lane (Q1 entity==yield
+/// `id=b.auction`), taking the raw `f64` instead of constructing a [`Value`]
+/// per cell. Byte-identical to the `Value::Number(f64)` path. Falls back to the
+/// `Value` path for non-numeric target types (Time / Ip / Hex), and rejects
+/// non-finite numbers exactly like the `Value` path.
+pub(crate) fn export_yield_f64(
+    n: f64,
+    field_type: Option<&FieldType>,
+) -> CoreResult<(DataType, ModelValue)> {
+    match field_type {
+        Some(FieldType::Base(BaseType::Digit)) if n.is_finite() && n.fract() == 0.0 => {
+            Ok((DataType::Digit, ModelValue::from(n as i64)))
+        }
+        Some(FieldType::Base(BaseType::Float)) if n.is_finite() => {
+            Ok((DataType::Float, ModelValue::from(n)))
+        }
+        // Chars / untyped from a number render the f64 Display form, same as
+        // `export_untyped_value` / `export_typed_value(Chars, Number)`.
+        Some(FieldType::Base(BaseType::Chars)) => {
+            Ok((DataType::Chars, ModelValue::from(n.to_string().as_str())))
+        }
+        None if n.is_finite() => Ok((DataType::Float, ModelValue::from(n))),
+        // Any other target (Time / Ip / Hex / non-finite / array / object) —
+        // fall back to the Value path for byte-identical handling.
+        _ => export_yield_value(&Value::Number(n), field_type),
+    }
+}
+
 fn export_typed_value(base_type: &BaseType, value: &Value) -> CoreResult<(DataType, ModelValue)> {
     match base_type {
         BaseType::Digit => match value {
