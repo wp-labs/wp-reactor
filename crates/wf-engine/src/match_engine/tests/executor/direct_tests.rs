@@ -518,3 +518,89 @@ fn execute_each_direct_batch_filter_rejections_match_per_event_path() {
     assert_eq!(appended_idx, vec![0, 2]);
     assert_eq!(via_batch.len(), 2);
 }
+
+#[test]
+fn execute_each_direct_batch_columnar_matches_event_path_rows() {
+    // Deferred-vs-columnar 对拍: the columnar fast path (no per-row `Event`
+    // materialization, field reads straight from Arrow columns) must produce
+    // byte-identical rows to the eager `materialize_rows` + batch path —
+    // including the missing-field (null) lane and the 2^53 f64 round-trip
+    // lane in the wfx_id hash.
+    use crate::match_engine::event_bridge::{ColumnarEvent, materialize_rows, sorted_fields_for};
+    use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    let exec = each_plan_rule();
+    assert!(
+        exec.each_plan_columnar_safe(),
+        "test rule must be columnar-safe"
+    );
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("sip", DataType::Utf8, true),
+        Field::new("auction_id", DataType::Float64, true),
+        Field::new("price", DataType::Float64, true),
+        // Int64 column with a 2^53+1 value: `extract_value` renders it through
+        // the f64 round-trip — both paths must hash the identical bytes.
+        Field::new("big", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["10.0.0.1", "10.0.0.2", "10.0.0.3"])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![1000.0, 1001.0, 1002.0])),
+            Arc::new(Float64Array::from(vec![Some(99.5), Some(79.25), None])),
+            Arc::new(Int64Array::from(vec![
+                9007199254740993,
+                -9007199254740993,
+                42,
+            ])),
+        ],
+    )
+    .unwrap();
+
+    // Reference: eager materialization + the Event-based batch path.
+    let events: Vec<Event> = materialize_rows(&batch, &[0, 1, 2]);
+    let rows: Vec<(&Event, i64)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut via_events = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_idx = Vec::new();
+    let stats = exec.execute_each_direct_batch(
+        &rows,
+        &EmptyLookup,
+        &[],
+        NANOS,
+        &mut via_events,
+        &mut appended_idx,
+    );
+    assert_eq!(stats.appended, 3);
+    assert_eq!(stats.rejected, 0);
+    assert_eq!(stats.failed, 0);
+
+    // Columnar fast path.
+    let col_events: Vec<ColumnarEvent<'_>> =
+        (0..3).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut via_columnar = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_idx_c = Vec::new();
+    let stats_c = exec.execute_each_direct_batch_columnar(
+        &col_rows,
+        &sorted_fields_for(&batch),
+        NANOS,
+        &mut via_columnar,
+        &mut appended_idx_c,
+    );
+    assert_eq!(stats_c, stats);
+    assert_eq!(appended_idx_c, appended_idx);
+
+    assert_batches_equal_rows(&via_events.finish(), &via_columnar.finish());
+}

@@ -2,18 +2,22 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use smol_str::SmolStr;
-use wf_lang::ast::Expr;
+use wf_lang::ast::{Expr, FieldRef};
 
 use crate::alert::{AlertColumnBuilder, EachRowCells};
 use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::MACHINE_ID;
+use crate::match_engine::event_bridge::ColumnarEvent;
 use crate::match_engine::match_engine::{
-    CepStateMachine, Event, Value, WindowLookup, eval_field_value,
+    CepStateMachine, Event, Value, WindowLookup, eval_field_value, field_ref_name, value_to_string,
 };
 
 use super::RuleExecutor;
-use super::alert::{build_each_wfx_id, build_each_wfx_id_reusing, format_nanos_utc, now_nanos};
+use super::alert::{
+    build_each_wfx_id, build_each_wfx_id_columnar_reusing, build_each_wfx_id_reusing,
+    format_nanos_utc, now_nanos,
+};
 use super::context::execute_joins;
 use super::eval::{
     YieldMeta, eval_bool_expr, eval_entity_id, eval_score, eval_yield_expr_with_meta,
@@ -314,6 +318,227 @@ impl RuleExecutor {
                         YieldKind::General => {
                             eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
                                 .expect("eval_yield_expr_with_meta never returns None")
+                        }
+                    };
+                    let Some(value) = RuleExecutor::coerce_yield_field_value_with(
+                        name,
+                        field_type.as_ref(),
+                        value,
+                    )?
+                    else {
+                        // Optional input field was missing → omit it from
+                        // the output row (wp-labs/warp-fusion#62).
+                        continue;
+                    };
+                    builder.stage_yield_cell(name, field_type.as_ref(), &value)?;
+                }
+                Ok(())
+            });
+            if let Err(e) = staged {
+                log::warn!("alert export error: {e}");
+                stats.failed += 1;
+                continue;
+            }
+            builder.commit_each_row(EachRowCells {
+                wfx_id,
+                score,
+                entity_id,
+                fired_at,
+                rule_name: &statics.rule_name,
+                entity_type: &statics.entity_type,
+                origin: &statics.each_origin,
+                close_reason: &statics.each_close_reason,
+                emit_time: &emit_time,
+                summary: &summary,
+            });
+            stats.appended += 1;
+            appended_out.push(idx);
+        }
+        stats
+    }
+
+    /// Whether the on-each plan can run the columnar fast path: no joins, no
+    /// each filter, constant score, entity = field/const, yield values =
+    /// literal/field (flat refs only), and every bind filter absent or
+    /// columnar (a non-columnar bind filter falls back to the per-event
+    /// interpreted `event_matches_alias`, which the columnar branch does not
+    /// replicate). Anything else falls back to the Event-based path, keeping
+    /// both paths byte-identical by construction.
+    pub fn each_plan_columnar_safe(&self) -> bool {
+        let Some(each_plan) = &self.plan.each_plan else {
+            return false;
+        };
+        if !self.plan.joins.is_empty() || each_plan.filter.is_some() {
+            return false;
+        }
+        if !self.plan.binds.iter().all(|b| {
+            b.filter
+                .as_ref()
+                .map_or(true, |f| wf_lang::columnar::expr_is_columnar(f))
+        }) {
+            return false;
+        }
+        if !matches!(self.plan.score_plan.expr, Expr::Number(_)) {
+            return false;
+        }
+        let flat = |fr: &FieldRef| {
+            matches!(
+                fr,
+                FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
+            )
+        };
+        match &self.plan.entity_plan.entity_id_expr {
+            Expr::StringLit(_) => {}
+            Expr::Field(fr) if flat(fr) => {}
+            _ => return false,
+        }
+        self.plan
+            .yield_plan
+            .fields
+            .iter()
+            .all(|field| match &field.value {
+                Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => true,
+                Expr::Field(fr) => flat(fr),
+                _ => false,
+            })
+    }
+
+    /// Columnar form of [`Self::execute_each_direct_batch`]: reads field
+    /// values straight from the Arrow columns via [`ColumnarEvent`], skipping
+    /// per-row `Event` materialization entirely (design doc §3.5「on each
+    /// 完全不物化」).
+    ///
+    /// Caller must gate on [`Self::each_plan_columnar_safe`]; the per-row
+    /// output (wfx_id / entity_id / fired_at / yield cells) is byte-identical
+    /// to the Event-based path — locked by the deferred-vs-columnar 对拍 test.
+    pub fn execute_each_direct_batch_columnar(
+        &self,
+        rows: &[(&ColumnarEvent<'_>, i64)],
+        sorted_fields: &[(String, usize)],
+        emit_time_nanos: i64,
+        builder: &mut AlertColumnBuilder,
+        appended_out: &mut Vec<usize>,
+    ) -> EachDirectBatchStats {
+        appended_out.clear();
+        let mut stats = EachDirectBatchStats::default();
+        let Some(each_plan) = &self.plan.each_plan else {
+            log::warn!(
+                "execute_each_direct_batch_columnar called for non-`on each` rule {}; skipping {} rows",
+                self.plan.name,
+                rows.len()
+            );
+            stats.failed = rows.len();
+            return stats;
+        };
+        debug_assert!(self.each_plan_columnar_safe());
+        let _ = each_plan; // filter is None by the safety gate
+        let statics = self.output_static();
+        let emit_time = self.cached_emit_time(emit_time_nanos);
+        let summary = Arc::clone(
+            statics
+                .each_summary
+                .as_ref()
+                .expect("on-each rule missing precomputed summary"),
+        );
+        let origin = AlertOrigin::Event;
+
+        // Plan-constant specialization — the safety gate guarantees these
+        // shapes (score const; entity StringLit or flat Field; yields Lit/Field).
+        let score_const = match &self.plan.score_plan.expr {
+            Expr::Number(n) => n.clamp(0.0, 100.0),
+            _ => unreachable!("columnar gate requires a constant score"),
+        };
+        let entity_const: Option<String> = match &self.plan.entity_plan.entity_id_expr {
+            Expr::StringLit(s) => Some(s.clone()),
+            _ => None,
+        };
+        let entity_field: Option<&FieldRef> = match &self.plan.entity_plan.entity_id_expr {
+            Expr::Field(fr) => Some(fr),
+            _ => None,
+        };
+        let yield_kinds: Vec<YieldKind> = self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| match &field.value {
+                Expr::Number(n) => YieldKind::Lit(Value::Number(*n)),
+                Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
+                Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
+                Expr::Field(_) => YieldKind::Field,
+                _ => unreachable!("columnar gate excludes general yield exprs"),
+            })
+            .collect();
+        let yield_field_refs: Vec<Option<&FieldRef>> = self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| match &field.value {
+                Expr::Field(fr) => Some(fr),
+                _ => None,
+            })
+            .collect();
+
+        builder.reserve_rows(rows.len());
+        let mut wfx_scratch = String::new();
+
+        for (idx, (event, event_time_nanos)) in rows.iter().enumerate() {
+            // -- Per-row system values (identical to the Event-based path) ---
+            let score = score_const;
+            let entity_id = match &entity_const {
+                Some(s) => s.clone(),
+                None => match entity_field
+                    .and_then(|fr| event.field_value(field_ref_name(fr)))
+                    .as_ref()
+                    .map(value_to_string)
+                {
+                    Some(s) => s,
+                    None => {
+                        // eval_entity_id on None is an error → failed row.
+                        log::warn!("alert export error: entity_id expression evaluated to None");
+                        stats.failed += 1;
+                        continue;
+                    }
+                },
+            };
+            let fired_at = format_nanos_utc(*event_time_nanos);
+            let wfx_id = build_each_wfx_id_columnar_reusing(
+                &self.plan.name,
+                *event_time_nanos,
+                event,
+                sorted_fields,
+                &origin,
+                &mut wfx_scratch,
+            );
+            // (yield_meta is only consumed by General yield exprs — excluded
+            // by the columnar gate, so it is not built here.)
+
+            // -- Yield staging (fallible work before any column push) ------
+            builder.begin_row();
+            let staged: CoreResult<()> = with_yield_eval_scope(|| {
+                for (((_field, (name, field_type)), kind), field_ref) in self
+                    .plan
+                    .yield_plan
+                    .fields
+                    .iter()
+                    .zip(statics.yield_specs.iter())
+                    .zip(yield_kinds.iter())
+                    .zip(yield_field_refs.iter())
+                {
+                    let value = match kind {
+                        YieldKind::Lit(v) => v.clone(),
+                        YieldKind::Field => {
+                            // Missing field falls back to an empty string,
+                            // exactly like the interpreter path's wrapper.
+                            event
+                                .field_value(field_ref_name(
+                                    field_ref.expect("Field kind implies a field ref"),
+                                ))
+                                .unwrap_or_else(|| Value::Str(SmolStr::default()))
+                        }
+                        YieldKind::General => {
+                            unreachable!("columnar gate excludes general yield exprs")
                         }
                     };
                     let Some(value) = RuleExecutor::coerce_yield_field_value_with(

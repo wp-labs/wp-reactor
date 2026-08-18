@@ -56,9 +56,12 @@ impl FromStr for HumanDuration {
             "m" => value * 60,
             "h" => value * 3600,
             "d" => value * 86400,
+            "ms" => {
+                return Ok(Self(Duration::from_millis(value)));
+            }
             _ => {
                 return ConfigReason::Validation.fail(format!(
-                    "unsupported duration suffix {suffix:?} in {s:?} (expected s/m/h/d)"
+                    "unsupported duration suffix {suffix:?} in {s:?} (expected ms/s/m/h/d)"
                 ));
             }
         };
@@ -71,6 +74,10 @@ impl fmt::Display for HumanDuration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let secs = self.0.as_secs();
         if secs == 0 {
+            let millis = self.0.subsec_millis();
+            if millis > 0 {
+                return write!(f, "{millis}ms");
+            }
             return write!(f, "0s");
         }
         if secs.is_multiple_of(86400) {
@@ -287,6 +294,13 @@ mod tests {
         let d: HumanDuration = "0s".parse().unwrap();
         assert_eq!(d.as_duration(), Duration::from_secs(0));
         assert_eq!(d.to_string(), "0s");
+    }
+
+    #[test]
+    fn duration_millis() {
+        let d: HumanDuration = "100ms".parse().unwrap();
+        assert_eq!(d.as_duration(), Duration::from_millis(100));
+        assert_eq!(d.to_string(), "100ms");
     }
 
     #[test]

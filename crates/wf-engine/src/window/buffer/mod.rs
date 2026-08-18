@@ -623,21 +623,40 @@ fn offsets_bytes(n: usize, width: usize) -> usize {
 }
 
 /// Content bytes of a utf8 column: `(n + 1)` i32 offsets + string payload.
+///
+/// O(1) payload: `offsets[n] - offsets[0]` (offsets only advance by actual
+/// value lengths — null slots carry the previous offset forward), so no
+/// per-row `str::len` walk is needed. Called twice per batch on the hot path
+/// ([`push_decoded_batch`] + [`Router::route_parse`]); the walk version cost
+/// ~2×100k iterator steps per string column per batch at 44M EPS.
 fn utf8_content(n: usize, arr: &StringArray) -> usize {
-    offsets_bytes(n, 4) + arr.iter().flatten().map(str::len).sum::<usize>()
+    offsets_bytes(n, 4) + utf8_payload_bytes(arr.value_offsets())
+}
+
+fn utf8_payload_bytes(offsets: &[i32]) -> usize {
+    let first = offsets.first().copied().unwrap_or(0);
+    let last = offsets.last().copied().unwrap_or(first);
+    (last as usize).saturating_sub(first as usize)
 }
 
 fn large_utf8_content(n: usize, arr: &LargeStringArray) -> usize {
-    offsets_bytes(n, 8) + arr.iter().flatten().map(str::len).sum::<usize>()
+    offsets_bytes(n, 8) + large_utf8_payload_bytes(arr.value_offsets())
+}
+
+fn large_utf8_payload_bytes(offsets: &[i64]) -> usize {
+    let first = offsets.first().copied().unwrap_or(0);
+    let last = offsets.last().copied().unwrap_or(first);
+    (last as usize).saturating_sub(first as usize)
 }
 
 /// Content bytes of a binary column: `(n + 1)` i32 offsets + payload.
+/// O(1) payload via offset span, same as utf8.
 fn binary_content(n: usize, arr: &BinaryArray) -> usize {
-    offsets_bytes(n, 4) + arr.iter().flatten().map(|b| b.len()).sum::<usize>()
+    offsets_bytes(n, 4) + utf8_payload_bytes(arr.value_offsets())
 }
 
 fn large_binary_content(n: usize, arr: &LargeBinaryArray) -> usize {
-    offsets_bytes(n, 8) + arr.iter().flatten().map(|b| b.len()).sum::<usize>()
+    offsets_bytes(n, 8) + large_utf8_payload_bytes(arr.value_offsets())
 }
 
 // ---------------------------------------------------------------------------

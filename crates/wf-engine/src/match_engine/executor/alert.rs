@@ -1,7 +1,11 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use wf_lang::ast::FieldRef;
 
+use arrow::array::Array;
+use arrow::datatypes::{DataType, TimeUnit};
+
 use crate::alert::AlertOrigin;
+use crate::match_engine::event_bridge::extract_field_value;
 use crate::match_engine::match_engine::{StepData, Value, field_ref_name, value_to_string};
 
 /// Format nanoseconds since epoch as ISO 8601 UTC string.
@@ -218,6 +222,130 @@ pub(super) fn build_each_wfx_id_reusing(
     hasher.update(origin.as_str().as_bytes());
     let hash = hasher.finalize();
     hex_encode(&hash.to_le_bytes())
+}
+
+/// Columnar twin of [`build_each_wfx_id_reusing`] over a [`ColumnarEvent`]
+/// (no per-row `Event` materialization). The hashed byte stream is identical:
+/// field set/order and `value_to_string` renderings match the eager path
+/// exactly — flat columns render straight from the Arrow column (no per-row
+/// Value build / string clone), structured/other columns go through the full
+/// extraction (absent on failure, mirroring `Event.fields`).
+pub(super) fn build_each_wfx_id_columnar_reusing(
+    rule_name: &str,
+    event_time_nanos: i64,
+    event: &crate::match_engine::event_bridge::ColumnarEvent<'_>,
+    sorted_fields: &[(String, usize)],
+    origin: &AlertOrigin,
+    scratch: &mut String,
+) -> String {
+    let mut hasher = Fnv1a::new();
+    hasher.update(rule_name.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(&event_time_nanos.to_le_bytes());
+    hasher.update(b"\x00");
+
+    // Name-sorted field list is hoisted once per batch; iterate it per row,
+    // skipping nulls (absent fields, exactly like `Event.fields`). The eager
+    // deferred path passes an empty field_order, so it always hashes the
+    // per-row sorted branch — this iteration is that branch, byte-identical.
+    for (name, idx) in sorted_fields {
+        let schema = event.batch().schema();
+        let col = event.batch().column(*idx);
+        if col.is_null(event.row()) {
+            continue;
+        }
+        let field = schema.field(*idx);
+        let structured =
+            crate::match_engine::event_bridge::wfl_structured_field_kind(field).is_some();
+        let flat = matches!(
+            col.data_type(),
+            DataType::Int64
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::Boolean
+                | DataType::Timestamp(_, _)
+        ) && !structured;
+        if !flat {
+            // Structured / nested / unusual columns: full extraction (absent
+            // on failure — same field set as the eager path).
+            let Some(value) = extract_field_value(field, col.as_ref(), event.row()) else {
+                continue;
+            };
+            hasher.update(name.as_bytes());
+            hasher.update(b"\x1e");
+            write_value_scratch(&value, scratch);
+            hasher.update(scratch.as_bytes());
+            hasher.update(b"\x1f");
+            continue;
+        }
+        hasher.update(name.as_bytes());
+        hasher.update(b"\x1e");
+        write_flat_column_scratch(col.as_ref(), event.row(), scratch);
+        hasher.update(scratch.as_bytes());
+        hasher.update(b"\x1f");
+    }
+
+    hasher.update(b"\x00");
+    hasher.update(origin.as_str().as_bytes());
+    let hash = hasher.finalize();
+    hex_encode(&hash.to_le_bytes())
+}
+
+/// Render a flat column value into `scratch`, byte-identical to
+/// `value_to_string(extract_value(...))` but without building a [`Value`]:
+/// Int64/Timestamp go through the f64 round-trip (`as f64` → Display) exactly
+/// like `Value::Number(i as f64)`, Utf8 pushes the string directly.
+fn write_flat_column_scratch(col: &dyn Array, row: usize, scratch: &mut String) {
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+    use std::fmt::Write;
+    scratch.clear();
+    match col.data_type() {
+        DataType::Int64 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|a| a.value(row))
+                .unwrap_or(0);
+            let _ = write!(scratch, "{}", v as f64);
+        }
+        DataType::Float64 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .map(|a| a.value(row))
+                .unwrap_or(0.0);
+            let _ = write!(scratch, "{v}");
+        }
+        DataType::Utf8 => {
+            let s = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(|a| a.value(row))
+                .unwrap_or("");
+            scratch.push_str(s);
+        }
+        DataType::Boolean => {
+            let v = col
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .map(|a| a.value(row))
+                .unwrap_or(false);
+            let _ = write!(scratch, "{v}");
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            use arrow::array::TimestampNanosecondArray;
+            let v = col
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .map(|a| a.value(row))
+                .unwrap_or(0);
+            let _ = write!(scratch, "{}", v as f64);
+        }
+        _ => {
+            // Unreachable for the `flat` gate; defensive fallback.
+            scratch.push_str("[array]");
+        }
+    }
 }
 
 /// Render a [`Value`] into `out` byte-identically to `value_to_string`, but

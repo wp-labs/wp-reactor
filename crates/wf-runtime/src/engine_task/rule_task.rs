@@ -11,9 +11,9 @@ use tokio::sync::mpsc;
 
 use wf_engine::alert::{AlertColumnBuilder, OutputRecord};
 use wf_engine::match_engine::{
-    CepStateMachine, CloseReason, Event, GuardMasks, RuleExecutor, StepResult,
+    CepStateMachine, CloseReason, ColumnarEvent, Event, GuardMasks, RuleExecutor, StepResult,
     batch_event_time_nanos_at, batch_time_col_index, batch_to_events, batch_to_events_filtered,
-    close_is_qualified, materialize_rows,
+    close_is_qualified, materialize_rows, sorted_fields_for,
 };
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
@@ -456,6 +456,18 @@ impl RuleTask {
         let defer_materialize =
             events.is_none() && batch.is_some() && self.machine.is_some() && !debug_enabled;
 
+        // On-each columnar fast path: no per-row `Event` materialization —
+        // field values are read straight from the Arrow columns. Byte-identical
+        // to the eager path (deferred-vs-columnar 对拍 test locks it).
+        // Independent of `defer_materialize` (that requires a state machine;
+        // Q1 on-each has none).
+        let columnar_each = !debug_enabled
+            && self.machine.is_none()
+            && self.each_direct
+            && events.is_none()
+            && batch.is_some()
+            && self.executor.each_plan_columnar_safe();
+
         let deferred: Option<DeferredRows> = if defer_materialize {
             let batch = batch.expect("deferral requires the raw batch");
             let num_rows = batch.num_rows();
@@ -493,10 +505,17 @@ impl RuleTask {
                 .filter(|&row| hit[row])
                 .map(|row| row as u32)
                 .collect();
-            let hit_events: Vec<Arc<Event>> = materialize_rows(batch, &hit_indices)
-                .into_iter()
-                .map(Arc::new)
-                .collect();
+            let hit_events: Vec<Arc<Event>> = if columnar_each {
+                // The columnar fast path reads columns directly — materializing
+                // all hit rows (Q1: 100% of rows) into HashMap Events is the
+                // cost this path exists to avoid.
+                Vec::new()
+            } else {
+                materialize_rows(batch, &hit_indices)
+                    .into_iter()
+                    .map(Arc::new)
+                    .collect()
+            };
             Some(DeferredRows {
                 times,
                 hit_indices,
@@ -508,7 +527,7 @@ impl RuleTask {
 
         // Eager events (full materialization), used by the non-deferred machine
         // path and the `on each` path.
-        let eager_events: Option<Arc<Vec<Arc<Event>>>> = if defer_materialize {
+        let eager_events: Option<Arc<Vec<Arc<Event>>>> = if defer_materialize || columnar_each {
             None
         } else {
             Some(match events {
@@ -583,6 +602,59 @@ impl RuleTask {
         // (nanos, formatted) pair — the executor caches the formatted string
         // and Arc-shares it across every record it builds this batch.
         let batch_emit_nanos = self.cached_wall_nanos.load(Ordering::Relaxed) as i64;
+        // On-each columnar fast path: skip the per-row loop entirely. Hit rows
+        // come from the (absent-or-columnar) bind-filter masks — with the gate
+        // in `each_plan_columnar_safe`, a `None` mask means no filter (every
+        // row passes, exactly like `event_matches_alias` with no filter).
+        if columnar_each {
+            let batch = batch.expect("columnar each requires the raw batch");
+            let num_rows = batch.num_rows();
+            let mut hit = vec![false; num_rows];
+            for alias in aliases.iter() {
+                match columnar_masks.get(alias) {
+                    Some(Some(mask)) => {
+                        for row in 0..num_rows {
+                            hit[row] |= mask.value(row);
+                        }
+                    }
+                    _ => {
+                        for row in 0..num_rows {
+                            hit[row] = true;
+                        }
+                    }
+                }
+            }
+            let hit_indices: Vec<u32> = (0..num_rows)
+                .filter(|&row| hit[row])
+                .map(|row| row as u32)
+                .collect();
+            let time_col_index = batch_time_col_index(batch, self.each_time_field.as_deref());
+            let sorted_fields = sorted_fields_for(batch);
+            let col_events: Vec<ColumnarEvent<'_>> = hit_indices
+                .iter()
+                .map(|&row| ColumnarEvent::new(batch, row as usize))
+                .collect();
+            let rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+                .iter()
+                .zip(hit_indices.iter())
+                .map(|(ev, &row)| {
+                    let row = row as usize;
+                    let event_nanos = time_col_index
+                        .map(|col| batch_event_time_nanos_at(batch, col, row))
+                        .unwrap_or(0);
+                    (ev, event_nanos)
+                })
+                .collect();
+            // Metrics parity: the eager path reported the input count before
+            // the loop; the unconditional add with 0 is a no-op, so add the
+            // real count here.
+            if let Some(metrics) = &self.metrics {
+                metrics.add_rule_events(self.executor.plan().name.as_str(), rows.len());
+            }
+            self.emit_each_direct_batch_columnar(&rows, &sorted_fields, batch_emit_nanos)
+                .await;
+            return;
+        }
         // Plan C2 batching: when the per-event detail logs are off, collect
         // the each-direct rows and emit them in one vectorized pass after
         // the loop (debug runs keep the per-event path for exact detail).
@@ -1797,6 +1869,106 @@ impl RuleTask {
                 // sampled segment time back to the per-call average × the
                 // sample interval so the accumulator stays comparable with
                 // the per-event path's accounting.
+                let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64 / calls.max(1) as u64;
+                self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
+                if let Some(metrics) = &self.metrics {
+                    metrics.add_alert_serialize_nanos(scaled);
+                }
+            }
+            if should_flush {
+                self.flush_alerts().await;
+            }
+            start = end;
+        }
+    }
+
+    /// Columnar twin of [`Self::emit_each_direct_batch`]: same flush cadence /
+    /// pending bound / telemetry accounting, but the executor reads field
+    /// values straight from the Arrow columns via [`ColumnarEvent`] (no
+    /// per-row `Event` materialization). Caller gates on
+    /// `each_plan_columnar_safe()`.
+    async fn emit_each_direct_batch_columnar(
+        &self,
+        rows: &[(&ColumnarEvent<'_>, i64)],
+        sorted_fields: &[(String, usize)],
+        batch_emit_nanos: i64,
+    ) {
+        let mut appended_idx: Vec<usize> = Vec::new();
+        let mut start = 0;
+        while start < rows.len() {
+            let end = (start + ALERT_BATCH_SIZE).min(rows.len());
+            let segment = &rows[start..end];
+            let calls = segment.len();
+            let time_this = {
+                let rem = self
+                    .serialize_sample_remaining
+                    .fetch_sub(1, Ordering::Relaxed);
+                if rem == 1 {
+                    self.serialize_sample_remaining
+                        .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                }
+            };
+            let _ser_start = time_this.then(Instant::now);
+            let (outcome, should_flush) = {
+                let mut pending = self.pending_alerts.lock().unwrap();
+                let target = self.executor.static_yield_target();
+                let slot = pending
+                    .by_target
+                    .iter_mut()
+                    .find(|(existing, _)| **existing == **target);
+                let builder = match slot {
+                    Some((_, builder)) => builder,
+                    None => {
+                        pending.by_target.push((
+                            std::sync::Arc::clone(target),
+                            AlertColumnBuilder::new(std::sync::Arc::clone(target)),
+                        ));
+                        let last = pending.by_target.len() - 1;
+                        &mut pending.by_target[last].1
+                    }
+                };
+                let outcome = self.executor.execute_each_direct_batch_columnar(
+                    segment,
+                    sorted_fields,
+                    batch_emit_nanos,
+                    builder,
+                    &mut appended_idx,
+                );
+                pending.count += outcome.appended;
+                (outcome, pending.count >= ALERT_BATCH_SIZE)
+            };
+            // Per-row telemetry outside the builder lock — same accounting as
+            // the Event-based batch path; the machine_id comes from the column.
+            if let Some(metrics) = &self.metrics {
+                for &idx in appended_idx.iter() {
+                    metrics.inc_alert_emitted_total(self.rule_name());
+                    let (event, event_nanos) = segment[idx];
+                    let now_nanos = self.cached_wall_nanos.load(Ordering::Relaxed);
+                    let sample = self.emit_sample_remaining.load(Ordering::Relaxed);
+                    if sample == 0 {
+                        self.emit_sample_remaining
+                            .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
+                        metrics.inc_alert_emitted_detail(
+                            self.rule_name(),
+                            &event.field_value_str(wf_engine::match_engine::MACHINE_ID),
+                            self.rule_name(),
+                        );
+                        let e2e_nanos = now_nanos.saturating_sub(event_nanos.max(0) as u64);
+                        metrics.observe_event_e2e_latency(Duration::from_nanos(e2e_nanos));
+                    } else {
+                        self.emit_sample_remaining
+                            .store(sample - 1, Ordering::Relaxed);
+                    }
+                }
+                for _ in 0..outcome.failed {
+                    metrics.inc_alert_serialize_failed();
+                }
+            }
+            if let Some(ser_start) = _ser_start {
+                let elapsed = ser_start.elapsed().as_nanos() as u64;
                 let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64 / calls.max(1) as u64;
                 self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
                 if let Some(metrics) = &self.metrics {

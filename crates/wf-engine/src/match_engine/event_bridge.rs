@@ -231,7 +231,7 @@ pub fn batch_to_timestamped_rows(
     rows
 }
 
-fn extract_field_value(field: &Field, col: &dyn Array, row: usize) -> Option<Value> {
+pub(crate) fn extract_field_value(field: &Field, col: &dyn Array, row: usize) -> Option<Value> {
     if let Some(kind) = wfl_structured_field_kind(field)
         && matches!(col.data_type(), DataType::Utf8)
     {
@@ -619,4 +619,68 @@ mod tests {
         );
         assert_eq!(events[0].fields["plain"], Value::Str(r#"[22,2222]"#.into()));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Columnar event view (on-each fast path — "on-each 完全不物化")
+// ---------------------------------------------------------------------------
+
+/// Field access straight from an Arrow row, byte-identical to the eager
+/// `Event{fields: HashMap}` semantics: the same [`extract_field_value`]
+/// conversions, null / failed extraction → field absent.
+///
+/// Used by the on-each columnar fast path to skip per-row `Event`
+/// materialization entirely (design doc §3.5「`on each` 规则完全不物化」).
+pub struct ColumnarEvent<'a> {
+    batch: &'a RecordBatch,
+    row: usize,
+}
+
+impl<'a> ColumnarEvent<'a> {
+    pub fn new(batch: &'a RecordBatch, row: usize) -> Self {
+        Self { batch, row }
+    }
+
+    pub(crate) fn batch(&self) -> &'a RecordBatch {
+        self.batch
+    }
+
+    pub(crate) fn row(&self) -> usize {
+        self.row
+    }
+
+    /// Field value by name, or `None` when the column is absent / null /
+    /// fails extraction — mirrors `Event.fields.get(name)`.
+    pub fn field_value(&self, name: &str) -> Option<Value> {
+        let idx = self.batch.schema().index_of(name).ok()?;
+        let col = self.batch.column(idx);
+        if col.is_null(self.row) {
+            return None;
+        }
+        extract_field_value(self.batch.schema().field(idx), col.as_ref(), self.row)
+    }
+
+    /// Mirrors `CepStateMachine::extract_event_str`: a `Str` field → its
+    /// string, anything else (absent / non-str) → empty string.
+    pub fn field_value_str(&self, name: &str) -> String {
+        match self.field_value(name) {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => String::new(),
+        }
+    }
+}
+
+/// (field name, column index) pairs sorted by name — the eager wfx_id hash's
+/// per-row collect+sort, hoisted once per batch. Build once and share across
+/// every row of the batch.
+pub fn sorted_fields_for(batch: &RecordBatch) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, f)| (f.name().clone(), idx))
+        .collect();
+    out.sort_by_key(|(name, _)| name.clone());
+    out
 }
