@@ -57,10 +57,17 @@ append/reorder/evict（`router.rs` 加 `bypassable` 集 + `dispatch_parsed` 短�
 
 ## 3. ingress（只 receive）天花板定位
 
-只 receive 的 14.05M 是「客户端 `send-arrow` 走 TCP 喂进来的上限」，不是引擎上限
-（此时 cpu_avg 仅 0.94 核）。
+只 receive 的天花板分三阶段挖出（每步都有实证）：
 
-连接数 / `instances` 缩放（只 receive 切法）：
+1. **热点分片限制 14.05M**：旧 `SHARD_KEYS=bid_events:auction` 只分 bid，auction/person
+   全进 s0（s0=2.47GB vs 其余 1.76GB），最大分片完成时间卡住 ingress。
+2. **均匀分片 → 20.2M**：`SHARD_KEYS="bid_events:auction,auction_events:id,person_events:id"`
+   三个流各自按键分，8×970MB 均匀 → ingress 14.05M → 20.2M。
+3. **客户端 copy 缓冲 → 43.9M**：`send-arrow` 用 `tokio::io::copy`（8KiB 栈缓冲），
+   100M 数据约 100 万次文件读（syscall + spawn_blocking 交接）→ 卡 20.2M；改
+   1MiB 大缓冲 → **43.9M EPS（~3.4GB/s）**。
+
+连接数 / `instances` 缩放（旧分片 + 旧客户端）：
 
 | 引擎 `instances` | CONNECTIONS | EPS |
 |---|---|---|
@@ -73,13 +80,14 @@ append/reorder/evict（`router.rs` 加 `bypassable` 集 + `dispatch_parsed` 短�
 
 - **连接数 > `instances` 会退化**：C=8/16 配 instances=4 时，4 个 decode 循环在 2/4 条
   连接间 async 切换，掉到 5.48M（C=8 与 C=16 完全相同 = 撞到同一个 `instances=4` 上限）。
-- **把 `instances` 提到 8 配 C=8，ingress 回到 14.05M**；但**没有超过 14.05M** →
-  **14.05M 是客户端 push 天花板，不是引擎 decode 天花板**。
-- 要突破 14M ingress 需在**客户端侧**加并行，不是引擎侧。
+- **把 `instances` 提到 8 配 C=8，ingress 回到 14.05M**；再配均匀分片 + 大缓冲客户端，
+  ingress 逐级涨到 43.9M。
+- 8 分片 vs 16 分片（均匀 + 优化客户端）同为 ~20M 之后涨到 43.9M：分片数不影响，
+  瓶颈在客户端 copy 缓冲，改完 1MiB/4MiB 持平（43.9/43.4M）。
 
-## 4. 分片文件不均（benchmark 工具口径问题）
+## 4. 分片文件不均与修复（benchmark 工具口径）
 
-`shard-frames --shard-keys bid_events:auction` 只按 `bid_events.auction` 分片，导致
+旧 `shard-frames --shard-keys bid_events:auction` 只按 `bid_events.auction` 分片，导致
 `auction_events`（~6M）与 `person_events`（~2M）**全部落进 s0**，s0 永远是热点分片：
 
 | 分片数 | s0 大小 | 其余分片大小 | s0 占比 |
@@ -88,10 +96,12 @@ append/reorder/evict（`router.rs` 加 `bypassable` 集 + `dispatch_parsed` 短�
 | C=8 | 1.59 GB | 0.88 GB × 7 | ~21% |
 | C=16 | 1.15 GB | 0.44 GB × 15 | ~15% |
 
-- 这是 **benchmark 工具侧**问题（`SHARD_KEYS` 只覆盖 bid_events，没覆盖另外两个流），
-  不在 wp-reactor 引擎侧。
+- **修复**：`SHARD_KEYS="bid_events:auction,auction_events:id,person_events:id"` 三个流
+  各自按键分 → 8×970MB / 16×485MB 均匀（偏差 <0.1%）。
 - 光分片不均解释不了 5.48M 暴跌（C=8 的 s0 比 C=4 的 s0 更小却更慢）；5.48M 的根因是
   `instances` 与连接数错配（§3）。
+- **send-arrow 优化**（warp-fusion `wfgen`，commit `db39f81`）：`tokio::io::copy` 的
+  8KiB 栈缓冲 → 1MiB 大缓冲，只 receive 20.2M → 43.9M（+2.2×）。
 
 ## 5. 结论
 
@@ -99,15 +109,15 @@ append/reorder/evict（`router.rs` 加 `bypassable` 集 + `dispatch_parsed` 短�
    `emit_each_direct_batch`。这是下一步最该打的地方——把 `on each` 规则任务列式化
    （不产生 Event HashMap，直接对 `RecordBatch` 求值）。
 2. 其次 parse/window/broadcast（~13%）；sink 基本不是（~4%）。
-3. ingress 天花板 14.05M 是**客户端**限制，不是引擎；且对 Q1 端到端（7.17M）不是瓶颈。
+3. **ingress 已不是瓶颈**：均匀分片 + 优化客户端后 43.9M，远超全链路 7.17M。
 4. 旁路窗口 actor、切 sink 都已回退，不是干净收益。
-5. benchmark 侧有两处口径问题待修：`SHARD_KEYS` 未覆盖三流导致分片不均；连接数需与
-   `instances` 匹配。
+5. benchmark 工具侧：`SHARD_KEYS` 已修（三流分片）、`send-arrow` copy 缓冲已优化；
+   连接数需与 `instances` 匹配（`instances` 默认 4，建议改文档）。
 
 ## 6. 下一步
 
 - **Q1**：rule `process_batch` 列式化（打 ~38%）。
 - **Q2**：match 状态机 `scan_expired_at` + `advance_at_with_masks` 分段计时（summary 里
   Q2 actor broadcast 73.3% 的证据指向这里）。
-- **benchmark 工具**：`shard-frames` 分片键覆盖三个流；文档化「连接数 = instances」的
-  匹配要求。
+- **benchmark 工具**：把 `SHARD_KEYS` 三流分片、`instances=连接数` 写进 bench.sh 默认
+  配置；`send-arrow` 大缓冲已提交（warp-fusion `alpha` `db39f81`）。
