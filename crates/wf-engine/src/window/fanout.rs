@@ -903,4 +903,61 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn broadcast_batch_only_sharded_sends_row_subsets() {
+        // 列式 sharded 广播（broadcast_batch_only，events=None + batch）：
+        // 每个 shard 收到 events=None + batch:Some + shard_rows:Some(本 shard 行子集),
+        // 且各 shard 行子集并集 = 全批（不丢、不重）。
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use wf_lang::ast::FieldRef;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                Some("k1"),
+                Some("k2"),
+                Some("k1"),
+                Some("k3"),
+            ])) as ArrayRef],
+        )
+        .unwrap();
+
+        let fanout = RuleFanout::new();
+        let (tx0, mut rx0) = mpsc::channel(8);
+        let (tx1, mut rx1) = mpsc::channel(8);
+        fanout.register_sharded(
+            "win_a",
+            vec![tx0, tx1],
+            Arc::from(vec![FieldRef::Simple("id".into())].into_boxed_slice()),
+        );
+
+        fanout.broadcast_batch_only("win_a", &batch, None, 0).await;
+
+        let mut seen: Vec<u32> = Vec::new();
+        let mut pushed = 0;
+        for rx in [&mut rx0, &mut rx1] {
+            while let Ok(p) = rx.try_recv() {
+                pushed += 1;
+                assert!(
+                    p.events.is_none(),
+                    "deferred sharded push must carry no events"
+                );
+                assert!(
+                    p.batch.is_some(),
+                    "deferred sharded push must carry the batch"
+                );
+                let rows = p.shard_rows.expect("shard_rows set");
+                seen.extend(rows.iter().copied());
+            }
+        }
+        // 非空 shard 各收到一个 push；k3 若单独一个 shard 也各一个。
+        assert!(pushed >= 1 && pushed <= 2);
+        // 并集 = 全批 4 行，无重复。
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+    }
 }

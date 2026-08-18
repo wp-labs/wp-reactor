@@ -2163,6 +2163,66 @@ async fn push_triggers_alert() {
     assert!(!field_str(&alert, "__wfu_fired_at").is_empty());
 }
 
+#[tokio::test]
+async fn push_columnar_sharded_defers_runs_all_rows() {
+    // 列式 sharded deferred push：events=None + batch + shard_rows（本 shard 行子集）。
+    // 规则任务只对 shard_rows 内的行跑 bind filter(无=全行命中）+状态机（count>=3 触发）。
+    // 此处 shard_rows 含全部 3 行 → 全命中 → 触发 alert。
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, mut alert_rx, _win, _notify) = make_task();
+
+    let ts_nanos = 1_700_000_000_000_000_000i64;
+    let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.1", "10.0.0.1"], ts_nanos);
+
+    let push = RulePush {
+        window_name: "auth_events".into(),
+        events: None, // deferred: 规则任务按 batch 列式物化命中行
+        batch: Some(Arc::new(batch)),
+        materialize_fields: None,
+        shard_rows: Some(Arc::new(vec![0, 1, 2])), // 本 shard 拥有全部行
+        seq: u64::MAX,
+    };
+    task.process_push(push).await;
+
+    let alert = take_alert(&mut alert_rx);
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
+    assert!((field_f64(&alert, "__wfu_score") - 70.0).abs() < f64::EPSILON);
+}
+
+#[tokio::test]
+async fn push_sharded_only_processes_shard_rows_subset() {
+    // 列式 sharded：shard_rows 只含行 0,2（两个 10.0.0.1）；行 1（10.0.0.2）不属于本
+    // shard。规则只应对 shard_rows 内行推进状态机 → count=2 <3 不触发 → 无 alert，
+    // 证明只扫 shard 子集（若误扫全批会让 10.0.0.1 count=2 仍不触发，故同时把行 1 也
+    // 设为 10.0.0.1 以区分「子集处理」的额外断言在尾部补）。
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, mut alert_rx, _win, _notify) = make_task();
+
+    let ts_nanos = 1_700_000_000_000_000_000i64;
+    // 行 0: 10.0.0.1, 行 1: 10.0.0.1, 行 2: 10.0.0.1 —— 全同 key；
+    // 若规则误扫整批（3 行）会触发 count=3；shard_rows 只给 [0,1] → 只扫 2 行 → count=2 不触发。
+    let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.1", "10.0.0.1"], ts_nanos);
+
+    let push = RulePush {
+        window_name: "auth_events".into(),
+        events: None,
+        batch: Some(Arc::new(batch)),
+        materialize_fields: None,
+        shard_rows: Some(Arc::new(vec![0, 1])), // 本 shard 只有 2 行
+        seq: u64::MAX,
+    };
+    task.process_push(push).await;
+
+    // count=2 (<3) → 不触发。
+    let tr = alert_rx.try_recv();
+    assert!(
+        matches!(tr, Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
+        "shard_rows 子集行 count=2 不应触发 alert"
+    );
+}
+
 fn drain_alert_entity_ids(rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>) -> Vec<String> {
     let mut ids = Vec::new();
     while let Ok(batch) = rx.try_recv() {
