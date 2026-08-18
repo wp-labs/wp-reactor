@@ -513,8 +513,11 @@ impl AlertColumnBuilder {
     }
 
     /// Seal the builder into an immutable batch. The builder is left empty
-    /// (capacities are not preserved; see flush call sites for reuse).
+    /// (capacities are not preserved; see flush call sites for reuse) and its
+    /// layout cache is dropped — the yield columns moved out invalidate the
+    /// cached column indices, so a reused builder must re-resolve them.
     pub fn finish(&mut self) -> AlertColumnBatch {
+        self.layout_cache.clear();
         AlertColumnBatch {
             target: Arc::clone(&self.target),
             len: std::mem::take(&mut self.len),

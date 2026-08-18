@@ -9,7 +9,7 @@ use arrow::record_batch::RecordBatch;
 use orion_error::conversion::{SourceRawErr, ToStructError};
 use tokio::sync::mpsc;
 
-use wf_engine::alert::{AlertColumnBuilder, OutputRecord};
+use wf_engine::alert::{AlertColumnBatch, AlertColumnBuilder, OutputRecord};
 use wf_engine::match_engine::{
     CepStateMachine, CloseReason, ColumnarEvent, Event, GuardMasks, RuleExecutor, StepResult,
     batch_event_time_nanos_at, batch_time_col_index, batch_to_events, batch_to_events_filtered,
@@ -41,7 +41,7 @@ type PendingEventBatch = Option<(Arc<str>, Arc<Vec<Arc<Event>>>)>;
 /// always counted.
 const EMIT_METRIC_SAMPLE_INTERVAL: u32 = 64;
 /// Flush size for the batched alert sink delivery (amortizes per-alert fan-out).
-const ALERT_BATCH_SIZE: usize = 256;
+const ALERT_BATCH_SIZE: usize = 4096;
 
 /// Deferred-materialization row source for one batch (L2): the event time of
 /// every row (for the watermark/expiry scan) plus the pre-materialized
@@ -1987,16 +1987,28 @@ impl RuleTask {
     /// channel send) of columnar records, amortizing the per-alert resolve /
     /// try_send / blocking that dominated the q1 pass-through emit path.
     async fn flush_alerts(&self) {
-        let pending = {
+        // Builder-lifetime optimization: only the sealed columns leave the
+        // pending slot — the `AlertColumnBuilder` itself stays resident for
+        // the rule task's lifetime (its `staged` buffer keeps its capacity;
+        // the layout cache is re-resolved on the next first row, see
+        // `finish()`). Previously the whole pending (builder included) was
+        // taken and dropped every flush, re-instantiating the builder every
+        // ALERT_BATCH_SIZE rows.
+        let batches: Vec<(Arc<str>, AlertColumnBatch)> = {
             let mut guarded = self.pending_alerts.lock().unwrap();
             if guarded.count == 0 {
                 return;
             }
-            std::mem::take(&mut *guarded)
+            guarded.count = 0;
+            guarded
+                .by_target
+                .iter_mut()
+                .map(|(target, builder)| (Arc::clone(target), builder.finish()))
+                .collect()
         };
         let _fan_start = Instant::now();
-        for (target, mut builder) in pending.by_target {
-            let records_len = builder.len();
+        for (target, batch) in batches {
+            let records_len = batch.len();
             let sink_groups = self.sink_fanout.resolve(&target);
             if sink_groups.is_empty() {
                 if let Some(metrics) = &self.metrics {
@@ -2005,7 +2017,7 @@ impl RuleTask {
                 self.sink_fanout.warn_if_no_sink(&target);
                 continue;
             }
-            let batch = crate::alert_task::AlertBatch::Columns(Arc::new(builder.finish()));
+            let batch = crate::alert_task::AlertBatch::Columns(Arc::new(batch));
             for (sink_ptr, channels) in sink_groups.iter() {
                 // Round-robin across this sink's parallel writers.
                 let idx = self.sink_fanout.next_index(*sink_ptr, channels.len());

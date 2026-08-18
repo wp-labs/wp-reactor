@@ -773,3 +773,21 @@ parse 拿到核 → 供给 58-79M——正常时 parse 与规则抢核两败俱�
 **主战场已从「规则内部 CPU」转向「22+ 线程抢 12-13 核的 CPU 超订」**：
 下一步候选：① 等 load 低时稳定复测 p=5 r=10（线程配比）；② 减少每线程
 CPU（遥测批量提交等）；③ 线程合并（Q1 纯转发，parse/rule 可考虑合并）。
+
+## 20. builder 常驻 + ALERT_BATCH_SIZE 4096（2026-08-18 晚）
+
+用户方向：builder 不要不停新建——单例 + 批次复用。
+
+- **`AlertColumnBuilder` 常驻**：`flush_alerts` 不再 `mem::take` 整个 pending
+  （builder 随之一轮一 drop），改为只把各 builder 的列 `finish()` 出去，
+  builder 留在 `PendingAlertColumns` 里复用（`staged` 容量保留）。
+  `finish()` 现在清 `layout_cache`——yield_cols 被取走后缓存列索引失效，
+  复用 builder 的首行重新解析（摊薄 ~0.5ns/行）。
+- **`ALERT_BATCH_SIZE` 256 → 4096**：flush 频率 ÷16（builder 每轮 reserve
+  分配、慢路径重建、sink 通道 send 全部摊薄 16 倍）。
+- 端到端 13.0-13.1M（持平，无回归）——预期收益 ~5-8ns/行 占每任务
+  800ns 的 ~1%，在噪声内；收益主要被 CPU 超订掩盖，但设计更健康：
+  **100M 行的 ~39 万次 builder new/finish/drop 循环消除**。
+- 测试全绿（wf-engine 482 + wf-runtime 165）。
+- 注：批次池化（列容量跨 flush 复用）不可行——batch 发给 sink 后由 sink
+  线程持有 Arc，消费时机不确定，无法可靠归还列容量。
