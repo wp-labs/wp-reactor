@@ -120,7 +120,10 @@ impl ScopeKey {
             }
             Value::Str(s) => ScopeKey::Str(s.clone()),
             Value::Bool(b) => ScopeKey::Str(if *b { "true" } else { "false" }.into()),
-            Value::Array(_) | Value::Object(_) => ScopeKey::Str(value_to_string(value).into()),
+            // Structured values: fixed deterministic token (rare as a match key);
+            // no `String` allocation on the typed-key path.
+            Value::Array(_) => ScopeKey::Str(SmolStr::new_static("[array]")),
+            Value::Object(_) => ScopeKey::Str(SmolStr::new_static("[object]")),
         }
     }
 }
