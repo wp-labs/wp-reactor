@@ -811,3 +811,25 @@ push」。改为**批级预注册**：
   3 Lit + 1 Field）锁定列式 vs eager 逐字节一致。测试 483 + 165 全绿。
 - 端到端 load 14-15 波动下 10.4-13.55M（无回归，13.55M 为历史最高），
   稳定值待 load 低复测。
+
+## 22. 当前状态与下一步（2026-08-18 晚，重启交接点）
+
+**分支**：`feat/columnar-execution`（wp-reactor），全部已提交，工作树干净。
+最近提交：`9e23953`（常量 yield 批级缓存）→ `9158d45`（builder 常驻）→
+`03a8dd6`（wfx_id 语义）→ `2eb97e0`（each_bench 分解）→ `d2eec2c`…
+
+**微基准（release-only，Q1 真实形态）**：
+`cargo test --release -p wf-engine each_bench -- --ignored --nocapture`
+
+**当前单线程构成（215.3 ns/row，起点 621.6，-65%）**：
+fill ~110（stage 只剩变值 id 字段）+ entity 59 + fired_at 27 + wfx_id 30。
+
+**端到端基线**：12.1M（优化前）→ 13.0-13.5M（load 7-12 时），10:10:8 最优；
+CPU 超订（22+ 线程抢 ~12-13 核）是当前端到端主约束，单线程再省也不一定
+转成 EPS（§19）。
+
+**下一步候选（按优先级）**：
+1. entity 列名查找批级预解析（`schema.index_of` 每行 2 次 → 批级 1 次，
+   ~15-25ns/行）；
+2. load 低时复测端到端（常量缓存优化后的稳定 EPS）；
+3. CPU 超订治理：p=5 r=10 稳定复测 / 遥测批量提交（切刀 +8%）/ 线程合并。
