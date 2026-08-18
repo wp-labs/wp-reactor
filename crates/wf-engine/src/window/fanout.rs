@@ -275,7 +275,7 @@ impl RuleFanout {
                             let per = per.unwrap_or_else(|| {
                                 // Key column absent from schema → every row
                                 // missing → all shard 0 (matches row-based).
-                                let mut v = vec![Vec::new(); 1];
+                                let mut v = vec![Vec::new(); shards.len()];
                                 v[0] = (0..batch.num_rows()).map(|r| r as u32).collect();
                                 v
                             });

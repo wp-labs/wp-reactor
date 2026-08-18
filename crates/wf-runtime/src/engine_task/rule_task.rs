@@ -13,7 +13,7 @@ use wf_engine::alert::{AlertColumnBatch, AlertColumnBuilder, OutputRecord};
 use wf_engine::match_engine::{
     CepStateMachine, CloseReason, ColumnarEvent, Event, GuardMasks, RuleExecutor, StepResult,
     batch_event_time_nanos_at, batch_time_col_index, batch_to_events, batch_to_events_filtered,
-    close_is_qualified, materialize_rows,
+    close_is_qualified, materialize_rows, materialize_rows_filtered,
 };
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
@@ -535,15 +535,20 @@ impl RuleTask {
                 // all hit rows into HashMap Events is the cost this path avoids.
                 Vec::new()
             } else {
-                // Materialize the hit rows by their **absolute** batch rows.
+                // Materialize the hit rows by their **absolute** batch rows,
+                // restricted to the window's `materialize_fields` projection
+                // (the rule's read-set) when available, exactly like the eager
+                // path — keeps the hit Event byte-identical and avoids pulling
+                // in unused schema columns.
                 let abs: Vec<u32> = hit_indices
                     .iter()
                     .map(|&i| row_domain[i as usize] as u32)
                     .collect();
-                materialize_rows(batch, &abs)
-                    .into_iter()
-                    .map(Arc::new)
-                    .collect()
+                let hit_events: Vec<Event> = match materialize_fields {
+                    Some(fields) => materialize_rows_filtered(batch, &abs, fields),
+                    None => materialize_rows(batch, &abs),
+                };
+                hit_events.into_iter().map(Arc::new).collect()
             };
             Some(DeferredRows {
                 times,
