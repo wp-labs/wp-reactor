@@ -35,7 +35,10 @@ fn execute_match_static_score() {
 }
 
 #[test]
-fn execute_each_wfx_id_changes_with_event_content() {
+fn execute_each_wfx_id_depends_on_rule_and_time_not_fields() {
+    // 2026-08-18 语义变更：字段不再参与 on-each wfx_id 哈希（现实流同一
+    // 纳秒不可能有两个事件；全字段渲染+哈希是每行 ~190ns 的大头）。
+    // 新语义：同规则 + 同时刻 → 同 ID（幂等）；不同时刻 → 不同 ID。
     let mut plan = simple_rule_plan(
         "r1",
         simple_plan(vec![], vec![]),
@@ -55,8 +58,12 @@ fn execute_each_wfx_id_changes_with_event_content() {
 
     let left_alert = exec.execute_each(&left, 1_000_000).unwrap().unwrap();
     let right_alert = exec.execute_each(&right, 1_000_000).unwrap().unwrap();
+    let later_alert = exec.execute_each(&left, 1_000_001).unwrap().unwrap();
 
-    assert_ne!(left_alert.wfx_id, right_alert.wfx_id);
+    // 同规则 + 同时刻：字段内容不再影响 ID。
+    assert_eq!(left_alert.wfx_id, right_alert.wfx_id);
+    // 同规则 + 不同时刻：ID 不同。
+    assert_ne!(left_alert.wfx_id, later_alert.wfx_id);
 }
 
 // =========================================================================

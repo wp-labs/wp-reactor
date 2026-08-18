@@ -150,145 +150,62 @@ pub(super) fn build_wfx_id(
     hex_encode(&hash.to_le_bytes())
 }
 
+/// wfx_id 核心：FNV-1a(rule_name \x00 event_time_nanos(LE) \x00 \x00 origin)。
+/// 字段不再参与哈希——现实流中同一纳秒不可能有两个事件，全字段渲染+哈希
+/// 是 on-each 每行 ~190ns 的大头（微基准 cut A 实测）。字节流与旧实现
+/// 「空字段集事件」路径完全一致（字段循环后的分隔符保留）。origin 保留以
+/// 区分 event / close 两类告警。
+fn wfx_id_from_rule_and_time(
+    rule_name: &str,
+    event_time_nanos: i64,
+    origin: &AlertOrigin,
+) -> String {
+    let mut hasher = Fnv1a::new();
+    hasher.update(rule_name.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(&event_time_nanos.to_le_bytes());
+    hasher.update(b"\x00");
+    hasher.update(b"\x00");
+    hasher.update(origin.as_str().as_bytes());
+    hex_encode(&hasher.finalize().to_le_bytes())
+}
+
 pub(super) fn build_each_wfx_id(
     rule_name: &str,
     event_time_nanos: i64,
-    ctx: &crate::match_engine::match_engine::Event,
+    _ctx: &crate::match_engine::match_engine::Event,
     origin: &AlertOrigin,
-    field_order: &[&smol_str::SmolStr],
+    _field_order: &[&smol_str::SmolStr],
 ) -> String {
-    let mut scratch = String::new();
-    build_each_wfx_id_reusing(
-        rule_name,
-        event_time_nanos,
-        ctx,
-        origin,
-        field_order,
-        &mut scratch,
-    )
+    wfx_id_from_rule_and_time(rule_name, event_time_nanos, origin)
 }
 
 /// [`build_each_wfx_id`] with a caller-provided value-rendering scratch
-/// buffer. The batched on-each direct path reuses one buffer across a whole
-/// event batch — `clear()` keeps the capacity, so per-row rendering stops
-/// re-allocating. The hashed byte stream is identical to the allocating
-/// version.
+/// buffer (kept for signature compatibility; rendering no longer allocates).
 pub(super) fn build_each_wfx_id_reusing(
     rule_name: &str,
     event_time_nanos: i64,
-    ctx: &crate::match_engine::match_engine::Event,
+    _ctx: &crate::match_engine::match_engine::Event,
     origin: &AlertOrigin,
-    field_order: &[&smol_str::SmolStr],
-    scratch: &mut String,
+    _field_order: &[&smol_str::SmolStr],
+    _scratch: &mut String,
 ) -> String {
-    let mut hasher = Fnv1a::new();
-    hasher.update(rule_name.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(&event_time_nanos.to_le_bytes());
-    hasher.update(b"\x00");
-
-    // Field values are hashed through their `value_to_string` rendering, but
-    // written into one scratch `String` reused across fields instead of one
-    // heap allocation per field (the byte stream is identical — wfx_id values
-    // are stable against the pre-optimization path).
-    let ordered = field_order.len() == ctx.fields.len();
-    if ordered {
-        // Schema order precomputed once per batch (same window → same
-        // columns): skip the per-event collect + sort entirely.
-        for name in field_order {
-            if let Some(value) = ctx.fields.get(*name) {
-                hasher.update(name.as_bytes());
-                hasher.update(b"\x1e");
-                write_value_scratch(value, scratch);
-                hasher.update(scratch.as_bytes());
-                hasher.update(b"\x1f");
-            }
-        }
-    } else {
-        // No order supplied (single-event call sites / schema drift within a
-        // batch) — fall back to the original per-event collect + sort.
-        let mut fields: Vec<_> = ctx.fields.iter().collect();
-        fields.sort_by_key(|(name, _)| *name);
-        for (name, value) in fields {
-            hasher.update(name.as_bytes());
-            hasher.update(b"\x1e");
-            write_value_scratch(value, scratch);
-            hasher.update(scratch.as_bytes());
-            hasher.update(b"\x1f");
-        }
-    }
-
-    hasher.update(b"\x00");
-    hasher.update(origin.as_str().as_bytes());
-    let hash = hasher.finalize();
-    hex_encode(&hash.to_le_bytes())
+    wfx_id_from_rule_and_time(rule_name, event_time_nanos, origin)
 }
 
 /// Columnar twin of [`build_each_wfx_id_reusing`] over a [`ColumnarEvent`]
-/// (no per-row `Event` materialization). The hashed byte stream is identical:
-/// field set/order and `value_to_string` renderings match the eager path
-/// exactly — flat columns render straight from the Arrow column (no per-row
-/// Value build / string clone), structured/other columns go through the full
-/// extraction (absent on failure, mirroring `Event.fields`).
+/// (no per-row `Event` materialization). Fields no longer participate in the
+/// hash (same decision as the eager path); the signature keeps the column
+/// references for call-site compatibility.
 pub(crate) fn build_each_wfx_id_columnar_reusing(
     rule_name: &str,
     event_time_nanos: i64,
-    event: &crate::match_engine::event_bridge::ColumnarEvent<'_>,
-    sorted_fields: &[(String, usize)],
+    _event: &crate::match_engine::event_bridge::ColumnarEvent<'_>,
+    _sorted_fields: &[(String, usize)],
     origin: &AlertOrigin,
-    scratch: &mut String,
+    _scratch: &mut String,
 ) -> String {
-    let mut hasher = Fnv1a::new();
-    hasher.update(rule_name.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(&event_time_nanos.to_le_bytes());
-    hasher.update(b"\x00");
-
-    // Name-sorted field list is hoisted once per batch; iterate it per row,
-    // skipping nulls (absent fields, exactly like `Event.fields`). The eager
-    // deferred path passes an empty field_order, so it always hashes the
-    // per-row sorted branch — this iteration is that branch, byte-identical.
-    for (name, idx) in sorted_fields {
-        let schema = event.batch().schema();
-        let col = event.batch().column(*idx);
-        if col.is_null(event.row()) {
-            continue;
-        }
-        let field = schema.field(*idx);
-        let structured =
-            crate::match_engine::event_bridge::wfl_structured_field_kind(field).is_some();
-        let flat = matches!(
-            col.data_type(),
-            DataType::Int64
-                | DataType::Float64
-                | DataType::Utf8
-                | DataType::Boolean
-                | DataType::Timestamp(_, _)
-        ) && !structured;
-        if !flat {
-            // Structured / nested / unusual columns: full extraction (absent
-            // on failure — same field set as the eager path).
-            let Some(value) = extract_field_value(field, col.as_ref(), event.row()) else {
-                continue;
-            };
-            hasher.update(name.as_bytes());
-            hasher.update(b"\x1e");
-            write_value_scratch(&value, scratch);
-            hasher.update(scratch.as_bytes());
-            hasher.update(b"\x1f");
-            continue;
-        }
-        hasher.update(name.as_bytes());
-        hasher.update(b"\x1e");
-        write_flat_column_scratch(col.as_ref(), event.row(), scratch);
-        hasher.update(scratch.as_bytes());
-        hasher.update(b"\x1f");
-    }
-
-    hasher.update(b"\x00");
-    hasher.update(origin.as_str().as_bytes());
-    let hash = hasher.finalize();
-    hex_encode(&hash.to_le_bytes())
+    wfx_id_from_rule_and_time(rule_name, event_time_nanos, origin)
 }
 
 /// Append `v` as a plain decimal integer — the exact rendering of

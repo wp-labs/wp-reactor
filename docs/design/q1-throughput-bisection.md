@@ -740,3 +740,36 @@ instances（ingress.toml）+ parse + rule + CONNECTIONS 统一调 6：
   （execute ~650 + caller ~150），并行度只是线性乘子。
 - 6:6:6 比 10:10:8 低 37%——降低并行度无收益，**10:10:8 保持最优**。
 - 实验后已恢复 instances=8（8:8 既定基线）。
+
+## 18. wfx_id 只哈希 rule+time（语义变更，2026-08-18 晚）
+
+用户决策：现实流同一纳秒不可能有两个事件，字段不必参与 wfx_id 哈希。
+`build_each_wfx_id*`（on-each 三个入口：eager / reusing / columnar）统一为
+`FNV-1a(rule_name \\x00 time(LE) \\x00 \\00 origin)`——字段循环整体删除，
+字节流与旧实现「空字段集」路径一致；origin 保留（区分 event/close）。
+**match 规则路径 `build_wfx_id`（scope_key/step_data 哈希）不动**。
+
+- 微基准：wfx_id 249.6 → 30.1ns（-88%）；**baseline 495 → 275ns（-44%）**；
+  fill 210ns 重新成为第一大项（76.5%）。测试 482 全绿（含语义测试更新：
+  同规则同时刻 → 同 ID；不同时刻 → 不同 ID）。
+- **端到端 12.0M（无提升）**——execute 单线程再省 220ns 也不动 EPS：
+  execute 已不是端到端瓶颈。
+
+## 19. 端到端新瓶颈：CPU 超订（2026-08-18 晚）
+
+机器 16 核（Zed 等后台占 ~3 核，引擎可用 ~12-13 核），引擎线程 22+：
+rule 10 + parse 10 + 窗口 actor + sink + metrics。
+
+| 实验 | EPS | 结论 |
+|---|---|---|
+| 遥测切刀（no-op 每行 `inc_alert_emitted_total`） | 13.0-13.1M（+8%） | 共享原子竞争小贡献 |
+| p=5 r=10 | 首轮 13.5M（+12%）；二轮 8.5M（load 15.7 干扰） | 待稳定复测 |
+| wfx_id -88% / execute -44% | 12.0M（无提升） | execute CPU 不是瓶颈 |
+
+每任务墙钟 833ns（12M/10）中，execute 275 + caller 150 = 425ns 干活，
+**~408ns 在等 CPU 时间片/上游供给**。切 execute 探针（规则不占 CPU）时
+parse 拿到核 → 供给 58-79M——正常时 parse 与规则抢核两败俱伤。
+
+**主战场已从「规则内部 CPU」转向「22+ 线程抢 12-13 核的 CPU 超订」**：
+下一步候选：① 等 load 低时稳定复测 p=5 r=10（线程配比）；② 减少每线程
+CPU（遥测批量提交等）；③ 线程合并（Q1 纯转发，parse/rule 可考虑合并）。
