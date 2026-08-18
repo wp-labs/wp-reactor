@@ -604,3 +604,135 @@ fn execute_each_direct_batch_columnar_matches_event_path_rows() {
 
     assert_batches_equal_rows(&via_events.finish(), &via_columnar.finish());
 }
+
+/// Q1 形状的 plan：3 个字面量 yield（alert_type/detail/request_count，批级
+/// 常量缓存路径）+ 1 个字段 yield（id = b.auction，逐行取列）。
+fn q1_lit_shape_rule() -> RuleExecutor {
+    use wf_lang::plan::{EachPlan, YieldField};
+    let mut plan = simple_rule_plan(
+        "q1_lit_shape",
+        simple_plan(vec![], vec![]),
+        Expr::Number(1.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.binds[0].window = "bid_events".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "b".into(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        },
+        YieldField {
+            name: "alert_type".into(),
+            value: Expr::StringLit("q1_passthrough".into()),
+        },
+        YieldField {
+            name: "detail".into(),
+            value: Expr::StringLit("bid".into()),
+        },
+        YieldField {
+            name: "request_count".into(),
+            value: Expr::Number(1.0),
+        },
+    ];
+    RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("id".into(), FieldType::Base(BaseType::Float)),
+            ("alert_type".into(), FieldType::Base(BaseType::Chars)),
+            ("detail".into(), FieldType::Base(BaseType::Chars)),
+            ("request_count".into(), FieldType::Base(BaseType::Float)),
+        ]),
+    )
+}
+
+#[test]
+fn columnar_const_yield_literals_match_event_path_rows() {
+    // 常量 yield 批级缓存（register_yield_column + fill_row_gaps 填常量）
+    // 必须与 eager 路径逐字节一致——含 null→字段缺失 lane 与 2^53 lane。
+    use crate::match_engine::event_bridge::{ColumnarEvent, materialize_rows, sorted_fields_for};
+    use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    let exec = q1_lit_shape_rule();
+    assert!(
+        exec.each_plan_columnar_safe(),
+        "Q1 shape must be columnar-safe"
+    );
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+        Field::new("channel", DataType::Utf8, true),
+        Field::new("url", DataType::Utf8, true),
+        Field::new("dateTime", DataType::Int64, true),
+        Field::new("extra", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2, 3])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+            Arc::new(Int64Array::from(vec![7i64, 8, 9])),
+            Arc::new(StringArray::from(vec!["mobile", "phone", "mobile"])),
+            Arc::new(StringArray::from(vec![
+                "http://example.com/a",
+                "http://example.com/b",
+                "http://example.com/c",
+            ])),
+            Arc::new(Int64Array::from(vec![1_700_000_000_000i64; 3])),
+            Arc::new(StringArray::from(vec!["x"; 3])),
+        ],
+    )
+    .unwrap();
+
+    // Reference: eager materialization + Event-based batch path.
+    let events: Vec<Event> = materialize_rows(&batch, &[0, 1, 2]);
+    let rows: Vec<(&Event, i64)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut via_events = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_idx = Vec::new();
+    let stats = exec.execute_each_direct_batch(
+        &rows,
+        &EmptyLookup,
+        &[],
+        NANOS,
+        &mut via_events,
+        &mut appended_idx,
+    );
+    assert_eq!(stats.appended, 3);
+    assert_eq!(stats.failed, 0);
+
+    // Columnar fast path (constant-yield caching active).
+    let col_events: Vec<ColumnarEvent<'_>> =
+        (0..3).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut via_columnar = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_idx_c = Vec::new();
+    let stats_c = exec.execute_each_direct_batch_columnar(
+        &col_rows,
+        &sorted_fields_for(&batch),
+        NANOS,
+        &mut via_columnar,
+        &mut appended_idx_c,
+    );
+    assert_eq!(stats_c, stats);
+    assert_eq!(appended_idx_c, appended_idx);
+
+    assert_batches_equal_rows(&via_events.finish(), &via_columnar.finish());
+}

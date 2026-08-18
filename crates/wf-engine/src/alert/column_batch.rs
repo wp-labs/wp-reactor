@@ -65,6 +65,11 @@ struct YieldCol {
     name: Arc<str>,
     metas: Vec<DataType>,
     values: Vec<ModelValue>,
+    /// Batch-constant default cell (e.g. `alert_type = "q1_passthrough"`):
+    /// when set, `fill_row_gaps` fills missing cells with a clone of this
+    /// value instead of `(Ignore, Null)` — the columnar fast path registers
+    /// literal yield fields once per batch and skips their per-row staging.
+    const_value: Option<(DataType, ModelValue)>,
 }
 
 impl AlertColumnBatch {
@@ -369,6 +374,7 @@ impl AlertColumnBuilder {
                         name: Arc::clone(name),
                         metas: Vec::new(),
                         values: Vec::new(),
+                        const_value: None,
                     });
                     let col = self.yield_cols.last_mut().unwrap();
                     // Backfill rows that predate this column so every column
@@ -388,6 +394,49 @@ impl AlertColumnBuilder {
     }
 
     // -- C2 direct-write staging API --------------------------------------
+
+    /// Batch-level column registration for the columnar direct path: create
+    /// the yield column up front (once per batch) and record a
+    /// batch-constant cell when the field is a literal (`const_value = Some`).
+    /// Literal fields then skip per-row staging — `fill_row_gaps` fills their
+    /// cells with the constant. Non-constant (field) fields register with
+    /// `None` and get a layout-cache entry (in register order — the same
+    /// order the row loop stages them), so per-row `stage_yield_cell` hits
+    /// the pointer-equality fast path.
+    pub(crate) fn register_yield_column(
+        &mut self,
+        name: &Arc<str>,
+        const_value: Option<(DataType, ModelValue)>,
+    ) -> CoreResult<()> {
+        if name.starts_with(WFU_PREFIX) {
+            return CoreReason::DataFormat
+                .to_err()
+                .with_detail(format!(
+                    "yield field {name:?} uses reserved prefix {WFU_PREFIX}"
+                ))
+                .err();
+        }
+        let is_const = const_value.is_some();
+        let col_idx = match self.yield_cols.iter().position(|c| c.name == *name) {
+            Some(i) => i,
+            None => {
+                self.yield_cols.push(YieldCol {
+                    name: Arc::clone(name),
+                    metas: Vec::new(),
+                    values: Vec::new(),
+                    const_value,
+                });
+                self.yield_cols.len() - 1
+            }
+        };
+        // Constant fields are never staged per row, so they get no layout
+        // cache entry (entries are indexed by staged position). Only
+        // non-constant fields push one.
+        if !is_const {
+            self.layout_cache.push((Arc::clone(name), col_idx, None));
+        }
+        Ok(())
+    }
 
     /// Begin staging a new row for the on-each direct path: clears the cells
     /// staged for the previous row (e.g. after a mid-row error).
@@ -435,6 +484,7 @@ impl AlertColumnBuilder {
                     name: Arc::clone(name),
                     metas: Vec::new(),
                     values: Vec::new(),
+                    const_value: None,
                 });
                 let col = self.yield_cols.last_mut().unwrap();
                 // Backfill rows that predate this column so every column
@@ -493,7 +543,10 @@ impl AlertColumnBuilder {
 
     /// Fill gap cells for yield columns that received no staged cell this
     /// row (optional input field missing → field omitted, wp-labs#62). Every
-    /// column must stay row-aligned; gap cells read back as `(Ignore, Null)`.
+    /// column must stay row-aligned; gap cells read back as `(Ignore, Null)`
+    /// unless the column was registered with a batch-constant value, in which
+    /// case the constant is filled instead (literal yield fields on the
+    /// columnar fast path skip per-row staging entirely).
     ///
     /// This also repairs the record-based `append_record` path, which had
     /// the same latent misalignment when a later record omitted a field an
@@ -501,8 +554,16 @@ impl AlertColumnBuilder {
     fn fill_row_gaps(&mut self) {
         for col in &mut self.yield_cols {
             if col.values.len() == self.len {
-                col.metas.push(DataType::Ignore);
-                col.values.push(ModelValue::Null);
+                match &col.const_value {
+                    Some((meta, value)) => {
+                        col.metas.push(meta.clone());
+                        col.values.push(value.clone());
+                    }
+                    None => {
+                        col.metas.push(DataType::Ignore);
+                        col.values.push(ModelValue::Null);
+                    }
+                }
             }
         }
         debug_assert!(

@@ -791,3 +791,23 @@ CPU（遥测批量提交等）；③ 线程合并（Q1 纯转发，parse/rule �
 - 测试全绿（wf-engine 482 + wf-runtime 165）。
 - 注：批次池化（列容量跨 flush 复用）不可行——batch 发给 sink 后由 sink
   线程持有 Arc，消费时机不确定，无法可靠归还列容量。
+
+## 21. 常量 yield 批级缓存（2026-08-18 晚）
+
+fill stage（~101ns）的 3/4 字段是批内字面量（alert_type/detail/request_count），
+此前每行重复「Value clone + coerce + export（Chars 分配 ModelValue）+ staged
+push」。改为**批级预注册**：
+
+- `YieldCol` 加 `const_value: Option<(DataType, ModelValue)>`；新 API
+  `AlertColumnBuilder::register_yield_column`——批开头把每个 yield 字段的列建
+  好；字面量字段记录批级常量值（coerce + export 只做一次），字段字段进
+  layout cache（行循环 stage 走快路径）。
+- 行循环 stage 只处理变值字段（`YieldKind::Lit` 直接 `continue`）；
+  `fill_row_gaps` 对常量列填常量克隆而非 `(Ignore, Null)`。
+- `alert/mod.rs` re-export `export_yield_value`（types 模块私有）。
+- **微基准 baseline 275.1 → 215.3ns（-22%）**；累计 621.6 → 215.3
+  （**单线程 -65%**）。
+- 对拍测试 `columnar_const_yield_literals_match_event_path_rows`（Q1 形状
+  3 Lit + 1 Field）锁定列式 vs eager 逐字节一致。测试 483 + 165 全绿。
+- 端到端 load 14-15 波动下 10.4-13.55M（无回归，13.55M 为历史最高），
+  稳定值待 load 低复测。

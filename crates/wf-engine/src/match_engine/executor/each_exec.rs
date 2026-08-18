@@ -483,6 +483,49 @@ impl RuleExecutor {
         builder.reserve_rows(rows.len());
         let mut wfx_scratch = String::new();
 
+        // Batch-level constant-yield caching: literal fields (alert_type /
+        // detail / request_count in Q1) are coerced + exported once here and
+        // registered as batch-constant columns — the per-row loop skips
+        // their staging entirely and `fill_row_gaps` fills the constant.
+        // Field yields register as ordinary columns (layout-cache entry).
+        for (((_field, (name, field_type)), kind), _field_ref) in self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .zip(statics.yield_specs.iter())
+            .zip(yield_kinds.iter())
+            .zip(yield_field_refs.iter())
+        {
+            let const_value = match kind {
+                YieldKind::Lit(v) => {
+                    let converted = RuleExecutor::coerce_yield_field_value_with(
+                        name,
+                        field_type.as_ref(),
+                        v.clone(),
+                    )
+                    .and_then(|v| {
+                        let v = v.expect("literal yield values are never omitted");
+                        crate::alert::export_yield_value(&v, field_type.as_ref())
+                    });
+                    match converted {
+                        Ok((meta, model_value)) => Some((meta, model_value)),
+                        Err(e) => {
+                            log::warn!("alert export error: {e}");
+                            stats.failed = rows.len();
+                            return stats;
+                        }
+                    }
+                }
+                YieldKind::Field | YieldKind::General => None,
+            };
+            if let Err(e) = builder.register_yield_column(name, const_value) {
+                log::warn!("alert export error: {e}");
+                stats.failed = rows.len();
+                return stats;
+            }
+        }
+
         for (idx, (event, event_time_nanos)) in rows.iter().enumerate() {
             // -- Per-row system values (identical to the Event-based path) ---
             let score = score_const;
@@ -515,6 +558,8 @@ impl RuleExecutor {
             // by the columnar gate, so it is not built here.)
 
             // -- Yield staging (fallible work before any column push) ------
+            // Literal fields were registered batch-level above and are filled
+            // by `fill_row_gaps` — only field (per-row value) yields stage.
             builder.begin_row();
             let staged: CoreResult<()> = with_yield_eval_scope(|| {
                 for (((_field, (name, field_type)), kind), field_ref) in self
@@ -527,7 +572,10 @@ impl RuleExecutor {
                     .zip(yield_field_refs.iter())
                 {
                     let value = match kind {
-                        YieldKind::Lit(v) => v.clone(),
+                        YieldKind::Lit(_) => {
+                            // Batch-constant: pre-registered, no per-row work.
+                            continue;
+                        }
                         YieldKind::Field => {
                             // Missing field falls back to an empty string,
                             // exactly like the interpreter path's wrapper.
