@@ -324,6 +324,90 @@ fn q1_each_components_per_row() {
     c.line(baseline_ns);
     assert_eq!(builder.len(), N, "fill must append all rows");
 
+    // ---- fill 分解 A：只 stage（begin_row + 4×stage_yield_cell，不 commit） ----
+    {
+        let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+        let ft_float = Some(FieldType::Base(BaseType::Float));
+        let ft_str = Some(FieldType::Base(BaseType::Chars));
+        let name_id: Arc<str> = Arc::from("id");
+        let name_at: Arc<str> = Arc::from("alert_type");
+        let name_det: Arc<str> = Arc::from("detail");
+        let name_cnt: Arc<str> = Arc::from("request_count");
+        let start = Instant::now();
+        for ev in &col_events {
+            builder.begin_row();
+            let v = ev
+                .field_value("auction")
+                .unwrap_or_else(|| Value::Str(SmolStr::default()));
+            let v = RuleExecutor::coerce_yield_field_value_with("id", ft_float.as_ref(), v)
+                .unwrap()
+                .unwrap();
+            builder
+                .stage_yield_cell(&name_id, ft_float.as_ref(), &v)
+                .unwrap();
+            let v = Value::Str("q1_passthrough".into());
+            let v = RuleExecutor::coerce_yield_field_value_with("alert_type", ft_str.as_ref(), v)
+                .unwrap()
+                .unwrap();
+            builder
+                .stage_yield_cell(&name_at, ft_str.as_ref(), &v)
+                .unwrap();
+            let v = Value::Str("bid".into());
+            let v = RuleExecutor::coerce_yield_field_value_with("detail", ft_str.as_ref(), v)
+                .unwrap()
+                .unwrap();
+            builder
+                .stage_yield_cell(&name_det, ft_str.as_ref(), &v)
+                .unwrap();
+            let v = Value::Number(1.0);
+            let v =
+                RuleExecutor::coerce_yield_field_value_with("request_count", ft_float.as_ref(), v)
+                    .unwrap()
+                    .unwrap();
+            builder
+                .stage_yield_cell(&name_cnt, ft_float.as_ref(), &v)
+                .unwrap();
+        }
+        let per = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+        eprintln!(
+            "[each-bench] fill_stage_only: {:>7.1} ns/row  ({:>5.1}% of baseline)  [4×stage, 无 commit]",
+            per,
+            per / baseline_ns * 100.0
+        );
+    }
+
+    // ---- fill 分解 B：只 commit（系统列 push，staged 为空） ----
+    {
+        let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+        let rule_name: Arc<str> = Arc::from("q1_bid_passthrough");
+        let entity_type: Arc<str> = Arc::from("digit");
+        let origin: Arc<str> = Arc::from(AlertOrigin::Event.as_str());
+        let close_reason: Arc<str> = Arc::from("");
+        let emit_time: Arc<str> = Arc::from("2026-08-18T00:00:00.000000000Z");
+        let summary: Arc<str> = Arc::from("summary");
+        let start = Instant::now();
+        for _ in 0..N {
+            builder.commit_each_row(EachRowCells {
+                wfx_id: String::from("wf_0000000000000000001"),
+                score: 1.0,
+                entity_id: String::from("1"),
+                fired_at: String::from("2026-08-18T00:00:00.000000000Z"),
+                rule_name: &rule_name,
+                entity_type: &entity_type,
+                origin: &origin,
+                close_reason: &close_reason,
+                emit_time: &emit_time,
+                summary: &summary,
+            });
+        }
+        let per = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+        eprintln!(
+            "[each-bench] fill_commit_only: {:>7.1} ns/row  ({:>5.1}% of baseline)  [commit, 无 stage]",
+            per,
+            per / baseline_ns * 100.0
+        );
+    }
+
     // ---- cut A 分解：String 分配裸成本（wfx_id 每行一次 40B hex 分配） ----
     let start = Instant::now();
     let mut sum = 0usize;
