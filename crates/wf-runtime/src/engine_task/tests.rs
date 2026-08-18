@@ -2149,6 +2149,7 @@ async fn push_triggers_alert() {
                 .collect::<Vec<_>>(),
         )),
         batch: None,
+        materialize_fields: None,
         seq: u64::MAX,
     };
     task.process_push(push).await;
@@ -2210,6 +2211,7 @@ async fn columnar_bind_filter_matches_interpreted_path() {
         window_name: "auth_events".into(),
         events: Some(Arc::clone(&events)),
         batch: Some(Arc::new(batch.clone())),
+        materialize_fields: None,
         seq: u64::MAX,
     })
     .await;
@@ -2222,6 +2224,7 @@ async fn columnar_bind_filter_matches_interpreted_path() {
             window_name: "auth_events".into(),
             events: Some(events),
             batch: None,
+            materialize_fields: None,
             seq: u64::MAX,
         })
         .await;
@@ -2261,6 +2264,7 @@ async fn columnar_branch_guard_matches_interpreted_path() {
         window_name: "auth_events".into(),
         events: Some(Arc::clone(&events)),
         batch: Some(Arc::new(batch.clone())),
+        materialize_fields: None,
         seq: u64::MAX,
     })
     .await;
@@ -2273,6 +2277,7 @@ async fn columnar_branch_guard_matches_interpreted_path() {
             window_name: "auth_events".into(),
             events: Some(events),
             batch: None,
+            materialize_fields: None,
             seq: u64::MAX,
         })
         .await;
@@ -2304,6 +2309,7 @@ async fn deferred_materialization_matches_eager_path() {
         window_name: "auth_events".into(),
         events: None,
         batch: Some(Arc::new(batch.clone())),
+        materialize_fields: None,
         seq: u64::MAX,
     })
     .await;
@@ -2322,6 +2328,7 @@ async fn deferred_materialization_matches_eager_path() {
             window_name: "auth_events".into(),
             events: Some(events),
             batch: None,
+            materialize_fields: None,
             seq: u64::MAX,
         })
         .await;
@@ -2366,6 +2373,7 @@ async fn deferred_materialization_scans_every_row_for_intra_batch_expiry() {
         window_name: "auth_events".into(),
         events: None,
         batch: Some(Arc::new(batch.clone())),
+        materialize_fields: None,
         seq: u64::MAX,
     })
     .await;
@@ -2384,6 +2392,7 @@ async fn deferred_materialization_scans_every_row_for_intra_batch_expiry() {
             window_name: "auth_events".into(),
             events: Some(events),
             batch: None,
+            materialize_fields: None,
             seq: u64::MAX,
         })
         .await;
@@ -2393,6 +2402,69 @@ async fn deferred_materialization_scans_every_row_for_intra_batch_expiry() {
     // so the final accepted row starts over at count=1 — no `count>=3` fire.
     assert_eq!(deferred_ids, eager_ids);
     assert!(deferred_ids.is_empty());
+}
+
+#[tokio::test]
+async fn deferred_materialization_preserves_close_emission_for_rejected_rows() {
+    init_tracing();
+    // Regression: the deferred path used to `continue` past the close-emission
+    // block for bind-filter-rejected rows, dropping expired-instance closes.
+    // A columnar bind filter (`action == "failed"`) + a close step: accepted
+    // rows complete the event step, then a later rejected row's event time
+    // expires the instance and must still emit the close.
+    let schema = filtered_schema();
+    let sips = ["10.0.0.1", "10.0.0.1", "10.0.0.1", "10.0.0.1"];
+    let actions = ["failed", "failed", "failed", "login"];
+    let times = [0i64, 100_000_000_000, 200_000_000_000, 400_000_000_000];
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                sips.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                actions.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
+            )),
+            Arc::new(TimestampNanosecondArray::from(times.to_vec())),
+        ],
+    )
+    .unwrap();
+
+    // Deferred: no pre-parsed events; the rejected "login" row (T=400s) must
+    // still drive the expiry scan and emit the instance's close.
+    let (mut task, mut alert_rx, _win, _notify) = make_filtered_close_task();
+    task.process_push(RulePush {
+        window_name: "auth_events".into(),
+        events: None,
+        batch: Some(Arc::new(batch.clone())),
+        materialize_fields: None,
+        seq: u64::MAX,
+    })
+    .await;
+    let deferred_ids = drain_alert_entity_ids(&mut alert_rx);
+
+    // Eager: pre-parsed events (full materialization).
+    let events = Arc::new(
+        batch_to_events(&batch)
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>(),
+    );
+    let (mut task2, mut alert_rx2, _win2, _notify2) = make_filtered_close_task();
+    task2
+        .process_push(RulePush {
+            window_name: "auth_events".into(),
+            events: Some(events),
+            batch: None,
+            materialize_fields: None,
+            seq: u64::MAX,
+        })
+        .await;
+    let eager_ids = drain_alert_entity_ids(&mut alert_rx2);
+
+    // Both paths emit exactly one close for the expired instance.
+    assert_eq!(deferred_ids, eager_ids);
+    assert_eq!(deferred_ids, vec!["10.0.0.1".to_string()]);
 }
 
 #[tokio::test]
@@ -2422,6 +2494,7 @@ async fn sharded_rule_produces_same_alerts_as_single_worker() {
             window_name: "auth_events".into(),
             events: Some(Arc::clone(&events)),
             batch: None,
+            materialize_fields: None,
             seq: u64::MAX,
         })
         .await;
@@ -3446,6 +3519,7 @@ async fn conv_sink_process_batch_barrier_tracks_event_time() {
                 .collect::<Vec<_>>(),
         )),
         batch: None,
+        materialize_fields: None,
         seq: u64::MAX,
     };
     task.process_push(push).await;
@@ -3477,6 +3551,7 @@ async fn conv_sink_scan_timeouts_advances_barrier_by_wall_clock() {
                 .collect::<Vec<_>>(),
         )),
         batch: None,
+        materialize_fields: None,
         seq: u64::MAX,
     };
     task.process_push(push).await;
@@ -3879,6 +3954,7 @@ async fn conv_sink_sends_one_batch_per_process_batch() {
                 .collect::<Vec<_>>(),
         )),
         batch: None,
+        materialize_fields: None,
         seq: u64::MAX,
     };
     task.process_push(push).await;

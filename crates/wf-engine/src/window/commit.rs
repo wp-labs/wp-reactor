@@ -58,13 +58,24 @@ pub(super) async fn commit_appended_batch(
     if matches!(outcome, AppendOutcome::Appended) {
         if let Some(events) = &events {
             fanout
-                .broadcast_with_batch(window_name, events, &broadcast_batch, batch_seq)
+                .broadcast_with_batch(
+                    window_name,
+                    events,
+                    &broadcast_batch,
+                    win.materialize_fields.as_ref(),
+                    batch_seq,
+                )
                 .await;
         } else if fanout.has_subscribers(window_name) {
             // L2 deferred materialization: broadcast only the raw batch; rule
             // tasks materialize the rows their bind filter accepts.
             fanout
-                .broadcast_batch_only(window_name, &broadcast_batch, batch_seq)
+                .broadcast_batch_only(
+                    window_name,
+                    &broadcast_batch,
+                    win.materialize_fields.as_ref(),
+                    batch_seq,
+                )
                 .await;
         }
         if let Some(notify) = notify {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,6 +30,11 @@ pub struct RulePush {
     /// Rule tasks use it for columnar guard evaluation (zero-copy); `None` for
     /// relay pushes (intermediate pipes) that only carry parsed events.
     pub batch: Option<Arc<RecordBatch>>,
+    /// Per-event field whitelist the producer used (or would use) when
+    /// materializing `events`. Deferred rule tasks use it to materialize the
+    /// raw `batch` with the same field set as the eager path, keeping the
+    /// event representation (and downstream wfx_id) stable.
+    pub materialize_fields: Option<Arc<HashSet<String>>>,
     pub seq: u64,
 }
 
@@ -186,7 +192,7 @@ impl RuleFanout {
     /// each channel receives from exactly one send future per broadcast, and
     /// broadcasts themselves are serialized by the single-writer commit path.
     pub async fn broadcast(&self, window_name: &str, events: &Arc<Vec<Arc<Event>>>, seq: u64) {
-        self.broadcast_inner(window_name, Some(events), None, seq)
+        self.broadcast_inner(window_name, Some(events), None, None, seq)
             .await;
     }
 
@@ -198,17 +204,30 @@ impl RuleFanout {
         window_name: &str,
         events: &Arc<Vec<Arc<Event>>>,
         batch: &RecordBatch,
+        materialize_fields: Option<&Arc<HashSet<String>>>,
         seq: u64,
     ) {
-        self.broadcast_inner(window_name, Some(events), Some(batch), seq)
-            .await;
+        self.broadcast_inner(
+            window_name,
+            Some(events),
+            Some(batch),
+            materialize_fields,
+            seq,
+        )
+        .await;
     }
 
     /// Broadcast only the raw [`RecordBatch`] (L2 deferred materialization):
     /// each rule task materializes only the rows its bind filter accepts.
     /// Only valid for non-sharded subscriptions (deferral excludes sharded).
-    pub async fn broadcast_batch_only(&self, window_name: &str, batch: &RecordBatch, seq: u64) {
-        self.broadcast_inner(window_name, None, Some(batch), seq)
+    pub async fn broadcast_batch_only(
+        &self,
+        window_name: &str,
+        batch: &RecordBatch,
+        materialize_fields: Option<&Arc<HashSet<String>>>,
+        seq: u64,
+    ) {
+        self.broadcast_inner(window_name, None, Some(batch), materialize_fields, seq)
             .await;
     }
 
@@ -217,6 +236,7 @@ impl RuleFanout {
         window_name: &str,
         events: Option<&Arc<Vec<Arc<Event>>>>,
         batch: Option<&RecordBatch>,
+        materialize_fields: Option<&Arc<HashSet<String>>>,
         seq: u64,
     ) {
         let subs: Vec<Subscription> = {
@@ -241,6 +261,7 @@ impl RuleFanout {
                         window_name: Arc::clone(&window_name),
                         events: events.map(Arc::clone),
                         batch: batch_arc.clone(),
+                        materialize_fields: materialize_fields.map(Arc::clone),
                         seq,
                     };
                     let tx = tx.clone();
@@ -261,6 +282,7 @@ impl RuleFanout {
                         window_name: Arc::clone(&window_name),
                         events: events.map(Arc::clone),
                         batch: batch_arc.clone(),
+                        materialize_fields: materialize_fields.map(Arc::clone),
                         seq,
                     };
                     let tx = shards[idx].clone();
@@ -357,6 +379,7 @@ fn sharded_sends(
             window_name: Arc::clone(window_name),
             events: Some(Arc::new(sub)),
             batch: None,
+            materialize_fields: None,
             seq,
         };
         let tx = shards[i].clone();

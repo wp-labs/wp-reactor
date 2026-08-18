@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 use wf_engine::alert::{AlertColumnBuilder, OutputRecord};
 use wf_engine::match_engine::{
     CepStateMachine, CloseReason, Event, GuardMasks, RuleExecutor, StepResult,
-    batch_event_time_nanos_at, batch_time_col_index, batch_to_events, close_is_qualified,
-    materialize_rows,
+    batch_event_time_nanos_at, batch_time_col_index, batch_to_events, batch_to_events_filtered,
+    close_is_qualified, materialize_rows,
 };
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
@@ -392,7 +392,7 @@ impl RuleTask {
         for (window_name, first_batch_seq, events_list) in pending {
             for (batch_index, events) in events_list.iter().enumerate() {
                 let batch_seq = first_batch_seq + batch_index as u64;
-                self.process_batch(&window_name, batch_seq, Some(events), None)
+                self.process_batch(&window_name, batch_seq, Some(events), None, None)
                     .await;
                 // Ack consumption so time eviction may reclaim this batch.
                 if let Some(slot) = self.progress.get(&window_name) {
@@ -414,6 +414,7 @@ impl RuleTask {
         batch_seq: u64,
         events: Option<&Arc<Vec<Arc<Event>>>>,
         batch: Option<&RecordBatch>,
+        materialize_fields: Option<&HashSet<String>>,
     ) {
         let Some(aliases) = self.aliases.get(window_name) else {
             return;
@@ -514,7 +515,11 @@ impl RuleTask {
                 Some(events) => Arc::clone(events),
                 None => {
                     let batch = batch.expect("deferred materialization requires the raw batch");
-                    Arc::new(batch_to_events(batch).into_iter().map(Arc::new).collect())
+                    let events = match materialize_fields {
+                        Some(fields) => batch_to_events_filtered(batch, fields),
+                        None => batch_to_events(batch),
+                    };
+                    Arc::new(events.into_iter().map(Arc::new).collect())
                 }
             })
         };
@@ -637,169 +642,169 @@ impl RuleTask {
                 };
                 self.scan_nanos += _scan_start.elapsed().as_nanos() as u64;
                 // Non-hit rows only need the time-column scan above (watermark /
-                // expiry); there is no Event to advance and no bind filter would
-                // accept them, so skip the state-machine step entirely.
-                let Some(event) = event else {
-                    continue;
-                };
-                let _advance_start = Instant::now();
+                // expiry) plus the close emission below; there is no Event to
+                // advance and no bind filter would accept them, so skip the
+                // state-machine step but keep the close path.
                 let mut matched = Vec::new();
-                for alias in ordered_aliases {
-                    if !alias_accepts(
-                        &self.executor,
-                        &columnar_masks,
-                        alias,
-                        row_index,
-                        event,
-                        &lookup,
-                    ) {
-                        if debug_enabled {
-                            stats.alias_rejected += 1;
-                        }
-                        if debug_enabled && stats.allow_detail() {
-                            let event_ref = event_debug_ref(event, batch_seq, row_index);
-                            wf_debug!(pipe,
-                                rule = %rule_name_for_log,
-                                stage = 0,
-                                window = %window_name,
-                                alias = %alias,
-                                event_ref = %event_ref,
-                                reason = "bind_filter_false",
-                                "rule event rejected"
-                            );
-                        }
-                        continue;
-                    }
-                    if debug_enabled {
-                        stats.alias_passed += 1;
-                    }
-                    let should_capture_progress = debug_enabled && stats.can_log_detail();
-                    let (step_result, progress) = if should_capture_progress {
-                        let outcome = machine.advance_at_with_progress(
+                if let Some(event) = event {
+                    let _advance_start = Instant::now();
+                    for alias in ordered_aliases {
+                        if !alias_accepts(
+                            &self.executor,
+                            &columnar_masks,
                             alias,
+                            row_index,
                             event,
-                            event_nanos,
-                            Some(&lookup),
-                        );
-                        (outcome.result, outcome.progress)
-                    } else {
-                        (
-                            machine.advance_at_with_masks(
-                                alias,
-                                event,
-                                event_nanos,
-                                Some(&lookup),
-                                row_index,
-                                Some(&branch_masks),
-                            ),
-                            None,
-                        )
-                    };
-                    match step_result {
-                        StepResult::Accumulate => {
+                            &lookup,
+                        ) {
                             if debug_enabled {
-                                stats.accumulated += 1;
-                            }
-                            if debug_enabled && stats.allow_detail() {
-                                let instances = machine.instance_count();
-                                let event_ref = event_debug_ref(event, batch_seq, row_index);
-                                if let Some(progress) = progress.as_ref() {
-                                    wf_debug!(pipe,
-                                        rule = %rule_name_for_log,
-                                        stage = 0,
-                                        window = %window_name,
-                                        alias = %alias,
-                                        event_ref = %event_ref,
-                                        scope_key = %debug_scope_key(&progress.scope_key),
-                                        machine_id = %progress.machine_id,
-                                        step_index = progress.step_index,
-                                        step_label = progress.step_label.as_deref().unwrap_or(""),
-                                        branch_index = progress.branch_index,
-                                        threshold_checked_branches = progress.threshold_checked_branches,
-                                        measure_value = progress.measure_value,
-                                        cmp = %progress.cmp,
-                                        threshold = %progress.threshold,
-                                        instances = instances,
-                                        "rule event accumulated"
-                                    );
-                                } else {
-                                    wf_debug!(pipe,
-                                        rule = %rule_name_for_log,
-                                        stage = 0,
-                                        window = %window_name,
-                                        alias = %alias,
-                                        event_ref = %event_ref,
-                                        instances = instances,
-                                        "rule event accumulated"
-                                    );
-                                }
-                            }
-                        }
-                        StepResult::Advance => {
-                            if debug_enabled {
-                                stats.advanced += 1;
-                            }
-                            if debug_enabled && stats.allow_detail() {
-                                let instances = machine.instance_count();
-                                let event_ref = event_debug_ref(event, batch_seq, row_index);
-                                if let Some(progress) = progress.as_ref() {
-                                    wf_debug!(pipe,
-                                        rule = %rule_name_for_log,
-                                        stage = 0,
-                                        window = %window_name,
-                                        alias = %alias,
-                                        event_ref = %event_ref,
-                                        scope_key = %debug_scope_key(&progress.scope_key),
-                                        machine_id = %progress.machine_id,
-                                        step_index = progress.step_index,
-                                        step_label = progress.step_label.as_deref().unwrap_or(""),
-                                        branch_index = progress.branch_index,
-                                        threshold_checked_branches = progress.threshold_checked_branches,
-                                        measure_value = progress.measure_value,
-                                        cmp = %progress.cmp,
-                                        threshold = %progress.threshold,
-                                        instances = instances,
-                                        "rule step advanced"
-                                    );
-                                } else {
-                                    wf_debug!(pipe,
-                                        rule = %rule_name_for_log,
-                                        stage = 0,
-                                        window = %window_name,
-                                        alias = %alias,
-                                        event_ref = %event_ref,
-                                        instances = instances,
-                                        "rule step advanced"
-                                    );
-                                }
-                            }
-                        }
-                        StepResult::Matched(ctx) => {
-                            if debug_enabled {
-                                stats.matched += 1;
+                                stats.alias_rejected += 1;
                             }
                             if debug_enabled && stats.allow_detail() {
                                 let event_ref = event_debug_ref(event, batch_seq, row_index);
-                                let step = ctx.step_data.last();
                                 wf_debug!(pipe,
                                     rule = %rule_name_for_log,
                                     stage = 0,
                                     window = %window_name,
                                     alias = %alias,
                                     event_ref = %event_ref,
-                                    scope_key = %debug_scope_key(&ctx.scope_key),
-                                    machine_id = %ctx.machine_id,
-                                    matched_steps = ctx.step_data.len(),
-                                    step_label = step.and_then(|s| s.label.as_deref()).unwrap_or(""),
-                                    measure_value = step.map(|s| s.measure_value).unwrap_or_default(),
-                                    "rule matched"
+                                    reason = "bind_filter_false",
+                                    "rule event rejected"
                                 );
                             }
-                            matched.push(ctx);
+                            continue;
+                        }
+                        if debug_enabled {
+                            stats.alias_passed += 1;
+                        }
+                        let should_capture_progress = debug_enabled && stats.can_log_detail();
+                        let (step_result, progress) = if should_capture_progress {
+                            let outcome = machine.advance_at_with_progress(
+                                alias,
+                                event,
+                                event_nanos,
+                                Some(&lookup),
+                            );
+                            (outcome.result, outcome.progress)
+                        } else {
+                            (
+                                machine.advance_at_with_masks(
+                                    alias,
+                                    event,
+                                    event_nanos,
+                                    Some(&lookup),
+                                    row_index,
+                                    Some(&branch_masks),
+                                ),
+                                None,
+                            )
+                        };
+                        match step_result {
+                            StepResult::Accumulate => {
+                                if debug_enabled {
+                                    stats.accumulated += 1;
+                                }
+                                if debug_enabled && stats.allow_detail() {
+                                    let instances = machine.instance_count();
+                                    let event_ref = event_debug_ref(event, batch_seq, row_index);
+                                    if let Some(progress) = progress.as_ref() {
+                                        wf_debug!(pipe,
+                                            rule = %rule_name_for_log,
+                                            stage = 0,
+                                            window = %window_name,
+                                            alias = %alias,
+                                            event_ref = %event_ref,
+                                            scope_key = %debug_scope_key(&progress.scope_key),
+                                            machine_id = %progress.machine_id,
+                                            step_index = progress.step_index,
+                                            step_label = progress.step_label.as_deref().unwrap_or(""),
+                                            branch_index = progress.branch_index,
+                                            threshold_checked_branches = progress.threshold_checked_branches,
+                                            measure_value = progress.measure_value,
+                                            cmp = %progress.cmp,
+                                            threshold = %progress.threshold,
+                                            instances = instances,
+                                            "rule event accumulated"
+                                        );
+                                    } else {
+                                        wf_debug!(pipe,
+                                            rule = %rule_name_for_log,
+                                            stage = 0,
+                                            window = %window_name,
+                                            alias = %alias,
+                                            event_ref = %event_ref,
+                                            instances = instances,
+                                            "rule event accumulated"
+                                        );
+                                    }
+                                }
+                            }
+                            StepResult::Advance => {
+                                if debug_enabled {
+                                    stats.advanced += 1;
+                                }
+                                if debug_enabled && stats.allow_detail() {
+                                    let instances = machine.instance_count();
+                                    let event_ref = event_debug_ref(event, batch_seq, row_index);
+                                    if let Some(progress) = progress.as_ref() {
+                                        wf_debug!(pipe,
+                                            rule = %rule_name_for_log,
+                                            stage = 0,
+                                            window = %window_name,
+                                            alias = %alias,
+                                            event_ref = %event_ref,
+                                            scope_key = %debug_scope_key(&progress.scope_key),
+                                            machine_id = %progress.machine_id,
+                                            step_index = progress.step_index,
+                                            step_label = progress.step_label.as_deref().unwrap_or(""),
+                                            branch_index = progress.branch_index,
+                                            threshold_checked_branches = progress.threshold_checked_branches,
+                                            measure_value = progress.measure_value,
+                                            cmp = %progress.cmp,
+                                            threshold = %progress.threshold,
+                                            instances = instances,
+                                            "rule step advanced"
+                                        );
+                                    } else {
+                                        wf_debug!(pipe,
+                                            rule = %rule_name_for_log,
+                                            stage = 0,
+                                            window = %window_name,
+                                            alias = %alias,
+                                            event_ref = %event_ref,
+                                            instances = instances,
+                                            "rule step advanced"
+                                        );
+                                    }
+                                }
+                            }
+                            StepResult::Matched(ctx) => {
+                                if debug_enabled {
+                                    stats.matched += 1;
+                                }
+                                if debug_enabled && stats.allow_detail() {
+                                    let event_ref = event_debug_ref(event, batch_seq, row_index);
+                                    let step = ctx.step_data.last();
+                                    wf_debug!(pipe,
+                                        rule = %rule_name_for_log,
+                                        stage = 0,
+                                        window = %window_name,
+                                        alias = %alias,
+                                        event_ref = %event_ref,
+                                        scope_key = %debug_scope_key(&ctx.scope_key),
+                                        machine_id = %ctx.machine_id,
+                                        matched_steps = ctx.step_data.len(),
+                                        step_label = step.and_then(|s| s.label.as_deref()).unwrap_or(""),
+                                        measure_value = step.map(|s| s.measure_value).unwrap_or_default(),
+                                        "rule matched"
+                                    );
+                                }
+                                matched.push(ctx);
+                            }
                         }
                     }
+                    self.advance_nanos += _advance_start.elapsed().as_nanos() as u64;
                 }
-                self.advance_nanos += _advance_start.elapsed().as_nanos() as u64;
                 let _emit_start = Instant::now();
 
                 // When routed to the conv stage, the inline close processing is
@@ -1172,6 +1177,7 @@ impl RuleTask {
             seq,
             push.events.as_ref(),
             push.batch.as_deref(),
+            push.materialize_fields.as_deref(),
         )
         .await;
         // Ack the window batch seq so time eviction may reclaim it (the

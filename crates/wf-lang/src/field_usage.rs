@@ -98,16 +98,26 @@ pub fn compute_window_field_usage(plans: &[RulePlan]) -> WindowFieldUsage {
             }
         }
 
+        // A window may defer (broadcast the raw batch and let rule tasks
+        // materialize) only when EVERY rule binding it is defer-safe: a
+        // state-machine rule whose bind filters are all columnar, or an
+        // `on each` rule (the rule task materializes the raw batch itself,
+        // filtered, instead of route_parse materializing eagerly).
+        let plan_defer_safe = plan.each_plan.is_some()
+            || plan
+                .binds
+                .iter()
+                .all(|b| b.filter.as_ref().is_some_and(expr_is_columnar));
+
         // Bind filters are evaluated against the bound event.
         for bind in &plan.binds {
             if let Some(filter) = &bind.filter {
                 collect_expr_fields(filter, &mut global);
             }
-            let columnar = bind.filter.as_ref().is_some_and(expr_is_columnar);
             defer_candidates
                 .entry(bind.window.as_str())
-                .and_modify(|all| *all &= columnar)
-                .or_insert(columnar);
+                .and_modify(|all| *all &= plan_defer_safe)
+                .or_insert(plan_defer_safe);
         }
 
         // Event / close steps and sequence branches — read the source alias's
@@ -426,5 +436,59 @@ mod tests {
         assert!(usage.defer_materialization.contains("bid_events"));
         assert!(!usage.defer_materialization.contains("no_filter"));
         assert!(!usage.defer_materialization.contains("func"));
+    }
+
+    #[test]
+    fn each_rule_defers_materialization_without_needs_all() {
+        let bind = BindPlan {
+            alias: "b".into(),
+            window: "bid_events".into(),
+            filter: None,
+        };
+        let mut plan = make_rule(
+            vec![bind],
+            MatchPlan {
+                keys: vec![],
+                key_map: None,
+                window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
+                event_steps: vec![],
+                close_steps: vec![],
+                close_mode: crate::ast::CloseMode::Or,
+                tracked_bind_aliases: std::collections::HashSet::from(["b".to_string()]),
+                tracked_bind_fields: std::collections::HashMap::from([(
+                    "b".to_string(),
+                    std::collections::HashSet::from(["auction".to_string()]),
+                )]),
+                tracked_plain_fields: std::collections::HashSet::new(),
+                match_mode: crate::ast::MatchMode::Any,
+                seq: None,
+                accu: false,
+                needs_field_history: false,
+            },
+        );
+        plan.each_plan = Some(crate::plan::EachPlan {
+            alias: "b".into(),
+            filter: None,
+        });
+        plan.entity_plan.entity_id_expr =
+            Expr::Field(FieldRef::Qualified("b".into(), "auction".into()));
+        plan.yield_plan.fields = vec![crate::plan::YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        }];
+
+        let usage = compute_window_field_usage(&[plan]);
+        assert!(usage.defer_materialization.contains("bid_events"));
+        assert!(!usage.needs_all.contains("bid_events"));
+        let f = usage
+            .filter_for(
+                "bid_events",
+                ["auction", "bidder", "price", "dateTime", MACHINE_ID],
+            )
+            .expect("each rule must reduce materialization");
+        assert!(f.contains("auction"));
+        assert!(f.contains(MACHINE_ID));
+        assert!(!f.contains("bidder"));
+        assert!(!f.contains("price"));
     }
 }

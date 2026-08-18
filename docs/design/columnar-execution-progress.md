@@ -203,6 +203,13 @@
   锁定 Int64/Timestamp 的 f64 往返（含 `2^53+1`）与 null/缺字段 → 0 语义。
 - 验证：`cargo test -p wf-engine --lib` → 477 全绿；`wf-runtime --lib` → 164 全绿；
   `cargo check --workspace --all-targets` → 通过。
+- **review 修复（2026-08-18）**：懒物化路径原先把非命中行 `continue` 到 close-emission
+  块之前，导致被 bind filter 拒绝的行的 `scan_expired_at_with_conv` 产生的 close 被
+  **丢弃**（eager 路径会对每行都 emit close）。已改为把状态机 advance 包在
+  `if let Some(event)` 内、close-emission 块对每行都执行；新增回归测试
+  `deferred_materialization_preserves_close_emission_for_rejected_rows`。
+  **已知限制（非正确性）**：懒物化用 `materialize_rows`（全 schema），未套用窗口的
+  `materialize_fields` 投影——命中行会物化更多字段（仅 RSS/CPU，规则不读这些字段）。
 - **端到端 Q2 复测（`bench.sh q2 cont 100m`，重编 `wfusion`，2026-08-18）**：
 
   ```text
@@ -242,12 +249,39 @@
 - 验证：`cargo test -p wf-engine --lib` → 480 全绿；`wf-runtime --lib` → 164 全绿；
   `cargo check --workspace --all-targets` → 通过。
 
+### Step 12 — Q1 `on each` 懒物化（defer，广播原始批）
+
+- **问题**：Q1（`on each`，无 bind filter）仍 eager 物化——`route_parse` 对每个窗口调用
+  `batch_to_events_filtered`（每事件一个 `HashMap`，~300B/行）→ 窗口 mailbox 按
+  `content_bytes + events_bytes` 记账，~37MB/批把 64MB 窗口 mailbox 塞成 ~2 槽，
+  10 个 parse worker 争 2 槽（dispatch 等 mailbox 占 parse 忙时 65.5%）。
+- **改动**：
+  - `wf-lang/field_usage.rs`：`defer_materialization` 允许 `on each` 规则——
+    `plan_defer_safe = each_plan.is_some() || 所有 bind filter 均列式`（match 语义不变）。
+  - `wf-engine/window/fanout.rs` + `commit.rs`：`RulePush` 增加 `materialize_fields`，
+    窗口 actor 广播原始批时把字段白名单一并带给规则任务，保证规则任务物化出的
+    `Event` 字段集与 eager 路径一致（wfx_id 稳定）。
+  - `wf-runtime/rule_task.rs`：`process_batch` 增加 `materialize_fields` 参数；
+    `events=None`（deferred）时用 `batch_to_events_filtered(batch, materialize_fields)`
+    物化，而不是 `batch_to_events`（全字段）。
+- **测试**：`field_usage.rs` 新增 `each_rule_defers_materialization_without_needs_all`。
+- **测量（q1 cont 100m，WARMUP=1）**：
+  - `[parse-split]`：dispatch 占比从 **65.5% → 7.4%**（mailbox 争抢解除）；
+    route_parse 从 ~17ms/批降到 ~48µs/批（不再物化）。
+  - EPS：6.15M / 6.63M / 7.13M / 7.16M / 7.17M（仍双峰，高相 ~7.17M 与基线一致）。
+  - RSS 峰值：~8.9GB（对比 1.0.2 同配置 14GB，窗口不再持有事件 HashMap）。
+- **结论**：defer 解除了 mailbox 争抢、明显降内存，但 **EPS 中性**——Q1 吞吐天花板不是
+  物化/mailbox，而是管线深度（Little's law，`preread` 2GB 甜点，见
+  `concurrency-scaling.md` 两道墙模型）。真正要提 Q1 吞吐得**旁路窗口 actor**（无状态
+  `on each` 窗口是纯开销），或进一步列式化 each 路径消除物化——但单就 defer 而言已把
+  mailbox 这道墙拆掉，为后续铺路。
+
 ## 验证结果
 
 ```text
-cargo test -p wf-lang --lib   → 525 passed
+cargo test -p wf-lang --lib   → 526 passed
 cargo test -p wf-engine --lib  → 480 passed, 3 ignored (guard_bench 基准)
-cargo test -p wf-runtime --lib → 164 passed
+cargo test -p wf-runtime --lib → 165 passed
 ```
 
 ## M2a — qradar 规则集 guard 纯列运算覆盖率
@@ -298,3 +332,8 @@ cargo test -p wf-runtime --lib → 164 passed
 3. **guard_bench 随机对拍**：把 `columnar_wiring` 的对拍扩展到随机数据（负值/null/2^53±1）进一步加固。
 4. ~~**L2 端到端 Q2 复测**~~ ✅ 已完成（Step 10 末尾）：两次 `bench.sh q2 cont 100m` 均 clean、
    暖相 6.67M/6.70M、EMIT 747816 精确一致，EPS 无回归（受「两道墙」限无增益，见 Step 8）。
+5. ~~**Q1 `on each` 懒物化（defer）**~~ ✅ 已完成（Step 12）：解除 mailbox 争抢（dispatch 65.5%→7.4%）
+   并降 RSS（~14GB→~8.9GB），但 **EPS 中性**——Q1 天花板是管线深度，不是物化。
+6. **Q1 旁路窗口 actor**（下一步）：无状态 `on each` 窗口是纯开销，把 raw batch 直接广播到
+   规则任务、跳过窗口 append/reorder/evict，才可能突破 ~7.17M 高相天花板（见
+   `concurrency-scaling.md` §2.3 / 两道墙模型）。
