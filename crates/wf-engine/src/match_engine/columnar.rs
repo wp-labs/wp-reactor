@@ -191,19 +191,6 @@ enum ColRef<'a> {
     Null,
 }
 
-impl ColRef<'_> {
-    fn value(&self, row: usize) -> Option<CScalar> {
-        match self {
-            ColRef::Int64(a) => (!a.is_null(row)).then(|| CScalar::Int(a.value(row))),
-            ColRef::Float64(a) => (!a.is_null(row)).then(|| CScalar::Float(a.value(row))),
-            ColRef::Utf8(a) => (!a.is_null(row)).then(|| CScalar::Str(a.value(row).into())),
-            ColRef::Bool(a) => (!a.is_null(row)).then(|| CScalar::Bool(a.value(row))),
-            ColRef::TimestampNs(a) => (!a.is_null(row)).then(|| CScalar::Int(a.value(row))),
-            ColRef::Null => None,
-        }
-    }
-}
-
 /// Map a non-null scalar at `row` of `col` to a [`CScalar`], mirroring
 /// `event_bridge::extract_value`'s scalar mapping exactly.
 fn col_ref_from_array(col: &dyn Array) -> ColRef<'_> {
@@ -268,18 +255,25 @@ pub fn eval_guard_columnar(expr: &Expr, view: &ColumnarBatch<'_>) -> BooleanArra
         // Non-columnar expression (the gate keeps these out): all rows miss.
         return BooleanArray::from(vec![false; view.num_rows()]);
     };
-    let mut builder = BooleanBuilder::with_capacity(view.num_rows());
-    for row in 0..view.num_rows() {
-        match eval_cx_bool(&plan, row) {
-            Some(b) => builder.append_value(b),
-            // Preserve null (missing field / non-bool) as a null slot instead of
-            // collapsing it to `false`, so permissive (close-step) guards can
-            // distinguish "explicit false" from "absent". Two-valued consumers
-            // (`value()`) still read null as `false` — unchanged.
-            None => builder.append_null(),
+    let out = plan.eval_vec(view.num_rows());
+    match out {
+        // Top-level boolean column: materialize, preserving null slots.
+        CVec::Bool(col) => {
+            let mut builder = BooleanBuilder::with_capacity(col.len());
+            for b in col {
+                match b {
+                    Some(true) => builder.append_value(true),
+                    Some(false) => builder.append_value(false),
+                    // Null (missing field / non-bool) → null slot.
+                    None => builder.append_null(),
+                }
+            }
+            builder.finish()
         }
+        // Non-boolean top-level (e.g. `auction + 1`) → interpreted `None` per
+        // row → all null slots (two-valued consumers read them as `false`).
+        _ => BooleanArray::from(vec![None; view.num_rows()]),
     }
-    builder.finish()
 }
 
 fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnExpr<'a>> {
@@ -318,61 +312,206 @@ fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnEx
     }
 }
 
-fn eval_cx_bool(expr: &ColumnExpr<'_>, row: usize) -> Option<bool> {
-    match eval_cx(expr, row)? {
-        CScalar::Bool(b) => Some(b),
-        _ => None,
-    }
+/// A materialized whole-column output of a vectorized expression node (P3).
+///
+/// Each `ColumnExpr` node is evaluated **column-at-a-time**: it pulls its input
+/// column(s), computes over the entire batch in one linear pass, and produces a
+/// typed column of per-row `Option`s. The root of a guard yields
+/// [`CVec::Bool`], which [`eval_guard_columnar`] materializes into a
+/// [`BooleanArray`]. This is the vectorized-execution kernel form that replaces
+/// the old per-row recursive tree walk — the row loop now iterates contiguous
+/// native columns instead of re-descending the AST every row.
+///
+/// Semantics are byte-for-byte identical to the interpreted evaluator: the
+/// per-row calls below reconstruct [`CScalar`] and delegate to the exact same
+/// `compare_scalars` / `arithmetic` kernels, so null propagation, three-valued
+/// `&&` / `||`, native `i64`, epsilon float compare, and the documented `>2^53`
+/// divergence are all unchanged.
+enum CVec {
+    Int(Vec<Option<i64>>),
+    Float(Vec<Option<f64>>),
+    Str(Vec<Option<SmolStr>>),
+    Bool(Vec<Option<bool>>),
 }
 
-fn eval_cx(expr: &ColumnExpr<'_>, row: usize) -> Option<CScalar> {
-    match expr {
-        ColumnExpr::Lit(v) => Some(v.clone()),
-        ColumnExpr::Col(col) => col.value(row),
-        ColumnExpr::Neg(inner) => match eval_cx(inner, row)? {
-            CScalar::Int(i) => Some(CScalar::Float(-(i as f64))),
-            CScalar::Float(f) => Some(CScalar::Float(-f)),
+impl CVec {
+    /// Per-row [`CScalar`] view (used only by compare / arithmetic kernels that
+    /// delegate to the shared interpreted-semantics helpers).
+    fn scalar_at(&self, row: usize) -> Option<CScalar> {
+        match self {
+            CVec::Int(v) => v[row].map(CScalar::Int),
+            CVec::Float(v) => v[row].map(CScalar::Float),
+            CVec::Str(v) => v[row].clone().map(CScalar::Str),
+            CVec::Bool(v) => v[row].map(CScalar::Bool),
+        }
+    }
+
+    /// The SQL three-valued boolean view of a cell: `Bool(b)` → `b`, any
+    /// non-boolean scalar (and null) → `None`. Mirrors what
+    /// `eval_cx` + the `&&` / `||` match arms saw for a non-`Bool` scalar.
+    fn bool_at(&self, row: usize) -> Option<bool> {
+        match self {
+            CVec::Bool(v) => v[row],
             _ => None,
-        },
-        ColumnExpr::And(left, right) => cx_logic_and(left, right, row),
-        ColumnExpr::Or(left, right) => cx_logic_or(left, right, row),
-        ColumnExpr::Cmp { op, left, right } => {
-            let lv = eval_cx(left, row)?;
-            let rv = eval_cx(right, row)?;
-            Some(CScalar::Bool(compare_scalars(*op, &lv, &rv)))
         }
-        ColumnExpr::Arith { op, left, right } => {
-            let lv = eval_cx(left, row)?;
-            let rv = eval_cx(right, row)?;
-            arithmetic(*op, &lv, &rv)
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            CVec::Int(v) => v.len(),
+            CVec::Float(v) => v.len(),
+            CVec::Str(v) => v.len(),
+            CVec::Bool(v) => v.len(),
         }
     }
 }
 
-/// SQL three-valued AND (mirrors `eval_logic_and`).
-fn cx_logic_and(left: &ColumnExpr<'_>, right: &ColumnExpr<'_>, row: usize) -> Option<CScalar> {
-    let lv = eval_cx(left, row);
-    let rv = eval_cx(right, row);
-    match (lv.as_ref(), rv.as_ref()) {
-        (Some(CScalar::Bool(false)), _) | (_, Some(CScalar::Bool(false))) => {
-            Some(CScalar::Bool(false))
+impl ColumnExpr<'_> {
+    /// Evaluate this node over the whole batch (vectorized) into a typed column.
+    /// One linear pass per node; intermediate columns are materialized and flow
+    /// bottom-up to the root.
+    fn eval_vec(&self, n: usize) -> CVec {
+        match self {
+            ColumnExpr::Lit(v) => lit_vec(v, n),
+            ColumnExpr::Col(col) => col_vec(col, n),
+            ColumnExpr::Neg(inner) => neg_vec(inner.eval_vec(n)),
+            ColumnExpr::And(left, right) => logic_vec::<true>(left.eval_vec(n), right.eval_vec(n)),
+            ColumnExpr::Or(left, right) => logic_vec::<false>(left.eval_vec(n), right.eval_vec(n)),
+            ColumnExpr::Cmp { op, left, right } => {
+                cmp_vec(*op, left.eval_vec(n), right.eval_vec(n))
+            }
+            ColumnExpr::Arith { op, left, right } => {
+                arith_vec(*op, left.eval_vec(n), right.eval_vec(n))
+            }
         }
-        (Some(CScalar::Bool(true)), Some(CScalar::Bool(true))) => Some(CScalar::Bool(true)),
-        _ => None,
     }
 }
 
-/// SQL three-valued OR (mirrors `eval_logic_or`).
-fn cx_logic_or(left: &ColumnExpr<'_>, right: &ColumnExpr<'_>, row: usize) -> Option<CScalar> {
-    let lv = eval_cx(left, row);
-    let rv = eval_cx(right, row);
-    match (lv.as_ref(), rv.as_ref()) {
-        (Some(CScalar::Bool(true)), _) | (_, Some(CScalar::Bool(true))) => {
-            Some(CScalar::Bool(true))
-        }
-        (Some(CScalar::Bool(false)), Some(CScalar::Bool(false))) => Some(CScalar::Bool(false)),
-        _ => None,
+/// A literal constant column (one value repeated over `n` rows).
+fn lit_vec(v: &CScalar, n: usize) -> CVec {
+    match v {
+        CScalar::Int(i) => CVec::Int(vec![Some(*i); n]),
+        CScalar::Float(f) => CVec::Float(vec![Some(*f); n]),
+        CScalar::Str(s) => CVec::Str((0..n).map(|_| Some(s.clone())).collect()),
+        CScalar::Bool(b) => CVec::Bool(vec![Some(*b); n]),
     }
+}
+
+/// Materialize a [`ColRef`] leaf into a typed column in a single pass. A
+/// `Timestamp(Ns)` column reads as native `i64`; a `Null` column (missing field
+/// / unsupported type) reads as all-null, matching `ColRef` → `None`.
+fn col_vec(col: &ColRef<'_>, n: usize) -> CVec {
+    match col {
+        ColRef::Int64(a) => CVec::Int(
+            (0..n)
+                .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+                .collect(),
+        ),
+        ColRef::TimestampNs(a) => CVec::Int(
+            (0..n)
+                .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+                .collect(),
+        ),
+        ColRef::Float64(a) => CVec::Float(
+            (0..n)
+                .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+                .collect(),
+        ),
+        ColRef::Utf8(a) => CVec::Str(
+            (0..n)
+                .map(|r| (!a.is_null(r)).then(|| a.value(r).into()))
+                .collect(),
+        ),
+        ColRef::Bool(a) => CVec::Bool(
+            (0..n)
+                .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+                .collect(),
+        ),
+        ColRef::Null => CVec::Int(vec![None; n]),
+    }
+}
+
+/// Vectorized unary negation. `Int` negates to `Float` (widening, mirroring the
+/// interpreted `-(i as f64)`); `Str`/`Bool` (and null) → all-null.
+fn neg_vec(inner: CVec) -> CVec {
+    let n = inner.len();
+    match inner {
+        CVec::Int(v) => CVec::Float(v.into_iter().map(|o| o.map(|i| -(i as f64))).collect()),
+        CVec::Float(v) => CVec::Float(v.into_iter().map(|o| o.map(|f| -f)).collect()),
+        _ => CVec::Float(vec![None; n]),
+    }
+}
+
+/// Vectorized comparison: per row, null cell on either side → null; else
+/// `compare_scalars` (which returns `false` for a non-numeric pair).
+fn cmp_vec(op: BinOp, left: CVec, right: CVec) -> CVec {
+    let n = left.len();
+    let mut out = Vec::with_capacity(n);
+    for row in 0..n {
+        let cell = match (left.scalar_at(row), right.scalar_at(row)) {
+            (Some(lv), Some(rv)) => Some(compare_scalars(op, &lv, &rv)),
+            _ => None,
+        };
+        out.push(cell);
+    }
+    CVec::Bool(out)
+}
+
+/// Vectorized arithmetic. The output column type is deterministic from the
+/// homogeneous input column types: `%` over two `Int` columns stays `Int`;
+/// every other case goes through `arithmetic`'s f64 path → `Float` (div-by-zero
+/// and non-numeric cells → null).
+fn arith_vec(op: BinOp, left: CVec, right: CVec) -> CVec {
+    let n = left.len();
+    let mut out = Vec::with_capacity(n);
+    let int_mod = op == BinOp::Mod && matches!(left, CVec::Int(_)) && matches!(right, CVec::Int(_));
+    for row in 0..n {
+        out.push(arith_cell(op, &left, &right, row));
+    }
+    if int_mod {
+        CVec::Int(
+            out.into_iter()
+                .map(|o| match o {
+                    Some(CScalar::Int(i)) => Some(i),
+                    _ => None,
+                })
+                .collect(),
+        )
+    } else {
+        CVec::Float(
+            out.into_iter()
+                .map(|o| match o {
+                    Some(CScalar::Float(f)) => Some(f),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Per-row arithmetic via the shared interpreted-semantics `arithmetic` helper
+/// (null propagation and div-by-zero both surface as `Ok(None)` → null).
+fn arith_cell(op: BinOp, left: &CVec, right: &CVec, row: usize) -> Option<CScalar> {
+    let lv = left.scalar_at(row)?;
+    let rv = right.scalar_at(row)?;
+    arithmetic(op, &lv, &rv)
+}
+
+/// Vectorized SQL three-valued `&&` (`AND=true`) / `||` (`AND=false`).
+fn logic_vec<const AND: bool>(left: CVec, right: CVec) -> CVec {
+    let n = left.len();
+    let mut out = Vec::with_capacity(n);
+    for row in 0..n {
+        let cell = match (left.bool_at(row), right.bool_at(row)) {
+            (Some(false), _) | (_, Some(false)) if AND => Some(false),
+            (Some(true), Some(true)) if AND => Some(true),
+            (Some(true), _) | (_, Some(true)) if !AND => Some(true),
+            (Some(false), Some(false)) if !AND => Some(false),
+            _ => None,
+        };
+        out.push(cell);
+    }
+    CVec::Bool(out)
 }
 
 fn compare_scalars(op: BinOp, lv: &CScalar, rv: &CScalar) -> bool {

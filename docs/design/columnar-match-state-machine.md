@@ -11,7 +11,11 @@
 > P2（§6 全部管道）已实现并验证：**代码 ✅ · 2b 对拍 ✅ · 完整回归 ✅**。
 > Q2 免物化后 EPS 从 ~6-7M 提升到 ~17.9M（EMIT 精确、`[clean]`）；受第二道墙
 > （窗口 actor 单写者 P0-③）约束，再往上需拆该墙，而非 rule 侧。
-> 详见最后的「附录：实现状态与实测」。
+>
+> **P3（guard 整列向量化 kernel）已实现（2026-08-19）并验证，但对 Q2 吞吐无增益**：
+> 把 `columnar.rs` 的 guard 求值从逐行递归树升级为整列 kernel（`CVec` + `eval_vec` +
+> `cmp_vec/arith_vec/logic_vec/neg_vec/col_vec`，语义逐字节对齐解释器，`eval_guard_columnar`
+> 接口不变）。详见最后的「附录：实现状态与实测」。
 
 ## 0. 背景与缺口（一句话）
 
@@ -254,8 +258,9 @@ let rows_iter: Box<dyn Iterator<Item = usize>> = match shard_rows {
 - **本次交付**：sharded 免物化（broadcast 列式分片 + rule task 只扫 shard_rows + 命中行
   `materialize_rows_filtered`）。收益即 parse 侧全量物化的解放（Q2 从 ~6-7M 提升到
   ~17.9M）；再往上受第二道墙（窗口 actor 单写者 P0-③）约束，需另拆。
-- **P3（后续）**：`FieldView` trait + 命中行也免物化（直接 `ColumnarEvent` 喂状态机），
-  guard 向量化 kernel —— 把 `columnar-execution-design.md` 的 vectorized 走到底。
+- **P3（后续）**：`FieldView` trait + 命中行也免物化（直接 `ColumnarEvent` 喂状态机）；
+  guard 向量化 kernel（整列 kernel）**已实现**（见附录），但对 Q2 吞吐无增益——被
+  第二道墙挡住，非 guard 侧。
 
 ## 7. 边界与语义保持
 
@@ -293,7 +298,9 @@ let rows_iter: Box<dyn Iterator<Item = usize>> = match shard_rows {
 3. **端到端 Q2**：EPS 较物化基线（~6-7M）提升、EMIT 精确、`[clean]`：
    ✅ 完成——EPS ~17.9M（提升 ~2.5×），EMIT 747816 精确 + `[clean]`。
 4. 回归 Q1/Q2/Q3/Q5/Q7/Q9 + seq：✅ 完成（全 `[clean]`，见附录实测表）
-5. （可选 P3）`FieldView` + 命中行免物化 + guard 整列 kernel：未做（可选）
+5. (P3) `FieldView` + 命中行免物化 + guard 整列 kernel：
+   **guard 整列 kernel 已实现（✅）**，`FieldView`/命中行免物化未做。guard 向量化后
+   Q2 吞吐仍顶在第二道墙（100m 实测 EPS ~18.4M，CPU/RSS 无明显改善），见附录。
 
 > **§9.3 注：为什么 EPS 停在 ~17.9M（不能再涨）**
 >
@@ -314,7 +321,10 @@ let rows_iter: Box<dyn Iterator<Item = usize>> = match shard_rows {
 - **中**：`batch.clone()`（Arc 副本）在广播时给每 shard 一份，RSS 是 refcount 增量、
   零拷贝，但需确认 `Arc<RecordBatch>` 生命周期（TimedBatch 已持 batch，Arc 不复制列）。
 - **低**：命中行 `materialize_rows_filtered` 仍是物化（0.81%），但相对全批省 99%，
-  已是本步收益主体；P3 再消这 0.81%。
+  已是本步收益主体；P3（FieldView）再消这 0.81%。
+- **中（P3 已实现，收益暂未兑现）**：guard 整列向量化 kernel 对 Q2 无吞吐增益——
+  因 Q2 不是 guard CPU 受限，而是窗口 actor 单写者（P0-③）墙受限；待拆该墙后
+   guard kernel 的 CPU 收益才可能变现。
 
 ---
 
@@ -356,7 +366,16 @@ let rows_iter: Box<dyn Iterator<Item = usize>> = match shard_rows {
    actor，见 §9.3 注。
 2. **行式 sharded 回退未单测**：非 columnar sharded 规则走物化的用例未构造
    （列式路径已有分片对拍覆盖）。
-3. **P3（FieldView / 命中行免物化 / guard 整列 kernel）未做**（设计标注为可选）。
+3. **P3 guard 整列 kernel 已实现（2026-08-19）但对 Q2 无吞吐增益**：
+   把 `columnar.rs` 的逐行求值升级为整列 kernel（`CVec`{Int/Float/Str/Bool} +
+   `eval_vec` + 各整列算子，复用 `compare_scalars`/`arithmetic` 保证语义逐字节一致，
+   删去逐行 `eval_cx`/`cx_logic_*`），`eval_guard_columnar` 接口不变；
+   wf-engine 488 + wf-runtime 167 全绿。100m 苹果对苹果（同 load 块）P2 vs P3：
+   Q2 EPS 18.28M vs 18.45M（噪声带）、CPU 420% vs 473%、RSS 8335 vs 9180MB——
+   **无吞吐/CPU 提升，内存略增**。原因：Q2 已是窗口 actor 单写者墙受限，guard CPU
+   非瓶颈；Q1 无 filter 不走 guard kernel（30m RSS 逐字节一致，100m ~23GB 为负载
+   固有非 P3）。**guard kernel 收益须待拆第二道墙后评估**；优化点：常量列
+   `lit_vec` 整列物化可改标量融合。
 
 ### 实现过程中修复的既有 bug
 
