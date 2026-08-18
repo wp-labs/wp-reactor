@@ -61,6 +61,12 @@ pub enum WindowMsg {
         /// Window byte-budget permits held on behalf of this message;
         /// released when the actor finishes with it (append or late drop).
         permits: Vec<OwnedSemaphorePermit>,
+        /// Precomputed columnar shard partition of `batch` (per-shard row
+        /// subsets), produced in the parallel parse stage so the single-writer
+        /// actor does not repartition the whole batch on every commit. `None`
+        /// for non-sharded windows / row-based pushes (defensive repartition
+        /// in `broadcast_inner`).
+        shard_rows: Option<Arc<[Vec<u32>]>>,
     },
 }
 
@@ -258,6 +264,7 @@ async fn commit_append(
         events,
         byte_size,
         permits: _,
+        shard_rows,
     } = msg;
     let rows = batch.num_rows();
     let result = super::commit::commit_appended_batch(
@@ -268,6 +275,7 @@ async fn commit_append(
         batch,
         events,
         byte_size,
+        shard_rows,
     )
     .await;
     match result {
@@ -350,6 +358,7 @@ mod tests {
             events: None,
             byte_size: 64,
             permits: Vec::new(),
+            shard_rows: None,
         }
     }
 
@@ -590,6 +599,7 @@ mod tests {
             events: None,
             byte_size: capacity,
             permits: vec![permits],
+            shard_rows: None,
         })
         .await
         .unwrap();
@@ -610,6 +620,7 @@ mod tests {
             events: None,
             byte_size: capacity,
             permits: vec![gap_permits],
+            shard_rows: None,
         })
         .await
         .unwrap();
@@ -642,6 +653,7 @@ mod tests {
                 events: None,
                 byte_size: 64,
                 permits,
+                shard_rows: None,
             })
             .await
             .unwrap();
@@ -721,6 +733,7 @@ mod tests {
             events: Some(events),
             byte_size: 64,
             permits: Vec::new(),
+            shard_rows: None,
         })
         .await
         .unwrap();

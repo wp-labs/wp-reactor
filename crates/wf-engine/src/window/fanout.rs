@@ -185,7 +185,7 @@ impl RuleFanout {
     /// each channel receives from exactly one send future per broadcast, and
     /// broadcasts themselves are serialized by the single-writer commit path.
     pub async fn broadcast(&self, window_name: &str, events: &Arc<Vec<Arc<Event>>>, seq: u64) {
-        self.broadcast_inner(window_name, Some(events), None, None, seq)
+        self.broadcast_inner(window_name, Some(events), None, None, None, seq)
             .await;
     }
 
@@ -205,6 +205,7 @@ impl RuleFanout {
             Some(events),
             Some(batch),
             materialize_fields,
+            None,
             seq,
         )
         .await;
@@ -212,16 +213,56 @@ impl RuleFanout {
 
     /// Broadcast only the raw [`RecordBatch`] (L2 deferred materialization):
     /// each rule task materializes only the rows its bind filter accepts.
-    /// Only valid for non-sharded subscriptions (deferral excludes sharded).
+    /// `shard_rows` is an optional **precomputed** columnar partition of the
+    /// batch rows (produced in the parallel parse stage); when present and its
+    /// length matches the live subscription's shard count, the actor reuses it
+    /// instead of re-partitioning the whole batch on the single-writer path
+    /// (Q2 P0-③ wall).
     pub async fn broadcast_batch_only(
         &self,
         window_name: &str,
         batch: &RecordBatch,
         materialize_fields: Option<&Arc<HashSet<String>>>,
+        shard_rows: Option<&[Vec<u32>]>,
         seq: u64,
     ) {
-        self.broadcast_inner(window_name, None, Some(batch), materialize_fields, seq)
-            .await;
+        self.broadcast_inner(
+            window_name,
+            None,
+            Some(batch),
+            materialize_fields,
+            shard_rows,
+            seq,
+        )
+        .await;
+    }
+
+    /// Precompute the sharded row partition for a window's batch, in the
+    /// parallel parse stage. Returns `None` when the window has no sharded
+    /// subscription (nothing to partition). Byte-identical to the partition
+    /// [`broadcast_inner`] computes (`partition_rows_by_key`), so moving it
+    /// here does not change which rows land on which shard.
+    pub(crate) fn precompute_shard_rows(
+        &self,
+        window_name: &str,
+        batch: &RecordBatch,
+    ) -> Option<Arc<[Vec<u32>]>> {
+        let subs = self.table.read().expect("fanout lock poisoned");
+        let sub = subs.get(window_name)?.iter().find_map(|s| match s {
+            Subscription::Sharded { shards, keys } => Some((shards, keys)),
+            _ => None,
+        })?;
+        let (shards, keys) = sub;
+        let shard_count = shards.len();
+        let per = partition_rows_by_key(batch, keys, shard_count).unwrap_or_else(|| {
+            // Key column absent from schema → every row missing → all shard 0
+            // (matches row-based).
+            let mut v = Vec::with_capacity(shard_count);
+            v.resize_with(shard_count, Vec::new);
+            v[0] = (0..batch.num_rows()).map(|r| r as u32).collect();
+            v
+        });
+        Some(per.into())
     }
 
     async fn broadcast_inner(
@@ -230,6 +271,7 @@ impl RuleFanout {
         events: Option<&Arc<Vec<Arc<Event>>>>,
         batch: Option<&RecordBatch>,
         materialize_fields: Option<&Arc<HashSet<String>>>,
+        shard_rows: Option<&[Vec<u32>]>,
         seq: u64,
     ) {
         let subs: Vec<Subscription> = {
@@ -270,17 +312,29 @@ impl RuleFanout {
                         }
                         // Columnar deferred (events=None): partition the raw batch
                         // by key and send each shard the batch + its row subset.
+                        // Reuse the parse-side-precomputed `shard_rows` when it
+                        // matches this subscription's shard count (off the actor's
+                        // serial O(batch) partition work); otherwise fall back to
+                        // a defensive re-partition (config drift / hot reload).
                         (None, Some(batch)) => {
-                            let per = partition_rows_by_key(batch, keys, shards.len());
-                            let per = per.unwrap_or_else(|| {
-                                // Key column absent from schema → every row
-                                // missing → all shard 0 (matches row-based).
-                                let mut v = vec![Vec::new(); shards.len()];
-                                v[0] = (0..batch.num_rows()).map(|r| r as u32).collect();
-                                v
-                            });
-                            for (i, rows) in per.into_iter().enumerate() {
-                                if i >= shards.len() || rows.is_empty() {
+                            let pre = match shard_rows {
+                                Some(pre) if pre.len() == shards.len() => Some(pre),
+                                _ => None,
+                            };
+                            let per: Arc<[Vec<u32>]> = match pre {
+                                Some(pre) => Arc::from(pre),
+                                None => partition_rows_by_key(batch, keys, shards.len())
+                                    .unwrap_or_else(|| {
+                                        // Key column absent from schema → every row
+                                        // missing → all shard 0 (matches row-based).
+                                        let mut v = vec![Vec::new(); shards.len()];
+                                        v[0] = (0..batch.num_rows()).map(|r| r as u32).collect();
+                                        v
+                                    })
+                                    .into(),
+                            };
+                            for (i, rows) in per.iter().enumerate() {
+                                if rows.is_empty() {
                                     continue;
                                 }
                                 let push = RulePush {
@@ -288,7 +342,7 @@ impl RuleFanout {
                                     events: None,
                                     batch: batch_arc.clone(), // shared Arc (refcount, zero copy)
                                     materialize_fields: materialize_fields.map(Arc::clone),
-                                    shard_rows: Some(Arc::new(rows)),
+                                    shard_rows: Some(Arc::new(rows.clone())),
                                     seq,
                                 };
                                 let tx = shards[i].clone();
@@ -847,6 +901,82 @@ mod tests {
     }
 
     #[test]
+    fn precompute_shard_rows_equals_partition_rows_by_key() {
+        // 方案 A：`precompute_shard_rows`（并行 parse 阶段，读 fanout 的 sharded
+        // keys/shard_count）产出的分片，必须与广播内部所用的
+        // `partition_rows_by_key` 逐 shard 完全一致（否则提前分片会改变
+        // 命中行落子，破坏有状态语义）。逐 shard 比较行子集（含排序后相等）。
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use wf_lang::ast::FieldRef;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "auction",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+                None,
+                Some(1),
+            ])) as ArrayRef],
+        )
+        .unwrap();
+
+        let fanout = RuleFanout::new();
+        let shard_count = 3usize;
+        let (txs, _rxs): (Vec<_>, Vec<_>) = (0..shard_count)
+            .map(|_| mpsc::channel::<RulePush>(8))
+            .unzip();
+        let keys: Arc<[FieldRef]> =
+            Arc::from(vec![FieldRef::Simple("auction".into())].into_boxed_slice());
+        fanout.register_sharded("win_p", txs, keys.clone());
+
+        let pre = fanout
+            .precompute_shard_rows("win_p", &batch)
+            .expect("sharded window");
+        let internal = partition_rows_by_key(&batch, &keys, shard_count).expect("key col present");
+        assert_eq!(pre.len(), internal.len(), "same shard count");
+        for i in 0..shard_count {
+            let mut a = pre[i].clone();
+            let mut b = internal[i].clone();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "precompute shard {i} differs from internal partition");
+        }
+    }
+
+    #[test]
+    fn unsharded_precompute_shard_rows_returns_none() {
+        // 无 sharded 订阅的窗口：`precompute_shard_rows` 返回 None（不该分片），
+        // 广播走原路径。
+        use arrow::array::ArrayRef;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        let fanout = RuleFanout::new();
+        let (tx, _rx) = mpsc::channel::<RulePush>(8);
+        fanout.register("win_s", tx);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![Some(1)])) as ArrayRef],
+        )
+        .unwrap();
+        assert!(fanout.precompute_shard_rows("win_s", &batch).is_none());
+        assert!(fanout.precompute_shard_rows("missing", &batch).is_none());
+    }
+
+    #[test]
     fn extract_key_columnar_matches_row_based() {
         // 2b 对拍：`extract_key_columnar`（从列读 key）必须与行式
         // `extract_key_simple`（Event.fields.get）逐行返回同一个 `Vec<Value>`——
@@ -935,29 +1065,70 @@ mod tests {
             Arc::from(vec![FieldRef::Simple("id".into())].into_boxed_slice()),
         );
 
-        fanout.broadcast_batch_only("win_a", &batch, None, 0).await;
+        // (a) Defensive fallback path: no precomputed shard_rows → actor
+        // repartitions internally.
+        fanout
+            .broadcast_batch_only("win_a", &batch, None, None, 0)
+            .await;
 
-        let mut seen: Vec<u32> = Vec::new();
-        let mut pushed = 0;
-        for rx in [&mut rx0, &mut rx1] {
-            while let Ok(p) = rx.try_recv() {
-                pushed += 1;
-                assert!(
-                    p.events.is_none(),
-                    "deferred sharded push must carry no events"
-                );
-                assert!(
-                    p.batch.is_some(),
-                    "deferred sharded push must carry the batch"
-                );
-                let rows = p.shard_rows.expect("shard_rows set");
-                seen.extend(rows.iter().copied());
+        let mut drain = |rx0: &mut mpsc::Receiver<RulePush>, rx1: &mut mpsc::Receiver<RulePush>| {
+            let mut seen: Vec<u32> = Vec::new();
+            let mut pushed = 0;
+            for rx in [rx0, rx1] {
+                while let Ok(p) = rx.try_recv() {
+                    pushed += 1;
+                    assert!(
+                        p.events.is_none(),
+                        "deferred sharded push must carry no events"
+                    );
+                    assert!(
+                        p.batch.is_some(),
+                        "deferred sharded push must carry the batch"
+                    );
+                    let rows = p.shard_rows.expect("shard_rows set");
+                    seen.extend(rows.iter().copied());
+                }
             }
-        }
-        // 非空 shard 各收到一个 push；k3 若单独一个 shard 也各一个。
-        assert!(pushed >= 1 && pushed <= 2);
-        // 并集 = 全批 4 行，无重复。
-        seen.sort_unstable();
-        assert_eq!(seen, vec![0, 1, 2, 3]);
+            // 非空 shard 各收到一个 push；k3 若单独一个 shard 也各一个。
+            assert!(pushed >= 1 && pushed <= 2);
+            // 并集 = 全批 4 行，无重复。
+            seen.sort_unstable();
+            assert_eq!(seen, vec![0, 1, 2, 3]);
+        };
+        drain(&mut rx0, &mut rx1);
+
+        // (b) Parse-side precomputed path: `precompute_shard_rows` (parallel parse
+        // stage) must produce a partition that, handed to the broadcast, routes
+        // each row to the *same* shard and covers the batch exactly once.
+        let pre = fanout
+            .precompute_shard_rows("win_a", &batch)
+            .expect("sharded");
+        let (tx0b, mut rx0b) = mpsc::channel(8);
+        let (tx1b, mut rx1b) = mpsc::channel(8);
+        fanout.register_sharded(
+            "win_a",
+            vec![tx0b, tx1b],
+            Arc::from(vec![FieldRef::Simple("id".into())].into_boxed_slice()),
+        );
+        fanout
+            .broadcast_batch_only("win_a", &batch, None, Some(pre.as_ref()), 0)
+            .await;
+        drain(&mut rx0b, &mut rx1b);
+
+        // (c) Defensive fallback on config drift: a precomputed `shard_rows` whose
+        // length does not match the live subscription's shard count must be
+        // ignored and the full batch repartitioned internally (never drops rows).
+        let (tx0c, mut rx0c) = mpsc::channel(8);
+        let (tx1c, mut rx1c) = mpsc::channel(8);
+        fanout.register_sharded(
+            "win_a",
+            vec![tx0c, tx1c],
+            Arc::from(vec![FieldRef::Simple("id".into())].into_boxed_slice()),
+        );
+        let stale: Arc<[Vec<u32>]> = Arc::from(vec![vec![0, 1, 2, 3], vec![], vec![], vec![]]); // len 4 != 2 shards
+        fanout
+            .broadcast_batch_only("win_a", &batch, None, Some(stale.as_ref()), 0)
+            .await;
+        drain(&mut rx0c, &mut rx1c);
     }
 }

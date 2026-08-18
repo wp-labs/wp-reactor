@@ -45,6 +45,7 @@ pub(super) async fn commit_appended_batch(
     batch: RecordBatch,
     events: Option<Arc<Vec<Arc<Event>>>>,
     byte_size: usize,
+    shard_rows: Option<Arc<[Vec<u32>]>>,
 ) -> CoreResult<(AppendOutcome, u64)> {
     // Clone the raw batch for the columnar rule push; the append below moves
     // the original into the window. `RecordBatch` clone is O(columns) Arc bumps.
@@ -68,12 +69,16 @@ pub(super) async fn commit_appended_batch(
                 .await;
         } else if fanout.has_subscribers(window_name) {
             // L2 deferred materialization: broadcast only the raw batch; rule
-            // tasks materialize the rows their bind filter accepts.
+            // tasks materialize the rows their bind filter accepts. `shard_rows`
+            // is the parse-side-precomputed columnar partition (off the actor's
+            // serial O(batch) partition work); re-partitions defensively when it
+            // mismatches the live subscription.
             fanout
                 .broadcast_batch_only(
                     window_name,
                     &broadcast_batch,
                     win.materialize_fields.as_ref(),
+                    shard_rows.as_deref(),
                     batch_seq,
                 )
                 .await;

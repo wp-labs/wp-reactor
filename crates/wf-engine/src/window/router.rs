@@ -50,6 +50,12 @@ pub struct ParsedWindow {
     /// part of the window's byte accounting or memory eviction fires far past the
     /// real water level (wp-labs/wp-reactor#20).
     pub events_bytes: usize,
+    /// Precomputed columnar shard partition of the raw batch (per-shard row
+    /// subsets), produced here in the **parallel parse stage** so the single-
+    /// writer window actor does not repartition the whole batch on every commit
+    /// (Q2 P0-③ wall). `Some` only for deferred-materialization windows with a
+    /// sharded subscription; `None` otherwise (actor repartitions defensively).
+    pub shard_rows: Option<Arc<[Vec<u32>]>>,
 }
 
 /// Parsed events for every local window of a stream.
@@ -223,6 +229,7 @@ impl Router {
                         events: window.events,
                         byte_size,
                         permits,
+                        shard_rows: window.shard_rows,
                     };
                     let send_result = mailbox.tx.send(msg).await;
                     if send_result.is_err() {
@@ -289,6 +296,7 @@ impl Router {
                     events_bytes: 0,
                     window_name,
                     events: None,
+                    shard_rows: None,
                 });
                 continue;
             }
@@ -304,11 +312,16 @@ impl Router {
             // excluded here because the broadcast could not partition a
             // row-subset; `broadcast_inner` now handles `events=None` sharded
             // via columnar key partition (see fanout::partition_rows_by_key).
+            // The columnar partition is computed **here in the parallel parse
+            // stage** and carried to the actor, so the single-writer actor does
+            // not repartition the whole batch on its serial critical path.
             if win.defer_materialization() {
+                let shard_rows = self.rule_fanout.precompute_shard_rows(&window_name, batch);
                 windows.push(ParsedWindow {
                     events_bytes: 0,
                     window_name,
                     events: None,
+                    shard_rows,
                 });
                 continue;
             }
@@ -330,6 +343,7 @@ impl Router {
                 events_bytes: events_bytes(&events),
                 window_name,
                 events: Some(events),
+                shard_rows: None,
             });
         }
 
@@ -406,6 +420,7 @@ impl Router {
             batch.clone(),
             window.events,
             byte_size,
+            None, // inline/ordered path: no precomputed shard partition
         )
         .await?;
         Ok(WindowRouteOutcome {
