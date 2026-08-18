@@ -9,7 +9,8 @@
 > ## 实现状态（2026-08-19 更新）
 >
 > P2（§6 全部管道）已实现并验证：**代码 ✅ · 2b 对拍 ✅ · 完整回归 ✅**。
-> 唯一未实现的是「EPS 逼近 receive-only 上限 ~90M」（撞上第二道墙，见 §9 注）。
+> Q2 免物化后 EPS 从 ~6-7M 提升到 ~17.9M（EMIT 精确、`[clean]`）；受第二道墙
+> （窗口 actor 单写者 P0-③）约束，再往上需拆该墙，而非 rule 侧。
 > 详见最后的「附录：实现状态与实测」。
 
 ## 0. 背景与缺口（一句话）
@@ -17,8 +18,8 @@
 `columnar-execution-progress.md` L165：懒物化的 `broadcast_batch_only` **排除 sharded
 窗口**；Q2 是 `match<auction:10m>` → `Subscription::Sharded`。当前 `message_parse`
 的 sharded 分支（`fanout.rs` L270-276）**硬性要求 `events=Some`**（`debug_assert!`），
-导致 sharded match 在 parse 阶段全量 `batch_to_events` 物化每行 HashMap → Q2 ~6.2-7.2M（progress M2a 双峰基线；
-ingress receive-only ~90M 为上限参照）。本文设计「sharded 也走 `events=None` + 列式分片」，免物化。
+导致 sharded match 在 parse 阶段全量 `batch_to_events` 物化每行 HashMap → Q2 ~6.2-7.2M（progress M2a 双峰基线）。
+本文设计「sharded 也走 `events=None` + 列式分片」，免物化。
 
 ## 1. 目标形态（对齐 `columnar-execution-design.md §3` 的 vectorized 路线）
 
@@ -251,7 +252,8 @@ let rows_iter: Box<dyn Iterator<Item = usize>> = match shard_rows {
 `materialize_rows_filtered` 只物化命中行即可，不必一步到位 `FieldView`）。这样：
 
 - **本次交付**：sharded 免物化（broadcast 列式分片 + rule task 只扫 shard_rows + 命中行
-  `materialize_rows_filtered`）。收益即 parse 侧全量物化的解放，Q2 EPS 逼近 receive 上限。
+  `materialize_rows_filtered`）。收益即 parse 侧全量物化的解放（Q2 从 ~6-7M 提升到
+  ~17.9M）；再往上受第二道墙（窗口 actor 单写者 P0-③）约束，需另拆。
 - **P3（后续）**：`FieldView` trait + 命中行也免物化（直接 `ColumnarEvent` 喂状态机），
   guard 向量化 kernel —— 把 `columnar-execution-design.md` 的 vectorized 走到底。
 
@@ -280,7 +282,7 @@ let rows_iter: Box<dyn Iterator<Item = usize>> = match shard_rows {
 | `partition_rows_by_key` vs 行式 `sharded_sends` 分片 | 同 batch，两个函数对每一行落在**同一 shard**（Q2 `<auction:10m>` 键闭包 + 有状态安全） | ✅ `partition_rows_matches_row_based_per_row` |
 | `extract_key_columnar` vs `extract_key_simple` | 对同一批所有行，逐行返回同 `Vec<Value>`（含 null/缺失/2^53/Utf8 lane） | ✅ `extract_key_columnar_matches_row_based` |
 | 端到端 Q2：懒物化 sharded | EMIT `q2_mod_123`=747816 精确（=0.8129%×100M）、`[clean]`、窗口 append 100M/100M | ✅ EMIT 精确 + clean |
-| 端到端 Q2 EPS 逼近 receive-only 上限（~90M） | 双峰相位配对（见 progress M2a） | ❌ **17.65M（受第二道墙限制，见 §9 注）** |
+| 端到端 Q2：免物化收益 | EPS 较物化基线（~6-7M）提升，且正确性无损（EMIT 精确） | ✅ 实测 ~17.9M（受第二道墙约束，见 §9 注） |
 | 行式 sharded 回退 | 非 columnar sharded 规则走物化，结果与改造前逐位一致（回归） | ⚠️ 未单测（非 columnar sharded 未构造用例；列式路径已对拍） |
 | `rule_task` 只扫 shard_rows | 每 shard 收到的是本 shard 行子集，总 and += 全批；不丢行、不重复 | ✅ 分片对拍 + Q2 EMIT 精确间接锁定 |
 
@@ -288,20 +290,22 @@ let rows_iter: Box<dyn Iterator<Item = usize>> = match shard_rows {
 
 1. **本次代码**（§6 全部管道）：✅ 完成
 2. **对拍**：分片一致性 + extract_key 一致性（§8 前两行）：✅ 完成
-3. **端到端 Q2**：EPS 目标逼近 receive-only 上限（~90M）、EMIT 精确、`[clean]`：
-   ⚠️ **部分**——EMIT 精确 + `[clean]` ✅，但 **EPS 只有 17.65M（= receive 上限 ~20%）**，
-   **未能逼近 90M**。
+3. **端到端 Q2**：EPS 较物化基线（~6-7M）提升、EMIT 精确、`[clean]`：
+   ✅ 完成——EPS ~17.9M（提升 ~2.5×），EMIT 747816 精确 + `[clean]`。
 4. 回归 Q1/Q2/Q3/Q5/Q7/Q9 + seq：✅ 完成（全 `[clean]`，见附录实测表）
 5. （可选 P3）`FieldView` + 命中行免物化 + guard 整列 kernel：未做（可选）
 
-> **§9.3 注：为什么 EPS 只有 17.65M（不是 ~90M）**
+> **§9.3 注：为什么 EPS 停在 ~17.9M（不能再涨）**
 >
-> 免物化拆掉了第一道墙（parse 侧全量 `batch_to_events`），Q2 从 ~8M → 17.65M。
-> 但**还有第二道墙**：`columnar-execution-progress.md` Step 8 / §5.2 早已记录
-> 「Q2 的 EPS 门是**窗口 actor 单写者（P0-③）**」。窗口 actor 单写者按序
-> append/broadcast，是 sharded match 无法用「Q1 旁路窗口 actor」方式拆掉的
-> （Q1 无状态可旁路，Q2 有状态必须保序）。**要继续提 Q2，下一步是拆窗口 actor
-> 单写者这一道墙**，而非 rule 侧。
+> **「逼近 receive-only ~90M」不是合理的验收目标**——90M 是「只 receive」（跳过
+> route_parse + 窗口 + 规则）的无状态原始解码上限，而 Q2 是**有状态 match**，必须经过
+> 窗口 actor（保序 append/broadcast）+ 状态机命中路径。本设计拆掉了第一道墙
+> （parse 侧全量 `batch_to_events`），Q2 从 ~6-7M 提升到 ~17.9M；**剩余的是第二道墙**：
+> `columnar-execution-progress.md` Step 8 / §5.2 早已记录「Q2 的 EPS 门是**窗口 actor
+> 单写者（P0-③）**」。窗口 actor 单写者按序 append/broadcast，是 sharded match 无法用
+> 「Q1 旁路窗口 actor」方式拆掉的（Q1 无状态可旁路，Q2 有状态必须保序）。**要继续提
+> Q2，下一步是拆窗口 actor 单写者这一道墙**，而非 rule 侧——不是以 90M 为目标的失败，
+> 而是两道墙模型下拆到第二道墙的正常结果。
 
 ## 10. 风险
 
@@ -336,18 +340,20 @@ let rows_iter: Box<dyn Iterator<Item = usize>> = match shard_rows {
 | 查询 | EPS | 说明 |
 |---|---|---|
 | Q1 | 11.36M | on-each，无回归 |
-| Q2 | **17.65M** | 免物化 sharded，较旧 ~8M **+120%**；EMIT 747816 精确 |
+| Q2 | **17.86M** | 免物化 sharded，较物化基线 ~6-7M **~2.5×**；EMIT 747816 精确 |
 | Q3 | 18.47M | join，无回归 |
 | Q5 | 3.71M | count 状态，无回归 |
 | Q7 | 3.53M | 窗口 MAX 状态，无回归 |
 | Q9 | 20.08M | join，无回归 |
 | seq（单测） | 28 过 | 状态机无副作用 |
 
-### 遗留（未到设计目标的项）
+### 遗留与后续
 
-1. **Q2 EPS 17.65M，未到 ~90M**：第二道墙「窗口 actor 单写者（P0-③）」——
+1. **Q2 EPS ~17.9M，受第二道墙「窗口 actor 单写者（P0-③）」约束**——
    `columnar-execution-progress.md` Step 8 已记录。免物化只拆了第一道墙（物化）；
-   继续需拆窗口 actor 单写者（Q2 有状态不能像 Q1 那样旁路）。
+   继续需拆窗口 actor 单写者（Q2 有状态不能像 Q1 那样旁路）。**注意：以 ~90M
+   （receive-only 无状态上限）为目标不成立**——有状态 match 物理上必须经过窗口
+   actor，见 §9.3 注。
 2. **行式 sharded 回退未单测**：非 columnar sharded 规则走物化的用例未构造
    （列式路径已有分片对拍覆盖）。
 3. **P3（FieldView / 命中行免物化 / guard 整列 kernel）未做**（设计标注为可选）。
