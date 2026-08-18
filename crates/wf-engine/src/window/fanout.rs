@@ -9,7 +9,8 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use wf_lang::ast::FieldRef;
 
-use crate::match_engine::{Event, extract_key_simple, shard_index};
+use crate::match_engine::event_bridge::extract_field_value;
+use crate::match_engine::{Event, Value, extract_key_simple, field_ref_name, shard_index};
 use arrow::record_batch::RecordBatch;
 
 /// A batch of parsed events pushed from one window to its subscribing rules.
@@ -36,6 +37,12 @@ pub struct RulePush {
     /// event representation (and downstream wfx_id) stable.
     pub materialize_fields: Option<Arc<HashSet<String>>>,
     pub seq: u64,
+    /// Only set by a **sharded** broadcast that defers materialization
+    /// (`events` is `None`): the batch rows this shard owns (subset of the
+    /// raw `batch`, already partitioned by the match key). Unsharded pushes and
+    /// row-based (pre-materialized) pushes leave this `None`. The rule task
+    /// applies its columnar bind filter over exactly these rows.
+    pub shard_rows: Option<Arc<Vec<u32>>>,
 }
 
 /// A subscription for one window: a single (unsharded) rule channel, N shard
@@ -108,20 +115,6 @@ impl RuleFanout {
             .expect("fanout lock poisoned")
             .get(window_name)
             .is_some_and(|subs| !subs.is_empty())
-    }
-
-    /// Whether `window_name` has any sharded subscription (L2 deferral is only
-    /// safe for non-sharded windows — sharded subscriptions partition rows, so
-    /// their indices no longer match the whole raw batch).
-    pub fn has_sharded_subscribers(&self, window_name: &str) -> bool {
-        self.table
-            .read()
-            .expect("fanout lock poisoned")
-            .get(window_name)
-            .is_some_and(|subs| {
-                subs.iter()
-                    .any(|s| matches!(s, Subscription::Sharded { .. }))
-            })
     }
 
     /// Register a single (unsharded) rule channel for `window_name`.
@@ -262,18 +255,52 @@ impl RuleFanout {
                         events: events.map(Arc::clone),
                         batch: batch_arc.clone(),
                         materialize_fields: materialize_fields.map(Arc::clone),
+                        shard_rows: None,
                         seq,
                     };
                     let tx = tx.clone();
                     sends.push(Box::pin(async move { tx.send(push).await.is_err() }));
                 }
                 Subscription::Sharded { shards, keys } => {
-                    // Deferral excludes sharded windows, so `events` must be Some.
-                    let Some(events) = events else {
-                        debug_assert!(false, "broadcast_batch_only on a sharded window");
-                        continue;
-                    };
-                    sharded_sends(shards, keys, &window_name, events, seq, &mut sends);
+                    match (events, batch_arc.as_ref()) {
+                        // Row-based (pre-materialized events): keep the existing
+                        // per-event key partition.
+                        (Some(events), _) => {
+                            sharded_sends(shards, keys, &window_name, events, seq, &mut sends);
+                        }
+                        // Columnar deferred (events=None): partition the raw batch
+                        // by key and send each shard the batch + its row subset.
+                        (None, Some(batch)) => {
+                            let per = partition_rows_by_key(batch, keys, shards.len());
+                            let per = per.unwrap_or_else(|| {
+                                // Key column absent from schema → every row
+                                // missing → all shard 0 (matches row-based).
+                                let mut v = vec![Vec::new(); 1];
+                                v[0] = (0..batch.num_rows()).map(|r| r as u32).collect();
+                                v
+                            });
+                            for (i, rows) in per.into_iter().enumerate() {
+                                if i >= shards.len() || rows.is_empty() {
+                                    continue;
+                                }
+                                let push = RulePush {
+                                    window_name: Arc::clone(&window_name),
+                                    events: None,
+                                    batch: batch_arc.clone(), // shared Arc (refcount, zero copy)
+                                    materialize_fields: materialize_fields.map(Arc::clone),
+                                    shard_rows: Some(Arc::new(rows)),
+                                    seq,
+                                };
+                                let tx = shards[i].clone();
+                                sends.push(Box::pin(async move { tx.send(push).await.is_err() }));
+                            }
+                        }
+                        // Unreachable: a sharded broadcast with neither events nor
+                        // batch (no producer sends a sharded batch-only-without-batch).
+                        (None, None) => {
+                            debug_assert!(false, "sharded broadcast without events or batch");
+                        }
+                    }
                 }
                 Subscription::RoundRobin { shards, next } => {
                     let n = shards.len();
@@ -283,6 +310,7 @@ impl RuleFanout {
                         events: events.map(Arc::clone),
                         batch: batch_arc.clone(),
                         materialize_fields: materialize_fields.map(Arc::clone),
+                        shard_rows: None,
                         seq,
                     };
                     let tx = shards[idx].clone();
@@ -350,6 +378,65 @@ async fn join_sends(mut sends: Vec<Pin<Box<dyn Future<Output = bool> + Send>>>) 
     .await
 }
 
+/// Extract a field from a batch at a pre-resolved column index, byte-identical
+/// to the row-based `Event.fields.get(name)` used by [`extract_key_simple`].
+fn column_scalar(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<Value> {
+    let col = batch.column(col_idx);
+    if col.is_null(row) {
+        return None;
+    }
+    extract_field_value(batch.schema().field(col_idx), col.as_ref(), row)
+}
+
+/// Extract the match-key fields of `row` from the batch at pre-resolved column
+/// indices — the columnar twin of [`extract_key_simple`](crate::match_engine::extract_key_simple)
+/// over a `&Event`. Returns `None` iff any key column is null / missing (row
+/// lands shard 0, same as the row-based `fields.get()?`).
+///
+/// Each returned `Value` is produced by the exact same `extract_field_value`
+/// the row-based path uses, so the two agree per-field byte-for-byte (including
+/// Int64→f64 round-trip / Timestamp / Utf8 / structured-JSON / null lanes).
+fn extract_key_columnar(batch: &RecordBatch, col_idx: &[usize], row: usize) -> Option<Vec<Value>> {
+    let mut scope_key = Vec::with_capacity(col_idx.len());
+    for &ci in col_idx {
+        scope_key.push(column_scalar(batch, ci, row)?);
+    }
+    Some(scope_key)
+}
+
+/// Partition a batch's rows by the match key into per-shard row-index subsets,
+/// so a sharded rule can be fed the raw batch + a row subset (zero per-event
+/// materialization) instead of a fully materialized `Vec<Arc<Event>>`.
+///
+/// Byte-identical partition to the row-based [`sharded_sends`]: same
+/// `extract_field_value` value, same `make_scope_key_str` → FNV `shard_index`.
+/// A row whose key column is missing / null/ absent from the schema lands on
+/// shard 0, exactly like the row-based missing-key `unwrap_or(0)`.
+/// Returns `None` when a key field is absent from the whole schema (then every
+/// row is missing → all shard 0).
+fn partition_rows_by_key(
+    batch: &RecordBatch,
+    keys: &[FieldRef],
+    shard_count: usize,
+) -> Option<Vec<Vec<u32>>> {
+    // Resolve each key field to its batch column index once (schema immutable).
+    let col_idx: Vec<usize> = keys
+        .iter()
+        .map(field_ref_name)
+        .map(|name| batch.schema().index_of(name).ok())
+        .collect::<Option<_>>()?;
+    let mut per: Vec<Vec<u32>> = (0..shard_count).map(|_| Vec::new()).collect();
+    for row in 0..batch.num_rows() {
+        // Missing key (any key column null/absent) → shard 0, same as the
+        // row-based `extract_key_simple(...).unwrap_or(0)`.
+        let idx = extract_key_columnar(batch, &col_idx, row)
+            .map(|scope_key| shard_index(&scope_key, shard_count))
+            .unwrap_or(0);
+        per[idx].push(row as u32);
+    }
+    Some(per)
+}
+
 /// Partition a batch by match key and push one send future per non-empty
 /// shard into `sends`. Awaits full shard channels via the caller's join
 /// (backpressure).
@@ -380,6 +467,7 @@ fn sharded_sends(
             events: Some(Arc::new(sub)),
             batch: None,
             materialize_fields: None,
+            shard_rows: None,
             seq,
         };
         let tx = shards[i].clone();
@@ -697,5 +785,122 @@ mod tests {
             1,
             "fast shard got its sub-batch"
         );
+    }
+
+    #[test]
+    fn partition_rows_matches_row_based_per_row() {
+        // 列式分片（partition_rows_by_key，从 batch 列读 key）必须与行式分片
+        // （batch_to_events + extract_key_simple + shard_index）逐行落在同一
+        // shard —— Q2 键闭包 + 有状态安全的基础。含 null / UTF8 / 多行 key。
+        use crate::match_engine::batch_to_events;
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use wf_lang::ast::FieldRef;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                Some("k1"),
+                Some("k2"),
+                None, // null key → both should land shard 0
+                Some("k3"),
+                Some("k1"),
+            ])) as ArrayRef],
+        )
+        .unwrap();
+
+        let keys = vec![FieldRef::Simple("id".into())];
+        let shards = 3usize;
+
+        // 列式：每行 → shard
+        let per = partition_rows_by_key(&batch, &keys, shards).expect("key col present");
+        let col_shard = |row: usize| -> usize {
+            per.iter()
+                .position(|rows| rows.contains(&(row as u32)))
+                .unwrap()
+        };
+
+        // 行式：每行物化 Event → extract_key_simple → shard_index
+        let events = batch_to_events(&batch);
+        let row_shard = |row: usize| -> usize {
+            extract_key_simple(&events[row], &keys)
+                .map(|sk| shard_index(&sk, shards))
+                .unwrap_or(0)
+        };
+
+        assert_eq!(batch.num_rows(), 5);
+        for row in 0..batch.num_rows() {
+            assert_eq!(
+                col_shard(row),
+                row_shard(row),
+                "row {row} landed on different shard (columnar vs row-based)"
+            );
+        }
+
+        // 无丢失、无重复：并集覆盖全部 5 行
+        let flat: Vec<u32> = per.iter().flatten().copied().collect();
+        let mut flat = flat;
+        flat.sort_unstable();
+        assert_eq!(flat, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn extract_key_columnar_matches_row_based() {
+        // 2b 对拍：`extract_key_columnar`（从列读 key）必须与行式
+        // `extract_key_simple`（Event.fields.get）逐行返回同一个 `Vec<Value>`——
+        // 覆盖 Utf8、null（→ shard 0）、Int64 <2^53 与 >2^53（f64 往返）、
+        // 多列 key。
+        use crate::match_engine::batch_to_events;
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use wf_lang::ast::FieldRef;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+        ]));
+        // Int64 值含 <2^53、>2^53（f64 往返丢精度 lane）、null。
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("k1"),
+                    Some("k2"),
+                    None,
+                    Some("k3"),
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![
+                    Some(7),
+                    Some(9007199254740993), // 2^53+1
+                    Some(-3),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let keys = vec![FieldRef::Simple("id".into()), FieldRef::Simple("n".into())];
+        let col_idx: Vec<usize> = keys
+            .iter()
+            .map(field_ref_name)
+            .map(|name| batch.schema().index_of(name).unwrap())
+            .collect();
+        let events = batch_to_events(&batch);
+
+        assert_eq!(batch.num_rows(), 4);
+        for row in 0..batch.num_rows() {
+            let col = extract_key_columnar(&batch, &col_idx, row);
+            let rw = extract_key_simple(&events[row], &keys);
+            assert_eq!(
+                col,
+                rw,
+                "row {row}: columnar key {} != row-based key {:?}",
+                format!("{:?}", col),
+                rw
+            );
+        }
     }
 }

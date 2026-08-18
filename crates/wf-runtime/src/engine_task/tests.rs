@@ -2150,6 +2150,7 @@ async fn push_triggers_alert() {
         )),
         batch: None,
         materialize_fields: None,
+        shard_rows: None,
         seq: u64::MAX,
     };
     task.process_push(push).await;
@@ -2212,6 +2213,7 @@ async fn columnar_bind_filter_matches_interpreted_path() {
         events: Some(Arc::clone(&events)),
         batch: Some(Arc::new(batch.clone())),
         materialize_fields: None,
+        shard_rows: None,
         seq: u64::MAX,
     })
     .await;
@@ -2225,6 +2227,7 @@ async fn columnar_bind_filter_matches_interpreted_path() {
             events: Some(events),
             batch: None,
             materialize_fields: None,
+            shard_rows: None,
             seq: u64::MAX,
         })
         .await;
@@ -2265,6 +2268,7 @@ async fn columnar_branch_guard_matches_interpreted_path() {
         events: Some(Arc::clone(&events)),
         batch: Some(Arc::new(batch.clone())),
         materialize_fields: None,
+        shard_rows: None,
         seq: u64::MAX,
     })
     .await;
@@ -2278,6 +2282,7 @@ async fn columnar_branch_guard_matches_interpreted_path() {
             events: Some(events),
             batch: None,
             materialize_fields: None,
+            shard_rows: None,
             seq: u64::MAX,
         })
         .await;
@@ -2310,6 +2315,7 @@ async fn deferred_materialization_matches_eager_path() {
         events: None,
         batch: Some(Arc::new(batch.clone())),
         materialize_fields: None,
+        shard_rows: None,
         seq: u64::MAX,
     })
     .await;
@@ -2329,6 +2335,7 @@ async fn deferred_materialization_matches_eager_path() {
             events: Some(events),
             batch: None,
             materialize_fields: None,
+            shard_rows: None,
             seq: u64::MAX,
         })
         .await;
@@ -2374,6 +2381,7 @@ async fn deferred_materialization_scans_every_row_for_intra_batch_expiry() {
         events: None,
         batch: Some(Arc::new(batch.clone())),
         materialize_fields: None,
+        shard_rows: None,
         seq: u64::MAX,
     })
     .await;
@@ -2393,6 +2401,7 @@ async fn deferred_materialization_scans_every_row_for_intra_batch_expiry() {
             events: Some(events),
             batch: None,
             materialize_fields: None,
+            shard_rows: None,
             seq: u64::MAX,
         })
         .await;
@@ -2438,6 +2447,7 @@ async fn deferred_materialization_preserves_close_emission_for_rejected_rows() {
         events: None,
         batch: Some(Arc::new(batch.clone())),
         materialize_fields: None,
+        shard_rows: None,
         seq: u64::MAX,
     })
     .await;
@@ -2457,6 +2467,7 @@ async fn deferred_materialization_preserves_close_emission_for_rejected_rows() {
             events: Some(events),
             batch: None,
             materialize_fields: None,
+            shard_rows: None,
             seq: u64::MAX,
         })
         .await;
@@ -2495,6 +2506,7 @@ async fn sharded_rule_produces_same_alerts_as_single_worker() {
             events: Some(Arc::clone(&events)),
             batch: None,
             materialize_fields: None,
+            shard_rows: None,
             seq: u64::MAX,
         })
         .await;
@@ -3520,6 +3532,7 @@ async fn conv_sink_process_batch_barrier_tracks_event_time() {
         )),
         batch: None,
         materialize_fields: None,
+        shard_rows: None,
         seq: u64::MAX,
     };
     task.process_push(push).await;
@@ -3552,6 +3565,7 @@ async fn conv_sink_scan_timeouts_advances_barrier_by_wall_clock() {
         )),
         batch: None,
         materialize_fields: None,
+        shard_rows: None,
         seq: u64::MAX,
     };
     task.process_push(push).await;
@@ -3955,6 +3969,7 @@ async fn conv_sink_sends_one_batch_per_process_batch() {
         )),
         batch: None,
         materialize_fields: None,
+        shard_rows: None,
         seq: u64::MAX,
     };
     task.process_push(push).await;

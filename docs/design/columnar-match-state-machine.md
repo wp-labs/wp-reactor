@@ -6,6 +6,12 @@
 > 本文把「sharded match（Q2）免物化」落到可实施：**类型、签名、分片算法、接线、
 > 测试矩阵**，让代码能照着写。
 
+> ## 实现状态（2026-08-19 更新）
+>
+> P2（§6 全部管道）已实现并验证：**代码 ✅ · 2b 对拍 ✅ · 完整回归 ✅**。
+> 唯一未实现的是「EPS 逼近 receive-only 上限 ~90M」（撞上第二道墙，见 §9 注）。
+> 详见最后的「附录：实现状态与实测」。
+
 ## 0. 背景与缺口（一句话）
 
 `columnar-execution-progress.md` L165：懒物化的 `broadcast_batch_only` **排除 sharded
@@ -267,23 +273,35 @@ let rows_iter: Box<dyn Iterator<Item = usize>> = match shard_rows {
 
 ## 8. 测试矩阵（逐字节锁定）
 
-| 测试 | 断言 |
-|---|---|
-| `partition_rows_by_key` vs 行式 `sharded_sends` 分片 | 同 batch，两个函数对每一行落在**同一 shard**（Q2 `<auction:10m>` 键闭包 + 有状态安全） |
-| `extract_key_columnar` vs `extract_key_simple` | 对同一批所有行，逐行返回同 `Vec<Value>`（含 null/缺失/2^53/Utf8 lane） |
-| 端到端 Q2：懒物化 sharded | EPS 逼近 receive-only 上限（双峰相位配对，见 progress M2a），EMIT `q2_mod_123`=747816 精确（=0.8129%×100M），`[clean]`，窗口 append 100M/100M（ingress 全量口径，勿与 EMIT 混淆） |
-| 行式 sharded 回退 | 非 columnar sharded 规则走物化，结果与改造前逐位一致（回归） |
-| `rule_task` 只扫 shard_rows | 每 shard 收到的是本 shard 行子集，总 and += 全批；不丢行、不重复 |
+> ✅ = 已实现并验证（2026-08-19）。
+
+| 测试 | 断言 | 状态 |
+|---|---|---|
+| `partition_rows_by_key` vs 行式 `sharded_sends` 分片 | 同 batch，两个函数对每一行落在**同一 shard**（Q2 `<auction:10m>` 键闭包 + 有状态安全） | ✅ `partition_rows_matches_row_based_per_row` |
+| `extract_key_columnar` vs `extract_key_simple` | 对同一批所有行，逐行返回同 `Vec<Value>`（含 null/缺失/2^53/Utf8 lane） | ✅ `extract_key_columnar_matches_row_based` |
+| 端到端 Q2：懒物化 sharded | EMIT `q2_mod_123`=747816 精确（=0.8129%×100M）、`[clean]`、窗口 append 100M/100M | ✅ EMIT 精确 + clean |
+| 端到端 Q2 EPS 逼近 receive-only 上限（~90M） | 双峰相位配对（见 progress M2a） | ❌ **17.65M（受第二道墙限制，见 §9 注）** |
+| 行式 sharded 回退 | 非 columnar sharded 规则走物化，结果与改造前逐位一致（回归） | ⚠️ 未单测（非 columnar sharded 未构造用例；列式路径已对拍） |
+| `rule_task` 只扫 shard_rows | 每 shard 收到的是本 shard 行子集，总 and += 全批；不丢行、不重复 | ✅ 分片对拍 + Q2 EMIT 精确间接锁定 |
 
 ## 9. 验收顺序（方向既定，直接做）
 
-1. **本次代码**（§6 全部管道）：`RulePush.shard_rows` + `partition_rows_by_key` +
-   `broadcast_inner` sharded 列式分支 + `route_parse` 放宽 defer + `rule_task` 扫 shard_rows
-   （`process_batch` 签名加 `shard_rows`）。
-2. **对拍**：分片一致性 + extract_key 一致性（§8 前两行）。
-3. **端到端 Q2**：EPS 目标逼近 receive-only 上限（~90M 参照，双峰相位配对）、EMIT 精确、`[clean]`。
-4. 回归 Q1/Q2/Q3/Q5/Q7/Q9 + seq。
-5. （可选 P3）`FieldView` + 命中行免物化 + guard 整列 kernel（vectorized 走完）。
+1. **本次代码**（§6 全部管道）：✅ 完成
+2. **对拍**：分片一致性 + extract_key 一致性（§8 前两行）：✅ 完成
+3. **端到端 Q2**：EPS 目标逼近 receive-only 上限（~90M）、EMIT 精确、`[clean]`：
+   ⚠️ **部分**——EMIT 精确 + `[clean]` ✅，但 **EPS 只有 17.65M（= receive 上限 ~20%）**，
+   **未能逼近 90M**。
+4. 回归 Q1/Q2/Q3/Q5/Q7/Q9 + seq：✅ 完成（全 `[clean]`，见附录实测表）
+5. （可选 P3）`FieldView` + 命中行免物化 + guard 整列 kernel：未做（可选）
+
+> **§9.3 注：为什么 EPS 只有 17.65M（不是 ~90M）**
+>
+> 免物化拆掉了第一道墙（parse 侧全量 `batch_to_events`），Q2 从 ~8M → 17.65M。
+> 但**还有第二道墙**：`columnar-execution-progress.md` Step 8 / §5.2 早已记录
+> 「Q2 的 EPS 门是**窗口 actor 单写者（P0-③）**」。窗口 actor 单写者按序
+> append/broadcast，是 sharded match 无法用「Q1 旁路窗口 actor」方式拆掉的
+> （Q1 无状态可旁路，Q2 有状态必须保序）。**要继续提 Q2，下一步是拆窗口 actor
+> 单写者这一道墙**，而非 rule 侧。
 
 ## 10. 风险
 
@@ -293,3 +311,49 @@ let rows_iter: Box<dyn Iterator<Item = usize>> = match shard_rows {
   零拷贝，但需确认 `Arc<RecordBatch>` 生命周期（TimedBatch 已持 batch，Arc 不复制列）。
 - **低**：命中行 `materialize_rows_filtered` 仍是物化（0.81%），但相对全批省 99%，
   已是本步收益主体；P3 再消这 0.81%。
+
+---
+
+## 附录：实现状态与实测（2026-08-19）
+
+### 代码改动（P2 全部管道，与 §6 设计一致）
+
+| 文件 | 改动 |
+|---|---|
+| `wf-engine/src/window/fanout.rs` | `RulePush.shard_rows`；新增 `column_scalar` / `extract_key_columnar` / `partition_rows_by_key`；`broadcast_inner` Sharded 分支「二者择一」（events=Some 行式分片 / events=None 列式 batch+shard_rows，共享 `batch_arc`） |
+| `wf-engine/src/window/router.rs` | `route_parse` 删 `&& !has_sharded_subscribers` 合取项（sharded 也能 defer，仅此一处改动，未新增 `columnar_match_safe`） |
+| `wf-engine/src/match_engine/mod.rs` | `pub(crate)` re-export `field_ref_name` |
+| `wf-runtime/src/engine_task/rule_task.rs` | `process_batch` 加 `shard_rows: Option<&[u32]>` 形参；defer 块 + 主循环按 `row_domain` 遍历 shard 子集 |
+| `wf-runtime/src/engine_task/tests.rs` | 15 处 `RulePush` 构造补 `shard_rows: None` |
+
+### 对拍（wf-engine 487 全绿）
+
+- `partition_rows_matches_row_based_per_row`：列式 vs 行式分片逐行同 shard（含 null key → shard0）
+- `extract_key_columnar_matches_row_based`：逐行同 `Vec<Value>`（Utf8 / null / Int64 <2^53 与 >2^53 f64 往返 lane）
+
+### 完整回归（nexmark_pk 100m，全 `[clean]`、window append 100M/100M）
+
+| 查询 | EPS | 说明 |
+|---|---|---|
+| Q1 | 11.36M | on-each，无回归 |
+| Q2 | **17.65M** | 免物化 sharded，较旧 ~8M **+120%**；EMIT 747816 精确 |
+| Q3 | 18.47M | join，无回归 |
+| Q5 | 3.71M | count 状态，无回归 |
+| Q7 | 3.53M | 窗口 MAX 状态，无回归 |
+| Q9 | 20.08M | join，无回归 |
+| seq（单测） | 28 过 | 状态机无副作用 |
+
+### 遗留（未到设计目标的项）
+
+1. **Q2 EPS 17.65M，未到 ~90M**：第二道墙「窗口 actor 单写者（P0-③）」——
+   `columnar-execution-progress.md` Step 8 已记录。免物化只拆了第一道墙（物化）；
+   继续需拆窗口 actor 单写者（Q2 有状态不能像 Q1 那样旁路）。
+2. **行式 sharded 回退未单测**：非 columnar sharded 规则走物化的用例未构造
+   （列式路径已有分片对拍覆盖）。
+3. **P3（FieldView / 命中行免物化 / guard 整列 kernel）未做**（设计标注为可选）。
+
+### 实现过程中修复的既有 bug
+
+- `process_batch` 主循环原用 `batch.num_rows()` 定界，relay/Eager push（events=Some, batch=None）
+  误得 0 行 → 主循环空转 → `downstream_close_*` 测试 hang。
+  改为事件优先（`events.len()`，其次 `batch.num_rows()`），2 个 hang 测试恢复通过。

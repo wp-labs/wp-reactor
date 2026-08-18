@@ -392,7 +392,7 @@ impl RuleTask {
         for (window_name, first_batch_seq, events_list) in pending {
             for (batch_index, events) in events_list.iter().enumerate() {
                 let batch_seq = first_batch_seq + batch_index as u64;
-                self.process_batch(&window_name, batch_seq, Some(events), None, None)
+                self.process_batch(&window_name, batch_seq, Some(events), None, None, None)
                     .await;
                 // Ack consumption so time eviction may reclaim this batch.
                 if let Some(slot) = self.progress.get(&window_name) {
@@ -414,6 +414,7 @@ impl RuleTask {
         batch_seq: u64,
         events: Option<&Arc<Vec<Arc<Event>>>>,
         batch: Option<&RecordBatch>,
+        shard_rows: Option<&[u32]>,
         materialize_fields: Option<&HashSet<String>>,
     ) {
         let Some(aliases) = self.aliases.get(window_name) else {
@@ -468,50 +469,78 @@ impl RuleTask {
             && batch.is_some()
             && self.executor.each_plan_columnar_safe();
 
+        // Row domain: a **sharded** deferred push only owns the rows partitioned
+        // to this shard (`shard_rows`); an unsharded push scans the whole batch.
+        // Both the lazy-materialization scan and the main state-machine loop
+        // iterate this domain. `DeferredRows` always uses **absolute** batch-row
+        // indices (times / hit_indices), so all downstream consumers are
+        // unchanged; shard-external rows are simply never iterated here.
+        // Row count for the unsharded domain: relay / eager pushes carry
+        // materialized `events` (batch is None) so their count comes from the
+        // events; deferred pushes carry the raw batch.
+        let num_rows = events
+            .map(|e| e.len())
+            .unwrap_or_else(|| batch.map(|b| b.num_rows()).unwrap_or(0));
+        let row_domain: Vec<usize> = match shard_rows {
+            Some(rows) => rows.iter().map(|&r| r as usize).collect(),
+            None => (0..num_rows).collect(),
+        };
+
         let deferred: Option<DeferredRows> = if defer_materialize {
             let batch = batch.expect("deferral requires the raw batch");
-            let num_rows = batch.num_rows();
             let time_field = self.machine.as_ref().and_then(|m| m.time_field());
             // Scan needs the event time for every row (watermark/expiry); read
             // it straight from the time column with the same f64 round-trip the
             // eager path uses (`extract_event_time`). Resolve the column once,
-            // then read per row.
+            // then read per row over `row_domain` (whole batch for unsharded,
+            // this shard's subset for sharded).
+            //
+            // `times` / `hit` / `hit_indices` are all **row-domain-relative**
+            // (length == `row_domain.len()`; slot i covers `row_domain[i]`), so
+            // a sharded push allocates only its own shard's rows — not the whole
+            // batch. Absolute batch rows are recovered from `row_domain` at the
+            // point they are needed (materialization, hit matching below).
             let time_col_index = batch_time_col_index(batch, time_field);
-            let times: Vec<i64> = match time_col_index {
-                Some(col_idx) => (0..num_rows)
-                    .map(|row| batch_event_time_nanos_at(batch, col_idx, row))
-                    .collect(),
-                None => vec![0; num_rows],
-            };
+            let mut times = vec![0; row_domain.len()];
+            if let Some(col_idx) = time_col_index {
+                for (i, &row) in row_domain.iter().enumerate() {
+                    times[i] = batch_event_time_nanos_at(batch, col_idx, row);
+                }
+            }
             // Hit = any alias's columnar bind filter accepts this row. The
             // window-level defer flag guarantees every alias here is columnar;
             // a missing mask is a defensive fallback that materializes all rows.
-            let mut hit = vec![false; num_rows];
+            let mut hit = vec![false; row_domain.len()];
             for alias in aliases.iter() {
                 match columnar_masks.get(alias) {
                     Some(Some(mask)) => {
-                        for row in 0..num_rows {
-                            hit[row] |= mask.value(row);
+                        for (i, &row) in row_domain.iter().enumerate() {
+                            hit[i] |= mask.value(row);
                         }
                     }
                     _ => {
-                        for row in 0..num_rows {
-                            hit[row] = true;
+                        for h in hit.iter_mut() {
+                            *h = true;
                         }
                     }
                 }
             }
-            let hit_indices: Vec<u32> = (0..num_rows)
-                .filter(|&row| hit[row])
-                .map(|row| row as u32)
+            // Row-domain-relative hit positions.
+            let hit_indices: Vec<u32> = (0..row_domain.len())
+                .filter(|&i| hit[i])
+                .map(|i| i as u32)
                 .collect();
             let hit_events: Vec<Arc<Event>> = if columnar_each {
                 // The columnar fast path reads columns directly — materializing
-                // all hit rows (Q1: 100% of rows) into HashMap Events is the
-                // cost this path exists to avoid.
+                // all hit rows into HashMap Events is the cost this path avoids.
                 Vec::new()
             } else {
-                materialize_rows(batch, &hit_indices)
+                // Materialize the hit rows by their **absolute** batch rows.
+                let abs: Vec<u32> = hit_indices
+                    .iter()
+                    .map(|&i| row_domain[i as usize] as u32)
+                    .collect();
+                materialize_rows(batch, &abs)
                     .into_iter()
                     .map(Arc::new)
                     .collect()
@@ -663,18 +692,14 @@ impl RuleTask {
         // the loop — avoids a per-event bounded(32) channel send on the hot path.
         let mut conv_closes: Vec<wf_engine::match_engine::CloseOutput> = Vec::new();
         let mut conv_max_wm: i64 = 0;
-        // Resolve the row count and a cursor into the deferred hit rows.
-        let num_rows = deferred
-            .as_ref()
-            .map(|d| d.times.len())
-            .unwrap_or_else(|| eager_events.as_ref().map_or(0, |e| e.len()));
         let mut hit_cursor = 0usize;
-        for row_index in 0..num_rows {
+        // Iterate the row domain: `i` is the position within `row_domain`
+        // (matches the row-domain-relative `DeferredRows` times/hit_indices),
+        // `row_index` is the absolute batch row it maps to.
+        for (i, &row_index) in row_domain.iter().enumerate() {
             let event: Option<&Arc<Event>> = match (&deferred, &eager_events) {
                 (Some(d), _) => {
-                    if hit_cursor < d.hit_indices.len()
-                        && d.hit_indices[hit_cursor] as usize == row_index
-                    {
+                    if hit_cursor < d.hit_indices.len() && d.hit_indices[hit_cursor] as usize == i {
                         let event = &d.hit_events[hit_cursor];
                         hit_cursor += 1;
                         Some(event)
@@ -687,7 +712,7 @@ impl RuleTask {
             };
             if let Some(machine) = &mut self.machine {
                 let event_nanos = match (&deferred, event) {
-                    (Some(d), _) => d.times[row_index],
+                    (Some(d), _) => d.times[i],
                     (None, Some(event)) => machine.event_time_nanos(event),
                     (None, None) => {
                         unreachable!("machine rows are always materialized when eager")
@@ -1248,6 +1273,7 @@ impl RuleTask {
             seq,
             push.events.as_ref(),
             push.batch.as_deref(),
+            push.shard_rows.as_deref().map(|rows| rows.as_slice()),
             push.materialize_fields.as_deref(),
         )
         .await;

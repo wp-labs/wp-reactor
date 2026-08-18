@@ -23,4 +23,4 @@ pub use match_engine::{
     SharedLimits, StepData, StepOutcome, StepProgress, StepResult, Value, WindowLookup,
 };
 pub use match_engine::{EngineHashMap, EngineHashSet};
-pub(crate) use match_engine::{extract_key_simple, shard_index};
+pub(crate) use match_engine::{extract_key_simple, field_ref_name, shard_index};

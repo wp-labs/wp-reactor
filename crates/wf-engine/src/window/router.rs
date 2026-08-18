@@ -297,12 +297,14 @@ impl Router {
                 .registry
                 .get_window(&window_name)
                 .expect("subscription references non-existent window");
-            // L2 deferred materialization: every bound rule has a columnar bind
-            // filter, so rule tasks materialize only the rows their filter
-            // accepts (from the raw batch). Leave `events` uninitialized here.
-            if win.defer_materialization()
-                && !self.rule_fanout.has_sharded_subscribers(&window_name)
-            {
+            // L2 deferred materialization: every bound rule is columnar-safe
+            // (`defer_materialization`, pure plan analysis), so the batch is
+            // broadcast raw and each rule task materializes only the rows its
+            // bind filter accepts. Sharded subscriptions were previously
+            // excluded here because the broadcast could not partition a
+            // row-subset; `broadcast_inner` now handles `events=None` sharded
+            // via columnar key partition (see fanout::partition_rows_by_key).
+            if win.defer_materialization() {
                 windows.push(ParsedWindow {
                     events_bytes: 0,
                     window_name,
