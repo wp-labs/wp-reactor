@@ -1,7 +1,7 @@
 # WarpFusion 执行计划
 <!-- 角色：架构师 / 项目管理 | 状态：v2.2 M20 MVP 已完成 | 创建：2026-02-15 | 更新：2026-02-20 -->
 
-> 本文档将 WarpFusion 引擎基建（[warp-fusion.md](warp-fusion.md) P0–P7）与 WFL v2.1 语言实现（[wfl-desion.md](wfl-desion.md) Phase 0–4）统一为主干 30 个里程碑（M01–M30，十个阶段）。  
+> 本文档将 WarpFusion 引擎基建（[warp-fusion.md](warp-fusion.md) P0–P7）与 WFL v2.1 语言实现（[wfl-design.md](wfl-design.md) Phase 0–4）统一为主干 30 个里程碑（M01–M30，十个阶段）。  
 > `wfgen` 的 M31–M33 保留为**支撑轨道**（已完成），用于 `gen -> send -> verify` 质量闭环。
 
 ## 总览
@@ -505,8 +505,8 @@ M20 MVP 已完成，下一步两条路径可并行推进：
 ## 相关文档
 
 - WarpFusion 设计方案 → [warp-fusion.md](warp-fusion.md)
-- WFL v2.1 设计方案 → [wfl-desion.md](wfl-desion.md)
+- WFL v2.1 设计方案 → [wfl-design.md](wfl-design.md)
 - WFL 与主流 DSL 对比分析 → [wfl-dsl-comparison.md](wfl-dsl-comparison.md)
 - 运行时指标与统计设计（评审草案）→ [runtime-metrics-design.md](runtime-metrics-design.md)
 - wfgen 测试数据生成方案 → [wfg-design.md](wfg-design.md)
-- 后续提案（P1/P2） → [wfl-desion.md §17](wfl-desion.md)
+- 后续提案（P1/P2） → [wfl-design.md §17](wfl-design.md)

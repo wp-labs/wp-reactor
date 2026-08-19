@@ -3,7 +3,7 @@
 
 > 本文档对比 WFL（Warp Fusion Language）与 YARA-L 2.0、Elastic EQL、Sigma、Splunk SPL、KQL（Microsoft Sentinel）五种主流关联/检测 DSL 的能力差异，分析 WFL 的设计优势与已知短板。
 >
-> 本文基于 [wfl-desion.md](wfl-desion.md)（2026-02-20，v2.1）的最新设计。
+> 本文基于 [wfl-design.md](wfl-design.md)（2026-02-20，v2.1）的最新设计。
 
 
 ## 1. 能力矩阵
@@ -325,5 +325,5 @@ WFL 的独特定位：**唯一同时提供时序检测、实体建模、可解�
 ## 相关文档
 
 - WarpFusion 设计方案 → [warp-fusion.md](warp-fusion.md)
-- WFL v2.1 设计方案 → [wfl-desion.md](wfl-desion.md)
+- WFL v2.1 设计方案 → [wfl-design.md](wfl-design.md)
 - WarpFusion 执行计划 → [wf-execution-plan.md](wf-execution-plan.md)

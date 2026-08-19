@@ -1226,7 +1226,7 @@ file = "logs/wf-engine.log"                    # 日志文件路径
 
 ### 6.2 关联规则
 
-关联检测规则使用 WFL 语言编写，存储在 `.wfl` 文件中。完整语法和语义模型见 [WFL v2.1 设计方案](wfl-desion.md)，与主流 DSL 的对比分析见 [WFL DSL 对比](wfl-dsl-comparison.md)。
+关联检测规则使用 WFL 语言编写，存储在 `.wfl` 文件中。完整语法和语义模型见 [WFL v2.1 设计方案](wfl-design.md)，与主流 DSL 的对比分析见 [WFL DSL 对比](wfl-dsl-comparison.md)。
 
 WFL 规则中的数据源名称引用 **Window Schema (.wfs) 中定义的 window 名称**，不直接引用 stream tag。这使得同一个 stream 可以以不同方式（不同 mode、不同 over）被多个 window 引用，规则按需选择合适的 window。
 
@@ -1576,7 +1576,7 @@ retry_max_interval = "30s"                        # 最大重试间隔
 
 WFL 语言设计已独立为专属文档，详见：
 
-- **WFL v2.1 设计方案** → [wfl-desion.md](wfl-desion.md)
+- **WFL v2.1 设计方案** → [wfl-design.md](wfl-design.md)
   - 三文件架构（.wfs / .wfl / .toml）
   - v2.1 规则治理（`meta.lang` / `meta.contract_version` / `limits` / `yield@vN`）
   - 固定执行链与语义模型（BIND / SCOPE / JOIN / ENTITY / YIELD / CONV）

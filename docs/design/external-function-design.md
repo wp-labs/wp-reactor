@@ -627,6 +627,6 @@ pub enum Expr {
 
 ## 12. 相关文档
 
-- WFL v2.1 设计方案 → [wfl-desion.md](wfl-desion.md)
+- WFL v2.1 设计方案 → [wfl-design.md](wfl-design.md)
 - WarpFusion 设计方案 → [warp-fusion.md](warp-fusion.md)
 - weak_password 示例 → `warp-fusion/examples/weak_password/README.md`
