@@ -10,6 +10,7 @@ mod keymap;
 mod limits;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use wf_lang::ast::{CloseMode, Expr, FieldRef, JoinMode};
@@ -17,9 +18,9 @@ use wf_lang::plan::{
     ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, RateSpec, WindowSpec,
 };
 
-use crate::match_engine::RuleExecutor;
+use crate::match_engine::{JoinRow, RuleExecutor};
 use crate::match_engine::match_engine::{
-    CepStateMachine, CloseReason, EngineHashMap, MatchedContext, SharedLimits, StepData,
+    CepStateMachine, CloseReason, EngineHashMap, Event, MatchedContext, SharedLimits, StepData,
     StepResult, Value, WindowLookup,
 };
 
@@ -70,13 +71,29 @@ impl WindowLookup for MockWindowLookup {
             .cloned()
     }
 
-    fn snapshot(&self, window: &str) -> Option<Vec<HashMap<String, Value>>> {
-        self.snapshots.get(window).cloned()
+    fn snapshot(&self, window: &str) -> Option<Vec<JoinRow>> {
+        self.snapshots.get(window).map(|rows| {
+            rows.iter()
+                .cloned()
+                .map(map_row_to_join_row)
+                .collect()
+        })
     }
 
-    fn snapshot_with_timestamps(&self, window: &str) -> Option<Vec<(i64, HashMap<String, Value>)>> {
-        self.timestamped_snapshots.get(window).cloned()
+    fn snapshot_with_timestamps(&self, window: &str) -> Option<Vec<(i64, JoinRow)>> {
+        self.timestamped_snapshots.get(window).map(|rows| {
+            rows.iter()
+                .map(|(ts, row)| (*ts, map_row_to_join_row(row.clone())))
+                .collect()
+        })
     }
+}
+
+/// Wrap a `HashMap<String, Value>` row as a materialized [`JoinRow::Event`].
+fn map_row_to_join_row(row: HashMap<String, Value>) -> JoinRow {
+    JoinRow::Event(Arc::new(Event {
+        fields: row.into_iter().map(|(k, v)| (k.into(), v)).collect(),
+    }))
 }
 
 // ---------------------------------------------------------------------------

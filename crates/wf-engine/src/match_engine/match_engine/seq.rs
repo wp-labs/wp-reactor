@@ -11,7 +11,7 @@ use wf_lang::plan::{BranchPlan, MatchPlan, SeqStepPlan};
 
 use super::eval::eval_expr_ext;
 use super::state::Instance;
-use super::types::{Event, Value, WindowLookup};
+use super::types::{FieldSource, Value, WindowLookup};
 use crate::match_engine::columnar::GuardMasks;
 
 /// A negation step: the event must NOT match within its window.
@@ -64,11 +64,13 @@ impl SeqRuntime {
 
 /// Scan an incoming event against negation steps. When the event matches a neg
 /// step's source within its window, mark the instance as violated.
-pub(super) fn scan_negations(
+// Hot per-row path; flat args keep it allocation-free on the neg scan loop.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scan_negations<E: FieldSource>(
     meta: &SeqRuntime,
     instance: &mut Instance,
     alias: &str,
-    event: &Event,
+    event: &E,
     now_nanos: i64,
     windows: Option<&dyn WindowLookup>,
     row: usize,

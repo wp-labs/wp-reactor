@@ -279,7 +279,7 @@ impl AlertColumnBuilder {
             return Err(e);
         }
 
-        /// Infallible column pushes (system fields, then yield cells).
+        // Infallible column pushes (system fields, then yield cells).
         self.wfx_id.push(record.wfx_id.clone());
         self.rule_name.push(Arc::clone(&record.rule_name));
         self.score.push(record.score);
@@ -657,17 +657,17 @@ impl AlertColumnBuilder {
         self.fired_at.extend_from_slice(fired_at);
         // Plan-constant columns: same `Arc` every row.
         self.rule_name
-            .extend(std::iter::repeat(Arc::clone(rule_name)).take(n));
+            .extend(std::iter::repeat_n(Arc::clone(rule_name), n));
         self.entity_type
-            .extend(std::iter::repeat(Arc::clone(entity_type)).take(n));
+            .extend(std::iter::repeat_n(Arc::clone(entity_type), n));
         self.origin
-            .extend(std::iter::repeat(Arc::clone(origin)).take(n));
+            .extend(std::iter::repeat_n(Arc::clone(origin), n));
         self.close_reason
-            .extend(std::iter::repeat(Arc::clone(close_reason)).take(n));
+            .extend(std::iter::repeat_n(Arc::clone(close_reason), n));
         self.emit_time
-            .extend(std::iter::repeat(Arc::clone(emit_time)).take(n));
+            .extend(std::iter::repeat_n(Arc::clone(emit_time), n));
         self.summary
-            .extend(std::iter::repeat(Arc::clone(summary)).take(n));
+            .extend(std::iter::repeat_n(Arc::clone(summary), n));
         // Yield cells, interleaved with per-row gap fills. `fill_row_gaps`
         // (per-row path) pushes one fill cell for every column that received no
         // staged cell that row — so a field that is present in rows {0, 2} but
@@ -910,7 +910,7 @@ mod tests {
         via_row
             .register_yield_column(&Arc::from("idle"), None)
             .unwrap();
-        for i in 0..n {
+        for (i, price_present) in price_present.iter().enumerate() {
             via_row.begin_row();
             via_row
                 .stage_yield_cell(
@@ -919,7 +919,7 @@ mod tests {
                     &Value::Number((1000 + i) as f64),
                 )
                 .unwrap();
-            if price_present[i] {
+            if *price_present {
                 via_row
                     .stage_yield_cell(
                         &Arc::from("price"),
@@ -978,10 +978,10 @@ mod tests {
         let eids: Vec<String> = (0..n).map(|i| format!("10.0.0.{}", i + 1)).collect();
         let fats: Vec<String> = (0..n).map(|i| format!("ts{i}")).collect();
         let mut staged_rows = Vec::with_capacity(n);
-        for i in 0..n {
+        for (i, price_present) in price_present.iter().enumerate() {
             let a = export_yield_value(&Value::Number((1000 + i) as f64), Some(&ft_float)).unwrap();
             let mut row_cells = vec![(auction_col, a.0, a.1)];
-            if price_present[i] {
+            if *price_present {
                 let p = export_yield_value(&Value::Number(9.5 + i as f64 * 10.0), Some(&ft_float))
                     .unwrap();
                 row_cells.push((price_col, p.0, p.1));

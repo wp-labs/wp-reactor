@@ -12,7 +12,7 @@ use wf_lang::{BaseType, FieldType};
 
 use crate::alert::AlertColumnBuilder;
 use crate::match_engine::match_engine::WindowLookup;
-use crate::match_engine::{Event, RuleExecutor, Value};
+use crate::match_engine::{Event, RuleExecutor};
 
 use super::super::helpers::*;
 
@@ -27,13 +27,13 @@ impl WindowLookup for EmptyLookup {
     ) -> Option<std::collections::HashSet<String>> {
         None
     }
-    fn snapshot(&self, _window: &str) -> Option<Vec<HashMap<String, Value>>> {
+    fn snapshot(&self, _window: &str) -> Option<Vec<crate::match_engine::JoinRow>> {
         None
     }
     fn snapshot_with_timestamps(
         &self,
         _window: &str,
-    ) -> Option<Vec<(i64, HashMap<String, Value>)>> {
+    ) -> Option<Vec<(i64, crate::match_engine::JoinRow)>> {
         None
     }
 }

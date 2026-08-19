@@ -2,8 +2,8 @@ use std::cell::Cell;
 
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::match_engine::{
-    EngineHashMap, Event, Value, WindowLookup, eval_expr, eval_expr_ext, eval_field_value,
-    value_to_string, values_equal,
+    EngineHashMap, Event, FieldSource, Value, WindowLookup, eval_expr, eval_expr_ext,
+    eval_field_value, value_to_string, values_equal,
 };
 
 mod builtins;
@@ -145,7 +145,7 @@ pub(super) fn eval_bool_expr(expr: &wf_lang::ast::Expr, ctx: &Event) -> Option<b
 
 pub(super) fn eval_bool_expr_with_lookup(
     expr: &wf_lang::ast::Expr,
-    ctx: &Event,
+    ctx: &dyn FieldSource,
     windows: Option<&dyn WindowLookup>,
 ) -> Option<bool> {
     let mut baselines = EngineHashMap::default();

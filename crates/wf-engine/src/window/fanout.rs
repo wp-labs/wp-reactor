@@ -554,7 +554,7 @@ fn sharded_sends(
     let mut sub_batches: Vec<Vec<Arc<Event>>> = (0..n).map(|_| Vec::new()).collect();
     for event in events.iter() {
         // Missing key → shard 0; the rule's state machine skips it anyway.
-        let idx = extract_key_simple(event, keys)
+        let idx = extract_key_simple(event.as_ref(), keys)
             .map(|scope_key| scope_key_shard_index(&scope_key_from_values(&scope_key), n))
             .unwrap_or(0);
         sub_batches[idx].push(Arc::clone(event));
@@ -1075,9 +1075,9 @@ mod tests {
 
         assert_eq!(batch.num_rows(), 4);
         // 2^53+1 是唯一的分歧 lane（行式 f64 丢精度），其余必须逐行相等。
-        for row in 0..batch.num_rows() {
+        for (row, event) in events.iter().enumerate() {
             let col = scope_key_columnar(&batch, &col_idx, row);
-            let rw = extract_key_simple(&events[row], &keys).map(|sk| scope_key_from_values(&sk));
+            let rw = extract_key_simple(event, &keys).map(|sk| scope_key_from_values(&sk));
             if row == 1 {
                 // >2^53：列式 Int(2^53+1) vs 行式 f64 舍入 → 分歧（已知语义）。
                 assert!(
@@ -1131,7 +1131,7 @@ mod tests {
             .broadcast_batch_only("win_a", &batch, None, None, 0)
             .await;
 
-        let mut drain = |rx0: &mut mpsc::Receiver<RulePush>, rx1: &mut mpsc::Receiver<RulePush>| {
+        let drain = |rx0: &mut mpsc::Receiver<RulePush>, rx1: &mut mpsc::Receiver<RulePush>| {
             let mut seen: Vec<u32> = Vec::new();
             let mut pushed = 0;
             for rx in [rx0, rx1] {
@@ -1150,7 +1150,7 @@ mod tests {
                 }
             }
             // 非空 shard 各收到一个 push；k3 若单独一个 shard 也各一个。
-            assert!(pushed >= 1 && pushed <= 2);
+            assert!((1..=2).contains(&pushed));
             // 并集 = 全批 4 行，无重复。
             seen.sort_unstable();
             assert_eq!(seen, vec![0, 1, 2, 3]);

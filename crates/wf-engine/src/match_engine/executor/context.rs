@@ -6,6 +6,7 @@ use wf_lang::plan::{JoinCondPlan, JoinPlan, StepPlan};
 use crate::match_engine::match_engine::{
     BindData, EngineHashMap, Event, StepData, Value, WindowLookup, field_ref_name, values_equal,
 };
+use crate::match_engine::JoinRow;
 
 /// Build a synthetic [`Event`] from match context for expression evaluation.
 ///
@@ -164,11 +165,16 @@ pub(super) fn execute_joins(
             continue;
         };
 
-        for (field_name, value) in &row {
+        // Materialize the matched row's fields into the eval context — only the
+        // matched row, on demand (JoinRow reads straight from the columns).
+        for field_name in row.field_names() {
+            let Some(value) = row.field_value(field_name) else {
+                continue;
+            };
             let qualified = format!("{}.{}", join.right_window, field_name);
             ctx.fields.insert(qualified.into(), value.clone());
             ctx.fields
-                .entry(field_name.clone().into())
+                .entry(field_name.to_string().into())
                 .or_insert_with(|| value.clone());
         }
     }
@@ -187,10 +193,10 @@ fn first_join_key(ctx: &Event, conds: &[JoinCondPlan]) -> Option<(String, Value)
 
 /// Find the first row matching all join conditions.
 fn find_matching_row(
-    rows: &[std::collections::HashMap<String, Value>],
+    rows: &[JoinRow],
     conds: &[JoinCondPlan],
     ctx: &Event,
-) -> Option<std::collections::HashMap<String, Value>> {
+) -> Option<JoinRow> {
     rows.iter()
         .find(|row| row_matches_conds(row, conds, ctx))
         .cloned()
@@ -199,12 +205,12 @@ fn find_matching_row(
 /// Find the latest row that matches all conditions AND has timestamp <= event_time.
 /// If `within` is specified, also require timestamp >= event_time - within.
 fn find_asof_row(
-    rows: &[(i64, std::collections::HashMap<String, Value>)],
+    rows: &[(i64, JoinRow)],
     conds: &[JoinCondPlan],
     ctx: &Event,
     event_time_nanos: i64,
     within: Option<&Duration>,
-) -> Option<std::collections::HashMap<String, Value>> {
+) -> Option<JoinRow> {
     let min_ts = within
         .map(|d| {
             let nanos = i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
@@ -220,16 +226,12 @@ fn find_asof_row(
 }
 
 /// Check whether a row satisfies all join conditions against the current context.
-fn row_matches_conds(
-    row: &std::collections::HashMap<String, Value>,
-    conds: &[JoinCondPlan],
-    ctx: &Event,
-) -> bool {
+fn row_matches_conds(row: &JoinRow, conds: &[JoinCondPlan], ctx: &Event) -> bool {
     conds.iter().all(|cond| {
         let left_name = field_ref_name(&cond.left);
         let right_name = field_ref_name(&cond.right);
-        match (ctx.fields.get(left_name), row.get(right_name)) {
-            (Some(lv), Some(rv)) => values_equal(lv, rv),
+        match (ctx.fields.get(left_name), row.field_value(right_name)) {
+            (Some(lv), Some(rv)) => values_equal(lv, &rv),
             _ => false,
         }
     })
@@ -266,5 +268,108 @@ mod tests {
         );
         assert_eq!(event.fields.get("user"), Some(&Value::Str("root".into())));
         assert!(event.fields.contains_key("_bind_e_field_dip"));
+    }
+
+    #[test]
+    fn columnar_join_row_matches_materialized_path() {
+        // The columnar `JoinRow` (scan fallback) must be byte-identical to the
+        // materialized `HashMap` rows the old path produced: same field values
+        // (null → absent), same `find_matching_row` result, same enrichment set.
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use arrow::array::{BooleanArray, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        use crate::match_engine::{JoinRow, batch_to_events, columnar_join_rows};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ip", DataType::Utf8, true),
+            Field::new("score", DataType::Int64, true),
+            Field::new("active", DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("10.0.0.1"),
+                    None,
+                    Some("10.0.0.2"),
+                ])),
+                Arc::new(Int64Array::from(vec![Some(80), Some(95), Some(100)])),
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false), Some(true)])),
+            ],
+        )
+        .unwrap();
+
+        let col_rows = columnar_join_rows(vec![batch.clone()]);
+        let map_rows: Vec<HashMap<String, Value>> = batch_to_events(&batch)
+            .into_iter()
+            .map(|ev| {
+                ev.fields
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(col_rows.len(), map_rows.len());
+
+        // Per-row, per-field parity (null cell → None / absent).
+        for (i, (c, m)) in col_rows.iter().zip(&map_rows).enumerate() {
+            for name in ["ip", "score", "active"] {
+                assert_eq!(c.field_value(name), m.get(name).cloned(), "row {i} field {name}");
+            }
+            for name in c.field_names() {
+                assert_eq!(
+                    c.field_value(name).is_some(),
+                    m.contains_key(name),
+                    "row {i} name {name} presence"
+                );
+            }
+        }
+
+        // `find_matching_row` agrees between the columnar view and the
+        // materialized `Event` wrapper (the old HashMap path).
+        let mut ctx_fields = EngineHashMap::default();
+        ctx_fields.insert("ip".into(), Value::Str("10.0.0.2".into()));
+        ctx_fields.insert("score".into(), Value::Number(100.0));
+        let ctx = Event { fields: ctx_fields };
+        let conds = vec![
+            JoinCondPlan {
+                left: FieldRef::Simple("ip".into()),
+                right: FieldRef::Simple("ip".into()),
+            },
+            JoinCondPlan {
+                left: FieldRef::Simple("score".into()),
+                right: FieldRef::Simple("score".into()),
+            },
+        ];
+        let event_rows: Vec<JoinRow> = map_rows
+            .into_iter()
+            .map(|row| {
+                JoinRow::Event(Arc::new(Event {
+                    fields: row
+                        .into_iter()
+                        .map(|(k, v)| (k.into(), v))
+                        .collect(),
+                }))
+            })
+            .collect();
+        let matched_col = find_matching_row(&col_rows, &conds, &ctx).expect("columnar match");
+        let matched_event = find_matching_row(&event_rows, &conds, &ctx).expect("event match");
+        for name in ["ip", "score", "active"] {
+            assert_eq!(
+                matched_col.field_value(name),
+                matched_event.field_value(name),
+                "matched field {name}"
+            );
+        }
+        // The columnar matched row is row 2 (ip=10.0.0.2, score=100).
+        assert_eq!(
+            matched_col.field_value("ip"),
+            Some(Value::Str("10.0.0.2".into()))
+        );
+        assert_eq!(matched_col.field_value("score"), Some(Value::Number(100.0)));
     }
 }

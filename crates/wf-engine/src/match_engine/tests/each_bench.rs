@@ -181,12 +181,8 @@ fn q1_each_components_per_row() {
     let mut total_appended = 0usize;
     let start = Instant::now();
     for chunk in rows.chunks(ALERT_BATCH_SIZE) {
-        let stats = exec.execute_each_direct_batch_columnar(
-            chunk,
-            NANOS,
-            &mut builder,
-            &mut appended,
-        );
+        let stats =
+            exec.execute_each_direct_batch_columnar(chunk, NANOS, &mut builder, &mut appended);
         total_appended += stats.appended;
     }
     let baseline_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;

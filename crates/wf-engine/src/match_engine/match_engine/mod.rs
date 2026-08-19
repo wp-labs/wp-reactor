@@ -11,8 +11,8 @@ mod types;
 // Re-export public types
 pub use limits::SharedLimits;
 pub use types::{
-    BindData, CloseOutput, CloseReason, Event, JoinKey, MACHINE_ID, MatchedContext, StepData,
-    StepOutcome, StepProgress, StepResult, Value, WindowLookup,
+    BindData, CloseOutput, CloseReason, Event, FieldSource, JoinKey, MACHINE_ID, MatchedContext,
+    StepData, StepOutcome, StepProgress, StepResult, Value, WindowLookup,
 };
 pub use types::{EngineHashMap, EngineHashSet};
 
@@ -244,16 +244,11 @@ impl CepStateMachine {
         self.time_field.as_deref()
     }
 
-    /// Extract a string field from an event, returning empty string if not found.
-    pub(crate) fn extract_event_str(event: &Event, field: &str) -> String {
-        event
-            .fields
-            .get(field)
-            .and_then(|v| match v {
-                Value::Str(s) => Some(s.to_string()),
-                _ => None,
-            })
-            .unwrap_or_default()
+    /// Extract a string field from an event source, returning empty string if
+    /// not found. Generic over [`FieldSource`] so the columnar path reads it
+    /// straight from the batch.
+    pub(crate) fn extract_event_str<E: FieldSource>(event: &E, field: &str) -> String {
+        event.field_value_str(field)
     }
 
     /// Feed one event with explicit timestamp and optional window lookup.
@@ -270,10 +265,14 @@ impl CepStateMachine {
     /// Like [`Self::advance_at_with`], but with batch-level columnar branch-guard
     /// masks and the row index within the current batch. `masks` may be `None`
     /// (interpreted fallback for every branch).
-    pub fn advance_at_with_masks(
+    ///
+    /// Generic over [`FieldSource`]: the eager path passes `&Event`, the
+    /// deferred columnar path passes `&ColumnarEvent` (P3 FieldView — hit rows
+    /// are fed straight from the batch, no HashMap materialization).
+    pub fn advance_at_with_masks<E: FieldSource>(
         &mut self,
         alias: &str,
-        event: &Event,
+        event: &E,
         now_nanos: i64,
         windows: Option<&dyn WindowLookup>,
         row: usize,
@@ -285,20 +284,21 @@ impl CepStateMachine {
 
     /// Feed one event and return both the state-machine result and diagnostic
     /// progress for the evaluated step, when progress can be captured.
-    pub fn advance_at_with_progress(
+    pub fn advance_at_with_progress<E: FieldSource>(
         &mut self,
         alias: &str,
-        event: &Event,
+        event: &E,
         now_nanos: i64,
         windows: Option<&dyn WindowLookup>,
     ) -> StepOutcome {
         self.advance_at_with_diagnostics(alias, event, now_nanos, windows, 0, None, true)
     }
 
-    fn advance_at_with_diagnostics(
+    #[allow(clippy::too_many_arguments)]
+    fn advance_at_with_diagnostics<E: FieldSource>(
         &mut self,
         alias: &str,
-        event: &Event,
+        event: &E,
         now_nanos: i64,
         windows: Option<&dyn WindowLookup>,
         row: usize,
@@ -680,7 +680,7 @@ impl CepStateMachine {
                     window_start_time_nanos: instance.created_at,
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
-                    trigger_event: Some(std::sync::Arc::new(event.clone())),
+                    trigger_event: Some(std::sync::Arc::new(event.to_event())),
                 };
                 if plan.accu {
                     // `on event<accu>` — keep accumulating across fires.
@@ -881,7 +881,7 @@ impl CepStateMachine {
                     window_start_time_nanos: instance.created_at,
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
-                    trigger_event: Some(std::sync::Arc::new(event.clone())),
+                    trigger_event: Some(std::sync::Arc::new(event.to_event())),
                 };
                 if plan.accu {
                     // `on event<accu>` — keep accumulating across fires.
@@ -934,7 +934,7 @@ impl CepStateMachine {
                     window_start_time_nanos: instance.created_at,
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
-                    trigger_event: Some(std::sync::Arc::new(event.clone())),
+                    trigger_event: Some(std::sync::Arc::new(event.to_event())),
                 };
                 StepResult::Matched(ctx)
             } else {

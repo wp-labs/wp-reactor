@@ -211,9 +211,7 @@ impl EachWfxPrefix {
     /// Per-row finish — byte stream identical to
     /// [`wfx_id_from_rule_and_time`] (locked by unit test).
     pub(crate) fn wfx_id(&self, event_time_nanos: i64, origin: &AlertOrigin) -> String {
-        let mut hasher = Fnv1a {
-            state: self.state,
-        };
+        let mut hasher = Fnv1a { state: self.state };
         hasher.update(&event_time_nanos.to_le_bytes());
         hasher.update(b"\x00");
         hasher.update(b"\x00");

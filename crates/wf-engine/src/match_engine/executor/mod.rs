@@ -25,7 +25,7 @@ use self::eval::eval_bool_expr_with_lookup;
 use crate::alert::AlertOrigin;
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::columnar::{ColumnarBatch, GuardMasks, eval_guard_columnar};
-use crate::match_engine::match_engine::{Event, Value, WindowLookup};
+use crate::match_engine::match_engine::{FieldSource, Value, WindowLookup};
 use crate::time::normalize_epoch_timestamp_float_nanos;
 use arrow::array::BooleanArray;
 use arrow::record_batch::RecordBatch;
@@ -273,7 +273,7 @@ impl RuleExecutor {
     pub fn event_matches_alias(
         &self,
         alias: &str,
-        event: &Event,
+        event: &dyn FieldSource,
         windows: Option<&dyn WindowLookup>,
     ) -> bool {
         passes_bind_filter(self.bind_filter(alias), event, windows)
@@ -557,7 +557,7 @@ fn yield_value_to_json(value: &Value) -> CoreResult<serde_json::Value> {
 
 fn passes_bind_filter(
     filter: Option<&Expr>,
-    event: &Event,
+    event: &dyn FieldSource,
     windows: Option<&dyn WindowLookup>,
 ) -> bool {
     match filter.and_then(|expr| eval_bool_expr_with_lookup(expr, event, windows)) {

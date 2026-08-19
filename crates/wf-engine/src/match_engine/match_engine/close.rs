@@ -8,7 +8,8 @@ use super::step::{
     record_evidence_time, update_measure,
 };
 use super::types::{
-    CloseOutput, CloseReason, EngineHashMap, Event, RollingStats, StepData, Value, WindowLookup,
+    CloseOutput, CloseReason, EngineHashMap, Event, FieldSource, RollingStats, StepData, Value,
+    WindowLookup,
 };
 use crate::match_engine::columnar::GuardMasks;
 
@@ -25,9 +26,12 @@ use crate::match_engine::columnar::GuardMasks;
 ///   correctly while close_reason guards pass through.
 /// - Apply transforms (Distinct dedup must happen during accumulation)
 /// - Update measure accumulators (count++, sum+=, etc.)
-pub(super) fn accumulate_close_steps(
+// Hot per-row path: flat args avoid a context struct on the accumulation
+// loop (and its borrows); internal to the match engine only.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn accumulate_close_steps<E: FieldSource>(
     alias: &str,
-    event: &Event,
+    event: &E,
     event_time_nanos: i64,
     plan: &MatchPlan,
     close_step_states: &mut [StepState],

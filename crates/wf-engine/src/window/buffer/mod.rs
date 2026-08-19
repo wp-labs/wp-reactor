@@ -8,7 +8,7 @@ mod tests;
 
 pub use types::{AppendOutcome, WindowParams};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -122,6 +122,11 @@ pub struct Window {
     total_rows: AtomicUsize,
     /// Number of batches currently in the log.
     batch_count: AtomicUsize,
+    /// Monotonic content-generation counter: bumped once per successful append
+    /// (which subsumes any accompanying memory eviction — the only other log
+    /// mutation). `window.has()` / join snapshot caches key off this to
+    /// invalidate stale distinct-value sets without a per-call scan.
+    generation: AtomicU64,
     /// Fast path: whether a join index has been configured. Non-join windows
     /// (the common case) skip the join-index lock entirely.
     join_enabled: AtomicBool,
@@ -154,6 +159,7 @@ impl Window {
             current_bytes: AtomicUsize::new(0),
             total_rows: AtomicUsize::new(0),
             batch_count: AtomicUsize::new(0),
+            generation: AtomicU64::new(0),
             join_enabled: AtomicBool::new(false),
             join_index: RwLock::new(None),
             materialize_fields,
@@ -186,43 +192,21 @@ impl Window {
         *self.join_index.write().expect("join index lock poisoned") = Some(index);
     }
 
-    /// O(1) lookup of parsed events whose `key_field` equals `key`. Returns
-    /// `None` if this window has no join index (not a join target).
+    /// O(1) lookup of parsed events whose `key_field` equals `key`. `Some(empty)`
+    /// if this window is indexed but the key has no matching rows; `None` if it
+    /// has no join index (not a join target — the caller falls back to a
+    /// snapshot scan).
     pub fn join_lookup(&self, key: &JoinKey) -> Option<Vec<Arc<Event>>> {
         if !self.join_enabled.load(Ordering::Acquire) {
             return None;
         }
-        self.join_index
-            .read()
-            .expect("join index lock poisoned")
-            .as_ref()?
-            .lookup(key)
-    }
-
-    /// Indexed join rows as `HashMap<String, Value>` (matching `WindowLookup`
-    /// row shape). `Some(empty)` if indexed but no row matches; `None` if this
-    /// window has no join index (caller falls back to a snapshot scan).
-    pub fn join_rows(&self, key: &JoinKey) -> Option<Vec<HashMap<String, Value>>> {
-        if !self.join_enabled.load(Ordering::Acquire) {
-            return None;
-        }
-        let events = self
-            .join_index
-            .read()
-            .expect("join index lock poisoned")
-            .as_ref()?
-            .lookup(key)
-            .unwrap_or_default();
         Some(
-            events
-                .into_iter()
-                .map(|ev| {
-                    ev.fields
-                        .iter()
-                        .map(|(k, v)| (k.to_string(), v.clone()))
-                        .collect()
-                })
-                .collect(),
+            self.join_index
+                .read()
+                .expect("join index lock poisoned")
+                .as_ref()?
+                .lookup(key)
+                .unwrap_or_default(),
         )
     }
 
@@ -378,7 +362,16 @@ impl Window {
             );
         }
 
+        // Content changed (append + any accompanying eviction): bump the
+        // generation so `window.has()` / snapshot caches invalidate.
+        self.generation.fetch_add(1, Ordering::Relaxed);
+
         Ok(seq)
+    }
+
+    /// Monotonic content-generation counter (see the struct field docs).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Remove an evicted batch's rows from the join index (if configured).

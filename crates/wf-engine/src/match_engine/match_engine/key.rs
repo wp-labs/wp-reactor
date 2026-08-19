@@ -1,7 +1,7 @@
 use smol_str::SmolStr;
 use wf_lang::ast::{FieldRef, PathSegment};
 
-use super::types::{EngineHashMap, Event, Value};
+use super::types::{EngineHashMap, FieldSource, Value};
 
 // ---------------------------------------------------------------------------
 // Value key — typed, hashable key for distinct-like state
@@ -260,8 +260,8 @@ fn flatten_scope_values(key: &ScopeKey) -> Vec<Value> {
 ///
 /// Returns `None` if any key field is missing from the event.
 /// Returns `Some(vec![])` if the key list is empty (shared instance).
-pub(super) fn extract_key(
-    event: &Event,
+pub(super) fn extract_key<E: FieldSource>(
+    event: &E,
     keys: &[FieldRef],
     key_map: Option<&[wf_lang::plan::KeyMapPlan]>,
     alias: &str,
@@ -292,16 +292,16 @@ pub(super) fn extract_key(
         let mapped = km
             .iter()
             .find(|e| e.logical_name == *logical && e.source_alias == alias)
-            .and_then(|e| event.fields.get(e.source_field.as_str()));
+            .and_then(|e| event.field_value(e.source_field.as_str()));
 
         if let Some(val) = mapped {
-            result.push(val.clone());
+            result.push(val);
             continue;
         }
 
         // Fallback: field named after the logical key
-        if let Some(val) = event.fields.get(logical.as_str()) {
-            result.push(val.clone());
+        if let Some(val) = event.field_value(logical.as_str()) {
+            result.push(val);
             continue;
         }
     }
@@ -318,12 +318,15 @@ pub(super) fn extract_key(
     Some(result)
 }
 
-pub(crate) fn extract_key_simple(event: &Event, keys: &[FieldRef]) -> Option<Vec<Value>> {
+pub(crate) fn extract_key_simple<E: FieldSource>(
+    event: &E,
+    keys: &[FieldRef],
+) -> Option<Vec<Value>> {
     let mut result = Vec::with_capacity(keys.len());
     for key in keys {
         let field_name = field_ref_name(key);
-        let val = event.fields.get(field_name)?;
-        result.push(val.clone());
+        let val = event.field_value(field_name)?;
+        result.push(val);
     }
     Some(result)
 }
@@ -373,6 +376,38 @@ pub(crate) fn eval_field_value(
         return None;
     };
     let mut value = fields.get(root.as_str())?.clone();
+    for segment in iter {
+        match segment {
+            PathSegment::Field(name) => match value {
+                Value::Object(map) => value = map.get(name.as_str())?.clone(),
+                _ => return None,
+            },
+            PathSegment::Index(idx) => match value {
+                Value::Array(items) => value = items.get(*idx)?.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    Some(value)
+}
+
+/// [`eval_field_value`] over a [`FieldSource`] (eager `Event` or columnar
+/// view). The `FieldRef::Path` walk is identical — the root field is read from
+/// the source (a columnar source JSON-parses structured fields exactly like
+/// `batch_to_events`), then the nested object/array walk applies unchanged.
+pub(crate) fn eval_field_value_src(
+    src: &dyn FieldSource,
+    fr: &FieldRef,
+) -> Option<Value> {
+    let FieldRef::Path { segments, .. } = fr else {
+        return src.field_value(field_ref_name(fr));
+    };
+    let mut iter = segments.iter();
+    let Some(PathSegment::Field(root)) = iter.next() else {
+        return None;
+    };
+    let mut value = src.field_value(root.as_str())?;
     for segment in iter {
         match segment {
             PathSegment::Field(name) => match value {

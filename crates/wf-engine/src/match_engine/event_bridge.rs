@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow::array::{
     Array, BooleanArray, FixedSizeListArray, Float64Array, Int64Array, LargeListArray, ListArray,
@@ -6,8 +7,9 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use smol_str::SmolStr;
 
-use super::match_engine::{EngineHashMap, Event, Value};
+use super::match_engine::{EngineHashMap, Event, FieldSource, Value};
 
 pub const WFL_FIELD_TYPE_METADATA_KEY: &str = "wf.wfl.field_type";
 pub const WFL_FIELD_TYPE_OBJECT: &str = "object";
@@ -341,6 +343,322 @@ fn extract_list_values(values: &dyn Array) -> Vec<Value> {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Columnar event view (on-each fast path — "on-each 完全不物化")
+// ---------------------------------------------------------------------------
+
+/// Read one cell of `col_idx` as the same string `window.has()` membership
+/// uses: the shared [`extract_field_value`] conversion (Int64/Timestamp →
+/// `Number` with the f64 round-trip, Utf8 → `Str`, Boolean → `Bool`), then the
+/// Event-path string form (Str → its text, Number → f64 Display, Bool →
+/// `true`/`false`). Structured values (List / Struct / JSON object-array
+/// columns) → `None`, matching the `Array`/`Object` skip in
+/// [`WindowLookup::snapshot_field_values`]. Null cell → `None`.
+///
+/// Lets `window.has()` build its distinct-value `HashSet` from a single column
+/// instead of materializing the whole referenced window into `Event` HashMaps.
+pub fn column_scalar_string(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<String> {
+    let col = batch.column(col_idx);
+    if col.is_null(row) {
+        return None;
+    }
+    let value = extract_field_value(batch.schema_ref().field(col_idx), col.as_ref(), row)?;
+    match value {
+        Value::Str(s) => Some(s.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+/// Batch-level `field name → column index` map, so [`ColumnarEvent::field_value`]
+/// is O(1) instead of a per-call `schema().index_of` linear scan. Built once per
+/// batch ([`build_field_index`]) and Arc-shared across every row view.
+pub type FieldIndex = EngineHashMap<SmolStr, usize>;
+
+/// Build a `name → column index` map for a batch (one pass over its schema).
+/// The schema is immutable for the batch's lifetime, so the index is stable.
+pub fn build_field_index(batch: &RecordBatch) -> Arc<FieldIndex> {
+    let mut index = EngineHashMap::default();
+    for (i, field) in batch.schema().fields().iter().enumerate() {
+        index.insert(SmolStr::new(field.name()), i);
+    }
+    Arc::new(index)
+}
+
+/// Field access straight from an Arrow row, byte-identical to the eager
+/// `Event{fields: HashMap}` semantics: the same [`extract_field_value`]
+/// conversions, null / failed extraction → field absent.
+///
+/// Used by the on-each columnar fast path to skip per-row `Event`
+/// materialization entirely (design doc §3.5「`on each` 规则完全不物化」) and by
+/// the match state machine's columnar entry (P3 FieldView) so hit rows never
+/// build a HashMap.
+pub struct ColumnarEvent<'a> {
+    batch: &'a RecordBatch,
+    row: usize,
+    /// Optional batch-level name→column index for O(1) `field_value`.
+    index: Option<Arc<FieldIndex>>,
+    /// Optional `materialize_fields` projection: [`FieldSource::to_event`]
+    /// materializes only these fields (byte-identical to
+    /// `materialize_rows_filtered`); `None` = all schema columns
+    /// (byte-identical to `batch_to_events`). Mirrors the eager deferred
+    /// path's projected trigger event on emit.
+    projection: Option<Arc<HashSet<String>>>,
+}
+
+impl<'a> ColumnarEvent<'a> {
+    pub fn new(batch: &'a RecordBatch, row: usize) -> Self {
+        Self {
+            batch,
+            row,
+            index: None,
+            projection: None,
+        }
+    }
+
+    /// Same as [`Self::new`], but carry a batch-level field-name index so
+    /// [`Self::field_value`] resolves names in O(1) instead of a per-call
+    /// `schema().index_of` linear scan. Use on hot paths that read many rows.
+    pub fn with_index(
+        batch: &'a RecordBatch,
+        row: usize,
+        index: Arc<FieldIndex>,
+    ) -> Self {
+        Self {
+            batch,
+            row,
+            index: Some(index),
+            projection: None,
+        }
+    }
+
+    /// [`Self::with_index`] plus the window's `materialize_fields` projection,
+    /// so [`FieldSource::to_event`] reproduces the eager deferred path's
+    /// projected trigger event exactly (extra schema columns stay out of the
+    /// eval context instead of risking a label/name collision).
+    pub fn with_index_projected(
+        batch: &'a RecordBatch,
+        row: usize,
+        index: Arc<FieldIndex>,
+        projection: Option<Arc<HashSet<String>>>,
+    ) -> Self {
+        Self {
+            batch,
+            row,
+            index: Some(index),
+            projection,
+        }
+    }
+
+    pub(crate) fn batch(&self) -> &'a RecordBatch {
+        self.batch
+    }
+
+    pub(crate) fn row(&self) -> usize {
+        self.row
+    }
+
+    /// Field value by name, or `None` when the column is absent / null /
+    /// fails extraction — mirrors `Event.fields.get(name)`.
+    pub fn field_value(&self, name: &str) -> Option<Value> {
+        let idx = match &self.index {
+            Some(index) => index.get(name).copied()?,
+            None => self.batch.schema().index_of(name).ok()?,
+        };
+        self.value_at(idx)
+    }
+
+    /// Field value by a **pre-resolved** column index — byte-identical to
+    /// [`Self::field_value`] for the same column, but skips the per-call
+    /// `schema().index_of(name)` lookup. The index is stable for the lifetime
+    /// of a batch (the schema is `Arc`-shared and immutable), so callers
+    /// resolve it once per batch (hot-path Q1 bisection).
+    pub fn value_at(&self, idx: usize) -> Option<Value> {
+        let col = self.batch.column(idx);
+        if col.is_null(self.row) {
+            return None;
+        }
+        extract_field_value(self.batch.schema().field(idx), col.as_ref(), self.row)
+    }
+
+    /// Mirrors `CepStateMachine::extract_event_str`: a `Str` field → its
+    /// string, anything else (absent / non-str) → empty string.
+    pub fn field_value_str(&self, name: &str) -> String {
+        match self.field_value(name) {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => String::new(),
+        }
+    }
+}
+
+impl FieldSource for ColumnarEvent<'_> {
+    fn field_value(&self, name: &str) -> Option<Value> {
+        // The inherent method resolves the same way (index-first, schema
+        // fallback); call it directly rather than recursing into the trait.
+        self.field_value(name)
+    }
+
+    fn field_names(&self) -> Vec<&str> {
+        // `schema_ref()` borrows from the batch; `schema()` would return an
+        // owned `Arc<Schema>` temporary whose fields we cannot return. With a
+        // `materialize_fields` projection the names match the eager Event's map
+        // keys exactly (projected, non-null only), so the iterate-all evidence
+        // collection and the memory estimate stay byte-identical.
+        self.batch
+            .schema_ref()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .filter(|name| match &self.projection {
+                Some(proj) => proj.contains(*name),
+                None => true,
+            })
+            .collect()
+    }
+
+    fn to_event(&self) -> Event {
+        let mut fields = EngineHashMap::default();
+        // Iterate the precomputed field index (name → column) instead of
+        // building a fresh `field_names` Vec — this runs per emit (the
+        // trigger_event for every fired instance, e.g. Q7's per-event max rule).
+        if let Some(index) = &self.index {
+            for (name, &col_idx) in index.iter() {
+                if let Some(proj) = &self.projection
+                    && !proj.contains(name.as_str())
+                {
+                    continue;
+                }
+                let col = self.batch.column(col_idx);
+                if col.is_null(self.row) {
+                    continue;
+                }
+                if let Some(value) =
+                    extract_field_value(self.batch.schema_ref().field(col_idx), col.as_ref(), self.row)
+                {
+                    fields.insert(name.clone(), value);
+                }
+            }
+        } else {
+            for name in self.field_names() {
+                if let Some(value) = self.field_value(name) {
+                    fields.insert(SmolStr::new(name), value);
+                }
+            }
+        }
+        Event { fields }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JoinRow — columnar join-candidate row (免物化: 按需读字段)
+// ---------------------------------------------------------------------------
+
+/// A join-candidate row: a columnar view over an owned batch row (zero HashMap
+/// materialization — fields are read on demand) or a pre-materialized [`Event`]
+/// (provider / join-index rows). Lets the join executor evaluate conditions and
+/// enrich the eval context without materializing the whole referenced window.
+#[derive(Clone)]
+pub enum JoinRow {
+    Columnar {
+        batch: Arc<RecordBatch>,
+        row: usize,
+        index: Arc<FieldIndex>,
+    },
+    Event(Arc<Event>),
+}
+
+impl JoinRow {
+    /// Field value by name, or `None` when absent / null. The Columnar variant
+    /// reads through the same [`extract_field_value`] conversion as
+    /// `batch_to_events`, so the value is byte-identical to the eager path.
+    pub fn field_value(&self, name: &str) -> Option<Value> {
+        match self {
+            JoinRow::Columnar {
+                batch,
+                row,
+                index,
+            } => {
+                let idx = *index.get(name)?;
+                let col = batch.column(idx);
+                if col.is_null(*row) {
+                    return None;
+                }
+                extract_field_value(batch.schema_ref().field(idx), col.as_ref(), *row)
+            }
+            JoinRow::Event(ev) => ev.fields.get(name).cloned(),
+        }
+    }
+
+    /// Every field name this row exposes. The Columnar variant lists the whole
+    /// schema (null cells read `None` via [`Self::field_value`], matching the
+    /// eager `batch_to_events` map which drops nulls); the Event variant lists
+    /// its materialized (projected) map keys.
+    pub fn field_names(&self) -> Vec<&str> {
+        match self {
+            JoinRow::Columnar { batch, .. } => batch
+                .schema_ref()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect(),
+            JoinRow::Event(ev) => ev.fields.keys().map(|k| k.as_str()).collect(),
+        }
+    }
+}
+
+/// Build columnar [`JoinRow`]s for every row of the given (cheaply Arc-cloned)
+/// batches — the scan-fallback join path. No Event/HashMap materialization.
+pub fn columnar_join_rows(batches: Vec<RecordBatch>) -> Vec<JoinRow> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let batch = Arc::new(batch);
+        let index = build_field_index(&batch);
+        for row in 0..batch.num_rows() {
+            rows.push(JoinRow::Columnar {
+                batch: Arc::clone(&batch),
+                row,
+                index: Arc::clone(&index),
+            });
+        }
+    }
+    rows
+}
+
+/// Build timestamped columnar [`JoinRow`]s for the asof-join path. The
+/// timestamp is the **raw** `Timestamp(Ns)` i64 (byte-identical to
+/// [`batch_to_timestamped_rows`]); rows with a null timestamp are skipped.
+pub fn columnar_timestamped_join_rows(
+    batches: Vec<RecordBatch>,
+    time_col_index: usize,
+) -> Vec<(i64, JoinRow)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let batch = Arc::new(batch);
+        let index = build_field_index(&batch);
+        let ts_array = batch
+            .column(time_col_index)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>();
+        for row in 0..batch.num_rows() {
+            let Some(ts) = ts_array
+                .and_then(|a| (!a.is_null(row)).then(|| a.value(row)))
+            else {
+                continue;
+            };
+            rows.push((
+                ts,
+                JoinRow::Columnar {
+                    batch: Arc::clone(&batch),
+                    row,
+                    index: Arc::clone(&index),
+                },
+            ));
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,62 +938,3 @@ mod tests {
         assert_eq!(events[0].fields["plain"], Value::Str(r#"[22,2222]"#.into()));
     }
 }
-
-// ---------------------------------------------------------------------------
-// Columnar event view (on-each fast path — "on-each 完全不物化")
-// ---------------------------------------------------------------------------
-
-/// Field access straight from an Arrow row, byte-identical to the eager
-/// `Event{fields: HashMap}` semantics: the same [`extract_field_value`]
-/// conversions, null / failed extraction → field absent.
-///
-/// Used by the on-each columnar fast path to skip per-row `Event`
-/// materialization entirely (design doc §3.5「`on each` 规则完全不物化」).
-pub struct ColumnarEvent<'a> {
-    batch: &'a RecordBatch,
-    row: usize,
-}
-
-impl<'a> ColumnarEvent<'a> {
-    pub fn new(batch: &'a RecordBatch, row: usize) -> Self {
-        Self { batch, row }
-    }
-
-    pub(crate) fn batch(&self) -> &'a RecordBatch {
-        self.batch
-    }
-
-    pub(crate) fn row(&self) -> usize {
-        self.row
-    }
-
-    /// Field value by name, or `None` when the column is absent / null /
-    /// fails extraction — mirrors `Event.fields.get(name)`.
-    pub fn field_value(&self, name: &str) -> Option<Value> {
-        let idx = self.batch.schema().index_of(name).ok()?;
-        self.value_at(idx)
-    }
-
-    /// Field value by a **pre-resolved** column index — byte-identical to
-    /// [`Self::field_value`] for the same column, but skips the per-call
-    /// `schema().index_of(name)` lookup. The index is stable for the lifetime
-    /// of a batch (the schema is `Arc`-shared and immutable), so callers
-    /// resolve it once per batch (hot-path Q1 bisection).
-    pub fn value_at(&self, idx: usize) -> Option<Value> {
-        let col = self.batch.column(idx);
-        if col.is_null(self.row) {
-            return None;
-        }
-        extract_field_value(self.batch.schema().field(idx), col.as_ref(), self.row)
-    }
-
-    /// Mirrors `CepStateMachine::extract_event_str`: a `Str` field → its
-    /// string, anything else (absent / non-str) → empty string.
-    pub fn field_value_str(&self, name: &str) -> String {
-        match self.field_value(name) {
-            Some(Value::Str(s)) => s.to_string(),
-            _ => String::new(),
-        }
-    }
-}
-

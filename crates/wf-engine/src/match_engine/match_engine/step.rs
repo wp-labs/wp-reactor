@@ -6,16 +6,16 @@ use wf_lang::plan::{AggPlan, StepPlan};
 use super::eval::{eval_expr_ext, try_eval_expr_to_f64, try_eval_expr_to_value};
 use super::key::ValueKey;
 use super::state::{AliasState, BranchState, StepState};
-use super::types::{EngineHashMap, Event, RollingStats, StepProgress, Value, WindowLookup};
+use super::types::{EngineHashMap, FieldSource, RollingStats, StepProgress, Value, WindowLookup};
 use crate::match_engine::columnar::GuardMasks;
 
 // ---------------------------------------------------------------------------
 // Step evaluation
 // ---------------------------------------------------------------------------
 
-pub(super) struct StepEvaluationInput<'a> {
+pub(super) struct StepEvaluationInput<'a, E: FieldSource> {
     pub alias: &'a str,
-    pub event: &'a Event,
+    pub event: &'a E,
     pub event_time_nanos: i64,
     pub windows: Option<&'a dyn WindowLookup>,
     pub progress: Option<StepProgressCapture<'a>>,
@@ -36,8 +36,8 @@ pub(super) struct StepProgressCapture<'a> {
 }
 
 /// Evaluate all branches in a step and optionally capture progress details.
-pub(super) fn evaluate_step_with_progress(
-    input: StepEvaluationInput<'_>,
+pub(super) fn evaluate_step_with_progress<E: FieldSource>(
+    input: StepEvaluationInput<'_, E>,
     step_plan: &StepPlan,
     step_state: &mut StepState,
     baselines: &mut EngineHashMap<String, RollingStats>,
@@ -188,8 +188,8 @@ pub(super) fn record_evidence_time(bs: &mut BranchState, event_time_nanos: i64) 
     }
 }
 
-pub(super) fn collect_event_fields(
-    event: &Event,
+pub(super) fn collect_event_fields<E: FieldSource>(
+    event: &E,
     bs: &mut BranchState,
     tracked_fields: Option<&HashSet<String>>,
     tracked_plain_fields: &HashSet<String>,
@@ -209,23 +209,28 @@ pub(super) fn collect_event_fields(
             push_event_field(event, bs, field_name);
         }
     } else {
-        for (field_name, value) in &event.fields {
-            let values = bs
-                .field_values_mut()
-                .entry(field_name.to_string())
-                .or_default();
-            push_capped(values, value.clone());
+        // No tracked set: collect every non-null field. `field_names` covers the
+        // whole schema/map; null/missing cells read `None` and are skipped, which
+        // matches the eager path (batch_to_events drops nulls from the map).
+        for field_name in event.field_names() {
+            if let Some(value) = event.field_value(field_name) {
+                let values = bs
+                    .field_values_mut()
+                    .entry(field_name.to_string())
+                    .or_default();
+                push_capped(values, value);
+            }
         }
     }
 }
 
-fn push_event_field(event: &Event, bs: &mut BranchState, field_name: &str) {
-    if let Some(value) = event.fields.get(field_name) {
+fn push_event_field<E: FieldSource>(event: &E, bs: &mut BranchState, field_name: &str) {
+    if let Some(value) = event.field_value(field_name) {
         let values = bs
             .field_values_mut()
             .entry(field_name.to_string())
             .or_default();
-        push_capped(values, value.clone());
+        push_capped(values, value);
     }
 }
 
@@ -262,23 +267,25 @@ fn push_capped(values: &mut Vec<Value>, value: Value) {
     }
 }
 
-pub(super) fn collect_alias_event(
-    event: &Event,
+pub(super) fn collect_alias_event<E: FieldSource>(
+    event: &E,
     alias_state: &mut AliasState,
     tracked_fields: Option<&HashSet<String>>,
 ) {
     alias_state.count += 1;
     if let Some(fields) = tracked_fields {
         for field_name in fields {
-            if let Some(value) = event.fields.get(field_name.as_str()) {
+            if let Some(value) = event.field_value(field_name.as_str()) {
                 let values = field_values_for(alias_state, field_name.as_str());
-                push_capped(values, value.clone());
+                push_capped(values, value);
             }
         }
     } else {
-        for (field_name, value) in &event.fields {
-            let values = field_values_for(alias_state, field_name.as_str());
-            push_capped(values, value.clone());
+        for field_name in event.field_names() {
+            if let Some(value) = event.field_value(field_name) {
+                let values = field_values_for(alias_state, field_name);
+                push_capped(values, value);
+            }
         }
     }
 }
@@ -300,10 +307,13 @@ fn field_values_for<'a>(alias_state: &'a mut AliasState, field_name: &str) -> &'
 // Branch field extraction
 // ---------------------------------------------------------------------------
 
-pub(super) fn extract_branch_field(event: &Event, field: &Option<FieldSelector>) -> Option<Value> {
+pub(super) fn extract_branch_field<E: FieldSource>(
+    event: &E,
+    field: &Option<FieldSelector>,
+) -> Option<Value> {
     match field {
         Some(FieldSelector::Dot(name)) | Some(FieldSelector::Bracket(name)) => {
-            event.fields.get(name.as_str()).cloned()
+            event.field_value(name.as_str())
         }
         Some(_) => None,
         None => None,
@@ -553,6 +563,7 @@ fn value_to_f64(v: &Value) -> Option<f64> {
 mod tests {
     use super::super::state::{AliasState, BranchState};
     use super::super::types::Value;
+    use super::super::types::Event;
     use super::*;
 
     fn event_with(field: &str, value: i64) -> Event {

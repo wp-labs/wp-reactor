@@ -386,7 +386,7 @@ impl RuleExecutor {
         if !self.plan.binds.iter().all(|b| {
             b.filter
                 .as_ref()
-                .map_or(true, |f| wf_lang::columnar::expr_is_columnar(f))
+                .is_none_or(wf_lang::columnar::expr_is_columnar)
         }) {
             return false;
         }

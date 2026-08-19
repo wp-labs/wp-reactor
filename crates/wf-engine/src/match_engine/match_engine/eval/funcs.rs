@@ -8,7 +8,7 @@ use wf_lang::ast::Expr;
 use crate::time::{normalize_epoch_timestamp_float_nanos, positive_interval_seconds_to_nanos};
 
 use super::super::key::value_to_string;
-use super::super::types::{EngineHashMap, Event, RollingStats, Value, WindowLookup};
+use super::super::types::{EngineHashMap, FieldSource, RollingStats, Value, WindowLookup};
 use super::cmp::{
     apply_fmt_template, compare_sortable_values, current_time_nanos, eval_single_string_arg,
     f64_to_i64_trunc, is_blank_str, normalize_index, parse_time_to_timestamp_nanos,
@@ -82,7 +82,7 @@ use super::{eval_expr_ext, values_equal};
 pub(super) fn eval_func_call(
     name: &str,
     args: &[Expr],
-    event: &Event,
+    event: &dyn FieldSource,
     windows: Option<&dyn WindowLookup>,
     baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<Value> {
@@ -959,7 +959,7 @@ fn scalar_value_to_string(value: &Value) -> Option<String> {
 
 fn eval_join_arg(
     arg: &Expr,
-    event: &Event,
+    event: &dyn FieldSource,
     windows: Option<&dyn WindowLookup>,
     baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<String> {
@@ -972,7 +972,7 @@ fn eval_join_arg(
 
 fn eval_merge_arg(
     arg: &Expr,
-    event: &Event,
+    event: &dyn FieldSource,
     windows: Option<&dyn WindowLookup>,
     baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<Value> {

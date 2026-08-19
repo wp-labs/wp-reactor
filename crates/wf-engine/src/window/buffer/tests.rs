@@ -857,9 +857,10 @@ fn join_index_maintained_on_append_and_evict() {
         Some(1),
         "one row with value 44 indexed"
     );
-    assert!(
-        win.join_lookup(&JoinKey::Int(999)).is_none(),
-        "no match → None"
+    assert_eq!(
+        win.join_lookup(&JoinKey::Int(999)).map(|v| v.len()),
+        Some(0),
+        "indexed but no match → empty (not None)"
     );
 
     // Expire all batches: over=3600s, now=4000s → cutoff=400s >> event times

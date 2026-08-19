@@ -99,11 +99,17 @@ pub fn compute_window_field_usage(plans: &[RulePlan]) -> WindowFieldUsage {
         }
 
         // A window may defer (broadcast the raw batch and let rule tasks
-        // materialize) only when EVERY rule binding it is defer-safe: a
-        // state-machine rule whose bind filters are all columnar, or an
+        // materialize) only when EVERY rule binding it is defer-safe: an
         // `on each` rule (the rule task materializes the raw batch itself,
-        // filtered, instead of route_parse materializing eagerly).
+        // filtered), or a state-machine rule (P3 FieldView feeds the machine
+        // straight from the columns, so hit rows need no HashMap
+        // materialization — a bind filter, columnar or not, is evaluated over
+        // the columnar view). The `all binds columnar` conjunct is kept for
+        // symmetry/legacy; the match-plan arm already covers every match rule.
         let plan_defer_safe = plan.each_plan.is_some()
+            || !plan.match_plan.event_steps.is_empty()
+            || !plan.match_plan.close_steps.is_empty()
+            || plan.match_plan.seq.is_some()
             || plan
                 .binds
                 .iter()
@@ -436,6 +442,52 @@ mod tests {
         assert!(usage.defer_materialization.contains("bid_events"));
         assert!(!usage.defer_materialization.contains("no_filter"));
         assert!(!usage.defer_materialization.contains("func"));
+    }
+
+    #[test]
+    fn match_rule_defers_without_columnar_bind_filter() {
+        use crate::ast::{CmpOp, Measure};
+        use crate::plan::AggPlan;
+        // P3 FieldView: a state-machine rule is defer-safe even with no bind
+        // filter — hit rows are fed to the machine as columnar views, so the
+        // old "every bind must have a columnar filter" requirement no longer
+        // applies (the rule task evaluates the (absent) filter over the
+        // columnar view and materializes nothing).
+        let no_filter_bind = BindPlan {
+            alias: "b".into(),
+            window: "no_filter".into(),
+            filter: None,
+        };
+        let match_plan = MatchPlan {
+            keys: vec![field_ref("auction")],
+            key_map: None,
+            window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
+            event_steps: vec![StepPlan {
+                branches: vec![BranchPlan {
+                    label: None,
+                    source: "b".into(),
+                    field: None,
+                    guard: None,
+                    agg: AggPlan {
+                        transforms: vec![],
+                        measure: Measure::Count,
+                        cmp: CmpOp::Ge,
+                        threshold: Expr::Number(1.0),
+                    },
+                }],
+            }],
+            close_steps: vec![],
+            close_mode: crate::ast::CloseMode::Or,
+            tracked_bind_aliases: std::collections::HashSet::new(),
+            tracked_bind_fields: std::collections::HashMap::new(),
+            tracked_plain_fields: std::collections::HashSet::new(),
+            match_mode: crate::ast::MatchMode::Any,
+            seq: None,
+            accu: false,
+            needs_field_history: false,
+        };
+        let usage = compute_window_field_usage(&[make_rule(vec![no_filter_bind], match_plan)]);
+        assert!(usage.defer_materialization.contains("no_filter"));
     }
 
     #[test]

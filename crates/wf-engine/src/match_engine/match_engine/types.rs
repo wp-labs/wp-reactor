@@ -4,6 +4,8 @@ use std::sync::Arc;
 use foldhash::fast::RandomState as FoldRandomState;
 use smol_str::SmolStr;
 
+use crate::match_engine::event_bridge::JoinRow;
+
 /// HashMap/HashSet over hot-path keys (InstanceKey, field names, event field
 /// keys) using foldhash's fast, minimally-DoS-resistant hasher instead of the
 /// default SipHash. SipHash was ~3k samples of the match-engine profile; field
@@ -39,6 +41,54 @@ pub enum Value {
     Bool(bool),
     Array(Vec<Value>),
     Object(EngineHashMap<SmolStr, Value>),
+}
+
+// ---------------------------------------------------------------------------
+// FieldSource — the per-row event abstraction consumed by the state machine
+// ---------------------------------------------------------------------------
+
+/// A per-row source of named fields: either a materialized [`Event`] or a
+/// columnar view over one Arrow row ([`crate::match_engine::ColumnarEvent`]).
+///
+/// The match state machine consumes this instead of a concrete `&Event`, so hit
+/// rows never need a per-row `HashMap` materialization on the deferred path
+/// (P3 FieldView — see `docs/design/columnar-match-state-machine.md` §6).
+pub trait FieldSource {
+    /// Field value by name, or `None` when absent / null / fails extraction.
+    /// Mirrors `Event.fields.get(name).cloned()` / `ColumnarEvent::field_value`.
+    fn field_value(&self, name: &str) -> Option<Value>;
+
+    /// Every field name this row's schema/map carries. Null cells are included;
+    /// callers skip them via `field_value() == None`, which is byte-identical
+    /// to `batch_to_events` (it drops null cells from the map).
+    fn field_names(&self) -> Vec<&str>;
+
+    /// Materialize a full owned [`Event`] for this row (emit-path trigger
+    /// event and any concrete-`Event` fallback).
+    fn to_event(&self) -> Event;
+
+    /// `Str` field → its string, anything else (absent / non-str) → `""`.
+    /// Mirrors `CepStateMachine::extract_event_str`.
+    fn field_value_str(&self, name: &str) -> String {
+        match self.field_value(name) {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => String::new(),
+        }
+    }
+}
+
+impl FieldSource for Event {
+    fn field_value(&self, name: &str) -> Option<Value> {
+        self.fields.get(name).cloned()
+    }
+
+    fn field_names(&self) -> Vec<&str> {
+        self.fields.keys().map(|k| k.as_str()).collect()
+    }
+
+    fn to_event(&self) -> Event {
+        self.clone()
+    }
 }
 
 /// Hashable scalar key for join indexes. `Value` itself is not reliably
@@ -214,34 +264,35 @@ pub trait WindowLookup: Send + Sync {
     /// Get all distinct values for a field in a static window (for `has()`).
     fn snapshot_field_values(&self, window: &str, field: &str) -> Option<HashSet<String>>;
 
-    /// Get a full snapshot of a window (for join).
-    fn snapshot(&self, window: &str) -> Option<Vec<HashMap<String, Value>>>;
+    /// Get a snapshot of a window as columnar [`JoinRow`]s (for join) — rows
+    /// are read on demand, so no whole-window HashMap materialization.
+    fn snapshot(&self, window: &str) -> Option<Vec<JoinRow>>;
 
-    /// Get a full snapshot with per-row timestamps (for asof join).
+    /// Get a snapshot with per-row timestamps (for asof join).
     ///
     /// Returns `None` if the window doesn't exist or doesn't support timestamps.
-    /// Each entry is `(timestamp_nanos, fields)`.
-    fn snapshot_with_timestamps(&self, window: &str) -> Option<Vec<(i64, HashMap<String, Value>)>> {
+    /// Each entry is `(timestamp_nanos, row)`.
+    fn snapshot_with_timestamps(&self, window: &str) -> Option<Vec<(i64, JoinRow)>> {
         let _ = window;
         None
     }
 
     /// Indexed join lookup: return rows of `window` whose `key_field` equals `key`.
     ///
-    /// Default implementation falls back to a full snapshot + linear filter
+    /// Default implementation falls back to a snapshot + linear filter
     /// (O(rows)); a window with a maintained hash index overrides this to O(1).
     fn join_lookup(
         &self,
         window: &str,
         key_field: &str,
         key: &Value,
-    ) -> Option<Vec<HashMap<String, Value>>> {
+    ) -> Option<Vec<JoinRow>> {
         let rows = self.snapshot(window)?;
         Some(
             rows.into_iter()
                 .filter(|row| {
-                    row.get(key_field)
-                        .is_some_and(|v| crate::match_engine::match_engine::values_equal(v, key))
+                    row.field_value(key_field)
+                        .is_some_and(|v| crate::match_engine::match_engine::values_equal(&v, key))
                 })
                 .collect(),
         )

@@ -37,6 +37,9 @@ use super::fanout::RuleFanout;
 /// seq+1). Errors propagate to the caller — each entry point keeps its own
 /// error policy (the actor logs and continues; the ordered path fails the
 /// route).
+// Hot append path; flat args (vs a context struct) keep the commit call sites
+// self-describing at the three entry points that fan out into it.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn commit_appended_batch(
     win: &Window,
     fanout: &RuleFanout,

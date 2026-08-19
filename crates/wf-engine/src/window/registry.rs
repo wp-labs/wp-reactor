@@ -1,5 +1,5 @@
 use crate::match_engine::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
@@ -45,6 +45,12 @@ struct Subscription {
 // WindowRegistry
 // ---------------------------------------------------------------------------
 
+/// Cached `window.has()` distinct-value sets: `(window, field) → (window
+/// generation snapshot, distinct values)`. Invalidated by a generation
+/// mismatch (the window's content changed), so a repeated `window.has()`
+/// between appends is O(distinct) instead of rescanning the whole window.
+type HasValueCache = RwLock<HashMap<(String, String), (u64, Arc<HashSet<String>>)>>;
+
 /// Central structure holding all [`Window`] instances and a subscription
 /// routing table that maps stream names → windows.
 ///
@@ -62,6 +68,7 @@ pub struct WindowRegistry {
     subscriptions: RwLock<HashMap<String, Vec<Subscription>>>,
     notifiers: RwLock<HashMap<String, Arc<Notify>>>,
     progress: RwLock<HashMap<String, Arc<WindowProgress>>>,
+    has_cache: HasValueCache,
 }
 
 impl std::fmt::Debug for WindowRegistry {
@@ -134,7 +141,39 @@ impl WindowRegistry {
             subscriptions: RwLock::new(subscriptions),
             notifiers: RwLock::new(notifiers),
             progress: RwLock::new(progress),
+            has_cache: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Cached distinct-value set for `window.has(window, field)` if the cache
+    /// entry matches `generation` (the window's current content generation).
+    pub fn has_field_values(
+        &self,
+        window: &str,
+        field: &str,
+        generation: u64,
+    ) -> Option<Arc<HashSet<String>>> {
+        self.has_cache
+            .read()
+            .expect("has cache lock poisoned")
+            .get(&(window.to_string(), field.to_string()))
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, set)| Arc::clone(set))
+    }
+
+    /// Store a freshly built distinct-value set for `(window, field)` keyed to
+    /// `generation`.
+    pub fn put_has_field_values(
+        &self,
+        window: &str,
+        field: &str,
+        generation: u64,
+        set: Arc<HashSet<String>>,
+    ) {
+        self.has_cache
+            .write()
+            .expect("has cache lock poisoned")
+            .insert((window.to_string(), field.to_string()), (generation, set));
     }
 
     /// Consumption-progress table for the named window.

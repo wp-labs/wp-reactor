@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use wf_lang::plan::MatchPlan;
 
 use super::key::ValueKey;
-use super::types::{BindData, EngineHashMap, Event, RollingStats, Value};
+use super::types::{BindData, EngineHashMap, FieldSource, RollingStats, Value};
 
 // ---------------------------------------------------------------------------
 // Internal — per-branch / per-step / per-instance state
@@ -239,11 +239,11 @@ impl Instance {
     ///
     /// Accounts for struct overhead, scope key, and empty branch states
     /// from the plan (same layout as `Instance::new` would produce).
-    pub(super) fn base_estimated_bytes(
+    pub(super) fn base_estimated_bytes<E: FieldSource>(
         plan: &MatchPlan,
         _scope_key: &[Value],
         alias: &str,
-        event: &Event,
+        event: &E,
     ) -> usize {
         let mut size: usize = 128; // base struct overhead
         size += 32; // InstanceKey string (short ip key), per instance
@@ -351,21 +351,31 @@ fn val_estimated_bytes(v: &Value) -> usize {
     }
 }
 
-fn estimated_tracked_event_fields_bytes(plan: &MatchPlan, alias: &str, event: &Event) -> usize {
+fn estimated_tracked_event_fields_bytes<E: FieldSource>(
+    plan: &MatchPlan,
+    alias: &str,
+    event: &E,
+) -> usize {
     match plan.tracked_bind_fields.get(alias) {
         Some(fields) => fields
             .iter()
             .filter_map(|field| {
                 event
-                    .fields
-                    .get(field.as_str())
-                    .map(|value| field.len() + 24 + val_estimated_bytes(value))
+                    .field_value(field.as_str())
+                    .map(|value| field.len() + 24 + val_estimated_bytes(&value))
             })
             .sum(),
+        // No tracked set: estimate from every non-null field. `field_names` covers
+        // the whole schema/map; null/missing cells read `None` → 0 bytes, matching
+        // the eager event (batch_to_events drops nulls from the map).
         None => event
-            .fields
-            .iter()
-            .map(|(field, value)| field.len() + 24 + val_estimated_bytes(value))
+            .field_names()
+            .into_iter()
+            .filter_map(|field| {
+                event
+                    .field_value(field)
+                    .map(|value| field.len() + 24 + val_estimated_bytes(&value))
+            })
             .sum(),
     }
 }

@@ -593,13 +593,13 @@ fn number_literal(n: f64) -> CScalar {
 /// every other case (`+ - * /`, and any `i64`/`f64` mix) is f64 to match
 /// `eval_arithmetic`.
 fn arithmetic(op: BinOp, lv: &CScalar, rv: &CScalar) -> Option<CScalar> {
-    if op == BinOp::Mod {
-        if let (CScalar::Int(a), CScalar::Int(b)) = (lv, rv) {
-            if *b == 0 {
-                return None;
-            }
-            return Some(CScalar::Int(a % b));
+    if op == BinOp::Mod
+        && let (CScalar::Int(a), CScalar::Int(b)) = (lv, rv)
+    {
+        if *b == 0 {
+            return None;
         }
+        return Some(CScalar::Int(a % b));
     }
     let ln = to_f64(lv)?;
     let rn = to_f64(rv)?;

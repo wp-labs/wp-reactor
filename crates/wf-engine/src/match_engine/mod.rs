@@ -10,17 +10,19 @@ mod tests;
 
 pub use columnar::{GuardMasks, mask_to_indices};
 pub use event_bridge::{
-    ColumnarEvent, WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY, WFL_FIELD_TYPE_OBJECT,
-    batch_event_time_nanos, batch_event_time_nanos_at, batch_time_col_index, batch_to_events,
-    batch_to_events_filtered, batch_to_timestamped_rows, is_wfl_structured_field, materialize_rows,
-    materialize_rows_filtered, wfl_structured_field_kind,
+    build_field_index, column_scalar_string, columnar_join_rows, columnar_timestamped_join_rows,
+    ColumnarEvent, FieldIndex, JoinRow, WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY,
+    WFL_FIELD_TYPE_OBJECT, batch_event_time_nanos, batch_event_time_nanos_at, batch_time_col_index,
+    batch_to_events, batch_to_events_filtered, batch_to_timestamped_rows, is_wfl_structured_field,
+    materialize_rows, materialize_rows_filtered, wfl_structured_field_kind,
 };
 pub use executor::{EachDirectBatchStats, RuleExecutor, RuleExecutorOptions};
 pub use match_engine::apply_conv;
 pub use match_engine::close_is_qualified;
 pub use match_engine::{
-    CepStateMachine, CloseOutput, CloseReason, Event, JoinKey, MACHINE_ID, MatchedContext,
-    SharedLimits, StepData, StepOutcome, StepProgress, StepResult, Value, WindowLookup,
+    CepStateMachine, CloseOutput, CloseReason, Event, FieldSource, JoinKey, MACHINE_ID,
+    MatchedContext, SharedLimits, StepData, StepOutcome, StepProgress, StepResult, Value,
+    WindowLookup,
 };
 pub use match_engine::{EngineHashMap, EngineHashSet};
 pub(crate) use match_engine::{

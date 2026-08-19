@@ -10,6 +10,7 @@
 //!   - q2_filter：完整 guard `auction % 123 == 0`（含 binds 解析 + filter 查找 + 表达式评估）
 //!   - no_filter：无 guard 基线（Q1 on-each 形态的过滤入口）
 //!   - field_lookup：仅 HashMap 字段提取（guard 内 `auction` 读取的裸成本）
+//!
 //! delta = q2_filter − no_filter 即 guard 表达式的增量开销。
 
 use std::sync::Arc;

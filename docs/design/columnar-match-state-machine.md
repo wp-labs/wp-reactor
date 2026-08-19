@@ -67,8 +67,8 @@ RuleFanout::broadcast_inner:  Subscription::Sharded
                                   ▼
 RuleTask::process_batch:  sharded match 走懒物化（分层见 §6）
    只扫本 shard 的 shard_rows：时间列 + bind-filter 掩码 → 命中行子集
-   P2（本次）：命中行 materialize_rows_filtered 物化喂状态机（Q2 命中 ~0.81%）
-   P3（后续）：ColumnarEvent::new(batch, row) 直喂状态机（零 HashMap 物化）
+   P2（历史中间态，已删除）：命中行 materialize_rows_filtered 物化喂状态机（Q2 命中 ~0.81%）
+   P3（已落地，当前生产路径）：ColumnarEvent::with_index(batch, row, FieldIndex) 直喂状态机（零 HashMap 物化）
 ```
 
 ## 2. 类型/签名改动
@@ -284,30 +284,37 @@ let row_domain: Vec<usize> = match shard_rows {
 // unsharded 分支的 (0..num_rows)；sharded 走 row_domain，主循环也迭代 row_domain —— 不丢不重。
 // DeferredRows（times/hit/hit_indices）按 row_domain 相对下标构建，下游需绝对行时由
 // row_domain[i] 还原。现有逻辑原样作用于该子集：时间列读取 + bind-filter 掩码 → 命中行
-// P2（本次）：命中行 materialize_rows_filtered(batch, &hit_rows, materialize_fields)
+// P2（历史中间态，已删除）：命中行 materialize_rows_filtered(batch, &hit_rows, materialize_fields)
 //             物化喂 machine.advance_at（同现有 deferred 路径，状态机接口不动）
-// P3（后续）：ColumnarEvent::new(batch, row) 直喂状态机（免物化）
+// P3（已落地，当前路径）：ColumnarEvent::with_index(batch, row, &FieldIndex) 直喂状态机（免物化）
 ```
 
 - **watermark 语义不变**：shard 任务只扫本 shard 行的时间——与行式 sharded 一致（每 shard
   一台状态机，水位本就按各自子集推进）；shard_rows 外的非命中行零成本跳过。
-- 命中行（Q2 ~0.81%）本次仍物化为 `Event`（`materialize_fields` 投影），P3 再消。
+- 命中行（Q2 ~0.81%）现在直接以 `ColumnarEvent`（批级 `FieldIndex` O(1) 名解析）喂状态机，
+  不再物化 `Event`——`materialize_rows[_filtered]` 已从 deferred 生产路径删除（P3 落地）。
 
-## 6. 分层：先免物化广播（本次），后免物化命中行（P3）
+## 6. 分层：先免物化广播，后免物化命中行（两层均已落地）
 
-本次一次交付全部管道改动——`scope_key_columnar`/`partition_rows_by_key` + `precompute_shard_rows`
+先交付全部管道改动——`scope_key_columnar`/`partition_rows_by_key` + `precompute_shard_rows`
 （parse 侧预分片）+ 两级 `shard_rows`（`ParsedWindow` 全部分片 / `RulePush` 本 shard 子集）+
 `broadcast_inner` 复用预分片（fallback 才重分片）+ `route_parse` 放行 + `rule_task` 扫
-`row_domain`——但**不改状态机接口**：状态机仍吃命中行的 `&Event`（命中行仅 ~0.81%，
-`materialize_rows_filtered` 只物化命中行即可，不必一步到位 `FieldView`）。这样：
+`row_domain`。命中行免物化（P3）随后落地：状态机接口改为泛型
+`advance_at_with_masks<E: FieldSource>`，命中行以 `ColumnarEvent::with_index` 直喂，
+`materialize_rows[_filtered]` 已从生产路径删除。这样：
 
-- **本次交付**：sharded 免物化（broadcast 列式分片 + rule task 只扫 shard_rows + 命中行
+- **P2（历史交付）**：sharded 免物化（broadcast 列式分片 + rule task 只扫 shard_rows + 命中行
   `materialize_rows_filtered`）。收益即 parse 侧全量物化的解放（Q2 从 ~6-7M 提升到
   ~18M）；之后方案A 把分片挪出 actor + ScopeKey typed 直读原生值，再提到 **~34M**；
   再往上受残余第二道墙（窗口 actor 单写者 P0-③ 串行 append/broadcast）约束，需另拆。
-- **P3（后续）**：`FieldView` trait + 命中行也免物化（直接 `ColumnarEvent` 喂状态机）；
-  guard 向量化 kernel（整列 kernel）**已实现**（见附录），但对 Q2 吞吐无增益——被
-  第二道墙挡住，非 guard 侧。
+  （命中行 `materialize_rows_filtered` 已被 P3 取代并从生产路径删除。）
+- **P3（已实现，2026-08-19，commit 后续）**：`FieldSource` trait（`Event`/`ColumnarEvent`
+  都实现）+ 状态机 `advance_at_with_masks` 泛型化 → 命中行直接 `ColumnarEvent::with_index`
+  （批级 `FieldIndex` O(1) 名解析）直喂状态机，零 HashMap 物化；`defer_materialize` 不再
+  物化命中行（`DeferredRows` 只带 batch + index）。同时**放宽 defer 门槛**（field_usage
+  `plan_defer_safe` 放行任意 match 规则）——Q5/Q7/qradar 这类无 filter match 也走
+  deferred+columnar，消除 eager 整批物化。guard 整列向量化 kernel **已实现**（见附录），
+  对 Q2 吞吐无增益——被第二道墙挡住，非 guard 侧。
 
 ## 7. 边界与语义保持
 
@@ -319,7 +326,7 @@ let row_domain: Vec<usize> = match shard_rows {
 | `shard_rows` 为空 sub | `if rows.is_empty() { continue; }` 不发空 batch 给该 shard（省一次 channel send） |
 | 事件时间列 | 列式路径 `shard_rows` 行的时间仍从 batch 时间列取（现有 `batch_event_time_nanos_at`） |
 | seq / watermark / 回放 | sharded 广播仍是每 shard 一个 send，`seq` 不变；窗口 actor 不感知分片 |
-| 命中行物化字段集 | 用 `materialize_fields`（窗口 `field_usage` 投影），命中行 `materialize_rows_filtered` |
+| 命中行字段投影 | `materialize_fields`（窗口 `field_usage` 投影）作为 `ColumnarEvent` 的 `projection` 携带，仅 `trigger_event`→`Event` 转换时按需物化命中行；状态机 eval 经批级 `FieldIndex` 直读列（零 HashMap，P3 落地后 `materialize_rows_filtered` 已从生产路径删除） |
 | `trigger_event`（emit 路径） | 命中行在命中时物化该事件（`ColumnarEvent` → Event），仅命中行，可接受 |
 | match step guard 非列式 | `branch_guard_masks` 只对列式 guard 插掩码 → 无掩码即逐行解释求值（既有回退，不阻塞 defer） |
 | key 字段可用性 | `field_usage` 已把 `m.keys` 收进物化投影 → 行式回退同键可提取；列式路径按列名 `index_of`，同列同键 |
@@ -347,9 +354,10 @@ let row_domain: Vec<usize> = match shard_rows {
 3. **端到端 Q2**：EPS 较物化基线（~6-7M）提升、EMIT 精确、`[clean]`：
    ✅ 完成——EPS ~34M（提升 ~5×），EMIT 747816 精确 + `[clean]`。
 4. 回归 Q1/Q2/Q3/Q5/Q7/Q9 + seq：✅ 完成（全 `[clean]`，见附录实测表）
-5. (P3) `FieldView` + 命中行免物化 + guard 整列 kernel：
-   **guard 整列 kernel 已实现（✅）**，`FieldView`/命中行免物化未做。guard 向量化后
-   Q2 吞吐仍顶在第二道墙（100m 实测 EPS ~34M，CPU/RSS 无明显改善），见附录。
+5. (P3) `FieldSource` + 命中行免物化 + guard 整列 kernel：**全部已实现（✅）**——
+   guard 整列 kernel（commit `d7360f8`）+ `FieldSource` trait / 命中行 `ColumnarEvent`
+   直喂（本 commit）+ defer 门槛放宽（无 filter match 也 deferred）。Q2 吞吐仍顶在
+   第二道墙（100m 实测 EPS ~34M），见附录；Q5/Q7 由此消除 eager 整批物化。
 
 > **§9.3 注：为什么 Q2 停在 ~34M（路线回顾）**
 >
@@ -377,8 +385,8 @@ let row_domain: Vec<usize> = match shard_rows {
   构造一个（`Arc::new(b.clone())`，仅克隆 RecordBatch 外壳——列都是 `Arc<Array>`，成本极低），
   各 shard 仅 `batch_arc.clone()`（refcount 增量、零拷贝）。**不是每 shard 一份副本**。
   需确认 `Arc<RecordBatch>` 生命周期（TimedBatch 已持 batch，Arc 不复制列）。
-- **低**：命中行 `materialize_rows_filtered` 仍是物化（~0.81%），但相对全批省 99%，
-  已是本步收益主体；P3（FieldView）再消这 0.81%。
+- **低（已解决）**：命中行物化已由 P3 消除——`materialize_rows[_filtered]` 从生产路径删除，
+  命中行以 `ColumnarEvent::with_index` 直喂状态机（零 HashMap）。
 - **中（P3 已实现，收益暂未兑现）**：guard 整列向量化 kernel 对 Q2 无吞吐增益——
   因 Q2 不是 guard CPU 受限，而是窗口 actor 单写者（P0-③）墙受限；待拆该墙后
   guard kernel 的 CPU 收益才可能变现。

@@ -11,9 +11,9 @@ use tokio::sync::mpsc;
 
 use wf_engine::alert::{AlertColumnBatch, AlertColumnBuilder, OutputRecord};
 use wf_engine::match_engine::{
-    CepStateMachine, CloseReason, ColumnarEvent, Event, GuardMasks, RuleExecutor, StepResult,
-    batch_event_time_nanos_at, batch_time_col_index, batch_to_events, batch_to_events_filtered,
-    close_is_qualified, materialize_rows, materialize_rows_filtered,
+    CepStateMachine, CloseReason, ColumnarEvent, Event, FieldIndex, FieldSource, GuardMasks,
+    RuleExecutor, StepResult, batch_event_time_nanos_at, batch_time_col_index, batch_to_events,
+    batch_to_events_filtered, build_field_index, close_is_qualified,
 };
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
@@ -44,12 +44,49 @@ const EMIT_METRIC_SAMPLE_INTERVAL: u32 = 64;
 const ALERT_BATCH_SIZE: usize = 4096;
 
 /// Deferred-materialization row source for one batch (L2): the event time of
-/// every row (for the watermark/expiry scan) plus the pre-materialized
-/// bind-filter hit rows in ascending batch-row order.
-struct DeferredRows {
+/// every row (for the watermark/expiry scan) plus the bind-filter hit rows in
+/// ascending batch-row order. Hit rows are fed to the state machine as
+/// [`ColumnarEvent`] views (P3 FieldView) — no per-row HashMap materialization.
+struct DeferredRows<'a> {
     times: Vec<i64>,
     hit_indices: Vec<u32>,
-    hit_events: Vec<Arc<Event>>,
+    batch: &'a RecordBatch,
+    index: Arc<FieldIndex>,
+    /// The window's `materialize_fields` read-set projection: the columnar
+    /// `to_event()` materializes only these fields on emit, matching the eager
+    /// deferred path's projected trigger event.
+    projection: Option<Arc<HashSet<String>>>,
+}
+
+/// A per-row field source for the state-machine loop: either the eager
+/// materialized [`Event`] or a deferred [`ColumnarEvent`] view (P3 FieldView).
+/// Implements [`FieldSource`] so the generic machine consumes either unchanged.
+enum RowEvent<'a> {
+    Eager(&'a Event),
+    Columnar(ColumnarEvent<'a>),
+}
+
+impl FieldSource for RowEvent<'_> {
+    fn field_value(&self, name: &str) -> Option<wf_engine::match_engine::Value> {
+        match self {
+            RowEvent::Eager(e) => e.field_value(name),
+            RowEvent::Columnar(c) => c.field_value(name),
+        }
+    }
+
+    fn field_names(&self) -> Vec<&str> {
+        match self {
+            RowEvent::Eager(e) => e.field_names(),
+            RowEvent::Columnar(c) => c.field_names(),
+        }
+    }
+
+    fn to_event(&self) -> Event {
+        match self {
+            RowEvent::Eager(e) => e.to_event(),
+            RowEvent::Columnar(c) => c.to_event(),
+        }
+    }
 }
 
 /// Columnar accumulation of pending alerts, grouped by yield target.
@@ -530,30 +567,22 @@ impl RuleTask {
                 .filter(|&i| hit[i])
                 .map(|i| i as u32)
                 .collect();
-            let hit_events: Vec<Arc<Event>> = if columnar_each {
-                // The columnar fast path reads columns directly — materializing
-                // all hit rows into HashMap Events is the cost this path avoids.
-                Vec::new()
-            } else {
-                // Materialize the hit rows by their **absolute** batch rows,
-                // restricted to the window's `materialize_fields` projection
-                // (the rule's read-set) when available, exactly like the eager
-                // path — keeps the hit Event byte-identical and avoids pulling
-                // in unused schema columns.
-                let abs: Vec<u32> = hit_indices
-                    .iter()
-                    .map(|&i| row_domain[i as usize] as u32)
-                    .collect();
-                let hit_events: Vec<Event> = match materialize_fields {
-                    Some(fields) => materialize_rows_filtered(batch, &abs, fields),
-                    None => materialize_rows(batch, &abs),
-                };
-                hit_events.into_iter().map(Arc::new).collect()
-            };
+            // P3 FieldView: hit rows are fed to the state machine straight from
+            // the columns — no HashMap materialization. The batch-level field
+            // index makes `ColumnarEvent::field_value` O(1) per read; the
+            // `materialize_fields` projection keeps the emit-path trigger event
+            // byte-identical to the eager deferred path (projected). (The
+            // `columnar_each` early path is machine-free, so this branch never
+            // runs for it; `materialize_rows[_filtered]` stays only on the
+            // eager path below.)
+            let index = build_field_index(batch);
+            let projection = materialize_fields.map(|f| Arc::new(f.clone()));
             Some(DeferredRows {
                 times,
                 hit_indices,
-                hit_events,
+                batch,
+                index,
+                projection,
             })
         } else {
             None
@@ -647,14 +676,12 @@ impl RuleTask {
             for alias in aliases.iter() {
                 match columnar_masks.get(alias) {
                     Some(Some(mask)) => {
-                        for row in 0..num_rows {
-                            hit[row] |= mask.value(row);
+                        for (row, h) in hit.iter_mut().enumerate() {
+                            *h |= mask.value(row);
                         }
                     }
                     _ => {
-                        for row in 0..num_rows {
-                            hit[row] = true;
-                        }
+                        hit.fill(true);
                     }
                 }
             }
@@ -703,15 +730,9 @@ impl RuleTask {
         // `row_index` is the absolute batch row it maps to.
         for (i, &row_index) in row_domain.iter().enumerate() {
             let event: Option<&Arc<Event>> = match (&deferred, &eager_events) {
-                (Some(d), _) => {
-                    if hit_cursor < d.hit_indices.len() && d.hit_indices[hit_cursor] as usize == i {
-                        let event = &d.hit_events[hit_cursor];
-                        hit_cursor += 1;
-                        Some(event)
-                    } else {
-                        None
-                    }
-                }
+                // Deferred hit rows are served as ColumnarEvent views inside the
+                // machine branch — no materialized hit events here.
+                (Some(_), _) => None,
                 (None, Some(events)) => Some(&events[row_index]),
                 (None, None) => None,
             };
@@ -747,7 +768,26 @@ impl RuleTask {
                 // advance and no bind filter would accept them, so skip the
                 // state-machine step but keep the close path.
                 let mut matched = Vec::new();
-                if let Some(event) = event {
+                // Resolve the per-row source: ColumnarEvent for deferred hit rows
+                // (P3 FieldView — no HashMap materialization), else the eager
+                // event. Debug and defer are mutually exclusive, so the Eager arm
+                // is the only one that appears with debug detail enabled.
+                let row_event: Option<RowEvent<'_>> = if let Some(d) = &deferred {
+                    (hit_cursor < d.hit_indices.len()
+                        && d.hit_indices[hit_cursor] as usize == i)
+                    .then(|| {
+                        hit_cursor += 1;
+                        RowEvent::Columnar(ColumnarEvent::with_index_projected(
+                            d.batch,
+                            row_index,
+                            Arc::clone(&d.index),
+                            d.projection.clone(),
+                        ))
+                    })
+                } else {
+                    event.map(|ev| RowEvent::Eager(ev.as_ref()))
+                };
+                if let Some(row_event) = row_event {
                     let _advance_start = Instant::now();
                     for alias in ordered_aliases {
                         if !alias_accepts(
@@ -755,14 +795,14 @@ impl RuleTask {
                             &columnar_masks,
                             alias,
                             row_index,
-                            event,
+                            &row_event,
                             &lookup,
                         ) {
                             if debug_enabled {
                                 stats.alias_rejected += 1;
                             }
                             if debug_enabled && stats.allow_detail() {
-                                let event_ref = event_debug_ref(event, batch_seq, row_index);
+                                let event_ref = row_event_debug_ref(&row_event, batch_seq, row_index);
                                 wf_debug!(pipe,
                                     rule = %rule_name_for_log,
                                     stage = 0,
@@ -782,7 +822,7 @@ impl RuleTask {
                         let (step_result, progress) = if should_capture_progress {
                             let outcome = machine.advance_at_with_progress(
                                 alias,
-                                event,
+                                &row_event,
                                 event_nanos,
                                 Some(&lookup),
                             );
@@ -791,7 +831,7 @@ impl RuleTask {
                             (
                                 machine.advance_at_with_masks(
                                     alias,
-                                    event,
+                                    &row_event,
                                     event_nanos,
                                     Some(&lookup),
                                     row_index,
@@ -807,7 +847,7 @@ impl RuleTask {
                                 }
                                 if debug_enabled && stats.allow_detail() {
                                     let instances = machine.instance_count();
-                                    let event_ref = event_debug_ref(event, batch_seq, row_index);
+                                    let event_ref = row_event_debug_ref(&row_event, batch_seq, row_index);
                                     if let Some(progress) = progress.as_ref() {
                                         wf_debug!(pipe,
                                             rule = %rule_name_for_log,
@@ -846,7 +886,7 @@ impl RuleTask {
                                 }
                                 if debug_enabled && stats.allow_detail() {
                                     let instances = machine.instance_count();
-                                    let event_ref = event_debug_ref(event, batch_seq, row_index);
+                                    let event_ref = row_event_debug_ref(&row_event, batch_seq, row_index);
                                     if let Some(progress) = progress.as_ref() {
                                         wf_debug!(pipe,
                                             rule = %rule_name_for_log,
@@ -884,7 +924,7 @@ impl RuleTask {
                                     stats.matched += 1;
                                 }
                                 if debug_enabled && stats.allow_detail() {
-                                    let event_ref = event_debug_ref(event, batch_seq, row_index);
+                                    let event_ref = row_event_debug_ref(&row_event, batch_seq, row_index);
                                     let step = ctx.step_data.last();
                                     wf_debug!(pipe,
                                         rule = %rule_name_for_log,
@@ -1022,7 +1062,7 @@ impl RuleTask {
                     &columnar_masks,
                     alias,
                     row_index,
-                    event,
+                    event.as_ref(),
                     &lookup,
                 ) {
                     if debug_enabled {
@@ -2183,7 +2223,7 @@ fn alias_accepts(
     masks: &HashMap<String, Option<BooleanArray>>,
     alias: &str,
     row: usize,
-    event: &Event,
+    event: &dyn FieldSource,
     lookup: &RegistryLookup<'_>,
 ) -> bool {
     match masks.get(alias) {
@@ -2204,6 +2244,16 @@ fn event_debug_ref(
         .or_else(|| event.fields.get("id"))
         .map(value_debug_string)
         .unwrap_or_else(|| format!("batch:{batch_seq}/row:{row_index}"))
+}
+
+/// Debug rendering for a [`RowEvent`]: the Eager arm delegates to the event's
+/// fields; the Columnar arm has no materialized fields and is mutually
+/// exclusive with debug detail (deferral requires `!debug_enabled`).
+fn row_event_debug_ref(ev: &RowEvent<'_>, batch_seq: u64, row_index: usize) -> String {
+    match ev {
+        RowEvent::Eager(e) => event_debug_ref(e, batch_seq, row_index),
+        RowEvent::Columnar(_) => format!("batch:{batch_seq}/row:{row_index}"),
+    }
 }
 
 fn value_debug_string(value: &wf_engine::match_engine::Value) -> String {
