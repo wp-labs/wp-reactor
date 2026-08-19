@@ -2,6 +2,44 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [1.2.0] — 2026-08-19
+
+### Added
+
+- **wf-engine / wf-runtime**: Sharded `match` rules are now deferable — `RulePush.shard_rows` broadcasts the shared batch + per-shard row subset (`events=None`), with columnar sharding byte-identical to the row path; `route_parse` no longer excludes sharded windows from deferred broadcast. Q2 **~8M → ~17.86M** (+123%), EMIT 747 816 exact.
+- **wf-engine**: Key sharding moved off the window-actor hot path — `precompute_shard_rows` partitions batches in the parallel parse stage and the actor reuses the result (defensive re-partition fallback). Cuts actor-side partition CPU ~98%, but the wall is per-row partition cost, not its location — hence `ScopeKey`.
+- **wf-engine**: `ScopeKey` — typed match-key enum (`Empty`/`Int`/`Float`/`Str`/`Pair`) read straight from columns, shared by columnar/row sharding (identical below `2^53`); replaces the `Vec<Value> → string → FNV` shard-hash chain.
+
+### Changed
+
+- **wf-engine**: Guard evaluation is now a whole-column vectorized kernel (each `ColumnExpr` node computes a typed `CVec` for the whole batch; byte-identical semantics — SQL three-valued `&&`/`||`, native `i64`, epsilon float, `>2^53` divergence, null propagation); per-row `eval_cx` removed.
+- **wf-engine**: Q1 output commit is batched unconditionally (`WF_L3_BATCH` gate removed) — the per-row `Vec::push`×10 + `fill_row_gaps` scan becomes one `commit_each_rows_batch` per segment.
+- **wf-engine**: Q1 last materialization removed — numeric `entity == yield` fields are written straight as raw `f64` (byte-identical to the `Value` path for Digit/Float/Chars/untyped targets).
+- **wf-engine**: `InstanceKey` migrated to `ScopeKey` — instance lookup is serialization-free.
+- **wf-runtime**: Deferred hit rows materialize via the `materialize_fields` projection (`materialize_rows_filtered`) instead of full `materialize_rows`.
+
+### Fixed
+
+- **wf-engine**: Block-level fill misplaced gaps in sparse segments (`[real0, real2, fill]` → `[real0, fill, real2]`), now row-order aligned with `fill_row_gaps`; pinned by equivalence tests.
+- **wf-runtime**: Relay/eager push used the batch row count when `events=Some` but `batch=None`, hanging `downstream_close`.
+- **wf-engine**: A null/missing entity on the columnar path now emits the empty string (aligned with the eager `Event` path) instead of erroring + continuing.
+
+### Performance
+
+- **wf-engine**: Q2 sharded deferral `~8M → ~17.86M` (+123%); regression suite `[clean]`.
+- **wf-engine**: `ScopeKey` shard hash — Q2 `~18M → ~34M` (×2), Q5 `3.7M → 5.23M` (+41%), Q7 `3.5M → 5.02M` (+43%); Q1 unchanged.
+- **wf-engine**: `InstanceKey → ScopeKey` — Q2 31.9M; Q5/Q7 4.7–5.0M under load (+35%+).
+- **wf-engine**: Q1 on-each third round -13% (batch-level column index, typed `EntityCol`, batched wfx prefix) — single-thread E1 `621.6 → 140.6 ns/row` (-77%); entity==yield f64 write → 13.79M @100m.
+- **wf-engine**: L3 batch commit — 100m EPS **+305%**, CPU -16%, RSS halved, EMIT 92M exact.
+- **wf-engine**: P3 guard kernel — no Q2 gain (window-actor single-writer wall); the per-event CPU win is deferred until that wall falls.
+
+### Documentation
+
+- **Design**: Added `docs/design/columnar-match-state-machine.md` (sharded no-materialization design); corrected the Q2 acceptance target (~90M receive-only is not a sensible goal).
+- **Design**: `q1-throughput-bisection.md` §23 — the EMIT end-of-run sampling artifact (81.65M vs 92M is exporter flush lag, not ~11% row loss); `[clean]` is the integrity authority.
+- **Design**: `columnar-execution-progress.md` — residual-materialization A/B/C survey; none are current hot spots → no blind fixing.
+- **Design**: Stale-doc cleanup — removed `reviewed.md`, fixed 8 dead links, corrected the `error-handling.md` crate-boundary table.
+
 ## [1.1.0] — 2026-08-18
 
 ### Added

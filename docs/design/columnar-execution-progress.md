@@ -12,8 +12,9 @@
 | M2a 重测 Q2 基线 + 覆盖率统计 | ✅ 完成 | guard 覆盖率 **85.3%**；Q2 基线（2GB content）**~6.8M（双峰 6.2~7.2M）**，详见下 |
 | M2b L1 guard 列式化 | ✅ 完成 | 静态门 + 预编译列式求值器（f64 + 原生 Int64）；bind filter + 事件/close/seq branch guard 全部列式化（close 三值 permissive、event/neg 两值 must-be-true）；列式 guard **14.3ns/事件**（interpreted 216.9ns），<20ns 达标；≤2^53 对拍 100% 一致；**端到端 Q2 EPS 无增益（两道墙限，见 Step 8）** |
 | M3 L2 物化延迟 | ✅ 端到端懒物化已落地 | `route_parse` 广播原始批 → `RuleTask` 全行扫时间列（watermark/过期）+ 只物化 bind-filter 命中行 → 只推进命中行 |
-| M4 L3 输出列式 | ⬜ 未开始 | — |
+| M4 L3 输出列式 | ✅ 已落地（2026-08-19） | on-each 输出改**批式列写**（`AlertColumnBuilder::commit_each_rows_batch`，无条件化，删掉被替换的逐行 `commit_each_row`）——段末一次列主序 bulk extend + 块级填充，替代逐行 10×`Vec::push` + `fill_row_gaps` 扫描；修复块级填充的稀疏段中空缺错位；Q1 100m 稳态同 load 下 **EPS +305%、CPU -16%、RSS 砍半，EMIT 92M 精确 `[clean]`** |
 | M5 L4/L5 | ⬜ 未开始 | — |
+| （旁记）Sharded match 免物化 | ✅（详见 `columnar-match-state-machine.md`） | 方案A parse 侧预分片（`precompute_shard_rows`）+ `ScopeKey` typed 分片键——Q2 ~18M → **~34M**；Q5/Q7 +28-43% |
 
 ## 本次提交内容
 
@@ -276,13 +277,51 @@
   `on each` 窗口是纯开销），或进一步列式化 each 路径消除物化——但单就 defer 而言已把
   mailbox 这道墙拆掉，为后续铺路。
 
+### Step 13 — L3 输出列式（批式列写，commit `a5ca4d2`）
+
+- **背景**：Q1 100m 稳态主墙是 on-each 输出**填充**（fill）——每行 10×`Vec::push`
+  （wfx_id/score/entity_id/fired_at + 6 个 plan 常量 Arc clone）+ 一次 `fill_row_gaps`
+  扫描。q1-bisection §15 cut C 实测 fill ≈ 每行工作的大头。
+- **实现**（`wf-engine/src/alert/column_batch.rs` + `executor/each_exec.rs`）：
+  - 新增 `AlertColumnBuilder::commit_each_rows_batch`：段末一次**列主序** bulk `extend`
+    系统列（10 列各一次 reserve + extend），段级块填充补齐 yield 列；
+  - `execute_each_direct_batch_columnar` 收段：逐行 `stage_yield_cell(_f64)` 走既有
+    校验/导出，但**不逐行 commit**，改为收集到段缓冲（`wfx_ids/scores/entity_ids/`
+    `fired_ats` + `take_staged()` 每行的 staged 单元），段末一次 `commit_each_rows_batch`。
+  - 去掉 `WF_L3_BATCH` env 门控，批写成为**唯一路径**；删除被替换的逐行
+    `builder.commit_each_row(EachRowCells{...})` 分支（事件路径 `execute_each` /
+    `build_each_direct` 仍逐行，保留 `commit_each_row`）。
+- **正确性修复（关键）**：块级填充原先把空缺补到**块尾**（`[real0, real2, fill]`），而
+  逐行 `fill_row_gaps` 目标是**就地填充**（`[real0, fill, real2]`）——稀疏段中缺席字段
+  会错位到块尾，导致后续列单元错位。改为按行序遍历、在推进每个真实单元前先补齐该列
+  空缺（`while col.values.len() < row_pos` 填 `const_value` 或 `Ignore/Null`），再块尾
+  top-up 从未被 stage 的列（字面量/闲置列）。`fill_row_gaps` 与 `commit_each_rows_batch`
+  在稠密/稀疏/闲置列三类下均逐字节一致。
+- **测试**（`column_batch.rs`）：`commit_each_rows_batch_matches_repeated_commit_each_row`（稀疏
+  段中 `price in {0,2}` + 闲置列 + `assert_mid_gap_at` 断言空缺位置）+
+  `commit_each_rows_batch_dense_all_present`（稠密默认）。
+- **测量（100m 稳态，同 load 块配对）**：
+
+  | 配置 | EPS | CPU | RSS | EMIT |
+  |---|---|---|---|---|
+  | 基线（fill 逐行） | 8-14M | ~990-1360% | 18-20GB | 92M（`[clean]`） |
+  | **L3 批写（默认）** | **~27-33M** | ~720-1140% | ~9GB | **92M 精确（`[clean]`）** |
+
+  - 同 load 下较 fill 逐行基线 **+305% EPS、CPU -16%、RSS 砍半**；
+  - 相对 fill 切探针（41M）仍低：fill 切不产出真数据，L3 是真实产出且已吸收 fill，
+    差距来自残余 yield stage / 收集开销。
+
 ## 验证结果
 
 ```text
 cargo test -p wf-lang --lib   → 526 passed
-cargo test -p wf-engine --lib  → 480 passed, 3 ignored (guard_bench 基准)
-cargo test -p wf-runtime --lib → 165 passed
+cargo test -p wf-engine --lib  → 493 passed, 4 ignored
+cargo test -p wf-runtime --lib → 167 passed
 ```
+
+> 数字随 M4 L3 落地更新：5 查询（Q1/Q2/Q3/Q5/Q7/Q9）100m 全 `[clean]`、appended 100M/100M，
+> Q1 EMIT 92M 精确、Q2 `q2_mod_123` 747816（=0.8129%×100M）；qradar_pk 450 规则
+> EPS~150-162k（目标 1 万）、`#18` 无驱逐。
 
 ## M2a — qradar 规则集 guard 纯列运算覆盖率
 
@@ -358,3 +397,10 @@ C 是必需物化非浪费。**不盲修**（避免 M13 P3 教训：优化不是
    sink。切掉 sink 单独复测（`flush_alerts` 直接 drop）：EPS 7.52M/8.18M（vs 基线 7.17M），
    **sink 只占 ~5-10%**。**结论：Q1 端到端天花板仍是管线深度（preread 2GB / Little's law），
    sink 与窗口 actor 都不是主墙；旁路与 sink 切均已回退。**
+7. ~~**M4 L3 输出列式**~~ ✅ 已完成（Step 13，commit `a5ca4d2`）：on-each 输出改批式列写并无条件化，
+   Q1 100m 稳态同 load 下 EPS +305%、CPU -16%、RSS 砍半，EMIT 92M 精确 `[clean]`。
+8. **M4 后续（可选，Q1 仍低于 fill 切 41M 下限）**：L3 批写相对 fill 切还有 ~20-30% 差距（来自残余
+   yield stage / 段收集开销）——若要逼近 fill 切，可压分段收集或数字列批量格式化（q1-bisection §16
+   wfx_id 的 4×f64 格式化）。当前 EPS ~27-33M 已是净大胜，非紧急。
+9. **Sharded match 免物化（方案A + ScopeKey）**：已在 `columnar-match-state-machine.md` 记录，
+   Q2 ~34M / Q5+41% / Q7+43%；残余墙是窗口 actor 单写者（P0-③），后续拆墙见该文档。
