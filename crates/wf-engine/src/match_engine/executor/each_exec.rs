@@ -28,6 +28,14 @@ use super::eval::{
     with_yield_eval_scope,
 };
 
+// L3 batched write (now unconditional): collect a segment's column values and
+// bulk-`extend` each builder column once at the end via
+// `commit_each_rows_batch`, instead of per-row `commit_each_row`. Cell staging
+// still runs through the builder (same validation+export); only the final
+// column push is batched. Byte-identical to the per-row commit (see the
+// `commit_each_rows_batch_*` equivalence tests) — Q1 on-each is fill-bound and
+// this is ~4× cheaper on CPU and ~half the RSS.
+
 impl RuleExecutor {
     /// Produce an [`OutputRecord`] from a single event in `on each` mode.
     ///
@@ -593,6 +601,18 @@ impl RuleExecutor {
             _ => EntityCol::Generic,
         };
 
+        // L3 batched write: collect each segment row's column values and commit
+        // them once at the end (see function-level doc). Cell staging still runs
+        // through the builder (same validation+export); only the final column
+        // push is batched.
+        let mut wfx_ids: Vec<String> = Vec::new();
+        let mut scores: Vec<f64> = Vec::new();
+        let mut entity_ids: Vec<String> = Vec::new();
+        let mut fired_ats: Vec<String> = Vec::new();
+        // `Vec<(usize, DataType, ModelValue)>` — one row of staged yield cells
+        // per segment row, drained via `builder.take_staged()`. Inferred here.
+        let mut staged_rows: Vec<Vec<_>> = Vec::new();
+
         for (idx, (event, event_time_nanos)) in rows.iter().enumerate() {
             // -- Per-row system values (identical to the Event-based path) ---
             let t_entity = if prof.enabled() {
@@ -761,23 +781,35 @@ impl RuleExecutor {
             } else {
                 None
             };
-            builder.commit_each_row(EachRowCells {
-                wfx_id,
-                score,
-                entity_id,
-                fired_at,
-                rule_name: &statics.rule_name,
-                entity_type: &statics.entity_type,
-                origin: &statics.each_origin,
-                close_reason: &statics.each_close_reason,
-                emit_time: &emit_time,
-                summary: &summary,
-            });
+            // Batch-write: collect this row's columns; the per-row staged
+            // cells are drained from the builder (same validation/export as
+            // per-row). Commit all rows once after the loop.
+            wfx_ids.push(wfx_id);
+            scores.push(score);
+            entity_ids.push(entity_id);
+            fired_ats.push(fired_at);
+            staged_rows.push(builder.take_staged());
             if let Some(t) = t_commit {
                 prof.add(e1_bucket_commit(), t);
             }
             stats.appended += 1;
             appended_out.push(idx);
+        }
+        // L3 batched commit: one bulk column append for the whole segment.
+        if !wfx_ids.is_empty() {
+            builder.commit_each_rows_batch(
+                &wfx_ids,
+                &scores,
+                &entity_ids,
+                &fired_ats,
+                &statics.rule_name,
+                &statics.entity_type,
+                &statics.each_origin,
+                &statics.each_close_reason,
+                &emit_time,
+                &summary,
+                &staged_rows,
+            );
         }
         prof.report(rows.len());
         stats

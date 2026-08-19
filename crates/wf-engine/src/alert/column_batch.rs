@@ -444,6 +444,14 @@ impl AlertColumnBuilder {
         self.staged.clear();
     }
 
+    /// Drain the cells staged for the current row (batch-write path; L3).
+    /// `stage_yield_cell`/`stage_yield_cell_f64` append here; the batched
+    /// commit collects them via this instead of `commit_each_row` draining
+    /// them per row.
+    pub(crate) fn take_staged(&mut self) -> Vec<(usize, DataType, ModelValue)> {
+        std::mem::take(&mut self.staged)
+    }
+
     /// Stage one yield cell for the row being built (fallible: reserved-name
     /// validation, duplicate detection and typed conversion — identical rules
     /// to `append_record`). `field_type` is the plan-side spec of this field
@@ -602,6 +610,117 @@ impl AlertColumnBuilder {
         self.len += 1;
     }
 
+    /// L3 batched commit: append a whole segment of rows **column-major**, so
+    /// the per-row fill that dominated Q1's on-each output (10 `Vec::push` +
+    /// a `fill_row_gaps` scan per row) becomes 10 bulk `extend`s + one block-
+    /// level yield fill. Byte-identical to committing each row via
+    /// [`Self::commit_each_row`].
+    ///
+    /// `staged_rows` is one entry per row, in order, each a slice of that
+    /// row's staged yield cells `(col_idx, meta, value)` (same layout
+    /// `stage_yield_cell`/`stage_yield_cell_f64` produce).
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_each_rows_batch(
+        &mut self,
+        wfx_id: &[String],
+        score: &[f64],
+        entity_id: &[String],
+        fired_at: &[String],
+        rule_name: &Arc<str>,
+        entity_type: &Arc<str>,
+        origin: &Arc<str>,
+        close_reason: &Arc<str>,
+        emit_time: &Arc<str>,
+        summary: &Arc<str>,
+        staged_rows: &[Vec<(usize, DataType, ModelValue)>],
+    ) {
+        let n = wfx_id.len();
+        debug_assert_eq!(score.len(), n);
+        debug_assert_eq!(entity_id.len(), n);
+        debug_assert_eq!(fired_at.len(), n);
+        debug_assert_eq!(staged_rows.len(), n);
+        // Reserve once for the whole block (amortizes the per-row growth).
+        self.wfx_id.reserve(n);
+        self.score.reserve(n);
+        self.entity_id.reserve(n);
+        self.fired_at.reserve(n);
+        self.rule_name.reserve(n);
+        self.entity_type.reserve(n);
+        self.origin.reserve(n);
+        self.close_reason.reserve(n);
+        self.emit_time.reserve(n);
+        self.summary.reserve(n);
+        // Bulk system columns.
+        self.wfx_id.extend_from_slice(wfx_id);
+        self.score.extend_from_slice(score);
+        self.entity_id.extend_from_slice(entity_id);
+        self.fired_at.extend_from_slice(fired_at);
+        // Plan-constant columns: same `Arc` every row.
+        self.rule_name
+            .extend(std::iter::repeat(Arc::clone(rule_name)).take(n));
+        self.entity_type
+            .extend(std::iter::repeat(Arc::clone(entity_type)).take(n));
+        self.origin
+            .extend(std::iter::repeat(Arc::clone(origin)).take(n));
+        self.close_reason
+            .extend(std::iter::repeat(Arc::clone(close_reason)).take(n));
+        self.emit_time
+            .extend(std::iter::repeat(Arc::clone(emit_time)).take(n));
+        self.summary
+            .extend(std::iter::repeat(Arc::clone(summary)).take(n));
+        // Yield cells, interleaved with per-row gap fills. `fill_row_gaps`
+        // (per-row path) pushes one fill cell for every column that received no
+        // staged cell that row — so a field that is present in rows {0, 2} but
+        // absent in row 1 must land as [real0, fill, real2], NOT be topped up
+        // to the block tail as a trailing run. To stay byte-identical we walk
+        // the rows in order and, before pushing each real cell, pad that column
+        // with the fill(s) for the rows since its previous real cell. Columns
+        // with no staged cells (literal/idle) get the block-level top-up below.
+        let target = self.len + n;
+        for (row_idx, row) in staged_rows.iter().enumerate() {
+            let row_pos = self.len + row_idx;
+            for (col_idx, meta, value) in row {
+                let col = &mut self.yield_cols[*col_idx];
+                // Pad columns whose last real cell predates this row (field was
+                // absent for intervening rows) — same fill value as
+                // `fill_row_gaps` (batched constant, else Ignore/Null).
+                while col.values.len() < row_pos {
+                    match &col.const_value {
+                        Some((meta, value)) => {
+                            col.metas.push(meta.clone());
+                            col.values.push(value.clone());
+                        }
+                        None => {
+                            col.metas.push(DataType::Ignore);
+                            col.values.push(ModelValue::Null);
+                        }
+                    }
+                }
+                col.metas.push(meta.clone());
+                col.values.push(value.clone());
+            }
+        }
+        // Top up columns that never got a staged cell this block (literal /
+        // idle columns) to the block target — each fill contributes the column
+        // constant, else Ignore/Null (byte-identical to their per-row fills).
+        for col in &mut self.yield_cols {
+            while col.values.len() < target {
+                match &col.const_value {
+                    Some((meta, value)) => {
+                        col.metas.push(meta.clone());
+                        col.values.push(value.clone());
+                    }
+                    None => {
+                        col.metas.push(DataType::Ignore);
+                        col.values.push(ModelValue::Null);
+                    }
+                }
+            }
+        }
+        debug_assert!(self.yield_cols.iter().all(|c| c.values.len() == target));
+        self.len += n;
+    }
+
     /// Fill gap cells for yield columns that received no staged cell this
     /// row (optional input field missing → field omitted, wp-labs#62). Every
     /// column must stay row-aligned; gap cells read back as `(Ignore, Null)`
@@ -708,6 +827,21 @@ mod tests {
         }
     }
 
+    /// Assert the field `name` was filled as a **mid-segment gap** at `row`
+    /// (meta `Ignore`, null) — i.e. it was absent that row rather than a
+    /// trailing fill. Guards the sparse-in-the-middle placement fix for the
+    /// batched fill (the pre-fix block-level top-up put such fills at the tail,
+    /// which is not byte-identical to the per-row path).
+    fn assert_mid_gap_at(builder: &AlertColumnBuilder, name: &Arc<str>, row: usize) {
+        let col = builder.yield_cols.iter().find(|c| c.name == *name).unwrap();
+        assert_eq!(
+            col.metas[row],
+            DataType::Ignore,
+            "expected mid-segment fill gap for {name:?} at row {row}"
+        );
+        assert_eq!(col.values[row], ModelValue::Null);
+    }
+
     #[test]
     fn column_batch_row_view_matches_to_data_record() {
         let records = vec![
@@ -734,6 +868,233 @@ mod tests {
             let via_columns = batch.iter_data_records().nth(row).unwrap().unwrap();
             let via_rows = record.to_data_record().unwrap();
             assert_records_equal(&via_columns, &via_rows);
+        }
+    }
+
+    #[test]
+    fn commit_each_rows_batch_matches_repeated_commit_each_row() {
+        // L3 batched commit must produce byte-identical output to committing
+        // the same rows one-by-one via `commit_each_row` (constant + field
+        // yield columns, block-level gap fill, plan-constant system cols).
+        use crate::alert::types::export_yield_value;
+        use wf_lang::BaseType;
+        let target = Arc::from("alerts");
+        let ft_chars = FieldType::Base(BaseType::Chars);
+        let ft_float = FieldType::Base(BaseType::Float);
+        let rule_name = Arc::from("q1_pass");
+        let entity_type = Arc::from("digit");
+        let origin = Arc::from("event");
+        let close_reason = Arc::from("");
+        let emit_time = Arc::from("2026-08-16T00:00:01Z");
+        let summary = Arc::from("summary");
+        let n = 3usize;
+        // `price` present in rows {0, 2} but absent in row 1 → the batched
+        // fill must land [real0, fill, real2], not a trailing run; `idle` is a
+        // registered column that never gets staged (idle/literal analog).
+        let price_present = [true, false, true];
+
+        // ---- row-by-row builder ----
+        let mut via_row = AlertColumnBuilder::new(Arc::clone(&target));
+        via_row
+            .register_yield_column(
+                &Arc::from("alert_type"),
+                Some(export_yield_value(&Value::Str("q1".into()), Some(&ft_chars)).unwrap()),
+            )
+            .unwrap();
+        via_row
+            .register_yield_column(&Arc::from("auction_id"), None)
+            .unwrap();
+        via_row
+            .register_yield_column(&Arc::from("price"), None)
+            .unwrap();
+        via_row
+            .register_yield_column(&Arc::from("idle"), None)
+            .unwrap();
+        for i in 0..n {
+            via_row.begin_row();
+            via_row
+                .stage_yield_cell(
+                    &Arc::from("auction_id"),
+                    Some(&ft_float),
+                    &Value::Number((1000 + i) as f64),
+                )
+                .unwrap();
+            if price_present[i] {
+                via_row
+                    .stage_yield_cell(
+                        &Arc::from("price"),
+                        Some(&ft_float),
+                        &Value::Number(9.5 + i as f64 * 10.0),
+                    )
+                    .unwrap();
+            }
+            via_row.commit_each_row(EachRowCells {
+                wfx_id: format!("id{i}"),
+                score: 42.0 + i as f64,
+                entity_id: format!("10.0.0.{}", i + 1),
+                fired_at: format!("ts{i}"),
+                rule_name: &rule_name,
+                entity_type: &entity_type,
+                origin: &origin,
+                close_reason: &close_reason,
+                emit_time: &emit_time,
+                summary: &summary,
+            });
+        }
+        // Sparse-mid-segment `price` placement: [real0, fill, real2].
+        assert_mid_gap_at(&via_row, &Arc::from("price"), 1);
+
+        // ---- batched builder ----
+        let mut via_batch = AlertColumnBuilder::new(Arc::clone(&target));
+        via_batch
+            .register_yield_column(
+                &Arc::from("alert_type"),
+                Some(export_yield_value(&Value::Str("q1".into()), Some(&ft_chars)).unwrap()),
+            )
+            .unwrap();
+        via_batch
+            .register_yield_column(&Arc::from("auction_id"), None)
+            .unwrap();
+        via_batch
+            .register_yield_column(&Arc::from("price"), None)
+            .unwrap();
+        via_batch
+            .register_yield_column(&Arc::from("idle"), None)
+            .unwrap();
+        // Pre-export the field cells for the batch path (same export the
+        // per-row `stage_yield_cell` performs), column-major per row.
+        let auction_col = via_batch
+            .yield_cols
+            .iter()
+            .position(|c| c.name.as_ref() == "auction_id")
+            .unwrap();
+        let price_col = via_batch
+            .yield_cols
+            .iter()
+            .position(|c| c.name.as_ref() == "price")
+            .unwrap();
+        let wfx: Vec<String> = (0..n).map(|i| format!("id{i}")).collect();
+        let scores: Vec<f64> = (0..n).map(|i| 42.0 + i as f64).collect();
+        let eids: Vec<String> = (0..n).map(|i| format!("10.0.0.{}", i + 1)).collect();
+        let fats: Vec<String> = (0..n).map(|i| format!("ts{i}")).collect();
+        let mut staged_rows = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = export_yield_value(&Value::Number((1000 + i) as f64), Some(&ft_float)).unwrap();
+            let mut row_cells = vec![(auction_col, a.0, a.1)];
+            if price_present[i] {
+                let p = export_yield_value(&Value::Number(9.5 + i as f64 * 10.0), Some(&ft_float))
+                    .unwrap();
+                row_cells.push((price_col, p.0, p.1));
+            }
+            staged_rows.push(row_cells);
+        }
+        via_batch.commit_each_rows_batch(
+            &wfx,
+            &scores,
+            &eids,
+            &fats,
+            &rule_name,
+            &entity_type,
+            &origin,
+            &close_reason,
+            &emit_time,
+            &summary,
+            &staged_rows,
+        );
+        assert_mid_gap_at(&via_batch, &Arc::from("price"), 1);
+
+        let batch_row = via_row.finish();
+        let batch_col = via_batch.finish();
+        assert_eq!(batch_row.len(), batch_col.len());
+        assert_eq!(batch_row.len(), n);
+        for i in 0..batch_row.len() {
+            let a = batch_row.iter_data_records().nth(i).unwrap().unwrap();
+            let b = batch_col.iter_data_records().nth(i).unwrap().unwrap();
+            assert_records_equal(&a, &b);
+        }
+    }
+
+    #[test]
+    fn commit_each_rows_batch_dense_all_present() {
+        // Regression guard for the L3 default case (Q1: every yield field
+        // present every row, no mid-segment gaps): batched commit stays
+        // byte-identical to repeated `commit_each_row`.
+        use crate::alert::types::export_yield_value;
+        use wf_lang::BaseType;
+        let target = Arc::from("alerts");
+        let ft_chars = FieldType::Base(BaseType::Chars);
+        let rule_name = Arc::from("q1_pass");
+        let entity_type = Arc::from("digit");
+        let origin = Arc::from("event");
+        let close_reason = Arc::from("");
+        let emit_time = Arc::from("2026-08-16T00:00:01Z");
+        let summary = Arc::from("summary");
+        let n = 3usize;
+
+        let mut via_row = AlertColumnBuilder::new(Arc::clone(&target));
+        via_row
+            .register_yield_column(&Arc::from("alert_type"), None)
+            .unwrap();
+        for i in 0..n {
+            via_row.begin_row();
+            via_row
+                .stage_yield_cell(
+                    &Arc::from("alert_type"),
+                    Some(&ft_chars),
+                    &Value::Str(format!("type{i}").into()),
+                )
+                .unwrap();
+            via_row.commit_each_row(EachRowCells {
+                wfx_id: format!("id{i}"),
+                score: 1.0 + i as f64,
+                entity_id: format!("e{i}"),
+                fired_at: format!("ts{i}"),
+                rule_name: &rule_name,
+                entity_type: &entity_type,
+                origin: &origin,
+                close_reason: &close_reason,
+                emit_time: &emit_time,
+                summary: &summary,
+            });
+        }
+
+        let mut via_batch = AlertColumnBuilder::new(Arc::clone(&target));
+        via_batch
+            .register_yield_column(&Arc::from("alert_type"), None)
+            .unwrap();
+        let type_col = 0usize;
+        let wfx: Vec<String> = (0..n).map(|i| format!("id{i}")).collect();
+        let scores: Vec<f64> = (0..n).map(|i| 1.0 + i as f64).collect();
+        let eids: Vec<String> = (0..n).map(|i| format!("e{i}")).collect();
+        let fats: Vec<String> = (0..n).map(|i| format!("ts{i}")).collect();
+        let staged_rows: Vec<Vec<(usize, DataType, ModelValue)>> = (0..n)
+            .map(|i| {
+                let t = export_yield_value(&Value::Str(format!("type{i}").into()), Some(&ft_chars))
+                    .unwrap();
+                vec![(type_col, t.0, t.1)]
+            })
+            .collect();
+        via_batch.commit_each_rows_batch(
+            &wfx,
+            &scores,
+            &eids,
+            &fats,
+            &rule_name,
+            &entity_type,
+            &origin,
+            &close_reason,
+            &emit_time,
+            &summary,
+            &staged_rows,
+        );
+
+        let batch_row = via_row.finish();
+        let batch_col = via_batch.finish();
+        assert_eq!(batch_row.len(), batch_col.len());
+        for i in 0..batch_row.len() {
+            let a = batch_row.iter_data_records().nth(i).unwrap().unwrap();
+            let b = batch_col.iter_data_records().nth(i).unwrap().unwrap();
+            assert_records_equal(&a, &b);
         }
     }
 
