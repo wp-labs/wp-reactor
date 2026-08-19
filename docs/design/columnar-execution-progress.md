@@ -323,6 +323,23 @@ cargo test -p wf-runtime --lib → 165 passed
   「高相 ~7.23M / 低相 ~6.2-6.7M」作为 Q2 基线口径，后续 L1-L3 端到端对比需按相位配对
   （同相 A/B 或取高相）。
 
+### 残留物化点调查（2026-08-19）：A/B/C 确认，结论为「当前基准均非热点，不盲修」
+
+全量扫 `batch_to_events`/`materialize_rows` 调用点，识别三处可能的残余物化，并**用
+nexmark + qradar_pk 验证触发情况**：
+
+| 物化点 | 机制 | 触发验证 | 判定 |
+|---|---|---|---|
+| **A** `window.has` 守卫全量物化 | `eval/mod.rs:173` 每求值 `snapshot_field_values` 整窗 `batch_to_events` 成 HashSet | nexmark/qradar 规则集里 `window.has` 均 **0** | ⚠️ 潜在热点，但两个基准未触发；需带 `window.has` 的负载才可测 |
+| **B** join 索引构建 | `buffer/mod.rs:167 set_join_key` 建索引时全窗物化**一次**；append 每批 `tb.events()` 懒物化**一次**该批入索引；之后 join 走 O(1) `join_rows` | nexmark Q3/Q4/Q9 走索引增量（非每事件）；qradar 无 join | ✅ 结构合理（每批一次物化是索引必要成本），**非每事件热点，不动** |
+| **C** eager 整批 `batch_to_events` | `field_usage.rs:106` defer 门槛：`plan_defer_safe = each_plan.is_some() || 所有 bind 有 columnar filter`。无 filter 的 `match`（Q5/Q7/qradar 的 `on event { b | count>=N }`）→ false → `rule_task.rs:573` eager 整批物化 | **Q5/Q7/qradar 大量触发** | ⚠️ 真触发，但本质是「无 filter 的 match 每行都进状态机」的**必需物化**；defer/lazy 只是把物化从 route_parse 挪到 rule task，**行物化总数不变**（同方案A「位置≠数量」教训）。可省的是字段子集投影（`materialize_rows_filtered` 已做）+ 未来「列式喂状态机」 |
+
+**验证基准**：qradar_pk 200k（load 低）`EPS=164,757`（目标 10,000，远超）、emitted 2.4M、`#18 OK` 无驱逐。
+
+**结论（诚实）**：A/B/C **都不是当前两个基准的瓶颈**——qradar 已达目标 16×，A/B 未被触发，
+C 是必需物化非浪费。**不盲修**（避免 M13 P3 教训：优化不是墙的路径）。若要证明 A 的成本，须先造带
+`window.has` 的负载；C 的进一步消省（列式喂状态机）是独立的 L5 级大工程。
+
 ## 待办 / 下一步
 
 1. ~~**L2 逐行物化优化（真正的省）**~~ ✅ 已完成（Step 10）：`process_batch` 已改为全行扫时间列 +
