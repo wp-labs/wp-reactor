@@ -1262,6 +1262,36 @@ fn join_index_duplicate_key_keeps_all_rows() {
     );
 }
 
+#[test]
+fn join_index_stays_columnar_without_materializing_parsed_events() {
+    // The columnar join index (set_join_key + append + lookup) must never
+    // trigger `TimedBatch::events()`, so a join-target window with no rule
+    // subscription keeps its batches fully columnar — the Q22 `person_events`
+    // RSS win. `join_lookup` works off the `(batch, row)` locators directly.
+    let win = test_window(3600, usize::MAX);
+    win.set_join_key("value".into());
+
+    win.append(make_batch(
+        &test_schema(),
+        &[1_000_000, 2_000_000],
+        &[42, 43],
+    ))
+    .unwrap();
+
+    // Columnar lookup still works.
+    let rows = win
+        .join_lookup(&JoinKey::Int(42))
+        .expect("indexed window should return rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].field_value("value"), Some(Value::Number(42.0)));
+
+    // And the batch's `parsed_events` stayed uninitialized.
+    assert!(
+        !win.any_parsed_events_materialized(),
+        "join index must not materialize parsed events"
+    );
+}
+
 // -- Eager-drop regression (window log reclamation) ------------------------
 //
 // History: A.1 replaced the `VecDeque<TimedBatch>` window log with a lock-free

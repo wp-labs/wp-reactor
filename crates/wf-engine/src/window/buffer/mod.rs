@@ -25,48 +25,100 @@ use smol_str::SmolStr;
 use wf_config::WindowConfig;
 
 use crate::error::{CoreReason, CoreResult};
-use crate::match_engine::{Event, JoinKey, Value};
+use crate::match_engine::event_bridge::extract_field_value;
+use crate::match_engine::{Event, JoinKey, JoinRow, Value, batch_raw_ts_nanos, build_field_index};
 use crate::window::WindowProgress;
 
 use types::TimedBatch;
 
-/// Hash index for join lookups: maps a scalar key value to the parsed events
-/// holding it. Maintained incrementally on append/evict/expire. Only present on
-/// windows configured as join targets (`set_join_key`).
+/// Hash index for join lookups: maps a scalar key value to columnar row
+/// locators (`IndexedRow`). Maintained incrementally on append/evict/expire,
+/// with **no per-row `Event` materialization** — the index holds `(batch, row)`
+/// and reads fields on demand, so join-target windows stay columnar. Only
+/// present on windows configured as join targets (`set_join_key`).
 pub(super) struct JoinIndex {
     key_field: SmolStr,
-    by_key: crate::match_engine::EngineHashMap<JoinKey, Vec<Arc<Event>>>,
+    /// The window's `materialize_fields` projection: enrich reads only these
+    /// columns from the joined rows. `None` = all columns.
+    projection: Option<Arc<HashSet<String>>>,
+    /// Columnar row locators per key. `ts_nanos` is `None` for rows without a
+    /// `Timestamp(Ns)` time value (valid snapshot-join rows, skipped by asof).
+    by_key: crate::match_engine::EngineHashMap<JoinKey, Vec<IndexedRow>>,
+}
+
+/// A columnar row locator: `(batch, row)` plus the batch-level field index and
+/// the row's raw timestamp. The join index holds these instead of materialized
+/// `Event`s.
+struct IndexedRow {
+    ts_nanos: Option<i64>,
+    batch: Arc<RecordBatch>,
+    row: usize,
+    index: Arc<crate::match_engine::FieldIndex>,
 }
 
 impl JoinIndex {
-    fn index_event(&mut self, ev: &Arc<Event>) {
-        if let Some(key) = ev.fields.get(&self.key_field).and_then(JoinKey::from_value) {
-            self.by_key.entry(key).or_default().push(Arc::clone(ev));
+    /// Index every row of `batch` by its `key_field` value. Reads the key column
+    /// straight from the Arrow batch through the same [`extract_field_value`]
+    /// conversion the eager `Event` path uses, so the produced keys are
+    /// byte-identical to the previous materialized-index behavior.
+    fn index_batch(&mut self, batch: &Arc<RecordBatch>, ts_list: &[Option<i64>]) {
+        let Ok(col_idx) = batch.schema().index_of(self.key_field.as_str()) else {
+            return;
+        };
+        let schema = batch.schema();
+        let field = schema.field(col_idx);
+        let col = batch.column(col_idx);
+        let index = build_field_index(batch);
+        for (row, ts) in ts_list.iter().enumerate() {
+            if col.is_null(row) {
+                continue;
+            }
+            let Some(value) = extract_field_value(field, col.as_ref(), row) else {
+                continue;
+            };
+            let Some(key) = JoinKey::from_value(&value) else {
+                continue;
+            };
+            self.by_key.entry(key).or_default().push(IndexedRow {
+                ts_nanos: *ts,
+                batch: Arc::clone(batch),
+                row,
+                index: Arc::clone(&index),
+            });
         }
     }
 
-    fn remove_event(&mut self, ev: &Arc<Event>) {
-        if let Some(key) = ev.fields.get(&self.key_field).and_then(JoinKey::from_value)
-            && let Some(v) = self.by_key.get_mut(&key)
-        {
-            v.retain(|e| !Arc::ptr_eq(e, ev));
+    /// Remove every row belonging to `batch` (matched by `Arc` pointer
+    /// identity — the index holds the same `Arc<RecordBatch>` the log does).
+    fn remove_batch(&mut self, batch: &Arc<RecordBatch>) {
+        for rows in self.by_key.values_mut() {
+            rows.retain(|r| !Arc::ptr_eq(&r.batch, batch));
         }
     }
 
-    fn index_batch(&mut self, events: &[Arc<Event>]) {
-        for ev in events {
-            self.index_event(ev);
-        }
+    /// Snapshot-join view: every indexed row for `key`, as a columnar [`JoinRow`].
+    fn lookup(&self, key: &JoinKey) -> Option<Vec<JoinRow>> {
+        self.by_key
+            .get(key)
+            .map(|rows| rows.iter().map(|r| self.row_to_join_row(r)).collect())
     }
 
-    fn remove_batch(&mut self, events: &[Arc<Event>]) {
-        for ev in events {
-            self.remove_event(ev);
-        }
+    /// Asof-join view: only the timestamped rows for `key`, as `(raw_ts, row)`.
+    fn lookup_timestamped(&self, key: &JoinKey) -> Option<Vec<(i64, JoinRow)>> {
+        self.by_key.get(key).map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.ts_nanos.map(|ts| (ts, self.row_to_join_row(r))))
+                .collect()
+        })
     }
 
-    fn lookup(&self, key: &JoinKey) -> Option<Vec<Arc<Event>>> {
-        self.by_key.get(key).cloned()
+    fn row_to_join_row(&self, r: &IndexedRow) -> JoinRow {
+        JoinRow::Columnar {
+            batch: Arc::clone(&r.batch),
+            row: r.row,
+            index: Arc::clone(&r.index),
+            projection: self.projection.clone(),
+        }
     }
 }
 
@@ -201,29 +253,31 @@ impl Window {
         let key_field = SmolStr::new(&key_field);
         let mut index = JoinIndex {
             key_field,
+            projection: self.materialize_fields.clone(),
             by_key: crate::match_engine::EngineHashMap::default(),
         };
         // Read the log under its read lock; the guard is released before the
         // join-index write lock is taken (lock ordering: log → join_index,
-        // never the reverse).
-        let existing: Vec<Arc<Vec<Arc<Event>>>> = {
+        // never the reverse). The index holds columnar row locators — no
+        // per-row `Event` materialization.
+        let existing: Vec<(Arc<RecordBatch>, Vec<Option<i64>>)> = {
             let log = self.log.read().expect("window log lock poisoned");
             log.values()
-                .map(|tb| tb.events(self.materialize_fields.as_deref()))
+                .map(|tb| (Arc::clone(&tb.batch), self.raw_ts_list(tb)))
                 .collect()
         };
-        for events in &existing {
-            index.index_batch(events);
+        for (batch, ts_list) in &existing {
+            index.index_batch(batch, ts_list);
         }
         self.join_enabled.store(true, Ordering::Release);
         *self.join_index.write().expect("join index lock poisoned") = Some(index);
     }
 
-    /// O(1) lookup of parsed events whose `key_field` equals `key`. `Some(empty)`
-    /// if this window is indexed but the key has no matching rows; `None` if it
-    /// has no join index (not a join target — the caller falls back to a
-    /// snapshot scan).
-    pub fn join_lookup(&self, key: &JoinKey) -> Option<Vec<Arc<Event>>> {
+    /// O(1) lookup of rows whose `key_field` equals `key`, as columnar
+    /// [`JoinRow`]s. `Some(empty)` if this window is indexed but the key has no
+    /// matching rows; `None` if it has no join index (not a join target — the
+    /// caller falls back to a snapshot scan).
+    pub fn join_lookup(&self, key: &JoinKey) -> Option<Vec<JoinRow>> {
         if !self.join_enabled.load(Ordering::Acquire) {
             return None;
         }
@@ -235,6 +289,46 @@ impl Window {
                 .lookup(key)
                 .unwrap_or_default(),
         )
+    }
+
+    /// O(1) timestamped lookup for the asof-join path: rows whose `key_field`
+    /// equals `key`, as `(raw_ts_nanos, JoinRow)` — rows without a
+    /// `Timestamp(Ns)` time value are skipped. `Some(empty)` when indexed but
+    /// the key has no timestamped rows; `None` when there is no join index
+    /// (caller falls back to a timestamped snapshot scan).
+    pub fn join_lookup_timestamped(&self, key: &JoinKey) -> Option<Vec<(i64, JoinRow)>> {
+        if !self.join_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(
+            self.join_index
+                .read()
+                .expect("join index lock poisoned")
+                .as_ref()?
+                .lookup_timestamped(key)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Raw `Timestamp(Ns)` time values for every row of a batch, aligned with
+    /// the batch's row order (row `i` → `ts_list[i]`). `None` for null / non-Ts
+    /// rows (the asof path skips them).
+    fn raw_ts_list(&self, tb: &TimedBatch) -> Vec<Option<i64>> {
+        match self.time_col_index {
+            Some(tc) => (0..tb.batch.num_rows())
+                .map(|row| batch_raw_ts_nanos(&tb.batch, tc, row))
+                .collect(),
+            None => vec![None; tb.batch.num_rows()],
+        }
+    }
+
+    /// Test-only: whether any buffered batch has materialized its
+    /// `parsed_events`. The columnar join index must never trigger this — a
+    /// join-target window with no rule subscription stays fully columnar.
+    #[cfg(test)]
+    fn any_parsed_events_materialized(&self) -> bool {
+        let log = self.log.read().expect("log lock poisoned");
+        log.values().any(|tb| tb.parsed_events.get().is_some())
     }
 
     /// Append a RecordBatch to this window.
@@ -354,7 +448,7 @@ impl Window {
             log.insert(
                 seq,
                 TimedBatch {
-                    batch,
+                    batch: Arc::new(batch),
                     event_time_range,
                     ingested_at: Instant::now(),
                     row_count,
@@ -394,16 +488,14 @@ impl Window {
             // by the incoming batch aren't kept in the index).
             if self.join_enabled.load(Ordering::Acquire)
                 && let Some(tb) = log.get(&seq)
-            {
-                let events = tb.events(self.materialize_fields.as_deref());
-                if let Some(idx) = self
+                && let Some(idx) = self
                     .join_index
                     .write()
                     .expect("join index lock poisoned")
                     .as_mut()
-                {
-                    idx.index_batch(&events);
-                }
+            {
+                let ts_list = self.raw_ts_list(tb);
+                idx.index_batch(&tb.batch, &ts_list);
             }
         }
         if evicted_rows > 0 {
@@ -445,8 +537,7 @@ impl Window {
             .expect("join index lock poisoned")
             .as_mut()
         {
-            let events = evicted.events(self.materialize_fields.as_deref());
-            idx.remove_batch(&events);
+            idx.remove_batch(&evicted.batch);
         }
     }
 
@@ -457,7 +548,7 @@ impl Window {
     /// mutated.
     pub fn snapshot(&self) -> Vec<RecordBatch> {
         let log = self.log.read().expect("window log lock poisoned");
-        log.values().map(|tb| tb.batch.clone()).collect()
+        log.values().map(|tb| tb.batch.as_ref().clone()).collect()
     }
 
     /// Return a snapshot of the batches with `seq <= max_seq`.
@@ -473,8 +564,11 @@ impl Window {
     pub fn snapshot_up_to(&self, max_seq: Option<u64>) -> Vec<RecordBatch> {
         let log = self.log.read().expect("window log lock poisoned");
         match max_seq {
-            Some(n) => log.range(..=n).map(|(_, tb)| tb.batch.clone()).collect(),
-            None => log.values().map(|tb| tb.batch.clone()).collect(),
+            Some(n) => log
+                .range(..=n)
+                .map(|(_, tb)| tb.batch.as_ref().clone())
+                .collect(),
+            None => log.values().map(|tb| tb.batch.as_ref().clone()).collect(),
         }
     }
 

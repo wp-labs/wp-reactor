@@ -133,9 +133,16 @@ pub(super) fn execute_joins(
                 find_matching_row(&rows, &join.conds, ctx)
             }
             JoinMode::Asof { within } => {
-                // asof still uses the timestamped scan path (the hash index is
-                // not timestamp-aware yet).
-                let Some(rows) = windows.snapshot_with_timestamps(&join.right_window) else {
+                // Prefer the timestamped hash index (O(1) key lookup); fall back
+                // to a full timestamped scan when the right window has no index
+                // or is watermarked. `find_asof_row` still applies every join
+                // condition plus the time-proximity filter, so results stay
+                // byte-identical to the previous scan-only path.
+                let Some((key_field, key_val)) = first_join_key(ctx, &join.conds) else {
+                    continue;
+                };
+                let Some(rows) = windows.asof_candidates(&join.right_window, &key_field, &key_val)
+                else {
                     continue;
                 };
                 find_asof_row(&rows, &join.conds, ctx, event_time_nanos, within.as_ref())
@@ -303,7 +310,7 @@ mod tests {
         )
         .unwrap();
 
-        let col_rows = columnar_join_rows(vec![batch.clone()]);
+        let col_rows = columnar_join_rows(vec![batch.clone()], None);
         let map_rows: Vec<HashMap<String, Value>> = batch_to_events(&batch)
             .into_iter()
             .map(|ev| {

@@ -38,7 +38,7 @@ pub struct WindowParams {
 #[derive(::moju_derive::MoJu)]
 #[moju(kind = "struct", domain = "Engine", module = "Engine.WindowManager")]
 pub(in crate::window) struct TimedBatch {
-    pub(super) batch: RecordBatch,
+    pub(super) batch: Arc<RecordBatch>,
     /// (min, max) event time in nanoseconds.
     pub(super) event_time_range: (i64, i64),
     #[allow(dead_code)]

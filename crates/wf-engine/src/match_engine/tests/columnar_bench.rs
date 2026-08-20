@@ -17,9 +17,10 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use crate::match_engine::{
-    ColumnarEvent, FieldSource, Value, batch_to_events, build_field_index, column_scalar_string,
-    columnar_join_rows,
+    ColumnarEvent, FieldSource, JoinKey, Value, batch_to_events, build_field_index,
+    column_scalar_string, columnar_join_rows, columnar_timestamped_join_rows,
 };
+use crate::window::{Window, WindowParams};
 
 /// nexmark bid_events 形态的 7 字段批（auction/bidder/price/channel/url/dateTime/extra），
 /// 少量 null 对齐真实数据。返回 (batch, price 列索引)。
@@ -147,7 +148,7 @@ fn to_event_vs_event_clone() {
 fn join_row_field_value_vs_map_get() {
     let n = 1_000_000usize;
     let (batch, _) = bid_batch(n);
-    let rows = columnar_join_rows(vec![batch.clone()]);
+    let rows = columnar_join_rows(vec![batch.clone()], None);
     let map_rows: Vec<std::collections::HashMap<String, Value>> = batch_to_events(&batch)
         .into_iter()
         .map(|ev| {
@@ -258,4 +259,150 @@ fn has_cache_hit_vs_cold_scan() {
         "[columnar-bench] has() eval: cold-scan {cold_per:8.2} ms/eval (1M rows)  cache-hit {hit_ns:5.1} ns/eval  ({:.0}x)",
         cold_per * 1e6 / hit_ns
     );
+}
+
+// ---------------------------------------------------------------------------
+// Join index（列式行定位符）性能基准
+//
+// 测量对象（asof/snapshot join 走 hash index 的免物化改进）：
+// - `Window::join_lookup`（O(1) 列式 hash 查找）vs `columnar_join_rows` 全量扫描
+// - `Window::join_lookup_timestamped`（asof O(1)）vs 全量 timestamped 扫描
+// 两对都验证“Q22 asof join 从 O(window rows) 降到 O(1)”的量级。
+//
+// 运行：cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+
+/// 构造一个 `ts` + `key` + `payload` 三列的 join-target 窗口，索引 `n` 行
+/// （`key` 列 0..n 唯一），返回 `(窗口, ts 列索引)`。
+fn join_bench_window(n: usize) -> (Window, usize) {
+    use std::time::Duration;
+    use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new("key", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let win = Window::new(
+        WindowParams {
+            name: "join_bench".into(),
+            schema: schema.clone(),
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        WindowConfig {
+            name: "join_bench".into(),
+            mode: DistMode::Local,
+            max_window_bytes: usize::MAX.into(),
+            over_cap: Duration::from_secs(3600).into(),
+            evict_policy: EvictPolicy::TimeFirst,
+            watermark: Duration::from_secs(5).into(),
+            allowed_lateness: Duration::from_secs(0).into(),
+            late_policy: LatePolicy::Drop,
+            table: None,
+        },
+    );
+    win.set_join_key("key".into());
+
+    let ts: Vec<i64> = (0..n as i64)
+        .map(|i| 1_700_000_000_000_000_000 + i)
+        .collect();
+    let key: Vec<i64> = (0..n as i64).collect();
+    let payload: Vec<String> = (0..n).map(|i| format!("p{}", i % 100)).collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampNanosecondArray::from(ts)) as ArrayRef,
+            Arc::new(Int64Array::from(key)) as ArrayRef,
+            Arc::new(StringArray::from(payload)) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    win.append(batch).unwrap();
+    (win, 0)
+}
+
+/// snapshot join：`join_lookup`（O(1) hash 查找）vs `columnar_join_rows` 全量扫描。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture"]
+fn join_index_lookup_vs_full_scan() {
+    let n = 1_000_000usize;
+    let (win, _) = join_bench_window(n);
+
+    // Indexed lookup：R 次点查，统计 ns/lookup。
+    let r = 1_000_000usize;
+    let start = Instant::now();
+    let mut idx_hits = 0usize;
+    for i in 0..r {
+        let key = (i as i64) % (n as i64);
+        if let Some(rows) = win.join_lookup(&JoinKey::Int(key)) {
+            idx_hits += rows.len();
+        }
+    }
+    let idx_ns = start.elapsed().as_secs_f64() * 1e9 / r as f64;
+
+    // Full scan：S 次全量扫描（每次 snapshot + 建 100 万行 + 过滤一个 key），
+    // 统计 ns/scan。
+    let s = 10usize;
+    let start = Instant::now();
+    let mut scan_hits = 0usize;
+    for i in 0..s {
+        let key = (i as i64) % (n as i64);
+        let rows = columnar_join_rows(win.snapshot(), None);
+        scan_hits += rows
+            .iter()
+            .filter(|row| row.field_value("key") == Some(Value::Number(key as f64)))
+            .count();
+    }
+    let scan_ns = start.elapsed().as_secs_f64() * 1e9 / s as f64;
+
+    eprintln!(
+        "[join-index-bench] snapshot lookup: index {idx_ns:8.1} ns/lookup  full-scan {scan_ns:8.1} ns/scan  ({:.0}x)",
+        scan_ns / idx_ns
+    );
+    assert_eq!(idx_hits, r, "each indexed lookup must return one row");
+    assert_eq!(scan_hits, s, "each full scan must find one row");
+}
+
+/// asof join：`join_lookup_timestamped`（O(1)）vs 全量 timestamped 扫描。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture"]
+fn join_index_timestamped_lookup_vs_full_scan() {
+    let n = 1_000_000usize;
+    let (win, ts_col) = join_bench_window(n);
+
+    // Indexed asof lookup：R 次点查，统计 ns/lookup。
+    let r = 1_000_000usize;
+    let start = Instant::now();
+    let mut idx_hits = 0usize;
+    for i in 0..r {
+        let key = (i as i64) % (n as i64);
+        if let Some(rows) = win.join_lookup_timestamped(&JoinKey::Int(key)) {
+            idx_hits += rows.len();
+        }
+    }
+    let idx_ns = start.elapsed().as_secs_f64() * 1e9 / r as f64;
+
+    // Full timestamped scan：S 次全量扫描。
+    let s = 10usize;
+    let start = Instant::now();
+    let mut scan_hits = 0usize;
+    for i in 0..s {
+        let key = (i as i64) % (n as i64);
+        let rows = columnar_timestamped_join_rows(win.snapshot(), ts_col, None);
+        scan_hits += rows
+            .iter()
+            .filter(|(_, row)| row.field_value("key") == Some(Value::Number(key as f64)))
+            .count();
+    }
+    let scan_ns = start.elapsed().as_secs_f64() * 1e9 / s as f64;
+
+    eprintln!(
+        "[join-index-bench] asof lookup:    index {idx_ns:8.1} ns/lookup  full-scan {scan_ns:8.1} ns/scan  ({:.0}x)",
+        scan_ns / idx_ns
+    );
+    assert_eq!(idx_hits, r, "each indexed asof lookup must return one row");
+    assert_eq!(scan_hits, s, "each full asof scan must find one row");
 }

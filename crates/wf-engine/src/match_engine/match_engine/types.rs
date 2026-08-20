@@ -292,6 +292,31 @@ pub trait WindowLookup: Send + Sync {
                 .collect(),
         )
     }
+
+    /// Asof-join candidates: rows of `window` whose `key_field` equals `key`,
+    /// each with its raw `Timestamp(Ns)` time (rows without a time value are
+    /// skipped).
+    ///
+    /// Default implementation falls back to a full timestamped snapshot +
+    /// linear key filter (O(rows)); a window with a maintained timestamped hash
+    /// index overrides this to O(1), avoiding the full-window scan on every
+    /// event (the Q22 asof-join hot path).
+    fn asof_candidates(
+        &self,
+        window: &str,
+        key_field: &str,
+        key: &Value,
+    ) -> Option<Vec<(i64, JoinRow)>> {
+        let rows = self.snapshot_with_timestamps(window)?;
+        Some(
+            rows.into_iter()
+                .filter(|(_, row)| {
+                    row.field_value(key_field)
+                        .is_some_and(|v| crate::match_engine::match_engine::values_equal(&v, key))
+                })
+                .collect(),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

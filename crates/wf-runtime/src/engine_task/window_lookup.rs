@@ -144,19 +144,24 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
             );
         }
         // Buffer window: columnar rows straight from the (seq-bounded) batches —
-        // no whole-window Event/HashMap materialization.
+        // no whole-window Event/HashMap materialization. The window's
+        // `materialize_fields` projection keeps enrich to the read set.
         let win = self.router.registry().get_window(window)?;
+        let projection = win.materialize_fields().cloned();
         Some(columnar_join_rows(
             win.snapshot_up_to(self.eff_max_seq(window)),
+            projection,
         ))
     }
 
     fn snapshot_with_timestamps(&self, window: &str) -> Option<Vec<(i64, JoinRow)>> {
         let win = self.router.registry().get_window(window)?;
         let time_col = win.time_col_index()?;
+        let projection = win.materialize_fields().cloned();
         Some(columnar_timestamped_join_rows(
             win.snapshot_up_to(self.eff_max_seq(window)),
             time_col,
+            projection,
         ))
     }
 
@@ -164,14 +169,14 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
         let win = self.router.registry().get_window(window)?;
         let join_key = JoinKey::from_value(key)?;
         // Indexed lookup if the window has a maintained join index (the index
-        // stores already-materialized `Arc<Event>`s — wrap them directly, no
-        // per-lookup HashMap conversion). The index is built incrementally
-        // across the *full* window up to the current generation, so it is not
-        // seq-cut safe: under a `max_seq` watermark we bypass it and scan.
+        // stores columnar row locators — `JoinRow::Columnar`, no per-row
+        // HashMap materialization). The index is built incrementally across
+        // the *full* window up to the current generation, so it is not seq-cut
+        // safe: under a `max_seq` watermark we bypass it and scan.
         if self.eff_max_seq(window).is_none()
-            && let Some(events) = win.join_lookup(&join_key)
+            && let Some(rows) = win.join_lookup(&join_key)
         {
-            return Some(events.into_iter().map(JoinRow::Event).collect());
+            return Some(rows);
         }
         // Scan fallback (bounded watermark, or no index): filter the seq-bounded
         // snapshot by key equality. Rows are keyed through the same
@@ -184,6 +189,41 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
         Some(
             rows.into_iter()
                 .filter(|row| {
+                    row.field_value(key_field)
+                        .and_then(|v| JoinKey::from_value(&v))
+                        .is_some_and(|row_key| row_key == join_key)
+                })
+                .collect(),
+        )
+    }
+
+    fn asof_candidates(
+        &self,
+        window: &str,
+        key_field: &str,
+        key: &Value,
+    ) -> Option<Vec<(i64, JoinRow)>> {
+        let win = self.router.registry().get_window(window)?;
+        let join_key = JoinKey::from_value(key)?;
+        // Indexed asof lookup: the window's maintained hash index already stores
+        // raw timestamps alongside each columnar row locator (built by
+        // `set_join_key` / `append_inner`), so the full-window timestamped scan
+        // is skipped — the Q22 asof join is O(1) instead of O(window rows) per
+        // bid. As with `join_lookup`, the index is not seq-cut safe, so under a
+        // watermark we fall back to the timestamped scan.
+        if self.eff_max_seq(window).is_none()
+            && let Some(rows) = win.join_lookup_timestamped(&join_key)
+        {
+            return Some(rows);
+        }
+        // Scan fallback: filter the seq-bounded timestamped snapshot by key. The
+        // key is truncated through `JoinKey::from_value` exactly like the index,
+        // and the timestamps come from the same raw `Timestamp(Ns)` column the
+        // index stores, so both paths are byte-identical.
+        let rows = self.snapshot_with_timestamps(window)?;
+        Some(
+            rows.into_iter()
+                .filter(|(_, row)| {
                     row.field_value(key_field)
                         .and_then(|v| JoinKey::from_value(&v))
                         .is_some_and(|row_key| row_key == join_key)
@@ -334,6 +374,64 @@ mod tests {
             .join_lookup("threat_intel", "ip", &Value::Str("9.9.9.9".into()))
             .expect("indexed window exists");
         assert!(none.is_empty(), "unknown key → empty rows");
+    }
+
+    #[tokio::test]
+    async fn asof_candidates_uses_index_and_matches_scan() {
+        // The asof fast path must return the same rows (and the same raw
+        // timestamps) as the timestamped scan fallback: the index stores the
+        // raw `Timestamp(Ns)` i64, so epoch-nanos values survive without the
+        // f64 round-trip the eager event-time path applies.
+        let schema = ts_schema();
+        let reg = WindowRegistry::build(vec![make_def("threat_intel", vec!["feed"])]).unwrap();
+        let router = Router::new(reg);
+        router
+            .registry()
+            .get_window("threat_intel")
+            .unwrap()
+            .set_join_key("ip".into());
+
+        // `ts1` is large enough that `ts1 as f64 as i64` would round it; the raw
+        // index path must keep it exact.
+        let ts1: i64 = 1_767_225_600_000_000_123;
+        let ts2: i64 = 1_767_225_600_000_000_456;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![ts1, ts2])),
+                Arc::new(StringArray::from(vec!["10.0.0.1", "10.0.0.2"])),
+                Arc::new(Int64Array::from(vec![80, 95])),
+            ],
+        )
+        .unwrap();
+        router.route("feed", batch).await.unwrap();
+
+        let key = Value::Str("10.0.0.1".into());
+
+        // Indexed path (full window → `eff_max_seq = None`).
+        let indexed = RegistryLookup::new(&router)
+            .asof_candidates("threat_intel", "ip", &key)
+            .expect("window exists");
+        assert_eq!(indexed.len(), 1, "one row matches key ip=10.0.0.1");
+        assert_eq!(indexed[0].0, ts1, "raw epoch nanos preserved exactly");
+        assert_eq!(
+            indexed[0].1.field_value("ip"),
+            Some(Value::Str("10.0.0.1".into()))
+        );
+
+        // Scan fallback (watermarked → index bypassed). seq 0 is the only batch.
+        let scanned = RegistryLookup::with_max_seq(&router, Some(0))
+            .asof_candidates("threat_intel", "ip", &key)
+            .expect("window exists");
+        assert_eq!(scanned.len(), 1);
+
+        // Both paths must be byte-identical (ts + joined field values).
+        assert_eq!(indexed.len(), scanned.len());
+        for ((its, irow), (sts, srow)) in indexed.iter().zip(&scanned) {
+            assert_eq!(its, sts);
+            assert_eq!(irow.field_value("ip"), srow.field_value("ip"));
+            assert_eq!(irow.field_value("score"), srow.field_value("score"));
+        }
     }
 
     #[tokio::test]

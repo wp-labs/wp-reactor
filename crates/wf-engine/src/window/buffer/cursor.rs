@@ -35,7 +35,7 @@ impl Window {
         // (at-least-once), same as before.
         let batches: Vec<RecordBatch> = log
             .range(effective_start..=newest_seq)
-            .map(|(_, tb)| tb.batch.clone()) // Arc clone, zero data copy
+            .map(|(_, tb)| tb.batch.as_ref().clone()) // Arc clone, zero data copy
             .collect();
         (batches, newest_seq + 1, gap)
     }
@@ -82,7 +82,7 @@ impl Window {
         // a batch appended after this call is re-delivered next round
         // (at-least-once), same as the row-based `events_since`.
         for (_, tb) in log.range(effective_start..=newest_seq) {
-            batches.push(tb.batch.clone());
+            batches.push(tb.batch.as_ref().clone());
             // `shard_rows[i]` is the absolute row indices this shard owns in
             // this batch. The stored inner type is `Vec<u32>` (one index list
             // per shard), so we wrap it in an `Arc` for the pull-path return.

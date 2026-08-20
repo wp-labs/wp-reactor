@@ -562,6 +562,11 @@ pub enum JoinRow {
         batch: Arc<RecordBatch>,
         row: usize,
         index: Arc<FieldIndex>,
+        /// Optional `materialize_fields` projection: [`Self::field_names`]
+        /// exposes only these columns, so enrich reads just the fields rules
+        /// actually use (byte-identical to the projected `Event` path). `None`
+        /// = all schema columns.
+        projection: Option<Arc<HashSet<String>>>,
     },
     Event(Arc<Event>),
 }
@@ -572,7 +577,9 @@ impl JoinRow {
     /// `batch_to_events`, so the value is byte-identical to the eager path.
     pub fn field_value(&self, name: &str) -> Option<Value> {
         match self {
-            JoinRow::Columnar { batch, row, index } => {
+            JoinRow::Columnar {
+                batch, row, index, ..
+            } => {
                 let idx = *index.get(name)?;
                 let col = batch.column(idx);
                 if col.is_null(*row) {
@@ -584,17 +591,24 @@ impl JoinRow {
         }
     }
 
-    /// Every field name this row exposes. The Columnar variant lists the whole
-    /// schema (null cells read `None` via [`Self::field_value`], matching the
-    /// eager `batch_to_events` map which drops nulls); the Event variant lists
-    /// its materialized (projected) map keys.
+    /// Every field name this row exposes. The Columnar variant lists the
+    /// (optionally projected) schema columns — null cells read `None` via
+    /// [`Self::field_value`], matching the eager `batch_to_events` map which
+    /// drops nulls; the Event variant lists its materialized (projected) map
+    /// keys.
     pub fn field_names(&self) -> Vec<&str> {
         match self {
-            JoinRow::Columnar { batch, .. } => batch
+            JoinRow::Columnar {
+                batch, projection, ..
+            } => batch
                 .schema_ref()
                 .fields()
                 .iter()
                 .map(|f| f.name().as_str())
+                .filter(|name| match projection {
+                    Some(proj) => proj.contains(*name),
+                    None => true,
+                })
                 .collect(),
             JoinRow::Event(ev) => ev.fields.keys().map(|k| k.as_str()).collect(),
         }
@@ -603,7 +617,11 @@ impl JoinRow {
 
 /// Build columnar [`JoinRow`]s for every row of the given (cheaply Arc-cloned)
 /// batches — the scan-fallback join path. No Event/HashMap materialization.
-pub fn columnar_join_rows(batches: Vec<RecordBatch>) -> Vec<JoinRow> {
+/// `projection` mirrors the window's `materialize_fields`: `None` = all columns.
+pub fn columnar_join_rows(
+    batches: Vec<RecordBatch>,
+    projection: Option<Arc<HashSet<String>>>,
+) -> Vec<JoinRow> {
     let mut rows = Vec::new();
     for batch in batches {
         let batch = Arc::new(batch);
@@ -613,10 +631,25 @@ pub fn columnar_join_rows(batches: Vec<RecordBatch>) -> Vec<JoinRow> {
                 batch: Arc::clone(&batch),
                 row,
                 index: Arc::clone(&index),
+                projection: projection.clone(),
             });
         }
     }
     rows
+}
+
+/// Read the **raw** `Timestamp(Ns)` i64 for a row from a resolved time column,
+/// or `None` when the column is null / not a `Timestamp(Ns)` column. This is
+/// the timestamp the asof-join path compares against (byte-identical to
+/// [`columnar_timestamped_join_rows`]); it deliberately skips the f64
+/// round-trip that [`batch_event_time_nanos_at`] applies on the eager
+/// event-time path, so epoch-nanos values stay exact.
+pub fn batch_raw_ts_nanos(batch: &RecordBatch, time_col_index: usize, row: usize) -> Option<i64> {
+    batch
+        .column(time_col_index)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .and_then(|a| (!a.is_null(row)).then(|| a.value(row)))
 }
 
 /// Build timestamped columnar [`JoinRow`]s for the asof-join path. The
@@ -625,17 +658,14 @@ pub fn columnar_join_rows(batches: Vec<RecordBatch>) -> Vec<JoinRow> {
 pub fn columnar_timestamped_join_rows(
     batches: Vec<RecordBatch>,
     time_col_index: usize,
+    projection: Option<Arc<HashSet<String>>>,
 ) -> Vec<(i64, JoinRow)> {
     let mut rows = Vec::new();
     for batch in batches {
         let batch = Arc::new(batch);
         let index = build_field_index(&batch);
-        let ts_array = batch
-            .column(time_col_index)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>();
         for row in 0..batch.num_rows() {
-            let Some(ts) = ts_array.and_then(|a| (!a.is_null(row)).then(|| a.value(row))) else {
+            let Some(ts) = batch_raw_ts_nanos(&batch, time_col_index, row) else {
                 continue;
             };
             rows.push((
@@ -644,6 +674,7 @@ pub fn columnar_timestamped_join_rows(
                     batch: Arc::clone(&batch),
                     row,
                     index: Arc::clone(&index),
+                    projection: projection.clone(),
                 },
             ));
         }
@@ -928,5 +959,100 @@ mod tests {
             Value::Array(vec![Value::Number(22.0), Value::Number(2222.0)])
         );
         assert_eq!(events[0].fields["plain"], Value::Str(r#"[22,2222]"#.into()));
+    }
+
+    #[test]
+    fn test_batch_raw_ts_nanos() {
+        // Raw `Timestamp(Ns)` i64 must be preserved exactly (no `as f64 as i64`
+        // collapse), null → None, and a non-Timestamp column → None.
+        let schema = make_schema(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+            Field::new("i", DataType::Int64, true),
+        ]);
+        let epoch: i64 = 1_767_225_600_000_000_123;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![Some(epoch), None])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(1), Some(2)])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        // Raw value preserved exactly (f64 would round this).
+        assert_eq!(batch_raw_ts_nanos(&batch, 0, 0), Some(epoch));
+        // Null timestamp → None.
+        assert_eq!(batch_raw_ts_nanos(&batch, 0, 1), None);
+        // Non-Timestamp(Ns) column → None.
+        assert_eq!(batch_raw_ts_nanos(&batch, 1, 0), None);
+    }
+
+    #[test]
+    fn test_columnar_join_rows_projection() {
+        let schema = make_schema(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![42, 99])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["alice", "bob"])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![1_000, 2_000])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let proj: Arc<HashSet<String>> =
+            Arc::new(HashSet::from(["id".to_string(), "ts".to_string()]));
+        let rows = columnar_join_rows(vec![batch], Some(proj));
+
+        assert_eq!(rows.len(), 2);
+        // `field_names` exposes only the projected columns.
+        let mut names: Vec<&str> = rows[0].field_names();
+        names.sort_unstable();
+        assert_eq!(names, vec!["id", "ts"]);
+        // `field_value` still reads non-projected columns (join conditions).
+        assert_eq!(
+            rows[0].field_value("name"),
+            Some(Value::Str("alice".into()))
+        );
+        assert_eq!(rows[0].field_value("id"), Some(Value::Number(42.0)));
+    }
+
+    #[test]
+    fn test_columnar_timestamped_join_rows_projection() {
+        let schema = make_schema(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(1_000),
+                    None,
+                    Some(3_000),
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![42, 99, 7])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["alice", "bob", "carol"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let proj: Arc<HashSet<String>> = Arc::new(HashSet::from(["ts".to_string()]));
+        let rows = columnar_timestamped_join_rows(vec![batch], 0, Some(proj));
+
+        // Null-timestamp row (index 1) is skipped.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 1_000);
+        assert_eq!(rows[1].0, 3_000);
+        // `field_names` is projected to only "ts".
+        assert_eq!(rows[0].1.field_names(), vec!["ts"]);
+        // `field_value` still reads non-projected "id" (join conditions).
+        assert_eq!(rows[0].1.field_value("id"), Some(Value::Number(42.0)));
+        assert_eq!(rows[1].1.field_value("id"), Some(Value::Number(7.0)));
     }
 }
