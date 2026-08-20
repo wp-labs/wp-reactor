@@ -281,12 +281,7 @@ pub trait WindowLookup: Send + Sync {
     ///
     /// Default implementation falls back to a snapshot + linear filter
     /// (O(rows)); a window with a maintained hash index overrides this to O(1).
-    fn join_lookup(
-        &self,
-        window: &str,
-        key_field: &str,
-        key: &Value,
-    ) -> Option<Vec<JoinRow>> {
+    fn join_lookup(&self, window: &str, key_field: &str, key: &Value) -> Option<Vec<JoinRow>> {
         let rows = self.snapshot(window)?;
         Some(
             rows.into_iter()

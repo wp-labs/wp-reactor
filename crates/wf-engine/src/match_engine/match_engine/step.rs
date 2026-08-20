@@ -562,8 +562,8 @@ fn value_to_f64(v: &Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::super::state::{AliasState, BranchState};
-    use super::super::types::Value;
     use super::super::types::Event;
+    use super::super::types::Value;
     use super::*;
 
     fn event_with(field: &str, value: i64) -> Event {

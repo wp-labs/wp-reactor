@@ -18,11 +18,11 @@ use wf_lang::plan::{
     ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, RateSpec, WindowSpec,
 };
 
-use crate::match_engine::{JoinRow, RuleExecutor};
 use crate::match_engine::match_engine::{
     CepStateMachine, CloseReason, EngineHashMap, Event, MatchedContext, SharedLimits, StepData,
     StepResult, Value, WindowLookup,
 };
+use crate::match_engine::{JoinRow, RuleExecutor};
 
 use super::helpers::*;
 
@@ -72,12 +72,9 @@ impl WindowLookup for MockWindowLookup {
     }
 
     fn snapshot(&self, window: &str) -> Option<Vec<JoinRow>> {
-        self.snapshots.get(window).map(|rows| {
-            rows.iter()
-                .cloned()
-                .map(map_row_to_join_row)
-                .collect()
-        })
+        self.snapshots
+            .get(window)
+            .map(|rows| rows.iter().cloned().map(map_row_to_join_row).collect())
     }
 
     fn snapshot_with_timestamps(&self, window: &str) -> Option<Vec<(i64, JoinRow)>> {

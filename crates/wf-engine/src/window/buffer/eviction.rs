@@ -104,9 +104,7 @@ impl Window {
     pub fn evict_oldest_acked(&self, acked_floor: u64) -> Option<usize> {
         let mut log = self.log.write().expect("window log lock poisoned");
         let removable = {
-            let Some((_, tb)) = log.first_key_value() else {
-                return None;
-            };
+            let (_, tb) = log.first_key_value()?;
             tb.seq < acked_floor
         };
         if !removable {

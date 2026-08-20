@@ -104,13 +104,16 @@ impl Clone for Subscription {
 /// per-shard row subsets so they can be stored once in the window log (P2
 /// zero re-partition). That partition is registered here and consulted by
 /// `precompute_shard_rows` even when no delivery `Subscription` exists.
+/// Pull-model key partition of one window: `(match keys, shard count)`.
+pub type WindowShardPartition = (Arc<[FieldRef]>, usize);
+
 #[derive(Default)]
 pub struct RuleFanout {
     table: RwLock<HashMap<String, Vec<Subscription>>>,
     /// window_name → (match keys, shard count) for the key-partitioned
     /// subscription of that window, used by the pull model to precompute
     /// shard row subsets without a delivery channel.
-    window_sharding: RwLock<HashMap<String, (Arc<[FieldRef]>, usize)>>,
+    window_sharding: RwLock<HashMap<String, WindowShardPartition>>,
 }
 
 impl RuleFanout {

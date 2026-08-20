@@ -400,10 +400,7 @@ pub(crate) fn eval_field_value(
 /// view). The `FieldRef::Path` walk is identical — the root field is read from
 /// the source (a columnar source JSON-parses structured fields exactly like
 /// `batch_to_events`), then the nested object/array walk applies unchanged.
-pub(crate) fn eval_field_value_src(
-    src: &dyn FieldSource,
-    fr: &FieldRef,
-) -> Option<Value> {
+pub(crate) fn eval_field_value_src(src: &dyn FieldSource, fr: &FieldRef) -> Option<Value> {
     let FieldRef::Path { segments, .. } = fr else {
         return src.field_value(field_ref_name(fr));
     };

@@ -1456,7 +1456,9 @@ async fn push_decoded_batch_commits_through_parse_pool() {
 #[tokio::test]
 async fn actor_mode_interleaved_streams_append_without_deadlock() {
     use tokio_util::sync::CancellationToken;
-    use wf_engine::window::{EvictionGate, WINDOW_CHANNEL_DEPTH, WindowMailbox, WindowMsg, run_window_actor};
+    use wf_engine::window::{
+        EvictionGate, WINDOW_CHANNEL_DEPTH, WindowMailbox, WindowMsg, run_window_actor,
+    };
 
     let router = make_multi_stream_router();
     let gate = Arc::new(EvictionGate::new(usize::MAX));

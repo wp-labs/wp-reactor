@@ -121,6 +121,11 @@ pub async fn acquire_window_budget(
 /// concurrency contract). On cancellation it commits
 /// whatever is already queued (bounded, non-blocking drain) so a graceful
 /// shutdown does not lose the queued tail, then stops.
+///
+/// The eight parameters are the actor's fixed wiring (name, window, eviction
+/// gate, fanout, notifier, mailbox, cancel, report); grouping them into a
+/// config struct would add an indirection layer for a spawn-time-only bundle.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_window_actor(
     name: Arc<str>,
     win: Arc<Window>,

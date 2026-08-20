@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use arrow::array::{Int64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 
 use wf_engine::window::{RuleFanout, RulePush};
 
@@ -50,7 +50,8 @@ fn make_batch() -> Arc<RecordBatch> {
     ]));
     let id = Int64Array::from((0..1000).collect::<Vec<i64>>());
     let auction = Int64Array::from((0..1000).map(|i| (i % 10) as i64).collect::<Vec<i64>>());
-    let ts = TimestampNanosecondArray::from((0..1000).map(|i| i as i64 * 1000).collect::<Vec<i64>>());
+    let ts =
+        TimestampNanosecondArray::from((0..1000).map(|i| i as i64 * 1000).collect::<Vec<i64>>());
     let extra = StringArray::from((0..1000).map(|i| format!("s{i}")).collect::<Vec<_>>());
     Arc::new(
         RecordBatch::try_new(
@@ -85,9 +86,9 @@ async fn run_push(with_slow: bool) -> (usize, Duration) {
             slow_rx = Some(rx); // 保留但不读
             continue;
         }
-        handles.push(tokio::spawn(async move {
-            while let Some(_) = rx.recv().await {}
-        }));
+        handles.push(tokio::spawn(
+            async move { while rx.recv().await.is_some() {} },
+        ));
     }
     let batch = make_batch();
     let start = Instant::now();
@@ -118,29 +119,24 @@ async fn run_push(with_slow: bool) -> (usize, Duration) {
 async fn run_pull() -> (usize, Duration, usize) {
     let log: Arc<Mutex<Vec<Arc<RecordBatch>>>> = Arc::new(Mutex::new(Vec::new()));
     let notify = Arc::new(Notify::new());
-    let cursors: Vec<Arc<Mutex<usize>>> =
-        (0..N_SUBS).map(|_| Arc::new(Mutex::new(0))).collect();
+    let cursors: Vec<Arc<Mutex<usize>>> = (0..N_SUBS).map(|_| Arc::new(Mutex::new(0))).collect();
     let batch = make_batch();
 
     // 快订阅者：自拉所有新批（cursor 追赶）
     let mut handles = Vec::new();
-    for i in 0..N_SUBS {
+    for (i, cursor) in cursors.iter().enumerate() {
         if i == SLOW_IDX {
             continue; // 慢/不读订阅者：cursor 停在 0，但不阻塞任何人
         }
         let log = log.clone();
         let notify = notify.clone();
-        let cur = cursors[i].clone();
+        let cur = cursor.clone();
         handles.push(tokio::spawn(async move {
             loop {
                 let next = {
                     let g = log.lock().unwrap();
                     let c = *cur.lock().unwrap();
-                    if c >= g.len() {
-                        None
-                    } else {
-                        Some(c)
-                    }
+                    if c >= g.len() { None } else { Some(c) }
                 };
                 match next {
                     Some(idx) => {
@@ -176,9 +172,7 @@ async fn bench_push_stalls_under_skew_pull_does_not() {
     let (pull_done, pull_el, slow_lag) = run_pull().await; // M1 模型
 
     println!("=== fanout stall bench ===");
-    println!(
-        "subs={N_SUBS} cap={CAP} slow_idx={SLOW_IDX} target={M_BATCHES} timeout={TIMEOUT:?}"
-    );
+    println!("subs={N_SUBS} cap={CAP} slow_idx={SLOW_IDX} target={M_BATCHES} timeout={TIMEOUT:?}");
     println!(
         "[PUSH healthy] done={push_ok_done}/{M_BATCHES} elapsed={push_ok_el:?} -> {}",
         if push_ok_done == M_BATCHES {
@@ -205,10 +199,7 @@ async fn bench_push_stalls_under_skew_pull_does_not() {
     );
 
     // 断言：健康 push 不卡；skew push 在 CAP 附近停滞；pull 完成全部。
-    assert_eq!(
-        push_ok_done, M_BATCHES,
-        "healthy push must not stall"
-    );
+    assert_eq!(push_ok_done, M_BATCHES, "healthy push must not stall");
     assert!(
         push_skew_done <= CAP + 2,
         "skewed push must stall near CAP, got {push_skew_done}"

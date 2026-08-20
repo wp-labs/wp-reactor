@@ -168,7 +168,7 @@ impl Evictor {
                     .progress(name)
                     .map(|p| p.min_acked())
                     .unwrap_or(u64::MAX);
-                if win.oldest_seq().map_or(false, |s| s < floor) {
+                if win.oldest_seq().is_some_and(|s| s < floor) {
                     let mem = win.memory_usage();
                     if mem > target_mem {
                         target_mem = mem;

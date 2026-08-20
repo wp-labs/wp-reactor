@@ -39,11 +39,19 @@ fn bid_batch(n: usize) -> (RecordBatch, usize) {
     ]));
     let auction: Vec<i64> = (0..n as i64).collect();
     let bidder: Vec<i64> = (0..n as i64).map(|i| i % 1000).collect();
-    let price: Vec<Option<i64>> = (0..n as i64).map(|i| (i % 7 != 0).then_some(i % 200)).collect();
+    let price: Vec<Option<i64>> = (0..n as i64)
+        .map(|i| (i % 7 != 0).then_some(i % 200))
+        .collect();
     let channel: Vec<String> = (0..n).map(|i| format!("ch{}", i % 8)).collect();
-    let url: Vec<String> = (0..n).map(|i| format!("http://example.com/{}", i % 1000)).collect();
-    let date_time: Vec<i64> = (0..n as i64).map(|i| 1_700_000_000_000_000_000 + i).collect();
-    let extra: Vec<Option<String>> = (0..n).map(|i| (i % 3 != 0).then(|| "x".to_string())).collect();
+    let url: Vec<String> = (0..n)
+        .map(|i| format!("http://example.com/{}", i % 1000))
+        .collect();
+    let date_time: Vec<i64> = (0..n as i64)
+        .map(|i| 1_700_000_000_000_000_000 + i)
+        .collect();
+    let extra: Vec<Option<String>> = (0..n)
+        .map(|i| (i % 3 != 0).then(|| "x".to_string()))
+        .collect();
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -142,7 +150,12 @@ fn join_row_field_value_vs_map_get() {
     let rows = columnar_join_rows(vec![batch.clone()]);
     let map_rows: Vec<std::collections::HashMap<String, Value>> = batch_to_events(&batch)
         .into_iter()
-        .map(|ev| ev.fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        .map(|ev| {
+            ev.fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect()
+        })
         .collect();
 
     let mut acc = 0.0f64;

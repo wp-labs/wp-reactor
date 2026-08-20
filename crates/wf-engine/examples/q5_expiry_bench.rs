@@ -16,11 +16,9 @@ use std::time::{Duration, Instant};
 use smol_str::SmolStr;
 
 use wf_lang::ast::{CmpOp, Expr, FieldRef, Measure};
-use wf_lang::plan::{
-    AggPlan, BranchPlan, MatchPlan, StepPlan, WindowSpec,
-};
+use wf_lang::plan::{AggPlan, BranchPlan, MatchPlan, StepPlan, WindowSpec};
 
-use wf_engine::match_engine::{CepStateMachine, Event, StepResult, Value, EngineHashMap};
+use wf_engine::match_engine::{CepStateMachine, EngineHashMap, Event, StepResult, Value};
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -128,7 +126,10 @@ fn main() {
     expired_total += remaining.len();
 
     println!("----");
-    println!("total: {total} events, live={} matched={matched} expired_total={expired_total}", sm.instance_count());
+    println!(
+        "total: {total} events, live={} matched={matched} expired_total={expired_total}",
+        sm.instance_count()
+    );
     println!("final sweep ({}) took {drain_ms}ms", remaining.len());
     println!(
         "advance total {:.1}ms  scan total {:.1}ms",
@@ -167,7 +168,6 @@ fn wave_test() {
     let mut popped = 0usize;
     let t = Instant::now();
     for _ in 0..(total / 1024 + 10) {
-        let before = popped;
         let expired = sm.scan_expired_at(expire_at);
         popped += expired.len();
         rows += 1;
@@ -176,7 +176,8 @@ fn wave_test() {
         }
     }
     let ms = t.elapsed().as_millis();
-    println!("---- wave test: created={created} drained={popped} in {rows} rows over {ms}ms ({:.1}ms/row, {:.1}µs/close)",
+    println!(
+        "---- wave test: created={created} drained={popped} in {rows} rows over {ms}ms ({:.1}ms/row, {:.1}µs/close)",
         ms as f64 / rows.max(1) as f64,
         ms as f64 * 1000.0 / popped.max(1) as f64,
     );
@@ -185,5 +186,9 @@ fn wave_test() {
     // A second far-ahead scan drains the rest under a larger budget.
     let t2 = Instant::now();
     let rest = sm.scan_expired_at(i64::MAX);
-    println!("second drain: {} closes in {}ms", rest.len(), t2.elapsed().as_millis());
+    println!(
+        "second drain: {} closes in {}ms",
+        rest.len(),
+        t2.elapsed().as_millis()
+    );
 }

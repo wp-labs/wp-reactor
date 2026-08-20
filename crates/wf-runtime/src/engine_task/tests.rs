@@ -2836,8 +2836,11 @@ fn make_sharded_match_tasks(
             conv_plan: None,
             limits_plan: None,
         };
-        let machine =
-            CepStateMachine::new("sharded_match".into(), match_plan, Some("event_time".into()));
+        let machine = CepStateMachine::new(
+            "sharded_match".into(),
+            match_plan,
+            Some("event_time".into()),
+        );
         let executor = RuleExecutor::new(rule_plan);
 
         let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);

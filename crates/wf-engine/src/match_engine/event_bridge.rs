@@ -420,11 +420,7 @@ impl<'a> ColumnarEvent<'a> {
     /// Same as [`Self::new`], but carry a batch-level field-name index so
     /// [`Self::field_value`] resolves names in O(1) instead of a per-call
     /// `schema().index_of` linear scan. Use on hot paths that read many rows.
-    pub fn with_index(
-        batch: &'a RecordBatch,
-        row: usize,
-        index: Arc<FieldIndex>,
-    ) -> Self {
+    pub fn with_index(batch: &'a RecordBatch, row: usize, index: Arc<FieldIndex>) -> Self {
         Self {
             batch,
             row,
@@ -533,9 +529,11 @@ impl FieldSource for ColumnarEvent<'_> {
                 if col.is_null(self.row) {
                     continue;
                 }
-                if let Some(value) =
-                    extract_field_value(self.batch.schema_ref().field(col_idx), col.as_ref(), self.row)
-                {
+                if let Some(value) = extract_field_value(
+                    self.batch.schema_ref().field(col_idx),
+                    col.as_ref(),
+                    self.row,
+                ) {
                     fields.insert(name.clone(), value);
                 }
             }
@@ -574,11 +572,7 @@ impl JoinRow {
     /// `batch_to_events`, so the value is byte-identical to the eager path.
     pub fn field_value(&self, name: &str) -> Option<Value> {
         match self {
-            JoinRow::Columnar {
-                batch,
-                row,
-                index,
-            } => {
+            JoinRow::Columnar { batch, row, index } => {
                 let idx = *index.get(name)?;
                 let col = batch.column(idx);
                 if col.is_null(*row) {
@@ -641,9 +635,7 @@ pub fn columnar_timestamped_join_rows(
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>();
         for row in 0..batch.num_rows() {
-            let Some(ts) = ts_array
-                .and_then(|a| (!a.is_null(row)).then(|| a.value(row)))
-            else {
+            let Some(ts) = ts_array.and_then(|a| (!a.is_null(row)).then(|| a.value(row))) else {
                 continue;
             };
             rows.push((

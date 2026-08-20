@@ -1025,8 +1025,10 @@ impl CepStateMachine {
     ///
     /// For rules with **no close steps** the qualification is decidable from the
     /// instance alone without building a CloseOutput:
+    ///
     ///   - `And` mode: qualifies iff `event_ok` (`close_ok` is always true)
     ///   - `Or` mode: never qualifies (empty `close_step_data`)
+    ///
     /// `event_ok` is a cheap bool on the instance. At 100M-scale count rules
     /// (q5) the vast majority of expiring instances never matched, so
     /// `evaluate_close` (close-steps eval + bind snapshot + completed-steps

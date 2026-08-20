@@ -16,16 +16,18 @@ use std::time::Duration;
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use wf_lang::ast::{BinOp, CloseMode, Expr, FieldRef, FieldSelector, MatchMode, Measure, CmpOp};
+use wf_lang::ast::{BinOp, CloseMode, CmpOp, Expr, FieldRef, FieldSelector, MatchMode, Measure};
 use wf_lang::plan::{AggPlan, BranchPlan, MatchPlan, SeqPlan, SeqSkipPlan, SeqStepPlan};
 
+use crate::match_engine::match_engine::{CepStateMachine, CloseReason};
 use crate::match_engine::{
     ColumnarEvent, FieldSource, GuardMasks, RuleExecutor, batch_event_time_nanos_at,
     batch_time_col_index, batch_to_events, build_field_index, materialize_rows_filtered,
 };
-use crate::match_engine::match_engine::{CepStateMachine, CloseReason};
 
-use super::helpers::{branch, count_ge, plan_with_close, simple_key, simple_plan, simple_rule_plan, step};
+use super::helpers::{
+    branch, count_ge, plan_with_close, simple_key, simple_plan, simple_rule_plan, step,
+};
 
 fn eq_str(field: &str, val: &str) -> Expr {
     Expr::BinOp {
@@ -139,8 +141,16 @@ fn assert_columnar_matches(
     assert_eq!(close_e.len(), close_c.len(), "close_all count");
     for (i, (ce, cc)) in close_e.iter().zip(close_c.iter()).enumerate() {
         assert_eq!(ce.close_ok, cc.close_ok, "close {i} close_ok");
-        let me = ce.close_step_data.iter().map(|s| s.measure_value).collect::<Vec<_>>();
-        let mc = cc.close_step_data.iter().map(|s| s.measure_value).collect::<Vec<_>>();
+        let me = ce
+            .close_step_data
+            .iter()
+            .map(|s| s.measure_value)
+            .collect::<Vec<_>>();
+        let mc = cc
+            .close_step_data
+            .iter()
+            .map(|s| s.measure_value)
+            .collect::<Vec<_>>();
         assert_eq!(me, mc, "close {i} measures");
     }
 }
@@ -169,11 +179,11 @@ fn event_close_plan() -> MatchPlan {
 
 fn event_close_rows() -> Vec<(&'static str, Option<&'static str>, Option<i64>, i64)> {
     vec![
-        ("10.0.0.2", None, Some(80), 0),            // event guard false → no instance
-        ("10.0.0.1", None, Some(443), 1),           // event guard true → Matched (trigger to_event)
-        ("10.0.0.1", Some("blocked"), None, 2),     // close: accumulate (action blocked)
-        ("10.0.0.1", Some("login"), None, 3),       // close: explicit false → blocked
-        ("10.0.0.1", None, None, 4),                // close: action null → permissive → accumulate
+        ("10.0.0.2", None, Some(80), 0),  // event guard false → no instance
+        ("10.0.0.1", None, Some(443), 1), // event guard true → Matched (trigger to_event)
+        ("10.0.0.1", Some("blocked"), None, 2), // close: accumulate (action blocked)
+        ("10.0.0.1", Some("login"), None, 3), // close: explicit false → blocked
+        ("10.0.0.1", None, None, 4),      // close: action null → permissive → accumulate
     ]
 }
 

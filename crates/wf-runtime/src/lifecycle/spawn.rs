@@ -343,8 +343,7 @@ pub(super) fn spawn_rule_tasks(
                     }
                 } else {
                     let push_rx = if use_push {
-                        let (push_tx, push_rx) =
-                            mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
+                        let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                         for source in &window_sources {
                             router
                                 .fanout()
@@ -411,9 +410,11 @@ pub(super) fn spawn_rule_tasks(
                     // Harmless in push mode (the broadcast path resolves the
                     // partition from its own delivery subscription instead).
                     for source in &window_sources {
-                        router
-                            .fanout()
-                            .register_window_sharding(&source.window_name, Arc::clone(&keys), shard_count);
+                        router.fanout().register_window_sharding(
+                            &source.window_name,
+                            Arc::clone(&keys),
+                            shard_count,
+                        );
                     }
                     // P2b: one shared rate-limit/budget handle across all shards
                     // (only when the rule carries limits).
@@ -523,8 +524,7 @@ pub(super) fn spawn_rule_tasks(
                     let machine =
                         CepStateMachine::with_limits(name, match_plan, time_field, limits);
                     let push_rx = if use_push {
-                        let (push_tx, push_rx) =
-                            mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
+                        let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                         for source in &window_sources {
                             router
                                 .fanout()

@@ -3,10 +3,10 @@ use std::time::Duration;
 use wf_lang::ast::{FieldRef, JoinMode};
 use wf_lang::plan::{JoinCondPlan, JoinPlan, StepPlan};
 
+use crate::match_engine::JoinRow;
 use crate::match_engine::match_engine::{
     BindData, EngineHashMap, Event, StepData, Value, WindowLookup, field_ref_name, values_equal,
 };
-use crate::match_engine::JoinRow;
 
 /// Build a synthetic [`Event`] from match context for expression evaluation.
 ///
@@ -192,11 +192,7 @@ fn first_join_key(ctx: &Event, conds: &[JoinCondPlan]) -> Option<(String, Value)
 }
 
 /// Find the first row matching all join conditions.
-fn find_matching_row(
-    rows: &[JoinRow],
-    conds: &[JoinCondPlan],
-    ctx: &Event,
-) -> Option<JoinRow> {
+fn find_matching_row(rows: &[JoinRow], conds: &[JoinCondPlan], ctx: &Event) -> Option<JoinRow> {
     rows.iter()
         .find(|row| row_matches_conds(row, conds, ctx))
         .cloned()
@@ -298,7 +294,11 @@ mod tests {
                     Some("10.0.0.2"),
                 ])),
                 Arc::new(Int64Array::from(vec![Some(80), Some(95), Some(100)])),
-                Arc::new(BooleanArray::from(vec![Some(true), Some(false), Some(true)])),
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                ])),
             ],
         )
         .unwrap();
@@ -318,7 +318,11 @@ mod tests {
         // Per-row, per-field parity (null cell → None / absent).
         for (i, (c, m)) in col_rows.iter().zip(&map_rows).enumerate() {
             for name in ["ip", "score", "active"] {
-                assert_eq!(c.field_value(name), m.get(name).cloned(), "row {i} field {name}");
+                assert_eq!(
+                    c.field_value(name),
+                    m.get(name).cloned(),
+                    "row {i} field {name}"
+                );
             }
             for name in c.field_names() {
                 assert_eq!(
@@ -349,10 +353,7 @@ mod tests {
             .into_iter()
             .map(|row| {
                 JoinRow::Event(Arc::new(Event {
-                    fields: row
-                        .into_iter()
-                        .map(|(k, v)| (k.into(), v))
-                        .collect(),
+                    fields: row.into_iter().map(|(k, v)| (k.into(), v)).collect(),
                 }))
             })
             .collect();

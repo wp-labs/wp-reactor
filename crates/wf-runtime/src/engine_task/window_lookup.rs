@@ -92,14 +92,13 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
         // (`max_seq = None`) view — a watermarked read must re-scan with the
         // seq cut set by `max_seq`.
         let eff_max_seq = self.eff_max_seq(window);
-        if eff_max_seq.is_none() {
-            if let Some(cached) = self
+        if eff_max_seq.is_none()
+            && let Some(cached) = self
                 .router
                 .registry()
                 .has_field_values(window, field, generation)
-            {
-                return Some(cached.as_ref().clone());
-            }
+        {
+            return Some(cached.as_ref().clone());
         }
         // Cache miss / stale / watermarked: read only the referenced column from
         // each (visible) batch — the whole window is never materialized into
@@ -169,10 +168,10 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
         // per-lookup HashMap conversion). The index is built incrementally
         // across the *full* window up to the current generation, so it is not
         // seq-cut safe: under a `max_seq` watermark we bypass it and scan.
-        if self.eff_max_seq(window).is_none() {
-            if let Some(events) = win.join_lookup(&join_key) {
-                return Some(events.into_iter().map(JoinRow::Event).collect());
-            }
+        if self.eff_max_seq(window).is_none()
+            && let Some(events) = win.join_lookup(&join_key)
+        {
+            return Some(events.into_iter().map(JoinRow::Event).collect());
         }
         // Scan fallback (bounded watermark, or no index): filter the seq-bounded
         // snapshot by key equality. Rows are keyed through the same

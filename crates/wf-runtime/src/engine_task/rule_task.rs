@@ -565,6 +565,7 @@ impl RuleTask {
     /// This is the per-batch body shared by the legacy pull path
     /// ([`Self::pull_and_advance`]) and the push path (channel recv). `batch_seq`
     /// is used only for debug event references.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn process_batch(
         &mut self,
         window_name: &str,

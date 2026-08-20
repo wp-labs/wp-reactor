@@ -6,6 +6,11 @@ use crate::match_engine::Event;
 
 use super::Window;
 
+/// Result of a columnar pull: `(batches, per-batch shard row subsets,
+/// new_cursor, gap_detected)`. Each `shard_rows_per_batch[i]` is the caller's
+/// row subset within batch `i` (`None` = whole batch).
+pub type ShardedReadSince = (Vec<RecordBatch>, Vec<Option<Arc<Vec<u32>>>>, u64, bool);
+
 impl Window {
     /// Read batches appended since the given cursor position.
     ///
@@ -58,7 +63,7 @@ impl Window {
         &self,
         cursor: u64,
         shard_index: Option<usize>,
-    ) -> (Vec<RecordBatch>, Vec<Option<Arc<Vec<u32>>>>, u64, bool) {
+    ) -> ShardedReadSince {
         let log = self.log.read().expect("window log lock poisoned");
         let Some(&oldest_seq) = log.keys().next() else {
             return (Vec::new(), Vec::new(), cursor, false);
