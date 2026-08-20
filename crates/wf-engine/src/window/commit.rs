@@ -53,10 +53,21 @@ pub(super) async fn commit_appended_batch(
     // Clone the raw batch for the columnar rule push; the append below moves
     // the original into the window. `RecordBatch` clone is O(columns) Arc bumps.
     let broadcast_batch = batch.clone();
+    // Persist the parse-side precomputed columnar shard partition (P2 zero
+    // re-partition) into the window log so pull-mode rule tasks can read only
+    // their own row subset. Convert `[Vec<u32>]` → `Vec<Vec<u32>>` (cheap clone
+    // of the small per-shard index vectors) for storage.
+    let stored_shard_rows: Option<Arc<Vec<Vec<u32>>>> =
+        shard_rows.as_ref().map(|s| Arc::from(s.to_vec()));
     let result = if let Some(events) = events.as_ref() {
-        win.append_with_watermark_parsed_sized(batch, Arc::clone(events), byte_size)
+        win.append_with_watermark_parsed_sized(
+            batch,
+            Arc::clone(events),
+            byte_size,
+            stored_shard_rows.clone(),
+        )
     } else {
-        win.append_with_watermark_sized(batch, byte_size)
+        win.append_with_watermark_sized(batch, byte_size, stored_shard_rows)
     };
     let (outcome, batch_seq) = result?;
     if matches!(outcome, AppendOutcome::Appended) {

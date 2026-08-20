@@ -58,6 +58,11 @@ pub(crate) struct RuleTaskConfig {
     /// `Arc<Vec<Arc<Event>>>` from it instead of pulling from the window read lock
     /// (R1). When `None`, the task falls back to the legacy notify + pull loop.
     pub push_rx: Option<mpsc::Receiver<RulePush>>,
+    /// Pull-model shard identity (M1). `Some(i)` for a sharded rule task;
+    /// `None` when unsharded. See `RuleTask::shard_index` for semantics.
+    pub shard_index: Option<usize>,
+    /// Total shard count this rule is split across (1 when unsharded).
+    pub shard_count: usize,
     /// Consumption-progress slots by window name. The task acks `seq + 1`
     /// after fully processing a batch; on drop the slots are released so a
     /// shutdown task cannot pin window memory. Gates time-based eviction.

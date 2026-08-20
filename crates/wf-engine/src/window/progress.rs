@@ -22,9 +22,11 @@ use std::sync::{Arc, RwLock, Weak};
 /// belt-and-braces for graceful shutdown paths that want the slot
 /// deactivated before the task struct itself drops.
 ///
-/// Memory-pressure eviction (`Evictor` phase 2) deliberately ignores this
-/// floor — it is the explicit lossy backstop when the global byte cap is
-/// exceeded.
+/// Time eviction ([`crate::window::Window::evict_expired`]) and per-window /
+/// global memory eviction all respect this floor: a batch a live consumer has
+/// not yet acked is never dropped, so a slow pull rule cannot lose unread
+/// data. When nothing is safe to drop under memory pressure, the actor parks
+/// (backpressure) instead.
 pub struct WindowProgress {
     slots: RwLock<Vec<Weak<AtomicU64>>>,
 }

@@ -1456,9 +1456,10 @@ async fn push_decoded_batch_commits_through_parse_pool() {
 #[tokio::test]
 async fn actor_mode_interleaved_streams_append_without_deadlock() {
     use tokio_util::sync::CancellationToken;
-    use wf_engine::window::{WINDOW_CHANNEL_DEPTH, WindowMailbox, WindowMsg, run_window_actor};
+    use wf_engine::window::{EvictionGate, WINDOW_CHANNEL_DEPTH, WindowMailbox, WindowMsg, run_window_actor};
 
     let router = make_multi_stream_router();
+    let gate = Arc::new(EvictionGate::new(usize::MAX));
     for name in ["win_a", "win_b"] {
         let win = router.registry().get_window(name).unwrap();
         let notify = router.registry().get_notifier(name).unwrap();
@@ -1473,11 +1474,12 @@ async fn actor_mode_interleaved_streams_append_without_deadlock() {
         );
         let name: Arc<str> = Arc::from(name);
         let fanout = Arc::clone(router.fanout());
+        let gate = Arc::clone(&gate);
         let cancel = CancellationToken::new();
         let cancel = cancel.child_token();
         // Leak the actor task handle: the test runtime reaps it at teardown.
         tokio::spawn(async move {
-            run_window_actor(name, win, fanout, notify, rx, cancel, None).await;
+            run_window_actor(name, win, gate, fanout, notify, rx, cancel, None).await;
         });
     }
 

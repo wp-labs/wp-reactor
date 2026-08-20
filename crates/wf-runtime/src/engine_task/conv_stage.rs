@@ -272,7 +272,10 @@ impl ConvStageTask {
             Some(plan) => apply_conv(plan, &self.keys, closes),
             None => closes,
         };
-        let lookup = RegistryLookup(&self.router);
+        // Conv-stage aggregation spans multiple source batches' closes, so it
+        // is not bound to one input batch's seq — read the full window (no
+        // `max_seq` watermark) for join/has during emit.
+        let lookup = RegistryLookup::new(&self.router);
         let mut records: Vec<OutputRecord> = Vec::new();
         for close in closes {
             if !close_is_qualified(&close) {

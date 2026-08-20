@@ -119,10 +119,12 @@ impl WindowRegistry {
             }
 
             let mode = def.config.mode.clone();
-            let window = Window::new(def.params, def.config);
-            windows.insert(name.clone(), Arc::new(window));
+            let window = Arc::new(Window::new(def.params, def.config));
+            let prog = Arc::new(WindowProgress::new());
+            window.set_progress(Arc::clone(&prog));
+            windows.insert(name.clone(), window);
             notifiers.insert(name.clone(), Arc::new(Notify::new()));
-            progress.insert(name.clone(), Arc::new(WindowProgress::new()));
+            progress.insert(name.clone(), prog);
 
             for stream_name in def.streams {
                 subscriptions
@@ -356,6 +358,11 @@ impl WindowRegistry {
     pub fn try_add_window(&self, def: WindowDef) -> CoreResult<()> {
         let name = def.params.name.clone();
         let mode = def.config.mode.clone();
+        // Build the progress table up front and wire it into the window so
+        // per-window eviction can respect the ack floor immediately.
+        let prog = Arc::new(WindowProgress::new());
+        let window = Arc::new(Window::new(def.params, def.config));
+        window.set_progress(Arc::clone(&prog));
 
         // (1) windows — name check + insert under one write guard (no TOCTOU).
         {
@@ -366,8 +373,7 @@ impl WindowRegistry {
                     .with_detail(format!("duplicate window name: {:?}", name))
                     .err();
             }
-            let window = Window::new(def.params, def.config);
-            wins.insert(name.clone(), Arc::new(window));
+            wins.insert(name.clone(), window);
         }
 
         // (2) notifiers
@@ -381,7 +387,7 @@ impl WindowRegistry {
         self.progress
             .write()
             .expect("progress lock poisoned")
-            .insert(name.clone(), Arc::new(WindowProgress::new()));
+            .insert(name.clone(), prog);
 
         // (3) subscriptions — append, never overwrite existing entries.
         {
@@ -421,6 +427,11 @@ impl WindowRegistry {
     pub fn try_replace_window(&self, def: WindowDef) -> CoreResult<()> {
         let name = def.params.name.clone();
         let mode = def.config.mode.clone();
+        // Build the fresh progress table up front and wire it into the new
+        // window so per-window eviction respects the ack floor immediately.
+        let prog = Arc::new(WindowProgress::new());
+        let window = Arc::new(Window::new(def.params, def.config));
+        window.set_progress(Arc::clone(&prog));
 
         // (1) windows — verify existence + replace atomically.
         {
@@ -431,8 +442,7 @@ impl WindowRegistry {
                     .with_detail(format!("cannot replace non-existent window: {:?}", name))
                     .err();
             }
-            let window = Window::new(def.params, def.config);
-            wins.insert(name.clone(), Arc::new(window));
+            wins.insert(name.clone(), window);
         }
 
         // (2) notifiers — replace.
@@ -447,7 +457,7 @@ impl WindowRegistry {
         self.progress
             .write()
             .expect("progress lock poisoned")
-            .insert(name.clone(), Arc::new(WindowProgress::new()));
+            .insert(name.clone(), prog);
 
         // (3) subscriptions — remove old entries for this window, then
         //     insert the new stream subscriptions.

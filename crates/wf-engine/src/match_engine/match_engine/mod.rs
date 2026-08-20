@@ -93,6 +93,11 @@ pub struct CepStateMachine {
     seq_meta: Option<SeqRuntime>,
 }
 
+/// Max expiry candidates processed per `scan_expired_at` call (incremental
+/// expiry). Bounds each sweep so a far-ahead watermark cannot pop the whole
+/// heap in one call and starve the pipeline (see `scan_expired_at`).
+const MAX_EXPIRY_SCAN_BUDGET: usize = 1024;
+
 impl CepStateMachine {
     /// Create a new state machine for the given rule + plan.
     pub fn new(rule_name: String, plan: MatchPlan, time_field: Option<String>) -> Self {
@@ -1003,20 +1008,55 @@ impl CepStateMachine {
         self.scan_expired_at(self.watermark_nanos)
     }
 
-    /// Scan all instances for maxspan expiry using an explicit watermark.
-    ///
-    /// Used by the oracle and tests.
+    /// Scan all instances for maxspan expiry using an explicit watermark,
+    /// returning every expired instance's [`CloseOutput`] (qualified or not) —
+    /// the full-close contract used by the oracle and tests.
     ///
     /// Each expired instance's close output uses `created_at + maxspan` as its
     /// watermark (the logical expiry time), rather than the detection-time
     /// watermark. This makes `fired_at` deterministic regardless of batch size
     /// or scan frequency.
     pub fn scan_expired_at(&mut self, watermark_nanos: i64) -> Vec<CloseOutput> {
+        self.scan_expired_at_impl(watermark_nanos, false)
+    }
+
+    /// Like [`Self::scan_expired_at`], but skips building [`CloseOutput`]s for
+    /// instances that can never produce an alert.
+    ///
+    /// For rules with **no close steps** the qualification is decidable from the
+    /// instance alone without building a CloseOutput:
+    ///   - `And` mode: qualifies iff `event_ok` (`close_ok` is always true)
+    ///   - `Or` mode: never qualifies (empty `close_step_data`)
+    /// `event_ok` is a cheap bool on the instance. At 100M-scale count rules
+    /// (q5) the vast majority of expiring instances never matched, so
+    /// `evaluate_close` (close-steps eval + bind snapshot + completed-steps
+    /// move) for each of them is pure waste that monopolizes the rule task and
+    /// starves push consumption. The instance is removed identically either
+    /// way, so skipping neither defers expiry nor holds memory. Callers that
+    /// only process qualifying closes (the rule-task hot path, conv stage)
+    /// can use this and observe identical output.
+    pub fn scan_expired_at_skip_non_alerting(&mut self, watermark_nanos: i64) -> Vec<CloseOutput> {
+        self.scan_expired_at_impl(watermark_nanos, true)
+    }
+
+    fn scan_expired_at_impl(
+        &mut self,
+        watermark_nanos: i64,
+        skip_non_alerting: bool,
+    ) -> Vec<CloseOutput> {
         let mut results = Vec::new();
+        // Incremental expiry: bound each sweep so a far-ahead watermark cannot
+        // pop millions of candidates in a single call and starve push
+        // consumption (q5/q6/q7 froze at 30M+ — the sweep occupied the rule
+        // task, the push channel filled, the pipeline froze). Remaining
+        // candidates stay in the heap and are processed on the next scan
+        // (per-row in the deferred loop + periodic `scan_timeouts`).
+        let mut budget = MAX_EXPIRY_SCAN_BUDGET;
         while let Some(Reverse((candidate_expire, key))) = self.expiry_heap.peek().cloned() {
-            if candidate_expire > watermark_nanos {
+            if candidate_expire > watermark_nanos || budget == 0 {
                 break;
             }
+            budget -= 1;
             self.expiry_heap.pop();
             self.pending_expiry.remove(&key);
 
@@ -1036,6 +1076,15 @@ impl CepStateMachine {
             if let Some(instance) = self.remove_instance(&key) {
                 // P1②: expiry is a permanent remove — release its slot.
                 self.release_shared_instance();
+                let skip_close = skip_non_alerting
+                    && self.plan.close_steps.is_empty()
+                    && match self.plan.close_mode {
+                        CloseMode::And => !instance.event_ok,
+                        CloseMode::Or => true,
+                    };
+                if skip_close {
+                    continue;
+                }
                 let mut output = evaluate_close(
                     &self.rule_name,
                     &self.plan,
@@ -1062,6 +1111,17 @@ impl CepStateMachine {
         conv_plan: Option<&ConvPlan>,
     ) -> Vec<CloseOutput> {
         let outputs = self.scan_expired_at(watermark_nanos);
+        apply_conv_filtered(outputs, conv_plan, &self.plan.keys)
+    }
+
+    /// [`Self::scan_expired_at_with_conv`] over the skip-non-alerting scan — for
+    /// the rule-task hot path where non-qualifying closes are discarded anyway.
+    pub fn scan_expired_at_with_conv_skip_non_alerting(
+        &mut self,
+        watermark_nanos: i64,
+        conv_plan: Option<&ConvPlan>,
+    ) -> Vec<CloseOutput> {
+        let outputs = self.scan_expired_at_skip_non_alerting(watermark_nanos);
         apply_conv_filtered(outputs, conv_plan, &self.plan.keys)
     }
 
@@ -1239,8 +1299,33 @@ impl CepStateMachine {
     /// (O(1)), so the running estimate drifts below true usage as instances
     /// accumulate state (field_values, distinct_set, …). Calling this
     /// periodically (e.g. per timeout scan) re-anchors it to the exact sum.
+    ///
+    /// Skips the O(instances) sweep when the running estimate is already at or
+    /// above `max_memory_bytes`: the exact value can only be larger (instances
+    /// accumulate state, never shrink), so it cannot flip the throttle decision
+    /// — the rule is already over budget and `Throttle`/`DropOldest` engage.
+    /// Without this, a high-instance rule spends ~a second per `scan_timeouts`
+    /// tick walking millions of instances (`estimated_bytes`), during which the
+    /// rule task is not draining pushes — the 30 rule channels fill, the window
+    /// broadcast blocks, the window byte budget exhausts, and the pipeline
+    /// stalls (q5 100M: `budget starved` / freeze).
     pub fn recalibrate_memory(&mut self) {
         if !self.tracks_memory_bytes() {
+            return;
+        }
+        let Some(limit) = self
+            .limits
+            .as_ref()
+            .and_then(|limits| limits.max_memory_bytes)
+        else {
+            return;
+        };
+        let cur = self
+            .shared
+            .as_ref()
+            .map(|s| s.memory_bytes())
+            .unwrap_or(self.estimated_memory_bytes);
+        if cur >= limit {
             return;
         }
         let exact: usize = self

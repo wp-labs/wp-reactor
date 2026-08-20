@@ -291,7 +291,17 @@ impl Router {
             // parse side on windows no rule reads. Events stay `None` so the
             // window's lazy OnceLock is left uninitialized — a later subscriber
             // (hot reload) still gets real events via `events_since()`.
-            if !self.rule_fanout.has_subscribers(&window_name) {
+            //
+            // A window is skipped entirely only when nothing consumes it: no
+            // fanout delivery subscriber AND no pull-model sharding. A
+            // pull-sharded window (`window_actor_pull_model.md`, M1) still
+            // needs its columnar shard partition computed and stored in the
+            // window log, so it must not be skipped here (the partition is
+            // computed just below via `precompute_shard_rows`, which now
+            // consults the sharding registry).
+            if !self.rule_fanout.has_subscribers(&window_name)
+                && !self.rule_fanout.window_is_sharded(&window_name)
+            {
                 windows.push(ParsedWindow {
                     events_bytes: 0,
                     window_name,
@@ -315,7 +325,14 @@ impl Router {
             // The columnar partition is computed **here in the parallel parse
             // stage** and carried to the actor, so the single-writer actor does
             // not repartition the whole batch on its serial critical path.
-            if win.defer_materialization() {
+            //
+            // A pull-model sharded window (`window_actor_pull_model.md`, M1)
+            // enters this branch as well: it is key-partitioned but has no
+            // delivery subscriber, so `precompute_shard_rows` reads the
+            // sharding registry instead of a fanout `Sharded` subscription,
+            // and the partition is stored in the window log for the sharded
+            // rule tasks to pull their own subset.
+            if win.defer_materialization() || self.rule_fanout.window_is_sharded(&window_name) {
                 let shard_rows = self.rule_fanout.precompute_shard_rows(&window_name, batch);
                 windows.push(ParsedWindow {
                     events_bytes: 0,
@@ -864,6 +881,7 @@ mod tests {
         use tokio::sync::{Semaphore, mpsc};
         use tokio_util::sync::CancellationToken;
 
+        use crate::window::EvictionGate;
         use crate::window::WINDOW_CHANNEL_DEPTH;
         use crate::window::run_window_actor;
 
@@ -899,10 +917,11 @@ mod tests {
         let fanout = Arc::clone(router.fanout());
         let name: Arc<str> = Arc::from("win_live");
         let notify = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(EvictionGate::new(usize::MAX));
         let cancel = CancellationToken::new();
         let cancel2 = cancel.clone();
         tokio::spawn(async move {
-            run_window_actor(name, live_win, fanout, notify, live_rx, cancel2, None).await;
+            run_window_actor(name, live_win, gate, fanout, notify, live_rx, cancel2, None).await;
         });
 
         let schema = test_schema();

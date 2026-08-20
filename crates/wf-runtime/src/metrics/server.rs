@@ -50,8 +50,15 @@ pub async fn run_metrics_task(
                 if let Some(ref sender) = mon_send {
                     let snap = metrics.snapshot();
                     let records = snap.to_records();
-                    if sender.try_send(records).is_err() {
-                        wf_debug!(sys, "monitor channel full, dropping metrics snapshot");
+                    // Backpressure instead of drop: `snapshot()` above already
+                    // drained (swap(0)) every counter, so a `try_send` on a full
+                    // channel would silently lose that drained increment — the
+                    // append/emit totals the bench relies on would undercount
+                    // (q3 emitted_total / q5 append_total both drifted ~15-25%).
+                    // `send().await` parks the metrics loop until the monitor
+                    // consumer drains, so no drained batch is ever discarded.
+                    if sender.send(records).await.is_err() {
+                        wf_debug!(sys, "monitor channel closed, dropping metrics snapshot");
                     }
                 }
             }

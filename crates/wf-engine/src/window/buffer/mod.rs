@@ -26,6 +26,7 @@ use wf_config::WindowConfig;
 
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::{Event, JoinKey, Value};
+use crate::window::WindowProgress;
 
 use types::TimedBatch;
 
@@ -140,6 +141,11 @@ pub struct Window {
     /// L2 deferred materialization (see `WindowParams`). Immutable after
     /// construction.
     pub(super) defer_materialization: bool,
+    /// Consumption progress (ack floor) for this window, injected by the
+    /// registry. Per-window memory eviction respects this floor so a slow
+    /// pull consumer never loses unread batches (`None` until the registry
+    /// wires it — treated as "no consumers", i.e. everything evictable).
+    progress: RwLock<Option<Arc<WindowProgress>>>,
 }
 
 impl Window {
@@ -164,7 +170,28 @@ impl Window {
             join_index: RwLock::new(None),
             materialize_fields,
             defer_materialization,
+            progress: RwLock::new(None),
         }
+    }
+
+    /// Wire this window to its consumption-progress table. Called once by the
+    /// registry right after construction, so per-window memory eviction can
+    /// respect the ack floor (see [`Self::min_acked`]).
+    pub(crate) fn set_progress(&self, progress: Arc<WindowProgress>) {
+        *self.progress.write().expect("progress lock poisoned") = Some(progress);
+    }
+
+    /// Consumption floor for this window: the lowest acked `seq + 1` across
+    /// all live consumers, or `u64::MAX` when there are none (everything is
+    /// evictable). Per-window memory eviction uses this to avoid dropping a
+    /// batch a slow pull rule has not yet read.
+    fn min_acked(&self) -> u64 {
+        self.progress
+            .read()
+            .expect("progress lock poisoned")
+            .as_ref()
+            .map(|p| p.min_acked())
+            .unwrap_or(u64::MAX)
     }
 
     /// Configure this window as a join target: build a hash index on `key_field`
@@ -216,7 +243,7 @@ impl Window {
     /// schema does not match the window schema. After appending, memory
     /// eviction runs if `current_bytes > max_window_bytes`.
     pub fn append(&self, batch: RecordBatch) -> CoreResult<()> {
-        self.append_inner(batch, None, None).map(|_| ())
+        self.append_inner(batch, None, None, None).map(|_| ())
     }
 
     /// Append a RecordBatch whose events were already parsed *outside* the
@@ -227,7 +254,7 @@ impl Window {
         batch: RecordBatch,
         parsed_events: Arc<Vec<Arc<Event>>>,
     ) -> CoreResult<()> {
-        self.append_inner(batch, Some(parsed_events), None)
+        self.append_inner(batch, Some(parsed_events), None, None)
             .map(|_| ())
     }
 
@@ -240,8 +267,28 @@ impl Window {
         batch: RecordBatch,
         parsed_events: Arc<Vec<Arc<Event>>>,
         byte_size: usize,
+        shard_rows: Option<Arc<Vec<Vec<u32>>>>,
     ) -> CoreResult<u64> {
-        self.append_inner(batch, Some(parsed_events), Some(byte_size))
+        self.append_inner(batch, Some(parsed_events), Some(byte_size), shard_rows)
+    }
+
+    /// Append a RecordBatch *without* pre-parsed events but *with* a
+    /// precomputed content byte size (R2 parse worker) **and** the parse-side
+    /// precomputed columnar shard partition (`shard_rows`, the P2 zero
+    /// re-partition data). Used by the columnar/deferred commit path (pull
+    /// model sharded match rules) where `route_parse` leaves events `None`
+    /// but still carries `shard_rows`. The prior `(None, _)` arm of
+    /// `append_with_watermark_inner` funnelled here via `self.append(batch)`,
+    /// which dropped `shard_rows` — leaving every pull shard to process the
+    /// whole batch (Q2 30M pull over-production, ~9×). Returns the sequence
+    /// number assigned to the appended batch.
+    pub fn append_sized(
+        &self,
+        batch: RecordBatch,
+        byte_size: usize,
+        shard_rows: Option<Arc<Vec<Vec<u32>>>>,
+    ) -> CoreResult<u64> {
+        self.append_inner(batch, None, Some(byte_size), shard_rows)
     }
 
     fn append_inner(
@@ -249,6 +296,7 @@ impl Window {
         batch: RecordBatch,
         parsed_events: Option<Arc<Vec<Arc<Event>>>>,
         byte_size: Option<usize>,
+        shard_rows: Option<Arc<Vec<Vec<u32>>>>,
     ) -> CoreResult<u64> {
         if batch.num_rows() == 0 {
             return Ok(0);
@@ -293,6 +341,12 @@ impl Window {
 
         // Memory eviction: pop oldest batches while over budget.
         let max_bytes = self.config.max_window_bytes.as_bytes();
+        // Per-window eviction is floor-respecting: only drop batches every
+        // live consumer has already acked (`seq < ack_floor`). An unacked
+        // front batch stops the sweep — the window may transiently exceed
+        // `max_window_bytes` rather than lose unread pull data (the periodic
+        // evictor reclaims it once consumers advance).
+        let ack_floor = self.min_acked();
         let mut evicted_bytes = 0usize;
         let mut evicted_rows = 0usize;
         {
@@ -307,12 +361,18 @@ impl Window {
                     byte_size,
                     seq,
                     parsed_events: parsed_lock,
+                    shard_rows,
                 },
             );
             while self.current_bytes.load(Ordering::Relaxed) > max_bytes {
-                let Some((&key, _)) = log.first_key_value() else {
+                let Some((&key, tb)) = log.first_key_value() else {
                     break;
                 };
+                // Unacked front batch: stop the sweep — never drop a batch a
+                // live consumer has not yet read.
+                if tb.seq >= ack_floor {
+                    break;
+                }
                 // `BTreeMap::remove` returns the owned value: dropping it
                 // destroys the Arrow batch and parsed events eagerly — no
                 // deferred (epoch-GC) reclamation to drive.
@@ -400,6 +460,24 @@ impl Window {
         log.values().map(|tb| tb.batch.clone()).collect()
     }
 
+    /// Return a snapshot of the batches with `seq <= max_seq`.
+    ///
+    /// M2 (seq-watermark consistency, window-actor-pull-model.md §3.5): when a
+    /// rule task is processing batch N, its `window_lookup` must see only the
+    /// batches this rule already pulled (`seq <= N`), never the batches the
+    /// actor may already have appended past it. `None` returns the full log
+    /// (identical to [`Window::snapshot`]) — the legacy view used when no
+    /// seq watermark is enforced (push mode / no-join rules).
+    ///
+    /// `RecordBatch::clone()` is Arc-ref-counted — no data copy occurs.
+    pub fn snapshot_up_to(&self, max_seq: Option<u64>) -> Vec<RecordBatch> {
+        let log = self.log.read().expect("window log lock poisoned");
+        match max_seq {
+            Some(n) => log.range(..=n).map(|(_, tb)| tb.batch.clone()).collect(),
+            None => log.values().map(|tb| tb.batch.clone()).collect(),
+        }
+    }
+
     pub fn memory_usage(&self) -> usize {
         self.current_bytes.load(Ordering::Relaxed)
     }
@@ -436,6 +514,14 @@ impl Window {
     /// Whether rule tasks defer per-row event materialization (L2).
     pub fn defer_materialization(&self) -> bool {
         self.defer_materialization
+    }
+
+    /// Field projection used when materializing events from this window's
+    /// batches (L2 deferred materialization). `None` materializes every schema
+    /// column. Exposed for the pull-model rule tasks, which read the raw
+    /// `RecordBatch` and need the same projection the columnar push path uses.
+    pub fn materialize_fields(&self) -> Option<&Arc<HashSet<String>>> {
+        self.materialize_fields.as_ref()
     }
 
     // -- private helpers ----------------------------------------------------

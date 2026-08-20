@@ -78,6 +78,87 @@ fn close_missing_detection() {
 }
 
 #[test]
+fn int_key_close_preserves_number_scope_key() {
+    // Regression: the close path's scope_key used to flatten Int keys to
+    // `Value::Str`, so digit-typed yield/entity fields referencing the key
+    // (e.g. `id = b.auction` on `on close` / conv rules) received a string and
+    // failed digit coercion — every close alert was dropped with `data format
+    // error` (Q12/Q14 hit this). A close over an Int key must produce a
+    // `Number` scope_key, byte-identical to the event path.
+    let plan = plan_with_close(
+        vec![simple_key("auction")],
+        vec![step(vec![branch("b", count_ge(1.0))])],
+        vec![step(vec![branch("b", count_ge(1.0))])],
+        Duration::from_secs(60),
+    );
+    let mut sm = CepStateMachine::new("int_key_close".to_string(), plan, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
+
+    let bid = event(vec![("auction", num(421_762.0))]);
+    assert_eq!(sm.advance_at("b", &bid, base), StepResult::Advance);
+
+    let expired = sm.scan_expired_at(base + 61 * NANOS_PER_SEC);
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].scope_key, vec![num(421_762.0)]);
+}
+
+#[test]
+fn close_sum_measure_fires_at_window_end() {
+    // Q16 regression probe: `and close { b.price | sum >= T }` on a fixed window.
+    // Count-close fires (q12min), but sum/avg close returned 0 — verify the
+    // engine accumulates the branch field's sum across the window and fires.
+    use wf_lang::ast::FieldSelector;
+
+    let sum_price = BranchPlan {
+        label: Some("total".to_string()),
+        source: "b".to_string(),
+        field: Some(FieldSelector::Dot("price".into())),
+        guard: None,
+        agg: AggPlan {
+            transforms: vec![],
+            measure: Measure::Sum,
+            cmp: CmpOp::Ge,
+            threshold: Expr::Number(10.0),
+        },
+    };
+    let plan = plan_with_close(
+        vec![simple_key("auction")],
+        vec![step(vec![branch("b", count_ge(1.0))])],
+        vec![step(vec![sum_price])],
+        Duration::from_secs(60),
+    );
+    let mut sm = CepStateMachine::new("close_sum".to_string(), plan, None);
+    let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
+
+    // Three bids, prices 5/5/5 → window sum 15 >= 10. The event step fires once
+    // (AND mode, event_ok kept), close accumulates every bid's price.
+    for (i, price) in [5.0, 5.0, 5.0].into_iter().enumerate() {
+        let ns = base + (i as i64) * NANOS_PER_SEC;
+        let result = sm.advance_at(
+            "b",
+            &event(vec![("auction", num(1.0)), ("price", num(price))]),
+            ns,
+        );
+        assert!(
+            matches!(result, StepResult::Advance | StepResult::Accumulate),
+            "AND close should not emit per event"
+        );
+    }
+
+    let expired = sm.scan_expired_at(base + 61 * NANOS_PER_SEC);
+    assert_eq!(expired.len(), 1, "one window closes");
+    let out = &expired[0];
+    assert!(out.event_ok);
+    assert!(out.close_ok, "close must qualify (sum >= 10)");
+    assert_eq!(out.close_step_data.len(), 1);
+    assert_eq!(out.close_step_data[0].label, Some("total".to_string()));
+    assert_eq!(
+        out.close_step_data[0].measure_value, 15.0,
+        "window sum of prices must be 15"
+    );
+}
+
+#[test]
 fn maxspan_expiry_resets() {
     // Instance past maxspan → scan_expired removes it, returns CloseOutput
     let plan = plan_with_close(

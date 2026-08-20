@@ -546,3 +546,75 @@ async fn commit(router: &Router, metrics: &Option<Arc<RuntimeMetrics>>, item: Pa
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The parse worker pool shares one `mpsc::Receiver` behind an
+    /// `Arc<tokio::sync::Mutex<_>>` and calls `guard.recv().await` while holding
+    /// the lock. This makes **receives strictly serialized** (one worker
+    /// receives at a time), but **processing happens outside the lock** (parallel).
+    /// The test pins both properties: serialized receive, parallel processing —
+    /// so a burst cannot be starved by the receive mutex (the suspected q5
+    /// pull-freeze amplifier), only bounded by processing parallelism.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mutex_receiver_recv_serialized_processing_parallel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel::<usize>(1024);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let recv_active = Arc::new(AtomicUsize::new(0));
+        let recv_max = Arc::new(AtomicUsize::new(0));
+        let process_active = Arc::new(AtomicUsize::new(0));
+        let process_max = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let rx = Arc::clone(&rx);
+            let ra = Arc::clone(&recv_active);
+            let rm = Arc::clone(&recv_max);
+            let pa = Arc::clone(&process_active);
+            let pm = Arc::clone(&process_max);
+            handles.push(tokio::spawn(async move {
+                loop {
+                    let item = {
+                        // Receive under the lock (serialized).
+                        let mut guard = rx.lock().await;
+                        let cur = ra.fetch_add(1, Ordering::Relaxed) + 1;
+                        rm.fetch_max(cur, Ordering::Relaxed);
+                        let r = guard.recv().await;
+                        ra.fetch_sub(1, Ordering::Relaxed);
+                        r
+                    };
+                    let Some(item) = item else { break };
+                    // Processing outside the lock (parallel).
+                    let cur = pa.fetch_add(1, Ordering::Relaxed) + 1;
+                    pm.fetch_max(cur, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_micros(200)).await;
+                    let _ = item;
+                    pa.fetch_sub(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        for i in 0..64 {
+            tx.send(i).await.unwrap();
+        }
+        drop(tx);
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(
+            recv_max.load(Ordering::Relaxed),
+            1,
+            "recv is under the Mutex → strictly serialized"
+        );
+        assert!(
+            process_max.load(Ordering::Relaxed) > 1,
+            "processing is outside the lock → parallel"
+        );
+    }
+}

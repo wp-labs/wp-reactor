@@ -13,7 +13,7 @@ pub use actor::{
     run_window_actor,
 };
 pub use buffer::{AppendOutcome, Window, WindowParams, content_bytes, events_bytes};
-pub use evictor::{EvictReport, Evictor, WindowEvictCount};
+pub use evictor::{EvictReport, EvictionGate, Evictor, WindowEvictCount};
 pub use fanout::{RuleFanout, RulePush};
 pub use progress::WindowProgress;
 pub use provider::ProviderWindow;

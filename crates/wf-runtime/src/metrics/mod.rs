@@ -158,6 +158,7 @@ pub(crate) struct MetricsSnapshot {
     window_capacity_bytes: BTreeMap<String, u64>,
     window_rows: BTreeMap<String, u64>,
     window_batches: BTreeMap<String, u64>,
+    window_acked_lag: BTreeMap<String, u64>,
     window_append: BTreeMap<String, u64>,
     window_evict: BTreeMap<String, u64>,
     window_late: BTreeMap<String, u64>,
@@ -371,6 +372,9 @@ impl MetricsSnapshot {
         }
         for (window, v) in &self.window_batches {
             out.push(metric("window", "batches", window, *v));
+        }
+        for (window, v) in &self.window_acked_lag {
+            out.push(metric("window", "acked_lag", window, *v));
         }
         for (window, v) in &self.window_append {
             out.push(metric("window", "append_total", window, *v));
@@ -744,6 +748,11 @@ pub struct RuntimeMetrics {
     window_capacity_bytes: BTreeMap<String, AtomicU64>,
     window_rows: BTreeMap<String, AtomicU64>,
     window_batches: BTreeMap<String, AtomicU64>,
+    /// Gauge: number of batches appended but not yet acked by the slowest live
+    /// consumer (`next_seq - min_acked`). `0` for an unconsumed window (min_acked
+    /// = u64::MAX) or a fully-consumed window. The bench uses the sum over input
+    /// windows as the pull-model "rules drained" completion signal.
+    window_acked_lag: BTreeMap<String, AtomicU64>,
     window_append_total: BTreeMap<String, AtomicU64>,
     window_evict_total: BTreeMap<String, AtomicU64>,
     window_late_total: BTreeMap<String, AtomicU64>,
@@ -923,6 +932,7 @@ impl RuntimeMetrics {
             window_capacity_bytes: make_window_map(),
             window_rows: make_window_map(),
             window_batches: make_window_map(),
+            window_acked_lag: make_window_map(),
             window_append_total: make_window_map(),
             window_evict_total: make_window_map(),
             window_late_total: make_window_map(),
@@ -1314,6 +1324,7 @@ impl RuntimeMetrics {
             window_capacity_bytes: self.read_map(&self.window_capacity_bytes),
             window_rows: self.read_map(&self.window_rows),
             window_batches: self.read_map(&self.window_batches),
+            window_acked_lag: self.read_map(&self.window_acked_lag),
             window_append: self.drain_map(&self.window_append_total),
             window_evict: self.drain_map(&self.window_evict_total),
             window_late: self.drain_map(&self.window_late_total),

@@ -1,4 +1,8 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use super::registry::WindowRegistry;
+use tokio::sync::Notify;
 
 // ---------------------------------------------------------------------------
 // EvictReport
@@ -20,6 +24,50 @@ pub struct EvictReport {
     pub batches_time_evicted: usize,
     pub batches_memory_evicted: usize,
     pub per_window_evicted: Vec<WindowEvictCount>,
+    /// Set when the aggregate memory stayed over `max_total_bytes` but no
+    /// window had a safe-to-drop (fully-acked) oldest batch. The caller
+    /// (window actor) is expected to apply backpressure (stop accepting new
+    /// appends) rather than let the evictor lose data a pull rule has not
+    /// yet read.
+    pub memory_pressure: bool,
+}
+
+// ---------------------------------------------------------------------------
+// EvictionGate
+// ---------------------------------------------------------------------------
+
+/// Shared state bridging the periodic [`Evictor`] and the window actors'
+/// append path for **memory backpressure**.
+///
+/// The evictor runs on a timer and reclaims memory via time-based eviction
+/// gated by the consumption floor (every live consumer has acked a batch
+/// before it is dropped). When global memory is still over budget but no
+/// window has a *safe-to-drop* oldest batch, the evictor cannot reclaim
+/// without losing unread pull data — so instead the actors must stop
+/// appending (the "conveyor belt stops") until the evictor's next sweep
+/// frees space. [`EvictionGate::freed`] is the [`Notify`] the evictor
+/// signals after each sweep; actors park on it while over budget.
+pub struct EvictionGate {
+    /// Global memory budget across all windows (bytes).
+    pub max_total_bytes: usize,
+    /// Latest aggregate window memory across all windows (bytes),
+    /// recomputed by the evictor on every sweep. Window actors read this on
+    /// their hot append path — a single atomic load — to decide whether to
+    /// apply memory backpressure (stop appending) instead of waiting on the
+    /// evictor to free space via `freed`.
+    pub current_bytes: AtomicUsize,
+    /// Signaled by the evictor after every sweep so parked actors re-check.
+    pub freed: Notify,
+}
+
+impl EvictionGate {
+    pub fn new(max_total_bytes: usize) -> Self {
+        Self {
+            max_total_bytes,
+            current_bytes: AtomicUsize::new(0),
+            freed: Notify::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -29,12 +77,12 @@ pub struct EvictReport {
 /// Periodic evictor that enforces time-based and global-memory-based eviction
 /// across all windows in a [`WindowRegistry`].
 pub struct Evictor {
-    max_total_bytes: usize,
+    gate: Arc<EvictionGate>,
 }
 
 impl Evictor {
-    pub fn new(max_total_bytes: usize) -> Self {
-        Self { max_total_bytes }
+    pub fn new(gate: Arc<EvictionGate>) -> Self {
+        Self { gate }
     }
 
     /// Run one eviction cycle.
@@ -44,16 +92,23 @@ impl Evictor {
     /// `now_nanos - over` **and** which every live consumer has acked
     /// (consumption floor from the registry's `WindowProgress`).
     ///
-    /// **Phase 2 — memory eviction**: while the aggregate memory across all
-    /// windows exceeds `max_total_bytes`, evicts the oldest batch from the
-    /// window with the most memory. This phase is the explicit lossy
-    /// backstop and deliberately ignores the consumption floor.
-    pub fn run_once(&self, registry: &WindowRegistry, now_nanos: i64) -> EvictReport {
+    /// **Phase 2 — memory eviction (floor-respecting, lossless)**: while the
+    /// aggregate memory across all windows exceeds `max_total_bytes`, evicts
+    /// the oldest batch of the largest window **whose oldest batch is
+    /// already fully acked** (`oldest_seq < min_acked`). A batch a live
+    /// consumer has not yet read is never dropped. When no window has a
+    /// safe-to-drop oldest batch, the sweep stops and sets
+    /// `memory_pressure`: the actor applies backpressure (stops appending)
+    /// instead of losing unread pull data. This replaces the old lossy
+    /// "evict oldest regardless of floor" backstop that broke pull-mode
+    /// window delivery.
+    pub fn run_once(&self, registry: &WindowRegistry, _now_nanos: i64) -> EvictReport {
         let mut report = EvictReport {
             windows_scanned: 0,
             batches_time_evicted: 0,
             batches_memory_evicted: 0,
             per_window_evicted: Vec::new(),
+            memory_pressure: false,
         };
 
         // Phase 1: time eviction (gated by consumption progress)
@@ -67,7 +122,12 @@ impl Evictor {
                 .unwrap_or(u64::MAX);
             let win = registry.get_window(name).unwrap();
             let before = win.batch_count();
-            win.evict_expired(now_nanos, floor);
+            // Time eviction must cut on the window's **event-time watermark**,
+            // not wall clock. Nexmark event times are absolute (~2026-01-01),
+            // so a wall-clock cutoff would treat every batch as expired on
+            // every sweep, high-frequency-evicting all acked batches and
+            // starving the actor's append write lock (the q5 pull-freeze).
+            win.evict_expired(win.watermark_nanos(), floor);
             let evicted = before - win.batch_count();
             report.batches_time_evicted += evicted;
             if evicted > 0 {
@@ -78,37 +138,75 @@ impl Evictor {
             }
         }
 
-        // Phase 2: memory eviction
-        loop {
-            let mut total = 0usize;
-            let mut largest_name: Option<&str> = None;
-            let mut largest_mem = 0usize;
+        // Phase 2: memory eviction — floor-respecting and lossless.
+        //
+        // We only ever drop a window's oldest batch when every live consumer
+        // has already acked past it. If no window has a safe-to-drop oldest
+        // batch, we stop and flag `memory_pressure` so the actor applies
+        // backpressure (stops appending) instead of us losing unread pull
+        // data.
+        //
+        // `total` tracks the live aggregate after Phase-1 time eviction and is
+        // decremented on each reclaim, then published to `gate.current_bytes`
+        // so window actors can cheaply observe the global budget on their hot
+        // path (a single atomic load instead of walking every window per
+        // append).
+        let mut total = 0usize;
+        for name in &names {
+            total += registry.get_window(name).unwrap().memory_usage();
+        }
 
+        while total > self.gate.max_total_bytes {
+            // Pick the largest window whose oldest batch is fully acked
+            // (safe to drop). Preferring the largest gives the fastest
+            // memory relief without ever touching unacked data.
+            let mut target: Option<&str> = None;
+            let mut target_mem = 0usize;
             for name in &names {
                 let win = registry.get_window(name).unwrap();
-                let mem = win.memory_usage();
-                total += mem;
-                if mem > largest_mem {
-                    largest_mem = mem;
-                    largest_name = Some(name);
+                let floor = registry
+                    .progress(name)
+                    .map(|p| p.min_acked())
+                    .unwrap_or(u64::MAX);
+                if win.oldest_seq().map_or(false, |s| s < floor) {
+                    let mem = win.memory_usage();
+                    if mem > target_mem {
+                        target_mem = mem;
+                        target = Some(name);
+                    }
                 }
             }
 
-            if total <= self.max_total_bytes {
-                break;
-            }
-
-            match largest_name {
+            match target {
                 Some(name) => {
                     let win = registry.get_window(name).unwrap();
-                    if win.evict_oldest().is_none() {
-                        break;
+                    let floor = registry
+                        .progress(name)
+                        .map(|p| p.min_acked())
+                        .unwrap_or(u64::MAX);
+                    match win.evict_oldest_acked(floor) {
+                        Some(reclaimed) => {
+                            total = total.saturating_sub(reclaimed);
+                            report.batches_memory_evicted += 1;
+                        }
+                        None => break,
                     }
-                    report.batches_memory_evicted += 1;
                 }
-                None => break,
+                None => {
+                    // Over budget but nothing safe to drop: signal
+                    // backpressure rather than lose unread pull data.
+                    report.memory_pressure = true;
+                    break;
+                }
             }
         }
+
+        // Publish the post-eviction aggregate so actors see the reclaimed
+        // space immediately, then wake any actor parked on the memory
+        // backpressure gate; it re-checks and resumes appending once space
+        // is available.
+        self.gate.current_bytes.store(total, Ordering::Relaxed);
+        self.gate.freed.notify_waiters();
 
         report
     }
@@ -127,6 +225,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 
@@ -181,26 +280,30 @@ mod tests {
         }])
         .unwrap();
 
-        // Manually append two batches at 1s and 5s.
+        // Append 1s, 5s, then 25s to advance the event-time watermark to
+        // 25s - 5s(watermark delay) = 20s. Time eviction now cuts on the
+        // window's watermark (not an externally passed wall clock).
         {
             let win = reg.get_window("win_a").unwrap();
-            win.append(make_batch(&schema, &[1_000_000_000], &[100]))
+            win.append_with_watermark(make_batch(&schema, &[1_000_000_000], &[100]))
                 .unwrap();
-            win.append(make_batch(&schema, &[5_000_000_000], &[200]))
+            win.append_with_watermark(make_batch(&schema, &[5_000_000_000], &[200]))
                 .unwrap();
-            assert_eq!(win.batch_count(), 2);
+            win.append_with_watermark(make_batch(&schema, &[25_000_000_000], &[300]))
+                .unwrap();
+            assert_eq!(win.batch_count(), 3);
         }
 
-        // now=20s, cutoff = 20s - 10s = 10s → both batches (max 1s, 5s) < 10s → evicted
-        let evictor = Evictor::new(usize::MAX);
-        let report = evictor.run_once(&reg, 20_000_000_000);
+        // watermark=20s, cutoff = 20s - 10s = 10s → batches (max 1s, 5s) < 10s → evicted
+        let evictor = Evictor::new(Arc::new(EvictionGate::new(usize::MAX)));
+        let report = evictor.run_once(&reg, 0);
 
         assert_eq!(report.windows_scanned, 1);
         assert_eq!(report.batches_time_evicted, 2);
         assert_eq!(report.batches_memory_evicted, 0);
 
         let win = reg.get_window("win_a").unwrap();
-        assert!(win.is_empty());
+        assert_eq!(win.batch_count(), 1, "25s batch (>= cutoff 10s) survives");
     }
 
     // -- 2. evictor_global_memory_cap -----------------------------------------
@@ -254,7 +357,7 @@ mod tests {
         }
 
         // Cap at 2 batches. now=0 → no time eviction.
-        let evictor = Evictor::new(one_batch_size * 2);
+        let evictor = Evictor::new(Arc::new(EvictionGate::new(one_batch_size * 2)));
         let report = evictor.run_once(&reg, 0);
 
         assert_eq!(report.batches_time_evicted, 0);
@@ -305,7 +408,7 @@ mod tests {
         }])
         .unwrap();
 
-        let evictor = Evictor::new(usize::MAX);
+        let evictor = Evictor::new(Arc::new(EvictionGate::new(usize::MAX)));
 
         let mut memory_samples: Vec<usize> = Vec::new();
         let mut batch_counts: Vec<usize> = Vec::new();
@@ -427,7 +530,7 @@ mod tests {
         }])
         .unwrap();
 
-        let evictor = Evictor::new(usize::MAX);
+        let evictor = Evictor::new(Arc::new(EvictionGate::new(usize::MAX)));
         let step_nanos = 2_000_000_000i64;
         let over_nanos = 10_000_000_000i64;
         let expected_batches_per_window = (over_nanos / step_nanos) as usize;
@@ -531,7 +634,7 @@ mod tests {
 
         // Alert window needs memory eviction since it has no time col.
         // Global cap = 10 batches' worth (shared across all windows).
-        let evictor = Evictor::new(one_batch_size * 10);
+        let evictor = Evictor::new(Arc::new(EvictionGate::new(one_batch_size * 10)));
         let step_nanos = 1_000_000_000i64; // 1s per step
 
         let total_iterations = 3000;
@@ -638,7 +741,7 @@ mod tests {
         }])
         .unwrap();
 
-        let evictor = Evictor::new(usize::MAX);
+        let evictor = Evictor::new(Arc::new(EvictionGate::new(usize::MAX)));
 
         // Phase 1 — Burst: inject 100 batches, all at t = 1s
         let burst_count = 100;
@@ -711,11 +814,137 @@ mod tests {
     #[test]
     fn evictor_empty_registry() {
         let reg = WindowRegistry::build(vec![]).unwrap();
-        let evictor = Evictor::new(1024);
+        let evictor = Evictor::new(Arc::new(EvictionGate::new(1024)));
         let report = evictor.run_once(&reg, 0);
 
         assert_eq!(report.windows_scanned, 0);
         assert_eq!(report.batches_time_evicted, 0);
         assert_eq!(report.batches_memory_evicted, 0);
+    }
+
+    // -- 8. evictor_time_eviction_respects_consumption_floor ------------------
+
+    /// Phase 1 time eviction must honour the consumption floor: a batch is
+    /// only removable when **every** registered consumer has acked past it.
+    ///
+    /// This is the invariant that protects pull-mode rule tasks from losing
+    /// data a slow shard has not yet read. Reproduces the q3 pull regression
+    /// class at the unit level: when one shard lags (low ack), its unacked
+    /// tail must survive the sweep.
+    #[test]
+    fn evictor_time_eviction_respects_consumption_floor() {
+        let schema = test_schema();
+        let reg = WindowRegistry::build(vec![WindowDef {
+            params: WindowParams {
+                name: "data".into(),
+                schema: schema.clone(),
+                time_col_index: Some(0),
+                // All batches expire once now > 1s + 1s = 2s.
+                over: Duration::from_secs(1),
+                materialize_fields: None,
+                defer_materialization: false,
+            },
+            streams: vec![],
+            config: test_config(),
+        }])
+        .unwrap();
+
+        // Two pull-rule shards consuming this window, like a sharded match rule.
+        let progress = reg.progress("data").expect("progress table exists");
+        let fast = progress.register();
+        let slow = progress.register();
+
+        // 10 batches, all at t = 1s (event time); advance the watermark to
+        // 3s so cutoff = 3s - 1s(over) = 2s, making every 1s batch expired.
+        let n: u64 = 10;
+        for i in 0..n {
+            let win = reg.get_window("data").unwrap();
+            win.append(make_batch(&schema, &[1_000_000_000], &[i as i64]))
+                .unwrap();
+        }
+        reg.get_window("data")
+            .unwrap()
+            .set_watermark_for_test(3_000_000_000);
+
+        // Fast shard acked everything (last batch seq n-1 => store n).
+        fast.store(n, Ordering::Release);
+        // Slow shard only acked up to batch seq k (store k+1); still needs
+        // seq k+1 .. n-1.
+        let k: u64 = 3;
+        slow.store(k + 1, Ordering::Release);
+
+        // floor = min(fast=n, slow=k+1) = k+1. Time eviction may only drop
+        // batches with seq < floor (seq 0..k). Everything else must survive.
+        let evictor = Evictor::new(Arc::new(EvictionGate::new(usize::MAX))); // disable Phase 2
+        evictor.run_once(&reg, 3_000_000_000i64); // now=3s > 2s, all expired
+
+        let win = reg.get_window("data").unwrap();
+        // Evicted: seq 0..k (k+1 batches). Surviving: seq k+1..n-1 (n-(k+1)).
+        assert_eq!(
+            win.batch_count() as u64,
+            n - (k + 1),
+            "slow shard's unacked tail (seq {}..{}) must survive time eviction",
+            k + 1,
+            n - 1
+        );
+    }
+
+    // -- 9. evictor_memory_eviction_respects_consumption_floor ----------------
+
+    /// Phase 2 memory eviction must NOT drop a batch that a registered,
+    /// live consumer has not yet acknowledged — even under memory pressure.
+    ///
+    /// This is the q3 pull root cause: `Evictor` phase 2 calls
+    /// `Window::evict_oldest`, which deliberately ignores the consumption
+    /// floor. In push mode that is harmless (data was already broadcast to
+    /// rule channels before landing in the log); in pull mode the rule task
+    /// depends on the log remaining readable, so a floor-less memory sweep
+    /// silently drops unread batches -> lost alerts + cursor_gap.
+    ///
+    /// This test guards the corrected behaviour: with a live (unacked)
+    /// consumer, the memory backstop must leave its unacked batches in place.
+    #[test]
+    fn evictor_memory_eviction_respects_consumption_floor() {
+        let schema = test_schema();
+        let reg = WindowRegistry::build(vec![WindowDef {
+            params: WindowParams {
+                name: "data".into(),
+                schema: schema.clone(),
+                // over = 0 disables Phase 1 so we isolate Phase 2.
+                time_col_index: Some(0),
+                over: Duration::ZERO,
+                materialize_fields: None,
+                defer_materialization: false,
+            },
+            streams: vec![],
+            config: test_config(),
+        }])
+        .unwrap();
+
+        // A pull-rule shard registers its consumption slot but has not read
+        // anything yet (slot stays at 0).
+        let _consumer = reg
+            .progress("data")
+            .expect("progress table exists")
+            .register();
+
+        // 10 batches, all live (no time eviction possible).
+        let n: u64 = 10;
+        for i in 0..n {
+            let win = reg.get_window("data").unwrap();
+            win.append(make_batch(&schema, &[1_000_000_000], &[i as i64]))
+                .unwrap();
+        }
+
+        // Force Phase 2: global cap of 0 bytes => every batch is "over budget".
+        let evictor = Evictor::new(Arc::new(EvictionGate::new(0)));
+        evictor.run_once(&reg, 3_000_000_000i64);
+
+        let win = reg.get_window("data").unwrap();
+        assert_eq!(
+            win.batch_count() as u64,
+            n,
+            "memory eviction must not drop batches a registered consumer has not acked"
+        );
     }
 }

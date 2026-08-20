@@ -28,12 +28,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use super::EvictionGate;
 use super::buffer::{AppendOutcome, Window};
 use super::fanout::RuleFanout;
 use crate::match_engine::Event;
@@ -122,6 +124,7 @@ pub async fn acquire_window_budget(
 pub async fn run_window_actor(
     name: Arc<str>,
     win: Arc<Window>,
+    gate: Arc<EvictionGate>,
     fanout: Arc<RuleFanout>,
     notify: Arc<Notify>,
     mut rx: mpsc::Receiver<WindowMsg>,
@@ -142,7 +145,7 @@ pub async fn run_window_actor(
                 // producer hands at this point are torn down with them (same
                 // semantics as the old commit worker on a cancelled pool).
                 while let Ok(msg) = rx.try_recv() {
-                    commit_append(&name, &win, &fanout, &notify, &report, msg).await;
+                    commit_append(&name, &win, &gate, &fanout, &notify, &report, msg).await;
                 }
                 break;
             }
@@ -160,7 +163,7 @@ pub async fn run_window_actor(
                         };
                         let cursor = next_seq.entry(Arc::clone(&source)).or_insert(0);
                         if seq == *cursor {
-                            commit_append(&name, &win, &fanout, &notify, &report, m).await;
+                            commit_append(&name, &win, &gate, &fanout, &notify, &report, m).await;
                             *cursor += 1;
                             // Drain this source's now-consecutive pending tail.
                             // The gap never blocked the channel — these
@@ -168,7 +171,7 @@ pub async fn run_window_actor(
                             while let Some(msg) =
                                 pending.remove(&(Arc::clone(&source), *cursor))
                             {
-                                commit_append(&name, &win, &fanout, &notify, &report, msg)
+                                commit_append(&name, &win, &gate, &fanout, &notify, &report, msg)
                                     .await;
                                 *cursor += 1;
                             }
@@ -234,7 +237,7 @@ pub async fn run_window_actor(
                 }
             }
             while let Some(msg) = pending.remove(&(Arc::clone(&source), *cursor)) {
-                commit_append(&name, &win, &fanout, &notify, &report, msg).await;
+                commit_append(&name, &win, &gate, &fanout, &notify, &report, msg).await;
                 *cursor += 1;
             }
         }
@@ -252,11 +255,27 @@ pub async fn run_window_actor(
 async fn commit_append(
     name: &Arc<str>,
     win: &Arc<Window>,
+    gate: &Arc<EvictionGate>,
     fanout: &Arc<RuleFanout>,
     notify: &Arc<Notify>,
     report: &Option<WindowAppendReport>,
     msg: WindowMsg,
 ) {
+    // Memory backpressure (global cap): if the aggregate window memory across
+    // all windows is still over `max_total_bytes` — and the evictor therefore
+    // cannot reclaim space without dropping unacked pull data — stop this
+    // conveyor (park) until the evictor's next sweep frees room. The actor
+    // holds no locks while parked (only awaits the gate's `Notify`), so the
+    // periodic evictor task keeps running and will wake it. This is the
+    // "传送带得停" guarantee: under global memory pressure we back off instead
+    // of letting the evictor lose unread pull batches.
+    loop {
+        if gate.current_bytes.load(Ordering::Relaxed) <= gate.max_total_bytes {
+            break;
+        }
+        gate.freed.notified().await;
+    }
+
     let WindowMsg::Append {
         source: _,
         seq: _,
@@ -387,7 +406,17 @@ mod tests {
         let notify = Arc::new(Notify::new());
         let cancel2 = cancel.clone();
         tokio::spawn(async move {
-            run_window_actor(name, win, fanout, notify, rx, cancel2, None).await;
+            run_window_actor(
+                name,
+                win,
+                Arc::new(EvictionGate::new(usize::MAX)),
+                fanout,
+                notify,
+                rx,
+                cancel2,
+                None,
+            )
+            .await;
         });
         (tx, cancel)
     }
@@ -441,6 +470,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(appended_values(&win), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    // -- 2b. pending tail latency: a large out-of-order window -----------------
+
+    /// A large reverse-ordered burst reproduces the q5 pull-freeze tail: every
+    /// seq parks in `pending` until seq 0 closes the gap, so nothing appends
+    /// while the cursor is pinned (the tail-latency signature) and everything
+    /// drains in order once it does. Guards completeness under a 100-batch
+    /// reorder window (parse parallelism ~10 in production, but bursts can
+    /// exceed it).
+    #[tokio::test]
+    async fn large_out_of_order_window_drains_completely() {
+        let win = make_window("w");
+        let (tx, _cancel) = spawn_actor(Arc::clone(&win)).await;
+        const N: u64 = 100;
+
+        // Reverse order (N..=1) parks everything; nothing may append yet.
+        for seq in (1..=N).rev() {
+            tx.send(msg("s", seq, seq as i64 * 10_000_000_000, seq as i64))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            win.total_rows(),
+            0,
+            "cursor pinned by the missing seq 0 → tail latency (nothing appends)"
+        );
+
+        // Closing the gap flushes all N+1 batches in order.
+        tx.send(msg("s", 0, 0, 0)).await.unwrap();
+        for _ in 0..200 {
+            if win.total_rows() == (N + 1) as usize {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(appended_values(&win), (0..=N as i64).collect::<Vec<i64>>());
     }
 
     // -- 3. independent per-source cursors -------------------------------------
@@ -720,7 +787,17 @@ mod tests {
         let name: Arc<str> = Arc::from("w");
         let win2 = Arc::clone(&win);
         tokio::spawn(async move {
-            run_window_actor(name, win2, fanout, notify, rx, cancel, None).await;
+            run_window_actor(
+                name,
+                win2,
+                Arc::new(EvictionGate::new(usize::MAX)),
+                fanout,
+                notify,
+                rx,
+                cancel,
+                None,
+            )
+            .await;
         });
 
         let events: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(Event {

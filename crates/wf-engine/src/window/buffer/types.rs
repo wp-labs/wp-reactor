@@ -47,6 +47,15 @@ pub(in crate::window) struct TimedBatch {
     pub(super) byte_size: usize,
     /// Monotonically increasing sequence number assigned on append.
     pub(super) seq: u64,
+    /// Precomputed columnar shard partition of this batch's rows, produced in
+    /// the parallel parse stage and stored once so every sharded rule task
+    /// pulls *only* its own row subset on the single-writer critical path
+    /// (P2: zero re-partition). `Some` only for deferred-materialization
+    /// windows with a sharded (key-partitioned) subscription; the outer Vec
+    /// is indexed by shard, each inner Vec the absolute batch-row indices that
+    /// shard owns. `None` for unsharded windows / non-deferred batches — the
+    /// pull path processes the whole batch.
+    pub(super) shard_rows: Option<Arc<Vec<Vec<u32>>>>,
     /// Lazily parsed full events, shared by all consuming rules via `Arc`.
     ///
     /// Previously every rule parsed the batch independently (`batch_to_events`

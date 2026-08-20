@@ -281,6 +281,7 @@ struct EvictReport {
   batches_time_evicted: Int
   batches_memory_evicted: Int
   per_window_evicted: List<WindowEvictCount>
+  memory_pressure: Boolean
 }
 
 struct WindowEvictCount {

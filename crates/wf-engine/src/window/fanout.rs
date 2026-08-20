@@ -96,9 +96,21 @@ impl Clone for Subscription {
 /// taking the window log lock. Registration happens at rule-task spawn time;
 /// closed channels (from a drained/cancelled rule) are pruned lazily on the
 /// next broadcast.
+///
+/// A second table, `window_sharding`, carries the *key partition* of a window
+/// independent of the delivery channels. The pull-model (window-actor-pull-
+/// model.md, M1) does not register delivery channels (rule tasks pull from the
+/// window log instead), yet the parse stage still needs to precompute the
+/// per-shard row subsets so they can be stored once in the window log (P2
+/// zero re-partition). That partition is registered here and consulted by
+/// `precompute_shard_rows` even when no delivery `Subscription` exists.
 #[derive(Default)]
 pub struct RuleFanout {
     table: RwLock<HashMap<String, Vec<Subscription>>>,
+    /// window_name → (match keys, shard count) for the key-partitioned
+    /// subscription of that window, used by the pull model to precompute
+    /// shard row subsets without a delivery channel.
+    window_sharding: RwLock<HashMap<String, (Arc<[FieldRef]>, usize)>>,
 }
 
 impl RuleFanout {
@@ -164,6 +176,38 @@ impl RuleFanout {
                 shards,
                 next: Arc::new(AtomicUsize::new(0)),
             });
+    }
+
+    /// Register the key-partition of `window_name` for the **pull model**
+    /// (window-actor-pull-model.md, M1).
+    ///
+    /// Unlike the `register_*` delivery methods this does **not** create a
+    /// delivery channel — rule tasks pull from the window log instead. It only
+    /// records `(keys, shard_count)` so the parallel parse stage can
+    /// precompute the per-shard row subsets (`precompute_shard_rows`) and the
+    /// window can store them once for every sharded rule task to read.
+    pub fn register_window_sharding(
+        &self,
+        window_name: &str,
+        keys: Arc<[FieldRef]>,
+        shard_count: usize,
+    ) {
+        debug_assert!(shard_count > 0);
+        let mut reg = self
+            .window_sharding
+            .write()
+            .expect("fanout sharding lock poisoned");
+        reg.insert(window_name.to_string(), (keys, shard_count));
+    }
+
+    /// Whether `window_name` has a key-partitioned (sharded) subscription
+    /// registered for the pull model — i.e. the parse stage should precompute
+    /// `shard_rows` even though no delivery channel exists.
+    pub fn window_is_sharded(&self, window_name: &str) -> bool {
+        self.window_sharding
+            .read()
+            .expect("fanout sharding lock poisoned")
+            .contains_key(window_name)
     }
 
     /// Broadcast `events` (window batch with sequence `seq`) to every rule
@@ -245,19 +289,39 @@ impl RuleFanout {
     /// subscription (nothing to partition). Byte-identical to the partition
     /// [`broadcast_inner`] computes (`partition_rows_by_key`), so moving it
     /// here does not change which rows land on which shard.
+    ///
+    /// The partition source is resolved as: (1) a fanout `Sharded` delivery
+    /// subscription (push model), else (2) the `window_sharding` registry
+    /// (pull model — no delivery channel registered). The pull-model case is
+    /// what lets `route_parse` precompute `shard_rows` for storage in the
+    /// window log without any rule delivery channel.
     pub(crate) fn precompute_shard_rows(
         &self,
         window_name: &str,
         batch: &RecordBatch,
     ) -> Option<Arc<[Vec<u32>]>> {
-        let subs = self.table.read().expect("fanout lock poisoned");
-        let sub = subs.get(window_name)?.iter().find_map(|s| match s {
-            Subscription::Sharded { shards, keys } => Some((shards, keys)),
-            _ => None,
-        })?;
-        let (shards, keys) = sub;
-        let shard_count = shards.len();
-        let per = partition_rows_by_key(batch, keys, shard_count).unwrap_or_else(|| {
+        let (keys, shard_count) = {
+            let subs = self.table.read().expect("fanout lock poisoned");
+            let fanout = subs.get(window_name).and_then(|list| {
+                list.iter().find_map(|s| match s {
+                    Subscription::Sharded { shards, keys } => {
+                        Some((Arc::clone(keys), shards.len()))
+                    }
+                    _ => None,
+                })
+            });
+            if let Some((keys, n)) = fanout {
+                (keys, n)
+            } else {
+                let reg = self
+                    .window_sharding
+                    .read()
+                    .expect("fanout sharding lock poisoned");
+                let entry = reg.get(window_name)?;
+                (Arc::clone(&entry.0), entry.1)
+            }
+        };
+        let per = partition_rows_by_key(batch, &keys, shard_count).unwrap_or_else(|| {
             // Key column absent from schema → every row missing → all shard 0
             // (matches row-based).
             let mut v = Vec::with_capacity(shard_count);
@@ -1190,5 +1254,50 @@ mod tests {
             .broadcast_batch_only("win_a", &batch, None, Some(stale.as_ref()), 0)
             .await;
         drain(&mut rx0c, &mut rx1c);
+    }
+
+    /// `precompute_shard_rows` is the parse-stage hot path for sharded pull
+    /// windows (q5's `bid_events`, ~100k rows/batch partitioned by `auction`).
+    /// If it is slow, uneven parse workers delay a batch's `seq`, the actor's
+    /// out-of-order `pending` map accumulates, and the append tail never catches
+    /// up — the q5 pull-freeze signature. This measures the partition cost as a
+    /// diagnostic baseline.
+    #[test]
+    fn precompute_shard_rows_throughput_is_bounded() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::time::{Duration, Instant};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "auction",
+            DataType::Int64,
+            false,
+        )]));
+        let values: Vec<i64> = (0..100_000).map(|i| i % 1024).collect();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap();
+
+        let fanout = RuleFanout::new();
+        fanout.register_window_sharding(
+            "win",
+            Arc::from(vec![FieldRef::Simple("auction".into())].into_boxed_slice()),
+            10,
+        );
+
+        // Warm up (allocations, first-hash).
+        let _ = fanout.precompute_shard_rows("win", &batch);
+
+        let n = 100u32;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            let rows = fanout
+                .precompute_shard_rows("win", &batch)
+                .expect("sharded window must partition");
+            assert_eq!(rows.len(), 10);
+        }
+        let per = t0.elapsed() / n;
+        assert!(
+            per < Duration::from_millis(200),
+            "precompute_shard_rows 100k rows took {per:?}; it is a parse bottleneck"
+        );
     }
 }

@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use wf_config::{FusionConfig, FusionReloadPlan, RawFusionConfigTree};
-use wf_engine::window::Router;
+use wf_engine::window::{EvictionGate, Router};
 
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::metrics::{RuntimeMetrics, maybe_build_metrics};
@@ -344,8 +344,22 @@ impl Reactor {
             spawn_alert_task(data.dispatcher.clone(), metrics.clone(), cancel.clone());
         head_watchers.push(watch_group(alert_group, cancel.clone()));
 
+        // One shared memory-backpressure gate for the evictor and every
+        // window actor. The evictor sweeps on its interval and publishes the
+        // aggregate window memory into the gate; actors read it on their hot
+        // append path and park (stop the conveyor) when over budget instead
+        // of letting the evictor drop unacked pull batches.
+        let eviction_gate = Arc::new(EvictionGate::new(
+            config.window_defaults.max_total_bytes.as_bytes(),
+        ));
         head_watchers.push(watch_group(
-            spawn_evictor_task(&config, &data.router, cancel.child_token(), metrics.clone()),
+            spawn_evictor_task(
+                &config,
+                &data.router,
+                Arc::clone(&eviction_gate),
+                cancel.child_token(),
+                metrics.clone(),
+            ),
             cancel.clone(),
         ));
 
@@ -354,7 +368,13 @@ impl Reactor {
         // active from the first decoded batch. Joined between the receiver
         // and the rules (see `actor_watch`).
         let actor_watch = watch_group(
-            spawn_window_actors(&config, &data.router, cancel.clone(), metrics.clone()),
+            spawn_window_actors(
+                &config,
+                &data.router,
+                Arc::clone(&eviction_gate),
+                cancel.clone(),
+                metrics.clone(),
+            ),
             cancel.clone(),
         );
 

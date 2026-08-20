@@ -20,6 +20,17 @@ impl RuntimeMetrics {
                 if let Some(v) = self.window_batches.get(&window_name) {
                     v.store(win.batch_count() as u64, Ordering::Relaxed);
                 }
+                if let Some(v) = self.window_acked_lag.get(&window_name) {
+                    // Number of batches appended but not yet acked by the slowest
+                    // live consumer. Unconsumed windows report `min_acked =
+                    // u64::MAX`, so `saturating_sub` yields 0 (trivially drained).
+                    let min_acked = router
+                        .registry()
+                        .progress(&window_name)
+                        .map(|p| p.min_acked())
+                        .unwrap_or(u64::MAX);
+                    v.store(win.next_seq().saturating_sub(min_acked), Ordering::Relaxed);
+                }
             }
         }
     }

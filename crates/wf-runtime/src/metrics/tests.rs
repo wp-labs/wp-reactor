@@ -161,6 +161,7 @@ fn add_evict_report_tracks_per_window_eviction() {
             window_name: "win_a".into(),
             time_evicted: 2,
         }],
+        memory_pressure: false,
     };
     metrics.add_evict_report(&report);
     assert_eq!(metrics.snapshot().window_evict.get("win_a"), Some(&2));

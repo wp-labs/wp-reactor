@@ -10,8 +10,13 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
+use wf_lang::ast::FieldRef;
+
+use crate::window::RuleFanout;
+use crate::window::WindowProgress;
 
 fn test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -199,6 +204,92 @@ fn memory_eviction_on_append() {
         .unwrap();
     assert_eq!(win.batch_count(), 2);
     assert!(win.memory_usage() <= max_bytes);
+}
+
+/// Per-window memory eviction must respect the consumption floor: a batch a
+/// live consumer has not yet acked is never dropped on append, even when the
+/// window exceeds `max_window_bytes`. This is the per-window analogue of the
+/// evictor's floor-respecting sweep — the q3 root cause (append dropped the
+/// oldest batch regardless of the pull rule's read cursor).
+#[test]
+fn memory_eviction_respects_ack_floor() {
+    let schema = test_schema();
+    let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+    let one_batch_size = content_bytes(&probe);
+    let max_bytes = one_batch_size * 2;
+    let win = Window::new(
+        WindowParams {
+            name: "mem_ack".into(),
+            schema,
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        test_config(max_bytes),
+    );
+
+    // A live consumer that has not acked anything yet (floor = 0).
+    let progress = Arc::new(WindowProgress::new());
+    win.set_progress(Arc::clone(&progress));
+    let slot = progress.register();
+
+    // Fill to exactly the 2-batch budget.
+    win.append(probe.clone()).unwrap(); // seq 0
+    win.append(make_batch(win.schema(), &[2_000_000_000], &[200]))
+        .unwrap(); // seq 1
+    assert_eq!(win.batch_count(), 2);
+
+    // Third append exceeds the budget, but the oldest batch (seq 0) is unacked
+    // (floor = 0), so nothing may be evicted → the window transiently exceeds
+    // `max_window_bytes` rather than dropping unread data.
+    win.append(make_batch(win.schema(), &[3_000_000_000], &[300]))
+        .unwrap(); // seq 2
+    assert_eq!(
+        win.batch_count(),
+        3,
+        "unacked batches must survive per-window eviction"
+    );
+
+    // Consumer acks past the first two batches (floor = 2); a further append
+    // may now reclaim seq 0 and seq 1, but must keep seq 2 (still unacked).
+    slot.store(2, Ordering::Release);
+    win.append(make_batch(win.schema(), &[4_000_000_000], &[400]))
+        .unwrap(); // seq 3
+    assert_eq!(
+        win.batch_count(),
+        2,
+        "only acked batches (seq 0,1) should be reclaimed; seq 2,3 survive"
+    );
+}
+
+/// Time eviction must bump the content generation so a cached `window.has()`
+/// distinct-value set invalidates (otherwise it goes stale after a sweep).
+#[test]
+fn eviction_bumps_generation() {
+    let win = test_window(10, usize::MAX);
+    let schema = win.schema().clone();
+
+    let g0 = win.generation();
+    win.append(make_batch(&schema, &[1_000_000_000], &[100]))
+        .unwrap();
+    let g1 = win.generation();
+    assert!(g1 > g0, "append bumps generation");
+
+    // cutoff = 12s - 10s = 2s; batch max=1s < 2s → evicted (acked floor = MAX).
+    win.evict_expired(12_000_000_000, u64::MAX);
+    let g2 = win.generation();
+    assert!(g2 > g1, "time eviction must bump generation");
+
+    // evict_oldest_acked must too.
+    win.append(make_batch(&schema, &[20_000_000_000], &[200]))
+        .unwrap();
+    let g3 = win.generation();
+    assert!(win.evict_oldest_acked(u64::MAX).is_some());
+    assert!(
+        win.generation() > g3,
+        "acked memory eviction must bump generation"
+    );
 }
 
 // -- 6. no_time_col_window ----------------------------------------------
@@ -767,6 +858,7 @@ fn window_evicts_on_parsed_event_footprint_not_content() {
                 batch.clone(),
                 Arc::new(parsed.clone()),
                 content + events,
+                None,
             )
             .unwrap();
     }
@@ -811,7 +903,8 @@ fn sized_append_keeps_events_lazily_parseable() {
             table: None,
         },
     );
-    win.append_with_watermark_sized(batch, content).unwrap();
+    win.append_with_watermark_sized(batch, content, None)
+        .unwrap();
 
     // events_since lazily parses the batch → real events, not empty.
     let (events_list, cursor, gap) = win.events_since(0);
@@ -823,6 +916,176 @@ fn sized_append_keeps_events_lazily_parseable() {
         "both rows must be lazily parsed into events"
     );
     assert_eq!(cursor, 1, "cursor advances past the batch");
+}
+
+/// Regression: the columnar/deferred append path (`append_with_watermark_sized`,
+/// `events = None`) must persist the parse-side precomputed `shard_rows` into
+/// the window log. The pull-model rule tasks read their per-shard row subset
+/// from `read_since_with_shard(shard_index)` — if the `(None, _)` arm of
+/// `append_with_watermark_inner` dropped `shard_rows` (the Q2 30M pull
+/// over-production bug, ~9×), every pull shard would process the WHOLE batch.
+#[test]
+fn sized_append_persists_shard_rows_for_pull() {
+    let schema = test_schema();
+    // 3 rows; shard 0 owns rows {0, 2}, shard 1 owns row {1}.
+    let batch = make_batch(
+        &schema,
+        &[1_000_000_000, 2_000_000_000, 3_000_000_000],
+        &[42, 99, 7],
+    );
+    let content = content_bytes(&batch);
+
+    let win = Window::new(
+        WindowParams {
+            name: "sharded".into(),
+            schema: schema.clone(),
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        WindowConfig {
+            name: "sharded".into(),
+            mode: DistMode::Local,
+            max_window_bytes: usize::MAX.into(),
+            over_cap: Duration::from_secs(3600).into(),
+            evict_policy: EvictPolicy::TimeFirst,
+            watermark: Duration::from_secs(0).into(),
+            allowed_lateness: Duration::from_secs(3600).into(),
+            late_policy: LatePolicy::Drop,
+            table: None,
+        },
+    );
+    let shard_rows: Option<Arc<Vec<Vec<u32>>>> = Some(Arc::from(vec![vec![0u32, 2], vec![1u32]]));
+    win.append_with_watermark_sized(batch, content, shard_rows)
+        .unwrap();
+
+    // Shard 0 must pull only its own rows {0, 2}.
+    let (_batches, per_shard, _cursor, _gap) = win.read_since_with_shard(0, Some(0));
+    assert_eq!(per_shard.len(), 1, "one batch");
+    assert_eq!(
+        per_shard[0].as_ref().map(|v| v.as_slice()),
+        Some(&[0u32, 2][..]),
+        "shard 0 owns rows {{0, 2}}"
+    );
+
+    // Shard 1 must pull only row {1}.
+    let (_batches, per_shard, _cursor, _gap) = win.read_since_with_shard(0, Some(1));
+    assert_eq!(
+        per_shard[0].as_ref().map(|v| v.as_slice()),
+        Some(&[1u32][..]),
+        "shard 1 owns row {{1}}"
+    );
+
+    // Unpartitioned pull (shard_index = None) sees the whole batch.
+    let (_batches, per_shard, _cursor, _gap) = win.read_since_with_shard(0, None);
+    assert!(
+        per_shard[0].is_none(),
+        "unsharded pull gets no row subset (processes whole batch)"
+    );
+}
+
+/// M1 pull-model invariant (P2 zero re-partition) across **multiple batches
+/// and multiple shards**: `read_since_with_shard(shard_index)` returns exactly
+/// the per-shard row subset stored in the window log, and the cross-shard
+/// (batch × row) union must cover every row **exactly once** — no loss, no
+/// duplication. The partition is computed once at write time (here via the
+/// production `precompute_shard_rows`) and each shard pulls only its own slice.
+#[test]
+fn pull_sharded_multi_batch_zero_repartition_union() {
+    let schema = test_schema(); // ts(col0), value(col1)
+    let fanout = RuleFanout::new();
+    fanout.register_window_sharding(
+        "auth_events",
+        Arc::from(vec![FieldRef::Simple("value".into())].into_boxed_slice()),
+        2,
+    );
+
+    let win = test_window(3600, usize::MAX);
+
+    const NBATCH: u32 = 3;
+    const NROW: u32 = 5;
+    for b in 0..NBATCH {
+        let times: Vec<i64> = (0..NROW)
+            .map(|i| 1_700_000_000_000_000_000i64 + (b * NROW + i) as i64)
+            .collect();
+        let values: Vec<i64> = (0..NROW).map(|i| (b * NROW + i) as i64).collect();
+        let batch = make_batch(&schema, &times, &values);
+        // Parse-stage precompute: partition this batch once by the match key.
+        let shard_rows = fanout
+            .precompute_shard_rows("auth_events", &batch)
+            .expect("sharded window has a partition");
+        let size = content_bytes(&batch);
+        win.append_with_watermark_sized(batch, size, Some(Arc::new(shard_rows.to_vec())))
+            .unwrap();
+    }
+
+    // Every shard reads ALL batches but only its own row subset. The union
+    // across shards must equal the full (batch, row) grid exactly once.
+    let mut seen: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
+    let mut duplicate = false;
+    for shard in 0..2usize {
+        let (batches, per_shard, cursor, gap) = win.read_since_with_shard(0, Some(shard));
+        assert!(!gap, "no eviction before first read");
+        assert_eq!(
+            batches.len(),
+            NBATCH as usize,
+            "every shard sees all batches"
+        );
+        assert_eq!(cursor, NBATCH as u64, "cursor advances to newest+1");
+        for (k, subset) in per_shard.iter().enumerate() {
+            let rows = subset.as_ref().expect("shard subset present for batch {k}");
+            for &r in rows.iter() {
+                if !seen.insert((k, r)) {
+                    duplicate = true;
+                }
+            }
+        }
+    }
+    assert!(!duplicate, "each row must belong to exactly one shard");
+    let mut all: Vec<(usize, u32)> = seen.into_iter().collect();
+    all.sort();
+    let expected: Vec<(usize, u32)> = (0..NBATCH as usize)
+        .flat_map(|k| (0..NROW as usize).map(move |r| (k, r as u32)))
+        .collect();
+    assert_eq!(
+        all, expected,
+        "union of all shards covers every row exactly once (zero re-partition)"
+    );
+}
+
+/// M1 regression anchor for consumption-floor safety: if a batch is evicted
+/// before the pull cursor reads it, `read_since_with_shard` must report
+/// `gap = true` (cursor < oldest_seq) and resume from the oldest surviving
+/// batch, while still advancing the cursor to `newest + 1`. A cursor that has
+/// caught up (== floor) reads cleanly with no gap.
+#[test]
+fn pull_gap_detected_when_batch_evicted_before_read() {
+    let schema = test_schema();
+    let win = test_window(3600, usize::MAX);
+    for b in 0..3u32 {
+        let times = vec![1_700_000_000_000_000_000i64 + b as i64; 2];
+        let values = vec![10i64 + b as i64, 20 + b as i64];
+        let batch = make_batch(&schema, &times, &values);
+        let size = content_bytes(&batch);
+        win.append_with_watermark_sized(batch, size, None).unwrap();
+    }
+    assert_eq!(win.batch_count(), 3, "three batches appended");
+
+    // Drop the oldest batch (memory eviction ignores the consumption floor).
+    assert!(win.evict_oldest().is_some());
+
+    // Cursor still at 0 → 0 < oldest_seq(=1) → gap.
+    let (batches, _per, cursor, gap) = win.read_since_with_shard(0, None);
+    assert!(gap, "cursor 0 must detect gap after front eviction");
+    assert_eq!(batches.len(), 2, "only the surviving batches are returned");
+    assert_eq!(cursor, 3, "cursor still advances to newest+1");
+
+    // A cursor that caught up to the floor reads cleanly, no gap.
+    let (batches2, _per2, cursor2, gap2) = win.read_since_with_shard(1, None);
+    assert!(!gap2, "cursor at floor reads without gap");
+    assert_eq!(batches2.len(), 2);
+    assert_eq!(cursor2, 3);
 }
 
 // -- join index ------------------------------------------------------------
@@ -1051,12 +1314,14 @@ fn time_evicted_batch_releases_parsed_events() {
         make_batch(&schema, &[1_000_000_000], &[100]),
         Arc::clone(&first),
         4096,
+        None,
     )
     .unwrap();
     win.append_parsed_sized(
         make_batch(&schema, &[12_000_000_000], &[300]),
         parsed_events(3),
         4096,
+        None,
     )
     .unwrap();
     assert_eq!(win.batch_count(), 2);
@@ -1079,6 +1344,7 @@ fn memory_evicted_batch_releases_parsed_events() {
         make_batch(&schema, &[1_000_000_000], &[100]),
         Arc::clone(&first),
         4096,
+        None,
     )
     .unwrap();
     // Second 4KiB batch pushes current_bytes (8192) over max (6144) → first
@@ -1087,6 +1353,7 @@ fn memory_evicted_batch_releases_parsed_events() {
         make_batch(&schema, &[2_000_000_000], &[200]),
         parsed_events(2),
         4096,
+        None,
     )
     .unwrap();
     assert_eq!(win.batch_count(), 1);
@@ -1105,12 +1372,14 @@ fn evict_oldest_releases_parsed_events() {
         make_batch(&schema, &[1_000_000], &[42]),
         Arc::clone(&first),
         4096,
+        None,
     )
     .unwrap();
     win.append_parsed_sized(
         make_batch(&schema, &[2_000_000], &[43]),
         parsed_events(2),
         4096,
+        None,
     )
     .unwrap();
 
@@ -1118,4 +1387,113 @@ fn evict_oldest_releases_parsed_events() {
     assert_eq!(win.batch_count(), 1);
 
     assert_events_released(&first);
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency diagnostics (q5 pull-mode freeze): these tests reproduce the
+// lock-shape of the freeze — 30 pull rule tasks share the window log read lock
+// while the single-writer actor takes the write lock on append — and assert the
+// writer is not starved.
+// ---------------------------------------------------------------------------
+
+/// A platform `RwLock` must not starve a writer under a sustained read burst:
+/// q5 runs 30 pull rule tasks that read the shared window log concurrently
+/// against one actor writer. If the writer starves, append stalls, the 64 MiB
+/// window byte budget exhausts, and the whole pipeline freezes. This test
+/// measures the writer's worst-case wait under a 30-reader burst.
+#[test]
+fn rwlock_writer_not_starved_by_readers() {
+    use std::sync::RwLock;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let lock = Arc::new(RwLock::new(0u64));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // 30 readers: brief read + a short "rule processing" pause, mirroring the
+    // pull-loop's read_since_with_shard followed by batch processing.
+    let mut readers = Vec::new();
+    for _ in 0..30 {
+        let lock = Arc::clone(&lock);
+        let stop = Arc::clone(&stop);
+        readers.push(thread::spawn(move || {
+            while !stop.load(AtomicOrdering::Relaxed) {
+                let _g = lock.read().unwrap();
+                thread::sleep(Duration::from_micros(50));
+            }
+        }));
+    }
+
+    let mut max_wait = Duration::ZERO;
+    let mut total = Duration::ZERO;
+    let n = 200u64;
+    for _ in 0..n {
+        let t0 = Instant::now();
+        let mut w = lock.write().unwrap();
+        let wait = t0.elapsed();
+        max_wait = max_wait.max(wait);
+        total += wait;
+        *w += 1;
+        drop(w);
+    }
+
+    stop.store(true, AtomicOrdering::Relaxed);
+    for r in readers {
+        r.join().unwrap();
+    }
+
+    let avg = total / n as u32;
+    // If the platform starves the writer, max_wait grows unboundedly under a
+    // continuous read burst. 500ms is generous for a non-starving lock.
+    assert!(
+        max_wait < Duration::from_millis(500),
+        "writer starved: max write-lock wait {max_wait:?} (avg {avg:?})"
+    );
+}
+
+/// `read_since_with_shard` must return the correct per-shard row subset. This
+/// also pins the current behaviour: the returned `Arc<Vec<u32>>` is a **deep
+/// copy** of the stored subset (the stored type is `Arc<Vec<Vec<u32>>>`, so a
+/// zero-copy `Arc::clone` of the inner list is not yet possible). The deep copy
+/// runs inside the log read lock; under 30 pull tasks it lengthens every read
+/// critical section and amplifies the q5 pull-freeze.
+#[test]
+fn read_since_with_shard_returns_correct_subset() {
+    let schema = test_schema();
+    let per_shard: Arc<Vec<Vec<u32>>> = Arc::new(vec![vec![0, 2], vec![1, 3]]);
+    let win = Window::new(
+        WindowParams {
+            name: "sharded".into(),
+            schema,
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        test_config(usize::MAX),
+    );
+    win.append_sized(
+        make_batch(win.schema(), &[1_000_000_000, 2_000_000_000], &[10, 20]),
+        4096,
+        Some(Arc::clone(&per_shard)),
+    )
+    .unwrap();
+
+    let (_, rows, _, _) = win.read_since_with_shard(0, Some(0));
+    let returned = rows.into_iter().flatten().collect::<Vec<_>>();
+    assert_eq!(returned.len(), 1, "one batch → one shard subset");
+    assert_eq!(
+        returned[0].as_ref().as_slice(),
+        &[0u32, 2],
+        "shard 0 must see its own row indices"
+    );
+
+    // Unsharded pull returns `None` for every batch (whole-batch processing).
+    let (_, rows, _, _) = win.read_since_with_shard(0, None);
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].is_none(),
+        "unsharded pull must not request a shard subset"
+    );
 }

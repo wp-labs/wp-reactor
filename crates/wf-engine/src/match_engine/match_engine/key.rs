@@ -233,13 +233,17 @@ impl InstanceKey {
     }
 }
 
-/// Flatten a possibly-`Pair`ed [`ScopeKey`] into its leaf [`Value`]s (all `Str`),
-/// matching the old `\x1f`-split string reconstruction.
+/// Flatten a possibly-`Pair`ed [`ScopeKey`] into its leaf [`Value`]s, preserving
+/// the **original Value types** (`Int`/`Float` → `Number`, `Str` → `Str`) so the
+/// close path's `scope_key` is byte-identical to the event path's (`extract_key`
+/// returns the raw field Values). Previously Int keys flattened to `Str`, which
+/// broke digit-typed yield/entity fields on `on close` rules (`id = b.auction`
+/// got a string and failed digit coercion).
 fn flatten_scope_values(key: &ScopeKey) -> Vec<Value> {
     match key {
         ScopeKey::Empty => vec![],
-        ScopeKey::Int(v) => vec![Value::Str(v.to_string().into())],
-        ScopeKey::Float(bits) => vec![Value::Str(f64::from_bits(*bits).to_string().into())],
+        ScopeKey::Int(v) => vec![Value::Number(*v as f64)],
+        ScopeKey::Float(bits) => vec![Value::Number(f64::from_bits(*bits))],
         ScopeKey::Str(s) => vec![Value::Str(s.clone())],
         ScopeKey::Pair(a, b) => {
             let mut out = flatten_scope_values(a);
@@ -685,6 +689,42 @@ mod tests {
                 ]
             )),
             Some("related")
+        );
+    }
+
+    #[test]
+    fn scope_key_values_preserve_original_value_types() {
+        // Regression: `flatten_scope_values` used to flatten `ScopeKey::Int` to
+        // `Value::Str`, so the close path's scope_key diverged from the event
+        // path (`extract_key` returns the raw field Value). Digit-typed
+        // yield/entity fields referencing the key (e.g. `id = b.auction`) then
+        // received a string on `on close` rules and failed digit coercion —
+        // every close alert was dropped with `data format error`.
+        assert_eq!(
+            flatten_scope_values(&ScopeKey::Int(421_762)),
+            vec![Value::Number(421_762.0)]
+        );
+        assert_eq!(
+            flatten_scope_values(&ScopeKey::Float(f64::to_bits(7.5))),
+            vec![Value::Number(7.5)]
+        );
+        assert_eq!(
+            flatten_scope_values(&ScopeKey::Str("abc".into())),
+            vec![Value::Str("abc".into())]
+        );
+        // Pair flattens both leaves in order.
+        assert_eq!(
+            flatten_scope_values(&ScopeKey::Pair(
+                Box::new(ScopeKey::Int(42)),
+                Box::new(ScopeKey::Str("k".into())),
+            )),
+            vec![Value::Number(42.0), Value::Str("k".into())]
+        );
+        // `InstanceKey::fixed` (the close/conv window path) round-trips the
+        // Int key as `Number`, byte-identical to the event path.
+        assert_eq!(
+            InstanceKey::fixed(&ScopeKey::Int(99), 1_000).scope_key_values(),
+            vec![Value::Number(99.0)]
         );
     }
 }

@@ -23,7 +23,7 @@ impl Window {
     /// Windows without a time column never advance the watermark and never
     /// reject data as late.
     pub fn append_with_watermark(&self, batch: RecordBatch) -> CoreResult<AppendOutcome> {
-        self.append_with_watermark_inner(batch, None, None)
+        self.append_with_watermark_inner(batch, None, None, None)
             .map(|(outcome, _)| outcome)
     }
 
@@ -35,7 +35,7 @@ impl Window {
         batch: RecordBatch,
         parsed_events: Arc<Vec<Arc<Event>>>,
     ) -> CoreResult<AppendOutcome> {
-        self.append_with_watermark_inner(batch, Some(parsed_events), None)
+        self.append_with_watermark_inner(batch, Some(parsed_events), None, None)
             .map(|(outcome, _)| outcome)
     }
 
@@ -49,8 +49,9 @@ impl Window {
         batch: RecordBatch,
         parsed_events: Arc<Vec<Arc<Event>>>,
         byte_size: usize,
+        shard_rows: Option<Arc<Vec<Vec<u32>>>>,
     ) -> CoreResult<(AppendOutcome, u64)> {
-        self.append_with_watermark_inner(batch, Some(parsed_events), Some(byte_size))
+        self.append_with_watermark_inner(batch, Some(parsed_events), Some(byte_size), shard_rows)
     }
 
     /// Like [`Self::append_with_watermark_parsed_sized`], but without pre-parsed
@@ -61,8 +62,9 @@ impl Window {
         &self,
         batch: RecordBatch,
         byte_size: usize,
+        shard_rows: Option<Arc<Vec<Vec<u32>>>>,
     ) -> CoreResult<(AppendOutcome, u64)> {
-        self.append_with_watermark_inner(batch, None, Some(byte_size))
+        self.append_with_watermark_inner(batch, None, Some(byte_size), shard_rows)
     }
 
     fn append_with_watermark_inner(
@@ -70,6 +72,7 @@ impl Window {
         batch: RecordBatch,
         parsed_events: Option<Arc<Vec<Arc<Event>>>>,
         byte_size: Option<usize>,
+        shard_rows: Option<Arc<Vec<Vec<u32>>>>,
     ) -> CoreResult<(AppendOutcome, u64)> {
         if batch.num_rows() == 0 {
             return Ok((AppendOutcome::Appended, 0));
@@ -129,12 +132,18 @@ impl Window {
         }
 
         let seq = match (parsed_events, byte_size) {
-            (Some(events), Some(size)) => self.append_parsed_sized(batch, events, size)?,
+            (Some(events), Some(size)) => {
+                self.append_parsed_sized(batch, events, size, shard_rows)?
+            }
             (Some(events), None) => {
                 self.append_parsed(batch, events)?;
                 0
             }
-            (None, _) => {
+            // Columnar/deferred commit (pull-model sharded match rules):
+            // events are `None` but `shard_rows` carries the precomputed
+            // partition — must be persisted into the window log, not dropped.
+            (None, Some(size)) => self.append_sized(batch, size, shard_rows)?,
+            (None, None) => {
                 self.append(batch)?;
                 0
             }
@@ -145,5 +154,13 @@ impl Window {
     /// Current watermark in nanoseconds.
     pub fn watermark_nanos(&self) -> i64 {
         self.watermark_nanos.load(Ordering::Acquire)
+    }
+
+    /// Test-only setter for the event-time watermark, so time-eviction tests
+    /// can pin a cutoff without appending a watermark-advancing batch.
+    #[cfg(test)]
+    pub(crate) fn set_watermark_for_test(&self, watermark_nanos: i64) {
+        self.watermark_nanos
+            .store(watermark_nanos, Ordering::Release);
     }
 }

@@ -427,6 +427,8 @@ fn make_task_inner(
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
 
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
@@ -602,6 +604,8 @@ fn make_pipeline_stage_task_opts(
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -693,6 +697,8 @@ fn make_each_task() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -799,6 +805,8 @@ fn make_filtered_match_task() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -918,6 +926,8 @@ fn make_filtered_close_task() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -1006,6 +1016,8 @@ fn make_filtered_each_task() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
@@ -1126,6 +1138,8 @@ fn make_intermediate_each_task() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1228,6 +1242,8 @@ fn make_intermediate_each_task_with_explicit_time() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -1338,6 +1354,8 @@ fn make_intermediate_score_tasks() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (upstream_task, _cancel, _interval) = rule_task::RuleTask::new(upstream_config);
 
@@ -1478,6 +1496,8 @@ fn make_intermediate_score_tasks() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (downstream_task, _cancel, _interval) = rule_task::RuleTask::new(downstream_config);
 
@@ -1589,6 +1609,8 @@ fn make_intermediate_score_band_tasks() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (upstream_task, _cancel, _interval) = rule_task::RuleTask::new(upstream_config);
 
@@ -1782,6 +1804,8 @@ fn make_intermediate_score_band_tasks() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (downstream_task, _cancel, _interval) = rule_task::RuleTask::new(downstream_config);
 
@@ -1956,6 +1980,8 @@ fn make_filtered_bind_alias_match_task() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, window, notify)
@@ -2069,6 +2095,8 @@ fn make_window_has_match_task() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, router)
@@ -2718,6 +2746,222 @@ async fn pull_detects_gap() {
     );
 }
 
+/// Build a keyed (`sip`) match rule (count>=1 fires once per key) with the
+/// pull-model window sharding registered, and return `shard_count` independent
+/// pull `RuleTask`s that all share ONE window log. Used to test P2 zero
+/// re-partition: each shard must process only its stored `shard_rows` subset
+/// and the union of all shards must cover every key exactly once.
+fn make_sharded_match_tasks(
+    shard_count: usize,
+) -> (
+    Vec<rule_task::RuleTask>,
+    Vec<mpsc::Receiver<crate::alert_task::AlertBatch>>,
+    Arc<Window>,
+    Arc<Router>,
+) {
+    let schema = test_schema(); // sip(col0), event_time(col1)
+    let registry = WindowRegistry::build(vec![make_window_def(
+        "auth_events",
+        &schema,
+        &["syslog"],
+        Some(1),
+    )])
+    .unwrap();
+    let router = Arc::new(Router::new(registry));
+    let window = router.registry().get_window("auth_events").unwrap();
+    let notify = router.registry().get_notifier("auth_events").unwrap();
+    // Register the key partition so `pull_and_advance` treats the window as
+    // key-sharded (reads its `shard_rows` subset instead of the whole batch).
+    router.fanout().register_window_sharding(
+        "auth_events",
+        Arc::from(vec![FieldRef::Simple("sip".into())].into_boxed_slice()),
+        shard_count,
+    );
+
+    let mut tasks = Vec::new();
+    let mut rxs = Vec::new();
+    for shard_index in 0..shard_count {
+        let match_plan = MatchPlan {
+            keys: vec![FieldRef::Simple("sip".into())],
+            key_map: None,
+            window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
+            event_steps: vec![StepPlan {
+                branches: vec![BranchPlan {
+                    label: Some("x".into()),
+                    source: "x".into(),
+                    field: None,
+                    guard: None,
+                    agg: AggPlan {
+                        transforms: vec![],
+                        measure: Measure::Count,
+                        cmp: CmpOp::Ge,
+                        threshold: Expr::Number(1.0),
+                    },
+                }],
+            }],
+            close_steps: vec![],
+            close_mode: CloseMode::Or,
+            tracked_bind_aliases: HashSet::new(),
+            tracked_bind_fields: empty_tracked_bind_fields(),
+            tracked_plain_fields: empty_tracked_plain_fields(),
+            seq: None,
+            match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
+            needs_field_history: true,
+        };
+        let rule_plan = RulePlan {
+            conv_window: None,
+            name: "sharded_match".into(),
+            binds: vec![BindPlan {
+                alias: "x".into(),
+                window: "auth_events".into(),
+                filter: None,
+            }],
+            match_plan: match_plan.clone(),
+            each_plan: None,
+            joins: vec![],
+            entity_plan: EntityPlan {
+                entity_type: "ip".into(),
+                entity_id_expr: Expr::Field(FieldRef::Qualified("x".into(), "sip".into())),
+            },
+            yield_plan: YieldPlan {
+                target: "alerts".into(),
+                version: None,
+                fields: vec![],
+            },
+            score_plan: ScorePlan {
+                expr: Expr::Number(1.0),
+            },
+            pattern_origin: None,
+            conv_plan: None,
+            limits_plan: None,
+        };
+        let machine =
+            CepStateMachine::new("sharded_match".into(), match_plan, Some("event_time".into()));
+        let executor = RuleExecutor::new(rule_plan);
+
+        let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+        let mut progress = std::collections::HashMap::new();
+        if let Some(slot) = router
+            .registry()
+            .progress("auth_events")
+            .map(|p| p.register())
+        {
+            progress.insert("auth_events".to_string(), slot);
+        }
+        let config = task_types::RuleTaskConfig {
+            progress,
+            conv_sink: None,
+            machine: Some(machine),
+            each_alias: None,
+            each_time_field: None,
+            executor,
+            window_sources: vec![task_types::WindowSource {
+                window_name: "auth_events".into(),
+                window: Arc::clone(&window),
+                notify: Arc::clone(&notify),
+                aliases: vec!["x".into()],
+            }],
+            sink_fanout: make_test_fanout(alert_tx),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            timeout_scan_interval: Duration::from_secs(60),
+            router: Arc::clone(&router),
+            metrics: None,
+            intermediate_targets: HashSet::new(),
+            pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+            eos_flush: tokio::sync::watch::channel(0u64).1,
+            push_rx: None,
+            shard_index: Some(shard_index),
+            shard_count,
+        };
+        let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
+        tasks.push(task);
+        rxs.push(alert_rx);
+    }
+    (tasks, rxs, window, router)
+}
+
+#[tokio::test]
+async fn pull_sharded_match_zero_repartition() {
+    // P2 零重复分片端到端验证：6 个 key 按行号 % 2 分片（row i → shard i%2），
+    // 每个 shard 只处理自己 shard_rows 子集 → 只对自己 key 触发；跨所有 shard
+    // 的并集 == 全部 key 各一次（不丢、不重、不跨 shard 重复触发）。
+    init_tracing();
+    let schema = test_schema();
+    let ts = 1_700_000_000_000_000_000i64;
+    let sips = ["s0", "s1", "s2", "s3", "s4", "s5"];
+    let batch = make_batch(&schema, &sips, ts);
+    let shard_rows: Vec<Vec<u32>> = (0..2)
+        .map(|sh| {
+            (0..sips.len() as u32)
+                .filter(|&r| r as usize % 2 == sh)
+                .collect()
+        })
+        .collect();
+
+    let (mut tasks, mut rxs, win, _router) = make_sharded_match_tasks(2);
+    let size = content_bytes(&batch);
+    win.append_with_watermark_sized(batch, size, Some(Arc::new(shard_rows)))
+        .unwrap();
+
+    for t in tasks.iter_mut() {
+        t.pull_and_advance().await;
+    }
+    let ids0: HashSet<String> = drain_alert_entity_ids(&mut rxs[0]).into_iter().collect();
+    let ids1: HashSet<String> = drain_alert_entity_ids(&mut rxs[1]).into_iter().collect();
+
+    let expect0: HashSet<String> = ["s0", "s2", "s4"].iter().map(|s| s.to_string()).collect();
+    let expect1: HashSet<String> = ["s1", "s3", "s5"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(ids0, expect0, "shard 0 must fire only its own keys");
+    assert_eq!(ids1, expect1, "shard 1 must fire only its own keys");
+
+    // Union across shards == every key exactly once.
+    let union: HashSet<String> = ids0.union(&ids1).cloned().collect();
+    assert_eq!(
+        union.len(),
+        sips.len(),
+        "every key must fire exactly once across all shards (zero re-partition)"
+    );
+    assert!(
+        union.iter().all(|s| sips.contains(&s.as_str())),
+        "only real keys should fire"
+    );
+}
+
+#[tokio::test]
+async fn pull_sharded_advances_ack_floor() {
+    // pull 后必须把消费进度写进 WindowProgress slot，使驱逐地板（min_acked）
+    // 跟上 cursor —— 否则时间驱逐会在 pull cursor 读取前清掉未消费批次（q3 的
+    // cursor_gap / 数据丢失回归锚点）。
+    init_tracing();
+    let schema = test_schema();
+    let ts = 1_700_000_000_000_000_000i64;
+    let (mut tasks, _rxs, win, router) = make_sharded_match_tasks(1);
+
+    for b in 0..3u32 {
+        let batch = make_batch(&schema, &["10.0.0.1", "10.0.0.2"], ts + b as i64);
+        let size = content_bytes(&batch);
+        win.append_with_watermark_sized(batch, size, None).unwrap();
+    }
+    tasks[0].pull_and_advance().await;
+
+    let floor = router
+        .registry()
+        .progress("auth_events")
+        .expect("progress table exists")
+        .min_acked();
+    assert_eq!(floor, 3, "ack floor must equal batches processed + 1");
+
+    // A time-eviction sweep must NOT drop the acked batches (floor gates it).
+    let before = win.batch_count();
+    win.evict_expired(ts + 1_000, floor);
+    assert_eq!(
+        win.batch_count(),
+        before,
+        "acked batches are protected from time eviction by the floor"
+    );
+}
+
 #[tokio::test]
 async fn flush_closes_active_instances() {
     init_tracing();
@@ -3257,6 +3501,8 @@ async fn port_scan_rule_triggers_close_alert() {
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
 
     let (mut task, _cancel, _interval) = rule_task::RuleTask::new(config);
@@ -3570,6 +3816,8 @@ fn make_conv_sink_task() -> (
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
+        shard_index: None,
+        shard_count: 1,
     };
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, conv_rx)

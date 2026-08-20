@@ -33,7 +33,20 @@ const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
 const DEBUG_DETAIL_LIMIT: usize = 20;
 
 /// Pull-path pending rows: (alias, cursor, event arcs) per source window.
-type PendingAliasRows = Vec<(String, u64, Vec<Arc<Vec<Arc<Event>>>>)>;
+/// Pulled batches for one round of [`RuleTask::pull_and_advance`], collected
+/// up front so the subsequent `process_batch` (`&mut self`) calls don't
+/// conflict with the `&self.sources` borrow. Tuple:
+/// `(window_name, first_batch_seq, batches, shard_rows_per_batch,
+///  materialize_fields, key_partitioned, new_cursor)`.
+type PendingAliasRows = Vec<(
+    String,
+    u64,
+    Vec<RecordBatch>,
+    Vec<Option<Arc<Vec<u32>>>>,
+    Option<Arc<HashSet<String>>>,
+    bool,
+    u64,
+)>;
 /// Staged pipe batch: (window name, events) or `None` when nothing staged.
 type PendingEventBatch = Option<(Arc<str>, Arc<Vec<Arc<Event>>>)>;
 /// Batch the allocation-heavy per-alert telemetry (detail map + e2e latency
@@ -193,6 +206,11 @@ pub(super) struct RuleTask {
     /// by the elapsed wall time — letting instances expire per their window TTL
     /// even without new events (window semantics, not just event-time).
     last_activity_wall: std::time::Instant,
+    /// Periodic timeout-scan interval: the wall-clock expiry advance is **capped**
+    /// at this (see `scan_timeouts`) so a slow/backpressured pipeline cannot race
+    /// the effective watermark far ahead of event time and snowball into a huge
+    /// single expiry sweep that starves pushes.
+    timeout_scan_interval: std::time::Duration,
     /// Push-mode input channel (R1). When `Some`, the rule consumes pushed
     /// `Arc<Vec<Arc<Event>>>` instead of pulling from the window read lock; when
     /// `None`, the task falls back to the legacy notify + pull loop. Consumed
@@ -200,6 +218,14 @@ pub(super) struct RuleTask {
     pub(super) push_rx: Option<mpsc::Receiver<RulePush>>,
     /// Monotonic batch sequence for pushed batches (debug event refs only).
     pushed_seq: u64,
+    /// Pull-model shard identity (M1, window-actor-pull-model.md §3.1).
+    /// `Some(i)` for a sharded rule task: a key-partitioned (match) task pulls
+    /// only its `TimedBatch.shard_rows[i]` row subset; an on-each round-robin
+    /// task uses `i` as the whole-batch round-robin index. `None` = unsharded.
+    shard_index: Option<usize>,
+    /// Total shard count this rule is split across (1 when unsharded). Used by
+    /// the on-each round-robin gate (`seq % shard_count == shard_index`).
+    shard_count: usize,
     /// Profiling accumulators (nanos) for locating the rule-task bottleneck.
     advance_nanos: u64,
     scan_nanos: u64,
@@ -287,6 +313,8 @@ impl RuleTask {
             push_rx,
             progress,
             conv_sink,
+            shard_index,
+            shard_count,
         } = config;
         let aliases: HashMap<String, Vec<String>> = window_sources
             .iter()
@@ -346,8 +374,11 @@ impl RuleTask {
             pipe_registry,
             eos_flush,
             last_activity_wall: std::time::Instant::now(),
+            timeout_scan_interval,
             push_rx,
             pushed_seq: 0,
+            shard_index,
+            shard_count,
             progress,
             advance_nanos: 0,
             scan_nanos: 0,
@@ -380,32 +411,49 @@ impl RuleTask {
 
     // -- Data processing ----------------------------------------------------
 
-    /// Read new batches from all windows, convert to events, and advance
-    /// the state machine.
+    /// Read new batches from all windows and advance the state machine.
+    ///
+    /// **Pull-model (M1, window-actor-pull-model.md §3.3).** Columnar pull:
+    /// each window's shared `RecordBatch` Arcs are read once (zero data copy)
+    /// and fed straight into [`Self::process_batch`]'s columnar entry point —
+    /// replacing the legacy `events_since` row-based path. Sharding is handled
+    /// without re-partitioning:
+    ///
+    /// - *Key-partitioned (match) windows* — the parse stage already computed
+    ///   the per-shard row subset and stored it in `TimedBatch.shard_rows`. A
+    ///   sharded task pulls only its `shard_rows[i]` rows (P2 zero re-partition);
+    ///   `read_since_with_shard(cursor, Some(i))` returns that subset.
+    /// - *On-each round-robin / unsharded windows* — `read_since_with_shard`
+    ///   returns the whole batch; a round-robin task processes a batch only
+    ///   when `seq % shard_count == shard_index` (whole-batch round-robin,
+    ///   identical to the legacy `register_round_robin` semantics).
     pub(super) async fn pull_and_advance(&mut self) {
-        // Collect new events per window first (this phase only takes disjoint
-        // field borrows), then process each batch — which needs `&mut self` and
-        // would otherwise conflict with the `&self.sources` iteration.
+        // Phase 1: collect pulled batches per window. This phase only takes
+        // disjoint field borrows, so it must stay free of `&mut self` calls
+        // (the `&self.sources` borrow would conflict with `process_batch`).
         let mut pending: PendingAliasRows = Vec::new();
         for source in &self.sources {
             let cursor = self.cursors.get(&source.window_name).copied().unwrap_or(0);
-            let (events_list, new_cursor, gap) = {
-                // Shared parsed events: the window parses each batch once and
-                // hands every rule the same Arc (wp-reactor#19). Lock-free
-                // cursor read — no window lock involved.
-                let win = &source.window;
-                let result = win.events_since(cursor);
-                wf_debug!(pipe,
-                    task_id = %self.task_id,
-                    window = %source.window_name,
-                    cursor = cursor,
-                    new_cursor = result.1,
-                    batches = result.0.len(),
-                    gap = result.2,
-                    "events_since"
-                );
-                result
+            // Key-partitioned (match) windows yield per-shard row subsets;
+            // everything else (on-each round-robin, unsharded) pulls whole
+            // batches and is gated below.
+            let key_partitioned = self.router.fanout().window_is_sharded(&source.window_name);
+            let pull_shard = if key_partitioned {
+                self.shard_index
+            } else {
+                None
             };
+            let (batches, shard_rows_per_batch, new_cursor, gap) =
+                source.window.read_since_with_shard(cursor, pull_shard);
+            wf_debug!(pipe,
+                task_id = %self.task_id,
+                window = %source.window_name,
+                cursor = cursor,
+                new_cursor = new_cursor,
+                batches = batches.len(),
+                gap = gap,
+                "read_since_with_shard"
+            );
 
             if gap {
                 wf_warn!(pipe,
@@ -420,21 +468,93 @@ impl RuleTask {
                     );
                 }
             }
-            self.cursors.insert(source.window_name.clone(), new_cursor);
-
-            let first_batch_seq = new_cursor.saturating_sub(events_list.len() as u64);
-            pending.push((source.window_name.clone(), first_batch_seq, events_list));
+            let first_batch_seq = new_cursor.saturating_sub(batches.len() as u64);
+            let materialize_fields = source.window.materialize_fields().cloned();
+            pending.push((
+                source.window_name.clone(),
+                first_batch_seq,
+                batches,
+                shard_rows_per_batch,
+                materialize_fields,
+                key_partitioned,
+                new_cursor,
+            ));
         }
 
-        for (window_name, first_batch_seq, events_list) in pending {
-            for (batch_index, events) in events_list.iter().enumerate() {
+        // Phase 2: advance read cursors (separate from phase 1 so the mutable
+        // borrow does not fight the `&self.sources` iteration above).
+        for (window, _, _, _, _, _, new_cursor) in &pending {
+            self.cursors.insert(window.clone(), *new_cursor);
+        }
+
+        // Phase 3: process each pulled batch (`&mut self`).
+        for (
+            window,
+            first_batch_seq,
+            batches,
+            shard_rows_per_batch,
+            materialize_fields,
+            key_partitioned,
+            new_cursor,
+        ) in pending
+        {
+            for (batch_index, batch) in batches.iter().enumerate() {
                 let batch_seq = first_batch_seq + batch_index as u64;
-                self.process_batch(&window_name, batch_seq, Some(events), None, None, None)
-                    .await;
-                // Ack consumption so time eviction may reclaim this batch.
-                if let Some(slot) = self.progress.get(&window_name) {
-                    slot.store(batch_seq + 1, std::sync::atomic::Ordering::Release);
+                let shard_rows = shard_rows_per_batch
+                    .get(batch_index)
+                    .and_then(|opt| opt.as_deref())
+                    .map(|rows| rows.as_slice());
+                // Key-partitioned windows are expected to carry a precomputed
+                // per-shard row subset for *every* batch they own; a `None` here
+                // means this batch fell back to whole-batch processing (missing
+                // `shard_rows` — e.g. a hot-reload batch or a changed shard
+                // count). When several shard instances hit the same gap they
+                // each process the whole batch → cross-shard duplicate
+                // consumption. That is the lossless-but-duplicating defensive
+                // trade-off (duplicates are masked by at-least-once acking), but
+                // surface it so a recurring fallback is not silent.
+                if key_partitioned && shard_rows.is_none() {
+                    wf_warn!(pipe,
+                        task_id = %self.task_id,
+                        window = %window,
+                        shard = ?self.shard_index,
+                        batch_seq = batch_seq,
+                        "key-partitioned batch missing shard_rows — fell back to whole-batch processing (possible cross-shard duplicate)"
+                    );
                 }
+                // Key-partitioned: `shard_rows` already restricts this task to
+                // its own rows, so every pulled batch is processed. Otherwise
+                // gate whole-batch (on-each round-robin / unsharded) tasks.
+                let should_process = key_partitioned
+                    || self.shard_count <= 1
+                    || (batch_seq % self.shard_count as u64)
+                        == self.shard_index.unwrap_or(0) as u64;
+                if !should_process {
+                    continue;
+                }
+                self.process_batch(
+                    &window,
+                    batch_seq,
+                    Some(batch_seq),
+                    None,
+                    Some(batch),
+                    shard_rows,
+                    materialize_fields.as_deref(),
+                )
+                .await;
+            }
+            // Ack the READ position (`new_cursor`) — the shared-log cursor this
+            // task just advanced to — rather than only the last batch it
+            // *processed*. For key-partitioned rules every pulled batch is
+            // processed so this equals `next_seq` when drained; for whole-batch
+            // round-robin (on-each) each batch is owned by exactly one shard, so
+            // acking the read position is what lets `min_acked` reach `next_seq`
+            // once every shard has pulled the shared log — the true "rules
+            // drained" signal. The cross-shard `min_acked` remains the eviction
+            // floor: a slow shard still holds the floor below any batch it has
+            // not yet read, so no owned batch is ever evicted early.
+            if let Some(slot) = self.progress.get(&window) {
+                slot.store(new_cursor, std::sync::atomic::Ordering::Release);
             }
         }
         self.update_rule_instances_metric();
@@ -449,6 +569,7 @@ impl RuleTask {
         &mut self,
         window_name: &str,
         batch_seq: u64,
+        lookup_max_seq: Option<u64>,
         events: Option<&Arc<Vec<Arc<Event>>>>,
         batch: Option<&RecordBatch>,
         shard_rows: Option<&[u32]>,
@@ -646,7 +767,14 @@ impl RuleTask {
             self.cached_wall_nanos
                 .store(wall_nanos(), Ordering::Relaxed);
         }
-        let lookup = RegistryLookup(&self.router);
+        // M2 (seq-watermark consistency): bound window_lookup to the seq of the
+        // batch being processed (pull model only — push keeps the legacy full-
+        // window view via `lookup_max_seq = None`). The watermark is scoped to
+        // *this* source window only: join targets are independent windows and
+        // must not be bounded by this window's seq. See
+        // window-actor-pull-model.md §3.5.
+        let lookup =
+            RegistryLookup::with_source_watermark(&self.router, lookup_max_seq, window_name);
         // on-each: events within a batch share the window schema, so the
         // sorted field order used for wfx_id hashing is computed once per
         // batch instead of collected + sorted per event.
@@ -749,7 +877,7 @@ impl RuleTask {
                 // (aggregation window); inline conv is applied only on the
                 // legacy single-machine path.
                 let (routed, closes) = if self.conv_sink.is_some() {
-                    let raw = machine.scan_expired_at(event_nanos);
+                    let raw = machine.scan_expired_at_skip_non_alerting(event_nanos);
                     // Barrier watermark must reflect the scan's watermark (the
                     // event time) — the machine's cached watermark only advances
                     // during `advance`, which runs after the scan.
@@ -759,7 +887,10 @@ impl RuleTask {
                 } else {
                     (
                         false,
-                        machine.scan_expired_at_with_conv(event_nanos, self.conv_plan.as_ref()),
+                        machine.scan_expired_at_with_conv_skip_non_alerting(
+                            event_nanos,
+                            self.conv_plan.as_ref(),
+                        ),
                     )
                 };
                 self.scan_nanos += _scan_start.elapsed().as_nanos() as u64;
@@ -773,17 +904,16 @@ impl RuleTask {
                 // event. Debug and defer are mutually exclusive, so the Eager arm
                 // is the only one that appears with debug detail enabled.
                 let row_event: Option<RowEvent<'_>> = if let Some(d) = &deferred {
-                    (hit_cursor < d.hit_indices.len()
-                        && d.hit_indices[hit_cursor] as usize == i)
-                    .then(|| {
-                        hit_cursor += 1;
-                        RowEvent::Columnar(ColumnarEvent::with_index_projected(
-                            d.batch,
-                            row_index,
-                            Arc::clone(&d.index),
-                            d.projection.clone(),
-                        ))
-                    })
+                    (hit_cursor < d.hit_indices.len() && d.hit_indices[hit_cursor] as usize == i)
+                        .then(|| {
+                            hit_cursor += 1;
+                            RowEvent::Columnar(ColumnarEvent::with_index_projected(
+                                d.batch,
+                                row_index,
+                                Arc::clone(&d.index),
+                                d.projection.clone(),
+                            ))
+                        })
                 } else {
                     event.map(|ev| RowEvent::Eager(ev.as_ref()))
                 };
@@ -802,7 +932,8 @@ impl RuleTask {
                                 stats.alias_rejected += 1;
                             }
                             if debug_enabled && stats.allow_detail() {
-                                let event_ref = row_event_debug_ref(&row_event, batch_seq, row_index);
+                                let event_ref =
+                                    row_event_debug_ref(&row_event, batch_seq, row_index);
                                 wf_debug!(pipe,
                                     rule = %rule_name_for_log,
                                     stage = 0,
@@ -847,7 +978,8 @@ impl RuleTask {
                                 }
                                 if debug_enabled && stats.allow_detail() {
                                     let instances = machine.instance_count();
-                                    let event_ref = row_event_debug_ref(&row_event, batch_seq, row_index);
+                                    let event_ref =
+                                        row_event_debug_ref(&row_event, batch_seq, row_index);
                                     if let Some(progress) = progress.as_ref() {
                                         wf_debug!(pipe,
                                             rule = %rule_name_for_log,
@@ -886,7 +1018,8 @@ impl RuleTask {
                                 }
                                 if debug_enabled && stats.allow_detail() {
                                     let instances = machine.instance_count();
-                                    let event_ref = row_event_debug_ref(&row_event, batch_seq, row_index);
+                                    let event_ref =
+                                        row_event_debug_ref(&row_event, batch_seq, row_index);
                                     if let Some(progress) = progress.as_ref() {
                                         wf_debug!(pipe,
                                             rule = %rule_name_for_log,
@@ -924,7 +1057,8 @@ impl RuleTask {
                                     stats.matched += 1;
                                 }
                                 if debug_enabled && stats.allow_detail() {
-                                    let event_ref = row_event_debug_ref(&row_event, batch_seq, row_index);
+                                    let event_ref =
+                                        row_event_debug_ref(&row_event, batch_seq, row_index);
                                     let step = ctx.step_data.last();
                                     wf_debug!(pipe,
                                         rule = %rule_name_for_log,
@@ -1316,6 +1450,7 @@ impl RuleTask {
         self.process_batch(
             window_name.as_ref(),
             seq,
+            None,
             push.events.as_ref(),
             push.batch.as_deref(),
             push.shard_rows.as_deref().map(|rows| rows.as_slice()),
@@ -1356,19 +1491,28 @@ impl RuleTask {
         self.cached_wall_nanos
             .store(wall_nanos(), Ordering::Relaxed);
         // Advance the effective watermark by the wall-clock time elapsed since the
-        // last event was processed. This lets instances expire per their window TTL
-        // even when input is completely idle (window semantics, not just event-time).
-        let effective_watermark = machine
-            .watermark_nanos()
-            .saturating_add(self.last_activity_wall.elapsed().as_nanos() as i64);
+        // last event was processed — but **capped at one scan interval**. This
+        // lets idle instances expire per their window TTL (window semantics, not
+        // just event-time), while bounding each sweep: a slow/backpressured
+        // pipeline cannot accumulate minutes of wall-clock and snowball into a
+        // huge single expiry sweep that starves push consumption (q5/q6/q7 froze
+        // at ~22-25M appends on 30M data before this cap).
+        let effective_watermark = machine.watermark_nanos().saturating_add(
+            self.last_activity_wall
+                .elapsed()
+                .min(self.timeout_scan_interval)
+                .as_nanos() as i64,
+        );
         let started = Instant::now();
-        let lookup = RegistryLookup(&self.router);
+        // No input batch is being processed here (timeout scan), so the window
+        // lookups read the full window (no `max_seq` watermark).
+        let lookup = RegistryLookup::new(&self.router);
         // P2c: shards of a conv rule route raw closes to the conv stage.
         let (rule_name, closes, routed) = {
             let machine = self.machine.as_mut().expect("checked above");
             let rule_name = machine.rule_name().to_string();
             if self.conv_sink.is_some() {
-                let raw = machine.scan_expired_at(effective_watermark);
+                let raw = machine.scan_expired_at_skip_non_alerting(effective_watermark);
                 // Barrier watermark = the effective (wall-clock advanced) scan
                 // watermark, so an idle shard still advances its barrier and the
                 // conv stage can seal buckets for the whole rule (without this,
@@ -1395,7 +1539,10 @@ impl RuleTask {
             } else {
                 (
                     rule_name,
-                    machine.scan_expired_at_with_conv(effective_watermark, self.conv_plan.as_ref()),
+                    machine.scan_expired_at_with_conv_skip_non_alerting(
+                        effective_watermark,
+                        self.conv_plan.as_ref(),
+                    ),
                     false,
                 )
             }
@@ -1502,7 +1649,9 @@ impl RuleTask {
         self.cached_wall_nanos
             .store(wall_nanos(), Ordering::Relaxed);
         let started = Instant::now();
-        let lookup = RegistryLookup(&self.router);
+        // Shutdown flush is not processing any single input batch, so window
+        // lookups read the full window (no `max_seq` watermark).
+        let lookup = RegistryLookup::new(&self.router);
         // P2c: on flush a conv-rule shard routes ALL remaining raw closes to the
         // conv stage and publishes a drained barrier (i64::MAX via the batch).
         let (rule_name, closes, routed) = {

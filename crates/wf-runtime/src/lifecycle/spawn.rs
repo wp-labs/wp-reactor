@@ -12,15 +12,28 @@ use wf_config::FusionConfig;
 use wf_engine::match_engine::{CepStateMachine, SharedLimits};
 use wf_engine::sink::SinkDispatcher;
 use wf_engine::window::{
-    Evictor, Router, RulePush, WINDOW_CHANNEL_DEPTH, WindowAppendReport, WindowMailbox, WindowMsg,
-    WindowRegistry, run_window_actor,
+    EvictionGate, Evictor, Router, RulePush, WINDOW_CHANNEL_DEPTH, WindowAppendReport,
+    WindowMailbox, WindowMsg, WindowRegistry, run_window_actor,
 };
 
 /// Bounded capacity of each rule push channel (a channel carries whole batches
 /// of parsed events, `Arc<Vec<Arc<Event>>>`). A full channel blocks the
 /// window actor's broadcast — backpressure — instead of buffering unboundedly
 /// (50M sustained inject grew RSS to ~13GB with unbounded channels).
-pub(crate) const RULE_CHANNEL_CAPACITY: usize = 32;
+///
+/// Tuning note (q5 100M freeze, ISSUE_q5_100m_freeze.md): the window actor is
+/// a single writer that, per batch, `join_sends` a 30-way broadcast to every
+/// rule channel. If ANY rule task pauses transiently (GC / lock contention /
+/// residual `recalibrate_memory` scan), its channel fills and the actor's
+/// broadcast blocks — stalling *all* window commits, which then backs up the
+/// mailbox, exhausts the byte budget, and stops the receiver, so
+/// `append_total` can never reach TOTAL (the ~99M tail freeze). A deeper
+/// channel lets the actor absorb a transient pause without stalling; it is
+/// memory-bounded because each queued `RulePush` keeps its `Arc<RecordBatch>`
+/// alive until the (slow) rule task consumes it. 256 (~3.5s of backlog at the
+/// q5 ingest rate) covers transient pauses without the unbounded-channel RSS
+/// blow-up; raise further only if a *sustained* single-shard skew is observed.
+pub(crate) const RULE_CHANNEL_CAPACITY: usize = 256;
 use wf_lang::ast::FieldRef;
 
 use crate::alert_task;
@@ -136,6 +149,7 @@ const MIN_WINDOW_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 pub(super) fn spawn_window_actors(
     config: &FusionConfig,
     router: &Arc<Router>,
+    gate: Arc<EvictionGate>,
     cancel: CancellationToken,
     metrics: Option<Arc<RuntimeMetrics>>,
 ) -> TaskGroup {
@@ -173,9 +187,20 @@ pub(super) fn spawn_window_actors(
         let name: Arc<str> = Arc::from(name.as_str());
         let report = Arc::clone(&report);
         let fanout = Arc::clone(&fanout);
+        let gate = Arc::clone(&gate);
         let cancel = cancel.child_token();
         group.push(tokio::spawn(async move {
-            run_window_actor(name, win, fanout, notify, rx, cancel, Some(report)).await;
+            run_window_actor(
+                name,
+                win,
+                Arc::clone(&gate),
+                fanout,
+                notify,
+                rx,
+                cancel,
+                Some(report),
+            )
+            .await;
             Ok(())
         }));
     }
@@ -187,10 +212,11 @@ pub(super) fn spawn_window_actors(
 pub(super) fn spawn_evictor_task(
     config: &FusionConfig,
     router: &Arc<Router>,
+    gate: Arc<EvictionGate>,
     cancel: CancellationToken,
     metrics: Option<Arc<RuntimeMetrics>>,
 ) -> TaskGroup {
-    let evictor = Evictor::new(config.window_defaults.max_total_bytes.as_bytes());
+    let evictor = Evictor::new(Arc::clone(&gate));
     let evict_interval = config.window_defaults.evict_interval.as_duration();
     let router = Arc::clone(router);
     let mut group = TaskGroup::new("evictor");
@@ -244,6 +270,14 @@ pub(super) fn spawn_rule_tasks(
     let mut group = TaskGroup::new("rules");
     let timeout_scan_interval = Duration::from_secs(1);
     let shard_count = shard_count.max(1);
+    // M1 window-actor-pull-model.md §5: default **pull**; the legacy push
+    // broadcast (channel + fanout) is retained as an emergency fallback behind
+    // `WFUSION_WINDOW_DISPATCH=push` (byte-identical production behavior, 256
+    // stall止血 kept). Pull eliminates the actor single-writer stall that froze
+    // q5 100M.
+    let use_push = std::env::var("WFUSION_WINDOW_DISPATCH")
+        .map(|v| v.eq_ignore_ascii_case("push"))
+        .unwrap_or(false);
 
     for rule in rules {
         let window_sources = resolve_window_sources(&rule.window_aliases, router.registry());
@@ -263,9 +297,18 @@ pub(super) fn spawn_rule_tasks(
 
                 if shardable {
                     let mut shard_txs = Vec::with_capacity(shard_count);
-                    for _ in 0..shard_count {
-                        let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
-                        shard_txs.push(push_tx);
+                    for shard_idx in 0..shard_count {
+                        // Push mode only: create the delivery channel. Pull mode
+                        // carries no channel — the task pulls the shared window
+                        // log directly (whole-batch round-robin gated by seq).
+                        let push_rx = if use_push {
+                            let (push_tx, push_rx) =
+                                mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
+                            shard_txs.push(push_tx);
+                            Some(push_rx)
+                        } else {
+                            None
+                        };
                         let progress = register_progress(router, &window_sources);
                         let task_config = RuleTaskConfig {
                             machine: None,
@@ -281,7 +324,9 @@ pub(super) fn spawn_rule_tasks(
                             intermediate_targets: intermediate_targets.clone(),
                             pipe_registry: Arc::clone(&pipe_registry),
                             eos_flush: eos_tx.subscribe(),
-                            push_rx: Some(push_rx),
+                            push_rx,
+                            shard_index: Some(shard_idx),
+                            shard_count,
                             progress: progress.clone(),
                             conv_sink: None,
                         };
@@ -289,18 +334,26 @@ pub(super) fn spawn_rule_tasks(
                             async move { run_rule_task(task_config).await },
                         ));
                     }
-                    for source in &window_sources {
-                        router
-                            .fanout()
-                            .register_round_robin(&source.window_name, shard_txs.clone());
+                    if use_push {
+                        for source in &window_sources {
+                            router
+                                .fanout()
+                                .register_round_robin(&source.window_name, shard_txs.clone());
+                        }
                     }
                 } else {
-                    let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
-                    for source in &window_sources {
-                        router
-                            .fanout()
-                            .register(&source.window_name, push_tx.clone());
-                    }
+                    let push_rx = if use_push {
+                        let (push_tx, push_rx) =
+                            mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
+                        for source in &window_sources {
+                            router
+                                .fanout()
+                                .register(&source.window_name, push_tx.clone());
+                        }
+                        Some(push_rx)
+                    } else {
+                        None
+                    };
                     let progress = register_progress(router, &window_sources);
                     let task_config = RuleTaskConfig {
                         machine: None,
@@ -316,7 +369,9 @@ pub(super) fn spawn_rule_tasks(
                         intermediate_targets: intermediate_targets.clone(),
                         pipe_registry: Arc::clone(&pipe_registry),
                         eos_flush: eos_tx.subscribe(),
-                        push_rx: Some(push_rx),
+                        push_rx,
+                        shard_index: None,
+                        shard_count: 1,
                         progress: progress.clone(),
                         conv_sink: None,
                     };
@@ -349,6 +404,17 @@ pub(super) fn spawn_rule_tasks(
 
                 if shardable {
                     let keys: Arc<[FieldRef]> = match_plan.keys.clone().into();
+                    // M1 pull model: register the window's key partition so the
+                    // parse stage computes the per-shard row subset once and
+                    // stores it on the log (P2 zero re-partition). The pull
+                    // rule task then pulls only its `shard_rows[i]` subset.
+                    // Harmless in push mode (the broadcast path resolves the
+                    // partition from its own delivery subscription instead).
+                    for source in &window_sources {
+                        router
+                            .fanout()
+                            .register_window_sharding(&source.window_name, Arc::clone(&keys), shard_count);
+                    }
                     // P2b: one shared rate-limit/budget handle across all shards
                     // (only when the rule carries limits).
                     let shared_limits = limits.as_ref().map(|_| SharedLimits::new());
@@ -404,8 +470,17 @@ pub(super) fn spawn_rule_tasks(
                             // Emit raw closes to the conv stage (aggregation window).
                             machine.set_raw_conv_mode();
                         }
-                        let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
-                        shard_txs.push(push_tx);
+                        // Push mode only: create the delivery channel. Pull mode
+                        // carries no channel — the task pulls its `shard_rows[i]`
+                        // subset directly from the shared window log.
+                        let push_rx = if use_push {
+                            let (push_tx, push_rx) =
+                                mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
+                            shard_txs.push(push_tx);
+                            Some(push_rx)
+                        } else {
+                            None
+                        };
                         let progress = register_progress(router, &window_sources);
                         let conv_sink = conv_ctx.as_ref().map(|(tx, _barrier)| ConvShardSink {
                             tx: tx.clone(),
@@ -425,7 +500,9 @@ pub(super) fn spawn_rule_tasks(
                             intermediate_targets: intermediate_targets.clone(),
                             pipe_registry: Arc::clone(&pipe_registry),
                             eos_flush: eos_tx.subscribe(),
-                            push_rx: Some(push_rx),
+                            push_rx,
+                            shard_index: Some(shard_idx),
+                            shard_count,
                             progress: progress.clone(),
                             conv_sink,
                         };
@@ -433,22 +510,30 @@ pub(super) fn spawn_rule_tasks(
                             async move { run_rule_task(task_config).await },
                         ));
                     }
-                    for source in &window_sources {
-                        router.fanout().register_sharded(
-                            &source.window_name,
-                            shard_txs.clone(),
-                            Arc::clone(&keys),
-                        );
+                    if use_push {
+                        for source in &window_sources {
+                            router.fanout().register_sharded(
+                                &source.window_name,
+                                shard_txs.clone(),
+                                Arc::clone(&keys),
+                            );
+                        }
                     }
                 } else {
                     let machine =
                         CepStateMachine::with_limits(name, match_plan, time_field, limits);
-                    let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
-                    for source in &window_sources {
-                        router
-                            .fanout()
-                            .register(&source.window_name, push_tx.clone());
-                    }
+                    let push_rx = if use_push {
+                        let (push_tx, push_rx) =
+                            mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
+                        for source in &window_sources {
+                            router
+                                .fanout()
+                                .register(&source.window_name, push_tx.clone());
+                        }
+                        Some(push_rx)
+                    } else {
+                        None
+                    };
                     let progress = register_progress(router, &window_sources);
                     let task_config = RuleTaskConfig {
                         machine: Some(machine),
@@ -464,7 +549,9 @@ pub(super) fn spawn_rule_tasks(
                         intermediate_targets: intermediate_targets.clone(),
                         pipe_registry: Arc::clone(&pipe_registry),
                         eos_flush: eos_tx.subscribe(),
-                        push_rx: Some(push_rx),
+                        push_rx,
+                        shard_index: None,
+                        shard_count: 1,
                         progress: progress.clone(),
                         conv_sink: None,
                     };
