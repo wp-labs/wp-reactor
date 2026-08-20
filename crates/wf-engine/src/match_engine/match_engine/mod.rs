@@ -1017,7 +1017,7 @@ impl CepStateMachine {
     /// watermark. This makes `fired_at` deterministic regardless of batch size
     /// or scan frequency.
     pub fn scan_expired_at(&mut self, watermark_nanos: i64) -> Vec<CloseOutput> {
-        self.scan_expired_at_impl(watermark_nanos, false)
+        self.scan_expired_at_impl(watermark_nanos, false, MAX_EXPIRY_SCAN_BUDGET)
     }
 
     /// Like [`Self::scan_expired_at`], but skips building [`CloseOutput`]s for
@@ -1038,13 +1038,27 @@ impl CepStateMachine {
     /// only process qualifying closes (the rule-task hot path, conv stage)
     /// can use this and observe identical output.
     pub fn scan_expired_at_skip_non_alerting(&mut self, watermark_nanos: i64) -> Vec<CloseOutput> {
-        self.scan_expired_at_impl(watermark_nanos, true)
+        self.scan_expired_at_impl(watermark_nanos, true, MAX_EXPIRY_SCAN_BUDGET)
+    }
+
+    /// Like [`Self::scan_expired_at_skip_non_alerting`], but with an **unbounded**
+    /// expiry budget. Only safe off the event hot path (periodic `scan_timeouts`,
+    /// where the push pipeline is idle): a far-ahead watermark here pops the whole
+    /// remaining heap in one call instead of deferring — fixed-window rules whose
+    /// final bucket expires past the last event time depend on this sweep to close
+    /// (q16 30M dropped the final bucket: 1.48M vs 1.89M ideal with a 1024 budget).
+    pub fn scan_expired_at_skip_non_alerting_unbounded(
+        &mut self,
+        watermark_nanos: i64,
+    ) -> Vec<CloseOutput> {
+        self.scan_expired_at_impl(watermark_nanos, true, usize::MAX)
     }
 
     fn scan_expired_at_impl(
         &mut self,
         watermark_nanos: i64,
         skip_non_alerting: bool,
+        budget: usize,
     ) -> Vec<CloseOutput> {
         let mut results = Vec::new();
         // Incremental expiry: bound each sweep so a far-ahead watermark cannot
@@ -1053,7 +1067,7 @@ impl CepStateMachine {
         // task, the push channel filled, the pipeline froze). Remaining
         // candidates stay in the heap and are processed on the next scan
         // (per-row in the deferred loop + periodic `scan_timeouts`).
-        let mut budget = MAX_EXPIRY_SCAN_BUDGET;
+        let mut budget = budget;
         while let Some(Reverse((candidate_expire, key))) = self.expiry_heap.peek().cloned() {
             if candidate_expire > watermark_nanos || budget == 0 {
                 break;
@@ -1124,6 +1138,18 @@ impl CepStateMachine {
         conv_plan: Option<&ConvPlan>,
     ) -> Vec<CloseOutput> {
         let outputs = self.scan_expired_at_skip_non_alerting(watermark_nanos);
+        apply_conv_filtered(outputs, conv_plan, &self.plan.keys)
+    }
+
+    /// [`Self::scan_expired_at_with_conv_skip_non_alerting`] with the unbounded
+    /// expiry budget (off the event hot path only, see
+    /// [`Self::scan_expired_at_skip_non_alerting_unbounded`]).
+    pub fn scan_expired_at_with_conv_skip_non_alerting_unbounded(
+        &mut self,
+        watermark_nanos: i64,
+        conv_plan: Option<&ConvPlan>,
+    ) -> Vec<CloseOutput> {
+        let outputs = self.scan_expired_at_skip_non_alerting_unbounded(watermark_nanos);
         apply_conv_filtered(outputs, conv_plan, &self.plan.keys)
     }
 
