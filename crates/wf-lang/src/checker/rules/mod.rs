@@ -83,6 +83,31 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
         // Check score expression (T27)
         score_entity::check_score(rule, &base_scope, errors);
 
+        // Check `where` post-join filter: must be a bool expression; join target
+        // windows are registered in scope_build, so `join_window.field` resolves.
+        if let Some(w) = &rule.r#where {
+            if rule.joins.is_empty() {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(name.to_string()),
+                    test: None,
+                    message: "`where` requires at least one `join` clause (it filters the joined fields; use a bind filter / `on each where` for event-only conditions)"
+                        .to_string(),
+                });
+            }
+            check_expr_type(w, &base_scope, name, errors);
+            if let Some(t) = infer_type(w, &base_scope)
+                && t != ValType::Bool
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(name.to_string()),
+                    test: None,
+                    message: format!("`where` expression must be bool, got {:?}", t),
+                });
+            }
+        }
+
         // Check entity clause (T33)
         score_entity::check_entity(rule, &base_scope, errors);
 

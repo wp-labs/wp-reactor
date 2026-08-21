@@ -110,6 +110,10 @@ impl RuleExecutor {
         if !execute_joins(&self.plan.joins, &mut ctx, windows, event_time_nanos) {
             return Ok(None);
         }
+        // Post-join `where`: strict — false/None suppresses the output.
+        if !self.where_ok(&ctx) {
+            return Ok(None);
+        }
         self.build_each_alert(&ctx, event_time_nanos, field_order, emit_time_nanos)
     }
 
@@ -160,6 +164,10 @@ impl RuleExecutor {
         let mut ctx = event.clone();
         self.apply_lets(&mut ctx);
         if !execute_joins(&self.plan.joins, &mut ctx, windows, event_time_nanos) {
+            return Ok(false);
+        }
+        // Post-join `where`: strict — false/None suppresses the output.
+        if !self.where_ok(&ctx) {
             return Ok(false);
         }
         self.build_each_direct(
@@ -275,6 +283,11 @@ impl RuleExecutor {
                 let mut ctx = Cow::<Event>::Owned((**event).clone());
                 self.apply_lets(ctx.to_mut());
                 if !execute_joins(&self.plan.joins, ctx.to_mut(), windows, *event_time_nanos) {
+                    stats.rejected += 1;
+                    continue;
+                }
+                // Post-join `where`: strict — false/None suppresses the row.
+                if !self.where_ok(ctx.to_mut()) {
                     stats.rejected += 1;
                     continue;
                 }

@@ -1519,6 +1519,7 @@ fn execute_close_yield_resolves_tracked_bind_alias_field() {
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(wf_lang::ast::FieldRef::Qualified(

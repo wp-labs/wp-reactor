@@ -28,7 +28,7 @@ use self::eval::eval_bool_expr_with_lookup;
 use crate::alert::AlertOrigin;
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::columnar::{ColumnarBatch, GuardMasks, eval_guard_columnar};
-use crate::match_engine::match_engine::{FieldSource, Value, WindowLookup, field_ref_name};
+use crate::match_engine::match_engine::{Event, FieldSource, Value, WindowLookup, field_ref_name};
 use crate::time::normalize_epoch_timestamp_float_nanos;
 use arrow::array::BooleanArray;
 use arrow::record_batch::RecordBatch;
@@ -341,6 +341,17 @@ impl RuleExecutor {
 
     pub fn plan(&self) -> &RulePlan {
         &self.plan
+    }
+
+    /// Post-join `where` filter check: evaluated after joins enrich the event
+    /// context, before alert construction. Strict semantics — `false` or a
+    /// missing field (`None`) suppresses the output, aligning INNER JOIN
+    /// miss-drop (q3 state filter / q20 category filter).
+    pub(crate) fn where_ok(&self, ctx: &Event) -> bool {
+        match &self.plan.r#where {
+            None => true,
+            Some(expr) => matches!(self::eval::eval_bool_expr(expr, ctx), Some(true)),
+        }
     }
 
     /// Precomputed plan-level output constants (see [`OutputStatic`]).

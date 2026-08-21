@@ -81,6 +81,11 @@ impl RuleExecutor {
         ) {
             return Ok(None);
         }
+        // Post-join `where`: strict — false/None (e.g. join miss leaves the
+        // joined field absent) suppresses the output (INNER JOIN semantics).
+        if !self.where_ok(&ctx) {
+            return Ok(None);
+        }
         self.build_match_alert(matched, &ctx, emit_time_nanos)
             .map(Some)
     }

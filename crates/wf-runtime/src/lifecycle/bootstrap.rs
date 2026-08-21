@@ -555,6 +555,7 @@ mod tests {
             },
             each_plan: None,
             joins: vec![],
+            r#where: None,
             entity_plan: EntityPlan {
                 entity_type: "ip".into(),
                 entity_id_expr: Expr::Bool(false),

@@ -93,6 +93,10 @@ pub struct RuleDecl {
     pub each_clause: Option<EachClause>,
     pub score: ScoreExpr,
     pub joins: Vec<JoinClause>,
+    /// `where <expr>` — post-join filter evaluated after all joins enrich the
+    /// event context and before alert construction. `false`/`None` suppresses
+    /// the output (strict semantics, aligning INNER JOIN miss-drop).
+    pub r#where: Option<Expr>,
     pub pipeline_stages: Vec<PipelineStage>,
     pub entity: EntityClause,
     pub yield_clause: YieldClause,

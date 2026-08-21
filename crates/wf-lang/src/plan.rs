@@ -32,6 +32,8 @@ pub struct RulePlan {
     pub match_plan: MatchPlan,
     pub each_plan: Option<EachPlan>,
     pub joins: Vec<JoinPlan>,
+    /// `where <expr>` — post-join filter (strict: false/None suppresses output).
+    pub r#where: Option<ExprPlan>,
     pub entity_plan: EntityPlan,
     pub yield_plan: YieldPlan,
     pub score_plan: ScorePlan,

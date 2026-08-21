@@ -165,6 +165,7 @@ fn infer_func_call(
         | "sha1_n" | "sha256" | "stable_id" => Some(ValType::Base(BaseType::Chars)),
         "hex" => Some(ValType::Base(BaseType::Hex)),
         "indexof" => Some(ValType::Base(BaseType::Digit)),
+        "count_char" => Some(ValType::Base(BaseType::Digit)),
         "coalesce" => args.first().and_then(|a| infer_type(a, scope)),
         "merge" => Some(ValType::Object),
         "len" => Some(ValType::Base(BaseType::Digit)),

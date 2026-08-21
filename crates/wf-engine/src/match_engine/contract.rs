@@ -1,6 +1,6 @@
 use wf_lang::ast::{
-    CloseTrigger, CmpOp, ExpectStmt, Expr, FieldAssign, HitAssert, InputStmt, PermutationMode,
-    TestBlock,
+    CloseTrigger, CmpOp, ExpectStmt, Expr, FieldAssign, FieldRef, HitAssert, InputStmt,
+    PermutationMode, TestBlock,
 };
 use wf_lang::plan::RulePlan;
 
@@ -86,6 +86,29 @@ pub fn run_test(
                  runs without a WindowLookup, so every join is a miss); use E2E verify"
                     .to_string(),
             ],
+            output_count: 0,
+        });
+    }
+    // `where` post-join filters that reference join-window fields need a
+    // WindowLookup the harness does not provide — reject loudly. Without the
+    // lookup every join misses, so the joined field is absent and the strict
+    // `where` suppresses every output (hits == 0 would pass vacuously).
+    if let Some(w) = &plan.r#where
+        && let Some(join_win) = plan
+            .joins
+            .iter()
+            .find(|j| expr_refs_window(w, &j.right_window))
+    {
+        return Ok(TestResult {
+            test_name: test.name.clone(),
+            rule_name: test.rule_name.clone(),
+            passed: false,
+            failures: vec![format!(
+                "rule `where` references joined window `{}`: inline tests cannot assert hit \
+                 counts (the harness runs without a WindowLookup, so the join misses and the \
+                 strict where suppresses every output); use E2E verify",
+                join_win.right_window
+            )],
             output_count: 0,
         });
     }
@@ -261,6 +284,42 @@ fn validate_expect_stmts(expect_stmts: &[ExpectStmt], alerts: &[OutputRecord]) -
         }
     }
     failures
+}
+
+/// Whether `expr` references a field of window `window` (qualified/path form,
+/// e.g. `person_events.state`). Used to reject inline tests for rules whose
+/// `where` filters joined fields the harness cannot populate.
+fn expr_refs_window(expr: &Expr, window: &str) -> bool {
+    match expr {
+        Expr::Field(fr) => match fr {
+            FieldRef::Qualified(q, _) | FieldRef::Bracketed(q, _) => q == window,
+            FieldRef::Path { alias, .. } => alias == window,
+            FieldRef::Simple(_) => false,
+            _ => false, // non_exhaustive FieldRef: unknown forms are not window refs
+        },
+        Expr::Neg(inner) => expr_refs_window(inner, window),
+        Expr::BinOp { left, right, .. } => {
+            expr_refs_window(left, window) || expr_refs_window(right, window)
+        }
+        Expr::InList {
+            expr: inner, list, ..
+        } => expr_refs_window(inner, window) || list.iter().any(|e| expr_refs_window(e, window)),
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_refs_window(cond, window)
+                || expr_refs_window(then_expr, window)
+                || expr_refs_window(else_expr, window)
+        }
+        Expr::FuncCall { args, .. } => args.iter().any(|e| expr_refs_window(e, window)),
+        Expr::Array(items) => items.iter().any(|e| expr_refs_window(e, window)),
+        Expr::Object(items) => items
+            .iter()
+            .any(|item| expr_refs_window(&item.value, window)),
+        _ => false,
+    }
 }
 
 fn shuffle_row_input(input: &[InputStmt], seed: u64) -> Vec<InputStmt> {

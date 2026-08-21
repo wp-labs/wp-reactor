@@ -704,6 +704,34 @@ pub fn check_func_call(
             });
         }
         "now" | "now_s" | "now_ms" | "now_us" | "now_ns" => {}
+        "count_char" => {
+            // count_char(text, ch)：统计 ch 在 text 中的出现次数（Flink q14 UDF 同款）。
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "count_char() requires exactly 2 arguments: (text, char)".to_string(),
+                });
+            } else {
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(t) = infer_type(arg, scope)
+                        && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "count_char() argument {} must be chars, got {:?}",
+                                i + 1,
+                                t
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         "strftime" => {
             if args.len() != 1 && args.len() != 2 {
                 errors.push(CheckError {

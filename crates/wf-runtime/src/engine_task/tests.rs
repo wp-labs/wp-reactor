@@ -37,7 +37,7 @@ use crate::tracing_init::DomainFormat;
 /// cargo test -p wf-runtime -- engine_task::tests --nocapture
 /// ```
 /// Safe to call multiple times -- subsequent calls are no-ops.
-fn init_tracing() {
+pub fn init_tracing() {
     let _ = tracing_subscriber::registry()
         .with(
             fmt::layer()
@@ -48,12 +48,12 @@ fn init_tracing() {
         .try_init();
 }
 
-fn empty_tracked_bind_fields() -> std::collections::HashMap<String, HashSet<String>> {
+pub fn empty_tracked_bind_fields() -> std::collections::HashMap<String, HashSet<String>> {
     std::collections::HashMap::new()
 }
 
 /// Extract the first record from the next alert batch (tests deliver batches).
-fn take_alert(
+pub fn take_alert(
     rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>,
 ) -> Arc<wp_model_core::model::DataRecord> {
     let batch = rx.try_recv().expect("expected an alert batch");
@@ -84,7 +84,7 @@ fn first_record(batch: &crate::alert_task::AlertBatch) -> Arc<wp_model_core::mod
     }
 }
 
-fn make_test_fanout(tx: mpsc::Sender<crate::alert_task::AlertBatch>) -> Arc<SinkFanout> {
+pub fn make_test_fanout(tx: mpsc::Sender<crate::alert_task::AlertBatch>) -> Arc<SinkFanout> {
     let mut cache = std::collections::HashMap::new();
     // One sink (ptr=0) with a single writer channel (batches); the cache type is
     // inferred from `SinkFanout::from_resolved`.
@@ -95,7 +95,7 @@ fn make_test_fanout(tx: mpsc::Sender<crate::alert_task::AlertBatch>) -> Arc<Sink
 }
 
 /// Extract a `__wfu_*` field's string form from a sink `DataRecord`.
-fn field_str(record: &wp_model_core::model::DataRecord, name: &str) -> String {
+pub fn field_str(record: &wp_model_core::model::DataRecord, name: &str) -> String {
     record
         .field(name)
         .map(|f| f.get_value().to_string())
@@ -110,7 +110,7 @@ fn field_f64(record: &wp_model_core::model::DataRecord, name: &str) -> f64 {
         .unwrap_or(f64::NAN)
 }
 
-fn empty_tracked_plain_fields() -> HashSet<String> {
+pub fn empty_tracked_plain_fields() -> HashSet<String> {
     HashSet::new()
 }
 
@@ -194,7 +194,7 @@ fn scored_source_schema() -> SchemaRef {
     ]))
 }
 
-fn test_window_config(max_bytes: usize) -> WindowConfig {
+pub fn test_window_config(max_bytes: usize) -> WindowConfig {
     WindowConfig {
         name: "auth_events".into(),
         mode: DistMode::Local,
@@ -381,6 +381,7 @@ fn make_task_inner(
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("fail".into(), "sip".into())),
@@ -553,6 +554,7 @@ fn make_pipeline_stage_task_opts(
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "pipeline".into(),
             entity_id_expr: Expr::Field(FieldRef::Simple("sip".into())),
@@ -657,6 +659,7 @@ fn make_each_task() -> (
             }),
         }),
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
@@ -765,6 +768,7 @@ fn make_filtered_match_task() -> (
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("fail".into(), "sip".into())),
@@ -888,6 +892,7 @@ fn make_filtered_close_task() -> (
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("fail".into(), "sip".into())),
@@ -985,6 +990,7 @@ fn make_filtered_each_task() -> (
             filter: None,
         }),
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
@@ -1084,6 +1090,7 @@ fn make_intermediate_each_task() -> (
             filter: None,
         }),
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
@@ -1208,6 +1215,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
             filter: None,
         }),
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
@@ -1317,6 +1325,7 @@ fn make_intermediate_score_tasks() -> (
             filter: None,
         }),
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
@@ -1432,6 +1441,7 @@ fn make_intermediate_score_tasks() -> (
         match_plan: downstream_match.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("x".into(), "sip".into())),
@@ -1576,6 +1586,7 @@ fn make_intermediate_score_band_tasks() -> (
             filter: None,
         }),
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
@@ -1711,6 +1722,7 @@ fn make_intermediate_score_band_tasks() -> (
         match_plan: downstream_match.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("x".into(), "sip".into())),
@@ -1917,6 +1929,7 @@ fn make_filtered_bind_alias_match_task() -> (
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("x".into(), "sip".into())),
@@ -2077,6 +2090,7 @@ fn make_window_has_match_task() -> (
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("fail".into(), "sip".into())),
@@ -2850,6 +2864,7 @@ fn make_sharded_match_tasks(
             match_plan: match_plan.clone(),
             each_plan: None,
             joins: vec![],
+            r#where: None,
             entity_plan: EntityPlan {
                 entity_type: "ip".into(),
                 entity_id_expr: Expr::Field(FieldRef::Qualified("x".into(), "sip".into())),
@@ -3487,6 +3502,7 @@ async fn port_scan_rule_triggers_close_alert() {
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("c".into(), "sip".into())),
@@ -3803,6 +3819,7 @@ fn make_conv_sink_task() -> (
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Qualified("fail".into(), "sip".into())),
@@ -3977,6 +3994,7 @@ async fn conv_stage_emits_sealed_close_to_sink() {
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Simple("sip".into())),
@@ -4108,6 +4126,7 @@ fn conv_stage_test_executor() -> RuleExecutor {
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "ip".into(),
             entity_id_expr: Expr::Field(FieldRef::Simple("sip".into())),

@@ -163,6 +163,10 @@ impl RuleExecutor {
         );
         ctx = annotate_close_step_stages(ctx, close.event_step_data.len());
         execute_joins(&self.plan.joins, &mut ctx, windows, close.last_event_nanos);
+        // Post-join `where`: strict — false/None suppresses the output.
+        if !self.where_ok(&ctx) {
+            return Ok(None);
+        }
         if let Some(t) = _t_ctx {
             prof.add(1, t);
         }

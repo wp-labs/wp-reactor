@@ -9,6 +9,7 @@ use crate::parse_utils::{ident, kw, quoted_string, ws_skip};
 use super::clauses;
 use super::conv_p;
 use super::events;
+use super::expr;
 use super::match_p;
 use super::pattern_p;
 
@@ -63,18 +64,32 @@ pub(super) fn rule_decl_with_patterns(
     // 2) stage chain: stage {|> stage} with implicit _in between stages.
     ws_skip.parse_next(input)?;
     let saved = *input;
-    let (match_clause, each_clause, score, joins, pipeline_stages, pattern_origin) =
+    let (match_clause, each_clause, score, joins, pipeline_stages, pattern_origin, r#where) =
         match pattern_invocation(input, patterns) {
             Ok((match_clause, score, pattern_origin)) => {
                 ws_skip.parse_next(input)?;
                 let joins: Vec<JoinClause> = repeat(0.., clauses::join_clause).parse_next(input)?;
                 ws_skip.parse_next(input)?;
+                // Patterns are template expansions; v1 forbids `where` on them.
+                if opt(kw("where")).parse_next(input)?.is_some() {
+                    return Err(winnow::error::ErrMode::Cut(
+                        winnow::error::ContextError::new(),
+                    ));
+                }
                 if opt(literal("|>")).parse_next(input)?.is_some() {
                     return Err(winnow::error::ErrMode::Cut(
                         winnow::error::ContextError::new(),
                     ));
                 }
-                (match_clause, None, score, joins, Vec::new(), pattern_origin)
+                (
+                    match_clause,
+                    None,
+                    score,
+                    joins,
+                    Vec::new(),
+                    pattern_origin,
+                    None,
+                )
             }
             Err(winnow::error::ErrMode::Backtrack(_)) => {
                 *input = saved;
@@ -93,6 +108,13 @@ pub(super) fn rule_decl_with_patterns(
 
                     // Non-final pipeline stage must not carry score.
                     if parsed_stage.score.is_some() {
+                        return Err(winnow::error::ErrMode::Cut(
+                            winnow::error::ContextError::new(),
+                        ));
+                    }
+                    // Non-final pipeline stage must not carry `where` (v1: the
+                    // post-join filter is supported on the final stage only).
+                    if parsed_stage.r#where.is_some() {
                         return Err(winnow::error::ErrMode::Cut(
                             winnow::error::ContextError::new(),
                         ));
@@ -128,6 +150,7 @@ pub(super) fn rule_decl_with_patterns(
                     parsed_stage.joins,
                     pipeline_stages,
                     None,
+                    parsed_stage.r#where,
                 )
             }
             Err(e) => return Err(e),
@@ -173,6 +196,7 @@ pub(super) fn rule_decl_with_patterns(
         each_clause,
         score,
         joins,
+        r#where,
         pipeline_stages,
         entity,
         yield_clause,
@@ -188,11 +212,12 @@ struct ParsedStage {
     each_clause: Option<EachClause>,
     score: Option<ScoreExpr>,
     joins: Vec<JoinClause>,
+    r#where: Option<Expr>,
 }
 
 /// Parse one stage:
-/// `match<...> { ... } [-> score(...)] { join ... }*`
-/// or `on each alias [where expr] [-> score(...)] { join ... }*`
+/// `match<...> { ... } [-> score(...)] { join ... }* [where expr]`
+/// or `on each alias [where expr] [-> score(...)] { join ... }* [where expr]`
 fn stage_clause(input: &mut &str) -> ModalResult<ParsedStage> {
     let saved = *input;
     let (match_clause, each_clause) = match match_p::each_clause_only.parse_next(input) {
@@ -215,11 +240,24 @@ fn stage_clause(input: &mut &str) -> ModalResult<ParsedStage> {
     ws_skip.parse_next(input)?;
     let joins: Vec<JoinClause> = repeat(0.., clauses::join_clause).parse_next(input)?;
 
+    // `where <expr>` — post-join filter (parsed after joins so the syntax
+    // reads `... -> score(...) join ... [join ...] where <expr>`); execution
+    // is always join-then-where. `where` is a keyword shared with `on each` /
+    // conv, so this is unambiguous against `entity` / `join`.
+    ws_skip.parse_next(input)?;
+    let r#where = if opt(kw("where")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        Some(cut_err(expr::parse_expr).parse_next(input)?)
+    } else {
+        None
+    };
+
     Ok(ParsedStage {
         match_clause,
         each_clause,
         score,
         joins,
+        r#where,
     })
 }
 

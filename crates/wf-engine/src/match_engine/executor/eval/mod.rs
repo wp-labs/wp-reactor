@@ -290,12 +290,16 @@ pub(super) fn eval_expr_with_l3(
                 || args.iter().any(contains_l3_func)
                 || args.iter().any(contains_aggregate_func)
                 || args.iter().any(contains_eval_time_func)
+                || args.iter().any(contains_stat_selector)
             {
                 // `external()` is implemented only in `eval_builtin_func_with_l3`
                 // (it dispatches to the global ExternalCallHandler / wp_knowledge
                 // facade). Route it here even when its args are plain literals /
                 // fields, otherwise `on each where external(...)` filters silently
                 // evaluate to None and never query the backend.
+                // 含 stat.* 参数时同样必须走 L3 路径：fmt("{}", stat.value(final(x)))
+                // 等包装函数若回退到 match_engine 的 eval（无 stat 支持），stat 求值
+                // 为 None 使整个表达式返回 None（q15/q16/q17 统计输出为空）。
                 return eval_builtin_func_with_l3(name, args, ctx, score);
             }
             if args.iter().any(contains_system_var) {
@@ -438,6 +442,40 @@ fn contains_eval_time_func(expr: &wf_lang::ast::Expr) -> bool {
             contains_eval_time_func(cond)
                 || contains_eval_time_func(then_expr)
                 || contains_eval_time_func(else_expr)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `expr` contains a `stat.count/stat.value` selector call.
+///
+/// Wrapper functions like `fmt("{}", stat.value(final(x)))` must stay on the
+/// L3 eval path when any argument references stat selectors — the plain
+/// match-engine eval has no stat support and would evaluate them to `None`,
+/// making the whole expression `None` (q15/q16/q17 close-path stats output).
+fn contains_stat_selector(expr: &wf_lang::ast::Expr) -> bool {
+    use wf_lang::ast::Expr;
+    match expr {
+        Expr::FuncCall {
+            qualifier, args, ..
+        } => qualifier.as_deref() == Some("stat") || args.iter().any(contains_stat_selector),
+        Expr::BinOp { left, right, .. } => {
+            contains_stat_selector(left) || contains_stat_selector(right)
+        }
+        Expr::Neg(inner) => contains_stat_selector(inner),
+        Expr::Object(items) => items.iter().any(|item| contains_stat_selector(&item.value)),
+        Expr::Array(items) => items.iter().any(contains_stat_selector),
+        Expr::InList { expr, list, .. } => {
+            contains_stat_selector(expr) || list.iter().any(contains_stat_selector)
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            contains_stat_selector(cond)
+                || contains_stat_selector(then_expr)
+                || contains_stat_selector(else_expr)
         }
         _ => false,
     }

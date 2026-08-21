@@ -130,6 +130,7 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
         match_plan,
         each_plan: rule.each_clause.as_ref().map(compile_each),
         joins,
+        r#where: rule.r#where.clone(),
         entity_plan,
         yield_plan,
         score_plan,
@@ -238,6 +239,7 @@ fn compile_pipeline_rule(
             match_plan,
             each_plan: None,
             joins: stage_joins,
+            r#where: None, // `where` on pipeline stages rejected at parse time (v1)
             entity_plan,
             yield_plan,
             score_plan,

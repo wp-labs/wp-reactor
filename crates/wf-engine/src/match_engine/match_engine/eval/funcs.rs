@@ -87,6 +87,25 @@ pub(super) fn eval_func_call(
     baselines: &mut EngineHashMap<String, RollingStats>,
 ) -> Option<Value> {
     match name {
+        "count_char" => {
+            // Flink q14 UDF 同款：count_char(text, ch) = ch 在 text 中的出现次数。
+            if args.len() != 2 {
+                return None;
+            }
+            let text = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let needle = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            if needle.is_empty() {
+                return Some(Value::Number(0.0));
+            }
+            let ch = needle.chars().next().unwrap();
+            Some(Value::Number(text.chars().filter(|&c| c == ch).count() as f64))
+        }
         "contains" => {
             if args.len() != 2 {
                 return None;

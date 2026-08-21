@@ -5,6 +5,8 @@ mod window_lookup;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod where_integration_tests;
 
 use std::pin::Pin;
 use std::sync::Arc;

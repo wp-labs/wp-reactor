@@ -390,6 +390,7 @@ fn q12_like_plan() -> wf_lang::plan::RulePlan {
         ),
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: "digit".to_string(),
             entity_id_expr: Expr::Field(FieldRef::Simple("bidder".to_string())),

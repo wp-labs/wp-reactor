@@ -180,6 +180,7 @@ pub fn simple_rule_plan(
         match_plan,
         each_plan: None,
         joins: vec![],
+        r#where: None,
         entity_plan: EntityPlan {
             entity_type: entity_type.to_string(),
             entity_id_expr,

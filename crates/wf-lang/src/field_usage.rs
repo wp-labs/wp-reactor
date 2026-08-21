@@ -158,6 +158,13 @@ pub fn compute_window_field_usage(plans: &[RulePlan]) -> WindowFieldUsage {
         for field in &plan.yield_plan.fields {
             collect_expr_fields(&field.value, &mut global);
         }
+        // Post-join `where` filter reads joined fields from the eval context
+        // (e.g. `person_events.state`) — the join target window must keep them
+        // materialized or the enrichment is empty and the strict where
+        // suppresses every output (q3 state filter regression).
+        if let Some(w) = &plan.r#where {
+            collect_expr_fields(w, &mut global);
+        }
 
         // Join conditions reference fields on both sides.
         for join in &plan.joins {
@@ -289,6 +296,7 @@ mod tests {
             match_plan,
             each_plan: None,
             joins: Vec::new(),
+            r#where: None,
             entity_plan: crate::plan::EntityPlan {
                 entity_type: String::new(),
                 entity_id_expr: Expr::Bool(false),
@@ -305,6 +313,47 @@ mod tests {
             conv_plan: None,
             limits_plan: None,
         }
+    }
+
+    #[test]
+    fn where_filter_fields_are_collected_for_join_target_materialization() {
+        // Regression: the post-join `where` reads joined fields from the eval
+        // context (e.g. `person_events.state`); the join target window must
+        // keep them materialized or the enrichment is empty and the strict
+        // where suppresses every output (q3 state filter regression).
+        let mut rule = make_rule(
+            Vec::new(),
+            MatchPlan {
+                keys: vec![],
+                key_map: None,
+                key_join: None,
+                window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
+                event_steps: vec![],
+                close_steps: vec![],
+                close_mode: crate::ast::CloseMode::Or,
+                tracked_bind_aliases: std::collections::HashSet::new(),
+                tracked_bind_fields: std::collections::HashMap::new(),
+                tracked_plain_fields: std::collections::HashSet::new(),
+                match_mode: crate::ast::MatchMode::Seq,
+                seq: None,
+                accu: false,
+                needs_field_history: false,
+            },
+        );
+        rule.r#where = Some(Expr::InList {
+            expr: Box::new(Expr::Field(FieldRef::Qualified(
+                "person_events".to_string(),
+                "state".to_string(),
+            ))),
+            list: vec![Expr::StringLit("OR".into())],
+            negated: false,
+        });
+        let usage = compute_window_field_usage(&[rule]);
+        assert!(
+            usage.global_fields.contains("state"),
+            "where-referenced joined field `state` must be materialized, got {:?}",
+            usage.global_fields
+        );
     }
 
     #[test]
