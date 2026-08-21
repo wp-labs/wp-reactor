@@ -339,7 +339,7 @@ pub(super) fn apply_transforms(
             };
             if !bs
                 .distinct_set
-                .get_or_insert_with(|| Box::new(HashSet::new()))
+                .get_or_insert_with(|| Box::new(crate::match_engine::EngineHashSet::default()))
                 .insert(key)
             {
                 return false; // duplicate
