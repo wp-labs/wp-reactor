@@ -291,7 +291,92 @@ pub fn check_match_keys_clause(
                     ),
                 });
             }
+            // K1d: join-key index-key soundness. The join index key truncates
+            // f64 (`JoinKey::from_value` does `*n as i64` — the same "f64
+            // truncation would false-match" hazard the right-side scalar rule
+            // guards against). The driver-side condition field (e.g.
+            // `b.auction`) is not checked anywhere else, so a float driver
+            // field would silently hit truncated rows at runtime; the
+            // match-time join path re-checks with `values_equal`, the
+            // join-then-key path must too (compiler/checker keep the same
+            // invariant).
+            if let Some(cond) = join.conditions.first() {
+                if matches!(cond.right, FieldRef::Path { .. }) {
+                    // compiler's resolve_join_key returns None for a Path
+                    // right side (silently degrading to ordinary-key
+                    // extraction → every event skips). Keep the asymmetry
+                    // explicit: reject at compile time instead.
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "match key `{}` resolves to a join-side field; the join condition's \
+                             right side must be a plain field (nested paths unsupported)",
+                            field
+                        ),
+                    });
+                }
+                let left_ft = field_ref_field_type(&cond.left, scope);
+                if let Some(ft) = &left_ft
+                    && !is_scalar_key_type(ft)
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "match key `{}` resolves to a join-side field; the join condition's \
+                             left field type must be scalar (digit/chars/bool/time/ip/hex; float \
+                             excluded — f64 truncation would false-match truncated index rows)",
+                            field
+                        ),
+                    });
+                }
+                if let Some(right_ft) = field_ref_field_type(&cond.right, scope)
+                    && let Some(left_ft) = left_ft
+                {
+                    let lv = scope::field_type_to_val(left_ft);
+                    let rv = scope::field_type_to_val(right_ft);
+                    if !compatible(&lv, &rv) {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message: format!(
+                                "match key `{}` resolves to a join-side field; join condition \
+                                 type mismatch: left {:?} vs right {:?}",
+                                field, lv, rv
+                            ),
+                        });
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Resolve a field reference's declared type against the rule scope (driver
+/// aliases first for unqualified names, then join windows). Returns `None`
+/// when the field can't be resolved (missing alias/field) — the join
+/// condition checks report existence separately.
+fn field_ref_field_type<'a>(
+    fr: &'a FieldRef,
+    scope: &'a Scope<'_>,
+) -> Option<&'a crate::schema::FieldType> {
+    match fr {
+        FieldRef::Qualified(alias, field) | FieldRef::Bracketed(alias, field) => scope
+            .aliases
+            .get(alias.as_str())
+            .and_then(|s| s.fields.iter().find(|f| &f.name == field))
+            .map(|f| &f.field_type),
+        FieldRef::Simple(name) => scope
+            .aliases
+            .iter()
+            .filter(|(alias, _)| !scope.join_windows.contains(alias))
+            .find_map(|(_, s)| s.fields.iter().find(|f| f.name == *name))
+            .map(|f| &f.field_type),
+        FieldRef::Path { .. } => None,
     }
 }
 

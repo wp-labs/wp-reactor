@@ -334,11 +334,20 @@ impl CepStateMachine {
             let Some(left_val) = event.field_value(field_ref_name(&kjp.left_field)) else {
                 return step_outcome(StepResult::Accumulate, None); // missing join-left key → skip
             };
-            let Some(rows) = windows.join_lookup(&kjp.right_window, &kjp.right_key_field, &left_val)
+            let Some(rows) =
+                windows.join_lookup(&kjp.right_window, &kjp.right_key_field, &left_val)
             else {
                 return step_outcome(StepResult::Accumulate, None); // window not found → skip
             };
-            let Some(row) = rows.first() else {
+            // Match-time join re-verifies every candidate with `values_equal`
+            // after the index lookup (`find_matching_row`); join-then-key must
+            // do the same — the index key truncates f64
+            // (`JoinKey::from_value` `as i64`), so a fractional driver value
+            // would otherwise false-match a truncated row.
+            let Some(row) = rows.iter().find(|r| {
+                r.field_value(&kjp.right_key_field)
+                    .is_some_and(|rv| values_equal(&left_val, &rv))
+            }) else {
                 return step_outcome(StepResult::Accumulate, None); // join miss → skip
             };
             let Some(key_val) = row.field_value(&kjp.right_field) else {

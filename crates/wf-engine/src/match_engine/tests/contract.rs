@@ -493,3 +493,104 @@ test reset_five for reset_rule {
         "default reset fires on events 2 and 4 only"
     );
 }
+
+#[test]
+fn contract_join_key_rule_rejected_by_guard() {
+    // join-then-key rules can't be asserted by inline tests: the harness runs
+    // advance_at without a WindowLookup, so every event is skipped as a join
+    // miss — an `expect hits == 0` would pass vacuously. The guard must fail
+    // the test instead of green-lighting it.
+    let bid = WindowSchema {
+        name: "bid_events".to_string(),
+        streams: vec!["bid_stream".to_string()],
+        time_field: Some("event_time".to_string()),
+        over: Duration::from_secs(3600),
+        fields: vec![
+            FieldDef {
+                name: "auction".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "bidder".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "price".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "event_time".to_string(),
+                field_type: FieldType::Base(BaseType::Time),
+            },
+        ],
+    };
+    let auction = WindowSchema {
+        name: "auction_events".to_string(),
+        streams: vec!["auction_stream".to_string()],
+        time_field: Some("event_time".to_string()),
+        over: Duration::from_secs(3600),
+        fields: vec![
+            FieldDef {
+                name: "id".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "category".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "event_time".to_string(),
+                field_type: FieldType::Base(BaseType::Time),
+            },
+        ],
+    };
+    let out = WindowSchema {
+        name: "out".to_string(),
+        streams: vec![],
+        time_field: None,
+        over: Duration::from_secs(3600),
+        fields: vec![FieldDef {
+            name: "id".to_string(),
+            field_type: FieldType::Base(BaseType::Digit),
+        }],
+    };
+    let schemas = vec![bid, auction, out];
+    let source = r#"
+rule r {
+    events { b : bid_events }
+    match<category:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on b.auction == auction_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+
+test t for r {
+    input {
+        row(b, auction = 1, bidder = 2, price = 3);
+    }
+    expect {
+        hits == 0;
+    }
+}
+"#;
+    let wfl_file = wf_lang::parse_wfl(source).expect("parse should succeed");
+    let plans = wf_lang::compile_wfl(&wfl_file, &schemas).expect("compile should succeed");
+    let test = &wfl_file.tests[0];
+    let plan = plans
+        .iter()
+        .find(|p| p.name == test.rule_name)
+        .expect("rule present");
+    let result =
+        crate::match_engine::contract::run_test(test, plan, None).expect("run_test should succeed");
+    assert!(
+        !result.passed,
+        "join-key inline test must be rejected by the guard"
+    );
+    assert!(
+        result.failures[0].contains("join-then-key"),
+        "failure must explain the join-then-key guard, got: {:?}",
+        result.failures
+    );
+}

@@ -161,7 +161,9 @@ pub struct JoinKeyPlan {
     pub right_key_field: String,
     /// Right-row field read as the window key (e.g. `category`).
     pub right_field: String,
-    /// Logical key name (defaults to `right_field`).
+    /// RESERVED — logical key name (defaults to `right_field`). No consumer in
+    /// the engine today (v1 forbids key_mapping, so the logical name is always
+    /// the right field); kept for moju/explain compatibility. Do not rely on it.
     pub key_name: String,
 }
 
