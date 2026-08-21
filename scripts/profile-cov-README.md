@@ -46,19 +46,37 @@ BENCHES="close_bench" PKGS="wf-engine" scripts/profile-cov.sh
 
 ```bash
 RUNTIME_BENCH="q1 q4 q12" TOTAL=10m scripts/profile-runtime.sh
+# 或直接集成进 bench.sh（默认 10M 数据量）：
+PROFILE=1 ./bench.sh all replay 10m
 ```
 
 流程：插桩构建（隔离 CARGO_TARGET_DIR）→ `LLVM_PROFILE_FILE` 跑真实 bench
 （bench.sh 透传）→ `llvm-profdata merge` → `llvm-cov export` → 行级计数报告。
-产物：`target/profile-runtime/{runtime.json, report.txt}`。
+产物：`data/profile/{runtime.profdata, runtime.json}`（bench.sh PROFILE 模式）或
+`target/profile-runtime/`（profile-runtime.sh）。
 
-首跑对比（q4/q12 replay 10m，微基准 close_bench 完全看不到这些热点）：
+## 闭环：真实覆盖 vs 微基准 vs 指标预期
 
-| 真实运行热点 | 计数 | 说明 |
-|------|------|------|
-| `event_bridge.rs:22-34`（batch_to_events） | 2620 万次 | 事件物化路径 |
-| `window/buffer/mod.rs:728-730` | 2000 万次 | 窗口缓冲（q4 join 路径） |
-| `executor/close_exec.rs` | 覆盖 571 行 | fixed+close 执行器 |
+三件套形成性能治理闭环：
+
+```bash
+# 1. 真实运行覆盖（插桩跑批，默认 10M）
+PROFILE=1 ./bench.sh all replay 10m        # → data/profile/runtime.json
+
+# 2. 覆盖差集：真实运行 vs 微基准（需先跑 profile-cov.sh 生成 bench.json）
+scripts/compare-profile.sh                  # → 差集 = 需补 test bench 的路径
+
+# 3. 指标偏离：bench 结果 vs VVR/OSS 预期
+wf-examples/performance/nexmark_pk/scripts/compare-metrics.sh
+# → < 0.5×VVR 标 ⚠（优化候选）；注意插桩跑批 EPS 含 2-5× 开销，
+#   指标对比须用正常二进制重跑
+```
+
+首跑差集结论（q1/q4/q12 真实运行 vs close_bench 微基准）：
+- A. 真实执行、微基准未覆盖 5370 行——大头是 wf-lang/wf-config 编译/校验路径
+  （daemon 启动真实编译 wfl/wfs，微基准不经过）→ 补编译类 test bench
+- B. 微基准执行、真实未触发 905 行——close_bench 覆盖但 q1/q4 未触发的
+  match_engine 分支（each_exec 182 行、columnar 111 行等）；扩大 query 集后收敛
 
 > 注意：插桩构建需 `-Cdebuginfo=1`（llvm-cov 需要行映射）；两次跑批间清理
 > profraw；`profile-generate`（PGO）不生成行级映射，llvm-cov 读不了——
