@@ -112,7 +112,10 @@ impl Evictor {
             memory_pressure: false,
         };
 
-        // Phase 1: time eviction (event-time based, no consumption floor)
+        // Phase 1: time eviction — event-time based, gated on the pull
+        // consumption floor so a lagging rule task never loses unread batches
+        // (cursor gap). With no pull consumers (push mode) the floor is
+        // u64::MAX and every expired batch is dropped, as before.
         let names: Vec<String> = registry.window_names();
 
         for name in &names {
@@ -124,7 +127,11 @@ impl Evictor {
             // so a wall-clock cutoff would treat every batch as expired on
             // every sweep, high-frequency-evicting all batches and starving
             // the actor's append write lock (the q5 pull-freeze).
-            win.evict_expired(win.watermark_nanos());
+            let floor = registry
+                .progress(name)
+                .map(|p| p.min_acked())
+                .unwrap_or(u64::MAX);
+            win.evict_expired_acked(win.watermark_nanos(), floor);
             let evicted = before - win.batch_count();
             report.batches_time_evicted += evicted;
             if evicted > 0 {
@@ -819,18 +826,17 @@ mod tests {
         assert_eq!(report.batches_memory_evicted, 0);
     }
 
-    // -- 8. evictor_time_eviction_ignores_consumption_floor -------------------
+    // -- 8. evictor_time_eviction_respects_consumption_floor ------------------
 
-    /// Phase 1 time eviction is purely event-time based and **ignores** the
-    /// consumption floor: a slow shard that has not yet acked its tail will see
-    /// those batches evicted once they expire (and observe a pull gap on its
-    /// next read), rather than pinning the whole window's eviction.
-    ///
-    /// This is the deliberate trade-off: one slow rule must not drag the
-    /// whole system down by holding every window's eviction floor at its own
-    /// lagging cursor.
+    /// Phase 1 time eviction is event-time based and **gated on the pull
+    /// consumption floor**: a slow shard that has not yet acked its tail keeps
+    /// those (expired) batches in the log — they are dropped only once every
+    /// consumer has acked past them (then the memory-pressure phase reclaims
+    /// them). This is the pull-mode counterpart of the q3 memory-floor fix:
+    /// a lagging rule task must never observe a cursor gap from the evictor
+    /// sweep.
     #[test]
-    fn evictor_time_eviction_ignores_consumption_floor() {
+    fn evictor_time_eviction_respects_consumption_floor() {
         let schema = test_schema();
         let reg = WindowRegistry::build(vec![WindowDef {
             params: WindowParams {
@@ -865,7 +871,8 @@ mod tests {
             .set_watermark_for_test(3_000_000_000);
 
         // Fast shard acked everything; slow shard still lags (only acked
-        // through seq 3). The lagging shard must NOT pin eviction.
+        // through seq 3 → min_acked = 4). Batches seq ≥ 4 are expired but
+        // unread — they must NOT be time-evicted.
         fast.store(n, Ordering::Release);
         slow.store(4, Ordering::Release);
 
@@ -875,8 +882,13 @@ mod tests {
         let win = reg.get_window("data").unwrap();
         assert_eq!(
             win.batch_count() as u64,
-            0,
-            "time eviction drops all expired batches regardless of the slow shard's ack floor"
+            n - 4,
+            "time eviction keeps the slow shard's unacked (expired) batches"
+        );
+        assert_eq!(
+            win.oldest_seq(),
+            Some(4),
+            "only seq < min_acked (4) may be time-evicted"
         );
     }
 

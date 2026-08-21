@@ -15,7 +15,28 @@ impl Window {
     /// pin every window's eviction and drag the whole engine down.
     ///
     /// No-op for windows without a time column or with `over == Duration::ZERO`.
+    ///
+    /// This unfettered variant is used when the window has no pull consumers
+    /// (push mode — the data was already broadcast before landing in the log);
+    /// pull windows use [`Self::evict_expired_acked`] so a lagging rule task
+    /// never loses unread batches.
     pub fn evict_expired(&self, now_nanos: i64) {
+        self.evict_expired_impl(now_nanos, u64::MAX)
+    }
+
+    /// Time eviction gated on the consumption floor: only front batches whose
+    /// `seq` is below `acked_floor` (every registered pull consumer has already
+    /// read them) are dropped, even when their event time is expired. A
+    /// lagging rule task therefore never observes a cursor gap from the
+    /// time-eviction sweep; its unread expired batches stay until it catches
+    /// up (the memory-pressure phase then reclaims them once acked). With no
+    /// pull consumers the floor is `u64::MAX` and behaviour matches
+    /// [`Self::evict_expired`] exactly.
+    pub fn evict_expired_acked(&self, now_nanos: i64, acked_floor: u64) {
+        self.evict_expired_impl(now_nanos, acked_floor)
+    }
+
+    fn evict_expired_impl(&self, now_nanos: i64, acked_floor: u64) {
         if self.time_col_index.is_none() || self.over == Duration::ZERO {
             return;
         }
@@ -34,7 +55,7 @@ impl Window {
                     let Some((_, tb)) = log.first_key_value() else {
                         break;
                     };
-                    tb.event_time_range.1 < cutoff
+                    tb.event_time_range.1 < cutoff && tb.seq < acked_floor
                 };
                 if !removable {
                     break;
