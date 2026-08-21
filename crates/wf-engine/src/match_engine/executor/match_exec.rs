@@ -1,10 +1,16 @@
 use std::sync::Arc;
 
+use smol_str::SmolStr;
+use wf_lang::ast::Expr;
+
 use crate::alert::{AlertOrigin, OutputRecord};
-use crate::error::{CoreReason, CoreResult};
-use crate::match_engine::match_engine::{Event, MatchedContext, WindowLookup};
+use crate::error::CoreResult;
+use crate::match_engine::match_engine::{
+    Event, MatchedContext, Value, WindowLookup, eval_field_value, value_to_string,
+};
 
 use super::RuleExecutor;
+use super::YieldKind;
 use super::alert::{build_summary, build_wfx_id, format_nanos_utc, now_nanos};
 use super::context::{build_eval_context, execute_joins};
 use super::eval::{
@@ -14,6 +20,17 @@ use super::eval::{
 impl RuleExecutor {
     /// Produce an [`OutputRecord`] from an on-event match (L1 — no joins).
     pub fn execute_match(&self, matched: &MatchedContext) -> CoreResult<OutputRecord> {
+        self.execute_match_at(matched, now_nanos())
+    }
+
+    /// [`execute_match`] with an explicit emit timestamp (the runtime's
+    /// batch-level cached wall clock), so every record in a batch shares one
+    /// `emit_time` without a per-record `SystemTime::now()` syscall.
+    pub fn execute_match_at(
+        &self,
+        matched: &MatchedContext,
+        emit_time_nanos: i64,
+    ) -> CoreResult<OutputRecord> {
         let step_plans: Vec<_> = self.plan.match_plan.event_steps.iter().collect();
         let ctx = build_eval_context(
             &self.plan.match_plan.keys,
@@ -23,7 +40,7 @@ impl RuleExecutor {
             &step_plans,
             matched.trigger_event.as_deref(),
         );
-        self.build_match_alert(matched, &ctx)
+        self.build_match_alert(matched, &ctx, emit_time_nanos)
     }
 
     /// Produce an [`OutputRecord`] from an on-event match with join support.
@@ -34,6 +51,16 @@ impl RuleExecutor {
         &self,
         matched: &MatchedContext,
         windows: &dyn WindowLookup,
+    ) -> CoreResult<Option<OutputRecord>> {
+        self.execute_match_with_joins_at(matched, windows, now_nanos())
+    }
+
+    /// [`execute_match_with_joins`] with an explicit emit timestamp.
+    pub fn execute_match_with_joins_at(
+        &self,
+        matched: &MatchedContext,
+        windows: &dyn WindowLookup,
+        emit_time_nanos: i64,
     ) -> CoreResult<Option<OutputRecord>> {
         let step_plans: Vec<_> = self.plan.match_plan.event_steps.iter().collect();
         let mut ctx = build_eval_context(
@@ -52,17 +79,34 @@ impl RuleExecutor {
         ) {
             return Ok(None);
         }
-        self.build_match_alert(matched, &ctx).map(Some)
+        self.build_match_alert(matched, &ctx, emit_time_nanos)
+            .map(Some)
     }
 
     /// Internal: build the OutputRecord from an already-constructed eval context.
-    fn build_match_alert(&self, matched: &MatchedContext, ctx: &Event) -> CoreResult<OutputRecord> {
-        let score = eval_score(&self.plan.score_plan.expr, ctx)?;
-        let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
+    pub(crate) fn build_match_alert(
+        &self,
+        matched: &MatchedContext,
+        ctx: &Event,
+        emit_time_nanos: i64,
+    ) -> CoreResult<OutputRecord> {
+        let score = match self.output_static().score_const {
+            Some(s) => s,
+            None => eval_score(&self.plan.score_plan.expr, ctx)?,
+        };
+        // Field-typed entity (e.g. `digit(b.auction)`) takes the direct flat
+        // lookup — skipping the interpreter's per-record eval-time scope. A
+        // missing field degrades to an empty string, byte-identical to the
+        // interpreter wrapper (`eval_yield_expr_with_meta` substitutes `""`).
+        let entity_id = match &self.plan.entity_plan.entity_id_expr {
+            Expr::Field(fr) => eval_field_value(&ctx.fields, fr)
+                .map(|v| value_to_string(&v))
+                .unwrap_or_default(),
+            _ => eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?,
+        };
         let origin = AlertOrigin::Event;
         let fired_at = format_nanos_utc(matched.event_time_nanos);
-        let emit_time_nanos = now_nanos();
-        let emit_time = Arc::from(format_nanos_utc(emit_time_nanos));
+        let emit_time = self.cached_emit_time(emit_time_nanos);
         let wfx_id = build_wfx_id(
             &self.plan.name,
             &matched.scope_key,
@@ -96,21 +140,31 @@ impl RuleExecutor {
                 emit_time_nanos: Some(emit_time_nanos),
                 time_format: Some(self.output_config().time_format.as_str()),
             };
-            // Plan fields and precomputed specs are index-aligned (see
-            // `OutputStatic`) — no per-field name clone or type-map lookup.
+            // Plan fields, precomputed specs, and precomputed yield kinds are
+            // all index-aligned (see `OutputStatic`) — no per-field name clone,
+            // type-map lookup, or expression re-classification on the hot path.
             self.plan
                 .yield_plan
                 .fields
                 .iter()
                 .zip(self.output_static().yield_specs.iter())
-                .map(|(field, (name, field_type))| {
-                    let Some(value) = eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
-                    else {
-                        return Err(orion_error::StructError::from(CoreReason::RuleExec)
-                            .with_detail(format!(
-                                "match yield field {:?} expression evaluated to None",
-                                field.name
-                            )));
+                .zip(self.output_static().yield_kinds.iter())
+                .map(|((field, (name, field_type)), kind)| {
+                    let value = match kind {
+                        YieldKind::Lit(v) => v.clone(),
+                        YieldKind::Field => {
+                            let Expr::Field(fr) = &field.value else {
+                                unreachable!("YieldKind::Field implies an Expr::Field value")
+                            };
+                            // Missing field falls back to an empty string,
+                            // exactly like the interpreter wrapper.
+                            eval_field_value(&ctx.fields, fr)
+                                .unwrap_or_else(|| Value::Str(SmolStr::default()))
+                        }
+                        YieldKind::General => {
+                            eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
+                                .expect("eval_yield_expr_with_meta never returns None")
+                        }
                     };
                     let Some(value) = RuleExecutor::coerce_yield_field_value_with(
                         name,

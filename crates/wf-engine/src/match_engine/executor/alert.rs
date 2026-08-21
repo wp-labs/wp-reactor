@@ -2,7 +2,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wf_lang::ast::FieldRef;
 
 use crate::alert::AlertOrigin;
-use crate::match_engine::match_engine::{StepData, Value, field_ref_name, value_to_string};
+use crate::match_engine::match_engine::{
+    StepData, Value, field_ref_name, push_i64_exact_decimal, value_to_string,
+};
 
 /// Format nanoseconds since epoch as ISO 8601 UTC string.
 ///
@@ -220,34 +222,6 @@ impl EachWfxPrefix {
     }
 }
 
-/// Append `v` as a plain decimal integer — the exact rendering of
-/// `(v as f64).to_string()` when `|v| <= 2^53` (the fast path in
-/// [`write_flat_column_scratch`]), without the `fmt` machinery (~3-5× cheaper
-/// than `write!(scratch, "{v}")` on this hot path).
-fn write_i64_exact_decimal(scratch: &mut String, mut v: i64) {
-    if v == i64::MIN {
-        scratch.push_str("-9223372036854775808");
-        return;
-    }
-    if v < 0 {
-        scratch.push('-');
-        v = -v;
-    }
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    // SAFETY: `buf[i..]` contains only ASCII digits ('0'..='9').
-    let digits = std::str::from_utf8(&buf[i..]).expect("decimal digits are ASCII");
-    scratch.push_str(digits);
-}
-
 /// Append `v` exactly as `value_to_string(&Value::Number(v as f64))` renders
 /// it: `|v| <= 2^53` takes the itoa fast path (the exact f64 Display of such
 /// an integer is the plain decimal — no ".0", no exponent), larger magnitudes
@@ -258,7 +232,7 @@ fn write_i64_exact_decimal(scratch: &mut String, mut v: i64) {
 pub(crate) fn write_int64_value(scratch: &mut String, v: i64) {
     use std::fmt::Write;
     if v.unsigned_abs() <= (1i64 << 53) as u64 {
-        write_i64_exact_decimal(scratch, v);
+        push_i64_exact_decimal(scratch, v);
     } else {
         let _ = write!(scratch, "{}", v as f64);
     }
@@ -275,6 +249,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Build a human-readable summary.
+///
+/// Writes directly into a single `String` (no intermediate `Vec<String>` or
+/// `join`) — byte-identical to the previous `format!`+`join` implementation,
+/// but one allocation per alert instead of one per part plus a final join.
 pub(super) fn build_summary(
     rule_name: &str,
     keys: &[FieldRef],
@@ -282,32 +260,38 @@ pub(super) fn build_summary(
     step_data: &[StepData],
     origin: &AlertOrigin,
 ) -> String {
-    let mut parts = Vec::new();
+    use std::fmt::Write as _;
 
-    parts.push(format!("rule={}", rule_name));
+    // Estimate capacity so the common case (a few keys / steps) never reallocates.
+    let mut out = String::with_capacity(64 + scope_key.len() * 12 + step_data.len() * 16);
+    let _ = write!(out, "rule={}; ", rule_name);
 
     if scope_key.is_empty() {
-        parts.push("scope=global".to_string());
+        out.push_str("scope=global; ");
     } else {
-        let key_strs: Vec<String> = keys
-            .iter()
-            .zip(scope_key.iter())
-            .map(|(fr, val)| format!("{}={}", field_ref_name(fr), value_to_string(val)))
-            .collect();
-        parts.push(format!("scope=[{}]", key_strs.join(", ")));
+        out.push_str("scope=[");
+        for (i, (fr, val)) in keys.iter().zip(scope_key.iter()).enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{}={}", field_ref_name(fr), value_to_string(val));
+        }
+        out.push_str("]; ");
     }
 
     for (i, sd) in step_data.iter().enumerate() {
-        let label_part = match &sd.label {
-            Some(l) => format!("{}={:.1}", l, sd.measure_value),
-            None => format!("step{}={:.1}", i, sd.measure_value),
-        };
-        parts.push(label_part);
+        match &sd.label {
+            Some(label) => {
+                let _ = write!(out, "{}={:.1}; ", label, sd.measure_value);
+            }
+            None => {
+                let _ = write!(out, "step{}={:.1}; ", i, sd.measure_value);
+            }
+        }
     }
 
-    parts.push(format!("origin={}", origin.as_str()));
-
-    parts.join("; ")
+    let _ = write!(out, "origin={}", origin.as_str());
+    out
 }
 
 #[cfg(test)]
@@ -437,5 +421,88 @@ mod format_tests {
             nanos += 1;
         }
         let _ = nanos;
+    }
+
+    #[test]
+    fn build_summary_matches_reference() {
+        use crate::match_engine::match_engine::EngineHashMap;
+
+        // Reference: the previous `format!` + `Vec<String>` + `join` shape.
+        fn reference_summary(
+            rule_name: &str,
+            keys: &[FieldRef],
+            scope_key: &[Value],
+            step_data: &[StepData],
+            origin: &AlertOrigin,
+        ) -> String {
+            let mut parts = Vec::new();
+            parts.push(format!("rule={}", rule_name));
+            if scope_key.is_empty() {
+                parts.push("scope=global".to_string());
+            } else {
+                let key_strs: Vec<String> = keys
+                    .iter()
+                    .zip(scope_key.iter())
+                    .map(|(fr, val)| format!("{}={}", field_ref_name(fr), value_to_string(val)))
+                    .collect();
+                parts.push(format!("scope=[{}]", key_strs.join(", ")));
+            }
+            for (i, sd) in step_data.iter().enumerate() {
+                let label_part = match &sd.label {
+                    Some(l) => format!("{}={:.1}", l, sd.measure_value),
+                    None => format!("step{}={:.1}", i, sd.measure_value),
+                };
+                parts.push(label_part);
+            }
+            parts.push(format!("origin={}", origin.as_str()));
+            parts.join("; ")
+        }
+
+        fn step(measure_value: f64, label: Option<&str>) -> StepData {
+            StepData {
+                satisfied_branch_index: 0,
+                label: label.map(|s| s.to_string()),
+                measure_value,
+                event_first_time_nanos: None,
+                event_last_time_nanos: None,
+                collected_values: Vec::new(),
+                field_values: EngineHashMap::default(),
+            }
+        }
+
+        let keys = [FieldRef::Simple("auction".to_string())];
+        let scope = [Value::Number(421_762.0)];
+        let steps = [step(1.0, None), step(2.5, Some("count"))];
+
+        // Empty scope + empty steps.
+        assert_eq!(
+            build_summary("q22_asof_person", &[], &[], &[], &AlertOrigin::Event),
+            reference_summary("q22_asof_person", &[], &[], &[], &AlertOrigin::Event),
+        );
+        // Populated scope + labelled and unlabelled steps.
+        assert_eq!(
+            build_summary(
+                "q22_asof_person",
+                &keys,
+                &scope,
+                &steps,
+                &AlertOrigin::Event
+            ),
+            reference_summary(
+                "q22_asof_person",
+                &keys,
+                &scope,
+                &steps,
+                &AlertOrigin::Event
+            ),
+        );
+        // Close origin.
+        let origin = AlertOrigin::Close {
+            reason: crate::match_engine::CloseReason::Timeout,
+        };
+        assert_eq!(
+            build_summary("q22_asof_person", &keys, &scope, &steps, &origin),
+            reference_summary("q22_asof_person", &keys, &scope, &steps, &origin),
+        );
     }
 }

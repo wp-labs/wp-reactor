@@ -18,6 +18,7 @@ use crate::match_engine::match_engine::{
 };
 
 use super::RuleExecutor;
+use super::YieldKind;
 use super::alert::{
     EachWfxPrefix, build_each_wfx_id, build_each_wfx_id_reusing, format_nanos_utc, now_nanos,
     write_int64_value,
@@ -1130,16 +1131,6 @@ impl E1Profiler {
             );
         }
     }
-}
-
-/// Per-yield-field evaluation strategy for the batched on-each direct path.
-enum YieldKind {
-    /// Literal expression — value built once per batch, cloned per row.
-    Lit(Value),
-    /// `Expr::Field` — direct field lookup, skipping the interpreter.
-    Field,
-    /// Anything else — full interpreter evaluation with the per-row meta.
-    General,
 }
 
 /// The null / missing-column entity fallback on the columnar on-each path:

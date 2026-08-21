@@ -425,16 +425,63 @@ pub(crate) fn eval_field_value_src(src: &dyn FieldSource, fr: &FieldRef) -> Opti
     Some(value)
 }
 
+/// Append `v` as a plain decimal integer — byte-identical to
+/// `(v as f64).to_string()` when `|v| <= 2^53`, without the `fmt` machinery.
+/// Single source for the integer fast path shared by [`value_to_string`] and
+/// the columnar on-each path (`write_int64_value`).
+pub(crate) fn push_i64_exact_decimal(scratch: &mut String, mut v: i64) {
+    if v == i64::MIN {
+        scratch.push_str("-9223372036854775808");
+        return;
+    }
+    if v < 0 {
+        scratch.push('-');
+        v = -v;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    // SAFETY: `buf[i..]` contains only ASCII digits ('0'..='9').
+    let digits = std::str::from_utf8(&buf[i..]).expect("decimal digits are ASCII");
+    scratch.push_str(digits);
+}
+
 /// Deterministic shard index for a scope key (superseded by
 /// [`scope_key_shard_index`], which hashes the typed [`ScopeKey`] instead of a
 /// re-serialized string). Kept inline for reference / legacy tests.
 pub(crate) fn value_to_string(v: &Value) -> String {
     match v {
-        Value::Number(n) => n.to_string(),
+        Value::Number(n) => number_to_string(*n),
         Value::Str(s) => s.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Array(_) => "[array]".to_string(),
         Value::Object(_) => "[object]".to_string(),
+    }
+}
+
+/// `f64` → string with a plain-decimal fast path for integer-valued numbers
+/// within ±2^53 (the dominant case for scope keys / entity ids: `auction`,
+/// `bidder`, `id`, …). Byte-identical to `f64::to_string()` — such integers
+/// display without a `.0` or exponent, and non-integer / out-of-range / non-
+/// finite values fall through to std's shortest-representation Display.
+fn number_to_string(n: f64) -> String {
+    if n.is_finite() && n.fract() == 0.0 && n.abs() <= (1u64 << 53) as f64 {
+        if n == 0.0 && n.is_sign_negative() {
+            // `-0.0` displays as "-0", not "0".
+            return "-0".to_string();
+        }
+        let mut s = String::with_capacity(20);
+        push_i64_exact_decimal(&mut s, n as i64);
+        s
+    } else {
+        n.to_string()
     }
 }
 
@@ -723,5 +770,42 @@ mod tests {
             InstanceKey::fixed(&ScopeKey::Int(99), 1_000).scope_key_values(),
             vec![Value::Number(99.0)]
         );
+    }
+
+    #[test]
+    fn value_to_string_number_matches_f64_display() {
+        // The integer fast path in `number_to_string` must be byte-identical to
+        // `f64::to_string()` for every input: integers take the fast path,
+        // non-integer / out-of-range / non-finite values fall through to std's
+        // shortest-representation Display.
+        let cases: &[f64] = &[
+            -0.0,
+            0.0,
+            1.0,
+            -1.0,
+            7.5,
+            -7.5,
+            123.456,
+            (1i64 << 53) as f64,
+            -(1i64 << 53) as f64,
+            9_007_199_254_740_992.0, // 2^53 (fast-path boundary)
+            9_007_199_254_740_994.0, // 2^53 + 2 (exact, but > 2^53 → slow path)
+            1e20,
+            0.1,
+            1.0 / 3.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for &n in cases {
+            assert_eq!(
+                value_to_string(&Value::Number(n)),
+                n.to_string(),
+                "value_to_string mismatch for f64 {n:?}"
+            );
+        }
+        // Spot-check the fast path renders an integer-valued f64 as a plain
+        // decimal (no `.0` suffix), matching f64 Display.
+        assert_eq!(value_to_string(&Value::Number(421_762.0)), "421762");
     }
 }

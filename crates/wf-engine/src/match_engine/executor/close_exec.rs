@@ -1,12 +1,16 @@
 use std::sync::Arc;
 
-use wf_lang::ast::CloseMode;
+use smol_str::SmolStr;
+use wf_lang::ast::{CloseMode, Expr};
 
 use crate::alert::{AlertOrigin, OutputRecord};
-use crate::error::{CoreReason, CoreResult};
-use crate::match_engine::match_engine::{CloseOutput, Event, StepData, WindowLookup};
+use crate::error::CoreResult;
+use crate::match_engine::match_engine::{
+    CloseOutput, Event, StepData, Value, WindowLookup, eval_field_value, value_to_string,
+};
 
 use super::RuleExecutor;
+use super::YieldKind;
 use super::alert::{build_summary, build_wfx_id, format_nanos_utc, now_nanos};
 use super::context::{build_eval_context, execute_joins};
 use super::eval::{
@@ -80,8 +84,19 @@ impl RuleExecutor {
         all_step_data: &[StepData],
         ctx: &Event,
     ) -> CoreResult<Option<OutputRecord>> {
-        let score = eval_score(&self.plan.score_plan.expr, ctx)?;
-        let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
+        let score = match self.output_static().score_const {
+            Some(s) => s,
+            None => eval_score(&self.plan.score_plan.expr, ctx)?,
+        };
+        // Field-typed entity takes the direct flat lookup (see the match path);
+        // a missing field degrades to an empty string, byte-identical to the
+        // interpreter wrapper.
+        let entity_id = match &self.plan.entity_plan.entity_id_expr {
+            Expr::Field(fr) => eval_field_value(&ctx.fields, fr)
+                .map(|v| value_to_string(&v))
+                .unwrap_or_default(),
+            _ => eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?,
+        };
         let origin = AlertOrigin::Close {
             reason: close.close_reason,
         };
@@ -121,21 +136,29 @@ impl RuleExecutor {
                 emit_time_nanos: Some(emit_time_nanos),
                 time_format: Some(self.output_config().time_format.as_str()),
             };
-            // Plan fields and precomputed specs are index-aligned (see
-            // `OutputStatic`) — no per-field name clone or type-map lookup.
+            // Plan fields, precomputed specs, and precomputed yield kinds are
+            // all index-aligned (see `OutputStatic`) — no per-field name clone,
+            // type-map lookup, or expression re-classification on the hot path.
             self.plan
                 .yield_plan
                 .fields
                 .iter()
                 .zip(self.output_static().yield_specs.iter())
-                .map(|(field, (name, field_type))| {
-                    let Some(value) = eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
-                    else {
-                        return Err(orion_error::StructError::from(CoreReason::RuleExec)
-                            .with_detail(format!(
-                                "close yield field {:?} expression evaluated to None",
-                                field.name
-                            )));
+                .zip(self.output_static().yield_kinds.iter())
+                .map(|((field, (name, field_type)), kind)| {
+                    let value = match kind {
+                        YieldKind::Lit(v) => v.clone(),
+                        YieldKind::Field => {
+                            let Expr::Field(fr) = &field.value else {
+                                unreachable!("YieldKind::Field implies an Expr::Field value")
+                            };
+                            eval_field_value(&ctx.fields, fr)
+                                .unwrap_or_else(|| Value::Str(SmolStr::default()))
+                        }
+                        YieldKind::General => {
+                            eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
+                                .expect("eval_yield_expr_with_meta never returns None")
+                        }
                     };
                     let Some(value) = RuleExecutor::coerce_yield_field_value_with(
                         name,

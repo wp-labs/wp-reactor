@@ -3,6 +3,8 @@ mod alert;
 pub(crate) use alert::{EachWfxPrefix, format_nanos_utc};
 mod close_exec;
 mod context;
+#[cfg(test)]
+pub(crate) use context::{build_eval_context, execute_joins};
 mod each_exec;
 mod eval;
 mod match_exec;
@@ -30,6 +32,21 @@ use crate::time::normalize_epoch_timestamp_float_nanos;
 use arrow::array::BooleanArray;
 use arrow::record_batch::RecordBatch;
 
+/// Per-yield-field specialization, precomputed once at executor construction.
+///
+/// - `Lit`: a literal expression — its `Value` is built once and cloned per
+///   record (no interpreter dispatch).
+/// - `Field`: an `Expr::Field` — a direct flat field lookup, skipping the
+///   interpreter and its per-record eval-time scope.
+/// - `General`: anything else (system vars, `$wfu.*`, functions) — full
+///   interpreter evaluation with the per-record meta.
+#[derive(Clone)]
+pub(crate) enum YieldKind {
+    Lit(Value),
+    Field,
+    General,
+}
+
 /// Plan-level output constants, precomputed once at executor construction.
 ///
 /// These are identical for every event/match a rule produces. The hot path
@@ -48,6 +65,11 @@ pub(crate) struct OutputStatic {
     pub(crate) yield_specs: Arc<[(Arc<str>, Option<FieldType>)]>,
     /// Typed field list carried by every `OutputRecord` (plan constant).
     pub(crate) yield_field_types: Arc<[(Arc<str>, FieldType)]>,
+    /// Per-yield-field specialization, index-aligned with `yield_specs`.
+    pub(crate) yield_kinds: Arc<[YieldKind]>,
+    /// `Some(clamp(n))` when the score expression is a numeric literal — lets
+    /// the hot path skip `eval_score` for constant-score rules.
+    pub(crate) score_const: Option<f64>,
     /// `on each` constant summary — scope key and step data are always empty
     /// on that path, so the whole summary string is a plan constant.
     pub(crate) each_summary: Option<Arc<str>>,
@@ -180,6 +202,25 @@ impl RuleExecutor {
                 &AlertOrigin::Event,
             ))
         });
+        // Precompute per-field yield specialization (literal value / direct
+        // field lookup / full interpreter) and the constant score, so the
+        // per-record hot path never re-classifies expressions.
+        let yield_kinds: Vec<YieldKind> = plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| match &field.value {
+                Expr::Number(n) => YieldKind::Lit(Value::Number(*n)),
+                Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
+                Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
+                Expr::Field(_) => YieldKind::Field,
+                _ => YieldKind::General,
+            })
+            .collect();
+        let score_const = match &plan.score_plan.expr {
+            Expr::Number(n) => Some(n.clamp(0.0, 100.0)),
+            _ => None,
+        };
         Self {
             output_static: OutputStatic {
                 rule_name: Arc::from(plan.name.as_str()),
@@ -187,6 +228,8 @@ impl RuleExecutor {
                 yield_target: Arc::from(plan.yield_plan.target.as_str()),
                 yield_specs: Arc::from(yield_specs),
                 yield_field_types: Arc::from(typed_fields),
+                yield_kinds: Arc::from(yield_kinds),
+                score_const,
                 each_summary,
                 each_origin: Arc::from(AlertOrigin::Event.as_str()),
                 each_close_reason: Arc::from(""),

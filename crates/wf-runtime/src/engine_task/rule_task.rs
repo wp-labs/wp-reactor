@@ -1138,7 +1138,10 @@ impl RuleTask {
                         metrics.inc_rule_match(self.rule_name());
                     }
                     let _exec_start = Instant::now();
-                    match self.executor.execute_match_with_joins(&ctx, &lookup) {
+                    match self
+                        .executor
+                        .execute_match_with_joins_at(&ctx, &lookup, batch_emit_nanos)
+                    {
                         Ok(Some(record)) => {
                             self.exec_nanos += _exec_start.elapsed().as_nanos() as u64;
                             if debug_enabled {

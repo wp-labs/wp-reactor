@@ -16,7 +16,7 @@ use crate::match_engine::match_engine::{
 /// - Labels that collide with key names are silently skipped (keys take priority)
 /// - Adds `_step_{i}_values` fields with collected values for L3/aggregate functions
 /// - Adds `_step_{i}_measure` and `_step_{i}_label` fields for close-path aggregates
-pub(super) fn build_eval_context(
+pub(crate) fn build_eval_context(
     keys: &[FieldRef],
     scope_key: &[Value],
     step_data: &[StepData],
@@ -115,7 +115,7 @@ pub(super) fn build_eval_context(
 /// and as plain `field` (if not already present).
 /// Execute join plans. Returns `true` if the event should be kept,
 /// `false` if it should be dropped (anti join matched).
-pub(super) fn execute_joins(
+pub(crate) fn execute_joins(
     joins: &[JoinPlan],
     ctx: &mut Event,
     windows: &dyn WindowLookup,

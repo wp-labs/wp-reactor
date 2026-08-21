@@ -7,6 +7,7 @@ mod columnar_wiring;
 mod each_bench;
 mod guard_bench;
 mod helpers;
+mod match_bench;
 mod perf;
 mod seq_examples;
 mod seq_l2;
