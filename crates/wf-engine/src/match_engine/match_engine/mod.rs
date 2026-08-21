@@ -11,8 +11,8 @@ mod types;
 // Re-export public types
 pub use limits::SharedLimits;
 pub use types::{
-    BindData, CloseOutput, CloseReason, Event, FieldSource, JoinKey, MACHINE_ID, MatchedContext,
-    StepData, StepOutcome, StepProgress, StepResult, Value, WindowLookup,
+    AsofLookup, BindData, CloseOutput, CloseReason, Event, FieldSource, JoinKey, MACHINE_ID,
+    MatchedContext, StepData, StepOutcome, StepProgress, StepResult, Value, WindowLookup,
 };
 pub use types::{EngineHashMap, EngineHashSet};
 

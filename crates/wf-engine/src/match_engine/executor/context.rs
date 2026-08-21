@@ -5,7 +5,8 @@ use wf_lang::plan::{JoinCondPlan, JoinPlan, StepPlan};
 
 use crate::match_engine::JoinRow;
 use crate::match_engine::match_engine::{
-    BindData, EngineHashMap, Event, StepData, Value, WindowLookup, field_ref_name, values_equal,
+    AsofLookup, BindData, EngineHashMap, Event, StepData, Value, WindowLookup, field_ref_name,
+    values_equal,
 };
 
 /// Build a synthetic [`Event`] from match context for expression evaluation.
@@ -133,19 +134,51 @@ pub(super) fn execute_joins(
                 find_matching_row(&rows, &join.conds, ctx)
             }
             JoinMode::Asof { within } => {
-                // Prefer the timestamped hash index (O(1) key lookup); fall back
-                // to a full timestamped scan when the right window has no index
-                // or is watermarked. `find_asof_row` still applies every join
-                // condition plus the time-proximity filter, so results stay
-                // byte-identical to the previous scan-only path.
+                // Asof = "latest row ≤ event_time (and ≥ event_time - within)".
+                // Single-condition joins get an O(1) fast path through the
+                // index's per-key `max_ts`; multi-condition joins (and any
+                // window without an index / under a watermark) fall back to the
+                // full timestamped candidate scan. `find_asof_row` still applies
+                // every condition + the time-proximity filter, so both paths are
+                // byte-identical. A `Miss` short-circuits the scan: when the
+                // key's max timestamp is already older than the asof window,
+                // the scan would return `None` too, so we skip it entirely.
                 let Some((key_field, key_val)) = first_join_key(ctx, &join.conds) else {
                     continue;
                 };
-                let Some(rows) = windows.asof_candidates(&join.right_window, &key_field, &key_val)
-                else {
-                    continue;
-                };
-                find_asof_row(&rows, &join.conds, ctx, event_time_nanos, within.as_ref())
+                if join.conds.len() == 1 {
+                    match windows.asof_lookup_max(
+                        &join.right_window,
+                        &key_field,
+                        &key_val,
+                        event_time_nanos,
+                        within.as_ref(),
+                    ) {
+                        AsofLookup::Hit(row) => Some(row),
+                        AsofLookup::Miss => None,
+                        AsofLookup::Fallback => {
+                            let Some(rows) =
+                                windows.asof_candidates(&join.right_window, &key_field, &key_val)
+                            else {
+                                continue;
+                            };
+                            find_asof_row(
+                                &rows,
+                                &join.conds,
+                                ctx,
+                                event_time_nanos,
+                                within.as_ref(),
+                            )
+                        }
+                    }
+                } else {
+                    let Some(rows) =
+                        windows.asof_candidates(&join.right_window, &key_field, &key_val)
+                    else {
+                        continue;
+                    };
+                    find_asof_row(&rows, &join.conds, ctx, event_time_nanos, within.as_ref())
+                }
             }
             JoinMode::Anti => {
                 let Some((key_field, key_val)) = first_join_key(ctx, &join.conds) else {
@@ -243,6 +276,121 @@ fn row_matches_conds(row: &JoinRow, conds: &[JoinCondPlan], ctx: &Event) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execute_joins_asof_miss_keeps_event_without_enrichment() {
+        use std::collections::HashSet;
+
+        // A lookup that always reports `Miss` (the key's max timestamp is older
+        // than the asof lower bound). The event must be kept (join is optional)
+        // but not enriched with joined fields.
+        struct MissLookup;
+        impl WindowLookup for MissLookup {
+            fn snapshot_field_values(&self, _w: &str, _f: &str) -> Option<HashSet<String>> {
+                None
+            }
+            fn snapshot(&self, _w: &str) -> Option<Vec<JoinRow>> {
+                None
+            }
+            fn asof_lookup_max(
+                &self,
+                _w: &str,
+                _key_field: &str,
+                _key: &Value,
+                _event_time_nanos: i64,
+                _within: Option<&Duration>,
+            ) -> AsofLookup {
+                AsofLookup::Miss
+            }
+        }
+
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("bidder".into(), Value::Number(1.0));
+
+        let joins = vec![JoinPlan {
+            right_window: "person_events".to_string(),
+            mode: JoinMode::Asof {
+                within: Some(Duration::from_secs(300)),
+            },
+            conds: vec![JoinCondPlan {
+                left: FieldRef::Simple("bidder".to_string()),
+                right: FieldRef::Simple("id".to_string()),
+            }],
+        }];
+
+        let ok = execute_joins(&joins, &mut ctx, &MissLookup, 500_000_000_000);
+        assert!(ok, "an asof Miss must keep the event");
+        assert!(
+            !ctx.fields.contains_key("person_events.id"),
+            "an asof Miss must not enrich the joined fields"
+        );
+    }
+
+    #[test]
+    fn execute_joins_asof_hit_enriches_event() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let joined = Arc::new(Event {
+            fields: {
+                let mut f = EngineHashMap::default();
+                f.insert("id".into(), Value::Number(1.0));
+                f.insert("name".into(), Value::Str("person".into()));
+                f
+            },
+        });
+
+        struct HitLookup(Arc<Event>);
+        impl WindowLookup for HitLookup {
+            fn snapshot_field_values(&self, _w: &str, _f: &str) -> Option<HashSet<String>> {
+                None
+            }
+            fn snapshot(&self, _w: &str) -> Option<Vec<JoinRow>> {
+                None
+            }
+            fn asof_lookup_max(
+                &self,
+                _w: &str,
+                _key_field: &str,
+                _key: &Value,
+                _event_time_nanos: i64,
+                _within: Option<&Duration>,
+            ) -> AsofLookup {
+                AsofLookup::Hit(JoinRow::Event(Arc::clone(&self.0)))
+            }
+        }
+
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("bidder".into(), Value::Number(1.0));
+
+        let joins = vec![JoinPlan {
+            right_window: "person_events".to_string(),
+            mode: JoinMode::Asof {
+                within: Some(Duration::from_secs(300)),
+            },
+            conds: vec![JoinCondPlan {
+                left: FieldRef::Simple("bidder".to_string()),
+                right: FieldRef::Simple("id".to_string()),
+            }],
+        }];
+
+        let ok = execute_joins(&joins, &mut ctx, &HitLookup(joined), 500_000_000_000);
+        assert!(ok, "an asof Hit must keep the event");
+        assert_eq!(
+            ctx.fields.get("person_events.id"),
+            Some(&Value::Number(1.0)),
+            "qualified joined field must be enriched"
+        );
+        assert_eq!(
+            ctx.fields.get("id"),
+            Some(&Value::Number(1.0)),
+            "plain joined field must be enriched"
+        );
+    }
 
     #[test]
     fn plain_field_names_from_bind_data() {

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use foldhash::fast::RandomState as FoldRandomState;
 use smol_str::SmolStr;
@@ -317,6 +318,41 @@ pub trait WindowLookup: Send + Sync {
                 .collect(),
         )
     }
+
+    /// Asof fast path: return the single row of `window` whose `key_field`
+    /// equals `key` and whose raw timestamp is the maximum within
+    /// `[event_time - within, event_time]` — O(1) via the index's per-key
+    /// `max_ts`, no candidate scan.
+    ///
+    /// See [`AsofLookup`] for the three outcomes. The default implementation is
+    /// always [`AsofLookup::Fallback`].
+    fn asof_lookup_max(
+        &self,
+        window: &str,
+        key_field: &str,
+        key: &Value,
+        event_time_nanos: i64,
+        within: Option<&Duration>,
+    ) -> AsofLookup {
+        let _ = (window, key_field, key, event_time_nanos, within);
+        AsofLookup::Fallback
+    }
+}
+
+/// Outcome of the asof-join O(1) fast path ([`WindowLookup::asof_lookup_max`]).
+#[derive(Clone)]
+pub enum AsofLookup {
+    /// Fast-path hit: the unique row whose timestamp is the maximum within
+    /// `[event_time - within, event_time]`.
+    Hit(JoinRow),
+    /// Definitively no match: the key's max timestamp is already older than the
+    /// asof lower bound, so no row can satisfy the time window — the full scan
+    /// would also return `None`. The caller should fail the join without a scan.
+    Miss,
+    /// The fast path cannot answer (max timestamp newer than `event_time`, no
+    /// index, or a watermark cuts the window); fall back to `asof_candidates` +
+    /// `find_asof_row`.
+    Fallback,
 }
 
 // ---------------------------------------------------------------------------

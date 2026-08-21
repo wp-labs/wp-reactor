@@ -1,4 +1,4 @@
-use crate::match_engine::{JoinKey, Value};
+use crate::match_engine::{AsofLookup, JoinKey, Value};
 use crate::window::buffer::Window;
 use crate::window::buffer::types::AppendOutcome;
 use crate::window::buffer::types::WindowParams;
@@ -99,12 +99,12 @@ fn append_and_evict_expired() {
     assert_eq!(win.total_rows(), 3);
 
     // cutoff = 12s - 10s = 2s → batch1 (max=1s) < 2s → evicted
-    win.evict_expired(12_000_000_000, u64::MAX);
+    win.evict_expired(12_000_000_000);
     assert_eq!(win.batch_count(), 2);
     assert_eq!(win.total_rows(), 2);
 
     // cutoff = 16s - 10s = 6s → batch2 (max=5s) < 6s → evicted
-    win.evict_expired(16_000_000_000, u64::MAX);
+    win.evict_expired(16_000_000_000);
     assert_eq!(win.batch_count(), 1);
     assert_eq!(win.total_rows(), 1);
 }
@@ -277,7 +277,7 @@ fn eviction_bumps_generation() {
     assert!(g1 > g0, "append bumps generation");
 
     // cutoff = 12s - 10s = 2s; batch max=1s < 2s → evicted (acked floor = MAX).
-    win.evict_expired(12_000_000_000, u64::MAX);
+    win.evict_expired(12_000_000_000);
     let g2 = win.generation();
     assert!(g2 > g1, "time eviction must bump generation");
 
@@ -315,7 +315,7 @@ fn no_time_col_window() {
     assert_eq!(win.total_rows(), 2);
 
     // evict_expired is no-op for no-time-column windows.
-    win.evict_expired(i64::MAX, u64::MAX);
+    win.evict_expired(i64::MAX);
     assert_eq!(win.batch_count(), 1);
     assert_eq!(win.total_rows(), 2);
 }
@@ -325,7 +325,7 @@ fn no_time_col_window() {
 #[test]
 fn evict_on_empty_window_is_noop() {
     let win = test_window(60, usize::MAX);
-    win.evict_expired(i64::MAX, u64::MAX);
+    win.evict_expired(i64::MAX);
     assert!(win.is_empty());
 }
 
@@ -365,11 +365,11 @@ fn multi_row_batch_time_range() {
     assert_eq!(win.batch_count(), 1);
 
     // cutoff = 15s - 10s = 5s → batch max=8s >= 5s → NOT evicted
-    win.evict_expired(15_000_000_000, u64::MAX);
+    win.evict_expired(15_000_000_000);
     assert_eq!(win.batch_count(), 1);
 
     // cutoff = 19s - 10s = 9s → batch max=8s < 9s → evicted
-    win.evict_expired(19_000_000_000, u64::MAX);
+    win.evict_expired(19_000_000_000);
     assert_eq!(win.batch_count(), 0);
 }
 
@@ -1128,7 +1128,7 @@ fn join_index_maintained_on_append_and_evict() {
 
     // Expire all batches: over=3600s, now=4000s → cutoff=400s >> event times
     // (1-4ms), so all batches are time-evicted and index entries removed.
-    win.evict_expired(4_000_000_000_000, u64::MAX);
+    win.evict_expired(4_000_000_000_000);
     assert!(
         win.join_lookup(&JoinKey::Int(42))
             .is_none_or(|v| v.is_empty()),
@@ -1173,6 +1173,12 @@ fn join_index_absent_without_set_join_key() {
         win.join_lookup(&JoinKey::Int(1)).is_none(),
         "no join index → None (caller falls back to scan)"
     );
+    // The asof fast path must also fall back (not Miss) without an index: the
+    // caller then runs the full timestamped scan.
+    assert!(matches!(
+        win.join_lookup_asof(&JoinKey::Int(1), 5_000_000_000, 0),
+        AsofLookup::Fallback
+    ));
 }
 
 #[test]
@@ -1292,6 +1298,96 @@ fn join_index_stays_columnar_without_materializing_parsed_events() {
     );
 }
 
+#[test]
+fn join_lookup_asof_max_fast_path() {
+    let win = test_window(3600, usize::MAX);
+    win.set_join_key("value".into());
+
+    // Same key 42 at ts=1s and ts=3s → per-key max_ts = 3s.
+    win.append(make_batch(&test_schema(), &[1_000_000_000], &[42]))
+        .unwrap();
+    win.append(make_batch(&test_schema(), &[3_000_000_000], &[42]))
+        .unwrap();
+
+    // Fast-path hit: max_ts=3s falls within [2s, 5s] → returns the latest row.
+    match win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 2_000_000_000) {
+        AsofLookup::Hit(row) => {
+            assert_eq!(row.field_value("ts"), Some(Value::Number(3_000_000_000.0)));
+        }
+        AsofLookup::Miss => panic!("expected Hit, got Miss"),
+        AsofLookup::Fallback => panic!("expected Hit, got Fallback"),
+    }
+
+    // max_ts too old (3s < min_ts=4s) → Miss (no scan needed).
+    assert!(matches!(
+        win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 4_000_000_000),
+        AsofLookup::Miss
+    ));
+    // Miss must be consistent with the fallback scan: every candidate ts is
+    // below min_ts, so `find_asof_row` would also return `None`.
+    let cands = win.join_lookup_timestamped(&JoinKey::Int(42)).unwrap();
+    assert!(
+        cands.iter().all(|(ts, _)| *ts < 4_000_000_000),
+        "Miss implies all candidate timestamps are below the asof lower bound"
+    );
+
+    // max_ts too new (3s > event_time=2s) → Fallback (a smaller row may qualify).
+    assert!(matches!(
+        win.join_lookup_asof(&JoinKey::Int(42), 2_000_000_000, 0),
+        AsofLookup::Fallback
+    ));
+
+    // Unknown key → Miss.
+    assert!(matches!(
+        win.join_lookup_asof(&JoinKey::Int(99), 5_000_000_000, 0),
+        AsofLookup::Miss
+    ));
+
+    // Boundary: max_ts == min_ts (3s == 3s) → still a hit (inclusive lower bound).
+    match win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 3_000_000_000) {
+        AsofLookup::Hit(row) => {
+            assert_eq!(row.field_value("ts"), Some(Value::Number(3_000_000_000.0)));
+        }
+        AsofLookup::Miss => panic!("expected Hit at inclusive lower bound, got Miss"),
+        AsofLookup::Fallback => panic!("expected Hit at inclusive lower bound, got Fallback"),
+    }
+
+    // Boundary: max_ts == event_time (3s == 3s) → still a hit (inclusive upper bound).
+    match win.join_lookup_asof(&JoinKey::Int(42), 3_000_000_000, 2_000_000_000) {
+        AsofLookup::Hit(row) => {
+            assert_eq!(row.field_value("ts"), Some(Value::Number(3_000_000_000.0)));
+        }
+        AsofLookup::Miss => panic!("expected Hit at inclusive upper bound, got Miss"),
+        AsofLookup::Fallback => panic!("expected Hit at inclusive upper bound, got Fallback"),
+    }
+}
+
+#[test]
+fn join_lookup_asof_max_miss_without_timestamps() {
+    // A join-indexed window with no time column has no per-row timestamps, so
+    // the asof fast path must report `Miss` (the timestamped scan would also
+    // return no candidates, so `find_asof_row` would be `None`).
+    let schema = test_schema_no_time();
+    let win = Window::new(
+        WindowParams {
+            name: "no_time".into(),
+            schema: schema.clone(),
+            time_col_index: None,
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        test_config(usize::MAX),
+    );
+    win.set_join_key("value".into());
+    win.append(make_batch_no_time(&schema, &[42])).unwrap();
+
+    assert!(matches!(
+        win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 0),
+        AsofLookup::Miss
+    ));
+}
+
 // -- Eager-drop regression (window log reclamation) ------------------------
 //
 // History: A.1 replaced the `VecDeque<TimedBatch>` window log with a lock-free
@@ -1357,7 +1453,7 @@ fn time_evicted_batch_releases_parsed_events() {
     assert_eq!(win.batch_count(), 2);
 
     // cutoff = 12s - 10s = 2s → batch1 (max=1s) evicted.
-    win.evict_expired(12_000_000_000, u64::MAX);
+    win.evict_expired(12_000_000_000);
     assert_eq!(win.batch_count(), 1);
 
     assert_events_released(&first);

@@ -26,7 +26,9 @@ use wf_config::WindowConfig;
 
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::event_bridge::extract_field_value;
-use crate::match_engine::{Event, JoinKey, JoinRow, Value, batch_raw_ts_nanos, build_field_index};
+use crate::match_engine::{
+    AsofLookup, Event, JoinKey, JoinRow, Value, batch_raw_ts_nanos, build_field_index,
+};
 use crate::window::WindowProgress;
 
 use types::TimedBatch;
@@ -41,9 +43,18 @@ pub(super) struct JoinIndex {
     /// The window's `materialize_fields` projection: enrich reads only these
     /// columns from the joined rows. `None` = all columns.
     projection: Option<Arc<HashSet<String>>>,
-    /// Columnar row locators per key. `ts_nanos` is `None` for rows without a
-    /// `Timestamp(Ns)` time value (valid snapshot-join rows, skipped by asof).
-    by_key: crate::match_engine::EngineHashMap<JoinKey, Vec<IndexedRow>>,
+    /// Columnar row locators per key. Each [`KeyedRows`] keeps a running
+    /// `max_ts` so the asof fast path can answer the common "latest row
+    /// ≤ event_time" case in O(1) without scanning every candidate.
+    by_key: crate::match_engine::EngineHashMap<JoinKey, KeyedRows>,
+}
+
+/// The indexed rows for one join key, plus the maximum raw timestamp among them
+/// (`None` when the key has no timestamped rows).
+#[derive(Default)]
+struct KeyedRows {
+    rows: Vec<IndexedRow>,
+    max_ts: Option<i64>,
 }
 
 /// A columnar row locator: `(batch, row)` plus the batch-level field index and
@@ -79,20 +90,26 @@ impl JoinIndex {
             let Some(key) = JoinKey::from_value(&value) else {
                 continue;
             };
-            self.by_key.entry(key).or_default().push(IndexedRow {
+            let kr = self.by_key.entry(key).or_default();
+            kr.rows.push(IndexedRow {
                 ts_nanos: *ts,
                 batch: Arc::clone(batch),
                 row,
                 index: Arc::clone(&index),
             });
+            if let Some(t) = *ts {
+                kr.max_ts = Some(kr.max_ts.map_or(t, |m| m.max(t)));
+            }
         }
     }
 
     /// Remove every row belonging to `batch` (matched by `Arc` pointer
-    /// identity — the index holds the same `Arc<RecordBatch>` the log does).
+    /// identity — the index holds the same `Arc<RecordBatch>` the log does),
+    /// then recompute the per-key `max_ts` (a removal may have dropped the max).
     fn remove_batch(&mut self, batch: &Arc<RecordBatch>) {
-        for rows in self.by_key.values_mut() {
-            rows.retain(|r| !Arc::ptr_eq(&r.batch, batch));
+        for kr in self.by_key.values_mut() {
+            kr.rows.retain(|r| !Arc::ptr_eq(&r.batch, batch));
+            kr.max_ts = kr.rows.iter().filter_map(|r| r.ts_nanos).max();
         }
     }
 
@@ -100,16 +117,47 @@ impl JoinIndex {
     fn lookup(&self, key: &JoinKey) -> Option<Vec<JoinRow>> {
         self.by_key
             .get(key)
-            .map(|rows| rows.iter().map(|r| self.row_to_join_row(r)).collect())
+            .map(|kr| kr.rows.iter().map(|r| self.row_to_join_row(r)).collect())
     }
 
     /// Asof-join view: only the timestamped rows for `key`, as `(raw_ts, row)`.
     fn lookup_timestamped(&self, key: &JoinKey) -> Option<Vec<(i64, JoinRow)>> {
-        self.by_key.get(key).map(|rows| {
-            rows.iter()
+        self.by_key.get(key).map(|kr| {
+            kr.rows
+                .iter()
                 .filter_map(|r| r.ts_nanos.map(|ts| (ts, self.row_to_join_row(r))))
                 .collect()
         })
+    }
+
+    /// Asof fast path: if `key`'s maximum timestamp falls within
+    /// `[min_ts, event_time]`, return that row directly — O(1), no per-candidate
+    /// scan.
+    ///
+    /// `Miss` when the key is absent, has no timestamped rows, or its max
+    /// timestamp is already older than `min_ts` (the full scan would also return
+    /// `None`, so the caller can fail the join without scanning). `Fallback` when
+    /// the max is newer than `event_time` (a smaller row may still qualify) —
+    /// the caller then runs the full timestamped scan.
+    fn lookup_asof_max(&self, key: &JoinKey, event_time: i64, min_ts: i64) -> AsofLookup {
+        let Some(kr) = self.by_key.get(key) else {
+            return AsofLookup::Miss;
+        };
+        let Some(max_ts) = kr.max_ts else {
+            return AsofLookup::Miss;
+        };
+        if max_ts < min_ts {
+            return AsofLookup::Miss;
+        }
+        if max_ts > event_time {
+            return AsofLookup::Fallback;
+        }
+        // min_ts <= max_ts <= event_time: `max_ts` comes from `kr.rows`, so the
+        // reverse scan is guaranteed to find it.
+        let Some(r) = kr.rows.iter().rev().find(|r| r.ts_nanos == Some(max_ts)) else {
+            return AsofLookup::Fallback;
+        };
+        AsofLookup::Hit(self.row_to_join_row(r))
     }
 
     fn row_to_join_row(&self, r: &IndexedRow) -> JoinRow {
@@ -308,6 +356,21 @@ impl Window {
                 .lookup_timestamped(key)
                 .unwrap_or_default(),
         )
+    }
+
+    /// Asof fast path: return `key`'s row whose timestamp is the maximum
+    /// `<= event_time` and `>= min_ts`, using the index's per-key `max_ts` —
+    /// O(1), no candidate scan. See [`AsofLookup`] for the three outcomes.
+    /// [`AsofLookup::Fallback`] when the window has no join index.
+    pub fn join_lookup_asof(&self, key: &JoinKey, event_time: i64, min_ts: i64) -> AsofLookup {
+        if !self.join_enabled.load(Ordering::Acquire) {
+            return AsofLookup::Fallback;
+        }
+        let guard = self.join_index.read().expect("join index lock poisoned");
+        let Some(index) = guard.as_ref() else {
+            return AsofLookup::Fallback;
+        };
+        index.lookup_asof_max(key, event_time, min_ts)
     }
 
     /// Raw `Timestamp(Ns)` time values for every row of a batch, aligned with

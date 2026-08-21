@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use wf_engine::match_engine::{
-    Event, JoinKey, JoinRow, Value, WindowLookup, column_scalar_string, columnar_join_rows,
-    columnar_timestamped_join_rows,
+    AsofLookup, Event, JoinKey, JoinRow, Value, WindowLookup, column_scalar_string,
+    columnar_join_rows, columnar_timestamped_join_rows,
 };
 use wf_engine::window::Router;
 
@@ -231,6 +232,33 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
                 .collect(),
         )
     }
+
+    fn asof_lookup_max(
+        &self,
+        window: &str,
+        _key_field: &str,
+        key: &Value,
+        event_time_nanos: i64,
+        within: Option<&Duration>,
+    ) -> AsofLookup {
+        let Some(win) = self.router.registry().get_window(window) else {
+            return AsofLookup::Fallback;
+        };
+        let Some(join_key) = JoinKey::from_value(key) else {
+            return AsofLookup::Fallback;
+        };
+        // The index's per-key `max_ts` fast path is only valid on the full
+        // (unwatermarked) window; under a watermark the index is not seq-cut
+        // safe, so the caller must fall back to `asof_candidates`.
+        if self.eff_max_seq(window).is_some() {
+            return AsofLookup::Fallback;
+        }
+        let min_ts = within.map_or(i64::MIN, |d| {
+            let nanos = i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
+            event_time_nanos.saturating_sub(nanos)
+        });
+        win.join_lookup_asof(&join_key, event_time_nanos, min_ts)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +459,108 @@ mod tests {
             assert_eq!(its, sts);
             assert_eq!(irow.field_value("ip"), srow.field_value("ip"));
             assert_eq!(irow.field_value("score"), srow.field_value("score"));
+        }
+    }
+
+    #[tokio::test]
+    async fn asof_lookup_max_fast_path() {
+        let schema = ts_schema();
+        let reg = WindowRegistry::build(vec![make_def("threat_intel", vec!["feed"])]).unwrap();
+        let router = Router::new(reg);
+        router
+            .registry()
+            .get_window("threat_intel")
+            .unwrap()
+            .set_join_key("ip".into());
+
+        // Same key ip=10.0.0.1 at ts=1s and ts=3s → per-key max_ts = 3s.
+        router
+            .route(
+                "feed",
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(TimestampNanosecondArray::from(vec![1_000_000_000])),
+                        Arc::new(StringArray::from(vec!["10.0.0.1"])),
+                        Arc::new(Int64Array::from(vec![80])),
+                    ],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        router
+            .route(
+                "feed",
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(TimestampNanosecondArray::from(vec![3_000_000_000])),
+                        Arc::new(StringArray::from(vec!["10.0.0.1"])),
+                        Arc::new(Int64Array::from(vec![95])),
+                    ],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let lookup = RegistryLookup::new(&router);
+        let key = Value::Str("10.0.0.1".into());
+
+        // Fast-path hit: max_ts=3s within [2s, 5s] → latest row (score 95).
+        match lookup.asof_lookup_max(
+            "threat_intel",
+            "ip",
+            &key,
+            5_000_000_000,
+            Some(&Duration::from_secs(3)),
+        ) {
+            AsofLookup::Hit(row) => {
+                assert_eq!(row.field_value("score"), Some(Value::Number(95.0)));
+                assert_eq!(row.field_value("ip"), Some(Value::Str("10.0.0.1".into())));
+            }
+            AsofLookup::Miss => panic!("expected Hit, got Miss"),
+            AsofLookup::Fallback => panic!("expected Hit, got Fallback"),
+        }
+
+        // Too old: max_ts=3s < min_ts=4s (within 1s) → Miss (no scan needed).
+        assert!(matches!(
+            lookup.asof_lookup_max(
+                "threat_intel",
+                "ip",
+                &key,
+                5_000_000_000,
+                Some(&Duration::from_secs(1)),
+            ),
+            AsofLookup::Miss
+        ));
+
+        // Too new: max_ts=3s > event_time=2s → Fallback (caller falls back).
+        assert!(matches!(
+            lookup.asof_lookup_max("threat_intel", "ip", &key, 2_000_000_000, None),
+            AsofLookup::Fallback
+        ));
+
+        // Unknown key → Miss.
+        assert!(matches!(
+            lookup.asof_lookup_max(
+                "threat_intel",
+                "ip",
+                &Value::Str("9.9.9.9".into()),
+                5_000_000_000,
+                None,
+            ),
+            AsofLookup::Miss
+        ));
+
+        // within=None (no lower bound): max_ts=3s <= event_time=3s → Hit.
+        match lookup.asof_lookup_max("threat_intel", "ip", &key, 3_000_000_000, None) {
+            AsofLookup::Hit(row) => {
+                assert_eq!(row.field_value("score"), Some(Value::Number(95.0)));
+            }
+            AsofLookup::Miss => panic!("expected Hit with within=None, got Miss"),
+            AsofLookup::Fallback => panic!("expected Hit with within=None, got Fallback"),
         }
     }
 

@@ -21,7 +21,7 @@ pub use executor::{EachDirectBatchStats, RuleExecutor, RuleExecutorOptions};
 pub use match_engine::apply_conv;
 pub use match_engine::close_is_qualified;
 pub use match_engine::{
-    CepStateMachine, CloseOutput, CloseReason, Event, FieldSource, JoinKey, MACHINE_ID,
+    AsofLookup, CepStateMachine, CloseOutput, CloseReason, Event, FieldSource, JoinKey, MACHINE_ID,
     MatchedContext, SharedLimits, StepData, StepOutcome, StepProgress, StepResult, Value,
     WindowLookup,
 };

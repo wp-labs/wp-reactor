@@ -6,14 +6,16 @@ use super::Window;
 impl Window {
     /// Remove front batches whose max event time is older than `now_nanos - over`.
     ///
-    /// `acked_floor` is the consumption floor from
-    /// [`WindowProgress::min_acked`](crate::window::WindowProgress::min_acked):
-    /// a batch is only removable when **every** live consumer has acked past
-    /// it (`batch.seq + 1 <= acked_floor`), so a sweep can never drop data a
-    /// slow rule has not yet read. Windows without consumers get `u64::MAX`.
+    /// This is purely event-time based: it does **not** gate on the consumption
+    /// floor (`WindowProgress::min_acked`). A slow rule that has not yet read an
+    /// expired batch will see it evicted and observe a pull `gap_detected` on its
+    /// next `read_since` / `read_since_with_shard`; it then resumes from the
+    /// window's new `oldest_seq`, skipping the gap. This trades a slow rule's
+    /// completeness for system-wide window boundedness — one slow rule must not
+    /// pin every window's eviction and drag the whole engine down.
     ///
     /// No-op for windows without a time column or with `over == Duration::ZERO`.
-    pub fn evict_expired(&self, now_nanos: i64, acked_floor: u64) {
+    pub fn evict_expired(&self, now_nanos: i64) {
         if self.time_col_index.is_none() || self.over == Duration::ZERO {
             return;
         }
@@ -32,9 +34,7 @@ impl Window {
                     let Some((_, tb)) = log.first_key_value() else {
                         break;
                     };
-                    let expired = tb.event_time_range.1 < cutoff;
-                    let consumed = tb.seq < acked_floor;
-                    expired && consumed
+                    tb.event_time_range.1 < cutoff
                 };
                 if !removable {
                     break;

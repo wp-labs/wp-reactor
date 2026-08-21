@@ -9,18 +9,25 @@
 //!
 //! 运行：cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture
 
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
+use crate::match_engine::match_engine::{EngineHashMap, MatchedContext, StepData, WindowLookup};
 use crate::match_engine::{
-    ColumnarEvent, FieldSource, JoinKey, Value, batch_to_events, build_field_index,
-    column_scalar_string, columnar_join_rows, columnar_timestamped_join_rows,
+    AsofLookup, ColumnarEvent, FieldSource, JoinKey, JoinRow, RuleExecutor, Value,
+    batch_raw_ts_nanos, batch_to_events, build_field_index, column_scalar_string,
+    columnar_join_rows, columnar_timestamped_join_rows,
 };
 use crate::window::{Window, WindowParams};
+
+use super::helpers::{branch, count_ge, simple_key, simple_plan, simple_rule_plan, step, str_val};
+use wf_lang::ast::{Expr, FieldRef, JoinMode};
+use wf_lang::plan::{JoinCondPlan, JoinPlan};
 
 /// nexmark bid_events 形态的 7 字段批（auction/bidder/price/channel/url/dateTime/extra），
 /// 少量 null 对齐真实数据。返回 (batch, price 列索引)。
@@ -405,4 +412,207 @@ fn join_index_timestamped_lookup_vs_full_scan() {
     );
     assert_eq!(idx_hits, r, "each indexed asof lookup must return one row");
     assert_eq!(scan_hits, s, "each full asof scan must find one row");
+}
+
+// ---------------------------------------------------------------------------
+// `execute_match_with_joins` 端到端性能 profile
+//
+// 测量 `RuleExecutor::execute_match_with_joins`（build_eval_context +
+// execute_joins[asof] + build_match_alert）在「asof 候选版本数 N」下的单次
+// 耗时，量化 Q22 里「每个 bid 遍历该 bidder 的 N 个 person 版本」的成本。
+//
+// 运行：cargo test --release -p wf-engine execute_match_with_joins -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+
+/// 一个只服务 asof join 的 [`WindowLookup`]：`asof_candidates` 原样返回
+/// 预置的 `N` 个 `(raw_ts, JoinRow)` 候选；`asof_lookup_max` 若 `fast_path`
+/// 则模拟 index 的 per-key `max_ts` 快路径（O(1) 直接返回 max 候选），否则
+/// 返回 `None`（退化为全量 `asof_candidates` 线性扫）。
+struct BenchAsofLookup {
+    candidates: Vec<(i64, JoinRow)>,
+    max_row: Option<(i64, JoinRow)>,
+    fast_path: bool,
+}
+
+impl BenchAsofLookup {
+    fn new(candidates: Vec<(i64, JoinRow)>, fast_path: bool) -> Self {
+        let max_row = candidates.iter().max_by_key(|(ts, _)| *ts).cloned();
+        Self {
+            candidates,
+            max_row,
+            fast_path,
+        }
+    }
+}
+
+impl WindowLookup for BenchAsofLookup {
+    fn snapshot_field_values(&self, _w: &str, _f: &str) -> Option<HashSet<String>> {
+        None
+    }
+
+    fn snapshot(&self, _w: &str) -> Option<Vec<JoinRow>> {
+        None
+    }
+
+    fn snapshot_with_timestamps(&self, _w: &str) -> Option<Vec<(i64, JoinRow)>> {
+        Some(self.candidates.clone())
+    }
+
+    fn asof_candidates(
+        &self,
+        _w: &str,
+        _key_field: &str,
+        _key: &Value,
+    ) -> Option<Vec<(i64, JoinRow)>> {
+        Some(self.candidates.clone())
+    }
+
+    fn asof_lookup_max(
+        &self,
+        _w: &str,
+        _key_field: &str,
+        _key: &Value,
+        event_time: i64,
+        within: Option<&Duration>,
+    ) -> AsofLookup {
+        if !self.fast_path {
+            return AsofLookup::Fallback;
+        }
+        let Some((max_ts, _)) = self.max_row.as_ref() else {
+            return AsofLookup::Miss;
+        };
+        let min_ts = within.map_or(i64::MIN, |d| {
+            let nanos = i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
+            event_time.saturating_sub(nanos)
+        });
+        if *max_ts < min_ts {
+            return AsofLookup::Miss;
+        }
+        if *max_ts > event_time {
+            return AsofLookup::Fallback;
+        }
+        match self.max_row.as_ref() {
+            Some((_, row)) => AsofLookup::Hit(row.clone()),
+            None => AsofLookup::Fallback,
+        }
+    }
+}
+
+/// 构造 `n` 个列式 person 候选（`JoinRow::Columnar`，同一 batch 的 `n` 行），
+/// 时间戳均匀分布在 `[bid_ts - within, bid_ts]`，全部落在 asof 的时间窗内。
+fn person_batch_candidates(n: usize, bid_ts: i64, within: Duration) -> Vec<(i64, JoinRow)> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+    ]));
+    let span = within.as_nanos() as i64;
+    let ids: Vec<String> = (0..n).map(|_| "10.0.0.1".to_string()).collect();
+    let names: Vec<String> = (0..n).map(|_| "person".to_string()).collect();
+    let tss: Vec<i64> = (0..n)
+        .map(|i| bid_ts - span + (span * i as i64 / n as i64))
+        .collect();
+    let batch = Arc::new(
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(names)) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(tss)) as ArrayRef,
+            ],
+        )
+        .unwrap(),
+    );
+    let index = build_field_index(&batch);
+    (0..n)
+        .map(|row| {
+            let ts = batch_raw_ts_nanos(&batch, 2, row).expect("timestamped row");
+            (
+                ts,
+                JoinRow::Columnar {
+                    batch: Arc::clone(&batch),
+                    row,
+                    index: Arc::clone(&index),
+                    projection: None,
+                },
+            )
+        })
+        .collect()
+}
+
+/// 构造一个带 asof join 的 [`RuleExecutor`]（左键 `sip`，右键 `id`）。
+fn asof_join_executor(within: Duration) -> RuleExecutor {
+    let match_plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(1.0))])],
+    );
+    let mut rule_plan = simple_rule_plan(
+        "r_asof_bench",
+        match_plan,
+        Expr::Number(70.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".to_string())),
+    );
+    rule_plan.joins = vec![JoinPlan {
+        right_window: "person_events".to_string(),
+        mode: JoinMode::Asof {
+            within: Some(within),
+        },
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Simple("sip".to_string()),
+            right: FieldRef::Simple("id".to_string()),
+        }],
+    }];
+    RuleExecutor::new(rule_plan)
+}
+
+/// `execute_match_with_joins` 单次耗时随 asof 候选版本数 `N` 的缩放。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine execute_match_with_joins -- --ignored --nocapture"]
+fn execute_match_with_joins_asof_scaling() {
+    let bid_ts: i64 = 1_767_225_600_000_000_000;
+    let within = Duration::from_secs(300);
+    let exec = asof_join_executor(within);
+
+    let matched = MatchedContext {
+        rule_name: "r_asof_bench".to_string(),
+        scope_key: vec![str_val("10.0.0.1")],
+        step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: None,
+            measure_value: 1.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
+            collected_values: Vec::new(),
+            field_values: EngineHashMap::default(),
+        }],
+        bind_data: vec![],
+        event_time_nanos: bid_ts,
+        event_first_time_nanos: bid_ts,
+        event_last_time_nanos: bid_ts,
+        window_start_time_nanos: bid_ts - 600_000_000_000,
+        window_end_time_nanos: bid_ts + 600_000_000_000,
+        machine_id: String::new(),
+        trigger_event: None,
+    };
+
+    for fast in [true, false] {
+        let mode = if fast { "fast(max_ts)" } else { "linear(scan)" };
+        for n in [1usize, 10, 100, 200, 500, 1000] {
+            let lookup = BenchAsofLookup::new(person_batch_candidates(n, bid_ts, within), fast);
+            let reps = 100_000usize;
+            let start = Instant::now();
+            for _ in 0..reps {
+                let record = exec
+                    .execute_match_with_joins(&matched, &lookup)
+                    .unwrap()
+                    .unwrap();
+                std::hint::black_box(&record);
+            }
+            let ns = start.elapsed().as_secs_f64() * 1e9 / reps as f64;
+            eprintln!(
+                "[exec-join-bench] execute_match_with_joins {mode:>12} candidates={n:>5}  {ns:8.1} ns/op"
+            );
+        }
+    }
 }

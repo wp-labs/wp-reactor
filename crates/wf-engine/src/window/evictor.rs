@@ -89,8 +89,9 @@ impl Evictor {
     ///
     /// **Phase 1 — time eviction**: calls [`Window::evict_expired`] on every
     /// window, removing batches whose max event time is older than
-    /// `now_nanos - over` **and** which every live consumer has acked
-    /// (consumption floor from the registry's `WindowProgress`).
+    /// `now_nanos - over`. This is purely event-time based and does not wait
+    /// on the consumption floor — a slow rule that falls behind simply skips
+    /// the evicted batches on its next pull (`gap_detected`).
     ///
     /// **Phase 2 — memory eviction (floor-respecting, lossless)**: while the
     /// aggregate memory across all windows exceeds `max_total_bytes`, evicts
@@ -111,23 +112,19 @@ impl Evictor {
             memory_pressure: false,
         };
 
-        // Phase 1: time eviction (gated by consumption progress)
+        // Phase 1: time eviction (event-time based, no consumption floor)
         let names: Vec<String> = registry.window_names();
 
         for name in &names {
             report.windows_scanned += 1;
-            let floor = registry
-                .progress(name)
-                .map(|progress| progress.min_acked())
-                .unwrap_or(u64::MAX);
             let win = registry.get_window(name).unwrap();
             let before = win.batch_count();
             // Time eviction must cut on the window's **event-time watermark**,
             // not wall clock. Nexmark event times are absolute (~2026-01-01),
             // so a wall-clock cutoff would treat every batch as expired on
-            // every sweep, high-frequency-evicting all acked batches and
-            // starving the actor's append write lock (the q5 pull-freeze).
-            win.evict_expired(win.watermark_nanos(), floor);
+            // every sweep, high-frequency-evicting all batches and starving
+            // the actor's append write lock (the q5 pull-freeze).
+            win.evict_expired(win.watermark_nanos());
             let evicted = before - win.batch_count();
             report.batches_time_evicted += evicted;
             if evicted > 0 {
@@ -822,17 +819,18 @@ mod tests {
         assert_eq!(report.batches_memory_evicted, 0);
     }
 
-    // -- 8. evictor_time_eviction_respects_consumption_floor ------------------
+    // -- 8. evictor_time_eviction_ignores_consumption_floor -------------------
 
-    /// Phase 1 time eviction must honour the consumption floor: a batch is
-    /// only removable when **every** registered consumer has acked past it.
+    /// Phase 1 time eviction is purely event-time based and **ignores** the
+    /// consumption floor: a slow shard that has not yet acked its tail will see
+    /// those batches evicted once they expire (and observe a pull gap on its
+    /// next read), rather than pinning the whole window's eviction.
     ///
-    /// This is the invariant that protects pull-mode rule tasks from losing
-    /// data a slow shard has not yet read. Reproduces the q3 pull regression
-    /// class at the unit level: when one shard lags (low ack), its unacked
-    /// tail must survive the sweep.
+    /// This is the deliberate trade-off: one slow rule must not drag the
+    /// whole system down by holding every window's eviction floor at its own
+    /// lagging cursor.
     #[test]
-    fn evictor_time_eviction_respects_consumption_floor() {
+    fn evictor_time_eviction_ignores_consumption_floor() {
         let schema = test_schema();
         let reg = WindowRegistry::build(vec![WindowDef {
             params: WindowParams {
@@ -866,26 +864,19 @@ mod tests {
             .unwrap()
             .set_watermark_for_test(3_000_000_000);
 
-        // Fast shard acked everything (last batch seq n-1 => store n).
+        // Fast shard acked everything; slow shard still lags (only acked
+        // through seq 3). The lagging shard must NOT pin eviction.
         fast.store(n, Ordering::Release);
-        // Slow shard only acked up to batch seq k (store k+1); still needs
-        // seq k+1 .. n-1.
-        let k: u64 = 3;
-        slow.store(k + 1, Ordering::Release);
+        slow.store(4, Ordering::Release);
 
-        // floor = min(fast=n, slow=k+1) = k+1. Time eviction may only drop
-        // batches with seq < floor (seq 0..k). Everything else must survive.
         let evictor = Evictor::new(Arc::new(EvictionGate::new(usize::MAX))); // disable Phase 2
         evictor.run_once(&reg, 3_000_000_000i64); // now=3s > 2s, all expired
 
         let win = reg.get_window("data").unwrap();
-        // Evicted: seq 0..k (k+1 batches). Surviving: seq k+1..n-1 (n-(k+1)).
         assert_eq!(
             win.batch_count() as u64,
-            n - (k + 1),
-            "slow shard's unacked tail (seq {}..{}) must survive time eviction",
-            k + 1,
-            n - 1
+            0,
+            "time eviction drops all expired batches regardless of the slow shard's ack floor"
         );
     }
 

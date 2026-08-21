@@ -2933,9 +2933,8 @@ async fn pull_sharded_match_zero_repartition() {
 
 #[tokio::test]
 async fn pull_sharded_advances_ack_floor() {
-    // pull 后必须把消费进度写进 WindowProgress slot，使驱逐地板（min_acked）
-    // 跟上 cursor —— 否则时间驱逐会在 pull cursor 读取前清掉未消费批次（q3 的
-    // cursor_gap / 数据丢失回归锚点）。
+    // pull 后必须把消费进度写进 WindowProgress slot（min_acked 跟上 cursor）。
+    // 内存驱逐仍依赖这个地板；时间驱逐不再依赖它（见下方断言）。
     init_tracing();
     let schema = test_schema();
     let ts = 1_700_000_000_000_000_000i64;
@@ -2955,13 +2954,14 @@ async fn pull_sharded_advances_ack_floor() {
         .min_acked();
     assert_eq!(floor, 3, "ack floor must equal batches processed + 1");
 
-    // A time-eviction sweep must NOT drop the acked batches (floor gates it).
-    let before = win.batch_count();
-    win.evict_expired(ts + 1_000, floor);
+    // 时间驱逐现在纯按事件时间，忽略 ack floor：now 推进到 over 之后，即使
+    // batch 已 ack（floor=3），过期批次仍被驱逐（慢规则会在这里观察到 pull gap）。
+    assert_eq!(win.batch_count(), 3, "sanity: 3 batches buffered");
+    win.evict_expired(ts + 3_600_000_000_000 + 1_000);
     assert_eq!(
         win.batch_count(),
-        before,
-        "acked batches are protected from time eviction by the floor"
+        0,
+        "time eviction drops expired batches regardless of ack floor"
     );
 }
 
