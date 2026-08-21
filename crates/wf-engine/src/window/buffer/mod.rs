@@ -130,15 +130,24 @@ impl JoinIndex {
         })
     }
 
-    /// Asof fast path: if `key`'s maximum timestamp falls within
-    /// `[min_ts, event_time]`, return that row directly — O(1), no per-candidate
-    /// scan.
+    /// Asof lookup: return `key`'s row whose raw timestamp is the greatest
+    /// within `[min_ts, event_time]`.
+    ///
+    /// Fast path — when the key's running `max_ts` already falls inside the
+    /// window, that row is the answer and is returned in O(1) (the reverse scan
+    /// is guaranteed to find it because `max_ts` comes from `kr.rows`).
     ///
     /// `Miss` when the key is absent, has no timestamped rows, or its max
-    /// timestamp is already older than `min_ts` (the full scan would also return
-    /// `None`, so the caller can fail the join without scanning). `Fallback` when
-    /// the max is newer than `event_time` (a smaller row may still qualify) —
-    /// the caller then runs the full timestamped scan.
+    /// timestamp is already older than `min_ts` (so no row can qualify).
+    ///
+    /// When `max_ts > event_time` a smaller row may still qualify, so we do a
+    /// single linear scan over `kr.rows` — comparing raw timestamps only — and
+    /// materialize just the winning row. This keeps the common asof case on the
+    /// index (no `Vec` allocation, no per-row `JoinRow` clone, no redundant
+    /// condition re-check), unlike the caller's `asof_candidates` + scan
+    /// fallback which is only needed for multi-condition joins and watermarked
+    /// reads. `Fallback` remains only for the defensive miss of the fast-path
+    /// reverse scan.
     fn lookup_asof_max(&self, key: &JoinKey, event_time: i64, min_ts: i64) -> AsofLookup {
         let Some(kr) = self.by_key.get(key) else {
             return AsofLookup::Miss;
@@ -149,15 +158,30 @@ impl JoinIndex {
         if max_ts < min_ts {
             return AsofLookup::Miss;
         }
-        if max_ts > event_time {
-            return AsofLookup::Fallback;
+        if max_ts <= event_time {
+            // min_ts <= max_ts <= event_time: `max_ts` comes from `kr.rows`, so
+            // the reverse scan is guaranteed to find it.
+            let Some(r) = kr.rows.iter().rev().find(|r| r.ts_nanos == Some(max_ts)) else {
+                return AsofLookup::Fallback;
+            };
+            return AsofLookup::Hit(self.row_to_join_row(r));
         }
-        // min_ts <= max_ts <= event_time: `max_ts` comes from `kr.rows`, so the
-        // reverse scan is guaranteed to find it.
-        let Some(r) = kr.rows.iter().rev().find(|r| r.ts_nanos == Some(max_ts)) else {
-            return AsofLookup::Fallback;
-        };
-        AsofLookup::Hit(self.row_to_join_row(r))
+        // max_ts > event_time: find the greatest timestamp in [min_ts, event_time].
+        let mut best: Option<&IndexedRow> = None;
+        let mut best_ts = i64::MIN;
+        for r in &kr.rows {
+            let Some(ts) = r.ts_nanos else {
+                continue;
+            };
+            if ts <= event_time && ts >= min_ts && ts > best_ts {
+                best_ts = ts;
+                best = Some(r);
+            }
+        }
+        match best {
+            Some(r) => AsofLookup::Hit(self.row_to_join_row(r)),
+            None => AsofLookup::Miss,
+        }
     }
 
     fn row_to_join_row(&self, r: &IndexedRow) -> JoinRow {

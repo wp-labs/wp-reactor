@@ -1331,11 +1331,15 @@ fn join_lookup_asof_max_fast_path() {
         "Miss implies all candidate timestamps are below the asof lower bound"
     );
 
-    // max_ts too new (3s > event_time=2s) → Fallback (a smaller row may qualify).
-    assert!(matches!(
-        win.join_lookup_asof(&JoinKey::Int(42), 2_000_000_000, 0),
-        AsofLookup::Fallback
-    ));
+    // max_ts too new (3s > event_time=2s): a smaller row (ts=1s) qualifies, so
+    // the index scans and returns it directly — no caller-side fallback scan.
+    match win.join_lookup_asof(&JoinKey::Int(42), 2_000_000_000, 0) {
+        AsofLookup::Hit(row) => {
+            assert_eq!(row.field_value("ts"), Some(Value::Number(1_000_000_000.0)));
+        }
+        AsofLookup::Miss => panic!("expected Hit for max_ts > event_time, got Miss"),
+        AsofLookup::Fallback => panic!("expected Hit for max_ts > event_time, got Fallback"),
+    }
 
     // Unknown key → Miss.
     assert!(matches!(
@@ -1360,6 +1364,63 @@ fn join_lookup_asof_max_fast_path() {
         AsofLookup::Miss => panic!("expected Hit at inclusive upper bound, got Miss"),
         AsofLookup::Fallback => panic!("expected Hit at inclusive upper bound, got Fallback"),
     }
+}
+
+#[test]
+fn join_lookup_asof_max_scans_when_max_is_future() {
+    // When a key's running max_ts is newer than the event time (person X has a
+    // future event in the same/next bucket), the index must still return the
+    // greatest timestamp <= event_time — without falling back to the caller's
+    // full candidate scan. Rows are appended out of time order within/across
+    // batches, so the scan must not assume sorted order.
+    let win = test_window(3600, usize::MAX);
+    win.set_join_key("value".into());
+
+    // Key 42 at ts = 5s, 1s, 9s, 3s (append order != ts order; max_ts = 9s).
+    for ts in [
+        5_000_000_000i64,
+        1_000_000_000,
+        9_000_000_000,
+        3_000_000_000,
+    ] {
+        win.append(make_batch(&test_schema(), &[ts], &[42]))
+            .unwrap();
+    }
+
+    // event_time=7s, min_ts=0: max_ts(9s) > 7s → scan picks 5s (greatest ≤ 7s).
+    match win.join_lookup_asof(&JoinKey::Int(42), 7_000_000_000, 0) {
+        AsofLookup::Hit(row) => {
+            assert_eq!(row.field_value("ts"), Some(Value::Number(5_000_000_000.0)));
+        }
+        AsofLookup::Miss => panic!("expected Hit, got Miss"),
+        AsofLookup::Fallback => panic!("expected Hit, got Fallback"),
+    }
+
+    // Tight window [4s, 6s]: 5s qualifies, 3s/1s below, 9s above → 5s.
+    match win.join_lookup_asof(&JoinKey::Int(42), 6_000_000_000, 4_000_000_000) {
+        AsofLookup::Hit(row) => {
+            assert_eq!(row.field_value("ts"), Some(Value::Number(5_000_000_000.0)));
+        }
+        AsofLookup::Miss => panic!("expected Hit, got Miss"),
+        AsofLookup::Fallback => panic!("expected Hit, got Fallback"),
+    }
+
+    // No candidate in [8s, 9s] below event_time=9s: max_ts==9s (== event_time)
+    // is the fast-path hit, not the scan path.
+    match win.join_lookup_asof(&JoinKey::Int(42), 9_000_000_000, 8_000_000_000) {
+        AsofLookup::Hit(row) => {
+            assert_eq!(row.field_value("ts"), Some(Value::Number(9_000_000_000.0)));
+        }
+        AsofLookup::Miss => panic!("expected Hit, got Miss"),
+        AsofLookup::Fallback => panic!("expected Hit, got Fallback"),
+    }
+
+    // No candidate in [7.5s, 8.5s] (max_ts=9s > event_time=8.5s, all rows ≤7.5s
+    // or =9s are outside [7.5s,8.5s]) → Miss.
+    assert!(matches!(
+        win.join_lookup_asof(&JoinKey::Int(42), 8_500_000_000, 7_500_000_000),
+        AsofLookup::Miss
+    ));
 }
 
 #[test]

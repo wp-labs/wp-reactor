@@ -414,6 +414,96 @@ fn join_index_timestamped_lookup_vs_full_scan() {
     assert_eq!(scan_hits, s, "each full asof scan must find one row");
 }
 
+/// asof `lookup_asof_max`：快路径（`max_ts <= event_time`，O(1)）vs 扫描路径
+/// （`max_ts > event_time`，需要线性扫 key 的 N 行挑最大 ≤ event_time 的行）。
+/// 模拟 Q22 里「每个 bid 回看该 bidder 的 ~N 个 person 版本」的两种热路径成本。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture"]
+fn join_index_asof_max_scan_vs_fast_path() {
+    use std::time::Duration;
+    use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
+
+    let n = 200usize; // 每个 key 的 person 版本数（Q22 单 bidder ≈ 200）
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new("key", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let win = Window::new(
+        WindowParams {
+            name: "asof_bench".into(),
+            schema: schema.clone(),
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        WindowConfig {
+            name: "asof_bench".into(),
+            mode: DistMode::Local,
+            max_window_bytes: usize::MAX.into(),
+            over_cap: Duration::from_secs(3600).into(),
+            evict_policy: EvictPolicy::TimeFirst,
+            watermark: Duration::from_secs(5).into(),
+            allowed_lateness: Duration::from_secs(0).into(),
+            late_policy: LatePolicy::Drop,
+            table: None,
+        },
+    );
+    win.set_join_key("key".into());
+
+    // 单 key=42，N 行，ts 均匀 1s..N s（append 顺序 == ts 顺序，max_ts = N s）。
+    let ts: Vec<i64> = (0..n as i64)
+        .map(|i| 1_700_000_000_000_000_000 + (i + 1) * 1_000_000_000)
+        .collect();
+    let keys: Vec<i64> = vec![42; n];
+    let payload: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
+    win.append(
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(ts)) as ArrayRef,
+                Arc::new(Int64Array::from(keys)) as ArrayRef,
+                Arc::new(StringArray::from(payload)) as ArrayRef,
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let key = JoinKey::Int(42);
+    let max_ts = 1_700_000_000_000_000_000 + n as i64 * 1_000_000_000;
+    let r = 1_000_000usize;
+
+    // 快路径：event_time == max_ts（max_ts <= event_time）→ 反向找到 max_ts 即返回。
+    let start = Instant::now();
+    let mut fast_hits = 0usize;
+    for _ in 0..r {
+        if matches!(win.join_lookup_asof(&key, max_ts, 0), AsofLookup::Hit(_)) {
+            fast_hits += 1;
+        }
+    }
+    let fast_ns = start.elapsed().as_secs_f64() * 1e9 / r as f64;
+
+    // 扫描路径：event_time 在中间（max_ts > event_time）→ 线性扫 N 行。
+    let mid_ts = 1_700_000_000_000_000_000 + (n as i64 / 2) * 1_000_000_000;
+    let start = Instant::now();
+    let mut scan_hits = 0usize;
+    for _ in 0..r {
+        if matches!(win.join_lookup_asof(&key, mid_ts, 0), AsofLookup::Hit(_)) {
+            scan_hits += 1;
+        }
+    }
+    let scan_ns = start.elapsed().as_secs_f64() * 1e9 / r as f64;
+
+    eprintln!(
+        "[join-index-bench] asof max:      fast {fast_ns:8.1} ns/lookup  scan(N={n}) {scan_ns:8.1} ns/lookup  ({:.1}x)",
+        scan_ns / fast_ns
+    );
+    assert_eq!(fast_hits, r);
+    assert_eq!(scan_hits, r);
+}
+
 // ---------------------------------------------------------------------------
 // `execute_match_with_joins` 端到端性能 profile
 //

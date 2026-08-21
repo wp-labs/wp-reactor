@@ -536,11 +536,15 @@ mod tests {
             AsofLookup::Miss
         ));
 
-        // Too new: max_ts=3s > event_time=2s → Fallback (caller falls back).
-        assert!(matches!(
-            lookup.asof_lookup_max("threat_intel", "ip", &key, 2_000_000_000, None),
-            AsofLookup::Fallback
-        ));
+        // Too new: max_ts=3s > event_time=2s → index scans and returns the
+        // latest row ≤ 2s (ts=1s, score 80) — no caller-side fallback.
+        match lookup.asof_lookup_max("threat_intel", "ip", &key, 2_000_000_000, None) {
+            AsofLookup::Hit(row) => {
+                assert_eq!(row.field_value("score"), Some(Value::Number(80.0)));
+            }
+            AsofLookup::Miss => panic!("expected Hit for max_ts > event_time, got Miss"),
+            AsofLookup::Fallback => panic!("expected Hit for max_ts > event_time, got Fallback"),
+        }
 
         // Unknown key → Miss.
         assert!(matches!(
