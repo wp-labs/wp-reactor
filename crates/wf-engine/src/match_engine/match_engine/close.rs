@@ -133,7 +133,7 @@ fn evaluate_close_steps(
                 let collected_values = step_state.branch_states[branch_idx]
                     .collected_values
                     .as_deref()
-                    .cloned()
+                    .map(|q| q.iter().cloned().collect())
                     .unwrap_or_default();
                 close_step_data.push(StepData {
                     satisfied_branch_index: branch_idx,
@@ -147,7 +147,11 @@ fn evaluate_close_steps(
                     field_values: step_state.branch_states[branch_idx]
                         .field_values
                         .as_deref()
-                        .cloned()
+                        .map(|m| {
+                            m.iter()
+                                .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+                                .collect()
+                        })
                         .unwrap_or_default(),
                 });
             }

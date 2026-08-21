@@ -20,22 +20,35 @@
 //!   collect_clone   : `update_measure` 的 raw 值收集（8× Value.clone + Vec push）
 //!   amort_slice_10s : 惰性累积（每 100k 事件/slice 全量一次）的每事件摊还
 //!                     = baseline_ns / 100_000（优化方向：close 状态定期快照）
+//!
+//! 生产外围路径（2026-08-22 追加——状态机 advance 之外，rule_task 每行循环）：
+//!   masks_build     : `RuleExecutor::branch_guard_masks` 列式 guard mask（batch 级，摊到行）
+//!   scan_per_row    : `scan_expired_at_with_conv_skip_non_alerting` 每行过期扫描
+//!   deferred_row    : ColumnarEvent + advance_at_with_masks（列式 guard，deferred 路径）
+//!   eager_row       : 每行 Event 物化（HashMap 3 字段）+ advance_at（解释器 guard，eager 路径）
+//!   prod_row_full   : masks 摊还 + scan + advance_with_masks（复刻 rule_task deferred 行）
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Instant;
 
+use arrow::array::{ArrayRef, Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{
     BinOp, CloseMode, CmpOp, Expr, FieldRef, FieldSelector, MatchMode, Measure, Transform,
 };
-use wf_lang::plan::{AggPlan, BranchPlan, MatchPlan, StepPlan, WindowSpec};
+use wf_lang::plan::{AggPlan, BindPlan, BranchPlan, MatchPlan, StepPlan, WindowSpec};
 
 use crate::match_engine::EngineHashSet;
+use crate::match_engine::RuleExecutor;
+use crate::match_engine::event_bridge::ColumnarEvent;
 use crate::match_engine::match_engine::{
-    EngineHashMap, Event, FieldSource, RollingStats, StepState, Value, ValueKey,
+    CepStateMachine, EngineHashMap, Event, FieldSource, RollingStats, StepState, Value, ValueKey,
     accumulate_close_steps, eval_expr_ext,
 };
 
-use super::helpers::{event, num};
+use super::helpers::{event, num, simple_rule_plan};
 
 const N: usize = 500_000;
 /// q15 引用域：bidder ≈ 最近 1000 人 ± lead，auction ≈ 最近 100 个 ± lead。
@@ -406,12 +419,171 @@ fn q15_close_accumulate_components() {
     };
     amort.line(baseline_ns);
 
-    eprintln!();
+    // ===================================================================
+    // 生产外围路径（rule_task 每行循环）：状态机 advance 之外的每行开销
+    // ===================================================================
+    let prod = q15_production_path(&full.per_ns);
     eprintln!(
-        "[close-bench] baseline = {:.1} ns/evt → 惰性累积(每{:.0}k事件一次)上限 = {:.2} ns/evt ({:.0}×)",
-        baseline_ns,
-        SLICE_EVENTS / 1e3,
-        baseline_ns / SLICE_EVENTS,
-        SLICE_EVENTS
+        "[close-bench] 状态机 advance {:.0}ns vs 生产每行 {:.0}ns → 外围增量 = {:.0} ns/evt ({:.0}%)",
+        full.per_ns,
+        prod,
+        prod - full.per_ns,
+        (prod - full.per_ns) / full.per_ns * 100.0
     );
+}
+
+/// q15 的 RulePlan（bind=b / bid_events + q15 match_plan），供 RuleExecutor 路径。
+fn q15_rule_plan() -> wf_lang::plan::RulePlan {
+    let mut plan = simple_rule_plan(
+        "q15_bench",
+        q15_plan(),
+        Expr::Number(10.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds = vec![BindPlan {
+        alias: "b".into(),
+        window: "bid_events".into(),
+        filter: None,
+    }];
+    plan
+}
+
+/// q15 形状的 Arrow 批（与 nexmark_pk 7 列一致；dateTime 列供事件时间）。
+fn q15_batch(n: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("bidder", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+        Field::new("channel", DataType::Utf8, false),
+        Field::new("url", DataType::Utf8, false),
+        Field::new("dateTime", DataType::Int64, false),
+        Field::new("extra", DataType::Utf8, false),
+    ]));
+    let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = |range: u64| {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (rng >> 33) % range
+    };
+    let mut auction = Vec::with_capacity(n);
+    let mut bidder = Vec::with_capacity(n);
+    let mut price = Vec::with_capacity(n);
+    let mut date_time = Vec::with_capacity(n);
+    for _ in 0..n {
+        auction.push(1000 + (next(110) as i64));
+        bidder.push(1000 + (next(1010) as i64));
+        price.push((10f64.powf((next(1_000_000) as f64 / 1_000_000.0) * 6.0) * 100.0) as i64);
+        date_time.push(1_700_000_000_000_000_000i64 + next(1_000_000) as i64);
+    }
+    let channel = vec!["mobile"; n];
+    let url = vec!["https://www.nexmark.com/aaaa/bbbb/cccc/item.htm?query=1"; n];
+    let extra = vec!["x"; n];
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(auction)) as ArrayRef,
+            Arc::new(Int64Array::from(bidder)),
+            Arc::new(Int64Array::from(price)),
+            Arc::new(StringArray::from(channel)),
+            Arc::new(StringArray::from(url)),
+            Arc::new(Int64Array::from(date_time)),
+            Arc::new(StringArray::from(extra)),
+        ],
+    )
+    .unwrap()
+}
+
+/// 复刻 rule_task 每行循环的生产路径，返回完整生产每行 ns。
+fn q15_production_path(engine_full_ns: &f64) -> f64 {
+    const ROWS: usize = 200_000;
+    let exec = RuleExecutor::new(q15_rule_plan());
+    let batch = q15_batch(ROWS);
+    let nanos = 1_700_000_000_000_000_000i64;
+
+    // ---- masks_build：列式 guard mask（batch 级一次，摊到每行） ----
+    let start = Instant::now();
+    let masks = exec.branch_guard_masks(&batch);
+    let masks_ns = start.elapsed().as_secs_f64() * 1e9 / ROWS as f64;
+    let masks_report = Report {
+        name: "masks_build(摊还)",
+        per_ns: masks_ns,
+    };
+    masks_report.line(*engine_full_ns);
+
+    // ---- scan_per_row：每行过期扫描（fixed 30m 单实例，watermark 递增） ----
+    let mut sm = CepStateMachine::new("q15_bench".to_string(), q15_plan(), None);
+    let start = Instant::now();
+    for i in 0..ROWS {
+        std::hint::black_box(
+            sm.scan_expired_at_with_conv_skip_non_alerting(nanos + i as i64, None),
+        );
+    }
+    let scan_ns = start.elapsed().as_secs_f64() * 1e9 / ROWS as f64;
+    let scan_report = Report {
+        name: "scan_per_row",
+        per_ns: scan_ns,
+    };
+    scan_report.line(*engine_full_ns);
+
+    // ---- deferred_row：ColumnarEvent + advance_at_with_masks（列式 guard） ----
+    let mut sm = CepStateMachine::new("q15_bench".to_string(), q15_plan(), None);
+    let start = Instant::now();
+    for i in 0..ROWS {
+        let ev = ColumnarEvent::new(&batch, i);
+        std::hint::black_box(sm.advance_at_with_masks(
+            "b",
+            &ev,
+            nanos + i as i64,
+            None,
+            i,
+            Some(&masks),
+        ));
+    }
+    let deferred_ns = start.elapsed().as_secs_f64() * 1e9 / ROWS as f64;
+    let deferred_report = Report {
+        name: "deferred_row(列式)",
+        per_ns: deferred_ns,
+    };
+    deferred_report.line(*engine_full_ns);
+
+    // ---- eager_row：每行 Event 物化 + advance_at（解释器 guard） ----
+    let mut sm = CepStateMachine::new("q15_bench".to_string(), q15_plan(), None);
+    let start = Instant::now();
+    for i in 0..ROWS {
+        let ev = ColumnarEvent::new(&batch, i);
+        let owned = ev.to_event();
+        std::hint::black_box(sm.advance_at("b", &owned, nanos + i as i64));
+    }
+    let eager_ns = start.elapsed().as_secs_f64() * 1e9 / ROWS as f64;
+    let eager_report = Report {
+        name: "eager_row(物化)",
+        per_ns: eager_ns,
+    };
+    eager_report.line(*engine_full_ns);
+
+    // ---- prod_row_full：masks 摊还 + scan + advance_with_masks（完整生产行） ----
+    let mut sm = CepStateMachine::new("q15_bench".to_string(), q15_plan(), None);
+    let start = Instant::now();
+    for i in 0..ROWS {
+        let ev = ColumnarEvent::new(&batch, i);
+        sm.scan_expired_at_with_conv_skip_non_alerting(nanos + i as i64, None);
+        std::hint::black_box(sm.advance_at_with_masks(
+            "b",
+            &ev,
+            nanos + i as i64,
+            None,
+            i,
+            Some(&masks),
+        ));
+    }
+    let prod_ns = start.elapsed().as_secs_f64() * 1e9 / ROWS as f64;
+    let prod_report = Report {
+        name: "prod_row_full(生产)",
+        per_ns: prod_ns,
+    };
+    prod_report.line(*engine_full_ns);
+
+    prod_ns
 }

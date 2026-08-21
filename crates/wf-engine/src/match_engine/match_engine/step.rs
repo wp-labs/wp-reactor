@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use wf_lang::ast::{BinOp, CmpOp, Expr, FieldSelector, Measure, Transform};
 use wf_lang::plan::{AggPlan, StepPlan};
@@ -259,11 +259,16 @@ const MAX_TRACKED_FIELD_VALUES: usize = 1024;
 
 /// Push `value` onto `values`, trimming to the most recent
 /// `MAX_TRACKED_FIELD_VALUES` entries.
-fn push_capped(values: &mut Vec<Value>, value: Value) {
-    values.push(value);
+///
+/// 环形维护（VecDeque push_back + pop_front 均 O(1)）：旧实现用 `Vec::drain(..1)`
+/// 每次把剩余元素整体 memmove 左移（drain 后 len=1024，下一次 push 又触发 drain）——
+/// 每 push 一次 O(1024) 搬运。q15 每事件 8 个 distinct branch 收集 → 每事件
+/// 8×32KB memmove，占 q15 CPU 的 88%（macOS sample 2026-08-22 实测，q15 10M
+/// EPS 37k 的主因）。
+fn push_capped(values: &mut VecDeque<Value>, value: Value) {
+    values.push_back(value);
     if values.len() > MAX_TRACKED_FIELD_VALUES {
-        let keep_from = values.len() - MAX_TRACKED_FIELD_VALUES;
-        values.drain(..keep_from);
+        values.pop_front(); // O(1)：保留最近 MAX 个（与旧 drain 语义一致）
     }
 }
 
@@ -295,10 +300,13 @@ pub(super) fn collect_alias_event<E: FieldSource>(
 /// lookup (`entry(field_name.clone())`) — the dominant per-event allocation on
 /// count-only rules, which re-collect the same fields every event. Now the
 /// common path (key already present) is a lookup + `get_mut`, no allocation.
-fn field_values_for<'a>(alias_state: &'a mut AliasState, field_name: &str) -> &'a mut Vec<Value> {
+fn field_values_for<'a>(
+    alias_state: &'a mut AliasState,
+    field_name: &str,
+) -> &'a mut VecDeque<Value> {
     let fvm = alias_state.field_values_mut();
     if !fvm.contains_key(field_name) {
-        fvm.insert(field_name.to_string(), Vec::new());
+        fvm.insert(field_name.to_string(), VecDeque::new());
     }
     fvm.get_mut(field_name).expect("just inserted")
 }
@@ -589,7 +597,7 @@ mod tests {
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         // The retained window is the most recent entries; `.last()` is the latest event,
         // which is what yield field resolution (`e.dip`) reads.
-        assert_eq!(values.last(), Some(&Value::Number((over - 1) as f64)));
+        assert_eq!(values.back(), Some(&Value::Number((over - 1) as f64)));
         // count tracks every event regardless of the value cap.
         assert_eq!(state.count, over as u64);
     }
@@ -610,7 +618,7 @@ mod tests {
             .expect("event_id collected");
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         assert!(!values.contains(&Value::Number(0.0)));
-        assert_eq!(values.last(), Some(&Value::Number((over - 1) as f64)));
+        assert_eq!(values.back(), Some(&Value::Number((over - 1) as f64)));
         assert_eq!(state.count, over as u64);
     }
 
@@ -638,7 +646,7 @@ mod tests {
             .expect("dport collected");
         assert_eq!(values.len(), MAX_TRACKED_FIELD_VALUES);
         // `.last()` — the value yield field resolution reads — stays correct.
-        assert_eq!(values.last(), Some(&Value::Number((over - 1) as f64)));
+        assert_eq!(values.back(), Some(&Value::Number((over - 1) as f64)));
     }
 
     #[test]
@@ -746,7 +754,7 @@ mod tests {
             MAX_TRACKED_FIELD_VALUES
         );
         assert_eq!(
-            bs.collected_values.as_deref().and_then(|v| v.last()),
+            bs.collected_values.as_deref().and_then(|v| v.back()),
             Some(&Value::Number((over - 1) as f64))
         );
         // Threshold accumulators still see every event; only the raw value list is capped.

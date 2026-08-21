@@ -674,8 +674,18 @@ impl CepStateMachine {
                         (
                             bs.event_first_time_nanos,
                             bs.event_last_time_nanos,
-                            bs.collected_values.as_deref().cloned().unwrap_or_default(),
-                            bs.field_values.as_deref().cloned().unwrap_or_default(),
+                            bs.collected_values
+                                .as_deref()
+                                .map(|q| q.iter().cloned().collect())
+                                .unwrap_or_default(),
+                            bs.field_values
+                                .as_deref()
+                                .map(|m| {
+                                    m.iter()
+                                        .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                         )
                     };
                     instance.completed_steps.push(StepData {
@@ -816,7 +826,7 @@ impl CepStateMachine {
             let collected_values = step_state.branch_states[branch_idx]
                 .collected_values
                 .as_deref()
-                .cloned()
+                .map(|q| q.iter().cloned().collect())
                 .unwrap_or_default();
             instance.completed_steps.push(StepData {
                 satisfied_branch_index: branch_idx,
@@ -828,7 +838,11 @@ impl CepStateMachine {
                 field_values: step_state.branch_states[branch_idx]
                     .field_values
                     .as_deref()
-                    .cloned()
+                    .map(|m| {
+                        m.iter()
+                            .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+                            .collect()
+                    })
                     .unwrap_or_default(),
             });
 

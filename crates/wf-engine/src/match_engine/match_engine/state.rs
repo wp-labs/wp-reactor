@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use wf_lang::plan::MatchPlan;
 
 use super::key::ValueKey;
@@ -30,12 +32,17 @@ pub(super) struct BranchState {
     pub(super) event_last_time_nanos: Option<i64>,
     // L3: collected values for collect_set/list, first/last, stddev/percentile.
     // Lazy, boxed — only L3 collection measures allocate.
+    // `VecDeque`（环形）：push_capped 维护最近 MAX 个值时 push_back + pop_front
+    // 均 O(1)；旧实现用 `Vec::drain(..1)` 每 push 一次 memmove 整个数组（O(1024)），
+    // q15 每事件 8 branch 收集 → 每事件 8×32KB memmove，实测占 q15 88% CPU（sample）。
     #[allow(clippy::box_collection)] // intentional per-instance memory saving (wp-reactor#19)
-    pub(super) collected_values: Option<Box<Vec<Value>>>,
+    pub(super) collected_values: Option<Box<VecDeque<Value>>>,
     /// Per-field value history for yield / L3 collection. Lazy, boxed — a
     /// count rule never allocates this.
+    /// 值类型 VecDeque（环形）：push_capped 维护最近 MAX 个值时 O(1)；旧 Vec::drain
+    /// 每 push 一次 memmove 整个数组（q15 88% CPU 的根因，见 push_capped 注释）。
     #[allow(clippy::box_collection)] // intentional per-instance memory saving (wp-reactor#19)
-    pub(super) field_values: Option<Box<EngineHashMap<String, Vec<Value>>>>,
+    pub(super) field_values: Option<Box<EngineHashMap<String, VecDeque<Value>>>>,
 }
 
 impl BranchState {
@@ -58,15 +65,16 @@ impl BranchState {
     }
 
     /// Mutable access to the field-value history, allocating lazily.
-    pub(super) fn field_values_mut(&mut self) -> &mut EngineHashMap<String, Vec<Value>> {
+    pub(super) fn field_values_mut(&mut self) -> &mut EngineHashMap<String, VecDeque<Value>> {
         self.field_values
             .get_or_insert_with(|| Box::new(EngineHashMap::default()))
     }
 
     /// Mutable access to the L3 collected-values list, allocating lazily.
-    pub(super) fn collected_values_mut(&mut self) -> &mut Vec<Value> {
+    /// VecDeque 环形（push_back/pop_front O(1)，见 push_capped 注释）。
+    pub(super) fn collected_values_mut(&mut self) -> &mut VecDeque<Value> {
         self.collected_values
-            .get_or_insert_with(|| Box::new(Vec::new()))
+            .get_or_insert_with(|| Box::new(VecDeque::new()))
     }
 }
 
@@ -74,7 +82,7 @@ impl BranchState {
 pub(super) struct AliasState {
     pub(super) count: u64,
     /// Lazy, boxed — only aliases with tracked bind fields allocate.
-    pub(super) field_values: Option<Box<EngineHashMap<String, Vec<Value>>>>,
+    pub(super) field_values: Option<Box<EngineHashMap<String, VecDeque<Value>>>>,
 }
 
 impl AliasState {
@@ -85,7 +93,7 @@ impl AliasState {
         }
     }
 
-    pub(super) fn field_values_mut(&mut self) -> &mut EngineHashMap<String, Vec<Value>> {
+    pub(super) fn field_values_mut(&mut self) -> &mut EngineHashMap<String, VecDeque<Value>> {
         self.field_values
             .get_or_insert_with(|| Box::new(EngineHashMap::default()))
     }
@@ -122,6 +130,8 @@ pub(super) struct Instance {
     pub(super) step_states: Vec<StepState>,
     pub(super) completed_steps: Vec<super::types::StepData>,
     pub(super) close_step_states: Vec<StepState>,
+    /// Lazy, boxed (None = 8B vs HashMap 48B): rules that never track alias
+    /// bind fields don't allocate this.
     /// Lazy, boxed (None = 8B vs HashMap 48B): rules that never track alias
     /// bind fields don't allocate this.
     pub(super) alias_states: Option<Box<EngineHashMap<String, AliasState>>>,
@@ -332,7 +342,15 @@ pub(super) fn snapshot_bind_data(
             alias_states.get(&alias).map(|state| BindData {
                 alias,
                 count: state.count,
-                field_values: state.field_values.as_deref().cloned().unwrap_or_default(),
+                field_values: state
+                    .field_values
+                    .as_deref()
+                    .map(|m| {
+                        m.iter()
+                            .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
         })
         .collect()
