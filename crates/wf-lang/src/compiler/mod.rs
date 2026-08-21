@@ -8,7 +8,7 @@ use crate::ast::{
 use crate::checker::check_wfl;
 use crate::plan::{
     AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, ConvWindowPlan, EachPlan,
-    EntityPlan, ExceedAction, JoinCondPlan, JoinKeyPlan, JoinPlan, KeyMapPlan, LimitsPlan,
+    EntityPlan, ExceedAction, JoinCondPlan, JoinKeyPlan, JoinPlan, KeyMapPlan, LetPlan, LimitsPlan,
     MatchPlan, PatternOriginPlan, RateSpec, RulePlan, ScorePlan, SeqPlan, SeqSkipPlan, SeqStepPlan,
     SortKeyPlan, StepPlan, WindowSpec, YieldField, YieldPlan,
 };
@@ -119,6 +119,14 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
     RulePlan {
         name: rule.name.clone(),
         binds,
+        lets: rule
+            .lets
+            .iter()
+            .map(|l| LetPlan {
+                name: l.name.clone(),
+                expr: l.expr.clone(),
+            })
+            .collect(),
         match_plan,
         each_plan: rule.each_clause.as_ref().map(compile_each),
         joins,
@@ -226,6 +234,7 @@ fn compile_pipeline_rule(
         plans.push(RulePlan {
             name,
             binds,
+            lets: Vec::new(), // pipeline stages: `let` bindings not supported on stage chains (v1)
             match_plan,
             each_plan: None,
             joins: stage_joins,

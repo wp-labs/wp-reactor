@@ -297,3 +297,46 @@ test spray_only for password_spraying {
 "#;
     run_all_contracts(source);
 }
+
+#[test]
+fn let_binding_contracts_pass() {
+    // `let parts = split(...)` evaluates once per event (on-each path); later
+    // yield expressions reference it by bare name. Asserts the bound value is
+    // really the split array (detail = mvindex(parts,0) + "/" + mvindex(parts,2)).
+    let source = r#"
+rule r_let_dirs {
+    events { e : conn_events }
+    let parts = split(e.action, "/")
+    on each e -> score(1.0)
+    entity(ip, e.sip)
+    yield security_alerts (
+        sip = e.sip,
+        alert_type = "let_dirs",
+        detail = concat(mvindex(parts, 0), "/", mvindex(parts, 2))
+    )
+}
+
+test t1 for r_let_dirs {
+  input {
+    row(e, sip = "1.2.3.4", action = "a/b/c");
+  }
+  expect {
+    hits == 1;
+    hit[0].field("detail") == "a/c";
+  }
+}
+
+test t2 for r_let_dirs {
+  input {
+    row(e, sip = "9.9.9.9", action = "x/y");
+  }
+  expect {
+    hits == 1;
+    // split("x/y") = ["x","y"]：mvindex(parts,2) 越界 → None → concat 失败
+    // → yield 空串（与解释器路径一致）。
+    hit[0].field("detail") == "";
+  }
+}
+"#;
+    run_all_contracts(source);
+}

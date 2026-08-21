@@ -383,6 +383,7 @@ fn q12_like_plan() -> wf_lang::plan::RulePlan {
             window: "bid_events".to_string(),
             filter: None,
         }],
+        lets: Vec::new(),
         match_plan: simple_plan(
             vec![simple_key("bidder")],
             vec![step(vec![branch("b", count_ge(1.0))])],

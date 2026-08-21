@@ -51,6 +51,17 @@ pub fn build_scope<'a>(
         }
     }
 
+    // Register per-event `let` bindings: type-check the binding expression and
+    // record its inferred type so later expressions can reference it by name.
+    // Bindings are registered in order, so a later `let` may reference an
+    // earlier one (no forward references).
+    for l in &rule.lets {
+        if let Some(t) = crate::checker::types::infer_type(&l.expr, &scope) {
+            scope.let_types.insert(l.name.clone(), t);
+        }
+        crate::checker::types::check_expr_type(&l.expr, &scope, rule_name, errors);
+    }
+
     // Register join target windows so yield expressions can reference join_window.field
     for join in &rule.joins {
         let target = &join.target_window;

@@ -53,6 +53,11 @@ pub(super) fn rule_decl_with_patterns(
         )))
         .parse_next(input)?;
 
+    // Optional per-event `let` bindings (evaluated once per event on the
+    // on-each path; referenced by bare name in later expressions).
+    ws_skip.parse_next(input)?;
+    let lets: Vec<LetDecl> = repeat(0.., clauses::let_clause).parse_next(input)?;
+
     // Parse either:
     // 1) legacy/pattern single-stage rule, or
     // 2) stage chain: stage {|> stage} with implicit _in between stages.
@@ -163,6 +168,7 @@ pub(super) fn rule_decl_with_patterns(
         name,
         meta,
         events,
+        lets,
         match_clause,
         each_clause,
         score,

@@ -78,7 +78,7 @@ pub struct PipelineStage {
     pub joins: Vec<JoinClause>,
 }
 
-/// `rule name { meta events stage_chain entity yield [conv] [limits] }`
+/// `rule name { meta events [let ...]* stage_chain entity yield [conv] [limits] }`
 #[non_exhaustive]
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
 #[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
@@ -86,6 +86,9 @@ pub struct RuleDecl {
     pub name: String,
     pub meta: Option<MetaBlock>,
     pub events: EventsBlock,
+    /// Per-event bindings: `let <name> = <expr>` — evaluated once per event
+    /// (on-each path), referenced by bare `<name>` in later expressions.
+    pub lets: Vec<LetDecl>,
     pub match_clause: MatchClause,
     pub each_clause: Option<EachClause>,
     pub score: ScoreExpr,
@@ -96,6 +99,17 @@ pub struct RuleDecl {
     pub pattern_origin: Option<PatternOrigin>,
     pub conv: Option<ConvClause>,
     pub limits: Option<LimitsBlock>,
+}
+
+/// One `let <name> = <expr>` binding (evaluated once per event on the on-each
+/// path; the bound value is injected into the event's field map, so later
+/// expressions reference it by bare name).
+#[non_exhaustive]
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
+pub struct LetDecl {
+    pub name: String,
+    pub expr: Expr,
 }
 
 /// `meta { key = "value" ... }`

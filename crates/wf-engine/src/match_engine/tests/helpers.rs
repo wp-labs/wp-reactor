@@ -176,6 +176,7 @@ pub fn simple_rule_plan(
             window: "w".to_string(),
             filter: None,
         }],
+        lets: Vec::new(),
         match_plan,
         each_plan: None,
         joins: vec![],

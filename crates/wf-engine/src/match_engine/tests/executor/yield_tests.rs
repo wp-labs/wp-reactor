@@ -1515,6 +1515,7 @@ fn execute_close_yield_resolves_tracked_bind_alias_field() {
             window: "conn_events".into(),
             filter: None,
         }],
+        lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
         joins: vec![],

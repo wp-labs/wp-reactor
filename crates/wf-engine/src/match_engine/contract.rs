@@ -8,7 +8,33 @@ use crate::alert::OutputRecord;
 use crate::error::CoreResult;
 use crate::match_engine::match_engine::EngineHashMap;
 use crate::match_engine::match_engine::eval_expr;
-use crate::match_engine::{CepStateMachine, CloseReason, Event, RuleExecutor, StepResult, Value};
+use crate::match_engine::{
+    CepStateMachine, CloseReason, Event, RuleExecutor, StepResult, Value, WindowLookup,
+};
+
+/// Empty [`WindowLookup`] for the inline test harness — only reachable for
+/// `on each` rules whose joins are rejected up front, so no window is ever
+/// consulted.
+struct NoLookup;
+
+impl WindowLookup for NoLookup {
+    fn snapshot_field_values(
+        &self,
+        _window: &str,
+        _field: &str,
+    ) -> Option<std::collections::HashSet<String>> {
+        None
+    }
+    fn snapshot(&self, _window: &str) -> Option<Vec<crate::match_engine::JoinRow>> {
+        None
+    }
+    fn snapshot_with_timestamps(
+        &self,
+        _window: &str,
+    ) -> Option<Vec<(i64, crate::match_engine::JoinRow)>> {
+        None
+    }
+}
 
 /// Result of running a single test block against a rule.
 pub struct TestResult {
@@ -43,6 +69,21 @@ pub fn run_test(
                 "join-then-key rule: inline tests cannot assert hit counts (the harness runs \
                  advance_at without a WindowLookup, so every event is skipped as a join miss); \
                  use the engine-level join-key tests or E2E verify"
+                    .to_string(),
+            ],
+            output_count: 0,
+        });
+    }
+    // `on each` rules with joins need a WindowLookup the harness does not
+    // provide — reject loudly (same rationale as the key-join guard).
+    if plan.each_plan.is_some() && !plan.joins.is_empty() {
+        return Ok(TestResult {
+            test_name: test.name.clone(),
+            rule_name: test.rule_name.clone(),
+            passed: false,
+            failures: vec![
+                "on-each rule with joins: inline tests cannot assert hit counts (the harness \
+                 runs without a WindowLookup, so every join is a miss); use E2E verify"
                     .to_string(),
             ],
             output_count: 0,
@@ -121,6 +162,21 @@ fn execute_test_run(
                         }
                     }
                     StepResult::Advance | StepResult::Accumulate => {}
+                }
+
+                // `on each` rules: the match machine has no state for them, so
+                // drive the on-each path directly (joins are rejected up front,
+                // so an empty lookup never matters here).
+                if plan.each_plan.is_some() {
+                    if let Ok(Some(alert)) = executor.execute_each_with_joins(
+                        &event,
+                        current_nanos,
+                        &NoLookup,
+                        &[],
+                        current_nanos,
+                    ) {
+                        alerts.push(alert);
+                    }
                 }
 
                 current_nanos += 1_000_000_000;
@@ -289,16 +345,50 @@ fn validate_hit_assert(
             ));
         }
         HitAssert::EntityId { .. } => {}
-        HitAssert::Field {
-            name,
-            cmp,
-            value: _,
-        } => {
-            // Field assertion on yield outputs requires yield output capture.
-            failures.push(format!(
-                "hit[{}].field({}): field-level assertions not yet supported (cmp: {:?})",
-                index, name, cmp
-            ));
+        HitAssert::Field { name, cmp, value } => {
+            // Field assertion on yield outputs (validates against the record's
+            // evaluated `yield (...)` fields). Only Eq/Ne supported for now.
+            let Some(actual) = output
+                .yield_fields
+                .iter()
+                .find(|(n, _)| **n == *name)
+                .map(|(_, v)| v)
+            else {
+                failures.push(format!(
+                    "hit[{}].field({}): no such yield field",
+                    index, name
+                ));
+                return;
+            };
+            let Some(expected) = expr_to_value(value) else {
+                failures.push(format!(
+                    "hit[{}].field({}): unsupported expected value",
+                    index, name
+                ));
+                return;
+            };
+            let eq = actual == &expected;
+            let ok = match cmp {
+                CmpOp::Eq => eq,
+                CmpOp::Ne => !eq,
+                _ => {
+                    failures.push(format!(
+                        "hit[{}].field({}): only ==/!= comparisons supported, got {:?}",
+                        index, name, cmp
+                    ));
+                    return;
+                }
+            };
+            if !ok {
+                failures.push(format!(
+                    "hit[{}].field({}): expected {:?} {}, got {:?}",
+                    index,
+                    name,
+                    expected,
+                    if *cmp == CmpOp::Eq { "==" } else { "!=" },
+                    actual
+                ));
+            }
         }
         _ => {} // future-proof for non_exhaustive
     }

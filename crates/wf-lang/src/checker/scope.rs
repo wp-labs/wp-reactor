@@ -5,10 +5,12 @@ use crate::schema::{BaseType, FieldType, WindowSchema};
 
 use super::types::ValType;
 
-/// Scope built from a rule's events block and join clauses.
+/// Scope built from a rule's events block, `let` bindings and join clauses.
 pub struct Scope<'a> {
     /// Event alias → WindowSchema mapping.
     pub aliases: HashMap<&'a str, &'a WindowSchema>,
+    /// Per-event `let` bindings → value type (referenced by bare name).
+    pub let_types: HashMap<String, ValType>,
     /// Join target window names (registered in aliases but not event sources).
     pub join_windows: Vec<&'a str>,
     /// Match/close step label metadata for stat selector validation.
@@ -32,6 +34,7 @@ impl<'a> Scope<'a> {
     pub fn new() -> Self {
         Scope {
             aliases: HashMap::new(),
+            let_types: HashMap::new(),
             join_windows: Vec::new(),
             stat_labels: HashMap::new(),
         }
@@ -58,6 +61,11 @@ impl<'a> Scope<'a> {
     }
 
     fn resolve_simple(&self, name: &str) -> Result<Option<ValType>, String> {
+        // Per-event `let` bindings take precedence over event-source fields:
+        // `let parts = split(...)` is a value binding, not a field access.
+        if let Some(t) = self.let_types.get(name) {
+            return Ok(Some(t.clone()));
+        }
         // First check if it's an alias (set-level reference, e.g. count(fail))
         if self.aliases.contains_key(name) {
             return Ok(None); // Valid reference but no scalar type

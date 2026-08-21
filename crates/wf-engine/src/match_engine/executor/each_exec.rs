@@ -25,8 +25,8 @@ use super::alert::{
 };
 use super::context::execute_joins;
 use super::eval::{
-    YieldMeta, eval_bool_expr, eval_entity_id, eval_score, eval_yield_expr_with_meta,
-    with_yield_eval_scope,
+    YieldMeta, eval_bool_expr, eval_entity_id, eval_expr_with_l3, eval_score,
+    eval_yield_expr_with_meta, with_yield_eval_scope,
 };
 
 // L3 batched write (now unconditional): collect a segment's column values and
@@ -38,6 +38,18 @@ use super::eval::{
 // this is ~4× cheaper on CPU and ~half the RSS.
 
 impl RuleExecutor {
+    /// Evaluate the plan's per-event `let` bindings against `ctx` and inject
+    /// the results into the event's field map, so later expressions resolve
+    /// them by bare name. Bindings evaluate in order — a later `let` may
+    /// reference an earlier one; a binding that fails to evaluate (null)
+    /// leaves no injected field (later references then read as absent/null).
+    fn apply_lets(&self, ctx: &mut Event) {
+        for l in &self.plan.lets {
+            if let Some(v) = eval_expr_with_l3(&l.expr, ctx, YieldMeta::default()) {
+                ctx.fields.insert(l.name.clone().into(), v);
+            }
+        }
+    }
     /// Produce an [`OutputRecord`] from a single event in `on each` mode.
     ///
     /// Returns `Ok(None)` when the optional `where` filter rejects the event.
@@ -53,7 +65,13 @@ impl RuleExecutor {
         if !passes_each_filter(each_plan.filter.as_ref(), event) {
             return Ok(None);
         }
-        self.build_each_alert(event, event_time_nanos, &[], now_nanos())
+        if self.plan.lets.is_empty() {
+            self.build_each_alert(event, event_time_nanos, &[], now_nanos())
+        } else {
+            let mut ctx = event.clone();
+            self.apply_lets(&mut ctx);
+            self.build_each_alert(&ctx, event_time_nanos, &[], now_nanos())
+        }
     }
 
     /// Produce an [`OutputRecord`] from a single event in `on each` mode with
@@ -81,13 +99,14 @@ impl RuleExecutor {
         if !passes_each_filter(each_plan.filter.as_ref(), event) {
             return Ok(None);
         }
-        // Rules without joins never mutate the event — skip the per-event
-        // `fields` HashMap clone entirely (profile: the clone + its drop were
-        // ~3% of on-CPU samples on pass-through rules).
-        if self.plan.joins.is_empty() {
+        // Rules without joins or `let` bindings never mutate the event — skip
+        // the per-event `fields` HashMap clone entirely (profile: the clone +
+        // its drop were ~3% of on-CPU samples on pass-through rules).
+        if self.plan.joins.is_empty() && self.plan.lets.is_empty() {
             return self.build_each_alert(event, event_time_nanos, field_order, emit_time_nanos);
         }
         let mut ctx = event.clone();
+        self.apply_lets(&mut ctx);
         if !execute_joins(&self.plan.joins, &mut ctx, windows, event_time_nanos) {
             return Ok(None);
         }
@@ -125,9 +144,10 @@ impl RuleExecutor {
         if !passes_each_filter(each_plan.filter.as_ref(), event) {
             return Ok(false);
         }
-        // Rules without joins never mutate the event — skip the per-event
-        // `fields` HashMap clone (same optimization as the record path).
-        if self.plan.joins.is_empty() {
+        // Rules without joins or `let` bindings never mutate the event — skip
+        // the per-event `fields` HashMap clone (same optimization as the
+        // record path).
+        if self.plan.joins.is_empty() && self.plan.lets.is_empty() {
             self.build_each_direct(
                 event,
                 event_time_nanos,
@@ -138,6 +158,7 @@ impl RuleExecutor {
             return Ok(true);
         }
         let mut ctx = event.clone();
+        self.apply_lets(&mut ctx);
         if !execute_joins(&self.plan.joins, &mut ctx, windows, event_time_nanos) {
             return Ok(false);
         }
@@ -245,12 +266,14 @@ impl RuleExecutor {
                 stats.rejected += 1;
                 continue;
             }
-            // Rules without joins never mutate the event — borrow instead of
-            // cloning (same optimization as the per-event path).
-            let ctx: Cow<'_, Event> = if self.plan.joins.is_empty() {
+            // Rules without joins or `let` bindings never mutate the event —
+            // borrow instead of cloning (same optimization as the per-event
+            // path).
+            let ctx: Cow<'_, Event> = if self.plan.joins.is_empty() && self.plan.lets.is_empty() {
                 Cow::Borrowed::<Event>(*event)
             } else {
                 let mut ctx = Cow::<Event>::Owned((**event).clone());
+                self.apply_lets(ctx.to_mut());
                 if !execute_joins(&self.plan.joins, ctx.to_mut(), windows, *event_time_nanos) {
                     stats.rejected += 1;
                     continue;
@@ -381,6 +404,9 @@ impl RuleExecutor {
         let Some(each_plan) = &self.plan.each_plan else {
             return false;
         };
+        if !self.plan.lets.is_empty() {
+            return false;
+        }
         if !self.plan.joins.is_empty() || each_plan.filter.is_some() {
             return false;
         }

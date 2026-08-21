@@ -9,6 +9,33 @@ use crate::parse_utils::{duration_value, ident, kw, nonneg_integer, quoted_strin
 use super::expr;
 
 // ---------------------------------------------------------------------------
+// let clause
+// ---------------------------------------------------------------------------
+
+/// `let <ident> = <expr>` — per-event binding, referenced by bare name later.
+pub(super) fn let_clause(input: &mut &str) -> ModalResult<LetDecl> {
+    kw("let").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let name = cut_err(ident)
+        .context(StrContext::Expected(StrContextValue::Description(
+            "let binding name",
+        )))
+        .parse_next(input)?
+        .to_string();
+    ws_skip.parse_next(input)?;
+    cut_err(literal("="))
+        .context(StrContext::Expected(StrContextValue::Description("'='")))
+        .parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let expr = cut_err(expr::parse_expr)
+        .context(StrContext::Expected(StrContextValue::Description(
+            "let binding expression",
+        )))
+        .parse_next(input)?;
+    Ok(LetDecl { name, expr })
+}
+
+// ---------------------------------------------------------------------------
 // entity clause
 // ---------------------------------------------------------------------------
 

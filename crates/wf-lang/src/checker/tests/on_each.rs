@@ -2,6 +2,57 @@ use super::*;
 use crate::schema::FieldType;
 
 #[test]
+fn let_binding_compiles_and_type_resolves_in_yield() {
+    // `let parts = split(...)` registers a per-event binding; later expressions
+    // reference it by bare name (`mvindex(parts, 3)` type-checks to Chars).
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    let parts = split(e.action, "/")
+    on each e -> score(1.0)
+    entity(ip, e.sip)
+    yield out (x = mvindex(parts, 3))
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
+}
+
+#[test]
+fn let_binding_chained_references_earlier_let() {
+    // A later `let` may reference an earlier one (registered in order).
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    let parts = split(e.action, "/")
+    let first = mvindex(parts, 0)
+    on each e -> score(1.0)
+    entity(ip, e.sip)
+    yield out (x = first)
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
+}
+
+#[test]
+fn let_binding_type_error_reported() {
+    // split() requires chars; a digit source is a type error at the binding.
+    let input = r#"
+rule r {
+    events { e : auth_events }
+    let parts = split(e.count, "/")
+    on each e -> score(1.0)
+    entity(ip, e.sip)
+    yield out (x = mvindex(parts, 3))
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "split() first argument must be chars",
+    );
+}
+
+#[test]
 fn on_each_join_key_object_rejected() {
     // Hash-join index needs a scalar key; object/array join keys are rejected.
     let lookup = make_window(

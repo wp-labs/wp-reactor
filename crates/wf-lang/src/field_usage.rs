@@ -285,6 +285,7 @@ mod tests {
             conv_window: None,
             name: "t".into(),
             binds,
+            lets: Vec::new(),
             match_plan,
             each_plan: None,
             joins: Vec::new(),

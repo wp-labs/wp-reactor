@@ -26,6 +26,9 @@ pub type ExprPlan = Expr;
 pub struct RulePlan {
     pub name: String,
     pub binds: Vec<BindPlan>,
+    /// Per-event `let` bindings: evaluated once per event (on-each path), the
+    /// bound value injected into the event's field map under `name`.
+    pub lets: Vec<LetPlan>,
     pub match_plan: MatchPlan,
     pub each_plan: Option<EachPlan>,
     pub joins: Vec<JoinPlan>,
@@ -40,6 +43,13 @@ pub struct RulePlan {
     /// rule is then shardable and closes are aggregated cross-shard. Sliding /
     /// session conv rules keep `None` and stay on the legacy inline path.
     pub conv_window: Option<ConvWindowPlan>,
+}
+
+/// One compiled `let <name> = <expr>` binding (on-each per-event evaluation).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LetPlan {
+    pub name: String,
+    pub expr: ExprPlan,
 }
 
 /// Auto-generated conv aggregation descriptor (P2c).
