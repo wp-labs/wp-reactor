@@ -317,3 +317,69 @@ rule r {
         "field `nonexistent` not found",
     );
 }
+
+#[test]
+fn join_key_left_field_float_rejected() {
+    // The join index key truncates f64 (`JoinKey::from_value` does `*n as i64`)
+    // — a float driver-side condition field (b.auction) would hash into the
+    // truncated slot and false-match a real row. The right-side scalar rule
+    // already excludes float; K1d mirrors it on the left.
+    let bid = make_window(
+        "bid_events",
+        vec!["bid_stream"],
+        vec![
+            ("auction", bt(BaseType::Float)),
+            ("bidder", bt(BaseType::Digit)),
+            ("price", bt(BaseType::Digit)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { b : bid_events }
+    match<category:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on b.auction == auction_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#;
+    assert_has_error(
+        input,
+        &[bid, auction_window(), out_id_window()],
+        "f64 truncation would false-match",
+    );
+}
+
+#[test]
+fn join_key_left_right_type_mismatch_rejected() {
+    // Driver-side condition field Chars vs right-side key Digit: the join
+    // index would never match consistently — rejected at compile time.
+    let bid = make_window(
+        "bid_events",
+        vec!["bid_stream"],
+        vec![
+            ("auction", bt(BaseType::Chars)),
+            ("bidder", bt(BaseType::Digit)),
+            ("price", bt(BaseType::Digit)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { b : bid_events }
+    match<category:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on b.auction == auction_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#;
+    assert_has_error(
+        input,
+        &[bid, auction_window(), out_id_window()],
+        "type mismatch",
+    );
+}

@@ -215,7 +215,7 @@ fn field_selector_name(sel: &Option<FieldSelector>) -> Option<&str> {
     }
 }
 
-fn field_ref_name(fr: &FieldRef) -> &str {
+pub(crate) fn field_ref_name(fr: &FieldRef) -> &str {
     match fr {
         FieldRef::Simple(name) => name,
         FieldRef::Qualified(_, name) | FieldRef::Bracketed(_, name) => name,
@@ -226,7 +226,7 @@ fn field_ref_name(fr: &FieldRef) -> &str {
     }
 }
 
-fn collect_expr_fields(expr: &Expr, out: &mut HashSet<String>) {
+pub(crate) fn collect_expr_fields(expr: &Expr, out: &mut HashSet<String>) {
     match expr {
         Expr::Field(fr) => {
             out.insert(field_ref_name(fr).to_string());

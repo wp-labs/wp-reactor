@@ -1,9 +1,7 @@
-use std::collections::HashSet;
-
 use wf_lang::plan::MatchPlan;
 
 use super::key::ValueKey;
-use super::types::{BindData, EngineHashMap, FieldSource, RollingStats, Value};
+use super::types::{BindData, EngineHashMap, EngineHashSet, FieldSource, RollingStats, Value};
 
 // ---------------------------------------------------------------------------
 // Internal — per-branch / per-step / per-instance state
@@ -23,8 +21,11 @@ pub(super) struct BranchState {
     pub(super) avg_sum: f64,
     pub(super) avg_count: u64,
     /// Lazy, boxed (None = 8B vs HashSet 48B): only `distinct` transforms allocate.
+    /// Foldhash (not std SipHash): the distinct set is pure internal state —
+    /// no cross-process determinism contract — and foldhash inserts are ~3×
+    /// cheaper on the q17-style per-event distinct hot path.
     #[allow(clippy::box_collection)] // intentional per-instance memory saving (wp-reactor#19)
-    pub(super) distinct_set: Option<Box<HashSet<ValueKey>>>,
+    pub(super) distinct_set: Option<Box<EngineHashSet<ValueKey>>>,
     pub(super) event_first_time_nanos: Option<i64>,
     pub(super) event_last_time_nanos: Option<i64>,
     // L3: collected values for collect_set/list, first/last, stddev/percentile.

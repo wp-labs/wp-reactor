@@ -334,11 +334,20 @@ impl CepStateMachine {
             let Some(left_val) = event.field_value(field_ref_name(&kjp.left_field)) else {
                 return step_outcome(StepResult::Accumulate, None); // missing join-left key → skip
             };
-            let Some(rows) = windows.join_lookup(&kjp.right_window, &kjp.right_key_field, &left_val)
+            let Some(rows) =
+                windows.join_lookup(&kjp.right_window, &kjp.right_key_field, &left_val)
             else {
                 return step_outcome(StepResult::Accumulate, None); // window not found → skip
             };
-            let Some(row) = rows.first() else {
+            // Match-time join re-verifies every candidate with `values_equal`
+            // after the index lookup (`find_matching_row`); join-then-key must
+            // do the same — the index key truncates f64
+            // (`JoinKey::from_value` `as i64`), so a fractional driver value
+            // would otherwise false-match a truncated row.
+            let Some(row) = rows.iter().find(|r| {
+                r.field_value(&kjp.right_key_field)
+                    .is_some_and(|rv| values_equal(&left_val, &rv))
+            }) else {
                 return step_outcome(StepResult::Accumulate, None); // join miss → skip
             };
             let Some(key_val) = row.field_value(&kjp.right_field) else {
@@ -541,13 +550,26 @@ impl CepStateMachine {
         if is_new {
             self.push_expiry_candidate(&instance_key, fixed_created_at.unwrap_or(now_nanos));
         }
-        let mut instance = self.remove_instance(&instance_key).unwrap_or_else(|| {
+        let mut instance = self.take_instance(&instance_key).unwrap_or_else(|| {
             let created = fixed_created_at.unwrap_or(now_nanos);
             let machine_id = Self::extract_event_str(event, MACHINE_ID);
             let mut inst = Instance::new_at(&self.plan, machine_id, created);
             inst.base_cost = new_base.unwrap_or(0);
             inst
         });
+        if is_new {
+            // A freshly created instance enters the map here — account its base
+            // cost once (the old insert_instance did it per put; put_instance is
+            // net-zero and skips the mirror, so the admission must charge it).
+            if self.tracks_memory_bytes() {
+                self.estimated_memory_bytes = self
+                    .estimated_memory_bytes
+                    .saturating_add(instance.base_cost);
+                if let Some(shared) = &self.shared {
+                    shared.add_memory(instance.base_cost);
+                }
+            }
+        }
         let plan = &self.plan;
 
         instance.observe_seen_event_time(now_nanos);
@@ -589,7 +611,7 @@ impl CepStateMachine {
             instance.reset(plan, reset_at);
             instance.neg_violated = neg_violated;
             self.push_expiry_candidate(&instance_key, reset_at);
-            self.insert_instance(instance_key, instance);
+            self.put_instance(instance_key, instance);
             return step_outcome(StepResult::Accumulate, None);
         }
 
@@ -685,12 +707,12 @@ impl CepStateMachine {
                                 instance.reset(plan, reset_at);
                                 self.push_expiry_candidate(&instance_key, reset_at);
                             }
-                            self.insert_instance(instance_key, instance);
+                            self.put_instance(instance_key, instance);
                             return step_outcome(StepResult::Accumulate, None);
                         }
                         ExceedAction::FailRule => {
                             fail_rule(&mut self.failed, &self.shared);
-                            self.insert_instance(instance_key, instance);
+                            self.put_instance(instance_key, instance);
                             return step_outcome(StepResult::Accumulate, None);
                         }
                     }
@@ -719,11 +741,11 @@ impl CepStateMachine {
                     instance.reset(plan, reset_at);
                     self.push_expiry_candidate(&instance_key, reset_at);
                 }
-                self.insert_instance(instance_key, instance);
+                self.put_instance(instance_key, instance);
                 return step_outcome(StepResult::Matched(ctx), None);
             }
 
-            self.insert_instance(instance_key, instance);
+            self.put_instance(instance_key, instance);
             return step_outcome(StepResult::Accumulate, None);
         }
 
@@ -972,7 +994,7 @@ impl CepStateMachine {
                 StepResult::Advance
             }
         };
-        self.insert_instance(instance_key, instance);
+        self.put_instance(instance_key, instance);
         if let Some(progress) = &mut progress {
             progress.instances = self.instances.len();
         }
@@ -1290,23 +1312,20 @@ impl CepStateMachine {
         self.expiry_heap.push(Reverse((expire_time, key.clone())));
     }
 
-    fn insert_instance(&mut self, key: InstanceKey, instance: Instance) {
-        if self.tracks_memory_bytes() {
-            self.estimated_memory_bytes = self
-                .estimated_memory_bytes
-                .saturating_add(instance.base_cost);
-        }
-        // P1②: the shared instance count is maintained by the exact CAS
-        // reservation at admission (new instances) and explicit releases at
-        // permanent removes (evict / close / expiry) — NOT by a per-insert
-        // mirror, which double-counts a reserved new instance. Memory is still
-        // mirrored here (base-cost delta) because it is inherently approximate
-        // (recalibrate corrects drift).
-        if self.tracks_memory_bytes()
-            && let Some(shared) = &self.shared
-        {
-            shared.add_memory(instance.base_cost);
-        }
+    /// Take an instance out of the map for the in-event processing round-trip
+    /// WITHOUT touching the memory mirror — the same instance is put back a few
+    /// statements later (net-zero base cost), so the per-event add/sub churn
+    /// on the q17-style high-fire path (171 万实例 sliding map, every event
+    /// removes + re-inserts) was pure overhead: 4 AtomicU64 ops per event.
+    /// New-instance admission accounts its base cost explicitly at the take
+    /// site; permanent removes (evict/close/expiry) keep `remove_instance`.
+    fn take_instance(&mut self, key: &InstanceKey) -> Option<Instance> {
+        self.instances.remove(key)
+    }
+
+    /// Put the instance back after the in-event round-trip (no memory
+    /// mirroring — see [`Self::take_instance`]).
+    fn put_instance(&mut self, key: InstanceKey, instance: Instance) {
         self.instances.insert(key, instance);
     }
 

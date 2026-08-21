@@ -715,7 +715,14 @@ pub(crate) fn compute_needs_field_history(
     yield_fields: &[YieldField],
 ) -> bool {
     if !match_plan.close_steps.is_empty() {
-        return true;
+        // Close steps accumulate per event, but the field *history* (the
+        // per-event `field_values` collection feeding close-time `Field`
+        // resolution) is only needed when the close-path outputs reference a
+        // field that resolves outside the match keys — `build_eval_context`
+        // serves keys from `scope_key` with precedence over the history.
+        // q12-style count rules whose yields read only the key (or literals /
+        // system vars) skip the per-event `collect_alias_event` entirely.
+        return close_path_reads_non_key_fields(match_plan, score_expr, entity_expr, yield_fields);
     }
     if binds.len() > 1 || !joins.is_empty() {
         return true;
@@ -727,6 +734,37 @@ pub(crate) fn compute_needs_field_history(
         return true;
     }
     false
+}
+
+/// Close path needs the per-event field history iff the score/entity/yield
+/// expressions read a field that is not one of the match keys (which the eval
+/// ctx serves from `scope_key`) or call a function that consumes collected
+/// values / alias counts (L3 series, `stat.*`, event accessors).
+fn close_path_reads_non_key_fields(
+    match_plan: &MatchPlan,
+    score_expr: &Expr,
+    entity_expr: &Expr,
+    yield_fields: &[YieldField],
+) -> bool {
+    if expr_uses_l3_series(score_expr)
+        || expr_uses_l3_series(entity_expr)
+        || yield_fields.iter().any(|f| expr_uses_l3_series(&f.value))
+    {
+        return true;
+    }
+    let key_names: HashSet<&str> = match_plan
+        .keys
+        .iter()
+        .map(crate::field_usage::field_ref_name)
+        .collect();
+    let mut refs = HashSet::new();
+    crate::field_usage::collect_expr_fields(score_expr, &mut refs);
+    crate::field_usage::collect_expr_fields(entity_expr, &mut refs);
+    for f in yield_fields {
+        crate::field_usage::collect_expr_fields(&f.value, &mut refs);
+    }
+    refs.into_iter()
+        .any(|name| name.is_empty() || name.starts_with('_') || !key_names.contains(name.as_str()))
 }
 
 fn compile_step(step: &crate::ast::MatchStep, inject_implicit_stage_labels: bool) -> StepPlan {

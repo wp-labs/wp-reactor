@@ -11,10 +11,12 @@ use crate::match_engine::match_engine::{CepStateMachine, StepResult, Value, Wind
 use super::helpers::{branch, count_ge, event, num, simple_plan, step};
 
 /// Minimal `WindowLookup` for join-then-key tests: keyed by
-/// `(window, key_field, key_value_bits)` with numeric keys (f64 → u64 bits so
-/// the map is `Hash`-able).
+/// `(window, key_field, index_key)` where the index key mirrors the real join
+/// index's f64 truncation (`JoinKey::from_value` does `*n as i64`) — so a
+/// fractional driver value lands in the truncated slot, exercising the
+/// `values_equal` re-check the key-join branch now performs.
 struct TestLookup {
-    rows: HashMap<(String, String, u64), Vec<JoinRow>>,
+    rows: HashMap<(String, String, i64), Vec<JoinRow>>,
 }
 
 impl TestLookup {
@@ -39,8 +41,10 @@ impl WindowLookup for TestLookup {
         let Value::Number(n) = key else {
             return None;
         };
+        // Same truncation as the real hash index (JoinKey::from_value).
+        let index_key = *n as i64;
         self.rows
-            .get(&(window.to_string(), key_field.to_string(), n.to_bits()))
+            .get(&(window.to_string(), key_field.to_string(), index_key))
             .cloned()
     }
 }
@@ -71,7 +75,7 @@ fn join_key_hit_routes_to_joined_key_instance() {
     let mut sm = CepStateMachine::new("t".into(), plan, None);
     let lookup = TestLookup {
         rows: HashMap::from([(
-            ("auction_events".into(), "id".into(), 42.0f64.to_bits()),
+            ("auction_events".into(), "id".into(), 42),
             vec![TestLookup::row(42.0, 7.0)],
         )]),
     };
@@ -93,11 +97,11 @@ fn join_key_hit_routes_distinct_joined_keys_to_distinct_instances() {
     let lookup = TestLookup {
         rows: HashMap::from([
             (
-                ("auction_events".into(), "id".into(), 1.0f64.to_bits()),
+                ("auction_events".into(), "id".into(), 1),
                 vec![TestLookup::row(1.0, 10.0)],
             ),
             (
-                ("auction_events".into(), "id".into(), 2.0f64.to_bits()),
+                ("auction_events".into(), "id".into(), 2),
                 vec![TestLookup::row(2.0, 20.0)],
             ),
         ]),
@@ -123,11 +127,11 @@ fn join_key_hit_routes_distinct_joined_keys_to_distinct_instances() {
     let same_category = TestLookup {
         rows: HashMap::from([
             (
-                ("auction_events".into(), "id".into(), 1.0f64.to_bits()),
+                ("auction_events".into(), "id".into(), 1),
                 vec![TestLookup::row(1.0, 5.0)],
             ),
             (
-                ("auction_events".into(), "id".into(), 2.0f64.to_bits()),
+                ("auction_events".into(), "id".into(), 2),
                 vec![TestLookup::row(2.0, 5.0)],
             ),
         ]),
@@ -168,7 +172,7 @@ fn join_key_missing_left_field_skips_event() {
     let mut sm = CepStateMachine::new("t".into(), plan, None);
     let lookup = TestLookup {
         rows: HashMap::from([(
-            ("auction_events".into(), "id".into(), 42.0f64.to_bits()),
+            ("auction_events".into(), "id".into(), 42),
             vec![TestLookup::row(42.0, 7.0)],
         )]),
     };
@@ -192,13 +196,43 @@ fn join_key_without_lookup_skips_event() {
 }
 
 #[test]
+fn join_key_fractional_left_value_does_not_false_match() {
+    // The join index key truncates f64 (`JoinKey::from_value` `as i64`): a
+    // fractional driver value 1.5 lands in the Int(1) slot next to auction
+    // id=1. The key-join branch re-checks with `values_equal` (like the
+    // match-time join path) and must reject the row — no instance, no match.
+    let plan = join_key_plan();
+    let mut sm = CepStateMachine::new("t".into(), plan, None);
+    let lookup = TestLookup {
+        rows: HashMap::from([(
+            ("auction_events".into(), "id".into(), 1),
+            vec![TestLookup::row(1.0, 7.0)],
+        )]),
+    };
+    let e = event(vec![("auction", num(1.5))]);
+    assert_eq!(
+        sm.advance_at_with("b", &e, 1_000, Some(&lookup)),
+        StepResult::Accumulate,
+        "fractional driver value must not false-match the truncated index slot"
+    );
+    assert_eq!(sm.instance_count(), 0);
+
+    // Exact integer 1.0 still joins normally.
+    let e = event(vec![("auction", num(1.0))]);
+    let StepResult::Matched(ctx) = sm.advance_at_with("b", &e, 2_000, Some(&lookup)) else {
+        panic!("exact integer driver value should join");
+    };
+    assert_eq!(ctx.scope_key, vec![num(7.0)]);
+}
+
+#[test]
 fn join_key_key_absent_on_joined_row_skips_event() {
     let plan = join_key_plan();
     let mut sm = CepStateMachine::new("t".into(), plan, None);
     // Joined row exists but lacks the `category` key field.
     let lookup = TestLookup {
         rows: HashMap::from([(
-            ("auction_events".into(), "id".into(), 42.0f64.to_bits()),
+            ("auction_events".into(), "id".into(), 42),
             vec![JoinRow::Event(Arc::new(event(vec![("id", num(42.0))])))],
         )]),
     };
@@ -238,11 +272,11 @@ fn join_key_fixed_window_routes_to_bucket() {
     let lookup = TestLookup {
         rows: HashMap::from([
             (
-                ("auction_events".into(), "id".into(), 1.0f64.to_bits()),
+                ("auction_events".into(), "id".into(), 1),
                 vec![TestLookup::row(1.0, 7.0)],
             ),
             (
-                ("auction_events".into(), "id".into(), 2.0f64.to_bits()),
+                ("auction_events".into(), "id".into(), 2),
                 vec![TestLookup::row(2.0, 7.0)],
             ),
         ]),
@@ -260,7 +294,11 @@ fn join_key_fixed_window_routes_to_bucket() {
         sm.advance_at_with("b", &e2, 150, Some(&lookup)),
         StepResult::Matched(_)
     ));
-    assert_eq!(sm.instance_count(), 1, "same category + same bucket → 1 instance");
+    assert_eq!(
+        sm.instance_count(),
+        1,
+        "same category + same bucket → 1 instance"
+    );
 
     // Same category but different buckets (t=100s vs t=610s → bucket 1) →
     // distinct fixed instances.
@@ -277,7 +315,11 @@ fn join_key_fixed_window_routes_to_bucket() {
         sm2.advance_at_with("b", &e2, 610_000_000_000, Some(&lookup)),
         StepResult::Matched(_)
     ));
-    assert_eq!(sm2.instance_count(), 2, "same category, different buckets → 2 instances");
+    assert_eq!(
+        sm2.instance_count(),
+        2,
+        "same category, different buckets → 2 instances"
+    );
 }
 
 #[test]
@@ -288,7 +330,7 @@ fn join_key_fixed_with_epoch_ns_timestamp_matches() {
     plan.window_spec = WindowSpec::Fixed(Duration::from_secs(600));
     let lookup = TestLookup {
         rows: HashMap::from([(
-            ("auction_events".into(), "id".into(), 1.0f64.to_bits()),
+            ("auction_events".into(), "id".into(), 1),
             vec![TestLookup::row(1.0, 7.0)],
         )]),
     };
@@ -311,7 +353,7 @@ fn join_key_fixed_with_seq_mode_matches() {
     plan.match_mode = MatchMode::Seq;
     let lookup = TestLookup {
         rows: HashMap::from([(
-            ("auction_events".into(), "id".into(), 1.0f64.to_bits()),
+            ("auction_events".into(), "id".into(), 1),
             vec![TestLookup::row(1.0, 7.0)],
         )]),
     };

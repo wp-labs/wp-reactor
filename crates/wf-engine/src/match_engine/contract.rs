@@ -28,6 +28,26 @@ pub fn run_test(
     plan: &RulePlan,
     time_field: Option<String>,
 ) -> CoreResult<TestResult> {
+    // join-then-key rules can't be asserted by inline tests: the harness runs
+    // `advance_at` without a WindowLookup, so the key-join branch treats every
+    // event as a join miss and skips it (hits == 0 no matter what the input
+    // says) — an `expect hits: 0` would pass vacuously. Reject loudly instead
+    // of silently green-lighting a vacuous assertion (P1 guard; join-key
+    // behavior is anchored by engine-level tests + E2E verify).
+    if plan.match_plan.key_join.is_some() {
+        return Ok(TestResult {
+            test_name: test.name.clone(),
+            rule_name: test.rule_name.clone(),
+            passed: false,
+            failures: vec![
+                "join-then-key rule: inline tests cannot assert hit counts (the harness runs \
+                 advance_at without a WindowLookup, so every event is skipped as a join miss); \
+                 use the engine-level join-key tests or E2E verify"
+                    .to_string(),
+            ],
+            output_count: 0,
+        });
+    }
     let permutation = test.options.as_ref().and_then(|o| o.permutation);
     let runs = test.options.as_ref().and_then(|o| o.runs).unwrap_or(1);
 
