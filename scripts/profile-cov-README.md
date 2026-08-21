@@ -38,6 +38,32 @@ BENCHES="close_bench" PKGS="wf-engine" scripts/profile-cov.sh
 - **基准覆盖面**：close_bench 只覆盖 wf-engine 状态机层；`rule_task.rs`（生产外围）
   显示为"仅测试覆盖"——这类模块需要端到端/集成基准（bench.sh 跑批 + sample）。
 
+## 真实运行时热路径（profile-runtime.sh）
+
+微基准覆盖的是引擎内部路径；**真实运行**（TCP 接收 / parse / 列式转换 / routing /
+窗口 / emit / ack 全链路）的热点分布完全不同。用 LLVM **instrument-coverage 插桩**
+构建 wfusion，跑真实 bench，精确统计每行执行次数：
+
+```bash
+RUNTIME_BENCH="q1 q4 q12" TOTAL=10m scripts/profile-runtime.sh
+```
+
+流程：插桩构建（隔离 CARGO_TARGET_DIR）→ `LLVM_PROFILE_FILE` 跑真实 bench
+（bench.sh 透传）→ `llvm-profdata merge` → `llvm-cov export` → 行级计数报告。
+产物：`target/profile-runtime/{runtime.json, report.txt}`。
+
+首跑对比（q4/q12 replay 10m，微基准 close_bench 完全看不到这些热点）：
+
+| 真实运行热点 | 计数 | 说明 |
+|------|------|------|
+| `event_bridge.rs:22-34`（batch_to_events） | 2620 万次 | 事件物化路径 |
+| `window/buffer/mod.rs:728-730` | 2000 万次 | 窗口缓冲（q4 join 路径） |
+| `executor/close_exec.rs` | 覆盖 571 行 | fixed+close 执行器 |
+
+> 注意：插桩构建需 `-Cdebuginfo=1`（llvm-cov 需要行映射）；两次跑批间清理
+> profraw；`profile-generate`（PGO）不生成行级映射，llvm-cov 读不了——
+> 必须用 `-Cinstrument-coverage`。
+
 ## 2026-08-22 首跑结论（close_bench + each_bench，500k 事件）
 
 热点行（每事件调用次数 = 计数 ÷ 500k）：
