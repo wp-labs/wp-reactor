@@ -21,11 +21,12 @@ use wf_lang::plan::RulePlan;
 use wf_lang::{BaseType, FieldType};
 
 use self::alert::build_summary;
+use self::context::CloseCtxFields;
 use self::eval::eval_bool_expr_with_lookup;
 use crate::alert::AlertOrigin;
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::columnar::{ColumnarBatch, GuardMasks, eval_guard_columnar};
-use crate::match_engine::match_engine::{FieldSource, Value, WindowLookup};
+use crate::match_engine::match_engine::{FieldSource, Value, WindowLookup, field_ref_name};
 use crate::time::normalize_epoch_timestamp_float_nanos;
 use arrow::array::BooleanArray;
 use arrow::record_batch::RecordBatch;
@@ -59,6 +60,84 @@ pub(crate) struct OutputStatic {
     pub(crate) each_close_reason: Arc<str>,
 }
 
+/// Narrow the synthetic ctx fields built for close/match alert construction
+/// to the names the rule's score/entity/yield expressions can actually read.
+/// Any function call (L3 aggregation, window access) or a reference to a
+/// reserved synthetic field name forces the conservative all-fields build.
+fn plan_close_ctx_fields(plan: &RulePlan) -> CloseCtxFields {
+    let mut names = std::collections::HashSet::new();
+    let mut force_all = false;
+    visit_expr_fields(&plan.score_plan.expr, &mut names, &mut force_all);
+    visit_expr_fields(&plan.entity_plan.entity_id_expr, &mut names, &mut force_all);
+    for field in &plan.yield_plan.fields {
+        visit_expr_fields(&field.value, &mut names, &mut force_all);
+    }
+
+    if force_all {
+        CloseCtxFields::All
+    } else {
+        CloseCtxFields::Named(names)
+    }
+}
+
+fn visit_expr_fields(
+    expr: &Expr,
+    names: &mut std::collections::HashSet<String>,
+    force_all: &mut bool,
+) {
+    match expr {
+        Expr::Field(fr) => match field_ref_name(fr) {
+            "" => *force_all = true,
+            name if name.starts_with('_') => *force_all = true,
+            name => {
+                names.insert(name.to_string());
+            }
+        },
+        Expr::FuncCall { .. } | Expr::PresetParam(_) => *force_all = true,
+        Expr::BinOp { left, right, .. } => {
+            visit_expr_fields(left, names, force_all);
+            visit_expr_fields(right, names, force_all);
+        }
+        Expr::Neg(inner) => visit_expr_fields(inner, names, force_all),
+        Expr::Array(items) => {
+            for item in items {
+                visit_expr_fields(item, names, force_all);
+            }
+        }
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
+            visit_expr_fields(inner, names, force_all);
+            for item in list {
+                visit_expr_fields(item, names, force_all);
+            }
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            visit_expr_fields(cond, names, force_all);
+            visit_expr_fields(then_expr, names, force_all);
+            visit_expr_fields(else_expr, names, force_all);
+        }
+        Expr::Object(items) => {
+            for item in items {
+                visit_expr_fields(&item.value, names, force_all);
+            }
+        }
+        // Number/StringLit/Bool/SystemVar/WfuMeta read literals or
+        // YieldMeta — no ctx field access.
+        Expr::Number(_)
+        | Expr::StringLit(_)
+        | Expr::Bool(_)
+        | Expr::SystemVar(_)
+        | Expr::WfuMeta(_) => {}
+        // Non-exhaustive Expr: unknown variants conservatively force the
+        // all-fields build (the eval may read anything from the ctx).
+        _ => *force_all = true,
+    }
+}
 /// Evaluates score/entity expressions from a [`RulePlan`] and produces
 /// [`OutputRecord`]s from CEP match/close outputs.
 ///
@@ -87,6 +166,10 @@ pub struct RuleExecutor {
     /// 6 workers on one lock dropped per-worker throughput ~20x (nexmark
     /// q1 30M, 2026-08-16).
     emit_time_cache: Mutex<(i64, Arc<str>)>,
+    /// Narrowed synthetic ctx field set for the close/match alert builders
+    /// (see [`plan_close_ctx_fields`] — `All` for rules whose expressions
+    /// can't be statically narrowed).
+    close_ctx_fields: CloseCtxFields,
 }
 
 // Manual impl: `Mutex` is not `Clone`. `emit_time_cache` is a pure memo
@@ -101,6 +184,7 @@ impl Clone for RuleExecutor {
             bind_filters: self.bind_filters.clone(),
             output_static: self.output_static.clone(),
             emit_time_cache: Mutex::new((0, Arc::from(""))),
+            close_ctx_fields: self.close_ctx_fields.clone(),
         }
     }
 }
@@ -180,6 +264,7 @@ impl RuleExecutor {
                 &AlertOrigin::Event,
             ))
         });
+        let close_ctx_fields = plan_close_ctx_fields(&plan);
         Self {
             output_static: OutputStatic {
                 rule_name: Arc::from(plan.name.as_str()),
@@ -196,6 +281,7 @@ impl RuleExecutor {
             output: options.output,
             bind_filters,
             emit_time_cache: Mutex::new((0, Arc::from(""))),
+            close_ctx_fields,
         }
     }
 

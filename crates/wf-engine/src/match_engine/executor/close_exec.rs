@@ -13,6 +13,85 @@ use super::eval::{
     YieldMeta, eval_entity_id, eval_score, eval_yield_expr_with_meta, with_yield_eval_scope,
 };
 
+// ---------------------------------------------------------------------------
+// Close-path stage profiler (E2): split execute_close_with_joins into its
+// phases so the q12-style close fan-out cost can be read from stderr. Enabled
+// with `E2_TIMER=1`; buckets cover combine / ctx-build / alert-build.
+// ---------------------------------------------------------------------------
+#[derive(Default)]
+struct E2Profiler {
+    on: bool,
+    buckets: [u64; 3],
+    calls: u64,
+}
+
+static E2_STATE: std::sync::OnceLock<std::sync::Mutex<E2Profiler>> = std::sync::OnceLock::new();
+
+impl E2Profiler {
+    fn maybe() -> Self {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ENABLED.get_or_init(|| {
+            std::env::var("E2_TIMER").is_ok() && std::env::var("E2_TIMER").as_deref() != Ok("0")
+        });
+        E2Profiler {
+            on,
+            buckets: [0; 3],
+            calls: 0,
+        }
+    }
+    #[inline(always)]
+    fn add(&mut self, bucket: usize, start: std::time::Instant) {
+        if self.on {
+            self.buckets[bucket] += start.elapsed().as_nanos() as u64;
+        }
+    }
+    /// Fold this call's buckets into the shared accumulator; report + reset
+    /// every 65536 calls so stderr stays bounded while the run covers millions
+    /// of closes.
+    fn fold(&mut self) {
+        if !self.on {
+            return;
+        }
+        let mut shared = E2_STATE
+            .get_or_init(|| std::sync::Mutex::new(E2Profiler::default()))
+            .lock()
+            .unwrap();
+        for (i, b) in self.buckets.iter().enumerate() {
+            shared.buckets[i] += b;
+        }
+        shared.calls += 1;
+        if shared.calls >= 65536 {
+            let snap = std::mem::replace(&mut *shared, E2Profiler::default());
+            snap.report();
+        }
+    }
+    fn report(&self) {
+        if self.calls == 0 {
+            return;
+        }
+        let total: u64 = self.buckets.iter().sum();
+        let n = self.calls as f64;
+        eprintln!(
+            "[E2-profiler] calls={} total={:.1}ns/call",
+            self.calls,
+            total as f64 / n
+        );
+        let names = ["\u{7c} combine ", "\u{7c} ctx     ", "\u{7c} build   "];
+        for (name, ns) in names.iter().zip(self.buckets.iter()) {
+            eprintln!(
+                "  {} {:>7.1} ns/call ({:>4.1}%)\n",
+                name,
+                *ns as f64 / n,
+                if total > 0 {
+                    *ns as f64 / total as f64 * 100.0
+                } else {
+                    0.0
+                }
+            );
+        }
+    }
+}
+
 /// Check whether a close output qualifies to produce an alert.
 fn is_qualified(close: &CloseOutput) -> bool {
     match close.close_mode {
@@ -44,6 +123,7 @@ impl RuleExecutor {
             &close.bind_data,
             &step_plans,
             None,
+            &self.close_ctx_fields,
         );
         let ctx = annotate_close_step_stages(ctx, close.event_step_data.len());
         self.build_close_alert(close, &all_step_data, &ctx)
@@ -58,8 +138,14 @@ impl RuleExecutor {
         if !is_qualified(close) {
             return Ok(None);
         }
+        let mut prof = E2Profiler::maybe();
+        let _t_combine = prof.on.then(std::time::Instant::now);
         let all_step_data = combine_step_data(close);
         let step_plans = combine_step_plans(self, close);
+        if let Some(t) = _t_combine {
+            prof.add(0, t);
+        }
+        let _t_ctx = prof.on.then(std::time::Instant::now);
         let mut ctx = build_eval_context(
             &self.plan.match_plan.keys,
             &close.scope_key,
@@ -67,10 +153,20 @@ impl RuleExecutor {
             &close.bind_data,
             &step_plans,
             None,
+            &self.close_ctx_fields,
         );
         ctx = annotate_close_step_stages(ctx, close.event_step_data.len());
         execute_joins(&self.plan.joins, &mut ctx, windows, close.last_event_nanos);
-        self.build_close_alert(close, &all_step_data, &ctx)
+        if let Some(t) = _t_ctx {
+            prof.add(1, t);
+        }
+        let _t_build = prof.on.then(std::time::Instant::now);
+        let result = self.build_close_alert(close, &all_step_data, &ctx);
+        if let Some(t) = _t_build {
+            prof.add(2, t);
+        }
+        prof.fold();
+        result
     }
 
     /// Internal: build the OutputRecord from an already-constructed eval context.

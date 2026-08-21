@@ -234,6 +234,11 @@ pub(super) struct RuleTask {
     /// The to_data_record time is also exported as the `alert.serialize_nanos`
     /// metric (summed across the run).
     exec_nanos: u64,
+    /// Finer emit split: execute_close_with_joins (close path output record
+    /// construction) — the q12 hot spot; kept separate from `emit_nanos` so the
+    /// per-record build vs. the batch append hand-off can be read from the
+    /// profiling dump.
+    close_exec_nanos: u64,
     serialize_nanos: std::sync::atomic::AtomicU64,
     fanout_nanos: std::sync::atomic::AtomicU64,
     /// Last wall-clock dump of the profiling accumulators (throttled log).
@@ -384,6 +389,7 @@ impl RuleTask {
             scan_nanos: 0,
             emit_nanos: 0,
             exec_nanos: 0,
+            close_exec_nanos: 0,
             serialize_nanos: std::sync::atomic::AtomicU64::new(0),
             fanout_nanos: std::sync::atomic::AtomicU64::new(0),
             last_profile_dump: std::time::Instant::now(),
@@ -852,6 +858,17 @@ impl RuleTask {
         // and send ONE ConvCloseBatch (with the max event-time watermark) after
         // the loop — avoids a per-event bounded(32) channel send on the hot path.
         let mut conv_closes: Vec<wf_engine::match_engine::CloseOutput> = Vec::new();
+        // Records produced by the match/close paths accumulate here and are
+        // appended to the pending columnar builder in one lock per
+        // ALERT_BATCH_SIZE group (see [`Self::emit_batch`]) — the per-record
+        // lock + target lookup was measurable on the q12 close fan-out hot
+        // path (emit_nanos dominated the profiling budget).
+        let mut staged_outputs: Vec<OutputRecord> = Vec::new();
+        // Records produced by the match/close paths accumulate here and are
+        // appended to the pending columnar builder in one lock per
+        // ALERT_BATCH_SIZE group (see [`Self::emit_batch`]) — the per-record
+        // lock + target lookup was measurable on the q12 close fan-out hot
+        // path (emit_nanos dominated the profiling budget).
         let mut conv_max_wm: i64 = 0;
         let mut hit_cursor = 0usize;
         // Iterate the row domain: `i` is the position within `row_domain`
@@ -1087,7 +1104,10 @@ impl RuleTask {
                 // skipped (the closes were already sent in the scan step).
                 if !routed {
                     for close in &closes {
-                        match self.executor.execute_close_with_joins(close, &lookup) {
+                        let _close_exec_start = Instant::now();
+                        let result = self.executor.execute_close_with_joins(close, &lookup);
+                        self.close_exec_nanos += _close_exec_start.elapsed().as_nanos() as u64;
+                        match result {
                             Ok(Some(record)) => {
                                 if debug_enabled {
                                     stats.count_output(&record, &self.intermediate_targets);
@@ -1101,7 +1121,7 @@ impl RuleTask {
                                         close.scope_key.as_slice(),
                                     );
                                 }
-                                self.emit(record).await;
+                                self.stage_or_emit_record(&mut staged_outputs, record).await;
                             }
                             Ok(None) => {
                                 if debug_enabled {
@@ -1153,7 +1173,7 @@ impl RuleTask {
                                     ctx.scope_key.as_slice(),
                                 );
                             }
-                            self.emit(record).await;
+                            self.stage_or_emit_record(&mut staged_outputs, record).await;
                         }
                         Ok(None) => {
                             if debug_enabled {
@@ -1394,6 +1414,11 @@ impl RuleTask {
             }
         }
         self.dump_profiling();
+        // Deliver any remaining staged outputs (same cadence as the per-event
+        // flush — bounds delivery latency to one event batch).
+        if !staged_outputs.is_empty() {
+            self.emit_batch(std::mem::take(&mut staged_outputs)).await;
+        }
         // Deliver any accumulated alert batch (bounds delivery latency to one
         // event batch and flushes test expectations without an explicit EOS).
         self.flush_alerts().await;
@@ -1414,6 +1439,7 @@ impl RuleTask {
             scan_nanos = self.scan_nanos,
             advance_nanos = self.advance_nanos,
             exec_nanos = self.exec_nanos,
+            close_exec_nanos = self.close_exec_nanos,
             serialize_nanos = self.serialize_nanos.load(Ordering::Relaxed),
             fanout_nanos = self.fanout_nanos.load(Ordering::Relaxed),
             emit_nanos = self.emit_nanos,
@@ -1879,6 +1905,138 @@ impl RuleTask {
         }
         if should_flush {
             self.flush_alerts().await;
+        }
+    }
+
+    /// Batch twin of [`Self::emit`]: append a whole group of already-built
+    /// records to the per-target columnar builder under **one** pending lock
+    /// and one target lookup, flushing when the pending batch fills. Records
+    /// are appended in order; telemetry is exact (same counters as
+    /// [`Self::emit`]); the serialize timing covers the whole group and is
+    /// sampled 1-in-`EMIT_METRIC_SAMPLE_INTERVAL` (scaled by group size) —
+    /// same diagnostic shape as the per-record sampler.
+    ///
+    /// The q12-style close/match fan-out emits one record per closed window;
+    /// per-record lock + target lookup + await-poll was measurable on the
+    /// profiling hot path (emit_nanos dominated the q12 batch budget), while
+    /// the append itself is a Vec push per column.
+    async fn emit_batch(&self, records: Vec<OutputRecord>) {
+        let n = records.len();
+        if n == 0 {
+            return;
+        }
+        // Exact totals + sampled detail/e2e — identical accounting to
+        // [`Self::emit`] (the sampler state lives on the rule task, so the
+        // cadence is unchanged whether records arrive one-by-one or in a group).
+        if let Some(metrics) = &self.metrics {
+            let now_nanos = self.cached_wall_nanos.load(Ordering::Relaxed);
+            for record in &records {
+                metrics.inc_alert_emitted_total(&record.rule_name);
+                let sample = self.emit_sample_remaining.load(Ordering::Relaxed);
+                if sample == 0 {
+                    self.emit_sample_remaining
+                        .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
+                    metrics.inc_alert_emitted_detail(
+                        &record.rule_name,
+                        &record.machine_id,
+                        &record.scope_key,
+                    );
+                    let e2e_nanos = now_nanos.saturating_sub(record.event_time_nanos.max(0) as u64);
+                    metrics.observe_event_e2e_latency(Duration::from_nanos(e2e_nanos));
+                } else {
+                    self.emit_sample_remaining
+                        .store(sample - 1, Ordering::Relaxed);
+                }
+            }
+        }
+        // Split off intermediate (pipe) targets — same relay semantics as the
+        // per-record path, before any sink append.
+        let mut pipe_records = Vec::new();
+        let mut sink_records: Vec<OutputRecord> = Vec::with_capacity(n);
+        for record in records {
+            if self.intermediate_targets.contains(&*record.yield_target) {
+                pipe_records.push(record);
+            } else {
+                sink_records.push(record);
+            }
+        }
+        for record in pipe_records {
+            self.stage_pipe_record(record);
+        }
+        if sink_records.is_empty() {
+            return;
+        }
+        let time_this = {
+            let rem = self
+                .serialize_sample_remaining
+                .fetch_sub(1, Ordering::Relaxed);
+            if rem == 1 {
+                self.serialize_sample_remaining
+                    .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        };
+        let _ser_start = time_this.then(Instant::now);
+        let should_flush = {
+            let mut pending = self.pending_alerts.lock().unwrap();
+            let target = &sink_records[0].yield_target;
+            let slot = pending
+                .by_target
+                .iter_mut()
+                .find(|(existing, _)| *existing == *target);
+            let builder = match slot {
+                Some((_, builder)) => builder,
+                None => {
+                    pending.by_target.push((
+                        std::sync::Arc::clone(target),
+                        AlertColumnBuilder::new(std::sync::Arc::clone(target)),
+                    ));
+                    let last = pending.by_target.len() - 1;
+                    &mut pending.by_target[last].1
+                }
+            };
+            let mut failed = 0usize;
+            for record in &sink_records {
+                if builder.append_record(record).is_err() {
+                    failed += 1;
+                }
+            }
+            pending.count += sink_records.len() - failed;
+            if failed > 0 {
+                if let Some(metrics) = &self.metrics {
+                    for _ in 0..failed {
+                        metrics.inc_alert_serialize_failed();
+                    }
+                }
+            }
+            pending.count >= ALERT_BATCH_SIZE
+        };
+        if let Some(start) = _ser_start {
+            // Sampled 1-in-64 *batches* (the sampler decrements once per group),
+            // so the report scales the group's append time by
+            // EMIT_METRIC_SAMPLE_INTERVAL only — multiplying by the group size
+            // as well double-counted (group duration already covers all n rows).
+            let elapsed = start.elapsed().as_nanos() as u64;
+            let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64;
+            self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
+            if let Some(metrics) = &self.metrics {
+                metrics.add_alert_serialize_nanos(scaled);
+            }
+        }
+        if should_flush {
+            self.flush_alerts().await;
+        }
+    }
+
+    /// Accumulate one produced record into `staged`, draining through
+    /// [`Self::emit_batch`] once the group reaches [`ALERT_BATCH_SIZE`] — keeps
+    /// the flush cadence and pending memory bound of the per-record path.
+    async fn stage_or_emit_record(&self, staged: &mut Vec<OutputRecord>, record: OutputRecord) {
+        staged.push(record);
+        if staged.len() >= ALERT_BATCH_SIZE {
+            self.emit_batch(std::mem::take(staged)).await;
         }
     }
 

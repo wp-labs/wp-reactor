@@ -22,6 +22,7 @@ impl RuleExecutor {
             &matched.bind_data,
             &step_plans,
             matched.trigger_event.as_deref(),
+            &self.close_ctx_fields,
         );
         self.build_match_alert(matched, &ctx)
     }
@@ -43,6 +44,7 @@ impl RuleExecutor {
             &matched.bind_data,
             &step_plans,
             matched.trigger_event.as_deref(),
+            &self.close_ctx_fields,
         );
         if !execute_joins(
             &self.plan.joins,

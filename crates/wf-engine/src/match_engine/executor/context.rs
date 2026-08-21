@@ -8,6 +8,38 @@ use crate::match_engine::match_engine::{
     BindData, EngineHashMap, Event, StepData, Value, WindowLookup, field_ref_name, values_equal,
 };
 
+/// Which context fields the close/match alert builders need materialized.
+///
+/// The score/entity/yield expressions of a rule reference a small, statically
+/// known set of field names (match keys, step labels, collected field values).
+/// Building every `_step_*` / `_bind_*` synthetic field on every close was a
+/// measurable q12 hot spot (each close allocates a fresh `EngineHashMap` and
+/// several `format!` keys + `Vec` clones that the output never reads). Rules
+/// whose expressions contain function calls (L3 aggregations, window access)
+/// fall back to the conservative all-fields build.
+#[derive(Debug, Clone)]
+pub(crate) enum CloseCtxFields {
+    /// Build every synthetic field (expressions may reference `_step_*`,
+    /// `_bind_*`, or any collected history).
+    All,
+    /// Build only the match keys plus these unqualified field names (from
+    /// `field_ref_name` of every `Field` reference in score/entity/yield).
+    Named(std::collections::HashSet<String>),
+}
+
+impl CloseCtxFields {
+    fn is_all(&self) -> bool {
+        matches!(self, CloseCtxFields::All)
+    }
+
+    fn wants(&self, name: &str) -> bool {
+        match self {
+            CloseCtxFields::All => true,
+            CloseCtxFields::Named(set) => set.contains(name),
+        }
+    }
+}
+
 /// Build a synthetic [`Event`] from match context for expression evaluation.
 ///
 /// - Maps `keys[i]` field name → `scope_key[i]` value (original type preserved)
@@ -15,6 +47,10 @@ use crate::match_engine::match_engine::{
 /// - Labels that collide with key names are silently skipped (keys take priority)
 /// - Adds `_step_{i}_values` fields with collected values for L3/aggregate functions
 /// - Adds `_step_{i}_measure` and `_step_{i}_label` fields for close-path aggregates
+///
+/// `needed` narrows the synthetic field set to what the rule's output
+/// expressions can actually read; `CloseCtxFields::All` reproduces the
+/// historical unconditional build.
 pub(super) fn build_eval_context(
     keys: &[FieldRef],
     scope_key: &[Value],
@@ -22,8 +58,10 @@ pub(super) fn build_eval_context(
     bind_data: &[BindData],
     step_plans: &[&StepPlan],
     trigger_event: Option<&Event>,
+    needed: &CloseCtxFields,
 ) -> Event {
     let mut fields = EngineHashMap::default();
+    let all = needed.is_all();
 
     // Key fields — preserve original Value type
     for (fr, val) in keys.iter().zip(scope_key.iter()) {
@@ -50,51 +88,68 @@ pub(super) fn build_eval_context(
     for (step_idx, sd) in step_data.iter().enumerate() {
         if let Some(label) = &sd.label
             && !fields.contains_key(label.as_str())
+            && (all || needed.wants(label.as_str()))
         {
             fields.insert(label.clone().into(), Value::Number(sd.measure_value));
         }
-        // Store collected values for L3 functions (collect_set/list, first/last, stddev/percentile)
-        let values_field = format!("_step_{}_values", step_idx);
-        let values_array = Value::Array(sd.collected_values.clone());
-        fields.insert(values_field.into(), values_array);
-        for (field_name, values) in &sd.field_values {
-            let step_field = format!("_step_{}_field_{}", step_idx, field_name);
-            fields.insert(step_field.into(), Value::Array(values.clone()));
-            if let Some(last_val) = values.last()
-                && !fields.contains_key(field_name.as_str())
-            {
-                fields.insert(field_name.clone().into(), last_val.clone());
+        if all {
+            // Store collected values for L3 functions (collect_set/list, first/last, stddev/percentile)
+            let values_field = format!("_step_{}_values", step_idx);
+            let values_array = Value::Array(sd.collected_values.clone());
+            fields.insert(values_field.into(), values_array);
+            for (field_name, values) in &sd.field_values {
+                let step_field = format!("_step_{}_field_{}", step_idx, field_name);
+                fields.insert(step_field.into(), Value::Array(values.clone()));
+                if let Some(last_val) = values.last()
+                    && !fields.contains_key(field_name.as_str())
+                {
+                    fields.insert(field_name.clone().into(), last_val.clone());
+                }
             }
-        }
-        let measure_field = format!("_step_{}_measure", step_idx);
-        fields.insert(measure_field.into(), Value::Number(sd.measure_value));
-        if let Some(label) = &sd.label {
-            let label_field = format!("_step_{}_label", step_idx);
-            fields.insert(label_field.into(), Value::Str(label.clone().into()));
-        }
-        if let Some(step_plan) = step_plans.get(step_idx)
-            && let Some(branch) = step_plan.branches.get(sd.satisfied_branch_index)
-        {
-            let source_field = format!("_step_{}_source", step_idx);
-            fields.insert(
-                source_field.into(),
-                Value::Str(branch.source.clone().into()),
-            );
+            let measure_field = format!("_step_{}_measure", step_idx);
+            fields.insert(measure_field.into(), Value::Number(sd.measure_value));
+            if let Some(label) = &sd.label {
+                let label_field = format!("_step_{}_label", step_idx);
+                fields.insert(label_field.into(), Value::Str(label.clone().into()));
+            }
+            if let Some(step_plan) = step_plans.get(step_idx)
+                && let Some(branch) = step_plan.branches.get(sd.satisfied_branch_index)
+            {
+                let source_field = format!("_step_{}_source", step_idx);
+                fields.insert(
+                    source_field.into(),
+                    Value::Str(branch.source.clone().into()),
+                );
+            }
+        } else {
+            // Narrow build: only the collected bare field names the output
+            // expressions reference (`.last()` is the value a `Field` reads).
+            for (field_name, values) in &sd.field_values {
+                if needed.wants(field_name.as_str())
+                    && !fields.contains_key(field_name.as_str())
+                    && let Some(last_val) = values.last()
+                {
+                    fields.insert(field_name.clone().into(), last_val.clone());
+                }
+            }
         }
     }
 
     for bd in bind_data {
-        fields.insert(
-            format!("_bind_{}_count", bd.alias).into(),
-            Value::Number(bd.count as f64),
-        );
+        let count_field = format!("_bind_{}_count", bd.alias);
+        if all || needed.wants(&count_field) {
+            fields.insert(count_field.into(), Value::Number(bd.count as f64));
+        }
         for (field_name, values) in &bd.field_values {
-            fields.insert(
-                format!("_bind_{}_field_{}", bd.alias, field_name).into(),
-                Value::Array(values.clone()),
-            );
-            if let Some(last_val) = values.last()
+            if all {
+                fields.insert(
+                    format!("_bind_{}_field_{}", bd.alias, field_name).into(),
+                    Value::Array(values.clone()),
+                );
+            }
+            if needed.wants(field_name.as_str())
                 && !fields.contains_key(field_name.as_str())
+                && let Some(last_val) = values.last()
             {
                 fields.insert(field_name.clone().into(), last_val.clone());
             }
@@ -252,8 +307,15 @@ mod tests {
         let step_data: Vec<StepData> = vec![];
         let step_plans: Vec<&StepPlan> = vec![];
 
-        let event =
-            build_eval_context(&keys, &scope_key, &step_data, &bind_data, &step_plans, None);
+        let event = build_eval_context(
+            &keys,
+            &scope_key,
+            &step_data,
+            &bind_data,
+            &step_plans,
+            None,
+            &CloseCtxFields::All,
+        );
         assert_eq!(
             event.fields.get("sip"),
             Some(&Value::Str("10.0.0.1".into()))
