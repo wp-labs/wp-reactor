@@ -50,6 +50,167 @@ rule compound {
 }
 
 // =========================================================================
+// 6b. join-then-key (Path A): key_join compilation
+// =========================================================================
+
+/// `match<category:10m>` where `category` lives on the snapshot-joined
+/// auction window → `key_join` descriptor is populated with the lookup
+/// parameters the runtime needs.
+#[test]
+fn compile_join_key_populates_key_join() {
+    let bid = make_window(
+        "bid_events",
+        vec!["bid_stream"],
+        vec![
+            ("auction", bt(BaseType::Digit)),
+            ("bidder", bt(BaseType::Digit)),
+            ("price", bt(BaseType::Digit)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let auction = make_window(
+        "auction_events",
+        vec!["auction_stream"],
+        vec![
+            ("id", bt(BaseType::Digit)),
+            ("seller", bt(BaseType::Digit)),
+            ("category", bt(BaseType::Digit)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let out = make_output_window("out", vec![("id", bt(BaseType::Digit))]);
+    let plans = compile_with(
+        r#"
+rule r {
+    events { b : bid_events }
+    match<category:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on b.auction == auction_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#,
+        &[bid, auction, out],
+    );
+    let plan = &plans[0];
+    assert_eq!(
+        plan.match_plan.keys,
+        vec![FieldRef::Simple("category".into())]
+    );
+    let kj = plan
+        .match_plan
+        .key_join
+        .as_ref()
+        .expect("category is a join-side key → key_join should be populated");
+    assert_eq!(kj.join_idx, 0, "single snapshot join → index 0");
+    assert_eq!(kj.right_window, "auction_events");
+    assert_eq!(
+        kj.left_field,
+        FieldRef::Qualified("b".into(), "auction".into())
+    );
+    assert_eq!(kj.right_key_field, "id");
+    assert_eq!(kj.right_field, "category");
+    assert_eq!(kj.key_name, "category");
+}
+
+/// A driver key on a rule with a join (e.g. q21 anti-join style) must NOT be
+/// treated as a join key — `key_join` stays `None`.
+#[test]
+fn compile_join_present_with_driver_key_keeps_key_join_none() {
+    let bid = make_window(
+        "bid_events",
+        vec!["bid_stream"],
+        vec![
+            ("auction", bt(BaseType::Digit)),
+            ("bidder", bt(BaseType::Digit)),
+            ("price", bt(BaseType::Digit)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let person = make_window(
+        "person_events",
+        vec!["person_stream"],
+        vec![
+            ("id", bt(BaseType::Digit)),
+            ("name", bt(BaseType::Chars)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let out = make_output_window("out", vec![("id", bt(BaseType::Digit))]);
+    let plans = compile_with(
+        r#"
+rule r {
+    events { b : bid_events }
+    match<auction:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join person_events anti on b.bidder == person_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#,
+        &[bid, person, out],
+    );
+    assert!(
+        plans[0].match_plan.key_join.is_none(),
+        "driver key `auction` must not resolve to a join key"
+    );
+}
+
+/// A field that exists on BOTH the driver and the join window resolves as a
+/// driver key (driver wins — checker K1 requires presence in all event sources
+/// before falling back to a join window).
+#[test]
+fn compile_join_key_skipped_when_driver_also_has_field() {
+    let bid = make_window(
+        "bid_events",
+        vec!["bid_stream"],
+        vec![
+            ("auction", bt(BaseType::Digit)),
+            ("bidder", bt(BaseType::Digit)),
+            // `seller` exists on the driver too → must stay a driver key even
+            // though auction_events also carries it.
+            ("seller", bt(BaseType::Digit)),
+            ("price", bt(BaseType::Digit)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let auction = make_window(
+        "auction_events",
+        vec!["auction_stream"],
+        vec![
+            ("id", bt(BaseType::Digit)),
+            ("seller", bt(BaseType::Digit)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let out = make_output_window("out", vec![("id", bt(BaseType::Digit))]);
+    let plans = compile_with(
+        r#"
+rule r {
+    events { b : bid_events }
+    match<seller:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on b.auction == auction_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#,
+        &[bid, auction, out],
+    );
+    assert!(
+        plans[0].match_plan.key_join.is_none(),
+        "driver field `seller` wins over the join window field"
+    );
+    assert_eq!(
+        plans[0].match_plan.keys,
+        vec![FieldRef::Simple("seller".into())]
+    );
+}
+
+// =========================================================================
 // 7. compile_entity_type_normalization
 // =========================================================================
 

@@ -32,6 +32,7 @@ fn build_plan(window_dur: Duration) -> MatchPlan {
     MatchPlan {
         keys: vec![FieldRef::Simple("auction".to_string())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Fixed(window_dur),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {

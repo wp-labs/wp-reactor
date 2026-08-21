@@ -24,6 +24,7 @@ fn key_map_extracts_from_alias_field() {
     let plan = MatchPlan {
         keys: vec![FieldRef::Simple("ip".to_string())],
         key_map: Some(key_map),
+        key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
         event_steps: vec![step(vec![
             branch("login", count_ge(1.0)),

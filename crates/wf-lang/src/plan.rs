@@ -99,6 +99,10 @@ pub struct BindPlan {
 pub struct MatchPlan {
     pub keys: Vec<FieldRef>,
     pub key_map: Option<Vec<KeyMapPlan>>,
+    /// join-then-key (Path A): the match key comes from a snapshot join's right
+    /// window (e.g. `match<category:10m>` where `category` is on auction_events
+    /// and the driver is bid). `None` = all keys are read from the driver event.
+    pub key_join: Option<JoinKeyPlan>,
     pub window_spec: WindowSpec,
     pub event_steps: Vec<StepPlan>,
     pub close_steps: Vec<StepPlan>,
@@ -134,6 +138,31 @@ pub struct KeyMapPlan {
     pub logical_name: String,
     pub source_alias: String,
     pub source_field: String,
+}
+
+/// join-then-key descriptor: the match key's value is resolved by looking the
+/// event's join-left key up in the join's right window, then reading
+/// `right_field` from the joined row (e.g. bid.auction → auction_events.id →
+/// auction_events.category). Carries everything the runtime needs so the state
+/// machine can do the lookup without reaching into `RulePlan.joins`.
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+pub struct JoinKeyPlan {
+    /// Index into `RulePlan.joins` whose right window provides the key value
+    /// (kept for explain / match-time join enrichment reuse).
+    pub join_idx: usize,
+    /// Right window name — the join target that holds the key field.
+    pub right_window: String,
+    /// Driver-side join key field (e.g. `b.auction`) — extracted from the
+    /// event to drive `WindowLookup::join_lookup`.
+    pub left_field: FieldRef,
+    /// Join condition's right-side key field (e.g. `auction_events.id`) — the
+    /// lookup index key on the right window.
+    pub right_key_field: String,
+    /// Right-row field read as the window key (e.g. `category`).
+    pub right_field: String,
+    /// Logical key name (defaults to `right_field`).
+    pub key_name: String,
 }
 
 /// Window specification for the match clause.

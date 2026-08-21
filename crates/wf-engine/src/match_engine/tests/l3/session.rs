@@ -10,6 +10,7 @@ fn session_plan(gap_secs: u64) -> wf_lang::plan::MatchPlan {
     wf_lang::plan::MatchPlan {
         keys: vec![FieldRef::Simple("k".to_string())],
         key_map: None,
+        key_join: None,
         window_spec: wf_lang::plan::WindowSpec::Session(Duration::from_secs(gap_secs)),
         event_steps: vec![wf_lang::plan::StepPlan {
             branches: vec![wf_lang::plan::BranchPlan {

@@ -8,8 +8,8 @@ use crate::ast::{
 use crate::checker::check_wfl;
 use crate::plan::{
     AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, ConvWindowPlan, EachPlan,
-    EntityPlan, ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan,
-    PatternOriginPlan, RateSpec, RulePlan, ScorePlan, SeqPlan, SeqSkipPlan, SeqStepPlan,
+    EntityPlan, ExceedAction, JoinCondPlan, JoinKeyPlan, JoinPlan, KeyMapPlan, LimitsPlan,
+    MatchPlan, PatternOriginPlan, RateSpec, RulePlan, ScorePlan, SeqPlan, SeqSkipPlan, SeqStepPlan,
     SortKeyPlan, StepPlan, WindowSpec, YieldField, YieldPlan,
 };
 use crate::schema::WindowSchema;
@@ -41,18 +41,25 @@ pub fn compile_wfl(file: &WflFile, schemas: &[WindowSchema]) -> LangResult<Vec<R
             .with_detail(format!("semantic errors:\n{}", msgs.join("\n")))
             .err();
     }
-    compile_wfl_after_semantic_checks(file)
+    compile_wfl_after_semantic_checks(file, schemas)
 }
 
-pub(crate) fn compile_wfl_after_semantic_checks(file: &WflFile) -> LangResult<Vec<RulePlan>> {
+pub(crate) fn compile_wfl_after_semantic_checks(
+    file: &WflFile,
+    schemas: &[WindowSchema],
+) -> LangResult<Vec<RulePlan>> {
     let mut plans = Vec::new();
     for rule in &file.rules {
-        plans.extend(compile_rule(rule, file)?);
+        plans.extend(compile_rule(rule, file, schemas)?);
     }
     Ok(plans)
 }
 
-fn compile_rule(rule: &RuleDecl, file: &WflFile) -> LangResult<Vec<RulePlan>> {
+fn compile_rule(
+    rule: &RuleDecl,
+    file: &WflFile,
+    schemas: &[WindowSchema],
+) -> LangResult<Vec<RulePlan>> {
     if rule.each_clause.is_some() && !rule.pipeline_stages.is_empty() {
         return LangReason::Compile
             .to_err()
@@ -70,16 +77,17 @@ fn compile_rule(rule: &RuleDecl, file: &WflFile) -> LangResult<Vec<RulePlan>> {
             .err();
     }
     if rule.pipeline_stages.is_empty() {
-        return Ok(vec![compile_regular_rule(rule, file)]);
+        return Ok(vec![compile_regular_rule(rule, file, schemas)]);
     }
-    Ok(compile_pipeline_rule(rule, file))
+    Ok(compile_pipeline_rule(rule, file, schemas))
 }
 
-fn compile_regular_rule(rule: &RuleDecl, file: &WflFile) -> RulePlan {
+fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema]) -> RulePlan {
     let score_plan = compile_score(&rule.score);
     let entity_plan = compile_entity(&rule.entity);
     let yield_plan = compile_yield(&rule.yield_clause, file);
-    let mut match_plan = compile_match(&rule.match_clause, false);
+    let binds = compile_binds(&rule.events);
+    let mut match_plan = compile_match(&rule.match_clause, false, &binds, &rule.joins, schemas);
     let bind_tracking = collect_rule_bind_tracking(
         &score_plan.expr,
         &entity_plan.entity_id_expr,
@@ -88,7 +96,6 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile) -> RulePlan {
     match_plan.tracked_bind_aliases = bind_tracking.aliases;
     match_plan.tracked_bind_fields = bind_tracking.fields;
     match_plan.tracked_plain_fields = bind_tracking.plain_fields;
-    let binds = compile_binds(&rule.events);
     let joins = compile_joins(&rule.joins);
     match_plan.needs_field_history = compute_needs_field_history(
         &match_plan,
@@ -145,7 +152,11 @@ fn build_conv_window_plan(match_plan: &MatchPlan, over: Duration) -> ConvWindowP
     }
 }
 
-fn compile_pipeline_rule(rule: &RuleDecl, file: &WflFile) -> Vec<RulePlan> {
+fn compile_pipeline_rule(
+    rule: &RuleDecl,
+    file: &WflFile,
+    schemas: &[WindowSchema],
+) -> Vec<RulePlan> {
     const PIPE_IN_ALIAS: &str = "_in";
 
     let stage_count = rule.pipeline_stages.len() + 1;
@@ -176,7 +187,7 @@ fn compile_pipeline_rule(rule: &RuleDecl, file: &WflFile) -> Vec<RulePlan> {
             }]
         };
 
-        let mut match_plan = compile_match(match_clause, !is_final);
+        let mut match_plan = compile_match(match_clause, !is_final, &binds, joins, schemas);
         let entity_plan = if is_final {
             compile_entity(&rule.entity)
         } else {
@@ -281,7 +292,13 @@ fn compile_binds(events: &EventsBlock) -> Vec<BindPlan> {
 // Match
 // ---------------------------------------------------------------------------
 
-fn compile_match(mc: &MatchClause, inject_implicit_stage_labels: bool) -> MatchPlan {
+fn compile_match(
+    mc: &MatchClause,
+    inject_implicit_stage_labels: bool,
+    binds: &[BindPlan],
+    joins: &[crate::ast::JoinClause],
+    schemas: &[WindowSchema],
+) -> MatchPlan {
     let (keys, key_map) = if let Some(ref km) = mc.key_mapping {
         // When key mapping is present, use logical key names as keys
         let logical_names: Vec<FieldRef> = km
@@ -319,9 +336,12 @@ fn compile_match(mc: &MatchClause, inject_implicit_stage_labels: bool) -> MatchP
         (mc.keys.clone(), None)
     };
 
+    let key_join = resolve_join_key(&keys, &mc.key_mapping, binds, joins, schemas);
+
     MatchPlan {
         keys,
         key_map,
+        key_join,
         window_spec: match mc.window_mode {
             WindowMode::Sliding => WindowSpec::Sliding(mc.duration),
             WindowMode::Fixed => WindowSpec::Fixed(mc.duration),
@@ -383,6 +403,80 @@ fn compile_match(mc: &MatchClause, inject_implicit_stage_labels: bool) -> MatchP
         accu: mc.accu,
         needs_field_history: false, // set by the caller after binds/joins/yield are known
     }
+}
+
+/// Resolve a join-then-key (Path A) descriptor for a rule whose match key is a
+/// single simple field absent from every driver bind window but present on a
+/// snapshot join's right window. Mirrors checker K1b/K1c — compile only runs
+/// after semantic checks pass, so `Some` here means the checker accepted it.
+///
+/// Conservative on unknowns: if any bind window schema can't be found (e.g. a
+/// generated pipeline stage window), no join key is produced — the checker
+/// rejects join keys in those stages anyway.
+fn resolve_join_key(
+    keys: &[FieldRef],
+    key_mapping: &Option<Vec<crate::ast::KeyMapItem>>,
+    binds: &[BindPlan],
+    joins: &[crate::ast::JoinClause],
+    schemas: &[WindowSchema],
+) -> Option<JoinKeyPlan> {
+    // v1 constraints (checker enforces; mirror keeps the invariant):
+    // exactly one simple key, no key mapping.
+    if key_mapping.is_some() {
+        return None;
+    }
+    let [FieldRef::Simple(field)] = keys else {
+        return None;
+    };
+
+    // Driver field present → ordinary key. Unknown bind schema → conservative
+    // None (can't prove the field is absent from the driver).
+    for bind in binds {
+        let Some(schema) = schemas.iter().find(|s| s.name == bind.window) else {
+            return None;
+        };
+        if schema.fields.iter().any(|f| f.name == *field) {
+            return None;
+        }
+    }
+
+    // Exactly one snapshot join whose target window provides the field.
+    let mut found: Vec<(usize, &crate::ast::JoinClause)> = Vec::new();
+    for (idx, join) in joins.iter().enumerate() {
+        if join.mode != crate::ast::JoinMode::Snapshot {
+            continue;
+        }
+        let Some(schema) = schemas.iter().find(|s| s.name == join.target_window) else {
+            continue;
+        };
+        if schema.fields.iter().any(|f| f.name == *field) {
+            found.push((idx, join));
+        }
+    }
+    if found.len() != 1 {
+        return None;
+    }
+    let (join_idx, join) = found[0];
+
+    let cond = join
+        .conditions
+        .first()
+        .expect("checker K1c guarantees exactly one condition for join-key joins");
+    let left_field = cond.left.clone();
+    let right_key_field = match &cond.right {
+        FieldRef::Simple(f) | FieldRef::Qualified(_, f) | FieldRef::Bracketed(_, f) => f.clone(),
+        // checker rejects nested join-condition paths — defensive: no silent
+        // empty key field (an empty key_field would make every join miss).
+        _ => return None,
+    };
+    Some(JoinKeyPlan {
+        join_idx,
+        right_window: join.target_window.clone(),
+        left_field,
+        right_key_field,
+        right_field: field.clone(),
+        key_name: field.clone(),
+    })
 }
 
 #[derive(Default)]

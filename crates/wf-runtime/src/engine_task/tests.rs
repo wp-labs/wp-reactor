@@ -342,6 +342,7 @@ fn make_task_inner(
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {
@@ -513,6 +514,7 @@ fn make_pipeline_stage_task_opts(
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {
@@ -630,6 +632,7 @@ fn make_each_task() -> (
         match_plan: MatchPlan {
             keys: vec![],
             key_map: None,
+            key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
             event_steps: vec![],
             close_steps: vec![],
@@ -716,6 +719,7 @@ fn make_filtered_match_task() -> (
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {
@@ -824,6 +828,7 @@ fn make_filtered_close_task() -> (
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {
@@ -956,6 +961,7 @@ fn make_filtered_each_task() -> (
         match_plan: MatchPlan {
             keys: vec![],
             key_map: None,
+            key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
             event_steps: vec![],
             close_steps: vec![],
@@ -1053,6 +1059,7 @@ fn make_intermediate_each_task() -> (
         match_plan: MatchPlan {
             keys: vec![],
             key_map: None,
+            key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
             event_steps: vec![],
             close_steps: vec![],
@@ -1175,6 +1182,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
         match_plan: MatchPlan {
             keys: vec![],
             key_map: None,
+            key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
             event_steps: vec![],
             close_steps: vec![],
@@ -1282,6 +1290,7 @@ fn make_intermediate_score_tasks() -> (
         match_plan: MatchPlan {
             keys: vec![],
             key_map: None,
+            key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
             event_steps: vec![],
             close_steps: vec![],
@@ -1362,6 +1371,7 @@ fn make_intermediate_score_tasks() -> (
     let downstream_match = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(1)),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {
@@ -1537,6 +1547,7 @@ fn make_intermediate_score_band_tasks() -> (
         match_plan: MatchPlan {
             keys: vec![],
             key_map: None,
+            key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(1)),
             event_steps: vec![],
             close_steps: vec![],
@@ -1617,6 +1628,7 @@ fn make_intermediate_score_band_tasks() -> (
     let downstream_match = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(1)),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {
@@ -1834,6 +1846,7 @@ fn make_filtered_bind_alias_match_task() -> (
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {
@@ -2008,6 +2021,7 @@ fn make_window_has_match_task() -> (
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {
@@ -2784,6 +2798,7 @@ fn make_sharded_match_tasks(
         let match_plan = MatchPlan {
             keys: vec![FieldRef::Simple("sip".into())],
             key_map: None,
+            key_join: None,
             window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
             event_steps: vec![StepPlan {
                 branches: vec![BranchPlan {
@@ -3398,6 +3413,7 @@ async fn port_scan_rule_triggers_close_alert() {
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Qualified("c".into(), "sip".into())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(10)),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {
@@ -3733,6 +3749,7 @@ fn make_conv_sink_task() -> (
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(60)),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {
@@ -3909,6 +3926,7 @@ async fn conv_stage_emits_sealed_close_to_sink() {
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(60)),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {
@@ -4038,6 +4056,7 @@ fn conv_stage_test_executor() -> RuleExecutor {
     let match_plan = MatchPlan {
         keys: vec![FieldRef::Simple("sip".into())],
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Fixed(Duration::from_secs(60)),
         event_steps: vec![StepPlan {
             branches: vec![BranchPlan {
