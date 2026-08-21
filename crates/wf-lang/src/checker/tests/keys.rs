@@ -1,5 +1,247 @@
 use super::*;
 
+/// Minimal bid-style driver window (no `category`/`seller` — those live on the
+/// joined auction window).
+fn bid_window() -> WindowSchema {
+    make_window(
+        "bid_events",
+        vec!["bid_stream"],
+        vec![
+            ("auction", bt(BaseType::Digit)),
+            ("bidder", bt(BaseType::Digit)),
+            ("price", bt(BaseType::Digit)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    )
+}
+
+/// Minimal auction-style lookup window (snapshot join target).
+fn auction_window() -> WindowSchema {
+    make_window(
+        "auction_events",
+        vec!["auction_stream"],
+        vec![
+            ("id", bt(BaseType::Digit)),
+            ("seller", bt(BaseType::Digit)),
+            ("category", bt(BaseType::Digit)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    )
+}
+
+/// Output window with a digit `id` field (matches `b.auction`).
+fn out_id_window() -> WindowSchema {
+    make_output_window("out", vec![("id", bt(BaseType::Digit))])
+}
+
+#[test]
+fn join_key_resolves_from_snapshot_join() {
+    // `category` is absent from bid_events but present on the snapshot-joined
+    // auction_events → join-then-key is accepted.
+    let input = r#"
+rule r {
+    events { b : bid_events }
+    match<category:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on b.auction == auction_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#;
+    assert_no_errors(input, &[bid_window(), auction_window(), out_id_window()]);
+}
+
+#[test]
+fn join_key_requires_snapshot_join() {
+    let input = r#"
+rule r {
+    events { b : bid_events }
+    match<category:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events anti on b.auction == auction_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#;
+    assert_has_error(
+        input,
+        &[bid_window(), auction_window(), out_id_window()],
+        "requires a snapshot join",
+    );
+}
+
+#[test]
+fn join_key_compound_rejected() {
+    // Two keys both resolving to the join window — v1 rejects compound join keys.
+    let input = r#"
+rule r {
+    events { b : bid_events }
+    match<category, seller:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on b.auction == auction_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#;
+    assert_has_error(
+        input,
+        &[bid_window(), auction_window(), out_id_window()],
+        "compound join keys",
+    );
+}
+
+#[test]
+fn join_key_mixed_with_driver_key_rejected() {
+    // `auction` is a driver field; `category` is a join field — mixed keys are
+    // rejected in v1.
+    let input = r#"
+rule r {
+    events { b : bid_events }
+    match<auction, category:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on b.auction == auction_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#;
+    assert_has_error(
+        input,
+        &[bid_window(), auction_window(), out_id_window()],
+        "mixed driver/join keys",
+    );
+}
+
+#[test]
+fn join_key_with_key_mapping_rejected() {
+    let input = r#"
+rule r {
+    events { b : bid_events }
+    match<category:10m> {
+        key {
+            category = b.auction;
+        }
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on b.auction == auction_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#;
+    assert_has_error(
+        input,
+        &[bid_window(), auction_window(), out_id_window()],
+        "not supported together with a join key",
+    );
+}
+
+#[test]
+fn qualified_join_window_key_rejected() {
+    // Join-side keys must be written unqualified so the compiler can route them
+    // through join-then-key.
+    let input = r#"
+rule r {
+    events { b : bid_events }
+    match<auction_events.category:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on b.auction == auction_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#;
+    assert_has_error(
+        input,
+        &[bid_window(), auction_window(), out_id_window()],
+        "must be unqualified",
+    );
+}
+
+#[test]
+fn join_key_ambiguous_across_snapshot_joins_rejected() {
+    // Two snapshot joins whose windows both carry `category` — ambiguous source.
+    let other = make_window(
+        "auction_events2",
+        vec!["auction2_stream"],
+        vec![
+            ("id", bt(BaseType::Digit)),
+            ("category", bt(BaseType::Digit)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { b : bid_events }
+    match<category:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on b.auction == auction_events.id
+    join auction_events2 snapshot on b.auction == auction_events2.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#;
+    assert_has_error(
+        input,
+        &[bid_window(), auction_window(), other, out_id_window()],
+        "ambiguous",
+    );
+}
+
+#[test]
+fn join_key_left_side_must_reference_driver() {
+    // Join left referencing the join window itself (not the driver) — rejected.
+    let input = r#"
+rule r {
+    events { b : bid_events }
+    match<category:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on auction_events.id == auction_events.category
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#;
+    assert_has_error(
+        input,
+        &[bid_window(), auction_window(), out_id_window()],
+        "must reference the driver event",
+    );
+}
+
+#[test]
+fn join_key_scalar_type_required() {
+    // Join key field of structured type — cannot hash → rejected.
+    let auction = make_window(
+        "auction_events",
+        vec!["auction_stream"],
+        vec![
+            ("id", bt(BaseType::Digit)),
+            ("category", FieldType::Object),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let input = r#"
+rule r {
+    events { b : bid_events }
+    match<category:10m> {
+        on event { b | count >= 1; }
+    } -> score(50.0)
+    join auction_events snapshot on b.auction == auction_events.id
+    entity(digit, b.auction)
+    yield out (id = b.auction)
+}
+"#;
+    assert_has_error(
+        input,
+        &[bid_window(), auction, out_id_window()],
+        "not a scalar base type",
+    );
+}
+
 #[test]
 fn key_field_not_in_all_sources() {
     // "dport" only exists in fw_events, not in auth_events

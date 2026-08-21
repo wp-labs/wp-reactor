@@ -40,6 +40,7 @@ pub fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
     MatchPlan {
         keys,
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Sliding(Duration::from_secs(300)),
         event_steps: steps,
         close_steps: vec![],
@@ -87,6 +88,7 @@ pub fn plan_with_close(
     MatchPlan {
         keys,
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Sliding(window_dur),
         event_steps,
         close_steps,
@@ -105,6 +107,7 @@ pub fn fixed_plan(keys: Vec<FieldRef>, dur: Duration, steps: Vec<StepPlan>) -> M
     MatchPlan {
         keys,
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Fixed(dur),
         event_steps: steps,
         close_steps: vec![],
@@ -128,6 +131,7 @@ pub fn fixed_plan_with_close(
     MatchPlan {
         keys,
         key_map: None,
+        key_join: None,
         window_spec: WindowSpec::Fixed(dur),
         event_steps,
         close_steps,

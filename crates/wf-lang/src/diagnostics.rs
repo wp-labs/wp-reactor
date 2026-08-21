@@ -119,7 +119,7 @@ pub fn compile_wfl_with_diagnostics(
             format!("semantic errors:\n{}", diagnostics.join("\n\n")),
         );
     }
-    crate::compiler::compile_wfl_after_semantic_checks(file).map_err(|error| {
+    crate::compiler::compile_wfl_after_semantic_checks(file, schemas).map_err(|error| {
         crate::error::error(
             LangReason::Compile,
             format!(

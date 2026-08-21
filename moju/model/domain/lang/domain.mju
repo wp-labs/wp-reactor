@@ -673,6 +673,7 @@ struct BindPlan {
 struct MatchPlan {
   keys: List<FieldRef>
   key_map: List<KeyMapPlan>?
+  key_join: JoinKeyPlan?
   window_spec: WindowSpec
   event_steps: List<StepPlan>
   close_steps: List<StepPlan>
@@ -686,6 +687,16 @@ struct KeyMapPlan {
   logical_name: String
   source_alias: String
   source_field: String
+}
+
+// Join-then-key (Path A): match key resolved from a snapshot join right window.
+struct JoinKeyPlan {
+  join_idx: Int
+  right_window: String
+  left_field: FieldRef
+  right_key_field: String
+  right_field: String
+  key_name: String
 }
 
 state WindowSpec {

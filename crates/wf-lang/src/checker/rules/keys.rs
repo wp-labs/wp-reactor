@@ -1,8 +1,9 @@
-use crate::ast::{FieldRef, MatchClause, WindowMode};
+use crate::ast::{FieldRef, JoinMode, MatchClause, WindowMode};
 
 use crate::checker::scope::{self, Scope};
 use crate::checker::types::{ValType, compatible};
 use crate::checker::{CheckError, Severity};
+use crate::schema::BaseType;
 
 pub fn check_session_gap_clause(
     match_clause: &MatchClause,
@@ -23,32 +24,109 @@ pub fn check_session_gap_clause(
 
 pub fn check_match_keys_clause(
     match_clause: &MatchClause,
+    joins_list: &[crate::ast::JoinClause],
     scope: &Scope<'_>,
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
+    // K1b: at most one simple key may resolve to a snapshot join's right window
+    // (join-then-key). Records `(key field, join index)` when one is found.
+    let mut join_key: Option<(String, usize)> = None;
+
     for key in &match_clause.keys {
         match key {
             FieldRef::Simple(field) => {
                 // K1: unqualified key must exist in ALL event sources (skip join windows)
-                for (alias, schema) in &scope.aliases {
-                    if scope.join_windows.contains(alias) {
-                        continue;
-                    }
-                    if !schema.fields.iter().any(|f| f.name == *field) {
-                        errors.push(CheckError {
-                            severity: Severity::Error,
-                            rule: Some(rule_name.to_string()),
-                            test: None,
-                            message: format!(
-                                "match key `{}` not found in event source `{}` (window `{}`)",
-                                field, alias, schema.name
-                            ),
-                        });
+                let driver_missing: Vec<(&str, &crate::schema::WindowSchema)> = scope
+                    .aliases
+                    .iter()
+                    .filter(|(alias, _)| !scope.join_windows.contains(*alias))
+                    .filter(|(_, schema)| !schema.fields.iter().any(|f| f.name == *field))
+                    .map(|(alias, schema)| (*alias, *schema))
+                    .collect();
+                if driver_missing.is_empty() {
+                    // K4: types must be consistent across sources
+                    check_key_type_consistency(field, scope, rule_name, errors);
+                } else {
+                    // K1b: fall back to a snapshot join's right window (join-then-key)
+                    match resolve_join_key_source(field, joins_list, scope) {
+                        JoinKeySource::Resolved { join_idx } => {
+                            // Join-then-key needs a hashable scalar on the right
+                            // row (same rule as join index keys: float excluded).
+                            if let Some(join) = joins_list.get(join_idx)
+                                && let Some(schema) = scope.aliases.get(join.target_window.as_str())
+                                && let Some(fd) = schema.fields.iter().find(|f| f.name == *field)
+                                && !is_scalar_key_type(&fd.field_type)
+                            {
+                                errors.push(CheckError {
+                                    severity: Severity::Error,
+                                    rule: Some(rule_name.to_string()),
+                                    test: None,
+                                    message: format!(
+                                        "match key `{}` resolves to join window `{}` but its type \
+                                         is not a scalar base type (digit/chars/bool/time/ip/hex; \
+                                         float excluded)",
+                                        field, join.target_window
+                                    ),
+                                });
+                            }
+                            if let Some((prev_field, _)) = &join_key {
+                                errors.push(CheckError {
+                                    severity: Severity::Error,
+                                    rule: Some(rule_name.to_string()),
+                                    test: None,
+                                    message: format!(
+                                        "match keys `{}` and `{}` both resolve to join-side fields; \
+                                         compound join keys are not supported yet (v1: at most one \
+                                         join key per rule)",
+                                        prev_field, field
+                                    ),
+                                });
+                            } else {
+                                join_key = Some((field.clone(), join_idx));
+                            }
+                        }
+                        JoinKeySource::Ambiguous { windows } => {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                test: None,
+                                message: format!(
+                                    "match key `{}` exists on multiple join windows ({}); \
+                                     ambiguous join-then-key source",
+                                    field,
+                                    windows.join(", ")
+                                ),
+                            });
+                        }
+                        JoinKeySource::NonSnapshot { windows } => {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                test: None,
+                                message: format!(
+                                    "match key `{}` is only available on non-snapshot join window(s) ({}); \
+                                     join-then-key requires a snapshot join",
+                                    field,
+                                    windows.join(", ")
+                                ),
+                            });
+                        }
+                        JoinKeySource::NotFound => {
+                            for (alias, schema) in driver_missing {
+                                errors.push(CheckError {
+                                    severity: Severity::Error,
+                                    rule: Some(rule_name.to_string()),
+                                    test: None,
+                                    message: format!(
+                                        "match key `{}` not found in event source `{}` (window `{}`)",
+                                        field, alias, schema.name
+                                    ),
+                                });
+                            }
+                        }
                     }
                 }
-                // K4: types must be consistent across sources
-                check_key_type_consistency(field, scope, rule_name, errors);
             }
             FieldRef::Qualified(alias, field) => {
                 // K2: qualified key
@@ -60,6 +138,19 @@ pub fn check_match_keys_clause(
                         message: format!(
                             "match key `{}.{}` references unknown alias `{}`",
                             alias, field, alias
+                        ),
+                    });
+                } else if scope.join_windows.contains(&alias.as_str()) {
+                    // K2b: a join-side key must be written unqualified so the
+                    // compiler can route it through join-then-key (v1).
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "match key `{}.{}` references join window `{}`; join-side keys must \
+                             be unqualified (e.g. `match<{}:10m>`)",
+                            alias, field, alias, field
                         ),
                     });
                 } else if !scope.alias_has_field(alias, field) {
@@ -85,6 +176,17 @@ pub fn check_match_keys_clause(
                             alias, key, alias
                         ),
                     });
+                } else if scope.join_windows.contains(&alias.as_str()) {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "match key `{}[\"{}\"]` references join window `{}`; join-side keys must \
+                             be unqualified (e.g. `match<{}:10m>`)",
+                            alias, key, alias, key
+                        ),
+                    });
                 } else if !scope.alias_has_field(alias, key) {
                     errors.push(CheckError {
                         severity: Severity::Error,
@@ -107,6 +209,165 @@ pub fn check_match_keys_clause(
             }
         }
     }
+
+    // K1c: rule-level constraints once a join key is present.
+    if let Some((field, join_idx)) = &join_key {
+        if match_clause.key_mapping.is_some() {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: format!(
+                    "match key `{}` resolves to a join-side field; key mapping \
+                     (key_block) is not supported together with a join key yet (v1)",
+                    field
+                ),
+            });
+        }
+        let driver_alias_count = scope
+            .aliases
+            .keys()
+            .filter(|alias| !scope.join_windows.contains(*alias))
+            .count();
+        if driver_alias_count > 1 {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: format!(
+                    "match key `{}` resolves to a join-side field; join-then-key requires a \
+                     single event bind (found {} event sources; multi-bind is not supported yet)",
+                    field, driver_alias_count
+                ),
+            });
+        }
+        if match_clause.keys.len() > 1 {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: format!(
+                    "match key `{}` resolves to a join-side field; mixed driver/join keys are not \
+                     supported yet (v1: exactly one key when using a join key)",
+                    field
+                ),
+            });
+        }
+        let join = joins_list.get(*join_idx);
+        if let Some(join) = join {
+            let left_is_driver = join.conditions.iter().any(|c| match &c.left {
+                FieldRef::Qualified(alias, _) | FieldRef::Bracketed(alias, _) => {
+                    !scope.join_windows.contains(&alias.as_str())
+                }
+                FieldRef::Simple(name) => !scope.join_windows.iter().any(|a| {
+                    scope
+                        .aliases
+                        .get(a)
+                        .is_some_and(|s| s.fields.iter().any(|f| f.name == *name))
+                }),
+                _ => false,
+            });
+            if !left_is_driver {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "match key `{}` resolves to a join-side field; the join condition's left \
+                         side must reference the driver event (e.g. `b.auction`)",
+                        field
+                    ),
+                });
+            }
+            if join.conditions.len() != 1 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "match key `{}` resolves to a join-side field; the providing join must \
+                         have exactly one condition (v1: single join key)",
+                        field
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// K1b result of resolving a simple key to a snapshot join right window.
+pub(super) enum JoinKeySource<'a> {
+    /// Exactly one snapshot join's target window provides the key field.
+    Resolved { join_idx: usize },
+    /// The field exists on multiple snapshot join windows (ambiguous source).
+    Ambiguous { windows: Vec<&'a str> },
+    /// The field only exists on non-snapshot join windows (asof/anti).
+    NonSnapshot { windows: Vec<&'a str> },
+    /// The field is absent from every join window.
+    NotFound,
+}
+
+/// K1b: resolve a simple key absent from the driver events to a snapshot
+/// join's right window (join-then-key). Only snapshot joins qualify — asof has
+/// window-timing semantics and anti has no row to read the value from.
+fn resolve_join_key_source<'a>(
+    field: &str,
+    joins_list: &'a [crate::ast::JoinClause],
+    scope: &Scope<'a>,
+) -> JoinKeySource<'a> {
+    let mut snapshots: Vec<(usize, &'a str)> = Vec::new();
+    let mut non_snapshot: Vec<&'a str> = Vec::new();
+    for (idx, join) in joins_list.iter().enumerate() {
+        let alias = join.target_window.as_str();
+        if !scope.join_windows.contains(&alias) {
+            continue;
+        }
+        let Some(schema) = scope.aliases.get(alias) else {
+            continue;
+        };
+        if !schema.fields.iter().any(|f| f.name == field) {
+            continue;
+        }
+        if join.mode == JoinMode::Snapshot {
+            snapshots.push((idx, alias));
+        } else {
+            non_snapshot.push(alias);
+        }
+    }
+    match snapshots.len() {
+        0 => {
+            if non_snapshot.is_empty() {
+                JoinKeySource::NotFound
+            } else {
+                JoinKeySource::NonSnapshot {
+                    windows: non_snapshot,
+                }
+            }
+        }
+        1 => JoinKeySource::Resolved {
+            join_idx: snapshots[0].0,
+        },
+        _ => JoinKeySource::Ambiguous {
+            windows: snapshots.into_iter().map(|(_, a)| a).collect(),
+        },
+    }
+}
+
+/// Whether a field type can serve as a window key (scalar base types only —
+/// same rule as join index keys; float excluded: f64 truncation would
+/// false-match).
+pub(super) fn is_scalar_key_type(ft: &crate::schema::FieldType) -> bool {
+    matches!(
+        ft,
+        crate::schema::FieldType::Base(
+            BaseType::Digit
+                | BaseType::Chars
+                | BaseType::Bool
+                | BaseType::Time
+                | BaseType::Ip
+                | BaseType::Hex
+        )
+    )
 }
 
 /// K4: check that a simple key field has the same type across all event sources.

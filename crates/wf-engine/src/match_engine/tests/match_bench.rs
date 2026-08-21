@@ -21,7 +21,7 @@ use wf_lang::ast::{Expr, FieldRef, JoinMode};
 use wf_lang::plan::{JoinCondPlan, JoinPlan, MatchPlan, RulePlan, StepPlan, YieldField};
 use wf_lang::{BaseType, FieldType};
 
-use crate::match_engine::executor::{build_eval_context, execute_joins};
+use crate::match_engine::executor::{CloseCtxFields, build_eval_context, execute_joins};
 use crate::match_engine::match_engine::BindData;
 use crate::match_engine::{
     AsofLookup, CepStateMachine, EngineHashMap, Event, JoinRow, MatchedContext, RuleExecutor,
@@ -273,6 +273,7 @@ fn q22_match_pipeline_components() {
             &bind_data,
             &step_plans,
             Some(&trigger),
+            &CloseCtxFields::All,
         );
         std::hint::black_box(&ctx);
     }
@@ -291,6 +292,7 @@ fn q22_match_pipeline_components() {
         &bind_data,
         &step_plans,
         Some(&trigger),
+        &CloseCtxFields::All,
     );
     let start = Instant::now();
     for _ in 0..N {

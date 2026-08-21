@@ -321,12 +321,36 @@ impl CepStateMachine {
             self.watermark_nanos = now_nanos;
         }
 
-        // 1. Extract scope key from event
-        let scope_key =
+        // 1. Extract scope key from event. Join-then-key (Path A): when the key
+        //    lives on a snapshot join's right window (plan.key_join), resolve it
+        //    by looking the event's join-left value up in the joined window and
+        //    reading the key field off the joined row. A miss anywhere (no
+        //    lookup, missing left field, join miss, key absent on the row) is
+        //    the same as a missing key field: skip the event.
+        let scope_key = if let Some(kjp) = &self.plan.key_join {
+            let Some(windows) = windows else {
+                return step_outcome(StepResult::Accumulate, None); // no lookup → join miss
+            };
+            let Some(left_val) = event.field_value(field_ref_name(&kjp.left_field)) else {
+                return step_outcome(StepResult::Accumulate, None); // missing join-left key → skip
+            };
+            let Some(rows) = windows.join_lookup(&kjp.right_window, &kjp.right_key_field, &left_val)
+            else {
+                return step_outcome(StepResult::Accumulate, None); // window not found → skip
+            };
+            let Some(row) = rows.first() else {
+                return step_outcome(StepResult::Accumulate, None); // join miss → skip
+            };
+            let Some(key_val) = row.field_value(&kjp.right_field) else {
+                return step_outcome(StepResult::Accumulate, None); // key absent on joined row → skip
+            };
+            vec![key_val]
+        } else {
             match extract_key(event, &self.plan.keys, self.plan.key_map.as_deref(), alias) {
                 Some(k) => k,
                 None => return step_outcome(StepResult::Accumulate, None), // missing key field → skip
-            };
+            }
+        };
 
         // Build structured instance key
         let (instance_key, fixed_created_at) = match self.plan.window_spec {

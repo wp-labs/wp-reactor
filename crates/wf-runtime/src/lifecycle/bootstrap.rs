@@ -539,6 +539,7 @@ mod tests {
             match_plan: MatchPlan {
                 keys: vec![],
                 key_map: None,
+                key_join: None,
                 window_spec: WindowSpec::Sliding(Duration::from_secs(60)),
                 event_steps: vec![],
                 close_steps: vec![],

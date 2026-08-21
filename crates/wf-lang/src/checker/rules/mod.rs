@@ -247,7 +247,7 @@ fn check_stage(
     rule_name: &str,
     errors: &mut Vec<CheckError>,
 ) {
-    keys::check_match_keys_clause(match_clause, scope, rule_name, errors);
+    keys::check_match_keys_clause(match_clause, joins_list, scope, rule_name, errors);
     keys::check_session_gap_clause(match_clause, rule_name, errors);
     keys::check_key_mapping_clause(match_clause, scope, rule_name, errors);
 

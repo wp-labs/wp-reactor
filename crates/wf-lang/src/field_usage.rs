@@ -316,6 +316,7 @@ mod tests {
         let match_plan = MatchPlan {
             keys: vec![field_ref("auction")],
             key_map: None,
+            key_join: None,
             window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
             event_steps: vec![],
             close_steps: vec![],
@@ -349,6 +350,7 @@ mod tests {
         let match_plan = MatchPlan {
             keys: vec![field_ref("auction")],
             key_map: None,
+            key_join: None,
             window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
             event_steps: vec![],
             close_steps: vec![],
@@ -420,6 +422,7 @@ mod tests {
         let match_plan = MatchPlan {
             keys: vec![field_ref("auction")],
             key_map: None,
+            key_join: None,
             window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
             event_steps: vec![],
             close_steps: vec![],
@@ -461,6 +464,7 @@ mod tests {
         let match_plan = MatchPlan {
             keys: vec![field_ref("auction")],
             key_map: None,
+            key_join: None,
             window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
             event_steps: vec![StepPlan {
                 branches: vec![BranchPlan {
@@ -502,6 +506,7 @@ mod tests {
             MatchPlan {
                 keys: vec![],
                 key_map: None,
+                key_join: None,
                 window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
                 event_steps: vec![],
                 close_steps: vec![],
