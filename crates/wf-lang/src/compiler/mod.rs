@@ -757,7 +757,7 @@ fn close_path_reads_non_key_fields(
     let key_names: HashSet<&str> = match_plan
         .keys
         .iter()
-        .map(|k| crate::field_usage::field_ref_name(k))
+        .map(crate::field_usage::field_ref_name)
         .collect();
     let mut refs = HashSet::new();
     crate::field_usage::collect_expr_fields(score_expr, &mut refs);

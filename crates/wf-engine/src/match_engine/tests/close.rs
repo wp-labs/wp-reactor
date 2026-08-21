@@ -496,3 +496,108 @@ fn tracked_alias_same_as_branch_source_still_matches() {
     assert!(out.event_ok, "event_ok should be true");
     assert!(out.close_ok, "close_ok should be true");
 }
+
+// =========================================================================
+// needs_field_history=false (q12 advance fast path) preserves close outputs
+// =========================================================================
+
+#[test]
+fn field_history_disabled_close_outputs_match_enabled_for_key_only_rule() {
+    // q12 shape: fixed window + `and close`, single alias, count steps, and
+    // the match key is the only field referenced by any output. With
+    // needs_field_history=false the machine skips the per-event field
+    // collection (collect_alias_event + close-step collect_event_fields);
+    // the close outputs — scope key, step labels / measures, event/close_ok —
+    // must be identical to the history-enabled machine (bind_data aside,
+    // which only feeds `_bind_*`/join ctx fields these yields never read).
+    let dur = Duration::from_secs(10);
+    let run = |needs_field_history: bool| -> Vec<crate::match_engine::match_engine::CloseOutput> {
+        let mut plan = fixed_plan_with_close(
+            vec![simple_key("bidder")],
+            dur,
+            vec![step(vec![branch("b", count_ge(1.0))])],
+            vec![step(vec![branch("b", count_ge(1.0))])],
+        );
+        plan.needs_field_history = needs_field_history;
+        let mut sm = CepStateMachine::new("r".to_string(), plan, None);
+        let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
+        // 5 events for bidder 42 in the same 10s bucket, one for bidder 7.
+        for i in 0..5 {
+            let e = event(vec![("bidder", num(42.0))]);
+            sm.advance_at("b", &e, base + i * 1_000_000_000);
+        }
+        sm.advance_at(
+            "b",
+            &event(vec![("bidder", num(7.0))]),
+            base + 5_000_000_000,
+        );
+        // Bucket closes at base + 10s.
+        sm.scan_expired_at(base + 11 * NANOS_PER_SEC)
+    };
+
+    let with_history = run(true);
+    let without_history = run(false);
+    assert_eq!(with_history.len(), without_history.len());
+    assert_eq!(with_history.len(), 2, "two bidder buckets expire");
+    for (a, b) in with_history.iter().zip(without_history.iter()) {
+        assert_eq!(a.scope_key, b.scope_key);
+        assert_eq!(a.close_reason, b.close_reason);
+        assert_eq!(a.event_ok, b.event_ok);
+        assert_eq!(a.close_ok, b.close_ok);
+        assert_eq!(a.close_mode, b.close_mode);
+        assert_eq!(a.event_step_data.len(), b.event_step_data.len());
+        assert_eq!(a.close_step_data.len(), b.close_step_data.len());
+        for (sa, sb) in a.event_step_data.iter().zip(b.event_step_data.iter()) {
+            assert_eq!(sa.label, sb.label);
+            assert_eq!(sa.measure_value, sb.measure_value);
+            assert_eq!(sa.satisfied_branch_index, sb.satisfied_branch_index);
+        }
+        for (sa, sb) in a.close_step_data.iter().zip(b.close_step_data.iter()) {
+            assert_eq!(sa.label, sb.label);
+            assert_eq!(sa.measure_value, sb.measure_value);
+            assert_eq!(sa.satisfied_branch_index, sb.satisfied_branch_index);
+        }
+        // With history on, the alias field history was collected (bind_data
+        // carries it); with it off there is no collection — both feed the
+        // same outputs for key-only rules.
+        assert!(
+            !a.bind_data.is_empty(),
+            "history-enabled machine collects alias bind data"
+        );
+        assert!(
+            b.bind_data.is_empty(),
+            "history-disabled machine skips alias bind data"
+        );
+    }
+}
+
+#[test]
+fn field_history_disabled_still_emits_same_alert_count() {
+    // End-to-end shape: with needs_field_history=false every qualifying close
+    // still fires — the collection skip must not suppress outputs.
+    let dur = Duration::from_secs(10);
+    let run = |needs: bool| -> usize {
+        let mut plan = fixed_plan_with_close(
+            vec![simple_key("bidder")],
+            dur,
+            vec![step(vec![branch("b", count_ge(1.0))])],
+            vec![step(vec![branch("b", count_ge(1.0))])],
+        );
+        plan.needs_field_history = needs;
+        let mut sm = CepStateMachine::new("r".to_string(), plan, None);
+        let base: i64 = 1_700_000_000 * NANOS_PER_SEC;
+        for i in 0..3 {
+            sm.advance_at(
+                "b",
+                &event(vec![("bidder", num(9.0))]),
+                base + i * 1_000_000_000,
+            );
+        }
+        sm.scan_expired_at(base + 11 * NANOS_PER_SEC)
+            .into_iter()
+            .filter(|o| o.event_ok && o.close_ok)
+            .count()
+    };
+    assert_eq!(run(true), 1);
+    assert_eq!(run(false), 1);
+}

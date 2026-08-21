@@ -458,6 +458,108 @@ rule q12_like_l3 {
     );
 }
 
+#[test]
+fn close_rule_entity_reads_non_key_field_needs_field_history() {
+    // entity referencing a non-key field resolves via field_values at close
+    // time — history required.
+    let schemas = [auth_events_window(), output_window()];
+    let plans = compile_with(
+        r#"
+rule q12_like_entity_nonkey {
+    events { b : auth_events }
+    match<sip:10s:fixed> {
+        on event { b | count >= 1; }
+        and close { n: b | count >= 1; }
+    } -> score(10.0)
+    entity(chars, b.action)
+    yield out (x = b.sip, y = "q12")
+}
+"#,
+        &schemas,
+    );
+    let p = &plans[0];
+    assert!(
+        p.match_plan.needs_field_history,
+        "non-key entity needs the history"
+    );
+}
+
+#[test]
+fn close_rule_score_reads_non_key_field_needs_field_history() {
+    let schemas = [auth_events_window(), output_window()];
+    let plans = compile_with(
+        r#"
+rule q12_like_score_nonkey {
+    events { b : auth_events }
+    match<sip:10s:fixed> {
+        on event { b | count >= 1; }
+        and close { n: b | count >= 1; }
+    } -> score(b.count)
+    entity(digit, b.sip)
+    yield out (x = b.sip, y = "q12")
+}
+"#,
+        &schemas,
+    );
+    let p = &plans[0];
+    assert!(
+        p.match_plan.needs_field_history,
+        "non-key score needs the history"
+    );
+}
+
+#[test]
+fn close_rule_stat_count_needs_field_history() {
+    // stat.count(window_event(b)) consumes the alias event count maintained by
+    // collect_alias_event — must stay on.
+    let schemas = [auth_events_window(), output_window()];
+    let plans = compile_with(
+        r#"
+rule q12_like_stat {
+    events { b : auth_events }
+    match<sip:10s:fixed> {
+        on event { b | count >= 1; }
+        and close { n: b | count >= 1; }
+    } -> score(10.0)
+    entity(digit, b.sip)
+    yield out (x = b.sip, y = "q12", n = stat.count(window_event(b)))
+}
+"#,
+        &schemas,
+    );
+    let p = &plans[0];
+    assert!(
+        p.match_plan.needs_field_history,
+        "stat.count(window_event) needs the history"
+    );
+}
+
+#[test]
+fn no_close_rule_key_only_still_skips_field_history() {
+    // Regression: the no-close-steps path (single bind, no joins, no L3)
+    // keeps skipping the history — unchanged by the close-path refinement.
+    let schemas = [auth_events_window(), output_window()];
+    let plans = compile_with(
+        r#"
+rule q1_like {
+    events { e : auth_events }
+    match<sip:5m> {
+        on event { e | count >= 1; }
+    } -> score(1.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#,
+        &schemas,
+    );
+    let p = &plans[0];
+    assert!(p.match_plan.close_steps.is_empty());
+    assert!(
+        !p.match_plan.needs_field_history,
+        "no-close key-only rule keeps skipping the history"
+    );
+}
+
 // =========================================================================
 // 4. compile_or_branches
 // =========================================================================
