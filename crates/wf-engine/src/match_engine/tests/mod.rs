@@ -1,5 +1,6 @@
 mod accu;
 mod any_l2;
+mod close_bench;
 mod columnar_bench;
 mod columnar_close_seq;
 mod columnar_fieldview;

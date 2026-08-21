@@ -9,7 +9,7 @@ use super::types::{EngineHashMap, FieldSource, Value};
 
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq, Eq, Hash)]
 #[moju(kind = "state", domain = "Engine", module = "Engine.MatchEngine")]
-pub(super) enum ValueKey {
+pub(crate) enum ValueKey {
     Number(u64),
     Str(String),
     Bool(bool),
@@ -18,7 +18,7 @@ pub(super) enum ValueKey {
 }
 
 impl ValueKey {
-    pub(super) fn from_value(value: &Value) -> Self {
+    pub(crate) fn from_value(value: &Value) -> Self {
         match value {
             Value::Number(n) => Self::Number(canonical_f64_bits(*n)),
             Value::Str(s) => Self::Str(s.to_string()),

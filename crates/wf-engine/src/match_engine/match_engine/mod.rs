@@ -27,6 +27,16 @@ pub use conv::apply_conv;
 
 pub(crate) use eval::eval_expr_ext;
 
+// Test-only re-exports: the `tests` sibling module sits outside `match_engine`,
+// so private submodules (close/key/state/types) are not directly reachable.
+// Benchmarks measure the production hot path without widening production APIs.
+#[cfg(test)]
+pub(crate) use key::ValueKey;
+#[cfg(test)]
+pub(crate) use state::StepState;
+#[cfg(test)]
+pub(crate) use types::RollingStats;
+
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -34,7 +44,8 @@ use wf_lang::ast::CloseMode;
 use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, RateSpec, WindowSpec};
 
 use crate::match_engine::columnar::GuardMasks;
-use close::{accumulate_close_steps, evaluate_close, evidence_time_range};
+pub(crate) use close::accumulate_close_steps;
+use close::{evaluate_close, evidence_time_range};
 use key::{InstanceKey, extract_key};
 use seq::{SeqRuntime, consec_broken, scan_negations};
 use state::{AliasState, Instance, snapshot_bind_data};

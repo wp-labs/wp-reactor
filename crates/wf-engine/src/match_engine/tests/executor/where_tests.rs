@@ -75,7 +75,13 @@ fn person_join() -> JoinPlan {
 
 #[test]
 fn match_join_where_hit_passes_and_false_suppresses() {
-    let mut plan = simple_rule_plan("r1", default_match_plan(), Expr::Number(1.0), "host", Expr::StringLit("x".into()));
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(1.0),
+        "host",
+        Expr::StringLit("x".into()),
+    );
     plan.joins = vec![person_join()];
     plan.r#where = Some(where_state_eq_or());
 
@@ -107,7 +113,13 @@ fn match_join_where_hit_passes_and_false_suppresses() {
 
 #[test]
 fn match_join_where_miss_suppresses() {
-    let mut plan = simple_rule_plan("r1", default_match_plan(), Expr::Number(1.0), "host", Expr::StringLit("x".into()));
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(1.0),
+        "host",
+        Expr::StringLit("x".into()),
+    );
     plan.joins = vec![person_join()];
     plan.r#where = Some(where_state_eq_or());
 
@@ -128,7 +140,13 @@ fn match_join_where_miss_suppresses() {
 fn match_without_where_still_emits_on_join_miss() {
     // Regression guard: without `where`, a join miss must NOT suppress (the
     // historical optional-enrichment behavior).
-    let mut plan = simple_rule_plan("r1", default_match_plan(), Expr::Number(1.0), "host", Expr::StringLit("x".into()));
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(1.0),
+        "host",
+        Expr::StringLit("x".into()),
+    );
     plan.joins = vec![person_join()];
     plan.r#where = None;
 
@@ -148,7 +166,13 @@ fn match_without_where_still_emits_on_join_miss() {
 // ---------------------------------------------------------------------------
 
 fn each_rule_plan() -> wf_lang::plan::RulePlan {
-    let mut plan = simple_rule_plan("r1", default_match_plan(), Expr::Number(1.0), "host", Expr::StringLit("x".into()));
+    let mut plan = simple_rule_plan(
+        "r1",
+        default_match_plan(),
+        Expr::Number(1.0),
+        "host",
+        Expr::StringLit("x".into()),
+    );
     plan.each_plan = Some(EachPlan {
         alias: "fail".to_string(),
         filter: None,

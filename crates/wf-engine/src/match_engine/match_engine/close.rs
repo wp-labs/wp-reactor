@@ -29,7 +29,7 @@ use crate::match_engine::columnar::GuardMasks;
 // Hot per-row path: flat args avoid a context struct on the accumulation
 // loop (and its borrows); internal to the match engine only.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn accumulate_close_steps<E: FieldSource>(
+pub(crate) fn accumulate_close_steps<E: FieldSource>(
     alias: &str,
     event: &E,
     event_time_nanos: i64,

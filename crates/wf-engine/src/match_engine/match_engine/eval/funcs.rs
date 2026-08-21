@@ -104,7 +104,9 @@ pub(super) fn eval_func_call(
                 return Some(Value::Number(0.0));
             }
             let ch = needle.chars().next().unwrap();
-            Some(Value::Number(text.chars().filter(|&c| c == ch).count() as f64))
+            Some(Value::Number(
+                text.chars().filter(|&c| c == ch).count() as f64
+            ))
         }
         "contains" => {
             if args.len() != 2 {
