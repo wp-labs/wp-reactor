@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
-use wf_lang::ast::CloseMode;
+use wf_lang::ast::{CloseMode, Expr, FieldRef};
 
-use crate::alert::{AlertOrigin, OutputRecord};
+use crate::alert::{AlertColumnBuilder, AlertOrigin, OutputRecord};
 use crate::error::{CoreReason, CoreResult};
-use crate::match_engine::match_engine::{CloseOutput, Event, StepData, WindowLookup};
+use crate::match_engine::match_engine::{
+    CloseOutput, Event, StepData, Value, WindowLookup, field_ref_name, value_to_string,
+};
 
+use super::EachDirectBatchStats;
 use super::RuleExecutor;
 use super::alert::{build_summary, build_wfx_id, format_nanos_utc, now_nanos};
 use super::context::{build_eval_context, execute_joins};
@@ -61,7 +64,7 @@ impl E2Profiler {
         }
         shared.calls += 1;
         if shared.calls >= 65536 {
-            let snap = std::mem::replace(&mut *shared, E2Profiler::default());
+            let snap = std::mem::take(&mut *shared);
             snap.report();
         }
     }
@@ -271,6 +274,272 @@ impl RuleExecutor {
             machine_id,
             scope_key: Arc::from(scope_key),
         }))
+    }
+
+    /// Columnar-safety gate for the batched close emit path. Mirrors the
+    /// on-each gate (`each_plan_columnar_safe`): constant score, entity
+    /// StringLit / plain Field, yields Lit / plain Field. Joins are unsupported
+    /// on this path yet — rules with joins fall back to the per-record
+    /// join-enriched path (q4/q6 style).
+    pub fn close_plan_columnar_safe(&self) -> bool {
+        if !matches!(self.plan.score_plan.expr, Expr::Number(_)) {
+            return false;
+        }
+        match &self.plan.entity_plan.entity_id_expr {
+            Expr::StringLit(_) => {}
+            Expr::Field(fr) if !matches!(fr, FieldRef::Path { .. }) => {}
+            _ => return false,
+        }
+        if !self.plan.yield_plan.fields.iter().all(|f| match &f.value {
+            Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => true,
+            Expr::Field(fr) => !matches!(fr, FieldRef::Path { .. }),
+            _ => false,
+        }) {
+            return false;
+        }
+        if !self.plan.joins.is_empty() {
+            return false;
+        }
+        true
+    }
+
+    /// Batched columnar close emit (L4): appends a whole batch of
+    /// [`CloseOutput`]s straight into the columnar builder — no per-close
+    /// `OutputRecord` / synthetic `Event` ctx (the q12 hot spot: ctx build
+    /// + alert build measured ~95% of `execute_close_with_joins`).
+    ///
+    /// Output is byte-identical to `execute_close_with_joins` + `OutputRecord`
+    /// for gate-passing shapes (locked by the
+    /// `columnar_close_matches_per_record_close` test), with one documented
+    /// difference: `emit_time` is **batch-level** (shared by the whole
+    /// segment), matching the on-each columnar path; verify compares EMIT
+    /// counts, not payload bytes, and `emit_time` never feeds semantics.
+    ///
+    /// Field resolution replicates `build_eval_context`'s precedence: match
+    /// keys → step labels / `field_values.last()` (event steps then close
+    /// steps) → `bind_data.field_values.last()`.
+    pub fn execute_close_direct_batch_columnar(
+        &self,
+        closes: &[CloseOutput],
+        builder: &mut AlertColumnBuilder,
+        emit_time_nanos: i64,
+    ) -> EachDirectBatchStats {
+        let mut stats = EachDirectBatchStats::default();
+        debug_assert!(self.close_plan_columnar_safe());
+        let statics = self.output_static();
+        let keys = &self.plan.match_plan.keys;
+        let emit_time = self.cached_emit_time(emit_time_nanos);
+        let score_const = match &self.plan.score_plan.expr {
+            Expr::Number(n) => *n,
+            _ => unreachable!("columnar close gate requires a constant score"),
+        };
+        let entity_const: Option<&str> = match &self.plan.entity_plan.entity_id_expr {
+            Expr::StringLit(s) => Some(s.as_str()),
+            _ => None,
+        };
+        let entity_field_name: Option<&str> = match &self.plan.entity_plan.entity_id_expr {
+            Expr::Field(fr) => Some(field_ref_name(fr)),
+            _ => None,
+        };
+        let yield_specs = &statics.yield_specs;
+
+        // Batch-constant literal yields: coerced + exported once here and
+        // registered as constant columns (per-row staging skipped, gap-filled
+        // by the commit). Field yields register as ordinary columns.
+        for (field, (name, field_type)) in
+            self.plan.yield_plan.fields.iter().zip(yield_specs.iter())
+        {
+            let literal: Option<Value> = match &field.value {
+                Expr::Number(n) => Some(Value::Number(*n)),
+                Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
+                Expr::Bool(b) => Some(Value::Bool(*b)),
+                _ => None,
+            };
+            let const_value = literal.map(|v| {
+                RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), v).and_then(
+                    |v| {
+                        let v = v.expect("literal yield values are never omitted");
+                        crate::alert::export_yield_value(&v, field_type.as_ref())
+                    },
+                )
+            });
+            match const_value {
+                Some(Ok((meta, model_value))) => {
+                    if let Err(e) = builder.register_yield_column(name, Some((meta, model_value))) {
+                        log::warn!("alert export error: {e}");
+                        stats.failed = closes.len();
+                        return stats;
+                    }
+                }
+                Some(Err(e)) => {
+                    log::warn!("alert export error: {e}");
+                    stats.failed = closes.len();
+                    return stats;
+                }
+                None => {
+                    // Field yield: ordinary column, staged per row.
+                    if let Err(e) = builder.register_yield_column(name, None) {
+                        log::warn!("alert export error: {e}");
+                        stats.failed = closes.len();
+                        return stats;
+                    }
+                }
+            }
+        }
+
+        builder.reserve_rows(closes.len());
+
+        let mut wfx_ids: Vec<String> = Vec::with_capacity(closes.len());
+        let mut scores: Vec<f64> = Vec::with_capacity(closes.len());
+        let mut entity_ids: Vec<String> = Vec::with_capacity(closes.len());
+        let mut fired_ats: Vec<String> = Vec::with_capacity(closes.len());
+        let mut origins: Vec<Arc<str>> = Vec::with_capacity(closes.len());
+        let mut close_reasons: Vec<Arc<str>> = Vec::with_capacity(closes.len());
+        let mut summaries: Vec<Arc<str>> = Vec::with_capacity(closes.len());
+        let mut staged_rows: Vec<
+            Vec<(
+                usize,
+                wp_model_core::model::DataType,
+                wp_model_core::model::Value,
+            )>,
+        > = Vec::with_capacity(closes.len());
+
+        for close in closes {
+            if !is_qualified(close) {
+                stats.rejected += 1;
+                continue;
+            }
+            let origin = AlertOrigin::Close {
+                reason: close.close_reason,
+            };
+            let fired_at = format_nanos_utc(close.watermark_nanos);
+            // entity
+            let entity_id: String = if let Some(s) = entity_const {
+                s.to_string()
+            } else {
+                match resolve_close_field(close, keys, entity_field_name.unwrap_or("")) {
+                    Some(v) => value_to_string(&v),
+                    None => {
+                        // eval_entity_id errors on None — record as failed.
+                        stats.failed += 1;
+                        continue;
+                    }
+                }
+            };
+            // wfx_id / summary need the combined step data (same byte stream
+            // as build_wfx_id/build_summary on the per-record path).
+            let all_step_data = combine_step_data(close);
+            let wfx_id = build_wfx_id(
+                &self.plan.name,
+                &close.scope_key,
+                &fired_at,
+                &all_step_data,
+                &origin,
+            );
+            let summary = build_summary(
+                &self.plan.name,
+                keys,
+                &close.scope_key,
+                &all_step_data,
+                &origin,
+            );
+
+            // Field yields: resolve each from keys / field_values / bind.
+            for (field, (name, field_type)) in
+                self.plan.yield_plan.fields.iter().zip(yield_specs.iter())
+            {
+                if !matches!(field.value, Expr::Field(_)) {
+                    continue; // literal — constant column, gap-filled
+                }
+                let value = resolve_close_field(close, keys, field_ref_name_of(&field.value))
+                    .unwrap_or_else(|| Value::Str(String::new().into()));
+                match RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)
+                {
+                    Ok(Some(v)) => {
+                        if let Err(e) = builder.stage_yield_cell(name, field_type.as_ref(), &v) {
+                            log::warn!("alert export error: {e}");
+                            stats.failed += 1;
+                            builder.take_staged();
+                            break;
+                        }
+                    }
+                    Ok(None) => { /* optional missing field omitted */ }
+                    Err(e) => {
+                        log::warn!("alert export error: {e}");
+                        stats.failed += 1;
+                        builder.take_staged();
+                        break;
+                    }
+                }
+            }
+            staged_rows.push(builder.take_staged());
+
+            wfx_ids.push(wfx_id);
+            scores.push(score_const);
+            entity_ids.push(entity_id);
+            fired_ats.push(fired_at);
+            origins.push(Arc::from(origin.as_str()));
+            close_reasons.push(Arc::from(origin.close_reason().map_or("", |r| r.as_str())));
+            summaries.push(Arc::from(summary));
+            stats.appended += 1;
+        }
+
+        if !wfx_ids.is_empty() {
+            builder.commit_close_rows_batch(
+                &wfx_ids,
+                &scores,
+                &entity_ids,
+                &fired_ats,
+                &statics.rule_name,
+                &statics.entity_type,
+                &origins,
+                &close_reasons,
+                &emit_time,
+                &summaries,
+                &staged_rows,
+            );
+        }
+        stats
+    }
+}
+
+/// Resolve a bare field name against a close output with `build_eval_context`
+/// precedence: match keys (scope_key) → step labels / `field_values.last()`
+/// (event steps then close steps) → `bind_data.field_values.last()`. Returns
+/// `None` when absent everywhere — the per-record path then reads `None` from
+/// the synthetic ctx (entity errors, yield falls back to empty string).
+fn resolve_close_field(close: &CloseOutput, keys: &[FieldRef], name: &str) -> Option<Value> {
+    for (i, k) in keys.iter().enumerate() {
+        if field_ref_name(k) == name {
+            return close.scope_key.get(i).cloned();
+        }
+    }
+    for sd in close
+        .event_step_data
+        .iter()
+        .chain(close.close_step_data.iter())
+    {
+        if let Some(label) = &sd.label
+            && label.as_str() == name
+        {
+            return Some(Value::Number(sd.measure_value));
+        }
+        if let Some(v) = sd.field_values.get(name).and_then(|vs| vs.last()) {
+            return Some(v.clone());
+        }
+    }
+    for bd in &close.bind_data {
+        if let Some(v) = bd.field_values.get(name).and_then(|vs| vs.last()) {
+            return Some(v.clone());
+        }
+    }
+    None
+}
+
+fn field_ref_name_of(expr: &Expr) -> &str {
+    match expr {
+        Expr::Field(fr) => field_ref_name(fr),
+        _ => "",
     }
 }
 

@@ -721,6 +721,101 @@ impl AlertColumnBuilder {
         self.len += n;
     }
 
+    /// L3 batched commit for the **close** path: identical to
+    /// [`Self::commit_each_rows_batch`] except `origin`, `close_reason` and
+    /// `summary` vary per row (close reason differs per close; the summary
+    /// embeds the scope key). Same block-level yield fill semantics — must
+    /// stay byte-identical to committing via [`Self::commit_each_row`] with
+    /// per-record `AlertOrigin::Close` / `build_summary` outputs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_close_rows_batch(
+        &mut self,
+        wfx_id: &[String],
+        score: &[f64],
+        entity_id: &[String],
+        fired_at: &[String],
+        rule_name: &Arc<str>,
+        entity_type: &Arc<str>,
+        origin: &[Arc<str>],
+        close_reason: &[Arc<str>],
+        emit_time: &Arc<str>,
+        summary: &[Arc<str>],
+        staged_rows: &[Vec<(usize, DataType, ModelValue)>],
+    ) {
+        let n = wfx_id.len();
+        debug_assert_eq!(score.len(), n);
+        debug_assert_eq!(entity_id.len(), n);
+        debug_assert_eq!(fired_at.len(), n);
+        debug_assert_eq!(origin.len(), n);
+        debug_assert_eq!(close_reason.len(), n);
+        debug_assert_eq!(summary.len(), n);
+        debug_assert_eq!(staged_rows.len(), n);
+        // Reserve once for the whole block (amortizes the per-row growth).
+        self.wfx_id.reserve(n);
+        self.score.reserve(n);
+        self.entity_id.reserve(n);
+        self.fired_at.reserve(n);
+        self.rule_name.reserve(n);
+        self.entity_type.reserve(n);
+        self.origin.reserve(n);
+        self.close_reason.reserve(n);
+        self.emit_time.reserve(n);
+        self.summary.reserve(n);
+        // Bulk system columns. Plan-constant columns: same `Arc` every row.
+        self.wfx_id.extend_from_slice(wfx_id);
+        self.score.extend_from_slice(score);
+        self.entity_id.extend_from_slice(entity_id);
+        self.fired_at.extend_from_slice(fired_at);
+        self.rule_name
+            .extend(std::iter::repeat_n(Arc::clone(rule_name), n));
+        self.entity_type
+            .extend(std::iter::repeat_n(Arc::clone(entity_type), n));
+        self.origin.extend_from_slice(origin);
+        self.close_reason.extend_from_slice(close_reason);
+        self.emit_time
+            .extend(std::iter::repeat_n(Arc::clone(emit_time), n));
+        self.summary.extend_from_slice(summary);
+        // Yield cells, interleaved with per-row gap fills — see
+        // `commit_each_rows_batch` for the byte-identity contract.
+        let target = self.len + n;
+        for (row_idx, row) in staged_rows.iter().enumerate() {
+            let row_pos = self.len + row_idx;
+            for (col_idx, meta, value) in row {
+                let col = &mut self.yield_cols[*col_idx];
+                while col.values.len() < row_pos {
+                    match &col.const_value {
+                        Some((meta, value)) => {
+                            col.metas.push(meta.clone());
+                            col.values.push(value.clone());
+                        }
+                        None => {
+                            col.metas.push(DataType::Ignore);
+                            col.values.push(ModelValue::Null);
+                        }
+                    }
+                }
+                col.metas.push(meta.clone());
+                col.values.push(value.clone());
+            }
+        }
+        for col in &mut self.yield_cols {
+            while col.values.len() < target {
+                match &col.const_value {
+                    Some((meta, value)) => {
+                        col.metas.push(meta.clone());
+                        col.values.push(value.clone());
+                    }
+                    None => {
+                        col.metas.push(DataType::Ignore);
+                        col.values.push(ModelValue::Null);
+                    }
+                }
+            }
+        }
+        debug_assert!(self.yield_cols.iter().all(|c| c.values.len() == target));
+        self.len += n;
+    }
+
     /// Fill gap cells for yield columns that received no staged cell this
     /// row (optional input field missing → field omitted, wp-labs#62). Every
     /// column must stay row-aligned; gap cells read back as `(Ignore, Null)`

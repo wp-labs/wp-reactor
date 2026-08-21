@@ -858,6 +858,11 @@ impl RuleTask {
         // and send ONE ConvCloseBatch (with the max event-time watermark) after
         // the loop — avoids a per-event bounded(32) channel send on the hot path.
         let mut conv_closes: Vec<wf_engine::match_engine::CloseOutput> = Vec::new();
+        // Columnar close emit (L4): gate-passing rules accumulate raw closes
+        // here and emit them vectorized after the row loop — see
+        // `execute_close_direct_batch_columnar`.
+        let close_columnar = self.executor.close_plan_columnar_safe();
+        let mut columnar_closes: Vec<wf_engine::match_engine::CloseOutput> = Vec::new();
         // Records produced by the match/close paths accumulate here and are
         // appended to the pending columnar builder in one lock per
         // ALERT_BATCH_SIZE group (see [`Self::emit_batch`]) — the per-record
@@ -1102,7 +1107,14 @@ impl RuleTask {
 
                 // When routed to the conv stage, the inline close processing is
                 // skipped (the closes were already sent in the scan step).
-                if !routed {
+                // Columnar-safety gate: gate-passing rules accumulate raw
+                // closes across the batch and emit them vectorized after the
+                // row loop (see the batch close emit below) — the q12 close
+                // fan-out hot path (per-close OutputRecord + synthetic ctx
+                // build measured ~95% of execute_close_with_joins).
+                if close_columnar && !routed {
+                    columnar_closes.extend(closes);
+                } else if !routed {
                     for close in &closes {
                         let _close_exec_start = Instant::now();
                         let result = self.executor.execute_close_with_joins(close, &lookup);
@@ -1414,6 +1426,51 @@ impl RuleTask {
             }
         }
         self.dump_profiling();
+        // Vectorized close emit for gate-passing rules (L4): one pending lock,
+        // one target lookup, one columnar batch commit — no per-close
+        // OutputRecord / synthetic ctx. Metrics mirror the per-record path
+        // (exact totals; serialize-failed increments for eval failures).
+        if close_columnar && !columnar_closes.is_empty() {
+            let _close_exec_start = Instant::now();
+            let (outcome, should_flush) = {
+                let mut pending = self.pending_alerts.lock().unwrap();
+                let target = self.executor.static_yield_target();
+                let slot = pending
+                    .by_target
+                    .iter_mut()
+                    .find(|(existing, _)| *existing == *target);
+                let builder = match slot {
+                    Some((_, builder)) => builder,
+                    None => {
+                        pending.by_target.push((
+                            std::sync::Arc::clone(target),
+                            AlertColumnBuilder::new(std::sync::Arc::clone(target)),
+                        ));
+                        let last = pending.by_target.len() - 1;
+                        &mut pending.by_target[last].1
+                    }
+                };
+                let outcome = self.executor.execute_close_direct_batch_columnar(
+                    &columnar_closes,
+                    builder,
+                    batch_emit_nanos,
+                );
+                pending.count += outcome.appended;
+                (outcome, pending.count >= ALERT_BATCH_SIZE)
+            };
+            self.close_exec_nanos += _close_exec_start.elapsed().as_nanos() as u64;
+            if let Some(metrics) = &self.metrics {
+                for _ in 0..outcome.appended {
+                    metrics.inc_alert_emitted_total(self.rule_name());
+                }
+                for _ in 0..outcome.failed {
+                    metrics.inc_alert_serialize_failed();
+                }
+            }
+            if should_flush {
+                self.flush_alerts().await;
+            }
+        }
         // Deliver any remaining staged outputs (same cadence as the per-event
         // flush — bounds delivery latency to one event batch).
         if !staged_outputs.is_empty() {
@@ -2004,11 +2061,11 @@ impl RuleTask {
                 }
             }
             pending.count += sink_records.len() - failed;
-            if failed > 0 {
-                if let Some(metrics) = &self.metrics {
-                    for _ in 0..failed {
-                        metrics.inc_alert_serialize_failed();
-                    }
+            if failed > 0
+                && let Some(metrics) = &self.metrics
+            {
+                for _ in 0..failed {
+                    metrics.inc_alert_serialize_failed();
                 }
             }
             pending.count >= ALERT_BATCH_SIZE
