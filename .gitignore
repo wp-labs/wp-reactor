@@ -6,3 +6,7 @@ examples/logs
 out/
 **/data/*.jsonl
 moju/draft/
+
+# LLVM coverage profraw（llvm-cov 跑测试时散落）
+default_*.profraw
+**/default_*.profraw
