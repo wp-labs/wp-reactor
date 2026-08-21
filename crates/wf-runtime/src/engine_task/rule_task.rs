@@ -860,8 +860,9 @@ impl RuleTask {
         let mut conv_closes: Vec<wf_engine::match_engine::CloseOutput> = Vec::new();
         // Columnar close emit (L4): gate-passing rules accumulate raw closes
         // here and emit them vectorized after the row loop — see
-        // `execute_close_direct_batch_columnar`.
-        let close_columnar = self.executor.close_plan_columnar_safe();
+        // `execute_close_direct_batch_columnar`. Debug detail off keeps the
+        // per-close log/counts (same gate shape as the on-each columnar path).
+        let close_columnar = !debug_enabled && self.executor.close_plan_columnar_safe();
         let mut columnar_closes: Vec<wf_engine::match_engine::CloseOutput> = Vec::new();
         // Records produced by the match/close paths accumulate here and are
         // appended to the pending columnar builder in one lock per

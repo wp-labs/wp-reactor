@@ -280,19 +280,25 @@ impl RuleExecutor {
     /// on-each gate (`each_plan_columnar_safe`): constant score, entity
     /// StringLit / plain Field, yields Lit / plain Field. Joins are unsupported
     /// on this path yet — rules with joins fall back to the per-record
-    /// join-enriched path (q4/q6 style).
+    /// join-enriched path (q4/q6 style). Field references to the synthetic
+    /// `_step_*` / `_bind_*` ctx fields are rejected: the columnar resolver
+    /// only reads keys / step labels / `field_values` / `bind_data`.
     pub fn close_plan_columnar_safe(&self) -> bool {
         if !matches!(self.plan.score_plan.expr, Expr::Number(_)) {
             return false;
         }
         match &self.plan.entity_plan.entity_id_expr {
             Expr::StringLit(_) => {}
-            Expr::Field(fr) if !matches!(fr, FieldRef::Path { .. }) => {}
+            Expr::Field(fr)
+                if !matches!(fr, FieldRef::Path { .. }) && !field_ref_name(fr).starts_with('_') => {
+            }
             _ => return false,
         }
         if !self.plan.yield_plan.fields.iter().all(|f| match &f.value {
             Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => true,
-            Expr::Field(fr) => !matches!(fr, FieldRef::Path { .. }),
+            Expr::Field(fr) => {
+                !matches!(fr, FieldRef::Path { .. }) && !field_ref_name(fr).starts_with('_')
+            }
             _ => false,
         }) {
             return false;
@@ -417,14 +423,12 @@ impl RuleExecutor {
             let entity_id: String = if let Some(s) = entity_const {
                 s.to_string()
             } else {
-                match resolve_close_field(close, keys, entity_field_name.unwrap_or("")) {
-                    Some(v) => value_to_string(&v),
-                    None => {
-                        // eval_entity_id errors on None — record as failed.
-                        stats.failed += 1;
-                        continue;
-                    }
-                }
+                // eval_entity_id → eval_yield_expr falls back to an empty
+                // string when the field is absent (never errors) — mirror that
+                // instead of failing the close.
+                resolve_close_field(close, keys, entity_field_name.unwrap_or(""))
+                    .map(|v| value_to_string(&v))
+                    .unwrap_or_default()
             };
             // wfx_id / summary need the combined step data (same byte stream
             // as build_wfx_id/build_summary on the per-record path).
@@ -509,9 +513,14 @@ impl RuleExecutor {
 /// `None` when absent everywhere — the per-record path then reads `None` from
 /// the synthetic ctx (entity errors, yield falls back to empty string).
 fn resolve_close_field(close: &CloseOutput, keys: &[FieldRef], name: &str) -> Option<Value> {
+    // Keys first (build_eval_context inserts keys before anything else; a key
+    // with no scope value is absent from the ctx, so fall through to the
+    // field_values/bind lookups below).
     for (i, k) in keys.iter().enumerate() {
-        if field_ref_name(k) == name {
-            return close.scope_key.get(i).cloned();
+        if field_ref_name(k) == name
+            && let Some(v) = close.scope_key.get(i)
+        {
+            return Some(v.clone());
         }
     }
     for sd in close

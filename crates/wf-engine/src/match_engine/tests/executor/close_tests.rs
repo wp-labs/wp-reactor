@@ -576,3 +576,176 @@ fn columnar_close_resolves_field_from_step_label() {
     // close step label "n" = 7.0 → "7" (f64 Display of an integral value).
     assert_eq!(entity.get_value(), &wp_model_core::model::Value::from("7"));
 }
+
+// -------------------------------------------------------------------------
+// L4 edge cases (review 2026-08-21): entity fallback, rejection, missing
+// yields, synthetic-field gate, keys-without-scope fallback.
+// -------------------------------------------------------------------------
+
+#[test]
+fn columnar_close_entity_missing_falls_back_to_empty() {
+    // entity = Field(absent): eval_yield_expr falls back to an empty string
+    // on the per-record path — the columnar path must match (not fail the
+    // close, which was the first implementation's bug).
+    let mut plan = q12_like_plan();
+    plan.entity_plan.entity_id_expr = Expr::Field(FieldRef::Simple("absent".to_string()));
+    let exec = RuleExecutor::new(plan);
+    let close = q12_like_close();
+
+    let record = exec.execute_close(&close).unwrap().unwrap();
+    assert_eq!(record.entity_id, "");
+
+    let mut builder = crate::alert::AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
+    let stats = exec.execute_close_direct_batch_columnar(&[close], &mut builder, 1_700_000_000_000);
+    assert_eq!(stats.appended, 1, "absent entity must still append");
+    assert_eq!(stats.failed, 0);
+    let batch = builder.finish();
+    let rows: Vec<_> = batch
+        .iter_data_records()
+        .collect::<crate::error::CoreResult<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_records_equal_ignoring_emit_time(&record.to_data_record().unwrap(), &rows[0]);
+}
+
+#[test]
+fn columnar_close_rejects_unqualified_close() {
+    let exec = RuleExecutor::new(q12_like_plan());
+    let mut close = q12_like_close();
+    close.close_ok = false;
+
+    let mut builder = crate::alert::AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
+    let stats = exec.execute_close_direct_batch_columnar(&[close], &mut builder, 1_700_000_000_000);
+    assert_eq!(stats.rejected, 1);
+    assert_eq!(stats.appended, 0);
+    let batch = builder.finish();
+    assert_eq!(batch.len(), 0);
+}
+
+#[test]
+fn columnar_close_batch_mixes_qualified_and_unqualified() {
+    let exec = RuleExecutor::new(q12_like_plan());
+    let mut bad = q12_like_close();
+    bad.close_ok = false;
+    let good = q12_like_close();
+
+    let mut builder = crate::alert::AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
+    let stats = exec.execute_close_direct_batch_columnar(
+        &[good.clone(), bad, good.clone()],
+        &mut builder,
+        1_700_000_000_000,
+    );
+    assert_eq!(stats.appended, 2);
+    assert_eq!(stats.rejected, 1);
+    let batch = builder.finish();
+    assert_eq!(batch.len(), 2);
+    // Both appended rows identical to the per-record path.
+    let rows: Vec<_> = batch
+        .iter_data_records()
+        .collect::<crate::error::CoreResult<Vec<_>>>()
+        .unwrap();
+    let per_record = exec
+        .execute_close(&good)
+        .unwrap()
+        .unwrap()
+        .to_data_record()
+        .unwrap();
+    for row in &rows {
+        assert_records_equal_ignoring_emit_time(&per_record, row);
+    }
+}
+
+#[test]
+fn columnar_close_missing_yield_field_falls_back_to_empty() {
+    // yield id = Field(absent): eval_yield_expr_with_meta falls back to an
+    // empty string — the columnar path must stage the same empty value.
+    let mut plan = q12_like_plan();
+    plan.yield_plan.fields[0].value = Expr::Field(FieldRef::Simple("absent".to_string()));
+    let exec = RuleExecutor::new(plan);
+    let close = q12_like_close();
+
+    let record = exec.execute_close(&close).unwrap().unwrap();
+    let (name, value) = record
+        .yield_fields
+        .iter()
+        .find(|(n, _)| &**n == "id")
+        .expect("id yield present");
+    assert_eq!(
+        value,
+        &crate::match_engine::match_engine::Value::Str("".into())
+    );
+    let _ = name;
+
+    let mut builder = crate::alert::AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
+    let stats = exec.execute_close_direct_batch_columnar(&[close], &mut builder, 1_700_000_000_000);
+    assert_eq!(stats.appended, 1);
+    assert_eq!(stats.failed, 0);
+    let batch = builder.finish();
+    let rows: Vec<_> = batch
+        .iter_data_records()
+        .collect::<crate::error::CoreResult<Vec<_>>>()
+        .unwrap();
+    assert_records_equal_ignoring_emit_time(&record.to_data_record().unwrap(), &rows[0]);
+}
+
+#[test]
+fn close_plan_columnar_safe_rejects_synthetic_field_refs() {
+    // `_step_*` / `_bind_*` ctx fields can't be resolved columnarly — the
+    // gate must reject them so those rules keep the per-record path.
+    let mut plan = q12_like_plan();
+    plan.yield_plan.fields[0].value = Expr::Field(FieldRef::Simple("_step_0_values".to_string()));
+    assert!(!RuleExecutor::new(plan).close_plan_columnar_safe());
+
+    let mut plan = q12_like_plan();
+    plan.entity_plan.entity_id_expr = Expr::Field(FieldRef::Simple("_bind_b_count".to_string()));
+    assert!(!RuleExecutor::new(plan).close_plan_columnar_safe());
+}
+
+#[test]
+fn columnar_close_scope_key_short_falls_back_to_field_values() {
+    // Two match keys but a scope_key of length 1: the second key has no value
+    // in the ctx (keys.zip(scope_key) truncates), so a yield on it resolves
+    // from field_values — both paths must agree.
+    let mut plan = q12_like_plan();
+    plan.match_plan = simple_plan(
+        vec![simple_key("bidder"), simple_key("category")],
+        vec![step(vec![branch("b", count_ge(1.0))])],
+    );
+    plan.yield_plan.fields[0].value = Expr::Field(FieldRef::Simple("category".to_string()));
+    let exec = RuleExecutor::new(plan);
+
+    let mut close = q12_like_close();
+    // scope_key shorter than keys (truncated zip on the per-record path).
+    close.scope_key = vec![crate::match_engine::match_engine::Value::Number(42.0)];
+    close.event_step_data[0].field_values = {
+        let mut m = EngineHashMap::default();
+        m.insert(
+            "category".to_string(),
+            vec![crate::match_engine::match_engine::Value::Str("cars".into())],
+        );
+        m
+    };
+
+    let record = exec.execute_close(&close).unwrap().unwrap();
+    let id_val = record
+        .yield_fields
+        .iter()
+        .find(|(n, _)| &**n == "id")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert_eq!(
+        id_val,
+        crate::match_engine::match_engine::Value::Str("cars".into())
+    );
+
+    let mut builder = crate::alert::AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
+    let stats = exec.execute_close_direct_batch_columnar(&[close], &mut builder, 1_700_000_000_000);
+    assert_eq!(stats.appended, 1);
+    assert_eq!(stats.failed, 0);
+    let batch = builder.finish();
+    let rows: Vec<_> = batch
+        .iter_data_records()
+        .collect::<crate::error::CoreResult<Vec<_>>>()
+        .unwrap();
+    assert_records_equal_ignoring_emit_time(&record.to_data_record().unwrap(), &rows[0]);
+}
