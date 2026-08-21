@@ -76,13 +76,22 @@ pub(super) fn accumulate_close_steps<E: FieldSource>(
 
             record_evidence_time(bs, event_time_nanos);
 
-            collect_event_fields(
-                event,
-                bs,
-                tracked_fields,
-                &plan.tracked_plain_fields,
-                branch.field.as_ref(),
-            );
+            // The per-event field_values history feeds close-time `Field`
+            // resolution (build_eval_context). `needs_field_history=false`
+            // (compiler: close outputs read only the match keys / literals)
+            // means those values are never consumed — skip the collection
+            // entirely. q12-style count rules: saves the per-event
+            // HashMap-insert + Vec push per tracked field on the advance hot
+            // path.
+            if plan.needs_field_history {
+                collect_event_fields(
+                    event,
+                    bs,
+                    tracked_fields,
+                    &plan.tracked_plain_fields,
+                    branch.field.as_ref(),
+                );
+            }
 
             // Update measure accumulators
             update_measure(&branch.agg.measure, &field_value, bs);
