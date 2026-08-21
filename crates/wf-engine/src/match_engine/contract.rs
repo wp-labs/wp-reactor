@@ -87,6 +87,13 @@ fn execute_test_run(
                     alias
                 };
 
+                // 评估 bind 级过滤（events { b : bid_events && guard }），与引擎
+                // rule_task 的 alias_accepts 一致——否则 test 会绕过 guard 全部放行。
+                if !executor.event_matches_alias(use_alias, &event, None) {
+                    current_nanos += 1_000_000_000;
+                    continue;
+                }
+
                 match sm.advance_at(use_alias, &event, current_nanos) {
                     StepResult::Matched(ctx) => {
                         if let Ok(alert) = executor.execute_match(&ctx) {

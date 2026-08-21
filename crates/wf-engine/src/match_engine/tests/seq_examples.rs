@@ -177,24 +177,24 @@ rule rat_propagation {
 
 test full_chain_detected for rat_propagation {
   input {
-    row(scan, sip = "10.0.0.99", dip = "192.168.1.10", dport = "22", bytes_out = "100", event_time = "2026-01-01T00:00:00Z");
+    row(scan, sip = "10.0.0.99", dip = "192.168.1.10", dport = 22, bytes_out = 100, event_time = "2026-01-01T00:00:00Z");
     row(login, sip = "10.0.0.99", dip = "192.168.1.10", result = "success", event_time = "2026-01-01T00:01:00Z");
-    row(xfer, sip = "10.0.0.99", dip = "192.168.1.10", bytes_out = "50000", event_time = "2026-01-01T00:02:00Z");
-    row(scan, sip = "10.0.0.99", dip = "192.168.1.20", dport = "445", bytes_out = "200", event_time = "2026-01-01T00:03:00Z");
+    row(xfer, sip = "10.0.0.99", dip = "192.168.1.10", bytes_out = 50000, event_time = "2026-01-01T00:02:00Z");
+    row(scan, sip = "10.0.0.99", dip = "192.168.1.20", dport = 445, bytes_out = 200, event_time = "2026-01-01T00:03:00Z");
     row(login, sip = "10.0.0.99", dip = "192.168.1.20", result = "success", event_time = "2026-01-01T00:04:00Z");
-    row(xfer, sip = "10.0.0.99", dip = "192.168.1.20", bytes_out = "200000", event_time = "2026-01-01T00:05:00Z");
-    row(scan, sip = "10.0.0.99", dip = "192.168.1.30", dport = "3389", bytes_out = "150", event_time = "2026-01-01T00:06:00Z");
+    row(xfer, sip = "10.0.0.99", dip = "192.168.1.20", bytes_out = 200000, event_time = "2026-01-01T00:05:00Z");
+    row(scan, sip = "10.0.0.99", dip = "192.168.1.30", dport = 3389, bytes_out = 150, event_time = "2026-01-01T00:06:00Z");
     row(login, sip = "10.0.0.99", dip = "192.168.1.30", result = "success", event_time = "2026-01-01T00:07:00Z");
-    row(xfer, sip = "10.0.0.99", dip = "192.168.1.30", bytes_out = "150000", event_time = "2026-01-01T00:08:00Z");
+    row(xfer, sip = "10.0.0.99", dip = "192.168.1.30", bytes_out = 150000, event_time = "2026-01-01T00:08:00Z");
   }
   expect { hits == 3; }
 }
 
 test missing_xfer_step for rat_propagation {
   input {
-    row(scan, sip = "10.0.0.50", dip = "192.168.1.10", dport = "22", bytes_out = "100", event_time = "2026-01-01T00:00:00Z");
+    row(scan, sip = "10.0.0.50", dip = "192.168.1.10", dport = 22, bytes_out = 100, event_time = "2026-01-01T00:00:00Z");
     row(login, sip = "10.0.0.50", dip = "192.168.1.10", result = "success", event_time = "2026-01-01T00:01:00Z");
-    row(scan, sip = "10.0.0.50", dip = "192.168.1.20", dport = "445", bytes_out = "200", event_time = "2026-01-01T00:02:00Z");
+    row(scan, sip = "10.0.0.50", dip = "192.168.1.20", dport = 445, bytes_out = 200, event_time = "2026-01-01T00:02:00Z");
     row(login, sip = "10.0.0.50", dip = "192.168.1.20", result = "success", event_time = "2026-01-01T00:03:00Z");
   }
   expect { hits == 0; }
@@ -202,18 +202,18 @@ test missing_xfer_step for rat_propagation {
 
 test admin_scan_only for rat_propagation {
   input {
-    row(scan, sip = "10.0.0.200", dip = "192.168.1.01", dport = "22", bytes_out = "100", event_time = "2026-01-01T00:00:00Z");
-    row(scan, sip = "10.0.0.200", dip = "192.168.1.02", dport = "22", bytes_out = "100", event_time = "2026-01-01T00:01:00Z");
-    row(scan, sip = "10.0.0.200", dip = "192.168.1.03", dport = "22", bytes_out = "100", event_time = "2026-01-01T00:02:00Z");
+    row(scan, sip = "10.0.0.200", dip = "192.168.1.01", dport = 22, bytes_out = 100, event_time = "2026-01-01T00:00:00Z");
+    row(scan, sip = "10.0.0.200", dip = "192.168.1.02", dport = 22, bytes_out = 100, event_time = "2026-01-01T00:01:00Z");
+    row(scan, sip = "10.0.0.200", dip = "192.168.1.03", dport = 22, bytes_out = 100, event_time = "2026-01-01T00:02:00Z");
   }
   expect { hits == 0; }
 }
 
 test single_target_full_chain for rat_propagation {
   input {
-    row(scan, sip = "10.0.0.77", dip = "192.168.1.10", dport = "22", bytes_out = "100", event_time = "2026-01-01T00:00:00Z");
+    row(scan, sip = "10.0.0.77", dip = "192.168.1.10", dport = 22, bytes_out = 100, event_time = "2026-01-01T00:00:00Z");
     row(login, sip = "10.0.0.77", dip = "192.168.1.10", result = "success", event_time = "2026-01-01T00:01:00Z");
-    row(xfer, sip = "10.0.0.77", dip = "192.168.1.10", bytes_out = "50000", event_time = "2026-01-01T00:02:00Z");
+    row(xfer, sip = "10.0.0.77", dip = "192.168.1.10", bytes_out = 50000, event_time = "2026-01-01T00:02:00Z");
   }
   expect { hits == 1; }
 }
@@ -221,8 +221,8 @@ test single_target_full_chain for rat_propagation {
 test out_of_order_login for rat_propagation {
   input {
     row(login, sip = "10.0.0.88", dip = "192.168.1.10", result = "success", event_time = "2026-01-01T00:00:00Z");
-    row(scan, sip = "10.0.0.88", dip = "192.168.1.10", dport = "22", bytes_out = "100", event_time = "2026-01-01T00:01:00Z");
-    row(xfer, sip = "10.0.0.88", dip = "192.168.1.10", bytes_out = "50000", event_time = "2026-01-01T00:02:00Z");
+    row(scan, sip = "10.0.0.88", dip = "192.168.1.10", dport = 22, bytes_out = 100, event_time = "2026-01-01T00:01:00Z");
+    row(xfer, sip = "10.0.0.88", dip = "192.168.1.10", bytes_out = 50000, event_time = "2026-01-01T00:02:00Z");
   }
   expect { hits == 0; }
 }
@@ -261,36 +261,36 @@ rule password_spraying {
 
 test spray_then_success for password_spraying {
   input {
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u1", event_time = "2026-01-01T00:00:00Z");
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u2", event_time = "2026-01-01T00:01:00Z");
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u3", event_time = "2026-01-01T00:02:00Z");
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u4", event_time = "2026-01-01T00:03:00Z");
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u5", event_time = "2026-01-01T00:04:00Z");
-    row(ok, password_hash = "h1", sip = "10.0.0.9", user = "u5", event_time = "2026-01-01T00:06:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u1", event_time = "2026-01-01T00:00:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u2", event_time = "2026-01-01T00:01:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u3", event_time = "2026-01-01T00:02:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u4", event_time = "2026-01-01T00:03:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u5", event_time = "2026-01-01T00:04:00Z");
+    row(ok, result = "success", password_hash = "h1", sip = "10.0.0.9", user = "u5", event_time = "2026-01-01T00:06:00Z");
   }
   expect { hits == 1; }
 }
 
 test success_too_late for password_spraying {
   input {
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u1", event_time = "2026-01-01T00:00:00Z");
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u2", event_time = "2026-01-01T00:01:00Z");
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u3", event_time = "2026-01-01T00:02:00Z");
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u4", event_time = "2026-01-01T00:03:00Z");
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u5", event_time = "2026-01-01T00:04:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u1", event_time = "2026-01-01T00:00:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u2", event_time = "2026-01-01T00:01:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u3", event_time = "2026-01-01T00:02:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u4", event_time = "2026-01-01T00:03:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u5", event_time = "2026-01-01T00:04:00Z");
     tick(6m);
-    row(ok, password_hash = "h1", sip = "10.0.0.9", user = "u5", event_time = "2026-01-01T00:10:00Z");
+    row(ok, result = "success", password_hash = "h1", sip = "10.0.0.9", user = "u5", event_time = "2026-01-01T00:10:00Z");
   }
   expect { hits == 0; }
 }
 
 test spray_only for password_spraying {
   input {
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u1", event_time = "2026-01-01T00:00:00Z");
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u2", event_time = "2026-01-01T00:01:00Z");
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u3", event_time = "2026-01-01T00:02:00Z");
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u4", event_time = "2026-01-01T00:03:00Z");
-    row(spray, password_hash = "h1", sip = "10.0.0.9", user = "u5", event_time = "2026-01-01T00:04:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u1", event_time = "2026-01-01T00:00:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u2", event_time = "2026-01-01T00:01:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u3", event_time = "2026-01-01T00:02:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u4", event_time = "2026-01-01T00:03:00Z");
+    row(spray, result = "failed", password_hash = "h1", sip = "10.0.0.9", user = "u5", event_time = "2026-01-01T00:04:00Z");
   }
   expect { hits == 0; }
 }

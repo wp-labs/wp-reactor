@@ -1513,7 +1513,11 @@ impl RuleTask {
             let machine = self.machine.as_mut().expect("checked above");
             let rule_name = machine.rule_name().to_string();
             if self.conv_sink.is_some() {
-                let raw = machine.scan_expired_at_skip_non_alerting(effective_watermark);
+                // Timeout scan runs off the event hot path (pipeline idle), so it
+                // uses the **unbounded** expiry budget: fixed-window rules whose
+                // final bucket expires past the last event time depend on this
+                // sweep to close (q16 30M dropped the final bucket otherwise).
+                let raw = machine.scan_expired_at_skip_non_alerting_unbounded(effective_watermark);
                 // Barrier watermark = the effective (wall-clock advanced) scan
                 // watermark, so an idle shard still advances its barrier and the
                 // conv stage can seal buckets for the whole rule (without this,
@@ -1540,7 +1544,7 @@ impl RuleTask {
             } else {
                 (
                     rule_name,
-                    machine.scan_expired_at_with_conv_skip_non_alerting(
+                    machine.scan_expired_at_with_conv_skip_non_alerting_unbounded(
                         effective_watermark,
                         self.conv_plan.as_ref(),
                     ),
