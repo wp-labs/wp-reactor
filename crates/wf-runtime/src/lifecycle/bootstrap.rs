@@ -536,6 +536,7 @@ mod tests {
             conv_window: None,
             name: name.into(),
             binds: vec![],
+            lets: Vec::new(),
             match_plan: MatchPlan {
                 keys: vec![],
                 key_map: None,
