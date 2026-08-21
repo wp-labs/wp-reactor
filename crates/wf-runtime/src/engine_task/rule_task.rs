@@ -616,11 +616,20 @@ impl RuleTask {
             None => GuardMasks::default(),
         };
 
-        // Deferral is safe only for the state-machine path when the producer
-        // broadcast the raw batch without events and debug detail logging is
-        // off (rejected rows have no Event to render a debug ref from).
-        let defer_materialize =
-            events.is_none() && batch.is_some() && self.machine.is_some() && !debug_enabled;
+        // Deferral is safe only for the state-machine path when debug detail
+        // logging is off (rejected rows have no Event to render a debug ref
+        // from) and every bind filter of this window is columnar (a missing
+        // mask in the deferred path accepts all rows — a non-columnar filter
+        // would silently lose its rejection). The raw batch must be present;
+        // relay/push pushes that also carry materialized `events` now prefer
+        // the columnar path too — the materialized events are only used as the
+        // emit-path trigger projection (byte-identical via `materialize_fields`),
+        // so carrying them is no longer a reason to force eager per-row
+        // materialization (q15 eager_row 1.1µs vs deferred 326ns, 2026-08-22).
+        let defer_materialize = batch.is_some()
+            && self.machine.is_some()
+            && !debug_enabled
+            && self.executor.bind_filters_columnar_safe(window_name);
 
         // On-each columnar fast path: no per-row `Event` materialization —
         // field values are read straight from the Arrow columns. Byte-identical

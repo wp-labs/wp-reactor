@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{BinOp, Expr, FieldRef};
@@ -12,6 +12,7 @@ use wf_lang::plan::{BindPlan, EachPlan};
 
 use crate::match_engine::RuleExecutor;
 use crate::match_engine::batch_to_events;
+use crate::match_engine::match_engine::FieldSource;
 
 use super::helpers::{branch, count_ge, simple_plan, simple_rule_plan, step};
 
@@ -125,6 +126,49 @@ fn non_columnar_filter_returns_none() {
 
     let each = each_executor(Some(func_filter()));
     assert!(each.each_filter_columnar_mask(&batch).is_none());
+}
+
+/// contains 函数 filter：非列式（走解释器），Str 字段必须命中正确行。
+#[test]
+fn contains_filter_matches_per_event_interpreted() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("sip", DataType::Utf8, false),
+        Field::new("event_time", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![
+                "10.0.0.1", "10.0.0.2", "9.0.0.3", "10.0.0.4",
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+        ],
+    )
+    .unwrap();
+    let filter = Expr::FuncCall {
+        qualifier: None,
+        name: "contains".into(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("sip".into())),
+            Expr::StringLit("0.0".into()),
+        ],
+    };
+    let exec = bind_executor(Some(filter));
+    assert!(
+        exec.bind_filter_columnar_mask("b", &batch).is_none(),
+        "contains 应非列式（返回 None mask）"
+    );
+    let events = batch_to_events(&batch);
+    // 全部含子串 "0.0"：10.0.0.1 / 10.0.0.2 / 9.0.0.3 / 10.0.0.4 均命中。
+    let expect = [true, true, true, true];
+    for (row, ev) in events.iter().enumerate() {
+        assert_eq!(
+            exec.event_matches_alias("b", ev, None),
+            expect[row],
+            "row {row}: sip={} contains \"0.0\"",
+            ev.field_value_str("sip")
+        );
+    }
 }
 
 #[test]

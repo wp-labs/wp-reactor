@@ -2476,6 +2476,91 @@ async fn deferred_materialization_matches_eager_path() {
 }
 
 #[tokio::test]
+async fn events_and_batch_both_present_prefers_columnar_path() {
+    // 2026-08-22：defer_materialize 放宽——raw batch 存在且 bind filter 列式时，
+    // 即使 relay/push 同时携带物化 events 也走列式（deferred）路径；events 仅作
+    // emit 路径 trigger 投影。断言与纯 eager 输出一致（filter 仍生效：只放行
+    // sip=10.0.0.1）。
+    init_tracing();
+    let filter = Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Simple("sip".into()))),
+        right: Box::new(Expr::StringLit("10.0.0.1".into())),
+    };
+    let schema = test_schema();
+    let ts = 1_700_000_000_000_000_000i64;
+    let batch = make_batch(
+        &schema,
+        &["10.0.0.1", "10.0.0.2", "10.0.0.1", "10.0.0.1"],
+        ts,
+    );
+    let events = Arc::new(
+        batch_to_events(&batch)
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>(),
+    );
+
+    // events + batch 同时存在：放宽后应走列式（deferred），filter 列式生效。
+    let (mut task, mut alert_rx, _win, _notify) = make_filter_task(filter);
+    task.process_push(RulePush {
+        window_name: "auth_events".into(),
+        events: Some(Arc::clone(&events)),
+        batch: Some(Arc::new(batch)),
+        materialize_fields: None,
+        shard_rows: None,
+        seq: u64::MAX,
+    })
+    .await;
+    let both_ids = drain_alert_entity_ids(&mut alert_rx);
+    assert_eq!(both_ids, vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn non_columnar_filter_with_batch_falls_back_to_eager() {
+    // 非列式 bind filter（含谓词函数调用）→ 即使 batch 存在也不 defer：
+    // eager 路径解释执行 filter（拒绝的行不得漏进状态机——deferred 的
+    // missing-mask 兜底会全放行，必须避免）。
+    init_tracing();
+    // `sip contains "0.0"` —— contains 非列式（列式安全门外），走解释器。
+    let filter = Expr::FuncCall {
+        qualifier: None,
+        name: "contains".into(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("sip".into())),
+            Expr::StringLit("0.0".into()),
+        ],
+    };
+    let schema = test_schema();
+    let ts = 1_700_000_000_000_000_000i64;
+    // contains "0.0"：10.0.0.1×3 命中（count=3 收口 fire）；9.9.9.9 不含 "0.0" 被拒。
+    let batch = make_batch(
+        &schema,
+        &["10.0.0.1", "10.0.0.1", "10.0.0.1", "9.9.9.9"],
+        ts,
+    );
+    let events = Arc::new(
+        batch_to_events(&batch)
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>(),
+    );
+    let (mut task, mut alert_rx, _win, _notify) = make_filter_task(filter);
+
+    task.process_push(RulePush {
+        window_name: "auth_events".into(),
+        events: Some(Arc::clone(&events)),
+        batch: Some(Arc::new(batch)),
+        materialize_fields: None,
+        shard_rows: None,
+        seq: u64::MAX,
+    })
+    .await;
+    let both_ids = drain_alert_entity_ids(&mut alert_rx);
+    assert_eq!(both_ids, vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
 async fn deferred_materialization_scans_every_row_for_intra_batch_expiry() {
     init_tracing();
     // `sip == "10.0.0.1"` is a columnar bind filter, so the deferred path
@@ -2860,7 +2945,7 @@ fn make_sharded_match_tasks(
                 window: "auth_events".into(),
                 filter: None,
             }],
-        lets: Vec::new(),
+            lets: Vec::new(),
             match_plan: match_plan.clone(),
             each_plan: None,
             joins: vec![],

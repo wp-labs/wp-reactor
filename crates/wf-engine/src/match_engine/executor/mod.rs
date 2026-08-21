@@ -456,6 +456,24 @@ impl RuleExecutor {
         Some(eval_guard_columnar(filter, &view))
     }
 
+    /// Whether every bind of `window` can be evaluated columnarly — every
+    /// filter is absent (nothing to reject) or [`expr_is_columnar`]. This is
+    /// the rule-task's local check for safe deferred (columnar) materialization
+    /// when a raw batch is present: a non-columnar filter would otherwise be
+    /// skipped entirely (the deferred path's missing-mask fallback accepts all
+    /// rows), silently corrupting the filtered subset.
+    pub fn bind_filters_columnar_safe(&self, window: &str) -> bool {
+        self.plan
+            .binds
+            .iter()
+            .filter(|b| b.window == window)
+            .all(|b| {
+                b.filter
+                    .as_ref()
+                    .is_none_or(|f| wf_lang::columnar::expr_is_columnar(f))
+            })
+    }
+
     /// Columnar evaluation of the `on each` filter over a whole batch.
     ///
     /// Same `None` / `Some(mask)` contract as [`Self::bind_filter_columnar_mask`],
