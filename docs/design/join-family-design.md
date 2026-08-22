@@ -264,7 +264,7 @@ rule q9_winning_bid {
 | **P1** | 语法+计划：`within`/`reduce`/`as label` AST+parser + over 校验 | — | wf-lang | 单测 |
 | **P2** | 回看 interval eager 执行（时间谓词 + 存在/首/最新） | 通用面 | `lookup_timestamped` + `execute_joins` | 单测 + oracle |
 | **P3** | **前瞻 deferred**（keyed TTL 状态 + watermark 到期 + reduce） | **Q8/Q9** | match expiry + `lookup_timestamped` | Q8/Q9 权威对拍 |
-| **P4** | side input 补齐（provider 窗口声明 + 文档） | Q13 精确化 | `provider_snapshot` | Q13 文档 |
+| **P4** | side input 补齐（provider 窗口声明 + 运行时接线） | Q13 精确化 | `provider_snapshot` | Q13 文档（§14）✅ |
 | — | stats close 桶内回查 | Q5/Q7 | conv | stats P5 |
 
 > oracle 已有窗口状态 + WindowLookup（join-field-as-key-design P2 建好）——interval = oracle 侧加同样 `lookup_interval`，对拍可行。
@@ -289,6 +289,7 @@ rule q9_winning_bid {
 
 - 前置：`docs/stats-executor-design.md`（v6，stats+join 正交能力）
 - 既有 join：`docs/design/join-field-as-key-design.md`（snapshot join-then-key，P0-P2 已完成）
+- side input：`docs/design/provider-window-usage.md`（P4，provider 窗口声明 + Q13 精确化）
 - 语法示例：`wf-examples/performance/nexmark_pk/models/queries/q8.wfl` / `q9.wfl`（现状近似版）
 
 ---
@@ -478,3 +479,107 @@ interval 的 1.5×，多出 reduce 选择 + label 注入 + 完整 alert 构建�
 - deferred join 仅支持 on-each 驱动形态（match 形态 checker 拒绝，见 §13.2b）。
 - `top(N)` 输出取首行 + label 注入；N>1 多行 Array 注入未实现（无现实用例）。
 - oracle（wfgen）跨仓库对拍未在本仓执行（`warp-fusion/crates/wfgen`）。
+
+---
+
+## 14. P4 实施记录（2026-08-22，side input：provider 窗口声明 + 运行时接线）
+
+P4（side input 补齐）已落地。`cargo test -p wf-lang -p wf-engine -p wf-runtime` 全绿
+（新增 10 checker 单测 + 2 wfs 解析单测 + 1 runtime join_lookup 单测 + 2 端到端）。
+
+### 14.1 关键发现：语法/checker 链路早已就绪，缺口在运行时
+
+- **`parse_wfs` 已把 `window<provider>` 合并进 flow schema 列表**
+  （`wfs_parser/mod.rs` `wfs_file`：`sw.to_flow_schema()` 入 `windows`）——checker 的
+  `check_joins_list` 因此**已能看到 provider 目标窗口**，`join person_table snapshot on ...`
+  本就通过“target window exists”+字段校验。
+- **真正的缺口是运行时**：`RegistryLookup::join_lookup`（`wf-runtime/engine_task/window_lookup.rs`）
+  对 join 目标先 `get_window(window)?`——provider 窗口在 `provider_windows`，不在
+  `windows`（buffer），返回 `None` → **join 静默 miss**（snapshot miss 不丢事件、不富化，
+  结果看似正常实则全空）。这是 P4 修复的核心。
+
+### 14.2 已实现
+
+1. **运行时 provider join_lookup**（`window_lookup.rs`）：`join_lookup` 先查
+   `get_provider`——provider 命中则按精确键等值（`values_equal`，与 `find_matching_row`
+   同一语义）扫描 `provider_snapshot` 行；无匹配返回 `Some(空)`，窗口不存在返回 `None`。
+   静态表小、无索引，O(rows) 扫描是预期（设计 §1「provider 窗口 → side input 现成」）。
+   `values_equal` 从 `pub(crate)` 提为 `pub` 并随 `wf_engine::match_engine` 导出。
+2. **checker 静态窗口限制**（`checker/rules/joins.rs`）：`is_static_window`
+   （无 stream + 无 time + over=0，即 `to_flow_schema()` 投影）→ 仅允许
+   snapshot 与缺省 inner；anti/asof/within/reduce/emit at 全部报错（信息指明
+   「provider/静态窗口（side input）v1 仅支持 snapshot join」及原因）。流式窗口路径不变。
+3. **bootstrap 既有接线复用**：wfs 声明 provider → `parse_wfs` 合并 → checker 可见；
+   config `[window.x] table=` 分区到 provider（`bootstrap.rs:74-84`）；knowdb.toml
+   `load_knowledge_into_windows` 注册 provider。`configure_join_indexes` 对 provider
+   自动跳过（`get_window` 为 None），无索引即为预期扫描。
+
+### 14.3 Q13 精确化形态（side input 权威形状，文档级）
+
+当前 `q13.wfl` 用 `person_events`（2% person **流**窗口）近似侧输入；精确化为真
+provider 静态表需要三处接线（本仓未改 q13.wfl——bench 未生成 person 静态表，避免
+静默零命中；下述为落地清单）：
+
+```wfs
+// nexmark.wfs：person 静态表声明
+window<provider> person_table {
+    fields {
+        id: digit
+        state: chars
+        city: chars
+    }
+}
+```
+
+```toml
+# windows.toml：绑定 knowdb 表
+[window.person_table]
+mode = "local"
+table = "person_table"
+```
+
+```toml
+# knowdb.toml：数据源（CSV/PG），列名对齐 wfs 字段
+[[tables]]
+name = "person_table"
+dir = "person_table"
+enabled = true
+columns.by_header = ["id", "state", "city"]
+```
+
+```wfl
+// q13.wfl 精确化：bid ⋈ provider person 静态表 snapshot
+rule q13_bid_person_join {
+    events { b : bid_events }
+    on each b -> score(10.0)
+    join person_table snapshot on b.bidder == person_table.id
+    entity(digit, b.bidder)
+    yield nexmark_alerts (id = b.bidder, alert_type = "q13_sidejoin",
+        detail = "bid joined person", request_count = 1)
+}
+```
+
+（bench 数据链路需 gen-nexmark 额外把 person 行导出为 person_table CSV——留作
+bench 侧后续；对拍可比性不受影响：Q13 的输出键/计数不变，仅富化来源从流窗口
+改为静态表。）
+
+### 14.4 测试
+
+- checker（`tests/provider_joins.rs`）：snapshot/inner 通过；asof/within/anti/reduce/
+  emit at 报「provider/静态窗口」错误。
+- wfs 解析（`tests/validation.rs`）：`parse_wfs` 合并 provider 为 flow schema（无
+  stream/time/over）；provider 与 flow 窗口撞名报错。
+- runtime（`window_lookup.rs`）：provider join_lookup 命中/未命中/窗口不存在三态。
+- 端到端（`engine_task/provider_join_integration_tests.rs`）：注册 provider →
+  on-each 规则 snapshot join 富化输出（hit）、miss 保留事件不富化（Q13 形状）。
+
+### 14.5 边界（v1 限制与后续）
+
+- provider join 仅 snapshot/缺省 inner（checker 强制）；anti/interval/asof/reduce/
+  deferred 对静态表 v1 拒绝——语义上无时序载体，后续按需放开。
+- provider 无 join 索引，O(rows) 扫描（静态小表预期）；大静态表后续可加
+  `ProviderWindow` 内存索引（`table → 行定位`）。
+- `snapshot_field_values`（`has()` 守卫）对 provider 仍返回 None（`get_window` 路径）——
+  `window.has()` 查 provider 留后续。
+- bootstrap `_static_schemas` 加载仍为冗余（parse 已合并）；若需“wfs 声明必有 table
+  绑定”的强校验，可在此处加（v1 未加，避免与 `__window_miss` 等内部 provider 冲突）。

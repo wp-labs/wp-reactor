@@ -9,6 +9,7 @@ mod limits;
 mod nested_path;
 mod on_each;
 mod pipeline;
+mod provider_joins;
 mod scope;
 mod seq;
 mod stats;

@@ -17,7 +17,8 @@ pub use types::{
 pub use types::{EngineHashMap, EngineHashSet};
 
 // Re-export pub(crate) items
-pub(crate) use eval::{eval_expr, values_equal};
+pub(crate) use eval::eval_expr;
+pub use eval::values_equal;
 pub use key::{ScopeKey, field_ref_name};
 pub(crate) use key::{
     eval_field_value, extract_key_simple, push_i64_exact_decimal, scope_key_from_values,

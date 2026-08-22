@@ -148,6 +148,66 @@ window<provider> ip_reputation {
     assert!(err.to_string().contains("provider object/array fields"));
 }
 
+/// P4：`parse_wfs`（flow 入口）必须把 `window<provider>` 合并进返回的
+/// `WindowSchema` 列表（`StaticWindowSchema::to_flow_schema()`）——否则 checker
+/// 的 `check_joins_list` 查不到 provider 目标窗口，side input join 无法编译。
+#[test]
+fn flow_entrypoint_merges_provider_as_flow_schema() {
+    let input = r#"
+window bid_events {
+    stream_tag = "bid"
+    time = event_time
+    over = 10m
+    fields {
+        bidder: digit
+        event_time: time
+    }
+}
+window<provider> person_table {
+    fields {
+        id: digit
+        state: chars
+    }
+}
+"#;
+    let schemas = parse_wfs(input).unwrap();
+    assert_eq!(schemas.len(), 2);
+    let person = schemas
+        .iter()
+        .find(|s| s.name == "person_table")
+        .expect("provider window must be merged into flow schemas");
+    // provider 投影：无 stream、无 time、over = 0
+    assert!(person.streams.is_empty());
+    assert!(person.time_field.is_none());
+    assert!(person.over.is_zero());
+    assert_eq!(person.fields.len(), 2);
+    assert_eq!(person.fields[0].name, "id");
+}
+
+/// P4：provider 与 flow 窗口同名（重名覆盖）应报错——to_flow_schema 投影会与
+/// 既有 flow 窗口撞名。
+#[test]
+fn flow_entrypoint_rejects_provider_colliding_with_flow_window() {
+    let input = r#"
+window person_table {
+    stream_tag = "person"
+    time = event_time
+    over = 10m
+    fields {
+        id: digit
+        event_time: time
+    }
+}
+window<provider> person_table {
+    fields {
+        id: digit
+    }
+}
+"#;
+    let err = parse_wfs(input).unwrap_err();
+    assert!(err.to_string().contains("duplicate window name"));
+}
+
 #[test]
 fn accept_structured_fields_in_yield_only_window() {
     let input = r#"

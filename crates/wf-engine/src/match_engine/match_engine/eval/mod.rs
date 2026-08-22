@@ -300,7 +300,7 @@ fn eval_arithmetic(op: BinOp, lv: f64, rv: f64) -> Option<Value> {
 }
 
 /// Equality check for InList membership.
-pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
+pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => (x - y).abs() < f64::EPSILON,
         (Value::Str(x), Value::Str(y)) => x == y,

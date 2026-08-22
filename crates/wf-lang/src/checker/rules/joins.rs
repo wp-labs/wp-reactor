@@ -146,37 +146,44 @@ pub fn check_joins_list(
                     }
                 }
 
-                // T49: asof mode requires time field on right table
-                if let JoinMode::Asof { within } = &join.mode {
-                    if target_schema.time_field.is_none() {
-                        errors.push(CheckError {
-                            severity: Severity::Error,
-                            rule: Some(rule_name.to_string()),
-                            test: None,
-                            message: format!(
-                                "join `{}` uses asof mode but target window has no time field",
-                                join.target_window
-                            ),
-                        });
+                // P4：provider/静态窗口（side input，无 stream/time/over）仅支持
+                // snapshot（及缺省 inner）join——anti/asof/interval/reduce/deferred
+                // 对无时序静态表无意义（设计 §7/§8 P4；`StaticWindowSchema::to_flow_schema`）。
+                if is_static_window(target_schema) {
+                    check_static_window_join(join, rule_name, errors);
+                } else {
+                    // T49: asof mode requires time field on right table
+                    if let JoinMode::Asof { within } = &join.mode {
+                        if target_schema.time_field.is_none() {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                test: None,
+                                message: format!(
+                                    "join `{}` uses asof mode but target window has no time field",
+                                    join.target_window
+                                ),
+                            });
+                        }
+                        if let Some(dur) = within
+                            && dur.is_zero()
+                        {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                test: None,
+                                message: format!(
+                                    "join `{}` asof within must be > 0",
+                                    join.target_window
+                                ),
+                            });
+                        }
                     }
-                    if let Some(dur) = within
-                        && dur.is_zero()
-                    {
-                        errors.push(CheckError {
-                            severity: Severity::Error,
-                            rule: Some(rule_name.to_string()),
-                            test: None,
-                            message: format!(
-                                "join `{}` asof within must be > 0",
-                                join.target_window
-                            ),
-                        });
-                    }
-                }
 
-                check_within(join, target_schema, scope, rule_name, errors);
-                check_emit_at(join, scope, rule_name, errors);
-                check_reduce(join, target_schema, rule_name, errors);
+                    check_within(join, target_schema, scope, rule_name, errors);
+                    check_emit_at(join, scope, rule_name, errors);
+                    check_reduce(join, target_schema, rule_name, errors);
+                }
             }
         }
 
@@ -205,6 +212,61 @@ pub fn check_joins_list(
                 });
             }
         }
+    }
+}
+
+/// 是否 provider/静态窗口（side input）：无 stream、无 time 字段、over=0——
+/// 即 `StaticWindowSchema::to_flow_schema()` 的投影（schema.rs）。注意输出窗口
+/// （yield-only，如 nexmark_alerts）也是无 stream 窗口，但其 over 通常非 0 或
+/// 无 join 目标场景；此处按「无 stream + 无 time + over=0」判定静态侧输入。
+fn is_static_window(ws: &WindowSchema) -> bool {
+    ws.streams.is_empty() && ws.time_field.is_none() && ws.over.is_zero()
+}
+
+/// provider/静态窗口（side input）join 限制：v1 仅支持 snapshot（及缺省 inner）。
+/// 无 time/over 的静态表上 anti/asof/interval（within）/reduce/deferred（emit at）
+/// 均无意义——anti 需要时序语义的“至今未匹配”判断，asof/interval 需要时间列，
+/// reduce/deferred 需要窗口生命周期（设计 §7 side input / §8 P4）。
+fn check_static_window_join(
+    join: &crate::ast::JoinClause,
+    rule_name: &str,
+    errors: &mut Vec<CheckError>,
+) {
+    let what = format!(
+        "provider/静态窗口 `{}`（side input）v1 仅支持 snapshot（及缺省 inner）join",
+        join.target_window
+    );
+    if !matches!(join.mode, JoinMode::Snapshot | JoinMode::Inner) {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!("{what}；`{:?}` 模式对无时序静态表无意义", join.mode),
+        });
+    }
+    if join.within.is_some() {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!("{what}；`within` interval 需要右窗 time 字段，静态表没有"),
+        });
+    }
+    if join.emit_at.is_some() {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!("{what}；`emit at` deferred 触发需要窗口生命周期，静态表没有"),
+        });
+    }
+    if join.reduce.is_some() {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(rule_name.to_string()),
+            test: None,
+            message: format!("{what}；`reduce` 归约对静态表 v1 不支持"),
+        });
     }
 }
 

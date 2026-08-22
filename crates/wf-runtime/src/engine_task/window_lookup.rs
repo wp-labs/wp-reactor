@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use wf_engine::match_engine::{
     AsofLookup, Event, JoinKey, JoinRow, Value, WindowLookup, column_scalar_string,
-    columnar_join_rows, columnar_timestamped_join_rows,
+    columnar_join_rows, columnar_timestamped_join_rows, values_equal,
 };
 use wf_engine::window::Router;
 
@@ -167,6 +167,23 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
     }
 
     fn join_lookup(&self, window: &str, key_field: &str, key: &Value) -> Option<Vec<JoinRow>> {
+        // Provider (table-backed) windows: no buffer window / join index — scan
+        // the static rows by exact key equality (`values_equal`). Provider tables
+        // are small static snapshots, so O(rows) per lookup is expected (P4 side
+        // input). The scan is intentional here — the index-based path below
+        // cannot be used because providers live outside the buffer-window
+        // registry (join-key indexes are only maintained for buffer windows).
+        if self.router.registry().get_provider(window).is_some() {
+            let rows = self.snapshot(window)?;
+            return Some(
+                rows.into_iter()
+                    .filter(|row| {
+                        row.field_value(key_field)
+                            .is_some_and(|v| values_equal(&v, key))
+                    })
+                    .collect(),
+            );
+        }
         let win = self.router.registry().get_window(window)?;
         let join_key = JoinKey::from_value(key)?;
         // Indexed lookup if the window has a maintained join index (the index
@@ -402,6 +419,59 @@ mod tests {
             .join_lookup("threat_intel", "ip", &Value::Str("9.9.9.9".into()))
             .expect("indexed window exists");
         assert!(none.is_empty(), "unknown key → empty rows");
+    }
+
+    /// P4 side input：provider 窗口 join_lookup——无 buffer 窗口/索引，按精确
+    /// 键等值扫描静态行（`values_equal`）。此前 `get_window` 对 provider 返回
+    /// None → join 静默 miss（事件不富化也不丢，结果错误）。
+    #[tokio::test]
+    async fn join_lookup_provider_window_scans_static_rows() {
+        use std::collections::HashMap;
+        use wf_engine::window::ProviderWindow;
+
+        let mut reg = WindowRegistry::build(vec![]).unwrap();
+        let mut pw = ProviderWindow::new(
+            "person_table".into(),
+            "SELECT * FROM person_table".into(),
+            None,
+        );
+        pw.load(vec![
+            {
+                let mut m = HashMap::new();
+                m.insert("id".to_string(), Value::Number(5.0));
+                m.insert("state".to_string(), Value::Str("CA".into()));
+                m
+            },
+            {
+                let mut m = HashMap::new();
+                m.insert("id".to_string(), Value::Number(7.0));
+                m.insert("state".to_string(), Value::Str("ID".into()));
+                m
+            },
+        ]);
+        reg.register_provider("person_table".to_string(), pw)
+            .unwrap();
+        let router = Router::new(reg);
+
+        let lookup = RegistryLookup::new(&router);
+        let rows = lookup
+            .join_lookup("person_table", "id", &Value::Number(7.0))
+            .expect("provider join lookup must hit, not miss");
+        assert_eq!(rows.len(), 1, "exactly one provider row matches id=7");
+        assert_eq!(rows[0].field_value("state"), Some(Value::Str("ID".into())));
+
+        // 未知键 → Some(空集)（窗口存在，只是无匹配）——与 buffer 窗口一致
+        let none = lookup
+            .join_lookup("person_table", "id", &Value::Number(999.0))
+            .expect("provider window exists");
+        assert!(none.is_empty(), "unknown key → empty rows");
+
+        // 不存在的窗口 → None（保持既有语义）
+        assert!(
+            lookup
+                .join_lookup("no_such_window", "id", &Value::Number(5.0))
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,8 @@ mod window_lookup;
 #[cfg(test)]
 mod deferred_integration_tests;
 #[cfg(test)]
+mod provider_join_integration_tests;
+#[cfg(test)]
 mod stats_task_tests;
 #[cfg(test)]
 mod tests;
