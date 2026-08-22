@@ -17,7 +17,7 @@ pub use event_bridge::{
     is_wfl_structured_field, materialize_rows, materialize_rows_filtered,
     wfl_structured_field_kind,
 };
-pub use executor::{EachDirectBatchStats, RuleExecutor, RuleExecutorOptions};
+pub use executor::{EachDirectBatchStats, RuleExecutor, RuleExecutorOptions, StatsExecutor};
 pub use match_engine::apply_conv;
 pub use match_engine::close_is_qualified;
 pub use match_engine::{

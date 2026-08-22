@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use wf_engine::match_engine::{CepStateMachine, RuleExecutor};
+use wf_engine::match_engine::{CepStateMachine, RuleExecutor, StatsExecutor};
 use wf_engine::window::{Router, RulePush, Window};
 
 use crate::alert_task::SinkFanout;
@@ -71,4 +71,34 @@ pub(crate) struct RuleTaskConfig {
     /// raw qualifying closes to the conv stage (aggregation window). `None`
     /// otherwise (inline conv path).
     pub conv_sink: Option<ConvShardSink>,
+}
+
+// ---------------------------------------------------------------------------
+// StatsTaskConfig -- 声明式窗口统计任务（stats 形态, P1 步骤④c）
+// ---------------------------------------------------------------------------
+
+/// Everything needed to construct a [`StatsTask`](crate::engine_task::stats_task::StatsTask).
+///
+/// 与 `RuleTaskConfig` 同构但简化: 无状态机/on-each/conv——stats 执行器消费
+/// fanout 投递的 raw RecordBatch（列式 `process_batch`, 失败回退行式）, 固定
+/// 窗口按事件时间 watermark 越过边界时 close 并复用 alert 构建产出。
+pub(crate) struct StatsTaskConfig {
+    /// 窗口统计执行器（含编译后的 StatsPlan）。
+    pub stats: StatsExecutor,
+    /// 复用 alert 构建（execute_close_with_joins → OutputRecord）。
+    pub executor: RuleExecutor,
+    pub window_sources: Vec<WindowSource>,
+    pub sink_fanout: Arc<SinkFanout>,
+    pub cancel: CancellationToken,
+    pub router: Arc<Router>,
+    pub metrics: Option<Arc<RuntimeMetrics>>,
+    /// 事件时间字段（batch 时间列解析）。
+    pub time_field: Option<String>,
+    pub intermediate_targets: HashSet<String>,
+    pub pipe_registry: std::sync::Arc<wf_engine::pipe::PipeRegistry>,
+    pub eos_flush: watch::Receiver<u64>,
+    pub push_rx: Option<mpsc::Receiver<RulePush>>,
+    pub progress: std::collections::HashMap<String, Arc<AtomicU64>>,
+    pub shard_index: Option<usize>,
+    pub shard_count: usize,
 }

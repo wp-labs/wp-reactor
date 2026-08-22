@@ -134,30 +134,44 @@ stats<30m:fixed> {
    distinct 每行 1-4 次哈希不可回避（批内预去重为后续优化）。
 4. 已实测否决: 共享 baselines 不可行（`RollingStats` 为 cfg(test) 类型）。
 
-## 6. 下一步（步骤 ④c daemon 接线）
+## 6. daemon 接线（步骤 ④c, 已落地）
 
-**引擎层数据路径已锁定**（④b）: 编译 stats 规则 → StatsExecutor 归并（编译出的
-where_expr 逐行求值）→ 合成 CloseOutput → `execute_close_with_joins` → OutputRecord,
-与 CEP q15 锚点逐字符一致。剩余为 daemon 投递层：
+**StatsTask 已实现**（`wf-runtime/src/engine_task/stats_task.rs`, 提交 xxx）:
 
-- **StatsTask**（wf-runtime）: 类比 rule_task 的新任务类型
-  - 消费 `broadcast_batch_only` 的 raw RecordBatch（空键 `register`; 带 key 后续
-    `register_sharded`）; pull 模型（M1）需从 window log 直接拉批次
-  - 窗口 close 信号: fixed 窗口按事件时间 watermark 越过窗口边界触发（镜像 CEP
-    的固定窗口 bucket close, 见 match_engine close/scan_expired）
-  - close 时: `close_window()` → 合成 CloseOutput（④b 已验证的路径）→
-    `execute_close_with_joins` → 经 sink_fanout 下沉
-  - **必须参与 ack floor**（progress slot, push_seq+1, 与 rule_task 对齐, 否则
-    卡驱逐 cursor-gap）
-- **spawn 接线**: `RunRuleKind::Stats` 变体 + `spawn_rule_tasks` 分支
-- **P1.5 列式段**: process_rows 升级为 RecordBatch 列式读取（复用
-  `scope_key_columnar` + `eval_guard_columnar`; count/sum/min/max 整列归并）
+- `RunRuleKind::Stats` + `build_run_rules` 分支（stats_plan + time_field 解析）+
+  `spawn_rule_tasks` 分支（空键单实例 `register`; 带 key 分片为 P2）
+- StatsTask 消费 fanout 投递的 raw RecordBatch: push 通道
+  （`WFUSION_WINDOW_DISPATCH=push`）或 pull window log（默认 M1）
+- 归并: 列式 `process_batch` 优先, 前置不满足回退行式 `process_rows`
+  （batch_to_events 物化; 语义等价）
+- 窗口 close: fixed 桶对齐 CEP（`bucket_start = (t/dur)*dur`）, 按批次最大事件
+  时间（单调 watermark）越过边界触发; 空桶不产出（与 CEP 无实例一致）;
+  EOS/取消/通道关闭时 `flush` 关闭残留窗口
+- close 时: `close_window()` → 合成 CloseOutput（④b 路径）→
+  `execute_close_with_joins` → AlertColumnBuilder 单条 → sink_fanout 投递
+- **ack floor**: 处理完 ack 进度 slot（push_seq+1 / 读位置）, 与 rule_task 对齐
 
-## 7. 阻塞项
+**接线 review 修复**: `advance_window` 死循环 bug——`while watermark >= window_end`
+用循环外绑定的局部 `window_end`（close 后不更新）→ watermark 越界时无限 close。
+改为循环内重读 `self.window_end` + 极短 dur 防呆（测试捕获）。
+
+**测试**（stats_task_tests, 4 个）: 跨窗口 close 触发 + alert 值 + ack floor;
+单窗口 flush 收尾; 多窗口跳变（空桶跳过）; 不可列式 where 回退行式路径。
+
+## 7. P1 完整状态
+
+P1（语法 → 计划 → 执行 → 对拍 → 接线）已全部落地。全量回归:
+wf-lang 567 / wf-engine 577 / wf-runtime 190 全绿。
+
+**性能全景**（Q15, N=500k 同数据同机）:
+CEP engine_full 589 → stats 行式 450 → **stats 列式 115 ns/evt（8.7M/s）**
+= 相对 CEP 生产路径 ~3×、engine_full ~5×。
+
+## 8. 阻塞项
 
 - ~~系统文件句柄耗尽~~ ✅ 已恢复
 - ~~checker 不感知 stats 标签~~ ✅ 已修（`populate_stats_measure_labels`, 3 测试）
-- daemon 投递层（④c）为剩余接线面, 见 §6
+- daemon 投递层（④c）✅ 已落地（本 §）
 
 ## 8. review 发现与修复（2026-08-22, 提交 xxx）
 

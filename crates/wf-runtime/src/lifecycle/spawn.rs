@@ -38,8 +38,8 @@ use wf_lang::ast::FieldRef;
 
 use crate::alert_task;
 use crate::engine_task::{
-    ConvCloseBatch, ConvShardSink, ConvStageConfig, RuleTaskConfig, WindowSource,
-    run_conv_stage_task, run_rule_task,
+    ConvCloseBatch, ConvShardSink, ConvStageConfig, RuleTaskConfig, StatsTaskConfig, WindowSource,
+    run_conv_stage_task, run_rule_task, run_stats_task,
 };
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::evictor_task;
@@ -283,6 +283,47 @@ pub(super) fn spawn_rule_tasks(
         let window_sources = resolve_window_sources(&rule.window_aliases, router.registry());
 
         match rule.kind {
+            RunRuleKind::Stats {
+                stats_plan,
+                time_field,
+            } => {
+                // 声明式窗口统计: 空键单实例（P1）; 带 key 分片为 P2。
+                // 消费 fanout 投递的 raw RecordBatch（push）或 window log（pull）, 列式
+                // process_batch（失败回退行式）, 固定窗口 close → alert 复用。
+                let stats = wf_engine::match_engine::StatsExecutor::new(stats_plan);
+                let push_rx = if use_push {
+                    let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
+                    for source in &window_sources {
+                        router
+                            .fanout()
+                            .register(&source.window_name, push_tx.clone());
+                    }
+                    Some(push_rx)
+                } else {
+                    None
+                };
+                let progress = register_progress(router, &window_sources);
+                let task_config = StatsTaskConfig {
+                    stats,
+                    executor: rule.executor.clone(),
+                    window_sources,
+                    sink_fanout: Arc::clone(&sink_fanout),
+                    cancel: cancel.child_token(),
+                    router: Arc::clone(router),
+                    metrics: metrics.clone(),
+                    time_field,
+                    intermediate_targets: intermediate_targets.clone(),
+                    pipe_registry: Arc::clone(&pipe_registry),
+                    eos_flush: eos_tx.subscribe(),
+                    push_rx,
+                    progress: progress.clone(),
+                    shard_index: None,
+                    shard_count: 1,
+                };
+                group.push(tokio::spawn(
+                    async move { run_stats_task(task_config).await },
+                ));
+            }
             RunRuleKind::Each { alias, time_field } => {
                 // Stateless each rule. Terminal-output rules (yield target is
                 // NOT an intermediate pipe) shard across `shard_count` workers

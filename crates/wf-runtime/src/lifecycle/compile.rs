@@ -846,7 +846,12 @@ pub(crate) fn build_run_rules(
                 output: output.clone(),
             },
         );
-        let kind = if let Some(each_plan) = &plan.each_plan {
+        let kind = if let Some(stats_plan) = &plan.stats_plan {
+            RunRuleKind::Stats {
+                stats_plan: stats_plan.clone(),
+                time_field: resolve_time_field(&plan.binds, schemas),
+            }
+        } else if let Some(each_plan) = &plan.each_plan {
             RunRuleKind::Each {
                 alias: each_plan.alias.clone(),
                 time_field: resolve_alias_time_field(&plan.binds, schemas, &each_plan.alias),

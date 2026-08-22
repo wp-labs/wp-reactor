@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use orion_error::conversion::{SourceErr, ToStructError};
 use orion_error::prelude::*;
 use wf_engine::match_engine::RuleExecutor;
-use wf_lang::plan::{LimitsPlan, MatchPlan};
+use wf_lang::plan::{LimitsPlan, MatchPlan, StatsPlan};
 
 use crate::error::{RuntimeReason, RuntimeResult};
 
@@ -255,6 +255,10 @@ pub(crate) enum RunRuleKind {
     },
     Each {
         alias: String,
+        time_field: Option<String>,
+    },
+    Stats {
+        stats_plan: StatsPlan,
         time_field: Option<String>,
     },
 }

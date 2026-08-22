@@ -1,8 +1,11 @@
 mod conv_stage;
 mod rule_task;
+mod stats_task;
 mod task_types;
 mod window_lookup;
 
+#[cfg(test)]
+mod stats_task_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -18,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 use wf_engine::window::RulePush;
 
 pub(crate) use conv_stage::{ConvCloseBatch, ConvShardSink, ConvStageConfig, run_conv_stage_task};
-pub(crate) use task_types::{RuleTaskConfig, WindowSource};
+pub(crate) use stats_task::run_stats_task;
+pub(crate) use task_types::{RuleTaskConfig, StatsTaskConfig, WindowSource};
 
 use crate::error::RuntimeResult;
 
