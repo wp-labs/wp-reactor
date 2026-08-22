@@ -13,7 +13,9 @@
 | ① 语法层 | AST + parser（stats 子句） | ✅ 已提交 `444778d`（wf-lang 557 全绿） |
 | ② 计划层 | StatsPlan 编译（桶键/度量/输出形状） | ✅ 已提交 `d09fdb0`（wf-lang 559 + wf-engine 557 + wf-runtime 186） |
 | ③ 执行层 | StatsExecutor（空键 fixed count/distinct/sum/avg/min/max） | ✅ 已提交 `8b68e8a`（5 单测 + 全量回归） |
-| ④ 接线 + 对拍 | window fanout → StatsExecutor + Q15 验证 | 🔶 进行中 |
+| ④a 执行器对拍 | Q15 12 度量对拍（逐度量 where + 独立参考实现） | ✅ 已提交 `7b7b885`（wf-engine 565 全绿） |
+| ④b 引擎层接线 | checker stats 标签 + 编译→归并→alert 全链路对拍 | ✅ 已提交（wf-lang 562 / wf-engine 568 全绿） |
+| ④c daemon 接线 | fanout/pull 投递 + 窗口 close 信号 + ack floor | 🔶 下一步（见 §6） |
 
 ---
 
@@ -95,18 +97,30 @@ stats<30m:fixed> {
 | `d09fdb0` | 步骤② 计划层: StatsPlan 编译 |
 | `8b68e8a` | 步骤③ 执行层核心: StatsExecutor（count/distinct/sum/avg/min/max） |
 
-## 5. 下一步（步骤 ④ 接线 + 对拍）
+## 5. 下一步（步骤 ④c daemon 接线）
 
-- **接线**: fanout 注册 stats 订阅（空键 `register` + `broadcast_batch_only`）→
-  StatsExecutor::process_rows; 窗口 close 时构建 Event（measure 值注入）→ 复用
-  RuleExecutor alert 构建（build_close_alert 同构）
-- **列式段（P1.5）**: 从 row-based 升级为 RecordBatch 列式读取（桶键分派 + 整列归并）
-- **Q15 对拍**: stats 版 q15 输出 12 列 vs 现有 CEP 版逐列一致
+**引擎层数据路径已锁定**（④b）: 编译 stats 规则 → StatsExecutor 归并（编译出的
+where_expr 逐行求值）→ 合成 CloseOutput → `execute_close_with_joins` → OutputRecord,
+与 CEP q15 锚点逐字符一致。剩余为 daemon 投递层：
+
+- **StatsTask**（wf-runtime）: 类比 rule_task 的新任务类型
+  - 消费 `broadcast_batch_only` 的 raw RecordBatch（空键 `register`; 带 key 后续
+    `register_sharded`）; pull 模型（M1）需从 window log 直接拉批次
+  - 窗口 close 信号: fixed 窗口按事件时间 watermark 越过窗口边界触发（镜像 CEP
+    的固定窗口 bucket close, 见 match_engine close/scan_expired）
+  - close 时: `close_window()` → 合成 CloseOutput（④b 已验证的路径）→
+    `execute_close_with_joins` → 经 sink_fanout 下沉
+  - **必须参与 ack floor**（progress slot, push_seq+1, 与 rule_task 对齐, 否则
+    卡驱逐 cursor-gap）
+- **spawn 接线**: `RunRuleKind::Stats` 变体 + `spawn_rule_tasks` 分支
+- **P1.5 列式段**: process_rows 升级为 RecordBatch 列式读取（复用
+  `scope_key_columnar` + `eval_guard_columnar`; count/sum/min/max 整列归并）
 
 ## 6. 阻塞项
 
 - ~~系统文件句柄耗尽~~ ✅ 已恢复
-- 接线需确认 fanout 注册/ack 机制在 stats 场景的完整路径（研究已完成, 见步骤④）
+- ~~checker 不感知 stats 标签~~ ✅ 已修（`populate_stats_measure_labels`, 3 测试）
+- daemon 投递层（④c）为剩余接线面, 见 §5
 
 ---
 

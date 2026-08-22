@@ -10,6 +10,7 @@ mod on_each;
 mod pipeline;
 mod scope;
 mod seq;
+mod stats;
 mod t14_t51;
 mod t5_threshold;
 mod type_check;

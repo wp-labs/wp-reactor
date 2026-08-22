@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::ast::{
     EachClause, Expr, FieldRef, MatchClause, Measure, PipelineStage, RuleDecl, SeqClause, SeqSkip,
+    StatsAgg, StatsClause,
 };
 use crate::checker::scope::{Scope, StatLabelInfo, StatLabelStage};
 use crate::checker::types::{ValType, check_expr_type, infer_type};
@@ -42,6 +43,9 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
     // Build scope from events block
     let mut base_scope = scope_build::build_scope(rule, schemas, name, errors);
     populate_stat_labels(&mut base_scope, &rule.match_clause);
+    if let Some(stats) = &rule.stats_clause {
+        populate_stats_measure_labels(&mut base_scope, stats);
+    }
 
     if rule.each_clause.is_some() && !rule.pipeline_stages.is_empty() {
         errors.push(CheckError {
@@ -261,6 +265,31 @@ fn populate_stat_labels(scope: &mut Scope<'_>, match_clause: &MatchClause) {
                 );
             }
         }
+    }
+}
+
+/// stats 规则的 measure 标签 → `stat.value(final(label))` 校验（Close 阶段）。
+///
+/// stats 形态无 match 步骤, 但 yield 的 stat 选择器仍需按 measure 标签校验——
+/// 标签全部落在 Close 阶段（度量在窗口关闭时产出终值）。
+fn populate_stats_measure_labels(scope: &mut Scope<'_>, stats: &StatsClause) {
+    for m in &stats.measures {
+        scope.stat_labels.insert(
+            m.label.clone(),
+            StatLabelInfo {
+                stage: StatLabelStage::Close,
+                uses_distinct: m.agg == StatsAgg::DistinctCount,
+                measure: match m.agg {
+                    StatsAgg::Sum => Measure::Sum,
+                    StatsAgg::Avg => Measure::Avg,
+                    StatsAgg::Min => Measure::Min,
+                    StatsAgg::Max => Measure::Max,
+                    // Count / DistinctCount / Last / Top: 检查器只对
+                    // stat.count(match_event/distinct) 细分 measure, 此处够用
+                    _ => Measure::Count,
+                },
+            },
+        );
     }
 }
 

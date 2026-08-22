@@ -15,6 +15,8 @@ pub use stats_exec::{DistinctKey, StatsAccum, StatsExecutor, StatsWindowState};
 
 #[cfg(test)]
 mod stats_exec_test;
+#[cfg(test)]
+mod stats_exec_wiring_test;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
