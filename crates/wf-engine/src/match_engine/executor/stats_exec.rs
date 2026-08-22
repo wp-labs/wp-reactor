@@ -104,16 +104,34 @@ impl StatsExecutor {
     /// 处理一批行（row-based; 列式段为 P1.5）。
     ///
     /// `extract_field(row, name) -> Option<Value>`: 由调用方提供行字段读取。
-    /// where 过滤: 调用方预先求值并注入 `__where_ok` 字段（P1 简化）。
+    /// where 过滤: 调用方预先求值并注入 `__where_ok` 字段（P1 简化）——所有带
+    /// where_expr 的度量共享同一过滤（单 where 场景）。多档 where 用
+    /// [`Self::process_rows_where`]。
     pub fn process_rows<F>(&mut self, rows: &[HashMap<String, Value>], extract: F)
     where
         F: Fn(&HashMap<String, Value>, &str) -> Option<Value>,
     {
+        self.process_rows_where(rows, extract, |row, _idx| {
+            !matches!(row.get("__where_ok"), Some(Value::Bool(false)))
+        });
+    }
+
+    /// 处理一批行, 支持**逐度量** where 过滤（Q15 多档价格分档等场景）。
+    ///
+    /// `where_ok(row, measure_idx) -> bool`: 调用方按度量求值 where; 仅在
+    /// `measure.where_expr.is_some()` 时被咨询（无 where 的度量恒通过）。
+    pub fn process_rows_where<F, W>(
+        &mut self,
+        rows: &[HashMap<String, Value>],
+        extract: F,
+        where_ok: W,
+    ) where
+        F: Fn(&HashMap<String, Value>, &str) -> Option<Value>,
+        W: Fn(&HashMap<String, Value>, usize) -> bool,
+    {
         for row in rows {
             for (idx, measure) in self.plan.measures.iter().enumerate() {
-                if measure.where_expr.is_some()
-                    && matches!(extract(row, "__where_ok"), Some(Value::Bool(false)))
-                {
+                if measure.where_expr.is_some() && !where_ok(row, idx) {
                     continue;
                 }
                 let acc = &mut self.window.accum[idx];
