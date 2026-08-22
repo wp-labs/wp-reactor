@@ -17,9 +17,14 @@ use crate::error::{RuntimeReason, RuntimeResult};
 /// best-effort — a task busy in a non-cancellable await may not check its
 /// cancel token in time — so the join layer force-aborts any task that
 /// doesn't exit within this window. It is the guarantee that shutdown always
-/// terminates. Kept under the bench SIGTERM grace (5s) so the daemon exits
-/// before it is SIGKILLed.
-const GROUP_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+/// terminates.
+///
+/// 60s（原 3s）: stats 执行器在 shutdown 时执行 close flush（构建百万级
+/// alert——q19 30M ≈ 8M 条 ~13s）; 3s 会在 flush 完成前 abort rules/alert
+/// group → 尾部窗口产出丢失。60s 覆盖 stats flush 构建 + sink 消费（正常
+/// 路径; 卡死任务仍会被 abort 兜底）。bench kill 宽限须同步调大
+/// （SIGTERM 后 ≥ 60s 再 SIGKILL, 见 bench.sh kill_daemon）。
+const GROUP_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Max time to wait for an aborted task to actually unwind. `abort()` only
 /// cancels at the task's next yield point — a task chewing through a large

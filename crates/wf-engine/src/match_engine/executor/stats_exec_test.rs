@@ -1,6 +1,6 @@
 //! StatsExecutor 单元测试（P1: 空键 fixed count/distinct/sum/avg/min/max）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{Date32Array, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
@@ -74,6 +74,28 @@ fn avg_measure(label: &str, field: &str) -> StatsMeasurePlan {
     }
 }
 
+fn last_measure(label: &str, field: &str) -> StatsMeasurePlan {
+    StatsMeasurePlan {
+        label: label.into(),
+        source_alias: "b".into(),
+        where_expr: None,
+        agg: StatsAggPlan::Last,
+        field: Some(FieldRef::Qualified("b".into(), field.into())),
+        arg: None,
+    }
+}
+
+fn top_measure(label: &str, field: &str, n: u64) -> StatsMeasurePlan {
+    StatsMeasurePlan {
+        label: label.into(),
+        source_alias: "b".into(),
+        where_expr: None,
+        agg: StatsAggPlan::Top,
+        field: Some(FieldRef::Qualified("b".into(), field.into())),
+        arg: Some(n),
+    }
+}
+
 fn row(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
     pairs
         .iter()
@@ -83,6 +105,41 @@ fn row(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
 
 fn extract(row: &HashMap<String, Value>, name: &str) -> Option<Value> {
     row.get(name).cloned()
+}
+
+/// 行字段列数组按名取值（P5 紧凑化测试辅助; `names` = 提取列序）。
+fn row_val<'a>(row: &'a [Option<Value>], names: &[String], name: &str) -> Option<&'a Value> {
+    names
+        .iter()
+        .position(|n| n == name)
+        .and_then(|i| row.get(i))
+        .and_then(|v| v.as_ref())
+}
+
+/// batch schema 字段名排序——与执行器 None 子集提取列序一致（行式/列式同序）。
+fn sorted_schema_names(batch: &RecordBatch) -> Vec<String> {
+    let mut ns: Vec<String> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    ns.sort();
+    ns
+}
+
+/// rows_to_batch 的排序字段名（price/bidder/auction → auction, bidder, price）。
+fn sorted_bid_names() -> Vec<String> {
+    ["auction", "bidder", "price"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// 全字段子集（等价 None 全列, 但带确定列序——last/top 度量值提取需要子集,
+/// 生产经 spawn 恒有子集）。
+fn full_bid_subset() -> Arc<HashSet<String>> {
+    Arc::new(sorted_bid_names().into_iter().collect())
 }
 
 #[test]
@@ -439,6 +496,34 @@ fn q15_tier_boundaries_and_null() {
 
 /// 行 → Int64 列 RecordBatch（price/bidder/auction, 对齐 nexmark 数据; null 保留）。
 fn rows_to_batch(rows: &[HashMap<String, Value>]) -> RecordBatch {
+    fn i64_of(row: &HashMap<String, Value>, name: &str) -> Option<i64> {
+        match row.get(name) {
+            Some(Value::Number(n)) => Some(*n as i64),
+            _ => None,
+        }
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+    ]));
+    let price: Vec<Option<i64>> = rows.iter().map(|r| i64_of(r, "price")).collect();
+    let bidder: Vec<Option<i64>> = rows.iter().map(|r| i64_of(r, "bidder")).collect();
+    let auction: Vec<Option<i64>> = rows.iter().map(|r| i64_of(r, "auction")).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(price)),
+            Arc::new(Int64Array::from(bidder)),
+            Arc::new(Int64Array::from(auction)),
+        ],
+    )
+    .expect("batch")
+}
+
+/// 同 rows_to_batch, 但指定行（`null_price_rows` 集合中的行号）price 列为 null——
+/// 列式 last 字段缺失语义的模拟（行式 = 缺 price 键）。
+fn rows_to_batch_with_null_price(rows: &[HashMap<String, Value>]) -> RecordBatch {
     fn i64_of(row: &HashMap<String, Value>, name: &str) -> Option<i64> {
         match row.get(name) {
             Some(Value::Number(n)) => Some(*n as i64),
@@ -915,6 +1000,195 @@ fn stats_group_by_function_key_falls_back_row() {
 }
 
 // ---------------------------------------------------------------------------
+// P5+ 复合键扁平哈希（列式无 Box 分配路径）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stats_composite_key_hash_flat_matches_tree() {
+    // 复合键优化契约: 列式叶数组哈希 == 行式完整树哈希——同一逻辑键两条查找
+    // 路径（comps_hash / scope_key_hash）必落同桶。字节级同构: N-1 个 Pair tag
+    // 前缀 + 每叶 tag/payload + 0x1f 分隔。
+    use crate::match_engine::executor::stats_exec::{
+        comps_hash, scope_key_from_comps, scope_key_hash,
+    };
+    let cases: Vec<Vec<ScopeKey>> = vec![
+        vec![ScopeKey::Int(42)],
+        vec![ScopeKey::Int(7), ScopeKey::Int(8)],
+        vec![ScopeKey::Int(1), ScopeKey::Int(2), ScopeKey::Int(3)],
+        vec![
+            ScopeKey::Int(1),
+            ScopeKey::Int(2),
+            ScopeKey::Int(3),
+            ScopeKey::Int(4),
+        ],
+        vec![ScopeKey::Float(1.5f64.to_bits()), ScopeKey::Int(9)],
+        vec![ScopeKey::Str("cat".into()), ScopeKey::Int(10)],
+        vec![
+            ScopeKey::Str("a".into()),
+            ScopeKey::Float((-0.0f64).to_bits()),
+            ScopeKey::Int(3),
+        ],
+    ];
+    for comps in cases {
+        let tree = scope_key_from_comps(&comps); // 左深 Pair 链
+        assert_eq!(
+            comps_hash(&comps),
+            scope_key_hash(&tree),
+            "comps={comps:?} tree={tree:?}"
+        );
+    }
+}
+
+#[test]
+fn stats_composite_key_mixed_types_columnar_matches_row_based() {
+    // 复合键 (bidder: Int64, auction: Utf8) 混合类型——列式扁平键 vs 行式树键
+    // 逐桶对拍（两路径哈希同值 + 碰撞链完整比较消歧）。
+    let plan = keyed_plan(
+        vec![field_key("b", "bidder"), field_key("b", "auction")],
+        vec![count_measure("n")],
+    );
+    let rows = vec![
+        row(&[
+            ("bidder", num(1.0)),
+            ("auction", str_val("a")),
+            ("price", num(10.0)),
+        ]),
+        row(&[
+            ("bidder", num(1.0)),
+            ("auction", str_val("a")),
+            ("price", num(20.0)),
+        ]),
+        row(&[
+            ("bidder", num(1.0)),
+            ("auction", str_val("b")),
+            ("price", num(30.0)),
+        ]),
+        row(&[
+            ("bidder", num(2.0)),
+            ("auction", str_val("a")),
+            ("price", num(40.0)),
+        ]),
+    ];
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+            Arc::new(Int64Array::from(vec![1, 1, 1, 2])),
+            Arc::new(StringArray::from(vec!["a", "a", "b", "a"])),
+        ],
+    )
+    .unwrap();
+    let mut row_exec = StatsExecutor::new(plan.clone());
+    row_exec.process_rows(&rows, extract);
+    let mut col_exec = StatsExecutor::new(plan);
+    assert!(col_exec.process_batch(&batch), "字段键应可列式化");
+    assert_eq!(
+        row_exec.final_measure_values_by_bucket(),
+        col_exec.final_measure_values_by_bucket(),
+        "混合类型复合键行式/列式逐桶一致"
+    );
+}
+
+#[test]
+fn stats_composite_key_three_field_columnar_matches_row_based() {
+    // 3 键 (price, bidder, auction) 左深 Pair(Pair(p,b),a)——列式扁平键 vs 行式
+    // 树键逐桶对拍（>2 键的 comps_match 递归边界）。
+    let plan = keyed_plan(
+        vec![
+            field_key("b", "price"),
+            field_key("b", "bidder"),
+            field_key("b", "auction"),
+        ],
+        vec![count_measure("n")],
+    );
+    let rows = vec![
+        row(&[
+            ("price", num(10.0)),
+            ("bidder", num(1.0)),
+            ("auction", num(100.0)),
+        ]),
+        row(&[
+            ("price", num(10.0)),
+            ("bidder", num(1.0)),
+            ("auction", num(100.0)),
+        ]),
+        row(&[
+            ("price", num(10.0)),
+            ("bidder", num(2.0)),
+            ("auction", num(100.0)),
+        ]),
+        row(&[
+            ("price", num(20.0)),
+            ("bidder", num(1.0)),
+            ("auction", num(100.0)),
+        ]),
+    ];
+    let batch = rows_to_batch(&rows);
+    let mut row_exec = StatsExecutor::new(plan.clone());
+    row_exec.process_rows(&rows, extract);
+    let mut col_exec = StatsExecutor::new(plan);
+    assert!(col_exec.process_batch(&batch), "字段键应可列式化");
+    assert_eq!(
+        row_exec.final_measure_values_by_bucket(),
+        col_exec.final_measure_values_by_bucket(),
+        "3 键行式/列式逐桶一致"
+    );
+    let buckets = col_exec.final_measure_values_by_bucket();
+    assert_eq!(buckets.len(), 3);
+    assert_eq!(
+        buckets[0].0,
+        ScopeKey::Pair(
+            Box::new(ScopeKey::Pair(
+                Box::new(ScopeKey::Int(10)),
+                Box::new(ScopeKey::Int(1))
+            )),
+            Box::new(ScopeKey::Int(100)),
+        )
+    );
+    assert_eq!(buckets[0].1, vec![2.0]);
+}
+
+#[test]
+fn stats_composite_key_mixed_paths_same_bucket() {
+    // 同一 executor 先列式批、再行式行——两查找路径（扁平键 vs 树键）必须落
+    // **同一桶**（哈希同值 + 链内完整比较消歧）; 计数跨路径累加, 不产生重复桶。
+    let plan = keyed_plan(
+        vec![field_key("b", "bidder"), field_key("b", "auction")],
+        vec![count_measure("n")],
+    );
+    let rows = vec![
+        row(&[
+            ("bidder", num(1.0)),
+            ("auction", num(10.0)),
+            ("price", num(1.0)),
+        ]),
+        row(&[
+            ("bidder", num(1.0)),
+            ("auction", num(10.0)),
+            ("price", num(2.0)),
+        ]),
+        row(&[
+            ("bidder", num(2.0)),
+            ("auction", num(10.0)),
+            ("price", num(3.0)),
+        ]),
+    ];
+    let batch = rows_to_batch(&rows);
+    let mut exec = StatsExecutor::new(plan);
+    assert!(exec.process_batch(&batch), "列式路径");
+    exec.process_rows(&rows, extract); // 行式路径同一桶
+    let buckets = exec.final_measure_values_by_bucket();
+    assert_eq!(buckets.len(), 2, "不产生重复桶");
+    assert_eq!(buckets[0].1, vec![4.0], "(1,10): 列式 2 + 行式 2");
+    assert_eq!(buckets[1].1, vec![2.0], "(2,10): 列式 1 + 行式 1");
+}
+
+// ---------------------------------------------------------------------------
 // P2 分片行子集（Blocker 1 回归）: process_batch_rows(batch, Some(rows)) 只归并
 // 行域内的行——否则每片处理全批, 每个键被 N 片各算一遍, close 重复输出 N 倍。
 // ---------------------------------------------------------------------------
@@ -1019,7 +1293,7 @@ fn stats_columnar_keyed_precision_matches_empty_key_native() {
     // distinct 原生 = 2（f64 路径会塌缩到 1）
     assert_eq!(buckets[0].1[0], 2.0, "≥2^53 的 distinct 不得 f64 化");
     // sum 精确断言（i128 累加器域）: 2^53 + (2^53+1) = 2^54+1
-    let accs = keyed.window.buckets.get(&ScopeKey::Int(1)).unwrap();
+    let accs = keyed.window.find_bucket(&ScopeKey::Int(1)).unwrap();
     assert_eq!(
         accs[1].sum_i128,
         9_007_199_254_740_992i128 + 9_007_199_254_740_993i128,
@@ -1071,4 +1345,467 @@ fn stats_columnar_keyed_timestamp_distinct_native() {
         vec![2.0],
         "Timestamp 原生 distinct = 2（修复前为 0）"
     );
+}
+
+// ---------------------------------------------------------------------------
+// P4 last/top 扩展度量（Q18/Q19）: last 保留最近合格行, top 保留 key DESC top-N;
+// rich close（close_window_by_bucket_rows）按条目携带行字段供 yield 注入。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stats_last_keeps_last_row_and_injects_fields() {
+    // Q18 形状: group by (auction), last(price) —— 最近合格行的价格 + 行字段
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![last_measure("last_price", "price")],
+    );
+    let rows = vec![
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(100.0)),
+            ("bidder", num(7.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(200.0)),
+            ("bidder", num(8.0)),
+        ]),
+        row(&[
+            ("auction", num(2.0)),
+            ("price", num(300.0)),
+            ("bidder", num(9.0)),
+        ]),
+    ];
+    let mut exec = StatsExecutor::with_row_fields(plan, Some(full_bid_subset()));
+    exec.process_rows(&rows, extract);
+    let buckets = exec.close_window_by_bucket_rows();
+    assert_eq!(buckets.len(), 2, "2 个 auction 桶");
+    // 桶序 ScopeKey 升序: auction 1 → 2
+    assert_eq!(buckets[0].key, ScopeKey::Int(1));
+    assert_eq!(buckets[0].measures[0].len(), 1, "last 单条目");
+    let e = &buckets[0].measures[0][0];
+    assert_eq!(e.measure_value, 200.0, "最后一条 bid 的价格");
+    let rf = e.row_fields.as_ref().expect("last 携带行字段");
+    let names = sorted_bid_names();
+    assert_eq!(row_val(rf, &names, "price"), Some(&num(200.0)));
+    assert_eq!(row_val(rf, &names, "bidder"), Some(&num(8.0)));
+    assert_eq!(buckets[1].key, ScopeKey::Int(2));
+    assert_eq!(buckets[1].measures[0][0].measure_value, 300.0);
+}
+
+#[test]
+fn stats_top_keeps_top_n_desc() {
+    // Q19 形状: group by (auction), top(2, price) —— key DESC 前 2 条, 各带行字段
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![top_measure("top_price", "price", 2)],
+    );
+    let rows = vec![
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(100.0)),
+            ("bidder", num(1.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(300.0)),
+            ("bidder", num(2.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(200.0)),
+            ("bidder", num(3.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(250.0)),
+            ("bidder", num(4.0)),
+        ]),
+    ];
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(&rows, extract);
+    let buckets = exec.close_window_by_bucket_rows();
+    assert_eq!(buckets.len(), 1);
+    let entries = &buckets[0].measures[0];
+    assert_eq!(entries.len(), 2, "top-2");
+    assert_eq!(entries[0].measure_value, 300.0, "rank1 = 最高价");
+    assert_eq!(entries[1].measure_value, 250.0, "rank2");
+    let names = sorted_bid_names();
+    assert_eq!(
+        row_val(&entries[0].row_fields.as_ref().unwrap(), &names, "bidder"),
+        Some(&num(2.0))
+    );
+    assert_eq!(
+        row_val(&entries[1].row_fields.as_ref().unwrap(), &names, "bidder"),
+        Some(&num(4.0))
+    );
+}
+
+#[test]
+fn stats_top_tie_earlier_arrival_wins() {
+    // 同 key 平局: 先到者保留在前（流有序下的确定性 tie-break）
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![top_measure("top_price", "price", 2)],
+    );
+    let rows = vec![
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(100.0)),
+            ("bidder", num(1.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(100.0)),
+            ("bidder", num(2.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(50.0)),
+            ("bidder", num(3.0)),
+        ]),
+    ];
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(&rows, extract);
+    let entries = &exec.close_window_by_bucket_rows()[0].measures[0];
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].measure_value, 100.0);
+    let names = sorted_bid_names();
+    assert_eq!(
+        row_val(&entries[0].row_fields.as_ref().unwrap(), &names, "bidder"),
+        Some(&num(1.0)),
+        "同价先到者 rank1"
+    );
+    assert_eq!(
+        row_val(&entries[1].row_fields.as_ref().unwrap(), &names, "bidder"),
+        Some(&num(2.0)),
+        "同价后到者 rank2"
+    );
+}
+
+#[test]
+fn stats_last_top_where_filter_applies() {
+    // where 过滤: last/top 只统计合格行
+    let mut m = last_measure("last_high", "price");
+    m.where_expr = Some(price_ge(150.0));
+    let plan = keyed_plan(vec![field_key("b", "auction")], vec![m]);
+    let rows = vec![
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(100.0)),
+            ("bidder", num(1.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(200.0)),
+            ("bidder", num(2.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(150.0)),
+            ("bidder", num(3.0)),
+        ]),
+    ];
+    let mut exec = StatsExecutor::with_row_fields(plan, Some(full_bid_subset()));
+    exec.process_rows(&rows, extract);
+    let e = &exec.close_window_by_bucket_rows()[0].measures[0][0];
+    assert_eq!(e.measure_value, 150.0, "最后合格行（price>=150）");
+    let names = sorted_bid_names();
+    assert_eq!(
+        row_val(&e.row_fields.as_ref().unwrap(), &names, "bidder"),
+        Some(&num(3.0))
+    );
+}
+
+#[test]
+fn stats_last_top_columnar_matches_row_based() {
+    // 列式（带 key 逐行）vs 行式: 逐桶逐条目（值 + 行字段）一致
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![
+            last_measure("last_price", "price"),
+            top_measure("top_price", "price", 2),
+        ],
+    );
+    let rows = vec![
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(100.0)),
+            ("bidder", num(1.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(300.0)),
+            ("bidder", num(2.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(200.0)),
+            ("bidder", num(3.0)),
+        ]),
+        row(&[
+            ("auction", num(2.0)),
+            ("price", num(50.0)),
+            ("bidder", num(4.0)),
+        ]),
+    ];
+    let batch = rows_to_batch(&rows);
+    let mut row_exec = StatsExecutor::new(plan.clone());
+    row_exec.process_rows(&rows, extract);
+    let mut col_exec = StatsExecutor::new(plan);
+    assert!(col_exec.process_batch(&batch), "字段键应可列式化");
+    let (rb, cb) = (
+        row_exec.close_window_by_bucket_rows(),
+        col_exec.close_window_by_bucket_rows(),
+    );
+    assert_eq!(rb.len(), cb.len());
+    for (r, c) in rb.iter().zip(cb.iter()) {
+        assert_eq!(r.key, c.key);
+        assert_eq!(r.measures.len(), c.measures.len());
+        for (rm, cm) in r.measures.iter().zip(c.measures.iter()) {
+            assert_eq!(rm.len(), cm.len(), "条目数一致");
+            for (re, ce) in rm.iter().zip(cm.iter()) {
+                assert_eq!(re.measure_value, ce.measure_value);
+                assert_eq!(re.row_fields, ce.row_fields, "行字段一致");
+            }
+        }
+    }
+}
+
+#[test]
+fn stats_last_scalar_accessor_numeric() {
+    // 标量访问器 final_measure_values_by_bucket 对 last 返回字段数值
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![last_measure("last_price", "price")],
+    );
+    let rows = vec![
+        row(&[("auction", num(1.0)), ("price", num(100.0))]),
+        row(&[("auction", num(1.0)), ("price", num(250.0))]),
+    ];
+    let mut exec = StatsExecutor::with_row_fields(plan, Some(full_bid_subset()));
+    exec.process_rows(&rows, extract);
+    assert_eq!(
+        exec.final_measure_values_by_bucket(),
+        vec![(ScopeKey::Int(1), vec![250.0])]
+    );
+}
+
+#[test]
+fn stats_top_full_cutoff_replaces_tail() {
+    // top-N 满后: 高于门槛的 key 替换尾部, 低于/等于门槛的跳过（快速淘汰路径）——
+    // 行序: 100, 200, 50, 150 → top-2 = [200, 150]
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![top_measure("top_price", "price", 2)],
+    );
+    let rows = vec![
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(100.0)),
+            ("bidder", num(1.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(200.0)),
+            ("bidder", num(2.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(50.0)),
+            ("bidder", num(3.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(150.0)),
+            ("bidder", num(4.0)),
+        ]),
+    ];
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(&rows, extract);
+    let entries = &exec.close_window_by_bucket_rows()[0].measures[0];
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].measure_value, 200.0);
+    assert_eq!(entries[1].measure_value, 150.0, "150 替换 100");
+    let names = sorted_bid_names();
+    assert_eq!(
+        row_val(&entries[1].row_fields.as_ref().unwrap(), &names, "bidder"),
+        Some(&num(4.0))
+    );
+}
+
+#[test]
+fn stats_last_missing_field_keeps_row() {
+    // 字段缺失语义（P4 review 补充）: last 的字段缺失仍保留整行（yield 可能读
+    // 其它字段）; 度量值回退 0.0。行式/列式两条路径一致。
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![last_measure("last_price", "price")],
+    );
+    let rows = vec![
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(100.0)),
+            ("bidder", num(7.0)),
+        ]),
+        // 最后一条缺 price 字段（列式 = price 列 null）
+        row(&[("auction", num(1.0)), ("bidder", num(8.0))]),
+    ];
+    // 行式路径
+    let mut row_exec = StatsExecutor::new(plan.clone());
+    row_exec.process_rows(&rows, extract);
+    let buckets = row_exec.close_window_by_bucket_rows();
+    let e = &buckets[0].measures[0][0];
+    assert_eq!(e.measure_value, 0.0, "字段缺失 → 度量值 0.0");
+    let rf = e.row_fields.as_ref().expect("last 保留整行");
+    // 行式 None 子集列序 = 本行排序键（最后一条缺 price → [auction, bidder]）
+    let row_names = ["auction", "bidder"]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        row_val(rf, &row_names, "bidder"),
+        Some(&num(8.0)),
+        "字段缺失仍保留行字段"
+    );
+    // 列式路径: price 列 null 对应行
+    let batch = rows_to_batch_with_null_price(&rows);
+    let mut col_exec = StatsExecutor::new(plan);
+    assert!(col_exec.process_batch(&batch), "应可列式化");
+    let cb = col_exec.close_window_by_bucket_rows();
+    let ce = &cb[0].measures[0][0];
+    assert_eq!(ce.measure_value, 0.0);
+    let col_names = sorted_schema_names(&batch); // [auction, bidder, price]
+    assert_eq!(
+        row_val(&ce.row_fields.as_ref().unwrap(), &col_names, "bidder"),
+        Some(&num(8.0))
+    );
+}
+
+#[test]
+fn stats_top_zero_keeps_no_entries() {
+    // top(0, ...) 边界（P4 review 补充）: 不保留任何条目, close 时该度量空条目
+    // （任务层 n_records=0 → 不产出; 而非以前虚假的 scalar(0.0)）。
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![top_measure("top_price", "price", 0)],
+    );
+    let rows = vec![
+        row(&[("auction", num(1.0)), ("price", num(300.0))]),
+        row(&[("auction", num(1.0)), ("price", num(100.0))]),
+    ];
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(&rows, extract);
+    let buckets = exec.close_window_by_bucket_rows();
+    assert_eq!(buckets.len(), 1, "桶仍存在（有事件）");
+    assert!(
+        buckets[0].measures[0].is_empty(),
+        "top(0) 无条目——不产出而非 0.0"
+    );
+}
+
+#[test]
+fn stats_row_fields_compact_and_shared() {
+    // P5 紧凑化结构验证: (1) 行字段列数组长度 = 子集大小（非整行 8 字段）;
+    // (2) 同桶多个 last 度量 Arc 共享同一列数组（内存 1 份）。
+    let subset: Arc<HashSet<String>> = Arc::new(
+        ["price".to_string(), "bidder".to_string()]
+            .into_iter()
+            .collect(),
+    );
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![
+            last_measure("last_price", "price"),
+            last_measure("last_bidder", "bidder"),
+        ],
+    );
+    let rows = vec![row(&[
+        ("auction", num(1.0)),
+        ("price", num(100.0)),
+        ("bidder", num(7.0)),
+    ])];
+    let mut exec = StatsExecutor::with_row_fields(plan, Some(subset));
+    exec.process_rows(&rows, extract);
+    let buckets = exec.close_window_by_bucket_rows();
+    assert_eq!(buckets.len(), 1);
+    let m0 = &buckets[0].measures[0][0].row_fields;
+    let m1 = &buckets[0].measures[1][0].row_fields;
+    let (r0, r1) = (
+        m0.as_ref().expect("last 行字段"),
+        m1.as_ref().expect("last 行字段"),
+    );
+    assert_eq!(r0.len(), 2, "列数组长度 = 子集大小, 而非整行");
+    assert!(
+        std::sync::Arc::ptr_eq(r0, r1),
+        "同桶多 last 度量共享同一列数组"
+    );
+    // 子集列序 = 排序 [bidder, price]
+    let names = ["bidder", "price"]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+    assert_eq!(row_val(r0, &names, "price"), Some(&num(100.0)));
+    assert_eq!(row_val(r0, &names, "bidder"), Some(&num(7.0)));
+    assert!(row_val(r0, &names, "auction").is_none(), "子集外不入列");
+}
+
+#[test]
+fn stats_row_fields_subset_both_paths_match() {
+    // row_fields 子集（P4 review 修复）: 行式回退与列式路径都只保留子集字段——
+    // Q18/Q19 内存关键（整行 8 字段 vs 子集）。行式此前保留整行（修复点）。
+    let subset: std::sync::Arc<HashSet<String>> = std::sync::Arc::new(
+        ["price".to_string(), "bidder".to_string()]
+            .into_iter()
+            .collect(),
+    );
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![last_measure("last_price", "price")],
+    );
+    let rows = vec![
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(100.0)),
+            ("bidder", num(7.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(200.0)),
+            ("bidder", num(8.0)),
+        ]),
+    ];
+    let batch = rows_to_batch(&rows);
+    let mut row_exec = StatsExecutor::with_row_fields(plan.clone(), Some(subset.clone()));
+    row_exec.process_rows(&rows, extract);
+    let mut col_exec = StatsExecutor::with_row_fields(plan, Some(subset));
+    assert!(col_exec.process_batch(&batch), "应可列式化");
+    let (rb, cb) = (
+        row_exec.close_window_by_bucket_rows(),
+        col_exec.close_window_by_bucket_rows(),
+    );
+    assert_eq!(rb.len(), cb.len());
+    for (r, c) in rb.iter().zip(cb.iter()) {
+        assert_eq!(r.key, c.key);
+        for (rm, cm) in r.measures.iter().zip(c.measures.iter()) {
+            assert_eq!(rm.len(), cm.len());
+            for (re, ce) in rm.iter().zip(cm.iter()) {
+                assert_eq!(re.measure_value, ce.measure_value);
+                assert_eq!(re.row_fields, ce.row_fields);
+            }
+        }
+    }
+    // 子集生效: 行字段不含 auction（不在子集内, 且非桶键注入目标）
+    let rf = &rb[0].measures[0][0]
+        .row_fields
+        .as_ref()
+        .expect("last 行字段");
+    // 子集 {price, bidder} 排序列序 = [bidder, price]
+    let names = ["bidder", "price"]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+    assert!(row_val(rf, &names, "price").is_some());
+    assert!(row_val(rf, &names, "bidder").is_some());
+    assert!(row_val(rf, &names, "auction").is_none(), "子集外字段不入行");
 }

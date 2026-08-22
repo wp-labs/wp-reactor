@@ -100,8 +100,12 @@ fn group_by_clause(input: &mut &str) -> ModalResult<Vec<Expr>> {
     ws_skip.parse_next(input)?;
     let keys: Vec<Expr> = cut_err(delimited(
         literal("("),
-        separated(0.., expr::parse_expr, preceded(ws_skip, literal(","))),
-        cut_err(literal(")")),
+        separated(
+            0..,
+            preceded(ws_skip, expr::parse_expr),
+            preceded(ws_skip, literal(",")),
+        ),
+        cut_err(preceded(ws_skip, literal(")"))),
     ))
     .parse_next(input)?;
     Ok(keys)
@@ -192,7 +196,7 @@ fn stats_agg(input: &mut &str) -> ModalResult<(StatsAgg, Option<FieldRef>, Optio
             let f = cut_err(delimited(
                 literal("("),
                 field_ref_lit,
-                cut_err(literal(")")),
+                cut_err(preceded(ws_skip, literal(")"))),
             ))
             .parse_next(input)?;
             let agg = match name.as_str() {
@@ -209,20 +213,21 @@ fn stats_agg(input: &mut &str) -> ModalResult<(StatsAgg, Option<FieldRef>, Optio
             let f = cut_err(delimited(
                 literal("("),
                 field_ref_lit,
-                cut_err(literal(")")),
+                cut_err(preceded(ws_skip, literal(")"))),
             ))
             .parse_next(input)?;
             Ok((StatsAgg::Last, Some(f), None))
         }
         "top" => {
             ws_skip.parse_next(input)?;
-            let (n, f) = cut_err(delimited(
+            let (n, _, f) = cut_err(delimited(
                 literal("("),
                 (
-                    number_literal,
-                    preceded(literal(","), cut_err(field_ref_lit)),
+                    preceded(ws_skip, number_literal),
+                    preceded(ws_skip, literal(",")),
+                    cut_err(field_ref_lit),
                 ),
-                cut_err(literal(")")),
+                cut_err(preceded(ws_skip, literal(")"))),
             ))
             .parse_next(input)?;
             Ok((StatsAgg::Top, Some(f), Some(n as u64)))
@@ -233,8 +238,10 @@ fn stats_agg(input: &mut &str) -> ModalResult<(StatsAgg, Option<FieldRef>, Optio
     }
 }
 
-/// 字段引用: `b.price` / `b.bidder`（简版：Qualified）。
+/// 字段引用: `b.price` / `b.bidder`（简版：Qualified）。入口跳前导空白——
+/// `top(10, b.price)` 逗号后、`sum( b.price)` 括号内均允许空格。
 fn field_ref_lit(input: &mut &str) -> ModalResult<FieldRef> {
+    ws_skip.parse_next(input)?;
     let alias = cut_err(ident).parse_next(input)?.to_string();
     ws_skip.parse_next(input)?;
     if opt(literal(".")).parse_next(input)?.is_some() {

@@ -520,7 +520,11 @@ fn column_scalar(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<Valu
 /// Returns `None` when the cell is null / missing (row → shard 0). Unsupported
 /// column types fall back to reading via [`column_scalar`] → [`ScopeKey::from_value`]
 /// so they still shard deterministically.
-fn scope_key_from_column(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<ScopeKey> {
+pub(crate) fn scope_key_from_column(
+    batch: &RecordBatch,
+    col_idx: usize,
+    row: usize,
+) -> Option<ScopeKey> {
     use arrow::datatypes::{DataType, TimeUnit};
     let col = batch.column(col_idx);
     if col.is_null(row) {

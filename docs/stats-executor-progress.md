@@ -336,3 +336,280 @@ ground truth 精确一致（1,079,512 / 719,753）**——批量 emit 让窗口 
 
 测试: q12 任务测试改为 `take_alerts` 断言一批多条（批量语义）; 全量回归
 wf-engine 588 / wf-runtime 197 全绿。
+
+## 10. P4 last/top 扩展度量（Q18/Q19, 已实现 + review 修复）
+
+### 10.1 实现（工作区, 未提交）
+
+- **执行器** `stats_exec.rs`: `StatsAccum.last_row`（Arc 跨同桶多 last 度量共享,
+  免 4× 内存）+ `top_entries`（TopEntry = key f64 + 行字段）; `apply_last_top` /
+  `insert_top`; `row_fields_from_batch`（字段子集提取, `None` = 全列）;
+  `with_row_fields` 构造器; rich close `close_window_by_bucket_rows`（每桶每度量
+  值列表, top = N 条目 rank 序; 桶按 ScopeKey 升序, 清空状态）; 带 key 逐行路径
+  每行一次 `row_cache` 懒提取, 多 last 度量共享。
+- **任务** `stats_task.rs`: `close_current_window` 有 last/top 走 rich 路径
+  （n_records = 每桶最大条目数; top 每条目一条 alert, 行字段注入 `b.*`）;
+  `build_stats_close_output` 加 `row_fields` 参数; 批量 emit 沿用。
+- **spawn** `spawn.rs`: `stats_row_fields` 计算 last/top 行字段提取子集
+  （yield/entity 引用 ∪ 度量字段; 桶键不入行）——Q18 5.29M 桶 × 整行 8 字段
+  会到 ~19GB, 子集降 4× 以上。
+- **解析器** `stats_p.rs`: `field_ref_lit` 入口 `ws_skip`; `group_by_clause` /
+  `top(N, f)` 逗号两侧空白; 闭括号空白。
+- **wf-examples**: `q18_stats.wfl`（group by (bidder, auction) + 4 last 度量）/
+  `q19_stats.wfl`（group by (auction) + top(10, price)）。
+
+**端到端**（30M v5）: Q18 EMIT 5,286,087 = CEP 精确一致, 抽查 30 万条 last bid
+与帧数据 100% 一致; Q19 EMIT 7,943,687 = Σ min(10,bids) 精确一致。
+
+### 10.2 review 发现与修复（2026-08-22）
+
+1. **🔴 行式回退路径忽略 `row_fields` 子集（已修）**: `process_rows` 的 last/top
+   保留整行（8 字段）, 与列式 `row_fields_from_batch` 子集不一致——一旦走行式
+   回退（非列式 where / 函数键）Q18/Q19 内存放大 4×+。修复: 新增
+   `row_fields_from_row`（按子集过滤）两处替换。测试:
+   `stats_row_fields_subset_both_paths_match`（行式 vs 列式 close 逐条目一致 +
+   子集外字段不入行）。
+2. **🟡 top 空条目虚假产出（已修）**: `bucket_measure_entries` 的 Top 空条目
+   原返回 `vec![scalar(0.0)]` —— `top(0, ...)` 或全部非数值键时产出 0.0 记录;
+   且该分支是 `m.len()-1` 下溢的唯一防线。修复: 空条目返回空 Vec, 任务层
+   `close_current_window` 改用 `m.get(min(k, len.saturating_sub(1)))` 安全读取
+   （空 → 0.0/None）, 全空时 n_records=0 整桶不产出。测试:
+   `stats_top_zero_keeps_no_entries` / `stats_top_zero_emits_nothing`。
+3. **🟡 `insert_top` 每事件整行克隆（已修）**: Q19 每 bid 先 `row.clone()` 再
+   `insert_top`（满时再截断）——克隆白付。修复: 快速淘汰提前到克隆前（满且
+   `key <= entries[n-1].key` 直接跳过; 同 key 新条目必插在既有之后, 满时必被
+   截断, 先到者语义不变）。测试: `stats_top_full_cutoff_replaces_tail`（满后
+   高于门槛替换尾部、低于/等于门槛跳过）。
+4. **🟡 解析器空格边界（已修）**: `group by (a , b)`（逗号前空格）与
+   `top(10 , b.price)` 解析失败——separator/逗号用裸 `literal(",")` 不跳前导
+   空白; `top( 10 ...)` 括号后空格亦失败。修复: 逗号两侧、闭括号均 `ws_skip`。
+   测试: `stats_ws_tolerant_comma_and_parens`。
+5. **🟡 last 字段缺失保留行（语义锁定, 补测试）**: last 度量字段缺失仍保留整
+   行（yield 读其它字段）, 度量值 0.0——行式/列式一致。测试:
+   `stats_last_missing_field_keeps_row`（行式缺键 vs 列式 null 列）。
+
+### 10.3 已知保留项
+
+- Q18/Q19 RSS 仍 ~21GB（5.29M 桶 × 6 字段子集）: Arc 共享 + 子集已生效; 进一步
+  需行字段改紧凑结构（并行数组 / Vec<(name, value)> 代替 EngineHashMap）——
+  **已由 §11 P5 落地**（行字段状态 ~19GB → ~1.3GB 量级, 30M RSS 预计 21GB →
+  ~10GB 量级, 待 bench 复跑实测确认）。
+- top 空条目时该度量对跨 top 记录贡献 0.0（混合 last+top 且 top 无条目）——
+  退化可接受, 与 CEP 无实例语义对齐。
+
+### 10.4 测试与回归
+
+执行器 41（+5: 子集一致性 / top(0) / 字段缺失 / 满后替换 / 既有 tie 覆盖快速淘汰）;
+任务 17（+1: top(0) 不产出）; 解析器 17（+1: 空格边界）。全量回归: wf-lang 570 /
+wf-engine 598 / wf-runtime 203 全绿。切段 profile（release, N=500k）: 扫描 5.5
+ns/evt, 切段+归并 42.6 vs 整批 31.5（附加 34.9%）, 边界密集 10 段 2.5×——与修复
+前基线一致, 无回归。
+
+## 11. P5 行字段紧凑化（Q18/Q19 内存, 2026-08-22）
+
+### 11.1 动机
+
+Q18/Q19 30M RSS ~21GB。行字段状态为 `Arc<EngineHashMap<String, Value>>`——每桶
+6 个 SmolStr key + foldhash 节点 + Value ≈ 400B+/桶, 5.29M 桶直接顶到 ~19GB。
+10.3 记录的 P5 可选优化落地。
+
+### 11.2 方案
+
+行字段从 **字段名 HashMap → 按子集列序的 `Box<[Option<Value>]>`**（缺失/null =
+`None`）:
+
+- `StatsAccum.last_row: Option<Arc<Box<[Option<Value>]>>>`、`TopEntry.row:
+  Box<[Option<Value>]>`、`StatsCloseEntry.row_fields` 同型。
+- **列序确定性契约**（三处同序）: 子集路径 = 构造期对 `row_fields` 排序（spawn
+  恒传子集, 生产路径）; 无子集 = 行式按行键排序 / 列式按 schema 字段名排序。
+- **热路径零查找**: `measure_field_idx`（每度量字段在列数组的位置）构造期预计算,
+  `apply_last_top`/close 取值直索引（免去旧的每事件字符串查找）; 无子集时退化为
+  按列名 position 查找（仅测试/缺省）。
+- **提取零克隆**: 子集路径 `row_fields_from_batch` 直接复用列名切片, 不逐行克隆;
+  None 时每批算一次排序名。
+- **行式路径补 Arc 共享**: `process_rows` 也按行懒提取一次, 多 last/top 度量共享
+  同一 Arc（原每度量各提取一份——与 accumulate_keyed_row 的 row_cache 对齐）。
+- **任务层注入**: `build_stats_close_output` 加 `row_names` 参数, 列数组按列名展开
+  注入 StepData.field_values（yield 读 `b.*` 不变）。
+
+### 11.3 内存估算
+
+每桶: 1 Arc + 1 Box + 6 × Option<Value>(24B) ≈ 170B + ScopeKey/Vec 开销 ≈ 250B,
+vs 旧 ~400B+/桶——行字段状态 ~1.3GB 量级（旧 ~19GB）。30M RSS 预计 21GB →
+~10GB 量级（剩余为 alert 批量构建等, 非行字段状态）。**30M 实测待 bench 复跑确认。**
+
+### 11.4 测试
+
+- `stats_row_fields_compact_and_shared`: 列数组长度 = 子集大小（非整行）+ 同桶
+  多 last 度量 `Arc::ptr_eq` 共享 + 子集外字段不入列。
+- 既有 last/top 测试改为显式子集形态（`full_bid_subset`——生产经 spawn 恒有子集,
+  无子集时 last/top 度量值在标量/close 路径为 0.0, 已在 `with_row_fields` 注释
+  声明该限制）; 列数组断言走 `row_val(row, names, name)` 辅助。
+
+### 11.5 回归
+
+执行器 42（+1 结构验证）; 全量: wf-lang 570 / wf-engine 599 / wf-runtime 203 全绿。
+
+### 11.6 last/top 热路径 profile（release, N=500k, 10k auction 桶）
+
+优化前:
+
+| 形态 | ns/evt | evt/s | 边际（vs keyed count 40.8 ns/evt） |
+|---|---|---|---|
+| keyed count（基线） | 40.8 | 24.5M | — |
+| 单键 4×last | 158.1 | 6.3M | +117.3（行字段列数组提取 + Arc 共享） |
+| **Q18 复合键 4×last** | **507.4** | **2.0M** | **+466.6（其中 Pair 盒装键 ≈ 349）** |
+| Q19 top(10) 单键 | 165.8 | 6.0M | +124.9（提取 + 有界插入） |
+
+**发现**: 复合键 `ScopeKey::Pair` 每次事件 2 次 Box 分配 ≈ 349 ns/evt——Q18
+的 bidder+auction 复合键是最大单项开销（占 Q18 总时间 ~69%）。
+
+### 11.7 复合键优化（2026-08-22, 已实施）
+
+**方案（11.6 方向 a 落地）**: stats 桶表从 `HashMap<ScopeKey, Vec<StatsAccum>>`
+改为 **`HashMap<u64, Vec<StatsBucket>>`**（哈希键 + 碰撞链; `StatsBucket` =
+完整 `ScopeKey` + 累加器）:
+
+- **列式路径每事件零 Box 分配**: 键数 ≤ 4 走扁平路径——栈上叶数组
+  （`scope_key_from_column`, 复用 fanout 的规范化单一来源）→ `comps_hash` →
+  `keyed_bucket_mut`（链扫描, 完整 `ScopeKey` 仅**每桶首见**构建一次）;
+  键数 > 4 回退 `scope_key_columnar`（罕见）。
+- **哈希字节级同构**: `comps_hash`（叶数组）== `scope_key_hash`（树）——仅最外层
+  tag + 内层叶 payload + 0x1f 分隔, 与 `key.rs::scope_key_shard_index` 同序列
+  （内层叶无 tag 是既有设计: 类型歧义由碰撞链完整比较消歧）。行式/列式两路径
+  同键必落同桶（测试锁定）。
+- **空键/行式路径不变**: `bucket_mut(&ScopeKey)` 走树哈希; 空键单桶预建。
+- **close 拍平**: `take_buckets()` 清空并拍平为 `(ScopeKey, accs)` 按 ScopeKey
+  升序（输出契约不变）。
+
+**效果**（同 profile 复测）:
+
+| 形态 | 优化前 | 优化后 | 提升 |
+|---|---|---|---|
+| Q18 复合键 4×last | 507.4 ns/evt（2.0M） | **379.8 ns/evt（2.6M）** | **1.34×** |
+| 单键 4×last | 158.1 | 149.2 | 1.06× |
+| Q19 top(10) | 165.8 | 152.9 | 1.08× |
+
+复合键 Pair 盒装成本 349 → 231 ns/evt（-34%）。**剩余** ~119 ns 复合键边际:
+列式键读取分派（`scope_key_from_column` 每行每键 `downcast_ref`）可提前到每批
+一次预解析（后续优化项, 收益 ~30-50 ns）; 行字段提取 ~111 ns 已成最大单项。
+
+**测试**: `stats_composite_key_hash_flat_matches_tree`（哈希同构契约, 1-4 键 /
+int+float+str 混合）/ `stats_composite_key_mixed_types_columnar_matches_row_based`
+（Int64+Utf8 混合复合键逐桶对拍）/ `stats_composite_key_three_field_columnar_matches_row_based`
+（3 键左深递归边界）/ `stats_composite_key_mixed_paths_same_bucket`（同一 executor
+先列式批再行式行, 两查找路径落同桶不产生重复桶）。
+
+### 11.8 复合键深度优化（2026-08-22, 三轮）
+
+**① 键列类型预解析**: `resolve_key_columns` 每批一次解析键列类型为 `KeyColumn`
+（借用 batch 列数组）——逐行免 `downcast_ref` 动态分派; 规范化与
+`scope_key_from_column` 一致（含 Float64 规范化位, 复制 key.rs canonical 口径）;
+不支持类型回退 `Other`。
+
+**② profile 数据分布修正（重要）**: 原 profile 的 bidder 伪随机 100 万取值 →
+50 万行几乎全唯一 → 50 万桶（100% 唯一率）, 夸大哈希表压力（复合键 count 189.7
+ns/evt, 其中 ~98 ns 是桶密度伪影）。修正为 10 万桶 / 每桶 5 行（对齐 Q18 真实
+唯一率 ~19%）后: 复合键 count 91.5、Q18 228.1 ns/evt。**结论: 复合键查找真实
+成本 ~54 ns, 非早期误判的 ~152。**
+
+**③ 桶表换 foldhash**: `buckets` 从 std `HashMap<u64, _>`（SipHash RandomState）
+改为 `EngineHashMap`（foldhash, 与引擎热路径哈希一致）——单键 count 37.1 → 26.7
+ns/evt（-28%）; 复合键 count 91.5 → 73.7。
+
+**④ 行字段列索引预解析**: `row_fields_from_batch` 改收每批预解析的列索引切片
+（`row_field_cols`, 免逐行 `schema.index_of`）——行字段提取边际 121 → 94 ns/evt。
+
+**最终效果**（对齐 Q18 真实分布, N=500k, 10k auction × 10 万 bidder）:
+
+| 形态 | 优化前 | 优化后 | 提升 |
+|---|---|---|---|
+| keyed count（单键基线） | 37.1 | 26.8 | 1.39× |
+| 复合键 count | 91.5 | 80.2 | 1.14× |
+| 单键 4×last | 148.0 | 120.7 | 1.23× |
+| **Q18 复合键 4×last** | **228.1** | **183.1** | **1.25×**（EPS 4.3M → 5.5M） |
+| Q19 top(10) | 143.0 | 135.4 | 1.06× |
+
+**剩余构成**（Q18 = 183 ns/evt）: 行字段提取+Arc ~94 / 复合键查找 ~54 / 单键
+基线 ~27 / 其余 ~8。下一优化候选: 行字段 Box 分配（每行一次, 每桶保留一行——
+可提前判断「该行是否会成为 last」避免无谓分配, 或改紧凑定长数组）。
+
+### 11.10 行字段分配优化（2026-08-22）
+
+**⑤ 行字段 `Arc<[T]>` 单块分配**: `Arc<Box<[Option<Value>]>>` → `Arc<[Option<Value>]>`
+——消除 Arc→Box→数组两层间接/两次堆分配（`Arc::from(vec)` 单块）。`TopEntry.row`
+保持 `Box<[T]>`（top 条目各自独立行, 不共享; 插入时从 Arc 显式深拷贝,
+快速淘汰分支仍提前跳过）。任务层 `row_fields` 类型同步。
+
+**⑥ spawn 行字段子集排除桶键**: `stats_row_fields` 从子集移除 `plan.keys` 的
+简单字段——桶键已由 close 从 scope_key 注入 field_values, 行字段重复存纯属浪费
+（Q18 键 bidder/auction 去掉后子集 6 → 4 字段, 提取量与内存 -33%）。注意:
+若 last/top 度量字段恰为桶键, 其度量值退化为 0.0（yield 读该字段仍经 scope_key
+注入, 实际输出不受影响——注释已声明）。测试:
+`stats_row_fields_excludes_key_fields`（spawn 层锁定）。
+
+**效果**（对齐生产形态: schema 含 channel/url/dateTime, 子集排除桶键）:
+
+| 形态 | 优化前(§11.8) | 优化后 | 提升 |
+|---|---|---|---|
+| Q18 复合键 4×last | 183-197 | **180-197（5.1-5.5M evt/s）** | 持平（噪声内） |
+| 单键 4×last | 120.7 | 115.6-119.8 | ~1.04× |
+| Q19 top(10) | 135.4 | 127.5-138.4 | ~1.03× |
+
+Q18 数字受机器负载噪声（±10%）影响难精确归因; **⑥ 的对照测**（同计划 6 字段
+不排键 vs 4 字段生产形态）波动 3.8-51.8 ns/evt, 方向明确; 内存收益明确:
+行字段 6 → 4 字段（-33%）+ Arc 单块（-1 层指针）。Q18 端到端 EPS 预计
+5.5M+（30M 实测待 bench）。
+
+### 11.11 回归
+
+执行器 46 / 任务 17 / spawn +1（桶键不入行）; 全量: wf-lang 570 / wf-engine 603 /
+wf-runtime 204 全绿。
+
+## 12. 端到端验证 + shutdown flush 修复 + 分块 emit（2026-08-22）
+
+### 12.1 30M/10M 实测（stats 版, blackhole sink, `run_stats_bench.sh`）
+
+30M 正确性（窗口事件推进产出, metrics 正常采集）:
+
+| 查询 | EPS | RSS | EMIT | 对拍 |
+|---|---|---|---|---|
+| q18_stats | 3.47M | **14.2GB** | 5,286,087 | ✅ 与优化前一致; RSS 21.7→14.2GB（-35%） |
+| q19_stats | 5.43M | **17.6GB** | 7,943,687 | ✅ 与优化前一致; RSS 23.3→17.6GB（-25%, 分块后） |
+
+10M 性能摸底: q12 12.8M（EMIT 282,514 ✓ 10s 窗自然关闭）/ q15 4.1M / q16 6.5M /
+q17 10.2M / q18 9.9M / q19 10.2M（EPS; 均 [clean]）。
+
+### 12.2 shutdown flush 产出被丢（修复）
+
+**现象**: 10M + 30m 窗口查询（span 16.7m < 30m 窗, 唯一窗口靠 flush 关闭）
+EMIT=0。daemon.log: `stats alert channel closed, dropping alert batch`。
+
+**根因链**: ① daemon 模式 receiver 常驻 → EOS 只在 cancel 时触发 → stats 的
+EOS flush 永远发生在 shutdown 中; ② stats flush 构建百万级 alert 需数秒
+（q19 30M ≈ 8M 条 ~13s）; ③ `SINK_DRAIN_BUDGET=1s` → sink consumer 在 stats
+flush 投递前耗尽预算退出（drop rx）; ④ `GROUP_JOIN_TIMEOUT=3s` → rules/alert
+group 在 flush 完成前被 abort。投递必然失败。
+
+**修复**: `SINK_DRAIN_BUDGET 1s → 30s`（sink 等 stats flush 投递）+
+`GROUP_JOIN_TIMEOUT 3s → 60s`（group 等 flush 完成; 卡死任务仍被 abort 兜底）。
+验证: 10M q18 shutdown 后 alert group `aborted=0`、无 channel closed 警告,
+产出落地（debug_output 文件增量）; 30M q18 窗口 2 也能产出。
+
+**残余（采集口径, 非实现 bug）**: metrics task 在 SIGTERM 后立即退出, flush 的
+emitted_total 增量在 metrics 停止后 → 10M 30m 窗查询的 EMIT 仍显示 0（产出已在
+sink 侧确认）。正确性验证走 30M（窗口事件推进产出, metrics 正常）或任务测试。
+
+### 12.3 q19 close 峰值（分块 emit, 修复）
+
+**现象**: q19 30M close 一次构建 7.94M 条 alert, RSS 峰值 23.3GB（与 alert 条数
+正相关; q18 5.29M 条 → 14.2GB）。
+
+**修复**: `emit_close_record` 分块——builder 累计达 `EMIT_CHUNK=100 万` 条即
+`dispatch_columns` 并重建（投递仍批量, 不引入 §9.9 前的逐桶 await 回压）。
+效果: q19 30M RSS 23.3 → 17.6GB（-25%）, CPU 789%→362%, EPS 持平 5.4M,
+EMIT 7,943,687 一致。
+
+### 12.4 回归
+
+全量: wf-lang 570 / wf-engine 603 / wf-runtime 204 全绿。

@@ -52,17 +52,22 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{ArrayRef, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampNanosecondArray};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{
     BinOp, CloseMode, CmpOp, Expr, FieldRef, FieldSelector, MatchMode, Measure, Transform,
 };
-use wf_lang::plan::{AggPlan, BindPlan, BranchPlan, MatchPlan, StepPlan, WindowSpec};
+use wf_lang::plan::{
+    AggPlan, BindPlan, BranchPlan, MatchPlan, StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan,
+    StatsPlan, StepPlan, WindowSpec,
+};
 
 use crate::match_engine::EngineHashSet;
 use crate::match_engine::RuleExecutor;
-use crate::match_engine::event_bridge::ColumnarEvent;
+use crate::match_engine::event_bridge::{
+    ColumnarEvent, batch_event_time_nanos_at, batch_time_col_index,
+};
 use crate::match_engine::executor::StatsExecutor;
 use crate::match_engine::match_engine::{
     CepStateMachine, EngineHashMap, Event, FieldSource, RollingStats, StepState, Value, ValueKey,
@@ -973,5 +978,426 @@ fn q15_stats_executor_profile() {
     eprintln!(
         "[close-bench]   列式剩余开销 ≈ {:.0} ns/evt = where mask 摊还 + 度量循环 + 列解析（distinct 每行哈希不可回避）",
         stats_col_ns - distinct_ns
+    );
+}
+
+/// 构造 N 行 price/bidder/auction/event_time 批（event_time 线性 0..span, 100µs/evt
+/// 对齐 nexmark 速率; 窗口边界落在批内, 复刻 Q12/Q18/Q19 批跨边界形态）。
+fn time_batch(n: usize, span_ns: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]));
+    let step = span_ns / n as i64;
+    let ts: Vec<i64> = (0..n as i64).map(|i| i * step).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1i64; n])),
+            Arc::new(Int64Array::from(vec![1i64; n])),
+            Arc::new(Int64Array::from(vec![1i64; n])),
+            Arc::new(TimestampNanosecondArray::from(ts)),
+        ],
+    )
+    .unwrap()
+}
+
+/// 窗口切段边界扫描（复刻 stats_task::process_batch_from 的段循环——扫时间列,
+/// 每段起点行索引; 不含归并, 测量切段本身的最小成本）。
+fn segment_starts(batch: &RecordBatch, time_col: usize, dur_nanos: i64) -> Vec<usize> {
+    let n = batch.num_rows();
+    let mut starts = vec![0usize];
+    let mut window_end: Option<i64> = None;
+    for i in 0..n {
+        let t = batch_event_time_nanos_at(batch, time_col, i);
+        let bucket = (t / dur_nanos) * dur_nanos;
+        match window_end {
+            None => window_end = Some(bucket + dur_nanos),
+            Some(end) if t >= end => {
+                window_end = Some(bucket + dur_nanos);
+                starts.push(i);
+            }
+            Some(_) => {}
+        }
+    }
+    starts
+}
+
+/// 切段 + 每段列式归并（复刻 process_batch_from 的归并侧: 段行子集喂
+/// process_batch_rows）。
+fn process_segmented(
+    exec: &mut StatsExecutor,
+    batch: &RecordBatch,
+    time_col: usize,
+    dur_nanos: i64,
+) {
+    let starts = segment_starts(batch, time_col, dur_nanos);
+    let n = batch.num_rows();
+    for (k, &s) in starts.iter().enumerate() {
+        let e = if k + 1 < starts.len() {
+            starts[k + 1]
+        } else {
+            n
+        };
+        let seg: Vec<u32> = (s..e).map(|i| i as u32).collect();
+        let ok = exec.process_batch_rows(batch, Some(&seg));
+        assert!(ok, "count-only 计划应可列式化");
+    }
+}
+
+/// stats 窗口切段热路径 profile（P4 追加）: `process_batch_from` 对**每个 batch**
+/// 扫时间列切段（批跨窗口边界时逐段归并, Q12 10s 窗 / Q18/Q19 30m 窗）——
+/// 量化切段开销相对整批归并基线, 防止切段逻辑性能回归。
+///
+/// 运行:
+///   cargo test --release -p wf-engine close_bench -- --ignored --nocapture
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine close_bench -- --ignored --nocapture"]
+fn stats_window_segmentation_profile() {
+    let n = 500_000usize;
+    let dur_nanos = 10 * 1_000_000_000i64; // 10s 窗
+    let span_ns = dur_nanos * 2; // 批跨 2 个窗口（1 边界）
+    let batch = time_batch(n, span_ns);
+    let time_col = batch_time_col_index(&batch, Some("event_time")).expect("event_time col");
+    let starts = segment_starts(&batch, time_col, dur_nanos);
+    assert!(
+        starts.len() >= 2,
+        "批应跨至少 1 个窗口边界, 实际段数={}",
+        starts.len()
+    );
+
+    // keyed count 计划（group by bidder, 近似 Q12 真实形态——每行哈希; 整批归并
+    // 本身 O(n), 对照公平; 空键 sum 会被向量化到 ~0.4 ns/evt, 虚高切段占比）。
+    let count_plan = wf_lang::plan::StatsPlan {
+        window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(10)),
+        keys: vec![Expr::Field(FieldRef::Qualified(
+            "b".into(),
+            "bidder".into(),
+        ))],
+        output_shape: wf_lang::plan::StatsOutputShapePlan::Rows,
+        measures: vec![wf_lang::plan::StatsMeasurePlan {
+            label: "n".into(),
+            source_alias: "b".into(),
+            where_expr: None,
+            agg: StatsAggPlan::Count,
+            field: None,
+            arg: None,
+        }],
+        tracked_bind_fields: HashMap::new(),
+    };
+
+    eprintln!(
+        "[close-bench] ===== stats 窗口切段热路径 profile（N={}, 10s 窗, 段数={}, {} 边界）=====",
+        n,
+        starts.len(),
+        starts.len() - 1
+    );
+
+    // ---- 分量 1: segment_scan（仅时间列扫描切段, 无归并）----
+    let iters = 20;
+    let start = Instant::now();
+    let mut total_starts = 0usize;
+    for _ in 0..iters {
+        let s = segment_starts(&batch, time_col, dur_nanos);
+        total_starts += s.len();
+        std::hint::black_box(&s);
+    }
+    assert!(total_starts > 0);
+    let scan_ns = start.elapsed().as_secs_f64() * 1e9 / (n as f64 * iters as f64);
+    Report {
+        name: "切段 segment_scan(仅扫描)",
+        per_ns: scan_ns,
+    }
+    .line(scan_ns);
+
+    // ---- 分量 2: segmented_merge（切段 + 每段列式归并, 生产完整路径）----
+    let start = Instant::now();
+    let mut seg_exec = StatsExecutor::new(count_plan.clone());
+    process_segmented(&mut seg_exec, &batch, time_col, dur_nanos);
+    let seg_ns = start.elapsed().as_secs_f64() * 1e9 / n as f64;
+    let seg_total = seg_exec.final_measure_values();
+    assert_eq!(seg_total[0], n as f64, "切段归并 count = N");
+    Report {
+        name: "切段+归并 segmented_merge",
+        per_ns: seg_ns,
+    }
+    .line(seg_ns);
+
+    // ---- 分量 3: whole_batch（对照基线: 无切段, 整批一次归并）----
+    let start = Instant::now();
+    let mut whole_exec = StatsExecutor::new(count_plan.clone());
+    assert!(whole_exec.process_batch(&batch));
+    let whole_ns = start.elapsed().as_secs_f64() * 1e9 / n as f64;
+    let whole_total = whole_exec.final_measure_values();
+    assert_eq!(whole_total[0], n as f64, "keyed count 总和 = N");
+    Report {
+        name: "整批归并 whole_batch(对照)",
+        per_ns: whole_ns,
+    }
+    .line(whole_ns);
+
+    eprintln!(
+        "[close-bench]   切段热路径: 扫描 {scan_ns:.1} ns/evt, 切段+归并 {seg_ns:.1} vs 整批归并 {whole_ns:.1}（切段附加 {:.1} ns/evt = {:.1}%）",
+        seg_ns - whole_ns,
+        (seg_ns - whole_ns) / whole_ns * 100.0
+    );
+
+    // ---- 边界密集对照: 同一批跨 10 个窗口（9 边界）——段数放大每段的
+    // domain_mask/view 前置（每段 O(n) 构建）, 量化切段附加对段数的敏感度。
+    let dense_batch = time_batch(n, dur_nanos * 10);
+    let dense_starts = segment_starts(&dense_batch, time_col, dur_nanos);
+    let start = Instant::now();
+    let mut dense_exec = StatsExecutor::new(count_plan.clone());
+    process_segmented(&mut dense_exec, &dense_batch, time_col, dur_nanos);
+    let dense_ns = start.elapsed().as_secs_f64() * 1e9 / n as f64;
+    assert_eq!(dense_exec.final_measure_values()[0], n as f64);
+    Report {
+        name: "切段+归并 边界密集(10 段)",
+        per_ns: dense_ns,
+    }
+    .line(seg_ns);
+    eprintln!(
+        "[close-bench]   边界密集({} 段) vs 单边界: {:.1} vs {:.1} ns/evt（段数放大附加 {:.1}×）",
+        dense_starts.len(),
+        dense_ns,
+        seg_ns,
+        (dense_ns - whole_ns) / (seg_ns - whole_ns)
+    );
+}
+
+/// last/top 热路径批（Q18/Q19 形态）: 10k 个 auction 桶 × 10 万 bidder 值伪随机
+/// 交错 → (bidder, auction) 组合 ~10 万桶, 每桶 ~5 行（对齐 Q18 真实分布:
+/// 27.6M bids / 5.29M 组合 ≈ 5.2 行/桶, 唯一率 ~19%）——避免全唯一键的
+/// 高桶密度缓存放大。price 伪随机, 每桶多条 → last 替换 + top 有界插入路径。
+fn last_top_batch(n: usize) -> RecordBatch {
+    // schema 对齐真实 Q18 bid 表: price/bidder/auction/event_time + 4 个 last 度量
+    // 字段（channel/url/dateTime——行字段提取子集的关键成员）。
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+        Field::new("channel", DataType::Int64, true),
+        Field::new("url", DataType::Int64, true),
+        Field::new("dateTime", DataType::Int64, true),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]));
+    let step = 30 * 60 * 1_000_000_000i64 / n as i64; // 30m 跨度
+    let ts: Vec<i64> = (0..n as i64).map(|i| i * step).collect();
+    let price: Vec<i64> = (0..n as i64)
+        .map(|i| (i * 7919 % 1_000_000) + 100)
+        .collect();
+    let channel: Vec<i64> = (0..n as i64).map(|i| (i * 104_729) % 100_000).collect();
+    let url: Vec<i64> = (0..n as i64).map(|i| (i * 15_485_863 % 100_000)).collect();
+    let date_time: Vec<i64> = (0..n as i64).map(|i| i % 1_000_000).collect();
+    // 104729 与 100000 互质 → (i*104729)%100000 与 i%10000 的组合周期 = 100000,
+    // 每组合 5 行（n=500k）——~10 万桶, 对齐 Q18 唯一率
+    let bidder: Vec<i64> = (0..n as i64)
+        .map(|i| ((i * 104_729) % 100_000) + 1)
+        .collect();
+    let auction: Vec<i64> = (0..n as i64).map(|i| (i % 10_000) + 1).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(price)),
+            Arc::new(Int64Array::from(bidder)),
+            Arc::new(Int64Array::from(auction)),
+            Arc::new(Int64Array::from(channel)),
+            Arc::new(Int64Array::from(url)),
+            Arc::new(Int64Array::from(date_time)),
+            Arc::new(TimestampNanosecondArray::from(ts)),
+        ],
+    )
+    .unwrap()
+}
+
+fn keyed_stats_plan(keys: Vec<Expr>, measures: Vec<StatsMeasurePlan>) -> StatsPlan {
+    StatsPlan {
+        window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(1800)),
+        keys,
+        output_shape: StatsOutputShapePlan::Rows,
+        measures,
+        tracked_bind_fields: HashMap::new(),
+    }
+}
+
+fn last_measure(field: &str, label: &str) -> StatsMeasurePlan {
+    StatsMeasurePlan {
+        label: label.into(),
+        source_alias: "b".into(),
+        where_expr: None,
+        agg: StatsAggPlan::Last,
+        field: Some(FieldRef::Qualified("b".into(), field.into())),
+        arg: None,
+    }
+}
+
+fn top_measure(field: &str, label: &str, n: u64) -> StatsMeasurePlan {
+    StatsMeasurePlan {
+        label: label.into(),
+        source_alias: "b".into(),
+        where_expr: None,
+        agg: StatsAggPlan::Top,
+        field: Some(FieldRef::Qualified("b".into(), field.into())),
+        arg: Some(n),
+    }
+}
+
+/// stats last/top 热路径 profile（P5 紧凑化）: 带 key 列式（Q18/Q19 形态）——
+/// 每事件行字段列数组提取 + apply_last_top（last 保留 / top 有界插入）。对比
+/// 同形态 keyed count-only 基线, 量化 last/top 边际成本。
+///
+/// 运行:
+///   cargo test --release -p wf-engine close_bench -- --ignored --nocapture
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine close_bench -- --ignored --nocapture"]
+fn stats_last_top_keyed_profile() {
+    let n = 500_000usize;
+    let batch = last_top_batch(n);
+    // 行字段提取子集 = 生产 spawn 形态（yield ∪ 度量字段, **排除桶键**——
+    // bidder/auction 已由 scope_key 注入 field_values）。Q18 = 4 字段。
+    let subset: Arc<HashSet<String>> = Arc::new(
+        ["price", "channel", "url", "dateTime"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    );
+    let auction_key = Expr::Field(FieldRef::Qualified("b".into(), "auction".into()));
+    let bidder_key = Expr::Field(FieldRef::Qualified("b".into(), "bidder".into()));
+
+    // 基线: keyed count-only（每行 1 次桶哈希, 无行字段提取）
+    let count_plan = keyed_stats_plan(
+        vec![auction_key.clone()],
+        vec![StatsMeasurePlan {
+            label: "n".into(),
+            source_alias: "b".into(),
+            where_expr: None,
+            agg: StatsAggPlan::Count,
+            field: None,
+            arg: None,
+        }],
+    );
+    let start = Instant::now();
+    let mut exec = StatsExecutor::new(count_plan);
+    assert!(exec.process_batch_rows(&batch, None));
+    let count_ns = start.elapsed().as_secs_f64() * 1e9 / n as f64;
+    Report {
+        name: "keyed count(基线)",
+        per_ns: count_ns,
+    }
+    .line(count_ns);
+
+    // 复合键 count-only（隔离: 复合键查找本身 vs 单键基线）
+    let comp_key_count = keyed_stats_plan(
+        vec![bidder_key.clone(), auction_key.clone()],
+        vec![StatsMeasurePlan {
+            label: "n".into(),
+            source_alias: "b".into(),
+            where_expr: None,
+            agg: StatsAggPlan::Count,
+            field: None,
+            arg: None,
+        }],
+    );
+    let start = Instant::now();
+    let mut exec = StatsExecutor::new(comp_key_count);
+    assert!(exec.process_batch_rows(&batch, None));
+    let comp_count_ns = start.elapsed().as_secs_f64() * 1e9 / n as f64;
+    Report {
+        name: "复合键 count",
+        per_ns: comp_count_ns,
+    }
+    .line(count_ns);
+
+    // Q18 形态: 复合键 (bidder, auction) + 4 last 度量
+    let q18_plan = keyed_stats_plan(
+        vec![bidder_key.clone(), auction_key.clone()],
+        vec![
+            last_measure("price", "last_price"),
+            last_measure("channel", "last_channel"),
+            last_measure("url", "last_url"),
+            last_measure("dateTime", "last_dt"),
+        ],
+    );
+    let start = Instant::now();
+    let mut exec = StatsExecutor::with_row_fields(q18_plan.clone(), Some(subset.clone()));
+    assert!(exec.process_batch_rows(&batch, None));
+    let q18_ns = start.elapsed().as_secs_f64() * 1e9 / n as f64;
+    Report {
+        name: "Q18 复合键 4×last",
+        per_ns: q18_ns,
+    }
+    .line(count_ns);
+
+    // Q18 对照: 不排除桶键（6 字段全提取）——量化 spawn「桶键不入行」收益
+    let full_subset: Arc<HashSet<String>> = Arc::new(
+        ["price", "channel", "url", "dateTime", "bidder", "auction"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    );
+    let start = Instant::now();
+    let mut exec = StatsExecutor::with_row_fields(q18_plan.clone(), Some(full_subset));
+    assert!(exec.process_batch_rows(&batch, None));
+    let q18_full_ns = start.elapsed().as_secs_f64() * 1e9 / n as f64;
+    Report {
+        name: "Q18 不排键(6 字段)",
+        per_ns: q18_full_ns,
+    }
+    .line(count_ns);
+
+    // 单键 + 4 last（隔离: 复合键 Pair 盒装与 last 提取分开计）
+    let last4_plan = keyed_stats_plan(
+        vec![auction_key.clone()],
+        vec![
+            last_measure("price", "last_price"),
+            last_measure("channel", "last_channel"),
+            last_measure("url", "last_url"),
+            last_measure("dateTime", "last_dt"),
+        ],
+    );
+    let start = Instant::now();
+    let mut exec = StatsExecutor::with_row_fields(last4_plan, Some(subset.clone()));
+    assert!(exec.process_batch_rows(&batch, None));
+    let last4_ns = start.elapsed().as_secs_f64() * 1e9 / n as f64;
+    Report {
+        name: "单键 4×last",
+        per_ns: last4_ns,
+    }
+    .line(count_ns);
+
+    // Q19 形态: 单键 auction + top(10, price)
+    let q19_plan = keyed_stats_plan(
+        vec![auction_key],
+        vec![top_measure("price", "top_price", 10)],
+    );
+    let start = Instant::now();
+    let mut exec = StatsExecutor::with_row_fields(q19_plan, Some(subset.clone()));
+    assert!(exec.process_batch_rows(&batch, None));
+    let q19_ns = start.elapsed().as_secs_f64() * 1e9 / n as f64;
+    Report {
+        name: "Q19 形态 top(10)",
+        per_ns: q19_ns,
+    }
+    .line(count_ns);
+
+    eprintln!("[close-bench] ---- last/top 热路径汇总（P5 紧凑列数组）----");
+    eprintln!(
+        "[close-bench]   复合键查找 = {:.1} ns/evt; 单键 4×last 边际 = {:.1}; Q18(4 字段) = {:.1}; Q18(不排键 6 字段) = {:.1}（桶键不入行收益 = {:.1}）; Q19 top10 边际 = {:.1}",
+        comp_count_ns - count_ns,
+        last4_ns - count_ns,
+        q18_ns,
+        q18_full_ns,
+        q18_full_ns - q18_ns,
+        q19_ns - count_ns
     );
 }

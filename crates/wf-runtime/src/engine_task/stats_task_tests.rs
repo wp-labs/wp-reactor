@@ -25,6 +25,165 @@ use super::stats_task::StatsTask;
 use super::task_types::StatsTaskConfig;
 use super::tests::{field_str, make_test_fanout, take_alert};
 
+/// Q18/Q19 形状任务（P4 last/top）: 用 price/bidder/auction/event_time schema。
+/// 返回 (task, alert_rx); detail 由调用方给 Expr 决定。
+fn make_ranked_task(
+    keys: Vec<Expr>,
+    measures: Vec<StatsMeasurePlan>,
+    detail: Expr,
+) -> (StatsTask, mpsc::Receiver<crate::alert_task::AlertBatch>) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]));
+    let win = Arc::new(Window::new(
+        WindowParams {
+            name: "bid_events".into(),
+            schema: schema.clone(),
+            time_col_index: Some(3),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        super::tests::test_window_config(usize::MAX),
+    ));
+    let plan = StatsPlan {
+        window_spec: WindowSpec::Fixed(Duration::from_secs(10)),
+        keys,
+        output_shape: StatsOutputShapePlan::Rows,
+        measures: measures.clone(),
+        tracked_bind_fields: HashMap::new(),
+    };
+    let rp = wf_lang::plan::RulePlan {
+        name: "ranked_stats".into(),
+        binds: vec![BindPlan {
+            alias: "b".into(),
+            window: "bid_events".into(),
+            filter: None,
+        }],
+        lets: vec![],
+        match_plan: wf_lang::plan::MatchPlan {
+            keys: vec![],
+            key_map: None,
+            key_join: None,
+            window_spec: WindowSpec::Fixed(Duration::from_secs(10)),
+            event_steps: vec![],
+            close_steps: vec![],
+            close_mode: wf_lang::ast::CloseMode::And,
+            match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
+            seq: None,
+            tracked_bind_aliases: std::collections::HashSet::new(),
+            tracked_bind_fields: HashMap::new(),
+            tracked_plain_fields: std::collections::HashSet::new(),
+            needs_field_history: false,
+        },
+        each_plan: None,
+        stats_plan: Some(plan.clone()),
+        joins: vec![],
+        r#where: None,
+        entity_plan: EntityPlan {
+            entity_type: "digit".into(),
+            entity_id_expr: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![
+                YieldField {
+                    name: "id".into(),
+                    value: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+                },
+                YieldField {
+                    name: "detail".into(),
+                    value: detail,
+                },
+            ],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(10.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+        conv_window: None,
+    };
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    // last/top 行字段提取子集（P5: 生产经 spawn 恒有; 测试用全 schema 字段）——
+    // 无子集时列数组列序不定, 任务层注入需要列名。
+    let row_subset: Option<std::sync::Arc<std::collections::HashSet<String>>> =
+        Some(std::sync::Arc::new(
+            ["price", "bidder", "auction", "event_time"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        ));
+    let config = StatsTaskConfig {
+        stats: StatsExecutor::with_row_fields(plan.clone(), row_subset),
+        executor: RuleExecutor::new(rp),
+        window_sources: vec![super::task_types::WindowSource {
+            window_name: "bid_events".into(),
+            window: Arc::clone(&win),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            aliases: vec!["b".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        router: Arc::new(wf_engine::window::Router::new(
+            wf_engine::window::WindowRegistry::build(vec![]).unwrap(),
+        )),
+        metrics: None,
+        time_field: Some("event_time".into()),
+        timeout_scan_interval: Duration::from_secs(1),
+        intermediate_targets: std::collections::HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        progress: std::collections::HashMap::new(),
+        shard_index: None,
+        shard_count: 1,
+    };
+    let (task, _cancel) = StatsTask::new(config);
+    (task, alert_rx)
+}
+
+/// 带 price/bidder/auction 的批次（q18/q19 任务测试用）。
+fn make_bid_batch(rows: &[(i64, i64, i64)], ts: i64) -> RecordBatch {
+    use arrow::array::Int64Array;
+    let n = rows.len();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("price", DataType::Int64, true),
+            Field::new("bidder", DataType::Int64, true),
+            Field::new("auction", DataType::Int64, true),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| Some(r.0)).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| Some(r.1)).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| Some(r.2)).collect::<Vec<_>>(),
+            )),
+            Arc::new(TimestampNanosecondArray::from(vec![ts; n])),
+        ],
+    )
+    .unwrap()
+}
+
 /// 取回一个 AlertBatch 并展开为全部 record（批量 emit: 一个 close 的多个桶合成
 /// 一批, `take_alert` 只取首条——带 key 多桶断言须用本函数）。
 fn take_alerts(
@@ -956,4 +1115,230 @@ async fn stats_task_empty_key_jump_emits_no_zero_windows() {
         alert_rx.try_recv().is_err(),
         "只有 2 窗——空窗/跳变不得产出全 0 alert"
     );
+}
+
+// ---------------------------------------------------------------------------
+// P4 last/top 任务接线（Q18/Q19）: rich close 每桶多条目 + 行字段注入 yield
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn q18_stats_task_last_bid_fields_injected() {
+    // Q18 形状: group by (bidder, auction), last(price) —— 每键一条 alert,
+    // detail 读最后一条 bid 的 price（行字段经 field_values 注入 yield 的 b.price）。
+    let detail = Expr::FuncCall {
+        qualifier: None,
+        name: "fmt".into(),
+        args: vec![
+            Expr::StringLit("{} {}".into()),
+            Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+            Expr::Field(FieldRef::Qualified("b".into(), "price".into())),
+        ],
+    };
+    let (mut task, mut alert_rx) = make_ranked_task(
+        vec![
+            Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+            Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        ],
+        vec![StatsMeasurePlan {
+            label: "last_price".into(),
+            source_alias: "b".into(),
+            where_expr: None,
+            agg: StatsAggPlan::Last,
+            field: Some(FieldRef::Qualified("b".into(), "price".into())),
+            arg: None,
+        }],
+        detail,
+    );
+    // 同一 (bidder=5, auction=1): 两条 bid, price 100 → 200; last = 200
+    push_batch(
+        &mut task,
+        make_bid_batch(&[(100, 5, 1), (200, 5, 1)], 5_000_000_000),
+        1,
+    )
+    .await;
+    task.flush().await;
+    let alerts = take_alerts(&mut alert_rx);
+    assert_eq!(alerts.len(), 1, "每 (bidder,auction) 一条");
+    assert_eq!(
+        field_str(&alerts[0], "detail"),
+        "5 200",
+        "last bid 的 price"
+    );
+    assert_eq!(field_str(&alerts[0], "id"), "1", "entity = auction");
+}
+
+#[tokio::test]
+async fn q19_stats_task_top_n_emits_per_entry() {
+    // Q19 形状: group by (auction), top(2, price) —— 每 auction 2 条 alert（rank 序）,
+    // detail 读每条目的 bidder + price。
+    let detail = Expr::FuncCall {
+        qualifier: None,
+        name: "fmt".into(),
+        args: vec![
+            Expr::StringLit("{} {}".into()),
+            Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+            Expr::Field(FieldRef::Qualified("b".into(), "price".into())),
+        ],
+    };
+    let (mut task, mut alert_rx) = make_ranked_task(
+        vec![Expr::Field(FieldRef::Qualified(
+            "b".into(),
+            "auction".into(),
+        ))],
+        vec![StatsMeasurePlan {
+            label: "top_price".into(),
+            source_alias: "b".into(),
+            where_expr: None,
+            agg: StatsAggPlan::Top,
+            field: Some(FieldRef::Qualified("b".into(), "price".into())),
+            arg: Some(2),
+        }],
+        detail,
+    );
+    // auction=1 三条 bid: 100, 300, 200 → top-2 = 300(bidder 2), 200(bidder 3)
+    push_batch(
+        &mut task,
+        make_bid_batch(&[(100, 1, 1), (300, 2, 1), (200, 3, 1)], 5_000_000_000),
+        1,
+    )
+    .await;
+    task.flush().await;
+    let alerts = take_alerts(&mut alert_rx);
+    assert_eq!(alerts.len(), 2, "top-2 → 每 auction 2 条 alert");
+    assert_eq!(
+        field_str(&alerts[0], "detail"),
+        "2 300",
+        "rank1: bidder 2 price 300"
+    );
+    assert_eq!(
+        field_str(&alerts[1], "detail"),
+        "3 200",
+        "rank2: bidder 3 price 200"
+    );
+    assert!(alert_rx.try_recv().is_err(), "只有 2 条");
+}
+
+#[tokio::test]
+async fn stats_top_zero_emits_nothing() {
+    // top(0, ...) 边界（P4 review 修复）: 无条目 → 整桶不产出（此前虚假产出
+    // scalar(0.0) 记录）。
+    let detail = Expr::StringLit("x".into());
+    let (mut task, mut alert_rx) = make_ranked_task(
+        vec![Expr::Field(FieldRef::Qualified(
+            "b".into(),
+            "auction".into(),
+        ))],
+        vec![StatsMeasurePlan {
+            label: "top_price".into(),
+            source_alias: "b".into(),
+            where_expr: None,
+            agg: StatsAggPlan::Top,
+            field: Some(FieldRef::Qualified("b".into(), "price".into())),
+            arg: Some(0),
+        }],
+        detail,
+    );
+    push_batch(
+        &mut task,
+        make_bid_batch(&[(100, 1, 1), (300, 2, 1)], 5_000_000_000),
+        1,
+    )
+    .await;
+    task.flush().await;
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "top(0) 无条目 → 整桶不产出, 无 alert"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 窗口判定边界（大 case 定位回归教训: 30m 窗 + 非零 BASE 的桶归属必须在测试
+// 锁定, 不靠 30M 对拍暴露）:
+// 1. 桶起点 = (t/dur)*dur（epoch 对齐, 与事件时间起始值无关）;
+// 2. 两窗口各自归属（Q18/Q19 形态）;
+// 3. 数据未越边界不产出（10m 数据 EMIT=0 是语义而非 bug）;
+// 4. 尾部窗口仅 flush/墙钟关闭。
+// ---------------------------------------------------------------------------
+
+const NEXMARK_BASE_NS: i64 = 1_767_225_600_000_000_000; // 2026-01-01T00:00:00Z
+
+#[tokio::test]
+async fn stats_task_window_bucket_epoch_aligned_large_ts() {
+    // 真实 nexmark BASE_NS 级大时间戳: ts = BASE+25s, 10s 窗 → 窗口
+    // [BASE+20s, BASE+30s), fired_at = BASE+30s —— 桶起点 = (t/dur)*dur,
+    // 不是「首事件时间 + dur」（BASE 非 0 时两者的差会暴露）。
+    let (mut task, mut alert_rx, _p) = make_stats_task();
+    push_batch(
+        &mut task,
+        make_ts_batch(&[("10.0.0.1", NEXMARK_BASE_NS + 25_000_000_000)]),
+        1,
+    )
+    .await;
+    task.flush().await;
+    let alerts = take_alerts(&mut alert_rx);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(
+        field_str(&alerts[0], "__wfu_fired_at"),
+        "2026-01-01T00:00:30.000Z",
+        "窗口 end = bucket(BASE+25s)+10s = BASE+30s"
+    );
+}
+
+#[tokio::test]
+async fn stats_task_two_windows_large_ts_buckets() {
+    // Q18/Q19 形态: 大时间戳下两窗口各自归属。同一批: BASE+25s（窗 1
+    // [BASE+20s,+30s)）与 BASE+32s（窗 2 [BASE+30s,+40s)）; 窗 1 在事件推进中
+    // close（32s 越过 30s 边界）, 窗 2 由 flush 收尾。
+    let (mut task, mut alert_rx, _p) = make_stats_task();
+    push_batch(
+        &mut task,
+        make_ts_batch(&[
+            ("10.0.0.1", NEXMARK_BASE_NS + 25_000_000_000),
+            ("10.0.0.2", NEXMARK_BASE_NS + 32_000_000_000),
+        ]),
+        1,
+    )
+    .await;
+    task.flush().await;
+    let a1 = take_alert(&mut alert_rx);
+    assert_eq!(
+        field_str(&a1, "__wfu_fired_at"),
+        "2026-01-01T00:00:30.000Z",
+        "窗口 1 end"
+    );
+    assert_eq!(
+        field_str(&a1, "detail"),
+        "1 1 1",
+        "窗口 1: total=1 r1=1 uniq=1"
+    );
+    let a2 = take_alert(&mut alert_rx);
+    assert_eq!(
+        field_str(&a2, "__wfu_fired_at"),
+        "2026-01-01T00:00:40.000Z",
+        "窗口 2 end"
+    );
+    assert_eq!(
+        field_str(&a2, "detail"),
+        "1 0 1",
+        "窗口 2: total=1 r1=0 uniq=1"
+    );
+    assert!(alert_rx.try_recv().is_err(), "只有 2 窗");
+}
+
+#[tokio::test]
+async fn stats_task_window_not_closed_until_watermark_crosses() {
+    // 数据 max < window_end → 窗口未到点不产出（10m 数据 span < 30m 窗时
+    // EMIT=0 的语义: 窗口只在事件时间越过边界 close, 否则等 flush/墙钟兜底）。
+    let (mut task, mut alert_rx, _p) = make_stats_task();
+    push_batch(&mut task, make_batch(&["10.0.0.1"], 9_000_000_000), 1).await;
+    assert!(alert_rx.try_recv().is_err(), "9s 未越 10s 边界不产出");
+    // 越过 10s 边界 → 窗口 1 close
+    push_batch(&mut task, make_batch(&["10.0.0.2"], 15_000_000_000), 2).await;
+    let a1 = take_alert(&mut alert_rx);
+    assert_eq!(field_str(&a1, "detail"), "1 1 1", "窗口 1 [0,10)");
+    // 尾部窗口 2 由 flush 关闭
+    task.flush().await;
+    let a2 = take_alert(&mut alert_rx);
+    assert_eq!(field_str(&a2, "detail"), "1 0 1", "窗口 2 [10,20)");
+    assert!(alert_rx.try_recv().is_err(), "只有 2 窗");
 }

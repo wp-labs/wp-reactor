@@ -18,9 +18,14 @@ use crate::metrics::RuntimeMetrics;
 pub const SINK_CHANNEL_CAPACITY: usize = 2048;
 
 /// Max wall time the sink consumers may keep flushing a buffered alert
-/// backlog after cancel before dropping the rest. Matches the rule-task
-/// shutdown drain budget so graceful shutdown stays bounded.
-const SINK_DRAIN_BUDGET: Duration = Duration::from_secs(1);
+/// backlog after cancel before dropping the rest.
+///
+/// 30s（原 1s）: stats 执行器的 close flush 在 shutdown 时构建百万级 alert
+/// （q18 10M ≈ 1.8M 条 ~3s; q19 30M ≈ 8M 条 ~13s）——若 budget 过短, sink
+/// consumer 在 stats flush 投递前退出（drop rx）→ 产出被丢（10M+30m 窗
+/// EMIT=0 根因）。30s 覆盖 stats flush 构建 + 投递 + sink 消费。正常 shutdown
+/// （无 flush 构建）不受影响: 通道 closed / 无数据时 consumer 立即退出。
+const SINK_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 
 /// Resolved delivery fanout: `yield_target → sink senders`.
 ///

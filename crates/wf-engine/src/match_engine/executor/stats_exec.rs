@@ -11,12 +11,14 @@ use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{Expr, FieldRef};
-use wf_lang::plan::{StatsAggPlan, StatsPlan};
+use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsPlan};
 
-use crate::match_engine::Value;
 use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
+use crate::match_engine::event_bridge::extract_field_value;
 use crate::match_engine::match_engine::{Event, ScopeKey, field_ref_name};
+use crate::match_engine::{EngineHashMap, Value};
 use crate::window::scope_key_columnar;
+use crate::window::scope_key_from_column;
 
 // ---------------------------------------------------------------------------
 // 状态结构（v6 §6.1 — 无匹配进度, 纯累加）
@@ -30,6 +32,23 @@ pub struct StatsAccum {
     pub min: Option<i128>,
     pub max: Option<i128>,
     pub distinct_set: Option<HashSet<DistinctKey>>,
+    /// `last(field)` 用（Q18）: 最近合格行的**行字段列数组**（P5 紧凑化——按
+    /// `row_field_names` 列序存储, 缺失/null = `None`; 旧 `EngineHashMap` 每桶
+    /// 6 个 SmolStr key + hash 节点 ≈ 400B+/桶, 5.29M 桶直接顶到 ~19GB）。
+    /// 每次合格行替换（流有序 = 事件时间最新）。**Arc 跨同桶多个 last 度量共享**;
+    /// `Arc<[T]>` 单块分配（Arc 头 + 数组同块, 免 Arc→Box→数组两层间接）。
+    pub last_row: Option<std::sync::Arc<[Option<Value>]>>,
+    /// `top(N, field)` 用（Q19）: 按 key DESC 有序的 top-N 条目（含行字段列数组）。
+    pub top_entries: Option<Vec<TopEntry>>,
+}
+
+/// top-N 条目: 排序键 + 行字段列数组（yield 经 field_values 注入读 `b.*`）。
+#[derive(Debug, Clone)]
+pub struct TopEntry {
+    /// 排序键（数值; 与行式 `value_to_f64` 同口径）。
+    pub key: f64,
+    /// 条目行字段列数组（null 跳过, 与行式 Event 一致; 列序 = `row_field_names`）。
+    pub row: Box<[Option<Value>]>,
 }
 
 /// Distinct key: 从列式原生值构造（i64/timestamp 域内哈希, D7）——
@@ -71,28 +90,107 @@ impl DistinctKey {
 /// 窗口状态: 桶 → 度量累加器数组（索引对齐 `StatsPlan.measures`）。
 /// 空键规则恒单桶（`ScopeKey::Empty` 键, P1 快路径不变）; 带 key（P2）每
 /// `(key 组合)` 一桶。
+///
+/// **复合键优化（P5+）**: 桶表键为**扁平哈希 u64** + 碰撞链 `Vec<StatsBucket>`——
+/// 列式路径每事件只做「栈上叶数组 + 哈希 + 链扫描」, 无每事件 `ScopeKey::Pair`
+/// Box 分配; 完整 `ScopeKey` 仅**每桶首见**时构建一次（Q18: 27.6M → 5.29M 次盒装）。
+/// 哈希为字节级同构 FNV 混合（`scope_key_hash` == `comps_hash`, 行式/列式两路径
+/// 同桶）; 碰撞由链内 `ScopeKey` 完整比较消歧（概率极低, 正确性不受影响）。
 pub struct StatsWindowState {
-    pub buckets: HashMap<ScopeKey, Vec<StatsAccum>>,
+    pub buckets: EngineHashMap<u64, Vec<StatsBucket>>,
     pub window_start_nanos: i64,
     pub last_event_nanos: i64,
     pub event_count: u64,
 }
 
+/// 单桶: 完整 [`ScopeKey`]（close 排序/输出; 每桶一次构建）+ 累加器数组。
+#[derive(Debug, Clone)]
+pub struct StatsBucket {
+    pub scope_key: ScopeKey,
+    pub accs: Vec<StatsAccum>,
+}
+
 impl StatsWindowState {
     fn new(window_start_nanos: i64) -> Self {
         Self {
-            buckets: HashMap::new(),
+            buckets: EngineHashMap::default(),
             window_start_nanos,
             last_event_nanos: 0,
             event_count: 0,
         }
     }
 
-    /// 取/建一个桶的累加器数组（惰性创建）。
+    /// 预建空键单桶（`ScopeKey::Empty`）——哈希路径 `bucket_mut(&Empty)` 命中。
+    fn seed_empty_bucket(buckets: &mut EngineHashMap<u64, Vec<StatsBucket>>, n_measures: usize) {
+        buckets.insert(
+            scope_key_hash(&ScopeKey::Empty),
+            vec![StatsBucket {
+                scope_key: ScopeKey::Empty,
+                accs: vec![StatsAccum::default(); n_measures],
+            }],
+        );
+    }
+
+    /// 取/建一个桶（完整键路径: 行式回退 / 空键规则用）。哈希与列式
+    /// `keyed_bucket_mut` 同值, 链内按 ScopeKey 完整比较消歧。
     fn bucket_mut(&mut self, key: &ScopeKey, n_measures: usize) -> &mut Vec<StatsAccum> {
+        let hash = scope_key_hash(key);
+        let chain = self.buckets.entry(hash).or_default();
+        let pos = chain.iter().position(|b| &b.scope_key == key);
+        match pos {
+            Some(i) => &mut chain[i].accs,
+            None => {
+                chain.push(StatsBucket {
+                    scope_key: key.clone(),
+                    accs: vec![StatsAccum::default(); n_measures],
+                });
+                &mut chain.last_mut().expect("just pushed").accs
+            }
+        }
+    }
+
+    /// 取/建一个桶（列式扁平键路径）: `hash` = 叶数组哈希, `comps` = 栈上叶
+    /// 数组（列序）。链内按 `comps` 与完整键比较消歧; 未命中时构建完整键
+    /// （每桶一次）。
+    fn keyed_bucket_mut(
+        &mut self,
+        hash: u64,
+        comps: &[ScopeKey],
+        n_measures: usize,
+    ) -> &mut Vec<StatsAccum> {
+        let chain = self.buckets.entry(hash).or_default();
+        let pos = chain
+            .iter()
+            .position(|b| comps_match(&b.scope_key, comps, 0, comps.len()));
+        match pos {
+            Some(i) => &mut chain[i].accs,
+            None => {
+                let scope_key = scope_key_from_comps(comps);
+                chain.push(StatsBucket {
+                    scope_key,
+                    accs: vec![StatsAccum::default(); n_measures],
+                });
+                &mut chain.last_mut().expect("just pushed").accs
+            }
+        }
+    }
+
+    /// 按完整键取桶（测试/调试用; 生产走哈希路径）。
+    pub fn find_bucket(&self, key: &ScopeKey) -> Option<&Vec<StatsAccum>> {
         self.buckets
-            .entry(key.clone())
-            .or_insert_with(|| vec![StatsAccum::default(); n_measures])
+            .get(&scope_key_hash(key))
+            .and_then(|chain| chain.iter().find(|b| &b.scope_key == key))
+            .map(|b| &b.accs)
+    }
+
+    /// 清空并拍平全部桶（close 用）: `(ScopeKey, accs)` 按 ScopeKey 升序。
+    fn take_buckets(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+        let mut out: Vec<(ScopeKey, Vec<StatsAccum>)> = std::mem::take(&mut self.buckets)
+            .into_iter()
+            .flat_map(|(_, chain)| chain.into_iter().map(|b| (b.scope_key, b.accs)))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }
 
@@ -108,11 +206,29 @@ pub struct StatsExecutor {
     unique_wheres: Vec<Expr>,
     /// 每度量对应 `unique_wheres` 的索引; `None` = 无条件度量（恒通过）。
     measure_where: Vec<Option<usize>>,
+    /// P5 紧凑化: 子集字段名的**确定排序**（executor 构造时从传入子集排序
+    /// 派生; None = 全列, 列序在提取时确定）。行字段列数组按此列序存储。
+    row_field_names: Option<std::sync::Arc<Vec<String>>>,
+    /// 每度量字段在行字段列数组中的位置（预计算, 热路径免字符串查找;
+    /// last/top 且字段在子集内 → Some, 其余 None）。
+    measure_field_idx: Vec<Option<usize>>,
 }
 
 impl StatsExecutor {
     pub fn new(plan: StatsPlan) -> Self {
-        // 预计算 where 去重映射: 度量 → 唯一条件索引。Expr 纯函数无副作用,
+        Self::with_row_fields(plan, None)
+    }
+
+    /// 指定 last/top 行字段提取子集（None = 全部 schema 列）。
+    ///
+    /// **生产路径（spawn）恒传子集**——`None` 仅测试/缺省: 无子集时列数组列序
+    /// 在提取时确定（行式行键排序/列式 schema 排序）, `measure_field_idx` 无法
+    /// 构造期预计算, last/top 的**度量值**在标量/close 路径退化为 0.0（行字段
+    /// 仍保留, 注入需任务层另行约定列序）。Q18/Q19 类规则必须传子集。
+    pub fn with_row_fields(
+        plan: StatsPlan,
+        row_fields: Option<std::sync::Arc<HashSet<String>>>,
+    ) -> Self {
         // 同表达式对同行的求值结果一致, 可安全共享（设计 §6.2 段1c 的行式对应）。
         let mut unique_wheres: Vec<Expr> = Vec::new();
         let mut measure_where: Vec<Option<usize>> = Vec::with_capacity(plan.measures.len());
@@ -128,11 +244,26 @@ impl StatsExecutor {
                 },
             }
         }
+        // P5: 子集字段名确定排序（列数组的列序）+ 每度量字段位置（last/top 热
+        // 路径零查找）。`None` 子集 = 全列（列序在提取时确定, 见文档注释）。
+        let row_field_names = row_fields.as_ref().map(|s| {
+            let mut names: Vec<String> = s.iter().cloned().collect();
+            names.sort(); // 确定性列序（对拍契约: 同 plan 恒同序）
+            std::sync::Arc::new(names)
+        });
+        let measure_field_idx = plan
+            .measures
+            .iter()
+            .map(|m| match (&m.field, &row_field_names) {
+                (Some(fr), Some(names)) => names.iter().position(|n| n == field_name(fr)),
+                _ => None,
+            })
+            .collect();
         let n = plan.measures.len();
         // 空键规则预建 Empty 桶（快路径; 带 key 惰性建桶）。
-        let mut buckets = HashMap::new();
+        let mut buckets = EngineHashMap::default();
         if plan.keys.is_empty() {
-            buckets.insert(ScopeKey::Empty, vec![StatsAccum::default(); n]);
+            StatsWindowState::seed_empty_bucket(&mut buckets, n);
         }
         Self {
             plan,
@@ -145,6 +276,8 @@ impl StatsExecutor {
             watermark_nanos: 0,
             unique_wheres,
             measure_where,
+            row_field_names,
+            measure_field_idx,
         }
     }
 
@@ -165,6 +298,11 @@ impl StatsExecutor {
         // where 结果缓存: 行间复用 buffer（无逐行分配）; 无 where 规则时保持空。
         let mut where_ok: Vec<bool> = Vec::with_capacity(self.unique_wheres.len());
         let n_measures = self.plan.measures.len();
+        let has_row_measures = self
+            .plan
+            .measures
+            .iter()
+            .any(|m| matches!(m.agg, StatsAggPlan::Last | StatsAggPlan::Top));
         for row in rows {
             where_ok.clear();
             if !self.unique_wheres.is_empty() {
@@ -185,6 +323,23 @@ impl StatsExecutor {
             let Some(bucket_key) = eval_row_key(&self.plan.keys, row) else {
                 continue;
             };
+            // 行字段列名（P5）: 子集 → 直接用; None → 本行键排序（仅测试/缺省,
+            // 生产恒有子集）。last/top 度量才需计算。
+            let row_names: Option<Box<[String]>> = if has_row_measures {
+                match &self.row_field_names {
+                    Some(ns) => Some(ns.as_slice().into()),
+                    None => {
+                        let mut keys: Vec<String> = row.keys().cloned().collect();
+                        keys.sort();
+                        Some(keys.into_boxed_slice())
+                    }
+                }
+            } else {
+                None
+            };
+            // 行字段列数组懒提取（每行一次, 多 last/top 度量共享同一 Arc——与
+            // accumulate_keyed_row 的 row_cache 对齐）。
+            let mut row_cache: Option<std::sync::Arc<[Option<Value>]>> = None;
             let bucket = self.window.bucket_mut(&bucket_key, n_measures);
             for (idx, measure) in self.plan.measures.iter().enumerate() {
                 if let Some(wi) = self.measure_where[idx]
@@ -226,14 +381,40 @@ impl StatsExecutor {
                                     .insert(key);
                             }
                             StatsAggPlan::Last | StatsAggPlan::Top => {
-                                // P1 不实现（Q18/Q19 扩展）
+                                // 行式路径: 按 row_names 列序提取（与列式
+                                // row_fields_from_batch 对齐; 同桶多 last 度量 Arc
+                                // 共享 1 份内存）。
+                                let row = row_cache.get_or_insert_with(|| {
+                                    row_fields_from_row(row, row_names.as_deref())
+                                });
+                                let fidx = measure_field_position(
+                                    &self.plan,
+                                    &self.measure_field_idx,
+                                    idx,
+                                    row_names.as_deref(),
+                                );
+                                apply_last_top(acc, measure, row, fidx);
                             }
+                        }
+                    } else if matches!(measure.agg, StatsAggPlan::Last | StatsAggPlan::Top) {
+                        // 字段缺失: last 仍保留整行（yield 读其它字段）, top 无键跳过
+                        if measure.agg == StatsAggPlan::Last {
+                            let row = row_cache.get_or_insert_with(|| {
+                                row_fields_from_row(row, row_names.as_deref())
+                            });
+                            acc.last_row = Some(std::sync::Arc::clone(row));
                         }
                     }
                 }
             }
             self.window.event_count += 1;
         }
+    }
+
+    /// last/top 行字段列名（列数组列序; `None` = 无子集且未定——任务层仅在
+    /// 生产子集路径使用）。
+    pub fn row_field_names(&self) -> Option<&std::sync::Arc<Vec<String>>> {
+        self.row_field_names.as_ref()
     }
 
     /// 计算最终度量值（空键兼容: 取单桶; 带 key 用 by_bucket 版本）。
@@ -246,16 +427,47 @@ impl StatsExecutor {
     }
 
     /// 按桶的最终度量值（桶序 = ScopeKey 升序, 确定性输出对拍契约; avg 由
-    /// sum/count 求得, D6）。
+    /// sum/count 求得, D6）。标量访问器——last 取字段数值, top 为多值不适用
+    /// （用 [`Self::close_window_by_bucket_rows`]）。
     pub fn final_measure_values_by_bucket(&self) -> Vec<(ScopeKey, Vec<f64>)> {
         let mut buckets: Vec<(ScopeKey, Vec<f64>)> = self
             .window
             .buckets
             .iter()
-            .map(|(k, accs)| (k.clone(), measure_values(&self.plan, accs)))
+            .flat_map(|(_, chain)| chain.iter())
+            .map(|b| {
+                (
+                    b.scope_key.clone(),
+                    measure_values(&self.plan, &b.accs, &self.measure_field_idx),
+                )
+            })
             .collect();
         buckets.sort_by(|a, b| a.0.cmp(&b.0));
         buckets
+    }
+
+    /// 按桶 close 输出（rich 版, last/top 用; 标量计划同样适用）: 每桶每度量一个
+    /// 值列表——标量恒 1 条目, `top` 产生 N 条目（rank 序, key DESC）。
+    /// 条目携带行字段（last/top 的整行）, 供 yield 经 field_values 读 `b.*`。
+    /// 桶序 = ScopeKey 升序; 同时清空窗口状态。
+    pub fn close_window_by_bucket_rows(&mut self) -> Vec<StatsCloseBucket> {
+        let buckets = self.window.take_buckets();
+        let out: Vec<StatsCloseBucket> = buckets
+            .into_iter()
+            .map(|(key, accs)| StatsCloseBucket {
+                key,
+                measures: self
+                    .plan
+                    .measures
+                    .iter()
+                    .zip(accs.iter())
+                    .zip(self.measure_field_idx.iter())
+                    .map(|((m, acc), fidx)| bucket_measure_entries(m, acc, *fidx))
+                    .collect(),
+            })
+            .collect();
+        self.reset_window();
+        out
     }
 
     /// 窗口 close: 冻结当前值（空键单桶）, 清空状态。
@@ -274,9 +486,9 @@ impl StatsExecutor {
 
     fn reset_window(&mut self) {
         let n = self.plan.measures.len();
-        let mut buckets = HashMap::new();
+        let mut buckets = EngineHashMap::default();
         if self.plan.keys.is_empty() {
-            buckets.insert(ScopeKey::Empty, vec![StatsAccum::default(); n]);
+            StatsWindowState::seed_empty_bucket(&mut buckets, n);
         }
         self.window = StatsWindowState {
             buckets,
@@ -341,10 +553,52 @@ impl StatsExecutor {
             .iter()
             .map(|e| eval_guard_columnar(e, &view))
             .collect();
+        // 行字段列名（P5）: 子集 → 直接用; None → 排序的 schema 字段名（与行式
+        // None 同序, 任务层注入同序）。仅 last/top 计划需要。
+        let has_row_measures = self
+            .plan
+            .measures
+            .iter()
+            .any(|m| matches!(m.agg, StatsAggPlan::Last | StatsAggPlan::Top));
+        let row_names: Option<Box<[String]>> = if has_row_measures {
+            match &self.row_field_names {
+                Some(ns) => Some(ns.as_slice().into()),
+                None => {
+                    let mut ns: Vec<String> = batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().to_string())
+                        .collect();
+                    ns.sort();
+                    Some(ns.into_boxed_slice())
+                }
+            }
+        } else {
+            None
+        };
+        // 行字段列索引（P5+ 优化: 每批预解析一次, 免逐行 schema.index_of）
+        let row_field_cols: Option<Box<[Option<usize>]>> = row_names.as_deref().map(|ns| {
+            ns.iter()
+                .map(|n| batch.schema().index_of(n).ok())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
         // 带 key（P2）: 逐行按桶归并（mask 列式 + 桶键列式, 无解释器 eval）。
         // 空键保持整列归并快路径（P1.5）。
         if !self.plan.keys.is_empty() {
-            return self.process_batch_keyed(batch, &masks, &key_cols, n, rows);
+            // 键列类型每批预解析一次（免逐行 downcast_ref 分派）
+            let key_columns = resolve_key_columns(batch, &key_cols);
+            return self.process_batch_keyed(
+                batch,
+                &masks,
+                &key_cols,
+                &key_columns,
+                n,
+                rows,
+                row_names.as_deref(),
+                row_field_cols.as_deref(),
+            );
         }
         // 段 1d: 纯归并度量整列累加。行式语义: 满足 where 的行对**每个**度量都
         // `count += 1`（在字段读取前）——avg 的 count 必须与 sum 同步累加,
@@ -386,22 +640,44 @@ impl StatsExecutor {
                 }
             }
         }
-        // 段 2: distinct 行式段（原生列值按 mask 过滤插入）
+        // 段 2: distinct/last/top 行式段（原生列值按 mask 过滤; last/top 提取
+        // 行字段供 yield 注入）
         for (idx, measure) in self.plan.measures.iter().enumerate() {
-            if !matches!(measure.agg, StatsAggPlan::DistinctCount) {
+            if !matches!(
+                measure.agg,
+                StatsAggPlan::DistinctCount | StatsAggPlan::Last | StatsAggPlan::Top
+            ) {
                 continue;
             }
-            let Some(field) = &measure.field else {
-                continue;
-            };
             let mask = combine_masks(
                 domain.as_ref(),
                 self.measure_where[idx].map(|wi| &masks[wi]),
             );
             let acc = &mut self.window.bucket_mut(&ScopeKey::Empty, n_measures)[idx];
-            let set = acc.distinct_set.get_or_insert_with(HashSet::new);
-            if !insert_distinct_column(batch, field_name(field), mask.as_ref(), set) {
-                return false;
+            if matches!(measure.agg, StatsAggPlan::DistinctCount) {
+                let Some(field) = &measure.field else {
+                    continue;
+                };
+                let set = acc.distinct_set.get_or_insert_with(HashSet::new);
+                if !insert_distinct_column(batch, field_name(field), mask.as_ref(), set) {
+                    return false;
+                }
+            } else {
+                // last/top: 逐行按 mask 更新（子集行字段提取; 空键 last 规则少用）
+                let iter: Box<dyn Iterator<Item = usize>> = match mask.as_ref() {
+                    Some(m) => Box::new((0..n).filter(|&r| m.value(r))),
+                    None => Box::new(0..n),
+                };
+                for r in iter {
+                    let row = row_fields_from_batch(batch, r, row_field_cols.as_deref());
+                    let fidx = measure_field_position(
+                        &self.plan,
+                        &self.measure_field_idx,
+                        idx,
+                        row_names.as_deref(),
+                    );
+                    apply_last_top(acc, measure, &row, fidx);
+                }
             }
         }
         self.window.event_count += rows.map_or(n as u64, |rs| rs.len() as u64);
@@ -420,8 +696,11 @@ impl StatsExecutor {
         batch: &RecordBatch,
         masks: &[BooleanArray],
         key_cols: &[usize],
+        key_columns: &[KeyColumn<'_>],
         n: usize,
         rows: Option<&[u32]>,
+        row_names: Option<&[String]>,
+        row_field_cols: Option<&[Option<usize>]>,
     ) -> bool {
         let n_measures = self.plan.measures.len();
         match rows {
@@ -430,12 +709,30 @@ impl StatsExecutor {
                     if (r as usize) >= n {
                         continue; // 防御: 越界行号（与 materialize_rows 一致跳过）
                     }
-                    self.accumulate_keyed_row(batch, masks, key_cols, r as usize, n_measures);
+                    self.accumulate_keyed_row(
+                        batch,
+                        masks,
+                        key_cols,
+                        key_columns,
+                        r as usize,
+                        n_measures,
+                        row_names,
+                        row_field_cols,
+                    );
                 }
             }
             None => {
                 for row in 0..n {
-                    self.accumulate_keyed_row(batch, masks, key_cols, row, n_measures);
+                    self.accumulate_keyed_row(
+                        batch,
+                        masks,
+                        key_cols,
+                        key_columns,
+                        row,
+                        n_measures,
+                        row_names,
+                        row_field_cols,
+                    );
                 }
             }
         }
@@ -448,60 +745,126 @@ impl StatsExecutor {
     /// 字段读取走**原生列值**（`column_i128`/`column_distinct_key`）——与空键
     /// 列式段同精度（D7/D8: ≥2^53 的 Int64 不得经 `Value::Number(f64)` 舍入;
     /// Timestamp 列 distinct 也走原生 i64, 不得静默跳过）。
+    ///
+    /// **复合键优化（P5+）**: 键数 ≤ 4 走扁平键路径——栈上叶数组（`key_column_comp`
+    /// 预解析列, 无 Box 分配/无逐行 downcast）→ `comps_hash` → `keyed_bucket_mut`
+    /// （链扫描, `ScopeKey` 仅每桶首见构建一次）; 键数 > 4 回退完整键
+    /// `scope_key_columnar`（罕见）。
     fn accumulate_keyed_row(
         &mut self,
         batch: &RecordBatch,
         masks: &[BooleanArray],
         key_cols: &[usize],
+        key_columns: &[KeyColumn<'_>],
         row: usize,
         n_measures: usize,
+        row_names: Option<&[String]>,
+        row_field_cols: Option<&[Option<usize>]>,
     ) {
+        const MAX_STACK_KEYS: usize = 4;
+        if key_columns.len() <= MAX_STACK_KEYS {
+            let mut comps: [ScopeKey; MAX_STACK_KEYS] = std::array::from_fn(|_| ScopeKey::Empty);
+            for (i, kc) in key_columns.iter().enumerate() {
+                let Some(c) = key_column_comp(kc, batch, row) else {
+                    return; // 键 null → 跳过
+                };
+                comps[i] = c;
+            }
+            let comps = &comps[..key_columns.len()];
+            let hash = comps_hash(comps);
+            let bucket = self.window.keyed_bucket_mut(hash, comps, n_measures);
+            accumulate_column_row(
+                bucket,
+                &self.plan,
+                &self.measure_where,
+                &self.measure_field_idx,
+                row_names,
+                row_field_cols,
+                batch,
+                masks,
+                row,
+            );
+            return;
+        }
         let Some(key) = scope_key_columnar(batch, key_cols, row) else {
             return; // 键 null → 跳过
         };
         let bucket = self.window.bucket_mut(&key, n_measures);
-        for (idx, measure) in self.plan.measures.iter().enumerate() {
-            if let Some(wi) = self.measure_where[idx]
-                && !masks[wi].value(row)
-            {
-                continue;
+        accumulate_column_row(
+            bucket,
+            &self.plan,
+            &self.measure_where,
+            &self.measure_field_idx,
+            row_names,
+            row_field_cols,
+            batch,
+            masks,
+            row,
+        );
+    }
+}
+
+/// 单行桶累加主体（列式路径; 自由函数——调用点持有 `&mut self.window` 桶借用,
+/// 方法会整 self 借用冲突）。
+///
+/// last/top 行字段每行懒提取一次, 多度量共享同一 Arc（Q18 4 个 last 度量内存
+/// 1 份; 提取列序 = row_names, 免整行 8 字段）。
+fn accumulate_column_row(
+    bucket: &mut Vec<StatsAccum>,
+    plan: &StatsPlan,
+    measure_where: &[Option<usize>],
+    measure_field_idx: &[Option<usize>],
+    row_names: Option<&[String]>,
+    row_field_cols: Option<&[Option<usize>]>,
+    batch: &RecordBatch,
+    masks: &[BooleanArray],
+    row: usize,
+) {
+    let mut row_cache: Option<std::sync::Arc<[Option<Value>]>> = None;
+    for (idx, measure) in plan.measures.iter().enumerate() {
+        if let Some(wi) = measure_where[idx]
+            && !masks[wi].value(row)
+        {
+            continue;
+        }
+        let acc = &mut bucket[idx];
+        acc.count += 1;
+        let Some(field) = &measure.field else {
+            continue;
+        };
+        match measure.agg {
+            StatsAggPlan::Count => {}
+            StatsAggPlan::Sum | StatsAggPlan::Avg => {
+                if let Some(nn) = column_i128(batch, field_name(field), row) {
+                    acc.sum_i128 += nn;
+                }
             }
-            let acc = &mut bucket[idx];
-            acc.count += 1;
-            let Some(field) = &measure.field else {
-                continue;
-            };
-            match measure.agg {
-                StatsAggPlan::Count => {}
-                StatsAggPlan::Sum | StatsAggPlan::Avg => {
-                    if let Some(nn) = column_i128(batch, field_name(field), row) {
-                        acc.sum_i128 += nn;
-                    }
+            StatsAggPlan::Min => {
+                if let Some(nn) = column_i128(batch, field_name(field), row) {
+                    acc.min = Some(match acc.min {
+                        Some(m) if m <= nn => m,
+                        _ => nn,
+                    });
                 }
-                StatsAggPlan::Min => {
-                    if let Some(nn) = column_i128(batch, field_name(field), row) {
-                        acc.min = Some(match acc.min {
-                            Some(m) if m <= nn => m,
-                            _ => nn,
-                        });
-                    }
+            }
+            StatsAggPlan::Max => {
+                if let Some(nn) = column_i128(batch, field_name(field), row) {
+                    acc.max = Some(match acc.max {
+                        Some(m) if m >= nn => m,
+                        _ => nn,
+                    });
                 }
-                StatsAggPlan::Max => {
-                    if let Some(nn) = column_i128(batch, field_name(field), row) {
-                        acc.max = Some(match acc.max {
-                            Some(m) if m >= nn => m,
-                            _ => nn,
-                        });
-                    }
+            }
+            StatsAggPlan::DistinctCount => {
+                if let Some(k) = column_distinct_key(batch, field_name(field), row) {
+                    acc.distinct_set.get_or_insert_with(HashSet::new).insert(k);
                 }
-                StatsAggPlan::DistinctCount => {
-                    if let Some(k) = column_distinct_key(batch, field_name(field), row) {
-                        acc.distinct_set.get_or_insert_with(HashSet::new).insert(k);
-                    }
-                }
-                StatsAggPlan::Last | StatsAggPlan::Top => {
-                    // P1 不实现（Q18/Q19 扩展）
-                }
+            }
+            StatsAggPlan::Last | StatsAggPlan::Top => {
+                let row = row_cache
+                    .get_or_insert_with(|| row_fields_from_batch(batch, row, row_field_cols));
+                let fidx = measure_field_position(plan, measure_field_idx, idx, row_names);
+                apply_last_top(acc, measure, row, fidx);
             }
         }
     }
@@ -519,10 +882,363 @@ fn field_name(fr: &FieldRef) -> &str {
     }
 }
 
+/// 度量字段在行字段列数组中的位置: 子集模式走构造期预计算; 无子集按
+/// `names` 名查（last/top 且字段在列内 → Some, 其余 None）。
+/// 自由函数而非方法: 调用点同时持有 `&mut self.window` 的桶借用, 方法会整
+/// self 借用冲突; 自由函数只借 `plan` + `measure_field_idx` 两字段。
+fn measure_field_position(
+    plan: &StatsPlan,
+    measure_field_idx: &[Option<usize>],
+    idx: usize,
+    names: Option<&[String]>,
+) -> Option<usize> {
+    match measure_field_idx[idx] {
+        Some(i) => Some(i),
+        None => match (&plan.measures[idx].field, names) {
+            (Some(f), Some(ns)) => ns.iter().position(|n| n == field_name(f)),
+            _ => None,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 键列预解析（P5+ 优化: 每批一次类型分派, 免逐行 `downcast_ref`）
+// ---------------------------------------------------------------------------
+//
+// `fanout::scope_key_from_column` 每行每键重复做 `col.data_type()` match +
+// `downcast_ref` 动态分派（Q18 双键 × 27.6M 行）。此处每批解析一次键列类型为
+// `KeyColumn`（借用 batch 列数组）, 逐行直接 `is_null` + `value`——规范化与
+// `scope_key_from_column` 完全一致（Int64/Timestamp → Int, Float64 → 规范化位,
+// Utf8 → Str, Boolean → Str "true"/"false"）; 不支持类型回退 `Other`。
+
+enum KeyColumn<'a> {
+    Int64(&'a Int64Array),
+    Timestamp(&'a arrow::array::TimestampNanosecondArray),
+    Float64(&'a Float64Array),
+    Utf8(&'a StringArray),
+    Boolean(&'a BooleanArray),
+    /// 其它类型 → 逐行回退 `scope_key_from_column`（罕见）。
+    Other(usize),
+}
+
+fn resolve_key_columns<'a>(batch: &'a RecordBatch, key_cols: &[usize]) -> Vec<KeyColumn<'a>> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    key_cols
+        .iter()
+        .map(|&ci| {
+            let col = batch.column(ci);
+            match col.data_type() {
+                DataType::Int64 => col
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .map(KeyColumn::Int64)
+                    .unwrap_or(KeyColumn::Other(ci)),
+                DataType::Timestamp(TimeUnit::Nanosecond, _) => col
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                    .map(KeyColumn::Timestamp)
+                    .unwrap_or(KeyColumn::Other(ci)),
+                DataType::Float64 => col
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .map(KeyColumn::Float64)
+                    .unwrap_or(KeyColumn::Other(ci)),
+                DataType::Utf8 => col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .map(KeyColumn::Utf8)
+                    .unwrap_or(KeyColumn::Other(ci)),
+                DataType::Boolean => col
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .map(KeyColumn::Boolean)
+                    .unwrap_or(KeyColumn::Other(ci)),
+                _ => KeyColumn::Other(ci),
+            }
+        })
+        .collect()
+}
+
+/// 从预解析键列读单行叶键（null → None; 规范化与 `scope_key_from_column` 同）。
+fn key_column_comp<'a>(
+    col: &KeyColumn<'a>,
+    batch: &'a RecordBatch,
+    row: usize,
+) -> Option<ScopeKey> {
+    match col {
+        KeyColumn::Int64(a) => {
+            if a.is_null(row) {
+                None
+            } else {
+                Some(ScopeKey::Int(a.value(row)))
+            }
+        }
+        KeyColumn::Timestamp(a) => {
+            if a.is_null(row) {
+                None
+            } else {
+                Some(ScopeKey::Int(a.value(row)))
+            }
+        }
+        KeyColumn::Float64(a) => {
+            if a.is_null(row) {
+                None
+            } else {
+                Some(scope_key_from_f64(a.value(row)))
+            }
+        }
+        KeyColumn::Utf8(a) => {
+            if a.is_null(row) {
+                None
+            } else {
+                Some(ScopeKey::Str(a.value(row).into()))
+            }
+        }
+        KeyColumn::Boolean(a) => {
+            if a.is_null(row) {
+                None
+            } else {
+                Some(ScopeKey::Str(
+                    if a.value(row) { "true" } else { "false" }.into(),
+                ))
+            }
+        }
+        KeyColumn::Other(ci) => scope_key_from_column(batch, *ci, row),
+    }
+}
+
+/// f64 → 键叶（与 `ScopeKey::from_value(Number)` 同规范化: 整数 <2^53 → Int,
+/// 否则 Float(规范化位)）。
+fn scope_key_from_f64(n: f64) -> ScopeKey {
+    if n.fract() == 0.0 && n.abs() < TWO_POW_53 {
+        ScopeKey::Int(n as i64)
+    } else {
+        ScopeKey::Float(canonical_f64_bits(n))
+    }
+}
+
+/// 规范化 f64 位（0.0 → +0.0, NaN → canonical NaN; 与 key.rs 同口径）。
+fn canonical_f64_bits(n: f64) -> u64 {
+    if n == 0.0 {
+        0.0f64.to_bits()
+    } else if n.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        n.to_bits()
+    }
+}
+
+/// <2^53 的整数可被 f64 精确表示（与 `ScopeKey::from_value` 一致）。
+const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
+
+// ---------------------------------------------------------------------------
+// 复合键扁平哈希（P5+ 优化）
+// ---------------------------------------------------------------------------
+//
+// 桶表键 = 扁平键的 FNV 式混合 u64。`comps_hash`（列式叶数组）与
+// `scope_key_hash`（行式完整树）字节级同构——同一逻辑键两种路径产出同值
+// （`stats_composite_key_hash_flat_matches_tree` 锁定）; 碰撞链内以完整键比较
+// 消歧。混合风格与 `key.rs::scope_key_shard_index` 一致（确定性, 无随机种子）。
+
+const KEY_HASH_BASE: u64 = 0xcbf2_9ce4_8422_2325;
+
+fn mix_byte(hash: &mut u64, b: u8) {
+    *hash ^= u64::from(b);
+    *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+}
+
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        mix_byte(hash, b);
+    }
+}
+
+/// 完整 `ScopeKey` 树哈希（行式路径）——与 `key.rs::scope_key_shard_index`
+/// 同字节序列（tag + 嵌套 payload, Pair 以 0x1f 分隔）。pub(crate) 供
+/// 哈希同构契约测试。
+pub(crate) fn scope_key_hash(key: &ScopeKey) -> u64 {
+    let mut h = KEY_HASH_BASE;
+    let tag = match key {
+        ScopeKey::Empty => 0u8,
+        ScopeKey::Int(_) => 1,
+        ScopeKey::Float(_) => 2,
+        ScopeKey::Str(_) => 3,
+        ScopeKey::Pair(_, _) => 4,
+    };
+    mix_byte(&mut h, tag);
+    nested_key_bytes(&mut h, key);
+    h
+}
+
+fn nested_key_bytes(h: &mut u64, key: &ScopeKey) {
+    match key {
+        ScopeKey::Empty => {}
+        ScopeKey::Int(v) => hash_bytes(h, &v.to_ne_bytes()),
+        ScopeKey::Float(bits) => hash_bytes(h, &bits.to_ne_bytes()),
+        ScopeKey::Str(s) => hash_bytes(h, s.as_bytes()),
+        ScopeKey::Pair(a, b) => {
+            nested_key_bytes(h, a);
+            mix_byte(h, 0x1f);
+            nested_key_bytes(h, b);
+        }
+    }
+}
+
+/// 叶数组（列式扁平键）哈希——**字节级镜像** `scope_key_hash` 的树字节序列:
+/// 仅最外层 Pair tag（内层叶只 payload, 与嵌套树一致——内层类型歧义由碰撞链
+/// 完整比较消歧）; N-1 个 0x1f 分隔。同逻辑键两路径产出同值（契约测试锁定）。
+/// pub(crate) 供哈希同构契约测试。
+pub(crate) fn comps_hash(comps: &[ScopeKey]) -> u64 {
+    let mut h = KEY_HASH_BASE;
+    let n = comps.len();
+    match n {
+        0 => {}
+        1 => mix_leaf(&mut h, &comps[0], true), // 顶层单叶: tag + payload
+        _ => {
+            mix_byte(&mut h, 4); // 顶层 Pair tag（仅最外层 mix tag）
+            for (i, c) in comps.iter().enumerate() {
+                mix_leaf(&mut h, c, false); // 内层叶只 payload
+                if i + 1 < n {
+                    mix_byte(&mut h, 0x1f);
+                }
+            }
+        }
+    }
+    h
+}
+
+/// 叶字节混入: `with_tag` = 顶层叶（mix 类型 tag）; 内层叶仅 payload。
+fn mix_leaf(h: &mut u64, c: &ScopeKey, with_tag: bool) {
+    match c {
+        ScopeKey::Int(v) => {
+            if with_tag {
+                mix_byte(h, 1);
+            }
+            hash_bytes(h, &v.to_ne_bytes());
+        }
+        ScopeKey::Float(bits) => {
+            if with_tag {
+                mix_byte(h, 2);
+            }
+            hash_bytes(h, &bits.to_ne_bytes());
+        }
+        ScopeKey::Str(s) => {
+            if with_tag {
+                mix_byte(h, 3);
+            }
+            hash_bytes(h, s.as_bytes());
+        }
+        _ => unreachable!("comps 只含叶变体"),
+    }
+}
+
+/// 左深 Pair 树与叶数组比较（列式命中校验）: `comps[start..end]` 是否被
+/// `scope` 完全匹配。右叶恒为单键, 与 `comps[end-1]` 直接相等比较。
+fn comps_match(scope: &ScopeKey, comps: &[ScopeKey], start: usize, end: usize) -> bool {
+    match scope {
+        ScopeKey::Empty => start == end,
+        ScopeKey::Int(_) | ScopeKey::Float(_) | ScopeKey::Str(_) => {
+            start + 1 == end && comps.get(start) == Some(scope)
+        }
+        ScopeKey::Pair(l, r) => {
+            if start >= end {
+                return false;
+            }
+            comps.get(end - 1) == Some(r.as_ref()) && comps_match(l, comps, start, end - 1)
+        }
+    }
+}
+
+/// 叶数组 → 完整 `ScopeKey`（左深 Pair 链; 每桶一次, 建桶时）。
+/// pub(crate) 供哈希同构契约测试。
+pub(crate) fn scope_key_from_comps(comps: &[ScopeKey]) -> ScopeKey {
+    let mut acc: Option<ScopeKey> = None;
+    for c in comps {
+        acc = Some(match acc {
+            None => c.clone(),
+            Some(prev) => ScopeKey::Pair(Box::new(prev), Box::new(c.clone())),
+        });
+    }
+    acc.unwrap_or(ScopeKey::Empty)
+}
+
 fn value_to_i128(v: &Value) -> Option<i128> {
     match v {
         Value::Number(n) => Some(*n as i128),
         _ => None,
+    }
+}
+
+fn value_to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// last/top 行更新（Q18/Q19, 非归并状态）:
+/// - `last`: 最近合格行的行字段列数组替换（流有序 = 事件时间最新, 权威 Q18
+///   ORDER BY dateTime DESC）; 同桶多 last 度量共享同一 Arc（内存 1 份）。
+/// - `top`: 按 key DESC 插入有界 top-N（同 key 先到者优先——流有序下的确定性
+///   tie-break, 权威 Q19 未指定平局顺序）。
+///
+/// `field_idx` = 度量字段在行字段列数组中的位置（P5 预计算, 免字符串查找）;
+/// `None` = 字段不在子集/无字段 → top 无键跳过, last 仍保留行。
+fn apply_last_top(
+    acc: &mut StatsAccum,
+    measure: &StatsMeasurePlan,
+    row: &std::sync::Arc<[Option<Value>]>,
+    field_idx: Option<usize>,
+) {
+    match measure.agg {
+        StatsAggPlan::Last => {
+            acc.last_row = Some(std::sync::Arc::clone(row));
+        }
+        StatsAggPlan::Top => {
+            let Some(key) = field_idx
+                .and_then(|i| row.get(i))
+                .and_then(|v| v.as_ref())
+                .and_then(value_to_f64)
+            else {
+                return; // 非数值键 → 跳过（与 sum 跳过非数值一致）
+            };
+            let n = measure.arg.unwrap_or(10) as usize;
+            if n == 0 {
+                return; // top(0, ...): 不保留任何条目
+            }
+            let entries = acc.top_entries.get_or_insert_with(Vec::new);
+            // 快速淘汰: 已满且 key 进不了前 N（≤ 当前最小）→ 跳过。同 key 新条目
+            // 必插在既有同 key 条目之后（先到者在前）, 满时必被截断——跳过后语义
+            // 不变, 免去每事件整行克隆（Q19 绝大部分 bid 低于当前 top-10 门槛）。
+            if entries.len() == n && key <= entries[n - 1].key {
+                return;
+            }
+            // Arc<[T]> 深拷贝为独立 Box（top 条目各自的行, 不共享）
+            insert_top(entries, key, row.as_ref().to_vec().into_boxed_slice(), n);
+        }
+        _ => {}
+    }
+}
+
+/// top-N 插入: key DESC 有序保留前 N; 同 key 新条目插在已有同 key 条目之后
+/// （先到者在前）。n=0 时清空（top(0, ...) 边界）。
+fn insert_top(entries: &mut Vec<TopEntry>, key: f64, row: Box<[Option<Value>]>, n: usize) {
+    if n == 0 {
+        return;
+    }
+    // 快速淘汰: 已满且 key 进不了前 N（≤ 当前最小）→ 跳过。同 key 新条目必插在
+    // 既有同 key 条目之后（先到者在前）, 满时必被截断——跳过后语义不变, 免去
+    // 每事件整行克隆（Q19 绝大部分 bid 低于当前 top-10 门槛）。
+    if entries.len() == n && key <= entries[n - 1].key {
+        return;
+    }
+    let pos = entries
+        .iter()
+        .position(|e| key > e.key)
+        .unwrap_or(entries.len());
+    entries.insert(pos, TopEntry { key, row });
+    if entries.len() > n {
+        entries.truncate(n);
     }
 }
 
@@ -540,11 +1256,18 @@ fn value_to_distinct_key(v: &Value) -> DistinctKey {
 // ---------------------------------------------------------------------------
 
 /// 由 `plan.measures` + 桶累加器计算度量值（avg 输出时 sum/count, D6）。
-fn measure_values(plan: &StatsPlan, accs: &[StatsAccum]) -> Vec<f64> {
+/// last 取字段数值（非数值 → 0; 无子集时 idx 未知 → 0, 标量访问器需子集）;
+/// top 为多值不适用, 返回 0（rich close 用）。
+fn measure_values(
+    plan: &StatsPlan,
+    accs: &[StatsAccum],
+    measure_field_idx: &[Option<usize>],
+) -> Vec<f64> {
     plan.measures
         .iter()
         .zip(accs.iter())
-        .map(|(m, acc)| match m.agg {
+        .zip(measure_field_idx.iter())
+        .map(|((m, acc), fidx)| match m.agg {
             StatsAggPlan::Count => acc.count as f64,
             StatsAggPlan::Sum => acc.sum_i128 as f64,
             StatsAggPlan::Avg => {
@@ -557,9 +1280,89 @@ fn measure_values(plan: &StatsPlan, accs: &[StatsAccum]) -> Vec<f64> {
             StatsAggPlan::Min => acc.min.unwrap_or(0) as f64,
             StatsAggPlan::Max => acc.max.unwrap_or(0) as f64,
             StatsAggPlan::DistinctCount => acc.distinct_set.as_ref().map_or(0, HashSet::len) as f64,
-            StatsAggPlan::Last | StatsAggPlan::Top => 0.0,
+            StatsAggPlan::Last => match (&acc.last_row, fidx) {
+                (Some(row), Some(i)) => row
+                    .get(*i)
+                    .and_then(|v| v.as_ref())
+                    .and_then(value_to_f64)
+                    .unwrap_or(0.0),
+                _ => 0.0,
+            },
+            StatsAggPlan::Top => 0.0,
         })
         .collect()
+}
+
+/// 每桶输出条目: 度量值 + 可选行字段列数组（last/top 注入 yield 用; 标量 =
+/// None）。行字段为 Arc（与状态共享, close 零拷贝; 构造 alert 时才逐值克隆）。
+/// 列序 = `StatsExecutor::row_field_names()`（None 子集 = schema 列序）。
+#[derive(Debug, Clone)]
+pub struct StatsCloseEntry {
+    pub measure_value: f64,
+    pub row_fields: Option<std::sync::Arc<[Option<Value>]>>,
+}
+
+/// 每桶 close 输出: 每度量一个值列表（标量 = 1; top = N, 按 rank 序）。
+#[derive(Debug, Clone)]
+pub struct StatsCloseBucket {
+    pub key: ScopeKey,
+    pub measures: Vec<Vec<StatsCloseEntry>>,
+}
+
+/// 单个度量的 close 条目列表（标量 = 1; last = 1 带行字段列数组; top = N 带行
+/// 字段列数组）。行字段为 Arc（与状态共享, close 零拷贝; 构造 alert 时才逐值
+/// 克隆）。`field_idx` = 该度量字段在列数组中的位置（P5 预计算）。
+fn bucket_measure_entries(
+    m: &StatsMeasurePlan,
+    acc: &StatsAccum,
+    field_idx: Option<usize>,
+) -> Vec<StatsCloseEntry> {
+    let scalar = |value: f64| StatsCloseEntry {
+        measure_value: value,
+        row_fields: None,
+    };
+    match m.agg {
+        StatsAggPlan::Count => vec![scalar(acc.count as f64)],
+        StatsAggPlan::Sum => vec![scalar(acc.sum_i128 as f64)],
+        StatsAggPlan::Avg => vec![scalar(if acc.count == 0 {
+            0.0
+        } else {
+            acc.sum_i128 as f64 / acc.count as f64
+        })],
+        StatsAggPlan::Min => vec![scalar(acc.min.unwrap_or(0) as f64)],
+        StatsAggPlan::Max => vec![scalar(acc.max.unwrap_or(0) as f64)],
+        StatsAggPlan::DistinctCount => {
+            vec![scalar(
+                acc.distinct_set.as_ref().map_or(0, HashSet::len) as f64
+            )]
+        }
+        StatsAggPlan::Last => {
+            let value = match (&acc.last_row, field_idx) {
+                (Some(row), Some(i)) => row
+                    .get(i)
+                    .and_then(|v| v.as_ref())
+                    .and_then(value_to_f64)
+                    .unwrap_or(0.0),
+                _ => 0.0,
+            };
+            vec![StatsCloseEntry {
+                measure_value: value,
+                row_fields: acc.last_row.clone(),
+            }]
+        }
+        StatsAggPlan::Top => match &acc.top_entries {
+            Some(entries) if !entries.is_empty() => entries
+                .iter()
+                .map(|e| StatsCloseEntry {
+                    measure_value: e.key,
+                    row_fields: Some(std::sync::Arc::from(e.row.clone())),
+                })
+                .collect(),
+            // 空条目（top(0, ...) 或全部非数值键）: 不产出——n_records 由其它
+            // 度量驱动; 全是 top 时整桶不产出（与 CEP 无实例无输出一致）。
+            _ => vec![],
+        },
+    }
 }
 
 /// 行式桶键（复合键: 逐 key 求值 → Pair 组合）。任一 key 缺失/不可求值 → None。
@@ -640,6 +1443,73 @@ fn bucket_unit_nanos(expr: &Expr) -> Option<i64> {
 /// 边界升序; `v < bounds[0]` → 0, `< bounds[1]` → 1, ..., 否则 `bounds.len()`。
 fn tier_index(v: f64, bounds: &[f64]) -> i64 {
     bounds.iter().position(|b| v < *b).unwrap_or(bounds.len()) as i64
+}
+
+/// 行式 last/top 行字段提取（与列式 [`row_fields_from_batch`] 对齐, P5 紧凑化）:
+/// 按 `names` 列序返回 `Box<[Option<Value>]>`（缺失 = `None`）。`None` = 全列,
+/// 行键**排序**（确定性; 仅测试/缺省——生产经 spawn 恒有子集）。
+fn row_fields_from_row(
+    row: &HashMap<String, Value>,
+    names: Option<&[String]>,
+) -> std::sync::Arc<[Option<Value>]> {
+    let vals: Vec<Option<Value>> = match names {
+        Some(ns) => ns.iter().map(|n| row.get(n).cloned()).collect(),
+        None => {
+            let mut keys: Vec<&String> = row.keys().collect();
+            keys.sort();
+            keys.into_iter().map(|k| row.get(k).cloned()).collect()
+        }
+    };
+    std::sync::Arc::from(vals) // 单块分配: Arc 头 + 数组同块
+}
+
+/// 从 batch 行提取字段列数组（last/top 列式路径用, P5 紧凑化）: 按 `cols`
+/// （每字段列索引, 每批预解析一次——免逐行 `schema.index_of`）提取, null/缺失 =
+/// `None`。`cols = None` 时全部 schema 列按字段名**排序**（与行式 None 同序——
+/// 行键 == schema 字段时两路径列序一致; 测试/缺省路径）。
+fn row_fields_from_batch(
+    batch: &RecordBatch,
+    row: usize,
+    cols: Option<&[Option<usize>]>,
+) -> std::sync::Arc<[Option<Value>]> {
+    let schema = batch.schema();
+    let mut fields: Vec<Option<Value>> = Vec::with_capacity(cols.map_or(0, |c| c.len()));
+    match cols {
+        Some(cols) => {
+            for ci in cols {
+                let v = match ci {
+                    Some(ci) => {
+                        let col = batch.column(*ci);
+                        if col.is_null(row) {
+                            None
+                        } else {
+                            extract_field_value(schema.field(*ci), col.as_ref(), row)
+                        }
+                    }
+                    None => None, // 字段缺失 → None
+                };
+                fields.push(v);
+            }
+        }
+        None => {
+            let mut names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            names.sort();
+            for name in names {
+                let col_idx = schema.index_of(name).expect("schema 字段必存在");
+                let col = batch.column(col_idx);
+                if col.is_null(row) {
+                    fields.push(None);
+                } else {
+                    fields.push(extract_field_value(
+                        schema.field(col_idx),
+                        col.as_ref(),
+                        row,
+                    ));
+                }
+            }
+        }
+    }
+    std::sync::Arc::from(fields) // 单块分配: Arc 头 + 数组同块
 }
 
 /// 从 batch 列读单行原生数值（Int64 原生 i64 → i128, 不走 f64——D8: ≥2^53 的

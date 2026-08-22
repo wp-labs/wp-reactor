@@ -15,6 +15,8 @@ use wf_engine::window::{
     EvictionGate, Evictor, Router, RulePush, WINDOW_CHANNEL_DEPTH, WindowAppendReport,
     WindowMailbox, WindowMsg, WindowRegistry, run_window_actor,
 };
+use wf_lang::ast::Expr;
+use wf_lang::plan::RulePlan;
 
 /// Bounded capacity of each rule push channel (a channel carries whole batches
 /// of parsed events, `Arc<Vec<Arc<Event>>>`). A full channel blocks the
@@ -233,6 +235,75 @@ pub(super) fn spawn_evictor_task(
 /// The task acks `seq + 1` per processed batch; time-based eviction only
 /// removes batches every live consumer has acked, so sweeps can no longer
 /// drop unconsumed data.
+/// stats last/top（P4, Q18/Q19）的行字段提取子集: yield/entity 引用字段 ∪ 度量
+/// 字段。桶键字段不入行（close 已单独注入 scope_key）。`None` = 全部 schema 列
+/// （计划无 last/top 时无需提取——`None` 让执行器跳过整行提取）。
+fn stats_row_fields(
+    plan: &RulePlan,
+    stats_plan: &wf_lang::plan::StatsPlan,
+) -> Option<std::sync::Arc<HashSet<String>>> {
+    let has_row_measures = stats_plan.measures.iter().any(|m| {
+        matches!(
+            m.agg,
+            wf_lang::plan::StatsAggPlan::Last | wf_lang::plan::StatsAggPlan::Top
+        )
+    });
+    if !has_row_measures {
+        return None;
+    }
+    let mut fields = HashSet::new();
+    for f in &plan.yield_plan.fields {
+        collect_expr_field_names(&f.value, &mut fields);
+    }
+    collect_expr_field_names(&plan.entity_plan.entity_id_expr, &mut fields);
+    collect_expr_field_names(&plan.score_plan.expr, &mut fields);
+    for m in &stats_plan.measures {
+        if let Some(fr) = &m.field {
+            let n = wf_engine::match_engine::field_ref_name(fr);
+            if !n.is_empty() {
+                fields.insert(n.to_string());
+            }
+        }
+    }
+    // 桶键字段不入行（P5+ 优化: close 已从 scope_key 注入 field_values, 行字段
+    // 重复存一份纯属浪费——Q18 键 bidder/auction 去掉后子集 6 → 4 字段, 提取量
+    // 与内存 -33%）。只排除简单字段键; 函数键（tier/bucket）yield 不直接读。
+    // 注意: 若 last/top 度量字段恰为桶键（如 last(b.auction)）, 其度量值会退化
+    // 0.0——yield 读 b.auction 仍经 scope_key 注入, 实际输出不受影响。
+    for k in &stats_plan.keys {
+        if let Expr::Field(fr) = k {
+            let n = wf_engine::match_engine::field_ref_name(fr);
+            if !n.is_empty() {
+                fields.remove(&n.to_string());
+            }
+        }
+    }
+    Some(std::sync::Arc::new(fields))
+}
+
+/// 表达式内全部字段名（stats 规则无 join, 所有引用均属 `b` 别名）。
+fn collect_expr_field_names(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Field(fr) => {
+            let n = wf_engine::match_engine::field_ref_name(fr);
+            if !n.is_empty() {
+                out.insert(n.to_string());
+            }
+        }
+        Expr::BinOp { left, right, .. } => {
+            collect_expr_field_names(left, out);
+            collect_expr_field_names(right, out);
+        }
+        Expr::FuncCall { args, .. } => {
+            for a in args {
+                collect_expr_field_names(a, out);
+            }
+        }
+        Expr::Neg(inner) => collect_expr_field_names(inner, out),
+        _ => {}
+    }
+}
+
 fn register_progress(
     router: &Arc<Router>,
     window_sources: &[WindowSource],
@@ -293,7 +364,13 @@ pub(super) fn spawn_rule_tasks(
                 // 分片（P2）: 桶键全为简单字段（fanout 分片按字段）且 shard_count>1
                 // → 按键分片多任务（同 key 同片, 片内桶不跨片拆分）; 空键/含函数键
                 // → 单实例。
-                let stats = wf_engine::match_engine::StatsExecutor::new(stats_plan.clone());
+                // last/top（P4, Q18/Q19）: 行字段提取子集 = yield/entity 引用字段 ∪
+                // 度量字段——Q18 5.29M 桶 × 整行 8 字段会到 ~19GB, 子集可降 4× 以上。
+                let row_fields = stats_row_fields(rule.executor.plan(), &stats_plan);
+                let stats = wf_engine::match_engine::StatsExecutor::with_row_fields(
+                    stats_plan.clone(),
+                    row_fields.clone(),
+                );
                 let field_keys: Vec<FieldRef> = stats
                     .plan
                     .keys
@@ -328,7 +405,10 @@ pub(super) fn spawn_rule_tasks(
                         };
                         let progress = register_progress(router, &window_sources);
                         let task_config = StatsTaskConfig {
-                            stats: wf_engine::match_engine::StatsExecutor::new(stats_plan.clone()),
+                            stats: wf_engine::match_engine::StatsExecutor::with_row_fields(
+                                stats_plan.clone(),
+                                row_fields.clone(),
+                            ),
                             executor: rule.executor.clone(),
                             window_sources: window_sources.clone(),
                             sink_fanout: Arc::clone(&sink_fanout),
@@ -1263,6 +1343,109 @@ mod tests {
         assert_eq!(
             source_param_to_json("0.0.0.0"),
             serde_json::json!("0.0.0.0")
+        );
+    }
+
+    #[test]
+    fn stats_row_fields_excludes_key_fields() {
+        // P5+ 优化: 桶键字段不入行（close 已从 scope_key 注入 field_values）——
+        // Q18 键 bidder/auction 从行字段子集排除, 即使 yield/entity 也引用它们。
+        use std::collections::HashMap;
+        use wf_lang::ast::{CloseMode, FieldRef, MatchMode};
+        use wf_lang::plan::{
+            BindPlan, EntityPlan, MatchPlan, ScorePlan, StatsAggPlan, StatsMeasurePlan,
+            StatsOutputShapePlan, StatsPlan, WindowSpec, YieldField, YieldPlan,
+        };
+
+        let stats_plan = StatsPlan {
+            window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(1800)),
+            keys: vec![
+                wf_lang::ast::Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+                wf_lang::ast::Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+            ],
+            output_shape: StatsOutputShapePlan::Rows,
+            measures: vec![StatsMeasurePlan {
+                label: "last_price".into(),
+                source_alias: "b".into(),
+                where_expr: None,
+                agg: StatsAggPlan::Last,
+                field: Some(FieldRef::Qualified("b".into(), "price".into())),
+                arg: None,
+            }],
+            tracked_bind_fields: HashMap::new(),
+        };
+        let plan = super::RulePlan {
+            name: "q18".into(),
+            binds: vec![BindPlan {
+                alias: "b".into(),
+                window: "bid_events".into(),
+                filter: None,
+            }],
+            lets: vec![],
+            match_plan: MatchPlan {
+                keys: vec![],
+                key_map: None,
+                key_join: None,
+                window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(10)),
+                event_steps: vec![],
+                close_steps: vec![],
+                close_mode: CloseMode::And,
+                match_mode: MatchMode::Seq,
+                accu: false,
+                seq: None,
+                tracked_bind_aliases: std::collections::HashSet::new(),
+                tracked_bind_fields: HashMap::new(),
+                tracked_plain_fields: std::collections::HashSet::new(),
+                needs_field_history: false,
+            },
+            each_plan: None,
+            stats_plan: Some(stats_plan.clone()),
+            joins: vec![],
+            r#where: None,
+            entity_plan: EntityPlan {
+                entity_type: "digit".into(),
+                entity_id_expr: wf_lang::ast::Expr::Field(FieldRef::Qualified(
+                    "b".into(),
+                    "auction".into(),
+                )),
+            },
+            yield_plan: YieldPlan {
+                target: "alerts".into(),
+                version: None,
+                fields: vec![
+                    YieldField {
+                        name: "id".into(),
+                        value: wf_lang::ast::Expr::Field(FieldRef::Qualified(
+                            "b".into(),
+                            "auction".into(),
+                        )),
+                    },
+                    YieldField {
+                        name: "detail".into(),
+                        value: wf_lang::ast::Expr::Field(FieldRef::Qualified(
+                            "b".into(),
+                            "bidder".into(),
+                        )),
+                    },
+                ],
+            },
+            score_plan: ScorePlan {
+                expr: wf_lang::ast::Expr::Number(1.0),
+            },
+            pattern_origin: None,
+            conv_plan: None,
+            limits_plan: None,
+            conv_window: None,
+        };
+        let row_fields = super::stats_row_fields(&plan, &stats_plan).expect("last 度量应产出子集");
+        assert!(row_fields.contains("price"), "度量字段保留");
+        assert!(
+            !row_fields.contains("bidder"),
+            "桶键不入行（即使 yield 引用）"
+        );
+        assert!(
+            !row_fields.contains("auction"),
+            "桶键不入行（即使 entity/yield 引用）"
         );
     }
 }

@@ -21,13 +21,13 @@ use tokio_util::sync::CancellationToken;
 
 use wf_engine::alert::{AlertColumnBatch, AlertColumnBuilder};
 use wf_engine::match_engine::{
-    CloseOutput, CloseReason, RuleExecutor, ScopeKey, StatsExecutor, StepData,
-    batch_event_time_nanos_at, batch_time_col_index, batch_to_events, field_ref_name,
+    CloseOutput, CloseReason, EngineHashMap, RuleExecutor, ScopeKey, StatsExecutor, StepData,
+    Value, batch_event_time_nanos_at, batch_time_col_index, batch_to_events, field_ref_name,
     materialize_rows,
 };
 use wf_engine::window::{Router, RulePush};
 use wf_lang::ast::{CloseMode, Expr};
-use wf_lang::plan::WindowSpec;
+use wf_lang::plan::{StatsAggPlan, WindowSpec};
 
 use crate::alert_task::SinkFanout;
 use crate::error::RuntimeResult;
@@ -36,6 +36,11 @@ use crate::metrics::RuntimeMetrics;
 use super::TASK_SEQ;
 use super::task_types::{StatsTaskConfig, WindowSource};
 use super::{register_notifications, wait_any};
+
+/// 分块 emit 阈值（P5+ q19 close 峰值优化）: builder 累计达该条数即投递并重建。
+/// 100 万条/批——投递仍批量（非逐条, 不引入 §9.9 前的逐桶 await 回压）, 但
+/// 单次构建峰值从全窗口（q19 30M ≈ 7.94M 条）降到阈值量级。
+const EMIT_CHUNK: usize = 1_000_000;
 
 /// stats 任务: 消费批次 → 归并 → 固定窗口 close → alert。
 pub(super) struct StatsTask {
@@ -348,7 +353,6 @@ impl StatsTask {
         if self.stats.window.event_count == 0 {
             return;
         }
-        let buckets = self.stats.close_window_by_bucket();
         let labels: Vec<String> = self
             .stats
             .plan
@@ -367,57 +371,71 @@ impl StatsTask {
             })
             .collect();
         let lookup = super::window_lookup::RegistryLookup::new(&self.router);
-        // **批量 emit**（Q12/Q16/Q17 改进）: 逐桶构建 record, 按 yield_target 合并
-        // 进同一 AlertColumnBatch, 每窗口一次投递——消除 per-bucket 顺序 await 的
-        // sink 回压（旧路径每桶 try_send/send, 桶多时通道满后阻塞整条归并循环;
-        // 实测 debug sink 下 5.6× 退化: Q12 30M 2.66M→14.9M EPS）。
-        // 桶序 = ScopeKey 升序, 同桶序写入同一 batch, 输出顺序不变。
+        // **批量 emit**: 逐桶/逐条目 record 按 yield_target 合并进同一
+        // AlertColumnBatch, 每窗口一次投递（消除 per-record await 回压）。
         let mut builders: HashMap<Arc<str>, AlertColumnBuilder> = HashMap::new();
-        for (scope_key, values) in buckets {
-            let close = build_stats_close_output(
-                self.rule_name(),
-                &values,
-                &labels,
-                window_start,
-                window_end,
-                &scope_key,
-                &key_fields,
-            );
-            match self.executor.execute_close_with_joins(&close, &lookup) {
-                Ok(Some(record)) => {
-                    if let Some(metrics) = &self.metrics {
-                        metrics.inc_alert_emitted_total(&record.rule_name);
-                    }
-                    if self.intermediate_targets.contains(&*record.yield_target) {
-                        // P1: stats → 中间流（pipe）为后续扩展; 先记录丢弃
-                        wf_debug!(pipe,
-                            task_id = %self.task_id,
-                            rule = %record.rule_name,
-                            target = %record.yield_target,
-                            output_kind = "intermediate",
-                            "stats intermediate output not yet supported (P2)"
-                        );
-                        continue;
-                    }
-                    let builder = builders
-                        .entry(Arc::clone(&record.yield_target))
-                        .or_insert_with(|| {
-                            AlertColumnBuilder::new(Arc::clone(&record.yield_target))
-                        });
-                    if let Err(e) = builder.append_record(&record) {
-                        wf_warn!(pipe, rule = %record.rule_name, error = %e, "stats alert serialize failed");
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    wf_warn!(pipe,
-                        task_id = %self.task_id,
-                        rule = %self.rule_name(),
-                        phase = "stats_close",
-                        error = %e,
-                        "stats alert build failed"
+        // rich 路径（last/top, Q18/Q19）: 每桶每度量一个值列表, top 产生 N 条目
+        // （rank 序）→ 每条目一条 alert, 行字段注入 yield 的 `b.*`。
+        let has_row_measures = self
+            .stats
+            .plan
+            .measures
+            .iter()
+            .any(|m| matches!(m.agg, StatsAggPlan::Last | StatsAggPlan::Top));
+        if has_row_measures {
+            // 行字段列名（P5 紧凑化: 列数组按此列序存储; 生产经 spawn 恒有子集）
+            let row_names = self.stats.row_field_names().cloned();
+            for bucket in self.stats.close_window_by_bucket_rows() {
+                let n_records = bucket.measures.iter().map(Vec::len).max().unwrap_or(1);
+                for k in 0..n_records {
+                    // 空条目度量（如 top(0) 无产出）安全读取: 越界/空 → 0.0/None,
+                    // 否则取 min(k, len-1) 的携带语义（标量跨 top 条目重复）。
+                    let values: Vec<f64> = bucket
+                        .measures
+                        .iter()
+                        .map(|m| {
+                            m.get(usize::min(k, m.len().saturating_sub(1)))
+                                .map_or(0.0, |e| e.measure_value)
+                        })
+                        .collect();
+                    let row_fields: Vec<Option<&std::sync::Arc<[Option<Value>]>>> = bucket
+                        .measures
+                        .iter()
+                        .map(|m| {
+                            m.get(usize::min(k, m.len().saturating_sub(1)))
+                                .and_then(|e| e.row_fields.as_ref())
+                        })
+                        .collect();
+                    let close = build_stats_close_output(
+                        self.rule_name(),
+                        &values,
+                        &labels,
+                        &row_fields,
+                        row_names.as_deref().map(|v| v.as_slice()),
+                        window_start,
+                        window_end,
+                        &bucket.key,
+                        &key_fields,
                     );
+                    self.emit_close_record(&close, &lookup, &mut builders).await;
                 }
+            }
+        } else {
+            // 标量快路径（Q12/16/17 原样）: 每桶 1 条
+            let none_rows: Vec<Option<&std::sync::Arc<[Option<Value>]>>> = vec![None; labels.len()];
+            for (scope_key, values) in self.stats.close_window_by_bucket() {
+                let close = build_stats_close_output(
+                    self.rule_name(),
+                    &values,
+                    &labels,
+                    &none_rows,
+                    None,
+                    window_start,
+                    window_end,
+                    &scope_key,
+                    &key_fields,
+                );
+                self.emit_close_record(&close, &lookup, &mut builders).await;
             }
         }
         for (target, mut builder) in builders {
@@ -426,6 +444,60 @@ impl StatsTask {
             }
             let batch = builder.finish();
             self.dispatch_columns(&target, batch).await;
+        }
+    }
+
+    /// 单条 CloseOutput → record → 批量 builder（指标计数 + 中间流丢弃 + append）。
+    ///
+    /// **分块 emit（P5+）**: builder 达到 [`EMIT_CHUNK`] 条立即投递并重建——
+    /// 避免一次性构建全窗口 alert 的峰值内存（q19 30M close 7.94M 条一次构建
+    /// RSS 23GB; 分块后峰值 ≈ 阈值 × 条均 + sink 在途缓冲）。投递仍是批量
+    /// （100 万条/批, 非逐条）, 不引入 §9.9 修复前的逐桶 await 回压。
+    async fn emit_close_record(
+        &self,
+        close: &CloseOutput,
+        lookup: &super::window_lookup::RegistryLookup<'_>,
+        builders: &mut HashMap<Arc<str>, AlertColumnBuilder>,
+    ) {
+        match self.executor.execute_close_with_joins(close, lookup) {
+            Ok(Some(record)) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.inc_alert_emitted_total(&record.rule_name);
+                }
+                if self.intermediate_targets.contains(&*record.yield_target) {
+                    // P1: stats → 中间流（pipe）为后续扩展; 先记录丢弃
+                    wf_debug!(pipe,
+                        task_id = %self.task_id,
+                        rule = %record.rule_name,
+                        target = %record.yield_target,
+                        output_kind = "intermediate",
+                        "stats intermediate output not yet supported (P2)"
+                    );
+                    return;
+                }
+                let target = Arc::clone(&record.yield_target);
+                let builder = builders
+                    .entry(Arc::clone(&target))
+                    .or_insert_with(|| AlertColumnBuilder::new(Arc::clone(&target)));
+                if let Err(e) = builder.append_record(&record) {
+                    wf_warn!(pipe, rule = %record.rule_name, error = %e, "stats alert serialize failed");
+                }
+                if builder.len() >= EMIT_CHUNK {
+                    let batch = builder.finish();
+                    self.dispatch_columns(&target, batch).await;
+                    builders.remove(&target);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                wf_warn!(pipe,
+                    task_id = %self.task_id,
+                    rule = %self.rule_name(),
+                    phase = "stats_close",
+                    error = %e,
+                    "stats alert build failed"
+                );
+            }
         }
     }
 
@@ -541,20 +613,22 @@ fn batch_max_time(batch: &RecordBatch, time_field: Option<&str>) -> i64 {
 /// 合成 CloseOutput（fixed 窗口）: close_step_data = 每 measure 一个 StepData;
 /// 带 key 时桶键拆解为 `scope_key`, 键字段值注入首个 StepData 的 field_values
 /// （yield 读分组键字段; build_eval_context 的 narrow/all 分支都注入字段）。
+/// `row_fields`（每度量一个, last/top 用）: 行字段列数组按 `row_names` 列序展开
+/// 注入其所在度量的 StepData——yield 经 field_values 读 `b.*`（如 Q18 最后一条
+/// bid 的 price/channel; P5 紧凑化: 列数组而非 HashMap, 列序 = 提取同序）。
 fn build_stats_close_output(
     rule_name: &str,
     values: &[f64],
     labels: &[String],
+    row_fields: &[Option<&std::sync::Arc<[Option<Value>]>>],
+    row_names: Option<&[String]>,
     window_start: i64,
     window_end: i64,
     scope_key: &ScopeKey,
     key_fields: &[String],
 ) -> CloseOutput {
     let scope_values = scope_key_to_values(scope_key);
-    let mut first_field_values = wf_engine::match_engine::EngineHashMap::<
-        String,
-        Vec<wf_engine::match_engine::Value>,
-    >::default();
+    let mut first_field_values = EngineHashMap::<String, Vec<Value>>::default();
     if !key_fields.is_empty() {
         for (kf, kv) in key_fields.iter().zip(scope_values.iter()) {
             first_field_values.insert(kf.clone(), vec![kv.clone()]);
@@ -564,18 +638,32 @@ fn build_stats_close_output(
         .iter()
         .zip(labels.iter())
         .enumerate()
-        .map(|(i, (v, label))| StepData {
-            satisfied_branch_index: 0,
-            label: Some(label.clone()),
-            measure_value: *v,
-            event_first_time_nanos: Some(window_start),
-            event_last_time_nanos: Some(window_end),
-            collected_values: vec![],
-            field_values: if i == 0 {
+        .map(|(i, (v, label))| {
+            // 键字段注入首个 StepData; last/top 行字段列数组（P5 紧凑化）按
+            // row_names 列序展开注入其所在度量 StepData——yield 读 `b.*`。
+            let mut fv = if i == 0 {
                 first_field_values.clone()
             } else {
-                Default::default()
-            },
+                EngineHashMap::default()
+            };
+            if let (Some(names), Some(row)) = (row_names, row_fields.get(i).copied().flatten()) {
+                for (pos, val) in row.iter().enumerate() {
+                    if let Some(v) = val
+                        && let Some(name) = names.get(pos)
+                    {
+                        fv.insert(name.clone(), vec![v.clone()]);
+                    }
+                }
+            }
+            StepData {
+                satisfied_branch_index: 0,
+                label: Some(label.clone()),
+                measure_value: *v,
+                event_first_time_nanos: Some(window_start),
+                event_last_time_nanos: Some(window_end),
+                collected_values: vec![],
+                field_values: fv,
+            }
         })
         .collect();
     CloseOutput {
