@@ -8,6 +8,9 @@ pub mod provider;
 mod registry;
 mod router;
 
+#[cfg(test)]
+mod tests;
+
 pub use actor::{
     WINDOW_CHANNEL_DEPTH, WindowAppendReport, WindowMailbox, WindowMsg, acquire_window_budget,
     run_window_actor,

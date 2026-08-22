@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use wf_config::MetricsConfig;
 use wf_engine::window::{EvictReport, RouteReport};
 
+#[cfg(test)]
+mod coverage_extra;
 mod sampling;
 mod server;
 #[cfg(test)]

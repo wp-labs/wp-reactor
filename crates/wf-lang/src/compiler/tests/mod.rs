@@ -8,6 +8,7 @@ use crate::wfl_parser::parse_wfl;
 
 mod basic;
 mod coverage_extra;
+mod coverage_more;
 mod edge;
 mod join_family;
 mod keys_entity;

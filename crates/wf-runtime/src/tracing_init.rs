@@ -412,3 +412,7 @@ mod tests {
         assert_eq!(d, "info");
     }
 }
+
+#[cfg(test)]
+#[path = "tracing_init_coverage.rs"]
+mod tracing_init_coverage;

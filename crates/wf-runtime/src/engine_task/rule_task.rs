@@ -3486,3 +3486,7 @@ mod pipe_stager_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "rule_task_coverage.rs"]
+mod rule_task_coverage;

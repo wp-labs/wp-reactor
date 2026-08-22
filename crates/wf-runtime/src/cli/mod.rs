@@ -7,6 +7,9 @@ use orion_error::report::DiagnosticReport;
 
 pub mod error;
 
+#[cfg(test)]
+mod tests;
+
 use crate::error::RuntimeError;
 use crate::lifecycle::Reactor;
 use crate::tracing_init::init_tracing;

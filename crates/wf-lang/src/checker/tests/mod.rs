@@ -1,6 +1,7 @@
 mod contracts;
 mod conv;
 mod coverage_extra;
+mod coverage_more;
 mod edge_cases;
 mod func_params;
 mod joins_family;

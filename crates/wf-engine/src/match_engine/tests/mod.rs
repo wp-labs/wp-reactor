@@ -10,6 +10,7 @@ mod deferred_bench;
 mod deferred_join;
 mod each_bench;
 mod eval_coverage;
+mod event_bridge_coverage;
 mod guard_bench;
 mod helpers;
 mod interval_bench;

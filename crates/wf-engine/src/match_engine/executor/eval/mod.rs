@@ -7,6 +7,8 @@ use crate::match_engine::match_engine::{
 };
 
 mod builtins;
+#[cfg(test)]
+mod coverage_extra;
 mod step_data;
 #[cfg(test)]
 mod tests;

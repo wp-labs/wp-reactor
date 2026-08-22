@@ -789,3 +789,7 @@ async fn run_stats_pull_loop(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "stats_task_coverage.rs"]
+mod stats_task_coverage;

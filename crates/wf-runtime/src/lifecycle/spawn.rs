@@ -1468,3 +1468,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "spawn_coverage.rs"]
+mod spawn_coverage;

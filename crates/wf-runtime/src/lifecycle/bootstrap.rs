@@ -643,3 +643,7 @@ mod tests {
         assert!(pipe.schema.fields().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "bootstrap_coverage.rs"]
+mod bootstrap_coverage;

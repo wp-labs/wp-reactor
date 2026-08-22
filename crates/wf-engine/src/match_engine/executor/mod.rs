@@ -16,6 +16,10 @@ pub use each_exec::EachDirectBatchStats;
 pub use stats_exec::{DistinctKey, StatsAccum, StatsExecutor, StatsWindowState};
 
 #[cfg(test)]
+mod coverage_extra;
+#[cfg(test)]
+mod stats_coverage_extra;
+#[cfg(test)]
 mod stats_exec_test;
 #[cfg(test)]
 mod stats_exec_wiring_test;
