@@ -97,7 +97,35 @@ stats<30m:fixed> {
 | `d09fdb0` | 步骤② 计划层: StatsPlan 编译 |
 | `8b68e8a` | 步骤③ 执行层核心: StatsExecutor（count/distinct/sum/avg/min/max） |
 
-## 5. 下一步（步骤 ④c daemon 接线）
+## 5. Q15 stats 性能 profile（2026-08-22, release, N=500k 同数据同机）
+
+`cargo test --release -p wf-engine close_bench -- --ignored --nocapture`
+（`q15_stats_executor_profile`, 与 CEP 对照同一次运行）：
+
+| 路径 | ns/evt | M evt/s | 相对 CEP engine_full |
+|---|---|---|---|
+| CEP engine_full(advance) | 606 | 1.65 | 1.00× |
+| CEP accumulate_close | 530 | 1.89 | 0.87× |
+| CEP prod_row_full(生产) | 339 | 2.95 | 0.55× |
+| **stats 行式全量（P1 当前）** | **1387** | **0.72** | **0.44×（慢）** |
+| 分量 count(×1) | 1.4 | 737 | — |
+| 分量 where9（当前: 每度量 build+eval） | 405 | 2.47 | — |
+| 分量 where3（共享分档参考） | 195 | 5.13 | — |
+| 分量 distinct(×4, DistinctKey) | 86 | 11.6 | — |
+
+**结论**：
+
+1. **P1 行式全量比 CEP 慢**——瓶颈不是 stats 归并本身（分量和 ≈ 493 ns），而是
+   where 求值方式：wiring 的 `where_ok` 闭包**每度量重建 Event**（9× HashMap 构建）
+   + 9 次解释器 eval, 额外 ~900 ns/evt。
+2. **行式可立即优化**：where 共享 ctx + 共享分档（9→3 eval）→ 估算 ≈ count 1 +
+   where3 195 + distinct 86 ≈ **282 ns/evt（3.5M/s）**, 已快于 CEP 生产路径。
+3. **列式段（P1.5）才是目标**：count/where 整列化后理论下限 ≈ distinct 主导 ≈
+   **86 ns/evt（12M/s）**, 相对 CEP 生产路径 ~4×、engine_full ~7×。
+4. 接线实现注意：`process_rows_where` 的 where_ok 调用方应**每行构建一次 Event**
+   （共享 ctx 求值全部度量 where）, 不要逐度量重建。
+
+## 6. 下一步（步骤 ④c daemon 接线）
 
 **引擎层数据路径已锁定**（④b）: 编译 stats 规则 → StatsExecutor 归并（编译出的
 where_expr 逐行求值）→ 合成 CloseOutput → `execute_close_with_joins` → OutputRecord,
@@ -116,7 +144,7 @@ where_expr 逐行求值）→ 合成 CloseOutput → `execute_close_with_joins` 
 - **P1.5 列式段**: process_rows 升级为 RecordBatch 列式读取（复用
   `scope_key_columnar` + `eval_guard_columnar`; count/sum/min/max 整列归并）
 
-## 6. 阻塞项
+## 7. 阻塞项
 
 - ~~系统文件句柄耗尽~~ ✅ 已恢复
 - ~~checker 不感知 stats 标签~~ ✅ 已修（`populate_stats_measure_labels`, 3 测试）
@@ -124,7 +152,7 @@ where_expr 逐行求值）→ 合成 CloseOutput → `execute_close_with_joins` 
 
 ---
 
-## 6. 相关文档
+## 8. 相关文档
 
 - 设计：`docs/stats-executor-design.md`（v6 统一桶键模型）
 - review：`docs/stats-executor-design-review.md` / `-v2.md`

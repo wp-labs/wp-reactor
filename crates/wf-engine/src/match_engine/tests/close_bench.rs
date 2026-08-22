@@ -36,8 +36,16 @@
 //!   deferred_row    : ColumnarEvent + advance_at_with_masks（列式 guard，deferred 路径）
 //!   eager_row       : 每行 Event 物化（HashMap 3 字段）+ advance_at（解释器 guard，eager 路径）
 //!   prod_row_full   : masks 摊还 + scan + advance_with_masks（复刻 rule_task deferred 行）
+//!
+//! stats 执行器对照（2026-08-22 追加——P1 行式 StatsExecutor vs CEP 同数据同机）：
+//!   q15_stats_executor_profile：同 bid_events(N) 数据, 12 度量（4 count + 8 distinct）
+//!     stats 行式全量 : process_rows_where + 逐度量 where eval（P1 接线路径）
+//!     分量: count_only / where_8（8× Event build+eval）/ where_shared（1× build+3 eval
+//!           共享分档参考）/ distinct_8（4× DistinctKey 插入/行）
+//!     列式段（P1.5）为下一步：count/sum 整列归并 + where 列式 mask, distinct 每行哈希
+//!     不可回避——本基准的行式基线即为列式化的优化依据。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -52,6 +60,7 @@ use wf_lang::plan::{AggPlan, BindPlan, BranchPlan, MatchPlan, StepPlan, WindowSp
 use crate::match_engine::EngineHashSet;
 use crate::match_engine::RuleExecutor;
 use crate::match_engine::event_bridge::ColumnarEvent;
+use crate::match_engine::executor::StatsExecutor;
 use crate::match_engine::match_engine::{
     CepStateMachine, EngineHashMap, Event, FieldSource, RollingStats, StepState, Value, ValueKey,
     accumulate_close_steps, eval_expr_ext,
@@ -595,4 +604,341 @@ fn q15_production_path(engine_full_ns: &f64) -> f64 {
     prod_report.line(*engine_full_ns);
 
     prod_ns
+}
+
+// ---------------------------------------------------------------------------
+// stats 执行器 Q15 profile（P1 行式基线, 列式段 P1.5 的优化依据）
+// ---------------------------------------------------------------------------
+
+/// q15 形状的 stats StatsPlan（12 度量: 4 count + 8 distinct, 8 个带价格分档
+/// where）——与 `q15_close_steps` 同构（同档位阈值/字段域）, 同数据可横向对拍。
+fn q15_stats_plan() -> wf_lang::plan::StatsPlan {
+    use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan};
+    let m = |label: &str, agg: StatsAggPlan, field: Option<&str>, where_expr: Option<Expr>| {
+        StatsMeasurePlan {
+            label: label.into(),
+            source_alias: "b".into(),
+            where_expr,
+            agg,
+            field: field.map(|f| FieldRef::Qualified("b".into(), f.into())),
+            arg: None,
+        }
+    };
+    StatsPlan {
+        window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(1800)),
+        keys: vec![],
+        output_shape: StatsOutputShapePlan::Rows,
+        measures: vec![
+            m("total", StatsAggPlan::Count, None, None),
+            m("r1", StatsAggPlan::Count, None, Some(price_lt(10_000.0))),
+            m(
+                "r2",
+                StatsAggPlan::Count,
+                None,
+                Some(price_range(10_000.0, 1_000_000.0)),
+            ),
+            m("r3", StatsAggPlan::Count, None, Some(price_ge(1_000_000.0))),
+            m(
+                "total_bidder",
+                StatsAggPlan::DistinctCount,
+                Some("bidder"),
+                None,
+            ),
+            m(
+                "r1_bidder",
+                StatsAggPlan::DistinctCount,
+                Some("bidder"),
+                Some(price_lt(10_000.0)),
+            ),
+            m(
+                "r2_bidder",
+                StatsAggPlan::DistinctCount,
+                Some("bidder"),
+                Some(price_range(10_000.0, 1_000_000.0)),
+            ),
+            m(
+                "r3_bidder",
+                StatsAggPlan::DistinctCount,
+                Some("bidder"),
+                Some(price_ge(1_000_000.0)),
+            ),
+            m(
+                "total_auction",
+                StatsAggPlan::DistinctCount,
+                Some("auction"),
+                None,
+            ),
+            m(
+                "r1_auction",
+                StatsAggPlan::DistinctCount,
+                Some("auction"),
+                Some(price_lt(10_000.0)),
+            ),
+            m(
+                "r2_auction",
+                StatsAggPlan::DistinctCount,
+                Some("auction"),
+                Some(price_range(10_000.0, 1_000_000.0)),
+            ),
+            m(
+                "r3_auction",
+                StatsAggPlan::DistinctCount,
+                Some("auction"),
+                Some(price_ge(1_000_000.0)),
+            ),
+        ],
+        tracked_bind_fields: HashMap::new(),
+    }
+}
+
+fn extract_field(row: &HashMap<String, Value>, name: &str) -> Option<Value> {
+    row.get(name).cloned()
+}
+
+fn rows_from_events(events: &[Event]) -> Vec<HashMap<String, Value>> {
+    events
+        .iter()
+        .map(|ev| {
+            ev.fields
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect()
+        })
+        .collect()
+}
+
+/// Q15 stats 执行器 profile：行式全量 + 分量（count/where/distinct）, 与 CEP
+/// 同数据同机对照（engine_full advance + accumulate_close_steps）。
+///
+/// 运行：
+///   cargo test --release -p wf-engine close_bench -- --ignored --nocapture
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine close_bench -- --ignored --nocapture"]
+fn q15_stats_executor_profile() {
+    use crate::match_engine::executor::DistinctKey;
+    let events = bid_events(N);
+    let rows = rows_from_events(&events);
+    let now = 1_700_000_000_000_000_000i64;
+
+    eprintln!(
+        "[close-bench] ===== Q15 stats vs CEP profile（N={}, 同数据同机）=====",
+        N
+    );
+
+    // ---- CEP 对照（与 q15_close_accumulate_components 同路径, 同一次运行）----
+    let mut sm = CepStateMachine::new("q15_bench".to_string(), q15_plan(), None);
+    let start = Instant::now();
+    for (i, ev) in events.iter().enumerate() {
+        std::hint::black_box(sm.advance_at("b", ev, now + i as i64));
+    }
+    let cep_full_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    Report {
+        name: "CEP engine_full",
+        per_ns: cep_full_ns,
+    }
+    .line(cep_full_ns);
+
+    let plan = q15_plan();
+    let mut step_states: Vec<StepState> = plan
+        .close_steps
+        .iter()
+        .map(|s| StepState::new(s.branches.len()))
+        .collect();
+    let mut baselines0 = EngineHashMap::<String, RollingStats>::default();
+    let start = Instant::now();
+    for ev in &events {
+        accumulate_close_steps(
+            "b",
+            ev,
+            now,
+            &plan,
+            &mut step_states,
+            None,
+            &mut baselines0,
+            0,
+            None,
+        );
+    }
+    let cep_accum_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    Report {
+        name: "CEP accumulate_close",
+        per_ns: cep_accum_ns,
+    }
+    .line(cep_full_ns);
+
+    // ---- stats 行式全量（P1: process_rows_where + 逐度量 where eval）----
+    let stats_plan = q15_stats_plan();
+    let exprs: Vec<Option<Expr>> = stats_plan
+        .measures
+        .iter()
+        .map(|m| m.where_expr.clone())
+        .collect();
+    // 先收集 8 个带 where 表达式（owned）, 供分量 2 使用——where_ok 闭包随后
+    // move 捕获 exprs, 借用关系与闭包生命周期解耦。
+    let with_where: Vec<Expr> = exprs.iter().flatten().cloned().collect();
+    assert_eq!(
+        with_where.len(),
+        9,
+        "q15 9 个带 where 度量（r1/r2/r3 × count/bidder/auction）"
+    );
+    let baselines = std::cell::RefCell::new(EngineHashMap::<String, RollingStats>::default());
+    let where_ok = move |row: &HashMap<String, Value>, idx: usize| -> bool {
+        let Some(e) = &exprs[idx] else {
+            return true;
+        };
+        let ctx = Event {
+            fields: row
+                .iter()
+                .map(|(k, v)| (k.as_str().into(), v.clone()))
+                .collect(),
+        };
+        matches!(
+            eval_expr_ext(e, &ctx, None, &mut baselines.borrow_mut()),
+            Some(Value::Bool(true))
+        )
+    };
+    let start = Instant::now();
+    let mut stats_exec = StatsExecutor::new(stats_plan);
+    stats_exec.process_rows_where(&rows, extract_field, where_ok);
+    let stats_full_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    let values = stats_exec.final_measure_values();
+    assert_eq!(values[0], N as f64, "total count 应为 N");
+    Report {
+        name: "stats 行式全量",
+        per_ns: stats_full_ns,
+    }
+    .line(cep_full_ns);
+    eprintln!(
+        "[close-bench]    → vs CEP engine_full {:.2}× ; vs accumulate_close 的 {:.0}%",
+        cep_full_ns / stats_full_ns,
+        stats_full_ns / cep_accum_ns * 100.0
+    );
+
+    // ---- 分量 1: count_only（4 count 无 where 无 distinct——行式纯归并下限）----
+    let count_plan = {
+        let mut p = q15_stats_plan();
+        p.measures.retain(|m| {
+            matches!(m.agg, wf_lang::plan::StatsAggPlan::Count) && m.where_expr.is_none()
+        });
+        p
+    };
+    assert_eq!(
+        count_plan.measures.len(),
+        1,
+        "q15 仅 total 一个无条件 count"
+    );
+    let start = Instant::now();
+    let mut exec = StatsExecutor::new(count_plan);
+    exec.process_rows(&rows, extract_field);
+    let count_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    Report {
+        name: "  分量 count(×1)",
+        per_ns: count_ns,
+    }
+    .line(cep_full_ns);
+
+    // ---- 分量 2: where9（9 个带 where 度量 × Event build + eval/行, 当前实现）----
+    let baselines = std::cell::RefCell::new(EngineHashMap::<String, RollingStats>::default());
+    let start = Instant::now();
+    let mut hits = 0u64;
+    for row in &rows {
+        let ctx = Event {
+            fields: row
+                .iter()
+                .map(|(k, v)| (k.as_str().into(), v.clone()))
+                .collect(),
+        };
+        for e in &with_where {
+            hits += u64::from(matches!(
+                std::hint::black_box(eval_expr_ext(e, &ctx, None, &mut baselines.borrow_mut())),
+                Some(Value::Bool(true))
+            ));
+        }
+    }
+    assert!(hits > 0);
+    let where9_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    Report {
+        name: "  分量 where9(当前)",
+        per_ns: where9_ns,
+    }
+    .line(cep_full_ns);
+
+    // ---- 分量 3: where_shared（1× Event build + 3 eval, 共享分档——优化参考）----
+    let shared: Vec<Expr> = [
+        price_lt(10_000.0),
+        price_range(10_000.0, 1_000_000.0),
+        price_ge(1_000_000.0),
+    ]
+    .into_iter()
+    .collect();
+    let baselines = std::cell::RefCell::new(EngineHashMap::<String, RollingStats>::default());
+    let start = Instant::now();
+    let mut hits = 0u64;
+    for row in &rows {
+        let ctx = Event {
+            fields: row
+                .iter()
+                .map(|(k, v)| (k.as_str().into(), v.clone()))
+                .collect(),
+        };
+        for e in &shared {
+            hits += u64::from(matches!(
+                std::hint::black_box(eval_expr_ext(e, &ctx, None, &mut baselines.borrow_mut())),
+                Some(Value::Bool(true))
+            ));
+        }
+    }
+    assert!(hits > 0);
+    let where3_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    Report {
+        name: "  分量 where3(共享)",
+        per_ns: where3_ns,
+    }
+    .line(cep_full_ns);
+
+    // ---- 分量 4: distinct_8（4× DistinctKey 插入/行, 8 集合）----
+    let mut sets: Vec<std::collections::HashSet<DistinctKey>> =
+        (0..8).map(|_| Default::default()).collect();
+    let mut inserted = 0u64;
+    let start = Instant::now();
+    for row in &rows {
+        let price = match row.get("price") {
+            Some(Value::Number(p)) => *p,
+            _ => 0.0,
+        };
+        let tier = price_tier(price);
+        let b = DistinctKey::from_f64(match row.get("bidder") {
+            Some(Value::Number(n)) => *n,
+            _ => 0.0,
+        });
+        let a = DistinctKey::from_f64(match row.get("auction") {
+            Some(Value::Number(n)) => *n,
+            _ => 0.0,
+        });
+        for (idx, key) in [(0usize, &b), (1 + tier, &b), (4, &a), (5 + tier, &a)] {
+            if sets[idx].insert(key.clone()) {
+                inserted += 1;
+            }
+        }
+    }
+    assert!(inserted > 0);
+    let distinct_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    Report {
+        name: "  分量 distinct(×4)",
+        per_ns: distinct_ns,
+    }
+    .line(cep_full_ns);
+
+    // ---- 汇总 ----
+    eprintln!(
+        "[close-bench] ---- 汇总（P1 行式基线; 列式段 P1.5 目标: count/where 整列化, distinct 不可回避）----"
+    );
+    eprintln!(
+        "[close-bench]   count={count_ns:.0} + where9={where9_ns:.0} + distinct={distinct_ns:.0} = {:.0} ns/evt（估算）vs 全量 {stats_full_ns:.0}",
+        count_ns + where9_ns + distinct_ns
+    );
+    eprintln!(
+        "[close-bench]   列式化后可消灭 ≈ count/where 全部 + where 摊还 → 理论下限 ≈ distinct {distinct_ns:.0} ns/evt（{:.0}M/s）",
+        1e3 / distinct_ns
+    );
 }
