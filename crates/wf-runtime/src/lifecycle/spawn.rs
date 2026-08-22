@@ -779,6 +779,8 @@ pub(super) fn resolve_window_sources(
     let mut sources = Vec::new();
 
     for (window_name, aliases) in window_aliases {
+        let has_window = registry.get_window(window_name).is_some();
+        let has_notify = registry.get_notifier(window_name).is_some();
         if let Some(window) = registry.get_window(window_name)
             && let Some(notify) = registry.get_notifier(window_name)
         {
@@ -788,6 +790,14 @@ pub(super) fn resolve_window_sources(
                 notify,
                 aliases: aliases.clone(),
             });
+        } else {
+            wf_warn!(
+                conf,
+                window = %window_name,
+                has_window = has_window,
+                has_notify = has_notify,
+                "rule window source skipped — window or notifier missing in registry"
+            );
         }
     }
 

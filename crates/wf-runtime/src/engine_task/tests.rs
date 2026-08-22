@@ -88,9 +88,13 @@ pub fn make_test_fanout(tx: mpsc::Sender<crate::alert_task::AlertBatch>) -> Arc<
     let mut cache = std::collections::HashMap::new();
     // One sink (ptr=0) with a single writer channel (batches); the cache type is
     // inferred from `SinkFanout::from_resolved`.
-    let groups = Arc::new(vec![(0usize, Arc::new(vec![tx]))]);
+    let groups = Arc::new(vec![(0usize, Arc::new(vec![tx.clone()]))]);
     cache.insert("alerts".to_string(), Arc::clone(&groups));
     cache.insert("network_alerts".to_string(), groups);
+    // nexmark_pk 输出窗口（q8/q9 等 yield nexmark_alerts）——fanout 无此 key
+    // 时 flush_alerts 的 resolve 为空 → 输出被丢弃（测试假失败）。
+    let nexmark_groups = Arc::new(vec![(0usize, Arc::new(vec![tx]))]);
+    cache.insert("nexmark_alerts".to_string(), nexmark_groups);
     SinkFanout::from_resolved(cache)
 }
 
@@ -2962,7 +2966,7 @@ fn make_sharded_match_tasks(
             lets: Vec::new(),
             match_plan: match_plan.clone(),
             each_plan: None,
-        stats_plan: None,
+            stats_plan: None,
             joins: vec![],
             r#where: None,
             entity_plan: EntityPlan {

@@ -170,6 +170,109 @@ fn execute_deferred_join_q9_maxrow_tie_and_label() {
 }
 
 #[test]
+fn execute_deferred_join_closed_interval_boundaries_inclusive() {
+    // Q9 `within [a.dateTime, a.expires]` 是**闭区间**（权威 `B.dateTime BETWEEN
+    // A.dateTime AND A.expires`）——bid 恰在下界/上界都应命中；Q8 的上开桶
+    // （`<bucket_end`）恰在边界排除（另一测试覆盖），两处语义相反，各钉一个。
+    let exec = RuleExecutor::new(q9_rule_plan());
+    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    assert_eq!(pending.lo_ns, T);
+    assert_eq!(pending.hi_ns, T + 60_000_000_000);
+
+    // 恰在下界（ts == a.dateTime）→ 命中
+    let lo = BidLookup(vec![bid(T, 5.0, 1.0, 100.0)]);
+    let rec = exec
+        .execute_deferred_join(0, &pending, &lo, T + 100_000_000_000)
+        .unwrap()
+        .expect("bid exactly at lo boundary must match (closed interval)");
+    assert_eq!(
+        rec.yield_fields
+            .iter()
+            .find(|(n, _)| &**n == "winner_bidder")
+            .map(|(_, v)| v),
+        Some(&num(1.0))
+    );
+
+    // 恰在上界（ts == a.expires）→ 命中
+    let hi = BidLookup(vec![bid(T + 60_000_000_000, 5.0, 2.0, 200.0)]);
+    let rec = exec
+        .execute_deferred_join(0, &pending, &hi, T + 100_000_000_000)
+        .unwrap()
+        .expect("bid exactly at hi boundary must match (closed interval)");
+    assert_eq!(
+        rec.yield_fields
+            .iter()
+            .find(|(n, _)| &**n == "winner_bidder")
+            .map(|(_, v)| v),
+        Some(&num(2.0))
+    );
+
+    // 恰在下界之外 1ns（ts == a.dateTime - 1ns）→ 排除（低于下界）
+    let below = BidLookup(vec![bid(T - 1, 5.0, 3.0, 300.0)]);
+    assert!(
+        exec.execute_deferred_join(0, &pending, &below, T + 100_000_000_000)
+            .unwrap()
+            .is_none(),
+        "bid below lo boundary must not match"
+    );
+
+    // 恰在上界之外 1ns（ts == a.expires + 1ns）→ 排除（超过上界）
+    let above = BidLookup(vec![bid(T + 60_000_000_001, 5.0, 4.0, 400.0)]);
+    assert!(
+        exec.execute_deferred_join(0, &pending, &above, T + 100_000_000_000)
+            .unwrap()
+            .is_none(),
+        "bid above hi boundary must not match"
+    );
+}
+
+#[test]
+fn execute_deferred_join_multi_condition_recheck() {
+    // deferred 多条件 join：键（首条件）命中但次条件不满足的行必须被
+    // `row_matches_conds` 复核拒绝（复刻 match-time find_matching_row 语义）。
+    // 双条件：a.id == bid.auction && a.seller == bid.bidder。
+    let mut plan = q9_rule_plan();
+    plan.joins[0].conds.push(JoinCondPlan {
+        left: FieldRef::Qualified("a".into(), "seller".into()),
+        right: FieldRef::Qualified("bid_events".into(), "bidder".into()),
+    });
+    let exec = RuleExecutor::new(plan);
+    // 驱动 auction：id=5, seller=42
+    let auction = event(vec![
+        ("id", num(5.0)),
+        ("seller", num(42.0)),
+        ("dateTime", num(T as f64)),
+        ("expires", num((T + 60_000_000_000) as f64)),
+    ]);
+    let pending = exec.deferred_pending_for(0, &auction, T).expect("pending");
+    assert_eq!(pending.key_field, "auction");
+    assert_eq!(pending.key, num(5.0));
+
+    // 键命中（auction=5）但次条件不满足（bidder=1 != seller=42）→ 不输出
+    let wrong_bidder = BidLookup(vec![bid(T + 10_000_000_000, 5.0, 1.0, 100.0)]);
+    assert!(
+        exec.execute_deferred_join(0, &pending, &wrong_bidder, T + 100_000_000_000)
+            .unwrap()
+            .is_none(),
+        "second condition fails → row rejected (multi-condition recheck)"
+    );
+
+    // 两个条件都满足（bidder=42）→ 输出
+    let ok = BidLookup(vec![bid(T + 10_000_000_000, 5.0, 42.0, 100.0)]);
+    let rec = exec
+        .execute_deferred_join(0, &pending, &ok, T + 100_000_000_000)
+        .unwrap()
+        .expect("both conditions satisfied → output");
+    assert_eq!(
+        rec.yield_fields
+            .iter()
+            .find(|(n, _)| &**n == "winner_bidder")
+            .map(|(_, v)| v),
+        Some(&num(42.0))
+    );
+}
+
+#[test]
 fn execute_deferred_join_empty_set_no_output() {
     let exec = RuleExecutor::new(q9_rule_plan());
     let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
@@ -214,6 +317,143 @@ fn execute_deferred_join_pure_existence_q8_shape() {
         exec.execute_deferred_join(0, &pending, &miss, T + 100_000_000_000)
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn deferred_q8_bucket_end_half_open_interval() {
+    // Q8 精确形状：person 驱动，`within [p.dateTime, <bucket_end(p.dateTime, 10s)]`
+    // （上开桶）+ `emit at bucket_end(...)`——纯存在，桶内 seller==id 的 auction
+    // 命中输出；恰在桶边界 / 桶外 / seller 不匹配均不输出。
+    // T = 1.7e18 ns 整除 10s（1e10）→ time_bucket(T) = T → bucket_end = T + 10s。
+    let mut plan = super::helpers::simple_rule_plan(
+        "q8_deferred",
+        super::helpers::simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "digit",
+        Expr::Field(FieldRef::Simple("id".into())),
+    );
+    plan.each_plan = Some(EachPlan {
+        alias: "p".into(),
+        filter: None,
+    });
+    let bucket_end = |arg: Expr| Expr::FuncCall {
+        qualifier: None,
+        name: "bucket_end".to_string(),
+        args: vec![arg, Expr::Number(10.0)],
+    };
+    plan.joins = vec![JoinPlan {
+        right_window: "auction_events".to_string(),
+        mode: JoinMode::Inner,
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Qualified("p".into(), "id".into()),
+            right: FieldRef::Qualified("auction_events".into(), "seller".into()),
+        }],
+        within: Some(WithinSpec {
+            lo: Bound {
+                open: false,
+                val: BoundVal::Expr(Expr::Field(FieldRef::Qualified(
+                    "p".into(),
+                    "dateTime".into(),
+                ))),
+            },
+            hi: Bound {
+                open: true, // 上开桶 [B, B+10s)
+                val: BoundVal::Expr(bucket_end(Expr::Field(FieldRef::Qualified(
+                    "p".into(),
+                    "dateTime".into(),
+                )))),
+            },
+        }),
+        reduce: None,
+        emit_at: Some(bucket_end(Expr::Field(FieldRef::Qualified(
+            "p".into(),
+            "dateTime".into(),
+        )))),
+    }];
+    let exec = RuleExecutor::new(plan);
+
+    // 驱动 person：id=5, dateTime=T（10s 桶界上）
+    let person = event(vec![("id", num(5.0)), ("dateTime", num(T as f64))]);
+    let pending = exec
+        .deferred_pending_for(0, &person, T)
+        .expect("Q8 person must pend");
+    let bucket_ns = 10_000_000_000i64;
+    assert_eq!(pending.lo_ns, T);
+    assert_eq!(pending.hi_ns, T + bucket_ns, "bucket_end = T + 10s");
+    assert!(pending.hi_open, "上开桶 <bucket_end");
+    assert!(!pending.lo_open);
+    assert_eq!(pending.expiry_nanos, T + bucket_ns, "emit at bucket_end");
+
+    // 命中：桶内 seller==5 的 auction
+    let hit = BidLookup(vec![(
+        T + 5_000_000_000,
+        JoinRow::Event(Arc::new(Event {
+            fields: {
+                let mut f = crate::match_engine::EngineHashMap::default();
+                f.insert("seller".into(), num(5.0));
+                f
+            },
+        })),
+    )]);
+    let rec = exec
+        .execute_deferred_join(0, &pending, &hit, T + bucket_ns)
+        .unwrap()
+        .expect("桶内 seller 命中 → 输出");
+    assert_eq!(rec.origin, AlertOrigin::Deferred);
+
+    // 恰在桶边界 B+10s：上开排除（归下桶，权威 TUMBLE 桶 [B, B+10s)）
+    let boundary = BidLookup(vec![(
+        T + bucket_ns,
+        JoinRow::Event(Arc::new(Event {
+            fields: {
+                let mut f = crate::match_engine::EngineHashMap::default();
+                f.insert("seller".into(), num(5.0));
+                f
+            },
+        })),
+    )]);
+    assert!(
+        exec.execute_deferred_join(0, &pending, &boundary, T + bucket_ns)
+            .unwrap()
+            .is_none(),
+        "恰在桶边界 → 上开排除，不输出"
+    );
+
+    // 下个桶内（T+15s）：区间外 miss
+    let next_bucket = BidLookup(vec![(
+        T + 15_000_000_000,
+        JoinRow::Event(Arc::new(Event {
+            fields: {
+                let mut f = crate::match_engine::EngineHashMap::default();
+                f.insert("seller".into(), num(5.0));
+                f
+            },
+        })),
+    )]);
+    assert!(
+        exec.execute_deferred_join(0, &pending, &next_bucket, T + bucket_ns)
+            .unwrap()
+            .is_none(),
+        "下个桶 → 区间外不输出"
+    );
+
+    // 桶内但 seller 不匹配
+    let wrong_seller = BidLookup(vec![(
+        T + 5_000_000_000,
+        JoinRow::Event(Arc::new(Event {
+            fields: {
+                let mut f = crate::match_engine::EngineHashMap::default();
+                f.insert("seller".into(), num(9.0));
+                f
+            },
+        })),
+    )]);
+    assert!(
+        exec.execute_deferred_join(0, &pending, &wrong_seller, T + bucket_ns)
+            .unwrap()
+            .is_none(),
+        "seller 不匹配 → 不输出"
     );
 }
 

@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Expr, FieldRef, FieldSelector, ObjectItem, PathSegment};
+use crate::ast::{BoundVal, Expr, FieldRef, FieldSelector, ObjectItem, PathSegment, ReduceMeasure};
 use crate::columnar::expr_is_columnar;
 use crate::plan::{BranchPlan, RulePlan, StepPlan};
 
@@ -166,11 +166,42 @@ pub fn compute_window_field_usage(plans: &[RulePlan]) -> WindowFieldUsage {
             collect_expr_fields(w, &mut global);
         }
 
-        // Join conditions reference fields on both sides.
+        // Join conditions reference fields on both sides; `within` bounds and
+        // `emit at` triggers reference **driver (left) fields** (P3 deferred:
+        // `deferred_pending_for` 在挂起时求值界与触发点，缺字段则挂起失败 →
+        // 静默 0 输出——q9 实证 expires 被裁剪、60 万 auction 全挂起失败）；
+        // `reduce` 度量/tie 字段读**右窗行**（评估时从命中行取）。全部必须
+        // 物化，否则编译产物正确但运行静默无输出。
         for join in &plan.joins {
             for cond in &join.conds {
                 global.insert(field_ref_name(&cond.left).to_string());
                 global.insert(field_ref_name(&cond.right).to_string());
+            }
+            if let Some(wspec) = &join.within {
+                for bound in [&wspec.lo, &wspec.hi] {
+                    if let BoundVal::Expr(e) = &bound.val {
+                        collect_expr_fields(e, &mut global);
+                    }
+                }
+            }
+            if let Some(emit_at) = &join.emit_at {
+                collect_expr_fields(emit_at, &mut global);
+            }
+            if let Some(rc) = &join.reduce {
+                match &rc.measure {
+                    ReduceMeasure::Maxrow { field, tie } | ReduceMeasure::Minrow { field, tie } => {
+                        global.insert(field_ref_name(field).to_string());
+                        if let Some(t) = tie {
+                            global.insert(field_ref_name(&t.field).to_string());
+                        }
+                    }
+                    ReduceMeasure::Last { field } => {
+                        global.insert(field_ref_name(field).to_string());
+                    }
+                    ReduceMeasure::Top { field, .. } => {
+                        global.insert(field_ref_name(field).to_string());
+                    }
+                }
             }
         }
 
@@ -370,6 +401,98 @@ mod tests {
         assert!(
             usage.global_fields.contains("state"),
             "where-referenced joined field `state` must be materialized, got {:?}",
+            usage.global_fields
+        );
+    }
+
+    #[test]
+    fn deferred_join_within_emit_at_reduce_fields_collected() {
+        // Regression (q9 引擎 0 输出根因)：field_usage 只统计 join 条件两侧字段，
+        // `within` 界（a.dateTime/a.expires）、`emit at`（a.expires）、`reduce`
+        // 度量/tie（price/dateTime）若被物化裁剪 → `deferred_pending_for` 挂起
+        // 失败/评估失败 → 静默 0 输出（60 万 auction 全挂起失败实证）。
+        let mut rule = make_rule(
+            Vec::new(),
+            MatchPlan {
+                keys: vec![],
+                key_map: None,
+                key_join: None,
+                window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
+                event_steps: vec![],
+                close_steps: vec![],
+                close_mode: crate::ast::CloseMode::Or,
+                tracked_bind_aliases: std::collections::HashSet::new(),
+                tracked_bind_fields: std::collections::HashMap::new(),
+                tracked_plain_fields: std::collections::HashSet::new(),
+                match_mode: crate::ast::MatchMode::Seq,
+                seq: None,
+                accu: false,
+                needs_field_history: false,
+            },
+        );
+        rule.each_plan = Some(crate::plan::EachPlan {
+            alias: "a".into(),
+            filter: None,
+        });
+        rule.joins = vec![crate::plan::JoinPlan {
+            right_window: "bid_events".to_string(),
+            mode: crate::ast::JoinMode::Inner,
+            conds: vec![crate::plan::JoinCondPlan {
+                left: FieldRef::Qualified("a".into(), "id".into()),
+                right: FieldRef::Qualified("bid_events".into(), "auction".into()),
+            }],
+            within: Some(crate::ast::WithinSpec {
+                lo: crate::ast::Bound {
+                    open: false,
+                    val: crate::ast::BoundVal::Expr(Expr::Field(FieldRef::Qualified(
+                        "a".into(),
+                        "dateTime".into(),
+                    ))),
+                },
+                hi: crate::ast::Bound {
+                    open: false,
+                    val: crate::ast::BoundVal::Expr(Expr::Field(FieldRef::Qualified(
+                        "a".into(),
+                        "expires".into(),
+                    ))),
+                },
+            }),
+            reduce: Some(crate::ast::ReduceClause {
+                measure: crate::ast::ReduceMeasure::Maxrow {
+                    field: FieldRef::Simple("price".into()),
+                    tie: Some(crate::ast::TieSpec {
+                        field: FieldRef::Simple("dateTime".into()),
+                        desc: false,
+                    }),
+                },
+                label: Some("winner".into()),
+            }),
+            emit_at: Some(Expr::Field(FieldRef::Qualified(
+                "a".into(),
+                "expires".into(),
+            ))),
+        }];
+        let usage = compute_window_field_usage(&[rule]);
+        // 驱动（左）字段：join 键 id + within 界 dateTime/expires + emit_at expires
+        assert!(usage.global_fields.contains("id"), "join cond left field");
+        assert!(
+            usage.global_fields.contains("dateTime"),
+            "within lo / tie field must be materialized, got {:?}",
+            usage.global_fields
+        );
+        assert!(
+            usage.global_fields.contains("expires"),
+            "within hi / emit_at field must be materialized, got {:?}",
+            usage.global_fields
+        );
+        // 右窗字段：join 键 auction + reduce 度量 price
+        assert!(
+            usage.global_fields.contains("auction"),
+            "join cond right field"
+        );
+        assert!(
+            usage.global_fields.contains("price"),
+            "reduce measure field must be materialized, got {:?}",
             usage.global_fields
         );
     }
