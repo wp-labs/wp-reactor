@@ -484,7 +484,16 @@ pub(super) fn spawn_rule_tasks(
                 // downstream state machine must not see same-key events out
                 // of order.
                 let target = rule.executor.plan().yield_plan.target.clone();
-                let shardable = shard_count > 1 && !intermediate_targets.contains(&target);
+                // P3：deferred join（emit at）规则单 worker——挂起队列是 per-task 状态，
+                // 与 round-robin 分片冲突（设计 §9 风险 5）。
+                let deferred = rule
+                    .executor
+                    .plan()
+                    .joins
+                    .iter()
+                    .any(|j| j.emit_at.is_some());
+                let shardable =
+                    shard_count > 1 && !intermediate_targets.contains(&target) && !deferred;
 
                 if shardable {
                     let mut shard_txs = Vec::with_capacity(shard_count);

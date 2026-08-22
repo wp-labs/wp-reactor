@@ -29,7 +29,11 @@ pub use wf_lang::wfu_meta::{
 #[moju(kind = "state", domain = "Engine", module = "Engine.AlertOutput")]
 pub enum AlertOrigin {
     Event,
-    Close { reason: CloseReason },
+    Close {
+        reason: CloseReason,
+    },
+    /// Deferred join 到期触发（join-family P3：`emit at` 挂起实例在 watermark 到期时输出）。
+    Deferred,
 }
 
 impl AlertOrigin {
@@ -37,6 +41,7 @@ impl AlertOrigin {
     pub fn as_str(&self) -> &'static str {
         match self {
             AlertOrigin::Event => "event",
+            AlertOrigin::Deferred => "deferred",
             AlertOrigin::Close { reason } => match reason {
                 CloseReason::Timeout => "close:timeout",
                 CloseReason::Flush => "close:flush",
@@ -47,7 +52,7 @@ impl AlertOrigin {
 
     pub fn close_reason(&self) -> Option<CloseReason> {
         match self {
-            AlertOrigin::Event => None,
+            AlertOrigin::Event | AlertOrigin::Deferred => None,
             AlertOrigin::Close { reason } => Some(*reason),
         }
     }
@@ -79,6 +84,7 @@ impl<'de> Deserialize<'de> for AlertOrigin {
             "close:eos" => Ok(AlertOrigin::Close {
                 reason: CloseReason::Eos,
             }),
+            "deferred" => Ok(AlertOrigin::Deferred),
             other => Err(serde::de::Error::custom(format!(
                 "unknown AlertOrigin: {other}"
             ))),

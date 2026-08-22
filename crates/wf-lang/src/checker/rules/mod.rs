@@ -56,6 +56,17 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
             message: "`on each` is not supported together with pipeline stages yet".to_string(),
         });
     }
+
+    // P3：deferred join（`emit at`）v1 仅支持 on-each 驱动形态——match 形态无挂起
+    // 承载点（rule_task 的挂起逻辑在 each 分支），否则 join 静默无输出。
+    if rule.each_clause.is_none() && rule.joins.iter().any(|j| j.emit_at.is_some()) {
+        errors.push(CheckError {
+            severity: Severity::Error,
+            rule: Some(name.to_string()),
+            test: None,
+            message: "deferred join（`emit at`）v1 仅支持 on-each 驱动形态（`on each <alias>`）；match 形态的 deferred 输出留待后续".to_string(),
+        });
+    }
     if rule
         .pipeline_stages
         .iter()

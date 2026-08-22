@@ -80,7 +80,7 @@ fn join_plan_carries_within_reduce_emit_and_label_path() {
     let input = r#"
 rule q9 {
     events { a : auction_events }
-    match<id:10m> { on event { a | count >= 1; } } -> score(1.0)
+    on each a -> score(1.0)
     join bid_events reduce maxrow(price) tie(dateTime asc)
         within [a.dateTime, a.expires]
         on a.id == bid_events.auction as winner
@@ -147,7 +147,7 @@ fn join_plan_carries_emit_at_func_call() {
     let input = r#"
 rule q8 {
     events { p : auction_events }
-    match<id:10m> { on event { p | count >= 1; } } -> score(1.0)
+    on each p -> score(1.0)
     join bid_events within [p.dateTime, <bucket_end(p.dateTime, 10s)]
         on p.id == bid_events.auction
         emit at bucket_end(p.dateTime, 10s)
@@ -175,7 +175,7 @@ fn explain_renders_join_family_syntax() {
     let input = r#"
 rule q9 {
     events { a : auction_events }
-    match<id:10m> { on event { a | count >= 1; } } -> score(1.0)
+    on each a -> score(1.0)
     join bid_events reduce maxrow(price) tie(dateTime asc)
         within [a.dateTime, a.expires]
         on a.id == bid_events.auction as winner
@@ -207,7 +207,7 @@ fn where_clause_label_ref_rewritten_and_plain_qualified_preserved() {
     let input = r#"
 rule q9 {
     events { a : auction_events }
-    match<id:10m> { on event { a | count >= 1; } } -> score(1.0)
+    on each a -> score(1.0)
     join bid_events reduce maxrow(price) on a.id == bid_events.auction as winner
         where winner.bidder > 0
     entity(digit, a.id)

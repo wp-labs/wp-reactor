@@ -5,6 +5,8 @@ mod columnar_bench;
 mod columnar_close_seq;
 mod columnar_fieldview;
 mod columnar_wiring;
+mod deferred_bench;
+mod deferred_join;
 mod each_bench;
 mod guard_bench;
 mod helpers;

@@ -5,6 +5,8 @@ mod close_exec;
 mod context;
 #[cfg(test)]
 pub(crate) use context::{build_eval_context, execute_joins};
+mod deferred_exec;
+pub use deferred_exec::DeferredPending;
 mod each_exec;
 mod eval;
 mod match_exec;

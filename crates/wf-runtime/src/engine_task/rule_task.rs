@@ -25,6 +25,8 @@ use crate::engine_task::conv_stage::{ConvCloseBatch, ConvShardSink};
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::metrics::RuntimeMetrics;
 
+use wf_engine::match_engine::DeferredPending;
+
 use super::TASK_SEQ;
 use super::task_types::{RuleTaskConfig, WindowSource};
 use super::window_lookup::RegistryLookup;
@@ -114,6 +116,20 @@ struct PendingAlertColumns {
     /// hashing the target string on every append.
     by_target: Vec<(std::sync::Arc<str>, AlertColumnBuilder)>,
     count: usize,
+}
+
+/// P3：deferred join（`emit at`）运行时状态——挂起队列 + 事件时间 watermark。
+///
+/// 驱动事件到达时挂起（expiry = `emit at` 求值），watermark ≥ expiry 时到期评估
+/// （asof_candidates → 区间过滤 → reduce/exists → 输出）。watermark 仅由事件时间
+/// 驱动（不叠加墙钟）——replay 对拍依赖事件时间序，墙钟推进会提前触发。
+struct DeferredRuntime {
+    /// 挂起实例（每驱动行一条，设计 §5.2）。
+    pending: Vec<DeferredPending>,
+    /// 事件时间 watermark（本规则驱动流 max event ts）。
+    watermark: i64,
+    /// 驱动 join 索引（规则内第一个带 `emit at` 的 join；v1 单 deferred join）。
+    join_idx: usize,
 }
 
 /// Current wall-clock epoch nanos.
@@ -281,6 +297,8 @@ pub(super) struct RuleTask {
     /// columnar-ly for batched relay ([`Self::flush_pipes`]). Constant for
     /// the task's lifetime — decided once here.
     each_direct: bool,
+    /// P3：deferred join（`emit at`）挂起队列与到期调度（无 `emit at` 时 `None`）。
+    deferred: Option<DeferredRuntime>,
 }
 
 impl Drop for RuleTask {
@@ -359,6 +377,17 @@ impl RuleTask {
         // intermediate pipes still consume full `OutputRecord` rows.
         let each_direct = executor.plan().each_plan.is_some()
             && !intermediate_targets.contains(executor.plan().yield_plan.target.as_str());
+        // P3：第一个带 `emit at` 的 join 是 deferred 驱动（v1 单 deferred join，设计 §9 风险 5）
+        let deferred = executor
+            .plan()
+            .joins
+            .iter()
+            .position(|j| j.emit_at.is_some())
+            .map(|join_idx| DeferredRuntime {
+                pending: Vec::new(),
+                watermark: i64::MIN,
+                join_idx,
+            });
 
         let task = Self {
             task_id,
@@ -400,6 +429,7 @@ impl RuleTask {
             pending_alerts: std::sync::Mutex::new(PendingAlertColumns::default()),
             pipe_state: std::sync::Mutex::new(PipeState::Uninit),
             each_direct,
+            deferred,
         };
         (task, cancel, timeout_scan_interval)
     }
@@ -1249,6 +1279,24 @@ impl RuleTask {
                         stats.alias_passed += 1;
                     }
                     let event_nanos = event_time_nanos(event, self.each_time_field.as_deref());
+                    // P3：deferred join（`emit at`）——驱动事件挂起（expiry = emit at），
+                    // 不即时输出；到期评估在批次尾的 `scan_deferred`（设计 §5.2）。
+                    if self.deferred.is_some() {
+                        if let Some(deferred) = self.deferred.as_mut()
+                            && let Some(pending) = self.executor.deferred_pending_for(
+                                deferred.join_idx,
+                                event,
+                                event_nanos,
+                            )
+                        {
+                            deferred.watermark = deferred.watermark.max(event_nanos);
+                            deferred.pending.push(pending);
+                        }
+                        if debug_enabled {
+                            stats.advanced += 1;
+                        }
+                        continue;
+                    }
                     if self.each_direct {
                         if !debug_enabled {
                             // Plan C2 batched: defer to the vectorized pass
@@ -1403,6 +1451,12 @@ impl RuleTask {
                 batch_emit_nanos,
             )
             .await;
+        }
+        // P3：deferred join 到期扫描（本批次事件时间 watermark 已推进）
+        if self.deferred.is_some()
+            && let Some(wm) = self.deferred.as_ref().map(|d| d.watermark)
+        {
+            self.scan_deferred(wm, batch_emit_nanos).await;
         }
         if debug_enabled {
             let instances_after = self.instance_count();
@@ -1581,7 +1635,96 @@ impl RuleTask {
     // -- Timeout & shutdown -------------------------------------------------
 
     /// Scan for expired state machine instances and emit alerts.
+    /// P3：deferred join 到期扫描——触发 `expiry ≤ wm` 的挂起实例，评估并输出。
+    ///
+    /// `wm`：事件时间 watermark（`i64::MAX` = 全部到期，EOS/关闭 flush）；
+    /// `emit_time_nanos`：输出记录的墙钟 emit 时间。空集（Q9 无 bid）不输出。
+    async fn scan_deferred(&mut self, wm: i64, emit_time_nanos: i64) {
+        let Some(deferred) = self.deferred.as_mut() else {
+            return;
+        };
+        let join_idx = deferred.join_idx;
+        // 取到期实例（块内释放 `deferred` 借用，避免与 `self.executor`/`self.emit` 冲突）
+        let due: Vec<DeferredPending> = {
+            let pending = std::mem::take(&mut deferred.pending);
+            let mut keep = Vec::with_capacity(pending.len());
+            let mut due = Vec::new();
+            for p in pending {
+                if p.expiry_nanos <= wm {
+                    due.push(p);
+                } else {
+                    keep.push(p);
+                }
+            }
+            deferred.pending = keep;
+            due
+        };
+        if due.is_empty() {
+            return;
+        }
+        let lookup = RegistryLookup::new(&self.router);
+        let mut stats = RuleBatchDebugStats::default();
+        let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        for p in due {
+            match self
+                .executor
+                .execute_deferred_join(join_idx, &p, &lookup, emit_time_nanos)
+            {
+                Ok(Some(record)) => {
+                    if debug_enabled {
+                        stats.count_output(&record, &self.intermediate_targets);
+                    }
+                    if debug_enabled && stats.allow_detail() {
+                        log_output_emitted(
+                            "execute_deferred",
+                            "deferred",
+                            output_kind(&record, &self.intermediate_targets),
+                            &record,
+                            &[],
+                        );
+                    }
+                    self.emit(record).await;
+                }
+                Ok(None) => {
+                    if debug_enabled {
+                        stats.output_none += 1;
+                    }
+                    if debug_enabled && stats.allow_detail() {
+                        log_output_suppressed(self.rule_name(), "execute_deferred", None);
+                    }
+                }
+                Err(e) => {
+                    if debug_enabled {
+                        stats.errors += 1;
+                    }
+                    wf_warn!(
+                        pipe,
+                        task_id = %self.task_id,
+                        rule = %self.rule_name(),
+                        stage = 0,
+                        phase = "execute_deferred",
+                        error = %e,
+                        "deferred join output failed"
+                    );
+                }
+            }
+        }
+    }
+
     pub(super) async fn scan_timeouts(&mut self) {
+        // P3：deferred join 规则（无 machine）——事件时间 watermark 到期扫描
+        //（不叠加墙钟：replay 对拍依赖事件时间序，墙钟推进会提前触发）。
+        if self.machine.is_none() && self.deferred.is_some() {
+            let wm = self
+                .deferred
+                .as_ref()
+                .map(|d| d.watermark)
+                .unwrap_or(i64::MIN);
+            if wm > i64::MIN {
+                self.scan_deferred(wm, wall_nanos() as i64).await;
+            }
+            return;
+        }
         let Some(machine) = &self.machine else {
             return;
         };
@@ -1744,6 +1887,13 @@ impl RuleTask {
 
     /// Close all active instances (shutdown flush) and emit alerts.
     pub(super) async fn flush(&mut self) {
+        // P3：deferred join 规则——EOS/关闭时触发全部剩余挂起实例（reason=deferred）。
+        if self.machine.is_none() && self.deferred.is_some() {
+            self.scan_deferred(i64::MAX, wall_nanos() as i64).await;
+            self.flush_alerts().await;
+            self.flush_pipes().await;
+            return;
+        }
         let Some(_) = &self.machine else {
             return;
         };

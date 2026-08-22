@@ -114,7 +114,7 @@ fn q9_shape_checks_clean() {
     let input = r#"
 rule q9 {
     events { a : auction_events }
-    match<id:10m> { on event { a | count >= 1; } } -> score(1.0)
+    on each a -> score(1.0)
     join bid_events reduce maxrow(price) tie(dateTime asc)
         within [a.dateTime, a.expires]
         on a.id == bid_events.auction as winner
@@ -132,7 +132,7 @@ fn q8_shape_checks_clean() {
     let input = r#"
 rule q8 {
     events { p : auction_events }
-    match<id:10m> { on event { p | count >= 1; } } -> score(1.0)
+    on each p -> score(1.0)
     join bid_events within [p.dateTime, <bucket_end(p.dateTime, 10s)]
         on p.id == bid_events.auction
         emit at bucket_end(p.dateTime, 10s)
@@ -365,7 +365,7 @@ fn emit_at_bare_field_same_as_qualified_upper_ok() {
     let input = r#"
 rule r {
     events { a : auction_events }
-    match<id:10m> { on event { a | count >= 1; } } -> score(1.0)
+    on each a -> score(1.0)
     join bid_events within [a.dateTime, a.expires] on a.id == bid_events.auction
         emit at expires
     entity(digit, a.id)
@@ -438,6 +438,40 @@ rule pipe_label {
   join bid_events reduce maxrow(price) on _in.id == bid_events.auction as winner
   entity(digit, _in.id)
   yield out (id = _in.id, winner_id = winner.bidder)
+}
+"#;
+    assert_no_errors(input, &schemas());
+}
+
+/// review 修复（P3）：deferred join（emit at）v1 仅支持 on-each 驱动——
+/// match 形态规则带 emit_at 报错（否则 rule_task 无挂起承载点，join 静默无输出）。
+#[test]
+fn deferred_emit_at_match_shape_rejected() {
+    let input = r#"
+rule r {
+    events { a : auction_events }
+    match<id:10m> { on event { a | count >= 1; } } -> score(1.0)
+    join bid_events within [a.dateTime, a.expires] on a.id == bid_events.auction
+        emit at a.expires
+    entity(digit, a.id)
+    yield out (id = a.id)
+}
+"#;
+    assert_has_error(input, &schemas(), "仅支持 on-each 驱动形态");
+}
+
+/// on-each 形态 + emit_at 通过（P3 支持形态）。
+#[test]
+fn deferred_emit_at_each_shape_ok() {
+    let input = r#"
+rule r {
+    events { a : auction_events }
+    on each a -> score(1.0)
+    join bid_events reduce maxrow(price) within [a.dateTime, a.expires]
+        on a.id == bid_events.auction as winner
+        emit at a.expires
+    entity(digit, a.id)
+    yield out (id = a.id, winner_id = winner.bidder)
 }
 "#;
     assert_no_errors(input, &schemas());

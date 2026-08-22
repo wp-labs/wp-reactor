@@ -406,3 +406,75 @@ P2（回看 interval eager 执行：时间谓词 + 存在/首/最新）已落地
 - 前瞻（lookforward）与 deferred 触发（`emit at` + keyed TTL 状态 + watermark 到期）→ P3。
 - eager interval 对「未来行」（行内上界 > 当前 watermark）天然看不见——lookforward 语义需
   deferred（Q8/Q9 正是如此）。
+
+---
+
+## 13. P3 实施记录（2026-08-22，前瞻 deferred + reduce）
+
+P3（deferred 触发 + reduce 执行）已落地。`cargo test -p wf-engine -p wf-runtime` 全绿
+（新增 5 engine 单测 + 3 端到端）。
+
+### 13.1 已实现
+
+- **`AlertOrigin::Deferred`**（`alert/types.rs`）：`as_str()` = `"deferred"`；
+  `fired_at` = 到期 watermark（`emit at` 求值）。设计 R6「或新增」分支。
+- **engine `deferred_exec.rs`**：
+  - `RuleExecutor::deferred_pending_for`：驱动事件挂起求值——join 键 + within 界
+    （`eval_interval_bound` 复用 P2）+ `emit at` 触发点（`eval_expr` + 时间归一化）；
+  - `RuleExecutor::execute_deferred_join`：到期评估——`asof_candidates` → 区间过滤
+    （`in_interval` + `row_matches_conds` 复用 P2）→ **reduce/exists** → 注入 → 输出；
+  - **reduce 执行器**：`maxrow`/`minrow`/`last`/`top(N)` + `tie` 破平 + 确定性第三键
+    （右窗 ts，设计 §9 风险 2）；`as label` 整行 object 注入（`ctx.fields[label]`）；
+  - 空集不输出（Q9 无 bid 的 auction 恰不输出）；纯存在（Q8）取区间内最早行。
+  - 输出复用 `build_each_alert_with`（origin/fired_at 参数化，`each_exec.rs`）。
+- **runtime `rule_task.rs`**：
+  - `DeferredRuntime` 挂起队列（每驱动行一实例）+ 事件时间 watermark；
+  - each 分支挂起（不即时输出）；批次尾 `scan_deferred` 到期扫描；
+  - `scan_timeouts` 事件时间到期（**不叠加墙钟**——replay 对拍依赖事件时间序）；
+  - `flush`（EOS/关闭）触发全部剩余实例；
+  - **单 worker**（`spawn.rs` Each 分支排除 deferred sharding，设计 §9 风险 5）。
+
+### 13.2 测试
+
+- engine（`tests/deferred_join.rs`）：挂起求值（key/界/expiry）、Q9 maxrow+tie+label、
+  空集不输出、纯存在（Q8）、minrow/last/top 选择器。
+- 端到端（`engine_task/deferred_integration_tests.rs`）：watermark 过 expiry 输出胜者
+  （origin=deferred）、无 bid 不输出、EOS flush 触发剩余。
+
+### 13.2b review 修复（同轮）
+
+- **minrow + tie 破平方向**（真 bug）：`min_by` 复用 max 方向比较器导致 `tie asc` 取
+  大者。新增 `reduce_row_cmp_min`（tie/ts 与主键同向，等价 SQL `ORDER BY price ASC,
+  dateTime ASC`）。
+- **deferred + `let` 绑定**：挂起求值前 `apply_lets`（`each_exec::apply_lets` 提
+  pub(crate)）——界/触发点/yield 可引用裸名绑定。
+- **match 形态 + `emit_at` 防护**（防静默无输出）：checker 报错「v1 仅支持 on-each
+  驱动形态」——rule_task 的挂起逻辑在 each 分支，match 形态无承载点。
+- 补测试：minrow+tie asc 破平、post-join where 抑制、let 绑定触发点、上开界排除边界、
+  多条件复核、checker match 形态拒绝 / each 形态通过。
+
+### 13.2c 性能基准（`match_engine/tests/deferred_bench.rs`）
+
+热路径分解（release，`cargo test --release -p wf-engine deferred_bench -- --ignored`）：
+
+| 路径 | ns/op | vs eager |
+|---|---|---|
+| **挂起**（`deferred_pending_for`，Q9 驱动行） | 125 | — |
+| 挂起 + `let` 绑定（apply_lets） | 191 | 153% |
+| **到期评估**（maxrow+tie+label+alert 构建） | 1346 | — |
+| 到期评估（纯存在 Q8） | 1086 | 81% |
+| 候选 8 行 | 1485 | 110% |
+| 候选 64 行 | 3136 | 233% |
+| eager interval（P2，同环境基线） | 908 | 100% |
+
+结论：挂起成本极低（Q9 180 万 auction 挂起 ~0.2s）；到期评估 1.35µs/实例（约为 eager
+interval 的 1.5×，多出 reduce 选择 + label 注入 + 完整 alert 构建，与 on-each 输出同量级）；
+候选行数线性影响 reduce/过滤（64 行 2.3×，与 P2 一致）。另附 debug 常规回归
+`deferred_join_overhead_bounded`（eval ≤ eager × 8 + 50ns；pending < 2µs）。
+
+### 13.3 边界（v1 限制与后续）
+
+- 单 deferred join（规则内第一个 `emit at` join 驱动；后续忽略）——多 deferred join 留后续。
+- deferred join 仅支持 on-each 驱动形态（match 形态 checker 拒绝，见 §13.2b）。
+- `top(N)` 输出取首行 + label 注入；N>1 多行 Array 注入未实现（无现实用例）。
+- oracle（wfgen）跨仓库对拍未在本仓执行（`warp-fusion/crates/wfgen`）。

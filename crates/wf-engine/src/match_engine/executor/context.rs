@@ -365,14 +365,14 @@ fn execute_interval_join(
 }
 
 /// 区间谓词：`lo ≤ ts ≤ hi`（`open` 记号取开区间）。
-fn in_interval(ts: i64, lo_ns: i64, hi_ns: i64, lo_open: bool, hi_open: bool) -> bool {
+pub(crate) fn in_interval(ts: i64, lo_ns: i64, hi_ns: i64, lo_open: bool, hi_open: bool) -> bool {
     let lo_ok = if lo_open { ts > lo_ns } else { ts >= lo_ns };
     let hi_ok = if hi_open { ts < hi_ns } else { ts <= hi_ns };
     lo_ok && hi_ok
 }
 
 /// 区间界求值 → 纳秒：常量界相对左事件 ts（Dur，可负）；行内界为左行绝对时间表达式。
-fn eval_interval_bound(
+pub(crate) fn eval_interval_bound(
     bound: &wf_lang::ast::Bound,
     ctx: &Event,
     event_time_nanos: i64,
@@ -394,7 +394,7 @@ fn eval_interval_bound(
 }
 
 /// 把匹配行的字段物化进 eval context（限定名 `window.field` + 裸名）。
-fn enrich_join_row(ctx: &mut Event, join: &JoinPlan, row: &JoinRow) {
+pub(crate) fn enrich_join_row(ctx: &mut Event, join: &JoinPlan, row: &JoinRow) {
     for field_name in row.field_names() {
         let Some(value) = row.field_value(field_name) else {
             continue;
@@ -410,7 +410,7 @@ fn enrich_join_row(ctx: &mut Event, join: &JoinPlan, row: &JoinRow) {
 /// Extract the first join condition's `(right key field, left value)`, so the
 /// join can use a hash-index lookup for the primary key condition before
 /// filtering by any remaining conditions.
-fn first_join_key(ctx: &Event, conds: &[JoinCondPlan]) -> Option<(String, Value)> {
+pub(crate) fn first_join_key(ctx: &Event, conds: &[JoinCondPlan]) -> Option<(String, Value)> {
     let cond = conds.first()?;
     let left_name = field_ref_name(&cond.left);
     let val = ctx.fields.get(left_name)?.clone();
@@ -448,7 +448,7 @@ fn find_asof_row(
 }
 
 /// Check whether a row satisfies all join conditions against the current context.
-fn row_matches_conds(row: &JoinRow, conds: &[JoinCondPlan], ctx: &Event) -> bool {
+pub(crate) fn row_matches_conds(row: &JoinRow, conds: &[JoinCondPlan], ctx: &Event) -> bool {
     conds.iter().all(|cond| {
         let left_name = field_ref_name(&cond.left);
         let right_name = field_ref_name(&cond.right);

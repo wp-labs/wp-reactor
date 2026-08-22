@@ -43,7 +43,7 @@ impl RuleExecutor {
     /// them by bare name. Bindings evaluate in order — a later `let` may
     /// reference an earlier one; a binding that fails to evaluate (null)
     /// leaves no injected field (later references then read as absent/null).
-    fn apply_lets(&self, ctx: &mut Event) {
+    pub(crate) fn apply_lets(&self, ctx: &mut Event) {
         for l in &self.plan.lets {
             if let Some(v) = eval_expr_with_l3(&l.expr, ctx, YieldMeta::default()) {
                 ctx.fields.insert(l.name.clone().into(), v);
@@ -940,14 +940,32 @@ impl RuleExecutor {
         field_order: &[&SmolStr],
         emit_time_nanos: i64,
     ) -> CoreResult<Option<OutputRecord>> {
+        self.build_each_alert_with(
+            ctx,
+            event_time_nanos,
+            AlertOrigin::Event,
+            field_order,
+            emit_time_nanos,
+        )
+    }
+
+    /// [`Self::build_each_alert`] 的可参数化版本：允许自定义 [`AlertOrigin`] 与
+    /// `fired_at` 事件时间（P3 deferred join 到期输出用 `origin=Deferred`、
+    /// `fired_at=到期 watermark`）。
+    pub(crate) fn build_each_alert_with(
+        &self,
+        ctx: &Event,
+        fired_at_nanos: i64,
+        origin: AlertOrigin,
+        field_order: &[&SmolStr],
+        emit_time_nanos: i64,
+    ) -> CoreResult<Option<OutputRecord>> {
         let statics = self.output_static();
         let score = eval_score(&self.plan.score_plan.expr, ctx)?;
         let entity_id = eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?;
-        let origin = AlertOrigin::Event;
-        let fired_at = format_nanos_utc(event_time_nanos);
+        let fired_at = format_nanos_utc(fired_at_nanos);
         let emit_time = self.cached_emit_time(emit_time_nanos);
-        let wfx_id =
-            build_each_wfx_id(&self.plan.name, event_time_nanos, ctx, &origin, field_order);
+        let wfx_id = build_each_wfx_id(&self.plan.name, fired_at_nanos, ctx, &origin, field_order);
         // Summary is a plan constant on this path (empty scope + empty steps)
         // — precomputed in `OutputStatic`, no per-event formatting.
         let summary = Arc::clone(
@@ -964,7 +982,7 @@ impl RuleExecutor {
             score,
             &entity_id,
             &origin,
-            event_time_nanos,
+            fired_at_nanos,
             emit_time_nanos,
         );
         let yield_fields = with_yield_eval_scope(|| {
@@ -1016,7 +1034,7 @@ impl RuleExecutor {
             yield_target: Arc::clone(&statics.yield_target),
             yield_fields,
             yield_field_types: Arc::clone(&statics.yield_field_types),
-            event_time_nanos,
+            event_time_nanos: fired_at_nanos,
             machine_id,
             scope_key: Arc::clone(&statics.rule_name),
         }))
