@@ -339,7 +339,15 @@ impl StatsTask {
     ///
     /// 带 key（P2）: 每桶一条 alert; 桶键拆解为 `scope_key` + 键字段值注入
     /// `field_values`（yield 可读分组键字段, 如 Q12 的 bidder）。
+    ///
+    /// **空窗不产出**（设计 §6/§7: 空桶无事件不产出, 对齐 CEP 无实例即无输出）:
+    /// 空键规则预建 Empty 桶（全 0 累加器）, 无 guard 直接 close 会产出全 0 alert。
+    /// 分段归并下事件推进路径本不会空窗 close, 此 guard 是显式不变式 + 未来
+    /// session/sliding 路径的防线。
     async fn close_current_window(&mut self, window_start: i64, window_end: i64) {
+        if self.stats.window.event_count == 0 {
+            return;
+        }
         let buckets = self.stats.close_window_by_bucket();
         let labels: Vec<String> = self
             .stats

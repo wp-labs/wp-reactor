@@ -913,3 +913,30 @@ async fn stats_task_segments_empty_key_batch_across_window_boundary() {
     );
     assert!(alert_rx.try_recv().is_err(), "只有 2 窗");
 }
+
+#[tokio::test]
+async fn stats_task_empty_key_jump_emits_no_zero_windows() {
+    // 空键单批跨多窗跳变（5s → 35s, 10s 窗）: 窗口 1 收 5s 行, 窗口 4 收 35s 行,
+    // 空窗口 2/3 不得产出。旧整批归并: 先按 max=35s 推进 → 窗口 1 空窗 close
+    // 产出全 0 alert（空键预建 Empty 桶）, 两行全进窗口 4。
+    let (mut task, mut alert_rx, _progress) = make_stats_task();
+    let batch = make_ts_batch(&[("10.0.0.1", 5_000_000_000), ("10.0.0.2", 35_000_000_000)]);
+    push_batch(&mut task, batch, 1).await;
+    task.flush().await;
+    let a1 = take_alert(&mut alert_rx);
+    assert_eq!(
+        field_str(&a1, "detail"),
+        "1 1 1",
+        "窗口 1 [0,10): total=1 r1=1 uniq=1"
+    );
+    let a2 = take_alert(&mut alert_rx);
+    assert_eq!(
+        field_str(&a2, "detail"),
+        "1 0 1",
+        "窗口 4 [30,40): total=1 r1=0 uniq=1"
+    );
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "只有 2 窗——空窗/跳变不得产出全 0 alert"
+    );
+}

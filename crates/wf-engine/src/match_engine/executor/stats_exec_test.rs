@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Date32Array, Float64Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{Date32Array, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{BinOp, Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan, WindowSpec};
@@ -977,4 +977,98 @@ fn stats_columnar_row_subset_keyed_disjoint_partition() {
     let mut union = b0;
     union.extend(b1);
     assert_eq!(full.final_measure_values_by_bucket(), union);
+}
+
+#[test]
+fn stats_columnar_keyed_precision_matches_empty_key_native() {
+    // D7/D8 回归（review 发现）: 带 key 列式路径曾经 `column_value` 把 Int64
+    // 转 `Value::Number(f64)`——≥2^53 的 id 被舍入（2^53 与 2^53+1 的 f64 相同）:
+    // distinct 从 2 塌缩到 1、sum 从 2^54+1 变成 2^54, 与空键列式原生路径发散。
+    // 修复后带 key 走原生列值（column_i128/column_distinct_key）。
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![
+                9_007_199_254_740_992i64, // 2^53
+                9_007_199_254_740_993i64, // 2^53+1（f64 会舍入到 2^53）
+            ])),
+            Arc::new(Int64Array::from(vec![1i64, 1])),
+            Arc::new(Int64Array::from(vec![100i64, 200])),
+        ],
+    )
+    .unwrap();
+
+    // 带 key: group by (auction); 度量 = distinct(bidder) + sum(bidder)
+    let keyed_plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![
+            distinct_measure("bidders", "bidder"),
+            sum_measure("sum_bidder", "bidder"),
+        ],
+    );
+    let mut keyed = StatsExecutor::new(keyed_plan);
+    assert!(keyed.process_batch(&batch), "字段键应可列式化");
+    let buckets = keyed.final_measure_values_by_bucket();
+    assert_eq!(buckets.len(), 1, "单 auction 桶");
+    assert_eq!(buckets[0].0, ScopeKey::Int(1));
+    // distinct 原生 = 2（f64 路径会塌缩到 1）
+    assert_eq!(buckets[0].1[0], 2.0, "≥2^53 的 distinct 不得 f64 化");
+    // sum 精确断言（i128 累加器域）: 2^53 + (2^53+1) = 2^54+1
+    let accs = keyed.window.buckets.get(&ScopeKey::Int(1)).unwrap();
+    assert_eq!(
+        accs[1].sum_i128,
+        9_007_199_254_740_992i128 + 9_007_199_254_740_993i128,
+        "≥2^53 的 sum 不得 f64 舍入"
+    );
+
+    // 空键同批对照: 两列式路径同精度
+    let mut empty = StatsExecutor::new(simple_plan(vec![
+        distinct_measure("bidders", "bidder"),
+        sum_measure("sum_bidder", "bidder"),
+    ]));
+    assert!(empty.process_batch(&batch));
+    let ev = empty.final_measure_values();
+    assert_eq!(ev[0], 2.0);
+    assert_eq!(ev[1], buckets[0].1[1], "带 key 与空键列式 sum 同精度");
+}
+
+#[test]
+fn stats_columnar_keyed_timestamp_distinct_native() {
+    // review 发现: 旧 `column_value` 不含 Timestamp 分派——带 key 列式对
+    // Timestamp 字段 distinct 全跳过（静默 0）; 修复后原生 i64（对齐
+    // insert_distinct_column 的 from_i64, D7 口径）。
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]));
+    let t0 = 1_700_000_000_000_000_000i64;
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 1, 1])),
+            Arc::new(TimestampNanosecondArray::from(vec![t0, t0 + 1, t0])),
+        ],
+    )
+    .unwrap();
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![distinct_measure("days", "dateTime")],
+    );
+    let mut exec = StatsExecutor::new(plan);
+    assert!(exec.process_batch(&batch));
+    let buckets = exec.final_measure_values_by_bucket();
+    assert_eq!(
+        buckets[0].1,
+        vec![2.0],
+        "Timestamp 原生 distinct = 2（修复前为 0）"
+    );
 }

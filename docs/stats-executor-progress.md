@@ -284,3 +284,29 @@ Q17 尾窗完整验证需 bench 关停前给足 flush 时间（bench.sh 追平�
 wf-engine 586 / wf-runtime 196 / wf-lang 567 全绿（含新增 5 测试）。
 端到端: Q16 EPS 6.9M（CEP 3.4M, 2.1×）RSS 3.9GB（CEP 10.2GB）; Q12 stats
 EPS 2.5M（CEP 12M, stats 逐桶 close 为热点）; Q17 stats EPS 1.9M（CEP 6.8M）。
+
+### 9.7 P2 review 修复（2026-08-22, 提交 xxx）
+
+1. **🔴 D7/D8 精度（已修）**: `accumulate_keyed_row` 原经 `column_value` 把 Int64
+   转 `Value::Number(f64)` 再回 i128/distinct——≥2^53 的 id 被舍入（2^53 与
+   2^53+1 的 f64 相同 → distinct 塌缩、sum 失真）, 与空键列式原生路径发散; 且
+   `column_value` 不含 Timestamp 分派 → 带 key 对 Timestamp distinct 静默全跳过。
+   修复: 原生列值读取 `column_i128`/`column_distinct_key`（Int64 原生 i64、
+   Timestamp 原生 i64, 对齐 insert_distinct_column/sum_masked 口径）。
+   测试: `stats_columnar_keyed_precision_matches_empty_key_native` /
+   `stats_columnar_keyed_timestamp_distinct_native`。
+2. **🟡 空窗不产出（已修, 显式不变式）**: `close_current_window` 加
+   `event_count == 0` guard——空键规则预建 Empty 桶（全 0）, 无 guard 时空窗
+   close 会产出全 0 alert（分段归并下事件推进路径本不触发, 为显式不变式 +
+   session/sliding 未来路径防线）。测试:
+   `stats_task_empty_key_jump_emits_no_zero_windows`（5s→35s 跳窗, 空窗不产出）。
+3. **📊 性能发现（非 bug, 记录）**: debug 文件 sink 对 stats 逐桶 emit 是重大
+   瓶颈——同二进制 Q12 30M: sink 开 2.66M EPS/5.8GB vs sink 关 14.9M EPS/857MB
+   （每窗 close 内 2830 条 alert 顺序 await 投递, sink 慢则回压停整条归并循环）;
+   CEP 12M 不受影响。正常 bench（blackhole sink）下 stats Q12 实际快于 CEP。
+   后续可把 per-bucket emit 批量合成一次投递。
+
+### 9.8 P2 全量回归（review 后）
+
+wf-engine 588 / wf-runtime 197 / wf-lang 567 全绿。端到端复验（Q12 30M,
+precision 修复后）: 849,372/849,372 组合与 CEP 逐值一致, 0 差异。

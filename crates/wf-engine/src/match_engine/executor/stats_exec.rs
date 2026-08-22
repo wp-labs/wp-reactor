@@ -444,6 +444,10 @@ impl StatsExecutor {
     }
 
     /// 单行桶归并（P2 复合键逐行路径的公共主体, 供全批/行域两分支复用）。
+    ///
+    /// 字段读取走**原生列值**（`column_i128`/`column_distinct_key`）——与空键
+    /// 列式段同精度（D7/D8: ≥2^53 的 Int64 不得经 `Value::Number(f64)` 舍入;
+    /// Timestamp 列 distinct 也走原生 i64, 不得静默跳过）。
     fn accumulate_keyed_row(
         &mut self,
         batch: &RecordBatch,
@@ -464,40 +468,39 @@ impl StatsExecutor {
             }
             let acc = &mut bucket[idx];
             acc.count += 1;
-            if let Some(field) = &measure.field
-                && let Some(val) = column_value(batch, field_name(field), row)
-            {
-                match measure.agg {
-                    StatsAggPlan::Count => {}
-                    StatsAggPlan::Sum | StatsAggPlan::Avg => {
-                        if let Some(nn) = value_to_i128(&val) {
-                            acc.sum_i128 += nn;
-                        }
+            let Some(field) = &measure.field else {
+                continue;
+            };
+            match measure.agg {
+                StatsAggPlan::Count => {}
+                StatsAggPlan::Sum | StatsAggPlan::Avg => {
+                    if let Some(nn) = column_i128(batch, field_name(field), row) {
+                        acc.sum_i128 += nn;
                     }
-                    StatsAggPlan::Min => {
-                        if let Some(nn) = value_to_i128(&val) {
-                            acc.min = Some(match acc.min {
-                                Some(m) if m <= nn => m,
-                                _ => nn,
-                            });
-                        }
+                }
+                StatsAggPlan::Min => {
+                    if let Some(nn) = column_i128(batch, field_name(field), row) {
+                        acc.min = Some(match acc.min {
+                            Some(m) if m <= nn => m,
+                            _ => nn,
+                        });
                     }
-                    StatsAggPlan::Max => {
-                        if let Some(nn) = value_to_i128(&val) {
-                            acc.max = Some(match acc.max {
-                                Some(m) if m >= nn => m,
-                                _ => nn,
-                            });
-                        }
+                }
+                StatsAggPlan::Max => {
+                    if let Some(nn) = column_i128(batch, field_name(field), row) {
+                        acc.max = Some(match acc.max {
+                            Some(m) if m >= nn => m,
+                            _ => nn,
+                        });
                     }
-                    StatsAggPlan::DistinctCount => {
-                        acc.distinct_set
-                            .get_or_insert_with(HashSet::new)
-                            .insert(value_to_distinct_key(&val));
+                }
+                StatsAggPlan::DistinctCount => {
+                    if let Some(k) = column_distinct_key(batch, field_name(field), row) {
+                        acc.distinct_set.get_or_insert_with(HashSet::new).insert(k);
                     }
-                    StatsAggPlan::Last | StatsAggPlan::Top => {
-                        // P1 不实现（Q18/Q19 扩展）
-                    }
+                }
+                StatsAggPlan::Last | StatsAggPlan::Top => {
+                    // P1 不实现（Q18/Q19 扩展）
                 }
             }
         }
@@ -639,33 +642,50 @@ fn tier_index(v: f64, bounds: &[f64]) -> i64 {
     bounds.iter().position(|b| v < *b).unwrap_or(bounds.len()) as i64
 }
 
-/// 从 batch 列读单行值（Int64/Float64/Utf8/Bool; null → None）。
-/// 用于带 key 批处理的归并（f64 口径与行式一致; >2^53 分歧为文档化 D7）。
-fn column_value(batch: &RecordBatch, name: &str, row: usize) -> Option<Value> {
+/// 从 batch 列读单行原生数值（Int64 原生 i64 → i128, 不走 f64——D8: ≥2^53 的
+/// Int64 经 `Value::Number(f64)` 会丢精度; Float64 按 `sum_masked` 同口径截断）。
+/// null / 非数值列 → None（与行式 `value_to_i128` 的 None 一致）。
+fn column_i128(batch: &RecordBatch, name: &str, row: usize) -> Option<i128> {
     let idx = batch.schema().index_of(name).ok()?;
     let col = batch.column(idx);
     if col.is_null(row) {
         return None;
     }
-    match col.data_type() {
-        DataType::Int64 => col
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .map(|a| Value::Number(a.value(row) as f64)),
-        DataType::Float64 => col
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .map(|a| Value::Number(a.value(row))),
-        DataType::Utf8 => col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .map(|a| Value::Str(a.value(row).into())),
-        DataType::Boolean => col
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .map(|a| Value::Bool(a.value(row))),
-        _ => None,
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return Some(a.value(row) as i128);
     }
+    if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+        return Some(a.value(row) as i128);
+    }
+    None
+}
+
+/// 从 batch 列读单行原生 distinct 键（与列式段 `insert_distinct_column` 同类型
+/// 分派, 原生值构造——D7: 禁止 `Value::Number(f64)` 化 ≥2^53 的 Int64）。
+/// null / 类型不在支持集 → None（与行式 extract None 一致）。
+fn column_distinct_key(batch: &RecordBatch, name: &str, row: usize) -> Option<DistinctKey> {
+    use arrow::array::TimestampNanosecondArray;
+    let idx = batch.schema().index_of(name).ok()?;
+    let col = batch.column(idx);
+    if col.is_null(row) {
+        return None;
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return Some(DistinctKey::from_i64(a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+        return Some(DistinctKey::from_f64(a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        return Some(DistinctKey::from_str(a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<BooleanArray>() {
+        return Some(DistinctKey::from_f64(if a.value(row) { 1.0 } else { 0.0 }));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        return Some(DistinctKey::from_i64(a.value(row)));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
