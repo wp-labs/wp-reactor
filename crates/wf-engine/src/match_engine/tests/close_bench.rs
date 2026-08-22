@@ -23,6 +23,15 @@
 //!
 //! 生产外围路径（2026-08-22 追加——状态机 advance 之外，rule_task 每行循环）：
 //!   masks_build     : `RuleExecutor::branch_guard_masks` 列式 guard mask（batch 级，摊到行）
+//!
+//! 已否决的优化（2026-08-22 A/B 实测，勿重试）：
+//!   - `needs_collected_values`（update_measure 跳过 raw 值收集）：q15 每事件仅 4
+//!     branch 带 field 值，push_capped 只省 ~7ns，但新增参数破坏 accumulate_close_steps
+//!     内联 → 实测 -7~-13ns/evt 负优化（baseline 550 vs collect_on 542）。
+//!   - distinct 集合换 `foldhash::fast::FixedState`：固定种子反而比 RandomState 慢
+//!     ~49%（distinct_valkey_fixed 92ns vs valkey 62ns）；RandomState 的
+//!     `GlobalSeed::get` 是原子读已足够快，且固定种子失去 foldhash 的每-hasher
+//!     seed 混合。`distinct_i64`（原生 i64 key）仍是有效方向（35ns vs 62ns）。
 //!   scan_per_row    : `scan_expired_at_with_conv_skip_non_alerting` 每行过期扫描
 //!   deferred_row    : ColumnarEvent + advance_at_with_masks（列式 guard，deferred 路径）
 //!   eager_row       : 每行 Event 物化（HashMap 3 字段）+ advance_at（解释器 guard，eager 路径）
