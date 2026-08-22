@@ -11,9 +11,9 @@
 | 步骤 | 内容 | 状态 |
 |---|---|---|
 | ① 语法层 | AST + parser（stats 子句） | ✅ 已提交 `444778d`（wf-lang 557 全绿） |
-| ② 计划层 | StatsPlan 编译（桶键/度量/输出形状） | ✅ 待提交（wf-lang 559 + wf-engine 557 + wf-runtime 186 全绿） |
-| ③ 执行层 | StatsExecutor（空键 fixed count/distinct） | ⬜ 未开始 |
-| ④ 接线 + 对拍 | window fanout → StatsExecutor + Q15 验证 | ⬜ 未开始 |
+| ② 计划层 | StatsPlan 编译（桶键/度量/输出形状） | ✅ 已提交 `d09fdb0`（wf-lang 559 + wf-engine 557 + wf-runtime 186） |
+| ③ 执行层 | StatsExecutor（空键 fixed count/distinct/sum/avg/min/max） | ✅ 已提交 `8b68e8a`（5 单测 + 全量回归） |
+| ④ 接线 + 对拍 | window fanout → StatsExecutor + Q15 验证 | 🔶 进行中 |
 
 ---
 
@@ -87,30 +87,26 @@ stats<30m:fixed> {
 
 ---
 
-## 4. 下一步（步骤 ② 计划层）
+## 4. 已提交记录
 
-`crates/wf-lang/src/plan.rs` 新增：
+| 提交 | 内容 |
+|---|---|
+| `444778d` | 步骤① 语法层: AST + parser |
+| `d09fdb0` | 步骤② 计划层: StatsPlan 编译 |
+| `8b68e8a` | 步骤③ 执行层核心: StatsExecutor（count/distinct/sum/avg/min/max） |
 
-```rust
-pub struct StatsPlan {
-    pub window_spec: WindowSpec,
-    pub keys: Vec<ExprPlan>,             // 桶键表达式（含 tier() 桶键函数）
-    pub output_shape: OutputShape,       // Row | Column
-    pub measures: Vec<StatsMeasurePlan>,
-    pub tracked_bind_fields: HashMap<String, HashSet<String>>,
-}
-```
+## 5. 下一步（步骤 ④ 接线 + 对拍）
 
-`RulePlan` 加 `stats_plan: Option<StatsPlan>`；compiler `compile_stats` 从
-`RuleDecl.stats_clause` 编译（tier 展开、字段物化投影、yield 解析）。
+- **接线**: fanout 注册 stats 订阅（空键 `register` + `broadcast_batch_only`）→
+  StatsExecutor::process_rows; 窗口 close 时构建 Event（measure 值注入）→ 复用
+  RuleExecutor alert 构建（build_close_alert 同构）
+- **列式段（P1.5）**: 从 row-based 升级为 RecordBatch 列式读取（桶键分派 + 整列归并）
+- **Q15 对拍**: stats 版 q15 输出 12 列 vs 现有 CEP 版逐列一致
 
----
+## 6. 阻塞项
 
-## 5. 阻塞项
-
-- **系统文件句柄耗尽**（`Too many open files`，os error 24）：
-  需释放残留进程（多次编译/测试的 rustc 残留、浏览器进程）后继续。
-- 恢复后验证顺序：wf-lang 全量测试 → 提交语法层 → 计划层 → 执行层 → 接线对拍。
+- ~~系统文件句柄耗尽~~ ✅ 已恢复
+- 接线需确认 fanout 注册/ack 机制在 stats 场景的完整路径（研究已完成, 见步骤④）
 
 ---
 
