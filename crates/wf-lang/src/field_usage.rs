@@ -739,4 +739,227 @@ mod tests {
         assert!(!f.contains("bidder"));
         assert!(!f.contains("price"));
     }
+
+    fn minimal_match_plan() -> MatchPlan {
+        MatchPlan {
+            keys: vec![],
+            key_map: None,
+            key_join: None,
+            window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(600)),
+            event_steps: vec![],
+            close_steps: vec![],
+            close_mode: crate::ast::CloseMode::Or,
+            tracked_bind_aliases: std::collections::HashSet::new(),
+            tracked_bind_fields: std::collections::HashMap::new(),
+            tracked_plain_fields: std::collections::HashSet::new(),
+            match_mode: crate::ast::MatchMode::Any,
+            seq: None,
+            accu: false,
+            needs_field_history: false,
+        }
+    }
+
+    #[test]
+    fn filter_for_returns_none_when_window_needs_all() {
+        let mut plan = make_rule(
+            vec![BindPlan {
+                alias: "e".into(),
+                window: "auth_events".into(),
+                filter: None,
+            }],
+            minimal_match_plan(),
+        );
+        plan.match_plan.keys = vec![field_ref("sip")];
+        let usage = compute_window_field_usage(&[plan]);
+        assert!(usage.needs_all.contains("auth_events"));
+        assert_eq!(usage.filter_for("auth_events", ["sip", "dip"]), None);
+    }
+
+    #[test]
+    fn filter_for_empty_subset_materializes_nothing() {
+        // A window that no rule reads (e.g. an output-only window) gets an
+        // empty materialization filter, not full materialization.
+        let plan = make_rule(Vec::new(), minimal_match_plan());
+        let usage = compute_window_field_usage(&[plan]);
+        let f = usage
+            .filter_for("out", ["x", "y", "n"])
+            .expect("unused window should reduce to an empty set");
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn filter_for_full_subset_keeps_full_materialization() {
+        let mut plan = make_rule(
+            vec![BindPlan {
+                alias: "e".into(),
+                window: "auth_events".into(),
+                filter: Some(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
+            }],
+            minimal_match_plan(),
+        );
+        // A columnar bind filter keeps the window out of needs_all.
+        plan.match_plan.keys = vec![field_ref("sip")];
+        plan.match_plan.tracked_bind_fields = std::collections::HashMap::from([(
+            "e".to_string(),
+            std::collections::HashSet::from(["sip".to_string()]),
+        )]);
+        let usage = compute_window_field_usage(&[plan]);
+        assert!(!usage.needs_all.contains("auth_events"));
+        // Every schema field is referenced → no reduction.
+        assert_eq!(usage.filter_for("auth_events", ["sip", MACHINE_ID]), None);
+    }
+
+    #[test]
+    fn machine_id_always_collected() {
+        let plan = make_rule(Vec::new(), minimal_match_plan());
+        let usage = compute_window_field_usage(&[plan]);
+        assert!(
+            usage.global_fields.contains(MACHINE_ID),
+            "the match engine reads wp_src_ip from every event"
+        );
+    }
+
+    #[test]
+    fn key_map_and_keys_are_collected() {
+        let mut plan = make_rule(
+            vec![BindPlan {
+                alias: "a".into(),
+                window: "auth_events".into(),
+                filter: None,
+            }],
+            minimal_match_plan(),
+        );
+        plan.match_plan.keys = vec![field_ref("sip")];
+        plan.match_plan.key_map = Some(vec![crate::plan::KeyMapPlan {
+            logical_name: "user_id".into(),
+            source_alias: "a".into(),
+            source_field: "user".into(),
+        }]);
+        plan.match_plan.tracked_bind_fields = std::collections::HashMap::from([(
+            "a".to_string(),
+            std::collections::HashSet::from(["sip".to_string()]),
+        )]);
+        let usage = compute_window_field_usage(&[plan]);
+        assert!(usage.global_fields.contains("sip"));
+        assert!(usage.global_fields.contains("user_id"));
+        assert!(usage.global_fields.contains("user"));
+    }
+
+    #[test]
+    fn join_condition_fields_collected() {
+        let mut plan = make_rule(Vec::new(), minimal_match_plan());
+        plan.joins = vec![crate::plan::JoinPlan {
+            right_window: "bid_events".into(),
+            mode: crate::ast::JoinMode::Snapshot,
+            conds: vec![crate::plan::JoinCondPlan {
+                left: FieldRef::Qualified("b".into(), "auction".into()),
+                right: FieldRef::Qualified("auction_events".into(), "id".into()),
+            }],
+            within: None,
+            reduce: None,
+            emit_at: None,
+        }];
+        let usage = compute_window_field_usage(&[plan]);
+        assert!(usage.global_fields.contains("auction"));
+        assert!(usage.global_fields.contains("id"));
+    }
+
+    #[test]
+    fn seq_branch_fields_collected() {
+        let mut plan = make_rule(Vec::new(), minimal_match_plan());
+        plan.match_plan.seq = Some(crate::plan::SeqPlan {
+            consec: false,
+            skip: crate::plan::SeqSkipPlan::PastLast,
+            steps: vec![crate::plan::SeqStepPlan {
+                neg: false,
+                within: None,
+                branch: crate::plan::BranchPlan {
+                    label: None,
+                    source: "e".into(),
+                    field: Some(crate::ast::FieldSelector::Dot("action".into())),
+                    guard: None,
+                    agg: crate::plan::AggPlan {
+                        transforms: vec![],
+                        measure: crate::ast::Measure::Count,
+                        cmp: crate::ast::CmpOp::Ge,
+                        threshold: Expr::Number(1.0),
+                    },
+                },
+            }],
+        });
+        let usage = compute_window_field_usage(&[plan]);
+        assert!(usage.global_fields.contains("action"));
+    }
+
+    #[test]
+    fn stat_selector_args_are_not_treated_as_fields() {
+        let mut out = std::collections::HashSet::new();
+        collect_expr_fields(
+            &Expr::FuncCall {
+                qualifier: None,
+                name: "final".into(),
+                args: vec![Expr::Field(field_ref("lbl"))],
+            },
+            &mut out,
+        );
+        assert!(
+            out.is_empty(),
+            "stat-selector labels resolve from the eval context, not events"
+        );
+
+        let mut out2 = std::collections::HashSet::new();
+        collect_expr_fields(
+            &Expr::FuncCall {
+                qualifier: None,
+                name: "window_event".into(),
+                args: vec![Expr::Field(field_ref("auth"))],
+            },
+            &mut out2,
+        );
+        assert!(out2.is_empty());
+    }
+
+    #[test]
+    fn field_ref_name_edge_cases() {
+        assert_eq!(field_ref_name(&FieldRef::Simple("x".into())), "x");
+        assert_eq!(
+            field_ref_name(&FieldRef::Qualified("a".into(), "b".into())),
+            "b"
+        );
+        assert_eq!(
+            field_ref_name(&FieldRef::Bracketed("a".into(), "b".into())),
+            "b"
+        );
+        assert_eq!(
+            field_ref_name(&FieldRef::Path {
+                alias: "a".into(),
+                segments: vec![crate::ast::PathSegment::Field("root".into())],
+            }),
+            "root"
+        );
+        // A path starting with an index has no root field name.
+        assert_eq!(
+            field_ref_name(&FieldRef::Path {
+                alias: "a".into(),
+                segments: vec![crate::ast::PathSegment::Index(0)],
+            }),
+            ""
+        );
+    }
+
+    #[test]
+    fn untracked_bind_forces_needs_all() {
+        let plan = make_rule(
+            vec![BindPlan {
+                alias: "e".into(),
+                window: "auth_events".into(),
+                filter: None,
+            }],
+            minimal_match_plan(),
+        );
+        // tracked_bind_fields has no entry for `e` → close path iterates every
+        // field → full materialization required.
+        let usage = compute_window_field_usage(&[plan]);
+        assert!(usage.needs_all.contains("auth_events"));
+    }
 }

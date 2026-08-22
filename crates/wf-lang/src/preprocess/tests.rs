@@ -428,3 +428,66 @@ rule r {
         processed
     );
 }
+
+// ---------------------------------------------------------------------------
+// Extra coverage: passthrough / error branches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bare_dollar_not_followed_by_ident_is_passthrough() {
+    let v = vars(&[]);
+    // `$` before a digit / whitespace / end-of-input is left as-is.
+    assert_eq!(preprocess_vars("cost = $5", &v).unwrap(), "cost = $5");
+    assert_eq!(preprocess_vars("a $ b", &v).unwrap(), "a $ b");
+    assert_eq!(preprocess_vars("trailing $", &v).unwrap(), "trailing $");
+    assert_eq!(preprocess_vars("just $", &v).unwrap(), "just $");
+}
+
+#[test]
+fn braced_form_requires_ident_start() {
+    let v = vars(&[]);
+    let err = preprocess_vars("${5x}", &v).unwrap_err();
+    assert_eq!(err.position, 0);
+    assert!(
+        err.message.contains("expected variable name after ${"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn dollar_in_comment_and_string_passthrough_combined() {
+    let v = vars(&[("A", "1")]);
+    let source = "// keep $A and $B\n\"$A\" $A";
+    let processed = preprocess_vars(source, &v).unwrap();
+    assert_eq!(processed, "// keep $A and $B\n\"$A\" 1");
+}
+
+#[test]
+fn multi_byte_chars_before_var_are_preserved() {
+    let v = vars(&[("N", "7")]);
+    // A non-ASCII char before the `$` must not shift the substitution.
+    let source = "规则 $N 次";
+    let processed = preprocess_vars(source, &v).unwrap();
+    assert_eq!(processed, "规则 7 次");
+}
+
+#[test]
+fn underscore_leading_ident_substituted() {
+    let v = vars(&[("_X", "ok")]);
+    assert_eq!(preprocess_vars("$_X", &v).unwrap(), "ok");
+    assert_eq!(preprocess_vars("${_X}", &v).unwrap(), "ok");
+}
+
+#[test]
+fn error_positions_are_reported_in_original_source() {
+    let v = vars(&[]);
+    // First undefined var is at byte offset 0; the second at a later offset.
+    let err = preprocess_vars("$A then $B", &v).unwrap_err();
+    assert_eq!(err.position, 0);
+    assert!(err.message.contains("undefined variable 'A'"), "{}", err);
+
+    let err2 = preprocess_vars("xx $B", &v).unwrap_err();
+    assert_eq!(err2.position, 3);
+    assert!(err2.message.contains("undefined variable 'B'"), "{}", err2);
+}

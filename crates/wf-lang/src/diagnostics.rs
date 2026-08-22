@@ -1215,4 +1215,220 @@ rule preset_rule {
             None
         );
     }
+    // Extra coverage: entry-point diagnostics, categories, locations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_wfl_with_diagnostics_succeeds_on_valid_input() {
+        let source = r#"
+rule ok {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+        let file = parse_wfl_with_diagnostics(source, "rules/ok.wfl").unwrap();
+        assert_eq!(file.rules.len(), 1);
+    }
+
+    #[test]
+    fn validate_wfl_with_diagnostics_succeeds_on_valid_input() {
+        let source = r#"
+rule ok {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+        let file = parse_wfl(source).unwrap();
+        validate_wfl_with_diagnostics(
+            &file,
+            &[auth_events_window(), output_window()],
+            source,
+            "rules/ok.wfl",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn compile_wfl_with_diagnostics_returns_plans_and_reports_errors() {
+        let ok_source = r#"
+rule ok {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+        let file = parse_wfl(ok_source).unwrap();
+        let plans = compile_wfl_with_diagnostics(
+            &file,
+            &[auth_events_window(), output_window()],
+            ok_source,
+            "rules/ok.wfl",
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 1);
+
+        // Semantic error path returns a compile failure with the rule category.
+        let bad_source = r#"
+rule bad {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.bogus)
+}
+"#;
+        let file = parse_wfl(bad_source).unwrap();
+        let err = compile_wfl_with_diagnostics(
+            &file,
+            &[auth_events_window(), output_window()],
+            bad_source,
+            "rules/bad.wfl",
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("category: type"), "{text}");
+        assert!(text.contains("rule: bad"), "{text}");
+        assert!(text.contains("location: line"), "{text}");
+    }
+
+    #[test]
+    fn compile_diagnostic_classifies_topology_and_sink() {
+        let classify = |msg: &str| {
+            classify_check_error(&CheckError {
+                severity: Severity::Error,
+                rule: Some("r".into()),
+                test: None,
+                message: msg.to_string(),
+            })
+        };
+        assert_eq!(classify("pipeline stage topology issue"), "topology");
+        assert_eq!(classify("intermediate window cycle"), "topology");
+        assert_eq!(classify("output sink not found"), "sink");
+        assert_eq!(classify("yield window mismatch"), "yield");
+        assert_eq!(classify("unknown field `x`"), "type");
+        assert_eq!(classify("set-level alias in where"), "type");
+        assert_eq!(classify("something else entirely"), "rule");
+        // test-bound errors classify as "test" regardless of message.
+        let test_err = CheckError {
+            severity: Severity::Error,
+            rule: None,
+            test: Some("t".into()),
+            message: "boom".to_string(),
+        };
+        assert_eq!(classify_check_error(&test_err), "test");
+    }
+
+    #[test]
+    fn test_block_error_uses_test_location() {
+        let source = r#"
+rule ok {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+
+test t for missing_rule {
+    input { row(e, sip = "x"); }
+    expect { hits == 1; }
+}
+"#;
+        let file = parse_wfl(source).unwrap();
+        let errors = check_wfl_errors(&file, &[auth_events_window(), output_window()]);
+        let test_error = errors
+            .iter()
+            .find(|e| e.test.is_some())
+            .cloned()
+            .expect("test block errors carry test context");
+        let formatted = format_check_error_with_source(
+            &test_error,
+            &file,
+            source,
+            std::path::Path::new("rules/t.wfl"),
+        );
+        assert!(formatted.contains("test: t"), "{formatted}");
+        assert!(formatted.contains("location: line 9"), "{formatted}");
+    }
+
+    #[test]
+    fn heuristic_location_needles_pick_section_keywords() {
+        let mk = |msg: &str| CheckError {
+            severity: Severity::Error,
+            rule: Some("r".into()),
+            test: None,
+            message: msg.to_string(),
+        };
+        assert_eq!(
+            heuristic_location_needles(&mk("alias `x` is not a declared event alias"), "rule"),
+            vec!["match"]
+        );
+        assert_eq!(
+            heuristic_location_needles(&mk("yield arg missing"), "yield"),
+            vec!["yield"]
+        );
+        assert_eq!(
+            heuristic_location_needles(&mk("score expression must be numeric"), "rule"),
+            vec!["score"]
+        );
+        assert_eq!(
+            heuristic_location_needles(&mk("entity id type mismatch"), "rule"),
+            vec!["entity"]
+        );
+        assert_eq!(
+            heuristic_location_needles(&mk("event alias `x` conflicts"), "rule"),
+            vec!["events"]
+        );
+        assert_eq!(
+            heuristic_location_needles(&mk("match key missing"), "rule"),
+            vec!["match"]
+        );
+        assert_eq!(
+            heuristic_location_needles(&mk("misc error"), "rule"),
+            vec!["rule"]
+        );
+    }
+
+    #[test]
+    fn message_backtick_token_extraction() {
+        assert_eq!(
+            message_backtick_tokens("field `a.b` not found in window `w`"),
+            vec!["a.b", "w"]
+        );
+        // Unterminated backtick stops extraction.
+        assert_eq!(
+            message_backtick_tokens("dangling `token"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            primary_backtick_tokens("field `x` unknown", "type"),
+            vec!["x"]
+        );
+        assert_eq!(
+            primary_backtick_tokens("argument `a` wrong", "type"),
+            vec!["a"]
+        );
+        assert_eq!(
+            primary_backtick_tokens("source `s` missing", "type"),
+            vec!["s"]
+        );
+        assert_eq!(
+            primary_backtick_tokens("target window `w` unknown", "type"),
+            vec!["w"]
+        );
+        assert_eq!(
+            primary_backtick_tokens("target `t` missing", "type"),
+            vec!["t"]
+        );
+    }
+
+    #[test]
+    fn translate_position_caps_out_of_range_offset() {
+        assert_eq!(translate_position("ab\ncd", 1000), (2, 3));
+        assert_eq!(translate_position("", 0), (1, 1));
+        assert_eq!(translate_position("a\nb\nc", 3), (2, 2));
+    }
 }

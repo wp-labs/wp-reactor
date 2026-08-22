@@ -355,3 +355,241 @@ fn collect_preset_params<'a>(expr: &'a Expr, on_param: &mut impl FnMut(&'a str))
         | Expr::Field(_) => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{YieldPresetParam, YieldPresetRef};
+
+    fn preset(name: &str, params: Vec<YieldPresetParam>, args: Vec<NamedArg>) -> YieldPresetDecl {
+        YieldPresetDecl {
+            name: name.to_string(),
+            params,
+            args,
+        }
+    }
+
+    fn param(name: &str, default: Option<Expr>) -> YieldPresetParam {
+        YieldPresetParam {
+            name: name.to_string(),
+            default,
+        }
+    }
+
+    fn arg(name: &str, value: Expr) -> NamedArg {
+        NamedArg {
+            name: name.to_string(),
+            value,
+        }
+    }
+
+    fn preset_ref(name: &str, args: Vec<Expr>) -> YieldPresetRef {
+        YieldPresetRef {
+            name: name.to_string(),
+            args,
+        }
+    }
+
+    fn yield_clause(presets: Vec<YieldPresetRef>, args: Vec<NamedArg>) -> YieldClause {
+        YieldClause {
+            target: "out".to_string(),
+            version: None,
+            presets,
+            args,
+        }
+    }
+
+    fn error_messages(errors: &[YieldPresetError]) -> Vec<String> {
+        errors.iter().map(YieldPresetError::message).collect()
+    }
+
+    #[test]
+    fn validate_detects_duplicate_preset() {
+        let p = preset("base", vec![], vec![arg("y", Expr::StringLit("x".into()))]);
+        let errors = validate_yield_presets(&[p.clone(), p]);
+        let msgs = error_messages(&errors);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("duplicate yield preset `base`")),
+            "got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_detects_duplicate_and_misordered_params() {
+        let p = preset(
+            "base",
+            vec![
+                param("a", None),
+                param("b", Some(Expr::Number(1.0))),
+                param("a", None),
+            ],
+            vec![],
+        );
+        let errors = validate_yield_presets(&[p]);
+        let msgs = error_messages(&errors);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("duplicate yield preset parameter `a`")),
+            "got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_detects_required_param_after_default() {
+        let p = preset(
+            "base",
+            vec![param("a", Some(Expr::Number(1.0))), param("b", None)],
+            vec![],
+        );
+        let errors = validate_yield_presets(&[p]);
+        let msgs = error_messages(&errors);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("required parameter `b` cannot follow a defaulted parameter")),
+            "got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_detects_unknown_param_in_default() {
+        let p = preset(
+            "base",
+            vec![param("a", Some(Expr::PresetParam("nope".into())))],
+            vec![],
+        );
+        let errors = validate_yield_presets(&[p]);
+        let msgs = error_messages(&errors);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("unknown yield preset parameter `$nope`")),
+            "got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn expand_rejects_duplicate_and_unknown_preset_refs() {
+        let presets = [preset(
+            "base",
+            vec![],
+            vec![arg("y", Expr::StringLit("x".into()))],
+        )];
+        let dup = yield_clause(
+            vec![preset_ref("base", vec![]), preset_ref("base", vec![])],
+            vec![],
+        );
+        let err = expand_yield_args(&presets, &dup).unwrap_err();
+        assert!(err.message().contains("referenced more than once"));
+
+        let unknown = yield_clause(vec![preset_ref("missing", vec![])], vec![]);
+        let err = expand_yield_args(&presets, &unknown).unwrap_err();
+        assert!(err.message().contains("unknown yield preset `missing`"));
+    }
+
+    #[test]
+    fn expand_rejects_preset_param_in_inline_args() {
+        let presets = [preset(
+            "base",
+            vec![],
+            vec![arg("y", Expr::StringLit("x".into()))],
+        )];
+        let clause = yield_clause(vec![], vec![arg("z", Expr::PresetParam("p".into()))]);
+        let err = expand_yield_args(&presets, &clause).unwrap_err();
+        assert!(
+            err.message()
+                .contains("can only be used inside a yield preset")
+        );
+    }
+
+    #[test]
+    fn expand_missing_and_too_many_args() {
+        let presets = [preset(
+            "base",
+            vec![param("a", None), param("b", Some(Expr::Number(2.0)))],
+            vec![arg("y", Expr::PresetParam("a".into()))],
+        )];
+        let missing = yield_clause(vec![preset_ref("base", vec![])], vec![]);
+        let err = expand_yield_args(&presets, &missing).unwrap_err();
+        assert!(err.message().contains("missing required argument `a`"));
+
+        let too_many = yield_clause(
+            vec![preset_ref(
+                "base",
+                vec![Expr::Number(1.0), Expr::Number(2.0), Expr::Number(3.0)],
+            )],
+            vec![],
+        );
+        let err = expand_yield_args(&presets, &too_many).unwrap_err();
+        assert!(err.message().contains("expects 1..2 arguments, got 3"));
+    }
+
+    #[test]
+    fn expand_substitutes_params_in_nested_exprs() {
+        let presets = [preset(
+            "base",
+            vec![param("s", None)],
+            vec![arg(
+                "y",
+                Expr::IfThenElse {
+                    cond: Box::new(Expr::PresetParam("s".into())),
+                    then_expr: Box::new(Expr::Array(vec![Expr::PresetParam("s".into())])),
+                    else_expr: Box::new(Expr::StringLit("low".into())),
+                },
+            )],
+        )];
+        let clause = yield_clause(
+            vec![preset_ref("base", vec![Expr::StringLit("high".into())])],
+            vec![],
+        );
+        let merged = expand_yield_args(&presets, &clause).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].value,
+            Expr::IfThenElse {
+                cond: Box::new(Expr::StringLit("high".into())),
+                then_expr: Box::new(Expr::Array(vec![Expr::StringLit("high".into())])),
+                else_expr: Box::new(Expr::StringLit("low".into())),
+            }
+        );
+    }
+
+    #[test]
+    fn expand_unknown_param_in_body_rejected() {
+        // A body referencing a param that was never bound (e.g. it is not in
+        // params and not an argument) errors during substitution.
+        let presets = [preset(
+            "base",
+            vec![],
+            vec![arg("y", Expr::PresetParam("ghost".into()))],
+        )];
+        let clause = yield_clause(vec![preset_ref("base", vec![])], vec![]);
+        let err = expand_yield_args(&presets, &clause).unwrap_err();
+        assert!(
+            err.message()
+                .contains("unknown yield preset parameter `$ghost`")
+        );
+    }
+
+    #[test]
+    fn expand_later_values_override_earlier() {
+        let presets = [
+            preset("base", vec![], vec![arg("y", Expr::StringLit("a".into()))]),
+            preset("extra", vec![], vec![arg("y", Expr::StringLit("b".into()))]),
+        ];
+        let clause = yield_clause(
+            vec![preset_ref("base", vec![]), preset_ref("extra", vec![])],
+            vec![arg("y", Expr::StringLit("c".into()))],
+        );
+        let merged = expand_yield_args(&presets, &clause).unwrap();
+        // Inline args are merged last and win.
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].value, Expr::StringLit("c".into()));
+    }
+
+    #[test]
+    fn expand_empty_presets_passthrough() {
+        let clause = yield_clause(vec![], vec![arg("y", Expr::StringLit("x".into()))]);
+        let merged = expand_yield_args(&[], &clause).unwrap();
+        assert_eq!(merged, clause.args);
+    }
+}

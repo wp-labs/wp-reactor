@@ -283,3 +283,361 @@ rule accu_rule {
         "explain output must render <accu>, got:\n{output}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Extra coverage: format_expr variants, explain sections, lineage, limits
+// ---------------------------------------------------------------------------
+
+use crate::ast::{BinOp, CmpOp, Measure, Transform};
+
+#[test]
+fn format_expr_extra_variants() {
+    // WfuMeta
+    assert_eq!(
+        format_expr(&Expr::WfuMeta(crate::wfu_meta::WfuMetaField::EmitTime)),
+        "@__wfu_emit_time"
+    );
+    // PresetParam
+    assert_eq!(format_expr(&Expr::PresetParam("x".into())), "$x");
+    // Neg
+    assert_eq!(format_expr(&Expr::Neg(Box::new(Expr::Number(3.0)))), "-3.0");
+    // BinOp arithmetic
+    assert_eq!(
+        format_expr(&Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Number(2.0)),
+            right: Box::new(Expr::Number(3.0)),
+        }),
+        "2.0 * 3.0"
+    );
+    // FuncCall with qualifier
+    assert_eq!(
+        format_expr(&Expr::FuncCall {
+            qualifier: Some("stat".into()),
+            name: "count".into(),
+            args: vec![Expr::Field(FieldRef::Simple("fail".into()))],
+        }),
+        "stat.count(fail)"
+    );
+    // InList (not in)
+    assert_eq!(
+        format_expr(&Expr::InList {
+            expr: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
+            list: vec![
+                Expr::StringLit("1.2.3.4".into()),
+                Expr::StringLit("5.6.7.8".into()),
+            ],
+            negated: true,
+        }),
+        "e.sip not in (\"1.2.3.4\", \"5.6.7.8\")"
+    );
+    // InList (in)
+    assert_eq!(
+        format_expr(&Expr::InList {
+            expr: Box::new(Expr::Field(FieldRef::Simple("x".into()))),
+            list: vec![Expr::Number(1.0)],
+            negated: false,
+        }),
+        "x in (1.0)"
+    );
+    // IfThenElse
+    assert_eq!(
+        format_expr(&Expr::IfThenElse {
+            cond: Box::new(Expr::Bool(true)),
+            then_expr: Box::new(Expr::Number(1.0)),
+            else_expr: Box::new(Expr::Number(2.0)),
+        }),
+        "if true then 1.0 else 2.0"
+    );
+    // Bracketed field ref
+    assert_eq!(
+        format_expr(&Expr::Field(FieldRef::Bracketed("e".into(), "dip".into()))),
+        "e[\"dip\"]"
+    );
+    // Path with empty segments renders alias only
+    assert_eq!(
+        format_expr(&Expr::Field(FieldRef::Path {
+            alias: "e".into(),
+            segments: vec![],
+        })),
+        "e"
+    );
+    // SystemVar variants
+    assert_eq!(
+        format_expr(&Expr::SystemVar(SystemVar::EventFirstTime)),
+        "@event_first_time"
+    );
+    assert_eq!(
+        format_expr(&Expr::SystemVar(SystemVar::WindowStartTime)),
+        "@window_start_time"
+    );
+    assert_eq!(
+        format_expr(&Expr::SystemVar(SystemVar::EmitTime)),
+        "@emit_time"
+    );
+}
+
+#[test]
+fn format_helpers_cover_all_variants() {
+    use super::format::{format_cmp, format_measure, format_transform};
+
+    assert_eq!(format_cmp(CmpOp::Eq), "==");
+    assert_eq!(format_cmp(CmpOp::Ne), "!=");
+    assert_eq!(format_cmp(CmpOp::Lt), "<");
+    assert_eq!(format_cmp(CmpOp::Gt), ">");
+    assert_eq!(format_cmp(CmpOp::Le), "<=");
+    assert_eq!(format_cmp(CmpOp::Ge), ">=");
+
+    assert_eq!(format_measure(Measure::Count), "count");
+    assert_eq!(format_measure(Measure::Sum), "sum");
+    assert_eq!(format_measure(Measure::Avg), "avg");
+    assert_eq!(format_measure(Measure::Min), "min");
+    assert_eq!(format_measure(Measure::Max), "max");
+
+    assert_eq!(format_transform(&Transform::Distinct), "distinct");
+}
+
+#[test]
+fn format_duration_all_units() {
+    use super::format::format_duration;
+
+    assert_eq!(format_duration(&Duration::ZERO), "0s");
+    assert_eq!(format_duration(&Duration::from_millis(1500)), "1500ms");
+    assert_eq!(format_duration(&Duration::from_millis(100)), "100ms");
+    assert_eq!(format_duration(&Duration::from_secs(86400 * 2)), "2d");
+    assert_eq!(format_duration(&Duration::from_secs(7200)), "2h");
+    assert_eq!(format_duration(&Duration::from_secs(180)), "3m");
+    assert_eq!(format_duration(&Duration::from_secs(45)), "45s");
+}
+
+#[test]
+fn explain_session_window_and_close_mode() {
+    let input = r#"
+rule r {
+    events { s : auth_events }
+    match<sip:session(30m)> {
+        on event { ev: s | count >= 1; }
+        on close { cl: s | count >= 1; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield security_alerts (sip = s.sip, fail_count = 2)
+}
+"#;
+    let schemas = &[auth_events_window(), security_alerts_window()];
+    let file = parse_wfl(input).unwrap();
+    let plans = compile_wfl(&file, schemas).unwrap();
+    let expl = &explain_rules(&plans, schemas)[0];
+
+    assert_eq!(expl.match_expl.window_spec, "session(gap=30m)");
+    assert_eq!(expl.match_expl.close_steps.len(), 1);
+    assert_eq!(expl.match_expl.close_mode, Some(crate::ast::CloseMode::Or));
+    assert_eq!(expl.match_expl.event_steps.len(), 1);
+}
+
+#[test]
+fn explain_seq_step_formats_neg_and_within() {
+    let input = r#"
+rule r {
+    events { a : auth_events }
+    match<:5m> {
+        on event seq {
+            has a within 2s;
+            not has a within 3s;
+        }
+    } -> score(50.0)
+    entity(ip, a.sip)
+    yield security_alerts (sip = a.sip, fail_count = 2)
+}
+"#;
+    let schemas = &[auth_events_window(), security_alerts_window()];
+    let file = parse_wfl(input).unwrap();
+    let plans = compile_wfl(&file, schemas).unwrap();
+    let expl = &explain_rules(&plans, schemas)[0];
+    let seq = expl.match_expl.seq.as_ref().expect("seq steps");
+    assert_eq!(seq.len(), 2);
+    assert!(
+        seq[0].contains("within 2s"),
+        "seq step should carry within, got: {}",
+        seq[0]
+    );
+    assert!(
+        seq[1].contains("not "),
+        "negated seq step should be prefixed with not, got: {}",
+        seq[1]
+    );
+    assert!(seq[1].contains("within 3s"), "got: {}", seq[1]);
+}
+
+#[test]
+fn explain_joins_renders_modes_reduce_and_emit() {
+    let auction_win = WindowSchema {
+        name: "auction_events".to_string(),
+        streams: vec!["auction_stream".to_string()],
+        time_field: Some("event_time".to_string()),
+        over: Duration::from_secs(3600),
+        fields: vec![
+            FieldDef {
+                name: "id".to_string(),
+                field_type: bt(BaseType::Digit),
+            },
+            FieldDef {
+                name: "category".to_string(),
+                field_type: bt(BaseType::Chars),
+            },
+            FieldDef {
+                name: "price".to_string(),
+                field_type: bt(BaseType::Digit),
+            },
+            FieldDef {
+                name: "dateTime".to_string(),
+                field_type: bt(BaseType::Time),
+            },
+            FieldDef {
+                name: "event_time".to_string(),
+                field_type: bt(BaseType::Time),
+            },
+        ],
+    };
+    let bid_win = WindowSchema {
+        name: "bid_events".to_string(),
+        streams: vec!["bid_stream".to_string()],
+        time_field: Some("event_time".to_string()),
+        over: Duration::from_secs(3600),
+        fields: vec![
+            FieldDef {
+                name: "auction".to_string(),
+                field_type: bt(BaseType::Digit),
+            },
+            FieldDef {
+                name: "bidder".to_string(),
+                field_type: bt(BaseType::Chars),
+            },
+            FieldDef {
+                name: "price".to_string(),
+                field_type: bt(BaseType::Digit),
+            },
+            FieldDef {
+                name: "event_time".to_string(),
+                field_type: bt(BaseType::Time),
+            },
+        ],
+    };
+    let out = WindowSchema {
+        name: "out".to_string(),
+        streams: vec![],
+        time_field: None,
+        over: Duration::from_secs(3600),
+        fields: vec![FieldDef {
+            name: "bidder".to_string(),
+            field_type: bt(BaseType::Chars),
+        }],
+    };
+    let input = r#"
+rule r {
+    events { b : bid_events }
+    match<auction:5m> { on event { b | count >= 1; } } -> score(50.0)
+    join auction_events snapshot reduce maxrow(price) tie(dateTime desc) as winner
+        within [b.event_time, b.event_time]
+        on b.auction == auction_events.id
+    join bid_events anti within 10s on b.auction == bid_events.auction
+    join auction_events asof within 30s on b.auction == auction_events.id
+    entity(ip, b.bidder)
+    yield out (bidder = b.bidder)
+}
+"#;
+    let schemas = &[bid_win, auction_win, out];
+    let file = parse_wfl(input).unwrap();
+    let plans = compile_wfl(&file, schemas).unwrap();
+    let expl = &explain_rules(&plans, schemas)[0];
+
+    let joined = expl.joins.join("\n");
+    assert!(joined.contains("snapshot"), "got: {joined}");
+    assert!(
+        joined.contains("reduce maxrow(price) tie(dateTime desc) as winner"),
+        "got: {joined}"
+    );
+    assert!(joined.contains("within ["), "got: {joined}");
+    assert!(joined.contains("anti"), "got: {joined}");
+    assert!(joined.contains("asof within 30s"), "got: {joined}");
+}
+
+#[test]
+fn explain_limits_and_conv_and_lineage() {
+    let input = r#"
+rule r {
+    events { s : auth_events }
+    match<sip:1h:fixed> {
+        on event { fail: s.sip | distinct | count >= 1; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield security_alerts (
+        sip = s.sip,
+        fail_count = count(s),
+        message = "m"
+    )
+    conv { sort(-sip) | top(5) ; where(fail_count >= 1) ; }
+    limits {
+        max_memory = "256MB";
+        max_instances = 3;
+        max_throttle = "100/min";
+        on_exceed = "fail_rule";
+    }
+}
+"#;
+    let schemas = &[auth_events_window(), security_alerts_window()];
+    let file = parse_wfl(input).unwrap();
+    let plans = compile_wfl(&file, schemas).unwrap();
+    let expl = &explain_rules(&plans, schemas)[0];
+
+    let conv = expl.conv.as_ref().expect("conv");
+    assert_eq!(conv.len(), 2);
+    assert!(conv[0].contains("sort(-sip) | top(5)"), "got: {}", conv[0]);
+    assert!(
+        conv[1].contains("where(fail_count >= 1.0)"),
+        "got: {}",
+        conv[1]
+    );
+
+    let limits = expl.limits.as_ref().expect("limits");
+    assert!(limits.contains("max_memory=268435456B"), "got: {limits}");
+    assert!(limits.contains("max_instances=3"), "got: {limits}");
+    assert!(limits.contains("max_throttle=100/1m"), "got: {limits}");
+    assert!(limits.contains("on_exceed=FailRule"), "got: {limits}");
+
+    // Lineage: s.sip traces through the bind alias.
+    let (name, origin) = &expl.lineage[0];
+    assert_eq!(name, "sip");
+    assert_eq!(origin, "auth_events.sip (via s)");
+    // count(s) traces over the set-level alias reference.
+    let (name, origin) = &expl.lineage[1];
+    assert_eq!(name, "fail_count");
+    assert_eq!(origin, "count(s) over set-level ref to auth_events");
+    // A string literal lineage falls back to the formatted expression.
+    let (_, origin) = &expl.lineage[2];
+    assert_eq!(origin, "\"m\"");
+}
+
+#[test]
+fn explain_empty_keys_and_field_lineage_plain() {
+    let input = r#"
+rule r {
+    events { s : auth_events }
+    match<:5m> {
+        on event { s | count >= 1; }
+    } -> score(50.0)
+    entity(ip, s.sip)
+    yield security_alerts (sip = s.sip, fail_count = 2)
+}
+"#;
+    let schemas = &[auth_events_window(), security_alerts_window()];
+    let file = parse_wfl(input).unwrap();
+    let plans = compile_wfl(&file, schemas).unwrap();
+    let expl = &explain_rules(&plans, schemas)[0];
+
+    assert_eq!(expl.match_expl.keys, "(none)");
+    assert_eq!(expl.score, "50.0");
+    // Bind-alias-free plain field name lineage.
+    let (name, origin) = &expl.lineage[0];
+    assert_eq!(name, "sip");
+    assert_eq!(origin, "auth_events.sip (via s)");
+}

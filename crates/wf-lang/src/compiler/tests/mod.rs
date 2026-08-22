@@ -7,6 +7,7 @@ use crate::schema::{BaseType, FieldDef, FieldType, WindowSchema};
 use crate::wfl_parser::parse_wfl;
 
 mod basic;
+mod coverage_extra;
 mod edge;
 mod join_family;
 mod keys_entity;

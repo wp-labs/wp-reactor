@@ -3,6 +3,7 @@ mod basic;
 mod clauses;
 mod contract;
 mod conv;
+mod coverage_extra;
 mod errors;
 mod examples;
 mod expr;
