@@ -11,10 +11,12 @@ use tokio::sync::mpsc;
 
 use wf_engine::match_engine::{CepStateMachine, RuleExecutor};
 use wf_engine::window::{Router, Window, WindowDef, WindowParams, WindowRegistry};
-use wf_lang::ast::{CloseMode, CmpOp, Expr, FieldRef, JoinMode, MatchMode, Measure};
+use wf_lang::ast::{
+    Bound, BoundVal, CloseMode, CmpOp, Expr, FieldRef, JoinMode, MatchMode, Measure, WithinSpec,
+};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EntityPlan, JoinCondPlan, JoinPlan, MatchPlan, RulePlan,
-    ScorePlan, StepPlan, WindowSpec, YieldPlan,
+    ScorePlan, StepPlan, WindowSpec, YieldField, YieldPlan,
 };
 
 use super::tests::{empty_tracked_bind_fields, empty_tracked_plain_fields, make_test_fanout};
@@ -166,6 +168,9 @@ fn make_join_where_task() -> (
                 left: FieldRef::Simple("sip".into()),
                 right: FieldRef::Simple("id".into()),
             }],
+            within: None,
+            reduce: None,
+            emit_at: None,
         }],
         r#where: Some(where_state_in_or()),
         entity_plan: EntityPlan {
@@ -295,5 +300,211 @@ async fn match_join_where_miss_suppresses() {
     assert!(
         alert_rx.try_recv().is_err(),
         "join miss must suppress (INNER JOIN semantics)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2：eager interval join（within 回看时间谓词，缺省 inner）端到端
+// ---------------------------------------------------------------------------
+
+/// P2 任务：`join person_events within [10s, 0s] on fail.sip == person_events.id`
+///（缺省 inner）——区间内命中富化输出，miss 丢事件。yield 带 join 富化字段证明注入。
+fn make_interval_join_task() -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
+    Arc<Router>,
+) {
+    let driver = "auth_events";
+    let person = "person_events";
+    let registry = WindowRegistry::build(vec![
+        window_def(driver, &driver_schema()),
+        window_def(person, &person_schema()),
+    ])
+    .unwrap();
+    let router = Arc::new(Router::new(registry));
+    let source_window = router.registry().get_window(driver).unwrap();
+    let source_notify = router.registry().get_notifier(driver).unwrap();
+
+    let match_plan = MatchPlan {
+        keys: vec![FieldRef::Simple("sip".into())],
+        key_map: None,
+        key_join: None,
+        window_spec: WindowSpec::Sliding(std::time::Duration::from_secs(300)),
+        event_steps: vec![StepPlan {
+            branches: vec![BranchPlan {
+                label: Some("fail".into()),
+                source: "fail".into(),
+                field: None,
+                guard: None,
+                agg: AggPlan {
+                    transforms: vec![],
+                    measure: Measure::Count,
+                    cmp: CmpOp::Ge,
+                    threshold: Expr::Number(1.0),
+                },
+            }],
+        }],
+        close_steps: vec![],
+        close_mode: CloseMode::Or,
+        tracked_bind_aliases: HashSet::new(),
+        tracked_bind_fields: empty_tracked_bind_fields(),
+        tracked_plain_fields: empty_tracked_plain_fields(),
+        seq: None,
+        match_mode: MatchMode::Seq,
+        accu: false,
+        needs_field_history: true,
+    };
+
+    // `within [10s, 0s]`——回看 10s（`within 10s` 糖的常量界等价形态）
+    let within = WithinSpec {
+        lo: Bound {
+            open: false,
+            val: BoundVal::Dur {
+                dur: std::time::Duration::from_secs(10),
+                neg: true,
+            },
+        },
+        hi: Bound {
+            open: false,
+            val: BoundVal::Dur {
+                dur: std::time::Duration::ZERO,
+                neg: false,
+            },
+        },
+    };
+
+    let rule_plan = RulePlan {
+        conv_window: None,
+        name: "interval_join".into(),
+        binds: vec![BindPlan {
+            alias: "fail".into(),
+            window: driver.into(),
+            filter: None,
+        }],
+        lets: Vec::new(),
+        match_plan: match_plan.clone(),
+        each_plan: None,
+        stats_plan: None,
+        joins: vec![JoinPlan {
+            right_window: person.into(),
+            mode: JoinMode::Inner,
+            conds: vec![JoinCondPlan {
+                left: FieldRef::Simple("sip".into()),
+                right: FieldRef::Simple("id".into()),
+            }],
+            within: Some(within),
+            reduce: None,
+            emit_at: None,
+        }],
+        r#where: None,
+        entity_plan: EntityPlan {
+            entity_type: "ip".into(),
+            entity_id_expr: Expr::Field(FieldRef::Qualified("fail".into(), "sip".into())),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![YieldField {
+                name: "state".into(),
+                value: Expr::Field(FieldRef::Qualified("person_events".into(), "state".into())),
+            }],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(1.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+
+    let machine = CepStateMachine::new(
+        "interval_join".into(),
+        match_plan,
+        Some("event_time".into()),
+    );
+    let executor = RuleExecutor::new(rule_plan);
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
+        conv_sink: None,
+        machine: Some(machine),
+        each_alias: None,
+        each_time_field: None,
+        executor,
+        window_sources: vec![task_types::WindowSource {
+            window_name: driver.into(),
+            window: source_window,
+            notify: source_notify,
+            aliases: vec!["fail".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout_scan_interval: std::time::Duration::from_secs(60),
+        router: Arc::clone(&router),
+        metrics: None,
+        intermediate_targets: HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        shard_index: None,
+        shard_count: 1,
+    };
+    let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
+    (task, alert_rx, router)
+}
+
+#[tokio::test]
+async fn interval_inner_hit_emits_and_enriches() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_interval_join_task();
+    let ts = 4_000_000_000_000_000i64;
+
+    // person 行在 ts-1s（回看 10s 窗口内）→ 命中 → 富化 state 并输出
+    person_window(&router)
+        .append(person_batch(&["10.0.0.1"], &["OR"], ts - 1_000_000_000))
+        .unwrap();
+    router
+        .registry()
+        .get_window("auth_events")
+        .unwrap()
+        .append(driver_batch(&["10.0.0.1"], ts))
+        .unwrap();
+
+    task.pull_and_advance().await;
+
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "10.0.0.1"
+    );
+    assert_eq!(
+        super::tests::field_str(&alert, "state"),
+        "OR",
+        "interval join hit must enrich the joined field"
+    );
+}
+
+#[tokio::test]
+async fn interval_inner_miss_drops_alert() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_interval_join_task();
+    let ts = 4_000_000_000_000_000i64;
+
+    // person 行在 ts-20s（回看 10s 窗口之外）→ interval miss → 缺省 inner 丢事件
+    person_window(&router)
+        .append(person_batch(&["10.0.0.1"], &["OR"], ts - 20_000_000_000))
+        .unwrap();
+    router
+        .registry()
+        .get_window("auth_events")
+        .unwrap()
+        .append(driver_batch(&["10.0.0.1"], ts))
+        .unwrap();
+
+    task.pull_and_advance().await;
+
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "interval inner miss must drop the event (no alert)"
     );
 }

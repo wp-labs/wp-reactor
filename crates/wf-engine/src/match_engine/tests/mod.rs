@@ -8,6 +8,7 @@ mod columnar_wiring;
 mod each_bench;
 mod guard_bench;
 mod helpers;
+mod interval_bench;
 mod join_key;
 mod match_bench;
 mod perf;

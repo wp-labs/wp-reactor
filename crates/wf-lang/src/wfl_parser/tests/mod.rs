@@ -6,6 +6,7 @@ mod conv;
 mod errors;
 mod examples;
 mod expr;
+mod join_family;
 mod match_;
 mod pattern;
 mod pipeline;

@@ -290,3 +290,119 @@ rule q9_winning_bid {
 - 前置：`docs/stats-executor-design.md`（v6，stats+join 正交能力）
 - 既有 join：`docs/design/join-field-as-key-design.md`（snapshot join-then-key，P0-P2 已完成）
 - 语法示例：`wf-examples/performance/nexmark_pk/models/queries/q8.wfl` / `q9.wfl`（现状近似版）
+
+---
+
+## 11. P1 实施记录（2026-08-22，wf-lang 语法层）
+
+P1（语法+计划+over 校验）已落地，`cargo test -p wf-lang` 598 通过（含 28 个新用例）。
+
+### 11.1 已实现
+
+- **AST**（`ast/join.rs`）：`JoinClause` 新增 `within`/`reduce`/`emit_at`；新增 `WithinSpec`、
+  `Bound{open, val}`、`BoundVal::Dur{dur, neg} | Expr(Expr)`、`ReduceClause`、
+  `ReduceMeasure::Maxrow|Minrow|Last|Top`、`TieSpec`。
+- **`JoinMode::Inner`**（缺省 mode，设计 D4）：Q8/Q9 示例无 mode 关键字，必须表达缺省 inner。
+  引擎 `execute_joins` 的 `_ =>` 兜底天然承接（P2 再接执行）。
+- **Parser**（`wfl_parser/clauses.rs`）：`within [lo, hi]` / `within dur` 糖、`reduce ... [tie]`、
+  `as label`（reduce 后或 on 后两种位置）、`emit at <expr>`；`within`/`reduce` 任一顺序；
+  `asof within [..]` 经 asof_within 去 cut 回溯后落入 interval within（既有 `asof within DUR` 不变）。
+- **Plan/Compiler**（`plan.rs`/`compiler/mod.rs`）：`JoinPlan` 透传新字段；`as label` 引用
+  （`winner.bidder`）编译为 `FieldRef::Path`（review R2）——score/entity/yield/where/emit_at/
+  within 界全部重写。
+- **Checker**（`checker/rules/joins.rs` + `scope.rs` + `scope_build.rs`）：
+  - over ≥ 区间跨度（D3，常量界）；lo ≤ hi；lo/hi 类型一致；interval 需右窗 time field；
+  - `emit at`：需 `within`；上界须绝对时间表达式；同为字段时须 ≥ 上界（Q9 同字段）；
+  - reduce：度量/tie 字段右窗存在性、top N ≥ 1、度量非结构化；
+  - reduce 标签注册为 object 别名（`label.field` 解析）+ 与事件别名冲突报错；
+  - 同规则内 `as label` 唯一（跨 join 重复报错）；
+  - within 界 / emit at 表达式只能引用驱动事件字段（左行），不能引用 join 右窗；
+  - `asof within DUR` 与 `within [...]` 互斥；
+  - `bucket_end(time, seconds)` 内建（checker + infer 返回 Time）。
+- **Explain**（`explain/sections.rs`）：新语法字符串化（含 `as label`/`emit at`）。
+
+### 11.1b review 修复（同轮）
+
+- `emit_at` 字段比较改叶子名比较（裸名 vs 限定名同字段不再误报）。
+- 跨 join 重复 `as label` 报错（运行时同标签会互相覆盖注入）。
+- within 界 / emit at 表达式限驱动事件字段（左行），引 join 右窗报错。
+- pipeline 规则 final stage 的 reduce 标签注册（pipeline 分支手工建 scope，补 `register_reduce_labels`）。
+- reduce 标签叶子类型从 `Ok(Some(Object))` 改为 `Ok(None)`（运行时确定，与嵌套 Path 一致）——
+  使 `where winner.bidder > 0`、`winner.bidder` 在任意表达式位置都能通过静态检查。
+
+### 11.2 已知边界（P1 遗留，P2/P3 处理）
+
+- P2 已实现 eager interval（见 §12）；`reduce` 执行与 `emit at` deferred → P3。
+- `emit_at ≥ 上界`仅静态字段等值校验；更一般的关系（如 `emit at bucket_end(...)+5s`）留 P3
+  运行时 watermark 语义钉死。
+- `winner.bidder` 叶子类型运行时确定（`resolve_field_ref` 返回 `Ok(None)`）；`field_ref_name` 对
+  Path 取根段，bind tracking 会多记一个 label 根名（无执行影响）。
+- `reduce`/`within` 分片互斥（设计 §9 风险 5）与 deferred 单连接约束延续至 P3。
+
+---
+
+## 12. P2 实施记录（2026-08-22，eager interval join）
+
+P2（回看 interval eager 执行：时间谓词 + 存在/首/最新）已落地。
+`cargo test -p wf-engine -p wf-runtime` 全绿（新增 8 引擎单测 + 2 bucket_end 单测 + 2 端到端集成测试）。
+
+### 12.1 已实现
+
+- **`execute_joins` interval 分支**（`crates/wf-engine/src/match_engine/executor/context.rs`）：
+  - `join.within` 存在 → `execute_interval_join`：`asof_candidates`（R5 复用 trait 层）→
+    `retain(ts ∈ [lo, hi])`（复刻 `find_matching_row` 逐条件复核）→ 按 mode 选择；
+  - mode 选择：**Inner/Snapshot = 区间内最早（ts 最小，确定性）**、**Asof = 最新（ts 最大）**、
+    **Anti = 区间内有匹配则丢**；
+  - 界求值（`eval_interval_bound`）：`Dur`（相对左事件 ts，可负）→ 常量界；`Expr`（左行
+    绝对时间字段/函数）→ `eval_expr` + `normalize_epoch_timestamp_float_nanos`；
+  - 开闭记号：`Bound.open` → 开区间（`[lo, <hi]` 上开桶形态）；
+  - **缺省 inner（D4）**：interval 与非 interval 路径均实现「命中富化、miss 丢事件」；
+  - **deferred 跳过**：`join.emit_at.is_some()` 的 join 在 eager 路径跳过（P3 rule_task
+    deferred 分支处理，设计 §2.2 互斥）。
+- **`bucket_end(time, interval_seconds)` 内建**：`= time_bucket(t) + interval`（Q8 上开桶形态），
+  引擎两套 eval 路径（`match_engine/eval/funcs.rs` 与 `executor/eval/builtins.rs`）都实现。
+- **富化提取**：`enrich_join_row`（限定名 `window.field` + 裸名），interval 与既有 mode 共用。
+
+### 12.2 测试
+
+- 引擎单测（`context.rs`）：inner 命中/越界丢、snapshot 取最早、asof 取最新、anti 区间命中丢、
+  上开界排除边界、行内字段界（绝对时间）、多条件逐条复核、plain inner miss 丢。
+- `bucket_end` 单测（`l2/expr.rs`）：桶内偏移与桶边界移入下桶。
+- 端到端（`wf-runtime/engine_task/where_integration_tests.rs`）：interval inner 命中富化输出、
+  miss 丢（真实 Router + Window + RuleTask）。
+
+### 12.2b review 修复（同轮）
+
+- **close 路径尊重 join 返回值**（`close_exec.rs`）：原 `execute_joins(...)` 忽略返回值，
+  导致缺省 inner / interval inner miss 与 anti 命中在 close 输出路径不抑制——与
+  match/on-each 路径不一致。改为 `if !execute_joins(...) { return Ok(None); }`。
+  既有 close+join 测试均为 snapshot hit（返回 true）不受影响；Q21（anti）走 on-each。
+- 补测试：
+  - `l2/joins.rs`：close + interval inner miss 抑制、close + interval inner hit 富化输出、
+    close + plain inner miss 抑制；
+  - `context.rs`：闭区间包含 lo/hi 边界、snapshot interval miss 保留不富化、
+    interval join 后接 plain join 混合富化。
+
+### 12.2c 性能基准（`match_engine/tests/interval_bench.rs`）
+
+热路径分解（release，`cargo test --release -p wf-engine interval_bench -- --ignored`）：
+
+| 路径 | ns/event | vs snapshot |
+|---|---|---|
+| snapshot（Q3/Q13/Q20 路径） | 450 | 100% |
+| asof within 1800s（Q22 fallback） | 492 | 109% |
+| **interval 常量界**（`within 10s` 糖） | 484 | **108%** |
+| **interval 行内字段界**（`eval_expr` 求值） | 529 | **118%** |
+| interval 候选 8 行 | 494 | 110% |
+| interval 候选 64 行 | 832 | 185% |
+
+结论：interval 分支相对 snapshot 只增加 ~8%（常量界）/~18%（字段界），与 asof 相当；
+候选行数线性影响区间过滤成本（64 行 ≈ 2×）。设计 R5「读路径复用 asof_candidates」成立，
+无灾难性开销。另附 debug 常规回归测试 `interval_join_overhead_bounded`（interval ≤ snapshot × 8 + 20ns）。
+
+### 12.3 边界（P3 处理）
+
+- `reduce` 执行（maxrow/minrow/last/top + `as label` object 注入）→ P3。
+- 前瞻（lookforward）与 deferred 触发（`emit at` + keyed TTL 状态 + watermark 到期）→ P3。
+- eager interval 对「未来行」（行内上界 > 当前 watermark）天然看不见——lookforward 语义需
+  deferred（Q8/Q9 正是如此）。

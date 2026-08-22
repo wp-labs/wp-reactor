@@ -383,14 +383,16 @@ pub fn check_func_call(
                 }
             }
         }
-        "time_bucket" => {
+        "time_bucket" | "bucket_end" => {
             if args.len() != 2 {
                 errors.push(CheckError {
                     severity: Severity::Error,
                     rule: Some(rule_name.to_string()),
                     test: None,
-                    message: "time_bucket() requires exactly 2 arguments: (time, interval_seconds)"
-                        .to_string(),
+                    message: format!(
+                        "{}() requires exactly 2 arguments: (time, interval_seconds)",
+                        name
+                    ),
                 });
             } else {
                 // First argument must be time or numeric
@@ -403,8 +405,8 @@ pub fn check_func_call(
                         rule: Some(rule_name.to_string()),
                         test: None,
                         message: format!(
-                            "time_bucket() first argument must be time or numeric, got {:?}",
-                            t
+                            "{}() first argument must be time or numeric, got {:?}",
+                            name, t
                         ),
                     });
                 }
@@ -417,8 +419,8 @@ pub fn check_func_call(
                         rule: Some(rule_name.to_string()),
                         test: None,
                         message: format!(
-                            "time_bucket() second argument must be numeric (interval seconds), got {:?}",
-                            t
+                            "{}() second argument must be numeric (interval seconds), got {:?}",
+                            name, t
                         ),
                     });
                 }

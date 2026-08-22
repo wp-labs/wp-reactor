@@ -143,6 +143,8 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
                 let mut stage_scope = Scope::new();
                 stage_scope.aliases = base_scope.aliases.clone();
                 stage_scope.join_windows = base_scope.join_windows.clone();
+                // `reduce ... as label` 标签注册（pipeline 分支手工建 scope，不走 build_scope）
+                scope_build::register_reduce_labels(&mut stage_scope, &stage.joins);
                 populate_stat_labels(&mut stage_scope, &stage.match_clause);
                 check_stage(
                     &stage.match_clause,
@@ -166,6 +168,7 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
             stage_scope
                 .aliases
                 .insert(PIPE_IN_ALIAS, &stage_outputs[idx - 1]);
+            scope_build::register_reduce_labels(&mut stage_scope, &stage.joins);
             populate_stat_labels(&mut stage_scope, &stage.match_clause);
             check_stage(
                 &stage.match_clause,
@@ -188,6 +191,7 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
         if let Some(prev) = stage_outputs.last() {
             final_scope.aliases.insert(PIPE_IN_ALIAS, prev);
         }
+        scope_build::register_reduce_labels(&mut final_scope, &rule.joins);
         populate_stat_labels(&mut final_scope, &rule.match_clause);
         check_stage(
             &rule.match_clause,

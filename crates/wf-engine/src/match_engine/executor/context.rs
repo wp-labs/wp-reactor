@@ -1,13 +1,14 @@
 use std::time::Duration;
 
-use wf_lang::ast::{FieldRef, JoinMode};
+use wf_lang::ast::{BoundVal, FieldRef, JoinMode};
 use wf_lang::plan::{JoinCondPlan, JoinPlan, StepPlan};
 
 use crate::match_engine::JoinRow;
 use crate::match_engine::match_engine::{
-    AsofLookup, BindData, EngineHashMap, Event, StepData, Value, WindowLookup, field_ref_name,
-    values_equal,
+    AsofLookup, BindData, EngineHashMap, Event, StepData, Value, WindowLookup, eval_expr,
+    field_ref_name, values_equal,
 };
+use crate::time::normalize_epoch_timestamp_float_nanos;
 
 /// Which context fields the close/match alert builders need materialized.
 ///
@@ -177,7 +178,36 @@ pub(crate) fn execute_joins(
     event_time_nanos: i64,
 ) -> bool {
     for join in joins {
+        // P3（deferred，`emit at`）由 rule_task deferred 分支处理——eager 路径跳过
+        //（设计 §2.2：join 带 emit at → 整条规则转 deferred 输出路径）。
+        if join.emit_at.is_some() {
+            continue;
+        }
+
+        // P2：interval 时间谓词（within）——时间过滤匹配集后按 mode 选择
+        //（设计 §5.1：asof_candidates → retain(ts ∈ [lo, hi]) → 存在/首/最新/anti）。
+        if join.within.is_some() {
+            if !execute_interval_join(join, ctx, windows, event_time_nanos) {
+                return false;
+            }
+            continue;
+        }
+
         let matched_row = match &join.mode {
+            JoinMode::Inner => {
+                // 缺省 inner（设计 D4）：命中则富化，miss 丢事件
+                let Some((key_field, key_val)) = first_join_key(ctx, &join.conds) else {
+                    return false;
+                };
+                let Some(rows) = windows.join_lookup(&join.right_window, &key_field, &key_val)
+                else {
+                    return false;
+                };
+                let Some(row) = find_matching_row(&rows, &join.conds, ctx) else {
+                    return false;
+                };
+                Some(row)
+            }
             JoinMode::Snapshot => {
                 let Some((key_field, key_val)) = first_join_key(ctx, &join.conds) else {
                     continue;
@@ -260,20 +290,121 @@ pub(crate) fn execute_joins(
             continue;
         };
 
-        // Materialize the matched row's fields into the eval context — only the
-        // matched row, on demand (JoinRow reads straight from the columns).
-        for field_name in row.field_names() {
-            let Some(value) = row.field_value(field_name) else {
-                continue;
-            };
-            let qualified = format!("{}.{}", join.right_window, field_name);
-            ctx.fields.insert(qualified.into(), value.clone());
-            ctx.fields
-                .entry(field_name.to_string().into())
-                .or_insert_with(|| value.clone());
-        }
+        enrich_join_row(ctx, join, &row);
     }
     true
+}
+
+/// P2：eager interval join——`within [lo, hi]` 时间谓词过滤匹配集后按 mode 选择。
+///
+/// 返回 `false` 表示事件应被丢弃（inner miss / anti 命中）；`true` 保留。
+/// 界为常量（相对左事件 ts 的时长）或行内表达式（左行绝对时间字段/函数）。
+fn execute_interval_join(
+    join: &JoinPlan,
+    ctx: &mut Event,
+    windows: &dyn WindowLookup,
+    event_time_nanos: i64,
+) -> bool {
+    let wspec = join.within.as_ref().expect("caller checks within");
+
+    // 区间界求值失败（左行缺字段等）→ 保守按 miss 处理
+    let Some(lo_ns) = eval_interval_bound(&wspec.lo, ctx, event_time_nanos) else {
+        return !matches!(join.mode, JoinMode::Inner);
+    };
+    let Some(hi_ns) = eval_interval_bound(&wspec.hi, ctx, event_time_nanos) else {
+        return !matches!(join.mode, JoinMode::Inner);
+    };
+
+    let Some((key_field, key_val)) = first_join_key(ctx, &join.conds) else {
+        return !matches!(join.mode, JoinMode::Inner);
+    };
+    let Some(rows) = windows.asof_candidates(&join.right_window, &key_field, &key_val) else {
+        return !matches!(join.mode, JoinMode::Inner);
+    };
+
+    // 时间谓词 + 全部 join 条件（复刻 find_matching_row 的逐条件复核）
+    let matched: Vec<&(i64, JoinRow)> = rows
+        .iter()
+        .filter(|(ts, row)| {
+            in_interval(*ts, lo_ns, hi_ns, wspec.lo.open, wspec.hi.open)
+                && row_matches_conds(row, &join.conds, ctx)
+        })
+        .collect();
+
+    match &join.mode {
+        JoinMode::Anti => {
+            // 区间内有匹配 → 丢事件
+            matched.is_empty()
+        }
+        JoinMode::Asof { .. } => {
+            // 最新（ts 最大）
+            let row = matched
+                .into_iter()
+                .max_by_key(|(ts, _)| *ts)
+                .map(|(_, r)| r.clone());
+            let Some(row) = row else {
+                return true;
+            };
+            enrich_join_row(ctx, join, &row);
+            true
+        }
+        JoinMode::Snapshot | JoinMode::Inner => {
+            // 首匹配（ts 最小，确定性）；inner miss → 丢事件
+            let row = matched
+                .into_iter()
+                .min_by_key(|(ts, _)| *ts)
+                .map(|(_, r)| r.clone());
+            let Some(row) = row else {
+                return !matches!(join.mode, JoinMode::Inner);
+            };
+            enrich_join_row(ctx, join, &row);
+            true
+        }
+        _ => true,
+    }
+}
+
+/// 区间谓词：`lo ≤ ts ≤ hi`（`open` 记号取开区间）。
+fn in_interval(ts: i64, lo_ns: i64, hi_ns: i64, lo_open: bool, hi_open: bool) -> bool {
+    let lo_ok = if lo_open { ts > lo_ns } else { ts >= lo_ns };
+    let hi_ok = if hi_open { ts < hi_ns } else { ts <= hi_ns };
+    lo_ok && hi_ok
+}
+
+/// 区间界求值 → 纳秒：常量界相对左事件 ts（Dur，可负）；行内界为左行绝对时间表达式。
+fn eval_interval_bound(
+    bound: &wf_lang::ast::Bound,
+    ctx: &Event,
+    event_time_nanos: i64,
+) -> Option<i64> {
+    match &bound.val {
+        BoundVal::Dur { dur, neg } => {
+            let offset = i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX);
+            let offset = if *neg { -offset } else { offset };
+            Some(event_time_nanos.saturating_add(offset))
+        }
+        BoundVal::Expr(e) => {
+            let value = eval_expr(e, ctx)?;
+            match value {
+                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// 把匹配行的字段物化进 eval context（限定名 `window.field` + 裸名）。
+fn enrich_join_row(ctx: &mut Event, join: &JoinPlan, row: &JoinRow) {
+    for field_name in row.field_names() {
+        let Some(value) = row.field_value(field_name) else {
+            continue;
+        };
+        let qualified = format!("{}.{}", join.right_window, field_name);
+        ctx.fields.insert(qualified.into(), value.clone());
+        ctx.fields
+            .entry(field_name.to_string().into())
+            .or_insert_with(|| value.clone());
+    }
 }
 
 /// Extract the first join condition's `(right key field, left value)`, so the
@@ -373,6 +504,9 @@ mod tests {
                 left: FieldRef::Simple("bidder".to_string()),
                 right: FieldRef::Simple("id".to_string()),
             }],
+            within: None,
+            reduce: None,
+            emit_at: None,
         }];
 
         let ok = execute_joins(&joins, &mut ctx, &MissLookup, 500_000_000_000);
@@ -431,6 +565,9 @@ mod tests {
                 left: FieldRef::Simple("bidder".to_string()),
                 right: FieldRef::Simple("id".to_string()),
             }],
+            within: None,
+            reduce: None,
+            emit_at: None,
         }];
 
         let ok = execute_joins(&joins, &mut ctx, &HitLookup(joined), 500_000_000_000);
@@ -589,5 +726,479 @@ mod tests {
             Some(Value::Str("10.0.0.2".into()))
         );
         assert_eq!(matched_col.field_value("score"), Some(Value::Number(100.0)));
+    }
+
+    // -------------------------------------------------------------------
+    // P2：interval join（within 时间谓词，eager）
+    // -------------------------------------------------------------------
+
+    use std::sync::Arc;
+    use wf_lang::ast::{Bound, BoundVal, Expr, WithinSpec};
+
+    /// 带时间戳的候选 lookup（测试替身：`asof_candidates` 直接返回全部行）。
+    struct TimedLookup(Vec<(i64, JoinRow)>);
+    impl WindowLookup for TimedLookup {
+        fn snapshot_field_values(
+            &self,
+            _w: &str,
+            _f: &str,
+        ) -> Option<std::collections::HashSet<String>> {
+            None
+        }
+        fn snapshot(&self, _w: &str) -> Option<Vec<JoinRow>> {
+            Some(self.0.iter().map(|(_, r)| r.clone()).collect())
+        }
+        fn asof_candidates(
+            &self,
+            _w: &str,
+            _key_field: &str,
+            _key: &Value,
+        ) -> Option<Vec<(i64, JoinRow)>> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// 右窗行：`(ts, id, price)`。
+    fn timed_row(ts: i64, id: f64, price: f64) -> (i64, JoinRow) {
+        let mut fields = EngineHashMap::default();
+        fields.insert("id".into(), Value::Number(id));
+        fields.insert("price".into(), Value::Number(price));
+        (ts, JoinRow::Event(Arc::new(Event { fields })))
+    }
+
+    /// `on aid == right.id` 的单条件 join。
+    fn interval_join(within: Option<WithinSpec>, mode: JoinMode) -> JoinPlan {
+        JoinPlan {
+            right_window: "bid_events".into(),
+            mode,
+            conds: vec![JoinCondPlan {
+                left: FieldRef::Simple("aid".into()),
+                right: FieldRef::Simple("id".into()),
+            }],
+            within,
+            reduce: None,
+            emit_at: None,
+        }
+    }
+
+    /// `within [-10s, 0s]`（`within 10s` 糖的等价常量界）。
+    fn within_lookback() -> WithinSpec {
+        WithinSpec {
+            lo: Bound {
+                open: false,
+                val: BoundVal::Dur {
+                    dur: Duration::from_secs(10),
+                    neg: true,
+                },
+            },
+            hi: Bound {
+                open: false,
+                val: BoundVal::Dur {
+                    dur: Duration::ZERO,
+                    neg: false,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn interval_inner_hit_enriches_and_miss_drops() {
+        // t=500s 的事件，回看 10s：行 ts∈[490s, 500s]
+        let rows = vec![
+            timed_row(485_000_000_000, 1.0, 100.0),
+            timed_row(495_000_000_000, 1.0, 200.0),
+            timed_row(499_000_000_000, 1.0, 300.0),
+        ];
+        let lookup = TimedLookup(rows);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+
+        let joins = vec![interval_join(Some(within_lookback()), JoinMode::Inner)];
+        let ok = execute_joins(&joins, &mut ctx, &lookup, 500_000_000_000);
+        assert!(ok, "interval inner hit keeps event");
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(200.0)));
+
+        // miss：ts=485s 落在 [490s, 500s] 之外 → 丢事件
+        let lookup = TimedLookup(vec![timed_row(485_000_000_000, 1.0, 100.0)]);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        let ok = execute_joins(
+            &vec![interval_join(Some(within_lookback()), JoinMode::Inner)],
+            &mut ctx,
+            &lookup,
+            500_000_000_000,
+        );
+        assert!(!ok, "interval inner miss drops event");
+    }
+
+    #[test]
+    fn interval_snapshot_picks_earliest() {
+        let rows = vec![
+            timed_row(495_000_000_000, 1.0, 200.0),
+            timed_row(499_000_000_000, 1.0, 300.0),
+            timed_row(497_000_000_000, 1.0, 250.0),
+        ];
+        let lookup = TimedLookup(rows);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        let ok = execute_joins(
+            &vec![interval_join(Some(within_lookback()), JoinMode::Snapshot)],
+            &mut ctx,
+            &lookup,
+            500_000_000_000,
+        );
+        assert!(ok);
+        // 区间内最早 = ts 495s（price 200）
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(200.0)));
+    }
+
+    #[test]
+    fn interval_asof_picks_latest() {
+        let rows = vec![
+            timed_row(495_000_000_000, 1.0, 200.0),
+            timed_row(499_000_000_000, 1.0, 300.0),
+        ];
+        let lookup = TimedLookup(rows);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        let ok = execute_joins(
+            &vec![interval_join(
+                Some(within_lookback()),
+                JoinMode::Asof { within: None },
+            )],
+            &mut ctx,
+            &lookup,
+            500_000_000_000,
+        );
+        assert!(ok);
+        // 区间内最新 = ts 499s（price 300）
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(300.0)));
+    }
+
+    #[test]
+    fn interval_anti_drops_on_interval_match() {
+        let rows = vec![timed_row(495_000_000_000, 1.0, 200.0)];
+        let lookup = TimedLookup(rows);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        let ok = execute_joins(
+            &vec![interval_join(Some(within_lookback()), JoinMode::Anti)],
+            &mut ctx,
+            &lookup,
+            500_000_000_000,
+        );
+        assert!(
+            !ok,
+            "interval anti drops when a row matches in the interval"
+        );
+
+        // 区间外 → 保留
+        let lookup = TimedLookup(vec![timed_row(485_000_000_000, 1.0, 200.0)]);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        let ok = execute_joins(
+            &vec![interval_join(Some(within_lookback()), JoinMode::Anti)],
+            &mut ctx,
+            &lookup,
+            500_000_000_000,
+        );
+        assert!(ok, "interval anti keeps event when no row in interval");
+    }
+
+    #[test]
+    fn interval_open_upper_bound_excludes_boundary() {
+        // `[490s, <500s)`：恰在 500s 的行不匹配
+        let within = WithinSpec {
+            lo: Bound {
+                open: false,
+                val: BoundVal::Dur {
+                    dur: Duration::from_secs(10),
+                    neg: true,
+                },
+            },
+            hi: Bound {
+                open: true,
+                val: BoundVal::Dur {
+                    dur: Duration::ZERO,
+                    neg: false,
+                },
+            },
+        };
+        let lookup = TimedLookup(vec![timed_row(500_000_000_000, 1.0, 300.0)]);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        let ok = execute_joins(
+            &vec![interval_join(Some(within), JoinMode::Inner)],
+            &mut ctx,
+            &lookup,
+            500_000_000_000,
+        );
+        assert!(!ok, "upper-open bound excludes the boundary ts");
+    }
+
+    #[test]
+    fn interval_field_bounds_use_left_row_absolute_time() {
+        // 行内界（左行绝对时间字段）：`within [lo_f, hi_f]`，右行 ts ∈ [lo_f, hi_f]
+        let within = WithinSpec {
+            lo: Bound {
+                open: false,
+                val: BoundVal::Expr(Expr::Field(FieldRef::Simple("lo_f".into()))),
+            },
+            hi: Bound {
+                open: false,
+                val: BoundVal::Expr(Expr::Field(FieldRef::Simple("hi_f".into()))),
+            },
+        };
+        let rows = vec![
+            timed_row(492_000_000_000_000_000, 1.0, 100.0),
+            timed_row(494_000_000_000_000_000, 1.0, 200.0),
+        ];
+        let lookup = TimedLookup(rows);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields
+            .insert("lo_f".into(), Value::Number(490_000_000_000_000_000.0));
+        ctx.fields
+            .insert("hi_f".into(), Value::Number(493_000_000_000_000_000.0));
+        let ok = execute_joins(
+            &vec![interval_join(Some(within), JoinMode::Inner)],
+            &mut ctx,
+            &lookup,
+            500_000_000_000,
+        );
+        assert!(ok, "row ts=492s inside [490s, 493s] matches");
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(100.0)));
+    }
+
+    #[test]
+    fn deferred_emit_at_join_skipped_on_eager_path() {
+        // `emit at`（P3 deferred）不在 eager 路径执行：事件保留、不富化。
+        let mut join = interval_join(Some(within_lookback()), JoinMode::Inner);
+        join.emit_at = Some(Expr::Field(FieldRef::Simple("expires".into())));
+        let lookup = TimedLookup(vec![timed_row(495_000_000_000, 1.0, 200.0)]);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        let ok = execute_joins(&vec![join], &mut ctx, &lookup, 500_000_000_000);
+        assert!(
+            ok,
+            "deferred join must not drop the event on the eager path"
+        );
+        assert!(
+            !ctx.fields.contains_key("price"),
+            "deferred join must not enrich on the eager path"
+        );
+    }
+
+    /// 多条件 interval join：先按首条件键查，再逐条件复核（复刻 find_matching_row）。
+    #[test]
+    fn interval_multi_condition_rechecks_all_conds() {
+        let rows = vec![
+            // id 命中但 extra 不匹配（aid=1, extra=9）
+            timed_row_extra(495_000_000_000, 1.0, 200.0, 9.0),
+            // 全部条件命中
+            timed_row_extra(496_000_000_000, 1.0, 250.0, 7.0),
+        ];
+        let lookup = TimedLookup(rows);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        ctx.fields.insert("extra".into(), Value::Number(7.0));
+        let join = JoinPlan {
+            right_window: "bid_events".to_string(),
+            mode: JoinMode::Inner,
+            conds: vec![
+                JoinCondPlan {
+                    left: FieldRef::Simple("aid".into()),
+                    right: FieldRef::Simple("id".into()),
+                },
+                JoinCondPlan {
+                    left: FieldRef::Simple("extra".into()),
+                    right: FieldRef::Simple("extra".into()),
+                },
+            ],
+            within: Some(within_lookback()),
+            reduce: None,
+            emit_at: None,
+        };
+        let ok = execute_joins(&vec![join], &mut ctx, &lookup, 500_000_000_000);
+        assert!(ok);
+        // 仅 extra=7 的行通过全部条件
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(250.0)));
+    }
+
+    /// 闭区间：ts 恰在 lo / hi 边界上必须匹配。
+    #[test]
+    fn interval_closed_bounds_include_boundaries() {
+        let rows = vec![
+            timed_row(490_000_000_000, 1.0, 100.0), // == lo（t-10s）
+            timed_row(500_000_000_000, 1.0, 200.0), // == hi（t）
+        ];
+        let lookup = TimedLookup(rows);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        let ok = execute_joins(
+            &vec![interval_join(Some(within_lookback()), JoinMode::Inner)],
+            &mut ctx,
+            &lookup,
+            500_000_000_000,
+        );
+        assert!(ok, "closed interval must include both boundary ts");
+        // 最早 = ts 490s
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(100.0)));
+    }
+
+    /// snapshot interval miss：事件保留、不富化（与既有 snapshot 可选语义一致）。
+    #[test]
+    fn interval_snapshot_miss_keeps_event() {
+        let lookup = TimedLookup(vec![timed_row(480_000_000_000, 1.0, 100.0)]);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        let ok = execute_joins(
+            &vec![interval_join(Some(within_lookback()), JoinMode::Snapshot)],
+            &mut ctx,
+            &lookup,
+            500_000_000_000,
+        );
+        assert!(ok, "snapshot interval miss must keep the event");
+        assert!(
+            !ctx.fields.contains_key("price"),
+            "snapshot interval miss must not enrich"
+        );
+    }
+
+    /// 多 join 混合：interval inner 命中后继续处理下一个 plain snapshot join。
+    #[test]
+    fn interval_join_then_plain_join_both_enrich() {
+        // 第二个 plain snapshot join 走 join_lookup（TimedLookup 只覆写 asof_candidates，
+        // join_lookup 默认实现走 snapshot → 需要 snapshot 覆写）——这里直接构造组合 lookup
+        struct TwoLookup;
+        impl WindowLookup for TwoLookup {
+            fn snapshot_field_values(
+                &self,
+                _w: &str,
+                _f: &str,
+            ) -> Option<std::collections::HashSet<String>> {
+                None
+            }
+            fn snapshot(&self, _w: &str) -> Option<Vec<JoinRow>> {
+                let mut fields = EngineHashMap::default();
+                fields.insert("rid".into(), Value::Number(1.0));
+                fields.insert("region".into(), Value::Str("cn".into()));
+                Some(vec![JoinRow::Event(Arc::new(Event { fields }))])
+            }
+            fn asof_candidates(
+                &self,
+                _w: &str,
+                _key_field: &str,
+                _key: &Value,
+            ) -> Option<Vec<(i64, JoinRow)>> {
+                Some(vec![timed_row(495_000_000_000, 1.0, 200.0)])
+            }
+        }
+
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        let joins = vec![
+            interval_join(Some(within_lookback()), JoinMode::Inner),
+            JoinPlan {
+                right_window: "region_tbl".to_string(),
+                mode: JoinMode::Snapshot,
+                conds: vec![JoinCondPlan {
+                    left: FieldRef::Simple("aid".into()),
+                    right: FieldRef::Simple("rid".into()),
+                }],
+                within: None,
+                reduce: None,
+                emit_at: None,
+            },
+        ];
+        let ok = execute_joins(&joins, &mut ctx, &TwoLookup, 500_000_000_000);
+        assert!(ok);
+        // interval join 富化 price
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(200.0)));
+        // plain snapshot join 富化 region（裸名 or_insert——price 已存在，region 新增）
+        assert_eq!(ctx.fields.get("region"), Some(&Value::Str("cn".into())));
+    }
+
+    /// 右窗行：`(ts, id, price, extra)`。
+    fn timed_row_extra(ts: i64, id: f64, price: f64, extra: f64) -> (i64, JoinRow) {
+        let mut fields = EngineHashMap::default();
+        fields.insert("id".into(), Value::Number(id));
+        fields.insert("price".into(), Value::Number(price));
+        fields.insert("extra".into(), Value::Number(extra));
+        (ts, JoinRow::Event(Arc::new(Event { fields })))
+    }
+
+    #[test]
+    fn inner_mode_without_interval_drops_on_miss() {
+        // 缺省 inner（无 within）：命中富化、miss 丢（设计 D4）
+        struct OneRowLookup(JoinRow);
+        impl WindowLookup for OneRowLookup {
+            fn snapshot_field_values(
+                &self,
+                _w: &str,
+                _f: &str,
+            ) -> Option<std::collections::HashSet<String>> {
+                None
+            }
+            fn snapshot(&self, _w: &str) -> Option<Vec<JoinRow>> {
+                Some(vec![self.0.clone()])
+            }
+        }
+        let row = timed_row(0, 1.0, 200.0).1;
+
+        // miss
+        let lookup = OneRowLookup(row.clone());
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(9.0));
+        let ok = execute_joins(
+            &vec![interval_join(None, JoinMode::Inner)],
+            &mut ctx,
+            &lookup,
+            500_000_000_000,
+        );
+        assert!(!ok, "plain inner miss drops event");
+
+        // hit
+        let lookup = OneRowLookup(row);
+        let mut ctx = Event {
+            fields: EngineHashMap::default(),
+        };
+        ctx.fields.insert("aid".into(), Value::Number(1.0));
+        let ok = execute_joins(
+            &vec![interval_join(None, JoinMode::Inner)],
+            &mut ctx,
+            &lookup,
+            500_000_000_000,
+        );
+        assert!(ok, "plain inner hit keeps event");
+        assert_eq!(ctx.fields.get("price"), Some(&Value::Number(200.0)));
     }
 }

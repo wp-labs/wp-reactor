@@ -946,6 +946,24 @@ pub(super) fn eval_func_call(
             let bucketed = t.div_euclid(interval_nanos) * interval_nanos;
             Some(time_nanos_to_value(bucketed))
         }
+        "bucket_end" => {
+            // 桶末：`bucket_end(t, interval) = time_bucket(t, interval) + interval`
+            //（Q8 形态：`within [p.dateTime, <bucket_end(p.dateTime, 10s)]` 表达上开桶）
+            if args.len() != 2 {
+                return None;
+            }
+            let t = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+                _ => return None,
+            };
+            let interval = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let interval_nanos = positive_interval_seconds_to_nanos(interval)?;
+            let bucketed = t.div_euclid(interval_nanos) * interval_nanos;
+            Some(time_nanos_to_value(bucketed.checked_add(interval_nanos)?))
+        }
         // L3 Collection functions - require instance context, not supported in guard context
         "collect_set" | "collect_list" | "first" | "last" => {
             // These functions need access to the instance's collected events

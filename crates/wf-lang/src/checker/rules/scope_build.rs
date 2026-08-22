@@ -71,7 +71,20 @@ pub fn build_scope<'a>(
             scope.aliases.insert(target.as_str(), ws);
             scope.join_windows.push(target.as_str());
         }
+        // `reduce ... as label`：归约标签注册为 object 别名（review R2）
+        register_reduce_labels(&mut scope, &rule.joins);
     }
 
     scope
+}
+
+/// 将 joins 的 `reduce ... as label` 标签注册进 scope（object 别名）。
+pub fn register_reduce_labels(scope: &mut Scope<'_>, joins: &[crate::ast::JoinClause]) {
+    for join in joins {
+        if let Some(label) = join.reduce.as_ref().and_then(|r| r.label.as_ref())
+            && !scope.reduce_labels.iter().any(|l| l == label)
+        {
+            scope.reduce_labels.push(label.clone());
+        }
+    }
 }

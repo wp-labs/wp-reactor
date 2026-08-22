@@ -141,6 +141,7 @@ pub(super) fn explain_joins(joins: &[JoinPlan]) -> Vec<String> {
                     format!("asof within {}", format_duration(d))
                 }
                 crate::ast::JoinMode::Anti => "anti".to_string(),
+                crate::ast::JoinMode::Inner => "inner".to_string(),
             };
             let conds: Vec<String> = j
                 .conds
@@ -153,9 +154,75 @@ pub(super) fn explain_joins(joins: &[JoinPlan]) -> Vec<String> {
                     )
                 })
                 .collect();
-            format!("join {} {} on {}", j.right_window, mode, conds.join(" && "))
+            let mut parts = vec![format!("join {} {}", j.right_window, mode)];
+            if let Some(w) = &j.within {
+                parts.push(format!("within {}", format_within(w)));
+            }
+            if let Some(r) = &j.reduce {
+                parts.push(format!("reduce {}", format_reduce(r)));
+            }
+            parts.push(format!("on {}", conds.join(" && ")));
+            if let Some(label) = j.reduce.as_ref().and_then(|r| r.label.as_ref()) {
+                parts.push(format!("as {}", label));
+            }
+            if let Some(e) = &j.emit_at {
+                parts.push(format!("emit at {}", format_expr(e)));
+            }
+            parts.join(" ")
         })
         .collect()
+}
+
+fn format_within(w: &crate::ast::WithinSpec) -> String {
+    format!("[{} , {}]", format_bound(&w.lo), format_bound(&w.hi))
+}
+
+fn format_bound(b: &crate::ast::Bound) -> String {
+    let marker = if b.open { "<" } else { "" };
+    match &b.val {
+        crate::ast::BoundVal::Dur { dur, neg } => format!(
+            "{}{}",
+            marker,
+            if *neg {
+                format!("-{}", format_duration(dur))
+            } else {
+                format_duration(dur)
+            }
+        ),
+        crate::ast::BoundVal::Expr(e) => format!("{}{}", marker, format_expr(e)),
+    }
+}
+
+fn format_reduce(r: &crate::ast::ReduceClause) -> String {
+    let m = match &r.measure {
+        crate::ast::ReduceMeasure::Maxrow { field, tie } => {
+            format!("maxrow({}){}", format_field_ref(field), format_tie(tie))
+        }
+        crate::ast::ReduceMeasure::Minrow { field, tie } => {
+            format!("minrow({}){}", format_field_ref(field), format_tie(tie))
+        }
+        crate::ast::ReduceMeasure::Last { field } => {
+            format!("last({})", format_field_ref(field))
+        }
+        crate::ast::ReduceMeasure::Top { n, field } => {
+            format!("top({}, {})", n, format_field_ref(field))
+        }
+    };
+    match &r.label {
+        Some(l) => format!("{} as {}", m, l),
+        None => m,
+    }
+}
+
+fn format_tie(tie: &Option<crate::ast::TieSpec>) -> String {
+    match tie {
+        Some(t) => format!(
+            " tie({} {})",
+            format_field_ref(&t.field),
+            if t.desc { "desc" } else { "asc" }
+        ),
+        None => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------

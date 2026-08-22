@@ -66,6 +66,9 @@ fn person_join() -> JoinPlan {
             left: FieldRef::Simple("sip".to_string()),
             right: FieldRef::Simple("id".to_string()),
         }],
+        within: None,
+        reduce: None,
+        emit_at: None,
     }
 }
 

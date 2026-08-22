@@ -2,8 +2,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::ast::{
-    CloseMode, EachClause, EntityClause, EntityTypeVal, EventsBlock, Expr, FieldRef, MatchClause,
-    Measure, PathSegment, RuleDecl, ScoreExpr, SeqSkip, WflFile, WindowMode, YieldClause,
+    BoundVal, CloseMode, EachClause, EntityClause, EntityTypeVal, EventsBlock, Expr, FieldRef,
+    MatchClause, Measure, PathSegment, RuleDecl, ScoreExpr, SeqSkip, WflFile, WindowMode,
+    WithinSpec, YieldClause,
 };
 use crate::checker::check_wfl;
 use crate::plan::{
@@ -212,9 +213,9 @@ fn compile_stats_rule(
         stats_plan: Some(stats_plan),
         joins: Vec::new(),
         r#where: None,
-        entity_plan: compile_entity(&rule.entity),
-        yield_plan: compile_yield(&rule.yield_clause, file),
-        score_plan: compile_score(&rule.score),
+        entity_plan: compile_entity(&rule.entity, &HashSet::new()),
+        yield_plan: compile_yield(&rule.yield_clause, file, &HashSet::new()),
+        score_plan: compile_score(&rule.score, &HashSet::new()),
         pattern_origin: None,
         conv_plan: None,
         limits_plan: compile_limits(&rule.limits),
@@ -227,9 +228,15 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
     if let Some(stats) = &rule.stats_clause {
         return compile_stats_rule(rule, stats, file, schemas);
     }
-    let score_plan = compile_score(&rule.score);
-    let entity_plan = compile_entity(&rule.entity);
-    let yield_plan = compile_yield(&rule.yield_clause, file);
+    // `as label` 归约标签集：`label.field` 编译为 FieldRef::Path（review R2）
+    let labels: HashSet<String> = rule
+        .joins
+        .iter()
+        .filter_map(|j| j.reduce.as_ref().and_then(|r| r.label.clone()))
+        .collect();
+    let score_plan = compile_score(&rule.score, &labels);
+    let entity_plan = compile_entity(&rule.entity, &labels);
+    let yield_plan = compile_yield(&rule.yield_clause, file, &labels);
     let binds = compile_binds(&rule.events);
     let mut match_plan = compile_match(&rule.match_clause, false, &binds, &rule.joins, schemas);
     let bind_tracking = collect_rule_bind_tracking(
@@ -275,7 +282,10 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
         each_plan: rule.each_clause.as_ref().map(compile_each),
         stats_plan: None,
         joins,
-        r#where: rule.r#where.clone(),
+        r#where: rule
+            .r#where
+            .as_ref()
+            .map(|w| rewrite_expr_label_refs(w, &labels)),
         entity_plan,
         yield_plan,
         score_plan,
@@ -342,18 +352,28 @@ fn compile_pipeline_rule(
         };
 
         let mut match_plan = compile_match(match_clause, !is_final, &binds, joins, schemas);
+        // `as label` 归约标签集（仅最终 stage 的 score/entity/yield 可引用；
+        // 非最终 stage 的 yield/entity 为自动生成，无用户表达式）。
+        let labels: HashSet<String> = if is_final {
+            rule.joins
+                .iter()
+                .filter_map(|j| j.reduce.as_ref().and_then(|r| r.label.clone()))
+                .collect()
+        } else {
+            HashSet::new()
+        };
         let entity_plan = if is_final {
-            compile_entity(&rule.entity)
+            compile_entity(&rule.entity, &labels)
         } else {
             compile_pipeline_entity(&match_plan.keys)
         };
         let yield_plan = if is_final {
-            compile_yield(&rule.yield_clause, file)
+            compile_yield(&rule.yield_clause, file, &labels)
         } else {
             compile_pipeline_stage_yield(match_clause, pipeline_window_name(&rule.name, idx + 1))
         };
         let score_plan = if is_final {
-            compile_score(&rule.score)
+            compile_score(&rule.score, &labels)
         } else {
             ScorePlan {
                 expr: crate::ast::Expr::Number(0.0),
@@ -968,13 +988,13 @@ fn compile_branch(
 // Entity
 // ---------------------------------------------------------------------------
 
-fn compile_entity(entity: &EntityClause) -> EntityPlan {
+fn compile_entity(entity: &EntityClause, labels: &HashSet<String>) -> EntityPlan {
     let raw = match &entity.entity_type {
         EntityTypeVal::Ident(s) | EntityTypeVal::StringLit(s) => s.clone(),
     };
     EntityPlan {
         entity_type: raw.to_ascii_lowercase(),
-        entity_id_expr: entity.id_expr.clone(),
+        entity_id_expr: rewrite_expr_label_refs(&entity.id_expr, labels),
     }
 }
 
@@ -982,9 +1002,9 @@ fn compile_entity(entity: &EntityClause) -> EntityPlan {
 // Score
 // ---------------------------------------------------------------------------
 
-fn compile_score(score: &ScoreExpr) -> ScorePlan {
+fn compile_score(score: &ScoreExpr, labels: &HashSet<String>) -> ScorePlan {
     ScorePlan {
-        expr: score.expr.clone(),
+        expr: rewrite_expr_label_refs(&score.expr, labels),
     }
 }
 
@@ -992,7 +1012,11 @@ fn compile_score(score: &ScoreExpr) -> ScorePlan {
 // Yield
 // ---------------------------------------------------------------------------
 
-fn compile_yield(yield_clause: &YieldClause, file: &WflFile) -> YieldPlan {
+fn compile_yield(
+    yield_clause: &YieldClause,
+    file: &WflFile,
+    labels: &HashSet<String>,
+) -> YieldPlan {
     let args = expand_yield_args(&file.yield_presets, yield_clause)
         .expect("yield presets should have been validated before compilation");
     YieldPlan {
@@ -1002,7 +1026,7 @@ fn compile_yield(yield_clause: &YieldClause, file: &WflFile) -> YieldPlan {
             .iter()
             .map(|arg| YieldField {
                 name: arg.name.clone(),
-                value: arg.value.clone(),
+                value: rewrite_expr_label_refs(&arg.value, labels),
             })
             .collect(),
     }
@@ -1101,6 +1125,12 @@ fn key_output_name(key: &FieldRef) -> String {
 // ---------------------------------------------------------------------------
 
 fn compile_joins(joins: &[crate::ast::JoinClause]) -> Vec<JoinPlan> {
+    // `as label` 引用（`label.field`）编译为 FieldRef::Path（review R2）——
+    // 归约整行以裸键 object value 注入 eval context，裸名会丢限定词取错行。
+    let labels: HashSet<String> = joins
+        .iter()
+        .filter_map(|j| j.reduce.as_ref().and_then(|r| r.label.clone()))
+        .collect();
     joins
         .iter()
         .map(|j| JoinPlan {
@@ -1114,8 +1144,96 @@ fn compile_joins(joins: &[crate::ast::JoinClause]) -> Vec<JoinPlan> {
                     right: c.right.clone(),
                 })
                 .collect(),
+            within: j
+                .within
+                .as_ref()
+                .map(|w| rewrite_within_label_refs(w, &labels)),
+            reduce: j.reduce.clone(),
+            emit_at: j
+                .emit_at
+                .as_ref()
+                .map(|e| rewrite_expr_label_refs(e, &labels)),
         })
         .collect()
+}
+
+/// 将 `Qualified(label, field)` 重写为 `FieldRef::Path { alias: label, segments: [field] }`
+///（`as label` 归约结果的 object 访问；review R2）。非 label 限定符原样保留。
+fn rewrite_expr_label_refs(expr: &Expr, labels: &HashSet<String>) -> Expr {
+    match expr {
+        Expr::Field(FieldRef::Qualified(alias, field)) if labels.contains(alias) => {
+            Expr::Field(FieldRef::Path {
+                alias: alias.clone(),
+                segments: vec![PathSegment::Field(field.clone())],
+            })
+        }
+        Expr::Field(fr) => Expr::Field(fr.clone()),
+        Expr::Number(_)
+        | Expr::StringLit(_)
+        | Expr::Bool(_)
+        | Expr::SystemVar(_)
+        | Expr::WfuMeta(_)
+        | Expr::PresetParam(_)
+        | Expr::Object(_)
+        | Expr::Array(_) => expr.clone(),
+        Expr::BinOp { op, left, right } => Expr::BinOp {
+            op: *op,
+            left: Box::new(rewrite_expr_label_refs(left, labels)),
+            right: Box::new(rewrite_expr_label_refs(right, labels)),
+        },
+        Expr::Neg(inner) => Expr::Neg(Box::new(rewrite_expr_label_refs(inner, labels))),
+        Expr::FuncCall {
+            qualifier,
+            name,
+            args,
+        } => Expr::FuncCall {
+            qualifier: qualifier.clone(),
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rewrite_expr_label_refs(a, labels))
+                .collect(),
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(rewrite_expr_label_refs(expr, labels)),
+            list: list
+                .iter()
+                .map(|a| rewrite_expr_label_refs(a, labels))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => Expr::IfThenElse {
+            cond: Box::new(rewrite_expr_label_refs(cond, labels)),
+            then_expr: Box::new(rewrite_expr_label_refs(then_expr, labels)),
+            else_expr: Box::new(rewrite_expr_label_refs(else_expr, labels)),
+        },
+    }
+}
+
+/// `within` 界表达式里的 `label.field` 引用同样重写为 Path。
+fn rewrite_within_label_refs(within: &WithinSpec, labels: &HashSet<String>) -> WithinSpec {
+    let rewrite_bound = |b: &crate::ast::Bound| crate::ast::Bound {
+        open: b.open,
+        val: match &b.val {
+            BoundVal::Dur { dur, neg } => BoundVal::Dur {
+                dur: *dur,
+                neg: *neg,
+            },
+            BoundVal::Expr(e) => BoundVal::Expr(rewrite_expr_label_refs(e, labels)),
+        },
+    };
+    WithinSpec {
+        lo: rewrite_bound(&within.lo),
+        hi: rewrite_bound(&within.hi),
+    }
 }
 
 // ---------------------------------------------------------------------------

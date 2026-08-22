@@ -374,7 +374,11 @@ fn named_arg(input: &mut &str) -> ModalResult<NamedArg> {
 // join clause
 // ---------------------------------------------------------------------------
 
-/// `join WINDOW snapshot/asof [within DUR] on cond [&& cond]`
+/// `join WINDOW [mode] [within ...] [reduce ...] on cond [&& cond] [as label] [emit at expr]`
+///
+/// - `within` / `reduce` 位于 mode 与 `on` 之间，两者可任一顺序、各至多一次；
+/// - `as label`（Q9 形态）可跟在 `on` 条件之后；BNF 形态 `reduce ... as label` 也可；
+/// - `emit at <expr>` 为 deferred 标记 + 触发点（P1 语法）。
 pub(super) fn join_clause(input: &mut &str) -> ModalResult<JoinClause> {
     ws_skip.parse_next(input)?;
     kw("join").parse_next(input)?;
@@ -387,8 +391,32 @@ pub(super) fn join_clause(input: &mut &str) -> ModalResult<JoinClause> {
         .parse_next(input)?
         .to_string();
 
+    // mode 缺省 = 纯存在 inner（设计 D4）
     ws_skip.parse_next(input)?;
-    let mode = cut_err(join_mode).parse_next(input)?;
+    let mode = opt(join_mode).parse_next(input)?.unwrap_or(JoinMode::Inner);
+
+    // `within` / `reduce` 任一顺序、各至多一次
+    let mut within: Option<WithinSpec> = None;
+    let mut reduce: Option<ReduceClause> = None;
+    loop {
+        ws_skip.parse_next(input)?;
+        let saved = *input;
+        if within.is_none()
+            && let Ok(w) = within_clause.parse_next(input)
+        {
+            within = Some(w);
+            continue;
+        }
+        *input = saved;
+        if reduce.is_none()
+            && let Ok(r) = reduce_clause.parse_next(input)
+        {
+            reduce = Some(r);
+            continue;
+        }
+        *input = saved;
+        break;
+    }
 
     ws_skip.parse_next(input)?;
     cut_err(kw("on"))
@@ -412,10 +440,29 @@ pub(super) fn join_clause(input: &mut &str) -> ModalResult<JoinClause> {
         }
     }
 
+    // `as label`（Q9 形态：跟在 on 条件之后；需 reduce 且未重复）
+    ws_skip.parse_next(input)?;
+    if let Some(label) = opt(as_label).parse_next(input)? {
+        let Some(rc) = &mut reduce else {
+            return Err(parse_cut_error());
+        };
+        if rc.label.is_some() {
+            return Err(parse_cut_error());
+        }
+        rc.label = Some(label);
+    }
+
+    // `emit at <expr>`（deferred 标记）
+    ws_skip.parse_next(input)?;
+    let emit_at = opt(emit_at_clause).parse_next(input)?;
+
     Ok(JoinClause {
         target_window,
         mode,
         conditions,
+        within,
+        reduce,
+        emit_at,
     })
 }
 
@@ -431,7 +478,153 @@ fn join_mode(input: &mut &str) -> ModalResult<JoinMode> {
 fn asof_within(input: &mut &str) -> ModalResult<std::time::Duration> {
     kw("within").parse_next(input)?;
     ws_skip.parse_next(input)?;
-    cut_err(duration_value).parse_next(input)
+    // 非 cut：`asof within [lo, hi]` 时 duration 解析失败须回溯，让位给 interval
+    // within 子句（`asof` 降级为无 within 的 mode）。
+    duration_value.parse_next(input)
+}
+
+/// `within [lo, hi]` 或 `within dur` 糖（≡ `within [-dur, 0s]`）。
+fn within_clause(input: &mut &str) -> ModalResult<WithinSpec> {
+    kw("within").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    if opt(literal("[")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        let lo = cut_err(bound_value).parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        cut_err(literal(",")).parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        let hi = cut_err(bound_value).parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        cut_err(literal("]")).parse_next(input)?;
+        Ok(WithinSpec { lo, hi })
+    } else {
+        // `within 10s` 糖 ≡ within [-10s, 0s]
+        let dur = cut_err(duration_value).parse_next(input)?;
+        Ok(WithinSpec {
+            lo: Bound {
+                open: false,
+                val: BoundVal::Dur { dur, neg: true },
+            },
+            hi: Bound {
+                open: false,
+                val: BoundVal::Dur {
+                    dur: std::time::Duration::ZERO,
+                    neg: false,
+                },
+            },
+        })
+    }
+}
+
+/// 区间界：`['<' | '<='] (dur | expr)`。`<` 前缀 = 开区间；`<=`/缺省 = 闭。
+fn bound_value(input: &mut &str) -> ModalResult<Bound> {
+    // 开闭记号：`<=`（闭，显式）| `<`（开）| 缺省（闭）
+    let open = if opt(literal("<=")).parse_next(input)?.is_some() {
+        false
+    } else {
+        opt(literal("<")).parse_next(input)?.is_some()
+    };
+    let after_marker = *input;
+    ws_skip.parse_next(input)?;
+    if let Ok(dur) = duration_value.parse_next(input) {
+        return Ok(Bound {
+            open,
+            val: BoundVal::Dur { dur, neg: false },
+        });
+    }
+    // 非时长 → 左行绝对时间表达式（字段/函数调用）；重置到记号后解析
+    *input = after_marker;
+    ws_skip.parse_next(input)?;
+    let expr = cut_err(expr::parse_expr).parse_next(input)?;
+    Ok(Bound {
+        open,
+        val: BoundVal::Expr(expr),
+    })
+}
+
+/// `reduce maxrow(field) [tie(field asc|desc)] | minrow(...) | last(field) | top(N, field)`
+fn reduce_clause(input: &mut &str) -> ModalResult<ReduceClause> {
+    kw("reduce").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let measure = cut_err(reduce_measure).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let label = opt(as_label).parse_next(input)?;
+    Ok(ReduceClause { measure, label })
+}
+
+fn reduce_measure(input: &mut &str) -> ModalResult<ReduceMeasure> {
+    let name = cut_err(ident).parse_next(input)?.to_string();
+    ws_skip.parse_next(input)?;
+    cut_err(literal("(")).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let (field, n) = if name == "top" {
+        let n = cut_err(nonneg_integer).parse_next(input)? as u64;
+        ws_skip.parse_next(input)?;
+        cut_err(literal(",")).parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        let field = cut_err(join_field_ref).parse_next(input)?;
+        (field, Some(n))
+    } else {
+        let field = cut_err(join_field_ref).parse_next(input)?;
+        (field, None)
+    };
+    ws_skip.parse_next(input)?;
+    cut_err(literal(")")).parse_next(input)?;
+    match name.as_str() {
+        "maxrow" => Ok(ReduceMeasure::Maxrow {
+            field,
+            tie: opt_tie(input)?,
+        }),
+        "minrow" => Ok(ReduceMeasure::Minrow {
+            field,
+            tie: opt_tie(input)?,
+        }),
+        "last" => Ok(ReduceMeasure::Last { field }),
+        "top" => Ok(ReduceMeasure::Top {
+            n: n.expect("top parsed n"),
+            field,
+        }),
+        _ => Err(winnow::error::ErrMode::Cut(
+            winnow::error::ContextError::new(),
+        )),
+    }
+}
+
+/// `tie(field asc|desc)`（闭括号后）。
+fn opt_tie(input: &mut &str) -> ModalResult<Option<TieSpec>> {
+    ws_skip.parse_next(input)?;
+    if opt(kw("tie")).parse_next(input)?.is_none() {
+        return Ok(None);
+    }
+    ws_skip.parse_next(input)?;
+    cut_err(literal("(")).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let field = cut_err(join_field_ref).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let _ = opt(literal(",")).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let desc = opt(alt((kw("asc").value(false), kw("desc").value(true))))
+        .parse_next(input)?
+        .unwrap_or(false);
+    ws_skip.parse_next(input)?;
+    cut_err(literal(")")).parse_next(input)?;
+    Ok(Some(TieSpec { field, desc }))
+}
+
+/// `as <label>`。
+fn as_label(input: &mut &str) -> ModalResult<String> {
+    kw("as").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(ident).parse_next(input).map(|s| s.to_string())
+}
+
+/// `emit at <expr>`。
+fn emit_at_clause(input: &mut &str) -> ModalResult<Expr> {
+    kw("emit").parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(kw("at")).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(expr::parse_expr).parse_next(input)
 }
 
 fn join_cond(input: &mut &str) -> ModalResult<JoinCondition> {

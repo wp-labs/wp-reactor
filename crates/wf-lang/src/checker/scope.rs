@@ -15,6 +15,9 @@ pub struct Scope<'a> {
     pub join_windows: Vec<&'a str>,
     /// Match/close step label metadata for stat selector validation.
     pub stat_labels: HashMap<String, StatLabelInfo>,
+    /// `reduce ... as label` 归约标签：`label.field` 解析为 object 访问
+    ///（review R2——归约整行以裸键 object value 注入 eval context）。
+    pub reduce_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +40,7 @@ impl<'a> Scope<'a> {
             let_types: HashMap::new(),
             join_windows: Vec::new(),
             stat_labels: HashMap::new(),
+            reduce_labels: Vec::new(),
         }
     }
 
@@ -46,7 +50,14 @@ impl<'a> Scope<'a> {
     pub fn resolve_field_ref(&self, fref: &FieldRef) -> Result<Option<ValType>, String> {
         match fref {
             FieldRef::Simple(name) => self.resolve_simple(name),
-            FieldRef::Qualified(alias, field) => self.resolve_qualified(alias, field).map(Some),
+            FieldRef::Qualified(alias, field) => {
+                // `reduce ... as label` 的 `label.field`：object 访问，叶子类型运行时确定
+                //（与嵌套 Path 一致 → Ok(None)，解析通过但无静态标量类型）
+                if self.reduce_labels.iter().any(|l| l == alias) {
+                    return Ok(None);
+                }
+                self.resolve_qualified(alias, field).map(Some)
+            }
             FieldRef::Bracketed(alias, key) => self.resolve_qualified(alias, key).map(Some),
             FieldRef::Path { alias, segments } => {
                 // Nested paths validate the root field only; deep segments have
@@ -55,6 +66,10 @@ impl<'a> Scope<'a> {
                 let Some(PathSegment::Field(root)) = segments.first() else {
                     return Err("nested field path must start with a member name".to_string());
                 };
+                // reduce 标签的路径访问（`winner.bidder`）同样只验根、叶子类型运行时确定
+                if self.reduce_labels.iter().any(|l| l == alias) {
+                    return Ok(None);
+                }
                 self.resolve_qualified(alias, root).map(Some)
             }
         }
@@ -65,6 +80,10 @@ impl<'a> Scope<'a> {
         // `let parts = split(...)` is a value binding, not a field access.
         if let Some(t) = self.let_types.get(name) {
             return Ok(Some(t.clone()));
+        }
+        // reduce 标签裸引用（`winner` 自身）——object 访问，无静态标量类型
+        if self.reduce_labels.iter().any(|l| l == name) {
+            return Ok(None);
         }
         // First check if it's an alias (set-level reference, e.g. count(fail))
         if self.aliases.contains_key(name) {

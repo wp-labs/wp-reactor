@@ -653,3 +653,230 @@ fn join_asof_close_uses_last_event_nanos() {
         alert.score
     );
 }
+
+// ===========================================================================
+// P2：close 路径的缺省 inner / interval inner——miss 抑制 close 输出
+//（review 修复：close_exec 尊重 execute_joins 返回值，与 match/on-each 一致）
+// ===========================================================================
+
+/// `within [t-10s, t]` 常量界（`within 10s` 糖的等价形态）。
+fn within_lookback() -> WithinSpec {
+    WithinSpec {
+        lo: Bound {
+            open: false,
+            val: BoundVal::Dur {
+                dur: Duration::from_secs(10),
+                neg: true,
+            },
+        },
+        hi: Bound {
+            open: false,
+            val: BoundVal::Dur {
+                dur: Duration::ZERO,
+                neg: false,
+            },
+        },
+    }
+}
+
+fn interval_inner_join(window: &str, left_field: &str, right_field: &str) -> JoinPlan {
+    JoinPlan {
+        right_window: window.to_string(),
+        mode: JoinMode::Inner,
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Simple(left_field.to_string()),
+            right: FieldRef::Simple(right_field.to_string()),
+        }],
+        within: Some(within_lookback()),
+        reduce: None,
+        emit_at: None,
+    }
+}
+
+/// close + interval inner miss → close 输出被抑制（None）。
+#[test]
+fn join_interval_inner_close_miss_suppresses() {
+    use crate::match_engine::match_engine::{CloseOutput, CloseReason};
+
+    let match_plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(1.0))])],
+    );
+    let mut rule_plan = simple_rule_plan(
+        "r_interval_close",
+        match_plan,
+        Expr::Number(60.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".to_string())),
+    );
+    rule_plan.joins = vec![interval_inner_join("asset_db", "sip", "ip")];
+    let exec = RuleExecutor::new(rule_plan);
+
+    let mut wl = MockWindowLookup::new();
+    // 行在 [t-10s, t] 之外（t=30s，行在 5s）→ interval miss → inner 丢
+    wl.add_timestamped_snapshot(
+        "asset_db",
+        vec![(5_000_000_000, row(vec![("ip", str_val("10.0.0.1"))]))],
+    );
+
+    let close = CloseOutput {
+        rule_name: "r_interval_close".to_string(),
+        scope_key: vec![str_val("10.0.0.1")],
+        close_reason: CloseReason::Timeout,
+        event_ok: true,
+        close_ok: true,
+        close_mode: CloseMode::And,
+        event_emitted: false,
+        event_step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: Some("fail".to_string()),
+            measure_value: 1.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
+            collected_values: Vec::new(),
+            field_values: EngineHashMap::default(),
+        }],
+        close_step_data: vec![],
+        bind_data: vec![],
+        watermark_nanos: 30_000_000_000,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 30_000_000_000,
+        machine_id: String::new(),
+        last_event_nanos: 30_000_000_000,
+    };
+
+    let result = exec.execute_close_with_joins(&close, &wl).unwrap();
+    assert!(
+        result.is_none(),
+        "interval inner miss must suppress the close output"
+    );
+}
+
+/// close + interval inner 命中 → close 输出（富化后 score 走 join 字段）。
+#[test]
+fn join_interval_inner_close_hit_outputs() {
+    use crate::match_engine::match_engine::{CloseOutput, CloseReason};
+
+    let match_plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(1.0))])],
+    );
+    let mut rule_plan = simple_rule_plan(
+        "r_interval_close_hit",
+        match_plan,
+        // score 用富化的 risk 字段证明注入
+        Expr::Field(FieldRef::Simple("risk".to_string())),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".to_string())),
+    );
+    rule_plan.joins = vec![interval_inner_join("asset_db", "sip", "ip")];
+    let exec = RuleExecutor::new(rule_plan);
+
+    let mut wl = MockWindowLookup::new();
+    wl.add_timestamped_snapshot(
+        "asset_db",
+        vec![(
+            25_000_000_000,
+            row(vec![("ip", str_val("10.0.0.1")), ("risk", num(95.0))]),
+        )],
+    );
+
+    let close = CloseOutput {
+        rule_name: "r_interval_close_hit".to_string(),
+        scope_key: vec![str_val("10.0.0.1")],
+        close_reason: CloseReason::Timeout,
+        event_ok: true,
+        close_ok: true,
+        close_mode: CloseMode::And,
+        event_emitted: false,
+        event_step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: Some("fail".to_string()),
+            measure_value: 1.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
+            collected_values: Vec::new(),
+            field_values: EngineHashMap::default(),
+        }],
+        close_step_data: vec![],
+        bind_data: vec![],
+        watermark_nanos: 30_000_000_000,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 30_000_000_000,
+        machine_id: String::new(),
+        last_event_nanos: 30_000_000_000,
+    };
+
+    let alert = exec.execute_close_with_joins(&close, &wl).unwrap().unwrap();
+    assert!(
+        (alert.score - 95.0).abs() < f64::EPSILON,
+        "interval inner hit must enrich risk, got score {}",
+        alert.score
+    );
+}
+
+/// close + plain inner（无 within）miss → 抑制 close 输出。
+#[test]
+fn join_plain_inner_close_miss_suppresses() {
+    use crate::match_engine::match_engine::{CloseOutput, CloseReason};
+
+    let match_plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("fail", count_ge(1.0))])],
+    );
+    let mut rule_plan = simple_rule_plan(
+        "r_inner_close",
+        match_plan,
+        Expr::Number(60.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".to_string())),
+    );
+    let mut join = snapshot_join("asset_db", "sip", "ip");
+    join.mode = JoinMode::Inner;
+    rule_plan.joins = vec![join];
+    let exec = RuleExecutor::new(rule_plan);
+
+    let mut wl = MockWindowLookup::new();
+    wl.add_snapshot(
+        "asset_db",
+        vec![row(vec![("ip", str_val("10.0.0.9"))])], // 键不匹配
+    );
+
+    let close = CloseOutput {
+        rule_name: "r_inner_close".to_string(),
+        scope_key: vec![str_val("10.0.0.1")],
+        close_reason: CloseReason::Timeout,
+        event_ok: true,
+        close_ok: true,
+        close_mode: CloseMode::And,
+        event_emitted: false,
+        event_step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: Some("fail".to_string()),
+            measure_value: 1.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
+            collected_values: Vec::new(),
+            field_values: EngineHashMap::default(),
+        }],
+        close_step_data: vec![],
+        bind_data: vec![],
+        watermark_nanos: 30_000_000_000,
+        event_first_time_nanos: 0,
+        event_last_time_nanos: 0,
+        window_start_time_nanos: 0,
+        window_end_time_nanos: 30_000_000_000,
+        machine_id: String::new(),
+        last_event_nanos: 30_000_000_000,
+    };
+
+    let result = exec.execute_close_with_joins(&close, &wl).unwrap();
+    assert!(
+        result.is_none(),
+        "plain inner miss must suppress the close output"
+    );
+}

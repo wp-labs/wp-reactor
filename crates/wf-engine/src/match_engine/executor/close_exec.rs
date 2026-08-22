@@ -162,7 +162,11 @@ impl RuleExecutor {
             &self.close_ctx_fields,
         );
         ctx = annotate_close_step_stages(ctx, close.event_step_data.len());
-        execute_joins(&self.plan.joins, &mut ctx, windows, close.last_event_nanos);
+        // join 返回值：缺省 inner/interval inner miss 与 anti 命中 → 抑制 close 输出
+        //（与 match/on-each 路径一致，设计 D4「miss → 丢」）。
+        if !execute_joins(&self.plan.joins, &mut ctx, windows, close.last_event_nanos) {
+            return Ok(None);
+        }
         // Post-join `where`: strict — false/None suppresses the output.
         if !self.where_ok(&ctx) {
             return Ok(None);

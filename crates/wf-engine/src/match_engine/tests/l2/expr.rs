@@ -214,6 +214,55 @@ fn time_bucket_exact_boundary() {
     assert_eq!(result, Some(Value::Number(1_700_000_100_000.0)));
 }
 
+// ===========================================================================
+// bucket_end（P2 join within 内建；Q8 形态上开桶）
+// ===========================================================================
+
+/// `bucket_end(t, 60s)` = 桶末 = `time_bucket(t) + interval`。
+#[test]
+fn bucket_end_returns_bucket_upper_edge() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "bucket_end".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("ts".to_string())),
+            Expr::Number(60.0),
+        ],
+    };
+    let mut fields = EngineHashMap::default();
+    // ts = 75s（epoch ms）→ 60s 桶 [1_700_000_040_000, 1_700_000_100_000)，桶末 = 1_700_000_100_000
+    fields.insert("ts".into(), Value::Number(1_700_000_075_000.0));
+    let event = Event { fields };
+    assert_eq!(
+        eval_expr(&expr, &event),
+        Some(Value::Number(1_700_000_100_000.0))
+    );
+}
+
+/// 恰在桶边界：t = 1_700_000_040_000（60s 桶界）→ 桶末 = 1_700_000_100_000（移入下桶）。
+#[test]
+fn bucket_end_at_exact_boundary_moves_to_next_bucket() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "bucket_end".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("ts".to_string())),
+            Expr::Number(60.0),
+        ],
+    };
+    let mut fields = EngineHashMap::default();
+    fields.insert("ts".into(), Value::Number(1_700_000_040_000.0));
+    let event = Event { fields };
+    assert_eq!(
+        eval_expr(&expr, &event),
+        Some(Value::Number(1_700_000_100_000.0))
+    );
+}
+
 #[test]
 fn time_bucket_rejects_non_positive_or_non_finite_interval() {
     use crate::match_engine::match_engine::{Event, eval_expr};

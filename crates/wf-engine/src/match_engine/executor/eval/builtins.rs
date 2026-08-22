@@ -973,6 +973,25 @@ pub(super) fn eval_builtin_func_with_l3(
             let bucketed = t.div_euclid(interval_nanos) * interval_nanos;
             Some(utils::time_nanos_to_value(bucketed))
         }
+        "bucket_end" => {
+            // 桶末：`bucket_end(t, interval) = time_bucket(t, interval) + interval`
+            if args.len() != 2 {
+                return None;
+            }
+            let t = match eval_expr_with_l3(&args[0], ctx, score)? {
+                Value::Number(n) => normalize_epoch_timestamp_float_nanos(n)?,
+                _ => return None,
+            };
+            let interval = match eval_expr_with_l3(&args[1], ctx, score)? {
+                Value::Number(n) => n,
+                _ => return None,
+            };
+            let interval_nanos = positive_interval_seconds_to_nanos(interval)?;
+            let bucketed = t.div_euclid(interval_nanos) * interval_nanos;
+            Some(utils::time_nanos_to_value(
+                bucketed.checked_add(interval_nanos)?,
+            ))
+        }
         "external" => crate::external::eval_external(&args[0], &args[1..], |a| {
             eval_expr_with_l3(a, ctx, score)
         }),

@@ -57,6 +57,9 @@ fn q22_plan() -> (MatchPlan, RulePlan) {
             left: FieldRef::Simple("bidder".to_string()),
             right: FieldRef::Simple("id".to_string()),
         }],
+        within: None,
+        reduce: None,
+        emit_at: None,
     }];
     rule_plan.yield_plan.fields = vec![
         YieldField {

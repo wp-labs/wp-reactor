@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use wf_lang::ast::{CloseMode, Expr, FieldRef, JoinMode};
+use wf_lang::ast::{Bound, BoundVal, CloseMode, Expr, FieldRef, JoinMode, WithinSpec};
 use wf_lang::plan::{
     ExceedAction, JoinCondPlan, JoinPlan, KeyMapPlan, LimitsPlan, MatchPlan, RateSpec, WindowSpec,
 };
@@ -114,6 +114,9 @@ fn snapshot_join(window: &str, left_field: &str, right_field: &str) -> JoinPlan 
             left: FieldRef::Simple(left_field.to_string()),
             right: FieldRef::Simple(right_field.to_string()),
         }],
+        within: None,
+        reduce: None,
+        emit_at: None,
     }
 }
 
@@ -126,6 +129,9 @@ fn asof_join(window: &str, left_field: &str, right_field: &str) -> JoinPlan {
             left: FieldRef::Simple(left_field.to_string()),
             right: FieldRef::Simple(right_field.to_string()),
         }],
+        within: None,
+        reduce: None,
+        emit_at: None,
     }
 }
 
@@ -145,6 +151,9 @@ fn asof_join_within(
             left: FieldRef::Simple(left_field.to_string()),
             right: FieldRef::Simple(right_field.to_string()),
         }],
+        within: None,
+        reduce: None,
+        emit_at: None,
     }
 }
 
@@ -157,5 +166,8 @@ fn anti_join(window: &str, left_field: &str, right_field: &str) -> JoinPlan {
             left: FieldRef::Simple(left_field.to_string()),
             right: FieldRef::Simple(right_field.to_string()),
         }],
+        within: None,
+        reduce: None,
+        emit_at: None,
     }
 }

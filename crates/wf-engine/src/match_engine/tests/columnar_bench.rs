@@ -652,6 +652,9 @@ fn asof_join_executor(within: Duration) -> RuleExecutor {
             left: FieldRef::Simple("sip".to_string()),
             right: FieldRef::Simple("id".to_string()),
         }],
+        within: None,
+        reduce: None,
+        emit_at: None,
     }];
     RuleExecutor::new(rule_plan)
 }

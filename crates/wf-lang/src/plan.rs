@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::ast::{
-    CloseMode, CmpOp, Expr, FieldRef, FieldSelector, JoinMode, MatchMode, Measure, Transform,
+    CloseMode, CmpOp, Expr, FieldRef, FieldSelector, JoinMode, MatchMode, Measure, ReduceClause,
+    Transform, WithinSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -322,6 +323,12 @@ pub struct JoinPlan {
     pub right_window: String,
     pub mode: JoinMode,
     pub conds: Vec<JoinCondPlan>,
+    /// `within` 时间区间谓词（P1 语法/计划；P2/P3 执行）。
+    pub within: Option<WithinSpec>,
+    /// `reduce` 归约 + `as label`（P1 语法/计划；P3 执行）。
+    pub reduce: Option<ReduceClause>,
+    /// `emit at` deferred 触发点（P1 语法/计划；P3 执行）。
+    pub emit_at: Option<ExprPlan>,
 }
 
 /// A single join condition: left field == right field.
