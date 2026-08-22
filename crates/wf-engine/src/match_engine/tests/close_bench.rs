@@ -41,10 +41,12 @@
 //!   q15_stats_executor_profile：同 bid_events(N) 数据, 12 度量（4 count + 8 distinct）
 //!     stats 行式全量 : process_rows（where **内建求值**: 每行 1 次 ctx + 去重后
 //!                      唯一条件共享——q15 9 度量 where → 3 唯一表达式）
+//!     stats 列式全量 : process_batch（P1.5: where 列式 mask + count 整列归并 +
+//!                      distinct 行式段按 mask true 行读原生列值插入）
 //!     分量: count_only / where9（1× build + 9 eval, 未共享）/ where3（1× build + 3 eval
 //!           共享分档参考）/ distinct（4× DistinctKey 插入/行）
-//!     列式段（P1.5）为下一步：count/sum 整列归并 + where 列式 mask, distinct 每行哈希
-//!     不可回避——本基准的行式基线即为列式化的优化依据。
+//!     实测: 行式 450 ns/evt → 列式 115 ns/evt（3.9×）; 列式相对 CEP 生产路径 ~3×,
+//!     理论下限 ≈ distinct 87 ns/evt（distinct 每行哈希不可回避）。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -708,6 +710,34 @@ fn rows_from_events(events: &[Event]) -> Vec<HashMap<String, Value>> {
         .collect()
 }
 
+/// rows → Int64 列 RecordBatch（price/bidder/auction; 与行式 rows 数值字节一致,
+/// 保证列式/行式对拍同一分档——round() 的整数 f64 → i64 无损）。
+fn rows_to_batch(rows: &[HashMap<String, Value>]) -> RecordBatch {
+    fn i64_of(row: &HashMap<String, Value>, name: &str) -> Option<i64> {
+        match row.get(name) {
+            Some(Value::Number(n)) => Some(*n as i64),
+            _ => None,
+        }
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+    ]));
+    let price: Vec<Option<i64>> = rows.iter().map(|r| i64_of(r, "price")).collect();
+    let bidder: Vec<Option<i64>> = rows.iter().map(|r| i64_of(r, "bidder")).collect();
+    let auction: Vec<Option<i64>> = rows.iter().map(|r| i64_of(r, "auction")).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(price)),
+            Arc::new(Int64Array::from(bidder)),
+            Arc::new(Int64Array::from(auction)),
+        ],
+    )
+    .unwrap()
+}
+
 /// Q15 stats 执行器 profile：行式全量 + 分量（count/where/distinct）, 与 CEP
 /// 同数据同机对照（engine_full advance + accumulate_close_steps）。
 ///
@@ -797,6 +827,25 @@ fn q15_stats_executor_profile() {
         "[close-bench]    → vs CEP engine_full {:.2}× ; vs accumulate_close 的 {:.0}%",
         cep_full_ns / stats_full_ns,
         stats_full_ns / cep_accum_ns * 100.0
+    );
+
+    // ---- stats 列式全量（P1.5: where 列式 mask + count 整列归并 + distinct 行式段）----
+    let batch = rows_to_batch(&rows);
+    let start = Instant::now();
+    let mut col_exec = StatsExecutor::new(q15_stats_plan());
+    assert!(col_exec.process_batch(&batch), "q15 计划应可列式化");
+    let stats_col_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    let col_values = col_exec.final_measure_values();
+    assert_eq!(col_values, values, "列式/行式 12 值应一致");
+    Report {
+        name: "stats 列式全量",
+        per_ns: stats_col_ns,
+    }
+    .line(cep_full_ns);
+    eprintln!(
+        "[close-bench]    → 列式 vs 行式 {:.2}× ; vs CEP engine_full {:.2}×",
+        stats_full_ns / stats_col_ns,
+        cep_full_ns / stats_col_ns
     );
 
     // ---- 分量 1: count_only（4 count 无 where 无 distinct——行式纯归并下限）----
@@ -915,15 +964,14 @@ fn q15_stats_executor_profile() {
     .line(cep_full_ns);
 
     // ---- 汇总 ----
+    eprintln!("[close-bench] ---- 汇总（列式段 P1.5 已落地）----");
     eprintln!(
-        "[close-bench] ---- 汇总（P1 行式基线; 列式段 P1.5 目标: count/where 整列化, distinct 不可回避）----"
-    );
-    eprintln!(
-        "[close-bench]   行式全量（内建共享 where）应 ≈ count={count_ns:.0} + where3={where3_ns:.0} + distinct={distinct_ns:.0} = {:.0} ns/evt（对照实测 stats_full_ns）",
-        count_ns + where3_ns + distinct_ns
-    );
-    eprintln!(
-        "[close-bench]   列式化后可消灭 ≈ count/where 全部 + where 摊还 → 理论下限 ≈ distinct {distinct_ns:.0} ns/evt（{:.0}M/s）",
+        "[close-bench]   行式 {stats_full_ns:.0} ns/evt → 列式 {stats_col_ns:.0} ns/evt（{:.2}×）; 理论下限 ≈ distinct {distinct_ns:.0} ns/evt（{:.0}M/s）",
+        stats_full_ns / stats_col_ns,
         1e3 / distinct_ns
+    );
+    eprintln!(
+        "[close-bench]   列式剩余开销 ≈ {:.0} ns/evt = where mask 摊还 + 度量循环 + 列解析（distinct 每行哈希不可回避）",
+        stats_col_ns - distinct_ns
     );
 }

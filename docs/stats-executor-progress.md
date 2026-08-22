@@ -102,14 +102,15 @@ stats<30m:fixed> {
 `cargo test --release -p wf-engine close_bench -- --ignored --nocapture`
 （`q15_stats_executor_profile`, 与 CEP 对照同一次运行）:
 
-**优化后（where 内建求值 + 去重共享, 提交 xxx）**:
+**优化后（where 内建求值 + 去重共享, 提交 `497e095`）**:
 
 | 路径 | ns/evt | M evt/s | 相对 CEP engine_full |
 |---|---|---|---|
 | CEP engine_full(advance) | 600 | 1.67 | 1.00× |
 | CEP accumulate_close | 510 | 1.96 | 0.85× |
 | CEP prod_row_full(生产) | 339 | 2.95 | 0.57× |
-| **stats 行式全量（内建共享 where）** | **444** | **2.25** | **1.35×（快）** |
+| **stats 行式全量（内建共享 where）** | **450** | **2.22** | **1.31×（快）** |
+| **stats 列式全量（P1.5）** | **115** | **8.73** | **5.14×（快）** |
 | 分量 count(×1) | 1.4 | 695 | — |
 | 分量 where9（1× build + 9 eval, 未共享） | 406 | 2.46 | — |
 | 分量 where3（1× build + 3 eval, 共享分档） | 205 | 4.89 | — |
@@ -122,14 +123,16 @@ stats<30m:fixed> {
 1. **where 共享 ctx + 去重共享已落地**: `StatsExecutor::new` 预计算
    `unique_wheres`（q15 9 度量 where → 3 唯一表达式）+ `measure_where` 映射;
    `process_rows` 每行 1 次 Event 构建 + 唯一条件求值, 同条件度量共享结果。
-   **1387 → 444 ns/evt（3.1×）, 快于 CEP engine_full 1.35×**。
-2. 剩余差距（444 vs 分量和 ≈ 297）为行式固有: 12 度量循环 + extract +
-   `value_to_distinct_key` + `eval_bool_expr` 每次新建 baselines（where3 分量
-   共享 baselines 故更低）。`RollingStats` 为 cfg(test) 类型, 生产代码无法共享
-   baselines, 已实测否决（E0252/不可用）。
-3. **列式段（P1.5）才是最终目标**: count/where 整列化后理论下限 ≈ distinct 主导
-   ≈ **91 ns/evt（11M/s）**, 相对 CEP 生产路径 ~3.7×、engine_full ~6.6×。
-   distinct 每行哈希不可回避（可批量预去重再降）。
+   **1387 → 450 ns/evt（3.1×）, 快于 CEP engine_full 1.31×**。
+2. **列式段（P1.5）已落地**: `process_batch(&RecordBatch) -> bool`——where 列式
+   mask（`eval_guard_columnar`, 去重后唯一条件每批一次）+ count/sum/min/max
+   整列归并（无逐行循环）+ distinct 行式段（按 mask true 行读原生列值插入）。
+   **450 → 115 ns/evt（3.9×）, 相对 CEP engine_full 5.14×、生产路径 ~3×**。
+   列式前置不满足（where 不可列式化 / distinct 字段类型不支持）时返回 `false`,
+   调用方必须回退 `process_rows`（语义等价, 对拍测试锁定）。
+3. 列式剩余开销 ≈ 115 − distinct 87 ≈ 28 ns/evt（mask 摊还 + 度量循环 + 列解析）;
+   distinct 每行 1-4 次哈希不可回避（批内预去重为后续优化）。
+4. 已实测否决: 共享 baselines 不可行（`RollingStats` 为 cfg(test) 类型）。
 
 ## 6. 下一步（步骤 ④c daemon 接线）
 

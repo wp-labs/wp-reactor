@@ -18,7 +18,7 @@ use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
 use crate::match_engine::executor::stats_exec::StatsExecutor;
 use crate::match_engine::match_engine::{
-    BindData, CloseOutput, CloseReason, Event, StepData, WindowLookup,
+    BindData, CloseOutput, CloseReason, StepData, WindowLookup,
 };
 use crate::match_engine::{JoinRow, RuleExecutor, Value};
 

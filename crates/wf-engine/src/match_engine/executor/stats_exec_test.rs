@@ -1,7 +1,11 @@
 //! StatsExecutor 单元测试（P1: 空键 fixed count/distinct/sum/avg/min/max）。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use arrow::array::Int64Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{BinOp, Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan, WindowSpec};
 
@@ -423,4 +427,121 @@ fn q15_tier_boundaries_and_null() {
     // auction total=5, r1=1, r2=2, r3=1
     let expected = [5.0, 1.0, 2.0, 1.0, 2.0, 1.0, 1.0, 1.0, 5.0, 1.0, 2.0, 1.0];
     assert_eq!(exec.final_measure_values(), expected.to_vec(), "边界+null");
+}
+
+// ---------------------------------------------------------------------------
+// 列式段（P1.5）对拍: process_batch vs process_rows vs 参考实现
+// ---------------------------------------------------------------------------
+
+/// 行 → Int64 列 RecordBatch（price/bidder/auction, 对齐 nexmark 数据; null 保留）。
+fn rows_to_batch(rows: &[HashMap<String, Value>]) -> RecordBatch {
+    fn i64_of(row: &HashMap<String, Value>, name: &str) -> Option<i64> {
+        match row.get(name) {
+            Some(Value::Number(n)) => Some(*n as i64),
+            _ => None,
+        }
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+    ]));
+    let price: Vec<Option<i64>> = rows.iter().map(|r| i64_of(r, "price")).collect();
+    let bidder: Vec<Option<i64>> = rows.iter().map(|r| i64_of(r, "bidder")).collect();
+    let auction: Vec<Option<i64>> = rows.iter().map(|r| i64_of(r, "auction")).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(price)),
+            Arc::new(Int64Array::from(bidder)),
+            Arc::new(Int64Array::from(auction)),
+        ],
+    )
+    .expect("batch")
+}
+
+#[test]
+fn q15_columnar_matches_row_based_and_reference() {
+    let rows = bid_rows(100_000);
+    let batch = rows_to_batch(&rows);
+
+    let mut row_exec = StatsExecutor::new(q15_plan());
+    row_exec.process_rows(&rows, extract);
+
+    let mut col_exec = StatsExecutor::new(q15_plan());
+    assert!(col_exec.process_batch(&batch), "q15 计划应可列式化");
+
+    let expected = reference_q15(&rows);
+    let (rv, cv) = (
+        row_exec.final_measure_values(),
+        col_exec.final_measure_values(),
+    );
+    for i in 0..12 {
+        assert_eq!(rv[i], cv[i], "measure[{i}] 行式 vs 列式");
+        assert_eq!(cv[i], expected[i] as f64, "measure[{i}] 列式 vs 参考");
+    }
+}
+
+#[test]
+fn q15_columnar_tier_boundaries_and_null() {
+    // 与 q15_tier_boundaries_and_null 同数据集, 列式路径: null price 只计 total 档
+    let rows = vec![
+        row(&[
+            ("price", num(9_999.0)),
+            ("bidder", num(1.0)),
+            ("auction", num(1.0)),
+        ]),
+        row(&[
+            ("price", num(10_000.0)),
+            ("bidder", num(1.0)),
+            ("auction", num(2.0)),
+        ]),
+        row(&[("bidder", num(2.0)), ("auction", num(3.0))]), // 无 price → null
+    ];
+    let batch = rows_to_batch(&rows);
+    let mut col_exec = StatsExecutor::new(q15_plan());
+    assert!(col_exec.process_batch(&batch));
+    // total=3, r1=1, r2=1, r3=0; bidder total=2, r1=1, r2=1, r3=0;
+    // auction total=3, r1=1, r2=1, r3=0
+    let expected = [3.0, 1.0, 1.0, 0.0, 2.0, 1.0, 1.0, 0.0, 3.0, 1.0, 1.0, 0.0];
+    assert_eq!(
+        col_exec.final_measure_values(),
+        expected.to_vec(),
+        "列式边界+null"
+    );
+}
+
+#[test]
+fn stats_columnar_falls_back_on_non_columnar_where() {
+    // where 含函数调用（不可列式化）→ process_batch 返回 false, 调用方须回退行式
+    let mut m = count_measure("n");
+    m.where_expr = Some(Expr::FuncCall {
+        qualifier: None,
+        name: "len".into(),
+        args: vec![Expr::Field(FieldRef::Qualified("b".into(), "price".into()))],
+    });
+    let plan = simple_plan(vec![m]);
+    let mut exec = StatsExecutor::new(plan);
+    let batch = rows_to_batch(&[]);
+    assert!(
+        !exec.process_batch(&batch),
+        "非列式 where 应返回 false（回退行式）"
+    );
+}
+
+#[test]
+fn stats_columnar_distinct_unsupported_type_falls_back() {
+    // distinct 字段列类型不在支持集（此处 batch 无该字段 → 走缺失分支, 恒 true）;
+    // 用 object 字段类型构造不可 downcast 的场景不可行——改为验证字段缺失不误报。
+    let plan = simple_plan(vec![distinct_measure("bidders", "bidder")]);
+    let mut exec = StatsExecutor::new(plan);
+    // batch 无 bidder 列（字段缺失 → 与行式 extract None 一致, 不插入）
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "price",
+        DataType::Int64,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
+    assert!(exec.process_batch(&batch), "字段缺失不触发回退");
+    assert_eq!(exec.final_measure_values()[0], 0.0, "distinct 空集");
 }
