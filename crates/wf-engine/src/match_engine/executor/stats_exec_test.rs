@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use wf_lang::ast::{Expr, FieldRef};
+use wf_lang::ast::{BinOp, Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan, WindowSpec};
 
 use crate::match_engine::Value;
@@ -159,20 +159,22 @@ fn stats_distinct_i64_precision() {
 
 #[test]
 fn stats_where_filter_skips() {
-    let mut m = count_measure("google_bids");
-    m.where_expr = Some(Expr::Bool(false)); // 占位: where 由调用方预求值
+    // where 内建求值（P1 接线）: 逐行 eval 度量 where_expr, 非 Bool(true) 即过滤
+    let mut m = count_measure("keep_bids");
+    m.where_expr = Some(Expr::Field(FieldRef::Qualified("b".into(), "keep".into())));
     let plan = simple_plan(vec![m]);
     let mut exec = StatsExecutor::new(plan);
 
-    // 注入 __where_ok=false 的行被跳过
     exec.process_rows(
         &[
-            row(&[("__where_ok", Value::Bool(false))]),
-            row(&[("__where_ok", Value::Bool(true))]),
+            row(&[("keep", Value::Bool(false))]),
+            row(&[("keep", Value::Bool(true))]),
+            row(&[("keep", Value::Bool(true))]),
+            row(&[]), // 字段缺失 → null → 过滤
         ],
         extract,
     );
-    assert_eq!(exec.final_measure_values()[0], 1.0);
+    assert_eq!(exec.final_measure_values()[0], 2.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -192,60 +194,84 @@ fn q15_price_tier(price: f64) -> usize {
     }
 }
 
-/// q15 形状 StatsPlan: 12 度量, 各带 where_expr 占位以启用逐度量过滤。
+fn price_field() -> Expr {
+    Expr::Field(FieldRef::Qualified("b".into(), "price".into()))
+}
+
+fn price_lt(threshold: f64) -> Expr {
+    Expr::BinOp {
+        op: BinOp::Lt,
+        left: Box::new(price_field()),
+        right: Box::new(Expr::Number(threshold)),
+    }
+}
+
+fn price_ge(threshold: f64) -> Expr {
+    Expr::BinOp {
+        op: BinOp::Ge,
+        left: Box::new(price_field()),
+        right: Box::new(Expr::Number(threshold)),
+    }
+}
+
+fn price_range(lo: f64, hi: f64) -> Expr {
+    Expr::BinOp {
+        op: BinOp::And,
+        left: Box::new(price_ge(lo)),
+        right: Box::new(price_lt(hi)),
+    }
+}
+
+/// q15 形状 StatsPlan: 12 度量（4 count + 8 distinct）, where 为**真实分档条件**
+/// （内建求值, 去重后 3 个唯一表达式共享）。
 fn q15_plan() -> StatsPlan {
     let mut measures = Vec::new();
-    let mut push = |label: &str, agg: StatsAggPlan, field: Option<&str>| {
-        measures.push(StatsMeasurePlan {
-            label: label.into(),
-            source_alias: "b".into(),
-            // 占位: 仅用于触发 where_ok 咨询; 真实条件由 where_ok 闭包表达
-            where_expr: Some(Expr::Bool(true)),
-            agg,
-            field: field.map(|f| FieldRef::Qualified("b".into(), f.into())),
-            arg: None,
-        });
+    let mut push =
+        |label: &str, agg: StatsAggPlan, field: Option<&str>, where_expr: Option<Expr>| {
+            measures.push(StatsMeasurePlan {
+                label: label.into(),
+                source_alias: "b".into(),
+                where_expr,
+                agg,
+                field: field.map(|f| FieldRef::Qualified("b".into(), f.into())),
+                arg: None,
+            });
+        };
+    let where_of = |tier: usize| -> Option<Expr> {
+        match tier {
+            0 => None,
+            1 => Some(price_lt(10_000.0)),
+            2 => Some(price_range(10_000.0, 1_000_000.0)),
+            3 => Some(price_ge(1_000_000.0)),
+            _ => unreachable!(),
+        }
     };
-    for name in ["total", "r1", "r2", "r3"] {
-        push(&format!("count_{name}"), StatsAggPlan::Count, None);
+    for (i, name) in ["total", "r1", "r2", "r3"].iter().enumerate() {
+        push(
+            &format!("count_{name}"),
+            StatsAggPlan::Count,
+            None,
+            where_of(i),
+        );
     }
-    for name in ["total", "r1", "r2", "r3"] {
+    for (i, name) in ["total", "r1", "r2", "r3"].iter().enumerate() {
         push(
             &format!("bidder_{name}"),
             StatsAggPlan::DistinctCount,
             Some("bidder"),
+            where_of(i),
         );
     }
-    for name in ["total", "r1", "r2", "r3"] {
+    for (i, name) in ["total", "r1", "r2", "r3"].iter().enumerate() {
         push(
             &format!("auction_{name}"),
             StatsAggPlan::DistinctCount,
             Some("auction"),
+            where_of(i),
         );
     }
     assert_eq!(measures.len(), 12, "q15 应为 12 个度量");
     simple_plan(measures)
-}
-
-/// q15 逐度量 where 过滤: 按 price 分档筛选对应档位度量。
-/// 度量索引: 0-3 count(total/r1/r2/r3), 4-7 bidder, 8-11 auction。
-/// 分档索引: total=任意, r1=档0, r2=档1, r3=档2。
-/// null/missing price → 只计入 total 档（设计 §8.3, 对齐 Flink FILTER null 行为）。
-fn q15_where_ok(row: &HashMap<String, Value>, idx: usize) -> bool {
-    let tier_idx = |i: usize| match i % 4 {
-        1 => 0,
-        2 => 1,
-        3 => 2,
-        _ => usize::MAX,
-    };
-    let want = tier_idx(idx);
-    if want == usize::MAX {
-        return true; // total 档恒通过
-    }
-    match row.get("price") {
-        Some(Value::Number(p)) => q15_price_tier(*p) == want,
-        _ => false, // null → 不入任何条件档
-    }
 }
 
 /// 确定性 bid 行（镜像 close_bench::bid_events: 同一 LCG 种子与公式）——
@@ -341,7 +367,7 @@ fn q15_hand_verified_small() {
         ]),
     ];
     let mut exec = StatsExecutor::new(q15_plan());
-    exec.process_rows_where(&rows, extract, q15_where_ok);
+    exec.process_rows(&rows, extract);
     let expected = [3.0, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 3.0, 1.0, 1.0, 1.0];
     assert_eq!(
         exec.final_measure_values(),
@@ -355,7 +381,7 @@ fn q15_match_against_reference_fold() {
     // 独立参考实现逐列对拍（设计 §8.1: 不共享实现缺陷）
     let rows = bid_rows(100_000);
     let mut exec = StatsExecutor::new(q15_plan());
-    exec.process_rows_where(&rows, extract, q15_where_ok);
+    exec.process_rows(&rows, extract);
     let values = exec.final_measure_values();
     let expected = reference_q15(&rows);
     assert_eq!(values.len(), 12);
@@ -392,7 +418,7 @@ fn q15_tier_boundaries_and_null() {
         row(&[("bidder", num(2.0)), ("auction", num(5.0))]), // 无 price → null
     ];
     let mut exec = StatsExecutor::new(q15_plan());
-    exec.process_rows_where(&rows, extract, q15_where_ok);
+    exec.process_rows(&rows, extract);
     // total=5, r1=1, r2=2, r3=1; bidder total=2, r1=1, r2=1, r3=1;
     // auction total=5, r1=1, r2=2, r3=1
     let expected = [5.0, 1.0, 2.0, 1.0, 2.0, 1.0, 1.0, 1.0, 5.0, 1.0, 2.0, 1.0];

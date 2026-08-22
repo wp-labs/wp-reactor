@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use wf_lang::ast::{CloseMode, Expr};
+use wf_lang::ast::CloseMode;
 use wf_lang::plan::StatsPlan;
 use wf_lang::{BaseType, FieldDef, FieldType, WindowSchema};
 
@@ -117,23 +117,27 @@ fn compile_q15() -> (wf_lang::plan::RulePlan, RuleExecutor, StatsPlan) {
     (plan, exec, stats)
 }
 
-/// 用编译出的 where_expr 逐行求值（P1 行式; 列式 mask 为 P1.5）。
-/// 无 where 的度量恒通过; null/missing 字段按 permissive 语义处理。
-fn where_ok_from_exprs(
-    exprs: Vec<Option<Expr>>,
-) -> impl Fn(&HashMap<String, Value>, usize) -> bool {
-    move |row, idx| {
-        let Some(expr) = &exprs[idx] else {
-            return true;
-        };
-        let ctx = Event {
-            fields: row
-                .iter()
-                .map(|(k, v)| (k.as_str().into(), v.clone()))
-                .collect(),
-        };
-        matches!(super::eval::eval_bool_expr(expr, &ctx), Some(true))
-    }
+/// 完整接线: 编译 → StatsExecutor 归并（where 内建求值, 共享 ctx + 去重分档）
+/// → 合成 CloseOutput → alert。
+fn run_stats_to_alert(
+    rows: &[HashMap<String, Value>],
+) -> (
+    RuleExecutor,
+    crate::alert::OutputRecord,
+    Vec<f64>,
+    Vec<String>,
+) {
+    let (_plan, exec, stats) = compile_q15();
+    let labels: Vec<String> = stats.measures.iter().map(|m| m.label.clone()).collect();
+    let mut stats_exec = StatsExecutor::new(stats);
+    stats_exec.process_rows(rows, extract);
+    let values = stats_exec.final_measure_values();
+    let close = synthetic_close("q15_stats_wiring", &values, &labels);
+    let record = exec
+        .execute_close_with_joins(&close, &NoLookup)
+        .expect("execute_close_with_joins")
+        .expect("And 模式 close 应产出 alert");
+    (exec, record, values, labels)
 }
 
 /// 合成 CloseOutput（空键 fixed 窗口, close_step_data = 每 measure 一个 StepData）。
@@ -185,35 +189,6 @@ impl WindowLookup for NoLookup {
     fn snapshot(&self, _window: &str) -> Option<Vec<JoinRow>> {
         None
     }
-}
-
-/// 完整接线: 编译 → StatsExecutor 归并 → 合成 CloseOutput → alert。
-fn run_stats_to_alert(
-    rows: &[HashMap<String, Value>],
-) -> (
-    RuleExecutor,
-    crate::alert::OutputRecord,
-    Vec<f64>,
-    Vec<String>,
-) {
-    let (_plan, exec, stats) = compile_q15();
-    let labels: Vec<String> = stats.measures.iter().map(|m| m.label.clone()).collect();
-    let where_ok = where_ok_from_exprs(
-        stats
-            .measures
-            .iter()
-            .map(|m| m.where_expr.clone())
-            .collect(),
-    );
-    let mut stats_exec = StatsExecutor::new(stats);
-    stats_exec.process_rows_where(rows, extract, where_ok);
-    let values = stats_exec.final_measure_values();
-    let close = synthetic_close("q15_stats_wiring", &values, &labels);
-    let record = exec
-        .execute_close_with_joins(&close, &NoLookup)
-        .expect("execute_close_with_joins")
-        .expect("And 模式 close 应产出 alert");
-    (exec, record, values, labels)
 }
 
 fn extract(row: &HashMap<String, Value>, name: &str) -> Option<Value> {

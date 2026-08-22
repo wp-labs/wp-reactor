@@ -7,10 +7,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use wf_lang::ast::FieldRef;
+use wf_lang::ast::{Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsPlan};
 
 use crate::match_engine::Value;
+use crate::match_engine::match_engine::Event;
 
 // ---------------------------------------------------------------------------
 // 状态结构（v6 §6.1 — 无匹配进度, 纯累加）
@@ -89,49 +90,74 @@ pub struct StatsExecutor {
     pub window: StatsWindowState,
     /// 当前窗口的过期上界（水印推进, 触发 close）。
     pub watermark_nanos: i64,
+    /// 去重后的 where 表达式（相同条件共享一次求值——q15 9 个度量 where → 3
+    /// 个唯一条件; 行式实现的关键优化: 每行 1 次 Event 构建 + n_unique 次 eval）。
+    unique_wheres: Vec<Expr>,
+    /// 每度量对应 `unique_wheres` 的索引; `None` = 无条件度量（恒通过）。
+    measure_where: Vec<Option<usize>>,
 }
 
 impl StatsExecutor {
     pub fn new(plan: StatsPlan) -> Self {
+        // 预计算 where 去重映射: 度量 → 唯一条件索引。Expr 纯函数无副作用,
+        // 同表达式对同行的求值结果一致, 可安全共享（设计 §6.2 段1c 的行式对应）。
+        let mut unique_wheres: Vec<Expr> = Vec::new();
+        let mut measure_where: Vec<Option<usize>> = Vec::with_capacity(plan.measures.len());
+        for m in &plan.measures {
+            match &m.where_expr {
+                None => measure_where.push(None),
+                Some(e) => match unique_wheres.iter().position(|u| u == e) {
+                    Some(i) => measure_where.push(Some(i)),
+                    None => {
+                        measure_where.push(Some(unique_wheres.len()));
+                        unique_wheres.push(e.clone());
+                    }
+                },
+            }
+        }
         let n = plan.measures.len();
         Self {
             plan,
             window: StatsWindowState::new(n, 0),
             watermark_nanos: 0,
+            unique_wheres,
+            measure_where,
         }
     }
 
     /// 处理一批行（row-based; 列式段为 P1.5）。
     ///
-    /// `extract_field(row, name) -> Option<Value>`: 由调用方提供行字段读取。
-    /// where 过滤: 调用方预先求值并注入 `__where_ok` 字段（P1 简化）——所有带
-    /// where_expr 的度量共享同一过滤（单 where 场景）。多档 where 用
-    /// [`Self::process_rows_where`]。
+    /// `extract(row, name) -> Option<Value>`: 由调用方提供行字段读取。
+    ///
+    /// where 过滤**内建求值**: 每行构建 1 次 ctx Event, 对去重后的唯一 where
+    /// 表达式求值一次（结果共享给所有同条件度量）, 不再依赖调用方注入。
+    /// 三值语义与 CEP `where_ok` 一致（eval 非 `Bool(true)` 即过滤）。
     pub fn process_rows<F>(&mut self, rows: &[HashMap<String, Value>], extract: F)
     where
         F: Fn(&HashMap<String, Value>, &str) -> Option<Value>,
     {
-        self.process_rows_where(rows, extract, |row, _idx| {
-            !matches!(row.get("__where_ok"), Some(Value::Bool(false)))
-        });
-    }
-
-    /// 处理一批行, 支持**逐度量** where 过滤（Q15 多档价格分档等场景）。
-    ///
-    /// `where_ok(row, measure_idx) -> bool`: 调用方按度量求值 where; 仅在
-    /// `measure.where_expr.is_some()` 时被咨询（无 where 的度量恒通过）。
-    pub fn process_rows_where<F, W>(
-        &mut self,
-        rows: &[HashMap<String, Value>],
-        extract: F,
-        where_ok: W,
-    ) where
-        F: Fn(&HashMap<String, Value>, &str) -> Option<Value>,
-        W: Fn(&HashMap<String, Value>, usize) -> bool,
-    {
+        // where 结果缓存: 行间复用 buffer（无逐行分配）; 无 where 规则时保持空。
+        let mut where_ok: Vec<bool> = Vec::with_capacity(self.unique_wheres.len());
         for row in rows {
+            where_ok.clear();
+            if !self.unique_wheres.is_empty() {
+                let ctx = Event {
+                    fields: row
+                        .iter()
+                        .map(|(k, v)| (k.as_str().into(), v.clone()))
+                        .collect(),
+                };
+                for expr in &self.unique_wheres {
+                    where_ok.push(matches!(
+                        super::eval::eval_bool_expr(expr, &ctx),
+                        Some(true)
+                    ));
+                }
+            }
             for (idx, measure) in self.plan.measures.iter().enumerate() {
-                if measure.where_expr.is_some() && !where_ok(row, idx) {
+                if let Some(wi) = self.measure_where[idx]
+                    && !where_ok[wi]
+                {
                     continue;
                 }
                 let acc = &mut self.window.accum[idx];

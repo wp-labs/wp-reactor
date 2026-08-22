@@ -39,9 +39,10 @@
 //!
 //! stats 执行器对照（2026-08-22 追加——P1 行式 StatsExecutor vs CEP 同数据同机）：
 //!   q15_stats_executor_profile：同 bid_events(N) 数据, 12 度量（4 count + 8 distinct）
-//!     stats 行式全量 : process_rows_where + 逐度量 where eval（P1 接线路径）
-//!     分量: count_only / where_8（8× Event build+eval）/ where_shared（1× build+3 eval
-//!           共享分档参考）/ distinct_8（4× DistinctKey 插入/行）
+//!     stats 行式全量 : process_rows（where **内建求值**: 每行 1 次 ctx + 去重后
+//!                      唯一条件共享——q15 9 度量 where → 3 唯一表达式）
+//!     分量: count_only / where9（1× build + 9 eval, 未共享）/ where3（1× build + 3 eval
+//!           共享分档参考）/ distinct（4× DistinctKey 插入/行）
 //!     列式段（P1.5）为下一步：count/sum 整列归并 + where 列式 mask, distinct 每行哈希
 //!     不可回避——本基准的行式基线即为列式化的优化依据。
 
@@ -766,40 +767,24 @@ fn q15_stats_executor_profile() {
     }
     .line(cep_full_ns);
 
-    // ---- stats 行式全量（P1: process_rows_where + 逐度量 where eval）----
+    // ---- stats 行式全量（P1: process_rows 内建 where 求值——每行 1 次 ctx
+    // 构建 + 去重后唯一条件求值, 同条件度量共享结果）----
     let stats_plan = q15_stats_plan();
     let exprs: Vec<Option<Expr>> = stats_plan
         .measures
         .iter()
         .map(|m| m.where_expr.clone())
         .collect();
-    // 先收集 8 个带 where 表达式（owned）, 供分量 2 使用——where_ok 闭包随后
-    // move 捕获 exprs, 借用关系与闭包生命周期解耦。
+    // 收集 9 个带 where 表达式（owned）, 供分量 2 使用。
     let with_where: Vec<Expr> = exprs.iter().flatten().cloned().collect();
     assert_eq!(
         with_where.len(),
         9,
         "q15 9 个带 where 度量（r1/r2/r3 × count/bidder/auction）"
     );
-    let baselines = std::cell::RefCell::new(EngineHashMap::<String, RollingStats>::default());
-    let where_ok = move |row: &HashMap<String, Value>, idx: usize| -> bool {
-        let Some(e) = &exprs[idx] else {
-            return true;
-        };
-        let ctx = Event {
-            fields: row
-                .iter()
-                .map(|(k, v)| (k.as_str().into(), v.clone()))
-                .collect(),
-        };
-        matches!(
-            eval_expr_ext(e, &ctx, None, &mut baselines.borrow_mut()),
-            Some(Value::Bool(true))
-        )
-    };
     let start = Instant::now();
     let mut stats_exec = StatsExecutor::new(stats_plan);
-    stats_exec.process_rows_where(&rows, extract_field, where_ok);
+    stats_exec.process_rows(&rows, extract_field);
     let stats_full_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
     let values = stats_exec.final_measure_values();
     assert_eq!(values[0], N as f64, "total count 应为 N");
@@ -934,8 +919,8 @@ fn q15_stats_executor_profile() {
         "[close-bench] ---- 汇总（P1 行式基线; 列式段 P1.5 目标: count/where 整列化, distinct 不可回避）----"
     );
     eprintln!(
-        "[close-bench]   count={count_ns:.0} + where9={where9_ns:.0} + distinct={distinct_ns:.0} = {:.0} ns/evt（估算）vs 全量 {stats_full_ns:.0}",
-        count_ns + where9_ns + distinct_ns
+        "[close-bench]   行式全量（内建共享 where）应 ≈ count={count_ns:.0} + where3={where3_ns:.0} + distinct={distinct_ns:.0} = {:.0} ns/evt（对照实测 stats_full_ns）",
+        count_ns + where3_ns + distinct_ns
     );
     eprintln!(
         "[close-bench]   列式化后可消灭 ≈ count/where 全部 + where 摊还 → 理论下限 ≈ distinct {distinct_ns:.0} ns/evt（{:.0}M/s）",

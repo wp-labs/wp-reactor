@@ -100,30 +100,36 @@ stats<30m:fixed> {
 ## 5. Q15 stats 性能 profile（2026-08-22, release, N=500k 同数据同机）
 
 `cargo test --release -p wf-engine close_bench -- --ignored --nocapture`
-（`q15_stats_executor_profile`, 与 CEP 对照同一次运行）：
+（`q15_stats_executor_profile`, 与 CEP 对照同一次运行）:
+
+**优化后（where 内建求值 + 去重共享, 提交 xxx）**:
 
 | 路径 | ns/evt | M evt/s | 相对 CEP engine_full |
 |---|---|---|---|
-| CEP engine_full(advance) | 606 | 1.65 | 1.00× |
-| CEP accumulate_close | 530 | 1.89 | 0.87× |
-| CEP prod_row_full(生产) | 339 | 2.95 | 0.55× |
-| **stats 行式全量（P1 当前）** | **1387** | **0.72** | **0.44×（慢）** |
-| 分量 count(×1) | 1.4 | 737 | — |
-| 分量 where9（当前: 每度量 build+eval） | 405 | 2.47 | — |
-| 分量 where3（共享分档参考） | 195 | 5.13 | — |
-| 分量 distinct(×4, DistinctKey) | 86 | 11.6 | — |
+| CEP engine_full(advance) | 600 | 1.67 | 1.00× |
+| CEP accumulate_close | 510 | 1.96 | 0.85× |
+| CEP prod_row_full(生产) | 339 | 2.95 | 0.57× |
+| **stats 行式全量（内建共享 where）** | **444** | **2.25** | **1.35×（快）** |
+| 分量 count(×1) | 1.4 | 695 | — |
+| 分量 where9（1× build + 9 eval, 未共享） | 406 | 2.46 | — |
+| 分量 where3（1× build + 3 eval, 共享分档） | 205 | 4.89 | — |
+| 分量 distinct(×4, DistinctKey) | 91 | 11.0 | — |
+
+**优化前基线（P1 行式, where 逐度量 build+eval）: 1387 ns/evt（0.72M/s）= 0.44×（慢）**
 
 **结论**：
 
-1. **P1 行式全量比 CEP 慢**——瓶颈不是 stats 归并本身（分量和 ≈ 493 ns），而是
-   where 求值方式：wiring 的 `where_ok` 闭包**每度量重建 Event**（9× HashMap 构建）
-   + 9 次解释器 eval, 额外 ~900 ns/evt。
-2. **行式可立即优化**：where 共享 ctx + 共享分档（9→3 eval）→ 估算 ≈ count 1 +
-   where3 195 + distinct 86 ≈ **282 ns/evt（3.5M/s）**, 已快于 CEP 生产路径。
-3. **列式段（P1.5）才是目标**：count/where 整列化后理论下限 ≈ distinct 主导 ≈
-   **86 ns/evt（12M/s）**, 相对 CEP 生产路径 ~4×、engine_full ~7×。
-4. 接线实现注意：`process_rows_where` 的 where_ok 调用方应**每行构建一次 Event**
-   （共享 ctx 求值全部度量 where）, 不要逐度量重建。
+1. **where 共享 ctx + 去重共享已落地**: `StatsExecutor::new` 预计算
+   `unique_wheres`（q15 9 度量 where → 3 唯一表达式）+ `measure_where` 映射;
+   `process_rows` 每行 1 次 Event 构建 + 唯一条件求值, 同条件度量共享结果。
+   **1387 → 444 ns/evt（3.1×）, 快于 CEP engine_full 1.35×**。
+2. 剩余差距（444 vs 分量和 ≈ 297）为行式固有: 12 度量循环 + extract +
+   `value_to_distinct_key` + `eval_bool_expr` 每次新建 baselines（where3 分量
+   共享 baselines 故更低）。`RollingStats` 为 cfg(test) 类型, 生产代码无法共享
+   baselines, 已实测否决（E0252/不可用）。
+3. **列式段（P1.5）才是最终目标**: count/where 整列化后理论下限 ≈ distinct 主导
+   ≈ **91 ns/evt（11M/s）**, 相对 CEP 生产路径 ~3.7×、engine_full ~6.6×。
+   distinct 每行哈希不可回避（可批量预去重再降）。
 
 ## 6. 下一步（步骤 ④c daemon 接线）
 
