@@ -25,6 +25,24 @@ use super::stats_task::StatsTask;
 use super::task_types::StatsTaskConfig;
 use super::tests::{field_str, make_test_fanout, take_alert};
 
+/// 取回一个 AlertBatch 并展开为全部 record（批量 emit: 一个 close 的多个桶合成
+/// 一批, `take_alert` 只取首条——带 key 多桶断言须用本函数）。
+fn take_alerts(
+    rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>,
+) -> Vec<std::sync::Arc<wp_model_core::model::DataRecord>> {
+    let batch = rx.try_recv().expect("expected an alert batch");
+    match batch {
+        crate::alert_task::AlertBatch::Rows(rows) => rows.as_ref().clone(),
+        crate::alert_task::AlertBatch::Columns(cols) => cols
+            .iter_data_records()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("columnar row view conversion")
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect(),
+    }
+}
+
 fn test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("sip", DataType::Utf8, true),
@@ -66,7 +84,6 @@ fn make_batch(sips: &[&str], ts: i64) -> RecordBatch {
 
 /// 每行独立时间戳的批次（跨窗口边界切段测试用）。
 fn make_ts_batch(pairs: &[(&str, i64)]) -> RecordBatch {
-    let n = pairs.len();
     RecordBatch::try_new(
         test_schema(),
         vec![
@@ -813,7 +830,8 @@ fn make_q12_task_sharded(
 
 #[tokio::test]
 async fn q12_stats_task_per_bucket_alert_with_key_injected() {
-    // group by (b.sip): 每桶一条 alert, detail 含分组键值 + 计数
+    // group by (b.sip): 每桶一条 alert（同一 close 批量合成一批）, detail 含分组
+    // 键值 + 计数; 桶序 = ScopeKey 升序: 10.0.0.1 → 10.0.0.2
     let (mut task, mut alert_rx) = make_q12_task();
     push_batch(
         &mut task,
@@ -822,11 +840,10 @@ async fn q12_stats_task_per_bucket_alert_with_key_injected() {
     )
     .await;
     task.flush().await;
-    // 桶序 = ScopeKey 升序: 10.0.0.1 → 10.0.0.2
-    let a1 = take_alert(&mut alert_rx);
-    assert_eq!(field_str(&a1, "detail"), "10.0.0.1 2", "桶 10.0.0.1");
-    let a2 = take_alert(&mut alert_rx);
-    assert_eq!(field_str(&a2, "detail"), "10.0.0.2 1", "桶 10.0.0.2");
+    let alerts = take_alerts(&mut alert_rx);
+    assert_eq!(alerts.len(), 2, "2 桶合成一批");
+    assert_eq!(field_str(&alerts[0], "detail"), "10.0.0.1 2", "桶 10.0.0.1");
+    assert_eq!(field_str(&alerts[1], "detail"), "10.0.0.2 1", "桶 10.0.0.2");
     // 无更多桶
     assert!(alert_rx.try_recv().is_err(), "只有 2 桶");
 }

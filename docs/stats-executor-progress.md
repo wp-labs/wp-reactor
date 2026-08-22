@@ -310,3 +310,29 @@ EPS 2.5M（CEP 12M, stats 逐桶 close 为热点）; Q17 stats EPS 1.9M（CEP 6.
 
 wf-engine 588 / wf-runtime 197 / wf-lang 567 全绿。端到端复验（Q12 30M,
 precision 修复后）: 849,372/849,372 组合与 CEP 逐值一致, 0 差异。
+
+### 9.9 批量 emit 改进（Q12/Q16/Q17, 提交 xxx）
+
+**问题**（9.7 §3 发现落地）: close 逐桶 `emit_record().await`——每桶一次
+AlertColumnBatch 构建 + 通道投递, 桶多时通道满后阻塞整条归并循环; debug
+文件 sink 下实测 5.6× 退化（Q12 30M 2.66M→14.9M EPS）。
+
+**修复**: `close_current_window` 逐桶构建 record 后按 yield_target 合并进同一
+`AlertColumnBuilder`, 每窗口**一次**投递（桶序 = ScopeKey 升序不变）; 删
+`emit_record`（单条路径）。
+
+**验证**（30M v5, 批量 emit 后）:
+
+| Query | 之前 EPS（debug sink 开） | 之后 EPS | RSS | 提升 |
+|---|---|---|---|---|
+| Q12 | 2.66M / 5.8GB | 16.5M（sink 开）/ 17.6M（blackhole）/ 1.1-1.2GB | 6.2× |
+| Q16 | 6.9M / 3.9GB | 7.3M（sink 开）/ 7.5M（blackhole） | 1.09× |
+| Q17 | 1.9M / 3.8GB | 10.0M（sink 开）/ 10.3M（blackhole）/ 4.5GB | 5.3× |
+
+**正确性**: Q12 849,372/849,372 与 CEP 逐值一致; Q16 20,008（2 窗 × 10004
+channel）按窗口序与 CEP 0 差异; **Q17 两窗口 distinct auction 数与帧数据
+ground truth 精确一致（1,079,512 / 719,753）**——批量 emit 让窗口 2（719,753
+条）在 flush 时一次投递完成, 不再被关停竞态截断（旧逐桶 emit 只落 ~80k 条）。
+
+测试: q12 任务测试改为 `take_alerts` 断言一批多条（批量语义）; 全量回归
+wf-engine 588 / wf-runtime 197 全绿。

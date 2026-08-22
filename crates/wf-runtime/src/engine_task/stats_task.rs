@@ -19,7 +19,7 @@ use arrow::record_batch::RecordBatch;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use wf_engine::alert::{AlertColumnBatch, AlertColumnBuilder, OutputRecord};
+use wf_engine::alert::{AlertColumnBatch, AlertColumnBuilder};
 use wf_engine::match_engine::{
     CloseOutput, CloseReason, RuleExecutor, ScopeKey, StatsExecutor, StepData,
     batch_event_time_nanos_at, batch_time_col_index, batch_to_events, field_ref_name,
@@ -367,6 +367,12 @@ impl StatsTask {
             })
             .collect();
         let lookup = super::window_lookup::RegistryLookup::new(&self.router);
+        // **批量 emit**（Q12/Q16/Q17 改进）: 逐桶构建 record, 按 yield_target 合并
+        // 进同一 AlertColumnBatch, 每窗口一次投递——消除 per-bucket 顺序 await 的
+        // sink 回压（旧路径每桶 try_send/send, 桶多时通道满后阻塞整条归并循环;
+        // 实测 debug sink 下 5.6× 退化: Q12 30M 2.66M→14.9M EPS）。
+        // 桶序 = ScopeKey 升序, 同桶序写入同一 batch, 输出顺序不变。
+        let mut builders: HashMap<Arc<str>, AlertColumnBuilder> = HashMap::new();
         for (scope_key, values) in buckets {
             let close = build_stats_close_output(
                 self.rule_name(),
@@ -379,7 +385,28 @@ impl StatsTask {
             );
             match self.executor.execute_close_with_joins(&close, &lookup) {
                 Ok(Some(record)) => {
-                    self.emit_record(record).await;
+                    if let Some(metrics) = &self.metrics {
+                        metrics.inc_alert_emitted_total(&record.rule_name);
+                    }
+                    if self.intermediate_targets.contains(&*record.yield_target) {
+                        // P1: stats → 中间流（pipe）为后续扩展; 先记录丢弃
+                        wf_debug!(pipe,
+                            task_id = %self.task_id,
+                            rule = %record.rule_name,
+                            target = %record.yield_target,
+                            output_kind = "intermediate",
+                            "stats intermediate output not yet supported (P2)"
+                        );
+                        continue;
+                    }
+                    let builder = builders
+                        .entry(Arc::clone(&record.yield_target))
+                        .or_insert_with(|| {
+                            AlertColumnBuilder::new(Arc::clone(&record.yield_target))
+                        });
+                    if let Err(e) = builder.append_record(&record) {
+                        wf_warn!(pipe, rule = %record.rule_name, error = %e, "stats alert serialize failed");
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -392,6 +419,13 @@ impl StatsTask {
                     );
                 }
             }
+        }
+        for (target, mut builder) in builders {
+            if builder.is_empty() {
+                continue;
+            }
+            let batch = builder.finish();
+            self.dispatch_columns(&target, batch).await;
         }
     }
 
@@ -431,31 +465,8 @@ impl StatsTask {
     // 输出
     // ------------------------------------------------------------------
 
-    /// 单条列式 alert 投递（stats close 低频, 每窗口一次; 不引入 pending 机制）。
-    async fn emit_record(&self, record: OutputRecord) {
-        if let Some(metrics) = &self.metrics {
-            metrics.inc_alert_emitted_total(&record.rule_name);
-        }
-        if self.intermediate_targets.contains(&*record.yield_target) {
-            // P1: stats → 中间流（pipe）为后续扩展; 先记录丢弃
-            wf_debug!(pipe,
-                task_id = %self.task_id,
-                rule = %record.rule_name,
-                target = %record.yield_target,
-                output_kind = "intermediate",
-                "stats intermediate output not yet supported (P2)"
-            );
-            return;
-        }
-        let mut builder = AlertColumnBuilder::new(Arc::clone(&record.yield_target));
-        if let Err(e) = builder.append_record(&record) {
-            wf_warn!(pipe, rule = %record.rule_name, error = %e, "stats alert serialize failed");
-            return;
-        }
-        let batch = builder.finish();
-        self.dispatch_columns(&record.yield_target, batch).await;
-    }
-
+    /// 批量列式 alert 投递（每窗口 close 一次; 桶记录已按 yield_target 合并进
+    /// 同一 AlertColumnBatch, 见 [`Self::close_current_window`]）。
     async fn dispatch_columns(&self, target: &str, batch: AlertColumnBatch) {
         let records_len = batch.len();
         let sink_groups = self.sink_fanout.resolve(target);
