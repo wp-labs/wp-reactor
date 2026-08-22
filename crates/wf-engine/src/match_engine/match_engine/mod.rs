@@ -18,9 +18,10 @@ pub use types::{EngineHashMap, EngineHashSet};
 
 // Re-export pub(crate) items
 pub(crate) use eval::{eval_expr, values_equal};
+pub use key::{ScopeKey, field_ref_name};
 pub(crate) use key::{
-    ScopeKey, eval_field_value, extract_key_simple, field_ref_name, push_i64_exact_decimal,
-    scope_key_from_values, scope_key_shard_index, value_to_string,
+    eval_field_value, extract_key_simple, push_i64_exact_decimal, scope_key_from_values,
+    scope_key_shard_index, value_to_string,
 };
 
 pub use conv::apply_conv;

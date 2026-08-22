@@ -64,6 +64,23 @@ fn make_batch(sips: &[&str], ts: i64) -> RecordBatch {
     .unwrap()
 }
 
+/// 每行独立时间戳的批次（跨窗口边界切段测试用）。
+fn make_ts_batch(pairs: &[(&str, i64)]) -> RecordBatch {
+    let n = pairs.len();
+    RecordBatch::try_new(
+        test_schema(),
+        vec![
+            Arc::new(StringArray::from(
+                pairs.iter().map(|(s, _)| Some(*s)).collect::<Vec<_>>(),
+            )),
+            Arc::new(TimestampNanosecondArray::from(
+                pairs.iter().map(|(_, t)| Some(*t)).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Q15 12 度量验证（stats 执行器真实任务路径, 与 CEP 锚点对拍）
 // ---------------------------------------------------------------------------
@@ -667,3 +684,232 @@ async fn stats_scan_timeouts_closes_tail_window() {
     assert!(alert_rx.try_recv().is_err(), "空窗口不得循环产出");
 }
 
+// ---------------------------------------------------------------------------
+// P2 复合键分组: StatsTask 每桶一条 alert + 键字段注入 yield
+// ---------------------------------------------------------------------------
+
+/// Q12 形状任务: group by (b.bidder) { count } —— 每桶一条 alert, detail 含 bidder。
+fn make_q12_task() -> (StatsTask, mpsc::Receiver<crate::alert_task::AlertBatch>) {
+    make_q12_task_sharded(None, 1)
+}
+
+/// 分片版 Q12 任务（P2）: `shard_index` 决定本片拉/收的行子集。
+fn make_q12_task_sharded(
+    shard_index: Option<usize>,
+    shard_count: usize,
+) -> (StatsTask, mpsc::Receiver<crate::alert_task::AlertBatch>) {
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let schema = test_schema(); // sip + event_time
+    let win = Arc::new(Window::new(
+        WindowParams {
+            name: "bid_events".into(),
+            schema: schema.clone(),
+            time_col_index: Some(1),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        super::tests::test_window_config(usize::MAX),
+    ));
+    let plan = StatsPlan {
+        window_spec: WindowSpec::Fixed(Duration::from_secs(10)),
+        keys: vec![Expr::Field(FieldRef::Qualified("b".into(), "sip".into()))],
+        output_shape: StatsOutputShapePlan::Rows,
+        measures: vec![StatsMeasurePlan {
+            label: "bid_count".into(),
+            source_alias: "b".into(),
+            where_expr: None,
+            agg: StatsAggPlan::Count,
+            field: None,
+            arg: None,
+        }],
+        tracked_bind_fields: HashMap::new(),
+    };
+    // detail = fmt("{} {}", b.sip, stat.value(final(bid_count)))
+    let rp = wf_lang::plan::RulePlan {
+        name: "q12_stats".into(),
+        binds: vec![BindPlan {
+            alias: "b".into(),
+            window: "bid_events".into(),
+            filter: None,
+        }],
+        lets: vec![],
+        match_plan: wf_lang::plan::MatchPlan {
+            keys: vec![],
+            key_map: None,
+            key_join: None,
+            window_spec: WindowSpec::Fixed(Duration::from_secs(10)),
+            event_steps: vec![],
+            close_steps: vec![],
+            close_mode: wf_lang::ast::CloseMode::And,
+            match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
+            seq: None,
+            tracked_bind_aliases: std::collections::HashSet::new(),
+            tracked_bind_fields: HashMap::new(),
+            tracked_plain_fields: std::collections::HashSet::new(),
+            needs_field_history: false,
+        },
+        each_plan: None,
+        stats_plan: Some(plan.clone()),
+        joins: vec![],
+        r#where: None,
+        entity_plan: EntityPlan {
+            entity_type: "digit".into(),
+            entity_id_expr: Expr::Number(1.0),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![YieldField {
+                name: "detail".into(),
+                value: Expr::FuncCall {
+                    qualifier: None,
+                    name: "fmt".into(),
+                    args: vec![
+                        Expr::StringLit("{} {}".into()),
+                        Expr::Field(FieldRef::Qualified("b".into(), "sip".into())),
+                        stat_value("bid_count"),
+                    ],
+                },
+            }],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(10.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+        conv_window: None,
+    };
+    let config = StatsTaskConfig {
+        stats: StatsExecutor::new(plan),
+        executor: RuleExecutor::new(rp),
+        window_sources: vec![super::task_types::WindowSource {
+            window_name: "bid_events".into(),
+            window: Arc::clone(&win),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            aliases: vec!["b".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        router: Arc::new(wf_engine::window::Router::new(
+            wf_engine::window::WindowRegistry::build(vec![]).unwrap(),
+        )),
+        metrics: None,
+        time_field: Some("event_time".into()),
+        timeout_scan_interval: Duration::from_secs(1),
+        intermediate_targets: std::collections::HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        progress: std::collections::HashMap::new(),
+        shard_index,
+        shard_count,
+    };
+    let (task, _cancel) = StatsTask::new(config);
+    (task, alert_rx)
+}
+
+#[tokio::test]
+async fn q12_stats_task_per_bucket_alert_with_key_injected() {
+    // group by (b.sip): 每桶一条 alert, detail 含分组键值 + 计数
+    let (mut task, mut alert_rx) = make_q12_task();
+    push_batch(
+        &mut task,
+        make_batch(&["10.0.0.1", "10.0.0.1", "10.0.0.2"], 5_000_000_000),
+        1,
+    )
+    .await;
+    task.flush().await;
+    // 桶序 = ScopeKey 升序: 10.0.0.1 → 10.0.0.2
+    let a1 = take_alert(&mut alert_rx);
+    assert_eq!(field_str(&a1, "detail"), "10.0.0.1 2", "桶 10.0.0.1");
+    let a2 = take_alert(&mut alert_rx);
+    assert_eq!(field_str(&a2, "detail"), "10.0.0.2 1", "桶 10.0.0.2");
+    // 无更多桶
+    assert!(alert_rx.try_recv().is_err(), "只有 2 桶");
+}
+
+#[tokio::test]
+async fn stats_sharded_task_processes_only_own_rows() {
+    // P2 分片回归（Blocker 1）: 带 key 任务每片只归并自己的 shard_rows 子集——
+    // 否则每片处理全批, 每个键被 N 片各算一遍, close 重复输出 N 倍
+    // （Q16 实测 EMIT 10 倍）。模拟 2 片: 片 0 拥有行 {0,1}（key A）,
+    // 片 1 拥有行 {2,3}（key B）; 各自产出且互不重复。
+    let (mut shard0, mut rx0) = make_q12_task_sharded(Some(0), 2);
+    let (mut shard1, mut rx1) = make_q12_task_sharded(Some(1), 2);
+    let batch = make_batch(&["A", "A", "B", "B"], 5_000_000_000);
+    // 分片广播: RulePush.shard_rows 携带本片行子集（fanout 按键分区）
+    for (task, rows) in [(&mut shard0, vec![0u32, 1]), (&mut shard1, vec![2u32, 3])] {
+        let push = RulePush {
+            window_name: "bid_events".into(),
+            events: None,
+            batch: Some(Arc::new(batch.clone())),
+            materialize_fields: None,
+            shard_rows: Some(Arc::new(rows)),
+            seq: 1,
+        };
+        task.process_push(push).await;
+    }
+    shard0.flush().await;
+    shard1.flush().await;
+    // 片 0 只产出 key A（不得重复全批的 B）; 片 1 只产出 key B
+    let a0 = take_alert(&mut rx0);
+    assert_eq!(field_str(&a0, "detail"), "A 2", "片 0 只归并自己的行");
+    assert!(rx0.try_recv().is_err(), "片 0 不得产出 B（重复 bug）");
+    let a1 = take_alert(&mut rx1);
+    assert_eq!(field_str(&a1, "detail"), "B 2", "片 1 只归并自己的行");
+    assert!(rx1.try_recv().is_err(), "片 1 不得产出 A（重复 bug）");
+}
+
+#[tokio::test]
+async fn stats_task_segments_keyed_batch_across_window_boundary() {
+    // 回归（批跨窗口边界, Q12 根因）: 同一批的行按事件时间归属各自窗口。
+    // 旧整批归并: batch max=11s → 先推进到窗口 2, 4 行全进窗口 2 → 单条 "A 4";
+    // 新切段: 窗口 1 [0,10) A=2, 窗口 2 [10,20) A=2 → 两条 "A 2"。
+    let (mut task, mut alert_rx) = make_q12_task();
+    let batch = make_ts_batch(&[
+        ("A", 9_000_000_000),
+        ("A", 9_500_000_000),
+        ("A", 10_500_000_000),
+        ("A", 11_000_000_000),
+    ]);
+    push_batch(&mut task, batch, 1).await;
+    task.flush().await;
+    let a1 = take_alert(&mut alert_rx);
+    assert_eq!(field_str(&a1, "detail"), "A 2", "窗口 1 [0,10): A=2");
+    let a2 = take_alert(&mut alert_rx);
+    assert_eq!(field_str(&a2, "detail"), "A 2", "窗口 2 [10,20): A=2");
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "只有 2 窗（不得整批归并成 A 4）"
+    );
+}
+
+#[tokio::test]
+async fn stats_task_segments_empty_key_batch_across_window_boundary() {
+    // 空键同样按窗口切段: 窗口 1 收 9s/9.5s 两行, 窗口 2 收 10.5s 一行。
+    // 旧整批归并: 窗口 1 空（无产出）, 3 行全进窗口 2 → "3 1 2" 单条。
+    let (mut task, mut alert_rx, _progress) = make_stats_task();
+    let batch = make_ts_batch(&[
+        ("10.0.0.1", 9_000_000_000),
+        ("10.0.0.1", 9_500_000_000),
+        ("10.0.0.2", 10_500_000_000),
+    ]);
+    push_batch(&mut task, batch, 1).await;
+    task.flush().await;
+    let a1 = take_alert(&mut alert_rx);
+    assert_eq!(
+        field_str(&a1, "detail"),
+        "2 2 1",
+        "窗口 1 [0,10): total=2 r1=2 uniq=1"
+    );
+    let a2 = take_alert(&mut alert_rx);
+    assert_eq!(
+        field_str(&a2, "detail"),
+        "1 0 1",
+        "窗口 2 [10,20): total=1 r1=0 uniq=1"
+    );
+    assert!(alert_rx.try_recv().is_err(), "只有 2 窗");
+}

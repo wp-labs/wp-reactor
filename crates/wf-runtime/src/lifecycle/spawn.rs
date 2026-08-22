@@ -287,43 +287,112 @@ pub(super) fn spawn_rule_tasks(
                 stats_plan,
                 time_field,
             } => {
-                // 声明式窗口统计: 空键单实例（P1）; 带 key 分片为 P2。
-                // 消费 fanout 投递的 raw RecordBatch（push）或 window log（pull）, 列式
-                // process_batch（失败回退行式）, 固定窗口 close → alert 复用。
-                let stats = wf_engine::match_engine::StatsExecutor::new(stats_plan);
-                let push_rx = if use_push {
-                    let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
+                // 声明式窗口统计: 消费 fanout 投递的 raw RecordBatch（push）或
+                // window log（pull）, 列式 process_batch（失败回退行式）, 固定窗口
+                // close → alert 复用。
+                // 分片（P2）: 桶键全为简单字段（fanout 分片按字段）且 shard_count>1
+                // → 按键分片多任务（同 key 同片, 片内桶不跨片拆分）; 空键/含函数键
+                // → 单实例。
+                let stats = wf_engine::match_engine::StatsExecutor::new(stats_plan.clone());
+                let field_keys: Vec<FieldRef> = stats
+                    .plan
+                    .keys
+                    .iter()
+                    .filter_map(|k| match k {
+                        wf_lang::ast::Expr::Field(fr) => Some(fr.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let shardable = !field_keys.is_empty()
+                    && field_keys.len() == stats.plan.keys.len()
+                    && shard_count > 1;
+                if shardable {
+                    let keys: Arc<[FieldRef]> = field_keys.into();
+                    // M1 pull: 注册 window 键分区, parse 阶段预计算每片行子集。
                     for source in &window_sources {
-                        router
-                            .fanout()
-                            .register(&source.window_name, push_tx.clone());
+                        router.fanout().register_window_sharding(
+                            &source.window_name,
+                            Arc::clone(&keys),
+                            shard_count,
+                        );
                     }
-                    Some(push_rx)
+                    let mut shard_txs = Vec::with_capacity(shard_count);
+                    for shard_idx in 0..shard_count {
+                        let push_rx = if use_push {
+                            let (push_tx, push_rx) =
+                                mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
+                            shard_txs.push(push_tx);
+                            Some(push_rx)
+                        } else {
+                            None
+                        };
+                        let progress = register_progress(router, &window_sources);
+                        let task_config = StatsTaskConfig {
+                            stats: wf_engine::match_engine::StatsExecutor::new(stats_plan.clone()),
+                            executor: rule.executor.clone(),
+                            window_sources: window_sources.clone(),
+                            sink_fanout: Arc::clone(&sink_fanout),
+                            cancel: cancel.child_token(),
+                            router: Arc::clone(router),
+                            metrics: metrics.clone(),
+                            time_field: time_field.clone(),
+                            timeout_scan_interval,
+                            intermediate_targets: intermediate_targets.clone(),
+                            pipe_registry: Arc::clone(&pipe_registry),
+                            eos_flush: eos_tx.subscribe(),
+                            push_rx,
+                            progress: progress.clone(),
+                            shard_index: Some(shard_idx),
+                            shard_count,
+                        };
+                        group.push(tokio::spawn(
+                            async move { run_stats_task(task_config).await },
+                        ));
+                    }
+                    if use_push {
+                        for source in &window_sources {
+                            router.fanout().register_sharded(
+                                &source.window_name,
+                                shard_txs.clone(),
+                                Arc::clone(&keys),
+                            );
+                        }
+                    }
                 } else {
-                    None
-                };
-                let progress = register_progress(router, &window_sources);
-                let task_config = StatsTaskConfig {
-                    stats,
-                    executor: rule.executor.clone(),
-                    window_sources,
-                    sink_fanout: Arc::clone(&sink_fanout),
-                    cancel: cancel.child_token(),
-                    router: Arc::clone(router),
-                    metrics: metrics.clone(),
-                    time_field,
-                    timeout_scan_interval,
-                    intermediate_targets: intermediate_targets.clone(),
-                    pipe_registry: Arc::clone(&pipe_registry),
-                    eos_flush: eos_tx.subscribe(),
-                    push_rx,
-                    progress: progress.clone(),
-                    shard_index: None,
-                    shard_count: 1,
-                };
-                group.push(tokio::spawn(
-                    async move { run_stats_task(task_config).await },
-                ));
+                    let push_rx = if use_push {
+                        let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
+                        for source in &window_sources {
+                            router
+                                .fanout()
+                                .register(&source.window_name, push_tx.clone());
+                        }
+                        Some(push_rx)
+                    } else {
+                        None
+                    };
+                    let progress = register_progress(router, &window_sources);
+                    let task_config = StatsTaskConfig {
+                        stats,
+                        executor: rule.executor.clone(),
+                        window_sources,
+                        sink_fanout: Arc::clone(&sink_fanout),
+                        cancel: cancel.child_token(),
+                        router: Arc::clone(router),
+                        metrics: metrics.clone(),
+                        time_field,
+                        timeout_scan_interval,
+                        intermediate_targets: intermediate_targets.clone(),
+                        pipe_registry: Arc::clone(&pipe_registry),
+                        eos_flush: eos_tx.subscribe(),
+                        push_rx,
+                        progress: progress.clone(),
+                        shard_index: None,
+                        shard_count: 1,
+                    };
+                    group.push(tokio::spawn(
+                        async move { run_stats_task(task_config).await },
+                    ));
+                }
             }
             RunRuleKind::Each { alias, time_field } => {
                 // Stateless each rule. Terminal-output rules (yield target is

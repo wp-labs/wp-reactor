@@ -722,3 +722,259 @@ fn stats_columnar_multiple_batches_accumulate() {
     );
     assert_eq!(col_exec.final_measure_values()[0], 10_000.0, "total=2×5000");
 }
+
+// ---------------------------------------------------------------------------
+// P2 复合键分组（group by）: 字段键 / 复合键 / bucket / tier / 列式对拍
+// ---------------------------------------------------------------------------
+
+use crate::match_engine::match_engine::ScopeKey;
+
+/// 带键的 plan（keys 为桶键表达式）。
+fn keyed_plan(keys: Vec<Expr>, measures: Vec<StatsMeasurePlan>) -> StatsPlan {
+    StatsPlan {
+        window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(1800)),
+        keys,
+        output_shape: StatsOutputShapePlan::Rows,
+        measures,
+        tracked_bind_fields: HashMap::new(),
+    }
+}
+
+fn field_key(alias: &str, name: &str) -> Expr {
+    Expr::Field(FieldRef::Qualified(alias.into(), name.into()))
+}
+
+#[test]
+fn stats_group_by_field_buckets() {
+    // Q12 形状: group by (b.bidder) { count } —— 单字段键, 桶按 ScopeKey 升序输出
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let rows = vec![
+        row(&[("bidder", num(1.0))]),
+        row(&[("bidder", num(1.0))]),
+        row(&[("bidder", num(2.0))]),
+        row(&[("bidder", num(3.0))]),
+    ];
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(&rows, extract);
+    let buckets = exec.final_measure_values_by_bucket();
+    assert_eq!(buckets.len(), 3, "3 个 bidder 桶");
+    assert_eq!(buckets[0].0, ScopeKey::Int(1));
+    assert_eq!(buckets[0].1, vec![2.0]);
+    assert_eq!(buckets[1].0, ScopeKey::Int(2));
+    assert_eq!(buckets[1].1, vec![1.0]);
+    assert_eq!(buckets[2].0, ScopeKey::Int(3));
+    assert_eq!(buckets[2].1, vec![1.0]);
+}
+
+#[test]
+fn stats_group_by_compound_key_pairs() {
+    // 复合键 (b.bidder, b.auction) → ScopeKey::Pair; 桶按 Pair 字典序升序
+    let plan = keyed_plan(
+        vec![field_key("b", "bidder"), field_key("b", "auction")],
+        vec![count_measure("n")],
+    );
+    let rows = vec![
+        row(&[("bidder", num(1.0)), ("auction", num(10.0))]),
+        row(&[("bidder", num(1.0)), ("auction", num(10.0))]),
+        row(&[("bidder", num(1.0)), ("auction", num(11.0))]),
+        row(&[("bidder", num(2.0)), ("auction", num(10.0))]),
+    ];
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(&rows, extract);
+    let buckets = exec.final_measure_values_by_bucket();
+    assert_eq!(buckets.len(), 3);
+    // 桶序: (1,10) → (1,11) → (2,10)
+    assert_eq!(
+        buckets[0].0,
+        ScopeKey::Pair(Box::new(ScopeKey::Int(1)), Box::new(ScopeKey::Int(10)))
+    );
+    assert_eq!(buckets[0].1, vec![2.0]);
+    assert_eq!(
+        buckets[1].0,
+        ScopeKey::Pair(Box::new(ScopeKey::Int(1)), Box::new(ScopeKey::Int(11)))
+    );
+    assert_eq!(buckets[1].1, vec![1.0]);
+    assert_eq!(
+        buckets[2].0,
+        ScopeKey::Pair(Box::new(ScopeKey::Int(2)), Box::new(ScopeKey::Int(10)))
+    );
+}
+
+#[test]
+fn stats_group_by_bucket_day() {
+    // bucket(b.dateTime, 'day'): 时间按天取整为桶键（Q16/Q17 形状）
+    let day = 86_400_000_000_000i64;
+    let bucket_key = Expr::FuncCall {
+        qualifier: None,
+        name: "bucket".into(),
+        args: vec![field_key("b", "dateTime"), Expr::StringLit("day".into())],
+    };
+    let plan = keyed_plan(vec![bucket_key], vec![count_measure("n")]);
+    let rows = vec![
+        row(&[("dateTime", num(day as f64 + 1.0))]),
+        row(&[("dateTime", num(day as f64 + 1000.0))]),
+        row(&[("dateTime", num(2.0 * day as f64 + 1.0))]),
+    ];
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(&rows, extract);
+    let buckets = exec.final_measure_values_by_bucket();
+    assert_eq!(buckets.len(), 2, "两个 day 桶");
+    assert_eq!(buckets[0].0, ScopeKey::Int(day));
+    assert_eq!(buckets[0].1, vec![2.0]);
+    assert_eq!(buckets[1].0, ScopeKey::Int(2 * day));
+    assert_eq!(buckets[1].1, vec![1.0]);
+}
+
+#[test]
+fn stats_group_by_tier_bucket_index() {
+    // tier(b.price, 10000, 1000000): 区间桶索引（Q16/Q17 分档键）
+    let tier_key = Expr::FuncCall {
+        qualifier: None,
+        name: "tier".into(),
+        args: vec![
+            field_key("b", "price"),
+            Expr::Number(10_000.0),
+            Expr::Number(1_000_000.0),
+        ],
+    };
+    let plan = keyed_plan(vec![tier_key], vec![count_measure("n")]);
+    let rows = vec![
+        row(&[("price", num(100.0))]),       // tier 0
+        row(&[("price", num(50_000.0))]),    // tier 1
+        row(&[("price", num(2_000_000.0))]), // tier 2
+        row(&[("price", num(5_000.0))]),     // tier 0
+    ];
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(&rows, extract);
+    let buckets = exec.final_measure_values_by_bucket();
+    assert_eq!(buckets.len(), 3);
+    assert_eq!(buckets[0].0, ScopeKey::Int(0));
+    assert_eq!(buckets[0].1, vec![2.0]);
+    assert_eq!(buckets[1].0, ScopeKey::Int(1));
+    assert_eq!(buckets[1].1, vec![1.0]);
+    assert_eq!(buckets[2].0, ScopeKey::Int(2));
+    assert_eq!(buckets[2].1, vec![1.0]);
+}
+
+#[test]
+fn stats_group_by_null_key_skips_row() {
+    // 键缺失/null → 行跳过（对齐 CEP key 语义）
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let rows = vec![
+        row(&[("bidder", num(1.0))]),
+        row(&[]), // 键缺失
+    ];
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(&rows, extract);
+    assert_eq!(exec.final_measure_values()[0], 1.0, "键缺失行跳过");
+}
+
+#[test]
+fn stats_group_by_columnar_matches_row_based() {
+    // 带 key 批处理（列式桶键 + mask）vs 行式: 逐桶对拍
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let rows = vec![
+        row(&[("bidder", num(7.0))]),
+        row(&[("bidder", num(7.0))]),
+        row(&[("bidder", num(8.0))]),
+        row(&[("bidder", num(9.0))]),
+    ];
+    let batch = rows_to_batch(&rows); // price/bidder/auction 列
+    let mut row_exec = StatsExecutor::new(plan.clone());
+    row_exec.process_rows(&rows, extract);
+    let mut col_exec = StatsExecutor::new(plan);
+    assert!(col_exec.process_batch(&batch), "字段键应可列式化");
+    assert_eq!(
+        row_exec.final_measure_values_by_bucket(),
+        col_exec.final_measure_values_by_bucket(),
+        "行式/列式逐桶一致"
+    );
+}
+
+#[test]
+fn stats_group_by_function_key_falls_back_row() {
+    // 桶键含函数（bucket）→ process_batch 返回 false（回退行式）, 语义等价
+    let day = 86_400_000_000_000i64;
+    let bucket_key = Expr::FuncCall {
+        qualifier: None,
+        name: "bucket".into(),
+        args: vec![field_key("b", "dateTime"), Expr::StringLit("day".into())],
+    };
+    let plan = keyed_plan(vec![bucket_key], vec![count_measure("n")]);
+    let rows = vec![row(&[("dateTime", num(day as f64 + 1.0))])];
+    // batch 无 dateTime 列（rows_to_batch 只有 price/bidder/auction）→ 不可列式 → false
+    let batch = rows_to_batch(&rows);
+    let mut exec = StatsExecutor::new(plan);
+    assert!(
+        !exec.process_batch(&batch),
+        "函数桶键应回退行式（调用方负责）"
+    );
+    // 行式仍正确
+    exec.process_rows(&rows, extract);
+    assert_eq!(exec.final_measure_values_by_bucket()[0].1, vec![1.0]);
+}
+
+// ---------------------------------------------------------------------------
+// P2 分片行子集（Blocker 1 回归）: process_batch_rows(batch, Some(rows)) 只归并
+// 行域内的行——否则每片处理全批, 每个键被 N 片各算一遍, close 重复输出 N 倍。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stats_columnar_row_subset_empty_key_counts_domain_only() {
+    // 空键 + 行域: 归并只对行域生效（domain mask 与 where mask 逐位 AND）
+    let mut m = count_measure("cheap");
+    m.where_expr = Some(price_lt(300.0));
+    let plan = simple_plan(vec![
+        m,
+        sum_measure("sum_price", "price"),
+        distinct_measure("bidders", "bidder"),
+    ]);
+    let rows = vec![
+        row(&[("price", num(100.0)), ("bidder", num(1.0))]), // 域内, 便宜
+        row(&[("price", num(200.0)), ("bidder", num(2.0))]), // 域外
+        row(&[("price", num(300.0)), ("bidder", num(1.0))]), // 域内, 不便宜
+        row(&[("price", num(400.0)), ("bidder", num(3.0))]), // 域外
+    ];
+    let batch = rows_to_batch(&rows);
+    let mut exec = StatsExecutor::new(plan.clone());
+    assert!(exec.process_batch_rows(&batch, Some(&[0, 2])));
+    // 行域 {0,2}: cheap=1（仅行 0）, sum=400, distinct bidder={1}
+    assert_eq!(exec.final_measure_values(), vec![1.0, 400.0, 1.0]);
+    // 对照: 全批
+    let mut full = StatsExecutor::new(plan);
+    assert!(full.process_batch_rows(&batch, None));
+    assert_eq!(full.final_measure_values(), vec![2.0, 1000.0, 3.0]);
+}
+
+#[test]
+fn stats_columnar_row_subset_keyed_disjoint_partition() {
+    // 分片核心回归: 带 key + 行域 → 每片只归并自己的行（不得重复整批）。
+    // 模拟 2 片: 片 0 行 {0,1}（key 7）, 片 1 行 {2,3}（key 8/9）; 并集 = 全批。
+    let keys = || vec![field_key("b", "bidder")];
+    let plan = keyed_plan(keys(), vec![count_measure("n")]);
+    let rows = vec![
+        row(&[("bidder", num(7.0))]),
+        row(&[("bidder", num(7.0))]),
+        row(&[("bidder", num(8.0))]),
+        row(&[("bidder", num(9.0))]),
+    ];
+    let batch = rows_to_batch(&rows);
+    let mut shard0 = StatsExecutor::new(plan.clone());
+    assert!(shard0.process_batch_rows(&batch, Some(&[0, 1])));
+    let mut shard1 = StatsExecutor::new(plan);
+    assert!(shard1.process_batch_rows(&batch, Some(&[2, 3])));
+    // 片 0 只有 key 7; 片 1 只有 8/9 —— 无跨片重复
+    let b0 = shard0.final_measure_values_by_bucket();
+    assert_eq!(b0, vec![(ScopeKey::Int(7), vec![2.0])]);
+    let b1 = shard1.final_measure_values_by_bucket();
+    assert_eq!(
+        b1,
+        vec![(ScopeKey::Int(8), vec![1.0]), (ScopeKey::Int(9), vec![1.0]),]
+    );
+    // 并集 = 全批结果（无丢无重）
+    let mut full = StatsExecutor::new(keyed_plan(keys(), vec![count_measure("n")]));
+    assert!(full.process_batch_rows(&batch, None));
+    let mut union = b0;
+    union.extend(b1);
+    assert_eq!(full.final_measure_values_by_bucket(), union);
+}

@@ -21,11 +21,12 @@ use tokio_util::sync::CancellationToken;
 
 use wf_engine::alert::{AlertColumnBatch, AlertColumnBuilder, OutputRecord};
 use wf_engine::match_engine::{
-    CloseOutput, CloseReason, RuleExecutor, StatsExecutor, StepData, batch_event_time_nanos_at,
-    batch_time_col_index, batch_to_events,
+    CloseOutput, CloseReason, RuleExecutor, ScopeKey, StatsExecutor, StepData,
+    batch_event_time_nanos_at, batch_time_col_index, batch_to_events, field_ref_name,
+    materialize_rows,
 };
 use wf_engine::window::{Router, RulePush};
-use wf_lang::ast::CloseMode;
+use wf_lang::ast::{CloseMode, Expr};
 use wf_lang::plan::WindowSpec;
 
 use crate::alert_task::SinkFanout;
@@ -126,15 +127,28 @@ impl StatsTask {
     pub(super) async fn pull_and_process(&mut self) {
         // 先收集 pending（只借 &self.sources）, 再逐个 &mut self 处理
         // （镜像 rule_task 的分相, 避免借用冲突）。
-        let mut pending: Vec<(String, Vec<RecordBatch>, u64, bool)> = Vec::new();
+        let mut pending: Vec<(
+            String,
+            Vec<RecordBatch>,
+            Vec<Option<Arc<Vec<u32>>>>,
+            u64,
+            bool,
+        )> = Vec::new();
         for source in &self.sources {
             let cursor = self.cursors.get(&source.window_name).copied().unwrap_or(0);
-            // stats P1 空键单实例: 不按 key 分片; 多实例/分片为 P2。
-            let (batches, _shard_rows, new_cursor, gap) =
-                source.window.read_since_with_shard(cursor, None);
-            pending.push((source.window_name.clone(), batches, new_cursor, gap));
+            // 分片（P2）: 带 key 规则每片只拉自己的 shard_rows 子集; 空键单实例拉全批。
+            let (batches, shard_rows_per_batch, new_cursor, gap) = source
+                .window
+                .read_since_with_shard(cursor, self.shard_index);
+            pending.push((
+                source.window_name.clone(),
+                batches,
+                shard_rows_per_batch,
+                new_cursor,
+                gap,
+            ));
         }
-        for (window, batches, new_cursor, gap) in pending {
+        for (window, batches, shard_rows_per_batch, new_cursor, gap) in pending {
             if gap {
                 wf_warn!(pipe,
                     task_id = %self.task_id,
@@ -145,8 +159,13 @@ impl StatsTask {
                     metrics.inc_rule_cursor_gap(self.rule_name(), &window);
                 }
             }
-            for batch in &batches {
-                self.process_batch_from(&window, batch).await;
+            for (batch_index, batch) in batches.iter().enumerate() {
+                // 分片: 本片只归并自己的行子集; `None` = 全批（空键/未分片）。
+                let shard_rows = shard_rows_per_batch
+                    .get(batch_index)
+                    .and_then(|opt| opt.as_deref())
+                    .map(|rows| rows.as_slice());
+                self.process_batch_from(&window, batch, shard_rows).await;
             }
             self.cursors.insert(window.clone(), new_cursor);
             // ack 读位置（同 rule_task: 让 min_acked 到达 next_seq 释放驱逐）
@@ -160,7 +179,13 @@ impl StatsTask {
     pub(super) async fn process_push(&mut self, push: RulePush) {
         let push_seq = push.seq;
         if let Some(batch) = push.batch {
-            self.process_batch_from(&push.window_name, &batch).await;
+            // 分片广播携带本片行子集（fanout 按键分区）; 未分片为 None。
+            self.process_batch_from(
+                &push.window_name,
+                &batch,
+                push.shard_rows.as_deref().map(|v| v.as_slice()),
+            )
+            .await;
         }
         if let Some(slot) = self.progress.get(push.window_name.as_ref()) {
             slot.store(push_seq.saturating_add(1), Ordering::Release);
@@ -173,19 +198,77 @@ impl StatsTask {
         }
     }
 
-    /// 核心: 归并一个批次 + 按批次最大事件时间推进固定窗口。
-    async fn process_batch_from(&mut self, window_name: &str, batch: &RecordBatch) {
+    /// 核心: 归并一个批次（可选行子集, P2 分片）+ 推进固定窗口。
+    ///
+    /// **窗口归属对齐 CEP 逐事件语义**: 批次行按事件时间单调（v5 数据排序保证）,
+    /// 先扫时间列按窗口边界**切段**, 每段归并到其所属窗口后再推进——避免整批
+    /// 归属到推进后的窗口（10s 窗口下批跨边界时尾部 ~17k 行错归到下一窗, Q12
+    /// 44% 组合发散; 总计数仍守恒, 但逐桶值错误）。
+    async fn process_batch_from(
+        &mut self,
+        window_name: &str,
+        batch: &RecordBatch,
+        shard_rows: Option<&[u32]>,
+    ) {
         self.last_activity_wall = std::time::Instant::now();
-        // 先推进窗口（可能触发 close 产出）——用批次最大事件时间做 watermark。
         let max_time = batch_max_time(batch, self.time_field.as_deref());
         if max_time > self.last_watermark {
-            self.last_watermark = max_time;
-            self.advance_window(max_time).await;
+            self.last_watermark = max_time; // 单调; scan_timeouts 兜底推进用
         }
-        // 归并: 列式优先, 前置不满足回退行式（语义等价, 对拍锁定）。
-        let stats_ok = self.stats.process_batch(batch);
+        // 无时间列 / 非 fixed 窗口: 退化单段（不推进窗口, 原行为）。
+        let (Some(time_col), Some(dur_nanos)) = (
+            batch_time_col_index(batch, self.time_field.as_deref()),
+            self.window_dur_nanos(),
+        ) else {
+            self.accumulate_segment(batch, shard_rows).await;
+            let _ = window_name;
+            return;
+        };
+        // 行域（升序; 分片子集由 fanout 分区保序, 全批即 0..n）。
+        let domain: Vec<u32> = match shard_rows {
+            Some(rows) => rows.to_vec(),
+            None => (0..batch.num_rows() as u32).collect(),
+        };
+        let n = domain.len();
+        let mut i = 0;
+        while i < n {
+            // 段起点: 首个事件开窗（bucket 对齐）, 否则推进到段首行时间
+            // （跨多窗由 advance_window 循环逐个 close, 空窗不产出）。
+            let first_t = batch_event_time_nanos_at(batch, time_col, domain[i] as usize);
+            match self.window_end {
+                None => {
+                    let bucket_start = (first_t / dur_nanos) * dur_nanos;
+                    self.window_start = Some(bucket_start);
+                    self.window_end = Some(bucket_start + dur_nanos);
+                }
+                Some(end) if first_t >= end => {
+                    self.advance_window(first_t).await;
+                }
+                Some(_) => {}
+            }
+            // 段范围: 同一窗口内连续行（t < window_end）。时间列单调 → 段内
+            // 行共享同一窗口, 整段一次列式归并（行子集复用 Blocker 1 机制）。
+            let end = self.window_end.expect("window established");
+            let mut j = i;
+            while j < n && batch_event_time_nanos_at(batch, time_col, domain[j] as usize) < end {
+                j += 1;
+            }
+            self.accumulate_segment(batch, Some(&domain[i..j])).await;
+            i = j;
+        }
+        let _ = window_name;
+    }
+
+    /// 归并一个行段（列式优先, 前置不满足回退行式, 语义等价对拍锁定）。
+    /// `seg = None` = 全批; `Some(rows)` = 仅行域内的行（分片/窗口段）。
+    async fn accumulate_segment(&mut self, batch: &RecordBatch, seg: Option<&[u32]>) {
+        let stats_ok = self.stats.process_batch_rows(batch, seg);
         if !stats_ok {
-            let events = batch_to_events(batch);
+            // 回退行式: 只物化行域内的行（与列式行域一致）。
+            let events = match seg {
+                Some(rows) => materialize_rows(batch, rows),
+                None => batch_to_events(batch),
+            };
             let rows: Vec<HashMap<String, wf_engine::match_engine::Value>> = events
                 .into_iter()
                 .map(|ev| {
@@ -200,7 +283,6 @@ impl StatsTask {
             };
             self.stats.process_rows(&rows, extract);
         }
-        let _ = window_name;
     }
 
     // ------------------------------------------------------------------
@@ -253,9 +335,12 @@ impl StatsTask {
         }
     }
 
-    /// close 当前窗口: 冻结度量值 → 合成 CloseOutput → alert 构建 → 投递。
+    /// close 当前窗口: 冻结度量值 → 按桶合成 CloseOutput → alert 构建 → 投递。
+    ///
+    /// 带 key（P2）: 每桶一条 alert; 桶键拆解为 `scope_key` + 键字段值注入
+    /// `field_values`（yield 可读分组键字段, 如 Q12 的 bidder）。
     async fn close_current_window(&mut self, window_start: i64, window_end: i64) {
-        let values = self.stats.close_window();
+        let buckets = self.stats.close_window_by_bucket();
         let labels: Vec<String> = self
             .stats
             .plan
@@ -263,22 +348,41 @@ impl StatsTask {
             .iter()
             .map(|m| m.label.clone())
             .collect();
-        let close =
-            build_stats_close_output(self.rule_name(), &values, &labels, window_start, window_end);
+        let key_fields: Vec<String> = self
+            .stats
+            .plan
+            .keys
+            .iter()
+            .filter_map(|k| match k {
+                Expr::Field(fr) => Some(field_ref_name(fr).to_string()),
+                _ => None,
+            })
+            .collect();
         let lookup = super::window_lookup::RegistryLookup::new(&self.router);
-        match self.executor.execute_close_with_joins(&close, &lookup) {
-            Ok(Some(record)) => {
-                self.emit_record(record).await;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                wf_warn!(pipe,
-                    task_id = %self.task_id,
-                    rule = %self.rule_name(),
-                    phase = "stats_close",
-                    error = %e,
-                    "stats alert build failed"
-                );
+        for (scope_key, values) in buckets {
+            let close = build_stats_close_output(
+                self.rule_name(),
+                &values,
+                &labels,
+                window_start,
+                window_end,
+                &scope_key,
+                &key_fields,
+            );
+            match self.executor.execute_close_with_joins(&close, &lookup) {
+                Ok(Some(record)) => {
+                    self.emit_record(record).await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    wf_warn!(pipe,
+                        task_id = %self.task_id,
+                        rule = %self.rule_name(),
+                        phase = "stats_close",
+                        error = %e,
+                        "stats alert build failed"
+                    );
+                }
             }
         }
     }
@@ -415,30 +519,49 @@ fn batch_max_time(batch: &RecordBatch, time_field: Option<&str>) -> i64 {
     max
 }
 
-/// 合成 CloseOutput（空键 fixed 窗口; close_step_data = 每 measure 一个 StepData）。
+/// 合成 CloseOutput（fixed 窗口）: close_step_data = 每 measure 一个 StepData;
+/// 带 key 时桶键拆解为 `scope_key`, 键字段值注入首个 StepData 的 field_values
+/// （yield 读分组键字段; build_eval_context 的 narrow/all 分支都注入字段）。
 fn build_stats_close_output(
     rule_name: &str,
     values: &[f64],
     labels: &[String],
     window_start: i64,
     window_end: i64,
+    scope_key: &ScopeKey,
+    key_fields: &[String],
 ) -> CloseOutput {
+    let scope_values = scope_key_to_values(scope_key);
+    let mut first_field_values = wf_engine::match_engine::EngineHashMap::<
+        String,
+        Vec<wf_engine::match_engine::Value>,
+    >::default();
+    if !key_fields.is_empty() {
+        for (kf, kv) in key_fields.iter().zip(scope_values.iter()) {
+            first_field_values.insert(kf.clone(), vec![kv.clone()]);
+        }
+    }
     let close_step_data = values
         .iter()
         .zip(labels.iter())
-        .map(|(v, label)| StepData {
+        .enumerate()
+        .map(|(i, (v, label))| StepData {
             satisfied_branch_index: 0,
             label: Some(label.clone()),
             measure_value: *v,
             event_first_time_nanos: Some(window_start),
             event_last_time_nanos: Some(window_end),
             collected_values: vec![],
-            field_values: Default::default(),
+            field_values: if i == 0 {
+                first_field_values.clone()
+            } else {
+                Default::default()
+            },
         })
         .collect();
     CloseOutput {
         rule_name: rule_name.to_string(),
-        scope_key: vec![],
+        scope_key: scope_values,
         machine_id: String::new(),
         close_reason: CloseReason::Timeout,
         event_ok: true,
@@ -454,6 +577,21 @@ fn build_stats_close_output(
         event_last_time_nanos: window_end,
         window_start_time_nanos: window_start,
         window_end_time_nanos: window_end,
+    }
+}
+
+/// 桶键拆解为字段值列表（Pair 先序展开, 顺序与 keys 一致）。
+fn scope_key_to_values(key: &ScopeKey) -> Vec<wf_engine::match_engine::Value> {
+    match key {
+        ScopeKey::Empty => vec![],
+        ScopeKey::Int(i) => vec![wf_engine::match_engine::Value::Number(*i as f64)],
+        ScopeKey::Float(b) => vec![wf_engine::match_engine::Value::Number(f64::from_bits(*b))],
+        ScopeKey::Str(s) => vec![wf_engine::match_engine::Value::Str(s.clone())],
+        ScopeKey::Pair(a, b) => {
+            let mut v = scope_key_to_values(a);
+            v.extend(scope_key_to_values(b));
+            v
+        }
     }
 }
 

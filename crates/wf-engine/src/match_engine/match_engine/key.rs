@@ -79,7 +79,7 @@ fn canonical_f64_bits(value: f64) -> u64 {
 /// the row-based `Value::Number(f64)` (integer, `<2^53`) produce the **same**
 /// variant and hash equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
-pub(crate) enum ScopeKey {
+pub enum ScopeKey {
     #[default]
     Empty,
     Int(i64),
@@ -335,7 +335,7 @@ pub(crate) fn extract_key_simple<E: FieldSource>(
     Some(result)
 }
 
-pub(crate) fn field_ref_name(fr: &FieldRef) -> &str {
+pub fn field_ref_name(fr: &FieldRef) -> &str {
     match fr {
         FieldRef::Simple(name) => name,
         FieldRef::Qualified(_, name) | FieldRef::Bracketed(_, name) => name,

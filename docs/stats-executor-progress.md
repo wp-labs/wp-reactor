@@ -198,3 +198,89 @@ CEP engine_full 589 → stats 行式 450 → **stats 列式 115 ns/evt（8.7M/s�
 - 设计：`docs/stats-executor-design.md`（v6 统一桶键模型）
 - review：`docs/stats-executor-design-review.md` / `-v2.md`
 - 语法示例：`wf-examples/performance/nexmark_pk/models/queries/q15.wfl`（现状 CEP 版）
+
+---
+
+## 9. P2 实施进展（复合键分组 + sum/avg/min/max + 分片并行）
+
+> 状态：已实现 + 端到端验证（Q12/Q16 100% 对拍一致）；Q17 部分验证（见 §9.5）
+> 目标：`stats<dur:fixed> group by (keys) { count/sum/avg/min/max/distinct_count }`，
+> 覆盖 Q12/Q16/Q17；带 key 规则按键分片并行（fanout `register_sharded` / pull 行子集）。
+
+### 9.1 已实现（wp-reactor `feat/columnar-execution` 分支, 未提交）
+
+| 模块 | 内容 |
+|---|---|
+| `stats_exec.rs` | 多桶 `HashMap<ScopeKey, Vec<StatsAccum>>`（空键单桶快路径）; 桶键求值 `eval_row_key`/`eval_row_bucket_key`（Field / `bucket(f,'day'|...)` / `tier(f,b1,...)`）; `final_measure_values_by_bucket`（桶按 ScopeKey 升序, 确定性对拍契约）; `process_batch_keyed`（列式桶键 + mask 逐行归并）; `process_batch_rows(batch, rows: Option<&[u32]>)`（P2 分片行域, 见 §9.2） |
+| `stats_task.rs` | `close_current_window` 每桶一条 alert（桶键拆解为 scope_key + 键字段值注入 field_values）; pull 分片（`read_since_with_shard(cursor, shard_index)`）; **批内窗口切段**（见 §9.3） |
+| `spawn.rs` | stats 分片分支: 桶键全为简单字段且 `shard_count>1` → 按键分片多任务; 空键/含函数键 → 单实例 |
+| `ScopeKey`/`field_ref_name` | `pub(crate)` → `pub`（wf-runtime 跨 crate） |
+
+### 9.2 Blocker 1 — 分片行子集重复归并（已修）
+
+**Bug**: 带 key 规则分片后, `process_batch` 忽略 shard_rows, 每片处理全批 →
+每个键被 N 片各算一遍, close 重复输出 N 倍（Q16 实测 EMIT 152,318 = 10×）。
+
+**修复**: `process_batch_rows(batch, rows)`——`rows` = 本片行索引子集:
+- 空键路径: 行域转列 mask（`domain_mask`）与 where mask 逐位 AND（`combine_masks`）,
+  整列归并原语（count_true/sum_masked/minmax_masked/insert_distinct_column）无需改动;
+- 带 key 路径: `process_batch_keyed` 只遍历行域内行;
+- 任务侧: pull 传 `shard_rows_per_batch`（`read_since_with_shard`）; push 传
+  `RulePush.shard_rows`; 行式回退只物化行域（`materialize_rows`）。
+
+**测试**: `stats_columnar_row_subset_empty_key_counts_domain_only` /
+`stats_columnar_row_subset_keyed_disjoint_partition` /
+`stats_sharded_task_processes_only_own_rows`。
+
+**端到端验证**（30M v5 数据, rule_parallelism=10）: Q16 EMIT 152,318 → 20,008
+（0 重复行）; Q12 849,682 条 alert 全唯一（(bidder, window) 组合零重复）。
+
+### 9.3 窗口归属 — 批内切段（已修, 新发现）
+
+**Bug**（Q12 对拍暴露, 44% 组合发散）: 原实现先按批次最大事件时间推进窗口,
+再整批归并到推进后的窗口——批跨窗口边界时尾部 ~17k 行错归到下一窗
+（Q12 每窗总量 74k/111k 交替 vs CEP 恒 92k; 总计数守恒）。
+
+**修复**: `process_batch_from` 按事件时间（v5 数据排序保证）扫时间列**切段**, 每段
+归并到其所属窗口后再推进（对齐 CEP 逐事件归属; 分片子集/整批统一走行段）。
+
+**测试**: `stats_task_segments_keyed_batch_across_window_boundary` /
+`stats_task_segments_empty_key_batch_across_window_boundary`。
+
+**端到端验证**（30M v5 数据）:
+- **Q12**: 849,372/849,372 组合逐值一致（0 差异, 修复前 44% 发散）; 300 窗口
+  总量全等（每窗 92,000）。
+- **Q16**: 10004 channel × 2 窗口按序逐值一致（0 差异; 仅尾部窗 fired_at 标签
+  不同: stats=01:00:00 桶边界 vs CEP=00:49:59.998 关窗 watermark——元数据, 值相等）。
+
+### 9.4 分片语义
+
+- 桶键全为简单字段且 `shard_count>1` → fanout 按键分区（同 key 同片, 片内桶不跨
+  片拆分）; 空键/含函数键（bucket/tier）→ 单实例。
+- 片内窗口推进独立（每片只对自己的行切段/推进）; 键缺失行 → shard 0
+  （fanout 分片口径, 归并仍按完整键）。
+
+### 9.5 Q17 对拍分析（值一致; 尾窗产出受 bench 关停窗口限制）
+
+用帧数据（pyarrow 解析 RFC6587 帧）建立 ground truth: 30M v5 数据窗口 1 [0,30m)
+= 16.56M bids / **1,079,512 distinct auctions**; 窗口 2 [30m,60m) = 11.04M bids /
+**719,753 distinct auctions**。
+
+- **stats 窗口 1 EMIT = 1,079,512 = ground truth 精确一致**（10 片全部桶正确产出,
+  metrics 计数）→ 累积/分片/close/输出链路正确。
+- 窗口 2（end 60m > 数据 span 50m）只能由 EOS **flush** 关闭——bench.sh 追平后
+  `sleep 3` → `kill_daemon`（SIGKILL +13s）, 720k 条逐桶 alert 的 flush 被截断
+  （debug 文件只落 ~80k 条, 每次跑略有差异 = 关停竞态）。**CEP 同样丢失窗口 2**
+  （其 290k 尾部为窗口 1 空闲实例经墙钟 sweep 延迟关闭, 非窗口 2）。
+- 与 CEP 逐组合比较: 共享组合值 100% 一致（849,564）; 差异全部来自 (a) CEP
+  空闲实例墙钟 close 语义（fired_at 归到 ~50m 尾部）与 (b) 关停竞态截断尾窗。
+
+**结论**: stats 累积正确（窗口 1 精确匹配 ground truth + Q12 全窗口 100%）;
+Q17 尾窗完整验证需 bench 关停前给足 flush 时间（bench.sh 追平后等待
+`emitted_total` 稳定再采集/kill）, 属 bench 基建跟进项。
+
+### 9.6 全量回归
+
+wf-engine 586 / wf-runtime 196 / wf-lang 567 全绿（含新增 5 测试）。
+端到端: Q16 EPS 6.9M（CEP 3.4M, 2.1×）RSS 3.9GB（CEP 10.2GB）; Q12 stats
+EPS 2.5M（CEP 12M, stats 逐桶 close 为热点）; Q17 stats EPS 1.9M（CEP 6.8M）。

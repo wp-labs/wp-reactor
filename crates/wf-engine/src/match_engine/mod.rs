@@ -22,10 +22,8 @@ pub use match_engine::apply_conv;
 pub use match_engine::close_is_qualified;
 pub use match_engine::{
     AsofLookup, CepStateMachine, CloseOutput, CloseReason, Event, FieldSource, JoinKey, MACHINE_ID,
-    MatchedContext, SharedLimits, StepData, StepOutcome, StepProgress, StepResult, Value,
-    WindowLookup,
+    MatchedContext, ScopeKey, SharedLimits, StepData, StepOutcome, StepProgress, StepResult, Value,
+    WindowLookup, field_ref_name,
 };
 pub use match_engine::{EngineHashMap, EngineHashSet};
-pub(crate) use match_engine::{
-    ScopeKey, extract_key_simple, field_ref_name, scope_key_from_values, scope_key_shard_index,
-};
+pub(crate) use match_engine::{extract_key_simple, scope_key_from_values, scope_key_shard_index};
