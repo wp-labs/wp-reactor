@@ -380,6 +380,7 @@ fn make_task_inner(
         lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -553,6 +554,7 @@ fn make_pipeline_stage_task_opts(
         lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -658,6 +660,7 @@ fn make_each_task() -> (
                 right: Box::new(Expr::StringLit("10.0.0.1".into())),
             }),
         }),
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -767,6 +770,7 @@ fn make_filtered_match_task() -> (
         lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -891,6 +895,7 @@ fn make_filtered_close_task() -> (
         lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -989,6 +994,7 @@ fn make_filtered_each_task() -> (
             alias: "e".into(),
             filter: None,
         }),
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -1089,6 +1095,7 @@ fn make_intermediate_each_task() -> (
             alias: "e".into(),
             filter: None,
         }),
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -1214,6 +1221,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
             alias: "e".into(),
             filter: None,
         }),
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -1324,6 +1332,7 @@ fn make_intermediate_score_tasks() -> (
             alias: "e".into(),
             filter: None,
         }),
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -1440,6 +1449,7 @@ fn make_intermediate_score_tasks() -> (
         lets: Vec::new(),
         match_plan: downstream_match.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -1585,6 +1595,7 @@ fn make_intermediate_score_band_tasks() -> (
             alias: "e".into(),
             filter: None,
         }),
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -1721,6 +1732,7 @@ fn make_intermediate_score_band_tasks() -> (
         lets: Vec::new(),
         match_plan: downstream_match.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -1928,6 +1940,7 @@ fn make_filtered_bind_alias_match_task() -> (
         lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -2089,6 +2102,7 @@ fn make_window_has_match_task() -> (
         lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -2948,6 +2962,7 @@ fn make_sharded_match_tasks(
             lets: Vec::new(),
             match_plan: match_plan.clone(),
             each_plan: None,
+        stats_plan: None,
             joins: vec![],
             r#where: None,
             entity_plan: EntityPlan {
@@ -3586,6 +3601,7 @@ async fn port_scan_rule_triggers_close_alert() {
         lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -3903,6 +3919,7 @@ fn make_conv_sink_task() -> (
         lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -4078,6 +4095,7 @@ async fn conv_stage_emits_sealed_close_to_sink() {
         lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {
@@ -4210,6 +4228,7 @@ fn conv_stage_test_executor() -> RuleExecutor {
         lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {

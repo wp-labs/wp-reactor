@@ -1518,6 +1518,7 @@ fn execute_close_yield_resolves_tracked_bind_alias_field() {
         lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {

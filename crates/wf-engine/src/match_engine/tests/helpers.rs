@@ -179,6 +179,7 @@ pub fn simple_rule_plan(
         lets: Vec::new(),
         match_plan,
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {

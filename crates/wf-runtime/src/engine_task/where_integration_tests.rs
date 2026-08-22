@@ -158,6 +158,7 @@ fn make_join_where_task() -> (
         lets: Vec::new(),
         match_plan: match_plan.clone(),
         each_plan: None,
+        stats_plan: None,
         joins: vec![JoinPlan {
             right_window: person.into(),
             mode: JoinMode::Snapshot,

@@ -389,6 +389,7 @@ fn q12_like_plan() -> wf_lang::plan::RulePlan {
             vec![step(vec![branch("b", count_ge(1.0))])],
         ),
         each_plan: None,
+        stats_plan: None,
         joins: vec![],
         r#where: None,
         entity_plan: EntityPlan {

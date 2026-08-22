@@ -8,9 +8,10 @@ use crate::ast::{
 use crate::checker::check_wfl;
 use crate::plan::{
     AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, ConvWindowPlan, EachPlan,
-    EntityPlan, ExceedAction, JoinCondPlan, JoinKeyPlan, JoinPlan, KeyMapPlan, LetPlan, LimitsPlan,
-    MatchPlan, PatternOriginPlan, RateSpec, RulePlan, ScorePlan, SeqPlan, SeqSkipPlan, SeqStepPlan,
-    SortKeyPlan, StepPlan, WindowSpec, YieldField, YieldPlan,
+    EntityPlan, ExceedAction, ExprPlan, JoinCondPlan, JoinKeyPlan, JoinPlan, KeyMapPlan, LetPlan,
+    LimitsPlan, MatchPlan, PatternOriginPlan, RateSpec, RulePlan, ScorePlan, SeqPlan, SeqSkipPlan,
+    SeqStepPlan, SortKeyPlan, StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan,
+    StepPlan, WindowSpec, YieldField, YieldPlan,
 };
 use crate::schema::WindowSchema;
 use crate::yield_preset::expand_yield_args;
@@ -82,7 +83,150 @@ fn compile_rule(
     Ok(compile_pipeline_rule(rule, file, schemas))
 }
 
+// ---------------------------------------------------------------------------
+// Stats rule compilation（P1 步骤②）
+// ---------------------------------------------------------------------------
+
+/// 空 MatchPlan（stats 规则不使用 CEP 路径; 占位使 RulePlan 结构完整）。
+fn empty_match_plan() -> MatchPlan {
+    MatchPlan {
+        keys: Vec::new(),
+        key_map: None,
+        key_join: None,
+        window_spec: WindowSpec::Fixed(Duration::from_secs(0)),
+        event_steps: Vec::new(),
+        close_steps: Vec::new(),
+        close_mode: crate::ast::CloseMode::Or,
+        tracked_bind_aliases: HashSet::new(),
+        tracked_bind_fields: std::collections::HashMap::new(),
+        tracked_plain_fields: HashSet::new(),
+        match_mode: crate::ast::MatchMode::Seq,
+        seq: None,
+        accu: false,
+        needs_field_history: false,
+    }
+}
+
+/// 编译 stats 规则: stats<window> [group by] [tier] { measures } + entity + yield。
+/// 无 match/score/join——与 CEP 路径完全正交。
+fn compile_stats_rule(
+    rule: &RuleDecl,
+    stats: &crate::ast::StatsClause,
+    file: &WflFile,
+    _schemas: &[WindowSchema],
+) -> RulePlan {
+    // 1. 窗口规格
+    let window_spec = match stats.window.mode {
+        crate::ast::StatsWindowMode::Fixed => WindowSpec::Fixed(stats.window.duration),
+        crate::ast::StatsWindowMode::Session => WindowSpec::Session(stats.window.duration),
+    };
+
+    // 2. 桶键（group by + tier 统一为 ExprPlan）
+    let keys: Vec<ExprPlan> = stats.keys.clone();
+
+    // 3. 输出形状
+    let output_shape = match stats.output_shape {
+        crate::ast::StatsOutputShape::Rows => StatsOutputShapePlan::Rows,
+        crate::ast::StatsOutputShape::Columns => StatsOutputShapePlan::Columns,
+    };
+
+    // 4. 度量
+    let measures: Vec<StatsMeasurePlan> = stats
+        .measures
+        .iter()
+        .map(|m| StatsMeasurePlan {
+            label: m.label.clone(),
+            source_alias: m.source_alias.clone(),
+            where_expr: m.where_expr.clone(),
+            agg: match m.agg {
+                crate::ast::StatsAgg::Count => StatsAggPlan::Count,
+                crate::ast::StatsAgg::Sum => StatsAggPlan::Sum,
+                crate::ast::StatsAgg::Avg => StatsAggPlan::Avg,
+                crate::ast::StatsAgg::Min => StatsAggPlan::Min,
+                crate::ast::StatsAgg::Max => StatsAggPlan::Max,
+                crate::ast::StatsAgg::DistinctCount => StatsAggPlan::DistinctCount,
+                crate::ast::StatsAgg::Last => StatsAggPlan::Last,
+                crate::ast::StatsAgg::Top => StatsAggPlan::Top,
+            },
+            field: m.field.clone(),
+            arg: m.arg,
+        })
+        .collect();
+
+    // 5. 物化字段投影: 收集度量 field + where + 桶键 引用的字段
+    let mut tracked_bind_fields: std::collections::HashMap<String, HashSet<String>> =
+        std::collections::HashMap::new();
+    for m in &stats.measures {
+        // 度量字段（distinct_count(b.bidder) → (b, bidder)）
+        if let Some(fr) = &m.field {
+            if let FieldRef::Qualified(alias, name) = fr {
+                tracked_bind_fields
+                    .entry(alias.clone())
+                    .or_default()
+                    .insert(name.clone());
+            }
+        }
+    }
+    // where + 桶键 表达式引用的字段（粗粒度: 全部归到 measure 的 source_alias）
+    let mut global_fields = HashSet::new();
+    for m in &stats.measures {
+        if let Some(w) = &m.where_expr {
+            crate::field_usage::collect_expr_fields(w, &mut global_fields);
+        }
+    }
+    for k in &keys {
+        crate::field_usage::collect_expr_fields(k, &mut global_fields);
+    }
+    for m in &stats.measures {
+        let entry = tracked_bind_fields
+            .entry(m.source_alias.clone())
+            .or_default();
+        for name in &global_fields {
+            if !name.is_empty() {
+                entry.insert(name.clone());
+            }
+        }
+    }
+
+    let stats_plan = StatsPlan {
+        window_spec,
+        keys,
+        output_shape,
+        measures,
+        tracked_bind_fields,
+    };
+
+    RulePlan {
+        name: rule.name.clone(),
+        binds: compile_binds(&rule.events),
+        lets: rule
+            .lets
+            .iter()
+            .map(|l| LetPlan {
+                name: l.name.clone(),
+                expr: l.expr.clone(),
+            })
+            .collect(),
+        match_plan: empty_match_plan(),
+        each_plan: None,
+        stats_plan: Some(stats_plan),
+        joins: Vec::new(),
+        r#where: None,
+        entity_plan: compile_entity(&rule.entity),
+        yield_plan: compile_yield(&rule.yield_clause, file),
+        score_plan: compile_score(&rule.score),
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: compile_limits(&rule.limits),
+        conv_window: None,
+    }
+}
+
 fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema]) -> RulePlan {
+    // stats 形态: 声明式窗口统计, 无 match/score/join
+    if let Some(stats) = &rule.stats_clause {
+        return compile_stats_rule(rule, stats, file, schemas);
+    }
     let score_plan = compile_score(&rule.score);
     let entity_plan = compile_entity(&rule.entity);
     let yield_plan = compile_yield(&rule.yield_clause, file);
@@ -129,6 +273,7 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
             .collect(),
         match_plan,
         each_plan: rule.each_clause.as_ref().map(compile_each),
+        stats_plan: None,
         joins,
         r#where: rule.r#where.clone(),
         entity_plan,
@@ -238,6 +383,7 @@ fn compile_pipeline_rule(
             lets: Vec::new(), // pipeline stages: `let` bindings not supported on stage chains (v1)
             match_plan,
             each_plan: None,
+            stats_plan: None,
             joins: stage_joins,
             r#where: None, // `where` on pipeline stages rejected at parse time (v1)
             entity_plan,

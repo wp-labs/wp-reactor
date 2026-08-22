@@ -18,13 +18,6 @@ use crate::{LangReason, LangResult};
 use orion_error::conversion::ToStructError;
 
 #[cfg(test)]
-pub fn debug_stats_parse(input: &mut &str) -> Result<crate::ast::StatsClause, String> {
-    stats_p::stats_clause_only
-        .parse_next(input)
-        .map_err(|e| format!("{e:?}"))
-}
-
-#[cfg(test)]
 mod tests;
 
 // ---------------------------------------------------------------------------

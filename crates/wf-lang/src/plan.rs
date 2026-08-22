@@ -31,6 +31,8 @@ pub struct RulePlan {
     pub lets: Vec<LetPlan>,
     pub match_plan: MatchPlan,
     pub each_plan: Option<EachPlan>,
+    /// 声明式窗口统计计划（stats 形态, 与 match_plan 互斥——规则体二选一）。
+    pub stats_plan: Option<StatsPlan>,
     pub joins: Vec<JoinPlan>,
     /// `where <expr>` — post-join filter (strict: false/None suppresses output).
     pub r#where: Option<ExprPlan>,
@@ -141,6 +143,58 @@ pub struct MatchPlan {
     /// event instead, so `collect_alias_event` can be skipped entirely (avoids
     /// per-instance field_values allocation under churn → RSS growth).
     pub needs_field_history: bool,
+}
+
+// ---------------------------------------------------------------------------
+// StatsPlan — 声明式窗口统计（stats 形态, 与 MatchPlan 平级）
+// ---------------------------------------------------------------------------
+
+/// Compiled stats rule — 桶键表达式 + 度量 + 输出形状, 由 StatsExecutor 消费。
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+pub struct StatsPlan {
+    pub window_spec: WindowSpec,
+    /// 桶键表达式列表（group by + tier 桶键函数统一; 空 = 空键全局）。
+    pub keys: Vec<ExprPlan>,
+    /// 输出形状: 行展开（每桶一行）或列展开（每桶一列, pivot 转置）。
+    pub output_shape: StatsOutputShapePlan,
+    pub measures: Vec<StatsMeasurePlan>,
+    /// 物化字段投影（同 MatchPlan.tracked_bind_fields 语义）。
+    pub tracked_bind_fields: HashMap<String, HashSet<String>>,
+}
+
+/// 输出形状（对应 ast::StatsOutputShape）。
+#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
+pub enum StatsOutputShapePlan {
+    Rows,
+    Columns,
+}
+
+/// 编译后的统计度量。
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "struct", domain = "Lang", module = "Lang.LangCompile")]
+pub struct StatsMeasurePlan {
+    pub label: String,
+    pub source_alias: String,
+    pub where_expr: Option<ExprPlan>,
+    pub agg: StatsAggPlan,
+    pub field: Option<FieldRef>,
+    pub arg: Option<u64>,
+}
+
+/// 统计聚合函数（对应 ast::StatsAgg）。
+#[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangCompile")]
+pub enum StatsAggPlan {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    DistinctCount,
+    Last,
+    Top,
 }
 
 /// Explicit key mapping entry: logical name → source alias + field.

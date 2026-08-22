@@ -10,8 +10,8 @@
 
 | 步骤 | 内容 | 状态 |
 |---|---|---|
-| ① 语法层 | AST + parser（stats 子句） | 🔶 代码完成，测试 3/4 通过，1 个待最终确认 |
-| ② 计划层 | StatsPlan 编译（桶键/度量/输出形状） | ⬜ 未开始 |
+| ① 语法层 | AST + parser（stats 子句） | ✅ 已提交 `444778d`（wf-lang 557 全绿） |
+| ② 计划层 | StatsPlan 编译（桶键/度量/输出形状） | ✅ 待提交（wf-lang 559 + wf-engine 557 + wf-runtime 186 全绿） |
 | ③ 执行层 | StatsExecutor（空键 fixed count/distinct） | ⬜ 未开始 |
 | ④ 接线 + 对拍 | window fanout → StatsExecutor + Q15 验证 | ⬜ 未开始 |
 

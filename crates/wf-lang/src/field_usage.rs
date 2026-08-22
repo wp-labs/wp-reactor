@@ -312,6 +312,7 @@ mod tests {
             lets: Vec::new(),
             match_plan,
             each_plan: None,
+            stats_plan: None,
             joins: Vec::new(),
             r#where: None,
             entity_plan: crate::plan::EntityPlan {

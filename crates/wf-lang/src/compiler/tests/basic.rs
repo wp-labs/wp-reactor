@@ -1,6 +1,62 @@
 use super::*;
 
 // =========================================================================
+// stats plan compilation（P1 步骤②）
+// =========================================================================
+
+#[test]
+fn stats_plan_compiles_count_and_distinct() {
+    let schemas = [auth_events_window(), output_window()];
+    let plans = compile_with(
+        r#"
+rule q15_like {
+    events { b : auth_events }
+    stats<10s:fixed> {
+        b | count as total;
+        b | distinct_count(b.sip) as uniq;
+    }
+    entity(digit, 1)
+    yield out (n = 1, y = "x")
+}
+"#,
+        &schemas,
+    );
+    let p = &plans[0];
+    let sp = p.stats_plan.as_ref().expect("应有 stats_plan");
+    assert_eq!(sp.measures.len(), 2);
+    assert_eq!(sp.measures[0].agg, crate::plan::StatsAggPlan::Count);
+    assert_eq!(sp.measures[1].agg, crate::plan::StatsAggPlan::DistinctCount);
+    assert!(sp.keys.is_empty(), "空键规则无 keys");
+    assert_eq!(sp.output_shape, crate::plan::StatsOutputShapePlan::Rows);
+}
+
+#[test]
+fn stats_plan_tier_columns() {
+    let schemas = [auth_events_window(), output_window()];
+    let plans = compile_with(
+        r#"
+rule q15_like_tier {
+    events { b : auth_events }
+    stats<10s:fixed> tier b.count [ <100, <1000 ] {
+        b | count as total;
+    }
+    entity(digit, 1)
+    yield out (n = 1, y = "x")
+}
+"#,
+        &schemas,
+    );
+    let p = &plans[0];
+    let sp = p.stats_plan.as_ref().expect("应有 stats_plan");
+    assert_eq!(sp.keys.len(), 1, "tier 生成 1 个桶键");
+    assert_eq!(
+        sp.output_shape,
+        crate::plan::StatsOutputShapePlan::Columns,
+        "tier 隐含列展开"
+    );
+}
+
+// =========================================================================
 // 1. compile_brute_force
 // =========================================================================
 

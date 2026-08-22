@@ -554,6 +554,7 @@ mod tests {
                 needs_field_history: false,
             },
             each_plan: None,
+            stats_plan: None,
             joins: vec![],
             r#where: None,
             entity_plan: EntityPlan {
