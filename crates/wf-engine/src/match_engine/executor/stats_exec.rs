@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsPlan};
@@ -250,12 +251,18 @@ impl StatsExecutor {
     /// 返回 `false` 表示本计划/批不满足列式前置（where 不可列式化, 或 distinct
     /// 字段列类型不在支持集）——调用方**必须回退** [`Self::process_rows`] 保证语义。
     pub fn process_batch(&mut self, batch: &RecordBatch) -> bool {
-        // 前置: 全部 where 表达式可列式化（eval_guard_columnar 对不可列式表达式
-        // 返回全 false, 不可静默使用）。
+        // 前置（**必须在任何累加副作用之前**——返回 false 时调用方回退
+        // process_rows, 部分应用会把已累加的计数再算一遍）:
+        // 1. 全部 where 表达式可列式化（eval_guard_columnar 对不可列式表达式
+        //    返回全 false, 不可静默使用）
+        // 2. distinct 字段列类型在支持集（段 2 失败同样造成部分应用）
         for e in &self.unique_wheres {
             if !wf_lang::columnar::expr_is_columnar(e) {
                 return false;
             }
+        }
+        if !distinct_fields_columnar_safe(batch, &self.plan) {
+            return false;
         }
         let n = batch.num_rows();
         let view = ColumnarBatch::from_all_fields(batch);
@@ -265,18 +272,19 @@ impl StatsExecutor {
             .iter()
             .map(|e| eval_guard_columnar(e, &view))
             .collect();
-        // 段 1d: 纯归并度量整列累加
+        // 段 1d: 纯归并度量整列累加。行式语义: 满足 where 的行对**每个**度量都
+        // `count += 1`（在字段读取前）——avg 的 count 必须与 sum 同步累加,
+        // 否则 avg = sum/count 输出 0（D6: avg 仅输出时 sum/count 求得）。
         for (idx, measure) in self.plan.measures.iter().enumerate() {
             let mask = self.measure_where[idx].map(|wi| &masks[wi]);
             let acc = &mut self.window.accum[idx];
+            let rows_in = mask.map_or(n as u64, |m| count_true(m));
             match measure.agg {
                 StatsAggPlan::Count => {
-                    acc.count += match mask {
-                        Some(m) => count_true(m),
-                        None => n as u64,
-                    };
+                    acc.count += rows_in;
                 }
                 StatsAggPlan::Sum | StatsAggPlan::Avg => {
+                    acc.count += rows_in;
                     if let Some(field) = &measure.field
                         && let Some(col) = numeric_col(batch, field_name(field))
                     {
@@ -284,6 +292,7 @@ impl StatsExecutor {
                     }
                 }
                 StatsAggPlan::Min | StatsAggPlan::Max => {
+                    acc.count += rows_in;
                     if let Some(field) = &measure.field
                         && let Some(col) = numeric_col(batch, field_name(field))
                     {
@@ -291,7 +300,8 @@ impl StatsExecutor {
                     }
                 }
                 StatsAggPlan::DistinctCount => {
-                    // 段 2 处理
+                    // count 与行式一致维护（输出只用 distinct_set; 状态保持等价）
+                    acc.count += rows_in;
                 }
                 StatsAggPlan::Last | StatsAggPlan::Top => {
                     // P1 不实现（Q18/Q19 扩展）
@@ -353,6 +363,44 @@ fn value_to_distinct_key(v: &Value) -> DistinctKey {
 /// mask 中 true 的个数（含 null slot 读 false, 与行式 eval 语义一致）。
 fn count_true(mask: &BooleanArray) -> u64 {
     (0..mask.len()).filter(|&i| mask.value(i)).count() as u64
+}
+
+/// distinct 度量字段列类型支持检查（Int64/Float64/Utf8/Bool/TimestampNs）。
+/// 字段缺失视为安全（与行式 extract None 一致, 不插入）。
+///
+/// **必须在 `process_batch` 任何累加副作用之前调用**: 段 2 中途失败返回 false
+/// 时调用方会回退 `process_rows`, 此时段 1 已累加的 count/sum 会被重复计算
+/// （部分应用 bug）——类型支持与否必须一次性前置判定。
+fn distinct_fields_columnar_safe(batch: &RecordBatch, plan: &StatsPlan) -> bool {
+    for m in &plan.measures {
+        if !matches!(m.agg, StatsAggPlan::DistinctCount) {
+            continue;
+        }
+        let Some(field) = &m.field else {
+            continue;
+        };
+        let Some(idx) = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == field_name(field))
+        else {
+            continue; // 字段缺失 → 全 null
+        };
+        let dt = batch.column(idx).data_type();
+        let supported = matches!(
+            dt,
+            DataType::Int64
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::Boolean
+                | DataType::Timestamp(TimeUnit::Nanosecond, _)
+        );
+        if !supported {
+            return false;
+        }
+    }
+    true
 }
 
 /// 数值列引用（distinct 支持集之外的列式归并）。

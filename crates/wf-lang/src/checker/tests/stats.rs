@@ -58,3 +58,101 @@ rule stats_r {
         "requires step label `total` to come from on event",
     );
 }
+
+// =========================================================================
+// stats 度量校验（review 补充）: source alias / 字段 / where 类型
+// =========================================================================
+
+#[test]
+fn stats_measure_unknown_field_rejected() {
+    let input = r#"
+rule stats_r {
+    events { a : auth_events }
+    stats<10s:fixed> {
+        a | distinct_count(a.nope) as uniq;
+    }
+    entity(digit, 1)
+    yield out (y = "x")
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "stats measure `uniq`",
+    );
+}
+
+#[test]
+fn stats_measure_where_unknown_field_rejected() {
+    let input = r#"
+rule stats_r {
+    events { a : auth_events }
+    stats<10s:fixed> {
+        a | count as total where a.nope < 100;
+    }
+    entity(digit, 1)
+    yield out (y = "x")
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "stats measure `total` where",
+    );
+}
+
+#[test]
+fn stats_measure_where_non_bool_rejected() {
+    let input = r#"
+rule stats_r {
+    events { a : auth_events }
+    stats<10s:fixed> {
+        a | count as total where a.count + 1;
+    }
+    entity(digit, 1)
+    yield out (y = "x")
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "where expression must be bool",
+    );
+}
+
+#[test]
+fn stats_measure_unknown_source_alias_rejected() {
+    let input = r#"
+rule stats_r {
+    events { a : auth_events }
+    stats<10s:fixed> {
+        z | count as total;
+    }
+    entity(digit, 1)
+    yield out (y = "x")
+}
+"#;
+    assert_has_error(
+        input,
+        &[auth_events_window(), output_window()],
+        "source `z` is not a declared event alias",
+    );
+}
+
+#[test]
+fn stats_measure_valid_fields_and_where_ok() {
+    // 合法: 字段存在 + where 为 bool 比较 + where 字段存在
+    let input = r#"
+rule stats_r {
+    events { a : auth_events }
+    stats<10s:fixed> {
+        a | count as total where a.count < 100;
+        a | distinct_count(a.sip) as uniq;
+        a | sum(a.count) as sum_count where a.action == "login";
+    }
+    entity(digit, 1)
+    yield out (y = "x")
+}
+"#;
+    assert_no_errors(input, &[auth_events_window(), output_window()]);
+}

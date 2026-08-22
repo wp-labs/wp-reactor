@@ -157,7 +157,25 @@ where_expr 逐行求值）→ 合成 CloseOutput → `execute_close_with_joins` 
 
 - ~~系统文件句柄耗尽~~ ✅ 已恢复
 - ~~checker 不感知 stats 标签~~ ✅ 已修（`populate_stats_measure_labels`, 3 测试）
-- daemon 投递层（④c）为剩余接线面, 见 §5
+- daemon 投递层（④c）为剩余接线面, 见 §6
+
+## 8. review 发现与修复（2026-08-22, 提交 xxx）
+
+1. **🔴 部分应用 bug（已修）**: `process_batch` 在段 1（count/sum 累加）**之后**
+   段 2 才发现 distinct 字段类型不支持返回 `false` → 调用方回退 `process_rows`
+   会把已累加的值重复计算。修复: 前置检查 `distinct_fields_columnar_safe`
+   （在**任何副作用之前**一次性判定类型支持集）。回归测试
+   `stats_columnar_partial_apply_rolls_back_cleanly`。
+2. **🔴 avg count 缺失（已修）**: 段 1d 对 `Sum/Avg/Min/Max` 只累加 sum/极值,
+   不累加 `count`——avg 输出 `sum/count` 时 count=0 → 恒 0。修复: 段 1d 对所有
+   度量先按 mask 累加 `count`（对齐行式「count++ 在字段读取前」）。测试
+   `stats_columnar_sum_avg_min_max_matches_row_based`。
+3. **🟡 checker 不校验 stats 度量字段（已修）**: 度量 field/where 的字段拼写错误
+   在运行时静默失效（eval None → 不累计, 无告警）。新增 `check_stats_measures`:
+   source alias 存在 + field 引用可解析（`resolve_field_ref`）+ where 为 bool
+   表达式。5 测试（未知字段 / where 未知字段 / where 非 bool / 未知 alias / 合法）。
+4. 测试补充: 列式 sum/avg/min/max（含 null + where）、Float64/Utf8 列 distinct、
+   多批累积、列式接线路径（process_batch → alert 与行式逐字符一致）。
 
 ---
 

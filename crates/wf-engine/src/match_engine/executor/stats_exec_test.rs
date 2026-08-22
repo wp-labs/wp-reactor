@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{Date32Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{BinOp, Expr, FieldRef};
@@ -14,6 +14,10 @@ use crate::match_engine::executor::stats_exec::StatsExecutor;
 
 fn num(n: f64) -> Value {
     Value::Number(n)
+}
+
+fn str_val(s: &str) -> Value {
+    Value::Str(s.into())
 }
 
 fn simple_plan(measures: Vec<StatsMeasurePlan>) -> StatsPlan {
@@ -544,4 +548,177 @@ fn stats_columnar_distinct_unsupported_type_falls_back() {
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
     assert!(exec.process_batch(&batch), "字段缺失不触发回退");
     assert_eq!(exec.final_measure_values()[0], 0.0, "distinct 空集");
+}
+
+#[test]
+fn stats_columnar_partial_apply_rolls_back_cleanly() {
+    // 回归（Bug H 修复）: process_batch 前置检查必须在任何累加副作用之前——
+    // distinct 字段类型不支持时返回 false, 且不得留下已累加的 count（否则回退
+    // 行式会把同一批重复计算）。
+    let plan = simple_plan(vec![
+        count_measure("n"),
+        distinct_measure("bidders", "bidder"),
+    ]);
+    let rows = vec![
+        row(&[("price", num(1.0)), ("bidder", num(7.0))]),
+        row(&[("price", num(2.0)), ("bidder", num(8.0))]),
+    ];
+    // batch: price Int64（count 可算）, bidder Date32（distinct 不支持类型）
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Int64, true),
+        Field::new("bidder", DataType::Date32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2])),
+            Arc::new(Date32Array::from(vec![7i32, 8])),
+        ],
+    )
+    .unwrap();
+
+    let mut col_exec = StatsExecutor::new(plan.clone());
+    assert!(!col_exec.process_batch(&batch), "Date32 distinct 应回退");
+    // 无副作用: 全部累积为零（count 不得被预累加）
+    assert_eq!(
+        col_exec.final_measure_values(),
+        vec![0.0, 0.0],
+        "回退前不得有部分累加"
+    );
+    // 回退: 调用方对同一 executor 走行式, 结果与纯行式一致
+    col_exec.process_rows(&rows, extract);
+    let mut row_exec = StatsExecutor::new(plan);
+    row_exec.process_rows(&rows, extract);
+    assert_eq!(
+        col_exec.final_measure_values(),
+        row_exec.final_measure_values(),
+        "回退行式结果一致"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 列式段: sum/avg/min/max + 多类型 distinct + 多批累积
+// ---------------------------------------------------------------------------
+
+/// sum/avg/min/max 形状 plan（含带 where 的 sum——Q17 方向）。
+fn num_measures_plan() -> StatsPlan {
+    let mut measures = Vec::new();
+    let mut push = |label: &str, agg: StatsAggPlan, field: &str, where_expr: Option<Expr>| {
+        measures.push(StatsMeasurePlan {
+            label: label.into(),
+            source_alias: "b".into(),
+            where_expr,
+            agg,
+            field: Some(FieldRef::Qualified("b".into(), field.into())),
+            arg: None,
+        });
+    };
+    push("sum_all", StatsAggPlan::Sum, "price", None);
+    push("avg_all", StatsAggPlan::Avg, "price", None);
+    push("min_all", StatsAggPlan::Min, "price", None);
+    push("max_all", StatsAggPlan::Max, "price", None);
+    push(
+        "sum_r1",
+        StatsAggPlan::Sum,
+        "price",
+        Some(price_lt(1_000_000.0)),
+    );
+    simple_plan(measures)
+}
+
+#[test]
+fn stats_columnar_sum_avg_min_max_matches_row_based() {
+    // 含 null price 行: count 计行、sum/min/max 跳过 null（对齐行式）
+    let rows = vec![
+        row(&[
+            ("price", num(100.0)),
+            ("bidder", num(1.0)),
+            ("auction", num(1.0)),
+        ]),
+        row(&[
+            ("price", num(200.0)),
+            ("bidder", num(1.0)),
+            ("auction", num(2.0)),
+        ]),
+        row(&[("bidder", num(2.0)), ("auction", num(3.0))]), // price null
+        row(&[
+            ("price", num(2_000_000.0)),
+            ("bidder", num(2.0)),
+            ("auction", num(4.0)),
+        ]),
+    ];
+    let batch = rows_to_batch(&rows);
+    let mut row_exec = StatsExecutor::new(num_measures_plan());
+    row_exec.process_rows(&rows, extract);
+    let mut col_exec = StatsExecutor::new(num_measures_plan());
+    assert!(col_exec.process_batch(&batch), "数值度量应可列式化");
+    let (rv, cv) = (
+        row_exec.final_measure_values(),
+        col_exec.final_measure_values(),
+    );
+    assert_eq!(rv.len(), 5);
+    for i in 0..rv.len() {
+        assert_eq!(rv[i], cv[i], "measure[{i}] 行式 vs 列式");
+    }
+    // 手算: sum_all=2000300, avg=2000300/4（null 行也计入 count）, min=100,
+    // max=2000000, sum_r1=300
+    assert_eq!(cv[0], 2_000_300.0, "sum_all");
+    assert_eq!(cv[1], 2_000_300.0 / 4.0, "avg_all");
+    assert_eq!(cv[2], 100.0, "min_all");
+    assert_eq!(cv[3], 2_000_000.0, "max_all");
+    assert_eq!(cv[4], 300.0, "sum_r1");
+}
+
+#[test]
+fn stats_columnar_distinct_float_and_string() {
+    // Float64 / Utf8 列 distinct（对齐行式 from_f64/from_str 分派）
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("score", DataType::Float64, true),
+        Field::new("tag", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Float64Array::from(vec![1.5, 2.5, 1.5, 2.0, 2.0])),
+            Arc::new(StringArray::from(vec!["a", "b", "a", "c", "c"])),
+        ],
+    )
+    .unwrap();
+    let rows = vec![
+        row(&[("score", num(1.5)), ("tag", str_val("a"))]),
+        row(&[("score", num(2.5)), ("tag", str_val("b"))]),
+        row(&[("score", num(1.5)), ("tag", str_val("a"))]),
+        row(&[("score", num(2.0)), ("tag", str_val("c"))]),
+        row(&[("score", num(2.0)), ("tag", str_val("c"))]),
+    ];
+    let plan = simple_plan(vec![
+        distinct_measure("scores", "score"),
+        distinct_measure("tags", "tag"),
+    ]);
+    let mut row_exec = StatsExecutor::new(plan.clone());
+    row_exec.process_rows(&rows, extract);
+    let mut col_exec = StatsExecutor::new(plan);
+    assert!(col_exec.process_batch(&batch));
+    // score {1.5, 2.5, 2.0} = 3; tag {a,b,c} = 3
+    assert_eq!(row_exec.final_measure_values(), vec![3.0, 3.0]);
+    assert_eq!(col_exec.final_measure_values(), vec![3.0, 3.0]);
+}
+
+#[test]
+fn stats_columnar_multiple_batches_accumulate() {
+    // 同批两次 → 行式/列式累积一致（count 相加, distinct 并集）
+    let rows = bid_rows(5_000);
+    let batch = rows_to_batch(&rows);
+    let mut row_exec = StatsExecutor::new(q15_plan());
+    row_exec.process_rows(&rows, extract);
+    row_exec.process_rows(&rows, extract);
+    let mut col_exec = StatsExecutor::new(q15_plan());
+    assert!(col_exec.process_batch(&batch));
+    assert!(col_exec.process_batch(&batch));
+    assert_eq!(
+        row_exec.final_measure_values(),
+        col_exec.final_measure_values(),
+        "多批累积一致"
+    );
+    assert_eq!(col_exec.final_measure_values()[0], 10_000.0, "total=2×5000");
 }

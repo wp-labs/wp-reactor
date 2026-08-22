@@ -45,6 +45,7 @@ pub fn check_rule(rule: &RuleDecl, schemas: &[WindowSchema], errors: &mut Vec<Ch
     populate_stat_labels(&mut base_scope, &rule.match_clause);
     if let Some(stats) = &rule.stats_clause {
         populate_stats_measure_labels(&mut base_scope, stats);
+        check_stats_measures(stats, &base_scope, name, errors);
     }
 
     if rule.each_clause.is_some() && !rule.pipeline_stages.is_empty() {
@@ -290,6 +291,116 @@ fn populate_stats_measure_labels(scope: &mut Scope<'_>, stats: &StatsClause) {
                 },
             },
         );
+    }
+}
+
+/// stats 度量校验: source alias 存在 + field 引用可解析 + where 为 bool 表达式。
+///
+/// checker 原不感知 stats_clause——度量里的字段拼写错误会在运行时静默失效
+/// （eval 返回 None → 不累计, 无任何告警）, 这里补上编译期拦截。
+fn check_stats_measures(
+    stats: &StatsClause,
+    scope: &Scope<'_>,
+    rule_name: &str,
+    errors: &mut Vec<CheckError>,
+) {
+    for m in &stats.measures {
+        if !scope.aliases.contains_key(m.source_alias.as_str()) {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: format!(
+                    "stats measure `{}` source `{}` is not a declared event alias",
+                    m.label, m.source_alias
+                ),
+            });
+            continue; // alias 无效 → 字段/where 校验无意义
+        }
+        if let Some(fr) = &m.field
+            && let Err(e) = scope.resolve_field_ref(fr)
+        {
+            errors.push(CheckError {
+                severity: Severity::Error,
+                rule: Some(rule_name.to_string()),
+                test: None,
+                message: format!("stats measure `{}`: {}", m.label, e),
+            });
+        }
+        if let Some(w) = &m.where_expr {
+            let mut fields = Vec::new();
+            collect_expr_field_refs(w, &mut fields);
+            for fr in fields {
+                if let Err(e) = scope.resolve_field_ref(fr) {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!("stats measure `{}` where: {}", m.label, e),
+                    });
+                }
+            }
+            check_expr_type(w, scope, rule_name, errors);
+            if let Some(t) = infer_type(w, scope)
+                && t != ValType::Bool
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "stats measure `{}` where expression must be bool, got {:?}",
+                        m.label, t
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 收集表达式内全部 FieldRef（供 where 的字段存在性校验）。
+fn collect_expr_field_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a FieldRef>) {
+    match expr {
+        Expr::Field(fr) => out.push(fr),
+        Expr::Neg(inner) => collect_expr_field_refs(inner, out),
+        Expr::BinOp { left, right, .. } => {
+            collect_expr_field_refs(left, out);
+            collect_expr_field_refs(right, out);
+        }
+        Expr::InList {
+            expr: target, list, ..
+        } => {
+            collect_expr_field_refs(target, out);
+            for item in list {
+                collect_expr_field_refs(item, out);
+            }
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            collect_expr_field_refs(cond, out);
+            collect_expr_field_refs(then_expr, out);
+            collect_expr_field_refs(else_expr, out);
+        }
+        Expr::Object(items) => {
+            for item in items {
+                collect_expr_field_refs(&item.value, out);
+            }
+        }
+        Expr::Array(items) => {
+            for item in items {
+                collect_expr_field_refs(item, out);
+            }
+        }
+        Expr::FuncCall { args, .. } => {
+            for arg in args {
+                collect_expr_field_refs(arg, out);
+            }
+        }
+        // non_exhaustive: 其余变体（字面量/系统变量等）无字段引用
+        _ => {}
     }
 }
 

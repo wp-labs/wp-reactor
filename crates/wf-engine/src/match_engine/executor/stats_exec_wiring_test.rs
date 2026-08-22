@@ -375,3 +375,79 @@ fn stats_wiring_close_output_fields_carried() {
         Some(Value::Number(1.0))
     );
 }
+
+// ---------------------------------------------------------------------------
+// 列式接线路径: process_batch → 合成 CloseOutput → alert（与行式逐字符一致）
+// ---------------------------------------------------------------------------
+
+/// rows → Int64 列 RecordBatch（price/bidder/auction; 整数 f64 → i64 无损）。
+fn rows_to_batch(rows: &[HashMap<String, Value>]) -> arrow::record_batch::RecordBatch {
+    fn i64_of(row: &HashMap<String, Value>, name: &str) -> Option<i64> {
+        match row.get(name) {
+            Some(Value::Number(n)) => Some(*n as i64),
+            _ => None,
+        }
+    }
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+    ]));
+    let price: Vec<Option<i64>> = rows.iter().map(|r| i64_of(r, "price")).collect();
+    let bidder: Vec<Option<i64>> = rows.iter().map(|r| i64_of(r, "bidder")).collect();
+    let auction: Vec<Option<i64>> = rows.iter().map(|r| i64_of(r, "auction")).collect();
+    arrow::record_batch::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(price)),
+            Arc::new(Int64Array::from(bidder)),
+            Arc::new(Int64Array::from(auction)),
+        ],
+    )
+    .expect("batch")
+}
+
+/// 完整接线（列式路径）: 编译 → process_batch → 合成 CloseOutput → alert。
+fn run_stats_to_alert_columnar(
+    rows: &[HashMap<String, Value>],
+) -> (
+    RuleExecutor,
+    crate::alert::OutputRecord,
+    Vec<f64>,
+    Vec<String>,
+) {
+    let (_plan, exec, stats) = compile_q15();
+    let labels: Vec<String> = stats.measures.iter().map(|m| m.label.clone()).collect();
+    let batch = rows_to_batch(rows);
+    let mut stats_exec = StatsExecutor::new(stats);
+    assert!(stats_exec.process_batch(&batch), "q15 应列式化");
+    let values = stats_exec.final_measure_values();
+    let close = synthetic_close("q15_stats_wiring", &values, &labels);
+    let record = exec
+        .execute_close_with_joins(&close, &NoLookup)
+        .expect("execute_close_with_joins")
+        .expect("And 模式 close 应产出 alert");
+    (exec, record, values, labels)
+}
+
+#[test]
+fn stats_wiring_columnar_matches_row_path() {
+    // 列式接线 vs 行式接线: 同数据 alert 逐字符一致
+    let rows = bid_rows(20_000);
+    let (_rexec, rrecord, rvalues, _) = run_stats_to_alert(&rows);
+    let (_cexec, crecord, cvalues, _) = run_stats_to_alert_columnar(&rows);
+    assert_eq!(rvalues, cvalues, "列式/行式 12 值一致");
+    assert_eq!(
+        detail_of(&rrecord),
+        detail_of(&crecord),
+        "列式/行式 alert detail 一致"
+    );
+    // 与独立参考实现交叉验证
+    let expected = reference_q15(&rows);
+    for (i, (v, e)) in cvalues.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(*v, *e as f64, "measure[{i}] 列式 vs 参考");
+    }
+}
