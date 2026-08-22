@@ -7,6 +7,7 @@ mod join;
 mod limits;
 mod match_;
 mod rule;
+mod stats;
 
 pub use clauses::*;
 pub use contract::*;
@@ -17,3 +18,4 @@ pub use join::*;
 pub use limits::*;
 pub use match_::*;
 pub use rule::*;
+pub use stats::*;

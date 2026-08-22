@@ -9,3 +9,4 @@ mod expr;
 mod match_;
 mod pattern;
 mod pipeline;
+mod stats;

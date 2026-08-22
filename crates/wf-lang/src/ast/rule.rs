@@ -91,6 +91,8 @@ pub struct RuleDecl {
     pub lets: Vec<LetDecl>,
     pub match_clause: MatchClause,
     pub each_clause: Option<EachClause>,
+    /// 声明式窗口统计（stats 形态，与 match 互斥——规则体二选一）。
+    pub stats_clause: Option<StatsClause>,
     pub score: ScoreExpr,
     pub joins: Vec<JoinClause>,
     /// `where <expr>` — post-join filter evaluated after all joins enrich the

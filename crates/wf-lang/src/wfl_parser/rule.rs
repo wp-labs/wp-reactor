@@ -12,6 +12,7 @@ use super::events;
 use super::expr;
 use super::match_p;
 use super::pattern_p;
+use super::stats_p;
 
 // ---------------------------------------------------------------------------
 // rule declaration (with pattern support)
@@ -60,101 +61,144 @@ pub(super) fn rule_decl_with_patterns(
     let lets: Vec<LetDecl> = repeat(0.., clauses::let_clause).parse_next(input)?;
 
     // Parse either:
-    // 1) legacy/pattern single-stage rule, or
-    // 2) stage chain: stage {|> stage} with implicit _in between stages.
+    // 1) stats rule (声明式窗口统计, 无 score/join/conv),
+    // 2) legacy/pattern single-stage rule, or
+    // 3) stage chain: stage {|> stage} with implicit _in between stages.
     ws_skip.parse_next(input)?;
     let saved = *input;
-    let (match_clause, each_clause, score, joins, pipeline_stages, pattern_origin, r#where) =
-        match pattern_invocation(input, patterns) {
-            Ok((match_clause, score, pattern_origin)) => {
-                ws_skip.parse_next(input)?;
-                let joins: Vec<JoinClause> = repeat(0.., clauses::join_clause).parse_next(input)?;
-                ws_skip.parse_next(input)?;
-                // Patterns are template expansions; v1 forbids `where` on them.
-                if opt(kw("where")).parse_next(input)?.is_some() {
-                    return Err(winnow::error::ErrMode::Cut(
-                        winnow::error::ContextError::new(),
-                    ));
-                }
-                if opt(literal("|>")).parse_next(input)?.is_some() {
-                    return Err(winnow::error::ErrMode::Cut(
-                        winnow::error::ContextError::new(),
-                    ));
-                }
-                (
-                    match_clause,
-                    None,
-                    score,
-                    joins,
-                    Vec::new(),
-                    pattern_origin,
-                    None,
-                )
-            }
-            Err(winnow::error::ErrMode::Backtrack(_)) => {
-                *input = saved;
-                let mut parsed_stage = cut_err(stage_clause)
-                    .context(StrContext::Expected(StrContextValue::Description(
-                        "match clause",
-                    )))
-                    .parse_next(input)?;
-                let mut pipeline_stages: Vec<PipelineStage> = Vec::new();
-
-                loop {
+    let (
+        match_clause,
+        each_clause,
+        stats_clause,
+        score,
+        joins,
+        pipeline_stages,
+        pattern_origin,
+        r#where,
+    ): (
+        MatchClause,
+        Option<EachClause>,
+        Option<StatsClause>,
+        ScoreExpr,
+        Vec<JoinClause>,
+        Vec<PipelineStage>,
+        Option<PatternOrigin>,
+        Option<Expr>,
+    ) = match stats_p::stats_clause_only.parse_next(input) {
+        Ok(stats) => {
+            // stats 规则: 无 `-> score`(缺省 0), 无 joins, 无 pipeline
+            let score = ScoreExpr {
+                expr: crate::ast::Expr::Number(0.0),
+            };
+            (
+                MatchClause::placeholder(),
+                None,
+                Some(stats),
+                score,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+            )
+        }
+        Err(winnow::error::ErrMode::Backtrack(_)) => {
+            *input = saved;
+            match pattern_invocation(input, patterns) {
+                Ok((match_clause, score, pattern_origin)) => {
                     ws_skip.parse_next(input)?;
-                    if opt(literal("|>")).parse_next(input)?.is_none() {
-                        break;
-                    }
-
-                    // Non-final pipeline stage must not carry score.
-                    if parsed_stage.score.is_some() {
+                    let joins: Vec<JoinClause> =
+                        repeat(0.., clauses::join_clause).parse_next(input)?;
+                    ws_skip.parse_next(input)?;
+                    // Patterns are template expansions; v1 forbids `where` on them.
+                    if opt(kw("where")).parse_next(input)?.is_some() {
                         return Err(winnow::error::ErrMode::Cut(
                             winnow::error::ContextError::new(),
                         ));
                     }
-                    // Non-final pipeline stage must not carry `where` (v1: the
-                    // post-join filter is supported on the final stage only).
-                    if parsed_stage.r#where.is_some() {
+                    if opt(literal("|>")).parse_next(input)?.is_some() {
                         return Err(winnow::error::ErrMode::Cut(
                             winnow::error::ContextError::new(),
                         ));
                     }
-
-                    pipeline_stages.push(PipelineStage {
-                        match_clause: parsed_stage.match_clause,
-                        each_clause: parsed_stage.each_clause,
-                        joins: parsed_stage.joins,
-                    });
-
-                    ws_skip.parse_next(input)?;
-                    parsed_stage = cut_err(stage_clause)
+                    (
+                        match_clause,
+                        None,
+                        None,
+                        score,
+                        joins,
+                        Vec::new(),
+                        pattern_origin,
+                        None,
+                    )
+                }
+                Err(winnow::error::ErrMode::Backtrack(_)) => {
+                    *input = saved;
+                    let mut parsed_stage = cut_err(stage_clause)
                         .context(StrContext::Expected(StrContextValue::Description(
-                            "pipeline stage",
+                            "match clause",
                         )))
                         .parse_next(input)?;
-                }
+                    let mut pipeline_stages: Vec<PipelineStage> = Vec::new();
 
-                let score = match parsed_stage.score {
-                    Some(s) => s,
-                    None => {
-                        return Err(winnow::error::ErrMode::Cut(
-                            winnow::error::ContextError::new(),
-                        ));
+                    loop {
+                        ws_skip.parse_next(input)?;
+                        if opt(literal("|>")).parse_next(input)?.is_none() {
+                            break;
+                        }
+
+                        // Non-final pipeline stage must not carry score.
+                        if parsed_stage.score.is_some() {
+                            return Err(winnow::error::ErrMode::Cut(
+                                winnow::error::ContextError::new(),
+                            ));
+                        }
+                        // Non-final pipeline stage must not carry `where` (v1: the
+                        // post-join filter is supported on the final stage only).
+                        if parsed_stage.r#where.is_some() {
+                            return Err(winnow::error::ErrMode::Cut(
+                                winnow::error::ContextError::new(),
+                            ));
+                        }
+
+                        pipeline_stages.push(PipelineStage {
+                            match_clause: parsed_stage.match_clause,
+                            each_clause: parsed_stage.each_clause,
+                            joins: parsed_stage.joins,
+                        });
+
+                        ws_skip.parse_next(input)?;
+                        parsed_stage = cut_err(stage_clause)
+                            .context(StrContext::Expected(StrContextValue::Description(
+                                "pipeline stage",
+                            )))
+                            .parse_next(input)?;
                     }
-                };
 
-                (
-                    parsed_stage.match_clause,
-                    parsed_stage.each_clause,
-                    score,
-                    parsed_stage.joins,
-                    pipeline_stages,
-                    None,
-                    parsed_stage.r#where,
-                )
+                    let score = match parsed_stage.score {
+                        Some(s) => s,
+                        None => {
+                            return Err(winnow::error::ErrMode::Cut(
+                                winnow::error::ContextError::new(),
+                            ));
+                        }
+                    };
+
+                    (
+                        parsed_stage.match_clause,
+                        parsed_stage.each_clause,
+                        None,
+                        score,
+                        parsed_stage.joins,
+                        pipeline_stages,
+                        None,
+                        parsed_stage.r#where,
+                    )
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
-        };
+        }
+        Err(e) => return Err(e),
+    };
 
     // Required entity clause
     ws_skip.parse_next(input)?;
@@ -194,6 +238,7 @@ pub(super) fn rule_decl_with_patterns(
         lets,
         match_clause,
         each_clause,
+        stats_clause,
         score,
         joins,
         r#where,
