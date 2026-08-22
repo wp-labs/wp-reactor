@@ -1,6 +1,6 @@
 # WFL `stats` 声明式窗口统计执行器 — 完整设计
 
-> 状态：设计评审稿 v4（2026-08-22；v3 增 §2.5 全景，v4 修 D3/D6/D7/D8/N1/N2/N3，补 D4/D9）
+> 状态：设计评审稿 v6（2026-08-22；v4 修 D3/D6/D7/D8/N1/N2/N3 补 D4/D9，v5 增分档矩阵，v6 统一桶键模型+行/列 pivot）
 > 配套：`wf-examples/performance/nexmark_pk/NEXMARK_AUTHORITATIVE_SEMANTICS.md`
 > 动机数据：`close_bench`（q15 close 累积 550ns/evt；guard 33% + distinct 23% + close 循环 19%）
 
@@ -61,7 +61,7 @@ guard mask 33% —— 全部是「用匹配引擎做统计」的错配代价。
 | Q | 权威语义 | 分组 | 度量 |
 |---|---|---|---|
 | Q15 | price 分档 × count/distinct | 空键（`day`，30m 恰 1 天） | tier + count/distinct_count |
-| Q16 | channel × price 分档统计 | **复合键 (channel, day, minute)** | tier + count/distinct_count |
+| Q16 | channel × price 分档统计 | **复合键 (channel, day)** | tier + count/distinct_count |
 | Q17 | auction × price 分档 + min/max/avg/sum | **复合键 (auction, day)** | tier + count/min/max/avg/sum |
 
 **第二梯队 — 纯窗口计数（无 join 无 top，`stats` 直接命中）**
@@ -88,7 +88,8 @@ guard mask 33% —— 全部是「用匹配引擎做统计」的错配代价。
 |---|---|---|
 | Q8 | person⋈auction 增量 join | **当前是能力面测试（未对齐权威）**，非"待优化"——不做 stats 化 |
 | Q6 | 每 seller 10 行滑动 avg | join-then-key + ROWS 滑动窗，语义与 stats 窗口模型不同，暂留 match |
-| Q1/Q2/Q10/Q14/Q21/Q22 | 无状态变换 | `on each` |
+| Q1/Q2/Q10/Q21/Q22 | 无状态变换 | `on each` |
+| Q14 | 无状态变换 + 离散枚举分桶(dayTime/nightTime) | `on each`（枚举投影）；stats 枚举分桶用 `group by (daytime(...))`, 见 §4.1.1 |
 | Q3/Q13/Q20 | 单行 join | `on each`+join / match 富化 |
 
 ---
@@ -208,12 +209,17 @@ P5  stats → join 回查管线          → Q5/Q7 精确化
 rule            := 'rule' name '{' events lets? stats_body entity yield limits? '}'
 
 stats_body      := 'stats' window_spec '{' tier_decl? stats_block '}'
+                 (* tier_decl 是语法糖, ≡ group by 桶键 + output columns, 见 §4.1.1 *)
 
 window_spec     := '<' duration [':' window_mode] '>'      (* 分组独立声明, 见 group_by *)
 window_mode     := 'fixed' | 'sliding' | 'session'         (* 默认 fixed *)
 
-group_by        := 'group by' '(' field (',' field)* ')'   (* 复合键; 缺省 = 空键全局 *)
-tier_decl       := 'tier' field '[' boundary (',' boundary)* ']'
+group_by        := 'group by' '(' group_key (',' group_key)* ')'   (* 桶键表达式列表; 缺省 = 空键全局 *)
+group_key       := expr                                     (* 任意表达式; tier/bucket 是内置桶键函数 *)
+output_shape    := 'output' ('rows' | 'columns')            (* 缺省 rows; columns = 输出时 pivot 转置 *)
+
+tier_decl       := 'tier' field '[' boundary (',' boundary)* ']'  (* ≡ group by (tier(field,b..)) output columns *)
+time_unit       := 'second' | 'minute' | 'hour' | 'day' | 'week' | 'month'
 boundary        := '<' number | '<=' number                (* 升序常量 *)
 
 stats_block     := measure_decl (';' measure_decl)*
@@ -251,8 +257,76 @@ agg_func        := 'count'
 
   （v2 修订 R5：边界映射与权威 SQL 严格对齐；tier 字段为 null 的行**只计入 total 档**）
 
-- `group by (channel, day, minute)`（Q16 形态）：复合键分桶
+- `group by (b.channel, bucket(b.dateTime, 'day'))`（Q16 形态）：复合键 + 时间粒度分桶
 - 每个 measure 的 `where` 与 tier 叠加 = 行过滤后按档归并
+
+### 4.1.1 分档统一模型：分桶键函数 + 输出形状（v6 重构，替代 v5 三种并列语法）
+
+**核心抽象：所有分档 = 「分桶键函数」——每行计算一个桶键(索引/标签/下界)，值相同的行进同一桶。**
+`tier`/`bucket`/枚举表达式只是三种「桶键计算方式」，统一进 `group by`：
+
+```
+① 区间分档:   group by (tier(b.price, 10000, 1000000))   // 返回桶索引 0/1/2
+② 时间粒度:   group by (bucket(b.dateTime, 'day'))        // 返回粒度下界
+③ 枚举分桶:   group by (daytime(b.dateTime))              // 返回标签
+④ 复合:       group by (b.channel, bucket(b.dateTime,'day'), tier(b.price, 10000, 1000000))
+                // 多键 = 多分桶的叉乘; 每键一个累加器维度
+```
+
+**分桶键函数库（内置，后续可扩展）：**
+
+| 函数 | 返回 | 列式可优化 | 适用 |
+|---|---|---|---|
+| `tier(f, b1, b2, ...)` | 桶索引（边界数+1，含 total 档） | ✅ 区间列扫描 | Q15/Q16/Q17 |
+| `bucket(f, unit)` | 粒度下界（epoch 对齐） | ✅ 时间列取整 | Q15(day)/Q16(day) |
+| 任意比较/表达式 | 标签/索引 | ⚠️ 可列式则列式,否则逐行 | Q14(dayTime) |
+
+**语法统一（用户视角）：**
+
+```ebnf
+group_key       := expr                    (* 桶键表达式; tier/bucket 是内置函数 *)
+group_by        := 'group by' '(' group_key (',' group_key)* ')'
+output_shape    := 'rows' | 'columns'      (* 缺省: 单键 rows; 多键/声明 columns 时转置 *)
+```
+
+**保留的差异：输出形状（行展开 vs 列展开）——不是新语法，是同一分桶的 pivot 选择。**
+
+```wfl
+// 行展开（每档一行, 缺省）——Q12 形态
+stats<30m:fixed> group by (tier(b.price, 10000, 1000000)) { b | count as bids; }
+// → 3 行: (rank1,1) (rank2,1) (rank3,1)
+
+// 列展开（每档一列, 单行）——Q15 形态: 权威输出 1 行 12 列
+stats<30m:fixed> tier b.price [ <10000, <1000000 ] { b | count as bids; }
+// → 1 行 4 列: total=3, rank1=1, rank2=1, rank3=1
+// 语法糖: `tier f [b1,b2]` ≡ `group by (tier(f,b1,b2)) output columns`
+```
+
+**执行层**：分桶→累加只有一条路径；列展开在输出阶段做一次 **pivot（行转列）**。
+列序必须固定（与权威 SQL 列序一致）作为对拍契约：`total, rank1, rank2, rank3, ...`。
+
+**优化分派保留（实现视角）**：
+
+```
+语法统一 ≠ 放弃列式优化:
+  tier()/bucket() 是编译器「已知桶键函数」→ 识别后走列式扫描(§6.2 段1b)
+  其它表达式 → 通用逐行求值
+  → 统一的是声明语法, 保留的是优化分派(函数特例)
+```
+
+**多分档组合（group by × tier × where 叠加）：**
+
+```wfl
+// Q16 完整形态: channel+day 分组 × price 区间档 × 无条件 count
+stats<30m:fixed>
+    group by (b.channel, bucket(b.dateTime, 'day'))
+    tier b.price [ <10000, <1000000 ] {
+        b | count as total_bids;
+        b | distinct_count(b.bidder) as total_bidders;
+        b | distinct_count(b.auction) as total_auctions;
+    }
+// → 桶数 = 分组键值 × 4 档; 每桶 9 个度量(3 无条件 × 3 档展开)
+```
 
 ### 4.2 q15 重写示例（与权威 SQL 逐列对应）
 
@@ -289,8 +363,9 @@ rule q15_bidding_stats {
 | Q11 | `stats<10s:session> group by (bidder) { b | count as bid_count }` | session 窗口 |
 | Q12 | `stats<10s:fixed> group by (bidder) { b | count as bid_count }` | 固定窗口 |
 | Q15 | `stats<30m:fixed> tier b.price [<10000,<1000000] { ... }` | 空键 |
-| Q16 | `stats<30m:fixed> group by (channel, day, minute) tier b.price [...] { ... }` | 复合键 |
-| Q17 | `stats<30m:fixed> group by (auction, day) tier b.price [...] { ... }` | 复合键 |
+| Q16 | `stats<30m:fixed> group by (b.channel, bucket(b.dateTime,'day')) tier b.price [...] { ... }` | 复合键 + 时间粒度 |
+| Q17 | `stats<30m:fixed> group by (b.auction, bucket(b.dateTime,'day')) tier b.price [...] { ... }` | 复合键 + 时间粒度 |
+| Q14 | `stats<30m:fixed> group by (daytime(b.dateTime)) { b \| count }` | 离散枚举分桶（on each 投影改造） |
 | Q4 | `stats` inner(max) → stats outer(avg) 管线 + bid⋈auction join | 两级（§10.1） |
 | Q5 | `stats<10s:fixed> group by (auction) { count }` + `top(1, num)` 跨 auction | 全局 top 扩展 |
 | Q7 | `stats<10s:fixed> { max(price) }` + join 回 bid | 全局 max 回查 |
@@ -309,35 +384,40 @@ rule q15_bidding_stats {
 // wf-lang/src/plan.rs 新增
 pub struct StatsPlan {
     pub window_spec: WindowSpec,             // Fixed/Sliding/Session
-    pub keys: Vec<FieldRef>,                 // group by 复合键; 空 = 空键全局
-    pub tier: Option<TierPlan>,              // 分档（一次声明）
+    pub keys: Vec<ExprPlan>,                 // 桶键表达式列表(group by 统一, v6); 空 = 空键全局
+    pub output_shape: OutputShape,           // Row | Column(v6: 行展开/列展开 pivot)
     pub measures: Vec<StatsMeasurePlan>,
     pub tracked_bind_fields: HashMap<String, HashSet<String>>, // 物化字段
 }
 
-pub struct TierPlan {
-    pub field: FieldRef,                     // 分档字段（如 b.price）
-    pub boundaries: Vec<f64>,                // 升序上界（如 [10000, 1000000]）
-    // 桶数 = boundaries.len() + 1（含无条件档 total）
-    pub boundary_ops: Vec<BoundaryOp>,       // 每个边界是 < 还是 <=（对齐权威 SQL）
+pub enum OutputShape {
+    Row,        // 每桶一行(缺省)
+    Column,     // 每桶一列, 输出时 pivot 转置(单行多列)—— tier 语法糖的目标
 }
+
+// v6: TierPlan 并入 keys —— `tier f [b1,b2]` ≡ keys.push(Expr::Tier(f,[b1,b2])) + Column
+// 桶键函数识别留在编译/执行(已知函数列式化), 不再有独立 plan 结构。
 
 pub struct StatsMeasurePlan {
     pub label: String,
     pub source_alias: String,
-    pub where_expr: Option<ExprPlan>,        // 行过滤（与 tier 叠加）
+    pub where_expr: Option<ExprPlan>,        // 行过滤(与桶键叠加)
     pub agg: StatsAgg,                       // count/sum/avg/min/max/distinct_count/last/top
     pub field: Option<FieldRef>,             // sum(field) 等
     pub arg: Option<usize>,                  // top(N) 的 N
 }
 ```
 
-### 5.1 编译器职责
+### 5.1 编译器职责（v6 更新）
 
-1. **tier 展开**：`tier` 声明 → 每个度量 × (档数+1) 个聚合桶，共享一次分档扫描
-2. **字段物化投影**：`tracked_bind_fields` = 所有 `field` 引用 + `where` 字段 + tier 字段 + 复合键字段（复用现有 field_usage 机制）
+1. **桶键编译**：每个 `group by` 表达式 → 桶键函数分派——`tier()`/`bucket()` 标记为
+   「已知桶键函数」走列式扫描(§6.2 段1b)；其它表达式走通用逐行求值。
+   `tier f [b1,b2]` 语法糖展开为 `keys += tier(f, b1, b2)` + `output_shape = Column`。
+2. **字段物化投影**：`tracked_bind_fields` = 所有 `field` 引用 + `where` 字段 + 桶键表达式字段
+   （复用现有 field_usage 机制）
 3. **window 挂载**：复用现有 `WindowRegistry`/`Router`
-4. **yield 解析**：`stat.total(label)` / `stat.tier(n, label)` → 桶索引
+4. **yield 解析**：`stat.total(label)` / `stat.tier(n, label)` → 桶索引（列展开）；
+   行展开时 label 直接是输出列
 
 ---
 
@@ -358,11 +438,15 @@ pub struct StatsAccum {
 
 // 执行器实例：窗口 × key 桶
 pub struct StatsWindowState {
-    pub buckets: HashMap<ScopeKey, Vec<StatsAccum>>,  // [key][tier_idx]
+    pub buckets: HashMap<ScopeKey, Vec<StatsAccum>>,  // [key][bucket_idx]; bucket_idx 由桶键表达式组合
     pub window_start: i64,
     pub last_event_nanos: i64,                       // session gap / sliding 出窗用
 }
 ```
+
+> v6：无独立 tier 维度——`buckets[key][bucket_idx]` 的 `bucket_idx` 由全部桶键
+> 表达式（分组键 × 分档键）组合而成；`tier` 只是其中一个桶键函数。
+> 列展开（Column）时, 输出阶段对 bucket_idx 做 pivot(行转列)。
 
 > **D6/D8 精度约定**：归并状态只用 `count` + `sum_i128`（及整数 min/max）；
 > **avg 不作为状态**——它永远在输出时由 `sum_i128 / count` 求得（见 §5.4）。
@@ -375,29 +459,36 @@ pub struct StatsWindowState {
 
 ```
 段 1 — 列式（整列归并, 不逐行）:
-  a. 复合键列 → 列式 ScopeKey 分桶
+  a. 分组键列 → 列式 ScopeKey 分桶
        复用 fanout.rs:559 `pub(crate) fn scope_key_columnar`（或同模块
        `partition_rows_by_key` 提级为 pub(crate)）——**不是** 523 行的私有
        `scope_key_from_column`（D3）
-  b. tier 字段列（b.price）→ 一次扫描 → tier_idx 列
-       stats 自行实现「价格列 vs 边界数组」的列式比较（D2/N2：不复用 CEP 的
-       私有 `compare_int`/`cmp_vec`，那是 guard 求值底层助手且不可见）
+  b. 分档键(tier/bucket) → 列式求桶键
+       tier: 价格列 vs 边界数组一次扫描 → 桶索引列
+       bucket: 时间列粒度取整 → 下界列
+       stats 自行实现（D2/N2：不复用 CEP 的私有 `compare_int`/`cmp_vec`）；
+       非已知桶键函数的表达式 → 通用逐行求值(段 2 前置)
   c. where 涉及的列 → 列式 mask（复用 eval_guard_columnar, pub）
-  d. 纯归并度量（count/sum/min/max）按桶×档**整列累加**:
-       对每列切片, 按 (key, tier) 分组做 count/sum_i128/min/max —— 无逐行解释器
+  d. 纯归并度量（count/sum/min/max）按 key×桶键**整列累加**:
+       对每列切片, 按 (key, bucket_idx) 分组做 count/sum_i128/min/max —— 无逐行解释器
 
-段 2 — 行式（仅非归并度量, 逐行）:
+段 2 — 行式（仅非归并度量 / 非列式桶键, 逐行）:
   for (row in batch):
      如果该桶只有 count/sum/min/max（无 distinct/last/top）→ 段 1 已算完, 跳过
-     key = scope_key[row]; tier = tier_idx[row]
+     key = scope_key[row]; bucket = bucket_idx[row]
      if where_mask[row] == false: continue
-     acc = buckets[key][tier]
+     acc = buckets[key][bucket]
      if distinct: acc.distinct_set.insert(DistinctKey::from_raw(i64/timestamp))
                    // D7: 从列式原生值构造 key, **禁止** ValueKey::from_value 的
                    // f64 化（fanout.rs:1103 记载 >2^53 分歧）——bidder/auction
                    // 为 i64, 直接域内构造, 与列式路径字节一致
      if last:     acc.last_row = Some(row)
      if top:      acc.top_heap.push((row[field], row)); trim to N
+
+输出(pivot):
+  Row   → 每桶一行 (key, bucket_idx, measure...) 直接输出
+  Column→ 按 bucket_idx 转置: 单行 [total, rank1, rank2, ...] × 每个度量
+          列序固定为权威 SQL 列序(对拍契约): total, rank1, rank2, rank3, ...
 ```
 
 > 关键：**段 1 覆盖纯归并规则（Q11/Q12/Q15 大部分度量），整批无逐行循环**；
