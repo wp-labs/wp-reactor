@@ -3,3 +3,4 @@
 //! per-append outcome reporter (appended vs late-dropped).
 
 mod coverage_extra;
+mod coverage_more;

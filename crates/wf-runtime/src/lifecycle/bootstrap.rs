@@ -647,3 +647,6 @@ mod tests {
 #[cfg(test)]
 #[path = "bootstrap_coverage.rs"]
 mod bootstrap_coverage;
+#[cfg(test)]
+#[path = "bootstrap_coverage_more.rs"]
+mod bootstrap_coverage_more;

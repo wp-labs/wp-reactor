@@ -16,7 +16,13 @@ pub use each_exec::EachDirectBatchStats;
 pub use stats_exec::{DistinctKey, StatsAccum, StatsExecutor, StatsWindowState};
 
 #[cfg(test)]
+mod close_coverage_more;
+#[cfg(test)]
+mod context_coverage_more;
+#[cfg(test)]
 mod coverage_extra;
+#[cfg(test)]
+mod coverage_more;
 #[cfg(test)]
 mod stats_coverage_extra;
 #[cfg(test)]

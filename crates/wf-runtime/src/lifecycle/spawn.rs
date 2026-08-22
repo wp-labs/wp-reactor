@@ -1472,3 +1472,6 @@ mod tests {
 #[cfg(test)]
 #[path = "spawn_coverage.rs"]
 mod spawn_coverage;
+#[cfg(test)]
+#[path = "spawn_coverage_more.rs"]
+mod spawn_coverage_more;

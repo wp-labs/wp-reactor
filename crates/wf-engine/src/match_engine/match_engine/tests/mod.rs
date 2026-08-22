@@ -4,6 +4,7 @@
 //! (key/state/step/close/conv/seq/limits) directly.
 
 mod coverage_extra;
+mod coverage_more;
 
 use super::*;
 
