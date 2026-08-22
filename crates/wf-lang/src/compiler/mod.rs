@@ -668,10 +668,16 @@ fn is_l3_series_func(name: &str) -> bool {
 
 /// Event-accessor stat functions (`match_event`, `window_event`, `trigger`, …)
 /// that read the step's collected event data — also require the history.
+///
+/// `final(label)` is deliberately NOT here: the eval side resolves it to the
+/// close-accumulated measure value injected by `build_eval_context` (`ctx.fields
+/// .get(label)`), never the per-event field history. Including it forces
+/// empty-key close rules (q15: 12 measures × `stat.value(final(...))`) to keep
+/// the per-event `collect_event_fields` on for nothing.
 fn is_event_accessor(name: &str) -> bool {
     matches!(
         name,
-        "window_event" | "match_event" | "match_distinct" | "trigger" | "final"
+        "window_event" | "match_event" | "match_distinct" | "trigger"
     )
 }
 

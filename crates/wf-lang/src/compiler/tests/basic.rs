@@ -380,6 +380,41 @@ rule dns_timeout {
 // =========================================================================
 
 #[test]
+fn close_rule_stat_value_final_selector_skips_field_history() {
+    // q15 shape: empty-key fixed window + `and close` with 12 measures, and the
+    // yield reads `stat.value(final(label))`. `final(label)` resolves to the
+    // close-accumulated measure value injected by build_eval_context — it never
+    // reads the per-event field history. Collecting its label arg as a field
+    // made empty-key close rules look like they read non-key fields, forcing
+    // collect_event_fields on for nothing (24 亿 reads + 19.5 亿 push_capped on
+    // q15 10M).
+    let schemas = [auth_events_window(), output_window()];
+    let plans = compile_with(
+        r#"
+rule q15_like {
+    events { b : auth_events }
+    match<:10s:fixed> {
+        on event { b | count >= 1; }
+        and close {
+            total: b | count >= 1;
+            r1: b && b.count < 100 | count >= 1;
+        }
+    } -> score(10.0)
+    entity(digit, 1)
+    yield out (y = fmt("{} {}", stat.value(final(total)), stat.value(final(r1))))
+}
+"#,
+        &schemas,
+    );
+    let p = &plans[0];
+    assert!(!p.match_plan.close_steps.is_empty());
+    assert!(
+        !p.match_plan.needs_field_history,
+        "stat.value(final(label)) reads measure values, not the field history"
+    );
+}
+
+#[test]
 fn close_rule_yield_reads_only_key_skips_field_history() {
     // q12 shape: fixed window + `and close`, score/entity/yields reference
     // only the match key (served from scope_key by build_eval_context) and

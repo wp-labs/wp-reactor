@@ -233,6 +233,16 @@ pub(crate) fn field_ref_name(fr: &FieldRef) -> &str {
     }
 }
 
+/// True when `name` is a stat-selector function whose argument is a step label
+/// or bind alias (`final(label)`, `trigger(label)`, `window_event(alias)`, …)
+/// resolved from the eval context — never an event field.
+fn is_stat_selector_name(name: &str) -> bool {
+    matches!(
+        name,
+        "window_event" | "match_event" | "match_distinct" | "trigger" | "final"
+    )
+}
+
 pub(crate) fn collect_expr_fields(expr: &Expr, out: &mut HashSet<String>) {
     match expr {
         Expr::Field(fr) => {
@@ -243,9 +253,16 @@ pub(crate) fn collect_expr_fields(expr: &Expr, out: &mut HashSet<String>) {
             collect_expr_fields(right, out);
         }
         Expr::Neg(inner) => collect_expr_fields(inner, out),
-        Expr::FuncCall { args, .. } => {
-            for arg in args {
-                collect_expr_fields(arg, out);
+        Expr::FuncCall { name, args, .. } => {
+            // Stat-selector args (`final(label)`, `window_event(alias)`, …) are
+            // step labels / bind aliases resolved from the eval context, not
+            // event fields — collecting them as fields makes empty-key close
+            // rules (q15) look like they read non-key fields and forces the
+            // per-event field history on for nothing.
+            if !is_stat_selector_name(name) {
+                for arg in args {
+                    collect_expr_fields(arg, out);
+                }
             }
         }
         Expr::Object(items) => {
