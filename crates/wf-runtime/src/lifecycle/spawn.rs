@@ -312,6 +312,7 @@ pub(super) fn spawn_rule_tasks(
                     router: Arc::clone(router),
                     metrics: metrics.clone(),
                     time_field,
+                    timeout_scan_interval,
                     intermediate_targets: intermediate_targets.clone(),
                     pipe_registry: Arc::clone(&pipe_registry),
                     eos_flush: eos_tx.subscribe(),

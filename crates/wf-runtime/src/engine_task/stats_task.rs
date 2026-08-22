@@ -60,6 +60,10 @@ pub(super) struct StatsTask {
     window_end: Option<i64>,
     /// 单调事件时间 watermark（批次最大时间, 不倒退）。
     last_watermark: i64,
+    /// 上次真实事件批处理的墙钟时刻（scan_timeouts 兜底推进用）。
+    last_activity_wall: std::time::Instant,
+    /// 周期性超时扫描间隔（墙钟兜底推进 watermark 关闭尾部窗口）。
+    timeout_scan_interval: std::time::Duration,
 }
 
 impl StatsTask {
@@ -73,6 +77,7 @@ impl StatsTask {
             router,
             metrics,
             time_field,
+            timeout_scan_interval,
             intermediate_targets,
             pipe_registry,
             eos_flush,
@@ -103,6 +108,8 @@ impl StatsTask {
             window_start: None,
             window_end: None,
             last_watermark: i64::MIN,
+            last_activity_wall: std::time::Instant::now(),
+            timeout_scan_interval,
         };
         (task, cancel)
     }
@@ -168,6 +175,7 @@ impl StatsTask {
 
     /// 核心: 归并一个批次 + 按批次最大事件时间推进固定窗口。
     async fn process_batch_from(&mut self, window_name: &str, batch: &RecordBatch) {
+        self.last_activity_wall = std::time::Instant::now();
         // 先推进窗口（可能触发 close 产出）——用批次最大事件时间做 watermark。
         let max_time = batch_max_time(batch, self.time_field.as_deref());
         if max_time > self.last_watermark {
@@ -273,6 +281,38 @@ impl StatsTask {
                 );
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 超时扫描（墙钟兜底, 对齐 CEP scan_timeouts）
+    // ------------------------------------------------------------------
+
+    /// 周期性扫描: 用墙钟流逝（capped at 一个扫描间隔）兜底推进 watermark,
+    /// 关闭事件时间未越过边界的**尾部窗口**（replay 数据跨度恰好 ≤ 窗口时长时
+    /// 事件时间到不了边界——CEP 靠 scan_timeouts 的 wall 推进关闭, stats 同）。
+    ///
+    /// 语义对齐 CEP: 空窗口不产出（无实例无输出）; 关闭后**清空窗口状态**
+    /// （不设新桶）——墙钟持续推进若不重置会每 tick 关闭一个空窗口循环产出。
+    pub(super) async fn scan_timeouts(&mut self) {
+        let Some(end) = self.window_end else {
+            return; // 无窗口（无数据 / 已收尾）
+        };
+        let effective_watermark = self.last_watermark.saturating_add(
+            self.last_activity_wall
+                .elapsed()
+                .min(self.timeout_scan_interval)
+                .as_nanos() as i64,
+        );
+        if effective_watermark < end {
+            return;
+        }
+        let has_data = self.stats.window.event_count > 0;
+        if has_data && let (Some(start), Some(end)) = (self.window_start, self.window_end) {
+            self.close_current_window(start, end).await;
+        }
+        // 清空窗口状态, 等待真实事件重新开桶（避免空窗口循环产出）。
+        self.window_start = None;
+        self.window_end = None;
     }
 
     // ------------------------------------------------------------------
@@ -422,11 +462,13 @@ pub(crate) async fn run_stats_task(config: StatsTaskConfig) -> RuntimeResult<()>
     let (mut task, cancel) = StatsTask::new(config);
     let task_id = task.task_id.clone();
     let mut eos = task.eos_flush.clone();
+    let timeout_scan_interval = task.timeout_scan_interval;
+    let mut timeout_tick = tokio::time::interval(timeout_scan_interval);
 
     if let Some(rx) = task.push_rx.take() {
-        run_stats_push_loop(&mut task, rx, cancel, &mut eos, &task_id).await
+        run_stats_push_loop(&mut task, rx, cancel, &mut eos, &mut timeout_tick, &task_id).await
     } else {
-        run_stats_pull_loop(&mut task, cancel, &mut eos, &task_id).await
+        run_stats_pull_loop(&mut task, cancel, &mut eos, &mut timeout_tick, &task_id).await
     }
 }
 
@@ -435,6 +477,7 @@ async fn run_stats_push_loop(
     mut rx: mpsc::Receiver<RulePush>,
     cancel: CancellationToken,
     eos: &mut watch::Receiver<u64>,
+    timeout_tick: &mut tokio::time::Interval,
     task_id: &str,
 ) -> RuntimeResult<()> {
     loop {
@@ -463,6 +506,7 @@ async fn run_stats_push_loop(
                     wf_debug!(pipe, task_id = %task_id, "stats task EOS flush complete");
                 }
             }
+            _ = timeout_tick.tick() => task.scan_timeouts().await,
         }
     }
     Ok(())
@@ -472,6 +516,7 @@ async fn run_stats_pull_loop(
     task: &mut StatsTask,
     cancel: CancellationToken,
     eos: &mut watch::Receiver<u64>,
+    timeout_tick: &mut tokio::time::Interval,
     task_id: &str,
 ) -> RuntimeResult<()> {
     let notifiers: Vec<Arc<tokio::sync::Notify>> =
@@ -494,6 +539,7 @@ async fn run_stats_pull_loop(
                     wf_debug!(pipe, task_id = %task_id, "stats task EOS flush complete");
                 }
             }
+            _ = timeout_tick.tick() => task.scan_timeouts().await,
         }
     }
     Ok(())

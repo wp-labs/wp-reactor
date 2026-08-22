@@ -94,6 +94,7 @@ pub(crate) struct StatsTaskConfig {
     pub metrics: Option<Arc<RuntimeMetrics>>,
     /// 事件时间字段（batch 时间列解析）。
     pub time_field: Option<String>,
+    pub timeout_scan_interval: Duration,
     pub intermediate_targets: HashSet<String>,
     pub pipe_registry: std::sync::Arc<wf_engine::pipe::PipeRegistry>,
     pub eos_flush: watch::Receiver<u64>,

@@ -64,6 +64,254 @@ fn make_batch(sips: &[&str], ts: i64) -> RecordBatch {
     .unwrap()
 }
 
+// ---------------------------------------------------------------------------
+// Q15 12 度量验证（stats 执行器真实任务路径, 与 CEP 锚点对拍）
+// ---------------------------------------------------------------------------
+
+fn q15_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]))
+}
+
+fn make_q15_batch(rows: &[(i64, i64, i64)], ts: i64) -> RecordBatch {
+    use arrow::array::Int64Array;
+    let n = rows.len();
+    RecordBatch::try_new(
+        q15_schema(),
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| Some(r.0)).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| Some(r.1)).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| Some(r.2)).collect::<Vec<_>>(),
+            )),
+            Arc::new(TimestampNanosecondArray::from(vec![ts; n])),
+        ],
+    )
+    .unwrap()
+}
+
+/// Q15 12 度量 plan（价格分档 where + count/distinct_count）。
+fn q15_plan() -> StatsPlan {
+    let m = |label: &str, agg: StatsAggPlan, field: Option<&str>, where_expr: Option<Expr>| {
+        StatsMeasurePlan {
+            label: label.into(),
+            source_alias: "b".into(),
+            where_expr,
+            agg,
+            field: field.map(|f| FieldRef::Qualified("b".into(), f.into())),
+            arg: None,
+        }
+    };
+    let price = |op: wf_lang::ast::BinOp, v: f64| Expr::BinOp {
+        op,
+        left: Box::new(Expr::Field(FieldRef::Qualified("b".into(), "price".into()))),
+        right: Box::new(Expr::Number(v)),
+    };
+    let lt = |v: f64| price(wf_lang::ast::BinOp::Lt, v);
+    let ge = |v: f64| price(wf_lang::ast::BinOp::Ge, v);
+    let range = |lo: f64, hi: f64| Expr::BinOp {
+        op: wf_lang::ast::BinOp::And,
+        left: Box::new(ge(lo)),
+        right: Box::new(lt(hi)),
+    };
+    let tier_where = |tier: usize| -> Option<Expr> {
+        match tier {
+            0 => None,
+            1 => Some(lt(10_000.0)),
+            2 => Some(range(10_000.0, 1_000_000.0)),
+            3 => Some(ge(1_000_000.0)),
+            _ => unreachable!(),
+        }
+    };
+    let mut measures = Vec::new();
+    for (i, name) in ["total", "r1", "r2", "r3"].iter().enumerate() {
+        measures.push(m(
+            &format!("count_{name}"),
+            StatsAggPlan::Count,
+            None,
+            tier_where(i),
+        ));
+    }
+    for (i, name) in ["total", "r1", "r2", "r3"].iter().enumerate() {
+        measures.push(m(
+            &format!("bidder_{name}"),
+            StatsAggPlan::DistinctCount,
+            Some("bidder"),
+            tier_where(i),
+        ));
+    }
+    for (i, name) in ["total", "r1", "r2", "r3"].iter().enumerate() {
+        measures.push(m(
+            &format!("auction_{name}"),
+            StatsAggPlan::DistinctCount,
+            Some("auction"),
+            tier_where(i),
+        ));
+    }
+    StatsPlan {
+        window_spec: WindowSpec::Fixed(Duration::from_secs(1800)),
+        keys: vec![],
+        output_shape: StatsOutputShapePlan::Rows,
+        measures,
+        tracked_bind_fields: HashMap::new(),
+    }
+}
+
+fn make_q15_task() -> (StatsTask, mpsc::Receiver<crate::alert_task::AlertBatch>) {
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let schema = q15_schema();
+    let win = Arc::new(Window::new(
+        WindowParams {
+            name: "bid_events".into(),
+            schema: schema.clone(),
+            time_col_index: Some(3), // event_time 第 4 列
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        super::tests::test_window_config(usize::MAX),
+    ));
+    // 12 值 detail（与 CEP 版 q15 yield 同构）
+    let mut fmt_args = vec![Expr::StringLit(
+        "{} {} {} {} {} {} {} {} {} {} {} {}".into(),
+    )];
+    for label in [
+        "count_total",
+        "count_r1",
+        "count_r2",
+        "count_r3",
+        "bidder_total",
+        "bidder_r1",
+        "bidder_r2",
+        "bidder_r3",
+        "auction_total",
+        "auction_r1",
+        "auction_r2",
+        "auction_r3",
+    ] {
+        fmt_args.push(stat_value(label));
+    }
+    let rp = wf_lang::plan::RulePlan {
+        name: "q15_stats".into(),
+        binds: vec![BindPlan {
+            alias: "b".into(),
+            window: "bid_events".into(),
+            filter: None,
+        }],
+        lets: vec![],
+        match_plan: wf_lang::plan::MatchPlan {
+            keys: vec![],
+            key_map: None,
+            key_join: None,
+            window_spec: WindowSpec::Fixed(Duration::from_secs(1800)),
+            event_steps: vec![],
+            close_steps: vec![],
+            close_mode: wf_lang::ast::CloseMode::And,
+            match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
+            seq: None,
+            tracked_bind_aliases: std::collections::HashSet::new(),
+            tracked_bind_fields: HashMap::new(),
+            tracked_plain_fields: std::collections::HashSet::new(),
+            needs_field_history: false,
+        },
+        each_plan: None,
+        stats_plan: Some(q15_plan()),
+        joins: vec![],
+        r#where: None,
+        entity_plan: EntityPlan {
+            entity_type: "digit".into(),
+            entity_id_expr: Expr::Number(1.0),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![YieldField {
+                name: "detail".into(),
+                value: Expr::FuncCall {
+                    qualifier: None,
+                    name: "fmt".into(),
+                    args: fmt_args,
+                },
+            }],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(10.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+        conv_window: None,
+    };
+    let config = StatsTaskConfig {
+        stats: StatsExecutor::new(q15_plan()),
+        executor: RuleExecutor::new(rp),
+        window_sources: vec![super::task_types::WindowSource {
+            window_name: "bid_events".into(),
+            window: Arc::clone(&win),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            aliases: vec!["b".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        router: Arc::new(wf_engine::window::Router::new(
+            wf_engine::window::WindowRegistry::build(vec![]).unwrap(),
+        )),
+        metrics: None,
+        time_field: Some("event_time".into()),
+        timeout_scan_interval: Duration::from_secs(1),
+        intermediate_targets: std::collections::HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        progress: std::collections::HashMap::new(),
+        shard_index: None,
+        shard_count: 1,
+    };
+    let (task, _cancel) = StatsTask::new(config);
+    (task, alert_rx)
+}
+
+#[tokio::test]
+async fn q15_stats_task_12_measures_matches_cep_anchor() {
+    // Q15 真实任务路径（StatsTask 列式归并 → 固定窗口 close → alert）:
+    // 6 行覆盖 3 价格档, 期望 12 值（与 CEP 版 q15 锚点同构, 独立手算）。
+    let (mut task, mut alert_rx) = make_q15_task();
+    let rows = [
+        (100, 1, 10),       // tier0
+        (50_000, 1, 11),    // tier1
+        (2_000_000, 2, 12), // tier2
+        (50, 2, 10),        // tier0
+        (5_000, 3, 13),     // tier0
+        (999_999, 3, 11),   // tier1
+    ];
+    let batch = make_q15_batch(&rows, 5_000_000_000);
+    push_batch(&mut task, batch, 1).await;
+    // 未到 30m 边界 → 无产出
+    assert!(alert_rx.try_recv().is_err(), "窗口未关闭不应产出");
+    task.flush().await;
+    let alert = take_alert(&mut alert_rx);
+    // total=6, r1=3, r2=2, r3=1; bidder total=3, r1=3, r2=2, r3=1;
+    // auction total=4, r1=2, r2=1, r3=1
+    assert_eq!(
+        field_str(&alert, "detail"),
+        "6 3 2 1 3 3 2 1 4 2 1 1",
+        "Q15 stats 12 度量（真实任务路径）"
+    );
+}
+
 /// `stat.value(final(label))` 表达式（与编译后的 yield 同构）。
 fn stat_value(label: &str) -> Expr {
     let final_sel = Expr::FuncCall {
@@ -201,6 +449,7 @@ fn make_stats_task() -> (
         )),
         metrics: None,
         time_field: Some("event_time".into()),
+        timeout_scan_interval: Duration::from_secs(1),
         intermediate_targets: std::collections::HashSet::new(),
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
@@ -381,6 +630,7 @@ fn make_stats_task_with_plan(
         )),
         metrics: None,
         time_field: Some("event_time".into()),
+        timeout_scan_interval: Duration::from_secs(1),
         intermediate_targets: std::collections::HashSet::new(),
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
@@ -395,3 +645,25 @@ fn make_stats_task_with_plan(
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx, progress)
 }
+
+#[tokio::test]
+async fn stats_scan_timeouts_closes_tail_window() {
+    // 墙钟兜底（对齐 CEP scan_timeouts）: 数据跨度未达窗口边界时, 周期性扫描用
+    // wall elapsed 推进 watermark 关闭尾部窗口; 关闭后清空状态, 空窗口不得循环产出。
+    let (mut task, mut alert_rx, _progress) = make_stats_task();
+    // ts=9.999s: watermark 接近但未达 10s 边界 → 事件推进不 close
+    push_batch(&mut task, make_batch(&["10.0.0.1"], 9_999_000_000), 1).await;
+    assert!(alert_rx.try_recv().is_err(), "事件推进未到边界不应产出");
+
+    // 等待 20ms 后 scan → effective watermark 越过边界 → 关闭尾部窗口
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    task.scan_timeouts().await;
+    let alert = take_alert(&mut alert_rx);
+    assert_eq!(field_str(&alert, "detail"), "1 1 1", "尾部窗口产出");
+
+    // 再次 scan: 窗口已清空 → 无产出（不得每 tick 关闭空窗口循环 emit）
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    task.scan_timeouts().await;
+    assert!(alert_rx.try_recv().is_err(), "空窗口不得循环产出");
+}
+
