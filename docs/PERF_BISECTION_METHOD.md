@@ -5,6 +5,25 @@
 > 两者结合收敛最快。本方法沉淀自一次 NEXMark 吞吐回归定位（输出链 -38%、
 > 规则 -12%、注入供给三面墙），内容不依赖具体负载，可迁移到任何基准。
 
+## 0. 机制化：诊断模式
+
+> ✅ **已定稿**：本方法论已内建为引擎诊断模式机制，见
+> [`docs/design/perf-diag-mode-design.md`](design/perf-diag-mode-design.md)。
+> 诊断定位 = 声明式切换诊断点（不重启 daemon、不改代码、不手拼测量）：
+>
+> | 本文刀法 | 机制诊断点 | 载体 |
+> |---|---|---|
+> | ① 切输出 | `full` vs `rules` 档 | `[perf].cut_output` 原子门控 |
+> | ② 切规则 | `rules` vs `floor` 档 | `[perf].cut_rules` 原子门控（ack 保留） |
+> | 规则子集 | `family_*` 档 | `runtime.rules` hot reload |
+> | ④ 预算 | `budget:X` 档（唯一重启例外） | `parse_buffer_bytes` |
+| 计时 | `profiling=off` | `WF_RULE_PROFILING=0`（门控化） |
+| 完成信号 | 漂流瓶 sentinel `__perf_sentinel` | 内置窗口 emit 写 `perf_sentinel` 指标 |
+>
+> 驱动：`wfgen perf-diag --points ... --n-list ...`（逐点切 → 发帧+marker → 读指标
+> → 墙表）。本文以下各节的方法论细节（叠加式切除、CPU% 忙/等判别、裸环境测速、
+> 防坑清单）仍然适用，是诊断点落地时的操作手册。
+
 ## 1. 适用场景
 
 - 单查询 / 全量 EPS 不达标或相对历史基线回归
