@@ -32,6 +32,77 @@ use super::eval::{
 };
 use wf_lang::plan::{JoinPlan, RulePlan};
 
+/// Score 表达式形状（列式门控）：常量，或「常量 × 字段」（q1 的
+/// `score(0.908 * b.price)`）。常量×字段可在列式路径按行从 Arrow 列读 f64
+/// 乘常量——与解释求值 `ln * rn` 字节一致（IEEE f64 乘法交换，clamp 相同）。
+/// 其他形状（含 Add/Div、字段×字段）仍回退行式，保持两路径字节一致。
+enum ScoreShape<'a> {
+    Const(f64),
+    MulConst { const_v: f64, field: &'a FieldRef },
+}
+
+fn score_shape(expr: &Expr) -> Option<ScoreShape<'_>> {
+    match expr {
+        Expr::Number(n) => Some(ScoreShape::Const(*n)),
+        Expr::BinOp {
+            op: BinOp::Mul,
+            left,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Number(c), Expr::Field(fr)) | (Expr::Field(fr), Expr::Number(c)) => {
+                Some(ScoreShape::MulConst {
+                    const_v: *c,
+                    field: fr,
+                })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 列式执行时的 score 求值计划（`ScoreShape` 的拥有版本）。
+#[derive(Clone)]
+enum ScorePlan {
+    Const(f64),
+    MulConst { const_v: f64, field: FieldRef },
+}
+
+impl ScorePlan {
+    fn parse(expr: &Expr) -> Option<ScorePlan> {
+        match score_shape(expr)? {
+            ScoreShape::Const(n) => Some(ScorePlan::Const(n)),
+            ScoreShape::MulConst { const_v, field } => Some(ScorePlan::MulConst {
+                const_v,
+                field: field.clone(),
+            }),
+        }
+    }
+
+    fn field(&self) -> Option<&FieldRef> {
+        match self {
+            ScorePlan::Const(_) => None,
+            ScorePlan::MulConst { field, .. } => Some(field),
+        }
+    }
+
+    /// 按行求值：常量直接返回；常量×字段从 `score_idx` 列读 f64 乘常量。
+    /// 返回 None = 字段缺失/非数值（与解释路径 `eval_score` 的 Err 对应）。
+    fn eval(&self, event: &ColumnarEvent<'_>, score_idx: Option<usize>) -> Option<f64> {
+        match self {
+            ScorePlan::Const(n) => Some(n.clamp(0.0, 100.0)),
+            ScorePlan::MulConst { const_v, .. } => {
+                let idx = score_idx?;
+                let v = event.value_at(idx)?;
+                match v {
+                    Value::Number(n) => Some((n * const_v).clamp(0.0, 100.0)),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
 // L3 batched write (now unconditional): collect a segment's column values and
 // bulk-`extend` each builder column once at the end via
 // `commit_each_rows_batch`, instead of per-row `commit_each_row`. Cell staging
@@ -114,19 +185,19 @@ pub(crate) fn parse_each_join_columnar(
     let right_window = join.right_window.clone();
     // join 条件左字段的限定符必须是驱动别名或裸字段（checker 保证左字段来自
     // 驱动事件；此处防御——Qualified 其他窗名时列式无法从驱动列解析）。
-    if let FieldRef::Qualified(win, _) = &cond.left {
-        if win.as_str() != left_alias {
-            return None;
-        }
+    if let FieldRef::Qualified(win, _) = &cond.left
+        && win.as_str() != left_alias
+    {
+        return None;
     }
 
     // where：右窗限定字段 <cmp> 字面量 的合取（&&）。其他形状（左窗字段、
     // 函数、Simple 引用、`in` 列表）→ 不支持 → 回退行式。
     let mut where_preds = Vec::new();
-    if let Some(w) = &plan.r#where {
-        if !parse_where_preds(w, &right_window, &mut where_preds) {
-            return None;
-        }
+    if let Some(w) = &plan.r#where
+        && !parse_where_preds(w, &right_window, &mut where_preds)
+    {
+        return None;
     }
 
     // 输出字段来源：每个引用必须是 字面量 / 左窗限定 / 右窗限定。
@@ -608,9 +679,6 @@ impl RuleExecutor {
         }) {
             return false;
         }
-        if !matches!(self.plan.score_plan.expr, Expr::Number(_)) {
-            return false;
-        }
         // 无 join 时的字段形状（Simple/Qualified/Bracketed flat）；有 join 时
         // 输出字段来源已被 `parse_each_join_columnar` 校验（左窗/右窗限定）。
         let flat = |fr: &FieldRef| {
@@ -636,6 +704,19 @@ impl RuleExecutor {
                 }
             }
         };
+        // Score 形状：常量（原有）或「常量×flat 字段」（q1 `0.908*b.price`）。
+        // 有活 join 时仍只允许常量——join 列式富化路径的 score 未接右窗字段
+        // 读取，BinOp 一律回退行式，避免 columnar_join 的 unreachable。
+        let score_ok = match score_shape(&self.plan.score_plan.expr) {
+            Some(ScoreShape::Const(_)) => true,
+            Some(ScoreShape::MulConst { field, .. }) => {
+                self.live_joins.is_empty() && out_shape_ok(field)
+            }
+            None => false,
+        };
+        if !score_ok {
+            return false;
+        }
         match &self.plan.entity_plan.entity_id_expr {
             Expr::StringLit(_) => {}
             Expr::Field(fr) if out_shape_ok(fr) => {}
@@ -693,10 +774,11 @@ impl RuleExecutor {
         let origin = AlertOrigin::Event;
 
         // Plan-constant specialization — the safety gate guarantees these
-        // shapes (score const; entity StringLit or flat Field; yields Lit/Field).
-        let score_const = match &self.plan.score_plan.expr {
-            Expr::Number(n) => n.clamp(0.0, 100.0),
-            _ => unreachable!("columnar gate requires a constant score"),
+        // shapes (score const or const×field; entity StringLit or flat Field;
+        // yields Lit/Field).
+        let score_plan = match ScorePlan::parse(&self.plan.score_plan.expr) {
+            Some(p) => p,
+            None => unreachable!("columnar gate requires const or const×field score"),
         };
         let entity_const: Option<String> = match &self.plan.entity_plan.entity_id_expr {
             Expr::StringLit(s) => Some(s.clone()),
@@ -804,6 +886,11 @@ impl RuleExecutor {
             .iter()
             .map(|fr| resolve(fr.map(field_ref_name)))
             .collect();
+        // Score 列索引（常量×字段模式）：批级解析一次，行循环 value_at 读取。
+        let score_idx: Option<usize> = match score_plan.field() {
+            Some(fr) => resolve(Some(field_ref_name(fr))),
+            None => None,
+        };
         // Batch-level typed entity column (P2): ONE downcast per batch — all
         // rows share `batch0` (the caller builds every ColumnarEvent from one
         // batch; the index resolution above already relies on this), so the
@@ -857,7 +944,12 @@ impl RuleExecutor {
             } else {
                 None
             };
-            let score = score_const;
+            let Some(score) = score_plan.eval(event, score_idx) else {
+                // score 字段缺失/非数值——与解释路径 `eval_score` 的 Err 一致，
+                // 整行跳过。
+                stats.failed += 1;
+                continue;
+            };
             // For a field-entity (Q1: `entity(digit, b.auction)`), hold the read
             // `Value` so a yield field referencing the same column (id=b.auction)
             // reuses it instead of re-reading the column per row. `entity_f64`
@@ -1172,7 +1264,7 @@ impl RuleExecutor {
         let mut key_rows: HashMap<JoinKey, Vec<usize>> = HashMap::new();
         for (i, (ev, _)) in rows.iter().enumerate() {
             let val = left_idx.and_then(|idx| ev.value_at(idx));
-            match val.as_ref().and_then(|v| JoinKey::from_value(v)) {
+            match val.as_ref().and_then(JoinKey::from_value) {
                 Some(k) => {
                     key_rows.entry(k).or_default().push(i);
                     per_row_vals.push(val);

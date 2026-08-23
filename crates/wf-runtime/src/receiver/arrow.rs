@@ -23,6 +23,50 @@ use crate::receiver::schema::{
     validate_batch_schema_for_stream,
 };
 
+/// Decode a trusted `wp_arrow` IPC frame: `[4B tag_len BE][tag][Arrow IPC stream]`.
+///
+/// Same wire format as `wp_arrow::ipc::decode_ipc`, but skips arrow-rs's
+/// `ArrayData::validate_values` content validation (UTF-8 / offsets / null
+/// bitmap). Frames are produced locally by `wfgen gen-nexmark`/`dump-frames`,
+/// so the validation is pure overhead: on 30M bid events the string columns
+/// (channel/url/extra) add up to ~4.5GB of bytes that get fully re-scanned per
+/// frame (2026-08-23 measurement: `validate_utf8` is the decode hot spot and
+/// the single-connection ~2.3GB/s byte-rate wall). Structural safety is
+/// unchanged — offsets/lengths are still enforced by the decoder, only the
+/// redundant content re-validation is skipped.
+pub(crate) fn decode_ipc_trusted(
+    data: &[u8],
+) -> Result<(String, arrow::array::RecordBatch), arrow::error::ArrowError> {
+    use arrow::ipc::reader::StreamReader;
+
+    if data.len() < 4 {
+        return Err(arrow::error::ArrowError::IpcError(
+            "frame too short: {} bytes, minimum 4".to_string(),
+        ));
+    }
+    let tag_len = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
+    let tag_end = 4 + tag_len;
+    if data.len() < tag_end {
+        return Err(arrow::error::ArrowError::IpcError(format!(
+            "frame truncated: tag_len={tag_len} but only {} bytes remain after header",
+            data.len() - 4
+        )));
+    }
+    let tag = String::from_utf8(data[4..tag_end].to_vec())
+        .map_err(|e| arrow::error::ArrowError::IpcError(format!("invalid UTF-8 in tag: {e}")))?;
+    let ipc_payload = &data[tag_end..];
+    let reader = StreamReader::try_new(ipc_payload, None)?;
+    // SAFETY: `with_skip_validation` asserts the IPC payload needs no content
+    // re-validation; frames come from local `wfgen` producers (UTF-8/offsets
+    // guaranteed by the generator). Byte-identical output to the validating
+    // path for valid input — locked by the round-trip 对拍 test below.
+    let mut reader = unsafe { reader.with_skip_validation(true) };
+    let batch = reader.next().ok_or_else(|| {
+        arrow::error::ArrowError::IpcError("no RecordBatch in IPC payload".to_string())
+    })??;
+    Ok((tag, batch))
+}
+
 /// Replay framed `wp_arrow` IPC records from file and route them into the
 /// runtime.
 #[allow(clippy::too_many_arguments)]
@@ -69,12 +113,12 @@ pub(crate) async fn replay_arrow_framed_file(
                     break;
                 };
 
-                let frame = wp_arrow::ipc::decode_ipc(&payload)
+                let (tag, batch) = decode_ipc_trusted(&payload)
                     .source_raw_err(
                         RuntimeReason::data_error(),
                         format!("decode arrow frame from {}", path.display()),
                     )?;
-                let stream = stream_override.as_deref().unwrap_or(frame.tag.as_str());
+                let stream = stream_override.as_deref().unwrap_or(tag.as_str());
                 if stream_override.is_none()
                     && maybe_resolve_stream_schema(schemas, stream)?.is_none()
                 {
@@ -83,22 +127,22 @@ pub(crate) async fn replay_arrow_framed_file(
                         "file",
                         "wp_arrow_tag",
                         stream,
-                        frame.batch.num_rows(),
+                        batch.num_rows(),
                         metrics.as_ref(),
                         Some(router.as_ref()),
                     );
                     continue;
                 }
-                validate_batch_schema_for_stream(schemas, stream, frame.batch.schema().as_ref())?;
+                validate_batch_schema_for_stream(schemas, stream, batch.schema().as_ref())?;
 
-                total_rows += frame.batch.num_rows();
+                total_rows += batch.num_rows();
                 if !push_decoded_batch(
                     &parse_tx,
                     &preread,
                     &parse_seq,
                     source_name,
                     stream,
-                    frame.batch,
+                    batch,
                     router.as_ref(),
                     metrics.as_ref(),
                     limiter.as_deref(),
@@ -284,4 +328,108 @@ async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> io::Result<Opti
     let mut payload = vec![0u8; frame_len];
     reader.read_exact(&mut payload).await?;
     Ok(Some(payload))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn make_batch(num_rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let ids: Vec<i32> = (0..num_rows as i32).collect();
+        let names: Vec<Option<&str>> = (0..num_rows)
+            .map(|i| if i % 2 == 0 { Some("even") } else { None })
+            .collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn trusted_decode_matches_wp_arrow_roundtrip() {
+        // 对拍：trusted 解码结果与 wp_arrow 标准解码（含 validate）逐位一致。
+        let batch = make_batch(5);
+        let encoded = wp_arrow::ipc::encode_ipc("test-tag", &batch).unwrap();
+        let (tag, decoded) = decode_ipc_trusted(&encoded).unwrap();
+        assert_eq!(tag, "test-tag");
+        assert_eq!(decoded, batch);
+        let frame = wp_arrow::ipc::decode_ipc(&encoded).unwrap();
+        assert_eq!(frame.tag, tag);
+        assert_eq!(frame.batch, decoded);
+    }
+
+    #[test]
+    fn trusted_decode_handles_utf8_tag_and_empty_tag() {
+        let batch = make_batch(1);
+        for tag in ["", "数据标签-🚀", "auction_events"] {
+            let encoded = wp_arrow::ipc::encode_ipc(tag, &batch).unwrap();
+            let (got, decoded) = decode_ipc_trusted(&encoded).unwrap();
+            assert_eq!(got, tag);
+            assert_eq!(decoded, batch);
+        }
+    }
+
+    #[test]
+    fn trusted_decode_large_batch() {
+        let batch = make_batch(100_000);
+        let encoded = wp_arrow::ipc::encode_ipc("large", &batch).unwrap();
+        let (tag, decoded) = decode_ipc_trusted(&encoded).unwrap();
+        assert_eq!(tag, "large");
+        assert_eq!(decoded.num_rows(), 100_000);
+        assert_eq!(decoded, batch);
+    }
+
+    #[test]
+    fn trusted_decode_rejects_short_and_truncated_frames() {
+        assert!(decode_ipc_trusted(&[0u8; 2]).is_err());
+        let mut data = vec![0u8, 0, 0, 100]; // tag_len = 100 but no tag bytes
+        assert!(decode_ipc_trusted(&data).is_err());
+        data = vec![0u8, 0, 0, 1, b'x']; // tag ok, empty IPC payload
+        assert!(decode_ipc_trusted(&data).is_err());
+    }
+
+    /// 手动微基准：对真实帧（从 bench_30m_v5.frames 提取到 /tmp/frame.bin）
+    /// 对比 trusted（skip validate）与 wp_arrow 标准解码耗时。
+    #[test]
+    #[ignore = "manual: reads /tmp/frame.bin extracted from a real frames file"]
+    fn compare_decode_trusted_vs_wp_arrow_real_frame() {
+        use std::time::Instant;
+        let payload = std::fs::read("/tmp/frame.bin").unwrap();
+        let rows = wp_arrow::ipc::decode_ipc(&payload)
+            .unwrap()
+            .batch
+            .num_rows();
+        assert_eq!(decode_ipc_trusted(&payload).unwrap().1.num_rows(), rows);
+        for _ in 0..50 {
+            let _ = decode_ipc_trusted(&payload);
+        }
+        let t = Instant::now();
+        for _ in 0..500 {
+            let _ = decode_ipc_trusted(&payload);
+        }
+        let trusted = t.elapsed();
+        for _ in 0..50 {
+            let _ = wp_arrow::ipc::decode_ipc(&payload);
+        }
+        let t = Instant::now();
+        for _ in 0..500 {
+            let _ = wp_arrow::ipc::decode_ipc(&payload);
+        }
+        let wp = t.elapsed();
+        println!(
+            "rows={rows} trusted={trusted:?} wp_arrow={wp:?} speedup={:.2}x",
+            wp.as_secs_f64() / trusted.as_secs_f64()
+        );
+    }
 }

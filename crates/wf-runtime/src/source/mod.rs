@@ -146,14 +146,15 @@ impl DataSourceBatchSource {
                     .collect())
             }
             WireFormat::ArrowFramed => {
-                // Decode via wp_arrow to preserve the tag (stream name).
+                // Decode via trusted path to preserve the tag (stream name) and
+                // skip arrow-rs content re-validation (local wfgen frames).
                 let mut batches = Vec::new();
                 for event in &events {
                     let bytes = event.payload.as_bytes();
-                    match wp_arrow::ipc::decode_ipc(bytes) {
-                        Ok(frame) => {
-                            self.batch_tags.push_back(Some(frame.tag));
-                            batches.push(ensure_machine_id_column(frame.batch, &self.id));
+                    match crate::receiver::arrow::decode_ipc_trusted(bytes) {
+                        Ok((tag, batch)) => {
+                            self.batch_tags.push_back(Some(tag));
+                            batches.push(ensure_machine_id_column(batch, &self.id));
                         }
                         Err(e) => {
                             return Err(SourceReason::Decode.err_detail(e.to_string()));

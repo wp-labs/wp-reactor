@@ -2246,6 +2246,84 @@ fn each_plan_columnar_safe_gate_branches() {
     };
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
 
+    // BinOp score: 常量×字段（q1 `0.908 * b.price` 形态）→ safe（无 join）。
+    let mut plan = base();
+    plan.score_plan = ScorePlan {
+        expr: Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Number(0.908)),
+            right: Box::new(Expr::Field(FieldRef::Qualified(
+                "e".into(),
+                "sip".into(),
+            ))),
+        },
+    };
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // 字段×常量 → safe（顺序无关）。
+    let mut plan = base();
+    plan.score_plan = ScorePlan {
+        expr: Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Field(FieldRef::Qualified(
+                "e".into(),
+                "sip".into(),
+            ))),
+            right: Box::new(Expr::Number(0.908)),
+        },
+    };
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // 其他 BinOp（Add）→ false。
+    let mut plan = base();
+    plan.score_plan = ScorePlan {
+        expr: Expr::BinOp {
+            op: BinOp::Add,
+            left: Box::new(Expr::Number(0.5)),
+            right: Box::new(Expr::Field(FieldRef::Qualified(
+                "e".into(),
+                "sip".into(),
+            ))),
+        },
+    };
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // 字段×字段 → false。
+    let mut plan = base();
+    plan.score_plan = ScorePlan {
+        expr: Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Field(FieldRef::Qualified(
+                "e".into(),
+                "sip".into(),
+            ))),
+            right: Box::new(Expr::Field(FieldRef::Simple("sip".into()))),
+        },
+    };
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // 常量×字段 + 活 join → false（join 列式路径 score 仅允许常量）。
+    let mut plan = base();
+    plan.score_plan = ScorePlan {
+        expr: Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Number(0.908)),
+            right: Box::new(Expr::Field(FieldRef::Qualified(
+                "e".into(),
+                "sip".into(),
+            ))),
+        },
+    };
+    plan.joins = vec![JoinPlan {
+        right_window: "w".into(),
+        mode: JoinMode::Inner,
+        conds: vec![],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    }];
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+
     // Entity = Path field / general expr → false.
     let mut plan = base();
     plan.entity_plan.entity_id_expr = Expr::Field(FieldRef::Path {
@@ -2699,6 +2777,159 @@ fn columnar_each_entity_lanes_and_failure_paths() {
     let stats = exec.execute_each_direct_batch_columnar(&rows, 0, &mut builder, &mut appended);
     assert_eq!(stats.failed, 3);
     assert_eq!(stats.appended, 0);
+}
+
+#[test]
+fn columnar_each_binop_score_matches_row_path() {
+    // q1 形态：score(0.908 * e.price)、entity=e.id、yield 常量 + id 字段。
+    // 对拍：行式（Event 物化 + eval_score 解释求值）vs 列式（ColumnarEvent
+    // 零物化 + 列读 f64 × 常量）输出字节一致，且 score = clamp(0.908 × price)。
+    use wp_model_core::model::Value as ModelValue;
+
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("id", DataType::Int64, true),
+        ArrowField::new("price", DataType::Float64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![Some(1.5), Some(2.5), Some(100.0)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let mut plan = simple_rule_plan(
+        "q1_binop_score",
+        simple_plan(vec![], vec![]),
+        Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Number(0.908)),
+            right: Box::new(Expr::Field(FieldRef::Qualified(
+                "e".into(),
+                "price".into(),
+            ))),
+        },
+        "digit",
+        Expr::Field(FieldRef::Qualified("e".into(), "id".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "alert_type".into(),
+            value: Expr::StringLit("q1_passthrough".into()),
+        },
+        YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("e".into(), "id".into())),
+        },
+    ];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("id".into(), FieldType::Base(BaseType::Float))]),
+    );
+    assert!(exec.each_plan_columnar_safe());
+
+    let t = 1_700_000_000_000_000_000i64;
+
+    // 行式路径（Event 物化 + eval_score 解释求值）。
+    let events = crate::match_engine::event_bridge::batch_to_events(&batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr = exec.execute_each_direct_batch(
+        &row_refs,
+        &EmptyLookup,
+        &[],
+        0,
+        &mut b_row,
+        &mut app_row,
+    );
+    assert_eq!(sr.appended, 3);
+    let out_row: Vec<_> = b_row.finish().iter_data_records().map(|r| r.unwrap()).collect();
+
+    // 列式路径（ColumnarEvent 零物化 + 列读 f64）。
+    let col_events: Vec<ColumnarEvent> = (0..3).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc =
+        exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+    assert_eq!(sc.appended, 3);
+    assert_eq!(sc.failed, 0);
+    let out_col: Vec<_> = b_col.finish().iter_data_records().map(|r| r.unwrap()).collect();
+
+    // 对拍：两路径逐字段一致；score = clamp(0.908 × price)。
+    assert_eq!(out_row, out_col);
+    let scores: Vec<f64> = out_col
+        .iter()
+        .map(|r| {
+            r.fields()
+                .find(|f| f.get_name() == wf_lang::wfu_meta::WFU_SCORE)
+                .and_then(|f| match f.get_value() {
+                    ModelValue::Float(v) => Some(*v),
+                    _ => None,
+                })
+                .expect("score field present")
+        })
+        .collect();
+    assert_eq!(scores, vec![0.908 * 1.5, 0.908 * 2.5, 0.908 * 100.0]);
+}
+
+#[test]
+fn columnar_each_binop_score_null_field_fails_row() {
+    // 常量×字段的 score 字段为 null → 整行 failed（与解释路径 eval_score 的
+    // None → Err 一致），其余行正常 appended。
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("id", DataType::Int64, true),
+        ArrowField::new("price", DataType::Float64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![Some(1.5), None, Some(3.0)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let mut plan = simple_rule_plan(
+        "null_score",
+        simple_plan(vec![], vec![]),
+        Expr::BinOp {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Number(0.5)),
+            right: Box::new(Expr::Field(FieldRef::Qualified(
+                "e".into(),
+                "price".into(),
+            ))),
+        },
+        "digit",
+        Expr::Field(FieldRef::Qualified("e".into(), "id".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    let exec = RuleExecutor::new(plan);
+    assert!(exec.each_plan_columnar_safe());
+
+    let col_events: Vec<ColumnarEvent> = (0..3).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events
+        .iter()
+        .map(|ev| (ev, 1_700_000_000_000_000_000))
+        .collect();
+    let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended = Vec::new();
+    let stats = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut builder, &mut appended);
+    assert_eq!(stats.appended, 2);
+    assert_eq!(stats.failed, 1);
+    assert_eq!(appended, vec![0, 2]);
 }
 
 // ---------------------------------------------------------------------------
