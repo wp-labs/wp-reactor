@@ -34,7 +34,7 @@
 | Q3 | match+join+where | 18.9M | 1.3GB | 4.1× | |
 | Q4 | join-then-key+close avg | 3.09M | 7.3GB | 5.4× | 批级 join-then-key 后 2.66M→3.09M（+16%，A/B 同负载） |
 | Q5 | fixed 10s+conv top | 4.3M | 3.0GB | 15.3× | |
-| Q6 | join-then-key 滑动 avg | **0.55M** | 7.6GB | — | 26M EMIT 每事件 emit 路径（CPU ~106% 单核）；F8 后 0.50→0.55M（分配削减） |
+| Q6 | join-then-key 滑动 avg | **0.55M** | 7.6GB | —（无对标） | 26M EMIT 每事件 emit 路径（CPU ~106% 单核）；F7-F9 后 0.50→0.55M；官方未落地（无 Flink 测试数据），不再投入（§8.4） |
 | Q7 | fixed 10s max+conv top | **1.2M** | 4.4GB | 4.1× | 全表最低绝对 EPS |
 | Q8 | deferred exists | 21.1M | 1.3GB | 6.3× | |
 | Q9 | deferred reduce | 13.2M | 2.8GB | 35.2× | |
@@ -365,10 +365,14 @@ N=500k，同进程行式/列式对拍 + 输出逐位断言）**：
   match/close 输出时的 `execute_match_with_joins` 富化仍行式，待专项。
 - **q11/q18/q19 的 RSS**：均为同类积压/状态结构问题，待逐项归因。
 - **q22 split（A1）**：on-each 家族最高单事件成本，见 §7 遗留。
-- **match advance 列式化（q6 剩余瓶颈）**：CEP 状态机本体（InstanceKey 构建 +
+- **match advance 列式化（q6 剩余瓶颈）**：~~CEP 状态机本体（InstanceKey 构建 +
   HashMap 实例管理 + 逐事件 step 推进 + Matched 构造 ~790ns/evt）批级化需专用
-  执行路径（如 stats 列式聚合），或 q6 类「条件统计」规则改走 stats 执行器——
-  结构性决策，见 §8.8。
+  执行路径~~ **决策（2026-08-23）：Q6 不再投入**——官方 q6.sql 未落地（OVER
+  WINDOW 不支持 retractions）、无 Flink 测试数据、VVR 未发布，无对拍锚点；
+  stats 语义也不适用（行数 last-N vs 时间窗口、流式 vs 收口、join 键缺失三重
+  不匹配）。Q6 保持 CEP 形态作为 join-then-key 形态代表，性能表 vs VVR 列为
+  「无对标」，不参与对比。stats sliding + join 键留作引擎能力规划（有真实
+  last-N 需求再做）。
 
 ### 8.5 批级 join-then-key（F7，2026-08-23）
 
