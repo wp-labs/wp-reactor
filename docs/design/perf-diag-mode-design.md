@@ -26,9 +26,10 @@
 ### 1.2 目标
 
 - 性能退化定位成为引擎**内置能力**：诊断模式 + 声明式诊断点，一次实现、长期复用。
-- 定位过程**不重启 daemon**：诊断点之间靠热切换（原子门控 + 已有规则 reload）。
+- 定位过程**不重启 daemon**：诊断点之间靠 sentinel 驱动自切换（原子门控 +
+  已有规则 reload）。
 - **完成信号内嵌数据流**（漂流瓶 sentinel）：精确、跨诊断点一致，不再依赖
-  metrics 轮询粒度。
+  metrics 轮询粒度；完成信号同时是下一诊断点的切换触发器。
 - 测量协议固化进机制，杜绝测量假象类回归。
 
 ### 1.3 非目标 / 设计约束
@@ -48,7 +49,7 @@
 ┌─ wfgen（驱动方）────────────────────────────────────────────┐
 │  perf-diag 子命令（编译工具，非脚本）                        │
 │  for 诊断点 k in [floor, rules, full, c_*, g_*, ...]:       │
-│    ① 切点：POST /admin/v1/perf/point {point=k}              │
+│    ① 若 k>0：轮询 perf_point{current=k} 确认引擎已切到 k    │
 │    ② 发帧 batch_k；帧尾追加自描述 sentinel：               │
 │       {round=k, n=N_k, start_ns=T0}    ← 发送量+开始时间入载荷 │
 │    ③ 读 metrics: perf_sentinel{…, emit_ns}                  │
@@ -56,12 +57,13 @@
 │  输出墙表（每档 EPS + 增量成本 + 墙判定）                    │
 └────────────────────────────────────────────────────────────┘
 ┌─ wfusion daemon（一次启动，不重启）─────────────────────────┐
-│  [perf] 诊断模式：禁止型门控（原子，热切）                   │
-│    cut_rules / cut_output                                   │
-│  runtime.rules hot-reload：规则子集切换（已有能力）          │
+│  进入：--perf-diag conf/perf-diag.toml（启动参数，生产不带） │
+│  诊断点状态机（sentinel 驱动自切换，零外部控制面）：         │
+│    sentinel(round=k) emit ─▶ 应用点 k+1（门控翻转+规则reload）│
+│    ─▶ 写 perf_point{current=k+1}（切换完成信号）            │
 │  内置 __perf_sentinel 窗口 + 哨兵规则（豁免所有门控，活跃）  │
-│    sentinel emit 时写 perf_sentinel{round,n,start_ns,emit_ns}│
-│    四元组齐备 → EPS = n/(emit_ns−start_ns) 直接可算          │
+│    emit 写 perf_sentinel{round,n,start_ns,emit_ns}（四元组）  │
+│  runtime.rules hot-reload：规则子集切换（已有能力）          │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -93,19 +95,39 @@
 
 ## 4. 引擎改动
 
-### 4.1 `[perf]` 配置段（wf-config）
+### 4.1 诊断模式进入与配置（启动参数 + 独立文件）
 
-```toml
-[perf]
-diag = false        # 诊断模式：启用内置 __perf_sentinel 窗口（生产默认关）
-cut_rules = false   # 禁止规则求值（process_batch 直通，ack 保留）
-cut_output = false  # 禁止输出链（emit 不 serialize/stage/commit）
+诊断模式由**启动参数**进入，生产启动不带参数即完全关闭（`wfusion.toml` 零污染）：
+
+```
+wfusion daemon --perf-diag conf/perf-diag.toml
 ```
 
-- `PerfConfig` 全字段 `#[serde(default)]`，`FusionConfigRaw` / `FusionConfig` 各增
-  `perf` 字段。
+`conf/perf-diag.toml`（独立配置文件，bench 各自一份）：
+
+```toml
+diag = true          # 诊断模式：注册内置 __perf_sentinel 窗口
+cut_rules = false    # 初始门控：禁止规则求值（process_batch 直通，ack 保留）
+cut_output = false   # 初始门控：禁止输出链（emit 不 serialize/stage/commit）
+
+# 诊断点列表（sentinel 驱动依次应用；缺省/空 = 单点模式）
+[[points]]
+name = "floor"
+cut_rules = true
+cut_output = true
+rules = ""           # 空 = 保持当前规则；否则规则文件路径（触发热 reload）
+
+[[points]]
+name = "rules"
+cut_rules = false
+cut_output = true
+```
+
+- `PerfConfig`（wf-config）：`diag` / `cut_rules` / `cut_output` /
+  `points: Vec<PerfPoint{name, cut_rules, cut_output, rules}>`，全字段
+  `#[serde(default)]`；由 `--perf-diag` 参数加载，**不进 `wfusion.toml`**。
 - `cut_rules` / `cut_output` / `profiling`（复用 `WF_RULE_PROFILING`）均为**原子
-  门控**，经 §4.4 端点热切，不进 reload diff（避免污染规则 reload 语义）。
+  门控**，由诊断点状态机（§4.4）翻转，不进 reload diff。
 
 ### 4.2 门控切口（wf-runtime）
 
@@ -116,7 +138,7 @@ cut_output = false  # 禁止输出链（emit 不 serialize/stage/commit）
   之前 return——跳过 serialize/stage/commit/fanout，**emitted 计数保留**（#18 类
   门禁仍可跑）。
 - 门控形态：`set_rule_profiling` 同款全局原子 + `pub fn set_perf_cuts(...)`，
-  `Reactor::start` 时从 `config.perf` 初始化。
+  `Reactor::start` 时从 `--perf-diag` 加载的 `PerfConfig` 初始化（无参数 = 全关）。
 
 ### 4.3 内置 `__perf_sentinel` 窗口 + 哨兵规则（漂流瓶）
 
@@ -138,13 +160,23 @@ cut_output = false  # 禁止输出链（emit 不 serialize/stage/commit）
   sentinel 窗排水；绝对时间可能略早于"最慢数据窗口"的规则消化完，但**增量
   T1(k) − T1(k−1) 不受影响**，墙的归属判定不变。
 
-### 4.4 热切通道（admin API）
+### 4.4 诊断点状态机（sentinel 驱动自切换，无外部控制面）
 
-- 新增轻量端点 `POST /admin/v1/perf/point {point: "<floor|rules|full|family:...>"}`
-  （复用 admin HTTP + bearer token 基础设施）。
-- 语义：daemon 侧把端点参数映射为门控组合（cut_rules/cut_output 原子翻转）或
-  `runtime.rules` 子集热 reload（已有 HotReloadSupported）。进程内自转，零重启。
-- 不复用 `POST /admin/v1/reloads/model`（project-remote 版本化 reload，重机制）。
+- **切换触发器 = sentinel emit**：哨兵规则 emit（round=k）时向 Reactor 层诊断
+  控制器投递"点 k 完成"，控制器同步应用点 k+1：
+  1. 原子门控翻转（`cut_rules` / `cut_output`）；
+  2. 规则子集变化（`points[k+1].rules` 非空且不同）→ 触发已有 `runtime.rules`
+     热 reload（HotReloadSupported）；
+  3. 写 `perf_point{current=k+1}` 指标——**切换完成信号**（含 reload 完成）。
+- **同步性**：切换与 sentinel emit 同路径完成；wfgen 读到 `perf_sentinel{k}`
+  时点 k+1 已生效——无竞态。
+- **在途批次不受影响**：门控在 `process_batch` 入口检查，round k 的在途尾巴在旧
+  门控下自然跑完；round k+1 新数据吃新门控（delta 口径，跨点不串扰）。
+- **零新增控制面**：无 admin 端点 / HTTP / 外部切换指令——只有"发数据"与"读
+  指标"。不复用 `POST /admin/v1/reloads/model`（project-remote 版本化 reload，
+  重机制；规则子集切换走既有 `runtime.rules` 热 reload 通道）。
+- **切换完成语义**：`perf_point{current=k+1}` 只在门控已翻 + 规则 reload 已生效
+  后写出（reload 经 Reactor 现有 control_handle，异步完成后补写）。
 
 ### 4.5 metrics 协议（防假象，固化）
 
@@ -159,15 +191,18 @@ cut_output = false  # 禁止输出链（emit 不 serialize/stage/commit）
 ```
 wfgen perf-diag \
   --frames <file>                       # 预编码帧（数据部分）
+  --diag conf/perf-diag.toml            # 诊断配置（与 daemon 同一份；点列表=轮数）
   --addr 127.0.0.1:9800                 # TCP 数据端口
-  --admin 127.0.0.1:<admin_port>        # admin API 端口
   --n <N> | --n-list "100k,1m,3m"       # 数据量（单档或递增多档）
-  --points "floor,rules,full,c_*,g_*"   # 诊断点列表（默认墙梯）
   --rounds 2                            # 每点轮数（取 max，降负载噪声）
 ```
 
+- 诊断点列表的唯一来源是 `--diag` 指向的 `perf-diag.toml`（daemon 与 wfgen 读同一
+  份）；wfgen 按点数发送轮次，不另设 `--points`。
+
 - **循环**（每点 k，每轮）：
-  1. `POST /admin/v1/perf/point {point=k}` → 轮询 admin status 确认切换完成；
+  1. 若 k>0：轮询 metrics 直到 `perf_point{current=k}`——引擎已完成点 k 的切换
+     （门控翻转 + 规则 reload 生效），随后发送无竞态；
   2. 统计本批发送量 `n_k`（帧行数合计）；`T0 = now()`；`send-arrow` 发数据帧，
      帧尾追加 `__perf_sentinel{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq
      尾部，保证最后处理）；
@@ -185,9 +220,11 @@ wfgen perf-diag \
 
 ## 6. 定位流程（使用手册）
 
-1. **复现**：`wfgen perf-diag --n-list "1m,3m" --points full` 拿当前全量 EPS；
-2. **墙梯**：默认 `--points "floor,rules,full"` —— 规则墙 vs 输出墙在哪；
-3. **家族**：`--points "c_*,g_*,pr_*,..."`（规则子集热切）—— 哪类规则退化明显；
+1. **复现**：`perf-diag.toml` 只含 `full` 一个点，`wfgen perf-diag --n-list "1m,3m"`
+   拿当前全量 EPS；
+2. **墙梯**：`perf-diag.toml` 配 `floor → rules → full` 三点 —— 规则墙 vs 输出墙
+   在哪；
+3. **家族**：`points` 配 `c_*,g_*,pr_*,...` 子集点（规则热切）—— 哪类规则退化明显；
 4. **预算**：`budget:X` 档（唯一重启例外）—— preread 预算槽位是否墙；
 5. **热点**：墙段内用采样/微基准（PERF_BISECTION_METHOD §5）收敛到函数。
 
@@ -199,6 +236,7 @@ wfgen perf-diag \
 |---|---|---|
 | sentinel 队列 | 独立 `__perf_sentinel` 窗口（①a） | 绝对时间可能略早于最慢数据窗；相对增量不受影响 |
 | sentinel 载荷 | 自描述 `{round, n, start_ns}` | 发送量+开始时间入 sentinel；引擎补 `emit_ns` → EPS 四元组直接可算 |
+| 切换机制 | sentinel 驱动自切换 | 同步无竞态、零控制面；在途批次不受影响 |
 | 时钟 | 同机基准，wfgen `start_ns` 与引擎 `emit_ns` 同机时钟 | 跨机需 NTP 或引擎回写差值（未做） |
 | sink 热切 | 不做（RequiresRestart） | 输出墙用 cut_output 开关代替，无需动 sinks |
 | budget 热切 | 不做（RequiresRestart） | 预算档作为唯一重启例外 |
@@ -213,7 +251,8 @@ wfgen perf-diag \
 2. wf-runtime：`set_perf_cuts` 原子门控 + `process_batch`/`emit` 切口 + 测试；
 3. wf-runtime：内置 `__perf_sentinel` 窗口/规则 + `perf_sentinel` 指标（`diag=true`
    时注册）+ 豁免门控测试；
-4. wf-runtime：`POST /admin/v1/perf/point` 端点（门控翻转 + 规则子集热切映射）；
+4. wf-runtime：诊断点状态机——sentinel emit → 门控翻转 + 规则子集 reload 触发 +
+   `perf_point` 切换完成信号（无 admin 端点）；
 5. wf-config：`report_interval` 默认 100ms；
 6. wfgen：`perf-diag` 子命令（切点 → 发帧+sentinel → 读指标 → 墙表）；
 7. 文档：`PERF_BISECTION_METHOD.md` 挂接本机制（§6 定位流程即机制用法）。
