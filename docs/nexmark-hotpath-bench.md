@@ -229,12 +229,22 @@ fire + match/close 输出路径的 ctx 构建（Q3/Q4/Q5/Q6/Q7/Q12/Q13/Q20）。
 | `checker/tests/coverage_r4.rs` | mvcount/mvdedup/mvsort 参数数用例改为 0 参（原用例参数数正确不报错） |
 | `wf-runtime` 7 处 | window_batch 列长对齐；pipe_ts 列可空；bootstrap over_cap 去重段；spawn file stream_tag + default fallback sink；receiver 错误断言改 Debug 视图（source 链） |
 
+### ✅ F4 — fire 路径跳过 `event.to_event()` 全量 clone（Q5/Q7/Q12/Q13）
+
+实测 q5/q12/q13 等每事件命中 fire 的规则，fire 路径每事件 `event.to_event()`
+全量 clone 触发事件（HashMap 8 字段 + Value clone）是热成本。修复：
+- `MatchPlan` 新增 `trigger_event_needed: bool`（编译器 `compute_trigger_event_needed`
+  计算：score/entity/yield + join 条件左字段 + where 是否只读 match keys）；
+- 3 处 fire 路径（Seq/Any/Any+close）按标志跳过 clone（trigger_event=None）；
+- key 字段由 `build_eval_context` 从 scope_key 提供，输出不受影响（回归测试
+  `fire_skips_trigger_event_when_key_only_yield` / `fire_keeps_trigger_event_when_non_key_yield`；
+  编译器测试 `key_only_yield_skips_trigger_event` / `non_key_yield_needs_trigger_event` /
+  `join_left_field_non_key_needs_trigger_event`）。
+实测（nexmark_hotpath_bench，机器负载波动）：q5 **-42%**（640→370）、q13 advance
+**-38%**（985→611）、q12 **-22%**（762→592）、q11 **-19%**（756→615）。
+
 ### 🔍 已审查、暂不改（需实测数据或改动面大）
 
-- **trigger_event 每事件 clone**（mod.rs fire 路径 `event.to_event()`）：Q5/Q7/
-  Q12/Q13 等每事件命中 fire 的规则每事件全量 clone 触发事件。修复需在
-  MatchPlan 增加「trigger 是否读非 key 字段」标志（编译器计算）+ 所有构造点
-  更新，改动面大——F3 已缓解（注入窄化），剩余 clone 成本待实测占比确认。
 - **Q22 split**：`Vec<Value>` 分配为语言语义固有成本，`let parts` 绑定已避免
   重复 split，无静态改进空间。
 - **Q13/Q11/Q18 RSS**：需运行确认是状态物化还是管道积压（q22 的 RSS 已实证

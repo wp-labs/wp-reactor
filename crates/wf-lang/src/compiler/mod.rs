@@ -105,6 +105,7 @@ fn empty_match_plan() -> MatchPlan {
         seq: None,
         accu: false,
         needs_field_history: false,
+        trigger_event_needed: false,
     }
 }
 
@@ -255,6 +256,14 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
         &score_plan.expr,
         &entity_plan.entity_id_expr,
         &yield_plan.fields,
+    );
+    match_plan.trigger_event_needed = compute_trigger_event_needed(
+        &match_plan,
+        &score_plan.expr,
+        &entity_plan.entity_id_expr,
+        &yield_plan.fields,
+        &joins,
+        rule.r#where.as_ref(),
     );
 
     let conv_plan = compile_conv(&rule.conv);
@@ -579,6 +588,7 @@ fn compile_match(
         tracked_plain_fields: HashSet::new(),
         accu: mc.accu,
         needs_field_history: false, // set by the caller after binds/joins/yield are known
+        trigger_event_needed: false, // set by the caller (compute_trigger_event_needed)
     }
 }
 
@@ -945,6 +955,49 @@ fn close_path_reads_non_key_fields(
     crate::field_usage::collect_expr_fields(entity_expr, &mut refs);
     for f in yield_fields {
         crate::field_usage::collect_expr_fields(&f.value, &mut refs);
+    }
+    refs.into_iter()
+        .any(|name| name.is_empty() || name.starts_with('_') || !key_names.contains(name.as_str()))
+}
+
+/// Whether on-event fires need the triggering event materialized
+/// (`MatchedContext.trigger_event`).
+///
+/// `build_eval_context` serves match keys from `scope_key` (with precedence over
+/// the history / trigger event), so an on-event fire needs the trigger event
+/// only when score/entity/yield, a join condition **left field**
+/// (`first_join_key` reads it from the ctx — missing ⇒ join miss ⇒ all skips,
+/// the F3 lesson), or the post-join `where` reads a field that is not one of
+/// the match keys. When false, the fire path skips `event.to_event()` — a
+/// per-event full HashMap clone on every-event-fire rules (Q5/Q7/Q12/Q13,
+/// 2026-08 nexmark hotpath bench: match+join emit 1690 → 1553 ns/evt after the
+/// F3 ctx-narrowing; the clone remains and is this field's target).
+fn compute_trigger_event_needed(
+    match_plan: &MatchPlan,
+    score_expr: &Expr,
+    entity_expr: &Expr,
+    yield_fields: &[YieldField],
+    joins: &[JoinPlan],
+    r#where: Option<&Expr>,
+) -> bool {
+    let key_names: HashSet<&str> = match_plan
+        .keys
+        .iter()
+        .map(crate::field_usage::field_ref_name)
+        .collect();
+    let mut refs = HashSet::new();
+    crate::field_usage::collect_expr_fields(score_expr, &mut refs);
+    crate::field_usage::collect_expr_fields(entity_expr, &mut refs);
+    for f in yield_fields {
+        crate::field_usage::collect_expr_fields(&f.value, &mut refs);
+    }
+    for join in joins {
+        for cond in &join.conds {
+            crate::field_usage::collect_expr_fields(&Expr::Field(cond.left.clone()), &mut refs);
+        }
+    }
+    if let Some(w) = r#where {
+        crate::field_usage::collect_expr_fields(w, &mut refs);
     }
     refs.into_iter()
         .any(|name| name.is_empty() || name.starts_with('_') || !key_names.contains(name.as_str()))

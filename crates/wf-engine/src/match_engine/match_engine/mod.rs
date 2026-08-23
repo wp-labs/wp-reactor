@@ -754,7 +754,15 @@ impl CepStateMachine {
                     window_start_time_nanos: instance.created_at,
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
-                    trigger_event: Some(std::sync::Arc::new(event.to_event())),
+                    // trigger_event 只在 score/entity/yield + join 左字段 + where
+                    // 引用非 key 字段时需要（编译器 compute_trigger_event_needed）。
+                    // 不需要时跳过 per-fire `event.to_event()` 全量 clone——
+                    // Q5/Q7/Q12/Q13 每事件命中 fire 的热路径（2026-08）。
+                    trigger_event: if plan.trigger_event_needed {
+                        Some(std::sync::Arc::new(event.to_event()))
+                    } else {
+                        None
+                    },
                 };
                 if plan.accu {
                     // `on event<accu>` — keep accumulating across fires.
@@ -959,7 +967,15 @@ impl CepStateMachine {
                     window_start_time_nanos: instance.created_at,
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
-                    trigger_event: Some(std::sync::Arc::new(event.to_event())),
+                    // trigger_event 只在 score/entity/yield + join 左字段 + where
+                    // 引用非 key 字段时需要（编译器 compute_trigger_event_needed）。
+                    // 不需要时跳过 per-fire `event.to_event()` 全量 clone——
+                    // Q5/Q7/Q12/Q13 每事件命中 fire 的热路径（2026-08）。
+                    trigger_event: if plan.trigger_event_needed {
+                        Some(std::sync::Arc::new(event.to_event()))
+                    } else {
+                        None
+                    },
                 };
                 if plan.accu {
                     // `on event<accu>` — keep accumulating across fires.
@@ -1012,7 +1028,15 @@ impl CepStateMachine {
                     window_start_time_nanos: instance.created_at,
                     window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
                     machine_id: instance.machine_id.clone(),
-                    trigger_event: Some(std::sync::Arc::new(event.to_event())),
+                    // trigger_event 只在 score/entity/yield + join 左字段 + where
+                    // 引用非 key 字段时需要（编译器 compute_trigger_event_needed）。
+                    // 不需要时跳过 per-fire `event.to_event()` 全量 clone——
+                    // Q5/Q7/Q12/Q13 每事件命中 fire 的热路径（2026-08）。
+                    trigger_event: if plan.trigger_event_needed {
+                        Some(std::sync::Arc::new(event.to_event()))
+                    } else {
+                        None
+                    },
                 };
                 StepResult::Matched(ctx)
             } else {

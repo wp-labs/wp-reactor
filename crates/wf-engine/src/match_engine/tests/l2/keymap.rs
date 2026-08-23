@@ -39,6 +39,7 @@ fn key_map_extracts_from_alias_field() {
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: false,
+        trigger_event_needed: false,
     };
 
     let mut sm = CepStateMachine::new("rule_km".to_string(), plan, None);

@@ -230,6 +230,7 @@ fn q15_plan() -> MatchPlan {
         },
         tracked_plain_fields: HashSet::new(),
         needs_field_history: false,
+        trigger_event_needed: false,
     }
 }
 

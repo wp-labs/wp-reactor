@@ -298,6 +298,7 @@ fn q4_q6_plan(fixed: bool) -> MatchPlan {
         match_mode: MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     }
 }
 
@@ -351,6 +352,7 @@ fn q5_q7_plan(max_measure: bool) -> MatchPlan {
         match_mode: MatchMode::Seq,
         accu: false,
         needs_field_history: max_measure,
+        trigger_event_needed: false,
     }
 }
 
@@ -395,6 +397,7 @@ fn q11_q12_plan(session: bool) -> MatchPlan {
         match_mode: MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     }
 }
 
@@ -425,6 +428,7 @@ fn q13_rule() -> RulePlan {
             match_mode: MatchMode::Seq,
             accu: false,
             needs_field_history: false,
+            trigger_event_needed: false,
         },
         Expr::Number(10.0),
         "digit",
@@ -618,6 +622,7 @@ fn q16_plan() -> MatchPlan {
         match_mode: MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     }
 }
 
@@ -683,6 +688,7 @@ fn q17_plan() -> MatchPlan {
         match_mode: MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     }
 }
 
@@ -729,6 +735,7 @@ fn q18_plan() -> MatchPlan {
         match_mode: MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     }
 }
 

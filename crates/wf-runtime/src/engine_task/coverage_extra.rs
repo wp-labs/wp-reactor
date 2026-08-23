@@ -174,6 +174,7 @@ fn bare_plan() -> wf_lang::plan::RulePlan {
             tracked_bind_fields: std::collections::HashMap::new(),
             tracked_plain_fields: std::collections::HashSet::new(),
             needs_field_history: false,
+            trigger_event_needed: false,
         },
         each_plan: None,
         stats_plan: None,

@@ -29,8 +29,8 @@ use wf_lang::{BaseType, FieldType};
 use crate::alert::AlertColumnBuilder;
 use crate::match_engine::event_bridge::ColumnarEvent;
 use crate::match_engine::match_engine::{
-    AsofLookup, BindData, CloseOutput, CloseReason, EngineHashMap, Event, MatchedContext, StepData,
-    Value, WindowLookup,
+    AsofLookup, BindData, CepStateMachine, CloseOutput, CloseReason, EngineHashMap, Event,
+    MatchedContext, StepData, StepResult, Value, WindowLookup,
 };
 use crate::match_engine::{JoinRow, RuleExecutor};
 
@@ -105,6 +105,7 @@ fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
         match_mode: MatchMode::Seq,
         accu: false,
         needs_field_history: false,
+        trigger_event_needed: false,
     }
 }
 
@@ -128,6 +129,7 @@ fn plan_with_close(
         match_mode: MatchMode::Seq,
         accu: false,
         needs_field_history: false,
+        trigger_event_needed: false,
     }
 }
 
@@ -3637,4 +3639,93 @@ fn execute_match_general_yield_with_meta_vars() {
     assert_eq!(get("rule"), str_val("r1"));
     assert_eq!(get("score"), num(70.0));
     assert_eq!(get("scored"), num(140.0));
+}
+
+// ---------------------------------------------------------------------------
+// trigger_event_needed — fire 路径是否物化触发事件（2026-08 hotpath）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fire_skips_trigger_event_when_key_only_yield() {
+    // Q5/Q7/Q12/Q13 形状：score/entity/yield 只读 key 字段 → 编译器
+    // `trigger_event_needed=false` → fire 的 MatchedContext.trigger_event 为 None
+    // （跳过 per-fire `event.to_event()` 全量 clone）。key 字段由
+    // build_eval_context 从 scope_key 提供，输出不受影响。
+    let mut plan = simple_rule_plan(
+        "r",
+        simple_plan(
+            vec![simple_key("sip")],
+            vec![step(vec![branch("e", count_ge(1.0))])],
+        ),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.binds[0].window = "w".into();
+    plan.match_plan.trigger_event_needed = false;
+
+    let mut sm = CepStateMachine::new("r".into(), plan.match_plan.clone(), None);
+    let ev = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("action", str_val("failed")),
+    ]);
+    let StepResult::Matched(ctx) = sm.advance_at("e", &ev, 1_000) else {
+        panic!("must fire");
+    };
+    assert!(
+        ctx.trigger_event.is_none(),
+        "key-only yield → fire 不物化触发事件"
+    );
+
+    // 输出仍正确：entity/yield 的 key 字段从 scope_key 解析。
+    let exec = RuleExecutor::new(plan);
+    let rec = exec.execute_match(&ctx).expect("record");
+    assert_eq!(rec.entity_id, "10.0.0.1");
+}
+
+#[test]
+fn fire_keeps_trigger_event_when_non_key_yield() {
+    // 非 key yield（e.action）→ 编译器 `trigger_event_needed=true` → fire 保留
+    // 触发事件（build_eval_context 从 trigger_event 注入 action）。
+    let mut plan = simple_rule_plan(
+        "r",
+        simple_plan(
+            vec![simple_key("sip")],
+            vec![step(vec![branch("e", count_ge(1.0))])],
+        ),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.binds[0].window = "w".into();
+    plan.match_plan.trigger_event_needed = true;
+    plan.yield_plan.fields = vec![YieldField {
+        name: "action".into(),
+        value: Expr::Field(FieldRef::Qualified("e".into(), "action".into())),
+    }];
+
+    let mut sm = CepStateMachine::new("r".into(), plan.match_plan.clone(), None);
+    let ev = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("action", str_val("failed")),
+    ]);
+    let StepResult::Matched(ctx) = sm.advance_at("e", &ev, 1_000) else {
+        panic!("must fire");
+    };
+    assert!(
+        ctx.trigger_event.is_some(),
+        "非 key yield → fire 保留触发事件"
+    );
+
+    // yield action 从 trigger_event 注入 → 值正确。
+    let exec = RuleExecutor::new(plan);
+    let rec = exec.execute_match(&ctx).expect("record");
+    let action = rec
+        .yield_fields
+        .iter()
+        .find(|(n, _)| n.as_ref() == "action")
+        .map(|(_, v)| v.clone());
+    assert_eq!(action, Some(Value::Str("failed".into())));
 }

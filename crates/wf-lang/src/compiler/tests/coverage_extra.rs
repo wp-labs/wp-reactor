@@ -3,7 +3,7 @@
 //! needs-field-history decisions that the focused test files do not reach.
 
 use crate::ast::{Expr, FieldRef, PathSegment};
-use crate::compiler::{collect_bind_tracking, compile_wfl_after_semantic_checks, BindTracking};
+use crate::compiler::{BindTracking, collect_bind_tracking, compile_wfl_after_semantic_checks};
 use crate::plan::{
     ConvOpPlan, ExceedAction, JoinKeyPlan, RateSpec, SeqSkipPlan, StatsAggPlan,
     StatsOutputShapePlan, WindowSpec,
@@ -144,14 +144,22 @@ rule stats_cols {
         ]
     );
     // top(N, field) carries the arg.
-    let top = stats.measures.iter().find(|m| m.label == "top_users").unwrap();
+    let top = stats
+        .measures
+        .iter()
+        .find(|m| m.label == "top_users")
+        .unwrap();
     assert_eq!(top.arg, Some(3));
     assert_eq!(
         top.field,
         Some(FieldRef::Qualified("e".into(), "user".into()))
     );
     // last() carries the source field.
-    let last = stats.measures.iter().find(|m| m.label == "last_user").unwrap();
+    let last = stats
+        .measures
+        .iter()
+        .find(|m| m.label == "last_user")
+        .unwrap();
     assert_eq!(
         last.field,
         Some(FieldRef::Qualified("e".into(), "user".into()))
@@ -160,7 +168,9 @@ rule stats_cols {
     // Stats rules keep an empty match plan placeholder and no joins.
     assert!(plan.match_plan.keys.is_empty());
     assert!(plan.joins.is_empty());
-    assert!(plan.score_plan.expr == Expr::Number(50.0) || plan.score_plan.expr == Expr::Number(0.0));
+    assert!(
+        plan.score_plan.expr == Expr::Number(50.0) || plan.score_plan.expr == Expr::Number(0.0)
+    );
 }
 
 #[test]
@@ -182,7 +192,10 @@ rule stats_where {
 }
 "#;
     let plans = compile_with(src, &[stats_win(), alerts_window()]);
-    let plan = plans.iter().find(|p| p.name == "stats_where").expect("rule");
+    let plan = plans
+        .iter()
+        .find(|p| p.name == "stats_where")
+        .expect("rule");
     let stats = plan.stats_plan.as_ref().expect("stats plan");
     assert!(matches!(stats.window_spec, WindowSpec::Fixed(_)));
 
@@ -420,7 +433,14 @@ rule r {
     yield out (x = b.bidder)
 }
 "#;
-    let plans = compile_with(src, &[bid_events_window(), auction_events_window(), output_window()]);
+    let plans = compile_with(
+        src,
+        &[
+            bid_events_window(),
+            auction_events_window(),
+            output_window(),
+        ],
+    );
     let plan = plans.iter().find(|p| p.name == "r").expect("rule");
     let kj = plan.match_plan.key_join.as_ref().expect("key join");
     assert_eq!(
@@ -502,7 +522,12 @@ rule pipe {
     );
 
     let stage1 = &plans[0];
-    let names: Vec<&str> = stage1.yield_plan.fields.iter().map(|f| f.name.as_str()).collect();
+    let names: Vec<&str> = stage1
+        .yield_plan
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
     assert!(
         names.contains(&"sip") && names.contains(&"dport"),
         "stage yield should carry keys, got {names:?}"
@@ -545,7 +570,12 @@ rule pipe {
         &schemas,
     );
     let stage1 = &plans[0];
-    let names: Vec<&str> = stage1.yield_plan.fields.iter().map(|f| f.name.as_str()).collect();
+    let names: Vec<&str> = stage1
+        .yield_plan
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
     assert!(
         names.contains(&"count"),
         "unlabeled count measure should produce a `count` yield field, got {names:?}"
@@ -733,7 +763,10 @@ rule r {
     yield out (x = a.sip)
 }
 "#;
-    let plans = compile_with(src, &[auth_events_window(), fw_events_window(), output_window()]);
+    let plans = compile_with(
+        src,
+        &[auth_events_window(), fw_events_window(), output_window()],
+    );
     let plan = plans.iter().find(|p| p.name == "r").expect("rule");
     assert!(
         plan.match_plan.needs_field_history,
@@ -783,10 +816,7 @@ rule r {
 
 #[test]
 fn needs_field_history_true_for_l3_yield() {
-    let out = make_output_window(
-        "out",
-        vec![("x", bt(BaseType::Ip))],
-    );
+    let out = make_output_window("out", vec![("x", bt(BaseType::Ip))]);
     // `last` is an L3 series function: it needs the per-field history.
     let src = r#"
 rule r {
@@ -848,6 +878,84 @@ rule r {
     assert!(
         plan.match_plan.needs_field_history,
         "close rule reading a non-key field needs history"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// compute_trigger_event_needed: on-event fire 是否需要物化触发事件
+// ---------------------------------------------------------------------------
+
+#[test]
+fn key_only_yield_skips_trigger_event() {
+    // yield 只读 key 字段（e.sip）→ fire 路径可跳过 event.to_event() clone。
+    let plans = compile_with(
+        r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> {
+        on event { e | count >= 1; }
+        on close { e | count >= 1; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let plan = &plans[0];
+    assert!(
+        !plan.match_plan.trigger_event_needed,
+        "key-only yield skips trigger-event materialization"
+    );
+}
+
+#[test]
+fn non_key_yield_needs_trigger_event() {
+    // yield 读非 key 字段（e.action）→ fire 必须带触发事件（build_eval_context
+    // 从 trigger_event 注入 action，scope_key 只有 sip）。
+    let plans = compile_with(
+        r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> {
+        on event { e | count >= 1; }
+        on close { e | count >= 1; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (y = e.action)
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let plan = &plans[0];
+    assert!(
+        plan.match_plan.trigger_event_needed,
+        "non-key yield needs trigger-event materialization"
+    );
+}
+
+#[test]
+fn join_left_field_non_key_needs_trigger_event() {
+    // join 条件左字段（first_join_key 从 ctx 读）非 key → 需要触发事件
+    //（否则 join 静默 miss，F3 教训）。
+    let plans = compile_with(
+        r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> {
+        on event { e | count >= 1; }
+    } -> score(50.0)
+    join dns_response snapshot on e.action == dns_response.query_id
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#,
+        &[auth_events_window(), dns_response_window(), output_window()],
+    );
+    let plan = &plans[0];
+    assert!(
+        plan.match_plan.trigger_event_needed,
+        "join left field non-key needs trigger event"
     );
 }
 

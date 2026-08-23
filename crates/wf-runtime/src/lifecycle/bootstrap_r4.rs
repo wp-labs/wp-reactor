@@ -423,6 +423,7 @@ fn base_plan() -> wf_lang::plan::RulePlan {
             tracked_bind_fields: HashMap::new(),
             tracked_plain_fields: HashSet::new(),
             needs_field_history: false,
+            trigger_event_needed: false,
         },
         each_plan: None,
         stats_plan: None,

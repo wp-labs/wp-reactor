@@ -371,6 +371,7 @@ fn make_task_inner(
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     };
 
     let rule_plan = RulePlan {
@@ -546,6 +547,7 @@ fn make_pipeline_stage_task_opts(
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     };
     let rule_plan = RulePlan {
         conv_window: None,
@@ -655,6 +657,7 @@ fn make_each_task() -> (
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
             needs_field_history: true,
+            trigger_event_needed: false,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -757,6 +760,7 @@ fn make_filtered_match_task() -> (
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     };
 
     let rule_plan = RulePlan {
@@ -882,6 +886,7 @@ fn make_filtered_close_task() -> (
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     };
 
     let rule_plan = RulePlan {
@@ -993,6 +998,7 @@ fn make_filtered_each_task() -> (
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
             needs_field_history: true,
+            trigger_event_needed: false,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -1094,6 +1100,7 @@ fn make_intermediate_each_task() -> (
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
             needs_field_history: true,
+            trigger_event_needed: false,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -1220,6 +1227,7 @@ fn make_intermediate_each_task_with_explicit_time() -> (
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
             needs_field_history: true,
+            trigger_event_needed: false,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -1331,6 +1339,7 @@ fn make_intermediate_score_tasks() -> (
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
             needs_field_history: true,
+            trigger_event_needed: false,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -1440,6 +1449,7 @@ fn make_intermediate_score_tasks() -> (
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     };
 
     let downstream_plan = RulePlan {
@@ -1594,6 +1604,7 @@ fn make_intermediate_score_band_tasks() -> (
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
             needs_field_history: true,
+            trigger_event_needed: false,
         },
         each_plan: Some(EachPlan {
             alias: "e".into(),
@@ -1703,6 +1714,7 @@ fn make_intermediate_score_band_tasks() -> (
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     };
 
     let downstream_plan = RulePlan {
@@ -1911,6 +1923,7 @@ fn make_filtered_bind_alias_match_task() -> (
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     };
 
     let rule_plan = RulePlan {
@@ -2089,6 +2102,7 @@ fn make_window_has_match_task() -> (
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     };
 
     let rule_plan = RulePlan {
@@ -2954,6 +2968,7 @@ fn make_sharded_match_tasks(
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
             needs_field_history: true,
+            trigger_event_needed: false,
         };
         let rule_plan = RulePlan {
             conv_window: None,
@@ -3585,6 +3600,7 @@ async fn port_scan_rule_triggers_close_alert() {
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     };
 
     let rule_plan = RulePlan {
@@ -3911,6 +3927,7 @@ fn make_conv_sink_task() -> (
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: false,
+        trigger_event_needed: false,
     };
     let rule_plan = RulePlan {
         conv_window: None,
@@ -4091,6 +4108,7 @@ async fn conv_stage_emits_sealed_close_to_sink() {
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: false,
+        trigger_event_needed: false,
     };
     let rule_plan = RulePlan {
         conv_window: None,
@@ -4224,6 +4242,7 @@ fn conv_stage_test_executor() -> RuleExecutor {
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: false,
+        trigger_event_needed: false,
     };
     let rule_plan = RulePlan {
         conv_window: None,

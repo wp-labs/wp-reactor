@@ -82,6 +82,7 @@ fn minimal_plan() -> RulePlan {
             tracked_bind_fields: HashMap::new(),
             tracked_plain_fields: HashSet::new(),
             needs_field_history: false,
+            trigger_event_needed: false,
         },
         each_plan: None,
         stats_plan: None,
@@ -261,6 +262,7 @@ fn machine_rule() -> (RulePlan, CepStateMachine) {
         match_mode: wf_lang::ast::MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     };
     let plan = RulePlan {
         name: "r4_machine".into(),

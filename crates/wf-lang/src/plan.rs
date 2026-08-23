@@ -144,6 +144,12 @@ pub struct MatchPlan {
     /// event instead, so `collect_alias_event` can be skipped entirely (avoids
     /// per-instance field_values allocation under churn → RSS growth).
     pub needs_field_history: bool,
+    /// Whether on-event fires need the triggering event materialized
+    /// (`MatchedContext.trigger_event`). `false` = score/entity/yield + join
+    /// condition left fields + `where` read only match keys (served from
+    /// `scope_key`) or literals — the fire path can skip `event.to_event()`
+    /// per-event clone (Q5/Q7/Q12/Q13 every-event-fire hot path, 2026-08).
+    pub trigger_event_needed: bool,
 }
 
 // ---------------------------------------------------------------------------

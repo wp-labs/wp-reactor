@@ -75,6 +75,7 @@ fn simple_plan(keys: Vec<FieldRef>, steps: Vec<StepPlan>) -> MatchPlan {
         match_mode: MatchMode::Seq,
         accu: false,
         needs_field_history: false,
+        trigger_event_needed: false,
     }
 }
 

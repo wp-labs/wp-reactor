@@ -252,6 +252,7 @@ fn make_deferred_join_task() -> (
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
             needs_field_history: false,
+            trigger_event_needed: false,
         },
         each_plan: Some(EachPlan {
             alias: "a".into(),
@@ -491,6 +492,7 @@ fn make_q8_task() -> (
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
             needs_field_history: false,
+            trigger_event_needed: false,
         },
         each_plan: Some(EachPlan {
             alias: "p".into(),

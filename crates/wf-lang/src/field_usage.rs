@@ -387,6 +387,7 @@ mod tests {
                 seq: None,
                 accu: false,
                 needs_field_history: false,
+                trigger_event_needed: false,
             },
         );
         rule.r#where = Some(Expr::InList {
@@ -428,6 +429,7 @@ mod tests {
                 seq: None,
                 accu: false,
                 needs_field_history: false,
+                trigger_event_needed: false,
             },
         );
         rule.each_plan = Some(crate::plan::EachPlan {
@@ -522,6 +524,7 @@ mod tests {
             seq: None,
             accu: false,
             needs_field_history: false,
+            trigger_event_needed: false,
         };
         let plans = vec![make_rule(vec![bind], match_plan)];
         let usage = compute_window_field_usage(&plans);
@@ -553,6 +556,7 @@ mod tests {
             seq: None,
             accu: false,
             needs_field_history: false,
+            trigger_event_needed: false,
         };
         let plans = vec![make_rule(vec![bind], match_plan)];
         let usage = compute_window_field_usage(&plans);
@@ -625,6 +629,7 @@ mod tests {
             seq: None,
             accu: false,
             needs_field_history: false,
+            trigger_event_needed: false,
         };
 
         let plans = vec![
@@ -680,6 +685,7 @@ mod tests {
             seq: None,
             accu: false,
             needs_field_history: false,
+            trigger_event_needed: false,
         };
         let usage = compute_window_field_usage(&[make_rule(vec![no_filter_bind], match_plan)]);
         assert!(usage.defer_materialization.contains("no_filter"));
@@ -712,6 +718,7 @@ mod tests {
                 seq: None,
                 accu: false,
                 needs_field_history: false,
+                trigger_event_needed: false,
             },
         );
         plan.each_plan = Some(crate::plan::EachPlan {
@@ -756,6 +763,7 @@ mod tests {
             seq: None,
             accu: false,
             needs_field_history: false,
+            trigger_event_needed: false,
         }
     }
 

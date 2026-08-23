@@ -147,6 +147,7 @@ fn make_join_where_task() -> (
         match_mode: MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     };
 
     let rule_plan = RulePlan {
@@ -353,6 +354,7 @@ fn make_interval_join_task() -> (
         match_mode: MatchMode::Seq,
         accu: false,
         needs_field_history: true,
+        trigger_event_needed: false,
     };
 
     // `within [10s, 0s]`——回看 10s（`within 10s` 糖的常量界等价形态）

@@ -152,6 +152,7 @@ fn plan_with_join(right_window: &str, right_field: &str) -> wf_lang::plan::RuleP
             tracked_bind_fields: HashMap::new(),
             tracked_plain_fields: HashSet::new(),
             needs_field_history: true,
+            trigger_event_needed: false,
         },
         each_plan: None,
         stats_plan: None,

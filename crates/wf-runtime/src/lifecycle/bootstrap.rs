@@ -552,6 +552,7 @@ mod tests {
                 match_mode: MatchMode::Seq,
                 accu: false,
                 needs_field_history: false,
+                trigger_event_needed: false,
             },
             each_plan: None,
             stats_plan: None,

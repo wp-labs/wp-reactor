@@ -148,6 +148,7 @@ fn make_provider_join_task() -> (
             match_mode: wf_lang::ast::MatchMode::Seq,
             accu: false,
             needs_field_history: false,
+            trigger_event_needed: false,
         },
         each_plan: Some(EachPlan {
             alias: "b".into(),
