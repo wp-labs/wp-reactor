@@ -44,9 +44,10 @@
 │  perf-diag 子命令（编译工具，非脚本）                        │
 │  for 诊断点 k in [floor, rules, full, c_*, g_*, ...]:       │
 │    ① 切点：POST /admin/v1/perf/point {point=k}              │
-│    ② T0 = now(); 发帧 batch_k（帧尾追加 marker{round=k}）    │
-│    ③ 读 metrics: perf_marker{round=k, emit_ns} → T1         │
-│    ④ EPS_k = N / (T1 − T0)                                  │
+│    ② 发帧 batch_k；帧尾追加自描述 marker：                 │
+│       {round=k, n=N_k, start_ns=T0}    ← 发送量+开始时间入载荷 │
+│    ③ 读 metrics: perf_marker{…, emit_ns}                    │
+│    ④ EPS_k = n / (emit_ns − start_ns)  ← 全从 marker 记录算  │
 │  输出墙表（每档 EPS + 增量成本 + 墙判定）                    │
 └────────────────────────────────────────────────────────────┘
 ┌─ wfusion daemon（一次启动，不重启）─────────────────────────┐
@@ -54,7 +55,8 @@
 │    cut_rules / cut_output                                   │
 │  runtime.rules hot-reload：规则子集切换（已有能力）          │
 │  内置 __perf_marker 窗口 + 标记规则（豁免所有门控，永远活跃）│
-│    marker emit 时写 perf_marker{round, emit_ns} 指标        │
+│    marker emit 时写 perf_marker{round,n,start_ns,emit_ns}    │
+│    四元组齐备 → EPS = n/(emit_ns−start_ns) 直接可算          │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -113,10 +115,16 @@ cut_output = false  # 禁止输出链（emit 不 serialize/stage/commit）
 
 ### 4.3 内置 `__perf_marker` 窗口 + 标记规则（漂流瓶）
 
-- **内置 schema**：`__perf_marker` 流/窗口，字段 `{ round: digit, seq: digit }`
-  （引擎内置，不依赖用户 .wfs；`[perf].diag=true` 时自动注册）。
+- **内置 schema**：`__perf_marker` 流/窗口，字段 `{ round: digit, n: digit,
+  start_ns: digit }`（引擎内置，不依赖用户 .wfs；`[perf].diag=true` 时自动注册）。
+- **marker 载荷自描述**：wfgen 发送时把**发送量 `n`**（本批事件数）和**开始时间
+  `start_ns`**（wfgen 发送开始时钟）写进 marker 事件字段——wfgen 无需外部记账。
 - **内置标记规则**：marker 事件 emit 时（复用 emit 路径的 `cached_wall_nanos`
-  引擎时钟）写一条 `perf_marker{round=<k>, emit_ns=<wall>}` 指标。
+  引擎时钟）写一条完整测量记录：
+  `perf_marker{round=k, n=<N_k>, start_ns=<wfgen T0>, emit_ns=<引擎完成时刻>}`。
+  该记录四元组齐备，**EPS 直接可算**：`eps = n / (emit_ns − start_ns)`。
+- **时钟同一性**：基准同机运行，wfgen 的 `start_ns` 与引擎的 `emit_ns` 同机
+  时钟可比（跨机需 NTP 或 marker 由引擎侧回写差值，见 §7）。
 - **豁免所有 perf 门控**：cut_rules / cut_output 均不影响 marker 窗口与标记规则——
   保证各诊断点（含 floor 空规则档）都能拿到完成信号。
 - **顺序保证**：marker 帧与数据帧同 TCP 连接、同源 seq 有序 → marker 是"批末
@@ -155,10 +163,13 @@ wfgen perf-diag \
 
 - **循环**（每点 k，每轮）：
   1. `POST /admin/v1/perf/point {point=k}` → 轮询 admin status 确认切换完成；
-  2. `T0 = now()`；`send-arrow` 发数据帧，**帧尾追加 `__perf_marker{round=k}` 帧**
-     （同连接、同 seq 尾部，保证最后处理）；
-  3. 轮询 metrics 直到读到 `perf_marker{round=k, emit_ns}` → `T1 = emit_ns`；
-  4. `EPS_k = N / (T1 − T0)`（delta 口径，跨点窗口残留状态不影响）。
+  2. 统计本批发送量 `n_k`（帧行数合计）；`T0 = now()`；`send-arrow` 发数据帧，
+     帧尾追加 `__perf_marker{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq
+     尾部，保证最后处理）；
+  3. 轮询 metrics 直到读到 `perf_marker{round=k, …}` 的 `emit_ns`；
+  4. `EPS_k = n_k / (emit_ns − start_ns)`——**发送量/开始时间来自 marker 载荷，
+     完成时间来自引擎 emit 记录，全程无外部记账**（delta 口径，跨点窗口残留
+     状态不影响）。
 - **数据由小到大**：`--n-list` 对每个诊断点按递增 N 各测一次——小 N 秒级出方向，
   大 N 确认墙是 per-event 还是固定开销（2026-08-23 的 26万 vs 970万 正是这种
   区分救回来的）。
@@ -182,7 +193,8 @@ wfgen perf-diag \
 | 项 | 决策 | 说明 |
 |---|---|---|
 | marker 队列 | 独立 `__perf_marker` 窗口（①a） | 绝对时间可能略早于最慢数据窗；相对增量不受影响 |
-| 时钟 | 同机基准，wfgen T0 与引擎 emit_ns 同机 | 跨机需 marker 携带发送时间戳、引擎算 e2e 差值（未做） |
+| marker 载荷 | 自描述 `{round, n, start_ns}` | 发送量+开始时间入 marker；引擎补 `emit_ns` → EPS 四元组直接可算 |
+| 时钟 | 同机基准，wfgen `start_ns` 与引擎 `emit_ns` 同机时钟 | 跨机需 NTP 或引擎回写差值（未做） |
 | sink 热切 | 不做（RequiresRestart） | 输出墙用 cut_output 开关代替，无需动 sinks |
 | budget 热切 | 不做（RequiresRestart） | 预算档作为唯一重启例外 |
 | marker 处理开销 | 常数量（极小），计入每档 | 增量抵消，不影响墙归属 |
