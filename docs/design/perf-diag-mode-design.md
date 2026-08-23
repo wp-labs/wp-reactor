@@ -155,7 +155,7 @@ cut_output = true
   `perf_sentinel{round=k, n=<N_k>, start_ns=<wfgen T0>, emit_ns=<引擎完成时刻>}`。
   该记录四元组齐备，**EPS 直接可算**：`eps = n / (emit_ns − start_ns)`。
 - **记录输出（文件 sink，case 配置）**：sentinel 告警走既有 alert 链，由 case 的
-  `topology/sinks/business.d/perf_sentinel.toml` 落盘 `data/perf_sentinel.ndjson`
+  `topology/sinks/business.d/sentinel.toml` 落盘 `data/perf_sentinel.ndjson`
   （JSONL，一行一条记录）——**wfgen 从该文件读记录**，比从 metrics 流解析干净。
   ⚠ sink 路由组必须放 **`business.d/`**：`infra.d` 只读 `default/error/monitor`
   三个固定文件（`load_infra_group`），`[sink_group]` 形状在 business.d 才是
@@ -168,13 +168,13 @@ cut_output = true
   区分，见 §4.2）。单批仅 1-2 条，常数量处理开销，增量抵消。
 
   ```toml
-  # topology/sinks/business.d/perf_sentinel.toml（各 bench 一份）
+  # topology/sinks/business.d/sentinel.toml（各 bench 一份）
   [sink_group]
-  name = "perf_sentinel_infra"
+  name = "sentinel_infra"
   windows = ["__wf_sentinel"]
   [[sink_group.sinks]]
   connect = "file_json_sink"
-  name = "perf_sentinel_out"
+  name = "sentinel_out"
   [sink_group.sinks.params]
   base = "data"
   file = "perf_sentinel.ndjson"
@@ -313,7 +313,7 @@ wfgen perf-diag \
 2. wf-runtime：`set_perf_cuts` 原子门控 + `process_batch`/`emit` 切口 + 测试；
 3. wf-runtime：内置 `__wf_sentinel` 窗口/规则 + `perf_sentinel` 指标 + 告警落盘
    （走 alert 链、豁免 cut_output）+ 豁免门控测试；perf_diag_case 侧补
-   `topology/sinks/infra.d/perf_sentinel.toml`（`data/perf_sentinel.ndjson`）；
+   `topology/sinks/business.d/sentinel.toml`（`data/perf_sentinel.ndjson`）；
 4. wf-runtime：诊断点状态机——sentinel emit → 门控翻转 + 规则子集 reload 触发 +
    `perf_point` 切换完成信号（无 admin 端点）；
 5. wf-config：`report_interval` 默认 100ms；

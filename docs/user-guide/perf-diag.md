@@ -164,15 +164,15 @@ cut_output = false
 以 nexmark_pk 为例，需要 3 处（每 bench 一份，独立于基准数据）：
 
 1. **`conf/perf-diag.toml`** — 诊断点列表（§5 模板）；
-2. **哨兵记录 sink** — `topology/sinks/business.d/perf_sentinel.toml`：
+2. **哨兵记录 sink** — `topology/sinks/business.d/sentinel.toml`：
 
    ```toml
    [sink_group]
-   name = "perf_sentinel_infra"
+   name = "sentinel_infra"
    windows = ["__wf_sentinel"]
    [[sink_group.sinks]]
    connect = "file_json_sink"
-   name = "perf_sentinel_out"
+   name = "sentinel_out"
    [sink_group.sinks.params]
    base = "data"
    file = "perf_sentinel.ndjson"
