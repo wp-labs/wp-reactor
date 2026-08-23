@@ -2931,11 +2931,12 @@ fn close_direct_batch_columnar_paths() {
     );
     let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
     let stats = exec.execute_close_direct_batch_columnar(&[close.clone()], &mut builder, 0);
-    // Note: the per-row coerce failure increments `failed` but the row is
-    // still committed by the current close-executor (see the final report —
-    // suspected bug), so `appended` also advances.
+    // Per-row coerce failure: counted as failed and the row is **skipped**
+    // (no columns touched, not appended) — matches the on-each batch path
+    // contract (B1 fix).
     assert_eq!(stats.failed, 1);
-    assert_eq!(stats.appended, 1);
+    assert_eq!(stats.appended, 0);
+    assert!(builder.is_empty());
     // The per-row coerce failure path (non-literal value) is hit above; also
     // exercise the literal-coerce failure path (NaN against Float).
     let mut plan = simple_rule_plan(
@@ -3015,6 +3016,88 @@ fn close_direct_batch_columnar_paths() {
     let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
     let stats = exec.execute_close_direct_batch_columnar(&[close], &mut builder, 0);
     assert_eq!(stats.appended, 1);
+}
+
+#[test]
+fn close_direct_batch_columnar_skips_failed_row_keeps_rest() {
+    // B1 回归: 列式 close 中一行 coerce/export 失败（`failed += 1`）必须**跳过
+    // 该行**（不提交、不计 appended）——与 on-each 批量路径契约一致。此前
+    // `break` 只退出 yield 字段循环, 失败行仍被 push 提交（appended 也 +1）。
+    // 本测试用「两行 close: 第一行失败、第二行正常」验证行隔离与数组对齐。
+    let mut plan = simple_rule_plan(
+        "r1",
+        plan_with_close(
+            vec![simple_key("sip")],
+            vec![],
+            vec![step(vec![branch("c1", count_ge(1.0))])],
+        ),
+        Expr::Number(70.0),
+        "ip",
+        Expr::StringLit("const".into()),
+    );
+    plan.yield_plan.fields = vec![YieldField {
+        name: "f".into(),
+        value: Expr::Field(FieldRef::Simple("sip".into())),
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("f".into(), FieldType::Base(BaseType::Float))]),
+    );
+    assert!(exec.close_plan_columnar_safe());
+
+    let close_ok = |scope: &str| {
+        let mut c = close_output(
+            true,
+            true,
+            CloseMode::And,
+            vec![],
+            vec![step_data(Some("c1"), 1.0, EngineHashMap::default())],
+        );
+        c.scope_key = vec![str_val(scope)];
+        c
+    };
+    // 第一行: sip 是字符串 "10.0.0.1" 而目标类型是 Float → coerce 失败。
+    // 第二行: 同样失败。
+    let failing_a = close_ok("10.0.0.1");
+    let failing_b = close_ok("10.9.9.9");
+    let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+    let stats = exec.execute_close_direct_batch_columnar(
+        &[failing_a.clone(), failing_b.clone()],
+        &mut builder,
+        0,
+    );
+    assert_eq!(stats.failed, 2, "两行都失败");
+    assert_eq!(stats.appended, 0, "失败行不提交");
+    assert_eq!(stats.rejected, 0);
+    assert!(builder.is_empty(), "无任何列被触碰");
+
+    // 混合: 一行失败 + 一行成功（sip 数字可强转）——验证行隔离与对齐。
+    // 成功行需要 sip 为可强转浮点的值: 清空 scope_key（keys 不命中）后用
+    // close step 的 field_values 注入数值 sip。
+    let mut fv = EngineHashMap::default();
+    fv.insert("sip".into(), vec![num(7.0)]);
+    let mut ok_close = close_output(
+        true,
+        true,
+        CloseMode::And,
+        vec![],
+        vec![step_data(Some("c1"), 1.0, fv)],
+    );
+    ok_close.scope_key = vec![]; // keys 不命中 → 回退 field_values
+    let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+    let stats =
+        exec.execute_close_direct_batch_columnar(&[failing_a.clone(), ok_close], &mut builder, 0);
+    assert_eq!(stats.failed, 1, "仅失败行计入 failed");
+    assert_eq!(stats.appended, 1, "成功行正常提交");
+    assert_eq!(builder.len(), 1, "批次只含成功行, 列保持对齐");
+    let batch = builder.finish();
+    let records: Vec<_> = batch.iter_data_records().collect();
+    assert_eq!(records.len(), 1);
+    let record = records[0].as_ref().expect("record");
+    assert_eq!(
+        record.get_value("f"),
+        Some(&wp_model_core::model::Value::from(7.0_f64))
+    );
 }
 
 // ---------------------------------------------------------------------------

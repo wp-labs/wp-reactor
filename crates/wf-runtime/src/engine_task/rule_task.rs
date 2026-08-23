@@ -3493,3 +3493,6 @@ mod rule_task_coverage;
 #[cfg(test)]
 #[path = "rule_task_coverage_more.rs"]
 mod rule_task_coverage_more;
+#[cfg(test)]
+#[path = "rule_task_r4.rs"]
+mod rule_task_r4;

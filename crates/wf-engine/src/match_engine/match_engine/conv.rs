@@ -35,13 +35,28 @@ fn apply_chain(
 fn apply_op(op: &ConvOpPlan, keys: &[FieldRef], mut outputs: Vec<CloseOutput>) -> Vec<CloseOutput> {
     match op {
         ConvOpPlan::Sort(sort_keys) => {
-            outputs.sort_by(|a, b| {
-                let ctx_a = build_eval_context(a, keys);
-                let ctx_b = build_eval_context(b, keys);
-                for sk in sort_keys {
-                    let va = eval_expr(&sk.expr, &ctx_a);
-                    let vb = eval_expr(&sk.expr, &ctx_b);
-                    let ord = compare_option_values(&va, &vb);
+            // 预提取每个 output 的排序键值（每元素每 sort key 1 次 eval；旧实现
+            // 每次比较构建 2 次 context + eval 2 次 → O(n log n) 次 HashMap 分配
+            // 与求值，是 Q5/Q7 收口批 conv `sort(-m)|top(1)` 的主成本（~2k 行批
+            // → 数万次分配；2026-08 nexmark hotpath 审查）。预提取后比较阶段
+            // 零分配零求值。语义不变：eval/compare 与旧实现逐元素相同，且
+            // `sort_by` 为稳定排序（相同键保持原顺序）。
+            let key_rows: Vec<Vec<Option<Value>>> = outputs
+                .iter()
+                .map(|o| {
+                    let ctx = build_eval_context(o, keys);
+                    sort_keys
+                        .iter()
+                        .map(|sk| eval_expr(&sk.expr, &ctx))
+                        .collect()
+                })
+                .collect();
+            let mut idx: Vec<usize> = (0..outputs.len()).collect();
+            idx.sort_by(|&i, &j| {
+                let row_i = &key_rows[i];
+                let row_j = &key_rows[j];
+                for (sk, (va, vb)) in sort_keys.iter().zip(row_i.iter().zip(row_j.iter())) {
+                    let ord = compare_option_values(va, vb);
                     let ord = if sk.descending { ord.reverse() } else { ord };
                     if ord != std::cmp::Ordering::Equal {
                         return ord;
@@ -49,6 +64,11 @@ fn apply_op(op: &ConvOpPlan, keys: &[FieldRef], mut outputs: Vec<CloseOutput>) -
                 }
                 std::cmp::Ordering::Equal
             });
+            let mut buf: Vec<Option<CloseOutput>> = outputs.into_iter().map(Some).collect();
+            outputs = idx
+                .into_iter()
+                .map(|i| buf[i].take().expect("each output moved exactly once"))
+                .collect();
             outputs
         }
         ConvOpPlan::Top(n) => {
@@ -56,7 +76,9 @@ fn apply_op(op: &ConvOpPlan, keys: &[FieldRef], mut outputs: Vec<CloseOutput>) -
             outputs
         }
         ConvOpPlan::Dedup(expr) => {
-            let mut seen = Vec::<String>::new();
+            // HashSet 替代 Vec::contains 线性扫描（旧 O(n²)，大收口批下
+            // dedup 成本与 sort 同级；语义不变——只判存在性，序无关）。
+            let mut seen = std::collections::HashSet::<String>::new();
             outputs.retain(|output| {
                 let ctx = build_eval_context(output, keys);
                 let val = eval_expr(expr, &ctx);
@@ -64,12 +86,7 @@ fn apply_op(op: &ConvOpPlan, keys: &[FieldRef], mut outputs: Vec<CloseOutput>) -
                     Some(v) => value_to_string(&v),
                     None => "__none__".to_string(),
                 };
-                if seen.contains(&key) {
-                    false
-                } else {
-                    seen.push(key);
-                    true
-                }
+                seen.insert(key)
             });
             outputs
         }

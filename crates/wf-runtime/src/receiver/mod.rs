@@ -1,5 +1,7 @@
 pub mod arrow;
 pub(crate) mod batch;
+#[cfg(test)]
+mod coverage_r4;
 pub mod csv;
 pub(crate) mod miss;
 pub mod ndjson;

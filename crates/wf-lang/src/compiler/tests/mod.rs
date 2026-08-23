@@ -10,6 +10,7 @@ mod basic;
 mod coverage_extra;
 mod coverage_more;
 mod coverage_more2;
+mod coverage_r4;
 mod edge;
 mod join_family;
 mod keys_entity;
@@ -491,4 +492,93 @@ rule r {
         &[auth_events_window(), output_window()],
     );
     assert!(plans[0].conv_window.is_none());
+}
+
+#[test]
+fn reduce_label_refs_inside_object_and_array_are_rewritten() {
+    // B3 回归: `rewrite_expr_label_refs` 必须递归 object/array 字面量——
+    // `as label` 归约结果的 `label.field` 在 `object { }` / `array [ ]` 内
+    // 也要重写为 FieldRef::Path（运行期归约行以裸键 object 注入, 否则
+    // Qualified 引用会取错行）。此前 Object/Array 分支直接 clone 不递归。
+    let w1 = make_window(
+        "bid_events",
+        vec!["bid_stream"],
+        vec![
+            ("auction", bt(BaseType::Digit)),
+            ("price", bt(BaseType::Digit)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let w2 = make_window(
+        "auction_events",
+        vec!["auction_stream"],
+        vec![
+            ("id", bt(BaseType::Digit)),
+            ("category", bt(BaseType::Digit)),
+            ("seller", bt(BaseType::Digit)),
+            ("event_time", bt(BaseType::Time)),
+        ],
+    );
+    let out = make_output_window(
+        "out",
+        vec![
+            ("ctx", FieldType::Object),
+            ("cats", FieldType::ArrayAny),
+            ("bare", bt(BaseType::Digit)), // yield `bare = winner.seller`（seller 为 Digit）
+        ],
+    );
+    let src = r#"
+rule r {
+    events { b : bid_events }
+    match<auction:10m> { on event { b | count >= 1; } } -> score(50.0)
+    join auction_events reduce maxrow(category) on b.auction == auction_events.id as winner
+    entity(digit, 1)
+    yield out (
+        ctx = object { seller = winner.seller; category = winner.category; },
+        cats = array [ winner.category ],
+        bare = winner.seller,
+    )
+}
+"#;
+    let plans = compile_with(src, &[w1, w2, out]);
+    let plan = plans.iter().find(|p| p.name == "r").expect("rule r");
+    let field = |name: &str| {
+        plan.yield_plan
+            .fields
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("yield field {name}"))
+    };
+    // object 成员: winner.seller → FieldRef::Path(alias=winner, [seller])
+    let crate::ast::Expr::Object(items) = &field("ctx").value else {
+        panic!("ctx must be an object literal");
+    };
+    for item in items {
+        let crate::ast::Expr::Field(crate::ast::FieldRef::Path { alias, segments }) = &item.value
+        else {
+            panic!(
+                "object member {:?} must be rewritten to a Path, got {:?}",
+                item.targets, item.value
+            );
+        };
+        assert_eq!(alias, "winner");
+        assert_eq!(segments.len(), 1);
+    }
+    // array 成员: winner.category → Path
+    let crate::ast::Expr::Array(items) = &field("cats").value else {
+        panic!("cats must be an array literal");
+    };
+    let crate::ast::Expr::Field(crate::ast::FieldRef::Path { alias, .. }) = &items[0] else {
+        panic!(
+            "array member must be rewritten to a Path, got {:?}",
+            items[0]
+        );
+    };
+    assert_eq!(alias, "winner");
+    // 顶层裸引用同样被重写（既有行为回归）
+    let crate::ast::Expr::Field(crate::ast::FieldRef::Path { alias, .. }) = &field("bare").value
+    else {
+        panic!("bare winner.seller must be rewritten to a Path");
+    };
+    assert_eq!(alias, "winner");
 }

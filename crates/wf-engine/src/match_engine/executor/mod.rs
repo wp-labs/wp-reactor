@@ -24,6 +24,8 @@ mod coverage_extra;
 #[cfg(test)]
 mod coverage_more;
 #[cfg(test)]
+mod coverage_r4;
+#[cfg(test)]
 mod stats_coverage_extra;
 #[cfg(test)]
 mod stats_exec_test;
@@ -112,6 +114,20 @@ fn plan_close_ctx_fields(plan: &RulePlan) -> CloseCtxFields {
     visit_expr_fields(&plan.entity_plan.entity_id_expr, &mut names, &mut force_all);
     for field in &plan.yield_plan.fields {
         visit_expr_fields(&field.value, &mut names, &mut force_all);
+    }
+    // build_eval_context 的 trigger_event 注入按 `needed` 窄化后，Named 集合
+    // 必须覆盖所有从 ctx 读取的字段，否则静默失真：
+    // - join 条件**左字段**（`first_join_key` 从 ctx 读，缺字段 → join miss →
+    //   全 skip；Q4/Q6 的 b.auction 不在 yield 里，窄化前靠全量注入才有值）；
+    // - `where` 表达式字段（`where_ok` 从 ctx 读；可能引用 trigger_event 字段）。
+    // 右字段/富化字段由 execute_joins 的 enrich_join_row 注入，不依赖这里。
+    for join in &plan.joins {
+        for cond in &join.conds {
+            visit_expr_fields(&Expr::Field(cond.left.clone()), &mut names, &mut force_all);
+        }
+    }
+    if let Some(w) = &plan.r#where {
+        visit_expr_fields(w, &mut names, &mut force_all);
     }
 
     if force_all {

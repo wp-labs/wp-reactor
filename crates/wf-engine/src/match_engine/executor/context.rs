@@ -77,9 +77,15 @@ pub(crate) fn build_eval_context(
     // step_data loop below skips a field already present (`contains_key`), so
     // the history never overrides the event's value. Close fires pass `None`
     // and keep reading from `field_values`.
+    //
+    // Named 窄化（2026-08 hotpath）：只注入 `needed` 集合内的字段。
+    // `plan_close_ctx_fields` 已覆盖 score/entity/yield + join 条件左字段
+    // （first_join_key 读）+ where 字段——Named 集合外的事件字段（如 Q13 的
+    // price/channel/url/...）从不被输出路径读取，逐字段注入是 per-fire 热路径
+    // 的纯浪费（Q13 每事件 8 字段 → 1 字段，27.6M 事件 × 7 次 HashMap insert）。
     if let Some(ev) = trigger_event {
         for (name, value) in &ev.fields {
-            if !fields.contains_key(name.as_str()) {
+            if (all || needed.wants(name.as_str())) && !fields.contains_key(name.as_str()) {
                 fields.insert(name.clone(), value.clone());
             }
         }

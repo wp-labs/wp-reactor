@@ -19,6 +19,7 @@ pub use event_bridge::{
 };
 pub use executor::{
     DeferredPending, EachDirectBatchStats, RuleExecutor, RuleExecutorOptions, StatsExecutor,
+    StatsWindowState,
 };
 pub use match_engine::apply_conv;
 pub use match_engine::close_is_qualified;

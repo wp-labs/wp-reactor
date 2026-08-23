@@ -10,9 +10,13 @@ mod builtins;
 #[cfg(test)]
 mod builtins_more;
 #[cfg(test)]
+mod builtins_r4;
+#[cfg(test)]
 mod coverage_extra;
 #[cfg(test)]
 mod coverage_more;
+#[cfg(test)]
+mod coverage_r4;
 mod step_data;
 #[cfg(test)]
 mod tests;

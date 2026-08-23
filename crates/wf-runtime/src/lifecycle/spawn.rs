@@ -1475,3 +1475,6 @@ mod spawn_coverage;
 #[cfg(test)]
 #[path = "spawn_coverage_more.rs"]
 mod spawn_coverage_more;
+#[cfg(test)]
+#[path = "spawn_r4.rs"]
+mod spawn_r4;

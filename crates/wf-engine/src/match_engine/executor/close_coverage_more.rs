@@ -292,8 +292,8 @@ fn close_direct_batch_columnar_literal_bool_and_string_columns() {
 fn close_direct_batch_columnar_stage_error_marks_row_failed() {
     // An untyped yield whose value is an object containing a non-finite
     // number: coerce passes it through (no type), but export fails at
-    // `stage_yield_cell` → `stats.failed` increments (row still committed,
-    // like the coerce-failure lane in coverage_extra).
+    // `stage_yield_cell` → `stats.failed` increments and the row is
+    // **skipped** (no columns touched, not appended — B1 fix).
     let mut plan = default_plan();
     plan.yield_plan.fields = vec![YieldField {
         name: "obj".into(),
@@ -314,5 +314,6 @@ fn close_direct_batch_columnar_stage_error_marks_row_failed() {
     let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
     let stats = exec.execute_close_direct_batch_columnar(&[close], &mut builder, 0);
     assert_eq!(stats.failed, 1);
-    assert_eq!(stats.appended, 1);
+    assert_eq!(stats.appended, 0);
+    assert!(builder.is_empty());
 }

@@ -796,3 +796,6 @@ mod stats_task_coverage;
 #[cfg(test)]
 #[path = "stats_task_coverage_more.rs"]
 mod stats_task_coverage_more;
+#[cfg(test)]
+#[path = "stats_task_r4.rs"]
+mod stats_task_r4;

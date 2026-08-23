@@ -26,6 +26,7 @@ pub(super) fn stats_clause_only(input: &mut &str) -> ModalResult<StatsClause> {
     let keys: Vec<Expr> = opt(group_by_clause).parse_next(input)?.unwrap_or_default();
 
     // Optional `tier f [ <b1, <b2, ... ]` — 数值区间分档, 展开为 tier(f, b...) 桶键
+    ws_skip.parse_next(input)?;
     let tier_key: Option<Expr> = opt(tier_clause).parse_next(input)?;
     let has_tier = tier_key.is_some();
     let keys = match tier_key {

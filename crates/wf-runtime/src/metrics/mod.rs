@@ -9,6 +9,8 @@ use wf_engine::window::{EvictReport, RouteReport};
 
 #[cfg(test)]
 mod coverage_extra;
+#[cfg(test)]
+mod coverage_r4;
 mod sampling;
 mod server;
 #[cfg(test)]

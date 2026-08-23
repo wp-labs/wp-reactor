@@ -416,3 +416,6 @@ mod tests {
 #[cfg(test)]
 #[path = "tracing_init_coverage.rs"]
 mod tracing_init_coverage;
+#[cfg(test)]
+#[path = "tracing_init_r4.rs"]
+mod tracing_init_r4;

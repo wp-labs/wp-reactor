@@ -183,3 +183,36 @@ rule q18_ws {
     assert_eq!(alias, "b");
     assert_eq!(name, "price");
 }
+
+#[test]
+fn stats_group_by_then_tier_with_whitespace() {
+    // B2 回归: `group by (...)` 与 `tier` 之间必须允许空白（此前仅零空格
+    // `)tier` 可解析; `) tier` 因 tier_clause 前缺 ws_skip 而失败）。
+    let rule = parse_stats_rule(
+        r#"
+rule q19_tier_group {
+    events { b : bid_events }
+    stats<30m:fixed> group by (b.channel) tier b.price [ <10000, <1000000 ] {
+        b | count as bids;
+    }
+    entity(digit, 1)
+    yield alerts ( id = 1, alert_type = "q19", detail = "x" )
+}
+"#,
+    );
+    let stats = rule.stats_clause.expect("应有 stats_clause");
+    assert_eq!(stats.keys.len(), 2, "group-by 键 + tier 键");
+    assert_eq!(
+        stats.output_shape,
+        StatsOutputShape::Columns,
+        "tier 隐含列展开"
+    );
+    assert!(matches!(
+        &stats.keys[0],
+        crate::ast::Expr::Field(crate::ast::FieldRef::Qualified(a, f)) if a == "b" && f == "channel"
+    ));
+    let crate::ast::Expr::FuncCall { name, .. } = &stats.keys[1] else {
+        panic!("tier 应编译为 FuncCall");
+    };
+    assert_eq!(name, "tier");
+}

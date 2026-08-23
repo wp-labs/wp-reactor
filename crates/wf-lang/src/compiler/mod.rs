@@ -1173,9 +1173,23 @@ fn rewrite_expr_label_refs(expr: &Expr, labels: &HashSet<String>) -> Expr {
         | Expr::Bool(_)
         | Expr::SystemVar(_)
         | Expr::WfuMeta(_)
-        | Expr::PresetParam(_)
-        | Expr::Object(_)
-        | Expr::Array(_) => expr.clone(),
+        | Expr::PresetParam(_) => expr.clone(),
+        Expr::Object(items) => Expr::Object(
+            items
+                .iter()
+                .map(|item| crate::ast::ObjectItem {
+                    targets: item.targets.clone(),
+                    type_hint: item.type_hint.clone(),
+                    value: rewrite_expr_label_refs(&item.value, labels),
+                })
+                .collect(),
+        ),
+        Expr::Array(items) => Expr::Array(
+            items
+                .iter()
+                .map(|i| rewrite_expr_label_refs(i, labels))
+                .collect(),
+        ),
         Expr::BinOp { op, left, right } => Expr::BinOp {
             op: *op,
             left: Box::new(rewrite_expr_label_refs(left, labels)),

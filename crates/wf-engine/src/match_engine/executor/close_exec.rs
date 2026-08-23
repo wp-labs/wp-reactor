@@ -440,7 +440,7 @@ impl RuleExecutor {
             )>,
         > = Vec::with_capacity(closes.len());
 
-        for close in closes {
+        'close: for close in closes {
             if !is_qualified(close) {
                 stats.rejected += 1;
                 continue;
@@ -494,7 +494,7 @@ impl RuleExecutor {
                             log::warn!("alert export error: {e}");
                             stats.failed += 1;
                             builder.take_staged();
-                            break;
+                            continue 'close;
                         }
                     }
                     Ok(None) => { /* optional missing field omitted */ }
@@ -502,7 +502,7 @@ impl RuleExecutor {
                         log::warn!("alert export error: {e}");
                         stats.failed += 1;
                         builder.take_staged();
-                        break;
+                        continue 'close;
                     }
                 }
             }
