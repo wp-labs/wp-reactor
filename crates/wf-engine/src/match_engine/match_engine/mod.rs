@@ -1,6 +1,7 @@
 mod close;
 mod conv;
 mod eval;
+mod join_then_key;
 mod key;
 mod limits;
 mod seq;
@@ -26,6 +27,7 @@ pub(crate) use key::{
 };
 
 pub use conv::apply_conv;
+pub use join_then_key::precompute_join_then_keys;
 
 pub(crate) use eval::eval_expr_ext;
 
@@ -43,7 +45,9 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use wf_lang::ast::CloseMode;
-use wf_lang::plan::{ConvPlan, ExceedAction, LimitsPlan, MatchPlan, RateSpec, WindowSpec};
+use wf_lang::plan::{
+    ConvPlan, ExceedAction, JoinKeyPlan, LimitsPlan, MatchPlan, RateSpec, WindowSpec,
+};
 
 use crate::match_engine::columnar::GuardMasks;
 pub(crate) use close::accumulate_close_steps;
@@ -296,8 +300,38 @@ impl CepStateMachine {
         row: usize,
         masks: Option<&GuardMasks>,
     ) -> StepResult {
-        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, row, masks, false)
+        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, row, masks, false, None)
             .result
+    }
+
+    /// [`Self::advance_at_with_masks`] with a batch-precomputed join-then-key
+    /// scope key (2026-08-23 批级 join-then-key): rule_task resolves the
+    /// key_join lookup once per unique driver key for a whole batch, then feeds
+    /// each row's result here — the per-event index lookup + `values_equal`
+    /// re-check + key-field materialization (q4/q6 advance 88.8%) moves out of
+    /// the per-event loop. `key_override` semantics: `Some(Some(keys))` = use;
+    /// `Some(None)` = pre-resolved miss (skip); `None` = internal resolution.
+    pub fn advance_at_with_masks_key<E: FieldSource>(
+        &mut self,
+        alias: &str,
+        event: &E,
+        now_nanos: i64,
+        windows: Option<&dyn WindowLookup>,
+        row: usize,
+        masks: Option<&GuardMasks>,
+        key_override: Option<&Option<Vec<Value>>>,
+    ) -> StepResult {
+        self.advance_at_with_diagnostics(
+            alias,
+            event,
+            now_nanos,
+            windows,
+            row,
+            masks,
+            false,
+            key_override,
+        )
+        .result
     }
 
     /// Feed one event and return both the state-machine result and diagnostic
@@ -309,7 +343,7 @@ impl CepStateMachine {
         now_nanos: i64,
         windows: Option<&dyn WindowLookup>,
     ) -> StepOutcome {
-        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, 0, None, true)
+        self.advance_at_with_diagnostics(alias, event, now_nanos, windows, 0, None, true, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -322,6 +356,11 @@ impl CepStateMachine {
         row: usize,
         masks: Option<&GuardMasks>,
         capture_progress: bool,
+        // 批级 join-then-key 预解析（2026-08-23）：rule_task 对一批事件批级去重
+        // join lookup 后，每行传 `Some(Some(keys))`（用预解析 key，跳过内部
+        // 每事件 lookup）；`Some(None)` = 该行预解析 miss（跳过，同内部 miss）；
+        // `None` = 无预解析（走原逻辑，含 key_join / extract_key）。
+        key_override: Option<&Option<Vec<Value>>>,
     ) -> StepOutcome {
         // FailRule: once the rule has failed, reject all future events.
         // P2b: with shared limits, a FailRule latch on any shard fails the rule.
@@ -340,33 +379,21 @@ impl CepStateMachine {
         //    reading the key field off the joined row. A miss anywhere (no
         //    lookup, missing left field, join miss, key absent on the row) is
         //    the same as a missing key field: skip the event.
+        //    `key_override` 存在时（rule_task 批级预解析）直接用其结果，跳过内部
+        //    每事件 lookup（q4/q6 join-then-key 热路径：每 bid 一次索引 lookup
+        //    + values_equal 复核 + key 字段物化，占 advance 88.8%）。
         let scope_key = if let Some(kjp) = &self.plan.key_join {
-            let Some(windows) = windows else {
-                return step_outcome(StepResult::Accumulate, None); // no lookup → join miss
-            };
-            let Some(left_val) = event.field_value(field_ref_name(&kjp.left_field)) else {
-                return step_outcome(StepResult::Accumulate, None); // missing join-left key → skip
-            };
-            let Some(rows) =
-                windows.join_lookup(&kjp.right_window, &kjp.right_key_field, &left_val)
-            else {
-                return step_outcome(StepResult::Accumulate, None); // window not found → skip
-            };
-            // Match-time join re-verifies every candidate with `values_equal`
-            // after the index lookup (`find_matching_row`); join-then-key must
-            // do the same — the index key truncates f64
-            // (`JoinKey::from_value` `as i64`), so a fractional driver value
-            // would otherwise false-match a truncated row.
-            let Some(row) = rows.iter().find(|r| {
-                r.field_value(&kjp.right_key_field)
-                    .is_some_and(|rv| values_equal(&left_val, &rv))
-            }) else {
-                return step_outcome(StepResult::Accumulate, None); // join miss → skip
-            };
-            let Some(key_val) = row.field_value(&kjp.right_field) else {
-                return step_outcome(StepResult::Accumulate, None); // key absent on joined row → skip
-            };
-            vec![key_val]
+            if let Some(override_key) = key_override {
+                let Some(keys) = override_key else {
+                    return step_outcome(StepResult::Accumulate, None); // 预解析 miss
+                };
+                keys.clone()
+            } else {
+                let Some(scope_key) = resolve_key_join_scope_key(kjp, event, windows) else {
+                    return step_outcome(StepResult::Accumulate, None);
+                };
+                scope_key
+            }
         } else {
             match extract_key(event, &self.plan.keys, self.plan.key_map.as_deref(), alias) {
                 Some(k) => k,
@@ -1486,6 +1513,42 @@ fn should_track_bind_alias(plan: &MatchPlan, _alias: &str) -> bool {
     // skipping collection here avoids the per-instance field_values allocation
     // under churn that drove RSS unbounded on sustained inject.
     plan.needs_field_history
+}
+
+/// Resolve a join-then-key (Path A) scope key for one event: look the event's
+/// join-left value up in the joined window, re-verify candidates with
+/// `values_equal` (the index key truncates f64 — a fractional driver value
+/// would otherwise false-match a truncated row), and read the key field off
+/// the first matching row. `None` on any miss (no lookup, missing left field,
+/// join miss, key absent) — the caller skips the event.
+///
+/// Shared by the per-event advance path and the batch pre-resolution helper
+/// (`precompute_join_then_keys` in wf-runtime), which calls the same lookup so
+/// both produce byte-identical scope keys.
+fn resolve_key_join_scope_key<E: FieldSource>(
+    kjp: &JoinKeyPlan,
+    event: &E,
+    windows: Option<&dyn WindowLookup>,
+) -> Option<Vec<Value>> {
+    let Some(windows) = windows else {
+        return None; // no lookup → join miss
+    };
+    let Some(left_val) = event.field_value(field_ref_name(&kjp.left_field)) else {
+        return None; // missing join-left key → skip
+    };
+    let Some(rows) = windows.join_lookup(&kjp.right_window, &kjp.right_key_field, &left_val) else {
+        return None; // window not found → skip
+    };
+    let Some(row) = rows.iter().find(|r| {
+        r.field_value(&kjp.right_key_field)
+            .is_some_and(|rv| values_equal(&left_val, &rv))
+    }) else {
+        return None; // join miss → skip
+    };
+    let Some(key_val) = row.field_value(&kjp.right_field) else {
+        return None; // key absent on joined row → skip
+    };
+    Some(vec![key_val])
 }
 
 fn step_outcome(result: StepResult, progress: Option<StepProgress>) -> StepOutcome {

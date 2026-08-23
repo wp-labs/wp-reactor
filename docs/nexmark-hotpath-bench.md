@@ -32,9 +32,9 @@
 | Q1 | on each 投影 | 19.5M | 1.3GB | 4.5× | |
 | Q2 | on each 过滤 | 17.2M | 1.2GB | 2.6× | 绝对 EPS 高，简单查询 VVR 也快 |
 | Q3 | match+join+where | 18.9M | 1.3GB | 4.1× | |
-| Q4 | join-then-key+close avg | 3.4M | 5.9GB | 5.4× | 每 bid join + 状态累积 |
+| Q4 | join-then-key+close avg | 3.09M | 7.3GB | 5.4× | 批级 join-then-key 后 2.66M→3.09M（+16%，A/B 同负载） |
 | Q5 | fixed 10s+conv top | 4.3M | 3.0GB | 15.3× | |
-| Q6 | join-then-key 滑动 avg | 3.9M | 5.9GB | — | |
+| Q6 | join-then-key 滑动 avg | **0.5M** | 7.6GB | — | 旧值 3.9M 过期：26M EMIT（87% bid 每事件 emit）单核 106%，emit 路径为瓶颈 |
 | Q7 | fixed 10s max+conv top | **1.2M** | 4.4GB | 4.1× | 全表最低绝对 EPS |
 | Q8 | deferred exists | 21.1M | 1.3GB | 6.3× | |
 | Q9 | deferred reduce | 13.2M | 2.8GB | 35.2× | |
@@ -118,9 +118,9 @@ bench 项：`q5_q7_window_conv_top`。
 | Q1 | on each 列式发射 | `each_bench`（wfx_id/fired_at/entity/fill） | — |
 | Q2 | bind filter 数值 | `guard_bench`（q2_filter/no_filter） | — |
 | Q3 | match+snapshot join+where | `interval_bench`（snapshot 基础） | —（与 Q13/Q20 共享路径） |
-| Q4 | join-then-key+close avg | — | `q4_q6_join_then_key_advance` |
+| Q4 | join-then-key+close avg | — | `q4_q6_join_then_key_advance` + `q4_q6_join_then_key_batch_precompute`（批级预解析 vs 行式对拍+加速比） |
 | Q5 | fixed 10s count+conv top | — | `q5_q7_window_conv_top` |
-| Q6 | join-then-key 滑动 avg | — | `q4_q6_join_then_key_advance` |
+| Q6 | join-then-key 滑动 avg | — | `q4_q6_join_then_key_advance` + `q4_q6_join_then_key_batch_precompute` |
 | Q7 | fixed 10s max+conv top | — | `q5_q7_window_conv_top` |
 | Q8 | deferred exists | `deferred_bench`（eval-exists） | — |
 | Q9 | deferred reduce maxrow | `deferred_bench`（pending/eval-maxrow） | — |
@@ -148,8 +148,12 @@ bench 项：`q5_q7_window_conv_top`。
 
 | bench | ns/evt | M evt/s | 判定 | 对照 30M 实测 |
 |---|---|---|---|---|
-| q4 join-then-key+close | 837.1 | 1.19 | 🟡 见 A7 | 291ns/evt（3.4M） |
-| q6 join-then-key+sliding | **1176.7** | 0.85 | 🟡 见 A7；F4 后 -19%（1462→1177） | 255ns/evt（3.9M） |
+| q4 join-then-key+close | 837.1 | 1.19 | 🟡 见 A7 | 324ns/evt（3.09M，批级预解析后） |
+| q4 join-then-key 批级预解析 | **327.8** | **3.05** | ✅ 行式 68.7%（**1.46×**），同批对拍一致 | — |
+| q4 join-then-key 行式（内部解析） | 477.0 | 2.10 | 基准（同批对拍） | — |
+| q6 join-then-key+sliding | **1176.7** | 0.85 | 🟡 见 A7；F4 后 -19%（1462→1177） | **1960ns/evt（0.51M）**——旧 255ns（3.9M）过期：26M EMIT 每事件 emit 路径为瓶颈 |
+| q6 join-then-key 批级预解析 | **743.9** | **1.34** | ✅ 行式 83.4%（**1.20×**），同批对拍一致 | — |
+| q6 join-then-key 行式（内部解析） | 892.2 | 1.12 | 基准（同批对拍） | — |
 | q5 fixed10s count | 571.8 | 1.75 | ✅ 基线；F4 单跑 370 | 234ns/evt（4.3M） |
 | q7 fixed10s max | 681.7 | 1.47 | ✅ max vs count 仅 +19%（A6 修正） | 816ns/evt（1.2M） |
 | q5/q7 conv sort+top1 | 315.1 | 3.17 | ✅ F1 修复后 | — |
@@ -357,7 +361,43 @@ N=500k，同进程行式/列式对拍 + 输出逐位断言）**：
 ### 8.4 遗留
 
 - **D4 deferred join 窗口 pin**：落地后 bid over 可调小，q13 类查询 RSS 再降 ~3GB。
-- **match 形态的列式 join 富化**（q3/q4/q6）：each 家族已列式化；match+join 的
-  advance/match/close 富化仍行式，形态更复杂（step 数据 + 多 join），待专项。
+- **match 形态 join 富化 emit 路径**（q3/q6）：advance 的 join-then-key 已批级化（§8.5）；
+  match/close 输出时的 `execute_match_with_joins` 富化仍行式，待专项。
 - **q11/q18/q19 的 RSS**：均为同类积压/状态结构问题，待逐项归因。
 - **q22 split（A1）**：on-each 家族最高单事件成本，见 §7 遗留。
+
+### 8.5 批级 join-then-key（F7，2026-08-23）
+
+**背景**：q4/q6 的 `match<category|seller:...>` 键来自 snapshot join 右窗字段（
+join-then-key）——每事件 advance 都做一次 join 索引 lookup + `values_equal` 复核 +
+右窗键字段物化（A7：占 q4 advance 路径 ~88.8%）。NEXMark bid 的 auction 引用高度
+集中（50% 热点集中在最近 100 个）→ 一批 ~230 bid 去重后常 < 20 个唯一 auction。
+
+**实现**：
+- `precompute_join_then_keys`（新模块 `match_engine/match_engine/join_then_key.rs`，
+  pub 导出）：对一批事件按驱动 key 去重，每唯一 key 一次 lookup；int 左 key 取桶首行
+  （索引截断精确、复核恒真）；float 左 key 逐行复核（`1.5` 截断假匹配必须拒绝，与
+  `find_matching_row` 一致）；任一环节 miss → `None`（跳过）。
+- `advance_at_with_diagnostics` 新增 `key_override` 三态参数（`Some(Some(keys))` 用预
+  解析 / `Some(None)` 预解析 miss / `None` 内部解析）；`advance_at_with_masks_key`
+  对外暴露；`advance_at_with_masks`/`advance_at_with_progress` 保持旧行为。
+- rule_task `process_batch` 行循环前批级预解析（`key_overrides`），非 debug 路径走
+  `advance_at_with_masks_key`；debug 路径走内部解析（结果一致）。
+
+**微基准（`nexmark_hotpath_bench::q4_q6_join_then_key_batch_precompute`，release，
+N=500k，同批行式/批级对拍 + 前 10k 行 StepResult 逐位断言）**：
+
+| 路径 | ns/evt | M evt/s | 加速比 |
+|---|---|---|---|
+| q4 fixed10m 行式（内部解析） | 477.0 | 2.10 | 1× |
+| q4 fixed10m 批级预解析 | **327.8** | **3.05** | **1.46×** |
+| q6 sliding10m 行式（内部解析） | 892.2 | 1.12 | 1× |
+| q6 sliding10m 批级预解析 | **743.9** | **1.34** | **1.20×** |
+
+**30M 实测（单连接 replay，A/B 同负载）**：q4 2.66M → **3.09M**（+16%，CPU 94% 仍
+单核）；q3（非 join-then-key 对照）15.8M 无回归。q6 实测 0.51M 与改动无关（A/B
+stash 后同负载 0.50M）——q6 瓶颈是 26M EMIT 的每事件 emit 路径（score/entity/
+yield + join 富化），非 advance。
+
+**正确性**：`rule_task_key_join_tests`（3 用例：int 热点重复/miss、null+miss、float
+截断复核）逐行对拍两条路径 StepResult 序列一致；全量回归 2565 tests 绿。

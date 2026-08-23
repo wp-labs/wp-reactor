@@ -1125,6 +1125,94 @@ fn q4_q6_join_then_key_advance() {
     report("q6 join-then-key+sliding", q6_ns, q6_ns);
 }
 
+/// 批级 join-then-key（2026-08-23）：同一批列式行，路径 A 逐事件内部解析
+/// （`advance_at_with_masks`）vs 路径 B 批级预解析（`precompute_join_then_keys` +
+/// `advance_at_with_masks_key`）。前 K 行收集 StepResult 逐位对拍（防语义发散），
+/// 全量计时报告加速比。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine nexmark_hotpath_bench -- --ignored --nocapture"]
+fn q4_q6_join_then_key_batch_precompute() {
+    use crate::match_engine::event_bridge::ColumnarEvent;
+    use crate::match_engine::precompute_join_then_keys;
+
+    const K: usize = 10_000; // 对拍抽样行
+    let batch = bid_batch(N);
+    let lookup = AuctionLookup::new(AUCTION_DOMAIN);
+    let row_domain: Vec<usize> = (0..N).collect();
+
+    for (label, fixed) in [("q4 fixed10m", true), ("q6 sliding10m", false)] {
+        let plan = q4_q6_plan(fixed);
+        let kjp = plan.key_join.as_ref().unwrap();
+        let keys = precompute_join_then_keys(&batch, &row_domain, kjp, &lookup);
+        assert_eq!(keys.len(), N, "{label}: 每行一个预解析 key");
+
+        // 正确性对拍：前 K 行 StepResult 序列逐位一致（同 rule_name）。
+        let mut sm_a = CepStateMachine::new("q".into(), plan.clone(), None);
+        let mut sm_b = CepStateMachine::new("q".into(), plan.clone(), None);
+        for i in 0..K {
+            let ev = ColumnarEvent::new(&batch, i);
+            let ts = NOW + i as i64 * EVENT_STEP_NS;
+            let ra = sm_a.advance_at_with_masks("b", &ev, ts, Some(&lookup), i, None);
+            let rb = sm_b.advance_at_with_masks_key(
+                "b",
+                &ev,
+                ts,
+                Some(&lookup),
+                i,
+                None,
+                Some(&keys[i]),
+            );
+            assert_eq!(
+                ra, rb,
+                "{label} row {i}: 批级预解析 vs 内部解析结果必须一致"
+            );
+        }
+        assert_eq!(
+            sm_a.instance_count(),
+            sm_b.instance_count(),
+            "{label}: 实例数一致"
+        );
+
+        // 计时：路径 A（内部解析，基线）。
+        let mut sm = CepStateMachine::new("q".into(), plan.clone(), None);
+        let t0 = Instant::now();
+        for i in 0..N {
+            let ev = ColumnarEvent::new(&batch, i);
+            let ts = NOW + i as i64 * EVENT_STEP_NS;
+            let _ = std::hint::black_box(sm.advance_at_with_masks(
+                "b",
+                &ev,
+                ts,
+                Some(&lookup),
+                i,
+                None,
+            ));
+        }
+        let row_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+
+        // 计时：路径 B（批级预解析）。
+        let mut sm2 = CepStateMachine::new("q".into(), plan, None);
+        let t1 = Instant::now();
+        for i in 0..N {
+            let ev = ColumnarEvent::new(&batch, i);
+            let ts = NOW + i as i64 * EVENT_STEP_NS;
+            let _ = std::hint::black_box(sm2.advance_at_with_masks_key(
+                "b",
+                &ev,
+                ts,
+                Some(&lookup),
+                i,
+                None,
+                Some(&keys[i]),
+            ));
+        }
+        let batch_ns = t1.elapsed().as_secs_f64() * 1e9 / N as f64;
+
+        report(&format!("{label} 批级预解析"), batch_ns, row_ns);
+        report(&format!("{label} 行式(内部解析)"), row_ns, row_ns);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bench 2：Q5/Q7 fixed 10s 窗口 advance + conv sort/top(1) 归并
 // ---------------------------------------------------------------------------

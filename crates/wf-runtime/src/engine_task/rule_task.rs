@@ -925,6 +925,21 @@ impl RuleTask {
         // path (emit_nanos dominated the profiling budget).
         let mut conv_max_wm: i64 = 0;
         let mut hit_cursor = 0usize;
+        // 批级 join-then-key 预解析（2026-08-23，q4/q6：advance 88.8% 的 join
+        // 取键热路径——每 bid 一次索引 lookup + values_equal 复核 + key 字段
+        // 物化）。对一批事件按驱动 key 去重 lookup，每行得到预解析 scope key，
+        // advance 传入跳过内部每事件解析。非 key_join 规则 → None（原逻辑）。
+        let key_join_plan: Option<wf_lang::plan::JoinKeyPlan> = self
+            .machine
+            .as_ref()
+            .and_then(|m| m.plan().key_join.clone());
+        let key_overrides: Option<Vec<Option<Vec<wf_engine::match_engine::Value>>>> =
+            match (&key_join_plan, batch) {
+                (Some(kjp), Some(b)) => {
+                    Some(precompute_join_then_keys(b, &row_domain, kjp, &lookup))
+                }
+                _ => None,
+            };
         // Iterate the row domain: `i` is the position within `row_domain`
         // (matches the row-domain-relative `DeferredRows` times/hit_indices),
         // `row_index` is the absolute batch row it maps to.
@@ -1023,6 +1038,8 @@ impl RuleTask {
                         }
                         let should_capture_progress = debug_enabled && stats.can_log_detail();
                         let (step_result, progress) = if should_capture_progress {
+                            // debug 路径走内部解析（结果与预解析一致——批级共享同一
+                            // lookup + values_equal 语义）。
                             let outcome = machine.advance_at_with_progress(
                                 alias,
                                 &row_event,
@@ -1032,13 +1049,14 @@ impl RuleTask {
                             (outcome.result, outcome.progress)
                         } else {
                             (
-                                machine.advance_at_with_masks(
+                                machine.advance_at_with_masks_key(
                                     alias,
                                     &row_event,
                                     event_nanos,
                                     Some(&lookup),
                                     row_index,
                                     Some(&branch_masks),
+                                    key_overrides.as_ref().map(|ko| &ko[i]),
                                 ),
                                 None,
                             )
@@ -3596,12 +3614,27 @@ mod pipe_stager_tests {
     }
 }
 
+/// 批级 join-then-key（Path A）scope key 预解析（2026-08-23，q4/q6）：
+/// 实现已迁至 `wf_engine::match_engine::precompute_join_then_keys`（与
+/// `CepStateMachine::advance_at_with_masks_key` 的 key_override 配套），见
+/// crates/wf-engine/src/match_engine/match_engine/join_then_key.rs 模块文档。
+fn precompute_join_then_keys(
+    batch: &arrow::record_batch::RecordBatch,
+    row_domain: &[usize],
+    kjp: &wf_lang::plan::JoinKeyPlan,
+    windows: &impl wf_engine::match_engine::WindowLookup,
+) -> Vec<Option<Vec<wf_engine::match_engine::Value>>> {
+    wf_engine::match_engine::precompute_join_then_keys(batch, row_domain, kjp, windows)
+}
+
 #[cfg(test)]
 #[path = "rule_task_coverage.rs"]
 mod rule_task_coverage;
 #[cfg(test)]
 #[path = "rule_task_coverage_more.rs"]
 mod rule_task_coverage_more;
+#[cfg(test)]
+mod rule_task_key_join_tests;
 #[cfg(test)]
 #[path = "rule_task_r4.rs"]
 mod rule_task_r4;
