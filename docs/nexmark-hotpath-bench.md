@@ -60,7 +60,9 @@
 
 同为无状态纯投影，Q22 只有 `let parts = split(url) + 3×mvindex + concat` 的字符串成本。
 30M 数据 ≈ 6.6 亿次小分配（split 返回 Vec<String>）。**vs VVR 2.4× 全表最弱**。
-bench 项：`q22_each_split`（预期 80~150ns/evt，若 >200ns 需字符串列式化/复用 buffer）。
+bench 项：`q22_each_split`。实测 **2069ns**（2026-08-23 F4 后）——超出 §3 阈值
+（>200ns 需优化）11 倍，**待重新评估**（split buffer 复用 / mvindex 免 Value 包装
+/ concat 预分配），见 §7 遗留。
 
 ### 🔴 A2 — Q13 RSS 22.0GB 全表最高 + EPS 2.2M 全表最低
 
@@ -136,48 +138,55 @@ bench 项：`q5_q7_window_conv_top`。
 | Q21 | bind filter 字符串 | — | `q21_string_bind_filter` |
 | Q22 | each+split 字符串 | `match_bench`（旧 asof 形态，已废弃） | `q22_each_split` |
 
-## 5. 实测结果（2026-08-23，Mac，release）
+## 5. 实测结果（2026-08-23，Mac，release，**F4 后**）
 
 > 命令：`cargo test --release -p wf-engine nexmark_hotpath_bench -- --ignored --nocapture`
 > N = 500,000 事件；数据域 bidder≈1000 / auction≈100 / 价格对数均匀；单事件顺序调用
 > （eager 路径，**非生产批处理**——生产 EPS 普遍高 3~12×，见对照列）。
+> 本表为 F4（fire 跳过 trigger_event clone）之后全量混跑；机器负载波动 ±30%——
+> F4 受益查询的单跑稳定值见判定修正（q5 370 / q12 592 / q11 615 / q13 611）。
 
 | bench | ns/evt | M evt/s | 判定 | 对照 30M 实测 |
 |---|---|---|---|---|
-| q4 join-then-key+close | 788.1 | 1.27 | 🟡 见 A7 | 291ns/evt（3.4M） |
-| q6 join-then-key+sliding | 1461.6 | 0.68 | 🟡 见 A7 | 255ns/evt（3.9M） |
-| q5 fixed10s count | 525.3 | 1.90 | ✅ 基线 | 234ns/evt（4.3M） |
-| q7 fixed10s max | 673.8 | 1.48 | ✅ max vs count 仅 +28%（A6 修正） | 816ns/evt（1.2M） |
-| q5/q7 conv sort+top1 | 333.9 | 3.00 | ✅ F1 修复后 | — |
-| q11 session(10s) | 668.2 | 1.50 | ✅ 与 fixed 同量级（A3 修正：bench 无差） | 402ns/evt（2.5M） |
-| q12 fixed10s count | 655.4 | 1.53 | ✅ 基线 | 55ns/evt（18.1M） |
-| q13 advance | 474.9 | 2.11 | ✅ | 454ns/evt（2.2M） |
-| q13 match+join emit | **1800.2** | 0.56 | 🔴 **advance 的 3.8×**（A2 确认） | — |
-| q14 filter+strftime | 778.5 | 1.28 | ✅ | 49ns/evt（20.3M） |
-| q16 channel-keyed close | 1487.2 | 0.67 | 🟡 见 A6-close | 71ns/evt（14.0M） |
-| q17 auction-keyed close | 1651.4 | 0.61 | 🟡 见 A6-close | 67ns/evt（15.0M） |
-| q18 composite-key close | **2292.1** | 0.44 | 🔴 复合键 vs 单键 +39%（A4 确认） | 315ns/evt（3.2M） |
-| q19 stats rows top10 | 211.9 | 4.72 | ✅ | 218ns/evt（4.6M） |
-| q19 stats batch top10 | **88.5** | 11.29 | ✅ 列式 2.4× 行式 | — |
-| q20 each+join+where | **1317.1** | 0.76 | 🟡 join 富化 + where | 141ns/evt（7.1M） |
-| q21 str bind filter | 745.3 | 1.34 | ✅ | 62ns/evt（16.0M） |
-| q22 each+split | **2222.3** | 0.45 | 🔴 on-each 家族最高（A1 确认） | 130ns/evt（7.7M） |
+| q4 join-then-key+close | 837.1 | 1.19 | 🟡 见 A7 | 291ns/evt（3.4M） |
+| q6 join-then-key+sliding | **1176.7** | 0.85 | 🟡 见 A7；F4 后 -19%（1462→1177） | 255ns/evt（3.9M） |
+| q5 fixed10s count | 571.8 | 1.75 | ✅ 基线；F4 单跑 370 | 234ns/evt（4.3M） |
+| q7 fixed10s max | 681.7 | 1.47 | ✅ max vs count 仅 +19%（A6 修正） | 816ns/evt（1.2M） |
+| q5/q7 conv sort+top1 | 315.1 | 3.17 | ✅ F1 修复后 | — |
+| q11 session(10s) | 709.3 | 1.41 | ✅ 与 fixed 同量级（A3 修正）；F4 单跑 615 | 402ns/evt（2.5M） |
+| q12 fixed10s count | 697.0 | 1.43 | ✅ 基线；F4 单跑 592 | 55ns/evt（18.1M） |
+| q13 advance | 696.0 | 1.44 | ✅ F4 单跑 611（-38%） | 454ns/evt（2.2M） |
+| q13 match+join emit | **1877.9** | 0.53 | 🔴 **advance 的 2.7×**（A2 确认） | — |
+| q14 filter+strftime | 766.1 | 1.31 | ✅ | 49ns/evt（20.3M） |
+| q16 channel-keyed close | 1566.6 | 0.64 | 🟡 见 A6-close | 71ns/evt（14.0M） |
+| q17 auction-keyed close | 1589.2 | 0.63 | 🟡 见 A6-close | 67ns/evt（15.0M） |
+| q18 composite-key close | **2554.9** | 0.39 | 🔴 复合键 vs 单键 +61%（A4 确认） | 315ns/evt（3.2M） |
+| q19 stats rows top10 | 202.5 | 4.94 | ✅ | 218ns/evt（4.6M） |
+| q19 stats batch top10 | **89.4** | 11.19 | ✅ 列式 2.3× 行式 | — |
+| q20 each+join+where | **1320.3** | 0.76 | 🟡 join 富化 + where | 141ns/evt（7.1M） |
+| q21 str bind filter | 723.3 | 1.38 | ✅ | 62ns/evt（16.0M） |
+| q22 each+split | **2069.5** | 0.48 | 🔴 on-each 家族最高（A1 确认） | 130ns/evt（7.7M） |
 
 ### 判定修正（实测 vs 静态分析）
 
 - **A2（Q13）确认**：`execute_match_with_joins`（join 富化 + `build_eval_context` +
-  `build_match_alert`）1800ns = advance 475ns 的 **3.8×**——每事件 fire + 富化是
-  Q13 2.2M EPS 的主因。
-- **A1（Q22）确认**：2222ns 为 on-each 家族（q21 745 / q14 778）的 ~3×；split
-  `Vec<Value>` 分配 + concat 拼接为语言语义固有成本。
-- **A4（Q18）确认**：复合键 2292ns vs 单键 q17 1651ns（+39%）——复合键提取/
-  实例管理成本。
-- **A6（Q7）修正**：max measure 673.8ns vs count 525.3ns 仅 **+28%**，不是 30M 表
+  `build_match_alert`）1878ns = advance 696ns 的 **2.7×**——每事件 fire + 富化是
+  Q13 2.2M EPS 的主因。F4（跳过 fire clone）已把 advance 从 ~985 压到 611（单跑）；
+  剩余大头是 execute_joins 富化（~48%）+ build_eval_context（~35%）。
+- **A1（Q22）确认**：2069ns 为 on-each 家族（q21 723 / q14 766）的 ~2.8×；split
+  `Vec<Value>` 分配 + concat 拼接。**超出 §3 阈值（200ns）11 倍——值得重新评估
+  （split buffer 复用 / mvindex 免 Value 包装），见 §7 遗留**。
+- **A4（Q18）确认**：复合键 2555ns vs 单键 q17 1589ns（+61%，混跑波动）——复合键
+  提取/实例管理成本。
+- **A6（Q7）修正**：max measure 681.7ns vs count 571.8ns 仅 **+19%**，不是 30M 表
   1.2M vs 4.3M（3.6×）的根因——后者应归因于负载/conv 批大小，max 本身无缺陷。
-- **A3（Q11）修正**：session 668ns vs fixed 655ns 同量级；RSS 17.3GB 为状态/积压
+- **A3（Q11）修正**：session 709ns vs fixed 697ns 同量级；RSS 17.3GB 为状态/积压
   问题而非每事件成本。
+- **F4 效果（单跑对比，避开混跑争抢）**：q5 640→**370**（-42%）、q13 advance
+  985→**611**（-38%）、q12 762→**592**（-22%）、q11 756→**615**（-19%）、
+  q6 1350→**1177**（-13%）。
 - **对照差异说明**：bench 单事件顺序调用 vs 生产列式批处理 + 多线程分片，EPS 差
-  3~12×（q12 655 vs 55、q14 778 vs 49）——bench 用于**相对归因**，绝对值看生产。
+  3~12×（q12 697 vs 55、q14 766 vs 49）——bench 用于**相对归因**，绝对值看生产。
 
 ## 6. 判定标准（供后续自动比对）
 
@@ -245,7 +254,9 @@ fire + match/close 输出路径的 ctx 构建（Q3/Q4/Q5/Q6/Q7/Q12/Q13/Q20）。
 
 ### 🔍 已审查、暂不改（需实测数据或改动面大）
 
-- **Q22 split**：`Vec<Value>` 分配为语言语义固有成本，`let parts` 绑定已避免
-  重复 split，无静态改进空间。
-- **Q13/Q11/Q18 RSS**：需运行确认是状态物化还是管道积压（q22 的 RSS 已实证
-  为积压），不做无数据优化。
+- **Q22 split（A1）**：实测 2069ns 超出 §3 阈值 11 倍——**重新评估**：split 复用
+  输出 buffer（Vec 预分配）、mvindex 直接索引 str 段避免 Value 包装、concat 预分配
+  容量。此前判"无静态改进空间"与阈值矛盾，待专项做。
+- **Q13/Q11/Q18 RSS（A2/A3/A4）**：需运行确认是状态物化还是管道积压（q22 的 RSS
+  已实证为积压），不做无数据优化。
+- **Q19 top-N RSS（A5）** / **Q4/Q6 join-then-key RSS（A7）**：确认但未优化。
