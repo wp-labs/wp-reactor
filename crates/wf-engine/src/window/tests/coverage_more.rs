@@ -313,9 +313,11 @@ async fn sharded_row_broadcast_with_missing_key_routes_to_shard_zero() {
 }
 
 #[tokio::test]
-async fn broadcast_with_batch_sharded_row_path_leaves_batch_none() {
-    // Row-based sharded broadcast partitions pre-materialized events; the raw
-    // batch is not forwarded (row indices no longer match the whole batch).
+async fn broadcast_with_batch_sharded_row_path_forwards_batch_and_shard_rows() {
+    // 2026-08-23 行为变更：分片广播带 batch 时，转发 batch + shard_rows
+    // （列式分片下游——stats 任务——需要 batch；行消费者用 shard_rows 索引
+    // events）。此前只转发 events（batch=None）→ 列式分片下游静默饿死
+    // （q4a→auction_finals→q4b(stats) 双规则链断链，q4b EMIT=0）。
     let fanout = RuleFanout::new();
     let (tx0, mut rx0) = mpsc::channel::<RulePush>(8);
     let (tx1, _rx1) = mpsc::channel::<RulePush>(8);
@@ -327,9 +329,9 @@ async fn broadcast_with_batch_sharded_row_path_leaves_batch_none() {
         .await;
     let push = rx0.try_recv().expect("shard 0 receives the sub-batch");
     assert!(push.events.is_some());
+    assert!(push.batch.is_some(), "sharded push must forward the batch");
     assert!(
-        push.batch.is_none(),
-        "row-based sharded push drops the batch"
+        push.shard_rows.is_some(),
+        "sharded push must carry the row subset"
     );
-    assert!(push.shard_rows.is_none());
 }

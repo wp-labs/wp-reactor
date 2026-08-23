@@ -298,7 +298,7 @@ impl RuleFanout {
     /// (pull model — no delivery channel registered). The pull-model case is
     /// what lets `route_parse` precompute `shard_rows` for storage in the
     /// window log without any rule delivery channel.
-    pub(crate) fn precompute_shard_rows(
+    pub fn precompute_shard_rows(
         &self,
         window_name: &str,
         batch: &RecordBatch,
@@ -375,18 +375,26 @@ impl RuleFanout {
                 }
                 Subscription::Sharded { shards, keys } => {
                     match (events, batch_arc.as_ref()) {
-                        // Row-based (pre-materialized events): keep the existing
-                        // per-event key partition.
-                        (Some(events), _) => {
+                        // Row-based (pre-materialized events), **no batch**:
+                        // keep the existing per-event key partition.
+                        (Some(events), None) => {
                             sharded_sends(shards, keys, &window_name, events, seq, &mut sends);
                         }
-                        // Columnar deferred (events=None): partition the raw batch
-                        // by key and send each shard the batch + its row subset.
-                        // Reuse the parse-side-precomputed `shard_rows` when it
-                        // matches this subscription's shard count (off the actor's
-                        // serial O(batch) partition work); otherwise fall back to
-                        // a defensive re-partition (config drift / hot reload).
-                        (None, Some(batch)) => {
+                        // Batch available (with or without pre-materialized
+                        // events): partition the raw batch by key and send each
+                        // shard the batch + its row subset + the shared events
+                        // (columnar consumers like the stats executor read the
+                        // batch; row consumers index the events via shard_rows).
+                        //
+                        // The `events-only` sharded path (pipe relay broadcast
+                        // carried no batch) silently starved columnar shard
+                        // consumers — q4a→auction_finals→q4b(stats) chain emitted
+                        // nothing (2026-08-23). Reuse the parse-side-precomputed
+                        // `shard_rows` when it matches the subscription's shard
+                        // count (off the actor's serial O(batch) partition work);
+                        // otherwise fall back to a defensive re-partition
+                        // (config drift / hot reload).
+                        (events, Some(batch)) => {
                             let pre = match shard_rows {
                                 Some(pre) if pre.len() == shards.len() => Some(pre),
                                 _ => None,
@@ -409,7 +417,7 @@ impl RuleFanout {
                                 }
                                 let push = RulePush {
                                     window_name: Arc::clone(&window_name),
-                                    events: None,
+                                    events: events.map(Arc::clone),
                                     batch: batch_arc.clone(), // shared Arc (refcount, zero copy)
                                     materialize_fields: materialize_fields.map(Arc::clone),
                                     shard_rows: Some(Arc::new(rows.clone())),

@@ -50,7 +50,7 @@ type PendingAliasRows = Vec<(
     u64,
 )>;
 /// Staged pipe batch: (window name, events) or `None` when nothing staged.
-type PendingEventBatch = Option<(Arc<str>, Arc<Vec<Arc<Event>>>)>;
+type PendingEventBatch = Option<(Arc<str>, Arc<Vec<Arc<Event>>>, RecordBatch)>;
 /// Batch the allocation-heavy per-alert telemetry (detail map + e2e latency
 /// histogram): only 1 in N emitted alerts updates those, the exact total is
 /// always counted.
@@ -2261,6 +2261,13 @@ impl RuleTask {
 
     async fn emit(&self, record: OutputRecord) {
         if self.intermediate_targets.contains(&*record.yield_target) {
+            // 2026-08-23 q4：intermediate 输出也计入 `emitted_total`——
+            // verify-nexmark 读 EMIT 对拍，中间窗口行数（q4a→auction_finals
+            // 的输出量）是内层语义的体现，不计则 verify 读到 0（oracle 557,204）。
+            // alert detail/e2e 不采样（intermediate 非最终告警）。
+            if let Some(metrics) = &self.metrics {
+                metrics.inc_alert_emitted_total(&record.rule_name);
+            }
             self.stage_pipe_record(record);
             return;
         }
@@ -3063,11 +3070,33 @@ impl RuleTask {
                 _ => None,
             }
         };
-        if let Some((target, events)) = built {
+        if let Some((target, events, batch)) = built {
+            // 2026-08-23 q4 修复：pipe relay 若只广播（纯 relay，无窗口存储），
+            // **pull 模式**的列式下游（stats 任务从窗口读）收不到——
+            // q4a→auction_finals→q4b(stats) 默认 pull 双规则链断链（q4b EMIT=0）。
+            // 修复：append 到目标窗口（带分片行子集，供 pull 分片消费方读）+
+            // 广播（带 batch，供 push 消费方收）。两者共享同一批次，无复制。
+            if let Some(win) = self.router.registry().get_window(target.as_ref()) {
+                let shard_rows = self
+                    .router
+                    .fanout()
+                    .precompute_shard_rows(target.as_ref(), &batch);
+                let _ = win.append_with_watermark_sized(
+                    batch.clone(),
+                    wf_engine::window::content_bytes(&batch),
+                    shard_rows.map(|s| {
+                        let v: Vec<Vec<u32>> = s.iter().cloned().collect();
+                        std::sync::Arc::new(v)
+                    }),
+                );
+            }
             let fan_start = Instant::now();
+            // 带 batch 广播（2026-08-23 q4 修复）：仅 events 的 relay 广播会让
+            // 列式分片下游（stats 任务只看 `push.batch`）收不到——
+            // q4a→auction_finals→q4b(stats) 双规则链断链（q4b EMIT=0）。
             self.router
                 .fanout()
-                .broadcast(&target, &events, u64::MAX)
+                .broadcast_with_batch(&target, &events, &batch, None, u64::MAX)
                 .await;
             self.fanout_nanos
                 .fetch_add(fan_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3365,7 +3394,7 @@ impl PipeBatchStager {
                 .map(Arc::new)
                 .collect(),
         );
-        Ok(Some((Arc::clone(&self.target), events)))
+        Ok(Some((Arc::clone(&self.target), events, batch)))
     }
 }
 
@@ -3640,7 +3669,7 @@ mod pipe_stager_tests {
         for record in &records {
             stager.push_record(record).expect("stage row");
         }
-        let (_, staged) = stager.take_events().unwrap().expect("rows staged");
+        let (_, staged, _) = stager.take_events().unwrap().expect("rows staged");
         assert_eq!(staged.len(), records.len());
 
         // Row 0 — every field present, happy path.
@@ -3722,7 +3751,7 @@ mod pipe_stager_tests {
             vec![("event_time".into(), Value::Number(1_700_000_000_123.0))],
         );
         stager.push_record(&record).expect("stage row");
-        let (_, staged) = stager.take_events().unwrap().expect("rows staged");
+        let (_, staged, _) = stager.take_events().unwrap().expect("rows staged");
         assert_eq!(
             staged[0].fields.get("event_time"),
             Some(&Value::Number(ts as f64)),
@@ -3802,7 +3831,7 @@ mod pipe_stager_tests {
                 ))
                 .unwrap();
         }
-        let (_, events) = stager.take_events().unwrap().expect("rows staged");
+        let (_, events, _) = stager.take_events().unwrap().expect("rows staged");
         assert_eq!(events.len(), rows);
         for (i, event) in events.iter().enumerate() {
             assert_eq!(event.fields.get("n_i"), Some(&Value::Number(i as f64)));

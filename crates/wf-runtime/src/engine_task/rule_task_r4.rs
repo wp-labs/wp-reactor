@@ -749,7 +749,7 @@ fn pipe_stager_event_time_field_null_column_and_timestamp_non_number() {
     stager
         .push_record(&record)
         .expect("stage with Null event-time col");
-    let (_, events) = stager.take_events().unwrap().expect("rows staged");
+    let (_, events, _) = stager.take_events().unwrap().expect("rows staged");
     assert_eq!(events.len(), 1);
     // event_time 列为 Timestamp 但值为非数值 → `_ => None` 分支。
     let schema = Arc::new(Schema::new(vec![
@@ -766,7 +766,7 @@ fn pipe_stager_event_time_field_null_column_and_timestamp_non_number() {
     stager
         .push_record(&record)
         .expect("stage with non-number time");
-    let (_, events) = stager.take_events().unwrap().expect("rows staged");
+    let (_, events, _) = stager.take_events().unwrap().expect("rows staged");
     assert_eq!(events[0].fields.get("event_time"), None);
 }
 

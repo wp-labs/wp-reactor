@@ -3173,14 +3173,16 @@ async fn pipeline_stage_output_writes_internal_window_instead_of_alert_channel()
         "internal pipeline stage must not emit sink alerts"
     );
 
-    // Pure relay: the internal pipe is NOT stored — events broadcast downstream.
+    // 2026-08-23 行为变更：pipe flush 同时 **append 目标窗口**（供 pull 模式的
+    // 下游消费方读取——q4a→auction_finals→q4b(stats) 双规则链；纯 relay 只广播
+    // 会让 pull 消费方静默饿死）+ 广播（供 push 消费方）。
     assert!(
-        router
+        !router
             .registry()
             .snapshot("__wf_pipe_pipe_s1_w1")
             .unwrap_or_default()
             .is_empty(),
-        "pure relay: internal pipe must not be stored in a window"
+        "pipe flush must append the internal window (pull consumers read it)"
     );
     let push = down_rx
         .try_recv()
@@ -3221,14 +3223,15 @@ async fn intermediate_target_writes_window_instead_of_alert_channel() {
         "intermediate targets must not emit sink alerts"
     );
 
-    // Pure relay: no window storage; events broadcast to downstream rules.
+    // 2026-08-23 行为变更：pipe flush append 目标窗口（pull 消费方读取）+
+    // 广播（push 消费方）。
     assert!(
-        router
+        !router
             .registry()
             .snapshot("enriched_events")
             .unwrap_or_default()
             .is_empty(),
-        "pure relay: intermediate pipe must not be stored in a window"
+        "intermediate pipe flush must append the target window"
     );
     let push = down_rx
         .try_recv()
@@ -3286,13 +3289,14 @@ async fn intermediate_target_preserves_explicit_time_field() {
 
     // Pure relay: no window storage; the broadcast event preserves the explicit
     // time field as epoch nanos.
+    // 2026-08-23 行为变更：pipe flush 同时 append 目标窗口（pull 消费方）。
     assert!(
-        router
+        !router
             .registry()
             .snapshot("enriched_events")
             .unwrap_or_default()
             .is_empty(),
-        "pure relay: intermediate pipe must not be stored in a window"
+        "intermediate pipe flush must append the target window"
     );
     let push = down_rx
         .try_recv()
@@ -3729,13 +3733,15 @@ async fn pure_relay_broadcasts_to_sharded_downstream() {
     task.pull_and_advance().await;
 
     // Pure relay: nothing stored in the intermediate window.
+    // 2026-08-23 行为变更：pipe flush 同时 append 目标窗口（pull 消费方读取
+    // 分片行子集）——shard_rows 由 fanout 预计算，append 带分区。
     assert!(
-        router
+        !router
             .registry()
             .snapshot("__wf_pipe_pipe_s1_w1")
             .unwrap_or_default()
             .is_empty(),
-        "pure relay: sharded intermediate pipe must not be stored"
+        "sharded pipe flush must append the internal window"
     );
 
     let a: Vec<_> = std::iter::from_fn(|| shard_a_rx.try_recv().ok()).collect();
