@@ -958,6 +958,8 @@ fn find_pipeline_window_over(plans: &[wf_lang::plan::RulePlan], window: &str) ->
             wf_lang::plan::WindowSpec::Sliding(d)
             | wf_lang::plan::WindowSpec::Fixed(d)
             | wf_lang::plan::WindowSpec::Session(d) => d,
+            // Hop 的管道 over = 窗口大小（下游需保留整窗数据）。
+            wf_lang::plan::WindowSpec::Hop { size, .. } => size,
         })
 }
 
@@ -1212,6 +1214,79 @@ rule pipe {
         let cfg = &configs[0];
         assert_eq!(cfg.name, ws.name);
         assert_eq!(cfg.mode, DistMode::Local);
+    }
+
+    #[test]
+    fn pipeline_hop_stage_window_over_uses_hop_size() {
+        // 管道下游 stage 用 hop(size, slide)：内部管道窗 over = size（下游需
+        // 保留整窗数据），而非 slide（find_pipeline_window_over Hop 臂）。
+        let base_schemas = vec![
+            WindowSchema {
+                name: "fw_events".into(),
+                streams: vec!["syslog".into()],
+                time_field: Some("event_time".into()),
+                over: Duration::from_secs(3600),
+                fields: vec![
+                    FieldDef {
+                        name: "event_time".into(),
+                        field_type: FieldType::Base(BaseType::Time),
+                    },
+                    FieldDef {
+                        name: "sip".into(),
+                        field_type: FieldType::Base(BaseType::Ip),
+                    },
+                    FieldDef {
+                        name: "dport".into(),
+                        field_type: FieldType::Base(BaseType::Digit),
+                    },
+                ],
+            },
+            WindowSchema {
+                name: "alerts".into(),
+                streams: vec![],
+                time_field: Some("emit_time".into()),
+                over: Duration::from_secs(3600),
+                fields: vec![
+                    FieldDef {
+                        name: "emit_time".into(),
+                        field_type: FieldType::Base(BaseType::Time),
+                    },
+                    FieldDef {
+                        name: "sip".into(),
+                        field_type: FieldType::Base(BaseType::Ip),
+                    },
+                ],
+            },
+        ];
+
+        let wfl = parse_wfl(
+            r#"
+rule pipe {
+  events { e: fw_events }
+  match<sip,dport:5m> {
+    on event { c1: e | count >= 1; }
+  }
+  |> match<sip:hop(10s, 2s)> {
+    on event { c2: _in | count >= 1; }
+  } -> score(80.0)
+  entity(ip, _in.sip)
+  yield alerts (sip = _in.sip)
+}
+"#,
+        )
+        .unwrap();
+        let plans = wf_lang::compile_wfl(&wfl, &base_schemas).unwrap();
+
+        let (schemas, _configs) =
+            build_pipeline_internal_windows(&plans, &base_schemas, &defaults());
+        assert_eq!(schemas.len(), 1);
+        let ws = &schemas[0];
+        assert_eq!(ws.name, "__wf_pipe_pipe_w1");
+        assert_eq!(
+            ws.over,
+            Duration::from_secs(10),
+            "hop 管道 over = 窗口 size(10s)，而非 slide(2s)"
+        );
     }
 
     #[test]

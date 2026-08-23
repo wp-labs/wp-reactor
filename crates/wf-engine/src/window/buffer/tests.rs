@@ -1325,7 +1325,9 @@ fn join_lookup_asof_max_fast_path() {
     ));
     // Miss must be consistent with the fallback scan: every candidate ts is
     // below min_ts, so `find_asof_row` would also return `None`.
-    let cands = win.join_lookup_timestamped(&JoinKey::Int(42), None).unwrap();
+    let cands = win
+        .join_lookup_timestamped(&JoinKey::Int(42), None)
+        .unwrap();
     assert!(
         cands.iter().all(|(ts, _)| *ts < 4_000_000_000),
         "Miss implies all candidate timestamps are below the asof lower bound"

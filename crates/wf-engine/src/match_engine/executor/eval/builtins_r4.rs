@@ -488,8 +488,8 @@ fn math_functions_positive_negative_and_nonfinite() {
 
     assert_eq!(eval("round", &[num_expr(3.7)], &ctx), Some(num(4.0)));
     assert_eq!(
-        eval("round", &[num_expr(3.14159), num_expr(2.0)], &ctx),
-        Some(num(3.14))
+        eval("round", &[num_expr(12.3456), num_expr(2.0)], &ctx),
+        Some(num(12.35))
     );
     assert_eq!(eval("round", &[lit("x")], &ctx), None);
     assert_eq!(eval("round", &[num_expr(1.0), lit("x")], &ctx), None);

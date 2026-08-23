@@ -2,6 +2,19 @@
 
 All notable changes to wp-reactor will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **wf-lang / wf-engine / wf-runtime**: HOP sliding window operator — `match<key:hop(size, slide)>`（`size % slide == 0`）。每个事件扇入 `size/slide` 个覆盖窗口（epoch slide 对齐），窗口在 `w_start + size` 收口（slide 对齐）。
+  - 引擎：`advance_at_with_diagnostics` 尾部抽取为 `advance_window(scope_key, window_start)` 助手，HOP 逐窗口扇出并 `merge_step_outcome` 合并结果；`expire_time_for`/`close`/expiry 堆均按 hop 窗口收口。
+  - 扫描：hop 规则 per-event 扫描用无界预算（每 slide 边界恰一个窗口到期，关闭数受窗口内键数约束）——1024 预算会把同一窗口关闭拆多批、inline conv 逐批 top-1 造成同窗口重复 EMIT。
+  - conv：`conv` 块对 hop 窗口放开（checker），inline conv 每窗口一个收口批。
+  - oracle（wfgen）：hop 扫描步长 = slide 边界 + 无界预算，与引擎口径一致。
+  - 已知 v1 局限：hop + OR-mode `on event`（无 close 块）时，同一事件的多窗口 fire 经 `merge_step_outcome` 仅返回一个 Matched——每事件输出一个窗口命中（`and close` 形态不受影响，输出在窗口收口扫描逐窗口完整）。
+  - **conv `top_ties(N)`（RANK 语义并列全输出）**：`sort(...) | top_ties(N)` 取前 N 条并保留所有与第 N 条排序键等值的条目（并列全出）。checker 要求前导 `sort`；Q5/Q7 并列语义对齐（Q5 窗口并列最高 count、Q7 窗口并列最高价 auction 全输出）。修复 `top_ties(0)` 越界 panic（退化为空输出）。
+  - **测试**：新增代码（HOP 引擎/语法链/rule_task 扫描 + conv `top_ties`）测试覆盖率 **100%**（cargo llvm-cov 新增行口径，全 workspace 2587 测试全绿）；rule-task 级 hop 集成测试 4 例（slide 边界逐窗收口、多 key 独立收口、size==slide 等价 fixed、conv-sink 无界扫描路由 + flush drained），编译器/explain 补 hop 窗与 top_ties 格式/编译臂，lifecycle 补管道 hop stage `over=size` 臂。
+
 ## [1.2.0] — 2026-08-19
 
 ### Added

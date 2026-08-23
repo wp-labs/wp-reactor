@@ -197,12 +197,13 @@ fn config_diff_flags() {
     .command
     {
         Commands::Config {
-            command: ConfigCommands::Diff {
-                load,
-                compare,
-                filter,
-                expanded,
-            },
+            command:
+                ConfigCommands::Diff {
+                    load,
+                    compare,
+                    filter,
+                    expanded,
+                },
         } => {
             assert_eq!(load.config, std::path::PathBuf::from("base.toml"));
             assert_eq!(
@@ -325,7 +326,12 @@ fn resolve_config_load_parts_success() {
     let work_dir = dir.path().join("work");
     std::fs::create_dir_all(&work_dir).expect("create work dir");
 
-    let resolved = resolve_ok(config_path.clone(), vec![], vec!["THRESHOLD=5".to_string()], Some(work_dir.clone()));
+    let resolved = resolve_ok(
+        config_path.clone(),
+        vec![],
+        vec!["THRESHOLD=5".to_string()],
+        Some(work_dir.clone()),
+    );
 
     assert_eq!(resolved.config_path, config_path.canonicalize().unwrap());
     assert!(resolved.overlay_paths.is_empty());

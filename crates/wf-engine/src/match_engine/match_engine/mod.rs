@@ -374,23 +374,87 @@ impl CepStateMachine {
             }
         };
 
-        // Build structured instance key
-        let (instance_key, fixed_created_at) = match self.plan.window_spec {
-            WindowSpec::Sliding(_) | WindowSpec::Session(_) => {
-                // Session windows use sliding-style keys but with gap-based expiration
-                (
-                    InstanceKey::sliding(&scope_key_from_values(&scope_key)),
-                    None,
-                )
+        // Build per-window routing. HOP windows (size, slide): one event belongs
+        // to `size/slide` overlapping windows aligned to epoch slide boundaries;
+        // each (scope x window_start) is a separate instance (fixed-style keys).
+        let mut best: Option<StepOutcome> = None;
+        match self.plan.window_spec {
+            WindowSpec::Hop { size, slide } => {
+                let size_ns = size.as_nanos() as i64;
+                let slide_ns = slide.as_nanos() as i64;
+                let k_min = (now_nanos - size_ns).div_euclid(slide_ns) + 1;
+                let k_max = now_nanos.div_euclid(slide_ns);
+                for k in k_min..=k_max {
+                    let out = self.advance_window(
+                        alias,
+                        event,
+                        now_nanos,
+                        windows,
+                        row,
+                        masks,
+                        capture_progress,
+                        scope_key.clone(),
+                        Some(k * slide_ns),
+                    );
+                    best = Some(match best {
+                        Some(prev) => merge_step_outcome(prev, out),
+                        None => out,
+                    });
+                }
             }
             WindowSpec::Fixed(dur) => {
                 let dur_nanos = dur.as_nanos() as i64;
                 let bucket_start = (now_nanos / dur_nanos) * dur_nanos;
-                let skey = scope_key_from_values(&scope_key);
-                (InstanceKey::fixed(&skey, bucket_start), Some(bucket_start))
+                best = Some(self.advance_window(
+                    alias,
+                    event,
+                    now_nanos,
+                    windows,
+                    row,
+                    masks,
+                    capture_progress,
+                    scope_key,
+                    Some(bucket_start),
+                ));
             }
-        };
+            WindowSpec::Sliding(_) | WindowSpec::Session(_) => {
+                best = Some(self.advance_window(
+                    alias,
+                    event,
+                    now_nanos,
+                    windows,
+                    row,
+                    masks,
+                    capture_progress,
+                    scope_key,
+                    None,
+                ));
+            }
+        }
+        best.unwrap_or_else(|| step_outcome(StepResult::Accumulate, None))
+    }
 
+    /// Process one event against one window instance (fixed/hop buckets
+    /// carry `window_start`; sliding/session pass `None`). Extracted from
+    /// `advance_at_with_diagnostics` so HOP can fan a single event out to
+    /// every covering window.
+    fn advance_window<E: FieldSource>(
+        &mut self,
+        alias: &str,
+        event: &E,
+        now_nanos: i64,
+        windows: Option<&dyn WindowLookup>,
+        row: usize,
+        masks: Option<&GuardMasks>,
+        capture_progress: bool,
+        scope_key: Vec<Value>,
+        window_start: Option<i64>,
+    ) -> StepOutcome {
+        let skey = scope_key_from_values(&scope_key);
+        let instance_key = match window_start {
+            Some(ws) => InstanceKey::fixed(&skey, ws),
+            None => InstanceKey::sliding(&skey),
+        };
         // 2. Get or create instance (with limits check)
         let is_new = !self.instances.contains_key(&instance_key);
         // N1: whether THIS call holds a shared instance-slot reservation for the
@@ -561,10 +625,10 @@ impl CepStateMachine {
         }
 
         if is_new {
-            self.push_expiry_candidate(&instance_key, fixed_created_at.unwrap_or(now_nanos));
+            self.push_expiry_candidate(&instance_key, window_start.unwrap_or(now_nanos));
         }
         let mut instance = self.take_instance(&instance_key).unwrap_or_else(|| {
-            let created = fixed_created_at.unwrap_or(now_nanos);
+            let created = window_start.unwrap_or(now_nanos);
             let machine_id = Self::extract_event_str(event, MACHINE_ID);
             let mut inst = Instance::new_at(&self.plan, machine_id, created);
             inst.base_cost = new_base.unwrap_or(0);
@@ -617,7 +681,7 @@ impl CepStateMachine {
             false
         };
         if seq_broken {
-            let reset_at = fixed_created_at.unwrap_or(now_nanos);
+            let reset_at = window_start.unwrap_or(now_nanos);
             // A negation violation must persist across a `consec` adjacency break;
             // otherwise an in-window violation could be wiped and the chain re-fire.
             let neg_violated = instance.neg_violated;
@@ -726,7 +790,7 @@ impl CepStateMachine {
                             if plan.accu {
                                 instance.rearm(plan);
                             } else {
-                                let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                                let reset_at = window_start.unwrap_or(now_nanos);
                                 instance.reset(plan, reset_at);
                                 self.push_expiry_candidate(&instance_key, reset_at);
                             }
@@ -768,7 +832,7 @@ impl CepStateMachine {
                     // `on event<accu>` — keep accumulating across fires.
                     instance.rearm(plan);
                 } else {
-                    let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                    let reset_at = window_start.unwrap_or(now_nanos);
                     instance.reset(plan, reset_at);
                     self.push_expiry_candidate(&instance_key, reset_at);
                 }
@@ -890,7 +954,7 @@ impl CepStateMachine {
                 false
             };
             if within_violated {
-                let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                let reset_at = window_start.unwrap_or(now_nanos);
                 // Preserve a negation violation across a `within` reset, matching the
                 // `consec`-break reset: an in-window violation must not be wiped so the
                 // chain can re-fire.
@@ -908,7 +972,7 @@ impl CepStateMachine {
 
             // Chain negation: a violated negation step must suppress the emit.
             if instance.neg_violated {
-                let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                let reset_at = window_start.unwrap_or(now_nanos);
                 instance.reset(plan, reset_at);
                 self.push_expiry_candidate(&instance_key, reset_at);
                 break 'process StepResult::Accumulate;
@@ -938,7 +1002,7 @@ impl CepStateMachine {
                                 instance.rearm(plan);
                             } else {
                                 // Suppress the match — reset instance for future use
-                                let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                                let reset_at = window_start.unwrap_or(now_nanos);
                                 instance.reset(plan, reset_at);
                                 self.push_expiry_candidate(&instance_key, reset_at);
                             }
@@ -981,7 +1045,7 @@ impl CepStateMachine {
                     // `on event<accu>` — keep accumulating across fires.
                     instance.rearm(plan);
                 } else {
-                    let reset_at = fixed_created_at.unwrap_or(now_nanos);
+                    let reset_at = window_start.unwrap_or(now_nanos);
                     instance.reset(plan, reset_at);
                     self.push_expiry_candidate(&instance_key, reset_at);
                 }
@@ -1075,7 +1139,7 @@ impl CepStateMachine {
 
         let instance_key = match self.plan.window_spec {
             WindowSpec::Sliding(_) | WindowSpec::Session(_) => InstanceKey::sliding(&skey),
-            WindowSpec::Fixed(_) => self
+            WindowSpec::Fixed(_) | WindowSpec::Hop { .. } => self
                 .instances
                 .iter()
                 .filter(|(k, _)| k.matches_scope(&skey))
@@ -1359,6 +1423,7 @@ impl CepStateMachine {
             WindowSpec::Sliding(d) | WindowSpec::Fixed(d) | WindowSpec::Session(d) => {
                 created_at + d.as_nanos() as i64
             }
+            WindowSpec::Hop { size, .. } => created_at + size.as_nanos() as i64,
         };
         self.expiry_heap.push(Reverse((expire_time, key.clone())));
     }
@@ -1474,7 +1539,23 @@ impl CepStateMachine {
             WindowSpec::Sliding(d) | WindowSpec::Fixed(d) => {
                 instance.created_at + d.as_nanos() as i64
             }
+            WindowSpec::Hop { size, .. } => instance.created_at + size.as_nanos() as i64,
         }
+    }
+}
+
+/// Merge two per-window outcomes for HOP fan-out: the higher-priority result
+/// wins (Matched > Advance > Accumulate); the first window's progress is kept.
+fn merge_step_outcome(a: StepOutcome, b: StepOutcome) -> StepOutcome {
+    let rank = |r: &StepResult| match r {
+        StepResult::Matched(_) => 2,
+        StepResult::Advance => 1,
+        StepResult::Accumulate => 0,
+    };
+    if rank(&b.result) > rank(&a.result) {
+        b
+    } else {
+        a
     }
 }
 

@@ -52,6 +52,240 @@ fn make_conv_plan(chains: Vec<Vec<ConvOpPlan>>) -> ConvPlan {
 }
 
 // ===========================================================================
+// top_ties — RANK 语义并列全输出
+// ===========================================================================
+
+fn price_sort(descending: bool) -> ConvOpPlan {
+    ConvOpPlan::Sort(vec![SortKeyPlan {
+        expr: ExprPlan::Field(FieldRef::Simple("m".into())),
+        descending,
+    }])
+}
+
+#[test]
+fn conv_top_ties_keeps_rank_1_ties() {
+    // 5 条：m = 100, 100, 90, 80, 80 —— 降序 top_ties(1) 应保留两条 100。
+    let outputs: Vec<CloseOutput> = vec![100.0, 100.0, 90.0, 80.0, 80.0]
+        .into_iter()
+        .map(|v| make_close_output(vec![], vec![], vec![labeled_step("m", v)]))
+        .collect();
+    // sort_keys 由编译器从前导 sort 复制；此处显式传入以测试引擎行为。
+    let plan = make_conv_plan(vec![vec![
+        price_sort(true),
+        ConvOpPlan::TopTies {
+            n: 1,
+            sort_keys: vec![SortKeyPlan {
+                expr: ExprPlan::Field(FieldRef::Simple("m".into())),
+                descending: true,
+            }],
+        },
+    ]]);
+    let result = crate::match_engine::match_engine::apply_conv(
+        &plan,
+        &[FieldRef::Simple("sip".into())],
+        outputs,
+    );
+    assert_eq!(result.len(), 2, "并列第 1 名全输出");
+    for o in &result {
+        let m = o.close_step_data[0].measure_value;
+        assert_eq!(m, 100.0);
+    }
+}
+
+#[test]
+fn conv_top_ties_rank_2_keeps_rank_2_ties() {
+    // 降序 top_ties(2)：前 2 名 100, 90；与第 2 名（90）并列的条目全保留。
+    let outputs: Vec<CloseOutput> = vec![100.0, 90.0, 90.0, 80.0, 70.0]
+        .into_iter()
+        .map(|v| make_close_output(vec![], vec![], vec![labeled_step("m", v)]))
+        .collect();
+    let plan = make_conv_plan(vec![vec![
+        price_sort(true),
+        ConvOpPlan::TopTies {
+            n: 2,
+            sort_keys: vec![SortKeyPlan {
+                expr: ExprPlan::Field(FieldRef::Simple("m".into())),
+                descending: true,
+            }],
+        },
+    ]]);
+    let result = crate::match_engine::match_engine::apply_conv(
+        &plan,
+        &[FieldRef::Simple("sip".into())],
+        outputs,
+    );
+    assert_eq!(result.len(), 3, "100 + 两条 90");
+}
+
+#[test]
+fn conv_top_ties_without_ties_equals_top() {
+    // 无并列时 top_ties 与 top 等价。
+    let outputs: Vec<CloseOutput> = vec![100.0, 90.0, 80.0, 70.0, 60.0]
+        .into_iter()
+        .map(|v| make_close_output(vec![], vec![], vec![labeled_step("m", v)]))
+        .collect();
+    let plan = make_conv_plan(vec![vec![
+        price_sort(true),
+        ConvOpPlan::TopTies {
+            n: 1,
+            sort_keys: vec![SortKeyPlan {
+                expr: ExprPlan::Field(FieldRef::Simple("m".into())),
+                descending: true,
+            }],
+        },
+    ]]);
+    let result = crate::match_engine::match_engine::apply_conv(
+        &plan,
+        &[FieldRef::Simple("sip".into())],
+        outputs,
+    );
+    assert_eq!(result.len(), 1);
+}
+
+#[test]
+fn conv_top_ties_zero_does_not_panic() {
+    // 回归：top_ties(0) 曾因 `key_rows[count-1]` 越界 panic。
+    let outputs: Vec<CloseOutput> = vec![100.0, 90.0]
+        .into_iter()
+        .map(|v| make_close_output(vec![], vec![], vec![labeled_step("m", v)]))
+        .collect();
+    let plan = make_conv_plan(vec![vec![
+        price_sort(true),
+        ConvOpPlan::TopTies {
+            n: 0,
+            sort_keys: vec![SortKeyPlan {
+                expr: ExprPlan::Field(FieldRef::Simple("m".into())),
+                descending: true,
+            }],
+        },
+    ]]);
+    let result = crate::match_engine::match_engine::apply_conv(
+        &plan,
+        &[FieldRef::Simple("sip".into())],
+        outputs,
+    );
+    assert!(result.is_empty(), "top_ties(0) 输出为空");
+}
+
+#[test]
+fn conv_top_ties_empty_sort_keys_falls_back_to_top() {
+    // 防御分支：无前导 sort（checker 应拒绝）→ 空 sort_keys 退化为普通 top。
+    let outputs: Vec<CloseOutput> = vec![100.0, 90.0, 80.0]
+        .into_iter()
+        .map(|v| make_close_output(vec![], vec![], vec![labeled_step("m", v)]))
+        .collect();
+    let plan = make_conv_plan(vec![vec![ConvOpPlan::TopTies {
+        n: 1,
+        sort_keys: vec![],
+    }]]);
+    let result = crate::match_engine::match_engine::apply_conv(
+        &plan,
+        &[FieldRef::Simple("sip".into())],
+        outputs,
+    );
+    assert_eq!(result.len(), 1, "空 sort_keys 退化为 top(1)");
+}
+
+#[test]
+fn conv_top_ties_exactly_n_outputs_short_circuits() {
+    // len == N：输出恰好 N 条，无并列可延展 → truncate 后返回（len<=count 分支）。
+    let outputs: Vec<CloseOutput> = vec![100.0, 90.0]
+        .into_iter()
+        .map(|v| make_close_output(vec![], vec![], vec![labeled_step("m", v)]))
+        .collect();
+    let plan = make_conv_plan(vec![vec![
+        price_sort(true),
+        ConvOpPlan::TopTies {
+            n: 2,
+            sort_keys: vec![SortKeyPlan {
+                expr: ExprPlan::Field(FieldRef::Simple("m".into())),
+                descending: true,
+            }],
+        },
+    ]]);
+    let result = crate::match_engine::match_engine::apply_conv(
+        &plan,
+        &[FieldRef::Simple("sip".into())],
+        outputs,
+    );
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+fn conv_top_ties_multi_key_requires_all_keys_equal() {
+    // 多键排序：并列判定要求所有键等值（score 相同但 id 不同 → 不并列）。
+    let mk = |score: f64, id: f64| {
+        make_close_output(
+            vec![],
+            vec![],
+            vec![labeled_step("m", score), labeled_step("id", id)],
+        )
+    };
+    let outputs = vec![mk(100.0, 1.0), mk(100.0, 2.0), mk(90.0, 3.0)];
+    let plan = make_conv_plan(vec![vec![
+        ConvOpPlan::Sort(vec![
+            SortKeyPlan {
+                expr: ExprPlan::Field(FieldRef::Simple("m".into())),
+                descending: true,
+            },
+            SortKeyPlan {
+                expr: ExprPlan::Field(FieldRef::Simple("id".into())),
+                descending: true,
+            },
+        ]),
+        ConvOpPlan::TopTies {
+            n: 1,
+            sort_keys: vec![
+                SortKeyPlan {
+                    expr: ExprPlan::Field(FieldRef::Simple("m".into())),
+                    descending: true,
+                },
+                SortKeyPlan {
+                    expr: ExprPlan::Field(FieldRef::Simple("id".into())),
+                    descending: true,
+                },
+            ],
+        },
+    ]]);
+    let result = crate::match_engine::match_engine::apply_conv(
+        &plan,
+        &[FieldRef::Simple("sip".into())],
+        outputs,
+    );
+    // 100/1 与 100/2 第二键不同 → 不并列，仅 top-1；id 降序 → 100/2 在前。
+    assert_eq!(result.len(), 1, "多键排序下 (100,1) 与 (100,2) 不并列");
+    assert_eq!(result[0].close_step_data[1].measure_value, 2.0);
+}
+
+#[test]
+fn conv_top_ties_chain_with_dedup() {
+    // sort | top_ties | dedup 链：并列保留后去重。
+    let outputs: Vec<CloseOutput> = vec![100.0, 100.0, 90.0, 80.0]
+        .into_iter()
+        .map(|v| make_close_output(vec![], vec![], vec![labeled_step("m", v)]))
+        .collect();
+    let plan = make_conv_plan(vec![vec![
+        price_sort(true),
+        ConvOpPlan::TopTies {
+            n: 1,
+            sort_keys: vec![SortKeyPlan {
+                expr: ExprPlan::Field(FieldRef::Simple("m".into())),
+                descending: true,
+            }],
+        },
+        ConvOpPlan::Dedup(ExprPlan::Field(FieldRef::Simple("m".into()))),
+    ]]);
+    let result = crate::match_engine::match_engine::apply_conv(
+        &plan,
+        &[FieldRef::Simple("sip".into())],
+        outputs,
+    );
+    // 两条 100 并列全保留 → dedup(m) 后剩 1 条（同为 m=100）。
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].close_step_data[0].measure_value, 100.0);
+}
+
+// ===========================================================================
 // Sort descending
 // ===========================================================================
 

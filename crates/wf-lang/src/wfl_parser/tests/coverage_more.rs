@@ -26,7 +26,10 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-    assert!(parse_wfl(input).is_err(), "`where` after a pattern invocation must be rejected");
+    assert!(
+        parse_wfl(input).is_err(),
+        "`where` after a pattern invocation must be rejected"
+    );
 }
 
 #[test]
@@ -46,7 +49,10 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-    assert!(parse_wfl(input).is_err(), "`|>` after a pattern invocation must be rejected");
+    assert!(
+        parse_wfl(input).is_err(),
+        "`|>` after a pattern invocation must be rejected"
+    );
 }
 
 #[test]
@@ -61,7 +67,10 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-    assert!(parse_wfl(input).is_err(), "non-final stage `where` must be rejected");
+    assert!(
+        parse_wfl(input).is_err(),
+        "non-final stage `where` must be rejected"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +92,10 @@ rule r {
 "#;
     let file = parse_wfl(input).expect("parse should succeed");
     let rule = &file.rules[0];
-    assert!(rule.each_clause.is_some(), "final stage should carry the each clause");
+    assert!(
+        rule.each_clause.is_some(),
+        "final stage should carry the each clause"
+    );
     assert_eq!(rule.pipeline_stages.len(), 1);
     assert!(rule.pipeline_stages[0].each_clause.is_none());
 }
@@ -142,7 +154,10 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-    assert!(parse_wfl(input).is_err(), "meta key without a value must be rejected");
+    assert!(
+        parse_wfl(input).is_err(),
+        "meta key without a value must be rejected"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -164,5 +179,8 @@ rule r {
     yield out (y = "x")
 }
 "#;
-    assert!(parse_wfl(input).is_err(), "malformed stats measure must be rejected");
+    assert!(
+        parse_wfl(input).is_err(),
+        "malformed stats measure must be rejected"
+    );
 }

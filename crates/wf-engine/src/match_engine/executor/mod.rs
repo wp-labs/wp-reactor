@@ -13,7 +13,7 @@ mod match_exec;
 mod stats_exec;
 
 pub use each_exec::EachDirectBatchStats;
-pub use stats_exec::{DistinctKey, StatsAccum, StatsExecutor, StatsWindowState};
+pub use stats_exec::{StatsExecutor, StatsWindowState};
 
 #[cfg(test)]
 mod close_coverage_more;

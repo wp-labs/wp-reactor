@@ -23,6 +23,9 @@ pub struct ConvChain {
 pub enum ConvStep {
     Sort(Vec<SortKey>),
     Top(u64),
+    /// RANK 语义的 top-N：排序后取前 N 条，并保留所有与前 N 条末位排序键
+    /// 等值的条目（并列全输出）。要求前导 `sort`（checker 校验）。
+    TopTies(u64),
     Dedup(Expr),
     Where(Expr),
 }

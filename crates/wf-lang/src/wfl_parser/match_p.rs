@@ -1,5 +1,5 @@
 use winnow::combinator::{alt, cut_err, opt, separated};
-use winnow::error::{StrContext, StrContextValue};
+use winnow::error::{AddContext, ContextError, ErrMode, StrContext, StrContextValue};
 use winnow::prelude::*;
 use winnow::token::literal;
 
@@ -145,6 +145,7 @@ pub(super) fn each_clause_only(input: &mut &str) -> ModalResult<EachClause> {
 ///   `[key, key, ...] : duration`               (sliding window)
 ///   `[key, key, ...] : duration : fixed`       (fixed window)
 ///   `[key, key, ...] : session(gap)`           (session window, L3)
+///   `[key, key, ...] : hop(size, slide)`       (HOP sliding window)
 fn match_params(input: &mut &str) -> ModalResult<(Vec<FieldRef>, std::time::Duration, WindowMode)> {
     ws_skip.parse_next(input)?;
 
@@ -184,6 +185,52 @@ fn match_params(input: &mut &str) -> ModalResult<(Vec<FieldRef>, std::time::Dura
             .parse_next(input)?;
         ws_skip.parse_next(input)?;
         return Ok((keys, gap, WindowMode::Session(gap)));
+    }
+
+    // Check for hop(size, slide) — HOP sliding window
+    if opt(kw("hop")).parse_next(input)?.is_some() {
+        ws_skip.parse_next(input)?;
+        cut_err(literal("("))
+            .context(StrContext::Expected(StrContextValue::Description(
+                "'(' after 'hop'",
+            )))
+            .parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        let size = cut_err(duration_value)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "size duration in hop(size, slide)",
+            )))
+            .parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        cut_err(literal(","))
+            .context(StrContext::Expected(StrContextValue::Description(
+                "',' between hop size and slide",
+            )))
+            .parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        let slide = cut_err(duration_value)
+            .context(StrContext::Expected(StrContextValue::Description(
+                "slide duration in hop(size, slide)",
+            )))
+            .parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        cut_err(literal(")"))
+            .context(StrContext::Expected(StrContextValue::Description(
+                "')' after hop slide",
+            )))
+            .parse_next(input)?;
+        ws_skip.parse_next(input)?;
+        if size.as_nanos() == 0 || slide.as_nanos() == 0 || size.as_nanos() % slide.as_nanos() != 0
+        {
+            return Err(ErrMode::Cut(ContextError::new().add_context(
+                input,
+                &input.checkpoint(),
+                StrContext::Expected(StrContextValue::Description(
+                    "hop size must be a positive multiple of slide",
+                )),
+            )));
+        }
+        return Ok((keys, size, WindowMode::Hop { size, slide }));
     }
 
     // Parse duration for sliding/fixed window

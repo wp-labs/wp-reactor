@@ -87,10 +87,7 @@ fn dns_response_window() -> WindowSchema {
 fn meta_out_window() -> WindowSchema {
     make_output_window(
         "out",
-        vec![
-            ("s", bt(BaseType::Float)),
-            ("r", bt(BaseType::Chars)),
-        ],
+        vec![("s", bt(BaseType::Float)), ("r", bt(BaseType::Chars))],
     )
 }
 
@@ -275,7 +272,11 @@ rule r {
 "#;
     assert_has_error(
         input,
-        &[auction_events_window(), bid_events_window(), output_window()],
+        &[
+            auction_events_window(),
+            bid_events_window(),
+            output_window(),
+        ],
         "references unknown event alias `bid_events`",
     );
 }
@@ -514,7 +515,11 @@ rule r {
 "#;
     assert_has_error(
         input,
-        &[auction_events_window(), bid_events_window(), output_window()],
+        &[
+            auction_events_window(),
+            bid_events_window(),
+            output_window(),
+        ],
         "reduce top(N) N must be ≥ 1",
     );
 }
@@ -532,7 +537,11 @@ rule r {
 "#;
     assert_has_error(
         input,
-        &[auction_events_window(), bid_events_window(), output_window()],
+        &[
+            auction_events_window(),
+            bid_events_window(),
+            output_window(),
+        ],
         "join condition left side:",
     );
 }
@@ -550,7 +559,11 @@ rule r {
 "#;
     assert_has_error(
         input,
-        &[auction_events_window(), bid_events_window(), output_window()],
+        &[
+            auction_events_window(),
+            bid_events_window(),
+            output_window(),
+        ],
         "join condition right side must be qualified with window name",
     );
 }
@@ -568,7 +581,14 @@ rule r {
     yield out (n = a.id)
 }
 "#;
-    assert_no_errors(input, &[auction_events_window(), bid_events_window(), output_window()]);
+    assert_no_errors(
+        input,
+        &[
+            auction_events_window(),
+            bid_events_window(),
+            output_window(),
+        ],
+    );
 }
 
 #[test]
@@ -584,7 +604,11 @@ rule r {
 "#;
     assert_has_error(
         top_missing,
-        &[auction_events_window(), bid_events_window(), output_window()],
+        &[
+            auction_events_window(),
+            bid_events_window(),
+            output_window(),
+        ],
         "reduce measure field `nope` not found in window `bid_events`",
     );
 
@@ -599,7 +623,11 @@ rule r {
 "#;
     assert_has_error(
         last_missing,
-        &[auction_events_window(), bid_events_window(), output_window()],
+        &[
+            auction_events_window(),
+            bid_events_window(),
+            output_window(),
+        ],
         "reduce measure field `nope` not found in window `bid_events`",
     );
 }

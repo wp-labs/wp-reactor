@@ -1702,7 +1702,7 @@ fn minmax_masked(
     min: &mut Option<i128>,
     max: &mut Option<i128>,
 ) {
-    let mut fold = |v: i128, min: &mut Option<i128>, max: &mut Option<i128>| {
+    let fold = |v: i128, min: &mut Option<i128>, max: &mut Option<i128>| {
         *min = Some(match *min {
             Some(m) if m <= v => m,
             _ => v,

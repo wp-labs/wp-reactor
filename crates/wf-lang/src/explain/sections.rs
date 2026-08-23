@@ -45,6 +45,11 @@ pub(super) fn explain_match(mp: &MatchPlan) -> MatchExpl {
         WindowSpec::Sliding(d) => format!("sliding {}", format_duration(d)),
         WindowSpec::Fixed(d) => format!("fixed {}", format_duration(d)),
         WindowSpec::Session(gap) => format!("session(gap={})", format_duration(gap)),
+        WindowSpec::Hop { size, slide } => format!(
+            "hop(size={}, slide={})",
+            format_duration(size),
+            format_duration(slide)
+        ),
     };
 
     let event_steps = mp.event_steps.iter().map(format_step).collect();
@@ -327,6 +332,7 @@ pub(super) fn explain_conv(plan: &ConvPlan) -> Vec<String> {
                         format!("sort({})", k.join(", "))
                     }
                     ConvOpPlan::Top(n) => format!("top({})", n),
+                    ConvOpPlan::TopTies { n, .. } => format!("top_ties({})", n),
                     ConvOpPlan::Dedup(e) => format!("dedup({})", format_expr(e)),
                     ConvOpPlan::Where(e) => format!("where({})", format_expr(e)),
                 })

@@ -75,6 +75,42 @@ fn apply_op(op: &ConvOpPlan, keys: &[FieldRef], mut outputs: Vec<CloseOutput>) -
             outputs.truncate(*n as usize);
             outputs
         }
+        ConvOpPlan::TopTies { n, sort_keys } => {
+            let count = outputs.len().min(*n as usize);
+            // top_ties(0) / 空输入 / 无前导 sort（checker 应拒绝）：退化为普通
+            // top 截断，绝不 panic（第 N 条索引要求 count >= 1）。
+            if count == 0 || outputs.len() <= count || sort_keys.is_empty() {
+                outputs.truncate(count);
+                return outputs;
+            }
+            // 预提取排序键值（与 Sort 同路径；稳定排序保证并列条目相邻）。
+            let key_rows: Vec<Vec<Option<Value>>> = outputs
+                .iter()
+                .map(|o| {
+                    let ctx = build_eval_context(o, keys);
+                    sort_keys
+                        .iter()
+                        .map(|sk| eval_expr(&sk.expr, &ctx))
+                        .collect()
+                })
+                .collect();
+            // 第 N 条（0 基 count-1）的排序键值为并列基准：后续全部等值条目保留。
+            let tie = &key_rows[count - 1];
+            let mut i = count;
+            while i < outputs.len() {
+                let row = &key_rows[i];
+                let all_equal = row
+                    .iter()
+                    .zip(tie.iter())
+                    .all(|(a, b)| compare_option_values(a, b) == std::cmp::Ordering::Equal);
+                if !all_equal {
+                    break;
+                }
+                i += 1;
+            }
+            outputs.truncate(i);
+            outputs
+        }
         ConvOpPlan::Dedup(expr) => {
             // HashSet 替代 Vec::contains 线性扫描（旧 O(n²)，大收口批下
             // dedup 成本与 sort 同级；语义不变——只判存在性，序无关）。
