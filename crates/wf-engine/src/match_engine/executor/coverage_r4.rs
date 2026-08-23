@@ -1772,3 +1772,182 @@ fn ctx_free_match_output_matches_full_ctx_bytes() {
         "yield 含 General 表达式的规则必须禁用 ctx-free"
     );
 }
+
+#[test]
+fn columnar_match_output_matches_row_path() {
+    // q6 形状（无 join 变体）：键 seller、entity digit(b.auction)、yield
+    // id=b.auction + 字面量、score 常量、无 where —— match_plan_columnar_safe
+    // 通过，列式批输出与行式 `execute_match_at` 逐字段字节一致。
+    let mut plan = simple_rule_plan(
+        "match_col",
+        simple_plan(
+            vec![simple_key("seller")],
+            vec![step(vec![branch("b", count_ge(1.0))])],
+        ),
+        Expr::Number(20.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.binds[0].window = "bid_events".into();
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        },
+        YieldField {
+            name: "alert_type".into(),
+            value: Expr::StringLit("q6_avg200".into()),
+        },
+    ];
+    let exec = RuleExecutor::new(plan);
+    assert!(
+        exec.match_plan_columnar_safe(),
+        "q6 形状（无 join）必须通过 match 列式门控"
+    );
+
+    const NOW: i64 = 1_700_000_000_000_000_000;
+    let mk = |auction: f64, seller: f64| MatchedContext {
+        rule_name: "match_col".into(),
+        scope_key: vec![num(seller)],
+        step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: None,
+            measure_value: auction,
+            event_first_time_nanos: Some(NOW),
+            event_last_time_nanos: Some(NOW),
+            collected_values: vec![],
+            field_values: EngineHashMap::default(),
+        }],
+        bind_data: vec![],
+        event_time_nanos: NOW,
+        event_first_time_nanos: NOW,
+        event_last_time_nanos: NOW,
+        window_start_time_nanos: NOW - 600_000_000_000,
+        window_end_time_nanos: NOW,
+        machine_id: String::new(),
+        trigger_event: Some(Arc::new(event(vec![
+            ("auction", num(auction)),
+            ("price", num(300.0)),
+            ("bidder", num(5.0)),
+        ]))),
+    };
+    let m1 = mk(1001.0, 20.0);
+    let m2 = mk(1002.0, 21.0);
+
+    // 行式路径：每命中 execute_match_at → OutputRecord → append_record。
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    for m in [&m1, &m2] {
+        let record = exec.execute_match_at(m, NOW).unwrap();
+        b_row.append_record(&record).unwrap();
+    }
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // 列式路径：批量直写 builder。
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended = Vec::new();
+    let stats =
+        exec.execute_match_direct_batch_columnar(&[&m1, &m2], NOW, &mut b_col, &mut appended);
+    assert_eq!(stats.appended, 2);
+    assert_eq!(stats.failed, 0);
+    assert_eq!(appended, vec![0, 1]);
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // 逐字段字节一致。
+    assert_eq!(out_row, out_col);
+    // entity_id = auction（字符串化），两行各一条。
+    let entity_ids: Vec<String> = out_col
+        .iter()
+        .map(|r| {
+            r.fields()
+                .find(|f| f.get_name() == wf_lang::wfu_meta::WFU_ENTITY_ID)
+                .and_then(|f| f.get_chars().map(str::to_string))
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(entity_ids, vec!["1001", "1002"]);
+}
+
+#[test]
+fn columnar_match_gate_rejects_right_window_refs() {
+    // join 存在时，输出字段引用右窗字段（Qualified 右窗名）→ 门控回退行式。
+    let mut plan = simple_rule_plan(
+        "match_join_col",
+        simple_plan(
+            vec![simple_key("seller")],
+            vec![step(vec![branch("b", count_ge(1.0))])],
+        ),
+        Expr::Number(20.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.binds[0].window = "bid_events".into();
+    plan.joins = vec![JoinPlan {
+        right_window: "auction_events".into(),
+        mode: JoinMode::Inner,
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Qualified("b".into(), "auction".into()),
+            right: FieldRef::Qualified("auction_events".into(), "id".into()),
+        }],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    }];
+    // 输出引用右窗字段（seller 在 auction_events）→ 拒绝。
+    plan.yield_plan.fields = vec![YieldField {
+        name: "seller".into(),
+        value: Expr::Field(FieldRef::Qualified(
+            "auction_events".into(),
+            "seller".into(),
+        )),
+    }];
+    let exec = RuleExecutor::new(plan);
+    assert!(
+        !exec.match_plan_columnar_safe(),
+        "输出引用非键右窗字段必须回退行式（字节一致性）"
+    );
+
+    // 输出仅引用左窗字段（b.auction）+ 常量 → 即使有 join 也通过
+    // （join 在上游完成，输出不依赖富化）。
+    let mut plan2 = simple_rule_plan(
+        "match_join_col2",
+        simple_plan(
+            vec![simple_key("seller")],
+            vec![step(vec![branch("b", count_ge(1.0))])],
+        ),
+        Expr::Number(20.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan2.binds[0].alias = "b".into();
+    plan2.binds[0].window = "bid_events".into();
+    plan2.joins = vec![JoinPlan {
+        right_window: "auction_events".into(),
+        mode: JoinMode::Inner,
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Qualified("b".into(), "auction".into()),
+            right: FieldRef::Qualified("auction_events".into(), "id".into()),
+        }],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    }];
+    plan2.yield_plan.fields = vec![YieldField {
+        name: "id".into(),
+        value: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    }];
+    let exec2 = RuleExecutor::new(plan2);
+    assert!(
+        exec2.match_plan_columnar_safe(),
+        "输出仅左窗字段 + join 已上游完成 → 列式安全"
+    );
+}

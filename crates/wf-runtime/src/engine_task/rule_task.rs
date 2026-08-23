@@ -912,6 +912,13 @@ impl RuleTask {
         // per-close log/counts (same gate shape as the on-each columnar path).
         let close_columnar = !debug_enabled && self.executor.close_plan_columnar_safe();
         let mut columnar_closes: Vec<wf_engine::match_engine::CloseOutput> = Vec::new();
+        // Columnar match emit (2026-08-23, q6 形态): score 常量 + 输出全
+        // Lit/Field + 输出字段不引用非键右窗 —— 命中 ctx 批量直写 builder，免
+        // 每命中 OutputRecord 中间物化（`match_plan_columnar_safe` 门控）。
+        // 批级 owned 累积（move，零成本）：行内 extend，行循环后统一列式——
+        // 避免每命中一次 pending 锁（q6 每行恰命中 1 个，行内批处理反而更慢）。
+        let match_columnar = !debug_enabled && self.executor.match_plan_columnar_safe();
+        let mut match_rows: Vec<wf_engine::match_engine::MatchedContext> = Vec::new();
         // Records produced by the match/close paths accumulate here and are
         // appended to the pending columnar builder in one lock per
         // ALERT_BATCH_SIZE group (see [`Self::emit_batch`]) — the per-record
@@ -1248,56 +1255,68 @@ impl RuleTask {
                     }
                 }
 
-                for ctx in matched {
+                if match_columnar {
+                    // 列式：move 整行命中到批级累积（零成本），批后统一
+                    // 直写 builder——跳过 join 执行（门控保证输出不引用非键
+                    // 右窗字段，join 已在 advance 阶段完成）。
                     if let Some(metrics) = &self.metrics {
-                        metrics.inc_rule_match(self.rule_name());
+                        for _ in 0..matched.len() {
+                            metrics.inc_rule_match(self.rule_name());
+                        }
                     }
-                    let _exec_start = Instant::now();
-                    match self
-                        .executor
-                        .execute_match_with_joins_at(&ctx, &lookup, batch_emit_nanos)
-                    {
-                        Ok(Some(record)) => {
-                            self.exec_nanos += _exec_start.elapsed().as_nanos() as u64;
-                            if debug_enabled {
-                                stats.count_output(&record, &self.intermediate_targets);
-                            }
-                            if debug_enabled && stats.allow_detail() {
-                                log_output_emitted(
-                                    "execute_match",
-                                    "event",
-                                    output_kind(&record, &self.intermediate_targets),
-                                    &record,
-                                    ctx.scope_key.as_slice(),
-                                );
-                            }
-                            self.stage_or_emit_record(&mut staged_outputs, record).await;
+                    match_rows.extend(matched);
+                } else {
+                    for ctx in &matched {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.inc_rule_match(self.rule_name());
                         }
-                        Ok(None) => {
-                            if debug_enabled {
-                                stats.output_none += 1;
+                        let _exec_start = Instant::now();
+                        match self
+                            .executor
+                            .execute_match_with_joins_at(ctx, &lookup, batch_emit_nanos)
+                        {
+                            Ok(Some(record)) => {
+                                self.exec_nanos += _exec_start.elapsed().as_nanos() as u64;
+                                if debug_enabled {
+                                    stats.count_output(&record, &self.intermediate_targets);
+                                }
+                                if debug_enabled && stats.allow_detail() {
+                                    log_output_emitted(
+                                        "execute_match",
+                                        "event",
+                                        output_kind(&record, &self.intermediate_targets),
+                                        &record,
+                                        ctx.scope_key.as_slice(),
+                                    );
+                                }
+                                self.stage_or_emit_record(&mut staged_outputs, record).await;
                             }
-                            if debug_enabled && stats.allow_detail() {
-                                log_output_suppressed(
-                                    rule_name_for_log,
-                                    "execute_match",
-                                    Some(ctx.scope_key.as_slice()),
-                                );
+                            Ok(None) => {
+                                if debug_enabled {
+                                    stats.output_none += 1;
+                                }
+                                if debug_enabled && stats.allow_detail() {
+                                    log_output_suppressed(
+                                        rule_name_for_log,
+                                        "execute_match",
+                                        Some(ctx.scope_key.as_slice()),
+                                    );
+                                }
                             }
-                        }
-                        Err(e) => {
-                            if debug_enabled {
-                                stats.errors += 1;
+                            Err(e) => {
+                                if debug_enabled {
+                                    stats.errors += 1;
+                                }
+                                wf_warn!(
+                                    pipe,
+                                    rule = %rule_name.as_deref().unwrap_or_else(|| self.rule_name()),
+                                    stage = 0,
+                                    phase = "execute_match",
+                                    scope_key = %debug_scope_key(&ctx.scope_key),
+                                    error = %e,
+                                    "rule output failed"
+                                )
                             }
-                            wf_warn!(
-                                pipe,
-                                rule = %rule_name.as_deref().unwrap_or_else(|| self.rule_name()),
-                                stage = 0,
-                                phase = "execute_match",
-                                scope_key = %debug_scope_key(&ctx.scope_key),
-                                error = %e,
-                                "rule output failed"
-                            )
                         }
                     }
                 }
@@ -1536,6 +1555,52 @@ impl RuleTask {
             }
         }
         self.dump_profiling();
+        // Columnar match emit (q6 形态): one pending lock, one target lookup,
+        // one columnar batch commit — no per-match OutputRecord. Metrics mirror
+        // the per-record path (exact totals; serialize-failed for eval failures).
+        if match_columnar && !match_rows.is_empty() {
+            let row_refs: Vec<&wf_engine::match_engine::MatchedContext> =
+                match_rows.iter().collect();
+            let (outcome, should_flush) = {
+                let mut pending = self.pending_alerts.lock().unwrap();
+                let target = self.executor.static_yield_target();
+                let slot = pending
+                    .by_target
+                    .iter_mut()
+                    .find(|(existing, _)| *existing == *target);
+                let builder = match slot {
+                    Some((_, builder)) => builder,
+                    None => {
+                        pending.by_target.push((
+                            std::sync::Arc::clone(target),
+                            AlertColumnBuilder::new(std::sync::Arc::clone(target)),
+                        ));
+                        let last = pending.by_target.len() - 1;
+                        &mut pending.by_target[last].1
+                    }
+                };
+                let mut appended_idx = Vec::new();
+                let outcome = self.executor.execute_match_direct_batch_columnar(
+                    &row_refs,
+                    batch_emit_nanos,
+                    builder,
+                    &mut appended_idx,
+                );
+                pending.count += outcome.appended;
+                (outcome, pending.count >= ALERT_BATCH_SIZE)
+            };
+            if let Some(metrics) = &self.metrics {
+                for _ in 0..outcome.appended {
+                    metrics.inc_alert_emitted_total(self.rule_name());
+                }
+                for _ in 0..outcome.failed {
+                    metrics.inc_alert_serialize_failed();
+                }
+            }
+            if should_flush {
+                self.flush_alerts().await;
+            }
+        }
         // Vectorized close emit for gate-passing rules (L4): one pending lock,
         // one target lookup, one columnar batch commit — no per-close
         // OutputRecord / synthetic ctx. Metrics mirror the per-record path
