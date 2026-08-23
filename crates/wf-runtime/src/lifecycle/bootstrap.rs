@@ -59,8 +59,8 @@ pub(super) async fn load_and_compile(
     let mut runtime_window_configs = config.windows.clone();
     runtime_window_configs.extend(pipeline_window_configs);
 
-    // 3a. 诊断模式（--perf-diag diag=true）：注入内置 __perf_sentinel 窗口。
-    //     哨兵帧（wfgen 帧尾追加，tag=__perf_sentinel）路由进该窗口，由独立哨兵
+    // 3a. 诊断模式（--perf-diag diag=true）：注入内置 __wf_sentinel 窗口。
+    //     哨兵帧（wfgen 帧尾追加，tag=__wf_sentinel）路由进该窗口，由独立哨兵
     //     任务消费（写四元组记录 + 驱动诊断点状态机）。不依赖用户 .wfs。
     if crate::perf_diag::perf_diag_enabled() {
         inject_sentinel_window(&mut runtime_schemas, &mut runtime_window_configs)?;
@@ -286,7 +286,7 @@ fn register_window_miss_provider(
 
 /// 注入内置哨兵窗口（诊断模式，`--perf-diag diag=true`）。
 ///
-/// `__perf_sentinel` 是保留窗口名：用户 .wfs/windows.toml 不得声明同名窗口
+/// `__wf_sentinel` 是保留窗口名：用户 .wfs/windows.toml 不得声明同名窗口
 /// （与 `__window_miss` 同级的保留名）。schema 固定 `{round, n, start_ns}`（
 /// digit → Int64，`start_ns` 为 epoch nanos，f64 会丢精度）；无时间列——窗口
 /// 不推进水位、不拒绝迟到（`append_with_watermark` 对无时间列窗口的处理）。

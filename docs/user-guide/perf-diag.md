@@ -107,7 +107,7 @@ wfgen perf-diag --diag conf/perf-diag.toml \
 ## 5. 配置参考（`perf-diag.toml`）
 
 ```toml
-diag = true          # 诊断模式总开关：注册内置 __perf_sentinel 窗口
+diag = true          # 诊断模式总开关：注册内置 __wf_sentinel 窗口
 cut_rules = false    # 初始门控（仅单点模式生效；多点模式启动即应用 points[0]）
 cut_output = false
 
@@ -169,7 +169,7 @@ cut_output = false
    ```toml
    [sink_group]
    name = "perf_sentinel_infra"
-   windows = ["__perf_sentinel"]
+   windows = ["__wf_sentinel"]
    [[sink_group.sinks]]
    connect = "file_json_sink"
    name = "perf_sentinel_out"
@@ -218,5 +218,5 @@ full   eps=641240   n=1000000 rounds=1
   档是唯一重启例外（RequiresRestart）；
 - **哨兵走独立窗口**：测共享段（recv/decode/路由）+ 数据窗排空，绝对时间可能略早
   于最慢数据窗的规则消化完，但**跨档同一口径**，增量墙归属判定不受影响；
-- **`__perf_sentinel` 是保留名**：诊断模式下用户不得在 `.wfs`/`windows.toml` 声明
+- **`__wf_sentinel` 是保留名**：诊断模式下用户不得在 `.wfs`/`windows.toml` 声明
   同名窗口（启动即报错）。

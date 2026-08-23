@@ -17,7 +17,7 @@ use crate::{ConfigReason, ConfigResult};
 /// 全字段 `#[serde(default)]`——空文件/缺字段即默认关闭。
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct PerfConfig {
-    /// 诊断模式总开关：`true` 时引擎注册内置 `__perf_sentinel` 窗口/哨兵规则。
+    /// 诊断模式总开关：`true` 时引擎注册内置 `__wf_sentinel` 窗口/哨兵规则。
     #[serde(default)]
     pub diag: bool,
     /// 初始门控：禁止规则求值（`process_batch` 直通，ack 保留）。

@@ -4,7 +4,7 @@
 > 把该方法论**内建进引擎**的机制设计：一次实现诊断模式，之后每次性能退化定位 =
 > 声明式切换诊断点，**不重启 daemon、不改引擎代码、不手拼测量协议**。
 >
-> 术语：批末完成信号称 **sentinel（哨兵）**——内置 `__perf_sentinel` 窗口 +
+> 术语：批末完成信号称 **sentinel（哨兵）**——内置 `__wf_sentinel` 窗口 +
 > 哨兵规则，载荷 `{round, n, start_ns}` 自描述，emit 补 `emit_ns` → EPS 四元组
 > 直接可算。
 
@@ -61,7 +61,7 @@
 │  诊断点状态机（sentinel 驱动自切换，零外部控制面）：         │
 │    sentinel(round=k) emit ─▶ 应用点 k+1（门控翻转+规则reload）│
 │    ─▶ 写 perf_point{current=k+1}（切换完成信号）            │
-│  内置 __perf_sentinel 窗口 + 哨兵规则（豁免所有门控，活跃）  │
+│  内置 __wf_sentinel 窗口 + 哨兵规则（豁免所有门控，活跃）  │
 │    emit 写 perf_sentinel{round,n,start_ns,emit_ns}（四元组）  │
 │  runtime.rules hot-reload：规则子集切换（已有能力）          │
 └────────────────────────────────────────────────────────────┘
@@ -106,7 +106,7 @@ wfusion daemon --perf-diag conf/perf-diag.toml
 `conf/perf-diag.toml`（独立配置文件，bench 各自一份）：
 
 ```toml
-diag = true          # 诊断模式：注册内置 __perf_sentinel 窗口
+diag = true          # 诊断模式：注册内置 __wf_sentinel 窗口
 cut_rules = false    # 初始门控：禁止规则求值（process_batch 直通，ack 保留）
 cut_output = false   # 初始门控：禁止输出链（emit 不 serialize/stage/commit）
 
@@ -144,9 +144,9 @@ cut_output = true
 - 门控形态：`set_rule_profiling` 同款全局原子 + `pub fn set_perf_cuts(...)`，
   `Reactor::start` 时从 `--perf-diag` 加载的 `PerfConfig` 初始化（无参数 = 全关）。
 
-### 4.3 内置 `__perf_sentinel` 窗口 + 哨兵规则（漂流瓶）
+### 4.3 内置 `__wf_sentinel` 窗口 + 哨兵规则（漂流瓶）
 
-- **内置 schema**：`__perf_sentinel` 流/窗口，字段 `{ round: digit, n: digit,
+- **内置 schema**：`__wf_sentinel` 流/窗口，字段 `{ round: digit, n: digit,
   start_ns: digit }`（引擎内置，不依赖用户 .wfs；`[perf].diag=true` 时自动注册）。
 - **sentinel 载荷自描述**：wfgen 发送时把**发送量 `n`**（本批事件数）和**开始时间
   `start_ns`**（wfgen 发送开始时钟）写进 sentinel 事件字段——wfgen 无需外部记账。
@@ -171,7 +171,7 @@ cut_output = true
   # topology/sinks/business.d/perf_sentinel.toml（各 bench 一份）
   [sink_group]
   name = "perf_sentinel_infra"
-  windows = ["__perf_sentinel"]
+  windows = ["__wf_sentinel"]
   [[sink_group.sinks]]
   connect = "file_json_sink"
   name = "perf_sentinel_out"
@@ -251,8 +251,8 @@ wfgen perf-diag \
      启动即 points[0] + 初始信号；k>0 由哨兵驱动），随后发送无竞态；
   2. 取覆盖 `n_k` 行的帧前缀（帧行数合计 ≥ n_k，`n_k` 计入哨兵载荷）；
      `T0 = now()`；发数据帧 + 帧尾追加
-     `__perf_sentinel{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq 尾部）；
-     帧尾追加 `__perf_sentinel{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq
+     `__wf_sentinel{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq 尾部）；
+     帧尾追加 `__wf_sentinel{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq
      尾部，保证最后处理）；
   3. 从 `data/perf_sentinel.ndjson` 读到 `sentinel{round=k, n=n_k}` 的第
      r 条记录（含引擎补的 `emit_ns`）——引擎侧由哨兵任务落盘；
@@ -283,7 +283,7 @@ wfgen perf-diag \
 
 | 项 | 决策 | 说明 |
 |---|---|---|
-| sentinel 队列 | 独立 `__perf_sentinel` 窗口（①a） | 哨兵任务等**数据窗排空**（min_acked 追平 next_seq）后写记录；跨档同一口径 |
+| sentinel 队列 | 独立 `__wf_sentinel` 窗口（①a） | 哨兵任务等**数据窗排空**（min_acked 追平 next_seq）后写记录；跨档同一口径 |
 | sentinel 载荷 | 自描述 `{round, n, start_ns}` | 发送量+开始时间入 sentinel；引擎补 `emit_ns` → EPS 四元组直接可算；start/emit 以字符串携带防 f64 丢精度 |
 | 切换机制 | sentinel 驱动自切换 | 同步无竞态、零控制面；在途批次不受影响 |
 | 时钟 | 同机基准，wfgen `start_ns` 与引擎 `emit_ns` 同机时钟 | 跨机需 NTP 或引擎回写差值（未做） |
@@ -292,7 +292,7 @@ wfgen perf-diag \
 | sentinel 处理开销 | 常数量（极小），计入每档 | 增量抵消，不影响墙归属 |
 | 窗口残留 | delta 口径，2min 滑窗自动老化 | 跨点不重启可连续跑 |
 | rounds | 每点仅首轮有效 | 首个哨兵即切换下一档；`--rounds` 保留但去噪走 `--n-list` |
-| 非诊断模式哨兵帧 | 未知流 window miss | 未注册 `__perf_sentinel` 窗口 → `subscribers_of` 为空 → WARN 一次（按 source+tag 去重）+ miss 计数 + 丢弃；数据帧不受影响，门控全 false 无切换——`wfgen perf-diag` 对非诊断 daemon 会**超时报错**（错误信息含根因提示）而非给出错误数字。daemon 启动日志明示 perf-diag 启用状态 |
+| 非诊断模式哨兵帧 | 未知流 window miss | 未注册 `__wf_sentinel` 窗口 → `subscribers_of` 为空 → WARN 一次（按 source+tag 去重）+ miss 计数 + 丢弃；数据帧不受影响，门控全 false 无切换——`wfgen perf-diag` 对非诊断 daemon 会**超时报错**（错误信息含根因提示）而非给出错误数字。daemon 启动日志明示 perf-diag 启用状态 |
 
 ---
 
@@ -301,7 +301,7 @@ wfgen perf-diag \
 1. **新增代码单测覆盖率 ≥ 90%**（`cargo llvm-cov` 行覆盖率口径）：
    - wf-config `PerfConfig` 解析（含 points 列表、缺省值）；
    - wf-runtime 门控切口（cut_rules 直通保留 ack / cut_output 保留 emitted 计数）；
-   - 内置 `__perf_sentinel` 窗口/规则 + `perf_sentinel`/`perf_point` 指标 + 豁免门控；
+   - 内置 `__wf_sentinel` 窗口/规则 + `perf_sentinel`/`perf_point` 指标 + 豁免门控；
    - 诊断点状态机（sentinel emit → 门控翻转 + 规则 reload + 切换完成信号）；
    - wfgen `perf-diag` 子命令（EPS 计算与哨兵文件读取抽成库函数以便单测）。
 2. **perf_diag_case `floor` 档 EPS ≥ 10M**（N ≥ 1M 验收）：单流小字段管道吞吐
@@ -311,7 +311,7 @@ wfgen perf-diag \
 
 1. wf-config：`PerfConfig`（diag/cut_rules/cut_output）+ 解析 + 测试；
 2. wf-runtime：`set_perf_cuts` 原子门控 + `process_batch`/`emit` 切口 + 测试；
-3. wf-runtime：内置 `__perf_sentinel` 窗口/规则 + `perf_sentinel` 指标 + 告警落盘
+3. wf-runtime：内置 `__wf_sentinel` 窗口/规则 + `perf_sentinel` 指标 + 告警落盘
    （走 alert 链、豁免 cut_output）+ 豁免门控测试；perf_diag_case 侧补
    `topology/sinks/infra.d/perf_sentinel.toml`（`data/perf_sentinel.ndjson`）；
 4. wf-runtime：诊断点状态机——sentinel emit → 门控翻转 + 规则子集 reload 触发 +

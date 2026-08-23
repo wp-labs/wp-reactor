@@ -5,7 +5,7 @@
 //! - **进入诊断 = 启动参数** `wfusion daemon --perf-diag conf/perf-diag.toml`，
 //!   生产不带参数即全关（`wfusion.toml` 零污染）。
 //! - **诊断点 = 只有禁止开关**：`cut_rules`（规则求值）/ `cut_output`（输出链）。
-//! - **切换 = sentinel 驱动自切换**：wfgen 每批帧尾追加 `__perf_sentinel` 帧
+//! - **切换 = sentinel 驱动自切换**：wfgen 每批帧尾追加 `__wf_sentinel` 帧
 //!   （载荷自描述 `{round, n, start_ns}`）；哨兵处理时引擎补 `emit_ns` 并把
 //!   `{round, n, start_ns, emit_ns}` 四元组经 alert 链落盘（豁免门控）→
 //!   EPS = n / (emit_ns − start_ns) 直接可算。
@@ -35,9 +35,9 @@ use crate::lifecycle::RuntimeControlHandle;
 // ---------------------------------------------------------------------------
 
 /// 内置哨兵流/窗口名（诊断模式下自动注册，不依赖用户 .wfs）。
-pub const PERF_SENTINEL_STREAM: &str = "__perf_sentinel";
+pub const PERF_SENTINEL_STREAM: &str = "__wf_sentinel";
 /// 哨兵记录 sink 的 yield target（= 窗口名，case 的 sink group 按此匹配）。
-pub const PERF_SENTINEL_WINDOW: &str = "__perf_sentinel";
+pub const PERF_SENTINEL_WINDOW: &str = "__wf_sentinel";
 
 /// 诊断模式总开关（`--perf-diag` 传入）。
 static PERF_DIAG_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -155,7 +155,7 @@ pub fn parse_sentinel_batch(batch: &arrow::record_batch::RecordBatch, emit_ns: i
     out
 }
 
-/// 构建哨兵记录 OutputRecord（yield target = `__perf_sentinel` → 文件 sink）。
+/// 构建哨兵记录 OutputRecord（yield target = `__wf_sentinel` → 文件 sink）。
 ///
 /// `start_ns`/`emit_ns` 以字符串（Chars）携带：epoch nanos ≈ 1.7e18 超出 f64
 /// 精确范围（ulp ≈ 256ns），走 Digit/Number 会丢精度；字符串由 wfgen 解析回
@@ -376,7 +376,7 @@ pub(crate) struct SentinelTaskConfig {
     pub rx: mpsc::Receiver<RulePush>,
 }
 
-/// 哨兵任务：消费 `__perf_sentinel` 窗口的推送——写四元组记录（alert 链落盘，
+/// 哨兵任务：消费 `__wf_sentinel` 窗口的推送——写四元组记录（alert 链落盘，
 /// 豁免所有 perf 门控）+ 驱动诊断点状态机。
 ///
 /// **批末语义**：哨兵帧与数据帧同 TCP 连接、同源 seq 有序（哨兵是"批末最后
@@ -468,7 +468,7 @@ async fn process_sentinel_push(
     }
 }
 
-/// 把哨兵/完成信号记录经 alert 链投递到 `__perf_sentinel` 的 sink（文件落盘）。
+/// 把哨兵/完成信号记录经 alert 链投递到 `__wf_sentinel` 的 sink（文件落盘）。
 /// 常数量处理开销（每批 1-2 条），豁免 cut_rules/cut_output 门控。
 async fn emit_sentinel_records(records: Vec<OutputRecord>, sink_fanout: &Arc<SinkFanout>) {
     if records.is_empty() {

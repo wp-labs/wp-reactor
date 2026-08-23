@@ -18,7 +18,7 @@
 > | 规则子集 | `family_*` 档 | `runtime.rules` hot reload |
 > | ④ 预算 | `budget:X` 档（唯一重启例外） | `parse_buffer_bytes` |
 > | 计时 | `profiling=off` | `WF_RULE_PROFILING=0`（门控化） |
-> | 完成信号 | 漂流瓶 sentinel `__perf_sentinel` | 哨兵任务等数据窗排空后写 `perf_sentinel{round,n,start_ns,emit_ns}` + `point{current=k}` 记录 |
+> | 完成信号 | 漂流瓶 sentinel `__wf_sentinel` | 哨兵任务等数据窗排空后写 `perf_sentinel{round,n,start_ns,emit_ns}` + `point{current=k}` 记录 |
 >
 > 驱动：`wfgen perf-diag --diag conf/perf-diag.toml --frames ... --n-list ...`
 > （逐点切 → 发帧+哨兵 → 读哨兵文件 → 墙表）。本文以下各节的方法论细节

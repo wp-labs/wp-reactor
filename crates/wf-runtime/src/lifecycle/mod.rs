@@ -410,7 +410,7 @@ impl Reactor {
         );
         let rule_watch = watch_group(rule_group, cancel.clone());
 
-        // perf-diag 哨兵任务：诊断模式（--perf-diag）下订阅 __perf_sentinel 窗口，
+        // perf-diag 哨兵任务：诊断模式（--perf-diag）下订阅 __wf_sentinel 窗口，
         // 处理哨兵帧（写四元组记录 + 驱动诊断点状态机）。必须早于 receiver 注册
         // fanout 订阅，保证首个哨兵帧到达时投递通道已就绪。
         let diag_controller = if crate::perf_diag::perf_diag_enabled() {
