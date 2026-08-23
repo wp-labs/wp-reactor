@@ -152,7 +152,7 @@ AND B.dateTime BETWEEN A.dateTime AND A.expires）。
 | 现状 | ❌ 缺失 |
 | 形态 | `join ... from <side_table>` 静态/周期刷新快照 |
 
-**P4 — Hop 窗口（滑动重叠窗）**
+**P4 — Hop 窗口（滑动重叠窗）✅ 已落地（2026-08-23）**
 
 ```
 HOP(bid, 2s, 10s)：每 2s 推进、10s 跨度重叠窗口（Q5 权威形状）。
@@ -160,9 +160,9 @@ HOP(bid, 2s, 10s)：每 2s 推进、10s 跨度重叠窗口（Q5 权威形状）�
 
 | 项 | 值 |
 |---|---|
-| NEXMark | Q5（现用 fixed 10s 桶近似） |
-| 现状 | ❌ 缺失 |
-| 形态 | 窗口规格扩展 `WindowSpec::Hop { size, slide }`；stats 执行器按 slide 推进、size 出窗 |
+| NEXMark | Q5（已由 `match<auction:hop(10s, 2s)>` 精确对齐） |
+| 现状 | ✅ 已实现（`WindowSpec::Hop { size, slide }`，CEP match 路径；stats 执行器按 slide 推进待扩展） |
+| 形态 | `match<key:hop(size, slide)>`：每事件扇入 size/slide 个覆盖窗口，`w_start + size` 收口（slide 对齐）；`hop(size,size)` 等价 `fixed(size)` |
 
 **P5 — stats → join 回查管线**
 
@@ -373,8 +373,9 @@ rule q15_bidding_stats {
 | Q18 | `stats<30m:fixed> group by (bidder, auction) { b \| last(b) }` | last 整行 |
 | Q19 | `stats<30m:fixed> group by (auction) { b \| top(10, price) }` | per-key top-N |
 
-> 注：Q5 的 hop(2s,10s) 权威形状为滑动，本地实现以 fixed 10s 桶近似（与现有 wfl 一致，
-> 已在 NEXMARK_AUTHORITATIVE_SEMANTICS.md 标注近似）。stats 的 sliding 形态为后续扩展。
+> 注（2026-08-23 更新）：Q5 权威 hop(2s,10s) 滑动形状已由 CEP `match<auction:hop(10s, 2s)>`
+> 精确实现（见 docs/design/wfl-design.md window_spec），stats 执行器的 hop 形态仍为
+> 后续扩展。
 
 ---
 

@@ -190,7 +190,7 @@ match<sip:5m> {
 说明：
 
 - key 可为空、单 key、复合 key
-- 支持滑动窗口、固定窗口、会话窗口
+- 支持滑动窗口、固定窗口、会话窗口、HOP 滑动窗口
 - key 支持点字段和下标字段，例如 `match<e["detail.sha256"]:5m>`
 - 多步是顺序关系，前一步命中后才进入后一步
 
@@ -216,6 +216,24 @@ match<uid:session(30m)> {
     }
 }
 ```
+
+HOP 滑动窗口示例：
+
+```wfl
+match<auction:hop(10s, 2s)> {
+    on event {
+        b | count >= 1;
+    }
+    and close {
+        n: b | count >= 1;
+    }
+}
+```
+
+- `hop(size, slide)`：滑动窗口，`size` 为窗口时长、`slide` 为推进步长，要求 `size % slide == 0`。
+- 每个事件扇入 `size / slide` 个覆盖窗口（窗口按 epoch `slide` 边界对齐），各窗口独立累积。
+- 窗口在 `w_start + size` 收口（天然落在 slide 边界）；`hop(size, size)` 等价 `fixed(size)`。
+- 典型用途：滚动热点统计（NEXMark Q5 形态）——每 slide 更新一次最近 size 时长的 Top-N。
 
 显式 key 映射：
 
@@ -386,6 +404,40 @@ join blocked_list anti on sip == blocked_list.ip
 - `asof within`：在指定时间范围内回看
 - `anti`：排除式关联（白名单排除），仅保留右表无匹配的左记录
 - 支持多条件：`join t snapshot on sip == t.ip && dport == t.port`
+
+**join 后 `where` 过滤**：
+
+```wfl
+join person_events snapshot on a.seller == person_events.id
+where person_events.state in ("OR", "ID", "CA")
+```
+
+- 在全部 join 富化完成后、alert 构建前求值；`false` / join miss 导致字段缺失（`None`）均抑制输出——对齐 SQL `INNER JOIN ... WHERE` 的丢行语义（Q3/Q20 形态）。
+- 仅 `bool` 表达式合法；无 `join` 的规则不可用 `where`（编译期拒绝）。
+
+**deferred join（`emit at`）**：
+
+```wfl
+rule q9_winning_bid {
+    events { a : auction_events }
+    on each a -> score(30.0)
+    join bid_events reduce maxrow(price) tie(dateTime asc)
+        within [a.dateTime, a.expires]
+        on a.id == bid_events.auction as winner
+        emit at a.expires
+    entity(digit, a.id)
+    yield nexmark_alerts (
+        id = a.id,
+        detail = fmt("winner {}", winner.bidder)
+    )
+}
+```
+
+- 驱动事件（`on each` 驱动）挂起，`emit at <expr>` 为到期时刻（事件时间 watermark 到达后评估）。
+- `within [lo, hi]` 约束右表行的匹配时间区间；界可为驱动字段或函数（如 `bucket_end(p.dateTime, 10s)`，上开界写 `<bucket_end(...)`）。
+- `reduce maxrow(field) tie(...)` 在匹配行集中选一（`minrow`/`top` 同族）；`as winner` 把胜者整行以裸键注入，`winner.field` 读取（Q9 形态）。
+- 无匹配行不输出；`emit at` join 仅支持 `on each` 驱动形态（match 形态编译期拒绝）。
+- 用途：auction 生命周期内胜出价（Q4 内层 / Q9）、窗口存在性 join（Q8 用 `emit at bucket_end(...)`）。
 
 ### `|>` pipeline
 
@@ -703,20 +755,23 @@ risk_context = object {
 
 ```wfl
 conv { sort(-score) | top(10) ; }
+conv { sort(-score) | top_ties(1) ; }   // RANK 语义：前 N 名 + 并列全输出
 conv { sort(-score) ; where(count > 5) ; }
 ```
 
 支持的操作：
 
-- `sort(...)`
-- `top(n)`
+- `sort(...)` — 稳定排序，`-` 前缀表降序
+- `top(n)` — 截断前 n 条
+- `top_ties(n)` — **RANK 语义并列全输出**：取前 n 条，并保留所有与第 n 条排序键**等值**的条目（并列者全出，不截断）。要求同一 chain 内前导 `sort(...)` 提供并列判定键（编译期检查）；`top_ties(0)` / 空输入安全退化为空/截断
 - `dedup(expr)`
 - `where(expr)`
 
 说明：
 
 - `conv` 位于 `yield` 之后、`limits` 之前
-- checker 当前要求 `conv` 只能用于 fixed window：`match<...:fixed>`
+- checker 当前要求 `conv` 用于 `fixed` 或 `hop` 窗口：`match<...:fixed>` / `match<...:hop(size, slide)>`（窗口收口批边界确定；sliding/session 拒绝）
+- 典型用途：每窗口收口批取 Top-N（NEXMark Q5/Q7 形态，`sort(-count) | top_ties(1)` 输出并列最高）
 
 ### `limits`
 
@@ -734,6 +789,37 @@ limits {
 - `throttle`
 - `drop_oldest`
 - `fail_rule`
+
+### `stats` — 声明式窗口统计
+
+`stats` 规则形态（无 `match` 状态机，声明式窗口聚合）：
+
+```wfl
+rule q12_bidder_10s_window_count {
+    events { b : bid_events }
+    stats<10s:fixed> group by (b.bidder) {
+        b | count as bid_count;
+        b | avg(b.price) as avg_price;
+        b | distinct(b.bidder) as uniq_bidders;
+        b | last(b.url) as last_url;          // 最近合格行的整行字段（Q18）
+        b | top(10, b.price) as top_prices;   // per-key top-N（Q19）
+    }
+    entity(digit, b.bidder)
+    yield nexmark_alerts (
+        id = b.bidder,
+        detail = fmt("{} {}", b.bidder, stat.value(final(bid_count)))
+    )
+}
+```
+
+说明：
+
+- 窗口规格 `stats<dur:mode>`：`fixed(dur)`（epoch 对齐固定桶）或 `session(gap)`；时长支持 `d` 后缀（如 `1d:fixed` = UTC 日历天桶）。
+- `group by (keys)`：复合键分组；空键 = 全局单实例。
+- 度量聚合：`count` / `sum(f)` / `avg(f)`（(sum,count) 归并） / `min(f)` / `max(f)` / `distinct(f)` / `last(f)`（保留最近行字段） / `top(N, f)`（per-key top-N）。
+- `as <label>` 命名度量；yield 用 `stat.value(final(label))` 读取数值、`b.*` 读分组键/字段（last/top 行字段经 field_values 注入）。
+- 每 (键 × 桶) 收口一行；无 `on each`/`match`/`score`，不参与 conv。
+- 典型用途：NEXMark Q12/Q15-19 形态（按用户/分类/卖家/日历天的计数、去重、Top-N、末条）。
 
 ## 表达式与函数
 
@@ -1040,7 +1126,8 @@ Match 约束：
 - `match` 至少需要有效的事件/关闭路径才能通过后续语义检查
 - `close_reason` 仅可在 `on close` 中引用
 - `match` 与 `on each` 互斥
-- `conv` 仅允许与 fixed window 搭配
+- `conv` 仅允许与 fixed / hop 窗口搭配（sliding/session 拒绝）；`top_ties` 要求同 chain 前导 `sort`
+- `emit at`（deferred join）仅支持 `on each` 驱动形态
 - session 窗口的 gap 与 `asof within` 的时长必须 `> 0`（当前检查器不强制 `match` 滑动/固定窗口的 `duration > 0`，`match<sip:0>` 可通过解析）
 
 Seq / Any 约束：

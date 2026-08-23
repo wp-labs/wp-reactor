@@ -26,8 +26,12 @@
 | 条目 | 文档目标 | 当前实现状态 | 备注 |
 |------|---------|--------------|------|
 | `|>` 多级管道 + `_in` | L3 核心能力 | ✅ 已实现 | 解析、编译、运行、replay 均可用 |
-| `conv { sort/top/dedup/where }` | L3 核心能力 | ✅ 已实现 | 仅与 `fixed` 窗口配合（语义检查已加） |
+| `conv { sort/top/dedup/where/top_ties }` | L3 核心能力 | ✅ 已实现 | 与 `fixed`/`hop` 窗口配合（sliding/session 拒绝，语义检查已加）；`top_ties` 并列全输出（RANK，2026-08-23） |
+| `match<...:hop(size, slide)>` | L3 滑动窗口 | ✅ 已实现 | HOP 窗口：每事件扇入 size/slide 个覆盖窗口，`w_start+size` 收口（2026-08-23） |
 | `match<...:session(gap)>` | L3 行为分析窗口 | ✅ 已实现 | gap 超时切段语义已落地 |
+| `stats<dur:fixed\|session> group by(...) { agg as label }` | 声明式窗口统计 | ✅ 已实现 | 度量 count/sum/avg/min/max/distinct/last/top；每 (键×桶) 收口一行 |
+| deferred join：`join ... reduce ... within [..] on ... as label emit at expr` | 事件到期关联 | ✅ 已实现 | `on each` 驱动挂起 → watermark 到期评估（Q8/Q9 形态，2026-08-23 端到端激活） |
+| join 后 `where` 过滤 | L2 关联过滤 | ✅ 已实现 | 富化后输出前求值，false/None 抑制（Q3/Q20 形态） |
 | `join snapshot/asof [within]/anti` | L2 关联能力 | ✅ 已实现 | 包含 asof 时间约束与右表时间列检查；parser/AST 已支持 `anti` |
 | `limits { ... }` | v2.1 推荐声明 + 运行时预算 | ✅ 已实现 | 未声明给 Warning，声明后有编译/运行时约束 |
 | 内联 `test { input/expect/options }` + `wfl test --shuffle --runs N` | Conformance 基础 | ✅ `warp-fusion` 已实现 | `wp-reactor` 有 parser/runner；同级 `warp-fusion` 提供独立 `wfl` CLI |
@@ -157,8 +161,8 @@ runtime: runtime/wfusion.toml
 - 场景：情报关联、异常偏离、集合判定、实体建模。
 
 ### L3（高级，feature gate）
-- `|>`、`conv`、`fixed`、`session(gap)`、集合/统计函数、隐式中间窗口。
-- 场景：多级聚合、Top-N、固定间隔报表、后处理。
+- `|>`、`conv`、`fixed`、`session(gap)`、`hop(size, slide)`、集合/统计函数、`stats<>` 声明式统计、隐式中间窗口。
+- 场景：多级聚合、Top-N、固定间隔报表、后处理、滑动热点统计。
 
 > 当前代码没有解析 rule 内 `features [...]`；L3 能力由语义检查和具体语法使用约束。
 
@@ -188,7 +192,10 @@ runtime: runtime/wfusion.toml
 | `window.has(field)` 集合判定 | | ✓ | |
 | `entity(type, id_expr)` 实体声明 | ✓ | | |
 | `fixed` 固定间隔窗口 | | | ✓ |
-| `conv { ... }` 结果集变换 | | | ✓ |
+| `match<key:hop(size, slide)>` HOP 滑动窗口 | | | ✓ |
+| `conv { sort/top/dedup/where/top_ties }` 结果集变换 | | | ✓ |
+| `stats<dur:fixed\|session> group by(...)` 声明式统计 | | | ✓ |
+| deferred join（`emit at`） | | | ✓ |
 | `\|>` 多级管道 | | | ✓ |
 | 隐式 yield | | | 规划 |
 | 隐式中间 window（pipeline 展开） | | | ✓ |
@@ -386,7 +393,8 @@ key_block     = "key" , "{" , key_item , { key_item } , "}" ;
 key_item      = IDENT , "=" , field_ref , ";" ;
 window_spec   = DURATION                              (* 滑动窗口 *)
               | DURATION , ":" , "fixed"              (* 固定间隔窗口 *)
-              | "session" , "(" , DURATION , ")"  ;    (* 会话窗口，L3 行为分析，已实现 *)
+              | "session" , "(" , DURATION , ")"      (* 会话窗口，L3 行为分析，已实现 *)
+              | "hop" , "(" , DURATION , "," , DURATION , ")" ;  (* HOP 滑动窗口 size,slide；size % slide == 0，已实现 *)
 on_event_block= "on" , "event" , "{" , match_step , { match_step } , "}" ;
 close_block   = close_mode , "close" , "{" , match_step , { match_step } , "}" ;
 close_mode    = "on"                                    (* OR 模式：事件路径与关闭路径独立触发 *)
@@ -404,6 +412,16 @@ join_mode     = "snapshot"
               | "anti" ;
 join_cond     = field_ref , "==" , field_ref ;
 
+(* deferred join（`emit at`，Q8/Q9 形态，已实现）：驱动事件挂起至到期评估 *)
+deferred_join = "join" , IDENT , [ "reduce" , reduce_spec ] , [ "within" , bound , "," , bound ] ,
+                "on" , join_cond , [ "as" , IDENT ] , "emit" , "at" , expr ;
+reduce_spec   = ( "maxrow" | "minrow" | "top" ) , "(" , field_ref , [ "," , expr ] , ")" ,
+                [ "tie" , "(" , field_ref , [ "desc" ] , ")" ] ;
+bound         = [ "<" ] , expr ;
+
+(* join 后 where 过滤（富化后、输出前，Q3/Q20 形态，已实现） *)
+rule_where    = "where" , expr ;
+
 score_expr    = "score" , "(" , expr , ")" ;                                   (* 简洁写法 *)
 
 entity_clause = "entity" , "(" , entity_type , "," , expr , ")" ;              (* L1：实体声明，规则必选 *)
@@ -419,10 +437,16 @@ yield_preset_ref = IDENT , [ "<" , [ expr , { "," , expr } , [ "," ] ] , ">" ] ;
 named_arg     = yield_field , "=" , expr ;
 yield_field   = IDENT ;
 
-conv_clause   = "conv" , "{" , conv_chain , { conv_chain } , "}" ;             (* L3，已实现 *)
+conv_clause   = "conv" , "{" , conv_chain , { conv_chain } , "}" ;             (* L3，已实现；fixed/hop 窗口 *)
 conv_chain    = conv_step , { "|" , conv_step } , ";" ;                        (* L3，已实现 *)
-conv_step     = ("sort" | "top" | "dedup" | "where") , "(" , [ conv_args ] , ")" ;  (* L3，已实现 *)
+conv_step     = ("sort" | "top" | "top_ties" | "dedup" | "where") , "(" , [ conv_args ] , ")" ;  (* L3，已实现 *)
 conv_args     = expr , { "," , expr } ;                                        (* L3，已实现 *)
+
+stats_clause  = "stats" , "<" , stats_window , ">" , [ "group" , "by" , "(" , field_ref , { "," , field_ref } , ")" ] ,
+                "{" , stats_measure , { stats_measure } , "}" ;               (* 声明式窗口统计，已实现 *)
+stats_window  = DURATION , ":" , "fixed" | DURATION , ":" , "session" ;
+stats_measure = IDENT , "|" , stats_agg , [ "(" , field_ref , ")" ] , [ "as" , IDENT ] , ";" ;
+stats_agg     = "count" | "sum" | "avg" | "min" | "max" | "distinct" | "last" | "top" , "(" , INTEGER , "," , field_ref , ")" ;
 
 limits_clause = "limits" , "{" , limit_item , { limit_item } , "}" ;   (* 可选；省略时编译 Warning *)
 limit_item    = "max_memory" , "=" , STRING , ";"
