@@ -449,7 +449,7 @@ impl RuleExecutor {
 
     pub fn new_with_options(plan: RulePlan, options: RuleExecutorOptions) -> Self {
         let live_joins = compute_live_joins(&plan);
-        let each_join_plan = parse_each_join_columnar(&plan);
+        let each_join_plan = parse_each_join_columnar(&plan, &live_joins);
         let bind_filters = plan
             .binds
             .iter()

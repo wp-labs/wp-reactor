@@ -30,7 +30,7 @@ use super::eval::{
     YieldMeta, eval_bool_expr, eval_entity_id, eval_expr_with_l3, eval_score,
     eval_yield_expr_with_meta, with_yield_eval_scope,
 };
-use wf_lang::plan::RulePlan;
+use wf_lang::plan::{JoinPlan, RulePlan};
 
 // L3 batched write (now unconditional): collect a segment's column values and
 // bulk-`extend` each builder column once at the end via
@@ -72,9 +72,16 @@ pub(super) struct WherePred {
 
 /// 解析 each 规则的列式 join 支持性。`Some` = 可走列式 join 路径；
 /// `None` = 形状不支持（回退行式 `execute_each_direct`）。
-pub(crate) fn parse_each_join_columnar(plan: &RulePlan) -> Option<EachJoinPlan> {
-    let join = plan.joins.first()?;
-    if plan.joins.len() != 1 {
+///
+/// 基于 `live_joins`（死 join 消除后）解析——死 join 不参与执行，规则有 1 死
+/// 1 活 join 时活 join 若满足形状仍可列式化（2026-08-23 review：旧版基于
+/// `plan.joins`，死 join 存在时误拒活 join）。
+pub(crate) fn parse_each_join_columnar(
+    plan: &RulePlan,
+    live_joins: &[JoinPlan],
+) -> Option<EachJoinPlan> {
+    let join = live_joins.first()?;
+    if live_joins.len() != 1 {
         return None;
     }
     if !matches!(join.mode, JoinMode::Snapshot) {
@@ -105,6 +112,13 @@ pub(crate) fn parse_each_join_columnar(plan: &RulePlan) -> Option<EachJoinPlan> 
     }
     let left_alias = plan.each_plan.as_ref()?.alias.clone();
     let right_window = join.right_window.clone();
+    // join 条件左字段的限定符必须是驱动别名或裸字段（checker 保证左字段来自
+    // 驱动事件；此处防御——Qualified 其他窗名时列式无法从驱动列解析）。
+    if let FieldRef::Qualified(win, _) = &cond.left {
+        if win.as_str() != left_alias {
+            return None;
+        }
+    }
 
     // where：右窗限定字段 <cmp> 字面量 的合取（&&）。其他形状（左窗字段、
     // 函数、Simple 引用、`in` 列表）→ 不支持 → 回退行式。
@@ -1154,21 +1168,16 @@ impl RuleExecutor {
             _ => false,
         };
 
-        let mut per_row_keys: Vec<Option<JoinKey>> = Vec::with_capacity(rows.len());
         let mut per_row_vals: Vec<Option<Value>> = Vec::with_capacity(rows.len());
         let mut key_rows: HashMap<JoinKey, Vec<usize>> = HashMap::new();
         for (i, (ev, _)) in rows.iter().enumerate() {
             let val = left_idx.and_then(|idx| ev.value_at(idx));
             match val.as_ref().and_then(|v| JoinKey::from_value(v)) {
                 Some(k) => {
-                    per_row_keys.push(Some(k.clone()));
                     key_rows.entry(k).or_default().push(i);
                     per_row_vals.push(val);
                 }
-                None => {
-                    per_row_keys.push(None);
-                    per_row_vals.push(None);
-                }
+                None => per_row_vals.push(None),
             }
         }
 
@@ -1282,8 +1291,7 @@ impl RuleExecutor {
             // （索引只增，快照命中 ⇔ 逐事件命中）。
             let matched: Option<JoinRow> = if row_match[idx].is_some() {
                 row_match[idx].clone()
-            } else if let (Some(k), Some(v)) = (&per_row_keys[idx], &per_row_vals[idx]) {
-                let _ = k;
+            } else if let Some(v) = &per_row_vals[idx] {
                 let bucket =
                     windows.join_lookup(&join_plan.right_window, &join_plan.right_key_field, v);
                 if left_is_float {
