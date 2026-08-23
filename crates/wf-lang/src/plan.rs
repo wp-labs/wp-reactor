@@ -250,6 +250,10 @@ pub enum WindowSpec {
     Fixed(Duration),
     /// Session window with gap duration (L3 behavior analysis).
     Session(Duration),
+    /// HOP sliding window: `size` window duration advancing every `slide`
+    /// (size % slide == 0). Each event belongs to `size/slide` overlapping
+    /// windows aligned to epoch slide boundaries.
+    Hop { size: Duration, slide: Duration },
 }
 
 /// One match step containing one or more OR branches.
@@ -460,6 +464,12 @@ pub struct ConvChainPlan {
 pub enum ConvOpPlan {
     Sort(Vec<SortKeyPlan>),
     Top(u64),
+    /// RANK 语义 top-N：前 N 条 + 与第 N 条排序键等值的全部条目。
+    /// `sort_keys` 为前导 sort 的键（编译期复制；空 = 退化为普通 top）。
+    TopTies {
+        n: u64,
+        sort_keys: Vec<SortKeyPlan>,
+    },
     Dedup(ExprPlan),
     Where(ExprPlan),
 }

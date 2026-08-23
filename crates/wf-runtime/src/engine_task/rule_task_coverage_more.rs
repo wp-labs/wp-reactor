@@ -405,12 +405,13 @@ async fn emit_batch_splits_intermediate_records() {
         record_with("pipe_x", 3),
     ];
     task.emit_batch(records).await;
-    let state = task.pipe_state.lock().unwrap();
-    assert!(
-        matches!(&*state, PipeState::Dead),
-        "missing internal window must mark the pipe Dead"
-    );
-    drop(state);
+    {
+        let state = task.pipe_state.lock().unwrap();
+        assert!(
+            matches!(&*state, PipeState::Dead),
+            "missing internal window must mark the pipe Dead"
+        );
+    }
     // Dead 状态下 flush_pipes 空转。
     task.flush_pipes().await;
 }

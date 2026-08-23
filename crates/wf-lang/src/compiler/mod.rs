@@ -160,13 +160,13 @@ fn compile_stats_rule(
         std::collections::HashMap::new();
     for m in &stats.measures {
         // 度量字段（distinct_count(b.bidder) → (b, bidder)）
-        if let Some(fr) = &m.field {
-            if let FieldRef::Qualified(alias, name) = fr {
-                tracked_bind_fields
-                    .entry(alias.clone())
-                    .or_default()
-                    .insert(name.clone());
-            }
+        if let Some(fr) = &m.field
+            && let FieldRef::Qualified(alias, name) = fr
+        {
+            tracked_bind_fields
+                .entry(alias.clone())
+                .or_default()
+                .insert(name.clone());
         }
     }
     // where + 桶键 表达式引用的字段（粗粒度: 全部归到 measure 的 source_alias）
@@ -532,6 +532,7 @@ fn compile_match(
             WindowMode::Sliding => WindowSpec::Sliding(mc.duration),
             WindowMode::Fixed => WindowSpec::Fixed(mc.duration),
             WindowMode::Session(gap) => WindowSpec::Session(gap),
+            WindowMode::Hop { size, slide } => WindowSpec::Hop { size, slide },
         },
         event_steps: if let Some(chain) = &mc.seq {
             // Chain rules: emit ordered use-steps into event_steps so the existing
@@ -1398,23 +1399,34 @@ fn compile_conv(conv: &Option<crate::ast::ConvClause>) -> Option<ConvPlan> {
             .chains
             .iter()
             .map(|chain| ConvChainPlan {
-                ops: chain
-                    .steps
-                    .iter()
-                    .map(|step| match step {
-                        crate::ast::ConvStep::Sort(keys) => ConvOpPlan::Sort(
-                            keys.iter()
-                                .map(|k| SortKeyPlan {
-                                    expr: k.expr.clone(),
-                                    descending: k.descending,
-                                })
-                                .collect(),
-                        ),
-                        crate::ast::ConvStep::Top(n) => ConvOpPlan::Top(*n),
-                        crate::ast::ConvStep::Dedup(e) => ConvOpPlan::Dedup(e.clone()),
-                        crate::ast::ConvStep::Where(e) => ConvOpPlan::Where(e.clone()),
-                    })
-                    .collect(),
+                ops: {
+                    // 跟踪最近 Sort 键（top_ties 并列判定需要前导 sort 的键）。
+                    let mut last_sort_keys: Vec<SortKeyPlan> = Vec::new();
+                    chain
+                        .steps
+                        .iter()
+                        .map(|step| match step {
+                            crate::ast::ConvStep::Sort(keys) => {
+                                let plans: Vec<SortKeyPlan> = keys
+                                    .iter()
+                                    .map(|k| SortKeyPlan {
+                                        expr: k.expr.clone(),
+                                        descending: k.descending,
+                                    })
+                                    .collect();
+                                last_sort_keys = plans.clone();
+                                ConvOpPlan::Sort(plans)
+                            }
+                            crate::ast::ConvStep::Top(n) => ConvOpPlan::Top(*n),
+                            crate::ast::ConvStep::TopTies(n) => ConvOpPlan::TopTies {
+                                n: *n,
+                                sort_keys: last_sort_keys.clone(),
+                            },
+                            crate::ast::ConvStep::Dedup(e) => ConvOpPlan::Dedup(e.clone()),
+                            crate::ast::ConvStep::Where(e) => ConvOpPlan::Where(e.clone()),
+                        })
+                        .collect()
+                },
             })
             .collect(),
     })

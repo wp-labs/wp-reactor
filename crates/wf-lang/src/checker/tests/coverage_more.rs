@@ -8,8 +8,8 @@
 use std::time::Duration;
 
 use super::*;
-use crate::checker::Severity;
 use crate::check_wfl;
+use crate::checker::Severity;
 use crate::schema::{BaseType, FieldDef, WindowSchema};
 use crate::wfl_parser::parse_wfl;
 
@@ -92,7 +92,10 @@ fn ip_sip_win() -> WindowSchema {
     make_window(
         "ip_sip",
         vec!["s1"],
-        vec![("sip", bt(BaseType::Ip)), ("event_time", bt(BaseType::Time))],
+        vec![
+            ("sip", bt(BaseType::Ip)),
+            ("event_time", bt(BaseType::Time)),
+        ],
     )
 }
 
@@ -253,7 +256,10 @@ rule r {
     yield out (n = stat.count(window_event(a)))
 }
 "#;
-    assert_no_errors(input, &[auction_events_window(), bid_events_window(), out_window()]);
+    assert_no_errors(
+        input,
+        &[auction_events_window(), bid_events_window(), out_window()],
+    );
 }
 
 // ===========================================================================
@@ -330,7 +336,8 @@ rule r {
 "#;
     let errs = check_errors(input, &[auth_events_window(), out_window()]);
     assert!(
-        errs.iter().any(|m| m.contains("not supported together with pipeline stages")),
+        errs.iter()
+            .any(|m| m.contains("not supported together with pipeline stages")),
         "expected each+pipeline rejection, got: {:?}",
         errs
     );
@@ -351,7 +358,8 @@ rule r {
 "#;
     let errs = check_errors(input, &[auth_events_window(), out_window()]);
     assert!(
-        errs.iter().any(|m| m.contains("`on each` pipeline stages are not supported yet")),
+        errs.iter()
+            .any(|m| m.contains("`on each` pipeline stages are not supported yet")),
         "expected pipeline-each rejection, got: {:?}",
         errs
     );

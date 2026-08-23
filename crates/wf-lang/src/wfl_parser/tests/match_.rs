@@ -56,6 +56,45 @@ rule session_test {
     }
 }
 
+#[test]
+fn parse_match_hop_window() {
+    let input = r#"
+rule hop_test {
+    events { e : win }
+    match<uid:hop(10s, 2s)> {
+        on event { e | count >= 1; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    assert_eq!(file.rules.len(), 1);
+    let match_clause = &file.rules[0].match_clause;
+    match match_clause.window_mode {
+        WindowMode::Hop { size, slide } => {
+            assert_eq!(size.as_secs(), 10);
+            assert_eq!(slide.as_secs(), 2);
+        }
+        _ => panic!("expected Hop window mode"),
+    }
+}
+
+#[test]
+fn parse_match_hop_rejects_non_multiple_slide() {
+    let input = r#"
+rule hop_bad {
+    events { e : win }
+    match<uid:hop(10s, 3s)> {
+        on event { e | count >= 1; }
+    } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert!(parse_wfl(input).is_err(), "hop slide must divide size");
+}
+
 // -----------------------------------------------------------------------
 // Match clause - Sliding/Fixed window
 // -----------------------------------------------------------------------

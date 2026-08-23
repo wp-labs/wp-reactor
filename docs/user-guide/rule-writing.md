@@ -454,7 +454,7 @@ rule repeated_fail_bursts {
 
 ## 5. 场景五：Conv — 结果后处理
 
-命中告警后，可以用 `conv` 对结果集做排序、截断、去重、过滤。
+命中告警后，可以用 `conv` 对结果集做排序、截断、并列全出、去重、过滤。
 
 ```wfl
 rule top_port_scanners {
@@ -483,10 +483,11 @@ rule top_port_scanners {
 |------|------|------|
 | `sort(field)` | 按字段排序，`-field` 降序 | `sort(-scan)` |
 | `top(n)` | 保留前 n 条 | `top(2)` |
+| `top_ties(n)` | RANK 语义：前 n 条 + 与第 n 条并列的全部条目 | `sort(-scan) \| top_ties(1)` |
 | `dedup(field)` | 按字段去重 | `dedup(sip)` |
 | `where condition` | 条件过滤 | `where scan >= 5` |
 
-`conv` 只能与 `fixed` 窗口配合使用——因为 sliding 窗口的事件驱动模式下，告警是逐个产出的，没有"结果集"可以做后处理。
+`conv` 只能与 `fixed` / `hop` 窗口配合使用——因为 sliding 窗口的事件驱动模式下，告警是逐个产出的，没有"结果集"可以做后处理；hop 窗口在 slide 边界成批收口，与 fixed 同有确定收口批边界。
 
 ---
 

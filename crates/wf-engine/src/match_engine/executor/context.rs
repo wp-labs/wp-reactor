@@ -841,7 +841,7 @@ mod tests {
         };
         ctx.fields.insert("aid".into(), Value::Number(1.0));
         let ok = execute_joins(
-            &vec![interval_join(Some(within_lookback()), JoinMode::Inner)],
+            &[interval_join(Some(within_lookback()), JoinMode::Inner)],
             &mut ctx,
             &lookup,
             500_000_000_000,
@@ -862,7 +862,7 @@ mod tests {
         };
         ctx.fields.insert("aid".into(), Value::Number(1.0));
         let ok = execute_joins(
-            &vec![interval_join(Some(within_lookback()), JoinMode::Snapshot)],
+            &[interval_join(Some(within_lookback()), JoinMode::Snapshot)],
             &mut ctx,
             &lookup,
             500_000_000_000,
@@ -884,7 +884,7 @@ mod tests {
         };
         ctx.fields.insert("aid".into(), Value::Number(1.0));
         let ok = execute_joins(
-            &vec![interval_join(
+            &[interval_join(
                 Some(within_lookback()),
                 JoinMode::Asof { within: None },
             )],
@@ -906,7 +906,7 @@ mod tests {
         };
         ctx.fields.insert("aid".into(), Value::Number(1.0));
         let ok = execute_joins(
-            &vec![interval_join(Some(within_lookback()), JoinMode::Anti)],
+            &[interval_join(Some(within_lookback()), JoinMode::Anti)],
             &mut ctx,
             &lookup,
             500_000_000_000,
@@ -923,7 +923,7 @@ mod tests {
         };
         ctx.fields.insert("aid".into(), Value::Number(1.0));
         let ok = execute_joins(
-            &vec![interval_join(Some(within_lookback()), JoinMode::Anti)],
+            &[interval_join(Some(within_lookback()), JoinMode::Anti)],
             &mut ctx,
             &lookup,
             500_000_000_000,
@@ -956,7 +956,7 @@ mod tests {
         };
         ctx.fields.insert("aid".into(), Value::Number(1.0));
         let ok = execute_joins(
-            &vec![interval_join(Some(within), JoinMode::Inner)],
+            &[interval_join(Some(within), JoinMode::Inner)],
             &mut ctx,
             &lookup,
             500_000_000_000,
@@ -991,7 +991,7 @@ mod tests {
         ctx.fields
             .insert("hi_f".into(), Value::Number(493_000_000_000_000_000.0));
         let ok = execute_joins(
-            &vec![interval_join(Some(within), JoinMode::Inner)],
+            &[interval_join(Some(within), JoinMode::Inner)],
             &mut ctx,
             &lookup,
             500_000_000_000,
@@ -1010,7 +1010,7 @@ mod tests {
             fields: EngineHashMap::default(),
         };
         ctx.fields.insert("aid".into(), Value::Number(1.0));
-        let ok = execute_joins(&vec![join], &mut ctx, &lookup, 500_000_000_000);
+        let ok = execute_joins(&[join], &mut ctx, &lookup, 500_000_000_000);
         assert!(
             ok,
             "deferred join must not drop the event on the eager path"
@@ -1053,7 +1053,7 @@ mod tests {
             reduce: None,
             emit_at: None,
         };
-        let ok = execute_joins(&vec![join], &mut ctx, &lookup, 500_000_000_000);
+        let ok = execute_joins(&[join], &mut ctx, &lookup, 500_000_000_000);
         assert!(ok);
         // 仅 extra=7 的行通过全部条件
         assert_eq!(ctx.fields.get("price"), Some(&Value::Number(250.0)));
@@ -1072,7 +1072,7 @@ mod tests {
         };
         ctx.fields.insert("aid".into(), Value::Number(1.0));
         let ok = execute_joins(
-            &vec![interval_join(Some(within_lookback()), JoinMode::Inner)],
+            &[interval_join(Some(within_lookback()), JoinMode::Inner)],
             &mut ctx,
             &lookup,
             500_000_000_000,
@@ -1091,7 +1091,7 @@ mod tests {
         };
         ctx.fields.insert("aid".into(), Value::Number(1.0));
         let ok = execute_joins(
-            &vec![interval_join(Some(within_lookback()), JoinMode::Snapshot)],
+            &[interval_join(Some(within_lookback()), JoinMode::Snapshot)],
             &mut ctx,
             &lookup,
             500_000_000_000,
@@ -1193,7 +1193,7 @@ mod tests {
         };
         ctx.fields.insert("aid".into(), Value::Number(9.0));
         let ok = execute_joins(
-            &vec![interval_join(None, JoinMode::Inner)],
+            &[interval_join(None, JoinMode::Inner)],
             &mut ctx,
             &lookup,
             500_000_000_000,
@@ -1207,7 +1207,7 @@ mod tests {
         };
         ctx.fields.insert("aid".into(), Value::Number(1.0));
         let ok = execute_joins(
-            &vec![interval_join(None, JoinMode::Inner)],
+            &[interval_join(None, JoinMode::Inner)],
             &mut ctx,
             &lookup,
             500_000_000_000,

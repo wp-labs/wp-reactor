@@ -225,7 +225,7 @@ async fn send_records_passthrough_and_transformed_lanes() {
         Vec::new(),
     );
     runtime
-        .send_records(&[record.clone()])
+        .send_records(std::slice::from_ref(&record))
         .await
         .expect("projected send_records");
     let got = captured.lock().unwrap().clone().expect("captured");

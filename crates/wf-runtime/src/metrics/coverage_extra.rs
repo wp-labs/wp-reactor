@@ -327,8 +327,10 @@ fn format_bytes_units() {
 
 #[test]
 fn maybe_build_metrics_disabled_and_enabled() {
-    let mut config = wf_config::MetricsConfig::default();
-    config.enabled = false;
+    let mut config = wf_config::MetricsConfig {
+        enabled: false,
+        ..Default::default()
+    };
     assert!(maybe_build_metrics(&config, &[], &[], &[], BTreeMap::new()).is_none());
 
     config.enabled = true;

@@ -81,7 +81,11 @@ fn conv_sort_preserves_values_and_stable_order() {
             _ => 0.0,
         })
         .collect();
-    assert_eq!(scope_keys, vec![3.0, 2.0, 1.0, 9.0], "稳定排序：同键保持输入序");
+    assert_eq!(
+        scope_keys,
+        vec![3.0, 2.0, 1.0, 9.0],
+        "稳定排序：同键保持输入序"
+    );
     // 升序
     let asc = apply_conv(&conv_sort_plan(false), &keys, outputs);
     assert_eq!(conv_measures(&asc), vec![10.0, 10.0, 20.0, 30.0]);

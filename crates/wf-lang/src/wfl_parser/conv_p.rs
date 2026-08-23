@@ -75,6 +75,9 @@ fn conv_step(input: &mut &str) -> ModalResult<ConvStep> {
     if opt(kw("top")).parse_next(input)?.is_some() {
         return parse_top(input);
     }
+    if opt(kw("top_ties")).parse_next(input)?.is_some() {
+        return parse_top_ties(input);
+    }
     if opt(kw("dedup")).parse_next(input)?.is_some() {
         return parse_dedup(input);
     }
@@ -130,6 +133,21 @@ fn parse_top(input: &mut &str) -> ModalResult<ConvStep> {
     ws_skip.parse_next(input)?;
     cut_err(literal(")")).parse_next(input)?;
     Ok(ConvStep::Top(n as u64))
+}
+
+/// `"(" integer ")"` — RANK 语义（并列全输出），要求前导 sort。
+fn parse_top_ties(input: &mut &str) -> ModalResult<ConvStep> {
+    ws_skip.parse_next(input)?;
+    cut_err(literal("(")).parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    let n = cut_err(nonneg_integer)
+        .context(StrContext::Expected(StrContextValue::Description(
+            "positive integer for top_ties(N)",
+        )))
+        .parse_next(input)?;
+    ws_skip.parse_next(input)?;
+    cut_err(literal(")")).parse_next(input)?;
+    Ok(ConvStep::TopTies(n as u64))
 }
 
 /// `"(" expr ")"`

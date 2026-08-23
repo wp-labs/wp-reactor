@@ -1194,7 +1194,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
     let ctx = build_eval_context(
         &keys,
         &scope_key,
-        &[sd1.clone()],
+        std::slice::from_ref(&sd1),
         &[],
         &[&StepPlan { branches: vec![] }],
         Some(&trigger),
@@ -1215,8 +1215,8 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         &named,
     );
     assert_eq!(ctx.fields.get("price"), Some(&num(3.0)));
-    assert!(ctx.fields.get("login").is_none(), "label not requested");
-    assert!(ctx.fields.get("_step_0_measure").is_none());
+    assert!(!ctx.fields.contains_key("login"), "label not requested");
+    assert!(!ctx.fields.contains_key("_step_0_measure"));
     // Keys are always present.
     assert_eq!(ctx.fields.get("sip"), Some(&str_val("10.0.0.1")));
 
@@ -1230,7 +1230,15 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         )]),
     };
     let all = CloseCtxFields::All;
-    let ctx = build_eval_context(&keys, &scope_key, &[], &[bd.clone()], &[], None, &all);
+    let ctx = build_eval_context(
+        &keys,
+        &scope_key,
+        &[],
+        std::slice::from_ref(&bd),
+        &[],
+        None,
+        &all,
+    );
     assert_eq!(ctx.fields.get("_bind_win_count"), Some(&num(2.0)));
     assert_eq!(
         ctx.fields.get("_bind_win_field_amount"),
@@ -1240,7 +1248,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
     let named = CloseCtxFields::Named(HashSet::from(["amount".to_string()]));
     let ctx = build_eval_context(&keys, &scope_key, &[], &[bd], &[], None, &named);
     assert_eq!(ctx.fields.get("amount"), Some(&num(20.0)));
-    assert!(ctx.fields.get("_bind_win_count").is_none());
+    assert!(!ctx.fields.contains_key("_bind_win_count"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,7 +1292,7 @@ fn execute_joins_inner_snapshot_anti_modes() {
     let joins = vec![jp(JoinMode::Snapshot, vec![cond("key", "id")])];
     let mut ctx = event(vec![("key", num(9.0))]);
     assert!(execute_joins(&joins, &mut ctx, &lookup, 0));
-    assert!(ctx.fields.get("amt").is_none());
+    assert!(!ctx.fields.contains_key("amt"));
     let mut ctx = event(vec![]);
     assert!(execute_joins(&joins, &mut ctx, &lookup, 0));
 
@@ -1317,7 +1325,7 @@ fn execute_joins_inner_snapshot_anti_modes() {
     }];
     let mut ctx = event(vec![("key", num(9.0))]);
     assert!(execute_joins(&joins, &mut ctx, &lookup, 0));
-    assert!(ctx.fields.get("amt").is_none());
+    assert!(!ctx.fields.contains_key("amt"));
 }
 
 #[test]
@@ -1345,7 +1353,7 @@ fn execute_joins_asof_single_cond_hit_miss_fallback() {
         asof_outcome: Some(AsofLookup::Hit(row.clone())),
     };
     let mut ctx = event(vec![("key", num(1.0))]);
-    assert!(execute_joins(&vec![jp(None)], &mut ctx, &lookup, 1_000));
+    assert!(execute_joins(&[jp(None)], &mut ctx, &lookup, 1_000));
     assert_eq!(ctx.fields.get("amt"), Some(&num(5.0)));
 
     // Fast-path Miss → None (no enrichment, keep).
@@ -1355,8 +1363,8 @@ fn execute_joins_asof_single_cond_hit_miss_fallback() {
         asof_outcome: Some(AsofLookup::Miss),
     };
     let mut ctx = event(vec![("key", num(1.0))]);
-    assert!(execute_joins(&vec![jp(None)], &mut ctx, &lookup, 1_000));
-    assert!(ctx.fields.get("amt").is_none());
+    assert!(execute_joins(&[jp(None)], &mut ctx, &lookup, 1_000));
+    assert!(!ctx.fields.contains_key("amt"));
 
     // Fallback → candidate scan; picks the latest ts ≤ event_time.
     let lookup = RowsLookup::with_ts(vec![
@@ -1366,13 +1374,13 @@ fn execute_joins_asof_single_cond_hit_miss_fallback() {
         (999, join_row("id", 9.0, vec![("amt", num(99.0))])),
     ]);
     let mut ctx = event(vec![("key", num(1.0))]);
-    assert!(execute_joins(&vec![jp(None)], &mut ctx, &lookup, 250));
+    assert!(execute_joins(&[jp(None)], &mut ctx, &lookup, 250));
     assert_eq!(ctx.fields.get("amt"), Some(&num(2.0)));
 
     // `within` filters older rows: latest within [250-100, 250] is ts=200.
     let mut ctx = event(vec![("key", num(1.0))]);
     assert!(execute_joins(
-        &vec![jp(Some(Duration::from_secs(100)))],
+        &[jp(Some(Duration::from_secs(100)))],
         &mut ctx,
         &lookup,
         250
@@ -1381,11 +1389,11 @@ fn execute_joins_asof_single_cond_hit_miss_fallback() {
 
     // Asof with missing key → keep unenriched (continue).
     let mut ctx = event(vec![]);
-    assert!(execute_joins(&vec![jp(None)], &mut ctx, &lookup, 250));
+    assert!(execute_joins(&[jp(None)], &mut ctx, &lookup, 250));
 
     // Asof with no candidates → keep unenriched.
     let mut ctx = event(vec![("key", num(1.0))]);
-    assert!(execute_joins(&vec![jp(None)], &mut ctx, &EmptyLookup, 250));
+    assert!(execute_joins(&[jp(None)], &mut ctx, &EmptyLookup, 250));
 }
 
 #[test]
@@ -1437,7 +1445,7 @@ fn execute_joins_asof_multi_cond_uses_scan() {
         ),
     ]);
     let mut ctx = event(vec![("key", num(1.0)), ("chan", str_val("a"))]);
-    assert!(execute_joins(&vec![join], &mut ctx, &lookup, 1_000));
+    assert!(execute_joins(&[join], &mut ctx, &lookup, 1_000));
     // Latest matching both conds = ts=300.
     assert_eq!(ctx.fields.get("amt"), Some(&num(3.0)));
 }
@@ -1496,8 +1504,11 @@ fn execute_joins_interval_within_modes() {
     // Event at T0: interval [T0-100s, T0+100s] → rows at T0-50s and T0+50s.
     // Inner/Snapshot pick the earliest, Asof the latest.
     let mut ctx = event(vec![("key", num(1.0))]);
+    assert!(execute_joins(&[jp(JoinMode::Inner)], &mut ctx, &lookup, T0));
+    assert_eq!(ctx.fields.get("amt"), Some(&num(2.0)));
+    let mut ctx = event(vec![("key", num(1.0))]);
     assert!(execute_joins(
-        &vec![jp(JoinMode::Inner)],
+        &[jp(JoinMode::Snapshot)],
         &mut ctx,
         &lookup,
         T0
@@ -1505,15 +1516,7 @@ fn execute_joins_interval_within_modes() {
     assert_eq!(ctx.fields.get("amt"), Some(&num(2.0)));
     let mut ctx = event(vec![("key", num(1.0))]);
     assert!(execute_joins(
-        &vec![jp(JoinMode::Snapshot)],
-        &mut ctx,
-        &lookup,
-        T0
-    ));
-    assert_eq!(ctx.fields.get("amt"), Some(&num(2.0)));
-    let mut ctx = event(vec![("key", num(1.0))]);
-    assert!(execute_joins(
-        &vec![jp(JoinMode::Asof { within: None })],
+        &[jp(JoinMode::Asof { within: None })],
         &mut ctx,
         &lookup,
         T0
@@ -1521,16 +1524,11 @@ fn execute_joins_interval_within_modes() {
     assert_eq!(ctx.fields.get("amt"), Some(&num(3.0)));
     // Anti within: an interval match drops the event.
     let mut ctx = event(vec![("key", num(1.0))]);
-    assert!(!execute_joins(
-        &vec![jp(JoinMode::Anti)],
-        &mut ctx,
-        &lookup,
-        T0
-    ));
+    assert!(!execute_joins(&[jp(JoinMode::Anti)], &mut ctx, &lookup, T0));
     // Event at T0+500s: interval [T0+400s, T0+600s] → the T0+400s row qualifies.
     let mut ctx = event(vec![("key", num(1.0))]);
     assert!(execute_joins(
-        &vec![jp(JoinMode::Inner)],
+        &[jp(JoinMode::Inner)],
         &mut ctx,
         &lookup,
         T0 + 500_000_000_000
@@ -1539,14 +1537,14 @@ fn execute_joins_interval_within_modes() {
     // Event at T0-1000s: interval [T0-1100s, T0-900s] → nothing in range.
     let mut ctx = event(vec![("key", num(1.0))]);
     assert!(!execute_joins(
-        &vec![jp(JoinMode::Inner)],
+        &[jp(JoinMode::Inner)],
         &mut ctx,
         &lookup,
         T0 - 1_000_000_000_000
     ));
     let mut ctx = event(vec![("key", num(1.0))]);
     assert!(execute_joins(
-        &vec![jp(JoinMode::Anti)],
+        &[jp(JoinMode::Anti)],
         &mut ctx,
         &lookup,
         T0 - 1_000_000_000_000
@@ -1566,25 +1564,20 @@ fn execute_joins_interval_within_modes() {
     };
     let mut ctx = event(vec![("key", num(1.0))]);
     assert!(!execute_joins(
-        &vec![jp2(JoinMode::Inner)],
+        &[jp2(JoinMode::Inner)],
         &mut ctx,
         &lookup,
         T0
     ));
     let mut ctx = event(vec![("key", num(1.0))]);
     assert!(execute_joins(
-        &vec![jp2(JoinMode::Snapshot)],
+        &[jp2(JoinMode::Snapshot)],
         &mut ctx,
         &lookup,
         T0
     ));
     let mut ctx = event(vec![("key", num(1.0))]);
-    assert!(execute_joins(
-        &vec![jp2(JoinMode::Anti)],
-        &mut ctx,
-        &lookup,
-        T0
-    ));
+    assert!(execute_joins(&[jp2(JoinMode::Anti)], &mut ctx, &lookup, T0));
 }
 
 #[test]
@@ -3103,7 +3096,8 @@ fn close_direct_batch_columnar_paths() {
         vec![step_data(Some("c1"), 1.0, EngineHashMap::default())],
     );
     let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
-    let stats = exec.execute_close_direct_batch_columnar(&[close.clone()], &mut builder, 0);
+    let stats =
+        exec.execute_close_direct_batch_columnar(std::slice::from_ref(&close), &mut builder, 0);
     // Per-row coerce failure: counted as failed and the row is **skipped**
     // (no columns touched, not appended) — matches the on-each batch path
     // contract (B1 fix).
@@ -3760,7 +3754,7 @@ fn apply_lets_injects_bindings_and_skips_failures() {
     let mut ctx = event(vec![("x", num(5.0))]);
     exec.apply_lets(&mut ctx);
     assert_eq!(ctx.fields.get("a"), Some(&num(6.0)));
-    assert!(ctx.fields.get("b").is_none());
+    assert!(!ctx.fields.contains_key("b"));
     assert_eq!(ctx.fields.get("c"), Some(&num(12.0)));
 }
 

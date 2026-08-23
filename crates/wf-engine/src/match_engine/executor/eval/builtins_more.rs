@@ -175,18 +175,18 @@ fn l3_funcs_read_step_field_values_and_bind_series() {
     // per-field history — `resolve_step_indices` keys off it.)
     let step_fields = ctx_with(vec![
         (
-            "_step_0_field_x".into(),
+            "_step_0_field_x",
             Value::Array(vec![num(1.0), num(2.0), num(2.0)]),
         ),
-        ("_step_0_values".into(), Value::Array(vec![num(1.0)])),
-        ("_step_0_source".into(), str_val("e")),
-        ("_step_0_label".into(), str_val("fail")),
+        ("_step_0_values", Value::Array(vec![num(1.0)])),
+        ("_step_0_source", str_val("e")),
+        ("_step_0_label", str_val("fail")),
     ]);
     let qualified = Expr::Field(FieldRef::Qualified("e".into(), "x".into()));
     assert_eq!(
         eval_l3_func(
             "collect_list",
-            &[qualified.clone()],
+            std::slice::from_ref(&qualified),
             &step_fields,
             YieldMeta::default()
         ),
@@ -196,7 +196,7 @@ fn l3_funcs_read_step_field_values_and_bind_series() {
     assert_eq!(
         eval_l3_func(
             "collect_set",
-            &[qualified.clone()],
+            std::slice::from_ref(&qualified),
             &step_fields,
             YieldMeta::default()
         ),
@@ -205,7 +205,7 @@ fn l3_funcs_read_step_field_values_and_bind_series() {
     assert_eq!(
         eval_l3_func(
             "first",
-            &[qualified.clone()],
+            std::slice::from_ref(&qualified),
             &step_fields,
             YieldMeta::default()
         ),
@@ -214,7 +214,7 @@ fn l3_funcs_read_step_field_values_and_bind_series() {
     assert_eq!(
         eval_l3_func(
             "last",
-            &[qualified.clone()],
+            std::slice::from_ref(&qualified),
             &step_fields,
             YieldMeta::default()
         ),
@@ -234,16 +234,16 @@ fn l3_funcs_read_step_field_values_and_bind_series() {
     // Bind series for l3: `collect_set(b.x)` over `_bind_b_field_x`.
     let bind = ctx_with(vec![
         (
-            "_bind_b_field_x".into(),
+            "_bind_b_field_x",
             Value::Array(vec![num(1.0), num(2.0), num(1.0)]),
         ),
-        ("_bind_b_count".into(), num(3.0)),
+        ("_bind_b_count", num(3.0)),
     ]);
     let bind_qualified = Expr::Field(FieldRef::Qualified("b".into(), "x".into()));
     assert_eq!(
         eval_l3_func(
             "collect_set",
-            &[bind_qualified.clone()],
+            std::slice::from_ref(&bind_qualified),
             &bind,
             YieldMeta::default()
         ),
@@ -263,18 +263,18 @@ fn aggregate_func_bind_series_and_close_stage_preference() {
     // `sum(b.x)` → `_bind_b_field_x` = [1, 2, 3] → 6.
     let bind = ctx_with(vec![
         (
-            "_bind_b_field_x".into(),
+            "_bind_b_field_x",
             Value::Array(vec![num(1.0), num(2.0), num(3.0)]),
         ),
-        ("_bind_b_count".into(), num(3.0)),
+        ("_bind_b_count", num(3.0)),
     ]);
     let bind_qualified = Expr::Field(FieldRef::Qualified("b".into(), "x".into()));
     assert_eq!(
-        eval_aggregate_func("sum", &[bind_qualified.clone()], &bind),
+        eval_aggregate_func("sum", std::slice::from_ref(&bind_qualified), &bind),
         Some(num(6.0))
     );
     assert_eq!(
-        eval_aggregate_func("count", &[bind_qualified.clone()], &bind),
+        eval_aggregate_func("count", std::slice::from_ref(&bind_qualified), &bind),
         Some(num(3.0))
     );
     assert_eq!(
@@ -286,14 +286,14 @@ fn aggregate_func_bind_series_and_close_stage_preference() {
     // stage and one close stage. `sum(x)` must aggregate only the close-stage
     // step's measures (prefer_close_steps).
     let mixed = ctx_with(vec![
-        ("_step_0_measure".into(), num(10.0)),
-        ("_step_0_values".into(), Value::Array(vec![num(10.0)])),
-        ("_step_0_source".into(), str_val("e")),
-        ("_step_0_stage".into(), str_val("event")),
-        ("_step_1_measure".into(), num(30.0)),
-        ("_step_1_values".into(), Value::Array(vec![num(30.0)])),
-        ("_step_1_source".into(), str_val("e")),
-        ("_step_1_stage".into(), str_val("close")),
+        ("_step_0_measure", num(10.0)),
+        ("_step_0_values", Value::Array(vec![num(10.0)])),
+        ("_step_0_source", str_val("e")),
+        ("_step_0_stage", str_val("event")),
+        ("_step_1_measure", num(30.0)),
+        ("_step_1_values", Value::Array(vec![num(30.0)])),
+        ("_step_1_source", str_val("e")),
+        ("_step_1_stage", str_val("close")),
     ]);
     // Simple field arg: step_ref = "e" → by_source both steps → close only.
     assert_eq!(
@@ -306,14 +306,14 @@ fn aggregate_func_bind_series_and_close_stage_preference() {
     );
     // Without any close-stage step, all matching steps contribute.
     let only_event = ctx_with(vec![
-        ("_step_0_measure".into(), num(10.0)),
-        ("_step_0_values".into(), Value::Array(vec![num(10.0)])),
-        ("_step_0_source".into(), str_val("e")),
-        ("_step_0_stage".into(), str_val("event")),
-        ("_step_1_measure".into(), num(30.0)),
-        ("_step_1_values".into(), Value::Array(vec![num(30.0)])),
-        ("_step_1_source".into(), str_val("e")),
-        ("_step_1_stage".into(), str_val("event")),
+        ("_step_0_measure", num(10.0)),
+        ("_step_0_values", Value::Array(vec![num(10.0)])),
+        ("_step_0_source", str_val("e")),
+        ("_step_0_stage", str_val("event")),
+        ("_step_1_measure", num(30.0)),
+        ("_step_1_values", Value::Array(vec![num(30.0)])),
+        ("_step_1_source", str_val("e")),
+        ("_step_1_stage", str_val("event")),
     ]);
     assert_eq!(
         eval_aggregate_func("sum", &[field("e")], &only_event),

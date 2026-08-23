@@ -125,6 +125,31 @@ pub fn fixed_plan(keys: Vec<FieldRef>, dur: Duration, steps: Vec<StepPlan>) -> M
     }
 }
 
+pub fn hop_plan(
+    keys: Vec<FieldRef>,
+    size: Duration,
+    slide: Duration,
+    steps: Vec<StepPlan>,
+) -> MatchPlan {
+    MatchPlan {
+        keys,
+        key_map: None,
+        key_join: None,
+        window_spec: WindowSpec::Hop { size, slide },
+        event_steps: steps,
+        close_steps: vec![],
+        close_mode: CloseMode::Or,
+        tracked_bind_aliases: HashSet::new(),
+        tracked_bind_fields: std::collections::HashMap::new(),
+        tracked_plain_fields: HashSet::new(),
+        seq: None,
+        match_mode: wf_lang::ast::MatchMode::Seq,
+        accu: false,
+        needs_field_history: false,
+        trigger_event_needed: false,
+    }
+}
+
 pub fn fixed_plan_with_close(
     keys: Vec<FieldRef>,
     dur: Duration,

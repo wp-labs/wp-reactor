@@ -14,7 +14,8 @@ mod match_exec;
 mod stats_exec;
 
 pub use each_exec::EachDirectBatchStats;
-pub use stats_exec::{DistinctKey, StatsAccum, StatsExecutor, StatsWindowState};
+// 供 `match_engine::pub use executor::DistinctKey` 转发（stats distinct 键类型）。
+pub use stats_exec::{DistinctKey, StatsExecutor, StatsWindowState};
 
 #[cfg(test)]
 mod close_coverage_more;
@@ -769,7 +770,7 @@ impl RuleExecutor {
             .all(|b| {
                 b.filter
                     .as_ref()
-                    .is_none_or(|f| wf_lang::columnar::expr_is_columnar(f))
+                    .is_none_or(wf_lang::columnar::expr_is_columnar)
             })
     }
 

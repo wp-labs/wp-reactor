@@ -479,7 +479,10 @@ fn join_index_asof_max_scan_vs_fast_path() {
     let start = Instant::now();
     let mut fast_hits = 0usize;
     for _ in 0..r {
-        if matches!(win.join_lookup_asof(&key, max_ts, 0, None), AsofLookup::Hit(_)) {
+        if matches!(
+            win.join_lookup_asof(&key, max_ts, 0, None),
+            AsofLookup::Hit(_)
+        ) {
             fast_hits += 1;
         }
     }
@@ -490,7 +493,10 @@ fn join_index_asof_max_scan_vs_fast_path() {
     let start = Instant::now();
     let mut scan_hits = 0usize;
     for _ in 0..r {
-        if matches!(win.join_lookup_asof(&key, mid_ts, 0, None), AsofLookup::Hit(_)) {
+        if matches!(
+            win.join_lookup_asof(&key, mid_ts, 0, None),
+            AsofLookup::Hit(_)
+        ) {
             scan_hits += 1;
         }
     }

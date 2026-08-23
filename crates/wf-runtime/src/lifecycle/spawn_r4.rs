@@ -253,6 +253,7 @@ async fn spawn_rule_tasks_stats_non_field_key_shard_filter() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // 测试环境变量守卫（std Mutex）须跨越整个 await 测试体
 async fn spawn_rule_tasks_push_mode_all_kinds() {
     let _guard = ENV_LOCK.lock().unwrap();
     unsafe {

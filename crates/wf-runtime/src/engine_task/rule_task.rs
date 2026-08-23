@@ -17,7 +17,7 @@ use wf_engine::match_engine::{
 };
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
-use wf_lang::plan::ConvPlan;
+use wf_lang::plan::{ConvPlan, WindowSpec};
 use wf_lang::wfu_meta::{WFU_ID, WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
 
 use crate::alert_task::SinkFanout;
@@ -963,14 +963,30 @@ impl RuleTask {
                 // P2c: shards of a conv rule emit raw closes to the conv stage
                 // (aggregation window); inline conv is applied only on the
                 // legacy single-machine path.
+                // Hop 窗口：每 slide 边界恰有一个窗口到期（关闭数受窗口内键数
+                // 约束），用无界预算一次性收口——1024 预算会把同一窗口的关闭
+                // 拆成多批，inline conv 逐批 top-1 造成同窗口重复 EMIT。
+                let hop = matches!(machine.plan().window_spec, WindowSpec::Hop { .. });
                 let (routed, closes) = if self.conv_sink.is_some() {
-                    let raw = machine.scan_expired_at_skip_non_alerting(event_nanos);
+                    let raw = if hop {
+                        machine.scan_expired_at_skip_non_alerting_unbounded(event_nanos)
+                    } else {
+                        machine.scan_expired_at_skip_non_alerting(event_nanos)
+                    };
                     // Barrier watermark must reflect the scan's watermark (the
                     // event time) — the machine's cached watermark only advances
                     // during `advance`, which runs after the scan.
                     conv_max_wm = conv_max_wm.max(event_nanos);
                     conv_closes.extend(raw.into_iter().filter(close_is_qualified));
                     (true, Vec::new())
+                } else if hop {
+                    (
+                        false,
+                        machine.scan_expired_at_with_conv_skip_non_alerting_unbounded(
+                            event_nanos,
+                            self.conv_plan.as_ref(),
+                        ),
+                    )
                 } else {
                     (
                         false,

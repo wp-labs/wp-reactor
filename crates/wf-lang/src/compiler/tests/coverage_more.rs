@@ -61,7 +61,8 @@ rule r {
     let err = compile_wfl(&file, &[auth_events_window(), output_window()])
         .expect_err("`on each` together with pipeline stages must be rejected");
     assert!(
-        err.to_string().contains("not supported together with pipeline stages"),
+        err.to_string()
+            .contains("not supported together with pipeline stages"),
         "unexpected error: {err}"
     );
 }
@@ -84,7 +85,8 @@ rule r {
     let err = compile_wfl(&file, &[auth_events_window(), output_window()])
         .expect_err("`on each` pipeline stages must be rejected");
     assert!(
-        err.to_string().contains("`on each` pipeline stages are not supported yet"),
+        err.to_string()
+            .contains("`on each` pipeline stages are not supported yet"),
         "unexpected error: {err}"
     );
 }
@@ -141,7 +143,10 @@ rule r {
 "#,
         &[auth_events_window(), output_window()],
     );
-    assert!(plans[0].match_plan.accu, "accu flag must be carried into the plan");
+    assert!(
+        plans[0].match_plan.accu,
+        "accu flag must be carried into the plan"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -165,7 +170,10 @@ rule r {
         &[auth_events_window(), fw_events_window(), output_window()],
     );
     // Keys are the deduplicated logical names; the key map keeps both sources.
-    assert_eq!(plans[0].match_plan.keys, vec![FieldRef::Simple("user_id".into())]);
+    assert_eq!(
+        plans[0].match_plan.keys,
+        vec![FieldRef::Simple("user_id".into())]
+    );
     let key_map = plans[0].match_plan.key_map.as_ref().expect("key map");
     assert_eq!(key_map.len(), 2);
     assert_eq!(key_map[0].logical_name, "user_id");
@@ -200,7 +208,11 @@ rule mk {
     yield out (n = a.id)
 }
 "#,
-        &[auction_events_window(), bid_events_window(), output_window()],
+        &[
+            auction_events_window(),
+            bid_events_window(),
+            output_window(),
+        ],
     );
     assert!(
         plans.iter().all(|p| p.match_plan.key_join.is_none()),
@@ -253,7 +265,12 @@ rule r {
         plans[0].pattern_origin,
         Some(PatternOriginPlan {
             pattern_name: "burst".to_string(),
-            args: vec!["e".to_string(), "sip".to_string(), "5m".to_string(), "3".to_string()],
+            args: vec![
+                "e".to_string(),
+                "sip".to_string(),
+                "5m".to_string(),
+                "3".to_string()
+            ],
         })
     );
 }

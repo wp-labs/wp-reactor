@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use std::collections::HashSet;
 
-use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampNanosecondArray};
+use arrow::array::{ArrayRef, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc;

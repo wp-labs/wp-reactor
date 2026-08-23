@@ -3,7 +3,7 @@
 //! 覆盖点:
 //! - ndjson: 空行跳过、非法 JSON / 非对象行报错、文件打开失败、
 //!   >2048 行中途 flush（fixed + 动态 schema-cache 命中）、
-//!   `flush_ndjson_rows` 空集早退、`normalize_stream_tag_field` 空串默认值。
+//!   > `flush_ndjson_rows` 空集早退、`normalize_stream_tag_field` 空串默认值。
 //! - csv: fixed stream 中途 flush（>2048 行）、文件打开失败。
 //! - arrow: framed 畸形前缀（非数字/超长/长度 0）、帧解码失败、
 //!   parse 池关闭报错、IPC 文件打开失败、IPC schema 不匹配。

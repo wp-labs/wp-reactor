@@ -15,6 +15,7 @@ mod event_bridge_coverage_more;
 mod event_bridge_r4;
 mod guard_bench;
 mod helpers;
+mod hop_bench;
 mod interval_bench;
 mod join_key;
 mod match_bench;

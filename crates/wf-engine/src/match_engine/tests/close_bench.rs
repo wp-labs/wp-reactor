@@ -32,10 +32,10 @@
 //!     ~49%（distinct_valkey_fixed 92ns vs valkey 62ns）；RandomState 的
 //!     `GlobalSeed::get` 是原子读已足够快，且固定种子失去 foldhash 的每-hasher
 //!     seed 混合。`distinct_i64`（原生 i64 key）仍是有效方向（35ns vs 62ns）。
-//!   scan_per_row    : `scan_expired_at_with_conv_skip_non_alerting` 每行过期扫描
-//!   deferred_row    : ColumnarEvent + advance_at_with_masks（列式 guard，deferred 路径）
-//!   eager_row       : 每行 Event 物化（HashMap 3 字段）+ advance_at（解释器 guard，eager 路径）
-//!   prod_row_full   : masks 摊还 + scan + advance_with_masks（复刻 rule_task deferred 行）
+//!   - scan_per_row    : `scan_expired_at_with_conv_skip_non_alerting` 每行过期扫描
+//!   - deferred_row    : ColumnarEvent + advance_at_with_masks（列式 guard，deferred 路径）
+//!   - eager_row       : 每行 Event 物化（HashMap 3 字段）+ advance_at（解释器 guard，eager 路径）
+//!   - prod_row_full   : masks 摊还 + scan + advance_with_masks（复刻 rule_task deferred 行）
 //!
 //! stats 执行器对照（2026-08-22 追加——P1 行式 StatsExecutor vs CEP 同数据同机）：
 //!   q15_stats_executor_profile：同 bid_events(N) 数据, 12 度量（4 count + 8 distinct）
@@ -752,7 +752,7 @@ fn rows_to_batch(rows: &[HashMap<String, Value>]) -> RecordBatch {
 #[test]
 #[ignore = "release-only benchmark: cargo test --release -p wf-engine close_bench -- --ignored --nocapture"]
 fn q15_stats_executor_profile() {
-    use crate::match_engine::executor::DistinctKey;
+    use crate::match_engine::DistinctKey;
     let events = bid_events(N);
     let rows = rows_from_events(&events);
     let now = 1_700_000_000_000_000_000i64;
@@ -1198,7 +1198,7 @@ fn last_top_batch(n: usize) -> RecordBatch {
         .map(|i| (i * 7919 % 1_000_000) + 100)
         .collect();
     let channel: Vec<i64> = (0..n as i64).map(|i| (i * 104_729) % 100_000).collect();
-    let url: Vec<i64> = (0..n as i64).map(|i| (i * 15_485_863 % 100_000)).collect();
+    let url: Vec<i64> = (0..n as i64).map(|i| i * 15_485_863 % 100_000).collect();
     let date_time: Vec<i64> = (0..n as i64).map(|i| i % 1_000_000).collect();
     // 104729 与 100000 互质 → (i*104729)%100000 与 i%10000 的组合周期 = 100000,
     // 每组合 5 行（n=500k）——~10 万桶, 对齐 Q18 唯一率

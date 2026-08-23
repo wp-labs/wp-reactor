@@ -1432,11 +1432,11 @@ fn stats_top_keeps_top_n_desc() {
     assert_eq!(entries[1].measure_value, 250.0, "rank2");
     let names = sorted_bid_names();
     assert_eq!(
-        row_val(&entries[0].row_fields.as_ref().unwrap(), &names, "bidder"),
+        row_val(entries[0].row_fields.as_ref().unwrap(), &names, "bidder"),
         Some(&num(2.0))
     );
     assert_eq!(
-        row_val(&entries[1].row_fields.as_ref().unwrap(), &names, "bidder"),
+        row_val(entries[1].row_fields.as_ref().unwrap(), &names, "bidder"),
         Some(&num(4.0))
     );
 }
@@ -1472,12 +1472,12 @@ fn stats_top_tie_earlier_arrival_wins() {
     assert_eq!(entries[0].measure_value, 100.0);
     let names = sorted_bid_names();
     assert_eq!(
-        row_val(&entries[0].row_fields.as_ref().unwrap(), &names, "bidder"),
+        row_val(entries[0].row_fields.as_ref().unwrap(), &names, "bidder"),
         Some(&num(1.0)),
         "同价先到者 rank1"
     );
     assert_eq!(
-        row_val(&entries[1].row_fields.as_ref().unwrap(), &names, "bidder"),
+        row_val(entries[1].row_fields.as_ref().unwrap(), &names, "bidder"),
         Some(&num(2.0)),
         "同价后到者 rank2"
     );
@@ -1512,7 +1512,7 @@ fn stats_last_top_where_filter_applies() {
     assert_eq!(e.measure_value, 150.0, "最后合格行（price>=150）");
     let names = sorted_bid_names();
     assert_eq!(
-        row_val(&e.row_fields.as_ref().unwrap(), &names, "bidder"),
+        row_val(e.row_fields.as_ref().unwrap(), &names, "bidder"),
         Some(&num(3.0))
     );
 }
@@ -1629,7 +1629,7 @@ fn stats_top_full_cutoff_replaces_tail() {
     assert_eq!(entries[1].measure_value, 150.0, "150 替换 100");
     let names = sorted_bid_names();
     assert_eq!(
-        row_val(&entries[1].row_fields.as_ref().unwrap(), &names, "bidder"),
+        row_val(entries[1].row_fields.as_ref().unwrap(), &names, "bidder"),
         Some(&num(4.0))
     );
 }
@@ -1677,7 +1677,7 @@ fn stats_last_missing_field_keeps_row() {
     assert_eq!(ce.measure_value, 0.0);
     let col_names = sorted_schema_names(&batch); // [auction, bidder, price]
     assert_eq!(
-        row_val(&ce.row_fields.as_ref().unwrap(), &col_names, "bidder"),
+        row_val(ce.row_fields.as_ref().unwrap(), &col_names, "bidder"),
         Some(&num(8.0))
     );
 }

@@ -158,7 +158,7 @@ rule q8 {
     let plans = compile_with(input, &schemas());
     let join = &plans[0].joins[0];
     let w = join.within.as_ref().expect("within in plan");
-    assert_eq!(w.hi.open, true);
+    assert!(w.hi.open);
     assert!(matches!(
         &w.hi.val,
         BoundVal::Expr(Expr::FuncCall { name, .. }) if name == "bucket_end"

@@ -14,6 +14,19 @@ use super::match_p;
 use super::pattern_p;
 use super::stats_p;
 
+/// rule 声明体中 match/each/stats 各形态的解析产物（stats_p 优先分支的返回
+/// 形状，规则内仅此一处使用）。
+type RuleBodyParts = (
+    MatchClause,
+    Option<EachClause>,
+    Option<StatsClause>,
+    ScoreExpr,
+    Vec<JoinClause>,
+    Vec<PipelineStage>,
+    Option<PatternOrigin>,
+    Option<Expr>,
+);
+
 // ---------------------------------------------------------------------------
 // rule declaration (with pattern support)
 // ---------------------------------------------------------------------------
@@ -75,16 +88,7 @@ pub(super) fn rule_decl_with_patterns(
         pipeline_stages,
         pattern_origin,
         r#where,
-    ): (
-        MatchClause,
-        Option<EachClause>,
-        Option<StatsClause>,
-        ScoreExpr,
-        Vec<JoinClause>,
-        Vec<PipelineStage>,
-        Option<PatternOrigin>,
-        Option<Expr>,
-    ) = match stats_p::stats_clause_only.parse_next(input) {
+    ): RuleBodyParts = match stats_p::stats_clause_only.parse_next(input) {
         Ok(stats) => {
             // stats 规则: 无 `-> score`(缺省 0), 无 joins, 无 pipeline
             let score = ScoreExpr {

@@ -84,6 +84,28 @@ rule r {
     assert!(matches!(&steps[3], ConvStep::Where(_)));
 }
 
+#[test]
+fn parse_conv_top_ties() {
+    let input = r#"
+rule r {
+    events { e : win }
+    match<sip:1h:fixed> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    conv { sort(-f) | top_ties(3) ; }
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let conv = file.rules[0].conv.as_ref().expect("conv should be Some");
+    assert_eq!(conv.chains.len(), 1);
+    let steps = &conv.chains[0].steps;
+    assert!(matches!(&steps[0], ConvStep::Sort(_)));
+    match &steps[1] {
+        ConvStep::TopTies(n) => assert_eq!(*n, 3),
+        _ => panic!("expected TopTies step"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sort ascending (no dash)
 // ---------------------------------------------------------------------------

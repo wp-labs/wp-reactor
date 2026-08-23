@@ -454,6 +454,37 @@ rule r {
     );
 }
 
+#[test]
+fn explain_hop_window_and_top_ties_formatting() {
+    // HOP 窗口规格 + top_ties conv 的 explain 格式（sections.rs 新臂）。
+    let src = r#"
+rule r {
+    events { e : rich }
+    match<sip:hop(10s, 2s)> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (s0 = sip)
+    conv { sort(-e.count) | top_ties(3); }
+}
+"#;
+    let schemas = [rich_window(), rich_out_window()];
+    let file = parse_wfl(src).expect("parse should succeed");
+    let plans = compile_wfl(&file, &schemas).expect("compile");
+    let expl = &explain_rules(&plans, &schemas)[0];
+
+    let ws = &expl.match_expl.window_spec;
+    assert!(
+        ws.contains("hop(size=10s, slide=2s)"),
+        "hop window spec must be formatted: got: {ws}"
+    );
+
+    let conv = expl.conv.as_ref().expect("conv");
+    assert!(
+        conv[0].contains("sort(-e.count) | top_ties(3)"),
+        "top_ties conv op must be formatted: got: {}",
+        conv[0]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // stats compile — session window plan (regression guard)
 // ---------------------------------------------------------------------------

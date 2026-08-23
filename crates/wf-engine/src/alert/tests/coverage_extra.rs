@@ -393,7 +393,7 @@ fn commit_close_rows_batch_matches_record_appended_rows() {
 
     // ---- record path (origin = Close{reason}, per-row summary) ----
     let mut via_records = AlertColumnBuilder::new(Arc::clone(&target));
-    for i in 0..n {
+    for (i, &present) in price_present.iter().enumerate() {
         let reason = match i {
             0 => CloseReason::Timeout,
             1 => CloseReason::Flush,
@@ -406,7 +406,7 @@ fn commit_close_rows_batch_matches_record_appended_rows() {
                 (Arc::from("price"), Value::Number(9.5 + i as f64 * 10.0)),
             ],
         );
-        if !price_present[i] {
+        if !present {
             record
                 .yield_fields
                 .retain(|(name, _)| name.as_ref() != "price");
@@ -441,10 +441,10 @@ fn commit_close_rows_batch_matches_record_appended_rows() {
         .collect();
     let summaries: Vec<Arc<str>> = (0..n).map(|i| Arc::from(format!("summary{i}"))).collect();
     let mut staged_rows = Vec::with_capacity(n);
-    for i in 0..n {
+    for (i, &present) in price_present.iter().enumerate() {
         let a = export_yield_value(&Value::Number((1000 + i) as f64), Some(&ft_float)).unwrap();
         let mut row_cells = vec![(auction_col, a.0, a.1)];
-        if price_present[i] {
+        if present {
             let p =
                 export_yield_value(&Value::Number(9.5 + i as f64 * 10.0), Some(&ft_float)).unwrap();
             row_cells.push((price_col, p.0, p.1));
@@ -625,7 +625,7 @@ fn reserve_rows_and_take_staged_smoke() {
         .unwrap();
     let staged = builder.take_staged();
     assert_eq!(staged.len(), 1);
-    assert!(builder.len() == 0, "staged cells are not committed rows");
+    assert!(builder.is_empty(), "staged cells are not committed rows");
     // A second take is empty.
     assert!(builder.take_staged().is_empty());
 }

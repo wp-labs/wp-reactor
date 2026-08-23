@@ -6,13 +6,19 @@ use super::*;
 // Match clause
 // ---------------------------------------------------------------------------
 
-/// Window mode: sliding (default), fixed (L3), or session (L3).
+/// Window mode: sliding (default), fixed (L3), session (L3), or hop (sliding
+/// window, L3/HOP)。
 #[derive(::moju_derive::MoJu, Debug, Clone, Copy, PartialEq, Eq)]
 #[moju(kind = "state", domain = "Lang", module = "Lang.LangMatch")]
 pub enum WindowMode {
     Sliding,
     Fixed,
     Session(std::time::Duration), // gap duration
+    /// HOP 滑动窗口: size 大小、slide 步长（size % slide == 0）。
+    Hop {
+        size: std::time::Duration,
+        slide: std::time::Duration,
+    },
 }
 
 /// Close block mode: OR (independent paths) or AND (both required).

@@ -11,6 +11,8 @@ mod coverage_extra;
 #[cfg(test)]
 mod deferred_integration_tests;
 #[cfg(test)]
+mod hop_integration_tests;
+#[cfg(test)]
 mod provider_join_integration_tests;
 #[cfg(test)]
 mod stats_task_tests;

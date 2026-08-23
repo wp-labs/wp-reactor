@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use crate::ast::{BinOp, Expr, FieldRef, ObjectItem, PathSegment};
-use crate::compiler::{collect_rule_bind_tracking, compile_wfl};
+use crate::compiler::{collect_rule_bind_tracking, compile_wfl, compile_wfl_after_semantic_checks};
 use crate::plan::{
     ConvOpPlan, ExceedAction, RateSpec, StatsAggPlan, StatsOutputShapePlan, WindowSpec, YieldField,
 };
@@ -703,4 +703,122 @@ rule bad {
         err.to_string().contains("semantic errors"),
         "unexpected error: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// HOP 窗口 + top_ties conv —— 编译到 plan（compiler/mod.rs 新臂）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compile_hop_window_spec() {
+    let plans = compile_with(
+        r#"
+rule r {
+    events { e : auth_events }
+    match<sip:hop(10s, 2s)> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    assert!(
+        matches!(
+            plans[0].match_plan.window_spec,
+            WindowSpec::Hop { size, slide }
+                if size == Duration::from_secs(10) && slide == Duration::from_secs(2)
+        ),
+        "hop(10s, 2s) 编译为 WindowSpec::Hop: {:?}",
+        plans[0].match_plan.window_spec
+    );
+    // conv 规则 + hop 窗口同时编译通过（conv_window 自动装配）。
+    let plans = compile_with(
+        r#"
+rule r2 {
+    events { e : auth_events }
+    match<sip:hop(10s, 2s)> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    conv { sort(-count) | top(5); }
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let conv = plans[0].conv_plan.as_ref().expect("conv plan");
+    assert!(matches!(conv.chains[0].ops[0], ConvOpPlan::Sort(_)));
+    assert!(matches!(conv.chains[0].ops[1], ConvOpPlan::Top(5)));
+}
+
+#[test]
+fn compile_top_ties_copies_preceding_sort_keys() {
+    // `sort(-count) | top_ties(10)`：TopTies 的 sort_keys 从前导 sort 复制。
+    let plans = compile_with(
+        r#"
+rule r {
+    events { e : auth_events }
+    match<sip:1h:fixed> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    conv { sort(-count, e.sip) | top_ties(10); }
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let ops = &plans[0].conv_plan.as_ref().expect("conv plan").chains[0].ops;
+    match (&ops[0], &ops[1]) {
+        (ConvOpPlan::Sort(keys), ConvOpPlan::TopTies { n, sort_keys }) => {
+            assert_eq!(*n, 10);
+            assert_eq!(keys.len(), 2, "两键排序");
+            assert_eq!(sort_keys.len(), 2, "并列判定键复制自前导 sort");
+            assert!(sort_keys[0].descending, "降序标记保留");
+            assert!(!sort_keys[1].descending);
+            assert_eq!(
+                sort_keys[0].expr,
+                Expr::Field(FieldRef::Simple("count".into()))
+            );
+        }
+        other => panic!("expected Sort + TopTies, got {other:?}"),
+    }
+}
+
+#[test]
+fn compile_top_ties_tracks_sort_per_chain() {
+    // 每个 chain 独立跟踪前导 sort。chain1 的 top_ties 无前导 sort 时编译侧
+    // 退化为空 sort_keys（防御分支）——checker 会拒绝，故经
+    // `compile_wfl_after_semantic_checks` 直调编译（coverage_r4 同款模式）。
+    let file = parse_wfl(
+        r#"
+rule r {
+    events { e : auth_events }
+    match<sip:1h:fixed> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    conv {
+        sort(-count) | top_ties(3);
+        where(count >= 2) | top_ties(2);
+    }
+}
+"#,
+    )
+    .expect("parse should succeed");
+    let plans = compile_wfl_after_semantic_checks(&file, &[auth_events_window(), output_window()])
+        .expect("direct compile should succeed");
+    let cp = plans[0].conv_plan.as_ref().expect("conv plan");
+    let chain0 = &cp.chains[0].ops;
+    assert!(matches!(&chain0[0], ConvOpPlan::Sort(_)));
+    match &chain0[1] {
+        ConvOpPlan::TopTies { n, sort_keys } => {
+            assert_eq!(*n, 3);
+            assert_eq!(sort_keys.len(), 1, "chain0 的 top_ties 复制了前导 sort 键");
+        }
+        other => panic!("expected TopTies in chain0, got {other:?}"),
+    }
+    // chain1 无前导 sort：last_sort_keys 为空 → sort_keys 空（退化 top）。
+    match &cp.chains[1].ops[1] {
+        ConvOpPlan::TopTies { n, sort_keys } => {
+            assert_eq!(*n, 2);
+            assert!(sort_keys.is_empty(), "无前导 sort → 空 sort_keys");
+        }
+        other => panic!("expected TopTies in chain1, got {other:?}"),
+    }
 }
