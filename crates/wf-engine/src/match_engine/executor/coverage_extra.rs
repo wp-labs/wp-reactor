@@ -1108,6 +1108,66 @@ fn branch_guard_masks_empty_without_guards_or_seq() {
     assert!(masks.is_empty());
 }
 
+#[test]
+fn branch_guard_masks_list_index_path_guard() {
+    use crate::match_engine::columnar::GuardMasks;
+    use crate::match_engine::{WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY};
+
+    // The qradar `c && c.tags[0] == "prod"` guard: `c` is the step source, so
+    // the guard AST is just `c.tags[0] == "prod"` — a list-index Path.
+    let guard = || Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Path {
+            alias: "c".into(),
+            segments: vec![PathSegment::Field("tags".into()), PathSegment::Index(0)],
+        })),
+        right: Box::new(Expr::StringLit("prod".into())),
+    };
+    assert!(wf_lang::columnar::expr_is_columnar(&guard()));
+
+    let mut plan = simple_rule_plan(
+        "r_list_index",
+        simple_plan(vec![], vec![step(vec![branch_guard("c", Some(guard()), count_ge(1.0))])]),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".into())),
+    );
+    plan.match_plan.close_steps = vec![step(vec![branch_guard("c", Some(guard()), count_ge(1.0))])];
+    let exec = RuleExecutor::new(plan);
+
+    // `tags` is a structured JSON-array column (the frame storage shape): row 0
+    // hits, row 1 misses, row 2 is a null cell, row 3 is out of range.
+    let tags_col = Arc::new(StringArray::from(vec![
+        Some(r#"["prod","edge","dmz"]"#),
+        Some(r#"["edge"]"#),
+        None,
+        Some(r#"[]"#),
+    ])) as ArrayRef;
+    let field = ArrowField::new("tags", DataType::Utf8, true).with_metadata(HashMap::from([(
+        WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+        WFL_FIELD_TYPE_ARRAY.to_string(),
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![field])),
+        vec![tags_col],
+    )
+    .unwrap();
+
+    let masks: GuardMasks = exec.branch_guard_masks(&batch);
+    // Event step (0,0): row 0 matched; rows 1-3 null / miss → not matched.
+    assert_eq!(masks.event_value(0, 0, 0), Some(true));
+    assert_eq!(masks.event_value(0, 0, 1), Some(false));
+    assert_eq!(masks.event_value(0, 0, 2), Some(false));
+    assert_eq!(masks.event_value(0, 0, 3), Some(false));
+    // Close step: the matching row is a definite true, a miss is a definite
+    // false, and null / out-of-range rows stay permissive (null slot) — the
+    // null-vs-definite-false distinction close-step accumulation relies on.
+    assert_eq!(masks.close_value(0, 0, 0), Some(Some(true)));
+    assert_eq!(masks.close_value(0, 0, 1), Some(Some(false)));
+    assert_eq!(masks.close_value(0, 0, 2), Some(None));
+    assert_eq!(masks.close_value(0, 0, 3), Some(None));
+}
+
 // ---------------------------------------------------------------------------
 // context.rs — build_eval_context
 // ---------------------------------------------------------------------------

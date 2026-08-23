@@ -12,17 +12,20 @@
 //!   - field_lookup：仅 HashMap 字段提取（guard 内 `auction` 读取的裸成本）
 //!
 //! delta = q2_filter − no_filter 即 guard 表达式的增量开销。
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use std::time::{Duration, Instant};
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use wf_lang::ast::{BinOp, Expr, FieldRef};
+use wf_lang::ast::{BinOp, Expr, FieldRef, PathSegment};
 use wf_lang::plan::{BindPlan, RulePlan};
 
-use crate::match_engine::{Event, RuleExecutor, Value};
+use crate::match_engine::{
+    Event, RuleExecutor, Value, WFL_FIELD_TYPE_ARRAY, WFL_FIELD_TYPE_METADATA_KEY, batch_to_events,
+};
 
 use super::helpers::{branch, count_ge, event, simple_key, simple_plan, simple_rule_plan, step};
 
@@ -137,6 +140,100 @@ fn q2_field_lookup_per_event() {
         n as f64 / el.as_secs_f64() / 1e6
     );
     assert!(acc > 0.0);
+}
+
+/// qradar `g_tag_*` 家族形态的 guard：`c.tags[0] == "prod"`（列式 List-Index 路径）。
+fn tag_guard_expr() -> Expr {
+    Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Path {
+            alias: "c".into(),
+            segments: vec![
+                PathSegment::Field("tags".to_string()),
+                PathSegment::Index(0),
+            ],
+        })),
+        right: Box::new(Expr::StringLit("prod".into())),
+    }
+}
+
+/// qradar conn 事件形态的 RulePlan：单 bind（alias=c, filter 可空）。
+fn tag_plan(filter: Option<Expr>) -> RulePlan {
+    let mut plan = simple_rule_plan(
+        "tag_bench",
+        simple_plan(
+            vec![simple_key("sip")],
+            vec![step(vec![branch("c", count_ge(1.0))])],
+        ),
+        Expr::Number(5.0),
+        "ip",
+        Expr::Field(FieldRef::Simple("sip".to_string())),
+    );
+    plan.binds = vec![BindPlan {
+        alias: "c".into(),
+        window: "conn_events".into(),
+        filter,
+    }];
+    plan
+}
+
+/// `tags` 单列：Utf8-JSON 数组（结构化 array 元数据），与帧存储同构。
+/// 命中率 ~1/3，模拟 qradar 数据（`["prod","edge","dmz"]` / `["edge","dmz"]` / `["dmz"]`）。
+fn tags_batch(n: usize) -> RecordBatch {
+    let cells: Vec<Option<&str>> = (0..n)
+        .map(|i| match i % 3 {
+            0 => Some(r#"["prod","edge","dmz"]"#),
+            1 => Some(r#"["edge","dmz"]"#),
+            _ => Some(r#"["dmz"]"#),
+        })
+        .collect();
+    let field = Field::new("tags", DataType::Utf8, true).with_metadata(HashMap::from([(
+        WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+        WFL_FIELD_TYPE_ARRAY.to_string(),
+    )]));
+    let schema = Arc::new(Schema::new(vec![field]));
+    RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(cells)) as ArrayRef]).unwrap()
+}
+
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine tag_guard -- --ignored --nocapture"]
+fn tag_guard_columnar_vs_interpreted() {
+    // 列式 List-Index 批 guard vs 逐行 interpreted guard：同一 `c.tags[0] == "prod"`
+    // 过滤。列式路径：一次编译 + 逐行 JSON-数组前缀扫描（免整数组 Value 克隆）。
+    // interpreted 路径：逐事件 `event_matches_alias`（JSON 解析 + Vec<Value> 重建 + 元素克隆）。
+    let executor = RuleExecutor::new(tag_plan(Some(tag_guard_expr())));
+    let n = 1_000_000usize;
+    let batch = tags_batch(n);
+    let events = batch_to_events(&batch);
+
+    let start = Instant::now();
+    let mask = executor
+        .bind_filter_columnar_mask("c", &batch)
+        .expect("columnar mask");
+    let el = start.elapsed();
+    let per = el.as_secs_f64() * 1e9 / n as f64;
+    let passed = (0..mask.len()).filter(|&r| mask.value(r)).count();
+    eprintln!(
+        "[tag-guard-bench] columnar_batch(tags[0]==\"prod\"): {per:7.1} ns/event  ({:5.1}M ev/s)  passed={passed}",
+        n as f64 / el.as_secs_f64() / 1e6
+    );
+
+    let start = Instant::now();
+    let mut passed_interpreted = 0usize;
+    for ev in &events {
+        if executor.event_matches_alias("c", ev, None) {
+            passed_interpreted += 1;
+        }
+    }
+    let el = start.elapsed();
+    let per_interpreted = el.as_secs_f64() * 1e9 / n as f64;
+    eprintln!(
+        "[tag-guard-bench] interpreted_per_event: {per_interpreted:7.1} ns/event  ({:5.1}M ev/s)  passed={passed_interpreted}",
+        n as f64 / el.as_secs_f64() / 1e6
+    );
+
+    // 语义一致：两轨命中数相同（列式 List-Index 与逐行 Path 遍历逐位一致）。
+    assert_eq!(passed, passed_interpreted);
 }
 
 /// `auction` 单列 Int64 批（与 `bid_event` 的 auction 列同构，guard 只读该列）。

@@ -111,9 +111,12 @@ Expr(AST, 现有) ──┬─ expr_is_columnar()? ── yes ─→ ColumnExpr 
   + 类型分派表），运行期每批直接执行，**不做运行时判定**；
 - **列式判定** `expr_is_columnar(expr) -> bool`：纯字段算术/比较/常量
   （`Field % const == const`、`Field > const`、`Field == Field`、`!`、`&&`/`||`
-  短路）；含函数/嵌套路径 → false（回退逐行）；**含窗口查询（`window.has(...)`
-  等逐事件窗口读）的 guard → false**（需 `windows` 参数，无法列式）；
-  **多 bind 规则逐 bind 独立判定**（每个 bind 的 filter 单独编译为列计划或回退）；
+  短路）；含函数/深度嵌套路径 → false（回退逐行）；**列表索引路径 `root[i]`**
+  （根字段 + 一个常量下标，如 `c.tags[0]`）→ true（列式 List-Index：JSON 数组
+  列 / 原生 List 列的偏移读，逐行免整数组 `Value` 重建，2026-08-23 增补）；
+  **含窗口查询（`window.has(...)` 等逐事件窗口读）的 guard → false**（需
+  `windows` 参数，无法列式）；**多 bind 规则逐 bind 独立判定**（每个 bind 的
+  filter 单独编译为列计划或回退）；
 - **类型不匹配（订阅时静态判定，非运行期）**：`expr_is_columnar` 是静态的，看不到
   运行期列类型；类型匹配在**规则订阅源时一次性比对**——guard 涉及字段的声明类型
   vs source schema 列类型，存在不匹配（如声明 digit/Int64 但列是 Utf8 数字字符串）
@@ -223,8 +226,11 @@ fn RuleTask::process_batch(batch: &RecordBatch) {
 3. null 语义：列式短路不命中 == 现有跳过 null（一致）；
 4. **复合短路**：`&&`/`||` + null/缺失字段的组合（如 `a>0 && b==1` 中 b 为
    null、`a||b` 中 a 非空 b 缺失等）逐位对拍——列式位运算与逐行短路+null
-   传播结果一致（§3.2 定义）。示例字段均为简单字段；**嵌套路径（`s.a.b`）已由
-   §3.2 回退逐行，不在列式对拍范围**；
+   传播结果一致（§3.2 定义）。示例字段均为简单字段；**深度嵌套路径（`s.a.b`）
+   已由 §3.2 回退逐行，不在列式对拍范围**；**列表索引路径 `c.tags[i]` 属列式**
+   （§3.2 增补）：对拍覆盖 JSON-数组列（null 元素先剔除再取下标、越界/null/
+   非数组 → null、object/array 元素 → 确定 false 非 null）与原生
+   List/LargeList/FixedSizeList 列（`extract_list_values` 同款 null 剔除）；
 5. **类型不匹配（回退）与字段缺失（null，不回退）**：类型不匹配由订阅时 schema
    比对判定（§3.2），该 guard 回退逐行 interpreted；**字段缺失按 null 处理**
    （§3.1/§3.2），列式 null 不命中与 interpreted 读到 None 等价、不触发回退——

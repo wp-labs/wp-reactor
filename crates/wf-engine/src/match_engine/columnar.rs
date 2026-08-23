@@ -18,32 +18,53 @@
 //!   (matching interpreted `eval_arithmetic` / `compare_cmp` exactly)
 //! - `==` / `!=` over floats keep the interpreted epsilon comparison
 //!
+//! Structured array fields are handled natively in two shapes:
+//! - the **list-index path** `root[i]` (a `FieldRef::Path` of exactly one root
+//!   field + one constant index) compiles to an offset read of the array
+//!   column — a `Utf8` cell holding JSON array text (`JsonArray`, the frame
+//!   storage shape for `array/...` schema fields) or a native Arrow `List` /
+//!   `LargeList` / `FixedSizeList` column. It mirrors the interpreted path
+//!   walk exactly: null cells, parse failures, non-array roots, and
+//!   out-of-range indices read null; null elements are dropped before
+//!   indexing; object / array elements are a definite false on compare (not
+//!   null) — so close-step permissive semantics stay byte-identical.
+//! - a **bare array field** reads a non-null structured value per row
+//!   (`CScalar::Structured`): compares false to every scalar, reads null as a
+//!   boolean, and is not numeric.
+//!
 //! The native `i64` dispatch diverges from the interpreted f64 path only for
 //! `>2^53` integers and nanosecond timestamps — the documented "更准" semantic
 //! change in §3.4. The differential tests assert 100% equivalence below `2^53`
 //! and lock the divergence above it.
 
 use arrow::array::{
-    Array, BooleanArray, BooleanBuilder, Float64Array, Int64Array, StringArray,
-    TimestampNanosecondArray,
+    Array, BooleanArray, BooleanBuilder, FixedSizeListArray, Float64Array, Int64Array,
+    LargeListArray, ListArray, StringArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use smol_str::SmolStr;
-use wf_lang::ast::{BinOp, Expr, FieldRef};
+use wf_lang::ast::{BinOp, Expr, FieldRef, PathSegment};
 
 use super::match_engine::{EngineHashMap, field_ref_name};
+use crate::match_engine::{WFL_FIELD_TYPE_ARRAY, wfl_structured_field_kind};
 
 /// Three-valued scalar read from an Arrow column — the scalar subset of
-/// [`super::match_engine::Value`] (no object/array; those expressions fall back
-/// to the interpreted track). `Int` carries native integer precision for
-/// `Int64` / `Timestamp(Ns)` columns and integer-valued literals.
+/// [`super::match_engine::Value`], plus `Structured` for a non-null
+/// `Value::Object` / `Value::Array` (e.g. a whole array field read bare).
+/// `Int` carries native integer precision for `Int64` / `Timestamp(Ns)`
+/// columns and integer-valued literals.
 #[derive(Debug, Clone, PartialEq)]
 enum CScalar {
     Int(i64),
     Float(f64),
     Str(SmolStr),
     Bool(bool),
+    /// A non-null structured value (`Value::Array` / `Value::Object`). It
+    /// compares `false` to every scalar, reads `None` as a boolean, and is
+    /// not numeric — byte-identical to the interpreted structured values
+    /// flowing through the same operator kernels.
+    Structured,
 }
 
 /// A columnar view over a [`RecordBatch`]: resolves the normalized field name of
@@ -100,7 +121,20 @@ impl<'a> ColumnarBatch<'a> {
             return ColRef::Null;
         };
         let col_idx = self.projection[*proj_idx];
-        col_ref_from_array(self.batch.column(col_idx).as_ref())
+        let col = self.batch.column(col_idx);
+        // A `Utf8` column marked as a structured JSON array (the frame storage
+        // shape for `array/...` schema fields) reads as a JSON-array column.
+        if matches!(col.data_type(), DataType::Utf8)
+            && wfl_structured_field_kind(self.batch.schema().field(col_idx))
+                == Some(WFL_FIELD_TYPE_ARRAY)
+        {
+            return col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(ColRef::JsonArray)
+                .unwrap_or(ColRef::Null);
+        }
+        col_ref_from_array(col.as_ref())
     }
 }
 
@@ -182,12 +216,23 @@ fn schema_index_of(batch: &RecordBatch, name: &str) -> Option<usize> {
 /// A resolved, typed reference to a batch column (or `Null` for a field absent
 /// from the schema / an unsupported type — both read as null, matching
 /// `event_bridge::extract_value`).
+///
+/// `JsonArray` is a `Utf8` column whose field metadata marks it as a structured
+/// JSON array (`wf.wfl.field_type = "array"`): each cell holds JSON array text
+/// like `["prod","edge"]`. `List` / `LargeList` / `FixedSizeList` are native
+/// Arrow list columns. All four carry the array shape used by
+/// [`ColumnExpr::ListIndex`]; read as a bare field they are a non-null
+/// structured value.
 enum ColRef<'a> {
     Int64(&'a Int64Array),
     Float64(&'a Float64Array),
     Utf8(&'a StringArray),
     Bool(&'a BooleanArray),
     TimestampNs(&'a TimestampNanosecondArray),
+    JsonArray(&'a StringArray),
+    List(&'a ListArray),
+    LargeList(&'a LargeListArray),
+    FixedSizeList(&'a FixedSizeListArray),
     Null,
 }
 
@@ -220,6 +265,21 @@ fn col_ref_from_array(col: &dyn Array) -> ColRef<'_> {
             .downcast_ref::<TimestampNanosecondArray>()
             .map(ColRef::TimestampNs)
             .unwrap_or(ColRef::Null),
+        DataType::List(_) => col
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .map(ColRef::List)
+            .unwrap_or(ColRef::Null),
+        DataType::LargeList(_) => col
+            .as_any()
+            .downcast_ref::<LargeListArray>()
+            .map(ColRef::LargeList)
+            .unwrap_or(ColRef::Null),
+        DataType::FixedSizeList(_, _) => col
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .map(ColRef::FixedSizeList)
+            .unwrap_or(ColRef::Null),
         _ => ColRef::Null,
     }
 }
@@ -230,6 +290,15 @@ fn col_ref_from_array(col: &dyn Array) -> ColRef<'_> {
 enum ColumnExpr<'a> {
     Lit(CScalar),
     Col(ColRef<'a>),
+    /// `root[i]` — the `i`-th **non-null** element of the array column `col`,
+    /// per row. Mirror of the interpreted path walk: a null / non-array cell,
+    /// a non-array root column, a parse failure, or an out-of-range index all
+    /// read null (the path produces `None`); object / array elements read a
+    /// [`CScalar::Structured`] (definite false on compare, null as boolean).
+    ListIndex {
+        col: ColRef<'a>,
+        index: usize,
+    },
     Neg(Box<ColumnExpr<'a>>),
     And(Box<ColumnExpr<'a>>, Box<ColumnExpr<'a>>),
     Or(Box<ColumnExpr<'a>>, Box<ColumnExpr<'a>>),
@@ -281,7 +350,23 @@ fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnEx
         Expr::Number(n) => Some(ColumnExpr::Lit(number_literal(*n))),
         Expr::StringLit(s) => Some(ColumnExpr::Lit(CScalar::Str(s.clone().into()))),
         Expr::Bool(b) => Some(ColumnExpr::Lit(CScalar::Bool(*b))),
-        Expr::Field(field) => Some(ColumnExpr::Col(view.resolve_field(field))),
+        Expr::Field(field) => match field {
+            // `root[i]` — the list-index path the columnar evaluator handles
+            // natively (the static gate admits exactly this shape).
+            FieldRef::Path { segments, .. }
+                if matches!(segments.as_slice(), [PathSegment::Field(_), PathSegment::Index(_)]) =>
+            {
+                let index = match segments.last() {
+                    Some(PathSegment::Index(idx)) => *idx,
+                    _ => 0, // unreachable: shape matched above
+                };
+                Some(ColumnExpr::ListIndex {
+                    col: view.resolve_field(field),
+                    index,
+                })
+            }
+            _ => Some(ColumnExpr::Col(view.resolve_field(field))),
+        },
         Expr::Neg(inner) => Some(ColumnExpr::Neg(Box::new(compile_expr(inner, view)?))),
         Expr::BinOp { op, left, right } => match op {
             BinOp::And => Some(ColumnExpr::And(
@@ -332,6 +417,11 @@ enum CVec {
     Float(Vec<Option<f64>>),
     Str(Vec<Option<SmolStr>>),
     Bool(Vec<Option<bool>>),
+    /// Heterogeneous scalar cells — e.g. elements of a JSON-array column whose
+    /// element type can vary row to row. Each cell is one [`CScalar`] (or
+    /// null). Keeps the null / definite-false distinction alive for structured
+    /// cells (`CScalar::Structured`).
+    Scalar(Vec<Option<CScalar>>),
 }
 
 impl CVec {
@@ -343,6 +433,7 @@ impl CVec {
             CVec::Float(v) => v[row].map(CScalar::Float),
             CVec::Str(v) => v[row].clone().map(CScalar::Str),
             CVec::Bool(v) => v[row].map(CScalar::Bool),
+            CVec::Scalar(v) => v[row].clone(),
         }
     }
 
@@ -352,6 +443,10 @@ impl CVec {
     fn bool_at(&self, row: usize) -> Option<bool> {
         match self {
             CVec::Bool(v) => v[row],
+            CVec::Scalar(v) => match v[row].as_ref() {
+                Some(CScalar::Bool(b)) => Some(*b),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -362,6 +457,7 @@ impl CVec {
             CVec::Float(v) => v.len(),
             CVec::Str(v) => v.len(),
             CVec::Bool(v) => v.len(),
+            CVec::Scalar(v) => v.len(),
         }
     }
 }
@@ -374,6 +470,7 @@ impl ColumnExpr<'_> {
         match self {
             ColumnExpr::Lit(v) => lit_vec(v, n),
             ColumnExpr::Col(col) => col_vec(col, n),
+            ColumnExpr::ListIndex { col, index } => list_index_vec(col, *index, n),
             ColumnExpr::Neg(inner) => neg_vec(inner.eval_vec(n)),
             ColumnExpr::And(left, right) => logic_vec::<true>(left.eval_vec(n), right.eval_vec(n)),
             ColumnExpr::Or(left, right) => logic_vec::<false>(left.eval_vec(n), right.eval_vec(n)),
@@ -394,6 +491,10 @@ fn lit_vec(v: &CScalar, n: usize) -> CVec {
         CScalar::Float(f) => CVec::Float(vec![Some(*f); n]),
         CScalar::Str(s) => CVec::Str((0..n).map(|_| Some(s.clone())).collect()),
         CScalar::Bool(b) => CVec::Bool(vec![Some(*b); n]),
+        // `Lit` never carries a structured value (compile_expr only builds
+        // literals from Number / StringLit / Bool); the arm keeps the match
+        // total and is semantically inert.
+        CScalar::Structured => CVec::Scalar(vec![Some(CScalar::Structured); n]),
     }
 }
 
@@ -427,8 +528,25 @@ fn col_vec(col: &ColRef<'_>, n: usize) -> CVec {
                 .map(|r| (!a.is_null(r)).then(|| a.value(r)))
                 .collect(),
         ),
+        // Array-shaped columns read bare are a non-null structured value per
+        // row (`Value::Array`), never a scalar — compares false, reads null as
+        // a boolean, and is not numeric (byte-identical to interpreted).
+        ColRef::JsonArray(a) => structured_col(n, |r| !a.is_null(r)),
+        ColRef::List(a) => structured_col(n, |r| !a.is_null(r)),
+        ColRef::LargeList(a) => structured_col(n, |r| !a.is_null(r)),
+        ColRef::FixedSizeList(a) => structured_col(n, |r| !a.is_null(r)),
         ColRef::Null => CVec::Int(vec![None; n]),
     }
+}
+
+/// One `CVec::Scalar` slot per row: `Some(CScalar::Structured)` for a non-null
+/// cell, `None` for null.
+fn structured_col(n: usize, non_null: impl Fn(usize) -> bool) -> CVec {
+    CVec::Scalar(
+        (0..n)
+            .map(|r| non_null(r).then_some(CScalar::Structured))
+            .collect(),
+    )
 }
 
 /// Vectorized unary negation. `Int` negates to `Float` (widening, mirroring the
@@ -438,12 +556,215 @@ fn neg_vec(inner: CVec) -> CVec {
     match inner {
         CVec::Int(v) => CVec::Float(v.into_iter().map(|o| o.map(|i| -(i as f64))).collect()),
         CVec::Float(v) => CVec::Float(v.into_iter().map(|o| o.map(|f| -f)).collect()),
+        // Heterogeneous cells negate per cell: numbers → -n, everything else
+        // (and null) → null, matching the interpreted `Neg` on `Value`.
+        CVec::Scalar(v) => CVec::Float(
+            v.into_iter()
+                .map(|o| o.and_then(|s| match s {
+                    CScalar::Int(i) => Some(-(i as f64)),
+                    CScalar::Float(f) => Some(-f),
+                    _ => None,
+                }))
+                .collect(),
+        ),
         _ => CVec::Float(vec![None; n]),
     }
 }
 
+/// Vectorized `root[i]`: per row, read the `index`-th non-null element of the
+/// array cell as a scalar (null cell / parse failure / out of range → null).
+/// A non-array column reads all-null — the interpreted path walk yields `None`
+/// for an index segment on a non-array root, so this is byte-identical.
+fn list_index_vec(col: &ColRef<'_>, index: usize, n: usize) -> CVec {
+    match col {
+        ColRef::JsonArray(a) => CVec::Scalar(
+            (0..n)
+                .map(|r| {
+                    if a.is_null(r) {
+                        None
+                    } else {
+                        nth_json_array_scalar(a.value(r), index)
+                    }
+                })
+                .collect(),
+        ),
+        ColRef::List(a) => CVec::Scalar(
+            (0..n)
+                .map(|r| {
+                    if a.is_null(r) {
+                        None
+                    } else {
+                        list_slice_nth_scalar(a.value(r).as_ref(), index)
+                    }
+                })
+                .collect(),
+        ),
+        ColRef::LargeList(a) => CVec::Scalar(
+            (0..n)
+                .map(|r| {
+                    if a.is_null(r) {
+                        None
+                    } else {
+                        list_slice_nth_scalar(a.value(r).as_ref(), index)
+                    }
+                })
+                .collect(),
+        ),
+        ColRef::FixedSizeList(a) => CVec::Scalar(
+            (0..n)
+                .map(|r| {
+                    if a.is_null(r) {
+                        None
+                    } else {
+                        list_slice_nth_scalar(a.value(r).as_ref(), index)
+                    }
+                })
+                .collect(),
+        ),
+        // Non-array root column: the interpreted walk hits an index segment on
+        // a non-array value → `None` for every row.
+        _ => CVec::Scalar(vec![None; n]),
+    }
+}
+
+/// The `index`-th **non-null** element of the JSON array in `cell` as a
+/// scalar, byte-identical to the interpreted structured-array path
+/// (`serde_json` parse → `json_to_value` null-drop → index → scalar mapping):
+///
+/// - `null` cells, parse failures, non-array JSON, and out-of-range indices →
+///   `None` (the interpreted walk yields null);
+/// - null elements are skipped (`json_to_value(Null)` is dropped), so
+///   `["a", null, "b"][1]` is `"b"`;
+/// - object / array elements map to [`CScalar::Structured`] (definite false on
+///   compare, null as boolean).
+///
+/// Parsing never materializes the whole array `Value` (the per-row allocation
+/// the interpreted path pays): elements up to the found one are parsed, the
+/// rest are skipped as [`serde::de::IgnoredAny`].
+fn nth_json_array_scalar(cell: &str, index: usize) -> Option<CScalar> {
+    let mut de = serde_json::Deserializer::from_str(cell);
+    nth_json_element(&mut de, index).ok()?.as_ref().map(json_scalar)
+}
+
+/// Map one non-null JSON array element to a [`CScalar`], mirroring
+/// `event_bridge::json_to_value`: `Bool` → bool, `Number` → f64, `String` →
+/// str, and anything structured → [`CScalar::Structured`].
+fn json_scalar(v: &serde_json::Value) -> CScalar {
+    match v {
+        serde_json::Value::Bool(b) => CScalar::Bool(*b),
+        serde_json::Value::Number(n) => match n.as_f64() {
+            Some(f) => CScalar::Float(f),
+            // `Number::as_f64` is total in practice; a theoretical failure
+            // would mean the interpreted path drops this element.
+            None => CScalar::Structured,
+        },
+        serde_json::Value::String(s) => CScalar::Str(s.as_str().into()),
+        _ => CScalar::Structured,
+    }
+}
+
+/// The `index`-th **non-null** element of a native Arrow list slice, mirroring
+/// `extract_list_values` (null cells skipped, unsupported cell types dropped)
+/// plus `extract_value`'s scalar mapping.
+fn list_slice_nth_scalar(slice: &dyn Array, index: usize) -> Option<CScalar> {
+    let mut seen = 0usize;
+    for row in 0..slice.len() {
+        if slice.is_null(row) {
+            continue;
+        }
+        let Some(cell) = arrow_cell_scalar(slice, row) else {
+            continue; // unsupported child type → dropped, like `extract_value`
+        };
+        if seen == index {
+            return Some(cell);
+        }
+        seen += 1;
+    }
+    None
+}
+
+/// Scalar mapping of one Arrow cell, mirroring `extract_value`: supported
+/// scalar columns read natively; structured children (`Struct` → object,
+/// nested list → array) read [`CScalar::Structured`]; unsupported types →
+/// `None` (the element is dropped, shifting later indices).
+fn arrow_cell_scalar(col: &dyn Array, row: usize) -> Option<CScalar> {
+    match col.data_type() {
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|a| CScalar::Int(a.value(row))),
+        DataType::Float64 => col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|a| CScalar::Float(a.value(row))),
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| CScalar::Str(a.value(row).into())),
+        DataType::Boolean => col
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .map(|a| CScalar::Bool(a.value(row))),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => col
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .map(|a| CScalar::Int(a.value(row))),
+        DataType::Struct(_)
+        | DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _) => Some(CScalar::Structured),
+        _ => None,
+    }
+}
+
+/// Drive `de` to read "the `index`-th non-null element of a JSON array".
+/// Parses only the prefix up to the found element (later elements are skipped,
+/// not materialized); any top-level shape that is not an array (object / scalar
+/// / null) errors → the caller treats the cell as null, matching the
+/// interpreted non-array path.
+fn nth_json_element<'de, D>(de: D, index: usize) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct NthVisitor {
+        index: usize,
+    }
+    impl<'de> serde::de::Visitor<'de> for NthVisitor {
+        type Value = Option<serde_json::Value>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "a JSON array")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut seen = 0usize;
+            let mut found = None;
+            while let Some(v) = seq.next_element::<serde_json::Value>()? {
+                if v.is_null() {
+                    continue; // json_to_value drops null elements
+                }
+                if seen == self.index {
+                    found = Some(v);
+                    // serde_json's `deserialize_any` validates the closing `]`
+                    // after `visit_seq` returns, so drain the rest (skipped via
+                    // `IgnoredAny`, no `Value` allocation) before returning.
+                    while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                    break;
+                }
+                seen += 1;
+            }
+            Ok(found)
+        }
+    }
+    de.deserialize_any(NthVisitor { index })
+}
+
 /// Vectorized comparison: per row, null cell on either side → null; else
-/// `compare_scalars` (which returns `false` for a non-numeric pair).
+/// `compare_scalars` (which returns `false` for a non-numeric pair, including
+/// any [`CScalar::Structured`] operand).
 fn cmp_vec(op: BinOp, left: CVec, right: CVec) -> CVec {
     let n = left.len();
     let mut out = Vec::with_capacity(n);
@@ -534,6 +855,9 @@ fn compare_scalars(op: BinOp, lv: &CScalar, rv: &CScalar) -> bool {
             BinOp::Ne => a != b,
             _ => false,
         },
+        // A structured operand is a definite type mismatch → false (the
+        // interpreted `compare_values` catch-all for non-scalar `Value`s).
+        (CScalar::Structured, _) | (_, CScalar::Structured) => false,
         // Mixed i64/f64 (and any other numeric pairing) → f64 (epsilon) semantics.
         (a, b) => match (to_f64(a), to_f64(b)) {
             (Some(x), Some(y)) => compare_numeric(op, x, y),
@@ -627,7 +951,9 @@ fn arithmetic(op: BinOp, lv: &CScalar, rv: &CScalar) -> Option<CScalar> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::ArrayRef;
+    use crate::match_engine::WFL_FIELD_TYPE_METADATA_KEY;
+    use arrow::array::{ArrayRef, BinaryArray};
+    use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
 
@@ -902,6 +1228,420 @@ mod tests {
         );
         // Numeric expression at guard top level → interpreted `None` → false.
         let expr = bin(BinOp::Add, field("auction"), num(1.0));
+        assert!(wf_lang::columnar::expr_is_columnar(&expr));
+        assert_equiv(&expr, &batch);
+    }
+
+    /// A `tags`-style column: `Utf8` cells holding JSON arrays, marked with the
+    /// structured-array metadata the receiver attaches to `array/...` fields
+    /// (`wf.wfl.field_type = "array"`), plus an `auction` column for
+    /// composition tests.
+    fn json_array_batch(tags: Vec<Option<&str>>, auction: Vec<Option<i64>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tags", DataType::Utf8, true).with_metadata(std::collections::HashMap::from(
+                [(
+                    WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                    WFL_FIELD_TYPE_ARRAY.to_string(),
+                )],
+            )),
+            Field::new("auction", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(tags)) as ArrayRef,
+                Arc::new(Int64Array::from(auction)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// `c.tags[i]` — the list-index path under test.
+    fn tags_index(index: usize) -> Expr {
+        Expr::Field(FieldRef::Path {
+            alias: "c".to_string(),
+            segments: vec![
+                PathSegment::Field("tags".to_string()),
+                PathSegment::Index(index),
+            ],
+        })
+    }
+
+    #[test]
+    fn list_index_json_array_matches_interpreted() {
+        let batch = json_array_batch(
+            vec![
+                Some(r#"["prod","edge","dmz"]"#),
+                Some(r#"["edge"]"#),
+                Some(r#"["prod"]"#),
+                Some(r#"[]"#),
+                None,
+            ],
+            vec![Some(1); 5],
+        );
+        let exprs = vec![
+            bin(BinOp::Eq, tags_index(0), Expr::StringLit("prod".into())),
+            bin(BinOp::Eq, tags_index(1), Expr::StringLit("edge".into())),
+            bin(BinOp::Eq, tags_index(2), Expr::StringLit("dmz".into())),
+            // Out of range / null cell → null → not matched.
+            bin(BinOp::Eq, tags_index(3), Expr::StringLit("x".into())),
+            bin(BinOp::Ne, tags_index(0), Expr::StringLit("edge".into())),
+            bin(BinOp::Gt, tags_index(0), Expr::StringLit("a".into())),
+        ];
+        for expr in exprs {
+            assert!(
+                wf_lang::columnar::expr_is_columnar(&expr),
+                "expr should be columnar: {expr:?}"
+            );
+            assert_equiv(&expr, &batch);
+        }
+    }
+
+    #[test]
+    fn list_index_json_array_null_elements_are_dropped() {
+        let batch = json_array_batch(
+            vec![
+                Some(r#"["a", null, "b"]"#),
+                Some(r#"[null, null, "c"]"#),
+                Some(r#"[1, null, "x"]"#),
+            ],
+            vec![Some(1); 3],
+        );
+        // json_to_value drops null elements: [a, null, b] → [a, b], so [1] is "b".
+        let expr = bin(BinOp::Eq, tags_index(1), Expr::StringLit("b".into()));
+        assert_equiv(&expr, &batch);
+        // [null, null, "c"] → ["c"], so [2] is out of range → null.
+        let expr = bin(BinOp::Eq, tags_index(2), Expr::StringLit("c".into()));
+        assert_equiv(&expr, &batch);
+        // [1, null, "x"] → [1, "x"]; index 1 is the string "x".
+        let expr = bin(BinOp::Eq, tags_index(1), Expr::StringLit("x".into()));
+        assert_equiv(&expr, &batch);
+        // And the numeric element before the null: index 0 == 1.
+        let expr = bin(BinOp::Eq, tags_index(0), num(1.0));
+        assert_equiv(&expr, &batch);
+    }
+
+    #[test]
+    fn list_index_json_numeric_and_bool_elements() {
+        let batch = json_array_batch(
+            vec![
+                Some(r#"[5, 6.5]"#),
+                Some(r#"[true, false]"#),
+                Some(r#"[1e2]"#),
+            ],
+            vec![Some(1); 3],
+        );
+        // Number elements compare as f64 (interpreted `Value::Number`).
+        let expr = bin(BinOp::Eq, tags_index(0), num(5.0));
+        assert_equiv(&expr, &batch);
+        let expr = bin(BinOp::Gt, tags_index(0), num(4.0));
+        assert_equiv(&expr, &batch);
+        // 1e2 → 100.
+        let expr = bin(BinOp::Eq, tags_index(0), num(100.0));
+        assert_equiv(&expr, &batch);
+        // Bool elements compare as bools; a number never equals a bool.
+        let expr = bin(BinOp::Eq, tags_index(0), Expr::Bool(true));
+        assert_equiv(&expr, &batch);
+        let expr = bin(BinOp::Eq, tags_index(1), Expr::Bool(false));
+        assert_equiv(&expr, &batch);
+    }
+
+    #[test]
+    fn list_index_structured_elements_compare_false_not_null() {
+        let batch = json_array_batch(
+            vec![
+                Some(r#"[{"k":1}, "prod"]"#),
+                Some(r#"[[1,2]]"#),
+                Some(r#"["prod"]"#),
+            ],
+            vec![Some(1); 3],
+        );
+        // Object / array elements are a definite false on compare, never null.
+        let expr = bin(BinOp::Eq, tags_index(0), Expr::StringLit("prod".into()));
+        assert_equiv(&expr, &batch);
+        // Out-of-range index reads a null slot (the close-step permissive
+        // distinction) — lock it directly on the mask.
+        let out_of_range = bin(BinOp::Eq, tags_index(2), Expr::StringLit("prod".into()));
+        let view = ColumnarBatch::from_all_fields(&batch);
+        let mask = eval_guard_columnar(&expr, &view);
+        let mask_oob = eval_guard_columnar(&out_of_range, &view);
+        assert!(!mask.value(0) && !mask.is_null(0), "object element → false, not null");
+        assert!(!mask.value(1) && !mask.is_null(1), "array element → false, not null");
+        assert!(mask.value(2), "string element compares equal");
+        for row in 0..3 {
+            assert!(mask_oob.is_null(row), "out-of-range reads null (permissive)");
+        }
+    }
+
+    /// A single-column batch whose `tags` column is a native Arrow list shape.
+    fn native_list_batch(col: ArrayRef, list_dt: DataType) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("tags", list_dt, true)]));
+        RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    #[test]
+    fn list_index_native_list_columns_match_interpreted() {
+        // List<Utf8>: rows ["prod","edge"] / [null] / [] / ["dmz"].
+        let values = StringArray::from(vec![Some("prod"), Some("edge"), None, Some("dmz")]);
+        let list = ListArray::try_new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            OffsetBuffer::new(vec![0i32, 2, 3, 3, 4].into()),
+            Arc::new(values) as ArrayRef,
+            None,
+        )
+        .unwrap();
+        let batch = native_list_batch(
+            Arc::new(list) as ArrayRef,
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        );
+        // [null] drops the null element → empty → index 0 out of range → null.
+        let expr = bin(BinOp::Eq, tags_index(0), Expr::StringLit("prod".into()));
+        assert_equiv(&expr, &batch);
+        let expr = bin(BinOp::Eq, tags_index(0), Expr::StringLit("dmz".into()));
+        assert_equiv(&expr, &batch);
+
+        // LargeList<Int64>: rows [1, 2] / [3, 4, 5].
+        let large = LargeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Int64, true)),
+            OffsetBuffer::new(vec![0i64, 2, 5].into()),
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as ArrayRef,
+            None,
+        )
+        .unwrap();
+        let batch = native_list_batch(
+            Arc::new(large) as ArrayRef,
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Int64, true))),
+        );
+        let expr = bin(BinOp::Eq, tags_index(1), num(2.0));
+        assert_equiv(&expr, &batch);
+        let expr = bin(BinOp::Eq, tags_index(2), num(5.0));
+        assert_equiv(&expr, &batch);
+
+        // FixedSizeList<Utf8> size 2: rows ["a","b"] / ["c", null] → ["c"].
+        let values = StringArray::from(vec![Some("a"), Some("b"), Some("c"), None]);
+        let fixed = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            2,
+            Arc::new(values) as ArrayRef,
+            None,
+        );
+        let batch = native_list_batch(
+            Arc::new(fixed) as ArrayRef,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Utf8, true)),
+                2,
+            ),
+        );
+        let expr = bin(BinOp::Eq, tags_index(1), Expr::StringLit("b".into()));
+        assert_equiv(&expr, &batch);
+        // [c, null] → [c]: index 1 out of range → null; index 0 == "c".
+        let expr = bin(BinOp::Eq, tags_index(0), Expr::StringLit("c".into()));
+        assert_equiv(&expr, &batch);
+        let expr = bin(BinOp::Eq, tags_index(1), Expr::StringLit("c".into()));
+        assert_equiv(&expr, &batch);
+    }
+
+    #[test]
+    fn list_index_non_array_root_degrades_to_null() {
+        // A plain Utf8 column named `tags` (no array metadata) whose cells are
+        // JSON-array text: the interpreted walk hits `[0]` on a Str root → null.
+        let schema = Arc::new(Schema::new(vec![Field::new("tags", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some(r#"["prod"]"#)])) as ArrayRef],
+        )
+        .unwrap();
+        let expr = bin(BinOp::Eq, tags_index(0), Expr::StringLit("prod".into()));
+        assert!(wf_lang::columnar::expr_is_columnar(&expr));
+        let events = batch_to_events(&batch);
+        let view = ColumnarBatch::from_all_fields(&batch);
+        let mask = eval_guard_columnar(&expr, &view);
+        assert!(!mask.value(0) && mask.is_null(0), "non-array root reads null");
+        assert_eq!(mask.value(0), interpreted_bool(&expr, &events[0]));
+
+        // An Int64 column named `tags`: index on a Number root → null too.
+        let schema = Arc::new(Schema::new(vec![Field::new("tags", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1)])) as ArrayRef],
+        )
+        .unwrap();
+        let events = batch_to_events(&batch);
+        let view = ColumnarBatch::from_all_fields(&batch);
+        let mask = eval_guard_columnar(&expr, &view);
+        assert!(!mask.value(0) && mask.is_null(0));
+        assert_eq!(mask.value(0), interpreted_bool(&expr, &events[0]));
+    }
+
+    #[test]
+    fn bare_array_field_is_structured() {
+        // `c.tags` (Qualified, no index) reads the whole array as a structured
+        // value: never equal to a scalar, `!=` always true, present-but-null
+        // distinguished (a present array is a definite false, not null).
+        let batch = json_array_batch(vec![Some(r#"["prod","edge"]"#), None], vec![Some(1); 2]);
+        let tags_field = || Expr::Field(FieldRef::Qualified("c".into(), "tags".into()));
+        let expr = bin(BinOp::Eq, tags_field(), Expr::StringLit("prod".into()));
+        assert_equiv(&expr, &batch);
+        let expr = bin(BinOp::Ne, tags_field(), Expr::StringLit("prod".into()));
+        assert_equiv(&expr, &batch);
+        let view = ColumnarBatch::from_all_fields(&batch);
+        let mask =
+            eval_guard_columnar(&bin(BinOp::Eq, tags_field(), Expr::StringLit("x".into())), &view);
+        assert!(!mask.is_null(0), "present array is a definite false, not null");
+        assert!(mask.is_null(1), "null cell reads null");
+    }
+
+    #[test]
+    fn list_index_bool_logic_and_negation() {
+        // tags is a JSON-array column; flag is a flat Bool column. Rows cover
+        // bool elements, null-dropped arrays, and number elements — the
+        // three-valued `&&` and unary negation over heterogeneous cells.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tags", DataType::Utf8, true).with_metadata(std::collections::HashMap::from(
+                [(
+                    WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                    WFL_FIELD_TYPE_ARRAY.to_string(),
+                )],
+            )),
+            Field::new("flag", DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some(r#"[true]"#),
+                    Some(r#"[false]"#),
+                    Some(r#"[null]"#),
+                    Some(r#"[3.5]"#),
+                    Some(r#"[5]"#),
+                ])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![Some(true); 5])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        // Bool elements flow through the three-valued `&&` (bool_at over a
+        // heterogeneous cell); non-bool elements read null, exactly like
+        // `Value::Bool` vs `Value::Number` in the interpreted evaluator.
+        let expr = bin(BinOp::And, tags_index(0), field("flag"));
+        assert!(wf_lang::columnar::expr_is_columnar(&expr));
+        assert_equiv(&expr, &batch);
+        // Unary negation widens Int/Float cells to -n and nulls everything else.
+        let expr = bin(BinOp::Eq, Expr::Neg(Box::new(tags_index(0))), num(-5.0));
+        assert!(wf_lang::columnar::expr_is_columnar(&expr));
+        assert_equiv(&expr, &batch);
+    }
+
+    #[test]
+    fn bare_native_list_field_is_structured() {
+        // `c.tags` (no index) over native List / LargeList / FixedSizeList
+        // columns: a non-null structured value per row — never equal to a
+        // scalar, `!=` always true.
+        let tags_field = || Expr::Field(FieldRef::Qualified("c".into(), "tags".into()));
+        let eq = bin(BinOp::Eq, tags_field(), Expr::StringLit("a".into()));
+        let ne = bin(BinOp::Ne, tags_field(), Expr::StringLit("a".into()));
+
+        let values = StringArray::from(vec![Some("a"), None]);
+        let list = ListArray::try_new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            OffsetBuffer::new(vec![0i32, 1, 2].into()),
+            Arc::new(values) as ArrayRef,
+            None,
+        )
+        .unwrap();
+        let batch = native_list_batch(
+            Arc::new(list) as ArrayRef,
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        );
+        assert_equiv(&eq, &batch);
+        assert_equiv(&ne, &batch);
+
+        let large = LargeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            OffsetBuffer::new(vec![0i64, 1, 2].into()),
+            Arc::new(StringArray::from(vec![Some("a"), None])) as ArrayRef,
+            None,
+        )
+        .unwrap();
+        let batch = native_list_batch(
+            Arc::new(large) as ArrayRef,
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true))),
+        );
+        assert_equiv(&eq, &batch);
+        assert_equiv(&ne, &batch);
+
+        let fixed = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            1,
+            Arc::new(StringArray::from(vec![Some("a"), None])) as ArrayRef,
+            None,
+        );
+        let batch = native_list_batch(
+            Arc::new(fixed) as ArrayRef,
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Utf8, true)), 1),
+        );
+        assert_equiv(&eq, &batch);
+        assert_equiv(&ne, &batch);
+    }
+
+    #[test]
+    fn list_index_native_list_child_types() {
+        // List<Timestamp(Ns)>: timestamp children read as native i64 (the same
+        // documented precision as `TimestampNs` columns).
+        let ts_values = TimestampNanosecondArray::from(vec![Some(1_700_000_000_000_000i64), Some(2)]);
+        let ts_list = ListArray::try_new(
+            Arc::new(Field::new(
+                "item",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            )),
+            OffsetBuffer::new(vec![0i32, 2].into()),
+            Arc::new(ts_values) as ArrayRef,
+            None,
+        )
+        .unwrap();
+        let batch = native_list_batch(
+            Arc::new(ts_list) as ArrayRef,
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ))),
+        );
+        let expr = bin(BinOp::Eq, tags_index(0), num(1_700_000_000_000_000.0));
+        assert_equiv(&expr, &batch);
+        let expr = bin(BinOp::Eq, tags_index(1), num(2.0));
+        assert_equiv(&expr, &batch);
+
+        // List<Binary>: an unsupported child type is dropped before indexing
+        // (like `extract_value` → None), so index 0 reads null.
+        let bin_list = ListArray::try_new(
+            Arc::new(Field::new("item", DataType::Binary, true)),
+            OffsetBuffer::new(vec![0i32, 1].into()),
+            Arc::new(BinaryArray::from(vec![Some(&b"x"[..])])) as ArrayRef,
+            None,
+        )
+        .unwrap();
+        let batch = native_list_batch(
+            Arc::new(bin_list) as ArrayRef,
+            DataType::List(Arc::new(Field::new("item", DataType::Binary, true))),
+        );
+        let expr = bin(BinOp::Eq, tags_index(0), Expr::StringLit("x".into()));
+        assert!(wf_lang::columnar::expr_is_columnar(&expr));
+        assert_equiv(&expr, &batch);
+    }
+
+    #[test]
+    fn list_index_composes_with_flat_guards() {
+        let batch = json_array_batch(
+            vec![Some(r#"["prod"]"#), Some(r#"["edge"]"#), None],
+            vec![Some(1); 3],
+        );
+        // tags[0] == "prod" && auction > 0 — the qradar g_tag_prod guard shape.
+        let expr = bin(
+            BinOp::And,
+            bin(BinOp::Eq, tags_index(0), Expr::StringLit("prod".into())),
+            bin(BinOp::Gt, field("auction"), num(0.0)),
+        );
         assert!(wf_lang::columnar::expr_is_columnar(&expr));
         assert_equiv(&expr, &batch);
     }
