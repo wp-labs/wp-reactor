@@ -10,6 +10,7 @@
 //! - `pull_and_advance` 整批 round-robin 门控跳过分支。
 //! - `dump_profiling` 节流 / 日志; `update_rule_instances_metric` delta 上报。
 //! - `process_batch` 未知窗口早退 / 仅 events 输入路径; `Drop` 释放进度槽。
+use std::sync::Arc;
 
 use super::*;
 
@@ -199,7 +200,7 @@ fn record_with(target: &str, event_time_nanos: i64) -> OutputRecord {
         yield_fields: vec![(Arc::from("sip"), Value::Str("1.2.3.4".into()))],
         yield_field_types: Vec::new().into(),
         event_time_nanos,
-        machine_id: String::new(),
+        machine_id: Arc::from(""),
         scope_key: "".into(),
     }
 }

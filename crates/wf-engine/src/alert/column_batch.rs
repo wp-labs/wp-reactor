@@ -20,8 +20,8 @@
 //! (`export_yield_value` + the same reserved-prefix / duplicate checks), and
 //! [`AlertColumnBatch::iter_data_records`] reconstructs byte-equivalent
 //! `DataRecord`s for sinks that still want rows — locked by unit test.
-
 use std::sync::Arc;
+
 
 use orion_error::conversion::ToStructError;
 use wf_lang::FieldType;
@@ -904,7 +904,7 @@ mod tests {
                 ),
             ]),
             event_time_nanos: 0,
-            machine_id: String::new(),
+            machine_id: Arc::from(""),
             scope_key: Arc::from(""),
         }
     }

@@ -11,8 +11,8 @@
 //! - route: `batch_machine_id` 空列、`coerce_column` Utf8→Timestamp 坏值 /
 //!   Float64→Utf8、`coerce_column_for_field` 结构化 object 分支与回退、
 //!   `prepare_batch` 投影保留 machine_id。
-
 use std::sync::Arc;
+
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 

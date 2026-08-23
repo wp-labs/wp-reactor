@@ -6,8 +6,8 @@
 //! negation steps use "must be true" semantics. The differential tests feed the
 //! same events through `advance_at_with_masks` (columnar) and `advance_at_with`
 //! (interpreted) and assert identical state-machine results.
-
 use std::sync::Arc;
+
 use std::time::Duration;
 
 use arrow::array::{ArrayRef, StringArray};

@@ -4,9 +4,9 @@
 //! out-of-range indices, timestamped join rows over a non-timestamp time
 //! column, multi-batch join-row builders with null cells, timezone-aware
 //! timestamp columns, and the projected `ColumnarEvent::to_event` lane.
+use std::sync::Arc;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, Date32Array, Float32Array, Int16Array, Int64Array, StringArray,

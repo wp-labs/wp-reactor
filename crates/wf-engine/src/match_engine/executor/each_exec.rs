@@ -1577,7 +1577,7 @@ impl RuleExecutor {
                 .collect::<CoreResult<Vec<_>>>()
         })?;
 
-        let machine_id = CepStateMachine::extract_event_str(ctx, MACHINE_ID);
+        let machine_id = Arc::from(CepStateMachine::extract_event_str(ctx, MACHINE_ID));
 
         Ok(Some(OutputRecord {
             wfx_id,

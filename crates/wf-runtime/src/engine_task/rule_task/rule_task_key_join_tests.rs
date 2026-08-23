@@ -3,9 +3,9 @@
 //! 预解析 scope key）必须与逐事件内部解析（`advance_at_with_masks` 内部
 //! `resolve_key_join_scope_key`）产生**相同**的状态机结果序列——int / float
 //! 驱动 key、热点重复、join miss、null 左字段全覆盖。
+use std::sync::Arc;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array};

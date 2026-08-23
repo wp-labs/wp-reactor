@@ -25,9 +25,9 @@
 //!
 //! 数据域对齐（NEXMark 官方）：bidder ≈ 最近 1000 人、auction ≈ 最近 100 个、
 //! 价格对数均匀 ∈ [100, 1e8)；事件时间步长 = 30m 数据 / 27.6M bid ≈ 65.2µs/事件。
+use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::Int64Array;
@@ -1371,6 +1371,116 @@ fn q13_match_snapshot_join() {
     }
     let ctxjoin_ns = t3.elapsed().as_secs_f64() * 1e9 / (N as f64 / 10.0);
     report("q13 ctx+join (富化)", ctxjoin_ns, exec_ns);
+}
+
+// ---------------------------------------------------------------------------
+// Bench 5b：Q6 每事件 emit 路径归因（match + join-then-key，live_joins 空，
+//          score 常量 + entity/yield 读左窗字段）——q6 26M EMIT 的瓶颈侧。
+// ---------------------------------------------------------------------------
+
+/// Q6 形状 RulePlan：`match<seller:10m> avg>=200` + auction snapshot join
+/// （键来自 join 右窗 → join 存活但输出全左窗限定 → live_joins 空）。
+fn q6_rule() -> RulePlan {
+    let mut plan = simple_rule_plan(
+        "q6_bench",
+        q4_q6_plan(false),
+        Expr::Number(20.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.binds[0].window = "bid_events".into();
+    plan.joins = vec![JoinPlan {
+        right_window: "auction_events".to_string(),
+        mode: JoinMode::Snapshot,
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Qualified("b".into(), "auction".into()),
+            right: FieldRef::Qualified("auction_events".into(), "id".into()),
+        }],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    }];
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        },
+        YieldField {
+            name: "alert_type".into(),
+            value: Expr::StringLit("q6_avg200".into()),
+        },
+        YieldField {
+            name: "detail".into(),
+            value: Expr::StringLit("avg bid >= 200".into()),
+        },
+        YieldField {
+            name: "request_count".into(),
+            value: Expr::Number(1.0),
+        },
+    ];
+    plan
+}
+
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine nexmark_hotpath_bench -- --ignored --nocapture"]
+fn q6_match_emit() {
+    use crate::match_engine::executor::CloseCtxFields;
+    use crate::match_engine::executor::build_eval_context;
+
+    let events = bid_events(N);
+    let lookup = AuctionLookup::new(AUCTION_DOMAIN);
+    let rule = q6_rule();
+    let exec = RuleExecutor::new(rule.clone());
+    assert!(
+        exec.live_joins().is_empty(),
+        "q6 输出全左窗限定（yield 读 b.auction）→ join 必须判死，否则富化是纯浪费"
+    );
+
+    // 每事件 emit：execute_match_with_joins（live_joins 空 → execute_joins 空转）。
+    let matched = simple_matched("q6_bench", vec![num(20.0)], &events[0], NOW);
+    let t1 = Instant::now();
+    for _ in 0..N {
+        let _ = std::hint::black_box(exec.execute_match_with_joins(&matched, &lookup));
+    }
+    let exec_ns = t1.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q6 match emit(全路径)", exec_ns, exec_ns);
+
+    // 分量 1：build_eval_context（Named 窄化——q6 编译产物只读 b.auction/seller）。
+    let step_plans: Vec<&StepPlan> = rule.match_plan.event_steps.iter().collect();
+    let needed = CloseCtxFields::Named(HashSet::from(["auction".to_string()]));
+    let t2 = Instant::now();
+    for _ in 0..N {
+        let ctx = build_eval_context(
+            &rule.match_plan.keys,
+            &matched.scope_key,
+            &matched.step_data,
+            &matched.bind_data,
+            &step_plans,
+            matched.trigger_event.as_deref(),
+            &needed,
+        );
+        std::hint::black_box(ctx);
+    }
+    let ctx_ns = t2.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q6 build ctx(窄化)", ctx_ns, exec_ns);
+
+    // 分量 2：build_match_alert（ctx 复用，只测 alert 构建）。
+    let mut ctx = build_eval_context(
+        &rule.match_plan.keys,
+        &matched.scope_key,
+        &matched.step_data,
+        &matched.bind_data,
+        &step_plans,
+        matched.trigger_event.as_deref(),
+        &needed,
+    );
+    let t3 = Instant::now();
+    for _ in 0..N {
+        let _ = std::hint::black_box(exec.build_match_alert(&matched, &ctx, NOW).unwrap());
+    }
+    let alert_ns = t3.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q6 build_match_alert", alert_ns, exec_ns);
 }
 
 // ---------------------------------------------------------------------------

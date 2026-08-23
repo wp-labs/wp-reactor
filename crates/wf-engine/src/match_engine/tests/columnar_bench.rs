@@ -8,9 +8,9 @@
 //! - `window.has` 缓存命中（Arc<HashSet> clone）vs 冷扫描（单列建 set）
 //!
 //! 运行：cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture
+use std::sync::Arc;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampNanosecondArray};

@@ -9,8 +9,8 @@
 //! outputs — covering the interpreted-guard fallback (`masks = None`), the
 //! columnar-mask path (`masks = Some`), measure/branch-field reads, seq
 //! negation, and `to_event()` byte parity.
-
 use std::sync::Arc;
+
 use std::time::Duration;
 
 use arrow::array::{ArrayRef, Int64Array, StringArray};

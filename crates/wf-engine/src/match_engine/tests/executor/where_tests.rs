@@ -2,9 +2,9 @@
 //! after joins enrich the event context and before alert construction. Strict
 //! semantics — `false` or a missing joined field (`None`) suppresses output,
 //! aligning INNER JOIN miss-drop (q3 state filter / q20 category filter).
+use std::sync::Arc;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use wf_lang::ast::{BinOp, Expr, FieldRef, JoinMode};
 use wf_lang::plan::{EachPlan, JoinCondPlan, JoinPlan};

@@ -2,9 +2,9 @@
 //! bid 驱动流 ⋈ provider person 静态表（knowdb 加载），snapshot join 富化输出。
 //! 回归锚点：此前 `RegistryLookup::join_lookup` 对 provider 窗口 `get_window`
 //! 返回 None → join 静默 miss（事件不富化），本测试钉死「命中富化 / 未命中丢弃」。
+use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};

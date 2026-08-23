@@ -1,8 +1,8 @@
 //! Wiring tests: the columnar batch-filter masks on [`RuleExecutor`] must match
 //! the per-event interpreted filter path bit-for-bit (below `2^53`, where the
 //! native-i64 dispatch is identical to the f64 path).
-
 use std::sync::Arc;
+
 
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};

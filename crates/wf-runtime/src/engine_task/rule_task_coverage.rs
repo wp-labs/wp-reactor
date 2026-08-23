@@ -8,6 +8,7 @@
 //! - `alias_accepts`: 列式 mask 命中与未命中。
 //! - `RuleTask` 轻量路径: `scan_timeouts` / `flush` 无 machine 早退,
 //!   `process_push` ack progress slot。
+use std::sync::Arc;
 
 use super::*;
 
@@ -135,7 +136,7 @@ fn output_record(target: &str, yield_fields: Vec<(Arc<str>, Value)>) -> OutputRe
         yield_fields,
         yield_field_types: Arc::new([]),
         event_time_nanos: 1_700_000_000_000_000_000,
-        machine_id: String::new(),
+        machine_id: Arc::from(""),
         scope_key: Arc::from("k=v"),
     }
 }

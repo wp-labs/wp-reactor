@@ -1,9 +1,9 @@
 //! StatsTask 接线测试（P1 步骤④c）: push 路径端到端——批次投递 → 列式归并 →
 //! 固定窗口 close → alert; 窗口语义（单窗口/flush/跨窗口跳变）; ack floor;
 //! 非列式 where 回退行式。
+use std::sync::Arc;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 

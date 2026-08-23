@@ -47,9 +47,9 @@
 //!           共享分档参考）/ distinct（4× DistinctKey 插入/行）
 //!     实测: 行式 450 ns/evt → 列式 115 ns/evt（3.9×）; 列式相对 CEP 生产路径 ~3×,
 //!     理论下限 ≈ distinct 87 ns/evt（distinct 每行哈希不可回避）。
+use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampNanosecondArray};

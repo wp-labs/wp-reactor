@@ -12,9 +12,9 @@
 //!   baseline : advance + execute_match_with_joins（完整事件处理）
 //!   advance  : CepStateMachine::advance_at（状态机推进：key 提取/实例维护/step 求值）
 //!   exec     : execute_match_with_joins（eval context + join + alert 构建）
+use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wf_lang::ast::{Expr, FieldRef, JoinMode};

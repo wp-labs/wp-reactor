@@ -2,9 +2,9 @@
 //! (`execute_each_direct` → `AlertColumnBuilder` staging) must produce
 //! byte-equivalent rows to the record path
 //! (`execute_each_with_joins` → `OutputRecord` → `append_record`).
+use std::sync::Arc;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use wf_lang::ast::{BinOp, Expr, FieldRef, JoinMode};
 use wf_lang::plan::{EachPlan, JoinCondPlan, JoinPlan, YieldField};

@@ -127,7 +127,11 @@ pub(super) fn build_wfx_id(
     hasher.update(rule_name.as_bytes());
     hasher.update(b"\x00");
     for v in scope_key {
-        hasher.update(value_to_string(v).as_bytes());
+        // 2026-08-23：scope_key 直接 hash Value 的规范字节（Number → f64 LE
+        // bits、Str → bytes），免 value_to_string 渲染 + String 分配——q6 等
+        // join-then-key 每事件 emit 的分配热点之一。wfx_id 无字节级锚定
+        // （测试仅断言 16 hex 格式与同输入稳定性），输出 ID 语义不变。
+        hash_value_bytes(&mut hasher, v);
         hasher.update(b"\x1f");
     }
     hasher.update(b"\x00");
@@ -146,6 +150,19 @@ pub(super) fn build_wfx_id(
     let hash = hasher.finalize();
     // 8 bytes → 16 hex characters
     hex_encode(&hash.to_le_bytes())
+}
+
+/// Hash a [`Value`]'s canonical bytes for wfx_id (see [`build_wfx_id`]).
+/// Number hashes the f64 bits — byte-stable per value (same input → same ID),
+/// and distinct values stay distinct (f64 bits are injective).
+fn hash_value_bytes(hasher: &mut Fnv1a, v: &Value) {
+    match v {
+        Value::Number(n) => hasher.update(&n.to_bits().to_le_bytes()),
+        Value::Str(s) => hasher.update(s.as_bytes()),
+        Value::Bool(b) => hasher.update(&[*b as u8]),
+        Value::Array(_) => hasher.update(b"[array]"),
+        Value::Object(_) => hasher.update(b"[object]"),
+    }
 }
 
 /// wfx_id 核心：FNV-1a(rule_name \x00 event_time_nanos(LE) \x00 \x00 origin)。

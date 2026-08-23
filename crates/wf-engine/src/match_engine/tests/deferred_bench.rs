@@ -12,9 +12,9 @@
 //!
 //! 与 interval_bench 一致，lookup 替身模拟「索引已按 key 过滤」的 O(1) 读路径——
 //! 对比的是 join/挂起/到期评估逻辑本身。
+use std::sync::Arc;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wf_lang::ast::{

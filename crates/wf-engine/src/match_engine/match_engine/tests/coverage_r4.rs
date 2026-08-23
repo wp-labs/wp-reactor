@@ -13,9 +13,9 @@
 //! - expiry scans: stale candidates, session re-queue, skip-non-alerting,
 //!   conv filtering, close_all, memory recalibration
 //! - plumbing accessors and `extract_event_time` from a configured time field
+use std::sync::Arc;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use wf_lang::ast::{CloseMode, CmpOp, Expr, FieldRef, MatchMode, Measure};

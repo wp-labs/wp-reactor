@@ -4,9 +4,9 @@
 //! (qualified-close alert building, direct batch columnar field resolution,
 //! step-stage annotation), and `executor/each_exec.rs` (on-each filter / joins /
 //! `where` / error lanes and the direct-write batch path).
+use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::Int64Array;
@@ -539,13 +539,13 @@ fn where_ok_and_machine_id_and_scope_key() {
 
     // build_machine_id: empty → rule name, else passthrough.
     let m1 = exec2.build_machine_id("");
-    assert_eq!(m1, "w2");
+    assert_eq!(m1.as_ref(), "w2");
     let m2 = exec2.build_machine_id("host-1");
-    assert_eq!(m2, "host-1");
+    assert_eq!(m2.as_ref(), "host-1");
 
     // build_scope_key renders `name=value` pairs.
     let sk = exec2.build_scope_key(&[simple_key("sip")], &[str_val("10.0.0.1")]);
-    assert_eq!(sk, "sip=10.0.0.1");
+    assert_eq!(sk.as_ref(), "sip=10.0.0.1");
 }
 
 // ---------------------------------------------------------------------------
@@ -1465,7 +1465,7 @@ fn build_each_alert_with_deferred_origin() {
         (crate::match_engine::MACHINE_ID, str_val("mid-1")),
     ]);
     let rec = exec.execute_each(&ev, 1000).unwrap().expect("record");
-    assert_eq!(rec.machine_id, "mid-1");
+    assert_eq!(rec.machine_id.as_ref(), "mid-1");
     assert_eq!(rec.scope_key.as_ref(), "each_r");
     // machine_id_of reads the same extraction helper.
     assert_eq!(RuleExecutor::machine_id_of(&ev), "mid-1");
@@ -1530,7 +1530,7 @@ fn execute_match_yield_kinds_and_coercion_omission() {
     let mut matched2 = matched;
     matched2.machine_id = "m".into();
     let rec2 = exec.execute_match_at(&matched2, 1234).unwrap();
-    assert_eq!(rec2.machine_id, "m");
+    assert_eq!(rec2.machine_id.as_ref(), "m");
 }
 
 #[test]

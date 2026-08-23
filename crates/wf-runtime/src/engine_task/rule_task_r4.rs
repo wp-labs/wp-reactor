@@ -15,6 +15,7 @@
 //! - deferred-only 规则 `scan_timeouts` watermark 推进后扫描。
 //! - `PipeBatchStager` 事件时间字段为 Null 列 + Timestamp 列非数值分支;
 //!   `value_to_json` Object 成功路径。
+use std::sync::Arc;
 
 use super::*;
 
@@ -317,7 +318,7 @@ fn record_with(target: &str, event_time_nanos: i64) -> OutputRecord {
         yield_fields: vec![(Arc::from("sip"), Value::Str("1.2.3.4".into()))],
         yield_field_types: Vec::new().into(),
         event_time_nanos,
-        machine_id: String::new(),
+        machine_id: Arc::from(""),
         scope_key: "".into(),
     }
 }

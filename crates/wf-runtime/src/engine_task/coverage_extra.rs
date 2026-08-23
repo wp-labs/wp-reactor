@@ -3,10 +3,10 @@
 //! 覆盖点:
 //! - `register_notifications` / `wait_any`: 通知注册辅助函数。
 //! - `run_rule_task` push 通道关闭路径（channel 关闭 → drain + flush → Ok）。
+use std::sync::Arc;
 
 use super::*;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Notify, mpsc, watch};

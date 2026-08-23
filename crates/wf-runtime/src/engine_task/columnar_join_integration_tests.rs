@@ -2,9 +2,9 @@
 //! 列式 each+join 路径（`execute_each_direct_batch_columnar_join`）必须与行式
 //! 路径（`execute_each_direct_batch`）输出逐位一致——包括 join 命中/miss、
 //! 后置 where 过滤、右窗字段读（yield/where）。
+use std::sync::Arc;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};

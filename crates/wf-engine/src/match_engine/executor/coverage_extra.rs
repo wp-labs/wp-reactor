@@ -7,9 +7,9 @@
 //! contexts / events, focusing on the error paths, boundary conditions, and
 //! configuration branches that the equivalence-focused tests in
 //! `tests/executor/` do not reach.
+use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
@@ -531,18 +531,20 @@ fn build_machine_id_and_scope_key_edge_cases() {
         Expr::Field(FieldRef::Simple("sip".into())),
     );
     let exec = RuleExecutor::new(plan);
-    assert_eq!(exec.build_machine_id(""), "empty_mid");
-    assert_eq!(exec.build_machine_id("m1"), "m1");
+    assert_eq!(exec.build_machine_id("").as_ref(), "empty_mid");
+    assert_eq!(exec.build_machine_id("m1").as_ref(), "m1");
     // Zero keys → empty scope key string.
-    assert_eq!(exec.build_scope_key(&[], &[]), "");
+    assert_eq!(exec.build_scope_key(&[], &[]).as_ref(), "");
     // Key with a numeric value renders via value_to_string.
     assert_eq!(
-        exec.build_scope_key(&[simple_key("dport")], &[num(443.0)]),
+        exec.build_scope_key(&[simple_key("dport")], &[num(443.0)])
+            .as_ref(),
         "dport=443"
     );
     // Mismatched lengths zip silently.
     assert_eq!(
-        exec.build_scope_key(&[simple_key("a"), simple_key("b")], &[num(1.0)]),
+        exec.build_scope_key(&[simple_key("a"), simple_key("b")], &[num(1.0)])
+            .as_ref(),
         "a=1"
     );
 }

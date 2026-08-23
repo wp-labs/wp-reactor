@@ -6,6 +6,7 @@
 //! - `process_batch_from` 非固定窗口（sliding/session）整批退化归并分支。
 //! - `emit_close_record`: 中间流目标丢弃 / 未达标（event_ok=false）无输出。
 //! - `dispatch_columns`: 通道 Full（回退阻塞投递）/ Closed（丢弃）/ 无 sink。
+use std::sync::Arc;
 
 use super::*;
 
@@ -214,7 +215,7 @@ fn record_with(target: &str) -> OutputRecord {
         yield_fields: vec![(Arc::from("id"), Value::Number(7.0))],
         yield_field_types: Vec::new().into(),
         event_time_nanos: 100,
-        machine_id: String::new(),
+        machine_id: Arc::from(""),
         scope_key: "".into(),
     }
 }

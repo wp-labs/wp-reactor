@@ -15,9 +15,9 @@
 //!   schema-fallback `field_value` lane
 //! - `JoinRow::Event` field access and `columnar_timestamped_join_rows`
 //!   null-timestamp skip
+use std::sync::Arc;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float64Array, Int64Array, LargeListArray,

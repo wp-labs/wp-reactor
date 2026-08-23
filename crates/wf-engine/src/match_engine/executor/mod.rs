@@ -598,11 +598,14 @@ impl RuleExecutor {
         coerce_yield_value(name, field_type, value)
     }
 
-    pub(crate) fn build_machine_id(&self, machine_id: &str) -> String {
+    pub(crate) fn build_machine_id(&self, machine_id: &str) -> Arc<str> {
         if machine_id.is_empty() {
-            self.plan.name.clone()
+            // 热路径（q6 等无自定义 machine_id）：直接 Arc 复用 rule 名——
+            // OutputRecord.machine_id 由 String 改 Arc<str> 后免每事件 String
+            // clone + 堆分配（sample: String::clone 9+7+5）。
+            Arc::clone(&self.output_static().rule_name)
         } else {
-            machine_id.to_string()
+            Arc::from(machine_id)
         }
     }
 
@@ -610,18 +613,23 @@ impl RuleExecutor {
         &self,
         keys: &[wf_lang::ast::FieldRef],
         scope_values: &[crate::match_engine::match_engine::Value],
-    ) -> String {
-        keys.iter()
-            .zip(scope_values.iter())
-            .map(|(k, v)| {
-                format!(
-                    "{}={}",
-                    crate::match_engine::match_engine::field_ref_name(k),
-                    crate::match_engine::match_engine::value_to_string(v)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",")
+    ) -> Arc<str> {
+        use std::fmt::Write as _;
+        // 单 String 一次写入（旧实现每 key 一个 format! String + Vec + join
+        // → 每事件 2 次分配 + Vec 分配；q6 每事件 emit 路径的分配热点之一）。
+        let mut out = String::with_capacity(scope_values.len() * 16);
+        for (i, (k, v)) in keys.iter().zip(scope_values.iter()).enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let _ = write!(
+                out,
+                "{}={}",
+                crate::match_engine::match_engine::field_ref_name(k),
+                crate::match_engine::match_engine::value_to_string(v)
+            );
+        }
+        Arc::from(out)
     }
 
     pub fn event_matches_alias(

@@ -139,7 +139,7 @@ pub struct OutputRecord {
     pub event_time_nanos: i64,
     /// Machine identifier extracted from matched event (metrics-only, not yielded).
     #[serde(skip)]
-    pub machine_id: String,
+    pub machine_id: Arc<str>,
     /// State-machine scope key, formatted as `k1=v1,k2=v2` (metrics-only).
     #[serde(skip)]
     pub scope_key: Arc<str>,
@@ -696,7 +696,7 @@ mod tests {
                 ("risk_context".into(), FieldType::Object),
             ]),
             event_time_nanos: 0,
-            machine_id: String::new(),
+            machine_id: Arc::from(""),
             scope_key: "".into(),
         };
 
@@ -750,7 +750,7 @@ mod tests {
             )],
             yield_field_types: Vec::new().into(),
             event_time_nanos: 0,
-            machine_id: String::new(),
+            machine_id: Arc::from(""),
             scope_key: "".into(),
         };
 
@@ -781,7 +781,7 @@ mod tests {
             ],
             yield_field_types: Vec::new().into(),
             event_time_nanos: 0,
-            machine_id: String::new(),
+            machine_id: Arc::from(""),
             scope_key: "".into(),
         };
 
@@ -885,7 +885,7 @@ mod tests {
                 FieldType::Array(BaseType::Float),
             )]),
             event_time_nanos: 0,
-            machine_id: String::new(),
+            machine_id: Arc::from(""),
             scope_key: "".into(),
         };
 
@@ -918,7 +918,7 @@ mod tests {
                 FieldType::Array(BaseType::Chars),
             )]),
             event_time_nanos: 0,
-            machine_id: String::new(),
+            machine_id: Arc::from(""),
             scope_key: "".into(),
         };
 
@@ -955,7 +955,7 @@ mod tests {
                 FieldType::Object,
             )]),
             event_time_nanos: 0,
-            machine_id: String::new(),
+            machine_id: Arc::from(""),
             scope_key: "".into(),
         };
 
@@ -996,7 +996,7 @@ mod tests {
                 ("sha".into(), FieldType::Base(BaseType::Hex)),
             ]),
             event_time_nanos: 0,
-            machine_id: String::new(),
+            machine_id: Arc::from(""),
             scope_key: "".into(),
         };
 

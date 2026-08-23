@@ -1,8 +1,8 @@
 //! Post-join `where` integration tests (wf-runtime): join enrichment + strict
 //! where filter across the real RuleTask + window path (q3/q20 pattern).
+use std::sync::Arc;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};

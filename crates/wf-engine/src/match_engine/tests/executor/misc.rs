@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use wf_lang::ast::{BinOp, Expr, FieldRef};
 
 use crate::match_engine::EngineHashMap;
@@ -296,8 +297,8 @@ fn build_machine_id_and_scope_key() {
         Expr::Field(FieldRef::Qualified("e".to_string(), "sip".to_string())),
     );
     let exec = RuleExecutor::new(plan);
-    assert_eq!(exec.build_machine_id(""), "test_rule");
-    assert_eq!(exec.build_machine_id("10.0.0.1"), "10.0.0.1");
+    assert_eq!(exec.build_machine_id("").as_ref(), "test_rule");
+    assert_eq!(exec.build_machine_id("10.0.0.1").as_ref(), "10.0.0.1");
     assert_eq!(
         exec.build_scope_key(
             &[
@@ -305,7 +306,8 @@ fn build_machine_id_and_scope_key() {
                 FieldRef::Simple("user".to_string())
             ],
             &[Value::Str("10.0.0.1".into()), Value::Str("admin".into())],
-        ),
+        )
+        .as_ref(),
         "sip=10.0.0.1,user=admin"
     );
 }

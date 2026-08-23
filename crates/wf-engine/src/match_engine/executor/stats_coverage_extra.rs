@@ -3,9 +3,9 @@
 //! normalization edges, bucket-unit parsing, unknown bucket-key functions,
 //! top-N non-numeric keys, the `KeyColumn::Other` columnar fallback, and
 //! out-of-range row-subset indices.
+use std::sync::Arc;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};

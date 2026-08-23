@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use wf_lang::ast::{BinOp, Expr, FieldRef};
 use wf_lang::plan::EachPlan;
 

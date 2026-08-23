@@ -11,9 +11,9 @@
 //! - `build_eval_context` narrow build requesting the `_bind_<alias>_count`
 //!   synthetic field by its full name, and a step whose
 //!   `satisfied_branch_index` is out of range (no `_step_*_source`).
+use std::sync::Arc;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{ArrayRef, StringArray};

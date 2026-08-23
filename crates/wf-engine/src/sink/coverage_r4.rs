@@ -189,7 +189,7 @@ fn sample_output_record() -> OutputRecord {
         yield_fields: vec![("count".into(), Value::Number(3.0))],
         yield_field_types: Arc::from([]),
         event_time_nanos: 0,
-        machine_id: String::new(),
+        machine_id: Arc::from(""),
         scope_key: Arc::from(""),
     }
 }

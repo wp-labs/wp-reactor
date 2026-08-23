@@ -34,7 +34,7 @@
 | Q3 | match+join+where | 18.9M | 1.3GB | 4.1× | |
 | Q4 | join-then-key+close avg | 3.09M | 7.3GB | 5.4× | 批级 join-then-key 后 2.66M→3.09M（+16%，A/B 同负载） |
 | Q5 | fixed 10s+conv top | 4.3M | 3.0GB | 15.3× | |
-| Q6 | join-then-key 滑动 avg | **0.5M** | 7.6GB | — | 旧值 3.9M 过期：26M EMIT（87% bid 每事件 emit）单核 106%，emit 路径为瓶颈 |
+| Q6 | join-then-key 滑动 avg | **0.55M** | 7.6GB | — | 26M EMIT 每事件 emit 路径（CPU ~106% 单核）；F8 后 0.50→0.55M（分配削减） |
 | Q7 | fixed 10s max+conv top | **1.2M** | 4.4GB | 4.1× | 全表最低绝对 EPS |
 | Q8 | deferred exists | 21.1M | 1.3GB | 6.3× | |
 | Q9 | deferred reduce | 13.2M | 2.8GB | 35.2× | |
@@ -401,3 +401,38 @@ yield + join 富化），非 advance。
 
 **正确性**：`rule_task_key_join_tests`（3 用例：int 热点重复/miss、null+miss、float
 截断复核）逐行对拍两条路径 StepResult 序列一致；全量回归 2565 tests 绿。
+
+### 8.6 match 每事件 emit 路径分配削减（F8，2026-08-23）
+
+**背景**：q6 26M EMIT 的单核瓶颈（CPU ~106%，join-then-key 无法分片）中，
+`execute_match_with_joins` 与 advance 对半（4s sample：1089 vs 1076 叶子采样）。
+sample「Total number in stack」显示**分配器占压倒性比例**（mi_free/mi_malloc/
+arena ~40%）——q6 每事件 ~10 次分配，26M 事件 ≈ 2.6 亿次分配/释放。
+
+**实现**（确定性分配削减，逐项微基准验证）：
+- yield 字段 Vec 预分配（`Vec::with_capacity(fields.len())` 替换
+  `from_iter` 渐进扩容——sample 热点 spec_from_iter；match_exec/close_exec 两处）；
+- `build_eval_context` 预容量 HashMap（`with_capacity_and_hasher`——hashbrown
+  fallible_with_capacity 采样热点）；
+- `OutputRecord.machine_id` String → Arc<str>，`build_machine_id` 空 id 直接
+  Arc 复用 rule 名（sample 热点 String::clone——q6 每事件 22 字符堆分配）；
+- `build_scope_key` 单 String 一次写入（旧实现每 key format! + Vec + join
+  → 每事件 2 次分配 + Vec 分配），返回 Arc<str>；
+- `build_wfx_id` scope_key 直接 hash Value 规范字节（Number → f64 LE bits，
+  免 value_to_string 渲染 + String 分配；wfx_id 无字节级锚定，测试仅断言
+  16 hex 格式与同输入稳定性）。
+
+**微基准（`nexmark_hotpath_bench::q6_match_emit`，N=500k，q6 形状：
+live_joins 空 + score 常量 + yield 读左窗）**：
+
+| 分量 | 优化前 | 优化后 | 变化 |
+|---|---|---|---|
+| q6 match emit 全路径 | 1294.7 | ~1055 | **-18%** |
+| q6 build_match_alert | 693.9 | **502.8** | **-27.5%** |
+| q6 build ctx（窄化） | 202.6 | ~200 | 持平 |
+
+q13 match+join emit（同路径）顺带 -12%。
+
+**30M 实测**：q6 0.50M → **0.55M**（EPS 492k→578k 区间，load 6-8 波动 ±10%）；
+全量回归 2565 tests 绿。剩余瓶颈：ctx HashMap 构建（~200ns）+ advance sliding
+（~800ns）+ 单核串行（join-then-key 无法分片，v1 CONNECTIONS=1 结论）。

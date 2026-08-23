@@ -3,9 +3,9 @@
 //! `value_at` lane, the `batch()`/`row()` accessors, list/struct cells with
 //! null children, empty-batch join-row builders, and structured-JSON cells
 //! that contain JSON `null` (dropped, matching `json_to_value`).
+use std::sync::Arc;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, Int64Array, LargeListArray, ListArray, StringArray,

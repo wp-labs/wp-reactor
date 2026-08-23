@@ -9,9 +9,9 @@
 //! - `execute_close_direct_batch_columnar` literal **Bool / StringLit** const
 //!   columns, and the per-row `stage_yield_cell` error path (untyped object
 //!   with a non-finite number passes coerce, fails at export → `failed++`).
+use std::sync::Arc;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use wf_lang::ast::{CloseMode, CmpOp, Expr, FieldRef, MatchMode, Measure};
 use wf_lang::plan::{

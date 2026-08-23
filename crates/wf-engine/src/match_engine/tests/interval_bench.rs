@@ -9,9 +9,9 @@
 //!
 //! 三条路径都通过「索引已按 key 过滤」的 lookup 替身（`join_lookup`/`asof_candidates`
 //! 直接返回候选），等价真实 buffer hash index 的 O(1) 读路径——对比的是 join 逻辑本身。
+use std::sync::Arc;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wf_lang::ast::{Bound, BoundVal, Expr, FieldRef, JoinMode, WithinSpec};

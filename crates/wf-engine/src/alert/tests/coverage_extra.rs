@@ -6,8 +6,8 @@
 //! `take_staged`).
 //!
 //! Only test code lives here — no production logic is modified.
-
 use std::sync::Arc;
+
 
 use chrono::Timelike;
 use wf_lang::{BaseType, FieldType};
@@ -364,7 +364,7 @@ fn sample_record(origin: AlertOrigin, yield_fields: Vec<(Arc<str>, Value)>) -> O
             (Arc::from("price"), FieldType::Base(BaseType::Float)),
         ]),
         event_time_nanos: 0,
-        machine_id: String::new(),
+        machine_id: Arc::from(""),
         scope_key: Arc::from(""),
     }
 }

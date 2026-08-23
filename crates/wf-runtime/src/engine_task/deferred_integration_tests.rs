@@ -1,9 +1,9 @@
 //! P3 deferred join（`emit at`）端到端测试（wf-runtime）：Q9 形状——auction 驱动流
 //! 挂起 → bid 注入右窗 → 事件时间 watermark 推进到 expiry → 到期评估输出胜者；
 //! 无 bid 不输出；EOS flush 触发剩余挂起实例。
+use std::sync::Arc;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};

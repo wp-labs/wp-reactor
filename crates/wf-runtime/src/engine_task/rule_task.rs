@@ -3279,7 +3279,7 @@ mod debug_stats_tests {
             yield_fields: Vec::new(),
             yield_field_types: Vec::new().into(),
             event_time_nanos: 0,
-            machine_id: String::new(),
+            machine_id: Arc::from(""),
             scope_key: "".into(),
         }
     }
@@ -3354,7 +3354,7 @@ mod pipe_stager_tests {
             yield_fields,
             yield_field_types: Vec::new().into(),
             event_time_nanos,
-            machine_id: String::new(),
+            machine_id: Arc::from(""),
             scope_key: "".into(),
         }
     }

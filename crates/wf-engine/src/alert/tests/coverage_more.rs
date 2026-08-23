@@ -11,8 +11,8 @@
 //! - `OutputRecord`'s derived `serde::Serialize` (skipped fields stay out);
 //! - `export_yield_f64` fallbacks to Ip / Hex targets (error lanes);
 //! - `to_data_record` with untyped yield values.
-
 use std::sync::Arc;
+
 
 use wf_lang::{BaseType, FieldType};
 use wp_model_core::model::{DataRecord, DataType, Field, FieldStorage, Value as ModelValue};
@@ -197,7 +197,7 @@ fn to_data_record_untyped_yield_lanes() {
         ],
         yield_field_types: Arc::from([]),
         event_time_nanos: 0,
-        machine_id: String::new(),
+        machine_id: Arc::from(""),
         scope_key: "".into(),
     };
     let record = output.to_data_record().expect("record");

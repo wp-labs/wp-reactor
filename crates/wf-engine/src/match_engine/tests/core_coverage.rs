@@ -6,9 +6,9 @@
 //! conv, and the inline-contract harness failure branches.
 //!
 //! Only test code lives here — no production logic is modified.
+use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
@@ -1464,8 +1464,8 @@ fn is_aux_bind_alias_and_build_machine_id_helpers() {
     );
     assert!(exec.is_aux_bind_alias("other"), "unused alias is aux");
     // Empty machine id falls back to the rule name.
-    assert_eq!(exec.build_machine_id(""), "r_aux");
-    assert_eq!(exec.build_machine_id("m1"), "m1");
+    assert_eq!(exec.build_machine_id("").as_ref(), "r_aux");
+    assert_eq!(exec.build_machine_id("m1").as_ref(), "m1");
 }
 
 // ===========================================================================

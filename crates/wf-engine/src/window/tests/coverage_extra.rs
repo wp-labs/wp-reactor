@@ -2,8 +2,8 @@
 //! closed-semaphore / reporter branches the main actor suite drives only
 //! indirectly (it always drops the sender, cancels nothing, and passes no
 //! report closure).
-
 use std::sync::Arc;
+
 use std::sync::Mutex;
 use std::time::Duration;
 

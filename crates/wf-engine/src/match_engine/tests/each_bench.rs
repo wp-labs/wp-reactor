@@ -13,9 +13,9 @@
 //!   fired_at : `format_nanos_utc`（cut B：UTC 格式化）
 //!   entity   : `ColumnarEvent::field_value` + `value_to_string`（cut D）
 //!   fill     : `begin_row` + 4×`stage_yield_cell` + `commit_each_row`（cut C）
+use std::sync::Arc;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{ArrayRef, Int64Array, StringArray};

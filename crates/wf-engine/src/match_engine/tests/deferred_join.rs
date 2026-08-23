@@ -1,8 +1,8 @@
 //! P3 deferred join（`emit at`）执行测试：挂起求值、到期 reduce（Q9 maxrow+tie）、
 //! 纯存在（Q8）、空集不输出、label 注入（`winner.bidder` → Path）、origin=deferred。
+use std::sync::Arc;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use wf_lang::ast::{
     Bound, BoundVal, Expr, FieldRef, JoinMode, PathSegment, ReduceMeasure, TieSpec, WithinSpec,

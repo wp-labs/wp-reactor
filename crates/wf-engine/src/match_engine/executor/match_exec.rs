@@ -128,7 +128,7 @@ impl RuleExecutor {
             &matched.step_data,
             &origin,
         );
-        let yield_fields = with_yield_eval_scope(|| {
+        let yield_fields = with_yield_eval_scope(|| -> CoreResult<Vec<(Arc<str>, Value)>> {
             let yield_meta = YieldMeta {
                 score: Some(score),
                 wfx_id: Some(&wfx_id),
@@ -147,46 +147,42 @@ impl RuleExecutor {
                 emit_time_nanos: Some(emit_time_nanos),
                 time_format: Some(self.output_config().time_format.as_str()),
             };
-            // Plan fields, precomputed specs, and precomputed yield kinds are
-            // all index-aligned (see `OutputStatic`) — no per-field name clone,
-            // type-map lookup, or expression re-classification on the hot path.
-            self.plan
+            // 预分配：yield 字段数静态已知——`Vec::from_iter` 对 filter_map
+            // 迭代器无法预知长度，每事件渐进扩容（nexmark_hotpath 采样热点
+            // spec_from_iter；q6 26M 每事件 emit）。结果顺序与语义不变。
+            let mut out = Vec::with_capacity(self.plan.yield_plan.fields.len());
+            for ((field, (name, field_type)), kind) in self
+                .plan
                 .yield_plan
                 .fields
                 .iter()
                 .zip(self.output_static().yield_specs.iter())
                 .zip(self.output_static().yield_kinds.iter())
-                .map(|((field, (name, field_type)), kind)| {
-                    let value = match kind {
-                        YieldKind::Lit(v) => v.clone(),
-                        YieldKind::Field => {
-                            let Expr::Field(fr) = &field.value else {
-                                unreachable!("YieldKind::Field implies an Expr::Field value")
-                            };
-                            // Missing field falls back to an empty string,
-                            // exactly like the interpreter wrapper.
-                            eval_field_value(&ctx.fields, fr)
-                                .unwrap_or_else(|| Value::Str(SmolStr::default()))
-                        }
-                        YieldKind::General => {
-                            eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
-                                .expect("eval_yield_expr_with_meta never returns None")
-                        }
-                    };
-                    let Some(value) = RuleExecutor::coerce_yield_field_value_with(
-                        name,
-                        field_type.as_ref(),
-                        value,
-                    )?
-                    else {
-                        // Optional input field was missing → omit it from the
-                        // output record (wp-labs/warp-fusion#62).
-                        return Ok(None);
-                    };
-                    Ok(Some((Arc::clone(name), value)))
-                })
-                .filter_map(Result::transpose)
-                .collect::<CoreResult<Vec<_>>>()
+            {
+                let value = match kind {
+                    YieldKind::Lit(v) => v.clone(),
+                    YieldKind::Field => {
+                        let Expr::Field(fr) = &field.value else {
+                            unreachable!("YieldKind::Field implies an Expr::Field value")
+                        };
+                        // Missing field falls back to an empty string,
+                        // exactly like the interpreter wrapper.
+                        eval_field_value(&ctx.fields, fr)
+                            .unwrap_or_else(|| Value::Str(SmolStr::default()))
+                    }
+                    YieldKind::General => eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
+                        .expect("eval_yield_expr_with_meta never returns None"),
+                };
+                let Some(value) =
+                    RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)?
+                else {
+                    // Optional input field was missing → omit it from the
+                    // output record (wp-labs/warp-fusion#62).
+                    continue;
+                };
+                out.push((Arc::clone(name), value));
+            }
+            Ok(out)
         })?;
 
         let machine_id = self.build_machine_id(&matched.machine_id);
@@ -209,7 +205,7 @@ impl RuleExecutor {
             yield_field_types: Arc::clone(&statics.yield_field_types),
             event_time_nanos: matched.event_time_nanos,
             machine_id,
-            scope_key: Arc::from(scope_key),
+            scope_key,
         })
     }
 }

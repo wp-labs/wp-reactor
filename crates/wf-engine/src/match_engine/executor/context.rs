@@ -62,7 +62,15 @@ pub(crate) fn build_eval_context(
     trigger_event: Option<&Event>,
     needed: &CloseCtxFields,
 ) -> Event {
-    let mut fields = EngineHashMap::default();
+    // 预容量：q6 每事件 emit 的 ctx 构建（微基准 202ns/evt）中 hashbrown 渐进
+    // 扩容是分配热点（sample: fallible_with_capacity）。容量 = 键数 + 输出
+    // 读取字段数（Named 窄化下即 needed 集合；All 保守 8）——一次分配到位。
+    let cap = keys.len()
+        + match needed {
+            CloseCtxFields::All => 8,
+            CloseCtxFields::Named(set) => set.len().saturating_add(1),
+        };
+    let mut fields = EngineHashMap::with_capacity_and_hasher(cap, Default::default());
     let all = needed.is_all();
 
     // Key fields — preserve original Value type

@@ -12,8 +12,8 @@
 //!   - field_lookup：仅 HashMap 字段提取（guard 内 `auction` 读取的裸成本）
 //!
 //! delta = q2_filter − no_filter 即 guard 表达式的增量开销。
-
 use std::sync::Arc;
+
 use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, Int64Array};
