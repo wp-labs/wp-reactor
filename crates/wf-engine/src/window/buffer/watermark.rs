@@ -129,6 +129,10 @@ impl Window {
             let delay = self.config.watermark.as_duration().as_nanos() as i64;
             let candidate = max_event_time.saturating_sub(delay);
             self.watermark_nanos.fetch_max(candidate, Ordering::AcqRel);
+            // Raw max event time (before the watermark delay) — the global data
+            // tail the rule task needs at flush (see `max_event_time_nanos`).
+            self.max_event_time_nanos
+                .fetch_max(max_event_time, Ordering::AcqRel);
         }
 
         let seq = match (parsed_events, byte_size) {
@@ -154,6 +158,14 @@ impl Window {
     /// Current watermark in nanoseconds.
     pub fn watermark_nanos(&self) -> i64 {
         self.watermark_nanos.load(Ordering::Acquire)
+    }
+
+    /// Raw max event time seen on append, **before** the watermark delay is
+    /// subtracted (i64::MIN when no time-stamped batch has been appended).
+    /// This is the true global data tail — distinct from [`Self::watermark_nanos`]
+    /// which lags it by the configured watermark delay.
+    pub fn max_event_time_nanos(&self) -> i64 {
+        self.max_event_time_nanos.load(Ordering::Acquire)
     }
 
     /// Test-only setter for the event-time watermark, so time-eviction tests

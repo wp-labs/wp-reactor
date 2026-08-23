@@ -1377,12 +1377,8 @@ impl CepStateMachine {
         keys.sort_by(|(k1, t1), (k2, t2)| t1.cmp(t2).then_with(|| k1.cmp(k2)));
         let mut results = Vec::with_capacity(keys.len());
         let wm = self.watermark_nanos;
-        // HOP/Fixed 窗口的收口尺寸（w_end = created_at + size）；sliding/session
+        // HOP/Fixed 窗口的收口尺寸（w_end = created_at + size）；sliding
         // 无窗口完整性概念，全部收口。
-        let window_size_ns: Option<i64> = match self.plan.window_spec {
-            WindowSpec::Hop { size, .. } | WindowSpec::Fixed(size) => Some(size.as_nanos() as i64),
-            _ => None,
-        };
         for (key, _) in keys {
             if let Some(instance) = self.remove_instance(&key) {
                 // P1②: close_all is a permanent remove — release each slot.
@@ -1390,10 +1386,23 @@ impl CepStateMachine {
                 // 尾部未完整窗口：释放实例但不输出（oracle/Flink 语义）。
                 // wm ≤ 0 表示无事件时间推进（空流/测试直接 close_all）——
                 // 不适用窗口完整性判定，保留旧行为（全部收口）。
-                if wm > 0
-                    && let Some(size_ns) = window_size_ns
-                    && instance.created_at.saturating_add(size_ns) > wm
-                {
+                // 2026-08-23 q11 修复：session 同源——会话到期 = 最后事件时间
+                // + gap（随事件延长），尾部未超时会话（last_event + gap > wm）
+                // 释放实例但不发射（Q11 10M 实测多 204/197095≈0.1%）。
+                let incomplete = wm > 0
+                    && match &self.plan.window_spec {
+                        WindowSpec::Hop { size, .. } | WindowSpec::Fixed(size) => {
+                            instance.created_at.saturating_add(size.as_nanos() as i64) > wm
+                        }
+                        WindowSpec::Session(gap) => {
+                            instance
+                                .last_event_nanos
+                                .saturating_add(gap.as_nanos() as i64)
+                                > wm
+                        }
+                        _ => false,
+                    };
+                if incomplete {
                     continue;
                 }
                 let mut output = evaluate_close(

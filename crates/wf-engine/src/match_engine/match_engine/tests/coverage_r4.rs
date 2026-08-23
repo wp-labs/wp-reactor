@@ -915,6 +915,47 @@ fn close_all_sorted_and_clears_heaps() {
 }
 
 #[test]
+fn close_all_session_skips_tail_unexpired_sessions() {
+    // 2026-08-23 q11 修复：session 尾部未超时会话（last_event + gap > wm）
+    // 释放实例但不发射（oracle/Flink 事件时间到末尾即止）。
+    let mut plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+    );
+    plan.window_spec = WindowSpec::Session(Duration::from_secs(60));
+    let mut sm = CepStateMachine::new("r".into(), plan, None);
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    sm.advance_at("e", &e, 0);
+    sm.advance_at("e", &e, 30_000_000_000); // 会话延长 → last_event = 30s
+    assert_eq!(sm.watermark_nanos(), 30_000_000_000);
+    // 尾部会话（30s + 60s gap = 90s > wm 30s）未超时 → 释放但不输出。
+    let outs = sm.close_all(CloseReason::Flush);
+    assert!(outs.is_empty(), "未超时尾部会话不发射");
+    assert_eq!(sm.instance_count(), 0, "实例仍被释放（无泄漏）");
+}
+
+#[test]
+fn close_all_session_emits_sessions_expired_by_watermark() {
+    let mut plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![branch("e", count_ge(1.0))])],
+    );
+    plan.window_spec = WindowSpec::Session(Duration::from_secs(60));
+    let mut sm = CepStateMachine::new("r".into(), plan, None);
+    let e1 = event(vec![("sip", str_val("10.0.0.1"))]);
+    sm.advance_at("e", &e1, 0);
+    sm.advance_at("e", &e1, 30_000_000_000); // last_event = 30s，会话 90s 到期
+    // 另一 key 的事件把 watermark 推到 91s（不刷新 10.0.0.1 的会话）——
+    // 会话已完整（90s ≤ wm 91s）→ close_all 发射。
+    let e2 = event(vec![("sip", str_val("10.0.0.2"))]);
+    sm.advance_at("e", &e2, 91_000_000_000);
+    let outs = sm.close_all(CloseReason::Flush);
+    assert_eq!(outs.len(), 1, "已完整会话在 flush 收口发射");
+    assert_eq!(outs[0].close_reason, CloseReason::Flush);
+    assert_eq!(sm.instance_count(), 0);
+}
+
+#[test]
 fn recalibrate_memory_recomputes_exact_estimate() {
     let mut plan = simple_plan(
         vec![simple_key("sip")],

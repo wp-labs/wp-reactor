@@ -1970,19 +1970,29 @@ impl RuleTask {
         };
         self.cached_wall_nanos
             .store(wall_nanos(), Ordering::Relaxed);
-        // Advance the effective watermark by the wall-clock time elapsed since the
-        // last event was processed — but **capped at one scan interval**. This
-        // lets idle instances expire per their window TTL (window semantics, not
-        // just event-time), while bounding each sweep: a slow/backpressured
-        // pipeline cannot accumulate minutes of wall-clock and snowball into a
-        // huge single expiry sweep that starves push consumption (q5/q6/q7 froze
-        // at ~22-25M appends on 30M data before this cap).
-        let effective_watermark = machine.watermark_nanos().saturating_add(
-            self.last_activity_wall
-                .elapsed()
-                .min(self.timeout_scan_interval)
-                .as_nanos() as i64,
-        );
+        // 2026-08-23 q11 修复：session 窗口是纯事件时间语义（gap = 事件时间
+        // 间隔、会话随事件延长）——墙钟推进会把数据末尾未超时的尾部会话提前
+        // 扫出（10M replay 多 204/197095≈0.1%），与 deferred 分支同源（replay
+        // 对拍依赖事件时间序，墙钟推进会提前触发）。session 不叠加墙钟；
+        // fixed/sliding/hop 保留墙钟兜底（q16 30M 尾桶收口依赖该扫）。
+        let event_watermark = machine.watermark_nanos();
+        let effective_watermark = if matches!(machine.plan().window_spec, WindowSpec::Session(_)) {
+            event_watermark
+        } else {
+            // Advance the effective watermark by the wall-clock time elapsed since the
+            // last event was processed — but **capped at one scan interval**. This
+            // lets idle instances expire per their window TTL (window semantics, not
+            // just event-time), while bounding each sweep: a slow/backpressured
+            // pipeline cannot accumulate minutes of wall-clock and snowball into a
+            // huge single expiry sweep that starves push consumption (q5/q6/q7 froze
+            // at ~22-25M appends on 30M data before this cap).
+            event_watermark.saturating_add(
+                self.last_activity_wall
+                    .elapsed()
+                    .min(self.timeout_scan_interval)
+                    .as_nanos() as i64,
+            )
+        };
         let started = Instant::now();
         // No input batch is being processed here (timeout scan), so the window
         // lookups read the full window (no `max_seq` watermark).
@@ -2164,10 +2174,29 @@ impl RuleTask {
         let (rule_name, closes, routed) = {
             let machine = self.machine.as_mut().expect("checked above");
             let rule_name = machine.rule_name().to_string();
+            // 2026-08-23 q11 修复（分片尾部边界）：机器水位 = 本 shard 最后
+            // 处理行，分片下落后全局数据末尾（尾部几行 bid 的 bidder 在其它
+            // shard）——尾部会话 `last_event+gap ≤ 全局末尾` 的会被 close_all
+            // 误判未完整而跳过（q11 10M 实测少 1/197095≈0.0005%）。用窗口的
+            // raw `max_event_time`（全局末尾）先补扫一次（unbounded，off hot
+            // path），再 close_all 收口剩余（expiry > 全局末尾 的仍跳过）。
+            let machine_wm = machine.watermark_nanos();
+            let final_wm = self
+                .sources
+                .iter()
+                .map(|src| src.window.max_event_time_nanos())
+                .max()
+                .unwrap_or(machine_wm)
+                .max(machine_wm);
             if self.conv_sink.is_some() {
+                let mut extra = Vec::new();
+                if final_wm > machine_wm {
+                    extra = machine.scan_expired_at_skip_non_alerting_unbounded(final_wm);
+                }
                 let raw = machine.close_all(CloseReason::Flush);
-                let watermark = machine.watermark_nanos();
-                let qualifying: Vec<_> = raw.into_iter().filter(close_is_qualified).collect();
+                let watermark = final_wm.max(machine.watermark_nanos());
+                let mut qualifying: Vec<_> = raw.into_iter().filter(close_is_qualified).collect();
+                qualifying.extend(extra.into_iter().filter(close_is_qualified));
                 if let Some(sink) = self.conv_sink.as_ref() {
                     // P3-D: log when the conv stage is gone (drained closes dropped).
                     if sink
@@ -2186,11 +2215,17 @@ impl RuleTask {
                 }
                 (rule_name, Vec::new(), true)
             } else {
-                (
-                    rule_name,
+                let mut closes = Vec::new();
+                if final_wm > machine_wm {
+                    closes = machine.scan_expired_at_with_conv_skip_non_alerting_unbounded(
+                        final_wm,
+                        self.conv_plan.as_ref(),
+                    );
+                }
+                closes.extend(
                     machine.close_all_with_conv(CloseReason::Flush, self.conv_plan.as_ref()),
-                    false,
-                )
+                );
+                (rule_name, closes, false)
             }
         };
         let mut stats = RuleBatchDebugStats::default();

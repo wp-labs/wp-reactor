@@ -24,9 +24,10 @@ use wf_engine::alert::{AlertOrigin, OutputRecord};
 use wf_engine::match_engine::{CepStateMachine, ColumnarEvent, EngineHashMap, RuleExecutor, Value};
 use wf_engine::pipe::PipeRegistry;
 use wf_engine::window::{Router, Window, WindowParams, WindowRegistry};
-use wf_lang::ast::{FieldRef, JoinMode};
+use wf_lang::ast::{CloseMode, CmpOp, Expr, FieldRef, JoinMode, Measure};
 use wf_lang::plan::{
-    EachPlan, JoinCondPlan, JoinPlan, MatchPlan, RulePlan, ScorePlan, WindowSpec, YieldPlan,
+    AggPlan, BranchPlan, EachPlan, JoinCondPlan, JoinPlan, MatchPlan, RulePlan, ScorePlan,
+    StepPlan, WindowSpec, YieldPlan,
 };
 
 use crate::alert_task::{AlertBatch, SinkFanout};
@@ -579,6 +580,135 @@ async fn scan_timeouts_deferred_only_returns_early() {
         ..Spec::default()
     });
     task.scan_timeouts().await;
+}
+
+// ---------------------------------------------------------------------------
+// scan_timeouts — session 不叠加墙钟（2026-08-23 q11 修复）
+// ---------------------------------------------------------------------------
+
+/// on event count>=1 + and close count>=1 的步骤（q11 形态）。
+fn count_branch_step() -> StepPlan {
+    StepPlan {
+        branches: vec![BranchPlan {
+            label: None,
+            source: "b".into(),
+            field: None,
+            guard: None,
+            agg: AggPlan {
+                transforms: vec![],
+                measure: Measure::Count,
+                cmp: CmpOp::Ge,
+                threshold: Expr::Number(1.0),
+            },
+        }],
+    }
+}
+
+/// 带窗口源 + alert 接收的（session/fixed）规则 task。
+#[allow(clippy::type_complexity)]
+fn scan_timeouts_task(
+    window_spec: WindowSpec,
+) -> (RuleTask, mpsc::Receiver<AlertBatch>, Arc<Window>) {
+    let schema = test_schema();
+    let (win, notify) = make_window("auth_events", &schema);
+    let mut plan = minimal_plan();
+    plan.name = "scan_rule".into();
+    plan.match_plan.keys = vec![FieldRef::Simple("sip".into())];
+    plan.match_plan.window_spec = window_spec;
+    plan.match_plan.event_steps = vec![count_branch_step()];
+    plan.match_plan.close_steps = vec![count_branch_step()];
+    plan.match_plan.close_mode = CloseMode::And;
+    plan.match_plan.needs_field_history = true;
+    let machine = CepStateMachine::new(
+        "scan_rule".into(),
+        plan.match_plan.clone(),
+        Some("event_time".into()),
+    );
+    let (alert_tx, alert_rx) = mpsc::channel::<AlertBatch>(64);
+    let task = make_task(Spec {
+        plan,
+        machine: Some(machine),
+        window_sources: vec![crate::engine_task::task_types::WindowSource {
+            window_name: "auth_events".into(),
+            window: win.clone(),
+            notify,
+            aliases: vec!["b".into()],
+        }],
+        sink_fanout: crate::engine_task::tests::make_test_fanout(alert_tx),
+        ..Spec::default()
+    });
+    (task, alert_rx, win)
+}
+
+#[tokio::test]
+async fn scan_timeouts_session_ignores_wall_clock_advance() {
+    // 2026-08-23 q11 修复：session 是纯事件时间语义（gap = 事件时间间隔、
+    // 会话随事件延长）——scan_timeouts 的墙钟推进（+min(elapsed, interval)）
+    // 会把数据末尾未超时的尾部会话提前扫出（10M replay 多 204/197095≈0.1%），
+    // 与 deferred 分支同理（replay 对拍依赖事件时间序）。
+    let (mut task, mut alert_rx, win) =
+        scan_timeouts_task(WindowSpec::Session(std::time::Duration::from_secs(10)));
+    let t = 1_700_000_000_000_000_000i64;
+    win.append(make_batch(&["10.0.0.1"], t)).unwrap();
+    task.pull_and_advance().await;
+    // 会话 last=t，10s 后超时；空闲 61s（cap 60s）的墙钟推进在 session 分支被忽略。
+    task.last_activity_wall = std::time::Instant::now() - std::time::Duration::from_secs(61);
+    task.scan_timeouts().await;
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "session 尾部未超时会话不被墙钟推进扫出"
+    );
+    // flush（close_all 同源修复）同样不发射未超时会话。
+    task.flush().await;
+    assert!(alert_rx.try_recv().is_err(), "flush 也不发射未超时尾部会话");
+}
+
+#[tokio::test]
+async fn scan_timeouts_fixed_still_advances_wall_clock() {
+    // 对照：fixed 窗口保留墙钟推进（q16 30M 尾桶收口依赖该扫）——桶
+    // [t, t+10s) w_end ≤ t+60s → 空闲后 scan_timeouts 把桶收口。
+    let (mut task, mut alert_rx, win) =
+        scan_timeouts_task(WindowSpec::Fixed(std::time::Duration::from_secs(10)));
+    let t = 1_700_000_000_000_000_000i64;
+    win.append(make_batch(&["10.0.0.1"], t)).unwrap();
+    task.pull_and_advance().await;
+    task.last_activity_wall = std::time::Instant::now() - std::time::Duration::from_secs(61);
+    task.scan_timeouts().await;
+    // scan_timeouts 只 append pending（未达 ALERT_BATCH_SIZE 不自动 flush）。
+    task.flush_alerts().await;
+    assert!(
+        alert_rx.try_recv().is_ok(),
+        "fixed 尾桶被墙钟推进扫出（q16 依赖）"
+    );
+}
+
+#[tokio::test]
+async fn flush_complements_tail_sessions_beyond_shard_watermark() {
+    // 2026-08-23 q11 修复（分片尾部边界）：机器水位 = 本 shard 最后处理行，
+    // 分片下落后全局数据末尾（尾部几行 bid 的 bidder 在其它 shard）——尾部
+    // 会话 last_event+gap ≤ 全局末尾 的被 close_all 误判未完整跳过（10M 实测
+    // 少 1）。flush 先用窗口 raw `max_event_time`（全局末尾）补扫再 close_all。
+    let (mut task, mut alert_rx, win) =
+        scan_timeouts_task(WindowSpec::Session(std::time::Duration::from_secs(10)));
+    let t = 1_700_000_000_000_000_000i64;
+    // 本 shard 只处理到 t-5s：会话 [10.0.0.1] last_event=t-5s → expiry t+5s。
+    let machine = task.machine.as_mut().unwrap();
+    let mut fields = EngineHashMap::default();
+    fields.insert("sip".into(), Value::Str("10.0.0.1".into()));
+    machine.advance_at("b", &Event { fields }, t - 5_000_000_000);
+    assert_eq!(machine.watermark_nanos(), t - 5_000_000_000);
+    // 窗口已 append 到 t+5s（其它 shard 的尾部行）→ raw max_event_time = t+5s。
+    // daemon 路径用 append_with_watermark 推进 watermark / max_event_time。
+    win.append_with_watermark(make_batch(&["10.0.0.9"], t + 5_000_000_000))
+        .unwrap();
+    assert_eq!(win.max_event_time_nanos(), t + 5_000_000_000);
+    // flush：补扫（final_wm = t+5s）→ 会话（expiry t+5s ≤ t+5s）发射。
+    task.flush().await;
+    task.flush_alerts().await;
+    assert!(
+        alert_rx.try_recv().is_ok(),
+        "flush 补扫发射尾部完整会话（分片水位落后全局末尾）"
+    );
 }
 
 // ---------------------------------------------------------------------------

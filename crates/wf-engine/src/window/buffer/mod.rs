@@ -281,6 +281,13 @@ pub struct Window {
     next_seq: AtomicU64,
     /// Monotonic event-time watermark (`fetch_max` on append).
     watermark_nanos: AtomicI64,
+    /// Monotonic raw max event time seen on append (`fetch_max`, **before** the
+    /// watermark delay is subtracted). The rule task uses it at flush to know the
+    /// global data tail across shards: a shard's state-machine watermark stops at
+    /// its last processed row, which can lag the true end-of-data (q11 10M:
+    /// 10 shards each stop ~1.8-4.3ms early → a tail session with
+    /// `last_event+gap ≤ global end` was misjudged incomplete and dropped).
+    max_event_time_nanos: AtomicI64,
     /// Aggregate retained content bytes (approximate under concurrency —
     /// exact in the single-writer steady state).
     current_bytes: AtomicUsize,
@@ -327,6 +334,7 @@ impl Window {
             log: RwLock::new(BTreeMap::new()),
             next_seq: AtomicU64::new(0),
             watermark_nanos: AtomicI64::new(i64::MIN),
+            max_event_time_nanos: AtomicI64::new(i64::MIN),
             current_bytes: AtomicUsize::new(0),
             total_rows: AtomicUsize::new(0),
             batch_count: AtomicUsize::new(0),

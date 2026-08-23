@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 
 use crate::window::{
-    EvictionGate, RuleFanout, WINDOW_CHANNEL_DEPTH, Window, WindowAppendReport, WindowMsg,
-    WindowParams, acquire_window_budget, run_window_actor,
+    AppendOutcome, EvictionGate, RuleFanout, WINDOW_CHANNEL_DEPTH, Window, WindowAppendReport,
+    WindowMsg, WindowParams, acquire_window_budget, run_window_actor,
 };
 
 fn test_schema() -> SchemaRef {
@@ -91,6 +91,25 @@ fn appended_values(win: &Arc<Window>) -> Vec<i64> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+#[test]
+fn max_event_time_is_raw_before_watermark_delay() {
+    // 2026-08-23 q11 修复：`max_event_time_nanos` 是全局数据末尾（raw max，
+    // **不**减 watermark delay）——rule_task flush 用它补扫分片尾部边界；
+    // `watermark_nanos` 落后 delay（默认 1s），两者不可混用。
+    let win = make_window("wm");
+    let t = 1_700_000_000_000_000_000i64;
+    let outcome = win
+        .append_with_watermark(make_batch(&test_schema(), t, 1))
+        .unwrap();
+    assert!(matches!(outcome, AppendOutcome::Appended));
+    assert_eq!(win.max_event_time_nanos(), t, "raw max 不减 delay");
+    assert_eq!(
+        win.watermark_nanos(),
+        t - 5_000_000_000,
+        "watermark = max_event_time - 5s delay"
+    );
 }
 
 fn spawn_actor(
