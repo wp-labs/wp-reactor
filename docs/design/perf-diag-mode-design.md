@@ -150,6 +150,26 @@ cut_output = true
   引擎时钟）写一条完整测量记录：
   `perf_sentinel{round=k, n=<N_k>, start_ns=<wfgen T0>, emit_ns=<引擎完成时刻>}`。
   该记录四元组齐备，**EPS 直接可算**：`eps = n / (emit_ns − start_ns)`。
+- **记录输出（文件 sink，bench 配置）**：sentinel 告警走既有 alert 链，由 bench 的
+  `topology/sinks/infra.d/perf_sentinel.toml` 落盘 `data/perf_sentinel.ndjson`
+  （JSONL，一行一条四元组记录）——**wfgen 从该文件读记录**，比从 metrics 流
+  解析干净；`perf_sentinel` 指标仍写，作跨档一致性校验。
+- **记录路径豁免 cut_output**：完成信号不能随输出墙被切——哨兵规则的 emit
+  （metric + 告警落盘）不受 `cut_output` 门控影响（与数据规则区分，见 §4.2）。
+  单批仅 1 条，常数量处理开销，增量抵消。
+
+  ```toml
+  # topology/sinks/infra.d/perf_sentinel.toml（各 bench 一份）
+  [sink_group]
+  name = "perf_sentinel_infra"
+  windows = ["__perf_sentinel"]
+  [[sink_group.sinks]]
+  connect = "file_json_sink"
+  name = "perf_sentinel_out"
+  [sink_group.sinks.params]
+  base = "data"
+  file = "perf_sentinel.ndjson"
+  ```
 - **时钟同一性**：基准同机运行，wfgen 的 `start_ns` 与引擎的 `emit_ns` 同机
   时钟可比（跨机需 NTP 或由引擎侧回写差值，见 §7）。
 - **豁免所有 perf 门控**：cut_rules / cut_output 均不影响 sentinel 窗口与哨兵
@@ -206,7 +226,8 @@ wfgen perf-diag \
   2. 统计本批发送量 `n_k`（帧行数合计）；`T0 = now()`；`send-arrow` 发数据帧，
      帧尾追加 `__perf_sentinel{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq
      尾部，保证最后处理）；
-  3. 轮询 metrics 直到读到 `perf_sentinel{round=k, …}` 的 `emit_ns`；
+  3. 从 `data/perf_sentinel.ndjson` 读到 `round=k` 的记录（含 `emit_ns`）——
+     引擎侧由哨兵规则 emit 落盘；
   4. `EPS_k = n_k / (emit_ns − start_ns)`——**发送量/开始时间来自 sentinel 载荷，
      完成时间来自引擎 emit 记录，全程无外部记账**（delta 口径，跨点窗口残留
      状态不影响）。
@@ -249,8 +270,9 @@ wfgen perf-diag \
 
 1. wf-config：`PerfConfig`（diag/cut_rules/cut_output）+ 解析 + 测试；
 2. wf-runtime：`set_perf_cuts` 原子门控 + `process_batch`/`emit` 切口 + 测试；
-3. wf-runtime：内置 `__perf_sentinel` 窗口/规则 + `perf_sentinel` 指标（`diag=true`
-   时注册）+ 豁免门控测试；
+3. wf-runtime：内置 `__perf_sentinel` 窗口/规则 + `perf_sentinel` 指标 + 告警落盘
+   （走 alert 链、豁免 cut_output）+ 豁免门控测试；bench 侧补
+   `topology/sinks/infra.d/perf_sentinel.toml`（`data/perf_sentinel.ndjson`）；
 4. wf-runtime：诊断点状态机——sentinel emit → 门控翻转 + 规则子集 reload 触发 +
    `perf_point` 切换完成信号（无 admin 端点）；
 5. wf-config：`report_interval` 默认 100ms；
