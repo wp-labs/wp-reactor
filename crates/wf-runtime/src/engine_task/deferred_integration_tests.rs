@@ -421,11 +421,16 @@ async fn deferred_q9_no_bid_no_output() {
     );
 }
 
+/// EOS/关闭 flush 只收口**已到期**实例：尾部 expiry > 最终事件时间 watermark 的
+/// 实例窗口未完成（事件时间域），不输出——与 oracle 一致（oracle/mod.rs EOS
+/// 水位注释：按 slice 边界强扫会多出尾部桶，Q8 实证 82446 → 83274 +828）。
 #[tokio::test]
-async fn deferred_q9_flush_triggers_remaining_pending() {
+async fn deferred_q9_flush_does_not_emit_unexpired_tail() {
     super::tests::init_tracing();
     let (mut task, mut alert_rx, router) = make_deferred_join_task();
 
+    // auction=8（T，expires=T+60s）窗口内有 bid，但无后续事件推进 watermark
+    // → 最终 watermark = T < expiry：尾部未到期，flush 不输出
     bid_window(&router)
         .append(bid_batch(&[(8, 3, 50, T + 10_000_000_000)]))
         .unwrap();
@@ -434,7 +439,44 @@ async fn deferred_q9_flush_triggers_remaining_pending() {
         .unwrap();
     task.pull_and_advance().await;
 
-    // 无后续事件推进 watermark → EOS flush 触发剩余挂起实例
+    task.flush().await;
+
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "尾部未到期实例（expiry > 最终 watermark）flush 不输出"
+    );
+}
+
+/// 已到期实例（expiry ≤ 最终 watermark）由 EOS 重试补出：窗口内 bid 存在、
+/// 但评估发生在 watermark 过 expiry 之后（missed → EOS 重试命中）。
+#[tokio::test]
+async fn deferred_q9_eos_retry_recovers_due_instance() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_deferred_join_task();
+
+    // auction=8 挂起（T，expires=T+60s）；此时 bid 窗口为空 → 到期评估 miss
+    auction_window(&router)
+        .append(auction_batch(&[(8, T, T + 60_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    // auction=9（T+61s）推进 watermark 过 expiry → auction 8 到期，bid 为空 → miss
+    auction_window(&router)
+        .append(auction_batch(&[(
+            9,
+            T + 61_000_000_000,
+            T + 121_000_000_000,
+        )]))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "bid 窗口为空 → 到期 miss，等 EOS 重试"
+    );
+
+    // bid 迟到进入右窗（append 滞后）
+    bid_window(&router)
+        .append(bid_batch(&[(8, 3, 50, T + 10_000_000_000)]))
+        .unwrap();
     task.flush().await;
 
     let alert = super::tests::take_alert(&mut alert_rx);
@@ -666,6 +708,76 @@ async fn deferred_q8_no_auction_no_output() {
     assert!(
         alert_rx.try_recv().is_err(),
         "桶内无该 seller 的 auction → 不输出"
+    );
+}
+
+/// EOS 重试（2026-08-23 q8 修复）：到期评估时 join 目标窗口 append 滞后
+/// （auction 尚未 ingest）→ 实例进 `missed`；EOS flush 时目标完整，重试命中
+/// 补输出——q8 引擎 33k vs oracle 82k 的修复路径。
+#[tokio::test]
+async fn deferred_q8_eos_retry_recovers_miss_from_late_join_target() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_q8_task();
+
+    // person 5 注册（T，桶界 T+10s）→ 挂起；watermark = T
+    q8_person_window(&router)
+        .append(person_batch(&[(5, T)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(alert_rx.try_recv().is_err(), "未到期 — 不输出");
+
+    // person 6（T+11s）推进 watermark 过 T+10s → person 5 到期评估，但此时
+    // auction 窗口为空（append 滞后）→ miss 进 `missed`（非 EOS 扫描收集）
+    q8_person_window(&router)
+        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "auction 窗口仍为空 → 到期 miss，等 EOS 重试"
+    );
+
+    // auction（seller=5，桶内 T+5s）迟到进入右窗——模拟 append 滞后
+    q8_auction_window(&router)
+        .append(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .unwrap();
+
+    // EOS flush：scan_deferred(i64::MAX) + 重试 missed → 命中补输出
+    task.flush().await;
+
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "5",
+        "EOS 重试必须补出桶内 seller==5 的 person"
+    );
+}
+
+/// EOS 重试对真 miss 不误报：auction 窗口补齐后仍无匹配 → 不输出。
+#[tokio::test]
+async fn deferred_q8_eos_retry_true_miss_stays_silent() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_q8_task();
+
+    // person 5 挂起，到期时 auction 窗口为空 → miss
+    q8_person_window(&router)
+        .append(person_batch(&[(5, T)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    q8_person_window(&router)
+        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+
+    // 迟到的 auction seller=9 ≠ 5 → EOS 重试仍 miss
+    q8_auction_window(&router)
+        .append(q8_auction_batch(&[(9, T + 5_000_000_000)]))
+        .unwrap();
+    task.flush().await;
+
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "EOS 重试后仍无 seller==5 的 auction → 真 miss，不输出"
     );
 }
 

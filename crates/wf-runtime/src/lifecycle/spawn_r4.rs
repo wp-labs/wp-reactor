@@ -552,3 +552,64 @@ async fn spawn_metrics_task_with_monitor_sink() {
         .await
         .expect("metrics tasks join cleanly");
 }
+
+/// shutdown 尾部 metrics 导出：规则 shutdown flush（deferred EOS 重试 / stats
+/// close flush）的 `emitted_total` 增量发生在 metrics 任务最后 tick 之后——
+/// `export_final_metrics` 必须把这些尾部计数器写入 monitor sink，否则
+/// `verify-nexmark --engine-emit`（读 metrics.ndjson）漏计 EMIT（q8 82k vs 33k
+/// 的指标捕获竞态）。
+#[tokio::test]
+async fn final_metrics_export_writes_tail_of_stream_emitted_total() {
+    let dir = tempfile::tempdir().unwrap();
+    write_monitor_sink_layout(dir.path());
+    let dispatcher = build_dispatcher(dir.path()).await;
+    assert!(dispatcher.has_monitor_sinks(), "monitor sink configured");
+    // monitor 导出走 dispatcher.monitor_sinks（不经 SinkFanout::by_sink 通道）。
+
+    let m = metrics();
+    // 模拟 shutdown flush 期间（metrics 任务最后一次 tick 之后）的 emit 增量。
+    // 规则名必须是 metrics 构造时注册的名字（inc_alert_emitted_total 按名查找）。
+    m.inc_alert_emitted_total("r4_rule");
+    m.inc_alert_emitted_total("r4_rule");
+
+    let router = router_with_window();
+    crate::lifecycle::export_final_metrics(&Some(m), &router, &Some(dispatcher.clone())).await;
+    // 与 Reactor::wait 一致：导出后停 monitor sink（sync_all 落盘）。
+    dispatcher.stop_monitor_sinks().await;
+
+    let path = dir.path().join("data/out_dat/monitor.jsonl");
+    let data = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("monitor file {} not found: {e}", path.display()));
+    assert!(
+        data.contains("emitted_total") && data.contains("r4_rule"),
+        "final export must write the tail-of-stream emitted_total; got: {data}"
+    );
+    assert!(
+        data.lines()
+            .any(|l| l.contains("emitted_total") && l.contains("\"2\"")),
+        "emitted_total must carry the post-flush delta (2), got: {data}"
+    );
+}
+
+/// `export_final_metrics` 无 monitor sink / 无 metrics 时静默跳过（不 panic）。
+#[tokio::test]
+async fn final_metrics_export_noop_without_monitor_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    write_monitor_sink_layout(dir.path());
+    let dispatcher = build_dispatcher(dir.path()).await;
+    // 仅 default sink：has_monitor_sinks() = false → 跳过
+    let m = metrics();
+    m.inc_alert_emitted_total("r4_rule");
+    let router = router_with_window();
+    crate::lifecycle::export_final_metrics(&Some(m), &router, &Some(dispatcher)).await;
+    // 无 monitor sink：不应写任何文件，也不 panic
+}
+
+/// `export_final_metrics` 缺 dispatcher（closed fanout）时静默跳过。
+#[tokio::test]
+async fn final_metrics_export_noop_without_dispatcher() {
+    let m = metrics();
+    m.inc_alert_emitted_total("r4_rule");
+    let router = router_with_window();
+    crate::lifecycle::export_final_metrics(&Some(m), &router, &None).await;
+}

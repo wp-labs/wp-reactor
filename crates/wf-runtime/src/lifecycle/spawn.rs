@@ -1358,11 +1358,13 @@ async fn run_monitor_consumer(mut rx: MonRecv, dispatcher: Arc<SinkDispatcher>) 
             dispatcher.dispatch_to_monitor(&data).await;
         }
     }
-    // Monitor channel closed: stop the monitor sinks.
-    dispatcher.stop_monitor_sinks().await;
+    // Monitor channel closed: this consumer exits, but the monitor sinks are
+    // stopped by `Reactor::wait` after the final metrics export (the shutdown
+    // flush emits land after the metrics task's last tick, so stopping the
+    // sinks here would drop the tail-of-stream counters from metrics.ndjson).
 }
 
-fn metrics_record_to_data_record(record: &MetricsRecord) -> DataRecord {
+pub(crate) fn metrics_record_to_data_record(record: &MetricsRecord) -> DataRecord {
     let mut out = DataRecord::default();
     for (key, value) in &record.fields {
         let field = Field::new(DataType::Chars, key, Value::from(value.as_str()));

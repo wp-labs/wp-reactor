@@ -170,6 +170,12 @@ impl SinkFanout {
             .unwrap_or(0)
     }
 
+    /// Access the underlying sink dispatcher (used for the final metrics
+    /// export at shutdown, when the metrics task has already exited).
+    pub(crate) fn dispatcher(&self) -> Option<Arc<SinkDispatcher>> {
+        self.dispatcher.clone()
+    }
+
     /// Warn once-per-target when a yield_target has no sink at all.
     pub fn warn_if_no_sink(&self, window_name: &str) {
         let mut warned = self.warned_no_sink.lock().expect("warned lock poisoned");

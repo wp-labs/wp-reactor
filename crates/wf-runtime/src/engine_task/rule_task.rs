@@ -126,6 +126,11 @@ struct PendingAlertColumns {
 struct DeferredRuntime {
     /// 挂起实例（每驱动行一条，设计 §5.2）。
     pending: Vec<DeferredPending>,
+    /// 到期评估 miss 的实例（join 目标窗口 append 滞后，2026-08-23 q8 排查）：
+    /// 到期时 join 目标可能未追平（引擎流式 vs oracle 预加载），EOS flush 时
+    /// 重试一次（届时所有数据已 ingest、目标窗口完整）——q8 引擎 33k vs
+    /// oracle 82k 的根因修复。EOS 重试后仍 miss = 真 miss（auction 不存在）。
+    missed: Vec<DeferredPending>,
     /// 事件时间 watermark（本规则驱动流 max event ts）。
     watermark: i64,
     /// 驱动 join 索引（规则内第一个带 `emit at` 的 join；v1 单 deferred join）。
@@ -385,6 +390,7 @@ impl RuleTask {
             .position(|j| j.emit_at.is_some())
             .map(|join_idx| DeferredRuntime {
                 pending: Vec::new(),
+                missed: Vec::new(),
                 watermark: i64::MIN,
                 join_idx,
             });
@@ -671,7 +677,12 @@ impl RuleTask {
             && self.each_direct
             && events.is_none()
             && batch.is_some()
-            && self.executor.each_plan_columnar_safe();
+            && self.executor.each_plan_columnar_safe()
+            // deferred（emit at）规则不得走列式 each 快路径：挂起/到期评估在
+            // 行循环里（deferred_pending_for → scan_deferred）。q8 等 on each +
+            // deferred 若走快路径会被列式 join 当 Snapshot 即时输出——deferred
+            // 语义丢失（2026-08-23 验证基线暴露：q8 引擎 33k vs oracle 82k）。
+            && self.deferred.is_none();
 
         // Row domain: a **sharded** deferred push only owns the rows partitioned
         // to this shard (`shard_rows`); an unsharded push scans the whole batch.
@@ -1680,7 +1691,7 @@ impl RuleTask {
     /// Scan for expired state machine instances and emit alerts.
     /// P3：deferred join 到期扫描——触发 `expiry ≤ wm` 的挂起实例，评估并输出。
     ///
-    /// `wm`：事件时间 watermark（`i64::MAX` = 全部到期，EOS/关闭 flush）；
+    /// `wm`：事件时间 watermark（批次尾 / scan_timeouts / flush 收口）；
     /// `emit_time_nanos`：输出记录的墙钟 emit 时间。空集（Q9 无 bid）不输出。
     async fn scan_deferred(&mut self, wm: i64, emit_time_nanos: i64) {
         let Some(deferred) = self.deferred.as_mut() else {
@@ -1708,6 +1719,9 @@ impl RuleTask {
         let lookup = RegistryLookup::new(&self.router);
         let mut stats = RuleBatchDebugStats::default();
         let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        // 到期 miss 的收集——join 目标窗口可能 append 滞后（引擎流式 vs oracle
+        // 预加载），留到 EOS flush 重试（届时目标完整）；真 miss 重试后仍 miss。
+        let mut missed_this = Vec::new();
         for p in due {
             match self
                 .executor
@@ -1729,6 +1743,9 @@ impl RuleTask {
                     self.emit(record).await;
                 }
                 Ok(None) => {
+                    // 到期 miss：join 目标窗口可能未追平（append 滞后）——
+                    // 留到 EOS 重试（届时目标完整）。真 miss 重试后仍 miss。
+                    missed_this.push(p);
                     if debug_enabled {
                         stats.output_none += 1;
                     }
@@ -1751,6 +1768,77 @@ impl RuleTask {
                     );
                 }
             }
+        }
+        if !missed_this.is_empty()
+            && let Some(deferred) = self.deferred.as_mut()
+        {
+            deferred.missed.extend(missed_this);
+        }
+    }
+
+    /// EOS 重试：到期评估 miss 的 deferred 实例（join 目标 append 滞后）。
+    /// EOS 后 join 目标窗口完整（全部数据已 ingest），重新评估一次——
+    /// 命中则补输出，仍 miss 为真 miss（右窗无匹配行）。
+    async fn reevaluate_deferred_missed(&mut self) {
+        let missed = {
+            let Some(deferred) = self.deferred.as_mut() else {
+                return;
+            };
+            std::mem::take(&mut deferred.missed)
+        };
+        if missed.is_empty() {
+            return;
+        }
+        let join_idx = self
+            .deferred
+            .as_ref()
+            .expect("deferred state exists")
+            .join_idx;
+        let lookup = RegistryLookup::new(&self.router);
+        let missed_len = missed.len();
+        let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        let mut hit = 0usize;
+        for p in missed {
+            match self
+                .executor
+                .execute_deferred_join(join_idx, &p, &lookup, wall_nanos() as i64)
+            {
+                Ok(Some(record)) => {
+                    hit += 1;
+                    if debug_enabled {
+                        log_output_emitted(
+                            "execute_deferred",
+                            "deferred-eos-retry",
+                            output_kind(&record, &self.intermediate_targets),
+                            &record,
+                            &[],
+                        );
+                    }
+                    self.emit(record).await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    wf_warn!(
+                        pipe,
+                        task_id = %self.task_id,
+                        rule = %self.rule_name(),
+                        stage = 0,
+                        phase = "execute_deferred_eos_retry",
+                        error = %e,
+                        "deferred join EOS retry failed"
+                    );
+                }
+            }
+        }
+        if hit > 0 && debug_enabled {
+            wf_debug!(
+                pipe,
+                task_id = %self.task_id,
+                rule = %self.rule_name(),
+                missed = missed_len,
+                hit = hit,
+                "deferred EOS retry: missed instances re-evaluated against the full join window"
+            );
         }
     }
 
@@ -1930,9 +2018,25 @@ impl RuleTask {
 
     /// Close all active instances (shutdown flush) and emit alerts.
     pub(super) async fn flush(&mut self) {
-        // P3：deferred join 规则——EOS/关闭时触发全部剩余挂起实例（reason=deferred）。
+        // P3：deferred join 规则——EOS/关闭时触发剩余**已到期**挂起实例
+        // （reason=deferred）。按最终事件时间 watermark 到期扫描（与 oracle 一致）：
+        // 尾部 expiry > 最终 watermark 的实例窗口未完成（事件时间域），不输出——
+        // 用 i64::MAX 强评会多出尾部桶（Q8 实证：82446 → 83274，+828 条，
+        // oracle/mod.rs EOS 水位扫注释同源）。missed（到期时 join 目标 append
+        // 滞后）在窗口完整后重试一次，仍 miss 为真 miss。
         if self.machine.is_none() && self.deferred.is_some() {
-            self.scan_deferred(i64::MAX, wall_nanos() as i64).await;
+            let final_wm = self
+                .deferred
+                .as_ref()
+                .map(|d| d.watermark)
+                .unwrap_or(i64::MIN);
+            if final_wm > i64::MIN {
+                self.scan_deferred(final_wm, wall_nanos() as i64).await;
+            }
+            // EOS 重试（2026-08-23 q8 修复）：到期时 join 目标窗口 append 滞后
+            // 的 miss 实例——EOS 后所有数据已 ingest、目标窗口完整，重试命中
+            // （真 miss 重试后仍不输出）。oracle 预加载完整窗口即此理想值。
+            self.reevaluate_deferred_missed().await;
             self.flush_alerts().await;
             self.flush_pipes().await;
             return;

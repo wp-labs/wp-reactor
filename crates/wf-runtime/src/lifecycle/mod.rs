@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use wf_config::{FusionConfig, FusionReloadPlan, RawFusionConfigTree};
+use wf_engine::sink::SinkDispatcher;
 use wf_engine::window::{EvictionGate, Router};
 
 use crate::error::{RuntimeReason, RuntimeResult};
@@ -37,8 +38,8 @@ pub use signal::{ShutdownTrigger, wait_for_signal};
 
 use bootstrap::load_and_compile;
 use spawn::{
-    spawn_alert_task, spawn_evictor_task, spawn_metrics_task, spawn_receiver_task,
-    spawn_rule_tasks, spawn_window_actors,
+    metrics_record_to_data_record, spawn_alert_task, spawn_evictor_task, spawn_metrics_task,
+    spawn_receiver_task, spawn_rule_tasks, spawn_window_actors,
 };
 use types::TaskGroup;
 
@@ -576,6 +577,12 @@ impl Reactor {
         // longer needed. The rule tasks (joined below, before head/alert) still
         // hold their own clones, so they can finish flushing before the channel
         // closes and the alert task drains & exits last.
+        //
+        // The monitor dispatcher is extracted **before** dropping the fanout
+        // clone: `SinkFanout::by_sink` holds per-sink alert senders, so keeping
+        // the fanout `Arc` alive would keep the alert channel open past the
+        // rules and stall the alert task's exit (reload abort test regression).
+        let monitor_dispatcher = self.sink_fanout.as_ref().and_then(|f| f.dispatcher());
         self.sink_fanout.take();
 
         // tail: metrics → receiver, then window actors, then rule, then
@@ -607,12 +614,29 @@ impl Reactor {
         // channel and unblock a lingering blocking `send().await` — after which
         // they release their `alert_tx` clones and the alert channel can close.
         self.reap_detached_rule_watchers().await;
+
+        // Final monitor export (before head/alert joins, while the monitor
+        // sinks are still live): the rule tasks' shutdown flush (deferred EOS
+        // retry / stats close flush) increments `emitted_total` and friends
+        // AFTER the metrics task's last 100ms tick and after the metrics task
+        // itself exits (joined above with the tail). Without this export the
+        // tail-of-stream emit counts never reach the monitor sink and
+        // `verify-nexmark --engine-emit` (which reads metrics.ndjson) reports
+        // the pre-flush totals — e.g. q8 deferred EOS retry: oracle 82k vs
+        // engine 33k, purely a metrics-capture race, not an engine deficit.
+        self.export_final_metrics(&monitor_dispatcher).await;
         while let Some(handle) = self.head_watchers.pop() {
             if let Err(err) = join_supervisor(handle).await
                 && first_error.is_none()
             {
                 first_error = Some(err);
             }
+        }
+        // Monitor sinks are stopped by the Reactor now (previously by the
+        // monitor consumer, which exits when the metrics task drops its
+        // channel — before the shutdown flush counters are exported above).
+        if let Some(dispatcher) = &monitor_dispatcher {
+            let _ = dispatcher.stop_monitor_sinks().await;
         }
 
         if let Some(err) = first_error {
@@ -624,6 +648,47 @@ impl Reactor {
     /// Returns a clone of the root cancellation token (for signal integration).
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
+    }
+
+    /// Export the final interval's metrics counters to the monitor sinks.
+    ///
+    /// Called from [`wait`](Self::wait) after the rule tasks have joined: their
+    /// shutdown flush (deferred EOS retry / stats close flush) may increment
+    /// counters after the metrics task's last tick, and the metrics task exits
+    /// before the rules in the LIFO drain — so without this export the
+    /// tail-of-stream deltas are missing from metrics.ndjson. Reads the shared
+    /// `RuntimeMetrics` atomics (still final after the rules exit), so the
+    /// export is exact and never double-counts (the metrics task drained its
+    /// share on its last tick).
+    async fn export_final_metrics(&self, dispatcher: &Option<Arc<SinkDispatcher>>) {
+        export_final_metrics(&self.metrics, &self.router, dispatcher).await
+    }
+}
+
+/// Export the final metrics counters to the monitor sinks.
+///
+/// Free-function form of the shutdown tail export (see the inlined docs at
+/// the `wait()` call site) so tests can drive it without a full `Reactor`.
+pub(crate) async fn export_final_metrics(
+    metrics: &Option<Arc<RuntimeMetrics>>,
+    router: &Arc<Router>,
+    dispatcher: &Option<Arc<SinkDispatcher>>,
+) {
+    let (Some(metrics), Some(dispatcher)) = (metrics, dispatcher) else {
+        return;
+    };
+    if !dispatcher.has_monitor_sinks() {
+        return;
+    }
+    metrics.sample_windows(router);
+    let snap = metrics.snapshot();
+    let records = snap.to_records();
+    if records.is_empty() {
+        return;
+    }
+    for record in records {
+        let data = metrics_record_to_data_record(&record);
+        dispatcher.dispatch_to_monitor(&data).await;
     }
 }
 
