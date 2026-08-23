@@ -3,6 +3,10 @@
 > 状态：设计定稿（2026-08-23）。方法论见 `docs/PERF_BISECTION_METHOD.md`——本文是
 > 把该方法论**内建进引擎**的机制设计：一次实现诊断模式，之后每次性能退化定位 =
 > 声明式切换诊断点，**不重启 daemon、不改引擎代码、不手拼测量协议**。
+>
+> 术语：批末完成信号称 **sentinel（哨兵）**——内置 `__perf_sentinel` 窗口 +
+> 哨兵规则，载荷 `{round, n, start_ns}` 自描述，emit 补 `emit_ns` → EPS 四元组
+> 直接可算。
 
 ---
 
@@ -23,7 +27,8 @@
 
 - 性能退化定位成为引擎**内置能力**：诊断模式 + 声明式诊断点，一次实现、长期复用。
 - 定位过程**不重启 daemon**：诊断点之间靠热切换（原子门控 + 已有规则 reload）。
-- **完成信号内嵌数据流**（漂流瓶）：精确、跨诊断点一致，不再依赖 metrics 轮询粒度。
+- **完成信号内嵌数据流**（漂流瓶 sentinel）：精确、跨诊断点一致，不再依赖
+  metrics 轮询粒度。
 - 测量协议固化进机制，杜绝测量假象类回归。
 
 ### 1.3 非目标 / 设计约束
@@ -44,18 +49,18 @@
 │  perf-diag 子命令（编译工具，非脚本）                        │
 │  for 诊断点 k in [floor, rules, full, c_*, g_*, ...]:       │
 │    ① 切点：POST /admin/v1/perf/point {point=k}              │
-│    ② 发帧 batch_k；帧尾追加自描述 marker：                 │
+│    ② 发帧 batch_k；帧尾追加自描述 sentinel：               │
 │       {round=k, n=N_k, start_ns=T0}    ← 发送量+开始时间入载荷 │
-│    ③ 读 metrics: perf_marker{…, emit_ns}                    │
-│    ④ EPS_k = n / (emit_ns − start_ns)  ← 全从 marker 记录算  │
+│    ③ 读 metrics: perf_sentinel{…, emit_ns}                  │
+│    ④ EPS_k = n / (emit_ns − start_ns)  ← 全从 sentinel 记录算 │
 │  输出墙表（每档 EPS + 增量成本 + 墙判定）                    │
 └────────────────────────────────────────────────────────────┘
 ┌─ wfusion daemon（一次启动，不重启）─────────────────────────┐
 │  [perf] 诊断模式：禁止型门控（原子，热切）                   │
 │    cut_rules / cut_output                                   │
 │  runtime.rules hot-reload：规则子集切换（已有能力）          │
-│  内置 __perf_marker 窗口 + 标记规则（豁免所有门控，永远活跃）│
-│    marker emit 时写 perf_marker{round,n,start_ns,emit_ns}    │
+│  内置 __perf_sentinel 窗口 + 哨兵规则（豁免所有门控，活跃）  │
+│    sentinel emit 时写 perf_sentinel{round,n,start_ns,emit_ns}│
 │    四元组齐备 → EPS = n/(emit_ns−start_ns) 直接可算          │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -92,7 +97,7 @@
 
 ```toml
 [perf]
-diag = false        # 诊断模式：启用内置 __perf_marker 窗口（生产默认关）
+diag = false        # 诊断模式：启用内置 __perf_sentinel 窗口（生产默认关）
 cut_rules = false   # 禁止规则求值（process_batch 直通，ack 保留）
 cut_output = false  # 禁止输出链（emit 不 serialize/stage/commit）
 ```
@@ -113,24 +118,24 @@ cut_output = false  # 禁止输出链（emit 不 serialize/stage/commit）
 - 门控形态：`set_rule_profiling` 同款全局原子 + `pub fn set_perf_cuts(...)`，
   `Reactor::start` 时从 `config.perf` 初始化。
 
-### 4.3 内置 `__perf_marker` 窗口 + 标记规则（漂流瓶）
+### 4.3 内置 `__perf_sentinel` 窗口 + 哨兵规则（漂流瓶）
 
-- **内置 schema**：`__perf_marker` 流/窗口，字段 `{ round: digit, n: digit,
+- **内置 schema**：`__perf_sentinel` 流/窗口，字段 `{ round: digit, n: digit,
   start_ns: digit }`（引擎内置，不依赖用户 .wfs；`[perf].diag=true` 时自动注册）。
-- **marker 载荷自描述**：wfgen 发送时把**发送量 `n`**（本批事件数）和**开始时间
-  `start_ns`**（wfgen 发送开始时钟）写进 marker 事件字段——wfgen 无需外部记账。
-- **内置标记规则**：marker 事件 emit 时（复用 emit 路径的 `cached_wall_nanos`
+- **sentinel 载荷自描述**：wfgen 发送时把**发送量 `n`**（本批事件数）和**开始时间
+  `start_ns`**（wfgen 发送开始时钟）写进 sentinel 事件字段——wfgen 无需外部记账。
+- **内置哨兵规则**：sentinel 事件 emit 时（复用 emit 路径的 `cached_wall_nanos`
   引擎时钟）写一条完整测量记录：
-  `perf_marker{round=k, n=<N_k>, start_ns=<wfgen T0>, emit_ns=<引擎完成时刻>}`。
+  `perf_sentinel{round=k, n=<N_k>, start_ns=<wfgen T0>, emit_ns=<引擎完成时刻>}`。
   该记录四元组齐备，**EPS 直接可算**：`eps = n / (emit_ns − start_ns)`。
 - **时钟同一性**：基准同机运行，wfgen 的 `start_ns` 与引擎的 `emit_ns` 同机
-  时钟可比（跨机需 NTP 或 marker 由引擎侧回写差值，见 §7）。
-- **豁免所有 perf 门控**：cut_rules / cut_output 均不影响 marker 窗口与标记规则——
-  保证各诊断点（含 floor 空规则档）都能拿到完成信号。
-- **顺序保证**：marker 帧与数据帧同 TCP 连接、同源 seq 有序 → marker 是"批末
-  最后一条"，其 emit 时刻 ≈ 该批处理结束时刻（+marker 自身常数量处理开销）。
-- **跨档一致性**（决策 ①a）：marker 走独立窗口，测共享段（recv/decode/路由）+
-  marker 窗排水；绝对时间可能略早于"最慢数据窗口"的规则消化完，但**增量
+  时钟可比（跨机需 NTP 或由引擎侧回写差值，见 §7）。
+- **豁免所有 perf 门控**：cut_rules / cut_output 均不影响 sentinel 窗口与哨兵
+  规则——保证各诊断点（含 floor 空规则档）都能拿到完成信号。
+- **顺序保证**：sentinel 帧与数据帧同 TCP 连接、同源 seq 有序 → sentinel 是
+  "批末最后一条"，其 emit 时刻 ≈ 该批处理结束时刻（+sentinel 自身常数量处理开销）。
+- **跨档一致性**（决策 ①a）：sentinel 走独立窗口，测共享段（recv/decode/路由）+
+  sentinel 窗排水；绝对时间可能略早于"最慢数据窗口"的规则消化完，但**增量
   T1(k) − T1(k−1) 不受影响**，墙的归属判定不变。
 
 ### 4.4 热切通道（admin API）
@@ -145,7 +150,7 @@ cut_output = false  # 禁止输出链（emit 不 serialize/stage/commit）
 
 - `report_interval` **默认 100ms**（当前 nexmark 已用、qradar 曾用 1s 制造假象；
   根治为引擎默认值，改 100ms 后短跑不再被 ~1s 粒度钉死）。
-- 完成判定信号 = `perf_marker` 指标（事件驱动），替代 metrics 轮询近似。
+- 完成判定信号 = `perf_sentinel` 指标（事件驱动），替代 metrics 轮询近似。
 
 ---
 
@@ -164,10 +169,10 @@ wfgen perf-diag \
 - **循环**（每点 k，每轮）：
   1. `POST /admin/v1/perf/point {point=k}` → 轮询 admin status 确认切换完成；
   2. 统计本批发送量 `n_k`（帧行数合计）；`T0 = now()`；`send-arrow` 发数据帧，
-     帧尾追加 `__perf_marker{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq
+     帧尾追加 `__perf_sentinel{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq
      尾部，保证最后处理）；
-  3. 轮询 metrics 直到读到 `perf_marker{round=k, …}` 的 `emit_ns`；
-  4. `EPS_k = n_k / (emit_ns − start_ns)`——**发送量/开始时间来自 marker 载荷，
+  3. 轮询 metrics 直到读到 `perf_sentinel{round=k, …}` 的 `emit_ns`；
+  4. `EPS_k = n_k / (emit_ns − start_ns)`——**发送量/开始时间来自 sentinel 载荷，
      完成时间来自引擎 emit 记录，全程无外部记账**（delta 口径，跨点窗口残留
      状态不影响）。
 - **数据由小到大**：`--n-list` 对每个诊断点按递增 N 各测一次——小 N 秒级出方向，
@@ -192,12 +197,12 @@ wfgen perf-diag \
 
 | 项 | 决策 | 说明 |
 |---|---|---|
-| marker 队列 | 独立 `__perf_marker` 窗口（①a） | 绝对时间可能略早于最慢数据窗；相对增量不受影响 |
-| marker 载荷 | 自描述 `{round, n, start_ns}` | 发送量+开始时间入 marker；引擎补 `emit_ns` → EPS 四元组直接可算 |
+| sentinel 队列 | 独立 `__perf_sentinel` 窗口（①a） | 绝对时间可能略早于最慢数据窗；相对增量不受影响 |
+| sentinel 载荷 | 自描述 `{round, n, start_ns}` | 发送量+开始时间入 sentinel；引擎补 `emit_ns` → EPS 四元组直接可算 |
 | 时钟 | 同机基准，wfgen `start_ns` 与引擎 `emit_ns` 同机时钟 | 跨机需 NTP 或引擎回写差值（未做） |
 | sink 热切 | 不做（RequiresRestart） | 输出墙用 cut_output 开关代替，无需动 sinks |
 | budget 热切 | 不做（RequiresRestart） | 预算档作为唯一重启例外 |
-| marker 处理开销 | 常数量（极小），计入每档 | 增量抵消，不影响墙归属 |
+| sentinel 处理开销 | 常数量（极小），计入每档 | 增量抵消，不影响墙归属 |
 | 窗口残留 | delta 口径，2min 滑窗自动老化 | 跨点不重启可连续跑 |
 
 ---
@@ -206,9 +211,9 @@ wfgen perf-diag \
 
 1. wf-config：`PerfConfig`（diag/cut_rules/cut_output）+ 解析 + 测试；
 2. wf-runtime：`set_perf_cuts` 原子门控 + `process_batch`/`emit` 切口 + 测试；
-3. wf-runtime：内置 `__perf_marker` 窗口/规则 + `perf_marker` 指标（`diag=true` 时
-   注册）+ 豁免门控测试；
+3. wf-runtime：内置 `__perf_sentinel` 窗口/规则 + `perf_sentinel` 指标（`diag=true`
+   时注册）+ 豁免门控测试；
 4. wf-runtime：`POST /admin/v1/perf/point` 端点（门控翻转 + 规则子集热切映射）；
 5. wf-config：`report_interval` 默认 100ms；
-6. wfgen：`perf-diag` 子命令（切点 → 发帧+marker → 读指标 → 墙表）；
+6. wfgen：`perf-diag` 子命令（切点 → 发帧+sentinel → 读指标 → 墙表）；
 7. 文档：`PERF_BISECTION_METHOD.md` 挂接本机制（§6 定位流程即机制用法）。
