@@ -269,7 +269,18 @@ wfgen perf-diag \
 
 ---
 
-## 8. 落地清单（实现顺序）
+## 8. 质量门禁（实现验收）
+
+1. **新增代码单测覆盖率 ≥ 90%**（`cargo llvm-cov` 行覆盖率口径）：
+   - wf-config `PerfConfig` 解析（含 points 列表、缺省值）；
+   - wf-runtime 门控切口（cut_rules 直通保留 ack / cut_output 保留 emitted 计数）；
+   - 内置 `__perf_sentinel` 窗口/规则 + `perf_sentinel`/`perf_point` 指标 + 豁免门控；
+   - 诊断点状态机（sentinel emit → 门控翻转 + 规则 reload + 切换完成信号）；
+   - wfgen `perf-diag` 子命令（EPS 计算与哨兵文件读取抽成库函数以便单测）。
+2. **perf_diag_case `floor` 档 EPS ≥ 10M**（N ≥ 1M 验收）：单流小字段管道吞吐
+   应高于 qradar 6 流 floor 实测 9.7M；verify.sh 增断言 1m floor ≥ 10M。
+
+## 9. 落地清单（实现顺序）
 
 1. wf-config：`PerfConfig`（diag/cut_rules/cut_output）+ 解析 + 测试；
 2. wf-runtime：`set_perf_cuts` 原子门控 + `process_batch`/`emit` 切口 + 测试；
