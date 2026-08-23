@@ -164,6 +164,7 @@ bench 项：`q5_q7_window_conv_top`。
 | q19 stats rows top10 | 202.5 | 4.94 | ✅ | 218ns/evt（4.6M） |
 | q19 stats batch top10 | **89.4** | 11.19 | ✅ 列式 2.3× 行式 | — |
 | q20 each+join+where | **1320.3** | 0.76 | 🟡 join 富化 + where | 141ns/evt（7.1M） |
+| q20 each+join+where 列式（F6） | **183.7** | 5.44 | ✅ 行式 17.3%（**5.8×**，混跑 264ns=7.5×） | 33ns/evt（30M 9.24M） |
 | q21 str bind filter | 723.3 | 1.38 | ✅ | 62ns/evt（16.0M） |
 | q22 each+split | **2069.5** | 0.48 | 🔴 on-each 家族最高（A1 确认） | 130ns/evt（7.7M） |
 
@@ -329,6 +330,18 @@ yield/entity 为字面量 / 左窗限定 / 右窗限定。新执行路径
 |---|---|---|---|
 | 旧：each+join 行式 | 2.86M | 7.6GB | 736% |
 | **each + 列式 join 富化（F6）** | **9.24M** | 7.9GB | 454% |
+
+**微基准（`nexmark_hotpath_bench::q20_each_snapshot_join_where_columnar`，release，
+N=500k，同进程行式/列式对拍 + 输出逐位断言）**：
+
+| 路径 | ns/evt | M evt/s | 加速比 |
+|---|---|---|---|
+| 行式批路径（`execute_each_direct_batch`） | 1061 | 0.94 | 1× |
+| **列式 join 富化（`execute_each_direct_batch_columnar_join`）** | **184** | **5.44** | **5.8×** |
+
+（全量混跑下行式 1981ns、列式 264ns——7.5×；负载高时绝对 ns 上浮，加速比稳定。）
+每跑一次都执行行式/列式 stats + 输出行逐位对拍断言——列式路径任何语义回归
+都会在基准中报红。
 
 输出正确性：rate=3m 下列式 3 次 = 行式 = **5,503,985 逐位一致** ✓（30m 数据）；
 集成对拍测试（真实窗口+索引+RegistryLookup）锁定命中/miss/where 拒绝一致。

@@ -1403,6 +1403,92 @@ fn q20_each_snapshot_join_where() {
     report("q20 each+join+where", q20_ns, q20_ns);
 }
 
+/// Q20 列式 join 富化（F6，2026-08-23）：批级 join_lookup + 列式右窗读，与行式
+/// 批路径（`execute_each_direct_batch`）**同批对拍**（stats + 输出行逐位一致）
+/// 并测量加速比。分段 256 行模拟生产 `ALERT_BATCH_SIZE` 调用形态。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine nexmark_hotpath_bench -- --ignored --nocapture"]
+fn q20_each_snapshot_join_where_columnar() {
+    use crate::alert::AlertColumnBuilder;
+    use crate::match_engine::event_bridge::{ColumnarEvent, materialize_rows};
+    use crate::match_engine::executor::EachDirectBatchStats;
+
+    const SEG: usize = 256; // 生产 ALERT_BATCH_SIZE 分段
+    let batch = bid_batch(N);
+    let lookup = AuctionLookup::new(AUCTION_DOMAIN);
+    let exec = RuleExecutor::new(q20_rule());
+    assert!(
+        exec.each_join_columnar_ready() && exec.each_plan_columnar_safe(),
+        "q20 形状必须列式 join 支持（F6）"
+    );
+
+    // 列式 join 路径（分段调用，同生产 emit_each_direct_batch_columnar_join）。
+    let col_events: Vec<ColumnarEvent<'_>> =
+        (0..N).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NOW + i as i64 * EVENT_STEP_NS))
+        .collect();
+    let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended = Vec::new();
+    let mut stats_col = EachDirectBatchStats::default();
+    let t0 = Instant::now();
+    for seg in col_rows.chunks(SEG) {
+        let s = exec.execute_each_direct_batch_columnar_join(
+            seg,
+            &lookup,
+            NOW,
+            &mut builder,
+            &mut appended,
+        );
+        stats_col.appended += s.appended;
+        stats_col.rejected += s.rejected;
+        stats_col.failed += s.failed;
+    }
+    let col_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    let col_output = builder.finish();
+
+    // 行式参照（Event 版批路径，同批对拍）。
+    let all: Vec<u32> = (0..N as u32).collect();
+    let events = materialize_rows(&batch, &all);
+    let rows: Vec<(&Event, i64)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NOW + i as i64 * EVENT_STEP_NS))
+        .collect();
+    let mut b2 = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut idx2 = Vec::new();
+    let mut stats_row = EachDirectBatchStats::default();
+    let t0 = Instant::now();
+    for seg in rows.chunks(SEG) {
+        let s = exec.execute_each_direct_batch(seg, &lookup, &[], NOW, &mut b2, &mut idx2);
+        stats_row.appended += s.appended;
+        stats_row.rejected += s.rejected;
+        stats_row.failed += s.failed;
+    }
+    let row_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    let row_output = b2.finish();
+
+    // 对拍：stats + 输出行逐位一致（防列式路径回归）。O(n) zip 对比——
+    // `nth(row)` 每次重扫是 O(n²)，50 万行输出会挂起。
+    assert_eq!(stats_col, stats_row, "列式/行式 stats 必须一致");
+    assert_eq!(col_output.len(), row_output.len(), "输出行数一致");
+    let rows_a = col_output.iter_data_records();
+    let rows_b = row_output.iter_data_records();
+    for (row, (ra, rb)) in rows_a.zip(rows_b).enumerate() {
+        let (ra, rb) = (ra.unwrap(), rb.unwrap());
+        assert_eq!(ra.items.len(), rb.items.len(), "row {row} field count");
+        for (fa, fb) in ra.items.iter().zip(rb.items.iter()) {
+            assert_eq!(fa.get_name(), fb.get_name(), "row {row} field name");
+            assert_eq!(fa.get_value(), fb.get_value(), "row {row} field value");
+        }
+    }
+
+    report("q20 each+join+where 列式(F6)", col_ns, row_ns);
+    report("q20 each+join+where 行式", row_ns, row_ns);
+}
+
 // ---------------------------------------------------------------------------
 // Bench 11：Q21 bind filter channel_id != ""
 // ---------------------------------------------------------------------------
