@@ -36,10 +36,10 @@ use wf_lang::plan::{
     StepPlan, WindowSpec,
 };
 
+use crate::match_engine::apply_conv;
 use crate::match_engine::match_engine::{
     CepStateMachine, CloseOutput, CloseReason, EngineHashMap, Event, StepData, Value,
 };
-use crate::match_engine::{EngineHashMap as _, apply_conv};
 
 /// Q5 引用域：auction ≈ 热点域（HotAuctionBatch）± lead。
 const AUCTION_DOMAIN: i64 = 2000;
@@ -269,7 +269,7 @@ fn run_conv(ops: Vec<ConvOpPlan>, batch: Vec<CloseOutput>) -> f64 {
     // 预热
     apply_conv(&plan, &keys, batch.clone());
     let start = Instant::now();
-    let mut iters = 200;
+    let iters = 200;
     for _ in 0..iters {
         apply_conv(&plan, &keys, batch.clone());
     }

@@ -41,7 +41,7 @@ rule q9 {
     );
     // within 行内界（绝对时间表达式）
     let w = j.within.as_ref().expect("within");
-    assert_eq!(w.lo.open, false);
+    assert!(!w.lo.open);
     assert_eq!(
         w.lo.val,
         BoundVal::Expr(Expr::Field(FieldRef::Qualified(
@@ -49,7 +49,7 @@ rule q9 {
             "dateTime".into()
         )))
     );
-    assert_eq!(w.hi.open, false);
+    assert!(!w.hi.open);
     assert_eq!(
         w.hi.val,
         BoundVal::Expr(Expr::Field(FieldRef::Qualified(
@@ -86,7 +86,7 @@ rule q8 {
     assert_eq!(j.mode, JoinMode::Inner);
     let w = j.within.as_ref().expect("within");
     // 上开
-    assert_eq!(w.hi.open, true);
+    assert!(w.hi.open);
     match &w.hi.val {
         BoundVal::Expr(Expr::FuncCall { name, args, .. }) => {
             assert_eq!(name, "bucket_end");
@@ -153,7 +153,7 @@ rule r {
             neg: false
         }
     );
-    assert_eq!(w.lo.open, false);
+    assert!(!w.lo.open);
     assert_eq!(
         w.hi.val,
         BoundVal::Dur {
@@ -161,7 +161,7 @@ rule r {
             neg: false
         }
     );
-    assert_eq!(w.hi.open, true);
+    assert!(w.hi.open);
 
     // `<=` 显式闭 + `within 10m` 前置于 reduce 之前（顺序无关）
     let input = r#"
@@ -176,8 +176,8 @@ rule r2 {
     let file = parse_wfl(input).unwrap();
     let j = &file.rules[0].joins[0];
     let w = j.within.as_ref().expect("within");
-    assert_eq!(w.lo.open, false);
-    assert_eq!(w.hi.open, false);
+    assert!(!w.lo.open);
+    assert!(!w.hi.open);
     assert!(matches!(
         j.reduce.as_ref().map(|r| &r.measure),
         Some(ReduceMeasure::Last { .. })
@@ -352,6 +352,6 @@ rule r {
         })
     );
     let w = j.within.as_ref().expect("within");
-    assert_eq!(w.lo.open, true);
-    assert_eq!(w.hi.open, true);
+    assert!(w.lo.open);
+    assert!(w.hi.open);
 }

@@ -11,7 +11,7 @@ use arrow::record_batch::RecordBatch;
 use tokio::sync::{Notify, mpsc};
 
 use wf_engine::match_engine::{CepStateMachine, RuleExecutor};
-use wf_engine::window::{Router, Window, WindowDef, WindowParams, WindowRegistry};
+use wf_engine::window::{Router, Window, WindowParams, WindowRegistry};
 use wf_lang::ast::{CloseMode, CmpOp, Expr, FieldRef, MatchMode, Measure};
 use wf_lang::plan::{
     AggPlan, BindPlan, BranchPlan, EntityPlan, MatchPlan, RulePlan, ScorePlan, StepPlan,

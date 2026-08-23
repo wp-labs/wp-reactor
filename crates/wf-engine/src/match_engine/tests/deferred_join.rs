@@ -13,7 +13,7 @@ use crate::alert::AlertOrigin;
 use crate::match_engine::match_engine::{Event, Value, WindowLookup};
 use crate::match_engine::{JoinRow, RuleExecutor};
 
-use super::helpers::{event, num, str_val};
+use super::helpers::{event, num};
 
 const T: i64 = 1_700_000_000_000_000_000;
 
@@ -618,7 +618,7 @@ fn deferred_respects_let_bindings() {
     let exec = RuleExecutor::new(plan);
     let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
     // expiry = let buf = id(5) + 1000 = 1005（epoch 秒 → 归一化为 1005e9 纳秒）
-    assert_eq!(pending.expiry_nanos, 1005_000_000_000);
+    assert_eq!(pending.expiry_nanos, 1_005_000_000_000);
 }
 
 /// review 补充：上开区间界（`[lo, <hi]`）排除边界行。

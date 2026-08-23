@@ -42,6 +42,15 @@ use super::{register_notifications, wait_any};
 /// 单次构建峰值从全窗口（q19 30M ≈ 7.94M 条）降到阈值量级。
 const EMIT_CHUNK: usize = 1_000_000;
 
+/// pull 模式每次源拉取 = (窗口名, 批次, 每批分片行子集, 新游标, 是否 gap)。
+type PendingStatsPull = (
+    String,
+    Vec<RecordBatch>,
+    Vec<Option<Arc<Vec<u32>>>>,
+    u64,
+    bool,
+);
+
 /// stats 任务: 消费批次 → 归并 → 固定窗口 close → alert。
 pub(super) struct StatsTask {
     task_id: String,
@@ -53,13 +62,11 @@ pub(super) struct StatsTask {
     metrics: Option<Arc<RuntimeMetrics>>,
     time_field: Option<String>,
     intermediate_targets: HashSet<String>,
-    pipe_registry: std::sync::Arc<wf_engine::pipe::PipeRegistry>,
     eos_flush: watch::Receiver<u64>,
     push_rx: Option<mpsc::Receiver<RulePush>>,
     progress: HashMap<String, Arc<AtomicU64>>,
     cursors: HashMap<String, u64>,
     shard_index: Option<usize>,
-    shard_count: usize,
     /// 当前 fixed 窗口起点（bucket 对齐首个事件; `None` = 尚未见事件）。
     window_start: Option<i64>,
     /// 当前窗口结束（= window_start + dur; close 判定 watermark >= window_end）。
@@ -85,12 +92,12 @@ impl StatsTask {
             time_field,
             timeout_scan_interval,
             intermediate_targets,
-            pipe_registry,
+            pipe_registry: _,
             eos_flush,
             push_rx,
             progress,
             shard_index,
-            shard_count,
+            shard_count: _,
         } = config;
         let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
         let task_id = format!("{}#{}", executor.plan().name, seq);
@@ -104,13 +111,11 @@ impl StatsTask {
             metrics,
             time_field,
             intermediate_targets,
-            pipe_registry,
             eos_flush,
             push_rx,
             progress,
             cursors: HashMap::new(),
             shard_index,
-            shard_count,
             window_start: None,
             window_end: None,
             last_watermark: i64::MIN,
@@ -132,13 +137,7 @@ impl StatsTask {
     pub(super) async fn pull_and_process(&mut self) {
         // 先收集 pending（只借 &self.sources）, 再逐个 &mut self 处理
         // （镜像 rule_task 的分相, 避免借用冲突）。
-        let mut pending: Vec<(
-            String,
-            Vec<RecordBatch>,
-            Vec<Option<Arc<Vec<u32>>>>,
-            u64,
-            bool,
-        )> = Vec::new();
+        let mut pending: Vec<PendingStatsPull> = Vec::new();
         for source in &self.sources {
             let cursor = self.cursors.get(&source.window_name).copied().unwrap_or(0);
             // 分片（P2）: 带 key 规则每片只拉自己的 shard_rows 子集; 空键单实例拉全批。
@@ -320,10 +319,7 @@ impl StatsTask {
         if watermark < window_end {
             return; // 仍在当前窗口
         }
-        loop {
-            let (Some(start), Some(end)) = (self.window_start, self.window_end) else {
-                break;
-            };
+        while let (Some(start), Some(end)) = (self.window_start, self.window_end) {
             if watermark < end {
                 break;
             }
@@ -616,6 +612,7 @@ fn batch_max_time(batch: &RecordBatch, time_field: Option<&str>) -> i64 {
 /// `row_fields`（每度量一个, last/top 用）: 行字段列数组按 `row_names` 列序展开
 /// 注入其所在度量的 StepData——yield 经 field_values 读 `b.*`（如 Q18 最后一条
 /// bid 的 price/channel; P5 紧凑化: 列数组而非 HashMap, 列序 = 提取同序）。
+#[allow(clippy::too_many_arguments)] // 合成 CloseOutput: 规则名/值/label/行字段/窗界/键 6 组参数
 fn build_stats_close_output(
     rule_name: &str,
     values: &[f64],

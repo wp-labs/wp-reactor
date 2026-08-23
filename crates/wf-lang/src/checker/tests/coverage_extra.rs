@@ -990,7 +990,7 @@ rule r {
     yield out (n = mvcount(mvappend(e.active, e.active)))
 }
 "#;
-    assert_no_errors(&bool_ok, &[obj_win(), wide_output_window()]);
+    assert_no_errors(bool_ok, &[obj_win(), wide_output_window()]);
 }
 
 #[test]
@@ -1062,7 +1062,7 @@ rule r {
     yield out (n = count(e))
 }
 "#;
-    assert_no_errors(&count_ok, &[auth_events_window(), wide_output_window()]);
+    assert_no_errors(count_ok, &[auth_events_window(), wide_output_window()]);
 }
 
 // ===========================================================================
@@ -1215,7 +1215,7 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-    assert_has_error(&input, &schemas, "`where` expression must be bool");
+    assert_has_error(input, &schemas, "`where` expression must be bool");
 }
 
 #[test]
@@ -2229,7 +2229,7 @@ rule r {
     yield out (b = isnull(e.user), y = join(e.user, e.action))
 }
 "#;
-    assert_no_errors(&ok, &[auth_events_window(), wide_output_window()]);
+    assert_no_errors(ok, &[auth_events_window(), wide_output_window()]);
 }
 
 // ===========================================================================

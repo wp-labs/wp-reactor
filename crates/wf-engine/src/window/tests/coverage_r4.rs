@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 use wf_lang::ast::FieldRef;
 
-use crate::match_engine::{AsofLookup, Event, JoinKey, Value};
+use crate::match_engine::{AsofLookup, Event, JoinKey};
 use crate::window::buffer::{Window, WindowParams, content_bytes};
 use crate::window::provider::ProviderWindow;
 use crate::window::{RuleFanout, RulePush, WindowDef, WindowRegistry};
@@ -33,12 +33,6 @@ use crate::window::{RuleFanout, RulePush, WindowDef, WindowRegistry};
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
-
-fn event(id: &str) -> Event {
-    let mut fields = crate::match_engine::EngineHashMap::default();
-    fields.insert("id".into(), Value::Str(id.into()));
-    Event { fields }
-}
 
 fn no_key_event() -> Event {
     Event {

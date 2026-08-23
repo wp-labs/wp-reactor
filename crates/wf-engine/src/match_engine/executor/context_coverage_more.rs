@@ -120,7 +120,7 @@ fn interval_bound_eval_failure_semantics() {
     let mut ctx = event(vec![("aid", num(1.0))]);
     assert!(
         !execute_joins(
-            &vec![interval_join(within.clone(), JoinMode::Inner)],
+            &[interval_join(within.clone(), JoinMode::Inner)],
             &mut ctx,
             &lookup,
             500_000_000_000
@@ -130,7 +130,7 @@ fn interval_bound_eval_failure_semantics() {
     let mut ctx = event(vec![("aid", num(1.0))]);
     assert!(
         execute_joins(
-            &vec![interval_join(within.clone(), JoinMode::Snapshot)],
+            &[interval_join(within.clone(), JoinMode::Snapshot)],
             &mut ctx,
             &lookup,
             500_000_000_000
@@ -140,7 +140,7 @@ fn interval_bound_eval_failure_semantics() {
     let mut ctx = event(vec![("aid", num(1.0))]);
     assert!(
         execute_joins(
-            &vec![interval_join(within.clone(), JoinMode::Anti)],
+            &[interval_join(within.clone(), JoinMode::Anti)],
             &mut ctx,
             &lookup,
             500_000_000_000
@@ -160,7 +160,7 @@ fn interval_bound_eval_failure_semantics() {
     let mut ctx = event(vec![("aid", num(1.0))]);
     assert!(
         !execute_joins(
-            &vec![interval_join(within.clone(), JoinMode::Inner)],
+            &[interval_join(within.clone(), JoinMode::Inner)],
             &mut ctx,
             &lookup,
             500_000_000_000
@@ -170,7 +170,7 @@ fn interval_bound_eval_failure_semantics() {
     let mut ctx = event(vec![("aid", num(1.0))]);
     assert!(
         execute_joins(
-            &vec![interval_join(within, JoinMode::Snapshot)],
+            &[interval_join(within, JoinMode::Snapshot)],
             &mut ctx,
             &lookup,
             500_000_000_000
@@ -186,7 +186,7 @@ fn interval_join_without_candidates_falls_back_per_mode() {
     let mut ctx = event(vec![("aid", num(1.0))]);
     assert!(
         !execute_joins(
-            &vec![interval_join(within.clone(), JoinMode::Inner)],
+            &[interval_join(within.clone(), JoinMode::Inner)],
             &mut ctx,
             &EmptyLookup,
             500_000_000_000
@@ -196,7 +196,7 @@ fn interval_join_without_candidates_falls_back_per_mode() {
     let mut ctx = event(vec![("aid", num(1.0))]);
     assert!(
         execute_joins(
-            &vec![interval_join(within.clone(), JoinMode::Snapshot)],
+            &[interval_join(within.clone(), JoinMode::Snapshot)],
             &mut ctx,
             &EmptyLookup,
             500_000_000_000
@@ -206,7 +206,7 @@ fn interval_join_without_candidates_falls_back_per_mode() {
     let mut ctx = event(vec![("aid", num(1.0))]);
     assert!(
         execute_joins(
-            &vec![interval_join(within, JoinMode::Anti)],
+            &[interval_join(within, JoinMode::Anti)],
             &mut ctx,
             &EmptyLookup,
             500_000_000_000
@@ -288,8 +288,8 @@ fn enrich_join_row_skips_null_columnar_cells() {
     assert_eq!(ctx.fields.get("w.id"), Some(&str_val("a")));
     assert_eq!(ctx.fields.get("id"), Some(&str_val("a")));
     // Null `note` cell → field_value None → skipped entirely.
-    assert!(ctx.fields.get("w.note").is_none());
-    assert!(ctx.fields.get("note").is_none());
+    assert!(!ctx.fields.contains_key("w.note"));
+    assert!(!ctx.fields.contains_key("note"));
 }
 
 #[test]
@@ -307,7 +307,7 @@ fn build_eval_context_named_bind_count_and_out_of_range_branch() {
     let ctx = build_eval_context(&keys, &scope_key, &[], &[bd], &[], None, &named);
     assert_eq!(ctx.fields.get("_bind_win_count"), Some(&num(5.0)));
     // `amount` was not requested → absent (only the count field is wanted).
-    assert!(ctx.fields.get("amount").is_none());
+    assert!(!ctx.fields.contains_key("amount"));
 
     // Step whose satisfied_branch_index is out of range → no `_step_0_source`.
     let sd = StepData {
@@ -345,7 +345,7 @@ fn build_eval_context_named_bind_count_and_out_of_range_branch() {
     assert_eq!(ctx.fields.get("login"), Some(&num(3.0)));
     assert_eq!(ctx.fields.get("_step_0_measure"), Some(&num(3.0)));
     assert!(
-        ctx.fields.get("_step_0_source").is_none(),
+        !ctx.fields.contains_key("_step_0_source"),
         "out-of-range satisfied_branch_index must not set a source field"
     );
 }

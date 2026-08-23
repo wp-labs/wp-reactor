@@ -438,6 +438,7 @@ impl CepStateMachine {
     /// carry `window_start`; sliding/session pass `None`). Extracted from
     /// `advance_at_with_diagnostics` so HOP can fan a single event out to
     /// every covering window.
+    #[allow(clippy::too_many_arguments)] // HOP 扇出: 事件/时间/查找/掩码/行/进度/窗口键 7 组参数
     fn advance_window<E: FieldSource>(
         &mut self,
         alias: &str,

@@ -304,7 +304,6 @@ fn q4_q6_plan(fixed: bool) -> MatchPlan {
 
 /// Q4/Q6 的 RulePlan（joins 携带 auction_events snapshot）。
 // 注：join-then-key 的 lookup 由 state machine 直接消费，bench 不需要 RulePlan。
-
 /// Q5/Q7 的 MatchPlan：fixed 10s 窗口 + close count/max。
 fn q5_q7_plan(max_measure: bool) -> MatchPlan {
     MatchPlan {
@@ -963,23 +962,26 @@ impl WindowLookup for AuctionLookup {
 /// 行预缓存（模拟真实窗口索引——join_lookup 返回已存在行，Arc clone 便宜；
 /// 不每事件新建 JoinRow）。
 struct PersonLookup {
-    map: HashMap<i64, (String, String)>,
     rows: HashMap<i64, JoinRow>,
 }
 
 impl PersonLookup {
     fn new(domain: u64) -> Self {
         let states = ["OR", "ID", "CA", "AZ", "WY", "WA"];
-        let mut map = HashMap::with_capacity(domain as usize);
-        for id in 0..domain as i64 {
-            map.insert(
-                BIDDER_BASE + id,
-                (
-                    states[(id % states.len() as i64) as usize].to_string(),
-                    "city".to_string(),
-                ),
-            );
-        }
+        // 索引构建模拟（与真实窗口 join 索引同成本量级）；建完只留行缓存。
+        let map: HashMap<i64, (String, String)> = {
+            let mut m = HashMap::with_capacity(domain as usize);
+            for id in 0..domain as i64 {
+                m.insert(
+                    BIDDER_BASE + id,
+                    (
+                        states[(id % states.len() as i64) as usize].to_string(),
+                        "city".to_string(),
+                    ),
+                );
+            }
+            m
+        };
         let rows = map
             .iter()
             .map(|(id, (state, city))| {
@@ -990,7 +992,7 @@ impl PersonLookup {
                 (*id, JoinRow::Event(Arc::new(Event { fields })))
             })
             .collect();
-        Self { map, rows }
+        Self { rows }
     }
 }
 

@@ -1612,9 +1612,14 @@ fn build_eval_context_named_mode_and_trigger_event_precedence() {
 /// A `WindowLookup` for the `execute_joins` unit tests: `snapshot` /
 /// `snapshot_with_timestamps` back the default `join_lookup` / `asof_candidates`
 /// impls; `asof_fast` drives the single-condition O(1) fast path.
+///
+/// `rows`/`ts_rows` 按字符串键索引（多键 join 用）；`asof_fast` 命中时
+/// `join_lookup_asof` 走 O(1) 快路径。
+type JoinLookupRows = HashMap<String, Vec<HashMap<String, Value>>>;
+type JoinLookupTsRows = HashMap<String, Vec<(i64, HashMap<String, Value>)>>;
 struct JoinLookup {
-    rows: HashMap<String, Vec<HashMap<String, Value>>>,
-    ts_rows: HashMap<String, Vec<(i64, HashMap<String, Value>)>>,
+    rows: JoinLookupRows,
+    ts_rows: JoinLookupTsRows,
     asof_fast: Option<AsofOutcome>,
 }
 

@@ -190,16 +190,16 @@ fn execute_test_run(
                 // `on each` rules: the match machine has no state for them, so
                 // drive the on-each path directly (joins are rejected up front,
                 // so an empty lookup never matters here).
-                if plan.each_plan.is_some() {
-                    if let Ok(Some(alert)) = executor.execute_each_with_joins(
+                if plan.each_plan.is_some()
+                    && let Ok(Some(alert)) = executor.execute_each_with_joins(
                         &event,
                         current_nanos,
                         &NoLookup,
                         &[],
                         current_nanos,
-                    ) {
-                        alerts.push(alert);
-                    }
+                    )
+                {
+                    alerts.push(alert);
                 }
 
                 current_nanos += 1_000_000_000;

@@ -274,7 +274,7 @@ fn stats_row_fields(
         if let Expr::Field(fr) = k {
             let n = wf_engine::match_engine::field_ref_name(fr);
             if !n.is_empty() {
-                fields.remove(&n.to_string());
+                fields.remove(n);
             }
         }
     }

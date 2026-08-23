@@ -277,11 +277,8 @@ fn func_call_routing_qualified_system_var_and_builtins() {
 
     // L3 func dispatch (collect_set over `_step_0_values`).
     let l3_ctx = ctx_with(vec![
-        (
-            "_step_0_values".into(),
-            Value::Array(vec![num(1.0), num(1.0)]),
-        ),
-        ("_step_0_source".into(), str_val("e")),
+        ("_step_0_values", Value::Array(vec![num(1.0), num(1.0)])),
+        ("_step_0_source", str_val("e")),
     ]);
     assert_eq!(
         l3(&call("collect_set", vec![field("e")]), &l3_ctx, meta),

@@ -1245,8 +1245,8 @@ fn close_output_carries_window_times_and_last_event() {
         .close(&[str_val("10.0.0.1")], CloseReason::Timeout)
         .unwrap();
     assert_eq!(out.close_reason, CloseReason::Timeout);
-    assert_eq!(out.event_ok, true);
-    assert_eq!(out.close_ok, true);
+    assert!(out.event_ok);
+    assert!(out.close_ok);
     assert_eq!(out.event_first_time_nanos, 1_000);
     assert_eq!(out.event_last_time_nanos, 2_000);
     assert_eq!(out.last_event_nanos, 2_000);

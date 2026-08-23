@@ -623,7 +623,7 @@ fn format_and_join_functions() {
         name: "bogus_fn".into(),
         args: vec![],
     };
-    assert_eq!(eval("join", &[bogus.clone()], &ctx), None);
+    assert_eq!(eval("join", std::slice::from_ref(&bogus), &ctx), None);
 
     assert_eq!(
         eval("join_by", &[lit("|"), lit("a"), num_expr(1.0)], &ctx),
@@ -890,13 +890,13 @@ fn stat_selector_and_stat_func_branches() {
     };
 
     // count(window_event(alias)) reads `_bind_{alias}_count`.
-    let ctx = ctx_with(vec![("_bind_w_count".into(), num(7.0))]);
+    let ctx = ctx_with(vec![("_bind_w_count", num(7.0))]);
     assert_eq!(
         eval_stat_func("count", &[sel("window_event", "w")], &ctx),
         Some(num(7.0))
     );
     // count(match_event(label)) reads the label field.
-    let ctx = ctx_with(vec![("fail".into(), num(3.0))]);
+    let ctx = ctx_with(vec![("fail", num(3.0))]);
     assert_eq!(
         eval_stat_func("count", &[sel("match_event", "fail")], &ctx),
         Some(num(3.0))
@@ -933,7 +933,7 @@ fn stat_selector_and_stat_func_branches() {
     // unknown function name → None.
     assert_eq!(eval_stat_func("bogus", &[sel("trigger", "x")], &ctx), None);
     // non-numeric count field → None.
-    let ctx = ctx_with(vec![("_bind_w_count".into(), str_val("x"))]);
+    let ctx = ctx_with(vec![("_bind_w_count", str_val("x"))]);
     assert_eq!(
         eval_stat_func("count", &[sel("window_event", "w")], &ctx),
         None
@@ -947,11 +947,8 @@ fn stat_selector_and_stat_func_branches() {
 #[test]
 fn l3_func_series_and_edge_cases() {
     let ctx = ctx_with(vec![
-        (
-            "_step_0_values".into(),
-            arr(vec![num(1.0), num(2.0), num(2.0)]),
-        ),
-        ("_step_0_source".into(), str_val("e")),
+        ("_step_0_values", arr(vec![num(1.0), num(2.0), num(2.0)])),
+        ("_step_0_source", str_val("e")),
     ]);
     let empty_ctx = ctx_with(vec![]);
 
@@ -1019,14 +1016,14 @@ fn l3_func_series_and_edge_cases() {
     );
 
     // stddev with < 2 numeric values → 0.
-    let single = ctx_with(vec![("_step_0_values".into(), arr(vec![num(5.0)]))]);
+    let single = ctx_with(vec![("_step_0_values", arr(vec![num(5.0)]))]);
     assert_eq!(
         eval_l3_func("stddev", &[field("e")], &single, YieldMeta::default()),
         Some(num(0.0))
     );
     // stddev with non-numeric values only → 0.
     let strs = ctx_with(vec![(
-        "_step_0_values".into(),
+        "_step_0_values",
         arr(vec![str_val("a"), str_val("b")]),
     )]);
     assert_eq!(
@@ -1035,7 +1032,7 @@ fn l3_func_series_and_edge_cases() {
     );
     // stddev happy path: [1, 2, 3] → sqrt(2/3).
     let three = ctx_with(vec![(
-        "_step_0_values".into(),
+        "_step_0_values",
         arr(vec![num(1.0), num(2.0), num(3.0)]),
     )]);
     assert_eq!(
@@ -1101,12 +1098,12 @@ fn l3_func_series_and_edge_cases() {
 #[test]
 fn aggregate_func_step_bind_and_missing_paths() {
     let steps = ctx_with(vec![
-        ("_step_0_measure".into(), num(10.0)),
-        ("_step_0_values".into(), arr(vec![num(10.0)])),
-        ("_step_0_source".into(), str_val("e")),
-        ("_step_1_measure".into(), num(20.0)),
-        ("_step_1_values".into(), arr(vec![num(20.0)])),
-        ("_step_1_source".into(), str_val("e")),
+        ("_step_0_measure", num(10.0)),
+        ("_step_0_values", arr(vec![num(10.0)])),
+        ("_step_0_source", str_val("e")),
+        ("_step_1_measure", num(20.0)),
+        ("_step_1_values", arr(vec![num(20.0)])),
+        ("_step_1_source", str_val("e")),
     ]);
     // Simple field arg → step measures.
     assert_eq!(
@@ -1137,19 +1134,16 @@ fn aggregate_func_step_bind_and_missing_paths() {
             "sum",
             &[qualified("e", "x")],
             &ctx_with(vec![
-                ("_step_0_values".into(), arr(vec![num(1.0), num(2.0)])),
-                ("_step_0_source".into(), str_val("e")),
+                ("_step_0_values", arr(vec![num(1.0), num(2.0)])),
+                ("_step_0_source", str_val("e")),
             ])
         ),
         Some(num(3.0))
     );
     // Qualified field with bind values only → over_values on bind series.
     let bind = ctx_with(vec![
-        (
-            "_bind_b_field_x".into(),
-            arr(vec![num(1.0), num(2.0), num(3.0)]),
-        ),
-        ("_bind_b_count".into(), num(3.0)),
+        ("_bind_b_field_x", arr(vec![num(1.0), num(2.0), num(3.0)])),
+        ("_bind_b_count", num(3.0)),
     ]);
     assert_eq!(
         eval_aggregate_func("max", &[qualified("b", "x")], &bind),
@@ -1172,8 +1166,8 @@ fn aggregate_func_step_bind_and_missing_paths() {
             "avg",
             &[field("e")],
             &ctx_with(vec![
-                ("_step_0_values".into(), arr(vec![num(2.0), num(4.0)])),
-                ("_step_0_source".into(), str_val("e")),
+                ("_step_0_values", arr(vec![num(2.0), num(4.0)])),
+                ("_step_0_source", str_val("e")),
             ])
         ),
         Some(num(3.0))

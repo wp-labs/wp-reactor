@@ -631,7 +631,7 @@ fn execute_joins_inner_snapshot_anti_and_enrich() {
     join.emit_at = Some(Expr::Number(0.0));
     let mut ctx = event(vec![("bidder", num(1.0))]);
     assert!(execute_joins(&[join], &mut ctx, &lookup, 1000));
-    assert!(ctx.fields.get("w.id").is_none());
+    assert!(!ctx.fields.contains_key("w.id"));
 }
 
 #[test]
@@ -671,7 +671,7 @@ fn execute_joins_asof_single_and_multi_cond_scan() {
     });
     let mut ctx = event(vec![("bidder", num(1.0)), ("other", str_val("bob"))]);
     assert!(execute_joins(&[join], &mut ctx, &lookup, 1000));
-    assert!(ctx.fields.get("w.id").is_none());
+    assert!(!ctx.fields.contains_key("w.id"));
 }
 
 #[test]
@@ -725,7 +725,7 @@ fn execute_interval_join_modes() {
     ]);
     let mut ctx = event(vec![("bidder", num(1.0))]);
     assert!(execute_joins(&[asof], &mut ctx, &multi, 0));
-    assert!(ctx.fields.get("w.id").is_some());
+    assert!(ctx.fields.contains_key("w.id"));
 
     // Snapshot interval: picks the min-ts row; open bounds respected.
     let mut snap = join.clone();
@@ -819,8 +819,8 @@ fn build_eval_context_narrow_and_all() {
     let ctx = build_eval_context(
         &keys,
         &scope,
-        &[sd.clone()],
-        &[bind.clone()],
+        std::slice::from_ref(&sd),
+        std::slice::from_ref(&bind),
         &step_plans,
         Some(&trigger),
         &narrow,
@@ -830,12 +830,12 @@ fn build_eval_context_narrow_and_all() {
     assert_eq!(ctx.fields.get("src"), Some(&str_val("10.0.0.1")));
     assert_eq!(ctx.fields.get("dip"), Some(&str_val("8.8.8.8")));
     // `_step_*` synthetic fields absent in the narrow build.
-    assert!(ctx.fields.get("_step_0_values").is_none());
+    assert!(!ctx.fields.contains_key("_step_0_values"));
     // Named 窄化（2026-08 hotpath）：trigger_event 字段只注入 Named 集合内的；
     // "raw" 不在集合中 → 不注入（旧行为全量注入，是 per-fire 热路径浪费——
     // Q13 每事件 8 字段 → 1 字段）。All 模式下仍全量。
     assert!(
-        ctx.fields.get("raw").is_none(),
+        !ctx.fields.contains_key("raw"),
         "narrow 构建不注入集合外字段"
     );
 
@@ -844,8 +844,8 @@ fn build_eval_context_narrow_and_all() {
     let ctx = build_eval_context(
         &keys,
         &scope,
-        &[sd.clone()],
-        &[bind.clone()],
+        std::slice::from_ref(&sd),
+        std::slice::from_ref(&bind),
         &step_plans,
         None,
         &all,
@@ -1525,7 +1525,7 @@ fn execute_match_yield_kinds_and_coercion_omission() {
     assert_eq!(fields.get("flag_field"), Some(&&Value::Bool(true)));
     assert_eq!(fields.get("general_field"), Some(&&num(55.0)));
     // Missing typed field → omitted (empty-string + non-Chars).
-    assert!(fields.get("missing_typed").is_none());
+    assert!(!fields.contains_key("missing_typed"));
     // Machine id from the matched context.
     let mut matched2 = matched;
     matched2.machine_id = "m".into();

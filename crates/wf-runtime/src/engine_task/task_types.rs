@@ -96,10 +96,14 @@ pub(crate) struct StatsTaskConfig {
     pub time_field: Option<String>,
     pub timeout_scan_interval: Duration,
     pub intermediate_targets: HashSet<String>,
+    // 预留：stats → 中间流（pipe）relay（emit_close_record 现记录丢弃）与分片
+    // stats（当前仅 shard_index 用于 pull）——与 RuleTaskConfig 形状对齐。
+    #[allow(dead_code)]
     pub pipe_registry: std::sync::Arc<wf_engine::pipe::PipeRegistry>,
     pub eos_flush: watch::Receiver<u64>,
     pub push_rx: Option<mpsc::Receiver<RulePush>>,
     pub progress: std::collections::HashMap<String, Arc<AtomicU64>>,
     pub shard_index: Option<usize>,
+    #[allow(dead_code)]
     pub shard_count: usize,
 }

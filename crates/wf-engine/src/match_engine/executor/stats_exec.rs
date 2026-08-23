@@ -78,6 +78,7 @@ impl DistinctKey {
             })
         }
     }
+    #[allow(clippy::should_implement_trait)] // 与 from_i64/from_f64 平行的构造器命名，非 FromStr 实现
     pub fn from_str(s: &str) -> Self {
         DistinctKey::Str(s.into())
     }
@@ -111,15 +112,6 @@ pub struct StatsBucket {
 }
 
 impl StatsWindowState {
-    fn new(window_start_nanos: i64) -> Self {
-        Self {
-            buckets: EngineHashMap::default(),
-            window_start_nanos,
-            last_event_nanos: 0,
-            event_count: 0,
-        }
-    }
-
     /// 预建空键单桶（`ScopeKey::Empty`）——哈希路径 `bucket_mut(&Empty)` 命中。
     fn seed_empty_bucket(buckets: &mut EngineHashMap<u64, Vec<StatsBucket>>, n_measures: usize) {
         buckets.insert(
@@ -186,8 +178,8 @@ impl StatsWindowState {
     /// 清空并拍平全部桶（close 用）: `(ScopeKey, accs)` 按 ScopeKey 升序。
     fn take_buckets(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
         let mut out: Vec<(ScopeKey, Vec<StatsAccum>)> = std::mem::take(&mut self.buckets)
-            .into_iter()
-            .flat_map(|(_, chain)| chain.into_iter().map(|b| (b.scope_key, b.accs)))
+            .into_values()
+            .flat_map(|chain| chain.into_iter().map(|b| (b.scope_key, b.accs)))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -433,8 +425,8 @@ impl StatsExecutor {
         let mut buckets: Vec<(ScopeKey, Vec<f64>)> = self
             .window
             .buckets
-            .iter()
-            .flat_map(|(_, chain)| chain.iter())
+            .values()
+            .flat_map(|chain| chain.iter())
             .map(|b| {
                 (
                     b.scope_key.clone(),
@@ -610,7 +602,7 @@ impl StatsExecutor {
                 self.measure_where[idx].map(|wi| &masks[wi]),
             );
             let acc = &mut self.window.bucket_mut(&ScopeKey::Empty, n_measures)[idx];
-            let rows_in = mask.as_ref().map_or(n as u64, |m| count_true(m));
+            let rows_in = mask.as_ref().map_or(n as u64, count_true);
             match measure.agg {
                 StatsAggPlan::Count => {
                     acc.count += rows_in;
@@ -691,6 +683,7 @@ impl StatsExecutor {
     ///
     /// `rows`（P2 分片）= 本片行子集: **只归并行域内的行**——否则每片处理全批,
     /// 每个键被 N 片各算一遍, close 重复输出 N 倍（Q16 实测 EMIT 10 倍）。
+    #[allow(clippy::too_many_arguments)] // 列式批处理签名: 键列/掩码/行域/行字段提取列 4 组参数
     fn process_batch_keyed(
         &mut self,
         batch: &RecordBatch,
@@ -750,6 +743,7 @@ impl StatsExecutor {
     /// 预解析列, 无 Box 分配/无逐行 downcast）→ `comps_hash` → `keyed_bucket_mut`
     /// （链扫描, `ScopeKey` 仅每桶首见构建一次）; 键数 > 4 回退完整键
     /// `scope_key_columnar`（罕见）。
+    #[allow(clippy::too_many_arguments)] // 与 process_batch_keyed 同签名族
     fn accumulate_keyed_row(
         &mut self,
         batch: &RecordBatch,
@@ -809,8 +803,9 @@ impl StatsExecutor {
 ///
 /// last/top 行字段每行懒提取一次, 多度量共享同一 Arc（Q18 4 个 last 度量内存
 /// 1 份; 提取列序 = row_names, 免整行 8 字段）。
+#[allow(clippy::too_many_arguments)] // 单行桶累加: 桶/计划/掩码索引/行字段/列/行号 6 组参数
 fn accumulate_column_row(
-    bucket: &mut Vec<StatsAccum>,
+    bucket: &mut [StatsAccum],
     plan: &StatsPlan,
     measure_where: &[Option<usize>],
     measure_field_idx: &[Option<usize>],
