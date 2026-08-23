@@ -150,10 +150,13 @@ cut_output = true
   引擎时钟）写一条完整测量记录：
   `perf_sentinel{round=k, n=<N_k>, start_ns=<wfgen T0>, emit_ns=<引擎完成时刻>}`。
   该记录四元组齐备，**EPS 直接可算**：`eps = n / (emit_ns − start_ns)`。
-- **记录输出（文件 sink，bench 配置）**：sentinel 告警走既有 alert 链，由 bench 的
+- **记录输出（文件 sink，case 配置）**：sentinel 告警走既有 alert 链，由 case 的
   `topology/sinks/infra.d/perf_sentinel.toml` 落盘 `data/perf_sentinel.ndjson`
   （JSONL，一行一条四元组记录）——**wfgen 从该文件读记录**，比从 metrics 流
   解析干净；`perf_sentinel` 指标仍写，作跨档一致性校验。
+  **独立验证 case**：`wf-examples/performance/perf_diag_case/`（单流、~24 规则、
+  100k 事件）承载机制端到端验证（验收清单见其 README/verify.sh），不与
+  nexmark_pk/qradar_pk 基准混在一起；真实 bench 需要时各自补同款 sink。
 - **记录路径豁免 cut_output**：完成信号不能随输出墙被切——哨兵规则的 emit
   （metric + 告警落盘）不受 `cut_output` 门控影响（与数据规则区分，见 §4.2）。
   单批仅 1 条，常数量处理开销，增量抵消。
@@ -271,7 +274,7 @@ wfgen perf-diag \
 1. wf-config：`PerfConfig`（diag/cut_rules/cut_output）+ 解析 + 测试；
 2. wf-runtime：`set_perf_cuts` 原子门控 + `process_batch`/`emit` 切口 + 测试；
 3. wf-runtime：内置 `__perf_sentinel` 窗口/规则 + `perf_sentinel` 指标 + 告警落盘
-   （走 alert 链、豁免 cut_output）+ 豁免门控测试；bench 侧补
+   （走 alert 链、豁免 cut_output）+ 豁免门控测试；perf_diag_case 侧补
    `topology/sinks/infra.d/perf_sentinel.toml`（`data/perf_sentinel.ndjson`）；
 4. wf-runtime：诊断点状态机——sentinel emit → 门控翻转 + 规则子集 reload 触发 +
    `perf_point` 切换完成信号（无 admin 端点）；
