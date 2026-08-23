@@ -134,7 +134,7 @@ bench 项：`q5_q7_window_conv_top`。
 | Q17 | auction 键 close 8 | — | `q16_q17_keyed_close` |
 | Q18 | 复合键 close | — | `q18_composite_key_close` |
 | Q19 | stats group by top-N | — | `q19_stats_group_topn` |
-| Q20 | each+snapshot join+where | — | `q20_each_snapshot_join_where` |
+| Q20 | each+snapshot join+where | — | `q20_each_snapshot_join_where`（行式）+ `q20_each_snapshot_join_where_columnar`（列式 F6，含行/列对拍断言） |
 | Q21 | bind filter 字符串 | — | `q21_string_bind_filter` |
 | Q22 | each+split 字符串 | `match_bench`（旧 asof 形态，已废弃） | `q22_each_split` |
 
@@ -253,13 +253,15 @@ fire + match/close 输出路径的 ctx 构建（Q3/Q4/Q5/Q6/Q7/Q12/Q13/Q20）。
 实测（nexmark_hotpath_bench，机器负载波动）：q5 **-42%**（640→370）、q13 advance
 **-38%**（985→611）、q12 **-22%**（762→592）、q11 **-19%**（756→615）。
 
-### 🔍 已审查、暂不改（需实测数据或改动面大）
+### 🔍 已审查、暂不改 / 已解决（需实测数据或改动面大）
 
 - **Q22 split（A1）**：实测 2069ns 超出 §3 阈值 11 倍——**重新评估**：split 复用
   输出 buffer（Vec 预分配）、mvindex 直接索引 str 段避免 Value 包装、concat 预分配
   容量。此前判"无静态改进空间"与阈值矛盾，待专项做。
-- **Q13/Q11/Q18 RSS（A2/A3/A4）**：需运行确认是状态物化还是管道积压（q22 的 RSS
-  已实证为积压），不做无数据优化。
+- ~~**Q13 RSS（A2）**~~ ✅ 已解决（2026-08-23 F5 死 join 消除 + F6 列式 join，
+  22.9GB→7.1GB、EPS 1.7M→15.9M，见 §8）。
+- **Q11/Q18 RSS（A3/A4）**：需运行确认是状态物化还是管道积压（q22 的 RSS
+  已实证为积压），待逐项归因（见 §8.4）。
 - **Q19 top-N RSS（A5）** / **Q4/Q6 join-then-key RSS（A7）**：确认但未优化。
 
 ## 8. RSS 归因实证（2026-08-23，q13 22GB 根因 + 修复）
