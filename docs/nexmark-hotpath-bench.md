@@ -365,6 +365,10 @@ N=500k，同进程行式/列式对拍 + 输出逐位断言）**：
   match/close 输出时的 `execute_match_with_joins` 富化仍行式，待专项。
 - **q11/q18/q19 的 RSS**：均为同类积压/状态结构问题，待逐项归因。
 - **q22 split（A1）**：on-each 家族最高单事件成本，见 §7 遗留。
+- **match advance 列式化（q6 剩余瓶颈）**：CEP 状态机本体（InstanceKey 构建 +
+  HashMap 实例管理 + 逐事件 step 推进 + Matched 构造 ~790ns/evt）批级化需专用
+  执行路径（如 stats 列式聚合），或 q6 类「条件统计」规则改走 stats 执行器——
+  结构性决策，见 §8.8。
 
 ### 8.5 批级 join-then-key（F7，2026-08-23）
 
@@ -436,3 +440,31 @@ q13 match+join emit（同路径）顺带 -12%。
 **30M 实测**：q6 0.50M → **0.55M**（EPS 492k→578k 区间，load 6-8 波动 ±10%）；
 全量回归 2565 tests 绿。剩余瓶颈：ctx HashMap 构建（~200ns）+ advance sliding
 （~800ns）+ 单核串行（join-then-key 无法分片，v1 CONNECTIONS=1 结论）。
+
+### 8.7 match emit ctx-free 快路径（F8.5，2026-08-23）
+
+q6 的 ctx 只含 seller（scope_key）+ auction（trigger_event 字段）——
+`build_eval_context` 每事件构建 2 字段 HashMap（~200ns/事件）。输出字段直读
+scope_key + trigger_event 即可，免构建：
+- 编译期 gate `compute_match_ctx_free`（OutputStatic.match_ctx_free）：score
+  常量 + entity/yield 全 Field/Lit（无 General）+ 无 where + live_joins 空 +
+  输出字段不命中 step label/tracked/_step_/_bind_；
+- 运行时 `ResolveCtx` 抽象（Full / Free 两模式），`build_match_alert` 重构为
+  inner；`execute_match_at` / `execute_match_with_joins_at` gate 通过时直接走
+  free（execute_joins/where_ok 空转整体跳过）；
+- 对拍测试：Full vs free 逐字段字节一致 + gate 反向（where / General 禁用）。
+
+微基准：q6 emit 全路径 **1055→609ns（-42%）**；q13 同形状顺带受益。
+
+### 8.8 collected_values 收集 gate（F9，2026-08-23）
+
+`update_measure` 无条件 push collected_values（L3 序列函数经 ctx `_step_{i}_values`
+读取），q6 等单 bind avg/count 规则无人消费——每事件 VecDeque push + Matched 时
+StepData/MatchedContext 的 collected clone 纯浪费。收集移到调用方并 gate =
+`plan.needs_field_history`（编译器 L3/close 非键/join/多 bind 置 true）。
+微基准：q6 advance 797→791；q16/q17/q18 close 路径顺带受益。
+
+**q6 当前构成（30M 实测 1822ns/evt）**：advance ~790 + emit（ctx-free）~650 +
+rule_task 框架/scan/emit_batch ~380。剩余瓶颈 = CEP 状态机本体（InstanceKey
+构建 + HashMap 实例管理 + 逐事件 step 推进 + Matched 构造）——批级化需专用
+执行路径（见 §9 遗留），或 q6 类规则改走 stats 执行器列式聚合（结构性决策）。
