@@ -3,7 +3,8 @@
 //! 目标：为 NEXMark Q1~Q22 的运行热路径补齐微基准，量化各查询形态的
 //! ns/事件 成本并归因，找出性能数据不合理（偏离预期形态 / 与同类查询量级
 //! 不匹配）的位置。覆盖矩阵与 30M 实测基线见
-//! `docs/nexmark-hotpath-bench.md`（本文件为数据版，文档为分析版）。
+//! `docs/archive/nexmark-hotpath-bench.md`（本文件为数据版，文档为分析版，
+//! 已随历史调查记录归档）。
 //!
 //! 运行（release-only，与 close_bench/deferred_bench 同款）：
 //!   cargo test --release -p wf-engine nexmark_hotpath_bench -- --ignored --nocapture
