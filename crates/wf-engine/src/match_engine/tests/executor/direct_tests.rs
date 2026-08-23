@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use wf_lang::ast::{Expr, FieldRef};
-use wf_lang::plan::{EachPlan, YieldField};
+use wf_lang::ast::{BinOp, Expr, FieldRef, JoinMode};
+use wf_lang::plan::{EachPlan, JoinCondPlan, JoinPlan, YieldField};
 use wf_lang::{BaseType, FieldType};
 
 use crate::alert::AlertColumnBuilder;
@@ -36,6 +36,289 @@ impl WindowLookup for EmptyLookup {
     ) -> Option<Vec<(i64, crate::match_engine::JoinRow)>> {
         None
     }
+}
+
+/// Snapshot join lookup stub: serves fixed right-window rows through the
+/// trait's default `join_lookup` (snapshot scan + `values_equal`), which both
+/// the row and columnar join paths consult — identical lookup semantics.
+struct MockJoinLookup {
+    rows: Vec<crate::match_engine::JoinRow>,
+}
+
+impl WindowLookup for MockJoinLookup {
+    fn snapshot_field_values(
+        &self,
+        _window: &str,
+        _field: &str,
+    ) -> Option<std::collections::HashSet<String>> {
+        None
+    }
+    fn snapshot(&self, _window: &str) -> Option<Vec<crate::match_engine::JoinRow>> {
+        Some(self.rows.clone())
+    }
+    fn snapshot_with_timestamps(
+        &self,
+        _window: &str,
+    ) -> Option<Vec<(i64, crate::match_engine::JoinRow)>> {
+        None
+    }
+}
+
+/// q20 形状的 each + Snapshot join + where 规则：`b.auction ==
+/// auction_events.id`，where `auction_events.category == 10`，entity/yield 读
+/// 左窗 `b.auction` + 右窗 `auction_events.category`。
+fn each_join_plan_rule() -> RuleExecutor {
+    let mut plan = simple_rule_plan(
+        "q20_shape",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "b".into(),
+        filter: None,
+    });
+    plan.joins = vec![JoinPlan {
+        right_window: "auction_events".into(),
+        mode: JoinMode::Snapshot,
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Qualified("b".into(), "auction".into()),
+            right: FieldRef::Qualified("auction_events".into(), "id".into()),
+        }],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    }];
+    plan.r#where = Some(Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Qualified(
+            "auction_events".into(),
+            "category".into(),
+        ))),
+        right: Box::new(Expr::Number(10.0)),
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        },
+        YieldField {
+            name: "category".into(),
+            value: Expr::Field(FieldRef::Qualified(
+                "auction_events".into(),
+                "category".into(),
+            )),
+        },
+    ];
+    RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("id".into(), FieldType::Base(BaseType::Digit)),
+            ("category".into(), FieldType::Base(BaseType::Digit)),
+        ]),
+    )
+}
+
+/// q20 形状的驱动 batch：3 条 bid（auction=1/2/3）。右窗 auction 行：
+/// id=1 category=10（命中）、id=2 category=20（where 拒绝）、id=3 category=10
+/// （命中）。期望 appended=2 / rejected=1。
+#[test]
+fn execute_each_direct_batch_columnar_join_matches_event_path_rows() {
+    use crate::match_engine::event_bridge::{ColumnarEvent, JoinRow, materialize_rows};
+    use arrow::array::{ArrayRef, Float64Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    let exec = each_join_plan_rule();
+    assert_eq!(
+        exec.live_joins().len(),
+        1,
+        "where/yield 读右窗字段 → join 必须存活"
+    );
+    assert!(
+        exec.each_join_columnar_ready(),
+        "q20 形状必须解析出列式 join 计划"
+    );
+    assert!(exec.each_plan_columnar_safe(), "q20 形状必须列式安全");
+
+    let lookup = MockJoinLookup {
+        rows: vec![
+            JoinRow::Event(Arc::new(event(vec![
+                ("id", num(1.0)),
+                ("category", num(10.0)),
+            ]))),
+            JoinRow::Event(Arc::new(event(vec![
+                ("id", num(2.0)),
+                ("category", num(20.0)),
+            ]))),
+            JoinRow::Event(Arc::new(event(vec![
+                ("id", num(3.0)),
+                ("category", num(10.0)),
+            ]))),
+        ],
+    };
+
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("price", DataType::Float64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![100, 200, 300])),
+            Arc::new(Float64Array::from(vec![10.5, 20.5, 30.5])),
+        ],
+    )
+    .unwrap();
+
+    // Reference：eager 物化 + Event 版 each+join 批路径（行式）。
+    let events: Vec<Event> = materialize_rows(&batch, &[0, 1, 2]);
+    let rows: Vec<(&Event, i64)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut via_events = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_idx = Vec::new();
+    let stats = exec.execute_each_direct_batch(
+        &rows,
+        &lookup,
+        &[],
+        NANOS,
+        &mut via_events,
+        &mut appended_idx,
+    );
+    assert_eq!(stats.appended, 2, "行式：auction 1/3 命中且 category=10");
+    assert_eq!(stats.rejected, 1, "行式：auction 2 where 拒绝");
+    assert_eq!(stats.failed, 0);
+
+    // 列式 join 路径。
+    let col_events: Vec<ColumnarEvent<'_>> =
+        (0..3).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut via_columnar = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_idx_c = Vec::new();
+    let stats_c = exec.execute_each_direct_batch_columnar_join(
+        &col_rows,
+        &lookup,
+        NANOS,
+        &mut via_columnar,
+        &mut appended_idx_c,
+    );
+    assert_eq!(stats_c, stats);
+    assert_eq!(appended_idx_c, appended_idx);
+
+    assert_batches_equal_rows(&via_events.finish(), &via_columnar.finish());
+}
+
+/// 列式 join gate 分支：形状不支持 → 回退行式（each_plan_columnar_safe=false）。
+#[test]
+fn each_join_columnar_gate_rejects_unsupported_shapes() {
+    let base = || {
+        let mut plan = simple_rule_plan(
+            "r",
+            simple_plan(vec![], vec![]),
+            Expr::Number(1.0),
+            "ip",
+            Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        );
+        plan.binds[0].alias = "b".into();
+        plan.each_plan = Some(EachPlan {
+            alias: "b".into(),
+            filter: None,
+        });
+        plan.joins = vec![JoinPlan {
+            right_window: "auction_events".into(),
+            mode: JoinMode::Snapshot,
+            conds: vec![JoinCondPlan {
+                left: FieldRef::Qualified("b".into(), "auction".into()),
+                right: FieldRef::Qualified("auction_events".into(), "id".into()),
+            }],
+            within: None,
+            reduce: None,
+            emit_at: None,
+        }];
+        plan
+    };
+
+    // where 引用**左窗**字段（非右窗）→ 不支持（列式 where 只吃右窗字段）。
+    let mut plan = base();
+    plan.r#where = Some(Expr::BinOp {
+        op: BinOp::Gt,
+        left: Box::new(Expr::Field(FieldRef::Qualified("b".into(), "price".into()))),
+        right: Box::new(Expr::Number(5.0)),
+    });
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // where 为复合表达式（函数）→ 不支持。
+    let mut plan = base();
+    plan.r#where = Some(Expr::FuncCall {
+        qualifier: None,
+        name: "upper".into(),
+        args: vec![Expr::Field(FieldRef::Qualified(
+            "auction_events".into(),
+            "category".into(),
+        ))],
+    });
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // 多条件 join → 不支持（需让 join 存活：yield 读右窗字段，否则被死 join 消除）。
+    let mut plan = base();
+    plan.joins[0].conds.push(JoinCondPlan {
+        left: FieldRef::Qualified("b".into(), "bidder".into()),
+        right: FieldRef::Qualified("auction_events".into(), "seller".into()),
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "cat".into(),
+        value: Expr::Field(FieldRef::Qualified(
+            "auction_events".into(),
+            "category".into(),
+        )),
+    }];
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // Asof 模式 → 不支持（v1 仅 Snapshot；同样让 join 存活）。
+    let mut plan = base();
+    plan.joins[0].mode = JoinMode::Asof { within: None };
+    plan.yield_plan.fields = vec![YieldField {
+        name: "cat".into(),
+        value: Expr::Field(FieldRef::Qualified(
+            "auction_events".into(),
+            "category".into(),
+        )),
+    }];
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // yield 读 Simple（裸名）字段 → 不支持（列式无法分辨裸名来源）。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "cat".into(),
+        value: Expr::Field(FieldRef::Simple("category".into())),
+    }];
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // 无 where + 输出只读左窗（q13 死 join 消除后 live_joins 空，不适用）——
+    // 这里 join 存活（无 where 也需右窗字段读才存活）；全左窗输出 → join 死。
+    let mut plan = base();
+    let exec = RuleExecutor::new(plan);
+    // 无 where、yield/entity 全读左窗 → 死 join 消除 → live_joins 空 → 无 join 列式路径。
+    assert!(
+        exec.live_joins().is_empty(),
+        "全左窗输出的 Snapshot join 必须被死 join 消除"
+    );
+    assert!(
+        exec.each_plan_columnar_safe(),
+        "死 join 消除后无 join 列式安全"
+    );
 }
 
 fn each_plan_rule() -> RuleExecutor {

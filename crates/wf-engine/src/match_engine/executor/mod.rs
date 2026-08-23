@@ -1,6 +1,7 @@
 mod alert;
 #[cfg(test)]
 pub(crate) use alert::{EachWfxPrefix, format_nanos_utc};
+use each_exec::parse_each_join_columnar;
 mod close_exec;
 mod context;
 #[cfg(test)]
@@ -353,6 +354,9 @@ fn visit_output_expr(
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct RuleExecutor {
     plan: RulePlan,
+    /// 列式 join 富化计划（each + 单 Snapshot join 的列式执行描述）；`None` =
+    /// 形状不支持 → 行式 each+join 路径。见 [`parse_each_join_columnar`]。
+    each_join_plan: Option<crate::match_engine::executor::each_exec::EachJoinPlan>,
     /// Joins whose enrichment the rule's output expressions actually read.
     /// Dead joins (Snapshot/Asof, enrichment unreferenced) are dropped here so
     /// the per-event join cost (ctx clone + lookup + `find_matching_row` +
@@ -393,6 +397,7 @@ impl Clone for RuleExecutor {
     fn clone(&self) -> Self {
         Self {
             plan: self.plan.clone(),
+            each_join_plan: self.each_join_plan.clone(),
             live_joins: self.live_joins.clone(),
             yield_field_types: self.yield_field_types.clone(),
             output: self.output.clone(),
@@ -444,6 +449,7 @@ impl RuleExecutor {
 
     pub fn new_with_options(plan: RulePlan, options: RuleExecutorOptions) -> Self {
         let live_joins = compute_live_joins(&plan);
+        let each_join_plan = parse_each_join_columnar(&plan);
         let bind_filters = plan
             .binds
             .iter()
@@ -514,6 +520,7 @@ impl RuleExecutor {
                 each_close_reason: Arc::from(""),
             },
             plan,
+            each_join_plan,
             live_joins,
             yield_field_types: options.yield_field_types,
             output: options.output,
@@ -536,6 +543,18 @@ impl RuleExecutor {
 
     pub fn plan(&self) -> &RulePlan {
         &self.plan
+    }
+
+    /// Live (output-referenced) joins after dead-join elimination. The runtime
+    /// uses this to route between the join-free and join columnar each paths.
+    pub fn live_joins(&self) -> &[JoinPlan] {
+        &self.live_joins
+    }
+
+    /// Whether this rule can run the columnar join-enrichment each path
+    /// (q20 等：each + 单 Snapshot join + 受限 where/输出形状)。
+    pub fn each_join_columnar_ready(&self) -> bool {
+        self.each_join_plan.is_some()
     }
 
     /// Post-join `where` filter check: evaluated after joins enrich the event

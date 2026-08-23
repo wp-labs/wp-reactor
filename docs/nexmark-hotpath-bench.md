@@ -15,7 +15,7 @@
 | 形态 | 查询 | 热路径 |
 |---|---|---|
 | `on each` 无状态投影 | Q1/Q10/Q21/Q22/Q14 | 列式 each 发射 + bind filter + 表达式（字符串/算术） |
-| `on each` + snapshot join + where | Q3/Q13/Q20 | join 查找 + 富化 + 后置 where |
+| `on each` + snapshot join + where | Q3/Q13/Q20 | 列式 join 富化（F6：批级 lookup + 列式右窗读）——死 join（q13）消除后走无 join 列式路径 |
 | `on each` + deferred join（within/reduce/emit at） | Q8/Q9 | 挂起 + 到期评估（exists / maxrow+tie） |
 | `match` CEP 状态机（fixed/sliding/session） | Q4/Q5/Q6/Q7/Q11/Q12/Q13 | key 提取 + 实例管理 + step/close 累积 + 过期 |
 | `match` + join-then-key | Q4/Q6 | join 查找取键 → 按右窗字段分组 |
@@ -308,10 +308,41 @@ q13.wfl 同步从 `match<bidder:10m>` 改写为 `on each b`（输出等价：每
 
 q9（唯一 join bid 的 deferred 规则）10m 输出 557,204 = 基线一致 ✅（over 回 1h 后）。
 
-### 8.3 遗留
+### 8.3 列式 join 富化（F6，2026-08-23）
 
-- **q20 等活 join 查询（2.5~2.9M/s）**：join 富化被输出引用 → 死 join 消除不适用；
-  需要**列式 join 富化**（批级 join_lookup + 富化，免每事件 Event clone）才能上列式
-  路径——Q3/Q4/Q6/Q9/Q13/Q20 全家族受益，下一优先级。
+**背景**：q20 等 each+活 join 查询（2.5~2.9M/s）——join 富化被输出引用 → 死 join
+消除不适用 → 走行式 each+join（每事件 `Event::clone()` + `enrich_join_row` 全字段
+注入 + `find_matching_row` 复核）。
+
+**实现**：`RuleExecutor.each_join_plan`（`parse_each_join_columnar`）——v1 形状：单
+Snapshot join（单条件 flat 限定引用）+ `where` 为「右窗字段 <cmp> 字面量」合取 +
+yield/entity 为字面量 / 左窗限定 / 右窗限定。新执行路径
+`execute_each_direct_batch_columnar_join`：**批级去重 join_lookup**（hot key 一次查）
++ 列式右窗字段读（`JoinRow.field_value`，免 Event clone）+ 列式 where 求值
+（`join_cmp` 复刻 `compare_values` 语义）。浮点左 key 保留 values_equal 复核
+（f64→Int 截断假匹配）；批快照 miss 的行在行循环时点实时复查（与行式逐事件
+同时机）。
+
+**实测（30M 单连接，rate=3m）**：
+
+| 配置 | EPS | RSS | CPU |
+|---|---|---|---|
+| 旧：each+join 行式 | 2.86M | 7.6GB | 736% |
+| **each + 列式 join 富化（F6）** | **9.24M** | 7.9GB | 454% |
+
+输出正确性：rate=3m 下列式 3 次 = 行式 = **5,503,985 逐位一致** ✓（30m 数据）；
+集成对拍测试（真实窗口+索引+RegistryLookup）锁定命中/miss/where 拒绝一致。
+
+**语义说明（固有非确定性）**：数据生成允许 bid ±10 lead 引用**未来** auction——
+处理 bid 时该 auction 若尚未 append 则 join miss（Flink 流 join 同语义）。EMIT 因此
+依赖处理速率 vs ingest 的竞速：行式自身 rate=1m 时从 1.86M 掉到 1.79M（30m 数据
+从 5.50M 掉到 5.26M 量级），列式（处理快）在同一速率下 miss 更多——非列式 bug，
+是速率依赖的固有语义。rate=3m 标准口径下列式/行式逐位一致。
+
+### 8.4 遗留
+
 - **D4 deferred join 窗口 pin**：落地后 bid over 可调小，q13 类查询 RSS 再降 ~3GB。
+- **match 形态的列式 join 富化**（q3/q4/q6）：each 家族已列式化；match+join 的
+  advance/match/close 富化仍行式，形态更复杂（step 数据 + 多 join），待专项。
 - **q11/q18/q19 的 RSS**：均为同类积压/状态结构问题，待逐项归因。
+- **q22 split（A1）**：on-each 家族最高单事件成本，见 §7 遗留。

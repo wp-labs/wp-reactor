@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -6,15 +7,16 @@ use std::time::Instant;
 use arrow::array::{Array, ArrayAccessor, Int64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use smol_str::SmolStr;
-use wf_lang::ast::{Expr, FieldRef};
+use wf_lang::ast::{BinOp, Expr, FieldRef, JoinMode};
 
 use crate::alert::{AlertColumnBuilder, EachRowCells};
 use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::MACHINE_ID;
-use crate::match_engine::event_bridge::ColumnarEvent;
+use crate::match_engine::event_bridge::{ColumnarEvent, JoinRow};
 use crate::match_engine::match_engine::{
-    CepStateMachine, Event, Value, WindowLookup, eval_field_value, field_ref_name, value_to_string,
+    CepStateMachine, Event, JoinKey, Value, WindowLookup, eval_field_value, field_ref_name,
+    value_to_string, values_equal,
 };
 
 use super::RuleExecutor;
@@ -28,6 +30,7 @@ use super::eval::{
     YieldMeta, eval_bool_expr, eval_entity_id, eval_expr_with_l3, eval_score,
     eval_yield_expr_with_meta, with_yield_eval_scope,
 };
+use wf_lang::plan::RulePlan;
 
 // L3 batched write (now unconditional): collect a segment's column values and
 // bulk-`extend` each builder column once at the end via
@@ -36,6 +39,158 @@ use super::eval::{
 // column push is batched. Byte-identical to the per-row commit (see the
 // `commit_each_rows_batch_*` equivalence tests) — Q1 on-each is fill-bound and
 // this is ~4× cheaper on CPU and ~half the RSS.
+
+/// Columnar join-enrichment plan for `on each` + one live Snapshot join
+/// (2026-08-23, 列式 join 富化 — q20 等 each+join 查询 2.5M/s → 列式量级).
+///
+/// v1 形状（q20 等）：单 Snapshot join、单条件、左右均 flat 限定引用；
+/// `where` 为「右窗限定字段 <cmp> 字面量」的合取；yield/entity 为字面量 /
+/// 左窗（驱动）限定字段 / 右窗限定字段。行式路径（`execute_each_direct`）
+/// 每事件 `Event::clone()` + `enrich_join_row` 全字段注入 + `find_matching_row`
+/// 复核；列式版批级去重 join_lookup + 列式读右窗字段，输出字节一致。
+#[derive(Debug, Clone)]
+pub(crate) struct EachJoinPlan {
+    /// 右窗名（enrich 限定前缀，如 `auction_events`）。
+    pub(super) right_window: String,
+    /// 右窗 join key 字段（索引键，如 `auction_events.id`）。
+    pub(super) right_key_field: String,
+    /// 左字段名（驱动列，如 `b.auction`）。
+    pub(super) left_field: String,
+    /// 驱动 bind alias（如 `b`），区分左窗/右窗限定引用。
+    pub(super) left_alias: String,
+    /// `where` 谓词（右窗字段 <cmp> 字面量，合取）。空 = 无 where。
+    pub(super) where_preds: Vec<WherePred>,
+}
+
+/// 一个 `where` 谓词：右窗字段 `<op> 字面量`。
+#[derive(Debug, Clone)]
+pub(super) struct WherePred {
+    pub(super) field: String,
+    pub(super) op: wf_lang::ast::BinOp,
+    pub(super) const_val: Value,
+}
+
+/// 解析 each 规则的列式 join 支持性。`Some` = 可走列式 join 路径；
+/// `None` = 形状不支持（回退行式 `execute_each_direct`）。
+pub(crate) fn parse_each_join_columnar(plan: &RulePlan) -> Option<EachJoinPlan> {
+    let join = plan.joins.first()?;
+    if plan.joins.len() != 1 {
+        return None;
+    }
+    if !matches!(join.mode, JoinMode::Snapshot) {
+        return None;
+    }
+    if join.within.is_some() || join.reduce.is_some() || join.emit_at.is_some() {
+        return None;
+    }
+    if join.conds.len() != 1 {
+        return None;
+    }
+    let cond = &join.conds[0];
+    let left_field = field_ref_name(&cond.left).to_string();
+    let right_key_field = field_ref_name(&cond.right).to_string();
+    if left_field.is_empty() || right_key_field.is_empty() {
+        return None;
+    }
+    // 左右 key 必须 flat（Simple/Qualified/Bracketed）——Path（嵌套 object）
+    // 在列式路径下无法按列名解析。
+    let flat = |fr: &FieldRef| {
+        matches!(
+            fr,
+            FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
+        )
+    };
+    if !flat(&cond.left) || !flat(&cond.right) {
+        return None;
+    }
+    let left_alias = plan.each_plan.as_ref()?.alias.clone();
+    let right_window = join.right_window.clone();
+
+    // where：右窗限定字段 <cmp> 字面量 的合取（&&）。其他形状（左窗字段、
+    // 函数、Simple 引用、`in` 列表）→ 不支持 → 回退行式。
+    let mut where_preds = Vec::new();
+    if let Some(w) = &plan.r#where {
+        if !parse_where_preds(w, &right_window, &mut where_preds) {
+            return None;
+        }
+    }
+
+    // 输出字段来源：每个引用必须是 字面量 / 左窗限定 / 右窗限定。
+    // Simple/Bracketed/Path/一般表达式 → 不支持（无法确定来源，保守回退）。
+    let out_ok = |fr: &FieldRef| -> bool {
+        match fr {
+            FieldRef::Qualified(win, _) => win == &left_alias || win == &right_window,
+            _ => false,
+        }
+    };
+    for field in &plan.yield_plan.fields {
+        match &field.value {
+            Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => {}
+            Expr::Field(fr) => {
+                if !out_ok(fr) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    match &plan.entity_plan.entity_id_expr {
+        Expr::StringLit(_) => {}
+        Expr::Field(fr) => {
+            if !out_ok(fr) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(EachJoinPlan {
+        right_window,
+        right_key_field,
+        left_field,
+        left_alias,
+        where_preds,
+    })
+}
+
+/// 递归解析 `where` 为右窗字段比较的合取。
+fn parse_where_preds(expr: &Expr, right_window: &str, out: &mut Vec<WherePred>) -> bool {
+    match expr {
+        Expr::BinOp {
+            op: BinOp::And,
+            left,
+            right,
+        } => {
+            parse_where_preds(left, right_window, out)
+                && parse_where_preds(right, right_window, out)
+        }
+        Expr::BinOp { op, left, right }
+            if matches!(
+                op,
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+            ) =>
+        {
+            let Expr::Field(FieldRef::Qualified(win, f)) = left.as_ref() else {
+                return false;
+            };
+            if win != right_window {
+                return false;
+            }
+            let const_val = match right.as_ref() {
+                Expr::Number(n) => Value::Number(*n),
+                Expr::StringLit(s) => Value::Str(s.clone().into()),
+                Expr::Bool(b) => Value::Bool(*b),
+                _ => return false,
+            };
+            out.push(WherePred {
+                field: f.clone(),
+                op: *op,
+                const_val,
+            });
+            true
+        }
+        _ => false,
+    }
+}
 
 impl RuleExecutor {
     /// Evaluate the plan's per-event `let` bindings against `ctx` and inject
@@ -237,7 +392,6 @@ impl RuleExecutor {
                 .expect("on-each rule missing precomputed summary"),
         );
         let origin = AlertOrigin::Event;
-
         // -- Plan-constant specialization (evaluated once per batch) -------
         let score_const = match &self.plan.score_plan.expr {
             // eval_score on a Number literal is clamp(n), independent of ctx.
@@ -420,7 +574,17 @@ impl RuleExecutor {
         if !self.plan.lets.is_empty() {
             return false;
         }
-        if !self.live_joins.is_empty() || each_plan.filter.is_some() {
+        // 无活 join：形状检查走无 join 列式路径（后置 where 列式不执行——bind
+        // filter 已下推为事件过滤，plan.r#where 非空 → 回退行式）。单活 join：
+        // 必须满足列式 join 形状（each_join_plan 非 None）——where/输出字段的
+        // 限定来源由 `parse_each_join_columnar` 一并校验。多 join / 活 join
+        // 不满足形状 → 回退行式。
+        let join_ok = if self.live_joins.is_empty() {
+            self.plan.r#where.is_none()
+        } else {
+            self.each_join_plan.is_some()
+        };
+        if !join_ok || each_plan.filter.is_some() {
             return false;
         }
         if !self.plan.binds.iter().all(|b| {
@@ -433,15 +597,34 @@ impl RuleExecutor {
         if !matches!(self.plan.score_plan.expr, Expr::Number(_)) {
             return false;
         }
+        // 无 join 时的字段形状（Simple/Qualified/Bracketed flat）；有 join 时
+        // 输出字段来源已被 `parse_each_join_columnar` 校验（左窗/右窗限定）。
         let flat = |fr: &FieldRef| {
             matches!(
                 fr,
                 FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
             )
         };
+        let out_shape_ok = |fr: &FieldRef| -> bool {
+            if self.live_joins.is_empty() {
+                flat(fr)
+            } else {
+                // 有 join：限定引用且限定符 ∈ {左窗 alias, 右窗名}（Simple 是
+                // 歧义裸名——可能来自 enrich 裸名注入，列式无法分辨，保守回退）。
+                let Some(join_plan) = &self.each_join_plan else {
+                    return false;
+                };
+                match fr {
+                    FieldRef::Qualified(win, _) => {
+                        win == &join_plan.left_alias || win == &join_plan.right_window
+                    }
+                    _ => false,
+                }
+            }
+        };
         match &self.plan.entity_plan.entity_id_expr {
             Expr::StringLit(_) => {}
-            Expr::Field(fr) if flat(fr) => {}
+            Expr::Field(fr) if out_shape_ok(fr) => {}
             _ => return false,
         }
         self.plan
@@ -450,7 +633,7 @@ impl RuleExecutor {
             .iter()
             .all(|field| match &field.value {
                 Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => true,
-                Expr::Field(fr) => flat(fr),
+                Expr::Field(fr) => out_shape_ok(fr),
                 _ => false,
             })
     }
@@ -855,6 +1038,374 @@ impl RuleExecutor {
         stats
     }
 
+    /// Columnar join-enrichment form of [`Self::execute_each_direct_batch`]
+    /// (2026-08-23, 列式 join 富化): like [`Self::execute_each_direct_batch_columnar`]
+    /// but for `on each` + one live Snapshot join (q20 等).
+    ///
+    /// Row-level semantics are byte-identical to `execute_each_direct`:
+    /// - join lookup via the shared index (`JoinKey::from_value` truncation +
+    ///   `find_matching_row` first-hit; float left keys additionally re-check
+    ///   `values_equal` per row against the bucket — the f64→Int truncation
+    ///   would otherwise false-match);
+    /// - Snapshot miss keeps the event but with no enrichment → a `where` on a
+    ///   right-window field suppresses it, and right-window yield/entity reads
+    ///   yield an empty value (identical to the eager ctx without the field);
+    /// - per-event `Event::clone()` + `enrich_join_row` full-field injection
+    ///   are eliminated — right-window fields are read on demand from the
+    ///   columnar [`JoinRow`].
+    ///
+    /// Caller must gate on [`Self::each_plan_columnar_safe`] AND
+    /// `self.each_join_plan.is_some()`.
+    pub fn execute_each_direct_batch_columnar_join(
+        &self,
+        rows: &[(&ColumnarEvent<'_>, i64)],
+        windows: &dyn WindowLookup,
+        emit_time_nanos: i64,
+        builder: &mut AlertColumnBuilder,
+        appended_out: &mut Vec<usize>,
+    ) -> EachDirectBatchStats {
+        appended_out.clear();
+        let mut stats = EachDirectBatchStats::default();
+        let join_plan = self
+            .each_join_plan
+            .as_ref()
+            .expect("columnar join gate requires each_join_plan");
+        let Some(each_plan) = &self.plan.each_plan else {
+            stats.failed = rows.len();
+            return stats;
+        };
+        let _ = each_plan;
+        let statics = self.output_static();
+        let emit_time = self.cached_emit_time(emit_time_nanos);
+        let summary = Arc::clone(
+            statics
+                .each_summary
+                .as_ref()
+                .expect("on-each rule missing precomputed summary"),
+        );
+        let origin = AlertOrigin::Event;
+        let score_const = match &self.plan.score_plan.expr {
+            Expr::Number(n) => n.clamp(0.0, 100.0),
+            _ => unreachable!("columnar gate requires a constant score"),
+        };
+
+        // -- 输出字段来源解析（yield / entity）---------------------------
+        // Left = 驱动列（按列名），Right = 命中 JoinRow（按右窗字段名）。
+        // 字段名短、批级解析一次——owned String 避免闭包生命周期纠缠。
+        enum FieldSrc {
+            Left(String),
+            Right(String),
+        }
+        let field_src = |fr: &FieldRef| -> Option<FieldSrc> {
+            match fr {
+                FieldRef::Qualified(win, f) if win == &join_plan.left_alias => {
+                    Some(FieldSrc::Left(f.to_string()))
+                }
+                FieldRef::Qualified(win, f) if win == &join_plan.right_window => {
+                    Some(FieldSrc::Right(f.to_string()))
+                }
+                _ => None,
+            }
+        };
+        let yield_srcs: Vec<Option<FieldSrc>> = self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| match &field.value {
+                Expr::Field(fr) => field_src(fr),
+                _ => None,
+            })
+            .collect();
+        let entity_src: Option<FieldSrc> = match &self.plan.entity_plan.entity_id_expr {
+            Expr::StringLit(_) => None, // handled by entity_const
+            Expr::Field(fr) => field_src(fr),
+            _ => None,
+        };
+        let entity_const: Option<String> = match &self.plan.entity_plan.entity_id_expr {
+            Expr::StringLit(s) => Some(s.clone()),
+            _ => None,
+        };
+        // yield 字段种类（Lit/Field），同无 join 列式路径。
+        let yield_kinds: Vec<YieldKind> = self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| match &field.value {
+                Expr::Number(n) => YieldKind::Lit(Value::Number(*n)),
+                Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
+                Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
+                Expr::Field(_) => YieldKind::Field,
+                _ => unreachable!("columnar join gate excludes general yield exprs"),
+            })
+            .collect();
+
+        // -- 批级 join 查找 ----------------------------------------------
+        // 左 key 列 index（batch0 共享 schema）。左列缺列 → 每行 key=None →
+        // Snapshot miss（保留无富化），下面 row_match 全 None 路径一致。
+        let batch0 = rows.first().map(|(ev, _)| ev.batch());
+        let left_idx = batch0.and_then(|b| b.schema().index_of(&join_plan.left_field).ok());
+        let left_is_float = match (batch0, left_idx) {
+            (Some(b), Some(idx)) => matches!(
+                b.schema().field(idx).data_type(),
+                DataType::Float32 | DataType::Float64
+            ),
+            _ => false,
+        };
+
+        let mut per_row_keys: Vec<Option<JoinKey>> = Vec::with_capacity(rows.len());
+        let mut per_row_vals: Vec<Option<Value>> = Vec::with_capacity(rows.len());
+        let mut key_rows: HashMap<JoinKey, Vec<usize>> = HashMap::new();
+        for (i, (ev, _)) in rows.iter().enumerate() {
+            let val = left_idx.and_then(|idx| ev.value_at(idx));
+            match val.as_ref().and_then(|v| JoinKey::from_value(v)) {
+                Some(k) => {
+                    per_row_keys.push(Some(k.clone()));
+                    key_rows.entry(k).or_default().push(i);
+                    per_row_vals.push(val);
+                }
+                None => {
+                    per_row_keys.push(None);
+                    per_row_vals.push(None);
+                }
+            }
+        }
+
+        // 批级预查（快照）：每唯一 key 一次索引 lookup，hot key 享受去重。
+        // 索引只增不减：批快照「命中」的行在行式逐事件时点必然也命中 → 与行式
+        // 一致；「批快照 miss」的行在行循环时点**实时复查**（与行式逐事件同时
+        // 机）——否则批处理期间并行 ingest 补 append 的实体（q20 lead 引用未来
+        // auction）会被列式快照漏掉，EMIT 系统性偏少（rate=1m 实测 -8 万行）。
+        let mut row_match: Vec<Option<JoinRow>> = vec![None; rows.len()];
+        for idxs in key_rows.values() {
+            let first_val = per_row_vals[*idxs.first().unwrap()]
+                .as_ref()
+                .expect("key_rows rows always have a value");
+            let bucket = windows.join_lookup(
+                &join_plan.right_window,
+                &join_plan.right_key_field,
+                first_val,
+            );
+            let first = if left_is_float {
+                None
+            } else {
+                bucket.as_ref().and_then(|rs| rs.first().cloned())
+            };
+            for &i in idxs {
+                let lv = per_row_vals[i]
+                    .as_ref()
+                    .expect("key_rows rows always have a value");
+                row_match[i] = if left_is_float {
+                    bucket.as_ref().and_then(|rs| {
+                        rs.iter()
+                            .find(|r| {
+                                r.field_value(&join_plan.right_key_field)
+                                    .is_some_and(|rv| values_equal(lv, &rv))
+                            })
+                            .cloned()
+                    })
+                } else {
+                    first.clone()
+                };
+            }
+        }
+
+        // -- 输出构建（复用无 join 列式模式：L3 批量提交）----------------
+        let wfx_prefix = EachWfxPrefix::new(&self.plan.name);
+        let mut wfx_ids: Vec<String> = Vec::new();
+        let mut scores: Vec<f64> = Vec::new();
+        let mut entity_ids: Vec<String> = Vec::new();
+        let mut fired_ats: Vec<String> = Vec::new();
+        let mut staged_rows: Vec<Vec<_>> = Vec::new();
+
+        // 批级解析 Left（驱动列）字段的列 index —— 循环内按列名 index_of 是
+        // 每行开销；schema 批内共享（batch0）。
+        let resolve_left =
+            |name: &str| -> Option<usize> { batch0.and_then(|b| b.schema().index_of(name).ok()) };
+        let yield_left_idxs: Vec<Option<usize>> = yield_srcs
+            .iter()
+            .map(|src| match src {
+                Some(FieldSrc::Left(f)) => resolve_left(f),
+                _ => None,
+            })
+            .collect();
+        let entity_left_idx: Option<usize> = match &entity_src {
+            Some(FieldSrc::Left(f)) => resolve_left(f),
+            _ => None,
+        };
+
+        // 批级常量 yield 字段注册（同无 join 列式路径）：字面量字段
+        // （alert_type/detail/request_count 等）coerce+export 一次并注册为
+        // 批级常量列，行循环跳过其 staging，`fill_row_gaps` 填充。
+        for ((_field, (name, field_type)), kind) in self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .zip(statics.yield_specs.iter())
+            .zip(yield_kinds.iter())
+        {
+            let const_value = match kind {
+                YieldKind::Lit(v) => {
+                    let converted = RuleExecutor::coerce_yield_field_value_with(
+                        name,
+                        field_type.as_ref(),
+                        v.clone(),
+                    )
+                    .and_then(|v| {
+                        let v = v.expect("literal yield values are never omitted");
+                        crate::alert::export_yield_value(&v, field_type.as_ref())
+                    });
+                    match converted {
+                        Ok((meta, model_value)) => Some((meta, model_value)),
+                        Err(e) => {
+                            log::warn!("alert export error: {e}");
+                            stats.failed = rows.len();
+                            return stats;
+                        }
+                    }
+                }
+                YieldKind::Field | YieldKind::General => None,
+            };
+            if let Err(e) = builder.register_yield_column(name, const_value) {
+                log::warn!("alert export error: {e}");
+                stats.failed = rows.len();
+                return stats;
+            }
+        }
+        builder.reserve_rows(rows.len());
+
+        for (idx, (event, event_time_nanos)) in rows.iter().enumerate() {
+            // 批快照 miss 的行：行循环时点实时复查（与行式逐事件同时机——并行
+            // ingest 在批处理期间补 append 的实体此时可见）。命中行沿用批快照
+            // （索引只增，快照命中 ⇔ 逐事件命中）。
+            let matched: Option<JoinRow> = if row_match[idx].is_some() {
+                row_match[idx].clone()
+            } else if let (Some(k), Some(v)) = (&per_row_keys[idx], &per_row_vals[idx]) {
+                let _ = k;
+                let bucket =
+                    windows.join_lookup(&join_plan.right_window, &join_plan.right_key_field, v);
+                if left_is_float {
+                    bucket.as_ref().and_then(|rs| {
+                        rs.iter()
+                            .find(|r| {
+                                r.field_value(&join_plan.right_key_field)
+                                    .is_some_and(|rv| values_equal(v, &rv))
+                            })
+                            .cloned()
+                    })
+                } else {
+                    bucket.as_ref().and_then(|rs| rs.first().cloned())
+                }
+            } else {
+                None
+            };
+            let matched = matched.as_ref();
+            // Post-join `where`（严格）：右窗字段比较；miss → 字段缺失 → false
+            // → 抑制（对齐行式 where_ok：false/None 抑制）。
+            let where_ok = join_plan.where_preds.iter().all(|p| {
+                matched
+                    .and_then(|r| r.field_value(&p.field))
+                    .map(|v| join_cmp(p.op, &v, &p.const_val))
+                    .unwrap_or(false)
+            });
+            if !where_ok {
+                stats.rejected += 1;
+                continue;
+            }
+            // entity（来源：常量 / 左窗列 / 右窗 JoinRow；缺失 → 空串，同行式）。
+            let entity_id: String = match &entity_const {
+                Some(s) => s.clone(),
+                None => match &entity_src {
+                    Some(FieldSrc::Left(_)) => entity_left_idx
+                        .and_then(|eidx| event.value_at(eidx))
+                        .map(|v| value_to_string(&v))
+                        .unwrap_or_default(),
+                    Some(FieldSrc::Right(f)) => matched
+                        .and_then(|r| r.field_value(f))
+                        .map(|v| value_to_string(&v))
+                        .unwrap_or_default(),
+                    None => String::new(),
+                },
+            };
+            let fired_at = format_nanos_utc(*event_time_nanos);
+            let wfx_id = wfx_prefix.wfx_id(*event_time_nanos, &origin);
+
+            // -- Yield staging -------------------------------------------
+            builder.begin_row();
+            let staged: CoreResult<()> = (|| {
+                for (yield_i, (((_field, (name, field_type)), kind), src)) in self
+                    .plan
+                    .yield_plan
+                    .fields
+                    .iter()
+                    .zip(statics.yield_specs.iter())
+                    .zip(yield_kinds.iter())
+                    .zip(yield_srcs.iter())
+                    .enumerate()
+                {
+                    let value = match kind {
+                        YieldKind::Lit(_) => continue, // 批级常量，fill_row_gaps 填充
+                        YieldKind::Field => match src {
+                            Some(FieldSrc::Left(_)) => yield_left_idxs
+                                .get(yield_i)
+                                .copied()
+                                .flatten()
+                                .and_then(|fidx| event.value_at(fidx))
+                                .unwrap_or_else(|| Value::Str(SmolStr::default())),
+                            Some(FieldSrc::Right(f)) => matched
+                                .and_then(|r| r.field_value(f))
+                                .unwrap_or_else(|| Value::Str(SmolStr::default())),
+                            None => Value::Str(SmolStr::default()),
+                        },
+                        YieldKind::General => {
+                            unreachable!("columnar join gate excludes general yield exprs")
+                        }
+                    };
+                    let Some(value) = RuleExecutor::coerce_yield_field_value_with(
+                        name,
+                        field_type.as_ref(),
+                        value,
+                    )?
+                    else {
+                        continue;
+                    };
+                    builder.stage_yield_cell(name, field_type.as_ref(), &value)?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = staged {
+                log::warn!("alert export error: {e}");
+                stats.failed += 1;
+                continue;
+            }
+            wfx_ids.push(wfx_id);
+            scores.push(score_const);
+            entity_ids.push(entity_id);
+            fired_ats.push(fired_at);
+            staged_rows.push(builder.take_staged());
+            stats.appended += 1;
+            appended_out.push(idx);
+        }
+        if !wfx_ids.is_empty() {
+            builder.commit_each_rows_batch(
+                &wfx_ids,
+                &scores,
+                &entity_ids,
+                &fired_ats,
+                &statics.rule_name,
+                &statics.entity_type,
+                &statics.each_origin,
+                &statics.each_close_reason,
+                &emit_time,
+                &summary,
+                &staged_rows,
+            );
+        }
+        stats
+    }
+
     fn build_each_direct(
         &self,
         ctx: &Event,
@@ -1256,5 +1807,41 @@ impl I64Col<'_> {
                 }
             }
         }
+    }
+}
+
+/// 复刻 `eval::compare_values` 的标量比较语义（列式 where 谓词求值用；与行式
+/// where_ok 的 `eval_bool_expr` 输出逐位一致）：
+/// - Eq/Ne → `values_equal`（Number 容差、Str/Bool 相等）；
+/// - 有序比较 → 同类型 Number/Str/Bool 直接比；跨类型 → false。
+fn join_cmp(op: BinOp, lv: &Value, rv: &Value) -> bool {
+    match op {
+        BinOp::Eq => values_equal(lv, rv),
+        BinOp::Ne => !values_equal(lv, rv),
+        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => match (lv, rv) {
+            (Value::Number(a), Value::Number(b)) => match op {
+                BinOp::Lt => a < b,
+                BinOp::Gt => a > b,
+                BinOp::Le => a <= b,
+                BinOp::Ge => a >= b,
+                _ => false,
+            },
+            (Value::Str(a), Value::Str(b)) => match op {
+                BinOp::Lt => a < b,
+                BinOp::Gt => a > b,
+                BinOp::Le => a <= b,
+                BinOp::Ge => a >= b,
+                _ => false,
+            },
+            (Value::Bool(a), Value::Bool(b)) => match op {
+                BinOp::Lt => a < b,
+                BinOp::Gt => a > b,
+                BinOp::Le => a <= b,
+                BinOp::Ge => a >= b,
+                _ => false,
+            },
+            _ => false,
+        },
+        _ => false,
     }
 }

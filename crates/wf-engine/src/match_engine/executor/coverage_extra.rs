@@ -2370,7 +2370,12 @@ fn dead_join_elimination_keeps_only_referenced_enrichment() {
     });
     let exec = RuleExecutor::new(plan);
     assert_eq!(exec.live_joins.len(), 1, "where ref → join live");
-    assert!(!exec.each_plan_columnar_safe());
+    // 右窗 where 简单形状（字段 <cmp> 字面量）→ 列式 join 富化支持
+    // （2026-08-23 列式 join 富化——q20 形状）。
+    assert!(
+        exec.each_join_columnar_ready() && exec.each_plan_columnar_safe(),
+        "右窗 where 简单形状必须列式 join 支持"
+    );
 
     // yield reading the right window keeps it live.
     let mut plan = base();
@@ -2380,6 +2385,11 @@ fn dead_join_elimination_keeps_only_referenced_enrichment() {
     }];
     let exec = RuleExecutor::new(plan);
     assert_eq!(exec.live_joins.len(), 1, "yield ref → join live");
+    // yield 读右窗字段（限定）→ 列式 join 支持（q20 输出形状）。
+    assert!(
+        exec.each_join_columnar_ready() && exec.each_plan_columnar_safe(),
+        "右窗 yield 限定引用必须列式 join 支持"
+    );
 
     // A plain (unqualified) output field ref → conservative: join stays live.
     let mut plan = base();

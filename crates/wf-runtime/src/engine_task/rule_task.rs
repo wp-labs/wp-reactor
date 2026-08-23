@@ -885,8 +885,17 @@ impl RuleTask {
             if let Some(metrics) = &self.metrics {
                 metrics.add_rule_events(self.executor.plan().name.as_str(), rows.len());
             }
-            self.emit_each_direct_batch_columnar(&rows, batch_emit_nanos)
-                .await;
+            // 列式 each 分流：无活 join（q1 等）走无 join 列式路径；活 join
+            // （q20 等，each_join_plan 已解析）走列式 join 富化路径（批级
+            // join_lookup + 列式右窗字段读，免每事件 Event clone —— 2026-08-23
+            // 列式 join 富化，q20 2.5M/s → 列式量级）。
+            if self.executor.live_joins().is_empty() {
+                self.emit_each_direct_batch_columnar(&rows, batch_emit_nanos)
+                    .await;
+            } else {
+                self.emit_each_direct_batch_columnar_join(&rows, &lookup, batch_emit_nanos)
+                    .await;
+            }
             return;
         }
         // Plan C2 batching: when the per-event detail logs are off, collect
@@ -2542,6 +2551,106 @@ impl RuleTask {
             };
             // Per-row telemetry outside the builder lock — same accounting as
             // the Event-based batch path; the machine_id comes from the column.
+            if let Some(metrics) = &self.metrics {
+                for &idx in appended_idx.iter() {
+                    metrics.inc_alert_emitted_total(self.rule_name());
+                    let (event, event_nanos) = segment[idx];
+                    let now_nanos = self.cached_wall_nanos.load(Ordering::Relaxed);
+                    let sample = self.emit_sample_remaining.load(Ordering::Relaxed);
+                    if sample == 0 {
+                        self.emit_sample_remaining
+                            .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
+                        metrics.inc_alert_emitted_detail(
+                            self.rule_name(),
+                            &event.field_value_str(wf_engine::match_engine::MACHINE_ID),
+                            self.rule_name(),
+                        );
+                        let e2e_nanos = now_nanos.saturating_sub(event_nanos.max(0) as u64);
+                        metrics.observe_event_e2e_latency(Duration::from_nanos(e2e_nanos));
+                    } else {
+                        self.emit_sample_remaining
+                            .store(sample - 1, Ordering::Relaxed);
+                    }
+                }
+                for _ in 0..outcome.failed {
+                    metrics.inc_alert_serialize_failed();
+                }
+            }
+            if let Some(ser_start) = _ser_start {
+                let elapsed = ser_start.elapsed().as_nanos() as u64;
+                let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64 / calls.max(1) as u64;
+                self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
+                if let Some(metrics) = &self.metrics {
+                    metrics.add_alert_serialize_nanos(scaled);
+                }
+            }
+            if should_flush {
+                self.flush_alerts().await;
+            }
+            start = end;
+        }
+    }
+
+    /// Columnar join-enrichment emit (2026-08-23): [`Self::emit_each_direct_batch_columnar`]
+    /// for the live-join case — same batching/telemetry/flush, but the executor
+    /// runs the batch-level join lookup + columnar right-window reads
+    /// (`execute_each_direct_batch_columnar_join`). The per-row telemetry's
+    /// machine_id still comes from the driving event column.
+    async fn emit_each_direct_batch_columnar_join(
+        &self,
+        rows: &[(&ColumnarEvent<'_>, i64)],
+        lookup: &RegistryLookup<'_>,
+        batch_emit_nanos: i64,
+    ) {
+        let mut appended_idx: Vec<usize> = Vec::new();
+        let mut start = 0;
+        while start < rows.len() {
+            let end = (start + ALERT_BATCH_SIZE).min(rows.len());
+            let segment = &rows[start..end];
+            let calls = segment.len();
+            let time_this = {
+                let rem = self
+                    .serialize_sample_remaining
+                    .fetch_sub(1, Ordering::Relaxed);
+                if rem == 1 {
+                    self.serialize_sample_remaining
+                        .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                }
+            };
+            let _ser_start = time_this.then(Instant::now);
+            let (outcome, should_flush) = {
+                let mut pending = self.pending_alerts.lock().unwrap();
+                let target = self.executor.static_yield_target();
+                let slot = pending
+                    .by_target
+                    .iter_mut()
+                    .find(|(existing, _)| **existing == **target);
+                let builder = match slot {
+                    Some((_, builder)) => builder,
+                    None => {
+                        pending.by_target.push((
+                            std::sync::Arc::clone(target),
+                            AlertColumnBuilder::new(std::sync::Arc::clone(target)),
+                        ));
+                        let last = pending.by_target.len() - 1;
+                        &mut pending.by_target[last].1
+                    }
+                };
+                let outcome = self.executor.execute_each_direct_batch_columnar_join(
+                    segment,
+                    lookup,
+                    batch_emit_nanos,
+                    builder,
+                    &mut appended_idx,
+                );
+                pending.count += outcome.appended;
+                (outcome, pending.count >= ALERT_BATCH_SIZE)
+            };
+            // Per-row telemetry outside the builder lock — same accounting as
+            // the join-free columnar path; machine_id comes from the column.
             if let Some(metrics) = &self.metrics {
                 for &idx in appended_idx.iter() {
                     metrics.inc_alert_emitted_total(self.rule_name());
