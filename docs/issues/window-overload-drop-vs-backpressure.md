@@ -1,8 +1,8 @@
 # 窗口过载：满时丢弃 vs 反压（大 N 冻结）
 
 > 状态：**待修复** · 2026-08-18 · 优先级：高（大 N 场景卡死 + #18 门禁语义）
-> 关联：#18 门禁（object 大批次不被窗口内存驱逐）、`design/window-memory-control.md`、
-> `design/window-log-eviction-design.md`、`design/window-push-consumer-model.md`
+> 关联：#18 门禁（object 大批次不被窗口内存驱逐）、`design/archive/window-memory-control.md`、
+> `design/window-log-eviction-design.md`、`design/archive/window-push-consumer-model.md`
 > 复现场景：`wf-examples/performance/qradar_pk`（450 条有状态规则 / 6 类事件源 / 1000 sip 键）
 
 ---
@@ -226,7 +226,7 @@ commit 之前：pending 里已收到的消息继续持有 permits（不回退给
 
 ## 12. 关联
 
-- `design/window-memory-control.md`（窗口内存上界与驱逐）、`design/window-log-eviction-design.md`（日志桶）
-- `design/window-push-consumer-model.md`（窗口→规则有界反压模型，本设计补齐窗口←源半截）
+- `design/archive/window-memory-control.md`（窗口内存上界与驱逐）、`design/window-log-eviction-design.md`（日志桶）
+- `design/archive/window-push-consumer-model.md`（窗口→规则有界反压模型，本设计补齐窗口←源半截）
 - `wf-examples/performance/qradar_pk/PK_REPORT_LINUX.md`——1M 稳态为验证口径，
   大 N 需要反压修复后才可跑

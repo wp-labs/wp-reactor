@@ -2,7 +2,7 @@
 
 > 日期：2026-08-18 · 分支 `feat/columnar-execution`
 > 关联：`columnar-execution-design.md`（整体列式执行，vectorized 路线）、
-> `columnar-execution-progress.md`（已落地：guard 列式 14.3ns、on-each defer 懒物化）。
+> `archive/columnar-execution-progress.md`（已落地：guard 列式 14.3ns、on-each defer 懒物化）。
 > 本文把「sharded match（Q2）免物化」落到可实施：**类型、签名、分片算法、接线、
 > 测试矩阵**，让代码能照着写。
 
@@ -32,7 +32,7 @@
 
 ## 0. 背景与缺口（一句话）
 
-`columnar-execution-progress.md` L165：懒物化的 `broadcast_batch_only` 初版**排除 sharded
+`archive/columnar-execution-progress.md` L165：懒物化的 `broadcast_batch_only` 初版**排除 sharded
 窗口**；Q2 是 `match<auction:10m>` → `Subscription::Sharded`。**改造前** `message_parse`
 的 sharded 分支（`fanout.rs`）**硬性要求 `events=Some`**（`debug_assert!`），
 导致 sharded match 在 parse 阶段全量 `batch_to_events` 物化每行 HashMap → Q2 ~6.2-7.2M（progress M2a 双峰基线）。
@@ -368,7 +368,7 @@ let row_domain: Vec<usize> = match shard_rows {
 >   挪到并行 parse 侧（`precompute_shard_rows`），actor 仅零成本复用 → 避免串行瓶颈。
 > - **Int64 键经 `f64` 往返的逐行开销**：ScopeKey typed 直读原生值消除 → Q2 ~18M → ~34M。
 >
-> **残余第二道墙**：`columnar-execution-progress.md` Step 8 / §5.2 记录的「Q2 的 EPS 门是
+> **残余第二道墙**：`archive/columnar-execution-progress.md` Step 8 / §5.2 记录的「Q2 的 EPS 门是
 > **窗口 actor 单写者（P0-③）**」——actor 仍按序 `append`/`broadcast` 整批（含非 sharded
 > 订阅的 `batch_arc` clone、各 shard 的 `RulePush` 构造）。这是 sharded match 无法用
 > 「Q1 旁路窗口 actor」方式拆掉的（Q1 无状态可旁路，Q2 有状态必须保序）。**要继续提 Q2，
@@ -432,7 +432,7 @@ let row_domain: Vec<usize> = match shard_rows {
 ### 遗留与后续
 
 1. **Q2 EPS ~34M，残余第二道墙「窗口 actor 单写者（P0-③）」约束**——
-   `columnar-execution-progress.md` Step 8 已记录。本轮已拆两层墙（parse 物化 + actor 内
+   `archive/columnar-execution-progress.md` Step 8 已记录。本轮已拆两层墙（parse 物化 + actor 内
    重分片），并消除 Int64 键 f64 往返；**剩余的是窗口 actor 单写者本身的串行
    `append`/`broadcast`**（含 `batch_arc` clone、各 shard `RulePush` 构造）。
    **注意：以 ~90M（receive-only 无状态上限）为目标不成立**——有状态 match 物理上必须
