@@ -1620,3 +1620,155 @@ fn columnar_mask_helpers() {
     // bind_filters_columnar_safe with a columnar filter → true.
     assert!(exec.bind_filters_columnar_safe("w"));
 }
+
+// ---------------------------------------------------------------------------
+// ctx-free match emit（F8.5）：build_match_alert_free 与 Full ctx 逐字段对拍
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ctx_free_match_output_matches_full_ctx_bytes() {
+    // q6 形状：键 seller、无 label step、entity digit(b.auction)、yield
+    // id=b.auction + 字面量、score 常量、无 where/join → match_ctx_free=true。
+    let mut plan = simple_rule_plan(
+        "ctx_free_r",
+        simple_plan(
+            vec![simple_key("seller")],
+            vec![step(vec![branch("b", count_ge(1.0))])],
+        ),
+        Expr::Number(20.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.binds[0].window = "bid_events".into();
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        },
+        YieldField {
+            name: "alert_type".into(),
+            value: Expr::StringLit("q6_avg200".into()),
+        },
+    ];
+    let exec = RuleExecutor::new(plan);
+    assert!(
+        exec.output_static().match_ctx_free,
+        "q6 形状（score 常量 + entity/yield Field/Lit + 无 where/join）必须启用 ctx-free"
+    );
+
+    const NOW: i64 = 1_700_000_000_000_000_000;
+    let trigger = event(vec![
+        ("auction", num(1001.0)),
+        ("price", num(300.0)),
+        ("bidder", num(5.0)),
+    ]);
+    let matched = MatchedContext {
+        rule_name: "ctx_free_r".into(),
+        scope_key: vec![num(20.0)],
+        step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: None,
+            measure_value: 300.0,
+            event_first_time_nanos: Some(NOW),
+            event_last_time_nanos: Some(NOW),
+            collected_values: vec![],
+            field_values: EngineHashMap::default(),
+        }],
+        bind_data: vec![],
+        event_time_nanos: NOW,
+        event_first_time_nanos: NOW,
+        event_last_time_nanos: NOW,
+        window_start_time_nanos: NOW - 600_000_000_000,
+        window_end_time_nanos: NOW,
+        machine_id: String::new(),
+        trigger_event: Some(Arc::new(trigger.clone())),
+    };
+
+    // Full 路径：手动构造窄化 ctx（键字段 + trigger_event 字段——同
+    // build_eval_context 的 Named 注入语义）。
+    let mut fields = EngineHashMap::default();
+    fields.insert("seller".into(), num(20.0));
+    for (k, v) in &trigger.fields {
+        fields.insert(k.clone(), v.clone());
+    }
+    let ctx = Event { fields };
+    let full = exec.build_match_alert(&matched, &ctx, NOW).unwrap();
+
+    // ctx-free 路径：字段直读 scope_key + trigger_event。
+    let free = exec.build_match_alert_free(&matched, NOW).unwrap();
+
+    // 逐字段字节一致（OutputRecord 无 PartialEq——手工比较输出相关字段）。
+    assert_eq!(full.wfx_id, free.wfx_id, "wfx_id");
+    assert_eq!(full.score, free.score, "score");
+    assert_eq!(full.entity_id, free.entity_id, "entity_id");
+    assert_eq!(full.scope_key, free.scope_key, "scope_key");
+    assert_eq!(full.summary, free.summary, "summary");
+    assert_eq!(full.fired_at, free.fired_at, "fired_at");
+    assert_eq!(full.machine_id, free.machine_id, "machine_id");
+    assert_eq!(full.yield_fields, free.yield_fields, "yield_fields");
+    assert_eq!(
+        full.yield_field_types, free.yield_field_types,
+        "yield_field_types"
+    );
+    assert_eq!(
+        full.event_time_nanos, free.event_time_nanos,
+        "event_time_nanos"
+    );
+    assert_eq!(full.origin, free.origin, "origin");
+
+    // gate 反向：带 where 的规则必须走 Full（禁用 ctx-free）。
+    let mut plan_where = simple_rule_plan(
+        "ctx_free_where",
+        simple_plan(
+            vec![simple_key("seller")],
+            vec![step(vec![branch("b", count_ge(1.0))])],
+        ),
+        Expr::Number(20.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan_where.binds[0].alias = "b".into();
+    plan_where.binds[0].window = "bid_events".into();
+    plan_where.r#where = Some(Expr::BinOp {
+        op: BinOp::Ge,
+        left: Box::new(Expr::Field(FieldRef::Qualified("b".into(), "price".into()))),
+        right: Box::new(Expr::Number(100.0)),
+    });
+    plan_where.yield_plan.fields = vec![YieldField {
+        name: "id".into(),
+        value: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    }];
+    let exec_where = RuleExecutor::new(plan_where);
+    assert!(
+        !exec_where.output_static().match_ctx_free,
+        "带 where 的规则必须禁用 ctx-free（where 需要完整 ctx）"
+    );
+
+    // gate 反向：yield General 表达式（函数调用）必须禁用 ctx-free。
+    let mut plan_gen = simple_rule_plan(
+        "ctx_free_gen",
+        simple_plan(
+            vec![simple_key("seller")],
+            vec![step(vec![branch("b", count_ge(1.0))])],
+        ),
+        Expr::Number(20.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan_gen.binds[0].alias = "b".into();
+    plan_gen.binds[0].window = "bid_events".into();
+    plan_gen.yield_plan.fields = vec![YieldField {
+        name: "detail".into(),
+        value: Expr::BinOp {
+            op: BinOp::Add,
+            left: Box::new(Expr::Number(1.0)),
+            right: Box::new(Expr::Number(2.0)),
+        },
+    }];
+    let exec_gen = RuleExecutor::new(plan_gen);
+    assert!(
+        !exec_gen.output_static().match_ctx_free,
+        "yield 含 General 表达式的规则必须禁用 ctx-free"
+    );
+}

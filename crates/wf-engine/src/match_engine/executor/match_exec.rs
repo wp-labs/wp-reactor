@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use smol_str::SmolStr;
-use wf_lang::ast::Expr;
+use wf_lang::ast::{Expr, FieldRef};
 
 use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::CoreResult;
 use crate::match_engine::match_engine::{
-    Event, MatchedContext, Value, WindowLookup, eval_field_value, value_to_string,
+    Event, MatchedContext, Value, WindowLookup, eval_field_value, field_ref_name, value_to_string,
 };
 
 use super::RuleExecutor;
@@ -16,6 +16,40 @@ use super::context::{build_eval_context, execute_joins};
 use super::eval::{
     YieldMeta, eval_entity_id, eval_score, eval_yield_expr_with_meta, with_yield_eval_scope,
 };
+
+/// ctx 来源抽象：完整事件 ctx（HashMap 构建）或 ctx-free（字段直读
+/// scope_key + trigger_event，2026-08-23 F8.5——q6 等输出只读键 + 触发
+/// 事件字段的规则免每事件 HashMap 构建）。gate 由编译期
+/// `compute_match_ctx_free` 保证 Free 模式只用 Lit/Field 表达式。
+enum ResolveCtx<'a> {
+    Full(&'a Event),
+    Free {
+        keys: &'a [FieldRef],
+        scope_key: &'a [Value],
+        trigger_event: Option<&'a Event>,
+    },
+}
+
+impl ResolveCtx<'_> {
+    fn resolve_field(&self, fr: &FieldRef) -> Option<Value> {
+        match self {
+            ResolveCtx::Full(ctx) => eval_field_value(&ctx.fields, fr),
+            ResolveCtx::Free {
+                keys,
+                scope_key,
+                trigger_event,
+            } => {
+                let name = field_ref_name(fr);
+                // 键名优先（同 ctx 注入语义：keys 覆盖 trigger_event 字段）。
+                keys.iter()
+                    .zip(scope_key.iter())
+                    .find(|(k, _)| field_ref_name(k) == name)
+                    .map(|(_, v)| v.clone())
+                    .or_else(|| trigger_event.and_then(|ev| ev.fields.get(name).cloned()))
+            }
+        }
+    }
+}
 
 impl RuleExecutor {
     /// Produce an [`OutputRecord`] from an on-event match (L1 — no joins).
@@ -31,6 +65,11 @@ impl RuleExecutor {
         matched: &MatchedContext,
         emit_time_nanos: i64,
     ) -> CoreResult<OutputRecord> {
+        // ctx-free 快路径（F8.5）：score 常量 + entity/yield 全 Field/Lit +
+        // 无 where + live_joins 空时免 build_eval_context（q6 等每事件 emit）。
+        if self.output_static().match_ctx_free {
+            return self.build_match_alert_free(matched, emit_time_nanos);
+        }
         let step_plans: Vec<_> = self.plan.match_plan.event_steps.iter().collect();
         let ctx = build_eval_context(
             &self.plan.match_plan.keys,
@@ -63,6 +102,13 @@ impl RuleExecutor {
         windows: &dyn WindowLookup,
         emit_time_nanos: i64,
     ) -> CoreResult<Option<OutputRecord>> {
+        // ctx-free 快路径（F8.5）：gate 保证 live_joins 空 + 无 where——
+        // execute_joins/where_ok 空转可整体跳过，字段直读。
+        if self.output_static().match_ctx_free {
+            return self
+                .build_match_alert_free(matched, emit_time_nanos)
+                .map(Some);
+        }
         let step_plans: Vec<_> = self.plan.match_plan.event_steps.iter().collect();
         let mut ctx = build_eval_context(
             &self.plan.match_plan.keys,
@@ -97,19 +143,65 @@ impl RuleExecutor {
         ctx: &Event,
         emit_time_nanos: i64,
     ) -> CoreResult<OutputRecord> {
+        self.build_match_alert_inner(matched, &ResolveCtx::Full(ctx), emit_time_nanos)
+    }
+
+    /// ctx-free 变体（F8.5）：字段直读 scope_key + trigger_event，免
+    /// `build_eval_context` 的 HashMap 构建。gate 由
+    /// `compute_match_ctx_free` 保证：score 常量、entity/yield 全 Field/Lit、
+    /// 无 where、live_joins 空、字段不依赖 step label/tracked 集合。
+    pub(crate) fn build_match_alert_free(
+        &self,
+        matched: &MatchedContext,
+        emit_time_nanos: i64,
+    ) -> CoreResult<OutputRecord> {
+        debug_assert!(
+            self.output_static().match_ctx_free,
+            "ctx-free 快路径必须有编译期 gate"
+        );
+        let resolve = ResolveCtx::Free {
+            keys: &self.plan.match_plan.keys,
+            scope_key: &matched.scope_key,
+            trigger_event: matched.trigger_event.as_deref(),
+        };
+        self.build_match_alert_inner(matched, &resolve, emit_time_nanos)
+    }
+
+    fn build_match_alert_inner(
+        &self,
+        matched: &MatchedContext,
+        resolve: &ResolveCtx<'_>,
+        emit_time_nanos: i64,
+    ) -> CoreResult<OutputRecord> {
+        let free = matches!(resolve, ResolveCtx::Free { .. });
         let score = match self.output_static().score_const {
             Some(s) => s,
-            None => eval_score(&self.plan.score_plan.expr, ctx)?,
+            None => {
+                // ctx-free gate 要求 score 常量；非常量分支仅 Full 模式可达。
+                assert!(!free, "ctx-free 路径不允许非常量 score");
+                let ResolveCtx::Full(ctx) = resolve else {
+                    unreachable!()
+                };
+                eval_score(&self.plan.score_plan.expr, ctx)?
+            }
         };
         // Field-typed entity (e.g. `digit(b.auction)`) takes the direct flat
         // lookup — skipping the interpreter's per-record eval-time scope. A
         // missing field degrades to an empty string, byte-identical to the
         // interpreter wrapper (`eval_yield_expr_with_meta` substitutes `""`).
         let entity_id = match &self.plan.entity_plan.entity_id_expr {
-            Expr::Field(fr) => eval_field_value(&ctx.fields, fr)
+            Expr::Field(fr) => resolve
+                .resolve_field(fr)
                 .map(|v| value_to_string(&v))
                 .unwrap_or_default(),
-            _ => eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?,
+            _ => {
+                // ctx-free gate 要求 entity 为 Field；复杂表达式仅 Full 模式。
+                assert!(!free, "ctx-free 路径不允许非 Field entity");
+                let ResolveCtx::Full(ctx) = resolve else {
+                    unreachable!()
+                };
+                eval_entity_id(&self.plan.entity_plan.entity_id_expr, ctx)?
+            }
         };
         let origin = AlertOrigin::Event;
         let fired_at = format_nanos_utc(matched.event_time_nanos);
@@ -167,11 +259,19 @@ impl RuleExecutor {
                         };
                         // Missing field falls back to an empty string,
                         // exactly like the interpreter wrapper.
-                        eval_field_value(&ctx.fields, fr)
+                        resolve
+                            .resolve_field(fr)
                             .unwrap_or_else(|| Value::Str(SmolStr::default()))
                     }
-                    YieldKind::General => eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
-                        .expect("eval_yield_expr_with_meta never returns None"),
+                    YieldKind::General => {
+                        // ctx-free gate 排除 General 表达式（需要完整 ctx）。
+                        assert!(!free, "ctx-free 路径不允许 General yield 表达式");
+                        let ResolveCtx::Full(ctx) = resolve else {
+                            unreachable!()
+                        };
+                        eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
+                            .expect("eval_yield_expr_with_meta never returns None")
+                    }
                 };
                 let Some(value) =
                     RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)?

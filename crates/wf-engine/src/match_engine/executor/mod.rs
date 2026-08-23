@@ -102,6 +102,11 @@ pub(crate) struct OutputStatic {
     /// `on each` constant close reason (`""` — the event origin never has a
     /// close reason).
     pub(crate) each_close_reason: Arc<str>,
+    /// ctx-free match emit gate（F8.5）：true 时 `build_match_alert_free` 免
+    /// `build_eval_context` HashMap 构建，字段直读 scope_key + trigger_event。
+    /// 条件：score 常量、entity/yield 全 Field/Lit、无 where、live_joins 空、
+    /// 输出字段不依赖 step label/tracked/_step_/_bind_ 合成字段。
+    pub(crate) match_ctx_free: bool,
 }
 
 /// Narrow the synthetic ctx fields built for close/match alert construction
@@ -273,6 +278,76 @@ fn compute_live_joins(plan: &RulePlan) -> Vec<JoinPlan> {
         })
         .cloned()
         .collect()
+}
+
+/// ctx-free match emit gate（F8.5，2026-08-23，q6 每事件 emit）：
+/// 规则输出（score/entity/yield）只读「scope_key 键 ∪ 触发事件字段」时，
+/// emit 免 `build_eval_context` 的 HashMap 构建，字段直读。条件：
+/// - score 常量（`score_const` 同判定：Number 字面量）；
+/// - entity 为 `Expr::Field`；yield 字段全 Lit/Field（无 General 表达式）；
+/// - 无 `where`（execute_match_with_joins 的 where 需要完整 ctx）；
+/// - live_joins 空（join 富化字段读不到——match 形态 join 若存活则禁用）；
+/// - 输出 Field 字段名不命中 step branch labels / tracked 字段集合 /
+///   `_step_*`、`_bind_*` 合成字段（这些只能从 ctx 读取）。
+fn compute_match_ctx_free(
+    plan: &RulePlan,
+    live_joins: &[JoinPlan],
+    yield_kinds: &[YieldKind],
+) -> bool {
+    if plan.r#where.is_some()
+        || !live_joins.is_empty()
+        || !matches!(plan.score_plan.expr, Expr::Number(_))
+        || !matches!(plan.entity_plan.entity_id_expr, Expr::Field(_))
+        || yield_kinds.iter().any(|k| matches!(k, YieldKind::General))
+    {
+        return false;
+    }
+
+    // step branch labels：ctx 注入 label → measure_value，free 模式读不到。
+    let labels: std::collections::HashSet<&str> = plan
+        .match_plan
+        .event_steps
+        .iter()
+        .flat_map(|step| step.branches.iter())
+        .filter_map(|b| b.label.as_deref())
+        .collect();
+    // tracked 字段：ctx 的 field_values 注入 last_val（bare 字段名）。
+    let tracked: std::collections::HashSet<&str> = plan
+        .match_plan
+        .tracked_plain_fields
+        .iter()
+        .map(|s| s.as_str())
+        .chain(
+            plan.match_plan
+                .tracked_bind_fields
+                .values()
+                .flatten()
+                .map(|s| s.as_str()),
+        )
+        .collect();
+
+    // 输出字段引用集合。
+    let mut out_fields = Vec::new();
+    if let Expr::Field(fr) = &plan.entity_plan.entity_id_expr {
+        out_fields.push(fr);
+    }
+    out_fields.extend(
+        plan.yield_plan
+            .fields
+            .iter()
+            .filter_map(|f| match &f.value {
+                Expr::Field(fr) => Some(fr),
+                _ => None,
+            }),
+    );
+
+    out_fields.into_iter().all(|fr| {
+        let name = field_ref_name(fr);
+        !labels.contains(name)
+            && !tracked.contains(name)
+            && !name.starts_with("_step_")
+            && !name.starts_with("_bind_")
+    })
 }
 
 /// Collect field refs from an output expression: `Qualified(window, _)` records
@@ -506,6 +581,7 @@ impl RuleExecutor {
             _ => None,
         };
         let close_ctx_fields = plan_close_ctx_fields(&plan);
+        let match_ctx_free = compute_match_ctx_free(&plan, &live_joins, &yield_kinds);
         Self {
             output_static: OutputStatic {
                 rule_name: Arc::from(plan.name.as_str()),
@@ -518,6 +594,7 @@ impl RuleExecutor {
                 each_summary,
                 each_origin: Arc::from(AlertOrigin::Event.as_str()),
                 each_close_reason: Arc::from(""),
+                match_ctx_free,
             },
             plan,
             each_join_plan,
