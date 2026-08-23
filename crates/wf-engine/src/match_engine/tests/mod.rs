@@ -21,6 +21,7 @@ mod join_key;
 mod match_bench;
 mod nexmark_hotpath_bench;
 mod perf;
+mod q13b_join_bench;
 mod seq_examples;
 mod seq_l2;
 

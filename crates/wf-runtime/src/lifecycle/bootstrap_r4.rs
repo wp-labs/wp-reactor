@@ -328,6 +328,65 @@ data_file = "data.csv"
     assert!(registry.get_provider("empty_t").is_none());
 }
 
+#[test]
+fn load_knowledge_numeric_csv_join_index_hits_number_key() {
+    // 2026-08-23 q13 回归：side_input 数字 key 列（0..9999）经 CSV 加载必须进
+    // Number —— 否则 provider join 索引键是 Str、lookup 键是 Number（mod 表达
+    // 式），类型不匹配 → 每次 miss → 回退 O(rows) 全表扫描 → q13b 卡死。
+    let dir = TempDir::new().expect("tempdir");
+    let data_dir = dir.path().join("data/side_input");
+    std::fs::create_dir_all(&data_dir).expect("dir");
+    std::fs::write(
+        data_dir.join("side_input.csv"),
+        "key,value\n0,value-0\n1,value-1\n2345,value-2345\n",
+    )
+    .expect("csv");
+    let path = dir.path().join("knowdb.toml");
+    std::fs::write(
+        &path,
+        r#"
+base_dir = "data"
+[[tables]]
+name = "side_input"
+dir = "side_input"
+data_file = "side_input.csv"
+"#,
+    )
+    .expect("knowdb");
+    let mut registry = WindowRegistry::build(vec![]).expect("registry");
+    load_knowledge_into_windows(&path, dir.path(), &mut registry).expect("load");
+    let pw = registry
+        .get_provider("side_input")
+        .expect("provider registered");
+    // 加载的值类型：key 必须是 Number（而非 Str）——与 mod(auction,10000)
+    // 的 Number 键同类型，join 索引才能命中。
+    let mut pw = pw.write().expect("lock");
+    let snapshot = pw.snapshot();
+    let key_row = snapshot
+        .iter()
+        .find(|row| {
+            matches!(
+                row.get("key"),
+                Some(wf_engine::match_engine::Value::Number(n)) if *n == 2345.0
+            )
+        })
+        .expect("key=2345 行以 Number 加载");
+    assert_eq!(
+        key_row.get("value").unwrap(),
+        &wf_engine::match_engine::Value::Str("value-2345".into())
+    );
+    // 索引按 Number 键建立 → 引擎 lookup 键（Number）直接命中。
+    pw.set_join_key("key".into());
+    let hits = pw
+        .join_lookup(&wf_engine::match_engine::Value::Number(2345.0))
+        .expect("索引命中");
+    assert_eq!(hits.len(), 1, "key=2345 恰一行");
+    assert!(
+        pw.join_lookup(&wf_engine::match_engine::Value::Number(99999.0))
+            .is_none()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // load_from_postgres — PG init 失败
 // ---------------------------------------------------------------------------

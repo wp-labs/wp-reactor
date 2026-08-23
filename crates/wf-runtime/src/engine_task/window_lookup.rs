@@ -173,13 +173,34 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
         // input). The scan is intentional here — the index-based path below
         // cannot be used because providers live outside the buffer-window
         // registry (join-key indexes are only maintained for buffer windows).
-        if self.router.registry().get_provider(window).is_some() {
-            let rows = self.snapshot(window)?;
+        // 2026-08-23 q13：side_input 10000 行 × 920k bid 全表扫描卡死——
+        // ProviderWindow 现支持 set_join_key 的 O(1) 行索引（daemon spawn 时
+        // 与 buffer 窗口同路径设置）；有索引走索引，无索引回退扫描。
+        if let Some(pw) = self.router.registry().get_provider(window) {
+            let pw = pw.read().expect("provider window lock poisoned");
+            if let Some(rows) = pw.join_lookup(key) {
+                return Some(
+                    rows.into_iter()
+                        .map(|row| {
+                            JoinRow::Event(Arc::new(Event {
+                                fields: row
+                                    .iter()
+                                    .map(|(k, v)| (k.as_str().into(), v.clone()))
+                                    .collect(),
+                            }))
+                        })
+                        .collect(),
+                );
+            }
+            // 无索引（或 key 未命中）：回退全表扫描（与 provider_snapshot 一致）。
+            let rows = pw.snapshot();
             return Some(
                 rows.into_iter()
-                    .filter(|row| {
-                        row.field_value(key_field)
-                            .is_some_and(|v| values_equal(&v, key))
+                    .filter(|row| row.get(key_field).is_some_and(|v| values_equal(v, key)))
+                    .map(|row| {
+                        JoinRow::Event(Arc::new(Event {
+                            fields: row.into_iter().map(|(k, v)| (k.into(), v)).collect(),
+                        }))
                     })
                     .collect(),
             );

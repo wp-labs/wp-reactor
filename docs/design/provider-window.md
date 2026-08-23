@@ -90,6 +90,27 @@ bootstrap/refresh: facade::query() → HashMap   （定时，低频）
 join 期间:        HashMap::get()               （每事件，高频，纯内存）
 ```
 
+## Join 索引（2026-08-23 q13 性能修复）
+
+Provider 窗口默认**无 join 索引**：`join_lookup` 每事件全表扫描，对 side-input 形态
+（小静态表 × 海量事件）是 O(rows×events) 卡死级开销。修复：`set_join_key` 建 O(rows)
+哈希索引，lookup O(1)（键类型 `JoinKey`，与 buffer 窗口 join 索引同截断语义）。
+
+### 实测数据（`q13b_join_bench`，N=1M 行 × 10000 行 side_input，release）
+
+| 形态 | ns/行 | 相对基线 |
+|------|-------|----------|
+| no-join 列式 each（基线） | 233 | 100% |
+| join + 全表扫描 | 141,227 | 60,559%（606× 退化） |
+| join + 哈希索引 | 446 | 191% |
+
+全表扫描 141μs/行 与 daemon 实测 q13b ~0.46ms/行 同量级（bench 不含上下文/序列化）；
+索引加速 **316.5×**（防御断言要求 >50×）。
+
+接线点：`spawn.rs` 与 buffer 窗口同路径调用 `set_join_key`（首 join 条件右字段）；
+`window_lookup.rs` 的 `join_lookup` provider 分支有索引走索引、无索引回退扫描。
+`load()` 替换 rows 后自动重建索引。
+
 ## 数据加载策略
 
 | 策略 | 适用 | 数据量 | 机制 |

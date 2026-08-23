@@ -367,8 +367,14 @@ pub(super) fn spawn_rule_tasks(
             if key.is_empty() {
                 continue;
             }
+            // 2026-08-23 q13：provider 窗口（side_input）同样接 join 索引——
+            // 无索引时 join_lookup 全表扫描（10000 行 × 每事件 → q13b 卡死）。
             if let Some(win) = router.registry().get_window(&join.right_window) {
                 win.set_join_key(key.to_string());
+            } else if let Some(pw) = router.registry().get_provider(&join.right_window) {
+                pw.write()
+                    .expect("provider window lock poisoned")
+                    .set_join_key(key.to_string());
             }
         }
 
@@ -513,8 +519,20 @@ pub(super) fn spawn_rule_tasks(
                     .joins
                     .iter()
                     .any(|j| j.emit_at.is_some());
-                let shardable =
-                    shard_count > 1 && !intermediate_targets.contains(&target) && !deferred;
+                // 2026-08-23 q13：bind **中间管道窗口**（上游 yield 的中间窗口）的
+                // each 规则不分片——round-robin 分片 + 独立 pull 光标下，下游消费
+                // 滞后于 pipe append（shutdown 时只消化部分批次，q13b 10M 只处理
+                // ~40%、EMIT 不足）；单 worker 顺序消费保证全量。
+                let consumes_intermediate = rule
+                    .executor
+                    .plan()
+                    .binds
+                    .iter()
+                    .any(|b| intermediate_targets.contains(&b.window));
+                let shardable = shard_count > 1
+                    && !intermediate_targets.contains(&target)
+                    && !deferred
+                    && !consumes_intermediate;
 
                 if shardable {
                     let mut shard_txs = Vec::with_capacity(shard_count);
@@ -563,7 +581,12 @@ pub(super) fn spawn_rule_tasks(
                         }
                     }
                 } else {
-                    let push_rx = if use_push {
+                    // 2026-08-23 q13：bind 中间管道窗口的 each 规则强制 push（fanout
+                    // 广播订阅）——flush_pipes 的 broadcast_with_batch 直接投递，
+                    // 规避 pull+Notify 的通知竞态（append 与 wait 时序错位时下游
+                    // 消费停滞：q13b 只处理已拉取批次，EMIT 严重不足）。广播带
+                    // seq=u64::MAX，process_push 的 ack 有 saturating 处理。
+                    let push_rx = if use_push || consumes_intermediate {
                         let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                         for source in &window_sources {
                             router

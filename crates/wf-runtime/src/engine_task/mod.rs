@@ -85,7 +85,17 @@ async fn run_push_loop(
             // an ingest burst, `rx.recv()` would otherwise starve the cancel
             // branch and extend shutdown by the whole backlog.
             _ = cancel.cancelled() => {
-                task.drain_push_channel(&mut rx).await;
+                // 2026-08-23 q13：shutdown 竞态——中间管道生产者（上游规则
+                // flush_pipes 广播）可能晚于本任务 cancel；单次 drain 会漏掉
+                // 生产者稍后投递的剩余批次（q13b 只收到部分广播）。drain 后
+                // 短暂重试（每轮 50ms，最多 ~1s）直到通道排空，再 flush 收口。
+                for _ in 0..20 {
+                    task.drain_push_channel(&mut rx).await;
+                    if rx.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
                 task.flush().await;
                 wf_debug!(pipe, task_id = %task_id, "rule task shutdown complete");
                 break;

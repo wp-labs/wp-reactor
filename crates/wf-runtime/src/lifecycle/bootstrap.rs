@@ -12,6 +12,7 @@ use wp_core_connectors::sinks::tcp::TcpFactory;
 
 use wf_config::ConfigVarContext;
 use wf_config::FusionConfig;
+use wf_engine::match_engine::Value as EngineValue;
 use wf_engine::window::{ProviderWindow, Router, WindowRegistry};
 
 use crate::error::{RuntimeReason, RuntimeResult};
@@ -331,14 +332,34 @@ fn init_knowledge_redis_if_configured(knowdb_path: &Path, base_dir: &Path) {
     }
 }
 
+/// Infer a typed engine value from a raw knowdb cell (CSV / PG string).
+///
+/// Numeric-looking cells become `Number` so numeric side-input columns can
+/// join numeric expressions (q13: `mod(auction,10000) = side_input.key` —
+/// the loader used to store every column as `Str`, so the provider join
+/// index key (`JoinKey::Str`) never matched the lookup key
+/// (`JoinKey::Number`), every lookup missed the index and fell back to an
+/// O(rows) scan → q13b 卡死). `true`/`false` become `Bool`; everything else
+/// stays `Str`.
+fn infer_knowledge_value(cell: &str) -> EngineValue {
+    if let Ok(n) = cell.parse::<f64>()
+        && n.is_finite()
+    {
+        return EngineValue::Number(n);
+    }
+    match cell {
+        "true" => EngineValue::Bool(true),
+        "false" => EngineValue::Bool(false),
+        _ => EngineValue::Str(cell.to_string().into()),
+    }
+}
+
 /// Load knowdb CSV tables directly into matching static windows.
 fn load_knowledge_into_windows(
     knowdb_path: &Path,
     _base_dir: &Path,
     registry: &mut WindowRegistry,
 ) -> RuntimeResult<()> {
-    use wf_engine::match_engine::Value as EngineValue;
-
     let content = std::fs::read_to_string(knowdb_path).source_err(
         RuntimeReason::Bootstrap,
         format!("read {}", knowdb_path.display()),
@@ -433,7 +454,7 @@ fn load_knowledge_into_windows(
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("col_{}", i));
-                map.insert(field, EngineValue::Str(value.to_string().into()));
+                map.insert(field, infer_knowledge_value(value));
             }
             rows.push(map);
         }
@@ -461,8 +482,6 @@ fn load_from_postgres(
     tables: &[toml::Value],
     registry: &mut WindowRegistry,
 ) -> RuntimeResult<()> {
-    use wf_engine::match_engine::Value as EngineValue;
-
     let provider = config.get("provider").expect("provider section checked");
     let uri = provider
         .get("connection_uri")
@@ -503,7 +522,7 @@ fn load_from_postgres(
             for field in row.iter() {
                 map.insert(
                     field.name.to_string(),
-                    EngineValue::Str(field.value.to_string().into()),
+                    infer_knowledge_value(&field.value.to_string()),
                 );
             }
             rows.push(map);
@@ -530,6 +549,48 @@ mod tests {
 
     use wf_lang::ast::{CloseMode, Expr, MatchMode};
     use wf_lang::plan::{EntityPlan, MatchPlan, RulePlan, ScorePlan, WindowSpec, YieldPlan};
+
+    #[test]
+    fn infer_knowledge_value_types_numeric_bool_and_string() {
+        // 2026-08-23 q13：CSV 全列 Str → 侧输入数字列 join 数字表达式时索引键
+        // 类型不匹配（Str vs Number）→ 每次 lookup miss → 回退全表扫描卡死。
+        // 类型推断后数字列必须进 Number，join 索引才命中。
+        assert_eq!(
+            infer_knowledge_value("2345"),
+            EngineValue::Number(2345.0),
+            "整数字符串 → Number"
+        );
+        assert_eq!(
+            infer_knowledge_value("1.5"),
+            EngineValue::Number(1.5),
+            "浮点字符串 → Number"
+        );
+        assert_eq!(
+            infer_knowledge_value("true"),
+            EngineValue::Bool(true),
+            "true → Bool"
+        );
+        assert_eq!(
+            infer_knowledge_value("false"),
+            EngineValue::Bool(false),
+            "false → Bool"
+        );
+        assert_eq!(
+            infer_knowledge_value("value-0"),
+            EngineValue::Str("value-0".into()),
+            "非数字字符串保持 Str"
+        );
+        assert_eq!(
+            infer_knowledge_value(""),
+            EngineValue::Str("".into()),
+            "空串保持 Str"
+        );
+        assert_eq!(
+            infer_knowledge_value("NaN"),
+            EngineValue::Str("NaN".into()),
+            "非有限数保持 Str（防 NaN/Inf 混入 Number）"
+        );
+    }
 
     fn minimal_plan(name: &str, target: &str) -> RulePlan {
         RulePlan {

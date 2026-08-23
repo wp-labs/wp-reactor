@@ -3144,25 +3144,36 @@ impl RuleTask {
                     .router
                     .fanout()
                     .precompute_shard_rows(target.as_ref(), &batch);
-                let _ = win.append_with_watermark_sized(
-                    batch.clone(),
-                    wf_engine::window::content_bytes(&batch),
-                    shard_rows.map(|s| {
-                        let v: Vec<Vec<u32>> = s.iter().cloned().collect();
-                        std::sync::Arc::new(v)
-                    }),
-                );
+                // 2026-08-23 q13：广播带**真实窗口批次 seq**（append 返回）——
+                // 此前固定 u64::MAX 使下游 push 规则的 ack 不反映真实消费进度，
+                // 窗口 acked_lag 恒 0，bench 完成判定（等待 lag 归零）在中间
+                // 管道下游未消费完时就 SIGTERM（q13b 只处理 2/25 批）。
+                let seq = win
+                    .append_with_watermark_sized(
+                        batch.clone(),
+                        wf_engine::window::content_bytes(&batch),
+                        shard_rows.map(|s| {
+                            let v: Vec<Vec<u32>> = s.iter().cloned().collect();
+                            std::sync::Arc::new(v)
+                        }),
+                    )
+                    .map(|(_, seq)| seq)
+                    .unwrap_or(0);
+                // 2026-08-23 q13：直接 append（不走窗口 actor）不触发窗口 Notify——
+                // pull 模型下游（bind 中间窗口的 rule_task）靠 Notify 唤醒，漏通知
+                // 则消费停滞（q13b 只处理已拉取的部分，EMIT 严重不足）。append 后
+                // 显式 notify_waiters，与 actor 路径的通知语义对齐。
+                if let Some(notifier) = self.router.registry().get_notifier(target.as_ref()) {
+                    notifier.notify_waiters();
+                }
+                let fan_start = Instant::now();
+                self.router
+                    .fanout()
+                    .broadcast_with_batch(&target, &events, &batch, None, seq)
+                    .await;
+                self.fanout_nanos
+                    .fetch_add(fan_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
-            let fan_start = Instant::now();
-            // 带 batch 广播（2026-08-23 q4 修复）：仅 events 的 relay 广播会让
-            // 列式分片下游（stats 任务只看 `push.batch`）收不到——
-            // q4a→auction_finals→q4b(stats) 双规则链断链（q4b EMIT=0）。
-            self.router
-                .fanout()
-                .broadcast_with_batch(&target, &events, &batch, None, u64::MAX)
-                .await;
-            self.fanout_nanos
-                .fetch_add(fan_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
     }
 }

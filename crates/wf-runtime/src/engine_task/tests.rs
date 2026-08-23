@@ -3778,9 +3778,11 @@ async fn pure_relay_broadcasts_to_sharded_downstream() {
         empty.is_empty(),
         "the other shard must stay empty for the same key"
     );
-    // Pure relay carries the no-window sentinel seq (there is no window
-    // batch behind these events; consumers saturating-ack it).
-    assert_eq!(full[0].seq, u64::MAX, "relay pushes carry seq = u64::MAX");
+    // Pure relay carries the real window-batch seq (append 返回的真实 seq，
+    // 非 u64::MAX sentinel)——2026-08-23 q13：此前固定 u64::MAX 使下游
+    // push 规则的 ack 不反映真实消费进度（acked_lag 恒 0，bench 完成判定
+    // 提前 SIGTERM）。首批 append seq 从 0 起。
+    assert_eq!(full[0].seq, 0, "relay pushes carry the real append seq");
     assert_eq!(
         full[0].events.as_ref().unwrap()[0].fields.get("sip"),
         Some(&wf_engine::match_engine::Value::Str("10.0.0.8".into()))
