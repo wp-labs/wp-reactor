@@ -1360,6 +1360,12 @@ impl CepStateMachine {
     /// Close all active instances, returning a [`CloseOutput`] for each.
     ///
     /// Used during shutdown to flush all in-flight state.
+    ///
+    /// 2026-08-23 q5 修复：HOP/Fixed 窗口只收口**完整窗口**（`w_start + size ≤
+    /// 最终事件时间 watermark`）——尾部未完整窗口（w_end 超出数据末尾）flush
+    /// 强制收口会多输出（oracle/Flink 事件时间到末尾即止，未关闭窗口不发射；
+    /// q5 10M 多 3 条：992/994/996s 窗口 w_end=1002/1004/1006 > 1000s）。
+    /// 实例仍被移除并释放共享槽（不泄漏），只是不产出 CloseOutput。
     pub fn close_all(&mut self, reason: CloseReason) -> Vec<CloseOutput> {
         // Sort by (created_at, key) for fully deterministic rate limiting
         // order, same rationale as scan_expired_at.
@@ -1371,10 +1377,25 @@ impl CepStateMachine {
         keys.sort_by(|(k1, t1), (k2, t2)| t1.cmp(t2).then_with(|| k1.cmp(k2)));
         let mut results = Vec::with_capacity(keys.len());
         let wm = self.watermark_nanos;
+        // HOP/Fixed 窗口的收口尺寸（w_end = created_at + size）；sliding/session
+        // 无窗口完整性概念，全部收口。
+        let window_size_ns: Option<i64> = match self.plan.window_spec {
+            WindowSpec::Hop { size, .. } | WindowSpec::Fixed(size) => Some(size.as_nanos() as i64),
+            _ => None,
+        };
         for (key, _) in keys {
             if let Some(instance) = self.remove_instance(&key) {
                 // P1②: close_all is a permanent remove — release each slot.
                 self.release_shared_instance();
+                // 尾部未完整窗口：释放实例但不输出（oracle/Flink 语义）。
+                // wm ≤ 0 表示无事件时间推进（空流/测试直接 close_all）——
+                // 不适用窗口完整性判定，保留旧行为（全部收口）。
+                if wm > 0
+                    && let Some(size_ns) = window_size_ns
+                    && instance.created_at.saturating_add(size_ns) > wm
+                {
+                    continue;
+                }
                 let mut output = evaluate_close(
                     &self.rule_name,
                     &self.plan,

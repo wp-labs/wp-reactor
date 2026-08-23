@@ -3321,6 +3321,16 @@ async fn downstream_close_aggregates_intermediate_float_fields() {
     let batch = make_scored_batch(&schema, &["10.0.0.8", "10.0.0.8"], &[10.0, 30.0], ts);
     let source = router.registry().get_window("auth_events").unwrap();
     source.append(batch).unwrap();
+    // 推进 watermark 到 fixed 1s 桶 [ts, ts+1s) 完整（w_end ≤ wm）——2026-08-23
+    // close_all 对齐 oracle/Flink：尾部未完整窗口（w_end > 最终事件时间）不输出。
+    source
+        .append(make_scored_batch(
+            &schema,
+            &["10.0.0.1"],
+            &[1.0],
+            ts + 2_000_000_000,
+        ))
+        .unwrap();
 
     // Pure relay (P1c): the intermediate pipe is not stored in a window; the
     // downstream rule consumes the broadcast via push.
@@ -3352,6 +3362,16 @@ async fn downstream_close_counts_filtered_bind_aliases() {
     let batch = make_scored_batch(&schema, &["10.0.0.9", "10.0.0.9"], &[90.0, 70.0], ts);
     let source = router.registry().get_window("auth_events").unwrap();
     source.append(batch).unwrap();
+    // 推进 watermark 到 fixed 1s 桶 [ts, ts+1s) 完整（w_end ≤ wm）——2026-08-23
+    // close_all 对齐 oracle/Flink：尾部未完整窗口（w_end > 最终事件时间）不输出。
+    source
+        .append(make_scored_batch(
+            &schema,
+            &["10.0.0.1"],
+            &[1.0],
+            ts + 2_000_000_000,
+        ))
+        .unwrap();
 
     // Pure relay (P1c): the intermediate pipe is not stored in a window; the
     // downstream rule consumes the broadcast via push.

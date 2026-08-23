@@ -278,11 +278,21 @@ async fn hop_rule_task_closes_each_window_at_slide_boundary() {
         "exactly one window per slide boundary"
     );
 
-    // flush：剩余活跃窗口 k∈{849999998..=850000002} 全部收口。各窗口 count：
-    // 849999998/999/850000000 = 3，850000001 = 2，850000002 = 1（不达标）→ 4 条。
+    // t=T+6s：k=849999998 上界 T+6s 恰等于 wm → 到期收口（count=4）→ 又 1 条。
+    // 完整窗口（w_end ≤ wm）经由正常到期路径输出——与 flush 的「未完整窗口
+    // 不发射」互补（2026-08-23 close_all 对齐 oracle/Flink）。
+    win.append(driver_batch(&["10.0.0.1"], T + 6_000_000_000))
+        .unwrap();
+    task.pull_and_advance().await;
+    let alert = take_alert(&mut alert_rx);
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
+
+    // flush：剩余窗口 k∈{849999999..=850000003} 全部未完整（w_end=T+8s..T+16s
+    // > wm=T+6s）→ 0 条。close_all 只收口完整窗口，未完整窗口释放实例但不
+    // 发射（oracle/Flink 事件时间到末尾即止）。
     task.flush().await;
     let flushed = drain_alerts(&mut alert_rx);
-    assert_eq!(flushed.len(), 4, "flush 收口剩余 4 个达标窗口");
+    assert!(flushed.is_empty(), "flush 不发射尾部未完整窗口");
 }
 
 #[tokio::test]
@@ -371,12 +381,27 @@ async fn hop_rule_task_conv_sink_routes_unbounded_scan_closes() {
         "routed closes skip inline emit"
     );
 
-    // flush → drained 批次收口剩余窗口。
+    // t=T+6s：k=849999997（上界 T+4s）与 849999998（上界 T+6s 恰等于 wm）到期
+    // → 2 条 close 路由到 conv。
+    win.append(driver_batch(&["10.0.0.1"], T + 6_000_000_000))
+        .unwrap();
+    task.pull_and_advance().await;
+    let batch = conv_rx.try_recv().expect("hop close routed at boundary");
+    assert_eq!(
+        batch.closes.len(),
+        2,
+        "two windows expired at/under boundary"
+    );
+    assert_eq!(batch.watermark, T + 6_000_000_000, "barrier = event time");
+    assert!(!batch.drained);
+
+    // flush → drained 批次收口剩余窗口。2026-08-23 close_all 对齐 oracle/Flink：
+    // 尾部未完整窗口（w_end > 最终事件时间）不发射 → drained closes 为空。
     task.flush().await;
     let drained = conv_rx.try_recv().expect("drained batch on flush");
     assert!(drained.drained, "flush marks the conv barrier drained");
     assert!(
-        !drained.closes.is_empty(),
-        "remaining windows close on flush"
+        drained.closes.is_empty(),
+        "尾部未完整窗口不在 flush 收口发射（q5 语义）"
     );
 }
