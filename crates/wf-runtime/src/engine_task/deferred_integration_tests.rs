@@ -781,6 +781,209 @@ async fn deferred_q8_eos_retry_true_miss_stays_silent() {
     );
 }
 
+/// 排空 alert 通道并按 `__wfu_entity_id` 收集（精确计数断言：不重不丢）。
+fn drain_alert_entity_ids(rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>) -> Vec<String> {
+    use crate::alert_task::AlertBatch;
+    let mut ids = Vec::new();
+    while let Ok(batch) = rx.try_recv() {
+        match batch {
+            AlertBatch::Rows(rows) => {
+                for r in rows.iter() {
+                    ids.push(super::tests::field_str(r, "__wfu_entity_id"));
+                }
+            }
+            AlertBatch::Columns(cols) => {
+                for r in cols.iter_data_records() {
+                    if let Ok(r) = r {
+                        ids.push(super::tests::field_str(&r, "__wfu_entity_id"));
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// watermark 扫描**命中**（非 miss）→ flush 不得重复输出：missed 只收集 miss
+/// 实例，已命中实例不会进入重试路径。
+#[tokio::test]
+async fn deferred_q8_watermark_hit_not_duplicated_by_flush() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_q8_task();
+
+    // auction seller=5 先入右窗（桶内 T+5s）；person 5 注册（T）→ 挂起；
+    // person 6（T+11s）推 watermark 过 T+10s → person 5 到期**命中**
+    q8_auction_window(&router)
+        .append(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .unwrap();
+    q8_person_window(&router)
+        .append(person_batch(&[(5, T)]))
+        .unwrap();
+    q8_person_window(&router)
+        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+
+    assert_eq!(
+        drain_alert_entity_ids(&mut alert_rx),
+        vec!["5"],
+        "watermark 扫描命中输出 person 5"
+    );
+
+    // EOS flush：missed 为空 → 不得重复输出已命中实例
+    task.flush().await;
+    assert!(
+        drain_alert_entity_ids(&mut alert_rx).is_empty(),
+        "flush 不得重复输出已命中实例"
+    );
+}
+
+/// flush 幂等：EOS 重试命中后再次 flush（pending 已收口、missed 已 take）
+/// 不产生重复输出。
+#[tokio::test]
+async fn deferred_q8_flush_twice_idempotent() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_q8_task();
+
+    // person 5 到期时 auction 窗口为空 → miss；auction（seller=5）迟到入桶
+    q8_person_window(&router)
+        .append(person_batch(&[(5, T)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    q8_person_window(&router)
+        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    q8_auction_window(&router)
+        .append(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .unwrap();
+
+    task.flush().await;
+    assert_eq!(
+        drain_alert_entity_ids(&mut alert_rx),
+        vec!["5"],
+        "EOS 重试补出 person 5"
+    );
+
+    // 第二次 flush：无新增（missed 被 take、pending 已收口）
+    task.flush().await;
+    assert!(
+        drain_alert_entity_ids(&mut alert_rx).is_empty(),
+        "第二次 flush 幂等，不重复输出"
+    );
+}
+
+/// 多个实例在不同 watermark 扫描 miss → EOS 重试各自恰好补出一次
+/// （不丢不重；混入的真 miss 保持静默）。
+#[tokio::test]
+async fn deferred_q8_multiple_missed_recovered_exactly_once() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_q8_task();
+
+    // person 5（T，桶 [T, T+10s)）、person 7（T+21s，桶 [T+21s, T+31s)）
+    q8_person_window(&router)
+        .append(person_batch(&[(5, T), (7, T + 21_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    // person 6（T+11s）推 watermark 过 person 5 桶末 → person 5 miss（窗空）
+    q8_person_window(&router)
+        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    // person 8（T+32s）推 watermark 过 person 6/person 7 桶末：person 6 到期
+    // miss（真 miss，无其 auction）、person 7 到期 miss（窗仍空）
+    q8_person_window(&router)
+        .append(person_batch(&[(8, T + 32_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(alert_rx.try_recv().is_err(), "全部 miss，flush 前无输出");
+
+    // 两个迟到 auction 各自入桶（seller 5 桶内 T+5s；seller 7 桶内 T+25s）
+    q8_auction_window(&router)
+        .append(q8_auction_batch(&[
+            (5, T + 5_000_000_000),
+            (7, T + 25_000_000_000),
+        ]))
+        .unwrap();
+
+    task.flush().await;
+    let mut ids = drain_alert_entity_ids(&mut alert_rx);
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["5", "7"],
+        "EOS 重试各自恰好补出一次；person 6 真 miss 保持静默"
+    );
+}
+
+/// miss 实例从 pending 移除后**不进后续 watermark 扫描**（不提前输出、不重复），
+/// 只由 EOS 重试补出——期间多次水位推进必须保持静默。
+#[tokio::test]
+async fn deferred_q8_miss_not_reevaluated_until_flush() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_q8_task();
+
+    // person 5（T）→ person 6（T+11s）推水位过桶末 → person 5 miss（窗空）
+    q8_person_window(&router)
+        .append(person_batch(&[(5, T)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    q8_person_window(&router)
+        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(alert_rx.try_recv().is_err(), "miss 后无输出");
+
+    // auction（seller=5）入桶；再推两轮水位（person 9/10）——person 5 在
+    // missed 中，后续扫描不得重新评估它
+    q8_auction_window(&router)
+        .append(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .unwrap();
+    q8_person_window(&router)
+        .append(person_batch(&[
+            (9, T + 41_000_000_000),
+            (10, T + 51_000_000_000),
+        ]))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "miss 实例只由 EOS 重试补出，后续 watermark 扫描不得提前输出"
+    );
+
+    task.flush().await;
+    assert_eq!(
+        drain_alert_entity_ids(&mut alert_rx),
+        vec!["5"],
+        "flush 重试恰好补出一次"
+    );
+}
+
+/// 尾部未到期实例（expiry > 最终事件时间 watermark）即使桶内有 auction 也
+/// **不输出**——事件时间域窗口未完成（oracle/Flink 语义）。i64::MAX 强评会
+/// 多出尾部桶（Q8 实证 82446 → 83274，+828），flush 按最终水位收口后必须静默。
+#[tokio::test]
+async fn deferred_q8_unexpired_tail_with_auction_not_emitted_at_flush() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_q8_task();
+
+    // person 5（T，桶 [T, T+10s)）挂起；auction seller=5 桶内 T+5s 入右窗
+    q8_person_window(&router)
+        .append(person_batch(&[(5, T)]))
+        .unwrap();
+    q8_auction_window(&router)
+        .append(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    // 无后续 person 事件 → 最终 watermark = T < T+10s：窗口未完成
+    task.flush().await;
+
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "尾部未到期（expiry > 最终 watermark）即使桶内有 auction 也不输出"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 真实 wfl 编译集成测试：q9.wfl（文件内容）→ parse/compile（checker+compiler）
 // → RulePlan → rule_task 执行。覆盖「编译层 → 执行层」全链路——现有 e2e 均为

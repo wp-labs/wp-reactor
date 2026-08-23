@@ -224,6 +224,78 @@ over_cap = "1h"
         (root, reactor)
     }
 
+    /// 带 `[metrics]` + monitor sink 的 reactor fixture：文件源喂 3 条 failed
+    /// 事件（brute_force 阈值 3 → 至少 1 条 EMIT），metrics.ndjson 由 monitor
+    /// sink 落盘。用于验证 `wait()` 的 shutdown 尾部 metrics 导出。
+    async fn bootstrap_metrics_reactor() -> (PathBuf, Reactor) {
+        let root = make_temp_dir("reactor-metrics");
+        write_file(
+            &root.join("wfusion.toml"),
+            r#"
+mode = "daemon"
+windows = "models/windows.toml"
+sinks = "sinks"
+
+[metrics]
+enabled = true
+report_interval = "100ms"
+prometheus_listen = "127.0.0.1:0"
+
+[[sources]]
+type = "file"
+name = "seed"
+path = "seed.ndjson"
+stream_tag = "syslog"
+data_format = "ndjson"
+
+[runtime]
+parse_parallelism = 2
+rule_exec_timeout = "30s"
+schemas = "schemas/*.wfs"
+rules = "rules/*.wfl"
+"#,
+        );
+        write_file(&root.join("schemas/security.wfs"), SECURITY_SCHEMA);
+        write_file(&root.join("rules/brute_force.wfl"), BRUTE_FORCE_RULE);
+        // 3 条 failed（同 sip）→ 第 3 条触发 on-event（count>=3）输出
+        write_file(
+            &root.join("seed.ndjson"),
+            r#"{"sip":"10.0.0.1","username":"alice","action":"failed","event_time":"2026-01-01T00:00:00Z"}
+{"sip":"10.0.0.1","username":"alice","action":"failed","event_time":"2026-01-01T00:00:01Z"}
+{"sip":"10.0.0.1","username":"alice","action":"failed","event_time":"2026-01-01T00:00:02Z"}
+"#,
+        );
+        write_sink_layout(&root);
+        // monitor sink：metrics.ndjson 落盘目标（connector allow_override 仅 file，
+        // 不能覆盖 base → 用默认 ./data/out_dat）
+        write_file(
+            &root.join("sinks/infra.d/monitor.toml"),
+            r#"
+[sink_group]
+name = "monitor_infra"
+windows = ["*"]
+
+[[sink_group.sinks]]
+connect = "file_json"
+name = "monitor_out"
+
+[sink_group.sinks.params]
+file = "metrics.ndjson"
+"#,
+        );
+        write_window_config(&root);
+
+        let ctx = ConfigVarContext::new();
+        let cfg_path = root.join("wfusion.toml");
+        let loader = FusionConfigLoader::new(&cfg_path, &[], &ctx, Some(&root));
+        let raw = loader.load_raw().expect("load raw");
+        let config = loader.load().expect("load config");
+        let reactor = Reactor::start(config, raw, &root)
+            .await
+            .expect("reactor start");
+        (root, reactor)
+    }
+
     #[tokio::test]
     async fn apply_reload_swaps_rules_when_topology_unchanged() {
         let (root, mut reactor) = bootstrap_reactor(BRUTE_FORCE_RULE).await;
@@ -379,6 +451,48 @@ rule repeated_fail_bursts {
             .wait()
             .await
             .expect("clean shutdown after rules reload");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// wait() 的 shutdown 尾部 metrics 导出（q8 修复的集成保护）：
+    ///
+    /// 规则 shutdown flush 的 `emitted_total` 增量发生在 metrics 任务最后 tick
+    /// 之后、且 metrics 任务（tail 组）在 rules 之前退出——wait() 必须在 rules
+    /// join 后、head join 前把剩余计数器导出到 monitor sink，否则
+    /// `verify-nexmark --engine-emit`（读 metrics.ndjson）漏计 EMIT
+    /// （q8：30,785 + 51,661 = 82,446 = oracle 的修复路径）。
+    #[tokio::test]
+    async fn wait_exports_final_emitted_total_after_rules_flush() {
+        let (root, reactor) = bootstrap_metrics_reactor().await;
+        // 给足摄入时间：文件源读 3 条 failed → 规则 on-event 输出 + EOS flush
+        // 的 close 输出，metrics 任务 100ms tick 采样（也覆盖 wait() 尾部导出
+        // 路径——两条路径任一漏写都会让断言失败）。
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        reactor.shutdown();
+        reactor
+            .wait()
+            .await
+            .expect("clean shutdown with metrics tail export");
+
+        let path = root.join("data/out_dat/metrics.ndjson");
+        let data = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("metrics.ndjson not found at {}: {e}", path.display()));
+        let total: u64 = data
+            .lines()
+            .filter(|l| l.contains("\"emitted_total\"") && l.contains("brute_force_then_scan"))
+            .filter_map(|l| l.rsplit("\"value\":\"").next())
+            .filter_map(|v| {
+                v.trim_end_matches('}')
+                    .trim_end_matches('"')
+                    .parse::<u64>()
+                    .ok()
+            })
+            .sum();
+        assert!(
+            total >= 1,
+            "shutdown 后 metrics.ndjson 必须含规则的 EMIT 计数（tick 或 wait() 尾部导出），got total={total}: {data}"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

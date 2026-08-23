@@ -613,3 +613,72 @@ async fn final_metrics_export_noop_without_dispatcher() {
     let router = router_with_window();
     crate::lifecycle::export_final_metrics(&Some(m), &router, &None).await;
 }
+
+/// 最终导出 **drain** 计数器：第二次导出不再重复写 emitted_total 增量
+/// （metrics 任务最后 tick 已 drain 其份额；尾部导出只写 flush 期间增量一次）
+/// ——bench `--verify` 对 metrics.ndjson 求和，重复导出会双计数。
+#[tokio::test]
+async fn final_metrics_export_drains_counters_once() {
+    let dir = tempfile::tempdir().unwrap();
+    write_monitor_sink_layout(dir.path());
+    let dispatcher = build_dispatcher(dir.path()).await;
+    let m = metrics();
+    m.inc_alert_emitted_total("r4_rule");
+    m.inc_alert_emitted_total("r4_rule");
+    let router = router_with_window();
+
+    crate::lifecycle::export_final_metrics(&Some(m.clone()), &router, &Some(dispatcher.clone()))
+        .await;
+    crate::lifecycle::export_final_metrics(&Some(m), &router, &Some(dispatcher.clone())).await;
+    dispatcher.stop_monitor_sinks().await;
+
+    let path = dir.path().join("data/out_dat/monitor.jsonl");
+    let data = std::fs::read_to_string(&path).unwrap();
+    let deltas: Vec<&str> = data
+        .lines()
+        .filter(|l| l.contains("\"emitted_total\"") && l.contains("r4_rule"))
+        .collect();
+    assert_eq!(
+        deltas.len(),
+        2,
+        "两次导出各写一条（首条=2，次条=0 drain 后）: {data}"
+    );
+    assert_eq!(
+        deltas.iter().filter(|l| l.contains("\"2\"")).count(),
+        1,
+        "增量 2 只写一次（第二次导出不得重复）: {data}"
+    );
+}
+
+/// 最终导出覆盖**全部**注册规则（snapshot 整体 drain map，非单规则）。
+#[tokio::test]
+async fn final_metrics_export_captures_multiple_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    write_monitor_sink_layout(dir.path());
+    let dispatcher = build_dispatcher(dir.path()).await;
+    let m = Arc::new(RuntimeMetrics::new(
+        &["r4_rule".to_string(), "q8_rule".to_string()],
+        &["w".to_string()],
+        &[],
+        BTreeMap::new(),
+    ));
+    m.inc_alert_emitted_total("r4_rule");
+    m.inc_alert_emitted_total("q8_rule");
+    m.inc_alert_emitted_total("q8_rule");
+    let router = router_with_window();
+    crate::lifecycle::export_final_metrics(&Some(m), &router, &Some(dispatcher.clone())).await;
+    dispatcher.stop_monitor_sinks().await;
+
+    let path = dir.path().join("data/out_dat/monitor.jsonl");
+    let data = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        data.lines()
+            .any(|l| l.contains("emitted_total") && l.contains("r4_rule") && l.contains("\"1\"")),
+        "r4_rule 增量 1 必须导出: {data}"
+    );
+    assert!(
+        data.lines()
+            .any(|l| l.contains("emitted_total") && l.contains("q8_rule") && l.contains("\"2\"")),
+        "q8_rule 增量 2 必须导出: {data}"
+    );
+}
