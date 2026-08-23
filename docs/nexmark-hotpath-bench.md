@@ -260,3 +260,58 @@ fire + match/close 输出路径的 ctx 构建（Q3/Q4/Q5/Q6/Q7/Q12/Q13/Q20）。
 - **Q13/Q11/Q18 RSS（A2/A3/A4）**：需运行确认是状态物化还是管道积压（q22 的 RSS
   已实证为积压），不做无数据优化。
 - **Q19 top-N RSS（A5）** / **Q4/Q6 join-then-key RSS（A7）**：确认但未优化。
+
+## 8. RSS 归因实证（2026-08-23，q13 22GB 根因 + 修复）
+
+### 8.1 归因结论（逐项证实）
+
+1. **q13 30M RSS 22.9GB = bid 窗口持积压**，非 join 缓存/状态物化：
+   - 实测 evictor Phase-1 扫掠时 bid 窗口 `rows=24.1M / bytes=5.5GB / floor=94`——
+     驱逐被 ack floor 门控（`tb.seq < floor`），而 floor 只推进到 94（消费 1.7M/s
+     落后推入 3M/s → 每轮 pull 只 ack 已读位置）→ 窗口持 [floor, newest] 全部积压；
+   - 跑批结束（推入停止、消费追平）后 floor→775，窗口瞬间清到 3 批次——证实纯积压，
+     无泄漏/常驻状态。
+2. **生产从未调用 `set_join_key` → join 全量扫描**（前一轮诊断）已修复：spawn.rs 按
+   join 首条件右字段接索引（seq-cut 感知，`JOIN_DIAG=1` 实测 900 万次 lookup 全部
+   `idx_hits`、`scan_fb=0`）。但 q13 EPS 不变（1.7M）——**join 索引不是瓶颈**。
+3. **真瓶颈 = CEP 行式路径**：sample 采样热帧 = `CepStateMachine::advance_at_with_diagnostics`
+   + `AlertColumnBuilder::append_record` + `core::fmt::write` + `mi_heap_collect_ex`；
+   rule profile：exec 41.5% + emit 48.8% = 90%。q13 的 `match<bidder:10m>
+   { on event { b | count >= 1 } }` 每事件必匹配 → 每事件 advance + fire + 富化。
+4. **`each_plan_columnar_safe()` 对带 join 的 each 规则返回 false**（each_exec.rs:423）——
+   任何 each+join 规则退出列式快路径走行式（q13-each 2.29M / q20 2.55M vs q1 7.6M）。
+5. **bid over 调小（5s/2m）破坏 q9**：q9 的 deferred 评估由 auction watermark（慢）
+   驱动，bid 驱逐由 bid watermark（快）驱动，事件时间差 = 摄入积压滞后（30m 数据
+   ~1700s）——over < 滞后时评估前 bids 已被驱逐（over=2m 时 q9 丢 73% 输出）。
+   设计文档 D4 悬置项：deferred join 规则需在 join 窗口注册保留 pin（按自身
+   watermark 推进 ack）；落地前 bid over 保持 1h。
+
+### 8.2 修复（F5：死 join 消除，2026-08-23）
+
+`RuleExecutor` 新增 `live_joins`（`compute_live_joins`）：输出表达式（lets/where/
+score/entity/yield）**全为限定引用或字面量**时，Snapshot/Asof join 的富化字段无人
+读取 → 死 join 消除（输出字节不变——Snapshot/Asof miss 保留事件、无过滤语义）。
+Inner/Anti/within/reduce/emit_at 有输出/过滤语义 → 永不消除；任何 plain（未限定）
+字段引用 → 保守保留全部 join。
+
+q13.wfl 同步从 `match<bidder:10m>` 改写为 `on each b`（输出等价：每 bid 一条 alert，
+27.6M @30m 不变）——`on each` + 死 join → 列式快路径。
+
+**实测（30M，单连接 replay）**：
+
+| 配置 | EPS | RSS | CPU |
+|---|---|---|---|
+| 旧：match + join 全表扫描 | 1.7M | 22.9GB | 867% |
+| join 索引接上（无 seq 门禁） | 1.7M | 17.9GB | 829% |
+| match→each（join 仍在） | 2.29M | 16.5GB | 794% |
+| **each + 死 join 消除（F5）** | **15.9M** | **7.1GB** | **208%** |
+
+q9（唯一 join bid 的 deferred 规则）10m 输出 557,204 = 基线一致 ✅（over 回 1h 后）。
+
+### 8.3 遗留
+
+- **q20 等活 join 查询（2.5~2.9M/s）**：join 富化被输出引用 → 死 join 消除不适用；
+  需要**列式 join 富化**（批级 join_lookup + 富化，免每事件 Event clone）才能上列式
+  路径——Q3/Q4/Q6/Q9/Q13/Q20 全家族受益，下一优先级。
+- **D4 deferred join 窗口 pin**：落地后 bid over 可调小，q13 类查询 RSS 再降 ~3GB。
+- **q11/q18/q19 的 RSS**：均为同类积压/状态结构问题，待逐项归因。

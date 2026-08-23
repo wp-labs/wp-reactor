@@ -39,8 +39,8 @@ use std::sync::{Arc, Mutex};
 
 use orion_error::conversion::{SourceRawErr, ToStructError};
 use wf_config::OutputConfig;
-use wf_lang::ast::Expr;
-use wf_lang::plan::RulePlan;
+use wf_lang::ast::{Expr, FieldRef, JoinMode};
+use wf_lang::plan::{JoinPlan, RulePlan};
 use wf_lang::{BaseType, FieldType};
 
 use self::alert::build_summary;
@@ -195,6 +195,154 @@ fn visit_expr_fields(
         _ => *force_all = true,
     }
 }
+/// Compute the subset of [`JoinPlan`]s whose enrichment is actually consumed
+/// by the rule's output expressions (lets / `where` / score / entity / yield).
+///
+/// **Dead-join elimination** (2026-08-23, q13 RSS/EPS): a join whose added
+/// fields are never read is pure per-event overhead — for `Snapshot`/`Asof`
+/// modes a miss merely skips enrichment and keeps the event, so dropping the
+/// join is byte-identical. Other modes have output semantics and are never
+/// dropped:
+/// - `Inner` / `Anti`: filter (miss/hit drops the event);
+/// - `within` interval: `execute_interval_join` drops on miss;
+/// - `reduce` / `emit at`: produce output (label value / deferred driver).
+///
+/// The reference check is deliberately conservative: if any output expression
+/// reads a **plain** (unqualified) field, or contains an expression shape we
+/// cannot fully analyze, every dead-eligible join stays live (a plain field
+/// could be join-provided; the checker would have resolved it so). Only when
+/// every output field reference is **qualified** (or a literal) is a join
+/// provably dead — its `right_window` then cannot appear in the qualified
+/// windows the output reads.
+fn compute_live_joins(plan: &RulePlan) -> Vec<JoinPlan> {
+    let mut plain_ref = false;
+    let mut qualified_windows: std::collections::HashSet<String> = Default::default();
+    let mut force_all = false;
+
+    // Output expressions that read the (possibly join-enriched) ctx. The each
+    // bind filter runs *before* joins and is excluded (it cannot see enriched
+    // fields). The join conditions' own field refs are excluded too — they are
+    // read from the *driving* event, not the enriched output.
+    for let_plan in &plan.lets {
+        visit_output_expr(
+            &let_plan.expr,
+            &mut plain_ref,
+            &mut qualified_windows,
+            &mut force_all,
+        );
+    }
+    if let Some(w) = &plan.r#where {
+        visit_output_expr(w, &mut plain_ref, &mut qualified_windows, &mut force_all);
+    }
+    visit_output_expr(
+        &plan.score_plan.expr,
+        &mut plain_ref,
+        &mut qualified_windows,
+        &mut force_all,
+    );
+    visit_output_expr(
+        &plan.entity_plan.entity_id_expr,
+        &mut plain_ref,
+        &mut qualified_windows,
+        &mut force_all,
+    );
+    for field in &plan.yield_plan.fields {
+        visit_output_expr(
+            &field.value,
+            &mut plain_ref,
+            &mut qualified_windows,
+            &mut force_all,
+        );
+    }
+
+    plan.joins
+        .iter()
+        .filter(|join| {
+            // Non-eliminable (output semantics): keep.
+            let eligible = matches!(join.mode, JoinMode::Snapshot | JoinMode::Asof { .. })
+                && join.within.is_none()
+                && join.reduce.is_none()
+                && join.emit_at.is_none();
+            if !eligible || plain_ref || force_all {
+                return true;
+            }
+            // Keep iff the output reads this window's fields (provably dead
+            // otherwise: no output expression can see the dropped enrichment).
+            qualified_windows.contains(join.right_window.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Collect field refs from an output expression: `Qualified(window, _)` records
+/// the window; `Simple`/`Bracketed`/`Path` (plain reads) set `plain_ref`; shapes
+/// we cannot fully inspect set `force_all` (keep every join live).
+fn visit_output_expr(
+    expr: &Expr,
+    plain_ref: &mut bool,
+    qualified_windows: &mut std::collections::HashSet<String>,
+    force_all: &mut bool,
+) {
+    match expr {
+        Expr::Field(fr) => match fr {
+            FieldRef::Qualified(window, _) => {
+                qualified_windows.insert(window.clone());
+            }
+            FieldRef::Simple(_) | FieldRef::Bracketed(_, _) | FieldRef::Path { .. } => {
+                *plain_ref = true;
+            }
+            _ => *force_all = true,
+        },
+        Expr::FuncCall { args, .. } => {
+            for arg in args {
+                visit_output_expr(arg, plain_ref, qualified_windows, force_all);
+            }
+        }
+        Expr::BinOp { left, right, .. } => {
+            visit_output_expr(left, plain_ref, qualified_windows, force_all);
+            visit_output_expr(right, plain_ref, qualified_windows, force_all);
+        }
+        Expr::Neg(inner) => visit_output_expr(inner, plain_ref, qualified_windows, force_all),
+        Expr::Array(items) => {
+            for item in items {
+                visit_output_expr(item, plain_ref, qualified_windows, force_all);
+            }
+        }
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
+            visit_output_expr(inner, plain_ref, qualified_windows, force_all);
+            for item in list {
+                visit_output_expr(item, plain_ref, qualified_windows, force_all);
+            }
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            visit_output_expr(cond, plain_ref, qualified_windows, force_all);
+            visit_output_expr(then_expr, plain_ref, qualified_windows, force_all);
+            visit_output_expr(else_expr, plain_ref, qualified_windows, force_all);
+        }
+        Expr::Object(items) => {
+            for item in items {
+                visit_output_expr(&item.value, plain_ref, qualified_windows, force_all);
+            }
+        }
+        // Literals / system vars read no ctx fields.
+        Expr::Number(_)
+        | Expr::StringLit(_)
+        | Expr::Bool(_)
+        | Expr::SystemVar(_)
+        | Expr::WfuMeta(_)
+        | Expr::PresetParam(_) => {}
+        // Unknown/forward-compatible Expr variants: cannot prove field reads —
+        // conservatively keep every join live.
+        _ => *force_all = true,
+    }
+}
+
 /// Evaluates score/entity expressions from a [`RulePlan`] and produces
 /// [`OutputRecord`]s from CEP match/close outputs.
 ///
@@ -205,6 +353,15 @@ fn visit_expr_fields(
 #[moju(kind = "struct", domain = "Engine", module = "Engine.MatchEngine")]
 pub struct RuleExecutor {
     plan: RulePlan,
+    /// Joins whose enrichment the rule's output expressions actually read.
+    /// Dead joins (Snapshot/Asof, enrichment unreferenced) are dropped here so
+    /// the per-event join cost (ctx clone + lookup + `find_matching_row` +
+    /// enrichment) disappears and rules can use the columnar each path — the
+    /// q13 RSS/EPS fix (2026-08-23: q13 声明了 person 快照 join 但 yield/score/
+    /// entity 全读 bid 字段 → join 纯开销，消除后 1.7M→7.6M/s 量级)。
+    /// 语义安全：Snapshot/Asof miss 保留事件（无过滤作用），富化字段无人读 →
+    /// 输出字节不变。Inner/Anti/within/reduce/emit_at 有过滤/输出语义 → 永不消除。
+    live_joins: Vec<JoinPlan>,
     yield_field_types: HashMap<String, FieldType>,
     output: OutputConfig,
     /// alias → bind filter, precomputed so per-event alias matching is O(1)
@@ -236,6 +393,7 @@ impl Clone for RuleExecutor {
     fn clone(&self) -> Self {
         Self {
             plan: self.plan.clone(),
+            live_joins: self.live_joins.clone(),
             yield_field_types: self.yield_field_types.clone(),
             output: self.output.clone(),
             bind_filters: self.bind_filters.clone(),
@@ -285,6 +443,7 @@ impl RuleExecutor {
     }
 
     pub fn new_with_options(plan: RulePlan, options: RuleExecutorOptions) -> Self {
+        let live_joins = compute_live_joins(&plan);
         let bind_filters = plan
             .binds
             .iter()
@@ -355,6 +514,7 @@ impl RuleExecutor {
                 each_close_reason: Arc::from(""),
             },
             plan,
+            live_joins,
             yield_field_types: options.yield_field_types,
             output: options.output,
             bind_filters,

@@ -301,7 +301,11 @@ fn deferred_join_hot_paths() {
 
 #[test]
 fn deferred_join_overhead_bounded() {
-    // 宽松上限：到期评估 ≤ eager interval × 8 + 50ns 容差；挂起 ≤ 2µs/事件。
+    // 宽松上限：到期评估 ≤ eager interval × 8 + 50ns 容差（相对式，跨机器稳定）；
+    // 挂起 ≤ 8µs/事件。挂起绝对值在 debug 下随机器抖动大（实测 1.3–2.2µs/事件，
+    // 慢机/频率调制可更高），2µs 会在正常路径上误报——放宽到 8µs 仍远低于灾难量级
+    // （意外整窗扫描 ≈ eval 路径 ~12µs、逐事件克隆大结构），且对 debug 方差留足余量；
+    // release 真实成本见 deferred_join_hot_paths（~127ns/op）。
     // 防止挂起/评估引入灾难性开销（如意外的整窗扫描、每次克隆大结构）。
     let n = 20_000;
     let rows = vec![
@@ -382,7 +386,7 @@ fn deferred_join_overhead_bounded() {
         "deferred eval must stay within 8x of eager interval: eager={eager_ns:.1}ns eval={eval_ns:.1}ns"
     );
     assert!(
-        pending_ns < 2_000.0,
-        "deferred pending must stay under 2us/event: {pending_ns:.1}ns"
+        pending_ns < 8_000.0,
+        "deferred pending must stay under 8us/event: {pending_ns:.1}ns"
     );
 }

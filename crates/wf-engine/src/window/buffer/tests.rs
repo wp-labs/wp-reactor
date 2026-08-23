@@ -1111,17 +1111,17 @@ fn join_index_maintained_on_append_and_evict() {
 
     // Lookup by key: value 42 has 2 rows, 44 has 1, 999 has none.
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42)).map(|v| v.len()),
+        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
         Some(2),
         "two rows with value 42 indexed"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(44)).map(|v| v.len()),
+        win.join_lookup(&JoinKey::Int(44), None).map(|v| v.len()),
         Some(1),
         "one row with value 44 indexed"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(999)).map(|v| v.len()),
+        win.join_lookup(&JoinKey::Int(999), None).map(|v| v.len()),
         Some(0),
         "indexed but no match → empty (not None)"
     );
@@ -1130,7 +1130,7 @@ fn join_index_maintained_on_append_and_evict() {
     // (1-4ms), so all batches are time-evicted and index entries removed.
     win.evict_expired(4_000_000_000_000);
     assert!(
-        win.join_lookup(&JoinKey::Int(42))
+        win.join_lookup(&JoinKey::Int(42), None)
             .is_none_or(|v| v.is_empty()),
         "index cleared after eviction"
     );
@@ -1170,13 +1170,13 @@ fn join_key_from_value_conversion() {
 fn join_index_absent_without_set_join_key() {
     let win = test_window(3600, usize::MAX);
     assert!(
-        win.join_lookup(&JoinKey::Int(1)).is_none(),
+        win.join_lookup(&JoinKey::Int(1), None).is_none(),
         "no join index → None (caller falls back to scan)"
     );
     // The asof fast path must also fall back (not Miss) without an index: the
     // caller then runs the full timestamped scan.
     assert!(matches!(
-        win.join_lookup_asof(&JoinKey::Int(1), 5_000_000_000, 0),
+        win.join_lookup_asof(&JoinKey::Int(1), 5_000_000_000, 0, None),
         AsofLookup::Fallback
     ));
 }
@@ -1195,12 +1195,12 @@ fn join_index_built_for_existing_batches_on_set_join_key() {
         .unwrap();
     win.set_join_key("value".into());
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42)).map(|v| v.len()),
+        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
         Some(1),
         "existing rows indexed by set_join_key"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(44)).map(|v| v.len()),
+        win.join_lookup(&JoinKey::Int(44), None).map(|v| v.len()),
         Some(1),
         "rows from a later batch indexed"
     );
@@ -1229,17 +1229,17 @@ fn join_index_updated_on_oldest_eviction() {
         "evict_oldest returns byte size"
     );
     assert!(
-        win.join_lookup(&JoinKey::Int(42))
+        win.join_lookup(&JoinKey::Int(42), None)
             .is_none_or(|v| v.is_empty()),
         "key 42 (first batch) removed after evict_oldest"
     );
     assert!(
-        win.join_lookup(&JoinKey::Int(43))
+        win.join_lookup(&JoinKey::Int(43), None)
             .is_none_or(|v| v.is_empty()),
         "key 43 (first batch) removed after evict_oldest"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(44)).map(|v| v.len()),
+        win.join_lookup(&JoinKey::Int(44), None).map(|v| v.len()),
         Some(1),
         "key 44 (second batch) still indexed"
     );
@@ -1255,14 +1255,14 @@ fn join_index_duplicate_key_keeps_all_rows() {
     win.append(make_batch(&test_schema(), &[2_000_000], &[42]))
         .unwrap();
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42)).map(|v| v.len()),
+        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
         Some(2),
         "both rows with key 42 kept"
     );
     // Evict one batch → one row remains.
     win.evict_oldest();
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42)).map(|v| v.len()),
+        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
         Some(1),
         "one row removed on evict, one kept"
     );
@@ -1286,7 +1286,7 @@ fn join_index_stays_columnar_without_materializing_parsed_events() {
 
     // Columnar lookup still works.
     let rows = win
-        .join_lookup(&JoinKey::Int(42))
+        .join_lookup(&JoinKey::Int(42), None)
         .expect("indexed window should return rows");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].field_value("value"), Some(Value::Number(42.0)));
@@ -1310,7 +1310,7 @@ fn join_lookup_asof_max_fast_path() {
         .unwrap();
 
     // Fast-path hit: max_ts=3s falls within [2s, 5s] → returns the latest row.
-    match win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 2_000_000_000) {
+    match win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 2_000_000_000, None) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(3_000_000_000.0)));
         }
@@ -1320,12 +1320,12 @@ fn join_lookup_asof_max_fast_path() {
 
     // max_ts too old (3s < min_ts=4s) → Miss (no scan needed).
     assert!(matches!(
-        win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 4_000_000_000),
+        win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 4_000_000_000, None),
         AsofLookup::Miss
     ));
     // Miss must be consistent with the fallback scan: every candidate ts is
     // below min_ts, so `find_asof_row` would also return `None`.
-    let cands = win.join_lookup_timestamped(&JoinKey::Int(42)).unwrap();
+    let cands = win.join_lookup_timestamped(&JoinKey::Int(42), None).unwrap();
     assert!(
         cands.iter().all(|(ts, _)| *ts < 4_000_000_000),
         "Miss implies all candidate timestamps are below the asof lower bound"
@@ -1333,7 +1333,7 @@ fn join_lookup_asof_max_fast_path() {
 
     // max_ts too new (3s > event_time=2s): a smaller row (ts=1s) qualifies, so
     // the index scans and returns it directly — no caller-side fallback scan.
-    match win.join_lookup_asof(&JoinKey::Int(42), 2_000_000_000, 0) {
+    match win.join_lookup_asof(&JoinKey::Int(42), 2_000_000_000, 0, None) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(1_000_000_000.0)));
         }
@@ -1343,12 +1343,12 @@ fn join_lookup_asof_max_fast_path() {
 
     // Unknown key → Miss.
     assert!(matches!(
-        win.join_lookup_asof(&JoinKey::Int(99), 5_000_000_000, 0),
+        win.join_lookup_asof(&JoinKey::Int(99), 5_000_000_000, 0, None),
         AsofLookup::Miss
     ));
 
     // Boundary: max_ts == min_ts (3s == 3s) → still a hit (inclusive lower bound).
-    match win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 3_000_000_000) {
+    match win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 3_000_000_000, None) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(3_000_000_000.0)));
         }
@@ -1357,7 +1357,7 @@ fn join_lookup_asof_max_fast_path() {
     }
 
     // Boundary: max_ts == event_time (3s == 3s) → still a hit (inclusive upper bound).
-    match win.join_lookup_asof(&JoinKey::Int(42), 3_000_000_000, 2_000_000_000) {
+    match win.join_lookup_asof(&JoinKey::Int(42), 3_000_000_000, 2_000_000_000, None) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(3_000_000_000.0)));
         }
@@ -1388,7 +1388,7 @@ fn join_lookup_asof_max_scans_when_max_is_future() {
     }
 
     // event_time=7s, min_ts=0: max_ts(9s) > 7s → scan picks 5s (greatest ≤ 7s).
-    match win.join_lookup_asof(&JoinKey::Int(42), 7_000_000_000, 0) {
+    match win.join_lookup_asof(&JoinKey::Int(42), 7_000_000_000, 0, None) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(5_000_000_000.0)));
         }
@@ -1397,7 +1397,7 @@ fn join_lookup_asof_max_scans_when_max_is_future() {
     }
 
     // Tight window [4s, 6s]: 5s qualifies, 3s/1s below, 9s above → 5s.
-    match win.join_lookup_asof(&JoinKey::Int(42), 6_000_000_000, 4_000_000_000) {
+    match win.join_lookup_asof(&JoinKey::Int(42), 6_000_000_000, 4_000_000_000, None) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(5_000_000_000.0)));
         }
@@ -1407,7 +1407,7 @@ fn join_lookup_asof_max_scans_when_max_is_future() {
 
     // No candidate in [8s, 9s] below event_time=9s: max_ts==9s (== event_time)
     // is the fast-path hit, not the scan path.
-    match win.join_lookup_asof(&JoinKey::Int(42), 9_000_000_000, 8_000_000_000) {
+    match win.join_lookup_asof(&JoinKey::Int(42), 9_000_000_000, 8_000_000_000, None) {
         AsofLookup::Hit(row) => {
             assert_eq!(row.field_value("ts"), Some(Value::Number(9_000_000_000.0)));
         }
@@ -1418,7 +1418,7 @@ fn join_lookup_asof_max_scans_when_max_is_future() {
     // No candidate in [7.5s, 8.5s] (max_ts=9s > event_time=8.5s, all rows ≤7.5s
     // or =9s are outside [7.5s,8.5s]) → Miss.
     assert!(matches!(
-        win.join_lookup_asof(&JoinKey::Int(42), 8_500_000_000, 7_500_000_000),
+        win.join_lookup_asof(&JoinKey::Int(42), 8_500_000_000, 7_500_000_000, None),
         AsofLookup::Miss
     ));
 }
@@ -1444,7 +1444,7 @@ fn join_lookup_asof_max_miss_without_timestamps() {
     win.append(make_batch_no_time(&schema, &[42])).unwrap();
 
     assert!(matches!(
-        win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 0),
+        win.join_lookup_asof(&JoinKey::Int(42), 5_000_000_000, 0, None),
         AsofLookup::Miss
     ));
 }

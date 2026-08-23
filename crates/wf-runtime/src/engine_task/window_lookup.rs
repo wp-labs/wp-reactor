@@ -186,23 +186,20 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
         }
         let win = self.router.registry().get_window(window)?;
         let join_key = JoinKey::from_value(key)?;
-        // Indexed lookup if the window has a maintained join index (the index
-        // stores columnar row locators — `JoinRow::Columnar`, no per-row
-        // HashMap materialization). The index is built incrementally across
-        // the *full* window up to the current generation, so it is not seq-cut
-        // safe: under a `max_seq` watermark we bypass it and scan.
-        if self.eff_max_seq(window).is_none()
-            && let Some(rows) = win.join_lookup(&join_key)
-        {
+        // Indexed lookup with seq-cut（M2 pull 一致性）: 索引行带 batch seq，
+        // `max_seq` 过滤后只返回读者已拉取的 batch 的行（2026-08：索引此前无
+        // seq 感知，pull 模式被迫全量扫描 → q13 等 join 查询 CPU/积压瓶颈）。
+        // `None`（窗口无索引）→ 回退 snapshot 扫描。
+        if let Some(rows) = win.join_lookup(&join_key, self.eff_max_seq(window)) {
             return Some(rows);
         }
-        // Scan fallback (bounded watermark, or no index): filter the seq-bounded
-        // snapshot by key equality. Rows are keyed through the same
-        // `JoinKey::from_value` truncation the join index uses, so the bounded
-        // scan is byte-identical to the unbounded index path (both truncate
-        // floats to `Int` and compare with exact scalar equality). Inlined here
-        // rather than delegating to the trait's default `join_lookup` — that
-        // default re-dispatches to this override and would recurse.
+        // Scan fallback (no index): filter the seq-bounded snapshot by key
+        // equality. Rows are keyed through the same `JoinKey::from_value`
+        // truncation the join index uses, so the bounded scan is byte-identical
+        // to the unbounded index path (both truncate floats to `Int` and compare
+        // with exact scalar equality). Inlined here rather than delegating to
+        // the trait's default `join_lookup` — that default re-dispatches to this
+        // override and would recurse.
         let rows = self.snapshot(window)?;
         Some(
             rows.into_iter()
@@ -223,15 +220,10 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
     ) -> Option<Vec<(i64, JoinRow)>> {
         let win = self.router.registry().get_window(window)?;
         let join_key = JoinKey::from_value(key)?;
-        // Indexed asof lookup: the window's maintained hash index already stores
-        // raw timestamps alongside each columnar row locator (built by
-        // `set_join_key` / `append_inner`), so the full-window timestamped scan
-        // is skipped — the Q22 asof join is O(1) instead of O(window rows) per
-        // bid. As with `join_lookup`, the index is not seq-cut safe, so under a
-        // watermark we fall back to the timestamped scan.
-        if self.eff_max_seq(window).is_none()
-            && let Some(rows) = win.join_lookup_timestamped(&join_key)
-        {
+        // Indexed asof lookup（seq-cut）: 索引行带 batch seq + 原始时间戳,
+        // `max_seq` 过滤后 O(1)（2026-08 前 pull 模式回退全量扫描）。
+        // `None`（无索引）→ 回退 timestamped 扫描。
+        if let Some(rows) = win.join_lookup_timestamped(&join_key, self.eff_max_seq(window)) {
             return Some(rows);
         }
         // Scan fallback: filter the seq-bounded timestamped snapshot by key. The
@@ -264,17 +256,19 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
         let Some(join_key) = JoinKey::from_value(key) else {
             return AsofLookup::Fallback;
         };
-        // The index's per-key `max_ts` fast path is only valid on the full
-        // (unwatermarked) window; under a watermark the index is not seq-cut
-        // safe, so the caller must fall back to `asof_candidates`.
-        if self.eff_max_seq(window).is_some() {
-            return AsofLookup::Fallback;
-        }
         let min_ts = within.map_or(i64::MIN, |d| {
             let nanos = i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
             event_time_nanos.saturating_sub(nanos)
         });
-        win.join_lookup_asof(&join_key, event_time_nanos, min_ts)
+        // 索引 asof 快路径（seq-cut: max_seq 过滤后取最新行; 2026-08 前 pull
+        // 模式回退 `asof_candidates` 全量扫描）。`Fallback`（无索引）由调用方
+        // 走 asof_candidates。
+        win.join_lookup_asof(
+            &join_key,
+            event_time_nanos,
+            min_ts,
+            self.eff_max_seq(window),
+        )
     }
 }
 

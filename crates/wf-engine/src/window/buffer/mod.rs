@@ -65,6 +65,11 @@ struct IndexedRow {
     batch: Arc<RecordBatch>,
     row: usize,
     index: Arc<crate::match_engine::FieldIndex>,
+    /// Batch seq — M2 seq-cut: pull-mode lookups under a `max_seq` watermark
+    /// must not see rows from batches the reader has not pulled yet (2026-08:
+    /// 此前索引无 seq 感知，pull 模式被迫回退全量扫描 → q13 等 join 查询
+    /// CPU/积压瓶颈）。
+    seq: u64,
 }
 
 impl JoinIndex {
@@ -72,7 +77,7 @@ impl JoinIndex {
     /// straight from the Arrow batch through the same [`extract_field_value`]
     /// conversion the eager `Event` path uses, so the produced keys are
     /// byte-identical to the previous materialized-index behavior.
-    fn index_batch(&mut self, batch: &Arc<RecordBatch>, ts_list: &[Option<i64>]) {
+    fn index_batch(&mut self, batch: &Arc<RecordBatch>, ts_list: &[Option<i64>], seq: u64) {
         let Ok(col_idx) = batch.schema().index_of(self.key_field.as_str()) else {
             return;
         };
@@ -96,6 +101,7 @@ impl JoinIndex {
                 batch: Arc::clone(batch),
                 row,
                 index: Arc::clone(&index),
+                seq,
             });
             if let Some(t) = *ts {
                 kr.max_ts = Some(kr.max_ts.map_or(t, |m| m.max(t)));
@@ -113,18 +119,31 @@ impl JoinIndex {
         }
     }
 
-    /// Snapshot-join view: every indexed row for `key`, as a columnar [`JoinRow`].
-    fn lookup(&self, key: &JoinKey) -> Option<Vec<JoinRow>> {
-        self.by_key
-            .get(key)
-            .map(|kr| kr.rows.iter().map(|r| self.row_to_join_row(r)).collect())
-    }
-
-    /// Asof-join view: only the timestamped rows for `key`, as `(raw_ts, row)`.
-    fn lookup_timestamped(&self, key: &JoinKey) -> Option<Vec<(i64, JoinRow)>> {
+    /// Snapshot-join view: every indexed row for `key` with `seq <= max_seq`
+    /// (`None` = all rows), as columnar [`JoinRow`]s. The seq cut is the M2
+    /// pull-mode consistency boundary: a reader processing batch N must only
+    /// see rows from batches it has pulled (`seq <= N`), never rows the actor
+    /// appended past it.
+    fn lookup(&self, key: &JoinKey, max_seq: Option<u64>) -> Option<Vec<JoinRow>> {
         self.by_key.get(key).map(|kr| {
             kr.rows
                 .iter()
+                .filter(|r| max_seq.is_none_or(|m| r.seq <= m))
+                .map(|r| self.row_to_join_row(r))
+                .collect()
+        })
+    }
+
+    /// Asof-join view: only the timestamped rows for `key` with `seq <= max_seq`.
+    fn lookup_timestamped(
+        &self,
+        key: &JoinKey,
+        max_seq: Option<u64>,
+    ) -> Option<Vec<(i64, JoinRow)>> {
+        self.by_key.get(key).map(|kr| {
+            kr.rows
+                .iter()
+                .filter(|r| max_seq.is_none_or(|m| r.seq <= m))
                 .filter_map(|r| r.ts_nanos.map(|ts| (ts, self.row_to_join_row(r))))
                 .collect()
         })
@@ -148,20 +167,42 @@ impl JoinIndex {
     /// fallback which is only needed for multi-condition joins and watermarked
     /// reads. `Fallback` remains only for the defensive miss of the fast-path
     /// reverse scan.
-    fn lookup_asof_max(&self, key: &JoinKey, event_time: i64, min_ts: i64) -> AsofLookup {
+    fn lookup_asof_max(
+        &self,
+        key: &JoinKey,
+        event_time: i64,
+        min_ts: i64,
+        max_seq: Option<u64>,
+    ) -> AsofLookup {
         let Some(kr) = self.by_key.get(key) else {
             return AsofLookup::Miss;
         };
-        let Some(max_ts) = kr.max_ts else {
+        // seq-cut 下 max_ts 缓存可能来自未拉取 batch：`max_seq` 为 Some 时按
+        // 过滤后的行重新取最大 ts（域小 + asof 场景少，可接受）；None 用缓存。
+        let max_ts = match max_seq {
+            None => kr.max_ts,
+            Some(m) => kr
+                .rows
+                .iter()
+                .filter(|r| r.seq <= m)
+                .filter_map(|r| r.ts_nanos)
+                .max(),
+        };
+        let Some(max_ts) = max_ts else {
             return AsofLookup::Miss;
         };
         if max_ts < min_ts {
             return AsofLookup::Miss;
         }
+        let candidates: Vec<&IndexedRow> = kr
+            .rows
+            .iter()
+            .filter(|r| max_seq.is_none_or(|m| r.seq <= m))
+            .collect();
         if max_ts <= event_time {
-            // min_ts <= max_ts <= event_time: `max_ts` comes from `kr.rows`, so
-            // the reverse scan is guaranteed to find it.
-            let Some(r) = kr.rows.iter().rev().find(|r| r.ts_nanos == Some(max_ts)) else {
+            // min_ts <= max_ts <= event_time: `max_ts` comes from the filtered
+            // rows, so the reverse scan is guaranteed to find it.
+            let Some(r) = candidates.iter().rev().find(|r| r.ts_nanos == Some(max_ts)) else {
                 return AsofLookup::Fallback;
             };
             return AsofLookup::Hit(self.row_to_join_row(r));
@@ -169,7 +210,7 @@ impl JoinIndex {
         // max_ts > event_time: find the greatest timestamp in [min_ts, event_time].
         let mut best: Option<&IndexedRow> = None;
         let mut best_ts = i64::MIN;
-        for r in &kr.rows {
+        for r in candidates {
             let Some(ts) = r.ts_nanos else {
                 continue;
             };
@@ -321,7 +362,13 @@ impl Window {
     /// Configure this window as a join target: build a hash index on `key_field`
     /// and index any rows already buffered. Called by the runtime after rules
     /// are loaded (join target windows are only known from rule plans).
+    /// Idempotent: a second call with the same/different key is a no-op (the
+    /// first join condition's right field wins — consistent with
+    /// `first_join_key`).
     pub fn set_join_key(&self, key_field: String) {
+        if self.join_enabled.load(Ordering::Acquire) {
+            return; // 已配置（首个 join 条件的右字段），幂等
+        }
         let key_field = SmolStr::new(&key_field);
         let mut index = JoinIndex {
             key_field,
@@ -332,14 +379,14 @@ impl Window {
         // join-index write lock is taken (lock ordering: log → join_index,
         // never the reverse). The index holds columnar row locators — no
         // per-row `Event` materialization.
-        let existing: Vec<(Arc<RecordBatch>, Vec<Option<i64>>)> = {
+        let existing: Vec<(Arc<RecordBatch>, Vec<Option<i64>>, u64)> = {
             let log = self.log.read().expect("window log lock poisoned");
             log.values()
-                .map(|tb| (Arc::clone(&tb.batch), self.raw_ts_list(tb)))
+                .map(|tb| (Arc::clone(&tb.batch), self.raw_ts_list(tb), tb.seq))
                 .collect()
         };
-        for (batch, ts_list) in &existing {
-            index.index_batch(batch, ts_list);
+        for (batch, ts_list, seq) in &existing {
+            index.index_batch(batch, ts_list, *seq);
         }
         self.join_enabled.store(true, Ordering::Release);
         *self.join_index.write().expect("join index lock poisoned") = Some(index);
@@ -349,7 +396,10 @@ impl Window {
     /// [`JoinRow`]s. `Some(empty)` if this window is indexed but the key has no
     /// matching rows; `None` if it has no join index (not a join target — the
     /// caller falls back to a snapshot scan).
-    pub fn join_lookup(&self, key: &JoinKey) -> Option<Vec<JoinRow>> {
+    ///
+    /// `max_seq`（M2 pull 一致性）: 只返回 `seq <= max_seq` 的行（读者只能看到
+    /// 自己已拉取的 batch）; `None` = 全量（push 模式）。
+    pub fn join_lookup(&self, key: &JoinKey, max_seq: Option<u64>) -> Option<Vec<JoinRow>> {
         if !self.join_enabled.load(Ordering::Acquire) {
             return None;
         }
@@ -358,7 +408,7 @@ impl Window {
                 .read()
                 .expect("join index lock poisoned")
                 .as_ref()?
-                .lookup(key)
+                .lookup(key, max_seq)
                 .unwrap_or_default(),
         )
     }
@@ -368,7 +418,11 @@ impl Window {
     /// `Timestamp(Ns)` time value are skipped. `Some(empty)` when indexed but
     /// the key has no timestamped rows; `None` when there is no join index
     /// (caller falls back to a timestamped snapshot scan).
-    pub fn join_lookup_timestamped(&self, key: &JoinKey) -> Option<Vec<(i64, JoinRow)>> {
+    pub fn join_lookup_timestamped(
+        &self,
+        key: &JoinKey,
+        max_seq: Option<u64>,
+    ) -> Option<Vec<(i64, JoinRow)>> {
         if !self.join_enabled.load(Ordering::Acquire) {
             return None;
         }
@@ -377,7 +431,7 @@ impl Window {
                 .read()
                 .expect("join index lock poisoned")
                 .as_ref()?
-                .lookup_timestamped(key)
+                .lookup_timestamped(key, max_seq)
                 .unwrap_or_default(),
         )
     }
@@ -386,7 +440,13 @@ impl Window {
     /// `<= event_time` and `>= min_ts`, using the index's per-key `max_ts` —
     /// O(1), no candidate scan. See [`AsofLookup`] for the three outcomes.
     /// [`AsofLookup::Fallback`] when the window has no join index.
-    pub fn join_lookup_asof(&self, key: &JoinKey, event_time: i64, min_ts: i64) -> AsofLookup {
+    pub fn join_lookup_asof(
+        &self,
+        key: &JoinKey,
+        event_time: i64,
+        min_ts: i64,
+        max_seq: Option<u64>,
+    ) -> AsofLookup {
         if !self.join_enabled.load(Ordering::Acquire) {
             return AsofLookup::Fallback;
         }
@@ -394,7 +454,7 @@ impl Window {
         let Some(index) = guard.as_ref() else {
             return AsofLookup::Fallback;
         };
-        index.lookup_asof_max(key, event_time, min_ts)
+        index.lookup_asof_max(key, event_time, min_ts, max_seq)
     }
 
     /// Raw `Timestamp(Ns)` time values for every row of a batch, aligned with
@@ -582,7 +642,7 @@ impl Window {
                     .as_mut()
             {
                 let ts_list = self.raw_ts_list(tb);
-                idx.index_batch(&tb.batch, &ts_list);
+                idx.index_batch(&tb.batch, &ts_list, seq);
             }
         }
         if evicted_rows > 0 {

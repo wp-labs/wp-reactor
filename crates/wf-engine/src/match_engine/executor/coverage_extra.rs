@@ -2308,6 +2308,165 @@ fn each_plan_columnar_safe_gate_branches() {
     assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
 }
 
+/// Dead-join elimination (2026-08-23, q13 RSS/EPS): a Snapshot/Asof join whose
+/// enrichment no output expression reads is dropped from `live_joins` — the
+/// rule then qualifies for the columnar each fast path. Filtering modes
+/// (Inner/Anti), `within` intervals, `reduce`/`emit at`, and any plain
+/// (unqualified) output field reference keep the join live.
+#[test]
+fn dead_join_elimination_keeps_only_referenced_enrichment() {
+    let snapshot_join = || JoinPlan {
+        right_window: "person_events".into(),
+        mode: JoinMode::Snapshot,
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Qualified("b".into(), "bidder".into()),
+            right: FieldRef::Qualified("person_events".into(), "id".into()),
+        }],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    };
+    // Rule whose output reads only the driving event's fields (qualified) +
+    // literals — the q13 shape. The person snapshot join is dead.
+    let base = || {
+        let mut plan = simple_rule_plan(
+            "q13_shape",
+            simple_plan(vec![], vec![]),
+            Expr::Number(10.0),
+            "sink",
+            Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+        );
+        plan.binds[0].alias = "b".into();
+        plan.each_plan = Some(EachPlan {
+            alias: "b".into(),
+            filter: None,
+        });
+        plan.joins = vec![snapshot_join()];
+        plan.yield_plan.fields = vec![YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+        }];
+        plan
+    };
+    let exec = RuleExecutor::new(base());
+    assert!(
+        exec.live_joins.is_empty(),
+        "unreferenced Snapshot join must be eliminated"
+    );
+    assert!(
+        exec.each_plan_columnar_safe(),
+        "dead-join rule must qualify for the columnar each path"
+    );
+
+    // `where` reading a right-window field keeps the join live (q20 shape).
+    let mut plan = base();
+    plan.r#where = Some(Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Qualified(
+            "person_events".into(),
+            "id".into(),
+        ))),
+        right: Box::new(Expr::Number(42.0)),
+    });
+    let exec = RuleExecutor::new(plan);
+    assert_eq!(exec.live_joins.len(), 1, "where ref → join live");
+    assert!(!exec.each_plan_columnar_safe());
+
+    // yield reading the right window keeps it live.
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "city".into(),
+        value: Expr::Field(FieldRef::Qualified("person_events".into(), "city".into())),
+    }];
+    let exec = RuleExecutor::new(plan);
+    assert_eq!(exec.live_joins.len(), 1, "yield ref → join live");
+
+    // A plain (unqualified) output field ref → conservative: join stays live.
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "city".into(),
+        value: Expr::Field(FieldRef::Simple("city".into())),
+    }];
+    let exec = RuleExecutor::new(plan);
+    assert_eq!(
+        exec.live_joins.len(),
+        1,
+        "plain ref → join live (conservative)"
+    );
+
+    // Filtering modes are never eliminated (miss/hit drops the event).
+    for mode in [JoinMode::Inner, JoinMode::Anti] {
+        let mut plan = base();
+        plan.joins = vec![JoinPlan {
+            mode: mode.clone(),
+            ..snapshot_join()
+        }];
+        let exec = RuleExecutor::new(plan);
+        assert_eq!(
+            exec.live_joins.len(),
+            1,
+            "mode {mode:?} must never be eliminated"
+        );
+    }
+    // Asof miss keeps the event (like Snapshot) → dead-eliminable.
+    let mut plan = base();
+    plan.joins = vec![JoinPlan {
+        mode: JoinMode::Asof { within: None },
+        ..snapshot_join()
+    }];
+    assert!(
+        RuleExecutor::new(plan).live_joins.is_empty(),
+        "unreferenced Asof join must be eliminated"
+    );
+    // within / reduce / emit_at keep the join live.
+    let mut plan = base();
+    plan.joins = vec![JoinPlan {
+        within: Some(WithinSpec {
+            lo: Bound {
+                open: false,
+                val: BoundVal::Dur {
+                    dur: std::time::Duration::from_secs(1),
+                    neg: false,
+                },
+            },
+            hi: Bound {
+                open: false,
+                val: BoundVal::Dur {
+                    dur: std::time::Duration::from_secs(2),
+                    neg: false,
+                },
+            },
+        }),
+        ..snapshot_join()
+    }];
+    assert_eq!(RuleExecutor::new(plan).live_joins.len(), 1, "within → live");
+    let mut plan = base();
+    plan.joins = vec![JoinPlan {
+        emit_at: Some(Expr::Field(FieldRef::Qualified(
+            "a".into(),
+            "expires".into(),
+        ))),
+        ..snapshot_join()
+    }];
+    assert_eq!(
+        RuleExecutor::new(plan).live_joins.len(),
+        1,
+        "emit_at → live"
+    );
+    let mut plan = base();
+    plan.joins = vec![JoinPlan {
+        reduce: Some(ReduceClause {
+            measure: ReduceMeasure::Maxrow {
+                field: FieldRef::Simple("price".into()),
+                tie: None,
+            },
+            label: Some("winner".into()),
+        }),
+        ..snapshot_join()
+    }];
+    assert_eq!(RuleExecutor::new(plan).live_joins.len(), 1, "reduce → live");
+}
+
 #[test]
 fn columnar_each_entity_lanes_and_failure_paths() {
     // Schema: sip=Utf8, id=Int64, ts=Timestamp(Ns), price=Float64, note=structured Utf8.

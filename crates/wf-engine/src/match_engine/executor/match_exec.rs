@@ -74,7 +74,7 @@ impl RuleExecutor {
             &self.close_ctx_fields,
         );
         if !execute_joins(
-            &self.plan.joins,
+            &self.live_joins,
             &mut ctx,
             windows,
             matched.event_time_nanos,

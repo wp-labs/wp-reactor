@@ -351,6 +351,27 @@ pub(super) fn spawn_rule_tasks(
         .unwrap_or(false);
 
     for rule in rules {
+        // join 目标窗口接索引（2026-08 RSS/EPS 归因：生产此前未接线
+        // `set_join_key` → join_lookup 每事件全量扫描 → q13 等 join 查询
+        // CPU 瓶颈 + 消费跟不上 → pull 模式 ack floor 阻止时间驱逐 → 积压
+        // RSS 线性涨）。索引按键的 batch seq 维护（M2 seq-cut），pull 模式
+        // 也走 O(1) 路径。多条件 join 索引首条件右字段（与 first_join_key 一致）。
+        for join in &rule.executor.plan().joins {
+            let Some(key) = join
+                .conds
+                .first()
+                .map(|c| wf_engine::match_engine::field_ref_name(&c.right))
+            else {
+                continue;
+            };
+            if key.is_empty() {
+                continue;
+            }
+            if let Some(win) = router.registry().get_window(&join.right_window) {
+                win.set_join_key(key.to_string());
+            }
+        }
+
         let window_sources = resolve_window_sources(&rule.window_aliases, router.registry());
 
         match rule.kind {

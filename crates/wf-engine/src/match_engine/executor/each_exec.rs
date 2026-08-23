@@ -107,7 +107,7 @@ impl RuleExecutor {
         }
         let mut ctx = event.clone();
         self.apply_lets(&mut ctx);
-        if !execute_joins(&self.plan.joins, &mut ctx, windows, event_time_nanos) {
+        if !execute_joins(&self.live_joins, &mut ctx, windows, event_time_nanos) {
             return Ok(None);
         }
         // Post-join `where`: strict — false/None suppresses the output.
@@ -163,7 +163,7 @@ impl RuleExecutor {
         }
         let mut ctx = event.clone();
         self.apply_lets(&mut ctx);
-        if !execute_joins(&self.plan.joins, &mut ctx, windows, event_time_nanos) {
+        if !execute_joins(&self.live_joins, &mut ctx, windows, event_time_nanos) {
             return Ok(false);
         }
         // Post-join `where`: strict — false/None suppresses the output.
@@ -277,12 +277,12 @@ impl RuleExecutor {
             // Rules without joins or `let` bindings never mutate the event —
             // borrow instead of cloning (same optimization as the per-event
             // path).
-            let ctx: Cow<'_, Event> = if self.plan.joins.is_empty() && self.plan.lets.is_empty() {
+            let ctx: Cow<'_, Event> = if self.live_joins.is_empty() && self.plan.lets.is_empty() {
                 Cow::Borrowed::<Event>(*event)
             } else {
                 let mut ctx = Cow::<Event>::Owned((**event).clone());
                 self.apply_lets(ctx.to_mut());
-                if !execute_joins(&self.plan.joins, ctx.to_mut(), windows, *event_time_nanos) {
+                if !execute_joins(&self.live_joins, ctx.to_mut(), windows, *event_time_nanos) {
                     stats.rejected += 1;
                     continue;
                 }
@@ -420,7 +420,7 @@ impl RuleExecutor {
         if !self.plan.lets.is_empty() {
             return false;
         }
-        if !self.plan.joins.is_empty() || each_plan.filter.is_some() {
+        if !self.live_joins.is_empty() || each_plan.filter.is_some() {
             return false;
         }
         if !self.plan.binds.iter().all(|b| {

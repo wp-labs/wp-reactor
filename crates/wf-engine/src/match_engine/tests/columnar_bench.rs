@@ -344,7 +344,7 @@ fn join_index_lookup_vs_full_scan() {
     let mut idx_hits = 0usize;
     for i in 0..r {
         let key = (i as i64) % (n as i64);
-        if let Some(rows) = win.join_lookup(&JoinKey::Int(key)) {
+        if let Some(rows) = win.join_lookup(&JoinKey::Int(key), None) {
             idx_hits += rows.len();
         }
     }
@@ -386,7 +386,7 @@ fn join_index_timestamped_lookup_vs_full_scan() {
     let mut idx_hits = 0usize;
     for i in 0..r {
         let key = (i as i64) % (n as i64);
-        if let Some(rows) = win.join_lookup_timestamped(&JoinKey::Int(key)) {
+        if let Some(rows) = win.join_lookup_timestamped(&JoinKey::Int(key), None) {
             idx_hits += rows.len();
         }
     }
@@ -479,7 +479,7 @@ fn join_index_asof_max_scan_vs_fast_path() {
     let start = Instant::now();
     let mut fast_hits = 0usize;
     for _ in 0..r {
-        if matches!(win.join_lookup_asof(&key, max_ts, 0), AsofLookup::Hit(_)) {
+        if matches!(win.join_lookup_asof(&key, max_ts, 0, None), AsofLookup::Hit(_)) {
             fast_hits += 1;
         }
     }
@@ -490,7 +490,7 @@ fn join_index_asof_max_scan_vs_fast_path() {
     let start = Instant::now();
     let mut scan_hits = 0usize;
     for _ in 0..r {
-        if matches!(win.join_lookup_asof(&key, mid_ts, 0), AsofLookup::Hit(_)) {
+        if matches!(win.join_lookup_asof(&key, mid_ts, 0, None), AsofLookup::Hit(_)) {
             scan_hits += 1;
         }
     }

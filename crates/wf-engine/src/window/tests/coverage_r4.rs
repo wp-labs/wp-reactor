@@ -278,12 +278,12 @@ fn join_index_skips_null_key_cells_and_missing_key_column() {
     );
     win.append(batch).unwrap();
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(42)).map(|v| v.len()),
+        win.join_lookup(&JoinKey::Int(42), None).map(|v| v.len()),
         Some(1),
         "non-null key indexed"
     );
     assert_eq!(
-        win.join_lookup(&JoinKey::Int(43)).map(|v| v.len()),
+        win.join_lookup(&JoinKey::Int(43), None).map(|v| v.len()),
         Some(1),
         "later non-null key indexed"
     );
@@ -329,7 +329,7 @@ fn join_asof_scan_skips_un_timestamped_rows() {
     );
     win.append(batch).unwrap();
 
-    match win.join_lookup_asof(&JoinKey::Int(42), 1_500, 0) {
+    match win.join_lookup_asof(&JoinKey::Int(42), 1_500, 0, None) {
         AsofLookup::Hit(row) => match row {
             crate::match_engine::JoinRow::Columnar { row: r, .. } => {
                 assert_eq!(r, 1, "scan path must pick the ts=1000 row")
@@ -341,7 +341,7 @@ fn join_asof_scan_skips_un_timestamped_rows() {
 
     // The fast path (max_ts <= event_time) still works after the scan path.
     assert!(matches!(
-        win.join_lookup_asof(&JoinKey::Int(42), 5_000, 0),
+        win.join_lookup_asof(&JoinKey::Int(42), 5_000, 0, None),
         AsofLookup::Hit(_)
     ));
 }
