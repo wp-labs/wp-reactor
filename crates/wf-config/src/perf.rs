@@ -14,19 +14,11 @@ use crate::{ConfigReason, ConfigResult};
 
 /// 诊断模式配置（`--perf-diag <path>` 加载，不进 `wfusion.toml`）。
 ///
-/// 全字段 `#[serde(default)]`——空文件/缺字段即默认关闭。
+/// 入口是 `--perf-diag` 启动参数本身（wfgen 侧 `--diag`）——文件只承载诊断点
+/// 列表；顶层门控/总开关是历史遗留（实际永远被 `points[0]` 覆盖或不可达），已删。
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct PerfConfig {
-    /// 诊断模式总开关：`true` 时引擎注册内置 `__wf_sentinel` 窗口/哨兵规则。
-    #[serde(default)]
-    pub diag: bool,
-    /// 初始门控：禁止规则求值（`process_batch` 直通，ack 保留）。
-    #[serde(default)]
-    pub cut_rules: bool,
-    /// 初始门控：禁止输出链（emit 不 serialize/stage/commit）。
-    #[serde(default)]
-    pub cut_output: bool,
-    /// 诊断点列表（sentinel 驱动依次应用）。缺省/空 = 单点模式（仅初始门控）。
+    /// 诊断点列表（sentinel 驱动依次应用）。缺省/空 = 仅初始门控（无切换）。
     #[serde(default)]
     pub points: Vec<PerfPoint>,
 }
@@ -78,33 +70,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_config_defaults_to_disabled() {
+    fn empty_config_has_no_points() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("perf_diag_empty_{}.toml", std::process::id()));
         std::fs::write(&path, "").unwrap();
         let cfg = PerfConfig::load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert!(!cfg.diag, "empty file must default diag=false");
-        assert!(!cfg.cut_rules);
-        assert!(!cfg.cut_output);
         assert!(cfg.points.is_empty());
         assert_eq!(cfg.point_count(), 0);
         assert!(cfg.point_at(0).is_none());
     }
 
     #[test]
-    fn minimal_diag_config_parses() {
+    fn legacy_top_level_fields_are_ignored() {
+        // 顶层 diag/cut_rules/cut_output 是历史遗留：反序列化静默忽略。
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("perf_diag_min_{}.toml", std::process::id()));
+        let path = dir.join(format!("perf_diag_legacy_{}.toml", std::process::id()));
         std::fs::write(&path, "diag = true\ncut_rules = true\n").unwrap();
         let cfg = PerfConfig::load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert!(cfg.diag);
-        assert!(cfg.cut_rules);
-        assert!(!cfg.cut_output, "omitted cut_output must default false");
-        assert!(cfg.points.is_empty());
+        assert!(cfg.points.is_empty(), "顶层字段不产生诊断点");
     }
 
     #[test]
@@ -114,7 +101,6 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-diag = true
 [[points]]
 name = "floor"
 cut_rules = true
@@ -159,7 +145,6 @@ cut_output = false
         std::fs::write(
             &path,
             r#"
-diag = true
 [[points]]
 name = "c_family"
 rules = "models/rules/c_family.wfl"
@@ -180,9 +165,6 @@ rules = "models/rules/c_family.wfl"
     #[test]
     fn round_trips_through_serialize() {
         let cfg = PerfConfig {
-            diag: true,
-            cut_rules: false,
-            cut_output: false,
             points: vec![PerfPoint {
                 name: "floor".into(),
                 cut_rules: true,

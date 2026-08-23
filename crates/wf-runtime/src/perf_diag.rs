@@ -48,24 +48,26 @@ static PERF_CUT_OUTPUT: AtomicBool = AtomicBool::new(false);
 /// 诊断点列表（启动时 set，只读；测试可重复初始化）。
 static PERF_POINTS: std::sync::RwLock<Vec<PerfPoint>> = std::sync::RwLock::new(Vec::new());
 
-/// 初始化诊断模式全局状态（wfusion 启动参数解析后、`Reactor::start` 前调用）。
+/// 初始化诊断模式全局状态——**仅当 `--perf-diag <path>` 启动参数存在时调用**
+/// （wfusion CLI 已解析并 load 配置文件）。入口即参数本身：
 ///
-/// - `diag=true`：注册哨兵窗口 + 应用**初始门控**（多点模式 = `points[0]` 的
-///   门控，单点模式 = 顶层 `cut_rules`/`cut_output`）；
-/// - `diag=false`：全部复位（生产启动零污染）。
+/// - 注册哨兵窗口 + 应用**初始门控** = `points[0]` 的门控（无点 → 全 false）；
+/// - 顶层 `diag`/`cut_rules`/`cut_output` 是历史遗留字段，已从配置移除。
 pub fn init_perf_diag(config: &PerfConfig) {
     *PERF_POINTS.write().expect("perf points lock poisoned") = config.points.clone();
-    if config.diag {
-        PERF_DIAG_ENABLED.store(true, Ordering::Relaxed);
-        let (cut_rules, cut_output) = match config.points.first() {
-            Some(point) => (point.cut_rules, point.cut_output),
-            None => (config.cut_rules, config.cut_output),
-        };
-        set_perf_cuts(cut_rules, cut_output);
-    } else {
-        PERF_DIAG_ENABLED.store(false, Ordering::Relaxed);
-        set_perf_cuts(false, false);
-    }
+    PERF_DIAG_ENABLED.store(true, Ordering::Relaxed);
+    let (cut_rules, cut_output) = match config.points.first() {
+        Some(point) => (point.cut_rules, point.cut_output),
+        None => (false, false),
+    };
+    set_perf_cuts(cut_rules, cut_output);
+}
+
+/// 复位诊断模式全局状态——无 `--perf-diag` 时调用（生产启动零污染）。
+pub fn reset_perf_diag() {
+    PERF_DIAG_ENABLED.store(false, Ordering::Relaxed);
+    *PERF_POINTS.write().expect("perf points lock poisoned") = Vec::new();
+    set_perf_cuts(false, false);
 }
 
 /// 原子门控翻转（诊断点状态机专用，不进 reload diff）。
@@ -527,13 +529,13 @@ mod tests {
     #[test]
     fn init_disabled_resets_everything() {
         let _g = serial();
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
         assert!(!perf_diag_enabled());
         assert!(!perf_cut_rules());
         assert!(!perf_cut_output());
         set_perf_cuts(true, true);
-        init_perf_diag(&PerfConfig::default());
-        assert!(!perf_cut_rules(), "non-diag init must reset gates");
+        reset_perf_diag();
+        assert!(!perf_cut_rules(), "reset 必须复位门控");
         assert!(!perf_cut_output());
     }
 
@@ -541,9 +543,6 @@ mod tests {
     fn init_diag_with_points_applies_first_point_gates() {
         let _g = serial();
         let cfg = PerfConfig {
-            diag: true,
-            cut_rules: false,
-            cut_output: false,
             points: vec![
                 PerfPoint {
                     name: "floor".into(),
@@ -564,28 +563,24 @@ mod tests {
         assert!(perf_cut_rules(), "points[0] gates apply at startup");
         assert!(perf_cut_output());
         // 复位，避免污染其它测试。
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
     }
 
     #[test]
-    fn init_diag_without_points_uses_top_level_gates() {
+    fn init_without_points_defaults_gates_false() {
         let _g = serial();
-        let cfg = PerfConfig {
-            diag: true,
-            cut_rules: true,
-            cut_output: false,
-            points: vec![],
-        };
+        let cfg = PerfConfig::default();
         init_perf_diag(&cfg);
-        assert!(perf_cut_rules());
+        assert!(perf_diag_enabled(), "--perf-diag 即入口");
+        assert!(!perf_cut_rules(), "无点 → 初始门控全 false");
         assert!(!perf_cut_output());
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
     }
 
     #[test]
     fn set_perf_cuts_flips_both_gates() {
         let _g = serial();
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
         set_perf_cuts(true, false);
         assert!(perf_cut_rules());
         assert!(!perf_cut_output());
@@ -757,12 +752,7 @@ mod tests {
     // -- 诊断点状态机 -------------------------------------------------------
 
     fn test_config(points: Vec<PerfPoint>) -> PerfConfig {
-        PerfConfig {
-            diag: true,
-            cut_rules: false,
-            cut_output: false,
-            points,
-        }
+        PerfConfig { points }
     }
 
     fn floor_point() -> PerfPoint {
@@ -822,7 +812,7 @@ mod tests {
         // 重复轮次：round=1 再来一次 → None（幂等）
         assert!(controller.on_sentinel(1).await.is_none());
         assert_eq!(controller.current(), 2);
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
     }
 
     #[tokio::test]
@@ -834,21 +824,18 @@ mod tests {
         assert!(controller.on_sentinel(0).await.is_some());
         assert!(controller.on_sentinel(0).await.is_none(), "repeat round must not re-apply");
         assert_eq!(controller.current(), 1);
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
     }
 
     #[tokio::test]
     async fn controller_noop_without_points() {
         let _g = serial();
-        init_perf_diag(&PerfConfig {
-            diag: true,
-            ..Default::default()
-        });
+        init_perf_diag(&PerfConfig::default());
         let controller = PerfDiagController::new();
         assert_eq!(controller.current(), 0);
         assert!(!controller.has_next());
         assert!(controller.on_sentinel(0).await.is_none());
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
     }
 
     #[tokio::test]
@@ -858,7 +845,7 @@ mod tests {
         let controller = PerfDiagController::new();
         assert!(controller.on_sentinel(-1).await.is_none());
         assert_eq!(controller.current(), 0);
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
     }
 
     // -- 数据窗排空等待 ----------------------------------------------------
@@ -1090,7 +1077,7 @@ mod tests {
         let first = rx.try_recv().expect("第一批（point + sentinel）");
         assert_eq!(first.len(), 2);
         assert!(rx.try_recv().is_err());
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
     }
 
     #[tokio::test]
@@ -1132,7 +1119,7 @@ mod tests {
             .expect("task 应退出")
             .expect("join ok");
         assert!(result.is_ok());
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
     }
 
     #[tokio::test]
@@ -1220,7 +1207,7 @@ rules = "rules/basic.wfl"
 
         // 基线已推进：再触发同一目标（重复轮次）→ 幂等短路，不再 reload。
         assert!(controller.on_sentinel(0).await.is_none());
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
     }
 
     /// 构造带真实 loader 基线 + 空控制通道的控制器（reload 路径测试用）。
@@ -1306,7 +1293,7 @@ rules = "rules/basic.wfl"
         assert_eq!(applied.index, 1);
         assert!(!applied.reloaded, "reload 失败 → reloaded=false");
         assert_eq!(controller.current(), 1, "门控已翻即算切换完成");
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
     }
 
     #[tokio::test]
@@ -1336,7 +1323,7 @@ rules = "rules/basic.wfl"
                 .is_err(),
             "同 rules 不得触发 reload"
         );
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
     }
 
     #[tokio::test]
@@ -1369,6 +1356,6 @@ rules = "rules/basic.wfl"
                 .is_err(),
             "无基线不触发 reload"
         );
-        init_perf_diag(&PerfConfig::default());
+        reset_perf_diag();
     }
 }

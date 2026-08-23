@@ -107,11 +107,7 @@ wfgen perf-diag --diag conf/perf-diag.toml \
 ## 5. 配置参考（`perf-diag.toml`）
 
 ```toml
-diag = true          # 诊断模式总开关：注册内置 __wf_sentinel 窗口
-cut_rules = false    # 初始门控（仅单点模式生效；多点模式启动即应用 points[0]）
-cut_output = false
-
-# 诊断点列表（sentinel 驱动依次应用）
+# 入口是 --perf-diag 启动参数本身；本文件只承载诊断点列表
 [[points]]
 name = "floor"
 cut_rules = true
@@ -131,11 +127,11 @@ cut_output = false
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `diag` | bool | 总开关；`true` 时注册内置哨兵窗口/任务 |
-| `cut_rules` / `cut_output` | bool | 初始门控（单点模式用；多点模式被 `points[0]` 覆盖） |
 | `[[points]].name` | string | 档名（墙表输出用） |
-| `[[points]].cut_rules` / `cut_output` | bool | 该档生效期间的门控 |
+| `[[points]].cut_rules` / `cut_output` | bool | 该档生效期间的门控（`cut_rules` = 禁止规则求值、`cut_output` = 禁止输出链） |
 | `[[points]].rules` | string? | 规则子集文件路径；非空且不同 → 热 reload（不加钱换配置） |
+
+启动即应用 `points[0]` 的门控；`--perf-diag` 不带 = 全关（生产零污染）。
 
 ## 6. 命令参考
 

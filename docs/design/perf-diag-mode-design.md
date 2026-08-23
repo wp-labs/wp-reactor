@@ -103,14 +103,12 @@
 wfusion daemon --perf-diag conf/perf-diag.toml
 ```
 
-`conf/perf-diag.toml`（独立配置文件，bench 各自一份）：
+`conf/perf-diag.toml`（独立配置文件，bench 各自一份）——**入口是 `--perf-diag`
+参数本身，文件只承载诊断点列表**（顶层 `diag`/`cut_rules`/`cut_output` 是历史
+遗留，已被移除）：
 
 ```toml
-diag = true          # 诊断模式：注册内置 __wf_sentinel 窗口
-cut_rules = false    # 初始门控：禁止规则求值（process_batch 直通，ack 保留）
-cut_output = false   # 初始门控：禁止输出链（emit 不 serialize/stage/commit）
-
-# 诊断点列表（sentinel 驱动依次应用；缺省/空 = 单点模式）
+# 诊断点列表（sentinel 驱动依次应用；缺省/空 = 无切换，仅初始门控全 false）
 [[points]]
 name = "floor"
 cut_rules = true
@@ -123,15 +121,14 @@ cut_rules = false
 cut_output = true
 ```
 
-- `PerfConfig`（wf-config）：`diag` / `cut_rules` / `cut_output` /
-  `points: Vec<PerfPoint{name, cut_rules, cut_output, rules}>`，全字段
-  `#[serde(default)]`；由 `--perf-diag` 参数加载，**不进 `wfusion.toml`**。
+- `PerfConfig`（wf-config）：仅 `points: Vec<PerfPoint{name, cut_rules,
+  cut_output, rules}>`，全字段 `#[serde(default)]`；由 `--perf-diag` 参数加载，
+  **不进 `wfusion.toml`**。
 - `cut_rules` / `cut_output` / `profiling`（复用 `WF_RULE_PROFILING`）均为**原子
   门控**，由诊断点状态机（§4.4）翻转，不进 reload diff。
-- **初始门控语义（实现定稿）**：多点模式（`points` 非空）下启动即应用
-  `points[0]` 的门控并写 `point{current=0}`——第一点（floor）不依赖任何哨兵
-  即可测得；顶层 `cut_rules`/`cut_output` 仅作单点模式（`points` 为空）的
-  初始门控。
+- **初始门控语义（实现定稿）**：启动即应用 `points[0]` 的门控并写
+  `point{current=0}`——第一点（floor）不依赖任何哨兵即可测得；无诊断点 →
+  初始门控全 false（哨兵窗口仍注册，无切换）。
 
 ### 4.2 门控切口（wf-runtime）
 
