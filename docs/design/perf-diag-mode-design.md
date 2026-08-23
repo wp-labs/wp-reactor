@@ -292,6 +292,7 @@ wfgen perf-diag \
 | sentinel 处理开销 | 常数量（极小），计入每档 | 增量抵消，不影响墙归属 |
 | 窗口残留 | delta 口径，2min 滑窗自动老化 | 跨点不重启可连续跑 |
 | rounds | 每点仅首轮有效 | 首个哨兵即切换下一档；`--rounds` 保留但去噪走 `--n-list` |
+| 非诊断模式哨兵帧 | 未知流 window miss | 未注册 `__perf_sentinel` 窗口 → `subscribers_of` 为空 → WARN 一次（按 source+tag 去重）+ miss 计数 + 丢弃；数据帧不受影响，门控全 false 无切换——`wfgen perf-diag` 对非诊断 daemon 会**超时报错**（错误信息含根因提示）而非给出错误数字。daemon 启动日志明示 perf-diag 启用状态 |
 
 ---
 
