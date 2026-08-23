@@ -223,6 +223,17 @@ wfgen bench \
     --addr 127.0.0.1:9800
 ```
 
+性能墙定位（引擎诊断模式）：吞吐不达标/回归时用——声明式切诊断点、
+哨兵漂流瓶自动切换、EPS 直接可算。详见 [性能诊断模式（perf-diag）](./perf-diag.md)：
+
+```bash
+wfgen perf-diag \
+    --diag conf/perf-diag.toml \
+    --frames data/events.frames \
+    --addr 127.0.0.1:9800 \
+    --n-list "1m,3m"
+```
+
 ## 联合验证
 
 推荐直接运行仓库内置 e2e（在 `../warp-fusion` 仓库中）：

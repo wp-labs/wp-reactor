@@ -12,6 +12,7 @@
 - [On Each 与逐条打分](./on-each.md)
 - [语言参考](./language-reference.md)
 - [运行时配置](./runtime-config.md)
+- [性能诊断模式（perf-diag）](./perf-diag.md)
 - [开发与测试工具](./tooling.md)
 
 ## 推荐阅读顺序
