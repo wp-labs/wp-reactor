@@ -410,6 +410,37 @@ impl Reactor {
         );
         let rule_watch = watch_group(rule_group, cancel.clone());
 
+        // perf-diag 哨兵任务：诊断模式（--perf-diag）下订阅 __perf_sentinel 窗口，
+        // 处理哨兵帧（写四元组记录 + 驱动诊断点状态机）。必须早于 receiver 注册
+        // fanout 订阅，保证首个哨兵帧到达时投递通道已就绪。
+        let diag_controller = if crate::perf_diag::perf_diag_enabled() {
+            let controller = crate::perf_diag::PerfDiagController::new();
+            let mut sentinel_group = crate::lifecycle::types::TaskGroup::new("perf_sentinel");
+            // 推送订阅在 spawn 前注册：订阅必然先于 receiver 接受连接。
+            let (sentinel_tx, sentinel_rx) = tokio::sync::mpsc::channel(64);
+            data.router
+                .fanout()
+                .register(crate::perf_diag::PERF_SENTINEL_WINDOW, sentinel_tx);
+            let sentinel_fanout = sink_fanout.clone();
+            let sentinel_cancel = cancel.child_token();
+            let sentinel_controller = controller.clone();
+            let sentinel_router = data.router.clone();
+            sentinel_group.push(tokio::spawn(async move {
+                crate::perf_diag::run_sentinel_task(crate::perf_diag::SentinelTaskConfig {
+                    router: sentinel_router,
+                    sink_fanout: sentinel_fanout,
+                    controller: sentinel_controller,
+                    cancel: sentinel_cancel,
+                    rx: sentinel_rx,
+                })
+                .await
+            }));
+            tail_watchers.push(watch_group(sentinel_group, cancel.clone()));
+            Some(controller)
+        } else {
+            None
+        };
+
         let receiver_group = spawn_receiver_task(
             &config,
             data.router.clone(),
@@ -441,6 +472,15 @@ impl Reactor {
         // Reload control channel: the receiver lives on the Reactor (drained by
         // `run`); the sender is handed out via `control_handle`.
         let (control_tx, control_rx) = mpsc::channel(RELOAD_CONTROL_CHANNEL_CAPACITY);
+        // perf-diag：把 reload 通道 + 基线注入诊断控制器——诊断点规则子集热切
+        // （points[].rules 非空）走既有 runtime.rules 热 reload 通道。
+        if let Some(controller) = &diag_controller {
+            controller.set_reload_handle(
+                RuntimeControlHandle::new(control_tx.clone(), cancel.clone()),
+                raw.clone(),
+                config.clone(),
+            );
+        }
         Ok(Self {
             cancel,
             rule_cancel,

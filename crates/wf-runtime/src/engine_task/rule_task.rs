@@ -634,6 +634,12 @@ impl RuleTask {
         shard_rows: Option<&[u32]>,
         materialize_fields: Option<&HashSet<String>>,
     ) {
+        // perf-diag cut_rules 门控：规则求值直通（ack 保留——`pull_and_advance`
+        // 在 process_batch 返回后推进 cursor，append/ack 仍在 floor 档收敛）。
+        // 哨兵窗口由独立哨兵任务处理，不经过本函数，天然豁免。
+        if crate::perf_diag::perf_cut_rules() {
+            return;
+        }
         let Some(aliases) = self.aliases.get(window_name) else {
             return;
         };
@@ -2331,6 +2337,10 @@ impl RuleTask {
             if let Some(metrics) = &self.metrics {
                 metrics.inc_alert_emitted_total(&record.rule_name);
             }
+            // perf-diag cut_output 门控：emitted 计数保留，跳过 pipe 装载。
+            if crate::perf_diag::perf_cut_output() {
+                return;
+            }
             self.stage_pipe_record(record);
             return;
         }
@@ -2354,6 +2364,11 @@ impl RuleTask {
                 self.emit_sample_remaining
                     .store(sample - 1, Ordering::Relaxed);
             }
+        }
+        // perf-diag cut_output 门控：emitted 计数已保留（上面），跳过
+        // serialize/append/stage/commit/fanout——输出链整体直通。
+        if crate::perf_diag::perf_cut_output() {
+            return;
         }
         // Append straight into the per-target columnar batch, sealed and
         // flushed to the sink writers when it fills (amortizing the
@@ -2478,6 +2493,10 @@ impl RuleTask {
                 sink_records.push(record);
             }
         }
+        // perf-diag cut_output 门控：emitted 计数已保留，pipe/sink 输出链直通。
+        if crate::perf_diag::perf_cut_output() {
+            return;
+        }
         for record in pipe_records {
             self.stage_pipe_record(record);
         }
@@ -2576,6 +2595,11 @@ impl RuleTask {
         field_order: &[&smol_str::SmolStr],
         batch_emit_nanos: i64,
     ) -> wf_engine::error::CoreResult<bool> {
+        // perf-diag cut_output 门控：on-each 直接写路径在 append 前整体直通
+        // （该路径的 emitted 计数与 append 耦合，无法保留计数而切 append）。
+        if crate::perf_diag::perf_cut_output() {
+            return Ok(false);
+        }
         // Serialize timing is sampled 1-in-N and scaled back up (same
         // pattern as `emit`; covers the eval + column append).
         let time_this = {
@@ -2685,6 +2709,10 @@ impl RuleTask {
         field_order: &[&smol_str::SmolStr],
         batch_emit_nanos: i64,
     ) {
+        // perf-diag cut_output 门控（见 [`Self::emit_each_direct`]）。
+        if crate::perf_diag::perf_cut_output() {
+            return;
+        }
         let mut appended_idx: Vec<usize> = Vec::new();
         let mut start = 0;
         while start < rows.len() {
@@ -2792,6 +2820,10 @@ impl RuleTask {
         rows: &[(&ColumnarEvent<'_>, i64)],
         batch_emit_nanos: i64,
     ) {
+        // perf-diag cut_output 门控（见 [`Self::emit_each_direct`]）。
+        if crate::perf_diag::perf_cut_output() {
+            return;
+        }
         let mut appended_idx: Vec<usize> = Vec::new();
         let mut start = 0;
         while start < rows.len() {
@@ -2891,6 +2923,10 @@ impl RuleTask {
         lookup: &RegistryLookup<'_>,
         batch_emit_nanos: i64,
     ) {
+        // perf-diag cut_output 门控（见 [`Self::emit_each_direct`]）。
+        if crate::perf_diag::perf_cut_output() {
+            return;
+        }
         let mut appended_idx: Vec<usize> = Vec::new();
         let mut start = 0;
         while start < rows.len() {

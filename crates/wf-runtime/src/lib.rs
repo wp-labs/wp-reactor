@@ -11,6 +11,7 @@ pub mod external;
 pub mod hot_reload;
 pub mod lifecycle;
 pub mod metrics;
+pub mod perf_diag;
 pub mod receiver;
 mod schema_bridge;
 pub mod sink_build;

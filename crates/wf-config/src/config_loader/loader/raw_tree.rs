@@ -98,6 +98,39 @@ impl RawFusionConfigTree {
         self.origins.clear();
         record_origins(&self.value, source_path, None, &mut self.origins);
     }
+
+    /// 替换 `runtime.rules` 值（perf-diag 规则子集热切用）。
+    ///
+    /// 在原始 TOML 树上的 `runtime.rules` 叶节点写入新 glob；路径在重载时
+    /// 相对 base_dir 解析（与 `FusionConfig::load` 一致）。无 `runtime` 表则
+    /// 创建（缺省 parse/rule 并行度等仍走 serde 默认）。
+    pub fn set_runtime_rules(&mut self, rules: &str) {
+        let runtime = match self
+            .value
+            .as_table_mut()
+            .and_then(|root| root.get_mut("runtime"))
+        {
+            Some(toml::Value::Table(table)) => table,
+            _ => {
+                self.value
+                    .as_table_mut()
+                    .expect("raw tree root is a table")
+                    .insert("runtime".to_string(), toml::Value::Table(Default::default()));
+                match self
+                    .value
+                    .as_table_mut()
+                    .and_then(|root| root.get_mut("runtime"))
+                {
+                    Some(toml::Value::Table(table)) => table,
+                    _ => return,
+                }
+            }
+        };
+        runtime.insert("rules".to_string(), toml::Value::String(rules.to_string()));
+        // 该叶子的 origin 已不可信（改写于内存），移除以免 reload diff 被旧
+        // origin 误导（diff 只比较值，origin 仅供展示）。
+        self.origins.remove("runtime.rules");
+    }
 }
 
 fn merge_value_with_origins(

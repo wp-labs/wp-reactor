@@ -128,6 +128,10 @@ cut_output = true
   `#[serde(default)]`；由 `--perf-diag` 参数加载，**不进 `wfusion.toml`**。
 - `cut_rules` / `cut_output` / `profiling`（复用 `WF_RULE_PROFILING`）均为**原子
   门控**，由诊断点状态机（§4.4）翻转，不进 reload diff。
+- **初始门控语义（实现定稿）**：多点模式（`points` 非空）下启动即应用
+  `points[0]` 的门控并写 `point{current=0}`——第一点（floor）不依赖任何哨兵
+  即可测得；顶层 `cut_rules`/`cut_output` 仅作单点模式（`points` 为空）的
+  初始门控。
 
 ### 4.2 门控切口（wf-runtime）
 
@@ -151,18 +155,20 @@ cut_output = true
   `perf_sentinel{round=k, n=<N_k>, start_ns=<wfgen T0>, emit_ns=<引擎完成时刻>}`。
   该记录四元组齐备，**EPS 直接可算**：`eps = n / (emit_ns − start_ns)`。
 - **记录输出（文件 sink，case 配置）**：sentinel 告警走既有 alert 链，由 case 的
-  `topology/sinks/infra.d/perf_sentinel.toml` 落盘 `data/perf_sentinel.ndjson`
-  （JSONL，一行一条四元组记录）——**wfgen 从该文件读记录**，比从 metrics 流
-  解析干净；`perf_sentinel` 指标仍写，作跨档一致性校验。
-  **独立验证 case**：`wf-examples/performance/perf_diag_case/`（单流、~24 规则、
+  `topology/sinks/business.d/perf_sentinel.toml` 落盘 `data/perf_sentinel.ndjson`
+  （JSONL，一行一条记录）——**wfgen 从该文件读记录**，比从 metrics 流解析干净。
+  ⚠ sink 路由组必须放 **`business.d/`**：`infra.d` 只读 `default/error/monitor`
+  三个固定文件（`load_infra_group`），`[sink_group]` 形状在 business.d 才是
+  按窗口模式匹配的路由组。
+  **独立验证 case**：`wf-examples/performance/perf_diag_case/`（单流、21 规则、
   100k 事件）承载机制端到端验证（验收清单见其 README/verify.sh），不与
   nexmark_pk/qradar_pk 基准混在一起；真实 bench 需要时各自补同款 sink。
-- **记录路径豁免 cut_output**：完成信号不能随输出墙被切——哨兵规则的 emit
-  （metric + 告警落盘）不受 `cut_output` 门控影响（与数据规则区分，见 §4.2）。
-  单批仅 1 条，常数量处理开销，增量抵消。
+- **记录路径豁免 cut_output**：完成信号不能随输出墙被切——哨兵记录（告警落盘）
+  由独立哨兵任务处理，天然不受 `cut_rules`/`cut_output` 门控影响（与数据规则
+  区分，见 §4.2）。单批仅 1-2 条，常数量处理开销，增量抵消。
 
   ```toml
-  # topology/sinks/infra.d/perf_sentinel.toml（各 bench 一份）
+  # topology/sinks/business.d/perf_sentinel.toml（各 bench 一份）
   [sink_group]
   name = "perf_sentinel_infra"
   windows = ["__perf_sentinel"]
@@ -176,36 +182,47 @@ cut_output = true
 - **时钟同一性**：基准同机运行，wfgen 的 `start_ns` 与引擎的 `emit_ns` 同机
   时钟可比（跨机需 NTP 或由引擎侧回写差值，见 §7）。
 - **豁免所有 perf 门控**：cut_rules / cut_output 均不影响 sentinel 窗口与哨兵
-  规则——保证各诊断点（含 floor 空规则档）都能拿到完成信号。
-- **顺序保证**：sentinel 帧与数据帧同 TCP 连接、同源 seq 有序 → sentinel 是
-  "批末最后一条"，其 emit 时刻 ≈ 该批处理结束时刻（+sentinel 自身常数量处理开销）。
-- **跨档一致性**（决策 ①a）：sentinel 走独立窗口，测共享段（recv/decode/路由）+
-  sentinel 窗排水；绝对时间可能略早于"最慢数据窗口"的规则消化完，但**增量
-  T1(k) − T1(k−1) 不受影响**，墙的归属判定不变。
+  处理——保证各诊断点（含 floor 空规则档）都能拿到完成信号。
+- **精度（实现定稿）**：`start_ns`/`emit_ns` 为 epoch nanos（≈1.7e18），超出
+  f64 精确范围（ulp ≈ 256ns）。哨兵记录的这两个字段以**字符串**携带
+  （`Value::Str` + Chars 类型，JSON `"1727…"`），wfgen 解析回 i64 精确计算
+  EPS；`round`/`n` 走 Digit（JSON 整数）。哨兵帧（wfgen→引擎）本身是 Int64
+  Arrow 列，全程无精度损失。
+- **批末语义（实现定稿）**：哨兵帧与数据帧同 TCP 连接、同源 seq 有序（哨兵是
+  "批末最后一条"）。规则消费是异步 pull——哨兵任务在**数据窗排空**（所有数据窗
+  的 `min_acked` 追平 `next_seq`）后才写记录，`emit_ns` ≈ 该批真实处理结束时刻。
+  无此等待时小批量会把"提交完成"当成"处理完成"（100k 实测 full 档 10.9M 假象）。
+- **跨档一致性**：哨兵走独立窗口，测共享段（recv/decode/路由）+ 数据窗排空；
+  各档同一口径，增量 T1(k) − T1(k−1) 的墙归属判定成立。
 
 ### 4.4 诊断点状态机（sentinel 驱动自切换，无外部控制面）
 
-- **切换触发器 = sentinel emit**：哨兵规则 emit（round=k）时向 Reactor 层诊断
-  控制器投递"点 k 完成"，控制器同步应用点 k+1：
+- **切换触发器 = sentinel emit**：哨兵任务处理 sentinel(round=k) 时向诊断控制器
+  投递"点 k 完成"，控制器同步应用点 k+1：
   1. 原子门控翻转（`cut_rules` / `cut_output`）；
-  2. 规则子集变化（`points[k+1].rules` 非空且不同）→ 触发已有 `runtime.rules`
-     热 reload（HotReloadSupported）；
-  3. 写 `perf_point{current=k+1}` 指标——**切换完成信号**（含 reload 完成）。
-- **同步性**：切换与 sentinel emit 同路径完成；wfgen 读到 `perf_sentinel{k}`
-  时点 k+1 已生效——无竞态。
+  2. 规则子集变化（`points[k+1].rules` 非空且不同于基线）→ 触发已有
+     `runtime.rules` 热 reload（HotReloadSupported；经 Reactor control_handle，
+     Applied/Blocked 均算切换完成）；
+  3. 返回后哨兵任务写 `point{current=k+1}` 完成信号（与 sentinel 记录同批、
+     同 sink 通道——文件内顺序 = 切换信号先于哨兵记录）。
+- **完成信号形态（实现定稿）**：`point{current=k}` 与 `sentinel{round,n,
+  start_ns,emit_ns}` 均写进 `perf_sentinel.ndjson`（JSONL，`record_type` 区分），
+  wfgen 读文件即得——不新增 metrics 流解析（`perf_sentinel`/`perf_point` 独立
+  指标不再写，文件记录即跨档一致性校验的单一事实源）。
+- **同步性**：切换与 sentinel 处理同路径完成（reload 经 control_handle 等待其
+  完成后才返回）；wfgen 读到 `sentinel{k}` 记录时点 k+1 已生效——无竞态。
 - **在途批次不受影响**：门控在 `process_batch` 入口检查，round k 的在途尾巴在旧
   门控下自然跑完；round k+1 新数据吃新门控（delta 口径，跨点不串扰）。
 - **零新增控制面**：无 admin 端点 / HTTP / 外部切换指令——只有"发数据"与"读
-  指标"。不复用 `POST /admin/v1/reloads/model`（project-remote 版本化 reload，
+  记录文件"。不复用 `POST /admin/v1/reloads/model`（project-remote 版本化 reload，
   重机制；规则子集切换走既有 `runtime.rules` 热 reload 通道）。
-- **切换完成语义**：`perf_point{current=k+1}` 只在门控已翻 + 规则 reload 已生效
-  后写出（reload 经 Reactor 现有 control_handle，异步完成后补写）。
 
 ### 4.5 metrics 协议（防假象，固化）
 
 - `report_interval` **默认 100ms**（当前 nexmark 已用、qradar 曾用 1s 制造假象；
   根治为引擎默认值，改 100ms 后短跑不再被 ~1s 粒度钉死）。
-- 完成判定信号 = `perf_sentinel` 指标（事件驱动），替代 metrics 轮询近似。
+- 完成判定信号 = 哨兵文件记录（事件驱动，`point{current=k}`），替代 metrics
+  轮询近似。
 
 ---
 
@@ -213,26 +230,34 @@ cut_output = true
 
 ```
 wfgen perf-diag \
-  --frames <file>                       # 预编码帧（数据部分）
+  --frames <file>                       # 预编码帧（数据部分；覆盖 max(--n-list) 行）
   --diag conf/perf-diag.toml            # 诊断配置（与 daemon 同一份；点列表=轮数）
   --addr 127.0.0.1:9800                 # TCP 数据端口
-  --n <N> | --n-list "100k,1m,3m"       # 数据量（单档或递增多档）
-  --rounds 2                            # 每点轮数（取 max，降负载噪声）
+  --n-list "100k,1m,3m"                 # 数据量（递增多档；缺省 = 帧文件全部行）
+  --rounds 1                            # 每点轮数（实现定稿：仅 1 有效，见下）
+  --sentinels data/perf_sentinel.ndjson # 哨兵记录文件（缺省同上）
+  --output data/perf_diag_wall.txt      # 墙表输出（缺省同上）
+  --timeout-secs 90                     # 单次等待超时
 ```
 
 - 诊断点列表的唯一来源是 `--diag` 指向的 `perf-diag.toml`（daemon 与 wfgen 读同一
   份）；wfgen 按点数发送轮次，不另设 `--points`。
+- **`--rounds` 语义（实现定稿）**：sentinel 驱动的切换在首个哨兵后即发生，同点
+  的重复轮次会吃到**下一个点**的门控——每点只测一轮（`rounds=1`）；去噪用
+  `--n-list` 递增 N（小 N 秒级出方向，大 N 确认墙是 per-event 还是固定开销）。
 
-- **循环**（每点 k，每轮）：
-  1. 若 k>0：轮询 metrics 直到 `perf_point{current=k}`——引擎已完成点 k 的切换
-     （门控翻转 + 规则 reload 生效），随后发送无竞态；
-  2. 统计本批发送量 `n_k`（帧行数合计）；`T0 = now()`；`send-arrow` 发数据帧，
+- **循环**（每点 k）：
+  1. 轮询哨兵文件直到 `point{current=k}`——引擎已完成点 k 的切换（多点模式
+     启动即 points[0] + 初始信号；k>0 由哨兵驱动），随后发送无竞态；
+  2. 取覆盖 `n_k` 行的帧前缀（帧行数合计 ≥ n_k，`n_k` 计入哨兵载荷）；
+     `T0 = now()`；发数据帧 + 帧尾追加
+     `__perf_sentinel{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq 尾部）；
      帧尾追加 `__perf_sentinel{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq
      尾部，保证最后处理）；
-  3. 从 `data/perf_sentinel.ndjson` 读到 `round=k` 的记录（含 `emit_ns`）——
-     引擎侧由哨兵规则 emit 落盘；
+  3. 从 `data/perf_sentinel.ndjson` 读到 `sentinel{round=k, n=n_k}` 的第
+     r 条记录（含引擎补的 `emit_ns`）——引擎侧由哨兵任务落盘；
   4. `EPS_k = n_k / (emit_ns − start_ns)`——**发送量/开始时间来自 sentinel 载荷，
-     完成时间来自引擎 emit 记录，全程无外部记账**（delta 口径，跨点窗口残留
+     完成时间来自引擎记录，全程无外部记账**（delta 口径，跨点窗口残留
      状态不影响）。
 - **数据由小到大**：`--n-list` 对每个诊断点按递增 N 各测一次——小 N 秒级出方向，
   大 N 确认墙是 per-event 还是固定开销（2026-08-23 的 26万 vs 970万 正是这种
@@ -258,14 +283,15 @@ wfgen perf-diag \
 
 | 项 | 决策 | 说明 |
 |---|---|---|
-| sentinel 队列 | 独立 `__perf_sentinel` 窗口（①a） | 绝对时间可能略早于最慢数据窗；相对增量不受影响 |
-| sentinel 载荷 | 自描述 `{round, n, start_ns}` | 发送量+开始时间入 sentinel；引擎补 `emit_ns` → EPS 四元组直接可算 |
+| sentinel 队列 | 独立 `__perf_sentinel` 窗口（①a） | 哨兵任务等**数据窗排空**（min_acked 追平 next_seq）后写记录；跨档同一口径 |
+| sentinel 载荷 | 自描述 `{round, n, start_ns}` | 发送量+开始时间入 sentinel；引擎补 `emit_ns` → EPS 四元组直接可算；start/emit 以字符串携带防 f64 丢精度 |
 | 切换机制 | sentinel 驱动自切换 | 同步无竞态、零控制面；在途批次不受影响 |
 | 时钟 | 同机基准，wfgen `start_ns` 与引擎 `emit_ns` 同机时钟 | 跨机需 NTP 或引擎回写差值（未做） |
 | sink 热切 | 不做（RequiresRestart） | 输出墙用 cut_output 开关代替，无需动 sinks |
 | budget 热切 | 不做（RequiresRestart） | 预算档作为唯一重启例外 |
 | sentinel 处理开销 | 常数量（极小），计入每档 | 增量抵消，不影响墙归属 |
 | 窗口残留 | delta 口径，2min 滑窗自动老化 | 跨点不重启可连续跑 |
+| rounds | 每点仅首轮有效 | 首个哨兵即切换下一档；`--rounds` 保留但去噪走 `--n-list` |
 
 ---
 
