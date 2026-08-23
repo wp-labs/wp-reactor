@@ -289,6 +289,12 @@ impl Reactor {
         raw: RawFusionConfigTree,
         base_dir: &std::path::Path,
     ) -> RuntimeResult<Self> {
+        // 规则相位计时开关（默认开，兼容既有诊断日志）；压测可用
+        // `WF_RULE_PROFILING=0` 关闭——每行 Instant::now+elapsed 在规则热路径
+        // 实测占活跃 CPU ~7.6%（qradar c_* 家族采样）。
+        crate::engine_task::rule_task::set_rule_profiling(
+            std::env::var("WF_RULE_PROFILING").map_or(true, |v| v != "0"),
+        );
         let mut op = op_context!("engine-bootstrap").with_auto_log();
         op.record("mode", mode_name(config.mode));
         op.record("base_dir", base_dir.display().to_string().as_str());

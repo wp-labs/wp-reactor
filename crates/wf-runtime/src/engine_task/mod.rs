@@ -1,5 +1,5 @@
 mod conv_stage;
-mod rule_task;
+pub(crate) mod rule_task;
 mod stats_task;
 mod task_types;
 mod window_lookup;

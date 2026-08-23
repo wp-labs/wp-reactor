@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{BooleanArray, new_null_array};
@@ -33,6 +33,22 @@ use super::window_lookup::RegistryLookup;
 
 const PIPE_EVENT_TIME_FIELD: &str = "__wf_pipe_ts";
 const DEBUG_DETAIL_LIMIT: usize = 20;
+
+// 规则相位 profile 计时开关（scan/advance/emit/close_exec/exec 每行 Instant::now
+// + elapsed，仅为 dump_profiling 日志服务）。采样实测（qradar c_* 家族）时钟调用
+// 占活跃 CPU ~7.6%——默认保持开启（兼容既有诊断），压测场景经
+// [`set_rule_profiling`] 关闭（零时钟开销）。
+static RULE_PROFILING: AtomicBool = AtomicBool::new(true);
+
+/// 开关规则相位计时（false = 热路径免 clock_gettime，相位日志归零）。
+pub fn set_rule_profiling(enabled: bool) {
+    RULE_PROFILING.store(enabled, Ordering::Relaxed);
+}
+
+#[inline]
+fn rule_profiling() -> Option<Instant> {
+    RULE_PROFILING.load(Ordering::Relaxed).then(Instant::now)
+}
 
 /// Pull-path pending rows: (alias, cursor, event arcs) per source window.
 /// Pulled batches for one round of [`RuleTask::pull_and_advance`], collected
@@ -977,7 +993,7 @@ impl RuleTask {
                         unreachable!("machine rows are always materialized when eager")
                     }
                 };
-                let _scan_start = Instant::now();
+                let _scan_start = rule_profiling();
                 // P2c: shards of a conv rule emit raw closes to the conv stage
                 // (aggregation window); inline conv is applied only on the
                 // legacy single-machine path.
@@ -1014,7 +1030,9 @@ impl RuleTask {
                         ),
                     )
                 };
-                self.scan_nanos += _scan_start.elapsed().as_nanos() as u64;
+                if let Some(_scan_t) = _scan_start {
+                    self.scan_nanos += _scan_t.elapsed().as_nanos() as u64;
+                }
                 // Non-hit rows only need the time-column scan above (watermark /
                 // expiry) plus the close emission below; there is no Event to
                 // advance and no bind filter would accept them, so skip the
@@ -1039,7 +1057,7 @@ impl RuleTask {
                     event.map(|ev| RowEvent::Eager(ev.as_ref()))
                 };
                 if let Some(row_event) = row_event {
-                    let _advance_start = Instant::now();
+                    let _advance_start = rule_profiling();
                     for alias in ordered_aliases {
                         if !alias_accepts(
                             &self.executor,
@@ -1202,9 +1220,11 @@ impl RuleTask {
                             }
                         }
                     }
-                    self.advance_nanos += _advance_start.elapsed().as_nanos() as u64;
+                    if let Some(_advance_t) = _advance_start {
+                        self.advance_nanos += _advance_t.elapsed().as_nanos() as u64;
+                    }
                 }
-                let _emit_start = Instant::now();
+                let _emit_start = rule_profiling();
 
                 // When routed to the conv stage, the inline close processing is
                 // skipped (the closes were already sent in the scan step).
@@ -1217,9 +1237,11 @@ impl RuleTask {
                     columnar_closes.extend(closes);
                 } else if !routed {
                     for close in &closes {
-                        let _close_exec_start = Instant::now();
+                        let _close_exec_start = rule_profiling();
                         let result = self.executor.execute_close_with_joins(close, &lookup);
-                        self.close_exec_nanos += _close_exec_start.elapsed().as_nanos() as u64;
+                        if let Some(_close_t) = _close_exec_start {
+                            self.close_exec_nanos += _close_t.elapsed().as_nanos() as u64;
+                        }
                         match result {
                             Ok(Some(record)) => {
                                 if debug_enabled {
@@ -1281,14 +1303,16 @@ impl RuleTask {
                         if let Some(metrics) = &self.metrics {
                             metrics.inc_rule_match(self.rule_name());
                         }
-                        let _exec_start = Instant::now();
+                        let _exec_start = rule_profiling();
                         match self.executor.execute_match_with_joins_at(
                             ctx,
                             &lookup,
                             batch_emit_nanos,
                         ) {
                             Ok(Some(record)) => {
-                                self.exec_nanos += _exec_start.elapsed().as_nanos() as u64;
+                                if let Some(_exec_t) = _exec_start {
+                                    self.exec_nanos += _exec_t.elapsed().as_nanos() as u64;
+                                }
                                 if debug_enabled {
                                     stats.count_output(&record, &self.intermediate_targets);
                                 }
@@ -1332,7 +1356,9 @@ impl RuleTask {
                         }
                     }
                 }
-                self.emit_nanos += _emit_start.elapsed().as_nanos() as u64;
+                if let Some(_emit_t) = _emit_start {
+                    self.emit_nanos += _emit_t.elapsed().as_nanos() as u64;
+                }
             } else if let Some(alias) = self
                 .each_alias
                 .as_ref()
@@ -1618,7 +1644,7 @@ impl RuleTask {
         // OutputRecord / synthetic ctx. Metrics mirror the per-record path
         // (exact totals; serialize-failed increments for eval failures).
         if close_columnar && !columnar_closes.is_empty() {
-            let _close_exec_start = Instant::now();
+            let _close_exec_start = rule_profiling();
             let (outcome, should_flush) = {
                 let mut pending = self.pending_alerts.lock().unwrap();
                 let target = self.executor.static_yield_target();
@@ -1645,7 +1671,9 @@ impl RuleTask {
                 pending.count += outcome.appended;
                 (outcome, pending.count >= ALERT_BATCH_SIZE)
             };
-            self.close_exec_nanos += _close_exec_start.elapsed().as_nanos() as u64;
+            if let Some(_close_t) = _close_exec_start {
+                self.close_exec_nanos += _close_t.elapsed().as_nanos() as u64;
+            }
             if let Some(metrics) = &self.metrics {
                 for _ in 0..outcome.appended {
                     metrics.inc_alert_emitted_total(self.rule_name());
