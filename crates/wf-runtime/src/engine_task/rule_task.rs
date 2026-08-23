@@ -1282,10 +1282,11 @@ impl RuleTask {
                             metrics.inc_rule_match(self.rule_name());
                         }
                         let _exec_start = Instant::now();
-                        match self
-                            .executor
-                            .execute_match_with_joins_at(ctx, &lookup, batch_emit_nanos)
-                        {
+                        match self.executor.execute_match_with_joins_at(
+                            ctx,
+                            &lookup,
+                            batch_emit_nanos,
+                        ) {
                             Ok(Some(record)) => {
                                 self.exec_nanos += _exec_start.elapsed().as_nanos() as u64;
                                 if debug_enabled {
@@ -1842,8 +1843,13 @@ impl RuleTask {
     }
 
     /// EOS 重试：到期评估 miss 的 deferred 实例（join 目标 append 滞后）。
-    /// EOS 后 join 目标窗口完整（全部数据已 ingest），重新评估一次——
-    /// 命中则补输出，仍 miss 为真 miss（右窗无匹配行）。
+    ///
+    /// 重试**仍 miss** 的实例保留回 `missed`，不在此处判定为真 miss：flush 的
+    /// 调用方可能是 keep-running EOS（窗口 actors 仍在排空 mailbox，目标窗口
+    /// 可能不完整——shutdown 路径因 LIFO 排序无此问题，但 daemon 接收有限输入
+    /// 的 EOS 场景是真实竞态，2026-08-23 复现测试锁定）。保留后由窗口确认
+    /// 完整时的下一次 flush 再评估——命中补输出，仍 miss 为真 miss（此时任务
+    /// 即将退出，保留与否无差别）。命中则补输出。
     async fn reevaluate_deferred_missed(&mut self) {
         let missed = {
             let Some(deferred) = self.deferred.as_mut() else {
@@ -1863,6 +1869,7 @@ impl RuleTask {
         let missed_len = missed.len();
         let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
         let mut hit = 0usize;
+        let mut still_miss = Vec::with_capacity(missed_len.min(64));
         for p in missed {
             match self
                 .executor
@@ -1881,7 +1888,9 @@ impl RuleTask {
                     }
                     self.emit(record).await;
                 }
-                Ok(None) => {}
+                // 仍 miss：不判定为真 miss——窗口可能仍不完整（keep-running
+                // EOS 竞态）。保留回 missed，等下一次 flush（窗口完整后）。
+                Ok(None) => still_miss.push(p),
                 Err(e) => {
                     wf_warn!(
                         pipe,
@@ -1895,6 +1904,12 @@ impl RuleTask {
                 }
             }
         }
+        let still_miss_len = still_miss.len();
+        if !still_miss.is_empty()
+            && let Some(deferred) = self.deferred.as_mut()
+        {
+            deferred.missed.extend(still_miss);
+        }
         if hit > 0 && debug_enabled {
             wf_debug!(
                 pipe,
@@ -1902,7 +1917,8 @@ impl RuleTask {
                 rule = %self.rule_name(),
                 missed = missed_len,
                 hit = hit,
-                "deferred EOS retry: missed instances re-evaluated against the full join window"
+                still_miss = still_miss_len,
+                "deferred EOS retry: missed instances re-evaluated (still-miss preserved for the next flush)"
             );
         }
     }

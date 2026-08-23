@@ -781,6 +781,48 @@ async fn deferred_q8_eos_retry_true_miss_stays_silent() {
     );
 }
 
+/// keep-running EOS 竞态复现（2026-08-23 补充）：EOS flush 发生时窗口 actors
+/// 可能还在排空 mailbox → join 目标窗口**不完整**。若重试 miss 被直接 drop，
+/// 之后窗口补全也丢失输出（shutdown 路径因 LIFO 排序无此问题；keep-running
+/// 的 daemon 场景是真实隐患）。修复：重试仍 miss 的实例保留回 `missed`，
+/// 等窗口确认完整后的下一次 flush 再判定真 miss。
+#[tokio::test]
+async fn deferred_q8_eos_retry_preserves_miss_until_window_complete() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_q8_task();
+
+    // person 5（T，桶 [T, T+10s)）挂起；person 6（T+11s）推水位过桶末 →
+    // person 5 到期评估，auction 窗口为空 → miss 收集进 missed
+    q8_person_window(&router)
+        .append(person_batch(&[(5, T)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    q8_person_window(&router)
+        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+
+    // 模拟 EOS flush，但 auction 窗口**仍未 append**（actors 排空滞后）——
+    // 重试基于不完整窗口 → 假 miss
+    task.flush().await;
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "窗口不完整时 EOS flush 不输出（假 miss）"
+    );
+
+    // actors 排空后窗口补全：auction（seller=5）入桶
+    q8_auction_window(&router)
+        .append(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .unwrap();
+    // 窗口补全后再 flush（shutdown 或下一输入 EOS）→ 必须补出 person 5
+    task.flush().await;
+    assert_eq!(
+        drain_alert_entity_ids(&mut alert_rx),
+        vec!["5"],
+        "窗口补全后的 flush 必须补出 person 5（重试 miss 不得被提前丢弃）"
+    );
+}
+
 /// 排空 alert 通道并按 `__wfu_entity_id` 收集（精确计数断言：不重不丢）。
 fn drain_alert_entity_ids(rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>) -> Vec<String> {
     use crate::alert_task::AlertBatch;
