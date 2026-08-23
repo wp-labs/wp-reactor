@@ -466,8 +466,9 @@ fn update_measure_avg_and_sum_ignore_non_numeric() {
     let mut bs = BranchState::new();
     update_measure(&Measure::Sum, &Some(str_val("n/a")), &mut bs);
     assert_eq!(bs.sum, 0.0);
-    // Collected values still record the raw value regardless of measure.
-    assert_eq!(bs.collected_values.as_deref().map(|q| q.len()), Some(1));
+    // F9：collected_values 收集移到调用方（gate = needs_field_history），
+    // update_measure 自身不再记录原始值——此处不再断言 collected。
+    assert_eq!(bs.collected_values.as_deref().map(|q| q.len()), None);
 }
 
 #[test]

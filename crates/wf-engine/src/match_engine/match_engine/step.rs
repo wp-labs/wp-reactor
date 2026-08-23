@@ -25,6 +25,11 @@ pub(super) struct StepEvaluationInput<'a, E: FieldSource> {
     pub row: usize,
     /// Precomputed columnar branch-guard masks, when the runtime supplied them.
     pub masks: Option<&'a GuardMasks>,
+    /// 收集 collected_values（L3 序列函数经 ctx `_step_{i}_values` 读取）。
+    /// gate = `plan.needs_field_history`（编译器：L3/close 非键读取/join/多
+    /// bind 置 true；q6 等单 bind avg 规则为 false——每事件 push + StepData
+    /// clone 是纯浪费，2026-08-23 F9）。
+    pub collect_step_values: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +87,16 @@ pub(super) fn evaluate_step_with_progress<E: FieldSource>(
 
         // Update measure accumulators
         update_measure(&branch.agg.measure, &field_value, bs);
+
+        // Collect raw values for L3 functions（collect_set/list、first/last、
+        // stddev/percentile）——仅在编译期判定需要时（L3 表达式 / close 非键
+        // 读取 / join / 多 bind → needs_field_history=true）。q6 等规则跳过
+        // 每事件 VecDeque push + StepData/MatchedContext 的 collected clone。
+        if input.collect_step_values
+            && let Some(val) = &field_value
+        {
+            push_capped(bs.collected_values_mut(), val.clone());
+        }
 
         // Check threshold
         let satisfied = check_threshold(&branch.agg, bs);
@@ -265,7 +280,7 @@ const MAX_TRACKED_FIELD_VALUES: usize = 1024;
 /// 每 push 一次 O(1024) 搬运。q15 每事件 8 个 distinct branch 收集 → 每事件
 /// 8×32KB memmove，占 q15 CPU 的 88%（macOS sample 2026-08-22 实测，q15 10M
 /// EPS 37k 的主因）。
-fn push_capped(values: &mut VecDeque<Value>, value: Value) {
+pub(super) fn push_capped(values: &mut VecDeque<Value>, value: Value) {
     values.push_back(value);
     if values.len() > MAX_TRACKED_FIELD_VALUES {
         values.pop_front(); // O(1)：保留最近 MAX 个（与旧 drain 语义一致）
@@ -363,11 +378,6 @@ pub(super) fn apply_transforms(
 
 pub(super) fn update_measure(measure: &Measure, field_value: &Option<Value>, bs: &mut BranchState) {
     let fval = field_value.as_ref().and_then(value_to_f64);
-
-    // Collect raw values for L3 functions (collect_set/list, first/last, stddev/percentile)
-    if let Some(val) = field_value {
-        push_capped(bs.collected_values_mut(), val.clone());
-    }
 
     match measure {
         Measure::Count => {
@@ -747,6 +757,9 @@ mod tests {
         let over = MAX_TRACKED_FIELD_VALUES * 5;
         for i in 0..over as i64 {
             update_measure(&Measure::Count, &Some(Value::Number(i as f64)), &mut bs);
+            // F9：collected_values 收集移到调用方（gate = needs_field_history），
+            // update_measure 自身不再收集——测试补 push 以保持对 cap 的断言。
+            push_capped(bs.collected_values_mut(), Value::Number(i as f64));
         }
 
         assert_eq!(

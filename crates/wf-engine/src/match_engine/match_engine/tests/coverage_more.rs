@@ -570,6 +570,7 @@ fn evaluate_step_skips_branches_from_other_aliases() {
             step_index: 0,
             row: 0,
             masks: None,
+            collect_step_values: false,
         },
         &plan.event_steps[0],
         &mut step_state,

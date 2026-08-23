@@ -5,7 +5,7 @@ use super::eval::{eval_expr, eval_expr_ext};
 use super::state::{Instance, StepState, snapshot_bind_data};
 use super::step::{
     apply_transforms, check_threshold, collect_event_fields, compute_measure, extract_branch_field,
-    record_evidence_time, update_measure,
+    push_capped, record_evidence_time, update_measure,
 };
 use super::types::{
     CloseOutput, CloseReason, EngineHashMap, Event, FieldSource, RollingStats, StepData, Value,
@@ -95,6 +95,13 @@ pub(crate) fn accumulate_close_steps<E: FieldSource>(
 
             // Update measure accumulators
             update_measure(&branch.agg.measure, &field_value, bs);
+
+            // close 路径的 collected_values 同 gate（L3/非键读取时收集）。
+            if plan.needs_field_history
+                && let Some(val) = &field_value
+            {
+                push_capped(bs.collected_values_mut(), val.clone());
+            }
         }
     }
 }
