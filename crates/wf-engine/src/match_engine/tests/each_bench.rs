@@ -1,6 +1,6 @@
 //! Q1 `on each` 列式路径的逐分量微基准——cut A/B/C/D 的 ns/行归因（数据版）。
 //!
-//! 与端到端切刀（q1-throughput-bisection.md §15）互补：切刀在 load/工具量化
+//! 与端到端切刀（docs/design/archive/q1-throughput-bisection.md §15）互补：切刀在 load/工具量化
 //! 噪声下给「占比」，这里在同一进程内直接测每个分量的绝对 ns/行成本。
 //!
 //! 运行：

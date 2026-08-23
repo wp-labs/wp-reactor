@@ -4,7 +4,7 @@
 >
 > 2026-08-16 · 落地 commit：b65d46d（window log 去 SkipMap）、2563b8a（消费感知驱逐）
 > · 前置：[window-channel-actor-design.md](window-channel-actor-design.md)（window
-> actor 化 + rule 通道化拓扑）、[window-memory-control.md](window-memory-control.md)
+> actor 化 + rule 通道化拓扑）、[window-memory-control.md](archive/window-memory-control.md)
 > （旧版两层驱逐机制，Phase 1 已被本文取代）
 
 ---
@@ -56,7 +56,7 @@ commit 路径、metrics 并发读 atomic；改造成本（驱逐搬进 actor + i
 
 ## 2. 消费感知驱逐（2563b8a）
 
-### 2.1 旧机制的两个缺陷（[window-memory-control.md](window-memory-control.md) 描述的版本）
+### 2.1 旧机制的两个缺陷（[window-memory-control.md](archive/window-memory-control.md) 描述的版本）
 
 1. **驱逐器从不 tick**：`evict_interval` 30s，10s bench 里 Phase 1 时间驱逐从未
    执行 → 窗口全量驻留（30M RSS 21.5GB 的主因之一）；
