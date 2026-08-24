@@ -808,6 +808,27 @@ worker 与其余片 ingest 争核。已恢复串行 `merge_accum`（含 distinct
 测试：`cargo test -p wf-engine --lib stats` 58 pass + `cargo test -p wf-runtime
 --lib q15_input_shard` 4 pass（行域裁剪语义与全批一致）。
 
+### 归并性能基准（`b7face9`, 2026-08-24）——微优化无空间, 瓶颈是星形归并本身
+
+新增 bench：`close_bench::q15_merge_partial_profile`（模拟生产归并：空键 12
+度量、8 distinct 集、协调片 + 8 partial、域 8M 高度重叠）。运行：
+`cargo test --release -p wf-engine --lib q15_merge_partial -- --ignored --nocapture`
+
+**结论 1：merge 微优化全部无空间（±5% 噪声内）**——1M/集规模：
+cur(生产 clone+extend) 2154ms vs move 免 clone 2142 / move+reserve 2168 /
+move+小并大 2137。原因：foldhash `extend` 对 `iter().cloned()` 的 ExactSize
+Iterator 内部已 reserve；`DistinctKey::Int` 是 memcpy 级拷贝, clone 近免费。
+**不要改 merge_accum 的 micro 结构**。
+
+**结论 2：分片数敏感度揭示真瓶颈**（域 8M 固定, 每片 distinct ≈ 域/N）：
+分片 4 → 1518ms；分片 9 → 1979ms；分片 16 → 2296ms。星形归并总 insert ≈
+(N-1) 片 × 8 度量 × 域/N ≈ 常数——**墙钟不随分片数下降**（4→16 反而 +51%）。
+这就是生产 ~883ms 尾部的本质：不是单点可微的, 是协调片串行归并的固定成本。
+
+**推论（与 thread::scope 回退一致）**：要让归并变快只能**改归并形态**——
+树形归并（两两并行 union）或 `spawn_blocking` 异步化（数据移出 `&mut self`,
+工程大）。当前 7.86M 是分片 + 行域裁剪后的合理收口, 归并尾部 ~0.9s 暂接受。
+
 ## 下一步（重开 session 从这里继续）
 
 1. **全量 22 查询 30M 重跑 + OSS/VVR 对照刷新**（q4/q5/q9/q20/q15 均已大幅
