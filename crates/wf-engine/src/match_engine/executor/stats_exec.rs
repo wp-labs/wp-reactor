@@ -16,7 +16,7 @@ use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsPlan};
 use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
 use crate::match_engine::event_bridge::extract_field_value;
 use crate::match_engine::match_engine::{Event, ScopeKey, field_ref_name};
-use crate::match_engine::{EngineHashMap, Value};
+use crate::match_engine::{EngineHashMap, EngineHashSet, Value};
 use crate::window::scope_key_columnar;
 use crate::window::scope_key_from_column;
 
@@ -31,7 +31,7 @@ pub struct StatsAccum {
     pub sum_i128: i128,
     pub min: Option<i128>,
     pub max: Option<i128>,
-    pub distinct_set: Option<HashSet<DistinctKey>>,
+    pub distinct_set: Option<EngineHashSet<DistinctKey>>,
     /// `last(field)` 用（Q18）: 最近合格行的**行字段列数组**（P5 紧凑化——按
     /// `row_field_names` 列序存储, 缺失/null = `None`; 旧 `EngineHashMap` 每桶
     /// 6 个 SmolStr key + hash 节点 ≈ 400B+/桶, 5.29M 桶直接顶到 ~19GB）。
@@ -369,7 +369,7 @@ impl StatsExecutor {
                             StatsAggPlan::DistinctCount => {
                                 let key = value_to_distinct_key(&val);
                                 acc.distinct_set
-                                    .get_or_insert_with(HashSet::new)
+                                    .get_or_insert_with(EngineHashSet::default)
                                     .insert(key);
                             }
                             StatsAggPlan::Last | StatsAggPlan::Top => {
@@ -490,6 +490,36 @@ impl StatsExecutor {
         };
     }
 
+    /// 提取本片已关闭窗口的**原始累加状态**（输入分区分片归并用）并重置窗口。
+    /// 返回 `(桶原始状态, 本片事件数)`——协调片把它合并进自己的窗口后再 close。
+    /// 仅空键/可交换度量（count/sum/min/max/distinct）分片使用（last/top 被
+    /// spawn 门控排除——行序敏感不可归并）。
+    pub fn take_partial(&mut self) -> (Vec<(ScopeKey, Vec<StatsAccum>)>, u64) {
+        let buckets = self.window.take_buckets();
+        let count = self.window.event_count;
+        self.reset_window();
+        (buckets, count)
+    }
+
+    /// 归并另一片的原始累加状态（输入分区分片）: 计数相加、sum 相加、min/max
+    /// 取极值、distinct 集 union（`extend` 用自身 hasher 重插, 跨片 hasher 可
+    /// 不同）、事件数相加。last/top 不在此路径（spawn 门控排除）。
+    ///
+    /// **串行（2026-08-24 实测）**: `thread::scope` 并行 union 在协调片 async
+    /// close 里阻塞 tokio worker, 与其余片 ingest 争核 → EPS 5.96~7.86M 波动
+    /// （比串行 7.86M 更差）。q15 EOS 归并 ~883ms 是固定尾部成本; 若要并行须
+    /// 走 `spawn_blocking`/异步任务（数据移出 `&mut self`, 未做）。
+    pub fn merge_partial(&mut self, buckets: Vec<(ScopeKey, Vec<StatsAccum>)>, event_count: u64) {
+        let n = self.plan.measures.len();
+        for (key, accs) in buckets {
+            let target = self.window.bucket_mut(&key, n);
+            for (t, o) in target.iter_mut().zip(accs.iter()) {
+                merge_accum(t, o);
+            }
+        }
+        self.window.event_count += event_count;
+    }
+
     /// 列式批处理（P1.5, 设计 §6.2）: 消费 fanout 投递的 raw [`RecordBatch`]。
     ///
     /// - 段 1: where 列式 mask（去重后的唯一条件, 每批一次 [`eval_guard_columnar`]）
@@ -534,10 +564,8 @@ impl StatsExecutor {
         };
         let n = batch.num_rows();
         // 行域（P2 分片）: `rows` = 本片拥有的行索引子集（绝对行号, 升序）。
-        // 归并只对行域内的行生效; `None` = 全批。转为列 mask 与 where mask
-        // 逐位 AND, 使整列归并原语（count_true/sum_masked/minmax_masked/
-        // insert_distinct_column）无需改动即可按行域过滤。
-        let domain = domain_mask(n, rows);
+        // 归并段（段 1d/段 2）改为**行域驱动**（count_domain/sum_domain/
+        // insert_distinct_domain 只遍历本片行）——不再构建全批 domain mask。
         let view = ColumnarBatch::from_all_fields(batch);
         // 段 1: where 列式 mask（去重后唯一条件, 每批一次）
         let masks: Vec<BooleanArray> = self
@@ -592,17 +620,15 @@ impl StatsExecutor {
                 row_field_cols.as_deref(),
             );
         }
-        // 段 1d: 纯归并度量整列累加。行式语义: 满足 where 的行对**每个**度量都
-        // `count += 1`（在字段读取前）——avg 的 count 必须与 sum 同步累加,
-        // 否则 avg = sum/count 输出 0（D6: avg 仅输出时 sum/count 求得）。
+        // 段 1d: 纯归并度量整列累加（**行域驱动**——2026-08-24 分片裁剪: 只遍历
+        // 本片行, 消除每片对全批的 O(n) 冗余扫描; 全批路径 `rows=None` 行为不变）。
+        // 行式语义: 满足 where 的行对**每个**度量都 `count += 1`（在字段读取前）
+        // ——avg 的 count 必须与 sum 同步累加, 否则 avg = sum/count 输出 0（D6）。
         let n_measures = self.plan.measures.len();
         for (idx, measure) in self.plan.measures.iter().enumerate() {
-            let mask = combine_masks(
-                domain.as_ref(),
-                self.measure_where[idx].map(|wi| &masks[wi]),
-            );
+            let wi = self.measure_where[idx];
             let acc = &mut self.window.bucket_mut(&ScopeKey::Empty, n_measures)[idx];
-            let rows_in = mask.as_ref().map_or(n as u64, count_true);
+            let rows_in = count_domain(rows, n, &masks, wi);
             match measure.agg {
                 StatsAggPlan::Count => {
                     acc.count += rows_in;
@@ -612,7 +638,7 @@ impl StatsExecutor {
                     if let Some(field) = &measure.field
                         && let Some(col) = numeric_col(batch, field_name(field))
                     {
-                        acc.sum_i128 += sum_masked(&col, mask.as_ref());
+                        acc.sum_i128 += sum_domain(&col, rows, n, &masks, wi);
                     }
                 }
                 StatsAggPlan::Min | StatsAggPlan::Max => {
@@ -620,7 +646,7 @@ impl StatsExecutor {
                     if let Some(field) = &measure.field
                         && let Some(col) = numeric_col(batch, field_name(field))
                     {
-                        minmax_masked(&col, mask.as_ref(), &mut acc.min, &mut acc.max);
+                        minmax_domain(&col, rows, n, &masks, wi, &mut acc.min, &mut acc.max);
                     }
                 }
                 StatsAggPlan::DistinctCount => {
@@ -632,7 +658,7 @@ impl StatsExecutor {
                 }
             }
         }
-        // 段 2: distinct/last/top 行式段（原生列值按 mask 过滤; last/top 提取
+        // 段 2: distinct/last/top 行式段（原生列值按行域 + where 过滤; last/top 提取
         // 行字段供 yield 注入）
         for (idx, measure) in self.plan.measures.iter().enumerate() {
             if !matches!(
@@ -641,26 +667,20 @@ impl StatsExecutor {
             ) {
                 continue;
             }
-            let mask = combine_masks(
-                domain.as_ref(),
-                self.measure_where[idx].map(|wi| &masks[wi]),
-            );
+            let wi = self.measure_where[idx];
             let acc = &mut self.window.bucket_mut(&ScopeKey::Empty, n_measures)[idx];
             if matches!(measure.agg, StatsAggPlan::DistinctCount) {
                 let Some(field) = &measure.field else {
                     continue;
                 };
-                let set = acc.distinct_set.get_or_insert_with(HashSet::new);
-                if !insert_distinct_column(batch, field_name(field), mask.as_ref(), set) {
+                let set = acc.distinct_set.get_or_insert_with(EngineHashSet::default);
+                if !insert_distinct_domain(batch, field_name(field), rows, n, &masks, wi, set) {
                     return false;
                 }
             } else {
-                // last/top: 逐行按 mask 更新（子集行字段提取; 空键 last 规则少用）
-                let iter: Box<dyn Iterator<Item = usize>> = match mask.as_ref() {
-                    Some(m) => Box::new((0..n).filter(|&r| m.value(r))),
-                    None => Box::new(0..n),
-                };
-                for r in iter {
+                // last/top: 逐行按行域 + where 更新（子集行字段提取; 空键 last 规则少用）
+                let passes = |r: usize| wi.map_or(true, |wi| masks[wi].value(r));
+                for r in domain_rows(rows, n).filter(|&r| passes(r)) {
                     let row = row_fields_from_batch(batch, r, row_field_cols.as_deref());
                     let fidx = measure_field_position(
                         &self.plan,
@@ -852,7 +872,9 @@ fn accumulate_column_row(
             }
             StatsAggPlan::DistinctCount => {
                 if let Some(k) = column_distinct_key(batch, field_name(field), row) {
-                    acc.distinct_set.get_or_insert_with(HashSet::new).insert(k);
+                    acc.distinct_set
+                        .get_or_insert_with(EngineHashSet::default)
+                        .insert(k);
                 }
             }
             StatsAggPlan::Last | StatsAggPlan::Top => {
@@ -893,6 +915,34 @@ fn measure_field_position(
             (Some(f), Some(ns)) => ns.iter().position(|n| n == field_name(f)),
             _ => None,
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 归并（输入分区分片: 可交换度量）
+// ---------------------------------------------------------------------------
+
+/// 归并两个累加器（count 相加 / sum 相加 / min·max 取极值 / distinct 集 union）。
+/// 仅可交换度量路径使用（last/top 被 spawn 门控排除——行序敏感不可归并）。
+fn merge_accum(t: &mut StatsAccum, o: &StatsAccum) {
+    t.count += o.count;
+    t.sum_i128 += o.sum_i128;
+    t.min = match (t.min, o.min) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    t.max = match (t.max, o.max) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    match (&mut t.distinct_set, &o.distinct_set) {
+        (Some(ts), Some(os)) => ts.extend(os.iter().cloned()),
+        (None, Some(os)) => t.distinct_set = Some(os.clone()),
+        _ => {}
     }
 }
 
@@ -1557,36 +1607,152 @@ fn column_distinct_key(batch: &RecordBatch, name: &str, row: usize) -> Option<Di
 // 列式段辅助（P1.5）
 // ---------------------------------------------------------------------------
 
-/// mask 中 true 的个数（含 null slot 读 false, 与行式 eval 语义一致）。
-fn count_true(mask: &BooleanArray) -> u64 {
-    (0..mask.len()).filter(|&i| mask.value(i)).count() as u64
+/// 行域迭代（P2 分片裁剪）: `rows` = 本片行索引（升序, 绝对行号）; `None` =
+/// 全批 `0..n`。行域驱动的归并段（count/sum/minmax/distinct）只遍历本片行,
+/// 消除每片对全批的 O(n) 冗余扫描（q15 输入分片 10× 冗余归因, 2026-08-24）。
+fn domain_rows(rows: Option<&[u32]>, n: usize) -> Box<dyn Iterator<Item = usize> + '_> {
+    match rows {
+        Some(rs) => Box::new(rs.iter().map(|&r| r as usize)),
+        None => Box::new(0..n),
+    }
 }
 
-/// 行域 mask（P2 分片）: `rows` 内的行标 true, 其余 false; `None` = 全批。
-/// 与 where mask 逐位 AND 后喂给整列归并原语, 使归并只对行域生效。
-fn domain_mask(n: usize, rows: Option<&[u32]>) -> Option<BooleanArray> {
-    let rows = rows?;
-    let mut flags = vec![false; n];
-    for &r in rows {
-        if (r as usize) < n {
-            flags[r as usize] = true;
+/// 行域内满足 where 过滤的行数（`wi` = unique_wheres 索引; `None` = 恒通过）。
+/// 等价 `count_true(combine(domain, where))`——逐行查 where mask 位（null slot
+/// 读 false, 与 `BooleanArray::value` 一致）。
+fn count_domain(rows: Option<&[u32]>, n: usize, masks: &[BooleanArray], wi: Option<usize>) -> u64 {
+    let passes = |r: usize| wi.map_or(true, |wi| masks[wi].value(r));
+    match rows {
+        Some(rs) => rs.iter().filter(|&&r| passes(r as usize)).count() as u64,
+        None => (0..n).filter(|&r| passes(r)).count() as u64,
+    }
+}
+
+/// 行域驱动求和（null 跳过; 数值按行式 `value_to_i128` 截断, D8）。
+fn sum_domain(
+    col: &NumCol<'_>,
+    rows: Option<&[u32]>,
+    n: usize,
+    masks: &[BooleanArray],
+    wi: Option<usize>,
+) -> i128 {
+    let passes = |r: usize| wi.map_or(true, |wi| masks[wi].value(r));
+    match col {
+        NumCol::Int64(c) => domain_rows(rows, n)
+            .filter(|&r| passes(r) && !c.is_null(r))
+            .map(|r| c.value(r) as i128)
+            .sum(),
+        NumCol::Float64(c) => domain_rows(rows, n)
+            .filter(|&r| passes(r) && !c.is_null(r))
+            .map(|r| c.value(r) as i128)
+            .sum(),
+    }
+}
+
+/// 行域驱动 min/max（null 跳过）。
+fn minmax_domain(
+    col: &NumCol<'_>,
+    rows: Option<&[u32]>,
+    n: usize,
+    masks: &[BooleanArray],
+    wi: Option<usize>,
+    min: &mut Option<i128>,
+    max: &mut Option<i128>,
+) {
+    let passes = |r: usize| wi.map_or(true, |wi| masks[wi].value(r));
+    let fold = |v: i128, min: &mut Option<i128>, max: &mut Option<i128>| {
+        *min = Some(match *min {
+            Some(m) if m <= v => m,
+            _ => v,
+        });
+        *max = Some(match *max {
+            Some(m) if m >= v => m,
+            _ => v,
+        });
+    };
+    match col {
+        NumCol::Int64(c) => {
+            for r in domain_rows(rows, n) {
+                if passes(r) && !c.is_null(r) {
+                    fold(c.value(r) as i128, min, max);
+                }
+            }
+        }
+        NumCol::Float64(c) => {
+            for r in domain_rows(rows, n) {
+                if passes(r) && !c.is_null(r) {
+                    fold(c.value(r) as i128, min, max);
+                }
+            }
         }
     }
-    Some(flags.into_iter().collect())
 }
 
-/// 行域 mask 与 where mask 逐位 AND（null slot 读 false, 语义同 `value(i)`）。
-/// 返回 `None` 仅当两者皆无（= 全批全通过）。
-fn combine_masks(
-    domain: Option<&BooleanArray>,
-    where_mask: Option<&BooleanArray>,
-) -> Option<BooleanArray> {
-    match (domain, where_mask) {
-        (None, None) => None,
-        (Some(d), None) => Some(d.clone()),
-        (None, Some(m)) => Some(m.clone()),
-        (Some(d), Some(m)) => Some((0..d.len()).map(|i| d.value(i) && m.value(i)).collect()),
+/// 行域驱动的 distinct 插入（原生列值按行域 + where 过滤）——等价
+/// `insert_distinct_column` 的 mask 全批扫描, 但只遍历本片行。
+fn insert_distinct_domain(
+    batch: &RecordBatch,
+    name: &str,
+    rows: Option<&[u32]>,
+    n: usize,
+    masks: &[BooleanArray],
+    wi: Option<usize>,
+    set: &mut EngineHashSet<DistinctKey>,
+) -> bool {
+    let Some(idx) = batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|f| f.name() == name)
+    else {
+        return true; // 字段缺失 → 全 null（与行式 extract None 一致）
+    };
+    let col = batch.column(idx).as_ref();
+    let passes = |r: usize| wi.map_or(true, |wi| masks[wi].value(r));
+    if let Some(c) = col.as_any().downcast_ref::<Int64Array>() {
+        for r in domain_rows(rows, n) {
+            if passes(r) && !c.is_null(r) {
+                set.insert(DistinctKey::from_i64(c.value(r)));
+            }
+        }
+        return true;
     }
+    if let Some(c) = col.as_any().downcast_ref::<Float64Array>() {
+        for r in domain_rows(rows, n) {
+            if passes(r) && !c.is_null(r) {
+                set.insert(DistinctKey::from_f64(c.value(r)));
+            }
+        }
+        return true;
+    }
+    if let Some(c) = col.as_any().downcast_ref::<StringArray>() {
+        for r in domain_rows(rows, n) {
+            if passes(r) && !c.is_null(r) {
+                set.insert(DistinctKey::from_str(c.value(r)));
+            }
+        }
+        return true;
+    }
+    if let Some(c) = col.as_any().downcast_ref::<BooleanArray>() {
+        for r in domain_rows(rows, n) {
+            if passes(r) && !c.is_null(r) {
+                set.insert(DistinctKey::from_f64(if c.value(r) { 1.0 } else { 0.0 }));
+            }
+        }
+        return true;
+    }
+    if let Some(c) = col
+        .as_any()
+        .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+    {
+        for r in domain_rows(rows, n) {
+            if passes(r) && !c.is_null(r) {
+                set.insert(DistinctKey::from_i64(c.value(r)));
+            }
+        }
+        return true;
+    }
+    false
 }
 
 /// distinct 度量字段列类型支持检查（Int64/Float64/Utf8/Bool/TimestampNs）。
@@ -1647,177 +1813,4 @@ fn numeric_col<'a>(batch: &'a RecordBatch, name: &str) -> Option<NumCol<'a>> {
         return Some(NumCol::Float64(c));
     }
     None
-}
-
-/// 按 mask 过滤的列值迭代器（mask null slot / 列 null / 类型 mismatch 均跳过,
-/// 与行式 `extract None` 语义一致）。
-fn int_values<'a>(
-    c: &'a Int64Array,
-    mask: Option<&'a BooleanArray>,
-) -> impl Iterator<Item = i64> + 'a {
-    let len = c.len();
-    (0..len).filter_map(move |i| {
-        if let Some(m) = mask
-            && !m.value(i)
-        {
-            return None;
-        }
-        if c.is_null(i) { None } else { Some(c.value(i)) }
-    })
-}
-
-fn float_values<'a>(
-    c: &'a Float64Array,
-    mask: Option<&'a BooleanArray>,
-) -> impl Iterator<Item = f64> + 'a {
-    let len = c.len();
-    (0..len).filter_map(move |i| {
-        if let Some(m) = mask
-            && !m.value(i)
-        {
-            return None;
-        }
-        if c.is_null(i) { None } else { Some(c.value(i)) }
-    })
-}
-
-/// 按 mask 过滤求和（无 mask = 全列; null 跳过）。数值按行式 `value_to_i128`
-/// 的 f64→i128 截断转 i128 累加（D8: 整数域, 不用 f64）。
-fn sum_masked(col: &NumCol<'_>, mask: Option<&BooleanArray>) -> i128 {
-    match col {
-        NumCol::Int64(c) => int_values(c, mask).map(|v| v as i128).sum(),
-        NumCol::Float64(c) => float_values(c, mask).map(|v| v as i128).sum(),
-    }
-}
-
-/// 按 mask 过滤更新 min/max（null 跳过; 与行式一致）。
-fn minmax_masked(
-    col: &NumCol<'_>,
-    mask: Option<&BooleanArray>,
-    min: &mut Option<i128>,
-    max: &mut Option<i128>,
-) {
-    let fold = |v: i128, min: &mut Option<i128>, max: &mut Option<i128>| {
-        *min = Some(match *min {
-            Some(m) if m <= v => m,
-            _ => v,
-        });
-        *max = Some(match *max {
-            Some(m) if m >= v => m,
-            _ => v,
-        });
-    };
-    match col {
-        NumCol::Int64(c) => {
-            for v in int_values(c, mask) {
-                fold(v as i128, min, max);
-            }
-        }
-        NumCol::Float64(c) => {
-            for v in float_values(c, mask) {
-                fold(v as i128, min, max);
-            }
-        }
-    }
-}
-
-/// distinct 列式插入。返回 `false` = 字段列类型不在支持集（调用方须回退行式）。
-/// 支持集: Int64/Float64/Utf8/Bool/Timestamp(Ns)——与行式 `value_to_distinct_key`
-/// 的 Number/Str/Bool 分派一致（Timestamp 为整数 nanos, 走 Int 域内, D7）。
-fn insert_distinct_column(
-    batch: &RecordBatch,
-    name: &str,
-    mask: Option<&BooleanArray>,
-    set: &mut HashSet<DistinctKey>,
-) -> bool {
-    let Some(idx) = batch
-        .schema()
-        .fields()
-        .iter()
-        .position(|f| f.name() == name)
-    else {
-        return true; // 字段缺失 → 全 null（与行式 extract None 一致）
-    };
-    let col = batch.column(idx).as_ref();
-    if let Some(c) = col.as_any().downcast_ref::<Int64Array>() {
-        for v in int_values(c, mask) {
-            set.insert(DistinctKey::from_i64(v));
-        }
-        return true;
-    }
-    if let Some(c) = col.as_any().downcast_ref::<Float64Array>() {
-        for v in float_values(c, mask) {
-            set.insert(DistinctKey::from_f64(v));
-        }
-        return true;
-    }
-    if let Some(c) = col.as_any().downcast_ref::<StringArray>() {
-        for v in str_values(c, mask) {
-            set.insert(DistinctKey::from_str(v));
-        }
-        return true;
-    }
-    if let Some(c) = col.as_any().downcast_ref::<BooleanArray>() {
-        for v in bool_values(c, mask) {
-            set.insert(DistinctKey::from_f64(if v { 1.0 } else { 0.0 }));
-        }
-        return true;
-    }
-    // Timestamp(Ns): 整数 nanos → Int 域内（与行式 Number(f64) 的 from_f64 一致
-    // 对 <2^53 整数; >2^53 走原生 i64, 即文档化的 D7 更准语义）。
-    if let Some(c) = col
-        .as_any()
-        .downcast_ref::<arrow::array::TimestampNanosecondArray>()
-    {
-        for v in ts_values(c, mask) {
-            set.insert(DistinctKey::from_i64(v));
-        }
-        return true;
-    }
-    false
-}
-
-fn str_values<'a>(
-    c: &'a StringArray,
-    mask: Option<&'a BooleanArray>,
-) -> impl Iterator<Item = &'a str> + 'a {
-    let len = c.len();
-    (0..len).filter_map(move |i| {
-        if let Some(m) = mask
-            && !m.value(i)
-        {
-            return None;
-        }
-        if c.is_null(i) { None } else { Some(c.value(i)) }
-    })
-}
-
-fn bool_values<'a>(
-    c: &'a BooleanArray,
-    mask: Option<&'a BooleanArray>,
-) -> impl Iterator<Item = bool> + 'a {
-    let len = c.len();
-    (0..len).filter_map(move |i| {
-        if let Some(m) = mask
-            && !m.value(i)
-        {
-            return None;
-        }
-        if c.is_null(i) { None } else { Some(c.value(i)) }
-    })
-}
-
-fn ts_values<'a>(
-    c: &'a arrow::array::TimestampNanosecondArray,
-    mask: Option<&'a BooleanArray>,
-) -> impl Iterator<Item = i64> + 'a {
-    let len = c.len();
-    (0..len).filter_map(move |i| {
-        if let Some(m) = mask
-            && !m.value(i)
-        {
-            return None;
-        }
-        if c.is_null(i) { None } else { Some(c.value(i)) }
-    })
 }

@@ -106,4 +106,9 @@ pub(crate) struct StatsTaskConfig {
     pub shard_index: Option<usize>,
     #[allow(dead_code)]
     pub shard_count: usize,
+    /// 输入分区分片归并（空键 stats, 2026-08-24 q15）: 协调片（shard 0）持
+    /// `merge_rx` 收齐各片 partial 后合并再 emit; 非协调片持 `merge_tx` 在
+    /// 窗口 close 时发送自身 partial 且不 emit; 未分片两者皆 `None`。
+    pub merge_rx: Option<mpsc::Receiver<super::stats_task::StatsPartial>>,
+    pub merge_tx: Option<mpsc::Sender<super::stats_task::StatsPartial>>,
 }

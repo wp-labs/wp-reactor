@@ -440,6 +440,20 @@ pub(super) fn spawn_rule_tasks(
                 let shardable = !field_keys.is_empty()
                     && field_keys.len() == stats.plan.keys.len()
                     && shard_count > 1;
+                // 输入行索引分区（空键 stats, 2026-08-24 q15）: 空键 + 度量全部
+                // 可交换（count/sum/min/max/distinct——last/top 行序敏感不可归并）
+                // + pull 模式 → 按行号均匀切分多任务, close 时协调片（shard 0）
+                // 收齐各片 raw 状态归并后统一 emit（`StatsExecutor::merge_partial`）。
+                // push 模式暂不输入分片（broadcast 按 key 分区, 无 index 分区路径）。
+                let input_shardable = field_keys.is_empty()
+                    && !use_push
+                    && shard_count > 1
+                    && stats.plan.measures.iter().all(|m| {
+                        !matches!(
+                            m.agg,
+                            wf_lang::plan::StatsAggPlan::Last | wf_lang::plan::StatsAggPlan::Top
+                        )
+                    });
                 if shardable {
                     let keys: Arc<[FieldRef]> = field_keys.into();
                     // M1 pull: 注册 window 键分区, parse 阶段预计算每片行子集。
@@ -481,6 +495,8 @@ pub(super) fn spawn_rule_tasks(
                             progress: progress.clone(),
                             shard_index: Some(shard_idx),
                             shard_count,
+                            merge_rx: None,
+                            merge_tx: None,
                         };
                         group.push(tokio::spawn(
                             async move { run_stats_task(task_config).await },
@@ -494,6 +510,56 @@ pub(super) fn spawn_rule_tasks(
                                 Arc::clone(&keys),
                             );
                         }
+                    }
+                } else if input_shardable {
+                    // 输入行索引分区注册（parse 阶段按行号预计算每片行子集）。
+                    for source in &window_sources {
+                        router
+                            .fanout()
+                            .register_window_index_sharding(&source.window_name, shard_count);
+                    }
+                    let (merge_tx, merge_rx) =
+                        mpsc::channel::<crate::engine_task::StatsPartial>(shard_count.max(8));
+                    let mut merge_rx_opt = Some(merge_rx);
+                    for shard_idx in 0..shard_count {
+                        let push_rx = None;
+                        let progress = register_progress(router, &window_sources);
+                        let task_config = StatsTaskConfig {
+                            stats: wf_engine::match_engine::StatsExecutor::with_row_fields(
+                                stats_plan.clone(),
+                                row_fields.clone(),
+                            ),
+                            executor: rule.executor.clone(),
+                            window_sources: window_sources.clone(),
+                            sink_fanout: Arc::clone(&sink_fanout),
+                            cancel: cancel.child_token(),
+                            router: Arc::clone(router),
+                            metrics: metrics.clone(),
+                            time_field: time_field.clone(),
+                            timeout_scan_interval,
+                            intermediate_targets: intermediate_targets.clone(),
+                            pipe_registry: Arc::clone(&pipe_registry),
+                            eos_flush: eos_tx.subscribe(),
+                            push_rx,
+                            progress: progress.clone(),
+                            shard_index: Some(shard_idx),
+                            shard_count,
+                            // 协调片 = shard 0: 持接收端, close 时收齐 N-1 归并后 emit;
+                            // 其余片持发送端, close 时发自身 raw 状态且不 emit。
+                            merge_rx: if shard_idx == 0 {
+                                merge_rx_opt.take()
+                            } else {
+                                None
+                            },
+                            merge_tx: if shard_idx == 0 {
+                                None
+                            } else {
+                                Some(merge_tx.clone())
+                            },
+                        };
+                        group.push(tokio::spawn(
+                            async move { run_stats_task(task_config).await },
+                        ));
                     }
                 } else {
                     let push_rx = if use_push {
@@ -525,6 +591,8 @@ pub(super) fn spawn_rule_tasks(
                         progress: progress.clone(),
                         shard_index: None,
                         shard_count: 1,
+                        merge_rx: None,
+                        merge_tx: None,
                     };
                     group.push(tokio::spawn(
                         async move { run_stats_task(task_config).await },

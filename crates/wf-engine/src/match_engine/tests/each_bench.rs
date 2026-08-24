@@ -22,15 +22,19 @@ use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use smol_str::SmolStr;
-use wf_lang::ast::{Expr, FieldRef};
-use wf_lang::plan::{EachPlan, YieldField};
+use wf_lang::ast::{BinOp, Expr, FieldRef, JoinMode};
+use wf_lang::plan::{EachPlan, JoinCondPlan, JoinPlan, YieldField};
 use wf_lang::{BaseType, FieldType};
 
 use crate::alert::{AlertColumnBuilder, AlertOrigin, EachRowCells};
-use crate::match_engine::event_bridge::ColumnarEvent;
+use crate::match_engine::event_bridge::{ColumnarEvent, materialize_rows};
 use crate::match_engine::executor::{EachWfxPrefix, format_nanos_utc};
 use crate::match_engine::match_engine::{field_ref_name, value_to_string};
-use crate::match_engine::{RuleExecutor, Value};
+use crate::match_engine::{
+    Event, JoinKey, JoinRow, RuleExecutor, Value, WindowLookup, columnar_join_rows,
+};
+use crate::window::{Window, WindowParams};
+use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 
 use super::helpers::{simple_plan, simple_rule_plan};
 
@@ -487,5 +491,262 @@ fn q1_each_components_per_row() {
         baseline_ns,
         (baseline_ns - sum_parts).max(0.0),
         ((baseline_ns - sum_parts).max(0.0)) / baseline_ns * 100.0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Q20 snapshot join 列式路径（2026-08-24 Arc<JoinRow> 修复后）
+// ---------------------------------------------------------------------------
+
+/// q20 形状的 each + Snapshot join + where 规则：`b.auction ==
+/// auction_events.id` + where `auction_events.category == 10` + yield 读左窗
+/// `b.auction` + 右窗 `auction_events.category`（对齐 direct_tests 的
+/// `each_join_plan_rule`）。
+fn q20_plan_rule() -> RuleExecutor {
+    let mut plan = simple_rule_plan(
+        "q20_shape",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "b".into(),
+        filter: None,
+    });
+    plan.joins = vec![JoinPlan {
+        right_window: "auction_events".into(),
+        mode: JoinMode::Snapshot,
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Qualified("b".into(), "auction".into()),
+            right: FieldRef::Qualified("auction_events".into(), "id".into()),
+        }],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    }];
+    plan.r#where = Some(Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Qualified(
+            "auction_events".into(),
+            "category".into(),
+        ))),
+        right: Box::new(Expr::Number(10.0)),
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        },
+        YieldField {
+            name: "category".into(),
+            value: Expr::Field(FieldRef::Qualified(
+                "auction_events".into(),
+                "category".into(),
+            )),
+        },
+    ];
+    RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("id".into(), FieldType::Base(BaseType::Digit)),
+            ("category".into(), FieldType::Base(BaseType::Digit)),
+        ]),
+    )
+}
+
+/// q20 形状的 join 目标窗口：`n` 行 auction（id 唯一递增 + category + payload），
+/// join 索引建在 `id` 上。category 20% 为 10（where 通过率对齐生产）。
+fn q20_auction_window(n: usize) -> Window {
+    use std::time::Duration;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("category", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let win = Window::new(
+        WindowParams {
+            name: "auction_events".into(),
+            schema: schema.clone(),
+            time_col_index: None,
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        WindowConfig {
+            name: "auction_events".into(),
+            mode: DistMode::Local,
+            max_window_bytes: usize::MAX.into(),
+            over_cap: Duration::from_secs(3600).into(),
+            evict_policy: EvictPolicy::TimeFirst,
+            watermark: Duration::from_secs(5).into(),
+            allowed_lateness: Duration::from_secs(0).into(),
+            late_policy: LatePolicy::Drop,
+            table: None,
+        },
+    );
+    win.set_join_key("id".into());
+    let ids: Vec<i64> = (0..n as i64).collect();
+    let category: Vec<i64> = (0..n as i64)
+        .map(|i| if i % 5 == 0 { 10 } else { 99 })
+        .collect();
+    let payload: Vec<String> = (0..n).map(|i| format!("p{}", i % 100)).collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)) as ArrayRef,
+            Arc::new(Int64Array::from(category)),
+            Arc::new(StringArray::from(payload)),
+        ],
+    )
+    .unwrap();
+    win.append(batch).unwrap();
+    win
+}
+
+/// 把真实 join 索引窗口包装成 [`WindowLookup`]（bench 用；join_lookup 走真实
+/// 索引 O(1) 路径，与生产 RegistryLookup 同源）。
+struct Q20WinLookup<'a> {
+    win: &'a Window,
+}
+
+impl WindowLookup for Q20WinLookup<'_> {
+    fn snapshot_field_values(
+        &self,
+        _w: &str,
+        _f: &str,
+    ) -> Option<std::collections::HashSet<String>> {
+        None
+    }
+    fn snapshot(&self, _w: &str) -> Option<Vec<JoinRow>> {
+        Some(columnar_join_rows(self.win.snapshot(), None))
+    }
+    fn snapshot_with_timestamps(&self, _w: &str) -> Option<Vec<(i64, JoinRow)>> {
+        None
+    }
+    fn join_lookup(&self, _w: &str, _kf: &str, key: &Value) -> Option<Vec<JoinRow>> {
+        let jk = JoinKey::from_value(key)?;
+        self.win.join_lookup(&jk, None)
+    }
+}
+
+/// q20 形状 bid 批：`n` 行（auction 列）。`hot` 时 25% 行落在 8 个热键上
+/// （同桶多行共享 Arc<JoinRow> 路径），其余引用窗口内唯一键；`hot=false` 全唯一。
+fn q20_bid_batch(n: usize, hot: bool) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "auction",
+        DataType::Int64,
+        false,
+    )]));
+    let auction: Vec<i64> = if hot {
+        (0..n as i64)
+            .map(|i| {
+                if i % 4 == 0 {
+                    i % 8 // 热键 0..8，同桶多行
+                } else {
+                    1_000_000 + i // 窗口内唯一键（窗口 ≥ 1M 行）
+                }
+            })
+            .collect()
+    } else {
+        (0..n as i64).collect()
+    };
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(auction)) as ArrayRef],
+    )
+    .unwrap()
+}
+
+/// q20 列式 each+snapshot join 段处理基准（4096 行/段 = 生产 ALERT_BATCH_SIZE，
+/// 真实 join 索引窗口 1M 行）：全唯一键 vs 热键混合（Arc 共享）的 ns/row，
+/// 附行式参考。
+///
+/// 运行：cargo test --release -p wf-engine each_bench -- --ignored --nocapture
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine each_bench -- --ignored --nocapture"]
+fn q20_columnar_join_per_row() {
+    const SEG: usize = 4096;
+    const REPS: usize = 3000;
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+
+    let exec = q20_plan_rule();
+    assert!(
+        exec.each_join_columnar_ready() && exec.each_plan_columnar_safe(),
+        "q20 形状必须过列式 join 门"
+    );
+    let win = q20_auction_window(1_000_000);
+    let lookup = Q20WinLookup { win: &win };
+
+    for (name, hot) in [("unique", false), ("hot8+unique", true)] {
+        let batch = q20_bid_batch(SEG, hot);
+        let col_events: Vec<ColumnarEvent<'_>> =
+            (0..SEG).map(|r| ColumnarEvent::new(&batch, r)).collect();
+        let rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+            .iter()
+            .enumerate()
+            .map(|(i, ev)| (ev, NANOS + i as i64))
+            .collect();
+
+        // 预热（一次完整段 + 行式参考路径）。
+        let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+        let mut idx = Vec::new();
+        let s = exec.execute_each_direct_batch_columnar_join(
+            &rows,
+            &lookup,
+            NANOS,
+            &mut builder,
+            &mut idx,
+        );
+        assert!(s.appended > 0, "{name}: 段必须有输出");
+
+        let start = Instant::now();
+        let mut total = 0usize;
+        for _ in 0..REPS {
+            let mut b = AlertColumnBuilder::new(Arc::from("alerts"));
+            let mut out = Vec::new();
+            let s = exec
+                .execute_each_direct_batch_columnar_join(&rows, &lookup, NANOS, &mut b, &mut out);
+            total += s.appended;
+            std::hint::black_box(&out);
+        }
+        let per = start.elapsed().as_secs_f64() * 1e9 / (REPS as f64 * SEG as f64);
+        let mps = 1e9 / per / 1e6;
+        eprintln!(
+            "[each-join-bench] columnar each+snapshot-join {:>12}: {:>7.1} ns/row  ({:>5.1}M rows/s)  appended/rep={}",
+            name,
+            per,
+            mps,
+            total / REPS
+        );
+    }
+
+    // 行式参考（热键混合）：同 executor 的 execute_each_direct_batch。
+    let batch = q20_bid_batch(SEG, true);
+    let events: Vec<Event> = materialize_rows(&batch, &(0..SEG as u32).collect::<Vec<_>>());
+    let rows: Vec<(&Event, i64)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let start = Instant::now();
+    let mut total = 0usize;
+    for _ in 0..REPS {
+        let mut b = AlertColumnBuilder::new(Arc::from("alerts"));
+        let mut out = Vec::new();
+        let s = exec.execute_each_direct_batch(&rows, &lookup, &[], NANOS, &mut b, &mut out);
+        total += s.appended;
+        std::hint::black_box(&out);
+    }
+    let per = start.elapsed().as_secs_f64() * 1e9 / (REPS as f64 * SEG as f64);
+    let mps = 1e9 / per / 1e6;
+    eprintln!(
+        "[each-join-bench] row    each+snapshot-join {:>12}: {:>7.1} ns/row  ({:>5.1}M rows/s)  appended/rep={}",
+        "hot8+unique",
+        per,
+        mps,
+        total / REPS
     );
 }
