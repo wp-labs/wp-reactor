@@ -787,11 +787,33 @@ fill_hit=23.87M、recheck=104k。差异不在代码逻辑（两版提取同一 b
 片对**全批**做 where mask/domain 的 10× 冗余。方向：归并按度量并行（8 度量
 独立 union）、mask 单算共享或按片行域裁剪。
 
+### 行域裁剪（`6b394e9`, 2026-08-24）——10× 冗余消除
+
+段 1d/段 2 从「全批 domain mask + 整列归并」改为**行域驱动**：
+`domain_rows`/`count_domain`/`sum_domain`/`minmax_domain`/`insert_distinct_domain`
+只遍历本片行（`process_batch_rows` 传 `rows: Option<&[u32]>`），不再构建全批
+domain mask。删旧辅助：`count_true`/`domain_mask`/`combine_masks`/
+`int_values`/`float_values`/`sum_masked`/`minmax_masked`/`insert_distinct_column`/
+`str_values`/`bool_values`/`ts_values`。
+
+**实测**：q15 **7.86M EPS**（基线 7.75M）, CPU **563%→403%**（每片 CPU 降, 墙钟
+略升——墙钟瓶颈是串行归并, 行域裁剪是净收益但降的是 CPU 不是墙钟）。
+
+**并行归并试错（已回退）**：`thread::scope` 并行 distinct union（`split_all` 拆
+`&mut` + 每度量一线程）实测 **5.96~7.86M 波动（比串行 7.86M 差）**——阻塞 tokio
+worker 与其余片 ingest 争核。已恢复串行 `merge_accum`（含 distinct union）, 删除
+`merge_accum_arith`/`split_all` 死代码。**教训：不要在 async close 里用
+`thread::scope` 并行；要并行须 `spawn_blocking`/异步任务（数据移出 `&mut self`）。**
+
+测试：`cargo test -p wf-engine --lib stats` 58 pass + `cargo test -p wf-runtime
+--lib q15_input_shard` 4 pass（行域裁剪语义与全批一致）。
+
 ## 下一步（重开 session 从这里继续）
 
 1. **全量 22 查询 30M 重跑 + OSS/VVR 对照刷新**（q4/q5/q9/q20/q15 均已大幅
-   变化; q15 现 7.75M）
-2. （可选）q15 归并/冗余优化（见上节已知瓶颈）; q3 −16% 独立 bug
+   变化; q15 现 7.86M）
+2. （可选）q15 归并异步化（墙钟瓶颈 ~883ms 串行归并, 需 spawn_blocking/异步
+   任务, 工程量大）; q3 −16% 独立 bug
 3. D4 剩余：eager interval join 的 pin; 「结果可能不完整」的正确性信号/指标
 4. （可选）q20 确定性快照边界; q13 列式 join 免 Event 物化
 5. 旁支发现：`match_engine/tests/executor/direct_tests.rs:412` 编译告警 never
