@@ -454,67 +454,60 @@ fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnEx
             }
             _ => None,
         },
-        // `cidr_match(field, "addr/prefix")` / `regex_match(field, "pattern")`
-        // — the gate (wf-lang columnar) admits exactly this shape: a flat field
-        // + a string-literal constant. The constant is parsed/compiled here
-        // (once per batch — `compile_expr` runs per `eval_guard_columnar`
-        // call), never per row.
+        // 原生列式函数（cidr_match / regex_match / contains / startswith /
+        // endswith）——单一权威清单 `columnar_func` 与门控共享，消除函数名
+        // 清单 drift。常量（子网/正则/字面量 needle）在编译期解析一次
+        // （每 batch），字段 needle 解析为其列。
         Expr::FuncCall {
             qualifier: None,
             name,
             args,
-        } if (name == "cidr_match" || name == "regex_match")
-            && args.len() == 2
-            && matches!(
-                &args[0],
-                Expr::Field(
-                    FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
-                )
-            ) =>
-        {
-            let Expr::StringLit(constant) = &args[1] else {
+        } => {
+            let func = wf_lang::columnar::columnar_func(name)?;
+            // 门控已保证形态（`columnar_func_args_ok`），这里再防御性校验。
+            if !wf_lang::columnar::columnar_func_args_ok(func, args) {
                 return None;
-            };
+            }
             let Expr::Field(field) = &args[0] else {
-                unreachable!("shape matched above");
+                unreachable!("columnar_func_args_ok 保证 args[0] 为 flat 字段");
             };
             let col = view.resolve_field(field);
-            if name == "cidr_match" {
-                Some(ColumnExpr::CidrMatch {
-                    col,
-                    net: wf_lang::cidr::Cidr::parse(constant)?,
-                })
-            } else {
-                Some(ColumnExpr::RegexMatch {
-                    col,
-                    re: regex::Regex::new(constant).ok()?,
-                })
-            }
-        }
-        // `contains` / `startswith` / `endswith` — the gate admits a flat-field
-        // haystack and a literal-or-flat-field needle. The literal needle is
-        // shared across the row loop; a field needle resolves to its column.
-        Expr::FuncCall {
-            qualifier: None,
-            name,
-            args,
-        } if args.len() == 2 && StrFuncOp::from_name(name).is_some() => {
-            let Expr::Field(hay_field) = &args[0] else {
-                return None;
-            };
-            let op = StrFuncOp::from_name(name).unwrap();
-            let hay = view.resolve_field(hay_field);
-            let needle = match &args[1] {
-                Expr::StringLit(s) => Needle::Lit(s.clone().into()),
-                Expr::Field(FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)) => {
-                    let Expr::Field(f) = &args[1] else {
-                        unreachable!("shape matched above");
+            match func {
+                wf_lang::columnar::ColumnarFunc::CidrMatch
+                | wf_lang::columnar::ColumnarFunc::RegexMatch => {
+                    let Expr::StringLit(constant) = &args[1] else {
+                        unreachable!("columnar_func_args_ok 保证 args[1] 为字面量");
                     };
-                    Needle::Col(view.resolve_field(f))
+                    match func {
+                        wf_lang::columnar::ColumnarFunc::CidrMatch => {
+                            Some(ColumnExpr::CidrMatch {
+                                col,
+                                net: wf_lang::cidr::Cidr::parse(constant)?,
+                            })
+                        }
+                        _ => Some(ColumnExpr::RegexMatch {
+                            col,
+                            re: regex::Regex::new(constant).ok()?,
+                        }),
+                    }
                 }
-                _ => return None,
-            };
-            Some(ColumnExpr::StrFunc { op, hay, needle })
+                wf_lang::columnar::ColumnarFunc::StrSearch => {
+                    let op = StrFuncOp::from_name(name).expect("columnar_func 已确认名字");
+                    let needle = match &args[1] {
+                        Expr::StringLit(s) => Needle::Lit(s.clone().into()),
+                        Expr::Field(
+                            FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _),
+                        ) => {
+                            let Expr::Field(f) = &args[1] else {
+                                unreachable!("columnar_func_args_ok 保证 args[1] 为字段");
+                            };
+                            Needle::Col(view.resolve_field(f))
+                        }
+                        _ => unreachable!("columnar_func_args_ok 保证 args[1] 形态"),
+                    };
+                    Some(ColumnExpr::StrFunc { op, hay: col, needle })
+                }
+            }
         }
         _ => None,
     }
@@ -1962,6 +1955,29 @@ mod tests {
         assert_eq!(hits[0], all[0]);
         assert_eq!(hits[1], all[2]);
         assert_eq!(hits[2], all[4]);
+    }
+
+    /// 单一权威清单同步：wf-lang 的 `ColumnarFunc` 分类与 wf-engine 的
+    /// `StrFuncOp` 语义映射必须一致——`StrSearch` 分类 ↔ `StrFuncOp::from_name`
+    /// 一一对应，防止未来加函数时两处清单 drift。
+    #[test]
+    fn strfunc_op_stays_in_sync_with_columnar_func() {
+        use wf_lang::columnar::{ColumnarFunc, columnar_func};
+
+        // StrSearch 分类下的每个名字必须有 op；其他分类无 op。
+        for name in ["contains", "startswith", "endswith"] {
+            assert_eq!(columnar_func(name), Some(ColumnarFunc::StrSearch), "{name}");
+            assert!(StrFuncOp::from_name(name).is_some(), "{name} 应有 StrFuncOp");
+        }
+        for name in ["cidr_match", "regex_match"] {
+            assert!(columnar_func(name).is_some(), "{name}");
+            assert!(StrFuncOp::from_name(name).is_none(), "{name} 不应有 StrFuncOp");
+        }
+        // 非列式函数两边都不认。
+        for name in ["lower", "concat", "startswith_any", "bogus"] {
+            assert!(columnar_func(name).is_none(), "{name}");
+            assert!(StrFuncOp::from_name(name).is_none(), "{name}");
+        }
     }
 
     /// `sip` Utf8 column + `count` Int64 column — the cidr_match guard shape.

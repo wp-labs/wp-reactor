@@ -22,6 +22,57 @@
 
 use crate::ast::{BinOp, Expr, FieldRef, PathSegment};
 
+/// 列式执行器原生支持的内置函数分类 —— **单一权威清单**。
+///
+/// 门控（[`expr_is_columnar`]）与 wf-engine 的 `compile_expr` 都基于此枚举
+/// 判断函数是否可列式化及其参数形态，避免函数名清单在两处各自维护而 drift：
+/// 新增可列式函数只需在这里加一个分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnarFunc {
+    /// `cidr_match(field, "addr/prefix")` — 第二参数必须是 STRING 字面量。
+    CidrMatch,
+    /// `regex_match(field, "pattern")` — 第二参数必须是 STRING 字面量。
+    RegexMatch,
+    /// `contains` / `startswith` / `endswith` — 第二参数是字面量或 flat 字段。
+    StrSearch,
+}
+
+/// 返回 `name` 对应的列式函数分类（`None` = 非原生列式函数，回落解释器）。
+pub fn columnar_func(name: &str) -> Option<ColumnarFunc> {
+    match name {
+        "cidr_match" => Some(ColumnarFunc::CidrMatch),
+        "regex_match" => Some(ColumnarFunc::RegexMatch),
+        "contains" | "startswith" | "endswith" => Some(ColumnarFunc::StrSearch),
+        _ => None,
+    }
+}
+
+fn is_flat_field(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Field(
+            FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
+        )
+    )
+}
+
+/// 某个列式函数的参数形态是否可列式：第一操作数必须是 flat 字段；第二操作数
+/// 依分类而定（`CidrMatch`/`RegexMatch` 必须字面量，`StrSearch` 字面量或 flat
+/// 字段）。`false` 只表示回落解释器，不等于错误。
+pub fn columnar_func_args_ok(func: ColumnarFunc, args: &[Expr]) -> bool {
+    if args.len() != 2 || !is_flat_field(&args[0]) {
+        return false;
+    }
+    match func {
+        ColumnarFunc::CidrMatch | ColumnarFunc::RegexMatch => {
+            matches!(&args[1], Expr::StringLit(_))
+        }
+        ColumnarFunc::StrSearch => {
+            matches!(&args[1], Expr::StringLit(_)) || is_flat_field(&args[1])
+        }
+    }
+}
+
 /// Whether `expr` can be evaluated columnar (per batch) with results identical
 /// to the row-wise interpreted evaluator.
 ///
@@ -50,49 +101,13 @@ pub fn expr_is_columnar(expr: &Expr) -> bool {
             binop_is_columnar(*op) && expr_is_columnar(left) && expr_is_columnar(right)
         }
 
-        // `cidr_match(field, "addr/prefix")` and `regex_match(field, "pattern")`
-        // — the two functions the columnar evaluator lowers natively: the
-        // constant (subnet / pattern) is parsed/compiled **once** per batch at
-        // compile time, and the field reads as a string column. Everything else
-        // falls back to the interpreted path.
+        // 原生列式函数：单一权威清单（`columnar_func`）判定分类，形态由
+        // `columnar_func_args_ok` 校验。其余函数调用回落解释器。
         Expr::FuncCall {
             qualifier: None,
             name,
             args,
-        } if args.len() == 2 && (name == "cidr_match" || name == "regex_match") => {
-            matches!(args[0], Expr::Field(FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)))
-                && matches!(&args[1], Expr::StringLit(_))
-        }
-
-        // `contains` / `startswith` / `endswith` — the string-search functions
-        // the columnar evaluator lowers natively. Unlike `cidr_match` /
-        // `regex_match`, the second operand is **not** forced to a literal: it
-        // may be a flat field, so both `func(field, "lit")` and
-        // `func(field, field2)` compile to column reads (a literal needle is
-        // shared across the row loop). Other second-operand shapes (functions,
-        // nested paths, non-field literals) fall back to interpreted.
-        Expr::FuncCall {
-            qualifier: None,
-            name,
-            args,
-        } if args.len() == 2
-            && matches!(name.as_str(), "contains" | "startswith" | "endswith") =>
-        {
-            let hay_is_flat_field = matches!(
-                &args[0],
-                Expr::Field(
-                    FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
-                )
-            );
-            let needle_is_flat = matches!(
-                &args[1],
-                Expr::StringLit(_)
-                    | Expr::Field(
-                        FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
-                    )
-            );
-            hay_is_flat_field && needle_is_flat
-        }
+        } => columnar_func(name).is_some_and(|func| columnar_func_args_ok(func, args)),
 
         // Everything else needs meta / function / window / structured handling.
         Expr::SystemVar(_)
@@ -473,6 +488,48 @@ mod tests {
         assert!(expr_is_columnar(&cmp(BinOp::Or, sw, cmp(BinOp::Gt, field("count"), num(1.0)))));
         // not 包住也列式。
         assert!(expr_is_columnar(&Expr::Not(Box::new(and))));
+    }
+
+    #[test]
+    fn columnar_func_is_the_single_authoritative_list() {
+        // 清单：三个 StrSearch + 两个常量类。
+        for name in ["contains", "startswith", "endswith"] {
+            assert_eq!(columnar_func(name), Some(ColumnarFunc::StrSearch), "{name}");
+        }
+        assert_eq!(columnar_func("cidr_match"), Some(ColumnarFunc::CidrMatch));
+        assert_eq!(columnar_func("regex_match"), Some(ColumnarFunc::RegexMatch));
+        // 非列式函数不在清单。
+        for name in ["lower", "concat", "startswith_any", "strftime", "len", "bogus"] {
+            assert_eq!(columnar_func(name), None, "{name} 不应在列式清单");
+        }
+    }
+
+    #[test]
+    fn columnar_func_args_ok_shape_matrix() {
+        let flat = field("sip");
+        let lit = Expr::StringLit("10.0.0.0/8".into());
+        let func_call = func("lower");
+        for func in [
+            ColumnarFunc::CidrMatch,
+            ColumnarFunc::RegexMatch,
+            ColumnarFunc::StrSearch,
+        ] {
+            // 字段 + 字面量：三种分类都接受。
+            assert!(columnar_func_args_ok(func, &[flat.clone(), lit.clone()]));
+            // 字段 + 字段：仅 StrSearch 接受（cidr/regex 要求字面量）。
+            assert_eq!(
+                columnar_func_args_ok(func, &[flat.clone(), flat.clone()]),
+                func == ColumnarFunc::StrSearch
+            );
+            // 字面量 + 字段：首参非字段 → 都不接受。
+            assert!(!columnar_func_args_ok(func, &[lit.clone(), flat.clone()]));
+            // 字段 + 函数：次参非字面量/字段 → 都不接受。
+            assert!(!columnar_func_args_ok(func, &[flat.clone(), func_call.clone()]));
+            // 字段 + 嵌套路径：次参非 flat → 都不接受。
+            assert!(!columnar_func_args_ok(func, &[flat.clone(), nested_path()]));
+            // 参数个数：1 个 → 不接受。
+            assert!(!columnar_func_args_ok(func, std::slice::from_ref(&flat)));
+        }
     }
 
     #[test]
