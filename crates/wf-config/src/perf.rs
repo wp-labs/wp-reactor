@@ -1,7 +1,7 @@
 //! 性能诊断模式配置（perf-diag）。
 //!
 //! 独立于 `wfusion.toml` 的诊断配置文件（`wfusion daemon --perf-diag
-//! conf/perf-diag.toml`），引擎与 `wfgen perf-diag` 读同一份。诊断点列表
+//! conf/perf-diag.toml`），引擎与 `wfgen perf-diag` 读同一份。诊断档列表
 //! 由 sentinel（漂流瓶）驱动依次应用——见
 //! `docs/design/perf-diag-mode-design.md`。
 
@@ -14,25 +14,25 @@ use crate::{ConfigReason, ConfigResult};
 
 /// 诊断模式配置（`--perf-diag <path>` 加载，不进 `wfusion.toml`）。
 ///
-/// 入口是 `--perf-diag` 启动参数本身（wfgen 侧 `--diag`）——文件只承载诊断点
-/// 列表；顶层门控/总开关是历史遗留（实际永远被 `points[0]` 覆盖或不可达），已删。
+/// 入口是 `--perf-diag` 启动参数本身（wfgen 侧 `--diag`）——文件只承载诊断档
+/// 列表；顶层门控/总开关是历史遗留（实际永远被 `stages[0]` 覆盖或不可达），已删。
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct PerfConfig {
-    /// 诊断点列表（sentinel 驱动依次应用）。缺省/空 = 仅初始门控（无切换）。
+    /// 诊断档列表（sentinel 驱动依次应用）。缺省/空 = 仅初始门控（无切换）。
     #[serde(default)]
-    pub points: Vec<PerfPoint>,
+    pub stages: Vec<PerfStage>,
 }
 
-/// 一个诊断点 = 禁止开关组合 + 可选规则子集文件（触发热 reload）。
+/// 一个诊断档 = 禁止开关组合 + 可选规则子集文件（触发热 reload）。
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
-pub struct PerfPoint {
-    /// 点名称（墙表输出用，如 `floor` / `rules` / `full`）。
+pub struct PerfStage {
+    /// 档名称（墙表输出用，如 `floor` / `rules` / `full`）。
     #[serde(default)]
     pub name: String,
-    /// 本点生效期间：禁止规则求值。
+    /// 本档生效期间：禁止规则求值。
     #[serde(default)]
     pub cut_rules: bool,
-    /// 本点生效期间：禁止输出链。
+    /// 本档生效期间：禁止输出链。
     #[serde(default)]
     pub cut_output: bool,
     /// 规则子集文件路径（相对 work-dir）。空 = 保持当前规则；非空且与当前
@@ -54,14 +54,14 @@ impl PerfConfig {
         Ok(config)
     }
 
-    /// 诊断点数量（0 = 单点模式）。
-    pub fn point_count(&self) -> usize {
-        self.points.len()
+    /// 诊断档数量（0 = 单档模式）。
+    pub fn stage_count(&self) -> usize {
+        self.stages.len()
     }
 
-    /// 第 `index` 个诊断点；越界返回 `None`。
-    pub fn point_at(&self, index: usize) -> Option<&PerfPoint> {
-        self.points.get(index)
+    /// 第 `index` 个诊断档；越界返回 `None`。
+    pub fn stage_at(&self, index: usize) -> Option<&PerfStage> {
+        self.stages.get(index)
     }
 }
 
@@ -70,16 +70,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_config_has_no_points() {
+    fn empty_config_has_no_stages() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("perf_diag_empty_{}.toml", std::process::id()));
         std::fs::write(&path, "").unwrap();
         let cfg = PerfConfig::load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert!(cfg.points.is_empty());
-        assert_eq!(cfg.point_count(), 0);
-        assert!(cfg.point_at(0).is_none());
+        assert!(cfg.stages.is_empty());
+        assert_eq!(cfg.stage_count(), 0);
+        assert!(cfg.stage_at(0).is_none());
     }
 
     #[test]
@@ -91,26 +91,26 @@ mod tests {
         let cfg = PerfConfig::load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert!(cfg.points.is_empty(), "顶层字段不产生诊断点");
+        assert!(cfg.stages.is_empty(), "顶层字段不产生诊断档");
     }
 
     #[test]
-    fn points_list_parses_in_order() {
+    fn stages_list_parses_in_order() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("perf_diag_points_{}.toml", std::process::id()));
+        let path = dir.join(format!("perf_diag_stages_{}.toml", std::process::id()));
         std::fs::write(
             &path,
             r#"
-[[points]]
+[[stages]]
 name = "floor"
 cut_rules = true
 cut_output = true
 rules = ""
-[[points]]
+[[stages]]
 name = "rules"
 cut_rules = false
 cut_output = true
-[[points]]
+[[stages]]
 name = "full"
 cut_rules = false
 cut_output = false
@@ -120,22 +120,22 @@ cut_output = false
         let cfg = PerfConfig::load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(cfg.point_count(), 3);
-        let floor = cfg.point_at(0).expect("floor point");
+        assert_eq!(cfg.stage_count(), 3);
+        let floor = cfg.stage_at(0).expect("floor stage");
         assert_eq!(floor.name, "floor");
         assert!(floor.cut_rules);
         assert!(floor.cut_output);
         assert_eq!(floor.rules.as_deref(), Some(""), "empty rules = keep current");
-        let rules = cfg.point_at(1).unwrap();
+        let rules = cfg.stage_at(1).unwrap();
         assert_eq!(rules.name, "rules");
         assert!(!rules.cut_rules);
         assert!(rules.cut_output);
         assert!(rules.rules.is_none(), "omitted rules must be None");
-        let full = cfg.point_at(2).unwrap();
+        let full = cfg.stage_at(2).unwrap();
         assert_eq!(full.name, "full");
         assert!(!full.cut_rules);
         assert!(!full.cut_output);
-        assert!(cfg.point_at(3).is_none(), "out of range must be None");
+        assert!(cfg.stage_at(3).is_none(), "out of range must be None");
     }
 
     #[test]
@@ -145,7 +145,7 @@ cut_output = false
         std::fs::write(
             &path,
             r#"
-[[points]]
+[[stages]]
 name = "c_family"
 rules = "models/rules/c_family.wfl"
 "#,
@@ -154,9 +154,9 @@ rules = "models/rules/c_family.wfl"
         let cfg = PerfConfig::load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        let point = cfg.point_at(0).unwrap();
+        let stage = cfg.stage_at(0).unwrap();
         assert_eq!(
-            point.rules.as_deref(),
+            stage.rules.as_deref(),
             Some("models/rules/c_family.wfl"),
             "non-empty rules path must be preserved"
         );
@@ -165,7 +165,7 @@ rules = "models/rules/c_family.wfl"
     #[test]
     fn round_trips_through_serialize() {
         let cfg = PerfConfig {
-            points: vec![PerfPoint {
+            stages: vec![PerfStage {
                 name: "floor".into(),
                 cut_rules: true,
                 cut_output: true,

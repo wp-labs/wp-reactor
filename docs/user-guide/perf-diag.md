@@ -19,8 +19,8 @@ full（+输出链）                    ← 什么都不切
 
 - 由**启动参数**进入（`wfusion daemon --perf-diag conf/perf-diag.toml`），
   生产不带参数 = 完全关闭，`wfusion.toml` 零污染；
-- **诊断点自动切换**：wfgen 每批帧尾追加一条哨兵（漂流瓶），引擎处理完
-  "批末最后一条"后自动切到下一个诊断点——单 daemon 一次跑完所有档；
+- **诊断档自动切换**：wfgen 每批帧尾追加一条哨兵（漂流瓶），引擎处理完
+  "批末最后一条"后自动切到下一个诊断档——单 daemon 一次跑完所有档；
 - **EPS 直接可算**：哨兵记录自带 `{round, n, start_ns, emit_ns}` 四元组，
   `eps = n / (emit_ns − start_ns)`，全程无外部记账。
 
@@ -64,7 +64,7 @@ wfusion daemon --perf-diag conf/perf-diag.toml --config conf/wfusion.toml --work
 启动日志会打印诊断状态：
 
 ```text
-INFO [sys] perf-diag 诊断模式  diag=true points=3 initial_gates="cut_rules=true cut_output=true"
+INFO [sys] perf-diag 诊断模式  stages=3 initial_gates="cut_rules=true cut_output=true"
 ```
 
 不带 `--perf-diag` 时明示：`perf-diag 未启用（无 --perf-diag）——哨兵帧将按未知流 window miss 丢弃`。
@@ -87,9 +87,9 @@ wfgen perf-diag --diag conf/perf-diag.toml \
   --n-list "1m,3m" --timeout-secs 120
 ```
 
-逐点输出 + 墙表落盘 `data/perf_diag_wall.txt`。
+逐档输出 + 墙表落盘 `data/perf_diag_wall.txt`。
 
-## 4. 诊断点与墙梯语义
+## 4. 诊断档与墙梯语义
 
 | 档 | `cut_rules` | `cut_output` | 测得 | 对应二分法的刀 |
 |---|---|---|---|---|
@@ -99,7 +99,7 @@ wfgen perf-diag --diag conf/perf-diag.toml \
 
 - **叠加式**：`rules` 档 = floor + 规则成本；`full` 档 = rules + 输出成本；
   每档 EPS 的差 = 该段的增量成本；
-- **每点测一次**：哨兵驱动的切换在首个哨兵后即发生，同点重复轮次会吃到下一档
+- **每档测一次**：哨兵驱动的切换在首个哨兵后即发生，同档重复轮次会吃到下一档
   门控——去噪用 `--n-list` 递增 N，不要用 `--rounds`；
 - **数据由小到大**：小 N 秒级出方向，大 N 确认墙是 per-event（随 N 线性）还是
   固定开销（与 N 无关）。
@@ -107,19 +107,19 @@ wfgen perf-diag --diag conf/perf-diag.toml \
 ## 5. 配置参考（`perf-diag.toml`）
 
 ```toml
-# 入口是 --perf-diag 启动参数本身；本文件只承载诊断点列表
-[[points]]
+# 入口是 --perf-diag 启动参数本身；本文件只承载诊断档列表
+[[stages]]
 name = "floor"
 cut_rules = true
 cut_output = true
 rules = ""           # 空 = 保持当前规则；否则规则文件路径（触发热 reload）
 
-[[points]]
+[[stages]]
 name = "rules"
 cut_rules = false
 cut_output = true
 
-[[points]]
+[[stages]]
 name = "full"
 cut_rules = false
 cut_output = false
@@ -127,11 +127,11 @@ cut_output = false
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `[[points]].name` | string | 档名（墙表输出用） |
-| `[[points]].cut_rules` / `cut_output` | bool | 该档生效期间的门控（`cut_rules` = 禁止规则求值、`cut_output` = 禁止输出链） |
-| `[[points]].rules` | string? | 规则子集文件路径；非空且不同 → 热 reload（不加钱换配置） |
+| `[[stages]].name` | string | 档名（墙表输出用） |
+| `[[stages]].cut_rules` / `cut_output` | bool | 该档生效期间的门控（`cut_rules` = 禁止规则求值、`cut_output` = 禁止输出链） |
+| `[[stages]].rules` | string? | 规则子集文件路径；非空且不同 → 热 reload（不加钱换配置） |
 
-启动即应用 `points[0]` 的门控；`--perf-diag` 不带 = 全关（生产零污染）。
+启动即应用 `stages[0]` 的门控；`--perf-diag` 不带 = 全关（生产零污染）。
 
 ## 6. 命令参考
 
@@ -146,11 +146,11 @@ cut_output = false
 
 | 参数 | 缺省 | 说明 |
 |---|---|---|
-| `--diag <path>` | 必填 | 与 daemon **同一份** `perf-diag.toml`；`[[points]]` 列表 = 轮数 |
+| `--diag <path>` | 必填 | 与 daemon **同一份** `perf-diag.toml`；`[[stages]]` 列表 = 轮数 |
 | `--frames <file>` | 必填 | 预编码帧（`dump-frames` 产物，须覆盖 max(`--n-list`) 行） |
 | `--addr host:port` | `127.0.0.1:9800` | TCP 数据端口 |
 | `--n-list "100k,1m,3m"` | 帧全部行 | 每档按递增 N 各测一次 |
-| `--rounds N` | `1` | 保留参数；语义见 §4（实际每点仅首轮有效） |
+| `--rounds N` | `1` | 保留参数；语义见 §4（实际每档仅首轮有效） |
 | `--sentinels <file>` | `data/perf_sentinel.ndjson` | 哨兵记录文件 |
 | `--output <file>` | `data/perf_diag_wall.txt` | 墙表输出 |
 | `--timeout-secs N` | `60` | 单次等待（切换/哨兵记录）超时 |
@@ -159,7 +159,7 @@ cut_output = false
 
 以 nexmark_pk 为例，需要 3 处（每 bench 一份，独立于基准数据）：
 
-1. **`conf/perf-diag.toml`** — 诊断点列表（§5 模板）；
+1. **`conf/perf-diag.toml`** — 诊断档列表（§5 模板）；
 2. **哨兵记录 sink** — `topology/sinks/business.d/sentinel.toml`：
 
    ```toml
@@ -200,11 +200,11 @@ full   eps=641240   n=1000000 rounds=1
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `timeout waiting for point{current=0}` | daemon 未带 `--perf-diag`（哨兵帧被当未知流丢弃）；或哨兵文件在 daemon 启动后被清空 | 先起 daemon 再 `rm -f data/perf_sentinel.ndjson`；确认启动日志含"诊断模式" |
+| `timeout waiting for stage{current=0}` | daemon 未带 `--perf-diag`（哨兵帧被当未知流丢弃）；或哨兵文件在 daemon 启动后被清空 | 先起 daemon 再 `rm -f data/perf_sentinel.ndjson`；确认启动日志含"诊断模式" |
 | `timeout waiting for sentinel{round=k}` | 数据窗未排空（规则慢/挂起），或哨兵记录未落盘 | 看 daemon 日志 window miss / 规则超时；`--timeout-secs` 调大 |
 | 墙梯无区分度（floor ≈ full） | 事件时间太疏：窗口（如 2m）内同 key 计数上不去，规则不触发 | 把生成数据的时间步进改密（perf_diag_case 用 1ms，同 key 1s 一条） |
 | `rules` 比 `full` 快/慢 | 输出墙小（blackhole），rules≈full 在 ±15% 噪声内 | 加大 N 或多次取 max；输出墙容差放宽 |
-| 首轮后同点轮次变慢 | `--rounds > 1`：首个哨兵已切下一档，后续轮次吃新门控 | 用 `rounds=1` + `--n-list` 递增去噪 |
+| 首轮后同档轮次变慢 | `--rounds > 1`：首个哨兵已切下一档，后续轮次吃新门控 | 用 `rounds=1` + `--n-list` 递增去噪 |
 | 哨兵记录 `start_ns`/`emit_ns` 是字符串 | 设计如此：epoch nanos 超 f64 精确范围，字符串保精确 | 解析回 i64 再算 EPS（wfgen 已处理） |
 | 跨机部署 EPS 偏差大 | wfgen 与引擎时钟不同机，`start_ns`/`emit_ns` 不可比 | 诊断须同机跑；跨机需 NTP 或引擎回写差值（未做） |
 

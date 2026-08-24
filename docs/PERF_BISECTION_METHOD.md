@@ -9,20 +9,20 @@
 
 > ✅ **已定稿**：本方法论已内建为引擎诊断模式机制，见
 > [`docs/design/perf-diag-mode-design.md`](design/perf-diag-mode-design.md)。
-> 诊断定位 = 声明式切换诊断点（不重启 daemon、不改代码、不手拼测量）：
+> 诊断定位 = 声明式切换诊断档（不重启 daemon、不改代码、不手拼测量）：
 >
-> | 本文刀法 | 机制诊断点 | 载体 |
+> | 本文刀法 | 机制诊断档 | 载体 |
 > |---|---|---|
 > | ① 切输出 | `full` vs `rules` 档 | `[perf].cut_output` 原子门控 |
 > | ② 切规则 | `rules` vs `floor` 档 | `[perf].cut_rules` 原子门控（ack 保留） |
 > | 规则子集 | `family_*` 档 | `runtime.rules` hot reload |
 > | ④ 预算 | `budget:X` 档（唯一重启例外） | `parse_buffer_bytes` |
 > | 计时 | `profiling=off` | `WF_RULE_PROFILING=0`（门控化） |
-> | 完成信号 | 漂流瓶 sentinel `__wf_sentinel` | 哨兵任务等数据窗排空后写 `perf_sentinel{round,n,start_ns,emit_ns}` + `point{current=k}` 记录 |
+> | 完成信号 | 漂流瓶 sentinel `__wf_sentinel` | 哨兵任务等数据窗排空后写 `perf_sentinel{round,n,start_ns,emit_ns}` + `stage{current=k}` 记录 |
 >
 > 驱动：`wfgen perf-diag --diag conf/perf-diag.toml --frames ... --n-list ...`
-> （逐点切 → 发帧+哨兵 → 读哨兵文件 → 墙表）。本文以下各节的方法论细节
-> （叠加式切除、CPU% 忙/等判别、裸环境测速、防坑清单）仍然适用，是诊断点落地
+> （逐档切 → 发帧+哨兵 → 读哨兵文件 → 墙表）。本文以下各节的方法论细节
+> （叠加式切除、CPU% 忙/等判别、裸环境测速、防坑清单）仍然适用，是诊断档落地
 > 时的操作手册。
 
 ## 1. 适用场景

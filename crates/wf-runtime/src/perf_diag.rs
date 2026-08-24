@@ -1,17 +1,17 @@
-//! 性能诊断模式（perf-diag）：门控切口 + 内置哨兵（漂流瓶）+ 诊断点状态机。
+//! 性能诊断模式（perf-diag）：门控切口 + 内置哨兵（漂流瓶）+ 诊断档状态机。
 //!
 //! 机制设计见 `docs/design/perf-diag-mode-design.md`。核心概念：
 //!
 //! - **进入诊断 = 启动参数** `wfusion daemon --perf-diag conf/perf-diag.toml`，
 //!   生产不带参数即全关（`wfusion.toml` 零污染）。
-//! - **诊断点 = 只有禁止开关**：`cut_rules`（规则求值）/ `cut_output`（输出链）。
+//! - **诊断档 = 只有禁止开关**：`cut_rules`（规则求值）/ `cut_output`（输出链）。
 //! - **切换 = sentinel 驱动自切换**：wfgen 每批帧尾追加 `__wf_sentinel` 帧
 //!   （载荷自描述 `{round, n, start_ns}`）；哨兵处理时引擎补 `emit_ns` 并把
 //!   `{round, n, start_ns, emit_ns}` 四元组经 alert 链落盘（豁免门控）→
 //!   EPS = n / (emit_ns − start_ns) 直接可算。
 //! - **完成信号**：点 k 生效（门控翻转 + 规则 reload 完成）后写
-//!   `{"type":"point","current":k}` 记录到同一 ndjson；wfgen 读到
-//!   `point{current=k}` 才发 round k（无竞态）。
+//!   `{"type":"stage","current":k}` 记录到同一 ndjson；wfgen 读到
+//!   `stage{current=k}` 才发 round k（无竞态）。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use wf_config::{FusionConfig, PerfConfig, PerfPoint, RawFusionConfigTree};
+use wf_config::{FusionConfig, PerfConfig, PerfStage, RawFusionConfigTree};
 use wf_engine::alert::{AlertColumnBuilder, AlertOrigin, OutputRecord};
 use wf_engine::match_engine::Value;
 use wf_engine::window::{Router, RulePush};
@@ -45,19 +45,19 @@ static PERF_DIAG_ENABLED: AtomicBool = AtomicBool::new(false);
 static PERF_CUT_RULES: AtomicBool = AtomicBool::new(false);
 /// 门控：禁止输出链（emit 不 serialize/stage/commit/fanout）。
 static PERF_CUT_OUTPUT: AtomicBool = AtomicBool::new(false);
-/// 诊断点列表（启动时 set，只读；测试可重复初始化）。
-static PERF_POINTS: std::sync::RwLock<Vec<PerfPoint>> = std::sync::RwLock::new(Vec::new());
+/// 诊断档列表（启动时 set，只读；测试可重复初始化）。
+static PERF_STAGES: std::sync::RwLock<Vec<PerfStage>> = std::sync::RwLock::new(Vec::new());
 
 /// 初始化诊断模式全局状态——**仅当 `--perf-diag <path>` 启动参数存在时调用**
 /// （wfusion CLI 已解析并 load 配置文件）。入口即参数本身：
 ///
-/// - 注册哨兵窗口 + 应用**初始门控** = `points[0]` 的门控（无点 → 全 false）；
+/// - 注册哨兵窗口 + 应用**初始门控** = `stages[0]` 的门控（无档 → 全 false）；
 /// - 顶层 `diag`/`cut_rules`/`cut_output` 是历史遗留字段，已从配置移除。
 pub fn init_perf_diag(config: &PerfConfig) {
-    *PERF_POINTS.write().expect("perf points lock poisoned") = config.points.clone();
+    *PERF_STAGES.write().expect("perf stages lock poisoned") = config.stages.clone();
     PERF_DIAG_ENABLED.store(true, Ordering::Relaxed);
-    let (cut_rules, cut_output) = match config.points.first() {
-        Some(point) => (point.cut_rules, point.cut_output),
+    let (cut_rules, cut_output) = match config.stages.first() {
+        Some(stage) => (stage.cut_rules, stage.cut_output),
         None => (false, false),
     };
     set_perf_cuts(cut_rules, cut_output);
@@ -66,11 +66,11 @@ pub fn init_perf_diag(config: &PerfConfig) {
 /// 复位诊断模式全局状态——无 `--perf-diag` 时调用（生产启动零污染）。
 pub fn reset_perf_diag() {
     PERF_DIAG_ENABLED.store(false, Ordering::Relaxed);
-    *PERF_POINTS.write().expect("perf points lock poisoned") = Vec::new();
+    *PERF_STAGES.write().expect("perf stages lock poisoned") = Vec::new();
     set_perf_cuts(false, false);
 }
 
-/// 原子门控翻转（诊断点状态机专用，不进 reload diff）。
+/// 原子门控翻转（诊断档状态机专用，不进 reload diff）。
 pub fn set_perf_cuts(cut_rules: bool, cut_output: bool) {
     PERF_CUT_RULES.store(cut_rules, Ordering::Relaxed);
     PERF_CUT_OUTPUT.store(cut_output, Ordering::Relaxed);
@@ -93,9 +93,9 @@ pub fn perf_cut_output() -> bool {
     PERF_CUT_OUTPUT.load(Ordering::Relaxed)
 }
 
-/// 当前诊断点列表（空 = 非诊断模式或单点）。
-fn perf_points() -> Arc<Vec<PerfPoint>> {
-    Arc::new(PERF_POINTS.read().expect("perf points lock poisoned").clone())
+/// 当前诊断档列表（空 = 非诊断模式或单点）。
+fn perf_stages() -> Arc<Vec<PerfStage>> {
+    Arc::new(PERF_STAGES.read().expect("perf stages lock poisoned").clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ fn perf_points() -> Arc<Vec<PerfPoint>> {
 /// 一条哨兵测量记录（四元组齐备，EPS 直接可算）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentinelRecord {
-    /// wfgen 轮次（= 诊断点下标）。
+    /// wfgen 轮次（= 诊断档下标）。
     pub round: i64,
     /// 本批发送量（wfgen 记账，载荷自描述）。
     pub n: i64,
@@ -194,14 +194,14 @@ pub fn sentinel_record_output(rec: &SentinelRecord) -> OutputRecord {
     }
 }
 
-/// 构建切换完成信号 OutputRecord：`{"type":"point","current":k}`。
-pub fn point_record_output(current: usize) -> OutputRecord {
+/// 构建切换完成信号 OutputRecord：`{"type":"stage","current":k}`。
+pub fn stage_record_output(current: usize) -> OutputRecord {
     OutputRecord {
-        wfx_id: format!("perf-point-{current}"),
+        wfx_id: format!("perf-stage-{current}"),
         rule_name: Arc::from(PERF_SENTINEL_STREAM),
         score: 0.0,
         entity_type: Arc::from("perf"),
-        entity_id: format!("point-{current}"),
+        entity_id: format!("stage-{current}"),
         origin: AlertOrigin::Event,
         fired_at: String::new(),
         emit_time: String::new().into(),
@@ -209,7 +209,7 @@ pub fn point_record_output(current: usize) -> OutputRecord {
         summary: String::new().into(),
         yield_target: Arc::from(PERF_SENTINEL_WINDOW),
         yield_fields: vec![
-            ("record_type".into(), Value::Str("point".into())),
+            ("record_type".into(), Value::Str("stage".into())),
             ("current".into(), Value::Number(current as f64)),
         ],
         yield_field_types: Arc::from(vec![("current".into(), FieldType::Base(BaseType::Digit))]),
@@ -228,7 +228,7 @@ pub fn wall_nanos() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// 诊断点状态机控制器
+// 诊断档状态机控制器
 // ---------------------------------------------------------------------------
 
 /// 规则子集热 reload 的基线（`runtime.rules` 变化时用现有 reload 通道）。
@@ -238,22 +238,22 @@ struct ReloadBaseline {
     config: FusionConfig,
 }
 
-/// 一次切换的结果（供哨兵任务写 `point{current}` 完成信号）。
+/// 一次切换的结果（供哨兵任务写 `stage{current}` 完成信号）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppliedPoint {
-    /// 已生效诊断点下标（= 完成信号的 `current` 值）。
+pub struct AppliedStage {
+    /// 已生效诊断档下标（= 完成信号的 `current` 值）。
     pub index: usize,
     /// 是否触发了规则子集 reload。
     pub reloaded: bool,
 }
 
-/// 诊断点状态机：sentinel(round=k) emit → 应用点 k+1（门控翻转 + 可选规则
-/// 子集 reload）→ 返回后由哨兵任务写 `point{current=k+1}` 完成信号。
+/// 诊断档状态机：sentinel(round=k) emit → 应用点 k+1（门控翻转 + 可选规则
+/// 子集 reload）→ 返回后由哨兵任务写 `stage{current=k+1}` 完成信号。
 ///
 /// 同步语义：`on_sentinel` 返回时点 k+1 已生效（含 reload 完成）——wfgen 读到
 /// `sentinel{round=k}` 记录时点 k+1 已切换，无竞态。
 pub struct PerfDiagController {
-    points: Arc<Vec<PerfPoint>>,
+    stages: Arc<Vec<PerfStage>>,
     current: AtomicUsize,
     /// 规则子集 reload 通道（Reactor 启动后注入；未注入 = 不触发 reload）。
     control: std::sync::RwLock<Option<RuntimeControlHandle>>,
@@ -262,11 +262,11 @@ pub struct PerfDiagController {
 }
 
 impl PerfDiagController {
-    /// 从全局诊断配置构建控制器。非诊断模式/无诊断点 → 永不切换。
+    /// 从全局诊断配置构建控制器。非诊断模式/无诊断档 → 永不切换。
     pub fn new() -> Arc<Self> {
-        let points = perf_points();
+        let stages = perf_stages();
         Arc::new(Self {
-            points,
+            stages,
             current: AtomicUsize::new(0),
             control: std::sync::RwLock::new(None),
             baseline: std::sync::Mutex::new(None),
@@ -280,35 +280,35 @@ impl PerfDiagController {
         *self.baseline.lock().expect("baseline lock poisoned") = Some(ReloadBaseline { raw, config });
     }
 
-    /// 当前已生效诊断点下标（0 = 初始点已生效；`usize::MAX` = 无诊断点）。
+    /// 当前已生效诊断档下标（0 = 初始档已生效；`usize::MAX` = 无诊断档）。
     pub fn current(&self) -> usize {
         self.current.load(Ordering::Relaxed)
     }
 
-    /// 是否有后续诊断点可切换。
+    /// 是否有后续诊断档可切换。
     pub fn has_next(&self) -> bool {
-        self.current() + 1 < self.points.len()
+        self.current() + 1 < self.stages.len()
     }
 
-    /// sentinel(round=k) 完成 → 应用点 k+1（幂等：重复轮次/越界不动作）。
+    /// sentinel(round=k) 完成 → 应用档 k+1（幂等：重复轮次/越界不动作）。
     ///
-    /// 返回 `Some(AppliedPoint)` 表示本次真的切换到了新点；否则 `None`。
-    pub async fn on_sentinel(&self, round: i64) -> Option<AppliedPoint> {
+    /// 返回 `Some(AppliedStage)` 表示本次真的切换到了新档；否则 `None`。
+    pub async fn on_sentinel(&self, round: i64) -> Option<AppliedStage> {
         if round < 0 {
             return None;
         }
         let target = round as usize + 1;
         let cur = self.current();
-        // 幂等：重复轮次（--rounds N）不重复应用同一目标点。
+        // 幂等：重复轮次（--rounds N）不重复应用同一目标档。
         if target <= cur {
             return None;
         }
-        let point = self.points.get(target)?.clone();
+        let stage = self.stages.get(target)?.clone();
         // 1. 原子门控翻转（先于 reload——新数据即吃新门控）。
-        set_perf_cuts(point.cut_rules, point.cut_output);
+        set_perf_cuts(stage.cut_rules, stage.cut_output);
         // 2. 规则子集变化（非空且不同于基线）→ 触发现有 runtime.rules 热 reload。
         let mut reloaded = false;
-        let rules = point.rules.as_deref().unwrap_or("");
+        let rules = stage.rules.as_deref().unwrap_or("");
         // 先把控制句柄克隆出来（不跨 await 持锁——std 锁非 async）。
         let reload_handle = self.control.read().expect("control lock poisoned").clone();
         if !rules.is_empty() && reload_handle.is_some() {
@@ -356,7 +356,7 @@ impl PerfDiagController {
             }
         }
         self.current.store(target, Ordering::Relaxed);
-        Some(AppliedPoint {
+        Some(AppliedStage {
             index: target,
             reloaded,
         })
@@ -379,7 +379,7 @@ pub(crate) struct SentinelTaskConfig {
 }
 
 /// 哨兵任务：消费 `__wf_sentinel` 窗口的推送——写四元组记录（alert 链落盘，
-/// 豁免所有 perf 门控）+ 驱动诊断点状态机。
+/// 豁免所有 perf 门控）+ 驱动诊断档状态机。
 ///
 /// **批末语义**：哨兵帧与数据帧同 TCP 连接、同源 seq 有序（哨兵是"批末最后
 /// 一条"）。规则消费是异步的（pull），哨兵在数据窗**排空**（全部规则 ack 追平
@@ -393,9 +393,9 @@ pub(crate) async fn run_sentinel_task(config: SentinelTaskConfig) -> RuntimeResu
         mut rx,
     } = config;
 
-    // 启动即写初始完成信号 `point{current=k}`（k = 已生效诊断点）——wfgen 在
+    // 启动即写初始完成信号 `stage{current=k}`（k = 已生效诊断档）——wfgen 在
     // 发送第 k 轮数据前轮询该记录，保证无竞态。
-    emit_sentinel_records(vec![point_record_output(controller.current())], &sink_fanout).await;
+    emit_sentinel_records(vec![stage_record_output(controller.current())], &sink_fanout).await;
 
     loop {
         tokio::select! {
@@ -463,7 +463,7 @@ async fn process_sentinel_push(
         let applied = controller.on_sentinel(rec.round).await;
         let mut out: Vec<OutputRecord> = Vec::with_capacity(2);
         if let Some(applied) = applied {
-            out.push(point_record_output(applied.index));
+            out.push(stage_record_output(applied.index));
         }
         out.push(sentinel_record_output(rec));
         emit_sentinel_records(out, sink_fanout).await;
@@ -516,7 +516,7 @@ mod tests {
     use std::time::Duration;
     use crate::lifecycle::ReloadOutcome;
 
-    /// 门控/诊断点是进程级全局状态：串行化涉全局的测试，避免并行污染。
+    /// 门控/诊断档是进程级全局状态：串行化涉全局的测试，避免并行污染。
     static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn serial() -> std::sync::MutexGuard<'static, ()> {
@@ -540,17 +540,17 @@ mod tests {
     }
 
     #[test]
-    fn init_diag_with_points_applies_first_point_gates() {
+    fn init_diag_with_stages_applies_first_stage_gates() {
         let _g = serial();
         let cfg = PerfConfig {
-            points: vec![
-                PerfPoint {
+            stages: vec![
+                PerfStage {
                     name: "floor".into(),
                     cut_rules: true,
                     cut_output: true,
                     rules: None,
                 },
-                PerfPoint {
+                PerfStage {
                     name: "full".into(),
                     cut_rules: false,
                     cut_output: false,
@@ -560,14 +560,14 @@ mod tests {
         };
         init_perf_diag(&cfg);
         assert!(perf_diag_enabled());
-        assert!(perf_cut_rules(), "points[0] gates apply at startup");
+        assert!(perf_cut_rules(), "stages[0] gates apply at startup");
         assert!(perf_cut_output());
         // 复位，避免污染其它测试。
         reset_perf_diag();
     }
 
     #[test]
-    fn init_without_points_defaults_gates_false() {
+    fn init_without_stages_defaults_gates_false() {
         let _g = serial();
         let cfg = PerfConfig::default();
         init_perf_diag(&cfg);
@@ -738,25 +738,25 @@ mod tests {
     }
 
     #[test]
-    fn point_output_carries_current_index() {
-        let out = point_record_output(3);
+    fn stage_output_carries_current_index() {
+        let out = stage_record_output(3);
         let fields: std::collections::HashMap<&str, Value> = out
             .yield_fields
             .iter()
             .map(|(k, v)| (&**k, v.clone()))
             .collect();
         assert_eq!(fields.get("current"), Some(&Value::Number(3.0)));
-        assert_eq!(fields.get("record_type"), Some(&Value::Str("point".into())));
+        assert_eq!(fields.get("record_type"), Some(&Value::Str("stage".into())));
     }
 
-    // -- 诊断点状态机 -------------------------------------------------------
+    // -- 诊断档状态机 -------------------------------------------------------
 
-    fn test_config(points: Vec<PerfPoint>) -> PerfConfig {
-        PerfConfig { points }
+    fn test_config(stages: Vec<PerfStage>) -> PerfConfig {
+        PerfConfig { stages }
     }
 
-    fn floor_point() -> PerfPoint {
-        PerfPoint {
+    fn floor_stage() -> PerfStage {
+        PerfStage {
             name: "floor".into(),
             cut_rules: true,
             cut_output: true,
@@ -764,8 +764,8 @@ mod tests {
         }
     }
 
-    fn rules_point() -> PerfPoint {
-        PerfPoint {
+    fn rules_stage() -> PerfStage {
+        PerfStage {
             name: "rules".into(),
             cut_rules: false,
             cut_output: true,
@@ -773,8 +773,8 @@ mod tests {
         }
     }
 
-    fn full_point() -> PerfPoint {
-        PerfPoint {
+    fn full_stage() -> PerfStage {
+        PerfStage {
             name: "full".into(),
             cut_rules: false,
             cut_output: false,
@@ -783,11 +783,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controller_applies_next_point_on_sentinel() {
+    async fn controller_applies_next_stage_on_sentinel() {
         let _g = serial();
-        init_perf_diag(&test_config(vec![floor_point(), rules_point(), full_point()]));
+        init_perf_diag(&test_config(vec![floor_stage(), rules_stage(), full_stage()]));
         let controller = PerfDiagController::new();
-        assert_eq!(controller.current(), 0, "startup applies points[0]");
+        assert_eq!(controller.current(), 0, "startup applies stages[0]");
         assert!(controller.has_next());
 
         // round=0 完成 → 应用点 1（rules：cut_rules=false, cut_output=true）
@@ -795,8 +795,8 @@ mod tests {
         assert_eq!(applied.index, 1);
         assert!(!applied.reloaded);
         assert_eq!(controller.current(), 1);
-        assert!(!perf_cut_rules(), "point 1: rules 求值恢复");
-        assert!(perf_cut_output(), "point 1: 输出仍切");
+        assert!(!perf_cut_rules(), "stage 1: rules 求值恢复");
+        assert!(perf_cut_output(), "stage 1: 输出仍切");
         assert!(controller.has_next());
 
         // round=1 完成 → 应用点 2（full：全开）
@@ -818,7 +818,7 @@ mod tests {
     #[tokio::test]
     async fn controller_idempotent_on_repeat_rounds() {
         let _g = serial();
-        init_perf_diag(&test_config(vec![floor_point(), rules_point()]));
+        init_perf_diag(&test_config(vec![floor_stage(), rules_stage()]));
         let controller = PerfDiagController::new();
         // 同一 round 重复（--rounds 2）：只切换一次。
         assert!(controller.on_sentinel(0).await.is_some());
@@ -828,7 +828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controller_noop_without_points() {
+    async fn controller_noop_without_stages() {
         let _g = serial();
         init_perf_diag(&PerfConfig::default());
         let controller = PerfDiagController::new();
@@ -841,7 +841,7 @@ mod tests {
     #[tokio::test]
     async fn controller_negative_round_is_noop() {
         let _g = serial();
-        init_perf_diag(&test_config(vec![floor_point(), rules_point()]));
+        init_perf_diag(&test_config(vec![floor_stage(), rules_stage()]));
         let controller = PerfDiagController::new();
         assert!(controller.on_sentinel(-1).await.is_none());
         assert_eq!(controller.current(), 0);
@@ -960,12 +960,12 @@ mod tests {
             emit_ns: 2_000,
         };
         emit_sentinel_records(
-            vec![point_record_output(1), sentinel_record_output(&rec)],
+            vec![stage_record_output(1), sentinel_record_output(&rec)],
             &fanout,
         )
         .await;
         let batch = rx.try_recv().expect("record must reach the sink channel");
-        assert_eq!(batch.len(), 2, "point + sentinel 两条记录");
+        assert_eq!(batch.len(), 2, "stage + sentinel 两条记录");
         assert!(rx.try_recv().is_err(), "只有一批");
     }
 
@@ -1066,15 +1066,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_sentinel_push_writes_point_then_sentinel() {
+    async fn process_sentinel_push_writes_stage_then_sentinel() {
         let _g = serial();
-        init_perf_diag(&test_config(vec![floor_point(), rules_point()]));
+        init_perf_diag(&test_config(vec![floor_stage(), rules_stage()]));
         let (fanout, mut rx) = test_fanout();
         let controller = PerfDiagController::new();
         let batch = sentinel_batch(&[0], &[100], &[1_000]);
         process_sentinel_push(sentinel_push(Some(batch)), &fanout, &controller).await;
-        // 先 point{current=1}（切换完成信号）后 sentinel{round=0}：同批两记录。
-        let first = rx.try_recv().expect("第一批（point + sentinel）");
+        // 先 stage{current=1}（切换完成信号）后 sentinel{round=0}：同批两记录。
+        let first = rx.try_recv().expect("第一批（stage + sentinel）");
         assert_eq!(first.len(), 2);
         assert!(rx.try_recv().is_err());
         reset_perf_diag();
@@ -1084,7 +1084,7 @@ mod tests {
     async fn run_sentinel_task_processes_then_exits_on_cancel() {
         let (router, _win) = drain_router();
         let _g = serial();
-        init_perf_diag(&test_config(vec![floor_point()]));
+        init_perf_diag(&test_config(vec![floor_stage()]));
         let controller = PerfDiagController::new();
         let (fanout, mut rx) = test_fanout();
         let (tx, rx_ch) = tokio::sync::mpsc::channel::<RulePush>(8);
@@ -1096,7 +1096,7 @@ mod tests {
             cancel: cancel.clone(),
             rx: rx_ch,
         }));
-        // 启动即写 point{current=0} 初始信号（轮询等任务完成启动）。
+        // 启动即写 stage{current=0} 初始信号（轮询等任务完成启动）。
         let init = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Ok(batch) = rx.try_recv() {
@@ -1106,7 +1106,7 @@ mod tests {
             }
         })
         .await
-        .expect("初始 point 记录");
+        .expect("初始 stage 记录");
         assert_eq!(init.len(), 1);
         // 投一条哨兵 → 处理后 cancel → 任务返回。
         tx.send(sentinel_push(Some(sentinel_batch(&[0], &[10], &[1]))))
@@ -1126,8 +1126,8 @@ mod tests {
     async fn controller_reloads_rules_subset_via_control_handle() {
         let _g = serial();
         init_perf_diag(&test_config(vec![
-            floor_point(),
-            PerfPoint {
+            floor_stage(),
+            PerfStage {
                 name: "c_family".into(),
                 cut_rules: false,
                 cut_output: true,
@@ -1212,9 +1212,9 @@ rules = "rules/basic.wfl"
 
     /// 构造带真实 loader 基线 + 空控制通道的控制器（reload 路径测试用）。
     async fn controller_with_baseline(
-        points: Vec<PerfPoint>,
+        stages: Vec<PerfStage>,
     ) -> (Arc<PerfDiagController>, tokio::sync::mpsc::Receiver<crate::lifecycle::ReloadRequest>) {
-        init_perf_diag(&test_config(points));
+        init_perf_diag(&test_config(stages));
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("models")).unwrap();
         std::fs::write(
@@ -1266,8 +1266,8 @@ rules = "rules/basic.wfl"
     async fn controller_reload_failure_still_advances() {
         let _g = serial();
         let (controller, mut rx) = controller_with_baseline(vec![
-            floor_point(),
-            PerfPoint {
+            floor_stage(),
+            PerfStage {
                 name: "c_family".into(),
                 cut_rules: false,
                 cut_output: true,
@@ -1301,8 +1301,8 @@ rules = "rules/basic.wfl"
         let _g = serial();
         // 目标点 rules 与基线相同 → changed=false → 不触发 reload（reloaded=false）。
         let (controller, mut rx) = controller_with_baseline(vec![
-            floor_point(),
-            PerfPoint {
+            floor_stage(),
+            PerfStage {
                 name: "same_rules".into(),
                 cut_rules: false,
                 cut_output: true,
@@ -1330,8 +1330,8 @@ rules = "rules/basic.wfl"
     async fn controller_reload_without_baseline_applies_without_reload() {
         let _g = serial();
         init_perf_diag(&test_config(vec![
-            floor_point(),
-            PerfPoint {
+            floor_stage(),
+            PerfStage {
                 name: "c_family".into(),
                 cut_rules: false,
                 cut_output: true,
