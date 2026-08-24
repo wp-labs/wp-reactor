@@ -749,17 +749,53 @@ fill_hit=23.87M、recheck=104k。差异不在代码逻辑（两版提取同一 b
 精确一致是慢速 clone 恰做“节奏延迟”的巧合。**待办（可选）**：确定性快照边界
 （跨窗口 seq-cut 映射）才能彻底钉死，工程中等，暂不做。
 
+## ✅ q15 空键 stats 输入分区分片 + EOS 归并（2026-08-24）
+
+**目标**：q15（`stats<1d:fixed>` 空键 12 度量, 4.44M EPS 全量倒数第 4）单核封顶。
+
+### 归因（数据驱动, WF_Q15_DIAG 段级计时）
+
+- 每批 36,500 行 → seg 8.94ms（245ns/row）, **accumulate（process_batch_rows
+  列式归并）占 98%**——8 个 distinct_count 每行 4~8 次 HashSet insert 是全部
+  成本; 单核（CPU 76%）不可再优化 → 必须多核。
+- 第一步（已提交 `304094e`）：distinct_set 从 std SipHash 换 foldhash
+  （EngineHashSet）→ 245→185ns/row, **4.22M→5.53M（+31%）**, verify ✅。
+
+### 输入分区分片（`2d5b982`）
+
+空键 + 度量全可交换（count/sum/min/max/distinct; last/top 行序敏感门控排除）
++ pull 模式 + shard_count>1 → 按行号 `row % N` 均匀切分 N 任务, close 时归并：
+- fanout：`partition_rows_by_index` + `register_window_index_sharding`
+  （空键 = index 分区标记; precompute_shard_rows 分支）
+- stats_exec：`take_partial`（raw 桶状态 + 重置）+ `merge_partial`
+  （count 加 / sum 加 / min·max 极值 / distinct 集 union）
+- stats_task：非协调片 close 发 raw partial 不 emit（空窗发空 partial 防死
+  锁）; 协调片（shard 0）收齐 N-1 归并后统一 emit; flush 同构
+
+### 实测（30M replay, 哨兵 EPS）
+
+- **q15: 5.53M → 7.75M（+40%）, CPU 72%→563%（多核）, RSS 6.6GB 无爆炸**;
+  verify **全部一致 ✅**（归并精确——count 相加 + distinct 集 union 精确）
+- 测试：executor 级 `stats_input_shard_merge_matches_single`（两片归并 ==
+  单实例逐值一致）+ 任务级 `q15_input_shard_merge_emits_single_equivalent`
+  （2 片 + 协调片, 输出字节一致, 非协调片不 emit）
+- 全量 1079 + 525 测试过; clippy 无新增
+
+### 已知瓶颈（未解决）
+
+协调片 EOS 归并 ~883ms 串行（9 片 × 8 distinct 集 union = 68M 次 insert）+ 每
+片对**全批**做 where mask/domain 的 10× 冗余。方向：归并按度量并行（8 度量
+独立 union）、mask 单算共享或按片行域裁剪。
+
 ## 下一步（重开 session 从这里继续）
 
-1. **q15（4.44M stats 单桶）**：stats 列式本身 122ns/evt 已最优，瓶颈是空键单桶
-   单实例——方向 stats 分片 + EOS 归并（count 加法、distinct 集合并）
-2. 全量 22 查询 30M 重跑 + OSS/VVR 对照刷新（q20 已 20.87M=4.5×；q9/q4 也已
-   4.9×，两份基准文档数字需重采）
-3. q3 −16% 根因（独立 bug）；q12 fixed+close 尾桶收口
-4. D4 剩余：eager interval join 的 pin；「结果可能不完整」的正确性信号/指标
-5. （可选）q20 确定性快照边界（见上节机制）；q13 列式 join 免 Event 物化
-6. 旁支发现：`match_engine/tests/executor/direct_tests.rs:412` 编译告警 never
-   used——疑似漏 `#[test]`，测试没在跑。
+1. **全量 22 查询 30M 重跑 + OSS/VVR 对照刷新**（q4/q5/q9/q20/q15 均已大幅
+   变化; q15 现 7.75M）
+2. （可选）q15 归并/冗余优化（见上节已知瓶颈）; q3 −16% 独立 bug
+3. D4 剩余：eager interval join 的 pin; 「结果可能不完整」的正确性信号/指标
+4. （可选）q20 确定性快照边界; q13 列式 join 免 Event 物化
+5. 旁支发现：`match_engine/tests/executor/direct_tests.rs:412` 编译告警 never
+   used——疑似漏 `#[test]`, 测试没在跑。
 
 ## 测试补充（2026-08-24，随 q20 修复提交）
 
