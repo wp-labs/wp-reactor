@@ -380,6 +380,8 @@ pub(super) struct RuleTask {
     deferred: Option<DeferredRuntime>,
     /// D4 扩展：snapshot/asof join 目标窗口的保留 pin（全保留，见构造处注释）。
     /// 任务存活期间持有强引用；drop 时自动释放（Weak 死 → 窗口恢复可驱逐）。
+    /// 从不读取是预期行为（持有的唯一作用就是保持 Arc 存活）。
+    #[expect(dead_code)]
     snapshot_pins: Vec<Arc<AtomicI64>>,
 }
 
