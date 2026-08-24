@@ -1047,3 +1047,95 @@ fn columnar_str_search_overhead_bounded() {
         row_el
     );
 }
+
+/// 编译树缓存（review #5）：同一 executor 处理多个同 schema batch 时，编译树
+/// 跨 batch 复用应显著快于每 batch 重新编译。用 `regex_match` 作为守卫（正则
+/// 编译是重常量，每 batch 重编译的浪费最明显）。
+#[test]
+fn compiled_guard_cache_beats_per_batch_compile() {
+    use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
+    use wf_lang::plan::BindPlan;
+
+    let n = 200usize;
+    let schema = Arc::new(Schema::new(vec![Field::new("action", DataType::Utf8, true)]));
+    let batches: Vec<RecordBatch> = (0..n)
+        .map(|i| {
+            let vals: Vec<Option<&str>> = (0..64)
+                .map(|r| {
+                    if (r + i) % 2 == 0 {
+                        Some("failed_login")
+                    } else {
+                        Some("success")
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(vals)) as ArrayRef],
+            )
+            .unwrap()
+        })
+        .collect();
+
+    let field = |name: &str| Expr::Field(FieldRef::Simple(name.to_string()));
+    let filter = Expr::FuncCall {
+        qualifier: None,
+        name: "regex_match".into(),
+        args: vec![field("action"), Expr::StringLit("fail.*".into())],
+    };
+    let mut plan = simple_rule_plan(
+        "cache_bench",
+        simple_plan(
+            vec![FieldRef::Simple("action".into())],
+            vec![step(vec![branch("b", count_ge(1.0))])],
+        ),
+        Expr::Number(5.0),
+        "action",
+        field("action"),
+    );
+    plan.binds = vec![BindPlan {
+        alias: "b".into(),
+        window: "w".into(),
+        filter: Some(filter.clone()),
+    }];
+    let exec = RuleExecutor::new(plan);
+
+    // 方案 A：executor 编译缓存（跨 batch 复用）。
+    let mut col_el = Duration::MAX;
+    let mut last = arrow::array::BooleanArray::new_null(0);
+    for _ in 0..3 {
+        let start = Instant::now();
+        for b in &batches {
+            last = exec.bind_filter_columnar_mask("b", b).expect("列式 mask");
+        }
+        col_el = col_el.min(start.elapsed());
+    }
+    assert_eq!(last.len(), 64);
+
+    // 方案 B：每 batch 直接编译（无缓存）。
+    let mut row_el = Duration::MAX;
+    for _ in 0..3 {
+        let start = Instant::now();
+        for b in &batches {
+            let view = ColumnarBatch::from_all_fields(b);
+            std::hint::black_box(eval_guard_columnar(&filter, &view));
+        }
+        row_el = row_el.min(start.elapsed());
+    }
+
+    let per = |d: Duration| d.as_secs_f64() / (n as f64 * 64.0) * 1e9;
+    let ratio = col_el.as_secs_f64() / row_el.as_secs_f64();
+    eprintln!(
+        "[columnar-cache-bench] cached={:.1} ns/ev  per-batch={:.1} ns/ev  cached/per-batch={:.2}x",
+        per(col_el),
+        per(row_el),
+        ratio
+    );
+    assert!(
+        ratio < 1.0,
+        "编译缓存应快于每 batch 编译：{:.2}x (cached {:?} vs per-batch {:?})",
+        ratio,
+        col_el,
+        row_el
+    );
+}

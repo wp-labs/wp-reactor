@@ -368,6 +368,55 @@ fn str_search_columnar_mask_matches_per_event() {
     }
 }
 
+/// 编译树缓存：同一 executor 跨 batch 复用（batch 无关列索引），schema drift
+/// 的 batch 重新编译仍正确。
+#[test]
+fn compiled_guard_cache_reuses_across_batches() {
+    let schema_of = |extra: bool| {
+        let mut fields = vec![
+            Field::new("sip", DataType::Utf8, true),
+            Field::new("event_time", DataType::Int64, false),
+        ];
+        if extra {
+            fields.push(Field::new("extra", DataType::Utf8, true));
+        }
+        Arc::new(Schema::new(fields))
+    };
+    let mk_batch = |schema: Arc<Schema>, rows: Vec<Option<&str>>| {
+        let n = rows.len();
+        let mut cols: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(rows)) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1; n])) as ArrayRef,
+        ];
+        if schema.fields().len() > 2 {
+            cols.push(Arc::new(StringArray::from(vec![Some("x"); n])) as ArrayRef);
+        }
+        RecordBatch::try_new(schema, cols).unwrap()
+    };
+    let filter = Expr::FuncCall {
+        qualifier: None,
+        name: "cidr_match".into(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("sip".into())),
+            Expr::StringLit("10.0.0.0/8".into()),
+        ],
+    };
+    let exec = bind_executor(Some(filter));
+
+    // 同 schema 的两个 batch：编译树缓存复用，结果逐位正确。
+    let b1 = mk_batch(schema_of(false), vec![Some("10.1.1.1"), Some("11.2.3.4")]);
+    let b2 = mk_batch(schema_of(false), vec![Some("10.9.9.9"), Some("192.168.1.1")]);
+    let m1 = exec.bind_filter_columnar_mask("b", &b1).expect("列式 mask");
+    let m2 = exec.bind_filter_columnar_mask("b", &b2).expect("列式 mask");
+    assert!(m1.value(0) && !m1.value(1), "b1: 10/8 命中与否");
+    assert!(m2.value(0) && !m2.value(1), "b2: 10/8 命中与否");
+
+    // schema drift（多一列）→ 指纹变化 → 重新编译，仍正确。
+    let b3 = mk_batch(schema_of(true), vec![Some("10.0.0.1"), Some("172.16.0.1")]);
+    let m3 = exec.bind_filter_columnar_mask("b", &b3).expect("列式 mask");
+    assert!(m3.value(0) && !m3.value(1), "b3: schema drift 后仍正确");
+}
+
 #[test]
 fn no_filter_returns_none() {
     let batch = auction_batch(vec![Some(1), Some(2)]);

@@ -50,7 +50,9 @@ pub(crate) use self::context::CloseCtxFields;
 use self::eval::eval_bool_expr_with_lookup;
 use crate::alert::AlertOrigin;
 use crate::error::{CoreReason, CoreResult};
-use crate::match_engine::columnar::{ColumnarBatch, GuardMasks, eval_guard_columnar};
+use crate::match_engine::columnar::{
+    ColumnExpr, ColumnarBatch, GuardMasks, compile_guard, eval_compiled_guard,
+};
 use crate::match_engine::match_engine::{Event, FieldSource, Value, WindowLookup, field_ref_name};
 use crate::time::normalize_epoch_timestamp_float_nanos;
 use arrow::array::BooleanArray;
@@ -616,6 +618,37 @@ pub struct RuleExecutor {
     /// Whether the rule can observe a `reduce ... as label` object, gating the
     /// deferred-join label materialization (see [`plan_reduce_label_reads`]).
     reduce_label_reads: ReduceLabelReads,
+    /// Compiled columnar guard trees, cached across batches (review #5): a
+    /// [`wf_engine::match_engine::columnar::ColumnExpr`] tree is batch-
+    /// independent (leaf [`ColRef`]s are projection-slot + type tags), so the
+    /// expensive per-batch work — expression-tree build, `Cidr::parse` /
+    /// `regex::Regex::new` for literal constants — happens once per
+    /// (site, schema) instead of once per batch. The key carries a schema
+    /// fingerprint so a reused tree is never applied to a mismatched schema
+    /// (a batch whose schema drifted recompiles, then re-caches).
+    ///
+    /// The cache is a pure memo, so clones get their OWN cache (reset empty,
+    /// mirroring `emit_time_cache`). `Mutex` keeps the executor `Send + Sync`;
+    /// lookups happen once per (batch, site) — never in the per-row hot loop.
+    compiled_guards: Mutex<std::collections::HashMap<(String, u64), ColumnExpr>>,
+}
+
+/// Schema fingerprint for the compiled-guard cache: field name + data type +
+/// metadata (the metadata marks structured JSON-array columns, which change
+/// the compiled [`ColKind`]). Two batches of the same window share a schema, so
+/// the fingerprint is stable across them; any drift recompiles.
+fn guard_schema_fingerprint(batch: &RecordBatch) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in batch.schema().fields() {
+        f.name().hash(&mut h);
+        format!("{:?}", f.data_type()).hash(&mut h);
+        for (k, v) in f.metadata() {
+            k.hash(&mut h);
+            v.hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 // Manual impl: `Mutex` is not `Clone`. `emit_time_cache` is a pure memo
@@ -634,6 +667,7 @@ impl Clone for RuleExecutor {
             emit_time_cache: Mutex::new((0, Arc::from(""))),
             close_ctx_fields: self.close_ctx_fields.clone(),
             reduce_label_reads: self.reduce_label_reads.clone(),
+            compiled_guards: Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -760,6 +794,7 @@ impl RuleExecutor {
             emit_time_cache: Mutex::new((0, Arc::from(""))),
             close_ctx_fields,
             reduce_label_reads,
+            compiled_guards: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -908,7 +943,35 @@ impl RuleExecutor {
             return None;
         }
         let view = ColumnarBatch::from_all_fields(batch);
-        Some(eval_guard_columnar(filter, &view))
+        Some(self.guard_mask(&format!("bind:{alias}"), filter, &view, batch))
+    }
+
+    /// Compiled-guard cache lookup-or-compile: the compiled [`ColumnExpr`] tree
+    /// is batch-independent (leaf [`ColRef`]s are projection slot + type tag),
+    /// so identical `(site, schema)` calls reuse the tree instead of rebuilding
+    /// it — and re-parsing / recompiling its literal constants — per batch.
+    /// The schema fingerprint in the key means a schema-drifted batch recompiles
+    /// rather than evaluating a stale tree.
+    fn guard_mask(
+        &self,
+        site: &str,
+        filter: &Expr,
+        view: &ColumnarBatch<'_>,
+        batch: &RecordBatch,
+    ) -> BooleanArray {
+        let key = (site.to_string(), guard_schema_fingerprint(batch));
+        let mut cache = self.compiled_guards.lock().expect("compiled-guard cache poisoned");
+        if let Some(plan) = cache.get(&key) {
+            return eval_compiled_guard(plan, view);
+        }
+        let Some(plan) = compile_guard(filter, view) else {
+            // Uncompilable (a shape outside the gate, or an invalid literal
+            // constant) → all rows miss, matching `eval_guard_columnar`'s
+            // fallback; not cached (the failure is per-call cheap).
+            return BooleanArray::from(vec![false; view.num_rows()]);
+        };
+        let plan_ref = cache.entry(key).or_insert(plan);
+        eval_compiled_guard(plan_ref, view)
     }
 
     /// Whether every bind of `window` can be evaluated columnarly — every
@@ -939,7 +1002,7 @@ impl RuleExecutor {
             return None;
         }
         let view = ColumnarBatch::from_all_fields(batch);
-        Some(eval_guard_columnar(filter, &view))
+        Some(self.guard_mask("each", filter, &view, batch))
     }
 
     /// Columnar branch-guard masks for the three per-event guard sites:
@@ -958,7 +1021,8 @@ impl RuleExecutor {
                 if let Some(guard) = &branch.guard
                     && wf_lang::columnar::expr_is_columnar(guard)
                 {
-                    masks.insert_event(step_idx, branch_idx, eval_guard_columnar(guard, &view));
+                    let site = format!("event:{step_idx}:{branch_idx}");
+                    masks.insert_event(step_idx, branch_idx, self.guard_mask(&site, guard, &view, batch));
                 }
             }
         }
@@ -967,7 +1031,8 @@ impl RuleExecutor {
                 if let Some(guard) = &branch.guard
                     && wf_lang::columnar::expr_is_columnar(guard)
                 {
-                    masks.insert_close(step_idx, branch_idx, eval_guard_columnar(guard, &view));
+                    let site = format!("close:{step_idx}:{branch_idx}");
+                    masks.insert_close(step_idx, branch_idx, self.guard_mask(&site, guard, &view, batch));
                 }
             }
         }
@@ -980,7 +1045,8 @@ impl RuleExecutor {
                     if let Some(guard) = &step.branch.guard
                         && wf_lang::columnar::expr_is_columnar(guard)
                     {
-                        masks.insert_neg(neg_idx, 0, eval_guard_columnar(guard, &view));
+                        let site = format!("neg:{neg_idx}");
+                        masks.insert_neg(neg_idx, 0, self.guard_mask(&site, guard, &view, batch));
                     }
                     neg_idx += 1;
                 }

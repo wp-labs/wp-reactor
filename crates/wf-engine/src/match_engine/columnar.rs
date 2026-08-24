@@ -55,7 +55,7 @@ use crate::match_engine::{WFL_FIELD_TYPE_ARRAY, wfl_structured_field_kind};
 /// `Int` carries native integer precision for `Int64` / `Timestamp(Ns)`
 /// columns and integer-valued literals.
 #[derive(Debug, Clone, PartialEq)]
-enum CScalar {
+pub(crate) enum CScalar {
     Int(i64),
     Float(f64),
     Str(SmolStr),
@@ -116,9 +116,9 @@ impl<'a> ColumnarBatch<'a> {
         self.batch.num_rows()
     }
 
-    fn resolve_field(&self, field: &FieldRef) -> ColRef<'_> {
+    fn resolve_field(&self, field: &FieldRef) -> ColRef {
         let Some(proj_idx) = self.field_map.get(field_ref_name(field)) else {
-            return ColRef::Null;
+            return ColRef { proj: 0, kind: ColKind::Null };
         };
         let col_idx = self.projection[*proj_idx];
         let col = self.batch.column(col_idx);
@@ -128,13 +128,27 @@ impl<'a> ColumnarBatch<'a> {
             && wfl_structured_field_kind(self.batch.schema().field(col_idx))
                 == Some(WFL_FIELD_TYPE_ARRAY)
         {
-            return col
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .map(ColRef::JsonArray)
-                .unwrap_or(ColRef::Null);
+            return ColRef {
+                proj: *proj_idx,
+                kind: ColKind::JsonArray,
+            };
         }
-        col_ref_from_array(col.as_ref())
+        ColRef {
+            proj: *proj_idx,
+            kind: col_kind(col.data_type()),
+        }
+    }
+
+    /// Eval-time column resolution: the projection slot behind a compiled
+    /// [`ColRef`] maps to a concrete batch column. `Null` (or a stale slot from
+    /// a reused tree whose schema no longer matches) yields `None` → the read
+    /// kernels degrade to all-null, matching the compiled `ColKind::Null`.
+    fn column_at(&self, col: &ColRef) -> Option<&dyn Array> {
+        if col.kind == ColKind::Null {
+            return None;
+        }
+        let col_idx = self.projection.get(col.proj)?;
+        Some(self.batch.column(*col_idx))
     }
 }
 
@@ -213,9 +227,13 @@ fn schema_index_of(batch: &RecordBatch, name: &str) -> Option<usize> {
         .position(|f| f.name() == name)
 }
 
-/// A resolved, typed reference to a batch column (or `Null` for a field absent
-/// from the schema / an unsupported type — both read as null, matching
-/// `event_bridge::extract_value`).
+/// Compile-time column type tag — batch **independent** (a projection slot +
+/// the Arrow type the schema declared when the tree was compiled). The compiled
+/// [`ColumnExpr`] tree carries these instead of `&'a Array` references, so the
+/// same tree can be reused across batches of a window (same schema) without
+/// recompiling per batch. At eval time the view resolves the projection slot
+/// and downcasts by kind; a downcast failure reads null (the batch no longer
+/// matches the compiled schema — defensive, mirrors `ColKind::Null`).
 ///
 /// `JsonArray` is a `Utf8` column whose field metadata marks it as a structured
 /// JSON array (`wf.wfl.field_type = "array"`): each cell holds JSON array text
@@ -223,70 +241,50 @@ fn schema_index_of(batch: &RecordBatch, name: &str) -> Option<usize> {
 /// Arrow list columns. All four carry the array shape used by
 /// [`ColumnExpr::ListIndex`]; read as a bare field they are a non-null
 /// structured value.
-enum ColRef<'a> {
-    Int64(&'a Int64Array),
-    Float64(&'a Float64Array),
-    Utf8(&'a StringArray),
-    Bool(&'a BooleanArray),
-    TimestampNs(&'a TimestampNanosecondArray),
-    JsonArray(&'a StringArray),
-    List(&'a ListArray),
-    LargeList(&'a LargeListArray),
-    FixedSizeList(&'a FixedSizeListArray),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColKind {
+    Int64,
+    Float64,
+    Utf8,
+    Bool,
+    TimestampNs,
+    JsonArray,
+    List,
+    LargeList,
+    FixedSizeList,
+    /// Field absent from the schema / unsupported type — reads null, matching
+    /// `event_bridge::extract_value`.
     Null,
 }
 
-/// Map a non-null scalar at `row` of `col` to a [`CScalar`], mirroring
-/// `event_bridge::extract_value`'s scalar mapping exactly.
-fn col_ref_from_array(col: &dyn Array) -> ColRef<'_> {
-    match col.data_type() {
-        DataType::Int64 => col
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .map(ColRef::Int64)
-            .unwrap_or(ColRef::Null),
-        DataType::Float64 => col
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .map(ColRef::Float64)
-            .unwrap_or(ColRef::Null),
-        DataType::Utf8 => col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .map(ColRef::Utf8)
-            .unwrap_or(ColRef::Null),
-        DataType::Boolean => col
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .map(ColRef::Bool)
-            .unwrap_or(ColRef::Null),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => col
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .map(ColRef::TimestampNs)
-            .unwrap_or(ColRef::Null),
-        DataType::List(_) => col
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .map(ColRef::List)
-            .unwrap_or(ColRef::Null),
-        DataType::LargeList(_) => col
-            .as_any()
-            .downcast_ref::<LargeListArray>()
-            .map(ColRef::LargeList)
-            .unwrap_or(ColRef::Null),
-        DataType::FixedSizeList(_, _) => col
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .map(ColRef::FixedSizeList)
-            .unwrap_or(ColRef::Null),
-        _ => ColRef::Null,
+/// A resolved, typed reference to a batch column: a projection slot index into
+/// the eval-time [`ColumnarBatch`] plus the compile-time [`ColKind`]. Carrying
+/// no `'a`, it is the leaf of a reusable compiled [`ColumnExpr`] tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ColRef {
+    proj: usize,
+    kind: ColKind,
+}
+
+/// Map an Arrow `DataType` to its [`ColKind`] tag (mirrors the old
+/// `col_ref_from_array` downcasts; unsupported types read null).
+fn col_kind(data_type: &DataType) -> ColKind {
+    match data_type {
+        DataType::Int64 => ColKind::Int64,
+        DataType::Float64 => ColKind::Float64,
+        DataType::Utf8 => ColKind::Utf8,
+        DataType::Boolean => ColKind::Bool,
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => ColKind::TimestampNs,
+        DataType::List(_) => ColKind::List,
+        DataType::LargeList(_) => ColKind::LargeList,
+        DataType::FixedSizeList(_, _) => ColKind::FixedSizeList,
+        _ => ColKind::Null,
     }
 }
 
 /// The string-search operation of a [`ColumnExpr::StrFunc`] node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StrFuncOp {
+pub(crate) enum StrFuncOp {
     Contains,
     StartsWith,
     EndsWith,
@@ -306,58 +304,59 @@ impl StrFuncOp {
 /// The second operand of a [`ColumnExpr::StrFunc`] node: a shared literal
 /// needle (the gate admits `StringLit`) or a per-row string column (a flat
 /// field ref).
-enum Needle<'a> {
+pub(crate) enum Needle {
     Lit(SmolStr),
-    Col(ColRef<'a>),
+    Col(ColRef),
 }
 
-/// A precompiled columnar expression tree: field refs are resolved once to
-/// [`ColRef`]s, so the per-row hot loop reads native columns directly with no
-/// `HashMap` lookup or per-row downcast.
-enum ColumnExpr<'a> {
+/// A precompiled columnar expression tree — **batch-independent**: leaf columns
+/// are [`ColRef`] (projection slot + type tag), so the tree is built once and
+/// reused across batches of a window (same schema) instead of recompiling per
+/// batch. At eval time the view resolves each [`ColRef`] to its column; the
+/// per-row hot loop still reads native columns with no `HashMap` lookup.
+pub(crate) enum ColumnExpr {
     Lit(CScalar),
-    Col(ColRef<'a>),
+    Col(ColRef),
     /// `root[i]` — the `i`-th **non-null** element of the array column `col`,
     /// per row. Mirror of the interpreted path walk: a null / non-array cell,
     /// a non-array root column, a parse failure, or an out-of-range index all
     /// read null (the path produces `None`); object / array elements read a
     /// [`CScalar::Structured`] (definite false on compare, null as boolean).
     ListIndex {
-        col: ColRef<'a>,
+        col: ColRef,
         index: usize,
     },
-    Neg(Box<ColumnExpr<'a>>),
-    Not(Box<ColumnExpr<'a>>),
-    And(Box<ColumnExpr<'a>>, Box<ColumnExpr<'a>>),
-    Or(Box<ColumnExpr<'a>>, Box<ColumnExpr<'a>>),
+    Neg(Box<ColumnExpr>),
+    Not(Box<ColumnExpr>),
+    And(Box<ColumnExpr>, Box<ColumnExpr>),
+    Or(Box<ColumnExpr>, Box<ColumnExpr>),
     Cmp {
         op: BinOp,
-        left: Box<ColumnExpr<'a>>,
-        right: Box<ColumnExpr<'a>>,
+        left: Box<ColumnExpr>,
+        right: Box<ColumnExpr>,
     },
     Arith {
         op: BinOp,
-        left: Box<ColumnExpr<'a>>,
-        right: Box<ColumnExpr<'a>>,
+        left: Box<ColumnExpr>,
+        right: Box<ColumnExpr>,
     },
     /// `cidr_match(field, "addr/prefix")` — lowered natively: the subnet is
-    /// parsed at compile time (once per batch — `compile_expr` runs for every
-    /// `eval_guard_columnar` call, not per row; the checker enforces a
-    /// literal), the
+    /// parsed at compile time (once per **compiled tree**, reused across
+    /// batches; the checker enforces a literal), the
     /// field reads as a string column, and each non-null cell is parsed as an
     /// IP and compared against the net (mirroring the interpreted path exactly:
     /// non-Utf8 columns / null cells / non-IP strings read null / false).
     CidrMatch {
-        col: ColRef<'a>,
+        col: ColRef,
         net: wf_lang::cidr::Cidr,
     },
     /// `regex_match(field, "pattern")` — lowered natively: the regex is
-    /// compiled at compile time (once per batch, mirroring `CidrMatch`), the
+    /// compiled once per **compiled tree** (mirroring `CidrMatch`), the
     /// field reads as a string column, and each non-null
     /// cell is matched against the compiled regex (non-Utf8 columns / null
     /// cells read null, mirroring the interpreted `Value::Str`-only path).
     RegexMatch {
-        col: ColRef<'a>,
+        col: ColRef,
         re: regex::Regex,
     },
     /// `contains` / `startswith` / `endswith` — lowered natively over two
@@ -366,8 +365,8 @@ enum ColumnExpr<'a> {
     /// null cells read null, mirroring the interpreted `Value::Str`-only path.
     StrFunc {
         op: StrFuncOp,
-        hay: ColRef<'a>,
-        needle: Needle<'a>,
+        hay: ColRef,
+        needle: Needle,
     },
 }
 
@@ -376,12 +375,31 @@ enum ColumnExpr<'a> {
 /// **null slots** (so permissive consumers can distinguish them); two-valued
 /// consumers read null as `false` via [`BooleanArray::value`], matching the
 /// interpreted `passes_bind_filter` → `false` fallback.
+///
+/// Compiles the expression per call; hot callers that repeat the same filter
+/// over many batches should cache [`compile_guard`] and reuse
+/// [`eval_compiled_guard`] instead (see `RuleExecutor::compiled_guards`).
 pub fn eval_guard_columnar(expr: &Expr, view: &ColumnarBatch<'_>) -> BooleanArray {
-    let Some(plan) = compile_expr(expr, view) else {
+    match compile_guard(expr, view) {
+        Some(plan) => eval_compiled_guard(&plan, view),
         // Non-columnar expression (the gate keeps these out): all rows miss.
-        return BooleanArray::from(vec![false; view.num_rows()]);
-    };
-    let out = plan.eval_vec(view.num_rows());
+        None => BooleanArray::from(vec![false; view.num_rows()]),
+    }
+}
+
+/// Compile a (gate-admitted) guard into a batch-independent [`ColumnExpr`]
+/// tree. `None` = not compilable (a non-columnar shape — the gate keeps these
+/// out — or an invalid constant literal that `Cidr::parse` / `Regex::new`
+/// reject, which reads as all-false, matching the interpreted path).
+pub(crate) fn compile_guard(expr: &Expr, view: &ColumnarBatch<'_>) -> Option<ColumnExpr> {
+    compile_expr(expr, view)
+}
+
+/// Evaluate a compiled guard tree over every row of `view` (one `BooleanArray`
+/// per batch, null slots preserved). The same tree is reusable across batches
+/// of the same schema.
+pub(crate) fn eval_compiled_guard(plan: &ColumnExpr, view: &ColumnarBatch<'_>) -> BooleanArray {
+    let out = plan.eval_vec(view, view.num_rows());
     match out {
         // Top-level boolean column: materialize, preserving null slots.
         CVec::Bool(col) => {
@@ -402,7 +420,7 @@ pub fn eval_guard_columnar(expr: &Expr, view: &ColumnarBatch<'_>) -> BooleanArra
     }
 }
 
-fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnExpr<'a>> {
+fn compile_expr(expr: &Expr, view: &ColumnarBatch<'_>) -> Option<ColumnExpr> {
     match expr {
         Expr::Number(n) => Some(ColumnExpr::Lit(number_literal(*n))),
         Expr::StringLit(s) => Some(ColumnExpr::Lit(CScalar::Str(s.clone().into()))),
@@ -528,7 +546,7 @@ fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnEx
 /// `compare_scalars` / `arithmetic` kernels, so null propagation, three-valued
 /// `&&` / `||`, native `i64`, epsilon float compare, and the documented `>2^53`
 /// divergence are all unchanged.
-enum CVec {
+pub(crate) enum CVec {
     Int(Vec<Option<i64>>),
     Float(Vec<Option<f64>>),
     Str(Vec<Option<SmolStr>>),
@@ -578,30 +596,34 @@ impl CVec {
     }
 }
 
-impl ColumnExpr<'_> {
+impl ColumnExpr {
     /// Evaluate this node over the whole batch (vectorized) into a typed column.
     /// One linear pass per node; intermediate columns are materialized and flow
-    /// bottom-up to the root.
-    fn eval_vec(&self, n: usize) -> CVec {
+    /// bottom-up to the root. The `view` resolves compiled [`ColRef`] leaves to
+    /// concrete columns for *this* batch — the same tree evaluates any batch of
+    /// the window's schema.
+    fn eval_vec(&self, view: &ColumnarBatch<'_>, n: usize) -> CVec {
         match self {
             ColumnExpr::Lit(v) => lit_vec(v, n),
-            ColumnExpr::Col(col) => col_vec(col, n),
-            ColumnExpr::ListIndex { col, index } => list_index_vec(col, *index, n),
-            ColumnExpr::Neg(inner) => neg_vec(inner.eval_vec(n)),
-            ColumnExpr::Not(inner) => not_vec(inner.eval_vec(n)),
-            ColumnExpr::And(left, right) => logic_vec::<true>(left.eval_vec(n), right.eval_vec(n)),
-            ColumnExpr::Or(left, right) => logic_vec::<false>(left.eval_vec(n), right.eval_vec(n)),
+            ColumnExpr::Col(col) => view.col_vec(col, n),
+            ColumnExpr::ListIndex { col, index } => view.list_index_vec(col, *index, n),
+            ColumnExpr::Neg(inner) => neg_vec(inner.eval_vec(view, n)),
+            ColumnExpr::Not(inner) => not_vec(inner.eval_vec(view, n)),
+            ColumnExpr::And(left, right) => {
+                logic_vec::<true>(left.eval_vec(view, n), right.eval_vec(view, n))
+            }
+            ColumnExpr::Or(left, right) => {
+                logic_vec::<false>(left.eval_vec(view, n), right.eval_vec(view, n))
+            }
             ColumnExpr::Cmp { op, left, right } => {
-                cmp_vec(*op, left.eval_vec(n), right.eval_vec(n))
+                cmp_vec(*op, left.eval_vec(view, n), right.eval_vec(view, n))
             }
             ColumnExpr::Arith { op, left, right } => {
-                arith_vec(*op, left.eval_vec(n), right.eval_vec(n))
+                arith_vec(*op, left.eval_vec(view, n), right.eval_vec(view, n))
             }
-            ColumnExpr::CidrMatch { col, net } => cidr_vec(col, net, n),
-            ColumnExpr::RegexMatch { col, re } => regex_vec(col, re, n),
-            ColumnExpr::StrFunc { op, hay, needle } => {
-                strfunc_vec(*op, hay, needle, n)
-            }
+            ColumnExpr::CidrMatch { col, net } => view.cidr_vec(col, net, n),
+            ColumnExpr::RegexMatch { col, re } => view.regex_vec(col, re, n),
+            ColumnExpr::StrFunc { op, hay, needle } => view.strfunc_vec(*op, hay, needle, n),
         }
     }
 }
@@ -620,44 +642,177 @@ fn lit_vec(v: &CScalar, n: usize) -> CVec {
     }
 }
 
-/// Materialize a [`ColRef`] leaf into a typed column in a single pass. A
-/// `Timestamp(Ns)` column reads as native `i64`; a `Null` column (missing field
-/// / unsupported type) reads as all-null, matching `ColRef` → `None`.
-fn col_vec(col: &ColRef<'_>, n: usize) -> CVec {
-    match col {
-        ColRef::Int64(a) => CVec::Int(
-            (0..n)
-                .map(|r| (!a.is_null(r)).then(|| a.value(r)))
-                .collect(),
-        ),
-        ColRef::TimestampNs(a) => CVec::Int(
-            (0..n)
-                .map(|r| (!a.is_null(r)).then(|| a.value(r)))
-                .collect(),
-        ),
-        ColRef::Float64(a) => CVec::Float(
-            (0..n)
-                .map(|r| (!a.is_null(r)).then(|| a.value(r)))
-                .collect(),
-        ),
-        ColRef::Utf8(a) => CVec::Str(
-            (0..n)
-                .map(|r| (!a.is_null(r)).then(|| a.value(r).into()))
-                .collect(),
-        ),
-        ColRef::Bool(a) => CVec::Bool(
-            (0..n)
-                .map(|r| (!a.is_null(r)).then(|| a.value(r)))
-                .collect(),
-        ),
-        // Array-shaped columns read bare are a non-null structured value per
-        // row (`Value::Array`), never a scalar — compares false, reads null as
-        // a boolean, and is not numeric (byte-identical to interpreted).
-        ColRef::JsonArray(a) => structured_col(n, |r| !a.is_null(r)),
-        ColRef::List(a) => structured_col(n, |r| !a.is_null(r)),
-        ColRef::LargeList(a) => structured_col(n, |r| !a.is_null(r)),
-        ColRef::FixedSizeList(a) => structured_col(n, |r| !a.is_null(r)),
-        ColRef::Null => CVec::Int(vec![None; n]),
+/// Vectorized column-leaf kernels — `ColumnarBatch` methods so a compiled
+/// (batch-independent) [`ColumnExpr`] tree resolves its [`ColRef`] leaves to
+/// *this* batch's columns at eval time. A downcast failure (stale reused tree /
+/// schema drift) degrades to all-null, matching the compiled `ColKind::Null`.
+impl ColumnarBatch<'_> {
+    fn int64_array(&self, col: &ColRef) -> Option<&Int64Array> {
+        self.column_at(col).and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+    }
+
+    fn float64_array(&self, col: &ColRef) -> Option<&Float64Array> {
+        self.column_at(col).and_then(|a| a.as_any().downcast_ref::<Float64Array>())
+    }
+
+    fn string_array(&self, col: &ColRef) -> Option<&StringArray> {
+        self.column_at(col).and_then(|a| a.as_any().downcast_ref::<StringArray>())
+    }
+
+    fn bool_array(&self, col: &ColRef) -> Option<&BooleanArray> {
+        self.column_at(col).and_then(|a| a.as_any().downcast_ref::<BooleanArray>())
+    }
+
+    fn ts_array(&self, col: &ColRef) -> Option<&TimestampNanosecondArray> {
+        self.column_at(col)
+            .and_then(|a| a.as_any().downcast_ref::<TimestampNanosecondArray>())
+    }
+
+    fn list_array(&self, col: &ColRef) -> Option<&ListArray> {
+        self.column_at(col).and_then(|a| a.as_any().downcast_ref::<ListArray>())
+    }
+
+    fn large_list_array(&self, col: &ColRef) -> Option<&LargeListArray> {
+        self.column_at(col)
+            .and_then(|a| a.as_any().downcast_ref::<LargeListArray>())
+    }
+
+    fn fixed_size_list_array(&self, col: &ColRef) -> Option<&FixedSizeListArray> {
+        self.column_at(col)
+            .and_then(|a| a.as_any().downcast_ref::<FixedSizeListArray>())
+    }
+
+    /// Materialize a [`ColRef`] leaf into a typed column in a single pass. A
+    /// `Timestamp(Ns)` column reads as native `i64`; a `Null` column (missing
+    /// field / unsupported type) reads as all-null, matching `ColRef` → `None`.
+    fn col_vec(&self, col: &ColRef, n: usize) -> CVec {
+        match col.kind {
+            ColKind::Null => CVec::Int(vec![None; n]),
+            ColKind::Int64 => match self.int64_array(col) {
+                Some(a) => CVec::Int(
+                    (0..n)
+                        .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+                        .collect(),
+                ),
+                None => CVec::Int(vec![None; n]),
+            },
+            ColKind::TimestampNs => match self.ts_array(col) {
+                Some(a) => CVec::Int(
+                    (0..n)
+                        .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+                        .collect(),
+                ),
+                None => CVec::Int(vec![None; n]),
+            },
+            ColKind::Float64 => match self.float64_array(col) {
+                Some(a) => CVec::Float(
+                    (0..n)
+                        .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+                        .collect(),
+                ),
+                None => CVec::Float(vec![None; n]),
+            },
+            ColKind::Utf8 => match self.string_array(col) {
+                Some(a) => CVec::Str(
+                    (0..n)
+                        .map(|r| (!a.is_null(r)).then(|| a.value(r).into()))
+                        .collect(),
+                ),
+                None => CVec::Str(vec![None; n]),
+            },
+            ColKind::Bool => match self.bool_array(col) {
+                Some(a) => CVec::Bool(
+                    (0..n)
+                        .map(|r| (!a.is_null(r)).then(|| a.value(r)))
+                        .collect(),
+                ),
+                None => CVec::Bool(vec![None; n]),
+            },
+            // Array-shaped columns read bare are a non-null structured value per
+            // row (`Value::Array`), never a scalar — compares false, reads null as
+            // a boolean, and is not numeric (byte-identical to interpreted).
+            ColKind::JsonArray => match self.string_array(col) {
+                Some(a) => structured_col(n, |r| !a.is_null(r)),
+                None => structured_col(n, |_| false),
+            },
+            ColKind::List => match self.list_array(col) {
+                Some(a) => structured_col(n, |r| !a.is_null(r)),
+                None => structured_col(n, |_| false),
+            },
+            ColKind::LargeList => match self.large_list_array(col) {
+                Some(a) => structured_col(n, |r| !a.is_null(r)),
+                None => structured_col(n, |_| false),
+            },
+            ColKind::FixedSizeList => match self.fixed_size_list_array(col) {
+                Some(a) => structured_col(n, |r| !a.is_null(r)),
+                None => structured_col(n, |_| false),
+            },
+        }
+    }
+
+    /// Vectorized `cidr_match(field, net)` over a string column. Mirrors the
+    /// interpreted path: only a `Utf8` column can carry an IP string; null cells
+    /// read null; non-UTF8 / array-shaped / missing columns read all-null; a
+    /// non-IP string parses to `false` (via `Cidr::contains`). The subnet is
+    /// already parsed — this kernel never re-parses the CIDR.
+    fn cidr_vec(&self, col: &ColRef, net: &wf_lang::cidr::Cidr, n: usize) -> CVec {
+        match self.string_array(col) {
+            Some(a) => CVec::Bool(
+                (0..n)
+                    .map(|r| (!a.is_null(r)).then(|| net.contains(a.value(r))))
+                    .collect(),
+            ),
+            None => CVec::Bool(vec![None; n]),
+        }
+    }
+
+    /// Vectorized `regex_match(field, re)` over a string column. Mirrors the
+    /// interpreted path: only a `Utf8` column can carry a haystack; null cells
+    /// read null; non-UTF8 / array-shaped / missing columns read all-null. The
+    /// regex is already compiled — this kernel never recompiles it.
+    fn regex_vec(&self, col: &ColRef, re: &regex::Regex, n: usize) -> CVec {
+        match self.string_array(col) {
+            Some(a) => CVec::Bool(
+                (0..n)
+                    .map(|r| (!a.is_null(r)).then(|| re.is_match(a.value(r))))
+                    .collect(),
+            ),
+            None => CVec::Bool(vec![None; n]),
+        }
+    }
+
+    /// Vectorized `contains` / `startswith` / `endswith` over string columns.
+    /// Mirrors the interpreted path: both operands must be `Value::Str` (a `Utf8`
+    /// column); null on either side reads null; non-Utf8 columns read all-null.
+    /// A literal needle is shared across the row loop (no per-row clone).
+    fn strfunc_vec(&self, op: StrFuncOp, hay: &ColRef, needle: &Needle, n: usize) -> CVec {
+        let apply = |h: &str, nd: &str| match op {
+            StrFuncOp::Contains => h.contains(nd),
+            StrFuncOp::StartsWith => h.starts_with(nd),
+            StrFuncOp::EndsWith => h.ends_with(nd),
+        };
+        match (self.string_array(hay), needle) {
+            (Some(h), Needle::Lit(nd)) => CVec::Bool(
+                (0..n)
+                    .map(|r| (!h.is_null(r)).then(|| apply(h.value(r), nd)))
+                    .collect(),
+            ),
+            (Some(h), Needle::Col(nc)) => match self.string_array(nc) {
+                Some(nc) => CVec::Bool(
+                    (0..n)
+                        .map(|r| {
+                            if h.is_null(r) || nc.is_null(r) {
+                                None
+                            } else {
+                                Some(apply(h.value(r), nc.value(r)))
+                            }
+                        })
+                        .collect(),
+                ),
+                None => CVec::Bool(vec![None; n]),
+            },
+            _ => CVec::Bool(vec![None; n]),
+        }
     }
 }
 
@@ -669,68 +824,6 @@ fn structured_col(n: usize, non_null: impl Fn(usize) -> bool) -> CVec {
             .map(|r| non_null(r).then_some(CScalar::Structured))
             .collect(),
     )
-}
-
-/// Vectorized `cidr_match(field, net)` over a string column. Mirrors the
-/// interpreted path: only a `Utf8` column can carry an IP string; null cells
-/// read null; non-UTF8 / array-shaped / missing columns read all-null; a
-/// non-IP string parses to `false` (via `Cidr::contains`). The subnet is
-/// already parsed — this kernel never re-parses the CIDR.
-fn cidr_vec(col: &ColRef<'_>, net: &wf_lang::cidr::Cidr, n: usize) -> CVec {
-    match col {
-        ColRef::Utf8(a) => CVec::Bool(
-            (0..n)
-                .map(|r| (!a.is_null(r)).then(|| net.contains(a.value(r))))
-                .collect(),
-        ),
-        _ => CVec::Bool(vec![None; n]),
-    }
-}
-
-/// Vectorized `regex_match(field, re)` over a string column. Mirrors the
-/// interpreted path: only a `Utf8` column can carry a haystack; null cells
-/// read null; non-UTF8 / array-shaped / missing columns read all-null. The
-/// regex is already compiled — this kernel never recompiles it.
-fn regex_vec(col: &ColRef<'_>, re: &regex::Regex, n: usize) -> CVec {
-    match col {
-        ColRef::Utf8(a) => CVec::Bool(
-            (0..n)
-                .map(|r| (!a.is_null(r)).then(|| re.is_match(a.value(r))))
-                .collect(),
-        ),
-        _ => CVec::Bool(vec![None; n]),
-    }
-}
-
-/// Vectorized `contains` / `startswith` / `endswith` over string columns.
-/// Mirrors the interpreted path: both operands must be `Value::Str` (a `Utf8`
-/// column); null on either side reads null; non-Utf8 columns read all-null.
-/// A literal needle is shared across the row loop (no per-row clone).
-fn strfunc_vec(op: StrFuncOp, hay: &ColRef<'_>, needle: &Needle<'_>, n: usize) -> CVec {
-    let apply = |h: &str, nd: &str| match op {
-        StrFuncOp::Contains => h.contains(nd),
-        StrFuncOp::StartsWith => h.starts_with(nd),
-        StrFuncOp::EndsWith => h.ends_with(nd),
-    };
-    match (hay, needle) {
-        (ColRef::Utf8(h), Needle::Lit(nd)) => CVec::Bool(
-            (0..n)
-                .map(|r| (!h.is_null(r)).then(|| apply(h.value(r), nd)))
-                .collect(),
-        ),
-        (ColRef::Utf8(h), Needle::Col(ColRef::Utf8(nc))) => CVec::Bool(
-            (0..n)
-                .map(|r| {
-                    if h.is_null(r) || nc.is_null(r) {
-                        None
-                    } else {
-                        Some(apply(h.value(r), nc.value(r)))
-                    }
-                })
-                .collect(),
-        ),
-        _ => CVec::Bool(vec![None; n]),
-    }
 }
 
 /// Vectorized unary negation. `Int` negates to `Float` (widening, mirroring the
@@ -778,55 +871,69 @@ fn not_vec(inner: CVec) -> CVec {
 /// array cell as a scalar (null cell / parse failure / out of range → null).
 /// A non-array column reads all-null — the interpreted path walk yields `None`
 /// for an index segment on a non-array root, so this is byte-identical.
-fn list_index_vec(col: &ColRef<'_>, index: usize, n: usize) -> CVec {
-    match col {
-        ColRef::JsonArray(a) => CVec::Scalar(
-            (0..n)
-                .map(|r| {
-                    if a.is_null(r) {
-                        None
-                    } else {
-                        nth_json_array_scalar(a.value(r), index)
-                    }
-                })
-                .collect(),
-        ),
-        ColRef::List(a) => CVec::Scalar(
-            (0..n)
-                .map(|r| {
-                    if a.is_null(r) {
-                        None
-                    } else {
-                        list_slice_nth_scalar(a.value(r).as_ref(), index)
-                    }
-                })
-                .collect(),
-        ),
-        ColRef::LargeList(a) => CVec::Scalar(
-            (0..n)
-                .map(|r| {
-                    if a.is_null(r) {
-                        None
-                    } else {
-                        list_slice_nth_scalar(a.value(r).as_ref(), index)
-                    }
-                })
-                .collect(),
-        ),
-        ColRef::FixedSizeList(a) => CVec::Scalar(
-            (0..n)
-                .map(|r| {
-                    if a.is_null(r) {
-                        None
-                    } else {
-                        list_slice_nth_scalar(a.value(r).as_ref(), index)
-                    }
-                })
-                .collect(),
-        ),
+impl ColumnarBatch<'_> {
+    fn list_index_vec(&self, col: &ColRef, index: usize, n: usize) -> CVec {
+        match col.kind {
+            ColKind::JsonArray => match self.string_array(col) {
+            Some(a) => CVec::Scalar(
+                (0..n)
+                    .map(|r| {
+                        if a.is_null(r) {
+                            None
+                        } else {
+                            nth_json_array_scalar(a.value(r), index)
+                        }
+                    })
+                    .collect(),
+            ),
+            None => CVec::Scalar(vec![None; n]),
+        },
+        ColKind::List => match self.list_array(col) {
+            Some(a) => CVec::Scalar(
+                (0..n)
+                    .map(|r| {
+                        if a.is_null(r) {
+                            None
+                        } else {
+                            list_slice_nth_scalar(a.value(r).as_ref(), index)
+                        }
+                    })
+                    .collect(),
+            ),
+            None => CVec::Scalar(vec![None; n]),
+        },
+        ColKind::LargeList => match self.large_list_array(col) {
+            Some(a) => CVec::Scalar(
+                (0..n)
+                    .map(|r| {
+                        if a.is_null(r) {
+                            None
+                        } else {
+                            list_slice_nth_scalar(a.value(r).as_ref(), index)
+                        }
+                    })
+                    .collect(),
+            ),
+            None => CVec::Scalar(vec![None; n]),
+        },
+        ColKind::FixedSizeList => match self.fixed_size_list_array(col) {
+            Some(a) => CVec::Scalar(
+                (0..n)
+                    .map(|r| {
+                        if a.is_null(r) {
+                            None
+                        } else {
+                            list_slice_nth_scalar(a.value(r).as_ref(), index)
+                        }
+                    })
+                    .collect(),
+            ),
+            None => CVec::Scalar(vec![None; n]),
+        },
         // Non-array root column: the interpreted walk hits an index segment on
         // a non-array value → `None` for every row.
         _ => CVec::Scalar(vec![None; n]),
+        }
     }
 }
 
