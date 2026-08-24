@@ -15,7 +15,7 @@ mod stats_exec;
 
 pub use each_exec::EachDirectBatchStats;
 // 供 `match_engine::pub use executor::DistinctKey` 转发（stats distinct 键类型）。
-pub use stats_exec::{DistinctKey, StatsExecutor, StatsWindowState};
+pub use stats_exec::{DistinctKey, StatsAccum, StatsExecutor, StatsWindowState};
 
 #[cfg(test)]
 mod close_coverage_more;

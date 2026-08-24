@@ -142,6 +142,80 @@ fn full_bid_subset() -> Arc<HashSet<String>> {
     Arc::new(sorted_bid_names().into_iter().collect())
 }
 
+/// 输入分区分片归并（2026-08-24 q15）: 两片独立累加（各取一半行, 片间
+/// distinct 值有重叠）→ `take_partial` + `merge_partial` → 最终度量值与单实例
+/// 喂全部行**完全一致**（count 相加 / sum 相加 / min·max 取极值 / distinct 集
+/// union 去重）。
+#[test]
+fn stats_input_shard_merge_matches_single() {
+    let minmax = |agg: StatsAggPlan| StatsMeasurePlan {
+        label: "m".into(),
+        source_alias: "b".into(),
+        where_expr: None,
+        agg,
+        field: Some(FieldRef::Qualified("b".into(), "price".into())),
+        arg: None,
+    };
+    let plan = simple_plan(vec![
+        count_measure("count"),
+        distinct_measure("bidders", "bidder"),
+        distinct_measure("auctions", "auction"),
+        sum_measure("sum_price", "price"),
+        minmax(StatsAggPlan::Min),
+        minmax(StatsAggPlan::Max),
+    ]);
+    let rows: Vec<HashMap<String, Value>> = vec![
+        row(&[
+            ("bidder", num(1.0)),
+            ("auction", num(10.0)),
+            ("price", num(5.0)),
+        ]),
+        row(&[
+            ("bidder", num(1.0)),
+            ("auction", num(11.0)),
+            ("price", num(7.0)),
+        ]),
+        row(&[
+            ("bidder", num(2.0)),
+            ("auction", num(10.0)),
+            ("price", num(3.0)),
+        ]),
+        row(&[
+            ("bidder", num(2.0)),
+            ("auction", num(12.0)),
+            ("price", num(9.0)),
+        ]),
+    ];
+
+    // 单实例（基准）: 全部行。
+    let mut single = StatsExecutor::new(plan.clone());
+    single.process_rows(&rows, extract);
+    let expect = single.final_measure_values();
+    assert_eq!(expect[0], 4.0, "count");
+    assert_eq!(expect[1], 2.0, "distinct bidder {{1,2}}");
+    assert_eq!(expect[2], 3.0, "distinct auction {{10,11,12}}");
+    assert_eq!(expect[3], 24.0, "sum price");
+    assert_eq!(expect[4], 3.0, "min price");
+    assert_eq!(expect[5], 9.0, "max price");
+
+    // 两片（输入分区: 片 A = 行 0/2, 片 B = 行 1/3; bidder 1/2 跨片重复）。
+    let mut a = StatsExecutor::new(plan.clone());
+    a.process_rows(&[rows[0].clone(), rows[2].clone()], extract);
+    let mut b = StatsExecutor::new(plan);
+    b.process_rows(&[rows[1].clone(), rows[3].clone()], extract);
+    let (buckets, count) = b.take_partial();
+    a.merge_partial(buckets, count);
+    assert_eq!(
+        a.final_measure_values(),
+        expect,
+        "分片归并必须与单实例逐值一致（count/sum/min/max/distinct）"
+    );
+
+    // take_partial 后片 B 已重置: 再累加不叠加旧值。
+    b.process_rows(&[rows[0].clone()], extract);
+    assert_eq!(b.final_measure_values()[0], 1.0, "take_partial 重置窗口");
+}
+
 #[test]
 fn stats_count_and_distinct() {
     let plan = simple_plan(vec![

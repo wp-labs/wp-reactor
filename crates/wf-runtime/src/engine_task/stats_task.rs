@@ -42,6 +42,21 @@ use super::{register_notifications, wait_any};
 /// 单次构建峰值从全窗口（q19 30M ≈ 7.94M 条）降到阈值量级。
 const EMIT_CHUNK: usize = 1_000_000;
 
+/// 输入分区分片的窗口 partial（空键 stats, 2026-08-24 q15）:
+/// 非协调片在窗口 close 时发送的**原始累加状态**。
+/// `(window_start_nanos, window_end_nanos, 桶原始状态, 本片事件数)`——协调片
+/// 收齐 N-1 个后 `StatsExecutor::merge_partial` 合并再 close emit。
+/// 空窗（无事件）也发送空 partial, 协调片据此计数, 不会死锁。
+pub(crate) type StatsPartial = (
+    i64,
+    i64,
+    Vec<(
+        wf_engine::match_engine::ScopeKey,
+        Vec<wf_engine::match_engine::StatsAccum>,
+    )>,
+    u64,
+);
+
 /// pull 模式每次源拉取 = (窗口名, 批次, 每批分片行子集, 新游标, 是否 gap)。
 type PendingStatsPull = (
     String,
@@ -67,7 +82,12 @@ pub(super) struct StatsTask {
     progress: HashMap<String, Arc<AtomicU64>>,
     cursors: HashMap<String, u64>,
     shard_index: Option<usize>,
-    /// 当前 fixed 窗口起点（bucket 对齐首个事件; `None` = 尚未见事件）。
+    shard_count: usize,
+    /// 输入分区分片归并（空键 stats）: 协调片收 partial 的接收端（shard 0）;
+    /// 非协调片发送端; 未分片两者皆 None。
+    merge_rx: Option<mpsc::Receiver<StatsPartial>>,
+    merge_tx: Option<mpsc::Sender<StatsPartial>>,
+    /// 当前窗口（fixed 桶, bucket 对齐首个事件; `None` = 尚未见事件）。
     window_start: Option<i64>,
     /// 当前窗口结束（= window_start + dur; close 判定 watermark >= window_end）。
     window_end: Option<i64>,
@@ -97,7 +117,9 @@ impl StatsTask {
             push_rx,
             progress,
             shard_index,
-            shard_count: _,
+            shard_count,
+            merge_rx,
+            merge_tx,
         } = config;
         let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
         let task_id = format!("{}#{}", executor.plan().name, seq);
@@ -116,6 +138,9 @@ impl StatsTask {
             progress,
             cursors: HashMap::new(),
             shard_index,
+            shard_count,
+            merge_rx,
+            merge_tx,
             window_start: None,
             window_end: None,
             last_watermark: i64::MIN,
@@ -346,6 +371,35 @@ impl StatsTask {
     /// 分段归并下事件推进路径本不会空窗 close, 此 guard 是显式不变式 + 未来
     /// session/sliding 路径的防线。
     async fn close_current_window(&mut self, window_start: i64, window_end: i64) {
+        // 输入分区分片（空键 stats, q15）: 非协调片提取 raw 状态发送后不 emit
+        // （协调片合并后统一产出）; 协调片（shard 0）收齐 N-1 个 partial 合并
+        // 后再走正常 close+emit。空窗也发空 partial——协调片按 N-1 次 recv 计数,
+        // 空 partial 合并无效果, 避免死锁。
+        if let Some(tx) = &self.merge_tx {
+            let (buckets, count) = self.stats.take_partial();
+            let _ = tx.send((window_start, window_end, buckets, count)).await;
+            return;
+        }
+        if let Some(rx) = &mut self.merge_rx {
+            for _ in 1..self.shard_count.max(1) {
+                let (ws, we, buckets, count) = rx
+                    .recv()
+                    .await
+                    .expect("stats merge channel closed before all shards sent");
+                let empty = buckets.is_empty() && count == 0;
+                if !empty && (ws != window_start || we != window_end) {
+                    wf_warn!(pipe,
+                        task_id = %self.task_id,
+                        window_start = window_start,
+                        window_end = window_end,
+                        partial_start = ws,
+                        partial_end = we,
+                        "stats input-shard partial window mismatch (should not happen)"
+                    );
+                }
+                self.stats.merge_partial(buckets, count);
+            }
+        }
         if self.stats.window.event_count == 0 {
             return;
         }
@@ -578,6 +632,19 @@ impl StatsTask {
 
     /// close 残留窗口（事件时间未越过边界的尾部窗口）。
     pub(super) async fn flush(&mut self) {
+        // 输入分区分片非协调片: 无当前窗口也发空 partial（协调片 flush 在等
+        // N-1 个——空窗哨兵窗口 (MIN, MIN), 协调片按空 partial 合并跳过）。
+        if let Some(tx) = &self.merge_tx {
+            let (start, end) = match (self.window_start, self.window_end) {
+                (Some(s), Some(e)) => (s, e),
+                _ => (i64::MIN, i64::MIN),
+            };
+            let (buckets, count) = self.stats.take_partial();
+            let _ = tx.send((start, end, buckets, count)).await;
+            self.window_start = None;
+            self.window_end = None;
+            return;
+        }
         let (Some(start), Some(end)) = (self.window_start, self.window_end) else {
             return;
         };

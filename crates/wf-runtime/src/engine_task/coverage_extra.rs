@@ -89,6 +89,8 @@ async fn run_stats_task_push_channel_close_returns_ok() {
         progress: std::collections::HashMap::new(),
         shard_index: None,
         shard_count: 1,
+        merge_rx: None,
+        merge_tx: None,
     };
     drop(tx);
 

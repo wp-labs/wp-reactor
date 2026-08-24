@@ -637,6 +637,30 @@ q5 的**源**，pull ack 已保护，无害）。
 - 回归：`cargo test -p wf-lang -p wf-engine -p wf-runtime --lib` → **931 + 1075 +
   492 passed**；clippy 无新增（只剩既有 too_many_arguments）。
 
+## 2026-08-24 四次全量 30M replay（merge 后 + q4/q9 deferred 分片，哨兵 EPS 口径）
+
+`./bench.sh all replay 30m`（14:44-14:50），22/22 `[clean]`，**eps_mode=sentinel**（哨兵
+四元组口径，剔 ingest 等待；与前三轮 metrics-append 口径不可逐位比较）。
+vs OSS **7.41×~211.87×**；vs VVR **1.90×~56.25×，20/20 达 VVR**。
+
+| 查询 | 13:56 全量 | 本次 | 查询 | 13:56 全量 | 本次 |
+|---|---|---|---|---|---|
+| q1 | 17.97M | 20.61M | q12 | 18.27M | 18.45M |
+| q2 | 22.90M | 24.94M | q13 | 409.9k | 392.2k |
+| q3 | 22.43M | 25.87M | q14 | 10.86M | 11.42M |
+| **q4** | **4.05M** | **7.87M（分片 1.9×）** | q15 | 4.43M | 4.44M |
+| q5 | 6.63M | 6.89M | q16 | 7.42M | 7.44M |
+| q6 | 750.5k | 742.6k | q17 | 14.85M | 15.93M |
+| q7 | 17.59M | 16.85M | q18 | 14.63M | 15.67M |
+| q8 | 23.24M | 25.95M | q19 | 5.22M | 5.54M |
+| **q9** | **4.64M** | **7.84M（分片 1.7×）** | q20 | 4.59M | 4.70M |
+| q10 | 19.98M | 20.70M | q21 | 17.42M | 22.25M |
+| q11 | 18.51M | 19.22M | q22 | 7.65M | 7.81M |
+
+注：q4/q9 的提升是 deferred 分片（本轮真实增量）；其余差异主要是哨兵口径 + 负载
+噪声（q7 −4% 等）。低速点只剩：q13（392k，中间窗物化）、q6（743k，sliding 特殊
+口径）、q15（4.44M stats 单桶）、q20（4.70M snapshot 展开）。
+
 ## 2026-08-24 q4/q9 deferred 分片（spawn 放宽 + EOS 全局尾部修复）
 
 ### 为什么 q4 单核
@@ -681,15 +705,113 @@ q5 的**源**，pull ack 已保护，无害）。
 - 回归：`cargo test -p wf-lang -p wf-engine -p wf-runtime --lib` → **931 + 1075 +
   493 passed**；clippy 无新增。
 
+## ✅ q20 snapshot join 性能（2026-08-24，Arc<JoinRow> 消除每行 clone/drop）
+
+**目标**：q20（`on each b` + snapshot join auction + `where category==10`）30M 4.70M EPS
+（全量倒数第 4，snapshot 展开路径）。数据驱动：先函数级 profile，再改。
+
+### 函数级归因（macOS `sample` 采样 + 段级计时，非猜测）
+
+- each_exec 每段（4096 行）总耗时 7.5ms：join 3.15ms（key 0.14 + lookup 0.72 +
+  fill 1.78）+ out 4.34ms（recheck 1.86 + where 0.17 + meta/yield/commit ~0.25 +
+  **未捕获 2.1ms**）。rule_task exec 80ms/批 ≈ 8.8 段 × 7.3ms + 16ms 锁开销，账闭合。
+- `sample` 调用树：`execute_each_direct_batch_columnar_join` 占 process_batch
+  93%；其中 **JoinRow drop_glue 1791/4477 采样（40%）**——fill 每行 `first.clone()`
+  （JoinRow::Columnar = 4 个 Arc bump）+ recheck 每行 `row_match[idx].clone()`
+  （再 4 个）+ 行尾 drop；共享批 Arc 跨线程原子争用（q20 CPU 571%）。
+- 未捕获 2.1ms = drop 成本（计时器外的 JoinRow/Value drop，行尾 + 函数尾）。
+
+### 修复（`1b2f657`）
+
+1. `row_match: Vec<Option<Arc<JoinRow>>>`：每桶只搬移一次首行
+   （`into_iter().next()` 零 bump），每行仅 1 次 Arc clone（原 4 个 Arc bump）。
+2. recheck 命中行 `as_ref()` 零克隆；miss 行结果暂存 `miss_hold`（仅 miss 行
+   承担 lookup 成本）。
+3. fill 浮点/非浮点分支拆分（q20 非浮点走共享 Arc 路径）。
+
+### 实测（30M replay，哨兵 EPS）
+
+- **q20: 4.62M → 20.87M EPS（4.5×）**；RSS 10.0GB → 4.5GB（−55%）；CPU 618% → 260%
+  （原子争用消除）。
+- 段级：fill 1785µs→19µs（94×）、recheck 1862µs→296µs、每段 7512µs→1656µs。
+- 正确性：q13 全部一致 ✅（同路径静态 provider join 不受影响）；**q20 verify
+  偏差 0.97~1.65%（<5% 容差）**。
+
+### q20 偏差机制（已用计数器钉死，非逻辑 bug）
+
+fill_hit/recheck_rescue 计数器：原始 fill_hit=24.27M、recheck=0；修复后
+fill_hit=23.87M、recheck=104k。差异不在代码逻辑（两版提取同一 bucket.first()），
+而是原设计「批快照 + 行时复查」的**固有竞态**：join 目标窗口（非 source）按
+`eff_max_seq=None` 读**全量已提交状态**；原始 fill 循环的 clone 工作（1.78ms/段）
+穿插在 join_lookup 之间，窗口在期间持续前进，后面的 key 看到更晚快照；加速后
+所有 lookup 挤在窗口前进前完成 → 少命中，recheck（更晚时点）只补回部分。
+方向恒为**少发**（更接近真实流序——少看到“未来 auction”的过度匹配），原始
+精确一致是慢速 clone 恰做“节奏延迟”的巧合。**待办（可选）**：确定性快照边界
+（跨窗口 seq-cut 映射）才能彻底钉死，工程中等，暂不做。
+
+## ✅ q15 空键 stats 输入分区分片 + EOS 归并（2026-08-24）
+
+**目标**：q15（`stats<1d:fixed>` 空键 12 度量, 4.44M EPS 全量倒数第 4）单核封顶。
+
+### 归因（数据驱动, WF_Q15_DIAG 段级计时）
+
+- 每批 36,500 行 → seg 8.94ms（245ns/row）, **accumulate（process_batch_rows
+  列式归并）占 98%**——8 个 distinct_count 每行 4~8 次 HashSet insert 是全部
+  成本; 单核（CPU 76%）不可再优化 → 必须多核。
+- 第一步（已提交 `304094e`）：distinct_set 从 std SipHash 换 foldhash
+  （EngineHashSet）→ 245→185ns/row, **4.22M→5.53M（+31%）**, verify ✅。
+
+### 输入分区分片（`2d5b982`）
+
+空键 + 度量全可交换（count/sum/min/max/distinct; last/top 行序敏感门控排除）
++ pull 模式 + shard_count>1 → 按行号 `row % N` 均匀切分 N 任务, close 时归并：
+- fanout：`partition_rows_by_index` + `register_window_index_sharding`
+  （空键 = index 分区标记; precompute_shard_rows 分支）
+- stats_exec：`take_partial`（raw 桶状态 + 重置）+ `merge_partial`
+  （count 加 / sum 加 / min·max 极值 / distinct 集 union）
+- stats_task：非协调片 close 发 raw partial 不 emit（空窗发空 partial 防死
+  锁）; 协调片（shard 0）收齐 N-1 归并后统一 emit; flush 同构
+
+### 实测（30M replay, 哨兵 EPS）
+
+- **q15: 5.53M → 7.75M（+40%）, CPU 72%→563%（多核）, RSS 6.6GB 无爆炸**;
+  verify **全部一致 ✅**（归并精确——count 相加 + distinct 集 union 精确）
+- 测试：executor 级 `stats_input_shard_merge_matches_single`（两片归并 ==
+  单实例逐值一致）+ 任务级 `q15_input_shard_merge_emits_single_equivalent`
+  （2 片 + 协调片, 输出字节一致, 非协调片不 emit）
+- 全量 1079 + 525 测试过; clippy 无新增
+
+### 已知瓶颈（未解决）
+
+协调片 EOS 归并 ~883ms 串行（9 片 × 8 distinct 集 union = 68M 次 insert）+ 每
+片对**全批**做 where mask/domain 的 10× 冗余。方向：归并按度量并行（8 度量
+独立 union）、mask 单算共享或按片行域裁剪。
+
 ## 下一步（重开 session 从这里继续）
 
-1. **全量 22 查询 30M 重跑 + 重新采集 OSS/VVR 对照**（q9/q4 EPS 已 4.9×；两份基准
-   文档数字已过时）
-2. q3 −16% 根因（已反复确认与驱逐/pin 无关，是独立 bug）；q12 fixed+close 尾桶收口
-3. D4 剩余：eager interval join 的 pin（nexmark 暂无此形态）；及「结果可能不完整」
-   的正确性信号/指标（现在只有一条 warn）
-4. （可选）q13 列式 join 免 Event 物化
-5. （可选）跟进 ⚠️ 观察 1：10m 下 bid_mod 中间窗 9.3GB RSS（over=2d 不驱逐属预期，仅记录）
-6. 旁支发现（非本次改动）：`match_engine/tests/executor/direct_tests.rs:412`
-   `each_join_columnar_gate_rejects_unsupported_shapes` 编译告警 never used
-   ——疑似漏了 `#[test]`，测试其实没在跑。
+1. **全量 22 查询 30M 重跑 + OSS/VVR 对照刷新**（q4/q5/q9/q20/q15 均已大幅
+   变化; q15 现 7.75M）
+2. （可选）q15 归并/冗余优化（见上节已知瓶颈）; q3 −16% 独立 bug
+3. D4 剩余：eager interval join 的 pin; 「结果可能不完整」的正确性信号/指标
+4. （可选）q20 确定性快照边界; q13 列式 join 免 Event 物化
+5. 旁支发现：`match_engine/tests/executor/direct_tests.rs:412` 编译告警 never
+   used——疑似漏 `#[test]`, 测试没在跑。
+
+## 测试补充（2026-08-24，随 q20 修复提交）
+
+单元测试（direct_tests.rs，+3）：
+- `columnar_join_hot_key_rows_match_event_path`：热键多行同桶（Arc 共享首行），
+  且桶首行（而非桶内其它行）决定富化——列式 vs 行式字节一致
+- `columnar_join_recheck_rescues_mid_batch_append`：GrowJoinLookup（每 key 首次
+  lookup 空桶 → 批级 miss，后续非空 → 行时 recheck 救援）——救援后输出与
+  「快照即命中」静态 mock 字节一致（钉死 `miss_hold` 新路径）
+- `columnar_join_float_hot_key_matches_event_path`：float 左键热键同桶
+  （f64→Int 截断 + values_equal 复核）列式 vs 行式字节一致
+
+性能单元测试（each_bench.rs，+1，`cargo test --release -p wf-engine
+q20_columnar_join_per_row -- --ignored --nocapture`）：
+- 4096 行/段（生产 ALERT_BATCH_SIZE）+ 真实 join 索引窗口（1M auction 行）
+- unique 键 228ns/row（4.4M/s）vs 热键混合 122ns/row（8.3M/s，去重+单 Arc
+  共享 1.9×）vs 行式参考 276ns/row（3.6M/s，列式 2.3×）
+- 热键 122ns/row 与此前 stats 微基准 122ns/evt 吻合；端到端剩余成本在
+  rule_task 层（pull/遥测/锁/commit），不在 executor

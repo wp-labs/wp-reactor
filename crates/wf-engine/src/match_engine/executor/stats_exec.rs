@@ -16,7 +16,7 @@ use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsPlan};
 use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
 use crate::match_engine::event_bridge::extract_field_value;
 use crate::match_engine::match_engine::{Event, ScopeKey, field_ref_name};
-use crate::match_engine::{EngineHashMap, Value};
+use crate::match_engine::{EngineHashMap, EngineHashSet, Value};
 use crate::window::scope_key_columnar;
 use crate::window::scope_key_from_column;
 
@@ -31,7 +31,7 @@ pub struct StatsAccum {
     pub sum_i128: i128,
     pub min: Option<i128>,
     pub max: Option<i128>,
-    pub distinct_set: Option<HashSet<DistinctKey>>,
+    pub distinct_set: Option<EngineHashSet<DistinctKey>>,
     /// `last(field)` 用（Q18）: 最近合格行的**行字段列数组**（P5 紧凑化——按
     /// `row_field_names` 列序存储, 缺失/null = `None`; 旧 `EngineHashMap` 每桶
     /// 6 个 SmolStr key + hash 节点 ≈ 400B+/桶, 5.29M 桶直接顶到 ~19GB）。
@@ -369,7 +369,7 @@ impl StatsExecutor {
                             StatsAggPlan::DistinctCount => {
                                 let key = value_to_distinct_key(&val);
                                 acc.distinct_set
-                                    .get_or_insert_with(HashSet::new)
+                                    .get_or_insert_with(EngineHashSet::default)
                                     .insert(key);
                             }
                             StatsAggPlan::Last | StatsAggPlan::Top => {
@@ -488,6 +488,31 @@ impl StatsExecutor {
             last_event_nanos: 0,
             event_count: 0,
         };
+    }
+
+    /// 提取本片已关闭窗口的**原始累加状态**（输入分区分片归并用）并重置窗口。
+    /// 返回 `(桶原始状态, 本片事件数)`——协调片把它合并进自己的窗口后再 close。
+    /// 仅空键/可交换度量（count/sum/min/max/distinct）分片使用（last/top 被
+    /// spawn 门控排除——行序敏感不可归并）。
+    pub fn take_partial(&mut self) -> (Vec<(ScopeKey, Vec<StatsAccum>)>, u64) {
+        let buckets = self.window.take_buckets();
+        let count = self.window.event_count;
+        self.reset_window();
+        (buckets, count)
+    }
+
+    /// 归并另一片的原始累加状态（输入分区分片）: 计数相加、sum 相加、min/max
+    /// 取极值、distinct 集 union（`extend` 用自身 hasher 重插, 跨片 hasher 可
+    /// 不同）、事件数相加。last/top 不在此路径（spawn 门控排除）。
+    pub fn merge_partial(&mut self, buckets: Vec<(ScopeKey, Vec<StatsAccum>)>, event_count: u64) {
+        let n = self.plan.measures.len();
+        for (key, accs) in buckets {
+            let target = self.window.bucket_mut(&key, n);
+            for (t, o) in target.iter_mut().zip(accs.iter()) {
+                merge_accum(t, o);
+            }
+        }
+        self.window.event_count += event_count;
     }
 
     /// 列式批处理（P1.5, 设计 §6.2）: 消费 fanout 投递的 raw [`RecordBatch`]。
@@ -650,7 +675,7 @@ impl StatsExecutor {
                 let Some(field) = &measure.field else {
                     continue;
                 };
-                let set = acc.distinct_set.get_or_insert_with(HashSet::new);
+                let set = acc.distinct_set.get_or_insert_with(EngineHashSet::default);
                 if !insert_distinct_column(batch, field_name(field), mask.as_ref(), set) {
                     return false;
                 }
@@ -852,7 +877,9 @@ fn accumulate_column_row(
             }
             StatsAggPlan::DistinctCount => {
                 if let Some(k) = column_distinct_key(batch, field_name(field), row) {
-                    acc.distinct_set.get_or_insert_with(HashSet::new).insert(k);
+                    acc.distinct_set
+                        .get_or_insert_with(EngineHashSet::default)
+                        .insert(k);
                 }
             }
             StatsAggPlan::Last | StatsAggPlan::Top => {
@@ -893,6 +920,34 @@ fn measure_field_position(
             (Some(f), Some(ns)) => ns.iter().position(|n| n == field_name(f)),
             _ => None,
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 归并（输入分区分片: 可交换度量）
+// ---------------------------------------------------------------------------
+
+/// 归并两个累加器（count 相加 / sum 相加 / min·max 取极值 / distinct 集 union）。
+/// 仅可交换度量路径使用（last/top 被 spawn 门控排除——行序敏感不可归并）。
+fn merge_accum(t: &mut StatsAccum, o: &StatsAccum) {
+    t.count += o.count;
+    t.sum_i128 += o.sum_i128;
+    t.min = match (t.min, o.min) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    t.max = match (t.max, o.max) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    match (&mut t.distinct_set, &o.distinct_set) {
+        (Some(ts), Some(os)) => ts.extend(os.iter().cloned()),
+        (None, Some(os)) => t.distinct_set = Some(os.clone()),
+        _ => {}
     }
 }
 
@@ -1728,7 +1783,7 @@ fn insert_distinct_column(
     batch: &RecordBatch,
     name: &str,
     mask: Option<&BooleanArray>,
-    set: &mut HashSet<DistinctKey>,
+    set: &mut EngineHashSet<DistinctKey>,
 ) -> bool {
     let Some(idx) = batch
         .schema()

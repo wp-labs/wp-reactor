@@ -136,6 +136,8 @@ fn make_config(
         progress: HashMap::new(),
         shard_index: None,
         shard_count: 1,
+        merge_rx: None,
+        merge_tx: None,
     };
     let cancel = config.cancel.clone();
     (config, cancel)

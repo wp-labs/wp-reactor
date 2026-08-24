@@ -286,6 +286,8 @@ fn make_stats_task() -> (StatsTask, CancellationToken) {
         progress: HashMap::new(),
         shard_index: None,
         shard_count: 1,
+        merge_rx: None,
+        merge_tx: None,
     };
     StatsTask::new(config)
 }
