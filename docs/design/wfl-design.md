@@ -571,6 +571,7 @@ ANY           = ? any unicode char ? ;
 | `join` / `join_by` | `join(expr, ...)` / `join_by(separator, expr, ...)` → chars | L2 | 标量值拼接；取不到的参数按空字符串片段处理，不做 trim、大小写转换或转义 |
 | `split` | `split(field, separator)` → array/chars | L2 | 按分隔符切分字符串为多值 |
 | `regex_match` | `regex_match(field, pattern)` → bool | L2 | 正则匹配判定（pattern 须为 STRING 字面量） |
+| `cidr_match` | `cidr_match(ip, subnet)` → bool | L2 | IP 子网判定（subnet 须为 STRING 字面量 `"addr/prefix"`，编译期校验；兼容 IPv4/IPv6，Sigma `|cidr` 等效） |
 | `len` | `len(field)` → digit | L2 | 字符串长度 |
 | `lower` | `lower(field)` → chars | L2 | 转小写 |
 | `upper` | `upper(field)` → chars | L2 | 转大写 |
@@ -1276,6 +1277,7 @@ rule final_risk {
 | T17 | `time_bucket(f, interval_seconds)` — `f` 必须为 `time` 或 numeric；`interval_seconds` 必须为 numeric；返回 `time` |
 | T18 | `contains(f, pat)` — `f` 与 `pat` 必须为 `chars`；返回 `bool` |
 | T19 | `regex_match(f, pat)` — `f` 必须为 `chars`；`pat` 须为 STRING 字面量（编译期校验正则合法性）；返回 `bool` |
+| T19b | `cidr_match(f, cidr)` — `f` 必须为 `ip` 或 `chars`；`cidr` 须为 STRING 字面量（编译期校验 CIDR 合法性）；返回 `bool` |
 | T20 | `len(f)` — `f` 必须为 `chars`；返回 `digit` |
 | T21 | `lower(f)` / `upper(f)` — `f` 必须为 `chars`；返回 `chars` |
 | T22 | `collect_set(a.f)` / `collect_list(a.f)` — 参数必须为 Column 投影；返回 `array/T`（T 为 f 的类型） |

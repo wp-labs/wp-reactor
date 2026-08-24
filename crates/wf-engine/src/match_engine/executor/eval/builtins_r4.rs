@@ -871,6 +871,59 @@ fn time_and_regex_functions() {
 }
 
 // ---------------------------------------------------------------------------
+// CIDR: cidr_match（Sigma |cidr 等效）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cidr_match_v4_v6_and_errors() {
+    let ctx = ctx_with(vec![]);
+    // IPv4 私有网段命中。
+    assert_eq!(
+        eval("cidr_match", &[lit("10.1.2.3"), lit("10.0.0.0/8")], &ctx),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        eval("cidr_match", &[lit("11.0.0.1"), lit("10.0.0.0/8")], &ctx),
+        Some(Value::Bool(false))
+    );
+    // /32 精确匹配。
+    assert_eq!(
+        eval("cidr_match", &[lit("8.8.8.8"), lit("8.8.8.8/32")], &ctx),
+        Some(Value::Bool(true))
+    );
+    // 默认路由 /0。
+    assert_eq!(
+        eval("cidr_match", &[lit("1.2.3.4"), lit("0.0.0.0/0")], &ctx),
+        Some(Value::Bool(true))
+    );
+    // IPv6。
+    assert_eq!(
+        eval("cidr_match", &[lit("fe80::1"), lit("fe80::/10")], &ctx),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        eval("cidr_match", &[lit("fe80::1"), lit("::1/128")], &ctx),
+        Some(Value::Bool(false))
+    );
+    // 版本不一致不匹配。
+    assert_eq!(
+        eval("cidr_match", &[lit("127.0.0.1"), lit("::1/128")], &ctx),
+        Some(Value::Bool(false))
+    );
+    // 错误分支：非法 CIDR 子网 / 非字符串 / 非 IP。
+    assert_eq!(eval("cidr_match", &[lit("1.2.3.4"), lit("bad")], &ctx), None);
+    assert_eq!(eval("cidr_match", &[lit("1.2.3.4"), lit("10.0.0.0/33")], &ctx), None);
+    assert_eq!(eval("cidr_match", &[num_expr(1.0), lit("10.0.0.0/8")], &ctx), None);
+    assert_eq!(eval("cidr_match", &[lit("1.2.3.4"), num_expr(1.0)], &ctx), None);
+    assert_eq!(eval("cidr_match", &[lit("1.2.3.4")], &ctx), None);
+    // 非 IP 字符串（如 event.action）→ false。
+    assert_eq!(
+        eval("cidr_match", &[lit("not-an-ip"), lit("10.0.0.0/8")], &ctx),
+        Some(Value::Bool(false))
+    );
+}
+
+// ---------------------------------------------------------------------------
 // stat selectors: eval_stat_func / parse_stat_selector / number_value
 // ---------------------------------------------------------------------------
 

@@ -75,6 +75,7 @@ fn builtin_error_arg_count_guards() {
         "indexof",
         "pow",
         "regex_match",
+        "cidr_match",
         "time_diff",
         "time_bucket",
         "bucket_end",

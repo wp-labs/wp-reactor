@@ -76,6 +76,7 @@ use super::{eval_expr_ext, values_equal};
 /// - `strftime(timestamp, format)` → Str
 /// - `strptime(text, format)` → Number (timestamp millis)
 /// - `regex_match(text, pattern)` → Bool
+/// - `cidr_match(ip, subnet)` → Bool（Sigma `|cidr` 等效，subnet 形如 `"10.0.0.0/8"`）
 /// - `time_diff(t1, t2)` → Number (seconds)
 /// - `time_bucket(t, interval_seconds)` → Number (timestamp millis)
 /// - `external("service", arg1, ...)` → dispatched
@@ -915,6 +916,21 @@ pub(super) fn eval_func_call(
             };
             let re = regex::Regex::new(&pat).ok()?;
             Some(Value::Bool(re.is_match(&hay)))
+        }
+        "cidr_match" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let ip = match eval_expr_ext(&args[0], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let cidr = match eval_expr_ext(&args[1], event, windows, baselines)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let net = wf_lang::cidr::Cidr::parse(&cidr)?;
+            Some(Value::Bool(net.contains(&ip)))
         }
         "time_diff" => {
             if args.len() != 2 {

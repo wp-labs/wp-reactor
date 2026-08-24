@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod cidr;
 mod checker;
 pub mod columnar;
 mod compiler;

@@ -945,6 +945,21 @@ pub(super) fn eval_builtin_func_with_l3(
             let re = regex::Regex::new(&pat).ok()?;
             Some(Value::Bool(re.is_match(&hay)))
         }
+        "cidr_match" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let ip = match eval_expr_with_l3(&args[0], ctx, score)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let cidr = match eval_expr_with_l3(&args[1], ctx, score)? {
+                Value::Str(s) => s,
+                _ => return None,
+            };
+            let net = wf_lang::cidr::Cidr::parse(&cidr)?;
+            Some(Value::Bool(net.contains(&ip)))
+        }
         "time_diff" => {
             if args.len() != 2 {
                 return None;

@@ -876,6 +876,7 @@ fmt("{} failed {} times from {}", fail.username, count(fail), fail.sip)
 - 空值 / 空白处理：`coalesce`、`isnull`、`isnotnull`、`is_blank`、`null_if_blank`、`default_if_blank`
 - 结构化对象：`merge`
 - 时间：`time_diff`、`time_bucket`
+- 网络：`cidr_match(ip, subnet)`（IP 是否落在子网内，subnet 为 `"addr/prefix"`，兼容 IPv4/IPv6，Sigma `|cidr` 等效）
 - 当前引擎时间：`now`、`now_s`、`now_ms`、`now_us`、`now_ns`
 - 哈希 / 编码：`md5`、`sha1`、`sha1_n`、`sha256`、`hex`、`stable_id`
 - 窗口集合：`collect_set`、`collect_list`、`first`、`last`

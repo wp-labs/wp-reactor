@@ -214,6 +214,67 @@ fn regex_match_no_match() {
 }
 
 // ===========================================================================
+// cidr_match（Sigma |cidr 等效）
+// ===========================================================================
+
+#[test]
+fn cidr_match_guard_hit() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "cidr_match".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("sip".to_string())),
+            Expr::StringLit("10.0.0.0/8".to_string()),
+        ],
+    };
+    let mut fields = EngineHashMap::default();
+    fields.insert("sip".into(), Value::Str("10.23.45.67".into()));
+    let event = Event { fields };
+    assert_eq!(eval_expr(&expr, &event), Some(Value::Bool(true)));
+}
+
+#[test]
+fn cidr_match_guard_miss_and_error() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let base = |sip: &str| {
+        let mut fields = EngineHashMap::default();
+        fields.insert("sip".into(), Value::Str(sip.into()));
+        Event { fields }
+    };
+    let expr = |ip: &str| Expr::FuncCall {
+        qualifier: None,
+        name: "cidr_match".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple(ip.to_string())),
+            Expr::StringLit("172.16.0.0/12".to_string()),
+        ],
+    };
+    // 命中。
+    assert_eq!(
+        eval_expr(&expr("sip"), &base("172.31.0.1")),
+        Some(Value::Bool(true))
+    );
+    // 不命中。
+    assert_eq!(
+        eval_expr(&expr("sip"), &base("173.0.0.1")),
+        Some(Value::Bool(false))
+    );
+    // 非法子网 → None。
+    let bad = Expr::FuncCall {
+        qualifier: None,
+        name: "cidr_match".to_string(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("sip".to_string())),
+            Expr::StringLit("172.16.0.0/40".to_string()),
+        ],
+    };
+    assert_eq!(eval_expr(&bad, &base("172.31.0.1")), None);
+}
+
+// ===========================================================================
 // time_diff
 // ===========================================================================
 

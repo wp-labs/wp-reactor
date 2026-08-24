@@ -355,6 +355,58 @@ pub fn check_func_call(
                 }
             }
         }
+        "cidr_match" => {
+            if args.len() != 2 {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: "cidr_match() requires exactly 2 arguments: (ip, subnet)".to_string(),
+                });
+            } else {
+                // First argument: IP 字段（Ip）或字符串（Chars）都可。
+                if let Some(t) = infer_type(&args[0], scope)
+                    && !compatible(&t, &ValType::Base(BaseType::Chars))
+                    && !matches!(t, ValType::Base(BaseType::Ip))
+                {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "cidr_match() first argument must be an IP or string field, got {:?}",
+                            t
+                        ),
+                    });
+                }
+                // Second argument: 字符串字面量，编译期校验 CIDR 合法性。
+                match &args[1] {
+                    Expr::StringLit(cidr) => {
+                        if crate::cidr::Cidr::parse(cidr).is_none() {
+                            errors.push(CheckError {
+                                severity: Severity::Error,
+                                rule: Some(rule_name.to_string()),
+                                test: None,
+                                message: format!(
+                                    "cidr_match() subnet \"{}\" is not a valid CIDR (expect addr/prefix)",
+                                    cidr
+                                ),
+                            });
+                        }
+                    }
+                    _ => {
+                        errors.push(CheckError {
+                            severity: Severity::Error,
+                            rule: Some(rule_name.to_string()),
+                            test: None,
+                            message:
+                                "cidr_match() second argument must be a string literal CIDR"
+                                    .to_string(),
+                        });
+                    }
+                }
+            }
+        }
         "time_diff" => {
             if args.len() != 2 {
                 errors.push(CheckError {
