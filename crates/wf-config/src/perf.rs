@@ -45,8 +45,10 @@ impl PerfConfig {
     /// 从诊断配置文件加载。文件缺失/解析失败 → 报错（显式 `--perf-diag` 即
     /// 要求诊断模式可用，静默降级会掩盖配置错误）。
     pub fn load(path: &Path) -> ConfigResult<Self> {
-        let content = std::fs::read_to_string(path)
-            .source_err(ConfigReason::Load, format!("reading perf-diag config {}", path.display()))?;
+        let content = std::fs::read_to_string(path).source_err(
+            ConfigReason::Load,
+            format!("reading perf-diag config {}", path.display()),
+        )?;
         let config: PerfConfig = toml::from_str(&content).source_raw_err(
             ConfigReason::Parse,
             format!("parsing perf-diag config {}", path.display()),
@@ -125,7 +127,11 @@ cut_output = false
         assert_eq!(floor.name, "floor");
         assert!(floor.cut_rules);
         assert!(floor.cut_output);
-        assert_eq!(floor.rules.as_deref(), Some(""), "empty rules = keep current");
+        assert_eq!(
+            floor.rules.as_deref(),
+            Some(""),
+            "empty rules = keep current"
+        );
         let rules = cfg.stage_at(1).unwrap();
         assert_eq!(rules.name, "rules");
         assert!(!rules.cut_rules);

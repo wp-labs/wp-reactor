@@ -13,7 +13,6 @@
 //! - `to_data_record` with untyped yield values.
 use std::sync::Arc;
 
-
 use wf_lang::{BaseType, FieldType};
 use wp_model_core::model::{DataRecord, DataType, Field, FieldStorage, Value as ModelValue};
 

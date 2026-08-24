@@ -115,7 +115,10 @@ impl RawFusionConfigTree {
                 self.value
                     .as_table_mut()
                     .expect("raw tree root is a table")
-                    .insert("runtime".to_string(), toml::Value::Table(Default::default()));
+                    .insert(
+                        "runtime".to_string(),
+                        toml::Value::Table(Default::default()),
+                    );
                 match self
                     .value
                     .as_table_mut()

@@ -311,7 +311,13 @@ impl RuleExecutor {
                     .unwrap_or_default(),
             };
             let fired_at = format_nanos_utc(m.event_time_nanos);
-            let wfx_id = build_wfx_id(&self.plan.name, &m.scope_key, &fired_at, &m.step_data, &origin);
+            let wfx_id = build_wfx_id(
+                &self.plan.name,
+                &m.scope_key,
+                &fired_at,
+                &m.step_data,
+                &origin,
+            );
             let summary = Arc::from(build_summary(
                 &self.plan.name,
                 keys,

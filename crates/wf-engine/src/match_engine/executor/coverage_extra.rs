@@ -1127,7 +1127,10 @@ fn branch_guard_masks_list_index_path_guard() {
 
     let mut plan = simple_rule_plan(
         "r_list_index",
-        simple_plan(vec![], vec![step(vec![branch_guard("c", Some(guard()), count_ge(1.0))])]),
+        simple_plan(
+            vec![],
+            vec![step(vec![branch_guard("c", Some(guard()), count_ge(1.0))])],
+        ),
         Expr::Number(50.0),
         "ip",
         Expr::Field(FieldRef::Simple("sip".into())),
@@ -1147,11 +1150,7 @@ fn branch_guard_masks_list_index_path_guard() {
         WFL_FIELD_TYPE_METADATA_KEY.to_string(),
         WFL_FIELD_TYPE_ARRAY.to_string(),
     )]));
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![field])),
-        vec![tags_col],
-    )
-    .unwrap();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![tags_col]).unwrap();
 
     let masks: GuardMasks = exec.branch_guard_masks(&batch);
     // Event step (0,0): row 0 matched; rows 1-3 null / miss → not matched.
@@ -2312,10 +2311,7 @@ fn each_plan_columnar_safe_gate_branches() {
         expr: Expr::BinOp {
             op: BinOp::Mul,
             left: Box::new(Expr::Number(0.908)),
-            right: Box::new(Expr::Field(FieldRef::Qualified(
-                "e".into(),
-                "sip".into(),
-            ))),
+            right: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
         },
     };
     assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
@@ -2325,10 +2321,7 @@ fn each_plan_columnar_safe_gate_branches() {
     plan.score_plan = ScorePlan {
         expr: Expr::BinOp {
             op: BinOp::Mul,
-            left: Box::new(Expr::Field(FieldRef::Qualified(
-                "e".into(),
-                "sip".into(),
-            ))),
+            left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
             right: Box::new(Expr::Number(0.908)),
         },
     };
@@ -2340,10 +2333,7 @@ fn each_plan_columnar_safe_gate_branches() {
         expr: Expr::BinOp {
             op: BinOp::Add,
             left: Box::new(Expr::Number(0.5)),
-            right: Box::new(Expr::Field(FieldRef::Qualified(
-                "e".into(),
-                "sip".into(),
-            ))),
+            right: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
         },
     };
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
@@ -2353,10 +2343,7 @@ fn each_plan_columnar_safe_gate_branches() {
     plan.score_plan = ScorePlan {
         expr: Expr::BinOp {
             op: BinOp::Mul,
-            left: Box::new(Expr::Field(FieldRef::Qualified(
-                "e".into(),
-                "sip".into(),
-            ))),
+            left: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
             right: Box::new(Expr::Field(FieldRef::Simple("sip".into()))),
         },
     };
@@ -2368,10 +2355,7 @@ fn each_plan_columnar_safe_gate_branches() {
         expr: Expr::BinOp {
             op: BinOp::Mul,
             left: Box::new(Expr::Number(0.908)),
-            right: Box::new(Expr::Field(FieldRef::Qualified(
-                "e".into(),
-                "sip".into(),
-            ))),
+            right: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))),
         },
     };
     plan.joins = vec![JoinPlan {
@@ -2865,10 +2849,7 @@ fn columnar_each_binop_score_matches_row_path() {
         Expr::BinOp {
             op: BinOp::Mul,
             left: Box::new(Expr::Number(0.908)),
-            right: Box::new(Expr::Field(FieldRef::Qualified(
-                "e".into(),
-                "price".into(),
-            ))),
+            right: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "price".into()))),
         },
         "digit",
         Expr::Field(FieldRef::Qualified("e".into(), "id".into())),
@@ -2901,27 +2882,28 @@ fn columnar_each_binop_score_matches_row_path() {
     let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
     let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_row = Vec::new();
-    let sr = exec.execute_each_direct_batch(
-        &row_refs,
-        &EmptyLookup,
-        &[],
-        0,
-        &mut b_row,
-        &mut app_row,
-    );
+    let sr =
+        exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
     assert_eq!(sr.appended, 3);
-    let out_row: Vec<_> = b_row.finish().iter_data_records().map(|r| r.unwrap()).collect();
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
 
     // 列式路径（ColumnarEvent 零物化 + 列读 f64）。
     let col_events: Vec<ColumnarEvent> = (0..3).map(|r| ColumnarEvent::new(&batch, r)).collect();
     let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
     let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_col = Vec::new();
-    let sc =
-        exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
     assert_eq!(sc.appended, 3);
     assert_eq!(sc.failed, 0);
-    let out_col: Vec<_> = b_col.finish().iter_data_records().map(|r| r.unwrap()).collect();
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
 
     // 对拍：两路径逐字段一致；score = clamp(0.908 × price)。
     assert_eq!(out_row, out_col);
@@ -2963,10 +2945,7 @@ fn columnar_each_binop_score_null_field_fails_row() {
         Expr::BinOp {
             op: BinOp::Mul,
             left: Box::new(Expr::Number(0.5)),
-            right: Box::new(Expr::Field(FieldRef::Qualified(
-                "e".into(),
-                "price".into(),
-            ))),
+            right: Box::new(Expr::Field(FieldRef::Qualified("e".into(), "price".into()))),
         },
         "digit",
         Expr::Field(FieldRef::Qualified("e".into(), "id".into())),

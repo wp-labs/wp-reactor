@@ -22,7 +22,6 @@
 //! `DataRecord`s for sinks that still want rows — locked by unit test.
 use std::sync::Arc;
 
-
 use orion_error::conversion::ToStructError;
 use wf_lang::FieldType;
 use wp_model_core::model::{DataRecord, DataType, Field, FieldStorage, Value as ModelValue};

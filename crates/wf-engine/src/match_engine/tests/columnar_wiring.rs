@@ -3,7 +3,6 @@
 //! native-i64 dispatch is identical to the f64 path).
 use std::sync::Arc;
 
-
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;

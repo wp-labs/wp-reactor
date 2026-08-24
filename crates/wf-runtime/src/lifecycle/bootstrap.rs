@@ -14,8 +14,8 @@ use wf_config::ConfigVarContext;
 use wf_config::FusionConfig;
 use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 use wf_engine::window::{ProviderWindow, Router, WindowRegistry};
-use wf_lang::{BaseType, FieldDef, FieldType};
 use wf_lang::WindowSchema;
+use wf_lang::{BaseType, FieldDef, FieldType};
 
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::receiver::miss::WINDOW_MISS_WINDOW_NAME;
@@ -296,8 +296,12 @@ fn inject_sentinel_window(
 ) -> RuntimeResult<()> {
     use crate::perf_diag::{PERF_SENTINEL_STREAM, PERF_SENTINEL_WINDOW};
 
-    if runtime_schemas.iter().any(|ws| ws.name == PERF_SENTINEL_WINDOW)
-        || runtime_window_configs.iter().any(|c| c.name == PERF_SENTINEL_WINDOW)
+    if runtime_schemas
+        .iter()
+        .any(|ws| ws.name == PERF_SENTINEL_WINDOW)
+        || runtime_window_configs
+            .iter()
+            .any(|c| c.name == PERF_SENTINEL_WINDOW)
     {
         return RuntimeReason::Bootstrap
             .to_err()
