@@ -771,3 +771,85 @@ fn columnar_not_overhead_bounded() {
         ne_el
     );
 }
+
+/// cidr_match 性能保护：列式路径必须可用、mask 正确，且吞吐不能倒退到解释器
+/// （子网编译期解析一次；逐行只有 IP 字符串解析）。debug 模式时间噪声大，
+/// 用宽松界（列式相对解释 < 1.0x，即列式不慢于解释）守护回归。
+#[test]
+fn columnar_cidr_match_overhead_bounded() {
+    use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
+    use crate::match_engine::match_engine::eval_expr;
+
+    let n = 1_000usize;
+    let schema = Arc::new(Schema::new(vec![Field::new("sip", DataType::Utf8, true)]));
+    let vals: Vec<Option<&str>> = (0..n)
+        .map(|i| match i % 5 {
+            0 => None,
+            1 | 2 => Some("10.23.45.67"), // 命中 10/8
+            3 => Some("172.16.9.9"),       // 不命中
+            _ => Some("fe80::1"),           // v6 不匹配 v4 网段
+        })
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vals)) as ArrayRef],
+    )
+    .unwrap();
+    let view = ColumnarBatch::from_all_fields(&batch);
+
+    let field = |name: &str| Expr::Field(FieldRef::Simple(name.to_string()));
+    let cidr_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "cidr_match".into(),
+        args: vec![field("sip"), Expr::StringLit("10.0.0.0/8".into())],
+    };
+    assert!(
+        wf_lang::columnar::expr_is_columnar(&cidr_expr),
+        "cidr_match 字面量形态必须列式"
+    );
+
+    let rounds = 400usize;
+    let start = Instant::now();
+    let mut mask = arrow::array::BooleanArray::new_null(0);
+    for _ in 0..rounds {
+        mask = eval_guard_columnar(&cidr_expr, &view);
+    }
+    let col_el = start.elapsed();
+    let col_eps = n as f64 * rounds as f64 / col_el.as_secs_f64();
+
+    // mask 正确性：null → false；10/8 命中为 true；其余 false。
+    assert_eq!(mask.len(), n);
+    for (row, expect) in [(1, true), (2, true), (3, false), (4, false), (0, false)] {
+        assert_eq!(mask.value(row), expect, "row {row}");
+    }
+
+    // 解释路径对照（相同轮次，公平比较每行成本）。
+    let events = batch_to_events(&batch);
+    let start = Instant::now();
+    let mut count = 0usize;
+    for _ in 0..rounds {
+        count = 0;
+        for ev in &events {
+            if eval_expr(&cidr_expr, ev) == Some(Value::Bool(true)) {
+                count += 1;
+            }
+        }
+    }
+    let row_el = start.elapsed();
+    let row_eps = n as f64 * rounds as f64 / row_el.as_secs_f64();
+    // 每行 i%5∈{1,2} 命中 → 每轮 400 行。
+    assert_eq!(count, 400, "每轮解释路径命中数应为 400");
+
+    let ratio = col_el.as_secs_f64() / row_el.as_secs_f64();
+    eprintln!(
+        "[columnar-cidr-bench] col={:.0} ev/s  row={:.0} ev/s  col/row={:.2}x",
+        col_eps, row_eps, ratio
+    );
+    assert!(
+        ratio < 1.0,
+        "columnar cidr_match 不应慢于解释路径：{:.2}x (col {:?} vs row {:?})",
+        ratio,
+        col_el,
+        row_el
+    );
+}

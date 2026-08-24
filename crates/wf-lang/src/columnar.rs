@@ -7,7 +7,8 @@
 //! to the interpreted evaluator.
 //!
 //! Anything requiring meta context (`SystemVar` / `WfuMeta` / `PresetParam`),
-//! a function call, a window lookup (those expressions never reach here — they
+//! a function call other than the natively-lowered `cidr_match(field, "cidr")`,
+//! a window lookup (those expressions never reach here — they
 //! are structurally rejected by `FuncCall`), structured literals, or nested
 //! object traversal falls back to the interpreted path.
 //!
@@ -45,6 +46,19 @@ pub fn expr_is_columnar(expr: &Expr) -> bool {
         // column operations over the operands.
         Expr::BinOp { op, left, right } => {
             binop_is_columnar(*op) && expr_is_columnar(left) && expr_is_columnar(right)
+        }
+
+        // `cidr_match(field, "addr/prefix")` — the one function the columnar
+        // evaluator lowers natively: the subnet is a compile-time literal
+        // (parsed once per batch), and the IP field reads as a string column.
+        // Everything else falls back to the interpreted path.
+        Expr::FuncCall {
+            qualifier: None,
+            name,
+            args,
+        } if name == "cidr_match" && args.len() == 2 => {
+            matches!(args[0], Expr::Field(FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)))
+                && matches!(&args[1], Expr::StringLit(_))
         }
 
         // Everything else needs meta / function / window / structured handling.
@@ -287,6 +301,58 @@ mod tests {
         };
         assert!(!expr_is_columnar(&with_args));
         assert!(!expr_is_columnar(&func("strftime")));
+    }
+
+    #[test]
+    fn cidr_match_is_columnar_when_literal_subnet() {
+        let cm = |arg0: Expr, arg1: Expr| Expr::FuncCall {
+            qualifier: None,
+            name: "cidr_match".to_string(),
+            args: vec![arg0, arg1],
+        };
+        // 字段 + 字面量子网 → 列式。
+        assert!(expr_is_columnar(&cm(
+            field("sip"),
+            Expr::StringLit("10.0.0.0/8".into())
+        )));
+        assert!(expr_is_columnar(&cm(
+            qualified("e", "sip"),
+            Expr::StringLit("fe80::/10".into())
+        )));
+        // 非字面量子网 → 回落解释器。
+        assert!(!expr_is_columnar(&cm(field("sip"), field("subnet"))));
+        // 参数个数不符 → 回落。
+        assert!(!expr_is_columnar(&Expr::FuncCall {
+            qualifier: None,
+            name: "cidr_match".to_string(),
+            args: vec![field("sip")],
+        }));
+        // 非字段首参（如函数/字面量 IP）→ 回落。
+        assert!(!expr_is_columnar(&cm(
+            Expr::StringLit("10.0.0.1".into()),
+            Expr::StringLit("10.0.0.0/8".into())
+        )));
+        // 嵌套路径首参 → 回落。
+        assert!(!expr_is_columnar(&cm(
+            nested_path(),
+            Expr::StringLit("10.0.0.0/8".into())
+        )));
+        // 其他函数仍非列式。
+        assert!(!expr_is_columnar(&func("cidr_match")));
+    }
+
+    #[test]
+    fn cidr_match_composes_columnar() {
+        // `cidr_match(...) && count > 3` 整体列式。
+        let cm = Expr::FuncCall {
+            qualifier: None,
+            name: "cidr_match".to_string(),
+            args: vec![field("sip"), Expr::StringLit("10.0.0.0/8".into())],
+        };
+        let and = cmp(BinOp::And, cm, cmp(BinOp::Gt, field("count"), num(3.0)));
+        assert!(expr_is_columnar(&and));
+        // not 包住也列式。
+        assert!(expr_is_columnar(&Expr::Not(Box::new(and))));
     }
 
     #[test]

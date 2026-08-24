@@ -313,6 +313,15 @@ enum ColumnExpr<'a> {
         left: Box<ColumnExpr<'a>>,
         right: Box<ColumnExpr<'a>>,
     },
+    /// `cidr_match(field, "addr/prefix")` — lowered natively: the subnet is
+    /// parsed **once** at compile time (the checker enforces a literal), the
+    /// field reads as a string column, and each non-null cell is parsed as an
+    /// IP and compared against the net (mirroring the interpreted path exactly:
+    /// non-Utf8 columns / null cells / non-IP strings read null / false).
+    CidrMatch {
+        col: ColRef<'a>,
+        net: wf_lang::cidr::Cidr,
+    },
 }
 
 /// Evaluate a columnar guard expression over every row of `view`, producing one
@@ -398,6 +407,34 @@ fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnEx
             }
             _ => None,
         },
+        // `cidr_match(field, "addr/prefix")` — the gate (wf-lang columnar)
+        // admits exactly this shape: a flat field + a string-literal subnet.
+        // The subnet is parsed once here, not per row.
+        Expr::FuncCall {
+            qualifier: None,
+            name,
+            args,
+        } if name == "cidr_match"
+            && args.len() == 2
+            && matches!(
+                &args[0],
+                Expr::Field(
+                    FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
+                )
+            ) =>
+        {
+            let Expr::StringLit(cidr) = &args[1] else {
+                return None;
+            };
+            let net = wf_lang::cidr::Cidr::parse(cidr)?;
+            let Expr::Field(field) = &args[0] else {
+                unreachable!("shape matched above");
+            };
+            Some(ColumnExpr::CidrMatch {
+                col: view.resolve_field(field),
+                net,
+            })
+        }
         _ => None,
     }
 }
@@ -486,6 +523,7 @@ impl ColumnExpr<'_> {
             ColumnExpr::Arith { op, left, right } => {
                 arith_vec(*op, left.eval_vec(n), right.eval_vec(n))
             }
+            ColumnExpr::CidrMatch { col, net } => cidr_vec(col, net, n),
         }
     }
 }
@@ -553,6 +591,22 @@ fn structured_col(n: usize, non_null: impl Fn(usize) -> bool) -> CVec {
             .map(|r| non_null(r).then_some(CScalar::Structured))
             .collect(),
     )
+}
+
+/// Vectorized `cidr_match(field, net)` over a string column. Mirrors the
+/// interpreted path: only a `Utf8` column can carry an IP string; null cells
+/// read null; non-UTF8 / array-shaped / missing columns read all-null; a
+/// non-IP string parses to `false` (via `Cidr::contains`). The subnet is
+/// already parsed — this kernel never re-parses the CIDR.
+fn cidr_vec(col: &ColRef<'_>, net: &wf_lang::cidr::Cidr, n: usize) -> CVec {
+    match col {
+        ColRef::Utf8(a) => CVec::Bool(
+            (0..n)
+                .map(|r| (!a.is_null(r)).then(|| net.contains(a.value(r))))
+                .collect(),
+        ),
+        _ => CVec::Bool(vec![None; n]),
+    }
 }
 
 /// Vectorized unary negation. `Int` negates to `Float` (widening, mirroring the
@@ -1777,5 +1831,61 @@ mod tests {
         assert_eq!(hits[0], all[0]);
         assert_eq!(hits[1], all[2]);
         assert_eq!(hits[2], all[4]);
+    }
+
+    /// `sip` Utf8 column + `count` Int64 column — the cidr_match guard shape.
+    fn ip_batch(sip: Vec<Option<&str>>, count: Vec<Option<i64>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sip", DataType::Utf8, true),
+            Field::new("count", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(sip)) as ArrayRef,
+                Arc::new(Int64Array::from(count)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn cidr_call(ip: Expr, net: &str) -> Expr {
+        Expr::FuncCall {
+            qualifier: None,
+            name: "cidr_match".into(),
+            args: vec![ip, Expr::StringLit(net.into())],
+        }
+    }
+
+    #[test]
+    fn cidr_match_matches_interpreted_and_composes() {
+        let batch = ip_batch(
+            vec![
+                Some("10.1.2.3"),  // 10/8 命中
+                Some("172.31.0.1"), // 不命中
+                Some("fe80::1"),  // v6 与 v4 网段版本不一致
+                Some("8.8.8.8"),  // 不命中
+                None,             // null
+                Some("11.0.0.1"), // 不命中
+            ],
+            vec![Some(1), Some(5), Some(2), Some(0), Some(9), Some(7)],
+        );
+        let expr = cidr_call(field("sip"), "10.0.0.0/8");
+        assert!(wf_lang::columnar::expr_is_columnar(&expr));
+        assert_equiv(&expr, &batch);
+
+        // 组合：cidr_match && count > 1 — 整体列式且逐位一致。
+        let combo = bin(BinOp::And, expr, bin(BinOp::Gt, field("count"), num(1.0)));
+        assert!(wf_lang::columnar::expr_is_columnar(&combo));
+        assert_equiv(&combo, &batch);
+
+        // v6 网段。
+        let v6 = cidr_call(field("sip"), "fe80::/10");
+        assert!(wf_lang::columnar::expr_is_columnar(&v6));
+        assert_equiv(&v6, &batch);
+
+        // 字面量 IP 首参 → 非列式（回落解释器）。
+        let lit_ip = cidr_call(Expr::StringLit("10.0.0.1".into()), "10.0.0.0/8");
+        assert!(!wf_lang::columnar::expr_is_columnar(&lit_ip));
     }
 }

@@ -170,6 +170,87 @@ fn contains_filter_matches_per_event_interpreted() {
     }
 }
 
+/// cidr_match 列式：字面量子网编译期解析一次，mask 与逐行解释器逐位一致。
+#[test]
+fn cidr_match_columnar_mask_matches_per_event() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("sip", DataType::Utf8, true),
+        Field::new("event_time", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("10.1.2.3"), // 命中 10/8
+                Some("11.0.0.1"), // 不命中
+                None,             // null → 不匹配
+                Some("fe80::1"),  // v6 vs v4 网段 → 版本不一致不匹配
+                Some("172.31.0.1"), // 不命中
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+        ],
+    )
+    .unwrap();
+    let filter = Expr::FuncCall {
+        qualifier: None,
+        name: "cidr_match".into(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("sip".into())),
+            Expr::StringLit("10.0.0.0/8".into()),
+        ],
+    };
+    let exec = bind_executor(Some(filter));
+    let mask = exec
+        .bind_filter_columnar_mask("b", &batch)
+        .expect("cidr_match 应列式（返回 Some mask）");
+    let events = batch_to_events(&batch);
+    let expect = [true, false, false, false, false];
+    for (row, ev) in events.iter().enumerate() {
+        assert_eq!(mask.value(row), expect[row], "row {row}");
+        assert_eq!(
+            exec.event_matches_alias("b", ev, None),
+            expect[row],
+            "row {row}: sip={}",
+            ev.field_value_str("sip")
+        );
+    }
+}
+
+/// cidr_match 与非列式子表达组合 → 整体回落解释器，仍逐位正确。
+#[test]
+fn cidr_match_non_literal_subnet_falls_back_interpreted() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("sip", DataType::Utf8, false),
+        Field::new("event_time", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![
+                "10.1.2.3", "11.0.0.1",
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, 2])),
+        ],
+    )
+    .unwrap();
+    // 子网来自字段（动态）→ 非列式。
+    let filter = Expr::FuncCall {
+        qualifier: None,
+        name: "cidr_match".into(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("sip".into())),
+            Expr::Field(FieldRef::Simple("subnet".into())),
+        ],
+    };
+    let exec = bind_executor(Some(filter));
+    assert!(exec.bind_filter_columnar_mask("b", &batch).is_none());
+    // 解释路径：subnet 字段缺失 → None（不匹配）。
+    let events = batch_to_events(&batch);
+    for ev in &events {
+        assert!(!exec.event_matches_alias("b", ev, None));
+    }
+}
+
 #[test]
 fn no_filter_returns_none() {
     let batch = auction_batch(vec![Some(1), Some(2)]);
