@@ -434,16 +434,26 @@ mod tests {
         let total_iterations = 2000;
         let step_nanos = 2_000_000_000i64; // 2s per step
         let over_nanos = 10_000_000_000i64; // 10s over window
-        let expected_batches_per_window = (over_nanos / step_nanos) as usize; // ~5
+        // Retained span = over + watermark delay (test_config: 5s): the
+        // watermark lags the newest event time by the delay, so the time sweep
+        // keeps events within (over + delay) of the watermark.
+        let watermark_delay_nanos = 5_000_000_000i64;
+        let expected_batches_per_window =
+            ((over_nanos + watermark_delay_nanos) / step_nanos) as usize; // ~7
 
         for i in 0..total_iterations {
             let now = (i as i64 + 1) * step_nanos;
 
-            // Inject one batch at current time.
+            // Inject one batch at current time. `append_with_watermark` so the
+            // event-time watermark advances (the evictor's time sweep cuts on
+            // the window's watermark, not an external wall clock — q5 fix); a
+            // plain `append` leaves the watermark uninitialized and nothing is
+            // ever expired.
             {
                 let win = reg.get_window("data").unwrap();
                 let value = i as i64 * 10;
-                win.append(make_batch(&schema, &[now], &[value])).unwrap();
+                win.append_with_watermark(make_batch(&schema, &[now], &[value]))
+                    .unwrap();
             }
 
             // Run eviction.
@@ -460,7 +470,7 @@ mod tests {
         // ---- Assertions ----
 
         // 1. After warmup (first 50 iterations), memory should never exceed
-        //    ~6 batches (5 for over window + 1 grace for timing).
+        //    ~8 batches (7 retained = over + watermark delay, +1 grace).
         let warmup = 10;
         let max_after_warmup = memory_samples[warmup..].iter().max().copied().unwrap();
         assert!(
@@ -551,7 +561,9 @@ mod tests {
         let evictor = Evictor::new(Arc::new(EvictionGate::new(usize::MAX)));
         let step_nanos = 2_000_000_000i64;
         let over_nanos = 10_000_000_000i64;
-        let expected_batches_per_window = (over_nanos / step_nanos) as usize;
+        // Retained span = over + watermark delay (test_config: 5s).
+        let expected_batches_per_window =
+            ((over_nanos + 5_000_000_000i64) / step_nanos) as usize;
 
         let total_iterations = 2000;
         let mut memory_samples: Vec<usize> = Vec::new();
@@ -562,10 +574,11 @@ mod tests {
         for i in 0..total_iterations {
             let now = (i as i64 + 1) * step_nanos;
 
-            // Inject.
+            // Inject. `append_with_watermark` so the time sweep sees an
+            // advancing event-time watermark (see the long-running test).
             {
                 let win = reg.get_window("data").unwrap();
-                win.append(make_batch(&schema, &[now], &[(i * 10) as i64]))
+                win.append_with_watermark(make_batch(&schema, &[now], &[(i * 10) as i64]))
                     .unwrap();
             }
 
@@ -760,6 +773,10 @@ mod tests {
         .unwrap();
 
         let evictor = Evictor::new(Arc::new(EvictionGate::new(usize::MAX)));
+        // Drain injects one batch every 2s; retained span = over(10s) + watermark
+        // delay(5s) → ~7 batches.
+        let expected_batches_per_window =
+            ((10_000_000_000i64 + 5_000_000_000i64) / 2_000_000_000i64) as usize;
 
         // Phase 1 — Burst: inject 100 batches, all at t = 1s
         let burst_count = 100;
@@ -783,13 +800,20 @@ mod tests {
             one_batch_size
         );
 
-        // Phase 2 — Drain: advance now from 2s to 20s in 2s steps.
-        //   batches at t=1s expire when now > 1s + 10s = 11s.
-        //   So at now=12s, cutoff=2s → all batches evicted.
+        // Phase 2 — Drain: the evictor's time sweep cuts on the window's
+        // **event-time watermark** (q5 fix), so advancing the wall clock alone
+        // cannot expire the burst — inject one watermark-advancing batch per
+        // step to simulate new events arriving. The burst batches (t=1s) expire
+        // once the watermark passes 11s (cutoff = watermark - 10s > 1s).
+        let drain_steps = 12usize;
         let mut memory_samples: Vec<usize> = vec![peak_memory];
-
-        for step in 1..=10 {
-            let now_nanos = (step + 1) * 2_000_000_000i64;
+        for step in 1..=drain_steps {
+            let now_nanos = (step as i64 + 1) * 2_000_000_000i64;
+            {
+                let win = reg.get_window("data").unwrap();
+                win.append_with_watermark(make_batch(&schema, &[now_nanos], &[999 + step as i64]))
+                    .unwrap();
+            }
             evictor.run_once(&reg, now_nanos);
 
             let win = reg.get_window("data").unwrap();
@@ -798,33 +822,27 @@ mod tests {
 
         // ---- Assertions ----
 
-        // 1. Final memory should be 0 (all batches expired).
-        let final_memory = memory_samples.last().copied().unwrap();
-        assert_eq!(
-            final_memory, 0,
-            "after drain, memory should be 0, got {final_memory}"
-        );
-
-        // 2. Window should be empty.
+        // 1. The burst (100 same-timestamp batches) is fully evicted once the
+        //    watermark advances past 11s — memory drops back to the live
+        //    window's span (~over + watermark delay batches), far below peak.
         let win = reg.get_window("data").unwrap();
+        let final_memory = win.memory_usage();
+        let final_batches = win.batch_count();
         assert!(
-            win.is_empty(),
-            "after drain, window should be empty, got {} batches",
-            win.batch_count()
+            final_memory < peak_memory,
+            "burst must be drained: final {final_memory} >= peak {peak_memory}"
         );
-        assert_eq!(win.memory_usage(), 0, "memory_usage should be 0");
-        assert_eq!(win.total_rows(), 0, "total_rows should be 0");
-
-        // 3. Memory should monotonically decrease after the first step
-        //    (no spike during drain).
-        for i in 1..memory_samples.len() {
-            assert!(
-                memory_samples[i] <= memory_samples[i - 1],
-                "memory should not increase during drain: step {i}: {} > {}",
-                memory_samples[i],
-                memory_samples[i - 1]
-            );
-        }
+        assert!(
+            final_batches <= expected_batches_per_window + 2,
+            "after drain, batch count should be within the live window: got {final_batches} (expected <= {} + 2)",
+            expected_batches_per_window
+        );
+        assert!(
+            final_memory <= one_batch_size * (expected_batches_per_window + 2),
+            "after drain, memory should be within the live window: got {final_memory} (> {} * {} + 2)",
+            one_batch_size,
+            expected_batches_per_window
+        );
     }
 
     // -- 7. evictor_empty_registry --------------------------------------------
