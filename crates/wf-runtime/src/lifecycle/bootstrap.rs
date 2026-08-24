@@ -12,8 +12,11 @@ use wp_core_connectors::sinks::tcp::TcpFactory;
 
 use wf_config::ConfigVarContext;
 use wf_config::FusionConfig;
+use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
 use wf_engine::match_engine::Value as EngineValue;
 use wf_engine::window::{ProviderWindow, Router, WindowRegistry};
+use wf_lang::WindowSchema;
+use wf_lang::{BaseType, FieldDef, FieldType};
 
 use crate::error::{RuntimeReason, RuntimeResult};
 use crate::receiver::miss::WINDOW_MISS_WINDOW_NAME;
@@ -56,6 +59,13 @@ pub(super) async fn load_and_compile(
     runtime_schemas.extend(pipeline_schemas);
     let mut runtime_window_configs = config.windows.clone();
     runtime_window_configs.extend(pipeline_window_configs);
+
+    // 3a. 诊断模式（--perf-diag diag=true）：注入内置 __wf_sentinel 窗口。
+    //     哨兵帧（wfgen 帧尾追加，tag=__wf_sentinel）路由进该窗口，由独立哨兵
+    //     任务消费（写四元组记录 + 驱动诊断点状态机）。不依赖用户 .wfs。
+    if crate::perf_diag::perf_diag_enabled() {
+        inject_sentinel_window(&mut runtime_schemas, &mut runtime_window_configs)?;
+    }
 
     // 3. Cross-validate over vs over_cap
     let window_overs: HashMap<String, Duration> = runtime_schemas
@@ -272,6 +282,67 @@ fn register_window_miss_provider(
             RuntimeReason::Bootstrap,
             "register __window_miss provider window",
         )?;
+    Ok(())
+}
+
+/// 注入内置哨兵窗口（诊断模式，`--perf-diag diag=true`）。
+///
+/// `__wf_sentinel` 是保留窗口名：用户 .wfs/windows.toml 不得声明同名窗口
+/// （与 `__window_miss` 同级的保留名）。schema 固定 `{round, n, start_ns}`（
+/// digit → Int64，`start_ns` 为 epoch nanos，f64 会丢精度）；无时间列——窗口
+/// 不推进水位、不拒绝迟到（`append_with_watermark` 对无时间列窗口的处理）。
+fn inject_sentinel_window(
+    runtime_schemas: &mut Vec<WindowSchema>,
+    runtime_window_configs: &mut Vec<WindowConfig>,
+) -> RuntimeResult<()> {
+    use crate::perf_diag::{PERF_SENTINEL_STREAM, PERF_SENTINEL_WINDOW};
+
+    if runtime_schemas
+        .iter()
+        .any(|ws| ws.name == PERF_SENTINEL_WINDOW)
+        || runtime_window_configs
+            .iter()
+            .any(|c| c.name == PERF_SENTINEL_WINDOW)
+    {
+        return RuntimeReason::Bootstrap
+            .to_err()
+            .with_detail(format!(
+                "window name {PERF_SENTINEL_WINDOW:?} is reserved for perf-diag diagnostics"
+            ))
+            .err();
+    }
+
+    runtime_schemas.push(WindowSchema {
+        name: PERF_SENTINEL_WINDOW.to_string(),
+        streams: vec![PERF_SENTINEL_STREAM.to_string()],
+        time_field: None,
+        over: Duration::from_secs(3600),
+        fields: vec![
+            FieldDef {
+                name: "round".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "n".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+            FieldDef {
+                name: "start_ns".to_string(),
+                field_type: FieldType::Base(BaseType::Digit),
+            },
+        ],
+    });
+    runtime_window_configs.push(WindowConfig {
+        name: PERF_SENTINEL_WINDOW.to_string(),
+        mode: DistMode::Local,
+        max_window_bytes: (16 * 1024 * 1024).into(),
+        over_cap: Duration::from_secs(3600).into(),
+        evict_policy: EvictPolicy::TimeFirst,
+        watermark: Duration::from_secs(1).into(),
+        allowed_lateness: Duration::from_secs(0).into(),
+        late_policy: LatePolicy::Drop,
+        table: None,
+    });
     Ok(())
 }
 

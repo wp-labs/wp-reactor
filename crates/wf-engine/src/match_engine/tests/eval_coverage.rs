@@ -6,9 +6,6 @@
 //!   Neg / 算术 BinOp / 除零 / 非算术操作分支（经 `CepStateMachine` 阈值求值）；
 //! - `executor/eval`（L3 路径）：经 `RuleExecutor::execute_match` 驱动 score 钳位与错误、
 //!   entity_id 回退、yield 表达式中的系统变量 / L3 聚合 / 时间函数路由。
-use std::sync::Arc;
-
-
 use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, Measure};
 use wf_lang::plan::{AggPlan, BranchPlan, YieldField};
 

@@ -354,7 +354,10 @@ fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnEx
             // `root[i]` — the list-index path the columnar evaluator handles
             // natively (the static gate admits exactly this shape).
             FieldRef::Path { segments, .. }
-                if matches!(segments.as_slice(), [PathSegment::Field(_), PathSegment::Index(_)]) =>
+                if matches!(
+                    segments.as_slice(),
+                    [PathSegment::Field(_), PathSegment::Index(_)]
+                ) =>
             {
                 let index = match segments.last() {
                     Some(PathSegment::Index(idx)) => *idx,
@@ -560,11 +563,13 @@ fn neg_vec(inner: CVec) -> CVec {
         // (and null) → null, matching the interpreted `Neg` on `Value`.
         CVec::Scalar(v) => CVec::Float(
             v.into_iter()
-                .map(|o| o.and_then(|s| match s {
-                    CScalar::Int(i) => Some(-(i as f64)),
-                    CScalar::Float(f) => Some(-f),
-                    _ => None,
-                }))
+                .map(|o| {
+                    o.and_then(|s| match s {
+                        CScalar::Int(i) => Some(-(i as f64)),
+                        CScalar::Float(f) => Some(-f),
+                        _ => None,
+                    })
+                })
                 .collect(),
         ),
         _ => CVec::Float(vec![None; n]),
@@ -643,7 +648,10 @@ fn list_index_vec(col: &ColRef<'_>, index: usize, n: usize) -> CVec {
 /// rest are skipped as [`serde::de::IgnoredAny`].
 fn nth_json_array_scalar(cell: &str, index: usize) -> Option<CScalar> {
     let mut de = serde_json::Deserializer::from_str(cell);
-    nth_json_element(&mut de, index).ok()?.as_ref().map(json_scalar)
+    nth_json_element(&mut de, index)
+        .ok()?
+        .as_ref()
+        .map(json_scalar)
 }
 
 /// Map one non-null JSON array element to a [`CScalar`], mirroring
@@ -1238,12 +1246,12 @@ mod tests {
     /// composition tests.
     fn json_array_batch(tags: Vec<Option<&str>>, auction: Vec<Option<i64>>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("tags", DataType::Utf8, true).with_metadata(std::collections::HashMap::from(
-                [(
+            Field::new("tags", DataType::Utf8, true).with_metadata(
+                std::collections::HashMap::from([(
                     WFL_FIELD_TYPE_METADATA_KEY.to_string(),
                     WFL_FIELD_TYPE_ARRAY.to_string(),
-                )],
-            )),
+                )]),
+            ),
             Field::new("auction", DataType::Int64, true),
         ]));
         RecordBatch::try_new(
@@ -1365,11 +1373,20 @@ mod tests {
         let view = ColumnarBatch::from_all_fields(&batch);
         let mask = eval_guard_columnar(&expr, &view);
         let mask_oob = eval_guard_columnar(&out_of_range, &view);
-        assert!(!mask.value(0) && !mask.is_null(0), "object element → false, not null");
-        assert!(!mask.value(1) && !mask.is_null(1), "array element → false, not null");
+        assert!(
+            !mask.value(0) && !mask.is_null(0),
+            "object element → false, not null"
+        );
+        assert!(
+            !mask.value(1) && !mask.is_null(1),
+            "array element → false, not null"
+        );
         assert!(mask.value(2), "string element compares equal");
         for row in 0..3 {
-            assert!(mask_oob.is_null(row), "out-of-range reads null (permissive)");
+            assert!(
+                mask_oob.is_null(row),
+                "out-of-range reads null (permissive)"
+            );
         }
     }
 
@@ -1427,10 +1444,7 @@ mod tests {
         );
         let batch = native_list_batch(
             Arc::new(fixed) as ArrayRef,
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Utf8, true)),
-                2,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Utf8, true)), 2),
         );
         let expr = bin(BinOp::Eq, tags_index(1), Expr::StringLit("b".into()));
         assert_equiv(&expr, &batch);
@@ -1456,7 +1470,10 @@ mod tests {
         let events = batch_to_events(&batch);
         let view = ColumnarBatch::from_all_fields(&batch);
         let mask = eval_guard_columnar(&expr, &view);
-        assert!(!mask.value(0) && mask.is_null(0), "non-array root reads null");
+        assert!(
+            !mask.value(0) && mask.is_null(0),
+            "non-array root reads null"
+        );
         assert_eq!(mask.value(0), interpreted_bool(&expr, &events[0]));
 
         // An Int64 column named `tags`: index on a Number root → null too.
@@ -1485,9 +1502,14 @@ mod tests {
         let expr = bin(BinOp::Ne, tags_field(), Expr::StringLit("prod".into()));
         assert_equiv(&expr, &batch);
         let view = ColumnarBatch::from_all_fields(&batch);
-        let mask =
-            eval_guard_columnar(&bin(BinOp::Eq, tags_field(), Expr::StringLit("x".into())), &view);
-        assert!(!mask.is_null(0), "present array is a definite false, not null");
+        let mask = eval_guard_columnar(
+            &bin(BinOp::Eq, tags_field(), Expr::StringLit("x".into())),
+            &view,
+        );
+        assert!(
+            !mask.is_null(0),
+            "present array is a definite false, not null"
+        );
         assert!(mask.is_null(1), "null cell reads null");
     }
 
@@ -1497,12 +1519,12 @@ mod tests {
         // bool elements, null-dropped arrays, and number elements — the
         // three-valued `&&` and unary negation over heterogeneous cells.
         let schema = Arc::new(Schema::new(vec![
-            Field::new("tags", DataType::Utf8, true).with_metadata(std::collections::HashMap::from(
-                [(
+            Field::new("tags", DataType::Utf8, true).with_metadata(
+                std::collections::HashMap::from([(
                     WFL_FIELD_TYPE_METADATA_KEY.to_string(),
                     WFL_FIELD_TYPE_ARRAY.to_string(),
-                )],
-            )),
+                )]),
+            ),
             Field::new("flag", DataType::Boolean, true),
         ]));
         let batch = RecordBatch::try_new(
@@ -1587,7 +1609,8 @@ mod tests {
     fn list_index_native_list_child_types() {
         // List<Timestamp(Ns)>: timestamp children read as native i64 (the same
         // documented precision as `TimestampNs` columns).
-        let ts_values = TimestampNanosecondArray::from(vec![Some(1_700_000_000_000_000i64), Some(2)]);
+        let ts_values =
+            TimestampNanosecondArray::from(vec![Some(1_700_000_000_000_000i64), Some(2)]);
         let ts_list = ListArray::try_new(
             Arc::new(Field::new(
                 "item",

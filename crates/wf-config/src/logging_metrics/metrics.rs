@@ -37,7 +37,9 @@ pub struct MetricsTopNConfig {
 }
 
 fn default_report_interval() -> HumanDuration {
-    "2s".parse().expect("hardcoded duration must parse")
+    // 100ms：短跑诊断（perf-diag sentinel 轮次）不被 ~1s 粒度钉死——2026-08-23
+    // 实测 300k 单流 floor 被 1s 指标粒度钉成 26 万 EPS 假象，改 100ms 后为 970 万。
+    "100ms".parse().expect("hardcoded duration must parse")
 }
 
 fn default_prometheus_listen() -> String {
@@ -110,5 +112,21 @@ mod tests {
         let cfg: MetricsConfig = toml::from_str(toml_src).unwrap();
         assert!(cfg.enabled);
         assert!(!cfg.console_output);
+    }
+
+    #[test]
+    fn default_report_interval_is_100ms() {
+        // perf-diag 防假象协议：短跑不被 ~1s 指标粒度钉死（设计 §4.5）。
+        let cfg = MetricsConfig::default();
+        assert_eq!(
+            cfg.report_interval.as_duration(),
+            std::time::Duration::from_millis(100)
+        );
+        let parsed: MetricsConfig = toml::from_str("enabled = true\n").unwrap();
+        assert_eq!(
+            parsed.report_interval.as_duration(),
+            std::time::Duration::from_millis(100),
+            "omitted report_interval must default to 100ms"
+        );
     }
 }

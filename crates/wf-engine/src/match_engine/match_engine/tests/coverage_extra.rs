@@ -8,8 +8,6 @@
 //!
 //! Lives inside the module so it can reach the private submodules directly.
 //! Only test code lives here — no production logic is modified.
-use std::sync::Arc;
-
 use std::collections::HashSet;
 use std::time::Duration;
 

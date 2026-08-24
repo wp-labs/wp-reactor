@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use wf_lang::ast::{Expr, FieldRef};
 
 use crate::match_engine::EngineHashMap;

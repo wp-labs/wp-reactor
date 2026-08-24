@@ -168,7 +168,11 @@ mod tests {
         assert!(expr_is_columnar(&list_index("c", "tags", 0)));
         assert!(expr_is_columnar(&list_index("c", "tags", 3)));
         // And compositions over it are columnar too.
-        let cmp = cmp(BinOp::Eq, list_index("c", "tags", 0), Expr::StringLit("prod".into()));
+        let cmp = cmp(
+            BinOp::Eq,
+            list_index("c", "tags", 0),
+            Expr::StringLit("prod".into()),
+        );
         assert!(expr_is_columnar(&cmp));
     }
 

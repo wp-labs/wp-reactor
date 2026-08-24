@@ -153,7 +153,8 @@ fn load_full_toml() {
     assert!(!cfg.metrics.enabled);
     assert_eq!(
         cfg.metrics.report_interval.as_duration(),
-        Duration::from_secs(2)
+        // perf-diag 防假象协议：默认 100ms（2026-08-23 起，原 2s）。
+        Duration::from_millis(100)
     );
     assert_eq!(cfg.metrics.prometheus_listen, "127.0.0.1:9901");
     assert_eq!(cfg.sources.len(), 1);
