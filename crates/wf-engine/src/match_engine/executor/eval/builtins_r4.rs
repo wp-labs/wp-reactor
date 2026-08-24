@@ -911,10 +911,22 @@ fn cidr_match_v4_v6_and_errors() {
         Some(Value::Bool(false))
     );
     // 错误分支：非法 CIDR 子网 / 非字符串 / 非 IP。
-    assert_eq!(eval("cidr_match", &[lit("1.2.3.4"), lit("bad")], &ctx), None);
-    assert_eq!(eval("cidr_match", &[lit("1.2.3.4"), lit("10.0.0.0/33")], &ctx), None);
-    assert_eq!(eval("cidr_match", &[num_expr(1.0), lit("10.0.0.0/8")], &ctx), None);
-    assert_eq!(eval("cidr_match", &[lit("1.2.3.4"), num_expr(1.0)], &ctx), None);
+    assert_eq!(
+        eval("cidr_match", &[lit("1.2.3.4"), lit("bad")], &ctx),
+        None
+    );
+    assert_eq!(
+        eval("cidr_match", &[lit("1.2.3.4"), lit("10.0.0.0/33")], &ctx),
+        None
+    );
+    assert_eq!(
+        eval("cidr_match", &[num_expr(1.0), lit("10.0.0.0/8")], &ctx),
+        None
+    );
+    assert_eq!(
+        eval("cidr_match", &[lit("1.2.3.4"), num_expr(1.0)], &ctx),
+        None
+    );
     assert_eq!(eval("cidr_match", &[lit("1.2.3.4")], &ctx), None);
     // 非 IP 字符串（如 event.action）→ false。
     assert_eq!(

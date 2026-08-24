@@ -399,9 +399,8 @@ pub fn check_func_call(
                             severity: Severity::Error,
                             rule: Some(rule_name.to_string()),
                             test: None,
-                            message:
-                                "cidr_match() second argument must be a string literal CIDR"
-                                    .to_string(),
+                            message: "cidr_match() second argument must be a string literal CIDR"
+                                .to_string(),
                         });
                     }
                 }

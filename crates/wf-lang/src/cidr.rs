@@ -30,7 +30,10 @@ impl Cidr {
             IpAddr::V6(_) if prefix > 128 => return None,
             _ => {}
         }
-        Some(Cidr { net: masked(ip, prefix), prefix })
+        Some(Cidr {
+            net: masked(ip, prefix),
+            prefix,
+        })
     }
 
     /// `ip` 是否落在这个子网内（版本不一致 → 不匹配）。

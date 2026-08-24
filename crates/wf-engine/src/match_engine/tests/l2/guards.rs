@@ -56,7 +56,6 @@ fn not_guard_negates_condition() {
     );
 }
 
-
 /// window.has() inside `a && window.has(...)` must work (not lose context).
 #[test]
 fn compound_expr_and_window_has() {

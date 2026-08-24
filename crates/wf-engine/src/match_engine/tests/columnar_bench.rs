@@ -786,15 +786,12 @@ fn columnar_cidr_match_overhead_bounded() {
         .map(|i| match i % 5 {
             0 => None,
             1 | 2 => Some("10.23.45.67"), // 命中 10/8
-            3 => Some("172.16.9.9"),       // 不命中
-            _ => Some("fe80::1"),           // v6 不匹配 v4 网段
+            3 => Some("172.16.9.9"),      // 不命中
+            _ => Some("fe80::1"),         // v6 不匹配 v4 网段
         })
         .collect();
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(StringArray::from(vals)) as ArrayRef],
-    )
-    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vals)) as ArrayRef]).unwrap();
     let view = ColumnarBatch::from_all_fields(&batch);
 
     let field = |name: &str| Expr::Field(FieldRef::Simple(name.to_string()));
@@ -873,7 +870,11 @@ fn columnar_regex_match_overhead_bounded() {
     use crate::match_engine::match_engine::eval_expr;
 
     let n = 1_000usize;
-    let schema = Arc::new(Schema::new(vec![Field::new("action", DataType::Utf8, true)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "action",
+        DataType::Utf8,
+        true,
+    )]));
     let vals: Vec<Option<&str>> = (0..n)
         .map(|i| match i % 4 {
             0 => None,
@@ -881,11 +882,8 @@ fn columnar_regex_match_overhead_bounded() {
             _ => Some("success"),
         })
         .collect();
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(StringArray::from(vals)) as ArrayRef],
-    )
-    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vals)) as ArrayRef]).unwrap();
     let view = ColumnarBatch::from_all_fields(&batch);
 
     let field = |name: &str| Expr::Field(FieldRef::Simple(name.to_string()));
@@ -1057,7 +1055,11 @@ fn compiled_guard_cache_beats_per_batch_compile() {
     use wf_lang::plan::BindPlan;
 
     let n = 200usize;
-    let schema = Arc::new(Schema::new(vec![Field::new("action", DataType::Utf8, true)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "action",
+        DataType::Utf8,
+        true,
+    )]));
     let batches: Vec<RecordBatch> = (0..n)
         .map(|i| {
             let vals: Vec<Option<&str>> = (0..64)

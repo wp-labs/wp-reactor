@@ -121,7 +121,9 @@ fn infer_func_call(
         "distinct" => Some(ValType::Base(BaseType::Digit)),
         "fmt" => Some(ValType::Base(BaseType::Chars)),
         "has" | "contains" | "regex_match" | "startswith" | "endswith" | "startswith_any"
-        | "endswith_any" | "is_finite" | "isnull" | "isnotnull" | "is_blank" | "cidr_match" => Some(ValType::Bool),
+        | "endswith_any" | "is_finite" | "isnull" | "isnotnull" | "is_blank" | "cidr_match" => {
+            Some(ValType::Bool)
+        }
         "substr" => Some(ValType::Base(BaseType::Chars)),
         "abs" => args.first().and_then(|a| infer_type(a, scope)),
         "ceil" | "floor" | "round" => Some(ValType::Base(BaseType::Float)),

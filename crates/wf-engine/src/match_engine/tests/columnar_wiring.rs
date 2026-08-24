@@ -181,10 +181,10 @@ fn cidr_match_columnar_mask_matches_per_event() {
         schema,
         vec![
             Arc::new(StringArray::from(vec![
-                Some("10.1.2.3"), // 命中 10/8
-                Some("11.0.0.1"), // 不命中
-                None,             // null → 不匹配
-                Some("fe80::1"),  // v6 vs v4 网段 → 版本不一致不匹配
+                Some("10.1.2.3"),   // 命中 10/8
+                Some("11.0.0.1"),   // 不命中
+                None,               // null → 不匹配
+                Some("fe80::1"),    // v6 vs v4 网段 → 版本不一致不匹配
                 Some("172.31.0.1"), // 不命中
             ])) as ArrayRef,
             Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
@@ -226,9 +226,7 @@ fn cidr_match_non_literal_subnet_falls_back_interpreted() {
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(StringArray::from(vec![
-                "10.1.2.3", "11.0.0.1",
-            ])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["10.1.2.3", "11.0.0.1"])) as ArrayRef,
             Arc::new(Int64Array::from(vec![1, 2])),
         ],
     )
@@ -317,7 +315,11 @@ fn str_search_columnar_mask_matches_per_event() {
                 Some("FAILED"),       // 大小写敏感
             ])) as ArrayRef,
             Arc::new(StringArray::from(vec![
-                Some("fail"), Some("login"), Some("fail"), Some("fail"), None,
+                Some("fail"),
+                Some("login"),
+                Some("fail"),
+                Some("fail"),
+                None,
             ])) as ArrayRef,
             Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
         ],
@@ -405,7 +407,10 @@ fn compiled_guard_cache_reuses_across_batches() {
 
     // 同 schema 的两个 batch：编译树缓存复用，结果逐位正确。
     let b1 = mk_batch(schema_of(false), vec![Some("10.1.1.1"), Some("11.2.3.4")]);
-    let b2 = mk_batch(schema_of(false), vec![Some("10.9.9.9"), Some("192.168.1.1")]);
+    let b2 = mk_batch(
+        schema_of(false),
+        vec![Some("10.9.9.9"), Some("192.168.1.1")],
+    );
     let m1 = exec.bind_filter_columnar_mask("b", &b1).expect("列式 mask");
     let m2 = exec.bind_filter_columnar_mask("b", &b2).expect("列式 mask");
     assert!(m1.value(0) && !m1.value(1), "b1: 10/8 命中与否");

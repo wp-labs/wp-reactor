@@ -1472,7 +1472,10 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-    assert_no_errors(anti, &[auth_events_window(), provider_win(), output_window()]);
+    assert_no_errors(
+        anti,
+        &[auth_events_window(), provider_win(), output_window()],
+    );
 
     let within = r#"
 rule r {

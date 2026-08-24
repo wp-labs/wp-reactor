@@ -34,10 +34,7 @@ rule r {
     let file = parse_wfl(input).unwrap();
     let filter = file.rules[0].events.decls[0].filter.as_ref().unwrap();
     match filter {
-        Expr::Not(inner) => assert!(matches!(
-            inner.as_ref(),
-            Expr::BinOp { op: BinOp::Eq, .. }
-        )),
+        Expr::Not(inner) => assert!(matches!(inner.as_ref(), Expr::BinOp { op: BinOp::Eq, .. })),
         other => panic!("expected Not(Eq), got {other:?}"),
     }
 }
@@ -56,10 +53,7 @@ rule r {
     let file = parse_wfl(input).unwrap();
     let filter = file.rules[0].events.decls[0].filter.as_ref().unwrap();
     match filter {
-        Expr::Not(inner) => assert!(matches!(
-            inner.as_ref(),
-            Expr::BinOp { op: BinOp::Eq, .. }
-        )),
+        Expr::Not(inner) => assert!(matches!(inner.as_ref(), Expr::BinOp { op: BinOp::Eq, .. })),
         other => panic!("expected Not(Eq), got {other:?}"),
     }
 }
@@ -78,10 +72,7 @@ rule r {
     let file = parse_wfl(input).unwrap();
     let filter = file.rules[0].events.decls[0].filter.as_ref().unwrap();
     match filter {
-        Expr::Not(inner) => assert!(matches!(
-            inner.as_ref(),
-            Expr::BinOp { op: BinOp::Eq, .. }
-        )),
+        Expr::Not(inner) => assert!(matches!(inner.as_ref(), Expr::BinOp { op: BinOp::Eq, .. })),
         other => panic!("expected Not(Eq), got {other:?}"),
     }
 }
@@ -108,9 +99,7 @@ rule r {
 /// 解析 `events { e : win && <filter> }`，返回 filter 表达式。
 fn filter_of(input: &str) -> Expr {
     let file = parse_wfl(input).unwrap();
-    file.rules[0]
-        .events
-        .decls[0]
+    file.rules[0].events.decls[0]
         .filter
         .clone()
         .unwrap_or(Expr::Bool(true))
@@ -136,10 +125,7 @@ rule r {
             right,
         } => {
             assert!(matches!(left.as_ref(), Expr::Not(_)));
-            assert!(matches!(
-                right.as_ref(),
-                Expr::BinOp { op: BinOp::Eq, .. }
-            ));
+            assert!(matches!(right.as_ref(), Expr::BinOp { op: BinOp::Eq, .. }));
         }
         other => panic!("expected Or(Not, Eq), got {other:?}"),
     }
@@ -178,10 +164,7 @@ rule r {
 "#,
     );
     match filter {
-        Expr::Not(inner) => assert!(matches!(
-            inner.as_ref(),
-            Expr::BinOp { op: BinOp::Ne, .. }
-        )),
+        Expr::Not(inner) => assert!(matches!(inner.as_ref(), Expr::BinOp { op: BinOp::Ne, .. })),
         other => panic!("expected Not(Ne), got {other:?}"),
     }
 }

@@ -91,7 +91,9 @@ fn bid_batch(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
 /// ```
 /// `mode` 可配置（snapshot / anti）——anti 是白名单排除（2026-08-24 放开静态表
 /// anti：纯键存在性否定不依赖时间）。
-fn make_provider_join_task(mode: JoinMode) -> (
+fn make_provider_join_task(
+    mode: JoinMode,
+) -> (
     rule_task::RuleTask,
     mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<Router>,

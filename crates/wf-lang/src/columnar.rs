@@ -50,9 +50,7 @@ pub fn columnar_func(name: &str) -> Option<ColumnarFunc> {
 fn is_flat_field(expr: &Expr) -> bool {
     matches!(
         expr,
-        Expr::Field(
-            FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
-        )
+        Expr::Field(FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _))
     )
 }
 
@@ -451,19 +449,34 @@ mod tests {
         let lit_nd = Expr::StringLit("fail".into());
         for name in ["contains", "startswith", "endswith"] {
             // func(field, "literal") → 列式。
-            assert!(expr_is_columnar(&call(name, vec![field("action"), lit_nd.clone()])), "{name} lit");
+            assert!(
+                expr_is_columnar(&call(name, vec![field("action"), lit_nd.clone()])),
+                "{name} lit"
+            );
             // func(field, field2) → 列式（needle 为字段）。
-            assert!(expr_is_columnar(&call(name, vec![field("action"), field("pat")])), "{name} field");
-            assert!(expr_is_columnar(&call(
-                name,
-                vec![qualified("e", "action"), lit_nd.clone()]
-            )), "{name} qualified");
+            assert!(
+                expr_is_columnar(&call(name, vec![field("action"), field("pat")])),
+                "{name} field"
+            );
+            assert!(
+                expr_is_columnar(&call(name, vec![qualified("e", "action"), lit_nd.clone()])),
+                "{name} qualified"
+            );
             // func(literal, field) → 首参非字段 → 回落。
-            assert!(!expr_is_columnar(&call(name, vec![lit_nd.clone(), field("pat")])));
+            assert!(!expr_is_columnar(&call(
+                name,
+                vec![lit_nd.clone(), field("pat")]
+            )));
             // func(field, func(...)) → 次参非字段/字面量 → 回落。
-            assert!(!expr_is_columnar(&call(name, vec![field("action"), func("lower")])));
+            assert!(!expr_is_columnar(&call(
+                name,
+                vec![field("action"), func("lower")]
+            )));
             // 嵌套路径首参 → 回落。
-            assert!(!expr_is_columnar(&call(name, vec![nested_path(), lit_nd.clone()])));
+            assert!(!expr_is_columnar(&call(
+                name,
+                vec![nested_path(), lit_nd.clone()]
+            )));
             // 参数个数不符 → 回落。
             assert!(!expr_is_columnar(&call(name, vec![field("action")])));
         }
@@ -477,7 +490,11 @@ mod tests {
             args: vec![field("action"), Expr::StringLit("fail".into())],
         };
         // contains(...) && count > 3 → 整体列式。
-        let and = cmp(BinOp::And, contains, cmp(BinOp::Gt, field("count"), num(3.0)));
+        let and = cmp(
+            BinOp::And,
+            contains,
+            cmp(BinOp::Gt, field("count"), num(3.0)),
+        );
         assert!(expr_is_columnar(&and));
         // 字段 needle 的 startswith 与 regex_match 组合 → 列式。
         let sw = Expr::FuncCall {
@@ -485,7 +502,11 @@ mod tests {
             name: "startswith".to_string(),
             args: vec![field("action"), field("prefix")],
         };
-        assert!(expr_is_columnar(&cmp(BinOp::Or, sw, cmp(BinOp::Gt, field("count"), num(1.0)))));
+        assert!(expr_is_columnar(&cmp(
+            BinOp::Or,
+            sw,
+            cmp(BinOp::Gt, field("count"), num(1.0))
+        )));
         // not 包住也列式。
         assert!(expr_is_columnar(&Expr::Not(Box::new(and))));
     }
@@ -499,7 +520,14 @@ mod tests {
         assert_eq!(columnar_func("cidr_match"), Some(ColumnarFunc::CidrMatch));
         assert_eq!(columnar_func("regex_match"), Some(ColumnarFunc::RegexMatch));
         // 非列式函数不在清单。
-        for name in ["lower", "concat", "startswith_any", "strftime", "len", "bogus"] {
+        for name in [
+            "lower",
+            "concat",
+            "startswith_any",
+            "strftime",
+            "len",
+            "bogus",
+        ] {
             assert_eq!(columnar_func(name), None, "{name} 不应在列式清单");
         }
     }
@@ -524,7 +552,10 @@ mod tests {
             // 字面量 + 字段：首参非字段 → 都不接受。
             assert!(!columnar_func_args_ok(func, &[lit.clone(), flat.clone()]));
             // 字段 + 函数：次参非字面量/字段 → 都不接受。
-            assert!(!columnar_func_args_ok(func, &[flat.clone(), func_call.clone()]));
+            assert!(!columnar_func_args_ok(
+                func,
+                &[flat.clone(), func_call.clone()]
+            ));
             // 字段 + 嵌套路径：次参非 flat → 都不接受。
             assert!(!columnar_func_args_ok(func, &[flat.clone(), nested_path()]));
             // 参数个数：1 个 → 不接受。

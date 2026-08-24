@@ -960,7 +960,10 @@ impl RuleExecutor {
         batch: &RecordBatch,
     ) -> BooleanArray {
         let key = (site.to_string(), guard_schema_fingerprint(batch));
-        let mut cache = self.compiled_guards.lock().expect("compiled-guard cache poisoned");
+        let mut cache = self
+            .compiled_guards
+            .lock()
+            .expect("compiled-guard cache poisoned");
         if let Some(plan) = cache.get(&key) {
             return eval_compiled_guard(plan, view);
         }
@@ -1022,7 +1025,11 @@ impl RuleExecutor {
                     && wf_lang::columnar::expr_is_columnar(guard)
                 {
                     let site = format!("event:{step_idx}:{branch_idx}");
-                    masks.insert_event(step_idx, branch_idx, self.guard_mask(&site, guard, &view, batch));
+                    masks.insert_event(
+                        step_idx,
+                        branch_idx,
+                        self.guard_mask(&site, guard, &view, batch),
+                    );
                 }
             }
         }
@@ -1032,7 +1039,11 @@ impl RuleExecutor {
                     && wf_lang::columnar::expr_is_columnar(guard)
                 {
                     let site = format!("close:{step_idx}:{branch_idx}");
-                    masks.insert_close(step_idx, branch_idx, self.guard_mask(&site, guard, &view, batch));
+                    masks.insert_close(
+                        step_idx,
+                        branch_idx,
+                        self.guard_mask(&site, guard, &view, batch),
+                    );
                 }
             }
         }

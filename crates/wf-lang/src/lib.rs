@@ -1,6 +1,6 @@
 pub mod ast;
-pub mod cidr;
 mod checker;
+pub mod cidr;
 pub mod columnar;
 mod compiler;
 pub mod diagnostics;

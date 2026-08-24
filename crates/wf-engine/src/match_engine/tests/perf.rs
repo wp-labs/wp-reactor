@@ -664,7 +664,10 @@ fn not_guard_state_machine_parity() {
     assert_eq!(not_m, ne_m, "not guard 与 != guard 匹配数必须一致");
     assert!(not_m > 0, "guard 应产生匹配");
     let ratio = not_time.as_secs_f64() / ne_time.as_secs_f64();
-    eprintln!("  sm not={:?} ne={:?} ratio={:.2}x", not_time, ne_time, ratio);
+    eprintln!(
+        "  sm not={:?} ne={:?} ratio={:.2}x",
+        not_time, ne_time, ratio
+    );
     assert!(
         ratio < 5.0,
         "`not` guard 热路径开销过高：{:.2}x (not {:?} vs != {:?})",

@@ -238,7 +238,10 @@ fn check_static_window_join(
         "provider/静态窗口 `{}`（side input）join",
         join.target_window
     );
-    if !matches!(join.mode, JoinMode::Snapshot | JoinMode::Inner | JoinMode::Anti) {
+    if !matches!(
+        join.mode,
+        JoinMode::Snapshot | JoinMode::Inner | JoinMode::Anti
+    ) {
         errors.push(CheckError {
             severity: Severity::Error,
             rule: Some(rule_name.to_string()),

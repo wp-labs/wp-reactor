@@ -58,12 +58,7 @@ fn not_de_morgan_equivalence() {
         left: Box::new(Expr::Not(Box::new(a.clone()))),
         right: Box::new(Expr::Not(Box::new(b.clone()))),
     };
-    for (av, bv) in [
-        (true, true),
-        (true, false),
-        (false, true),
-        (false, false),
-    ] {
+    for (av, bv) in [(true, true), (true, false), (false, true), (false, false)] {
         let mut fields = EngineHashMap::default();
         fields.insert("a".into(), Value::Bool(av));
         fields.insert("b".into(), Value::Bool(bv));

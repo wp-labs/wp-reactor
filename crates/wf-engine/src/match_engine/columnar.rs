@@ -118,7 +118,10 @@ impl<'a> ColumnarBatch<'a> {
 
     fn resolve_field(&self, field: &FieldRef) -> ColRef {
         let Some(proj_idx) = self.field_map.get(field_ref_name(field)) else {
-            return ColRef { proj: 0, kind: ColKind::Null };
+            return ColRef {
+                proj: 0,
+                kind: ColKind::Null,
+            };
         };
         let col_idx = self.projection[*proj_idx];
         let col = self.batch.column(col_idx);
@@ -497,12 +500,10 @@ fn compile_expr(expr: &Expr, view: &ColumnarBatch<'_>) -> Option<ColumnExpr> {
                         unreachable!("columnar_func_args_ok 保证 args[1] 为字面量");
                     };
                     match func {
-                        wf_lang::columnar::ColumnarFunc::CidrMatch => {
-                            Some(ColumnExpr::CidrMatch {
-                                col,
-                                net: wf_lang::cidr::Cidr::parse(constant)?,
-                            })
-                        }
+                        wf_lang::columnar::ColumnarFunc::CidrMatch => Some(ColumnExpr::CidrMatch {
+                            col,
+                            net: wf_lang::cidr::Cidr::parse(constant)?,
+                        }),
                         _ => Some(ColumnExpr::RegexMatch {
                             col,
                             re: regex::Regex::new(constant).ok()?,
@@ -514,7 +515,9 @@ fn compile_expr(expr: &Expr, view: &ColumnarBatch<'_>) -> Option<ColumnExpr> {
                     let needle = match &args[1] {
                         Expr::StringLit(s) => Needle::Lit(s.clone().into()),
                         Expr::Field(
-                            FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _),
+                            FieldRef::Simple(_)
+                            | FieldRef::Qualified(_, _)
+                            | FieldRef::Bracketed(_, _),
                         ) => {
                             let Expr::Field(f) = &args[1] else {
                                 unreachable!("columnar_func_args_ok 保证 args[1] 为字段");
@@ -523,7 +526,11 @@ fn compile_expr(expr: &Expr, view: &ColumnarBatch<'_>) -> Option<ColumnExpr> {
                         }
                         _ => unreachable!("columnar_func_args_ok 保证 args[1] 形态"),
                     };
-                    Some(ColumnExpr::StrFunc { op, hay: col, needle })
+                    Some(ColumnExpr::StrFunc {
+                        op,
+                        hay: col,
+                        needle,
+                    })
                 }
             }
         }
@@ -648,19 +655,23 @@ fn lit_vec(v: &CScalar, n: usize) -> CVec {
 /// schema drift) degrades to all-null, matching the compiled `ColKind::Null`.
 impl ColumnarBatch<'_> {
     fn int64_array(&self, col: &ColRef) -> Option<&Int64Array> {
-        self.column_at(col).and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+        self.column_at(col)
+            .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
     }
 
     fn float64_array(&self, col: &ColRef) -> Option<&Float64Array> {
-        self.column_at(col).and_then(|a| a.as_any().downcast_ref::<Float64Array>())
+        self.column_at(col)
+            .and_then(|a| a.as_any().downcast_ref::<Float64Array>())
     }
 
     fn string_array(&self, col: &ColRef) -> Option<&StringArray> {
-        self.column_at(col).and_then(|a| a.as_any().downcast_ref::<StringArray>())
+        self.column_at(col)
+            .and_then(|a| a.as_any().downcast_ref::<StringArray>())
     }
 
     fn bool_array(&self, col: &ColRef) -> Option<&BooleanArray> {
-        self.column_at(col).and_then(|a| a.as_any().downcast_ref::<BooleanArray>())
+        self.column_at(col)
+            .and_then(|a| a.as_any().downcast_ref::<BooleanArray>())
     }
 
     fn ts_array(&self, col: &ColRef) -> Option<&TimestampNanosecondArray> {
@@ -669,7 +680,8 @@ impl ColumnarBatch<'_> {
     }
 
     fn list_array(&self, col: &ColRef) -> Option<&ListArray> {
-        self.column_at(col).and_then(|a| a.as_any().downcast_ref::<ListArray>())
+        self.column_at(col)
+            .and_then(|a| a.as_any().downcast_ref::<ListArray>())
     }
 
     fn large_list_array(&self, col: &ColRef) -> Option<&LargeListArray> {
@@ -860,7 +872,12 @@ fn not_vec(inner: CVec) -> CVec {
         // null) → null, matching the interpreted `Not` on `Value`.
         CVec::Scalar(v) => CVec::Bool(
             v.into_iter()
-                .map(|o| o.and_then(|s| match s { CScalar::Bool(b) => Some(!b), _ => None }))
+                .map(|o| {
+                    o.and_then(|s| match s {
+                        CScalar::Bool(b) => Some(!b),
+                        _ => None,
+                    })
+                })
                 .collect(),
         ),
         _ => CVec::Bool(vec![None; n]),
@@ -875,64 +892,64 @@ impl ColumnarBatch<'_> {
     fn list_index_vec(&self, col: &ColRef, index: usize, n: usize) -> CVec {
         match col.kind {
             ColKind::JsonArray => match self.string_array(col) {
-            Some(a) => CVec::Scalar(
-                (0..n)
-                    .map(|r| {
-                        if a.is_null(r) {
-                            None
-                        } else {
-                            nth_json_array_scalar(a.value(r), index)
-                        }
-                    })
-                    .collect(),
-            ),
-            None => CVec::Scalar(vec![None; n]),
-        },
-        ColKind::List => match self.list_array(col) {
-            Some(a) => CVec::Scalar(
-                (0..n)
-                    .map(|r| {
-                        if a.is_null(r) {
-                            None
-                        } else {
-                            list_slice_nth_scalar(a.value(r).as_ref(), index)
-                        }
-                    })
-                    .collect(),
-            ),
-            None => CVec::Scalar(vec![None; n]),
-        },
-        ColKind::LargeList => match self.large_list_array(col) {
-            Some(a) => CVec::Scalar(
-                (0..n)
-                    .map(|r| {
-                        if a.is_null(r) {
-                            None
-                        } else {
-                            list_slice_nth_scalar(a.value(r).as_ref(), index)
-                        }
-                    })
-                    .collect(),
-            ),
-            None => CVec::Scalar(vec![None; n]),
-        },
-        ColKind::FixedSizeList => match self.fixed_size_list_array(col) {
-            Some(a) => CVec::Scalar(
-                (0..n)
-                    .map(|r| {
-                        if a.is_null(r) {
-                            None
-                        } else {
-                            list_slice_nth_scalar(a.value(r).as_ref(), index)
-                        }
-                    })
-                    .collect(),
-            ),
-            None => CVec::Scalar(vec![None; n]),
-        },
-        // Non-array root column: the interpreted walk hits an index segment on
-        // a non-array value → `None` for every row.
-        _ => CVec::Scalar(vec![None; n]),
+                Some(a) => CVec::Scalar(
+                    (0..n)
+                        .map(|r| {
+                            if a.is_null(r) {
+                                None
+                            } else {
+                                nth_json_array_scalar(a.value(r), index)
+                            }
+                        })
+                        .collect(),
+                ),
+                None => CVec::Scalar(vec![None; n]),
+            },
+            ColKind::List => match self.list_array(col) {
+                Some(a) => CVec::Scalar(
+                    (0..n)
+                        .map(|r| {
+                            if a.is_null(r) {
+                                None
+                            } else {
+                                list_slice_nth_scalar(a.value(r).as_ref(), index)
+                            }
+                        })
+                        .collect(),
+                ),
+                None => CVec::Scalar(vec![None; n]),
+            },
+            ColKind::LargeList => match self.large_list_array(col) {
+                Some(a) => CVec::Scalar(
+                    (0..n)
+                        .map(|r| {
+                            if a.is_null(r) {
+                                None
+                            } else {
+                                list_slice_nth_scalar(a.value(r).as_ref(), index)
+                            }
+                        })
+                        .collect(),
+                ),
+                None => CVec::Scalar(vec![None; n]),
+            },
+            ColKind::FixedSizeList => match self.fixed_size_list_array(col) {
+                Some(a) => CVec::Scalar(
+                    (0..n)
+                        .map(|r| {
+                            if a.is_null(r) {
+                                None
+                            } else {
+                                list_slice_nth_scalar(a.value(r).as_ref(), index)
+                            }
+                        })
+                        .collect(),
+                ),
+                None => CVec::Scalar(vec![None; n]),
+            },
+            // Non-array root column: the interpreted walk hits an index segment on
+            // a non-array value → `None` for every row.
+            _ => CVec::Scalar(vec![None; n]),
         }
     }
 }
@@ -1430,7 +1447,11 @@ mod tests {
             // 逻辑否定：not 比较 / not flag / 双重 not（列式 == 解释器）。
             Expr::Not(Box::new(bin(BinOp::Eq, field("auction"), num(1.0)))),
             Expr::Not(Box::new(field("flag"))),
-            Expr::Not(Box::new(Expr::Not(Box::new(bin(BinOp::Eq, field("auction"), num(1.0)))))),
+            Expr::Not(Box::new(Expr::Not(Box::new(bin(
+                BinOp::Eq,
+                field("auction"),
+                num(1.0),
+            ))))),
         ];
 
         for expr in exprs {
@@ -2074,11 +2095,17 @@ mod tests {
         // StrSearch 分类下的每个名字必须有 op；其他分类无 op。
         for name in ["contains", "startswith", "endswith"] {
             assert_eq!(columnar_func(name), Some(ColumnarFunc::StrSearch), "{name}");
-            assert!(StrFuncOp::from_name(name).is_some(), "{name} 应有 StrFuncOp");
+            assert!(
+                StrFuncOp::from_name(name).is_some(),
+                "{name} 应有 StrFuncOp"
+            );
         }
         for name in ["cidr_match", "regex_match"] {
             assert!(columnar_func(name).is_some(), "{name}");
-            assert!(StrFuncOp::from_name(name).is_none(), "{name} 不应有 StrFuncOp");
+            assert!(
+                StrFuncOp::from_name(name).is_none(),
+                "{name} 不应有 StrFuncOp"
+            );
         }
         // 非列式函数两边都不认。
         for name in ["lower", "concat", "startswith_any", "bogus"] {
@@ -2115,12 +2142,12 @@ mod tests {
     fn cidr_match_matches_interpreted_and_composes() {
         let batch = ip_batch(
             vec![
-                Some("10.1.2.3"),  // 10/8 命中
+                Some("10.1.2.3"),   // 10/8 命中
                 Some("172.31.0.1"), // 不命中
-                Some("fe80::1"),  // v6 与 v4 网段版本不一致
-                Some("8.8.8.8"),  // 不命中
-                None,             // null
-                Some("11.0.0.1"), // 不命中
+                Some("fe80::1"),    // v6 与 v4 网段版本不一致
+                Some("8.8.8.8"),    // 不命中
+                None,               // null
+                Some("11.0.0.1"),   // 不命中
             ],
             vec![Some(1), Some(5), Some(2), Some(0), Some(9), Some(7)],
         );
@@ -2216,7 +2243,13 @@ mod tests {
                 None,                 // null
                 Some("FAILED"),       // 大小写敏感 → 不命中
             ],
-            vec![Some("fail"), Some("login"), Some("fail"), Some("fail"), None],
+            vec![
+                Some("fail"),
+                Some("login"),
+                Some("fail"),
+                Some("fail"),
+                None,
+            ],
             vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
         );
         // 字面量 needle。
