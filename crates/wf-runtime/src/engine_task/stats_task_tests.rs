@@ -24,6 +24,7 @@ use wf_lang::plan::{
 use super::stats_task::StatsTask;
 use super::task_types::StatsTaskConfig;
 use super::tests::{field_str, make_test_fanout, take_alert};
+use crate::engine_task::StatsPartial;
 
 /// Q18/Q19 形状任务（P4 last/top）: 用 price/bidder/auction/event_time schema。
 /// 返回 (task, alert_rx); detail 由调用方给 Expr 决定。
@@ -149,6 +150,8 @@ fn make_ranked_task(
         progress: std::collections::HashMap::new(),
         shard_index: None,
         shard_count: 1,
+        merge_rx: None,
+        merge_tx: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx)
@@ -377,6 +380,40 @@ fn make_q15_task() -> (StatsTask, mpsc::Receiver<crate::alert_task::AlertBatch>)
         },
         super::tests::test_window_config(usize::MAX),
     ));
+    let rp = q15_rule_plan();
+    let config = StatsTaskConfig {
+        stats: StatsExecutor::new(q15_plan()),
+        executor: RuleExecutor::new(rp),
+        window_sources: vec![super::task_types::WindowSource {
+            window_name: "bid_events".into(),
+            window: Arc::clone(&win),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            aliases: vec!["b".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        router: Arc::new(wf_engine::window::Router::new(
+            wf_engine::window::WindowRegistry::build(vec![]).unwrap(),
+        )),
+        metrics: None,
+        time_field: Some("event_time".into()),
+        timeout_scan_interval: Duration::from_secs(1),
+        intermediate_targets: std::collections::HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        progress: std::collections::HashMap::new(),
+        shard_index: None,
+        shard_count: 1,
+        merge_rx: None,
+        merge_tx: None,
+    };
+    let (task, _cancel) = StatsTask::new(config);
+    (task, alert_rx)
+}
+
+/// q15 stats 规则计划（12 度量 + fmt detail; 与 make_q15_task 共享, 分片测试复用）。
+fn q15_rule_plan() -> wf_lang::plan::RulePlan {
     // 12 值 detail（与 CEP 版 q15 yield 同构）
     let mut fmt_args = vec![Expr::StringLit(
         "{} {} {} {} {} {} {} {} {} {} {} {}".into(),
@@ -397,7 +434,7 @@ fn make_q15_task() -> (StatsTask, mpsc::Receiver<crate::alert_task::AlertBatch>)
     ] {
         fmt_args.push(stat_value(label));
     }
-    let rp = wf_lang::plan::RulePlan {
+    wf_lang::plan::RulePlan {
         name: "q15_stats".into(),
         binds: vec![BindPlan {
             alias: "b".into(),
@@ -449,34 +486,7 @@ fn make_q15_task() -> (StatsTask, mpsc::Receiver<crate::alert_task::AlertBatch>)
         conv_plan: None,
         limits_plan: None,
         conv_window: None,
-    };
-    let config = StatsTaskConfig {
-        stats: StatsExecutor::new(q15_plan()),
-        executor: RuleExecutor::new(rp),
-        window_sources: vec![super::task_types::WindowSource {
-            window_name: "bid_events".into(),
-            window: Arc::clone(&win),
-            notify: Arc::new(tokio::sync::Notify::new()),
-            aliases: vec!["b".into()],
-        }],
-        sink_fanout: make_test_fanout(alert_tx),
-        cancel: tokio_util::sync::CancellationToken::new(),
-        router: Arc::new(wf_engine::window::Router::new(
-            wf_engine::window::WindowRegistry::build(vec![]).unwrap(),
-        )),
-        metrics: None,
-        time_field: Some("event_time".into()),
-        timeout_scan_interval: Duration::from_secs(1),
-        intermediate_targets: std::collections::HashSet::new(),
-        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
-        eos_flush: tokio::sync::watch::channel(0u64).1,
-        push_rx: None,
-        progress: std::collections::HashMap::new(),
-        shard_index: None,
-        shard_count: 1,
-    };
-    let (task, _cancel) = StatsTask::new(config);
-    (task, alert_rx)
+    }
 }
 
 #[tokio::test]
@@ -505,6 +515,83 @@ async fn q15_stats_task_12_measures_matches_cep_anchor() {
         "6 3 2 1 3 3 2 1 4 2 1 1",
         "Q15 stats 12 度量（真实任务路径）"
     );
+}
+
+/// 输入分区分片（2026-08-24 q15）: 2 片（协调片 shard 0 + 发送片 shard 1）按
+/// 行号奇偶分区各归并一半行; flush 时发送片发 raw partial、协调片收齐归并后
+/// 统一 emit——输出与单实例锚点**字节一致**, 且非协调片不产出。
+#[tokio::test]
+async fn q15_input_shard_merge_emits_single_equivalent() {
+    let (alert_tx0, mut alert_rx0) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let (alert_tx1, mut alert_rx1) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let (merge_tx, merge_rx) = mpsc::channel::<StatsPartial>(8);
+
+    let mk = |shard_idx: usize,
+              alert_tx: mpsc::Sender<crate::alert_task::AlertBatch>,
+              merge_rx: Option<mpsc::Receiver<StatsPartial>>,
+              merge_tx: Option<mpsc::Sender<StatsPartial>>|
+     -> StatsTask {
+        let config = StatsTaskConfig {
+            stats: StatsExecutor::new(q15_plan()),
+            executor: RuleExecutor::new(q15_rule_plan()),
+            window_sources: vec![],
+            sink_fanout: make_test_fanout(alert_tx),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            router: Arc::new(wf_engine::window::Router::new(
+                wf_engine::window::WindowRegistry::build(vec![]).unwrap(),
+            )),
+            metrics: None,
+            time_field: Some("event_time".into()),
+            timeout_scan_interval: Duration::from_secs(1),
+            intermediate_targets: std::collections::HashSet::new(),
+            pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+            eos_flush: tokio::sync::watch::channel(0u64).1,
+            push_rx: None,
+            progress: std::collections::HashMap::new(),
+            shard_index: Some(shard_idx),
+            shard_count: 2,
+            merge_rx,
+            merge_tx,
+        };
+        let (task, _cancel) = StatsTask::new(config);
+        task
+    };
+    let mut coord = mk(0, alert_tx0, Some(merge_rx), None);
+    let mut shard1 = mk(1, alert_tx1, None, Some(merge_tx));
+
+    let rows = [
+        (100, 1, 10),       // tier0
+        (50_000, 1, 11),    // tier1
+        (2_000_000, 2, 12), // tier2
+        (50, 2, 10),        // tier0
+        (5_000, 3, 13),     // tier0
+        (999_999, 3, 11),   // tier1
+    ];
+    let batch = make_q15_batch(&rows, 5_000_000_000);
+    // 输入分区（行号奇偶）: 片 0 = 行 0/2/4, 片 1 = 行 1/3/5。
+    let push = |shard_rows: Arc<Vec<u32>>| RulePush {
+        window_name: "bid_events".into(),
+        events: None,
+        batch: Some(Arc::new(batch.clone())),
+        materialize_fields: None,
+        shard_rows: Some(shard_rows),
+        seq: 1,
+    };
+    coord.process_push(push(Arc::new(vec![0u32, 2, 4]))).await;
+    shard1.process_push(push(Arc::new(vec![1u32, 3, 5]))).await;
+    assert!(alert_rx0.try_recv().is_err(), "窗口未关闭不应产出");
+    assert!(alert_rx1.try_recv().is_err(), "非协调片不应产出");
+
+    // 并发 flush: 发送片发 raw partial, 协调片收齐归并后统一 emit。
+    tokio::join!(coord.flush(), shard1.flush());
+
+    let alert = take_alert(&mut alert_rx0);
+    assert_eq!(
+        field_str(&alert, "detail"),
+        "6 3 2 1 3 3 2 1 4 2 1 1",
+        "2 片输入分区归并输出必须与单实例锚点一致"
+    );
+    assert!(alert_rx1.try_recv().is_err(), "非协调片不得 emit");
 }
 
 /// `stat.value(final(label))` 表达式（与编译后的 yield 同构）。
@@ -656,6 +743,8 @@ fn make_stats_task() -> (
         )]),
         shard_index: None,
         shard_count: 1,
+        merge_rx: None,
+        merge_tx: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx, progress)
@@ -837,6 +926,8 @@ fn make_stats_task_with_plan(
         )]),
         shard_index: None,
         shard_count: 1,
+        merge_rx: None,
+        merge_tx: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx, progress)
@@ -986,6 +1077,8 @@ fn make_q12_task_sharded(
         progress: std::collections::HashMap::new(),
         shard_index,
         shard_count,
+        merge_rx: None,
+        merge_tx: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx)

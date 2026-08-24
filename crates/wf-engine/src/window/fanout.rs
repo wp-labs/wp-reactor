@@ -104,8 +104,24 @@ impl Clone for Subscription {
 /// per-shard row subsets so they can be stored once in the window log (P2
 /// zero re-partition). That partition is registered here and consulted by
 /// `precompute_shard_rows` even when no delivery `Subscription` exists.
-/// Pull-model key partition of one window: `(match keys, shard count)`.
+/// Pull-model partition of one window.
+///
+/// 空键 = **输入行索引分区**（`row % shard_count`, 2026-08-24 q15 空键 stats
+/// 输入分片用——按行号均匀切分, 各片独立累加, close 时归并）; 非空 = 按键
+/// 哈希分区（`partition_rows_by_key`, 同 key 同片）。
 pub type WindowShardPartition = (Arc<[FieldRef]>, usize);
+
+/// 输入行索引分区: `row % shard_count` 均匀切分（空键 stats 输入分片）。
+/// 行序保持（每片内行索引升序）, 时间分布均匀（各片窗口对齐）。
+pub fn partition_rows_by_index(batch: &RecordBatch, shard_count: usize) -> Vec<Vec<u32>> {
+    let n = batch.num_rows();
+    let shards = shard_count.max(1);
+    let mut per: Vec<Vec<u32>> = vec![Vec::with_capacity(n / shards + 1); shards];
+    for i in 0..n {
+        per[i % shards].push(i as u32);
+    }
+    per
+}
 
 #[derive(Default)]
 pub struct RuleFanout {
@@ -211,6 +227,17 @@ impl RuleFanout {
             .read()
             .expect("fanout sharding lock poisoned")
             .contains_key(window_name)
+    }
+
+    /// 输入行索引分区注册（空键 stats 输入分片, 2026-08-24 q15）:
+    /// `shard_rows[i] = 行号 % shard_count == i` 的行。空键 = index 分区标记。
+    pub fn register_window_index_sharding(&self, window_name: &str, shard_count: usize) {
+        debug_assert!(shard_count > 0);
+        let mut reg = self
+            .window_sharding
+            .write()
+            .expect("fanout sharding lock poisoned");
+        reg.insert(window_name.to_string(), (Arc::new([]), shard_count));
     }
 
     /// Broadcast `events` (window batch with sequence `seq`) to every rule
@@ -324,14 +351,19 @@ impl RuleFanout {
                 (Arc::clone(&entry.0), entry.1)
             }
         };
-        let per = partition_rows_by_key(batch, &keys, shard_count).unwrap_or_else(|| {
-            // Key column absent from schema → every row missing → all shard 0
-            // (matches row-based).
-            let mut v = Vec::with_capacity(shard_count);
-            v.resize_with(shard_count, Vec::new);
-            v[0] = (0..batch.num_rows()).map(|r| r as u32).collect();
-            v
-        });
+        let per = if keys.is_empty() {
+            // 空键 = 输入行索引分区（q15 空键 stats 输入分片）: 均匀按行号切分。
+            partition_rows_by_index(batch, shard_count)
+        } else {
+            partition_rows_by_key(batch, &keys, shard_count).unwrap_or_else(|| {
+                // Key column absent from schema → every row missing → all shard 0
+                // (matches row-based).
+                let mut v = Vec::with_capacity(shard_count);
+                v.resize_with(shard_count, Vec::new);
+                v[0] = (0..batch.num_rows()).map(|r| r as u32).collect();
+                v
+            })
+        };
         Some(per.into())
     }
 
