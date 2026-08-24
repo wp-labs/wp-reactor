@@ -131,6 +131,8 @@ pub enum Expr {
     },
     /// Unary negation.
     Neg(Box<Expr>),
+    /// Logical negation (`not <cond>` / `!<cond>`), Sigma 条件取反（issue #22）。
+    Not(Box<Expr>),
     /// Function call: `name(args...)` or `qualifier.name(args...)`.
     FuncCall {
         qualifier: Option<String>,

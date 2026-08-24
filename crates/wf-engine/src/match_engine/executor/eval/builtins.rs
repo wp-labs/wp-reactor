@@ -14,6 +14,7 @@ pub(super) fn contains_system_var(expr: &wf_lang::ast::Expr) -> bool {
         Expr::SystemVar(_) | Expr::WfuMeta(_) => true,
         Expr::BinOp { left, right, .. } => contains_system_var(left) || contains_system_var(right),
         Expr::Neg(inner) => contains_system_var(inner),
+        Expr::Not(inner) => contains_system_var(inner),
         Expr::FuncCall { args, .. } => args.iter().any(contains_system_var),
         Expr::Object(items) => items.iter().any(|item| contains_system_var(&item.value)),
         Expr::Array(items) => items.iter().any(contains_system_var),
@@ -72,6 +73,7 @@ pub(super) fn materialize_system_vars(
             right: Box::new(materialize_system_vars(right, score)?),
         }),
         Expr::Neg(inner) => Some(Expr::Neg(Box::new(materialize_system_vars(inner, score)?))),
+        Expr::Not(inner) => Some(Expr::Not(Box::new(materialize_system_vars(inner, score)?))),
         Expr::FuncCall {
             qualifier,
             name,

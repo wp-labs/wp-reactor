@@ -300,6 +300,7 @@ fn collect_expr_field_names(expr: &Expr, out: &mut HashSet<String>) {
             }
         }
         Expr::Neg(inner) => collect_expr_field_names(inner, out),
+        Expr::Not(inner) => collect_expr_field_names(inner, out),
         _ => {}
     }
 }

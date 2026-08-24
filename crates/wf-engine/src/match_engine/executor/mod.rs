@@ -163,6 +163,7 @@ fn visit_expr_fields(
             visit_expr_fields(right, names, force_all);
         }
         Expr::Neg(inner) => visit_expr_fields(inner, names, force_all),
+        Expr::Not(inner) => visit_expr_fields(inner, names, force_all),
         Expr::Array(items) => {
             for item in items {
                 visit_expr_fields(item, names, force_all);
@@ -309,6 +310,7 @@ fn visit_ctx_field_reads(
             visit_ctx_field_reads(right, names, force_all);
         }
         Expr::Neg(inner) => visit_ctx_field_reads(inner, names, force_all),
+        Expr::Not(inner) => visit_ctx_field_reads(inner, names, force_all),
         Expr::Array(items) => {
             for item in items {
                 visit_ctx_field_reads(item, names, force_all);
@@ -526,6 +528,7 @@ fn visit_output_expr(
             visit_output_expr(right, plain_ref, qualified_windows, force_all);
         }
         Expr::Neg(inner) => visit_output_expr(inner, plain_ref, qualified_windows, force_all),
+        Expr::Not(inner) => visit_output_expr(inner, plain_ref, qualified_windows, force_all),
         Expr::Array(items) => {
             for item in items {
                 visit_output_expr(item, plain_ref, qualified_windows, force_all);

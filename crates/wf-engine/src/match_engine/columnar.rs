@@ -300,6 +300,7 @@ enum ColumnExpr<'a> {
         index: usize,
     },
     Neg(Box<ColumnExpr<'a>>),
+    Not(Box<ColumnExpr<'a>>),
     And(Box<ColumnExpr<'a>>, Box<ColumnExpr<'a>>),
     Or(Box<ColumnExpr<'a>>, Box<ColumnExpr<'a>>),
     Cmp {
@@ -371,6 +372,7 @@ fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnEx
             _ => Some(ColumnExpr::Col(view.resolve_field(field))),
         },
         Expr::Neg(inner) => Some(ColumnExpr::Neg(Box::new(compile_expr(inner, view)?))),
+        Expr::Not(inner) => Some(ColumnExpr::Not(Box::new(compile_expr(inner, view)?))),
         Expr::BinOp { op, left, right } => match op {
             BinOp::And => Some(ColumnExpr::And(
                 Box::new(compile_expr(left, view)?),
@@ -475,6 +477,7 @@ impl ColumnExpr<'_> {
             ColumnExpr::Col(col) => col_vec(col, n),
             ColumnExpr::ListIndex { col, index } => list_index_vec(col, *index, n),
             ColumnExpr::Neg(inner) => neg_vec(inner.eval_vec(n)),
+            ColumnExpr::Not(inner) => not_vec(inner.eval_vec(n)),
             ColumnExpr::And(left, right) => logic_vec::<true>(left.eval_vec(n), right.eval_vec(n)),
             ColumnExpr::Or(left, right) => logic_vec::<false>(left.eval_vec(n), right.eval_vec(n)),
             ColumnExpr::Cmp { op, left, right } => {
@@ -573,6 +576,23 @@ fn neg_vec(inner: CVec) -> CVec {
                 .collect(),
         ),
         _ => CVec::Float(vec![None; n]),
+    }
+}
+
+/// Vectorized logical negation. `Bool` negates per cell; non-boolean scalars
+/// and null → null slots (interpreted `Not` returns `None` for non-`Bool`).
+fn not_vec(inner: CVec) -> CVec {
+    let n = inner.len();
+    match inner {
+        CVec::Bool(v) => CVec::Bool(v.into_iter().map(|o| o.map(|b| !b)).collect()),
+        // Heterogeneous cells negate per cell: bool → !b, everything else (and
+        // null) → null, matching the interpreted `Not` on `Value`.
+        CVec::Scalar(v) => CVec::Bool(
+            v.into_iter()
+                .map(|o| o.and_then(|s| match s { CScalar::Bool(b) => Some(!b), _ => None }))
+                .collect(),
+        ),
+        _ => CVec::Bool(vec![None; n]),
     }
 }
 
@@ -1122,6 +1142,10 @@ mod tests {
                 field("flag"),
                 bin(BinOp::Gt, field("auction"), num(0.0)),
             ),
+            // 逻辑否定：not 比较 / not flag / 双重 not（列式 == 解释器）。
+            Expr::Not(Box::new(bin(BinOp::Eq, field("auction"), num(1.0)))),
+            Expr::Not(Box::new(field("flag"))),
+            Expr::Not(Box::new(Expr::Not(Box::new(bin(BinOp::Eq, field("auction"), num(1.0)))))),
         ];
 
         for expr in exprs {
@@ -1131,6 +1155,64 @@ mod tests {
             );
             assert_equiv(&expr, &batch);
         }
+    }
+
+    /// 列式 `not (auction == 1)` vs `auction != 1`：语义等价、路径几乎相同
+    /// （not_vec 只对 bool 列逐格取反），吞吐应同量级，且 mask 逐位一致。
+    /// 保护 `not` 的列式实现不被退化成每行 fallback 或额外全列扫描。
+    #[test]
+    fn not_columnar_throughput_parity() {
+        use std::time::Instant;
+
+        let rows = 1_000usize;
+        let auction: Vec<Option<i64>> = (0..rows).map(|i| Some((i % 50) as i64)).collect();
+        let n = auction.len();
+        let batch = make_batch(
+            auction,
+            vec![Some(0.0); n],
+            vec![Some("a"); n],
+            vec![Some(true); n],
+        );
+        let view = ColumnarBatch::from_all_fields(&batch);
+
+        let not_expr = Expr::Not(Box::new(bin(BinOp::Eq, field("auction"), num(1.0))));
+        let ne_expr = bin(BinOp::Ne, field("auction"), num(1.0));
+
+        let rounds = 200usize;
+        let start_not = Instant::now();
+        let mut mask_not = BooleanArray::from(vec![false; rows]);
+        for _ in 0..rounds {
+            mask_not = eval_guard_columnar(&not_expr, &view);
+        }
+        let not_el = start_not.elapsed();
+
+        let start_ne = Instant::now();
+        let mut mask_ne = BooleanArray::from(vec![false; rows]);
+        for _ in 0..rounds {
+            mask_ne = eval_guard_columnar(&ne_expr, &view);
+        }
+        let ne_el = start_ne.elapsed();
+
+        assert_eq!(mask_not.len(), rows);
+        for r in 0..rows {
+            assert_eq!(
+                mask_not.value(r),
+                mask_ne.value(r),
+                "row {r}: not(...) 与 != 的列式结果必须一致"
+            );
+        }
+        let ratio = not_el.as_secs_f64() / ne_el.as_secs_f64();
+        eprintln!(
+            "  columnar not={:?} ne={:?} ratio={:.2}x",
+            not_el, ne_el, ratio
+        );
+        assert!(
+            ratio < 2.5,
+            "columnar `not` 相对 `!=` 开销过高：{:.2}x (not {:?} vs != {:?})",
+            ratio,
+            not_el,
+            ne_el
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use wf_lang::ast::MatchMode;
 use wf_lang::plan::{MatchPlan, SeqPlan, SeqSkipPlan, SeqStepPlan, WindowSpec};
 
 use crate::match_engine::match_engine::{CepStateMachine, StepResult};
-use crate::match_engine::{Event, RuleExecutor};
+use crate::match_engine::{Event, RuleExecutor, Value};
 
 use super::helpers::*;
 
@@ -521,4 +521,155 @@ fn deferred_materialization_throughput() {
         hits as f64 / el.as_secs_f64()
     );
     assert_eq!(total, hits);
+}
+
+// ===========================================================================
+// 逻辑否定 `not <cond>`（issue #22）性能保护
+// ===========================================================================
+
+/// 直接 eval 吞吐：`not (action == "fail")` 与语义等价的 `action != "fail"`
+/// 走几乎相同的解释器路径（not 只多一层递归 + bool 取反），吞吐应同量级。
+/// 断言：not 不慢于 != 的 2.5 倍（debug 模式宽松界，防止未来把 not 实现
+/// 退化成分支/复制重算）。
+#[test]
+fn not_guard_eval_overhead_bounded() {
+    use crate::match_engine::match_engine::eval_expr;
+    use wf_lang::ast::{BinOp, Expr, FieldRef};
+
+    let not_expr = Expr::Not(Box::new(Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Simple("action".to_string()))),
+        right: Box::new(Expr::StringLit("fail".to_string())),
+    }));
+    let ne_expr = Expr::BinOp {
+        op: BinOp::Ne,
+        left: Box::new(Expr::Field(FieldRef::Simple("action".to_string()))),
+        right: Box::new(Expr::StringLit("fail".to_string())),
+    };
+
+    let n = 200_000usize;
+    let fail_ev = event(vec![("action", str_val("fail"))]);
+    let ok_ev = event(vec![("action", str_val("ok"))]);
+
+    // 交替 fail/ok，统计结果为 true 的次数（not 与 != 应逐事件一致）。
+    let mut not_true = 0usize;
+    let start_not = Instant::now();
+    for i in 0..n {
+        let ev = if i % 2 == 0 { &fail_ev } else { &ok_ev };
+        if eval_expr(&not_expr, ev) == Some(Value::Bool(true)) {
+            not_true += 1;
+        }
+    }
+    let not_el = start_not.elapsed();
+
+    let mut ne_true = 0usize;
+    let start_ne = Instant::now();
+    for i in 0..n {
+        let ev = if i % 2 == 0 { &fail_ev } else { &ok_ev };
+        if eval_expr(&ne_expr, ev) == Some(Value::Bool(true)) {
+            ne_true += 1;
+        }
+    }
+    let ne_el = start_ne.elapsed();
+
+    assert_eq!(not_true, ne_true, "not 与 != 的判定结果必须一致");
+    assert_eq!(not_true, n / 2);
+    let ratio = not_el.as_secs_f64() / ne_el.as_secs_f64();
+    eprintln!(
+        "  not({:?}) vs !=({:?}) ratio={:.2}x ({:.0} ev/s)",
+        not_el,
+        ne_el,
+        ratio,
+        n as f64 / not_el.as_secs_f64()
+    );
+    assert!(
+        ratio < 2.5,
+        "`not` 求值相对 `!=` 开销过高：{:.2}x (not {:?} vs != {:?})",
+        ratio,
+        not_el,
+        ne_el
+    );
+}
+
+/// 状态机集成：带 `not (...)` guard 的规则 vs 等价 `!=` guard 的规则，
+/// 喂 20 万事件，matched 计数必须一致，且 not guard 不显著拖慢热路径
+/// （debug 宽松界 5x——guard 只是状态机每事件工作的一部分）。
+#[test]
+fn not_guard_state_machine_parity() {
+    use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, Measure};
+    use wf_lang::plan::{AggPlan, BranchPlan};
+
+    let guard = |neg: bool| {
+        let inner = Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(Expr::Field(FieldRef::Simple("action".to_string()))),
+            right: Box::new(Expr::StringLit("fail".to_string())),
+        };
+        if neg {
+            Expr::Not(Box::new(inner))
+        } else {
+            Expr::BinOp {
+                op: BinOp::Ne,
+                left: Box::new(Expr::Field(FieldRef::Simple("action".to_string()))),
+                right: Box::new(Expr::StringLit("fail".to_string())),
+            }
+        }
+    };
+    let plan = |neg: bool| {
+        simple_plan(
+            vec![simple_key("sip")],
+            vec![step(vec![BranchPlan {
+                label: None,
+                source: "a".to_string(),
+                field: None,
+                guard: Some(guard(neg)),
+                agg: AggPlan {
+                    transforms: vec![],
+                    measure: Measure::Count,
+                    cmp: CmpOp::Ge,
+                    threshold: Expr::Number(1.0),
+                },
+            }])],
+        )
+    };
+
+    // 每个 sip 交替 fail/ok 事件：not guard 只累积 ok 事件 → 每 key 匹配一次。
+    let n_keys = 64usize;
+    let rounds = 1_500usize;
+    let mut events = Vec::new();
+    let mut t = 0i64;
+    for _ in 0..rounds {
+        for k in 0..n_keys {
+            let action = if t % 2 == 0 { "fail" } else { "ok" };
+            events.push((
+                "a".to_string(),
+                event(vec![
+                    ("sip", str_val(&format!("10.0.0.{}", k))),
+                    ("action", str_val(action)),
+                ]),
+                t,
+            ));
+            t += 1;
+        }
+    }
+
+    let (not_m, not_time) = feed(
+        &mut CepStateMachine::new("perf_not".into(), plan(true), None),
+        &events,
+    );
+    let (ne_m, ne_time) = feed(
+        &mut CepStateMachine::new("perf_ne".into(), plan(false), None),
+        &events,
+    );
+    assert_eq!(not_m, ne_m, "not guard 与 != guard 匹配数必须一致");
+    assert!(not_m > 0, "guard 应产生匹配");
+    let ratio = not_time.as_secs_f64() / ne_time.as_secs_f64();
+    eprintln!("  sm not={:?} ne={:?} ratio={:.2}x", not_time, ne_time, ratio);
+    assert!(
+        ratio < 5.0,
+        "`not` guard 热路径开销过高：{:.2}x (not {:?} vs != {:?})",
+        ratio,
+        not_time,
+        ne_time
+    );
 }

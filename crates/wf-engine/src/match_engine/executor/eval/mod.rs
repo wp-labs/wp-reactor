@@ -213,6 +213,10 @@ pub(super) fn eval_expr_with_l3(
             Value::Number(n) => Some(Value::Number(-n)),
             _ => None,
         },
+        Expr::Not(inner) => match eval_expr_with_l3(inner, ctx, score)? {
+            Value::Bool(b) => Some(Value::Bool(!b)),
+            _ => None,
+        },
         Expr::BinOp { op, left, right } => match op {
             BinOp::And => eval_logic_and_with_l3(left, right, ctx, score),
             BinOp::Or => eval_logic_or_with_l3(left, right, ctx, score),
@@ -409,6 +413,7 @@ fn contains_l3_func(expr: &wf_lang::ast::Expr) -> bool {
         Expr::FuncCall { name, args, .. } => is_l3_func(name) || args.iter().any(contains_l3_func),
         Expr::BinOp { left, right, .. } => contains_l3_func(left) || contains_l3_func(right),
         Expr::Neg(inner) => contains_l3_func(inner),
+        Expr::Not(inner) => contains_l3_func(inner),
         Expr::Object(items) => items.iter().any(|item| contains_l3_func(&item.value)),
         Expr::Array(items) => items.iter().any(contains_l3_func),
         Expr::InList { expr, list, .. } => {
@@ -437,6 +442,7 @@ fn contains_eval_time_func(expr: &wf_lang::ast::Expr) -> bool {
             contains_eval_time_func(left) || contains_eval_time_func(right)
         }
         Expr::Neg(inner) => contains_eval_time_func(inner),
+        Expr::Not(inner) => contains_eval_time_func(inner),
         Expr::Object(items) => items
             .iter()
             .any(|item| contains_eval_time_func(&item.value)),
@@ -473,6 +479,7 @@ fn contains_stat_selector(expr: &wf_lang::ast::Expr) -> bool {
             contains_stat_selector(left) || contains_stat_selector(right)
         }
         Expr::Neg(inner) => contains_stat_selector(inner),
+        Expr::Not(inner) => contains_stat_selector(inner),
         Expr::Object(items) => items.iter().any(|item| contains_stat_selector(&item.value)),
         Expr::Array(items) => items.iter().any(contains_stat_selector),
         Expr::InList { expr, list, .. } => {
@@ -501,6 +508,7 @@ fn contains_aggregate_func(expr: &wf_lang::ast::Expr) -> bool {
             contains_aggregate_func(left) || contains_aggregate_func(right)
         }
         Expr::Neg(inner) => contains_aggregate_func(inner),
+        Expr::Not(inner) => contains_aggregate_func(inner),
         Expr::Object(items) => items
             .iter()
             .any(|item| contains_aggregate_func(&item.value)),

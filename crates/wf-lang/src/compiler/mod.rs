@@ -748,6 +748,7 @@ pub(crate) fn collect_bind_tracking(expr: &Expr, tracking: &mut BindTracking) {
             collect_bind_tracking(right, tracking);
         }
         Expr::Neg(inner) => collect_bind_tracking(inner, tracking),
+        Expr::Not(inner) => collect_bind_tracking(inner, tracking),
         Expr::InList { expr, list, .. } => {
             collect_bind_tracking(expr, tracking);
             for item in list {
@@ -882,6 +883,7 @@ fn expr_uses_l3_series(e: &Expr) -> bool {
         | Expr::PresetParam(_) => false,
         Expr::BinOp { left, right, .. } => expr_uses_l3_series(left) || expr_uses_l3_series(right),
         Expr::Neg(inner) => expr_uses_l3_series(inner),
+        Expr::Not(inner) => expr_uses_l3_series(inner),
         Expr::FuncCall { name, args, .. } => {
             is_l3_series_func(name)
                 || is_event_accessor(name)
@@ -1261,6 +1263,7 @@ fn rewrite_expr_label_refs(expr: &Expr, labels: &HashSet<String>) -> Expr {
             right: Box::new(rewrite_expr_label_refs(right, labels)),
         },
         Expr::Neg(inner) => Expr::Neg(Box::new(rewrite_expr_label_refs(inner, labels))),
+        Expr::Not(inner) => Expr::Not(Box::new(rewrite_expr_label_refs(inner, labels))),
         Expr::FuncCall {
             qualifier,
             name,

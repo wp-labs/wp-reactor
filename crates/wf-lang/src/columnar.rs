@@ -38,6 +38,9 @@ pub fn expr_is_columnar(expr: &Expr) -> bool {
         // Unary arithmetic negation is a per-element column op.
         Expr::Neg(inner) => expr_is_columnar(inner),
 
+        // Logical negation is a per-element column op over the bool column.
+        Expr::Not(inner) => expr_is_columnar(inner),
+
         // Binary ops: logic and arithmetic/comparison are all per-element
         // column operations over the operands.
         Expr::BinOp { op, left, right } => {
@@ -146,6 +149,22 @@ mod tests {
             "b".into(),
             "detail.sha256".into()
         ))));
+    }
+
+    #[test]
+    fn logical_not_gate_mirrors_inner() {
+        // `not (auction == 1)`：inner 列式 → Not 列式。
+        assert!(expr_is_columnar(&Expr::Not(Box::new(cmp(
+            BinOp::Eq,
+            field("auction"),
+            num(1.0)
+        )))));
+        // `not <函数调用>`：inner 非列式 → Not 也非列式（回落解释器）。
+        assert!(!expr_is_columnar(&Expr::Not(Box::new(func("now_s")))));
+        // 双层 not 仍列式。
+        assert!(expr_is_columnar(&Expr::Not(Box::new(Expr::Not(Box::new(
+            field("flag")
+        ))))));
     }
 
     #[test]

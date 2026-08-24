@@ -42,6 +42,13 @@ pub fn infer_type(expr: &Expr, scope: &Scope<'_>) -> Option<ValType> {
             let t = infer_type(inner, scope)?;
             if is_numeric(&t) { Some(t) } else { None }
         }
+        Expr::Not(inner) => {
+            if matches!(infer_type(inner, scope), Some(ValType::Bool)) {
+                Some(ValType::Bool)
+            } else {
+                None
+            }
+        }
         Expr::FuncCall {
             qualifier,
             name,

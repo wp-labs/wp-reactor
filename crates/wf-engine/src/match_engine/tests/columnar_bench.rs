@@ -715,3 +715,59 @@ fn execute_match_with_joins_asof_scaling() {
         }
     }
 }
+
+/// 列式 `not` 基准（issue #22）：`not (auction == 5)` vs `auction != 5`，
+/// 每批 1000 行 × 2000 轮。release 下断言 not 与 != 同量级（< 2x），
+/// 防止把 `not` 的列式实现退化成逐行 fallback（每行重编译/重扫描）。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture"]
+fn columnar_not_overhead_bounded() {
+    use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
+    use wf_lang::ast::{BinOp, Expr, FieldRef};
+
+    let n = 1_000usize;
+    let (batch, _) = bid_batch(n);
+    let view = ColumnarBatch::from_all_fields(&batch);
+
+    let field = |name: &str| Expr::Field(FieldRef::Simple(name.to_string()));
+    let not_expr = Expr::Not(Box::new(Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(field("auction")),
+        right: Box::new(Expr::Number(5.0)),
+    }));
+    let ne_expr = Expr::BinOp {
+        op: BinOp::Ne,
+        left: Box::new(field("auction")),
+        right: Box::new(Expr::Number(5.0)),
+    };
+
+    let rounds = 2_000usize;
+    let start = Instant::now();
+    let mut mask = arrow::array::BooleanArray::new_null(0);
+    for _ in 0..rounds {
+        mask = eval_guard_columnar(&not_expr, &view);
+    }
+    let not_el = start.elapsed();
+    let not_eps = n as f64 * rounds as f64 / not_el.as_secs_f64();
+
+    let start = Instant::now();
+    for _ in 0..rounds {
+        mask = eval_guard_columnar(&ne_expr, &view);
+    }
+    let ne_el = start.elapsed();
+    let ne_eps = n as f64 * rounds as f64 / ne_el.as_secs_f64();
+
+    let ratio = not_el.as_secs_f64() / ne_el.as_secs_f64();
+    eprintln!(
+        "[columnar-not-bench] not vs != ratio={:.2}x  not={:.0} ev/s  !=={:.0} ev/s",
+        ratio, not_eps, ne_eps
+    );
+    assert_eq!(mask.len(), n, "列式 not mask 行数必须等于批行数");
+    assert!(
+        ratio < 2.0,
+        "columnar `not` 相对 `!=` 开销过高：{:.2}x (not {:?} vs != {:?})",
+        ratio,
+        not_el,
+        ne_el
+    );
+}

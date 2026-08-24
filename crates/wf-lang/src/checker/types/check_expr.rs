@@ -207,6 +207,27 @@ fn check_expr_type_inner(
                 });
             }
         }
+        Expr::Not(inner) => {
+            check_expr_type_inner(
+                inner,
+                scope,
+                rule_name,
+                allow_l3_funcs,
+                allow_yield_context,
+                false,
+                errors,
+            );
+            if let Some(ref t) = infer_type(inner, scope)
+                && !compatible(t, &ValType::Bool)
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!("logical `not` requires a bool operand, got {:?}", t),
+                });
+            }
+        }
         Expr::FuncCall {
             qualifier,
             name,

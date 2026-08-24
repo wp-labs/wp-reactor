@@ -479,6 +479,7 @@ fn collect_qualified_aliases<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
             collect_qualified_aliases(right, out);
         }
         Expr::Neg(inner) => collect_qualified_aliases(inner, out),
+        Expr::Not(inner) => collect_qualified_aliases(inner, out),
         Expr::FuncCall { args, .. } => {
             for a in args {
                 collect_qualified_aliases(a, out);

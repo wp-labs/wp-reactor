@@ -255,6 +255,11 @@ fn substitute_preset_params(
             bindings,
             preset_name,
         )?))),
+        Expr::Not(inner) => Ok(Expr::Not(Box::new(substitute_preset_params(
+            inner,
+            bindings,
+            preset_name,
+        )?))),
         Expr::FuncCall {
             qualifier,
             name,
@@ -317,6 +322,7 @@ fn collect_preset_params<'a>(expr: &'a Expr, on_param: &mut impl FnMut(&'a str))
             collect_preset_params(right, on_param);
         }
         Expr::Neg(inner) => collect_preset_params(inner, on_param),
+        Expr::Not(inner) => collect_preset_params(inner, on_param),
         Expr::FuncCall { args, .. } => {
             for arg in args {
                 collect_preset_params(arg, on_param);

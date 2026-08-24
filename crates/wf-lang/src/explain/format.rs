@@ -31,6 +31,7 @@ pub fn format_expr(expr: &Expr) -> String {
             )
         }
         Expr::Neg(inner) => format!("-{}", format_expr(inner)),
+        Expr::Not(inner) => format!("not {}", format_expr(inner)),
         Expr::FuncCall {
             qualifier,
             name,

@@ -140,6 +140,7 @@ fn expr_debug_string(expr: &Expr) -> String {
         Expr::StringLit(value) => format!("{value:?}"),
         Expr::Bool(value) => value.to_string(),
         Expr::Neg(inner) => format!("-{}", expr_debug_atom(inner)),
+        Expr::Not(inner) => format!("not {}", expr_debug_atom(inner)),
         Expr::BinOp { op, left, right } if is_arithmetic(*op) => {
             format!(
                 "{} {} {}",
@@ -154,7 +155,7 @@ fn expr_debug_string(expr: &Expr) -> String {
 
 fn expr_debug_atom(expr: &Expr) -> String {
     match expr {
-        Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) | Expr::Neg(_) => {
+        Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) | Expr::Neg(_) | Expr::Not(_) => {
             expr_debug_string(expr)
         }
         Expr::BinOp { .. } => format!("({})", expr_debug_string(expr)),

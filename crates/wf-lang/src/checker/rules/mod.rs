@@ -378,6 +378,7 @@ fn collect_expr_field_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a FieldRef>) {
     match expr {
         Expr::Field(fr) => out.push(fr),
         Expr::Neg(inner) => collect_expr_field_refs(inner, out),
+        Expr::Not(inner) => collect_expr_field_refs(inner, out),
         Expr::BinOp { left, right, .. } => {
             collect_expr_field_refs(left, out);
             collect_expr_field_refs(right, out);
@@ -686,6 +687,7 @@ fn check_on_each_expr(
             check_on_each_expr(right, scope, rule_name, errors);
         }
         Expr::Neg(inner) => check_on_each_expr(inner, scope, rule_name, errors),
+        Expr::Not(inner) => check_on_each_expr(inner, scope, rule_name, errors),
         Expr::FuncCall { args, .. } => {
             for arg in args {
                 check_on_each_expr(arg, scope, rule_name, errors);

@@ -48,14 +48,14 @@ fn or_expr(input: &mut &str) -> ModalResult<Expr> {
     Ok(left)
 }
 
-/// `and_expr = cmp_expr { "&&" cmp_expr }`
+/// `and_expr = not_expr { "&&" not_expr }`
 fn and_expr(input: &mut &str) -> ModalResult<Expr> {
-    let mut left = cmp_expr.parse_next(input)?;
+    let mut left = not_expr.parse_next(input)?;
     loop {
         ws_skip.parse_next(input)?;
         if opt(literal("&&")).parse_next(input)?.is_some() {
             ws_skip.parse_next(input)?;
-            let right = cut_err(cmp_expr).parse_next(input)?;
+            let right = cut_err(not_expr).parse_next(input)?;
             left = Expr::BinOp {
                 op: BinOp::And,
                 left: Box::new(left),
@@ -66,6 +66,24 @@ fn and_expr(input: &mut &str) -> ModalResult<Expr> {
         }
     }
     Ok(left)
+}
+
+/// `not_expr = ["not" | "!"] not_expr | cmp_expr`
+///
+/// 逻辑否定（issue #22）：`not <条件>` / `!<条件>`。放在 `&&`/`||` 之下、
+/// 比较之上——`not a == b` 解析为 `not (a == b)`，`not a && not b` 为
+/// `(not a) && (not b)`；`x not in (...)` 的 `not in` 仍由 cmp_expr 处理。
+fn not_expr(input: &mut &str) -> ModalResult<Expr> {
+    ws_skip.parse_next(input)?;
+    let negated = opt(kw("not")).parse_next(input)?.is_some()
+        || opt(literal("!")).parse_next(input)?.is_some();
+    if negated {
+        ws_skip.parse_next(input)?;
+        let inner = not_expr.parse_next(input)?;
+        Ok(Expr::Not(Box::new(inner)))
+    } else {
+        cmp_expr.parse_next(input)
+    }
 }
 
 /// `cmp_expr = add_expr [cmp_op add_expr | "in" "(" list ")" | "not" "in" "(" list ")"]`

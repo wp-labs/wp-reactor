@@ -284,6 +284,7 @@ pub(crate) fn collect_expr_fields(expr: &Expr, out: &mut HashSet<String>) {
             collect_expr_fields(right, out);
         }
         Expr::Neg(inner) => collect_expr_fields(inner, out),
+        Expr::Not(inner) => collect_expr_fields(inner, out),
         Expr::FuncCall { name, args, .. } => {
             // Stat-selector args (`final(label)`, `window_event(alias)`, …) are
             // step labels / bind aliases resolved from the eval context, not

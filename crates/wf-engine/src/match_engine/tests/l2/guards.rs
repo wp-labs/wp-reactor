@@ -4,6 +4,59 @@ use super::*;
 // Compound expression context preservation — Issue #9
 // ---------------------------------------------------------------------------
 
+/// Guard `not (status == "fail")`：逻辑否定在 guard 里生效（issue #22）。
+#[test]
+fn not_guard_negates_condition() {
+    use wf_lang::ast::{BinOp, CmpOp, Expr, FieldRef, Measure};
+    use wf_lang::plan::{AggPlan, BranchPlan};
+
+    // Guard: not (status == "fail") —— 等价于 status != "fail"。
+    let guard = Expr::Not(Box::new(Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Simple("status".to_string()))),
+        right: Box::new(Expr::StringLit("fail".to_string())),
+    }));
+
+    let plan = simple_plan(
+        vec![simple_key("sip")],
+        vec![step(vec![BranchPlan {
+            label: None,
+            source: "fail".to_string(),
+            field: None,
+            guard: Some(guard),
+            agg: AggPlan {
+                transforms: vec![],
+                measure: Measure::Count,
+                cmp: CmpOp::Ge,
+                threshold: Expr::Number(1.0),
+            },
+        }])],
+    );
+
+    let mut sm = CepStateMachine::new("not_guard".into(), plan, None);
+
+    // status=ok → not (==fail) 为 true → 匹配。
+    let e = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("status", str_val("ok")),
+    ]);
+    assert!(
+        matches!(sm.advance_with("fail", &e, None), StepResult::Matched(_)),
+        "not(...) 守卫在 status=ok 时应匹配"
+    );
+
+    // status=fail → not (==fail) 为 false → 只累积不匹配。
+    let e2 = event(vec![
+        ("sip", str_val("10.0.0.1")),
+        ("status", str_val("fail")),
+    ]);
+    assert!(
+        matches!(sm.advance_with("fail", &e2, None), StepResult::Accumulate),
+        "not(...) 守卫在 status=fail 时应过滤"
+    );
+}
+
+
 /// window.has() inside `a && window.has(...)` must work (not lose context).
 #[test]
 fn compound_expr_and_window_has() {

@@ -160,14 +160,18 @@ fn collect_expr_field_names_walks_expressions() {
             Expr::Number(0.0),
         ],
     };
+    // `not <expr>` 子树里的字段同样要收集（issue #22 回归）。
+    let not_expr = Expr::Not(Box::new(Expr::Field(FieldRef::Simple("is_private".into()))));
     collect_expr_field_names(&expr, &mut out);
     collect_expr_field_names(&func, &mut out);
+    collect_expr_field_names(&not_expr, &mut out);
     assert!(out.contains("price"));
     assert!(out.contains("min_price"));
     assert!(out.contains("bidder"));
+    assert!(out.contains("is_private"));
     // Non-field leaves contribute nothing.
     collect_expr_field_names(&Expr::Number(1.0), &mut out);
-    assert_eq!(out.len(), 3);
+    assert_eq!(out.len(), 4);
 }
 
 #[test]

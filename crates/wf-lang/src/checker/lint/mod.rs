@@ -137,6 +137,7 @@ fn collect_expr_aliases<'a>(expr: &'a Expr, declared: &HashSet<&str>, used: &mut
             collect_expr_aliases(right, declared, used);
         }
         Expr::Neg(inner) => collect_expr_aliases(inner, declared, used),
+        Expr::Not(inner) => collect_expr_aliases(inner, declared, used),
         Expr::FuncCall { args, .. } => {
             for arg in args {
                 collect_expr_aliases(arg, declared, used);

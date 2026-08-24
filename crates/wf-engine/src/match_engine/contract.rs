@@ -298,6 +298,7 @@ fn expr_refs_window(expr: &Expr, window: &str) -> bool {
             _ => false, // non_exhaustive FieldRef: unknown forms are not window refs
         },
         Expr::Neg(inner) => expr_refs_window(inner, window),
+        Expr::Not(inner) => expr_refs_window(inner, window),
         Expr::BinOp { left, right, .. } => {
             expr_refs_window(left, window) || expr_refs_window(right, window)
         }

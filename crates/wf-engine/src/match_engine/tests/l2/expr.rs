@@ -2,6 +2,95 @@ use super::*;
 use wf_lang::ast::{BinOp, ObjectItem};
 
 // ===========================================================================
+// Not (逻辑否定) evaluation
+// ===========================================================================
+
+#[test]
+fn not_negates_bool_literal() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
+    assert_eq!(
+        eval_expr(&Expr::Not(Box::new(Expr::Bool(true))), &event),
+        Some(Value::Bool(false))
+    );
+    assert_eq!(
+        eval_expr(&Expr::Not(Box::new(Expr::Bool(false))), &event),
+        Some(Value::Bool(true))
+    );
+}
+
+#[test]
+fn not_negates_comparison() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    let expr = Expr::Not(Box::new(Expr::BinOp {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Field(FieldRef::Simple("action".to_string()))),
+        right: Box::new(Expr::StringLit("failed".to_string())),
+    }));
+    let mut fields = EngineHashMap::default();
+    fields.insert("action".into(), Value::Str("failed".into()));
+    let event = Event { fields };
+    assert_eq!(eval_expr(&expr, &event), Some(Value::Bool(false)));
+
+    let mut fields = EngineHashMap::default();
+    fields.insert("action".into(), Value::Str("ok".into()));
+    assert_eq!(eval_expr(&expr, &Event { fields }), Some(Value::Bool(true)));
+}
+
+#[test]
+fn not_de_morgan_equivalence() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    // `not (a || b)` ≡ `(not a) && (not b)`。
+    let a = Expr::Field(FieldRef::Simple("a".into()));
+    let b = Expr::Field(FieldRef::Simple("b".into()));
+    let not_or = Expr::Not(Box::new(Expr::BinOp {
+        op: BinOp::Or,
+        left: Box::new(a.clone()),
+        right: Box::new(b.clone()),
+    }));
+    let demorgan = Expr::BinOp {
+        op: BinOp::And,
+        left: Box::new(Expr::Not(Box::new(a.clone()))),
+        right: Box::new(Expr::Not(Box::new(b.clone()))),
+    };
+    for (av, bv) in [
+        (true, true),
+        (true, false),
+        (false, true),
+        (false, false),
+    ] {
+        let mut fields = EngineHashMap::default();
+        fields.insert("a".into(), Value::Bool(av));
+        fields.insert("b".into(), Value::Bool(bv));
+        let event = Event { fields };
+        assert_eq!(
+            eval_expr(&not_or, &event),
+            eval_expr(&demorgan, &event),
+            "not (a || b) 应等于 (not a) && (not b) @ a={av} b={bv}"
+        );
+    }
+}
+
+#[test]
+fn not_non_bool_is_none() {
+    use crate::match_engine::match_engine::{Event, eval_expr};
+
+    // `not 5`（数值）→ None：与 Neg 非数值 → None 一致，不做隐式非零判真。
+    let event = Event {
+        fields: EngineHashMap::default(),
+    };
+    assert_eq!(
+        eval_expr(&Expr::Not(Box::new(Expr::Number(5.0))), &event),
+        None
+    );
+}
+
+// ===========================================================================
 // IfThenElse expression evaluation
 // ===========================================================================
 

@@ -216,6 +216,7 @@ fn contains_stat_final_selector(expr: &Expr) -> bool {
             contains_stat_final_selector(left) || contains_stat_final_selector(right)
         }
         Expr::Neg(inner) => contains_stat_final_selector(inner),
+        Expr::Not(inner) => contains_stat_final_selector(inner),
         Expr::Object(items) => items
             .iter()
             .any(|item| contains_stat_final_selector(&item.value)),

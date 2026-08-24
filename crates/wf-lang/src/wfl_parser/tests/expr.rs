@@ -21,6 +21,188 @@ rule r {
 }
 
 #[test]
+fn parse_expr_logical_not_keyword() {
+    // `not <cond>`：events 过滤里对整组条件取逻辑非（Sigma t1571 形态）。
+    let input = r#"
+rule r {
+    events { e : win && not (e.state == "closed") }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let filter = file.rules[0].events.decls[0].filter.as_ref().unwrap();
+    match filter {
+        Expr::Not(inner) => assert!(matches!(
+            inner.as_ref(),
+            Expr::BinOp { op: BinOp::Eq, .. }
+        )),
+        other => panic!("expected Not(Eq), got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_expr_logical_not_bang() {
+    // `!<cond>` 符号否定。
+    let input = r#"
+rule r {
+    events { e : win && !(e.state == "closed") }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let filter = file.rules[0].events.decls[0].filter.as_ref().unwrap();
+    match filter {
+        Expr::Not(inner) => assert!(matches!(
+            inner.as_ref(),
+            Expr::BinOp { op: BinOp::Eq, .. }
+        )),
+        other => panic!("expected Not(Eq), got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_expr_not_binds_looser_than_comparison() {
+    // `not a == b` 解析为 `not (a == b)`（优先级：逻辑 NOT > 比较）。
+    let input = r#"
+rule r {
+    events { e : win && not e.state == "closed" }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let filter = file.rules[0].events.decls[0].filter.as_ref().unwrap();
+    match filter {
+        Expr::Not(inner) => assert!(matches!(
+            inner.as_ref(),
+            Expr::BinOp { op: BinOp::Eq, .. }
+        )),
+        other => panic!("expected Not(Eq), got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_expr_not_in_remains_in_list_negation() {
+    // `x not in (...)` 仍是列表成员否定（InList negated），不被 not_expr 抢占。
+    let input = r#"
+rule r {
+    events { e : win && e.state not in ("open", "closing") }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    let file = parse_wfl(input).unwrap();
+    let filter = file.rules[0].events.decls[0].filter.as_ref().unwrap();
+    match filter {
+        Expr::InList { negated: true, .. } => {}
+        other => panic!("expected InList(negated), got {other:?}"),
+    }
+}
+
+/// 解析 `events { e : win && <filter> }`，返回 filter 表达式。
+fn filter_of(input: &str) -> Expr {
+    let file = parse_wfl(input).unwrap();
+    file.rules[0]
+        .events
+        .decls[0]
+        .filter
+        .clone()
+        .unwrap_or(Expr::Bool(true))
+}
+
+#[test]
+fn parse_expr_not_binds_tighter_than_or() {
+    // `not a || b` → `(not a) || b`（逻辑 NOT 比 `||` 紧）。
+    let filter = filter_of(
+        r#"
+rule r {
+    events { e : win && not e.private || e.state == "closed" }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#,
+    );
+    match filter {
+        Expr::BinOp {
+            op: BinOp::Or,
+            left,
+            right,
+        } => {
+            assert!(matches!(left.as_ref(), Expr::Not(_)));
+            assert!(matches!(
+                right.as_ref(),
+                Expr::BinOp { op: BinOp::Eq, .. }
+            ));
+        }
+        other => panic!("expected Or(Not, Eq), got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_expr_not_nested_double() {
+    // `not not a` → Not(Not(a))。
+    let filter = filter_of(
+        r#"
+rule r {
+    events { e : win && not not e.private }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#,
+    );
+    match filter {
+        Expr::Not(inner) => assert!(matches!(inner.as_ref(), Expr::Not(_))),
+        other => panic!("expected Not(Not), got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_expr_bang_before_neq_is_not_of_comparison() {
+    // `!a != b` → `not (a != b)`（`!` 前缀 + `!=` 比较）。
+    let filter = filter_of(
+        r#"
+rule r {
+    events { e : win && !e.state != "closed" }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#,
+    );
+    match filter {
+        Expr::Not(inner) => assert!(matches!(
+            inner.as_ref(),
+            Expr::BinOp { op: BinOp::Ne, .. }
+        )),
+        other => panic!("expected Not(Ne), got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_expr_not_without_whitespace_before_paren() {
+    // `not(x)`（无空格）也应解析。
+    let filter = filter_of(
+        r#"
+rule r {
+    events { e : win && not(e.state == "closed") }
+    match<:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#,
+    );
+    assert!(matches!(filter, Expr::Not(_)));
+}
+
+#[test]
 fn parse_expr_logical_and() {
     let input = r#"
 rule r {

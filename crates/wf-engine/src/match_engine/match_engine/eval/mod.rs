@@ -98,6 +98,10 @@ pub(crate) fn eval_expr_ext(
                 _ => None,
             }
         }
+        Expr::Not(inner) => match eval_expr_ext(inner, event, windows, baselines)? {
+            Value::Bool(b) => Some(Value::Bool(!b)),
+            _ => None,
+        },
         Expr::BinOp { op, left, right } => eval_binop(*op, left, right, event, windows, baselines),
         Expr::InList {
             expr: target,

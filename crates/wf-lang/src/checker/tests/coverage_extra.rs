@@ -1954,6 +1954,35 @@ rule r {
 }
 
 #[test]
+fn logical_not_requires_bool_operand() {
+    // `not <非 bool 字段>`（guard 上下文）→ 报错。
+    let bad = r#"
+rule r {
+    events { e : auth_events && not e.sip }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_has_error(
+        bad,
+        &[auth_events_window(), output_window()],
+        "logical `not` requires a bool operand",
+    );
+
+    // `not <bool 比较>` → 通过（无错误）。
+    let ok = r#"
+rule r {
+    events { e : auth_events && not (e.action == "failed") }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+}
+"#;
+    assert_no_errors(ok, &[auth_events_window(), output_window()]);
+}
+
+#[test]
 fn negation_and_arithmetic_require_numeric() {
     let neg = r#"
 rule r {
