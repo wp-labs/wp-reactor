@@ -341,7 +341,9 @@ enum ColumnExpr<'a> {
         right: Box<ColumnExpr<'a>>,
     },
     /// `cidr_match(field, "addr/prefix")` — lowered natively: the subnet is
-    /// parsed **once** at compile time (the checker enforces a literal), the
+    /// parsed at compile time (once per batch — `compile_expr` runs for every
+    /// `eval_guard_columnar` call, not per row; the checker enforces a
+    /// literal), the
     /// field reads as a string column, and each non-null cell is parsed as an
     /// IP and compared against the net (mirroring the interpreted path exactly:
     /// non-Utf8 columns / null cells / non-IP strings read null / false).
@@ -350,8 +352,8 @@ enum ColumnExpr<'a> {
         net: wf_lang::cidr::Cidr,
     },
     /// `regex_match(field, "pattern")` — lowered natively: the regex is
-    /// compiled **once** at compile time (the checker enforces a literal and
-    /// validates it), the field reads as a string column, and each non-null
+    /// compiled at compile time (once per batch, mirroring `CidrMatch`), the
+    /// field reads as a string column, and each non-null
     /// cell is matched against the compiled regex (non-Utf8 columns / null
     /// cells read null, mirroring the interpreted `Value::Str`-only path).
     RegexMatch {
@@ -454,8 +456,9 @@ fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnEx
         },
         // `cidr_match(field, "addr/prefix")` / `regex_match(field, "pattern")`
         // — the gate (wf-lang columnar) admits exactly this shape: a flat field
-        // + a string-literal constant. The constant is parsed/compiled once
-        // here, not per row.
+        // + a string-literal constant. The constant is parsed/compiled here
+        // (once per batch — `compile_expr` runs per `eval_guard_columnar`
+        // call), never per row.
         Expr::FuncCall {
             qualifier: None,
             name,

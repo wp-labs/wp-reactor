@@ -957,7 +957,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 Value::Str(s) => s,
                 _ => return None,
             };
-            let net = wf_lang::cidr::Cidr::parse(&cidr)?;
+            let net = crate::match_engine::cidr_cache::cached_cidr(&cidr)?;
             Some(Value::Bool(net.contains(&ip)))
         }
         "time_diff" => {

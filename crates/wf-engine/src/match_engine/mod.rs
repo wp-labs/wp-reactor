@@ -1,6 +1,7 @@
 pub mod columnar;
 pub mod contract;
 pub mod event_bridge;
+mod cidr_cache;
 mod executor;
 mod regex_cache;
 #[allow(clippy::module_inception)]
