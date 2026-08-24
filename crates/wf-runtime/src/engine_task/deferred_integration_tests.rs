@@ -835,10 +835,8 @@ fn drain_alert_entity_ids(rx: &mut mpsc::Receiver<crate::alert_task::AlertBatch>
                 }
             }
             AlertBatch::Columns(cols) => {
-                for r in cols.iter_data_records() {
-                    if let Ok(r) = r {
-                        ids.push(super::tests::field_str(&r, "__wfu_entity_id"));
-                    }
+                for r in cols.iter_data_records().flatten() {
+                    ids.push(super::tests::field_str(&r, "__wfu_entity_id"));
                 }
             }
         }

@@ -12,7 +12,7 @@ use arrow::record_batch::RecordBatch;
 
 use wf_engine::alert::AlertColumnBuilder;
 use wf_engine::match_engine::{Event, RuleExecutor};
-use wf_engine::window::{Router, Window, WindowDef, WindowParams, WindowRegistry};
+use wf_engine::window::{Router, WindowDef, WindowParams, WindowRegistry};
 use wf_lang::ast::{BinOp, Expr, FieldRef, JoinMode};
 use wf_lang::plan::{
     BindPlan, EachPlan, EntityPlan, JoinCondPlan, JoinPlan, MatchPlan, RulePlan, ScorePlan,
@@ -196,7 +196,7 @@ fn columnar_join_matches_row_path_with_real_window_index() {
         Field::new("price", DataType::Int64, true),
     ]));
 
-    let mut registry = WindowRegistry::build(vec![
+    let registry = WindowRegistry::build(vec![
         window_def("auction_events", &auction_schema),
         window_def("bid_events", &bid_schema),
     ])

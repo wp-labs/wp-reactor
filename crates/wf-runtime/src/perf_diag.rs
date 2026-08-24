@@ -95,7 +95,12 @@ pub fn perf_cut_output() -> bool {
 
 /// 当前诊断档列表（空 = 非诊断模式或单点）。
 fn perf_stages() -> Arc<Vec<PerfStage>> {
-    Arc::new(PERF_STAGES.read().expect("perf stages lock poisoned").clone())
+    Arc::new(
+        PERF_STAGES
+            .read()
+            .expect("perf stages lock poisoned")
+            .clone(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -128,10 +133,17 @@ impl SentinelRecord {
 
 /// 从哨兵窗口 batch 解析哨兵记录。列缺失/类型不符的字段按 0 处理（防御）；
 /// `emit_ns` 由引擎侧补入。
-pub fn parse_sentinel_batch(batch: &arrow::record_batch::RecordBatch, emit_ns: i64) -> Vec<SentinelRecord> {
+pub fn parse_sentinel_batch(
+    batch: &arrow::record_batch::RecordBatch,
+    emit_ns: i64,
+) -> Vec<SentinelRecord> {
     use arrow::array::{Array, Int64Array};
-    let round_col = batch.column_by_name("round").and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-    let n_col = batch.column_by_name("n").and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let round_col = batch
+        .column_by_name("round")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let n_col = batch
+        .column_by_name("n")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
     let start_col = batch
         .column_by_name("start_ns")
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
@@ -179,7 +191,10 @@ pub fn sentinel_record_output(rec: &SentinelRecord) -> OutputRecord {
             ("record_type".into(), Value::Str("sentinel".into())),
             ("round".into(), Value::Number(rec.round as f64)),
             ("n".into(), Value::Number(rec.n as f64)),
-            ("start_ns".into(), Value::Str(rec.start_ns.to_string().into())),
+            (
+                "start_ns".into(),
+                Value::Str(rec.start_ns.to_string().into()),
+            ),
             ("emit_ns".into(), Value::Str(rec.emit_ns.to_string().into())),
         ],
         yield_field_types: Arc::from(vec![
@@ -275,9 +290,15 @@ impl PerfDiagController {
 
     /// 注入 reload 通道 + 基线（Reactor::start 完成后调用；`control_handle` 在
     /// `run` 驱动控制循环前即可安全调用）。
-    pub fn set_reload_handle(&self, handle: RuntimeControlHandle, raw: RawFusionConfigTree, config: FusionConfig) {
+    pub fn set_reload_handle(
+        &self,
+        handle: RuntimeControlHandle,
+        raw: RawFusionConfigTree,
+        config: FusionConfig,
+    ) {
         *self.control.write().expect("control lock poisoned") = Some(handle);
-        *self.baseline.lock().expect("baseline lock poisoned") = Some(ReloadBaseline { raw, config });
+        *self.baseline.lock().expect("baseline lock poisoned") =
+            Some(ReloadBaseline { raw, config });
     }
 
     /// 当前已生效诊断档下标（0 = 初始档已生效；`usize::MAX` = 无诊断档）。
@@ -319,17 +340,13 @@ impl PerfDiagController {
                     .map(|b| b.config.runtime.rules != rules)
                     .unwrap_or(false)
             };
-            if changed
-                && let Some(handle) = reload_handle
-            {
+            if changed && let Some(handle) = reload_handle {
                 // 构造下一份配置：仅 runtime.rules 指向规则子集文件。
                 // changed 成立的前提是基线存在（changed 由基线推导），故这里
                 // baseline 必为 Some——用 expect 表达不变量。
                 let (next_raw, next_config) = {
                     let baseline = self.baseline.lock().expect("baseline lock poisoned");
-                    let b = baseline
-                        .as_ref()
-                        .expect("changed implies baseline present");
+                    let b = baseline.as_ref().expect("changed implies baseline present");
                     let mut raw = b.raw.clone();
                     raw.set_runtime_rules(rules);
                     let mut config = b.config.clone();
@@ -395,7 +412,11 @@ pub(crate) async fn run_sentinel_task(config: SentinelTaskConfig) -> RuntimeResu
 
     // 启动即写初始完成信号 `stage{current=k}`（k = 已生效诊断档）——wfgen 在
     // 发送第 k 轮数据前轮询该记录，保证无竞态。
-    emit_sentinel_records(vec![stage_record_output(controller.current())], &sink_fanout).await;
+    emit_sentinel_records(
+        vec![stage_record_output(controller.current())],
+        &sink_fanout,
+    )
+    .await;
 
     loop {
         tokio::select! {
@@ -509,12 +530,16 @@ async fn emit_sentinel_records(records: Vec<OutputRecord>, sink_fanout: &Arc<Sin
 
 #[cfg(test)]
 mod tests {
+    // `serial()` 的序列化锁是**故意**跨 await 持有的：门控/诊断档是进程级全局状态，
+    // 测试必须在 await 期间也独占（否则其它测试会插入改写全局门控）。std Mutex 在
+    // 测试场景下短期持有无实际风险，clippy 的 await_holding_lock 属误报，模块级豁免。
+    #![allow(clippy::await_holding_lock)]
     use super::*;
+    use crate::lifecycle::ReloadOutcome;
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::time::Duration;
-    use crate::lifecycle::ReloadOutcome;
 
     /// 门控/诊断档是进程级全局状态：串行化涉全局的测试，避免并行污染。
     static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -652,11 +677,8 @@ mod tests {
             DataType::Int64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![7i64]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7i64]))]).unwrap();
         let records = parse_sentinel_batch(&batch, 42);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].round, 7);
@@ -717,15 +739,12 @@ mod tests {
         assert_eq!(fields.get("round"), Some(&Value::Number(2.0)));
         assert_eq!(fields.get("n"), Some(&Value::Number(500.0)));
         // start_ns/emit_ns 以字符串携带（epoch nanos 超出 f64 精确范围）。
+        assert_eq!(fields.get("start_ns"), Some(&Value::Str("1111".into())));
+        assert_eq!(fields.get("emit_ns"), Some(&Value::Str("2222".into())));
         assert_eq!(
-            fields.get("start_ns"),
-            Some(&Value::Str("1111".into()))
+            fields.get("record_type"),
+            Some(&Value::Str("sentinel".into()))
         );
-        assert_eq!(
-            fields.get("emit_ns"),
-            Some(&Value::Str("2222".into()))
-        );
-        assert_eq!(fields.get("record_type"), Some(&Value::Str("sentinel".into())));
         // 类型标注：round/n → Digit，start_ns/emit_ns → Chars（JSON 精确整数/字符串）。
         let types: std::collections::HashMap<&str, &FieldType> = out
             .yield_field_types
@@ -733,8 +752,14 @@ mod tests {
             .map(|(k, v)| (&**k, v))
             .collect();
         assert_eq!(types.get("round"), Some(&&FieldType::Base(BaseType::Digit)));
-        assert_eq!(types.get("start_ns"), Some(&&FieldType::Base(BaseType::Chars)));
-        assert_eq!(types.get("emit_ns"), Some(&&FieldType::Base(BaseType::Chars)));
+        assert_eq!(
+            types.get("start_ns"),
+            Some(&&FieldType::Base(BaseType::Chars))
+        );
+        assert_eq!(
+            types.get("emit_ns"),
+            Some(&&FieldType::Base(BaseType::Chars))
+        );
     }
 
     #[test]
@@ -785,7 +810,11 @@ mod tests {
     #[tokio::test]
     async fn controller_applies_next_stage_on_sentinel() {
         let _g = serial();
-        init_perf_diag(&test_config(vec![floor_stage(), rules_stage(), full_stage()]));
+        init_perf_diag(&test_config(vec![
+            floor_stage(),
+            rules_stage(),
+            full_stage(),
+        ]));
         let controller = PerfDiagController::new();
         assert_eq!(controller.current(), 0, "startup applies stages[0]");
         assert!(controller.has_next());
@@ -822,7 +851,10 @@ mod tests {
         let controller = PerfDiagController::new();
         // 同一 round 重复（--rounds 2）：只切换一次。
         assert!(controller.on_sentinel(0).await.is_some());
-        assert!(controller.on_sentinel(0).await.is_none(), "repeat round must not re-apply");
+        assert!(
+            controller.on_sentinel(0).await.is_none(),
+            "repeat round must not re-apply"
+        );
         assert_eq!(controller.current(), 1);
         reset_perf_diag();
     }
@@ -852,8 +884,8 @@ mod tests {
 
     fn drain_router() -> (Arc<Router>, Arc<wf_engine::window::Window>) {
         use arrow::datatypes::Schema;
-        use wf_engine::window::{WindowDef, WindowParams, WindowRegistry};
         use wf_config::{DistMode, EvictPolicy, LatePolicy, WindowConfig};
+        use wf_engine::window::{WindowDef, WindowParams, WindowRegistry};
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
         let def = WindowDef {
@@ -893,11 +925,7 @@ mod tests {
         assert_eq!(win.next_seq(), 1, "appended one batch");
         let cancel = CancellationToken::new();
         // 活消费者槽（未 ack）：min_acked=0 < next_seq=1 → 排空等待应阻塞。
-        let slot = router
-            .registry()
-            .progress("data_win")
-            .unwrap()
-            .register();
+        let slot = router.registry().progress("data_win").unwrap().register();
         let wait = tokio::spawn({
             let router = Arc::clone(&router);
             async move { wait_for_data_drain(&router, &cancel).await }
@@ -1057,7 +1085,11 @@ mod tests {
         let (fanout, mut rx) = test_fanout();
         let controller = PerfDiagController::new();
         let empty = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("round", DataType::Int64, false)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "round",
+                DataType::Int64,
+                false,
+            )])),
             vec![Arc::new(Int64Array::from(Vec::<i64>::new()))],
         )
         .unwrap();
@@ -1213,7 +1245,10 @@ rules = "rules/basic.wfl"
     /// 构造带真实 loader 基线 + 空控制通道的控制器（reload 路径测试用）。
     async fn controller_with_baseline(
         stages: Vec<PerfStage>,
-    ) -> (Arc<PerfDiagController>, tokio::sync::mpsc::Receiver<crate::lifecycle::ReloadRequest>) {
+    ) -> (
+        Arc<PerfDiagController>,
+        tokio::sync::mpsc::Receiver<crate::lifecycle::ReloadRequest>,
+    ) {
         init_perf_diag(&test_config(stages));
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("models")).unwrap();
@@ -1258,7 +1293,11 @@ rules = "rules/basic.wfl"
         let config = loader.load().expect("load config");
         let controller = PerfDiagController::new();
         let (tx, rx) = tokio::sync::mpsc::channel::<crate::lifecycle::ReloadRequest>(8);
-        controller.set_reload_handle(RuntimeControlHandle::new(tx, CancellationToken::new()), raw, config);
+        controller.set_reload_handle(
+            RuntimeControlHandle::new(tx, CancellationToken::new()),
+            raw,
+            config,
+        );
         (controller, rx)
     }
 
@@ -1285,10 +1324,7 @@ rules = "rules/basic.wfl"
                 other => panic!("unexpected: {other:?}"),
             }
         });
-        let applied = controller
-            .on_sentinel(0)
-            .await
-            .expect("reload 失败仍切换");
+        let applied = controller.on_sentinel(0).await.expect("reload 失败仍切换");
         consumer.await.unwrap();
         assert_eq!(applied.index, 1);
         assert!(!applied.reloaded, "reload 失败 → reloaded=false");
@@ -1310,10 +1346,7 @@ rules = "rules/basic.wfl"
             },
         ])
         .await;
-        let applied = controller
-            .on_sentinel(0)
-            .await
-            .expect("transition");
+        let applied = controller.on_sentinel(0).await.expect("transition");
         assert_eq!(applied.index, 1);
         assert!(!applied.reloaded, "rules 未变 → 不 reload");
         // 无 reload 请求发出。
@@ -1344,10 +1377,7 @@ rules = "rules/basic.wfl"
         let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::lifecycle::ReloadRequest>(8);
         *controller.control.write().unwrap() =
             Some(RuntimeControlHandle::new(tx, CancellationToken::new()));
-        let applied = controller
-            .on_sentinel(0)
-            .await
-            .expect("无基线也应切换");
+        let applied = controller.on_sentinel(0).await.expect("无基线也应切换");
         assert_eq!(applied.index, 1);
         assert!(!applied.reloaded);
         assert!(
