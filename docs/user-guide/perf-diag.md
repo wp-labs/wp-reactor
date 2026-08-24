@@ -160,7 +160,7 @@ cut_output = false
 以 nexmark_pk 为例，需要 3 处（每 bench 一份，独立于基准数据）：
 
 1. **`conf/perf-diag.toml`** — 诊断档列表（§5 模板）；
-2. **哨兵记录 sink** — `topology/sinks/business.d/sentinel.toml`：
+2. **哨兵记录 sink** — `topology/sinks/business.d/sentinel.toml`（**`wfadm init` 已自动生成**，无需手写）：
 
    ```toml
    [sink_group]
@@ -175,6 +175,7 @@ cut_output = false
    ```
 
    ⚠ 必须放 **`business.d/`**（`infra.d` 只读 `default/error/monitor` 三个固定文件）；
+   新 case 用 `wfadm init` 初始化即自带（业务路由组，窗口匹配加载）；
 3. **规则输出 sink** — 已有（benchmark blackhole 组）即覆盖；无则加一个
    `windows = ["<yield 目标>"]` 的组（否则 full 档告警无 sink，输出被丢弃并告警）。
 

@@ -156,7 +156,8 @@ cut_output = true
   （JSONL，一行一条记录）——**wfgen 从该文件读记录**，比从 metrics 流解析干净。
   ⚠ sink 路由组必须放 **`business.d/`**：`infra.d` 只读 `default/error/monitor`
   三个固定文件（`load_infra_group`），`[sink_group]` 形状在 business.d 才是
-  按窗口模式匹配的路由组。
+  按窗口模式匹配的路由组。**该文件由 `wfadm init` 自动生成**（`wfadm` 模板
+  `topology/sinks/business.d/sentinel.toml`），新 bench 无需手写。
   **独立验证 case**：`wf-examples/performance/perf_diag_case/`（单流、21 规则、
   100k 事件）承载机制端到端验证（验收清单见其 README/verify.sh），不与
   nexmark_pk/qradar_pk 基准混在一起；真实 bench 需要时各自补同款 sink。
