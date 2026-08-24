@@ -840,6 +840,34 @@ Iterator 内部已 reserve；`DistinctKey::Int` 是 memcpy 级拷贝, clone 近�
 5. 旁支发现：`match_engine/tests/executor/direct_tests.rs:412` 编译告警 never
    used——疑似漏 `#[test]`, 测试没在跑。
 
+## ✅ 静态表 anti 放开（`f79f9e7`, 2026-08-24）——白名单排除是合理需求
+
+**背景**：warp-fusion examples 的 port_scan_whitelist/ssh_brute_force 用
+`join scanner_whitelist anti`（静态表白名单排除）被 checker 拒绝（P4 限制：
+静态表仅 snapshot/inner）。用户质疑「anti 需要时序语义、对无时序静态表无意义
+是不合理需求」——质疑成立：
+
+- 设计文档 §2.1 表格 anti 时间谓词是「—」（无）——anti 与时间正交
+- 引擎 context.rs anti = `join_lookup` → 有匹配丢、无匹配留，**零时间依赖**
+- provider `join_lookup` 已有 O(1) 行索引（window_lookup.rs，q13 修复）
+- NEXMark Q21 就是 anti（黑名单过滤）——静态表白名单排除是标准用例
+- checker 注释「至今未匹配」是把 anti 与 interval/asof 混为一谈（后者才需要
+  时间列/窗口生命周期）
+
+**改动**：`check_static_window_join` 允许 `JoinMode::Anti`（仍拒绝 asof/within/
+reduce/deferred）；provider_joins.rs 的 anti 测试改「通过」断言；coverage_extra.rs
+同改；provider_join_integration_tests.rs 新增 `provider_anti_drops_whitelisted_
+keeps_others`（端到端：命中静态表丢弃、未命中保留）；join-family-design.md
+§14.5 更新。warp-fusion 两个示例规则恢复 anti（port_scan_whitelist 数据补
+5 行让非白名单 IP 达标）。
+
+**验证**：wf-lang 957 pass；wf-runtime 529 pass；warp-fusion run_all.sh
+24 pass / 1 skip（Redis）/ 0 fail。
+
+**顺带**：修 warp-fusion examples 一批测试失败（`ed519dc`）——两因：①测试
+输入字符串字面量 vs digit 字段数值 guard（`679ae40` 后 bind filter 真实评估
+暴露），②静态表 anti 被拒。根因 ① 的修复（字符串→数字）已含在该提交。
+
 ## 测试补充（2026-08-24，随 q20 修复提交）
 
 单元测试（direct_tests.rs，+3）：
