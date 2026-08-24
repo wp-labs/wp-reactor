@@ -186,9 +186,12 @@ cut_output = false
 > **非诊断用途（精确 EPS 统计）**：哨兵四元组本身也是精确的**完成信号/EPS 口径**。
 > nexmark_pk `bench.sh` 已接入：daemon 带 `--perf-diag`（**无档**配置 = 门控全
 > false，性能零影响，仅注册 `__wf_sentinel` 窗口）启动，发送端
-> `wfgen send-arrow/stream --sentinel <n>` 在数据末尾追加哨兵帧，引擎等**数据窗
-> 排空**后写四元组——完成判定与 EPS 直接读 `perf_sentinel.ndjson`，无 metrics
-> 轮询（±200ms）粒度误差。任意 bench 的发送端加 `--sentinel <n>` 即可复用。
+> `wfgen send-arrow/stream --sentinel` 启用**分连接哨兵**——每条连接 copy 完
+> 自己的数据后追加哨兵帧（round=连接号, n=该连接实际行数），单连接 1 条
+> （round=0）；引擎等**数据窗排空**后写四元组。完成判定与 EPS 直接读
+> `perf_sentinel.ndjson`（多连接汇总 Σn/(max emit − min start)，各连接 dt 可
+> 对比做均衡诊断），无 metrics 轮询（±200ms）粒度误差。任意 bench 的发送端加
+> `--sentinel` 即可复用。
 
 ## 8. 墙表解读
 
