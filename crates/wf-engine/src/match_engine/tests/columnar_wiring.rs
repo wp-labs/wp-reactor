@@ -251,6 +251,52 @@ fn cidr_match_non_literal_subnet_falls_back_interpreted() {
     }
 }
 
+/// regex_match 列式：字面量 pattern 编译期编译一次，mask 与逐行解释器逐位一致。
+#[test]
+fn regex_match_columnar_mask_matches_per_event() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("action", DataType::Utf8, true),
+        Field::new("event_time", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("failed_login"), // 命中
+                Some("success"),      // 不命中
+                None,                 // null → 不匹配
+                Some("fail fast"),    // 命中
+                Some("FAILED"),       // 大小写敏感 → 不命中
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+        ],
+    )
+    .unwrap();
+    let filter = Expr::FuncCall {
+        qualifier: None,
+        name: "regex_match".into(),
+        args: vec![
+            Expr::Field(FieldRef::Simple("action".into())),
+            Expr::StringLit("fail.*".into()),
+        ],
+    };
+    let exec = bind_executor(Some(filter));
+    let mask = exec
+        .bind_filter_columnar_mask("b", &batch)
+        .expect("regex_match 应列式（返回 Some mask）");
+    let events = batch_to_events(&batch);
+    let expect = [true, false, false, true, false];
+    for (row, ev) in events.iter().enumerate() {
+        assert_eq!(mask.value(row), expect[row], "row {row}");
+        assert_eq!(
+            exec.event_matches_alias("b", ev, None),
+            expect[row],
+            "row {row}: action={}",
+            ev.field_value_str("action")
+        );
+    }
+}
+
 #[test]
 fn no_filter_returns_none() {
     let batch = auction_batch(vec![Some(1), Some(2)]);

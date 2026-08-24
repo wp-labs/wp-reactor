@@ -322,6 +322,15 @@ enum ColumnExpr<'a> {
         col: ColRef<'a>,
         net: wf_lang::cidr::Cidr,
     },
+    /// `regex_match(field, "pattern")` — lowered natively: the regex is
+    /// compiled **once** at compile time (the checker enforces a literal and
+    /// validates it), the field reads as a string column, and each non-null
+    /// cell is matched against the compiled regex (non-Utf8 columns / null
+    /// cells read null, mirroring the interpreted `Value::Str`-only path).
+    RegexMatch {
+        col: ColRef<'a>,
+        re: regex::Regex,
+    },
 }
 
 /// Evaluate a columnar guard expression over every row of `view`, producing one
@@ -407,14 +416,15 @@ fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnEx
             }
             _ => None,
         },
-        // `cidr_match(field, "addr/prefix")` — the gate (wf-lang columnar)
-        // admits exactly this shape: a flat field + a string-literal subnet.
-        // The subnet is parsed once here, not per row.
+        // `cidr_match(field, "addr/prefix")` / `regex_match(field, "pattern")`
+        // — the gate (wf-lang columnar) admits exactly this shape: a flat field
+        // + a string-literal constant. The constant is parsed/compiled once
+        // here, not per row.
         Expr::FuncCall {
             qualifier: None,
             name,
             args,
-        } if name == "cidr_match"
+        } if (name == "cidr_match" || name == "regex_match")
             && args.len() == 2
             && matches!(
                 &args[0],
@@ -423,17 +433,24 @@ fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnEx
                 )
             ) =>
         {
-            let Expr::StringLit(cidr) = &args[1] else {
+            let Expr::StringLit(constant) = &args[1] else {
                 return None;
             };
-            let net = wf_lang::cidr::Cidr::parse(cidr)?;
             let Expr::Field(field) = &args[0] else {
                 unreachable!("shape matched above");
             };
-            Some(ColumnExpr::CidrMatch {
-                col: view.resolve_field(field),
-                net,
-            })
+            let col = view.resolve_field(field);
+            if name == "cidr_match" {
+                Some(ColumnExpr::CidrMatch {
+                    col,
+                    net: wf_lang::cidr::Cidr::parse(constant)?,
+                })
+            } else {
+                Some(ColumnExpr::RegexMatch {
+                    col,
+                    re: regex::Regex::new(constant).ok()?,
+                })
+            }
         }
         _ => None,
     }
@@ -524,6 +541,7 @@ impl ColumnExpr<'_> {
                 arith_vec(*op, left.eval_vec(n), right.eval_vec(n))
             }
             ColumnExpr::CidrMatch { col, net } => cidr_vec(col, net, n),
+            ColumnExpr::RegexMatch { col, re } => regex_vec(col, re, n),
         }
     }
 }
@@ -603,6 +621,21 @@ fn cidr_vec(col: &ColRef<'_>, net: &wf_lang::cidr::Cidr, n: usize) -> CVec {
         ColRef::Utf8(a) => CVec::Bool(
             (0..n)
                 .map(|r| (!a.is_null(r)).then(|| net.contains(a.value(r))))
+                .collect(),
+        ),
+        _ => CVec::Bool(vec![None; n]),
+    }
+}
+
+/// Vectorized `regex_match(field, re)` over a string column. Mirrors the
+/// interpreted path: only a `Utf8` column can carry a haystack; null cells
+/// read null; non-UTF8 / array-shaped / missing columns read all-null. The
+/// regex is already compiled — this kernel never recompiles it.
+fn regex_vec(col: &ColRef<'_>, re: &regex::Regex, n: usize) -> CVec {
+    match col {
+        ColRef::Utf8(a) => CVec::Bool(
+            (0..n)
+                .map(|r| (!a.is_null(r)).then(|| re.is_match(a.value(r))))
                 .collect(),
         ),
         _ => CVec::Bool(vec![None; n]),
@@ -1887,5 +1920,37 @@ mod tests {
         // 字面量 IP 首参 → 非列式（回落解释器）。
         let lit_ip = cidr_call(Expr::StringLit("10.0.0.1".into()), "10.0.0.0/8");
         assert!(!wf_lang::columnar::expr_is_columnar(&lit_ip));
+    }
+
+    #[test]
+    fn regex_match_matches_interpreted_and_composes() {
+        let batch = ip_batch(
+            vec![
+                Some("failed_login"), // 命中 fail.*
+                Some("success"),      // 不命中
+                Some("fail fast"),    // 命中
+                Some("login"),        // 不命中
+                None,                 // null
+                Some("FAILED"),       // 大小写敏感 → 不命中
+            ],
+            vec![Some(1), Some(5), Some(2), Some(0), Some(9), Some(7)],
+        );
+        let rm = |arg1: Expr| Expr::FuncCall {
+            qualifier: None,
+            name: "regex_match".into(),
+            args: vec![field("sip"), arg1],
+        };
+        let expr = rm(Expr::StringLit("fail.*".into()));
+        assert!(wf_lang::columnar::expr_is_columnar(&expr));
+        assert_equiv(&expr, &batch);
+
+        // 组合：regex_match && count > 1 — 整体列式且逐位一致。
+        let combo = bin(BinOp::And, expr, bin(BinOp::Gt, field("count"), num(1.0)));
+        assert!(wf_lang::columnar::expr_is_columnar(&combo));
+        assert_equiv(&combo, &batch);
+
+        // 非字面量 pattern → 非列式（回落解释器）。
+        let dyn_pat = rm(field("pat"));
+        assert!(!wf_lang::columnar::expr_is_columnar(&dyn_pat));
     }
 }

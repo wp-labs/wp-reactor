@@ -853,3 +853,84 @@ fn columnar_cidr_match_overhead_bounded() {
         row_el
     );
 }
+
+/// regex_match 性能保护：字面量 pattern 编译期编译一次，列式吞吐必须远快于
+/// 解释路径（解释路径每事件重编译正则，release 实测 ~19.6µs/ev vs 预编译
+/// 13ns/ev，相差 1465 倍；这里只需证明列式可用且明显更快）。
+#[test]
+fn columnar_regex_match_overhead_bounded() {
+    use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
+    use crate::match_engine::match_engine::eval_expr;
+
+    let n = 1_000usize;
+    let schema = Arc::new(Schema::new(vec![Field::new("action", DataType::Utf8, true)]));
+    let vals: Vec<Option<&str>> = (0..n)
+        .map(|i| match i % 4 {
+            0 => None,
+            1 | 2 => Some("failed_login"),
+            _ => Some("success"),
+        })
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vals)) as ArrayRef],
+    )
+    .unwrap();
+    let view = ColumnarBatch::from_all_fields(&batch);
+
+    let field = |name: &str| Expr::Field(FieldRef::Simple(name.to_string()));
+    let re_expr = Expr::FuncCall {
+        qualifier: None,
+        name: "regex_match".into(),
+        args: vec![field("action"), Expr::StringLit("fail.*".into())],
+    };
+    assert!(
+        wf_lang::columnar::expr_is_columnar(&re_expr),
+        "regex_match 字面量形态必须列式"
+    );
+
+    let rounds = 400usize;
+    let start = Instant::now();
+    let mut mask = arrow::array::BooleanArray::new_null(0);
+    for _ in 0..rounds {
+        mask = eval_guard_columnar(&re_expr, &view);
+    }
+    let col_el = start.elapsed();
+    let col_eps = n as f64 * rounds as f64 / col_el.as_secs_f64();
+
+    // mask 正确性：null → false；fail.* 命中为 true。
+    assert_eq!(mask.len(), n);
+    for (row, expect) in [(1, true), (2, true), (3, false), (0, false)] {
+        assert_eq!(mask.value(row), expect, "row {row}");
+    }
+
+    // 解释路径对照（相同轮次）。
+    let events = batch_to_events(&batch);
+    let start = Instant::now();
+    let mut count = 0usize;
+    for _ in 0..rounds {
+        count = 0;
+        for ev in &events {
+            if eval_expr(&re_expr, ev) == Some(Value::Bool(true)) {
+                count += 1;
+            }
+        }
+    }
+    let row_el = start.elapsed();
+    let row_eps = n as f64 * rounds as f64 / row_el.as_secs_f64();
+    // 每行 i%4∈{1,2} 命中 → 每轮 500 行。
+    assert_eq!(count, 500, "每轮解释路径命中数应为 500");
+
+    let ratio = col_el.as_secs_f64() / row_el.as_secs_f64();
+    eprintln!(
+        "[columnar-regex-bench] col={:.0} ev/s  row={:.0} ev/s  col/row={:.2}x",
+        col_eps, row_eps, ratio
+    );
+    assert!(
+        ratio < 1.0,
+        "columnar regex_match 不应慢于解释路径：{:.2}x (col {:?} vs row {:?})",
+        ratio,
+        col_el,
+        row_el
+    );
+}

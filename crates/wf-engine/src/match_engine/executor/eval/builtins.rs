@@ -942,7 +942,7 @@ pub(super) fn eval_builtin_func_with_l3(
                 Value::Str(s) => s,
                 _ => return None,
             };
-            let re = regex::Regex::new(&pat).ok()?;
+            let re = crate::match_engine::regex_cache::cached_regex(&pat)?;
             Some(Value::Bool(re.is_match(&hay)))
         }
         "cidr_match" => {

@@ -2,6 +2,7 @@ pub mod columnar;
 pub mod contract;
 pub mod event_bridge;
 mod executor;
+mod regex_cache;
 #[allow(clippy::module_inception)]
 mod match_engine;
 

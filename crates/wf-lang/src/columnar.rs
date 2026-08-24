@@ -48,15 +48,16 @@ pub fn expr_is_columnar(expr: &Expr) -> bool {
             binop_is_columnar(*op) && expr_is_columnar(left) && expr_is_columnar(right)
         }
 
-        // `cidr_match(field, "addr/prefix")` — the one function the columnar
-        // evaluator lowers natively: the subnet is a compile-time literal
-        // (parsed once per batch), and the IP field reads as a string column.
-        // Everything else falls back to the interpreted path.
+        // `cidr_match(field, "addr/prefix")` and `regex_match(field, "pattern")`
+        // — the two functions the columnar evaluator lowers natively: the
+        // constant (subnet / pattern) is parsed/compiled **once** per batch at
+        // compile time, and the field reads as a string column. Everything else
+        // falls back to the interpreted path.
         Expr::FuncCall {
             qualifier: None,
             name,
             args,
-        } if name == "cidr_match" && args.len() == 2 => {
+        } if args.len() == 2 && (name == "cidr_match" || name == "regex_match") => {
             matches!(args[0], Expr::Field(FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)))
                 && matches!(&args[1], Expr::StringLit(_))
         }
@@ -353,6 +354,44 @@ mod tests {
         assert!(expr_is_columnar(&and));
         // not 包住也列式。
         assert!(expr_is_columnar(&Expr::Not(Box::new(and))));
+    }
+
+    #[test]
+    fn regex_match_is_columnar_when_literal_pattern() {
+        let rm = |arg0: Expr, arg1: Expr| Expr::FuncCall {
+            qualifier: None,
+            name: "regex_match".to_string(),
+            args: vec![arg0, arg1],
+        };
+        // 字段 + 字面量 pattern → 列式。
+        assert!(expr_is_columnar(&rm(
+            field("action"),
+            Expr::StringLit("fail.*".into())
+        )));
+        assert!(expr_is_columnar(&rm(
+            qualified("e", "action"),
+            Expr::StringLit("^\\.exe$".into())
+        )));
+        // 非字面量 pattern → 回落解释器。
+        assert!(!expr_is_columnar(&rm(field("action"), field("pat"))));
+        // 非字段首参 → 回落。
+        assert!(!expr_is_columnar(&rm(
+            Expr::StringLit("x".into()),
+            Expr::StringLit("y".into())
+        )));
+        // 参数个数不符 → 回落。
+        assert!(!expr_is_columnar(&Expr::FuncCall {
+            qualifier: None,
+            name: "regex_match".to_string(),
+            args: vec![field("action")],
+        }));
+        // 组合：regex_match && contains(...)（后者非列式）→ 整体回落。
+        let mixed = cmp(
+            BinOp::And,
+            rm(field("action"), Expr::StringLit("fail.*".into())),
+            func("contains"),
+        );
+        assert!(!expr_is_columnar(&mixed));
     }
 
     #[test]
