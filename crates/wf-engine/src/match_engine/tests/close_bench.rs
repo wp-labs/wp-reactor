@@ -1622,7 +1622,7 @@ fn run_merge_shards(
             }
         } else {
             for src in p.drain(..) {
-                for (t, o) in c.iter_mut().zip(src.into_iter()) {
+                for (t, o) in c.iter_mut().zip(src) {
                     merge_owned(t, o);
                 }
             }
@@ -1640,7 +1640,7 @@ fn run_merge_shards(
         }
     } else {
         for src in p.drain(..) {
-            for (t, o) in c.iter_mut().zip(src.into_iter()) {
+            for (t, o) in c.iter_mut().zip(src) {
                 merge_owned(t, o);
             }
         }

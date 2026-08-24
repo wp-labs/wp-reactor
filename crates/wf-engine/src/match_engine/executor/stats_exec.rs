@@ -679,7 +679,7 @@ impl StatsExecutor {
                 }
             } else {
                 // last/top: 逐行按行域 + where 更新（子集行字段提取; 空键 last 规则少用）
-                let passes = |r: usize| wi.map_or(true, |wi| masks[wi].value(r));
+                let passes = |r: usize| wi.is_none_or(|wi| masks[wi].value(r));
                 for r in domain_rows(rows, n).filter(|&r| passes(r)) {
                     let row = row_fields_from_batch(batch, r, row_field_cols.as_deref());
                     let fidx = measure_field_position(
@@ -1621,7 +1621,7 @@ fn domain_rows(rows: Option<&[u32]>, n: usize) -> Box<dyn Iterator<Item = usize>
 /// 等价 `count_true(combine(domain, where))`——逐行查 where mask 位（null slot
 /// 读 false, 与 `BooleanArray::value` 一致）。
 fn count_domain(rows: Option<&[u32]>, n: usize, masks: &[BooleanArray], wi: Option<usize>) -> u64 {
-    let passes = |r: usize| wi.map_or(true, |wi| masks[wi].value(r));
+    let passes = |r: usize| wi.is_none_or(|wi| masks[wi].value(r));
     match rows {
         Some(rs) => rs.iter().filter(|&&r| passes(r as usize)).count() as u64,
         None => (0..n).filter(|&r| passes(r)).count() as u64,
@@ -1636,7 +1636,7 @@ fn sum_domain(
     masks: &[BooleanArray],
     wi: Option<usize>,
 ) -> i128 {
-    let passes = |r: usize| wi.map_or(true, |wi| masks[wi].value(r));
+    let passes = |r: usize| wi.is_none_or(|wi| masks[wi].value(r));
     match col {
         NumCol::Int64(c) => domain_rows(rows, n)
             .filter(|&r| passes(r) && !c.is_null(r))
@@ -1659,7 +1659,7 @@ fn minmax_domain(
     min: &mut Option<i128>,
     max: &mut Option<i128>,
 ) {
-    let passes = |r: usize| wi.map_or(true, |wi| masks[wi].value(r));
+    let passes = |r: usize| wi.is_none_or(|wi| masks[wi].value(r));
     let fold = |v: i128, min: &mut Option<i128>, max: &mut Option<i128>| {
         *min = Some(match *min {
             Some(m) if m <= v => m,
@@ -1708,7 +1708,7 @@ fn insert_distinct_domain(
         return true; // 字段缺失 → 全 null（与行式 extract None 一致）
     };
     let col = batch.column(idx).as_ref();
-    let passes = |r: usize| wi.map_or(true, |wi| masks[wi].value(r));
+    let passes = |r: usize| wi.is_none_or(|wi| masks[wi].value(r));
     if let Some(c) = col.as_any().downcast_ref::<Int64Array>() {
         for r in domain_rows(rows, n) {
             if passes(r) && !c.is_null(r) {
