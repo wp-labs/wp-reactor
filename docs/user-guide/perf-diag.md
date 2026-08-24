@@ -22,7 +22,9 @@ full（+输出链）                    ← 什么都不切
 - **诊断档自动切换**：wfgen 每批帧尾追加一条哨兵（漂流瓶），引擎处理完
   "批末最后一条"后自动切到下一个诊断档——单 daemon 一次跑完所有档；
 - **EPS 直接可算**：哨兵记录自带 `{round, n, start_ns, emit_ns}` 四元组，
-  `eps = n / (emit_ns − start_ns)`，全程无外部记账。
+  `eps = n / (emit_ns − start_ns)`，全程无外部记账。`emit_ns` 是引擎等**数据窗
+  排空**（每个数据窗 `min_acked ≥ next_seq`，即全部数据被所有规则消费完）后的
+  时刻——实现细节见[设计文档 §4.3](../design/perf-diag-mode-design.md)。
 
 ## 2. 快速开始（10 秒看墙梯）
 

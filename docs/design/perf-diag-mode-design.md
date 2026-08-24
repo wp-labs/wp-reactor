@@ -187,9 +187,25 @@ cut_output = true
   EPS；`round`/`n` 走 Digit（JSON 整数）。哨兵帧（wfgen→引擎）本身是 Int64
   Arrow 列，全程无精度损失。
 - **批末语义（实现定稿）**：哨兵帧与数据帧同 TCP 连接、同源 seq 有序（哨兵是
-  "批末最后一条"）。规则消费是异步 pull——哨兵任务在**数据窗排空**（所有数据窗
-  的 `min_acked` 追平 `next_seq`）后才写记录，`emit_ns` ≈ 该批真实处理结束时刻。
-  无此等待时小批量会把"提交完成"当成"处理完成"（100k 实测 full 档 10.9M 假象）。
+  "批末最后一条"；`send-arrow/stream --sentinel` 则在数据推完后单独连接追加）。
+  规则消费是异步 pull——哨兵任务在**数据窗排空**后才写记录，`emit_ns` ≈ 该批
+  真实处理结束时刻。无此等待时小批量会把"提交完成"当成"处理完成"（100k 实测
+  full 档 10.9M 假象）。
+  **哨兵帧路由**：TCP source 按 stream tag（`__wf_sentinel`）路由进内置哨兵
+  窗口（无时间列，不推水位/不拒迟到），窗口 fanout → 哨兵任务订阅通道
+  （Reactor 在 receiver 注册前 spawn 订阅，杜绝首帧漏投）→ 哨兵任务
+  `run_sentinel_task` 收到 `RulePush` 后先排空、再补 `emit_ns` 落盘。
+  **排空判定（`wait_for_data_drain`）**：遍历 registry 每个数据窗，检查
+  `min_acked ≥ next_seq`（哨兵窗自身、无消费语义的 provider 窗跳过）：
+  - `next_seq` = 窗口已 append 的批次数（`Window::next_seq`，append 时
+    `fetch_add(1)`）——"数据已全部进入窗口"；
+  - `min_acked` = **所有**规则消费者（含分片 shard）已确认读到的最小 seq
+    （`WindowProgress`，规则处理完批次后 ack）——"最慢的规则也已消费到最新"；
+  两者相等 = 该窗"接收完 **且** 全部被规则消费完"。1ms 轮询直到全部排空；
+  引擎关停经 cancel 令牌退出（bench 侧另有 MAX_SEC 超时 + metrics-append 兑底）。
+  `min_acked` 复用引擎既有消费进度记账——内存驱逐器（evictor）同样以它做
+  下限（时间驱逐只删所有消费者已读过的批次，慢规则未读的不能丢），哨兵排空
+  不新增机制。
 - **跨档一致性**：哨兵走独立窗口，测共享段（recv/decode/路由）+ 数据窗排空；
   各档同一口径，增量 T1(k) − T1(k−1) 的墙归属判定成立。
 
