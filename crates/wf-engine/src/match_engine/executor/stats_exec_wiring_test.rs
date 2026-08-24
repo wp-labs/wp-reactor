@@ -9,8 +9,6 @@
 //! 管线（build_close_alert）产出 OutputRecord，yield 里的 `stat.value(final(label))`
 //! 由 eval 上下文注入的 measure label 解析（executor/eval/builtins.rs eval_stat_func）。
 //! daemon 层的 fanout 注册/ack 为后续接线（pull/push 投递），本测试锁定其数据路径。
-use std::sync::Arc;
-
 use std::collections::HashMap;
 
 use wf_lang::ast::CloseMode;

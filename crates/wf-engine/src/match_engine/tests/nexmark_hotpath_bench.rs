@@ -1152,19 +1152,12 @@ fn q4_q6_join_then_key_batch_precompute() {
         // 正确性对拍：前 K 行 StepResult 序列逐位一致（同 rule_name）。
         let mut sm_a = CepStateMachine::new("q".into(), plan.clone(), None);
         let mut sm_b = CepStateMachine::new("q".into(), plan.clone(), None);
-        for i in 0..K {
+        for (i, key) in keys.iter().enumerate().take(K) {
             let ev = ColumnarEvent::new(&batch, i);
             let ts = NOW + i as i64 * EVENT_STEP_NS;
             let ra = sm_a.advance_at_with_masks("b", &ev, ts, Some(&lookup), i, None);
-            let rb = sm_b.advance_at_with_masks_key(
-                "b",
-                &ev,
-                ts,
-                Some(&lookup),
-                i,
-                None,
-                Some(&keys[i]),
-            );
+            let rb =
+                sm_b.advance_at_with_masks_key("b", &ev, ts, Some(&lookup), i, None, Some(key));
             assert_eq!(
                 ra, rb,
                 "{label} row {i}: 批级预解析 vs 内部解析结果必须一致"
@@ -1196,7 +1189,7 @@ fn q4_q6_join_then_key_batch_precompute() {
         // 计时：路径 B（批级预解析）。
         let mut sm2 = CepStateMachine::new("q".into(), plan, None);
         let t1 = Instant::now();
-        for i in 0..N {
+        for (i, key) in keys.iter().enumerate().take(N) {
             let ev = ColumnarEvent::new(&batch, i);
             let ts = NOW + i as i64 * EVENT_STEP_NS;
             let _ = std::hint::black_box(sm2.advance_at_with_masks_key(
@@ -1206,7 +1199,7 @@ fn q4_q6_join_then_key_batch_precompute() {
                 Some(&lookup),
                 i,
                 None,
-                Some(&keys[i]),
+                Some(key),
             ));
         }
         let batch_ns = t1.elapsed().as_secs_f64() * 1e9 / N as f64;
@@ -1469,7 +1462,7 @@ fn q6_match_emit() {
     report("q6 build ctx(窄化)", ctx_ns, exec_ns);
 
     // 分量 2：build_match_alert（ctx 复用，只测 alert 构建）。
-    let mut ctx = build_eval_context(
+    let ctx = build_eval_context(
         &rule.match_plan.keys,
         &matched.scope_key,
         &matched.step_data,

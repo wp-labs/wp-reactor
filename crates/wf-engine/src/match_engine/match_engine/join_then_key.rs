@@ -48,7 +48,7 @@ pub fn precompute_join_then_keys(
     let mut key_rows: HashMap<JoinKey, Vec<usize>> = HashMap::new();
     for (i, &row) in row_domain.iter().enumerate() {
         let val = ColumnarEvent::new(batch, row).value_at(left_idx);
-        match val.as_ref().and_then(|v| JoinKey::from_value(v)) {
+        match val.as_ref().and_then(JoinKey::from_value) {
             Some(k) => {
                 key_rows.entry(k).or_default().push(i);
                 per_row_val.push(val);

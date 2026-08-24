@@ -311,6 +311,7 @@ impl CepStateMachine {
     /// re-check + key-field materialization (q4/q6 advance 88.8%) moves out of
     /// the per-event loop. `key_override` semantics: `Some(Some(keys))` = use;
     /// `Some(None)` = pre-resolved miss (skip); `None` = internal resolution.
+    #[allow(clippy::too_many_arguments)]
     pub fn advance_at_with_masks_key<E: FieldSource>(
         &mut self,
         alias: &str,

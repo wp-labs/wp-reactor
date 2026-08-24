@@ -220,14 +220,11 @@ fn execute_each_direct_batch_columnar_join_matches_event_path_rows() {
     assert_batches_equal_rows(&via_events.finish(), &via_columnar.finish());
 }
 
-/// 列式 join gate 分支：形状不支持 → 回退行式（each_plan_columnar_safe=false）。
-#[test]
 /// 列式 join 执行的补充语义测试（2026-08-23 review）：
 /// 1. where 多谓词合取（`A == 1 && B == "x"`）；
 /// 2. float 左 key（f64→Int 截断后桶内 values_equal 复核拒绝——1.5 不匹配 id=1）；
 /// 3. 右窗字段 null → where 拒绝；
 /// 4. 无 where + join miss → 输出该行（右窗 yield 字段空串）。
-/// 全部与行式路径逐位对拍。
 #[test]
 fn columnar_join_semantics_edge_cases_match_event_path() {
     use crate::match_engine::event_bridge::{ColumnarEvent, JoinRow, materialize_rows};
@@ -409,6 +406,8 @@ fn columnar_join_semantics_edge_cases_match_event_path() {
     run_both(&exec_nowhere, &batch, (2, 0));
 }
 
+/// 列式 join gate 分支：形状不支持 → 回退行式（each_plan_columnar_safe=false）。
+#[test]
 fn each_join_columnar_gate_rejects_unsupported_shapes() {
     let base = || {
         let mut plan = simple_rule_plan(
@@ -495,7 +494,7 @@ fn each_join_columnar_gate_rejects_unsupported_shapes() {
 
     // 无 where + 输出只读左窗（q13 死 join 消除后 live_joins 空，不适用）——
     // 这里 join 存活（无 where 也需右窗字段读才存活）；全左窗输出 → join 死。
-    let mut plan = base();
+    let plan = base();
     let exec = RuleExecutor::new(plan);
     // 无 where、yield/entity 全读左窗 → 死 join 消除 → live_joins 空 → 无 join 列式路径。
     assert!(
@@ -545,7 +544,16 @@ fn each_join_columnar_gate_rejects_unsupported_shapes() {
     );
 
     // join 条件左字段限定符非驱动别名 → 不支持（防御）。
+    // 必须让 join 存活（yield 读右窗字段），否则死 join 消除 → live_joins 空 →
+    // 走无 join 路径，防御逻辑（parse_each_join_columnar）不触发。
     let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "cat".into(),
+        value: Expr::Field(FieldRef::Qualified(
+            "auction_events".into(),
+            "category".into(),
+        )),
+    }];
     plan.joins[0].conds[0].left = FieldRef::Qualified("other".into(), "auction".into());
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
 }
