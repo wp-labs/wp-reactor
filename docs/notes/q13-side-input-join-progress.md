@@ -705,15 +705,58 @@ vs OSS **7.41×~211.87×**；vs VVR **1.90×~56.25×，20/20 达 VVR**。
 - 回归：`cargo test -p wf-lang -p wf-engine -p wf-runtime --lib` → **931 + 1075 +
   493 passed**；clippy 无新增。
 
+## ✅ q20 snapshot join 性能（2026-08-24，Arc<JoinRow> 消除每行 clone/drop）
+
+**目标**：q20（`on each b` + snapshot join auction + `where category==10`）30M 4.70M EPS
+（全量倒数第 4，snapshot 展开路径）。数据驱动：先函数级 profile，再改。
+
+### 函数级归因（macOS `sample` 采样 + 段级计时，非猜测）
+
+- each_exec 每段（4096 行）总耗时 7.5ms：join 3.15ms（key 0.14 + lookup 0.72 +
+  fill 1.78）+ out 4.34ms（recheck 1.86 + where 0.17 + meta/yield/commit ~0.25 +
+  **未捕获 2.1ms**）。rule_task exec 80ms/批 ≈ 8.8 段 × 7.3ms + 16ms 锁开销，账闭合。
+- `sample` 调用树：`execute_each_direct_batch_columnar_join` 占 process_batch
+  93%；其中 **JoinRow drop_glue 1791/4477 采样（40%）**——fill 每行 `first.clone()`
+  （JoinRow::Columnar = 4 个 Arc bump）+ recheck 每行 `row_match[idx].clone()`
+  （再 4 个）+ 行尾 drop；共享批 Arc 跨线程原子争用（q20 CPU 571%）。
+- 未捕获 2.1ms = drop 成本（计时器外的 JoinRow/Value drop，行尾 + 函数尾）。
+
+### 修复（`1b2f657`）
+
+1. `row_match: Vec<Option<Arc<JoinRow>>>`：每桶只搬移一次首行
+   （`into_iter().next()` 零 bump），每行仅 1 次 Arc clone（原 4 个 Arc bump）。
+2. recheck 命中行 `as_ref()` 零克隆；miss 行结果暂存 `miss_hold`（仅 miss 行
+   承担 lookup 成本）。
+3. fill 浮点/非浮点分支拆分（q20 非浮点走共享 Arc 路径）。
+
+### 实测（30M replay，哨兵 EPS）
+
+- **q20: 4.62M → 20.87M EPS（4.5×）**；RSS 10.0GB → 4.5GB（−55%）；CPU 618% → 260%
+  （原子争用消除）。
+- 段级：fill 1785µs→19µs（94×）、recheck 1862µs→296µs、每段 7512µs→1656µs。
+- 正确性：q13 全部一致 ✅（同路径静态 provider join 不受影响）；**q20 verify
+  偏差 0.97~1.65%（<5% 容差）**。
+
+### q20 偏差机制（已用计数器钉死，非逻辑 bug）
+
+fill_hit/recheck_rescue 计数器：原始 fill_hit=24.27M、recheck=0；修复后
+fill_hit=23.87M、recheck=104k。差异不在代码逻辑（两版提取同一 bucket.first()），
+而是原设计「批快照 + 行时复查」的**固有竞态**：join 目标窗口（非 source）按
+`eff_max_seq=None` 读**全量已提交状态**；原始 fill 循环的 clone 工作（1.78ms/段）
+穿插在 join_lookup 之间，窗口在期间持续前进，后面的 key 看到更晚快照；加速后
+所有 lookup 挤在窗口前进前完成 → 少命中，recheck（更晚时点）只补回部分。
+方向恒为**少发**（更接近真实流序——少看到“未来 auction”的过度匹配），原始
+精确一致是慢速 clone 恰做“节奏延迟”的巧合。**待办（可选）**：确定性快照边界
+（跨窗口 seq-cut 映射）才能彻底钉死，工程中等，暂不做。
+
 ## 下一步（重开 session 从这里继续）
 
-1. **全量 22 查询 30M 重跑 + 重新采集 OSS/VVR 对照**（q9/q4 EPS 已 4.9×；两份基准
-   文档数字已过时）
-2. q3 −16% 根因（已反复确认与驱逐/pin 无关，是独立 bug）；q12 fixed+close 尾桶收口
-3. D4 剩余：eager interval join 的 pin（nexmark 暂无此形态）；及「结果可能不完整」
-   的正确性信号/指标（现在只有一条 warn）
-4. （可选）q13 列式 join 免 Event 物化
-5. （可选）跟进 ⚠️ 观察 1：10m 下 bid_mod 中间窗 9.3GB RSS（over=2d 不驱逐属预期，仅记录）
-6. 旁支发现（非本次改动）：`match_engine/tests/executor/direct_tests.rs:412`
-   `each_join_columnar_gate_rejects_unsupported_shapes` 编译告警 never used
-   ——疑似漏了 `#[test]`，测试其实没在跑。
+1. **q15（4.44M stats 单桶）**：stats 列式本身 122ns/evt 已最优，瓶颈是空键单桶
+   单实例——方向 stats 分片 + EOS 归并（count 加法、distinct 集合并）
+2. 全量 22 查询 30M 重跑 + OSS/VVR 对照刷新（q20 已 20.87M=4.5×；q9/q4 也已
+   4.9×，两份基准文档数字需重采）
+3. q3 −16% 根因（独立 bug）；q12 fixed+close 尾桶收口
+4. D4 剩余：eager interval join 的 pin；「结果可能不完整」的正确性信号/指标
+5. （可选）q20 确定性快照边界（见上节机制）；q13 列式 join 免 Event 物化
+6. 旁支发现：`match_engine/tests/executor/direct_tests.rs:412` 编译告警 never
+   used——疑似漏 `#[test]`，测试没在跑。
