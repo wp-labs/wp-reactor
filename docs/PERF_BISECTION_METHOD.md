@@ -17,7 +17,7 @@
 > | ② 切规则 | `rules` vs `floor` 档 | `[perf].cut_rules` 原子门控（ack 保留） |
 > | 规则子集 | `family_*` 档 | `runtime.rules` hot reload |
 > | ④ 预算 | `budget:X` 档（唯一重启例外） | `parse_buffer_bytes` |
-> | 计时 | `profiling=off` | `WF_RULE_PROFILING=0`（门控化） |
+> | 计时 | `profiling=off` | `WF_RULE_PROFILING=0`（启动期环境变量，非诊断档） |
 > | 完成信号 | 漂流瓶 sentinel `__wf_sentinel` | 哨兵任务等数据窗排空后写 `perf_sentinel{round,n,start_ns,emit_ns}` + `stage{current=k}` 记录 |
 >
 > 驱动：`wfgen perf-diag --diag conf/perf-diag.toml --frames ... --n-list ...`

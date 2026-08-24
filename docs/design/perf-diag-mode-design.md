@@ -5,7 +5,7 @@
 > 声明式切换诊断档，**不重启 daemon、不改引擎代码、不手拼测量协议**。
 >
 > 术语：批末完成信号称 **sentinel（哨兵）**——内置 `__wf_sentinel` 窗口 +
-> 哨兵规则，载荷 `{round, n, start_ns}` 自描述，emit 补 `emit_ns` → EPS 四元组
+> 哨兵任务，载荷 `{round, n, start_ns}` 自描述，处理完成补 `emit_ns` → EPS 四元组
 > 直接可算。
 
 ---
@@ -52,16 +52,16 @@
 │    ① 若 k>0：轮询 perf_stage{current=k} 确认引擎已切到 k    │
 │    ② 发帧 batch_k；帧尾追加自描述 sentinel：               │
 │       {round=k, n=N_k, start_ns=T0}    ← 发送量+开始时间入载荷 │
-│    ③ 读 metrics: perf_sentinel{…, emit_ns}                  │
+│    ③ 读哨兵文件记录 sentinel{…, emit_ns}                    │
 │    ④ EPS_k = n / (emit_ns − start_ns)  ← 全从 sentinel 记录算 │
-│  输出墙表（每档 EPS + 增量成本 + 墙判定）                    │
+│  输出墙表（每档 eps/n/rounds；CPU%/增量由脚本算）            │
 └────────────────────────────────────────────────────────────┘
 ┌─ wfusion daemon（一次启动，不重启）─────────────────────────┐
 │  进入：--perf-diag conf/perf-diag.toml（启动参数，生产不带） │
 │  诊断档状态机（sentinel 驱动自切换，零外部控制面）：         │
 │    sentinel(round=k) emit ─▶ 应用档 k+1（门控翻转+规则reload）│
 │    ─▶ 写 perf_stage{current=k+1}（切换完成信号）            │
-│  内置 __wf_sentinel 窗口 + 哨兵规则（豁免所有门控，活跃）  │
+│  内置 __wf_sentinel 窗口 + 哨兵任务（豁免所有门控，活跃）  │
 │    emit 写 perf_sentinel{round,n,start_ns,emit_ns}（四元组）  │
 │  runtime.rules hot-reload：规则子集切换（已有能力）          │
 └────────────────────────────────────────────────────────────┘
@@ -79,8 +79,11 @@
 | `rules` | — | ✅ 禁止 | 全量 | + 规则求值（增量 = 规则墙） |
 | `full` | — | — | 全量 | + 输出链（增量 = 输出墙） |
 | `family_*` | — | ✅ 禁止 | 按前缀子集 | 家族墙（c_* / g_* / pr_* …） |
-| `budget:X` | — | — | 全量 | parse_buffer_bytes=X（**重启例外**） |
+| `budget:X`※ | — | — | 全量 | parse_buffer_bytes=X（**重启例外**） |
 
+- ※ **`budget:X` 不是诊断档语法（实现定稿）**：`PerfStage` 无 budget 字段，
+  `perf-diag.toml` 里写不出这一档；列在表里只为墙梯口径完整——它实际是人工流程
+  （改 `wfusion.toml` 的 `parse_buffer_bytes` + 重启 daemon，见 §3.2）。
 - 墙梯**叠加式**（尾部向前切），与 `PERF_BISECTION_METHOD.md` §2 同构。
 - 输出墙用 `cut_output` 开关隔离，**不需要动 sinks 拓扑**——`sinks` 是
   RequiresRestart 路径（见 §4.4），用开关绕开。
@@ -90,6 +93,10 @@
 `parse_buffer_bytes`（preread 预算）在 parse pool 启动时分配 semaphore，**不热切**
 （`runtime.*` 均 RequiresRestart，见 wf-config change.rs 分类）。预算档作为唯一
 需要重启的诊断档，文档化接受，其余诊断档全部热切。
+
+**形态（实现定稿）**：预算档**没有对应的 TOML 字段**（`PerfStage` 只有 `name /
+cut_rules / cut_output / rules`），因此不是诊断档语法，而是人工流程：改
+`wfusion.toml` 的 `parse_buffer_bytes` → 重启 daemon → 重跑墙梯，逐个预算值对比。
 
 ---
 
@@ -124,8 +131,13 @@ cut_output = true
 - `PerfConfig`（wf-config）：仅 `stages: Vec<PerfStage{name, cut_rules,
   cut_output, rules}>`，全字段 `#[serde(default)]`；由 `--perf-diag` 参数加载，
   **不进 `wfusion.toml`**。
-- `cut_rules` / `cut_output` / `profiling`（复用 `WF_RULE_PROFILING`）均为**原子
-  门控**，由诊断档状态机（§4.4）翻转，不进 reload diff。
+- `cut_rules` / `cut_output` 为**原子门控**，由诊断档状态机（§4.4）翻转，不进
+  reload diff（`PerfStage` 也只有这两个门控字段）。
+- **profiling 不是诊断档门控（实现定稿）**：规则相位计时是**独立的启动期环境
+  变量门控** `WF_RULE_PROFILING=0`——`Reactor::start` 启动时读一次并
+  `set_rule_profiling`（`lifecycle/mod.rs:293`），**诊断档状态机不翻转它**，也不进
+  `perf-diag.toml`。诊断时需要关掉计时开销（规则热路径实测 ~7.6% 活跃 CPU），
+  就在启动 daemon 时带上该环境变量——全程生效，各档口径一致。
 - **初始门控语义（实现定稿）**：启动即应用 `stages[0]` 的门控并写
   `stage{current=0}`——第一档（floor）不依赖任何哨兵即可测得；无诊断档 →
   初始门控全 false（哨兵窗口仍注册，无切换）。
@@ -137,18 +149,31 @@ cut_output = true
   append/ack 收敛在 floor 档成立，完成判定可用。
 - **cut_output**：`RuleTask::emit` 在 metrics 计数之后、`AlertColumnBuilder::append_record`
   之前 return——跳过 serialize/stage/commit/fanout，**emitted 计数保留**（#18 类
-  门禁仍可跑）。
+  门禁仍可跑）。`emit` / `emit_batch` 均如此（计数在门控之前）。
+  - **on-each 直投路径例外（实现定稿）**：`emit_each_direct` /
+    `emit_each_direct_batch` / `emit_each_direct_batch_columnar` /
+    `emit_each_direct_batch_columnar_join` 四个直投函数的门控 return 在计数
+    **之前**——该路径的 emitted 计数与 append 耦合，切了 append 就**留不住计数**
+    （实测：nexmark q1 `on each` 在 `rules` 档的 `emitted_total` 为 0；4 档墙梯
+    warmup+floor+rules+full 的总 emitted = 2×9.2M 而非 3×9.2M）。
+  - **影响墙增量的解释口径**：on-each 类规则的 `rules → full` 增量**包含
+    `OutputRecord` 构造成本**（构造在门控之后）；而 match 类规则的构造成本已计入
+    `rules` 档——两类规则的「输出墙」不同口径，不可直接横向比。
 - 门控形态：`set_rule_profiling` 同款全局原子 + `pub fn set_perf_cuts(...)`，
   `Reactor::start` 时从 `--perf-diag` 加载的 `PerfConfig` 初始化（无参数 = 全关）。
+  （`set_rule_profiling` 仅作形态参照，它本身不由诊断档翻转，见 §4.1。）
 
-### 4.3 内置 `__wf_sentinel` 窗口 + 哨兵规则（漂流瓶）
+### 4.3 内置 `__wf_sentinel` 窗口 + 哨兵任务（漂流瓶）
 
 - **内置 schema**：`__wf_sentinel` 流/窗口，字段 `{ round: digit, n: digit,
-  start_ns: digit }`（引擎内置，不依赖用户 .wfs；`[perf].diag=true` 时自动注册）。
+  start_ns: digit }`（引擎内置，不依赖用户 .wfs；`--perf-diag` 启用时自动注册）。
 - **sentinel 载荷自描述**：wfgen 发送时把**发送量 `n`**（本批事件数）和**开始时间
   `start_ns`**（wfgen 发送开始时钟）写进 sentinel 事件字段——wfgen 无需外部记账。
-- **内置哨兵规则**：sentinel 事件 emit 时（复用 emit 路径的 `cached_wall_nanos`
-  引擎时钟）写一条完整测量记录：
+- **内置哨兵任务**：哨兵任务在**数据窗排空后**取 `wall_nanos()`
+  （`perf_diag.rs:223`，`SystemTime::now()` 纪元纳秒，与 wfgen 的 `start_ns` 同一
+  时钟域；取值点在 `process_sentinel_push`，`wait_for_data_drain` 之后）——
+  **不复用** rule_task 的批级缓存时钟 `cached_wall_nanos`（批入口缓存一次，排空
+  等待期间已陈旧）。据此写一条完整测量记录：
   `perf_sentinel{round=k, n=<N_k>, start_ns=<wfgen T0>, emit_ns=<引擎完成时刻>}`。
   该记录四元组齐备，**EPS 直接可算**：`eps = n / (emit_ns − start_ns)`。
 - **记录输出（文件 sink，case 配置）**：sentinel 告警走既有 alert 链，由 case 的
@@ -187,7 +212,7 @@ cut_output = true
   EPS；`round`/`n` 走 Digit（JSON 整数）。哨兵帧（wfgen→引擎）本身是 Int64
   Arrow 列，全程无精度损失。
 - **批末语义（实现定稿）**：哨兵帧与数据帧同 TCP 连接、同源 seq 有序（哨兵是
-  "批末最后一条"；`send-arrow/stream --sentinel` 则在数据推完后单独连接追加）。
+  "批末最后一条"；`send-arrow/stream --sentinel` 走**分连接哨兵**，见下条）。
   规则消费是异步 pull——哨兵任务在**数据窗排空**后才写记录，`emit_ns` ≈ 该批
   真实处理结束时刻。无此等待时小批量会把"提交完成"当成"处理完成"（100k 实测
   full 档 10.9M 假象）。
@@ -206,6 +231,27 @@ cut_output = true
   `min_acked` 复用引擎既有消费进度记账——内存驱逐器（evictor）同样以它做
   下限（时间驱逐只删所有消费者已读过的批次，慢规则未读的不能丢），哨兵排空
   不新增机制。
+- **多连接注入（分连接哨兵，round=连接号）**：`wfgen perf-diag` 是**单连接**发送
+  （`send_payload` 只开一条 TCP，哨兵在帧尾同连接追加，见 §5）。而 bench 侧精确
+  EPS 统计用的 `wfgen send-arrow --sentinel N --connections M` 走**分连接哨兵**
+  （`cmd_frames.rs:173-177, 209-213`）：
+  - 每条连接 copy 完自己的数据后**在自身尾部**追加哨兵帧
+    `{round=连接号, n=该连接实际行数, start_ns=该连接开始}`——单连接 = 1 条
+    （round=0，兼容旧语义）；多连接 = M 条（round=0..M-1）；
+  - 三种注入形态都走同一协议：多连接各推整文件（raw）、预分片逐文件纯 copy
+    （`--shard-files`）、键闭包动态分片（`--shard-keys`）；
+  - `wfgen stream --sentinel N`（实时流）是**单连接预算模式**：发满 N 条后末尾
+    追加哨兵帧 `{round=0, n=total, start_ns}`（`cmd_stream.rs:256-263`）；
+  - 引擎哨兵任务等**全部数据窗排空**后为每条连接写四元组——bench 侧聚合：
+    `EPS = Σn / (max emit_ns − min start_ns)`（`Σn` = 该批总行数，`min start` =
+    最先开始的连接，`max emit` = 最后完成的连接；`sentinel_tuple` 读全部记录）；
+  - 各连接 `dt = emit−start` 可单独对比——**连接均衡/慢连接诊断**（某连接 dt
+    显著偏大 = 该连接供给不足或分片不均，如 shard 桶阻塞）；
+  - **round 字段过载**：perf-diag 场景 round=档索引 k（驱动状态机切换）；
+    send-arrow/stream 场景 round=连接号。两者走同一哨兵窗口与 `on_sentinel(round)`
+    ——send-arrow 场景 `stages.get(round+1)` 越界即 no-op（`perf_diag.rs:306`），
+    **bench 用无档配置（空 stages）跑精确 EPS**：门控全 false、无切换、哨兵窗口
+    仅作完成信号，round=连接号不产生任何档位副作用。
 - **跨档一致性**：哨兵走独立窗口，测共享段（recv/decode/路由）+ 数据窗排空；
   各档同一口径，增量 T1(k) − T1(k−1) 的墙归属判定成立。
 
@@ -251,23 +297,31 @@ wfgen perf-diag \
   --rounds 1                            # 每档轮数（实现定稿：仅 1 有效，见下）
   --sentinels data/perf_sentinel.ndjson # 哨兵记录文件（缺省同上）
   --output data/perf_diag_wall.txt      # 墙表输出（缺省同上）
-  --timeout-secs 90                     # 单次等待超时
+  --timeout-secs 90                     # 单次等待超时（clap 默认 60）
 ```
 
 - 诊断档列表的唯一来源是 `--diag` 指向的 `perf-diag.toml`（daemon 与 wfgen 读同一
   份）；wfgen 按档数发送轮次，不另设 `--stages`。
 - **`--rounds` 语义（实现定稿）**：sentinel 驱动的切换在首个哨兵后即发生，同档
   的重复轮次会吃到**下一档**的门控——每档只测一轮（`rounds=1`）；去噪用
-  `--n-list` 递增 N（小 N 秒级出方向，大 N 确认墙是 per-event 还是固定开销）。
+  `--n-list` 递增 N（小 N 秒级出方向，大 N 确认墙是 per-event 还是固定开销）
+  ——**仅限单档配置**，见下条。
+- **`--n-list` 语义（实现定稿）**：循环嵌套是
+  `for stage k { for n_target in n_list { for r in rounds } }`
+  （`cmd_perf_diag.rs:409`）。引擎侧 `on_sentinel(round=k)` 在**首个**哨兵后就把门控
+  翻到 k+1，且 `target <= current` 只保证重复幂等、**不回滚**（`perf_diag.rs:300`）
+  ——所以同一档的第 2 个 N 与第 2 轮同病：都吃下一档的门控。结论：「去噪用
+  `--n-list` 递增 N」**只在单档配置（`stages` 仅 1 个）下成立**；**多档墙梯下
+  `--n-list` 必须只给一个值**，多个 N 要在外层循环里每个 N 重跑（重启）一套完整
+  墙梯。
 
 - **循环**（每档 k）：
   1. 轮询哨兵文件直到 `stage{current=k}`——引擎已完成档 k 的切换（多点模式
      启动即 stages[0] + 初始信号；k>0 由哨兵驱动），随后发送无竞态；
   2. 取覆盖 `n_k` 行的帧前缀（帧行数合计 ≥ n_k，`n_k` 计入哨兵载荷）；
      `T0 = now()`；发数据帧 + 帧尾追加
-     `__wf_sentinel{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq 尾部）；
-     帧尾追加 `__wf_sentinel{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq
-     尾部，保证最后处理）；
+     `__wf_sentinel{round=k, n=n_k, start_ns=T0}` 帧（同连接、同 seq 尾部，
+     保证最后处理）；
   3. 从 `data/perf_sentinel.ndjson` 读到 `sentinel{round=k, n=n_k}` 的第
      r 条记录（含引擎补的 `emit_ns`）——引擎侧由哨兵任务落盘；
   4. `EPS_k = n_k / (emit_ns − start_ns)`——**发送量/开始时间来自 sentinel 载荷，
@@ -275,9 +329,14 @@ wfgen perf-diag \
      状态不影响）。
 - **数据由小到大**：`--n-list` 对每个诊断档按递增 N 各测一次——小 N 秒级出方向，
   大 N 确认墙是 per-event 还是固定开销（2026-08-23 的 26万 vs 970万 正是这种
-  区分救回来的）。
-- **墙表输出**：每档 EPS/CPU%/RSS + 增量成本 + 墙判定（CPU 高且增量大 = 忙墙，
-  CPU 低 = 等/供给墙，PERF_BISECTION_METHOD §2.4）。
+  区分救回来的）。**单档配置口径**；多档墙梯见上面的 `--n-list` 实现定稿。
+- **墙表输出（实现定稿）**：墙表只写**最小事实源**——每行
+  `<档名>  eps=<EPS> n=<N> rounds=<轮数>`（`cmd_perf_diag.rs:447`），无 CPU%/RSS、
+  无增量成本、无墙判定列（与 §4.4「文件记录即单一事实源」同一原则，驱动侧不
+  重复记账）。CPU%/RSS 与增量成本、墙判定（CPU 高且增量大 = 忙墙，CPU 低 =
+  等/供给墙，PERF_BISECTION_METHOD §2.4）**由 bench 侧脚本消费哨兵记录自行计算**：
+  哨兵四元组的 `[start_ns, emit_ns]` 区间可与带 epoch 纳秒时间戳的采样对齐切分，
+  从而给出每档 CPU%/RSS。参考实现：`wf-examples/performance/nexmark_pk/diag.sh`。
 
 ---
 
@@ -299,13 +358,14 @@ wfgen perf-diag \
 |---|---|---|
 | sentinel 队列 | 独立 `__wf_sentinel` 窗口（①a） | 哨兵任务等**数据窗排空**（min_acked 追平 next_seq）后写记录；跨档同一口径 |
 | sentinel 载荷 | 自描述 `{round, n, start_ns}` | 发送量+开始时间入 sentinel；引擎补 `emit_ns` → EPS 四元组直接可算；start/emit 以字符串携带防 f64 丢精度 |
+| 多连接注入 | 分连接哨兵（round=连接号） | `send-arrow --sentinel --connections M`：每连接尾部各自追加哨兵帧，引擎等全部数据窗排空后逐连接写四元组；EPS = Σn/(max emit − min start)，各连接 dt 可对比做均衡诊断；无档配置下 round=连接号无档位副作用（见 §4.3） |
 | 切换机制 | sentinel 驱动自切换 | 同步无竞态、零控制面；在途批次不受影响 |
 | 时钟 | 同机基准，wfgen `start_ns` 与引擎 `emit_ns` 同机时钟 | 跨机需 NTP 或引擎回写差值（未做） |
 | sink 热切 | 不做（RequiresRestart） | 输出墙用 cut_output 开关代替，无需动 sinks |
 | budget 热切 | 不做（RequiresRestart） | 预算档作为唯一重启例外 |
 | sentinel 处理开销 | 常数量（极小），计入每档 | 增量抵消，不影响墙归属 |
 | 窗口残留 | delta 口径，2min 滑窗自动老化 | 跨档不重启可连续跑 |
-| rounds | 每档仅首轮有效 | 首个哨兵即切换下一档；`--rounds` 保留但去噪走 `--n-list` |
+| rounds / n-list | 每档仅**首个哨兵**有效 | 首个哨兵即切下一档（`target <= current` 只幂等、不回滚）；故同档的第 2 轮与第 2 个 N 都吃下一档门控——`--rounds` 保留但恒取 1；`--n-list` 多值仅单档配置可用，多档墙梯每个 N 各重跑一套墙梯 |
 | 非诊断模式哨兵帧 | 未知流 window miss | 未注册 `__wf_sentinel` 窗口 → `subscribers_of` 为空 → WARN 一次（按 source+tag 去重）+ miss 计数 + 丢弃；数据帧不受影响，门控全 false 无切换——`wfgen perf-diag` 对非诊断 daemon 会**超时报错**（错误信息含根因提示）而非给出错误数字。daemon 启动日志明示 perf-diag 启用状态 |
 
 ---
@@ -314,8 +374,9 @@ wfgen perf-diag \
 
 1. **新增代码单测覆盖率 ≥ 90%**（`cargo llvm-cov` 行覆盖率口径）：
    - wf-config `PerfConfig` 解析（含 stages 列表、缺省值）；
-   - wf-runtime 门控切口（cut_rules 直通保留 ack / cut_output 保留 emitted 计数）；
-   - 内置 `__wf_sentinel` 窗口/规则 + `perf_sentinel`/`perf_stage` 记录 + 豁免门控；
+   - wf-runtime 门控切口（cut_rules 直通保留 ack / cut_output 保留 emitted 计数，
+     on-each 直投路径按 §4.2 例外不保留计数）；
+   - 内置 `__wf_sentinel` 窗口/哨兵任务 + `sentinel`/`stage` 记录 + 豁免门控；
    - 诊断档状态机（sentinel emit → 门控翻转 + 规则 reload + 切换完成信号）；
    - wfgen `perf-diag` 子命令（EPS 计算与哨兵文件读取抽成库函数以便单测）。
 2. **perf_diag_case `floor` 档 EPS ≥ 10M**（N ≥ 1M 验收）：单流小字段管道吞吐
@@ -325,8 +386,8 @@ wfgen perf-diag \
 
 1. wf-config：`PerfConfig`（diag/cut_rules/cut_output）+ 解析 + 测试；
 2. wf-runtime：`set_perf_cuts` 原子门控 + `process_batch`/`emit` 切口 + 测试；
-3. wf-runtime：内置 `__wf_sentinel` 窗口/规则 + `perf_sentinel` 指标 + 告警落盘
-   （走 alert 链、豁免 cut_output）+ 豁免门控测试；perf_diag_case 侧补
+3. wf-runtime：内置 `__wf_sentinel` 窗口 + 独立哨兵任务 + 哨兵记录落盘
+   （走 alert 链、天然不受 cut_output 门控）+ 豁免门控测试；perf_diag_case 侧补
    `topology/sinks/business.d/sentinel.toml`（`data/perf_sentinel.ndjson`）；
 4. wf-runtime：诊断档状态机——sentinel emit → 门控翻转 + 规则子集 reload 触发 +
    `perf_stage{current=k}` 切换完成信号（无 admin 端点）；
