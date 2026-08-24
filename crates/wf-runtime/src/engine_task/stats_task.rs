@@ -71,6 +71,7 @@ pub(super) struct StatsTask {
     task_id: String,
     stats: StatsExecutor,
     executor: RuleExecutor,
+    cancel: CancellationToken,
     sources: Vec<WindowSource>,
     sink_fanout: Arc<SinkFanout>,
     router: Arc<Router>,
@@ -123,10 +124,12 @@ impl StatsTask {
         } = config;
         let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
         let task_id = format!("{}#{}", executor.plan().name, seq);
+        let task_cancel = cancel.clone();
         let task = Self {
             task_id,
             stats,
             executor,
+            cancel: task_cancel,
             sources: window_sources,
             sink_fanout,
             router,
@@ -382,10 +385,24 @@ impl StatsTask {
         }
         if let Some(rx) = &mut self.merge_rx {
             for _ in 1..self.shard_count.max(1) {
-                let (ws, we, buckets, count) = rx
-                    .recv()
-                    .await
-                    .expect("stats merge channel closed before all shards sent");
+                // 片退出（tx drop / cancel）时 recv 返回 None——不能 panic（协调片
+                // 崩会拖垮整个 daemon）; 放弃该窗口的剩余合并（输出可能不完整,
+                // 仅发生在 shutdown/异常场景）。cancel 时同样放弃——避免关闭时序
+                // 不一致（某片已退、协调片还在等）时的死锁。
+                let partial = tokio::select! {
+                    p = rx.recv() => p,
+                    _ = self.cancel.cancelled() => None,
+                };
+                let Some((ws, we, buckets, count)) = partial else {
+                    wf_warn!(pipe,
+                        task_id = %self.task_id,
+                        window_start = window_start,
+                        window_end = window_end,
+                        remaining = self.shard_count.saturating_sub(1) as u64,
+                        "stats merge channel closed / cancelled before all shards sent — skipping merge for this window"
+                    );
+                    break;
+                };
                 let empty = buckets.is_empty() && count == 0;
                 if !empty && (ws != window_start || we != window_end) {
                     wf_warn!(pipe,

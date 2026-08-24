@@ -157,6 +157,51 @@ fn precompute_shard_rows_missing_key_column_puts_every_row_on_shard_zero() {
     assert!(rows[2].is_empty());
 }
 
+/// 输入行索引分区（2026-08-24 q15 空键 stats 输入分片）: 空键注册 →
+/// `precompute_shard_rows` 走 `partition_rows_by_index`（row % N）——每片行集
+/// 无重叠、并集 = 全批、片内行索引升序（时间列单调前提保持）。
+#[test]
+fn precompute_shard_rows_index_partition_splits_by_row() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![
+            Some(10),
+            Some(20),
+            Some(30),
+            Some(40),
+            Some(50),
+        ])) as ArrayRef],
+    )
+    .unwrap();
+
+    let fanout = RuleFanout::new();
+    fanout.register_window_index_sharding("win", 3);
+    let rows = fanout
+        .precompute_shard_rows("win", &batch)
+        .expect("index-sharded window partitions");
+    assert_eq!(rows.len(), 3);
+    // row % 3: 行 0/3 → 片 0, 行 1/4 → 片 1, 行 2 → 片 2。
+    assert_eq!(rows[0], vec![0, 3]);
+    assert_eq!(rows[1], vec![1, 4]);
+    assert_eq!(rows[2], vec![2]);
+    // 并集 = 全批且不重叠。
+    let mut all: Vec<u32> = rows.iter().flatten().copied().collect();
+    all.sort_unstable();
+    assert_eq!(all, vec![0, 1, 2, 3, 4], "每行恰好落入一片");
+
+    // 空键 index 分区独立生效（2 片）。
+    let fanout2 = RuleFanout::new();
+    fanout2.register_window_index_sharding("win", 2);
+    let rows2 = fanout2.precompute_shard_rows("win", &batch).unwrap();
+    assert_eq!(rows2[0], vec![0, 2, 4]);
+    assert_eq!(rows2[1], vec![1, 3]);
+}
+
 #[test]
 fn scope_key_from_column_type_lanes() {
     // Timestamp(Nanosecond) → ScopeKey::Int (raw value).
