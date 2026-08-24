@@ -658,9 +658,12 @@ impl CepStateMachine {
         }
         // A1（2026-08-24，hop 热路径）：entry 替代 take/put 往返——原实现每窗口
         // contains_key + remove + insert 三次哈希操作（remove/insert 还破坏 HashMap
-        // 缓存局部性）；现在 contains_key（判 is_new，limits 检查需在 entry 前改
-        // map）+ 一次 entry。实例从不移出 map：各 early return 无需归还（借用
-        // 自动结束）。语义不变：Occupied 借用原实例，Vacant 构造并插入。
+        // 缓存局部性），且 remove/insert 上的内存镜像每次事件 add/sub 两次
+        // AtomicU64（q17 高触发路径净零churn 也是开销）；现在 contains_key（判
+        // is_new，limits 检查需在 entry 前改 map）+ 一次 entry。实例从不移出 map：
+        // 各 early return 无需归还（借用自动结束），新实例入场时统一记一次
+        // base_cost（见下）。语义不变：Occupied 借用原实例，Vacant 构造并插入。
+        // 旧 take_instance/put_instance 已随此优化删除（2026-08-24）。
         let tracks_memory = self.tracks_memory_bytes();
         let instance = match self.instances.entry(instance_key.clone()) {
             std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
@@ -674,8 +677,10 @@ impl CepStateMachine {
         };
         if is_new {
             // A freshly created instance enters the map here — account its base
-            // cost once (the old insert_instance did it per put; put_instance is
-            // net-zero and skips the mirror, so the admission must charge it).
+            // cost once at admission. The old take/put round-trip was net-zero
+            // (no mirror churn) and charged nothing, so the entry-based path
+            // must charge the admission explicitly; permanent removes still go
+            // through remove_instance.
             if tracks_memory {
                 self.estimated_memory_bytes = self
                     .estimated_memory_bytes
@@ -1481,23 +1486,6 @@ impl CepStateMachine {
             WindowSpec::Hop { size, .. } => created_at + size.as_nanos() as i64,
         };
         self.expiry_heap.push(Reverse((expire_time, key.clone())));
-    }
-
-    /// Take an instance out of the map for the in-event processing round-trip
-    /// WITHOUT touching the memory mirror — the same instance is put back a few
-    /// statements later (net-zero base cost), so the per-event add/sub churn
-    /// on the q17-style high-fire path (171 万实例 sliding map, every event
-    /// removes + re-inserts) was pure overhead: 4 AtomicU64 ops per event.
-    /// New-instance admission accounts its base cost explicitly at the take
-    /// site; permanent removes (evict/close/expiry) keep `remove_instance`.
-    fn take_instance(&mut self, key: &InstanceKey) -> Option<Instance> {
-        self.instances.remove(key)
-    }
-
-    /// Put the instance back after the in-event round-trip (no memory
-    /// mirroring — see [`Self::take_instance`]).
-    fn put_instance(&mut self, key: InstanceKey, instance: Instance) {
-        self.instances.insert(key, instance);
     }
 
     fn remove_instance(&mut self, key: &InstanceKey) -> Option<Instance> {

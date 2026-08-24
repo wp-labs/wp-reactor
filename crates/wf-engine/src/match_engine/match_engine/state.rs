@@ -142,9 +142,9 @@ pub(super) struct Instance {
     /// with `event_steps`.
     pub(super) satisfied_flags: Vec<bool>,
     /// Estimated size of this instance at creation time (fixed per the plan +
-    /// tracked bind fields). Used for O(1) memory accounting in
-    /// `insert/remove_instance`; exact state growth is corrected by periodic
-    /// `recalibrate_memory()`.
+    /// tracked bind fields). Used for O(1) memory accounting (entry-based
+    /// admission charges it once; permanent removes via `remove_instance`);
+    /// exact state growth is corrected by periodic `recalibrate_memory()`.
     pub(super) base_cost: usize,
 }
 
