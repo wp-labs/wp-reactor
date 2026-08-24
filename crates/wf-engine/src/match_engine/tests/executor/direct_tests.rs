@@ -2,7 +2,7 @@
 //! (`execute_each_direct` → `AlertColumnBuilder` staging) must produce
 //! byte-equivalent rows to the record path
 //! (`execute_each_with_joins` → `OutputRecord` → `append_record`).
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use std::collections::HashMap;
 
@@ -61,6 +61,60 @@ impl WindowLookup for MockJoinLookup {
         _window: &str,
     ) -> Option<Vec<(i64, crate::match_engine::JoinRow)>> {
         None
+    }
+}
+
+/// Stateful join lookup：每个 key 的**首次** lookup 返回空桶（fill 快照时
+/// 桶仍空——模拟批处理开始时实体尚未 append），后续 lookup 返回行（模拟
+/// 并行 ingest 在批处理期间补 append，行时 recheck 可见）。
+/// 专测 `execute_each_direct_batch_columnar_join` 的 recheck 救援路径
+/// （`miss_hold`：fill 快照 miss 的行在行循环时点实时复查）。
+struct GrowJoinLookup {
+    rows: Vec<crate::match_engine::JoinRow>,
+    calls: Mutex<HashMap<crate::match_engine::JoinKey, usize>>,
+}
+
+impl WindowLookup for GrowJoinLookup {
+    fn snapshot_field_values(
+        &self,
+        _window: &str,
+        _field: &str,
+    ) -> Option<std::collections::HashSet<String>> {
+        None
+    }
+    fn snapshot(&self, _window: &str) -> Option<Vec<crate::match_engine::JoinRow>> {
+        Some(self.rows.clone())
+    }
+    fn snapshot_with_timestamps(
+        &self,
+        _window: &str,
+    ) -> Option<Vec<(i64, crate::match_engine::JoinRow)>> {
+        None
+    }
+    fn join_lookup(
+        &self,
+        _window: &str,
+        key_field: &str,
+        key: &crate::match_engine::Value,
+    ) -> Option<Vec<crate::match_engine::JoinRow>> {
+        let join_key = crate::match_engine::JoinKey::from_value(key)?;
+        let mut calls = self.calls.lock().expect("GrowJoinLookup mutex poisoned");
+        let n = calls.entry(join_key).or_insert(0);
+        *n += 1;
+        if *n == 1 {
+            return Some(Vec::new()); // 首次（fill 快照）空桶 → 批级 miss
+        }
+        // 之后（行时 recheck）返回桶内行——与 trait 默认相同的按键过滤。
+        Some(
+            self.rows
+                .iter()
+                .filter(|r| {
+                    r.field_value(key_field)
+                        .is_some_and(|rv| crate::match_engine::values_equal(&rv, key))
+                })
+                .cloned()
+                .collect(),
+        )
     }
 }
 
@@ -404,6 +458,244 @@ fn columnar_join_semantics_edge_cases_match_event_path() {
     )
     .unwrap();
     run_both(&exec_nowhere, &batch, (2, 0));
+}
+
+/// 热键多行同桶（2026-08-24 Arc<JoinRow> 修复）：同一左 key 多行共享桶首行
+/// JoinRow（每桶只建一个 Arc，每行 1 次 Arc clone）——输出必须与行式逐事件
+/// 路径字节一致，且桶首行（而非桶内其它行）决定富化。
+#[test]
+fn columnar_join_hot_key_rows_match_event_path() {
+    use crate::match_engine::event_bridge::{ColumnarEvent, JoinRow, materialize_rows};
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    let exec = each_join_plan_rule();
+    // 右窗：id=1 有两行（cat=10 在前、cat=99 在后——桶首行 cat=10 必须赢），
+    // id=2（cat=20 拒绝）、id=3（cat=10）。
+    let lookup = MockJoinLookup {
+        rows: vec![
+            JoinRow::Event(Arc::new(event(vec![
+                ("id", num(1.0)),
+                ("category", num(10.0)),
+            ]))),
+            JoinRow::Event(Arc::new(event(vec![
+                ("id", num(1.0)),
+                ("category", num(99.0)),
+            ]))),
+            JoinRow::Event(Arc::new(event(vec![
+                ("id", num(2.0)),
+                ("category", num(20.0)),
+            ]))),
+            JoinRow::Event(Arc::new(event(vec![
+                ("id", num(3.0)),
+                ("category", num(10.0)),
+            ]))),
+        ],
+    };
+
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+    // 热键 auction=1 重复 3 行（同桶共享首行），auction=2/3 单行。
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "auction",
+        DataType::Int64,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![1, 1, 1, 2, 3])) as ArrayRef],
+    )
+    .unwrap();
+
+    // 行式参考路径。
+    let events: Vec<Event> = materialize_rows(&batch, &[0, 1, 2, 3, 4]);
+    let rows: Vec<(&Event, i64)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut idx_row = Vec::new();
+    let s_row =
+        exec.execute_each_direct_batch(&rows, &lookup, &[], NANOS, &mut b_row, &mut idx_row);
+    assert_eq!(
+        s_row.appended, 4,
+        "3×auction=1 + auction=3 命中（桶首行 cat=10）；auction=2 拒绝"
+    );
+    assert_eq!(s_row.rejected, 1);
+
+    // 列式 join 路径（热键同桶 Arc 共享）。
+    let col_events: Vec<ColumnarEvent<'_>> =
+        (0..5).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut idx_col = Vec::new();
+    let s_col = exec.execute_each_direct_batch_columnar_join(
+        &col_rows,
+        &lookup,
+        NANOS,
+        &mut b_col,
+        &mut idx_col,
+    );
+    assert_eq!(s_col, s_row);
+    assert_eq!(idx_col, idx_row);
+    assert_batches_equal_rows(&b_row.finish(), &b_col.finish());
+}
+
+/// recheck 救援（2026-08-24 `miss_hold` 新路径）：fill 快照时桶空（key 首次
+/// lookup 空桶）→ 批级 miss；行循环时点实时复查（key 后续 lookup 非空）→
+/// 救回并富化。用状态化 GrowJoinLookup 断言：救援后的输出与「快照即命中」
+/// 的静态 mock **字节一致**——即 recheck 完整补回 fill 快照 miss。
+#[test]
+fn columnar_join_recheck_rescues_mid_batch_append() {
+    use crate::match_engine::event_bridge::{ColumnarEvent, JoinRow};
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    let exec = each_join_plan_rule();
+    let rows_auc = vec![
+        JoinRow::Event(Arc::new(event(vec![
+            ("id", num(1.0)),
+            ("category", num(10.0)),
+        ]))),
+        JoinRow::Event(Arc::new(event(vec![
+            ("id", num(2.0)),
+            ("category", num(20.0)),
+        ]))),
+        JoinRow::Event(Arc::new(event(vec![
+            ("id", num(3.0)),
+            ("category", num(10.0)),
+        ]))),
+    ];
+
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "auction",
+        DataType::Int64,
+        true,
+    )]));
+    // 热键 auction=1 重复 3 行：fill 首次 lookup 全 miss → recheck 逐行救援。
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![1, 1, 1, 2, 3])) as ArrayRef],
+    )
+    .unwrap();
+    let col_events: Vec<ColumnarEvent<'_>> =
+        (0..5).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+
+    // 静态快照（fill 即命中）：
+    let static_lookup = MockJoinLookup {
+        rows: rows_auc.clone(),
+    };
+    let mut b_static = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut idx_static = Vec::new();
+    let s_static = exec.execute_each_direct_batch_columnar_join(
+        &col_rows,
+        &static_lookup,
+        NANOS,
+        &mut b_static,
+        &mut idx_static,
+    );
+
+    // 延迟 append（每 key 首次 lookup 空桶 → 批级 miss；recheck 救援）：
+    let grow_lookup = GrowJoinLookup {
+        rows: rows_auc,
+        calls: Mutex::new(HashMap::new()),
+    };
+    let mut b_grow = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut idx_grow = Vec::new();
+    let s_grow = exec.execute_each_direct_batch_columnar_join(
+        &col_rows,
+        &grow_lookup,
+        NANOS,
+        &mut b_grow,
+        &mut idx_grow,
+    );
+
+    assert_eq!(
+        s_grow, s_static,
+        "recheck 必须完整补回 fill 快照 miss：grow={s_grow:?} static={s_static:?}"
+    );
+    assert_eq!(
+        s_grow.appended, 4,
+        "3×auction=1 + auction=3 被 recheck 救援；auction=2 where 拒绝"
+    );
+    assert_eq!(idx_grow, idx_static);
+    assert_batches_equal_rows(&b_static.finish(), &b_grow.finish());
+}
+
+/// float 左键热键同桶（Arc 修复的浮点分支）：f64→Int 截断后桶内逐行
+/// `values_equal` 复核——1.5 截断为 1 进桶但复核拒绝，1.0 复核通过。
+/// 热键重复 + 浮点复核组合，列式与行式必须字节一致。
+#[test]
+fn columnar_join_float_hot_key_matches_event_path() {
+    use crate::match_engine::event_bridge::{ColumnarEvent, JoinRow, materialize_rows};
+    use arrow::array::{ArrayRef, Float64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    let exec = each_join_plan_rule();
+    let lookup = MockJoinLookup {
+        rows: vec![JoinRow::Event(Arc::new(event(vec![
+            ("id", num(1.0)),
+            ("category", num(10.0)),
+        ])))],
+    };
+
+    const NANOS: i64 = 1_750_000_000_000_000_000;
+    // auction=1.5 ×3（截断进 id=1 桶，复核拒绝）+ auction=1.0 ×2（复核通过）。
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "auction",
+        DataType::Float64,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Float64Array::from(vec![1.5, 1.5, 1.5, 1.0, 1.0])) as ArrayRef],
+    )
+    .unwrap();
+
+    let events: Vec<Event> = materialize_rows(&batch, &[0, 1, 2, 3, 4]);
+    let rows: Vec<(&Event, i64)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut idx_row = Vec::new();
+    let s_row =
+        exec.execute_each_direct_batch(&rows, &lookup, &[], NANOS, &mut b_row, &mut idx_row);
+    assert_eq!(s_row.appended, 2, "1.5×3 复核拒绝；1.0×2 通过");
+
+    let col_events: Vec<ColumnarEvent<'_>> =
+        (0..5).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_rows: Vec<(&ColumnarEvent<'_>, i64)> = col_events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut idx_col = Vec::new();
+    let s_col = exec.execute_each_direct_batch_columnar_join(
+        &col_rows,
+        &lookup,
+        NANOS,
+        &mut b_col,
+        &mut idx_col,
+    );
+    assert_eq!(s_col, s_row);
+    assert_eq!(idx_col, idx_row);
+    assert_batches_equal_rows(&b_row.finish(), &b_col.finish());
 }
 
 /// 列式 join gate 分支：形状不支持 → 回退行式（each_plan_columnar_safe=false）。

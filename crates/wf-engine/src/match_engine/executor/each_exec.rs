@@ -1391,17 +1391,17 @@ impl RuleExecutor {
             // 命中行直接借用 row_match 的 Arc 内容（零克隆——此前每行
             // `row_match[idx].clone()` 是 4 个 Arc bump + 行尾 drop）；miss 行
             // 实时复查结果暂存 miss_hold，仅 miss 行承担 lookup 成本。
-            let mut miss_hold: Option<Arc<JoinRow>> = None;
+            let miss_hold: Option<Arc<JoinRow>>;
             let matched: Option<&JoinRow> = match row_match[idx].as_ref() {
                 Some(r) => Some(r.as_ref()),
                 None => {
-                    if let Some(v) = &per_row_vals[idx] {
+                    miss_hold = if let Some(v) = &per_row_vals[idx] {
                         let bucket = windows.join_lookup(
                             &join_plan.right_window,
                             &join_plan.right_key_field,
                             v,
                         );
-                        miss_hold = if left_is_float {
+                        if left_is_float {
                             bucket.as_ref().and_then(|rs| {
                                 rs.iter()
                                     .find(|r| {
@@ -1413,11 +1413,11 @@ impl RuleExecutor {
                             })
                         } else {
                             bucket.and_then(|rs| rs.into_iter().next()).map(Arc::new)
-                        };
-                        miss_hold.as_ref().map(|a| a.as_ref())
+                        }
                     } else {
                         None
-                    }
+                    };
+                    miss_hold.as_ref().map(|a| a.as_ref())
                 }
             };
             // Post-join `where`（严格）：右窗字段比较；miss → 字段缺失 → false

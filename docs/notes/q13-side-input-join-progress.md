@@ -760,3 +760,22 @@ fill_hit=23.87M、recheck=104k。差异不在代码逻辑（两版提取同一 b
 5. （可选）q20 确定性快照边界（见上节机制）；q13 列式 join 免 Event 物化
 6. 旁支发现：`match_engine/tests/executor/direct_tests.rs:412` 编译告警 never
    used——疑似漏 `#[test]`，测试没在跑。
+
+## 测试补充（2026-08-24，随 q20 修复提交）
+
+单元测试（direct_tests.rs，+3）：
+- `columnar_join_hot_key_rows_match_event_path`：热键多行同桶（Arc 共享首行），
+  且桶首行（而非桶内其它行）决定富化——列式 vs 行式字节一致
+- `columnar_join_recheck_rescues_mid_batch_append`：GrowJoinLookup（每 key 首次
+  lookup 空桶 → 批级 miss，后续非空 → 行时 recheck 救援）——救援后输出与
+  「快照即命中」静态 mock 字节一致（钉死 `miss_hold` 新路径）
+- `columnar_join_float_hot_key_matches_event_path`：float 左键热键同桶
+  （f64→Int 截断 + values_equal 复核）列式 vs 行式字节一致
+
+性能单元测试（each_bench.rs，+1，`cargo test --release -p wf-engine
+q20_columnar_join_per_row -- --ignored --nocapture`）：
+- 4096 行/段（生产 ALERT_BATCH_SIZE）+ 真实 join 索引窗口（1M auction 行）
+- unique 键 228ns/row（4.4M/s）vs 热键混合 122ns/row（8.3M/s，去重+单 Arc
+  共享 1.9×）vs 行式参考 276ns/row（3.6M/s，列式 2.3×）
+- 热键 122ns/row 与此前 stats 微基准 122ns/evt 吻合；端到端剩余成本在
+  rule_task 层（pull/遥测/锁/commit），不在 executor
