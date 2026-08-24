@@ -1,7 +1,8 @@
 // P4 side input：provider/静态窗口 join 校验。
 // 设计文档：docs/design/join-family-design.md §7/§8 P4——provider 窗口（side input）
-// 无 stream/time/over，v1 仅支持 snapshot（及缺省 inner）join；anti/asof/interval/
-// reduce/deferred 对无时序静态表无意义。
+// 无 stream/time/over，v1 支持 snapshot（及缺省 inner）与 **anti** join；
+// anti 是纯键存在性否定不依赖时间（白名单排除，Q21 形状）；
+// asof/interval/reduce/deferred 对无时序静态表无意义。
 
 use std::time::Duration;
 
@@ -104,9 +105,11 @@ rule r {
     assert_has_error(input, &schemas(), "provider/静态窗口");
 }
 
-/// anti 对无时序静态表无意义（v1 拒绝）。
+/// anti 对无时序静态表**有意义**（2026-08-24 放开）：anti 是纯键存在性否定
+/// （`join_lookup` → 有匹配丢、无匹配留），不依赖时间——静态表白名单排除是
+/// 标准用例（NEXMark Q21 形状），provider `join_lookup` 已有 O(1) 行索引。
 #[test]
-fn provider_anti_rejected() {
+fn provider_anti_join_clean() {
     let input = r#"
 rule r {
     events { b : bid_events }
@@ -116,7 +119,7 @@ rule r {
     yield out (id = b.bidder)
 }
 "#;
-    assert_has_error(input, &schemas(), "provider/静态窗口");
+    assert_no_errors(input, &schemas());
 }
 
 /// reduce 归约 v1 不支持静态表。

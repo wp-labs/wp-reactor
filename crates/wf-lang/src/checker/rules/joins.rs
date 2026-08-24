@@ -223,9 +223,11 @@ fn is_static_window(ws: &WindowSchema) -> bool {
     ws.streams.is_empty() && ws.time_field.is_none() && ws.over.is_zero()
 }
 
-/// provider/静态窗口（side input）join 限制：v1 仅支持 snapshot（及缺省 inner）。
-/// 无 time/over 的静态表上 anti/asof/interval（within）/reduce/deferred（emit at）
-/// 均无意义——anti 需要时序语义的“至今未匹配”判断，asof/interval 需要时间列，
+/// provider/静态窗口（side input）join 限制：v1 支持 snapshot、缺省 inner 与
+/// **anti**。anti 是纯键存在性否定（`join_lookup` → 有匹配丢、无匹配留），不依赖
+/// 时间——静态表（无 time/over）上语义清晰（如白名单排除，NEXMark Q21 形状），
+/// provider `join_lookup` 已有 O(1) 行索引支撑（window_lookup.rs）。
+/// 仍拒绝 asof/interval（within）/reduce/deferred：asof/interval 需要时间列，
 /// reduce/deferred 需要窗口生命周期（设计 §7 side input / §8 P4）。
 fn check_static_window_join(
     join: &crate::ast::JoinClause,
@@ -233,10 +235,10 @@ fn check_static_window_join(
     errors: &mut Vec<CheckError>,
 ) {
     let what = format!(
-        "provider/静态窗口 `{}`（side input）v1 仅支持 snapshot（及缺省 inner）join",
+        "provider/静态窗口 `{}`（side input）join",
         join.target_window
     );
-    if !matches!(join.mode, JoinMode::Snapshot | JoinMode::Inner) {
+    if !matches!(join.mode, JoinMode::Snapshot | JoinMode::Inner | JoinMode::Anti) {
         errors.push(CheckError {
             severity: Severity::Error,
             rule: Some(rule_name.to_string()),

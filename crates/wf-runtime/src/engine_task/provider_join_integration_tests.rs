@@ -89,7 +89,9 @@ fn bid_batch(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
 /// entity(digit, b.bidder)
 /// yield alerts (id = b.bidder, state = person_table.state)
 /// ```
-fn make_provider_join_task() -> (
+/// `mode` 可配置（snapshot / anti）——anti 是白名单排除（2026-08-24 放开静态表
+/// anti：纯键存在性否定不依赖时间）。
+fn make_provider_join_task(mode: JoinMode) -> (
     rule_task::RuleTask,
     mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<Router>,
@@ -157,7 +159,7 @@ fn make_provider_join_task() -> (
         stats_plan: None,
         joins: vec![JoinPlan {
             right_window: "person_table".to_string(),
-            mode: JoinMode::Snapshot,
+            mode,
             conds: vec![JoinCondPlan {
                 left: FieldRef::Qualified("b".into(), "bidder".into()),
                 right: FieldRef::Qualified("person_table".into(), "id".into()),
@@ -232,7 +234,7 @@ fn bid_window(router: &Router) -> Arc<Window> {
 #[tokio::test]
 async fn provider_join_hit_enriches_from_static_table() {
     super::tests::init_tracing();
-    let (mut task, mut alert_rx, router) = make_provider_join_task();
+    let (mut task, mut alert_rx, router) = make_provider_join_task(JoinMode::Snapshot);
 
     bid_window(&router)
         .append(bid_batch(&[(1, 5, 100, T + 10_000_000_000)]))
@@ -256,7 +258,7 @@ async fn provider_join_hit_enriches_from_static_table() {
 #[tokio::test]
 async fn provider_join_miss_keeps_event_without_enrichment() {
     super::tests::init_tracing();
-    let (mut task, mut alert_rx, router) = make_provider_join_task();
+    let (mut task, mut alert_rx, router) = make_provider_join_task(JoinMode::Snapshot);
 
     // bidder=999 不在 person_table 中
     bid_window(&router)
@@ -274,6 +276,35 @@ async fn provider_join_miss_keeps_event_without_enrichment() {
         super::tests::field_str(&alert, "state"),
         "",
         "unmatched bid has no enriched state"
+    );
+}
+
+/// provider anti（2026-08-24 放开）：命中静态表 → 丢弃（白名单排除）；未命中
+/// → 保留。person_table 有 id 5/7（state CA/ID）。
+#[tokio::test]
+async fn provider_anti_drops_whitelisted_keeps_others() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_provider_join_task(JoinMode::Anti);
+
+    // bidder=5（白名单）→ 丢弃；bidder=999（不在白名单）→ 保留。
+    bid_window(&router)
+        .append(bid_batch(&[
+            (1, 5, 100, T + 10_000_000_000),
+            (2, 999, 100, T + 11_000_000_000),
+        ]))
+        .unwrap();
+    task.pull_and_advance().await;
+
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "999",
+        "anti join keeps non-whitelisted bidder"
+    );
+    assert_eq!(
+        super::tests::field_str(&alert, "state"),
+        "",
+        "anti hit has no enrichment (event dropped instead)"
     );
 }
 

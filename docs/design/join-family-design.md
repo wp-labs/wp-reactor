@@ -565,7 +565,7 @@ bench 侧后续；对拍可比性不受影响：Q13 的输出键/计数不变，
 
 ### 14.4 测试
 
-- checker（`tests/provider_joins.rs`）：snapshot/inner 通过；asof/within/anti/reduce/
+- checker（`tests/provider_joins.rs`）：snapshot/inner/anti 通过；asof/within/reduce/
   emit at 报「provider/静态窗口」错误。
 - wfs 解析（`tests/validation.rs`）：`parse_wfs` 合并 provider 为 flow schema（无
   stream/time/over）；provider 与 flow 窗口撞名报错。
@@ -575,8 +575,9 @@ bench 侧后续；对拍可比性不受影响：Q13 的输出键/计数不变，
 
 ### 14.5 边界（v1 限制与后续）
 
-- provider join 仅 snapshot/缺省 inner（checker 强制）；anti/interval/asof/reduce/
-  deferred 对静态表 v1 拒绝——语义上无时序载体，后续按需放开。
+- provider join 支持 snapshot、缺省 inner 与 **anti**（2026-08-24 放开：anti 是纯
+  键存在性否定，不依赖时间——白名单排除是标准用例，provider `join_lookup` 有 O(1)
+  行索引）；interval/asof/reduce/deferred 对静态表 v1 拒绝（需时序/窗口生命周期）。
 - provider 无 join 索引，O(rows) 扫描（静态小表预期）；大静态表后续可加
   `ProviderWindow` 内存索引（`table → 行定位`）。
 - `snapshot_field_values`（`has()` 守卫）对 provider 仍返回 None（`get_window` 路径）——

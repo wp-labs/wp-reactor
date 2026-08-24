@@ -1461,6 +1461,8 @@ rule r {
 
 #[test]
 fn static_window_join_mode_restrictions() {
+    // anti 对静态表**允许**（2026-08-24 放开）：纯键存在性否定不依赖时间，
+    // 白名单排除是标准用例（Q21 形状）——不报错。
     let anti = r#"
 rule r {
     events { e : auth_events }
@@ -1470,11 +1472,7 @@ rule r {
     yield out (x = e.sip)
 }
 "#;
-    assert_has_error(
-        anti,
-        &[auth_events_window(), provider_win(), output_window()],
-        "仅支持 snapshot（及缺省 inner）join",
-    );
+    assert_no_errors(anti, &[auth_events_window(), provider_win(), output_window()]);
 
     let within = r#"
 rule r {
