@@ -650,7 +650,12 @@ async fn q15_input_shard_merge_multi_window_matches_single() {
     };
     // 窗口 1 [0,10s): 4 行（sip a/b/c/d, ts=5s）。行号分区: 片 0 = 行 0/2,
     // 片 1 = 行 1/3。
-    let b1 = make_ts_batch(&[("a", 5_000_000_000), ("b", 5_000_000_000), ("c", 5_000_000_000), ("d", 5_000_000_000)]);
+    let b1 = make_ts_batch(&[
+        ("a", 5_000_000_000),
+        ("b", 5_000_000_000),
+        ("c", 5_000_000_000),
+        ("d", 5_000_000_000),
+    ]);
     tokio::join!(
         coord.process_push(push(b1.clone(), Arc::new(vec![0u32, 2]))),
         shard1.process_push(push(b1, Arc::new(vec![1u32, 3])))
@@ -659,7 +664,12 @@ async fn q15_input_shard_merge_multi_window_matches_single() {
     // 窗口 2 [10s,20s): 越过边界 → close 窗口 1（协调片 close 时收齐发送片
     // partial——必须并发执行, 顺序 await 会死锁: 协调片 close 阻塞在 recv,
     // 发送片 push 还没执行）。
-    let b2 = make_ts_batch(&[("a", 15_000_000_000), ("b", 15_000_000_000), ("e", 15_000_000_000), ("f", 15_000_000_000)]);
+    let b2 = make_ts_batch(&[
+        ("a", 15_000_000_000),
+        ("b", 15_000_000_000),
+        ("e", 15_000_000_000),
+        ("f", 15_000_000_000),
+    ]);
     tokio::join!(
         coord.process_push(push(b2.clone(), Arc::new(vec![0u32, 2]))),
         shard1.process_push(push(b2, Arc::new(vec![1u32, 3])))
@@ -668,7 +678,11 @@ async fn q15_input_shard_merge_multi_window_matches_single() {
     // 协调片 mid-stream close 窗口 1: total=4, r1=4（全是 10.0.0.1? 不——sip
     // 是 a/b/c/d, where sip=="10.0.0.1" 全 false）→ r1=0; uniq=4。
     let alert = take_alert(&mut alert_rx0);
-    assert_eq!(field_str(&alert, "detail"), "4 0 4", "窗口 1 归并（total/r1/uniq）");
+    assert_eq!(
+        field_str(&alert, "detail"),
+        "4 0 4",
+        "窗口 1 归并（total/r1/uniq）"
+    );
     assert!(alert_rx1.try_recv().is_err(), "非协调片不得 emit");
 
     // flush 收窗口 2: total=4, r1=0, uniq=4（a/b/e/f）。
@@ -703,7 +717,11 @@ async fn q15_input_shard_empty_shard_flush_sentinel_no_deadlock() {
     // merge（空）→ 输出 = 自己的 2 行。
     tokio::join!(coord.flush(), shard1.flush());
     let alert = take_alert(&mut alert_rx0);
-    assert_eq!(field_str(&alert, "detail"), "2 0 2", "空片 sentinel 合并无效果");
+    assert_eq!(
+        field_str(&alert, "detail"),
+        "2 0 2",
+        "空片 sentinel 合并无效果"
+    );
 }
 
 /// 协调片 recv None（某片已退出 / tx drop）不 panic——warn 后放弃该窗口
@@ -730,7 +748,11 @@ async fn q15_input_shard_partial_sender_exit_no_panic() {
 
     coord.flush().await; // 不得 panic
     let alert = take_alert(&mut alert_rx0);
-    assert_eq!(field_str(&alert, "detail"), "2 0 2", "片退出后仅协调片自己的数据");
+    assert_eq!(
+        field_str(&alert, "detail"),
+        "2 0 2",
+        "片退出后仅协调片自己的数据"
+    );
 }
 
 /// `stat.value(final(label))` 表达式（与编译后的 yield 同构）。

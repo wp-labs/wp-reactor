@@ -236,7 +236,9 @@ fn stats_input_shard_merge_columnar_matches_single() {
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int64Array::from(vec![100, 50_000, 2_000_000, 50, 5_000, 999_999])),
+            Arc::new(Int64Array::from(vec![
+                100, 50_000, 2_000_000, 50, 5_000, 999_999,
+            ])),
             Arc::new(Int64Array::from(vec![1, 1, 2, 2, 3, 3])),
             Arc::new(Int64Array::from(vec![10, 11, 12, 10, 13, 11])),
         ],

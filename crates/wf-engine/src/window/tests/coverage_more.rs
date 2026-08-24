@@ -162,11 +162,7 @@ fn precompute_shard_rows_missing_key_column_puts_every_row_on_shard_zero() {
 /// 无重叠、并集 = 全批、片内行索引升序（时间列单调前提保持）。
 #[test]
 fn precompute_shard_rows_index_partition_splits_by_row() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int64,
-        true,
-    )]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
     let batch = RecordBatch::try_new(
         schema,
         vec![Arc::new(Int64Array::from(vec![
