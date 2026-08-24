@@ -4175,6 +4175,7 @@ async fn conv_stage_emits_sealed_close_to_sink() {
         conv_plan: None,
         keys: Arc::new([FieldRef::Simple("sip".into())]),
         over: Duration::from_secs(60),
+        bucket_align: Duration::from_secs(60),
         limits: None,
         shared_limits: None,
         barrier,
@@ -4350,6 +4351,7 @@ fn make_conv_stage_config(
         conv_plan: None,
         keys: Arc::new([FieldRef::Simple("sip".into())]),
         over: Duration::from_secs(60),
+        bucket_align: Duration::from_secs(60),
         limits,
         shared_limits,
         barrier,
@@ -4362,6 +4364,183 @@ fn make_conv_stage_config(
         timeout_scan_interval: Duration::from_secs(60),
     };
     (config, conv_tx, alert_rx)
+}
+
+/// P2c hop 扩展（2026-08-24）：conv stage 的桶键按 `bucket_align`（hop = slide）
+/// 对齐，封口长度仍用 `over`（hop = size）。
+///
+/// 判别性设计：close window_start = 6s / 16s（hop 收口事件 window_start =
+/// k*slide，2s 对齐 → 桶 6s / 16s；若误用 `over`（10s）对齐 → 桶 0s / 10s）。
+/// barrier 水位 = 20s：正确逻辑只封 6s 桶（6s+10s ≤ 20s），16s 桶未封
+///（16s+10s > 20s）→ 只输出 1 条；错误对齐会封两个桶（0s+10s、10s+10s 均
+/// ≤ 20s）→ 输出 2 条。
+#[tokio::test]
+async fn conv_stage_hop_bucket_aligns_to_slide_seals_by_size() {
+    init_tracing();
+    let (alert_tx, mut alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let (conv_tx, conv_rx) = mpsc::channel::<crate::engine_task::ConvCloseBatch>(4);
+    let barrier: Arc<Vec<std::sync::atomic::AtomicI64>> =
+        Arc::new(vec![std::sync::atomic::AtomicI64::new(i64::MIN)]);
+    let config = crate::engine_task::ConvStageConfig {
+        executor: conv_stage_test_executor(),
+        conv_plan: None,
+        keys: Arc::new([FieldRef::Simple("sip".into())]),
+        over: Duration::from_secs(10),        // hop size：封口长度
+        bucket_align: Duration::from_secs(2), // hop slide：桶对齐
+        limits: None,
+        shared_limits: None,
+        barrier: Arc::clone(&barrier),
+        sink_fanout: make_test_fanout(alert_tx),
+        router: Arc::new(Router::new(WindowRegistry::build(vec![]).unwrap())),
+        metrics: None,
+        rx: conv_rx,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        eos: tokio::sync::watch::channel(0u64).1,
+        timeout_scan_interval: Duration::from_secs(60),
+    };
+    let _stage = tokio::spawn(async move { crate::engine_task::run_conv_stage_task(config).await });
+
+    let mut close_6 = conv_stage_test_close();
+    close_6.window_start_time_nanos = 6_000_000_000; // 桶 = 6s（2s 对齐）
+    close_6.scope_key = vec![wf_engine::match_engine::Value::Str("a".into())];
+    let mut close_16 = conv_stage_test_close();
+    close_16.window_start_time_nanos = 16_000_000_000; // 桶 = 16s
+    close_16.scope_key = vec![wf_engine::match_engine::Value::Str("b".into())];
+    conv_tx
+        .send(crate::engine_task::ConvCloseBatch {
+            closes: vec![close_6, close_16],
+            watermark: 20_000_000_000,
+            drained: false,
+            barrier_index: 0,
+        })
+        .await
+        .unwrap();
+
+    // barrier=20s：只 6s 桶封口（6+10=16 ≤ 20）；16s 桶（16+10=26 > 20）不封。
+    let alert = take_alert_recv(&mut alert_rx).await;
+    assert_eq!(
+        field_str(&alert, "__wfu_entity_id"),
+        "a",
+        "只有 6s 桶（2s 对齐）应封口输出"
+    );
+    // 16s 桶未封口：关停 stage 时被丢弃（partial 不输出），无第二条。
+    drop(conv_tx);
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while alert_rx.try_recv().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .ok();
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "未封口的 16s 桶不得输出（hop 分片语义：桶级全局聚合）"
+    );
+}
+
+/// P2c hop 分片（2026-08-24）：**跨分片**全局聚合 + `top_ties` 语义。
+///
+/// 两个分片各自收口自己那部分 auction 的 close（同 bucket、不同 count），
+/// 路由到 conv stage 后：按 slide 对齐分桶 → barrier 等齐 → 桶封口时全局
+/// `apply_conv(sort(-count) | top_ties(1))` —— 必须取**跨分片**最高 count，
+/// 而非片内 top（片内 top 会错：分片 0 只有 count=5）。
+///
+/// 判别性：分片 0 发 a(count=5)，分片 1 发 b(count=9)（同桶 6s）→ 输出必须是
+/// b（count=9）；若 conv stage 误按片聚合会输出 a（错误）。另发 c(count=7,
+/// 桶 16s) 验证封口长度（16+10=26 > barrier 20 → 不封，不输出）。
+#[tokio::test]
+async fn conv_stage_hop_shards_aggregate_globally_top_ties() {
+    init_tracing();
+    let (alert_tx, mut alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let (conv_tx, conv_rx) = mpsc::channel::<crate::engine_task::ConvCloseBatch>(4);
+    let barrier: Arc<Vec<std::sync::atomic::AtomicI64>> = Arc::new(vec![
+        std::sync::atomic::AtomicI64::new(i64::MIN),
+        std::sync::atomic::AtomicI64::new(i64::MIN),
+    ]);
+    let sort_key = wf_lang::plan::SortKeyPlan {
+        expr: wf_lang::plan::ExprPlan::Field(wf_lang::ast::FieldRef::Simple("count".into())),
+        descending: true,
+    };
+    let config = crate::engine_task::ConvStageConfig {
+        executor: conv_stage_test_executor(),
+        conv_plan: Some(wf_lang::plan::ConvPlan {
+            chains: vec![wf_lang::plan::ConvChainPlan {
+                ops: vec![
+                    wf_lang::plan::ConvOpPlan::Sort(vec![sort_key.clone()]),
+                    wf_lang::plan::ConvOpPlan::TopTies {
+                        n: 1,
+                        sort_keys: vec![sort_key],
+                    },
+                ],
+            }],
+        }),
+        keys: Arc::new([FieldRef::Simple("sip".into())]),
+        over: Duration::from_secs(10),        // hop size
+        bucket_align: Duration::from_secs(2), // hop slide
+        limits: None,
+        shared_limits: None,
+        barrier: Arc::clone(&barrier),
+        sink_fanout: make_test_fanout(alert_tx),
+        router: Arc::new(Router::new(WindowRegistry::build(vec![]).unwrap())),
+        metrics: None,
+        rx: conv_rx,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        eos: tokio::sync::watch::channel(0u64).1,
+        timeout_scan_interval: Duration::from_secs(60),
+    };
+    let _stage = tokio::spawn(async move { crate::engine_task::run_conv_stage_task(config).await });
+
+    // 分片 0：a(count=5, 桶 6s)，水位 20s。
+    let mut close_a = conv_stage_test_close();
+    close_a.window_start_time_nanos = 6_000_000_000;
+    close_a.scope_key = vec![wf_engine::match_engine::Value::Str("a".into())];
+    close_a.event_step_data[0].measure_value = 5.0;
+    conv_tx
+        .send(crate::engine_task::ConvCloseBatch {
+            closes: vec![close_a],
+            watermark: 20_000_000_000,
+            drained: false,
+            barrier_index: 0,
+        })
+        .await
+        .unwrap();
+
+    // 分片 1：b(count=9, 同桶 6s) + c(count=7, 桶 16s)，水位 20s。
+    let mut close_b = conv_stage_test_close();
+    close_b.window_start_time_nanos = 6_000_000_000;
+    close_b.scope_key = vec![wf_engine::match_engine::Value::Str("b".into())];
+    close_b.event_step_data[0].measure_value = 9.0;
+    let mut close_c = conv_stage_test_close();
+    close_c.window_start_time_nanos = 16_000_000_000;
+    close_c.scope_key = vec![wf_engine::match_engine::Value::Str("c".into())];
+    close_c.event_step_data[0].measure_value = 7.0;
+    conv_tx
+        .send(crate::engine_task::ConvCloseBatch {
+            closes: vec![close_b, close_c],
+            watermark: 20_000_000_000,
+            drained: false,
+            barrier_index: 1,
+        })
+        .await
+        .unwrap();
+
+    // 两分片水位都到 20s：桶 6s 封口（6+10 ≤ 20），全局 top_ties → b（count=9）。
+    let alert = take_alert_recv(&mut alert_rx).await;
+    assert_eq!(
+        field_str(&alert, "__wfu_entity_id"),
+        "b",
+        "跨分片全局聚合必须取 count 最高者（片内 top 会错选 a）"
+    );
+    // 桶 16s 未封（16+10=26 > 20），关停时丢弃，不输出。
+    drop(conv_tx);
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while alert_rx.try_recv().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .ok();
+    assert!(alert_rx.try_recv().is_err(), "未封口的 16s 桶不得输出");
 }
 
 // P1①: conv-stage throttle over-limit must dispatch on_exceed — FailRule

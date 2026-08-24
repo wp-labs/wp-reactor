@@ -202,6 +202,152 @@ fn visit_expr_fields(
         _ => *force_all = true,
     }
 }
+
+/// Ctx field names the rule's post-join expressions can read, used to gate the
+/// `reduce ... as label` object materialization (see [`ReduceLabelReads`]).
+#[derive(Debug, Clone)]
+pub(crate) enum ReduceLabelReads {
+    /// An expression shape we cannot fully analyze — assume every name is read.
+    All,
+    /// `field_ref_name` of every field reference in the post-join expressions.
+    Named(std::collections::HashSet<String>),
+}
+
+impl ReduceLabelReads {
+    /// True when the rule can read `label` as a whole object, i.e. the `as
+    /// label` injection is observable.
+    pub(crate) fn needs(&self, label: &str) -> bool {
+        match self {
+            ReduceLabelReads::All => true,
+            ReduceLabelReads::Named(names) => names.contains(label),
+        }
+    }
+}
+
+/// Which `reduce ... as label` objects the rule's expressions actually read
+/// (2026-08-24, q9 deferred hot path).
+///
+/// `as label` injects the winning row as a `Value::Object` under `label`, but
+/// the documented access shape `label.field` compiles to `FieldRef::Path {
+/// alias: label, segments: [field] }` and [`eval_field_value`] **drops the
+/// alias** — it reads `segments[0]` as a root ctx field, i.e. the bare column
+/// name that `enrich_join_row` already injected. So for `winner.bidder` the
+/// object is pure redundant materialization (one `EngineHashMap` + a clone per
+/// row column, per emitted row: `deferred_bench` eval-maxrow 1353 → 1113 ns/op).
+///
+/// The object *is* observable when some reference resolves to the label name
+/// itself — `FieldRef::Simple(label)` (bare `winner`, explicitly allowed by the
+/// checker's `resolve_simple`) or any shape whose [`field_ref_name`] equals the
+/// label (`Qualified`/`Bracketed` second component). That is exactly the
+/// name-set this analysis collects, so gating on it is behavior-preserving.
+fn plan_reduce_label_reads(plan: &RulePlan) -> ReduceLabelReads {
+    // No labels → nothing to gate (skip the walk entirely).
+    if !plan
+        .joins
+        .iter()
+        .any(|j| j.reduce.as_ref().is_some_and(|rc| rc.label.is_some()))
+    {
+        return ReduceLabelReads::Named(Default::default());
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut force_all = false;
+    // Every expression evaluated against the *post-injection* ctx: `where`
+    // (`where_ok`), score / entity / yield (`build_each_alert_with`), plus
+    // `lets` (conservative — not evaluated on this path today).
+    for let_plan in &plan.lets {
+        visit_ctx_field_reads(&let_plan.expr, &mut names, &mut force_all);
+    }
+    if let Some(w) = &plan.r#where {
+        visit_ctx_field_reads(w, &mut names, &mut force_all);
+    }
+    visit_ctx_field_reads(&plan.score_plan.expr, &mut names, &mut force_all);
+    visit_ctx_field_reads(&plan.entity_plan.entity_id_expr, &mut names, &mut force_all);
+    for field in &plan.yield_plan.fields {
+        visit_ctx_field_reads(&field.value, &mut names, &mut force_all);
+    }
+    if force_all {
+        ReduceLabelReads::All
+    } else {
+        ReduceLabelReads::Named(names)
+    }
+}
+
+/// Collect the ctx field names an expression can read by name.
+///
+/// Unlike [`visit_expr_fields`] (which force-alls on any call because the
+/// close-ctx build must also cover synthetic `_step_*` fields), plain function
+/// calls recurse into their arguments: a function can only reach a ctx field
+/// through a field reference in its own arguments. Qualified calls (`stat.*`)
+/// and preset params can resolve names we cannot see, so they stay
+/// conservative.
+fn visit_ctx_field_reads(
+    expr: &Expr,
+    names: &mut std::collections::HashSet<String>,
+    force_all: &mut bool,
+) {
+    match expr {
+        Expr::Field(fr) => {
+            let name = field_ref_name(fr);
+            // "" = a path starting with an index — cannot name a label.
+            if !name.is_empty() {
+                names.insert(name.to_string());
+            }
+        }
+        Expr::FuncCall {
+            qualifier, args, ..
+        } => {
+            if qualifier.is_some() {
+                *force_all = true;
+                return;
+            }
+            for arg in args {
+                visit_ctx_field_reads(arg, names, force_all);
+            }
+        }
+        Expr::BinOp { left, right, .. } => {
+            visit_ctx_field_reads(left, names, force_all);
+            visit_ctx_field_reads(right, names, force_all);
+        }
+        Expr::Neg(inner) => visit_ctx_field_reads(inner, names, force_all),
+        Expr::Array(items) => {
+            for item in items {
+                visit_ctx_field_reads(item, names, force_all);
+            }
+        }
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
+            visit_ctx_field_reads(inner, names, force_all);
+            for item in list {
+                visit_ctx_field_reads(item, names, force_all);
+            }
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            visit_ctx_field_reads(cond, names, force_all);
+            visit_ctx_field_reads(then_expr, names, force_all);
+            visit_ctx_field_reads(else_expr, names, force_all);
+        }
+        Expr::Object(items) => {
+            for item in items {
+                visit_ctx_field_reads(&item.value, names, force_all);
+            }
+        }
+        Expr::Number(_)
+        | Expr::StringLit(_)
+        | Expr::Bool(_)
+        | Expr::SystemVar(_)
+        | Expr::WfuMeta(_) => {}
+        // Preset params expand to unknown expressions; unknown variants may
+        // read anything.
+        Expr::PresetParam(_) => *force_all = true,
+        _ => *force_all = true,
+    }
+}
+
 /// Compute the subset of [`JoinPlan`]s whose enrichment is actually consumed
 /// by the rule's output expressions (lets / `where` / score / entity / yield).
 ///
@@ -464,6 +610,9 @@ pub struct RuleExecutor {
     /// (see [`plan_close_ctx_fields`] — `All` for rules whose expressions
     /// can't be statically narrowed).
     close_ctx_fields: CloseCtxFields,
+    /// Whether the rule can observe a `reduce ... as label` object, gating the
+    /// deferred-join label materialization (see [`plan_reduce_label_reads`]).
+    reduce_label_reads: ReduceLabelReads,
 }
 
 // Manual impl: `Mutex` is not `Clone`. `emit_time_cache` is a pure memo
@@ -481,6 +630,7 @@ impl Clone for RuleExecutor {
             output_static: self.output_static.clone(),
             emit_time_cache: Mutex::new((0, Arc::from(""))),
             close_ctx_fields: self.close_ctx_fields.clone(),
+            reduce_label_reads: self.reduce_label_reads.clone(),
         }
     }
 }
@@ -582,6 +732,7 @@ impl RuleExecutor {
             _ => None,
         };
         let close_ctx_fields = plan_close_ctx_fields(&plan);
+        let reduce_label_reads = plan_reduce_label_reads(&plan);
         let match_ctx_free = compute_match_ctx_free(&plan, &live_joins, &yield_kinds);
         Self {
             output_static: OutputStatic {
@@ -605,6 +756,7 @@ impl RuleExecutor {
             bind_filters,
             emit_time_cache: Mutex::new((0, Arc::from(""))),
             close_ctx_fields,
+            reduce_label_reads,
         }
     }
 

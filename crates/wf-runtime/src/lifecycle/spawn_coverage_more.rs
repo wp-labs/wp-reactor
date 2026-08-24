@@ -472,6 +472,7 @@ async fn spawn_rule_tasks_match_sharded_conv_stage() {
     // conv_window → shardable conv 规则：spawn 聚合阶段任务 + 分片规则任务。
     plan.conv_window = Some(wf_lang::plan::ConvWindowPlan {
         over: std::time::Duration::from_secs(60),
+        slide: None,
         keys: vec![FieldRef::Simple("sip".into())],
     });
     let rule = make_rule(

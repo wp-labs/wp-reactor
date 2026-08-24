@@ -263,6 +263,224 @@ fn memory_eviction_respects_ack_floor() {
     );
 }
 
+/// D4 保留 pin：**无任何 pull 消费者**（ack floor = u64::MAX，即 join 目标窗口的
+/// 处境）时，内存驱逐仍需尊重 pin 发布的事件时间前沿——这是 q9/q4a 30M
+/// −62%（bid 字节上限丢掉 deferred 到期评估还要用的 bid）的防网。
+/// 双向断言：前沿之前的行仍可驱逐（不过度保留），前沿之后的行不可驱逐。
+#[test]
+fn memory_eviction_respects_retention_pin() {
+    let schema = test_schema();
+    let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+    let one_batch_size = content_bytes(&probe);
+    let max_bytes = one_batch_size * 2;
+    let win = Window::new(
+        WindowParams {
+            name: "mem_pin".into(),
+            schema,
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        test_config(max_bytes),
+    );
+
+    // 关键：不注册任何消费者槽位（ack floor = u64::MAX，全部可驱逐），
+    // 只有一个保留 pin——完全复现 join 目标窗口的处境。
+    let progress = Arc::new(WindowProgress::new());
+    win.set_progress(Arc::clone(&progress));
+    let pin = progress.register_retention_pin();
+    assert_eq!(
+        win.retention_floor_ns(),
+        i64::MIN,
+        "刚注册的 pin fail-safe 全保留（读者尚未发布前沿）"
+    );
+
+    // 前沿 = 3s：只需要事件时间 ≥ 3s 的行。
+    pin.store(3_000_000_000, Ordering::Release);
+    assert_eq!(win.retention_floor_ns(), 3_000_000_000);
+
+    win.append(probe.clone()).unwrap(); // seq 0, ts 1s
+    win.append(make_batch(win.schema(), &[2_000_000_000], &[200]))
+        .unwrap(); // seq 1, ts 2s
+    assert_eq!(win.batch_count(), 2);
+
+    // 超预算：seq 0（max 1s < 3s）不在前沿内 → 仍可驱逐。pin 不能变成
+    // 「什么都不丢」的内存泄洏。
+    win.append(make_batch(win.schema(), &[3_000_000_000], &[300]))
+        .unwrap(); // seq 2, ts 3s
+    assert_eq!(
+        win.batch_count(),
+        2,
+        "前沿之前的 batch 必须仍可被内存驱逐（否则 pin 就是内存泄洏）"
+    );
+    assert!(win.memory_usage() <= max_bytes);
+
+    // 前沿回退到 1s（比如新挂起了一个 lo_ns 更早的实例）：现存 batch 全在
+    // 前沿内 → 超预算也不得丢，窗口瞬时超出 max_window_bytes。
+    pin.store(1_000_000_000, Ordering::Release);
+    win.append(make_batch(win.schema(), &[4_000_000_000], &[400]))
+        .unwrap(); // seq 3, ts 4s
+    assert_eq!(
+        win.batch_count(),
+        3,
+        "pin 住的行必须存活（宁可瞬时超预算，也不静默丢 join 目标数据）"
+    );
+    assert!(win.memory_usage() > max_bytes);
+
+    // 释放 pin（EOS）→ 恢复完全可驱逐，内存回到预算内。
+    pin.store(i64::MAX, Ordering::Release);
+    win.append(make_batch(win.schema(), &[5_000_000_000], &[500]))
+        .unwrap(); // seq 4, ts 5s
+    assert_eq!(win.batch_count(), 2, "pin 释放后内存驱逐恢复");
+    assert!(win.memory_usage() <= max_bytes);
+}
+
+/// D4：spawn 阶段预注册的 pin 必须在读者（异步规则任务）启动**之前**就生效。
+///
+/// q4 30M 回归：规则任务是 `tokio::spawn` 的、在 future 内自构，而摄入紧接
+/// `spawn_rule_tasks` 开始——pin 在 future 里注册会与首批 append 竞争，当时非确定性
+/// 丢 0~6% 输出（启动期 5 vs 48 次驱逐清扫）。
+#[test]
+fn preregistered_pin_protects_before_the_reader_starts() {
+    let schema = test_schema();
+    let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+    let max_bytes = content_bytes(&probe) * 2;
+    let win = Window::new(
+        WindowParams {
+            name: "parked_pin".into(),
+            schema,
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        test_config(max_bytes),
+    );
+    let progress = Arc::new(WindowProgress::new());
+    win.set_progress(Arc::clone(&progress));
+
+    // spawn 阶段（同步）：声明这是 deferred join 目标，读者尚未启动。
+    win.preregister_retention_pin();
+    assert_eq!(win.retention_floor_ns(), i64::MIN);
+
+    // 首批数据已经在灌入——超预算也不得丢（这些行可能正是 deferred 到期
+    // 评估要用的）。
+    for (i, ts) in [1_000_000_000, 2_000_000_000, 3_000_000_000]
+        .into_iter()
+        .enumerate()
+    {
+        win.append(make_batch(win.schema(), &[ts], &[100 * (i as i64 + 1)]))
+            .unwrap();
+    }
+    assert_eq!(
+        win.batch_count(),
+        3,
+        "读者启动前的 append 必须受预注册 pin 保护"
+    );
+
+    // 读者启动：取走 pin 并发布真实前沿（只需≥ 3s）。
+    let pin = win.take_retention_pin().expect("parked pin");
+    pin.store(3_000_000_000, Ordering::Release);
+    win.append(make_batch(win.schema(), &[4_000_000_000], &[400]))
+        .unwrap();
+    assert_eq!(win.batch_count(), 2, "发布前沿后，前沿之前的行应被回收");
+    assert!(win.memory_usage() <= max_bytes);
+
+    // 取过一次后不再有寄存 pin；后续调用自己注册一个（分片规则的其余分片）。
+    let extra = win.take_retention_pin().expect("fresh pin");
+    assert_eq!(
+        win.retention_floor_ns(),
+        i64::MIN,
+        "新注册的分片 pin 同样 fail-safe 全保留"
+    );
+    drop(extra);
+}
+
+/// D4：全局内存上限路径（驱逐器的 `evict_oldest_acked`）同样尊重保留 pin——
+/// 否则按窗预算护住的行会从全局 `max_total_bytes` 那一侧被抽走。
+#[test]
+fn evict_oldest_acked_respects_retention_pin() {
+    let schema = test_schema();
+    let win = Window::new(
+        WindowParams {
+            name: "global_pin".into(),
+            schema,
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        test_config(usize::MAX),
+    );
+    let progress = Arc::new(WindowProgress::new());
+    win.set_progress(Arc::clone(&progress));
+    let pin = progress.register_retention_pin();
+    pin.store(2_000_000_000, Ordering::Release);
+
+    win.append(make_batch(win.schema(), &[1_000_000_000], &[100]))
+        .unwrap(); // seq 0, ts 1s
+    win.append(make_batch(win.schema(), &[3_000_000_000], &[300]))
+        .unwrap(); // seq 1, ts 3s
+
+    // seq 0（max 1s < 2s）在前沿之前 → 可回收。
+    assert!(
+        win.evict_oldest_acked(u64::MAX).is_some(),
+        "前沿之前的 batch 应可被全局内存回收"
+    );
+    // seq 1（max 3s ≥ 2s）被 pin 住 → 报不可回收（调用方转而施加背压）。
+    assert!(
+        win.evict_oldest_acked(u64::MAX).is_none(),
+        "pin 住的 batch 不得被全局内存上限丢弃"
+    );
+    assert_eq!(win.batch_count(), 1);
+}
+
+/// `front_pinned_by_retention` 直接单测：空窗口 / 无 pin / front 在前沿内 /
+/// front 在前沿外 / 释放后 五种状态。evictor 用它做候选选择，语义必须精确。
+#[test]
+fn front_pinned_by_retention_states() {
+    let schema = test_schema();
+    let win = Window::new(
+        WindowParams {
+            name: "front_pin".into(),
+            schema,
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        test_config(usize::MAX),
+    );
+    let progress = Arc::new(WindowProgress::new());
+    win.set_progress(Arc::clone(&progress));
+
+    assert!(!win.front_pinned_by_retention(), "空窗口 → false");
+
+    win.append(make_batch(win.schema(), &[1_000_000_000], &[100]))
+        .unwrap(); // front: ts 1s
+    assert!(
+        !win.front_pinned_by_retention(),
+        "无 pin → false（同 pin 前行为）"
+    );
+
+    let pin = progress.register_retention_pin();
+    pin.store(2_000_000_000, Ordering::Release);
+    assert!(
+        !win.front_pinned_by_retention(),
+        "front (max 1s) < 前沿 2s → 可驱逐，false"
+    );
+
+    pin.store(1_000_000_000, Ordering::Release);
+    assert!(
+        win.front_pinned_by_retention(),
+        "front (max 1s) >= 前沿 1s → pin 住，true"
+    );
+
+    pin.store(i64::MAX, Ordering::Release);
+    assert!(!win.front_pinned_by_retention(), "释放后 → false");
+}
+
 /// Time eviction must bump the content generation so a cached `window.has()`
 /// distinct-value set invalidates (otherwise it goes stale after a sweep).
 #[test]
@@ -1684,5 +1902,81 @@ fn read_since_with_shard_returns_correct_subset() {
     assert!(
         rows[0].is_none(),
         "unsharded pull must not request a shard subset"
+    );
+}
+
+// -- join 索引 append 微基准（2026-08-24 q9/q4 性能归因） ---------------------
+//
+// q9/q4 的 join 目标（bid_events，30M 时 27.6M 行）每次 append 都要 index_batch
+// （逐行按 key 建列式 JoinIndex）；q8 的 join 目标只有 auction_events 1.8M 行，
+// 差 15×，正好对应 q9（~0.9M EPS）比 q8（23M EPS）慢 ~25×。本基准量出 append
+// 有无 join 索引的 ns/row 差，把「索引维护」从「纯 append」里分离出来。
+//
+// 运行：
+//   cargo test --release -p wf-engine join_index_append_bench -- --ignored --nocapture
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine join_index_append_bench -- --ignored --nocapture"]
+fn join_index_append_bench() {
+    use std::time::Instant;
+
+    const N: usize = 1_000_000;
+    const BATCH: usize = 2000; // 对齐 bench 帧大小（每批 ~2000 行）
+
+    // 数据：ts 递增（避免驱逐触发，隔离纯 append+index），value 0..9999（10k 去重键，
+    // 近似 q9 bid.auction 的去重度）。
+    fn make(win: &Window, batch_idx: usize) -> RecordBatch {
+        let schema = win.schema().clone();
+        let base = batch_idx * BATCH;
+        let times: Vec<i64> = (0..BATCH).map(|i| (base + i) as i64 * 100_000).collect();
+        let values: Vec<i64> = (0..BATCH).map(|i| (base + i) as i64 % 10_000).collect();
+        make_batch(&schema, &times, &values)
+    }
+
+    // baseline：无 join 索引（纯 append）
+    let win = test_window(3600, usize::MAX);
+    let start = Instant::now();
+    for b in 0..(N / BATCH) {
+        win.append(make(&win, b)).unwrap();
+    }
+    let baseline_ns = start.elapsed().as_nanos() as f64 / N as f64;
+
+    // join 目标：set_join_key 后 append（append + index_batch）
+    let win = test_window(3600, usize::MAX);
+    win.set_join_key("value".into());
+    let start = Instant::now();
+    for b in 0..(N / BATCH) {
+        win.append(make(&win, b)).unwrap();
+    }
+    let indexed_ns = start.elapsed().as_nanos() as f64 / N as f64;
+
+    // set_join_key 初始建索引（空窗 → 无行，仅建空结构；真实引擎 spawn 时调用，
+    // 不计入每行成本，但单独量一下以防 rebuild 开销被误读）。
+    let win = test_window(3600, usize::MAX);
+    let start = Instant::now();
+    win.set_join_key("value".into());
+    let set_key_ns = start.elapsed().as_nanos() as f64;
+
+    eprintln!("[join-index-append-bench] N={N}, batch={BATCH}, keys=10000");
+    eprintln!(
+        "[join-index-append-bench] {:<28} {:>9.1} ns/row  ({:>6.2}M rows/s)",
+        "append (no index)",
+        baseline_ns,
+        1e9 / baseline_ns / 1e6
+    );
+    eprintln!(
+        "[join-index-append-bench] {:<28} {:>9.1} ns/row  ({:>6.2}M rows/s)",
+        "append + join index",
+        indexed_ns,
+        1e9 / indexed_ns / 1e6
+    );
+    eprintln!(
+        "[join-index-append-bench] {:<28} {:>9.1} ns/row  ({:>5.1}% overhead)",
+        "index_batch (diff)",
+        indexed_ns - baseline_ns,
+        (indexed_ns - baseline_ns) / baseline_ns * 100.0
+    );
+    eprintln!(
+        "[join-index-append-bench] set_join_key (empty) = {:.1} ns",
+        set_key_ns
     );
 }

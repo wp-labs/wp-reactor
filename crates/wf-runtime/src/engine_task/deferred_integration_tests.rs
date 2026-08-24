@@ -1293,3 +1293,48 @@ async fn deferred_q9_real_wfl_compiled_plan_runs() {
         "maxrow(price) 胜者 = price 200（bidder=2），label 注入 detail"
     );
 }
+
+/// 分片尾部评估（2026-08-24 q4/q9 分片修复）：round-robin 分片后 worker 自身
+/// watermark 停在**最后处理批次**的时刻，而驱动窗口的全局尾部（其他 worker 拿到
+/// 的更晚批次）可能更靠后——flush（EOS）必须用**驱动窗口全局最终事件时间**评估
+/// 剩余挂起（expiry ≤ 全局末尾），否则尾部 pending 永不评估。
+///
+/// q4 30M 实测：修复前丢 869 条（1,671,690 vs 1,672,559）；修复后 identical。
+#[tokio::test]
+async fn deferred_flush_uses_global_window_tail_for_sharded_workers() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_deferred_join_task();
+
+    // bid 先到（auction=5，price 200）。
+    bid_window(&router)
+        .append(bid_batch(&[(5, 2, 200, T + 20_000_000_000)]))
+        .unwrap();
+    // auction=5（expiry = T+60s）到达并处理：挂起创建，任务自身 watermark = T。
+    auction_window(&router)
+        .append(auction_batch(&[(5, T, T + 60_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+
+    // 模拟「其他 worker 拿到更晚批次」：驱动窗口 append auction=9（dateTime
+    // T+120s），但**本任务不处理它**（不调 pull_and_advance）→ 窗口全局尾部推进
+    // 到 T+120s，任务自身 watermark 仍是 T。用 append_with_watermark：普通
+    // append 不更新窗口 max_event_time（watermark.rs L128），flush 读不到全局尾部。
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[(
+            9,
+            T + 120_000_000_000,
+            T + 180_000_000_000,
+        )]))
+        .unwrap();
+
+    // flush：必须用窗口全局尾部（T+120s ≥ expiry T+60s）评估 auction=5 的挂起
+    // ——修复前用自身 watermark（T）会漏评估。
+    task.flush().await;
+
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "5",
+        "flush 必须用驱动窗口全局尾部评估尾部挂起（分片 worker 自身 watermark 不足）"
+    );
+}

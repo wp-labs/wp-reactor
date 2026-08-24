@@ -5,13 +5,15 @@
 // cross-shard conv (sort / top / dedup / where) + emit pipeline.
 //
 // Design (rule-sharding-and-aggregation-window.md, P2c):
-//   - A fixed-window conv rule is shardable. Each shard emits RAW qualifying
-//     closes (no inline conv) to this stage via a bounded channel.
-//   - This stage accumulates closes into fixed buckets (`over` = the rule's
-//     match window duration; bucket key = close.window_start_time_nanos
-//     floored to the bucket boundary).
+//   - A fixed/hop-window conv rule is shardable (2026-08-24: hop 加入——桶对齐
+//     = slide、封口长度 = size；sliding/session 仍 inline). Each shard emits RAW
+//     qualifying closes (no inline conv) to this stage via a bounded channel.
+//   - This stage accumulates closes into buckets (bucket key = close
+//     window_start_time_nanos floored to `bucket_align`; fixed = over,
+//     hop = slide).
 //   - A bucket is sealed only when EVERY shard's watermark has passed the
-//     bucket end (barrier protocol) — a slow shard never loses closes.
+//     bucket end (= bucket start + `over`; fixed = 窗口长, hop = size)
+//     (barrier protocol) — a slow shard never loses closes.
 //   - On seal: apply `conv::apply_conv` over the whole aggregated batch, apply
 //     the shared rate limit (P2b), then emit each result via SinkFanout.
 //
@@ -76,6 +78,9 @@ pub(crate) struct ConvStageConfig {
     pub(crate) conv_plan: Option<ConvPlan>,
     pub(crate) keys: Arc<[FieldRef]>,
     pub(crate) over: Duration,
+    /// Bucket alignment：fixed = `over`；hop = `slide`（桶键 = window_start
+    /// floor 到该长度）。封口仍用 `over`（bucket + over <= barrier 最小值）。
+    pub(crate) bucket_align: Duration,
     pub(crate) limits: Option<LimitsPlan>,
     pub(crate) shared_limits: Option<Arc<SharedLimits>>,
     pub(crate) barrier: Arc<Vec<AtomicI64>>,
@@ -94,6 +99,7 @@ pub(crate) async fn run_conv_stage_task(config: ConvStageConfig) -> RuntimeResul
         conv_plan: config.conv_plan,
         keys: config.keys,
         over: config.over,
+        bucket_align: config.bucket_align,
         limits: config.limits,
         shared_limits: config.shared_limits,
         barrier: config.barrier,
@@ -116,6 +122,7 @@ struct ConvStageTask {
     conv_plan: Option<ConvPlan>,
     keys: Arc<[FieldRef]>,
     over: Duration,
+    bucket_align: Duration,
     limits: Option<LimitsPlan>,
     shared_limits: Option<Arc<SharedLimits>>,
     barrier: Arc<Vec<AtomicI64>>,
@@ -228,9 +235,12 @@ impl ConvStageTask {
             slot.store(cur.max(batch.watermark), Ordering::Release);
         }
         if !batch.closes.is_empty() {
-            let over_nanos = self.over.as_nanos() as i64;
+            // 桶键对齐：fixed 用 `over`（现状）；hop 用 `slide`（收口事件
+            // window_start = k*slide，见 hop 实例 created_at）。封口判定仍用
+            // `over`（hop 的 over = size）：`bucket + size <= min(barrier)`。
+            let align_ns = self.bucket_align.as_nanos() as i64;
             for close in batch.closes {
-                let bucket = (close.window_start_time_nanos.div_euclid(over_nanos)) * over_nanos;
+                let bucket = (close.window_start_time_nanos.div_euclid(align_ns)) * align_ns;
                 self.buckets.entry(bucket).or_default().push(close);
             }
         }
@@ -238,7 +248,7 @@ impl ConvStageTask {
         self.check_all_drained();
     }
 
-    /// Seal every bucket whose end has been passed by all shards.
+    /// Seal every bucket whose end (= start + `over`) has been passed by all shards.
     async fn try_seal(&mut self) {
         let min_wm = self
             .barrier

@@ -59,16 +59,24 @@ pub struct LetPlan {
 
 /// Auto-generated conv aggregation descriptor (P2c).
 ///
-/// Marks a fixed-window conv rule as shardable and carries the runtime
-/// bucketing parameters for the conv stage. `over` = fixed bucket length (the
-/// rule's match window duration); `keys` = scope keys. (The runtime aggregates
-/// closes inside the conv stage — a dedicated aggregation window is not
-/// materialized.)
+/// Marks a conv rule as shardable and carries the runtime bucketing parameters
+/// for the conv stage. `over` = **seal length** (bucket start + over must be
+/// passed by every shard's watermark before the bucket is sealed); `keys` =
+/// scope keys. (The runtime aggregates closes inside the conv stage — a
+/// dedicated aggregation window is not materialized.)
+///
+/// Bucket alignment differs by window shape (2026-08-24 hop extension):
+/// - `slide == None`（fixed）：bucket 对齐 = `over`（每 over 一个桶，现状）；
+/// - `slide == Some(slide)`（hop）：bucket 对齐 = `slide`（每 slide 一个桶，
+///   实例在 window_start + size 收口），`over` = size（封口长度）。
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
 #[moju(kind = "struct", domain = "Lang", module = "Lang.LangExePlan")]
 pub struct ConvWindowPlan {
-    /// Fixed bucket length = the rule's match window duration.
+    /// Seal length：bucket 封口需要 `bucket + over <= min(barrier)`。
+    /// fixed = 窗口时长；hop = size。
     pub over: Duration,
+    /// Bucket alignment：`None`（fixed）= `over`；`Some(slide)`（hop）= slide。
+    pub slide: Option<Duration>,
     /// Scope-key fields (same as `MatchPlan.keys`).
     pub keys: Vec<FieldRef>,
 }

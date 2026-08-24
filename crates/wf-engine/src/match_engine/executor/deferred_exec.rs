@@ -123,9 +123,18 @@ impl RuleExecutor {
                 let Some(row) = select_reduce_row(matched, &rc.measure) else {
                     return Ok(None);
                 };
+                // 胜出行的字段以裸名富化（`winner.bidder` 编译成 Path{alias:"winner",
+                // segments:["bidder"]}，eval_field_value 丢弃 alias、把 segments[0]
+                // 当根字段名读 `fields["bidder"]`）。
                 enrich_join_row(&mut out_ctx, join, &row);
-                // `as label`：归约整行以裸键 object value 注入（review R2）
-                if let Some(label) = &rc.label {
+                // `as label`：归约整行以裸键 object value 注入（review R2）。
+                // 仅当规则真能读到该 object（裸 `winner` / `field_ref_name` 命中
+                // 标签名，见 plan_reduce_label_reads）时才物化——`label.field`
+                // 形态读的是上面 enrich 的裸名，object 纯冗余（2026-08-24
+                // deferred_bench：eval-maxrow 1353 → 1113 ns/op）。
+                if let Some(label) = &rc.label
+                    && self.reduce_label_reads.needs(label)
+                {
                     inject_reduce_label(&mut out_ctx, label, &row);
                 }
             }

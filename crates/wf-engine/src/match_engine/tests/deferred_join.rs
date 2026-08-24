@@ -729,3 +729,73 @@ fn bid_with_channel(
     fields.insert("channel".into(), num(channel));
     (ts, JoinRow::Event(Arc::new(Event { fields })))
 }
+
+/// `as label` 整对象引用（`winner` 裸名）——checker 的 `resolve_simple` 显式
+/// 允许这种形态（“reduce 标签裸引用”），此处锁定运行时行为：胜出整行以
+/// `Value::Object` 注入。回归防网：`plan_reduce_label_reads` 的按需物化门控
+///（2026-08-24 deferred 热路径）必须在这种形态下保留注入（`winner.bidder`
+/// 读的是 enrich 裸名，不需 object；裸 `winner` 则只能从 object 读）。
+#[test]
+fn execute_deferred_join_bare_label_yields_whole_row_object() {
+    let mut plan = q9_rule_plan();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "winner_obj".into(),
+        value: Expr::Field(FieldRef::Simple("winner".into())),
+    }];
+    let exec = RuleExecutor::new(plan);
+    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let lookup = BidLookup(vec![
+        bid(T + 10_000_000_000, 5.0, 1.0, 100.0),
+        bid(T + 20_000_000_000, 5.0, 2.0, 200.0),
+    ]);
+
+    let rec = exec
+        .execute_deferred_join(0, &pending, &lookup, T + 100_000_000_000)
+        .unwrap()
+        .expect("bare label reference must still emit");
+
+    let obj = rec
+        .yield_fields
+        .iter()
+        .find(|(name, _)| &**name == "winner_obj")
+        .map(|(_, v)| v)
+        .expect("winner_obj yield field");
+    let Value::Object(map) = obj else {
+        panic!("bare `winner` must evaluate to the injected row object, got {obj:?}");
+    };
+    // 胜者 = price 200（bidder=2），整行字段均在 object 里。
+    assert_eq!(map.get("bidder"), Some(&num(2.0)));
+    assert_eq!(map.get("price"), Some(&num(200.0)));
+    assert_eq!(map.get("auction"), Some(&num(5.0)));
+}
+
+/// `field_ref_name` 命中标签名的限定形态（`a.winner` → `Qualified("a","winner")`
+/// → `eval_field_value` 非-Path 分支读 `fields["winner"]`）同样能观测到注入
+/// object——按需门控用 `field_ref_name` 而非仅 `Simple` 判定，正是为了盖住它。
+#[test]
+fn execute_deferred_join_qualified_label_name_reads_injected_object() {
+    let mut plan = q9_rule_plan();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "winner_obj".into(),
+        value: Expr::Field(FieldRef::Qualified("a".into(), "winner".into())),
+    }];
+    let exec = RuleExecutor::new(plan);
+    let pending = exec.deferred_pending_for(0, &auction_event(), T).unwrap();
+    let lookup = BidLookup(vec![bid(T + 20_000_000_000, 5.0, 2.0, 200.0)]);
+
+    let rec = exec
+        .execute_deferred_join(0, &pending, &lookup, T + 100_000_000_000)
+        .unwrap()
+        .expect("qualified label name must still emit");
+
+    let obj = rec
+        .yield_fields
+        .iter()
+        .find(|(name, _)| &**name == "winner_obj")
+        .map(|(_, v)| v)
+        .expect("winner_obj yield field");
+    assert!(
+        matches!(obj, Value::Object(map) if map.get("bidder") == Some(&num(2.0))),
+        "`a.winner` reads fields[\"winner\"] — the injected object must be present, got {obj:?}"
+    );
+}

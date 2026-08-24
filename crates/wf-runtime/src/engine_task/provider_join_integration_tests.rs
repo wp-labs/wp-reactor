@@ -276,3 +276,143 @@ async fn provider_join_miss_keeps_event_without_enrichment() {
         "unmatched bid has no enriched state"
     );
 }
+
+/// D4 扩展（2026-08-24）：snapshot join 目标窗口（**buffer 窗口**，区别于 provider
+/// 静态表）在规则任务构造时取得保留 pin——全保留（`i64::MIN`）直到任务结束。
+///
+/// 回归锚点：snapshot 语义 = join 时刻的完整状态，驱动事件可引用任意老的实体行
+///（q3 join person / q6·q20 join auction）。此前这类窗口的字节上限一旦成为约束，
+/// 驱逐会静默丢掉快照还需要的行（历史根因：q3 差 50% / q6 差 36% / q20 差 21%）。
+#[test]
+fn snapshot_join_buffer_target_gets_retention_pin() {
+    let driver = "bid_events";
+    let target = "auction_events";
+    let registry = WindowRegistry::build(vec![
+        window_def(driver, &bid_schema()),
+        window_def(target, &auction_schema()),
+    ])
+    .unwrap();
+    let router = Arc::new(Router::new(registry));
+    let source_window = router.registry().get_window(driver).unwrap();
+    let source_notify = router.registry().get_notifier(driver).unwrap();
+
+    // Q20 形状：bid 驱动 ⋈ auction 实体表 snapshot join。
+    let rule_plan = RulePlan {
+        conv_window: None,
+        name: "snap_pin_e2e".into(),
+        binds: vec![BindPlan {
+            alias: "b".into(),
+            window: driver.into(),
+            filter: None,
+        }],
+        lets: Vec::new(),
+        match_plan: MatchPlan {
+            keys: vec![],
+            key_map: None,
+            key_join: None,
+            window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::ZERO),
+            event_steps: vec![],
+            close_steps: vec![],
+            close_mode: wf_lang::ast::CloseMode::Or,
+            tracked_bind_aliases: HashSet::new(),
+            tracked_bind_fields: empty_tracked_bind_fields(),
+            tracked_plain_fields: empty_tracked_plain_fields(),
+            seq: None,
+            match_mode: wf_lang::ast::MatchMode::Seq,
+            accu: false,
+            needs_field_history: false,
+            trigger_event_needed: false,
+        },
+        each_plan: Some(EachPlan {
+            alias: "b".into(),
+            filter: None,
+        }),
+        stats_plan: None,
+        joins: vec![JoinPlan {
+            right_window: target.to_string(),
+            mode: JoinMode::Snapshot,
+            conds: vec![JoinCondPlan {
+                left: FieldRef::Qualified("b".into(), "auction".into()),
+                right: FieldRef::Qualified(target.into(), "id".into()),
+            }],
+            within: None,
+            reduce: None,
+            emit_at: None,
+        }],
+        r#where: None,
+        entity_plan: EntityPlan {
+            entity_type: "digit".into(),
+            entity_id_expr: Expr::Field(FieldRef::Simple("auction".into())),
+        },
+        yield_plan: YieldPlan {
+            target: "alerts".into(),
+            version: None,
+            fields: vec![YieldField {
+                name: "id".into(),
+                value: Expr::Field(FieldRef::Simple("auction".into())),
+            }],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(10.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+
+    let executor = RuleExecutor::new(rule_plan);
+    let (alert_tx, _alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let config = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
+        conv_sink: None,
+        machine: None,
+        each_alias: Some("b".into()),
+        each_time_field: Some("event_time".into()),
+        executor,
+        window_sources: vec![task_types::WindowSource {
+            window_name: driver.into(),
+            window: source_window,
+            notify: source_notify,
+            aliases: vec!["b".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout_scan_interval: std::time::Duration::from_secs(60),
+        router: Arc::clone(&router),
+        metrics: None,
+        intermediate_targets: HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        shard_index: None,
+        shard_count: 1,
+    };
+
+    let task = rule_task::RuleTask::new(config);
+    let target_win = router.registry().get_window(target).unwrap();
+    assert_eq!(
+        target_win.retention_floor_ns(),
+        i64::MIN,
+        "snapshot join 目标窗口必须全保留（快照需要完整状态）"
+    );
+
+    // 任务结束（drop）→ pin 自动释放 → 窗口恢复可驱逐。
+    drop(task);
+    assert_eq!(
+        target_win.retention_floor_ns(),
+        i64::MAX,
+        "任务 drop 后 pin 必须自动释放（Weak 死）"
+    );
+}
+
+/// auction 实体表 schema（join 目标用）：id + event_time。
+fn auction_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]))
+}

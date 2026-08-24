@@ -318,6 +318,17 @@ pub struct Window {
     /// pull consumer never loses unread batches (`None` until the registry
     /// wires it — treated as "no consumers", i.e. everything evictable).
     progress: RwLock<Option<Arc<WindowProgress>>>,
+    /// D4: retention pin pre-registered **synchronously** at spawn time for a
+    /// deferred join target, parked here until the (async) rule task takes
+    /// ownership via [`Self::take_retention_pin`].
+    ///
+    /// Why park it instead of letting the task register its own: rule tasks are
+    /// `tokio::spawn`ed and construct themselves inside the spawned future,
+    /// while ingestion starts as soon as `spawn_rule_tasks` returns. A pin
+    /// created in the future therefore races with the first appends — nexmark q4
+    /// lost 0–6% of its output nondeterministically (5 vs 48 startup eviction
+    /// sweeps) until the pin existed before the first batch landed.
+    parked_pin: RwLock<Option<Arc<std::sync::atomic::AtomicI64>>>,
 }
 
 impl Window {
@@ -344,6 +355,7 @@ impl Window {
             materialize_fields,
             defer_materialization,
             progress: RwLock::new(None),
+            parked_pin: RwLock::new(None),
         }
     }
 
@@ -365,6 +377,66 @@ impl Window {
             .as_ref()
             .map(|p| p.min_acked())
             .unwrap_or(u64::MAX)
+    }
+
+    /// Retention frontier for this window (D4): the oldest event time any live
+    /// join-target reader still needs, or `i64::MAX` when nothing is pinned.
+    ///
+    /// Memory eviction (per-window byte cap here, global cap via
+    /// [`Self::evict_oldest_acked`]) must not drop a batch that may hold rows at
+    /// or after this frontier — a join-target reader owns no consumer slot, so
+    /// [`Self::min_acked`] cannot protect it. See [`WindowProgress`] for why the
+    /// pin is event-time based and why `over` eviction ignores it.
+    pub fn retention_floor_ns(&self) -> i64 {
+        self.progress
+            .read()
+            .expect("progress lock poisoned")
+            .as_ref()
+            .map(|p| p.min_retention_ns())
+            .unwrap_or(i64::MAX)
+    }
+
+    /// Register a retention pin on this window (D4), or `None` when the window
+    /// is not wired to a progress table (unit-test windows).
+    ///
+    /// Called by a rule task that uses this window as a **join target**: it
+    /// publishes the oldest event time its pending evaluations can still need,
+    /// and memory eviction then refuses to drop those rows.
+    pub fn register_retention_pin(&self) -> Option<Arc<std::sync::atomic::AtomicI64>> {
+        self.progress
+            .read()
+            .expect("progress lock poisoned")
+            .as_ref()
+            .map(|p| p.register_retention_pin())
+    }
+
+    /// Pre-register a retention pin at spawn time and park it (see
+    /// [`Self::parked_pin`]). Idempotent — a second call while a pin is parked is
+    /// a no-op, so re-declaring the same join target does not stack pins.
+    ///
+    /// The pin starts fully pinned (`i64::MIN`): from the very first append the
+    /// window keeps everything until the rule task publishes a real frontier.
+    pub fn preregister_retention_pin(&self) {
+        let mut parked = self.parked_pin.write().expect("parked pin lock poisoned");
+        if parked.is_none() {
+            *parked = self.register_retention_pin();
+        }
+    }
+
+    /// Take ownership of the parked pin, or register a fresh one when none was
+    /// pre-registered (direct construction in tests, extra shards of a sharded
+    /// rule). The caller must keep the returned handle alive for as long as it
+    /// needs the rows, and publish `i64::MAX` when done.
+    pub fn take_retention_pin(&self) -> Option<Arc<std::sync::atomic::AtomicI64>> {
+        if let Some(pin) = self
+            .parked_pin
+            .write()
+            .expect("parked pin lock poisoned")
+            .take()
+        {
+            return Some(pin);
+        }
+        self.register_retention_pin()
     }
 
     /// Configure this window as a join target: build a hash index on `key_field`
@@ -590,12 +662,32 @@ impl Window {
 
         // Memory eviction: pop oldest batches while over budget.
         let max_bytes = self.config.max_window_bytes.as_bytes();
+        // 热路径：绝大多数 append 不超预算——仅在需要驱逐时才取消费前沿与保留
+        // 前沿（两把 progress 读锁）。锁序保持 progress.read → log.write，与
+        // `evict_oldest_acked` 一致（绝不持 log 锁时取 progress 锁，防死锁）。
+        let over_budget = self.current_bytes.load(Ordering::Relaxed) > max_bytes;
         // Per-window eviction is floor-respecting: only drop batches every
         // live consumer has already acked (`seq < ack_floor`). An unacked
         // front batch stops the sweep — the window may transiently exceed
         // `max_window_bytes` rather than lose unread pull data (the periodic
         // evictor reclaims it once consumers advance).
-        let ack_floor = self.min_acked();
+        let ack_floor = if over_budget {
+            self.min_acked()
+        } else {
+            u64::MAX
+        };
+        // D4 retention pin: a join-target reader (deferred join) owns no consumer
+        // slot, so `ack_floor` says "everything evictable" for it. Its published
+        // frontier is honoured here instead — without this, the byte cap silently
+        // truncates join results (nexmark q9/q4a −62% at 30M, 2026-08-24).
+        // `i64::MAX` = no pins → the check is skipped entirely (byte-identical to
+        // the pre-pin behaviour, including windows with no time column).
+        let retention_ns = if over_budget {
+            self.retention_floor_ns()
+        } else {
+            i64::MAX
+        };
+        let pinned = retention_ns != i64::MAX;
         let mut evicted_bytes = 0usize;
         let mut evicted_rows = 0usize;
         {
@@ -620,6 +712,11 @@ impl Window {
                 // Unacked front batch: stop the sweep — never drop a batch a
                 // live consumer has not yet read.
                 if tb.seq >= ack_floor {
+                    break;
+                }
+                // Pinned rows: this batch may still hold rows a join-target
+                // reader needs. Exceed the budget rather than lose them.
+                if pinned && tb.event_time_range.1 >= retention_ns {
                     break;
                 }
                 // `BTreeMap::remove` returns the owned value: dropping it
@@ -659,13 +756,14 @@ impl Window {
             // frame exceeds the cap and is silently discarded. Log it so rules
             // that stop seeing events aren't a mystery.
             log::warn!(
-                "window `{}` dropped {} row(s) / {} bytes in memory eviction (max_window_bytes={} bytes, incoming batch = {} rows / {} bytes)",
+                "window `{}` dropped {} row(s) / {} bytes in memory eviction (max_window_bytes={} bytes, incoming batch = {} rows / {} bytes, retention_floor_ns={})",
                 self.name,
                 evicted_rows,
                 evicted_bytes,
                 max_bytes,
                 row_count,
                 byte_size,
+                retention_ns,
             );
         }
 

@@ -655,18 +655,27 @@ impl CepStateMachine {
         if is_new {
             self.push_expiry_candidate(&instance_key, window_start.unwrap_or(now_nanos));
         }
-        let mut instance = self.take_instance(&instance_key).unwrap_or_else(|| {
-            let created = window_start.unwrap_or(now_nanos);
-            let machine_id = Self::extract_event_str(event, MACHINE_ID);
-            let mut inst = Instance::new_at(&self.plan, machine_id, created);
-            inst.base_cost = new_base.unwrap_or(0);
-            inst
-        });
+        // A1（2026-08-24，hop 热路径）：entry 替代 take/put 往返——原实现每窗口
+        // contains_key + remove + insert 三次哈希操作（remove/insert 还破坏 HashMap
+        // 缓存局部性）；现在 contains_key（判 is_new，limits 检查需在 entry 前改
+        // map）+ 一次 entry。实例从不移出 map：各 early return 无需归还（借用
+        // 自动结束）。语义不变：Occupied 借用原实例，Vacant 构造并插入。
+        let tracks_memory = self.tracks_memory_bytes();
+        let instance = match self.instances.entry(instance_key.clone()) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let created = window_start.unwrap_or(now_nanos);
+                let machine_id = Self::extract_event_str(event, MACHINE_ID);
+                let mut inst = Instance::new_at(&self.plan, machine_id, created);
+                inst.base_cost = new_base.unwrap_or(0);
+                v.insert(inst)
+            }
+        };
         if is_new {
             // A freshly created instance enters the map here — account its base
             // cost once (the old insert_instance did it per put; put_instance is
             // net-zero and skips the mirror, so the admission must charge it).
-            if self.tracks_memory_bytes() {
+            if tracks_memory {
                 self.estimated_memory_bytes = self
                     .estimated_memory_bytes
                     .saturating_add(instance.base_cost);
@@ -694,17 +703,8 @@ impl CepStateMachine {
 
         // 2b. Chain semantics: negation scan + strict adjacency.
         let seq_broken = if let Some(meta) = self.seq_meta.as_ref() {
-            scan_negations(
-                meta,
-                &mut instance,
-                alias,
-                event,
-                now_nanos,
-                windows,
-                row,
-                masks,
-            );
-            consec_broken(meta, &instance, plan, alias)
+            scan_negations(meta, instance, alias, event, now_nanos, windows, row, masks);
+            consec_broken(meta, instance, plan, alias)
         } else {
             false
         };
@@ -716,7 +716,6 @@ impl CepStateMachine {
             instance.reset(plan, reset_at);
             instance.neg_violated = neg_violated;
             self.push_expiry_candidate(&instance_key, reset_at);
-            self.put_instance(instance_key, instance);
             return step_outcome(StepResult::Accumulate, None);
         }
 
@@ -823,12 +822,10 @@ impl CepStateMachine {
                                 instance.reset(plan, reset_at);
                                 self.push_expiry_candidate(&instance_key, reset_at);
                             }
-                            self.put_instance(instance_key, instance);
                             return step_outcome(StepResult::Accumulate, None);
                         }
                         ExceedAction::FailRule => {
                             fail_rule(&mut self.failed, &self.shared);
-                            self.put_instance(instance_key, instance);
                             return step_outcome(StepResult::Accumulate, None);
                         }
                     }
@@ -845,7 +842,7 @@ impl CepStateMachine {
                     event_first_time_nanos: evidence_first,
                     event_last_time_nanos: evidence_last,
                     window_start_time_nanos: instance.created_at,
-                    window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
+                    window_end_time_nanos: Self::expire_time_for(&plan.window_spec, instance),
                     machine_id: instance.machine_id.clone(),
                     // trigger_event 只在 score/entity/yield + join 左字段 + where
                     // 引用非 key 字段时需要（编译器 compute_trigger_event_needed）。
@@ -865,11 +862,9 @@ impl CepStateMachine {
                     instance.reset(plan, reset_at);
                     self.push_expiry_candidate(&instance_key, reset_at);
                 }
-                self.put_instance(instance_key, instance);
                 return step_outcome(StepResult::Matched(ctx), None);
             }
 
-            self.put_instance(instance_key, instance);
             return step_outcome(StepResult::Accumulate, None);
         }
 
@@ -1059,7 +1054,7 @@ impl CepStateMachine {
                     event_first_time_nanos: evidence_first,
                     event_last_time_nanos: evidence_last,
                     window_start_time_nanos: instance.created_at,
-                    window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
+                    window_end_time_nanos: Self::expire_time_for(&plan.window_spec, instance),
                     machine_id: instance.machine_id.clone(),
                     // trigger_event 只在 score/entity/yield + join 左字段 + where
                     // 引用非 key 字段时需要（编译器 compute_trigger_event_needed）。
@@ -1120,7 +1115,7 @@ impl CepStateMachine {
                     event_first_time_nanos: evidence_first,
                     event_last_time_nanos: evidence_last,
                     window_start_time_nanos: instance.created_at,
-                    window_end_time_nanos: Self::expire_time_for(&plan.window_spec, &instance),
+                    window_end_time_nanos: Self::expire_time_for(&plan.window_spec, instance),
                     machine_id: instance.machine_id.clone(),
                     // trigger_event 只在 score/entity/yield + join 左字段 + where
                     // 引用非 key 字段时需要（编译器 compute_trigger_event_needed）。
@@ -1139,7 +1134,6 @@ impl CepStateMachine {
                 StepResult::Advance
             }
         };
-        self.put_instance(instance_key, instance);
         if let Some(progress) = &mut progress {
             progress.instances = self.instances.len();
         }

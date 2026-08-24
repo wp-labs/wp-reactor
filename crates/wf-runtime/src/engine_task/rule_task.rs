@@ -151,6 +151,64 @@ struct DeferredRuntime {
     watermark: i64,
     /// 驱动 join 索引（规则内第一个带 `emit at` 的 join；v1 单 deferred join）。
     join_idx: usize,
+    /// D4 保留 pin：向 join 目标窗口发布「本规则还可能需要的最早事件时间」，
+    /// 内存驱逐据此拒绝丢弃这些行（join 目标读者没有 pull 消费者槽位，
+    /// `min_acked` 保护不到它 —— q9/q4a 30M −62% 的根因）。`None` = 窗口未接
+    /// progress 表（单测窗口）或 join 目标不是 buffer 窗口（provider 静态表
+    /// 不驱逐，无需 pin）。
+    retention_pin: Option<Arc<std::sync::atomic::AtomicI64>>,
+}
+
+impl DeferredRuntime {
+    /// D4：把本规则的保留前沿发布到 join 目标窗口。
+    ///
+    /// 前沿 = 存活挂起实例的 `min(lo_ns)`——每个实例需要 `[lo_ns, hi_ns]` 内的
+    /// 右窗行，比最早的 `lo_ns` 更旧的行任何实例都用不到。无挂起（含 missed）时
+    /// 退回本规则 watermark：**这依赖驱动流事件时间单调**——未来挂起实例由更晚
+    /// 的驱动事件产生，其 `lo_ns` 不会早于 watermark。若驱动流乱序（多生产者
+    /// 交错摄入），乱序到达的实例会在评估时 miss 进 `missed`，把前沿拉回其
+    /// `lo_ns`（见下）——乱序深度大于首个 miss 之前的窗口期才可能丢行；
+    /// 实测（nexmark 30M 10 生产者）首 miss 极早发生，前沿随即被拉低，无丢失。
+    ///
+    /// ⚠ watermark 尚未初始化（`i64::MIN`，还没见过驱动事件）时**就发布
+    /// `i64::MIN` = 全保留**：此时本规则还不知道自己的前沿，不能放行。曾把它
+    /// 映射成 `i64::MAX`（“无所需”），结果启动时的定时扫描（1s 间隔）先于首批
+    /// 驱动事件触发，把刚预注册的 pin 立即释放 → q4 30M 仍丢 0.67% 输出
+    ///（2026-08-24 实测：驱逐告警里 `retention_floor_ns=i64::MAX`）。
+    ///
+    /// “驱动流始终无数据 → 永久 pin”不会无界增长：pin 只阻断**内存上限**驱逐，
+    /// `over` 的时间驱逐故意忽略 pin（见 `evict_expired`），所以保留量的上界仍是
+    /// `over`。EOS 时另有 `release_retention_floor` 显式释放。
+    ///
+    /// `missed`（到期 miss、EOS 重试）**也计入前沿**：它们 miss 的原因是 join 目标
+    /// append 滞后（需要的行还没到），那些行稍后才落地，必须活到 EOS 重试那一刻。
+    /// 曾把 `missed` 排除在外（“pin 住更旧的行救不了它”），q4 30M 因此仍丢 0.67%
+    /// 输出（1,661,399 vs 1,672,559）——q4a 比 q9 多一条 q4b 规则、任务更慢 → miss 更
+    /// 多 → 更依赖 EOS 重试，而那 5 次内存驱逐正好抽走了它们要重试的行（同次 q9
+    /// 同样 5 次驱逐却 identical，差别就在 miss 量）。
+    ///
+    /// 内存上界不变：`missed` 把前沿冻结在早期事件时间，但保留量仍由 `over` 的
+    /// 时间驱逐封顶（时间驱逐故意忽略 pin）。
+    fn publish_retention_floor(&self) {
+        let Some(pin) = &self.retention_pin else {
+            return;
+        };
+        let floor = self
+            .pending
+            .iter()
+            .chain(self.missed.iter())
+            .map(|p| p.lo_ns)
+            .min()
+            .unwrap_or(self.watermark);
+        pin.store(floor, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 释放 pin（EOS/关停）：窗口恢复完全可驱逐。
+    fn release_retention_floor(&self) {
+        if let Some(pin) = &self.retention_pin {
+            pin.store(i64::MAX, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 /// Current wall-clock epoch nanos.
@@ -320,6 +378,9 @@ pub(super) struct RuleTask {
     each_direct: bool,
     /// P3：deferred join（`emit at`）挂起队列与到期调度（无 `emit at` 时 `None`）。
     deferred: Option<DeferredRuntime>,
+    /// D4 扩展：snapshot/asof join 目标窗口的保留 pin（全保留，见构造处注释）。
+    /// 任务存活期间持有强引用；drop 时自动释放（Weak 死 → 窗口恢复可驱逐）。
+    snapshot_pins: Vec<Arc<AtomicI64>>,
 }
 
 impl Drop for RuleTask {
@@ -404,12 +465,50 @@ impl RuleTask {
             .joins
             .iter()
             .position(|j| j.emit_at.is_some())
-            .map(|join_idx| DeferredRuntime {
-                pending: Vec::new(),
-                missed: Vec::new(),
-                watermark: i64::MIN,
-                join_idx,
+            .map(|join_idx| {
+                // D4：在 join 目标窗口取走保留 pin（spawn 阶段已同步预注册，避免与首批
+                // append 竞争；无预注册时当场注册一个）。deferred 规则不从右窗 pull
+                //（只做点查询）→ 无消费者槽位 → `min_acked` 对它报 u64::MAX（全部可
+                // 驱逐），字节上限一旦成为约束就会静默丢掉到期评估还要用的行
+                //（q9/q4a 30M −62%，2026-08-24）。pin 按自身评估前沿推进，见
+                // `publish_retention_floor`。
+                let retention_pin = router
+                    .registry()
+                    .get_window(&executor.plan().joins[join_idx].right_window)
+                    .and_then(|w| w.take_retention_pin());
+                DeferredRuntime {
+                    pending: Vec::new(),
+                    missed: Vec::new(),
+                    watermark: i64::MIN,
+                    join_idx,
+                    retention_pin,
+                }
             });
+        // D4 扩展（2026-08-24）：snapshot/asof join 目标窗口同样持有保留 pin。
+        // snapshot 语义 = join 时刻的完整状态，驱动事件可引用**任意老**的实体行
+        // （q3 join person / q6·q20 join auction）——无法像 deferred 那样按
+        // `min(lo_ns)` 精确化前沿，只能全保留（`i64::MIN`）直到任务结束（Arc drop
+        // → Weak 死 → 自动释放）。实体表目标（person/auction @30M 全量 ~470MB）内存
+        // 代价可忽略，且由 `over` 时间驱逐封顶；这正是「2GB 字节上限恰好够大」
+        // 背后的预算兵役的引擎化——上限收紧或数据变大时不再静默丢输出。
+        let snapshot_pins: Vec<Arc<AtomicI64>> = executor
+            .plan()
+            .joins
+            .iter()
+            .filter(|j| {
+                j.emit_at.is_none()
+                    && matches!(
+                        j.mode,
+                        wf_lang::ast::JoinMode::Snapshot | wf_lang::ast::JoinMode::Asof { .. }
+                    )
+            })
+            .filter_map(|j| {
+                router
+                    .registry()
+                    .get_window(&j.right_window)
+                    .and_then(|w| w.take_retention_pin())
+            })
+            .collect();
 
         let task = Self {
             task_id,
@@ -452,6 +551,7 @@ impl RuleTask {
             pipe_state: std::sync::Mutex::new(PipeState::Uninit),
             each_direct,
             deferred,
+            snapshot_pins,
         };
         (task, cancel, timeout_scan_interval)
     }
@@ -1557,6 +1657,11 @@ impl RuleTask {
             && let Some(wm) = self.deferred.as_ref().map(|d| d.watermark)
         {
             self.scan_deferred(wm, batch_emit_nanos).await;
+            // D4：到期实例已退场 → 把新的保留前沿发布给 join 目标窗口（批次
+            // 级，不在行循环里）。扫描后发布：前沿尽可能向前，窗口尽早释放。
+            if let Some(d) = self.deferred.as_ref() {
+                d.publish_retention_floor();
+            }
         }
         if debug_enabled {
             let instances_after = self.instance_count();
@@ -1963,6 +2068,12 @@ impl RuleTask {
             if wm > i64::MIN {
                 self.scan_deferred(wm, wall_nanos() as i64).await;
             }
+            // D4：空闲/超时扫描也发布保留前沿（到期实例可能已在此退场）。
+            // 注：尚未见过驱动事件时这里会发布 i64::MIN（全保留），而不是释放——
+            // 参见 `publish_retention_floor` 的 ⚠ 注释。
+            if let Some(d) = self.deferred.as_ref() {
+                d.publish_retention_floor();
+            }
             return;
         }
         let Some(machine) = &self.machine else {
@@ -2137,17 +2248,25 @@ impl RuleTask {
 
     /// Close all active instances (shutdown flush) and emit alerts.
     pub(super) async fn flush(&mut self) {
-        // P3：deferred join 规则——EOS/关闭时触发剩余**已到期**挂起实例
+        // P3：deferred join 规则——EOS/关闭时触发剩余挂起实例
         // （reason=deferred）。按最终事件时间 watermark 到期扫描（与 oracle 一致）：
-        // 尾部 expiry > 最终 watermark 的实例窗口未完成（事件时间域），不输出——
+        // 尾部 expiry > 最终事件时间的实例窗口未完成（事件时间域），不输出——
         // 用 i64::MAX 强评会多出尾部桶（Q8 实证：82446 → 83274，+828 条，
         // oracle/mod.rs EOS 水位扫注释同源）。missed（到期时 join 目标 append
         // 滞后）在窗口完整后重试一次，仍 miss 为真 miss。
+        //
+        // 2026-08-24 q4/q9 分片后：worker 自身 watermark 停在**最后批次**的事件
+        // 时间（其他 worker 拿到更晚批次）→ 只用自身 watermark 会漏掉
+        // expiry ≤ 数据末尾的 pending（q4 30M 丢 869 条实测）。改用**驱动窗口
+        // 的全局最终事件时间**（共享窗口 max_event_time = true global data
+        // tail）——与单 worker 的最终 watermark 同语义：expiry ≤ 末尾全评估，
+        // > 末尾不输出。
         if self.machine.is_none() && self.deferred.is_some() {
             let final_wm = self
-                .deferred
-                .as_ref()
-                .map(|d| d.watermark)
+                .sources
+                .iter()
+                .map(|s| s.window.max_event_time_nanos())
+                .max()
                 .unwrap_or(i64::MIN);
             if final_wm > i64::MIN {
                 self.scan_deferred(final_wm, wall_nanos() as i64).await;
@@ -2156,6 +2275,11 @@ impl RuleTask {
             // 的 miss 实例——EOS 后所有数据已 ingest、目标窗口完整，重试命中
             // （真 miss 重试后仍不输出）。oracle 预加载完整窗口即此理想值。
             self.reevaluate_deferred_missed().await;
+            // D4：EOS 后本规则不再需要右窗任何行 → 释放保留 pin（窗口恢复完全
+            // 可驱逐，关停阶段不再顶着字节预算）。
+            if let Some(d) = self.deferred.as_ref() {
+                d.release_retention_floor();
+            }
             self.flush_alerts().await;
             self.flush_pipes().await;
             return;
@@ -3929,6 +4053,96 @@ fn precompute_join_then_keys(
     windows: &impl wf_engine::match_engine::WindowLookup,
 ) -> Vec<Option<Vec<wf_engine::match_engine::Value>>> {
     wf_engine::match_engine::precompute_join_then_keys(batch, row_domain, kjp, windows)
+}
+
+#[cfg(test)]
+mod retention_pin_tests {
+    use super::*;
+
+    fn pending(lo_ns: i64) -> DeferredPending {
+        DeferredPending {
+            key_field: "auction".into(),
+            key: wf_engine::match_engine::Value::Number(1.0),
+            lo_ns,
+            hi_ns: lo_ns + 1_000_000_000,
+            lo_open: false,
+            hi_open: false,
+            expiry_nanos: lo_ns + 1_000_000_000,
+            left: wf_engine::match_engine::Event {
+                fields: Default::default(),
+            },
+        }
+    }
+
+    fn runtime(pin: &Arc<AtomicI64>) -> DeferredRuntime {
+        DeferredRuntime {
+            pending: Vec::new(),
+            missed: Vec::new(),
+            watermark: i64::MIN,
+            join_idx: 0,
+            retention_pin: Some(Arc::clone(pin)),
+        }
+    }
+
+    /// 未见过驱动事件时必须发布 `i64::MIN`（全保留），**不能**发布 `i64::MAX`。
+    ///
+    /// 回归防网：曾把“watermark 未初始化”映射成“无所需”，启动时的定时扫描（1s
+    /// 间隔）先于首批驱动事件触发，把刚预注册的 pin 立即释放 → q4 30M 丢 0.67%
+    /// 输出（2026-08-24）。
+    #[test]
+    fn uninitialized_watermark_publishes_fully_pinned() {
+        let pin = Arc::new(AtomicI64::new(i64::MIN));
+        let rt = runtime(&pin);
+        rt.publish_retention_floor();
+        assert_eq!(
+            pin.load(Ordering::Acquire),
+            i64::MIN,
+            "还没见过驱动事件 → 不知道自己的前沿 → 必须全保留"
+        );
+    }
+
+    /// 无挂起且 watermark 已推进 → 前沿 = watermark（更旧的行未来实例也用不到）。
+    #[test]
+    fn empty_pending_publishes_watermark() {
+        let pin = Arc::new(AtomicI64::new(i64::MIN));
+        let mut rt = runtime(&pin);
+        rt.watermark = 5_000;
+        rt.publish_retention_floor();
+        assert_eq!(pin.load(Ordering::Acquire), 5_000);
+    }
+
+    /// 前沿 = `pending ∪ missed` 的 `min(lo_ns)`。
+    ///
+    /// 回归防网：曾将 `missed`（EOS 重试）排除在外，它们要重试的右窗行被内存
+    /// 驱逐抽走 → q4 30M 丢 0.67% 输出（1,661,399 vs 1,672,559，2026-08-24）。
+    #[test]
+    fn floor_covers_both_pending_and_missed() {
+        let pin = Arc::new(AtomicI64::new(i64::MIN));
+        let mut rt = runtime(&pin);
+        rt.watermark = 9_000;
+        rt.pending = vec![pending(7_000), pending(8_000)];
+        rt.missed = vec![pending(3_000)];
+        rt.publish_retention_floor();
+        assert_eq!(
+            pin.load(Ordering::Acquire),
+            3_000,
+            "missed 实例的 lo_ns 必须参与前沿（它们在 EOS 还要重试）"
+        );
+
+        // 没有 missed 时回到 pending 的最小 lo_ns。
+        rt.missed.clear();
+        rt.publish_retention_floor();
+        assert_eq!(pin.load(Ordering::Acquire), 7_000);
+    }
+
+    /// EOS 释放 → `i64::MAX`（窗口恢复完全可驱逐）。
+    #[test]
+    fn release_unpins_the_window() {
+        let pin = Arc::new(AtomicI64::new(1_234));
+        let rt = runtime(&pin);
+        rt.release_retention_floor();
+        assert_eq!(pin.load(Ordering::Acquire), i64::MAX);
+    }
 }
 
 #[cfg(test)]

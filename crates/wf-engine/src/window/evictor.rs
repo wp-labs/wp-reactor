@@ -172,7 +172,13 @@ impl Evictor {
                     .progress(name)
                     .map(|p| p.min_acked())
                     .unwrap_or(u64::MAX);
-                if win.oldest_seq().is_some_and(|s| s < floor) {
+                // D4: a window whose front batch is held by a retention pin is
+                // not a reclaim candidate (its rows may still be needed by a
+                // deferred join's pending evaluations). Including it would make
+                // `evict_oldest_acked` return `None` and the sweep would stop
+                // without signalling `memory_pressure`, letting the engine
+                // append past the global cap unchecked.
+                if win.oldest_seq().is_some_and(|s| s < floor) && !win.front_pinned_by_retention() {
                     let mem = win.memory_usage();
                     if mem > target_mem {
                         target_mem = mem;
@@ -193,7 +199,15 @@ impl Evictor {
                             total = total.saturating_sub(reclaimed);
                             report.batches_memory_evicted += 1;
                         }
-                        None => break,
+                        // Defensive: the candidate check should have excluded
+                        // unacked / pinned fronts. If it still returns `None`
+                        // (window raced to empty, or a pin landed between the
+                        // scan and the call), treat it as memory pressure —
+                        // never silently continue appending over the cap.
+                        None => {
+                            report.memory_pressure = true;
+                            break;
+                        }
                     }
                 }
                 None => {
@@ -949,5 +963,132 @@ mod tests {
             n,
             "memory eviction must not drop batches a registered consumer has not acked"
         );
+    }
+
+    // -- 10. D4: evictor_global_memory_cap_pinned_window_signals_pressure ------
+
+    /// D4 review regression (2026-08-24): the global evictor's candidate scan
+    /// checked only the ack floor, so a window whose front batch is held by a
+    /// **retention pin** was still selected; `evict_oldest_acked` then returned
+    /// `None` and the old code silently `break` — over the cap with nothing
+    /// reclaimed and **no `memory_pressure`**, the engine would keep appending
+    /// unchecked (OOM risk). A pinned window must be excluded from candidates;
+    /// when nothing is reclaimable the sweep must report pressure.
+    #[test]
+    fn evictor_global_memory_cap_pinned_window_signals_pressure() {
+        let schema = test_schema();
+        let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+        let one_batch_size = content_bytes(&probe);
+
+        let reg = WindowRegistry::build(vec![WindowDef {
+            params: WindowParams {
+                name: "win_a".into(),
+                schema: schema.clone(),
+                time_col_index: Some(0),
+                over: Duration::from_secs(3600),
+                materialize_fields: None,
+                defer_materialization: false,
+            },
+            streams: vec![],
+            config: test_config(),
+        }])
+        .unwrap();
+
+        // 3 batches, cap at 2 → over budget, front batch pinned at 1s.
+        for ts in [1_000_000_000, 2_000_000_000, 3_000_000_000] {
+            reg.get_window("win_a")
+                .unwrap()
+                .append(make_batch(&schema, &[ts], &[100]))
+                .unwrap();
+        }
+        let pin = reg
+            .get_window("win_a")
+            .unwrap()
+            .register_retention_pin()
+            .expect("registry windows are wired to progress");
+        pin.store(1_000_000_000, Ordering::Release);
+
+        let evictor = Evictor::new(Arc::new(EvictionGate::new(one_batch_size * 2)));
+        let report = evictor.run_once(&reg, 0);
+
+        assert_eq!(
+            report.batches_memory_evicted, 0,
+            "pinned front batch must not be memory-evicted"
+        );
+        assert!(
+            report.memory_pressure,
+            "over the global cap with only a pinned window reclaimable → must signal backpressure"
+        );
+        assert_eq!(reg.get_window("win_a").unwrap().batch_count(), 3);
+
+        // Pin released (EOS): the same sweep now reclaims down to the cap.
+        pin.store(i64::MAX, Ordering::Release);
+        let report = evictor.run_once(&reg, 0);
+        assert_eq!(report.batches_memory_evicted, 1);
+        assert!(!report.memory_pressure);
+    }
+
+    // -- 11. D4: evictor_global_memory_cap_skips_pinned_window -----------------
+
+    /// Pinned windows must be skipped as reclaim candidates **without** being
+    /// mistaken for global pressure while other windows are still reclaimable:
+    /// the sweep reclaims from the unpinned window and reports no pressure.
+    #[test]
+    fn evictor_global_memory_cap_skips_pinned_window() {
+        let schema = test_schema();
+        let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+        let one_batch_size = content_bytes(&probe);
+
+        let mut defs = vec![];
+        for name in ["pinned", "free"] {
+            defs.push(WindowDef {
+                params: WindowParams {
+                    name: name.into(),
+                    schema: schema.clone(),
+                    time_col_index: Some(0),
+                    over: Duration::from_secs(3600),
+                    materialize_fields: None,
+                    defer_materialization: false,
+                },
+                streams: vec![],
+                config: test_config(),
+            });
+        }
+        let reg = WindowRegistry::build(defs).unwrap();
+
+        // Both windows hold 3 batches; cap at 4 → need 2 reclaimed, all from
+        // the unpinned one.
+        for name in ["pinned", "free"] {
+            for ts in [1_000_000_000, 2_000_000_000, 3_000_000_000] {
+                reg.get_window(name)
+                    .unwrap()
+                    .append(make_batch(&schema, &[ts], &[100]))
+                    .unwrap();
+            }
+        }
+        let pin = reg
+            .get_window("pinned")
+            .unwrap()
+            .register_retention_pin()
+            .expect("wired");
+        pin.store(1_000_000_000, Ordering::Release);
+
+        let evictor = Evictor::new(Arc::new(EvictionGate::new(one_batch_size * 4)));
+        let report = evictor.run_once(&reg, 0);
+
+        assert_eq!(
+            report.batches_memory_evicted, 2,
+            "reclaim from the free window"
+        );
+        assert!(
+            !report.memory_pressure,
+            "reclaimable windows exist → no pressure despite a pinned window"
+        );
+        assert_eq!(
+            reg.get_window("pinned").unwrap().batch_count(),
+            3,
+            "pinned untouched"
+        );
+        assert_eq!(reg.get_window("free").unwrap().batch_count(), 1);
     }
 }

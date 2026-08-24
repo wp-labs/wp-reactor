@@ -350,6 +350,16 @@ pub(super) fn spawn_rule_tasks(
         .map(|v| v.eq_ignore_ascii_case("push"))
         .unwrap_or(false);
 
+    // 被 Match 状态机消费的 intermediate target（2026-08-24 q4 分片）：这些下游
+    // 对同 key 事件顺序敏感（保序），上游分片输出乱序会破坏语义 → 相关 target
+    // 的上游 each 规则保持单 worker。stats/on-each 下游聚合可交换，容忍乱序。
+    let match_consumed_targets: HashSet<String> = rules
+        .iter()
+        .filter(|r| matches!(r.kind, RunRuleKind::Match { .. }))
+        .flat_map(|r| r.executor.plan().binds.iter().map(|b| b.window.clone()))
+        .filter(|w| intermediate_targets.contains(w))
+        .collect();
+
     for rule in rules {
         // join 目标窗口接索引（2026-08 RSS/EPS 归因：生产此前未接线
         // `set_join_key` → join_lookup 每事件全量扫描 → q13 等 join 查询
@@ -371,6 +381,25 @@ pub(super) fn spawn_rule_tasks(
             // 无索引时 join_lookup 全表扫描（10000 行 × 每事件 → q13b 卡死）。
             if let Some(win) = router.registry().get_window(&join.right_window) {
                 win.set_join_key(key.to_string());
+                // D4：join 目标窗口在此**同步**预注册保留 pin（deferred `emit at` 与
+                // snapshot/asof 两类读者都要）。必须在这里（而不是任务 future 内）：
+                // `spawn_rule_tasks` 返回后立即 `spawn_receiver_task` 开始摄入，而
+                // 规则任务是 `tokio::spawn` 的，在 future 里注册会与首批 append 竞争
+                // ——q4 30M 因此非确定性丢 0~6% 输出（启动期 5 vs 48 次驱逐清扫，
+                // 2026-08-24）。
+                // - deferred（`emit at`）：需要 `[lo_ns, hi_ns]` 内的行直到到期评估，
+                //   按挂起集合推进前沿（见 `DeferredRuntime::publish_retention_floor`）；
+                // - snapshot/asof：语义 = join 时刻的完整状态，驱动事件可引用任意老
+                //   的实体行（q3 join person / q6·q20 join auction）——**无法按事件
+                //   时间精确化**，全保留（i64::MIN）直到任务结束，pin drop 自动释放。
+                if join.emit_at.is_some()
+                    || matches!(
+                        join.mode,
+                        wf_lang::ast::JoinMode::Snapshot | wf_lang::ast::JoinMode::Asof { .. }
+                    )
+                {
+                    win.preregister_retention_pin();
+                }
             } else if let Some(pw) = router.registry().get_provider(&join.right_window) {
                 pw.write()
                     .expect("provider window lock poisoned")
@@ -513,26 +542,30 @@ pub(super) fn spawn_rule_tasks(
                 let target = rule.executor.plan().yield_plan.target.clone();
                 // P3：deferred join（emit at）规则单 worker——挂起队列是 per-task 状态，
                 // 与 round-robin 分片冲突（设计 §9 风险 5）。
-                let deferred = rule
-                    .executor
-                    .plan()
-                    .joins
-                    .iter()
-                    .any(|j| j.emit_at.is_some());
+                // 2026-08-24 q4 放宽：§9 风险 5 的分片互斥实为 **join-then-key** 场景
+                // （路由键来自 join 侧，键在路由前不可得）；deferred 且路由键在驱动
+                // 事件上（`key_join.is_none()`）的规则可整批轮转分片——每 worker 独立
+                // 挂起队列/watermark，驱动事件整批分配（每个驱动事件恰一次 → 同
+                // worker，pending 无跨 worker 依赖），join 目标窗口共享（并发
+                // lookup）。到期输出跨 worker 乱序：仅当下游无 Match 状态机
+                // （stats/on-each 可交换聚合）时允许。q4a/q8/q9 均满足。
+                let plan = rule.executor.plan();
+                let deferred = plan.joins.iter().any(|j| j.emit_at.is_some());
+                let deferred_shardable = deferred
+                    && plan.match_plan.key_join.is_none()
+                    && !match_consumed_targets.contains(&target);
                 // 2026-08-23 q13：bind **中间管道窗口**（上游 yield 的中间窗口）的
                 // each 规则不分片——round-robin 分片 + 独立 pull 光标下，下游消费
                 // 滞后于 pipe append（shutdown 时只消化部分批次，q13b 10M 只处理
                 // ~40%、EMIT 不足）；单 worker 顺序消费保证全量。
-                let consumes_intermediate = rule
-                    .executor
-                    .plan()
+                let consumes_intermediate = plan
                     .binds
                     .iter()
                     .any(|b| intermediate_targets.contains(&b.window));
                 let shardable = shard_count > 1
-                    && !intermediate_targets.contains(&target)
-                    && !deferred
-                    && !consumes_intermediate;
+                    && !consumes_intermediate
+                    && (!intermediate_targets.contains(&target) || deferred_shardable)
+                    && (!deferred || deferred_shardable);
 
                 if shardable {
                     let mut shard_txs = Vec::with_capacity(shard_count);
@@ -633,10 +666,11 @@ pub(super) fn spawn_rule_tasks(
                 let conv_window = rule.executor.plan().conv_window.clone();
                 let yield_target = rule.executor.plan().yield_plan.target.clone();
                 // P2a + P2c: shard rules with a match key and no *inline* conv.
-                // A fixed-window conv rule with a generated conv window becomes
-                // shardable; sliding/session conv stays inline. Conv rules that
-                // yield to an intermediate pipe stay inline too (the conv stage
-                // emits final sink output only).
+                // A fixed/hop-window conv rule with a generated conv window becomes
+                // shardable（hop：桶对齐 slide、封口 size，2026-08-24）; sliding/
+                // session conv stays inline. Conv rules that yield to an
+                // intermediate pipe stay inline too (the conv stage emits final
+                // sink output only).
                 let has_inline_conv = conv_plan.is_some() && conv_window.is_none();
                 let conv_to_pipe =
                     conv_window.is_some() && intermediate_targets.contains(yield_target.as_str());
@@ -676,6 +710,8 @@ pub(super) fn spawn_rule_tasks(
                                 conv_plan: conv_plan.clone(),
                                 keys: Arc::clone(&keys),
                                 over: cw.over,
+                                // hop：桶对齐 = slide（封口长度仍 = over = size）。
+                                bucket_align: cw.slide.unwrap_or(cw.over),
                                 limits: limits.clone(),
                                 shared_limits: shared_limits.clone(),
                                 barrier: Arc::clone(&barrier),

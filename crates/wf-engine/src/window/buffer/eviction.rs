@@ -102,6 +102,27 @@ impl Window {
         Some(byte_size)
     }
 
+    /// Whether the oldest batch is currently held by a D4 retention pin (its
+    /// event-time range may contain rows a join-target reader still needs).
+    ///
+    /// The global evictor consults this **before** selecting a window for
+    /// memory reclaim: a pinned front batch would make `evict_oldest_acked`
+    /// return `None`, and silently breaking out of the sweep there (instead of
+    /// signalling memory pressure) would let the engine keep appending past the
+    /// global cap — the OOM risk D4's "exceed the budget rather than lose data"
+    /// contract is supposed to prevent (2026-08-24 review fix).
+    pub fn front_pinned_by_retention(&self) -> bool {
+        let retention_ns = self.retention_floor_ns();
+        if retention_ns == i64::MAX {
+            return false;
+        }
+        let log = self.log.read().expect("window log lock poisoned");
+        match log.first_key_value() {
+            Some((_, tb)) => tb.event_time_range.1 >= retention_ns,
+            None => false,
+        }
+    }
+
     /// Sequence number of the oldest (front) batch, or `None` if the window
     /// is empty. The evictor's memory-pressure phase uses this to decide
     /// whether the front batch is safe to drop (its `seq` is below the
@@ -122,11 +143,18 @@ impl Window {
     /// the q3 pull regression. With this variant the evictor can never lose
     /// unread pull data; when nothing is safe to drop it reports
     /// `memory_pressure` and the actor applies backpressure instead.
+    ///
+    /// D4: the same guarantee is extended to **join-target** readers, which own
+    /// no consumer slot — a batch at or after the window's retention frontier
+    /// ([`Window::retention_floor_ns`]) is kept too, so the global memory cap
+    /// cannot silently truncate a deferred join's input.
     pub fn evict_oldest_acked(&self, acked_floor: u64) -> Option<usize> {
+        let retention_ns = self.retention_floor_ns();
+        let pinned = retention_ns != i64::MAX;
         let mut log = self.log.write().expect("window log lock poisoned");
         let removable = {
             let (_, tb) = log.first_key_value()?;
-            tb.seq < acked_floor
+            tb.seq < acked_floor && !(pinned && tb.event_time_range.1 >= retention_ns)
         };
         if !removable {
             return None;

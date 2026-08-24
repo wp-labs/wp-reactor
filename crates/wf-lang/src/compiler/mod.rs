@@ -267,12 +267,18 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
     );
 
     let conv_plan = compile_conv(&rule.conv);
-    // P2c: fixed-window conv rules get an auto-generated conv aggregation
-    // window (shardable); sliding/session conv stays inline (not shardable).
+    // P2c: fixed / hop conv rules get an auto-generated conv aggregation window
+    // (shardable — 分片算 + conv stage 全局聚合); sliding/session conv stays
+    // inline (not shardable). 2026-08-24: hop 加入——桶对齐 = slide、封口长度
+    // = size（hop 实例在 window_start + size 收口，收口事件 window_start 为
+    // slide 对齐，conv stage 按 slide 分桶、按 size 封口）。
     let conv_window = conv_plan
         .as_ref()
         .and_then(|_| match match_plan.window_spec.clone() {
-            WindowSpec::Fixed(over) => Some(build_conv_window_plan(&match_plan, over)),
+            WindowSpec::Fixed(over) => Some(build_conv_window_plan(&match_plan, over, None)),
+            WindowSpec::Hop { size, slide } => {
+                Some(build_conv_window_plan(&match_plan, size, Some(slide)))
+            }
             _ => None,
         });
 
@@ -318,9 +324,14 @@ fn compile_regular_rule(rule: &RuleDecl, file: &WflFile, schemas: &[WindowSchema
 /// Only `over` and `keys` are consumed at runtime (the conv stage buckets by
 /// `over`); there is no materialized aggregation window, so no window schema
 /// fields are derived here (P3-A).
-fn build_conv_window_plan(match_plan: &MatchPlan, over: Duration) -> ConvWindowPlan {
+fn build_conv_window_plan(
+    match_plan: &MatchPlan,
+    over: Duration,
+    slide: Option<Duration>,
+) -> ConvWindowPlan {
     ConvWindowPlan {
         over,
+        slide,
         keys: match_plan.keys.clone(),
     }
 }

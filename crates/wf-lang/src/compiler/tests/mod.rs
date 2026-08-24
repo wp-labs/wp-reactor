@@ -475,7 +475,62 @@ rule r {
     // P3-A: only `over` (bucket length) and `keys` are carried — no window
     // schema / step-labels dead fields.
     assert_eq!(cw.over, Duration::from_secs(3600));
+    assert_eq!(cw.slide, None, "fixed: 桶对齐 = over");
     assert_eq!(cw.keys, plans[0].match_plan.keys);
+}
+
+/// hop conv 规则（P2c 延伸，2026-08-24）：生成 conv_window——`over` = size
+///（封口长度）、`slide` = Some(slide)（桶对齐）。q5 = hop(10s, 2s)。
+#[test]
+fn hop_conv_rule_generates_conv_window() {
+    let plans = compile_with(
+        r#"
+rule r {
+    events { e : auth_events }
+    match<sip:hop(10s, 2s)> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    conv { sort(-count) | top(10) ; }
+}
+"#,
+        &[auth_events_window(), output_window()],
+    );
+    let cw = plans[0]
+        .conv_window
+        .as_ref()
+        .expect("hop conv rule should generate a conv window");
+    assert_eq!(cw.over, Duration::from_secs(10), "hop: 封口长度 = size");
+    assert_eq!(
+        cw.slide,
+        Some(Duration::from_secs(2)),
+        "hop: 桶对齐 = slide"
+    );
+    assert_eq!(cw.keys, plans[0].match_plan.keys);
+}
+
+/// sliding + conv 被 checker 拒绝（`conv block requires fixed or hop window
+/// mode`）——sliding 无固定对齐边界，conv 无法成批，行为保持（2026-08-24 补测）。
+#[test]
+fn sliding_conv_rule_rejected_by_checker() {
+    let file = parse_wfl(
+        r#"
+rule r {
+    events { e : auth_events }
+    match<sip:1h> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    conv { sort(-count) | top(10) ; }
+}
+"#,
+    )
+    .expect("parse should succeed");
+    let err = compile_wfl(&file, &[auth_events_window(), output_window()])
+        .expect_err("sliding conv 必须被 checker 拒绝（无固定批边界）");
+    let detail = format!("{err}");
+    assert!(
+        detail.contains("conv block requires fixed or hop window mode"),
+        "错误信息应指明窗口形态限制, got {detail}"
+    );
 }
 
 #[test]

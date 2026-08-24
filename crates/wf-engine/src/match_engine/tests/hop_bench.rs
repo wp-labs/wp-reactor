@@ -15,18 +15,22 @@
 //!   top_ties_vs_top      : Q5/Q7 收口批（10k CloseOutput）sort+top(1) vs
 //!                          sort+top_ties(1)，有/无并列两种分布
 //!
-//! 2026-08-23 基线（Apple M3 Max，release，N=200k 事件、100µs/事件）：
-//!   hop_vs_fixed_advance : hop(10,2)=942 ns/evt（1.06M eps）| hop(10,10)=218
-//!     ns/evt（4.58M eps）| fixed(10)=195 ns/evt（5.13M eps）。
-//!     → 每窗口成本 (942−218)/4 ≈ 181 ns/window；5 窗口放大 4.8×（理论 5×，
-//!       语义内成本——Q5 权威即每事件 5 窗口计数）；hop(10,10)≈fixed（+12%）
+//! 2026-08-24 优化后基线（Apple M3 Max，release，N=200k 事件、100µs/事件）：
+//!   hop_vs_fixed_advance : hop(10,2)=831 ns/evt（1.20M eps）| hop(10,10)=247
+//!     ns/evt（4.05M eps）| fixed(10)=220 ns/evt（4.55M eps）。
+//!     → 每窗口成本 146 ns/window（(831−247)/4）；hop(10,10)≈fixed（+12%）
 //!       验证单窗口路径无额外开销。
-//!   hop_scan_cost        : 1026 ns/evt（含 advance + slide 边界扫描），
+//!   hop_scan_cost        : 873 ns/evt（含 advance + slide 边界扫描），
 //!     200k 事件收口 18k 窗口，扫描摊还成本可忽略。
-//!   top_ties_vs_top      : 无并列 +36%、高并列 +51%；tie_every 扫描
-//!     +45~52%（并列块大小影响小）。增量主要来自 top_ties 对批内每条目
-//!     重新预提取排序键值（eval_expr）——sort 已算过一遍、op 间无状态
-//!     共享 → 双倍 eval。优化方向：chain 内 sort→top_ties 共享 key_rows。
+//!   top_ties_vs_top      : 无并列 +0%、高并列 +2%（2026-08-24 优化后：
+//!     `apply_chain` 对 `sort | top_ties` 相邻对共享一次 key 预提取，双倍 eval
+//!     消除——此前 +46~55%）。
+//!
+//! 2026-08-23 基线（改前，存档）：hop(10,2)=942 ns/evt（1.06M eps）；每窗口
+//!   成本 ≈ 181 ns/window；top_ties 增量 +36~52%（双倍 eval key）。
+//! 2026-08-24 优化：① `advance_window` 实例取用改 entry（contains+remove+insert
+//!   三次哈希 → contains+entry 两次，remove/insert 不再破坏 HashMap 缓存局部性），
+//!   每窗口成本 172→146 ns（−15%）；② conv `sort | top_ties` 合并共享 key_rows。
 
 use std::time::Instant;
 
