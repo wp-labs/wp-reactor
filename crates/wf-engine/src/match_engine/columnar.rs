@@ -284,6 +284,33 @@ fn col_ref_from_array(col: &dyn Array) -> ColRef<'_> {
     }
 }
 
+/// The string-search operation of a [`ColumnExpr::StrFunc`] node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrFuncOp {
+    Contains,
+    StartsWith,
+    EndsWith,
+}
+
+impl StrFuncOp {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "contains" => Some(StrFuncOp::Contains),
+            "startswith" => Some(StrFuncOp::StartsWith),
+            "endswith" => Some(StrFuncOp::EndsWith),
+            _ => None,
+        }
+    }
+}
+
+/// The second operand of a [`ColumnExpr::StrFunc`] node: a shared literal
+/// needle (the gate admits `StringLit`) or a per-row string column (a flat
+/// field ref).
+enum Needle<'a> {
+    Lit(SmolStr),
+    Col(ColRef<'a>),
+}
+
 /// A precompiled columnar expression tree: field refs are resolved once to
 /// [`ColRef`]s, so the per-row hot loop reads native columns directly with no
 /// `HashMap` lookup or per-row downcast.
@@ -330,6 +357,15 @@ enum ColumnExpr<'a> {
     RegexMatch {
         col: ColRef<'a>,
         re: regex::Regex,
+    },
+    /// `contains` / `startswith` / `endswith` — lowered natively over two
+    /// string operands. The haystack is always a flat field (string column);
+    /// the needle is a shared literal or a second string column. Non-Utf8 /
+    /// null cells read null, mirroring the interpreted `Value::Str`-only path.
+    StrFunc {
+        op: StrFuncOp,
+        hay: ColRef<'a>,
+        needle: Needle<'a>,
     },
 }
 
@@ -452,6 +488,31 @@ fn compile_expr<'a>(expr: &Expr, view: &'a ColumnarBatch<'a>) -> Option<ColumnEx
                 })
             }
         }
+        // `contains` / `startswith` / `endswith` — the gate admits a flat-field
+        // haystack and a literal-or-flat-field needle. The literal needle is
+        // shared across the row loop; a field needle resolves to its column.
+        Expr::FuncCall {
+            qualifier: None,
+            name,
+            args,
+        } if args.len() == 2 && StrFuncOp::from_name(name).is_some() => {
+            let Expr::Field(hay_field) = &args[0] else {
+                return None;
+            };
+            let op = StrFuncOp::from_name(name).unwrap();
+            let hay = view.resolve_field(hay_field);
+            let needle = match &args[1] {
+                Expr::StringLit(s) => Needle::Lit(s.clone().into()),
+                Expr::Field(FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)) => {
+                    let Expr::Field(f) = &args[1] else {
+                        unreachable!("shape matched above");
+                    };
+                    Needle::Col(view.resolve_field(f))
+                }
+                _ => return None,
+            };
+            Some(ColumnExpr::StrFunc { op, hay, needle })
+        }
         _ => None,
     }
 }
@@ -542,6 +603,9 @@ impl ColumnExpr<'_> {
             }
             ColumnExpr::CidrMatch { col, net } => cidr_vec(col, net, n),
             ColumnExpr::RegexMatch { col, re } => regex_vec(col, re, n),
+            ColumnExpr::StrFunc { op, hay, needle } => {
+                strfunc_vec(*op, hay, needle, n)
+            }
         }
     }
 }
@@ -636,6 +700,37 @@ fn regex_vec(col: &ColRef<'_>, re: &regex::Regex, n: usize) -> CVec {
         ColRef::Utf8(a) => CVec::Bool(
             (0..n)
                 .map(|r| (!a.is_null(r)).then(|| re.is_match(a.value(r))))
+                .collect(),
+        ),
+        _ => CVec::Bool(vec![None; n]),
+    }
+}
+
+/// Vectorized `contains` / `startswith` / `endswith` over string columns.
+/// Mirrors the interpreted path: both operands must be `Value::Str` (a `Utf8`
+/// column); null on either side reads null; non-Utf8 columns read all-null.
+/// A literal needle is shared across the row loop (no per-row clone).
+fn strfunc_vec(op: StrFuncOp, hay: &ColRef<'_>, needle: &Needle<'_>, n: usize) -> CVec {
+    let apply = |h: &str, nd: &str| match op {
+        StrFuncOp::Contains => h.contains(nd),
+        StrFuncOp::StartsWith => h.starts_with(nd),
+        StrFuncOp::EndsWith => h.ends_with(nd),
+    };
+    match (hay, needle) {
+        (ColRef::Utf8(h), Needle::Lit(nd)) => CVec::Bool(
+            (0..n)
+                .map(|r| (!h.is_null(r)).then(|| apply(h.value(r), nd)))
+                .collect(),
+        ),
+        (ColRef::Utf8(h), Needle::Col(ColRef::Utf8(nc))) => CVec::Bool(
+            (0..n)
+                .map(|r| {
+                    if h.is_null(r) || nc.is_null(r) {
+                        None
+                    } else {
+                        Some(apply(h.value(r), nc.value(r)))
+                    }
+                })
                 .collect(),
         ),
         _ => CVec::Bool(vec![None; n]),
@@ -1952,5 +2047,96 @@ mod tests {
         // 非字面量 pattern → 非列式（回落解释器）。
         let dyn_pat = rm(field("pat"));
         assert!(!wf_lang::columnar::expr_is_columnar(&dyn_pat));
+    }
+
+    /// `action` + `pattern` 双 Utf8 列 + `count` Int64 列 —— contains / startswith
+    /// / endswith 的两种 needle 形态（字面量 / 字段）都覆盖。
+    fn str_batch(
+        action: Vec<Option<&str>>,
+        pattern: Vec<Option<&str>>,
+        count: Vec<Option<i64>>,
+    ) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("action", DataType::Utf8, true),
+            Field::new("pattern", DataType::Utf8, true),
+            Field::new("count", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(action)) as ArrayRef,
+                Arc::new(StringArray::from(pattern)) as ArrayRef,
+                Arc::new(Int64Array::from(count)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn str_func_call(name: &str, hay: Expr, needle: Expr) -> Expr {
+        Expr::FuncCall {
+            qualifier: None,
+            name: name.into(),
+            args: vec![hay, needle],
+        }
+    }
+
+    #[test]
+    fn str_search_matches_interpreted_literal_and_field_needle() {
+        let batch = str_batch(
+            vec![
+                Some("failed_login"), // 含 "fail"、以 "fail" 开头、以 "login" 结尾
+                Some("login_fail"),   // 含 "fail"、不以 "fail" 开头、以 "fail" 结尾
+                Some("success"),      // 都不命中
+                None,                 // null
+                Some("FAILED"),       // 大小写敏感 → 不命中
+            ],
+            vec![Some("fail"), Some("login"), Some("fail"), Some("fail"), None],
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
+        );
+        // 字面量 needle。
+        for (name, expected) in [
+            ("contains", vec![true, true, false, false, false]),
+            ("startswith", vec![true, false, false, false, false]),
+            ("endswith", vec![false, true, false, false, false]),
+        ] {
+            let expr = str_func_call(name, field("action"), Expr::StringLit("fail".into()));
+            assert!(
+                wf_lang::columnar::expr_is_columnar(&expr),
+                "{name} 字面量形态应列式"
+            );
+            let mask = {
+                let view = ColumnarBatch::from_all_fields(&batch);
+                eval_guard_columnar(&expr, &view)
+            };
+            for (row, want) in expected.iter().enumerate() {
+                assert_eq!(mask.value(row), *want, "{name} row {row}");
+            }
+            assert_equiv(&expr, &batch);
+        }
+
+        // 字段 needle（pattern 列）：null pattern 行 → null → false。
+        let expr = str_func_call("contains", field("action"), field("pattern"));
+        assert!(wf_lang::columnar::expr_is_columnar(&expr));
+        assert_equiv(&expr, &batch);
+        let sw = str_func_call("startswith", field("action"), field("pattern"));
+        assert!(wf_lang::columnar::expr_is_columnar(&sw));
+        assert_equiv(&sw, &batch);
+        let ew = str_func_call("endswith", field("action"), field("pattern"));
+        assert!(wf_lang::columnar::expr_is_columnar(&ew));
+        assert_equiv(&ew, &batch);
+
+        // 组合：contains(..., "fail") && count > 1 → 整体列式且逐位一致。
+        let combo = bin(
+            BinOp::And,
+            str_func_call("contains", field("action"), Expr::StringLit("fail".into())),
+            bin(BinOp::Gt, field("count"), num(1.0)),
+        );
+        assert!(wf_lang::columnar::expr_is_columnar(&combo));
+        assert_equiv(&combo, &batch);
+
+        // 空 needle 语义与解释一致（starts_with("") == true）。
+        let empty = str_func_call("contains", field("action"), Expr::StringLit(String::new()));
+        assert!(wf_lang::columnar::expr_is_columnar(&empty));
+        assert_equiv(&empty, &batch);
     }
 }

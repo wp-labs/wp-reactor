@@ -7,7 +7,9 @@
 //! to the interpreted evaluator.
 //!
 //! Anything requiring meta context (`SystemVar` / `WfuMeta` / `PresetParam`),
-//! a function call other than the natively-lowered `cidr_match(field, "cidr")`,
+//! a function call other than the natively-lowered string/IP predicates
+//! (`cidr_match(field, "cidr")`, `regex_match(field, "pattern")`, `contains` /
+//! `startswith` / `endswith` with a flat-field or literal second operand),
 //! a window lookup (those expressions never reach here — they
 //! are structurally rejected by `FuncCall`), structured literals, or nested
 //! object traversal falls back to the interpreted path.
@@ -60,6 +62,36 @@ pub fn expr_is_columnar(expr: &Expr) -> bool {
         } if args.len() == 2 && (name == "cidr_match" || name == "regex_match") => {
             matches!(args[0], Expr::Field(FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)))
                 && matches!(&args[1], Expr::StringLit(_))
+        }
+
+        // `contains` / `startswith` / `endswith` — the string-search functions
+        // the columnar evaluator lowers natively. Unlike `cidr_match` /
+        // `regex_match`, the second operand is **not** forced to a literal: it
+        // may be a flat field, so both `func(field, "lit")` and
+        // `func(field, field2)` compile to column reads (a literal needle is
+        // shared across the row loop). Other second-operand shapes (functions,
+        // nested paths, non-field literals) fall back to interpreted.
+        Expr::FuncCall {
+            qualifier: None,
+            name,
+            args,
+        } if args.len() == 2
+            && matches!(name.as_str(), "contains" | "startswith" | "endswith") =>
+        {
+            let hay_is_flat_field = matches!(
+                &args[0],
+                Expr::Field(
+                    FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
+                )
+            );
+            let needle_is_flat = matches!(
+                &args[1],
+                Expr::StringLit(_)
+                    | Expr::Field(
+                        FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
+                    )
+            );
+            hay_is_flat_field && needle_is_flat
         }
 
         // Everything else needs meta / function / window / structured handling.
@@ -392,6 +424,55 @@ mod tests {
             func("contains"),
         );
         assert!(!expr_is_columnar(&mixed));
+    }
+
+    #[test]
+    fn str_search_funcs_are_columnar_with_literal_or_field_needle() {
+        let call = |name: &str, args: Vec<Expr>| Expr::FuncCall {
+            qualifier: None,
+            name: name.to_string(),
+            args,
+        };
+        let lit_nd = Expr::StringLit("fail".into());
+        for name in ["contains", "startswith", "endswith"] {
+            // func(field, "literal") → 列式。
+            assert!(expr_is_columnar(&call(name, vec![field("action"), lit_nd.clone()])), "{name} lit");
+            // func(field, field2) → 列式（needle 为字段）。
+            assert!(expr_is_columnar(&call(name, vec![field("action"), field("pat")])), "{name} field");
+            assert!(expr_is_columnar(&call(
+                name,
+                vec![qualified("e", "action"), lit_nd.clone()]
+            )), "{name} qualified");
+            // func(literal, field) → 首参非字段 → 回落。
+            assert!(!expr_is_columnar(&call(name, vec![lit_nd.clone(), field("pat")])));
+            // func(field, func(...)) → 次参非字段/字面量 → 回落。
+            assert!(!expr_is_columnar(&call(name, vec![field("action"), func("lower")])));
+            // 嵌套路径首参 → 回落。
+            assert!(!expr_is_columnar(&call(name, vec![nested_path(), lit_nd.clone()])));
+            // 参数个数不符 → 回落。
+            assert!(!expr_is_columnar(&call(name, vec![field("action")])));
+        }
+    }
+
+    #[test]
+    fn str_search_funcs_compose_columnar() {
+        let contains = Expr::FuncCall {
+            qualifier: None,
+            name: "contains".to_string(),
+            args: vec![field("action"), Expr::StringLit("fail".into())],
+        };
+        // contains(...) && count > 3 → 整体列式。
+        let and = cmp(BinOp::And, contains, cmp(BinOp::Gt, field("count"), num(3.0)));
+        assert!(expr_is_columnar(&and));
+        // 字段 needle 的 startswith 与 regex_match 组合 → 列式。
+        let sw = Expr::FuncCall {
+            qualifier: None,
+            name: "startswith".to_string(),
+            args: vec![field("action"), field("prefix")],
+        };
+        assert!(expr_is_columnar(&cmp(BinOp::Or, sw, cmp(BinOp::Gt, field("count"), num(1.0)))));
+        // not 包住也列式。
+        assert!(expr_is_columnar(&Expr::Not(Box::new(and))));
     }
 
     #[test]

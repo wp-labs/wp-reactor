@@ -669,10 +669,11 @@ fn bind_filter_columnar_mask_branches() {
         window: "w".into(),
         filter: Some(Expr::FuncCall {
             qualifier: None,
-            name: "startswith".into(),
+            name: "startswith_any".into(),
             args: vec![
                 Expr::Field(FieldRef::Simple("sip".into())),
                 Expr::StringLit("10.".into()),
+                Expr::StringLit("192.168.".into()),
             ],
         }),
     }];
@@ -1029,10 +1030,11 @@ fn branch_guard_masks_event_close_and_seq_neg() {
     };
     let guard_noncol = || Expr::FuncCall {
         qualifier: None,
-        name: "startswith".into(),
+        name: "startswith_any".into(),
         args: vec![
             Expr::Field(FieldRef::Simple("sip".into())),
             Expr::StringLit("10.".into()),
+            Expr::StringLit("192.168.".into()),
         ],
     };
 

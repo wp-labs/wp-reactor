@@ -127,7 +127,7 @@ fn non_columnar_filter_returns_none() {
     assert!(each.each_filter_columnar_mask(&batch).is_none());
 }
 
-/// contains 函数 filter：非列式（走解释器），Str 字段必须命中正确行。
+/// contains 函数 filter：字面量形态列式（mask 与逐行解释器逐位一致）。
 #[test]
 fn contains_filter_matches_per_event_interpreted() {
     let schema = Arc::new(Schema::new(vec![
@@ -153,14 +153,14 @@ fn contains_filter_matches_per_event_interpreted() {
         ],
     };
     let exec = bind_executor(Some(filter));
-    assert!(
-        exec.bind_filter_columnar_mask("b", &batch).is_none(),
-        "contains 应非列式（返回 None mask）"
-    );
+    let mask = exec
+        .bind_filter_columnar_mask("b", &batch)
+        .expect("contains 字面量形态应列式（返回 Some mask）");
     let events = batch_to_events(&batch);
     // 全部含子串 "0.0"：10.0.0.1 / 10.0.0.2 / 9.0.0.3 / 10.0.0.4 均命中。
     let expect = [true, true, true, true];
     for (row, ev) in events.iter().enumerate() {
+        assert_eq!(mask.value(row), expect[row], "row {row}: 列式 mask");
         assert_eq!(
             exec.event_matches_alias("b", ev, None),
             expect[row],
@@ -294,6 +294,77 @@ fn regex_match_columnar_mask_matches_per_event() {
             "row {row}: action={}",
             ev.field_value_str("action")
         );
+    }
+}
+
+/// contains/startswith/endswith 列式：mask 与逐行解释器逐位一致（字面量与字段
+/// needle 两种形态）。
+#[test]
+fn str_search_columnar_mask_matches_per_event() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("action", DataType::Utf8, true),
+        Field::new("pattern", DataType::Utf8, true),
+        Field::new("event_time", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("failed_login"), // contains/startswith "fail" 命中
+                Some("login_fail"),   // contains 命中，startswith 不命中
+                Some("success"),      // 都不命中
+                None,                 // null
+                Some("FAILED"),       // 大小写敏感
+            ])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("fail"), Some("login"), Some("fail"), Some("fail"), None,
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+        ],
+    )
+    .unwrap();
+    let mk = |name: &str, needle: Expr| Expr::FuncCall {
+        qualifier: None,
+        name: name.into(),
+        args: vec![Expr::Field(FieldRef::Simple("action".into())), needle],
+    };
+    let cases: &[(&str, Expr, [bool; 5])] = &[
+        (
+            "contains",
+            mk("contains", Expr::StringLit("fail".into())),
+            [true, true, false, false, false],
+        ),
+        (
+            "startswith",
+            mk("startswith", Expr::StringLit("fail".into())),
+            [true, false, false, false, false],
+        ),
+        (
+            "endswith",
+            mk("endswith", Expr::StringLit("fail".into())),
+            [false, true, false, false, false],
+        ),
+        (
+            "contains_field_needle",
+            mk("contains", Expr::Field(FieldRef::Simple("pattern".into()))),
+            [true, true, false, false, false],
+        ),
+    ];
+    for (label, filter, expect) in cases {
+        let exec = bind_executor(Some(filter.clone()));
+        let mask = exec
+            .bind_filter_columnar_mask("b", &batch)
+            .expect("字符串搜索函数应列式（返回 Some mask）");
+        let events = batch_to_events(&batch);
+        for (row, ev) in events.iter().enumerate() {
+            assert_eq!(mask.value(row), expect[row], "{label} row {row}");
+            assert_eq!(
+                exec.event_matches_alias("b", ev, None),
+                expect[row],
+                "{label} row {row}: action={}",
+                ev.field_value_str("action")
+            );
+        }
     }
 }
 
