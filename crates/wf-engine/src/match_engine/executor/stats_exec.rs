@@ -16,7 +16,7 @@ use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsPlan};
 use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
 use crate::match_engine::event_bridge::extract_field_value;
 use crate::match_engine::match_engine::{Event, ScopeKey, field_ref_name};
-use crate::match_engine::{EngineHashMap, Value};
+use crate::match_engine::{EngineHashMap, EngineHashSet, Value};
 use crate::window::scope_key_columnar;
 use crate::window::scope_key_from_column;
 
@@ -31,7 +31,7 @@ pub struct StatsAccum {
     pub sum_i128: i128,
     pub min: Option<i128>,
     pub max: Option<i128>,
-    pub distinct_set: Option<HashSet<DistinctKey>>,
+    pub distinct_set: Option<EngineHashSet<DistinctKey>>,
     /// `last(field)` 用（Q18）: 最近合格行的**行字段列数组**（P5 紧凑化——按
     /// `row_field_names` 列序存储, 缺失/null = `None`; 旧 `EngineHashMap` 每桶
     /// 6 个 SmolStr key + hash 节点 ≈ 400B+/桶, 5.29M 桶直接顶到 ~19GB）。
@@ -369,7 +369,7 @@ impl StatsExecutor {
                             StatsAggPlan::DistinctCount => {
                                 let key = value_to_distinct_key(&val);
                                 acc.distinct_set
-                                    .get_or_insert_with(HashSet::new)
+                                    .get_or_insert_with(EngineHashSet::default)
                                     .insert(key);
                             }
                             StatsAggPlan::Last | StatsAggPlan::Top => {
@@ -650,7 +650,7 @@ impl StatsExecutor {
                 let Some(field) = &measure.field else {
                     continue;
                 };
-                let set = acc.distinct_set.get_or_insert_with(HashSet::new);
+                let set = acc.distinct_set.get_or_insert_with(EngineHashSet::default);
                 if !insert_distinct_column(batch, field_name(field), mask.as_ref(), set) {
                     return false;
                 }
@@ -852,7 +852,9 @@ fn accumulate_column_row(
             }
             StatsAggPlan::DistinctCount => {
                 if let Some(k) = column_distinct_key(batch, field_name(field), row) {
-                    acc.distinct_set.get_or_insert_with(HashSet::new).insert(k);
+                    acc.distinct_set
+                        .get_or_insert_with(EngineHashSet::default)
+                        .insert(k);
                 }
             }
             StatsAggPlan::Last | StatsAggPlan::Top => {
@@ -1728,7 +1730,7 @@ fn insert_distinct_column(
     batch: &RecordBatch,
     name: &str,
     mask: Option<&BooleanArray>,
-    set: &mut HashSet<DistinctKey>,
+    set: &mut EngineHashSet<DistinctKey>,
 ) -> bool {
     let Some(idx) = batch
         .schema()
