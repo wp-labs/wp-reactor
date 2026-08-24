@@ -1278,7 +1278,7 @@ impl RuleExecutor {
         // 一致；「批快照 miss」的行在行循环时点**实时复查**（与行式逐事件同时
         // 机）——否则批处理期间并行 ingest 补 append 的实体（q20 lead 引用未来
         // auction）会被列式快照漏掉，EMIT 系统性偏少（rate=1m 实测 -8 万行）。
-        let mut row_match: Vec<Option<JoinRow>> = vec![None; rows.len()];
+        let mut row_match: Vec<Option<Arc<JoinRow>>> = vec![None; rows.len()];
         for idxs in key_rows.values() {
             let first_val = per_row_vals[*idxs.first().unwrap()]
                 .as_ref()
@@ -1288,27 +1288,34 @@ impl RuleExecutor {
                 &join_plan.right_key_field,
                 first_val,
             );
-            let first = if left_is_float {
-                None
-            } else {
-                bucket.as_ref().and_then(|rs| rs.first().cloned())
-            };
-            for &i in idxs {
-                let lv = per_row_vals[i]
-                    .as_ref()
-                    .expect("key_rows rows always have a value");
-                row_match[i] = if left_is_float {
-                    bucket.as_ref().and_then(|rs| {
+            if left_is_float {
+                for &i in idxs {
+                    let lv = per_row_vals[i]
+                        .as_ref()
+                        .expect("key_rows rows always have a value");
+                    row_match[i] = bucket.as_ref().and_then(|rs| {
                         rs.iter()
                             .find(|r| {
                                 r.field_value(&join_plan.right_key_field)
                                     .is_some_and(|rv| values_equal(lv, &rv))
                             })
                             .cloned()
-                    })
-                } else {
-                    first.clone()
-                };
+                            .map(Arc::new)
+                    });
+                }
+            } else {
+                // 非浮点左键：桶内所有行共享同一个首行 JoinRow——每个桶只搬移
+                // 一次（`into_iter().next()` 零 Arc bump），每行仅 1 次 Arc clone
+                // （此前每行 `first.clone()` 是 4 个 Arc bump，共享批 Arc 跨线程
+                // 争用 → 采样 40% 线程时间在 drop_glue）。
+                let first_arc: Option<Arc<JoinRow>> =
+                    bucket.and_then(|rs| rs.into_iter().next()).map(Arc::new);
+                for &i in idxs {
+                    row_match[i] = match &first_arc {
+                        Some(a) => Some(Arc::clone(a)),
+                        None => None,
+                    };
+                }
             }
         }
 
@@ -1381,27 +1388,38 @@ impl RuleExecutor {
             // 批快照 miss 的行：行循环时点实时复查（与行式逐事件同时机——并行
             // ingest 在批处理期间补 append 的实体此时可见）。命中行沿用批快照
             // （索引只增，快照命中 ⇔ 逐事件命中）。
-            let matched: Option<JoinRow> = if row_match[idx].is_some() {
-                row_match[idx].clone()
-            } else if let Some(v) = &per_row_vals[idx] {
-                let bucket =
-                    windows.join_lookup(&join_plan.right_window, &join_plan.right_key_field, v);
-                if left_is_float {
-                    bucket.as_ref().and_then(|rs| {
-                        rs.iter()
-                            .find(|r| {
-                                r.field_value(&join_plan.right_key_field)
-                                    .is_some_and(|rv| values_equal(v, &rv))
+            // 命中行直接借用 row_match 的 Arc 内容（零克隆——此前每行
+            // `row_match[idx].clone()` 是 4 个 Arc bump + 行尾 drop）；miss 行
+            // 实时复查结果暂存 miss_hold，仅 miss 行承担 lookup 成本。
+            let mut miss_hold: Option<Arc<JoinRow>> = None;
+            let matched: Option<&JoinRow> = match row_match[idx].as_ref() {
+                Some(r) => Some(r.as_ref()),
+                None => {
+                    if let Some(v) = &per_row_vals[idx] {
+                        let bucket = windows.join_lookup(
+                            &join_plan.right_window,
+                            &join_plan.right_key_field,
+                            v,
+                        );
+                        miss_hold = if left_is_float {
+                            bucket.as_ref().and_then(|rs| {
+                                rs.iter()
+                                    .find(|r| {
+                                        r.field_value(&join_plan.right_key_field)
+                                            .is_some_and(|rv| values_equal(v, &rv))
+                                    })
+                                    .cloned()
+                                    .map(Arc::new)
                             })
-                            .cloned()
-                    })
-                } else {
-                    bucket.as_ref().and_then(|rs| rs.first().cloned())
+                        } else {
+                            bucket.and_then(|rs| rs.into_iter().next()).map(Arc::new)
+                        };
+                        miss_hold.as_ref().map(|a| a.as_ref())
+                    } else {
+                        None
+                    }
                 }
-            } else {
-                None
             };
-            let matched = matched.as_ref();
             // Post-join `where`（严格）：右窗字段比较；miss → 字段缺失 → false
             // → 抑制（对齐行式 where_ok：false/None 抑制）。
             let where_ok = join_plan.where_preds.iter().all(|p| {
