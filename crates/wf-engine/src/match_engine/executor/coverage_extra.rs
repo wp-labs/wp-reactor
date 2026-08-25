@@ -3889,6 +3889,80 @@ fn each_columnar_general_yield_not_first_matches_row_path() {
     assert_eq!(detail(&out_col[2]), "", "null extra → count_char None → fmt 参数 None → 空串");
 }
 
+/// each filter 引用 OBJECT 元数据列：gate 放行（flat FieldRef 形状），但列式
+/// 读原始 JSON 文本、解释器解析成 Value::Object——比较可分叉 → filter 槽位
+/// 不编译，逐行 `passes_eval_filter` 解释回退。两路必须一致（Object 比较
+/// 非 Bool → None → 全拒绝）。
+#[test]
+fn each_columnar_filter_structured_field_falls_back_parity() {
+    use crate::match_engine::WFL_FIELD_TYPE_METADATA_KEY;
+    use crate::match_engine::WFL_FIELD_TYPE_OBJECT;
+
+    let b_field = |n: &str| Expr::Field(FieldRef::Qualified("b".into(), n.into()));
+    let mut plan = simple_rule_plan(
+        "obj_filter",
+        simple_plan(vec![], vec![]),
+        Expr::Number(5.0),
+        "digit",
+        b_field("auction"),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "b".into(),
+        // 原始 JSON 文本恰好等于字面量时，列式会比较命中——解释器是 Object
+        // 比较非 Bool → 拒绝；必须走解释回退保持一致。
+        filter: Some(Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(b_field("ext")),
+            right: Box::new(Expr::StringLit("{\"k\":1}".into())),
+        }),
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "detail".into(),
+        value: Expr::StringLit("x".into()),
+    }];
+    let exec = RuleExecutor::new(plan);
+    assert!(exec.each_plan_columnar_safe());
+
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("auction", DataType::Int64, true),
+        ArrowField::new("ext", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                WFL_FIELD_TYPE_OBJECT.to_string(),
+            )]),
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1), Some(2)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some(r#"{"k":1}"#), Some(r#"{"k":2}"#)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let t = 1_700_000_000_000_000_000i64;
+
+    let events = crate::match_engine::event_bridge::batch_to_events(&batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    assert_eq!(sr.rejected, 2, "行式：Object 比较非 Bool → None → 全拒绝");
+    assert_eq!(sr.appended, 0);
+
+    let col_events: Vec<ColumnarEvent> = (0..2).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+    assert_eq!(sc.rejected, 2, "列式：结构化 filter 槽位不编译 → 解释回退 → 全拒绝");
+    assert_eq!(sc.appended, 0);
+    assert_eq!(sc.failed, 0);
+    assert_eq!(app_row, Vec::<usize>::new());
+    assert_eq!(app_col, Vec::<usize>::new());
+}
+
 // ---------------------------------------------------------------------------
 // close_exec.rs — close paths
 // ---------------------------------------------------------------------------

@@ -635,7 +635,7 @@ fn compile_guard_func(
 /// fmt 直接渲染、count_char 对其计数，字节分叉 → 相关输出表达式整体回退行式。
 /// 递归覆盖 IfThenElse/InList/嵌套函数调用：结构化字段藏在分支里时 gate 仍会
 /// 放行（flat FieldRef 不含元数据信息），必须在此编译期拦截。
-fn arg_reads_structured(view: &ColumnarBatch<'_>, expr: &Expr) -> bool {
+pub(crate) fn arg_reads_structured(view: &ColumnarBatch<'_>, expr: &Expr) -> bool {
     match expr {
         Expr::Field(field) => {
             let Some(&proj) = view.field_map.get(field_ref_name(field)) else {

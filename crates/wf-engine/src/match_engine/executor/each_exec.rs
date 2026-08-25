@@ -801,11 +801,15 @@ impl RuleExecutor {
                 }
             })
             .collect();
+        // each filter：结构化字段（OBJECT/ARRAY 元数据列）比较在列式读原始
+        // JSON 文本、解释器解析成 Object/Array，字节可分叉（与输出函数同源）
+        // → 不编译（槽位 None → 逐行 `passes_each_filter` 解释回退）。
         let filter_cvec = self
             .plan
             .each_plan
             .as_ref()
             .and_then(|ep| ep.filter.as_ref())
+            .filter(|f| !crate::match_engine::columnar::arg_reads_structured(&view, f))
             .and_then(|f| compile_guard(f, &view))
             .map(|plan| plan.eval_vec(&view, n));
         EachBatchVecs {
