@@ -939,9 +939,13 @@ impl RuleExecutor {
         // + `eval_vec` 整帧求值**一次**（`each_batch_prepare`），行循环只取
         // cell（向量化 cell 求值）；编译失败（结构化列参数等）→ 该 yield 行式
         // 回退（prepared 槽位 None）。
-        let has_general_yield = yield_kinds
+        // 仅当某 General yield 的槽位是 None（prepare 编译失败 → 每行解释回退）
+        // 才构造每行 meta——全编译（Q14：fmt/strftime/count_char 槽位全 Some）
+        // 时 meta 只被回退分支读取，构造是纯开销（Arc bump + Vec 分配）。
+        let need_yield_meta = yield_kinds
             .iter()
-            .any(|k| matches!(k, YieldKind::General));
+            .zip(prepared.general_cvecs.iter())
+            .any(|(kind, cvec)| matches!(kind, YieldKind::General) && cvec.is_none());
 
         // Batch-constant wfx_id FNV prefix: `rule_name \x00` hashed once per
         // batch (rule names run tens of bytes and were previously re-hashed
@@ -1166,10 +1170,10 @@ impl RuleExecutor {
             if let Some(t) = t_wfx {
                 prof.add(e1_bucket_wfx(), t);
             }
-            // 仅当存在 General yield（列式输出函数 / 行式回退）时构造 meta——
-            // 纯 Lit/Field 输出（q1 等）不构造，避免每行开销（原注释：被 gate
-            // 排除时 TLS 进出是纯开销）。
-            let yield_meta = has_general_yield.then(|| {
+            // 仅当存在 General yield 且 prepare 编译失败（需逐行解释回退）时
+            // 构造 meta——全编译（Q14）与纯 Lit/Field 输出（q1）都不构造，
+            // 避免每行开销（原注释：被 gate 排除时 TLS 进出是纯开销）。
+            let yield_meta = need_yield_meta.then(|| {
                 self.each_yield_meta(
                     &wfx_id,
                     &fired_at,
@@ -1265,7 +1269,7 @@ impl RuleExecutor {
                                 None => eval_yield_expr_with_meta(
                                     &field.value,
                                     &event.to_event(),
-                                    yield_meta.expect("has_general_yield → meta 已构造"),
+                                    yield_meta.expect("need_yield_meta → meta 已构造"),
                                 )
                                 .expect("eval_yield_expr_with_meta never returns None"),
                             };
