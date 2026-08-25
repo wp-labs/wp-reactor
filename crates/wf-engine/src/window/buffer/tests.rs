@@ -799,7 +799,7 @@ fn committed_frontier_records_parsed_sized_from() {
 /// 否则被丢的行会污染前沿（看似已提交、实际不在窗口里）。
 #[test]
 fn committed_frontier_ignores_dropped_late() {
-    let mut cfg = test_config(usize::MAX);
+    let cfg = test_config(usize::MAX);
     // allowed_lateness=0 + Drop：乱序旧 batch 必被丢。
     let schema = test_schema();
     let win = Window::new(

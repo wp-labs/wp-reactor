@@ -1935,3 +1935,153 @@ fn stats_row_fields_subset_both_paths_match() {
     assert!(row_val(rf, &names, "bidder").is_some());
     assert!(row_val(rf, &names, "auction").is_none(), "子集外字段不入行");
 }
+
+// ---------------------------------------------------------------------------
+// 状态内存 guard（2026-08-25）: `limits.max_memory` → 超限拒收新键桶
+// ---------------------------------------------------------------------------
+
+/// Q19 形状（键 = auction, 度量 = top(3, price)）。
+fn q19_like_plan() -> StatsPlan {
+    keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![top_measure("top_price", "price", 3)],
+    )
+}
+
+fn auction_price_rows(pairs: &[(f64, f64)]) -> Vec<HashMap<String, Value>> {
+    pairs
+        .iter()
+        .map(|(a, p)| row(&[("auction", num(*a)), ("price", num(*p))]))
+        .collect()
+}
+
+#[test]
+fn stats_memory_guard_rejects_new_buckets_over_limit() {
+    // top(3) 桶预算 = 512 + 1×128 + 3×160 = 1120B。限额 1200 → 只放行 1 桶。
+    let plan = q19_like_plan();
+    let mut exec = StatsExecutor::new(plan);
+    exec.set_memory_limit("guard_test", Some(1200));
+
+    // 10 个不同 auction 键, 每键 1 行（先到者进桶）。
+    let rows = auction_price_rows(&[
+        (1.0, 100.0),
+        (2.0, 200.0),
+        (3.0, 300.0),
+        (4.0, 400.0),
+        (5.0, 500.0),
+        (6.0, 600.0),
+        (7.0, 700.0),
+        (8.0, 800.0),
+        (9.0, 900.0),
+        (10.0, 1000.0),
+    ]);
+    exec.process_rows(&rows, extract);
+
+    assert_eq!(
+        exec.window.over_limit_new_buckets(),
+        9,
+        "10 个新键, 限额只放 1 个 → 拒收 9"
+    );
+    assert!(
+        exec.window.estimated_bytes() <= 1200,
+        "估算必须在限额内（有界）: {}",
+        exec.window.estimated_bytes()
+    );
+    // 放行的键累积成功, 拒收的键无桶。
+    let buckets = exec.final_measure_values_by_bucket();
+    assert_eq!(buckets.len(), 1, "只应存在 1 个桶");
+    assert_eq!(buckets[0].0, ScopeKey::Int(1));
+}
+
+#[test]
+fn stats_memory_guard_existing_bucket_keeps_accumulating() {
+    // 已存在的桶不受拒收影响（同键后续行继续累积）。
+    let plan = q19_like_plan();
+    let mut exec = StatsExecutor::new(plan);
+    exec.set_memory_limit("guard_test", Some(1200));
+
+    exec.process_rows(&auction_price_rows(&[(1.0, 100.0), (2.0, 200.0)]), extract);
+    assert_eq!(exec.window.over_limit_new_buckets(), 1, "键 2 被拒");
+
+    // 键 1 再进 2 行 → 桶计数/条目继续累积。
+    exec.process_rows(&auction_price_rows(&[(1.0, 90.0), (1.0, 80.0)]), extract);
+    assert_eq!(exec.window.over_limit_new_buckets(), 1, "同键不新增拒收");
+    let buckets = exec.final_measure_values_by_bucket();
+    assert_eq!(buckets.len(), 1);
+}
+
+#[test]
+fn stats_memory_guard_no_limit_accepts_all() {
+    // 未设限额（默认 None）→ 全部键放行, 拒收计数 0（不设防 = 原行为）。
+    let plan = q19_like_plan();
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(&auction_price_rows(&[(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]), extract);
+    assert_eq!(exec.window.over_limit_new_buckets(), 0);
+    assert!(
+        exec.window.estimated_bytes() > 0,
+        "估算恒记账（可观测）, 无限额不拒收"
+    );
+    let buckets = exec.final_measure_values_by_bucket();
+    assert_eq!(buckets.len(), 3);
+}
+
+#[test]
+fn stats_memory_guard_resets_on_close() {
+    let plan = q19_like_plan();
+    let mut exec = StatsExecutor::new(plan);
+    exec.set_memory_limit("guard_test", Some(1200));
+    exec.process_rows(&auction_price_rows(&[(1.0, 100.0), (2.0, 200.0)]), extract);
+    assert!(exec.window.estimated_bytes() > 0);
+    assert_eq!(exec.window.over_limit_new_buckets(), 1);
+
+    // close（take_buckets + reset_window）→ 账本清零; 拒收计数保留（指标用）。
+    let _ = exec.close_window_by_bucket_rows();
+    assert_eq!(exec.window.estimated_bytes(), 0, "close 后状态清零");
+    assert_eq!(exec.window.over_limit_new_buckets(), 1, "拒收计数跨窗口保留");
+
+    // 新窗口仍受 guard 保护（限额配置跨窗口保留）。
+    exec.process_rows(&auction_price_rows(&[(3.0, 300.0), (4.0, 400.0)]), extract);
+    assert_eq!(exec.window.over_limit_new_buckets(), 2, "新窗口继续拒收");
+}
+
+#[test]
+fn stats_memory_guard_empty_key_unaffected() {
+    // 空键规则: Empty 桶预建, 不参与限额（guard 只针对键空间膨胀）。
+    let plan = simple_plan(vec![count_measure("n")]);
+    let mut exec = StatsExecutor::new(plan);
+    exec.set_memory_limit("guard_test", Some(1)); // 极小限额也不影响空键桶
+    let rows = vec![
+        row(&[("price", num(1.0))]),
+        row(&[("price", num(2.0))]),
+        row(&[("price", num(3.0))]),
+    ];
+    exec.process_rows(&rows, extract);
+    assert_eq!(exec.window.over_limit_new_buckets(), 0);
+    let values = exec.final_measure_values();
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0], 3.0, "空键 count 不受 guard 影响");
+}
+
+#[test]
+fn stats_memory_guard_columnar_path_rejects_too() {
+    // 列式路径（process_batch）与行式同受 guard 约束。
+    let plan = q19_like_plan();
+    let mut exec = StatsExecutor::new(plan);
+    exec.set_memory_limit("guard_test", Some(1200));
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as _,
+            Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500])) as _,
+        ],
+    )
+    .unwrap();
+    assert!(exec.process_batch(&batch), "列式前置满足");
+    assert_eq!(exec.window.over_limit_new_buckets(), 4, "5 键限 1 → 拒 4");
+    assert!(exec.window.estimated_bytes() <= 1200);
+}

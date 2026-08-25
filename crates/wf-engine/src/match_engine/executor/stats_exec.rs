@@ -97,11 +97,97 @@ impl DistinctKey {
 /// Box 分配; 完整 `ScopeKey` 仅**每桶首见**时构建一次（Q18: 27.6M → 5.29M 次盒装）。
 /// 哈希为字节级同构 FNV 混合（`scope_key_hash` == `comps_hash`, 行式/列式两路径
 /// 同桶）; 碰撞由链内 `ScopeKey` 完整比较消歧（概率极低, 正确性不受影响）。
+#[derive(Default)]
 pub struct StatsWindowState {
     pub buckets: EngineHashMap<u64, Vec<StatsBucket>>,
     pub window_start_nanos: i64,
     pub last_event_nanos: i64,
     pub event_count: u64,
+    /// 状态内存上限（字节; None = 不设防）。由规则 `limits.max_memory` 注入
+    /// （spawn 层）。**超限后拒绝新建桶**（已有桶继续累积, 内存有界）——语义上
+    /// 是「新键丢失」的优雅降级, 有日志 + 计数可观测, 不是静默膨胀到 OOM。
+    limit_bytes: Option<u64>,
+    /// 估算的在用状态内存（桶级预算模型: 新桶固定 allowance, 含 top/last 条目
+    /// 预算——保守上界, 偏安全方向）。窗口 close 时清零。
+    estimated_bytes: u64,
+    /// 累计超限拒收的新桶数（跨窗口累计, 供指标/告警）。
+    over_limit_new_buckets: u64,
+    /// 当前窗口是否已告警（每窗口一次, 防刷屏）。
+    limit_warned: bool,
+    /// 告警用的规则名（set_memory_limit 注入）。
+    rule_name: String,
+}
+
+impl StatsWindowState {
+    /// 新建窗口状态（无内存限制, 由 spawn 层按规则 limits 注入）。
+    fn new(buckets: EngineHashMap<u64, Vec<StatsBucket>>) -> Self {
+        StatsWindowState {
+            buckets,
+            window_start_nanos: 0,
+            last_event_nanos: 0,
+            event_count: 0,
+            limit_bytes: None,
+            estimated_bytes: 0,
+            over_limit_new_buckets: 0,
+            limit_warned: false,
+            rule_name: String::new(),
+        }
+    }
+
+    /// 注入状态内存上限（字节; None = 不设防）。
+    pub fn set_memory_limit(&mut self, rule_name: &str, bytes: Option<usize>) {
+        self.rule_name = rule_name.to_string();
+        self.limit_bytes = bytes.map(|b| b as u64);
+    }
+
+    /// 当前估算的在用状态内存（桶级预算）。
+    pub fn estimated_bytes(&self) -> u64 {
+        self.estimated_bytes
+    }
+
+    /// 累计因超限被拒收的新桶数。
+    pub fn over_limit_new_buckets(&self) -> u64 {
+        self.over_limit_new_buckets
+    }
+
+    /// 新桶预算（保守上界）: 固定基数 + 每度量结构 + top/last 条目预算
+    /// （含行字段列数组; distinct 集不在此预算内, 见文档注记）。
+    fn bucket_allowance(plan: &StatsPlan, n_measures: usize) -> u64 {
+        let mut bytes = 512u64 + n_measures as u64 * 128;
+        for m in &plan.measures {
+            match m.agg {
+                StatsAggPlan::Top => {
+                    bytes += m.arg.unwrap_or(10) * 160;
+                }
+                StatsAggPlan::Last => bytes += 160,
+                _ => {}
+            }
+        }
+        bytes
+    }
+
+    /// 新建桶前的限额检查: 超限 → 计数 + 每窗口告警一次 + 拒绝（false）。
+    fn account_new_bucket(&mut self, plan: &StatsPlan, n_measures: usize) -> bool {
+        let allowance = Self::bucket_allowance(plan, n_measures);
+        if let Some(limit) = self.limit_bytes
+            && self.estimated_bytes + allowance > limit
+        {
+            self.over_limit_new_buckets += 1;
+            if !self.limit_warned {
+                self.limit_warned = true;
+                log::warn!(
+                    "stats 状态内存超限（规则 {}, 估算 {}B / 上限 {}B）——拒绝新建键桶, 已有桶继续累积; 累计拒收 {} 个新桶",
+                    self.rule_name,
+                    self.estimated_bytes,
+                    limit,
+                    self.over_limit_new_buckets
+                );
+            }
+            return false;
+        }
+        self.estimated_bytes += allowance;
+        true
+    }
 }
 
 /// 单桶: 完整 [`ScopeKey`]（close 排序/输出; 每桶一次构建）+ 累加器数组。
@@ -125,46 +211,61 @@ impl StatsWindowState {
 
     /// 取/建一个桶（完整键路径: 行式回退 / 空键规则用）。哈希与列式
     /// `keyed_bucket_mut` 同值, 链内按 ScopeKey 完整比较消歧。
-    fn bucket_mut(&mut self, key: &ScopeKey, n_measures: usize) -> &mut Vec<StatsAccum> {
+    /// 新桶先过限额检查（超限 → None, 调用方跳过该行——内存有界）。
+    fn bucket_mut(
+        &mut self,
+        key: &ScopeKey,
+        plan: &StatsPlan,
+        n_measures: usize,
+    ) -> Option<&mut Vec<StatsAccum>> {
         let hash = scope_key_hash(key);
-        let chain = self.buckets.entry(hash).or_default();
-        let pos = chain.iter().position(|b| &b.scope_key == key);
-        match pos {
-            Some(i) => &mut chain[i].accs,
-            None => {
-                chain.push(StatsBucket {
-                    scope_key: key.clone(),
-                    accs: vec![StatsAccum::default(); n_measures],
-                });
-                &mut chain.last_mut().expect("just pushed").accs
-            }
+        // 先只读查找（entry 可变借用会与限额记账的 &mut self 冲突）。
+        let pos = self
+            .buckets
+            .get(&hash)
+            .and_then(|chain| chain.iter().position(|b| &b.scope_key == key));
+        if let Some(i) = pos {
+            return Some(&mut self.buckets.get_mut(&hash).expect("命中即存在")[i].accs);
         }
+        if !self.account_new_bucket(plan, n_measures) {
+            return None;
+        }
+        let chain = self.buckets.entry(hash).or_default();
+        chain.push(StatsBucket {
+            scope_key: key.clone(),
+            accs: vec![StatsAccum::default(); n_measures],
+        });
+        Some(&mut chain.last_mut().expect("just pushed").accs)
     }
 
     /// 取/建一个桶（列式扁平键路径）: `hash` = 叶数组哈希, `comps` = 栈上叶
     /// 数组（列序）。链内按 `comps` 与完整键比较消歧; 未命中时构建完整键
-    /// （每桶一次）。
+    /// （每桶一次）。新桶先过限额检查（超限 → None）。
     fn keyed_bucket_mut(
         &mut self,
         hash: u64,
         comps: &[ScopeKey],
+        plan: &StatsPlan,
         n_measures: usize,
-    ) -> &mut Vec<StatsAccum> {
-        let chain = self.buckets.entry(hash).or_default();
-        let pos = chain
-            .iter()
-            .position(|b| comps_match(&b.scope_key, comps, 0, comps.len()));
-        match pos {
-            Some(i) => &mut chain[i].accs,
-            None => {
-                let scope_key = scope_key_from_comps(comps);
-                chain.push(StatsBucket {
-                    scope_key,
-                    accs: vec![StatsAccum::default(); n_measures],
-                });
-                &mut chain.last_mut().expect("just pushed").accs
-            }
+    ) -> Option<&mut Vec<StatsAccum>> {
+        let pos = self.buckets.get(&hash).and_then(|chain| {
+            chain
+                .iter()
+                .position(|b| comps_match(&b.scope_key, comps, 0, comps.len()))
+        });
+        if let Some(i) = pos {
+            return Some(&mut self.buckets.get_mut(&hash).expect("命中即存在")[i].accs);
         }
+        if !self.account_new_bucket(plan, n_measures) {
+            return None;
+        }
+        let chain = self.buckets.entry(hash).or_default();
+        let scope_key = scope_key_from_comps(comps);
+        chain.push(StatsBucket {
+            scope_key,
+            accs: vec![StatsAccum::default(); n_measures],
+        });
+        Some(&mut chain.last_mut().expect("just pushed").accs)
     }
 
     /// 按完整键取桶（测试/调试用; 生产走哈希路径）。
@@ -176,12 +277,15 @@ impl StatsWindowState {
     }
 
     /// 清空并拍平全部桶（close 用）: `(ScopeKey, accs)` 按 ScopeKey 升序。
+    /// 同时清零内存账本（新窗口重新累积; 拒收计数保留——指标用）。
     fn take_buckets(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
         let mut out: Vec<(ScopeKey, Vec<StatsAccum>)> = std::mem::take(&mut self.buckets)
             .into_values()
             .flat_map(|chain| chain.into_iter().map(|b| (b.scope_key, b.accs)))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
+        self.estimated_bytes = 0;
+        self.limit_warned = false;
         out
     }
 }
@@ -259,12 +363,7 @@ impl StatsExecutor {
         }
         Self {
             plan,
-            window: StatsWindowState {
-                buckets,
-                window_start_nanos: 0,
-                last_event_nanos: 0,
-                event_count: 0,
-            },
+            window: StatsWindowState::new(buckets),
             watermark_nanos: 0,
             unique_wheres,
             measure_where,
@@ -332,7 +431,10 @@ impl StatsExecutor {
             // 行字段列数组懒提取（每行一次, 多 last/top 度量共享同一 Arc——与
             // accumulate_keyed_row 的 row_cache 对齐）。
             let mut row_cache: Option<std::sync::Arc<[Option<Value>]>> = None;
-            let bucket = self.window.bucket_mut(&bucket_key, n_measures);
+            // 新桶超限（内存 guard）→ 该行跳过（与列式路径一致）。
+            let Some(bucket) = self.window.bucket_mut(&bucket_key, &self.plan, n_measures) else {
+                continue;
+            };
             for (idx, measure) in self.plan.measures.iter().enumerate() {
                 if let Some(wi) = self.measure_where[idx]
                     && !where_ok[wi]
@@ -482,12 +584,18 @@ impl StatsExecutor {
         if self.plan.keys.is_empty() {
             StatsWindowState::seed_empty_bucket(&mut buckets, n);
         }
-        self.window = StatsWindowState {
-            buckets,
-            window_start_nanos: 0,
-            last_event_nanos: 0,
-            event_count: 0,
-        };
+        let limit = self.window.limit_bytes;
+        let rule_name = self.window.rule_name.clone();
+        let over_limit = self.window.over_limit_new_buckets;
+        self.window = StatsWindowState::new(buckets);
+        // 保留限额配置 + 拒收计数跨窗口（guard 持续生效; 计数供指标/告警）。
+        self.window.set_memory_limit(&rule_name, limit.map(|b| b as usize));
+        self.window.over_limit_new_buckets = over_limit;
+    }
+
+    /// 注入状态内存上限（字节; None = 不设防）——超限拒收新键桶, 已有桶继续。
+    pub fn set_memory_limit(&mut self, rule_name: &str, bytes: Option<usize>) {
+        self.window.set_memory_limit(rule_name, bytes);
     }
 
     /// 提取本片已关闭窗口的**原始累加状态**（输入分区分片归并用）并重置窗口。
@@ -512,7 +620,10 @@ impl StatsExecutor {
     pub fn merge_partial(&mut self, buckets: Vec<(ScopeKey, Vec<StatsAccum>)>, event_count: u64) {
         let n = self.plan.measures.len();
         for (key, accs) in buckets {
-            let target = self.window.bucket_mut(&key, n);
+            // 超限（guard）→ 该片该键跳过（协调片侧同样受桶预算约束）。
+            let Some(target) = self.window.bucket_mut(&key, &self.plan, n) else {
+                continue;
+            };
             for (t, o) in target.iter_mut().zip(accs.iter()) {
                 merge_accum(t, o);
             }
@@ -627,7 +738,9 @@ impl StatsExecutor {
         let n_measures = self.plan.measures.len();
         for (idx, measure) in self.plan.measures.iter().enumerate() {
             let wi = self.measure_where[idx];
-            let acc = &mut self.window.bucket_mut(&ScopeKey::Empty, n_measures)[idx];
+            // 空键规则恒单桶（预建, 不参与限额——guard 只针对键空间膨胀）。
+            let acc =
+                &mut self.window.bucket_mut(&ScopeKey::Empty, &self.plan, n_measures).expect("Empty 桶恒存在")[idx];
             let rows_in = count_domain(rows, n, &masks, wi);
             match measure.agg {
                 StatsAggPlan::Count => {
@@ -668,7 +781,8 @@ impl StatsExecutor {
                 continue;
             }
             let wi = self.measure_where[idx];
-            let acc = &mut self.window.bucket_mut(&ScopeKey::Empty, n_measures)[idx];
+            let acc =
+                &mut self.window.bucket_mut(&ScopeKey::Empty, &self.plan, n_measures).expect("Empty 桶恒存在")[idx];
             if matches!(measure.agg, StatsAggPlan::DistinctCount) {
                 let Some(field) = &measure.field else {
                     continue;
@@ -786,7 +900,11 @@ impl StatsExecutor {
             }
             let comps = &comps[..key_columns.len()];
             let hash = comps_hash(comps);
-            let bucket = self.window.keyed_bucket_mut(hash, comps, n_measures);
+            // 新桶超限（内存 guard）→ 该行跳过。
+            let Some(bucket) = self.window.keyed_bucket_mut(hash, comps, &self.plan, n_measures)
+            else {
+                return;
+            };
             accumulate_column_row(
                 bucket,
                 &self.plan,
@@ -803,7 +921,10 @@ impl StatsExecutor {
         let Some(key) = scope_key_columnar(batch, key_cols, row) else {
             return; // 键 null → 跳过
         };
-        let bucket = self.window.bucket_mut(&key, n_measures);
+        // 新桶超限（内存 guard）→ 该行跳过。
+        let Some(bucket) = self.window.bucket_mut(&key, &self.plan, n_measures) else {
+            return;
+        };
         accumulate_column_row(
             bucket,
             &self.plan,

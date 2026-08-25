@@ -358,12 +358,7 @@ async fn close_current_window_empty_bucket_guard() {
     .await;
     assert!(task.window_start.is_some());
     // 清空累加器 → close 时 event_count == 0 → guard 返回, 不产出。
-    task.stats.window = StatsWindowState {
-        buckets: Default::default(),
-        window_start_nanos: 0,
-        last_event_nanos: 0,
-        event_count: 0,
-    };
+    task.stats.window = StatsWindowState::default();
     task.flush().await;
     assert_eq!(task.window_start, None);
 }

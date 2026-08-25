@@ -424,10 +424,20 @@ pub(super) fn spawn_rule_tasks(
                 // last/top（P4, Q18/Q19）: 行字段提取子集 = yield/entity 引用字段 ∪
                 // 度量字段——Q18 5.29M 桶 × 整行 8 字段会到 ~19GB, 子集可降 4× 以上。
                 let row_fields = stats_row_fields(rule.executor.plan(), &stats_plan);
-                let stats = wf_engine::match_engine::StatsExecutor::with_row_fields(
+                let mut stats = wf_engine::match_engine::StatsExecutor::with_row_fields(
                     stats_plan.clone(),
                     row_fields.clone(),
                 );
+                // 状态内存 guard（2026-08-25）: 规则 `limits.max_memory` →
+                // StatsExecutor 超限拒收新键桶（内存有界 + 每窗口告警 + 计数）。
+                // None = 不设防（未写 limits 的规则保持原行为）。
+                let state_mem_limit: Option<usize> = rule
+                    .executor
+                    .plan()
+                    .limits_plan
+                    .as_ref()
+                    .and_then(|l| l.max_memory_bytes);
+                stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
                 let field_keys: Vec<FieldRef> = stats
                     .plan
                     .keys
@@ -475,11 +485,13 @@ pub(super) fn spawn_rule_tasks(
                             None
                         };
                         let progress = register_progress(router, &window_sources);
+                        let mut shard_stats = wf_engine::match_engine::StatsExecutor::with_row_fields(
+                            stats_plan.clone(),
+                            row_fields.clone(),
+                        );
+                        shard_stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
                         let task_config = StatsTaskConfig {
-                            stats: wf_engine::match_engine::StatsExecutor::with_row_fields(
-                                stats_plan.clone(),
-                                row_fields.clone(),
-                            ),
+                            stats: shard_stats,
                             executor: rule.executor.clone(),
                             window_sources: window_sources.clone(),
                             sink_fanout: Arc::clone(&sink_fanout),
@@ -524,11 +536,13 @@ pub(super) fn spawn_rule_tasks(
                     for shard_idx in 0..shard_count {
                         let push_rx = None;
                         let progress = register_progress(router, &window_sources);
+                        let mut shard_stats = wf_engine::match_engine::StatsExecutor::with_row_fields(
+                            stats_plan.clone(),
+                            row_fields.clone(),
+                        );
+                        shard_stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
                         let task_config = StatsTaskConfig {
-                            stats: wf_engine::match_engine::StatsExecutor::with_row_fields(
-                                stats_plan.clone(),
-                                row_fields.clone(),
-                            ),
+                            stats: shard_stats,
                             executor: rule.executor.clone(),
                             window_sources: window_sources.clone(),
                             sink_fanout: Arc::clone(&sink_fanout),

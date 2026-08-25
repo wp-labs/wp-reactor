@@ -507,7 +507,7 @@ async fn deferred_q9_flush_unblocks_evaluation_when_frontier_never_advances() {
     let (mut task, mut alert_rx, router) = make_deferred_join_task();
     let src_a: Arc<str> = Arc::from("ingress#1");
     let bw = bid_window(&router);
-    let schema = bw.schema().clone();
+    let _schema = bw.schema().clone();
 
     // auction 5 挂起（expiry=T+30s）；目标窗**没有任何提交**（per-source 空 →
     // frontier 回退 max_event_time = i64::MIN → 运行期 gate 挂起）。
@@ -560,7 +560,7 @@ async fn deferred_q9_cross_source_reorder_holds_evaluation_until_committed() {
     let src_a: Arc<str> = Arc::from("ingress#1");
     let src_b: Arc<str> = Arc::from("ingress#2");
     let bw = bid_window(&router);
-    let schema = bw.schema().clone();
+    let _schema = bw.schema().clone();
 
     // auction 5 挂起（lo=T, expiry=T+30s）
     auction_window(&router)
