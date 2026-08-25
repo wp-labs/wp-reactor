@@ -542,4 +542,67 @@ mod format_tests {
             reference_summary("q22_asof_person", &keys, &scope, &steps, &origin),
         );
     }
+
+    /// **StrSink 一致性**（2026-08-26 段 4）：`write_int64_value` 泛型化为
+    /// `StrSink`（String + SmolStrBuilder 两实现）后，两条路径必须渲染出
+    /// **相同的字节**——SmolStrBuilder 路径是 q13b entity_id 的新热路径
+    /// （数字内联零堆分配），若与 String 路径有偏差，alert 的 entity_id
+    /// 列会静默变值（下游序列化/sink 消费方按字符串处理）。
+    #[test]
+    fn str_sink_smol_builder_matches_string_rendering() {
+        let edge_vals: Vec<i64> = vec![
+            i64::MIN,
+            i64::MIN + 1,
+            -(1i64 << 53) - 1,
+            -(1i64 << 53),
+            -(1i64 << 53) + 1,
+            -1,
+            0,
+            1,
+            (1i64 << 53) - 1,
+            (1i64 << 53),
+            (1i64 << 53) + 1,
+            123_456_789,
+            999_999_999_999_999_999,
+            i64::MAX,
+        ];
+        for &v in edge_vals.iter() {
+            let mut string_sink = String::new();
+            write_int64_value(&mut string_sink, v);
+            let mut smol = smol_str::SmolStrBuilder::new();
+            write_int64_value(&mut smol, v);
+            let smol_str: smol_str::SmolStr = smol.into();
+            assert_eq!(
+                smol_str.as_str(),
+                string_sink,
+                "int64 v={v}：SmolStrBuilder 与 String 渲染必须字节一致"
+            );
+        }
+    }
+
+    /// **hex_encode_smol 字节一致**（2026-08-26 段 4）：fnv64 hex 的 SmolStr
+    /// 直写（内联 16 字符）与 String 版本输出必须相同——wfx_id 是下游去重/
+    /// 关联键，静默变值会破坏语义。
+    #[test]
+    fn hex_encode_smol_matches_string_version() {
+        // 覆盖全字节值域与典型 hash 输出（fnv64 → 8 字节）。
+        let cases: &[&[u8]] = &[
+            &[0u8; 8],
+            &[0xffu8; 8],
+            &[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+            &[0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33],
+            &[7u8],
+            &[],
+        ];
+        for bytes in cases {
+            let legacy = hex_encode(bytes);
+            let smol = hex_encode_smol(bytes);
+            assert_eq!(
+                smol.as_str(),
+                legacy,
+                "bytes {:02x?}：SmolStr 直写与 String 版本必须字节一致",
+                bytes
+            );
+        }
+}
 }
