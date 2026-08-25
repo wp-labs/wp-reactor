@@ -2141,7 +2141,8 @@ impl RuleExecutor {
                 stats.failed += 1;
                 continue;
             }
-            // 直连逐行 commit（owned String move 进列，零二次拷贝）。
+            // 直连逐行 commit（owned 值 move 进列，零二次拷贝：wfx_id/entity_id
+            // 是 SmolStr、fired_at 是 String）。
             builder.commit_each_row(EachRowCells {
                 wfx_id,
                 score: score_const,

@@ -42,11 +42,11 @@ pub struct AlertColumnBatch {
     target: Arc<str>,
     len: usize,
     /// Fixed system-field columns, in `to_data_record` order. `wfx_id` /
-    /// `entity_id` / `fired_at` are per-row owned strings — stored as `String`
-    /// so the columnar direct path moves them in with zero extra allocation
-    /// (an `Arc` would pay a fresh allocation + memcpy per row for a value
-    /// that is never shared). The remaining six are plan/batch constants and
-    /// stay `Arc<str>` (refcount-shared).
+    /// `entity_id` are per-row owned [`SmolStr`]（2026-08-26：内联 ≤22B，零堆
+    /// 分配——q13b per-row churn 消减），`fired_at` 是 `String`（ISO 时间戳 24
+    /// 字符超内联上限）。列式直接路径 move 进列、零额外分配（`Arc` 反而要每行
+    /// 一次分配 + 拷贝，且值从不共享）。其余六列是计划/批常量，保持
+    /// `Arc<str>`（引用计数共享）。
     wfx_id: Vec<SmolStr>,
     rule_name: Vec<Arc<str>>,
     score: Vec<f64>,

@@ -111,6 +111,9 @@ pub fn perf_diag_enabled() -> bool {
 ///
 /// 设计为环境变量而非档位字段：它是临时消融手段（跑完即撤），不需要进
 /// 档状态机/配置。OnceLock 缓存，热路径零开销。
+///
+/// ⚠ **生产勿设**：本开关不依赖 `--perf-diag`（env 直接生效），误设会静默
+/// 丢弃全部 alert 输出（emitted 计数仍走）。用完即撤。
 pub fn perf_cut_alert() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
