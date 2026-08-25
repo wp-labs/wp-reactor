@@ -116,33 +116,65 @@ meta 列**：`__wfu_rule_name` / `__wfu_entity_type` / `__wfu_entity_id`（字�
 （load 8.0–10.8）。这种幅度不像稳定结构体，更像**分配器瞬时 churn / 碎片**
 （alert 构建、parse 缓冲、列式临时量）叠加负载影响。
 
-### ✅ 已定案（分配器分账，30M）：**引擎真持有 13GB 非窗口内存**
+### ✅ 已定案（分配器分账 + 堆归因）：**在途 Arrow 数据量，非泄漏、非分配器**
 
-`alloc.*` 指标（mimalloc `mi_process_info`，本次接入）一次跑批定位：
-
+#### 第一步：分账（`alloc.*` 指标，30M）
 | 指标 | 值 |
 |---|---|
-| `peak_commit`（mimalloc 实际持有） | **16.75GB** |
+| `peak_commit` | 16.75GB |
 | `peak_rss` | 15.38GB |
-| 窗口合计（各窗峰值和） | **3.60GB** |
-| **peak_commit − 窗口** | **13.16GB ← 引擎真持有** |
-| peak_rss − peak_commit | −1.37GB（commit 略高属正常：已提交未触碰） |
+| 窗口合计 | 3.60GB |
+| **peak_commit − 窗口** | **13.16GB** |
 
-**结论：「段区/OS 伪影」假说排除**。commit 与 rss 基本相等 → 这 13GB 是引擎
-**真的申请并持有**着，不是分配器把小内存放大的假象。而 q13 几乎**没有规则
-状态**（stateless each + 静态表 snapshot join）——无状态却占 13GB，是明确异常。
+#### 第二步：分配器**被排除**（关掉 mimalloc 对照，q13a-only 30M）
+| 分配器 | RSS_peak |
+|---|---|
+| mimalloc（基线） | 18,521MB |
+| mimalloc + `PURGE_DELAY=0 ABANDONED_RECLAIM_ON_FREE=1` | 18,345MB |
+| **系统分配器**（mimalloc 关掉） | **17,916MB** |
 
-**反面信号（缩小候选）**：q1 同样每行一条 alert，30M RSS 仅 4.0GB →
-**"per-row alert 输出基数"本身不解释 13GB**，差异在链路结构（中间窗 +
-10 分片推送 + join）而非输出量。
+三者几乎相等 → **mimalloc / arena / abandoned 页都不是因**（虽然 stats 确实显示
+98.7% 页 abandoned、reserved 20GiB/14 arenas，但换分配器后内存不变 → 那是
+**现象而非原因**）。
 
-### 待答（探针消融定位持有者）
-已排除：窗口保留（有界 3.6GB）、over 参数（实测无效）、通道条目额外占用
-（Arc 共享重叠）、段区伪影（commit≈rss）、alert 输出基数（q1 反例）。
-剩余候选：alert 构建/序列化临时量、parse pool 缓冲、列式求值临时列、
-分片 worker 的每批临时结构（10 并发 × 批内临时量）。
-**下一步：`current_commit` 时间曲线 vs 窗口字节曲线，定位 13GB 是何时累积的**
-（ingest 全程均匀增长 = 结构持有；尖峰 = 瞬时临时量）。
+#### 第三步：同条件对照定位到 pipe 路径（30M）
+| 规则 | peak_commit | 窗口 | 非窗口 | EPS |
+|---|---|---|---|---|
+| **q1**（each → **sink**） | 4.30GB | 3.21GB | **1.09GB** | 18.1M |
+| **q13a-only**（each → **中间窗**） | ~21GB | 3.87GB | **~17GB** | 6.3M |
+| q13a+q13b | 16.75GB | 3.60GB | 13.16GB | 3.3M |
+
+同一 bid_events 输入、同样 each 形状、同样 10 分片——差异只在输出去向。
+**注意：EPS 越低 → 内存越高**（这是下面结论的关键伏笔）。
+
+#### 第四步：堆归因（`heap` 尺寸分级 + `malloc_history` 调用栈）
+全速 30M 采样（`heap -s`）：2270 万个活跃分配，其中 16B×1509万 +
+32B×756万——看似骇人，但按字节只 ~0.5GB。
+
+重度插桩跑（`MallocStackLogging` + `malloc_history -allBySize`）的成分：
+| 尺寸 | 数量 | 合计 | 归因（调用栈） |
+|---|---|---|---|
+| ~6.9–7.5MB | **337** | **~2.4GB** | `decode_ipc_trusted` → `MutableBuffer::from_len_zeroed`（IPC 帧体） |
+| 80KB–528KB | ~11k | ~2.0GB | Arrow 列缓冲（含 `flush_pipes → take_batch → Int64Array`） |
+| 16B/32B | 5.6M | ~0.15GB | 零碎小对象（**非主体**） |
+
+**关键反证**：该插桩跑 EPS 仅 118k（极慢）时，footprint 4.9GB / malloc 活跃
+5.16GB——**缺口几乎消失**。而全速时是 14–18GB vs 窗口 3.9GB。
+
+#### 结论
+缺口 = **管道在途的 Arrow 批数据**（receiver 解码帧体 + parse → mailbox → 窗口
+路径上并存的批次），其**并存深度随吐吐量/背压放大**，不是泄漏、不是分配器
+行为、也不是窗口保留。旁证链：慢跑无缺口 · q1（快）缺口 1.09GB · q13（慢）
+缺口 13GB · q13a-only（更慢且无下游消费）缺口 17GB。
+
+#### 下一步（已收窄为工程题）
+1. **把在途深度变成指标**（目前完全无可观测性）：receiver 解码队列深度、
+   parse pool 在途字节、窗口 mailbox permits 已用量。有了这三个数字，13GB 就能
+   逐段对账。
+2. **确认背压是否生效**：q13 消费比 q1 慢 5 倍，若 receiver 仍按网络速度读入并
+   解码，在途就会堆到预算上限——对应
+   `issues/window-overload-drop-vs-backpressure.md` 的同一类问题（源侧反压）。
+3. 目标：在途预算有界且与总量无关 → 100M 峰值 < 10GB。
 
 ## 4. 已尝试 / 已排除
 
