@@ -65,6 +65,17 @@ fn bid_schema() -> Arc<Schema> {
 }
 
 fn window_def(name: &str, schema: &Arc<Schema>) -> WindowDef {
+    window_def_with_over(name, schema, std::time::Duration::from_secs(3600))
+}
+
+/// `window_def` 的变体：可指定 `over`（时间驱逐窗口）。deferred join 目标窗
+/// 用小 over 可复现生产 q4a/q9（`bid_events over=30m`）的「评估时右行已越过
+/// 时间驱逐线」场景——D4 保留 pin 必须保住它们。
+fn window_def_with_over(
+    name: &str,
+    schema: &Arc<Schema>,
+    over: std::time::Duration,
+) -> WindowDef {
     let mut cfg = super::tests::test_window_config(usize::MAX);
     cfg.name = name.to_string();
     WindowDef {
@@ -72,7 +83,7 @@ fn window_def(name: &str, schema: &Arc<Schema>) -> WindowDef {
             name: name.to_string(),
             schema: schema.clone(),
             time_col_index: Some(schema.index_of("event_time").unwrap()),
-            over: std::time::Duration::from_secs(3600),
+            over,
             materialize_fields: None,
             defer_materialization: false,
         },
@@ -202,10 +213,20 @@ fn make_deferred_join_task() -> (
     mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<Router>,
 ) {
+    make_deferred_join_task_with_over(std::time::Duration::from_secs(3600))
+}
+
+/// `make_deferred_join_task` 的变体：bid 目标窗用小 `over`（复现 q4a/q9 生产
+/// `bid_events over=30m` 的时间驱逐场景）。
+fn make_deferred_join_task_with_over(bid_over: std::time::Duration) -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
+    Arc<Router>,
+) {
     let driver = "auction_events";
     let registry = WindowRegistry::build(vec![
         window_def(driver, &auction_schema()),
-        window_def("bid_events", &bid_schema()),
+        window_def_with_over("bid_events", &bid_schema(), bid_over),
     ])
     .unwrap();
     let router = Arc::new(Router::new(registry));
@@ -350,6 +371,223 @@ fn auction_window(router: &Router) -> Arc<Window> {
 
 fn bid_window(router: &Router) -> Arc<Window> {
     router.registry().get_window("bid_events").unwrap()
+}
+
+/// 时间驱逐 × D4 保留 pin 闭环（30M q4 over=30m 欠发的机制验证）：
+///
+/// auction 时长 > bid 窗 `over` 时，到期评估需要的右行早已越过时间驱逐线
+/// （生产：`bid_events over=30m` + 驱逐 tick）。deferred 规则发布保留 pin
+/// （= 存活挂起实例的 min(lo_ns)），时间驱逐与内存驱逐都不得删 `[lo, expiry]`
+/// 内的行（2026-08-25 D4 闭环：`evict_expired_impl` 尊重 pin）。
+///
+/// 本用例验证**正路径**：pin 保住越过驱逐线的右行 → 评估命中输出。
+/// （无 pin 侧由 wf-engine `evict_expired_respects_retention_pin` 覆盖。）
+#[tokio::test]
+async fn deferred_q9_time_eviction_pin_keeps_in_range_bids() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) =
+        make_deferred_join_task_with_over(std::time::Duration::from_secs(10));
+
+    // bid 先到（auction=5，price 100 @ T+5s）——落在 auction 5 的 [lo=T, expiry=T+30s] 内
+    bid_window(&router)
+        .append_with_watermark(bid_batch(&[(5, 1, 100, T + 5_000_000_000)]))
+        .unwrap();
+    // auction=5：时长 30s > over 10s → 到期评估时右行已越过驱逐线
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[(5, T, T + 30_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    // 挂起中（expiry=T+30s，watermark=T）；pin 已发布（lo_min=T）
+
+    // 事件时间推进到 T+25s：cutoff = T+15s > bid @ T+5s → 时间驱逐线已覆盖右行。
+    // pin（挂起实例 lo=T）必须挡住驱逐：batch(max=T+5s) ≥ pin(=T) → 保留。
+    bid_window(&router).evict_expired(T + 25_000_000_000);
+    assert_eq!(
+        bid_window(&router).total_rows(),
+        1,
+        "pin 必须保住挂起实例需要的右行（时间驱逐不得删）"
+    );
+
+    // 驱动 watermark + 目标窗都追平 expiry：auction=6 @ T+31s、bid=6 @ T+31s
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[
+            (6, T + 31_000_000_000, T + 61_000_000_000),
+        ]))
+        .unwrap();
+    bid_window(&router)
+        .append_with_watermark(bid_batch(&[(6, 3, 300, T + 31_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+
+    // auction 5 到期评估：右行在 → 命中输出
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "5",
+        "pin 保住右行 → 到期评估命中"
+    );
+}
+
+/// 内存机制回归：**lo_min 缓存必须随 pending drain 推进**（2026-08-25 修复）。
+///
+/// 旧实现把 lo_min 缓存为**历史最小** lo（插入时 min，drain 不更新）——任何
+/// shard 只要 pending 非空，pin 就发布历史第一个实例的 lo（≈流起点）→ 时间
+/// 驱逐全被挡（30M q4 over=30m：pin_floor=起点+1ms、evict=0、RSS 9.2GB = 整窗
+/// 保留，探针实锤）。修复：scan drain 到期前缀后标 dirty，publish 重算当前
+/// pending 的 min lo → pin 随评估前沿推进 → over 窗口外的旧行可驱逐。
+#[tokio::test]
+async fn deferred_q9_pin_floor_advances_with_pending_drain() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) =
+        make_deferred_join_task_with_over(std::time::Duration::from_secs(10));
+
+    // 三个短时长实例：1/2/3 号 auction，expiry = lo + 1s（随事件流推进评估）
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[(5, T, T + 1_000_000_000)]))
+        .unwrap();
+    bid_window(&router)
+        .append_with_watermark(bid_batch(&[(5, 1, 100, T + 500_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[
+            (6, T + 2_000_000_000, T + 3_000_000_000),
+        ]))
+        .unwrap();
+    bid_window(&router)
+        .append_with_watermark(bid_batch(&[(6, 3, 300, T + 2_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(super::tests::field_str(&alert, "__wfu_entity_id"), "5");
+
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[
+            (7, T + 4_000_000_000, T + 5_000_000_000),
+        ]))
+        .unwrap();
+    bid_window(&router)
+        .append_with_watermark(bid_batch(&[(7, 7, 7, T + 4_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(super::tests::field_str(&alert, "__wfu_entity_id"), "6");
+
+    // 三个实例都已评估（pending 只剩 7 号，min lo = T+4s）。
+    // 修复前：lo_min 缓存 = 历史最小 = T（1 号实例的 lo）→ pin = T。
+    // 修复后：drain 标 dirty → publish 重算 → pin = T+4s。
+    let pin_floor = bid_window(&router).retention_floor_ns();
+    assert!(
+        pin_floor >= T + 4_000_000_000,
+        "pin 必须随 pending drain 推进（当前 pending min lo = T+4s），实际 pin_floor={pin_floor}"
+    );
+
+    // 时间驱逐：now=T+20s、over=10s → cutoff=T+10s。三条 bid 都在 cutoff 前。
+    // 修复前 pin=T → 全被 pin 住 → 不驱逐（BUG：整窗保留）。
+    // 修复后 pin=T+4s → T+0.5s / T+2s 两条 < pin → 驱逐；T+4s 那条 = pin
+    //（auction 7 的 lo，挂起实例区间起点）→ 合法保留（正确性）。
+    bid_window(&router).evict_expired(T + 20_000_000_000);
+    assert_eq!(
+        bid_window(&router).total_rows(),
+        1,
+        "pin 推进后 over 窗口外的旧右行必须可驱逐（仅剩当前挂起实例区间内的行）"
+    );
+}
+
+/// 跨源提交乱序 × deferred 评估 gate（30M q4 over=30m -860 的机制回归）：
+///
+/// ingress `instances=8` + parse 并行派发下，窗口 actor 只保证 **source 内**
+/// seq 有序，跨 source 提交顺序自由——全局 `max_event_time` 会被任一 source 的
+/// 远未来 batch 提前推高。修复前 gate 用它 → 右行未落地就评估 → 假 miss →
+/// 行随后被 over 时间驱逐 → flush 重试无法恢复（-860）。修复后 gate 用
+/// `min(驱动 wm, 健全提交前沿 = 各源已提交 max 的 min)` → 右行真正落地才评估。
+#[tokio::test]
+async fn deferred_q9_cross_source_reorder_holds_evaluation_until_committed() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_deferred_join_task();
+    let src_a: Arc<str> = Arc::from("ingress#1");
+    let src_b: Arc<str> = Arc::from("ingress#2");
+    let bw = bid_window(&router);
+    let schema = bw.schema().clone();
+
+    // auction 5 挂起（lo=T, expiry=T+30s）
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[(5, T, T + 30_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+
+    // 跨源乱序：source A 先提交远未来 bid（全局 max → T+100s），
+    // source B 只提交到 T+2s（无关 auction 98）→ 健全前沿 = T+2s。
+    bw.append_with_watermark_sized_from(
+        bid_batch(&[(99, 9, 9, T + 100_000_000_000)]),
+        0,
+        None,
+        Arc::clone(&src_a),
+    )
+    .unwrap();
+    bw.append_with_watermark_sized_from(
+        bid_batch(&[(98, 8, 8, T + 2_000_000_000)]),
+        0,
+        None,
+        Arc::clone(&src_b),
+    )
+    .unwrap();
+
+    // 驱动 wm 追平 expiry（auction 6 @ T+31s）
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[
+            (6, T + 31_000_000_000, T + 61_000_000_000),
+        ]))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "修复前：eff_wm=全局 max=T+100s ≥ expiry → 提前评估假 miss；\
+         修复后：eff_wm=min(驱动 T+31s, 前沿 T+2s)=T+2s < expiry → 保持挂起"
+    );
+
+    // source B 提交 auction 5 的右行（@T+5s）→ 前沿 = T+5s < expiry → 仍挂起
+    bw.append_with_watermark_sized_from(
+        bid_batch(&[(5, 1, 100, T + 5_000_000_000)]),
+        0,
+        None,
+        Arc::clone(&src_b),
+    )
+    .unwrap();
+    task.pull_and_advance().await;
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "前沿（T+5s）未过 expiry（T+30s）前保持挂起"
+    );
+
+    // source B 提交到 T+40s → 前沿 = T+40s ≥ expiry；auction 7 @ T+45s 触发
+    // 下一次扫描：eff_wm = min(驱动 T+45s, 前沿 T+40s) = T+40s ≥ T+30s →
+    // 评估命中（右行已提交）
+    bw.append_with_watermark_sized_from(
+        bid_batch(&[(97, 7, 7, T + 40_000_000_000)]),
+        0,
+        None,
+        Arc::clone(&src_b),
+    )
+    .unwrap();
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[
+            (7, T + 45_000_000_000, T + 75_000_000_000),
+        ]))
+        .unwrap();
+    task.pull_and_advance().await;
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "5",
+        "右行提交后评估命中"
+    );
+    assert_eq!(
+        super::tests::field_str(&alert, "winner_bidder"),
+        "1",
+        "maxrow(price) 胜者 = bidder 1"
+    );
 }
 
 #[tokio::test]

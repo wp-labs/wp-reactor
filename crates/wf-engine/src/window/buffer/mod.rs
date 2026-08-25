@@ -393,6 +393,16 @@ pub struct Window {
     /// 10 shards each stop ~1.8-4.3ms early → a tail session with
     /// `last_event+gap ≤ global end` was misjudged incomplete and dropped).
     max_event_time_nanos: AtomicI64,
+    /// 2026-08-25（跨源提交乱序修复）：按 source 记录的**已提交**最大事件时间。
+    /// 窗口 actor 对每个 source 按 seq 顺序提交（跨 source 提交顺序自由）——
+    /// 全局 `max_event_time_nanos` 可能被任一 source 的晚 batch 提前推高，而
+    /// 其它 source 的早期行还没落地（ingress instances=8 + parse 并行派发）。
+    /// deferred 评估 gate 若用全局 max，会在右行未提交时提前评估 → 假 miss
+    /// （30M q4 over=30m -860 的根因，2026-08-25 实测）。`committed_frontier_ns`
+    /// = 各 source 已提交 max 的 **min**——所有 source 的行都提交到该水位，
+    /// 才是健全的"右行完整性"判据。非 actor 路径（单测/内嵌，source=None）
+    /// 不记录 → 回退全局 max（旧行为）。
+    per_source_max_event_time: std::sync::Mutex<std::collections::HashMap<Arc<str>, i64>>,
     /// Aggregate retained content bytes (approximate under concurrency —
     /// exact in the single-writer steady state).
     current_bytes: AtomicUsize,
@@ -454,6 +464,7 @@ impl Window {
             next_seq: AtomicU64::new(0),
             watermark_nanos: AtomicI64::new(i64::MIN),
             max_event_time_nanos: AtomicI64::new(i64::MIN),
+            per_source_max_event_time: std::sync::Mutex::new(std::collections::HashMap::new()),
             current_bytes: AtomicUsize::new(0),
             total_rows: AtomicUsize::new(0),
             batch_count: AtomicUsize::new(0),

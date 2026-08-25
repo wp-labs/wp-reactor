@@ -438,6 +438,7 @@ impl Router {
             window.events,
             byte_size,
             None, // inline/ordered path: no precomputed shard partition
+            None, // inline/ordered path: no per-source frontier tracking
         )
         .await?;
         Ok(WindowRouteOutcome {

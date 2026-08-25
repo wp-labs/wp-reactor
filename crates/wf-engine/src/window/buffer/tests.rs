@@ -437,6 +437,59 @@ fn evict_oldest_acked_respects_retention_pin() {
     assert_eq!(win.batch_count(), 1);
 }
 
+/// D4（2026-08-25 闭环）：**时间驱逐同样尊重保留 pin**——deferred join 的
+/// 挂起实例需要 `[lo, hi]` 内的右行，`over` 只是内存参数，绝不能因调小 over
+/// 删掉评估还要用的行（100M q4 over=1h 精确 / over=30m 欠发 6-9k 的根因）。
+/// 只删整体在 pin 之前的批；`event_time_range.1 ≥ pin` 的批保留到评估后。
+#[test]
+fn evict_expired_respects_retention_pin() {
+    let schema = test_schema();
+    let win = Window::new(
+        WindowParams {
+            name: "time_pin".into(),
+            schema,
+            time_col_index: Some(0),
+            over: Duration::from_secs(10),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        test_config(usize::MAX),
+    );
+    let progress = Arc::new(WindowProgress::new());
+    win.set_progress(Arc::clone(&progress));
+    let pin = progress.register_retention_pin();
+
+    // 无 pin 约束（pin 释放到 i64::MAX = 无 pin；注册默认 i64::MIN 是 fail-safe
+    // 全保留，不是"无 pin"）时行为与旧实现一致：时间驱逐自由删过期批。
+    pin.store(i64::MAX, Ordering::Release);
+    win.append(make_batch(win.schema(), &[1_000_000_000], &[100]))
+        .unwrap(); // seq 0, ts 1s
+    win.append(make_batch(win.schema(), &[15_000_000_000], &[300]))
+        .unwrap(); // seq 1, ts 15s
+    // cutoff = 30s - 10s = 20s；两批都 < 20s → 全删（无 pin 不拦）。
+    win.evict_expired(30_000_000_000);
+    assert_eq!(win.batch_count(), 0, "无 pin 时时间驱逐行为不变");
+
+    // 重新 append：pin = 12s → seq0(1s) 在前沿前可删，seq1(15s) 被 pin 住。
+    win.append(make_batch(win.schema(), &[1_000_000_000], &[100]))
+        .unwrap(); // seq 2, ts 1s
+    win.append(make_batch(win.schema(), &[15_000_000_000], &[300]))
+        .unwrap(); // seq 3, ts 15s
+    pin.store(12_000_000_000, Ordering::Release);
+    // cutoff = 20s：两批时间上都够老，但 seq3（max 15s ≥ pin 12s）被 pin 挡住。
+    win.evict_expired(30_000_000_000);
+    assert_eq!(
+        win.batch_count(),
+        1,
+        "pin 住的批不得被时间驱逐（over 是内存参数，不能删评估还要用的行）"
+    );
+
+    // 释放 pin → 时间驱逐恢复：seq3（15s < 20s）现在可删。
+    pin.store(i64::MAX, Ordering::Release);
+    win.evict_expired(30_000_000_000);
+    assert_eq!(win.batch_count(), 0, "释放 pin 后时间驱逐恢复正常");
+}
+
 /// `front_pinned_by_retention` 直接单测：空窗口 / 无 pin / front 在前沿内 /
 /// front 在前沿外 / 释放后 五种状态。evictor 用它做候选选择，语义必须精确。
 #[test]
@@ -611,7 +664,83 @@ fn append_with_watermark_on_time() {
     assert_eq!(win.watermark_nanos(), 5_000_000_000);
 }
 
-// -- 11. append_with_watermark_drop_late ----------------------------------
+// -- 10b. committed_frontier_ns（跨源提交乱序修复） -------------------------
+
+/// 健全提交前沿 = 各 source 已提交 max 的 min（2026-08-25 跨源提交乱序修复）：
+/// 全局 `max_event_time` 会被任一 source 的晚 batch 提前推高，deferred 评估
+/// gate 用它会在右行未提交时提前评估 → 假 miss（30M q4 over=30m -860）。
+/// `committed_frontier_ns` 才是"右行完整性"的健全判据。
+#[test]
+fn committed_frontier_tracks_per_source_min() {
+    // allowed_lateness=60s：跨 source 乱序的旧 batch 不丢（生产 = 30m）。
+    let mut cfg = test_config(usize::MAX);
+    cfg.allowed_lateness = Duration::from_secs(60).into();
+    let schema = test_schema();
+    let win = Window::new(
+        WindowParams {
+            name: "test_win".into(),
+            schema,
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        cfg,
+    );
+
+    // 无 per-source 记录（非 actor 路径）→ 回退全局 max（旧行为）。
+    win.append_with_watermark(make_batch(&win.schema().clone(), &[10_000_000_000], &[1]))
+        .unwrap();
+    assert_eq!(win.max_event_time_nanos(), 10_000_000_000);
+    assert_eq!(win.committed_frontier_ns(), 10_000_000_000);
+
+    // actor 路径：source A 提交到 50s，source B 提交到 20s → 前沿 = 20s。
+    let src_a: Arc<str> = Arc::from("ingress#1");
+    let src_b: Arc<str> = Arc::from("ingress#2");
+    let schema = win.schema().clone();
+    win.append_with_watermark_sized_from(
+        make_batch(&schema, &[50_000_000_000], &[2]),
+        0,
+        None,
+        Arc::clone(&src_a),
+    )
+    .unwrap();
+    win.append_with_watermark_sized_from(
+        make_batch(&schema, &[20_000_000_000], &[3]),
+        0,
+        None,
+        Arc::clone(&src_b),
+    )
+    .unwrap();
+    assert_eq!(
+        win.max_event_time_nanos(),
+        50_000_000_000,
+        "全局 max 被 source A 的晚 batch 推高（跨源乱序）"
+    );
+    assert_eq!(
+        win.committed_frontier_ns(),
+        20_000_000_000,
+        "健全前沿 = min(按源已提交) = 20s——source B 的行只提交到 20s"
+    );
+
+    // source B 追平 → 前沿推进；随后 source A 继续 → 前沿跟随较慢者。
+    win.append_with_watermark_sized_from(
+        make_batch(&schema, &[60_000_000_000], &[4]),
+        0,
+        None,
+        Arc::clone(&src_b),
+    )
+    .unwrap();
+    assert_eq!(win.committed_frontier_ns(), 50_000_000_000);
+    win.append_with_watermark_sized_from(
+        make_batch(&schema, &[70_000_000_000], &[5]),
+        0,
+        None,
+        Arc::clone(&src_a),
+    )
+    .unwrap();
+    assert_eq!(win.committed_frontier_ns(), 60_000_000_000);
+}
 
 #[test]
 fn append_with_watermark_drop_late() {

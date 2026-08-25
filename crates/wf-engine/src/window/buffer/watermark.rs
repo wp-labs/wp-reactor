@@ -23,11 +23,11 @@ impl Window {
     /// Windows without a time column never advance the watermark and never
     /// reject data as late.
     pub fn append_with_watermark(&self, batch: RecordBatch) -> CoreResult<AppendOutcome> {
-        self.append_with_watermark_inner(batch, None, None, None)
+        self.append_with_watermark_inner(batch, None, None, None, None)
             .map(|(outcome, _)| outcome)
     }
 
-    /// Like [`Self::append_with_watermark`], but stores already-parsed events
+    /// Like [`Self::append_with_watermark_parsed`], but stores already-parsed events
     /// (produced outside the window by the router) so rule reads never
     /// contend on the batch's `OnceLock`.
     pub fn append_with_watermark_parsed(
@@ -35,7 +35,7 @@ impl Window {
         batch: RecordBatch,
         parsed_events: Arc<Vec<Arc<Event>>>,
     ) -> CoreResult<AppendOutcome> {
-        self.append_with_watermark_inner(batch, Some(parsed_events), None, None)
+        self.append_with_watermark_inner(batch, Some(parsed_events), None, None, None)
             .map(|(outcome, _)| outcome)
     }
 
@@ -51,7 +51,13 @@ impl Window {
         byte_size: usize,
         shard_rows: Option<Arc<Vec<Vec<u32>>>>,
     ) -> CoreResult<(AppendOutcome, u64)> {
-        self.append_with_watermark_inner(batch, Some(parsed_events), Some(byte_size), shard_rows)
+        self.append_with_watermark_inner(
+            batch,
+            Some(parsed_events),
+            Some(byte_size),
+            shard_rows,
+            None,
+        )
     }
 
     /// Like [`Self::append_with_watermark_parsed_sized`], but without pre-parsed
@@ -64,7 +70,21 @@ impl Window {
         byte_size: usize,
         shard_rows: Option<Arc<Vec<Vec<u32>>>>,
     ) -> CoreResult<(AppendOutcome, u64)> {
-        self.append_with_watermark_inner(batch, None, Some(byte_size), shard_rows)
+        self.append_with_watermark_inner(batch, None, Some(byte_size), shard_rows, None)
+    }
+
+    /// 2026-08-25（跨源提交乱序修复）：窗口 actor 专用入口——带提交来源。
+    /// 与 [`Self::append_with_watermark_sized`] 等价，但会记录该 source 的
+    /// 已提交最大事件时间（`committed_frontier_ns` 的输入）。deferred 评估
+    /// gate 用健全前沿替代全局 max，避免跨源乱序下的假 miss。
+    pub fn append_with_watermark_sized_from(
+        &self,
+        batch: RecordBatch,
+        byte_size: usize,
+        shard_rows: Option<Arc<Vec<Vec<u32>>>>,
+        source: Arc<str>,
+    ) -> CoreResult<(AppendOutcome, u64)> {
+        self.append_with_watermark_inner(batch, None, Some(byte_size), shard_rows, Some(source))
     }
 
     fn append_with_watermark_inner(
@@ -73,6 +93,7 @@ impl Window {
         parsed_events: Option<Arc<Vec<Arc<Event>>>>,
         byte_size: Option<usize>,
         shard_rows: Option<Arc<Vec<Vec<u32>>>>,
+        source: Option<Arc<str>>,
     ) -> CoreResult<(AppendOutcome, u64)> {
         if batch.num_rows() == 0 {
             return Ok((AppendOutcome::Appended, 0));
@@ -152,7 +173,38 @@ impl Window {
                 0
             }
         };
+        // 2026-08-25（跨源提交乱序修复）：记录该 source 的已提交最大事件时间。
+        // 只在真正 append（非 DroppedLate）后记录；无时间列窗口不推进 max，
+        // 不记录（源路径不产生时间语义）。
+        if let Some(src) = source
+            && self.time_col_index.is_some()
+            && max_event_time != i64::MAX
+        {
+            self.per_source_max_event_time
+                .lock()
+                .expect("per-source max lock poisoned")
+                .entry(src)
+                .and_modify(|m| *m = (*m).max(max_event_time))
+                .or_insert(max_event_time);
+        }
         Ok((AppendOutcome::Appended, seq))
+    }
+
+    /// 2026-08-25（跨源提交乱序修复）：**健全提交前沿** = 各 source 已提交
+    /// 最大事件时间的 min。`max_event_time_nanos`（全局 max）可能被任一 source
+    /// 的晚 batch 提前推高（actor 只保证 source 内 seq 有序，跨 source 自由），
+    /// deferred 评估 gate 用它会在右行未提交时提前评估 → 假 miss。
+    /// `committed_frontier_ns` 是"右行完整性"的健全判据：所有 source 的行都
+    /// 已提交到该水位。无记录（非 actor 路径 append）时回退全局 max（旧行为）。
+    pub fn committed_frontier_ns(&self) -> i64 {
+        let m = self
+            .per_source_max_event_time
+            .lock()
+            .expect("per-source max lock poisoned");
+        if m.is_empty() {
+            return self.max_event_time_nanos();
+        }
+        m.values().copied().min().unwrap_or_else(|| self.max_event_time_nanos())
     }
 
     /// Current watermark in nanoseconds.

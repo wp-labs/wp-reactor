@@ -49,6 +49,7 @@ pub(super) async fn commit_appended_batch(
     events: Option<Arc<Vec<Arc<Event>>>>,
     byte_size: usize,
     shard_rows: Option<Arc<[Vec<u32>]>>,
+    source: Option<Arc<str>>,
 ) -> CoreResult<(AppendOutcome, u64)> {
     // Clone the raw batch for the columnar rule push; the append below moves
     // the original into the window. `RecordBatch` clone is O(columns) Arc bumps.
@@ -66,6 +67,10 @@ pub(super) async fn commit_appended_batch(
             byte_size,
             stored_shard_rows.clone(),
         )
+    } else if let Some(src) = source {
+        // 2026-08-25（跨源提交乱序修复）：actor 路径带提交来源，窗口记录
+        // 按源已提交前沿（deferred 评估 gate 的健全判据）。
+        win.append_with_watermark_sized_from(batch, byte_size, stored_shard_rows, src)
     } else {
         win.append_with_watermark_sized(batch, byte_size, stored_shard_rows)
     };

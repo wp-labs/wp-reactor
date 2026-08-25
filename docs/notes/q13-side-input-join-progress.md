@@ -1133,3 +1133,115 @@ RSS 构成（footprint）：bid 窗 6.8GB（over=1h 语义保留，33.1M 行）+
    数字待更新）
 3. q9 100M 复测（同款 deferred bid 目标，预期不再断崖）
 4. q15 归并异步化（可选）；q3 −16% 独立 bug（与驱逐无关）
+
+## Q4 三档规模（10M/30M/100M）EPS + 内存记录（2026-08-25，gate 修复后实测）
+
+### 实测（哨兵 EPS，同机同帧源，rate=3M/s；100M 行 = 多次运行范围）
+
+| 规模 | EPS | RSS_peak | q4a EMIT | oracle | 偏差 | bid 窗 | bid 行数 | 事件跨度 |
+|------|-----|----------|----------|--------|------|--------|---------|---------|
+| 10M | 10.0M | 3,345MB | 557,204 | 557,204 | 0 | ~1.8GB | 9.2M | 1000s=17min |
+| 30M | 10.5M | 9,180MB | 1,672,559 | 1,672,559 | 0 | ~5.4GB | 27.6M | 3000s=50min |
+| 100M | 10.7-10.9M | 17,076-17,317MB | 5,575,588-5,576,436 | 5,576,436 | 0~0.015% | 6.8GB | 33.1M | 10000s=2h46m |
+
+（10M/30M oracle = 历史对拍值，见 SEMANTIC_SUPPORT_MATRIX/CAPABILITY_GAP_MATRIX；
+100M oracle = wfgen verify 5,576,436）
+
+### 变化逻辑
+
+**EPS：与规模基本无关**（10.0/10.5/10.7M）——流式吞吐受速率（3M/s 摄入）与
+引擎并行度限制，不受总量影响；10M 略低是启动/尾部占比噪声。gate 修复后
+30M/100M EPS ≈ 10.5M（修前 12.98M，正确性换取的小幅回落）。
+
+**内存：稳态窗 = 速率 × over（有界），与总量无关；三档阶梯是「未满 over 的
+全量」vs「满 over 的 1h 保留」之差**：
+
+- 稳态 bid 窗行数 = bid 速率 × 1h：10M=9.2M×3600/1000=33.1M、30M=27.6M×
+  3600/3000=33.1M、100M=33.1M——**三档同密度下完全相等**（若都跑满 1h）。
+- 实际 10M/30M 数据跨度 < 1h → 零时间驱逐 → 窗内 = 全量（9.2M/27.6M），
+  **没装满 over 容量**；100M 跨度 2h46m > 1h → 驱逐到 1h → 33.1M。
+- RSS 阶梯 = bid 窗（1.8→5.4→6.8GB）+ join 索引（随窗行数 0.6→1.3→1.9GB）
+  + auction 窗（0.4→0.9→1.15GB）+ person/auction_finals（~0.4GB 恒定级）
+  + parse buffer 2GB（恒定）+ 引擎基线（q1 100M 即 5.4GB）。
+- 随总量增长的项只剩 missed 真 miss（~8.7%×auction 数，100M≈0.5GB，EOS 后
+  释放）——修前 ~50% 假 miss 积压已消除。
+
+### ⚠ 新发现：100M 尾部抖动（0~848 条，0~0.015%，待修）
+
+三次 100M 运行 EMIT：5,576,436（精确）/ 5,576,349（-87）/ 5,575,588（-848）。
+30M/10M 多次运行均精确。根因 = **keep-running EOS 竞态**（2026-08-23 曾为 q8
+修过同类：daemon 收有限输入的 EOS 时窗口 actors 可能仍在排空 mailbox）：
+
+- flush 用 final_wm（驱动窗 raw max_event_time）评估尾部 pending，但 bid 窗
+  （actor 排空中）可能未 append 到 final_wm → 尾部（数据末 ~1-2s 内的
+  auction，≈600-900 条）评估 miss → 进 missed；
+- reevaluate_deferred_missed 立即重试一次——若 bid 窗此时仍未追平 → 保留回
+  missed → 任务退出 → 丢。30M 尾部小 + 排空快所以未观察到。
+- 修前该竞态被 63% 欠发淹没；gate 后尾部 pending 统一到 flush 评估，暴露面
+  变成可观测的千条级抖动。
+
+修复方向（未做）：flush 的 deferred 分支等目标窗 max_event_time 追平 final_wm
+再评估（目标已 ingest 完全部输入，追平只差 actor 排空时间）；或退出前补一轮
+deferred flush。需配单测（模拟 flush 时目标未追平 → 追平后补出）。
+
+## ✅ 跨源提交乱序 × 健全前沿 gate（2026-08-25，本 session 落地）——30M over=30m -860 + 10M +2 + 内存 9.2GB 三连根治
+
+### 背景
+用户定调「不可能调 over 影响正确性」：D4 时间驱逐闭环后，30M over=30m 仍欠
+发 -854/-872（oracle 1,672,559 vs 1,671,687/1,671,705）。探针实锤：flush 时
+每 shard missed≈15.5k（重试恢复 99.4%，剩 ~85/shard = -860），仍 miss 的实例
+**都在数据开头 43ms~150s**（tail_delta≈2800s）——运行期假 miss → 行被 over 驱逐
+→ flush 重试无法恢复。
+
+### 根因 1：跨源提交乱序 → 运行期假 miss（正确性）
+- ingress `instances=8` + parse 10 并行派发：窗口 actor 只保证 **source 内** seq
+  有序（pending map 重排），**跨 source 提交顺序自由**。全局 `max_event_time`
+  被任一 source 的远未来 batch 提前推高。
+- 上轮 gate 用 `target_wm`（全局 max）→ 实例到期评估时右行可能还在延迟 batch
+  里 → 假 miss → missed（不再 pin）→ 行随后被 over=30m 驱逐 → 欠发。
+- **修复：`committed_frontier_ns`（各 source 已提交 max 的 min）**——actor 提交
+  时带 source 记录（`append_with_watermark_sized_from`），窗口暴露健全前沿；
+  运行期 gate = `min(驱动 wm, 健全前沿)`。驱动 wm 是 oracle 语义边界，前沿是
+  右行完整性判据。flush wait loop 同步改用前沿。
+
+### 根因 2：flush final_wm 误用 max(驱动,目标) → 10M +2（多发）
+- oracle 的 deferred watermark = **最后驱动事件时间**（wfgen oracle/mod.rs 469），
+  verify 不推进 EOS——不是全局 max。上轮把目标窗 max 并入 final_wm → 尾部
+  expiry ∈ (驱动末尾, 目标末尾] 的实例被评估 → 10M 557,206 vs oracle 557,204。
+- **修复：回退驱动窗 max**（wait loop 保留，改用前沿）。
+
+### 根因 3：lo_min 历史最小缓存 → pin 卡起点 → 内存 9.2GB（over 不降内存）
+- `lo_min` 缓存 = 插入时单调不增的 min（drain 不更新，注释写"偏保守安全"）——
+  正确性安全但内存不释放：任何 shard pending 非空 → pin = 历史第一个实例的
+  lo ≈ 流起点 → 时间驱逐全被挡（探针：pin_floor=起点+1ms、evict=0、
+  rows=27600000 整窗保留）。
+- **修复：scan drain 到期前缀后标 `lo_min_dirty`**，publish 重算当前 pending 的
+  min lo。旧 O(n²) 担忧是 63% 假 miss 时代（33M 挂起 × 2740 batch）的产物；
+  gate 修复后 pending 很小（~100-29k），O(n) 无压力。
+- 附带修复：gate 的 `frontier==i64::MIN` 回退（启动期目标窗空 → 对着空窗评估
+  = 假 miss）改为**挂起等待**首个提交。
+
+### 修复的测试（全部验证守护方向）
+- wf-engine `committed_frontier_tracks_per_source_min`：按源前沿 = min，空回退
+  max。
+- wf-runtime `deferred_q9_cross_source_reorder_holds_evaluation_until_committed`：
+  跨源乱序下评估必须等右行提交（sed 反证：旧 gate 失败）。
+- wf-runtime `deferred_q9_pin_floor_advances_with_pending_drain`：pin 随 pending
+  drain 推进，over 外旧行可驱逐（sed 反证：无 lo_min_dirty 失败）。
+- wf-runtime `deferred_q9_time_eviction_pin_keeps_in_range_bids`：D4 时间驱逐闭
+  环正路径（pin 保住越驱逐线的行）。
+- 顺带修复预先存在的 perf_diag 测试污染：`set_perf_cuts_flips_both_gates` 缺
+  reset（PERF_CUT_OUTPUT 常开 → 并行测试 emit 被切丢输出）；非门控测试改用
+  `no_cut_stage`（run_sentinel_task 等长测试曾持 cut_output=true 达数秒）。
+
+### 实测（哨兵 EPS，over=30m，正确性 + 内存双达标）
+
+| 规模 | EMIT | oracle | RSS_peak | evict | 修复前 RSS |
+|------|------|--------|----------|-------|-----------|
+| 10M | 557,204 | 557,204 ✓ | 3,344MB | 0 | 3,345MB（+2 消失）|
+| 30M | 1,672,559 | 1,672,559 ✓ | 6,698MB | 468 | 9,180MB（-860 消失）|
+| 100M ×2 | 5,576,436 | 5,576,436 ✓（两次一致） | 8,709MB | 2272 | 17.6GB（欠发 6-9k 消失，尾部抖动 0~848 也消失）|
+| q9 30M | 1,672,559 | 1,672,559 ✓ | 6,554MB | 468 | — |
+
+over=30m 真正成为纯内存参数：三档全部 oracle 精确，100M RSS 17.6GB → 8.7GB
+（比预期 ~13GB 更低）。

@@ -14,6 +14,13 @@ impl Window {
     /// completeness for system-wide window boundedness — one slow rule must not
     /// pin every window's eviction and drag the whole engine down.
     ///
+    /// D4（2026-08-25 扩展）：**保留 pin 同样约束时间驱逐**（`retention_floor_ns`）
+    /// ——deferred join 的挂起实例需要 `[lo, hi]` 内的右窗行，`over` 只是内存保留
+    /// 参数，绝不能因调小 over 删掉评估还要用的行（100M q4 over=1h 精确 /
+    /// over=30m 欠发 6-9k 的根因，2026-08-25）。`pinned && event_time_range.1
+    /// ≥ retention_ns` 的批（可能含挂起实例需要的行）保留；只删整体在 pin 之
+    /// 前的批。与 `evict_oldest_acked` 的 D4 检查逐分支一致。
+    ///
     /// No-op for windows without a time column or with `over == Duration::ZERO`.
     ///
     /// This unfettered variant is used when the window has no pull consumers
@@ -46,6 +53,11 @@ impl Window {
         // windows appended without `append_with_watermark`) must not panic and
         // must not evict anything (no batch time < i64::MIN).
         let cutoff = now_nanos.saturating_sub(over_nanos);
+        // D4：保留 pin（deferred join 评估前沿）同样挡住时间驱逐——`pinned &&
+        // event_time_range.1 ≥ retention_ns` 的批可能含挂起实例要评估的行，
+        // over 不能删它们（正确性不依赖 over）。`i64::MAX` = 无 pin → 跳过。
+        let retention_ns = self.retention_floor_ns();
+        let pinned = retention_ns != i64::MAX;
 
         let mut evicted = false;
         {
@@ -55,7 +67,9 @@ impl Window {
                     let Some((_, tb)) = log.first_key_value() else {
                         break;
                     };
-                    tb.event_time_range.1 < cutoff && tb.seq < acked_floor
+                    tb.event_time_range.1 < cutoff
+                        && tb.seq < acked_floor
+                        && !(pinned && tb.event_time_range.1 >= retention_ns)
                 };
                 if !removable {
                     break;

@@ -612,6 +612,10 @@ mod tests {
         set_perf_cuts(false, true);
         assert!(!perf_cut_rules());
         assert!(perf_cut_output());
+        // 复位，避免污染其它测试：全局 static 门控，并行测试的 emit 会
+        // 被 `perf_cut_output()` 早退丢输出（2026-08-25 实测：deferred_q8
+        // EOS 重试 emit 被切 → 断言 left=[]）。
+        reset_perf_diag();
     }
 
     // -- 哨兵载荷解析 -------------------------------------------------------
@@ -807,6 +811,19 @@ mod tests {
         }
     }
 
+    /// 无门控 stage（cut 全 false）——只测控制器/哨兵状态机、不测门控翻转的
+    /// 测试用它，避免并行测试期间全局 `PERF_CUT_*` 被拉高（会切断其它测试的
+    /// 规则求值/输出链，2026-08-25 实测：deferred_q8 EOS 重试 emit 被切 →
+    /// 断言 left=[]；lifecycle metrics 规则求值被切 → emitted_total=0）。
+    fn no_cut_stage(name: &str) -> PerfStage {
+        PerfStage {
+            name: name.into(),
+            cut_rules: false,
+            cut_output: false,
+            rules: None,
+        }
+    }
+
     #[tokio::test]
     async fn controller_applies_next_stage_on_sentinel() {
         let _g = serial();
@@ -847,7 +864,7 @@ mod tests {
     #[tokio::test]
     async fn controller_idempotent_on_repeat_rounds() {
         let _g = serial();
-        init_perf_diag(&test_config(vec![floor_stage(), rules_stage()]));
+        init_perf_diag(&test_config(vec![no_cut_stage("a"), no_cut_stage("b")]));
         let controller = PerfDiagController::new();
         // 同一 round 重复（--rounds 2）：只切换一次。
         assert!(controller.on_sentinel(0).await.is_some());
@@ -873,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn controller_negative_round_is_noop() {
         let _g = serial();
-        init_perf_diag(&test_config(vec![floor_stage(), rules_stage()]));
+        init_perf_diag(&test_config(vec![no_cut_stage("a"), no_cut_stage("b")]));
         let controller = PerfDiagController::new();
         assert!(controller.on_sentinel(-1).await.is_none());
         assert_eq!(controller.current(), 0);
@@ -1100,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn process_sentinel_push_writes_stage_then_sentinel() {
         let _g = serial();
-        init_perf_diag(&test_config(vec![floor_stage(), rules_stage()]));
+        init_perf_diag(&test_config(vec![no_cut_stage("a"), no_cut_stage("b")]));
         let (fanout, mut rx) = test_fanout();
         let controller = PerfDiagController::new();
         let batch = sentinel_batch(&[0], &[100], &[1_000]);
@@ -1116,7 +1133,7 @@ mod tests {
     async fn run_sentinel_task_processes_then_exits_on_cancel() {
         let (router, _win) = drain_router();
         let _g = serial();
-        init_perf_diag(&test_config(vec![floor_stage()]));
+        init_perf_diag(&test_config(vec![no_cut_stage("a")]));
         let controller = PerfDiagController::new();
         let (fanout, mut rx) = test_fanout();
         let (tx, rx_ch) = tokio::sync::mpsc::channel::<RulePush>(8);
@@ -1158,11 +1175,11 @@ mod tests {
     async fn controller_reloads_rules_subset_via_control_handle() {
         let _g = serial();
         init_perf_diag(&test_config(vec![
-            floor_stage(),
+            no_cut_stage("floor"),
             PerfStage {
                 name: "c_family".into(),
                 cut_rules: false,
-                cut_output: true,
+                cut_output: false,
                 rules: Some("models/rules/c_family.wfl".into()),
             },
         ]));
@@ -1305,11 +1322,11 @@ rules = "rules/basic.wfl"
     async fn controller_reload_failure_still_advances() {
         let _g = serial();
         let (controller, mut rx) = controller_with_baseline(vec![
-            floor_stage(),
+            no_cut_stage("floor"),
             PerfStage {
                 name: "c_family".into(),
                 cut_rules: false,
-                cut_output: true,
+                cut_output: false,
                 rules: Some("models/rules/c_family.wfl".into()),
             },
         ])
@@ -1337,11 +1354,11 @@ rules = "rules/basic.wfl"
         let _g = serial();
         // 目标点 rules 与基线相同 → changed=false → 不触发 reload（reloaded=false）。
         let (controller, mut rx) = controller_with_baseline(vec![
-            floor_stage(),
+            no_cut_stage("floor"),
             PerfStage {
                 name: "same_rules".into(),
                 cut_rules: false,
-                cut_output: true,
+                cut_output: false,
                 rules: Some("rules/basic.wfl".into()),
             },
         ])
@@ -1363,11 +1380,11 @@ rules = "rules/basic.wfl"
     async fn controller_reload_without_baseline_applies_without_reload() {
         let _g = serial();
         init_perf_diag(&test_config(vec![
-            floor_stage(),
+            no_cut_stage("floor"),
             PerfStage {
                 name: "c_family".into(),
                 cut_rules: false,
-                cut_output: true,
+                cut_output: false,
                 rules: Some("models/rules/c_family.wfl".into()),
             },
         ]));

@@ -157,10 +157,11 @@ struct DeferredRuntime {
     /// progress 表（单测窗口）或 join 目标不是 buffer 窗口（provider 静态表
     /// 不驱逐，无需 pin）。
     retention_pin: Option<Arc<std::sync::atomic::AtomicI64>>,
-    /// 存活挂起（pending + missed）的 min(lo_ns) 缓存（2026-08-25 q4 100M）：
+    /// 存活**挂起（未评估）**的 min(lo_ns) 缓存（2026-08-25 q4 100M）：
     /// `publish_retention_floor` 不再每次全量扫 O(n)。插入时 O(1) 更新；
     /// scan 移出前缀后若最小项被移出则标 dirty，publish 时重扫——因 min lo
     /// 项几乎总是最早挂起（数据时间单调），dirty 极少，摊销 O(1)。
+    /// （missed 不再参与 pin/lo_min——评估 gate 后运行期 miss 即真 miss。）
     lo_min: i64,
     lo_min_dirty: bool,
 }
@@ -168,13 +169,10 @@ struct DeferredRuntime {
 impl DeferredRuntime {
     /// D4：把本规则的保留前沿发布到 join 目标窗口。
     ///
-    /// 前沿 = 存活挂起实例的 `min(lo_ns)`——每个实例需要 `[lo_ns, hi_ns]` 内的
-    /// 右窗行，比最早的 `lo_ns` 更旧的行任何实例都用不到。无挂起（含 missed）时
-    /// 退回本规则 watermark：**这依赖驱动流事件时间单调**——未来挂起实例由更晚
-    /// 的驱动事件产生，其 `lo_ns` 不会早于 watermark。若驱动流乱序（多生产者
-    /// 交错摄入），乱序到达的实例会在评估时 miss 进 `missed`，把前沿拉回其
-    /// `lo_ns`（见下）——乱序深度大于首个 miss 之前的窗口期才可能丢行；
-    /// 实测（nexmark 30M 10 生产者）首 miss 极早发生，前沿随即被拉低，无丢失。
+    /// 前沿 = 存活**挂起（未评估）**实例的 `min(lo_ns)`——每个实例需要
+    /// `[lo_ns, hi_ns]` 内的右窗行，比最早的 `lo_ns` 更旧的行任何实例都用不到。
+    /// 无挂起时退回本规则 watermark：**这依赖驱动流事件时间单调**——未来挂起
+    /// 实例由更晚的驱动事件产生，其 `lo_ns` 不会早于 watermark。
     ///
     /// ⚠ watermark 尚未初始化（`i64::MIN`，还没见过驱动事件）时**就发布
     /// `i64::MIN` = 全保留**：此时本规则还不知道自己的前沿，不能放行。曾把它
@@ -182,34 +180,32 @@ impl DeferredRuntime {
     /// 驱动事件触发，把刚预注册的 pin 立即释放 → q4 30M 仍丢 0.67% 输出
     ///（2026-08-24 实测：驱逐告警里 `retention_floor_ns=i64::MAX`）。
     ///
-    /// “驱动流始终无数据 → 永久 pin”不会无界增长：pin 只阻断**内存上限**驱逐，
-    /// `over` 的时间驱逐故意忽略 pin（见 `evict_expired`），所以保留量的上界仍是
-    /// `over`。EOS 时另有 `release_retention_floor` 显式释放。
+    /// 2026-08-25（D4 闭环）：**时间驱逐也尊重 pin**（`evict_expired_impl` 与
+    /// `evict_oldest_acked` 同款检查）——`over` 只是内存参数，绝不能因调小 over
+    /// 删掉评估还要用的行（100M q4 over=1h 精确 / over=30m 欠发 6-9k 的根因）。
+    /// 保留量的上界 = max(`over` 窗口, 评估前沿之后)——评估及时时前沿 ≈ watermark，
+    /// 窗反而更小；驱动停摆时前沿冻结、窗随 watermark 增长（正确的代价，EOS 时
+    /// `release_retention_floor` 显式释放）。
     ///
-    /// `missed`（到期 miss、EOS 重试）**也计入前沿**：它们 miss 的原因是 join 目标
-    /// append 滞后（需要的行还没到），那些行稍后才落地，必须活到 EOS 重试那一刻。
-    /// 曾把 `missed` 排除在外（“pin 住更旧的行救不了它”），q4 30M 因此仍丢 0.67%
-    /// 输出（1,661,399 vs 1,672,559）——q4a 比 q9 多一条 q4b 规则、任务更慢 → miss 更
-    /// 多 → 更依赖 EOS 重试，而那 5 次内存驱逐正好抽走了它们要重试的行（同次 q9
-    /// 同样 5 次驱逐却 identical，差别就在 miss 量）。
-    ///
-    /// 内存上界不变：`missed` 把前沿冻结在早期事件时间，但保留量仍由 `over` 的
-    /// 时间驱逐封顶（时间驱逐故意忽略 pin）。
+    /// `missed`（已评估 miss、待 EOS 重试）**不再计入前沿**：评估 gate 保证运行期
+    /// 评估时目标窗已追平（target_wm ≥ expiry）→ 运行期 miss 即真 miss（右行确实
+    /// 不在区间内），EOS 重试只做确认、不需要保留行。missed 参与 pin 会把前沿拖
+    /// 到全流最早的真 miss lo（100M 真 miss ~8.7% 分布全流）→ 时间驱逐全被挡住。
+    /// （曾把 missed 计入前沿：那是目标 append 滞后时代的假 miss 保护——gate
+    /// 落地后假 miss 消失，该保护随之退役。）
     fn publish_retention_floor(&mut self) {
         let Some(pin) = &self.retention_pin else {
             return;
         };
         // 2026-08-25 q4 100M：缓存 min(lo_ns)（插入 O(1) 更新；dirty 才重扫）
-        // ——旧的每 batch 全量扫 pending+missed 在 33M 挂起下是第二个 O(n²)。
+        // ——旧的每 batch 全量扫 pending 在 33M 挂起下是第二个 O(n²)。
         // 缓存仅在维护路径上可靠：直接构造/绕过维护（测试、未来新路径）时
         // `lo_min == i64::MAX` 且集合非空 → 退回全量扫（正确性兜底，罕见）。
-        let cache_trustworthy = !(self.lo_min == i64::MAX
-            && (!self.pending.is_empty() || !self.missed.is_empty()));
+        let cache_trustworthy = !(self.lo_min == i64::MAX && !self.pending.is_empty());
         let floor = if self.lo_min_dirty || !cache_trustworthy {
             let lo = self
                 .pending
                 .iter()
-                .chain(self.missed.iter())
                 .map(|p| p.lo_ns)
                 .min()
                 .unwrap_or(self.watermark);
@@ -217,7 +213,7 @@ impl DeferredRuntime {
             self.lo_min = lo;
             self.lo_min_dirty = false;
             lo
-        } else if self.pending.is_empty() && self.missed.is_empty() {
+        } else if self.pending.is_empty() {
             // 空集 → watermark（与全量语义一致：更旧的行未来实例也用不到）。
             self.watermark
         } else {
@@ -1954,25 +1950,34 @@ impl RuleTask {
             return;
         };
         let join_idx = deferred.join_idx;
-        // 2026-08-25 q4 100M 欠发根治：运行期评估前沿 = min(驱动 watermark,
-        // join 目标窗口 append 位置)。驱动 watermark 只反映**驱动流**（q4a =
-        // auction）处理到哪；bid 等 join 目标由同一输入另行 append，存在管道
-        // 滞后——按驱动 wm 到期评估时目标窗口可能还没 append 该实例的右行
-        // （探针实锤：运行期 hit≈50%、cand0≈34-66%，越靠流尾命中率越高）。
-        // 后果：miss 积压进 `missed`（RSS 随总量增长，30M/100M 非窗口内存差
-        // ~9.2GB），且 100M 下 EOS 重试时早段右行已被 over 时间驱逐 → 欠发
-        // ~63%（oracle 5.58M vs 2.07M）。改为等目标窗口 raw max event time
-        // ≥ expiry 才评估：右行全在场且新鲜（刚 append，驱逐够不着）→ 运行期
-        // 命中、missed 不积压、EMIT 正确。目标窗口不存在/未 append（i64::MIN）
-        // → 不 gate（防御：保持旧行为，等 flush 收口）。
+        // 2026-08-25 q4 100M 欠发根治（两轮）＋跨源提交乱序修复：
+        // 1) 评估前沿 = min(驱动 watermark, join 目标窗**健全提交前沿**)。
+        //    驱动 wm 是 oracle 语义边界（deferred watermark = 最后驱动事件时间），
+        //    目标窗前沿（各 source 已提交 max 的 min，`committed_frontier_ns`）
+        //    是右行完整性的健全判据——全局 max_event_time 会被跨 source 乱序
+        //    提交提前推高（ingress instances=8 + parse 并行），用它会在右行未
+        //    落地时提前评估 → 假 miss（30M q4 over=30m -860，2026-08-25 实测）。
+        // 2) 防御：目标不存在/未 append（i64::MAX/i64::MIN）→ 退回驱动 wm。
+        // 3) 右行年龄保护：pending 期间 pin 挡住时间驱逐（D4 闭环），评估因
+        //    前沿等待而延迟时右行不会被 over 删掉。
         let eff_wm = if gate_on_target {
-            let target_wm = self
+            let frontier = self
                 .router
                 .registry()
                 .get_window(&self.executor.plan().joins[join_idx].right_window)
-                .map(|w| w.max_event_time_nanos())
+                .map(|w| w.committed_frontier_ns())
                 .unwrap_or(i64::MAX);
-            wm.min(target_wm)
+            if frontier == i64::MAX {
+                // 目标不存在/无时间列（防御）：退回驱动 wm（旧行为）。
+                wm
+            } else if frontier == i64::MIN {
+                // 目标窗**尚无任何提交**（启动期首个 batch 前）：右行必然不在，
+                // 评估即假 miss（对着空窗全 miss → 行到达后已无 pin 保护 →
+                // 驱逐 → 欠发）。保持挂起，等首个提交推进前沿。
+                i64::MIN
+            } else {
+                wm.min(frontier)
+            }
         } else {
             wm
         };
@@ -1980,13 +1985,19 @@ impl RuleTask {
         // 2026-08-25 q4 100M：pending 按 expiry 升序 → 到期项是前缀，
         // `partition_point` O(log n) 定位 + drain 前缀 O(due)——替代旧的
         // 全量遍历重建（O(n)/batch，33M 挂起 × 2740 batch 卡死 28×）。
+        //
+        // 2026-08-25（内存修复）：**drain 到期前缀后必须标 dirty**——lo_min
+        // 缓存是插入时单调不增的 min（历史最小 lo_ns），drain 后仍偏保守
+        //（更小）→ 正确性安全，但 pin 会永远停在流起点的历史最小值 → 时间
+        // 驱逐全被挡（30M q4 over=30m：pin_floor=起点+1ms、evict=0、RSS 9.2GB
+        // = 整窗保留，2026-08-25 探针实锤）。publish 下一次重算当前 pending 的
+        // min lo（评估 gate 后 pending 很小，O(n) 无压力——旧 O(n²) 担忧是
+        // 63% 假 miss 时代 33M 挂起 × 2740 batch 的产物，已不成立）。
         let due: Vec<DeferredPending> = {
             let split = deferred.pending.partition_point(|p| p.expiry_nanos <= eff_wm);
-            // 到期项移出**不**标 dirty：lo_min 缓存是插入时单调不增的 min
-            //（历史最小 lo_ns），移出后仍偏保守（更小）→ 安全，无需重扫。
-            // 仅 missed 集合被清空重建（reevaluate_deferred_missed）时才需
-            // 重扫（2026-08-25 q4 100M：有到期即标 dirty 会让 publish 每 batch
-            // 全量重扫 → O(n²)）。
+            if split > 0 {
+                deferred.lo_min_dirty = true;
+            }
             deferred.pending.drain(..split).collect()
         };
         if due.is_empty() {
@@ -2048,11 +2059,9 @@ impl RuleTask {
         if !missed_this.is_empty()
             && let Some(deferred) = self.deferred.as_mut()
         {
-            // missed 的 lo_ns 也计入前沿（它们需要的行稍后才落地，必须活到
-            // EOS 重试）——同步维护 lo_min 缓存。
-            for p in &missed_this {
-                deferred.lo_min = deferred.lo_min.min(p.lo_ns);
-            }
+            // 2026-08-25：missed 不再计入 pin/lo_min——评估 gate 后运行期 miss
+            // 即真 miss（右行确实不在区间内），EOS 重试只做确认，不需要保留
+            // 右行；missed 的 lo 分布全流，计入会把时间驱逐拖死。
             deferred.missed.extend(missed_this);
         }
     }
@@ -2125,11 +2134,8 @@ impl RuleTask {
         {
             deferred.missed.extend(still_miss);
         }
-        // missed 集合被取空重建——lo_min 缓存失效（含被命中移除的项）。
-        // EOS 收尾路径，全量重扫可接受（罕见调用）。
-        if let Some(d) = self.deferred.as_mut() {
-            d.lo_min_dirty = true;
-        }
+        // 2026-08-25：missed 不再参与 pin/lo_min，取空重建无需标 dirty。
+        //（lo_min 只由 pending 插入维护 + 空集/缓存失效回退全量扫。）
         if hit > 0 && debug_enabled {
             wf_debug!(
                 pipe,
@@ -2355,7 +2361,57 @@ impl RuleTask {
                 .map(|s| s.window.max_event_time_nanos())
                 .max()
                 .unwrap_or(i64::MIN);
+            // 2026-08-25 更正：**驱动窗** max 即全局末尾——oracle 的 deferred
+            // watermark 语义 = 最后驱动事件时间（wfgen oracle/mod.rs 469 行），
+            // 不是 max(驱动, 目标)。曾把目标窗 max 并入（bid 流尾晚 4.6ms）
+            // → expiry ∈ (驱动末尾, 目标末尾] 的尾部实例被评估 → 10M +2 多发
+            // （oracle 557,204 vs 引擎 557,206，2026-08-25 实测）。
             if final_wm > i64::MIN {
+                // 2026-08-25 q4 100M over=30m 欠发修复：flush 时 join 目标窗
+                // 的 actor 可能仍在排空 mailbox（keep-running EOS 竞态）——目标
+                // 窗提交前沿落后 final_wm，尾部 pending（expiry 近数据末）评估时
+                // 右行未落地 → miss → 重试仍 miss → 退出丢行（100M 实测欠发
+                // 6-7k 条 ≈ 尾部 10-12s，over=1h 时 ~0-850）。EOS 后全部输入已
+                // ingest，actor 必然排空：这里限时等目标窗**提交前沿停止增长**
+                // （连续 ~60ms 无新提交），然后一次评估全命中。用
+                // `committed_frontier_ns`（各 source 已提交 max 的 min）而非全局
+                // max——跨源乱序提交下 max 可能停滞后前沿仍在推进。
+                // 不能等 `前沿 ≥ final_wm`：数据尾部 bid/auction 流 max
+                // 天然差几行（最后的事件可能是 auction）→ 永远追不平。
+                let join_idx = self
+                    .deferred
+                    .as_ref()
+                    .expect("deferred state exists")
+                    .join_idx;
+                let target = self.executor.plan().joins[join_idx].right_window.clone();
+                let mut last_wm: Option<i64> = None;
+                let mut stalled = 0u32;
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(30);
+                loop {
+                    let target_wm = self
+                        .router
+                        .registry()
+                        .get_window(&target)
+                        .map(|w| w.committed_frontier_ns())
+                        .unwrap_or(i64::MAX);
+                    if target_wm == i64::MAX {
+                        break; // 目标不存在/无时间列（防御：不等待）
+                    }
+                    if Some(target_wm) == last_wm {
+                        stalled += 1;
+                        if stalled >= 3 {
+                            break; // 连续 ~60ms 无增长 → actor 已排空
+                        }
+                    } else {
+                        stalled = 0;
+                    }
+                    last_wm = Some(target_wm);
+                    if std::time::Instant::now() >= deadline {
+                        break; // 限时兜底（理论上到不了）
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
                 self.scan_deferred(final_wm, wall_nanos() as i64, false).await;
             }
             // EOS 重试（2026-08-23 q8 修复）：到期时 join 目标窗口 append 滞后
@@ -4237,12 +4293,14 @@ mod retention_pin_tests {
         assert_eq!(pin.load(Ordering::Acquire), 5_000);
     }
 
-    /// 前沿 = `pending ∪ missed` 的 `min(lo_ns)`。
+    /// 前沿 = 仅 `pending`（未评估）的 `min(lo_ns)`——`missed` 不再参与。
     ///
-    /// 回归防网：曾将 `missed`（EOS 重试）排除在外，它们要重试的右窗行被内存
-    /// 驱逐抽走 → q4 30M 丢 0.67% 输出（1,661,399 vs 1,672,559，2026-08-24）。
+    /// 2026-08-25（评估 gate 落地后）：运行期评估时目标窗已追平（target_wm ≥
+    /// expiry）→ 运行期 miss 即真 miss（右行确实不在区间内），EOS 重试只做确认、
+    /// 不需要保留右行；missed 的 lo 分布全流，参与 pin 会把时间驱逐拖死。
+    /// 曾将 missed 计入（目标 append 滞后时代的假 miss 保护），已随 gate 退役。
     #[test]
-    fn floor_covers_both_pending_and_missed() {
+    fn floor_covers_pending_only_ignores_missed() {
         let pin = Arc::new(AtomicI64::new(i64::MIN));
         let mut rt = runtime(&pin);
         rt.watermark = 9_000;
@@ -4251,15 +4309,12 @@ mod retention_pin_tests {
         rt.publish_retention_floor();
         assert_eq!(
             pin.load(Ordering::Acquire),
-            3_000,
-            "missed 实例的 lo_ns 必须参与前沿（它们在 EOS 还要重试）"
+            7_000,
+            "missed 的 lo_ns（3_000）不参与前沿——EOS 重试只做确认，不需要保留右行"
         );
 
-        // 没有 missed 时回到 pending 的最小 lo_ns。
-        // （生产路径 missed 清空经 `reevaluate_deferred_missed` 标 dirty；
-        //  测试直接清空需同步标 dirty 模拟该路径。）
+        // missed 清空不影响缓存（lo_min 只由 pending 维护）。
         rt.missed.clear();
-        rt.lo_min_dirty = true;
         rt.publish_retention_floor();
         assert_eq!(pin.load(Ordering::Acquire), 7_000);
     }

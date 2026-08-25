@@ -282,7 +282,7 @@ async fn commit_append(
     }
 
     let WindowMsg::Append {
-        source: _,
+        source,
         seq: _,
         batch,
         events,
@@ -300,6 +300,9 @@ async fn commit_append(
         events,
         byte_size,
         shard_rows,
+        // 2026-08-25（跨源提交乱序修复）：把提交来源传给窗口，记录按源
+        // 已提交前沿（deferred 评估 gate 的健全判据）。
+        Some(source),
     )
     .await;
     match result {
