@@ -45,6 +45,15 @@ pub(in crate::window) struct TimedBatch {
     pub(super) ingested_at: Instant,
     pub(super) row_count: usize,
     pub(super) byte_size: usize,
+    /// 本批**实际引用**的 Arrow 缓冲字节（[`allocated_bytes`](super::allocated_bytes)：
+    /// 按缓冲去重后累加引用长度，含 null bitmap / offsets）——与 `byte_size`
+    /// （`content_bytes` 逻辑内容口径）并行保存，供驱逐时扣减窗口的
+    /// `current_alloc_bytes`。只用于可观测性，不参与预算判定。
+    ///
+    /// 注意**不可**用 `RecordBatch::get_array_memory_size()`：IPC 解码批次各列是
+    /// 同一帧体的零拷贝切片，按列累加会重复计整块分配（实测把 content 1.58GB 的
+    /// 窗口报成 17.97GB，甚至超过进程 peak_commit）。
+    pub(super) alloc_size: usize,
     /// Monotonically increasing sequence number assigned on append.
     pub(super) seq: u64,
     /// Precomputed columnar shard partition of this batch's rows, produced in

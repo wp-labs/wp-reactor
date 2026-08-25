@@ -162,6 +162,8 @@ pub(crate) struct MetricsSnapshot {
     evictor_time_evicted: u64,
     evictor_memory_evicted: u64,
     window_memory_bytes: BTreeMap<String, u64>,
+    /// 窗口实际分配字节（会计保真度，2026-08-25）。
+    window_allocated_bytes: BTreeMap<String, u64>,
     /// 每窗 mailbox 在途字节（已用预算）——在途量可观测性（2026-08-25）。
     window_mailbox_inflight: BTreeMap<String, u64>,
     /// 每窗 mailbox 预算容量。
@@ -397,6 +399,13 @@ impl MetricsSnapshot {
         }
         for (window, v) in &self.window_memory_bytes {
             out.push(metric("window", "memory_bytes", window, *v));
+        }
+        // 会计保真度（2026-08-25）：`memory_bytes` 是 content_bytes（逻辑内容，
+        // 驱逐/mailbox 预算口径），不含 null bitmap / offsets；`allocated_bytes`
+        // 按缓冲去重后累加实际引用长度。生产实测两者基本相等（1.00×），该指标的
+        // 作用是持续证明 content 口径没有系统性低估。
+        for (window, v) in &self.window_allocated_bytes {
+            out.push(metric("window", "allocated_bytes", window, *v));
         }
         // 在途量分账（2026-08-25）：每窗 mailbox 已用预算 + parse pool 预读预算。
         // ❗ mailbox 在途与 `memory_bytes` **可能重叠**（Arrow 缓冲经 Arc 共享：
@@ -797,6 +806,9 @@ pub struct RuntimeMetrics {
     evictor_memory_evicted_total: AtomicU64,
 
     window_memory_bytes: BTreeMap<String, AtomicU64>,
+    /// 窗口**实际分配**字节（`Window::allocated_usage`）——`memory_bytes` 是逻辑
+    /// 内容口径（不含 bitmap/offsets）；内存分账用这个交叉校验。
+    window_allocated_bytes: BTreeMap<String, AtomicU64>,
     /// 每窗 mailbox 在途字节 / 预算容量（周期采样，同 window 其他 gauge）。
     window_mailbox_inflight: BTreeMap<String, AtomicU64>,
     window_mailbox_budget: BTreeMap<String, AtomicU64>,
@@ -992,6 +1004,7 @@ impl RuntimeMetrics {
             evictor_time_evicted_total: AtomicU64::new(0),
             evictor_memory_evicted_total: AtomicU64::new(0),
             window_memory_bytes: make_window_map(),
+            window_allocated_bytes: make_window_map(),
             window_mailbox_inflight: make_window_map(),
             window_mailbox_budget: make_window_map(),
             parse_inflight_bytes: AtomicU64::new(0),
@@ -1400,6 +1413,7 @@ impl RuntimeMetrics {
             evictor_time_evicted: self.drain_counter(&self.evictor_time_evicted_total),
             evictor_memory_evicted: self.drain_counter(&self.evictor_memory_evicted_total),
             window_memory_bytes: self.read_map(&self.window_memory_bytes),
+            window_allocated_bytes: self.read_map(&self.window_allocated_bytes),
             window_mailbox_inflight: self.read_map(&self.window_mailbox_inflight),
             window_mailbox_budget: self.read_map(&self.window_mailbox_budget),
             parse_inflight_bytes: self.parse_inflight_bytes.load(Ordering::Relaxed),

@@ -3889,28 +3889,48 @@ fn resolve_pipe_shape(
 }
 
 impl PipeBatchStager {
-    fn new(
-        target: Arc<str>,
-        schema: arrow::datatypes::SchemaRef,
-        time_col_index: Option<usize>,
-    ) -> Self {
-        let cols = schema
+    /// 按 schema 建列 builder。`capacity` = 行数预估（R4 review，2026-08-25）：
+    /// builder 用 `::new()` 时每批从 0 **倍增长**，`finish()` 后 buffer 容量可达
+    /// len 的 2×——这部分**容量宽余是真实占用**（存活批次实测 6.03MB vs
+    /// content 3.45MB），但 `window.allocated_bytes` 只计 buffer len 看不见。
+    /// 按上一批行数预置容量即可避免倍增（中间窗批大小稳定 ≈ 35k 行）。
+    fn make_cols(schema: &arrow::datatypes::SchemaRef, capacity: usize) -> Vec<PipeCol> {
+        schema
             .fields()
             .iter()
             .map(|field| match field.data_type() {
-                DataType::Int64 => PipeCol::Int64(arrow::array::Int64Builder::new()),
-                DataType::Float64 => PipeCol::Float64(arrow::array::Float64Builder::new()),
-                DataType::Boolean => PipeCol::Bool(arrow::array::BooleanBuilder::new()),
-                DataType::Utf8 => PipeCol::Utf8(arrow::array::StringBuilder::new()),
-                DataType::Timestamp(_, _) => {
-                    PipeCol::Timestamp(arrow::array::TimestampNanosecondBuilder::new())
+                DataType::Int64 => {
+                    PipeCol::Int64(arrow::array::Int64Builder::with_capacity(capacity))
                 }
+                DataType::Float64 => {
+                    PipeCol::Float64(arrow::array::Float64Builder::with_capacity(capacity))
+                }
+                DataType::Boolean => {
+                    PipeCol::Bool(arrow::array::BooleanBuilder::with_capacity(capacity))
+                }
+                // StringBuilder 需两个容量：offsets 条数与值字节数（估 16B/值，
+                // 中间窗 meta 列典型值长 5~12B）。
+                DataType::Utf8 => PipeCol::Utf8(arrow::array::StringBuilder::with_capacity(
+                    capacity,
+                    capacity * 16,
+                )),
+                DataType::Timestamp(_, _) => PipeCol::Timestamp(
+                    arrow::array::TimestampNanosecondBuilder::with_capacity(capacity),
+                ),
                 other => PipeCol::Null {
                     data_type: other.clone(),
                     len: 0,
                 },
             })
-            .collect();
+            .collect()
+    }
+
+    fn new(
+        target: Arc<str>,
+        schema: arrow::datatypes::SchemaRef,
+        time_col_index: Option<usize>,
+    ) -> Self {
+        let cols = Self::make_cols(&schema, 0);
         Self {
             target,
             schema,
@@ -4109,6 +4129,13 @@ impl PipeBatchStager {
             .collect::<RuntimeResult<Vec<_>>>()?;
         let batch = RecordBatch::try_new(std::sync::Arc::clone(&self.schema), arrays)
             .source_raw_err(RuntimeReason::Bootstrap, "build internal pipeline batch")?;
+        // R4 review 试验与**回退记录**（2026-08-25）：曾改为按刚完成行数预置下一批
+        // builder 容量（`make_cols(&schema, finished_rows)`），想消除 `::new()` 倍增长
+        // 留下的容量宽余。**实测否决**（`pipe_write_alloc_footprint`）：峰值
+        // 6.88MB → 11.53MB（+67%）——预置会在刚完成的批次**仍存活**时就把下一批
+        // 全量 builder（~4.6MB）分配出来，而保留批次的宽余没有可测改善。
+        // 因此保持容量 0（倍增长），宽余作为已知成本记在 issue 文档。
+        self.cols = Self::make_cols(&self.schema, 0);
         self.rows = 0;
         Ok(Some((Arc::clone(&self.target), batch)))
     }

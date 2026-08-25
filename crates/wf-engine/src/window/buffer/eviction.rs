@@ -79,11 +79,14 @@ impl Window {
                     .expect("front vanished between check and remove");
                 let byte_size = tb.byte_size;
                 let row_count = tb.row_count;
+                let alloc_size = tb.alloc_size;
                 self.remove_batch_from_index(&tb);
                 // Dropping the owned `TimedBatch` destroys the Arrow batch and
                 // parsed events eagerly — no deferred (epoch-GC) reclamation.
                 drop(tb);
                 self.current_bytes.fetch_sub(byte_size, Ordering::Relaxed);
+                self.current_alloc_bytes
+                    .fetch_sub(alloc_size, Ordering::Relaxed);
                 self.total_rows.fetch_sub(row_count, Ordering::Relaxed);
                 self.batch_count.fetch_sub(1, Ordering::Relaxed);
                 evicted = true;
@@ -106,9 +109,12 @@ impl Window {
         let (_, tb) = log.pop_first()?;
         let byte_size = tb.byte_size;
         let row_count = tb.row_count;
+        let alloc_size = tb.alloc_size;
         self.remove_batch_from_index(&tb);
         drop(tb);
         self.current_bytes.fetch_sub(byte_size, Ordering::Relaxed);
+        self.current_alloc_bytes
+            .fetch_sub(alloc_size, Ordering::Relaxed);
         self.total_rows.fetch_sub(row_count, Ordering::Relaxed);
         self.batch_count.fetch_sub(1, Ordering::Relaxed);
         // Content changed: invalidate has()/snapshot caches (see evict_expired).
@@ -178,9 +184,12 @@ impl Window {
             .expect("front vanished between check and remove");
         let byte_size = tb.byte_size;
         let row_count = tb.row_count;
+        let alloc_size = tb.alloc_size;
         self.remove_batch_from_index(&tb);
         drop(tb);
         self.current_bytes.fetch_sub(byte_size, Ordering::Relaxed);
+        self.current_alloc_bytes
+            .fetch_sub(alloc_size, Ordering::Relaxed);
         self.total_rows.fetch_sub(row_count, Ordering::Relaxed);
         self.batch_count.fetch_sub(1, Ordering::Relaxed);
         // Content changed: invalidate has()/snapshot caches (see evict_expired).

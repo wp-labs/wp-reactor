@@ -31,6 +31,10 @@ impl RuntimeMetrics {
                 if let Some(v) = self.window_memory_bytes.get(&window_name) {
                     v.store(win.memory_usage() as u64, Ordering::Relaxed);
                 }
+                // 会计保真度：实际分配字节（含 null bitmap/offsets/容量舍入）。
+                if let Some(v) = self.window_allocated_bytes.get(&window_name) {
+                    v.store(win.allocated_usage() as u64, Ordering::Relaxed);
+                }
                 // 在途量分账（2026-08-25）：该窗 mailbox 已用预算/容量。无 mailbox
                 // （同步模式 / 未注册）则保持 0。
                 if let Some((used, cap)) = router.mailbox_inflight(&window_name) {
