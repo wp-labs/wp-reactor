@@ -270,6 +270,14 @@ async fn dispatch_batch(
     metrics: &Option<Arc<RuntimeMetrics>>,
     batch: AlertBatch,
 ) {
+    // perf-diag cut_serialize 门控：AlertBatch 到 sink 即丢（不序列化不写）——
+    // 测「输出构建 + 通道投递」段; 增量（full − emit）= 序列化 + sink 写成本。
+    // 哨兵 sink（__wf_sentinel）豁免——哨兵记录经此落盘驱动档位切换/EPS。
+    if crate::perf_diag::perf_cut_serialize()
+        && sink.name != crate::perf_diag::PERF_SENTINEL_WINDOW
+    {
+        return;
+    }
     let dispatch_started = Instant::now();
     let send_result = match &batch {
         AlertBatch::Rows(rows) => sink.send_records(rows).await,

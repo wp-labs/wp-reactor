@@ -35,6 +35,18 @@ pub struct PerfStage {
     /// 本档生效期间：禁止输出链。
     #[serde(default)]
     pub cut_output: bool,
+    /// 本档生效期间：禁止窗口 append（解码后即丢, 测「注入 + 解码」前序段;
+    /// 哨兵流豁免——测量协议必须活）。
+    #[serde(default)]
+    pub cut_append: bool,
+    /// 本档生效期间：禁止解码（只读帧头 tag 识别哨兵, 非哨兵帧 body 即丢——
+    /// 测「注入 + TCP 接收」字节率; 哨兵流豁免）。
+    #[serde(default)]
+    pub cut_recv: bool,
+    /// 本档生效期间：禁止序列化/写入（AlertBatch 到 sink 即丢——测「输出构建 +
+    /// 通道投递」; 增量 full−emit = 序列化 + sink 写成本）。
+    #[serde(default)]
+    pub cut_serialize: bool,
     /// 规则子集文件路径（相对 work-dir）。空 = 保持当前规则；非空且与当前
     /// 不同 → 触发既有 `runtime.rules` 热 reload（HotReloadSupported）。
     #[serde(default)]
@@ -175,12 +187,31 @@ rules = "models/rules/c_family.wfl"
                 name: "floor".into(),
                 cut_rules: true,
                 cut_output: true,
+                cut_append: false,
+                cut_recv: false,
+                cut_serialize: false,
                 rules: None,
             }],
         };
         let toml_str = toml::to_string(&cfg).unwrap();
         let parsed: PerfConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed, cfg);
+
+        // cut_append（decode 档）round-trip。
+        let decode = PerfConfig {
+            stages: vec![PerfStage {
+                name: "decode".into(),
+                cut_rules: false,
+                cut_output: false,
+                cut_append: true,
+                cut_recv: false,
+                cut_serialize: false,
+                rules: None,
+            }],
+        };
+        let toml_str = toml::to_string(&decode).unwrap();
+        let parsed: PerfConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed, decode);
     }
 
     #[test]

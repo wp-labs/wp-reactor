@@ -298,6 +298,13 @@ impl StatsTask {
     /// 归并一个行段（列式优先, 前置不满足回退行式, 语义等价对拍锁定）。
     /// `seg = None` = 全批; `Some(rows)` = 仅行域内的行（分片/窗口段）。
     async fn accumulate_segment(&mut self, batch: &RecordBatch, seg: Option<&[u32]>) {
+        // perf-diag cut_rules 门控：归并直通（watermark/窗口推进/ack 保留——
+        // 这些在 process_batch_from/process_push 层, floor 档收敛）。stats 查询
+        // （q15-q19）与 rule_task 对齐——否则 floor 档仍跑全量归并, 墙梯失真
+        // （2026-08-25: 补 stats cuts 缺口）。
+        if crate::perf_diag::perf_cut_rules() {
+            return;
+        }
         let stats_ok = self.stats.process_batch_rows(batch, seg);
         if !stats_ok {
             // 回退行式: 只物化行域内的行（与列式行域一致）。
@@ -464,6 +471,18 @@ impl StatsTask {
             .measures
             .iter()
             .any(|m| matches!(m.agg, StatsAggPlan::Last | StatsAggPlan::Top));
+        if crate::perf_diag::perf_cut_output() {
+            // perf-diag 输出链直通：仍 close 窗口（取桶 + 度量计算 = 归并段
+            // 成本, 状态正确重置防泄漏）, 跳过 alert 构建/序列化/投递（输出
+            // 段成本）——full 档增量 = 纯输出链（2026-08-25 补 stats cuts）。
+            if has_row_measures {
+                let _ = self.stats.close_window_by_bucket_rows();
+            } else {
+                let _ = self.stats.close_window_by_bucket();
+            }
+            self.report_over_limit(window_start, window_end);
+            return;
+        }
         if has_row_measures {
             // 行字段列名（P5 紧凑化: 列数组按此列序存储; 生产经 spawn 恒有子集）
             let row_names = self.stats.row_field_names().cloned();

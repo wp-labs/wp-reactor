@@ -831,4 +831,132 @@ mod tests {
         assert_eq!(push.events.as_ref().map(|e| e.len()).unwrap_or(0), 1);
         assert_eq!(win.total_rows(), 1);
     }
+
+    /// 复现 perf-diag 墙梯（q19 30m rules 档）冻结：append 速率 > 消费速率 + 全局
+    /// 窗口内存 cap 时，window actor 在 `commit_append` 的 `gate.freed` park，驱逐只
+    /// 认"全部消费者已 ack"的批（`oldest_seq < min_acked`）。
+    ///
+    /// 镜像生产接线（actor + 小 mailbox 预算 + 小全局 cap + 周期 evictor + 慢 pull
+    /// 消费者），验证**自愈**：消费者归并追平后系统必须恢复——任何一次 park 都不能
+    /// 演变成永久冻结（2026-08-25 线上：q19 30m 墙梯 rules 档 CPU 0% 永久冻结 2min+）。
+    #[tokio::test]
+    async fn over_budget_park_recovers_once_consumer_catches_up() {
+        use crate::window::{Evictor, EvictionGate, WindowDef, WindowParams, WindowRegistry};
+        use std::sync::atomic::AtomicU64;
+
+        const PER_BATCH: usize = 64;
+        const MAILBOX_BUDGET: usize = PER_BATCH * 4; // 在途 4 批
+        const GLOBAL_CAP: usize = PER_BATCH * 3; // 全局 3 批（先撞全局 cap）
+        const TOTAL: u64 = 60;
+
+        let reg = Arc::new(
+            WindowRegistry::build(vec![WindowDef {
+                params: WindowParams {
+                    name: "win".into(),
+                    schema: test_schema(),
+                    time_col_index: Some(0),
+                    over: Duration::from_secs(3600),
+                    materialize_fields: None,
+                    defer_materialization: false,
+                },
+                streams: vec![],
+                config: test_config(),
+            }])
+            .unwrap(),
+        );
+        let win = reg.get_window("win").unwrap();
+        let notify = reg.get_notifier("win").unwrap();
+
+        // actor + mailbox（小预算，镜像 spawn_window_actors）
+        let (tx, rx) = mpsc::channel::<WindowMsg>(WINDOW_CHANNEL_DEPTH);
+        let budget = Arc::new(Semaphore::new(MAILBOX_BUDGET));
+        let gate = Arc::new(EvictionGate::new(GLOBAL_CAP));
+        let name: Arc<str> = Arc::from("win");
+        let fanout = RuleFanout::new();
+        let notify_actor = Arc::clone(&notify);
+        let win_actor = Arc::clone(&win);
+        let gate_actor = Arc::clone(&gate);
+        let cancel = CancellationToken::new();
+        tokio::spawn(async move {
+            run_window_actor(
+                name,
+                win_actor,
+                gate_actor,
+                fanout,
+                notify_actor,
+                rx,
+                cancel,
+                None,
+            )
+            .await;
+        });
+
+        // 慢 pull 消费者（镜像 stats pull loop：注册通知 → read_since → 处理 → ack）
+        let slot = reg.progress("win").unwrap().register_row_partitioned();
+        let consumed = Arc::new(AtomicU64::new(0));
+        let win_c = Arc::clone(&win);
+        let notify_c = Arc::clone(&notify);
+        let consumed_c = Arc::clone(&consumed);
+        let consumer = tokio::spawn(async move {
+            let mut cursor = 0u64;
+            while consumed_c.load(Ordering::SeqCst) < TOTAL {
+                let notified = notify_c.notified();
+                tokio::pin!(notified);
+                let (batches, new_cursor, _gap) = win_c.read_since(cursor);
+                for b in &batches {
+                    // 模拟归并：处理比 append 慢，制造窗口超预算
+                    tokio::time::sleep(Duration::from_millis(3)).await;
+                    consumed_c.fetch_add(b.num_rows() as u64, Ordering::SeqCst);
+                }
+                if new_cursor > cursor {
+                    cursor = new_cursor;
+                    slot.store(new_cursor, Ordering::Release);
+                }
+                tokio::select! {
+                    _ = &mut notified => {}
+                    // 兜底轮询（镜像 timeout_tick 的周期性唤醒）
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        });
+
+        // 周期 evictor（镜像 evictor_task）
+        let gate_e = Arc::clone(&gate);
+        let reg_e = Arc::clone(&reg);
+        let evictor_task = tokio::spawn(async move {
+            let evictor = Evictor::new(Arc::clone(&gate_e));
+            loop {
+                evictor.run_once(&reg_e, 0);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        // 生产者：镜像 dispatch_parsed（acquire mailbox 预算 → send）
+        for i in 0..TOTAL {
+            let permits = tokio::time::timeout(
+                Duration::from_secs(5),
+                acquire_window_budget(&budget, MAILBOX_BUDGET, PER_BATCH),
+            )
+            .await
+            .expect("producer must not deadlock on the mailbox budget");
+            tx.send(WindowMsg::Append {
+                source: Arc::from("s"),
+                seq: i,
+                batch: make_batch(&test_schema(), 10_000_000_000, i as i64),
+                events: None,
+                byte_size: PER_BATCH,
+                permits,
+                shard_rows: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(10), consumer).await;
+        evictor_task.abort();
+        result
+            .expect("死锁：消费者未在超时内追平全部批（actor park 未自愈）")
+            .expect("consumer task panicked");
+        assert_eq!(consumed.load(Ordering::SeqCst), TOTAL);
+    }
 }
