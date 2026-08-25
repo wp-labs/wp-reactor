@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use wf_config::MetricsConfig;
 use wf_engine::window::{EvictReport, RouteReport};
 
+/// 分配器/进程级内存分账（`window_bytes` 与进程峰值之间的缺口归因）。
+pub mod alloc_stats;
 #[cfg(test)]
 mod coverage_extra;
 #[cfg(test)]
@@ -172,6 +174,8 @@ pub(crate) struct MetricsSnapshot {
     event_e2e_latency: HistogramSnapshot,
     rule_scan_timeout: BTreeMap<String, HistogramSnapshot>,
     rule_flush: BTreeMap<String, HistogramSnapshot>,
+    /// 分配器读数（未装入 provider 时 `None`，快照略过这些指标）。
+    alloc: Option<alloc_stats::AllocStats>,
 }
 
 impl MetricsSnapshot {
@@ -272,6 +276,21 @@ impl MetricsSnapshot {
             "",
             self.evictor_memory_evicted,
         ));
+        // 内存分账（装入 provider 时才产出）：与各窗 `window.memory_bytes`
+        // 对比即可区分"引擎真持有"（peak_commit ≫ 窗口合计）与
+        // "段区/OS 伪影"（peak_commit ≈ 窗口合计但 peak_rss 远大）。
+        if let Some(a) = self.alloc {
+            out.push(metric("alloc", "current_rss_bytes", "", a.current_rss));
+            out.push(metric("alloc", "peak_rss_bytes", "", a.peak_rss));
+            out.push(metric(
+                "alloc",
+                "current_commit_bytes",
+                "",
+                a.current_commit,
+            ));
+            out.push(metric("alloc", "peak_commit_bytes", "", a.peak_commit));
+            out.push(metric("alloc", "page_faults_total", "", a.page_faults));
+        }
         out.push(metric(
             "alert",
             "channel_send_failed_total",
@@ -1363,6 +1382,8 @@ impl RuntimeMetrics {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.snapshot()))
                 .collect(),
+            // 分配器读数（provider 未装入则 None）。
+            alloc: alloc_stats::read(),
         }
     }
     fn drain_counter(&self, c: &AtomicU64) -> u64 {

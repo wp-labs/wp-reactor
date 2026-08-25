@@ -116,11 +116,33 @@ meta 列**：`__wfu_rule_name` / `__wfu_entity_type` / `__wfu_entity_id`（字�
 （load 8.0–10.8）。这种幅度不像稳定结构体，更像**分配器瞬时 churn / 碎片**
 （alert 构建、parse 缓冲、列式临时量）叠加负载影响。
 
-### 待答（探针消融定论）
-非窗口 ~8GB（30M）/ ~20GB（100M）的具体持有者**仍未定位**。已排除：
-窗口保留（有界）、over 参数（实测无效）、通道条目额外占用（Arc 共享，
-大概率重叠）。剩余候选：alert 构建/序列化临时量、parse pool 缓冲、列式求值
-临时列、分配器碎片。**用 §5 的消融实验逐档归因，勿再猜。**
+### ✅ 已定案（分配器分账，30M）：**引擎真持有 13GB 非窗口内存**
+
+`alloc.*` 指标（mimalloc `mi_process_info`，本次接入）一次跑批定位：
+
+| 指标 | 值 |
+|---|---|
+| `peak_commit`（mimalloc 实际持有） | **16.75GB** |
+| `peak_rss` | 15.38GB |
+| 窗口合计（各窗峰值和） | **3.60GB** |
+| **peak_commit − 窗口** | **13.16GB ← 引擎真持有** |
+| peak_rss − peak_commit | −1.37GB（commit 略高属正常：已提交未触碰） |
+
+**结论：「段区/OS 伪影」假说排除**。commit 与 rss 基本相等 → 这 13GB 是引擎
+**真的申请并持有**着，不是分配器把小内存放大的假象。而 q13 几乎**没有规则
+状态**（stateless each + 静态表 snapshot join）——无状态却占 13GB，是明确异常。
+
+**反面信号（缩小候选）**：q1 同样每行一条 alert，30M RSS 仅 4.0GB →
+**"per-row alert 输出基数"本身不解释 13GB**，差异在链路结构（中间窗 +
+10 分片推送 + join）而非输出量。
+
+### 待答（探针消融定位持有者）
+已排除：窗口保留（有界 3.6GB）、over 参数（实测无效）、通道条目额外占用
+（Arc 共享重叠）、段区伪影（commit≈rss）、alert 输出基数（q1 反例）。
+剩余候选：alert 构建/序列化临时量、parse pool 缓冲、列式求值临时列、
+分片 worker 的每批临时结构（10 并发 × 批内临时量）。
+**下一步：`current_commit` 时间曲线 vs 窗口字节曲线，定位 13GB 是何时累积的**
+（ingest 全程均匀增长 = 结构持有；尖峰 = 瞬时临时量）。
 
 ## 4. 已尝试 / 已排除
 
@@ -165,6 +187,18 @@ meta 列**：`__wfu_rule_name` / `__wfu_entity_type` / `__wfu_entity_id`（字�
 - `notes/q13-side-input-join-progress.md`（M-13 分片根治 + q13a/q13b 列式化）
 - `issues/window-overload-drop-vs-backpressure.md`（§3.3 事件时间压缩放大，
   §7 源反压设计——H2 若需背压可复用）
-- 全局 100M 内存盘点（2026-08-25 全量跑批，RSS>10G 判定为问题）：
-  q5 17.5GB / q13 26GB / q14 18GB / q16 22.9GB / q18 24.2GB / q19 32.9GB /
-  q22 30GB——**各 Q 可能同源（H1/H2），修 q13 后回归验证其余**
+- 全局 100M 内存盘点（2026-08-25 全量跑批，RSS>10G 判定为问题，**共 8 个**）：
+  q19 32.9GB / q22 30.0GB / q13 26.4GB / q18 24.2GB / q16 22.9GB / q14 18.0GB /
+  q5 17.5GB / q17 14.9GB
+  
+  **是否同源：目前不能断定，且有硬反例**。
+  - 反例：**q4 也是双规则链 + 中间窗**，100M 仅 8.68GB → "pipe 链/中间窗/
+    广播携带 events" **不是**其他 Q 高内存的驱动因素；本次修复（广播裁剪）
+    只作用于中间窗生产者（q4/q13），**对其余 6 个无帮助**。
+  - 性质可能不同：**无规则状态类**（q13：stateless each + 静态表 join）的
+    非窗口内存是**真异常**；**重状态类**（q16/q18/q19：stats/dedup/top-N）的
+    非窗口内存可能是**合法规则状态**（不计入 window_bytes，且键基数随
+    nexmark 的 auction/person id 增长）——需先区分"合法状态"与"异常占用"。
+  - **分账已就绪**：`alloc.*` 指标接入后，一轮 `./bench.sh all replay 100m`
+    就能给 22 个 Q 全部分账（window_bytes / peak_commit / peak_rss），一次看清
+    哪些是引擎真持有、哪些是合法状态。
