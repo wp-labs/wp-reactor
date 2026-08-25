@@ -1831,6 +1831,49 @@ fn stats_top_zero_keeps_no_entries() {
 }
 
 #[test]
+fn stats_top_precheck_skips_below_cutoff_rows() {
+    // 快速淘汰预检（q19 优化）: top 已满后大量低于门槛的行被预检挡下——
+    // 不构建行字段、不改变条目; 行式/列式同语义（列式预检用 measure_field_idx
+    // 原生列读, 行式预检用 value_to_f64——两实现独立, 结果必须一致）。
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![top_measure("top_price", "price", 2)],
+    );
+    // 键 1: 300/200 进 top-2; 之后 50 行低 bid（150..101 递减, 全低于门槛 200）
+    // → 全部被预检淘汰。键 2: 1 行（占位, 验证桶隔离）。
+    let mut rows = vec![
+        row(&[("auction", num(1.0)), ("price", num(300.0)), ("bidder", num(1.0))]),
+        row(&[("auction", num(1.0)), ("price", num(200.0)), ("bidder", num(2.0))]),
+    ];
+    for p in (101..150).rev() {
+        rows.push(row(&[
+            ("auction", num(1.0)),
+            ("price", num(p as f64)),
+            ("bidder", num(p as f64)),
+        ]));
+    }
+    rows.push(row(&[("auction", num(2.0)), ("price", num(50.0)), ("bidder", num(9.0))]));
+
+    let batch = rows_to_batch(&rows);
+    let mut row_exec = StatsExecutor::new(plan.clone());
+    row_exec.process_rows(&rows, extract);
+    let mut col_exec = StatsExecutor::new(plan);
+    assert!(col_exec.process_batch(&batch), "字段键应可列式化");
+    for (name, mut exec) in [("行式", row_exec), ("列式", col_exec)] {
+        let buckets = exec.close_window_by_bucket_rows();
+        assert_eq!(buckets.len(), 2, "{name}: 两个键的桶都在");
+        let top = &buckets[0]; // 键 1（ScopeKey 升序 → Int(1) 在前）
+        assert_eq!(top.key, ScopeKey::Int(1));
+        assert_eq!(top.measures[0].len(), 2, "{name}: 预检淘汰后仍 2 条目");
+        assert_eq!(top.measures[0][0].measure_value, 300.0, "{name}: rank1 300");
+        assert_eq!(top.measures[0][1].measure_value, 200.0, "{name}: rank2 200");
+        // 行字段仍携带原始 bidder（淘汰行不污染）。
+        let row = top.measures[0][0].row_fields.as_ref().expect("条目带行字段");
+        assert!(row.iter().any(|v| v.as_ref() == Some(&num(1.0))), "{name}: rank1 bidder=1");
+    }
+}
+
+#[test]
 fn stats_row_fields_compact_and_shared() {
     // P5 紧凑化结构验证: (1) 行字段列数组长度 = 子集大小（非整行 8 字段）;
     // (2) 同桶多个 last 度量 Arc 共享同一列数组（内存 1 份）。

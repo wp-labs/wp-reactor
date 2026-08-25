@@ -486,6 +486,22 @@ impl StatsExecutor {
                                     .insert(key);
                             }
                             StatsAggPlan::Last | StatsAggPlan::Top => {
+                                // 快速淘汰预检（在构建行字段前）: top 已满且 key 进不了
+                                // 前 N → 跳过, 免每行 row_fields 提取 + Arc 分配。
+                                // 与列式路径同一口径（value_to_f64 同义）。
+                                if measure.agg == StatsAggPlan::Top {
+                                    let n = measure.arg.unwrap_or(10) as usize;
+                                    if n == 0 {
+                                        continue; // top(0): 不保留任何条目
+                                    }
+                                    if let Some(key) = value_to_f64(&val)
+                                        && let Some(entries) = acc.top_entries.as_ref()
+                                        && entries.len() == n
+                                        && key <= entries[n - 1].key
+                                    {
+                                        continue;
+                                    }
+                                }
                                 // 行式路径: 按 row_names 列序提取（与列式
                                 // row_fields_from_batch 对齐; 同桶多 last 度量 Arc
                                 // 共享 1 份内存）。
@@ -1021,6 +1037,28 @@ fn accumulate_column_row(
                 }
             }
             StatsAggPlan::Last | StatsAggPlan::Top => {
+                // 快速淘汰预检（**在构建行字段前**）: top 已满且 key 进不了前 N
+                // → 直接跳过, 免每行 row_fields 的 Arc 分配 + 字段提取。q19 每
+                // auction 的 bid 绝大多数低于当前 top-10 门槛（bench ~99.8% 行
+                // 被此预检挡下）。列索引经构造期预计算的 `measure_field_idx` 取
+                // （零 index_of / 零 names 回退——无子集时 idx 恒 None → 不预检,
+                // 仅测试/缺省路径, 性能不敏感）。列值口径与行字段提取后
+                // `value_to_f64` 一致（Int64→as f64 / Float64 原值）。
+                if measure.agg == StatsAggPlan::Top {
+                    let n = measure.arg.unwrap_or(10) as usize;
+                    if n == 0 {
+                        continue; // top(0): 不保留任何条目, 无需行字段
+                    }
+                    if let Some(ci) = measure_field_idx[idx]
+                        .and_then(|i| row_field_cols.and_then(|cols| cols.get(i).copied()).flatten())
+                        && let Some(key) = column_f64_at(batch, ci, row)
+                        && let Some(entries) = acc.top_entries.as_ref()
+                        && entries.len() == n
+                        && key <= entries[n - 1].key
+                    {
+                        continue;
+                    }
+                }
                 let row = row_cache
                     .get_or_insert_with(|| row_fields_from_batch(batch, row, row_field_cols));
                 let fidx = measure_field_position(plan, measure_field_idx, idx, row_names);
@@ -1714,6 +1752,24 @@ fn column_i128(batch: &RecordBatch, name: &str, row: usize) -> Option<i128> {
     }
     if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
         return Some(a.value(row) as i128);
+    }
+    None
+}
+
+/// 从 batch 列读单行原生数值（top 快速淘汰预检用; 列索引预解析, 零 index_of）。
+/// Int64 → as f64 / Float64 → 原值——与行字段提取后 `value_to_f64(Value::Number)`
+/// 同口径（event_bridge 契约: Int64 → Number(i as f64), Float64 → Number(f)）。
+/// 非数值类型 → None（调用方回退原路径, 语义不变）。
+fn column_f64_at(batch: &RecordBatch, ci: usize, row: usize) -> Option<f64> {
+    let col = batch.column(ci);
+    if col.is_null(row) {
+        return None;
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return Some(a.value(row) as f64);
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+        return Some(a.value(row));
     }
     None
 }
