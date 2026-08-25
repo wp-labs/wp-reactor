@@ -1175,3 +1175,125 @@ fn q13b_concurrent_lock_bench() {
     );
     let _ = empty_tracked_bind_fields();
 }
+
+/// bid_mod 生产形状 schema（6 声明列 + 4 个 `__wfu_*` meta + `__wf_pipe_ts`）：
+/// 与真实中间窗一致（实测 91B/行 vs 声明 6×int64=48B，差额就是 meta 列）。
+fn bid_mod_prod_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("mod_key", DataType::Int64, true),
+        Field::new("__wfu_rule_name", DataType::Utf8, true),
+        Field::new("__wfu_score", DataType::Float64, true),
+        Field::new("__wfu_entity_type", DataType::Utf8, true),
+        Field::new("__wfu_entity_id", DataType::Utf8, true),
+        Field::new(
+            "__wf_pipe_ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]))
+}
+
+/// **pipe 写入路径的分配足迹量化**（2026-08-25，回答「优化空间多大」）。
+///
+/// 背景：q13 内存缺口已实证与 **pipe 写入分配速率**成正比（非在途积压、非
+/// 分配器、非窗口保留——见 `docs/issues/q13-memory-peak-scales-with-volume.md`）。
+/// 本测量给出每批的三个数字，用来判断优化天花板：
+/// - **暂存峰值**：`PipeEachRow` + `PipeCol` 的 `Vec<Option<T>>` 暂存
+/// - **输出内容**：`content_bytes(batch)`（最终落窗的有效字节 = 理论下界）
+/// - **放大倍数** = 暂存峰值 / 输出内容 —— 可优化空间就是这个倍数超出 1 的部分
+///
+/// 现实现的已知浪费（malloc_history 实证）：
+/// 1. `Vec<Option<i64>>` 暂存 **16B/值**，Arrow 目标 8B/值 + null bitmap → 2×
+/// 2. `take_batch` 的 `Int64Array::from(Vec<Option<_>>)` 是**全量拷贝**
+/// 3. `PipeEachRow.values: Vec<Option<Value>>` + `entity_id: String` **每行各一次堆分配**；
+///    `rule_name`/`entity_type` 每行重复渲染同一常量值
+#[test]
+#[ignore = "measurement: cargo test --release -p wf-runtime pipe_write_alloc_footprint -- --ignored --nocapture"]
+fn pipe_write_alloc_footprint() {
+    // 生产批规模（实测 bid_mod 35,360 行/批）。
+    const ROWS: usize = 35_360;
+    let exec = q13a_plan_rule();
+    let batch = bid_batch(ROWS);
+    let schema = bid_mod_prod_schema();
+    let yield_names: Vec<Arc<str>> = exec
+        .plan()
+        .yield_plan
+        .fields
+        .iter()
+        .map(|f| Arc::from(f.name.as_str()))
+        .collect();
+    let col_events: Vec<wf_engine::match_engine::ColumnarEvent<'_>> = (0..ROWS)
+        .map(|i| wf_engine::match_engine::ColumnarEvent::new(&batch, i))
+        .collect();
+    let rows: Vec<(&wf_engine::match_engine::ColumnarEvent<'_>, i64)> =
+        col_events.iter().map(|ev| (ev, NANOS)).collect();
+
+    // 预热一轮（首次触碰的分配器页不计入测量）。
+    {
+        let prepared = exec.each_batch_prepare(&batch);
+        let mut out = Vec::with_capacity(ROWS);
+        exec.execute_each_pipe_batch_columnar(&rows, &prepared, &mut out);
+        let mut stager =
+            PipeBatchStager::new_columnar(Arc::from("bid_mod"), Arc::clone(&schema), Some(4), &yield_names);
+        for row in &out {
+            stager.push_row("q13a_bid_mod", row, NANOS).expect("stage");
+        }
+        let _ = stager.take_batch().expect("build");
+    }
+
+    let probe = crate::memory_probe::MemoryProbe::exclusive();
+    let prepared = exec.each_batch_prepare(&batch);
+    let mut out: Vec<wf_engine::match_engine::PipeEachRow> = Vec::with_capacity(ROWS);
+    exec.execute_each_pipe_batch_columnar(&rows, &prepared, &mut out);
+    let after_eval = probe.peak_growth();
+
+    let mut stager =
+        PipeBatchStager::new_columnar(Arc::from("bid_mod"), Arc::clone(&schema), Some(4), &yield_names);
+    for row in &out {
+        stager.push_row("q13a_bid_mod", row, NANOS).expect("stage");
+    }
+    let after_stage = probe.peak_growth();
+
+    let built = stager.take_batch().expect("build").expect("non-empty");
+    let peak = probe.peak_growth();
+    let content = wf_engine::window::content_bytes(&built.1);
+
+    eprintln!("[pipe-alloc] 批规模 = {ROWS} 行（生产实测批大小）");
+    eprintln!(
+        "[pipe-alloc] ① execute_each_pipe_batch_columnar（PipeEachRow）峰值 = {:.2} MB ({:.0} B/行)",
+        after_eval as f64 / 1e6,
+        after_eval as f64 / ROWS as f64
+    );
+    eprintln!(
+        "[pipe-alloc] ② + push_row 暂存（PipeCol Vec<Option<T>>）峰值 = {:.2} MB ({:.0} B/行)",
+        after_stage as f64 / 1e6,
+        after_stage as f64 / ROWS as f64
+    );
+    eprintln!(
+        "[pipe-alloc] ③ + take_batch（Arrow 数组拷贝）峰值 = {:.2} MB ({:.0} B/行)",
+        peak as f64 / 1e6,
+        peak as f64 / ROWS as f64
+    );
+    eprintln!(
+        "[pipe-alloc] 输出 content_bytes = {:.2} MB ({:.0} B/行) ← 理论下界",
+        content as f64 / 1e6,
+        content as f64 / ROWS as f64
+    );
+    eprintln!(
+        "[pipe-alloc] **放大倍数 = {:.2}×**（峰值/输出）→ 可优化空间 = {:.2} MB/批 ({:.0} B/行)",
+        peak as f64 / content as f64,
+        (peak.saturating_sub(content)) as f64 / 1e6,
+        (peak.saturating_sub(content)) as f64 / ROWS as f64
+    );
+    assert!(content > 0, "输出批必须非空");
+    let _ = empty_tracked_bind_fields();
+}

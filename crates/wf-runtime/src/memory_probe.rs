@@ -18,9 +18,10 @@
 //!   不与 RSS 绝对值对齐。
 //!
 //! ## 并发注意
-//! 计数器是**进程全局**的：并行测试会互相污染 `peak`。所以规模对比测试必须
-//! 通过 [`MemoryProbe::exclusive`] 串行化（内部全局锁），并在测量段起点重置
-//! peak 基线。
+//! 计数器是**进程全局**的：并行测试会互相污染 `peak` 与相对基线的增量。所以
+//! 用本探针的测量/自测都必须**独占执行**——用测试名过滤（`cargo test
+//! pipe_write_alloc_footprint -- --ignored --nocapture`）或 `--test-threads=1`。
+//! 全套 `cargo test` 下这些测试标记为 `#[ignore]`，不参与并行跑。
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -139,14 +140,19 @@ impl MemoryProbe {
 mod tests {
     use super::*;
 
-    /// 计数器基本正确性：分配 → current/peak 上涨；释放 → current 回落、
-    /// peak 保持（历史水位）。
+    /// 探针自测（**单一测试**）：计数/峰值语义 + 峰值不累加。
+    ///
+    /// 为何合成一个：`CURRENT`/`PEAK` 是进程全局的，**拆成两个测试会互相污染**
+    /// （并行跑时对方释放的 MB 级内存使相对基线的增量饱和为 0）。合成单测后，
+    /// 过滤跑 `cargo test -p wf-runtime memory_probe -- --ignored` 即真正独占。
     #[test]
-    fn counts_allocations_and_tracks_peak() {
+    #[ignore = "requires exclusive run: cargo test -p wf-runtime memory_probe -- --ignored"]
+    fn probe_self_check() {
         let probe = MemoryProbe::exclusive();
         assert_eq!(probe.peak_growth(), 0, "基线处峰值增量为 0");
 
-        let big: Vec<u8> = vec![7u8; 4 << 20]; // 4MiB
+        // ① 计数：4MiB 分配被计入；释放后 current 回落、peak 保持历史水位。
+        let big: Vec<u8> = vec![7u8; 4 << 20];
         let after_alloc = probe.current_growth();
         assert!(
             after_alloc >= 4 << 20,
@@ -165,18 +171,16 @@ mod tests {
             probe.peak_growth() >= peak_with,
             "peak 是历史水位，释放后不回落"
         );
-    }
 
-    /// `peak_growth` 对**同量级重复**不累加：连续分配-释放同样大小，峰值
-    /// 只反映单次并存量——这是「内存与总量无关」断言的基础语义。
-    #[test]
-    fn peak_reflects_concurrent_not_cumulative() {
-        let probe = MemoryProbe::exclusive();
+        // ② 峰值只反映**并存量**而非累计量——这是「内存与总量无关」断言的
+        // 基础语义：新开一个基线，串行分配-释放 8 次 1MiB，峰值应远小于 8MiB。
+        drop(probe);
+        let probe2 = MemoryProbe::exclusive();
         for _ in 0..8 {
-            let chunk: Vec<u8> = vec![1u8; 1 << 20]; // 1MiB
+            let chunk: Vec<u8> = vec![1u8; 1 << 20];
             std::hint::black_box(&chunk);
         }
-        let peak = probe.peak_growth();
+        let peak = probe2.peak_growth();
         assert!(
             peak < 4 << 20,
             "8 次串行 1MiB 分配-释放，峰值应远小于累计 8MiB（实际 {peak}）"
