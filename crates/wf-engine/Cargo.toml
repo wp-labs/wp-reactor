@@ -17,6 +17,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 smol_str = { workspace = true }
 foldhash = { workspace = true }
+parking_lot = "0.12"
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }

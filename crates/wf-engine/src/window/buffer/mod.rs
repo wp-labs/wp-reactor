@@ -14,6 +14,12 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+// join_index 用 parking_lot::RwLock（读优先）——join 目标是读多写少热点
+// （q4a 33M 到期读 vs 900 batch 写），std RwLock 写者优先策略让读者在
+// 写者排队时被阻塞（100M q4 卡 28× 的锁竞争根因，2026-08-25）。
+// 其余窗口锁保持 std（log 写多、progress/parked_pin 低频）。
+use parking_lot::RwLock as PLRwLock;
+
 use arrow::array::{
     Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, LargeBinaryArray, LargeListArray,
     LargeStringArray, ListArray, MapArray, StringArray, StructArray, TimestampNanosecondArray,
@@ -38,16 +44,41 @@ use types::TimedBatch;
 /// with **no per-row `Event` materialization** — the index holds `(batch, row)`
 /// and reads fields on demand, so join-target windows stay columnar. Only
 /// present on windows configured as join targets (`set_join_key`).
+///
+/// **Sharded**: `shards.len()` (power of two) independent read-preferring
+/// `RwLock`s, one hash map each. q4 100M 断崖根因（2026-08-25）：单锁索引在
+/// 写者（bid append 的 `index_batch`，每 batch ~36.5k 行哈希插入，单批持锁
+/// ~5ms）持锁期间阻塞**全部**读者（deferred 到期查找）——30s 采样 21969/21969
+/// 全在 `lock_shared_slow`，EPS 7.6M→0.27M（28×）。分片后：
+///   - 查找只锁 key 所在一片（`shard_of & mask`）；
+///   - 写者先按片分组、再逐片短暂持写锁（每片临界区 36.5k/64 ≈ 570 行）。
+///
+/// deferred_bench `index_contention` 实测：写者活跃时读者吞吐 0.15M→6.9M
+/// ops/s（43–46×，达无写者天花板的 ~86%）。
 pub(super) struct JoinIndex {
     key_field: SmolStr,
     /// The window's `materialize_fields` projection: enrich reads only these
     /// columns from the joined rows. `None` = all columns.
     projection: Option<Arc<HashSet<String>>>,
-    /// Columnar row locators per key. Each [`KeyedRows`] keeps a running
-    /// `max_ts` so the asof fast path can answer the common "latest row
-    /// ≤ event_time" case in O(1) without scanning every candidate.
-    by_key: crate::match_engine::EngineHashMap<JoinKey, KeyedRows>,
+    /// Columnar row locators per key, split across `shards.len()` maps. Each
+    /// [`KeyedRows`] keeps a running `max_ts` so the asof fast path can answer
+    /// the common "latest row ≤ event_time" case in O(1) without scanning every
+    /// candidate.
+    shards: Vec<PLRwLock<crate::match_engine::EngineHashMap<JoinKey, KeyedRows>>>,
+    /// `shards.len() - 1`（2 的幂，选片用 `hash & mask`）。
+    mask: usize,
+    /// 每 batch 索引过的去重 key 集（`seq → keys`），供**增量驱逐**：驱逐一个
+    /// batch 只动它贡献过的 key，替代旧的整表扫描。q4 100M 断崖主因
+    /// （2026-08-25）：事件跨度 = count×100µs → 100M 跨度 2h46m > over=1h，
+    /// time 驱逐每 tick 弹掉一批 bid，旧 `remove_batch` 每批 O(全索引 33M 行)
+    /// （retain + max_ts 重算）→ evictor 线程独占一核、EPS 0.27M。registry 只
+    /// 保留**在窗** batch 的键（被驱逐 batch 的条目即删），内存 ≈ 窗内去重键
+    /// 数（100M 2GB cap ≈ 1.7M 键 × ~24B ≈ 40MB）。
+    batch_keys: PLRwLock<crate::match_engine::EngineHashMap<u64, Vec<JoinKey>>>,
 }
+
+/// 分片数：2 的幂。64 片时每片持锁临界区 ≈ 570 行/批，竞争摊薄 64×。
+const JOIN_INDEX_SHARDS: usize = 64;
 
 /// The indexed rows for one join key, plus the maximum raw timestamp among them
 /// (`None` when the key has no timestamped rows).
@@ -73,11 +104,26 @@ struct IndexedRow {
 }
 
 impl JoinIndex {
+    /// 选片：`DefaultHasher`（固定密钥，进程内确定性）对 `JoinKey` 散列后取
+    /// 低 `mask` 位。与分片内 map 自身的 foldhash 无关——只要求同一 key 恒落
+    /// 同一片。
+    fn shard_of(key: &JoinKey, mask: usize) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        (h.finish() as usize) & mask
+    }
+
     /// Index every row of `batch` by its `key_field` value. Reads the key column
     /// straight from the Arrow batch through the same [`extract_field_value`]
     /// conversion the eager `Event` path uses, so the produced keys are
     /// byte-identical to the previous materialized-index behavior.
-    fn index_batch(&mut self, batch: &Arc<RecordBatch>, ts_list: &[Option<i64>], seq: u64) {
+    ///
+    /// Sharded：先一遍提取 key + 选片（不持任何锁），再逐片短暂持写锁插入——
+    /// 每片临界区只有该片分到的行（≈ 36.5k/64），读者最多等自己那片（q4
+    /// 100M 单锁阻塞全读者的根因修复）。同时把本批的去重 key 集注册进
+    /// `batch_keys`（增量驱逐用，见 struct 注释）。
+    fn index_batch(&self, batch: &Arc<RecordBatch>, ts_list: &[Option<i64>], seq: u64) {
         let Ok(col_idx) = batch.schema().index_of(self.key_field.as_str()) else {
             return;
         };
@@ -85,6 +131,8 @@ impl JoinIndex {
         let field = schema.field(col_idx);
         let col = batch.column(col_idx);
         let index = build_field_index(batch);
+        let mut buckets: Vec<Vec<(JoinKey, usize, Option<i64>)>> =
+            (0..self.shards.len()).map(|_| Vec::new()).collect();
         for (row, ts) in ts_list.iter().enumerate() {
             if col.is_null(row) {
                 continue;
@@ -95,27 +143,81 @@ impl JoinIndex {
             let Some(key) = JoinKey::from_value(&value) else {
                 continue;
             };
-            let kr = self.by_key.entry(key).or_default();
-            kr.rows.push(IndexedRow {
-                ts_nanos: *ts,
-                batch: Arc::clone(batch),
-                row,
-                index: Arc::clone(&index),
-                seq,
-            });
-            if let Some(t) = *ts {
-                kr.max_ts = Some(kr.max_ts.map_or(t, |m| m.max(t)));
+            let shard = Self::shard_of(&key, self.mask);
+            buckets[shard].push((key, row, *ts));
+        }
+        // 去重本批 key 集（驱逐时按 key 增量清理，需与行去重一致）。Int 键
+        // clone 是 memcpy；Str 键只有首次出现才 clone（set 命中后跳过）。
+        // 用 foldhash（EngineHashSet）而非 std SipHash——append 热路径每批
+        // ~36.5k 行都过这个 set，SipHash 实测把 index_batch 拉到 ~117ns/row
+        //（join_index_append_bench），foldhash 约省 2/3。
+        let mut batch_key_set: crate::match_engine::EngineHashSet<JoinKey> =
+            crate::match_engine::EngineHashSet::default();
+        for (shard, rows) in buckets.into_iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let mut map = self.shards[shard].write();
+            for (key, row, ts) in rows {
+                if !batch_key_set.contains(&key) {
+                    batch_key_set.insert(key.clone());
+                }
+                let kr = map.entry(key).or_default();
+                kr.rows.push(IndexedRow {
+                    ts_nanos: ts,
+                    batch: Arc::clone(batch),
+                    row,
+                    index: Arc::clone(&index),
+                    seq,
+                });
+                if let Some(t) = ts {
+                    kr.max_ts = Some(kr.max_ts.map_or(t, |m| m.max(t)));
+                }
             }
         }
+        // 空 key 集也注册（空条目）：驱逐时能区分「本批没索引任何行」和
+        // 「registry 缺失」，避免空批误触发昂贵的全量回退扫描。
+        self.batch_keys
+            .write()
+            .insert(seq, batch_key_set.into_iter().collect());
     }
 
-    /// Remove every row belonging to `batch` (matched by `Arc` pointer
-    /// identity — the index holds the same `Arc<RecordBatch>` the log does),
-    /// then recompute the per-key `max_ts` (a removal may have dropped the max).
-    fn remove_batch(&mut self, batch: &Arc<RecordBatch>) {
-        for kr in self.by_key.values_mut() {
-            kr.rows.retain(|r| !Arc::ptr_eq(&r.batch, batch));
-            kr.max_ts = kr.rows.iter().filter_map(|r| r.ts_nanos).max();
+    /// Remove every row belonging to batch `seq`, then recompute the per-key
+    /// `max_ts` (a removal may have dropped the max).
+    ///
+    /// **增量**：只动 `batch_keys[seq]` 里的 key（O(受影响 key × 行数)），替代
+    /// 旧的整表扫描（O(全索引)——q4 100M 驱逐每 tick 33M 行）。registry 缺失
+    /// （防御：set_join_key 前的旧路径等）时回退全量扫描，正确性不变。
+    fn remove_batch(&self, seq: u64) {
+        let keys: Option<Vec<JoinKey>> = self.batch_keys.write().remove(&seq);
+        let Some(keys) = keys else {
+            // 回退：全量扫描（防御——batch 未注册：set_join_key 前的旧 batch、
+            // key 列缺失被 index_batch 早退的 batch）。按 seq 匹配与旧实现按
+            // Arc 指针匹配等价（batch↔seq 一一对应）。
+            for shard in &self.shards {
+                let mut map = shard.write();
+                for kr in map.values_mut() {
+                    kr.rows.retain(|r| r.seq != seq);
+                    kr.max_ts = kr.rows.iter().filter_map(|r| r.ts_nanos).max();
+                }
+                map.retain(|_, kr| !kr.rows.is_empty());
+            }
+            return;
+        };
+        for key in keys {
+            let shard = Self::shard_of(&key, self.mask);
+            let mut map = self.shards[shard].write();
+            let Some(kr) = map.get_mut(&key) else {
+                continue;
+            };
+            let before = kr.rows.len();
+            kr.rows.retain(|r| r.seq != seq);
+            if kr.rows.len() != before {
+                kr.max_ts = kr.rows.iter().filter_map(|r| r.ts_nanos).max();
+            }
+            if kr.rows.is_empty() {
+                map.remove(&key);
+            }
         }
     }
 
@@ -123,9 +225,10 @@ impl JoinIndex {
     /// (`None` = all rows), as columnar [`JoinRow`]s. The seq cut is the M2
     /// pull-mode consistency boundary: a reader processing batch N must only
     /// see rows from batches it has pulled (`seq <= N`), never rows the actor
-    /// appended past it.
+    /// appended past it. 只锁 key 所在片。
     fn lookup(&self, key: &JoinKey, max_seq: Option<u64>) -> Option<Vec<JoinRow>> {
-        self.by_key.get(key).map(|kr| {
+        let map = self.shards[Self::shard_of(key, self.mask)].read();
+        map.get(key).map(|kr| {
             kr.rows
                 .iter()
                 .filter(|r| max_seq.is_none_or(|m| r.seq <= m))
@@ -140,7 +243,8 @@ impl JoinIndex {
         key: &JoinKey,
         max_seq: Option<u64>,
     ) -> Option<Vec<(i64, JoinRow)>> {
-        self.by_key.get(key).map(|kr| {
+        let map = self.shards[Self::shard_of(key, self.mask)].read();
+        map.get(key).map(|kr| {
             kr.rows
                 .iter()
                 .filter(|r| max_seq.is_none_or(|m| r.seq <= m))
@@ -174,7 +278,8 @@ impl JoinIndex {
         min_ts: i64,
         max_seq: Option<u64>,
     ) -> AsofLookup {
-        let Some(kr) = self.by_key.get(key) else {
+        let map = self.shards[Self::shard_of(key, self.mask)].read();
+        let Some(kr) = map.get(key) else {
             return AsofLookup::Miss;
         };
         // seq-cut 下 max_ts 缓存可能来自未拉取 batch：`max_seq` 为 Some 时按
@@ -305,7 +410,10 @@ pub struct Window {
     join_enabled: AtomicBool,
     /// Optional hash index for join lookups (see `set_join_key`). Only
     /// mutated while `join_enabled` is true.
-    join_index: RwLock<Option<JoinIndex>>,
+    /// 2026-08-25 q4 100M 分片后：外层锁仅保护 `Option` 配置（`set_join_key`
+    /// 一次性写、后续不变），稳态读写都走读锁；真正的并发是 `JoinIndex` 内部
+    /// 的 64 片独立 RwLock（`index_batch` 逐片短暂持写锁，查找只锁一片）。
+    join_index: PLRwLock<Option<JoinIndex>>,
     /// Optional per-event field whitelist (see `WindowParams`). Immutable
     /// after construction — readers (`Router::route_parse`) access it with no
     /// synchronization at all.
@@ -351,7 +459,7 @@ impl Window {
             batch_count: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
             join_enabled: AtomicBool::new(false),
-            join_index: RwLock::new(None),
+            join_index: PLRwLock::new(None),
             materialize_fields,
             defer_materialization,
             progress: RwLock::new(None),
@@ -450,10 +558,16 @@ impl Window {
             return; // 已配置（首个 join 条件的右字段），幂等
         }
         let key_field = SmolStr::new(&key_field);
-        let mut index = JoinIndex {
+        let index = JoinIndex {
             key_field,
             projection: self.materialize_fields.clone(),
-            by_key: crate::match_engine::EngineHashMap::default(),
+            shards: (0..JOIN_INDEX_SHARDS)
+                .map(|_| {
+                    PLRwLock::new(crate::match_engine::EngineHashMap::default())
+                })
+                .collect(),
+            mask: JOIN_INDEX_SHARDS - 1,
+            batch_keys: PLRwLock::new(crate::match_engine::EngineHashMap::default()),
         };
         // Read the log under its read lock; the guard is released before the
         // join-index write lock is taken (lock ordering: log → join_index,
@@ -469,7 +583,7 @@ impl Window {
             index.index_batch(batch, ts_list, *seq);
         }
         self.join_enabled.store(true, Ordering::Release);
-        *self.join_index.write().expect("join index lock poisoned") = Some(index);
+        *self.join_index.write() = Some(index);
     }
 
     /// O(1) lookup of rows whose `key_field` equals `key`, as columnar
@@ -486,7 +600,6 @@ impl Window {
         Some(
             self.join_index
                 .read()
-                .expect("join index lock poisoned")
                 .as_ref()?
                 .lookup(key, max_seq)
                 .unwrap_or_default(),
@@ -509,7 +622,6 @@ impl Window {
         Some(
             self.join_index
                 .read()
-                .expect("join index lock poisoned")
                 .as_ref()?
                 .lookup_timestamped(key, max_seq)
                 .unwrap_or_default(),
@@ -530,7 +642,7 @@ impl Window {
         if !self.join_enabled.load(Ordering::Acquire) {
             return AsofLookup::Fallback;
         }
-        let guard = self.join_index.read().expect("join index lock poisoned");
+        let guard = self.join_index.read();
         let Some(index) = guard.as_ref() else {
             return AsofLookup::Fallback;
         };
@@ -740,11 +852,7 @@ impl Window {
             // by the incoming batch aren't kept in the index).
             if self.join_enabled.load(Ordering::Acquire)
                 && let Some(tb) = log.get(&seq)
-                && let Some(idx) = self
-                    .join_index
-                    .write()
-                    .expect("join index lock poisoned")
-                    .as_mut()
+                && let Some(idx) = self.join_index.read().as_ref()
             {
                 let ts_list = self.raw_ts_list(tb);
                 idx.index_batch(&tb.batch, &ts_list, seq);
@@ -780,17 +888,15 @@ impl Window {
     }
 
     /// Remove an evicted batch's rows from the join index (if configured).
+    /// 外层只取读锁（索引设置后不变）；`JoinIndex::remove_batch` 内部按
+    /// `batch_keys` 增量清理（只动该批贡献过的 key）——q4 100M 断崖修复：
+    /// 旧实现每驱逐一批就全索引扫描（33M 行 × 每批），evictor 线程卡死一核。
     fn remove_batch_from_index(&self, evicted: &TimedBatch) {
         if !self.join_enabled.load(Ordering::Acquire) {
             return;
         }
-        if let Some(idx) = self
-            .join_index
-            .write()
-            .expect("join index lock poisoned")
-            .as_mut()
-        {
-            idx.remove_batch(&evicted.batch);
+        if let Some(idx) = self.join_index.read().as_ref() {
+            idx.remove_batch(evicted.seq);
         }
     }
 

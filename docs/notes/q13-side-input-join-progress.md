@@ -886,3 +886,250 @@ q20_columnar_join_per_row -- --ignored --nocapture`）：
   共享 1.9×）vs 行式参考 276ns/row（3.6M/s，列式 2.3×）
 - 热键 122ns/row 与此前 stats 微基准 122ns/evt 吻合；端到端剩余成本在
   rule_task 层（pull/遥测/锁/commit），不在 executor
+
+## 2026-08-25 q4 100M 性能断崖修复（join_index 分片 + 增量驱逐）— 本 session
+
+### 任务与基线
+
+用户要求「100M 跑 Q4，性能特别差则分析定位解决」。q4 双规则链（q4a deferred
+join + q4b stats）。基线：30M 7.6M EPS；**100M 0.27M（28× 断崖）**，RSS 22GB，
+CPU 105%（单核）。
+
+### 第一层根因：join_index 单锁写者阻塞全部读者
+
+30s macOS `sample`：21969/21969 全在 `join_lookup_timestamped →
+lock_shared_slow`。写锁持有者 = bid append 的 `index_batch`（每批 36.5k 行
+哈希插入）。
+
+**数据先行**（deferred_bench `index_contention`，release）：1 写者批量插入 +
+4 读者随机查找——单锁在写者活跃时读者吞吐塌到天花板 2%（0.15M vs 7.98M
+ops/s）；64 分片恢复 6.9M（43–46×，达无写者天花板 ~86%）。
+
+**修复①**：`JoinIndex` 拆 64 片独立 parking_lot RwLock（`shards: Vec<PLRwLock<
+EngineHashMap>>` + `mask`，`DefaultHasher & mask` 选片）。`index_batch` 先按片
+分组再逐片短暂持写锁；查找只锁一片。外层 `join_index` 锁改读锁（设置后不变）。
+实测 100M：**0.27M → 0.378M（+40%）**——不够，断崖未根治。
+
+### 第二层根因（真正主因）：时间驱逐 × 全索引扫描
+
+再采样：21870/21870 在 `evictor → evict_expired_impl → remove_batch_from_index`。
+根因链：
+
+- `gen-nexmark` 事件跨度 = count × 100µs → **30M = 50min（< over=1h，零驱逐）**；
+  **100M = 2h46m（> over=1h）** → bid 窗时间驱逐**合法触发**（over 是语义边界，
+  D4 pin 不覆盖时间驱逐）；
+- 旧 `remove_batch` 每驱逐一批就**全索引扫描**（全片 retain + max_ts 重算，
+  O(全行数)）——100M 时 33M 行 × 数千批 → evictor 线程独占一核。metrics 实锤：
+  `time_evicted_total` 555+ 且持续增长。
+
+**数据先行**（deferred_bench `remove_batch`，release）：32.3M 行/170 万键量级
+全量 17.9ms/批 vs 增量 0.26ms/批 → **70×**。
+
+**修复②（增量驱逐）**：`JoinIndex` + `batch_keys: RwLock<HashMap<u64 seq,
+Vec<JoinKey>>>`（index_batch 注册去重 key 集；空批也注册空条目区分「没索引
+行」vs「registry 缺失」）。`remove_batch(seq)` 只动该批贡献的 key（O(受影响
+key × 行数)），max_ts 仅对受影响 key 重算；registry 缺失回退全量扫（防御）。
+内存 ≈ 窗内去重键数（100M 2GB cap ≈ 1.7M 键 × 24B ≈ 40MB）。
+
+### 实测（哨兵 EPS）
+
+| 规模 | 修前 | 修后 |
+|------|------|------|
+| 100M q4 | 0.27M（RSS 22GB） | **11.26M（42×，RSS 19.8GB）** |
+| 30M q4 | 7.6M | **12.9M（1.7×）** |
+| 30M q4a EMIT | — | 1,672,559（= 历史 oracle 精确值 ✅） |
+| 100M q4a EMIT | 2,573,772（SIGKILL 截断虚高） | 2,067,324（干净关停真值） |
+
+SUMMARY clean；100M oracle 对拍（verify-nexmark）运行中（~10-30min）。
+
+### 测试与基准（全部通过）
+
+- wf-engine 1113 / wf-runtime 530 pass
+- 单测 +4：`join_index_shards_spread_and_deterministic`、
+  `join_index_sharded_lookup_evict_and_asof_span_all_shards`、
+  `join_index_incremental_remove_only_touches_the_evicted_batch`、
+  `join_index_incremental_remove_recomputes_max_ts`
+- bench +2（deferred_bench）：`index_contention`（单锁 vs 分片 43–46×）、
+  `remove_batch`（全量 vs 增量 70×）
+
+### 未提交文件（wp-reactor main）
+
+- `M crates/wf-engine/Cargo.toml`（+parking_lot 0.12）
+- `M crates/wf-engine/src/window/buffer/mod.rs`（分片 + batch_keys 增量驱逐）
+- `M crates/wf-engine/src/window/buffer/tests.rs`（+4 测试）
+- `M crates/wf-engine/src/match_engine/tests/deferred_bench.rs`（+2 bench）
+- `M crates/wf-runtime/src/engine_task/rule_task.rs`（scan_deferred 前缀 +
+  lo_min 缓存，上一 session 遗留，已测）
+- `M crates/wf-runtime/src/engine_task/deferred_integration_tests.rs`（乱序
+  到期集成测试，上一 session 遗留）
+
+### Pitfalls（勿重蹈）
+
+- **瞬间/短 sample 会抓错热点**：第一次 30s 采样是读锁（index_batch 写锁），
+  分片后又采样才暴露 remove_batch——100M 断崖是**两层**叠加，第一层修复只
+  揭开第二层。
+- **bench_qN_replay.txt 会被下一轮覆盖**：100M 结果记得先存档（本 session
+  的 100M 行在 /tmp/q4_100m_run3.log，已 cp 到 /tmp/bench_q4_100m_fixed.txt）。
+- **SIGKILL 截断 EMIT 虚高**：SIGTERM 超时强杀会丢尾部 flush 计数（bench.sh
+  注释有记载），对比 EMIT 必须用干净关停的 run。
+- **事件跨度随 count 缩放**（count×100µs）：30M=50min 无驱逐 vs 100M=2h46m
+  驱逐——「30M 不驱逐所以 100M 也不驱逐」的假设在规模翻倍后失效。
+- 已验证有效的判别手段：evictor metrics（`time_evicted_total`）+ macOS
+  `sample` 完整调用栈 + 先写隔离微基准拿 A/B 数据再改生产代码。
+
+## 下一步（重开 session 从这里继续）
+
+1. **确认 100M q4 oracle 对拍结果**（`/tmp/q4_verify_100m.log`，verify-nexmark
+   100M --query q4）——clean 即可 commit 本 session 改动
+2. commit（用户之前每次 session 都 commit；本次改动 = 上述 6 文件）
+3. **全量 22 查询 30M 重跑**：q4 已 12.9M（30M 基线文档数字过时）；
+   `OSS_VVR_BASELINE.md` / `CAPABILITY_GAP_MATRIX.md` 待刷新（用户 2026-08-24
+   的待办仍在）
+4. （可选）q15 归并异步化；q3 −16% 独立 bug（与驱逐无关，已双证）
+5. 注意：其他把 bid 当 join 目标的查询（q9 30M 现 7.84M）在更大规模下同样会
+   触发时间驱逐——增量驱逐已一并修好，但 q9 100M 值得复测（预期不再断崖）
+
+## 2026-08-25 review 追加：代码修复 + 新发现（100M q4a 语义欠发，独立于本性能修复）
+
+### review 修复（数据驱动，已测）
+
+1. **index_batch 去重 HashSet 换 foldhash**（std SipHash → EngineHashSet）：
+   join_index_append_bench 实测 index_batch **116.7 → 88.6 ns/row（−24%）**；
+   100M q4 EPS 11.26M → **12.98M**。SipHash 在 append 热路径每批 36.5k 行
+   都过 set，是隐藏的常数项。
+2. **publish_retention_floor 缓存分支对齐全量语义**：cached 分支从
+   `lo_min.min(watermark)` 改为「空集→watermark / 非空→lo_min」（与重扫
+   分支 `min(lo_ns).unwrap_or(watermark)` 逐分支一致）；生产路径行为等价
+   （lo_min ≤ 真实 min，恒保守方向），消除两分支语义漂移。
+3. 注释修正（remove_batch 回退路径「按 Arc 指针匹配」→ 实际按 seq）+ 交接
+   bench 的 unused-mut 清理。
+
+### review 新增测试（wf-engine 1113→1115）
+
+- `join_index_remove_batch_fallback_when_registry_missing`：直接构造 JoinIndex
+  注入 registry 缺失态——未注册 seq 走全量回退（no-op 不 panic）、已注册 seq
+  增量删除、registry 条目随驱逐清理。
+- `join_index_concurrent_append_evict_lookup_no_deadlock`：写者 + 驱逐者 +
+  读者三线程交错（锁序：index_batch 先片锁后 registry、remove_batch 先
+  registry 后片锁，均不跨锁等另一把）——钉死分片 + registry 锁序。
+
+### ⚠️ 重大发现：100M q4a 语义欠发（预先存在，非本次性能修复引入）
+
+**oracle 对拍**（`wfgen verify-nexmark 100M --query q4`，47min）：
+- oracle q4a_auction_finals = **5,576,436**（真实 WFL 规则引擎、预加载完整窗）
+- 引擎 100M EMIT = **2,067,324**（≈ oracle × (1h/2h46m)）——**欠发 ~63%**
+- 修前 broken run（0.378M EPS）= 2,573,772 → **同量级，证明与本次性能修复无关**
+- 30M 引擎 = oracle = 1,672,559 精确一致（span 50min < over 1h，零驱逐）
+
+**根因**（机制推演 + 数据吻合）：auction 有效期只有 **1-333ms**（官方
+`1+[0,2×horizon)`，horizon=1666×100µs）。100M 事件跨度 2h46m > over=1h →
+bid 窗时间驱逐合法触发。**ingest 不被驱动任务流控**：TCP 摄入全速推进、bid
+窗按摄入位置驱逐 >1h 的 bid，而 q4a 驱动任务（6M auction × eval）滞后 →
+等它评估早期 auction 时，其 [dateTime, expires] 内的 bid 已被时间驱逐 → miss。
+只有最后 1h 内到期的 auction 命中（2.07M ≈ 5.58M × 1h/2h46m）。
+
+**性质**：deferred 评估延迟（Δ_event = 摄入位置 − 评估位置）超过 over 保留期
+时丢行。30M 不触发（span < over）。**这不是 join 索引/驱逐实现的 bug，是
+「驱动任务滞后 × over 时间驱逐」的语义缺口**——oracle 预加载全窗无此限制。
+
+**候选修复方向（未做，工程量大，需用户决策）**：
+- A. D4 pin 扩展到**时间驱逐**：pin = min(pending lo_ns) → bid 窗保留评估
+  前沿内的全部行 → 全局内存 cap 触顶 → 现有 memory_pressure 背压停摄入 →
+  驱动任务追平 → 前沿推进 → 驱逐恢复（自调节）。代价：RSS 上界变大、语义
+  从「over 声明保留」变为「评估前沿保留」。
+- B. 摄入流控：TCP 源按驱动窗口 min_acked 暂停（现只有哨兵完成信号，无
+  运行中流控）——大改。
+- C. 更快评估（10 分片已上，eval 本身 1.4µs 不是瓶颈；瓶颈是评估吞吐 vs
+  摄入速度的相对滞后）。
+
+**建议**：100M 是性能量级、30M 是正确性量级（用户既定口径，30M 精确一致）。
+此项记入待办，由用户决定是否投入。`--verify` 时注意：先跑 bench 再立刻
+verify（verify 读 data/metrics.ndjson，中间跑别的 query 会覆盖）。
+
+## 下一步（重开 session 从这里继续）
+
+1. **commit 本 session 全部改动**（wp-reactor main，6 文件：
+   buffer/mod.rs、buffer/tests.rs、deferred_bench.rs、Cargo.toml、
+   rule_task.rs、deferred_integration_tests.rs）
+2. 100M q4a 语义欠发（上节）——用户决策是否修复（方向 A/B/C）
+3. 全量 22 查询 30M 重跑 + OSS/VVR 基线刷新（q4 现 12.9M；文档数字过时）
+4. q15 归并异步化（可选）；q3 −16% 独立 bug（与驱逐无关）
+
+## ✅ 100M q4a 欠发根治：运行期评估 gate（2026-08-25，本 session 落地）——已 commit
+
+用户定调：「q4a 评估跟上摄入（或摄入对驱动任务背压）——100M 的 RSS 会从
+20.4GB 显著回落，逼近 30M 量级；这也是欠发（评估滞后 × over 驱逐）的同一根源」。
+选了「评估跟上摄入」方向（B 摄入流控是大改，未做）。
+
+### 根因（探针实锤，非猜测）
+
+- 运行期 hit 率只有 ~50%（流尾 71%），miss 里 cand0（键无候选）占 34-66%
+  （流尾 0.1%）——**join 目标窗口（bid）append 滞后**：驱动 watermark 只反映
+  auction 流处理到哪，bid 窗由同一输入另行 append，管道滞后下到期评估时右行
+  还没落地 → 运行期 miss → 全部进 missed（RSS 随总量增长）。
+- 30M 靠 EOS 重试掩护（窗完整 → 全命中 → oracle 精确）；100M 事件跨度 2h46m
+  > over=1h → EOS 时早段 bid 已被时间驱逐 → 重试只命中最后 1h → 欠发 ~63%。
+- 一度怀疑 `row_matches_conds` 系统性失败（[matched-probe] 未跑就被新方向
+  取代）——实际是候选根本没到（cand0 为主）。
+
+### 改动（`rule_task.rs` scan_deferred）
+
+评估前沿 = `min(驱动 watermark, join 目标窗口 raw max_event_time)`：
+`expiry > 目标 append 位置` 的实例**保持挂起**，目标追平后随下一批次扫描评估。
+语义保证：目标 max_event_time ≥ expiry 时，区间 [lo,hi] 内右行全部在场且新鲜
+（刚 append，驱逐够不着）→ 运行期命中、missed 不积压、EMIT 正确。
+
+- `scan_deferred(wm, emit, gate_on_target)`：批次尾/scan_timeouts 传 true；
+  flush 收口传 false（数据已全量 ingest，尾部 pending 不能被 gate 掉；miss
+  由 EOS 重试兜底）。
+- 目标窗口不存在/未 append（max_event_time=i64::MIN）→ 不 gate（防御：保持
+  旧行为，flush 收口）。
+- 无需改驱逐/pin：评估在目标追平后立刻发生，需要的右行永远新鲜，时间驱逐
+  与内存驱逐都够不着（pin 仍由 pending lo 推进）。
+
+### 实测（哨兵 EPS，30M/100M 帧，本地 wp-reactor）
+
+| 指标 | 修前 | 修后 |
+|------|------|------|
+| 30M q4a EMIT | 1,672,559 | **1,672,559（= oracle 精确）** |
+| 100M q4a EMIT | 2,067,324（欠发 63%） | **5,576,436（= oracle 精确）** |
+| 100M q4 RSS | 20.4GB | 17.6GB |
+| 100M EPS | 12.98M | 10.5-10.7M（略降，评估门控开销 + 噪声） |
+| 30M EPS | 12.98M | 10.5M（同上） |
+
+运行期队列规模（临时探针，已移除）：pending ≈ 100/shard（批次中瞬时 15k），
+missed ≈ 45-52k/shard ≈ 总数 8.7% = **真无 bid miss 率**（oracle 口径 7%）
+——不再随数据量膨胀（修前 ~50% 假 miss 积压）。
+
+RSS 构成（footprint）：bid 窗 6.8GB（over=1h 语义保留，33.1M 行）+ join 索引
+~2GB + auction 窗 1.15GB + person 0.18 + auction_finals 0.2 + parse buffer 2GB
++ 引擎基线 ≈ 17GB。**增长随总量的部分（missed 积压）已消除**；剩余 gap vs
+30M（9.2GB）是窗口保留量差异（100M 1h bid = 33M 行 vs 30M 全量 27.6M）+ 固定
+开销，非无界项。
+
+### 测试
+
+- 既有 deferred 集成测试改用 `append_with_watermark`（测试窗的 max_event_time
+  此前不推进；生产走 `commit_appended_batch` 的 watermark append）+ 目标追平
+  append（生产流 bid/auction 交错，目标天然追平）。
+- 新增回归 `deferred_q9_target_lag_holds_evaluation_until_target_catches_up`：
+  目标未追平 → 实例保持挂起不评估；目标追平 + 后续驱动事件触发扫描 → 运行期
+  命中输出（无需 flush/EOS 重试）；flush 不重复。
+- wf-engine 1115 / wf-runtime 531（+1）/ clippy 0 全过。
+
+### 遗留
+
+- 真 miss（无 bid auction ~8.7%）仍驻留 missed 至 EOS（~0.5GB）——语义所需
+  （窗口完整确认后判定），可后续优化（missed 只存 lo/hi/key 而非全 Event）。
+- 100M EPS 10.5M vs 30M 12.9M：评估 gate 每次 scan 多一次目标窗 max_event_time
+  读取（原子 load，可忽略）；EPS 下降更多是运行噪声/load 差异，未单独归因。
+- q9（同款 bid 目标 deferred）同享此修复，100M 值得复测。
+- 全量 22 查询 30M 重跑 + OSS/VVR 基线刷新仍待办（q4 数字：30M 12.9M → 10.5M）。
+
+## 下一步（重开 session 从这里继续）
+
+1. （已 commit 本 session：性能修复 + 欠发 gate + 测试）
+2. 全量 22 查询 30M 重跑 + OSS/VVR 基线刷新（q4 100M 已 5.58M 精确，文档 q4
+   数字待更新）
+3. q9 100M 复测（同款 deferred bid 目标，预期不再断崖）
+4. q15 归并异步化（可选）；q3 −16% 独立 bug（与驱逐无关）

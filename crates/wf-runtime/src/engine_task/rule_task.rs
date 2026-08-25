@@ -157,6 +157,12 @@ struct DeferredRuntime {
     /// progress 表（单测窗口）或 join 目标不是 buffer 窗口（provider 静态表
     /// 不驱逐，无需 pin）。
     retention_pin: Option<Arc<std::sync::atomic::AtomicI64>>,
+    /// 存活挂起（pending + missed）的 min(lo_ns) 缓存（2026-08-25 q4 100M）：
+    /// `publish_retention_floor` 不再每次全量扫 O(n)。插入时 O(1) 更新；
+    /// scan 移出前缀后若最小项被移出则标 dirty，publish 时重扫——因 min lo
+    /// 项几乎总是最早挂起（数据时间单调），dirty 极少，摊销 O(1)。
+    lo_min: i64,
+    lo_min_dirty: bool,
 }
 
 impl DeferredRuntime {
@@ -189,17 +195,38 @@ impl DeferredRuntime {
     ///
     /// 内存上界不变：`missed` 把前沿冻结在早期事件时间，但保留量仍由 `over` 的
     /// 时间驱逐封顶（时间驱逐故意忽略 pin）。
-    fn publish_retention_floor(&self) {
+    fn publish_retention_floor(&mut self) {
         let Some(pin) = &self.retention_pin else {
             return;
         };
-        let floor = self
-            .pending
-            .iter()
-            .chain(self.missed.iter())
-            .map(|p| p.lo_ns)
-            .min()
-            .unwrap_or(self.watermark);
+        // 2026-08-25 q4 100M：缓存 min(lo_ns)（插入 O(1) 更新；dirty 才重扫）
+        // ——旧的每 batch 全量扫 pending+missed 在 33M 挂起下是第二个 O(n²)。
+        // 缓存仅在维护路径上可靠：直接构造/绕过维护（测试、未来新路径）时
+        // `lo_min == i64::MAX` 且集合非空 → 退回全量扫（正确性兜底，罕见）。
+        let cache_trustworthy = !(self.lo_min == i64::MAX
+            && (!self.pending.is_empty() || !self.missed.is_empty()));
+        let floor = if self.lo_min_dirty || !cache_trustworthy {
+            let lo = self
+                .pending
+                .iter()
+                .chain(self.missed.iter())
+                .map(|p| p.lo_ns)
+                .min()
+                .unwrap_or(self.watermark);
+            // 重扫后同步缓存（后续 publish 免扫）。
+            self.lo_min = lo;
+            self.lo_min_dirty = false;
+            lo
+        } else if self.pending.is_empty() && self.missed.is_empty() {
+            // 空集 → watermark（与全量语义一致：更旧的行未来实例也用不到）。
+            self.watermark
+        } else {
+            // 非空 → 历史 min lo_ns（插入时 O(1) 维护的单调不增下界）。
+            // 到期项移出不标 dirty（见 scan_deferred 注释）→ 缓存可能停在
+            // 已退场实例的更小 lo_ns → 只偏保守（≤ 真实 min），不会丢行；
+            // 空集分支已单独处理，非空时 lo_min ≤ 任意存活实例的 lo_ns。
+            self.lo_min
+        };
         pin.store(floor, std::sync::atomic::Ordering::Release);
     }
 
@@ -487,6 +514,8 @@ impl RuleTask {
                     watermark: i64::MIN,
                     join_idx,
                     retention_pin,
+                    lo_min: i64::MAX,
+                    lo_min_dirty: false,
                 }
             });
         // D4 扩展（2026-08-24）：snapshot/asof join 目标窗口同样持有保留 pin。
@@ -1501,7 +1530,21 @@ impl RuleTask {
                             )
                         {
                             deferred.watermark = deferred.watermark.max(event_nanos);
-                            deferred.pending.push(pending);
+                            // 2026-08-25 q4 100M：pending 保持按 expiry 升序——
+                            // scan_deferred 据此只取到期前缀（O(due)）而非全量
+                            // 扫（O(n)，33M 挂起 × 2740 batch 卡死 28×）。驱动流
+                            // 事件时间单调时 expiry 也单调（emit at = expires 随
+                            // 事件时间），追加即有序 O(1)；乱序驱动二分插入兜底。
+                            let expiry = pending.expiry_nanos;
+                            let pos = deferred.pending.partition_point(|p| {
+                                p.expiry_nanos <= expiry
+                            });
+                            // lo_min 缓存：插入 O(1) 更新（publish 免全量扫）。
+                            // 用插入项的 lo_ns（区间下界）；pending 有序后 min lo
+                            // 项几乎总是最早挂起（数据时间单调），dirty 极少。
+                            let lo_ns = pending.lo_ns;
+                            deferred.pending.insert(pos, pending);
+                            deferred.lo_min = deferred.lo_min.min(lo_ns);
                         }
                         if debug_enabled {
                             stats.advanced += 1;
@@ -1667,10 +1710,10 @@ impl RuleTask {
         if self.deferred.is_some()
             && let Some(wm) = self.deferred.as_ref().map(|d| d.watermark)
         {
-            self.scan_deferred(wm, batch_emit_nanos).await;
+            self.scan_deferred(wm, batch_emit_nanos, true).await;
             // D4：到期实例已退场 → 把新的保留前沿发布给 join 目标窗口（批次
             // 级，不在行循环里）。扫描后发布：前沿尽可能向前，窗口尽早释放。
-            if let Some(d) = self.deferred.as_ref() {
+            if let Some(d) = self.deferred.as_mut() {
                 d.publish_retention_floor();
             }
         }
@@ -1903,25 +1946,48 @@ impl RuleTask {
     ///
     /// `wm`：事件时间 watermark（批次尾 / scan_timeouts / flush 收口）；
     /// `emit_time_nanos`：输出记录的墙钟 emit 时间。空集（Q9 无 bid）不输出。
-    async fn scan_deferred(&mut self, wm: i64, emit_time_nanos: i64) {
+    /// `gate_on_target`：运行期为 true 时把评估前沿压到 join 目标窗口的 append
+    /// 位置（见函数内注释——100M q4a 欠发根治）；flush 收口为 false（数据已全
+    /// 量 ingest，miss 由 EOS 重试兜底，不能 gate 掉尾部 pending）。
+    async fn scan_deferred(&mut self, wm: i64, emit_time_nanos: i64, gate_on_target: bool) {
         let Some(deferred) = self.deferred.as_mut() else {
             return;
         };
         let join_idx = deferred.join_idx;
+        // 2026-08-25 q4 100M 欠发根治：运行期评估前沿 = min(驱动 watermark,
+        // join 目标窗口 append 位置)。驱动 watermark 只反映**驱动流**（q4a =
+        // auction）处理到哪；bid 等 join 目标由同一输入另行 append，存在管道
+        // 滞后——按驱动 wm 到期评估时目标窗口可能还没 append 该实例的右行
+        // （探针实锤：运行期 hit≈50%、cand0≈34-66%，越靠流尾命中率越高）。
+        // 后果：miss 积压进 `missed`（RSS 随总量增长，30M/100M 非窗口内存差
+        // ~9.2GB），且 100M 下 EOS 重试时早段右行已被 over 时间驱逐 → 欠发
+        // ~63%（oracle 5.58M vs 2.07M）。改为等目标窗口 raw max event time
+        // ≥ expiry 才评估：右行全在场且新鲜（刚 append，驱逐够不着）→ 运行期
+        // 命中、missed 不积压、EMIT 正确。目标窗口不存在/未 append（i64::MIN）
+        // → 不 gate（防御：保持旧行为，等 flush 收口）。
+        let eff_wm = if gate_on_target {
+            let target_wm = self
+                .router
+                .registry()
+                .get_window(&self.executor.plan().joins[join_idx].right_window)
+                .map(|w| w.max_event_time_nanos())
+                .unwrap_or(i64::MAX);
+            wm.min(target_wm)
+        } else {
+            wm
+        };
         // 取到期实例（块内释放 `deferred` 借用，避免与 `self.executor`/`self.emit` 冲突）
+        // 2026-08-25 q4 100M：pending 按 expiry 升序 → 到期项是前缀，
+        // `partition_point` O(log n) 定位 + drain 前缀 O(due)——替代旧的
+        // 全量遍历重建（O(n)/batch，33M 挂起 × 2740 batch 卡死 28×）。
         let due: Vec<DeferredPending> = {
-            let pending = std::mem::take(&mut deferred.pending);
-            let mut keep = Vec::with_capacity(pending.len());
-            let mut due = Vec::new();
-            for p in pending {
-                if p.expiry_nanos <= wm {
-                    due.push(p);
-                } else {
-                    keep.push(p);
-                }
-            }
-            deferred.pending = keep;
-            due
+            let split = deferred.pending.partition_point(|p| p.expiry_nanos <= eff_wm);
+            // 到期项移出**不**标 dirty：lo_min 缓存是插入时单调不增的 min
+            //（历史最小 lo_ns），移出后仍偏保守（更小）→ 安全，无需重扫。
+            // 仅 missed 集合被清空重建（reevaluate_deferred_missed）时才需
+            // 重扫（2026-08-25 q4 100M：有到期即标 dirty 会让 publish 每 batch
+            // 全量重扫 → O(n²)）。
+            deferred.pending.drain(..split).collect()
         };
         if due.is_empty() {
             return;
@@ -1982,6 +2048,11 @@ impl RuleTask {
         if !missed_this.is_empty()
             && let Some(deferred) = self.deferred.as_mut()
         {
+            // missed 的 lo_ns 也计入前沿（它们需要的行稍后才落地，必须活到
+            // EOS 重试）——同步维护 lo_min 缓存。
+            for p in &missed_this {
+                deferred.lo_min = deferred.lo_min.min(p.lo_ns);
+            }
             deferred.missed.extend(missed_this);
         }
     }
@@ -2054,6 +2125,11 @@ impl RuleTask {
         {
             deferred.missed.extend(still_miss);
         }
+        // missed 集合被取空重建——lo_min 缓存失效（含被命中移除的项）。
+        // EOS 收尾路径，全量重扫可接受（罕见调用）。
+        if let Some(d) = self.deferred.as_mut() {
+            d.lo_min_dirty = true;
+        }
         if hit > 0 && debug_enabled {
             wf_debug!(
                 pipe,
@@ -2077,12 +2153,12 @@ impl RuleTask {
                 .map(|d| d.watermark)
                 .unwrap_or(i64::MIN);
             if wm > i64::MIN {
-                self.scan_deferred(wm, wall_nanos() as i64).await;
+                self.scan_deferred(wm, wall_nanos() as i64, true).await;
             }
             // D4：空闲/超时扫描也发布保留前沿（到期实例可能已在此退场）。
             // 注：尚未见过驱动事件时这里会发布 i64::MIN（全保留），而不是释放——
             // 参见 `publish_retention_floor` 的 ⚠ 注释。
-            if let Some(d) = self.deferred.as_ref() {
+            if let Some(d) = self.deferred.as_mut() {
                 d.publish_retention_floor();
             }
             return;
@@ -2280,7 +2356,7 @@ impl RuleTask {
                 .max()
                 .unwrap_or(i64::MIN);
             if final_wm > i64::MIN {
-                self.scan_deferred(final_wm, wall_nanos() as i64).await;
+                self.scan_deferred(final_wm, wall_nanos() as i64, false).await;
             }
             // EOS 重试（2026-08-23 q8 修复）：到期时 join 目标窗口 append 滞后
             // 的 miss 实例——EOS 后所有数据已 ingest、目标窗口完整，重试命中
@@ -4122,6 +4198,8 @@ mod retention_pin_tests {
             watermark: i64::MIN,
             join_idx: 0,
             retention_pin: Some(Arc::clone(pin)),
+            lo_min: i64::MAX,
+            lo_min_dirty: false,
         }
     }
 
@@ -4133,7 +4211,7 @@ mod retention_pin_tests {
     #[test]
     fn uninitialized_watermark_publishes_fully_pinned() {
         let pin = Arc::new(AtomicI64::new(i64::MIN));
-        let rt = runtime(&pin);
+        let mut rt = runtime(&pin);
         rt.publish_retention_floor();
         assert_eq!(
             pin.load(Ordering::Acquire),
@@ -4171,7 +4249,10 @@ mod retention_pin_tests {
         );
 
         // 没有 missed 时回到 pending 的最小 lo_ns。
+        // （生产路径 missed 清空经 `reevaluate_deferred_missed` 标 dirty；
+        //  测试直接清空需同步标 dirty 模拟该路径。）
         rt.missed.clear();
+        rt.lo_min_dirty = true;
         rt.publish_retention_floor();
         assert_eq!(pin.load(Ordering::Acquire), 7_000);
     }

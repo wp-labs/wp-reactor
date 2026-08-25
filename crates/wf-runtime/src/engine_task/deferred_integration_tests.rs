@@ -359,14 +359,14 @@ async fn deferred_q9_hit_outputs_winner_when_watermark_passes_expiry() {
 
     // bid 先到（auction=5，price 100/200，dateTime T+10s / T+20s）
     bid_window(&router)
-        .append(bid_batch(&[
+        .append_with_watermark(bid_batch(&[
             (5, 1, 100, T + 10_000_000_000),
             (5, 2, 200, T + 20_000_000_000),
         ]))
         .unwrap();
     // auction 到达：挂起（expiry = T+60s），watermark = T
     auction_window(&router)
-        .append(auction_batch(&[(5, T, T + 60_000_000_000)]))
+        .append_with_watermark(auction_batch(&[(5, T, T + 60_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
     // 未到期 → 无输出
@@ -374,11 +374,16 @@ async fn deferred_q9_hit_outputs_winner_when_watermark_passes_expiry() {
 
     // 第二个 auction（ts=T+61s）推进 watermark ≥ expiry → 第一个到期输出胜者
     auction_window(&router)
-        .append(auction_batch(&[(
+        .append_with_watermark(auction_batch(&[(
             6,
             T + 61_000_000_000,
             T + 121_000_000_000,
         )]))
+        .unwrap();
+    // join 目标窗口同步追平（2026-08-25 评估 gate：目标 max_event_time ≥ expiry
+    // 才评估——生产流中 bid/auction 交错 append，目标天然追平；单测需显式补）
+    bid_window(&router)
+        .append_with_watermark(bid_batch(&[(6, 3, 300, T + 61_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
 
@@ -421,6 +426,74 @@ async fn deferred_q9_no_bid_no_output() {
     );
 }
 
+/// 乱序驱动（2026-08-25 q4 100M 回归）：auction 到达顺序与 expires 顺序
+/// **相反**（二分插入保持 pending 按 expiry 有序）——到期扫描只取前缀，
+/// 输出顺序仍按到期时间正确。回归防网：pending 改有序前缀前，全量扫不
+/// 依赖顺序（等价）；改后若插入有序性被破坏会漏输出。
+#[tokio::test]
+async fn deferred_q9_out_of_order_driver_emits_by_expiry_order() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_deferred_join_task();
+
+    // 3 个 auction 乱序到达（expires 顺序：auction 11 最先到期）：
+    //   auction=11: dateTime=T,     expires=T+30s
+    //   auction=13: dateTime=T+2s,  expires=T+90s
+    //   auction=12: dateTime=T+1s,  expires=T+60s
+    // 每个 auction 各一个 bid（在各自区间内），保证到期评估命中。
+    bid_window(&router)
+        .append_with_watermark(bid_batch(&[
+            (11, 1, 100, T + 5_000_000_000),
+            (12, 2, 200, T + 10_000_000_000),
+            (13, 3, 300, T + 15_000_000_000),
+        ]))
+        .unwrap();
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[
+            (11, T, T + 30_000_000_000),
+            (13, T + 2_000_000_000, T + 90_000_000_000),
+            (12, T + 1_000_000_000, T + 60_000_000_000),
+        ]))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(alert_rx.try_recv().is_err(), "全部未到期，无输出");
+
+    // 推进 watermark 到 T+31s：只有 auction 11 到期 → 输出 1 条（id=11）
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[(14, T + 31_000_000_000, T + 91_000_000_000)]))
+        .unwrap();
+    // 目标窗口追平（bid 14 随 auction 14 到达，max_event_time 推过 T+30s）
+    bid_window(&router)
+        .append_with_watermark(bid_batch(&[(14, 4, 400, T + 31_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    task.flush().await;
+    let a1 = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&a1, "__wfu_entity_id"),
+        "11",
+        "最先到期（T+30s）的 auction 先输出"
+    );
+
+    // 推进到 T+61s：auction 12 到期（T+60s），auction 13 未到期（T+90s）
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[(15, T + 61_000_000_000, T + 121_000_000_000)]))
+        .unwrap();
+    // 目标窗口追平（bid 15 随 auction 15 到达，max_event_time 推过 T+60s）
+    bid_window(&router)
+        .append_with_watermark(bid_batch(&[(15, 5, 500, T + 61_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    task.flush().await;
+    let a2 = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&a2, "__wfu_entity_id"),
+        "12",
+        "第二个到期（T+60s）的 auction 输出"
+    );
+    // 此时已无其它到期（auction 13 expires=T+90s > T+61s）
+    assert!(alert_rx.try_recv().is_err(), "auction 13 未到期，不应输出");
+}
+
 /// EOS/关闭 flush 只收口**已到期**实例：尾部 expiry > 最终事件时间 watermark 的
 /// 实例窗口未完成（事件时间域），不输出——与 oracle 一致（oracle/mod.rs EOS
 /// 水位注释：按 slice 边界强扫会多出尾部桶，Q8 实证 82446 → 83274 +828）。
@@ -456,12 +529,12 @@ async fn deferred_q9_eos_retry_recovers_due_instance() {
 
     // auction=8 挂起（T，expires=T+60s）；此时 bid 窗口为空 → 到期评估 miss
     auction_window(&router)
-        .append(auction_batch(&[(8, T, T + 60_000_000_000)]))
+        .append_with_watermark(auction_batch(&[(8, T, T + 60_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
     // auction=9（T+61s）推进 watermark 过 expiry → auction 8 到期，bid 为空 → miss
     auction_window(&router)
-        .append(auction_batch(&[(
+        .append_with_watermark(auction_batch(&[(
             9,
             T + 61_000_000_000,
             T + 121_000_000_000,
@@ -475,13 +548,68 @@ async fn deferred_q9_eos_retry_recovers_due_instance() {
 
     // bid 迟到进入右窗（append 滞后）
     bid_window(&router)
-        .append(bid_batch(&[(8, 3, 50, T + 10_000_000_000)]))
+        .append_with_watermark(bid_batch(&[(8, 3, 50, T + 10_000_000_000)]))
         .unwrap();
     task.flush().await;
 
     let alert = super::tests::take_alert(&mut alert_rx);
     assert_eq!(super::tests::field_str(&alert, "__wfu_entity_id"), "8");
     assert_eq!(super::tests::field_str(&alert, "winner_bidder"), "3");
+}
+
+/// 2026-08-25 q4 100M 欠发根治：运行期评估 gate——join 目标窗口 append 位置未
+/// 过 expiry 时实例**保持挂起**（不评估、不 miss），目标追平后随下一次扫描命中
+/// 输出（无需 flush/EOS 重试）。修复前目标未追平就评估 → 运行期 miss → missed
+/// 积压（RSS 随总量增长）+ 100M 下 EOS 重试时早段右行已被 over 驱逐 → 欠发
+/// ~63%（oracle 5.58M vs 2.07M）。
+#[tokio::test]
+async fn deferred_q9_target_lag_holds_evaluation_until_target_catches_up() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_deferred_join_task();
+
+    // auction 5（T，expires=T+60s）挂起；bid 5 在窗内（T+10s）；auction 6
+    // （T+61s）推 watermark 过 expiry——但 bid 窗口 max_event_time 还停在
+    // T+10s（目标 append 滞后）→ 评估 gate 把实例保持挂起（旧行为：立即
+    // 评估 → 窗口缺后续 bid → miss 进 missed）
+    bid_window(&router)
+        .append_with_watermark(bid_batch(&[(5, 1, 100, T + 10_000_000_000)]))
+        .unwrap();
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[(5, T, T + 60_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[(
+            6,
+            T + 61_000_000_000,
+            T + 121_000_000_000,
+        )]))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "目标窗口未追平（max_event_time=T+10s < expiry T+60s）→ 实例保持挂起，不评估"
+    );
+
+    // 目标窗口追平：bid 6 随 auction 6 到达 → bid 窗口 max_event_time 推过
+    // T+60s；auction 7 随后的驱动事件触发批次尾扫描 → auction 5 命中输出
+    // （无需 flush/EOS 重试）
+    bid_window(&router)
+        .append_with_watermark(bid_batch(&[(6, 2, 200, T + 61_000_000_000)]))
+        .unwrap();
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[(7, T + 62_000_000_000, T + 122_000_000_000)]))
+        .unwrap();
+    task.pull_and_advance().await;
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(super::tests::field_str(&alert, "__wfu_entity_id"), "5");
+
+    // 运行期已命中（missed 为空）→ flush 收口不重复输出
+    task.flush().await;
+    assert!(
+        drain_alert_entity_ids(&mut alert_rx).is_empty(),
+        "运行期已命中，flush 不重复输出"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -638,19 +766,25 @@ async fn deferred_q8_hit_outputs_when_watermark_passes_bucket_end() {
 
     // person 5 注册（T，10s 桶界上）→ 挂起（expiry = T+10s），watermark = T
     q8_person_window(&router)
-        .append(person_batch(&[(5, T)]))
+        .append_with_watermark(person_batch(&[(5, T)]))
         .unwrap();
     task.pull_and_advance().await;
     assert!(alert_rx.try_recv().is_err(), "未到期 — 不输出");
 
-    // auction seller=5 在桶内（T+5s）入右窗
+    // auction seller=5 在桶内（T+5s）入右窗；另一个 auction（seller=99）在
+    // T+11s 入右窗 → 目标窗口 max_event_time 推过 T+10s（2026-08-25 评估
+    // gate：目标 max_event_time ≥ expiry 才评估，生产流中 auction 持续
+    // append 天然追平，单测需显式补）
     q8_auction_window(&router)
-        .append(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .append_with_watermark(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .unwrap();
+    q8_auction_window(&router)
+        .append_with_watermark(q8_auction_batch(&[(99, T + 11_000_000_000)]))
         .unwrap();
 
     // 第二个 person（T+11s，下个桶）推进 watermark ≥ T+10s → person 5 到期
     q8_person_window(&router)
-        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .append_with_watermark(person_batch(&[(6, T + 11_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
 
@@ -729,7 +863,7 @@ async fn deferred_q8_eos_retry_recovers_miss_from_late_join_target() {
     // person 6（T+11s）推进 watermark 过 T+10s → person 5 到期评估，但此时
     // auction 窗口为空（append 滞后）→ miss 进 `missed`（非 EOS 扫描收集）
     q8_person_window(&router)
-        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .append_with_watermark(person_batch(&[(6, T + 11_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
     assert!(
@@ -739,7 +873,7 @@ async fn deferred_q8_eos_retry_recovers_miss_from_late_join_target() {
 
     // auction（seller=5，桶内 T+5s）迟到进入右窗——模拟 append 滞后
     q8_auction_window(&router)
-        .append(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .append_with_watermark(q8_auction_batch(&[(5, T + 5_000_000_000)]))
         .unwrap();
 
     // EOS flush：scan_deferred(i64::MAX) + 重试 missed → 命中补输出
@@ -794,11 +928,11 @@ async fn deferred_q8_eos_retry_preserves_miss_until_window_complete() {
     // person 5（T，桶 [T, T+10s)）挂起；person 6（T+11s）推水位过桶末 →
     // person 5 到期评估，auction 窗口为空 → miss 收集进 missed
     q8_person_window(&router)
-        .append(person_batch(&[(5, T)]))
+        .append_with_watermark(person_batch(&[(5, T)]))
         .unwrap();
     task.pull_and_advance().await;
     q8_person_window(&router)
-        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .append_with_watermark(person_batch(&[(6, T + 11_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
 
@@ -812,7 +946,7 @@ async fn deferred_q8_eos_retry_preserves_miss_until_window_complete() {
 
     // actors 排空后窗口补全：auction（seller=5）入桶
     q8_auction_window(&router)
-        .append(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .append_with_watermark(q8_auction_batch(&[(5, T + 5_000_000_000)]))
         .unwrap();
     // 窗口补全后再 flush（shutdown 或下一输入 EOS）→ 必须补出 person 5
     task.flush().await;
@@ -854,13 +988,17 @@ async fn deferred_q8_watermark_hit_not_duplicated_by_flush() {
     // auction seller=5 先入右窗（桶内 T+5s）；person 5 注册（T）→ 挂起；
     // person 6（T+11s）推 watermark 过 T+10s → person 5 到期**命中**
     q8_auction_window(&router)
-        .append(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .append_with_watermark(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .unwrap();
+    // 目标窗口追平（另一个 auction @T+11s 推 max_event_time 过 T+10s）
+    q8_auction_window(&router)
+        .append_with_watermark(q8_auction_batch(&[(99, T + 11_000_000_000)]))
         .unwrap();
     q8_person_window(&router)
-        .append(person_batch(&[(5, T)]))
+        .append_with_watermark(person_batch(&[(5, T)]))
         .unwrap();
     q8_person_window(&router)
-        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .append_with_watermark(person_batch(&[(6, T + 11_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
 
@@ -887,15 +1025,15 @@ async fn deferred_q8_flush_twice_idempotent() {
 
     // person 5 到期时 auction 窗口为空 → miss；auction（seller=5）迟到入桶
     q8_person_window(&router)
-        .append(person_batch(&[(5, T)]))
+        .append_with_watermark(person_batch(&[(5, T)]))
         .unwrap();
     task.pull_and_advance().await;
     q8_person_window(&router)
-        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .append_with_watermark(person_batch(&[(6, T + 11_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
     q8_auction_window(&router)
-        .append(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .append_with_watermark(q8_auction_batch(&[(5, T + 5_000_000_000)]))
         .unwrap();
 
     task.flush().await;
@@ -922,25 +1060,25 @@ async fn deferred_q8_multiple_missed_recovered_exactly_once() {
 
     // person 5（T，桶 [T, T+10s)）、person 7（T+21s，桶 [T+21s, T+31s)）
     q8_person_window(&router)
-        .append(person_batch(&[(5, T), (7, T + 21_000_000_000)]))
+        .append_with_watermark(person_batch(&[(5, T), (7, T + 21_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
     // person 6（T+11s）推 watermark 过 person 5 桶末 → person 5 miss（窗空）
     q8_person_window(&router)
-        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .append_with_watermark(person_batch(&[(6, T + 11_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
     // person 8（T+32s）推 watermark 过 person 6/person 7 桶末：person 6 到期
     // miss（真 miss，无其 auction）、person 7 到期 miss（窗仍空）
     q8_person_window(&router)
-        .append(person_batch(&[(8, T + 32_000_000_000)]))
+        .append_with_watermark(person_batch(&[(8, T + 32_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
     assert!(alert_rx.try_recv().is_err(), "全部 miss，flush 前无输出");
 
     // 两个迟到 auction 各自入桶（seller 5 桶内 T+5s；seller 7 桶内 T+25s）
     q8_auction_window(&router)
-        .append(q8_auction_batch(&[
+        .append_with_watermark(q8_auction_batch(&[
             (5, T + 5_000_000_000),
             (7, T + 25_000_000_000),
         ]))
@@ -965,11 +1103,11 @@ async fn deferred_q8_miss_not_reevaluated_until_flush() {
 
     // person 5（T）→ person 6（T+11s）推水位过桶末 → person 5 miss（窗空）
     q8_person_window(&router)
-        .append(person_batch(&[(5, T)]))
+        .append_with_watermark(person_batch(&[(5, T)]))
         .unwrap();
     task.pull_and_advance().await;
     q8_person_window(&router)
-        .append(person_batch(&[(6, T + 11_000_000_000)]))
+        .append_with_watermark(person_batch(&[(6, T + 11_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
     assert!(alert_rx.try_recv().is_err(), "miss 后无输出");
@@ -977,10 +1115,10 @@ async fn deferred_q8_miss_not_reevaluated_until_flush() {
     // auction（seller=5）入桶；再推两轮水位（person 9/10）——person 5 在
     // missed 中，后续扫描不得重新评估它
     q8_auction_window(&router)
-        .append(q8_auction_batch(&[(5, T + 5_000_000_000)]))
+        .append_with_watermark(q8_auction_batch(&[(5, T + 5_000_000_000)]))
         .unwrap();
     q8_person_window(&router)
-        .append(person_batch(&[
+        .append_with_watermark(person_batch(&[
             (9, T + 41_000_000_000),
             (10, T + 51_000_000_000),
         ]))
@@ -1252,13 +1390,13 @@ async fn deferred_q9_real_wfl_compiled_plan_runs() {
         .registry()
         .get_window("auction_events")
         .unwrap()
-        .append(q9c_auction_batch(&[(5, 42, T, T + 60_000_000_000)]))
+        .append_with_watermark(q9c_auction_batch(&[(5, 42, T, T + 60_000_000_000)]))
         .unwrap();
     router
         .registry()
         .get_window("bid_events")
         .unwrap()
-        .append(q9c_bid_batch(&[
+        .append_with_watermark(q9c_bid_batch(&[
             (5, 1, 100, T + 10_000_000_000),
             (5, 2, 200, T + 20_000_000_000),
         ]))
@@ -1270,12 +1408,19 @@ async fn deferred_q9_real_wfl_compiled_plan_runs() {
         .registry()
         .get_window("auction_events")
         .unwrap()
-        .append(q9c_auction_batch(&[(
+        .append_with_watermark(q9c_auction_batch(&[(
             6,
             43,
             T + 61_000_000_000,
             T + 121_000_000_000,
         )]))
+        .unwrap();
+    // 目标窗口追平（bid 6 随 auction 6 到达，max_event_time 推过 T+60s）
+    router
+        .registry()
+        .get_window("bid_events")
+        .unwrap()
+        .append_with_watermark(q9c_bid_batch(&[(6, 3, 300, T + 61_000_000_000)]))
         .unwrap();
     task.pull_and_advance().await;
 
