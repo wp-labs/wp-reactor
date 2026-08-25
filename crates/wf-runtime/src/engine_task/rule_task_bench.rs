@@ -69,10 +69,10 @@ fn bid_batch(n: usize) -> RecordBatch {
     .unwrap()
 }
 
-/// q13a 形状的 RuleExecutor：`on each b` + entity(digit, b.bidder) + yield
-/// bid_mod（5 个 Field + 1 个 mod BinOp）。
-fn q13a_plan_rule() -> RuleExecutor {
-    let plan = RulePlan {
+/// q13a 形状的 RulePlan（`on each b` + entity(digit, b.bidder) + yield
+/// bid_mod（5 个 Field + 1 个 mod BinOp））——executor 与边缘对拍共用。
+fn q13a_plan_rule_plan() -> RulePlan {
+    RulePlan {
         conv_window: None,
         name: "q13a_bench".into(),
         binds: vec![BindPlan {
@@ -152,8 +152,13 @@ fn q13a_plan_rule() -> RuleExecutor {
         pattern_origin: None,
         conv_plan: None,
         limits_plan: None,
-    };
-    RuleExecutor::new(plan)
+    }
+}
+
+/// q13a 形状的 RuleExecutor：`on each b` + entity(digit, b.bidder) + yield
+/// bid_mod（5 个 Field + 1 个 mod BinOp）。
+fn q13a_plan_rule() -> RuleExecutor {
+    RuleExecutor::new(q13a_plan_rule_plan())
 }
 
 /// 空 WindowLookup（q13a 无 join，不查询窗口）。
@@ -470,6 +475,170 @@ fn q13a_pipe_columnar_matches_row_path() {
                     arrow::util::display::array_value_to_string(b, row).expect("display"),
                     "col {i} ({}): row {row} 值一致",
                     schema.field(i).name()
+                );
+            }
+        }
+    }
+    let _ = empty_tracked_bind_fields();
+}
+
+/// q13a 双路径 对拍 **边界用例**（2026-08-25 review R1/R4 补盲）：row path vs
+/// pipe 列式路径在以下边界的字节一致性——
+/// - **null 输入行**（auction/bidder 为 null → Field 缺失 → 空串→coerce→省略/空 cell）；
+/// - **负值 mod**（auction=-7 → cvec `int_mod` i64 取模 vs 解释器 f64 取模）；
+/// - **schema 时间列回退**（yield 未提供 time_fallback 列 → 回退 event_time_nanos）；
+/// - **Missing 源列**（schema 列不在 yield/meta → null cell）；
+/// - **meta 列**（`__wfu_entity_id`/`__wfu_score`——null entity 的渲染一致）。
+#[test]
+fn q13a_pipe_columnar_matches_row_path_edge_cases() {
+    use arrow::array::Array;
+    use wf_lang::plan::{EntityPlan, ScorePlan};
+
+    // 边缘输入批：auction 含 null 与负值，bidder 含 null。
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("note", DataType::Utf8, true),
+    ]));
+    let auction = vec![Some(-7i64), Some(0), Some(12345), None, Some(8)];
+    let bidder = vec![Some(5i64), None, Some(9), Some(2), Some(3)];
+    let price = vec![Some(100i64), Some(200), Some(300), Some(400), Some(500)];
+    let date_time: Vec<i64> = (0..5).map(|i| NANOS + i).collect();
+    let note = vec!["a", "b", "c", "d", "e"];
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(arrow::array::Int64Array::from(auction)) as ArrayRef,
+            Arc::new(arrow::array::Int64Array::from(bidder)),
+            Arc::new(arrow::array::Int64Array::from(price)),
+            Arc::new(arrow::array::TimestampNanosecondArray::from(date_time)),
+            Arc::new(arrow::array::StringArray::from(note)),
+        ],
+    )
+    .unwrap();
+
+    // 边缘计划：id=bidder、mod_key=auction%10000、note=note（Field Utf8）。
+    let mut plan = q13a_plan_rule_plan();
+    plan.yield_plan.fields = vec![
+        wf_lang::plan::YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+        },
+        wf_lang::plan::YieldField {
+            name: "mod_key".into(),
+            value: Expr::BinOp {
+                op: wf_lang::ast::BinOp::Mod,
+                left: Box::new(Expr::Field(FieldRef::Qualified(
+                    "b".into(),
+                    "auction".into(),
+                ))),
+                right: Box::new(Expr::Number(10000.0)),
+            },
+        },
+        wf_lang::plan::YieldField {
+            name: "note".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "note".into())),
+        },
+    ];
+    let exec = RuleExecutor::new(plan);
+    assert!(exec.each_pipe_columnar_safe(), "edge 形状必须过 pipe 列式门控");
+
+    // 边缘中间窗 schema：yield 三列 + 时间列回退（time_fallback，yield 未提供）
+    // + Missing 源列（missing_col）+ meta 列（entity_id/score）。
+    let pipe_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("mod_key", DataType::Int64, true),
+        Field::new("note", DataType::Utf8, true),
+        Field::new(
+            "time_fallback",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("missing_col", DataType::Int64, true),
+        Field::new("__wfu_entity_id", DataType::Utf8, true),
+        Field::new("__wfu_score", DataType::Float64, true),
+    ]));
+    let time_col_index = Some(3); // time_fallback 是 schema 时间列
+    let events: Vec<std::sync::Arc<wf_engine::match_engine::Event>> =
+        batch_to_events(&batch).into_iter().map(std::sync::Arc::new).collect();
+    let first = &events[0];
+    let mut field_order: Vec<&smol_str::SmolStr> = first.fields.keys().collect();
+    field_order.sort_unstable();
+    let lookup = NoLookup;
+
+    // Row path.
+    let mut row_stager =
+        PipeBatchStager::new(Arc::from("edge_pipe"), Arc::clone(&pipe_schema), time_col_index);
+    for (i, ev) in events.iter().enumerate() {
+        let record = exec
+            .execute_each_with_joins(ev, NANOS + i as i64, &lookup, &field_order, NANOS)
+            .expect("eval")
+            .expect("无 filter → 必有输出");
+        row_stager.push_record(&record).expect("stage");
+    }
+    let (_, _, row_batch) = row_stager.take_events().expect("build").expect("non-empty");
+
+    // Columnar pipe path.
+    let prepared = exec.each_batch_prepare(&batch);
+    let col_events: Vec<wf_engine::match_engine::ColumnarEvent<'_>> = (0..batch.num_rows())
+        .map(|i| wf_engine::match_engine::ColumnarEvent::new(&batch, i))
+        .collect();
+    let rows: Vec<(&wf_engine::match_engine::ColumnarEvent<'_>, i64)> = col_events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NANOS + i as i64))
+        .collect();
+    let mut out: Vec<wf_engine::match_engine::PipeEachRow> = Vec::new();
+    let stats = exec.execute_each_pipe_batch_columnar(&rows, &prepared, &mut out);
+    assert_eq!(stats.appended, 5, "无 filter → 全行输出（含 null 行）");
+    let yield_names: Vec<std::sync::Arc<str>> = exec
+        .plan()
+        .yield_plan
+        .fields
+        .iter()
+        .map(|f| std::sync::Arc::from(f.name.as_str()))
+        .collect();
+    let mut col_stager = PipeBatchStager::new_columnar(
+        Arc::from("edge_pipe"),
+        Arc::clone(&pipe_schema),
+        time_col_index,
+        &yield_names,
+    );
+    for (row, (_, event_nanos)) in out.iter().zip(rows.iter()) {
+        col_stager
+            .push_row("edge_rule", row, *event_nanos)
+            .expect("stage");
+    }
+    let (_, _, col_batch) = col_stager.take_events().expect("build").expect("non-empty");
+
+    assert_eq!(row_batch.num_rows(), col_batch.num_rows());
+    assert_eq!(row_batch.num_columns(), col_batch.num_columns());
+    for (i, (a, b)) in row_batch
+        .columns()
+        .iter()
+        .zip(col_batch.columns().iter())
+        .enumerate()
+    {
+        assert_eq!(a.len(), b.len(), "col {i} 长度一致");
+        for row in 0..row_batch.num_rows() {
+            assert_eq!(
+                a.is_null(row),
+                b.is_null(row),
+                "col {i} ({}): row {row} null 位一致",
+                pipe_schema.field(i).name()
+            );
+            if !a.is_null(row) {
+                assert_eq!(
+                    arrow::util::display::array_value_to_string(a, row).expect("display"),
+                    arrow::util::display::array_value_to_string(b, row).expect("display"),
+                    "col {i} ({}): row {row} 值一致",
+                    pipe_schema.field(i).name()
                 );
             }
         }

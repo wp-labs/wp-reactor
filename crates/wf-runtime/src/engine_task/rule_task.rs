@@ -1087,8 +1087,12 @@ impl RuleTask {
                     .await;
             }
             // 列式分支早退：pipe 路径已在此装载中间行，必须同批收口（与行式
-            // 路径的 flush_pipes 节奏一致）；sink 目标无 pipe 装载，no-op。
-            self.flush_pipes().await;
+            // 路径的 flush_pipes 节奏一致）。sink 目标（each_direct）无 pipe
+            // 装载——不调用，避免给 q1 等高频规则每批新增一次 pipe_state 锁
+            // 争用（2026-08-25 review R2）。
+            if !self.each_direct {
+                self.flush_pipes().await;
+            }
             return;
         }
         // Plan C2 batching: when the per-event detail logs are off, collect
@@ -3361,13 +3365,13 @@ impl RuleTask {
             .iter()
             .map(|f| Arc::from(f.name.as_str()))
             .collect();
-        let rule_name = self.rule_name().to_string();
+        let rule_name = self.rule_name();
         let mut guard = self.pipe_state.lock().unwrap();
         match &mut *guard {
             PipeState::Dead => {}
             PipeState::Staging(stager) => {
                 for (row, (_, event_nanos)) in out.iter().zip(rows.iter()) {
-                    if let Err(e) = stager.push_row(&rule_name, row, *event_nanos) {
+                    if let Err(e) = stager.push_row(rule_name, row, *event_nanos) {
                         wf_warn!(
                             pipe,
                             task_id = %self.task_id,
@@ -3388,7 +3392,7 @@ impl RuleTask {
                         let mut stager =
                             PipeBatchStager::new_columnar(target, schema, time_col_index, &yield_names);
                         for (row, (_, event_nanos)) in out.iter().zip(rows.iter()) {
-                            if let Err(e) = stager.push_row(&rule_name, row, *event_nanos) {
+                            if let Err(e) = stager.push_row(rule_name, row, *event_nanos) {
                                 wf_warn!(
                                     pipe,
                                     task_id = %self.task_id,
@@ -3758,6 +3762,7 @@ enum PipeCol {
 /// yield 值（按 yield 下标）/ `__wf_pipe_ts` / `_wfu_meta_*` 回退 / 无来源。
 /// 构造一次（new_columnar），`push_row` 逐行直查——免行式 `push_record` 的
 /// 每列 × 每字段名字符串查找。
+#[derive(Clone)]
 enum PipeColSource {
     Yield(usize),
     EventTime,
@@ -3766,20 +3771,6 @@ enum PipeColSource {
     MetaEntityType,
     MetaEntityId,
     Missing,
-}
-
-impl Clone for PipeColSource {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Yield(i) => Self::Yield(*i),
-            Self::EventTime => Self::EventTime,
-            Self::MetaRuleName => Self::MetaRuleName,
-            Self::MetaScore => Self::MetaScore,
-            Self::MetaEntityType => Self::MetaEntityType,
-            Self::MetaEntityId => Self::MetaEntityId,
-            Self::Missing => Self::Missing,
-        }
-    }
 }
 
 /// Resolved shape of an intermediate pipe target: the relay schema and its

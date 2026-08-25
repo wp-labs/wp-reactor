@@ -1478,3 +1478,46 @@ stage_pipe_record 476ns = **1248ns/行**（0.80M/s 单核）。
 - **push 模式（WFUSION_WINDOW_DISPATCH=push）q13a 仍走行式**：columnar_each
   分支要求 `events.is_none()`（广播带 events+batch 时不满足）——生产 pull 模式
   生效，push 模式是遗留兼容路径。
+
+## 2026-08-25 q13a 列式化 review（5 轮）——边界对拍补盲 + 直接写路径行为对齐（已 commit）
+
+### R1 正确性（修复：边界对拍补盲）
+逐分支核对 `push_pipe_col`（共享 helper）与行式 `push_record` 的 coercion 矩阵
+等价；对拍新增 **edge cases** 覆盖：
+- null 输入行（Field lane 空串→coerce→省略/空 cell）；
+- 负值 mod（cvec `int_mod` i64 vs 解释器 f64，±2^53 内一致）；
+- schema 时间列回退（yield 未提供 time_fallback → event_time_nanos）；
+- Missing 源列（schema 列不在 yield/meta → null cell）；
+- meta 列（null entity 的 `__wfu_entity_id`/`__wfu_score` 渲染）。
+全部字节一致（`q13a_pipe_columnar_matches_row_path_edge_cases`）。
+
+### R2 并发/生命周期（修复 ×2）
+- **sink 列式路径不再调 flush_pipes**（`if !self.each_direct`）：消除 q1 等高频
+  sink 规则每批一次 pipe_state 锁争用（原实现无差别调用，纯开销）。
+- `rule_name.to_string()` 改借用（每批一次堆分配消除）。
+- 验证无恙：锁序（metrics → pipe_state，无反向）、锁内无 await（push_row 同步）、
+  Uninit 惰性形状解析与行式 `stage_pipe_record` 同款。
+
+### R3 性能（验证无恙 + 记录已知开销）
+- `compile_guard` 无批级缓存——mod 小树每批重编译（~数百 ns/36.5k 行可忽略，
+  与 sink 输出函数路径行为一致）。
+- **已知开销（记录，不加 smallvec 依赖）**：`PipeEachRow.values` 每行一个
+  Vec 堆分配（6 元素）；entity_id String 每行分配（pipe schema 无 `__wfu_entity_id`
+  列时纯浪费，executor 不知 schema 故总是构造）。203ns 已达标（4.92M/s > ingest
+  3M/s），后续可按占比优化。
+
+### R4 测试（验证无恙）
+- cut_output 门控行为与直接写路径族（`emit_each_direct`/sink 列式）一致
+  （门控在前、计数在后）；record 路径 `emit()` 是另一套（计数在前、门控在后）
+  ——预存差异，pipe 列式跟随直接写路径惯例。
+- q13 e2e（6 个测试）走新路径且输出正确 + 门控守护测试（编译计划必须过门控）
+  构成链路闭环。
+
+### R5 质量（修复 ×2）
+- `PipeColSource` 手写 Clone impl → derive（多余代码消除）。
+- `let _ = each_plan` 丑写法 → `let Some(_each_plan)`。
+- 注：gate 注释强调 light meta 约束——扩展 gate 至可读 meta 的表达式前必须
+  重审 `each_yield_meta_light` 的空槽。
+
+### 回归
+wf-engine 1155 / wf-runtime 551 / clippy 0（+1 边界对拍）。

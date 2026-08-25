@@ -1433,7 +1433,7 @@ impl RuleExecutor {
     ) -> EachDirectBatchStats {
         out.clear();
         let mut stats = EachDirectBatchStats::default();
-        let Some(each_plan) = &self.plan.each_plan else {
+        let Some(_each_plan) = &self.plan.each_plan else {
             log::warn!(
                 "execute_each_pipe_batch_columnar called for non-`on each` rule {}; skipping {} rows",
                 self.plan.name,
@@ -1443,7 +1443,6 @@ impl RuleExecutor {
             return stats;
         };
         debug_assert!(self.each_pipe_columnar_safe());
-        let _ = each_plan; // 门控保证无 filter——形状约束即拒绝语义。
         let statics = self.output_static();
 
         // score 常量（门控保证 Number 字面量）——批级求值一次，非每行。
