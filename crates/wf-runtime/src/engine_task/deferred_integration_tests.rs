@@ -1898,7 +1898,7 @@ async fn q13_dual_chain_intermediate_window_pressure() {
         match batch {
             crate::alert_task::AlertBatch::Rows(rows) => {
                 for r in rows.iter() {
-                    values.push(super::tests::field_str(&r, "detail"));
+                    values.push(super::tests::field_str(r, "detail"));
                 }
             }
             crate::alert_task::AlertBatch::Columns(cols) => {
@@ -1965,7 +1965,7 @@ async fn q13_dual_chain_intermediate_window_unregistered_consumer_loses() {
 
     let probe = q13c_bid_mod_batch(&[(1, 1, 100, T)]);
     let one_batch_bytes = wf_engine::window::content_bytes(&probe);
-    let mut registry = WindowRegistry::build(vec![
+    let registry = WindowRegistry::build(vec![
         q13c_window_def("bid_events", &q13c_bid_schema(), usize::MAX),
         q13c_window_def("bid_mod", &q13c_bid_mod_schema(), one_batch_bytes * 2),
     ])

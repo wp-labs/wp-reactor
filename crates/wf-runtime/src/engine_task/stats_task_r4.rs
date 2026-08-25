@@ -399,3 +399,132 @@ async fn close_with_non_field_key_skips_key_field_injection() {
 // ---------------------------------------------------------------------------
 // 进度槽 ack（pull 路径）——已有 coverage_more 覆盖, 此处不再重复
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 状态内存 guard 告警（metrics + 每窗 wf_warn）
+// ---------------------------------------------------------------------------
+
+/// 从快照记录中取 `rule.stats_over_limit_total` 的 label 值（快照是 drain 语义——
+/// 每次调用 `snapshot()` 即消费并清零计数, 断言用一次取一次）。
+fn over_limit_reported(metrics: &crate::metrics::RuntimeMetrics, rule: &str) -> u64 {
+    metrics
+        .snapshot()
+        .to_records()
+        .iter()
+        .find(|r| {
+            r.fields
+                .iter()
+                .any(|(k, v)| k == "name" && v == "stats_over_limit_total")
+                && r.fields.iter().any(|(k, v)| k == "label" && v == rule)
+        })
+        .and_then(|r| {
+            r.fields
+                .iter()
+                .find(|(k, _)| k == "value")
+                .map(|(_, v)| v.parse::<u64>().unwrap_or(0))
+        })
+        .unwrap_or(0)
+}
+
+/// 带键 count 计划 + 极小限额（count 桶预算 = 512 + 1×128 = 640B, 限额 640
+/// → 只放行 1 桶, 其余键全拒收）。
+fn guard_plan_and_limit(task: &mut StatsTask) {
+    let mut plan = stats_plan();
+    plan.keys = vec![Expr::Field(wf_lang::ast::FieldRef::Qualified(
+        "b".into(),
+        "auction".into(),
+    ))];
+    task.stats = StatsExecutor::with_row_fields(plan, None);
+    task.stats.set_memory_limit("stats_r4_rule", Some(640));
+}
+
+/// 状态内存 guard 告警: close 时按窗口增量上报 metrics（delta 记账, 不重复）。
+/// 两个窗口各拒收 9 个新键 → 两次 close 各上报 9（不是第二次报累计 18）。
+#[tokio::test]
+async fn close_current_window_reports_over_limit_delta() {
+    let metrics = Arc::new(crate::metrics::RuntimeMetrics::new(
+        &["stats_r4_rule".to_string()],
+        &[],
+        &[],
+        std::collections::BTreeMap::new(),
+    ));
+    let (eos_tx, _) = watch::channel(0u64);
+    let (config, _cancel) = make_config(vec![], None, &eos_tx, Some(Arc::clone(&metrics)));
+    let (mut task, _cancel) = StatsTask::new(config);
+    guard_plan_and_limit(&mut task);
+
+    // 窗口 1: 10 个不同 auction 键（window_batch 的 auction = 0..len）→ 拒 9。
+    task.process_push(RulePush {
+        window_name: Arc::from("bid_events"),
+        events: None,
+        batch: Some(Arc::new(window_batch(&[1_000_000_000; 10]))),
+        materialize_fields: None,
+        seq: 1,
+        shard_rows: None,
+    })
+    .await;
+    assert_eq!(task.stats.window.over_limit_new_buckets(), 9, "窗口 1 拒收 9");
+
+    task.flush().await; // close 窗口 1 → 上报增量 9
+    assert_eq!(
+        over_limit_reported(&metrics, "stats_r4_rule"),
+        9,
+        "窗口 1 拒收 9 个新键应上报"
+    );
+
+    // 窗口 2（越界推进新窗口）: 新 10 键 → 再拒 9。计数跨窗口保留 → 增量 9。
+    task.process_push(RulePush {
+        window_name: Arc::from("bid_events"),
+        events: None,
+        batch: Some(Arc::new(window_batch(&[11_000_000_000; 10]))),
+        materialize_fields: None,
+        seq: 2,
+        shard_rows: None,
+    })
+    .await;
+    assert_eq!(task.stats.window.over_limit_new_buckets(), 18, "累计 18");
+    task.flush().await;
+    assert_eq!(
+        over_limit_reported(&metrics, "stats_r4_rule"),
+        9,
+        "窗口 2 增量 9（delta 记账, 不是累计 18）"
+    );
+}
+
+/// 输入分区分片非协调片（merge_tx）: close 只发 partial, 不上报告警——
+/// 协调片合并后才统一上报（否则每片各报一次, 计数放大 N 倍）。
+#[tokio::test]
+async fn shard_non_coordinator_does_not_report_over_limit() {
+    let metrics = Arc::new(crate::metrics::RuntimeMetrics::new(
+        &["stats_r4_rule".to_string()],
+        &[],
+        &[],
+        std::collections::BTreeMap::new(),
+    ));
+    let (eos_tx, _) = watch::channel(0u64);
+    let (config, _cancel) = make_config(vec![], None, &eos_tx, Some(Arc::clone(&metrics)));
+    let (mut task, _cancel) = StatsTask::new(config);
+    guard_plan_and_limit(&mut task);
+
+    // 模拟分片非协调片: merge_tx 已设置 → flush/close 走 take_partial 早退。
+    let (tx, _rx) = tokio::sync::mpsc::channel::<StatsPartial>(1);
+    task.merge_tx = Some(tx);
+
+    task.process_push(RulePush {
+        window_name: Arc::from("bid_events"),
+        events: None,
+        batch: Some(Arc::new(window_batch(&[1_000_000_000; 10]))),
+        materialize_fields: None,
+        seq: 1,
+        shard_rows: None,
+    })
+    .await;
+    assert_eq!(task.stats.window.over_limit_new_buckets(), 9, "guard 照常拒收");
+
+    task.flush().await; // 只发 partial, 不 close 不上报
+    assert_eq!(
+        over_limit_reported(&metrics, "stats_r4_rule"),
+        0,
+        "非协调片不上报（协调片合并后才统一报）"
+    );
+}

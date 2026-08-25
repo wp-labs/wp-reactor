@@ -143,6 +143,7 @@ pub(crate) struct MetricsSnapshot {
     rule_matches: BTreeMap<String, u64>,
     rule_instances: BTreeMap<String, u64>,
     rule_cursor_gaps: BTreeMap<String, BTreeMap<String, u64>>,
+    rule_stats_over_limit: BTreeMap<String, u64>,
     alert_emitted: BTreeMap<String, u64>,
     alert_emitted_detail: BTreeMap<String, BTreeMap<String, BTreeMap<String, u64>>>,
     alert_channel_send_failed: u64,
@@ -339,6 +340,9 @@ impl MetricsSnapshot {
             for (window, v) in windows {
                 out.push(metric_double("rule", "cursor_gap_total", rule, window, *v));
             }
+        }
+        for (rule, v) in &self.rule_stats_over_limit {
+            out.push(metric("rule", "stats_over_limit_total", rule, *v));
         }
         // Exact per-rule emitted totals are always exported. (Previously the
         // exact total was dropped when the rule had detail rows, and the
@@ -730,6 +734,8 @@ pub struct RuntimeMetrics {
     /// Gauge, summed across a rule's shards via delta reports (P2b).
     rule_instances: BTreeMap<String, AtomicI64>,
     rule_cursor_gap_total: BTreeMap<String, BTreeMap<String, AtomicU64>>,
+    /// 状态内存 guard 超限拒收新键桶累计（stats 规则, close 时按窗口增量上报）。
+    rule_stats_over_limit_total: BTreeMap<String, AtomicU64>,
 
     alert_emitted_total: BTreeMap<String, AtomicU64>,
     alert_emitted_detail_shards: Vec<Mutex<AlertDetailByRule>>,
@@ -915,6 +921,7 @@ impl RuntimeMetrics {
             rule_matches_total: make_rule_map(),
             rule_instances: make_rule_map_i64(),
             rule_cursor_gap_total: gap_map,
+            rule_stats_over_limit_total: make_rule_map(),
             alert_emitted_total: make_rule_map(),
             alert_emitted_detail_shards: (0..ALERT_DETAIL_SHARDS)
                 .map(|_| Mutex::new(BTreeMap::new()))
@@ -1096,6 +1103,16 @@ impl RuntimeMetrics {
             && let Some(v) = by_window.get(window)
         {
             v.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 状态内存 guard 超限拒收增量（stats close 时按窗口 delta 上报; 0 增量自动 no-op）。
+    pub fn inc_rule_stats_over_limit(&self, rule: &str, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(v) = self.rule_stats_over_limit_total.get(rule) {
+            v.fetch_add(delta, Ordering::Relaxed);
         }
     }
 
@@ -1308,6 +1325,7 @@ impl RuntimeMetrics {
             rule_matches: self.drain_map(&self.rule_matches_total),
             rule_instances: self.read_gauge_map(&self.rule_instances),
             rule_cursor_gaps: self.drain_gap_map(&self.rule_cursor_gap_total),
+            rule_stats_over_limit: self.drain_map(&self.rule_stats_over_limit_total),
             alert_emitted: self.drain_map(&self.alert_emitted_total),
             alert_emitted_detail: self.drain_emitted_detail(),
             alert_channel_send_failed: self.drain_counter(&self.alert_channel_send_failed_total),

@@ -98,6 +98,9 @@ pub(super) struct StatsTask {
     last_activity_wall: std::time::Instant,
     /// 周期性超时扫描间隔（墙钟兜底推进 watermark 关闭尾部窗口）。
     timeout_scan_interval: std::time::Duration,
+    /// 已上报 metrics 的超限拒收累计值（delta 记账——`over_limit_new_buckets`
+    /// 跨窗口累计, close 上报必须发增量, 否则重复计数）。
+    last_reported_over_limit: u64,
 }
 
 impl StatsTask {
@@ -149,6 +152,7 @@ impl StatsTask {
             last_watermark: i64::MIN,
             last_activity_wall: std::time::Instant::now(),
             timeout_scan_interval,
+            last_reported_over_limit: 0,
         };
         (task, cancel)
     }
@@ -511,6 +515,26 @@ impl StatsTask {
             }
             let batch = builder.finish();
             self.dispatch_columns(&target, batch).await;
+        }
+        // 状态内存 guard 告警（协调片/单片; merge_tx 分片早退分支在上面已 return）:
+        // close 重置窗口但拒收计数跨窗口保留——读累计值求本窗增量, 上报 metrics +
+        // 每窗一次 wf_warn（带窗口区间 + pipe 追踪, 比 executor 内部 log 更显眼）。
+        let over_limit = self.stats.window.over_limit_new_buckets();
+        let delta = over_limit.saturating_sub(self.last_reported_over_limit);
+        if delta > 0 {
+            self.last_reported_over_limit = over_limit;
+            if let Some(metrics) = &self.metrics {
+                metrics.inc_rule_stats_over_limit(self.rule_name(), delta);
+            }
+            wf_warn!(pipe,
+                task_id = %self.task_id,
+                rule = %self.rule_name(),
+                window_start = window_start,
+                window_end = window_end,
+                over_limit_new = delta,
+                "stats 状态内存超限——本窗拒收 {} 个新键桶（累计 {} 个; 已有桶继续累积）",
+                delta, over_limit
+            );
         }
     }
 

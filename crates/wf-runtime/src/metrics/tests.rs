@@ -94,6 +94,32 @@ fn snapshot_window_append_resets() {
     assert_eq!(metrics.snapshot().window_append.get("w1"), Some(&0));
 }
 
+#[test]
+fn snapshot_stats_over_limit_drains() {
+    let metrics = RuntimeMetrics::new(
+        &["r1".to_string()],
+        &["w1".to_string()],
+        &[],
+        BTreeMap::new(),
+    );
+    // 增量语义: 多次上报累加（stats close 每窗 delta）。
+    metrics.inc_rule_stats_over_limit("r1", 3);
+    metrics.inc_rule_stats_over_limit("r1", 2);
+    let snap = metrics.snapshot();
+    assert_eq!(snap.rule_stats_over_limit.get("r1"), Some(&5));
+    // 0 增量 no-op。
+    metrics.inc_rule_stats_over_limit("r1", 0);
+    // 导出记录带 `stats_over_limit_total` 名。
+    let records = snap.to_records();
+    assert!(records.iter().any(|r| {
+        r.fields.iter().any(|(k, v)| k == "name" && v == "stats_over_limit_total")
+            && r.fields.iter().any(|(k, v)| k == "label" && v == "r1")
+            && r.fields.iter().any(|(k, v)| k == "value" && v == "5")
+    }));
+    // drain → 0。
+    assert_eq!(metrics.snapshot().rule_stats_over_limit.get("r1"), Some(&0));
+}
+
 // -- per-window route counters --------------------------------------------
 
 #[test]
