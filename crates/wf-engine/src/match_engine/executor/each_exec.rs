@@ -218,6 +218,19 @@ pub(crate) fn parse_each_join_columnar(
                     return None;
                 }
             }
+            // 2026-08-25 q13b 列式化：`fmt("{}", 左/右窗 flat 字段)` = 字段值的
+            // 字符串渲染（fmt 单参数恒等，模板恰为 "{}"）。列式 join 路径读
+            // 字段后按 fmt 语义渲染（Str 透传 / 非 Str `value_to_string`），
+            // 免 row path 的 Event clone + fmt 解释（q13b 1.3µs → 列式 462ns，
+            // 分配量大降——q13a 分片放开后 RSS 28.9GB 的分配大头）。
+            Expr::FuncCall {
+                qualifier: None,
+                name,
+                args,
+            } if name == "fmt"
+                && args.len() == 2
+                && matches!(&args[0], Expr::StringLit(t) if t == "{}")
+                && matches!(&args[1], Expr::Field(fr) if out_ok(fr)) => {}
             _ => return None,
         }
     }
@@ -677,9 +690,7 @@ impl RuleExecutor {
         // 不复制）。
         let filter_ok = match &each_plan.filter {
             None => true,
-            Some(f) if self.live_joins.is_empty() => {
-                wf_lang::columnar::expr_is_columnar(f)
-            }
+            Some(f) if self.live_joins.is_empty() => wf_lang::columnar::expr_is_columnar(f),
             Some(_) => false,
         };
         if !join_ok || !filter_ok {
@@ -745,9 +756,13 @@ impl RuleExecutor {
                 // 列式输出函数（fmt/strftime/count_char，参数为字面量/flat 字段）
                 // 走无 join 路径的批量 cell 求值；有活 join 时拒绝（列式 join
                 // 富化路径未接入批量 cell，回退行式避免 unreachable panic）。
-                other => {
-                    self.live_joins.is_empty() && wf_lang::columnar::columnar_output_expr(other)
+                // **例外（2026-08-25 q13b 列式化）**：`fmt("{}", 限定字段)`
+                // 单参数恒等——列式 join 富化路径读字段后按 fmt 语义渲染
+                // （Str 透传 / 非 Str value_to_string），双侧门控校验字段限定。
+                other if !self.live_joins.is_empty() => {
+                    fmt_identity_field(other).is_some_and(&out_shape_ok)
                 }
+                other => wf_lang::columnar::columnar_output_expr(other),
             })
     }
 
@@ -803,6 +818,29 @@ impl RuleExecutor {
                 Expr::Field(fr) => flat(fr),
                 other => wf_lang::columnar::expr_is_columnar(other),
             })
+    }
+}
+
+/// `fmt("{}", fr)` 单参数恒等（q13b 列式化）：模板恰为 `"{}"` 且参数是
+/// 单字段引用。语义 = `value_to_string(字段值)`；Str 透传、非 Str 渲染——
+/// 与解释器 fmt 的 `apply_fmt_template` 逐字节一致（对拍锁定）。
+/// `None` = 不是该形状 → 行式回退。
+pub(crate) fn fmt_identity_field(expr: &Expr) -> Option<&FieldRef> {
+    match expr {
+        Expr::FuncCall {
+            qualifier: None,
+            name,
+            args,
+        } if name == "fmt"
+            && args.len() == 2
+            && matches!(&args[0], Expr::StringLit(t) if t == "{}") =>
+        {
+            match &args[1] {
+                Expr::Field(fr) => Some(fr),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1088,8 +1126,7 @@ impl RuleExecutor {
             "each_batch_prepare 必须来自 rows 的同一批"
         );
         debug_assert!(
-            prepared.num_rows == 0
-                || rows.iter().all(|(ev, _)| ev.row() < prepared.num_rows),
+            prepared.num_rows == 0 || rows.iter().all(|(ev, _)| ev.row() < prepared.num_rows),
             "rows 行号越界 prepared 批"
         );
         let resolve = |name: Option<&str>| -> Option<usize> {
@@ -1273,7 +1310,10 @@ impl RuleExecutor {
             // pure overhead on this path.
             builder.begin_row();
             let staged: CoreResult<()> = (|| {
-                for (field_idx, ((((field, (name, field_type)), kind), _field_ref), field_idx_opt)) in self
+                for (
+                    field_idx,
+                    ((((field, (name, field_type)), kind), _field_ref), field_idx_opt),
+                ) in self
                     .plan
                     .yield_plan
                     .fields
@@ -1561,16 +1601,16 @@ impl RuleExecutor {
                 .then(|| self.each_yield_meta_light(&entity_id, score, *event_time_nanos));
             let mut values = Vec::with_capacity(self.plan.yield_plan.fields.len());
             let mut row_ok = true;
-            for (field_idx, ((((field, (name, field_type)), kind), _field_ref), field_idx_opt)) in self
-                .plan
-                .yield_plan
-                .fields
-                .iter()
-                .zip(statics.yield_specs.iter())
-                .zip(yield_kinds.iter())
-                .zip(yield_field_refs.iter())
-                .zip(yield_field_idxs.iter().copied())
-                .enumerate()
+            for (field_idx, ((((field, (name, field_type)), kind), _field_ref), field_idx_opt)) in
+                self.plan
+                    .yield_plan
+                    .fields
+                    .iter()
+                    .zip(statics.yield_specs.iter())
+                    .zip(yield_kinds.iter())
+                    .zip(yield_field_refs.iter())
+                    .zip(yield_field_idxs.iter().copied())
+                    .enumerate()
             {
                 let value = match kind {
                     YieldKind::Lit(v) => v.clone(),
@@ -1699,6 +1739,20 @@ impl RuleExecutor {
             .iter()
             .map(|field| match &field.value {
                 Expr::Field(fr) => field_src(fr),
+                // fmt("{}", fr) 恒等：按内部字段解析来源（值读回后渲染）。
+                Expr::FuncCall {
+                    qualifier: None,
+                    name,
+                    args,
+                } if name == "fmt"
+                    && args.len() == 2
+                    && matches!(&args[0], Expr::StringLit(t) if t == "{}") =>
+                {
+                    match &args[1] {
+                        Expr::Field(fr) => field_src(fr),
+                        _ => None,
+                    }
+                }
                 _ => None,
             })
             .collect();
@@ -1711,7 +1765,8 @@ impl RuleExecutor {
             Expr::StringLit(s) => Some(s.clone()),
             _ => None,
         };
-        // yield 字段种类（Lit/Field），同无 join 列式路径。
+        // yield 字段种类（Lit/Field），同无 join 列式路径。fmt("{}", 字段)
+        // 恒等归入 Field（读值后按 fmt 语义渲染——`yield_fmt_render` 标记）。
         let yield_kinds: Vec<YieldKind> = self
             .plan
             .yield_plan
@@ -1722,7 +1777,39 @@ impl RuleExecutor {
                 Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
                 Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
                 Expr::Field(_) => YieldKind::Field,
+                Expr::FuncCall {
+                    qualifier: None,
+                    name,
+                    args,
+                } if name == "fmt"
+                    && args.len() == 2
+                    && matches!(&args[0], Expr::StringLit(t) if t == "{}")
+                    && matches!(&args[1], Expr::Field(_)) =>
+                {
+                    YieldKind::Field
+                }
                 _ => unreachable!("columnar join gate excludes general yield exprs"),
+            })
+            .collect();
+        // fmt 单参数恒等标记：读值后非 Str → `value_to_string` 渲染（与解释器
+        // fmt 的 `apply_fmt_template` 渲染一致）；Str 透传（零成本，q13b
+        // side_input.value 是 Str）。
+        let yield_fmt_render: Vec<bool> = self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| {
+                matches!(
+                    &field.value,
+                    Expr::FuncCall {
+                        qualifier: None,
+                        name,
+                        args,
+                    } if name == "fmt"
+                        && args.len() == 2
+                        && matches!(&args[0], Expr::StringLit(t) if t == "{}")
+                )
             })
             .collect();
 
@@ -1944,18 +2031,26 @@ impl RuleExecutor {
                 {
                     let value = match kind {
                         YieldKind::Lit(_) => continue, // 批级常量，fill_row_gaps 填充
-                        YieldKind::Field => match src {
-                            Some(FieldSrc::Left(_)) => yield_left_idxs
-                                .get(yield_i)
-                                .copied()
-                                .flatten()
-                                .and_then(|fidx| event.value_at(fidx))
-                                .unwrap_or_else(|| Value::Str(SmolStr::default())),
-                            Some(FieldSrc::Right(f)) => matched
-                                .and_then(|r| r.field_value(f))
-                                .unwrap_or_else(|| Value::Str(SmolStr::default())),
-                            None => Value::Str(SmolStr::default()),
-                        },
+                        YieldKind::Field => {
+                            let mut value = match src {
+                                Some(FieldSrc::Left(_)) => yield_left_idxs
+                                    .get(yield_i)
+                                    .copied()
+                                    .flatten()
+                                    .and_then(|fidx| event.value_at(fidx))
+                                    .unwrap_or_else(|| Value::Str(SmolStr::default())),
+                                Some(FieldSrc::Right(f)) => matched
+                                    .and_then(|r| r.field_value(f))
+                                    .unwrap_or_else(|| Value::Str(SmolStr::default())),
+                                None => Value::Str(SmolStr::default()),
+                            };
+                            // fmt("{}", x) 恒等：非 Str 值按 fmt 语义渲染为字符串
+                            //（`apply_fmt_template` 的 value_to_string；Str 透传）。
+                            if yield_fmt_render[yield_i] && !matches!(value, Value::Str(_)) {
+                                value = Value::Str(value_to_string(&value).into());
+                            }
+                            value
+                        }
                         YieldKind::General => {
                             unreachable!("columnar join gate excludes general yield exprs")
                         }

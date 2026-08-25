@@ -531,10 +531,11 @@ pub(super) fn spawn_rule_tasks(
                             None
                         };
                         let progress = register_row_partitioned_progress(router, &window_sources);
-                        let mut shard_stats = wf_engine::match_engine::StatsExecutor::with_row_fields(
-                            stats_plan.clone(),
-                            row_fields.clone(),
-                        );
+                        let mut shard_stats =
+                            wf_engine::match_engine::StatsExecutor::with_row_fields(
+                                stats_plan.clone(),
+                                row_fields.clone(),
+                            );
                         shard_stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
                         let task_config = StatsTaskConfig {
                             stats: shard_stats,
@@ -582,10 +583,11 @@ pub(super) fn spawn_rule_tasks(
                     for shard_idx in 0..shard_count {
                         let push_rx = None;
                         let progress = register_row_partitioned_progress(router, &window_sources);
-                        let mut shard_stats = wf_engine::match_engine::StatsExecutor::with_row_fields(
-                            stats_plan.clone(),
-                            row_fields.clone(),
-                        );
+                        let mut shard_stats =
+                            wf_engine::match_engine::StatsExecutor::with_row_fields(
+                                stats_plan.clone(),
+                                row_fields.clone(),
+                            );
                         shard_stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
                         let task_config = StatsTaskConfig {
                             stats: shard_stats,
@@ -701,15 +703,14 @@ pub(super) fn spawn_rule_tasks(
                     && !deferred
                     && !order_sensitive_targets.contains(&target);
                 // **yield 中间管道窗口**（本规则是上游生产者）的 each 规则：
-                // **强制单 worker（2026-08-25 回退）**。q13a 分片一度放开（当中间窗
-                // 无 Match 消费者时），但 10 核并发 row path 高频分配（Event/OutputRecord
-                // /String）让 mimalloc arena 膨胀不归还——30M RSS 9.1GB→40.9GB
-                // （window_bytes 峰值仅 8.7GB，有界）。**内存优先：生产者保持单 worker**，
-                // 待 q13a 列式化（分配量级大降）后再评估放开。下游消费分片（q13b）
-                // 无此问题，保留。
+                // 2026-08-25：q13a 分片放开（列式化后分配量级大降）——EPS
+                // 1.52M→3.88M 但 RSS 27-30GB 线性增长（窗口内存正常 ~4GB，
+                // 疑窗外分配：events 物化/并发分配，用 MIMALLOC_SHOW_STATS
+                // 定位中）。安全条件与消费分片同款：非 deferred、输出目标
+                // 不被顺序敏感下游消费。
                 let yields_intermediate = intermediate_targets.contains(&target);
-                // 回退：生产者分片条件恒 false（保留变量/门控结构便于未来放开）。
-                let intermediate_producer_shard_safe = false;
+                let intermediate_producer_shard_safe =
+                    !deferred && !order_sensitive_targets.contains(&target);
                 let shardable = shard_count > 1
                     && (!consumes_intermediate || intermediate_shard_safe)
                     && (!yields_intermediate || intermediate_producer_shard_safe)
@@ -720,6 +721,13 @@ pub(super) fn spawn_rule_tasks(
                 let wants_push = use_push || consumes_intermediate;
 
                 if shardable {
+                    wf_info!(pipe,
+                        rule = %plan.name,
+                        shards = shard_count,
+                        mode = if wants_push { "push-rr" } else { "pull-rr" },
+                        kind = "each",
+                        "rule sharded"
+                    );
                     let mut shard_txs = Vec::with_capacity(shard_count);
                     for shard_idx in 0..shard_count {
                         // Push mode only (or intermediate-window consumers, which
@@ -768,6 +776,20 @@ pub(super) fn spawn_rule_tasks(
                         }
                     }
                 } else {
+                    wf_info!(pipe,
+                        rule = %plan.name,
+                        kind = "each",
+                        reason = if consumes_intermediate && !intermediate_shard_safe {
+                            "intermediate-consumer-unsafe"
+                        } else if yields_intermediate && !intermediate_producer_shard_safe {
+                            "intermediate-producer-unsafe"
+                        } else if deferred && !deferred_shardable {
+                            "deferred-unsafe"
+                        } else {
+                            "single-worker"
+                        },
+                        "rule single-worker"
+                    );
                     // 2026-08-23 q13：bind 中间管道窗口的 each 规则强制 push（fanout
                     // 广播订阅）——flush_pipes 的 broadcast_with_batch 直接投递，
                     // 规避 pull+Notify 的通知竞态（append 与 wait 时序错位时下游

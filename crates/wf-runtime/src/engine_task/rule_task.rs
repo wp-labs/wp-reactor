@@ -67,6 +67,10 @@ type PendingAliasRows = Vec<(
 )>;
 /// Staged pipe batch: (window name, events) or `None` when nothing staged.
 type PendingEventBatch = Option<(Arc<str>, Arc<Vec<Arc<Event>>>, RecordBatch)>;
+/// 中间窗 flush 产物（2026-08-25 q13 分片内存）：`events` 为 `Some` 时下游存在
+/// Single/Sharded 订阅（row-path 契约），`None` 时已裁剪为 batch-only
+/// （RoundRobin-only/无订阅）。
+type PipeFlushBatch = (Arc<str>, Option<Arc<Vec<Arc<Event>>>>, RecordBatch);
 /// Batch the allocation-heavy per-alert telemetry (detail map + e2e latency
 /// histogram): only 1 in N emitted alerts updates those, the exact total is
 /// always counted.
@@ -842,10 +846,14 @@ impl RuleTask {
         // 满足 `each_pipe_columnar_safe` 形状（q13a：投影 + `%` BinOp yield）
         // 时同样走列式快路径——免每行 Event 物化 + OutputRecord + stage 的
         // 三重分配（q13a row path 1248ns/行，见 rule_task_bench）。
+        // 2026-08-25 q13b 列式化：**放开 `events.is_none()`**——push 消费者
+        // （中间窗，广播带 events+batch）同样可从 raw batch 列式读（batch
+        // 驱动，events 被忽略不物化，与 pull 字节一致）。防御：key 分区
+        // push 携带 `shard_rows`（列式分支未接行子集，走行式）。
         let columnar_each = !debug_enabled
             && self.machine.is_none()
             && self.deferred.is_none()
-            && events.is_none()
+            && shard_rows.is_none()
             && batch.is_some()
             && if self.each_direct {
                 self.executor.each_plan_columnar_safe()
@@ -1566,9 +1574,9 @@ impl RuleTask {
                             // 事件时间单调时 expiry 也单调（emit at = expires 随
                             // 事件时间），追加即有序 O(1)；乱序驱动二分插入兜底。
                             let expiry = pending.expiry_nanos;
-                            let pos = deferred.pending.partition_point(|p| {
-                                p.expiry_nanos <= expiry
-                            });
+                            let pos = deferred
+                                .pending
+                                .partition_point(|p| p.expiry_nanos <= expiry);
                             // lo_min 缓存：插入 O(1) 更新（publish 免全量扫）。
                             // 用插入项的 lo_ns（区间下界）；pending 有序后 min lo
                             // 项几乎总是最早挂起（数据时间单调），dirty 极少。
@@ -2033,7 +2041,9 @@ impl RuleTask {
         // min lo（评估 gate 后 pending 很小，O(n) 无压力——旧 O(n²) 担忧是
         // 63% 假 miss 时代 33M 挂起 × 2740 batch 的产物，已不成立）。
         let due: Vec<DeferredPending> = {
-            let split = deferred.pending.partition_point(|p| p.expiry_nanos <= eff_wm);
+            let split = deferred
+                .pending
+                .partition_point(|p| p.expiry_nanos <= eff_wm);
             if split > 0 {
                 deferred.lo_min_dirty = true;
             }
@@ -2425,8 +2435,7 @@ impl RuleTask {
                 let target = self.executor.plan().joins[join_idx].right_window.clone();
                 let mut last_wm: Option<i64> = None;
                 let mut stalled = 0u32;
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(30);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                 loop {
                     let target_wm = self
                         .router
@@ -2451,7 +2460,8 @@ impl RuleTask {
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
-                self.scan_deferred(final_wm, wall_nanos() as i64, false).await;
+                self.scan_deferred(final_wm, wall_nanos() as i64, false)
+                    .await;
             }
             // EOS 重试（2026-08-23 q8 修复）：到期时 join 目标窗口 append 滞后
             // 的 miss 实例——EOS 后所有数据已 ingest、目标窗口完整，重试命中
@@ -3389,8 +3399,12 @@ impl RuleTask {
                 let target = self.executor.static_yield_target().clone();
                 match resolve_pipe_shape(&self.pipe_registry, &self.router, &target) {
                     Some((schema, time_col_index)) => {
-                        let mut stager =
-                            PipeBatchStager::new_columnar(target, schema, time_col_index, &yield_names);
+                        let mut stager = PipeBatchStager::new_columnar(
+                            target,
+                            schema,
+                            time_col_index,
+                            &yield_names,
+                        );
                         for (row, (_, event_nanos)) in out.iter().zip(rows.iter()) {
                             if let Err(e) = stager.push_row(rule_name, row, *event_nanos) {
                                 wf_warn!(
@@ -3552,28 +3566,51 @@ impl RuleTask {
         }
     }
 
-    /// Flush staged intermediate rows: build one N-row `RecordBatch`, parse
-    /// it to events once, and hand it to the pipe's downstream-rule
-    /// subscribers with a single broadcast. Called at the end of every
-    /// input batch (and on timeout/flush emissions), so delivery latency is
-    /// bounded exactly like the batched sink-alert delivery.
+    /// Flush staged intermediate rows: build one N-row `RecordBatch` and hand
+    /// it to the pipe's downstream-rule subscribers with a single broadcast.
+    /// Called at the end of every input batch (and on timeout/flush emissions),
+    /// so delivery latency is bounded exactly like the batched sink-alert
+    /// delivery.
+    ///
+    /// 2026-08-25 q13 分片内存：广播按订阅类型裁剪——
+    /// - **RoundRobin-only 订阅**（stateless `on each` 分片消费者，列式安全）
+    ///   或**无订阅**：广播 batch-only（`take_batch` 不物化 events）。物化的
+    ///   events（36.5k Event ≈ 18MB/批）只增加分片积压在途（q13a 分片放开后
+    ///   RSS 28.8GB 平台期主因）；下游从 raw batch 列式读（或自行物化），
+    ///   窗口读者（q4b stats）从窗口读，都不需要生产者侧物化。
+    /// - **存在 Single/Sharded 订阅**（row-path 中间窗消费者，测试契约依赖
+    ///   `RulePush::events`）：保留 events（`take_events` + `broadcast_with_batch`）。
     async fn flush_pipes(&self) {
-        let built = {
+        let built: Option<PipeFlushBatch> = {
             let mut guard = self.pipe_state.lock().unwrap();
             match &mut *guard {
-                PipeState::Staging(stager) => match stager.take_events() {
-                    Ok(built) => built,
-                    Err(e) => {
-                        wf_warn!(
-                            pipe,
-                            task_id = %self.task_id,
-                            output_kind = "intermediate",
-                            error = %e,
-                            "build internal pipeline batch failed, dropping staged rows"
-                        );
-                        None
+                PipeState::Staging(stager) => {
+                    // 决策在 take 之前：round_robin_only 只看 fanout 表，
+                    // 不需要 pipe_state 之外的锁。
+                    let batch_only = self.router.fanout().round_robin_only(&stager.target);
+                    let res = if batch_only {
+                        stager
+                            .take_batch()
+                            .map(|b| b.map(|(target, batch)| (target, None, batch)))
+                    } else {
+                        stager
+                            .take_events()
+                            .map(|e| e.map(|(target, events, batch)| (target, Some(events), batch)))
+                    };
+                    match res {
+                        Ok(built) => built,
+                        Err(e) => {
+                            wf_warn!(
+                                pipe,
+                                task_id = %self.task_id,
+                                output_kind = "intermediate",
+                                error = %e,
+                                "build internal pipeline batch failed, dropping staged rows"
+                            );
+                            None
+                        }
                     }
-                },
+                }
                 _ => None,
             }
         };
@@ -3611,10 +3648,25 @@ impl RuleTask {
                     notifier.notify_waiters();
                 }
                 let fan_start = Instant::now();
-                self.router
-                    .fanout()
-                    .broadcast_with_batch(&target, &events, &batch, None, seq)
-                    .await;
+                // 2026-08-25：广播按订阅类型裁剪（见 flush_pipes 头注释）——
+                // RoundRobin-only/无订阅时 batch-only（不携带物化 events，分片
+                // 积压内存主因）；存在 Single/Sharded 订阅时保留 events（row-path
+                // 中间窗契约）。真实窗口 seq（append 返回）保持：下游 ack 反映
+                // 真实消费进度。
+                match events {
+                    Some(events) => {
+                        self.router
+                            .fanout()
+                            .broadcast_with_batch(&target, &events, &batch, None, seq)
+                            .await;
+                    }
+                    None => {
+                        self.router
+                            .fanout()
+                            .broadcast_batch_only(&target, &batch, None, None, seq)
+                            .await;
+                    }
+                }
                 self.fanout_nanos
                     .fetch_add(fan_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
@@ -3836,10 +3888,19 @@ impl PipeBatchStager {
         use wf_lang::wfu_meta::WfuIntermediateMetaField;
         let mut stager = Self::new(target, schema, time_col_index);
         let meta_names = [
-            (WfuIntermediateMetaField::RuleName, PipeColSource::MetaRuleName),
+            (
+                WfuIntermediateMetaField::RuleName,
+                PipeColSource::MetaRuleName,
+            ),
             (WfuIntermediateMetaField::Score, PipeColSource::MetaScore),
-            (WfuIntermediateMetaField::EntityType, PipeColSource::MetaEntityType),
-            (WfuIntermediateMetaField::EntityId, PipeColSource::MetaEntityId),
+            (
+                WfuIntermediateMetaField::EntityType,
+                PipeColSource::MetaEntityType,
+            ),
+            (
+                WfuIntermediateMetaField::EntityId,
+                PipeColSource::MetaEntityId,
+            ),
         ];
         stager.col_sources = stager
             .schema
@@ -3852,10 +3913,7 @@ impl PipeBatchStager {
                 if let Some(yield_idx) = yield_names.iter().position(|n| **n == *field.name()) {
                     return PipeColSource::Yield(yield_idx);
                 }
-                if let Some((_, src)) = meta_names
-                    .iter()
-                    .find(|(m, _)| m.name() == field.name())
-                {
+                if let Some((_, src)) = meta_names.iter().find(|(m, _)| m.name() == field.name()) {
                     return src.clone();
                 }
                 PipeColSource::Missing
@@ -3909,7 +3967,9 @@ impl PipeBatchStager {
         );
         for (idx, source) in self.col_sources.iter().enumerate() {
             let value = match source {
-                PipeColSource::Yield(yield_idx) => row.values.get(*yield_idx).and_then(|v| v.as_ref()),
+                PipeColSource::Yield(yield_idx) => {
+                    row.values.get(*yield_idx).and_then(|v| v.as_ref())
+                }
                 PipeColSource::EventTime => None,
                 PipeColSource::MetaRuleName => Some(&Value::Str(rule_name.into())),
                 PipeColSource::MetaScore => Some(&Value::Number(row.score)),
@@ -3934,6 +3994,25 @@ impl PipeBatchStager {
     /// Build the staged rows into one batch and parse it to events,
     /// resetting the buffers. Returns `None` when nothing is staged.
     fn take_events(&mut self) -> RuntimeResult<PendingEventBatch> {
+        let Some((target, batch)) = self.take_batch()? else {
+            return Ok(None);
+        };
+        let events: Arc<Vec<Arc<Event>>> = Arc::new(
+            wf_engine::match_engine::batch_to_events(&batch)
+                .into_iter()
+                .map(Arc::new)
+                .collect(),
+        );
+        Ok(Some((target, events, batch)))
+    }
+
+    /// Build the staged rows into one batch, resetting the buffers — **without**
+    /// materializing per-row `Event`s. 2026-08-25 q13 分片内存：events 物化
+    /// （36.5k Event HashMap ≈ 18MB/批）只服务广播的 row-path 下游；列式
+    /// 消费者（q13b 列式 join 从 raw batch 读）与窗口读者（q4b stats）都不
+    /// 需要。广播裁剪 batch-only 后，分片积压（169 批 × 18MB ≈ 24GB 在途）
+    /// 消除——q13a 分片放开后 RSS 28.8GB 的平台期主因。
+    fn take_batch(&mut self) -> RuntimeResult<Option<(Arc<str>, RecordBatch)>> {
         if self.rows == 0 {
             return Ok(None);
         }
@@ -3966,13 +4045,7 @@ impl PipeBatchStager {
         let batch = RecordBatch::try_new(std::sync::Arc::clone(&self.schema), arrays)
             .source_raw_err(RuntimeReason::Bootstrap, "build internal pipeline batch")?;
         self.rows = 0;
-        let events: Arc<Vec<Arc<Event>>> = Arc::new(
-            wf_engine::match_engine::batch_to_events(&batch)
-                .into_iter()
-                .map(Arc::new)
-                .collect(),
-        );
-        Ok(Some((Arc::clone(&self.target), events, batch)))
+        Ok(Some((Arc::clone(&self.target), batch)))
     }
 }
 
@@ -4000,12 +4073,7 @@ fn push_pipe_col(
     is_time_column: bool,
     event_time_nanos: i64,
 ) -> RuntimeResult<()> {
-    if is_event_time_field
-        && !matches!(
-            col,
-            PipeCol::Timestamp(_) | PipeCol::Null { .. }
-        )
-    {
+    if is_event_time_field && !matches!(col, PipeCol::Timestamp(_) | PipeCol::Null { .. }) {
         unreachable!("event-time field must be Timestamp");
     }
     match col {
@@ -4599,14 +4667,14 @@ mod retention_pin_tests {
 }
 
 #[cfg(test)]
+#[path = "rule_task_bench.rs"]
+mod rule_task_bench;
+#[cfg(test)]
 #[path = "rule_task_coverage.rs"]
 mod rule_task_coverage;
 #[cfg(test)]
 #[path = "rule_task_coverage_more.rs"]
 mod rule_task_coverage_more;
-#[cfg(test)]
-#[path = "rule_task_bench.rs"]
-mod rule_task_bench;
 #[cfg(test)]
 mod rule_task_key_join_tests;
 #[cfg(test)]

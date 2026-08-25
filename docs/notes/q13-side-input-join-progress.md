@@ -1521,3 +1521,38 @@ stage_pipe_record 476ns = **1248ns/行**（0.80M/s 单核）。
 
 ### 回归
 wf-engine 1155 / wf-runtime 551 / clippy 0（+1 边界对拍）。
+
+
+## 2026-08-25 q13 分片内存根治：广播按订阅类型裁剪（30M 达标，100M 遗留）——未 commit
+
+### 一句话
+分片态 RSS 28.8GB 根因 = 每批 q13a 物化 events（≈18MB/批）× 广播携带 × 分片积压
+（bid_mod acked_lag 169 批）。修复 = **广播按订阅类型裁剪**：`RuleFanout::round_robin_only`
+（只有 RoundRobin 订阅或无订阅）→ `take_batch` + `broadcast_batch_only`（不物化
+events）；存在 Single/Sharded 订阅 → `take_events` + `broadcast_with_batch`
+（保留 row-path 契约）。`columnar_each` 门控 `events.is_none()` → `shard_rows.is_none()`
+（push 消费者也列式）。`spawn.rs` 放开 q13a 生产者分片。
+
+### 实测（30M 达标）
+| 配置 | EPS | RSS_peak |
+|------|-----|----------|
+| 单 worker（基线） | 1.52M | 5.9GB |
+| 分片（events 冗余） | 2.78–3.88M | 28.8GB ✗ |
+| **分片（裁剪后）** | **4.06M / 3.41M** | **9.87GB / 8.43GB** ✓ |
+
+回归：wf-engine 1156 / wf-runtime 552 / clippy 0（+`round_robin_only_classifies_subscriptions`，
+3 个被无条件裁剪 break 的测试恢复）。
+
+### ⚠ 100M 遗留 → **独立 issue**：`issues/q13-100m-rss-mimalloc-segments.md`
+100M RSS_peak 26.4GB（平台期）：footprint 定案 23GB = mimalloc 段区（reclaimable，
+已 purge）、物理 dirty 仅 3.4GB、窗口有界 6.4GB、bid_mod acked_lag 峰值 765。
+机制判断 = RSS 是 mimalloc **峰值分配水位**，100M 下 q13b 消费滞后积压在途 batch
+把水位顶高。验证路径与候选修复见 issue 文档，**下次从那里继续**。
+
+### Pitfalls（本次新增）
+- 无条件广播裁剪 break row-path 中间窗契约（3 测试断言 `push.events`）——必须按
+  订阅类型（round_robin_only）裁剪。
+- 决策在 take 之前：`take_batch`/`take_events` 都消费 stager 缓冲，二者互斥。
+- RSS 26GB ≠ 泄漏：footprint 显示 23GB reclaimable，dirty 仅 3.4GB。RSS 是峰值
+  分配水位的代理指标。
+- 勿回退 q13a 分片（30M 已达标，回退是倒退）；100M 先看 lag 时间曲线再动手。

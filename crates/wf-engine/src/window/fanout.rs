@@ -151,6 +151,33 @@ impl RuleFanout {
             .is_some_and(|subs| !subs.is_empty())
     }
 
+    /// Whether `window_name` has **only** round-robin delivery subscriptions
+    /// (stateless `on each` sharded consumers) — or none at all.
+    ///
+    /// True means the producer can skip materializing per-row `Event`s for
+    /// the broadcast: every delivery channel reads the raw `batch` (columnar
+    /// safe, or falls back to parsing the batch itself), and no row-path
+    /// consumer depends on `RulePush::events`. This is what lets the pipe
+    /// producer (2026-08-25 q13) drop the ~18MB/批 events payload for sharded
+    /// chains (q13a→bid_mod→q13b) that otherwise accumulates in-flight with
+    /// sharded backpressure (RSS 28.8GB plateau).
+    ///
+    /// Single and Sharded subscriptions may consume `events` (row-path
+    /// intermediate-window contract, locked by tests), so their presence
+    /// forces the events path.
+    pub fn round_robin_only(&self, window_name: &str) -> bool {
+        let table = self.table.read().expect("fanout lock poisoned");
+        match table.get(window_name) {
+            None => true,
+            Some(subs) => {
+                subs.is_empty()
+                    || subs
+                        .iter()
+                        .all(|s| matches!(s, Subscription::RoundRobin { .. }))
+            }
+        }
+    }
+
     /// Register a single (unsharded) rule channel for `window_name`.
     pub fn register(&self, window_name: &str, tx: mpsc::Sender<RulePush>) {
         let mut table = self.table.write().expect("fanout lock poisoned");
@@ -701,6 +728,39 @@ mod tests {
 
     fn keys() -> Vec<FieldRef> {
         vec![FieldRef::Simple("id".into())]
+    }
+
+    /// `round_robin_only` 驱动中间窗广播裁剪（2026-08-25 q13 分片内存）：
+    /// - 无订阅 / 只有 RoundRobin 订阅 → true（生产者可跳过 events 物化，
+    ///   batch-only 广播）
+    /// - 存在 Single / Sharded / 混合订阅 → false（row-path 中间窗消费者
+    ///   依赖 `RulePush::events`，必须保留）
+    #[test]
+    fn round_robin_only_classifies_subscriptions() {
+        let fanout = RuleFanout::new();
+        let (tx, _rx) = mpsc::channel::<RulePush>(8);
+        let (tx2, _rx2) = mpsc::channel::<RulePush>(8);
+        let (tx3, _rx3) = mpsc::channel::<RulePush>(8);
+
+        // 未注册窗口 → true（广播无订阅者，物化 events 是纯浪费）。
+        assert!(fanout.round_robin_only("unregistered"));
+
+        // 只有 Single 订阅 → false（row-path 契约需要 events）。
+        fanout.register("win_single", tx.clone());
+        assert!(!fanout.round_robin_only("win_single"));
+
+        // 只有 Sharded 订阅 → false。
+        fanout.register_sharded("win_sharded", vec![tx2.clone()], Arc::from(keys()));
+        assert!(!fanout.round_robin_only("win_sharded"));
+
+        // 只有 RoundRobin 订阅 → true（列式安全，batch-only 广播）。
+        fanout.register_round_robin("win_rr", vec![tx3.clone()]);
+        assert!(fanout.round_robin_only("win_rr"));
+
+        // 混合：RoundRobin + Single → false（任一 row-path 消费者都需要 events）。
+        fanout.register("win_mixed", tx.clone());
+        fanout.register_round_robin("win_mixed", vec![tx.clone()]);
+        assert!(!fanout.round_robin_only("win_mixed"));
     }
 
     #[tokio::test]
