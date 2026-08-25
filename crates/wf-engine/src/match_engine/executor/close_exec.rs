@@ -304,11 +304,13 @@ impl RuleExecutor {
 
     /// Columnar-safety gate for the batched close emit path. Mirrors the
     /// on-each gate (`each_plan_columnar_safe`): constant score, entity
-    /// StringLit / plain Field, yields Lit / plain Field. Joins are unsupported
-    /// on this path yet — rules with joins fall back to the per-record
-    /// join-enriched path (q4/q6 style). Field references to the synthetic
-    /// `_step_*` / `_bind_*` ctx fields are rejected: the columnar resolver
-    /// only reads keys / step labels / `field_values` / `bind_data`.
+    /// StringLit / plain Field, yields Lit / plain Field **or a General
+    /// expression that only references plain fields**（fmt/strftime/count_char
+    /// 等 q15-q19 detail——列式 close 对 General 走轻量 ctx 求值）。Joins are
+    /// unsupported on this path yet — rules with joins fall back to the
+    /// per-record join-enriched path (q4/q6 style). Field references to the
+    /// synthetic `_step_*` / `_bind_*` ctx fields are rejected: the columnar
+    /// resolver only reads keys / step labels / `field_values` / `bind_data`.
     pub fn close_plan_columnar_safe(&self) -> bool {
         if !matches!(self.plan.score_plan.expr, Expr::Number(_)) {
             return false;
@@ -325,7 +327,7 @@ impl RuleExecutor {
             Expr::Field(fr) => {
                 !matches!(fr, FieldRef::Path { .. }) && !field_ref_name(fr).starts_with('_')
             }
-            _ => false,
+            general => Self::yield_general_columnar_safe(general),
         }) {
             return false;
         }
@@ -333,6 +335,41 @@ impl RuleExecutor {
             return false;
         }
         true
+    }
+
+    /// General yield（fmt/strftime/count_char 等）在列式 close 路径可安全求值:
+    /// 表达式引用的全部字段都是普通字段（非 `_step_*`/`_bind_*` 合成字段、非
+    /// Path、非空名）——Named 窄化的 `build_eval_context` 才会注入这些字段。
+    /// 合成字段只在 all 分支注入, 求值会读到空 → 输出失真, 门控拒绝。
+    fn yield_general_columnar_safe(expr: &Expr) -> bool {
+        match expr {
+            Expr::Field(fr) => {
+                let n = field_ref_name(fr);
+                !n.is_empty() && !n.starts_with('_') && !matches!(fr, FieldRef::Path { .. })
+            }
+            Expr::BinOp { left, right, .. } => {
+                Self::yield_general_columnar_safe(left) && Self::yield_general_columnar_safe(right)
+            }
+            Expr::Neg(inner) | Expr::Not(inner) => Self::yield_general_columnar_safe(inner),
+            Expr::Array(items) => items.iter().all(Self::yield_general_columnar_safe),
+            Expr::InList { expr: inner, list, .. } => {
+                Self::yield_general_columnar_safe(inner) && list.iter().all(Self::yield_general_columnar_safe)
+            }
+            Expr::IfThenElse {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                Self::yield_general_columnar_safe(cond)
+                    && Self::yield_general_columnar_safe(then_expr)
+                    && Self::yield_general_columnar_safe(else_expr)
+            }
+            Expr::Object(items) => items.iter().all(|it| Self::yield_general_columnar_safe(&it.value)),
+            Expr::FuncCall { args, .. } => args.iter().all(Self::yield_general_columnar_safe),
+            // Number/StringLit/Bool/SystemVar/WfuMeta/PresetParam: 读字面量/
+            // YieldMeta/参数体, 无 ctx 字段访问。
+            _ => true,
+        }
     }
 
     /// Batched columnar close emit (L4): appends a whole batch of
@@ -435,6 +472,10 @@ impl RuleExecutor {
                 wp_model_core::model::Value,
             )>,
         > = Vec::with_capacity(closes.len());
+        // 窗口级 fired_at 缓存: 同一窗口所有 close 的 watermark_nanos 相同——
+        // format_nanos_utc（civil_from_days + 24B 分配）每窗算一次（q19 单窗
+        // 百万级 close, 省百万次）。
+        let mut fired_at_cache: Option<(i64, String)> = None;
 
         'close: for close in closes {
             if !is_qualified(close) {
@@ -444,7 +485,14 @@ impl RuleExecutor {
             let origin = AlertOrigin::Close {
                 reason: close.close_reason,
             };
-            let fired_at = format_nanos_utc(close.watermark_nanos);
+            let fired_at = match &fired_at_cache {
+                Some((w, s)) if *w == close.watermark_nanos => s.clone(),
+                _ => {
+                    let s = format_nanos_utc(close.watermark_nanos);
+                    fired_at_cache = Some((close.watermark_nanos, s.clone()));
+                    s
+                }
+            };
             // entity
             let entity_id: String = if let Some(s) = entity_const {
                 s.to_string()
@@ -475,14 +523,53 @@ impl RuleExecutor {
             );
 
             // Field yields: resolve each from keys / field_values / bind.
+            // General yields（fmt/strftime/count_char——门控保证只引用普通字段）:
+            // 轻量 ctx 求值——build_eval_context 的 Named 窄化只注入输出引用
+            // 字段, 跳过 per-record 路径的 combine_step_plans / annotate /
+            // joins / where / OutputRecord（q15-q19 detail 的 fmt 批量列式化）。
+            let mut ctx: Option<Event> = None;
             for (field, (name, field_type)) in
                 self.plan.yield_plan.fields.iter().zip(yield_specs.iter())
             {
-                if !matches!(field.value, Expr::Field(_)) {
-                    continue; // literal — constant column, gap-filled
-                }
-                let value = resolve_close_field(close, keys, field_ref_name_of(&field.value))
-                    .unwrap_or_else(|| Value::Str(String::new().into()));
+                let value = match &field.value {
+                    Expr::Field(_) => resolve_close_field(close, keys, field_ref_name_of(&field.value))
+                        .unwrap_or_else(|| Value::Str(String::new().into())),
+                    general => {
+                        let ctx = ctx.get_or_insert_with(|| {
+                            build_eval_context(
+                                keys,
+                                &close.scope_key,
+                                &all_step_data,
+                                &close.bind_data,
+                                &[],
+                                None,
+                                &self.close_ctx_fields,
+                            )
+                        });
+                        let yield_meta = YieldMeta {
+                            score: Some(score_const),
+                            wfx_id: Some(&wfx_id),
+                            rule_name: Some(&self.plan.name),
+                            entity_type: Some(&self.plan.entity_plan.entity_type),
+                            entity_id: Some(&entity_id),
+                            origin: Some(origin.as_str()),
+                            close_reason: Some(close.close_reason.as_str()),
+                            fired_at: Some(&fired_at),
+                            emit_time: Some(&emit_time),
+                            summary: Some(&summary),
+                            event_first_time_nanos: Some(close.event_first_time_nanos),
+                            event_last_time_nanos: Some(close.event_last_time_nanos),
+                            window_start_time_nanos: Some(close.window_start_time_nanos),
+                            window_end_time_nanos: Some(close.window_end_time_nanos),
+                            emit_time_nanos: Some(emit_time_nanos),
+                            time_format: Some(self.output_config().time_format.as_str()),
+                        };
+                        with_yield_eval_scope(|| {
+                            eval_yield_expr_with_meta(general, ctx, yield_meta)
+                        })
+                        .expect("eval_yield_expr_with_meta never returns None")
+                    }
+                };
                 match RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)
                 {
                     Ok(Some(v)) => {

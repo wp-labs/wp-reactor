@@ -2382,15 +2382,23 @@ fn close_plan_columnar_safe_gate_variants() {
     p.entity_plan.entity_id_expr = Expr::Field(FieldRef::Simple("_step_0_measure".into()));
     assert!(!RuleExecutor::new(p).close_plan_columnar_safe());
 
-    // Yield with a general expression → unsafe.
+    // Yield with a general expression referencing plain fields → safe
+    // （2026-08-25 扩展: 列式 close 对 General 走轻量 ctx 求值）。
     let mut p = base();
     p.yield_plan.fields = vec![YieldField {
         name: "f".into(),
         value: Expr::BinOp {
             op: BinOp::Add,
-            left: Box::new(Expr::Number(1.0)),
+            left: Box::new(Expr::Field(FieldRef::Simple("sip".into()))),
             right: Box::new(Expr::Number(2.0)),
         },
+    }];
+    assert!(RuleExecutor::new(p).close_plan_columnar_safe());
+    // General referencing a synthetic `_step_*` field → unsafe（Named 窄化不注入）。
+    let mut p = base();
+    p.yield_plan.fields = vec![YieldField {
+        name: "f".into(),
+        value: Expr::Field(FieldRef::Simple("_step_0_measure".into())),
     }];
     assert!(!RuleExecutor::new(p).close_plan_columnar_safe());
 

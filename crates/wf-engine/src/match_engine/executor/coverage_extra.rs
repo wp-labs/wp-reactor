@@ -4352,6 +4352,19 @@ fn close_plan_columnar_safe_gate_branches() {
             args: vec![Expr::Field(FieldRef::Simple("sip".into()))],
         },
     }];
+    // General yield（fmt/strftime/count_char 等）只引用普通字段 → 允许
+    // （2026-08-25 扩展: 列式 close 对 General 走轻量 ctx 求值）。
+    assert!(RuleExecutor::new(plan).close_plan_columnar_safe());
+    // General 引用合成字段（`_bind_*`/`_step_*`, Named 窄化不注入）→ 拒绝。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "y".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "upper".into(),
+            args: vec![Expr::Field(FieldRef::Simple("_bind_x_count".into()))],
+        },
+    }];
     assert!(!RuleExecutor::new(plan).close_plan_columnar_safe());
 
     // Joins present → false.

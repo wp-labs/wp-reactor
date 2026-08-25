@@ -449,6 +449,12 @@ impl StatsTask {
         let lookup = super::window_lookup::RegistryLookup::new(&self.router);
         // **批量 emit**: 逐桶/逐条目 record 按 yield_target 合并进同一
         // AlertColumnBatch, 每窗口一次投递（消除 per-record await 回压）。
+        // 列式 close（L4, 2026-08-25）: 门控通过（常量 score + 简单 entity +
+        // Lit/Field/纯字段 General yield, 含 q15-q19 的 fmt detail）→ 收集全部
+        // CloseOutput 一次性 `execute_close_direct_batch_columnar`——跳过逐条
+        // 的 ctx build / joins / where / OutputRecord（close 路径输出链瓶颈）。
+        let columnar_close = self.executor.close_plan_columnar_safe();
+        let mut columnar_closes: Vec<CloseOutput> = Vec::new();
         let mut builders: HashMap<Arc<str>, AlertColumnBuilder> = HashMap::new();
         // rich 路径（last/top, Q18/Q19）: 每桶每度量一个值列表, top 产生 N 条目
         // （rank 序）→ 每条目一条 alert, 行字段注入 yield 的 `b.*`。
@@ -493,7 +499,11 @@ impl StatsTask {
                         &bucket.key,
                         &key_fields,
                     );
-                    self.emit_close_record(&close, &lookup, &mut builders).await;
+                    if columnar_close {
+                        columnar_closes.push(close);
+                    } else {
+                        self.emit_close_record(&close, &lookup, &mut builders).await;
+                    }
                 }
             }
         } else {
@@ -511,7 +521,34 @@ impl StatsTask {
                     &scope_key,
                     &key_fields,
                 );
-                self.emit_close_record(&close, &lookup, &mut builders).await;
+                if columnar_close {
+                    columnar_closes.push(close);
+                } else {
+                    self.emit_close_record(&close, &lookup, &mut builders).await;
+                }
+            }
+        }
+        if columnar_close && !columnar_closes.is_empty() {
+            // 批量列式 close: 单 target（静态 yield_target）builder, 一次投递。
+            // emit_time 用窗级墙钟（emit_time 不喂语义, 与 L4 文档一致）。
+            let emit_time_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64;
+            let target = self.executor.static_yield_target();
+            let builder = builders
+                .entry(Arc::clone(target))
+                .or_insert_with(|| AlertColumnBuilder::new(Arc::clone(target)));
+            let outcome = self
+                .executor
+                .execute_close_direct_batch_columnar(&columnar_closes, builder, emit_time_nanos);
+            if let Some(metrics) = &self.metrics {
+                for _ in 0..outcome.appended {
+                    metrics.inc_alert_emitted_total(self.rule_name());
+                }
+                for _ in 0..outcome.failed {
+                    metrics.inc_alert_serialize_failed();
+                }
             }
         }
         for (target, mut builder) in builders {

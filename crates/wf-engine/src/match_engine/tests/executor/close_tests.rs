@@ -486,13 +486,18 @@ fn close_plan_columnar_safe_rejects_non_constant_score() {
 }
 
 #[test]
-fn close_plan_columnar_safe_rejects_general_yield() {
+fn close_plan_columnar_safe_general_yield_plain_fields_only() {
+    // 2026-08-25 扩展: General yield（fmt/strftime/count_char 等）只要引用
+    // 普通字段/字面量就允许走列式 close（轻量 ctx 求值）; 引用合成字段
+    // （`_step_*`/`_bind_*`, Named 窄化不注入）拒绝。
     let mut plan = q12_like_plan();
     plan.yield_plan.fields[0].value = Expr::BinOp {
         op: wf_lang::ast::BinOp::Add,
         left: Box::new(Expr::Number(1.0)),
         right: Box::new(Expr::Number(2.0)),
     };
+    assert!(RuleExecutor::new(plan.clone()).close_plan_columnar_safe());
+    plan.yield_plan.fields[0].value = Expr::Field(wf_lang::ast::FieldRef::Simple("_step_0_measure".into()));
     assert!(!RuleExecutor::new(plan).close_plan_columnar_safe());
 }
 
@@ -551,6 +556,48 @@ fn columnar_close_matches_per_record_close() {
         .unwrap();
     assert_eq!(columnar_rows.len(), 1);
 
+    assert_records_equal_ignoring_emit_time(&per_record, &columnar_rows[0]);
+}
+
+#[test]
+fn columnar_close_general_fmt_yield_matches_per_record() {
+    // 2026-08-25 扩展: General yield（fmt, q15-q19 detail 形态）过门控后,
+    // 列式 close 的轻量 ctx 求值必须与逐条路径逐位一致（值 + 类型）。
+    use crate::alert::AlertColumnBuilder;
+    use crate::error::CoreResult;
+    use wf_lang::plan::YieldField;
+    use wp_model_core::model::DataRecord;
+
+    let mut plan = q12_like_plan();
+    plan.yield_plan.fields.push(YieldField {
+        name: "fmt_detail".to_string(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "fmt".to_string(),
+            args: vec![
+                Expr::StringLit("bidder={}".to_string()),
+                Expr::Field(FieldRef::Simple("bidder".to_string())),
+            ],
+        },
+    });
+    let exec = RuleExecutor::new(plan);
+    assert!(exec.close_plan_columnar_safe(), "fmt 引用普通字段应过门控");
+    let close = q12_like_close();
+
+    let record = exec.execute_close(&close).unwrap().unwrap();
+    let per_record = record.to_data_record().unwrap();
+
+    let mut builder = AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
+    let stats =
+        exec.execute_close_direct_batch_columnar(&[close], &mut builder, 1_700_000_000_000);
+    assert_eq!(stats.appended, 1);
+    assert_eq!(stats.failed, 0);
+    let batch = builder.finish();
+    let columnar_rows: Vec<DataRecord> = batch
+        .iter_data_records()
+        .collect::<CoreResult<Vec<_>>>()
+        .unwrap();
+    assert_eq!(columnar_rows.len(), 1);
     assert_records_equal_ignoring_emit_time(&per_record, &columnar_rows[0]);
 }
 
