@@ -1543,7 +1543,7 @@ events）；存在 Single/Sharded 订阅 → `take_events` + `broadcast_with_bat
 回归：wf-engine 1156 / wf-runtime 552 / clippy 0（+`round_robin_only_classifies_subscriptions`，
 3 个被无条件裁剪 break 的测试恢复）。
 
-### ⚠ 100M 遗留 → **独立 issue**：`issues/q13-100m-rss-mimalloc-segments.md`
+### ⚠ 100M 遗留 → **独立 issue**：`issues/q13-memory-peak-scales-with-volume.md`
 100M RSS_peak 26.4GB（平台期）：footprint 定案 23GB = mimalloc 段区（reclaimable，
 已 purge）、物理 dirty 仅 3.4GB、窗口有界 6.4GB、bid_mod acked_lag 峰值 765。
 机制判断 = RSS 是 mimalloc **峰值分配水位**，100M 下 q13b 消费滞后积压在途 batch
