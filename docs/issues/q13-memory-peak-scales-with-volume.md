@@ -167,14 +167,27 @@ meta 列**：`__wfu_rule_name` / `__wfu_entity_type` / `__wfu_entity_id`（字�
 行为、也不是窗口保留。旁证链：慢跑无缺口 · q1（快）缺口 1.09GB · q13（慢）
 缺口 13GB · q13a-only（更慢且无下游消费）缺口 17GB。
 
-#### 下一步（已收窄为工程题）
-1. **把在途深度变成指标**（目前完全无可观测性）：receiver 解码队列深度、
-   parse pool 在途字节、窗口 mailbox permits 已用量。有了这三个数字，13GB 就能
-   逐段对账。
-2. **确认背压是否生效**：q13 消费比 q1 慢 5 倍，若 receiver 仍按网络速度读入并
-   解码，在途就会堆到预算上限——对应
-   `issues/window-overload-drop-vs-backpressure.md` 的同一类问题（源侧反压）。
-3. 目标：在途预算有界且与总量无关 → 100M 峰值 < 10GB。
+#### 下一步（指标已成必需品：所有猜测均已被实测否决）
+
+已逐一否决：窗口保留、1over 参数、通道条目（Arc 共享）、分配器/arena、
+小对象（0.15GB）、alert 输出基数（q1 反例）、`parse_buffer_bytes` 预算。
+所以不能再猜，必须先把在途量变成可观测量：
+
+1. **`parse.inflight_bytes`（已用/预算）** —— 预算 2GB 但调到 256MB 内存不变，
+   必须看**实际已用值**才知道预算是否真是约束（若已用远小于预算 →
+   矶颈在其他环节）。
+2. **`receiver.decode_inflight_bytes` + 解码膚胀率** —— 7MB 帧体 × 337 活跃是
+   唯一被实证的大块，但并存深度上界未知。
+3. **`window.mailbox_permits_used`（每窗）** —— 确认 64MiB×7 是否真的只 0.45GB。
+4. **未归因残差** = `alloc.peak_commit − Σ窗口 − Σ以上` —— 唯一能证明"账对上了"
+   的量。
+
+#### 另一条已实证的优化（与根因无关但值得做）
+`malloc_history` 抓到 `flush_pipes → take_batch → Int64Array::from(Vec<Option<i64>>)`：
+`PipeCol` 用 `Vec<Option<i64>>` 暂存（**16B/值**，35k 行×11 列 ≈ 6.2MB/批），再
+**拷一份**进 Arrow 缓冲（8B/值 + null bitmap）。改用 Arrow builder 直写（或
+`Vec<i64>` + 独立 null buffer）可同时省一半暂存与一次全量拷贝，降低每批
+分配 churn。
 
 ## 4. 已尝试 / 已排除
 
@@ -185,6 +198,8 @@ meta 列**：`__wfu_rule_name` / `__wfu_entity_type` / `__wfu_entity_id`（字�
 | 回退 q13a 单 worker | 1.52M EPS、5.9GB | 性能倒退，不做 |
 | 单点 footprint 采样判定"RSS 虚高" | 误判（撞低谷） | 必须整程采样 |
 | **`bid_mod over = 1h → 1m`** | **无效**：bid_mod 峰值 1.69GB→2.03GB（噪声内略高）、窗口合计 3.87→4.25GB、RSS 13.8→13.5GB 不变 | **已否决**：时间驱逐被 ack floor 门控（`evictor.rs:130`），未被 q13b ack 的批次（lag 峰值 369–765）`over` 再小也删不掉——**保留量由消费滞后决定，不由 over 决定** |
+| **`parse_buffer_bytes` 2GB → 256MB** | **无效**：RSS 15.2GB（原 14–15GB）不变，EPS 3.3M→2.87M 反而变差。已核实 `/tmp/bench_conf.toml` 生效 | **已否决**：虽然参数注释写明"在途 = 预算 × IPC 解码膚胀 ~10×，下游卡顿时 RSS 可近 10×预算"，但实测不成立——本数据集的膚胀约 1×（bid_events 内容 7.43MB/批 ≈ IPC 帧体 6.9–7.5MB） |
+| **`window_buffer_bytes`**（默认 64MiB/窗） | 未单独测 | 名义上只 7×64MiB≈0.45GB，量级不对应 |
 
 ## 5. 下一步（测试驱动，已备好度量设施）
 
