@@ -841,13 +841,17 @@ impl StatsExecutor {
         row_field_cols: Option<&[Option<usize>]>,
     ) -> bool {
         let n_measures = self.plan.measures.len();
+        // 局部寄存器计数（F1 修复的 event_count 口径 + 零热路径开销）: 归并成功
+        // 才计, 批末一次性写回——避免每行一次 `self.window.event_count += 1` 的
+        // 内存往返（q19 列式实测 +2.3%）。
+        let mut counted: u64 = 0;
         match rows {
             Some(rs) => {
                 for &r in rs {
                     if (r as usize) >= n {
                         continue; // 防御: 越界行号（与 materialize_rows 一致跳过）
                     }
-                    self.accumulate_keyed_row(
+                    if self.accumulate_keyed_row(
                         batch,
                         masks,
                         key_cols,
@@ -856,12 +860,14 @@ impl StatsExecutor {
                         n_measures,
                         row_names,
                         row_field_cols,
-                    );
+                    ) {
+                        counted += 1;
+                    }
                 }
             }
             None => {
                 for row in 0..n {
-                    self.accumulate_keyed_row(
+                    if self.accumulate_keyed_row(
                         batch,
                         masks,
                         key_cols,
@@ -870,14 +876,19 @@ impl StatsExecutor {
                         n_measures,
                         row_names,
                         row_field_cols,
-                    );
+                    ) {
+                        counted += 1;
+                    }
                 }
             }
         }
+        self.window.event_count += counted;
         true
     }
 
     /// 单行桶归并（P2 复合键逐行路径的公共主体, 供全批/行域两分支复用）。
+    /// 返回 `true` = 归并成功（行计入 event_count）; `false` = 键 null/超限拒收
+    /// （行跳过, 不计入——F1 行式/列式对拍口径）。
     ///
     /// 字段读取走**原生列值**（`column_i128`/`column_distinct_key`）——与空键
     /// 列式段同精度（D7/D8: ≥2^53 的 Int64 不得经 `Value::Number(f64)` 舍入;
@@ -898,13 +909,13 @@ impl StatsExecutor {
         n_measures: usize,
         row_names: Option<&[String]>,
         row_field_cols: Option<&[Option<usize>]>,
-    ) {
+    ) -> bool {
         const MAX_STACK_KEYS: usize = 4;
         if key_columns.len() <= MAX_STACK_KEYS {
             let mut comps: [ScopeKey; MAX_STACK_KEYS] = std::array::from_fn(|_| ScopeKey::Empty);
             for (i, kc) in key_columns.iter().enumerate() {
                 let Some(c) = key_column_comp(kc, batch, row) else {
-                    return; // 键 null → 跳过
+                    return false; // 键 null → 跳过
                 };
                 comps[i] = c;
             }
@@ -913,7 +924,7 @@ impl StatsExecutor {
             // 新桶超限（内存 guard）→ 该行跳过。
             let Some(bucket) = self.window.keyed_bucket_mut(hash, comps, &self.plan, n_measures)
             else {
-                return;
+                return false;
             };
             accumulate_column_row(
                 bucket,
@@ -926,15 +937,14 @@ impl StatsExecutor {
                 masks,
                 row,
             );
-            self.window.event_count += 1; // 归并成功才计数（对齐行式路径）
-            return;
+            return true;
         }
         let Some(key) = scope_key_columnar(batch, key_cols, row) else {
-            return; // 键 null → 跳过
+            return false; // 键 null → 跳过
         };
         // 新桶超限（内存 guard）→ 该行跳过。
         let Some(bucket) = self.window.bucket_mut(&key, &self.plan, n_measures) else {
-            return;
+            return false;
         };
         accumulate_column_row(
             bucket,
@@ -947,7 +957,7 @@ impl StatsExecutor {
             masks,
             row,
         );
-        self.window.event_count += 1; // 归并成功才计数（对齐行式路径）
+        true
     }
 }
 
