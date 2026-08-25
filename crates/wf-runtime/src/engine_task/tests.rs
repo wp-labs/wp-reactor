@@ -4723,3 +4723,65 @@ async fn conv_stage_cancel_drops_unsealed_buckets() {
         "cancel must DROP unsealed (partial) buckets, not emit them"
     );
 }
+
+/// **广播载荷按订阅类型裁剪**（2026-08-25 q13 分片内存修复的核心不变量）。
+///
+/// 为何必须单独钉死：现有 q13 链用例（`deferred_integration_tests` 的
+/// round-robin 场景）只断言**输出正确性**——把 `round_robin_only` 条件写反后
+/// 链路依然跑通、用例依然通过，而每批多物化 36.5k 个 `Event`（≈18MB/批）会随
+/// 分片积压把 30M 的 RSS 从 9.9GB 推回 28.8GB（`53aca64` 修复的正是这个）。
+/// 所以这里断言的是**载荷形状**，不是业务结果。
+///
+/// - RoundRobin-only 订阅（stateless each 分片，列式安全）→ **batch-only**：
+///   `events == None` 且 `batch == Some`（下游从 raw batch 列式读）。
+/// - Single 订阅（row-path 中间窗契约）→ 保留 `events`：已由
+///   `intermediate_target_writes_window_instead_of_alert_channel` 等三个用例覆盖。
+#[tokio::test]
+async fn intermediate_broadcast_is_batch_only_for_round_robin_subscribers() {
+    init_tracing();
+    let schema = test_schema();
+    let (mut task, mut alert_rx, router) = make_intermediate_each_task();
+    let ts = 4_000_000_000_000_000_000i64;
+
+    // 关键差异：round-robin 订阅（生产分片路径），而非 register()（Single）。
+    let (down_tx, mut down_rx) = mpsc::channel::<wf_engine::window::RulePush>(8);
+    router
+        .fanout()
+        .register_round_robin("enriched_events", vec![down_tx]);
+
+    let batch = make_batch(&schema, &["10.0.0.8"], ts);
+    router
+        .registry()
+        .get_window("auth_events")
+        .unwrap()
+        .append(batch)
+        .unwrap();
+    task.pull_and_advance().await;
+
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "intermediate targets must not emit sink alerts"
+    );
+
+    let push = down_rx
+        .try_recv()
+        .expect("round-robin 订阅者必须收到投递（裁剪不等于不投递）");
+    assert!(
+        push.events.is_none(),
+        "RoundRobin-only 订阅必须裁剪为 batch-only：events 物化是分片积压内存主因"
+    );
+    let batch = push
+        .batch
+        .as_ref()
+        .expect("batch-only 投递必须携带 raw batch，否则下游无数据可读");
+    assert_eq!(
+        batch.num_rows(),
+        1,
+        "投递内容仍须完整（1 行输入 → 1 行中间窗）"
+    );
+    // 载荷可用性：下游按列名读得到 yield 字段（列式消费路径的前提）。
+    assert!(
+        batch.schema().index_of("sip").is_ok(),
+        "中间窗 batch 必须含 yield 列 sip"
+    );
+}

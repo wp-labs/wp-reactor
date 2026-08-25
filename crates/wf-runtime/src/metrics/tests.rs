@@ -112,7 +112,9 @@ fn snapshot_stats_over_limit_drains() {
     // 导出记录带 `stats_over_limit_total` 名。
     let records = snap.to_records();
     assert!(records.iter().any(|r| {
-        r.fields.iter().any(|(k, v)| k == "name" && v == "stats_over_limit_total")
+        r.fields
+            .iter()
+            .any(|(k, v)| k == "name" && v == "stats_over_limit_total")
             && r.fields.iter().any(|(k, v)| k == "label" && v == "r1")
             && r.fields.iter().any(|(k, v)| k == "value" && v == "5")
     }));
@@ -405,9 +407,7 @@ fn parse_inflight_gauges_are_exported() {
     let find = |recs: &Vec<MetricsRecord>, stage: &str, name: &str| -> Option<String> {
         recs.iter()
             .find(|r| {
-                r.fields
-                    .iter()
-                    .any(|(k, v)| k == "stage" && v == stage)
+                r.fields.iter().any(|(k, v)| k == "stage" && v == stage)
                     && r.fields.iter().any(|(k, v)| k == "name" && v == name)
             })
             .and_then(|r| {
@@ -439,5 +439,45 @@ fn parse_inflight_gauges_are_exported() {
         find(&recs, "parse", "budget_bytes").as_deref(),
         Some("8000"),
         "provider 装入后 budget 必须反映读数"
+    );
+}
+
+/// `window.allocated_bytes` / `mailbox_inflight_bytes` 指标必须被导出（2026-08-25
+/// 在途量分账）。
+///
+/// 为何需要：这两个 gauge 是内存分账的账目项；若采样或记录名静默失效，分账脚本
+/// 会读到 0 并把该阶段"误判为已排除"——本 session 正因分析脚本键名写错，白白
+/// 得出过一次「parse 预算 = 0」的错结论。
+#[test]
+fn window_memory_accounting_gauges_are_exported() {
+    let metrics = RuntimeMetrics::new(
+        &["r1".to_string()],
+        &["w1".to_string()],
+        &[],
+        BTreeMap::new(),
+    );
+    let recs = metrics.snapshot().to_records();
+    let has = |recs: &Vec<MetricsRecord>, stage: &str, name: &str, label: &str| -> bool {
+        recs.iter().any(|r| {
+            r.fields.iter().any(|(k, v)| k == "stage" && v == stage)
+                && r.fields.iter().any(|(k, v)| k == "name" && v == name)
+                && r.fields.iter().any(|(k, v)| k == "label" && v == label)
+        })
+    };
+    assert!(
+        has(&recs, "window", "memory_bytes", "w1"),
+        "content 口径（驱逐/mailbox 预算）必须导出"
+    );
+    assert!(
+        has(&recs, "window", "allocated_bytes", "w1"),
+        "实际引用字节口径必须导出（与 content 交叉校验，防止'低估'类误判）"
+    );
+    assert!(
+        has(&recs, "window", "mailbox_inflight_bytes", "w1"),
+        "mailbox 在途必须导出（该阶段的排除结论依赖它）"
+    );
+    assert!(
+        has(&recs, "window", "mailbox_budget_bytes", "w1"),
+        "mailbox 预算容量必须导出（已用/容量成对才可判断是否为约束）"
     );
 }
