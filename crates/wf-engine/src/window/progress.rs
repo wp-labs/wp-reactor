@@ -101,6 +101,29 @@ impl WindowProgress {
             .unwrap_or(u64::MAX)
     }
 
+    /// Maximum acked position over all live consumers.
+    ///
+    /// `0` when no consumer is alive. This is the **completion** signal:
+    /// `max_acked >= next_seq` means every batch has been acked by *some*
+    /// consumer. For a single (or pull) consumer it equals `min_acked`; for a
+    /// whole-batch round-robin sharded push consumer each shard only acks its
+    /// own batches (`seq % N == shard`), so `min_acked` stalls at the laggard
+    /// shard's last batch and can never reach `next_seq` — completion must be
+    /// judged on `max_acked` (2026-08-25 q13 卡尾：哨兵排空判定 + bench
+    /// acked_lag 用 min_acked 永不归零，30M/100M 挂死等超时）。驱逐保护
+    /// **仍用** [`Self::min_acked`]（未读不驱逐）；`max_acked` 只回答"是否
+    /// 全部消费完"。
+    pub fn max_acked(&self) -> u64 {
+        self.slots
+            .read()
+            .expect("progress lock poisoned")
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .map(|slot| slot.load(Ordering::Acquire))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Register a retention pin (D4), starting **fully pinned** (`i64::MIN`).
     ///
     /// Fail-safe initial value: a reader that has just registered has not
@@ -169,6 +192,33 @@ mod tests {
 
         b.store(20, Ordering::Release);
         assert_eq!(progress.min_acked(), 10);
+    }
+
+    /// 完成信号：round-robin 分片消费者每个 shard 只 ack 自己的批次，
+    /// `min_acked` 恒停在最慢 shard 最后一批（q13 分片卡尾），完成判定必须
+    /// 用 `max_acked`（每个批次都被其归属消费者消费）。驱逐保护仍用 min。
+    #[test]
+    fn max_acked_tracks_completion_across_shards() {
+        let progress = WindowProgress::new();
+        // 无消费者：min=MAX（全部可驱逐），max=0（无消费进度）
+        assert_eq!(progress.max_acked(), 0);
+
+        // 10 个 round-robin shard，各 ack 自己份额的最后一批（如 q13b：
+        // next_seq=255，最慢 shard 最后一批 245 → min=246）
+        let mut slots = Vec::new();
+        for i in 0..10u64 {
+            let slot = progress.register();
+            slot.store(246 + i, Ordering::Release);
+            slots.push(slot); // 持有强引用（Weak 表只在强引用存活时计数）
+        }
+        assert_eq!(progress.min_acked(), 246, "min = 最慢 shard 最后一批+1");
+        assert_eq!(progress.max_acked(), 255, "max = 最快 shard 追平 next_seq");
+
+        // 全部追平：min == max == next_seq
+        let all = progress.register();
+        all.store(256, Ordering::Release);
+        slots.push(all);
+        assert_eq!(progress.max_acked(), 256);
     }
 
     #[test]

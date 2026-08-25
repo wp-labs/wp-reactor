@@ -637,26 +637,55 @@ pub(super) fn spawn_rule_tasks(
                 let deferred_shardable = deferred
                     && plan.match_plan.key_join.is_none()
                     && !match_consumed_targets.contains(&target);
-                // 2026-08-23 q13：bind **中间管道窗口**（上游 yield 的中间窗口）的
-                // each 规则不分片——round-robin 分片 + 独立 pull 光标下，下游消费
-                // 滞后于 pipe append（shutdown 时只消化部分批次，q13b 10M 只处理
-                // ~40%、EMIT 不足）；单 worker 顺序消费保证全量。
+                // bind **中间管道窗口**（上游 yield 的中间窗口）的 each 规则：
+                // - 2026-08-23 起强制单 worker（push 广播订阅）——当时的 round-robin
+                //   分片走 **pull 光标**，下游独立游标消费滞后于 pipe append（shutdown
+                //   时只消化部分批次，q13b 10M 只处理 ~40%、EMIT 不足）。
+                // - 2026-08-25 q13 分片：**push 模式 round-robin** 没有该竞态——flush_pipes
+                //   广播带真实窗口 seq，每个批次**恰一次**投递到唯一 shard 通道（无共享
+                //   游标、无重复、无漏投），stateless each 跨批乱序无害；有界通道背压
+                //   传导到上游（q13a → bid_events），内存有界。安全条件：规则非 deferred
+                //   （挂起队列是 per-task 状态）、且其输出目标不被 Match 状态机消费
+                //   （下游保序敏感）。
                 let consumes_intermediate = plan
                     .binds
                     .iter()
                     .any(|b| intermediate_targets.contains(&b.window));
+                let intermediate_shard_safe = consumes_intermediate
+                    && !deferred
+                    && !match_consumed_targets.contains(&target);
+                // **yield 中间管道窗口**（本规则是上游生产者）的 each 规则：
+                // - 2026-08-23 起强制单 worker（下游保序——中间窗可能被 Match
+                //   状态机消费，乱序破坏语义）；
+                // - 2026-08-25 q13 放开：当该中间窗**无 Match 消费者**（
+                //   `match_consumed_targets` 不含 target）且本规则非 deferred 时，
+                //   下游（stateless each / stats 可交换聚合）容忍批次乱序——
+                //   q13a 由此 10 shard 并行生产 bid_mod（100M q13 瓶颈：q13b
+                //   分片后 q13a 单 worker ~630k/s 卡全链）。乱序 append 的
+                //   安全网：窗口 watermark 单调 fetch_max、时间驱逐仍受
+                //   min_acked 未读保护、push 消费者 ack 改 fetch_max。
+                let yields_intermediate = intermediate_targets.contains(&target);
+                let intermediate_producer_shard_safe = yields_intermediate
+                    && !deferred
+                    && !match_consumed_targets.contains(&target);
                 let shardable = shard_count > 1
-                    && !consumes_intermediate
-                    && (!intermediate_targets.contains(&target) || deferred_shardable)
+                    && (!consumes_intermediate || intermediate_shard_safe)
+                    && (!yields_intermediate || intermediate_producer_shard_safe)
                     && (!deferred || deferred_shardable);
+                // 中间窗消费者的投递必须是 push（广播直接投递；pull+Notify 有
+                // append/等待时序竞态，见 2026-08-23 注释）——分片版走 round-robin
+                // 订阅，单 worker 版走单 sender 广播订阅。
+                let wants_push = use_push || consumes_intermediate;
 
                 if shardable {
                     let mut shard_txs = Vec::with_capacity(shard_count);
                     for shard_idx in 0..shard_count {
-                        // Push mode only: create the delivery channel. Pull mode
-                        // carries no channel — the task pulls the shared window
-                        // log directly (whole-batch round-robin gated by seq).
-                        let push_rx = if use_push {
+                        // Push mode only (or intermediate-window consumers, which
+                        // are always push — see `wants_push`): create the delivery
+                        // channel. Pull mode carries no channel — the task pulls
+                        // the shared window log directly (whole-batch round-robin
+                        // gated by seq).
+                        let push_rx = if wants_push {
                             let (push_tx, push_rx) =
                                 mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                             shard_txs.push(push_tx);
@@ -689,7 +718,7 @@ pub(super) fn spawn_rule_tasks(
                             async move { run_rule_task(task_config).await },
                         ));
                     }
-                    if use_push {
+                    if wants_push {
                         for source in &window_sources {
                             router
                                 .fanout()
@@ -701,7 +730,8 @@ pub(super) fn spawn_rule_tasks(
                     // 广播订阅）——flush_pipes 的 broadcast_with_batch 直接投递，
                     // 规避 pull+Notify 的通知竞态（append 与 wait 时序错位时下游
                     // 消费停滞：q13b 只处理已拉取批次，EMIT 严重不足）。广播带
-                    // seq=u64::MAX，process_push 的 ack 有 saturating 处理。
+                    // **真实窗口批次 seq**（2026-08-23 修），process_push 的 ack
+                    // 反映真实消费进度（saturating 防 MAX+1 回绕）。
                     let push_rx = if use_push || consumes_intermediate {
                         let (push_tx, push_rx) = mpsc::channel::<RulePush>(RULE_CHANNEL_CAPACITY);
                         for source in &window_sources {

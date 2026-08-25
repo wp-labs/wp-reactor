@@ -1267,3 +1267,65 @@ over=30m 真正成为纯内存参数：三档全部 oracle 精确，100M RSS 17.
   准确化（i64::MAX = 窗口不存在；无时间列窗返回 i64::MIN 走挂起分支，deferred
   目标必有时间列故不可达）。
 - 回归：30M 1,672,559 ✓ + 6.7GB；100M 5,576,436 ✓ + 8.7GB（review 改动无损）。
+
+## 2026-08-25 M-13 q13 分片根治（max_acked 完成信号 + 生产/消费双分片）— 进行中
+
+### 背景
+M-13（100M q13 RSS 27GB + memory_evicted 1479）进入解决。探针/采样/基准逐层定位（非猜测）。
+
+### 关键结论
+1. **「丢数据」是误报**：1479 次 memory_evicted 全部是已读回收（min_acked 未读保护契约正常，
+   双链测试钉死）。q13 真问题是慢 + 内存。
+2. **q13b 单 worker 是性能墙**（~400k EPS，CPU 单核）：2026-08-23 保守规则「bind 中间窗的
+   each 强制单 worker」在 push 模式下不必要——广播带真实窗口 seq、每批恰一次投递。
+3. **卡尾 9 批（哨兵永不触发、bench 挂死）根因 = ack 语义**：round-robin 分片下每 shard 只
+   ack 自己的批次，`min_acked` 恒停在最慢 shard 最后一批（next_seq=255 时 min=246），哨兵
+   排空判定 `min_acked >= next_seq` 永不成立。修复 = **完成信号用 `max_acked`，驱逐保护仍用
+   `min_acked`**（两用途分离）。
+4. **q13a 分片后新瓶颈解除**：EPS 390k → 1.04M（2.7×）、CPU 10.9 核。
+
+### 实测（哨兵 EPS，本地 mac，over=30m 配置）
+| 规模 | 修前 | q13b 分片 | +q13a 分片 |
+|------|------|-----------|------------|
+| 30M | 400k / 15.4GB | 642k / 9.1GB | — |
+| 100M | 390k / 27.1GB | 630k / 14.5GB | 1.04M / 41.5GB（RSS 问题，见下）|
+
+输出完整性：30M 27.6M = oracle ✓；100M 91.67M（100M×91.7% bid 口径）✓；sink dispatch 全量 ✓。
+
+### ⚠ 遗留（未解决，下一步）
+1. **100M RSS 41.5GB（q13a 分片后）**：window_bytes 峰值 20.5GB = ingest 期间（33s，事件时间
+   跨度仅 ~10min < over=30m）bid_events 时间驱逐不触发 → 100M 行全量驻留（~20GB），drain 后
+   回落 3.8GB 稳态。**over 语义 × ingest 速度的固有内容，非泄漏**。候选：接受 peak（稳态有界）
+   或 ingest 期放宽/预驱逐。RSS_peak 超 10GB 目标。
+2. **memory_evicted_total=188 仍非零**（100M）：bench 作废判定。确认全为已读回收后考虑豁免。
+3. **q13a 分片 pull 的 ack 语义隐患**：分片下 ack 读位置（new_cursor=全部）→ min_acked 追平 →
+   bid_events 驱逐无未读保护 → cap 驱逐可能删「他 shard 未处理」批次。消费快未触发，但语义
+   竞态存在。修复方向：分片 pull ack 只推进「自己份额连续处理完的位置」或驱逐 floor 按归属。
+4. **q13b 列式化**（fmt 在 join 路径的 columnar gate 拒绝 → row path）：q13b 现仍 row path；
+   列式 join 富化支持 fmt 右窗字段可再提（460ns vs 2.5µs/行）。
+
+### 测试（全部通过）
+- q13_dual_chain_sharded_push_consumption_complete（3 shard 完整 + 未读保护）
+- q13_dual_chain_sharded_push_high_slope_repro（10 shard 紧通道背压 70 批全量）
+- q13_dual_chain_sharded_producer_and_consumer（2 生产者乱序 + 3 消费者 60/60）
+- max_acked_tracks_completion_across_shards（min 停滞 / max 追平语义）
+- wf-runtime 540 / wf-engine 1137 / clippy 0
+
+### 未提交改动
+- wf-engine: progress.rs（+max_acked）
+- wf-runtime: perf_diag.rs（哨兵排空 min→max）、metrics/sampling.rs（acked_lag min→max）、
+  rule_task.rs（process_push ack fetch_max）、spawn.rs（q13b 消费 + q13a 生产中间窗分片放开）、
+  deferred_integration_tests.rs（+3）
+- 探针已全部清理（probe_window_memory / probe-rr / probe-push / probe-pb / probe-bc / probe-new）
+
+### Pitfalls（本段新增）
+- **drain 口径指标**：`emitted_total`/`dispatch_total`/`sweeps_total` 等 _total 指标是每 100ms
+  drain（读后清零）的增量——加起来才是总量，单看会误判「停更=卡死」（本 session 两次误判）。
+- **macOS sample 深度截断**：忙线程栈只到 tokio blocking-pool 层；lldb attach 被系统拒绝。
+  定位靠分段探针（broadcast 前/后、append DONE、process_batch START/DONE）而非采样。
+- **「卡死」要先排除任务已正常结束**：q13a 处理完最后批次后 park 在 notified() 是正常态；
+  卡尾判定要看 ack_lag 是否归零 + 哨兵是否触发，而不是「探针日志停了」。
+- **round-robin 分片 + min_acked 完成判定结构性不兼容**：min_acked 是驱逐 floor（保守），
+  max_acked 才是完成信号——两用途必须分离。
+- **探针会拖慢生产路径改变卡点位置**（run6 探针过重，卡点偏移）：定位用最小探针，跑真数据
+  前清理。

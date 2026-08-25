@@ -432,12 +432,13 @@ pub(crate) async fn run_sentinel_task(config: SentinelTaskConfig) -> RuntimeResu
     Ok(())
 }
 
-/// 等待所有数据窗排空：每个窗口的 `min_acked`（规则消费进度）追平 `next_seq`
-/// （已追加批次）。无消费者的窗口视为已排空；哨兵窗自身除外。
+/// 等待所有数据窗排空：**全部批次已被消费**。单消费者用 `min_acked`（追平
+/// `next_seq`）即可；whole-batch round-robin 分片消费者每个 shard 只 ack
+/// 自己的批次（`seq % N == shard`），`min_acked` 恒停在最慢 shard 的最后一批
+/// 永远追不平（2026-08-25 q13 分片卡尾）——排空判定用 `max_acked`（每个批次
+/// 都被其归属 shard 消费 = 排空）。驱逐保护仍用 `min_acked`（未读不驱逐）。
 ///
-/// 哨兵帧提交后规则仍在异步消费——直接 emit 会把"提交完成"当成"处理完成"
-/// （100k 小批量实测 full 档读数 10.9M 假象）。排空等待让 EPS 四元组反映真实
-/// 处理吞吐，跨档一致（增量 T1(k)−T1(k−1) 的墙归属不变）。
+/// 无消费者的窗口视为已排空；哨兵窗自身除外。
 async fn wait_for_data_drain(router: &Arc<Router>, cancel: &CancellationToken) {
     loop {
         let drained = router.registry().window_names().iter().all(|name| {
@@ -449,7 +450,9 @@ async fn wait_for_data_drain(router: &Arc<Router>, cancel: &CancellationToken) {
             };
             let next = win.next_seq();
             match router.registry().progress(name) {
-                Some(progress) => progress.min_acked() >= next,
+                Some(progress) => {
+                    progress.max_acked() >= next || progress.min_acked() >= next
+                }
                 None => true, // 无消费者 → 已排空
             }
         });

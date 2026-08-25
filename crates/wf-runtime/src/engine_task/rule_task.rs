@@ -686,6 +686,9 @@ impl RuleTask {
             new_cursor,
         ) in pending
         {
+            // 分片（round-robin）下本 shard 最后处理的批次 seq——ack 用它而非
+            // 读位置（见下方 ack 注释）。
+            let mut last_processed: Option<u64> = None;
             for (batch_index, batch) in batches.iter().enumerate() {
                 let batch_seq = first_batch_seq + batch_index as u64;
                 let shard_rows = shard_rows_per_batch
@@ -730,19 +733,30 @@ impl RuleTask {
                     materialize_fields.as_deref(),
                 )
                 .await;
+                last_processed = Some(batch_seq);
             }
-            // Ack the READ position (`new_cursor`) — the shared-log cursor this
-            // task just advanced to — rather than only the last batch it
-            // *processed*. For key-partitioned rules every pulled batch is
-            // processed so this equals `next_seq` when drained; for whole-batch
-            // round-robin (on-each) each batch is owned by exactly one shard, so
-            // acking the read position is what lets `min_acked` reach `next_seq`
-            // once every shard has pulled the shared log — the true "rules
-            // drained" signal. The cross-shard `min_acked` remains the eviction
-            // floor: a slow shard still holds the floor below any batch it has
-            // not yet read, so no owned batch is ever evicted early.
+            // Ack 语义（2026-08-25 q13a 分片隐患修复）：
+            // - 非分片 / key-partitioned：ack **读位置**（`new_cursor`）——
+            //   本任务处理全部（行子集）批次，读 = 处理。
+            // - whole-batch round-robin 分片：ack **处理位置**（本 shard 份额内
+            //   最后处理批次 + 1）。旧代码 ack 读位置（= 全部批次）会让
+            //   `min_acked` 追平 `next_seq` → `bid_events` 驱逐无未读保护 →
+            //   cap/时间驱逐可能删掉**其他 shard 尚未处理**的批次（cursor gap
+            //   静默丢数据，q13a 分片后消费快未触发、语义竞态存在）。处理位置
+            //   ack 下，未处理批次恒受 `min_acked` 保护（不丢）；已处理批次
+            //   在 cap 超限时正常回收（最慢 shard 推进则 floor 推进）。
+            //   `max_acked` 完成信号不受影响：全部批次处理完 = 每 shard 处理到
+            //   自己的最后一批 → max = next_seq。`fetch_max` 与 push 路径一致
+            //   （乱序防御，单调）。
             if let Some(slot) = self.progress.get(&window) {
-                slot.store(new_cursor, std::sync::atomic::Ordering::Release);
+                let ack = if key_partitioned || self.shard_count <= 1 {
+                    new_cursor
+                } else {
+                    // 本轮无自己份额（全是别人批次）：ack 不推进（fetch_max(0)
+                    // 对已有值无影响）。
+                    last_processed.map(|seq| seq + 1).unwrap_or(0)
+                };
+                slot.fetch_max(ack, std::sync::atomic::Ordering::Release);
             }
         }
         self.update_rule_instances_metric();
@@ -1912,11 +1926,13 @@ impl RuleTask {
         )
         .await;
         // Ack the window batch seq so time eviction may reclaim it (the
-        // `seq` above is only a per-task debug counter).
+        // `seq` above is only a per-task debug counter). `fetch_max`:
+        // 2026-08-25 q13 中间窗生产者分片后，广播按 append 顺序仍单调，但
+        // 并发生产者（多 q13a shard）会让不同 shard 的广播 seq 乱序到达
+        // 同一消费者——覆盖写会让 ack 回退（min_acked 倒退、驱逐保护失效的
+        // 假象），单调 max 保证 ack 只前进。
         if let Some(slot) = self.progress.get(window_name.as_ref()) {
-            // saturating: relay pushes carry seq = u64::MAX (no window batch
-            // behind them) — MAX + 1 would overflow and wrap to 0.
-            slot.store(
+            slot.fetch_max(
                 push_seq.saturating_add(1),
                 std::sync::atomic::Ordering::Release,
             );
@@ -4338,6 +4354,9 @@ mod rule_task_coverage;
 #[cfg(test)]
 #[path = "rule_task_coverage_more.rs"]
 mod rule_task_coverage_more;
+#[cfg(test)]
+#[path = "rule_task_bench.rs"]
+mod rule_task_bench;
 #[cfg(test)]
 mod rule_task_key_join_tests;
 #[cfg(test)]
