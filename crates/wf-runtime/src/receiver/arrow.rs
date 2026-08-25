@@ -67,6 +67,22 @@ pub(crate) fn decode_ipc_trusted(
     Ok((tag, batch))
 }
 
+/// 只读帧头 tag（前 4 字节长度 + tag 字节）——**不解码 body**。perf-diag
+/// cut_recv 档用: 非哨兵帧只判流名即丢, 避免单线程 decode 的字节率墙
+/// （validate_utf8 ~2.3GB/s 单连接上限）把「纯 TCP 接收」混进来。与
+/// [`decode_ipc_trusted`] 的 tag 提取字节级一致。
+pub(crate) fn frame_tag(data: &[u8]) -> Option<String> {
+    if data.len() < 4 {
+        return None;
+    }
+    let tag_len = u32::from_be_bytes(data[0..4].try_into().ok()?) as usize;
+    let tag_end = 4 + tag_len;
+    if data.len() < tag_end {
+        return None;
+    }
+    String::from_utf8(data[4..tag_end].to_vec()).ok()
+}
+
 /// Replay framed `wp_arrow` IPC records from file and route them into the
 /// runtime.
 #[allow(clippy::too_many_arguments)]

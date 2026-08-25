@@ -151,6 +151,18 @@ impl DataSourceBatchSource {
                 let mut batches = Vec::new();
                 for event in &events {
                     let bytes = event.payload.as_bytes();
+                    // perf-diag cut_recv 门控: 只读帧头 tag 识别哨兵流——非哨兵
+                    // 帧 body **不解码即丢**（测「注入 + TCP 接收」字节率, 隔离
+                    // 单线程 decode 的 ~2.3GB/s validate_utf8 墙）。哨兵帧走原
+                    // 路径（测量协议必须活）。tag 无法识别时保守走原路径。
+                    if crate::perf_diag::perf_cut_recv() {
+                        match crate::receiver::arrow::frame_tag(bytes) {
+                            Some(tag) if tag != crate::perf_diag::PERF_SENTINEL_STREAM => {
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     match crate::receiver::arrow::decode_ipc_trusted(bytes) {
                         Ok((tag, batch)) => {
                             self.batch_tags.push_back(Some(tag));
@@ -301,6 +313,7 @@ fn map_wp_error(err: wp_connector_api::SourceError) -> SourceError {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::await_holding_lock)] // perf-diag cut_recv 测试跨 await 持全局锁
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -552,6 +565,87 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 1);
         assert_eq!(bs.pending_stream_tag(), Some("syslog"));
         assert_eq!(bs.next_stream_tag().as_deref(), Some("syslog"));
+    }
+
+    #[tokio::test]
+    async fn cut_recv_skips_non_sentinel_frame_body() {
+        // perf-diag cut_recv 门控: 非哨兵帧只读帧头 tag 即丢（不解码 body）——
+        // 测纯 TCP 接收字节率; 哨兵帧正常解码（测量协议必须活）。全局门控跨
+        // await 持锁（PERF_CUT_SERIAL）, 避免并行测试污染。
+        let _g = crate::perf_diag::PERF_CUT_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sc = schema();
+        let rb = |n: i64| {
+            RecordBatch::try_new(
+                sc.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["x"])),
+                    Arc::new(Int64Array::from(vec![n])),
+                ],
+            )
+            .unwrap()
+        };
+        let syslog = wp_arrow::ipc::encode_ipc("syslog", &rb(1)).unwrap();
+        let sentinel =
+            wp_arrow::ipc::encode_ipc(crate::perf_diag::PERF_SENTINEL_STREAM, &rb(2)).unwrap();
+        let mk_src = |frames: Vec<SourceEvent>| {
+            DataSourceBatchSource::new(
+                "framed",
+                Box::new(VecSource {
+                    id: "framed".into(),
+                    batches: vec![frames],
+                    idx: 0,
+                }),
+                Arc::new(Schema::empty()),
+                WireFormat::ArrowFramed,
+                empty_window_schemas(),
+                crate::receiver::DEFAULT_STREAM_TAG_FIELD,
+                false,
+            )
+        };
+        // 未切: 两帧都解码（syslog + sentinel）。
+        let mut bs = mk_src(vec![
+            SourceEvent::new(
+                0,
+                "test",
+                RawData::Bytes(syslog.clone().into()),
+                Arc::new(Tags::new()),
+            ),
+            SourceEvent::new(
+                0,
+                "test",
+                RawData::Bytes(sentinel.clone().into()),
+                Arc::new(Tags::new()),
+            ),
+        ]);
+        let batches = bs.receive_batch().await.unwrap();
+        assert_eq!(batches.len(), 2, "未切: 全部解码");
+
+        // 切: 只解码哨兵帧（syslog 帧 body 即丢）。
+        crate::perf_diag::set_perf_cuts(false, false, false, true);
+        let mut bs = mk_src(vec![
+            SourceEvent::new(
+                0,
+                "test",
+                RawData::Bytes(syslog.into()),
+                Arc::new(Tags::new()),
+            ),
+            SourceEvent::new(
+                0,
+                "test",
+                RawData::Bytes(sentinel.clone().into()),
+                Arc::new(Tags::new()),
+            ),
+        ]);
+        let batches = bs.receive_batch().await.unwrap();
+        assert_eq!(batches.len(), 1, "cut_recv: 非哨兵帧 body 即丢");
+        assert_eq!(
+            bs.next_stream_tag().as_deref(),
+            Some(crate::perf_diag::PERF_SENTINEL_STREAM),
+            "哨兵帧正常解码"
+        );
+        crate::perf_diag::reset_perf_diag();
     }
 
     #[tokio::test]

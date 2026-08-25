@@ -39,6 +39,10 @@ pub struct PerfStage {
     /// 哨兵流豁免——测量协议必须活）。
     #[serde(default)]
     pub cut_append: bool,
+    /// 本档生效期间：禁止解码（只读帧头 tag 识别哨兵, 非哨兵帧 body 即丢——
+    /// 测「注入 + TCP 接收」字节率; 哨兵流豁免）。
+    #[serde(default)]
+    pub cut_recv: bool,
     /// 规则子集文件路径（相对 work-dir）。空 = 保持当前规则；非空且与当前
     /// 不同 → 触发既有 `runtime.rules` 热 reload（HotReloadSupported）。
     #[serde(default)]
@@ -180,6 +184,7 @@ rules = "models/rules/c_family.wfl"
                 cut_rules: true,
                 cut_output: true,
                 cut_append: false,
+                cut_recv: false,
                 rules: None,
             }],
         };
@@ -194,6 +199,7 @@ rules = "models/rules/c_family.wfl"
                 cut_rules: false,
                 cut_output: false,
                 cut_append: true,
+                cut_recv: false,
                 rules: None,
             }],
         };
