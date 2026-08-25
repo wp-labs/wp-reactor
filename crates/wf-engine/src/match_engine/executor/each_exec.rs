@@ -643,9 +643,9 @@ impl RuleExecutor {
                 continue;
             }
             builder.commit_each_row(EachRowCells {
-                wfx_id,
+                wfx_id: SmolStr::from(wfx_id),
                 score,
-                entity_id,
+                entity_id: SmolStr::from(entity_id),
                 fired_at,
                 rule_name: &statics.rule_name,
                 entity_type: &statics.entity_type,
@@ -1184,9 +1184,9 @@ impl RuleExecutor {
         // them once at the end (see function-level doc). Cell staging still runs
         // through the builder (same validation+export); only the final column
         // push is batched.
-        let mut wfx_ids: Vec<String> = Vec::new();
+        let mut wfx_ids: Vec<SmolStr> = Vec::new();
         let mut scores: Vec<f64> = Vec::new();
-        let mut entity_ids: Vec<String> = Vec::new();
+        let mut entity_ids: Vec<SmolStr> = Vec::new();
         let mut fired_ats: Vec<String> = Vec::new();
         // `Vec<(usize, DataType, ModelValue)>` — one row of staged yield cells
         // per segment row, drained via `builder.take_staged()`. Inferred here.
@@ -1424,7 +1424,7 @@ impl RuleExecutor {
             // per-row). Commit all rows once after the loop.
             wfx_ids.push(wfx_id);
             scores.push(score);
-            entity_ids.push(entity_id);
+            entity_ids.push(SmolStr::from(entity_id));
             fired_ats.push(fired_at);
             staged_rows.push(builder.take_staged());
             if let Some(t) = t_commit {
@@ -1894,13 +1894,15 @@ impl RuleExecutor {
             }
         }
 
-        // -- 输出构建（复用无 join 列式模式：L3 批量提交）----------------
+        // -- 输出构建（复用无 join 列式模式；2026-08-26 改为**逐行 commit**）----
+        // 此前：5 个中转 Vec（wfx_ids/scores/entity_ids/fired_ats/staged_rows）
+        // 累积整批后 `commit_each_rows_batch`——该批式提交会**二次拷贝**
+        // （`extend_from_slice` clone 每行 3 个 String + staged cell clone）。
+        // 行式路径（`execute_each_direct`）一直用 `commit_each_row`（owned String
+        // move、零拷贝）；等价性由
+        // `commit_each_rows_batch_matches_repeated_commit_each_row` 守护。
+        // 这是 q13b 输出链内存的 per-row 分配 churn 的一部分（2026-08-26 定位）。
         let wfx_prefix = EachWfxPrefix::new(&self.plan.name);
-        let mut wfx_ids: Vec<String> = Vec::new();
-        let mut scores: Vec<f64> = Vec::new();
-        let mut entity_ids: Vec<String> = Vec::new();
-        let mut fired_ats: Vec<String> = Vec::new();
-        let mut staged_rows: Vec<Vec<_>> = Vec::new();
 
         // 批级解析 Left（驱动列）字段的列 index —— 循环内按列名 index_of 是
         // 每行开销；schema 批内共享（batch0）。
@@ -1916,6 +1918,34 @@ impl RuleExecutor {
         let entity_left_idx: Option<usize> = match &entity_src {
             Some(FieldSrc::Left(f)) => resolve_left(f),
             _ => None,
+        };
+        // entity 列直读（2026-08-26 移植无 join 列式路径的 `EntityCol`）：
+        // q13b 的 `entity(digit, m.bidder)` 是 Left Int64——原实现每行走
+        // `event.value_at` → `Value::Number(f64)` → `value_to_string`（SmolStr
+        // + 浮点 format，27.6M 行的 per-row 分配 churn 之一）。直读 Int64 列用
+        // `write_int64_value` 直写 String（整数格式化，无 Value/SmolStr 中转）。
+        let entity_col: EntityCol<'_> = match (entity_left_idx, batch0) {
+            (Some(idx), Some(b)) => {
+                let schema = b.schema();
+                let field = schema.field(idx);
+                let col = b.column(idx);
+                match field.data_type() {
+                    DataType::Int64 => col
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .map_or(EntityCol::Generic, |a| EntityCol::I64(I64Col::Int64(a))),
+                    DataType::Timestamp(TimeUnit::Nanosecond, _) => col
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .map_or(EntityCol::Generic, |a| EntityCol::I64(I64Col::TsNanos(a))),
+                    DataType::Utf8 if !crate::match_engine::is_wfl_structured_field(field) => col
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .map_or(EntityCol::Generic, EntityCol::Utf8),
+                    _ => EntityCol::Generic,
+                }
+            }
+            _ => EntityCol::Generic,
         };
 
         // 批级常量 yield 字段注册（同无 join 列式路径）：字面量字段
@@ -2007,19 +2037,49 @@ impl RuleExecutor {
                 stats.rejected += 1;
                 continue;
             }
-            // entity（来源：常量 / 左窗列 / 右窗 JoinRow；缺失 → 空串，同行式）。
-            let entity_id: String = match &entity_const {
-                Some(s) => s.clone(),
+            // entity（来源：常量 / 左窗列直读 / 左窗列通用 / 右窗 JoinRow；
+            // 缺失 → 空串，同行式）。2026-08-26：Left 来源优先列直读
+            // （EntityCol::I64/Utf8——零 Value/SmolStr 中转），仅通用类型回退
+            // `value_at` + `value_to_string`。
+            let entity_id: smol_str::SmolStr = match &entity_const {
+                Some(s) => smol_str::SmolStr::from(s.as_str()),
                 None => match &entity_src {
-                    Some(FieldSrc::Left(_)) => entity_left_idx
-                        .and_then(|eidx| event.value_at(eidx))
-                        .map(|v| value_to_string(&v))
-                        .unwrap_or_default(),
-                    Some(FieldSrc::Right(f)) => matched
-                        .and_then(|r| r.field_value(f))
-                        .map(|v| value_to_string(&v))
-                        .unwrap_or_default(),
-                    None => String::new(),
+                    Some(FieldSrc::Left(_)) => {
+                        let row = event.row();
+                        match &entity_col {
+                            // 2026-08-26：SmolStrBuilder 直写——bidder 等数字
+                            // ≤20 字符落在内联上限（22B），零堆分配（此前 String
+                            // 每行一次堆分配，q13b 27.6M 行的 churn 之一）。
+                            EntityCol::I64(i64col) => match i64col.read(row) {
+                                Some(v) => {
+                                    let mut b = smol_str::SmolStrBuilder::new();
+                                    write_int64_value(&mut b, v);
+                                    b.into()
+                                }
+                                None => smol_str::SmolStr::new(""),
+                            },
+                            EntityCol::Utf8(arr) => {
+                                if arr.is_null(row) {
+                                    smol_str::SmolStr::new("")
+                                } else {
+                                    smol_str::SmolStr::from(arr.value(row))
+                                }
+                            }
+                            EntityCol::Generic => smol_str::SmolStr::from(
+                                entity_left_idx
+                                    .and_then(|eidx| event.value_at(eidx))
+                                    .map(|v| value_to_string(&v))
+                                    .unwrap_or_default(),
+                            ),
+                        }
+                    }
+                    Some(FieldSrc::Right(f)) => smol_str::SmolStr::from(
+                        matched
+                            .and_then(|r| r.field_value(f))
+                            .map(|v| value_to_string(&v))
+                            .unwrap_or_default(),
+                    ),
+                    None => smol_str::SmolStr::new(""),
                 },
             };
             let fired_at = format_nanos_utc(*event_time_nanos);
@@ -2081,28 +2141,21 @@ impl RuleExecutor {
                 stats.failed += 1;
                 continue;
             }
-            wfx_ids.push(wfx_id);
-            scores.push(score_const);
-            entity_ids.push(entity_id);
-            fired_ats.push(fired_at);
-            staged_rows.push(builder.take_staged());
+            // 直连逐行 commit（owned String move 进列，零二次拷贝）。
+            builder.commit_each_row(EachRowCells {
+                wfx_id,
+                score: score_const,
+                entity_id,
+                fired_at,
+                rule_name: &statics.rule_name,
+                entity_type: &statics.entity_type,
+                origin: &statics.each_origin,
+                close_reason: &statics.each_close_reason,
+                emit_time: &emit_time,
+                summary: &summary,
+            });
             stats.appended += 1;
             appended_out.push(idx);
-        }
-        if !wfx_ids.is_empty() {
-            builder.commit_each_rows_batch(
-                &wfx_ids,
-                &scores,
-                &entity_ids,
-                &fired_ats,
-                &statics.rule_name,
-                &statics.entity_type,
-                &statics.each_origin,
-                &statics.each_close_reason,
-                &emit_time,
-                &summary,
-                &staged_rows,
-            );
         }
         stats
     }
@@ -2171,9 +2224,9 @@ impl RuleExecutor {
             Ok(())
         })?;
         builder.commit_each_row(EachRowCells {
-            wfx_id,
+            wfx_id: SmolStr::from(wfx_id),
             score,
-            entity_id,
+            entity_id: SmolStr::from(entity_id),
             fired_at,
             rule_name: &statics.rule_name,
             entity_type: &statics.entity_type,

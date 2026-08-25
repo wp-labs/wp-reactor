@@ -37,6 +37,15 @@ impl RuntimeMetrics {
                 }
                 // 在途量分账（2026-08-25）：该窗 mailbox 已用预算/容量。无 mailbox
                 // （同步模式 / 未注册）则保持 0。
+                // 输出链在途量：fanout 通道排队批数/容量（2026-08-26）。
+                if let Some((q, cap)) = router.fanout().queued_items(&window_name) {
+                    if let Some(v) = self.window_fanout_queued.get(&window_name) {
+                        v.store(q as u64, Ordering::Relaxed);
+                    }
+                    if let Some(v) = self.window_fanout_capacity.get(&window_name) {
+                        v.store(cap as u64, Ordering::Relaxed);
+                    }
+                }
                 if let Some((used, cap)) = router.mailbox_inflight(&window_name) {
                     if let Some(v) = self.window_mailbox_inflight.get(&window_name) {
                         v.store(used as u64, Ordering::Relaxed);

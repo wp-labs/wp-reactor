@@ -164,6 +164,9 @@ pub(crate) struct MetricsSnapshot {
     window_memory_bytes: BTreeMap<String, u64>,
     /// 窗口实际分配字节（会计保真度，2026-08-25）。
     window_allocated_bytes: BTreeMap<String, u64>,
+    /// 每窗 fanout 通道排队批数 / 总容量（输出链在途量，2026-08-26）。
+    window_fanout_queued: BTreeMap<String, u64>,
+    window_fanout_capacity: BTreeMap<String, u64>,
     /// 每窗 mailbox 在途字节（已用预算）——在途量可观测性（2026-08-25）。
     window_mailbox_inflight: BTreeMap<String, u64>,
     /// 每窗 mailbox 预算容量。
@@ -406,6 +409,15 @@ impl MetricsSnapshot {
         // 作用是持续证明 content 口径没有系统性低估。
         for (window, v) in &self.window_allocated_bytes {
             out.push(metric("window", "allocated_bytes", window, *v));
+        }
+        // 输出链在途量（2026-08-26）：规则分片通道排队批数/容量。diag 墙梯把
+        // q13 的 12.5GB 增量定位到输出链，而窗口会计只解释 4.1GB——这两个 gauge
+        // 判断"分片通道是否接近满"（10 分片 × 256 槽 × 3.45MB ≈ 8.8GB 满队）。
+        for (window, v) in &self.window_fanout_queued {
+            out.push(metric("window", "fanout_queued_batches", window, *v));
+        }
+        for (window, v) in &self.window_fanout_capacity {
+            out.push(metric("window", "fanout_capacity_batches", window, *v));
         }
         // 在途量分账（2026-08-25）：每窗 mailbox 已用预算 + parse pool 预读预算。
         // ❗ mailbox 在途与 `memory_bytes` **可能重叠**（Arrow 缓冲经 Arc 共享：
@@ -806,6 +818,9 @@ pub struct RuntimeMetrics {
     evictor_memory_evicted_total: AtomicU64,
 
     window_memory_bytes: BTreeMap<String, AtomicU64>,
+    /// 每窗 fanout 通道排队批数 / 总容量（输出链在途量，2026-08-26）。
+    window_fanout_queued: BTreeMap<String, AtomicU64>,
+    window_fanout_capacity: BTreeMap<String, AtomicU64>,
     /// 窗口**实际分配**字节（`Window::allocated_usage`）——`memory_bytes` 是逻辑
     /// 内容口径（不含 bitmap/offsets）；内存分账用这个交叉校验。
     window_allocated_bytes: BTreeMap<String, AtomicU64>,
@@ -1005,6 +1020,8 @@ impl RuntimeMetrics {
             evictor_memory_evicted_total: AtomicU64::new(0),
             window_memory_bytes: make_window_map(),
             window_allocated_bytes: make_window_map(),
+            window_fanout_queued: make_window_map(),
+            window_fanout_capacity: make_window_map(),
             window_mailbox_inflight: make_window_map(),
             window_mailbox_budget: make_window_map(),
             parse_inflight_bytes: AtomicU64::new(0),
@@ -1414,6 +1431,8 @@ impl RuntimeMetrics {
             evictor_memory_evicted: self.drain_counter(&self.evictor_memory_evicted_total),
             window_memory_bytes: self.read_map(&self.window_memory_bytes),
             window_allocated_bytes: self.read_map(&self.window_allocated_bytes),
+            window_fanout_queued: self.read_map(&self.window_fanout_queued),
+            window_fanout_capacity: self.read_map(&self.window_fanout_capacity),
             window_mailbox_inflight: self.read_map(&self.window_mailbox_inflight),
             window_mailbox_budget: self.read_map(&self.window_mailbox_budget),
             parse_inflight_bytes: self.parse_inflight_bytes.load(Ordering::Relaxed),

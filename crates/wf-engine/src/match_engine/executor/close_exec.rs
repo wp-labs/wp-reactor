@@ -458,9 +458,9 @@ impl RuleExecutor {
 
         builder.reserve_rows(closes.len());
 
-        let mut wfx_ids: Vec<String> = Vec::with_capacity(closes.len());
+        let mut wfx_ids: Vec<SmolStr> = Vec::with_capacity(closes.len());
         let mut scores: Vec<f64> = Vec::with_capacity(closes.len());
-        let mut entity_ids: Vec<String> = Vec::with_capacity(closes.len());
+        let mut entity_ids: Vec<SmolStr> = Vec::with_capacity(closes.len());
         let mut fired_ats: Vec<String> = Vec::with_capacity(closes.len());
         let mut origins: Vec<Arc<str>> = Vec::with_capacity(closes.len());
         let mut close_reasons: Vec<Arc<str>> = Vec::with_capacity(closes.len());
@@ -591,9 +591,9 @@ impl RuleExecutor {
             }
             staged_rows.push(builder.take_staged());
 
-            wfx_ids.push(wfx_id);
+            wfx_ids.push(SmolStr::from(wfx_id));
             scores.push(score_const);
-            entity_ids.push(entity_id);
+            entity_ids.push(SmolStr::from(entity_id));
             fired_ats.push(fired_at);
             origins.push(Arc::from(origin.as_str()));
             close_reasons.push(Arc::from(origin.close_reason().map_or("", |r| r.as_str())));

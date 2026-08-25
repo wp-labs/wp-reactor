@@ -103,6 +103,23 @@ pub fn perf_diag_enabled() -> bool {
     PERF_DIAG_ENABLED.load(Ordering::Relaxed)
 }
 
+/// **输出链消融**（2026-08-26 内存定位）：`WF_DIAG_CUT_ALERT=1` 时，规则仍照常
+/// 消费输入（pipe/join 全跑），但**跳过 sink alert 构建**（`AlertColumnBuilder`
+/// 装载）。与 `perf_cut_output` 的区别：后者把整个输出链（pipe 写入 + alert）
+/// 一刀切；本开关只切 alert 这一段，用来回答"那 12.5GB 输出链增量里，alert
+/// 构建占多少"。
+///
+/// 设计为环境变量而非档位字段：它是临时消融手段（跑完即撤），不需要进
+/// 档状态机/配置。OnceLock 缓存，热路径零开销。
+pub fn perf_cut_alert() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("WF_DIAG_CUT_ALERT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 /// 是否禁止规则求值（cut_rules 门控）。
 #[inline]
 pub fn perf_cut_rules() -> bool {
@@ -372,7 +389,13 @@ impl PerfDiagController {
         }
         let stage = self.stages.get(target)?.clone();
         // 1. 原子门控翻转（先于 reload——新数据即吃新门控）。
-        set_perf_cuts(stage.cut_rules, stage.cut_output, stage.cut_append, stage.cut_recv, stage.cut_serialize);
+        set_perf_cuts(
+            stage.cut_rules,
+            stage.cut_output,
+            stage.cut_append,
+            stage.cut_recv,
+            stage.cut_serialize,
+        );
         // 2. 规则子集变化（非空且不同于基线）→ 触发现有 runtime.rules 热 reload。
         let mut reloaded = false;
         let rules = stage.rules.as_deref().unwrap_or("");

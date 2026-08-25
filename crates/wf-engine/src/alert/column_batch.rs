@@ -20,6 +20,7 @@
 //! (`export_yield_value` + the same reserved-prefix / duplicate checks), and
 //! [`AlertColumnBatch::iter_data_records`] reconstructs byte-equivalent
 //! `DataRecord`s for sinks that still want rows — locked by unit test.
+use smol_str::SmolStr;
 use std::sync::Arc;
 
 use orion_error::conversion::ToStructError;
@@ -46,11 +47,11 @@ pub struct AlertColumnBatch {
     /// (an `Arc` would pay a fresh allocation + memcpy per row for a value
     /// that is never shared). The remaining six are plan/batch constants and
     /// stay `Arc<str>` (refcount-shared).
-    wfx_id: Vec<String>,
+    wfx_id: Vec<SmolStr>,
     rule_name: Vec<Arc<str>>,
     score: Vec<f64>,
     entity_type: Vec<Arc<str>>,
-    entity_id: Vec<String>,
+    entity_id: Vec<SmolStr>,
     origin: Vec<Arc<str>>,
     close_reason: Vec<Arc<str>>,
     fired_at: Vec<String>,
@@ -167,9 +168,9 @@ impl AlertColumnBatch {
 /// at commit (instead of a `String` build followed by a second copy, as the
 /// record-based path paid).
 pub struct EachRowCells<'a> {
-    pub wfx_id: String,
+    pub wfx_id: SmolStr,
     pub score: f64,
-    pub entity_id: String,
+    pub entity_id: SmolStr,
     pub fired_at: String,
     pub rule_name: &'a Arc<str>,
     pub entity_type: &'a Arc<str>,
@@ -184,11 +185,11 @@ pub struct EachRowCells<'a> {
 pub struct AlertColumnBuilder {
     target: Arc<str>,
     len: usize,
-    wfx_id: Vec<String>,
+    wfx_id: Vec<SmolStr>,
     rule_name: Vec<Arc<str>>,
     score: Vec<f64>,
     entity_type: Vec<Arc<str>>,
-    entity_id: Vec<String>,
+    entity_id: Vec<SmolStr>,
     origin: Vec<Arc<str>>,
     close_reason: Vec<Arc<str>>,
     fired_at: Vec<String>,
@@ -279,11 +280,11 @@ impl AlertColumnBuilder {
         }
 
         // Infallible column pushes (system fields, then yield cells).
-        self.wfx_id.push(record.wfx_id.clone());
+        self.wfx_id.push(SmolStr::from(record.wfx_id.clone()));
         self.rule_name.push(Arc::clone(&record.rule_name));
         self.score.push(record.score);
         self.entity_type.push(Arc::clone(&record.entity_type));
-        self.entity_id.push(record.entity_id.clone());
+        self.entity_id.push(SmolStr::from(record.entity_id.clone()));
         self.origin.push(Arc::from(record.origin.as_str()));
         self.close_reason.push(Arc::from(
             record
@@ -621,9 +622,9 @@ impl AlertColumnBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn commit_each_rows_batch(
         &mut self,
-        wfx_id: &[String],
+        wfx_id: &[SmolStr],
         score: &[f64],
-        entity_id: &[String],
+        entity_id: &[SmolStr],
         fired_at: &[String],
         rule_name: &Arc<str>,
         entity_type: &Arc<str>,
@@ -729,9 +730,9 @@ impl AlertColumnBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_close_rows_batch(
         &mut self,
-        wfx_id: &[String],
+        wfx_id: &[SmolStr],
         score: &[f64],
-        entity_id: &[String],
+        entity_id: &[SmolStr],
         fired_at: &[String],
         rule_name: &Arc<str>,
         entity_type: &Arc<str>,
@@ -1023,9 +1024,9 @@ mod tests {
                     .unwrap();
             }
             via_row.commit_each_row(EachRowCells {
-                wfx_id: format!("id{i}"),
+                wfx_id: format!("id{i}").into(),
                 score: 42.0 + i as f64,
-                entity_id: format!("10.0.0.{}", i + 1),
+                entity_id: format!("10.0.0.{}", i + 1).into(),
                 fired_at: format!("ts{i}"),
                 rule_name: &rule_name,
                 entity_type: &entity_type,
@@ -1067,9 +1068,9 @@ mod tests {
             .iter()
             .position(|c| c.name.as_ref() == "price")
             .unwrap();
-        let wfx: Vec<String> = (0..n).map(|i| format!("id{i}")).collect();
+        let wfx: Vec<SmolStr> = (0..n).map(|i| format!("id{i}").into()).collect();
         let scores: Vec<f64> = (0..n).map(|i| 42.0 + i as f64).collect();
-        let eids: Vec<String> = (0..n).map(|i| format!("10.0.0.{}", i + 1)).collect();
+        let eids: Vec<SmolStr> = (0..n).map(|i| format!("10.0.0.{}", i + 1).into()).collect();
         let fats: Vec<String> = (0..n).map(|i| format!("ts{i}")).collect();
         let mut staged_rows = Vec::with_capacity(n);
         for (i, price_present) in price_present.iter().enumerate() {
@@ -1139,9 +1140,9 @@ mod tests {
                 )
                 .unwrap();
             via_row.commit_each_row(EachRowCells {
-                wfx_id: format!("id{i}"),
+                wfx_id: format!("id{i}").into(),
                 score: 1.0 + i as f64,
-                entity_id: format!("e{i}"),
+                entity_id: format!("e{i}").into(),
                 fired_at: format!("ts{i}"),
                 rule_name: &rule_name,
                 entity_type: &entity_type,
@@ -1157,9 +1158,9 @@ mod tests {
             .register_yield_column(&Arc::from("alert_type"), None)
             .unwrap();
         let type_col = 0usize;
-        let wfx: Vec<String> = (0..n).map(|i| format!("id{i}")).collect();
+        let wfx: Vec<SmolStr> = (0..n).map(|i| format!("id{i}").into()).collect();
         let scores: Vec<f64> = (0..n).map(|i| 1.0 + i as f64).collect();
-        let eids: Vec<String> = (0..n).map(|i| format!("e{i}")).collect();
+        let eids: Vec<SmolStr> = (0..n).map(|i| format!("e{i}").into()).collect();
         let fats: Vec<String> = (0..n).map(|i| format!("ts{i}")).collect();
         let staged_rows: Vec<Vec<(usize, DataType, ModelValue)>> = (0..n)
             .map(|i| {
@@ -1252,9 +1253,9 @@ mod tests {
         fired_at: &str,
     ) {
         builder.commit_each_row(EachRowCells {
-            wfx_id: wfx_id.to_string(),
+            wfx_id: wfx_id.to_string().into(),
             score: 42.5,
-            entity_id: entity_id.to_string(),
+            entity_id: entity_id.to_string().into(),
             fired_at: fired_at.to_string(),
             rule_name: &Arc::from("q1_pass"),
             entity_type: &Arc::from("ip"),

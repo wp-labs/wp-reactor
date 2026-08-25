@@ -2910,6 +2910,11 @@ impl RuleTask {
         if crate::perf_diag::perf_cut_output() {
             return Ok(false);
         }
+        // 输出链消融（2026-08-26）：只切 alert 构建，保留 pipe/join 消费。
+        // 与 cut_output 的区别见 perf_diag::perf_cut_alert 注释。
+        if crate::perf_diag::perf_cut_alert() {
+            return Ok(false);
+        }
         // Serialize timing is sampled 1-in-N and scaled back up (same
         // pattern as `emit`; covers the eval + column append).
         let time_this = {
@@ -3242,6 +3247,10 @@ impl RuleTask {
     ) {
         // perf-diag cut_output 门控（见 [`Self::emit_each_direct`]）。
         if crate::perf_diag::perf_cut_output() {
+            return;
+        }
+        // 输出链消融（2026-08-26）：q13b 列式 join 的 alert 构建段。
+        if crate::perf_diag::perf_cut_alert() {
             return;
         }
         let mut appended_idx: Vec<usize> = Vec::new();

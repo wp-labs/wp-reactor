@@ -178,6 +178,40 @@ impl RuleFanout {
         }
     }
 
+    /// 每窗 fanout 通道的**排队批数 / 总容量**（求和到所有订阅与分片）。
+    ///
+    /// 存在理由（2026-08-26 内存定位）：diag 墙梯把 q13 的 12.5GB 内存增量定位到
+    /// **输出链**（floor 3.3GB → rules 3.9GB → full 16.4GB），而窗口会计只解释
+    /// 4.1GB。输出链里唯一未被度量的大容器就是规则分片通道：
+    /// 10 分片 × `RULE_CHANNEL_CAPACITY` 256 = 2560 槽，若按 bid_mod 批 3.45MB 算
+    /// 满队即 ~8.8GB——量级与残差吻合。
+    ///
+    /// 读的是 **批数**（tokio `max_capacity() - capacity()`）而非字节：通道里是
+    /// `Arc<RecordBatch>`，字节可能与窗口共享（未 ack 批次窗口也在留），相加会
+    /// 双算——先拿批数判断“通道是否接近满”，再决定是否值得追字节归属。
+    pub fn queued_items(&self, window_name: &str) -> Option<(usize, usize)> {
+        let table = self.table.read().expect("fanout lock poisoned");
+        let subs = table.get(window_name)?;
+        let mut queued = 0usize;
+        let mut capacity = 0usize;
+        let mut acc = |tx: &mpsc::Sender<RulePush>| {
+            let max = tx.max_capacity();
+            capacity += max;
+            queued += max.saturating_sub(tx.capacity());
+        };
+        for sub in subs.iter() {
+            match sub {
+                Subscription::Single(tx) => acc(tx),
+                Subscription::Sharded { shards, .. } | Subscription::RoundRobin { shards, .. } => {
+                    for tx in shards.iter() {
+                        acc(tx);
+                    }
+                }
+            }
+        }
+        Some((queued, capacity))
+    }
+
     /// Register a single (unsharded) rule channel for `window_name`.
     pub fn register(&self, window_name: &str, tx: mpsc::Sender<RulePush>) {
         let mut table = self.table.write().expect("fanout lock poisoned");
@@ -1407,4 +1441,46 @@ mod tests {
             "precompute_shard_rows 100k rows took {per:?}; it is a parse bottleneck"
         );
     }
+    /// `queued_items`（2026-08-26 输出链在途量）：报（排队批数, 总容量）。
+    ///
+    /// 为何需要：diag 墙梯把 q13 的 12.5GB 内存增量定位到**输出链**，而窗口会计只
+    /// 解释 4.1GB；规则分片通道（10 分片 × 256 槽）是该段唯一未度量的大容器。
+    /// 若该 API 静默失效（恒 0），"通道是否为持有者"就无法判定。
+    #[tokio::test]
+    async fn queued_items_reports_backlog_across_shards() {
+        let fanout = RuleFanout::new();
+        assert!(
+            fanout.queued_items("nope").is_none(),
+            "未注册窗口返回 None（区分'无订阅'与'空队'）"
+        );
+
+        // 两个分片，各容量 4 → 总容量 8、初始排队 0。
+        let (tx1, mut rx1) = mpsc::channel::<RulePush>(4);
+        let (tx2, _rx2) = mpsc::channel::<RulePush>(4);
+        fanout.register_round_robin("w", vec![tx1.clone(), tx2.clone()]);
+        assert_eq!(fanout.queued_items("w"), Some((0, 8)), "空队 = (0, 8)");
+
+        // 往分片 1 压 3 条（不消费）→ 排队 3。
+        let mk = || RulePush {
+            window_name: "w".into(),
+            events: None,
+            batch: None,
+            materialize_fields: None,
+            shard_rows: None,
+            seq: 0,
+        };
+        for _ in 0..3 {
+            tx1.send(mk()).await.unwrap();
+        }
+        assert_eq!(
+            fanout.queued_items("w"),
+            Some((3, 8)),
+            "压入 3 条未消费 → 排队须为 3（这是判断通道是否接近满的依据）"
+        );
+
+        // 消费 2 条 → 排队回落到 1（否则会把已消费的算成在途，虚增分账）。
+        rx1.recv().await.unwrap();
+        rx1.recv().await.unwrap();
+        assert_eq!(fanout.queued_items("w"), Some((1, 8)), "消费后排队须回落");
+}
 }

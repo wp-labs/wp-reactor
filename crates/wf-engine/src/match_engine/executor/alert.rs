@@ -3,7 +3,7 @@ use wf_lang::ast::FieldRef;
 
 use crate::alert::AlertOrigin;
 use crate::match_engine::match_engine::{
-    StepData, Value, field_ref_name, push_i64_exact_decimal, value_to_string,
+    StepData, Value, field_ref_name, value_to_string,
 };
 
 /// Format nanoseconds since epoch as ISO 8601 UTC string.
@@ -229,13 +229,16 @@ impl EachWfxPrefix {
 
     /// Per-row finish — byte stream identical to
     /// [`wfx_id_from_rule_and_time`] (locked by unit test).
-    pub(crate) fn wfx_id(&self, event_time_nanos: i64, origin: &AlertOrigin) -> String {
+    ///
+    /// 2026-08-26：返回 [`SmolStr`]（16 hex 内联，零堆分配）——q13b 每行
+    /// 构造 wfx_id 的 per-row churn 消减。
+    pub(crate) fn wfx_id(&self, event_time_nanos: i64, origin: &AlertOrigin) -> smol_str::SmolStr {
         let mut hasher = Fnv1a { state: self.state };
         hasher.update(&event_time_nanos.to_le_bytes());
         hasher.update(b"\x00");
         hasher.update(b"\x00");
         hasher.update(origin.as_str().as_bytes());
-        hex_encode(&hasher.finalize().to_le_bytes())
+        hex_encode_smol(&hasher.finalize().to_le_bytes())
     }
 }
 
@@ -246,12 +249,16 @@ impl EachWfxPrefix {
 /// path. Single source of the 2^53 rendering rule — used by the batch-typed
 /// entity column read in the columnar on-each path (locked by
 /// `flat_int64_fast_path_matches_f64_roundtrip_bytes`).
-pub(crate) fn write_int64_value(scratch: &mut String, v: i64) {
-    use std::fmt::Write;
+pub(crate) fn write_int64_value(
+    scratch: &mut impl crate::match_engine::match_engine::key::StrSink,
+    v: i64,
+) {
     if v.unsigned_abs() <= (1i64 << 53) as u64 {
-        push_i64_exact_decimal(scratch, v);
+        crate::match_engine::match_engine::key::push_i64_exact_decimal(scratch, v);
     } else {
-        let _ = write!(scratch, "{}", v as f64);
+        // |v| > 2^53：f64 Display 渲染（可能有 .0/科学计数——与 value_to_string 字节一致）。
+        let rendered = (v as f64).to_string();
+        scratch.push_str(&rendered);
     }
 }
 
@@ -263,6 +270,19 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
+}
+
+/// `hex_encode` 的 SmolStr 版本（2026-08-26 q13b per-row churn 消减）：
+/// fnv64 hex 固定 16 字符，落在 SmolStr 内联上限（22B）内 → 零堆分配。
+/// 仅用于 [`EachWfxPrefix::wfx_id`]（每行热路径）；其余调用方保持 String。
+fn hex_encode_smol(bytes: &[u8]) -> smol_str::SmolStr {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut b = smol_str::SmolStrBuilder::new();
+    for byte in bytes {
+        b.push(HEX[(byte >> 4) as usize] as char);
+        b.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    b.into()
 }
 
 /// Build a human-readable summary.

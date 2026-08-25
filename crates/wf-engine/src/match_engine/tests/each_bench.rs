@@ -296,9 +296,9 @@ fn q1_each_components_per_row() {
             .unwrap();
         // 系统列（wfx_id/entity/fired_at 用常量——各自的生成成本由 cut A/D/B 单独计）
         builder.commit_each_row(EachRowCells {
-            wfx_id: String::from("wf_0000000000000000001"),
+            wfx_id: String::from("wf_0000000000000000001").into(),
             score: 1.0,
-            entity_id: String::from("1"),
+            entity_id: String::from("1").into(),
             fired_at: String::from("2026-08-18T00:00:00.000000000Z"),
             rule_name: &rule_name,
             entity_type: &entity_type,
@@ -379,9 +379,9 @@ fn q1_each_components_per_row() {
         let start = Instant::now();
         for _ in 0..N {
             builder.commit_each_row(EachRowCells {
-                wfx_id: String::from("wf_0000000000000000001"),
+                wfx_id: String::from("wf_0000000000000000001").into(),
                 score: 1.0,
-                entity_id: String::from("1"),
+                entity_id: String::from("1").into(),
                 fired_at: String::from("2026-08-18T00:00:00.000000000Z"),
                 rule_name: &rule_name,
                 entity_type: &entity_type,
