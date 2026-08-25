@@ -3341,22 +3341,31 @@ fn each_columnar_q14_filter_matches_row_path() {
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4), None])) as ArrayRef,
             Arc::new(Int64Array::from(vec![
-                // 0.908*price 需 ∈ (1M, 50M)：1M 不过（<1M）、5M 过、60M 不过（>50M）、10M 过、null 不过。
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                None,
+                Some(6),
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                // 0.908*price 需 ∈ (1M, 50M)：1M 不过、5M 过、60M 不过、10M 过、null 不过、20M 过。
                 Some(1_000_000),
                 Some(5_000_000),
                 Some(60_000_000),
                 Some(10_000_000),
                 None,
+                Some(20_000_000),
             ])) as ArrayRef,
             Arc::new(Int64Array::from(vec![
-                // 22:13 UTC → dayTime；01:13 UTC（-45h）→ nightTime。
+                // 真实 3 档 CASE：22 时 → nightTime；10 时（-12h）→ dayTime；07 时（-15h）→ otherTime。
                 Some(1_700_000_000_000_000_000),
                 Some(1_700_000_000_000_000_000),
                 Some(1_700_000_000_000_000_000),
-                Some(1_700_000_000_000_000_000 - 45 * 3_600_000_000_000),
+                Some(1_700_000_000_000_000_000 - 12 * 3_600_000_000_000),
                 None,
+                Some(1_700_000_000_000_000_000 - 15 * 3_600_000_000_000),
             ])) as ArrayRef,
             Arc::new(StringArray::from(vec![
                 Some("abc"),
@@ -3364,6 +3373,7 @@ fn each_columnar_q14_filter_matches_row_path() {
                 Some("x"),
                 Some("no-c"),
                 None,
+                Some("zz"),
             ])) as ArrayRef,
         ],
     )
@@ -3408,6 +3418,15 @@ fn each_columnar_q14_filter_matches_row_path() {
             }),
         }),
     });
+    // 真实 q14.wfl：嵌套 3 档 CASE（nightTime/dayTime/otherTime，10/9 项 InList）。
+    let in_hours = |hours: &[&str]| Expr::InList {
+        expr: Box::new(call(
+            "strftime",
+            vec![b_field("dateTime"), Expr::StringLit("%H".into())],
+        )),
+        list: hours.iter().map(|h| Expr::StringLit((*h).into())).collect(),
+        negated: false,
+    };
     plan.yield_plan.fields = vec![YieldField {
         name: "detail".into(),
         value: call(
@@ -3415,20 +3434,17 @@ fn each_columnar_q14_filter_matches_row_path() {
             vec![
                 Expr::StringLit("{} c={}".into()),
                 Expr::IfThenElse {
-                    cond: Box::new(Expr::InList {
-                        expr: Box::new(call(
-                            "strftime",
-                            vec![b_field("dateTime"), Expr::StringLit("%H".into())],
-                        )),
-                        list: vec![
-                            Expr::StringLit("00".into()),
-                            Expr::StringLit("01".into()),
-                            Expr::StringLit("02".into()),
-                        ],
-                        negated: false,
-                    }),
+                    cond: Box::new(in_hours(&[
+                        "00", "01", "02", "03", "04", "05", "06", "20", "21", "22", "23",
+                    ])),
                     then_expr: Box::new(Expr::StringLit("nightTime".into())),
-                    else_expr: Box::new(Expr::StringLit("dayTime".into())),
+                    else_expr: Box::new(Expr::IfThenElse {
+                        cond: Box::new(in_hours(&[
+                            "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18",
+                        ])),
+                        then_expr: Box::new(Expr::StringLit("dayTime".into())),
+                        else_expr: Box::new(Expr::StringLit("otherTime".into())),
+                    }),
                 },
                 call("count_char", vec![b_field("extra"), Expr::StringLit("c".into())]),
             ],
@@ -3455,21 +3471,21 @@ fn each_columnar_q14_filter_matches_row_path() {
         .map(|r| r.unwrap())
         .collect();
 
-    let col_events: Vec<ColumnarEvent> = (0..5).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_events: Vec<ColumnarEvent> = (0..6).map(|r| ColumnarEvent::new(&batch, r)).collect();
     let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
     let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
     let mut app_col = Vec::new();
     let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
 
     // 统计对拍：each filter 拒绝 3 行（1M 低于区间 / 60M 高于区间 / null），
-    // 追加 2 行（5M / 10M）。
-    assert_eq!(sr.appended, 2, "行式 appended");
+    // 追加 3 行（5M / 10M / 20M）。
+    assert_eq!(sr.appended, 3, "行式 appended");
     assert_eq!(sr.rejected, 3, "行式 rejected");
-    assert_eq!(sc.appended, 2, "列式 appended");
+    assert_eq!(sc.appended, 3, "列式 appended");
     assert_eq!(sc.rejected, 3, "列式 rejected");
     assert_eq!(sc.failed, 0);
-    assert_eq!(app_row, vec![1usize, 3], "行式 appended 索引");
-    assert_eq!(app_col, vec![1usize, 3], "列式 appended 索引");
+    assert_eq!(app_row, vec![1usize, 3, 5], "行式 appended 索引");
+    assert_eq!(app_col, vec![1usize, 3, 5], "列式 appended 索引");
 
     let out_col: Vec<_> = b_col
         .finish()
@@ -3486,8 +3502,9 @@ fn each_columnar_q14_filter_matches_row_path() {
             })
             .expect("detail field")
     };
-    assert_eq!(label(&out_col[0]), "dayTime c=4", "5M 行：22 时 → dayTime，\"abc c cc\" 含 4 个 c");
-    assert_eq!(label(&out_col[1]), "nightTime c=1", "10M 行：01 时 → nightTime，\"no-c\" 含 1 个 c");
+    assert_eq!(label(&out_col[0]), "nightTime c=4", "5M 行：22 时 → nightTime，\"abc c cc\" 含 4 个 c");
+    assert_eq!(label(&out_col[1]), "dayTime c=1", "10M 行：10 时 → dayTime，\"no-c\" 含 1 个 c");
+    assert_eq!(label(&out_col[2]), "otherTime c=0", "20M 行：07 时 → otherTime，\"zz\" 无 c");
 }
 
 /// Q14 变体：fmt 的 IfThenElse 分支 / count_char 参数含 OBJECT 元数据字段。
@@ -3745,6 +3762,131 @@ fn each_columnar_filter_missing_column_rejects_all_parity() {
     assert_eq!(sc.failed, 0);
     assert_eq!(app_row, Vec::<usize>::new());
     assert_eq!(app_col, Vec::<usize>::new());
+}
+
+/// 回归：General（列式输出函数）yield **不在字段位 0**——前面有 Field/Lit
+/// 字段（真实 q14：id=Field, alert_type=Lit, detail=fmt General, request_count=Lit）。
+/// 此前 general_cvecs 用「只数 General 的游标」索引，错位取到 Field/Lit 槽位
+/// （None）→ 误走行式回退 + yield_meta 悬空 panic。必须逐位对拍。
+#[test]
+fn each_columnar_general_yield_not_first_matches_row_path() {
+    use wp_model_core::model::Value as ModelValue;
+
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("auction", DataType::Int64, true),
+        ArrowField::new("price", DataType::Int64, true),
+        ArrowField::new("extra", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![Some(11), Some(22), None])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(7), Some(8), Some(9)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("ab c"), Some("cc"), None])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let b_field = |n: &str| Expr::Field(FieldRef::Qualified("b".into(), n.into()));
+    let call = |name: &str, args: Vec<Expr>| Expr::FuncCall {
+        qualifier: None,
+        name: name.into(),
+        args,
+    };
+    let mut plan = simple_rule_plan(
+        "mixed_yield_order",
+        simple_plan(vec![], vec![]),
+        Expr::Number(5.0),
+        "digit",
+        b_field("auction"),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "b".into(),
+        filter: None,
+    });
+    // 字段顺序刻意让 General 落在第 3 位（前面 Field + Lit）。
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: b_field("auction"),
+        },
+        YieldField {
+            name: "alert_type".into(),
+            value: Expr::StringLit("q14_calc".into()),
+        },
+        YieldField {
+            name: "detail".into(),
+            value: call(
+                "fmt",
+                vec![
+                    Expr::StringLit("c={} p={}".into()),
+                    call("count_char", vec![b_field("extra"), Expr::StringLit("c".into())]),
+                    b_field("price"),
+                ],
+            ),
+        },
+        YieldField {
+            name: "request_count".into(),
+            value: Expr::Number(1.0),
+        },
+    ];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("id".into(), FieldType::Base(BaseType::Float)),
+            ("alert_type".into(), FieldType::Base(BaseType::Chars)),
+            ("detail".into(), FieldType::Base(BaseType::Chars)),
+            ("request_count".into(), FieldType::Base(BaseType::Float)),
+        ]),
+    );
+    assert!(exec.each_plan_columnar_safe());
+
+    let t = 1_700_000_000_000_000_000i64;
+    let events = crate::match_engine::event_bridge::batch_to_events(&batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let col_events: Vec<ColumnarEvent> = (0..3).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+
+    assert_eq!(sr.appended, 3, "行式 appended");
+    assert_eq!(sr.rejected, 0);
+    assert_eq!(sc.appended, 3, "列式 appended（General 不在字段 0 也必须全编译）");
+    assert_eq!(sc.rejected, 0);
+    assert_eq!(sc.failed, 0);
+    assert_eq!(app_row, vec![0usize, 1, 2]);
+    assert_eq!(app_col, vec![0usize, 1, 2]);
+
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(out_row, out_col, "混合 yield 顺序必须逐位一致");
+    let detail = |r: &wp_model_core::model::DataRecord| {
+        r.fields()
+            .find(|f| f.get_name() == "detail")
+            .and_then(|f| match f.get_value() {
+                ModelValue::Chars(v) => Some(v.to_string()),
+                _ => None,
+            })
+            .expect("detail field")
+    };
+    // 列式必须真的命中 fmt 槽位（错位取 None 会误回退成空串/悬空 panic）。
+    assert_eq!(detail(&out_col[0]), "c=1 p=7");
+    assert_eq!(detail(&out_col[1]), "c=2 p=8");
+    assert_eq!(detail(&out_col[2]), "", "null extra → count_char None → fmt 参数 None → 空串");
 }
 
 // ---------------------------------------------------------------------------

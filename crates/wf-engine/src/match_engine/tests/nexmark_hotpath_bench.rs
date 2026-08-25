@@ -42,6 +42,7 @@ use wf_lang::plan::{
     JoinPlan, LetPlan, MatchPlan, RulePlan, SortKeyPlan, StatsAggPlan, StatsMeasurePlan,
     StatsOutputShapePlan, StatsPlan, StepPlan, WindowSpec, YieldField,
 };
+use wf_lang::{BaseType, FieldType};
 
 use crate::match_engine::executor::StatsExecutor;
 use crate::match_engine::match_engine::{
@@ -454,7 +455,11 @@ fn q13_rule() -> RulePlan {
     plan
 }
 
-/// Q14：on each + bind filter（价格区间）+ strftime/count_char 字符串 detail。
+/// Q14（对齐真实 `nexmark_pk/models/queries/q14.wfl` 形状）：on each + 价格区间
+/// filter + 4 个 yield 字段；detail = `fmt("{} c={}", 嵌套 3 档 CASE
+/// nightTime/dayTime/otherTime（10/9 项 InList）, count_char(extra,"c"))`。
+/// 价格区间在真实规则里是 bind filter；bench 直接驱动 executor（不经过
+/// rule_task 的 bind mask），故按 each filter 建模——输出链成本形状一致。
 fn q14_rule() -> RulePlan {
     let mut plan = simple_rule_plan(
         "q14_bench",
@@ -489,39 +494,72 @@ fn q14_rule() -> RulePlan {
             }),
         }),
     });
-    plan.yield_plan.fields = vec![YieldField {
-        name: "detail".into(),
-        value: Expr::FuncCall {
+    let in_hours = |hours: &[&str]| Expr::InList {
+        expr: Box::new(Expr::FuncCall {
             qualifier: None,
-            name: "fmt".into(),
-            args: vec![
-                Expr::StringLit("{} c={}".into()),
-                Expr::IfThenElse {
-                    cond: Box::new(Expr::InList {
-                        expr: Box::new(Expr::FuncCall {
-                            qualifier: None,
-                            name: "strftime".into(),
-                            args: vec![b_field("dateTime"), Expr::StringLit("%H".into())],
-                        }),
-                        list: vec![
-                            Expr::StringLit("00".into()),
-                            Expr::StringLit("01".into()),
-                            Expr::StringLit("02".into()),
-                        ],
-                        negated: false,
-                    }),
-                    then_expr: Box::new(Expr::StringLit("nightTime".into())),
-                    else_expr: Box::new(Expr::StringLit("dayTime".into())),
-                },
-                Expr::FuncCall {
-                    qualifier: None,
-                    name: "count_char".into(),
-                    args: vec![b_field("extra"), Expr::StringLit("c".into())],
-                },
-            ],
+            name: "strftime".into(),
+            args: vec![b_field("dateTime"), Expr::StringLit("%H".into())],
+        }),
+        list: hours.iter().map(|h| Expr::StringLit((*h).into())).collect(),
+        negated: false,
+    };
+    let bid_time_type = Expr::IfThenElse {
+        cond: Box::new(in_hours(&[
+            "00", "01", "02", "03", "04", "05", "06", "20", "21", "22", "23",
+        ])),
+        then_expr: Box::new(Expr::StringLit("nightTime".into())),
+        else_expr: Box::new(Expr::IfThenElse {
+            cond: Box::new(in_hours(&[
+                "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18",
+            ])),
+            then_expr: Box::new(Expr::StringLit("dayTime".into())),
+            else_expr: Box::new(Expr::StringLit("otherTime".into())),
+        }),
+    };
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: b_field("auction"),
         },
-    }];
+        YieldField {
+            name: "alert_type".into(),
+            value: Expr::StringLit("q14_calc".into()),
+        },
+        YieldField {
+            name: "detail".into(),
+            value: Expr::FuncCall {
+                qualifier: None,
+                name: "fmt".into(),
+                args: vec![
+                    Expr::StringLit("{} c={}".into()),
+                    bid_time_type,
+                    Expr::FuncCall {
+                        qualifier: None,
+                        name: "count_char".into(),
+                        args: vec![b_field("extra"), Expr::StringLit("c".into())],
+                    },
+                ],
+            },
+        },
+        YieldField {
+            name: "request_count".into(),
+            value: Expr::Number(1.0),
+        },
+    ];
     plan
+}
+
+/// q14 bench executor：真实 yield 字段类型（同 `q14.wfl` 输出目标）。
+fn q14_exec() -> RuleExecutor {
+    RuleExecutor::new_with_yield_field_types(
+        q14_rule(),
+        HashMap::from([
+            ("id".into(), FieldType::Base(BaseType::Float)),
+            ("alert_type".into(), FieldType::Base(BaseType::Chars)),
+            ("detail".into(), FieldType::Base(BaseType::Chars)),
+            ("request_count".into(), FieldType::Base(BaseType::Float)),
+        ]),
+    )
 }
 
 /// Q16：`match<channel:30m:fixed>` + 12 close measure（4 count 档 + 8 distinct）。
@@ -1487,7 +1525,7 @@ fn q6_match_emit() {
 #[ignore = "release-only benchmark: cargo test --release -p wf-engine nexmark_hotpath_bench -- --ignored --nocapture"]
 fn q14_each_strftime_count_char() {
     let events = bid_events(N);
-    let exec = RuleExecutor::new(q14_rule());
+    let exec = q14_exec();
     let t0 = Instant::now();
     for (i, ev) in events.iter().enumerate() {
         let ts = NOW + i as i64 * EVENT_STEP_NS;
@@ -1571,7 +1609,7 @@ fn q14_each_strftime_count_char_columnar() {
     const SEG: usize = 4096; // 生产 ALERT_BATCH_SIZE
     const FRAME: usize = 65_536; // wfgen 默认 8MiB 帧 ≈ 5-6 万行/批
 
-    let exec = RuleExecutor::new(q14_rule());
+    let exec = q14_exec();
     assert!(
         exec.each_plan_columnar_safe(),
         "q14 each filter + 递归输出函数必须列式放行"

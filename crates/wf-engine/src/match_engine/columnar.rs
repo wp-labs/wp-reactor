@@ -2937,6 +2937,91 @@ mod tests {
         assert_value_equiv(&detail, &batch);
     }
 
+    /// 真实 `q14.wfl` 形状：**嵌套 3 档 CASE**（nightTime/dayTime/otherTime，
+    /// 10/9 项 InList）——else 分支里再嵌 IfThenElse。列式 gate/编译/求值必须
+    /// 与解释器逐行一致（三档都覆盖 + null ts）。
+    #[test]
+    fn q14_real_three_way_case_matches_interpreted() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    // 22 时 → nightTime；10 时 → dayTime；07 时 → otherTime；null。
+                    Some(1_700_000_000_000_000_000),
+                    Some(1_700_000_000_000_000_000 - 12 * 3_600_000_000_000),
+                    Some(1_700_000_000_000_000_000 - 15 * 3_600_000_000_000),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("abc c cc"),
+                    Some("no-c"),
+                    Some("zz"),
+                    None,
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let f = |n: &str| Expr::Field(FieldRef::Simple(n.into()));
+        let call = |name: &str, args: Vec<Expr>| Expr::FuncCall {
+            qualifier: None,
+            name: name.into(),
+            args,
+        };
+        let in_hours = |hours: &[&str]| Expr::InList {
+            expr: Box::new(call(
+                "strftime",
+                vec![f("ts"), Expr::StringLit("%H".into())],
+            )),
+            list: hours.iter().map(|h| Expr::StringLit((*h).into())).collect(),
+            negated: false,
+        };
+        let bid_time_type = Expr::IfThenElse {
+            cond: Box::new(in_hours(&[
+                "00", "01", "02", "03", "04", "05", "06", "20", "21", "22", "23",
+            ])),
+            then_expr: Box::new(Expr::StringLit("nightTime".into())),
+            else_expr: Box::new(Expr::IfThenElse {
+                cond: Box::new(in_hours(&[
+                    "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18",
+                ])),
+                then_expr: Box::new(Expr::StringLit("dayTime".into())),
+                else_expr: Box::new(Expr::StringLit("otherTime".into())),
+            }),
+        };
+        let detail = call(
+            "fmt",
+            vec![
+                Expr::StringLit("{} c={}".into()),
+                bid_time_type,
+                call("count_char", vec![f("extra"), Expr::StringLit("c".into())]),
+            ],
+        );
+        assert!(
+            wf_lang::columnar::columnar_output_expr(&detail),
+            "真实 q14 嵌套 3 档 CASE 必须可列式"
+        );
+        assert_value_equiv(&detail, &batch);
+        // 语义抽查：三档分型 + count_char。
+        let events = batch_to_events(&batch);
+        assert_eq!(
+            eval_expr(&detail, &events[0]).unwrap(),
+            Value::Str("nightTime c=4".into())
+        );
+        assert_eq!(
+            eval_expr(&detail, &events[1]).unwrap(),
+            Value::Str("dayTime c=1".into())
+        );
+        assert_eq!(
+            eval_expr(&detail, &events[2]).unwrap(),
+            Value::Str("otherTime c=0".into())
+        );
+        assert_eq!(eval_expr(&detail, &events[3]), None);
+    }
+
     #[test]
     fn fmt_structured_arg_falls_back_to_row() {
         use crate::match_engine::WFL_FIELD_TYPE_OBJECT;

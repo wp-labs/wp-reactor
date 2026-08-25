@@ -1201,8 +1201,7 @@ impl RuleExecutor {
             // pure overhead on this path.
             builder.begin_row();
             let staged: CoreResult<()> = (|| {
-                let mut general_cursor = 0usize;
-                for ((((field, (name, field_type)), kind), _field_ref), field_idx_opt) in self
+                for (field_idx, ((((field, (name, field_type)), kind), _field_ref), field_idx_opt)) in self
                     .plan
                     .yield_plan
                     .fields
@@ -1211,6 +1210,7 @@ impl RuleExecutor {
                     .zip(yield_kinds.iter())
                     .zip(yield_field_refs.iter())
                     .zip(yield_field_idxs.iter().copied())
+                    .enumerate()
                 {
                     let value = match kind {
                         YieldKind::Lit(_) => {
@@ -1257,9 +1257,14 @@ impl RuleExecutor {
                             // （缺字段/null）→ 空串，与 eval_yield_expr_with_meta
                             // 的 None→空串一致。编译失败（结构化列参数等）→
                             // 行式回退（构造 Event ctx）。
-                            let v = match prepared
+                            // 槽位按 **yield 字段位置** 索引（general_cvecs 与
+                            // yield_plan.fields 对齐，每字段一个槽位；非输出函数
+                            // 字段是 None）——不能用只数 General 的游标（前面有
+                            // Field/Lit 字段时会错位取到错误槽位，真实 q14 的
+                            // id/alert_type 前置字段曾触发）。
+                            match prepared
                                 .general_cvecs
-                                .get(general_cursor)
+                                .get(field_idx)
                                 .and_then(|oc| oc.as_ref())
                             {
                                 Some(cvec) => match cvec.scalar_at(event.row()) {
@@ -1272,9 +1277,7 @@ impl RuleExecutor {
                                     yield_meta.expect("need_yield_meta → meta 已构造"),
                                 )
                                 .expect("eval_yield_expr_with_meta never returns None"),
-                            };
-                            general_cursor += 1;
-                            v
+                            }
                         }
                     };
                     let Some(value) = RuleExecutor::coerce_yield_field_value_with(

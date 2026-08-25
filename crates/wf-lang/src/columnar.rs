@@ -768,6 +768,42 @@ mod tests {
             ],
         );
         assert!(columnar_output_expr(&detail), "Q14 detail 应可列式：{detail:?}");
+
+        // 真实 q14.wfl 形状：嵌套 3 档 CASE（else 分支再嵌 IfThenElse，10/9 项
+        // InList）→ 递归放行。
+        let in_hours = |hours: &[&str]| Expr::InList {
+            expr: Box::new(call(
+                "strftime",
+                vec![f("dateTime"), Expr::StringLit("%H".into())],
+            )),
+            list: hours.iter().map(|h| Expr::StringLit((*h).into())).collect(),
+            negated: false,
+        };
+        let three_way = call(
+            "fmt",
+            vec![
+                Expr::StringLit("{} c={}".into()),
+                Expr::IfThenElse {
+                    cond: Box::new(in_hours(&[
+                        "00", "01", "02", "03", "04", "05", "06", "20", "21", "22", "23",
+                    ])),
+                    then_expr: Box::new(Expr::StringLit("nightTime".into())),
+                    else_expr: Box::new(Expr::IfThenElse {
+                        cond: Box::new(in_hours(&[
+                            "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18",
+                        ])),
+                        then_expr: Box::new(Expr::StringLit("dayTime".into())),
+                        else_expr: Box::new(Expr::StringLit("otherTime".into())),
+                    }),
+                },
+                call("count_char", vec![f("extra"), Expr::StringLit("c".into())]),
+            ],
+        );
+        assert!(
+            columnar_output_expr(&three_way),
+            "真实 q14 嵌套 3 档 CASE 应可列式"
+        );
+
         // InList 非字面量项 → 整体否。
         let bad_list = call(
             "fmt",
