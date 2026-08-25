@@ -2135,7 +2135,7 @@ async fn q13_dual_chain_sharded_push_consumption_complete() {
             match batch {
                 crate::alert_task::AlertBatch::Rows(rows) => {
                     for r in rows.iter() {
-                        values.push(super::tests::field_str(&r, "detail"));
+                        values.push(super::tests::field_str(r, "detail"));
                     }
                 }
                 crate::alert_task::AlertBatch::Columns(cols) => {
@@ -2272,7 +2272,7 @@ async fn q13_dual_chain_sharded_push_high_slope_repro() {
         shard_index: None,
         shard_count: 1,
     };
-    let (mut task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
+    let (task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
 
     // task_b × 10 shards：紧通道 cap=2
     const SHARDS: usize = 10;
@@ -2360,7 +2360,7 @@ async fn q13_dual_chain_sharded_push_high_slope_repro() {
         }
         tokio::task::yield_now().await;
     }
-    let _ = producer.await.unwrap();
+    producer.await.unwrap();
     // task_a 收口后可能还有残余广播：再 drain 一轮
     for (i, task) in shard_tasks.iter_mut().enumerate() {
         let rx = shard_rxs[i].as_mut().unwrap();
@@ -2581,7 +2581,7 @@ async fn q13_sharded_pull_acks_processed_not_read_position() {
     let mut plan_a = plans.next().unwrap();
     plan_a.name = "q13a_bid_mod".into();
 
-    let mut registry = WindowRegistry::build(vec![q13c_window_def(
+    let registry = WindowRegistry::build(vec![q13c_window_def(
         "bid_events",
         &q13c_bid_schema(),
         usize::MAX,

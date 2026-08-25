@@ -1019,7 +1019,7 @@ mod tests {
         // 2 个 round-robin shard：拿到最后一批（seq=0）的 shard ack=1；
         // 另一个 shard 只 ack 自己最后一批（next=1 时它没有批次 → 停在 0）。
         let owner = progress.register();
-        let other = progress.register();
+        let _other = progress.register();
         owner.store(next, std::sync::atomic::Ordering::Release);
         assert_eq!(progress.min_acked(), 0, "min 停滞在无批次 shard");
         let wait = tokio::spawn({
