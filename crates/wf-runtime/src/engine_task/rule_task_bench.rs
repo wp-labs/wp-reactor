@@ -1240,27 +1240,44 @@ fn pipe_write_alloc_footprint() {
     // 预热一轮（首次触碰的分配器页不计入测量）。
     {
         let prepared = exec.each_batch_prepare(&batch);
-        let mut out = Vec::with_capacity(ROWS);
-        exec.execute_each_pipe_batch_columnar(&rows, &prepared, &mut out);
-        let mut stager =
-            PipeBatchStager::new_columnar(Arc::from("bid_mod"), Arc::clone(&schema), Some(4), &yield_names);
-        for row in &out {
-            stager.push_row("q13a_bid_mod", row, NANOS).expect("stage");
-        }
+        let mut stager = PipeBatchStager::new_columnar(
+            Arc::from("bid_mod"),
+            Arc::clone(&schema),
+            Some(4),
+            &yield_names,
+        );
+        let mut sink = TestStagerSink {
+            stager: &mut stager,
+        };
+        exec.execute_each_pipe_batch_columnar(&rows, &prepared, &mut sink);
         let _ = stager.take_batch().expect("build");
     }
 
+    // ① 旧路径（对照）：先物化整批 `Vec<PipeEachRow>`。
+    let eval_only = {
+        let probe = crate::memory_probe::MemoryProbe::exclusive();
+        let prepared = exec.each_batch_prepare(&batch);
+        let mut out: Vec<wf_engine::match_engine::PipeEachRow> = Vec::with_capacity(ROWS);
+        exec.execute_each_pipe_batch_columnar(&rows, &prepared, &mut out);
+        let peak = probe.peak_growth();
+        assert_eq!(out.len(), ROWS, "对照路径应输出全部行");
+        peak
+    };
+
+    // ② 生产路径（流式 sink）：executor 逐行直接装列。
     let probe = crate::memory_probe::MemoryProbe::exclusive();
     let prepared = exec.each_batch_prepare(&batch);
-    let mut out: Vec<wf_engine::match_engine::PipeEachRow> = Vec::with_capacity(ROWS);
-    exec.execute_each_pipe_batch_columnar(&rows, &prepared, &mut out);
-    let after_eval = probe.peak_growth();
-
-    let mut stager =
-        PipeBatchStager::new_columnar(Arc::from("bid_mod"), Arc::clone(&schema), Some(4), &yield_names);
-    for row in &out {
-        stager.push_row("q13a_bid_mod", row, NANOS).expect("stage");
-    }
+    let mut stager = PipeBatchStager::new_columnar(
+        Arc::from("bid_mod"),
+        Arc::clone(&schema),
+        Some(4),
+        &yield_names,
+    );
+    let mut sink = TestStagerSink {
+        stager: &mut stager,
+    };
+    let stats = exec.execute_each_pipe_batch_columnar(&rows, &prepared, &mut sink);
+    assert_eq!(stats.appended, ROWS, "流式路径应装载全部行");
     let after_stage = probe.peak_growth();
 
     let built = stager.take_batch().expect("build").expect("non-empty");
@@ -1269,17 +1286,17 @@ fn pipe_write_alloc_footprint() {
 
     eprintln!("[pipe-alloc] 批规模 = {ROWS} 行（生产实测批大小）");
     eprintln!(
-        "[pipe-alloc] ① execute_each_pipe_batch_columnar（PipeEachRow）峰值 = {:.2} MB ({:.0} B/行)",
-        after_eval as f64 / 1e6,
-        after_eval as f64 / ROWS as f64
+        "[pipe-alloc] ① 旧路径对照：物化 Vec<PipeEachRow> 峰值 = {:.2} MB ({:.0} B/行)",
+        eval_only as f64 / 1e6,
+        eval_only as f64 / ROWS as f64
     );
     eprintln!(
-        "[pipe-alloc] ② + push_row 暂存（PipeCol Vec<Option<T>>）峰值 = {:.2} MB ({:.0} B/行)",
+        "[pipe-alloc] ② 生产路径：流式求值+装列峰值 = {:.2} MB ({:.0} B/行)",
         after_stage as f64 / 1e6,
         after_stage as f64 / ROWS as f64
     );
     eprintln!(
-        "[pipe-alloc] ③ + take_batch（Arrow 数组拷贝）峰值 = {:.2} MB ({:.0} B/行)",
+        "[pipe-alloc] ③ + take_batch（builder.finish 零拷贝）峰值 = {:.2} MB ({:.0} B/行)",
         peak as f64 / 1e6,
         peak as f64 / ROWS as f64
     );
@@ -1289,11 +1306,39 @@ fn pipe_write_alloc_footprint() {
         content as f64 / ROWS as f64
     );
     eprintln!(
-        "[pipe-alloc] **放大倍数 = {:.2}×**（峰值/输出）→ 可优化空间 = {:.2} MB/批 ({:.0} B/行)",
+        "[pipe-alloc] **放大倍数 = {:.2}×**（峰值/输出）→ 剩余可优化 = {:.2} MB/批 ({:.0} B/行)",
         peak as f64 / content as f64,
         (peak.saturating_sub(content)) as f64 / 1e6,
         (peak.saturating_sub(content)) as f64 / ROWS as f64
     );
     assert!(content > 0, "输出批必须非空");
     let _ = empty_tracked_bind_fields();
+}
+
+/// 测试用 sink：直接转发给 stager（与生产 `PipeStagerSink` 同构，但不需要
+/// 错误聚合计数）。
+struct TestStagerSink<'a> {
+    stager: &'a mut PipeBatchStager,
+}
+
+impl wf_engine::match_engine::PipeRowSink for TestStagerSink<'_> {
+    fn push_pipe_row(
+        &mut self,
+        score: f64,
+        entity_type: &str,
+        entity_id: &str,
+        values: &[Option<wf_engine::match_engine::Value>],
+        event_time_nanos: i64,
+    ) -> Result<(), String> {
+        self.stager
+            .push_row_parts(
+                "q13a_bid_mod",
+                score,
+                entity_type,
+                entity_id,
+                values,
+                event_time_nanos,
+            )
+            .map_err(|e| e.to_string())
+    }
 }

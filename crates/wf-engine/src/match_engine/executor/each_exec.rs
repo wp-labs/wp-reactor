@@ -1469,9 +1469,8 @@ impl RuleExecutor {
         &self,
         rows: &[(&ColumnarEvent<'_>, i64)],
         prepared: &EachBatchVecs,
-        out: &mut Vec<PipeEachRow>,
+        sink: &mut dyn PipeRowSink,
     ) -> EachDirectBatchStats {
-        out.clear();
         let mut stats = EachDirectBatchStats::default();
         let Some(_each_plan) = &self.plan.each_plan else {
             log::warn!(
@@ -1566,40 +1565,42 @@ impl RuleExecutor {
             _ => EntityCol::Generic,
         };
 
+        // 流式装载的可复用 scratch（**每批各一次分配**，而非每行）：
+        // 原实现每行新建 `Vec<Option<Value>>` + `String`（实测 404 B/行）。
+        let mut values: Vec<Option<Value>> = Vec::with_capacity(self.plan.yield_plan.fields.len());
+        let mut entity_scratch = String::with_capacity(24);
         for (event, event_time_nanos) in rows {
-            let entity_id = match &entity_const {
-                Some(s) => s.to_string(),
+            entity_scratch.clear();
+            match &entity_const {
+                Some(s) => entity_scratch.push_str(s),
                 None => match &entity_col {
-                    EntityCol::I64(i64col) => match i64col.read(event.row()) {
-                        Some(v) => {
-                            let mut es = String::with_capacity(20);
-                            write_int64_value(&mut es, v);
-                            es
-                        }
-                        None => String::new(),
-                    },
-                    EntityCol::Utf8(arr) => {
-                        let row = event.row();
-                        if arr.is_null(row) {
-                            String::new()
-                        } else {
-                            String::from(arr.value(row))
+                    EntityCol::I64(i64col) => {
+                        if let Some(v) = i64col.read(event.row()) {
+                            write_int64_value(&mut entity_scratch, v);
                         }
                     }
-                    EntityCol::Generic => match entity_idx.and_then(|idx| event.value_at(idx)) {
-                        Some(v) => value_to_string(&v),
-                        None => String::new(),
-                    },
+                    EntityCol::Utf8(arr) => {
+                        let row = event.row();
+                        if !arr.is_null(row) {
+                            entity_scratch.push_str(arr.value(row));
+                        }
+                    }
+                    EntityCol::Generic => {
+                        if let Some(v) = entity_idx.and_then(|idx| event.value_at(idx)) {
+                            entity_scratch.push_str(&value_to_string(&v));
+                        }
+                    }
                 },
-            };
+            }
+            let entity_id = &entity_scratch;
             // 门控无 General-编译失败？防御：构造一次 meta 供行式回退
             // （与 sink 路径的 need_yield_meta 同款，仅编译失败时真用到）。
             let yield_meta = yield_kinds
                 .iter()
                 .zip(prepared.general_cvecs.iter())
                 .any(|(kind, cvec)| matches!(kind, YieldKind::General) && cvec.is_none())
-                .then(|| self.each_yield_meta_light(&entity_id, score, *event_time_nanos));
-            let mut values = Vec::with_capacity(self.plan.yield_plan.fields.len());
+                .then(|| self.each_yield_meta_light(entity_id, score, *event_time_nanos));
+            values.clear();
             let mut row_ok = true;
             for (field_idx, ((((field, (name, field_type)), kind), _field_ref), field_idx_opt)) in
                 self.plan
@@ -1652,13 +1653,21 @@ impl RuleExecutor {
                 stats.failed += 1;
                 continue;
             }
-            out.push(PipeEachRow {
+            match sink.push_pipe_row(
                 score,
-                entity_type: Arc::clone(&statics.entity_type),
+                &statics.entity_type,
                 entity_id,
-                values,
-            });
-            stats.appended += 1;
+                &values,
+                *event_time_nanos,
+            ) {
+                Ok(()) => stats.appended += 1,
+                Err(e) => {
+                    // sink 装载失败（coercion/JSON 渲染）——与求值失败同口径：
+                    // 记 failed 并继续下一行，不中断批次（同 sink 路径惯例）。
+                    log::warn!("pipe row stage error: {e}");
+                    stats.failed += 1;
+                }
+            }
         }
         stats
     }
@@ -2382,6 +2391,49 @@ pub struct PipeEachRow {
     pub entity_type: std::sync::Arc<str>,
     pub entity_id: String,
     pub values: Vec<Option<Value>>,
+}
+
+/// 中间管道行接收器（2026-08-25 pipe 写入分配足迹）。
+///
+/// executor **逐行回调**本 trait，实现方（wf-runtime 的 `PipeBatchStager`）直接
+/// 装列——避开先物化全批 `Vec<PipeEachRow>`（每行一个 `values` Vec + 一个
+/// `entity_id` String，实测 404 B/行）。`entity_id` / `values` 都是 executor 的
+/// **可复用 scratch 借用**，实现方不得跨行持有。
+///
+/// 与 sink 路径（`execute_each_direct_batch(..., &mut AlertColumnBuilder, ...)`）
+/// 同构：错误由 executor 记 `failed` 并继续下一行，不中断批次。
+pub trait PipeRowSink {
+    /// 装载一行。`values` 与 yield 字段顺序一一对应（`None` = 可选字段缺失）。
+    /// `Err` = 本行装载失败（executor 记 failed）。
+    fn push_pipe_row(
+        &mut self,
+        score: f64,
+        entity_type: &str,
+        entity_id: &str,
+        values: &[Option<Value>],
+        event_time_nanos: i64,
+    ) -> Result<(), String>;
+}
+
+/// 对照/兼容实现：按行物化成 `PipeEachRow`（每行两次堆分配，与流式改造前
+/// 等价）。仅用于 bench 对照与对拍测试，生产路径用 stager 直接实现。
+impl PipeRowSink for Vec<PipeEachRow> {
+    fn push_pipe_row(
+        &mut self,
+        score: f64,
+        entity_type: &str,
+        entity_id: &str,
+        values: &[Option<Value>],
+        _event_time_nanos: i64,
+    ) -> Result<(), String> {
+        self.push(PipeEachRow {
+            score,
+            entity_type: std::sync::Arc::from(entity_type),
+            entity_id: entity_id.to_string(),
+            values: values.to_vec(),
+        });
+        Ok(())
+    }
 }
 
 /// Outcome of [`RuleExecutor::execute_each_direct_batch`].

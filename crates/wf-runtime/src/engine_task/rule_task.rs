@@ -3353,18 +3353,6 @@ impl RuleTask {
             return;
         };
         let prepared = self.executor.each_batch_prepare(first.batch());
-        let mut out: Vec<wf_engine::match_engine::PipeEachRow> = Vec::with_capacity(rows.len());
-        let stats = self
-            .executor
-            .execute_each_pipe_batch_columnar(rows, &prepared, &mut out);
-        if let Some(metrics) = &self.metrics {
-            for _ in 0..stats.appended {
-                metrics.inc_alert_emitted_total(self.rule_name());
-            }
-            for _ in 0..stats.failed {
-                metrics.inc_alert_serialize_failed();
-            }
-        }
         // 行式路径在 stage_pipe_record 的 Uninit 分支解析形状并建 stager；
         // 列式路径同样惰性解析，但用 new_columnar 预计算列来源计划。
         let yield_names: Vec<Arc<str>> = self
@@ -3376,68 +3364,112 @@ impl RuleTask {
             .map(|f| Arc::from(f.name.as_str()))
             .collect();
         let rule_name = self.rule_name();
+        // 2026-08-25（pipe 写入分配足迹）：**先备好 stager，再把它当 sink 传进
+        // executor 流式装载**——不再先物化整批 `Vec<PipeEachRow>`（每行一个
+        // values Vec + 一个 entity_id String，实测 404 B/行）。锁在求值期间持有：
+        // `pipe_state` 是本 RuleTask 独占（分片各自一份，非 Arc 共享），无争用；
+        // 锁内全同步（无 await）。
         let mut guard = self.pipe_state.lock().unwrap();
-        match &mut *guard {
-            PipeState::Dead => {}
-            PipeState::Staging(stager) => {
-                for (row, (_, event_nanos)) in out.iter().zip(rows.iter()) {
-                    if let Err(e) = stager.push_row(rule_name, row, *event_nanos) {
-                        wf_warn!(
-                            pipe,
-                            task_id = %self.task_id,
-                            rule = %rule_name,
-                            output_kind = "intermediate",
-                            error = %e,
-                            "stage internal pipeline row failed (columnar)"
-                        );
-                    }
+        if matches!(&*guard, PipeState::Uninit) {
+            let target = self.executor.static_yield_target().clone();
+            match resolve_pipe_shape(&self.pipe_registry, &self.router, &target) {
+                Some((schema, time_col_index)) => {
+                    *guard = PipeState::Staging(PipeBatchStager::new_columnar(
+                        target,
+                        schema,
+                        time_col_index,
+                        &yield_names,
+                    ));
                 }
-            }
-            PipeState::Uninit => {
-                // 与行式 `stage_pipe_record` 同款惰性形状解析（首次发射时才
-                // 解析；pipe registry 启动期可能仍在填充）。
-                let target = self.executor.static_yield_target().clone();
-                match resolve_pipe_shape(&self.pipe_registry, &self.router, &target) {
-                    Some((schema, time_col_index)) => {
-                        let mut stager = PipeBatchStager::new_columnar(
-                            target,
-                            schema,
-                            time_col_index,
-                            &yield_names,
-                        );
-                        for (row, (_, event_nanos)) in out.iter().zip(rows.iter()) {
-                            if let Err(e) = stager.push_row(rule_name, row, *event_nanos) {
-                                wf_warn!(
-                                    pipe,
-                                    task_id = %self.task_id,
-                                    rule = %rule_name,
-                                    output_kind = "intermediate",
-                                    error = %e,
-                                    "stage internal pipeline row failed (columnar)"
-                                );
-                            }
-                        }
-                        *guard = PipeState::Staging(stager);
-                    }
-                    None => {
-                        wf_warn!(
-                            pipe,
-                            task_id = %self.task_id,
-                            rule = %rule_name,
-                            target = %target,
-                            output_kind = "intermediate",
-                            reason = "missing_internal_window",
-                            "missing internal pipeline window"
-                        );
-                        *guard = PipeState::Dead;
-                    }
+                None => {
+                    wf_warn!(
+                        pipe,
+                        task_id = %self.task_id,
+                        rule = %rule_name,
+                        target = %target,
+                        output_kind = "intermediate",
+                        reason = "missing_internal_window",
+                        "missing internal pipeline window"
+                    );
+                    *guard = PipeState::Dead;
                 }
             }
         }
+        let stats = match &mut *guard {
+            PipeState::Staging(stager) => {
+                let mut sink = PipeStagerSink {
+                    stager,
+                    rule_name,
+                    errors: 0,
+                };
+                let stats = self
+                    .executor
+                    .execute_each_pipe_batch_columnar(rows, &prepared, &mut sink);
+                if sink.errors > 0 {
+                    wf_warn!(
+                        pipe,
+                        task_id = %self.task_id,
+                        rule = %rule_name,
+                        output_kind = "intermediate",
+                        rows = sink.errors,
+                        "stage internal pipeline row failed (columnar)"
+                    );
+                }
+                stats
+            }
+            // Dead（缺中间窗）/ 其他：不装载，也不计发射数。
+            _ => wf_engine::match_engine::EachDirectBatchStats::default(),
+        };
         drop(guard);
+        if let Some(metrics) = &self.metrics {
+            for _ in 0..stats.appended {
+                metrics.inc_alert_emitted_total(self.rule_name());
+            }
+            for _ in 0..stats.failed {
+                metrics.inc_alert_serialize_failed();
+            }
+        }
         let _ = batch_emit_nanos;
     }
+}
 
+/// `PipeBatchStager` 的 [`PipeRowSink`] 适配器（2026-08-25 pipe 写入流式装载）：
+/// executor 逐行回调，直接装列——省掉整批 `Vec<PipeEachRow>` 中间层。
+/// `rule_name` 供 `__wfu_rule_name` 回退列；`errors` 聚合本批装载失败数
+/// （每行一条 warn 会在 3.5 万行批上淹没日志，故聚合后一次性上报）。
+struct PipeStagerSink<'a> {
+    stager: &'a mut PipeBatchStager,
+    rule_name: &'a str,
+    errors: usize,
+}
+
+impl wf_engine::match_engine::PipeRowSink for PipeStagerSink<'_> {
+    fn push_pipe_row(
+        &mut self,
+        score: f64,
+        entity_type: &str,
+        entity_id: &str,
+        values: &[Option<wf_engine::match_engine::Value>],
+        event_time_nanos: i64,
+    ) -> Result<(), String> {
+        match self.stager.push_row_parts(
+            self.rule_name,
+            score,
+            entity_type,
+            entity_id,
+            values,
+            event_time_nanos,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.errors += 1;
+                Err(e.to_string())
+            }
+        }
+    }
+}
+
+impl RuleTask {
     /// Flush the accumulated columnar alert batches to the sink writers,
     /// grouped by yield_target. Each sink receives one `AlertBatch` (a single
     /// channel send) of columnar records, amortizing the per-alert resolve /
@@ -3796,12 +3828,23 @@ enum PipeState {
 
 /// Per-column staging buffer. The variant is chosen once from the pipe
 /// schema; every row appends exactly one value (or null).
+/// 中间管道列装载缓冲。
+///
+/// 2026-08-25（pipe 写入分配足迹）：从 `Vec<Option<T>>` 改为 **Arrow builder**。
+/// 原实现的两处浪费（`malloc_history` + `pipe_write_alloc_footprint` 实证）：
+/// 1. `Vec<Option<i64>>` 是 **16B/值**（Option 对齐填充），Arrow 目标只需
+///    8B + 1bit —— builder 内部就是 `Vec<i64>` + null bitmap，直接省一半。
+/// 2. `Vec<Option<String>>` 每行一次 **String 堆分配**（3 个字符串列 × 35,360
+///    行 ≈ 10.6 万次/批），`StringBuilder` 追加进共享值缓冲 + offsets，
+///    per-row 分配归零。
+/// 3. `take_batch` 原先 `Int64Array::from(Vec<Option<_>>)` 是**全量拷贝**，
+///    改 `builder.finish()` 后是缓冲移动（零拷贝）。
 enum PipeCol {
-    Int64(Vec<Option<i64>>),
-    Float64(Vec<Option<f64>>),
-    Bool(Vec<Option<bool>>),
-    Utf8(Vec<Option<String>>),
-    Timestamp(Vec<Option<i64>>),
+    Int64(arrow::array::Int64Builder),
+    Float64(arrow::array::Float64Builder),
+    Bool(arrow::array::BooleanBuilder),
+    Utf8(arrow::array::StringBuilder),
+    Timestamp(arrow::array::TimestampNanosecondBuilder),
     /// Column types outside the supported coercion matrix stage as null —
     /// same fallback arm as `value_to_single_row_array`.
     Null {
@@ -3855,11 +3898,13 @@ impl PipeBatchStager {
             .fields()
             .iter()
             .map(|field| match field.data_type() {
-                DataType::Int64 => PipeCol::Int64(Vec::new()),
-                DataType::Float64 => PipeCol::Float64(Vec::new()),
-                DataType::Boolean => PipeCol::Bool(Vec::new()),
-                DataType::Utf8 => PipeCol::Utf8(Vec::new()),
-                DataType::Timestamp(_, _) => PipeCol::Timestamp(Vec::new()),
+                DataType::Int64 => PipeCol::Int64(arrow::array::Int64Builder::new()),
+                DataType::Float64 => PipeCol::Float64(arrow::array::Float64Builder::new()),
+                DataType::Boolean => PipeCol::Bool(arrow::array::BooleanBuilder::new()),
+                DataType::Utf8 => PipeCol::Utf8(arrow::array::StringBuilder::new()),
+                DataType::Timestamp(_, _) => {
+                    PipeCol::Timestamp(arrow::array::TimestampNanosecondBuilder::new())
+                }
                 other => PipeCol::Null {
                     data_type: other.clone(),
                     len: 0,
@@ -3953,10 +3998,17 @@ impl PipeBatchStager {
     /// （yield 值 / `__wf_pipe_ts` / `_wfu_meta_*`），coercion 矩阵与
     /// [`Self::push_record`] 逐分支一致（对拍测试钉死）。`rule_name` 供
     /// `_wfu_meta_rule_name` 回退列。
-    fn push_row(
+    ///
+    /// 2026-08-25（pipe 写入分配足迹）：参数改为**借用切片**，供 executor 的
+    /// 流式 sink 直接调用——不再需要先物化 `PipeEachRow`（每行一个 values Vec
+    /// + 一个 entity_id String，实测 404 B/行）。
+    fn push_row_parts(
         &mut self,
         rule_name: &str,
-        row: &wf_engine::match_engine::PipeEachRow,
+        score: f64,
+        entity_type: &str,
+        entity_id: &str,
+        values: &[Option<wf_engine::match_engine::Value>],
         event_time_nanos: i64,
     ) -> RuntimeResult<()> {
         use wf_engine::match_engine::Value;
@@ -3967,14 +4019,12 @@ impl PipeBatchStager {
         );
         for (idx, source) in self.col_sources.iter().enumerate() {
             let value = match source {
-                PipeColSource::Yield(yield_idx) => {
-                    row.values.get(*yield_idx).and_then(|v| v.as_ref())
-                }
+                PipeColSource::Yield(yield_idx) => values.get(*yield_idx).and_then(|v| v.as_ref()),
                 PipeColSource::EventTime => None,
                 PipeColSource::MetaRuleName => Some(&Value::Str(rule_name.into())),
-                PipeColSource::MetaScore => Some(&Value::Number(row.score)),
-                PipeColSource::MetaEntityType => Some(&Value::Str((&row.entity_type[..]).into())),
-                PipeColSource::MetaEntityId => Some(&Value::Str(row.entity_id.as_str().into())),
+                PipeColSource::MetaScore => Some(&Value::Number(score)),
+                PipeColSource::MetaEntityType => Some(&Value::Str(entity_type.into())),
+                PipeColSource::MetaEntityId => Some(&Value::Str(entity_id.into())),
                 PipeColSource::Missing => None,
             };
             let is_event_time = matches!(source, PipeColSource::EventTime);
@@ -3989,6 +4039,25 @@ impl PipeBatchStager {
         }
         self.rows += 1;
         Ok(())
+    }
+
+    /// `PipeEachRow` 形态的装载（bench 对照 / 对拍测试用）——委托
+    /// [`Self::push_row_parts`]，语义完全一致。
+    #[cfg(test)]
+    fn push_row(
+        &mut self,
+        rule_name: &str,
+        row: &wf_engine::match_engine::PipeEachRow,
+        event_time_nanos: i64,
+    ) -> RuntimeResult<()> {
+        self.push_row_parts(
+            rule_name,
+            row.score,
+            &row.entity_type,
+            &row.entity_id,
+            &row.values,
+            event_time_nanos,
+        )
     }
 
     /// Build the staged rows into one batch and parse it to events,
@@ -4020,21 +4089,17 @@ impl PipeBatchStager {
             .cols
             .iter_mut()
             .map(|col| match col {
-                PipeCol::Int64(v) => Ok(std::sync::Arc::new(arrow::array::Int64Array::from(
-                    std::mem::take(v),
-                )) as arrow::array::ArrayRef),
-                PipeCol::Float64(v) => Ok(std::sync::Arc::new(arrow::array::Float64Array::from(
-                    std::mem::take(v),
-                )) as arrow::array::ArrayRef),
-                PipeCol::Bool(v) => Ok(std::sync::Arc::new(arrow::array::BooleanArray::from(
-                    std::mem::take(v),
-                )) as arrow::array::ArrayRef),
-                PipeCol::Utf8(v) => Ok(std::sync::Arc::new(arrow::array::StringArray::from(
-                    std::mem::take(v),
-                )) as arrow::array::ArrayRef),
-                PipeCol::Timestamp(v) => Ok(std::sync::Arc::new(
-                    arrow::array::TimestampNanosecondArray::from(std::mem::take(v)),
-                ) as arrow::array::ArrayRef),
+                // `finish()` 移动 builder 内部缓冲（零拷贝）并重置 builder 供下一批
+                // 复用——原实现的 `XxxArray::from(std::mem::take(vec))` 是全量拷贝。
+                PipeCol::Int64(b) => Ok(std::sync::Arc::new(b.finish()) as arrow::array::ArrayRef),
+                PipeCol::Float64(b) => {
+                    Ok(std::sync::Arc::new(b.finish()) as arrow::array::ArrayRef)
+                }
+                PipeCol::Bool(b) => Ok(std::sync::Arc::new(b.finish()) as arrow::array::ArrayRef),
+                PipeCol::Utf8(b) => Ok(std::sync::Arc::new(b.finish()) as arrow::array::ArrayRef),
+                PipeCol::Timestamp(b) => {
+                    Ok(std::sync::Arc::new(b.finish()) as arrow::array::ArrayRef)
+                }
                 PipeCol::Null { data_type, len } => {
                     let array = new_null_array(data_type, *len);
                     *len = 0;
@@ -4077,35 +4142,48 @@ fn push_pipe_col(
         unreachable!("event-time field must be Timestamp");
     }
     match col {
-        PipeCol::Int64(v) => v.push(match value {
+        PipeCol::Int64(b) => b.append_option(match value {
             Some(wf_engine::match_engine::Value::Number(n)) => Some(*n as i64),
             _ => None,
         }),
-        PipeCol::Float64(v) => v.push(match value {
+        PipeCol::Float64(b) => b.append_option(match value {
             Some(wf_engine::match_engine::Value::Number(n)) => Some(*n),
             _ => None,
         }),
-        PipeCol::Bool(v) => v.push(match value {
-            Some(wf_engine::match_engine::Value::Bool(b)) => Some(*b),
+        PipeCol::Bool(b) => b.append_option(match value {
+            Some(wf_engine::match_engine::Value::Bool(v)) => Some(*v),
             _ => None,
         }),
-        PipeCol::Utf8(v) => {
-            v.push(match value {
-                Some(wf_engine::match_engine::Value::Str(s)) => Some(s.to_string()),
-                Some(wf_engine::match_engine::Value::Number(n)) => Some(n.to_string()),
-                Some(wf_engine::match_engine::Value::Bool(b)) => Some(b.to_string()),
+        PipeCol::Utf8(b) => {
+            // 字符串列是分配大头（3 列 × 35,360 行 ≈ 10.6 万次 String/批）：
+            // `Value::Str` 直接 `append_value(&str)`（**零中间 String**）；
+            // Number/Bool 用 `write!` 写进 builder 的共享值缓冲（同样零分配，
+            // 依赖 StringBuilder 实现了 `std::fmt::Write`）。数值渲染格式与
+            // 原 `n.to_string()` / `b.to_string()` 逐字节一致（Display 实现相同）。
+            match value {
+                Some(wf_engine::match_engine::Value::Str(s)) => b.append_value(s.as_str()),
+                Some(wf_engine::match_engine::Value::Number(n)) => {
+                    use std::fmt::Write as _;
+                    write!(b, "{n}").ok();
+                    b.append_value("");
+                }
+                Some(wf_engine::match_engine::Value::Bool(v)) => {
+                    use std::fmt::Write as _;
+                    write!(b, "{v}").ok();
+                    b.append_value("");
+                }
                 Some(
                     value @ (wf_engine::match_engine::Value::Array(_)
                     | wf_engine::match_engine::Value::Object(_)),
-                ) => Some(value_to_json_string(value)?),
-                _ => None,
-            });
+                ) => b.append_value(value_to_json_string(value)?),
+                _ => b.append_null(),
+            }
         }
-        PipeCol::Timestamp(v) => {
+        PipeCol::Timestamp(b) => {
             if is_event_time_field {
-                v.push(Some(event_time_nanos));
+                b.append_value(event_time_nanos);
             } else {
-                v.push(match value {
+                b.append_option(match value {
                     Some(wf_engine::match_engine::Value::Number(n)) => {
                         normalize_epoch_timestamp_float_nanos(*n)
                     }
