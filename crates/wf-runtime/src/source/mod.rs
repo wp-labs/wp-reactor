@@ -623,7 +623,7 @@ mod tests {
         assert_eq!(batches.len(), 2, "未切: 全部解码");
 
         // 切: 只解码哨兵帧（syslog 帧 body 即丢）。
-        crate::perf_diag::set_perf_cuts(false, false, false, true);
+        crate::perf_diag::set_perf_cuts(false, false, false, true, false);
         let mut bs = mk_src(vec![
             SourceEvent::new(
                 0,

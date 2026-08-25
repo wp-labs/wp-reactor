@@ -55,6 +55,28 @@ fn make_ranked_task(
         },
         super::tests::test_window_config(usize::MAX),
     ));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let config = ranked_task_config(keys, measures, detail, win, notify, HashMap::new());
+    let config = StatsTaskConfig {
+        sink_fanout: make_test_fanout(alert_tx),
+        ..config
+    };
+    let (task, _cancel) = StatsTask::new(config);
+    (task, alert_rx)
+}
+
+/// 构造 ranked（last/top）stats 任务的完整配置。窗口/notify/progress 由调用方给
+/// ——生产接线（registry 窗口 + actor 通知 + 分片 progress）与测试裸 Window 共用。
+fn ranked_task_config(
+    keys: Vec<Expr>,
+    measures: Vec<StatsMeasurePlan>,
+    detail: Expr,
+    win: Arc<Window>,
+    notify: Arc<tokio::sync::Notify>,
+    progress: HashMap<String, Arc<AtomicU64>>,
+) -> StatsTaskConfig {
+    let schema = win.schema().clone();
     let plan = StatsPlan {
         window_spec: WindowSpec::Fixed(Duration::from_secs(10)),
         keys,
@@ -117,7 +139,6 @@ fn make_ranked_task(
         limits_plan: None,
         conv_window: None,
     };
-    let (alert_tx, alert_rx) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     // last/top 行字段提取子集（P5: 生产经 spawn 恒有; 测试用全 schema 字段）——
     // 无子集时列数组列序不定, 任务层注入需要列名。
     let row_subset: Option<std::sync::Arc<std::collections::HashSet<String>>> =
@@ -127,16 +148,16 @@ fn make_ranked_task(
                 .map(String::from)
                 .collect(),
         ));
-    let config = StatsTaskConfig {
+    StatsTaskConfig {
         stats: StatsExecutor::with_row_fields(plan.clone(), row_subset),
         executor: RuleExecutor::new(rp),
         window_sources: vec![super::task_types::WindowSource {
             window_name: "bid_events".into(),
-            window: Arc::clone(&win),
-            notify: Arc::new(tokio::sync::Notify::new()),
+            window: win,
+            notify,
             aliases: vec!["b".into()],
         }],
-        sink_fanout: make_test_fanout(alert_tx),
+        sink_fanout: super::tests::make_test_fanout(mpsc::channel(1).0),
         cancel: tokio_util::sync::CancellationToken::new(),
         router: Arc::new(wf_engine::window::Router::new(
             wf_engine::window::WindowRegistry::build(vec![]).unwrap(),
@@ -148,14 +169,12 @@ fn make_ranked_task(
         pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
         eos_flush: tokio::sync::watch::channel(0u64).1,
         push_rx: None,
-        progress: std::collections::HashMap::new(),
+        progress,
         shard_index: None,
         shard_count: 1,
         merge_rx: None,
         merge_tx: None,
-    };
-    let (task, _cancel) = StatsTask::new(config);
-    (task, alert_rx)
+    }
 }
 
 /// 带 price/bidder/auction 的批次（q18/q19 任务测试用）。
@@ -1434,7 +1453,7 @@ async fn stats_task_perf_cut_rules_no_emit() {
     // cut_rules 单切（rules 档的 output 侧对照）: 归并直通 → 窗口无事件 →
     // 空窗不产出（无 EMIT）。恢复后同一数据正常归并 + 输出。全局门控跨
     // await 持锁（PERF_CUT_SERIAL）——否则并行测试期间其它 stats 测试被切。
-    crate::perf_diag::set_perf_cuts(true, false, false);
+    crate::perf_diag::set_perf_cuts(true, false, false, false, false);
     let (mut task, mut alert_rx) = make_q19_cut_task();
     push_batch(
         &mut task,
@@ -1463,7 +1482,7 @@ async fn stats_task_perf_cut_output_keeps_accumulate_no_emit() {
     let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     // full 档的对照: cut_output 只切输出链——归并照常（窗口 close 状态正确
     // 重置）, alert 不投递。恢复后正常输出。全局门控跨 await 持锁。
-    crate::perf_diag::set_perf_cuts(false, true, false);
+    crate::perf_diag::set_perf_cuts(false, true, false, false, false);
     let (mut task, mut alert_rx) = make_q19_cut_task();
     push_batch(
         &mut task,
@@ -1714,4 +1733,217 @@ async fn stats_task_window_not_closed_until_watermark_crosses() {
     let a2 = take_alert(&mut alert_rx);
     assert_eq!(field_str(&a2, "detail"), "1 0 1", "窗口 2 [10,20)");
     assert!(alert_rx.try_recv().is_err(), "只有 2 窗");
+}
+
+/// 复现 perf-diag 墙梯（q19 30m rules 档）冻结的**统计层**形态：真实 `StatsTask`
+/// （pull 模式）+ window actor + 小 mailbox 预算 + 小全局内存 cap + 周期 evictor。
+///
+/// 墙梯把同一批数据重发多次（每档一次），归并任务吃进第一批时若 append 持续
+/// 涌入且窗口超全局 cap，actor 会在 `commit_append` 的 `gate.freed` park——测试
+/// 验证**自愈**：任务追平后系统必须恢复（2026-08-25 线上：q19 30m 墙梯 rules 档
+/// CPU 0% 永久冻结 2min+，window 层已证自愈，本测试锁定 stats 层）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stats_pull_actor_evictor_over_budget_recovers() {
+    use wf_engine::window::{
+        Evictor, EvictionGate, WINDOW_CHANNEL_DEPTH, WindowDef, WindowMsg, WindowRegistry,
+        acquire_window_budget, run_window_actor,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    const ROWS_PER_BATCH: u64 = 100_000;
+    const N_BATCHES: u64 = 12;
+    const BATCH_BYTES: usize = 4 * 1024 * 1024; // 4MB/批
+    const MAILBOX_BUDGET: usize = BATCH_BYTES * 2; // 在途 2 批
+    const GLOBAL_CAP: usize = BATCH_BYTES; // 全局 cap = 1 批（每批都要先撞 cap）
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]));
+    let reg = Arc::new(
+        WindowRegistry::build(vec![WindowDef {
+            params: WindowParams {
+                name: "bid_events".into(),
+                schema: schema.clone(),
+                time_col_index: Some(3),
+                over: Duration::from_secs(3600),
+                materialize_fields: None,
+                defer_materialization: false,
+            },
+            streams: vec![],
+            config: super::tests::test_window_config(usize::MAX),
+        }])
+        .unwrap(),
+    );
+    let win = reg.get_window("bid_events").unwrap();
+    let notify = reg.get_notifier("bid_events").unwrap();
+    let slot = reg.progress("bid_events").unwrap().register_row_partitioned();
+
+    // actor + mailbox（小预算）
+    let (tx, rx) = mpsc::channel::<WindowMsg>(WINDOW_CHANNEL_DEPTH);
+    let budget = Arc::new(tokio::sync::Semaphore::new(MAILBOX_BUDGET));
+    let gate = Arc::new(EvictionGate::new(GLOBAL_CAP));
+    let name: Arc<str> = Arc::from("bid_events");
+    let fanout = wf_engine::window::RuleFanout::new();
+    let notify_a = Arc::clone(&notify);
+    let win_a = Arc::clone(&win);
+    let gate_a = Arc::clone(&gate);
+    let cancel = CancellationToken::new();
+    tokio::spawn(async move {
+        run_window_actor(name, win_a, gate_a, fanout, notify_a, rx, cancel, None).await;
+    });
+
+    // 周期 evictor
+    let gate_e = Arc::clone(&gate);
+    let reg_e = Arc::clone(&reg);
+    let evictor_task = tokio::spawn(async move {
+        let evictor = Evictor::new(Arc::clone(&gate_e));
+        loop {
+            evictor.run_once(&reg_e, 0);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    });
+
+    // q19 形状 stats 任务（pull 模式）: group by auction, top(2, price)
+    let detail = Expr::FuncCall {
+        qualifier: None,
+        name: "fmt".into(),
+        args: vec![
+            Expr::StringLit("{} {}".into()),
+            Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+            Expr::Field(FieldRef::Qualified("b".into(), "price".into())),
+        ],
+    };
+    let keys = vec![Expr::Field(FieldRef::Qualified(
+        "b".into(),
+        "auction".into(),
+    ))];
+    let measures = vec![StatsMeasurePlan {
+        label: "top_price".into(),
+        source_alias: "b".into(),
+        where_expr: None,
+        agg: StatsAggPlan::Top,
+        field: Some(FieldRef::Qualified("b".into(), "price".into())),
+        arg: Some(2),
+    }];
+    // 真实接线：registry 窗口 + actor 通知 + 分片 progress（make_ranked_task 用裸 Window）
+    let notify_task = Arc::clone(&notify);
+    let config = ranked_task_config(
+        keys,
+        measures,
+        detail,
+        win.clone(),
+        notify_task,
+        HashMap::from([("bid_events".to_string(), slot.clone())]),
+    );
+    let task = {
+        let (t, _c) = StatsTask::new(config);
+        t
+    };
+
+    // 消费者拉循环（镜像 run_stats_pull_loop：注册通知 → pull → 处理 → ack）——
+    // **必须先于生产者 spawn**（生产者会在 budget 上阻塞, 消费者要早就在跑）
+    let notify_c = Arc::clone(&notify);
+    let slot_pull = slot.clone();
+    let win_c = Arc::clone(&win);
+    let mut pull = tokio::spawn(async move {
+        let mut task = task;
+        loop {
+            let notified = notify_c.notified();
+            tokio::pin!(notified);
+            task.pull_and_process().await;
+            if slot_pull.load(std::sync::atomic::Ordering::Acquire) >= N_BATCHES {
+                break;
+            }
+            tokio::select! {
+                _ = &mut notified => {}
+                // 兜底轮询（镜像 timeout_tick 的周期性唤醒）
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    });
+
+    // 生产者：墙梯式重发同一批数据（相同事件时间）——镜像 dispatch_parsed
+    let ts = 10_000_000_000i64;
+    for seq in 0..N_BATCHES {
+        let acquired = tokio::time::timeout(
+            Duration::from_secs(10),
+            acquire_window_budget(&budget, MAILBOX_BUDGET, BATCH_BYTES),
+        )
+        .await;
+        let permits = match acquired {
+            Ok(p) => p,
+            Err(_) => {
+                panic!(
+                    "producer blocked on mailbox budget at seq={seq}: acked={} gate_bytes={} cap={GLOBAL_CAP} win_batches={} win_rows={} win_bytes={}",
+                    slot.load(std::sync::atomic::Ordering::Acquire),
+                    gate.current_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                    win.batch_count(),
+                    win.total_rows(),
+                    win.memory_usage(),
+                );
+            }
+        };
+        tx.send(WindowMsg::Append {
+            source: Arc::from("ingress"),
+            seq,
+            batch: big_bid_batch(&schema, ROWS_PER_BATCH, ts),
+            events: None,
+            byte_size: BATCH_BYTES,
+            permits,
+            shard_rows: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(15), &mut pull).await;
+    evictor_task.abort();
+    let acked = slot.load(std::sync::atomic::Ordering::Acquire);
+    if result.is_err() {
+        if pull.is_finished() {
+            // 消费者任务提前结束（panic?）——把 JoinError 亮出来
+            let join = pull.await;
+            panic!(
+                "pull task ended unexpectedly: {join:?} (acked={acked} gate_bytes={} cap={GLOBAL_CAP} win_batches={} win_rows={})",
+                gate.current_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                win.batch_count(),
+                win.total_rows(),
+            );
+        }
+        panic!(
+            "死锁：stats 任务未在超时内追平全部批（acked={acked}/{} gate_bytes={} cap={GLOBAL_CAP} win_batches={} win_rows={})",
+            N_BATCHES,
+            gate.current_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            win.batch_count(),
+            win.total_rows(),
+        );
+    }
+    result.expect("pull task panicked");
+    assert_eq!(acked, N_BATCHES, "全部批次被消费并 ack");
+}
+
+/// 构造 100k 行 bid 批（auction 0..1000 循环, price 递增——top-2 有真实竞争）。
+fn big_bid_batch(schema: &SchemaRef, rows: u64, ts: i64) -> RecordBatch {
+    use arrow::array::{Int64Array, TimestampNanosecondArray};
+    let n = rows as usize;
+    let price: Vec<i64> = (0..n as i64).collect();
+    let bidder: Vec<i64> = (0..n as i64).map(|i| i % 100).collect();
+    let auction: Vec<i64> = (0..n as i64).map(|i| i % 1000).collect();
+    RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(price)),
+            Arc::new(Int64Array::from(bidder)),
+            Arc::new(Int64Array::from(auction)),
+            Arc::new(TimestampNanosecondArray::from(vec![ts; n])),
+        ],
+    )
+    .unwrap()
 }

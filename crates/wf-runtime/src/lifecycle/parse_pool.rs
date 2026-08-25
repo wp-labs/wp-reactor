@@ -655,7 +655,7 @@ mod tests {
         };
 
         // 未切: 普通流进入 parse 管线。
-        crate::perf_diag::set_perf_cuts(false, false, false);
+        crate::perf_diag::set_perf_cuts(false, false, false, false, false);
         let ok = push_decoded_batch(
             &parse_tx,
             &preread,
@@ -672,7 +672,7 @@ mod tests {
         assert!(parse_rx.try_recv().is_ok(), "未切: 普通流进入 parse");
 
         // cut_append: 普通流解码后即丢; 哨兵流放行。
-        crate::perf_diag::set_perf_cuts(false, false, true);
+        crate::perf_diag::set_perf_cuts(false, false, true, false, false);
         let ok = push_decoded_batch(
             &parse_tx,
             &preread,
