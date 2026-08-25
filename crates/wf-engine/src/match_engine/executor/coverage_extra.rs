@@ -2464,6 +2464,33 @@ fn each_plan_columnar_safe_gate_branches() {
     }];
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
 
+    // 有活 join + 输出函数 yield → false（列式 join 富化路径未接入批量 cell，
+    // 拒绝避免 unreachable panic；回退行式）。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "y".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "fmt".into(),
+            args: vec![
+                Expr::StringLit("ip={}".into()),
+                Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+            ],
+        },
+    }];
+    plan.joins = vec![JoinPlan {
+        right_window: "w".into(),
+        mode: JoinMode::Inner,
+        conds: vec![],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    }];
+    assert!(
+        !RuleExecutor::new(plan).each_plan_columnar_safe(),
+        "有活 join 时输出函数 yield 必须回退行式"
+    );
+
     // Path yield field → false.
     let mut plan = base();
     plan.yield_plan.fields = vec![YieldField {
@@ -3170,6 +3197,102 @@ fn each_columnar_output_funcs_match_row_path() {
     assert_eq!(label(&out_col[0]), "ip=10.1.1.1|n=3", "row 0 fmt");
     assert_eq!(label(&out_col[1]), "", "row 1 fmt null sip → 空串");
     assert_eq!(label(&out_col[2]), "", "row 2 fmt null count → 空串");
+}
+
+/// fmt 参数为结构化（object）字段：形状 gate 放行，但编译失败 → 行式回退，
+/// 输出与纯行式路径逐字段一致（object 渲染 [object]）。
+#[test]
+fn each_columnar_fmt_structured_arg_falls_back_matches_row_path() {
+    use crate::match_engine::WFL_FIELD_TYPE_METADATA_KEY;
+    use crate::match_engine::WFL_FIELD_TYPE_OBJECT;
+    use wp_model_core::model::Value as ModelValue;
+
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("ext", DataType::Utf8, true).with_metadata(std::collections::HashMap::from(
+            [(
+                WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                WFL_FIELD_TYPE_OBJECT.to_string(),
+            )],
+        )),
+        ArrowField::new("sip", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![Some(r#"{"k":1}"#), Some(r#"{"k":2}"#)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("10.0.0.1"), Some("10.0.0.2")])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let mut plan = simple_rule_plan(
+        "obj_fmt",
+        simple_plan(vec![], vec![]),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "label".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "fmt".into(),
+            args: vec![
+                Expr::StringLit("x={}".into()),
+                Expr::Field(FieldRef::Qualified("e".into(), "ext".into())),
+            ],
+        },
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("label".into(), FieldType::Base(BaseType::Chars))]),
+    );
+    // 形状 gate 放行；执行时结构化参数编译失败 → 行式回退（不 panic）。
+    assert!(exec.each_plan_columnar_safe());
+
+    let t = 1_700_000_000_000_000_000i64;
+    let events = crate::match_engine::event_bridge::batch_to_events(&batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    assert_eq!(sr.appended, 2);
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let col_events: Vec<ColumnarEvent> = (0..2).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+    assert_eq!(sc.appended, 2);
+    assert_eq!(sc.failed, 0);
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(out_row, out_col);
+    // 行式回退渲染 [object]。
+    let label = |r: &wp_model_core::model::DataRecord| {
+        r.fields()
+            .find(|f| f.get_name() == "label")
+            .and_then(|f| match f.get_value() {
+                ModelValue::Chars(v) => Some(v.to_string()),
+                _ => None,
+            })
+            .expect("label field")
+    };
+    assert_eq!(label(&out_col[0]), "x=[object]", "object 参数渲染 [object]");
 }
 
 // ---------------------------------------------------------------------------

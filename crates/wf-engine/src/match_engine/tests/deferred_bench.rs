@@ -451,6 +451,7 @@ fn deferred_scan_strategy_bench() {
             wm += batch_ns;
             due_total += scan_full(&mut p, wm);
         }
+        std::hint::black_box(&due_total);
         let full_ns = t0.elapsed().as_secs_f64() * 1e9 / rounds as f64;
 
         // 真实 DeferredPending 含 Event（HashMap），拷贝成本高——用大结构模拟。
@@ -483,6 +484,7 @@ fn deferred_scan_strategy_bench() {
             }
             bp = keep;
         }
+        std::hint::black_box(&due_totalb);
         let full_big_ns = t0b.elapsed().as_secs_f64() * 1e9 / rounds as f64;
 
         // 候选修复（前缀扫，且插入有序）
@@ -645,7 +647,7 @@ fn contention_case<I: ContendedIndex + Sync>(
             let ops = Arc::clone(&reader_ops);
             scope.spawn(move || {
                 let mut state =
-                    0x9E37_79B9_7F4A_7C15u64 ^ (r as u64) * 0x9E37_79B9_7F4A_7C15;
+                    0x9E37_79B9_7F4A_7C15u64 ^ ((r as u64) * 0x9E37_79B9_7F4A_7C15);
                 while !stop.load(AtomicOrdering::Relaxed) {
                     let key = pick_key(&mut state, n_keys);
                     std::hint::black_box(index.lookup(key));

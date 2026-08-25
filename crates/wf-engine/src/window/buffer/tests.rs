@@ -1727,10 +1727,10 @@ fn join_index_sharded_lookup_evict_and_asof_span_all_shards() {
     let mask = JOIN_INDEX_SHARDS - 1;
     let mut per_shard: Vec<Vec<i64>> = vec![Vec::new(); JOIN_INDEX_SHARDS];
     let mut k = 0i64;
-    for s in 0..JOIN_INDEX_SHARDS {
+    for (s, shard) in per_shard.iter_mut().enumerate() {
         loop {
             if JoinIndex::shard_of(&JoinKey::Int(k), mask) == s {
-                per_shard[s].push(k);
+                shard.push(k);
                 k += 1;
                 break;
             }
@@ -1999,7 +1999,7 @@ fn join_index_concurrent_append_evict_lookup_no_deadlock() {
     writer.join().expect("writer join");
     evictor.join().expect("evictor join");
     // 只断言无死锁/无 panic（hit 数随交错变化，无固定期望）。
-    assert!(hit >= 0);
+    std::hint::black_box(hit);
 }
 
 // -- Eager-drop regression (window log reclamation) ------------------------

@@ -576,6 +576,21 @@ fn compile_guard_func(
     }
 }
 
+/// 输出函数参数是否为结构化列（`wf.wfl.field_type` = array/object 元数据）。
+/// 结构化列在解释路径解析成 `Value::Array`/`Value::Object`，列式读原始 JSON
+/// 文本（OBJECT）或 `CScalar::Structured`（ARRAY），渲染语义不同 → 相关输出
+/// 表达式整体回退行式。
+fn arg_reads_structured(view: &ColumnarBatch<'_>, expr: &Expr) -> bool {
+    let Expr::Field(field) = expr else {
+        return false;
+    };
+    let Some(&proj) = view.field_map.get(field_ref_name(field)) else {
+        return false;
+    };
+    let col_idx = view.projection[proj];
+    wfl_structured_field_kind(view.batch.schema().field(col_idx)).is_some()
+}
+
 /// Compile a gate-admitted output function (`fmt` / `strftime` / `count_char`)
 /// into a yield-cell [`ColumnExpr`] node. Argument shapes are guaranteed by
 /// `columnar_output_expr` (flat field / literal); a failure here (e.g. a
@@ -592,6 +607,14 @@ fn compile_output_func(
             let Expr::StringLit(template) = &args[0] else {
                 return None;
             };
+            // 结构化参数（ARRAY / OBJECT 元数据列）→ 回退行式：解释路径把
+            // 这类字段解析成 Value::Array/Object 并渲染 `[array]` / `[object]`，
+            // 列式读原始 JSON 文本（OBJECT）或 Structured 标记（ARRAY），渲染
+            // 字节不同。strftime/count_char 的参数对结构化天然一致（非
+            // Number/Str → None → 空串），无需回退。
+            if args[1..].iter().any(|a| arg_reads_structured(view, a)) {
+                return None;
+            }
             let cargs: Option<Vec<ColumnExpr>> =
                 args[1..].iter().map(|a| compile_expr(a, view)).collect();
             Some(ColumnExpr::Fmt {
@@ -2583,6 +2606,54 @@ mod tests {
         assert_output_equiv(
             &call("count_char", vec![f("action"), Expr::StringLit(String::new())]),
             &batch,
+        );
+    }
+
+    #[test]
+    fn fmt_structured_arg_falls_back_to_row() {
+        use crate::match_engine::WFL_FIELD_TYPE_OBJECT;
+
+        // OBJECT 元数据的 Utf8 列：解释路径解析成 Value::Object 渲染
+        // `[object]`，列式读原始 JSON 文本——字节不同，必须行式回退。
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ext", DataType::Utf8, true).with_metadata(
+                std::collections::HashMap::from([(
+                    WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                    WFL_FIELD_TYPE_OBJECT.to_string(),
+                )]),
+            ),
+            Field::new("id", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some(r#"{"k":1}"#)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(7)])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let fmt = Expr::FuncCall {
+            qualifier: None,
+            name: "fmt".into(),
+            args: vec![
+                Expr::StringLit("x={}".into()),
+                Expr::Field(FieldRef::Simple("ext".into())),
+            ],
+        };
+        // 形状 gate 放行（flat 字段参数），但编译必须失败 → 行式回退。
+        assert!(wf_lang::columnar::columnar_output_expr(&fmt));
+        let view = ColumnarBatch::from_all_fields(&batch);
+        assert!(
+            compile_guard(&fmt, &view).is_none(),
+            "fmt 结构化参数必须编译失败（行式回退）"
+        );
+        // 行式渲染：Value::Object → value_to_string → "[object]"。
+        let events = batch_to_events(&batch);
+        assert_eq!(
+            eval_expr(&fmt, &events[0])
+                .unwrap_or_else(|| Value::Str(SmolStr::default())),
+            Value::Str("x=[object]".into()),
+            "解释路径渲染 [object]"
         );
     }
 }

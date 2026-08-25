@@ -731,8 +731,11 @@ impl RuleExecutor {
                 Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => true,
                 Expr::Field(fr) => out_shape_ok(fr),
                 // 列式输出函数（fmt/strftime/count_char，参数为字面量/flat 字段）
-                // 走批量 cell 求值；其他一般表达式回退行式。
-                other => wf_lang::columnar::columnar_output_expr(other),
+                // 走无 join 路径的批量 cell 求值；有活 join 时拒绝（列式 join
+                // 富化路径未接入批量 cell，回退行式避免 unreachable panic）。
+                other => {
+                    self.live_joins.is_empty() && wf_lang::columnar::columnar_output_expr(other)
+                }
             })
     }
 
@@ -822,6 +825,9 @@ impl RuleExecutor {
         // 求值一次，行循环只取 cell（向量化 cell 求值）。编译失败（结构化列
         // 参数等）→ 该 yield 行式回退。
         let batch0 = rows.first().map(|(ev, _)| ev.batch());
+        let has_general_yield = yield_kinds
+            .iter()
+            .any(|k| matches!(k, YieldKind::General));
         let view = batch0.map(ColumnarBatch::from_all_fields);
         let general_plans: Vec<Option<ColumnExpr>> = self
             .plan
@@ -1055,20 +1061,22 @@ impl RuleExecutor {
             if let Some(t) = t_wfx {
                 prof.add(e1_bucket_wfx(), t);
             }
-            // Columnar-output General yields (fmt/strftime/count_char) and the
-            // interpreted fallback (compile failure) both need the same meta
-            // the Event-based path builds per row.
-            let yield_meta = self.each_yield_meta(
-                &wfx_id,
-                &fired_at,
-                &emit_time,
-                &summary,
-                score,
-                &entity_id,
-                &origin,
-                *event_time_nanos,
-                emit_time_nanos,
-            );
+            // 仅当存在 General yield（列式输出函数 / 行式回退）时构造 meta——
+            // 纯 Lit/Field 输出（q1 等）不构造，避免每行开销（原注释：被 gate
+            // 排除时 TLS 进出是纯开销）。
+            let yield_meta = has_general_yield.then(|| {
+                self.each_yield_meta(
+                    &wfx_id,
+                    &fired_at,
+                    &emit_time,
+                    &summary,
+                    score,
+                    &entity_id,
+                    &origin,
+                    *event_time_nanos,
+                    emit_time_nanos,
+                )
+            });
 
             // -- Yield staging (fallible work before any column push) ------
             // Literal fields were registered batch-level above and are filled
@@ -1151,7 +1159,7 @@ impl RuleExecutor {
                                 None => eval_yield_expr_with_meta(
                                     &field.value,
                                     &event.to_event(),
-                                    yield_meta,
+                                    yield_meta.expect("has_general_yield → meta 已构造"),
                                 )
                                 .expect("eval_yield_expr_with_meta never returns None"),
                             };
