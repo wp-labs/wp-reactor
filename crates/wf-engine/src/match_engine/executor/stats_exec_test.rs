@@ -1874,6 +1874,93 @@ fn stats_top_precheck_skips_below_cutoff_rows() {
 }
 
 #[test]
+fn stats_top_precheck_random_stream_matches_reference() {
+    // 强验证（预检正确性）: 随机流 × 高淘汰压力（top-5, 20 auction × ~200 bid,
+    // ~97.5% 行被预检挡下）——close 结果与**独立参考实现**（每键全量收集 →
+    // 按 (price DESC, 到达序 ASC) 排序 → 取前 N）逐位一致。若预检误淘汰
+    // 或误放行, 条目内容必然偏离参考。
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![top_measure("top_price", "price", 5)],
+    );
+    let mut rng: u64 = 0x1234_5678_9abc_def0;
+    let next = |rng: &mut u64| {
+        *rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *rng >> 33
+    };
+    let mut rows = Vec::new();
+    for _ in 0..4000usize {
+        let auction = next(&mut rng) % 20;
+        let price = next(&mut rng) % 1000; // 大量低值 → 高淘汰率
+        let bidder = next(&mut rng) % 100;
+        rows.push(row(&[
+            ("auction", num(auction as f64)),
+            ("price", num(price as f64)),
+            ("bidder", num(bidder as f64)),
+        ]));
+    }
+    // 参考: 每键全量收集 (price, bidder, 到达序) → 降序取前 5（同价先到者前）。
+    let mut reference: HashMap<u64, Vec<(f64, f64, usize)>> = HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        let auction = match r.get("auction") {
+            Some(Value::Number(n)) => *n as u64,
+            _ => unreachable!(),
+        };
+        let price = match r.get("price") {
+            Some(Value::Number(n)) => *n,
+            _ => unreachable!(),
+        };
+        let bidder = match r.get("bidder") {
+            Some(Value::Number(n)) => *n,
+            _ => unreachable!(),
+        };
+        reference.entry(auction).or_default().push((price, bidder, i));
+    }
+    let names = sorted_bid_names();
+    for (name, mut exec) in [
+        ("行式", {
+            let mut e = StatsExecutor::new(plan.clone());
+            e.process_rows(&rows, extract);
+            e
+        }),
+        ("列式", {
+            let batch = rows_to_batch(&rows);
+            let mut e = StatsExecutor::new(plan.clone());
+            assert!(e.process_batch(&batch), "字段键应可列式化");
+            e
+        }),
+    ] {
+        let buckets = exec.close_window_by_bucket_rows();
+        assert_eq!(buckets.len(), reference.len(), "{name}: 键数一致");
+        for b in &buckets {
+            let auction = match &b.key {
+                ScopeKey::Int(v) => *v as u64,
+                _ => panic!("{name}: 期望 Int 键"),
+            };
+            let mut ref_entries = reference[&auction].clone();
+            ref_entries.sort_by(|a, c| {
+                c.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.2.cmp(&c.2)) // 同价先到者前
+            });
+            ref_entries.truncate(5);
+            let entries = &b.measures[0];
+            assert_eq!(entries.len(), ref_entries.len(), "{name}: auction {auction} 条目数");
+            for (k, (re, e)) in ref_entries.iter().zip(entries.iter()).enumerate() {
+                assert_eq!(e.measure_value, re.0, "{name}: auction {auction} rank {k} price");
+                assert_eq!(
+                    row_val(e.row_fields.as_ref().expect("条目带行字段"), &names, "bidder"),
+                    Some(&num(re.1)),
+                    "{name}: auction {auction} rank {k} bidder"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn stats_row_fields_compact_and_shared() {
     // P5 紧凑化结构验证: (1) 行字段列数组长度 = 子集大小（非整行 8 字段）;
     // (2) 同桶多个 last 度量 Arc 共享同一列数组（内存 1 份）。
