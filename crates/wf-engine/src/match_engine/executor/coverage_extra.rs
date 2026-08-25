@@ -2305,6 +2305,22 @@ fn each_plan_columnar_safe_gate_branches() {
     });
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
 
+    // 列式 each filter + 活 join → false（列式 join 富化路径未接 filter 求值）。
+    let mut plan = base();
+    plan.joins = vec![JoinPlan {
+        right_window: "w".into(),
+        mode: JoinMode::Inner,
+        conds: vec![],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    }];
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: Some(Expr::Bool(true)),
+    });
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+
     // Non-columnar bind filter → false.
     let mut plan = base();
     plan.binds[0].filter = Some(Expr::FuncCall {
@@ -3609,6 +3625,126 @@ fn each_columnar_nested_structured_falls_back_matches_row_path() {
     assert_eq!(get(&out_col[0], "cc"), "", "count_char(Object) → None → 空串");
     assert_eq!(get(&out_col[1], "cc"), "", "count_char(Object) → None → 空串");
     assert_eq!(get(&out_col[2], "cc"), "", "count_char(null) → None → 空串");
+}
+
+/// 空 rows：wrapper 与 `_with` 都应安全返回零统计（batch 级注册/预留对空批是
+/// no-op，循环不执行；`emit_each_direct_batch_columnar` 的空行早退路径同源）。
+#[test]
+fn each_columnar_empty_rows_is_noop() {
+    let b_field = |n: &str| Expr::Field(FieldRef::Qualified("b".into(), n.into()));
+    let mut plan = simple_rule_plan(
+        "empty",
+        simple_plan(vec![], vec![]),
+        Expr::Number(5.0),
+        "digit",
+        b_field("auction"),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "b".into(),
+        // 列式 filter：即便有 filter，空 rows 也不该有任何求值/拒绝。
+        filter: Some(Expr::Bool(true)),
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "detail".into(),
+        value: Expr::StringLit("x".into()),
+    }];
+    let exec = RuleExecutor::new(plan);
+    assert!(exec.each_plan_columnar_safe());
+
+    // wrapper（prepare default 路径）。
+    let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended = Vec::new();
+    let stats = exec.execute_each_direct_batch_columnar(&[], 0, &mut builder, &mut appended);
+    assert_eq!(stats.appended, 0);
+    assert_eq!(stats.rejected, 0);
+    assert_eq!(stats.failed, 0);
+    assert!(appended.is_empty());
+    assert_eq!(builder.finish().len(), 0, "空批不得产出任何行");
+
+    // _with（真实 prepared + 空 rows）：debug_assert 不得触发，统计为零。
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("auction", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![Some(1)])) as ArrayRef],
+    )
+    .unwrap();
+    let prepared = exec.each_batch_prepare(&batch);
+    let mut b2 = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app2 = Vec::new();
+    let s2 = exec.execute_each_direct_batch_columnar_with(
+        &[],
+        0,
+        &prepared,
+        &mut b2,
+        &mut app2,
+    );
+    assert_eq!(s2.appended, 0);
+    assert_eq!(s2.rejected, 0);
+    assert_eq!(s2.failed, 0);
+    assert!(app2.is_empty());
+}
+
+/// each filter 引用批 schema 里不存在的列：gate 放行（形状可列式），列式编译
+/// 解析成 `ColKind::Null` → 掩码全 None → 全拒绝；行式 `passes_each_filter`
+/// 对缺字段求值 None → 同样全拒绝。两路统计与输出必须一致。
+#[test]
+fn each_columnar_filter_missing_column_rejects_all_parity() {
+    let b_field = |n: &str| Expr::Field(FieldRef::Qualified("b".into(), n.into()));
+    let mut plan = simple_rule_plan(
+        "missing_filter",
+        simple_plan(vec![], vec![]),
+        Expr::Number(5.0),
+        "digit",
+        b_field("auction"),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "b".into(),
+        // b.price 不在下面 batch 的 schema 里。
+        filter: Some(Expr::BinOp {
+            op: BinOp::Gt,
+            left: Box::new(b_field("price")),
+            right: Box::new(Expr::Number(1.0)),
+        }),
+    });
+    plan.yield_plan.fields = vec![YieldField {
+        name: "detail".into(),
+        value: Expr::StringLit("x".into()),
+    }];
+    let exec = RuleExecutor::new(plan);
+    assert!(exec.each_plan_columnar_safe());
+
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("auction", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![Some(1), Some(2), None])) as ArrayRef],
+    )
+    .unwrap();
+    let t = 1_700_000_000_000_000_000i64;
+
+    let events = crate::match_engine::event_bridge::batch_to_events(&batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    assert_eq!(sr.rejected, 3, "行式：缺字段 → None → 全拒绝");
+    assert_eq!(sr.appended, 0);
+
+    let col_events: Vec<ColumnarEvent> = (0..3).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+    assert_eq!(sc.rejected, 3, "列式：ColKind::Null → 全拒绝");
+    assert_eq!(sc.appended, 0);
+    assert_eq!(sc.failed, 0);
+    assert_eq!(app_row, Vec::<usize>::new());
+    assert_eq!(app_col, Vec::<usize>::new());
 }
 
 // ---------------------------------------------------------------------------

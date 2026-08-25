@@ -755,9 +755,8 @@ impl RuleExecutor {
 /// Batch-level precomputed on-each columnar state: the general-yield output
 /// cvecs (`fmt`/`strftime`/`count_char`, batch-evaluated once) and the
 /// each-filter mask. Opaque to callers — evaluated once per frame via
-/// [`RuleExecutor::each_batch_prepare`] and reused across the
-/// [`ALERT_BATCH_SIZE`](crate::match_engine::executor::ALERT_BATCH_SIZE)
-/// segments of one batch.
+/// [`RuleExecutor::each_batch_prepare`] and reused across the runtime's
+/// `ALERT_BATCH_SIZE` segments of one batch.
 #[derive(Default)]
 pub struct EachBatchVecs {
     general_cvecs: Vec<Option<CVec>>,
@@ -1007,7 +1006,8 @@ impl RuleExecutor {
         // `ColumnarEvent::value_at` in the loop.
         let batch0 = rows.first().map(|(ev, _)| ev.batch());
         debug_assert!(
-            prepared.batch_ptr == 0
+            rows.is_empty()
+                || prepared.batch_ptr == 0
                 || batch0.is_some_and(|b| (b as *const RecordBatch as usize) == prepared.batch_ptr),
             "each_batch_prepare 必须来自 rows 的同一批"
         );
