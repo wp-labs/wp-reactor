@@ -4,14 +4,17 @@
 use std::sync::Arc;
 
 use std::collections::HashSet;
+use std::collections::HashMap;
 
 use arrow::array::{ArrayRef, Int64Array, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc;
 
-use wf_engine::match_engine::RuleExecutor;
-use wf_engine::window::{Router, Window, WindowDef, WindowParams, WindowRegistry};
+use wf_engine::match_engine::{RuleExecutor, Value};
+use wf_engine::window::{
+    ProviderWindow, Router, Window, WindowDef, WindowParams, WindowRegistry,
+};
 use wf_lang::ast::{
     Bound, BoundVal, Expr, FieldRef, JoinMode, PathSegment, ReduceMeasure, TieSpec, WithinSpec,
 };
@@ -1469,6 +1472,37 @@ rule q9_winning_bid {
 }
 "#;
 
+/// 与 `wf-examples/performance/nexmark_pk/models/queries/q13.wfl` 同步的双规则链源码
+/// （q13a 写中间窗 bid_mod → q13b join side_input 静态表）。
+/// 100M 实测 RSS 27GB + `memory_evicted_total=1479`（2026-08-25）——复现测试用。
+const Q13_WFL: &str = r#"
+rule q13a_bid_mod {
+    events { b : bid_events }
+    on each b -> score(10.0)
+    entity(digit, b.bidder)
+    yield bid_mod (
+        id = b.bidder,
+        bidder = b.bidder,
+        auction = b.auction,
+        price = b.price,
+        dateTime = b.dateTime,
+        mod_key = b.auction % 10000
+    )
+}
+rule q13b_side_input_join {
+    events { m : bid_mod }
+    on each m -> score(10.0)
+    join side_input snapshot on m.mod_key == side_input.key
+    entity(digit, m.bidder)
+    yield nexmark_alerts (
+        id = m.bidder,
+        alert_type = "q13_sidejoin",
+        detail = fmt("{}", side_input.value),
+        request_count = 1
+    )
+}
+"#;
+
 fn nexmark_schemas() -> Vec<wf_lang::WindowSchema> {
     use wf_lang::{BaseType, FieldDef, FieldType};
     let f = |name: &str, ft: FieldType| FieldDef {
@@ -1514,6 +1548,29 @@ fn nexmark_schemas() -> Vec<wf_lang::WindowSchema> {
                 f("detail", c()),
                 f("request_count", d()),
             ],
+        },
+        // q13 中间窗（q13a yield → q13b bind）
+        wf_lang::WindowSchema {
+            name: "bid_mod".to_string(),
+            streams: vec![],
+            time_field: Some("dateTime".to_string()),
+            over: std::time::Duration::ZERO,
+            fields: vec![
+                f("id", d()),
+                f("bidder", d()),
+                f("auction", d()),
+                f("price", d()),
+                f("dateTime", t()),
+                f("mod_key", d()),
+            ],
+        },
+        // q13 有界侧输入静态表（provider）
+        wf_lang::WindowSchema {
+            name: "side_input".to_string(),
+            streams: vec![],
+            time_field: None,
+            over: std::time::Duration::ZERO,
+            fields: vec![f("key", d()), f("value", c())],
         },
     ]
 }
@@ -1566,6 +1623,84 @@ fn q9c_window_def(name: &str, schema: &Arc<Schema>) -> WindowDef {
     }
 }
 
+/// q13 双规则链测试的窗口定义：可指定字节预算（中间窗用小预算触发驱逐）。
+/// 中间窗 `bid_mod` over=0（无时间驱逐，模拟中间窗无 over 配置——只靠内存驱逐）。
+fn q13c_window_def(name: &str, schema: &Arc<Schema>, max_bytes: usize) -> WindowDef {
+    let mut cfg = super::tests::test_window_config(max_bytes);
+    cfg.name = name.to_string();
+    let time_idx = if name == "bid_mod" { 4 } else { 3 }; // dateTime 列位置
+    WindowDef {
+        params: WindowParams {
+            name: name.to_string(),
+            schema: schema.clone(),
+            time_col_index: Some(time_idx),
+            over: std::time::Duration::ZERO,
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        streams: vec![name.to_string()],
+        config: cfg,
+    }
+}
+
+fn q13c_bid_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]))
+}
+
+fn q13c_bid_mod_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("mod_key", DataType::Int64, true),
+    ]))
+}
+
+fn q13c_bid_batch(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
+    // (auction, bidder, price, dateTime)
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
+        Arc::new(Int64Array::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
+        Arc::new(Int64Array::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
+        Arc::new(TimestampNanosecondArray::from(
+            rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+        )),
+    ];
+    RecordBatch::try_new(q13c_bid_schema(), cols).unwrap()
+}
+
+fn q13c_bid_mod_batch(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
+    // (id, bidder, auction, price, dateTime, mod_key) — mod_key = auction % 10000
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
+        Arc::new(Int64Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
+        Arc::new(Int64Array::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
+        Arc::new(Int64Array::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
+        Arc::new(TimestampNanosecondArray::from(
+            rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.1 % 10000).collect::<Vec<_>>(),
+        )),
+    ];
+    RecordBatch::try_new(q13c_bid_mod_schema(), cols).unwrap()
+}
+
 fn q9c_auction_batch(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
     // (id, seller, dateTime, expires)
     let cols: Vec<ArrayRef> = vec![
@@ -1602,6 +1737,291 @@ fn q9c_bid_batch(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
         )),
     ];
     RecordBatch::try_new(q9c_bid_schema(), cols).unwrap()
+}
+
+/// q13 双规则链复现（2026-08-25 100M RSS 27GB + memory_evicted_total=1479）：
+///
+/// 链：q13a（on each b → yield 中间窗 bid_mod）→ q13b（on each m + join
+/// side_input 静态表）。复现目标：中间窗积压时（写入快、消费慢）——
+/// ① 中间窗的内存驱逐**不得丢未读数据**（消费者 ack floor 保护，输出完整）；
+/// ② 已读数据被驱逐回收（内存有界）。
+///
+/// 生产路径：task_b 通过 `register_progress` 注册 bid_mod 消费者槽（spawn.rs），
+/// 测试模拟该配置；负向对照（无槽位）验证引擎对"未注册消费者"中间窗的驱逐行为
+/// ——若生产中间窗漏注册，就会丢未读（memory_evicted_total 归因方向）。
+#[tokio::test]
+async fn q13_dual_chain_intermediate_window_pressure() {
+    super::tests::init_tracing();
+    let schemas = nexmark_schemas();
+    let file = wf_lang::parse_wfl(Q13_WFL).expect("parse q13.wfl");
+    let plans = wf_lang::compile_wfl(&file, &schemas).expect("compile q13.wfl");
+    assert_eq!(plans.len(), 2, "q13.wfl → 2 个 plan（q13a_bid_mod + q13b_side_input_join）");
+    let mut plans = plans.into_iter();
+    let mut plan_a = plans.next().unwrap();
+    let plan_b = plans.next().unwrap();
+    plan_a.name = "q13a_bid_mod".into();
+
+    // 中间窗预算 = 3 个中间 batch（每 bid batch 写 1 个中间 batch）——写入超过
+    // 预算触发内存驱逐。probe 用 3 行 batch（与实际驱动批同构）。
+    let probe = q13c_bid_mod_batch(&[(1, 1, 100, T), (1, 2, 200, T), (1, 3, 300, T)]);
+    let one_batch_bytes = wf_engine::window::content_bytes(&probe);
+    let bid_mod_budget = one_batch_bytes * 3;
+
+    let mut registry = WindowRegistry::build(vec![
+        q13c_window_def("bid_events", &q13c_bid_schema(), usize::MAX),
+        q13c_window_def("bid_mod", &q13c_bid_mod_schema(), bid_mod_budget),
+    ])
+    .unwrap();
+    // side_input 静态表：mod_key 1 → "v1"，2 → "v2"
+    let mut pw = ProviderWindow::new(
+        "side_input".into(),
+        "SELECT * FROM side_input".into(),
+        None,
+    );
+    pw.load(vec![
+        {
+            let mut m = HashMap::new();
+            m.insert("key".to_string(), Value::Number(1.0));
+            m.insert("value".to_string(), Value::Str("v1".into()));
+            m
+        },
+        {
+            let mut m = HashMap::new();
+            m.insert("key".to_string(), Value::Number(2.0));
+            m.insert("value".to_string(), Value::Str("v2".into()));
+            m
+        },
+    ]);
+    registry
+        .register_provider("side_input".to_string(), pw)
+        .unwrap();
+    let router = Arc::new(Router::new(registry));
+
+    // task_a：q13a（驱动 bid_events → yield 中间窗 bid_mod）
+    let src_a = router.registry().get_window("bid_events").unwrap();
+    let notify_a = router.registry().get_notifier("bid_events").unwrap();
+    let executor_a = RuleExecutor::new(plan_a);
+    let (alert_tx_a, _alert_rx_a) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let mut intermediate = HashSet::new();
+    intermediate.insert("bid_mod".to_string());
+    let config_a = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
+        conv_sink: None,
+        machine: None,
+        each_alias: Some("b".into()),
+        each_time_field: Some("dateTime".into()),
+        executor: executor_a,
+        window_sources: vec![task_types::WindowSource {
+            window_name: "bid_events".into(),
+            window: src_a,
+            notify: notify_a,
+            aliases: vec!["b".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx_a),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout_scan_interval: std::time::Duration::from_secs(60),
+        router: Arc::clone(&router),
+        metrics: None,
+        intermediate_targets: intermediate,
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        shard_index: None,
+        shard_count: 1,
+    };
+    let (mut task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
+
+    // task_b：q13b（驱动 bid_mod + join side_input），注册 bid_mod 消费者槽
+    let src_b = router.registry().get_window("bid_mod").unwrap();
+    let notify_b = router.registry().get_notifier("bid_mod").unwrap();
+    let executor_b = RuleExecutor::new(plan_b);
+    let (alert_tx_b, mut alert_rx_b) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let progress_b = {
+        let slot = router.registry().progress("bid_mod").unwrap().register();
+        let mut m = HashMap::new();
+        m.insert("bid_mod".to_string(), slot);
+        m
+    };
+    let config_b = task_types::RuleTaskConfig {
+        progress: progress_b,
+        conv_sink: None,
+        machine: None,
+        each_alias: Some("m".into()),
+        each_time_field: Some("dateTime".into()),
+        executor: executor_b,
+        window_sources: vec![task_types::WindowSource {
+            window_name: "bid_mod".into(),
+            window: src_b,
+            notify: notify_b,
+            aliases: vec!["m".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx_b),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout_scan_interval: std::time::Duration::from_secs(60),
+        router: Arc::clone(&router),
+        metrics: None,
+        intermediate_targets: HashSet::new(),
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        shard_index: None,
+        shard_count: 1,
+    };
+    let (mut task_b, _cancel_b, _interval_b) = rule_task::RuleTask::new(config_b);
+
+    // 驱动：5 个 bid batch（每批 3 行，auction 恒 1 → mod_key=1 → 命中 side_input）
+    let bid_win = router.registry().get_window("bid_events").unwrap();
+    for i in 0..5i64 {
+        bid_win
+            .append_with_watermark(q13c_bid_batch(&[
+                (1, i * 3, 100 + i * 3, T + i * 1_000_000_000),
+                (1, i * 3 + 1, 101 + i * 3, T + i * 1_000_000_000),
+                (1, i * 3 + 2, 102 + i * 3, T + i * 1_000_000_000),
+            ]))
+            .unwrap();
+    }
+
+    // task_a 处理全部 5 个 bid batch → 写中间窗 5 个 batch（超 3 预算）
+    task_a.pull_and_advance().await;
+    let bm = router.registry().get_window("bid_mod").unwrap();
+    assert_eq!(
+        bm.batch_count(),
+        5,
+        "task_b 未读前中间窗不得驱逐（超预算保留，宁可内存）"
+    );
+    assert_eq!(bm.total_rows(), 15, "中间窗全量 15 行");
+
+    // task_b 消费中间窗 + join 输出：全部 15 行必须富化输出（不丢未读）
+    task_b.pull_and_advance().await;
+    let mut values: Vec<String> = Vec::new();
+    while let Ok(batch) = alert_rx_b.try_recv() {
+        match batch {
+            crate::alert_task::AlertBatch::Rows(rows) => {
+                for r in rows.iter() {
+                    values.push(super::tests::field_str(&r, "detail"));
+                }
+            }
+            crate::alert_task::AlertBatch::Columns(cols) => {
+                for r in cols.iter_data_records().flatten() {
+                    values.push(super::tests::field_str(&r, "detail"));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        values.len(),
+        15,
+        "消费者 ack 保护：中间窗驱逐不得丢未读（输出完整 15/15）"
+    );
+    assert!(
+        values.iter().all(|v| v == "v1"),
+        "全部命中 side_input mod_key=1 → 富化 value=v1"
+    );
+
+    // task_a 继续写入 → 已读部分（前 3 batch）被驱逐回收，未读（后 2）保留
+    for i in 5..8i64 {
+        bid_win
+            .append_with_watermark(q13c_bid_batch(&[
+                (1, i * 3, 100 + i * 3, T + i * 1_000_000_000),
+                (1, i * 3 + 1, 101 + i * 3, T + i * 1_000_000_000),
+                (1, i * 3 + 2, 102 + i * 3, T + i * 1_000_000_000),
+            ]))
+            .unwrap();
+    }
+    task_a.pull_and_advance().await;
+    assert!(
+        bm.batch_count() <= 6,
+        "已读 batch 被驱逐回收（内存有界），当前 {}",
+        bm.batch_count()
+    );
+
+    // 剩余 9 行（5-7 批 + 未消费的）也能完整输出
+    task_b.pull_and_advance().await;
+    let mut more = 0usize;
+    while let Ok(batch) = alert_rx_b.try_recv() {
+        more += match batch {
+            crate::alert_task::AlertBatch::Rows(rows) => rows.len(),
+            crate::alert_task::AlertBatch::Columns(cols) => {
+                cols.iter_data_records().flatten().count()
+            }
+        };
+    }
+    assert_eq!(more, 9, "已读驱逐后剩余未读仍完整输出 9/9");
+}
+
+/// q13 双规则链**无消费者槽位**对照：中间窗无 ack 保护时驱逐自由删未读 →
+/// 下游输出丢失（引擎依赖消费者注册——生产 `register_progress` 已注册；
+/// 此对照证明该依赖是丢数据的守卫，任何漏注册都是正确性事故）。
+#[tokio::test]
+async fn q13_dual_chain_intermediate_window_unregistered_consumer_loses() {
+    super::tests::init_tracing();
+    let schemas = nexmark_schemas();
+    let file = wf_lang::parse_wfl(Q13_WFL).expect("parse q13.wfl");
+    let plans = wf_lang::compile_wfl(&file, &schemas).expect("compile q13.wfl");
+    let mut plans = plans.into_iter();
+    let mut plan_a = plans.next().unwrap();
+    let _plan_b = plans.next().unwrap();
+    plan_a.name = "q13a_bid_mod".into();
+
+    let probe = q13c_bid_mod_batch(&[(1, 1, 100, T)]);
+    let one_batch_bytes = wf_engine::window::content_bytes(&probe);
+    let mut registry = WindowRegistry::build(vec![
+        q13c_window_def("bid_events", &q13c_bid_schema(), usize::MAX),
+        q13c_window_def("bid_mod", &q13c_bid_mod_schema(), one_batch_bytes * 2),
+    ])
+    .unwrap();
+    let router = Arc::new(Router::new(registry));
+    let src_a = router.registry().get_window("bid_events").unwrap();
+    let notify_a = router.registry().get_notifier("bid_events").unwrap();
+    let executor_a = RuleExecutor::new(plan_a);
+    let (alert_tx_a, _alert_rx_a) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
+    let mut intermediate = HashSet::new();
+    intermediate.insert("bid_mod".to_string());
+    let config_a = task_types::RuleTaskConfig {
+        progress: std::collections::HashMap::new(),
+        conv_sink: None,
+        machine: None,
+        each_alias: Some("b".into()),
+        each_time_field: Some("dateTime".into()),
+        executor: executor_a,
+        window_sources: vec![task_types::WindowSource {
+            window_name: "bid_events".into(),
+            window: src_a,
+            notify: notify_a,
+            aliases: vec!["b".into()],
+        }],
+        sink_fanout: make_test_fanout(alert_tx_a),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        timeout_scan_interval: std::time::Duration::from_secs(60),
+        router: Arc::clone(&router),
+        metrics: None,
+        intermediate_targets: intermediate,
+        pipe_registry: Arc::new(wf_engine::pipe::PipeRegistry::new()),
+        eos_flush: tokio::sync::watch::channel(0u64).1,
+        push_rx: None,
+        shard_index: None,
+        shard_count: 1,
+    };
+    let (mut task_a, _cancel_a, _interval_a) = rule_task::RuleTask::new(config_a);
+
+    // 无消费者槽位：写 5 个 batch 超 2 预算 → append_inner 驱逐自由（min_acked=MAX）
+    let bid_win = router.registry().get_window("bid_events").unwrap();
+    for i in 0..5i64 {
+        bid_win
+            .append_with_watermark(q13c_bid_batch(&[(
+                1,
+                i,
+                100 + i,
+                T + i * 1_000_000_000,
+            )]))
+            .unwrap();
+    }
+    task_a.pull_and_advance().await;
+    let bm = router.registry().get_window("bid_mod").unwrap();
+    assert!(
+        bm.batch_count() < 5,
+        "无消费者槽位：中间窗驱逐自由删（min_acked=u64::MAX）——若生产漏注册即丢数据"
+    );
 }
 
 /// 真实 q9.wfl 编译 → rule_task 执行：挂起 → watermark 过 expiry → 输出胜者。
