@@ -96,6 +96,12 @@ pub fn perf_cut_output() -> bool {
     PERF_CUT_OUTPUT.load(Ordering::Relaxed)
 }
 
+/// 门控/诊断档是进程级全局状态：跨模块串行化涉全局门控的测试（perf_diag 自身
+/// 与 stats/rule 任务的 cut 测试共用），避免并行污染。std Mutex 测试场景短期持有
+/// 无实际风险（clippy await_holding_lock 在测试模块级豁免）。
+#[cfg(test)]
+pub(crate) static PERF_CUT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 是否禁止窗口 append（cut_append 门控）。
 #[inline]
 pub fn perf_cut_append() -> bool {
@@ -555,11 +561,11 @@ mod tests {
     use std::time::Duration;
 
     /// 门控/诊断档是进程级全局状态：串行化涉全局的测试，避免并行污染。
-    static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         // 测试内 panic（如异步断言失败）会污染互斥锁：恢复后继续串行。
-        TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+        crate::perf_diag::PERF_CUT_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     // -- 门控与初始化 -----------------------------------------------------

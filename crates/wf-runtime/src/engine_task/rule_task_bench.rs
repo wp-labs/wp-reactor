@@ -492,7 +492,6 @@ fn q13a_pipe_columnar_matches_row_path() {
 #[test]
 fn q13a_pipe_columnar_matches_row_path_edge_cases() {
     use arrow::array::Array;
-    use wf_lang::plan::{EntityPlan, ScorePlan};
 
     // 边缘输入批：auction 含 null 与负值，bidder 含 null。
     let schema = Arc::new(Schema::new(vec![

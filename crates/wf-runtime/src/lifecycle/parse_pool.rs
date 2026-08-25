@@ -557,6 +557,7 @@ async fn commit(router: &Router, metrics: &Option<Arc<RuntimeMetrics>>, item: Pa
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::await_holding_lock)] // perf-diag cut_append 测试跨 await 持全局锁
     use super::*;
 
     /// The parse worker pool shares one `mpsc::Receiver` behind an
@@ -634,6 +635,9 @@ mod tests {
         use arrow::datatypes::{DataType, Field as ArrowField, Schema};
         use wf_engine::window::{Router, WindowRegistry};
 
+        let _g = crate::perf_diag::PERF_CUT_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (parse_tx, mut parse_rx) = mpsc::channel::<ParseItem>(8);
         let preread = PrereadBudget::new(1024 * 1024);
         let parse_seq = AtomicU64::new(0);
