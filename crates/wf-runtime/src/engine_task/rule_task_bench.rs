@@ -1284,6 +1284,34 @@ fn pipe_write_alloc_footprint() {
     let peak = probe.peak_growth();
     let content = wf_engine::window::content_bytes(&built.1);
 
+    // ④ **窗口会计保真度**（2026-08-25 在途量分账后的新问题）：窗口用
+    //   `content_bytes`（逻辑列内容）计账，但批次实际占的分配器字节还包括
+    //   null bitmap / offsets / 容量舍入。若两者差很多，则 `Σwindow_bytes` 低估
+    //   真实占用，"未归因"就含有假额度。测法：只保留 batch（stager 已经
+    //   finish 并重置），重新建基线后看仅此批存活时的增量。
+    drop(probe);
+    let retained = {
+        let probe2 = crate::memory_probe::MemoryProbe::exclusive();
+        let base = probe2.current();
+        // 重建一份同形批（上一份仍活着作对照，不影响增量）。
+        let mut s2 = PipeBatchStager::new_columnar(
+            Arc::from("bid_mod"),
+            Arc::clone(&schema),
+            Some(4),
+            &yield_names,
+        );
+        {
+            let prepared2 = exec.each_batch_prepare(&batch);
+            let mut sink2 = TestStagerSink { stager: &mut s2 };
+            exec.execute_each_pipe_batch_columnar(&rows, &prepared2, &mut sink2);
+        }
+        let b2 = s2.take_batch().expect("build").expect("non-empty");
+        drop(s2); // builder 已重置；丢掉 stager 只留 batch
+        let held = probe2.current().saturating_sub(base);
+        drop(b2);
+        held
+    };
+
     eprintln!("[pipe-alloc] 批规模 = {ROWS} 行（生产实测批大小）");
     eprintln!(
         "[pipe-alloc] ① 旧路径对照：物化 Vec<PipeEachRow> 峰值 = {:.2} MB ({:.0} B/行)",
@@ -1310,6 +1338,12 @@ fn pipe_write_alloc_footprint() {
         peak as f64 / content as f64,
         (peak.saturating_sub(content)) as f64 / 1e6,
         (peak.saturating_sub(content)) as f64 / ROWS as f64
+    );
+    eprintln!(
+        "[pipe-alloc] ④ 窗口会计保真度：批次**存活占用** = {:.2} MB vs content_bytes {:.2} MB → 低估 {:.2}×",
+        retained as f64 / 1e6,
+        content as f64 / 1e6,
+        retained as f64 / content as f64
     );
     assert!(content > 0, "输出批必须非空");
     let _ = empty_tracked_bind_fields();

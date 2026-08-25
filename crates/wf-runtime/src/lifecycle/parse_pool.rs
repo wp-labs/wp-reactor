@@ -115,6 +115,21 @@ impl PrereadBudget {
         }
     }
 
+    /// 已用预算字节（= capacity − available）与容量——**在途量可观测性**
+    /// （2026-08-25）。q13 的 `peak_commit − Σwindow_bytes` 长期有 ~14.7GB 未归因，
+    /// 而所有"猜持有者"的假说已被实测逐一否决（见
+    /// `docs/issues/q13-memory-peak-scales-with-volume.md`）。把各阶段在途字节
+    /// 暴露为指标，将"未知 14.7GB"变成可对账的等式。
+    pub(crate) fn used_bytes(&self) -> usize {
+        self.capacity
+            .saturating_sub(self.semaphore.available_permits())
+    }
+
+    /// 预算容量（clamp 后的实际值，可能高于配置的 `parse_buffer_bytes`）。
+    pub(crate) fn capacity_bytes(&self) -> usize {
+        self.capacity
+    }
+
     /// Test-only introspection (used by budget regression tests to assert
     /// acquisition/release behaviour).
     #[cfg(test)]

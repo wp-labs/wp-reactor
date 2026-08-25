@@ -126,6 +126,22 @@ impl Router {
             .insert(window_name.to_string(), mailbox);
     }
 
+    /// 每窗 mailbox 的**在途字节**（已用预算, 容量）——在途量可观测性
+    /// （2026-08-25）。一个批次从 parse worker 派发起持有 permits，直到窗口
+    /// actor append（或丢弃）才释放，所以"已用"就是该窗当前在途内容字节。
+    ///
+    /// ❗ **与 `window.memory_bytes` 可能重叠**：Arrow 缓冲经 `Arc` 共享，一个
+    /// 已 append 但未释放 permits 的批次会同时计入两边——分账时不得直接相加
+    /// （曾因此得出"通道预算加 8.2GB"的错结论）。
+    pub fn mailbox_inflight(&self, window_name: &str) -> Option<(usize, usize)> {
+        let mailboxes = self.mailboxes.read().expect("mailbox lock poisoned");
+        let mb = mailboxes.get(window_name)?;
+        let used = mb
+            .budget_bytes
+            .saturating_sub(mb.budget.available_permits());
+        Some((used, mb.budget_bytes))
+    }
+
     /// Clone the actor mailbox for `window_name`, if one is registered.
     pub fn mailbox(&self, window_name: &str) -> Option<WindowMailbox> {
         self.mailboxes

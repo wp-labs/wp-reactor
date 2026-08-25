@@ -1091,6 +1091,19 @@ pub(super) async fn spawn_receiver_task(
         &mut group,
         config.runtime.parse_buffer_bytes,
     );
+    // 在途量分账（2026-08-25）：把 preread 预算句柄装给 metrics，周期采样输出
+    // `parse.inflight_bytes` / `parse.budget_bytes`——供 `peak_commit − Σwindow_bytes`
+    // 的 ~14.7GB 未归因逐段对账（q13 内存 issue §5）。
+    if let Some(m) = &metrics {
+        let budget = preread.clone();
+        wf_info!(
+            sys,
+            used = budget.used_bytes(),
+            capacity = budget.capacity_bytes(),
+            "parse inflight gauge provider installed"
+        );
+        m.set_parse_inflight_provider(move || (budget.used_bytes(), budget.capacity_bytes()));
+    }
     let ingest_limiter = config.runtime.max_ingest_rate.map(IngestLimiter::new);
 
     for (source_idx, source) in config.sources.iter().enumerate() {

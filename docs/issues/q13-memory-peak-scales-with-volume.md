@@ -267,3 +267,50 @@ meta 列**：`__wfu_rule_name` / `__wfu_entity_type` / `__wfu_entity_id`（字�
   - **分账已就绪**：`alloc.*` 指标接入后，一轮 `./bench.sh all replay 100m`
     就能给 22 个 Q 全部分账（window_bytes / peak_commit / peak_rss），一次看清
     哪些是引擎真持有、哪些是合法状态。
+
+---
+
+## 7. 在途量分账落地（2026-08-25）——两个阶段被实测排除 + 发现会计低估 1.75×
+
+### 新增指标
+- `parse.inflight_bytes` / `parse.budget_bytes`（PrereadBudget 已用/容量，provider
+  由 `spawn_receiver_task` 装入）
+- `window.mailbox_inflight_bytes` / `mailbox_budget_bytes`（每窗，
+  `Router::mailbox_inflight` 读 mailbox 信号量）
+- 守护测试 `parse_inflight_gauges_are_exported`（防 provider 静默失效）
+
+### 第一张账单（q13 replay 10M）
+| 项 | 峰值 | 预算 |
+|---|---|---|
+| peak_commit | 8.04 GB | — |
+| ① 窗口 content_bytes 合计 | 2.50 GB | — |
+| ② 窗口 mailbox 在途 | **0.00 GB** | 0.47 GB |
+| ③ parse pool 在途 | **0.02 GB** | 2.15 GB |
+| 未归因 | 5.53 GB (69%) | — |
+
+**决定性排除（用测量，不是推理）**：
+- **parse 预算 2GB 只用了 20MB** → 直接解释了此前"把 parse_buffer_bytes 从 2GB
+  降到 256MB 内存毫无变化"的实验结果；整条 parse 在途路径**不是持有者**。
+- **mailbox 在途峰值 0** → 窗口 mailbox 路径**不是持有者**。
+- ⇒ 落在决策表第二分支：**持有者不在任何有预算的阶段**。
+
+### 新发现：窗口会计低估实际分配 1.75×
+`pipe_write_alloc_footprint` 新增 ④ 项实测：一个 `content_bytes = 3.45MB` 的
+bid_mod 批，**存活占用 6.03MB**（差额 = null bitmap + offsets + builder 容量舍入）。
+即 `window.memory_bytes` 系统性低估真实占用 **1.75×**。
+
+按此修正账单：
+| 口径 | 未归因 |
+|---|---|
+| 原（content_bytes） | 5.53 GB (69%) |
+| **保真修正（×1.75）** | **3.65 GB (45%)** |
+
+⇒ 「未归因」里约 1.9GB 其实是**被少算的窗口内存**，不是神秘持有者。
+
+### 下一步
+1. **修会计口径**：让 `window.memory_bytes` 报实际分配字节（或额外报一个
+   `allocated_bytes`），否则内存讨论永远差 1.75×。
+2. 继续追剩余 45%：已排除窗口保留（修正后）、parse 在途、mailbox 在途、
+   分配器、小对象、alert 基数、per-row 分配足迹。剩余候选：alert 通道/构建器
+   在途（无预算指标）、规则任务每批工作态、rule channel（Arc 重叠需小心）。
+3. 目标不变：100M 峰值 < 10GB。

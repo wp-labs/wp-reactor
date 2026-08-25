@@ -162,6 +162,13 @@ pub(crate) struct MetricsSnapshot {
     evictor_time_evicted: u64,
     evictor_memory_evicted: u64,
     window_memory_bytes: BTreeMap<String, u64>,
+    /// 每窗 mailbox 在途字节（已用预算）——在途量可观测性（2026-08-25）。
+    window_mailbox_inflight: BTreeMap<String, u64>,
+    /// 每窗 mailbox 预算容量。
+    window_mailbox_budget: BTreeMap<String, u64>,
+    /// parse pool 预读预算：（已用, 容量）字节。
+    parse_inflight_bytes: u64,
+    parse_budget_bytes: u64,
     window_capacity_bytes: BTreeMap<String, u64>,
     window_rows: BTreeMap<String, u64>,
     window_batches: BTreeMap<String, u64>,
@@ -391,6 +398,22 @@ impl MetricsSnapshot {
         for (window, v) in &self.window_memory_bytes {
             out.push(metric("window", "memory_bytes", window, *v));
         }
+        // 在途量分账（2026-08-25）：每窗 mailbox 已用预算 + parse pool 预读预算。
+        // ❗ mailbox 在途与 `memory_bytes` **可能重叠**（Arrow 缓冲经 Arc 共享：
+        // 已 append 但未释放 permits 的批次两边都算）——对账时不得直接相加。
+        for (window, v) in &self.window_mailbox_inflight {
+            out.push(metric("window", "mailbox_inflight_bytes", window, *v));
+        }
+        for (window, v) in &self.window_mailbox_budget {
+            out.push(metric("window", "mailbox_budget_bytes", window, *v));
+        }
+        out.push(metric(
+            "parse",
+            "inflight_bytes",
+            "",
+            self.parse_inflight_bytes,
+        ));
+        out.push(metric("parse", "budget_bytes", "", self.parse_budget_bytes));
         for (window, v) in &self.window_capacity_bytes {
             out.push(metric("window", "window_capacity_bytes", window, *v));
         }
@@ -774,6 +797,16 @@ pub struct RuntimeMetrics {
     evictor_memory_evicted_total: AtomicU64,
 
     window_memory_bytes: BTreeMap<String, AtomicU64>,
+    /// 每窗 mailbox 在途字节 / 预算容量（周期采样，同 window 其他 gauge）。
+    window_mailbox_inflight: BTreeMap<String, AtomicU64>,
+    window_mailbox_budget: BTreeMap<String, AtomicU64>,
+    /// parse pool 预读预算的已用/容量字节（周期采样）。
+    parse_inflight_bytes: AtomicU64,
+    parse_budget_bytes: AtomicU64,
+    /// 读 parse 预算的 provider（由 bootstrap 装入；metrics 拿不到预算句柄）。
+    /// 返回（已用, 容量）字节。
+    #[allow(clippy::type_complexity)]
+    parse_inflight_provider: std::sync::OnceLock<Box<dyn Fn() -> (usize, usize) + Send + Sync>>,
     window_capacity_bytes: BTreeMap<String, AtomicU64>,
     window_rows: BTreeMap<String, AtomicU64>,
     window_batches: BTreeMap<String, AtomicU64>,
@@ -959,6 +992,11 @@ impl RuntimeMetrics {
             evictor_time_evicted_total: AtomicU64::new(0),
             evictor_memory_evicted_total: AtomicU64::new(0),
             window_memory_bytes: make_window_map(),
+            window_mailbox_inflight: make_window_map(),
+            window_mailbox_budget: make_window_map(),
+            parse_inflight_bytes: AtomicU64::new(0),
+            parse_budget_bytes: AtomicU64::new(0),
+            parse_inflight_provider: std::sync::OnceLock::new(),
             window_capacity_bytes: make_window_map(),
             window_rows: make_window_map(),
             window_batches: make_window_map(),
@@ -1362,6 +1400,10 @@ impl RuntimeMetrics {
             evictor_time_evicted: self.drain_counter(&self.evictor_time_evicted_total),
             evictor_memory_evicted: self.drain_counter(&self.evictor_memory_evicted_total),
             window_memory_bytes: self.read_map(&self.window_memory_bytes),
+            window_mailbox_inflight: self.read_map(&self.window_mailbox_inflight),
+            window_mailbox_budget: self.read_map(&self.window_mailbox_budget),
+            parse_inflight_bytes: self.parse_inflight_bytes.load(Ordering::Relaxed),
+            parse_budget_bytes: self.parse_budget_bytes.load(Ordering::Relaxed),
             window_capacity_bytes: self.read_map(&self.window_capacity_bytes),
             window_rows: self.read_map(&self.window_rows),
             window_batches: self.read_map(&self.window_batches),
