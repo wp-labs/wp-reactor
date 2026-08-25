@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
+use arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
+};
 use arrow::datatypes::{DataType, Field as ArrowField, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{
@@ -3470,6 +3472,143 @@ fn each_columnar_q14_filter_matches_row_path() {
     };
     assert_eq!(label(&out_col[0]), "dayTime c=4", "5M 行：22 时 → dayTime，\"abc c cc\" 含 4 个 c");
     assert_eq!(label(&out_col[1]), "nightTime c=1", "10M 行：01 时 → nightTime，\"no-c\" 含 1 个 c");
+}
+
+/// Q14 变体：fmt 的 IfThenElse 分支 / count_char 参数含 OBJECT 元数据字段。
+/// gate 放行（flat FieldRef），但编译期递归 `arg_reads_structured` 拦截 →
+/// 整个 yield 行式回退——行式/列式输出必须逐位一致（列式若不回退会渲染原始
+/// JSON / 对 JSON 计数，字节分叉）。
+#[test]
+fn each_columnar_nested_structured_falls_back_matches_row_path() {
+    use crate::match_engine::WFL_FIELD_TYPE_METADATA_KEY;
+    use crate::match_engine::WFL_FIELD_TYPE_OBJECT;
+    use wp_model_core::model::Value as ModelValue;
+
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("auction", DataType::Int64, true),
+        ArrowField::new("flag", DataType::Boolean, true),
+        ArrowField::new("ext", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                WFL_FIELD_TYPE_OBJECT.to_string(),
+            )]),
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), None])) as ArrayRef,
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false), Some(true)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some(r#"{"k":1}"#),
+                Some(r#"{"c":2}"#),
+                None,
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let b_field = |n: &str| Expr::Field(FieldRef::Qualified("b".into(), n.into()));
+    let call = |name: &str, args: Vec<Expr>| Expr::FuncCall {
+        qualifier: None,
+        name: name.into(),
+        args,
+    };
+    let mut plan = simple_rule_plan(
+        "q14_obj",
+        simple_plan(vec![], vec![]),
+        Expr::Number(5.0),
+        "digit",
+        b_field("auction"),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.binds[0].window = "bid_events".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "b".into(),
+        filter: None,
+    });
+    // label = fmt("{} {}", if b.flag then b.ext else "x", "y")——结构化藏在分支。
+    // cc    = count_char(b.ext, "c")——结构化作 text 参数（解释器 None → 空串）。
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "label".into(),
+            value: call(
+                "fmt",
+                vec![
+                    Expr::StringLit("{} {}".into()),
+                    Expr::IfThenElse {
+                        cond: Box::new(b_field("flag")),
+                        then_expr: Box::new(b_field("ext")),
+                        else_expr: Box::new(Expr::StringLit("x".into())),
+                    },
+                    Expr::StringLit("y".into()),
+                ],
+            ),
+        },
+        YieldField {
+            name: "cc".into(),
+            value: call("count_char", vec![b_field("ext"), Expr::StringLit("c".into())]),
+        },
+    ];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("label".into(), FieldType::Base(BaseType::Chars)),
+            ("cc".into(), FieldType::Base(BaseType::Chars)),
+        ]),
+    );
+    // 形状 gate 放行（分支/参数是 flat FieldRef）……
+    assert!(exec.each_plan_columnar_safe());
+
+    let t = 1_700_000_000_000_000_000i64;
+    let events = crate::match_engine::event_bridge::batch_to_events(&batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let col_events: Vec<ColumnarEvent> = (0..3).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+
+    assert_eq!(sr.appended, 3, "行式 appended");
+    assert_eq!(sc.appended, 3, "列式 appended（结构化回退仍应产出全部 3 行）");
+    assert_eq!(sr.rejected, 0);
+    assert_eq!(sc.rejected, 0);
+    assert_eq!(sc.failed, 0);
+    assert_eq!(app_row, vec![0usize, 1, 2]);
+    assert_eq!(app_col, vec![0usize, 1, 2]);
+
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(out_row, out_col, "结构化嵌套必须行式回退且输出逐位一致");
+    let get = |r: &wp_model_core::model::DataRecord, name: &str| {
+        r.fields()
+            .find(|f| f.get_name() == name)
+            .and_then(|f| match f.get_value() {
+                ModelValue::Chars(v) => Some(v.to_string()),
+                _ => None,
+            })
+            .expect(name)
+    };
+    // label：row 0 true 分支 → [object]；row 1 false 分支 → "x"；row 2 null ext → 空串。
+    assert_eq!(get(&out_col[0], "label"), "[object] y", "true 分支渲染 [object]（列式若未回退会渲染原始 JSON）");
+    assert_eq!(get(&out_col[1], "label"), "x y", "false 分支渲染 x");
+    assert_eq!(get(&out_col[2], "label"), "", "null ext → fmt 参数 None → 空串");
+    // cc：count_char(Object) → None → 空串（列式若未回退会对原始 JSON 文本计数）。
+    assert_eq!(get(&out_col[0], "cc"), "", "count_char(Object) → None → 空串");
+    assert_eq!(get(&out_col[1], "cc"), "", "count_char(Object) → None → 空串");
+    assert_eq!(get(&out_col[2], "cc"), "", "count_char(null) → None → 空串");
 }
 
 // ---------------------------------------------------------------------------

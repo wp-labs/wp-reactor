@@ -628,19 +628,41 @@ fn compile_guard_func(
     }
 }
 
-/// 输出函数参数是否为结构化列（`wf.wfl.field_type` = array/object 元数据）。
-/// 结构化列在解释路径解析成 `Value::Array`/`Value::Object`，列式读原始 JSON
-/// 文本（OBJECT）或 `CScalar::Structured`（ARRAY），渲染语义不同 → 相关输出
-/// 表达式整体回退行式。
+/// 输出函数参数（**递归**）是否读取结构化列（`wf.wfl.field_type` = array/object
+/// 元数据）。结构化列在解释路径解析成 `Value::Array`/`Value::Object`（fmt 渲染
+/// `[array]`/`[object]`、count_char 对非 Str → None），列式读原始 JSON 文本
+/// （OBJECT）或 `CScalar::Structured`（ARRAY）——OBJECT 列的原始文本会被
+/// fmt 直接渲染、count_char 对其计数，字节分叉 → 相关输出表达式整体回退行式。
+/// 递归覆盖 IfThenElse/InList/嵌套函数调用：结构化字段藏在分支里时 gate 仍会
+/// 放行（flat FieldRef 不含元数据信息），必须在此编译期拦截。
 fn arg_reads_structured(view: &ColumnarBatch<'_>, expr: &Expr) -> bool {
-    let Expr::Field(field) = expr else {
-        return false;
-    };
-    let Some(&proj) = view.field_map.get(field_ref_name(field)) else {
-        return false;
-    };
-    let col_idx = view.projection[proj];
-    wfl_structured_field_kind(view.batch.schema().field(col_idx)).is_some()
+    match expr {
+        Expr::Field(field) => {
+            let Some(&proj) = view.field_map.get(field_ref_name(field)) else {
+                return false;
+            };
+            let col_idx = view.projection[proj];
+            wfl_structured_field_kind(view.batch.schema().field(col_idx)).is_some()
+        }
+        Expr::BinOp { left, right, .. } => {
+            arg_reads_structured(view, left) || arg_reads_structured(view, right)
+        }
+        Expr::Neg(inner) | Expr::Not(inner) => arg_reads_structured(view, inner),
+        Expr::FuncCall { args, .. } => args.iter().any(|a| arg_reads_structured(view, a)),
+        Expr::InList { expr, list, .. } => {
+            arg_reads_structured(view, expr) || list.iter().any(|a| arg_reads_structured(view, a))
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            arg_reads_structured(view, cond)
+                || arg_reads_structured(view, then_expr)
+                || arg_reads_structured(view, else_expr)
+        }
+        _ => false,
+    }
 }
 
 /// Compile a gate-admitted output function (`fmt` / `strftime` / `count_char`)
@@ -654,19 +676,18 @@ fn compile_output_func(
     view: &ColumnarBatch<'_>,
 ) -> Option<ColumnExpr> {
     let func = wf_lang::columnar::columnar_output_func(name)?;
+    // 结构化参数（ARRAY / OBJECT 元数据列，含 IfThenElse/InList/嵌套调用里的
+    // 递归分支）→ 回退行式：解释路径解析成 Value::Array/Object 并渲染
+    // `[array]`/`[object]`（fmt）或对非 Str 取 None（count_char/strftime），
+    // 列式读原始 JSON 文本（OBJECT）渲染/计数字节不同。
+    if args.iter().any(|a| arg_reads_structured(view, a)) {
+        return None;
+    }
     match func {
         wf_lang::columnar::ColumnarOutputFunc::Fmt => {
             let Expr::StringLit(template) = &args[0] else {
                 return None;
             };
-            // 结构化参数（ARRAY / OBJECT 元数据列）→ 回退行式：解释路径把
-            // 这类字段解析成 Value::Array/Object 并渲染 `[array]` / `[object]`，
-            // 列式读原始 JSON 文本（OBJECT）或 Structured 标记（ARRAY），渲染
-            // 字节不同。strftime/count_char 的参数对结构化天然一致（非
-            // Number/Str → None → 空串），无需回退。
-            if args[1..].iter().any(|a| arg_reads_structured(view, a)) {
-                return None;
-            }
             let cargs: Option<Vec<ColumnExpr>> =
                 args[1..].iter().map(|a| compile_expr(a, view)).collect();
             Some(ColumnExpr::Fmt {
@@ -2961,6 +2982,124 @@ mod tests {
                 .unwrap_or_else(|| Value::Str(SmolStr::default())),
             Value::Str("x=[object]".into()),
             "解释路径渲染 [object]"
+        );
+    }
+
+    /// 结构化字段藏在 IfThenElse 分支 / InList 目标里：gate 放行（flat FieldRef
+    /// 不含元数据），但编译期 `arg_reads_structured` **递归**拦截 → 行式回退。
+    /// 否则列式读 OBJECT 列原始 JSON 文本，fmt 渲染原始 JSON / count_char 对
+    /// JSON 计数——与解释器 `[object]`/None 字节分叉。
+    #[test]
+    fn structured_nested_in_branch_compiles_fail() {
+        use crate::match_engine::WFL_FIELD_TYPE_OBJECT;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ext", DataType::Utf8, true).with_metadata(
+                std::collections::HashMap::from([(
+                    WFL_FIELD_TYPE_METADATA_KEY.to_string(),
+                    WFL_FIELD_TYPE_OBJECT.to_string(),
+                )]),
+            ),
+            Field::new("flag", DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some(r#"{"k":1}"#), None])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false)])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let view = ColumnarBatch::from_all_fields(&batch);
+        let f = |n: &str| Expr::Field(FieldRef::Simple(n.into()));
+        let call = |name: &str, args: Vec<Expr>| Expr::FuncCall {
+            qualifier: None,
+            name: name.into(),
+            args,
+        };
+
+        // fmt("{} {}", if flag then ext else "x", "y")——结构化藏在 then 分支。
+        let fmt_branch = call(
+            "fmt",
+            vec![
+                Expr::StringLit("{} {}".into()),
+                Expr::IfThenElse {
+                    cond: Box::new(f("flag")),
+                    then_expr: Box::new(f("ext")),
+                    else_expr: Box::new(Expr::StringLit("x".into())),
+                },
+                Expr::StringLit("y".into()),
+            ],
+        );
+        // gate 放行（分支是 flat FieldRef）……
+        assert!(wf_lang::columnar::columnar_output_expr(&fmt_branch));
+        // ……但编译必须失败（递归 arg_reads_structured 拦截）。
+        assert!(
+            compile_guard(&fmt_branch, &view).is_none(),
+            "fmt 分支里的结构化字段必须编译失败"
+        );
+
+        // count_char(ext, "c")——结构化直接作 text 参数。
+        let cc = call("count_char", vec![f("ext"), Expr::StringLit("c".into())]);
+        assert!(wf_lang::columnar::columnar_output_expr(&cc));
+        assert!(
+            compile_guard(&cc, &view).is_none(),
+            "count_char 结构化 text 参数必须编译失败"
+        );
+
+        // count_char("abc", ext)——结构化作 needle 参数（首字符计数分叉）。
+        let cc2 = call("count_char", vec![Expr::StringLit("abc".into()), f("ext")]);
+        assert!(wf_lang::columnar::columnar_output_expr(&cc2));
+        assert!(
+            compile_guard(&cc2, &view).is_none(),
+            "count_char 结构化 needle 参数必须编译失败"
+        );
+
+        // InList 目标为结构化列，藏在 fmt 的 IfThenElse cond 里（极端形态）：
+        // gate 放行（InList 列表字面量 + ext flat），但递归拦截必须使其编译失败。
+        let fmt_inlist_cond = call(
+            "fmt",
+            vec![
+                Expr::StringLit("{} {}".into()),
+                Expr::IfThenElse {
+                    cond: Box::new(Expr::InList {
+                        expr: Box::new(f("ext")),
+                        list: vec![Expr::StringLit("{\"k\":1}".into())],
+                        negated: false,
+                    }),
+                    then_expr: Box::new(Expr::StringLit("a".into())),
+                    else_expr: Box::new(Expr::StringLit("b".into())),
+                },
+                Expr::StringLit("y".into()),
+            ],
+        );
+        assert!(wf_lang::columnar::columnar_output_expr(&fmt_inlist_cond));
+        assert!(
+            compile_guard(&fmt_inlist_cond, &view).is_none(),
+            "fmt 内 InList 目标结构化必须编译失败"
+        );
+        // 裸 IfThenElse（非输出函数参数）作顶层 yield 从不走列式（executor 只对
+        // 输出函数编译 general 槽位）——此处仅确认它不 panic 且不误报结构化。
+        let bare_ite = Expr::IfThenElse {
+            cond: Box::new(f("flag")),
+            then_expr: Box::new(Expr::StringLit("a".into())),
+            else_expr: Box::new(Expr::StringLit("b".into())),
+        };
+        assert!(wf_lang::columnar::columnar_output_expr(&bare_ite));
+        assert!(compile_guard(&bare_ite, &view).is_some());
+
+        // 行式基准：true 分支渲染 [object]；count_char 对 Object → None。
+        let events = batch_to_events(&batch);
+        assert_eq!(
+            eval_expr(&fmt_branch, &events[0])
+                .unwrap_or_else(|| Value::Str(SmolStr::default())),
+            Value::Str("[object] y".into()),
+            "解释路径：true 分支渲染 [object]"
+        );
+        assert_eq!(
+            eval_expr(&cc, &events[0]).unwrap_or_else(|| Value::Str(SmolStr::default())),
+            Value::Str(SmolStr::default()),
+            "解释路径：count_char(Object) → None → 空串"
         );
     }
 }

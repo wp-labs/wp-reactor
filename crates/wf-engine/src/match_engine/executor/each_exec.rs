@@ -762,6 +762,10 @@ impl RuleExecutor {
 pub struct EachBatchVecs {
     general_cvecs: Vec<Option<CVec>>,
     filter_cvec: Option<CVec>,
+    /// Prepared batch row count + address — `debug_assert!` that the executor's
+    /// segment rows read the same batch (misuse would index the wrong cvecs).
+    num_rows: usize,
+    batch_ptr: usize,
 }
 
 impl RuleExecutor {
@@ -808,6 +812,8 @@ impl RuleExecutor {
         EachBatchVecs {
             general_cvecs,
             filter_cvec,
+            num_rows: n,
+            batch_ptr: batch as *const RecordBatch as usize,
         }
     }
 }
@@ -843,10 +849,15 @@ impl RuleExecutor {
 
     /// [`Self::execute_each_direct_batch_columnar`] with the batch-level
     /// columnar state **pre-evaluated once per batch** ([`Self::each_batch_prepare`])
-    /// and reused across [`ALERT_BATCH_SIZE`](crate::match_engine::executor::ALERT_BATCH_SIZE)
-    /// segments — re-evaluating the general-yield cvecs + each-filter mask per
-    /// segment over the full frame was O(frame × segments) (Q14 列式 4600 vs
-    /// 466 ns/evt 的墙：65k 帧 × 16 段全帧重算)。
+    /// and reused across the runtime's `ALERT_BATCH_SIZE` segments —
+    /// re-evaluating the general-yield cvecs + each-filter mask per segment
+    /// over the full frame was O(frame × segments) (Q14 列式 4600 vs 466 ns/evt
+    /// 的墙：65k 帧 × 16 段全帧重算)。
+    ///
+    /// `prepared` must be built from the same batch the `rows` read
+    /// ([`Self::each_batch_prepare`] on `rows.first().batch()`); `debug_assert!`
+    /// in release builds only checks row-count bounds, so the invariant is on
+    /// the caller.
     ///
     /// Caller must gate on [`Self::each_plan_columnar_safe`]; the per-row
     /// output (wfx_id / entity_id / fired_at / yield cells) is byte-identical
@@ -995,6 +1006,16 @@ impl RuleExecutor {
         // Arc-shared and immutable), so resolve once here and read via
         // `ColumnarEvent::value_at` in the loop.
         let batch0 = rows.first().map(|(ev, _)| ev.batch());
+        debug_assert!(
+            prepared.batch_ptr == 0
+                || batch0.is_some_and(|b| (b as *const RecordBatch as usize) == prepared.batch_ptr),
+            "each_batch_prepare 必须来自 rows 的同一批"
+        );
+        debug_assert!(
+            prepared.num_rows == 0
+                || rows.iter().all(|(ev, _)| ev.row() < prepared.num_rows),
+            "rows 行号越界 prepared 批"
+        );
         let resolve = |name: Option<&str>| -> Option<usize> {
             name.and_then(|n| batch0.and_then(|b| b.schema().index_of(n).ok()))
         };
