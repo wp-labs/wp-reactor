@@ -50,6 +50,8 @@ static PERF_CUT_APPEND: AtomicBool = AtomicBool::new(false);
 /// 门控：禁止解码（只读帧头 tag 识别哨兵, 非哨兵帧 body 即丢——测「注入 + TCP
 /// 接收」字节率; 哨兵流豁免）。
 static PERF_CUT_RECV: AtomicBool = AtomicBool::new(false);
+/// 门控：禁止序列化/写入（AlertBatch 到 sink 即丢——测「输出构建 + 通道投递」）。
+static PERF_CUT_SERIALIZE: AtomicBool = AtomicBool::new(false);
 /// 诊断档列表（启动时 set，只读；测试可重复初始化）。
 static PERF_STAGES: std::sync::RwLock<Vec<PerfStage>> = std::sync::RwLock::new(Vec::new());
 
@@ -61,23 +63,24 @@ static PERF_STAGES: std::sync::RwLock<Vec<PerfStage>> = std::sync::RwLock::new(V
 pub fn init_perf_diag(config: &PerfConfig) {
     *PERF_STAGES.write().expect("perf stages lock poisoned") = config.stages.clone();
     PERF_DIAG_ENABLED.store(true, Ordering::Relaxed);
-    let (cut_rules, cut_output, cut_append, cut_recv) = match config.stages.first() {
+    let (cut_rules, cut_output, cut_append, cut_recv, cut_serialize) = match config.stages.first() {
         Some(stage) => (
             stage.cut_rules,
             stage.cut_output,
             stage.cut_append,
             stage.cut_recv,
+            stage.cut_serialize,
         ),
-        None => (false, false, false, false),
+        None => (false, false, false, false, false),
     };
-    set_perf_cuts(cut_rules, cut_output, cut_append, cut_recv);
+    set_perf_cuts(cut_rules, cut_output, cut_append, cut_recv, cut_serialize);
 }
 
 /// 复位诊断模式全局状态——无 `--perf-diag` 时调用（生产启动零污染）。
 pub fn reset_perf_diag() {
     PERF_DIAG_ENABLED.store(false, Ordering::Relaxed);
     *PERF_STAGES.write().expect("perf stages lock poisoned") = Vec::new();
-    set_perf_cuts(false, false, false, false);
+    set_perf_cuts(false, false, false, false, false);
 }
 
 /// 原子门控翻转（诊断档状态机专用，不进 reload diff）。
@@ -86,11 +89,13 @@ pub fn set_perf_cuts(
     cut_output: bool,
     cut_append: bool,
     cut_recv: bool,
+    cut_serialize: bool,
 ) {
     PERF_CUT_RULES.store(cut_rules, Ordering::Relaxed);
     PERF_CUT_OUTPUT.store(cut_output, Ordering::Relaxed);
     PERF_CUT_APPEND.store(cut_append, Ordering::Relaxed);
     PERF_CUT_RECV.store(cut_recv, Ordering::Relaxed);
+    PERF_CUT_SERIALIZE.store(cut_serialize, Ordering::Relaxed);
 }
 
 /// 诊断模式是否开启。
@@ -126,6 +131,12 @@ pub fn perf_cut_append() -> bool {
 #[inline]
 pub fn perf_cut_recv() -> bool {
     PERF_CUT_RECV.load(Ordering::Relaxed)
+}
+
+/// 是否禁止序列化/写入（cut_serialize 门控）。
+#[inline]
+pub fn perf_cut_serialize() -> bool {
+    PERF_CUT_SERIALIZE.load(Ordering::Relaxed)
 }
 
 /// 当前诊断档列表（空 = 非诊断模式或单点）。
@@ -361,7 +372,7 @@ impl PerfDiagController {
         }
         let stage = self.stages.get(target)?.clone();
         // 1. 原子门控翻转（先于 reload——新数据即吃新门控）。
-        set_perf_cuts(stage.cut_rules, stage.cut_output, stage.cut_append, stage.cut_recv);
+        set_perf_cuts(stage.cut_rules, stage.cut_output, stage.cut_append, stage.cut_recv, stage.cut_serialize);
         // 2. 规则子集变化（非空且不同于基线）→ 触发现有 runtime.rules 热 reload。
         let mut reloaded = false;
         let rules = stage.rules.as_deref().unwrap_or("");
@@ -597,7 +608,7 @@ mod tests {
         assert!(!perf_diag_enabled());
         assert!(!perf_cut_rules());
         assert!(!perf_cut_output());
-        set_perf_cuts(true, true, true, true);
+        set_perf_cuts(true, true, true, true, false);
         reset_perf_diag();
         assert!(!perf_cut_rules(), "reset 必须复位门控");
         assert!(!perf_cut_output());
@@ -615,6 +626,7 @@ mod tests {
                     cut_output: true,
                     cut_append: false,
                     cut_recv: false,
+                    cut_serialize: false,
                     rules: None,
                 },
                 PerfStage {
@@ -623,6 +635,7 @@ mod tests {
                     cut_output: false,
                     cut_append: false,
                     cut_recv: false,
+                    cut_serialize: false,
                     rules: None,
                 },
             ],
@@ -650,16 +663,18 @@ mod tests {
     fn set_perf_cuts_flips_both_gates() {
         let _g = serial();
         reset_perf_diag();
-        set_perf_cuts(true, false, true, true);
+        set_perf_cuts(true, false, true, true, true);
         assert!(perf_cut_rules());
         assert!(!perf_cut_output());
         assert!(perf_cut_append());
         assert!(perf_cut_recv());
-        set_perf_cuts(false, true, false, true);
+        assert!(perf_cut_serialize());
+        set_perf_cuts(false, true, false, true, false);
         assert!(!perf_cut_rules());
         assert!(perf_cut_output());
         assert!(!perf_cut_append());
         assert!(perf_cut_recv());
+        assert!(!perf_cut_serialize());
         // 复位，避免污染其它测试：全局 static 门控，并行测试的 emit 会
         // 被 `perf_cut_output()` 早退丢输出（2026-08-25 实测：deferred_q8
         // EOS 重试 emit 被切 → 断言 left=[]）。
@@ -839,6 +854,7 @@ mod tests {
             cut_output: true,
             cut_append: false,
             cut_recv: false,
+            cut_serialize: false,
             rules: None,
         }
     }
@@ -850,6 +866,7 @@ mod tests {
             cut_output: true,
             cut_append: false,
             cut_recv: false,
+            cut_serialize: false,
             rules: None,
         }
     }
@@ -861,6 +878,7 @@ mod tests {
             cut_output: false,
             cut_append: false,
             cut_recv: false,
+            cut_serialize: false,
             rules: None,
         }
     }
@@ -873,6 +891,7 @@ mod tests {
             cut_output: false,
             cut_append: true,
             cut_recv: false,
+            cut_serialize: false,
             rules: None,
         }
     }
@@ -885,6 +904,21 @@ mod tests {
             cut_output: false,
             cut_append: false,
             cut_recv: true,
+            cut_serialize: false,
+            rules: None,
+        }
+    }
+
+    /// emit 档（cut_serialize=true, 2026-08-25）: 输出构建 + 通道投递完整,
+    /// sink 收到即丢（不序列化不写）——测输出构建段。
+    fn emit_stage() -> PerfStage {
+        PerfStage {
+            name: "emit".into(),
+            cut_rules: false,
+            cut_output: false,
+            cut_append: false,
+            cut_recv: false,
+            cut_serialize: true,
             rules: None,
         }
     }
@@ -900,6 +934,7 @@ mod tests {
             cut_output: false,
             cut_append: false,
             cut_recv: false,
+            cut_serialize: false,
             rules: None,
         }
     }
@@ -970,6 +1005,21 @@ mod tests {
         let applied = controller.on_sentinel(0).await.expect("transition");
         assert_eq!(applied.index, 1);
         assert!(!perf_cut_recv(), "stage 1: full 恢复");
+        reset_perf_diag();
+    }
+
+    /// emit 档（cut_serialize）经哨兵应用与恢复（2026-08-25 补）。
+    #[tokio::test]
+    async fn controller_applies_cut_serialize_stage() {
+        let _g = serial();
+        init_perf_diag(&test_config(vec![emit_stage(), full_stage()]));
+        let controller = PerfDiagController::new();
+        assert!(perf_cut_serialize(), "stage 0: emit 档切序列化");
+        assert!(!perf_cut_output());
+
+        let applied = controller.on_sentinel(0).await.expect("transition");
+        assert_eq!(applied.index, 1);
+        assert!(!perf_cut_serialize(), "stage 1: full 恢复");
         reset_perf_diag();
     }
 
@@ -1349,6 +1399,7 @@ mod tests {
                 cut_output: false,
                 cut_append: false,
                 cut_recv: false,
+                cut_serialize: false,
                 rules: Some("models/rules/c_family.wfl".into()),
             },
         ]));
@@ -1498,6 +1549,7 @@ rules = "rules/basic.wfl"
                 cut_output: false,
                 cut_append: false,
                 cut_recv: false,
+                cut_serialize: false,
                 rules: Some("models/rules/c_family.wfl".into()),
             },
         ])
@@ -1532,6 +1584,7 @@ rules = "rules/basic.wfl"
                 cut_output: false,
                 cut_append: false,
                 cut_recv: false,
+                cut_serialize: false,
                 rules: Some("rules/basic.wfl".into()),
             },
         ])
@@ -1560,6 +1613,7 @@ rules = "rules/basic.wfl"
                 cut_output: false,
                 cut_append: false,
                 cut_recv: false,
+                cut_serialize: false,
                 rules: Some("models/rules/c_family.wfl".into()),
             },
         ]));

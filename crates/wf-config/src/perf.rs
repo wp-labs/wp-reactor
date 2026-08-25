@@ -43,6 +43,10 @@ pub struct PerfStage {
     /// 测「注入 + TCP 接收」字节率; 哨兵流豁免）。
     #[serde(default)]
     pub cut_recv: bool,
+    /// 本档生效期间：禁止序列化/写入（AlertBatch 到 sink 即丢——测「输出构建 +
+    /// 通道投递」; 增量 full−emit = 序列化 + sink 写成本）。
+    #[serde(default)]
+    pub cut_serialize: bool,
     /// 规则子集文件路径（相对 work-dir）。空 = 保持当前规则；非空且与当前
     /// 不同 → 触发既有 `runtime.rules` 热 reload（HotReloadSupported）。
     #[serde(default)]
@@ -185,6 +189,7 @@ rules = "models/rules/c_family.wfl"
                 cut_output: true,
                 cut_append: false,
                 cut_recv: false,
+                cut_serialize: false,
                 rules: None,
             }],
         };
@@ -200,6 +205,7 @@ rules = "models/rules/c_family.wfl"
                 cut_output: false,
                 cut_append: true,
                 cut_recv: false,
+                cut_serialize: false,
                 rules: None,
             }],
         };
