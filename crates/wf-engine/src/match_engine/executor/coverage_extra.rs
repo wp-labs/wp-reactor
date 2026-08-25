@@ -3963,6 +3963,133 @@ fn each_columnar_filter_structured_field_falls_back_parity() {
     assert_eq!(app_col, Vec::<usize>::new());
 }
 
+/// 形状矩阵收口：**多个 General 被 Field/Lit 隔开**（Field, General, Lit,
+/// General）——每个 General 槽位按字段位置独立命中，`need_yield_meta` 与
+/// 槽位映射必须对齐。若有人把位置索引改回「只数 General 的游标」，此形状
+/// 会同时错位两个 General（修复前 general_cvecs 游标 bug 的完整触发面）。
+#[test]
+fn each_columnar_multiple_generals_interspersed_matches_row_path() {
+    use wp_model_core::model::Value as ModelValue;
+
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("auction", DataType::Int64, true),
+        ArrowField::new("ts", DataType::Int64, true),
+        ArrowField::new("extra", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![Some(11), Some(22), None])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(1_700_000_000_000_000_000),
+                Some(1_700_000_000_000_000_000),
+                None,
+            ])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("ab c"), Some("cc"), None])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let b_field = |n: &str| Expr::Field(FieldRef::Qualified("b".into(), n.into()));
+    let call = |name: &str, args: Vec<Expr>| Expr::FuncCall {
+        qualifier: None,
+        name: name.into(),
+        args,
+    };
+    let mut plan = simple_rule_plan(
+        "mixed_interspersed",
+        simple_plan(vec![], vec![]),
+        Expr::Number(5.0),
+        "digit",
+        b_field("auction"),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "b".into(),
+        filter: None,
+    });
+    // 刻意：Field, General, Lit, General——两个 General 都被非 General 隔开。
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: b_field("auction"),
+        },
+        YieldField {
+            name: "day".into(),
+            value: call(
+                "strftime",
+                vec![b_field("ts"), Expr::StringLit("%Y".into())],
+            ),
+        },
+        YieldField {
+            name: "alert_type".into(),
+            value: Expr::StringLit("q14_calc".into()),
+        },
+        YieldField {
+            name: "dots".into(),
+            value: call("count_char", vec![b_field("extra"), Expr::StringLit("c".into())]),
+        },
+    ];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("id".into(), FieldType::Base(BaseType::Float)),
+            ("day".into(), FieldType::Base(BaseType::Chars)),
+            ("alert_type".into(), FieldType::Base(BaseType::Chars)),
+            ("dots".into(), FieldType::Base(BaseType::Chars)),
+        ]),
+    );
+    assert!(exec.each_plan_columnar_safe());
+
+    let t = 1_700_000_000_000_000_000i64;
+    let events = crate::match_engine::event_bridge::batch_to_events(&batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let col_events: Vec<ColumnarEvent> = (0..3).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+
+    assert_eq!(sr.appended, 3);
+    assert_eq!(sr.rejected, 0);
+    assert_eq!(sc.appended, 3, "两个 General 槽位都必须命中");
+    assert_eq!(sc.rejected, 0);
+    assert_eq!(sc.failed, 0);
+    assert_eq!(app_row, vec![0usize, 1, 2]);
+    assert_eq!(app_col, vec![0usize, 1, 2]);
+
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(out_row, out_col, "交错多 General 必须逐位一致");
+    let get = |r: &wp_model_core::model::DataRecord, name: &str| {
+        r.fields()
+            .find(|f| f.get_name() == name)
+            .and_then(|f| match f.get_value() {
+                ModelValue::Chars(v) => Some(v.to_string()),
+                _ => None,
+            })
+            .expect(name)
+    };
+    // 两个 General 都得真命中各自槽位（错位会取到 Field/Lit 的 None → 空串）。
+    assert_eq!(get(&out_col[0], "day"), "2023", "strftime 槽位 1 命中");
+    assert_eq!(get(&out_col[1], "day"), "2023");
+    assert_eq!(get(&out_col[0], "dots"), "1", "count_char 槽位 3 命中（\"ab c\" 含 1 个 c）");
+    assert_eq!(get(&out_col[1], "dots"), "2", "\"cc\" 含 2 个 c");
+    assert_eq!(get(&out_col[2], "dots"), "", "null extra → None → 空串");
+}
+
 // ---------------------------------------------------------------------------
 // close_exec.rs — close paths
 // ---------------------------------------------------------------------------
