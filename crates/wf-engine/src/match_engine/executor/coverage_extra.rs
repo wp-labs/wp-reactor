@@ -2551,6 +2551,160 @@ fn each_plan_columnar_safe_gate_branches() {
     assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
 }
 
+/// `each_pipe_columnar_safe` 门控（2026-08-25 q13a 列式化）：pipe 列式路径的
+/// 保守形状——无 joins/lets/where/each filter、score 常量、entity 字面量/flat
+/// 字段、yield ∈ {字面量, flat 字段, `expr_is_columnar`（BinOp 如 q13a
+/// `auction % 10000`）}。sink 门控（each_plan_columnar_safe）放行的形状
+/// （each filter / 输出函数 / 活 join）在 pipe 门控下**保守拒绝**（回退行式
+/// stage_pipe_record）。
+#[test]
+fn each_pipe_columnar_safe_gate_branches() {
+    let base = || {
+        let mut plan = simple_rule_plan(
+            "q13a_bench",
+            simple_plan(vec![], vec![]),
+            Expr::Number(10.0),
+            "digit",
+            Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+        );
+        plan.binds[0].alias = "b".into();
+        plan.each_plan = Some(EachPlan {
+            alias: "b".into(),
+            filter: None,
+        });
+        plan
+    };
+
+    // q13a 形状：5 Field + 1 `%` BinOp yield → safe（BinOp 编译为批级 cvec）。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "mod_key".into(),
+        value: Expr::BinOp {
+            op: BinOp::Mod,
+            left: Box::new(Expr::Field(FieldRef::Qualified("b".into(), "auction".into()))),
+            right: Box::new(Expr::Number(10000.0)),
+        },
+    }];
+    assert!(
+        RuleExecutor::new(plan).each_pipe_columnar_safe(),
+        "q13a mod BinOp yield 必须通过 pipe 列式门控"
+    );
+
+    // 无 each plan → false。
+    let mut plan = base();
+    plan.each_plan = None;
+    assert!(!RuleExecutor::new(plan).each_pipe_columnar_safe());
+
+    // each filter → false（pipe 列式路径未接 filter 求值；sink 门控允许）。
+    let mut plan = base();
+    plan.each_plan = Some(EachPlan {
+        alias: "b".into(),
+        filter: Some(Expr::Bool(true)),
+    });
+    assert!(
+        !RuleExecutor::new(plan).each_pipe_columnar_safe(),
+        "pipe 门控对 each filter 保守拒绝（sink 门控放行）"
+    );
+
+    // lets → false。
+    let mut plan = base();
+    plan.lets = vec![LetPlan {
+        name: "x".into(),
+        expr: Expr::Number(1.0),
+    }];
+    assert!(!RuleExecutor::new(plan).each_pipe_columnar_safe());
+
+    // 活 join → false（pipe 列式路径无 join 富化）。yield 引用右窗字段使
+    // join 存活（否则死 join 消除 → live_joins 空 → 误放行）。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "cat".into(),
+        value: Expr::Field(FieldRef::Qualified("w".into(), "category".into())),
+    }];
+    plan.joins = vec![JoinPlan {
+        right_window: "w".into(),
+        mode: JoinMode::Snapshot,
+        conds: vec![JoinCondPlan {
+            left: FieldRef::Qualified("b".into(), "bidder".into()),
+            right: FieldRef::Qualified("w".into(), "id".into()),
+        }],
+        within: None,
+        reduce: None,
+        emit_at: None,
+    }];
+    assert!(!RuleExecutor::new(plan).each_pipe_columnar_safe());
+
+    // `where` → false。
+    let mut plan = base();
+    plan.r#where = Some(Expr::Bool(true));
+    assert!(!RuleExecutor::new(plan).each_pipe_columnar_safe());
+
+    // 非列式 yield（upper 函数调用）→ false。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "y".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "upper".into(),
+            args: vec![Expr::Field(FieldRef::Simple("sip".into()))],
+        },
+    }];
+    assert!(!RuleExecutor::new(plan).each_pipe_columnar_safe());
+
+    // 输出函数 fmt yield → false（pipe 门控未接批量 cell；sink 门控放行）。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "y".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "fmt".into(),
+            args: vec![
+                Expr::StringLit("x={}".into()),
+                Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+            ],
+        },
+    }];
+    assert!(
+        !RuleExecutor::new(plan).each_pipe_columnar_safe(),
+        "fmt yield 保守回退行式（列式装载仅支持 Lit/Field/expr_is_columnar）"
+    );
+
+    // Path yield field → false。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "y".into(),
+        value: Expr::Field(FieldRef::Path {
+            alias: "b".into(),
+            segments: vec![PathSegment::Field("obj".into())],
+        }),
+    }];
+    assert!(!RuleExecutor::new(plan).each_pipe_columnar_safe());
+
+    // 非 flat entity（Path）→ false。
+    let mut plan = base();
+    plan.entity_plan.entity_id_expr = Expr::Field(FieldRef::Path {
+        alias: "b".into(),
+        segments: vec![PathSegment::Field("obj".into())],
+    });
+    assert!(!RuleExecutor::new(plan).each_pipe_columnar_safe());
+
+    // 非常量 score → false。
+    let mut plan = base();
+    plan.score_plan = ScorePlan {
+        expr: Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+    };
+    assert!(!RuleExecutor::new(plan).each_pipe_columnar_safe());
+
+    // 非列式 bind filter → false。
+    let mut plan = base();
+    plan.binds[0].filter = Some(Expr::FuncCall {
+        qualifier: None,
+        name: "upper".into(),
+        args: vec![Expr::Field(FieldRef::Simple("sip".into()))],
+    });
+    assert!(!RuleExecutor::new(plan).each_pipe_columnar_safe());
+}
+
 /// Dead-join elimination (2026-08-23, q13 RSS/EPS): a Snapshot/Asof join whose
 /// enrichment no output expression reads is dropped from `live_joins` — the
 /// rule then qualifies for the columnar each fast path. Filtering modes

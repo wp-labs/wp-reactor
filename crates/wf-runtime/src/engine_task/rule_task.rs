@@ -838,17 +838,24 @@ impl RuleTask {
         // to the eager path (deferred-vs-columnar 对拍 test locks it).
         // Independent of `defer_materialize` (that requires a state machine;
         // Q1 on-each has none).
+        // 2026-08-25 q13a 列式化：中间管道目标（!each_direct）的 each 规则在
+        // 满足 `each_pipe_columnar_safe` 形状（q13a：投影 + `%` BinOp yield）
+        // 时同样走列式快路径——免每行 Event 物化 + OutputRecord + stage 的
+        // 三重分配（q13a row path 1248ns/行，见 rule_task_bench）。
         let columnar_each = !debug_enabled
             && self.machine.is_none()
-            && self.each_direct
+            && self.deferred.is_none()
             && events.is_none()
             && batch.is_some()
-            && self.executor.each_plan_columnar_safe()
-            // deferred（emit at）规则不得走列式 each 快路径：挂起/到期评估在
-            // 行循环里（deferred_pending_for → scan_deferred）。q8 等 on each +
-            // deferred 若走快路径会被列式 join 当 Snapshot 即时输出——deferred
-            // 语义丢失（2026-08-23 验证基线暴露：q8 引擎 33k vs oracle 82k）。
-            && self.deferred.is_none();
+            && if self.each_direct {
+                self.executor.each_plan_columnar_safe()
+            } else {
+                self.executor.each_pipe_columnar_safe()
+            };
+        // 注：deferred（emit at）规则不得走列式 each 快路径：挂起/到期评估在
+        // 行循环里（deferred_pending_for → scan_deferred）。q8 等 on each +
+        // deferred 若走快路径会被列式 join 当 Snapshot 即时输出——deferred
+        // 语义丢失（2026-08-23 验证基线暴露：q8 引擎 33k vs oracle 82k）。
 
         // Row domain: a **sharded** deferred push only owns the rows partitioned
         // to this shard (`shard_rows`); an unsharded push scans the whole batch.
@@ -1065,14 +1072,23 @@ impl RuleTask {
             // 列式 each 分流：无活 join（q1 等）走无 join 列式路径；活 join
             // （q20 等，each_join_plan 已解析）走列式 join 富化路径（批级
             // join_lookup + 列式右窗字段读，免每事件 Event clone —— 2026-08-23
-            // 列式 join 富化，q20 2.5M/s → 列式量级）。
+            // 列式 join 富化，q20 2.5M/s → 列式量级）。中间管道目标（q13a）
+            // 走 pipe 列式装载（2026-08-25 q13a 列式化）。
             if self.executor.live_joins().is_empty() {
-                self.emit_each_direct_batch_columnar(&rows, batch_emit_nanos)
-                    .await;
+                if self.each_direct {
+                    self.emit_each_direct_batch_columnar(&rows, batch_emit_nanos)
+                        .await;
+                } else {
+                    self.emit_each_pipe_batch_columnar(&rows, batch_emit_nanos)
+                        .await;
+                }
             } else {
                 self.emit_each_direct_batch_columnar_join(&rows, &lookup, batch_emit_nanos)
                     .await;
             }
+            // 列式分支早退：pipe 路径已在此装载中间行，必须同批收口（与行式
+            // 路径的 flush_pipes 节奏一致）；sink 目标无 pipe 装载，no-op。
+            self.flush_pipes().await;
             return;
         }
         // Plan C2 batching: when the per-event detail logs are off, collect
@@ -3303,6 +3319,107 @@ impl RuleTask {
         }
     }
 
+    /// Columnar on-each emit for **intermediate pipe targets** (q13a 等
+    /// each→pipe，2026-08-25 q13a 列式化）：批级求值（`each_batch_prepare`
+    /// 一次）→ 每行 yield 值（`execute_each_pipe_batch_columnar`，零 Event/
+    /// OutputRecord 物化）→ 直接装入 `PipeBatchStager` 类型列。装载节奏与
+    /// 行式路径一致（每输入批一次 flush_pipes）。
+    ///
+    /// 注：不采样 serialize 计时（pipe 装载路径不生成 OutputRecord，与
+    /// `flush_pipes` 的批构建/广播共享计时口径）。
+    async fn emit_each_pipe_batch_columnar(
+        &self,
+        rows: &[(&ColumnarEvent<'_>, i64)],
+        batch_emit_nanos: i64,
+    ) {
+        if crate::perf_diag::perf_cut_output() {
+            return;
+        }
+        let Some((first, _)) = rows.first() else {
+            return;
+        };
+        let prepared = self.executor.each_batch_prepare(first.batch());
+        let mut out: Vec<wf_engine::match_engine::PipeEachRow> = Vec::with_capacity(rows.len());
+        let stats = self
+            .executor
+            .execute_each_pipe_batch_columnar(rows, &prepared, &mut out);
+        if let Some(metrics) = &self.metrics {
+            for _ in 0..stats.appended {
+                metrics.inc_alert_emitted_total(self.rule_name());
+            }
+            for _ in 0..stats.failed {
+                metrics.inc_alert_serialize_failed();
+            }
+        }
+        // 行式路径在 stage_pipe_record 的 Uninit 分支解析形状并建 stager；
+        // 列式路径同样惰性解析，但用 new_columnar 预计算列来源计划。
+        let yield_names: Vec<Arc<str>> = self
+            .executor
+            .plan()
+            .yield_plan
+            .fields
+            .iter()
+            .map(|f| Arc::from(f.name.as_str()))
+            .collect();
+        let rule_name = self.rule_name().to_string();
+        let mut guard = self.pipe_state.lock().unwrap();
+        match &mut *guard {
+            PipeState::Dead => {}
+            PipeState::Staging(stager) => {
+                for (row, (_, event_nanos)) in out.iter().zip(rows.iter()) {
+                    if let Err(e) = stager.push_row(&rule_name, row, *event_nanos) {
+                        wf_warn!(
+                            pipe,
+                            task_id = %self.task_id,
+                            rule = %rule_name,
+                            output_kind = "intermediate",
+                            error = %e,
+                            "stage internal pipeline row failed (columnar)"
+                        );
+                    }
+                }
+            }
+            PipeState::Uninit => {
+                // 与行式 `stage_pipe_record` 同款惰性形状解析（首次发射时才
+                // 解析；pipe registry 启动期可能仍在填充）。
+                let target = self.executor.static_yield_target().clone();
+                match resolve_pipe_shape(&self.pipe_registry, &self.router, &target) {
+                    Some((schema, time_col_index)) => {
+                        let mut stager =
+                            PipeBatchStager::new_columnar(target, schema, time_col_index, &yield_names);
+                        for (row, (_, event_nanos)) in out.iter().zip(rows.iter()) {
+                            if let Err(e) = stager.push_row(&rule_name, row, *event_nanos) {
+                                wf_warn!(
+                                    pipe,
+                                    task_id = %self.task_id,
+                                    rule = %rule_name,
+                                    output_kind = "intermediate",
+                                    error = %e,
+                                    "stage internal pipeline row failed (columnar)"
+                                );
+                            }
+                        }
+                        *guard = PipeState::Staging(stager);
+                    }
+                    None => {
+                        wf_warn!(
+                            pipe,
+                            task_id = %self.task_id,
+                            rule = %rule_name,
+                            target = %target,
+                            output_kind = "intermediate",
+                            reason = "missing_internal_window",
+                            "missing internal pipeline window"
+                        );
+                        *guard = PipeState::Dead;
+                    }
+                }
+            }
+        }
+        drop(guard);
+        let _ = batch_emit_nanos;
+    }
+
     /// Flush the accumulated columnar alert batches to the sink writers,
     /// grouped by yield_target. Each sink receives one `AlertBatch` (a single
     /// channel send) of columnar records, amortizing the per-alert resolve /
@@ -3637,6 +3754,34 @@ enum PipeCol {
     },
 }
 
+/// 列式装载（q13a 列式化，2026-08-25）的列来源计划：schema 每列的值来自
+/// yield 值（按 yield 下标）/ `__wf_pipe_ts` / `_wfu_meta_*` 回退 / 无来源。
+/// 构造一次（new_columnar），`push_row` 逐行直查——免行式 `push_record` 的
+/// 每列 × 每字段名字符串查找。
+enum PipeColSource {
+    Yield(usize),
+    EventTime,
+    MetaRuleName,
+    MetaScore,
+    MetaEntityType,
+    MetaEntityId,
+    Missing,
+}
+
+impl Clone for PipeColSource {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Yield(i) => Self::Yield(*i),
+            Self::EventTime => Self::EventTime,
+            Self::MetaRuleName => Self::MetaRuleName,
+            Self::MetaScore => Self::MetaScore,
+            Self::MetaEntityType => Self::MetaEntityType,
+            Self::MetaEntityId => Self::MetaEntityId,
+            Self::Missing => Self::Missing,
+        }
+    }
+}
+
 /// Resolved shape of an intermediate pipe target: the relay schema and its
 /// time column (pipe registry first, window fallback).
 fn resolve_pipe_shape(
@@ -3684,7 +3829,48 @@ impl PipeBatchStager {
             time_col_index,
             cols,
             rows: 0,
+            col_sources: Vec::new(),
         }
+    }
+
+    /// 列式装载构造（q13a 列式化，2026-08-25）：额外预计算 schema 列 →
+    /// yield/meta 来源映射（`yield_names` = yield 计划字段名顺序），`push_row`
+    /// 逐行 O(cols) 直查，免 `push_record` 的每列名字符串查找。
+    fn new_columnar(
+        target: Arc<str>,
+        schema: arrow::datatypes::SchemaRef,
+        time_col_index: Option<usize>,
+        yield_names: &[std::sync::Arc<str>],
+    ) -> Self {
+        use wf_lang::wfu_meta::WfuIntermediateMetaField;
+        let mut stager = Self::new(target, schema, time_col_index);
+        let meta_names = [
+            (WfuIntermediateMetaField::RuleName, PipeColSource::MetaRuleName),
+            (WfuIntermediateMetaField::Score, PipeColSource::MetaScore),
+            (WfuIntermediateMetaField::EntityType, PipeColSource::MetaEntityType),
+            (WfuIntermediateMetaField::EntityId, PipeColSource::MetaEntityId),
+        ];
+        stager.col_sources = stager
+            .schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == PIPE_EVENT_TIME_FIELD {
+                    return PipeColSource::EventTime;
+                }
+                if let Some(yield_idx) = yield_names.iter().position(|n| **n == *field.name()) {
+                    return PipeColSource::Yield(yield_idx);
+                }
+                if let Some((_, src)) = meta_names
+                    .iter()
+                    .find(|(m, _)| m.name() == field.name())
+                {
+                    return src.clone();
+                }
+                PipeColSource::Missing
+            })
+            .collect();
+        stager
     }
 
     /// Stage one emitted row. The coercion matrix mirrors
@@ -3700,51 +3886,55 @@ impl PipeBatchStager {
                 .iter()
                 .find(|(name, _)| **name == *field.name())
                 .map(|(_, value)| value);
-            if field.name() == PIPE_EVENT_TIME_FIELD {
-                match &mut self.cols[idx] {
-                    PipeCol::Timestamp(v) => v.push(Some(event_time_nanos)),
-                    PipeCol::Null { len, .. } => *len += 1,
-                    _ => unreachable!("event-time field must be Timestamp"),
-                }
-                continue;
-            }
-            let col = &mut self.cols[idx];
-            match col {
-                PipeCol::Int64(v) => v.push(match value {
-                    Some(wf_engine::match_engine::Value::Number(n)) => Some(*n as i64),
-                    _ => None,
-                }),
-                PipeCol::Float64(v) => v.push(match value {
-                    Some(wf_engine::match_engine::Value::Number(n)) => Some(*n),
-                    _ => None,
-                }),
-                PipeCol::Bool(v) => v.push(match value {
-                    Some(wf_engine::match_engine::Value::Bool(b)) => Some(*b),
-                    _ => None,
-                }),
-                PipeCol::Utf8(v) => {
-                    v.push(match value {
-                        Some(wf_engine::match_engine::Value::Str(s)) => Some(s.to_string()),
-                        Some(wf_engine::match_engine::Value::Number(n)) => Some(n.to_string()),
-                        Some(wf_engine::match_engine::Value::Bool(b)) => Some(b.to_string()),
-                        Some(
-                            value @ (wf_engine::match_engine::Value::Array(_)
-                            | wf_engine::match_engine::Value::Object(_)),
-                        ) => Some(value_to_json_string(value)?),
-                        _ => None,
-                    });
-                }
-                PipeCol::Timestamp(v) => v.push(match value {
-                    Some(wf_engine::match_engine::Value::Number(n)) => {
-                        normalize_epoch_timestamp_float_nanos(*n)
-                    }
-                    // The schema's time column falls back to the row's event
-                    // time when the yield did not provide one.
-                    None if self.time_col_index == Some(idx) => Some(event_time_nanos),
-                    _ => None,
-                }),
-                PipeCol::Null { len, .. } => *len += 1,
-            }
+            let is_event_time = field.name() == PIPE_EVENT_TIME_FIELD;
+            let is_time_column = self.time_col_index == Some(idx);
+            push_pipe_col(
+                &mut self.cols[idx],
+                value,
+                is_event_time,
+                is_time_column,
+                event_time_nanos,
+            )?;
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// 列式装载一行（q13a 列式化，2026-08-25）：值来自预计算的列来源计划
+    /// （yield 值 / `__wf_pipe_ts` / `_wfu_meta_*`），coercion 矩阵与
+    /// [`Self::push_record`] 逐分支一致（对拍测试钉死）。`rule_name` 供
+    /// `_wfu_meta_rule_name` 回退列。
+    fn push_row(
+        &mut self,
+        rule_name: &str,
+        row: &wf_engine::match_engine::PipeEachRow,
+        event_time_nanos: i64,
+    ) -> RuntimeResult<()> {
+        use wf_engine::match_engine::Value;
+        debug_assert_eq!(
+            self.col_sources.len(),
+            self.schema.fields().len(),
+            "columnar stager 必须先 new_columnar 预计算来源计划"
+        );
+        for (idx, source) in self.col_sources.iter().enumerate() {
+            let value = match source {
+                PipeColSource::Yield(yield_idx) => row.values.get(*yield_idx).and_then(|v| v.as_ref()),
+                PipeColSource::EventTime => None,
+                PipeColSource::MetaRuleName => Some(&Value::Str(rule_name.into())),
+                PipeColSource::MetaScore => Some(&Value::Number(row.score)),
+                PipeColSource::MetaEntityType => Some(&Value::Str((&row.entity_type[..]).into())),
+                PipeColSource::MetaEntityId => Some(&Value::Str(row.entity_id.as_str().into())),
+                PipeColSource::Missing => None,
+            };
+            let is_event_time = matches!(source, PipeColSource::EventTime);
+            let is_time_column = self.time_col_index == Some(idx);
+            push_pipe_col(
+                &mut self.cols[idx],
+                value,
+                is_event_time,
+                is_time_column,
+                event_time_nanos,
+            )?;
         }
         self.rows += 1;
         Ok(())
@@ -3801,6 +3991,75 @@ struct PipeBatchStager {
     time_col_index: Option<usize>,
     cols: Vec<PipeCol>,
     rows: usize,
+    /// 列式装载（`new_columnar`）的列来源计划；行式 `push_record` 不填
+    /// （按名查找），`push_row` 要求非空。
+    col_sources: Vec<PipeColSource>,
+}
+
+/// 共享的单列装载（q13a 列式化，2026-08-25）：`push_record` 与 `push_row`
+/// 的 coercion 矩阵逐分支一致——Int64/Float64/Bool 数值转换、Utf8 的
+/// Str/Number/Bool/JSON 渲染、Timestamp 的 epoch-ns 归一化与时间列回退、
+/// Null 占位。`is_event_time_field` = `__wf_pipe_ts` 特殊列（直写
+/// event_time_nanos）；`is_time_column` = schema 时间列（value 缺失时回退
+/// event_time_nanos，与行式 Timestamp None 分支一致）。
+fn push_pipe_col(
+    col: &mut PipeCol,
+    value: Option<&wf_engine::match_engine::Value>,
+    is_event_time_field: bool,
+    is_time_column: bool,
+    event_time_nanos: i64,
+) -> RuntimeResult<()> {
+    if is_event_time_field
+        && !matches!(
+            col,
+            PipeCol::Timestamp(_) | PipeCol::Null { .. }
+        )
+    {
+        unreachable!("event-time field must be Timestamp");
+    }
+    match col {
+        PipeCol::Int64(v) => v.push(match value {
+            Some(wf_engine::match_engine::Value::Number(n)) => Some(*n as i64),
+            _ => None,
+        }),
+        PipeCol::Float64(v) => v.push(match value {
+            Some(wf_engine::match_engine::Value::Number(n)) => Some(*n),
+            _ => None,
+        }),
+        PipeCol::Bool(v) => v.push(match value {
+            Some(wf_engine::match_engine::Value::Bool(b)) => Some(*b),
+            _ => None,
+        }),
+        PipeCol::Utf8(v) => {
+            v.push(match value {
+                Some(wf_engine::match_engine::Value::Str(s)) => Some(s.to_string()),
+                Some(wf_engine::match_engine::Value::Number(n)) => Some(n.to_string()),
+                Some(wf_engine::match_engine::Value::Bool(b)) => Some(b.to_string()),
+                Some(
+                    value @ (wf_engine::match_engine::Value::Array(_)
+                    | wf_engine::match_engine::Value::Object(_)),
+                ) => Some(value_to_json_string(value)?),
+                _ => None,
+            });
+        }
+        PipeCol::Timestamp(v) => {
+            if is_event_time_field {
+                v.push(Some(event_time_nanos));
+            } else {
+                v.push(match value {
+                    Some(wf_engine::match_engine::Value::Number(n)) => {
+                        normalize_epoch_timestamp_float_nanos(*n)
+                    }
+                    // The schema's time column falls back to the row's event
+                    // time when the yield did not provide one.
+                    None if is_time_column => Some(event_time_nanos),
+                    _ => None,
+                });
+            }
+        }
+        PipeCol::Null { len, .. } => *len += 1,
+    }
+    Ok(())
 }
 
 fn record_window_fields(

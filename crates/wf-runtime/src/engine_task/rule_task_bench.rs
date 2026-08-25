@@ -306,6 +306,177 @@ fn q13a_pipe_bench() {
     let _ = empty_tracked_bind_fields();
 }
 
+/// q13a 中间窗装载的 **列式路径** 微基准（2026-08-25 q13a 列式化）：
+/// `execute_each_pipe_batch_columnar`（零 Event/OutputRecord 物化）+ `push_row`
+/// （预计算列来源计划）。与 ①② 对照：物化 246ns + per-record 526ns + stage 476ns
+/// = 1248ns/行 的 row path，应降至几百 ns 量级。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-runtime q13a_pipe_bench -- --ignored --nocapture"]
+fn q13a_pipe_columnar_bench() {
+    let exec = q13a_plan_rule();
+    assert!(
+        exec.each_pipe_columnar_safe(),
+        "q13a 形状必须满足 pipe 列式门控"
+    );
+    let batch = bid_batch(N);
+    let col_events: Vec<wf_engine::match_engine::ColumnarEvent<'_>> = (0..N)
+        .map(|i| wf_engine::match_engine::ColumnarEvent::new(&batch, i))
+        .collect();
+    let rows: Vec<(&wf_engine::match_engine::ColumnarEvent<'_>, i64)> = col_events
+        .iter()
+        .map(|ev| (ev, NANOS))
+        .collect();
+    let yield_names: Vec<std::sync::Arc<str>> = exec
+        .plan()
+        .yield_plan
+        .fields
+        .iter()
+        .map(|f| std::sync::Arc::from(f.name.as_str()))
+        .collect();
+
+    // ⑤ 求值 + 装载（列式全链）。
+    let start = Instant::now();
+    let mut total_appended = 0usize;
+    for _ in 0..4 {
+        let prepared = exec.each_batch_prepare(&batch);
+        let mut out: Vec<wf_engine::match_engine::PipeEachRow> = Vec::with_capacity(N);
+        let mut stager = PipeBatchStager::new_columnar(
+            Arc::from("bid_mod"),
+            bid_mod_schema(),
+            Some(4),
+            &yield_names,
+        );
+        let stats = exec.execute_each_pipe_batch_columnar(&rows, &prepared, &mut out);
+        for row in &out {
+            stager.push_row("q13a_bench", row, NANOS).expect("stage row");
+        }
+        total_appended += stats.appended;
+    }
+    let columnar_ns = start.elapsed().as_nanos() as f64 / (N as f64 * 4.0);
+    eprintln!(
+        "[q13a-pipe-bench] N = {N}, columnar appended = {total_appended} (expect {})",
+        N * 4
+    );
+    report("⑤ columnar pipe (eval+push_row)", columnar_ns, columnar_ns);
+    eprintln!(
+        "[q13a-pipe-bench] 列式路径 vs row path(含物化) = {:.1}x",
+        (246.0 + 526.0 + 476.0) / columnar_ns
+    );
+    let _ = empty_tracked_bind_fields();
+}
+
+/// q13a 双路径 对拍（2026-08-25 q13a 列式化正确性锁）：row path
+/// （`execute_each_with_joins` → `push_record`）与 columnar pipe path
+/// （`execute_each_pipe_batch_columnar` → `push_row`）产出的中间窗批次必须
+/// **字节一致**——含 meta 回退列（`__wfu_*`）与 `__wf_pipe_ts` 事件时间列。
+#[test]
+fn q13a_pipe_columnar_matches_row_path() {
+    use arrow::array::Array;
+    let exec = q13a_plan_rule();
+    let batch = bid_batch(N);
+    let events: Vec<std::sync::Arc<wf_engine::match_engine::Event>> =
+        batch_to_events(&batch).into_iter().map(std::sync::Arc::new).collect();
+    let first = &events[0];
+    let mut field_order: Vec<&smol_str::SmolStr> = first.fields.keys().collect();
+    field_order.sort_unstable();
+    let lookup = NoLookup;
+
+    // 含 meta 回退列 + 事件时间列的中间窗 schema（bid_mod 字段 + __wfu_* + ts）。
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("auction", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("mod_key", DataType::Int64, true),
+        Field::new("__wfu_rule_name", DataType::Utf8, true),
+        Field::new("__wfu_score", DataType::Float64, true),
+        Field::new("__wfu_entity_type", DataType::Utf8, true),
+        Field::new("__wfu_entity_id", DataType::Utf8, true),
+        Field::new("__wf_pipe_ts", DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None), true),
+    ]));
+
+    // Row path.
+    let mut row_stager = PipeBatchStager::new(Arc::from("bid_mod"), Arc::clone(&schema), Some(4));
+    for ev in &events {
+        let record = exec
+            .execute_each_with_joins(ev, NANOS, &lookup, &field_order, NANOS)
+            .expect("eval")
+            .expect("q13a 无 filter → 必有输出");
+        row_stager.push_record(&record).expect("stage");
+    }
+    let (_, _, row_batch) = row_stager.take_events().expect("build").expect("non-empty");
+
+    // Columnar pipe path.
+    let prepared = exec.each_batch_prepare(&batch);
+    let col_events: Vec<wf_engine::match_engine::ColumnarEvent<'_>> = (0..N)
+        .map(|i| wf_engine::match_engine::ColumnarEvent::new(&batch, i))
+        .collect();
+    let rows: Vec<(&wf_engine::match_engine::ColumnarEvent<'_>, i64)> = col_events
+        .iter()
+        .map(|ev| (ev, NANOS))
+        .collect();
+    let mut out: Vec<wf_engine::match_engine::PipeEachRow> = Vec::with_capacity(N);
+    let stats = exec.execute_each_pipe_batch_columnar(&rows, &prepared, &mut out);
+    assert_eq!(stats.appended, N, "无 filter → 全行输出");
+    let yield_names: Vec<std::sync::Arc<str>> = exec
+        .plan()
+        .yield_plan
+        .fields
+        .iter()
+        .map(|f| std::sync::Arc::from(f.name.as_str()))
+        .collect();
+    let mut col_stager = PipeBatchStager::new_columnar(
+        Arc::from("bid_mod"),
+        Arc::clone(&schema),
+        Some(4),
+        &yield_names,
+    );
+    for row in &out {
+        col_stager
+            .push_row("q13a_bench", row, NANOS)
+            .expect("stage");
+    }
+    let (_, _, col_batch) = col_stager.take_events().expect("build").expect("non-empty");
+
+    assert_eq!(row_batch.num_rows(), col_batch.num_rows());
+    assert_eq!(row_batch.num_columns(), col_batch.num_columns());
+    for (i, (a, b)) in row_batch
+        .columns()
+        .iter()
+        .zip(col_batch.columns().iter())
+        .enumerate()
+    {
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "col {i} ({}): 长度一致",
+            schema.field(i).name()
+        );
+        for row in 0..row_batch.num_rows() {
+            assert_eq!(
+                a.is_null(row),
+                b.is_null(row),
+                "col {i} ({}): row {row} null 位一致",
+                schema.field(i).name()
+            );
+            if !a.is_null(row) {
+                assert_eq!(
+                    arrow::util::display::array_value_to_string(a, row).expect("display"),
+                    arrow::util::display::array_value_to_string(b, row).expect("display"),
+                    "col {i} ({}): row {row} 值一致",
+                    schema.field(i).name()
+                );
+            }
+        }
+    }
+    let _ = empty_tracked_bind_fields();
+}
+
 /// q13b 生产真实路径微基准：`on each m` + `join side_input snapshot` +
 /// `detail = fmt("{}", side_input.value)`。生产 q13b **不走列式 join 路径**——
 /// yield 含 fmt 函数（live join 下 columnar gate 拒绝，回退 row path），每行

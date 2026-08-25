@@ -2676,6 +2676,23 @@ async fn q13_sharded_pull_acks_processed_not_read_position() {
     );
 }
 
+/// 真实编译的 q13a 计划必须走 **pipe 列式装载** 快路径（2026-08-25 q13a
+/// 列式化守护）：`each_pipe_columnar_safe` 对生产 q13a（5 Field + `%` BinOp
+/// yield，yield 中间窗 bid_mod）返回 true——否则列式化对生产规则不生效。
+#[test]
+fn q13a_compiled_plan_takes_pipe_columnar_path() {
+    let schemas = nexmark_schemas();
+    let file = wf_lang::parse_wfl(Q13_WFL).expect("parse q13.wfl");
+    let plans = wf_lang::compile_wfl(&file, &schemas).expect("compile q13.wfl");
+    let plan = plans.into_iter().next().expect("q13a first");
+    let executor = RuleExecutor::new(plan);
+    assert!(
+        executor.each_pipe_columnar_safe(),
+        "真实 q13a 计划必须通过 pipe 列式门控（projection + mod BinOp）"
+    );
+    assert_eq!(executor.live_joins().len(), 0, "q13a 无 join");
+}
+
 /// q13 双规则链**无消费者槽位**对照：中间窗无 ack 保护时驱逐自由删未读 →
 /// 下游输出丢失（引擎依赖消费者注册——生产 `register_progress` 已注册；
 /// 此对照证明该依赖是丢数据的守卫，任何漏注册都是正确性事故）。

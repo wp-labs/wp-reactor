@@ -20,8 +20,8 @@ pub use event_bridge::{
     wfl_structured_field_kind,
 };
 pub use executor::{
-    DeferredPending, DistinctKey, EachDirectBatchStats, RuleExecutor, RuleExecutorOptions,
-    StatsAccum, StatsExecutor, StatsWindowState,
+    DeferredPending, DistinctKey, EachDirectBatchStats, PipeEachRow, RuleExecutor,
+    RuleExecutorOptions, StatsAccum, StatsExecutor, StatsWindowState,
 };
 pub use match_engine::apply_conv;
 pub use match_engine::close_is_qualified;

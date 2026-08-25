@@ -1406,3 +1406,75 @@ append；驱逐回收 → 通知续跑）。对 q5/q16/q18 等 stats 大窗口�
   硬套全窗口。
 - **release 的 u64::MAX 是完成毒药**：完成聚合必须跳过 released 槽，否则热重载
   时哨兵提前排空。
+
+## 2026-08-25 q13a 列式化（中间窗生产路径 1248ns → 203ns/行，6.1×）— 已 commit
+
+### 背景
+M-13 遗留：q13a（`on each b` → yield 中间窗 bid_mod，含 `mod_key = auction %
+10000` BinOp）分片后 10 核 row path 分配放大 RSS 40GB → 回退单 worker（内存
+优先），等待列式化后再评估放开。q13a 走 record 路径的每行成本（rule_task_bench
+基线）：物化 batch_to_events 246ns + execute_each_with_joins 526ns +
+stage_pipe_record 476ns = **1248ns/行**（0.80M/s 单核）。
+
+### 实现（数据驱动：先 bench 定基线，再按 6.1× 目标改造）
+1. **`each_batch_prepare`**：yield 表达式编译范围从「列式输出函数」扩到**任意
+   `expr_is_columnar`**（BinOp `%` 编译为批级 cvec，`int_mod` 快路径）。sink 门控
+   不变（BinOp yield 仍行式），新能力只被 pipe 路径消费。
+2. **新 `each_pipe_columnar_safe()` 门控**（保守形状）：无 joins/lets/where/each
+   filter、score 常量、entity 字面量/flat 字段、yield ∈ {字面量, flat 字段,
+   `expr_is_columnar`}。真实 q13a 计划通过（守护测试）。
+3. **新 `execute_each_pipe_batch_columnar`**（wf-engine）：逐行从 `ColumnarEvent`
+   直读（零 Event 物化、零 OutputRecord/wfx_id/fired_at 脚手架），yield 经批级
+   cvec 求值 + `coerce_yield_field_value_with` 同矩阵收口，产出 `PipeEachRow`
+   （score/entity 元数据 + yield 值）。
+4. **`PipeBatchStager::new_columnar` + `push_row`**（wf-runtime）：列来源计划
+   （yield 下标 / `__wf_pipe_ts` / `__wfu_meta_*` / 无来源）构造一次，逐行直查——
+   免行式 `push_record` 的每列名字符串查找。coercion 矩阵与 `push_record` 逐分支
+   一致（共享 `push_pipe_col` 辅助）。
+5. **`process_batch` 分流**：`columnar_each` 门控扩展到 pipe 目标
+   （`each_direct ? each_plan_columnar_safe : each_pipe_columnar_safe`），分支内
+   按目标分流 sink 列式 / pipe 列式，pipe 路径在同批 flush_pipes 收口。
+
+### 实测（cargo bench，release，100k 行，同帧同机）
+| 路径 | ns/行 | rows/s | 对照 |
+|------|-------|--------|------|
+| row path（物化+record+stage） | 1228.9 | 0.81M | 1.0× |
+| **pipe 列式（eval+push_row）** | **203.4** | **4.92M** | **6.1×** |
+
+单 worker q13a 4.92M/s > ingest 3M/s → 消费追上摄入，bid_events 不再积压，
+为 100M 内存回落（min_acked 不再挡驱逐）铺路；也为重新评估「生产者分片放开」
+（分配量级大降，mimalloc arena 膨胀风险缓解）提供依据。
+
+### 测试（全部通过）
+- `q13a_pipe_columnar_matches_row_path`（**对拍**，wf-runtime）：row path vs
+  pipe 列式路径产出中间窗批次**字节一致**——含 `__wfu_meta_*` 回退列与
+  `__wf_pipe_ts` 事件时间列，N=100k 全列全行比较。
+- `each_pipe_columnar_safe_gate_branches`（wf-engine）：q13a mod BinOp 放行；
+  filter/lets/活 join/where/非列式 yield/fmt/Path/non-const score/非列式 bind
+  filter 拒绝（含死 join 消除后不误放行）。
+- `q13a_compiled_plan_takes_pipe_columnar_path`（wf-runtime）：**真实编译**的
+  q13a 计划必须过门控（防门控漂移）。
+- 回归：wf-engine 1154 / wf-runtime 550 / clippy 0。
+
+### 未提交改动（本段，已 commit）
+- wf-engine: match_engine/executor/each_exec.rs（prepare 扩编译 + pipe 门控 +
+  PipeEachRow + execute_each_pipe_batch_columnar + each_yield_meta_light +
+  +1 测试）、columnar 不变（Mod 已支持）、match_engine/mod.rs + executor/mod.rs
+  re-export PipeEachRow
+- wf-runtime: engine_task/rule_task.rs（process_batch 分流 + emit_each_pipe_batch_columnar
+  + PipeBatchStager::new_columnar/push_row + push_pipe_col + 列来源计划）、
+  rule_task_bench.rs（+列式 bench + 对拍测试）、deferred_integration_tests.rs
+  （+编译计划门控守护）
+
+### Pitfalls（本段新增）
+- **sink 列式门控与 pipe 列式门控是两个门**：sink 允许 each filter / 输出函数 /
+  活 join 列式，pipe 路径保守拒绝（回退行式 stage_pipe_record）——扩展 `%`
+  BinOp 编译时只动 `each_batch_prepare`（cvec 槽位），**不要**把 sink 门控也
+  放开（若 sink 门控放行 BinOp，`%` 的 int/f64 分叉与 div-by-zero 语义边界需要
+  全套 对拍 覆盖，超出本次范围）。
+- **`%` 的 int 快路径**：columnar `int_mod` 走 i64 取模，解释器走 f64——值在
+  ±2^53 内字节一致（对拍锁定）；极端大数会有 f64 精度分叉，`expr_is_columnar`
+  的保守性假设值域在安全范围内。
+- **push 模式（WFUSION_WINDOW_DISPATCH=push）q13a 仍走行式**：columnar_each
+  分支要求 `events.is_none()`（广播带 events+batch 时不满足）——生产 pull 模式
+  生效，push 模式是遗留兼容路径。

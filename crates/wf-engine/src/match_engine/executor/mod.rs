@@ -13,7 +13,7 @@ mod eval;
 mod match_exec;
 mod stats_exec;
 
-pub use each_exec::EachDirectBatchStats;
+pub use each_exec::{EachDirectBatchStats, PipeEachRow};
 // 供 `match_engine::pub use executor::DistinctKey` 转发（stats distinct 键类型）。
 pub use stats_exec::{DistinctKey, StatsAccum, StatsExecutor, StatsWindowState};
 

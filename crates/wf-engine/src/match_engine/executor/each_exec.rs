@@ -750,6 +750,60 @@ impl RuleExecutor {
                 }
             })
     }
+
+    /// Whether the on-each plan can run the **intermediate-pipe** columnar
+    /// fast path (q13a 等 each→pipe 生产路径，2026-08-25 q13a 列式化)。
+    ///
+    /// 形状（比 sink 的 [`Self::each_plan_columnar_safe`] 更严，因为 pipe
+    /// 列式路径是新建的、按保守形状实现）：无 joins / lets / where / each
+    /// filter（无每行拒绝）、bind filter 列式或无、score 常量、entity =
+    /// 字面量/flat 字段、yield 值 ∈ {字面量, flat 字段, `expr_is_columnar`
+    /// （BinOp 如 q13a `auction % 10000` 编译为批级 cvec）}。Anything else
+    /// falls back to the Event-based record path
+    /// (`execute_each_with_joins` + `PipeBatchStager::push_record`).
+    pub fn each_pipe_columnar_safe(&self) -> bool {
+        let Some(each_plan) = &self.plan.each_plan else {
+            return false;
+        };
+        if !self.plan.lets.is_empty()
+            || !self.live_joins.is_empty()
+            || self.plan.r#where.is_some()
+            || each_plan.filter.is_some()
+        {
+            return false;
+        }
+        if !self.plan.binds.iter().all(|b| {
+            b.filter
+                .as_ref()
+                .is_none_or(wf_lang::columnar::expr_is_columnar)
+        }) {
+            return false;
+        }
+        // score 常量（meta 回退列 `_wfu_meta_score` 用；q13a `score(10.0)`）。
+        if !matches!(self.plan.score_plan.expr, Expr::Number(_)) {
+            return false;
+        }
+        let flat = |fr: &FieldRef| {
+            matches!(
+                fr,
+                FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
+            )
+        };
+        match &self.plan.entity_plan.entity_id_expr {
+            Expr::StringLit(_) => {}
+            Expr::Field(fr) if flat(fr) => {}
+            _ => return false,
+        }
+        self.plan
+            .yield_plan
+            .fields
+            .iter()
+            .all(|field| match &field.value {
+                Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => true,
+                Expr::Field(fr) => flat(fr),
+                other => wf_lang::columnar::expr_is_columnar(other),
+            })
+    }
 }
 
 /// Batch-level precomputed on-each columnar state: the general-yield output
@@ -786,18 +840,32 @@ impl RuleExecutor {
             .fields
             .iter()
             .map(|field| {
-                let is_output_func = matches!(
-                    &field.value,
-                    Expr::FuncCall {
-                        qualifier: None,
-                        name,
-                        ..
-                    } if wf_lang::columnar::columnar_output_func(name).is_some()
-                );
-                if is_output_func {
-                    compile_guard(&field.value, &view).map(|plan| plan.eval_vec(&view, n))
-                } else {
-                    None
+                // 输出函数（fmt/strftime/count_char）与**任意可列式表达式**
+                // （expr_is_columnar：BinOp 如 q13a `auction % 10000`、
+                // 守卫函数）统一编译为批级 cvec——q13a 的 mod_key BinOp 因此
+                // 走列式 each 路径（2026-08-25 q13a 列式化）。Lit/Field 走
+                // 各自快通道（不编译）。编译失败（结构化列参数等）→ 槽位
+                // None → 行式回退。
+                match &field.value {
+                    Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) | Expr::Field(_) => None,
+                    other if wf_lang::columnar::expr_is_columnar(other) => {
+                        compile_guard(other, &view).map(|plan| plan.eval_vec(&view, n))
+                    }
+                    _ => {
+                        let is_output_func = matches!(
+                            &field.value,
+                            Expr::FuncCall {
+                                qualifier: None,
+                                name,
+                                ..
+                            } if wf_lang::columnar::columnar_output_func(name).is_some()
+                        );
+                        if is_output_func {
+                            compile_guard(&field.value, &view).map(|plan| plan.eval_vec(&view, n))
+                        } else {
+                            None
+                        }
+                    }
                 }
             })
             .collect();
@@ -1342,6 +1410,217 @@ impl RuleExecutor {
             );
         }
         prof.report(rows.len());
+        stats
+    }
+
+    /// Columnar on-each emit for **intermediate pipe targets** (q13a 等
+    /// each→pipe 生产路径，2026-08-25）：与 [`Self::execute_each_direct_batch_columnar_with`]
+    /// 同源——逐行从 [`ColumnarEvent`] 直读字段（零 `Event` 物化、零
+    /// `OutputRecord`/wfx_id/fired_at 脚手架），yield 表达式经批级 cvec
+    /// （`%` BinOp 等，见 [`Self::each_batch_prepare`]）求值，结果经
+    /// `coerce_yield_field_value_with` 同矩阵收口后交 runtime 装入 pipe 的
+    /// 类型列。
+    ///
+    /// 行语义与 `execute_each_with_joins` → `PipeBatchStager::push_record`
+    /// 字节一致（对拍测试钉死）。Caller must gate on
+    /// [`Self::each_pipe_columnar_safe`]（无 filter/join/let/where → 无每行
+    /// 拒绝，全行 append）；`prepared` 必须来自 rows 同一批。
+    pub fn execute_each_pipe_batch_columnar(
+        &self,
+        rows: &[(&ColumnarEvent<'_>, i64)],
+        prepared: &EachBatchVecs,
+        out: &mut Vec<PipeEachRow>,
+    ) -> EachDirectBatchStats {
+        out.clear();
+        let mut stats = EachDirectBatchStats::default();
+        let Some(each_plan) = &self.plan.each_plan else {
+            log::warn!(
+                "execute_each_pipe_batch_columnar called for non-`on each` rule {}; skipping {} rows",
+                self.plan.name,
+                rows.len()
+            );
+            stats.failed = rows.len();
+            return stats;
+        };
+        debug_assert!(self.each_pipe_columnar_safe());
+        let _ = each_plan; // 门控保证无 filter——形状约束即拒绝语义。
+        let statics = self.output_static();
+
+        // score 常量（门控保证 Number 字面量）——批级求值一次，非每行。
+        let score = match &self.plan.score_plan.expr {
+            Expr::Number(n) => n.clamp(0.0, 100.0),
+            _ => unreachable!("pipe columnar gate requires const score"),
+        };
+        let entity_const: Option<&str> = match &self.plan.entity_plan.entity_id_expr {
+            Expr::StringLit(s) => Some(s.as_str()),
+            _ => None,
+        };
+        let entity_field: Option<&FieldRef> = match &self.plan.entity_plan.entity_id_expr {
+            Expr::Field(fr) => Some(fr),
+            _ => None,
+        };
+        // yield 分类与列索引（与 sink 列式路径同款；Lit 批级常量、Field 按
+        // 预解析列索引直读、General 从批级 cvec 取 cell）。
+        let yield_kinds: Vec<YieldKind> = self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| match &field.value {
+                Expr::Number(n) => YieldKind::Lit(Value::Number(*n)),
+                Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
+                Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
+                Expr::Field(_) => YieldKind::Field,
+                _ => YieldKind::General,
+            })
+            .collect();
+        let yield_field_refs: Vec<Option<&FieldRef>> = self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| match &field.value {
+                Expr::Field(fr) => Some(fr),
+                _ => None,
+            })
+            .collect();
+        let batch0 = rows.first().map(|(ev, _)| ev.batch());
+        debug_assert!(
+            rows.is_empty()
+                || prepared.batch_ptr == 0
+                || batch0.is_some_and(|b| (b as *const RecordBatch as usize) == prepared.batch_ptr),
+            "each_batch_prepare 必须来自 rows 的同一批"
+        );
+        let resolve = |name: Option<&str>| -> Option<usize> {
+            name.and_then(|n| batch0.and_then(|b| b.schema().index_of(n).ok()))
+        };
+        let entity_idx: Option<usize> = if entity_const.is_some() {
+            None
+        } else {
+            resolve(entity_field.map(field_ref_name))
+        };
+        let yield_field_idxs: Vec<Option<usize>> = yield_field_refs
+            .iter()
+            .map(|fr| resolve(fr.map(field_ref_name)))
+            .collect();
+        let entity_col: EntityCol<'_> = match (entity_idx, batch0) {
+            (Some(idx), Some(b)) => {
+                let schema = b.schema();
+                let field = schema.field(idx);
+                let col = b.column(idx);
+                match field.data_type() {
+                    DataType::Int64 => col
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .map_or(EntityCol::Generic, |a| EntityCol::I64(I64Col::Int64(a))),
+                    DataType::Timestamp(TimeUnit::Nanosecond, _) => col
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .map_or(EntityCol::Generic, |a| EntityCol::I64(I64Col::TsNanos(a))),
+                    DataType::Utf8 if !crate::match_engine::is_wfl_structured_field(field) => col
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .map_or(EntityCol::Generic, EntityCol::Utf8),
+                    _ => EntityCol::Generic,
+                }
+            }
+            _ => EntityCol::Generic,
+        };
+
+        for (event, event_time_nanos) in rows {
+            let entity_id = match &entity_const {
+                Some(s) => s.to_string(),
+                None => match &entity_col {
+                    EntityCol::I64(i64col) => match i64col.read(event.row()) {
+                        Some(v) => {
+                            let mut es = String::with_capacity(20);
+                            write_int64_value(&mut es, v);
+                            es
+                        }
+                        None => String::new(),
+                    },
+                    EntityCol::Utf8(arr) => {
+                        let row = event.row();
+                        if arr.is_null(row) {
+                            String::new()
+                        } else {
+                            String::from(arr.value(row))
+                        }
+                    }
+                    EntityCol::Generic => match entity_idx.and_then(|idx| event.value_at(idx)) {
+                        Some(v) => value_to_string(&v),
+                        None => String::new(),
+                    },
+                },
+            };
+            // 门控无 General-编译失败？防御：构造一次 meta 供行式回退
+            // （与 sink 路径的 need_yield_meta 同款，仅编译失败时真用到）。
+            let yield_meta = yield_kinds
+                .iter()
+                .zip(prepared.general_cvecs.iter())
+                .any(|(kind, cvec)| matches!(kind, YieldKind::General) && cvec.is_none())
+                .then(|| self.each_yield_meta_light(&entity_id, score, *event_time_nanos));
+            let mut values = Vec::with_capacity(self.plan.yield_plan.fields.len());
+            let mut row_ok = true;
+            for (field_idx, ((((field, (name, field_type)), kind), _field_ref), field_idx_opt)) in self
+                .plan
+                .yield_plan
+                .fields
+                .iter()
+                .zip(statics.yield_specs.iter())
+                .zip(yield_kinds.iter())
+                .zip(yield_field_refs.iter())
+                .zip(yield_field_idxs.iter().copied())
+                .enumerate()
+            {
+                let value = match kind {
+                    YieldKind::Lit(v) => v.clone(),
+                    YieldKind::Field => match field_idx_opt {
+                        Some(idx) => event
+                            .value_at(idx)
+                            .unwrap_or_else(|| Value::Str(SmolStr::default())),
+                        None => Value::Str(SmolStr::default()),
+                    },
+                    YieldKind::General => match prepared
+                        .general_cvecs
+                        .get(field_idx)
+                        .and_then(|oc| oc.as_ref())
+                    {
+                        Some(cvec) => match cvec.scalar_at(event.row()) {
+                            Some(s) => cscalar_to_value(&s),
+                            None => Value::Str(SmolStr::default()),
+                        },
+                        None => eval_yield_expr_with_meta(
+                            &field.value,
+                            &event.to_event(),
+                            yield_meta.expect("need_yield_meta → meta 已构造"),
+                        )
+                        .expect("eval_yield_expr_with_meta never returns None"),
+                    },
+                };
+                match RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)
+                {
+                    Ok(Some(v)) => values.push(Some(v)),
+                    Ok(None) => values.push(None), // 可选字段缺失 → 省略 cell
+                    Err(e) => {
+                        log::warn!("alert export error: {e}");
+                        row_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !row_ok {
+                stats.failed += 1;
+                continue;
+            }
+            out.push(PipeEachRow {
+                score,
+                entity_type: Arc::clone(&statics.entity_type),
+                entity_id,
+                values,
+            });
+            stats.appended += 1;
+        }
         stats
     }
 
@@ -1947,6 +2226,40 @@ impl RuleExecutor {
         }
     }
 
+    /// Light `YieldMeta` for the pipe-columnar path's rare interpreter
+    /// fallback (a gate-passing yield whose cvec compile failed). The pipe
+    /// gate ([`Self::each_pipe_columnar_safe`]) restricts yields to
+    /// `expr_is_columnar`, which by construction can never read the meta keys
+    /// left empty here (`wfx_id` / `origin` / `fired_at` / `emit_time` /
+    /// `summary`) — SystemVar / WfuMeta expressions are excluded from
+    /// `expr_is_columnar` — so the empty slots are unobservable by the
+    /// fallback's evaluation.
+    fn each_yield_meta_light<'a>(
+        &'a self,
+        entity_id: &'a str,
+        score: f64,
+        event_time_nanos: i64,
+    ) -> YieldMeta<'a> {
+        YieldMeta {
+            score: Some(score),
+            wfx_id: None,
+            rule_name: Some(&self.plan.name),
+            entity_type: Some(&self.plan.entity_plan.entity_type),
+            entity_id: Some(entity_id),
+            origin: None,
+            close_reason: None,
+            fired_at: None,
+            emit_time: None,
+            summary: None,
+            event_first_time_nanos: Some(event_time_nanos),
+            event_last_time_nanos: Some(event_time_nanos),
+            window_start_time_nanos: Some(event_time_nanos),
+            window_end_time_nanos: Some(event_time_nanos),
+            emit_time_nanos: Some(event_time_nanos),
+            time_format: Some(self.output_config().time_format.as_str()),
+        }
+    }
+
     /// Machine id of an event, as carried by `OutputRecord::machine_id` on
     /// the on-each path. Exposed for the runtime's sampled per-alert
     /// telemetry on the direct-write path (which no longer materializes the
@@ -1962,6 +2275,19 @@ fn passes_each_filter(filter: Option<&wf_lang::ast::Expr>, event: &Event) -> boo
         Some(result) => result,
         None => filter.is_none(),
     }
+}
+
+/// One on-each **pipe** row (2026-08-25 q13a 列式化): score / entity meta
+/// (for `_wfu_meta_*` fallback columns when the pipe schema carries them)
+/// plus the coerced yield values in yield-plan order. A `None` value means
+/// the optional input field was missing → cell omitted, same as the record
+/// path's `#62` skip.
+#[derive(Debug, Default)]
+pub struct PipeEachRow {
+    pub score: f64,
+    pub entity_type: std::sync::Arc<str>,
+    pub entity_id: String,
+    pub values: Vec<Option<Value>>,
 }
 
 /// Outcome of [`RuleExecutor::execute_each_direct_batch`].
