@@ -46,8 +46,10 @@ use arrow::record_batch::RecordBatch;
 use smol_str::SmolStr;
 use wf_lang::ast::{BinOp, Expr, FieldRef, PathSegment};
 
-use super::match_engine::{EngineHashMap, field_ref_name};
+use super::match_engine::eval::cmp::{apply_fmt_template, timestamp_nanos_to_utc};
+use super::match_engine::{EngineHashMap, Value, field_ref_name};
 use crate::match_engine::{WFL_FIELD_TYPE_ARRAY, wfl_structured_field_kind};
+use crate::time::normalize_epoch_timestamp_float_nanos;
 
 /// Three-valued scalar read from an Arrow column — the scalar subset of
 /// [`super::match_engine::Value`], plus `Structured` for a non-null
@@ -371,6 +373,29 @@ pub(crate) enum ColumnExpr {
         hay: ColRef,
         needle: Needle,
     },
+    /// `fmt(template, v1, ...)` — yield-cell output function (on-each / match /
+    /// close columnar output): a literal template rendered over per-row scalar
+    /// arguments (`value_to_string`, byte-identical to the interpreted path).
+    /// Any argument cell that reads null renders the whole row null, matching
+    /// `apply_fmt_template`'s `None` (the interpreted `eval_yield` substitutes
+    /// an empty string for a missing field *before* the call).
+    Fmt {
+        template: SmolStr,
+        args: Vec<ColumnExpr>,
+    },
+    /// `strftime(ts, [fmt])` — yield-cell output function: a numeric epoch
+    /// nanos cell formatted via chrono with the (literal or default) format.
+    /// Null / non-numeric cells read null, matching the interpreted path.
+    Strftime {
+        ts: Box<ColumnExpr>,
+        fmt: SmolStr,
+    },
+    /// `count_char(text, ch)` — yield-cell output function: occurrence count of
+    /// `ch`'s first char in `text` → numeric, matching the interpreted path.
+    CountChar {
+        text: Box<ColumnExpr>,
+        needle: Box<ColumnExpr>,
+    },
 }
 
 /// Evaluate a columnar guard expression over every row of `view`, producing one
@@ -475,66 +500,129 @@ fn compile_expr(expr: &Expr, view: &ColumnarBatch<'_>) -> Option<ColumnExpr> {
             }
             _ => None,
         },
-        // 原生列式函数（cidr_match / regex_match / contains / startswith /
-        // endswith）——单一权威清单 `columnar_func` 与门控共享，消除函数名
-        // 清单 drift。常量（子网/正则/字面量 needle）在编译期解析一次
-        // （每 batch），字段 needle 解析为其列。
+        // 原生列式函数：守卫（cidr/regex/strsearch）与输出（fmt/strftime/
+        // count_char）两套清单，单一权威来源（`columnar_func` /
+        // `columnar_output_func`）。常量在编译期解析一次，字段解析为其列。
         Expr::FuncCall {
             qualifier: None,
             name,
             args,
         } => {
-            let func = wf_lang::columnar::columnar_func(name)?;
-            // 门控已保证形态（`columnar_func_args_ok`），这里再防御性校验。
-            if !wf_lang::columnar::columnar_func_args_ok(func, args) {
-                return None;
-            }
-            let Expr::Field(field) = &args[0] else {
-                unreachable!("columnar_func_args_ok 保证 args[0] 为 flat 字段");
-            };
-            let col = view.resolve_field(field);
-            match func {
-                wf_lang::columnar::ColumnarFunc::CidrMatch
-                | wf_lang::columnar::ColumnarFunc::RegexMatch => {
-                    let Expr::StringLit(constant) = &args[1] else {
-                        unreachable!("columnar_func_args_ok 保证 args[1] 为字面量");
-                    };
-                    match func {
-                        wf_lang::columnar::ColumnarFunc::CidrMatch => Some(ColumnExpr::CidrMatch {
-                            col,
-                            net: wf_lang::cidr::Cidr::parse(constant)?,
-                        }),
-                        _ => Some(ColumnExpr::RegexMatch {
-                            col,
-                            re: regex::Regex::new(constant).ok()?,
-                        }),
-                    }
-                }
-                wf_lang::columnar::ColumnarFunc::StrSearch => {
-                    let op = StrFuncOp::from_name(name).expect("columnar_func 已确认名字");
-                    let needle = match &args[1] {
-                        Expr::StringLit(s) => Needle::Lit(s.clone().into()),
-                        Expr::Field(
-                            FieldRef::Simple(_)
-                            | FieldRef::Qualified(_, _)
-                            | FieldRef::Bracketed(_, _),
-                        ) => {
-                            let Expr::Field(f) = &args[1] else {
-                                unreachable!("columnar_func_args_ok 保证 args[1] 为字段");
-                            };
-                            Needle::Col(view.resolve_field(f))
-                        }
-                        _ => unreachable!("columnar_func_args_ok 保证 args[1] 形态"),
-                    };
-                    Some(ColumnExpr::StrFunc {
-                        op,
-                        hay: col,
-                        needle,
-                    })
-                }
+            if let Some(func) = wf_lang::columnar::columnar_func(name) {
+                compile_guard_func(name, func, args, view)
+            } else if wf_lang::columnar::columnar_output_func(name).is_some() {
+                compile_output_func(name, args, view)
+            } else {
+                None
             }
         }
         _ => None,
+    }
+}
+
+/// Compile a gate-admitted guard function (`cidr_match` / `regex_match` /
+/// `contains` / `startswith` / `endswith`) into a [`ColumnExpr`] node.
+fn compile_guard_func(
+    name: &str,
+    func: wf_lang::columnar::ColumnarFunc,
+    args: &[Expr],
+    view: &ColumnarBatch<'_>,
+) -> Option<ColumnExpr> {
+    // 门控已保证形态（`columnar_func_args_ok`），这里再防御性校验。
+    if !wf_lang::columnar::columnar_func_args_ok(func, args) {
+        return None;
+    }
+    let Expr::Field(field) = &args[0] else {
+        unreachable!("columnar_func_args_ok 保证 args[0] 为 flat 字段");
+    };
+    let col = view.resolve_field(field);
+    match func {
+        wf_lang::columnar::ColumnarFunc::CidrMatch
+        | wf_lang::columnar::ColumnarFunc::RegexMatch => {
+            let Expr::StringLit(constant) = &args[1] else {
+                unreachable!("columnar_func_args_ok 保证 args[1] 为字面量");
+            };
+            match func {
+                wf_lang::columnar::ColumnarFunc::CidrMatch => Some(ColumnExpr::CidrMatch {
+                    col,
+                    net: wf_lang::cidr::Cidr::parse(constant)?,
+                }),
+                _ => Some(ColumnExpr::RegexMatch {
+                    col,
+                    re: regex::Regex::new(constant).ok()?,
+                }),
+            }
+        }
+        wf_lang::columnar::ColumnarFunc::StrSearch => {
+            let op = StrFuncOp::from_name(name).expect("columnar_func 已确认名字");
+            let needle = match &args[1] {
+                Expr::StringLit(s) => Needle::Lit(s.clone().into()),
+                Expr::Field(
+                    FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _),
+                ) => {
+                    let Expr::Field(f) = &args[1] else {
+                        unreachable!("columnar_func_args_ok 保证 args[1] 为字段");
+                    };
+                    Needle::Col(view.resolve_field(f))
+                }
+                _ => unreachable!("columnar_func_args_ok 保证 args[1] 形态"),
+            };
+            Some(ColumnExpr::StrFunc {
+                op,
+                hay: col,
+                needle,
+            })
+        }
+    }
+}
+
+/// Compile a gate-admitted output function (`fmt` / `strftime` / `count_char`)
+/// into a yield-cell [`ColumnExpr`] node. Argument shapes are guaranteed by
+/// `columnar_output_expr` (flat field / literal); a failure here (e.g. a
+/// structured-array column argument) tells the caller to fall back to the
+/// interpreted per-row path for that yield expression.
+fn compile_output_func(
+    name: &str,
+    args: &[Expr],
+    view: &ColumnarBatch<'_>,
+) -> Option<ColumnExpr> {
+    let func = wf_lang::columnar::columnar_output_func(name)?;
+    match func {
+        wf_lang::columnar::ColumnarOutputFunc::Fmt => {
+            let Expr::StringLit(template) = &args[0] else {
+                return None;
+            };
+            let cargs: Option<Vec<ColumnExpr>> =
+                args[1..].iter().map(|a| compile_expr(a, view)).collect();
+            Some(ColumnExpr::Fmt {
+                template: template.clone().into(),
+                args: cargs?,
+            })
+        }
+        wf_lang::columnar::ColumnarOutputFunc::Strftime => {
+            if args.is_empty() || args.len() > 2 {
+                return None;
+            }
+            let ts = compile_expr(&args[0], view)?;
+            let fmt = match args.get(1) {
+                Some(Expr::StringLit(f)) => f.clone(),
+                Some(_) => return None,
+                None => wf_config::DEFAULT_OUTPUT_TIME_FORMAT.to_string(),
+            };
+            Some(ColumnExpr::Strftime {
+                ts: Box::new(ts),
+                fmt: fmt.into(),
+            })
+        }
+        wf_lang::columnar::ColumnarOutputFunc::CountChar => {
+            if args.len() != 2 {
+                return None;
+            }
+            Some(ColumnExpr::CountChar {
+                text: Box::new(compile_expr(&args[0], view)?),
+                needle: Box::new(compile_expr(&args[1], view)?),
+            })
+        }
     }
 }
 
@@ -566,9 +654,9 @@ pub(crate) enum CVec {
 }
 
 impl CVec {
-    /// Per-row [`CScalar`] view (used only by compare / arithmetic kernels that
-    /// delegate to the shared interpreted-semantics helpers).
-    fn scalar_at(&self, row: usize) -> Option<CScalar> {
+    /// Per-row [`CScalar`] view (used by compare / arithmetic kernels and by
+    /// columnar yield-cell consumers of batch-evaluated output columns).
+    pub(crate) fn scalar_at(&self, row: usize) -> Option<CScalar> {
         match self {
             CVec::Int(v) => v[row].map(CScalar::Int),
             CVec::Float(v) => v[row].map(CScalar::Float),
@@ -609,7 +697,7 @@ impl ColumnExpr {
     /// bottom-up to the root. The `view` resolves compiled [`ColRef`] leaves to
     /// concrete columns for *this* batch — the same tree evaluates any batch of
     /// the window's schema.
-    fn eval_vec(&self, view: &ColumnarBatch<'_>, n: usize) -> CVec {
+    pub(crate) fn eval_vec(&self, view: &ColumnarBatch<'_>, n: usize) -> CVec {
         match self {
             ColumnExpr::Lit(v) => lit_vec(v, n),
             ColumnExpr::Col(col) => view.col_vec(col, n),
@@ -631,6 +719,14 @@ impl ColumnExpr {
             ColumnExpr::CidrMatch { col, net } => view.cidr_vec(col, net, n),
             ColumnExpr::RegexMatch { col, re } => view.regex_vec(col, re, n),
             ColumnExpr::StrFunc { op, hay, needle } => view.strfunc_vec(*op, hay, needle, n),
+            ColumnExpr::Fmt { template, args } => {
+                let arg_vecs: Vec<CVec> = args.iter().map(|a| a.eval_vec(view, n)).collect();
+                fmt_vec(template, &arg_vecs, n)
+            }
+            ColumnExpr::Strftime { ts, fmt } => strftime_vec(ts.eval_vec(view, n), fmt, n),
+            ColumnExpr::CountChar { text, needle } => {
+                count_char_vec(text.eval_vec(view, n), needle.eval_vec(view, n), n)
+            }
         }
     }
 }
@@ -836,6 +932,99 @@ fn structured_col(n: usize, non_null: impl Fn(usize) -> bool) -> CVec {
             .map(|r| non_null(r).then_some(CScalar::Structured))
             .collect(),
     )
+}
+
+/// Convert a columnar scalar cell to its interpreted [`Value`] equivalent
+/// (yield-cell consumers of the batch-evaluated output columns). Structured
+/// cells are unreachable here: the columnar-output gate excludes structured
+/// fields from `fmt`/`strftime`/`count_char` arguments (they compile to `None`
+/// and fall back to the interpreted per-row path).
+pub(crate) fn cscalar_to_value(s: &CScalar) -> Value {
+    match s {
+        CScalar::Int(i) => Value::Number(*i as f64),
+        CScalar::Float(f) => Value::Number(*f),
+        CScalar::Str(s) => Value::Str(s.clone()),
+        CScalar::Bool(b) => Value::Bool(*b),
+        CScalar::Structured => Value::Array(Vec::new()),
+    }
+}
+
+/// Vectorized `fmt(template, args...)` yield-cell evaluation: per row, all
+/// argument cells read (non-null) as scalars, render the template via
+/// `apply_fmt_template` (byte-identical to the interpreted path). A null cell
+/// or a placeholder-count mismatch reads null — the yield wrapper substitutes
+/// an empty string, exactly like the interpreted `eval_yield_expr_with_meta`.
+fn fmt_vec(template: &SmolStr, args: &[CVec], n: usize) -> CVec {
+    let mut out = Vec::with_capacity(n);
+    for row in 0..n {
+        let mut values = Vec::with_capacity(args.len());
+        let mut ok = true;
+        for a in args {
+            match a.scalar_at(row) {
+                Some(s) => values.push(cscalar_to_value(&s)),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        out.push(if ok {
+            apply_fmt_template(template, &values).map(SmolStr::from)
+        } else {
+            None
+        });
+    }
+    CVec::Str(out)
+}
+
+/// Vectorized `strftime(ts, fmt)` yield-cell evaluation: per row, a numeric
+/// epoch-nanos cell is normalized (the same f64 heuristic as the interpreted
+/// path) and formatted via chrono; null / non-numeric / out-of-range read null
+/// (the yield wrapper substitutes an empty string).
+fn strftime_vec(ts: CVec, fmt: &SmolStr, n: usize) -> CVec {
+    let mut out = Vec::with_capacity(n);
+    for row in 0..n {
+        let cell = match ts.scalar_at(row) {
+            Some(s) => s,
+            None => {
+                out.push(None);
+                continue;
+            }
+        };
+        let nanos = match cscalar_to_value(&cell) {
+            Value::Number(v) => normalize_epoch_timestamp_float_nanos(v),
+            _ => None,
+        };
+        out.push(nanos.and_then(timestamp_nanos_to_utc).map(|dt| dt.format(fmt).to_string().into()));
+    }
+    CVec::Str(out)
+}
+
+/// Vectorized `count_char(text, ch)` yield-cell evaluation: per row, count the
+/// first char of the needle in the text (empty needle → 0, matching the
+/// interpreted path); either operand non-string / null reads null (the yield
+/// wrapper substitutes an empty string).
+fn count_char_vec(text: CVec, needle: CVec, n: usize) -> CVec {
+    let mut out = Vec::with_capacity(n);
+    for row in 0..n {
+        let (t, nd) = match (text.scalar_at(row), needle.scalar_at(row)) {
+            (Some(t), Some(nd)) => (t, nd),
+            _ => {
+                out.push(None);
+                continue;
+            }
+        };
+        let (Value::Str(t), Value::Str(nd)) = (cscalar_to_value(&t), cscalar_to_value(&nd)) else {
+            out.push(None);
+            continue;
+        };
+        let count = match nd.chars().next() {
+            Some(ch) => t.chars().filter(|&c| c == ch).count() as i64,
+            None => 0,
+        };
+        out.push(Some(CScalar::Int(count)));
+    }
+    CVec::Scalar(out)
 }
 
 /// Vectorized unary negation. `Int` negates to `Float` (widening, mirroring the
@@ -1288,7 +1477,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::match_engine::event_bridge::{batch_to_events, materialize_rows};
-    use crate::match_engine::match_engine::{Event, Value, eval_expr_ext};
+    use crate::match_engine::match_engine::{Event, Value, eval_expr, eval_expr_ext};
 
     fn field(name: &str) -> Expr {
         Expr::Field(FieldRef::Simple(name.to_string()))
@@ -2297,5 +2486,103 @@ mod tests {
         let empty = str_func_call("contains", field("action"), Expr::StringLit(String::new()));
         assert!(wf_lang::columnar::expr_is_columnar(&empty));
         assert_equiv(&empty, &batch);
+    }
+
+    /// 列式输出 cell（fmt/strftime/count_char）与解释路径逐行对拍，含 yield
+    /// 语义的 None→空串包装（`eval_yield_expr_with_meta` 对缺字段/null 参数
+    /// 替换空串）。
+    fn assert_output_equiv(expr: &Expr, batch: &RecordBatch) {
+        let events = batch_to_events(batch);
+        let view = ColumnarBatch::from_all_fields(batch);
+        let plan = compile_guard(expr, &view).expect("输出函数应可编译");
+        let cvec = plan.eval_vec(&view, view.num_rows());
+        for (row, event) in events.iter().enumerate() {
+            let columnar = match cvec.scalar_at(row) {
+                Some(s) => cscalar_to_value(&s),
+                None => Value::Str(SmolStr::default()),
+            };
+            let interpreted =
+                eval_expr(expr, event).unwrap_or_else(|| Value::Str(SmolStr::default()));
+            assert_eq!(columnar, interpreted, "row {row}: expr={expr:?}");
+        }
+    }
+
+    #[test]
+    fn output_funcs_match_interpreted_cells() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("action", DataType::Utf8, true),
+            Field::new("count", DataType::Int64, true),
+            Field::new("ts", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("fail_login"),
+                    None,
+                    Some("success"),
+                    Some("aa"),
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(3), Some(7), None, Some(2)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![
+                    Some(1_700_000_000_000_000_000),
+                    Some(1_700_000_000_000_000_001),
+                    None,
+                    Some(1_700_000_000_000_000_002),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let call = |name: &str, args: Vec<Expr>| Expr::FuncCall {
+            qualifier: None,
+            name: name.into(),
+            args,
+        };
+        let f = |n: &str| Expr::Field(FieldRef::Simple(n.into()));
+
+        // fmt：字面量模板 + 字段参数（null action/count 行 → 空串）。
+        let fmt = call(
+            "fmt",
+            vec![Expr::StringLit("a={}|n={}".into()), f("action"), f("count")],
+        );
+        assert!(wf_lang::columnar::columnar_output_expr(&fmt));
+        assert_output_equiv(&fmt, &batch);
+        // fmt：纯字面量参数。
+        assert_output_equiv(
+            &call("fmt", vec![Expr::StringLit("x={}".into()), Expr::Number(42.0)]),
+            &batch,
+        );
+
+        // strftime：默认格式 + 自定义格式 + 常量 ts。
+        assert_output_equiv(&call("strftime", vec![f("ts")]), &batch);
+        assert_output_equiv(
+            &call(
+                "strftime",
+                vec![f("ts"), Expr::StringLit("%Y-%m-%d".into())],
+            ),
+            &batch,
+        );
+        assert_output_equiv(
+            &call(
+                "strftime",
+                vec![Expr::Number(1_700_000_000_000_000_000.0)],
+            ),
+            &batch,
+        );
+
+        // count_char：字面量 / 字段 needle；null 参数（action null 行）→ 空串。
+        assert_output_equiv(
+            &call("count_char", vec![f("action"), Expr::StringLit("a".into())]),
+            &batch,
+        );
+        assert_output_equiv(
+            &call("count_char", vec![f("action"), Expr::StringLit("l".into())]),
+            &batch,
+        );
+        // 空 needle → 0。
+        assert_output_equiv(
+            &call("count_char", vec![f("action"), Expr::StringLit(String::new())]),
+            &batch,
+        );
     }
 }

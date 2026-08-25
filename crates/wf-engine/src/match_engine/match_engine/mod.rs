@@ -1,8 +1,8 @@
 mod close;
 mod conv;
-mod eval;
+pub(crate) mod eval;
 mod join_then_key;
-mod key;
+pub(crate) mod key;
 mod limits;
 mod seq;
 mod state;

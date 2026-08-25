@@ -13,10 +13,11 @@ use crate::alert::{AlertColumnBuilder, EachRowCells};
 use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::MACHINE_ID;
+use crate::match_engine::columnar::{CVec, ColumnExpr, ColumnarBatch, compile_guard, cscalar_to_value};
 use crate::match_engine::event_bridge::{ColumnarEvent, JoinRow};
 use crate::match_engine::match_engine::{
-    CepStateMachine, Event, JoinKey, Value, WindowLookup, eval_field_value, field_ref_name,
-    value_to_string, values_equal,
+    CepStateMachine, Event, FieldSource, JoinKey, Value, WindowLookup, eval_field_value,
+    field_ref_name, value_to_string, values_equal,
 };
 
 use super::RuleExecutor;
@@ -729,7 +730,9 @@ impl RuleExecutor {
             .all(|field| match &field.value {
                 Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => true,
                 Expr::Field(fr) => out_shape_ok(fr),
-                _ => false,
+                // 列式输出函数（fmt/strftime/count_char，参数为字面量/flat 字段）
+                // 走批量 cell 求值；其他一般表达式回退行式。
+                other => wf_lang::columnar::columnar_output_expr(other),
             })
     }
 
@@ -798,7 +801,10 @@ impl RuleExecutor {
                 Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
                 Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
                 Expr::Field(_) => YieldKind::Field,
-                _ => unreachable!("columnar gate excludes general yield exprs"),
+                // 列式输出函数（fmt/strftime/count_char）→ General：批量 cell
+                // 求值（general_cvecs），编译失败（结构化列参数）行式回退。
+                // gate（each_plan_columnar_safe）保证 General 只含输出函数。
+                _ => YieldKind::General,
             })
             .collect();
         let yield_field_refs: Vec<Option<&FieldRef>> = self
@@ -811,6 +817,43 @@ impl RuleExecutor {
                 _ => None,
             })
             .collect();
+
+        // 列式输出函数（fmt/strftime/count_char）：批级编译 + `eval_vec` 整批
+        // 求值一次，行循环只取 cell（向量化 cell 求值）。编译失败（结构化列
+        // 参数等）→ 该 yield 行式回退。
+        let batch0 = rows.first().map(|(ev, _)| ev.batch());
+        let view = batch0.map(ColumnarBatch::from_all_fields);
+        let general_plans: Vec<Option<ColumnExpr>> = self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| {
+                let is_output_func = matches!(
+                    &field.value,
+                    Expr::FuncCall {
+                        qualifier: None,
+                        name,
+                        ..
+                    } if wf_lang::columnar::columnar_output_func(name).is_some()
+                );
+                if is_output_func {
+                    view.as_ref().and_then(|v| compile_guard(&field.value, v))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let general_cvecs: Vec<Option<CVec>> = match &view {
+            Some(v) => {
+                let n = v.num_rows();
+                general_plans
+                    .iter()
+                    .map(|p| p.as_ref().map(|plan| plan.eval_vec(v, n)))
+                    .collect()
+            }
+            None => (0..general_plans.len()).map(|_| None).collect(),
+        };
 
         // Batch-constant wfx_id FNV prefix: `rule_name \x00` hashed once per
         // batch (rule names run tens of bytes and were previously re-hashed
@@ -1012,8 +1055,20 @@ impl RuleExecutor {
             if let Some(t) = t_wfx {
                 prof.add(e1_bucket_wfx(), t);
             }
-            // (yield_meta is only consumed by General yield exprs — excluded
-            // by the columnar gate, so it is not built here.)
+            // Columnar-output General yields (fmt/strftime/count_char) and the
+            // interpreted fallback (compile failure) both need the same meta
+            // the Event-based path builds per row.
+            let yield_meta = self.each_yield_meta(
+                &wfx_id,
+                &fired_at,
+                &emit_time,
+                &summary,
+                score,
+                &entity_id,
+                &origin,
+                *event_time_nanos,
+                emit_time_nanos,
+            );
 
             // -- Yield staging (fallible work before any column push) ------
             // Literal fields were registered batch-level above and are filled
@@ -1029,7 +1084,8 @@ impl RuleExecutor {
             // pure overhead on this path.
             builder.begin_row();
             let staged: CoreResult<()> = (|| {
-                for ((((_field, (name, field_type)), kind), _field_ref), field_idx_opt) in self
+                let mut general_cursor = 0usize;
+                for ((((field, (name, field_type)), kind), _field_ref), field_idx_opt) in self
                     .plan
                     .yield_plan
                     .fields
@@ -1080,7 +1136,27 @@ impl RuleExecutor {
                             }
                         }
                         YieldKind::General => {
-                            unreachable!("columnar gate excludes general yield exprs")
+                            // 列式输出函数批量 cell：从预计算列取 cell；None
+                            // （缺字段/null）→ 空串，与 eval_yield_expr_with_meta
+                            // 的 None→空串一致。编译失败（结构化列参数等）→
+                            // 行式回退（构造 Event ctx）。
+                            let v = match general_cvecs
+                                .get(general_cursor)
+                                .and_then(|oc| oc.as_ref())
+                            {
+                                Some(cvec) => match cvec.scalar_at(event.row()) {
+                                    Some(s) => cscalar_to_value(&s),
+                                    None => Value::Str(SmolStr::default()),
+                                },
+                                None => eval_yield_expr_with_meta(
+                                    &field.value,
+                                    &event.to_event(),
+                                    yield_meta,
+                                )
+                                .expect("eval_yield_expr_with_meta never returns None"),
+                            };
+                            general_cursor += 1;
+                            v
                         }
                     };
                     let Some(value) = RuleExecutor::coerce_yield_field_value_with(

@@ -2397,6 +2397,73 @@ fn each_plan_columnar_safe_gate_branches() {
     }];
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
 
+    // 列式输出函数 yield（fmt/strftime/count_char）→ safe（批量 cell 求值）。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "y".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "fmt".into(),
+            args: vec![
+                Expr::StringLit("ip={}".into()),
+                Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+            ],
+        },
+    }];
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "y".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "strftime".into(),
+            args: vec![Expr::Field(FieldRef::Qualified("e".into(), "sip".into()))],
+        },
+    }];
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "y".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "count_char".into(),
+            args: vec![
+                Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+                Expr::StringLit("1".into()),
+            ],
+        },
+    }];
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
+
+    // fmt 模板非字面量 / 参数含函数调用 → false（columnar_output_expr 拒绝）。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "y".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "fmt".into(),
+            args: vec![Expr::Field(FieldRef::Simple("sip".into()))],
+        },
+    }];
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "y".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "fmt".into(),
+            args: vec![
+                Expr::StringLit("x={}".into()),
+                Expr::FuncCall {
+                    qualifier: None,
+                    name: "lower".into(),
+                    args: vec![Expr::Field(FieldRef::Simple("sip".into()))],
+                },
+            ],
+        },
+    }];
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+
     // Path yield field → false.
     let mut plan = base();
     plan.yield_plan.fields = vec![YieldField {
@@ -2971,6 +3038,138 @@ fn columnar_each_binop_score_null_field_fails_row() {
     assert_eq!(stats.appended, 2);
     assert_eq!(stats.failed, 1);
     assert_eq!(appended, vec![0, 2]);
+}
+
+/// 列式输出函数（fmt/strftime/count_char）yield：行式 vs 列式 each 输出逐字段
+/// 对拍（含 null 参数 → 空串的 yield 包装语义）。
+#[test]
+fn each_columnar_output_funcs_match_row_path() {
+    use wp_model_core::model::Value as ModelValue;
+
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("sip", DataType::Utf8, true),
+        ArrowField::new("count", DataType::Int64, true),
+        ArrowField::new("ts", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("10.1.1.1"),
+                None,
+                Some("192.168.0.2"),
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(3), Some(7), None])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(1_700_000_000_000_000_000),
+                Some(1_700_000_000_000_000_000),
+                None,
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let mut plan = simple_rule_plan(
+        "out_funcs",
+        simple_plan(vec![], vec![]),
+        Expr::Number(50.0),
+        "ip",
+        Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "label".into(),
+            value: Expr::FuncCall {
+                qualifier: None,
+                name: "fmt".into(),
+                args: vec![
+                    Expr::StringLit("ip={}|n={}".into()),
+                    Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+                    Expr::Field(FieldRef::Qualified("e".into(), "count".into())),
+                ],
+            },
+        },
+        YieldField {
+            name: "day".into(),
+            value: Expr::FuncCall {
+                qualifier: None,
+                name: "strftime".into(),
+                args: vec![
+                    Expr::Field(FieldRef::Qualified("e".into(), "ts".into())),
+                    Expr::StringLit("%Y-%m-%d".into()),
+                ],
+            },
+        },
+        YieldField {
+            name: "dots".into(),
+            value: Expr::FuncCall {
+                qualifier: None,
+                name: "count_char".into(),
+                args: vec![
+                    Expr::Field(FieldRef::Qualified("e".into(), "sip".into())),
+                    Expr::StringLit(".".into()),
+                ],
+            },
+        },
+    ];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("label".into(), FieldType::Base(BaseType::Chars)),
+            ("day".into(), FieldType::Base(BaseType::Chars)),
+            ("dots".into(), FieldType::Base(BaseType::Digit)),
+        ]),
+    );
+    assert!(exec.each_plan_columnar_safe(), "fmt/strftime/count_char yield 应列式");
+
+    let t = 1_700_000_000_000_000_000i64;
+    let events = crate::match_engine::event_bridge::batch_to_events(&batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    assert_eq!(sr.appended, 3);
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let col_events: Vec<ColumnarEvent> = (0..3).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+    assert_eq!(sc.appended, 3);
+    assert_eq!(sc.failed, 0);
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(out_row, out_col);
+    // 关键语义抽查：null sip（row 1）→ fmt 空串；null count（row 2）→ fmt
+    // 空串；count_char 正常行返回数字。
+    // 关键语义抽查：null sip（row 1）→ fmt 空串；null count（row 2）→ fmt
+    // 空串；count_char 正常行返回数字。
+    let label = |r: &wp_model_core::model::DataRecord| {
+        r.fields()
+            .find(|f| f.get_name() == "label")
+            .and_then(|f| match f.get_value() {
+                ModelValue::Chars(v) => Some(v.to_string()),
+                _ => None,
+            })
+            .expect("label field")
+    };
+    assert_eq!(label(&out_col[0]), "ip=10.1.1.1|n=3", "row 0 fmt");
+    assert_eq!(label(&out_col[1]), "", "row 1 fmt null sip → 空串");
+    assert_eq!(label(&out_col[2]), "", "row 2 fmt null count → 空串");
 }
 
 // ---------------------------------------------------------------------------

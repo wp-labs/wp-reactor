@@ -47,11 +47,15 @@ pub fn columnar_func(name: &str) -> Option<ColumnarFunc> {
     }
 }
 
-fn is_flat_field(expr: &Expr) -> bool {
+fn is_flat_field_ref(field: &FieldRef) -> bool {
     matches!(
-        expr,
-        Expr::Field(FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _))
+        field,
+        FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
     )
+}
+
+fn is_flat_field(expr: &Expr) -> bool {
+    matches!(expr, Expr::Field(field) if is_flat_field_ref(field))
 }
 
 /// 某个列式函数的参数形态是否可列式：第一操作数必须是 flat 字段；第二操作数
@@ -68,6 +72,76 @@ pub fn columnar_func_args_ok(func: ColumnarFunc, args: &[Expr]) -> bool {
         ColumnarFunc::StrSearch => {
             matches!(&args[1], Expr::StringLit(_)) || is_flat_field(&args[1])
         }
+    }
+}
+
+/// 列式**输出**（yield cell）原生支持的内置函数分类 —— 与 [`ColumnarFunc`]
+/// （守卫）并列的单一权威清单。这些函数产生字符串/数值 cell（而非布尔守卫），
+/// 供列式输出路径（on-each / match / close 的 yield 批量 cell 求值）编译。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnarOutputFunc {
+    /// `fmt(template, v1, ...)` — 字面量模板 + 列式标量参数，批量渲染 `{}`。
+    Fmt,
+    /// `strftime(ts, [fmt])` — 数值时间列 → 格式化字符串（fmt 字面量或默认）。
+    Strftime,
+    /// `count_char(text, ch)` — 数字符出现次数 → 数值。
+    CountChar,
+}
+
+/// 返回 `name` 对应的列式输出函数分类（`None` = 非原生列式输出函数）。
+pub fn columnar_output_func(name: &str) -> Option<ColumnarOutputFunc> {
+    match name {
+        "fmt" => Some(ColumnarOutputFunc::Fmt),
+        "strftime" => Some(ColumnarOutputFunc::Strftime),
+        "count_char" => Some(ColumnarOutputFunc::CountChar),
+        _ => None,
+    }
+}
+
+/// 输出函数参数的可列式形状：flat 字段或字面量（不嵌套函数调用）。
+fn output_arg_ok(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Number(_)
+            | Expr::StringLit(_)
+            | Expr::Bool(_)
+            | Expr::Field(
+                FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
+            )
+    )
+}
+
+/// yield 输出表达式是否可列式批量求值：字面量 / flat 字段 / 原生列式输出函数
+/// （`fmt`/`strftime`/`count_char`，参数为字面量或 flat 字段）。`false` 只表示
+/// 该输出 cell 走行式解释，不等于错误。
+pub fn columnar_output_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => true,
+        Expr::Field(field) => is_flat_field_ref(field),
+        Expr::FuncCall {
+            qualifier: None,
+            name,
+            args,
+        } => match columnar_output_func(name) {
+            Some(ColumnarOutputFunc::Fmt) => {
+                !args.is_empty()
+                    && matches!(&args[0], Expr::StringLit(_))
+                    && args[1..].iter().all(output_arg_ok)
+            }
+            Some(ColumnarOutputFunc::Strftime) => {
+                !args.is_empty()
+                    && args.len() <= 2
+                    && output_arg_ok(&args[0])
+                    && args
+                        .get(1)
+                        .is_none_or(|a| matches!(a, Expr::StringLit(_)))
+            }
+            Some(ColumnarOutputFunc::CountChar) => {
+                args.len() == 2 && output_arg_ok(&args[0]) && output_arg_ok(&args[1])
+            }
+            None => false,
+        },
+        _ => false,
     }
 }
 
@@ -552,15 +626,75 @@ mod tests {
             // 字面量 + 字段：首参非字段 → 都不接受。
             assert!(!columnar_func_args_ok(func, &[lit.clone(), flat.clone()]));
             // 字段 + 函数：次参非字面量/字段 → 都不接受。
-            assert!(!columnar_func_args_ok(
-                func,
-                &[flat.clone(), func_call.clone()]
-            ));
+            assert!(!columnar_func_args_ok(func, &[flat.clone(), func_call.clone()]));
             // 字段 + 嵌套路径：次参非 flat → 都不接受。
             assert!(!columnar_func_args_ok(func, &[flat.clone(), nested_path()]));
             // 参数个数：1 个 → 不接受。
             assert!(!columnar_func_args_ok(func, std::slice::from_ref(&flat)));
         }
+    }
+
+    #[test]
+    fn columnar_output_func_is_single_authoritative_list() {
+        for name in ["fmt", "strftime", "count_char"] {
+            assert!(columnar_output_func(name).is_some(), "{name} 应在输出清单");
+        }
+        for name in ["lower", "concat", "contains", "cidr_match", "bogus"] {
+            assert_eq!(columnar_output_func(name), None, "{name} 不应在输出清单");
+        }
+    }
+
+    #[test]
+    fn columnar_output_expr_shape_matrix() {
+        let call = |name: &str, args: Vec<Expr>| Expr::FuncCall {
+            qualifier: None,
+            name: name.to_string(),
+            args,
+        };
+        let lit_s = Expr::StringLit("x".into());
+        let lit_n = num(1.0);
+        let fld = field("action");
+        let fld2 = field("count");
+        let fcall = func("lower");
+
+        // fmt(字面量模板, 字面量/字段参数...) → 可列式。
+        assert!(columnar_output_expr(&call("fmt", vec![lit_s.clone(), fld.clone()])));
+        assert!(columnar_output_expr(&call(
+            "fmt",
+            vec![lit_s.clone(), fld.clone(), lit_n.clone()]
+        )));
+        // fmt 模板非字面量 → 否。
+        assert!(!columnar_output_expr(&call("fmt", vec![fld.clone()])));
+        // fmt 参数含函数调用 → 否。
+        assert!(!columnar_output_expr(&call("fmt", vec![lit_s.clone(), fcall.clone()])));
+        // fmt 空参数 → 否。
+        assert!(!columnar_output_expr(&call("fmt", vec![])));
+
+        // strftime(字段, [字面量]) → 可列式；fmt 非字面量 → 否；参数超 2 → 否。
+        assert!(columnar_output_expr(&call("strftime", vec![fld.clone()])));
+        assert!(columnar_output_expr(&call(
+            "strftime",
+            vec![fld.clone(), lit_s.clone()]
+        )));
+        assert!(!columnar_output_expr(&call("strftime", vec![fld.clone(), fld2.clone()])));
+        assert!(!columnar_output_expr(&call("strftime", vec![fld.clone(), lit_s.clone(), lit_n])));
+        assert!(!columnar_output_expr(&call("strftime", vec![])));
+
+        // count_char(字段, 字段/字面量) → 可列式；个数/形状不符 → 否。
+        assert!(columnar_output_expr(&call("count_char", vec![fld.clone(), lit_s.clone()])));
+        assert!(columnar_output_expr(&call("count_char", vec![fld.clone(), fld2.clone()])));
+        assert!(!columnar_output_expr(&call("count_char", vec![fld.clone()])));
+        assert!(!columnar_output_expr(&call("count_char", vec![fcall.clone(), fld.clone()])));
+
+        // 字面量 / flat 字段本身可列式输出；嵌套路径否。
+        assert!(columnar_output_expr(&lit_s));
+        assert!(columnar_output_expr(&fld));
+        assert!(!columnar_output_expr(&nested_path()));
+        assert!(!columnar_output_expr(&Expr::IfThenElse {
+            cond: Box::new(Expr::Bool(true)),
+            then_expr: Box::new(num(1.0)),
+            else_expr: Box::new(num(2.0)),
+        }));
     }
 
     #[test]

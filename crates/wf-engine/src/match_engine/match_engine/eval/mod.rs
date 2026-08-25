@@ -5,8 +5,8 @@ use wf_lang::ast::{BinOp, Expr};
 use super::key::{eval_field_value_src, field_ref_leaf_name, value_to_string};
 use super::types::{EngineHashMap, FieldSource, RollingStats, Value, WindowLookup};
 
-mod cmp;
 mod funcs;
+pub(crate) mod cmp;
 
 use cmp::{coerce_to_f64, compare_values};
 use funcs::eval_func_call;

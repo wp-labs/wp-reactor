@@ -1141,3 +1141,84 @@ fn compiled_guard_cache_beats_per_batch_compile() {
         row_el
     );
 }
+
+/// 输出链 cell 求值向量化（perf-diag 墙①）：fmt 类输出函数的批量 cell 求值
+/// （编译一次 + 整批 eval_vec）应快于逐行解释（每行 eval 分发 + 字段查找 +
+/// Value 构造）。
+#[test]
+fn columnar_output_func_cell_beats_per_row() {
+    use crate::match_engine::columnar::{ColumnarBatch, compile_guard, cscalar_to_value};
+    use crate::match_engine::match_engine::eval_expr;
+
+    let n = 1_000usize;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("action", DataType::Utf8, true),
+        Field::new("count", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from((0..n).map(|i| Some(format!("evt_{i}"))).collect::<Vec<_>>()))
+                as ArrayRef,
+            Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let field = |name: &str| Expr::Field(FieldRef::Simple(name.to_string()));
+    let expr = Expr::FuncCall {
+        qualifier: None,
+        name: "fmt".into(),
+        args: vec![
+            Expr::StringLit("evt={}|n={}".into()),
+            field("action"),
+            field("count"),
+        ],
+    };
+    assert!(wf_lang::columnar::columnar_output_expr(&expr));
+
+    // 方案 A：批量 cell 求值（编译一次 + 整批 eval_vec）。
+    let view = ColumnarBatch::from_all_fields(&batch);
+    let plan = compile_guard(&expr, &view).expect("fmt 应可编译");
+    let mut col_el = Duration::MAX;
+    for _ in 0..5 {
+        let start = Instant::now();
+        let cvec = plan.eval_vec(&view, n);
+        for row in 0..n {
+            std::hint::black_box(match cvec.scalar_at(row) {
+                Some(s) => cscalar_to_value(&s),
+                None => Value::Str(smol_str::SmolStr::default()),
+            });
+        }
+        col_el = col_el.min(start.elapsed());
+    }
+
+    // 方案 B：逐行解释。
+    let events = batch_to_events(&batch);
+    let mut row_el = Duration::MAX;
+    for _ in 0..5 {
+        let start = Instant::now();
+        for ev in &events {
+            std::hint::black_box(
+                eval_expr(&expr, ev).unwrap_or_else(|| Value::Str(smol_str::SmolStr::default())),
+            );
+        }
+        row_el = row_el.min(start.elapsed());
+    }
+
+    let per = |d: Duration| d.as_secs_f64() / n as f64 * 1e9;
+    let ratio = col_el.as_secs_f64() / row_el.as_secs_f64();
+    eprintln!(
+        "[columnar-cell-bench] batch={:.1} ns/ev  per-row={:.1} ns/ev  batch/per-row={:.2}x",
+        per(col_el),
+        per(row_el),
+        ratio
+    );
+    assert!(
+        ratio < 1.0,
+        "批量 cell 求值应快于逐行解释：{:.2}x (batch {:?} vs per-row {:?})",
+        ratio,
+        col_el,
+        row_el
+    );
+}

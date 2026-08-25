@@ -180,7 +180,7 @@ pub(super) fn round_with_precision(value: f64, precision: i64) -> Option<f64> {
     }
 }
 
-pub(super) fn timestamp_nanos_to_utc(timestamp_nanos: i64) -> Option<DateTime<Utc>> {
+pub(crate) fn timestamp_nanos_to_utc(timestamp_nanos: i64) -> Option<DateTime<Utc>> {
     let secs = timestamp_nanos.div_euclid(1_000_000_000);
     let nanos = timestamp_nanos.rem_euclid(1_000_000_000) as u32;
     DateTime::<Utc>::from_timestamp(secs, nanos)
@@ -249,7 +249,7 @@ pub(super) fn update_stable_id_hash(hasher: &mut Sha256, value: &Value) -> Optio
     Some(())
 }
 
-pub(super) fn apply_fmt_template(template: &str, values: &[Value]) -> Option<String> {
+pub(crate) fn apply_fmt_template(template: &str, values: &[Value]) -> Option<String> {
     let placeholders = template.matches("{}").count();
     if placeholders != values.len() {
         return None;
