@@ -47,7 +47,7 @@ use smol_str::SmolStr;
 use wf_lang::ast::{BinOp, Expr, FieldRef, PathSegment};
 
 use super::match_engine::eval::cmp::{apply_fmt_template, timestamp_nanos_to_utc};
-use super::match_engine::{EngineHashMap, Value, field_ref_name};
+use super::match_engine::{EngineHashMap, Value, field_ref_name, values_equal};
 use crate::match_engine::{WFL_FIELD_TYPE_ARRAY, wfl_structured_field_kind};
 use crate::time::normalize_epoch_timestamp_float_nanos;
 
@@ -396,6 +396,22 @@ pub(crate) enum ColumnExpr {
         text: Box<ColumnExpr>,
         needle: Box<ColumnExpr>,
     },
+    /// `expr in (lit, ...)` — per-row value membership over the compile-time
+    /// literal list (`values_equal` semantics, `negated` flips). Target null /
+    /// non-literal list items read null / false, matching the interpreted path.
+    InList {
+        expr: Box<ColumnExpr>,
+        list: Vec<Value>,
+        negated: bool,
+    },
+    /// `if cond then a else b` — per-row three-valued pick over the Bool
+    /// condition column; a non-Bool / null cond reads null, matching the
+    /// interpreted path.
+    IfThenElse {
+        cond: Box<ColumnExpr>,
+        then_expr: Box<ColumnExpr>,
+        else_expr: Box<ColumnExpr>,
+    },
 }
 
 /// Evaluate a columnar guard expression over every row of `view`, producing one
@@ -503,6 +519,9 @@ fn compile_expr(expr: &Expr, view: &ColumnarBatch<'_>) -> Option<ColumnExpr> {
         // 原生列式函数：守卫（cidr/regex/strsearch）与输出（fmt/strftime/
         // count_char）两套清单，单一权威来源（`columnar_func` /
         // `columnar_output_func`）。常量在编译期解析一次，字段解析为其列。
+        // 列式输出函数（fmt/strftime/count_char）——用于 yield cell 批量求值。
+        // 参数形状由 `columnar_output_expr` 保证（flat 字段/字面量）；编译失败的
+        // 输出表达式（如结构化列参数）由调用方回落行式解释。
         Expr::FuncCall {
             qualifier: None,
             name,
@@ -516,6 +535,39 @@ fn compile_expr(expr: &Expr, view: &ColumnarBatch<'_>) -> Option<ColumnExpr> {
                 None
             }
         }
+        // `expr in (lit, ...)` — 值 ∈ 编译期字面量列表（Q14 fmt 参数的
+        // strftime(...) in (...)：`if x in ("00","01","02") then ...`）。
+        // 列表项限定字面量（gate 保证）；其他形状回落解释器。
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let list_values: Option<Vec<Value>> = list
+                .iter()
+                .map(|item| match item {
+                    Expr::Number(n) => Some(Value::Number(*n)),
+                    Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
+                    Expr::Bool(b) => Some(Value::Bool(*b)),
+                    _ => None,
+                })
+                .collect();
+            Some(ColumnExpr::InList {
+                expr: Box::new(compile_expr(expr, view)?),
+                list: list_values?,
+                negated: *negated,
+            })
+        }
+        // `if c then a else b` — 三值条件选值（Q14 fmt 参数的 dayTime/nightTime）。
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => Some(ColumnExpr::IfThenElse {
+            cond: Box::new(compile_expr(cond, view)?),
+            then_expr: Box::new(compile_expr(then_expr, view)?),
+            else_expr: Box::new(compile_expr(else_expr, view)?),
+        }),
         _ => None,
     }
 }
@@ -692,7 +744,7 @@ impl CVec {
     /// The SQL three-valued boolean view of a cell: `Bool(b)` → `b`, any
     /// non-boolean scalar (and null) → `None`. Mirrors what
     /// `eval_cx` + the `&&` / `||` match arms saw for a non-`Bool` scalar.
-    fn bool_at(&self, row: usize) -> Option<bool> {
+    pub(crate) fn bool_at(&self, row: usize) -> Option<bool> {
         match self {
             CVec::Bool(v) => v[row],
             CVec::Scalar(v) => match v[row].as_ref() {
@@ -750,6 +802,21 @@ impl ColumnExpr {
             ColumnExpr::CountChar { text, needle } => {
                 count_char_vec(text.eval_vec(view, n), needle.eval_vec(view, n), n)
             }
+            ColumnExpr::InList {
+                expr,
+                list,
+                negated,
+            } => inlist_vec(expr.eval_vec(view, n), list, *negated, n),
+            ColumnExpr::IfThenElse {
+                cond,
+                then_expr,
+                else_expr,
+            } => ifthenelse_vec(
+                cond.eval_vec(view, n),
+                then_expr.eval_vec(view, n),
+                else_expr.eval_vec(view, n),
+                n,
+            ),
         }
     }
 }
@@ -1046,6 +1113,41 @@ fn count_char_vec(text: CVec, needle: CVec, n: usize) -> CVec {
             None => 0,
         };
         out.push(Some(CScalar::Int(count)));
+    }
+    CVec::Scalar(out)
+}
+
+/// Vectorized `expr in (lit, ...)`: per row, membership over the compile-time
+/// literal list via `values_equal` (byte-identical to the interpreted `InList`
+/// — number epsilon equality, Str/Bool equality). A null target cell reads
+/// null (the interpreted `eval_expr_ext(target)?` propagates `None`).
+fn inlist_vec(expr: CVec, list: &[Value], negated: bool, n: usize) -> CVec {
+    let mut out = Vec::with_capacity(n);
+    for row in 0..n {
+        match expr.scalar_at(row) {
+            Some(s) => {
+                let v = cscalar_to_value(&s);
+                let found = list.iter().any(|item| values_equal(&v, item));
+                out.push(Some(if negated { !found } else { found }));
+            }
+            None => out.push(None),
+        }
+    }
+    CVec::Bool(out)
+}
+
+/// Vectorized `if c then a else b`: per row, pick the then/else cell by the
+/// Bool condition; a non-Bool / null cond reads null, matching the interpreted
+/// three-valued path. Output is a heterogeneous scalar column (then/else may
+/// differ in type).
+fn ifthenelse_vec(cond: CVec, then_c: CVec, else_c: CVec, n: usize) -> CVec {
+    let mut out = Vec::with_capacity(n);
+    for row in 0..n {
+        match cond.scalar_at(row) {
+            Some(CScalar::Bool(true)) => out.push(then_c.scalar_at(row)),
+            Some(CScalar::Bool(false)) => out.push(else_c.scalar_at(row)),
+            _ => out.push(None),
+        }
     }
     CVec::Scalar(out)
 }
@@ -2607,6 +2709,211 @@ mod tests {
             &call("count_char", vec![f("action"), Expr::StringLit(String::new())]),
             &batch,
         );
+    }
+
+    /// Exact per-cell parity (incl. null-ness and value type): columnar
+    /// `eval_vec` vs interpreted `eval_expr` — the strictest lock for the
+    /// InList / IfThenElse output nodes.
+    fn assert_value_equiv(expr: &Expr, batch: &RecordBatch) {
+        let events = batch_to_events(batch);
+        let view = ColumnarBatch::from_all_fields(batch);
+        let plan = compile_guard(expr, &view).expect("应可编译");
+        let cvec = plan.eval_vec(&view, view.num_rows());
+        for (row, event) in events.iter().enumerate() {
+            let columnar = cvec.scalar_at(row).map(|s| cscalar_to_value(&s));
+            let interpreted = eval_expr(expr, event);
+            assert_eq!(columnar, interpreted, "row {row}: expr={expr:?}");
+        }
+    }
+
+    /// InList：`values_equal` 成员语义（数字 epsilon 等值 / Str / Bool）、negated
+    /// 翻转、null 目标传播 None——与解释器逐行一致。
+    #[test]
+    fn inlist_matches_interpreted_cells() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("count", DataType::Int64, true),
+            Field::new("ts", DataType::Int64, true),
+            Field::new("flag", DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(3),
+                    Some(7),
+                    Some(8),
+                    None,
+                    Some(3),
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![
+                    // 01:00 / 02:30 / 00:15 / null / 13:00 UTC（%H 小时）。
+                    Some(1_700_000_000_000_000_000),
+                    Some(1_700_000_000_000_000_000 + 90 * 3_600_000_000_000),
+                    Some(1_700_000_000_000_000_000 - 45 * 3_600_000_000_000),
+                    None,
+                    Some(1_700_000_000_000_000_000 + 13 * 3_600_000_000_000),
+                ])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    None,
+                    Some(true),
+                    Some(false),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let f = |n: &str| Expr::Field(FieldRef::Simple(n.into()));
+        let in_list = |expr: Expr, list: Vec<Expr>, negated: bool| Expr::InList {
+            expr: Box::new(expr),
+            list,
+            negated,
+        };
+
+        // 数字成员（Int64 列 vs 数字字面量列表）。
+        let nums = in_list(f("count"), vec![num(3.0), num(7.0)], false);
+        assert_value_equiv(&nums, &batch);
+        // negated 翻转（None 目标行仍然 None，不因否定变 true——解释器同）。
+        assert_value_equiv(&in_list(f("count"), vec![num(3.0)], true), &batch);
+        // Bool 成员。
+        assert_value_equiv(
+            &in_list(f("flag"), vec![Expr::Bool(true)], false),
+            &batch,
+        );
+        // Q14 形态：strftime(ts, "%H") in ("00","01","02")。
+        let hour = Expr::FuncCall {
+            qualifier: None,
+            name: "strftime".into(),
+            args: vec![f("ts"), Expr::StringLit("%H".into())],
+        };
+        assert!(wf_lang::columnar::columnar_output_expr(&hour));
+        assert_value_equiv(
+            &in_list(
+                hour,
+                vec![
+                    Expr::StringLit("00".into()),
+                    Expr::StringLit("01".into()),
+                    Expr::StringLit("02".into()),
+                ],
+                false,
+            ),
+            &batch,
+        );
+    }
+
+    /// IfThenElse：Bool cond 三值选值；非 Bool / null cond → None（解释器同）。
+    #[test]
+    fn ifthenelse_matches_interpreted_cells() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("count", DataType::Int64, true),
+            Field::new("flag", DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(3),
+                    Some(7),
+                    Some(8),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    None,
+                    Some(true),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let f = |n: &str| Expr::Field(FieldRef::Simple(n.into()));
+        let ite = |cond: Expr, then_e: Expr, else_e: Expr| Expr::IfThenElse {
+            cond: Box::new(cond),
+            then_expr: Box::new(then_e),
+            else_expr: Box::new(else_e),
+        };
+
+        // 比较条件（列式 Bool）→ 三值选值；分支类型切换（字符串 vs 数字）。
+        let by_flag = ite(
+            f("flag"),
+            Expr::StringLit("yes".into()),
+            Expr::StringLit("no".into()),
+        );
+        assert_value_equiv(&by_flag, &batch);
+        // 分支类型不同：数字 vs 字符串（列式异构 Scalar 列）。
+        let mixed = ite(f("flag"), num(1.0), Expr::StringLit("no".into()));
+        assert_value_equiv(&mixed, &batch);
+        // 非 Bool cond（数字列）→ 全 None。
+        let non_bool = ite(f("count"), num(1.0), num(2.0));
+        assert_value_equiv(&non_bool, &batch);
+        // InList cond 组合（`count in (3,7)` 做条件）。
+        let in_cond = Expr::InList {
+            expr: Box::new(f("count")),
+            list: vec![num(3.0), num(7.0)],
+            negated: false,
+        };
+        assert_value_equiv(
+            &ite(in_cond, Expr::StringLit("hit".into()), Expr::StringLit("miss".into())),
+            &batch,
+        );
+    }
+
+    /// Q14 全形态 value 对拍：`fmt("{} c={}", if strftime(ts,"%H") in (...)
+    /// then "nightTime" else "dayTime", count_char(extra,"c"))`。
+    #[test]
+    fn q14_fmt_shape_matches_interpreted_cells() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(1_700_000_000_000_000_000),
+                    Some(1_700_000_000_000_000_000 + 90 * 3_600_000_000_000),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("abc c cc"),
+                    Some("no-c"),
+                    None,
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let f = |n: &str| Expr::Field(FieldRef::Simple(n.into()));
+        let call = |name: &str, args: Vec<Expr>| Expr::FuncCall {
+            qualifier: None,
+            name: name.into(),
+            args,
+        };
+        let is_night = Expr::InList {
+            expr: Box::new(call(
+                "strftime",
+                vec![f("ts"), Expr::StringLit("%H".into())],
+            )),
+            list: vec![
+                Expr::StringLit("00".into()),
+                Expr::StringLit("01".into()),
+                Expr::StringLit("02".into()),
+            ],
+            negated: false,
+        };
+        let detail = call(
+            "fmt",
+            vec![
+                Expr::StringLit("{} c={}".into()),
+                Expr::IfThenElse {
+                    cond: Box::new(is_night),
+                    then_expr: Box::new(Expr::StringLit("nightTime".into())),
+                    else_expr: Box::new(Expr::StringLit("dayTime".into())),
+                },
+                call("count_char", vec![f("extra"), Expr::StringLit("c".into())]),
+            ],
+        );
+        assert!(wf_lang::columnar::columnar_output_expr(&detail));
+        assert_value_equiv(&detail, &batch);
     }
 
     #[test]

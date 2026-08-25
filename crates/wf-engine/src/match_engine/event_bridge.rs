@@ -448,7 +448,9 @@ impl<'a> ColumnarEvent<'a> {
         }
     }
 
-    pub(crate) fn batch(&self) -> &'a RecordBatch {
+    /// The shared Arrow batch this view reads from (all events of one batch
+    /// share it — batch-level indices resolve once per batch).
+    pub fn batch(&self) -> &'a RecordBatch {
         self.batch
     }
 

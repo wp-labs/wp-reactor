@@ -98,22 +98,25 @@ pub fn columnar_output_func(name: &str) -> Option<ColumnarOutputFunc> {
     }
 }
 
-/// 输出函数参数的可列式形状：flat 字段或字面量（不嵌套函数调用）。
-fn output_arg_ok(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Number(_)
-            | Expr::StringLit(_)
-            | Expr::Bool(_)
-            | Expr::Field(
-                FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
-            )
-    )
+/// InList 列表项：字面量（编译期折叠成 Value）。
+fn is_output_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_))
 }
 
-/// yield 输出表达式是否可列式批量求值：字面量 / flat 字段 / 原生列式输出函数
-/// （`fmt`/`strftime`/`count_char`，参数为字面量或 flat 字段）。`false` 只表示
-/// 该输出 cell 走行式解释，不等于错误。
+/// IfThenElse 条件：可列式 Bool 表达式——守卫门控（比较/逻辑/守卫函数）或
+/// 值可列式的 InList（产生 Bool）。
+fn columnar_output_cond(expr: &Expr) -> bool {
+    match expr {
+        Expr::InList { .. } => columnar_output_expr(expr),
+        other => expr_is_columnar(other),
+    }
+}
+
+/// yield 输出表达式是否可列式批量求值——**递归**的值表达式分类：字面量 /
+/// flat 字段 / 原生列式输出函数（`fmt`/`strftime`/`count_char`，参数递归）/ /
+/// `IfThenElse`（条件列式 Bool + 分支递归）/ `InList`（expr 递归 + 列表字面量）。
+/// 覆盖 Q14 形态：`fmt("{} c={}", if strftime(ts,"%H") in (...), count_char(...))`。
+/// `false` 只表示该输出 cell 走行式解释，不等于错误。
 pub fn columnar_output_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => true,
@@ -126,21 +129,35 @@ pub fn columnar_output_expr(expr: &Expr) -> bool {
             Some(ColumnarOutputFunc::Fmt) => {
                 !args.is_empty()
                     && matches!(&args[0], Expr::StringLit(_))
-                    && args[1..].iter().all(output_arg_ok)
+                    && args[1..].iter().all(columnar_output_expr)
             }
             Some(ColumnarOutputFunc::Strftime) => {
                 !args.is_empty()
                     && args.len() <= 2
-                    && output_arg_ok(&args[0])
+                    && columnar_output_expr(&args[0])
                     && args
                         .get(1)
                         .is_none_or(|a| matches!(a, Expr::StringLit(_)))
             }
             Some(ColumnarOutputFunc::CountChar) => {
-                args.len() == 2 && output_arg_ok(&args[0]) && output_arg_ok(&args[1])
+                args.len() == 2
+                    && columnar_output_expr(&args[0])
+                    && columnar_output_expr(&args[1])
             }
             None => false,
         },
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            columnar_output_cond(cond)
+                && columnar_output_expr(then_expr)
+                && columnar_output_expr(else_expr)
+        }
+        Expr::InList {
+            expr, list, ..
+        } => columnar_output_expr(expr) && list.iter().all(is_output_literal),
         _ => false,
     }
 }
@@ -690,11 +707,88 @@ mod tests {
         assert!(columnar_output_expr(&lit_s));
         assert!(columnar_output_expr(&fld));
         assert!(!columnar_output_expr(&nested_path()));
-        assert!(!columnar_output_expr(&Expr::IfThenElse {
+
+        // IfThenElse：条件列式 Bool + 分支递归 → 可列式（Q14 形态）。
+        assert!(columnar_output_expr(&Expr::IfThenElse {
             cond: Box::new(Expr::Bool(true)),
             then_expr: Box::new(num(1.0)),
             else_expr: Box::new(num(2.0)),
         }));
+        // 条件非列式（系统变量）→ 否。
+        use crate::ast::SystemVar;
+        assert!(!columnar_output_expr(&Expr::IfThenElse {
+            cond: Box::new(Expr::SystemVar(SystemVar::Score)),
+            then_expr: Box::new(num(1.0)),
+            else_expr: Box::new(num(2.0)),
+        }));
+        // InList：expr 递归 + 列表项字面量 → 可列式；非字面量项 → 否。
+        assert!(columnar_output_expr(&Expr::InList {
+            expr: Box::new(fld.clone()),
+            list: vec![lit_s.clone()],
+            negated: false,
+        }));
+        assert!(!columnar_output_expr(&Expr::InList {
+            expr: Box::new(fld.clone()),
+            list: vec![fld2.clone()],
+            negated: false,
+        }));
+    }
+
+    /// Q14 全形态：`fmt("{} c={}", if strftime(ts,"%H") in ("00","01","02")
+    /// then "nightTime" else "dayTime", count_char(extra,"c"))` → 递归可列式。
+    #[test]
+    fn q14_fmt_ifthenelse_inlist_shape_is_columnar() {
+        let call = |name: &str, args: Vec<Expr>| Expr::FuncCall {
+            qualifier: None,
+            name: name.to_string(),
+            args,
+        };
+        let f = |n: &str| Expr::Field(FieldRef::Simple(n.into()));
+        let hour = call("strftime", vec![f("dateTime"), Expr::StringLit("%H".into())]);
+        let is_night = Expr::InList {
+            expr: Box::new(hour),
+            list: vec![
+                Expr::StringLit("00".into()),
+                Expr::StringLit("01".into()),
+                Expr::StringLit("02".into()),
+            ],
+            negated: false,
+        };
+        let label = Expr::IfThenElse {
+            cond: Box::new(is_night),
+            then_expr: Box::new(Expr::StringLit("nightTime".into())),
+            else_expr: Box::new(Expr::StringLit("dayTime".into())),
+        };
+        let detail = call(
+            "fmt",
+            vec![
+                Expr::StringLit("{} c={}".into()),
+                label,
+                call("count_char", vec![f("extra"), Expr::StringLit("c".into())]),
+            ],
+        );
+        assert!(columnar_output_expr(&detail), "Q14 detail 应可列式：{detail:?}");
+        // InList 非字面量项 → 整体否。
+        let bad_list = call(
+            "fmt",
+            vec![
+                Expr::StringLit("{} c={}".into()),
+                Expr::IfThenElse {
+                    cond: Box::new(Expr::InList {
+                        expr: Box::new(call(
+                            "strftime",
+                            vec![f("dateTime"), Expr::StringLit("%H".into())],
+                        )),
+                        list: vec![f("extra")],
+                        negated: false,
+                    }),
+                    then_expr: Box::new(Expr::StringLit("nightTime".into())),
+                    else_expr: Box::new(Expr::StringLit("dayTime".into())),
+                },
+                call("count_char", vec![f("extra"), Expr::StringLit("c".into())]),
+            ],
+        );
+        assert!(!columnar_output_expr(&bad_list), "非字面量列表项应否：{bad_list:?}");
     }
 
     #[test]

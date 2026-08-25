@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use arrow::array::{Array, ArrayAccessor, Int64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
+use arrow::record_batch::RecordBatch;
 use smol_str::SmolStr;
 use wf_lang::ast::{BinOp, Expr, FieldRef, JoinMode};
 
@@ -13,7 +14,7 @@ use crate::alert::{AlertColumnBuilder, EachRowCells};
 use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::MACHINE_ID;
-use crate::match_engine::columnar::{CVec, ColumnExpr, ColumnarBatch, compile_guard, cscalar_to_value};
+use crate::match_engine::columnar::{CVec, ColumnarBatch, compile_guard, cscalar_to_value};
 use crate::match_engine::event_bridge::{ColumnarEvent, JoinRow};
 use crate::match_engine::match_engine::{
     CepStateMachine, Event, FieldSource, JoinKey, Value, WindowLookup, eval_field_value,
@@ -670,7 +671,18 @@ impl RuleExecutor {
         } else {
             self.each_join_plan.is_some()
         };
-        if !join_ok || each_plan.filter.is_some() {
+        // each filter：无活 join 时允许列式 filter（`expr_is_columnar`，Q14 价格
+        // 区间 `0.908*price in (1M, 50M)`）；有活 join 时列式 join 富化路径未接
+        // 入 filter 求值 → 保守回退行式。非列式 filter 同样回退（解释求值路径
+        // 不复制）。
+        let filter_ok = match &each_plan.filter {
+            None => true,
+            Some(f) if self.live_joins.is_empty() => {
+                wf_lang::columnar::expr_is_columnar(f)
+            }
+            Some(_) => false,
+        };
+        if !join_ok || !filter_ok {
             return false;
         }
         if !self.plan.binds.iter().all(|b| {
@@ -738,7 +750,69 @@ impl RuleExecutor {
                 }
             })
     }
+}
 
+/// Batch-level precomputed on-each columnar state: the general-yield output
+/// cvecs (`fmt`/`strftime`/`count_char`, batch-evaluated once) and the
+/// each-filter mask. Opaque to callers — evaluated once per frame via
+/// [`RuleExecutor::each_batch_prepare`] and reused across the
+/// [`ALERT_BATCH_SIZE`](crate::match_engine::executor::ALERT_BATCH_SIZE)
+/// segments of one batch.
+#[derive(Default)]
+pub struct EachBatchVecs {
+    general_cvecs: Vec<Option<CVec>>,
+    filter_cvec: Option<CVec>,
+}
+
+impl RuleExecutor {
+    /// Compile + batch-evaluate the on-each columnar output state for one
+    /// `batch` (frame): general-yield cvecs (`fmt`/`strftime`/`count_char`,
+    /// one slot per yield field, `None` = compile failed → per-row row
+    /// fallback) and the each-filter mask (`None` = no filter or compile
+    /// failed → per-row `passes_each_filter`).
+    ///
+    /// Caller must gate on [`Self::each_plan_columnar_safe`]; evaluation
+    /// happens once per frame, so the per-segment executor work stays
+    /// O(segment) instead of O(frame × segments).
+    pub fn each_batch_prepare(&self, batch: &RecordBatch) -> EachBatchVecs {
+        let view = ColumnarBatch::from_all_fields(batch);
+        let n = view.num_rows();
+        let general_cvecs: Vec<Option<CVec>> = self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| {
+                let is_output_func = matches!(
+                    &field.value,
+                    Expr::FuncCall {
+                        qualifier: None,
+                        name,
+                        ..
+                    } if wf_lang::columnar::columnar_output_func(name).is_some()
+                );
+                if is_output_func {
+                    compile_guard(&field.value, &view).map(|plan| plan.eval_vec(&view, n))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let filter_cvec = self
+            .plan
+            .each_plan
+            .as_ref()
+            .and_then(|ep| ep.filter.as_ref())
+            .and_then(|f| compile_guard(f, &view))
+            .map(|plan| plan.eval_vec(&view, n));
+        EachBatchVecs {
+            general_cvecs,
+            filter_cvec,
+        }
+    }
+}
+
+impl RuleExecutor {
     /// Columnar form of [`Self::execute_each_direct_batch`]: reads field
     /// values straight from the Arrow columns via [`ColumnarEvent`], skipping
     /// per-row `Event` materialization entirely (design doc §3.5「on each
@@ -751,6 +825,37 @@ impl RuleExecutor {
         &self,
         rows: &[(&ColumnarEvent<'_>, i64)],
         emit_time_nanos: i64,
+        builder: &mut AlertColumnBuilder,
+        appended_out: &mut Vec<usize>,
+    ) -> EachDirectBatchStats {
+        let prepared = match rows.first() {
+            Some((ev, _)) => self.each_batch_prepare(ev.batch()),
+            None => EachBatchVecs::default(),
+        };
+        self.execute_each_direct_batch_columnar_with(
+            rows,
+            emit_time_nanos,
+            &prepared,
+            builder,
+            appended_out,
+        )
+    }
+
+    /// [`Self::execute_each_direct_batch_columnar`] with the batch-level
+    /// columnar state **pre-evaluated once per batch** ([`Self::each_batch_prepare`])
+    /// and reused across [`ALERT_BATCH_SIZE`](crate::match_engine::executor::ALERT_BATCH_SIZE)
+    /// segments — re-evaluating the general-yield cvecs + each-filter mask per
+    /// segment over the full frame was O(frame × segments) (Q14 列式 4600 vs
+    /// 466 ns/evt 的墙：65k 帧 × 16 段全帧重算)。
+    ///
+    /// Caller must gate on [`Self::each_plan_columnar_safe`]; the per-row
+    /// output (wfx_id / entity_id / fired_at / yield cells) is byte-identical
+    /// to the Event-based path — locked by the deferred-vs-columnar 对拍 test.
+    pub fn execute_each_direct_batch_columnar_with(
+        &self,
+        rows: &[(&ColumnarEvent<'_>, i64)],
+        emit_time_nanos: i64,
+        prepared: &EachBatchVecs,
         builder: &mut AlertColumnBuilder,
         appended_out: &mut Vec<usize>,
     ) -> EachDirectBatchStats {
@@ -768,7 +873,6 @@ impl RuleExecutor {
             return stats;
         };
         debug_assert!(self.each_plan_columnar_safe());
-        let _ = each_plan; // filter is None by the safety gate
         let statics = self.output_static();
         let emit_time = self.cached_emit_time(emit_time_nanos);
         let summary = Arc::clone(
@@ -821,45 +925,13 @@ impl RuleExecutor {
             })
             .collect();
 
-        // 列式输出函数（fmt/strftime/count_char）：批级编译 + `eval_vec` 整批
-        // 求值一次，行循环只取 cell（向量化 cell 求值）。编译失败（结构化列
-        // 参数等）→ 该 yield 行式回退。
-        let batch0 = rows.first().map(|(ev, _)| ev.batch());
+        // 列式输出函数（fmt/strftime/count_char）与 each filter 掩码：批级编译
+        // + `eval_vec` 整帧求值**一次**（`each_batch_prepare`），行循环只取
+        // cell（向量化 cell 求值）；编译失败（结构化列参数等）→ 该 yield 行式
+        // 回退（prepared 槽位 None）。
         let has_general_yield = yield_kinds
             .iter()
             .any(|k| matches!(k, YieldKind::General));
-        let view = batch0.map(ColumnarBatch::from_all_fields);
-        let general_plans: Vec<Option<ColumnExpr>> = self
-            .plan
-            .yield_plan
-            .fields
-            .iter()
-            .map(|field| {
-                let is_output_func = matches!(
-                    &field.value,
-                    Expr::FuncCall {
-                        qualifier: None,
-                        name,
-                        ..
-                    } if wf_lang::columnar::columnar_output_func(name).is_some()
-                );
-                if is_output_func {
-                    view.as_ref().and_then(|v| compile_guard(&field.value, v))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let general_cvecs: Vec<Option<CVec>> = match &view {
-            Some(v) => {
-                let n = v.num_rows();
-                general_plans
-                    .iter()
-                    .map(|p| p.as_ref().map(|plan| plan.eval_vec(v, n)))
-                    .collect()
-            }
-            None => (0..general_plans.len()).map(|_| None).collect(),
-        };
 
         // Batch-constant wfx_id FNV prefix: `rule_name \x00` hashed once per
         // batch (rule names run tens of bytes and were previously re-hashed
@@ -987,6 +1059,18 @@ impl RuleExecutor {
         let mut staged_rows: Vec<Vec<_>> = Vec::new();
 
         for (idx, (event, event_time_nanos)) in rows.iter().enumerate() {
+            // -- each filter（与行式 `passes_each_filter` 语义一致）--------
+            // 列式掩码：null/非布尔 cell → 拒绝（行式 filter 求值 None → false）；
+            // 掩码缺失（无 filter / 编译失败兜底行式）→ 解释逐行。
+            let filter_pass = match (&each_plan.filter, &prepared.filter_cvec) {
+                (None, _) => true,
+                (Some(_), Some(cvec)) => cvec.bool_at(event.row()).unwrap_or(false),
+                (Some(_), None) => passes_each_filter(each_plan.filter.as_ref(), &event.to_event()),
+            };
+            if !filter_pass {
+                stats.rejected += 1;
+                continue;
+            }
             // -- Per-row system values (identical to the Event-based path) ---
             let t_entity = if prof.enabled() {
                 Some(Instant::now())
@@ -1148,7 +1232,8 @@ impl RuleExecutor {
                             // （缺字段/null）→ 空串，与 eval_yield_expr_with_meta
                             // 的 None→空串一致。编译失败（结构化列参数等）→
                             // 行式回退（构造 Event ctx）。
-                            let v = match general_cvecs
+                            let v = match prepared
+                                .general_cvecs
                                 .get(general_cursor)
                                 .and_then(|oc| oc.as_ref())
                             {

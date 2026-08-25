@@ -3029,6 +3029,12 @@ impl RuleTask {
         if crate::perf_diag::perf_cut_output() {
             return;
         }
+        // 批级列式状态（general-yield cvecs + each-filter 掩码）每帧求值一次，
+        // 各段复用——逐段对整帧重算是 O(帧×段)（Q14 65k 帧 × 16 段 4600 ns/evt）。
+        let Some((first, _)) = rows.first() else {
+            return;
+        };
+        let prepared = self.executor.each_batch_prepare(first.batch());
         let mut appended_idx: Vec<usize> = Vec::new();
         let mut start = 0;
         while start < rows.len() {
@@ -3066,9 +3072,10 @@ impl RuleTask {
                         &mut pending.by_target[last].1
                     }
                 };
-                let outcome = self.executor.execute_each_direct_batch_columnar(
+                let outcome = self.executor.execute_each_direct_batch_columnar_with(
                     segment,
                     batch_emit_nanos,
+                    &prepared,
                     builder,
                     &mut appended_idx,
                 );
