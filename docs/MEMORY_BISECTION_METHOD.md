@@ -89,17 +89,56 @@ churn 判据：`malloc 存活差分小` 但 `footprint reclaimable / 分配器�
 6. **先消融再优化**：在错误段上优化（q13a pipe 足迹 4.2× 下降）不会让内存
    变好——消融（CUT_ALERT）一次就指出正确的段。
 
-## 6. 已内建的测量设施（用它们，别再造）
+## 6. 可复用资产（机制 / 指标 / API / 模式 / 测试——用它们，别再造）
 
-| 设施 | 位置 | 用途 |
+### 6.1 诊断机制（直接跑，不写代码）
+
+| 机制 | 位置 | 用法 |
 |---|---|---|
-| 分配器分账 | `alloc.{current_rss,peak_rss,current_commit,peak_commit,page_faults}` | 层 ③：进程 vs 引擎缺口 |
-| 阶段在途 | `parse.inflight_bytes/budget_bytes`、`window.mailbox_inflight_bytes`、`window.fanout_queued_batches/capacity_batches` | 分账等式各项 |
-| 窗口真实占用 | `window.allocated_bytes`（按缓冲去重） | 层 ① 修正口径 |
-| 输出链消融 | `WF_DIAG_CUT_ALERT=1`（临时 env，生产勿设） | 切 alert 构建段 |
-| 分配计数探针 | `wf-runtime::memory_probe`（`MemoryProbe::exclusive` + `peak_growth`） | 层 ②：单测内量化 |
-| 墙梯 | `diag.sh STAGES=recv,decode,floor,rules,full` | 段定位（EPS + RSS 两列） |
-| 载荷形状守护 | `intermediate_broadcast_is_batch_only_for_round_robin_subscribers`（变异测试验证过） | 防内存修复回退静默复现 |
+| perf-diag 墙梯 | `wf-examples/performance/nexmark_pk/diag.sh` + `conf/perf-diag-wall.toml` | `WARMUP=0 STAGES=floor,rules,full ./diag.sh q13 30m` → EPS + RSS 两列 |
+| 输出链消融 | `WF_DIAG_CUT_ALERT=1` env（`perf_diag.rs`，生产勿设） | 只切 alert 构建段、保留 pipe/join |
+| 排查流程 | `docs/MEMORY_BISECTION_METHOD.md` §2-§4 | 墙梯→消融→差分→修复四步 |
+
+### 6.2 可观测性指标（引擎已内置，直接读 `metrics.ndjson`）
+
+| 指标 | 回答什么 |
+|---|---|
+| `alloc.{current,peak}_{rss,commit}`、`page_faults` | 进程 vs 引擎缺口（分账第一刀） |
+| `parse.inflight_bytes` / `budget_bytes` | parse 在途是否真占预算（q13：2GB 预算只用 20MB → 预算假说排除） |
+| `window.mailbox_inflight_bytes` / `budget_bytes` | 窗口 mailbox 在途 |
+| `window.fanout_queued_batches` / `capacity_batches` | 规则分片通道排队（q13：555/2560=22%，且与窗口 Arc 共享不双算） |
+| `window.allocated_bytes`（按缓冲指针去重） | 窗口真实占用——`content_bytes` 漏 bitmap/offsets，`get_array_memory_size` 重复计共享缓冲 |
+
+### 6.3 可调用 API（新代码直接用）
+
+| API | 位置 | 用途 |
+|---|---|---|
+| `RuleFanout::round_robin_only` / `queued_items` | `wf-engine/src/window/fanout.rs` | 订阅类型判断 / 通道排队量（含分片求和） |
+| `Router::mailbox_inflight` | `wf-engine/src/window/router.rs` | mailbox 已用/容量字节 |
+| `Window::allocated_usage` / `allocated_bytes(batch)` | `wf-engine/src/window/buffer/mod.rs` | 真实占用会计（驱逐/mailbox 预算仍用 content_bytes，勿混） |
+| `MemoryProbe::exclusive` / `peak_growth` | `wf-runtime/src/memory_probe.rs` | 测试内量化分配峰值（N vs 3N 断言）；⚠ 全局计数器，独占执行（测试名过滤） |
+
+### 6.4 优化模式（模式不是库，照抄到热路径）
+
+| 模式 | 落点 | 适用场景（实测收益） |
+|---|---|---|
+| `Vec<Option<T>>` → Arrow builder | `PipeCol`（`rule_task.rs`） | 列装载：16B/值 → 8B+nullbitmap，字符串列 per-row 分配归零 |
+| eval→stage 流式融合 | `PipeRowSink` trait（`each_exec.rs`）+ `PipeStagerSink` | 先物化整批中间结构 → 逐行 sink + 复用 scratch（811→195 B/行） |
+| `Vec<String>` → `Vec<SmolStr>` | `AlertColumnBuilder`（`column_batch.rs`） | 短字符串列（≤22B 内联零堆分配）；fired_at 24B 超限保持 String |
+| `StrSink` trait | `match_engine/key.rs` | String + SmolStrBuilder 统一渲染（2^53 边界由守护测试钉死） |
+| 中转 Vec → 直连 `commit_each_row` | `each_exec.rs` | 消灭“累积整批 + 二次拷贝”（每行 3 String clone + staged cell clone） |
+| `EntityCol` 列直读 | `each_exec.rs` | 免 `Value`/`SmolStr` 中转直读 Int64/Utf8 列（Int64/Utf8/Generic 三态） |
+
+### 6.5 守护测试族（防回归，改引擎时跑）
+
+| 测试 | 守护什么 |
+|---|---|
+| `intermediate_broadcast_is_batch_only_for_round_robin_subscribers` | 广播按订阅类型裁剪（**变异测试验证过**：`round_robin_only` 写反立刻失败） |
+| `allocated_usage_tracks_real_buffers_and_drops_on_evict` | 会计配对完整性（append 增、驱逐归零，防记账虚增造假泄漏） |
+| `str_sink_smol_builder_matches_string_rendering` + `hex_encode_smol_matches_string_version` | SmolStr 直写与 String 版本字节一致（entity_id / wfx_id 静默变值防护） |
+| `queued_items_reports_backlog_across_shards` | fanout 排队读数（空队/压入/消费回落四态） |
+| `parse_inflight_gauges_are_exported` + `window_memory_accounting_gauges_are_exported` | 分账指标必须被导出（防指标名/采样静默失效导致“误判已排除”） |
+| `pipe_write_alloc_footprint`（ignored bench） | 分配足迹量化代理 + 会计保真度（④ 项）——改一步测一步的标尺 |
 
 ## 7. 工作准则（沉淀）
 
