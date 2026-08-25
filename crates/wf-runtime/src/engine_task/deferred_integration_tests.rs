@@ -495,6 +495,54 @@ async fn deferred_q9_pin_floor_advances_with_pending_drain() {
     );
 }
 
+/// flush 收口**不受健全前沿限制**：目标窗一直不提交（frontier 卡 i64::MIN）时，
+/// 运行期 gate 挂起全部实例（不假 miss），flush（gate=false）仍按最终水位收口
+/// 评估——否则尾部/静态目标场景会全部丢到 flush 之外。
+#[tokio::test]
+async fn deferred_q9_flush_unblocks_evaluation_when_frontier_never_advances() {
+    super::tests::init_tracing();
+    let (mut task, mut alert_rx, router) = make_deferred_join_task();
+    let src_a: Arc<str> = Arc::from("ingress#1");
+    let bw = bid_window(&router);
+    let schema = bw.schema().clone();
+
+    // auction 5 挂起（expiry=T+30s）；目标窗**没有任何提交**（per-source 空 →
+    // frontier 回退 max_event_time = i64::MIN → 运行期 gate 挂起）。
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[(5, T, T + 30_000_000_000)]))
+        .unwrap();
+    // 驱动 wm 追平 expiry（auction 6 @ T+31s）——即使驱动已过 expiry，
+    // frontier=i64::MIN → gate=i64::MIN → 不评估（不假 miss）。
+    auction_window(&router)
+        .append_with_watermark(auction_batch(&[
+            (6, T + 31_000_000_000, T + 61_000_000_000),
+        ]))
+        .unwrap();
+    task.pull_and_advance().await;
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "目标无提交 → 运行期保持挂起（不假 miss）"
+    );
+
+    // 目标窗随后提交右行（跨源延迟送达）
+    bw.append_with_watermark_sized_from(
+        bid_batch(&[(5, 1, 100, T + 5_000_000_000)]),
+        0,
+        None,
+        Arc::clone(&src_a),
+    )
+    .unwrap();
+
+    // flush 收口：gate=false → 不受 frontier 限制 → 评估命中补输出
+    task.flush().await;
+    let alert = super::tests::take_alert(&mut alert_rx);
+    assert_eq!(
+        super::tests::field_str(&alert, "__wfu_entity_id"),
+        "5",
+        "flush 收口必须绕过 frontier gate（右行已提交 → 命中）"
+    );
+}
+
 /// 跨源提交乱序 × deferred 评估 gate（30M q4 over=30m -860 的机制回归）：
 ///
 /// ingress `instances=8` + parse 并行派发下，窗口 actor 只保证 **source 内**

@@ -27,7 +27,7 @@ impl Window {
             .map(|(outcome, _)| outcome)
     }
 
-    /// Like [`Self::append_with_watermark_parsed`], but stores already-parsed events
+    /// Like [`Self::append_with_watermark`], but stores already-parsed events
     /// (produced outside the window by the router) so rule reads never
     /// contend on the batch's `OnceLock`.
     pub fn append_with_watermark_parsed(
@@ -57,6 +57,29 @@ impl Window {
             Some(byte_size),
             shard_rows,
             None,
+        )
+    }
+
+    /// Like [`Self::append_with_watermark_parsed_sized`], but the caller records
+    /// the batch's source so the window can track its per-source committed
+    /// frontier (2026-08-25 cross-source reorder fix). Used by the window actor
+    /// when a rule subscribes to this window (`events = Some`) — without this,
+    /// a subscribed join target would silently fall back to the unsound global
+    /// `max_event_time` in [`Self::committed_frontier_ns`].
+    pub fn append_with_watermark_parsed_sized_from(
+        &self,
+        batch: RecordBatch,
+        parsed_events: Arc<Vec<Arc<Event>>>,
+        byte_size: usize,
+        shard_rows: Option<Arc<Vec<Vec<u32>>>>,
+        source: Arc<str>,
+    ) -> CoreResult<(AppendOutcome, u64)> {
+        self.append_with_watermark_inner(
+            batch,
+            Some(parsed_events),
+            Some(byte_size),
+            shard_rows,
+            Some(source),
         )
     }
 
@@ -204,7 +227,8 @@ impl Window {
         if m.is_empty() {
             return self.max_event_time_nanos();
         }
-        m.values().copied().min().unwrap_or_else(|| self.max_event_time_nanos())
+        // map 非空 → values 非空 → min 必为 Some（unwrap 安全）。
+        m.values().copied().min().unwrap()
     }
 
     /// Current watermark in nanoseconds.

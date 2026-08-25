@@ -1968,7 +1968,10 @@ impl RuleTask {
                 .map(|w| w.committed_frontier_ns())
                 .unwrap_or(i64::MAX);
             if frontier == i64::MAX {
-                // 目标不存在/无时间列（防御）：退回驱动 wm（旧行为）。
+                // 目标窗不存在（防御，get_window 失败）：退回驱动 wm（旧行为）。
+                // 注意：无时间列窗口的 frontier 是 i64::MIN（max 不推进）→
+                // 走挂起分支——但 deferred 目标必有时间列（within [lo,hi]
+                // 依赖 ts），该路径不可达。
                 wm
             } else if frontier == i64::MIN {
                 // 目标窗**尚无任何提交**（启动期首个 batch 前）：右行必然不在，

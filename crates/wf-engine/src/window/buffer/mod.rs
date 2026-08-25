@@ -381,6 +381,14 @@ pub struct Window {
     /// Time-ordered append log: batch sequence number → batch. Guarded by an
     /// `RwLock` — see the struct docs for the concurrency contract. Removal
     /// drops the value eagerly (no deferred reclamation).
+    ///
+    /// ⚠ 已知限制（2026-08-25 review 记录，预先存在）：seq 是**提交顺序**，
+    /// 跨 source 乱序提交（ingress instances>1 + parse 并行）下 ≠ 事件时间序。
+    /// 时间驱逐（`evict_expired_impl`）按 seq 从最旧提交弹栈——若最旧提交的
+    /// 事件时间很新（某 source 的远未来 batch 先落地），弹栈会卡住、后面
+    /// seq 更大但事件时间更老的 batch 不被驱逐 → 内存次优（正确性无损：
+    /// 多保留）。单源（conns=1）帧有序，无此问题。修复需改驱逐为按事件时间
+    /// 扫描（破坏 O(1) 弹栈 + BTreeMap 序），暂不做。
     log: RwLock<BTreeMap<u64, TimedBatch>>,
     /// Next sequence number to assign to an appended batch.
     next_seq: AtomicU64,

@@ -1245,3 +1245,25 @@ deferred flush。需配单测（模拟 flush 时目标未追平 → 追平后补
 
 over=30m 真正成为纯内存参数：三档全部 oracle 精确，100M RSS 17.6GB → 8.7GB
 （比预期 ~13GB 更低）。
+
+### 2026-08-25 review（5 轮）补强
+- **R1 正确性**：`commit_appended_batch` 的 parsed 分支（目标窗有规则订阅时
+  events=Some）曾丢 source → per_source 不记录 → 前沿回退全局 max → 跨源乱序
+  修复失效（真实场景：q4a 订阅 auction_events、q8 的 deferred 目标正是它）。
+  修复：新增 `append_with_watermark_parsed_sized_from`。无时间戳 batch
+  （(i64::MIN,i64::MAX)）不记录 ✓；DroppedLate 不记录 ✓；锁序（log 锁块内、
+  per_source 锁块外）无环 ✓。
+- **R2 并发**：actor 单线程提交无并发；max 先于 per_source 更新（frontier 滞后
+  = 保守方向）；lo_min 无"回落历史值"洞（dirty 重算覆盖 pending 空后新插入）。
+- **R3 性能**：per_source Mutex 每 batch 一次（~36.5k 行 amortize 可忽略）；
+  lo_min_dirty 重算 O(pending)（gate 后 pending 小）。⚠ 记录已知限制（预先
+  存在，未修）：跨源乱序下 log 按 seq 有序 ≠ 事件时间序，时间驱逐按 seq 弹栈
+  可能卡住旧行 → 内存次优（正确性无损，conns=1 不触发）。
+- **R4 测试**：新增 `committed_frontier_records_parsed_sized_from`（R1 守护）、
+  `committed_frontier_ignores_dropped_late`、
+  `deferred_q9_flush_unblocks_evaluation_when_frontier_never_advances`
+  （flush 收口不受 frontier 限制）。wf-engine 1117→1136、wf-runtime 533→535。
+- **R5 质量**：doc 引用修正、`committed_frontier_ns` 去冗余 fallback、gate 注释
+  准确化（i64::MAX = 窗口不存在；无时间列窗返回 i64::MIN 走挂起分支，deferred
+  目标必有时间列故不可达）。
+- 回归：30M 1,672,559 ✓ + 6.7GB；100M 5,576,436 ✓ + 8.7GB（review 改动无损）。

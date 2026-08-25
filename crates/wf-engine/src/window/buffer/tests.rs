@@ -742,6 +742,101 @@ fn committed_frontier_tracks_per_source_min() {
     assert_eq!(win.committed_frontier_ns(), 60_000_000_000);
 }
 
+/// 订阅窗（events=Some 的 parsed 路径）同样记录 per-source 前沿——
+/// `commit_appended_batch` 的 parsed 分支曾丢 source（2026-08-25 review 修复）：
+/// 目标窗有规则订阅时（如 q4a 订阅 auction_events、q8 的 deferred 目标正是它），
+/// 不记录会让前沿回退全局 max → 跨源乱序修复失效。
+#[test]
+fn committed_frontier_records_parsed_sized_from() {
+    let mut cfg = test_config(usize::MAX);
+    cfg.allowed_lateness = Duration::from_secs(60).into();
+    let schema = test_schema();
+    let win = Window::new(
+        WindowParams {
+            name: "test_win".into(),
+            schema,
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        cfg,
+    );
+    let src_a: Arc<str> = Arc::from("ingress#1");
+    let src_b: Arc<str> = Arc::from("ingress#2");
+    let schema = win.schema().clone();
+    let events = Arc::new(vec![]);
+
+    win.append_with_watermark_parsed_sized_from(
+        make_batch(&schema, &[40_000_000_000], &[1]),
+        Arc::clone(&events),
+        0,
+        None,
+        Arc::clone(&src_a),
+    )
+    .unwrap();
+    win.append_with_watermark_parsed_sized_from(
+        make_batch(&schema, &[10_000_000_000], &[2]),
+        Arc::clone(&events),
+        0,
+        None,
+        Arc::clone(&src_b),
+    )
+    .unwrap();
+    assert_eq!(
+        win.max_event_time_nanos(),
+        40_000_000_000,
+        "parsed 路径同样推进全局 max"
+    );
+    assert_eq!(
+        win.committed_frontier_ns(),
+        10_000_000_000,
+        "parsed 路径同样按源记录前沿（min = source B 的 10s）"
+    );
+}
+
+/// DroppedLate（乱序旧 batch 被迟到策略丢弃）**不**记录 per-source——
+/// 否则被丢的行会污染前沿（看似已提交、实际不在窗口里）。
+#[test]
+fn committed_frontier_ignores_dropped_late() {
+    let mut cfg = test_config(usize::MAX);
+    // allowed_lateness=0 + Drop：乱序旧 batch 必被丢。
+    let schema = test_schema();
+    let win = Window::new(
+        WindowParams {
+            name: "test_win".into(),
+            schema,
+            time_col_index: Some(0),
+            over: Duration::from_secs(3600),
+            materialize_fields: None,
+            defer_materialization: false,
+        },
+        cfg,
+    );
+    let src: Arc<str> = Arc::from("ingress#1");
+    let schema = win.schema().clone();
+
+    // 先推进 watermark：batch @ 100s → watermark = 95s（delay 5s）。
+    win.append_with_watermark(make_batch(&schema, &[100_000_000_000], &[1]))
+        .unwrap();
+    // 旧 batch @ 10s < watermark(95s) → DroppedLate。
+    let outcome = win
+        .append_with_watermark_sized_from(
+            make_batch(&schema, &[10_000_000_000], &[2]),
+            0,
+            None,
+            Arc::clone(&src),
+        )
+        .unwrap();
+    assert!(matches!(outcome.0, AppendOutcome::DroppedLate));
+    assert_eq!(
+        win.committed_frontier_ns(),
+        100_000_000_000,
+        "被丢的乱序 batch（10s）不记录 per-source——回退全局 max（100s），\
+         若被记录则 frontier 会被 10s 拉低"
+    );
+}
+
 #[test]
 fn append_with_watermark_drop_late() {
     // watermark delay = 5s, allowed_lateness = 0s, late_policy = Drop

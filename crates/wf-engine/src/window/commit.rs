@@ -61,12 +61,27 @@ pub(super) async fn commit_appended_batch(
     let stored_shard_rows: Option<Arc<Vec<Vec<u32>>>> =
         shard_rows.as_ref().map(|s| Arc::from(s.to_vec()));
     let result = if let Some(events) = events.as_ref() {
-        win.append_with_watermark_parsed_sized(
-            batch,
-            Arc::clone(events),
-            byte_size,
-            stored_shard_rows.clone(),
-        )
+        if let Some(src) = source {
+            // 2026-08-25（跨源提交乱序修复）：actor 路径带提交来源，窗口记录
+            // 按源已提交前沿（deferred 评估 gate 的健全判据）。
+            // **必须覆盖 parsed 分支**：目标窗有规则订阅（events=Some）时同样
+            // 要记录——否则订阅窗（如 q4a 订阅 auction_events，q8 的 deferred
+            // 目标就是它）的前沿回退全局 max，跨源乱序修复失效。
+            win.append_with_watermark_parsed_sized_from(
+                batch,
+                Arc::clone(events),
+                byte_size,
+                stored_shard_rows.clone(),
+                src,
+            )
+        } else {
+            win.append_with_watermark_parsed_sized(
+                batch,
+                Arc::clone(events),
+                byte_size,
+                stored_shard_rows.clone(),
+            )
+        }
     } else if let Some(src) = source {
         // 2026-08-25（跨源提交乱序修复）：actor 路径带提交来源，窗口记录
         // 按源已提交前沿（deferred 评估 gate 的健全判据）。
