@@ -10,7 +10,7 @@ use wf_lang::ast::{BinOp, Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan, WindowSpec};
 
 use crate::match_engine::Value;
-use crate::match_engine::executor::stats_exec::StatsExecutor;
+use crate::match_engine::executor::stats_exec::{StatsAccum, StatsExecutor, TopEntry};
 
 fn num(n: f64) -> Value {
     Value::Number(n)
@@ -2084,4 +2084,99 @@ fn stats_memory_guard_columnar_path_rejects_too() {
     assert!(exec.process_batch(&batch), "列式前置满足");
     assert_eq!(exec.window.over_limit_new_buckets(), 4, "5 键限 1 → 拒 4");
     assert!(exec.window.estimated_bytes() <= 1200);
+}
+
+#[test]
+fn stats_memory_guard_event_count_counts_only_accumulated_rows() {
+    // F1: 列式 keyed 路径的 event_count 只计归并成功行（被拒行不计）——
+    // 与行式路径一致（对拍契约）; 全被拒窗口 event_count == 0 → 空窗 guard。
+    let plan = q19_like_plan();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as _,
+            Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500])) as _,
+        ],
+    )
+    .unwrap();
+
+    // 列式: 5 键限 1 → 只归并 1 行, event_count == 1（不是 5）。
+    let mut col_exec = StatsExecutor::new(plan.clone());
+    col_exec.set_memory_limit("guard_test", Some(1200));
+    assert!(col_exec.process_batch(&batch), "列式前置满足");
+    assert_eq!(col_exec.window.over_limit_new_buckets(), 4);
+    assert_eq!(col_exec.window.event_count, 1, "被拒 4 行不计入 event_count");
+
+    // 行式对拍: 同一输入 → 同样只归并 1 行。
+    let mut row_exec = StatsExecutor::new(plan);
+    row_exec.set_memory_limit("guard_test", Some(1200));
+    let rows = auction_price_rows(&[(1.0, 100.0), (2.0, 200.0), (3.0, 300.0), (4.0, 400.0), (5.0, 500.0)]);
+    row_exec.process_rows(&rows, extract);
+    assert_eq!(row_exec.window.over_limit_new_buckets(), 4);
+    assert_eq!(row_exec.window.event_count, 1, "行式同口径");
+}
+
+#[test]
+fn stats_memory_guard_over_limit_counts_rows_not_keys() {
+    // F4: 拒收计数按行（每次新桶尝试）而非按新键——被拒键不建桶, 后续同键行
+    // 仍尝试建桶 → 每次 +1。这是有意取舍（每键记账需无界集合, 违背有界承诺）。
+    let plan = q19_like_plan();
+    let mut exec = StatsExecutor::new(plan);
+    exec.set_memory_limit("guard_test", Some(1200)); // 只放 1 桶
+
+    // 键 1 放行; 键 2 首次被拒; 键 2 再来 2 行仍被拒; 键 3 被拒。
+    exec.process_rows(
+        &auction_price_rows(&[
+            (1.0, 100.0),
+            (2.0, 200.0),
+            (2.0, 210.0),
+            (2.0, 220.0),
+            (3.0, 300.0),
+        ]),
+        extract,
+    );
+    assert_eq!(
+        exec.window.over_limit_new_buckets(),
+        4,
+        "键 2 被拒 3 行 + 键 3 被拒 1 行 = 4（按行, 非按新键 2）"
+    );
+    assert_eq!(exec.window.event_count, 1, "只归并键 1 的 1 行");
+}
+
+#[test]
+fn stats_memory_guard_merge_partial_rejects_over_limit() {
+    // F2（engine 侧）: 协调片 merge_partial 时新键同样过 guard——分片各自限额
+    // 内放行的键, 合并到协调片后可能超限被拒（协调片 own 预算）。
+    let plan = q19_like_plan();
+    let mut exec = StatsExecutor::new(plan);
+    exec.set_memory_limit("guard_test", Some(1200)); // 只放 1 桶
+
+    // 协调片已有键 1（占满预算 1120B）。
+    exec.process_rows(&auction_price_rows(&[(1.0, 100.0)]), extract);
+    assert_eq!(exec.window.over_limit_new_buckets(), 0);
+
+    // 分片 partial 带来键 2（分片侧限额内放行）——协调片合并时超限被拒。
+    let partial: Vec<(ScopeKey, Vec<StatsAccum>)> = vec![(
+        ScopeKey::Int(2),
+        vec![StatsAccum {
+            count: 1,
+            top_entries: Some(vec![TopEntry {
+                key: 200.0,
+                row: Box::new([Some(Value::Number(200.0))]),
+            }]),
+            ..StatsAccum::default()
+        }],
+    )];
+    exec.merge_partial(partial, 1);
+    assert_eq!(
+        exec.window.over_limit_new_buckets(),
+        1,
+        "协调片合并新键超限 → 拒收计数 +1"
+    );
+    assert_eq!(exec.window.event_count, 2, "partial 的 event_count 仍累计");
+    assert_eq!(exec.final_measure_values_by_bucket().len(), 1, "只有键 1 桶");
 }

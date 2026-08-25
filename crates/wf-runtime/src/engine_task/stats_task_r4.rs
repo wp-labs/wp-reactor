@@ -491,10 +491,11 @@ async fn close_current_window_reports_over_limit_delta() {
     );
 }
 
-/// 输入分区分片非协调片（merge_tx）: close 只发 partial, 不上报告警——
-/// 协调片合并后才统一上报（否则每片各报一次, 计数放大 N 倍）。
+/// 输入分区分片非协调片（merge_tx）: close 发 partial 的同时**上报自己的拒收
+/// 增量**——被拒键不在 partial 里（take_partial 只导出已建桶）, 协调片看不到;
+/// 不报则分片拒收永远丢失。各片上报自己的部分（互不重叠, 汇总 = 总拒收）。
 #[tokio::test]
-async fn shard_non_coordinator_does_not_report_over_limit() {
+async fn shard_non_coordinator_reports_own_over_limit() {
     let metrics = Arc::new(crate::metrics::RuntimeMetrics::new(
         &["stats_r4_rule".to_string()],
         &[],
@@ -507,7 +508,7 @@ async fn shard_non_coordinator_does_not_report_over_limit() {
     guard_plan_and_limit(&mut task);
 
     // 模拟分片非协调片: merge_tx 已设置 → flush/close 走 take_partial 早退。
-    let (tx, _rx) = tokio::sync::mpsc::channel::<StatsPartial>(1);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<StatsPartial>(1);
     task.merge_tx = Some(tx);
 
     task.process_push(RulePush {
@@ -521,10 +522,50 @@ async fn shard_non_coordinator_does_not_report_over_limit() {
     .await;
     assert_eq!(task.stats.window.over_limit_new_buckets(), 9, "guard 照常拒收");
 
-    task.flush().await; // 只发 partial, 不 close 不上报
+    task.flush().await; // 发 partial + 上报分片自己的拒收增量
+    let partial = rx.try_recv().expect("partial 已发送");
+    assert_eq!(partial.1 - partial.0, 10_000_000_000, "窗口区间正确");
+    assert_eq!(partial.2.len(), 1, "partial 只含已建桶（键 0）");
     assert_eq!(
         over_limit_reported(&metrics, "stats_r4_rule"),
-        0,
-        "非协调片不上报（协调片合并后才统一报）"
+        9,
+        "分片上报自己的拒收 9（协调片看不到被拒键）"
+    );
+}
+
+/// 全被拒窗口（event_count == 0）: 空窗 guard 不产出, 但拒收计数仍需上报——
+/// 不延迟到下一有数据窗口（metrics 实时性; F3）。
+#[tokio::test]
+async fn close_current_window_all_rejected_window_still_reports() {
+    let metrics = Arc::new(crate::metrics::RuntimeMetrics::new(
+        &["stats_r4_rule".to_string()],
+        &[],
+        &[],
+        std::collections::BTreeMap::new(),
+    ));
+    let (eos_tx, _) = watch::channel(0u64);
+    let (config, _cancel) = make_config(vec![], None, &eos_tx, Some(Arc::clone(&metrics)));
+    let (mut task, _cancel) = StatsTask::new(config);
+    guard_plan_and_limit(&mut task);
+    // 限额 < 桶预算 640B → 全部新键被拒（每键 allowance 640 > 100）。
+    task.stats.set_memory_limit("stats_r4_rule", Some(100));
+
+    task.process_push(RulePush {
+        window_name: Arc::from("bid_events"),
+        events: None,
+        batch: Some(Arc::new(window_batch(&[1_000_000_000; 10]))),
+        materialize_fields: None,
+        seq: 1,
+        shard_rows: None,
+    })
+    .await;
+    assert_eq!(task.stats.window.over_limit_new_buckets(), 10, "10 行全拒");
+    assert_eq!(task.stats.window.event_count, 0, "全被拒 → 无归并行");
+
+    task.flush().await; // 空窗 guard: 不产出但上报拒收
+    assert_eq!(
+        over_limit_reported(&metrics, "stats_r4_rule"),
+        10,
+        "全被拒窗口仍上报拒收增量"
     );
 }

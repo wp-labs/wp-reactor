@@ -385,6 +385,9 @@ impl StatsTask {
         if let Some(tx) = &self.merge_tx {
             let (buckets, count) = self.stats.take_partial();
             let _ = tx.send((window_start, window_end, buckets, count)).await;
+            // 分片也上报自己的拒收增量: 被拒键不在 partial 里（take_partial 只导出
+            // 已建桶）, 协调片看不到——不报则分片拒收永远丢失（metrics 低估）。
+            self.report_over_limit(window_start, window_end);
             return;
         }
         if let Some(rx) = &mut self.merge_rx {
@@ -422,6 +425,8 @@ impl StatsTask {
             }
         }
         if self.stats.window.event_count == 0 {
+            // 全被拒窗口（event_count 0）同样要上报拒收——不延迟到下一有数据窗口。
+            self.report_over_limit(window_start, window_end);
             return;
         }
         let labels: Vec<String> = self
@@ -516,9 +521,16 @@ impl StatsTask {
             let batch = builder.finish();
             self.dispatch_columns(&target, batch).await;
         }
-        // 状态内存 guard 告警（协调片/单片; merge_tx 分片早退分支在上面已 return）:
+        // 状态内存 guard 告警（协调片/单片; merge_tx 分片早退分支在上面已单独上报）:
         // close 重置窗口但拒收计数跨窗口保留——读累计值求本窗增量, 上报 metrics +
         // 每窗一次 wf_warn（带窗口区间 + pipe 追踪, 比 executor 内部 log 更显眼）。
+        self.report_over_limit(window_start, window_end);
+    }
+
+    /// 上报本窗超限拒收增量（metrics + 每窗一次 wf_warn）。同步（无 await）:
+    /// 读跨窗口累计计数求 delta（`over_limit_new_buckets` 在 close/reset 后保留,
+    /// 必须发增量防重复计数）。协调片/单片/分片（merge_tx）共用。
+    fn report_over_limit(&mut self, window_start: i64, window_end: i64) {
         let over_limit = self.stats.window.over_limit_new_buckets();
         let delta = over_limit.saturating_sub(self.last_reported_over_limit);
         if delta > 0 {
@@ -531,8 +543,8 @@ impl StatsTask {
                 rule = %self.rule_name(),
                 window_start = window_start,
                 window_end = window_end,
-                over_limit_new = delta,
-                "stats 状态内存超限——本窗拒收 {} 个新键桶（累计 {} 个; 已有桶继续累积）",
+                over_limit_rows = delta,
+                "stats 状态内存超限——本窗拒收 {} 行（新桶尝试; 累计 {} 行; 已有桶继续累积）",
                 delta, over_limit
             );
         }
@@ -682,6 +694,8 @@ impl StatsTask {
             };
             let (buckets, count) = self.stats.take_partial();
             let _ = tx.send((start, end, buckets, count)).await;
+            // 分片尾部窗口同样上报拒收增量（见 close_current_window merge_tx 分支）。
+            self.report_over_limit(start, end);
             self.window_start = None;
             self.window_end = None;
             return;

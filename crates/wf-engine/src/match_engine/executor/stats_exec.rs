@@ -151,7 +151,12 @@ impl StatsWindowState {
     }
 
     /// 新桶预算（保守上界）: 固定基数 + 每度量结构 + top/last 条目预算
-    /// （含行字段列数组; distinct 集不在此预算内, 见文档注记）。
+    /// （含行字段列数组）。
+    ///
+    /// **已知限制（文档注记）**: `distinct_set` 不在预算内——带 key + distinct 规则
+    /// 下每桶 distinct 集按值增长（无界）, guard 只限桶数不限每桶 distinct 集。
+    /// 这是有意取舍: 逐条目记账需侵入累加热路径且估算复杂; 现网规则集（q 系列）
+    /// 带 key 规则均无 distinct（q15 的 distinct 是空键单桶, 内存本身固定）。
     fn bucket_allowance(plan: &StatsPlan, n_measures: usize) -> u64 {
         let mut bytes = 512u64 + n_measures as u64 * 128;
         for m in &plan.measures {
@@ -167,6 +172,12 @@ impl StatsWindowState {
     }
 
     /// 新建桶前的限额检查: 超限 → 计数 + 每窗口告警一次 + 拒绝（false）。
+    ///
+    /// **计数口径（按行/尝试, 非按新键）**: 被拒的键不建桶 → 后续同键行仍走
+    /// 查找未命中 → 每次尝试都计数。这是有意取舍——「每新键一次」需记录被拒键
+    /// 集合（无界, 违背 guard 的内存有界承诺）; 按行计数不引入新状态, 只对
+    /// 已在桶内的键不计数（命中）。告警/metrics 的 `over_limit_new_buckets`
+    /// 实际含义是「被拒行数」。
     fn account_new_bucket(&mut self, plan: &StatsPlan, n_measures: usize) -> bool {
         let allowance = Self::bucket_allowance(plan, n_measures);
         if let Some(limit) = self.limit_bytes
@@ -176,7 +187,7 @@ impl StatsWindowState {
             if !self.limit_warned {
                 self.limit_warned = true;
                 log::warn!(
-                    "stats 状态内存超限（规则 {}, 估算 {}B / 上限 {}B）——拒绝新建键桶, 已有桶继续累积; 累计拒收 {} 个新桶",
+                    "stats 状态内存超限（规则 {}, 估算 {}B / 上限 {}B）——拒绝新建键桶, 已有桶继续累积; 累计拒收 {} 行（新桶尝试）",
                     self.rule_name,
                     self.estimated_bytes,
                     limit,
@@ -863,7 +874,6 @@ impl StatsExecutor {
                 }
             }
         }
-        self.window.event_count += rows.map_or(n as u64, |rs| rs.len() as u64);
         true
     }
 
@@ -916,6 +926,7 @@ impl StatsExecutor {
                 masks,
                 row,
             );
+            self.window.event_count += 1; // 归并成功才计数（对齐行式路径）
             return;
         }
         let Some(key) = scope_key_columnar(batch, key_cols, row) else {
@@ -936,6 +947,7 @@ impl StatsExecutor {
             masks,
             row,
         );
+        self.window.event_count += 1; // 归并成功才计数（对齐行式路径）
     }
 }
 
