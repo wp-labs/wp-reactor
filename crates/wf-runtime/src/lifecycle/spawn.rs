@@ -322,6 +322,53 @@ fn register_progress(
         .collect()
 }
 
+/// 同 [`register_progress`]，但注册为 **row-partitioned** 消费者（key / 行号
+/// 分片的 match/stats 任务）：每片只处理自己的行子集，一个批次只有在**所有**
+/// 分片都 ack 过之后才算被完全消费——完成判定用 min（2026-08-25 review：
+/// `wait_for_data_drain` 的 `max||min` 会在最快分片追平时提前排空，慢分片
+/// 仍在处理）。驱逐保护（全局 min over 两组）不受影响。
+fn register_row_partitioned_progress(
+    router: &Arc<Router>,
+    window_sources: &[WindowSource],
+) -> HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>> {
+    window_sources
+        .iter()
+        .map(|src| {
+            let slot = router
+                .registry()
+                .progress(&src.window_name)
+                .expect("progress table exists for every window")
+                .register_row_partitioned();
+            (src.window_name.clone(), slot)
+        })
+        .collect()
+}
+
+/// 收集被**顺序敏感**下游消费的 intermediate target（2026-08-25 review）：
+/// Match 状态机（同 key 保序）与 stats 的 last/top 聚合（按行序取极值）都
+/// 不允许上游分片乱序——它们的中间窗上游 each 规则必须保持单 worker。
+/// 可交换 stats（count/sum/min/max/distinct）与 on-each 下游容忍乱序。
+fn collect_order_sensitive_targets(
+    rules: &[RunRule],
+    intermediate_targets: &HashSet<String>,
+) -> HashSet<String> {
+    rules
+        .iter()
+        .filter(|r| match &r.kind {
+            RunRuleKind::Match { .. } => true,
+            RunRuleKind::Stats { stats_plan, .. } => stats_plan.measures.iter().any(|m| {
+                matches!(
+                    m.agg,
+                    wf_lang::plan::StatsAggPlan::Last | wf_lang::plan::StatsAggPlan::Top
+                )
+            }),
+            RunRuleKind::Each { .. } => false,
+        })
+        .flat_map(|r| r.executor.plan().binds.iter().map(|b| b.window.clone()))
+        .filter(|w| intermediate_targets.contains(w))
+        .collect()
+}
+
 /// Spawn one independent task per compiled rule.
 ///
 /// Each rule task owns its `CepStateMachine` exclusively (no `Arc<Mutex>`).
@@ -351,15 +398,14 @@ pub(super) fn spawn_rule_tasks(
         .map(|v| v.eq_ignore_ascii_case("push"))
         .unwrap_or(false);
 
-    // 被 Match 状态机消费的 intermediate target（2026-08-24 q4 分片）：这些下游
-    // 对同 key 事件顺序敏感（保序），上游分片输出乱序会破坏语义 → 相关 target
-    // 的上游 each 规则保持单 worker。stats/on-each 下游聚合可交换，容忍乱序。
-    let match_consumed_targets: HashSet<String> = rules
-        .iter()
-        .filter(|r| matches!(r.kind, RunRuleKind::Match { .. }))
-        .flat_map(|r| r.executor.plan().binds.iter().map(|b| b.window.clone()))
-        .filter(|w| intermediate_targets.contains(w))
-        .collect();
+    // 被**顺序敏感**下游消费的 intermediate target（2026-08-24 q4 分片 +
+    // 2026-08-25 review 补 stats last/top）：这些下游对同 key 事件顺序敏感
+    // （保序），上游 each 规则分片输出乱序会破坏语义 → 相关 target 的上游
+    // each 规则保持单 worker。
+    // - Match 状态机：同 key 事件必须按序进入（2026-08-24）；
+    // - stats 的 last/top 聚合：按行序取极值，跨片乱序会选错行。
+    // stats 可交换聚合（count/sum/min/max/distinct）与 on-each 下游容忍乱序。
+    let order_sensitive_targets = collect_order_sensitive_targets(&rules, intermediate_targets);
 
     for rule in rules {
         // join 目标窗口接索引（2026-08 RSS/EPS 归因：生产此前未接线
@@ -484,7 +530,7 @@ pub(super) fn spawn_rule_tasks(
                         } else {
                             None
                         };
-                        let progress = register_progress(router, &window_sources);
+                        let progress = register_row_partitioned_progress(router, &window_sources);
                         let mut shard_stats = wf_engine::match_engine::StatsExecutor::with_row_fields(
                             stats_plan.clone(),
                             row_fields.clone(),
@@ -535,7 +581,7 @@ pub(super) fn spawn_rule_tasks(
                     let mut merge_rx_opt = Some(merge_rx);
                     for shard_idx in 0..shard_count {
                         let push_rx = None;
-                        let progress = register_progress(router, &window_sources);
+                        let progress = register_row_partitioned_progress(router, &window_sources);
                         let mut shard_stats = wf_engine::match_engine::StatsExecutor::with_row_fields(
                             stats_plan.clone(),
                             row_fields.clone(),
@@ -636,7 +682,7 @@ pub(super) fn spawn_rule_tasks(
                 let deferred = plan.joins.iter().any(|j| j.emit_at.is_some());
                 let deferred_shardable = deferred
                     && plan.match_plan.key_join.is_none()
-                    && !match_consumed_targets.contains(&target);
+                    && !order_sensitive_targets.contains(&target);
                 // bind **中间管道窗口**（上游 yield 的中间窗口）的 each 规则：
                 // - 2026-08-23 起强制单 worker（push 广播订阅）——当时的 round-robin
                 //   分片走 **pull 光标**，下游独立游标消费滞后于 pipe append（shutdown
@@ -653,7 +699,7 @@ pub(super) fn spawn_rule_tasks(
                     .any(|b| intermediate_targets.contains(&b.window));
                 let intermediate_shard_safe = consumes_intermediate
                     && !deferred
-                    && !match_consumed_targets.contains(&target);
+                    && !order_sensitive_targets.contains(&target);
                 // **yield 中间管道窗口**（本规则是上游生产者）的 each 规则：
                 // **强制单 worker（2026-08-25 回退）**。q13a 分片一度放开（当中间窗
                 // 无 Match 消费者时），但 10 核并发 row path 高频分配（Event/OutputRecord
@@ -871,7 +917,7 @@ pub(super) fn spawn_rule_tasks(
                         } else {
                             None
                         };
-                        let progress = register_progress(router, &window_sources);
+                        let progress = register_row_partitioned_progress(router, &window_sources);
                         let conv_sink = conv_ctx.as_ref().map(|(tx, _barrier)| ConvShardSink {
                             tx: tx.clone(),
                             barrier_index: shard_idx,

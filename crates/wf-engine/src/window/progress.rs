@@ -10,6 +10,13 @@ use std::sync::{Arc, RwLock, Weak};
 /// time-based eviction may only remove batches every live consumer has
 /// acknowledged, so a slow rule can never lose unconsumed data to a sweep.
 ///
+/// Consumers come in two groups with different **completion** semantics (see
+/// [`WindowProgress::completion_gap`]): whole-batch consumers
+/// ([`WindowProgress::register`] — single worker / round-robin shards, each
+/// batch owned by exactly one slot) and row-partitioned consumers
+/// ([`WindowProgress::register_row_partitioned`] — key / row-index shards,
+/// a batch complete only when every shard acked it).
+///
 /// Slots are held as [`Weak`] handles: a task going away drops its last
 /// strong reference and the slot stops counting automatically — hot reload
 /// replaces rule tasks wholesale, and strong references would accumulate
@@ -54,7 +61,18 @@ use std::sync::{Arc, RwLock, Weak};
 /// query *declares*, so dropping rows past it is semantics, not resource
 /// pressure (see [`crate::window::Window::evict_expired`]).
 pub struct WindowProgress {
+    /// Whole-batch consumers: a batch is fully consumed by exactly one such
+    /// slot (single worker, or round-robin shards — each batch is delivered to
+    /// its owning shard only, so `max` over this group is the completion
+    /// signal).
     slots: RwLock<Vec<Weak<AtomicU64>>>,
+    /// Row-partitioned consumers (key / row-index sharded match & stats): each
+    /// shard processes only its row subset of every batch, so a batch is fully
+    /// consumed only when **every** slot in this group has acked past it —
+    /// `min` over this group is the completion signal (2026-08-25 review:
+    /// `wait_for_data_drain`'s `max||min` fired on the fastest shard of a
+    /// key-partitioned window while slower shards were still processing).
+    row_slots: RwLock<Vec<Weak<AtomicU64>>>,
     /// Retention pins: oldest event time (nanos) each join-target reader still
     /// needs. Held as [`Weak`] for the same reason as `slots`.
     pins: RwLock<Vec<Weak<AtomicI64>>>,
@@ -70,6 +88,7 @@ impl WindowProgress {
     pub fn new() -> Self {
         Self {
             slots: RwLock::new(Vec::new()),
+            row_slots: RwLock::new(Vec::new()),
             pins: RwLock::new(Vec::new()),
         }
     }
@@ -86,42 +105,93 @@ impl WindowProgress {
         slot
     }
 
-    /// Minimum acked position over all live consumers.
+    /// Register a **row-partitioned** consumer slot (key / row-index sharded
+    /// match & stats tasks). Each shard only ever processes its own row subset
+    /// of every batch, so the batch is complete only when every slot in this
+    /// group has acked past it — completion for this group is the **min**,
+    /// never the max (a fast shard reaching `next_seq` says nothing about the
+    /// slow ones). Eviction still respects the global min over both groups
+    /// (unread rows are never dropped).
+    ///
+    /// Whole-batch consumers (single worker / round-robin shards) use
+    /// [`Self::register`] instead.
+    pub fn register_row_partitioned(&self) -> Arc<AtomicU64> {
+        let slot = Arc::new(AtomicU64::new(0));
+        let mut row_slots = self.row_slots.write().expect("progress lock poisoned");
+        row_slots.retain(|w| w.strong_count() > 0);
+        row_slots.push(Arc::downgrade(&slot));
+        slot
+    }
+
+    /// Minimum acked position over all live consumers (both groups).
     ///
     /// `u64::MAX` when no consumer is alive: a window nobody reads is
     /// fully evictable by time.
     pub fn min_acked(&self) -> u64 {
-        self.slots
-            .read()
-            .expect("progress lock poisoned")
+        let slots = self.slots.read().expect("progress lock poisoned");
+        let row_slots = self.row_slots.read().expect("progress lock poisoned");
+        slots
             .iter()
+            .chain(row_slots.iter())
             .filter_map(|w| w.upgrade())
             .map(|slot| slot.load(Ordering::Acquire))
             .min()
             .unwrap_or(u64::MAX)
     }
 
-    /// Maximum acked position over all live consumers.
-    ///
-    /// `0` when no consumer is alive. This is the **completion** signal:
-    /// `max_acked >= next_seq` means every batch has been acked by *some*
-    /// consumer. For a single (or pull) consumer it equals `min_acked`; for a
-    /// whole-batch round-robin sharded push consumer each shard only acks its
-    /// own batches (`seq % N == shard`), so `min_acked` stalls at the laggard
-    /// shard's last batch and can never reach `next_seq` — completion must be
-    /// judged on `max_acked` (2026-08-25 q13 卡尾：哨兵排空判定 + bench
-    /// acked_lag 用 min_acked 永不归零，30M/100M 挂死等超时）。驱逐保护
-    /// **仍用** [`Self::min_acked`]（未读不驱逐）；`max_acked` 只回答"是否
-    /// 全部消费完"。
+    /// Maximum acked position over live consumers, **skipping released**
+    /// (`u64::MAX`) slots — a released consumer must not fabricate a
+    /// completion signal while live shards are still draining (hot reload /
+    /// partial task exit). `0` when no live (unreleased) consumer: no
+    /// consumption progress to report. (The drain criterion itself lives in
+    /// [`Self::completion_gap`], which is group-aware — `max_acked` is only a
+    /// raw aggregate for diagnostics.)
     pub fn max_acked(&self) -> u64 {
-        self.slots
-            .read()
-            .expect("progress lock poisoned")
+        let slots = self.slots.read().expect("progress lock poisoned");
+        let row_slots = self.row_slots.read().expect("progress lock poisoned");
+        slots
+            .iter()
+            .chain(row_slots.iter())
+            .filter_map(|w| w.upgrade())
+            .map(|slot| slot.load(Ordering::Acquire))
+            .filter(|v| *v != u64::MAX)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// How many batches (at `next_seq`) are still **not fully consumed** — the
+    /// completion criterion used by the sentinel drain and the `acked_lag`
+    /// metric. `0` = drained.
+    ///
+    /// Completion is **per consumption group**, because no single aggregate
+    /// works for every window shape (2026-08-25 review):
+    /// - whole-batch consumers (`slots`, single / round-robin): each batch is
+    ///   owned by exactly one slot → `max` over the group;
+    /// - row-partitioned consumers (`row_slots`, key / index shards): a batch
+    ///   is complete only when every shard acked past it → `min` over the
+    ///   group.
+    ///
+    /// An empty group is trivially complete (no such consumer). Released slots
+    /// (`u64::MAX`) are skipped in both groups — a released consumer is gone,
+    /// it neither completes nor holds back anything.
+    pub fn completion_gap(&self, next_seq: u64) -> u64 {
+        let slots = self.slots.read().expect("progress lock poisoned");
+        let row_slots = self.row_slots.read().expect("progress lock poisoned");
+        let batch_max = slots
             .iter()
             .filter_map(|w| w.upgrade())
             .map(|slot| slot.load(Ordering::Acquire))
-            .max()
-            .unwrap_or(0)
+            .filter(|v| *v != u64::MAX)
+            .max();
+        let row_min = row_slots
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .map(|slot| slot.load(Ordering::Acquire))
+            .filter(|v| *v != u64::MAX)
+            .min();
+        let batch_gap = batch_max.map(|m| next_seq.saturating_sub(m)).unwrap_or(0);
+        let row_gap = row_min.map(|m| next_seq.saturating_sub(m)).unwrap_or(0);
+        batch_gap.max(row_gap)
     }
 
     /// Register a retention pin (D4), starting **fully pinned** (`i64::MIN`).
@@ -165,6 +235,11 @@ impl WindowProgress {
     /// Optional: the slot also stops counting once the task drops its last
     /// strong reference (the table holds only a `Weak`). Kept for shutdown
     /// paths that release explicitly before the task struct goes away.
+    ///
+    /// Safe against the completion signal: released slots (`u64::MAX`) are
+    /// skipped by [`Self::completion_gap`] and [`Self::max_acked`], so a
+    /// releasing task can never make a window look drained while live shards
+    /// are still processing, and never holds the eviction floor either.
     pub fn release(slot: &Arc<AtomicU64>) {
         slot.fetch_max(u64::MAX, Ordering::AcqRel);
     }
@@ -230,6 +305,110 @@ mod tests {
 
         WindowProgress::release(&a);
         assert_eq!(progress.min_acked(), u64::MAX);
+    }
+
+    /// 完成判定是**分组**的（2026-08-25 review）：key/index 分片（row-partitioned）
+    /// 窗口用 min——最快 shard 追平 next_seq 不代表最慢 shard 处理完；
+    /// round-robin（whole-batch）窗口用 max——每批恰被其归属 shard 消费，
+    /// min 恒停在最慢 shard。
+    #[test]
+    fn completion_gap_waits_for_the_slowest_row_shard() {
+        let progress = WindowProgress::new();
+        let fast = progress.register_row_partitioned();
+        let slow = progress.register_row_partitioned();
+        fast.store(4, Ordering::Release);
+        slow.store(1, Ordering::Release);
+        assert_eq!(
+            progress.completion_gap(4),
+            3,
+            "最快 shard 已追平 next_seq=4，但最慢 shard 还在 1 → 未排空"
+        );
+        slow.store(4, Ordering::Release);
+        assert_eq!(progress.completion_gap(4), 0, "全部 row shard 追平 → 排空");
+    }
+
+    #[test]
+    fn completion_gap_uses_max_for_round_robin_shards() {
+        let progress = WindowProgress::new();
+        // 10 个 round-robin shard，最慢停在 245（min=246），最快已处理最后一批
+        //（seq=254 → ack 255）→ next_seq=255 时已排空（每批都被其归属 shard 消费）。
+        let mut slots = Vec::new();
+        for i in 0..10u64 {
+            let slot = progress.register();
+            slot.store(246 + i, Ordering::Release);
+            slots.push(slot);
+        }
+        assert_eq!(progress.min_acked(), 246);
+        assert_eq!(
+            progress.completion_gap(255),
+            0,
+            "round-robin：min 停滞不影响完成判定（max=255 追平）"
+        );
+        assert_eq!(progress.completion_gap(300), 45, "未追平 → 剩余批数");
+    }
+
+    /// 混合消费（同一窗口既有 key 分片 match/stats 又有 round-robin 消费者，如
+    /// bid_events = q5 key 分片 + q4a round-robin）：两组的完成条件**都必须**满足。
+    #[test]
+    fn completion_gap_mixed_requires_both_groups() {
+        let progress = WindowProgress::new();
+        let row_a = progress.register_row_partitioned();
+        let row_b = progress.register_row_partitioned();
+        let rr_a = progress.register();
+        let rr_b = progress.register();
+        row_a.store(5, Ordering::Release);
+        row_b.store(5, Ordering::Release);
+        rr_a.store(3, Ordering::Release);
+        rr_b.store(4, Ordering::Release);
+        assert_eq!(
+            progress.completion_gap(5),
+            1,
+            "row 组已追平，但 round-robin 组 max=4 < next=5（最后一批 seq=4 未处理）→ 未排空"
+        );
+        rr_a.store(5, Ordering::Release);
+        assert_eq!(progress.completion_gap(5), 0, "两组都满足 → 排空");
+        // row 组落后时同理：
+        row_a.store(2, Ordering::Release);
+        assert_eq!(progress.completion_gap(5), 3, "row 组最慢在 2 → 未排空");
+    }
+
+    /// release（u64::MAX）不能伪造完成信号，也不能拖住驱逐 floor：
+    /// 存活 shard 未追平时 completion_gap 必须反映它们，而不是被 release 冲成 0。
+    #[test]
+    fn released_slot_does_not_poison_completion() {
+        let progress = WindowProgress::new();
+        let gone = progress.register();
+        let live = progress.register();
+        gone.store(5, Ordering::Release);
+        live.store(7, Ordering::Release);
+        assert_eq!(progress.completion_gap(10), 3);
+
+        WindowProgress::release(&gone);
+        assert_eq!(
+            progress.completion_gap(10),
+            3,
+            "release 的槽被跳过：completion_gap 由存活槽决定"
+        );
+        assert_eq!(progress.max_acked(), 7, "max_acked 跳过已释放槽");
+        assert_eq!(progress.min_acked(), 7, "release 槽不拖驱逐 floor");
+
+        // 全部释放 → 无存活消费者 → 视为已排空。
+        WindowProgress::release(&live);
+        assert_eq!(progress.completion_gap(10), 0);
+        assert_eq!(progress.max_acked(), 0, "无存活消费者 → 无消费进度");
+        assert_eq!(progress.min_acked(), u64::MAX);
+    }
+
+    /// Row-partitioned 槽的驱逐保护与 whole-batch 槽合并计算（min over both）。
+    #[test]
+    fn min_acked_covers_both_consumer_groups() {
+        let progress = WindowProgress::new();
+        let batch = progress.register();
+        let row = progress.register_row_partitioned();
+        batch.store(8, Ordering::Release);
+        row.store(2, Ordering::Release);
+        assert_eq!(progress.min_acked(), 2, "驱逐 floor = 两组最慢");
+        assert_eq!(progress.completion_gap(8), 6);
     }
 
     /// Reload cycles must not accumulate slots: registering N consumers,

@@ -1329,3 +1329,80 @@ M-13（100M q13 RSS 27GB + memory_evicted 1479）进入解决。探针/采样/�
   max_acked 才是完成信号——两用途必须分离。
 - **探针会拖慢生产路径改变卡点位置**（run6 探针过重，卡点偏移）：定位用最小探针，跑真数据
   前清理。
+
+## 2026-08-25 M-13 review（5 轮）——完成判定分组化 + 顺序敏感门控补全（已 commit）
+
+对 M-13 双分片改动做 5 轮 review，修复 2 个真实缺陷，R2/R4/R5 验证无恙。
+
+### R1 完成信号语义（修复：`WindowProgress` 分组完成判定）
+
+**缺陷 A（真实）**：`wait_for_data_drain` 的 `max_acked>=next || min_acked>=next`
+对 **key/行号分片（match/stats）窗口**不健全——`max_acked` = 最快分片游标，
+它追平 next_seq 时慢分片可能仍在处理自己的行子集 → 哨兵提前排空（bench 提前
+SIGTERM → 尾部输出被切，q4 尾部抖动同一类）。修前 30M/100M 全量跑通过是因为
+稳态分片偏斜小，背压风暴下会放大。
+
+**缺陷 B（真实）**：`release()`（`fetch_max(u64::MAX)`）会毒化 `max_acked`——
+任务在 Drop 中释放槽位时（热重载替换规则任务）completion 被冲成已排空，
+即使同窗口其他存活 shard 仍在消费。
+
+**修复**：`WindowProgress` 消费槽分两组——`register()`（whole-batch：单 worker /
+round-robin，每批归属唯一槽，完成 = 组内 **max**）与 `register_row_partitioned()`
+（key/行号分片，每批要**所有**分片 ack 才算消费，完成 = 组内 **min**）；新
+`completion_gap(next)` = 两组的 max 缺口（0 = 排空），两组都跳过 `u64::MAX`
+（released）槽。驱逐保护仍用全局 `min_acked`（两组并集，不变）。
+
+接线：spawn.rs stats key 分片 / 行号分片（q15）/ match key 分片 →
+`register_row_partitioned_progress`；其余保持 `register_progress`。哨兵
+`wait_for_data_drain` 与 `acked_lag` 指标改用 `completion_gap`。
+
+**混合窗口（bid_events = q5 key 分片 + q4a round-robin）两条件都必须满足**：
+row 组 min 追平 && batch 组 max 追平——纯 min 会被 round-robin 最慢 shard 永久
+卡死（q13 卡尾的翻版），纯 max 会在最快 key 分片处提前排空。
+
+### R2 分片 pull ack 处理位置（验证无恙）
+`last_processed+1` + `fetch_max` 单调；空份额轮次 `unwrap_or(0)` no-op；每片
+从自己游标读连续批次（驱逐 floor 保证无空洞），门控 `seq%N` 自洽。已有测试
+`q13_sharded_pull_acks_processed_not_read_position` 守护。
+
+### R3 q13b 消费分片边界（修复：顺序敏感门控补 stats last/top）
+`intermediate_shard_safe = 非 deferred && 目标不被 Match 消费` 只挡了 Match；
+下游 **stats last/top** 聚合按行序取极值，上游 round-robin 乱序会选错行。
+修复：`collect_order_sensitive_targets` 把 stats last/top 的 binds 并入门控
+（可交换 count/sum/min/max/distinct 与 each 下游仍容忍乱序）。
+
+### R4 内存控制配置副作用（验证无恙 + 需全量实证）
+`max_total_bytes=2GB` + `evict_interval=200ms` 全局生效：驱逐无安全回收时
+`memory_pressure` → actor 停 append → 背压，无死锁环（任务 ack 不依赖新
+append；驱逐回收 → 通知续跑）。对 q5/q16/q18 等 stats 大窗口的影响需全量
+22 查询验证（bucket 状态在 StatsExecutor 内，2GB cap 管不到，靠 over 封顶）。
+
+### R5 memory_evicted 判定移除（验证无恙）
+生产驱逐全部 floor 门控（`evict_expired_acked`；无门控的 `evict_expired` 仅测试
+用）。`cursor_gap` 仍是唯一丢未读信号（round-robin push 消费的批次先经通道投递，
+日志被删无损；pull 消费者滞后时 floor 保护或 gap 告警二选一，不存在第三种）。
+
+### 新增测试
+- wf-engine progress：`completion_gap_waits_for_the_slowest_row_shard` /
+  `completion_gap_uses_max_for_round_robin_shards` /
+  `completion_gap_mixed_requires_both_groups` /
+  `released_slot_does_not_poison_completion` /
+  `min_acked_covers_both_consumer_groups`
+- wf-runtime perf_diag：`data_drain_waits_for_slowest_row_shard`（慢分片阻塞排空）/
+  `data_drain_completes_when_round_robin_max_catches_up`（min 停滞不卡完成）
+- wf-runtime spawn_r4：`collect_order_sensitive_targets_covers_match_and_last_top_stats`
+- 回归：wf-engine 1142 / wf-runtime 544 / clippy 0（全绿）
+
+### 未提交改动（本段）
+- wf-engine: window/progress.rs（+row_slots 分组 + completion_gap + 5 测试）
+- wf-runtime: lifecycle/spawn.rs（register_row_partitioned_progress +
+  collect_order_sensitive_targets）、perf_diag.rs（drain 改 completion_gap + 2 测试）、
+  metrics/sampling.rs（acked_lag 改 completion_gap）、lifecycle/spawn_r4.rs（+1 测试）
+- wf-examples: nexmark_pk/bench.sh + scripts/bench_lib.py（acked_lag 口径注释更新）
+
+### Pitfalls（本段新增）
+- **max/min 单一聚合做不了完成判定**：row 分片窗口看 min（最慢）、round-robin
+  窗口看 max（归属唯一）、混合窗口两者都要——按消费分组算，别用一个数字
+  硬套全窗口。
+- **release 的 u64::MAX 是完成毒药**：完成聚合必须跳过 released 槽，否则热重载
+  时哨兵提前排空。

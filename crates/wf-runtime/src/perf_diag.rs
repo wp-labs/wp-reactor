@@ -432,13 +432,16 @@ pub(crate) async fn run_sentinel_task(config: SentinelTaskConfig) -> RuntimeResu
     Ok(())
 }
 
-/// 等待所有数据窗排空：**全部批次已被消费**。单消费者用 `min_acked`（追平
-/// `next_seq`）即可；whole-batch round-robin 分片消费者每个 shard 只 ack
-/// 自己的批次（`seq % N == shard`），`min_acked` 恒停在最慢 shard 的最后一批
-/// 永远追不平（2026-08-25 q13 分片卡尾）——排空判定用 `max_acked`（每个批次
-/// 都被其归属 shard 消费 = 排空）。驱逐保护仍用 `min_acked`（未读不驱逐）。
+/// 等待所有数据窗排空：**全部批次已被消费**。完成判定是**分组的**
+/// （`WindowProgress::completion_gap`，2026-08-25 review）：
+/// - whole-batch（round-robin / 单消费者）窗口：每批恰被其归属 shard 消费，
+///   完成 = 组内 **max** 追平（min 恒停在最慢 shard，q13 分片卡尾的教训）；
+/// - row-partitioned（key / 行号分片 match/stats）窗口：每批要**所有**分片
+///   处理完才算消费，完成 = 组内 **min** 追平（max = 最快分片，追平不代表
+///   慢分片处理完——旧 `max||min` 会让哨兵在最快分片处提前排空）。
 ///
-/// 无消费者的窗口视为已排空；哨兵窗自身除外。
+/// 驱逐保护仍用 `min_acked`（未读不驱逐）。无消费者的窗口视为已排空；
+/// 哨兵窗自身除外。
 async fn wait_for_data_drain(router: &Arc<Router>, cancel: &CancellationToken) {
     loop {
         let drained = router.registry().window_names().iter().all(|name| {
@@ -450,9 +453,7 @@ async fn wait_for_data_drain(router: &Arc<Router>, cancel: &CancellationToken) {
             };
             let next = win.next_seq();
             match router.registry().progress(name) {
-                Some(progress) => {
-                    progress.max_acked() >= next || progress.min_acked() >= next
-                }
+                Some(progress) => progress.completion_gap(next) == 0,
                 None => true, // 无消费者 → 已排空
             }
         });
@@ -973,6 +974,61 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), wait)
             .await
             .expect("cancel 后排空等待应返回")
+            .unwrap();
+    }
+
+    /// Row-partitioned（key/行号分片）窗口：最快分片追平 **不代表** 排空——
+    /// 慢分片仍在处理自己的行子集（2026-08-25 review 修复：旧 `max||min`
+    /// 在最快分片处提前排空）。
+    #[tokio::test]
+    async fn data_drain_waits_for_slowest_row_shard() {
+        let (router, win) = drain_router();
+        let next = win.next_seq();
+        assert_eq!(next, 1, "appended one batch");
+        let cancel = CancellationToken::new();
+        let progress = router.registry().progress("data_win").unwrap();
+        // 两个 key 分片消费者：fast 已追平 next_seq，slow 还在 0。
+        let fast = progress.register_row_partitioned();
+        let slow = progress.register_row_partitioned();
+        fast.store(next, std::sync::atomic::Ordering::Release);
+        let wait = tokio::spawn({
+            let router = Arc::clone(&router);
+            async move { wait_for_data_drain(&router, &cancel).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !wait.is_finished(),
+            "最快分片已追平但慢分片未处理 → 必须阻塞（旧 max||min 会提前排空）"
+        );
+        slow.store(next, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(2), wait)
+            .await
+            .expect("全部分片追平后排空应返回")
+            .unwrap();
+    }
+
+    /// Round-robin（whole-batch）分片窗口：min 恒停在最慢 shard（每片只 ack
+    /// 自己的批次），排空只能看 max（q13 分片卡尾的修复——不能被 min 卡死）。
+    #[tokio::test]
+    async fn data_drain_completes_when_round_robin_max_catches_up() {
+        let (router, win) = drain_router();
+        let next = win.next_seq();
+        assert_eq!(next, 1, "appended one batch");
+        let cancel = CancellationToken::new();
+        let progress = router.registry().progress("data_win").unwrap();
+        // 2 个 round-robin shard：拿到最后一批（seq=0）的 shard ack=1；
+        // 另一个 shard 只 ack 自己最后一批（next=1 时它没有批次 → 停在 0）。
+        let owner = progress.register();
+        let other = progress.register();
+        owner.store(next, std::sync::atomic::Ordering::Release);
+        assert_eq!(progress.min_acked(), 0, "min 停滞在无批次 shard");
+        let wait = tokio::spawn({
+            let router = Arc::clone(&router);
+            async move { wait_for_data_drain(&router, &cancel).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), wait)
+            .await
+            .expect("round-robin max 追平即排空（不能被 min 卡死）")
             .unwrap();
     }
 

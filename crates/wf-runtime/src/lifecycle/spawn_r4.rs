@@ -682,3 +682,97 @@ async fn final_metrics_export_captures_multiple_rules() {
         "q8_rule 增量 2 必须导出: {data}"
     );
 }
+
+/// 顺序敏感下游收集（2026-08-25 review）：Match 规则与 stats **last/top**
+/// 聚合消费的 intermediate target 都必须命中；可交换 stats 与 each 下游不命中。
+#[test]
+fn collect_order_sensitive_targets_covers_match_and_last_top_stats() {
+    use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan};
+    use wf_lang::ast::{Expr, FieldRef};
+
+    let intermediate = HashSet::from(["mid".to_string(), "other_mid".to_string()]);
+
+    // Match 规则绑定中间窗 mid → 命中。
+    let mut match_plan = base_plan("m");
+    match_plan.match_plan.keys = vec![FieldRef::Qualified("b".into(), "sip".into())];
+    match_plan.binds = vec![wf_lang::plan::BindPlan {
+        window: "mid".into(),
+        alias: "b".into(),
+        filter: None,
+    }];
+    let match_rule = RunRule {
+        kind: RunRuleKind::Match {
+            match_plan: match_plan.match_plan.clone(),
+            time_field: Some("event_time".into()),
+            limits: None,
+        },
+        executor: RuleExecutor::new(match_plan),
+        window_aliases: HashMap::new(),
+    };
+
+    // stats last/top 绑定中间窗 → 命中（乱序会选错行）。
+    let last_stats = RunRule {
+        kind: RunRuleKind::Stats {
+            stats_plan: StatsPlan {
+                window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::from_secs(10)),
+                keys: vec![Expr::Field(FieldRef::Qualified("b".into(), "sip".into()))],
+                output_shape: StatsOutputShapePlan::Rows,
+                measures: vec![StatsMeasurePlan {
+                    label: "last_v".into(),
+                    source_alias: "b".into(),
+                    where_expr: None,
+                    agg: StatsAggPlan::Last,
+                    field: Some(FieldRef::Qualified("b".into(), "v".into())),
+                    arg: None,
+                }],
+                tracked_bind_fields: HashMap::new(),
+            },
+            time_field: Some("event_time".into()),
+        },
+        executor: RuleExecutor::new(base_plan("l")),
+        window_aliases: HashMap::new(),
+    };
+
+    // 可交换 stats（count）绑定中间窗 → 不命中。
+    let count_stats = RunRule {
+        kind: RunRuleKind::Stats {
+            stats_plan: StatsPlan {
+                window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::from_secs(10)),
+                keys: vec![Expr::Field(FieldRef::Qualified("b".into(), "sip".into()))],
+                output_shape: StatsOutputShapePlan::Rows,
+                measures: vec![StatsMeasurePlan {
+                    label: "cnt".into(),
+                    source_alias: "b".into(),
+                    where_expr: None,
+                    agg: StatsAggPlan::Count,
+                    field: None,
+                    arg: None,
+                }],
+                tracked_bind_fields: HashMap::new(),
+            },
+            time_field: Some("event_time".into()),
+        },
+        executor: RuleExecutor::new(base_plan("c")),
+        window_aliases: HashMap::new(),
+    };
+
+    // each 规则绑定中间窗 → 不命中（stateless，乱序无害）。
+    let each_rule = RunRule {
+        kind: RunRuleKind::Each {
+            alias: "b".into(),
+            time_field: Some("event_time".into()),
+        },
+        executor: RuleExecutor::new(base_plan("e")),
+        window_aliases: HashMap::new(),
+    };
+
+    let hits = super::collect_order_sensitive_targets(
+        &[match_rule, last_stats, count_stats, each_rule],
+        &intermediate,
+    );
+    assert_eq!(
+        hits,
+        HashSet::from(["mid".to_string()]),
+        "Match 与 stats last/top 消费者命中；count stats / each 不命中"
+    );
+}

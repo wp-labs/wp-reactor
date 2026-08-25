@@ -21,33 +21,19 @@ impl RuntimeMetrics {
                     v.store(win.batch_count() as u64, Ordering::Relaxed);
                 }
                 if let Some(v) = self.window_acked_lag.get(&window_name) {
-                    // Number of batches appended but not yet consumed by any
-                    // rule. `max_acked`（完成信号）：round-robin 分片消费者每
-                    // 个 shard 只 ack 自己的批次，min_acked 恒停在最慢 shard
-                    // 最后一批（2026-08-25 q13 分片卡尾）——完成判定必须用
-                    // max。驱逐保护仍用 min_acked（未读不驱逐，见
-                    // `WindowProgress::max_acked` 注释）。单/pull 消费者
-                    // min==max 等价。Unconsumed windows report
-                    // `min_acked = u64::MAX`；max_acked 无消费者 = 0 → lag =
-                    // next_seq，非零会误报未排空——无消费者窗口单独按
-                    // min_acked==u64::MAX 判已排空（与旧行为一致）。
-                    let min_acked = router
+                    // 未完全消费的批数（0 = 已排空）。分组完成判定
+                    // `completion_gap`（2026-08-25 review）：row-partitioned
+                    // （key/行号分片 match/stats）窗口用 min（最慢分片），
+                    // whole-batch（round-robin/单消费者）窗口用 max（每批
+                    // 归属唯一 shard）。旧 min/max 混合口径会在最快分片处
+                    // 提前报 0——哨兵/bench 因此提前排空/提前 SIGTERM，慢分片
+                    // 尾部输出被切。驱逐保护仍用 min_acked（未读不驱逐）。
+                    let gap = router
                         .registry()
                         .progress(&window_name)
-                        .map(|p| p.min_acked())
-                        .unwrap_or(u64::MAX);
-                    let max_acked = router
-                        .registry()
-                        .progress(&window_name)
-                        .map(|p| p.max_acked())
+                        .map(|p| p.completion_gap(win.next_seq()))
                         .unwrap_or(0);
-                    let consumed = if min_acked == u64::MAX {
-                        // 无消费者：trivially drained（与旧 min_acked 口径一致）。
-                        u64::MAX
-                    } else {
-                        max_acked
-                    };
-                    v.store(win.next_seq().saturating_sub(consumed), Ordering::Relaxed);
+                    v.store(gap, Ordering::Relaxed);
                 }
             }
         }
