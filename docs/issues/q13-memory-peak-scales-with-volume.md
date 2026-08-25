@@ -74,30 +74,39 @@ N × 100µs：
 - RSS 随机器负载波动明显：同 30M 在 load 9.3–9.6 时 8.4–9.9GB、load 10.6–10.8 时
   14–15GB → **负载越高 → 消费越滞后 → 积累峰值越高**（与积压假说一致）
 
-## 3. 根因（已收窄到"非窗口部分"，待定位具体持有者）
+## 3. 根因（已收窄到缓冲预算尺寸，**非泄漏**）
 
 ### 已排除：H1 窗口无法老化
 事件时间跨度算术（§2.2）+ 窗口实测证明窗口保留有界（30M 3.87GB / 100M 5.7GB），
 只解释 1.8GB 差额，**不是 12GB 峰值差的主因**。
 （注：10M 跨度 16.7min < 两个 over，窗口全量保留——小规模下反而是窗口主导。）
 
-### 待定位：非窗口部分 10GB→20GB
+### 主因（高度可信，待测试验证）：**在途通道缓冲预算过大 + Arc 共享使其隐形**
 
-候选持有者（按 q13 特征排序）：
+代码常量：`RULE_CHANNEL_CAPACITY = 256`（`lifecycle/spawn.rs:38`）是
+**每个规则分片通道**的容量。q13b 有 10 个 RoundRobin 分片（bench r=10）：
 
-1. **alert 输出路径 ∝ N**（最可疑）：q13 语义 = **每行 bid 产出一条 alert**
-   （30M 事件 → ~14M alerts；100M → ~46M alerts）。输出基数随总量线性增长，
-   若 alert 构建/序列化/dispatch 落后于产出，`AlertColumnBuilder` 批与通道
-   积压 ∝ N。旁证：`alert.channel_depth` 峰值 629；早前 `sample` 的 malloc
-   热点正是 `AlertColumnBuilder` + `RawVec<DataType,Value>`。
-2. **q13b 消费滞后的在途批次**：bid_mod acked_lag 369→765。但 pull 模型下未
-   ack 批次仍计在 window_bytes 内，可能与窗口成分重叠、非独立增量。
-3. **mimalloc 分配峰值水位**：高频 alert 构建 × 10 worker 并发 → 段区借入。
-   受机器负载放大（同 30M：load 8.9→13.8GB、load 9.3→9.9GB）。
+```
+10 分片 × 256 批/分片 = 2560 批在途
+× bid_mod 批 ~2MB（实测：1.69GB / ~845 批）
+= ~5.1GB 单 q13b 通道预算
+```
 
-**下一步定位手段**：峰值时刻 `vmmap <pid>` 的分类明细（footprint 摘要不够细），
-看 MALLOC_LARGE / MALLOC_HUGE 区与 Arrow 缓冲的占比；配合 `alert.channel_depth`
-与 `alert.dispatch_total` 的时间曲线判断 alert 路径是否为积压源。
+另：sink alert 通道 `SINK_CHANNEL_CAPACITY = 2048` 批 ×
+`ALERT_BATCH_SIZE = 4096` 条/批 = 8.4M 条在途 × ~150B ≈ **1.3GB/sink**
+（q13 每行 bid 一条 alert，通道长期接近满）。
+
+**为何窗口会计看不见**：`flush_pipes` 把**同一批次** append 到窗口并广播，
+Arrow 缓冲经 `Arc` 共享（`batch.clone()` / `Arc::new(b.clone())` 都是浅拷）。
+窗口驱逐后，**只要通道里还有在途条目持有 `Arc`，这些缓冲仍然活着，但已不计入
+`window_bytes`**——正是那 10→20GB。
+
+**为何增长是次线性**（3.3× 数据 → 1.86× 内存）：有界缓冲在 30M（ingest ~9s）
+没填满，100M（~30s 持续满载）才填到接近上限 → **渐近于预算总和，而非无界增长**。
+推推：300M 应仍 ≈ 26–30GB（预算封顶）。
+
+次要因素：mimalloc 分配峰值水位（高频 alert 构建 × 10 worker），受机器负载
+放大（同 30M：load 8.9→13.8GB、load 9.3→9.9GB）。
 
 ## 4. 已尝试 / 已排除
 
@@ -107,21 +116,35 @@ N × 100µs：
 | **广播按订阅类型裁剪**（`53aca64`） | 30M EPS 1.52M→4.06M、RSS 28.8→9.9GB | **保留，勿回退** |
 | 回退 q13a 单 worker | 1.52M EPS、5.9GB | 性能倒退，不做 |
 | 单点 footprint 采样判定"RSS 虚高" | 误判（撞低谷） | 必须整程采样 |
+| **`bid_mod over = 1h → 1m`** | **无效**：bid_mod 峰值 1.69GB→2.03GB（噪声内略高）、窗口合计 3.87→4.25GB、RSS 13.8→13.5GB 不变 | **已否决**：时间驱逐被 ack floor 门控（`evictor.rs:130`），未被 q13b ack 的批次（lag 峰值 369–765）`over` 再小也删不掉——**保留量由消费滞后决定，不由 over 决定** |
 
-## 5. 下一步（先数据，后动手）
+## 5. 下一步（测试驱动，已备好度量设施）
 
-1. **定位非窗口内存持有者**（唯一阻塞项）：100M 跑到峰值时刻抓 `vmmap <pid>`
-   分类明细，对比 30M 同时刻——差额落在哪个区（MALLOC_LARGE/HUGE vs Arrow
-   缓冲 vs 通道）。**勿用单点 footprint 摘要**（§2.1 已踩坑）。
-2. **验证 alert 路径假说**：`alert.channel_depth` / `dispatch_total` /
-   `emitted_total` 的时间曲线——积压是否全程增长且 ∝ N。若成立，修复方向是
-   alert 侧背压或 dispatch 吞吐（不是扩大缓冲）。
-3. **顺带可做的安全优化**：`bid_mod over = 1h` 对 q13 语义**无用**——q13b 的
-   join 目标是 `side_input` provider **静态表**，bid_mod 只是链路中转窗，
-   没有历史行需求。调小 over（如 1m）可省 1.7–2.8GB，**但需先确认无其他
-   规则把 bid_mod 当 join 目标**（当前只有 q13b 消费）。
+### 已落地：分配器级内存度量（`wf-runtime/src/memory_probe.rs`）
+把内存度量从"bench + 外部 footprint 采样"变成确定性 `cargo test`：
+- `CountingAlloc`：测试构建的 `#[global_allocator]`（包装 `System`，原子计数
+  current/peak）；生产二进制不受影响（wfusion CLI 用 mimalloc）。
+- `MemoryProbe::exclusive()`：取全局锁串行化 + 重置 peak 基线；
+  `peak_growth()` = 相对基线的峰值增量（**规模对比断言用这个**）。
+- 自测：`counts_allocations_and_tracks_peak`、
+  `peak_reflects_concurrent_not_cumulative`。
+- 口径：统计**请求字节**（`Layout::size()`），不含分配器元数据/碎片，
+  系统性低于 RSS——用于**同一测试内的 N vs 3N 对比**，不与 RSS 绝对值对齐。
+
+### 待做：用探针验证预算假说
+1. **在途通道占比**：驱动 q13a→bid_mod→q13b 链（消费故意慢于生产），
+   N 与 3N 两档比 `peak_growth()`。预期：峰值封顶于通道预算（不随 N 线性）
+   → 坐实"预算尺寸问题"；若线性增长 → 另有无界项。
+2. **消融实验（ablation）**：分别只跑 ① 窗口 append、② +each 发 alert
+   （sink 正常 drain）、③ +中间窗链慢消费，比各档 `peak_growth()` 差值
+   → 归因到具体路径。
+3. **验证修复**：调小 `RULE_CHANNEL_CAPACITY`（如 256→32）与/或
+   `SINK_CHANNEL_CAPACITY`，先在测试里看 `peak_growth()` 降幅，再跑 bench 确认
+   EPS 不降（通道是吸波器，过小会损失突发吸收能力——**预期有 EPS/内存
+   权衡，用数据定点**）。
 4. 目标：100M 峰值 < 10GB，EPS 维持 3.2M+。
-5. 修完回归其余高内存 Q（§6），确认是否同源。
+5. 修完回归其余高内存 Q（§6）——若确为通道预算，则 q5/q14/q16/q18/q19/q22
+   很可能**同源**（分片数 × 256 批），一处修复多处受益。
 
 ## 6. 关联
 
