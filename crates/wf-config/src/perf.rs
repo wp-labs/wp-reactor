@@ -186,6 +186,20 @@ rules = "models/rules/c_family.wfl"
         let toml_str = toml::to_string(&cfg).unwrap();
         let parsed: PerfConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed, cfg);
+
+        // cut_append（decode 档）round-trip。
+        let decode = PerfConfig {
+            stages: vec![PerfStage {
+                name: "decode".into(),
+                cut_rules: false,
+                cut_output: false,
+                cut_append: true,
+                rules: None,
+            }],
+        };
+        let toml_str = toml::to_string(&decode).unwrap();
+        let parsed: PerfConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed, decode);
     }
 
     #[test]

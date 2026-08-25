@@ -838,6 +838,17 @@ mod tests {
         }
     }
 
+    /// decode 档（cut_append=true, 2026-08-25）: 注入 + 解码（窗口 append 前即丢）。
+    fn decode_stage() -> PerfStage {
+        PerfStage {
+            name: "decode".into(),
+            cut_rules: false,
+            cut_output: false,
+            cut_append: true,
+            rules: None,
+        }
+    }
+
     /// 无门控 stage（cut 全 false）——只测控制器/哨兵状态机、不测门控翻转的
     /// 测试用它，避免并行测试期间全局 `PERF_CUT_*` 被拉高（会切断其它测试的
     /// 规则求值/输出链，2026-08-25 实测：deferred_q8 EOS 重试 emit 被切 →
@@ -886,6 +897,22 @@ mod tests {
         // 重复轮次：round=1 再来一次 → None（幂等）
         assert!(controller.on_sentinel(1).await.is_none());
         assert_eq!(controller.current(), 2);
+        reset_perf_diag();
+    }
+
+    /// decode 档（cut_append）经哨兵应用与恢复（2026-08-25 补）。
+    #[tokio::test]
+    async fn controller_applies_cut_append_stage() {
+        let _g = serial();
+        init_perf_diag(&test_config(vec![decode_stage(), full_stage()]));
+        let controller = PerfDiagController::new();
+        assert!(perf_cut_append(), "stage 0: decode 档切窗口 append");
+        assert!(!perf_cut_rules());
+        assert!(!perf_cut_output());
+
+        let applied = controller.on_sentinel(0).await.expect("transition");
+        assert_eq!(applied.index, 1);
+        assert!(!perf_cut_append(), "stage 1: full 恢复 append");
         reset_perf_diag();
     }
 

@@ -1429,11 +1429,11 @@ fn make_q19_cut_task() -> (StatsTask, mpsc::Receiver<crate::alert_task::AlertBat
 }
 
 #[tokio::test]
-async fn stats_task_perf_cut_rules_floor_no_emit() {
+async fn stats_task_perf_cut_rules_no_emit() {
     let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    // floor 档（cut_rules）: 归并直通 → 窗口无事件 → 空窗不产出（无 EMIT）。
-    // 恢复后同一数据正常归并 + 输出。全局门控跨 await 持锁（PERF_CUT_SERIAL）——
-    // 否则并行测试期间其它 stats 测试被切（2026-08-25 实测干扰）。
+    // cut_rules 单切（rules 档的 output 侧对照）: 归并直通 → 窗口无事件 →
+    // 空窗不产出（无 EMIT）。恢复后同一数据正常归并 + 输出。全局门控跨
+    // await 持锁（PERF_CUT_SERIAL）——否则并行测试期间其它 stats 测试被切。
     crate::perf_diag::set_perf_cuts(true, false, false);
     let (mut task, mut alert_rx) = make_q19_cut_task();
     push_batch(

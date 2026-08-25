@@ -250,7 +250,9 @@ pub(crate) async fn push_decoded_batch(
 ) -> bool {
     // perf-diag cut_append 门控：解码后即丢（测「注入 + 解码」前序段——不含
     // 窗口 append / fanout / 引擎 / 输出）。哨兵流豁免——测量协议（档位切换 +
-    // EPS 计算）必须活着。普通流被切时直接释放批次, 不占 parse 管线槽位。
+    // EPS 计算）必须活着。普通流被切时直接释放批次, 不占 parse 管线槽位;
+    // 同时**绕过限速与帧/行计数**（limiter/parse_item 指标在门控之后）——
+    // 诊断档语义: 测的是注入+解码的原始速率（2026-08-25 review 补注）。
     if crate::perf_diag::perf_cut_append()
         && stream_name != crate::perf_diag::PERF_SENTINEL_STREAM
     {
