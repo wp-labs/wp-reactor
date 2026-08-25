@@ -655,19 +655,15 @@ pub(super) fn spawn_rule_tasks(
                     && !deferred
                     && !match_consumed_targets.contains(&target);
                 // **yield 中间管道窗口**（本规则是上游生产者）的 each 规则：
-                // - 2026-08-23 起强制单 worker（下游保序——中间窗可能被 Match
-                //   状态机消费，乱序破坏语义）；
-                // - 2026-08-25 q13 放开：当该中间窗**无 Match 消费者**（
-                //   `match_consumed_targets` 不含 target）且本规则非 deferred 时，
-                //   下游（stateless each / stats 可交换聚合）容忍批次乱序——
-                //   q13a 由此 10 shard 并行生产 bid_mod（100M q13 瓶颈：q13b
-                //   分片后 q13a 单 worker ~630k/s 卡全链）。乱序 append 的
-                //   安全网：窗口 watermark 单调 fetch_max、时间驱逐仍受
-                //   min_acked 未读保护、push 消费者 ack 改 fetch_max。
+                // **强制单 worker（2026-08-25 回退）**。q13a 分片一度放开（当中间窗
+                // 无 Match 消费者时），但 10 核并发 row path 高频分配（Event/OutputRecord
+                // /String）让 mimalloc arena 膨胀不归还——30M RSS 9.1GB→40.9GB
+                // （window_bytes 峰值仅 8.7GB，有界）。**内存优先：生产者保持单 worker**，
+                // 待 q13a 列式化（分配量级大降）后再评估放开。下游消费分片（q13b）
+                // 无此问题，保留。
                 let yields_intermediate = intermediate_targets.contains(&target);
-                let intermediate_producer_shard_safe = yields_intermediate
-                    && !deferred
-                    && !match_consumed_targets.contains(&target);
+                // 回退：生产者分片条件恒 false（保留变量/门控结构便于未来放开）。
+                let intermediate_producer_shard_safe = false;
                 let shardable = shard_count > 1
                     && (!consumes_intermediate || intermediate_shard_safe)
                     && (!yields_intermediate || intermediate_producer_shard_safe)
