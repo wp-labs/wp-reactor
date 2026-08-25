@@ -248,6 +248,14 @@ pub(crate) async fn push_decoded_batch(
     metrics: Option<&Arc<RuntimeMetrics>>,
     limiter: Option<&IngestLimiter>,
 ) -> bool {
+    // perf-diag cut_append 门控：解码后即丢（测「注入 + 解码」前序段——不含
+    // 窗口 append / fanout / 引擎 / 输出）。哨兵流豁免——测量协议（档位切换 +
+    // EPS 计算）必须活着。普通流被切时直接释放批次, 不占 parse 管线槽位。
+    if crate::perf_diag::perf_cut_append()
+        && stream_name != crate::perf_diag::PERF_SENTINEL_STREAM
+    {
+        return true;
+    }
     if let Some(limiter) = limiter {
         limiter.acquire(batch.num_rows()).await;
     }
@@ -616,5 +624,81 @@ mod tests {
             process_max.load(Ordering::Relaxed) > 1,
             "processing is outside the lock → parallel"
         );
+    }
+
+    /// cut_append 门控：普通流解码后即丢（不占 parse 管线槽位）; 哨兵流豁免
+    /// （测量协议必须活）。未切时普通流照常进入。
+    #[tokio::test]
+    async fn push_decoded_batch_cut_append_drops_non_sentinel() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema};
+        use wf_engine::window::{Router, WindowRegistry};
+
+        let (parse_tx, mut parse_rx) = mpsc::channel::<ParseItem>(8);
+        let preread = PrereadBudget::new(1024 * 1024);
+        let parse_seq = AtomicU64::new(0);
+        let router = Router::new(WindowRegistry::build(vec![]).expect("registry"));
+        let schema =
+            Arc::new(Schema::new(vec![ArrowField::new("v", DataType::Int64, false)]));
+        let batch = |_stream: &str| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as _],
+            )
+            .unwrap()
+        };
+
+        // 未切: 普通流进入 parse 管线。
+        crate::perf_diag::set_perf_cuts(false, false, false);
+        let ok = push_decoded_batch(
+            &parse_tx,
+            &preread,
+            &parse_seq,
+            "s1",
+            "bid_events",
+            batch("bid_events"),
+            &router,
+            None,
+            None,
+        )
+        .await;
+        assert!(ok);
+        assert!(parse_rx.try_recv().is_ok(), "未切: 普通流进入 parse");
+
+        // cut_append: 普通流解码后即丢; 哨兵流放行。
+        crate::perf_diag::set_perf_cuts(false, false, true);
+        let ok = push_decoded_batch(
+            &parse_tx,
+            &preread,
+            &parse_seq,
+            "s1",
+            "bid_events",
+            batch("bid_events"),
+            &router,
+            None,
+            None,
+        )
+        .await;
+        assert!(ok);
+        assert!(parse_rx.try_recv().is_err(), "cut_append: 普通流被丢");
+
+        let ok = push_decoded_batch(
+            &parse_tx,
+            &preread,
+            &parse_seq,
+            "s1",
+            crate::perf_diag::PERF_SENTINEL_STREAM,
+            batch(crate::perf_diag::PERF_SENTINEL_STREAM),
+            &router,
+            None,
+            None,
+        )
+        .await;
+        assert!(ok);
+        assert!(
+            parse_rx.try_recv().is_ok(),
+            "cut_append: 哨兵流豁免（测量协议必须活）"
+        );
+        crate::perf_diag::reset_perf_diag();
     }
 }

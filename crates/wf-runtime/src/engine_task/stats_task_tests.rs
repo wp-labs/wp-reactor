@@ -1379,6 +1379,96 @@ async fn stats_task_empty_key_jump_emits_no_zero_windows() {
 // P4 last/top 任务接线（Q18/Q19）: rich close 每桶多条目 + 行字段注入 yield
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// perf-diag cuts（2026-08-25 补 stats 缺口）: 与 rule_task 对齐——cut_rules
+// 归并直通（空窗无输出）, cut_output 输出直通（归并正常但 alert 被切）。
+// ---------------------------------------------------------------------------
+
+/// q19 形状任务（top + fmt detail, 门控通过走列式 close）。
+fn make_q19_cut_task() -> (StatsTask, mpsc::Receiver<crate::alert_task::AlertBatch>) {
+    let detail = Expr::FuncCall {
+        qualifier: None,
+        name: "fmt".into(),
+        args: vec![
+            Expr::StringLit("{} {}".into()),
+            Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+            Expr::Field(FieldRef::Qualified("b".into(), "price".into())),
+        ],
+    };
+    make_ranked_task(
+        vec![Expr::Field(FieldRef::Qualified(
+            "b".into(),
+            "auction".into(),
+        ))],
+        vec![StatsMeasurePlan {
+            label: "top_price".into(),
+            source_alias: "b".into(),
+            where_expr: None,
+            agg: StatsAggPlan::Top,
+            field: Some(FieldRef::Qualified("b".into(), "price".into())),
+            arg: Some(2),
+        }],
+        detail,
+    )
+}
+
+#[tokio::test]
+async fn stats_task_perf_cut_rules_floor_no_emit() {
+    // floor 档（cut_rules）: 归并直通 → 窗口无事件 → 空窗不产出（无 EMIT）。
+    // 恢复后同一数据正常归并 + 输出。
+    crate::perf_diag::set_perf_cuts(true, false, false);
+    let (mut task, mut alert_rx) = make_q19_cut_task();
+    push_batch(
+        &mut task,
+        make_bid_batch(&[(100, 1, 1), (300, 2, 1)], 5_000_000_000),
+        1,
+    )
+    .await;
+    task.flush().await;
+    assert!(alert_rx.try_recv().is_err(), "cut_rules: 无归并 → 空窗无输出");
+    crate::perf_diag::reset_perf_diag();
+
+    // 恢复: 同数据重推 → 正常产出（窗口已重置, 重新开窗）。
+    push_batch(
+        &mut task,
+        make_bid_batch(&[(100, 1, 1), (300, 2, 1)], 5_000_000_000),
+        2,
+    )
+    .await;
+    task.flush().await;
+    let alerts = take_alerts(&mut alert_rx);
+    assert_eq!(alerts.len(), 2, "恢复后 top-2 两条");
+}
+
+#[tokio::test]
+async fn stats_task_perf_cut_output_keeps_accumulate_no_emit() {
+    // full 档的对照: cut_output 只切输出链——归并照常（窗口 close 状态正确
+    // 重置）, alert 不投递。恢复后正常输出。
+    crate::perf_diag::set_perf_cuts(false, true, false);
+    let (mut task, mut alert_rx) = make_q19_cut_task();
+    push_batch(
+        &mut task,
+        make_bid_batch(&[(100, 1, 1), (300, 2, 1)], 5_000_000_000),
+        1,
+    )
+    .await;
+    task.flush().await;
+    assert!(alert_rx.try_recv().is_err(), "cut_output: 输出链直通");
+    crate::perf_diag::reset_perf_diag();
+
+    // 恢复: 新窗口数据正常产出（前窗已被 cut_output 正确 close 重置——若泄漏
+    // 会污染本窗输出）。
+    push_batch(
+        &mut task,
+        make_bid_batch(&[(150, 1, 1), (250, 2, 1)], 11_000_000_000),
+        2,
+    )
+    .await;
+    task.flush().await;
+    let alerts = take_alerts(&mut alert_rx);
+    assert_eq!(alerts.len(), 2, "恢复后 top-2 两条（前窗无泄漏）");
+}
+
 #[tokio::test]
 async fn q18_stats_task_last_bid_fields_injected() {
     // Q18 形状: group by (bidder, auction), last(price) —— 每键一条 alert,

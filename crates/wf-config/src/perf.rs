@@ -35,6 +35,10 @@ pub struct PerfStage {
     /// 本档生效期间：禁止输出链。
     #[serde(default)]
     pub cut_output: bool,
+    /// 本档生效期间：禁止窗口 append（解码后即丢, 测「注入 + 解码」前序段;
+    /// 哨兵流豁免——测量协议必须活）。
+    #[serde(default)]
+    pub cut_append: bool,
     /// 规则子集文件路径（相对 work-dir）。空 = 保持当前规则；非空且与当前
     /// 不同 → 触发既有 `runtime.rules` 热 reload（HotReloadSupported）。
     #[serde(default)]
@@ -175,6 +179,7 @@ rules = "models/rules/c_family.wfl"
                 name: "floor".into(),
                 cut_rules: true,
                 cut_output: true,
+                cut_append: false,
                 rules: None,
             }],
         };
