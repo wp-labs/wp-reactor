@@ -42,14 +42,16 @@ use super::{register_notifications, wait_any};
 /// （非逐条, 不引入 §9.9 前的逐桶 await 回压）, 但单次构建峰值从全窗口
 /// （q19 30M ≈ 7.94M 条 / q18 100M ≈ 29.35M 条）降到阈值量级。
 /// `AtomicUsize` 供测试调小阈值以触发分块路径（生产恒 100 万）。
-/// 2026-08-26 q18 close 峰值归因后: **语义是「链数」不是「桶数」**——每链含
-/// 多桶（同 hash 碰撞链）, 实际每批 = 链数 × 桶/链（q18 100M: 100 万链 →
-/// 367 万桶/批 → 装载峰值 4G/批, memory_probe 实测 1094B/行）。
-/// `WF_EMIT_CHUNK` 环境变量可调（生产默认 100 万链; 调小降峰值、代价是
+/// 2026-08-26 q18 close 峰值归因后: `take_buckets_up_to(n)` 的 `n` 是**目标
+/// 桶数**（`retain` 回调按已取桶数 `out.len()` 判定）——但因**整链取出**
+/// （同 hash 碰撞链一次取空），实际每批可能超 n（q18 每链 ~3.67 桶：
+/// 100 万目标 → 367 万桶/批 → 装载峰值 4G/批, memory_probe 实测 1094B/行）。
+/// `WF_EMIT_CHUNK` 环境变量可调（生产默认 100 万桶目标; 调小降峰值、代价是
 /// 更多批次投递——用数据定点）。
 static EMIT_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1_000_000);
 
 /// 生产可配置（2026-08-26）: `WF_EMIT_CHUNK` 覆盖默认值（首次调用生效）。
+/// 默认 100 万 = close 分块的目标桶数（整链取会超，见上方注释）。
 fn emit_chunk() -> usize {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {

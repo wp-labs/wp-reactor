@@ -1600,6 +1600,54 @@ fn q18_close_batch(n: usize) -> RecordBatch {
     .unwrap()
 }
 
+/// 回归断言（非 ignore，常规测试）: 链 Vec `with_capacity(1)` 修复钉死——
+/// q18 每键独立 hash（链均长 1.0）时，每链容量必须精确 1（不能退回
+/// `or_default()` 的 capacity=4，否则 2935 万链 × 144B ≈ 4.2G 浪费）。
+/// 用 CountingAlloc 实测状态持有 vs 期望上界（宽松断言防平台差异）。
+#[test]
+fn q18_state_chain_capacity_bounded() {
+    const N: usize = 200_000;
+    let row_fields: Arc<std::collections::HashSet<String>> = Arc::new(
+        ["auction", "bidder", "price", "channel", "url", "dateTime"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    );
+    let mut exec = StatsExecutor::with_row_fields(q18_close_stats_plan(), Some(row_fields));
+    let batch = q18_close_batch(N);
+    assert!(exec.process_batch(&batch), "列式前置应满足");
+
+    // 链容量断言：每条链 capacity == 1（无碰撞时，每链 1 桶）。
+    // q18 键域 auction 200 万 + bidder 1010 → N=20 万行几乎无碰撞。
+    let max_cap = exec
+        .window
+        .buckets
+        .values()
+        .map(|c| c.capacity())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_cap <= 2,
+        "链 Vec 容量应精确 1（或碰撞链 2），实测 max_capacity={max_cap}——若退回 or_default() 会到 4"
+    );
+    let n_chains = exec.window.buckets.len();
+    assert!(n_chains > N / 2, "N=20 万应几乎每行一键，实际 {n_chains}");
+
+    // 状态持有上界（CountingAlloc 实测）：每桶 ≤ 800B（633B 实测 + 余量）。
+    // 若退回 or_default()（capacity 4），每桶 ~777B 仍在此界内——本断言主要
+    // 防「未来把状态改成意外的大结构」导致回归无感知。
+    let per_bucket = {
+        let probe = crate::memory_probe::MemoryProbe::exclusive();
+        let _ = probe.peak_growth();
+        let current = probe.current();
+        current as f64 / n_chains.max(1) as f64
+    };
+    assert!(
+        per_bucket < 1000.0,
+        "每桶状态持有应 < 1000B，实测 {per_bucket:.0}B/桶"
+    );
+}
+
 #[test]
 #[ignore = "measurement: cargo test --release -p wf-runtime q18_close_alloc_footprint -- --ignored --nocapture"]
 fn q18_close_alloc_footprint() {
@@ -1713,6 +1761,36 @@ fn q18_close_alloc_footprint() {
                 );
                 peak
             };
+
+            // 扁平键对比：`HashMap<(i64,i64), ()>` 直接做键（无 ScopeKey 树/无中间
+            // hash 层）——量化「q18 双 int 键专用扁平化」的上限收益。
+            let flat_key_overhead = {
+                use std::collections::HashMap as StdHashMap;
+                let probe = crate::memory_probe::MemoryProbe::exclusive();
+                let mut m: StdHashMap<(i64, i64), ()> = StdHashMap::new();
+                for i in 0..n_buckets {
+                    m.insert((i as i64, (i as i64) % 1010), ());
+                }
+                let peak = probe.peak_growth();
+                eprintln!(
+                    "[q18-state-hold] HashMap<(i64,i64),()> {} 桶容器开销 = {:.1}MB ({:.0}B/桶)【扁平键】",
+                    n_buckets,
+                    peak as f64 / 1e6,
+                    peak as f64 / n_buckets.max(1) as f64,
+                );
+                peak
+            };
+            let state_flat_proj = state_hold as f64
+                - (sum_bucket_stack + sum_scopes + sum_chain_cap + hashmap_bytes) as f64
+                + flat_key_overhead as f64;
+            eprintln!(
+                "[q18-state-hold] 扁平键投影: 去掉 scopeKey树+StatsBucket包+中间hash层 → 预计 {:.1}MB ({:.0}B/桶) vs 当前 {:.1}MB ({:.0}B/桶)",
+                state_flat_proj / 1e6,
+                state_flat_proj / n_buckets.max(1) as f64,
+                state_hold as f64 / 1e6,
+                state_hold as f64 / n_buckets.max(1) as f64,
+            );
+            assert!(n_buckets > 0);
             eprintln!(
                 "[q18-state-hold] 容器差 = CountingAlloc {} - 求和链 {} = {:.1}MB",
                 hm_overhead as f64 / 1e6,
@@ -1740,24 +1818,6 @@ fn q18_close_alloc_footprint() {
             peak
         };
 
-        // 阶段 ③：execute_stats_close_batch_columnar 直装载（alert 列）。
-        // 需 RuleExecutor（spawn 侧由同一 stats 计划装配）——此处用
-        // `stats_close_rule_executor` 构造同形 RuleExecutor（yield 计划与
-        // q18 一致：id/alert_type/detail/request_count）。
-        // 重新建桶（阶段 ② 已取光状态），模拟独立 close 批。
-        let exec3 = {
-            let row_fields3: Arc<std::collections::HashSet<String>> = Arc::new(
-                ["auction", "bidder", "price", "channel", "url", "dateTime"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            );
-            let mut e = StatsExecutor::with_row_fields(q18_close_stats_plan(), Some(row_fields3));
-            let b3 = q18_close_batch(n_buckets);
-            let ok = e.process_batch(&b3);
-            assert!(ok, "列式前置应满足");
-            e
-        };
         // 阶段 ③：execute_stats_close_batch_columnar 直装载（alert 列）。
         // 需 RuleExecutor（spawn 侧由同一 stats 计划装配）——此处用
         // `stats_close_rule_executor` 构造同形 RuleExecutor（yield 计划与
