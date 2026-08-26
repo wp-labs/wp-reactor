@@ -403,6 +403,14 @@ impl CepStateMachine {
             }
         };
 
+        // H1（2026-08-26，q5 hop 键 churn）：typed skey 提升到窗口扇出循环外。
+        // 原先每窗口各自 `scope_key_from_values` 重建 + `scope_key.clone()`
+        // （Vec<Value> 堆分配）——hop(10s,2s) 每事件 5 窗口 = 5 次重建 + 5 次
+        // 分配；skey 只建一次，非命中窗口零分配（ctx 仅在命中时 to_vec，成本
+        // 与旧每次 clone 相同，命中最坏持平、非命中纯省）。语义不变：
+        // scope_key_from_values 确定性纯函数，同输入同结果（对拍测试锁定）。
+        let skey = scope_key_from_values(&scope_key);
+
         // Build per-window routing. HOP windows (size, slide): one event belongs
         // to `size/slide` overlapping windows aligned to epoch slide boundaries;
         // each (scope x window_start) is a separate instance (fixed-style keys).
@@ -422,7 +430,8 @@ impl CepStateMachine {
                         row,
                         masks,
                         capture_progress,
-                        scope_key.clone(),
+                        &scope_key,
+                        &skey,
                         Some(k * slide_ns),
                     );
                     best = Some(match best {
@@ -442,7 +451,8 @@ impl CepStateMachine {
                     row,
                     masks,
                     capture_progress,
-                    scope_key,
+                    &scope_key,
+                    &skey,
                     Some(bucket_start),
                 ));
             }
@@ -455,7 +465,8 @@ impl CepStateMachine {
                     row,
                     masks,
                     capture_progress,
-                    scope_key,
+                    &scope_key,
+                    &skey,
                     None,
                 ));
             }
@@ -467,7 +478,7 @@ impl CepStateMachine {
     /// carry `window_start`; sliding/session pass `None`). Extracted from
     /// `advance_at_with_diagnostics` so HOP can fan a single event out to
     /// every covering window.
-    #[allow(clippy::too_many_arguments)] // HOP 扇出: 事件/时间/查找/掩码/行/进度/窗口键 7 组参数
+    #[allow(clippy::too_many_arguments)] // HOP 扇出: 事件/时间/查找/掩码/行/进度/键借用/窗口键 8 组参数
     fn advance_window<E: FieldSource>(
         &mut self,
         alias: &str,
@@ -477,13 +488,13 @@ impl CepStateMachine {
         row: usize,
         masks: Option<&GuardMasks>,
         capture_progress: bool,
-        scope_key: Vec<Value>,
+        scope_key: &[Value],
+        skey: &ScopeKey,
         window_start: Option<i64>,
     ) -> StepOutcome {
-        let skey = scope_key_from_values(&scope_key);
         let instance_key = match window_start {
-            Some(ws) => InstanceKey::fixed(&skey, ws),
-            None => InstanceKey::sliding(&skey),
+            Some(ws) => InstanceKey::fixed(skey, ws),
+            None => InstanceKey::sliding(skey),
         };
         // 2. Get or create instance (with limits check)
         let is_new = !self.instances.contains_key(&instance_key);
@@ -556,7 +567,7 @@ impl CepStateMachine {
         // corrected by periodic `recalibrate_memory`).
         let new_base = if is_new && self.tracks_memory_bytes() {
             Some(Instance::base_estimated_bytes(
-                &self.plan, &scope_key, alias, event,
+                &self.plan, scope_key, alias, event,
             ))
         } else {
             None
@@ -628,7 +639,7 @@ impl CepStateMachine {
                                 // Current key will be re-created — account for base cost
                                 if evicting_current && !is_new {
                                     total += Instance::base_estimated_bytes(
-                                        &self.plan, &scope_key, alias, event,
+                                        &self.plan, scope_key, alias, event,
                                     );
                                 }
                             } else {
@@ -842,7 +853,7 @@ impl CepStateMachine {
                         .unwrap_or((now_nanos, now_nanos));
                 let ctx = MatchedContext {
                     rule_name: self.rule_name.clone(),
-                    scope_key,
+                    scope_key: scope_key.to_vec(),
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
                     event_time_nanos: now_nanos,
@@ -905,7 +916,7 @@ impl CepStateMachine {
                         windows,
                         progress: capture_progress.then_some(StepProgressCapture {
                             rule_name: &self.rule_name,
-                            scope_key: &scope_key,
+                            scope_key,
                             machine_id: &instance.machine_id,
                             step_index: step_idx,
                         }),
@@ -1054,7 +1065,7 @@ impl CepStateMachine {
                         .unwrap_or((now_nanos, now_nanos));
                 let ctx = MatchedContext {
                     rule_name: self.rule_name.clone(),
-                    scope_key,
+                    scope_key: scope_key.to_vec(),
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
                     event_time_nanos: now_nanos,
@@ -1115,7 +1126,7 @@ impl CepStateMachine {
                         .unwrap_or((now_nanos, now_nanos));
                 let ctx = MatchedContext {
                     rule_name: self.rule_name.clone(),
-                    scope_key,
+                    scope_key: scope_key.to_vec(),
                     step_data: instance.completed_steps.clone(),
                     bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
                     event_time_nanos: now_nanos,
