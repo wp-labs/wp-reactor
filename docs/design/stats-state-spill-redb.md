@@ -310,16 +310,28 @@ rule q18_last_bid_stats {
 
 **结论**：
 1. **take 只读化 + touch 计数器对 EPS 无明显改善**——回访写事务不是主瓶颈
-2. **主瓶颈 = close 期全量 drain**（run6 日志: `task group "rules" join timed out after 60s, aborting`）：
-   drain 5.6GB + 并入桶表 + 输出 8.8M alert 同驻留 → 内存/时间双爆
-3. redb 行为两个坑（已修/缓解）：
+2. **主瓶颈 = close 期全量 drain + 内存峰值超物理内存 → swap 风暴**：
+   - run8/9/10 日志实锤: `task group "rules" join timed out after 60s, aborting`
+     ——close 期 43GB RSS（drain 5.6GB + 并入桶表 + 输出同驻留）超出 68.7GB
+     物理内存的可用部分（系统 swap 已用 20.6GB, Swapins 4750 万次）→ 换页
+     风暴 → close >60s 挂起（磁盘 22GB 空闲下复现——**不是磁盘满**）
+   - 处理期 RSS 稳定 ~8GB（256MB×10 状态 + 窗口/parse 基座）——**有界性 ✓**
+3. **数据热点验证（30M 生成器实测, 与跑批键数 8,811,730 完全吻合）**：
+   - 74.1% 键只出现 1 次（死键）; top 0.1% 键（8811 个）占 19.1% 引用、
+     top 1% 占 40.7%——强热点（官方滚动热点: bidder 75% 批次热点 +
+     auction 50% 批次热点）
+   - spill 理论完全成立（内存只留 ~1% 热点键 ≈ 几十 MB, 74% 死键可驱逐）
+   - 处理期 8GB 有界即证据; 剩余问题全在 close
+4. redb 行为两个坑（已修/缓解）：
    - `Durability::None` 脏页滞留内存（RSS 处理期爬升）→ 每 8 批一次 Immediate
      周期 flush（redb 连带持久化之前所有 None 提交）
    - 全量 `Immediate` 使 close drain 变磁盘读（更慢）→ 默认 None + 周期 flush
-4. **抖动观测已接入**：close 时 wf_warn 打「驱逐数/读回数/读回率」（
-   `spill_evictions`/`spill_readbacks` 计数器跨窗口保留）
+5. **抖动观测已接入**：close 时 log::warn 打「驱逐数/读回数/读回率」（
+   `spill_evictions`/`spill_readbacks` 计数器跨窗口保留; 注意 wf_warn/tracing
+   被 daemon 日志过滤器拦截, 必须用 log crate）
 
 **定论**：先做**流式 close drain**（drain 分批 + 与 take_buckets_up_to 归并排序输出），
+把 close 峰值从 43GB 降到 ~批大小（10 万键 ≈ 70MB）——不触发 swap, close 快速完成。
 其余优化（读回摊销/预算匹配）在其后按新数据决定。
 
 ## 14. 风险与缓解
