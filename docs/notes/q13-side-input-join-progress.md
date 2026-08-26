@@ -1557,6 +1557,22 @@ events）；存在 Single/Sharded 订阅 → `take_events` + `broadcast_with_bat
   分配水位的代理指标。
 - 勿回退 q13a 分片（30M 已达标，回退是倒退）；100M 先看 lag 时间曲线再动手。
 
+## 2026-08-26 内存定位完结：机制闭环 + 首个有效修复（f64 快车道，EPS +40%、dirty −43%）
+
+**定位结论**：q13b 30M 内存 = 流水线在途积压（footprint：跑批中 dirty 13G、
+停止注入 1s 后 4.4G），∝ 每行 CPU（fill 占列式路径 96%）。二分（6 轮短路消融）：
+alert 构建段 9.7G = 列装载 6.1G（值进列总量，与 push 方式无关——moved 批式
+无效已证）+ 3.6G。
+
+**修复**：q13b 列式 join 路径对齐无 join 路径（939）的 f64 快车道 + entity
+值复用（`id=m.bidder` 与 entity 同列数字 → stage_yield_cell_f64 直写，跳过
+Value/coerce 中转）→ **EPS 5.40M→7.57M（+40%）、跑批中 dirty 13→7.4G
+（−43%）**。首次正向验证「每行 CPU → 在途 → 内存」闭环。
+
+**遗留**：bench RSS_peak 采样不稳定（5-14G 波动，判内存用 MEMORY=1 diag +
+fp 探针）；detail（Right join 值）无快车道；列值总量仍决定水位上限。
+完整记录 `issues/q13-memory-peak-scales-with-volume.md` §10-12。
+
 ## 2026-08-26 over 调小实验：`bid_events/bid_mod → 10m`——无效，已回退
 
 用户假设内存随数据量上升 ∝ over 保留量，要求把两窗都改 10m 实测。

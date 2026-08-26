@@ -495,3 +495,44 @@ over 同时调到 10m，窗口保留应显著缩小，RSS 应随之下落。
   消化速率升 → 在途积压降 → 30M dirty 13G → 预计 ~8G。
 - 每步用 `cargo test --release each_bench / q13b_join_bench` 测 CPU，
   `MEMORY=1 diag q13 30m` + fp 探针测内存，数据驱动。
+
+---
+
+## 12. 首个有效修复：q13b f64 快车道 + entity 复用（2026-08-26）——
+    EPS +40%、dirty −43%，闭环「每行 CPU → 在途 → 内存」
+
+### 改动（对齐无 join 列式路径 939 的现成优化）
+`execute_each_direct_batch_columnar_join`（1693）移植 939 路径已有的两个
+列式直写：
+1. **f64 快车道**（939 路径 1341）：yield 字段与 entity 同一左列（q13b
+   `id=m.bidder` == `entity(digit, m.bidder)`）且目标数字类型 →
+   `stage_yield_cell_f64` 直接写，跳过每行 `value_at` + `Value::Number`
+   构造 + `coerce` 中转。
+2. **entity 值复用**（939 路径 1357）：同列 yield 字段复用已读的
+   `entity_val`，不重读列。
+
+### 实测（q13 replay 30M，同一二进制/帧/配置）
+| 指标 | 前 | 后 |
+|---|---|---|
+| EPS（哨兵） | 5.40M | **7.57M（+40%）** |
+| 跑批中 dirty（fp 采样） | 13G | **7.4G（−43%）** |
+| 跑批中 RSS（fp 采样） | 13.2G | 9.4G |
+| q13b_join_bench | 382.6 ns/row | 371.5 ns/row |
+| 30M full ΔRSS（墙梯） | 10.5G | 10.6G（墙梯口径不变） |
+
+### 意义（完整闭环首次实证）
+§11 的机制链「内存 = 在途积压 ∝ 每行 CPU」**首次被正向验证**：f64 快车道
+降每行 CPU → 消化速率升 → 在途积压减半 → dirty 13→7.4G。**性能与内存同源，
+优化性能即优化内存**。
+
+### ⚠ bench RSS_peak 波动（5.1G / 14.2G 两次）
+f64 后两次 bench RSS_peak 分别 5.1G/14.2G——**RSS_peak 采样器不稳定**
+（采样周期 vs 峰值持续窗口不匹配：峰值短暂时漏采）。判内存用
+`MEMORY=1 diag` + fp 探针（整程/密集采样）为准，bench RSS_peak 单次不可信。
+
+### 剩余
+- **detail（Right join 值）**是 fill 里最后的大项（每行 `matched.field_value`
+  + fmt 渲染 + stage）——无现成快车道，可后续做字符串快车道。
+- 列值总量（12 列/行）仍决定水位上限：常量列（alert_type/request_count）
+  免每行 cell、fired_at 列式 i64、yield 数字列原生——都是后续治本项。
+- 100M 未复测（待确认 100M 下 dirty 是否同样降）。
