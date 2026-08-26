@@ -50,7 +50,7 @@
 ```
 注入（客户端读盘 → TCP）→ daemon recv → decode（Arrow IPC）
   → 窗口 append（actor）→ 规则（each / match / close / stats）
-  → 输出（serialize → channel → sink）
+  → 输出（构建→通道 → sink 物化+序列化+写）
 ```
 
 每段的度量：

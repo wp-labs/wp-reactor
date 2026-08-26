@@ -348,16 +348,16 @@ pub(super) struct RuleTask {
     advance_nanos: u64,
     scan_nanos: u64,
     emit_nanos: u64,
-    /// Finer emit split: execute_match / to_data_record / fanout handoff.
-    /// The to_data_record time is also exported as the `alert.serialize_nanos`
-    /// metric (summed across the run).
+    /// Finer emit split: execute_match / record→列 append / fanout handoff.
+    /// The append time is also exported as the `alert.append_nanos` metric
+    /// (summed across the run).
     exec_nanos: u64,
     /// Finer emit split: execute_close_with_joins (close path output record
     /// construction) — the q12 hot spot; kept separate from `emit_nanos` so the
     /// per-record build vs. the batch append hand-off can be read from the
     /// profiling dump.
     close_exec_nanos: u64,
-    serialize_nanos: std::sync::atomic::AtomicU64,
+    append_nanos: std::sync::atomic::AtomicU64,
     fanout_nanos: std::sync::atomic::AtomicU64,
     /// Last wall-clock dump of the profiling accumulators (throttled log).
     last_profile_dump: std::time::Instant,
@@ -372,9 +372,9 @@ pub(super) struct RuleTask {
     progress: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Countdown for sampling the allocation-heavy per-alert telemetry.
     emit_sample_remaining: AtomicU32,
-    /// Serialize-timing sampler state (1-in-`EMIT_METRIC_SAMPLE_INTERVAL`),
+    /// Append-timing sampler state (1-in-`EMIT_METRIC_SAMPLE_INTERVAL`),
     /// see `emit`.
-    serialize_sample_remaining: AtomicU32,
+    append_sample_remaining: AtomicU32,
     /// Last value reported to the `rule_instances` gauge. The gauge is the sum
     /// across a rule's shards, so each shard reports the delta since its last
     /// report (P2b).
@@ -570,12 +570,12 @@ impl RuleTask {
             emit_nanos: 0,
             exec_nanos: 0,
             close_exec_nanos: 0,
-            serialize_nanos: std::sync::atomic::AtomicU64::new(0),
+            append_nanos: std::sync::atomic::AtomicU64::new(0),
             fanout_nanos: std::sync::atomic::AtomicU64::new(0),
             last_profile_dump: std::time::Instant::now(),
             cached_wall_nanos: AtomicU64::new(wall_nanos()),
             emit_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
-            serialize_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
+            append_sample_remaining: AtomicU32::new(EMIT_METRIC_SAMPLE_INTERVAL),
             last_reported_instances: AtomicI64::new(0),
             pending_alerts: std::sync::Mutex::new(PendingAlertColumns::default()),
             pipe_state: std::sync::Mutex::new(PipeState::Uninit),
@@ -1784,7 +1784,7 @@ impl RuleTask {
         self.dump_profiling();
         // Columnar match emit (q6 形态): one pending lock, one target lookup,
         // one columnar batch commit — no per-match OutputRecord. Metrics mirror
-        // the per-record path (exact totals; serialize-failed for eval failures).
+        // the per-record path (exact totals; append-failed for eval failures).
         if match_columnar && !match_rows.is_empty() {
             let row_refs: Vec<&wf_engine::match_engine::MatchedContext> =
                 match_rows.iter().collect();
@@ -1821,7 +1821,7 @@ impl RuleTask {
                     metrics.inc_alert_emitted_total(self.rule_name());
                 }
                 for _ in 0..outcome.failed {
-                    metrics.inc_alert_serialize_failed();
+                    metrics.inc_alert_append_failed();
                 }
             }
             if should_flush {
@@ -1831,7 +1831,7 @@ impl RuleTask {
         // Vectorized close emit for gate-passing rules (L4): one pending lock,
         // one target lookup, one columnar batch commit — no per-close
         // OutputRecord / synthetic ctx. Metrics mirror the per-record path
-        // (exact totals; serialize-failed increments for eval failures).
+        // (exact totals; append-failed increments for eval failures).
         if close_columnar && !columnar_closes.is_empty() {
             let _close_exec_start = rule_profiling();
             let (outcome, should_flush) = {
@@ -1868,7 +1868,7 @@ impl RuleTask {
                     metrics.inc_alert_emitted_total(self.rule_name());
                 }
                 for _ in 0..outcome.failed {
-                    metrics.inc_alert_serialize_failed();
+                    metrics.inc_alert_append_failed();
                 }
             }
             if should_flush {
@@ -1901,7 +1901,7 @@ impl RuleTask {
             advance_nanos = self.advance_nanos,
             exec_nanos = self.exec_nanos,
             close_exec_nanos = self.close_exec_nanos,
-            serialize_nanos = self.serialize_nanos.load(Ordering::Relaxed),
+            append_nanos = self.append_nanos.load(Ordering::Relaxed),
             fanout_nanos = self.fanout_nanos.load(Ordering::Relaxed),
             emit_nanos = self.emit_nanos,
             "rule profiling"
@@ -2666,7 +2666,7 @@ impl RuleTask {
             }
         }
         // perf-diag cut_output 门控：emitted 计数已保留（上面），跳过
-        // serialize/append/stage/commit/fanout——输出链整体直通。
+        // record→列构建/通道/sink 物化+序列化+写——输出链整体直通。
         if crate::perf_diag::perf_cut_output() {
             return;
         }
@@ -2677,7 +2677,7 @@ impl RuleTask {
         // here and freed on a sink thread drive mimalloc into its
         // abandoned-page reclaim path — measured ~2x rule-throughput loss.
         //
-        // Serialize timing is sampled 1-in-`EMIT_METRIC_SAMPLE_INTERVAL` and
+        // Append timing is sampled 1-in-`EMIT_METRIC_SAMPLE_INTERVAL` and
         // scaled back up (same sampling pattern as the e2e metrics): two
         // clock_gettime calls per record measured ~2.5% of on-CPU samples,
         // and the per-record timing only feeds diagnostics, not semantics.
@@ -2685,17 +2685,17 @@ impl RuleTask {
         // old to_data_record conversion.)
         let time_this = {
             let rem = self
-                .serialize_sample_remaining
+                .append_sample_remaining
                 .fetch_sub(1, Ordering::Relaxed);
             if rem == 1 {
-                self.serialize_sample_remaining
+                self.append_sample_remaining
                     .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
                 true
             } else {
                 false
             }
         };
-        let _ser_start = time_this.then(Instant::now);
+        let _append_start = time_this.then(Instant::now);
         let (append_result, should_flush) = {
             let mut pending = self.pending_alerts.lock().unwrap();
             // Linear target lookup (targets are few); avoids hashing the
@@ -2723,17 +2723,17 @@ impl RuleTask {
         };
         if let Err(e) = append_result {
             if let Some(metrics) = &self.metrics {
-                metrics.inc_alert_serialize_failed();
+                metrics.inc_alert_append_failed();
             }
             log::warn!("alert export error: {e}");
             return;
         }
-        if let Some(start) = _ser_start {
+        if let Some(start) = _append_start {
             let elapsed = start.elapsed().as_nanos() as u64;
             let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64;
-            self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
+            self.append_nanos.fetch_add(scaled, Ordering::Relaxed);
             if let Some(metrics) = &self.metrics {
-                metrics.add_alert_serialize_nanos(scaled);
+                metrics.add_alert_append_nanos(scaled);
             }
         }
         if should_flush {
@@ -2745,7 +2745,7 @@ impl RuleTask {
     /// records to the per-target columnar builder under **one** pending lock
     /// and one target lookup, flushing when the pending batch fills. Records
     /// are appended in order; telemetry is exact (same counters as
-    /// [`Self::emit`]); the serialize timing covers the whole group and is
+    /// [`Self::emit`]); the append timing covers the whole group and is
     /// sampled 1-in-`EMIT_METRIC_SAMPLE_INTERVAL` (scaled by group size) —
     /// same diagnostic shape as the per-record sampler.
     ///
@@ -2805,17 +2805,17 @@ impl RuleTask {
         }
         let time_this = {
             let rem = self
-                .serialize_sample_remaining
+                .append_sample_remaining
                 .fetch_sub(1, Ordering::Relaxed);
             if rem == 1 {
-                self.serialize_sample_remaining
+                self.append_sample_remaining
                     .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
                 true
             } else {
                 false
             }
         };
-        let _ser_start = time_this.then(Instant::now);
+        let _append_start = time_this.then(Instant::now);
         let should_flush = {
             let mut pending = self.pending_alerts.lock().unwrap();
             let target = &sink_records[0].yield_target;
@@ -2845,21 +2845,21 @@ impl RuleTask {
                 && let Some(metrics) = &self.metrics
             {
                 for _ in 0..failed {
-                    metrics.inc_alert_serialize_failed();
+                    metrics.inc_alert_append_failed();
                 }
             }
             pending.count >= ALERT_BATCH_SIZE
         };
-        if let Some(start) = _ser_start {
+        if let Some(start) = _append_start {
             // Sampled 1-in-64 *batches* (the sampler decrements once per group),
             // so the report scales the group's append time by
             // EMIT_METRIC_SAMPLE_INTERVAL only — multiplying by the group size
             // as well double-counted (group duration already covers all n rows).
             let elapsed = start.elapsed().as_nanos() as u64;
             let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64;
-            self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
+            self.append_nanos.fetch_add(scaled, Ordering::Relaxed);
             if let Some(metrics) = &self.metrics {
-                metrics.add_alert_serialize_nanos(scaled);
+                metrics.add_alert_append_nanos(scaled);
             }
         }
         if should_flush {
@@ -2880,7 +2880,7 @@ impl RuleTask {
     /// Direct-write on-each emit (plan C2): the executor evaluates the event
     /// and appends the row straight into the per-target columnar builder —
     /// no per-record `OutputRecord` materialization. Mirrors [`Self::emit`]'s
-    /// telemetry (exact totals, 1-in-N sampled detail/e2e, sampled serialize
+    /// telemetry (exact totals, 1-in-N sampled detail/e2e, sampled append
     /// timing) and batch-flush trigger.
     ///
     /// One diagnostic difference from the record path: the sampled detail's
@@ -2900,21 +2900,21 @@ impl RuleTask {
         if crate::perf_diag::perf_cut_output() {
             return Ok(false);
         }
-        // Serialize timing is sampled 1-in-N and scaled back up (same
+        // Append timing is sampled 1-in-N and scaled back up (same
         // pattern as `emit`; covers the eval + column append).
         let time_this = {
             let rem = self
-                .serialize_sample_remaining
+                .append_sample_remaining
                 .fetch_sub(1, Ordering::Relaxed);
             if rem == 1 {
-                self.serialize_sample_remaining
+                self.append_sample_remaining
                     .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
                 true
             } else {
                 false
             }
         };
-        let _ser_start = time_this.then(Instant::now);
+        let _append_start = time_this.then(Instant::now);
         let (result, should_flush) = {
             let mut pending = self.pending_alerts.lock().unwrap();
             // Linear target lookup via the plan-constant Arc (targets are
@@ -2972,16 +2972,16 @@ impl RuleTask {
             }
         } else if let Err(e) = &result {
             if let Some(metrics) = &self.metrics {
-                metrics.inc_alert_serialize_failed();
+                metrics.inc_alert_append_failed();
             }
             log::warn!("alert export error: {e}");
         }
-        if let Some(start) = _ser_start {
+        if let Some(start) = _append_start {
             let elapsed = start.elapsed().as_nanos() as u64;
             let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64;
-            self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
+            self.append_nanos.fetch_add(scaled, Ordering::Relaxed);
             if let Some(metrics) = &self.metrics {
-                metrics.add_alert_serialize_nanos(scaled);
+                metrics.add_alert_append_nanos(scaled);
             }
         }
         if should_flush {
@@ -2998,7 +2998,7 @@ impl RuleTask {
     ///
     /// Telemetry mirrors [`Self::emit_each_direct`]: exact `emitted_total`
     /// per appended row (via the appended-index list, outside the builder
-    /// lock), 1-in-N sampled detail/e2e per appended row, and serialize
+    /// lock), 1-in-N sampled detail/e2e per appended row, and append
     /// timing sampled per segment and scaled by the per-call average (a
     /// segment covers many "calls", so the scaled estimate stays comparable
     /// to the per-event path's accounting).
@@ -3021,17 +3021,17 @@ impl RuleTask {
             let calls = segment.len();
             let time_this = {
                 let rem = self
-                    .serialize_sample_remaining
+                    .append_sample_remaining
                     .fetch_sub(1, Ordering::Relaxed);
                 if rem == 1 {
-                    self.serialize_sample_remaining
+                    self.append_sample_remaining
                         .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
                     true
                 } else {
                     false
                 }
             };
-            let _ser_start = time_this.then(Instant::now);
+            let _append_start = time_this.then(Instant::now);
             let (outcome, should_flush) = {
                 let mut pending = self.pending_alerts.lock().unwrap();
                 // Linear target lookup via the plan-constant Arc — same as
@@ -3088,19 +3088,19 @@ impl RuleTask {
                     }
                 }
                 for _ in 0..outcome.failed {
-                    metrics.inc_alert_serialize_failed();
+                    metrics.inc_alert_append_failed();
                 }
             }
-            if let Some(ser_start) = _ser_start {
-                let elapsed = ser_start.elapsed().as_nanos() as u64;
+            if let Some(append_start) = _append_start {
+                let elapsed = append_start.elapsed().as_nanos() as u64;
                 // A segment covers `calls` per-event "calls"; scale the
                 // sampled segment time back to the per-call average × the
                 // sample interval so the accumulator stays comparable with
                 // the per-event path's accounting.
                 let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64 / calls.max(1) as u64;
-                self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
+                self.append_nanos.fetch_add(scaled, Ordering::Relaxed);
                 if let Some(metrics) = &self.metrics {
-                    metrics.add_alert_serialize_nanos(scaled);
+                    metrics.add_alert_append_nanos(scaled);
                 }
             }
             if should_flush {
@@ -3138,17 +3138,17 @@ impl RuleTask {
             let calls = segment.len();
             let time_this = {
                 let rem = self
-                    .serialize_sample_remaining
+                    .append_sample_remaining
                     .fetch_sub(1, Ordering::Relaxed);
                 if rem == 1 {
-                    self.serialize_sample_remaining
+                    self.append_sample_remaining
                         .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
                     true
                 } else {
                     false
                 }
             };
-            let _ser_start = time_this.then(Instant::now);
+            let _append_start = time_this.then(Instant::now);
             let (outcome, should_flush) = {
                 let mut pending = self.pending_alerts.lock().unwrap();
                 let target = self.executor.static_yield_target();
@@ -3201,15 +3201,15 @@ impl RuleTask {
                     }
                 }
                 for _ in 0..outcome.failed {
-                    metrics.inc_alert_serialize_failed();
+                    metrics.inc_alert_append_failed();
                 }
             }
-            if let Some(ser_start) = _ser_start {
-                let elapsed = ser_start.elapsed().as_nanos() as u64;
+            if let Some(append_start) = _append_start {
+                let elapsed = append_start.elapsed().as_nanos() as u64;
                 let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64 / calls.max(1) as u64;
-                self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
+                self.append_nanos.fetch_add(scaled, Ordering::Relaxed);
                 if let Some(metrics) = &self.metrics {
-                    metrics.add_alert_serialize_nanos(scaled);
+                    metrics.add_alert_append_nanos(scaled);
                 }
             }
             if should_flush {
@@ -3242,17 +3242,17 @@ impl RuleTask {
             let calls = segment.len();
             let time_this = {
                 let rem = self
-                    .serialize_sample_remaining
+                    .append_sample_remaining
                     .fetch_sub(1, Ordering::Relaxed);
                 if rem == 1 {
-                    self.serialize_sample_remaining
+                    self.append_sample_remaining
                         .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
                     true
                 } else {
                     false
                 }
             };
-            let _ser_start = time_this.then(Instant::now);
+            let _append_start = time_this.then(Instant::now);
             let (outcome, should_flush) = {
                 let mut pending = self.pending_alerts.lock().unwrap();
                 let target = self.executor.static_yield_target();
@@ -3305,15 +3305,15 @@ impl RuleTask {
                     }
                 }
                 for _ in 0..outcome.failed {
-                    metrics.inc_alert_serialize_failed();
+                    metrics.inc_alert_append_failed();
                 }
             }
-            if let Some(ser_start) = _ser_start {
-                let elapsed = ser_start.elapsed().as_nanos() as u64;
+            if let Some(append_start) = _append_start {
+                let elapsed = append_start.elapsed().as_nanos() as u64;
                 let scaled = elapsed * EMIT_METRIC_SAMPLE_INTERVAL as u64 / calls.max(1) as u64;
-                self.serialize_nanos.fetch_add(scaled, Ordering::Relaxed);
+                self.append_nanos.fetch_add(scaled, Ordering::Relaxed);
                 if let Some(metrics) = &self.metrics {
-                    metrics.add_alert_serialize_nanos(scaled);
+                    metrics.add_alert_append_nanos(scaled);
                 }
             }
             if should_flush {
@@ -3329,7 +3329,7 @@ impl RuleTask {
     /// OutputRecord 物化）→ 直接装入 `PipeBatchStager` 类型列。装载节奏与
     /// 行式路径一致（每输入批一次 flush_pipes）。
     ///
-    /// 注：不采样 serialize 计时（pipe 装载路径不生成 OutputRecord，与
+    /// 注：不采样 append 计时（pipe 装载路径不生成 OutputRecord，与
     /// `flush_pipes` 的批构建/广播共享计时口径）。
     async fn emit_each_pipe_batch_columnar(
         &self,
@@ -3352,7 +3352,7 @@ impl RuleTask {
                 metrics.inc_alert_emitted_total(self.rule_name());
             }
             for _ in 0..stats.failed {
-                metrics.inc_alert_serialize_failed();
+                metrics.inc_alert_append_failed();
             }
         }
         // 行式路径在 stage_pipe_record 的 Uninit 分支解析形状并建 stager；

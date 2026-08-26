@@ -118,7 +118,8 @@ params.topic = "wf_metrics"
 |------|------|------|
 | `alert_emitted_total` | counter | 告警产出数 |
 | `alert_channel_send_failed_total` | counter | 通道发送失败 |
-| `alert_serialize_failed_total` | counter | 序列化失败 |
+| `alert_append_failed_total` | counter | record→列 append（`AlertColumnBuilder::append_record`）失败（旧名 serialize_failed_total） |
+| `alert_append_nanos` | counter | record→列 append 耗时（worker 侧输出构建段; 与 sink 侧序列化区分，旧名 serialize_nanos） |
 | `alert_dispatch_total` | counter | 分发到 sink 数 |
 | `alert_dispatch_seconds` | histogram | 分发延迟 |
 

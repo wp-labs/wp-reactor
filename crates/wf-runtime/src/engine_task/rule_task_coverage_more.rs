@@ -2,7 +2,7 @@
 //!
 //! 覆盖点（第一轮 `rule_task_coverage` 之外）:
 //! - `RuleTask::new`: `each_direct` / `deferred`（emit at）标志计算。
-//! - 输出路径: `emit` 指标采样（detail/e2e + serialize 采样）、`emit_batch`
+//! - 输出路径: `emit` 指标采样（detail/e2e + append 采样）、`emit_batch`
 //!   （批量 + 中间流拆分）、`stage_or_emit_record` 满批 flush。
 //! - `flush_alerts`: 通道 Full（回退阻塞投递）/ Closed（丢弃）/ 无 sink 三种分支。
 //! - `stage_pipe_record` 目标缺失 → Dead 终态; `flush_pipes` 空转。
@@ -351,24 +351,24 @@ fn update_rule_instances_metric_reports_delta() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn emit_metric_sampling_detail_and_serialize() {
+async fn emit_metric_sampling_detail_and_append() {
     let m = metrics();
     let task = make_task(Spec {
         metrics: Some(m.clone()),
         ..Spec::default()
     });
-    // 采样计数器归零 → 命中 detail + e2e 分支; serialize 采样=1 → 计时分支。
+    // 采样计数器归零 → 命中 detail + e2e 分支; append 采样=1 → 计时分支。
     task.emit_sample_remaining
         .store(0, std::sync::atomic::Ordering::Relaxed);
-    task.serialize_sample_remaining
+    task.append_sample_remaining
         .store(1, std::sync::atomic::Ordering::Relaxed);
     task.emit(record_with("alerts", 1_700_000_000_000_000_000))
         .await;
     assert!(
-        task.serialize_nanos
+        task.append_nanos
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0,
-        "serialize timing sampled path must accumulate nanos"
+        "append timing sampled path must accumulate nanos"
     );
     assert!(
         m.summary_line().contains("alerts=1"),
@@ -378,7 +378,7 @@ async fn emit_metric_sampling_detail_and_serialize() {
 }
 
 #[tokio::test]
-async fn emit_append_error_increments_serialize_failed() {
+async fn emit_append_error_increments_append_failed() {
     // 空 yield 目标（无字段）仍可 append；用与 schema 冲突的 yield 触发失败——
     // 直接构造一个非有限数值的 yield 字段让 convert_yield 失败。
     let m = metrics();
@@ -389,7 +389,7 @@ async fn emit_append_error_increments_serialize_failed() {
     let mut record = record_with("alerts", 1);
     record.yield_fields = vec![(Arc::from("x"), Value::Number(f64::NAN))];
     task.emit(record).await;
-    // serialize_failed 计数无法直接读，仅验证不 panic 且 pending 未增长。
+    // append_failed 计数无法直接读，仅验证不 panic 且 pending 未增长。
     assert_eq!(task.pending_alerts.lock().unwrap().count, 0);
 }
 

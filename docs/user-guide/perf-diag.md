@@ -10,9 +10,12 @@
 诊断模式 = **引擎内置的性能墙定位开关**。把管线按"只有禁止"的方式切成几段：
 
 ```text
-floor（管道净段：注入+解码+窗口）  ← 切掉规则求值 + 切掉输出链
-rules（+规则求值）                 ← 只切输出链
-full（+输出链）                    ← 什么都不切
+recv（TCP 接收，非哨兵帧 body 即丢）
+decode（+ 解码，窗口 append 前即丢）
+floor（+ 窗口 append / fanout）   ← 切掉规则求值 + 切掉输出链
+rules（+ 规则求值）               ← 只切输出链
+emit（+ 输出构建 + 通道投递）     ← sink 收到即丢（cut_sink_write）
+full（+ sink 物化 + 序列化 + 写） ← 什么都不切
 ```
 
 逐段测出 EPS，增量成本最大的一段就是墙。整个过程：
@@ -93,14 +96,23 @@ wfgen perf-diag --diag conf/perf-diag.toml \
 
 ## 4. 诊断档与墙梯语义
 
-| 档 | `cut_rules` | `cut_output` | 测得 | 对应二分法的刀 |
-|---|---|---|---|---|
-| `floor` | ✅ 切 | ✅ 切 | 注入+解码+窗口净段 | ①② 输出+规则 |
-| `rules` | 开 | ✅ 切 | +规则求值 | ② 切规则 |
-| `full` | 开 | 开 | +输出链（serialize/sink） | ① 切输出 |
+| 档 | 关键门控 | 测得 | 对应二分法的刀 |
+|---|---|---|---|
+| `recv` | `cut_recv`（非哨兵帧 body 即丢） | TCP 接收（字节率） | ⑤ 读粒度 |
+| `decode` | `cut_append`（append 前即丢） | + 解码 | ③ 切解码校验 |
+| `floor` | `cut_rules` + `cut_output` | + 窗口 append / fanout | ①② 输出+规则 |
+| `rules` | `cut_output` | + 规则求值（规则墙） | ② 切规则 |
+| `emit` | `cut_sink_write`（sink 收到即丢） | + 输出构建 + 通道投递 | ① 切输出（构建侧） |
+| `full` | 全开 | + sink 物化 + 序列化 + 写 | ① 切输出（写侧） |
 
-- **叠加式**：`rules` 档 = floor + 规则成本；`full` 档 = rules + 输出成本；
-  每档 EPS 的差 = 该段的增量成本；
+- **叠加式**：后一档 = 前一档 + 该段成本；每档 EPS 的差 = 该段的增量成本
+  （如 `full − emit` = 序列化 + sink 写成本）；
+- **两个"序列化"是不同段（2026-08-26 统一命名）**：worker 侧的
+  `alert.append_nanos`（`AlertColumnBuilder::append_record` 的 record→列构建，属
+  **输出构建**段，emit 档内）vs sink 侧的 `cut_sink_write` 门控（列→行物化 + JSON
+  编码 + 写盘，属 **full − emit** 增量）。门控叫 `cut_sink_write`（旧名
+  `cut_serialize`）只切 sink 侧；worker 侧指标叫 `append_*`（旧名
+  `serialize_*`）。
 - **每档测一次**：哨兵驱动的切换在首个哨兵后即发生，同档重复轮次会吃到下一档
   门控——去噪用 `--n-list` 递增 N，不要用 `--rounds`；
 - **数据由小到大**：小 N 秒级出方向，大 N 确认墙是 per-event（随 N 线性）还是
@@ -111,10 +123,18 @@ wfgen perf-diag --diag conf/perf-diag.toml \
 ```toml
 # 入口是 --perf-diag 启动参数本身；本文件只承载诊断档列表
 [[stages]]
+name = "recv"
+cut_recv = true          # 只读帧头 tag，非哨兵帧 body 即丢
+
+[[stages]]
+name = "decode"
+cut_append = true        # 解码后、窗口 append 前即丢
+
+[[stages]]
 name = "floor"
 cut_rules = true
 cut_output = true
-rules = ""           # 空 = 保持当前规则；否则规则文件路径（触发热 reload）
+rules = ""               # 空 = 保持当前规则；否则规则文件路径（触发热 reload）
 
 [[stages]]
 name = "rules"
@@ -122,15 +142,24 @@ cut_rules = false
 cut_output = true
 
 [[stages]]
+name = "emit"
+cut_sink_write = true    # sink 收到 AlertBatch 即丢（不物化/序列化/写）
+
+[[stages]]
 name = "full"
 cut_rules = false
 cut_output = false
+cut_sink_write = false
 ```
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `[[stages]].name` | string | 档名（墙表输出用） |
-| `[[stages]].cut_rules` / `cut_output` | bool | 该档生效期间的门控（`cut_rules` = 禁止规则求值、`cut_output` = 禁止输出链） |
+| `[[stages]].cut_rules` | bool | 禁止规则求值 |
+| `[[stages]].cut_output` | bool | 禁止整条输出链（record→列构建 + 通道 + sink 物化/序列化/写） |
+| `[[stages]].cut_append` | bool | 禁止窗口 append（解码后即丢；哨兵流豁免） |
+| `[[stages]].cut_recv` | bool | 禁止解码（只读帧头；哨兵流豁免） |
+| `[[stages]].cut_sink_write` | bool | 禁止 **sink 消费侧**（列→行物化 + 序列化 + 写盘；AlertBatch 到 sink 即丢）——与 worker 侧 `append_*` 指标（record→列构建）区分，见 §4 |
 | `[[stages]].rules` | string? | 规则子集文件路径；非空且不同 → 热 reload（不加钱换配置） |
 
 启动即应用 `stages[0]` 的门控；`--perf-diag` 不带 = 全关（生产零污染）。
