@@ -79,6 +79,13 @@ type PipeFlushBatch = (Arc<str>, Option<Arc<Vec<Arc<Event>>>>, RecordBatch);
 const EMIT_METRIC_SAMPLE_INTERVAL: u32 = 64;
 /// Flush size for the batched alert sink delivery (amortizes per-alert fan-out).
 const ALERT_BATCH_SIZE: usize = 4096;
+/// Full-shutdown drain: how long a rule task waits for its source windows'
+/// actors to commit their queued tail before flushing anyway (safety net —
+/// normally the drain completes in milliseconds). See
+/// [`RuleTask::wait_shutdown_drain`].
+pub(super) const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Full-shutdown drain poll interval while waiting for the actors.
+pub(super) const SHUTDOWN_DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Deferred-materialization row source for one batch (L2): the event time of
 /// every row (for the watermark/expiry scan) plus the bind-filter hit rows in
@@ -1984,6 +1991,44 @@ impl RuleTask {
             if delta != 0 {
                 metrics.adjust_rule_instances(rule_name, delta);
             }
+        }
+    }
+
+    /// Whether every source window's actor has finished its shutdown drain.
+    /// A window without an actor (embedded direct-append / provider) reports
+    /// drained by default, so the wait below never stalls on it.
+    fn sources_drained(&self) -> bool {
+        self.sources.iter().all(|s| s.window.actor_drained())
+    }
+
+    /// Full-shutdown drain: keep pulling until every source window's actor has
+    /// committed its queued tail, so the final flush runs against a complete
+    /// machine.
+    ///
+    /// Without this, a rule task can flush — and exit — while the window
+    /// actors are still committing their mailbox tail: the flush closes
+    /// instances at a stale machine watermark (close:flush alerts with a stale
+    /// `fired_at` and tail-triggered alerts lost entirely). That is the
+    /// `e2e_datagen_brute_force` CI flake (loaded macos-14 runners: the actor
+    /// lags at EOF, the rule task's cancel branch drained an empty channel and
+    /// flushed before the actor committed). The poll bound is a safety net for
+    /// a stuck actor; normally the drain completes in milliseconds.
+    pub(super) async fn wait_shutdown_drain(&mut self) {
+        let deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+        loop {
+            self.pull_and_advance().await;
+            if self.sources_drained() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                wf_warn!(
+                    pipe,
+                    task_id = %self.task_id,
+                    "shutdown drain timeout — window actor(s) did not report drained; flushing with possibly-stale machine"
+                );
+                break;
+            }
+            tokio::time::sleep(SHUTDOWN_DRAIN_POLL).await;
         }
     }
 

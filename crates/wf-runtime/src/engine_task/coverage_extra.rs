@@ -60,9 +60,12 @@ async fn run_rule_task_push_channel_close_returns_ok() {
     let config = bare_config(rx);
     drop(tx); // close immediately → loop drains, flushes, breaks.
 
-    let result = tokio::time::timeout(Duration::from_secs(5), run_rule_task(config))
-        .await
-        .expect("rule task must finish promptly");
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_rule_task(config, CancellationToken::new()),
+    )
+    .await
+    .expect("rule task must finish promptly");
     result.expect("run_rule_task returns Ok on channel close");
 }
 
@@ -94,9 +97,12 @@ async fn run_stats_task_push_channel_close_returns_ok() {
     };
     drop(tx);
 
-    let result = tokio::time::timeout(Duration::from_secs(5), run_stats_task(config))
-        .await
-        .expect("stats task must finish promptly");
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_stats_task(config, CancellationToken::new()),
+    )
+    .await
+    .expect("stats task must finish promptly");
     result.expect("run_stats_task returns Ok on channel close");
 }
 
@@ -119,9 +125,12 @@ async fn run_rule_task_cancel_drains_and_returns_ok() {
     .expect("send");
     cancel.cancel();
 
-    let result = tokio::time::timeout(Duration::from_secs(5), run_rule_task(config))
-        .await
-        .expect("rule task must finish promptly");
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_rule_task(config, CancellationToken::new()),
+    )
+    .await
+    .expect("rule task must finish promptly");
     result.expect("run_rule_task returns Ok on cancel");
 }
 

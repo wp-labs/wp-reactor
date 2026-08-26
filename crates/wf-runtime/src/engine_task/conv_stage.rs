@@ -50,7 +50,14 @@ const STALE_BARRIER_AFTER: std::time::Duration = std::time::Duration::from_secs(
 /// shutdown. Shards flush their final closes as part of shutdown, so the stage
 /// must keep consuming until all shard senders drop the channel — otherwise a
 /// late flush batch is lost (same bug family as the sink consumer drain).
-const CONV_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+///
+/// Must cover the rule tasks' full-shutdown drain (`SHUTDOWN_DRAIN_TIMEOUT`,
+/// 5s) plus the flush itself: since the drained-wait fix (2026-08-26) the
+/// shards emit their final `drained` batch only after waiting for the window
+/// actors' tail commit, which can take longer than the old 1s budget on a
+/// loaded machine — a too-small budget drops the final closes and unsealed
+/// buckets.
+const CONV_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// A batch of raw qualifying closes sent from one shard to the conv stage.
 pub(crate) struct ConvCloseBatch {

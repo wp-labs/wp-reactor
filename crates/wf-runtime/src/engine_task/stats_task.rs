@@ -240,6 +240,35 @@ impl StatsTask {
         }
     }
 
+    /// Whether every source window's actor has finished its shutdown drain
+    /// (mirrors [`super::rule_task::RuleTask::sources_drained`]).
+    fn sources_drained(&self) -> bool {
+        self.sources.iter().all(|s| s.window.actor_drained())
+    }
+
+    /// Full-shutdown drain: keep pulling until every source window's actor has
+    /// committed its queued tail, so the final flush runs against a complete
+    /// machine (same race as the rule task — stats windows' tail can still be
+    /// in the actors' mailboxes when the shutdown flush fires).
+    pub(super) async fn wait_shutdown_drain(&mut self) {
+        let deadline = std::time::Instant::now() + super::rule_task::SHUTDOWN_DRAIN_TIMEOUT;
+        loop {
+            self.pull_and_process().await;
+            if self.sources_drained() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                wf_warn!(
+                    pipe,
+                    task_id = %self.task_id,
+                    "stats shutdown drain timeout — window actor(s) did not report drained; flushing with possibly-stale machine"
+                );
+                break;
+            }
+            tokio::time::sleep(super::rule_task::SHUTDOWN_DRAIN_POLL).await;
+        }
+    }
+
     /// Push 模式: 消费一个投递批次（raw batch, events=None 走 defer 路径）。
     pub(super) async fn process_push(&mut self, push: RulePush) {
         let push_seq = push.seq;
@@ -1076,7 +1105,12 @@ fn scope_key_to_values(key: &ScopeKey) -> Vec<wf_engine::match_engine::Value> {
 }
 
 /// 主循环: push 通道优先（WFUSION_WINDOW_DISPATCH=push）, 否则 pull window log。
-pub(crate) async fn run_stats_task(config: StatsTaskConfig) -> RuntimeResult<()> {
+/// `root_cancel` 语义同 [`run_rule_task`](super::run_rule_task): 全量关停时
+/// 等 window actor 排空后再 flush; 热重载（只 cancel 规则组）时跳过等待。
+pub(crate) async fn run_stats_task(
+    config: StatsTaskConfig,
+    root_cancel: CancellationToken,
+) -> RuntimeResult<()> {
     let (mut task, cancel) = StatsTask::new(config);
     let task_id = task.task_id.clone();
     let mut eos = task.eos_flush.clone();
@@ -1086,7 +1120,15 @@ pub(crate) async fn run_stats_task(config: StatsTaskConfig) -> RuntimeResult<()>
     if let Some(rx) = task.push_rx.take() {
         run_stats_push_loop(&mut task, rx, cancel, &mut eos, &mut timeout_tick, &task_id).await
     } else {
-        run_stats_pull_loop(&mut task, cancel, &mut eos, &mut timeout_tick, &task_id).await
+        run_stats_pull_loop(
+            &mut task,
+            cancel,
+            root_cancel,
+            &mut eos,
+            &mut timeout_tick,
+            &task_id,
+        )
+        .await
     }
 }
 
@@ -1133,6 +1175,7 @@ async fn run_stats_push_loop(
 async fn run_stats_pull_loop(
     task: &mut StatsTask,
     cancel: CancellationToken,
+    root_cancel: CancellationToken,
     eos: &mut watch::Receiver<u64>,
     timeout_tick: &mut tokio::time::Interval,
     task_id: &str,
@@ -1145,6 +1188,11 @@ async fn run_stats_pull_loop(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                // 同 rule task: 全量关停等 actor 排空（热重载跳过）。
+                if root_cancel.is_cancelled() {
+                    task.wait_shutdown_drain().await;
+                }
+                task.pull_and_process().await;
                 task.flush().await;
                 wf_debug!(pipe, task_id = %task_id, "stats task shutdown complete");
                 break;

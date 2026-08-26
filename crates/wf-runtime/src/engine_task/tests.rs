@@ -836,8 +836,8 @@ fn make_filtered_match_task() -> (
     (task, alert_rx, win_arc, notify_arc)
 }
 
-fn make_filtered_close_task() -> (
-    rule_task::RuleTask,
+fn make_filtered_close_config() -> (
+    task_types::RuleTaskConfig,
     mpsc::Receiver<crate::alert_task::AlertBatch>,
     Arc<Window>,
     Arc<Notify>,
@@ -958,6 +958,16 @@ fn make_filtered_close_task() -> (
         shard_index: None,
         shard_count: 1,
     };
+    (config, alert_rx, win_arc, notify_arc)
+}
+
+fn make_filtered_close_task() -> (
+    rule_task::RuleTask,
+    mpsc::Receiver<crate::alert_task::AlertBatch>,
+    Arc<Window>,
+    Arc<Notify>,
+) {
+    let (config, alert_rx, win_arc, notify_arc) = make_filtered_close_config();
     let (task, _cancel, _interval) = rule_task::RuleTask::new(config);
     (task, alert_rx, win_arc, notify_arc)
 }
@@ -2836,6 +2846,201 @@ async fn flush_emits_close_alert_for_completed_and_close_rule() {
     assert_eq!(field_str(&alert, "__wfu_entity_type"), "ip");
     assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
     assert_eq!(field_str(&alert, "__wfu_origin"), "close:flush");
+}
+
+#[tokio::test]
+async fn shutdown_drain_pulls_tail_before_flush() {
+    // e2e_datagen_brute_force CI flake regression: at full shutdown the rule
+    // task must keep pulling until the window actor reports drained, so the
+    // final flush runs against a complete machine. Without it the flush
+    // closes at a stale machine watermark (the alert's fired_at falls on the
+    // pre-tail watermark) and tail-triggered alerts are lost.
+    init_tracing();
+    let (mut task, mut alert_rx, win, _notify) = make_filtered_close_task();
+    // The window actor is still committing its queued tail at shutdown.
+    win.set_actor_drained(false);
+    let ts = 1_700_000_000_000_000_000i64;
+
+    // Tail committed to the window but NOT yet pulled by the rule task (what
+    // the actor's cancel-drain commits before setting the drained flag):
+    // 3 rows push count>=3, the 4th row (ts+60s) is the tail's last event.
+    let batch = RecordBatch::try_new(
+        filtered_schema(),
+        vec![
+            Arc::new(StringArray::from(vec![
+                "10.0.0.1", "10.0.0.1", "10.0.0.1", "10.0.0.1",
+            ])),
+            Arc::new(StringArray::from(vec![
+                "failed", "failed", "failed", "failed",
+            ])),
+            Arc::new(TimestampNanosecondArray::from(vec![
+                ts,
+                ts + 1,
+                ts + 2,
+                ts + 60_000_000_000,
+            ])),
+        ],
+    )
+    .unwrap();
+    win.append(batch).unwrap();
+
+    // The drain must block while the actor is still draining…
+    let mut drain = Box::pin(task.wait_shutdown_drain());
+    tokio::select! {
+        _ = &mut drain => panic!(
+            "wait_shutdown_drain must block while the window actor is still draining"
+        ),
+        _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+    }
+    // …and once the actor reports drained, it completes and the flush sees
+    // the tail.
+    win.set_actor_drained(true);
+    drain.await;
+    task.flush().await;
+
+    let alert = take_alert(&mut alert_rx);
+    assert_eq!(field_str(&alert, "__wfu_rule_name"), "filtered_close");
+    assert_eq!(field_str(&alert, "__wfu_entity_id"), "10.0.0.1");
+    assert_eq!(field_str(&alert, "__wfu_origin"), "close:flush");
+    // The close must fire at the tail's watermark (4th row, ts+60s) — not a
+    // stale pre-tail watermark (ts+2).
+    let fired = chrono::DateTime::parse_from_rfc3339(&field_str(&alert, "__wfu_fired_at"))
+        .unwrap_or_else(|e| panic!("parse fired_at: {e}"));
+    assert_eq!(
+        fired.timestamp_nanos_opt().expect("fired_at nanos"),
+        ts + 60_000_000_000,
+        "flush must run after the tail was pulled (fired_at = tail watermark)"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_drain_times_out_when_actor_stuck() {
+    // Safety net: a window actor that never reports drained must not hang the
+    // shutdown forever — wait_shutdown_drain bails at the timeout and the
+    // flush proceeds with the state it has.
+    init_tracing();
+    let (mut task, _alert_rx, win, _notify) = make_filtered_close_task();
+    win.set_actor_drained(false);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(7),
+        task.wait_shutdown_drain(),
+    )
+    .await
+    .expect("shutdown drain must not hang on a stuck actor (bounded by SHUTDOWN_DRAIN_TIMEOUT)");
+}
+
+#[tokio::test]
+async fn rule_cancel_without_root_cancel_skips_drain_wait() {
+    // Hot-reload shape: only the rule token fires, the window actors keep
+    // running (never report drained). The shutdown drain wait must be skipped
+    // or every reload would stall ~SHUTDOWN_DRAIN_TIMEOUT.
+    init_tracing();
+    let (mut config, _alert_rx, win, _notify) = make_filtered_close_config();
+    win.set_actor_drained(false); // actors keep running → never drained
+    let rule_cancel = tokio_util::sync::CancellationToken::new();
+    config.cancel = rule_cancel.clone();
+    let root_cancel = tokio_util::sync::CancellationToken::new();
+
+    rule_cancel.cancel();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        super::run_rule_task(config, root_cancel),
+    )
+    .await
+    .expect("rule-only cancel must exit promptly without waiting for the actors")
+    .expect("run_rule_task ok");
+}
+
+#[tokio::test]
+async fn full_shutdown_with_real_actor_processes_mailbox_tail() {
+    // 完整竞态的端到端回归：真实 window actor 在关停时 mailbox 里还押着尾部
+    // 批次。规则任务必须等 actor 的 drained 标志（边等边拉），最终 flush 才
+    // 会收口每个 key 的告警——无修复时它在陈旧 machine watermark 上 flush，
+    // 未提交的尾部直接丢失（e2e_datagen_brute_force CI flake 同型）。
+    init_tracing();
+    let (mut config, mut alert_rx, win, notify) = make_filtered_close_config();
+
+    // 在配置同一窗口上起一个真实 actor（规则任务从同一 Arc 拉取）。
+    let (mailbox_tx, mailbox_rx) =
+        mpsc::channel::<wf_engine::window::WindowMsg>(wf_engine::window::WINDOW_CHANNEL_DEPTH);
+    let actor_cancel = tokio_util::sync::CancellationToken::new();
+    let actor_win = Arc::clone(&win);
+    let actor_cancel2 = actor_cancel.clone();
+    let actor_notify = Arc::clone(&notify);
+    let actor = tokio::spawn(async move {
+        wf_engine::window::run_window_actor(
+            Arc::from("auth_events"),
+            actor_win,
+            Arc::new(wf_engine::window::EvictionGate::new(usize::MAX)),
+            wf_engine::window::RuleFanout::new(),
+            actor_notify,
+            mailbox_rx,
+            actor_cancel2,
+            None,
+        )
+        .await;
+    });
+
+    // 规则任务（pull 模式）读同一窗口。
+    let root_cancel = tokio_util::sync::CancellationToken::new();
+    let rule_cancel = tokio_util::sync::CancellationToken::new();
+    config.cancel = rule_cancel.clone();
+    let run = tokio::spawn(super::run_rule_task(config, root_cancel.clone()));
+
+    // 等 actor 与规则任务就绪，然后把 5 个 3 行批次（每 key 一个）打进
+    // actor 的 mailbox。count>=3 命中、无 close 事件 → 告警全部由关停
+    // flush 收口（close:flush）。
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let ts = 1_700_000_000_000_000_000i64;
+    let keys = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5"];
+    for (i, key) in keys.iter().enumerate() {
+        let batch = RecordBatch::try_new(
+            filtered_schema(),
+            vec![
+                Arc::new(StringArray::from(vec![*key, *key, *key])),
+                Arc::new(StringArray::from(vec!["failed", "failed", "failed"])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    ts + (i * 3) as i64 * 1_000_000_000,
+                    ts + (i * 3 + 1) as i64 * 1_000_000_000,
+                    ts + (i * 3 + 2) as i64 * 1_000_000_000,
+                ])),
+            ],
+        )
+        .unwrap();
+        mailbox_tx
+            .send(wf_engine::window::WindowMsg::Append {
+                source: Arc::from("ingress"),
+                seq: i as u64,
+                batch,
+                events: None,
+                byte_size: 128,
+                permits: Vec::new(),
+                shard_rows: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    // actor 可能还押着尾部时立刻关停（真实 reactor 中 root cancel 会传播
+    // 到 rule_cancel——child token；测试里两个 token 独立，需都 cancel）。
+    root_cancel.cancel();
+    rule_cancel.cancel();
+    actor_cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("rule task must finish promptly")
+        .expect("rule task joined without panic")
+        .expect("run_rule_task ok");
+    actor.await.expect("actor joins");
+
+    // 每个 key 都通过 close:flush 收口——drain 等到了尾部。
+    let mut ids = drain_alert_entity_ids(&mut alert_rx);
+    ids.sort();
+    let expected: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+    assert_eq!(
+        ids, expected,
+        "all tail keys must be flushed after the drain"
+    );
 }
 
 #[tokio::test]

@@ -472,7 +472,18 @@ pub struct Window {
     /// created in the future therefore races with the first appends — nexmark q4
     /// lost 0–6% of its output nondeterministically (5 vs 48 startup eviction
     /// sweeps) until the pin existed before the first batch landed.
+    /// parked_pin: RwLock<Option<Arc<std::sync::atomic::AtomicI64>>>,
     parked_pin: RwLock<Option<Arc<std::sync::atomic::AtomicI64>>>,
+    /// Shutdown drain state of this window's single-writer actor.
+    /// `true` = no actor (or its actor finished committing the queued tail);
+    /// `false` = an actor is live and may still append. Defaults to `true`
+    /// so windows without an actor (provider / embedded direct-append) are
+    /// trivially "drained". The actor flips it to `false` at start and back
+    /// to `true` after its shutdown drain. Rule tasks wait on it at full
+    /// shutdown so the final flush runs against a complete machine — the
+    /// window-tail commit vs rule-flush ordering race (e2e_datagen_brute_force
+    /// CI flake: close_all at a stale machine watermark).
+    actor_drained: AtomicBool,
 }
 
 impl Window {
@@ -502,7 +513,20 @@ impl Window {
             defer_materialization,
             progress: RwLock::new(None),
             parked_pin: RwLock::new(None),
+            actor_drained: AtomicBool::new(true),
         }
+    }
+
+    /// Mark whether this window's single-writer actor has finished its
+    /// shutdown drain (see the field docs).
+    pub fn set_actor_drained(&self, drained: bool) {
+        self.actor_drained.store(drained, Ordering::Release);
+    }
+
+    /// Whether this window's actor has finished committing its queued tail
+    /// (or never existed). `true` ⇒ no further appends will arrive.
+    pub fn actor_drained(&self) -> bool {
+        self.actor_drained.load(Ordering::Acquire)
     }
 
     /// Wire this window to its consumption-progress table. Called once by the

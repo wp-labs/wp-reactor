@@ -56,7 +56,15 @@ static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 ///   batches via cursor-based `events_since()`.
 ///
 /// Both paths keep the periodic timeout scan, EOS flush, and shutdown flush.
-pub(crate) async fn run_rule_task(config: RuleTaskConfig) -> RuntimeResult<()> {
+/// `root_cancel` is the reactor's root cancellation token (distinct from the
+/// rule group's own `RuleTaskConfig::cancel`): at full shutdown both fire and
+/// the window actors drain, so the pull loop waits for them before the final
+/// flush; on a hot reload only the rule token fires and the actors keep
+/// running, so the wait is skipped.
+pub(crate) async fn run_rule_task(
+    config: RuleTaskConfig,
+    root_cancel: CancellationToken,
+) -> RuntimeResult<()> {
     let (mut task, cancel, timeout_scan_interval) = rule_task::RuleTask::new(config);
     let task_id = task.task_id.clone();
     let mut timeout_tick = tokio::time::interval(timeout_scan_interval);
@@ -65,7 +73,15 @@ pub(crate) async fn run_rule_task(config: RuleTaskConfig) -> RuntimeResult<()> {
     if let Some(rx) = task.push_rx.take() {
         run_push_loop(&mut task, rx, cancel, &mut eos, &mut timeout_tick, &task_id).await
     } else {
-        run_pull_loop(&mut task, cancel, &mut eos, &mut timeout_tick, &task_id).await
+        run_pull_loop(
+            &mut task,
+            cancel,
+            root_cancel,
+            &mut eos,
+            &mut timeout_tick,
+            &task_id,
+        )
+        .await
     }
 }
 
@@ -137,6 +153,7 @@ async fn run_push_loop(
 async fn run_pull_loop(
     task: &mut RuleTask,
     cancel: CancellationToken,
+    root_cancel: CancellationToken,
     eos: &mut watch::Receiver<u64>,
     timeout_tick: &mut tokio::time::Interval,
     task_id: &str,
@@ -153,6 +170,14 @@ async fn run_pull_loop(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                // Full shutdown (root cancelled): the window actors are also
+                // draining — wait for them to commit their queued tail so the
+                // flush below runs against a complete machine. On a hot reload
+                // only the rule token fires and the actors keep running, so
+                // skip the wait (their data is re-pulled by the new generation).
+                if root_cancel.is_cancelled() {
+                    task.wait_shutdown_drain().await;
+                }
                 task.pull_and_advance().await;
                 task.flush().await;
                 wf_debug!(pipe, task_id = %task_id, "rule task shutdown complete");
