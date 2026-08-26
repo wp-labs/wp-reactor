@@ -267,8 +267,36 @@ rule q18_last_bid_stats {
    - 三层预算阶梯：内存 → 磁盘 → 拒收兜底（写失败/落盘满回退拒收不丢键）
    - 测试：`stats_spill_test.rs` 5 个（驱逐+读回 / 对拍契约 / 阶梯兜底 /
      redb 全链路+文件清理 / 内存有界）
-4. **M4**：wfl 声明（spill）解析 + spawn 注入
-5. **M5**：q18 100M 验证（内存曲线 + 对拍 + EPS 影响）
+4. **M4**：wfl 声明（spill）解析 + spawn 注入 ✅
+   - key 分片每片独立 executor（无跨片 merge）→ spill 按片独立启用（独立文件）；
+     仅输入分片（merge_partial）禁用（spill 状态无法跨片归并）
+   - 文件 `spill_{rule}_{pid}{_shard}.rb` 于 `WF_SPILL_DIR`（默认 `./spill`）
+5. **M5**：q18 验证——**正确性成立，性能/内存未达生产可用**（见 §15）
+
+## 15. M5 实测（2026-08-26, q18 30M, 10 key 分片, max_memory=256MB/片）
+
+| 项 | 值 | 结论 |
+|---|---|---|
+| 正确性 | [clean] + appended 100% + EMIT 8,811,730 | ✅ 输出 = 去重基数（30M×0.2935，
+   与 10M→2.94M / 100M→29.35M 同比例）——spill 对拍成立 |
+| spill 生效 | 10 片 × 538MB redb 文件增长，close 后删除 | ✅ 驱逐/读回/cleanup 全链路通 |
+| EPS | 878K → 941K（无 spill ~13M） | ❌ 15× 降——逐键读回事务 + 驱逐抖动 |
+| RSS_peak | 22.5G → 17.5G（无 spill 19.6G） | ❌ close 期 drain 全量物化 + 分配器残留 |
+
+**根因**（数据驱动）：
+1. **q18 数据与设计假设不符**：「死键不回来」不成立——滑窗生成器每键平均
+   出现 3.4 次 → 驱逐键大量回访 → 每次回访 = redb take（写事务+反序列化）
+   → 驱逐-回访抖动是 EPS 塌方主因
+2. **close drain 全量物化**：drain 把全部 spill 键一次性读回内存（30M ≈
+   5.6G，100M ≈ 18.6G）→ close 期 RSS 峰值不可接受
+3. redb 默认 1GiB/库页缓存 + 逐键事务 fsync 加重 RSS/EPS（已修：
+   `Durability::None` + `WF_SPILL_CACHE_MB` 默认 64MB）
+
+**下一步（未做）**：
+- 流式 close drain（trait drain 改迭代/分批，避免全量物化）——100M 的硬前提
+- 读回摊销（批内去重回访、或读回键短时驻留缓存）——消 EPS 塌方
+- 预算与工作集匹配（q18 每键实内存 633B > 估算 432B；预算应 < 工作集×余量）
+- 完整逐行对拍（本验证以 EMIT 基数 + [clean] 为证据，未做逐字节）
 
 ## 14. 风险与缓解
 

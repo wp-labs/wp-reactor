@@ -179,11 +179,24 @@ pub struct RedbSpillStore {
 impl RedbSpillStore {
     /// 打开/新建库（`Database::create` 语义：文件不存在则初始化，存在则打开）。
     /// 初始化时确保 `state` 表存在（读事务 `open_table` 要求表已存在）。
+    ///
+    /// **页缓存设界**（2026-08-26 M5 实测）：redb 默认缓存 1GiB/库——q18 10 片
+    /// 潜在 10GB 无谓 RSS。取 `WF_SPILL_CACHE_MB`（默认 64MB）。
+    ///
+    /// **无持久化语义**（设计 §8）：spill 是内存换磁盘的临时缓冲，崩溃即重
+    /// ingest——写事务用 `Durability::None`（无 fsync），正确性不依赖落盘。
     pub fn create(
         path: impl AsRef<std::path::Path>,
         layout: std::sync::Arc<RowFieldLayout>,
     ) -> Result<Self, SpillError> {
-        let db = redb::Database::create(path.as_ref()).map_err(|e| SpillError::Redb(e.into()))?;
+        let cache_mb: usize = std::env::var("WF_SPILL_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let db = redb::Database::builder()
+            .set_cache_size(cache_mb.saturating_mul(1024 * 1024))
+            .create(path.as_ref())
+            .map_err(|e| SpillError::Redb(e.into()))?;
         let write_txn = db.begin_write().map_err(|e| SpillError::Redb(e.into()))?;
         {
             let _ = write_txn
@@ -196,6 +209,15 @@ impl RedbSpillStore {
             path: path.as_ref().to_path_buf(),
             layout,
         })
+    }
+
+    /// 无 fsync 的写事务（spill 无持久化语义——崩溃重 ingest, §8）。
+    fn write_txn(&self) -> Result<redb::WriteTransaction, SpillError> {
+        let db = self.db.as_ref().expect("已 cleanup");
+        let mut txn = db.begin_write().map_err(|e| SpillError::Redb(e.into()))?;
+        txn.set_durability(redb::Durability::None)
+            .map_err(|e| SpillError::Redb(e.into()))?;
+        Ok(txn)
     }
 
     fn redb_expect(msg: &str) -> ! {
@@ -227,8 +249,7 @@ impl SpillStore for RedbSpillStore {
             return Ok(());
         }
         // 单事务批量写（驱逐批量事件——逐键事务/fsync 会压死 26M 键场景）。
-        let db = self.db.as_ref().expect("已 cleanup");
-        let write_txn = db.begin_write().map_err(|e| SpillError::Redb(e.into()))?;
+        let write_txn = self.write_txn()?;
         {
             let mut table = write_txn
                 .open_table(REDB_TABLE)
@@ -245,10 +266,9 @@ impl SpillStore for RedbSpillStore {
     }
 
     fn take(&mut self, hash: u64) -> Option<(ScopeKey, Vec<StatsAccum>)> {
-        let db = self.db.as_ref().expect("已 cleanup");
-        let write_txn = match db.begin_write() {
+        let write_txn = match self.write_txn() {
             Ok(t) => t,
-            Err(e) => Self::redb_expect(&format!("begin_write: {e}")),
+            Err(e) => Self::redb_expect(&format!("write_txn: {e}")),
         };
         let bytes = {
             let mut table = match write_txn.open_table(REDB_TABLE) {
