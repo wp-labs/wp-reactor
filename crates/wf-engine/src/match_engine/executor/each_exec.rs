@@ -2040,9 +2040,14 @@ impl RuleExecutor {
             // entity（来源：常量 / 左窗列直读 / 左窗列通用 / 右窗 JoinRow；
             // 缺失 → 空串，同行式）。2026-08-26：Left 来源优先列直读
             // （EntityCol::I64/Utf8——零 Value/SmolStr 中转），仅通用类型回退
-            // `value_at` + `value_to_string`。
-            let entity_id: smol_str::SmolStr = match &entity_const {
-                Some(s) => smol_str::SmolStr::from(s.as_str()),
+            // `value_at` + `value_to_string`。三元组对齐无 join 列式路径：
+            // `entity_val`（同列 yield 复用）+ `entity_f64`（数字快车道 stage）。
+            let (entity_id, entity_val, entity_f64): (
+                smol_str::SmolStr,
+                Option<Value>,
+                Option<f64>,
+            ) = match &entity_const {
+                Some(s) => (smol_str::SmolStr::from(s.as_str()), None, None),
                 None => match &entity_src {
                     Some(FieldSrc::Left(_)) => {
                         let row = event.row();
@@ -2054,32 +2059,40 @@ impl RuleExecutor {
                                 Some(v) => {
                                     let mut b = smol_str::SmolStrBuilder::new();
                                     write_int64_value(&mut b, v);
-                                    b.into()
+                                    (b.into(), Some(Value::Number(v as f64)), Some(v as f64))
                                 }
-                                None => smol_str::SmolStr::new(""),
+                                None => (smol_str::SmolStr::new(""), None, None),
                             },
                             EntityCol::Utf8(arr) => {
                                 if arr.is_null(row) {
-                                    smol_str::SmolStr::new("")
+                                    (smol_str::SmolStr::new(""), None, None)
                                 } else {
-                                    smol_str::SmolStr::from(arr.value(row))
+                                    (
+                                        smol_str::SmolStr::from(arr.value(row)),
+                                        Some(Value::Str(arr.value(row).into())),
+                                        None,
+                                    )
                                 }
                             }
-                            EntityCol::Generic => smol_str::SmolStr::from(
-                                entity_left_idx
-                                    .and_then(|eidx| event.value_at(eidx))
-                                    .map(|v| value_to_string(&v))
-                                    .unwrap_or_default(),
-                            ),
+                            EntityCol::Generic => match entity_left_idx
+                                .and_then(|eidx| event.value_at(eidx))
+                            {
+                                Some(v) => (smol_str::SmolStr::from(value_to_string(&v)), Some(v), None),
+                                None => (smol_str::SmolStr::new(""), None, None),
+                            },
                         }
                     }
-                    Some(FieldSrc::Right(f)) => smol_str::SmolStr::from(
-                        matched
-                            .and_then(|r| r.field_value(f))
-                            .map(|v| value_to_string(&v))
-                            .unwrap_or_default(),
+                    Some(FieldSrc::Right(f)) => (
+                        smol_str::SmolStr::from(
+                            matched
+                                .and_then(|r| r.field_value(f))
+                                .map(|v| value_to_string(&v))
+                                .unwrap_or_default(),
+                        ),
+                        None,
+                        None,
                     ),
-                    None => smol_str::SmolStr::new(""),
+                    None => (smol_str::SmolStr::new(""), None, None),
                 },
             };
             let fired_at = format_nanos_utc(*event_time_nanos);
@@ -2101,13 +2114,35 @@ impl RuleExecutor {
                     let value = match kind {
                         YieldKind::Lit(_) => continue, // 批级常量，fill_row_gaps 填充
                         YieldKind::Field => {
+                            // f64 快车道（对齐无 join 列式路径）：yield 字段与
+                            // entity 同一左列（q13b：id=m.bidder == entity bidder）
+                            // 且目标数字类型 → stage 原始 f64 直接写，跳过每行
+                            // `value_at` + Value 构造 + coerce 中转。
+                            if let (Some(FieldSrc::Left(yf)), Some(FieldSrc::Left(ef))) = (&src, &entity_src)
+                                && yf == ef
+                                && let Some(n) = entity_f64
+                                && is_numeric_yield_type(field_type.as_ref())
+                            {
+                                builder.stage_yield_cell_f64(name, field_type.as_ref(), n)?;
+                                continue;
+                            }
                             let mut value = match src {
-                                Some(FieldSrc::Left(_)) => yield_left_idxs
-                                    .get(yield_i)
-                                    .copied()
-                                    .flatten()
-                                    .and_then(|fidx| event.value_at(fidx))
-                                    .unwrap_or_else(|| Value::Str(SmolStr::default())),
+                                Some(FieldSrc::Left(f)) => {
+                                    // 同列复用 entity 已读值（不重读列）；否则按
+                                    // 预解析列 index 直读（无每行 index_of）。
+                                    if matches!(&entity_src, Some(FieldSrc::Left(ef)) if ef == f)
+                                        && let Some(ev) = entity_val.clone()
+                                    {
+                                        ev
+                                    } else {
+                                        yield_left_idxs
+                                            .get(yield_i)
+                                            .copied()
+                                            .flatten()
+                                            .and_then(|fidx| event.value_at(fidx))
+                                            .unwrap_or_else(|| Value::Str(SmolStr::default()))
+                                    }
+                                }
                                 Some(FieldSrc::Right(f)) => matched
                                     .and_then(|r| r.field_value(f))
                                     .unwrap_or_else(|| Value::Str(SmolStr::default())),
