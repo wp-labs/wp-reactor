@@ -152,12 +152,12 @@ pub(crate) struct MetricsSnapshot {
     alert_sink_dispatch_failed: u64,
     alert_channel_full: u64,
     alert_channel_depth: u64,
-    alert_serialize_failed: u64,
+    alert_append_failed: u64,
     alert_dispatch: u64,
     alert_no_sink_records: u64,
     alert_drain_dropped_records: u64,
     alert_escalate_failed: u64,
-    alert_serialize_nanos: u64,
+    alert_append_nanos: u64,
     evictor_sweeps: u64,
     evictor_time_evicted: u64,
     evictor_memory_evicted: u64,
@@ -329,9 +329,9 @@ impl MetricsSnapshot {
         ));
         out.push(metric(
             "alert",
-            "serialize_failed_total",
+            "append_failed_total",
             "",
-            self.alert_serialize_failed,
+            self.alert_append_failed,
         ));
         out.push(metric("alert", "dispatch_total", "", self.alert_dispatch));
         out.push(metric(
@@ -354,9 +354,9 @@ impl MetricsSnapshot {
         ));
         out.push(metric(
             "alert",
-            "serialize_nanos",
+            "append_nanos",
             "",
-            self.alert_serialize_nanos,
+            self.alert_append_nanos,
         ));
         for (rule, v) in &self.rule_events {
             out.push(metric("rule", "events_total", rule, *v));
@@ -806,12 +806,12 @@ pub struct RuntimeMetrics {
     alert_sink_dispatch_failed_total: AtomicU64,
     alert_channel_full_total: AtomicU64,
     alert_channel_depth: AtomicU64,
-    alert_serialize_failed_total: AtomicU64,
+    alert_append_failed_total: AtomicU64,
     alert_dispatch_total: AtomicU64,
     alert_no_sink_records_total: AtomicU64,
     alert_drain_dropped_records_total: AtomicU64,
     alert_escalate_failed_total: AtomicU64,
-    alert_serialize_nanos: AtomicU64,
+    alert_append_nanos: AtomicU64,
 
     evictor_sweeps_total: AtomicU64,
     evictor_time_evicted_total: AtomicU64,
@@ -1009,12 +1009,12 @@ impl RuntimeMetrics {
             alert_sink_dispatch_failed_total: AtomicU64::new(0),
             alert_channel_full_total: AtomicU64::new(0),
             alert_channel_depth: AtomicU64::new(0),
-            alert_serialize_failed_total: AtomicU64::new(0),
+            alert_append_failed_total: AtomicU64::new(0),
             alert_dispatch_total: AtomicU64::new(0),
             alert_no_sink_records_total: AtomicU64::new(0),
             alert_drain_dropped_records_total: AtomicU64::new(0),
             alert_escalate_failed_total: AtomicU64::new(0),
-            alert_serialize_nanos: AtomicU64::new(0),
+            alert_append_nanos: AtomicU64::new(0),
             evictor_sweeps_total: AtomicU64::new(0),
             evictor_time_evicted_total: AtomicU64::new(0),
             evictor_memory_evicted_total: AtomicU64::new(0),
@@ -1315,8 +1315,8 @@ impl RuntimeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn inc_alert_serialize_failed(&self) {
-        self.alert_serialize_failed_total
+    pub fn inc_alert_append_failed(&self) {
+        self.alert_append_failed_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1340,10 +1340,11 @@ impl RuntimeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Nanoseconds spent converting OutputRecords to DataRecords on the rule
-    /// workers' emit path (per-run counter, drained each export interval).
-    pub fn add_alert_serialize_nanos(&self, nanos: u64) {
-        self.alert_serialize_nanos
+    /// Nanoseconds spent on the record→列 append（`AlertColumnBuilder::append_record`）
+    /// in the rule workers' emit path（worker 侧输出构建; 与 sink 侧序列化区分,
+    /// per-run counter, drained each export interval）。
+    pub fn add_alert_append_nanos(&self, nanos: u64) {
+        self.alert_append_nanos
             .fetch_add(nanos, Ordering::Relaxed);
     }
 
@@ -1419,13 +1420,13 @@ impl RuntimeMetrics {
             alert_sink_dispatch_failed: self.drain_counter(&self.alert_sink_dispatch_failed_total),
             alert_channel_full: self.drain_counter(&self.alert_channel_full_total),
             alert_channel_depth: self.alert_channel_depth.load(Ordering::Relaxed),
-            alert_serialize_failed: self.drain_counter(&self.alert_serialize_failed_total),
+            alert_append_failed: self.drain_counter(&self.alert_append_failed_total),
             alert_dispatch: self.drain_counter(&self.alert_dispatch_total),
             alert_no_sink_records: self.drain_counter(&self.alert_no_sink_records_total),
             alert_drain_dropped_records: self
                 .drain_counter(&self.alert_drain_dropped_records_total),
             alert_escalate_failed: self.drain_counter(&self.alert_escalate_failed_total),
-            alert_serialize_nanos: self.drain_counter(&self.alert_serialize_nanos),
+            alert_append_nanos: self.drain_counter(&self.alert_append_nanos),
             evictor_sweeps: self.drain_counter(&self.evictor_sweeps_total),
             evictor_time_evicted: self.drain_counter(&self.evictor_time_evicted_total),
             evictor_memory_evicted: self.drain_counter(&self.evictor_memory_evicted_total),

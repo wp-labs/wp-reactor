@@ -566,7 +566,7 @@ impl StatsTask {
                     metrics.inc_alert_emitted_total(self.rule_name());
                 }
                 for _ in 0..outcome.failed {
-                    metrics.inc_alert_serialize_failed();
+                    metrics.inc_alert_append_failed();
                 }
             }
         }
@@ -639,7 +639,7 @@ impl StatsTask {
                     .entry(Arc::clone(&target))
                     .or_insert_with(|| AlertColumnBuilder::new(Arc::clone(&target)));
                 if let Err(e) = builder.append_record(&record) {
-                    wf_warn!(pipe, rule = %record.rule_name, error = %e, "stats alert serialize failed");
+                    wf_warn!(pipe, rule = %record.rule_name, error = %e, "stats alert append failed");
                 }
                 if builder.len() >= EMIT_CHUNK {
                     let batch = builder.finish();

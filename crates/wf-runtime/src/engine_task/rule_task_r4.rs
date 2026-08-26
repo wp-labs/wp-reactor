@@ -8,7 +8,7 @@
 //! - eager 机器路径（debug 开）: `advance_at_with_progress` + Accumulate/
 //!   Advance/Matched 细节日志分支。
 //! - on-each direct 批量化路径（debug 关）与 per-event 路径（debug 开）,
-//!   含采样器（detail / serialize）重置分支。
+//!   含采样器（detail / append）重置分支。
 //! - conv-sink 通道关闭（process_batch / scan_timeouts / flush）丢弃日志。
 //! - `emit` / `emit_batch` 的采样、空集、should_flush 分支;
 //!   `flush_alerts` 通道关闭（带 metrics）计数。
@@ -562,8 +562,8 @@ async fn process_batch_each_direct_per_event_debug_on_samplers() {
     });
     run_with_dispatch(debug_dispatch(), move || async move {
         // 65 批 × 1 事件 → emit_each_direct 65 次: 越过 emit_sample_remaining
-        // 与 serialize_sample_remaining 的 64 采样间隔, 触发采样重置分支
-        // （detail/e2e + serialize timing）。
+        // 与 append_sample_remaining 的 64 采样间隔, 触发采样重置分支
+        // （detail/e2e + append timing）。
         for i in 0..65u64 {
             let events: Arc<Vec<Arc<Event>>> = Arc::new(vec![Arc::new(Event {
                 fields: EngineHashMap::default(),
@@ -804,7 +804,7 @@ async fn scan_timeouts_machine_none_deferred_none_is_noop() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn emit_each_direct_serialize_failure_path() {
+async fn emit_each_direct_append_failure_path() {
     // 通过直接调用 emit_each_direct 不可行（需内部字段）; 改用 emit 追加一个
     // 结构化非有限数值 → AlertColumnBuilder::append_record 失败 → 计数分支。
     let task = make_task(Spec {

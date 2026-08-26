@@ -49,11 +49,11 @@ fn counters_flow_through_snapshot() {
     m.inc_alert_emitted("r1", "10.0.0.1", "sip=10.0.0.1");
     m.inc_alert_channel_send_failed();
     m.inc_sink_dispatch_failed();
-    m.inc_alert_serialize_failed();
+    m.inc_alert_append_failed();
     m.add_alert_no_sink_records(2);
     m.add_sink_drain_dropped_records(1);
     m.inc_alert_escalate_failed();
-    m.add_alert_serialize_nanos(123);
+    m.add_alert_append_nanos(123);
     m.inc_alert_dispatch();
     m.observe_alert_dispatch(Duration::from_millis(2));
     m.observe_rule_scan_timeout("r1", Duration::from_millis(3));
@@ -105,12 +105,12 @@ fn counters_flow_through_snapshot() {
     assert_eq!(snap.alert_sink_dispatch_failed, 1);
     assert_eq!(snap.alert_channel_full, 1);
     assert_eq!(snap.alert_channel_depth, 3);
-    assert_eq!(snap.alert_serialize_failed, 1);
+    assert_eq!(snap.alert_append_failed, 1);
     assert_eq!(snap.alert_dispatch, 1);
     assert_eq!(snap.alert_no_sink_records, 2);
     assert_eq!(snap.alert_drain_dropped_records, 1);
     assert_eq!(snap.alert_escalate_failed, 1);
-    assert_eq!(snap.alert_serialize_nanos, 123);
+    assert_eq!(snap.alert_append_nanos, 123);
 
     assert_eq!(snap.window_evict.get("w1"), Some(&2));
 

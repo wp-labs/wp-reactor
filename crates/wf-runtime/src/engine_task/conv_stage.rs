@@ -341,7 +341,7 @@ impl ConvStageTask {
             Ok(d) => d,
             Err(e) => {
                 if let Some(metrics) = &self.metrics {
-                    metrics.inc_alert_serialize_failed();
+                    metrics.inc_alert_append_failed();
                 }
                 log::warn!("conv stage alert export error: {e}");
                 return;

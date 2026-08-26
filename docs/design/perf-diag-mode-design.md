@@ -73,14 +73,14 @@
 
 ### 3.1 诊断档 = 禁止开关组合 + 规则子集
 
-| 诊断档 | cut_rules | cut_output | cut_append | cut_recv | cut_serialize | 规则 | 测的段 |
+| 诊断档 | cut_rules | cut_output | cut_append | cut_recv | cut_sink_write | 规则 | 测的段 |
 |---|---|---|---|---|---|---|---|
 | `recv` | — | — | — | ✅ 禁止 | — | 全量 | 注入 + TCP 接收（非哨兵帧 body 即丢, 2026-08-25 新档） |
 | `decode` | — | — | ✅ 禁止 | — | — | 全量 | + 解码（append 前即丢, 2026-08-25 新档） |
 | `floor` | ✅ 禁止 | ✅ 禁止 | — | — | — | 空 | + 窗口 append（+ fanout/ack） |
 | `rules` | — | ✅ 禁止 | — | — | — | 全量 | + 规则求值（增量 = 规则墙） |
 | `emit` | — | — | — | — | ✅ 禁止 | 全量 | + 输出构建（close 列式 + builder + 通道投递; sink 即丢, 2026-08-25 新档） |
-| `full` | — | — | — | — | — | 全量 | + 序列化 + sink 写（增量 = 序列化 + 写成本） |
+| `full` | — | — | — | — | — | 全量 | + 列→行物化 + 序列化 + sink 写（增量 = 序列化 + 写成本） |
 | `family_*` | — | ✅ 禁止 | — | — | — | 按前缀子集 | 家族墙（c_* / g_* / pr_* …） |
 | `budget:X`※ | — | — | — | — | — | 全量 | parse_buffer_bytes=X（**重启例外**） |
 
@@ -91,9 +91,11 @@
   parse 管线槽位、不进窗口/引擎/输出）; **哨兵流豁免**（`__wf_sentinel`）——测量协议
   （sentinel 驱动档位切换 + EPS 计算）必须活着。增量（floor − decode）= 窗口 append
   + fanout 投递成本。
-- `emit` 档（cut_serialize, 2026-08-25）在 `dispatch_batch` 入口生效：AlertBatch 到 sink
-  即丢（不序列化不写）——隔离「输出构建 + 通道投递」; **哨兵 sink 豁免**（哨兵记录
-  经此落盘驱动档位切换）。增量（full − emit）= 序列化 + sink 写成本。
+- `emit` 档（cut_sink_write, 2026-08-25）在 `dispatch_batch` 入口生效：AlertBatch 到 sink
+  即丢（不物化、不序列化、不写）——隔离「输出构建 + 通道投递」; **哨兵 sink 豁免**（哨兵记录
+  经此落盘驱动档位切换）。增量（full − emit）= 列→行物化 + 序列化 + sink 写成本。
+  ⚠ 命名：sink 侧门控叫 `cut_sink_write`，与 worker 侧的 `append_*` 指标（record→列
+  构建，属输出构建段）区分——旧名 `cut_serialize` 与指标名碰撞易误导，2026-08-26 统一改名。
 
 - ※ **`budget:X` 不是诊断档语法（实现定稿）**：`PerfStage` 无 budget 字段，
   `perf-diag.toml` 里写不出这一档；列在表里只为墙梯口径完整——它实际是人工流程
@@ -162,7 +164,7 @@ cut_output = true
   **ack 保留**（ack 在 `pull_and_advance` 于 process_batch 返回后执行）→
   append/ack 收敛在 floor 档成立，完成判定可用。
 - **cut_output**：`RuleTask::emit` 在 metrics 计数之后、`AlertColumnBuilder::append_record`
-  之前 return——跳过 serialize/stage/commit/fanout，**emitted 计数保留**（#18 类
+  之前 return——跳过 record→列构建/通道/sink 物化+序列化+写，**emitted 计数保留**（#18 类
   门禁仍可跑）。`emit` / `emit_batch` 均如此（计数在门控之前）。
   - **on-each 直投路径例外（实现定稿）**：`emit_each_direct` /
     `emit_each_direct_batch` / `emit_each_direct_batch_columnar` /
