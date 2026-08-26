@@ -235,11 +235,6 @@ pub(super) fn spawn_evictor_task(
 /// The task acks `seq + 1` per processed batch; time-based eviction only
 /// removes batches every live consumer has acked, so sweeps can no longer
 /// drop unconsumed data.
-/// stats last/top（P4, Q18/Q19）的行字段提取子集: yield/entity 引用字段 ∪ 度量
-/// 字段。桶键字段不入行（close 已单独注入 scope_key）。`None` = 全部 schema 列
-/// （计划无 last/top 时无需提取——`None` 让执行器跳过整行提取）。
-
-
 /// stats spill 文件路径（M4）: `WF_SPILL_DIR`（默认 `spill`）下的
 /// `spill_{rule}_{pid}{_shard}.rb`。窗口级生命周期：close 后 `cleanup` 删除；
 /// 进程异常退出残留由下次启动清理（设计 §8 时机④）。
@@ -260,6 +255,9 @@ fn spill_file_path(rule_name: &str, shard: Option<usize>) -> PathBuf {
     }
 }
 
+/// stats last/top（P4, Q18/Q19）的行字段提取子集: yield/entity 引用字段 ∪ 度量
+/// 字段。桶键字段不入行（close 已单独注入 scope_key）。`None` = 全部 schema 列
+/// （计划无 last/top 时无需提取——`None` 让执行器跳过整行提取）。
 fn stats_row_fields(
     plan: &RulePlan,
     stats_plan: &wf_lang::plan::StatsPlan,
