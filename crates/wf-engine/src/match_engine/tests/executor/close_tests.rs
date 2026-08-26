@@ -50,6 +50,8 @@ fn execute_close_both_ok() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
@@ -93,6 +95,8 @@ fn execute_close_close_not_ok() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 0,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let result = exec.execute_close(&close).unwrap();
@@ -133,6 +137,8 @@ fn execute_close_event_not_ok() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 0,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let result = exec.execute_close(&close).unwrap();
@@ -185,6 +191,8 @@ fn execute_close_score_can_use_count_alias() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
@@ -282,6 +290,8 @@ fn execute_close_yield_nested_path_via_bind_data() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
@@ -356,6 +366,8 @@ fn execute_close_yield_nested_path_missing_bind_omits() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
@@ -465,6 +477,8 @@ fn q12_like_close() -> CloseOutput {
         window_end_time_nanos: 10_000_000_000,
         machine_id: String::new(),
         last_event_nanos: 9_000,
+        row_fields: None,
+        row_field_names: None,
     }
 }
 

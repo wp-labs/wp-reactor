@@ -245,6 +245,8 @@ pub(super) fn evaluate_close(
         bind_data: snapshot_bind_data(instance.alias_states.as_deref()),
         watermark_nanos,
         last_event_nanos: instance.last_event_nanos,
+        row_fields: None,
+        row_field_names: None,
         event_first_time_nanos: evidence_first,
         event_last_time_nanos: evidence_last,
         window_start_time_nanos: instance.created_at,

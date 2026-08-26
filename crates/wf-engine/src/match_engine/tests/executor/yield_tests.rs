@@ -830,6 +830,8 @@ fn execute_close_yield_can_reference_score() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
@@ -914,6 +916,8 @@ fn execute_close_yield_can_reference_time_system_vars() {
         window_end_time_nanos: 10_000_000_000,
         machine_id: String::new(),
         last_event_nanos: 3_000_000_000,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
@@ -1003,6 +1007,8 @@ fn execute_close_yield_can_use_count_label_inside_if_and_concat() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
@@ -1107,6 +1113,8 @@ fn execute_close_yield_can_use_avg_on_field() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
@@ -1236,6 +1244,8 @@ fn execute_close_yield_can_use_bind_alias_aggregates() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
@@ -1466,6 +1476,8 @@ fn execute_close_yield_can_use_fmt_with_count() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close(&close).unwrap().unwrap();
@@ -2568,6 +2580,8 @@ fn execute_close_missing_optional_float_field_is_omitted_not_fatal() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec

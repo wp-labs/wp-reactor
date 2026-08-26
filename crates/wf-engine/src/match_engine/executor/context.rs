@@ -61,6 +61,13 @@ pub(crate) fn build_eval_context(
     step_plans: &[&StepPlan],
     trigger_event: Option<&Event>,
     needed: &CloseCtxFields,
+    // stats last/top 行字段引用（2026-08-26 q18 close 内存）: Named 窄化下
+    // `field_values` 不注入行字段, 由 CloseOutput.row_fields 携带——按需
+    // `value_at` 读（零拷贝, 与注入语义一致）。None = 无（CEP 路径/All 已注入）。
+    row_fields: Option<(
+        &std::sync::Arc<crate::match_engine::executor::RowFields>,
+        &std::sync::Arc<Vec<String>>,
+    )>,
 ) -> Event {
     // 预容量：q6 每事件 emit 的 ctx 构建（微基准 202ns/evt）中 hashbrown 渐进
     // 扩容是分配热点（sample: fallible_with_capacity）。容量 = 键数 + 输出
@@ -146,6 +153,20 @@ pub(crate) fn build_eval_context(
                     && let Some(last_val) = values.last()
                 {
                     fields.insert(field_name.clone().into(), last_val.clone());
+                }
+            }
+            // stats 行字段引用 fallback（2026-08-26 q18）: Named 下 field_values
+            // 不注入行字段——从 CloseOutput.row_fields 按列序 value_at（零拷贝）。
+            // 首个度量循环即注入; 后序度量同名字段已被 contains_key 跳过（与
+            // field_values 注入同语义——「首个有该字段的 StepData 胜出」）。
+            if let Some((rf, names)) = row_fields {
+                for (pos, name) in names.iter().enumerate() {
+                    if needed.wants(name)
+                        && !fields.contains_key(name.as_str())
+                        && let Some(v) = rf.value_at(pos)
+                    {
+                        fields.insert(name.as_str().into(), v);
+                    }
                 }
             }
         }
@@ -640,6 +661,7 @@ mod tests {
             &step_plans,
             None,
             &CloseCtxFields::All,
+            None,
         );
         assert_eq!(
             event.fields.get("sip"),

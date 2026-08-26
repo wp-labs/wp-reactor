@@ -426,6 +426,7 @@ async fn emit_close_record_intermediate_target_dropped() {
         110,
         &ScopeKey::Empty,
         &[],
+        true,
     );
     let lookup = RegistryLookup::new(&task.router);
     let mut builders: HashMap<Arc<str>, AlertColumnBuilder> = HashMap::new();
@@ -449,6 +450,7 @@ async fn emit_close_record_unqualified_returns_none() {
         110,
         &ScopeKey::Empty,
         &[],
+        true,
     );
     // And 模式 + event_ok=false → 未达标 → Ok(None)。
     close.event_ok = false;

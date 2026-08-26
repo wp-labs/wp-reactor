@@ -168,6 +168,8 @@ fn synthetic_close(rule_name: &str, values: &[f64], labels: &[String]) -> CloseO
         bind_data: Vec::<BindData>::new(),
         watermark_nanos: 1_800_000_000_000,
         last_event_nanos: 1_799_000_000_000,
+        row_fields: None,
+        row_field_names: None,
         event_first_time_nanos: 0,
         event_last_time_nanos: 1_799_000_000_000,
         window_start_time_nanos: 0,

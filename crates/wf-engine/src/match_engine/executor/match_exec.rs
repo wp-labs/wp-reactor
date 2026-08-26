@@ -83,6 +83,7 @@ impl RuleExecutor {
             &step_plans,
             matched.trigger_event.as_deref(),
             &self.close_ctx_fields,
+            None,
         );
         self.build_match_alert(matched, &ctx, emit_time_nanos)
     }
@@ -122,6 +123,7 @@ impl RuleExecutor {
             &step_plans,
             matched.trigger_event.as_deref(),
             &self.close_ctx_fields,
+            None,
         );
         if !execute_joins(
             &self.live_joins,
@@ -451,6 +453,7 @@ impl RuleExecutor {
                                         &step_plans,
                                         m.trigger_event.as_deref(),
                                         &self.close_ctx_fields,
+            None,
                                     )
                                 });
                                 // 复用循环外已算的 wfx_id / summary（字节一致）。

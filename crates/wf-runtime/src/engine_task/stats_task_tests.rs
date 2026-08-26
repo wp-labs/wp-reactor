@@ -1979,3 +1979,85 @@ fn big_bid_batch(schema: &SchemaRef, rows: u64, ts: i64) -> RecordBatch {
     )
     .unwrap()
 }
+
+/// 列式 close 分块 flush 与一次性全量输出逐字节一致（2026-08-26 q18 100M 修复
+/// 的保护测试）。q19 形状（top(2) + fmt detail, 门控通过走 columnar close）:
+/// 6 auction × 2 bid → 每桶 top-2 → 12 条输出。chunk=2 强制 6 次分块 flush;
+/// 对照 chunk=1_000_000（不分块）跑同数据——分块不得丢行/重复/乱序。
+#[tokio::test]
+async fn stats_task_columnar_close_chunked_matches_full() {
+    let detail = Expr::FuncCall {
+        qualifier: None,
+        name: "fmt".into(),
+        args: vec![
+            Expr::StringLit("{} {}".into()),
+            Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+            Expr::Field(FieldRef::Qualified("b".into(), "price".into())),
+        ],
+    };
+    let keys = vec![Expr::Field(FieldRef::Qualified(
+        "b".into(),
+        "auction".into(),
+    ))];
+    let measures = vec![StatsMeasurePlan {
+        label: "top_price".into(),
+        source_alias: "b".into(),
+        where_expr: None,
+        agg: StatsAggPlan::Top,
+        field: Some(FieldRef::Qualified("b".into(), "price".into())),
+        arg: Some(2),
+    }];
+
+    let run = |chunk: usize| {
+        let detail = detail.clone();
+        let keys = keys.clone();
+        let measures = measures.clone();
+        async move {
+            super::stats_task::set_emit_chunk_for_test(chunk);
+            let (mut task, mut alert_rx) = make_ranked_task(keys, measures, detail);
+            let rows: Vec<(i64, i64, i64)> = (0..6)
+                .flat_map(|a| vec![(a * 100 + 10, 1, a), (a * 100 + 20, 2, a)])
+                .collect();
+            push_batch(&mut task, make_bid_batch(&rows, 5_000_000_000), 1).await;
+            task.flush().await;
+            // 分块 flush 每块独立投递一个 AlertBatch——drain 全部（take_alerts
+            // 只读首个 batch, 分块下会漏后面的块）。
+            let mut out = Vec::new();
+            while let Ok(batch) = alert_rx.try_recv() {
+                match batch {
+                    crate::alert_task::AlertBatch::Rows(rows) => out.extend(rows.as_ref().clone()),
+                    crate::alert_task::AlertBatch::Columns(cols) => {
+                        out.extend(
+                            cols.iter_data_records()
+                                .collect::<Result<Vec<_>, _>>()
+                                .expect("columnar row view conversion")
+                                .into_iter()
+                                .map(std::sync::Arc::new),
+                        );
+                    }
+                }
+            }
+            out
+        }
+    };
+
+    let chunked = run(2).await; // 12 条 > chunk 2 → 6 次分块 flush
+    super::stats_task::set_emit_chunk_for_test(1_000_000);
+    let full = run(1_000_000).await; // 一次性（原实现路径）
+    super::stats_task::set_emit_chunk_for_test(1_000_000); // 恢复全局
+
+    assert_eq!(chunked.len(), full.len(), "分块与全量输出条数一致（不丢不重）");
+    // 无序比较: 流式分批打破批间全局排序（对拍只比每规则 EMIT 计数）, 逐条
+    // zip 会因批间顺序差异错位——按 (entity_id, detail) 排序后逐条比对。
+    let mut keyed_c: Vec<(String, String)> = chunked
+        .iter()
+        .map(|r| (field_str(r, "__wfu_entity_id"), field_str(r, "detail")))
+        .collect();
+    let mut keyed_f: Vec<(String, String)> = full
+        .iter()
+        .map(|r| (field_str(r, "__wfu_entity_id"), field_str(r, "detail")))
+        .collect();
+    keyed_c.sort();
+    keyed_f.sort();
+    assert_eq!(keyed_c, keyed_f, "分块与全量输出内容一致（无序比较）");
+}

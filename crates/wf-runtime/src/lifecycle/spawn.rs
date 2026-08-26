@@ -35,7 +35,7 @@ use wf_lang::plan::RulePlan;
 /// alive until the (slow) rule task consumes it. 256 (~3.5s of backlog at the
 /// q5 ingest rate) covers transient pauses without the unbounded-channel RSS
 /// blow-up; raise further only if a *sustained* single-shard skew is observed.
-pub(crate) const RULE_CHANNEL_CAPACITY: usize = 256;
+pub(crate) const RULE_CHANNEL_CAPACITY: usize = 64;
 use wf_lang::ast::FieldRef;
 
 use crate::alert_task;

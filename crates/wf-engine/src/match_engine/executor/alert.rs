@@ -721,6 +721,86 @@ pub(super) fn build_summary_split(
     )
 }
 
+/// (label, measure_value) 迭代器版 build_wfx_id（2026-08-26 q18 stats 直写）:
+/// 免构造 StepData（每桶 4 个 label String + 结构 ≈ 4G 分配, allocator 保留
+/// 致 RSS 虚高）。字节流 = `build_wfx_id_iter`（测试 `wfx_from_labels_matches`）。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_wfx_id_from_labels<'a>(
+    rule_name: &str,
+    scope_key: &[Value],
+    fired_at: &str,
+    steps: impl Iterator<Item = (Option<&'a str>, f64)>,
+    origin: &AlertOrigin,
+) -> String {
+    let mut hasher = Fnv1a::new();
+    hasher.update(rule_name.as_bytes());
+    hasher.update(b"\x00");
+    for v in scope_key {
+        hash_value_bytes(&mut hasher, v);
+        hasher.update(b"\x1f");
+    }
+    hasher.update(b"\x00");
+    hasher.update(fired_at.as_bytes());
+    hasher.update(b"\x00");
+    for (label, measure) in steps {
+        if let Some(label) = label {
+            hasher.update(label.as_bytes());
+        }
+        hasher.update(b"\x1e");
+        hasher.update(&measure.to_bits().to_le_bytes());
+        hasher.update(b"\x1f");
+    }
+    hasher.update(b"\x00");
+    hasher.update(origin.as_str().as_bytes());
+    hex_encode(&hasher.finalize().to_le_bytes())
+}
+
+/// (label, measure_value) 迭代器版 build_summary（2026-08-26 q18 stats 直写）。
+/// 字节流 = `build_summary_iter`（step 段: 有 label 则 `label=measure; `,
+/// 无 label 则 `step{i}=measure; `——由调用方保证 label 迭代器含 None 槽位,
+/// 顺序与索引一致）。
+pub(super) fn build_summary_from_labels<'a>(
+    rule_name: &str,
+    keys: &[FieldRef],
+    scope_key: &[Value],
+    steps: impl Iterator<Item = (Option<&'a str>, f64)>,
+    origin: &AlertOrigin,
+) -> String {
+    use std::fmt::Write as _;
+    let steps_vec: Vec<(Option<&str>, f64)> = steps.collect();
+    let mut out = String::with_capacity(64 + scope_key.len() * 12 + steps_vec.len() * 16);
+    let _ = write!(out, "rule={}; ", rule_name);
+    if scope_key.is_empty() {
+        out.push_str("scope=global; ");
+    } else {
+        out.push_str("scope=[");
+        for (i, (fr, val)) in keys.iter().zip(scope_key.iter()).enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{}={}", field_ref_name(fr), value_to_string(val));
+        }
+        out.push_str("]; ");
+    }
+    for (i, (label, measure)) in steps_vec.iter().enumerate() {
+        match label {
+            Some(label) => {
+                out.push_str(label);
+                out.push('=');
+                write_fixed1(&mut out, *measure);
+                out.push_str("; ");
+            }
+            None => {
+                let _ = write!(out, "step{}=", i);
+                write_fixed1(&mut out, *measure);
+                out.push_str("; ");
+            }
+        }
+    }
+    let _ = write!(out, "origin={}", origin.as_str());
+    out
+}
+
 fn build_summary_iter<'a>(
     rule_name: &str,
     keys: &[FieldRef],

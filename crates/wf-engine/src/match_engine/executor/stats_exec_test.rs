@@ -1422,7 +1422,7 @@ fn stats_columnar_keyed_precision_matches_empty_key_native() {
     // sum 精确断言（i128 累加器域）: 2^53 + (2^53+1) = 2^54+1
     let accs = keyed.window.find_bucket(&ScopeKey::Int(1)).unwrap();
     assert_eq!(
-        accs[1].sum_i128,
+        accs[1].numeric().sum,
         9_007_199_254_740_992i128 + 9_007_199_254_740_993i128,
         "≥2^53 的 sum 不得 f64 舍入"
     );
@@ -2303,19 +2303,15 @@ fn stats_memory_guard_merge_partial_rejects_over_limit() {
     // 分片 partial 带来键 2（分片侧限额内放行）——协调片合并时超限被拒。
     let partial: Vec<(ScopeKey, Vec<StatsAccum>)> = vec![(
         ScopeKey::Int(2),
-        vec![StatsAccum {
-            count: 1,
-            top_entries: Some(vec![TopEntry {
-                key: 200.0,
-                row: {
-                    let layout = std::sync::Arc::new(RowFieldLayout::all_other(&["price".to_string()]));
-                    let mut rf = RowFields::empty(layout);
-                    rf.set(0, Some(Value::Number(200.0)));
-                    rf
-                },
-            }]),
-            ..StatsAccum::default()
-        }],
+        vec![StatsAccum::Top(vec![TopEntry {
+            key: 200.0,
+            row: {
+                let layout = std::sync::Arc::new(RowFieldLayout::all_other(&["price".to_string()]));
+                let mut rf = RowFields::empty(layout);
+                rf.set(0, Some(Value::Number(200.0)));
+                rf
+            },
+        }])],
     )];
     exec.merge_partial(partial, 1);
     assert_eq!(
@@ -2326,6 +2322,51 @@ fn stats_memory_guard_merge_partial_rejects_over_limit() {
     assert_eq!(exec.window.event_count, 2, "partial 的 event_count 仍累计");
     assert_eq!(exec.final_measure_values_by_bucket().len(), 1, "只有键 1 桶");
 }
+#[test]
+fn stats_memory_guard_q18_shape_budget_not_overcounted() {
+    // 2026-08-26 q18 预算口径回归：度量专用累加器后 allowance = 432B/键
+    // （旧全功能累加器口径 1664B/键，含 last 160B/度量死预算）。43.2MB 预算下
+    // 新口径阈值 10 万键、旧口径仅 ~2.6 万键——喂 5 万唯一键：新口径全收
+    // （不丢键），旧口径会拒收 ~2.4 万。若 allowance 口径回退（变高），本测试红。
+    let plan = keyed_plan(
+        vec![field_key("b", "bidder"), field_key("b", "auction")],
+        vec![
+            last_measure("last_price", "price"),
+            last_measure("last_channel", "channel"),
+            last_measure("last_url", "url"),
+            last_measure("last_dateTime", "dateTime"),
+        ],
+    );
+    let mut exec = StatsExecutor::new(plan);
+    // 43.2MB: 新口径 432B → 阈值 10 万键; 旧口径 1664B → 阈值 2.6 万键。
+    exec.set_memory_limit("guard_q18_shape", Some(43_200_000));
+    const N: usize = 50_000;
+    let rows: Vec<HashMap<String, Value>> = (0..N)
+        .map(|i| {
+            row(&[
+                ("bidder", num(1000.0 + (i % 1010) as f64)),
+                ("auction", num(i as f64)), // auction 唯一 → (bidder,auction) 唯一
+                ("price", num(100.0)),
+                ("channel", str_val("Google")),
+                ("url", str_val("https://www.nexmark.com/a/b/c/item.htm?query=1")),
+                ("dateTime", num(1_700_000_000_000_000_000.0 + i as f64)),
+            ])
+        })
+        .collect();
+    exec.process_rows(&rows, extract);
+    assert_eq!(
+        exec.window.over_limit_new_buckets(),
+        0,
+        "新口径 5 万键全收（旧口径 ~2.6 万键即开始拒收）"
+    );
+    assert_eq!(exec.window.event_count, N as u64, "全部行归并");
+    assert_eq!(
+        exec.window.buckets.values().map(|c| c.len()).sum::<usize>(),
+        N,
+        "桶数 = 键数, 无丢键"
+    );
+}
+
 /// 快速验证：q18 形状列式路径的 RowFields layout 是否紧凑（2026-08-26）。
 #[test]
 fn q18_columnar_layout_is_compact() {

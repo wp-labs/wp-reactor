@@ -1512,6 +1512,7 @@ fn build_eval_context_all_mode_materializes_every_synthetic_field() {
         &[&step_plans[0]],
         None,
         &CloseCtxFields::All,
+        None,
     );
 
     assert_eq!(ctx.fields["sip"], str_val("10.0.0.1"));
@@ -1564,6 +1565,7 @@ fn build_eval_context_named_mode_and_trigger_event_precedence() {
         &[&step_plans[0]],
         None,
         &CloseCtxFields::Named(HashSet::from(["user".to_string()])),
+        None,
     );
     // Only the key + the one requested bare field are present.
     assert_eq!(ctx.fields["sip"], str_val("10.0.0.1"));
@@ -1582,6 +1584,7 @@ fn build_eval_context_named_mode_and_trigger_event_precedence() {
         &[],
         Some(&trigger),
         &CloseCtxFields::All,
+        None,
     );
     assert_eq!(
         ctx2.fields["sip"],
@@ -1601,6 +1604,7 @@ fn build_eval_context_named_mode_and_trigger_event_precedence() {
         &[&step_plans[0]],
         None,
         &CloseCtxFields::All,
+        None,
     );
     assert_eq!(
         ctx3.fields["sip"],
@@ -2239,6 +2243,8 @@ fn sample_close(close_mode: CloseMode, event_ok: bool, close_ok: bool) -> CloseO
         window_start_time_nanos: 0,
         window_end_time_nanos: 1_000,
         last_event_nanos: 1_000,
+        row_fields: None,
+        row_field_names: None,
     }
 }
 

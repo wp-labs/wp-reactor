@@ -37,10 +37,19 @@ use super::TASK_SEQ;
 use super::task_types::{StatsTaskConfig, WindowSource};
 use super::{register_notifications, wait_any};
 
-/// 分块 emit 阈值（P5+ q19 close 峰值优化）: builder 累计达该条数即投递并重建。
-/// 100 万条/批——投递仍批量（非逐条, 不引入 §9.9 前的逐桶 await 回压）, 但
-/// 单次构建峰值从全窗口（q19 30M ≈ 7.94M 条）降到阈值量级。
-const EMIT_CHUNK: usize = 1_000_000;
+/// 分块 emit 阈值（P5+ q19 close 峰值优化; 2026-08-26 q18 100M 列式路径补上）:
+/// builder/列式 closes 累计达该条数即投递并重建。100 万条/批——投递仍批量
+/// （非逐条, 不引入 §9.9 前的逐桶 await 回压）, 但单次构建峰值从全窗口
+/// （q19 30M ≈ 7.94M 条 / q18 100M ≈ 29.35M 条）降到阈值量级。
+/// `AtomicUsize` 供测试调小阈值以触发分块路径（生产恒 100 万）。
+static EMIT_CHUNK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(1_000_000);
+
+/// 测试辅助: 调小分块阈值（触发分块 flush 分支; 生产不用）。
+#[cfg(test)]
+pub(super) fn set_emit_chunk_for_test(n: usize) {
+    EMIT_CHUNK.store(n, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// 输入分区分片的窗口 partial（空键 stats, 2026-08-24 q15）:
 /// 非协调片在窗口 close 时发送的**原始累加状态**。
@@ -486,67 +495,119 @@ impl StatsTask {
         if has_row_measures {
             // 行字段列名（P5 紧凑化: 列数组按此列序存储; 生产经 spawn 恒有子集）
             let row_names = self.stats.row_field_names().cloned();
-            for bucket in self.stats.close_window_by_bucket_rows() {
-                let n_records = bucket.measures.iter().map(Vec::len).max().unwrap_or(1);
-                for k in 0..n_records {
-                    // 空条目度量（如 top(0) 无产出）安全读取: 越界/空 → 0.0/None,
-                    // 否则取 min(k, len-1) 的携带语义（标量跨 top 条目重复）。
-                    let values: Vec<f64> = bucket
-                        .measures
-                        .iter()
-                        .map(|m| {
-                            m.get(usize::min(k, m.len().saturating_sub(1)))
-                                .map_or(0.0, |e| e.measure_value)
-                        })
-                        .collect();
-                    let row_fields: Vec<Option<&std::sync::Arc<wf_engine::match_engine::RowFields>>> = bucket
-                        .measures
-                        .iter()
-                        .map(|m| {
-                            m.get(usize::min(k, m.len().saturating_sub(1)))
-                                .and_then(|e| e.row_fields.as_ref())
-                        })
-                        .collect();
+            // 窗级 emit_time 提前算（分块 flush 共用同一值——emit_time 不喂语义）。
+            let emit_time_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64;
+            // 流式 close（2026-08-26 q18 100M）: 分批 take 桶 → 转
+            // StatsCloseBucket → 构建 CloseOutput → 分块 flush。原实现
+            // `close_window_by_bucket_rows` 一次性全量 2935 万 StatsCloseBucket
+            // （~5.9G）与状态数据/输出结构同时驻留 → close 期 RSS 峰值 30G+。
+            // 每批 ~EMIT_CHUNK 桶, 峰值 ≈ 批大小×条均 + 分块装载缓冲。
+            let chunk = EMIT_CHUNK.load(std::sync::atomic::Ordering::Relaxed);
+            loop {
+                let buckets = self.stats.take_buckets_up_to(chunk);
+                if buckets.is_empty() {
+                    break;
+                }
+                if columnar_close {
+                    // 列式直写（2026-08-26 q18 close 内存 v3）: 直接消费桶数据
+                    // 装载（不构建 CloseOutput——省 per-record ~500B 分配,
+                    // allocator 保留致 RSS 虚高）。每批独立 builder + 投递。
+                    self.flush_stats_close_buckets(
+                        buckets,
+                        &labels,
+                        row_names.clone(),
+                        emit_time_nanos,
+                        window_end,
+                    )
+                    .await;
+                } else {
+                    // 非列式回退（门控不满足的规则）: 原 CloseOutput 路径
+                    for bucket in self.stats.close_buckets_to_rows(buckets) {
+                        let n_records = bucket.measures.iter().map(Vec::len).max().unwrap_or(1);
+                        for k in 0..n_records {
+                            // 空条目度量（如 top(0) 无产出）安全读取: 越界/空 → 0.0/None,
+                            // 否则取 min(k, len-1) 的携带语义（标量跨 top 条目重复）。
+                            let values: Vec<f64> = bucket
+                                .measures
+                                .iter()
+                                .map(|m| {
+                                    m.get(usize::min(k, m.len().saturating_sub(1)))
+                                        .map_or(0.0, |e| e.measure_value)
+                                })
+                                .collect();
+                            let row_fields: Vec<Option<&std::sync::Arc<wf_engine::match_engine::RowFields>>> = bucket
+                                .measures
+                                .iter()
+                                .map(|m| {
+                                    m.get(usize::min(k, m.len().saturating_sub(1)))
+                                        .and_then(|e| e.row_fields.as_ref())
+                                })
+                                .collect();
+                            let close = build_stats_close_output(
+                                self.rule_name(),
+                                &values,
+                                &labels,
+                                &row_fields,
+                                row_names.as_deref().map(|v| v.as_slice()),
+                                window_start,
+                                window_end,
+                                &bucket.key,
+                                &key_fields,
+                                self.executor.close_ctx_is_all(),
+                            );
+                            self.emit_close_record(&close, &lookup, &mut builders).await;
+                        }
+                    }
+                }
+            }
+            self.stats.finish_close_window();
+        } else {
+            // 标量快路径（Q12/16/17 原样）: 每桶 1 条。同样流式分批 take +
+            // 分块 flush（2026-08-26 q18 修复延伸——q16 100M 关窗输出量大时
+            // 全量收集同样压峰值）。
+            let none_rows: Vec<Option<&std::sync::Arc<wf_engine::match_engine::RowFields>>> =
+                vec![None; labels.len()];
+            let emit_time_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64;
+            let chunk = EMIT_CHUNK.load(std::sync::atomic::Ordering::Relaxed);
+            loop {
+                let buckets = self.stats.take_buckets_up_to(chunk);
+                if buckets.is_empty() {
+                    break;
+                }
+                for (scope_key, values) in self.stats.close_bucket_values(buckets) {
                     let close = build_stats_close_output(
                         self.rule_name(),
                         &values,
                         &labels,
-                        &row_fields,
-                        row_names.as_deref().map(|v| v.as_slice()),
+                        &none_rows,
+                        None,
                         window_start,
                         window_end,
-                        &bucket.key,
+                        &scope_key,
                         &key_fields,
+                        self.executor.close_ctx_is_all(),
                     );
                     if columnar_close {
                         columnar_closes.push(close);
+                        if columnar_closes.len() >= chunk {
+                            self.flush_columnar_closes(
+                                &mut columnar_closes,
+                                emit_time_nanos,
+                            )
+                            .await;
+                        }
                     } else {
                         self.emit_close_record(&close, &lookup, &mut builders).await;
                     }
                 }
             }
-        } else {
-            // 标量快路径（Q12/16/17 原样）: 每桶 1 条
-            let none_rows: Vec<Option<&std::sync::Arc<wf_engine::match_engine::RowFields>>> =
-                vec![None; labels.len()];
-            for (scope_key, values) in self.stats.close_window_by_bucket() {
-                let close = build_stats_close_output(
-                    self.rule_name(),
-                    &values,
-                    &labels,
-                    &none_rows,
-                    None,
-                    window_start,
-                    window_end,
-                    &scope_key,
-                    &key_fields,
-                );
-                if columnar_close {
-                    columnar_closes.push(close);
-                } else {
-                    self.emit_close_record(&close, &lookup, &mut builders).await;
-                }
-            }
+            self.stats.finish_close_window();
         }
         // 输出链消融（2026-08-26）：只切**列式 alert 装载**（`execute_close_direct_`
         // `batch_columnar` = AlertColumnBuilder 装载 + 投递），保留上面循环的
@@ -558,27 +619,14 @@ impl StatsTask {
             return;
         }
         if columnar_close && !columnar_closes.is_empty() {
-            // 批量列式 close: 单 target（静态 yield_target）builder, 一次投递。
-            // emit_time 用窗级墙钟（emit_time 不喂语义, 与 L4 文档一致）。
+            // 尾部 flush（分块执行, 见 flush_columnar_closes: 独立 builder +
+            // finish + 投递 + 释放——不累积）。
             let emit_time_nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as i64;
-            let target = self.executor.static_yield_target();
-            let builder = builders
-                .entry(Arc::clone(target))
-                .or_insert_with(|| AlertColumnBuilder::new(Arc::clone(target)));
-            let outcome = self
-                .executor
-                .execute_close_direct_batch_columnar(&columnar_closes, builder, emit_time_nanos);
-            if let Some(metrics) = &self.metrics {
-                for _ in 0..outcome.appended {
-                    metrics.inc_alert_emitted_total(self.rule_name());
-                }
-                for _ in 0..outcome.failed {
-                    metrics.inc_alert_append_failed();
-                }
-            }
+            self.flush_columnar_closes(&mut columnar_closes, emit_time_nanos)
+                .await;
         }
         for (target, mut builder) in builders {
             if builder.is_empty() {
@@ -616,7 +664,88 @@ impl StatsTask {
         }
     }
 
-    /// 单条 CloseOutput → record → 批量 builder（指标计数 + 中间流丢弃 + append）。
+    /// stats close 列式直写 flush（2026-08-26 q18 close 内存 v3）: 桶批 →
+    /// `execute_stats_close_batch_columnar` 直装载（**不构建 CloseOutput**——
+    /// 省 per-record ~500B 分配）→ 独立 builder finish + 投递 + 释放。
+    /// 语义/字节 = `flush_columnar_closes` 的 CloseOutput 路径（对拍契约）。
+    async fn flush_stats_close_buckets(
+        &self,
+        buckets: Vec<(
+            wf_engine::match_engine::ScopeKey,
+            Vec<wf_engine::match_engine::StatsAccum>,
+        )>,
+        labels: &[String],
+        row_names: Option<std::sync::Arc<Vec<String>>>,
+        emit_time_nanos: i64,
+        window_end_nanos: i64,
+    ) {
+        if buckets.is_empty() {
+            return;
+        }
+        // 输出链消融（与 CloseOutput 路径同款门控）: 只切 alert 装载——归并
+        // 照常（桶已 take）, emitted 不计数。
+        if crate::perf_diag::perf_cut_alert() {
+            return;
+        }
+        let close_buckets = self.stats.close_buckets_to_rows(buckets);
+        let target = self.executor.static_yield_target();
+        let mut builder = AlertColumnBuilder::new(Arc::clone(target));
+        let outcome = self
+            .executor
+            .execute_stats_close_batch_columnar(
+                &close_buckets,
+                labels,
+                row_names.as_ref(),
+                &mut builder,
+                emit_time_nanos,
+                window_end_nanos,
+            );
+        if let Some(metrics) = &self.metrics {
+            for _ in 0..outcome.appended {
+                metrics.inc_alert_emitted_total(self.rule_name());
+            }
+            for _ in 0..outcome.failed {
+                metrics.inc_alert_append_failed();
+            }
+        }
+        if !builder.is_empty() {
+            let batch = builder.finish();
+            self.dispatch_columns(target, batch).await;
+        }
+    }
+
+    /// 列式 close 分块 flush（2026-08-26 q18 100M 修复 v2）: 每块**独立 builder**,
+    /// execute 后立即 finish + dispatch + 释放——**不得累积到同一 builder**
+    /// （v1 缺陷: append 同一 builder 直到尾部 finish, 分块执行下 builder 仍持有
+    /// 全窗口 2935 万条列数据 → 内存峰值 40G+ 没降）。与 `emit_close_record`
+    /// （非列式）的「满 chunk 投递 + 重建」同款。
+    async fn flush_columnar_closes(
+        &self,
+        columnar_closes: &mut Vec<CloseOutput>,
+        emit_time_nanos: i64,
+    ) {
+        if columnar_closes.is_empty() {
+            return;
+        }
+        let target = self.executor.static_yield_target();
+        let mut builder = AlertColumnBuilder::new(Arc::clone(target));
+        let outcome = self
+            .executor
+            .execute_close_direct_batch_columnar(columnar_closes, &mut builder, emit_time_nanos);
+        if let Some(metrics) = &self.metrics {
+            for _ in 0..outcome.appended {
+                metrics.inc_alert_emitted_total(self.rule_name());
+            }
+            for _ in 0..outcome.failed {
+                metrics.inc_alert_append_failed();
+            }
+        }
+        if !builder.is_empty() {
+            let batch = builder.finish();
+            self.dispatch_columns(target, batch).await;
+        }
+        columnar_closes.clear();
+    }
     ///
     /// **分块 emit（P5+）**: builder 达到 [`EMIT_CHUNK`] 条立即投递并重建——
     /// 避免一次性构建全窗口 alert 的峰值内存（q19 30M close 7.94M 条一次构建
@@ -657,7 +786,7 @@ impl StatsTask {
                 if let Err(e) = builder.append_record(&record) {
                     wf_warn!(pipe, rule = %record.rule_name, error = %e, "stats alert append failed");
                 }
-                if builder.len() >= EMIT_CHUNK {
+                if builder.len() >= EMIT_CHUNK.load(std::sync::atomic::Ordering::Relaxed) {
                     let batch = builder.finish();
                     self.dispatch_columns(&target, batch).await;
                     builders.remove(&target);
@@ -817,6 +946,10 @@ fn build_stats_close_output(
     window_end: i64,
     scope_key: &ScopeKey,
     key_fields: &[String],
+    // true = 每个度量都展开行字段（`CloseCtxFields::All`——L3 聚合/`_step_i_field_*`
+    // 依赖每度量 field_values）; false = 只首个带 row_fields 的度量展开
+    // （Named 窄化——`build_eval_context` 合并时首个有该字段的 StepData 胜出）。
+    row_expand_each: bool,
 ) -> CloseOutput {
     let scope_values = scope_key_to_values(scope_key);
     let mut first_field_values = EngineHashMap::<String, Vec<Value>>::default();
@@ -825,6 +958,24 @@ fn build_stats_close_output(
             first_field_values.insert(kf.clone(), vec![kv.clone()]);
         }
     }
+    // 行字段展开策略（2026-08-26 q18 close 内存 v2）: Named 窄化下**不深拷贝**
+    // 行字段到 field_values（6 字段 Value/String/Vec × 千万级条 ≈ 5-6G 分配,
+    // allocator 保留致 RSS 虚高）——由 CloseOutput.row_fields 携带 [`RowFields`]
+    // Arc 引用（零拷贝）, 装载侧 `resolve_close_field`/`build_eval_context`
+    // 按需 `value_at` 读。All 门控（L3 聚合 `_step_i_field_*`）保持每度量独立
+    // 展开（语义不变）。
+    let (row_field_ref, row_field_names_arc) = if row_expand_each {
+        (None, None) // All 下 field_values 每度量注入, 无需引用
+    } else {
+        // Named 下: 首个带行字段的度量引用（q18 4 个 last 共享同一 Arc, 零拷贝）
+        let rf = row_fields.iter().filter_map(|r| r.as_ref()).next().cloned();
+        let names = if rf.is_some() {
+            row_names.map(|ns| std::sync::Arc::new(ns.to_vec()))
+        } else {
+            None
+        };
+        (rf, names)
+    };
     let close_step_data = values
         .iter()
         .zip(labels.iter())
@@ -832,12 +983,16 @@ fn build_stats_close_output(
         .map(|(i, (v, label))| {
             // 键字段注入首个 StepData; last/top 行字段列数组（P5 紧凑化）按
             // row_names 列序展开注入其所在度量 StepData——yield 读 `b.*`。
+            // 2026-08-26: first_field_values 仅首个 StepData 使用一次——move
+            // 而非 clone（省 2 键 String + Vec 深拷贝, 2935 万 CloseOutput）。
             let mut fv = if i == 0 {
-                first_field_values.clone()
+                std::mem::take(&mut first_field_values)
             } else {
                 EngineHashMap::default()
             };
-            if let (Some(names), Some(row)) = (row_names, row_fields.get(i).copied().flatten()) {
+            if row_expand_each
+                && let (Some(names), Some(row)) = (row_names, row_fields.get(i).copied().flatten())
+            {
                 for (pos, val) in row.iter_values().enumerate() {
                     if let Some(v) = val
                         && let Some(name) = names.get(pos)
@@ -857,9 +1012,17 @@ fn build_stats_close_output(
             }
         })
         .collect();
+    let row_fields_out = if row_expand_each {
+        None // All 下 field_values 已注入, 无需引用
+    } else {
+        // Named 下: 携带首个带行字段的度量引用（零拷贝）
+        row_field_ref.as_ref().cloned()
+    };
     CloseOutput {
         rule_name: rule_name.to_string(),
         scope_key: scope_values,
+        row_fields: row_fields_out.cloned(),
+        row_field_names: row_field_names_arc,
         machine_id: String::new(),
         close_reason: CloseReason::Timeout,
         event_ok: true,

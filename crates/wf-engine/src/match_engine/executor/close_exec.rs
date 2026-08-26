@@ -7,16 +7,18 @@ use crate::alert::{AlertColumnBuilder, AlertOrigin, OutputRecord};
 use crate::error::CoreResult;
 use crate::match_engine::columnar::{CVec, cscalar_to_value};
 use crate::match_engine::match_engine::{
-    CloseOutput, Event, StepData, Value, WindowLookup, eval_field_value, field_ref_name,
-    value_to_string,
+    CloseOutput, CloseReason, Event, StepData, Value, WindowLookup, eval_field_value,
+    field_ref_name, value_to_string,
 };
+use crate::match_engine::executor::StatsCloseBucket;
 
 use super::EachDirectBatchStats;
 use super::RuleExecutor;
 use super::YieldKind;
 use super::alert::{
-    build_summary, build_summary_split, build_wfx_id, format_nanos_utc, now_nanos, EntityIdCache,
-    OriginArcs, WfxPrefixCache,
+    build_summary, build_summary_from_labels, build_summary_split, build_wfx_id,
+    build_wfx_id_from_labels, format_nanos_utc, now_nanos, EntityIdCache, OriginArcs,
+    WfxPrefixCache,
 };
 use super::context::{build_eval_context, execute_joins};
 use super::eval::{
@@ -134,6 +136,7 @@ impl RuleExecutor {
             &step_plans,
             None,
             &self.close_ctx_fields,
+            close_row_fields(close),
         );
         let ctx = annotate_close_step_stages(ctx, close.event_step_data.len());
         self.build_close_alert(close, &all_step_data, &ctx)
@@ -164,6 +167,7 @@ impl RuleExecutor {
             &step_plans,
             None,
             &self.close_ctx_fields,
+            close_row_fields(close),
         );
         ctx = annotate_close_step_stages(ctx, close.event_step_data.len());
         // join 返回值：缺省 inner/interval inner miss 与 anti 命中 → 抑制 close 输出
@@ -617,6 +621,7 @@ impl RuleExecutor {
                                         &[],
                                         None,
                                         &self.close_ctx_fields,
+                                        close_row_fields(close),
                                     )
                                 });
                         let yield_meta = YieldMeta {
@@ -725,12 +730,32 @@ fn resolve_close_field(close: &CloseOutput, keys: &[FieldRef], name: &str) -> Op
             return Some(v.clone());
         }
     }
+    // stats last/top 行字段引用（2026-08-26 q18 close 内存）: Named 下 field_values
+    // 不注入行字段, 由 CloseOutput.row_fields 携带——按需 value_at（零拷贝）,
+    // 与 field_values 注入语义一致（值相同）。
+    if let (Some(rf), Some(names)) = (&close.row_fields, &close.row_field_names)
+        && let Some(pos) = names.iter().position(|n| n == name)
+    {
+        return rf.value_at(pos);
+    }
     for bd in &close.bind_data {
         if let Some(v) = bd.field_values.get(name).and_then(|vs| vs.last()) {
             return Some(v.clone());
         }
     }
     None
+}
+
+/// 2026-08-26 q18 close 内存: CloseOutput 行字段引用（Named 下 field_values 不
+/// 注入行字段, 装载/ctx 按需读）。返回 (RowFields Arc, 列名 Arc) 或 None。
+fn close_row_fields(close: &CloseOutput) -> Option<(
+    &std::sync::Arc<crate::match_engine::executor::RowFields>,
+    &std::sync::Arc<Vec<String>>,
+)> {
+    match (&close.row_fields, &close.row_field_names) {
+        (Some(rf), Some(names)) => Some((rf, names)),
+        _ => None,
+    }
 }
 
 fn field_ref_name_of(expr: &Expr) -> &str {
@@ -772,7 +797,19 @@ impl RuleExecutor {
     /// 空串，与解释路径 None→"" 一致。Number→Float64 / Str→Utf8 / Bool→
     /// Boolean 列（`cscalar_to_value` 还原为原 `Value`，渲染字节一致）。
     pub(crate) fn close_batch_prepare(&self, closes: &[CloseOutput]) -> CloseBatchVecs {
-        let n = closes.len();
+        let keys: &[FieldRef] = &self.plan.match_plan.keys;
+        self.close_batch_prepare_with(closes.len(), |row, name| {
+            resolve_close_field(&closes[row], keys, name)
+        })
+    }
+
+    /// 物化源参数化的批级准备（2026-08-26 q18 stats 直写）: stats close 直装载
+    /// 用（输入 StatsCloseBucket 而非 CloseOutput, 免 CloseOutput 构建）。语义
+    /// 与 [`Self::close_batch_prepare`] 一致（键名恒注入 + General 引用字段）。
+    pub(crate) fn close_batch_prepare_with<F>(&self, n: usize, resolve: F) -> CloseBatchVecs
+    where
+        F: Fn(usize, &str) -> Option<Value>,
+    {
         let slots = self.plan.yield_plan.fields.len();
         if n == 0 {
             return CloseBatchVecs {
@@ -790,16 +827,347 @@ impl RuleExecutor {
         // 2. 统一物化器 + 槽位编译（层 2 收口，`RuleExecutor::compile_general_slots`）；
         //    物化失败（类型不一致/结构化值）→ 整批回退逐行（保守）。close 传空
         //    lets：解释 close 路径（build_eval_context）无 let 视图，内联会分叉。
-        let keys: &[FieldRef] = &self.plan.match_plan.keys;
         CloseBatchVecs {
-            general_cvecs: self.compile_general_slots(
-                &ref_fields,
-                n,
-                |row, name| resolve_close_field(&closes[row], keys, name),
-                &[],
-            ),
+            general_cvecs: self.compile_general_slots(&ref_fields, n, resolve, &[]),
         }
     }
+
+    /// stats close 列式直写（2026-08-26 q18 close 内存 v3）: 输入为
+    /// [`StatsCloseBucket`] 批次（stats_task 流式分批产出）——**不构建
+    /// CloseOutput**（省 per-record 的 rule_name String / scope_key Vec /
+    /// StepData 深结构 ≈ 500B × 千万条分配, allocator 保留致 RSS 虚高）。
+    /// 每桶轻量 StepData 一次（label 克隆, field_values 空 HashMap 零分配）,
+    /// k 记录只更新 measure_value; Field/General yield 从 scope_key /
+    /// row_fields 按需读。输出与 `execute_close_direct_batch_columnar` 字节
+    /// 一致（对拍契约）。门控: 调用方须 `close_plan_columnar_safe()`（列式
+    /// 前置, 无逐行 fallback——门控保证 general 编译成功）。
+    pub fn execute_stats_close_batch_columnar(
+        &self,
+        buckets: &[StatsCloseBucket],
+        labels: &[String],
+        row_names: Option<&std::sync::Arc<Vec<String>>>,
+        builder: &mut AlertColumnBuilder,
+        emit_time_nanos: i64,
+        window_end_nanos: i64,
+    ) -> EachDirectBatchStats {
+        let mut stats = EachDirectBatchStats::default();
+        debug_assert!(self.close_plan_columnar_safe());
+        let statics = self.output_static();
+        let keys = &self.plan.match_plan.keys;
+        let emit_time = self.cached_emit_time(emit_time_nanos);
+        let score_const = match &self.plan.score_plan.expr {
+            Expr::Number(n) => *n,
+            _ => unreachable!("columnar close gate requires a constant score"),
+        };
+        let entity_const: Option<&str> = match &self.plan.entity_plan.entity_id_expr {
+            Expr::StringLit(s) => Some(s.as_str()),
+            _ => None,
+        };
+        let entity_field_name: Option<&str> = match &self.plan.entity_plan.entity_id_expr {
+            Expr::Field(fr) => Some(field_ref_name(fr)),
+            _ => None,
+        };
+        let yield_specs = &statics.yield_specs;
+
+        // 常量 yield 注册（与 execute_close_direct_batch_columnar 相同）
+        let mut const_yields: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (field, (name, field_type)) in
+            self.plan.yield_plan.fields.iter().zip(yield_specs.iter())
+        {
+            let literal: Option<Value> = match &field.value {
+                Expr::Number(n) => Some(Value::Number(*n)),
+                Expr::StringLit(s) => Some(Value::Str(s.clone().into())),
+                Expr::Bool(b) => Some(Value::Bool(*b)),
+                _ => None,
+            };
+            let const_value = literal.map(|v| {
+                RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), v).and_then(
+                    |v| {
+                        let v = v.expect("literal yield values are never omitted");
+                        crate::alert::export_yield_value(&v, field_type.as_ref())
+                    },
+                )
+            });
+            match const_value {
+                Some(Ok((meta, model_value))) => {
+                    if let Err(e) = builder.register_yield_column(name, Some((meta, model_value))) {
+                        log::warn!("alert export error: {e}");
+                        stats.failed += stats_bucket_rows(buckets);
+                        return stats;
+                    }
+                    const_yields.insert(field.name.as_str());
+                }
+                Some(Err(e)) => {
+                    log::warn!("alert export error: {e}");
+                    stats.failed += stats_bucket_rows(buckets);
+                    return stats;
+                }
+                None => {
+                    if let Err(e) = builder.register_yield_column(name, None) {
+                        log::warn!("alert export error: {e}");
+                        stats.failed += stats_bucket_rows(buckets);
+                        return stats;
+                    }
+                }
+            }
+        }
+
+        // 行数 = Σ桶 n_records（last=1, top=N）; 全局行号 → (桶, 记录) 映射
+        let mut row_index: Vec<(usize, usize)> = Vec::new();
+        let mut total = 0usize;
+        for (bi, b) in buckets.iter().enumerate() {
+            let n = b.measures.iter().map(Vec::len).max().unwrap_or(1);
+            for k in 0..n {
+                row_index.push((bi, k));
+            }
+            total += n;
+        }
+        builder.reserve_rows(total);
+
+        // prepare: General yield 物化源 = (桶, 记录) → 字段值
+        let prepared = self.close_batch_prepare_with(total, |row, name| {
+            let (bi, k) = row_index[row];
+            resolve_stats_bucket_field(&buckets[bi], k, keys, labels, row_names, name)
+        });
+
+        let mut wfx_ids: Vec<SmolStr> = Vec::with_capacity(total);
+        let mut scores: Vec<f64> = Vec::with_capacity(total);
+        let mut entity_ids: Vec<SmolStr> = Vec::with_capacity(total);
+        let mut fired_ats: Vec<String> = Vec::with_capacity(total);
+        let mut origins: Vec<Arc<str>> = Vec::with_capacity(total);
+        let mut close_reasons: Vec<Arc<str>> = Vec::with_capacity(total);
+        let mut summaries: Vec<Arc<str>> = Vec::with_capacity(total);
+        let mut staged_rows: Vec<Vec<(usize, wp_model_core::model::DataType, wp_model_core::model::Value)>> =
+            Vec::with_capacity(total);
+        let mut fired_at_cache: Option<(i64, String)> = None;
+        let mut wfx_cache: Option<WfxPrefixCache> = None;
+        let mut entity_cache = EntityIdCache::new();
+        let origin_arcs = OriginArcs::new();
+        let mut global_row = 0usize;
+
+        for bucket in buckets.iter() {
+            let n_records = bucket.measures.iter().map(Vec::len).max().unwrap_or(1);
+            let scope_values = stats_scope_key_to_values(&bucket.key);
+            for k in 0..n_records {
+                // (label, measure_value) 惰性迭代器——零 StepData 构造（2026-08-26
+                // v4: 删每桶 4 个 StepData ≈ 4G 分配）。
+                let step_iter = labels.iter().enumerate().map(|(i, label)| {
+                    let mv = bucket
+                        .measures
+                        .get(i)
+                        .and_then(|m| m.get(usize::min(k, m.len().saturating_sub(1))))
+                        .map_or(0.0, |e| e.measure_value);
+                    (Some(label.as_str()), mv)
+                });
+                let origin = AlertOrigin::Close {
+                    reason: CloseReason::Timeout,
+                };
+                let fired_at = match &fired_at_cache {
+                    Some((w, s)) if *w == window_end_nanos => s.clone(),
+                    _ => {
+                        let s = format_nanos_utc(window_end_nanos);
+                        fired_at_cache = Some((window_end_nanos, s.clone()));
+                        s
+                    }
+                };
+                let entity_id: String = if let Some(s) = entity_const {
+                    s.to_string()
+                } else {
+                    let key = scope_values.as_slice();
+                    entity_cache.get_or(key, || {
+                        resolve_stats_bucket_field(
+                            bucket,
+                            k,
+                            keys,
+                            labels,
+                            row_names,
+                            entity_field_name.unwrap_or(""),
+                        )
+                        .map(|v| value_to_string(&v))
+                        .unwrap_or_default()
+                    })
+                };
+                let wfx_id = build_wfx_id_from_labels(
+                    &self.plan.name,
+                    &scope_values,
+                    &fired_at,
+                    step_iter.clone(),
+                    &origin,
+                );
+                let summary = build_summary_from_labels(
+                    &self.plan.name,
+                    keys,
+                    &scope_values,
+                    step_iter,
+                    &origin,
+                );
+                for (field_idx, (field, (name, field_type))) in self
+                    .plan
+                    .yield_plan
+                    .fields
+                    .iter()
+                    .zip(yield_specs.iter())
+                    .enumerate()
+                {
+                    let value = match &field.value {
+                        Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_)
+                            if const_yields.contains(field.name.as_str()) =>
+                        {
+                            continue;
+                        }
+                        Expr::Number(n) => Value::Number(*n),
+                        Expr::StringLit(s) => Value::Str(s.clone().into()),
+                        Expr::Bool(b) => Value::Bool(*b),
+                        Expr::Field(_) => resolve_stats_bucket_field(
+                            bucket,
+                            k,
+                            keys,
+                            labels,
+                            row_names,
+                            field_ref_name_of(&field.value),
+                        )
+                        .unwrap_or_else(|| Value::Str(String::new().into())),
+                        general => match prepared
+                            .general_cvecs
+                            .get(field_idx)
+                            .and_then(|c| c.as_ref())
+                        {
+                            Some(cvec) => match cvec.scalar_at(global_row) {
+                                Some(s) => cscalar_to_value(&s),
+                                None => Value::Str(SmolStr::default()),
+                            },
+                            None => {
+                                // 门控保证 compiled 成功; 防御性空串
+                                let _ = general;
+                                Value::Str(SmolStr::default())
+                            }
+                        },
+                    };
+                    match RuleExecutor::coerce_yield_field_value_with(
+                        name,
+                        field_type.as_ref(),
+                        value,
+                    ) {
+                        Ok(Some(v)) => {
+                            if let Err(e) =
+                                builder.stage_yield_cell(name, field_type.as_ref(), &v)
+                            {
+                                log::warn!("alert export error: {e}");
+                                stats.failed += 1;
+                                builder.take_staged();
+                                continue;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::warn!("alert export error: {e}");
+                            stats.failed += 1;
+                            builder.take_staged();
+                            continue;
+                        }
+                    }
+                }
+                staged_rows.push(builder.take_staged());
+
+                wfx_ids.push(SmolStr::from(wfx_id));
+                scores.push(score_const);
+                entity_ids.push(SmolStr::from(entity_id));
+                fired_ats.push(fired_at);
+                origins.push(Arc::clone(origin_arcs.origin(CloseReason::Timeout)));
+                close_reasons.push(Arc::clone(origin_arcs.close_reason(CloseReason::Timeout)));
+                summaries.push(Arc::from(summary));
+                stats.appended += 1;
+                global_row += 1;
+            }
+        }
+
+        if !wfx_ids.is_empty() {
+            builder.commit_close_rows_batch(
+                &wfx_ids,
+                &scores,
+                &entity_ids,
+                &fired_ats,
+                &statics.rule_name,
+                &statics.entity_type,
+                &origins,
+                &close_reasons,
+                &emit_time,
+                &summaries,
+                &staged_rows,
+            );
+        }
+        stats
+    }
+}
+
+
+/// Σ桶行数（stats 直写失败计数用）。
+fn stats_bucket_rows(buckets: &[StatsCloseBucket]) -> usize {
+    buckets
+        .iter()
+        .map(|b| b.measures.iter().map(Vec::len).max().unwrap_or(1))
+        .sum()
+}
+
+/// 桶键拆解为字段值列表（Pair 先序展开, 顺序与 keys 一致; stats 直写局部版）。
+fn stats_scope_key_to_values(key: &crate::match_engine::match_engine::ScopeKey) -> Vec<Value> {
+    match key {
+        crate::match_engine::match_engine::ScopeKey::Empty => vec![],
+        crate::match_engine::match_engine::ScopeKey::Int(i) => vec![Value::Number(*i as f64)],
+        crate::match_engine::match_engine::ScopeKey::Float(b) => {
+            vec![Value::Number(f64::from_bits(*b))]
+        }
+        crate::match_engine::match_engine::ScopeKey::Str(s) => vec![Value::Str(s.clone())],
+        crate::match_engine::match_engine::ScopeKey::Pair(a, b) => {
+            let mut v = stats_scope_key_to_values(a);
+            v.extend(stats_scope_key_to_values(b));
+            v
+        }
+    }
+}
+
+/// stats 桶字段解析（列式直写用; 语义 = `resolve_close_field` 对 stats 桶数据）:
+/// 键字段（scope_key）→ 度量 label → measure_value → 行字段（row_fields value_at）。
+fn resolve_stats_bucket_field(
+    bucket: &StatsCloseBucket,
+    record: usize,
+    keys: &[FieldRef],
+    labels: &[String],
+    row_names: Option<&std::sync::Arc<Vec<String>>>,
+    name: &str,
+) -> Option<Value> {
+    // 1. 键字段（scope_key 先序展开）
+    let scope_values = stats_scope_key_to_values(&bucket.key);
+    for (i, k) in keys.iter().enumerate() {
+        if field_ref_name(k) == name {
+            return scope_values.get(i).cloned();
+        }
+    }
+    // 2. 度量 label → measure_value（首个匹配; 与 resolve_close_field 的
+    //    label → Number(measure_value) 同语义）
+    for (i, label) in labels.iter().enumerate() {
+        if label == name {
+            let mv = bucket
+                .measures
+                .get(i)
+                .and_then(|m| m.get(usize::min(record, m.len().saturating_sub(1))))
+                .map_or(0.0, |e| e.measure_value);
+            return Some(Value::Number(mv));
+        }
+    }
+    // 3. 行字段（row_fields → value_at, 与 CloseOutput.row_fields 同口径）
+    if let (Some(names), Some(rf)) = (
+        row_names,
+        bucket.measures.iter().find_map(|m| {
+            m.get(usize::min(record, m.len().saturating_sub(1)))
+                .and_then(|e| e.row_fields.as_ref())
+        }),
+    ) {
+        if let Some(pos) = names.iter().position(|n| n == name) {
+            return rf.value_at(pos);
+        }
+    }
+    None
 }
 
 fn combine_step_plans<'a>(

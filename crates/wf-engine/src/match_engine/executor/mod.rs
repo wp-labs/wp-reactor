@@ -20,7 +20,8 @@ mod stats_exec;
 pub use each_exec::{EachDirectBatchStats, PipeEachRow, PipeRowSink};
 // 供 `match_engine::pub use executor::DistinctKey` 转发（stats distinct 键类型）。
 pub use stats_exec::{
-    DistinctKey, DistinctSet, RowFieldLayout, RowFields, StatsAccum, StatsExecutor, StatsWindowState,
+    DistinctKey, DistinctSet, RowFieldLayout, RowFields, StatsAccum, StatsCloseBucket,
+    StatsCloseEntry, StatsExecutor, StatsWindowState,
 };
 
 #[cfg(test)]
@@ -869,6 +870,14 @@ impl RuleExecutor {
     /// builder without re-deriving or re-allocating the target string.
     pub fn static_yield_target(&self) -> &Arc<str> {
         &self.output_static().yield_target
+    }
+
+    /// close ctx 是否 All（保守全字段构建——L3 聚合/窗口访问表达式用）。
+    /// stats close 据此决定行字段注入方式（Named 窄化下多 last 度量共享同一
+    /// [`RowFields`] Arc, 只需首个度量注入; All 下每度量独立注入, 保
+    /// `_step_i_field_*` 完整性）。
+    pub fn close_ctx_is_all(&self) -> bool {
+        matches!(self.close_ctx_fields, CloseCtxFields::All)
     }
 
     pub(crate) fn output_config(&self) -> &OutputConfig {

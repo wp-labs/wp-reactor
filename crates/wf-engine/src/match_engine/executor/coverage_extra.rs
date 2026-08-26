@@ -246,6 +246,8 @@ fn close_output(
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     }
 }
 
@@ -1230,6 +1232,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         &step_plans,
         None,
         &all,
+        None,
     );
     assert_eq!(ctx.fields.get("sip"), Some(&str_val("10.0.0.1")));
     assert_eq!(ctx.fields.get("dport"), Some(&num(443.0)));
@@ -1260,6 +1263,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         &[&StepPlan { branches: vec![] }],
         None,
         &all,
+        None,
     );
     assert_eq!(ctx.fields.get("sip"), Some(&str_val("10.0.0.1")));
     assert_eq!(ctx.fields.get("_step_0_measure"), Some(&num(99.0)));
@@ -1274,6 +1278,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         &[&StepPlan { branches: vec![] }],
         Some(&trigger),
         &all,
+        None,
     );
     assert_eq!(ctx.fields.get("sip"), Some(&str_val("10.0.0.1")));
     assert_eq!(ctx.fields.get("raw"), Some(&num(7.0)));
@@ -1288,6 +1293,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         &step_plans,
         None,
         &named,
+        None,
     );
     assert_eq!(ctx.fields.get("price"), Some(&num(3.0)));
     assert!(!ctx.fields.contains_key("login"), "label not requested");
@@ -1313,6 +1319,7 @@ fn build_eval_context_all_and_named_synthetic_fields() {
         &[],
         None,
         &all,
+        None,
     );
     assert_eq!(ctx.fields.get("_bind_win_count"), Some(&num(2.0)));
     assert_eq!(
@@ -1321,7 +1328,8 @@ fn build_eval_context_all_and_named_synthetic_fields() {
     );
     assert_eq!(ctx.fields.get("amount"), Some(&num(20.0)));
     let named = CloseCtxFields::Named(HashSet::from(["amount".to_string()]));
-    let ctx = build_eval_context(&keys, &scope_key, &[], &[bd], &[], None, &named);
+    let ctx = build_eval_context(&keys, &scope_key, &[], &[bd], &[], None, &named,
+        None);
     assert_eq!(ctx.fields.get("amount"), Some(&num(20.0)));
     assert!(!ctx.fields.contains_key("_bind_win_count"));
 }

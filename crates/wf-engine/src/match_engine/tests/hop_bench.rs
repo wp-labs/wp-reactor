@@ -235,6 +235,8 @@ fn make_close(scope: Vec<Value>, m: f64) -> CloseOutput {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 0,
+        row_fields: None,
+        row_field_names: None,
     }
 }
 

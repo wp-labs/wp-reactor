@@ -126,6 +126,7 @@ fn build_stats_close_output_injects_key_fields() {
         110,
         &ScopeKey::Pair(Box::new(ScopeKey::Int(7)), Box::new(ScopeKey::Int(8))),
         &key_fields,
+        true,
     );
     assert_eq!(close.rule_name, "stats_rule");
     assert_eq!(close.close_reason, CloseReason::Timeout);
@@ -153,6 +154,7 @@ fn build_stats_close_output_empty_keys_no_injection() {
         110,
         &ScopeKey::Empty,
         &[],
+        true,
     );
     assert!(close.close_step_data[0].field_values.is_empty());
     assert!(close.scope_key.is_empty());
@@ -183,6 +185,7 @@ fn build_stats_close_output_expands_row_fields() {
         110,
         &ScopeKey::Int(5),
         &[],
+        true, // All ctx: 每度量独立展开（保 _step_i_field_* 完整性）
     );
     let fv = &close.close_step_data[0].field_values;
     assert_eq!(fv.get("price"), Some(&vec![Value::Number(99.0)]));
@@ -389,4 +392,84 @@ fn rule_plan_fields_are_consistent() {
     // Smoke-check the helper plan compiles into an executor without panicking.
     let executor = RuleExecutor::new(stats_rule_plan());
     assert_eq!(executor.plan().name, "stats_rule");
+}
+
+/// Named 窄化（q18/q19 场景）: 行字段只展开首个带 row_fields 的度量——
+/// `build_eval_context` 合并时「首个有该字段的 StepData 胜出」（contains_key
+/// 跳过）, yield 读 `b.*` 从首个注入度量拿到即可; 后序度量 field_values 为空
+/// 但**不破坏语义**（2026-08-26 q18 100M close 优化, 4 倍分配 churn 削减）。
+#[test]
+fn build_stats_close_output_named_ctx_expands_first_row_only() {
+    use wf_engine::match_engine::{RowFieldLayout, RowFields};
+    let row_names = vec!["price".to_string(), "channel".to_string()];
+    let layout = std::sync::Arc::new(RowFieldLayout::all_other(&row_names));
+    let mut row_a = RowFields::empty(std::sync::Arc::clone(&layout));
+    row_a.set(0, Some(Value::Number(99.0)));
+    row_a.set(1, Some(Value::Str("web".into())));
+    let row_a = std::sync::Arc::new(row_a);
+    // 同一 Arc 共享（q18 4 个 last 度量同一行）
+    let row_fields: Vec<Option<&std::sync::Arc<RowFields>>> =
+        vec![Some(&row_a), Some(&row_a), Some(&row_a), Some(&row_a)];
+
+    let close = build_stats_close_output(
+        "stats_rule",
+        &[1.0, 2.0, 3.0, 4.0],
+        &[
+            "last_price".to_string(),
+            "last_channel".to_string(),
+            "last_url".to_string(),
+            "last_ts".to_string(),
+        ],
+        &row_fields,
+        Some(&row_names),
+        100,
+        110,
+        &ScopeKey::Int(5),
+        &[],
+        false, // Named ctx: 只首个展开
+    );
+    // Named 窄化（2026-08-26 v2）: field_values **完全不注入行字段**（避免
+    // 6 字段 Value/String/Vec 深拷贝 × 千万级条）——由 CloseOutput.row_fields
+    // 携带 [`RowFields`] Arc 引用, 装载侧按需 `value_at` 读。
+    for sd in &close.close_step_data {
+        assert!(sd.field_values.is_empty(), "Named 下 field_values 不注入行字段");
+    }
+    let rf = close.row_fields.as_ref().expect("携带行字段引用");
+    let names = close.row_field_names.as_ref().expect("携带列名");
+    assert_eq!(
+        rf.value_at(names.iter().position(|n| n == "price").unwrap()),
+        Some(Value::Number(99.0))
+    );
+    assert_eq!(
+        rf.value_at(names.iter().position(|n| n == "channel").unwrap()),
+        Some(Value::Str("web".into()))
+    );
+    // 度量 0 无 row_fields 时, 首个带 row 的度量（idx 1）承担注入
+    let row_fields_mixed: Vec<Option<&std::sync::Arc<RowFields>>> =
+        vec![None, Some(&row_a), Some(&row_a)];
+    let close2 = build_stats_close_output(
+        "stats_rule",
+        &[1.0, 2.0, 3.0],
+        &[
+            "cnt".to_string(),
+            "last_price".to_string(),
+            "last_channel".to_string(),
+        ],
+        &row_fields_mixed,
+        Some(&row_names),
+        100,
+        110,
+        &ScopeKey::Int(5),
+        &[],
+        false,
+    );
+    assert!(close2.close_step_data[0].field_values.is_empty());
+    // 首个带 row 的度量（idx 1）的引用被携带（混合度量: 任意非空 row_fields 即可）
+    let rf2 = close2.row_fields.as_ref().expect("mixed 度量也携带引用");
+    let names2 = close2.row_field_names.as_ref().expect("列名");
+    assert_eq!(
+        rf2.value_at(names2.iter().position(|n| n == "price").unwrap()),
+        Some(Value::Number(99.0))
+    );
+    assert!(close2.close_step_data[2].field_values.is_empty());
 }

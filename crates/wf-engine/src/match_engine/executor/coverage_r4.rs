@@ -223,6 +223,8 @@ fn close_output(
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         last_event_nanos: 1_700_000_000_000_000_000,
+        row_fields: None,
+        row_field_names: None,
     }
 }
 
@@ -824,6 +826,7 @@ fn build_eval_context_narrow_and_all() {
         &step_plans,
         Some(&trigger),
         &narrow,
+        None,
     );
     assert_eq!(ctx.fields.get("sip"), Some(&str_val("10.0.0.1")));
     assert_eq!(ctx.fields.get("fail"), Some(&num(3.0)));
@@ -849,6 +852,7 @@ fn build_eval_context_narrow_and_all() {
         &step_plans,
         None,
         &all,
+        None,
     );
     assert_eq!(
         ctx.fields.get("_step_0_values"),
@@ -878,6 +882,7 @@ fn build_eval_context_narrow_and_all() {
         &[&plan.event_steps[0]],
         None,
         &all,
+        None,
     );
     assert_eq!(ctx.fields.get("_step_0_source"), Some(&str_val("fail")));
 }

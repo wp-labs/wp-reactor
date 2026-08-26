@@ -253,6 +253,16 @@ pub struct CloseOutput {
     /// matching against right-table rows that appeared after the
     /// instance stopped receiving events.
     pub last_event_nanos: i64,
+    /// stats last/top 行字段引用（2026-08-26 q18 close 内存）: Named 窄化下
+    /// `build_stats_close_output` **不深拷贝行字段到 field_values**（每 CloseOutput
+    /// 6 字段 Value/String/Vec × 千万级条 ≈ 5-6G 分配, allocator 保留致 RSS 虚高）
+    /// ——改为携带 [`RowFields`] Arc 引用（零拷贝）, 装载侧
+    /// `resolve_close_field` / `build_eval_context` 按需 `value_at` 读。
+    /// `All` ctx（L3 函数 `_step_i_field_*`）仍每度量注入 field_values（不受影响）。
+    /// None = 无行字段（CEP 路径/标量度量）。
+    pub row_fields: Option<std::sync::Arc<crate::match_engine::executor::RowFields>>,
+    /// 行字段列名（与 `row_fields` 配套, 按此列序 `value_at`; None = 无）。
+    pub row_field_names: Option<std::sync::Arc<Vec<String>>>,
 }
 
 // ---------------------------------------------------------------------------

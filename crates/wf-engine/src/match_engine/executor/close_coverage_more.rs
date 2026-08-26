@@ -135,6 +135,8 @@ fn close_output(event_step_data: Vec<StepData>, close_step_data: Vec<StepData>) 
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         last_event_nanos: 123,
+        row_fields: None,
+        row_field_names: None,
     }
 }
 

@@ -356,6 +356,8 @@ fn join_close_with_joins() {
         window_end_time_nanos: 0,
         machine_id: String::new(),
         last_event_nanos: 0,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close_with_joins(&close, &wl).unwrap().unwrap();
@@ -643,6 +645,8 @@ fn join_asof_close_uses_last_event_nanos() {
         window_end_time_nanos: watermark,
         machine_id: String::new(),
         last_event_nanos: last_event,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close_with_joins(&close, &wl).unwrap().unwrap();
@@ -745,6 +749,8 @@ fn join_interval_inner_close_miss_suppresses() {
         window_end_time_nanos: 30_000_000_000,
         machine_id: String::new(),
         last_event_nanos: 30_000_000_000,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let result = exec.execute_close_with_joins(&close, &wl).unwrap();
@@ -809,6 +815,8 @@ fn join_interval_inner_close_hit_outputs() {
         window_end_time_nanos: 30_000_000_000,
         machine_id: String::new(),
         last_event_nanos: 30_000_000_000,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let alert = exec.execute_close_with_joins(&close, &wl).unwrap().unwrap();
@@ -872,6 +880,8 @@ fn join_plain_inner_close_miss_suppresses() {
         window_end_time_nanos: 30_000_000_000,
         machine_id: String::new(),
         last_event_nanos: 30_000_000_000,
+        row_fields: None,
+        row_field_names: None,
     };
 
     let result = exec.execute_close_with_joins(&close, &wl).unwrap();

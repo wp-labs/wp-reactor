@@ -4217,6 +4217,8 @@ async fn conv_stage_emits_sealed_close_to_sink() {
         window_start_time_nanos: 0,
         window_end_time_nanos: 60_000_000_000,
         last_event_nanos: 0,
+        row_fields: None,
+        row_field_names: None,
     };
     conv_tx
         .send(crate::engine_task::ConvCloseBatch {
@@ -4330,6 +4332,8 @@ fn conv_stage_test_close() -> wf_engine::match_engine::CloseOutput {
         window_start_time_nanos: 0,
         window_end_time_nanos: 60_000_000_000,
         last_event_nanos: 0,
+        row_fields: None,
+        row_field_names: None,
     }
 }
 

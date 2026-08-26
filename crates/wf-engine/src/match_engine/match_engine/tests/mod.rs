@@ -40,6 +40,8 @@ fn conv_close(label: &str, measure: f64, scope: Vec<Value>) -> CloseOutput {
         window_start_time_nanos: 0,
         window_end_time_nanos: 0,
         last_event_nanos: 0,
+        row_fields: None,
+        row_field_names: None,
     }
 }
 
