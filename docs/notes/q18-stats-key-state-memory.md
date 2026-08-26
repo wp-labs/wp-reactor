@@ -218,6 +218,64 @@ allocator 保留 + close flush 峰值叠加），非采样器漏采、非批内�
 （macOS Instruments / malloc_history），记为待查。RULE_CHANNEL_CAPACITY=64 保留
 （EPS 略升 14.66M、RSS 微降，无害）。
 
+## 10.2 close 峰值归因定案（2026-08-26，memory_probe + 消融 + chunk 实验）
+
+**实测数据**（`q18_close_alloc_footprint`，CountingAlloc，release）：
+
+| 规模 | state_hold | convert_peak | **load_peak** | 每行 avg |
+|---|---|---|---|---|
+| 100 万桶 | 776.6MB | 64MB | **1093.9MB** | 1094B |
+| 300 万桶 | 2335.1MB | 191.9MB | **3414.5MB** | 1139B |
+
+- **load_peak 严格线性**（1M→3M 3.12×）——不是超线性；但**每行装载峰值 1094B**
+  （非文档估算的 200B）是核心：q18 100M close 每批 367 万行 × 1094B ≈ 4G/批瞬时。
+- **fmt detail 只占 7%**（`q18_close_fmt_vs_const`：fmt 1094B/行 vs 常量 1017B/行，
+  差 77MB/100 万行）——**1094B/行的 93% 与 detail 内容无关**，是系统列
+  （wfx_id/entity_id/fired_at/summary/origin/reason）+ staged_rows Vec 头 +
+  ModelValue 大 enum（~56B/cell）×2 cell + yield_cols 双份缓冲。**fmt 直写优化
+  收益上限 ~7%，不值得做**。
+- **state_hold 每桶 777B vs 文档 336B**（2.3× 未归因）：RowFields 共享后仍高，
+  需另查（可能 HashMap 槽/链结构）。
+- **消融**（WF_DIAG_CUT_ALERT=1）：正常 42G → 23.5G → **close alert 装载+转换
+  贡献 ~18.5G**；CUT_ALERT 仍 23.5G = 状态 9.8 + 窗口 3.5 + close 求值工作态 ~10G。
+- **chunk 实验**（WF_EMIT_CHUNK 生产可配置化，新加）：
+
+  | chunk | RSS | EPS |
+  |---|---|---|
+  | 100 万（默认） | 40.5G | 12.6M |
+  | 20 万 | 35.2G（-5.3） | 11.5M |
+  | 5 万 | 32.8G（-7.7） | 9.7M（-23%） |
+
+  → 单调降但边际递减，EPS 受损。**结论：close 装载峰值不是 42G 全部**——
+  剩余大头 = 状态 9.8G（语义）+ 窗口 3.5G + close 求值工作态（非装载）。
+- **最终判断**：q18 100M 40G 中 ~14G 是语义/窗口硬账（**q18 100M 无法 <10G**，
+  状态 9.8G 本身已接近红线）；~26G 为 close 期工作态，经三项实验（消融/装载/
+  fmt）拆解后无可再压的单点（装载已直写、分块已生效、fmt 非大头）。
+  **WF_EMIT_CHUNK=200000（-5.3G，EPS -9%）为可接受权衡**，生产可配。
+- **遗留**：state_hold 777B vs 336B（2.3×）待查；每行 1094B 装载的系统列
+  双份缓冲（builder 内 staged + yield_cols）理论可优化但跨 wp-model-core 边界，
+  收益与风险不成比。
+
+## 10.1 100M 峰值归因（2026-08-26，metrics + 墙梯 + RSS 曲线）
+
+**40G 构成**（100M 单独跑 3 次稳定 37.8-40.8G）：
+
+| 成分 | 量 | 性质 |
+|---|---|---|
+| stats 状态（2935 万键 × 336B） | ~9.8G | 语义必然（键数=数据特征） |
+| 窗口（bid 2.1 + auction 2.1 + person 0.6） | ~4.9G | 有界（字节 cap 生效） |
+| **未归因（帧/工作态/allocator 保留）** | **~25G** | 峰值在 close flush 期（sample 253），非 ingest |
+
+- **30M 对照**：MEMORY=1 墙梯 10.6G = 窗口 4.4 + 状态 3G + 工作态 3G——30M 未归因
+  仅 ~3G。100M 未归因 ~25G 是 **~8× 超线性**（数据 3.33×）→ 指向 close flush 期
+  的瞬时分配水位（q13 文档同款规律：内存 ∝ 分配速率 × 存活时间）。
+- **「30M recv 档 9.1G 帧滞留」是误判**：非 MEMORY 墙梯 6 档同数据累积（warmup 残留）；
+  MEMORY=1 不预热时 recv=0G。帧读到即丢，不滞留。
+- **close flush 峰值机理**：2935 万键 × 4 last 度量 → close 输出 2935 万条 alert。
+  虽然分块 flush（§6，峰值 ~1G/块），但 close 期间状态 9.8G 未释放 + 输出链
+  工作态叠加 → 40G 瞬时。**下一步**：close 输出的 alert 链分配足迹用 memory_probe
+  量化（rule_task_bench 已有设施），或 close 期间分批释放状态（释放与输出交错）。
+
 ## 复用机制
 
 - `RowFields` 紧凑行字段（本笔记前置优化，已入 REUSE_GUIDE）

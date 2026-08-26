@@ -394,11 +394,7 @@ fn q4a_stager_schema() -> Arc<arrow::datatypes::Schema> {
             DataType::Utf8,
             true,
         ),
-        Field::new(
-            WfuIntermediateMetaField::Score.name(),
-            DataType::Utf8,
-            true,
-        ),
+        Field::new(WfuIntermediateMetaField::Score.name(), DataType::Utf8, true),
         Field::new(
             WfuIntermediateMetaField::EntityType.name(),
             DataType::Utf8,
@@ -462,7 +458,8 @@ fn q4a_stage_bench() {
     // 行式 staging（旧路径）。
     let start = Instant::now();
     for _ in 0..4 {
-        let mut stager = PipeBatchStager::new(Arc::from("auction_finals"), Arc::clone(&schema), Some(4));
+        let mut stager =
+            PipeBatchStager::new(Arc::from("auction_finals"), Arc::clone(&schema), Some(4));
         for r in &records {
             stager.push_record(r).expect("row stage");
         }
@@ -1503,4 +1500,487 @@ impl wf_engine::match_engine::PipeRowSink for TestStagerSink<'_> {
             )
             .map_err(|e| e.to_string())
     }
+}
+
+// ---------------------------------------------------------------------------
+// q18 close 装载分配足迹（2026-08-26，q18 100M close 期 42G 归因）
+// ---------------------------------------------------------------------------
+//
+// 背景：q18 100M close flush 期 DIRTY 峰值 42G（状态 9.8G + 窗口 3.5G + 工作态
+// ~29G）。CUT_ALERT 消融（WF_DIAG_CUT_ALERT=1）降到 23.5G → **close alert 装载
+// 路径贡献 ~18.5G**。本测量量化 `close_buckets_to_rows` + `execute_stats_close_
+// batch_columnar` 的分配峰值随批内桶数（100 万 / 300 万）的增长形态，判断是
+// 「每批固有」还是「随批大小超线性」。
+//
+// 运行：cargo test --release -p wf-runtime q18_close_alloc_footprint -- --ignored --nocapture
+use wf_engine::alert::AlertColumnBuilder;
+use wf_engine::match_engine::StatsExecutor;
+use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan, WindowSpec};
+
+/// q18 形态 StatsPlan：4 个 last 度量（price/channel/url/dateTime），键
+/// (bidder, auction)——与 `nexmark_hotpath_bench::q18_stats_last_plan` 同形。
+fn q18_close_stats_plan() -> StatsPlan {
+    fn last(label: &str, field: &str) -> StatsMeasurePlan {
+        StatsMeasurePlan {
+            label: label.into(),
+            source_alias: "b".into(),
+            where_expr: None,
+            agg: StatsAggPlan::Last,
+            field: Some(wf_lang::ast::FieldRef::Qualified("b".into(), field.into())),
+            arg: None,
+        }
+    }
+    StatsPlan {
+        window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(86400)),
+        keys: vec![
+            wf_lang::ast::Expr::Field(wf_lang::ast::FieldRef::Qualified("b".into(), "bidder".into())),
+            wf_lang::ast::Expr::Field(wf_lang::ast::FieldRef::Qualified("b".into(), "auction".into())),
+        ],
+        output_shape: StatsOutputShapePlan::Rows,
+        measures: vec![
+            last("last_price", "price"),
+            last("last_channel", "channel"),
+            last("last_url", "url"),
+            last("last_dateTime", "dateTime"),
+        ],
+        tracked_bind_fields: {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "b".to_string(),
+                std::collections::HashSet::from([
+                    "auction".to_string(),
+                    "bidder".to_string(),
+                    "price".to_string(),
+                    "channel".to_string(),
+                    "url".to_string(),
+                    "dateTime".to_string(),
+                ]),
+            );
+            m
+        },
+    }
+}
+
+/// q18 形态批（键域 auction 放大 → 每行唯一，对齐 30M/100M 真实形态）。
+fn q18_close_batch(n: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("bidder", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+        Field::new("channel", DataType::Utf8, false),
+        Field::new("url", DataType::Utf8, false),
+        Field::new("dateTime", DataType::Int64, false),
+    ]));
+    let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = |range: u64| {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (rng >> 33) % range
+    };
+    let auctions: Vec<i64> = (0..n)
+        .map(|_| 1_000 + next(2_000_000) as i64)
+        .collect();
+    let bidders: Vec<i64> = (0..n).map(|_| 1_000 + next(1010) as i64).collect();
+    let prices: Vec<i64> = (0..n).map(|_| (next(10_000_000) + 1) as i64).collect();
+    let channels: Vec<String> = (0..n).map(|_| "Google".to_string()).collect();
+    let urls: Vec<String> = (0..n).map(|_| "https://www.nexmark.com/aaaaa/bbbbb/ccccc/item.htm?query=1".to_string()).collect();
+    let times: Vec<i64> = (0..n).map(|i| NANOS + i as i64 * 65_217).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(auctions)) as ArrayRef,
+            Arc::new(Int64Array::from(bidders)),
+            Arc::new(Int64Array::from(prices)),
+            Arc::new(arrow::array::StringArray::from(channels)),
+            Arc::new(arrow::array::StringArray::from(urls)),
+            Arc::new(Int64Array::from(times)),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+#[ignore = "measurement: cargo test --release -p wf-runtime q18_close_alloc_footprint -- --ignored --nocapture"]
+fn q18_close_alloc_footprint() {
+    // 每批桶数：100 万（EMIT_CHUNK 默认）与 300 万（观测超线性）。
+    for &n_buckets in &[1_000_000usize, 3_000_000] {
+        let row_fields: Arc<std::collections::HashSet<String>> = Arc::new(
+            ["auction", "bidder", "price", "channel", "url", "dateTime"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let mut exec = StatsExecutor::with_row_fields(q18_close_stats_plan(), Some(row_fields));
+        let batch = q18_close_batch(n_buckets);
+        let ok = exec.process_batch(&batch);
+        assert!(ok, "列式前置应满足");
+
+        // 阶段 ①：状态建桶（进程基线内增量）——参考：100M 状态 9.8G。
+        let state_hold = {
+            let probe = crate::memory_probe::MemoryProbe::exclusive();
+            // 预热后的新基线：probe 已重置。
+            let _ = probe.peak_growth();
+            // 读一次真实持有（current 已在 process_batch 后）
+            probe.current()
+        };
+
+        // 阶段 ②：close_buckets_to_rows 全量转换（StatsCloseBucket）。
+        let buckets = exec.take_buckets_up_to(n_buckets);
+        let convert_peak = {
+            let probe = crate::memory_probe::MemoryProbe::exclusive();
+            let cb = exec.close_buckets_to_rows(buckets);
+            let peak = probe.peak_growth();
+            let cb_bytes: usize = cb.iter().map(|b| b.measures.iter().map(Vec::capacity).sum::<usize>()).sum();
+            drop(cb);
+            eprintln!(
+                "[q18-close] n_buckets={} state_hold={:.1}MB convert_peak={:.1}MB convert_measures_cap={:.1}MB",
+                n_buckets,
+                state_hold as f64 / 1e6,
+                peak as f64 / 1e6,
+                cb_bytes as f64 / 1e6,
+            );
+            peak
+        };
+
+        // 阶段 ③：execute_stats_close_batch_columnar 直装载（alert 列）。
+        // 需 RuleExecutor（spawn 侧由同一 stats 计划装配）——此处用
+        // `stats_close_rule_executor` 构造同形 RuleExecutor（yield 计划与
+        // q18 一致：id/alert_type/detail/request_count）。
+        // 重新建桶（阶段 ② 已取光状态），模拟独立 close 批。
+        let exec3 = {
+            let row_fields3: Arc<std::collections::HashSet<String>> = Arc::new(
+                ["auction", "bidder", "price", "channel", "url", "dateTime"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            );
+            let mut e = StatsExecutor::with_row_fields(q18_close_stats_plan(), Some(row_fields3));
+            let b3 = q18_close_batch(n_buckets);
+            let ok = e.process_batch(&b3);
+            assert!(ok, "列式前置应满足");
+            e
+        };
+        // 阶段 ③：execute_stats_close_batch_columnar 直装载（alert 列）。
+        // 需 RuleExecutor（spawn 侧由同一 stats 计划装配）——此处用
+        // `stats_close_rule_executor` 构造同形 RuleExecutor（yield 计划与
+        // q18 一致：id/alert_type/detail/request_count）。
+        // 重新建桶（阶段 ② 已取光状态），模拟独立 close 批。
+        let exec3 = {
+            let row_fields3: Arc<std::collections::HashSet<String>> = Arc::new(
+                ["auction", "bidder", "price", "channel", "url", "dateTime"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            );
+            let mut e = StatsExecutor::with_row_fields(q18_close_stats_plan(), Some(row_fields3));
+            let b3 = q18_close_batch(n_buckets);
+            let ok = e.process_batch(&b3);
+            assert!(ok, "列式前置应满足");
+            e
+        };
+        let mut exec3 = exec3;
+        let b3 = exec3.take_buckets_up_to(n_buckets);
+        let cb = exec3.close_buckets_to_rows(b3);
+        let labels: Vec<String> = exec
+            .plan
+            .measures
+            .iter()
+            .map(|m| m.label.clone())
+            .collect();
+        let row_names = exec.row_field_names().cloned();
+        let target: Arc<str> = Arc::from("nexmark_alerts");
+        let load_peak = {
+            let probe = crate::memory_probe::MemoryProbe::exclusive();
+            let exec_r = stats_close_rule_executor();
+            let mut builder = AlertColumnBuilder::new(Arc::clone(&target));
+            let outcome = exec_r.execute_stats_close_batch_columnar(
+                &cb,
+                &labels,
+                row_names.as_ref(),
+                &mut builder,
+                NANOS,
+                NANOS + 86_400_000_000_000,
+            );
+            let peak = probe.peak_growth();
+            let built = builder.finish();
+            let built_bytes = built.len() as f64;
+            eprintln!(
+                "[q18-close] n_buckets={} load_peak={:.1}MB rows={} (avg {:.0}B/row)",
+                n_buckets,
+                peak as f64 / 1e6,
+                outcome.appended,
+                if outcome.appended > 0 { peak as f64 / outcome.appended as f64 } else { 0.0 },
+            );
+            assert_eq!(built_bytes as usize, outcome.appended);
+            peak
+        };
+        drop(cb);
+        assert!(load_peak > 0);
+    }
+    eprintln!("[q18-close] 完成：对比 1M vs 3M 桶的 convert/load 峰值增长形态");
+}
+
+/// 消融对照：fmt detail（真实 q18）vs 常量 detail——量化 fmt 逐行物化在
+/// load_peak 的占比（1094B/行的大头是否 fmt String）。
+#[test]
+#[ignore = "measurement: cargo test --release -p wf-runtime q18_close_fmt_vs_const -- --ignored --nocapture"]
+fn q18_close_fmt_vs_const() {
+    const N: usize = 1_000_000;
+    // 完整装载（真实 q18 detail = fmt 5 字段）——对照基线。
+    let full_peak = {
+        let row_fields: Arc<std::collections::HashSet<String>> = Arc::new(
+            ["auction", "bidder", "price", "channel", "url", "dateTime"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let mut exec = StatsExecutor::with_row_fields(q18_close_stats_plan(), Some(row_fields));
+        let batch = q18_close_batch(N);
+        let _ = exec.process_batch(&batch);
+        let b = exec.take_buckets_up_to(N);
+        let cb = exec.close_buckets_to_rows(b);
+        let labels: Vec<String> = exec.plan.measures.iter().map(|m| m.label.clone()).collect();
+        let row_names = exec.row_field_names().cloned();
+        let exec_r = stats_close_rule_executor();
+        let target: Arc<str> = Arc::from("nexmark_alerts");
+        let probe = crate::memory_probe::MemoryProbe::exclusive();
+        let mut builder = AlertColumnBuilder::new(Arc::clone(&target));
+        let outcome = exec_r.execute_stats_close_batch_columnar(
+            &cb,
+            &labels,
+            row_names.as_ref(),
+            &mut builder,
+            NANOS,
+            NANOS + 86_400_000_000_000,
+        );
+        let peak = probe.peak_growth();
+        eprintln!(
+            "[q18-fmt] fmt_detail load_peak={:.1}MB rows={} (avg {:.0}B/row)",
+            peak as f64 / 1e6,
+            outcome.appended,
+            if outcome.appended > 0 { peak as f64 / outcome.appended as f64 } else { 0.0 },
+        );
+        peak
+    };
+
+    // 常量 detail（fmt 替换为 StringLit）——量化 fmt 的增量。
+    let const_peak = {
+        let row_fields: Arc<std::collections::HashSet<String>> = Arc::new(
+            ["auction", "bidder", "price", "channel", "url", "dateTime"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let mut exec = StatsExecutor::with_row_fields(q18_close_stats_plan(), Some(row_fields));
+        let batch = q18_close_batch(N);
+        let _ = exec.process_batch(&batch);
+        let b = exec.take_buckets_up_to(N);
+        let cb = exec.close_buckets_to_rows(b);
+        let labels: Vec<String> = exec.plan.measures.iter().map(|m| m.label.clone()).collect();
+        let row_names = exec.row_field_names().cloned();
+        // 同形 executor，detail 改常量（StringLit）——列式 gate 仍放行。
+        let exec_r = stats_close_rule_executor_const_detail();
+        let target: Arc<str> = Arc::from("nexmark_alerts");
+        let probe = crate::memory_probe::MemoryProbe::exclusive();
+        let mut builder = AlertColumnBuilder::new(Arc::clone(&target));
+        let outcome = exec_r.execute_stats_close_batch_columnar(
+            &cb,
+            &labels,
+            row_names.as_ref(),
+            &mut builder,
+            NANOS,
+            NANOS + 86_400_000_000_000,
+        );
+        let peak = probe.peak_growth();
+        eprintln!(
+            "[q18-fmt] const_detail load_peak={:.1}MB rows={} (avg {:.0}B/row)",
+            peak as f64 / 1e6,
+            outcome.appended,
+            if outcome.appended > 0 { peak as f64 / outcome.appended as f64 } else { 0.0 },
+        );
+        peak
+    };
+    eprintln!(
+        "[q18-fmt] fmt 增量 = {:.1}MB（{:.0}%）",
+        (full_peak as f64 - const_peak as f64) / 1e6,
+        (full_peak as f64 - const_peak as f64) / full_peak as f64 * 100.0,
+    );
+    assert!(full_peak >= const_peak);
+}
+
+/// q18 同形 executor，detail 改 StringLit 常量（对照 fmt 增量）。
+fn stats_close_rule_executor_const_detail() -> wf_engine::match_engine::RuleExecutor {
+    use wf_lang::ast::CloseMode;
+    use wf_lang::ast::MatchMode;
+    use wf_lang::plan::{BindPlan, EntityPlan, MatchPlan, ScorePlan, YieldField, YieldPlan};
+    use wf_lang::ast::Expr;
+    let plan = wf_lang::plan::RulePlan {
+        conv_window: None,
+        name: "q18_last_bid_stats".into(),
+        binds: vec![BindPlan {
+            alias: "b".into(),
+            window: "bid_events".into(),
+            filter: None,
+        }],
+        lets: Vec::new(),
+        match_plan: MatchPlan {
+            keys: vec![],
+            key_map: None,
+            key_join: None,
+            window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::from_secs(86400)),
+            event_steps: vec![],
+            close_steps: vec![],
+            close_mode: CloseMode::And,
+            match_mode: MatchMode::Seq,
+            accu: false,
+            seq: None,
+            tracked_bind_aliases: std::collections::HashSet::new(),
+            tracked_bind_fields: std::collections::HashMap::new(),
+            tracked_plain_fields: std::collections::HashSet::new(),
+            needs_field_history: false,
+            trigger_event_needed: false,
+        },
+        each_plan: None,
+        stats_plan: Some(q18_close_stats_plan()),
+        joins: vec![],
+        r#where: None,
+        entity_plan: EntityPlan {
+            entity_type: "digit".into(),
+            entity_id_expr: Expr::Field(wf_lang::ast::FieldRef::Qualified(
+                "b".into(),
+                "auction".into(),
+            )),
+        },
+        yield_plan: YieldPlan {
+            target: "nexmark_alerts".into(),
+            version: None,
+            fields: vec![
+                YieldField {
+                    name: "id".into(),
+                    value: Expr::Field(wf_lang::ast::FieldRef::Qualified(
+                        "b".into(),
+                        "auction".into(),
+                    )),
+                },
+                YieldField {
+                    name: "alert_type".into(),
+                    value: Expr::StringLit("q18_last_stats".into()),
+                },
+                YieldField {
+                    name: "detail".into(),
+                    value: Expr::StringLit("q18_detail".into()),
+                },
+                YieldField {
+                    name: "request_count".into(),
+                    value: Expr::Number(1.0),
+                },
+            ],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(10.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+    wf_engine::match_engine::RuleExecutor::new_with_yield_field_types(
+        plan,
+        std::collections::HashMap::from([
+            ("id".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Float)),
+            ("alert_type".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Chars)),
+            ("detail".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Chars)),
+            ("request_count".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Float)),
+        ]),
+    )
+}
+
+/// q18 close 直写用 RuleExecutor（yield: id=b.auction / alert_type 常量 /
+/// detail=b.url / request_count=1——q18 输出形状）。
+fn stats_close_rule_executor() -> wf_engine::match_engine::RuleExecutor {
+    use wf_lang::ast::CloseMode;
+    use wf_lang::ast::MatchMode;
+    use wf_lang::plan::{BindPlan, EntityPlan, MatchPlan, ScorePlan, YieldField, YieldPlan};
+    use wf_lang::ast::Expr;
+    let plan = wf_lang::plan::RulePlan {
+        conv_window: None,
+        name: "q18_last_bid_stats".into(),
+        binds: vec![BindPlan {
+            alias: "b".into(),
+            window: "bid_events".into(),
+            filter: None,
+        }],
+        lets: Vec::new(),
+        match_plan: MatchPlan {
+            keys: vec![],
+            key_map: None,
+            key_join: None,
+            window_spec: wf_lang::plan::WindowSpec::Fixed(std::time::Duration::from_secs(86400)),
+            event_steps: vec![],
+            close_steps: vec![],
+            close_mode: CloseMode::And,
+            match_mode: MatchMode::Seq,
+            accu: false,
+            seq: None,
+            tracked_bind_aliases: std::collections::HashSet::new(),
+            tracked_bind_fields: std::collections::HashMap::new(),
+            tracked_plain_fields: std::collections::HashSet::new(),
+            needs_field_history: false,
+            trigger_event_needed: false,
+        },
+        each_plan: None,
+        stats_plan: Some(q18_close_stats_plan()),
+        joins: vec![],
+        r#where: None,
+        entity_plan: EntityPlan {
+            entity_type: "digit".into(),
+            entity_id_expr: Expr::Field(wf_lang::ast::FieldRef::Qualified(
+                "b".into(),
+                "auction".into(),
+            )),
+        },
+        yield_plan: YieldPlan {
+            target: "nexmark_alerts".into(),
+            version: None,
+            fields: vec![
+                YieldField {
+                    name: "id".into(),
+                    value: Expr::Field(wf_lang::ast::FieldRef::Qualified(
+                        "b".into(),
+                        "auction".into(),
+                    )),
+                },
+                YieldField {
+                    name: "alert_type".into(),
+                    value: Expr::StringLit("q18_last_bid_stats".into()),
+                },
+                YieldField {
+                    name: "detail".into(),
+                    value: Expr::Field(wf_lang::ast::FieldRef::Qualified(
+                        "b".into(),
+                        "url".into(),
+                    )),
+                },
+                YieldField {
+                    name: "request_count".into(),
+                    value: Expr::Number(1.0),
+                },
+            ],
+        },
+        score_plan: ScorePlan {
+            expr: Expr::Number(10.0),
+        },
+        pattern_origin: None,
+        conv_plan: None,
+        limits_plan: None,
+    };
+    wf_engine::match_engine::RuleExecutor::new_with_yield_field_types(
+        plan,
+        std::collections::HashMap::from([
+            ("id".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Float)),
+            ("alert_type".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Chars)),
+            ("detail".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Chars)),
+            ("request_count".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Float)),
+        ]),
+    )
 }

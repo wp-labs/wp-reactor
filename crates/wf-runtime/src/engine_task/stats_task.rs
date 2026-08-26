@@ -42,8 +42,27 @@ use super::{register_notifications, wait_any};
 /// （非逐条, 不引入 §9.9 前的逐桶 await 回压）, 但单次构建峰值从全窗口
 /// （q19 30M ≈ 7.94M 条 / q18 100M ≈ 29.35M 条）降到阈值量级。
 /// `AtomicUsize` 供测试调小阈值以触发分块路径（生产恒 100 万）。
-static EMIT_CHUNK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(1_000_000);
+/// 2026-08-26 q18 close 峰值归因后: **语义是「链数」不是「桶数」**——每链含
+/// 多桶（同 hash 碰撞链）, 实际每批 = 链数 × 桶/链（q18 100M: 100 万链 →
+/// 367 万桶/批 → 装载峰值 4G/批, memory_probe 实测 1094B/行）。
+/// `WF_EMIT_CHUNK` 环境变量可调（生产默认 100 万链; 调小降峰值、代价是
+/// 更多批次投递——用数据定点）。
+static EMIT_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1_000_000);
+
+/// 生产可配置（2026-08-26）: `WF_EMIT_CHUNK` 覆盖默认值（首次调用生效）。
+fn emit_chunk() -> usize {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        if let Ok(v) = std::env::var("WF_EMIT_CHUNK") {
+            if let Ok(n) = v.parse::<usize>() {
+                if n > 0 {
+                    EMIT_CHUNK.store(n, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    });
+    EMIT_CHUNK.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// 测试辅助: 调小分块阈值（触发分块 flush 分支; 生产不用）。
 #[cfg(test)]
@@ -505,7 +524,7 @@ impl StatsTask {
             // `close_window_by_bucket_rows` 一次性全量 2935 万 StatsCloseBucket
             // （~5.9G）与状态数据/输出结构同时驻留 → close 期 RSS 峰值 30G+。
             // 每批 ~EMIT_CHUNK 桶, 峰值 ≈ 批大小×条均 + 分块装载缓冲。
-            let chunk = EMIT_CHUNK.load(std::sync::atomic::Ordering::Relaxed);
+            let chunk = emit_chunk();
             loop {
                 let buckets = self.stats.take_buckets_up_to(chunk);
                 if buckets.is_empty() {
@@ -538,7 +557,9 @@ impl StatsTask {
                                         .map_or(0.0, |e| e.measure_value)
                                 })
                                 .collect();
-                            let row_fields: Vec<Option<&std::sync::Arc<wf_engine::match_engine::RowFields>>> = bucket
+                            let row_fields: Vec<
+                                Option<&std::sync::Arc<wf_engine::match_engine::RowFields>>,
+                            > = bucket
                                 .measures
                                 .iter()
                                 .map(|m| {
@@ -574,7 +595,7 @@ impl StatsTask {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as i64;
-            let chunk = EMIT_CHUNK.load(std::sync::atomic::Ordering::Relaxed);
+            let chunk = emit_chunk();
             loop {
                 let buckets = self.stats.take_buckets_up_to(chunk);
                 if buckets.is_empty() {
@@ -596,11 +617,8 @@ impl StatsTask {
                     if columnar_close {
                         columnar_closes.push(close);
                         if columnar_closes.len() >= chunk {
-                            self.flush_columnar_closes(
-                                &mut columnar_closes,
-                                emit_time_nanos,
-                            )
-                            .await;
+                            self.flush_columnar_closes(&mut columnar_closes, emit_time_nanos)
+                                .await;
                         }
                     } else {
                         self.emit_close_record(&close, &lookup, &mut builders).await;
@@ -690,16 +708,14 @@ impl StatsTask {
         let close_buckets = self.stats.close_buckets_to_rows(buckets);
         let target = self.executor.static_yield_target();
         let mut builder = AlertColumnBuilder::new(Arc::clone(target));
-        let outcome = self
-            .executor
-            .execute_stats_close_batch_columnar(
-                &close_buckets,
-                labels,
-                row_names.as_ref(),
-                &mut builder,
-                emit_time_nanos,
-                window_end_nanos,
-            );
+        let outcome = self.executor.execute_stats_close_batch_columnar(
+            &close_buckets,
+            labels,
+            row_names.as_ref(),
+            &mut builder,
+            emit_time_nanos,
+            window_end_nanos,
+        );
         if let Some(metrics) = &self.metrics {
             for _ in 0..outcome.appended {
                 metrics.inc_alert_emitted_total(self.rule_name());
@@ -729,9 +745,11 @@ impl StatsTask {
         }
         let target = self.executor.static_yield_target();
         let mut builder = AlertColumnBuilder::new(Arc::clone(target));
-        let outcome = self
-            .executor
-            .execute_close_direct_batch_columnar(columnar_closes, &mut builder, emit_time_nanos);
+        let outcome = self.executor.execute_close_direct_batch_columnar(
+            columnar_closes,
+            &mut builder,
+            emit_time_nanos,
+        );
         if let Some(metrics) = &self.metrics {
             for _ in 0..outcome.appended {
                 metrics.inc_alert_emitted_total(self.rule_name());
