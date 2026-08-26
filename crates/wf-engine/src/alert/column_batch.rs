@@ -37,21 +37,31 @@ use wf_lang::wfu_meta::{
     WFU_ORIGIN, WFU_RULE_NAME, WFU_SCORE, WFU_SUMMARY,
 };
 
-/// 系统字段列表示：整批常量（on-each：rule_name/entity_type/origin/close_reason/
-/// emit_time/summary 是计划/批常量，同一 Arc）或 per-row（close 路径的
-/// origin/close_reason/summary 逐 close 变化）。常量形态免每行 cell
-/// （8B/行 + Arc clone/行），读时按行返回常量——2026-08-26 列式化。
+/// 常量列折叠（Const Column Folding，2026-08-26，q13 列式化）。
+///
+/// 列内全部行同值（run of identical values）时，按行冗余存储（每行一个
+/// cell + 每行一次 clone）是纯浪费——折叠为 `Const(T)` 单值 + 外部行数，
+/// 读取时按行展开（O(1)），内存从 30M 份 → 1 份。`Rows(Vec<T>)` 保持
+/// 每行独立值（列内真不同，如 wfx_id / summary / close 的 origin）。
+///
+/// 覆盖两种列：
+/// - 系统字段列（`ColumnData<Arc<str>>`）：on-each 的 rule_name/entity_type/
+///   origin/close_reason/emit_time 是计划/批常量 → `Const`（免每行 cell 与
+///   Arc clone）；summary / close 路径的 origin 等 per-row → `Rows`。
+/// - yield 字面量列（`YieldCol::const_value`）：同样语义，values/metas 免
+///   每行 cell，读时展开 const_value。
 #[derive(Clone)]
-enum SystemCol {
-    Const(Arc<str>),
-    Rows(Vec<Arc<str>>),
+enum ColumnData<T> {
+    Const(T),
+    Rows(Vec<T>),
 }
 
-impl SystemCol {
-    fn rows(&self, row: usize) -> &Arc<str> {
+impl<T> ColumnData<T> {
+    /// 按行取单元格：`Const` 返回唯一值（行号无关），`Rows` 返回数组元素。
+    fn at(&self, row: usize) -> &T {
         match self {
-            SystemCol::Const(a) => a,
-            SystemCol::Rows(v) => &v[row],
+            ColumnData::Const(v) => v,
+            ColumnData::Rows(v) => &v[row],
         }
     }
 }
@@ -65,18 +75,19 @@ pub struct AlertColumnBatch {
     /// 分配——q13b per-row churn 消减），`fired_at` 是 `String`（ISO 时间戳 24
     /// 字符超内联上限）。列式直接路径 move 进列、零额外分配（`Arc` 反而要每行
     /// 一次分配 + 拷贝，且值从不共享）。其余六列是计划/批常量，用
-    /// [`SystemCol::Const`]（2026-08-26：免每行 cell 与 Arc clone）；close
-    /// 路径的 origin/close_reason/summary 用 [`SystemCol::Rows`]。
+    /// 常量列折叠（见 [`ColumnData`]）：on-each 的 5 列计划/批常量 →
+    /// [`ColumnData::Const`]（免每行 cell 与 Arc clone）；summary / close 的
+    /// origin 等 per-row → [`ColumnData::Rows`]。
     wfx_id: Vec<SmolStr>,
-    rule_name: SystemCol,
+    rule_name: ColumnData<Arc<str>>,
     score: Vec<f64>,
-    entity_type: SystemCol,
+    entity_type: ColumnData<Arc<str>>,
     entity_id: Vec<SmolStr>,
-    origin: SystemCol,
-    close_reason: SystemCol,
+    origin: ColumnData<Arc<str>>,
+    close_reason: ColumnData<Arc<str>>,
     fired_at: Vec<String>,
-    emit_time: SystemCol,
-    summary: SystemCol,
+    emit_time: ColumnData<Arc<str>>,
+    summary: ColumnData<Arc<str>>,
     /// Yield columns (layout follows the first appended record).
     yield_cols: Vec<YieldCol>,
 }
@@ -85,11 +96,17 @@ struct YieldCol {
     name: Arc<str>,
     metas: Vec<DataType>,
     values: Vec<ModelValue>,
-    /// Batch-constant default cell (e.g. `alert_type = "q1_passthrough"`):
-    /// when set, `fill_row_gaps` fills missing cells with a clone of this
-    /// value instead of `(Ignore, Null)` — the columnar fast path registers
-    /// literal yield fields once per batch and skips their per-row staging.
+    /// 常量列折叠：字面量 yield（`alert_type = "q1_passthrough"`）注册时带
+    /// 批级常量 cell——`values`/`metas` 免每行 push（Const 形态），读时按行
+    /// 展开；非字面量字段为 `None`（Rows 形态，逐行 stage）。
     const_value: Option<(DataType, ModelValue)>,
+}
+
+impl YieldCol {
+    /// 常量列折叠判定：字面量 yield = Const 形态（免每行 cell）。
+    fn is_const_column(&self) -> bool {
+        self.const_value.is_some()
+    }
 }
 
 impl AlertColumnBatch {
@@ -118,7 +135,7 @@ impl AlertColumnBatch {
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
                 WFU_RULE_NAME,
-                ModelValue::from(self.rule_name.rows(row).as_ref()),
+                ModelValue::from(self.rule_name.at(row).as_ref()),
             )));
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Float,
@@ -128,7 +145,7 @@ impl AlertColumnBatch {
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
                 WFU_ENTITY_TYPE,
-                ModelValue::from(self.entity_type.rows(row).as_ref()),
+                ModelValue::from(self.entity_type.at(row).as_ref()),
             )));
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
@@ -138,12 +155,12 @@ impl AlertColumnBatch {
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
                 WFU_ORIGIN,
-                ModelValue::from(self.origin.rows(row).as_ref()),
+                ModelValue::from(self.origin.at(row).as_ref()),
             )));
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
                 WFU_CLOSE_REASON,
-                ModelValue::from(self.close_reason.rows(row).as_ref()),
+                ModelValue::from(self.close_reason.at(row).as_ref()),
             )));
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
@@ -153,12 +170,12 @@ impl AlertColumnBatch {
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
                 WFU_EMIT_TIME,
-                ModelValue::from(self.emit_time.rows(row).as_ref()),
+                ModelValue::from(self.emit_time.at(row).as_ref()),
             )));
             record.push(FieldStorage::from_owned(Field::new(
                 DataType::Chars,
                 WFU_SUMMARY,
-                ModelValue::from(self.summary.rows(row).as_ref()),
+                ModelValue::from(self.summary.at(row).as_ref()),
             )));
             for col in &self.yield_cols {
                 // 常量列（字面量 yield）：values 免每行 cell，按行展开
@@ -216,15 +233,15 @@ pub struct AlertColumnBuilder {
     target: Arc<str>,
     len: usize,
     wfx_id: Vec<SmolStr>,
-    rule_name: Option<SystemCol>,
+    rule_name: Option<ColumnData<Arc<str>>>,
     score: Vec<f64>,
-    entity_type: Option<SystemCol>,
+    entity_type: Option<ColumnData<Arc<str>>>,
     entity_id: Vec<SmolStr>,
-    origin: Option<SystemCol>,
-    close_reason: Option<SystemCol>,
+    origin: Option<ColumnData<Arc<str>>>,
+    close_reason: Option<ColumnData<Arc<str>>>,
     fired_at: Vec<String>,
-    emit_time: Option<SystemCol>,
-    summary: Option<SystemCol>,
+    emit_time: Option<ColumnData<Arc<str>>>,
+    summary: Option<ColumnData<Arc<str>>>,
     yield_cols: Vec<YieldCol>,
     /// Fast-path layout cache: the yield field name sequence of the last
     /// appended record, mapped to `(column index, resolved FieldType)`. A
@@ -276,19 +293,19 @@ impl AlertColumnBuilder {
     /// 设置系统常量列（计划/批常量）：首次 set，后续忽略——信任批级常量
     /// 语义（rule_name/entity_type 等恒为计划常量；emit_time 跨段 Arc 可能
     /// 不同但值相同，不做每行校验）。每行一次 O(1) 分支，无每行 cell 与
-    /// Arc clone（2026-08-26 列式化：SystemCol::Const 单值存储）。
-    fn set_system_const(slot: &mut Option<SystemCol>, value: &Arc<str>) {
+    /// Arc clone（2026-08-26 常量列折叠：ColumnData::Const 单值存储）。
+    fn set_system_const(slot: &mut Option<ColumnData<Arc<str>>>, value: &Arc<str>) {
         if slot.is_none() {
-            *slot = Some(SystemCol::Const(Arc::clone(value)));
+            *slot = Some(ColumnData::Const(Arc::clone(value)));
         }
     }
 
     /// record 路径（`append_record`）：系统字段可能 per-row 变化（close 的
     /// summary/close_reason 等）→ 逐行 push Rows（不做常量假设）。
-    fn push_system_row(slot: &mut Option<SystemCol>, value: Arc<str>) {
+    fn push_system_row(slot: &mut Option<ColumnData<Arc<str>>>, value: Arc<str>) {
         match slot {
-            Some(SystemCol::Rows(v)) => v.push(value),
-            _ => *slot = Some(SystemCol::Rows(vec![value])),
+            Some(ColumnData::Rows(v)) => v.push(value),
+            _ => *slot = Some(ColumnData::Rows(vec![value])),
         }
     }
 
@@ -301,9 +318,9 @@ impl AlertColumnBuilder {
         self.score.reserve(additional);
         self.entity_id.reserve(additional);
         self.fired_at.reserve(additional);
-        // 系统常量列（SystemCol::Const）免 per-row 数组——不 reserve。
+        // 系统常量列（ColumnData::Const）免 per-row 数组——不 reserve。
         for col in &mut self.yield_cols {
-            if col.const_value.is_none() {
+            if !col.is_const_column() {
                 col.metas.reserve(additional);
                 col.values.reserve(additional);
             }
@@ -711,12 +728,12 @@ impl AlertColumnBuilder {
         self.entity_id.extend_from_slice(entity_id);
         self.fired_at.extend_from_slice(fired_at);
         // 计划常量列：同一 Arc 值扩展 n 行（引用计数共享）——现改为列级
-        // 常量（SystemCol::Const 一次存储），读时按行展开。
+        // 常量（ColumnData::Const 一次存储），读时按行展开。
         // summary：调用方（on-each 批式）传计划常量单值，但 match 语义可能
         // per-row——保守保持 Rows（n 行同一值，语义一致）。
         match &mut self.summary {
-            Some(SystemCol::Rows(v)) => v.extend(std::iter::repeat_n(Arc::clone(summary), n)),
-            _ => self.summary = Some(SystemCol::Rows(vec![Arc::clone(summary); n])),
+            Some(ColumnData::Rows(v)) => v.extend(std::iter::repeat_n(Arc::clone(summary), n)),
+            _ => self.summary = Some(ColumnData::Rows(vec![Arc::clone(summary); n])),
         }
         // Yield cells, interleaved with per-row gap fills. `fill_row_gaps`
         // (per-row path) pushes one fill cell for every column that received no
@@ -757,7 +774,7 @@ impl AlertColumnBuilder {
         // constant, else Ignore/Null (byte-identical to their per-row fills).
         // 常量列跳过：values 恒空，读时按行展开 const_value（免 ~32B/行 cell）。
         for col in &mut self.yield_cols {
-            if col.const_value.is_some() {
+            if col.is_const_column() {
                 continue;
             }
             while col.values.len() < target {
@@ -768,7 +785,7 @@ impl AlertColumnBuilder {
         debug_assert!(
             self.yield_cols
                 .iter()
-                .all(|c| c.const_value.is_some() || c.values.len() == target)
+                .all(|c| c.is_const_column() || c.values.len() == target)
         );
         self.len += n;
     }
@@ -813,16 +830,16 @@ impl AlertColumnBuilder {
         Self::set_system_const(&mut self.entity_type, entity_type);
         Self::set_system_const(&mut self.emit_time, emit_time);
         match &mut self.origin {
-            Some(SystemCol::Rows(v)) => v.extend_from_slice(origin),
-            _ => self.origin = Some(SystemCol::Rows(origin.to_vec())),
+            Some(ColumnData::Rows(v)) => v.extend_from_slice(origin),
+            _ => self.origin = Some(ColumnData::Rows(origin.to_vec())),
         }
         match &mut self.close_reason {
-            Some(SystemCol::Rows(v)) => v.extend_from_slice(close_reason),
-            _ => self.close_reason = Some(SystemCol::Rows(close_reason.to_vec())),
+            Some(ColumnData::Rows(v)) => v.extend_from_slice(close_reason),
+            _ => self.close_reason = Some(ColumnData::Rows(close_reason.to_vec())),
         }
         match &mut self.summary {
-            Some(SystemCol::Rows(v)) => v.extend_from_slice(summary),
-            _ => self.summary = Some(SystemCol::Rows(summary.to_vec())),
+            Some(ColumnData::Rows(v)) => v.extend_from_slice(summary),
+            _ => self.summary = Some(ColumnData::Rows(summary.to_vec())),
         }
         // Bulk system columns. Plan-constant columns: same `Arc` every row.
         self.wfx_id.extend_from_slice(wfx_id);
@@ -885,7 +902,7 @@ impl AlertColumnBuilder {
             // 常量列（字面量 yield：alert_type/request_count 等）：免每行
             // cell——values/metas 不逐行 push，读时按行展开 `const_value`
             //（省 ~32B/行 × 常量列数；2026-08-26 列式化）。
-            if col.const_value.is_some() {
+            if col.is_const_column() {
                 continue;
             }
             if col.values.len() == self.len {
@@ -896,7 +913,7 @@ impl AlertColumnBuilder {
         debug_assert!(
             self.yield_cols
                 .iter()
-                .all(|col| col.const_value.is_some() || col.values.len() == self.len + 1)
+                .all(|col| col.is_const_column() || col.values.len() == self.len + 1)
         );
     }
 
@@ -910,24 +927,27 @@ impl AlertColumnBuilder {
             target: Arc::clone(&self.target),
             len: std::mem::take(&mut self.len),
             wfx_id: std::mem::take(&mut self.wfx_id),
-            rule_name: self.rule_name.take().unwrap_or(SystemCol::Rows(Vec::new())),
+            rule_name: self
+                .rule_name
+                .take()
+                .unwrap_or(ColumnData::Rows(Vec::new())),
             score: std::mem::take(&mut self.score),
             entity_type: self
                 .entity_type
                 .take()
-                .unwrap_or(SystemCol::Rows(Vec::new())),
+                .unwrap_or(ColumnData::Rows(Vec::new())),
             entity_id: std::mem::take(&mut self.entity_id),
-            origin: self.origin.take().unwrap_or(SystemCol::Rows(Vec::new())),
+            origin: self.origin.take().unwrap_or(ColumnData::Rows(Vec::new())),
             close_reason: self
                 .close_reason
                 .take()
-                .unwrap_or(SystemCol::Rows(Vec::new())),
+                .unwrap_or(ColumnData::Rows(Vec::new())),
             fired_at: std::mem::take(&mut self.fired_at),
             emit_time: self
                 .emit_time
                 .take()
-                .unwrap_or(SystemCol::Rows(Vec::new())),
-            summary: self.summary.take().unwrap_or(SystemCol::Rows(Vec::new())),
+                .unwrap_or(ColumnData::Rows(Vec::new())),
+            summary: self.summary.take().unwrap_or(ColumnData::Rows(Vec::new())),
             yield_cols: std::mem::take(&mut self.yield_cols),
         }
     }
