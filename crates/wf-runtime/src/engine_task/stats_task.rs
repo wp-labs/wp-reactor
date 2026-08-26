@@ -488,6 +488,11 @@ impl StatsTask {
             let row_names = self.stats.row_field_names().cloned();
             for bucket in self.stats.close_window_by_bucket_rows() {
                 let n_records = bucket.measures.iter().map(Vec::len).max().unwrap_or(1);
+                // 桶内不变量（P8, 2026-08-26）: scope 值 + 键字段 HashMap 每桶算一次
+                // ——top-N 的 k 条条目共享（q19 同桶 top-10; 多键/Str key 的 q18
+                // 省得更多）。旧实现每条重做 scope_key_to_values + HashMap 构建。
+                let scope_values = scope_key_to_values(&bucket.key);
+                let first_field_values = stats_first_field_values(&key_fields, &scope_values);
                 for k in 0..n_records {
                     // 空条目度量（如 top(0) 无产出）安全读取: 越界/空 → 0.0/None,
                     // 否则取 min(k, len-1) 的携带语义（标量跨 top 条目重复）。
@@ -515,8 +520,8 @@ impl StatsTask {
                         row_names.as_deref().map(|v| v.as_slice()),
                         window_start,
                         window_end,
-                        &bucket.key,
-                        &key_fields,
+                        &scope_values,
+                        &first_field_values,
                     );
                     if columnar_close {
                         columnar_closes.push(close);
@@ -529,6 +534,9 @@ impl StatsTask {
             // 标量快路径（Q12/16/17 原样）: 每桶 1 条
             let none_rows: Vec<Option<&std::sync::Arc<[Option<Value>]>>> = vec![None; labels.len()];
             for (scope_key, values) in self.stats.close_window_by_bucket() {
+                // 每桶 1 条: 不变量就地算（无 k 循环可外提, 与行字段路径同一签名）。
+                let scope_values = scope_key_to_values(&scope_key);
+                let first_field_values = stats_first_field_values(&key_fields, &scope_values);
                 let close = build_stats_close_output(
                     self.rule_name(),
                     &values,
@@ -537,8 +545,8 @@ impl StatsTask {
                     None,
                     window_start,
                     window_end,
-                    &scope_key,
-                    &key_fields,
+                    &scope_values,
+                    &first_field_values,
                 );
                 if columnar_close {
                     columnar_closes.push(close);
@@ -799,13 +807,24 @@ fn batch_max_time(batch: &RecordBatch, time_field: Option<&str>) -> i64 {
     max
 }
 
-/// 合成 CloseOutput（fixed 窗口）: close_step_data = 每 measure 一个 StepData;
-/// 带 key 时桶键拆解为 `scope_key`, 键字段值注入首个 StepData 的 field_values
-/// （yield 读分组键字段; build_eval_context 的 narrow/all 分支都注入字段）。
-/// `row_fields`（每度量一个, last/top 用）: 行字段列数组按 `row_names` 列序展开
-/// 注入其所在度量的 StepData——yield 经 field_values 读 `b.*`（如 Q18 最后一条
-/// bid 的 price/channel; P5 紧凑化: 列数组而非 HashMap, 列序 = 提取同序）。
-#[allow(clippy::too_many_arguments)] // 合成 CloseOutput: 规则名/值/label/行字段/窗界/键 6 组参数
+/// 键字段 → 首个 StepData 的 field_values 基座（桶内不变量, P8 2026-08-26）:
+/// 同桶 top-N 条目共享同一 scope/key 注入, 每桶算一次——旧实现每条重插
+/// key_fields + clone, 多键/Str key 的 stats（q18）每条多 2N 次小分配。
+fn stats_first_field_values(
+    key_fields: &[String],
+    scope_values: &[Value],
+) -> EngineHashMap<String, Vec<Value>> {
+    let mut first_field_values = EngineHashMap::<String, Vec<Value>>::default();
+    for (kf, kv) in key_fields.iter().zip(scope_values.iter()) {
+        first_field_values.insert(kf.clone(), vec![kv.clone()]);
+    }
+    first_field_values
+}
+
+/// 构建 stats close 输出。**P8（2026-08-26）**：`scope_values` / `first_field_values`
+/// 是**桶内不变量**——调用方每桶预计算一次，top-N 的 k 条条目不再重复 scope 展开
+/// 与键字段 HashMap 构建（每条仅一次引用克隆给 step0 与 `scope_key`）。
+#[allow(clippy::too_many_arguments)] // 合成 CloseOutput: 规则名/值/label/行字段/窗界/scope 值/键基座 7 组参数
 fn build_stats_close_output(
     rule_name: &str,
     values: &[f64],
@@ -814,16 +833,9 @@ fn build_stats_close_output(
     row_names: Option<&[String]>,
     window_start: i64,
     window_end: i64,
-    scope_key: &ScopeKey,
-    key_fields: &[String],
+    scope_values: &[Value],
+    first_field_values: &EngineHashMap<String, Vec<Value>>,
 ) -> CloseOutput {
-    let scope_values = scope_key_to_values(scope_key);
-    let mut first_field_values = EngineHashMap::<String, Vec<Value>>::default();
-    if !key_fields.is_empty() {
-        for (kf, kv) in key_fields.iter().zip(scope_values.iter()) {
-            first_field_values.insert(kf.clone(), vec![kv.clone()]);
-        }
-    }
     let close_step_data = values
         .iter()
         .zip(labels.iter())
@@ -831,6 +843,8 @@ fn build_stats_close_output(
         .map(|(i, (v, label))| {
             // 键字段注入首个 StepData; last/top 行字段列数组（P5 紧凑化）按
             // row_names 列序展开注入其所在度量 StepData——yield 读 `b.*`。
+            // 桶级 first_field_values 每条 clone 一次（step0 需属主副本; 其余
+            // step 空——克隆从「每桶重建 + 每条 clone」降为「每条一次引用克隆」）。
             let mut fv = if i == 0 {
                 first_field_values.clone()
             } else {
@@ -858,7 +872,7 @@ fn build_stats_close_output(
         .collect();
     CloseOutput {
         rule_name: rule_name.to_string(),
-        scope_key: scope_values,
+        scope_key: scope_values.to_vec(),
         machine_id: String::new(),
         close_reason: CloseReason::Timeout,
         event_ok: true,

@@ -116,6 +116,11 @@ fn scope_key_to_values_all_variants() {
 #[test]
 fn build_stats_close_output_injects_key_fields() {
     let key_fields = vec!["bidder".to_string(), "auction".to_string()];
+    let scope_values = scope_key_to_values(&ScopeKey::Pair(
+        Box::new(ScopeKey::Int(7)),
+        Box::new(ScopeKey::Int(8)),
+    ));
+    let first_field_values = stats_first_field_values(&key_fields, &scope_values);
     let close = build_stats_close_output(
         "stats_rule",
         &[10.0, 20.0],
@@ -124,8 +129,8 @@ fn build_stats_close_output_injects_key_fields() {
         None,
         100,
         110,
-        &ScopeKey::Pair(Box::new(ScopeKey::Int(7)), Box::new(ScopeKey::Int(8))),
-        &key_fields,
+        &scope_values,
+        &first_field_values,
     );
     assert_eq!(close.rule_name, "stats_rule");
     assert_eq!(close.close_reason, CloseReason::Timeout);
@@ -143,6 +148,8 @@ fn build_stats_close_output_injects_key_fields() {
 
 #[test]
 fn build_stats_close_output_empty_keys_no_injection() {
+    let scope_values = scope_key_to_values(&ScopeKey::Empty);
+    let first_field_values = stats_first_field_values(&[], &scope_values);
     let close = build_stats_close_output(
         "stats_rule",
         &[1.0],
@@ -151,8 +158,8 @@ fn build_stats_close_output_empty_keys_no_injection() {
         None,
         100,
         110,
-        &ScopeKey::Empty,
-        &[],
+        &scope_values,
+        &first_field_values,
     );
     assert!(close.close_step_data[0].field_values.is_empty());
     assert!(close.scope_key.is_empty());
@@ -167,6 +174,8 @@ fn build_stats_close_output_expands_row_fields() {
     let row_b: Arc<[Option<Value>]> = Arc::new([None, Some(Value::Str("app".into()))]);
     let row_fields: Vec<Option<&Arc<[Option<Value>]>>> = vec![Some(&row_a), Some(&row_b)];
 
+    let scope_values = scope_key_to_values(&ScopeKey::Int(5));
+    let first_field_values = stats_first_field_values(&[], &scope_values);
     let close = build_stats_close_output(
         "stats_rule",
         &[1.0, 2.0],
@@ -175,8 +184,8 @@ fn build_stats_close_output_expands_row_fields() {
         Some(&row_names),
         100,
         110,
-        &ScopeKey::Int(5),
-        &[],
+        &scope_values,
+        &first_field_values,
     );
     let fv = &close.close_step_data[0].field_values;
     assert_eq!(fv.get("price"), Some(&vec![Value::Number(99.0)]));

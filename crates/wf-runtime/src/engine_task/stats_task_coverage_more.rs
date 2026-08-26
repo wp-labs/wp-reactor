@@ -416,6 +416,8 @@ async fn emit_close_record_intermediate_target_dropped() {
     let (config, _cancel) =
         make_config(vec![], None, &eos_tx, HashSet::from(["alerts".to_string()]));
     let (task, _cancel) = StatsTask::new(config);
+    let scope_values = scope_key_to_values(&ScopeKey::Empty);
+    let first_field_values = stats_first_field_values(&[], &scope_values);
     let close = build_stats_close_output(
         "stats_more_rule",
         &[1.0],
@@ -424,8 +426,8 @@ async fn emit_close_record_intermediate_target_dropped() {
         None,
         100,
         110,
-        &ScopeKey::Empty,
-        &[],
+        &scope_values,
+        &first_field_values,
     );
     let lookup = RegistryLookup::new(&task.router);
     let mut builders: HashMap<Arc<str>, AlertColumnBuilder> = HashMap::new();
@@ -439,6 +441,8 @@ async fn emit_close_record_unqualified_returns_none() {
     let (eos_tx, _) = watch::channel(0u64);
     let (config, _cancel) = make_config(vec![], None, &eos_tx, HashSet::new());
     let (task, _cancel) = StatsTask::new(config);
+    let scope_values = scope_key_to_values(&ScopeKey::Empty);
+    let first_field_values = stats_first_field_values(&[], &scope_values);
     let mut close = build_stats_close_output(
         "stats_more_rule",
         &[1.0],
@@ -447,8 +451,8 @@ async fn emit_close_record_unqualified_returns_none() {
         None,
         100,
         110,
-        &ScopeKey::Empty,
-        &[],
+        &scope_values,
+        &first_field_values,
     );
     // And 模式 + event_ok=false → 未达标 → Ok(None)。
     close.event_ok = false;
