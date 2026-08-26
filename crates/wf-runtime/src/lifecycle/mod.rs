@@ -356,9 +356,23 @@ impl Reactor {
         // aggregate window memory into the gate; actors read it on their hot
         // append path and park (stop the conveyor) when over budget instead
         // of letting the evictor drop unacked pull batches.
-        let eviction_gate = Arc::new(EvictionGate::new(
+        //
+        // 诊断模式内存口径：墙梯把同一份数据重发 N 档，人为放大窗口内存压力；
+        // cap 过小会让 commit_append 在 evictor 追不上的窗口（join 目标窗不可
+        // 驱逐）上停车，把内存墙错报成计算墙（q20 实测 2GB 下 rules 假墙 +324ns）。
+        // 诊断模式默认 = 物理内存 60%（WF_DIAG_MAX_TOTAL_BYTES 可调，0=沿用配置）；
+        // 非诊断模式 = 标准配置口径。见 perf_diag::perf_diag_max_total_bytes。
+        let (window_mem_cap, window_mem_cap_src) = crate::perf_diag::perf_diag_max_total_bytes(
             config.window_defaults.max_total_bytes.as_bytes(),
-        ));
+        );
+        wf_info!(
+            sys,
+            window_mem_cap = window_mem_cap,
+            "perf-diag 内存口径: max_total_bytes={} ({})",
+            wf_config::ByteSize::from(window_mem_cap),
+            window_mem_cap_src,
+        );
+        let eviction_gate = Arc::new(EvictionGate::new(window_mem_cap));
         head_watchers.push(watch_group(
             spawn_evictor_task(
                 &config,

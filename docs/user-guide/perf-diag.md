@@ -164,6 +164,26 @@ cut_sink_write = false
 
 启动即应用 `stages[0]` 的门控；`--perf-diag` 不带 = 全关（生产零污染）。
 
+### 5.1 诊断模式内存口径（`WF_DIAG_MAX_TOTAL_BYTES`）
+
+诊断模式启动时，引擎把全局窗口内存 cap（`window_defaults.max_total_bytes`）覆盖为
+`max(配置值, 计算值)`——**墙梯把同一份数据重发 N 档会放大窗口内存压力**，cap 过小
+会让 `commit_append` 停车，把内存墙错报成计算墙（q20 实测 2GB 下 rules 假墙
++324ns/事件，8GB 下真值 −0.5ns）。
+
+| 取值 | 效果 |
+|---|---|
+| （未设） | 物理内存 × 60%（通用方案，按机器比例放量） |
+| `"8GB"` / `"4096MB"` | 显式字节 cap |
+| `"60%"` | 物理内存 × 百分比 |
+| `"0"` | 不覆盖，沿用配置文件（测生产内存约束口径） |
+
+- **仅诊断模式读取**；非诊断模式一律按标准配置走，生产零污染；
+- 诊断只放大不缩小（取 max）；单窗 `max_window_bytes` 不变；
+- 启动日志打印实际口径 `perf-diag 内存口径: max_total_bytes=…`；bench 的
+  `diag.sh` 自动抓进报告口径行（`data/diag_<q>_<total>.txt` 末尾「口径:」）。
+  报告里看不到该行 = 二进制旧、未应用放量——重建 `wfusion` 再跑。
+
 ## 6. 命令参考
 
 ### `wfusion daemon [--perf-diag <path>]`
@@ -246,6 +266,7 @@ full   eps=641240   n=1000000 rounds=1
 | `timeout waiting for sentinel{round=k}` | 数据窗未排空（规则慢/挂起），或哨兵记录未落盘 | 看 daemon 日志 window miss / 规则超时；`--timeout-secs` 调大 |
 | 墙梯无区分度（floor ≈ full） | 事件时间太疏：窗口（如 2m）内同 key 计数上不去，规则不触发 | 把生成数据的时间步进改密（perf_diag_case 用 1ms，同 key 1s 一条） |
 | `rules` 比 `full` 快/慢 | 输出墙小（blackhole），rules≈full 在 ±15% 噪声内 | 加大 N 或多次取 max；输出墙容差放宽 |
+| 墙梯出现负增量档 / 低 CPU 假墙（如 rules 档 CPU 只有个位数 %） | 全局窗口内存 cap 太小，gate 停车把内存墙错报成计算墙（q20 实证） | 确认报告口径行显示 cap=物理内存 60%（`WF_DIAG_MAX_TOTAL_BYTES` 可调大或减 N）；旧二进制要重建 |
 | 首轮后同档轮次变慢 | `--rounds > 1`：首个哨兵已切下一档，后续轮次吃新门控 | 用 `rounds=1` + `--n-list` 递增去噪 |
 | 哨兵记录 `start_ns`/`emit_ns` 是字符串 | 设计如此：epoch nanos 超 f64 精确范围，字符串保精确 | 解析回 i64 再算 EPS（wfgen 已处理） |
 | 跨机部署 EPS 偏差大 | wfgen 与引擎时钟不同机，`start_ns`/`emit_ns` 不可比 | 诊断须同机跑；跨机需 NTP 或引擎回写差值（未做） |

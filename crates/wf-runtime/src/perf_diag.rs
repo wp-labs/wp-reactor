@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use wf_config::{FusionConfig, PerfConfig, PerfStage, RawFusionConfigTree};
+use wf_config::{ByteSize, FusionConfig, PerfConfig, PerfStage, RawFusionConfigTree};
 use wf_engine::alert::{AlertColumnBuilder, AlertOrigin, OutputRecord};
 use wf_engine::match_engine::Value;
 use wf_engine::window::{Router, RulePush};
@@ -55,6 +55,20 @@ static PERF_CUT_RECV: AtomicBool = AtomicBool::new(false);
 static PERF_CUT_SINK_WRITE: AtomicBool = AtomicBool::new(false);
 /// 诊断档列表（启动时 set，只读；测试可重复初始化）。
 static PERF_STAGES: std::sync::RwLock<Vec<PerfStage>> = std::sync::RwLock::new(Vec::new());
+
+/// 诊断模式全局窗口内存预算（`window_defaults.max_total_bytes`）覆盖环境变量。
+///
+/// 仅 `--perf-diag` 诊断模式下读取；非诊断模式永远按标准配置走。取值：
+///
+/// - `"0"` / 空 → 不覆盖，沿用配置文件 `window_defaults.max_total_bytes`
+///   （测「生产内存约束」口径，验证 2GB 下 gate 停车对墙梯的污染）；
+/// - 字节大小（如 `"8GB"`、`"4096MB"`）→ 直接用该值；
+/// - 百分比（如 `"60%"`）→ 物理内存 × 百分比。
+///
+/// 未设 = 物理内存 × 60%（通用方案：按机器比例放量，普适性优于固定 8GB）。
+pub const WF_DIAG_MAX_TOTAL_BYTES: &str = "WF_DIAG_MAX_TOTAL_BYTES";
+/// 诊断模式默认全局窗口内存比例（物理内存 × 60%）。
+const WF_DIAG_DEFAULT_MEM_FRACTION: f64 = 0.6;
 
 /// 初始化诊断模式全局状态——**仅当 `--perf-diag <path>` 启动参数存在时调用**
 /// （wfusion CLI 已解析并 load 配置文件）。入口即参数本身：
@@ -104,24 +118,137 @@ pub fn perf_diag_enabled() -> bool {
     PERF_DIAG_ENABLED.load(Ordering::Relaxed)
 }
 
-/// **输出链消融**（2026-08-26 内存定位）：`WF_DIAG_CUT_ALERT=1` 时，规则仍照常
-/// 消费输入（pipe/join 全跑），但**跳过 sink alert 构建**（`AlertColumnBuilder`
-/// 装载）。与 `perf_cut_output` 的区别：后者把整个输出链（pipe 写入 + alert）
-/// 一刀切；本开关只切 alert 这一段，用来回答"那 12.5GB 输出链增量里，alert
-/// 构建占多少"。
+/// 探测物理内存（字节）。Linux 读 `/proc/meminfo` 的 `MemTotal`（kB），macOS 走
+/// `sysctl -n hw.memsize`；探测失败返回 `None`（调用方回退配置值）。一次性启动
+/// 调用，不在热路径。
+fn physical_memory_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = info
+            .lines()
+            .find(|l| l.starts_with("MemTotal:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        usize::try_from(kb * 1024).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// 诊断模式的全局窗口内存预算（`window_defaults.max_total_bytes`）决策：
+///
+/// - **非诊断模式** → 原样返回 `config_max`（生产按标准配置走，零污染）；
+/// - **诊断模式**（`--perf-diag`）→ 覆盖为 `max(config_max, 计算值)`：
+///   [`WF_DIAG_MAX_TOTAL_BYTES`] 显式指定（字节大小 / 百分比 / `"0"` 关闭覆盖），
+///   未设 = 物理内存 × 60%。取 max 保证诊断只放大不缩小——内存口径永不比生产
+///   配置更紧。
+///
+/// 返回值 = `(实际预算字节, 来源描述)`（来源进启动日志，报告标注口径用）。
+///
+/// **为什么放大**：墙梯把同一份数据重发 N 档，人为放大窗口内存压力；全局 cap
+/// 过小时 `commit_append` 会在 evictor 追不上的窗口（join 目标窗不可驱逐）上停车，
+/// 把内存墙错报成计算墙——q20 实测 2GB 下 rules 假墙 +324ns/事件，8GB 下真值
+/// −0.5ns，归因方向完全反了。放量到机器比例后墙梯才测得到纯计算墙。
+pub fn perf_diag_max_total_bytes(config_max: usize) -> (usize, String) {
+    if !perf_diag_enabled() {
+        return (config_max, "配置".to_string());
+    }
+    diag_mem_cap(
+        config_max,
+        physical_memory_bytes(),
+        std::env::var(WF_DIAG_MAX_TOTAL_BYTES).ok().as_deref(),
+    )
+}
+
+/// 纯决策函数（不读进程环境、不探测内存，可确定性单测）。返回 `(预算, 来源)`。
+fn diag_mem_cap(config_max: usize, phys: Option<usize>, env: Option<&str>) -> (usize, String) {
+    if let Some(v) = env {
+        let v = v.trim();
+        if v.is_empty() || v == "0" {
+            return (
+                config_max,
+                format!("{WF_DIAG_MAX_TOTAL_BYTES}=0 关闭覆盖，沿用配置"),
+            );
+        }
+        if let Some(pct) = v.strip_suffix('%') {
+            if let (Ok(p), Some(phys)) = (pct.trim().parse::<f64>(), phys) {
+                return (
+                    config_max.max((phys as f64 * p / 100.0) as usize),
+                    format!("{WF_DIAG_MAX_TOTAL_BYTES}={v}（物理 {}）", ByteSize::from(phys)),
+                );
+            }
+        } else if let Ok(size) = v.parse::<ByteSize>() {
+            return (
+                config_max.max(size.as_bytes()),
+                format!("{WF_DIAG_MAX_TOTAL_BYTES}={v}"),
+            );
+        }
+        log::warn!(
+            "{WF_DIAG_MAX_TOTAL_BYTES}={v:?} 无法解析（支持 \"8GB\" / \"4096MB\" / \"60%\"），回退物理内存 60%"
+        );
+    }
+    match phys {
+        Some(phys) => (
+            config_max.max((phys as f64 * WF_DIAG_DEFAULT_MEM_FRACTION) as usize),
+            format!("60% 物理内存（{}）", ByteSize::from(phys)),
+        ),
+        None => {
+            log::warn!(
+                "{WF_DIAG_MAX_TOTAL_BYTES}: 物理内存探测失败，沿用配置 max_total_bytes={config_max}"
+            );
+            (config_max, "配置（物理内存探测失败）".to_string())
+        }
+    }
+}
+
+/// 输出链消融开关（Once 一次性读 env 缓存，之后纯原子读——热路径零开销）。
+/// 测试钩子 [`set_perf_cut_alert_for_test`] 消费 Once 后直接翻转（生产路径不调用）。
+static PERF_CUT_ALERT_INIT: std::sync::Once = std::sync::Once::new();
+static PERF_CUT_ALERT: AtomicBool = AtomicBool::new(false);
+
+/// 输出链消融：`WF_DIAG_CUT_ALERT=1` 时，规则仍照常消费输入（pipe/join 全跑），
+/// 但**跳过 sink alert 构建**（`AlertColumnBuilder` 装载）。与 `perf_cut_output`
+/// 的区别：后者把整个输出链（pipe 写入 + alert）一刀切；本开关只切 alert 这一段，
+/// 用来回答「那 12.5GB 输出链增量里，alert 构建占多少」。
 ///
 /// 设计为环境变量而非档位字段：它是临时消融手段（跑完即撤），不需要进
-/// 档状态机/配置。OnceLock 缓存，热路径零开销。
+/// 档状态机/配置。首次调用读 env 一次，之后纯原子读。
 ///
 /// ⚠ **生产勿设**：本开关不依赖 `--perf-diag`（env 直接生效），误设会静默
 /// 丢弃全部 alert 输出（emitted 计数仍走）。用完即撤。
 pub fn perf_cut_alert() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("WF_DIAG_CUT_ALERT")
+    PERF_CUT_ALERT_INIT.call_once(|| {
+        let on = std::env::var("WF_DIAG_CUT_ALERT")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+            .unwrap_or(false);
+        PERF_CUT_ALERT.store(on, Ordering::Relaxed);
+    });
+    PERF_CUT_ALERT.load(Ordering::Relaxed)
+}
+
+/// 测试专用钩子：直接翻转输出链消融开关（生产/正式路径不调用——env 由首次
+/// 访问读取一次）。与 `set_perf_cuts` 同款全局门控纪律：测试须在
+/// `PERF_CUT_SERIAL` 下使用，用完复位为 false。
+#[cfg(test)]
+pub(crate) fn set_perf_cut_alert_for_test(v: bool) {
+    PERF_CUT_ALERT_INIT.call_once(|| {}); // 消费 Once：之后不再读 env
+    PERF_CUT_ALERT.store(v, Ordering::Relaxed);
 }
 
 /// 是否禁止规则求值（cut_rules 门控）。
@@ -700,6 +827,114 @@ mod tests {
         // 被 `perf_cut_output()` 早退丢输出（2026-08-25 实测：deferred_q8
         // EOS 重试 emit 被切 → 断言 left=[]）。
         reset_perf_diag();
+    }
+
+    // -- 诊断模式内存口径（diag_mem_cap / perf_diag_max_total_bytes） ---------
+
+    #[test]
+    fn mem_cap_non_diag_returns_config_unchanged() {
+        let _g = serial();
+        reset_perf_diag();
+        // 非诊断模式：即使设了环境变量也必须返回配置值（生产零污染）。
+        unsafe { std::env::set_var(WF_DIAG_MAX_TOTAL_BYTES, "64GB") };
+        let (cap, src) = perf_diag_max_total_bytes(2 * 1024 * 1024 * 1024);
+        unsafe { std::env::remove_var(WF_DIAG_MAX_TOTAL_BYTES) };
+        assert_eq!(cap, 2 * 1024 * 1024 * 1024);
+        assert!(src.contains("配置"));
+    }
+
+    #[test]
+    fn mem_cap_env_bytes_overrides() {
+        let (cap, src) = diag_mem_cap(2 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024), Some("8GB"));
+        assert_eq!(cap, 8 * 1024 * 1024 * 1024);
+        assert!(src.contains("8GB"), "source={src}");
+        let (cap, src) = diag_mem_cap(2 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024), Some("4096MB"));
+        assert_eq!(cap, 4 * 1024 * 1024 * 1024);
+        assert!(src.contains("4096MB"), "source={src}");
+        // 字节大小不需要物理内存探测也能生效。
+        let (cap, src) = diag_mem_cap(2 * 1024 * 1024 * 1024, None, Some("8GB"));
+        assert_eq!(cap, 8 * 1024 * 1024 * 1024);
+        assert!(src.contains("8GB"), "source={src}");
+    }
+
+    #[test]
+    fn mem_cap_env_percent_scales_with_phys() {
+        let phys = 32 * 1024 * 1024 * 1024usize;
+        let (cap, src) = diag_mem_cap(2 * 1024 * 1024 * 1024, Some(phys), Some("75%"));
+        assert_eq!(cap, (phys as f64 * 0.75) as usize);
+        assert!(src.contains("75%"), "source={src}");
+        // 百分比但物理内存探测失败 → 回退默认（仍优先于配置）。
+        let (cap, _) = diag_mem_cap(2 * 1024 * 1024 * 1024, None, Some("75%"));
+        assert_eq!(cap, 2 * 1024 * 1024 * 1024, "探测失败应回退配置");
+    }
+
+    #[test]
+    fn mem_cap_default_is_sixty_percent_phys() {
+        let phys = 64 * 1024 * 1024 * 1024usize;
+        let (cap, src) = diag_mem_cap(2 * 1024 * 1024 * 1024, Some(phys), None);
+        assert_eq!(cap, (phys as f64 * 0.6) as usize);
+        assert!(src.contains("60%"), "source={src}");
+        // 未设环境变量 + 物理内存探测失败 → 沿用配置。
+        let (cap, src) = diag_mem_cap(2 * 1024 * 1024 * 1024, None, None);
+        assert_eq!(cap, 2 * 1024 * 1024 * 1024);
+        assert!(src.contains("配置"), "source={src}");
+    }
+
+    #[test]
+    fn mem_cap_zero_env_disables_override() {
+        let (cap, src) = diag_mem_cap(2 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024), Some("0"));
+        assert_eq!(cap, 2 * 1024 * 1024 * 1024, "WF_DIAG_MAX_TOTAL_BYTES=0 关闭覆盖");
+        assert!(src.contains("0"), "source={src}");
+        let (cap, _) = diag_mem_cap(2 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024), Some(""));
+        assert_eq!(cap, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn mem_cap_never_reduces_below_config() {
+        // 显式给更小的值 → 取 max(配置, 计算值)，诊断只放大不缩小。
+        let (cap, _) = diag_mem_cap(8 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024), Some("1GB"));
+        assert_eq!(cap, 8 * 1024 * 1024 * 1024);
+        // 无法解析的值 → 回退 60% 物理内存。
+        let (cap, _) = diag_mem_cap(2 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024), Some("garbage"));
+        let phys = (32 * 1024 * 1024 * 1024usize) as f64;
+        assert_eq!(cap, (phys * 0.6) as usize);
+    }
+
+    #[test]
+    fn mem_cap_diag_wrapper_defaults_to_sixty_percent() {
+        let _g = serial();
+        let cfg = PerfConfig {
+            stages: vec![PerfStage {
+                name: "floor".into(),
+                cut_rules: true,
+                cut_output: true,
+                cut_append: false,
+                cut_recv: false,
+                cut_sink_write: false,
+                rules: None,
+            }],
+        };
+        init_perf_diag(&cfg);
+        unsafe { std::env::remove_var(WF_DIAG_MAX_TOTAL_BYTES) };
+        let (cap, src) = perf_diag_max_total_bytes(2 * 1024 * 1024 * 1024);
+        // 机器相关：只断言不缩水 + 来源是默认放量（探测成功）或配置（探测失败）。
+        assert!(cap >= 2 * 1024 * 1024 * 1024, "诊断模式不得低于配置 cap");
+        assert!(
+            src.contains("60%") || src.contains("探测失败"),
+            "source={src}"
+        );
+        reset_perf_diag();
+    }
+
+    // -- 输出链消融开关（set_perf_cut_alert_for_test） ------------------------
+
+    #[test]
+    fn cut_alert_test_hook_flips_and_defaults_false() {
+        let _g = serial();
+        set_perf_cut_alert_for_test(true);
+        assert!(perf_cut_alert(), "测试钩子应能强制开启");
+        set_perf_cut_alert_for_test(false);
+        assert!(!perf_cut_alert(), "用完必须复位");
     }
 
     // -- 哨兵载荷解析 -------------------------------------------------------

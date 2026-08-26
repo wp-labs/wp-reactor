@@ -547,6 +547,15 @@ impl StatsTask {
                 }
             }
         }
+        // 输出链消融（2026-08-26）：只切**列式 alert 装载**（`execute_close_direct_`
+        // `batch_columnar` = AlertColumnBuilder 装载 + 投递），保留上面循环的
+        // CloseOutput 构造（= 规则侧 close 求值产物，与 `emit_close_record` 同款
+        // 门控）。emitted 计数随装载一并跳过（stats 的 emitted 在装载时计，与
+        // cut_output 对 stats 的口径一致）。q19 类 top/统计输出墙的构建成本隔离。
+        if columnar_close && crate::perf_diag::perf_cut_alert() {
+            self.report_over_limit(window_start, window_end);
+            return;
+        }
         if columnar_close && !columnar_closes.is_empty() {
             // 批量列式 close: 单 target（静态 yield_target）builder, 一次投递。
             // emit_time 用窗级墙钟（emit_time 不喂语义, 与 L4 文档一致）。
@@ -632,6 +641,12 @@ impl StatsTask {
                         output_kind = "intermediate",
                         "stats intermediate output not yet supported (P2)"
                     );
+                    return;
+                }
+                // 输出链消融（2026-08-26）：只切 alert 构建（`AlertColumnBuilder`
+                // 装载 + 投递），保留 `execute_close_with_joins` 的 close 求值（规则侧
+                // 成本）与 emitted 计数。与列式 close 门控同款（见 `close_current_window`）。
+                if crate::perf_diag::perf_cut_alert() {
                     return;
                 }
                 let target = Arc::clone(&record.yield_target);

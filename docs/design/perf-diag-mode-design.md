@@ -172,9 +172,19 @@ cut_output = true
     **之前**——该路径的 emitted 计数与 append 耦合，切了 append 就**留不住计数**
     （实测：nexmark q1 `on each` 在 `rules` 档的 `emitted_total` 为 0；4 档墙梯
     warmup+floor+rules+full 的总 emitted = 2×9.2M 而非 3×9.2M）。
-  - **影响墙增量的解释口径**：on-each 类规则的 `rules → full` 增量**包含
-    `OutputRecord` 构造成本**（构造在门控之后）；而 match 类规则的构造成本已计入
+  - **影响墙增量的解释口径**：on-each 类规则的 `rules → full` 增量**包含**
+    `OutputRecord` 构造成本（构造在门控之后）；而 match 类规则的构造成本已计入
     `rules` 档——两类规则的「输出墙」不同口径，不可直接横向比。
+- **cut_alert（输出链消融，env 门控，2026-08-26 扩至 close/stats）**：
+  `WF_DIAG_CUT_ALERT=1` 只切 `AlertColumnBuilder` 装载（sink alert 构建），
+  **保留 pipe/join 消费**（与 cut_output「整条输出链一刀切」的细分：回答
+  「输出链增量里 alert 构建占多少」）。覆盖全部 emit 路径：on-each 直投
+  （`emit_each_direct` / `emit_each_direct_batch_columnar_join`）、CEP
+  close/match（`RuleTask::emit` / `emit_batch`，2026-08-26 补）、stats close
+  （`StatsTask::close_current_window` 列式装载 + `emit_close_record` 行式，
+  2026-08-26 补——q19 类 top/统计输出墙的构建成本隔离）。env 临时消融手段
+  （生产勿设），首次调用读 env 一次缓存（Once + 原子读，热路径零开销）；
+  测试经 `set_perf_cut_alert_for_test` 翻转。
 - 门控形态：`set_rule_profiling` 同款全局原子 + `pub fn set_perf_cuts(...)`，
   `Reactor::start` 时从 `--perf-diag` 加载的 `PerfConfig` 初始化（无参数 = 全关）。
   （`set_rule_profiling` 仅作形态参照，它本身不由诊断档翻转，见 §4.1。）
@@ -299,6 +309,32 @@ cut_output = true
   根治为引擎默认值，改 100ms 后短跑不再被 ~1s 粒度钉死）。
 - 完成判定信号 = 哨兵文件记录（事件驱动，`stage{current=k}`），替代 metrics
   轮询近似。
+
+### 4.6 诊断模式内存口径（隔离内存墙，防墙梯归因污染）
+
+**问题（q20 实证，2026-08-26）**：墙梯把同一份数据重发 N 档，人为放大窗口内存
+压力。全局 cap（`window_defaults.max_total_bytes`）过小时，`commit_append` 会在
+evictor 追不上的窗口（join 目标窗 `over_cap` 全保留、不可驱逐）上停车——
+**把内存墙错报成计算墙**：q20 在 2GB 下 rules 档假墙 +324ns/事件（CPU 仅 18%，
+等/供给墙）、emit 档负增量 −306ns；同一台机器 8GB 下 rules 真值 −0.5ns（近零）。
+内存背压的方向性污染会给出**完全相反**的归因。
+
+**方案（引擎侧，非 diag.sh 改配置）**：诊断模式（`--perf-diag`）启动时，全局
+窗口内存 cap 覆盖为 `max(配置值, 计算值)`：
+
+- 默认 = **物理内存 × 60%**（按机器比例放量，普适性优于固定 8GB——大内存机器
+  仍可能不够，小内存机器 8GB 又太奢）；
+- 环境变量 `WF_DIAG_MAX_TOTAL_BYTES` 可调：`"8GB"` / `"4096MB"` 显式字节；
+  `"60%"` 百分比；`"0"` = 不覆盖，沿用配置（测「生产内存约束」口径，复现
+  2GB 下的 gate 停车污染）；
+- 取 max 保证**诊断只放大不缩小**——内存口径永不比生产配置更紧；
+- **非诊断模式完全不读取**该 env，一律按标准配置走（生产零污染）；
+- 单窗 `max_window_bytes` 不变（各自窗口的 ack-floor 自我保护，非本次污染源）。
+
+**实现位置**：`wf_runtime::perf_diag::perf_diag_max_total_bytes(config_max)`，
+`Reactor::start` 创建 `EvictionGate` 时调用；启动日志打印实际口径
+（`perf-diag 内存口径: max_total_bytes=…（来源）`），bench 的 diag.sh 从日志
+抓取并写进报告口径行——**报告自证内存口径，防拿旧二进制跑出新假墙**。
 
 ---
 
