@@ -1,7 +1,10 @@
 # stats 状态 spill 到 redb（大键状态内存有界化）
 
-> 状态：**设计中** · 2026-08-26 · 优先级：高（q18 100M 状态 18.6G 是语义必然，
+> 状态：**M1-M3 已完成**（trait + 序列化 → redb 存储 → StatsWindowState 接入）·
+> 2026-08-26 · 优先级：高（q18 100M 状态 18.6G 是语义必然，
 > 唯一的根治路径是让状态落盘，内存只保留活跃子集）
+> 实现：`crates/wf-engine/src/match_engine/spill.rs`（存储层）+
+> `stats_exec.rs`（StatsWindowState 接入：clock 驱逐/读回/close 合并）
 > 关联：`notes/q18-stats-key-state-memory.md`（q18 归因 + 键数线性增长根源 §10.4）、
 > `MEMORY_ISSUES_100M.md` M-18
 > 复现场景：`wf-examples/performance/nexmark_pk` → `./bench.sh q18 replay 100m`
@@ -254,9 +257,16 @@ rule q18_last_bid_stats {
 
 ## 13. 里程碑
 
-1. **M1**：SpillStore trait + Noop + 序列化（ScopeKey/StatsAccum/RowFields）
-2. **M2**：Redb 实现（put/get/drain）+ 单元测试
-3. **M3**：接入 StatsWindowState（超预算驱逐 + spill_index + 读回 + close 合并）
+1. **M1**：SpillStore trait + Noop + 序列化（ScopeKey/StatsAccum/RowFields）✅
+2. **M2**：Redb 实现（put_batch/take/drain）+ 单元测试 ✅
+3. **M3**：接入 StatsWindowState（超预算驱逐 + spill_index + 读回 + close 合并）✅
+   - 实现要点：trait 定为 `put_batch`/`take`（单事务批量写 + 读回即移除）——
+     保证内存/spill 不相交不变量，close 只需 drain+并入（免逐键 flush）
+   - 驱逐 = clock 二次机会近似 LRU（热路径只置一个 touched 位），
+     批量驱逐到 `min(上限-单桶, 90%)`
+   - 三层预算阶梯：内存 → 磁盘 → 拒收兜底（写失败/落盘满回退拒收不丢键）
+   - 测试：`stats_spill_test.rs` 5 个（驱逐+读回 / 对拍契约 / 阶梯兜底 /
+     redb 全链路+文件清理 / 内存有界）
 4. **M4**：wfl 声明（spill）解析 + spawn 注入
 5. **M5**：q18 100M 验证（内存曲线 + 对拍 + EPS 影响）
 

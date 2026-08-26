@@ -5,7 +5,7 @@
 //!
 //! 设计依据: docs/stats-executor-design.md v6（§6 执行器）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -16,6 +16,7 @@ use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsPlan};
 use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
 use crate::match_engine::event_bridge::extract_field_value;
 use crate::match_engine::match_engine::{Event, ScopeKey, field_ref_name};
+use crate::match_engine::spill::SpillStore;
 use crate::match_engine::{EngineHashMap, EngineHashSet, Value};
 use crate::window::scope_key_columnar;
 use crate::window::scope_key_from_column;
@@ -541,6 +542,22 @@ pub struct StatsWindowState {
     limit_warned: bool,
     /// 告警用的规则名（set_memory_limit 注入）。
     rule_name: String,
+    /// 状态外溢存储（M3，`docs/design/stats-state-spill-redb.md`）。None = 未配置
+    /// spill（Noop 语义，热路径零开销）。
+    pub(crate) spill: Option<Box<dyn SpillStore + Send + Sync>>,
+    /// 已 spill 键的存在性索引（hot path 未命中时 O(1) 查，不碰持久层）。
+    pub(crate) spill_index: HashSet<u64>,
+    /// 落盘字节上限（None = 不限）。三层预算阶梯第二层（内存→磁盘→拒收兜底）。
+    spill_limit_bytes: Option<u64>,
+    /// 估算的已落盘字节（按桶预算计，与 `estimated_bytes` 同口径）。
+    spilled_bytes: u64,
+    /// spill 写失败/满后的拒收回退标记（避免反复尝试写）。
+    spill_failed: bool,
+    /// 落盘满/写失败的告警标记（每窗口一次，防刷屏）。
+    spill_warned: bool,
+    /// 时钟队列（近似 LRU）：桶**创建序**的 hash 环。驱逐扫描队首：
+    /// 二次机会（touched）→ 清位回队尾；否则驱逐。每在内存键至多一个条目。
+    clock: VecDeque<u64>,
 }
 
 impl StatsWindowState {
@@ -556,6 +573,13 @@ impl StatsWindowState {
             over_limit_new_buckets: 0,
             limit_warned: false,
             rule_name: String::new(),
+            spill: None,
+            spill_index: HashSet::new(),
+            spill_limit_bytes: None,
+            spilled_bytes: 0,
+            spill_failed: false,
+            spill_warned: false,
+            clock: VecDeque::new(),
         }
     }
 
@@ -637,7 +661,8 @@ impl StatsWindowState {
         bytes
     }
 
-    /// 新建桶前的限额检查: 超限 → 计数 + 每窗口告警一次 + 拒绝（false）。
+    /// 新建桶前的限额检查: 超限 → 先尝试 spill 腾空间（M3 三层预算阶梯第二层）
+    /// → 仍超限 → 计数 + 每窗口告警一次 + 拒绝（false）。
     ///
     /// **计数口径（按行/尝试, 非按新键）**: 被拒的键不建桶 → 后续同键行仍走
     /// 查找未命中 → 每次尝试都计数。这是有意取舍——「每新键一次」需记录被拒键
@@ -649,14 +674,27 @@ impl StatsWindowState {
         if let Some(limit) = self.limit_bytes
             && self.estimated_bytes + allowance > limit
         {
+            // spill 启用且未失败: 先驱逐最老键腾空间（批量, 目标降到上限 90%）。
+            if self.spill.is_some() && !self.spill_failed {
+                self.evict_to_spill(plan);
+                if self.estimated_bytes + allowance <= limit {
+                    self.estimated_bytes += allowance;
+                    return true;
+                }
+                // 落盘满/写失败 → 落到拒收兜底（下面）
+            }
             self.over_limit_new_buckets += 1;
             if !self.limit_warned {
                 self.limit_warned = true;
                 log::warn!(
-                    "stats 状态内存超限（规则 {}, 估算 {}B / 上限 {}B）——拒绝新建键桶, 已有桶继续累积; 累计拒收 {} 行（新桶尝试）",
+                    "stats 状态内存超限（规则 {}, 估算 {}B / 上限 {}B, spill {}{}）——拒绝新建键桶, 已有桶继续累积; 累计拒收 {} 行（新桶尝试）",
                     self.rule_name,
                     self.estimated_bytes,
                     limit,
+                    if self.spill.is_some() { "已满/失败" } else { "未启用" },
+                    self.spill_limit_bytes
+                        .map(|b| format!(" 落盘 {}/{}B", self.spilled_bytes, b))
+                        .unwrap_or_default(),
                     self.over_limit_new_buckets
                 );
             }
@@ -665,6 +703,148 @@ impl StatsWindowState {
         self.estimated_bytes += allowance;
         true
     }
+
+    /// 注入状态外溢存储（窗口开始时由 spawn 层调用）。
+    /// `store = None` 关闭 spill（Noop 语义）。`max_spill_bytes = None` 不限落盘。
+    pub fn set_spill(&mut self, store: Option<Box<dyn SpillStore + Send + Sync>>, max_spill_bytes: Option<usize>) {
+        self.spill = store;
+        self.spill_limit_bytes = max_spill_bytes.map(|b| b as u64);
+        self.spill_index.clear();
+        self.spilled_bytes = 0;
+        self.spill_failed = false;
+        self.spill_warned = false;
+        self.clock.clear();
+    }
+
+    /// 驱逐最老未更新键到 spill（clock 二次机会近似 LRU），直到内存预算降到
+    /// `min(上限-单桶, 上限 90%)`（滞后带：既要放得下新桶，又避免每新键都驱逐）。
+    ///
+    /// 落盘上限已满/写失败 → 置 `spill_failed`, 由 `account_new_bucket` 落到
+    /// 拒收兜底（不丢内存键）。
+    fn evict_to_spill(&mut self, plan: &StatsPlan) {
+        let Some(limit) = self.limit_bytes else { return };
+        // 落盘上限已到 → 停止驱逐（拒收兜底）。
+        if let Some(sl) = self.spill_limit_bytes
+            && self.spilled_bytes >= sl
+        {
+            self.warn_spill_full();
+            return;
+        }
+        let allowance = Self::bucket_allowance(plan);
+        // 驱逐目标: 上限-单桶 与 上限 90% 取小（前者保证新桶放得下）。
+        let target = limit.saturating_sub(allowance).min(limit.saturating_mul(9) / 10);
+        let mut batch: Vec<(u64, ScopeKey, Vec<StatsAccum>)> = Vec::new();
+        let mut batch_hashes: Vec<u64> = Vec::new();
+        // 扫描期待驱逐字节（est 只在落盘后扣——循环条件用 est - pending）。
+        let mut pending = 0u64;
+        // 防活锁: 每轮最多扫 2× 时钟长度（全 second-chance 时停止）。
+        let max_scan = self.clock.len().saturating_mul(2);
+        let mut scanned = 0usize;
+        while self.estimated_bytes.saturating_sub(pending) > target && scanned < max_scan {
+            let Some(h) = self.clock.pop_front() else { break };
+            scanned += 1;
+            let Some(chain) = self.buckets.get_mut(&h) else {
+                continue; // 链已不在（close 分批取走）
+            };
+            if chain.iter().any(|b| b.touched) {
+                // 二次机会: 清位回队尾（本轮放行）。
+                for b in chain.iter_mut() {
+                    b.touched = false;
+                }
+                self.clock.push_back(h);
+                continue;
+            }
+            // 驱逐整链（先 clone 进 batch；落盘成功后才从桶表移除——写失败
+            // 不丢内存键）。
+            pending += allowance * chain.len() as u64;
+            for b in chain.iter() {
+                batch.push((h, b.scope_key.clone(), b.accs.clone()));
+            }
+            batch_hashes.push(h);
+        }
+        if batch.is_empty() {
+            return;
+        }
+        // 落盘预算检查（写入前）：超出则拒收兜底。
+        let add_bytes = batch_hashes.len() as u64 * allowance;
+        if let Some(sl) = self.spill_limit_bytes
+            && self.spilled_bytes + add_bytes > sl
+        {
+            self.warn_spill_full();
+            return;
+        }
+        // 单事务批量写。
+        let result = self
+            .spill
+            .as_mut()
+            .expect("调用方已确认 spill 启用")
+            .put_batch(batch);
+        if let Err(e) = result {
+            // 写失败（磁盘满/IO）→ 回退拒收（§5 三层阶梯兜底），不丢内存键。
+            self.spill_failed = true;
+            log::error!(
+                "spill 写失败(规则 {}): {e}——回退拒收新键",
+                self.rule_name
+            );
+            return;
+        }
+        // 落盘成功 → 从桶表移除 + 记账（内存/spill 不相交不变量成立）。
+        for h in &batch_hashes {
+            if let Some(chain) = self.buckets.remove(h) {
+                let n = chain.len() as u64;
+                self.estimated_bytes = self.estimated_bytes.saturating_sub(allowance * n);
+                self.spilled_bytes += allowance * n;
+            }
+            self.spill_index.insert(*h);
+        }
+    }
+
+    /// 落盘满/失败告警（每窗口一次）。
+    fn warn_spill_full(&mut self) {
+        if self.spill_warned {
+            return;
+        }
+        self.spill_warned = true;
+        log::warn!(
+            "spill 落盘上限/写失败（规则 {}, 已落盘 {}B / 上限 {:?}）——停止驱逐, 回退拒收新键",
+            self.rule_name,
+            self.spilled_bytes,
+            self.spill_limit_bytes
+        );
+    }
+
+    /// close 前把 spill 全部并入内存桶（drain 后内存/spill 不相交不变量 →
+    /// 每个键恰好一次）。并入后走原有 `take_buckets` / `take_buckets_up_to` 路径。
+    fn merge_spill_into_buckets(&mut self) {
+        let Some(spill) = &mut self.spill else { return };
+        if spill.is_empty() {
+            return;
+        }
+        let drained = spill.drain();
+        self.spill_index.clear();
+        self.spilled_bytes = 0;
+        self.clock.clear();
+        for (key, accs) in drained {
+            let hash = scope_key_hash(&key);
+            let chain = self
+                .buckets
+                .entry(hash)
+                .or_insert_with(|| Vec::with_capacity(1));
+            // 不变量: 内存与 spill 不相交——但防御性合并（不变量破坏时仍正确）。
+            match chain.iter_mut().find(|b| b.scope_key == key) {
+                Some(existing) => {
+                    for (t, o) in existing.accs.iter_mut().zip(accs.iter()) {
+                        merge_accum(t, o);
+                    }
+                }
+                None => chain.push(StatsBucket {
+                    scope_key: key,
+                    accs,
+                    touched: true,
+                }),
+            }
+        }
+    }
 }
 
 /// 单桶: 完整 [`ScopeKey`]（close 排序/输出; 每桶一次构建）+ 累加器数组。
@@ -672,6 +852,9 @@ impl StatsWindowState {
 pub struct StatsBucket {
     pub scope_key: ScopeKey,
     pub accs: Vec<StatsAccum>,
+    /// 时钟（clock）算法的二次机会位：命中置位，驱逐扫描清位放行。
+    /// spill 启用时才有意义；未启用恒 false，零开销。
+    touched: bool,
 }
 
 impl StatsWindowState {
@@ -682,13 +865,15 @@ impl StatsWindowState {
             vec![StatsBucket {
                 scope_key: ScopeKey::Empty,
                 accs: StatsAccum::accs_for_plan(plan),
+                touched: false,
             }],
         );
     }
 
     /// 取/建一个桶（完整键路径: 行式回退 / 空键规则用）。哈希与列式
     /// `keyed_bucket_mut` 同值, 链内按 ScopeKey 完整比较消歧。
-    /// 新桶先过限额检查（超限 → None, 调用方跳过该行——内存有界）。
+    /// 新桶先过限额检查（超限 → spill 腾空间 → 仍超限 → None, 调用方跳过
+    /// 该行——内存有界）。
     fn bucket_mut(&mut self, key: &ScopeKey, plan: &StatsPlan) -> Option<&mut Vec<StatsAccum>> {
         let hash = scope_key_hash(key);
         // 先只读查找（entry 可变借用会与限额记账的 &mut self 冲突）。
@@ -697,7 +882,46 @@ impl StatsWindowState {
             .get(&hash)
             .and_then(|chain| chain.iter().position(|b| &b.scope_key == key));
         if let Some(i) = pos {
-            return Some(&mut self.buckets.get_mut(&hash).expect("命中即存在")[i].accs);
+            let chain = self.buckets.get_mut(&hash).expect("命中即存在");
+            chain[i].touched = true; // 时钟二次机会位（spill 启用时才有意义）
+            return Some(&mut chain[i].accs);
+        }
+        // 未命中: 键可能已 spill → 读回（take 移除, 保持内存/spill 不相交）。
+        if self.spill_index.contains(&hash) {
+            let taken = self
+                .spill
+                .as_mut()
+                .expect("spill_index 非空即有 store")
+                .take(hash)
+                .unwrap_or_else(|| {
+                    panic!("spill 索引与存储不一致(致命): hash {hash:#x} 索引在但 take 空")
+                });
+            if taken.0 != *key {
+                // hash 碰撞且非同一键：take 已移除，致命（绝不静默丢键）。
+                panic!("spill hash 碰撞(致命): {hash:#x} 键不匹配");
+            }
+            self.spill_index.remove(&hash);
+            self.spilled_bytes = self
+                .spilled_bytes
+                .saturating_sub(Self::bucket_allowance(plan));
+            // 读回入账后可能超限 → 先驱逐最老键（此刻尚未借用 chain）。
+            self.estimated_bytes += Self::bucket_allowance(plan);
+            if let Some(limit) = self.limit_bytes
+                && self.estimated_bytes > limit
+            {
+                self.evict_to_spill(plan);
+            }
+            let chain = self
+                .buckets
+                .entry(hash)
+                .or_insert_with(|| Vec::with_capacity(1));
+            chain.push(StatsBucket {
+                scope_key: taken.0,
+                accs: taken.1,
+                touched: true, // 刚回访: 最近活跃, 二次机会
+            });
+            self.clock.push_back(hash);
+            return Some(&mut chain.last_mut().expect("just pushed").accs);
         }
         if !self.account_new_bucket(plan) {
             return None;
@@ -713,13 +937,15 @@ impl StatsWindowState {
         chain.push(StatsBucket {
             scope_key: key.clone(),
             accs: StatsAccum::accs_for_plan(plan),
+            touched: false,
         });
+        self.clock.push_back(hash); // 创建序入队（队尾 = 最新）
         Some(&mut chain.last_mut().expect("just pushed").accs)
     }
 
     /// 取/建一个桶（列式扁平键路径）: `hash` = 叶数组哈希, `comps` = 栈上叶
     /// 数组（列序）。链内按 `comps` 与完整键比较消歧; 未命中时构建完整键
-    /// （每桶一次）。新桶先过限额检查（超限 → None）。
+    /// （每桶一次）。新桶先过限额检查（超限 → spill 腾空间 → 仍超限 → None）。
     fn keyed_bucket_mut(
         &mut self,
         hash: u64,
@@ -732,7 +958,46 @@ impl StatsWindowState {
                 .position(|b| comps_match(&b.scope_key, comps, 0, comps.len()))
         });
         if let Some(i) = pos {
-            return Some(&mut self.buckets.get_mut(&hash).expect("命中即存在")[i].accs);
+            let chain = self.buckets.get_mut(&hash).expect("命中即存在");
+            chain[i].touched = true; // 时钟二次机会位
+            return Some(&mut chain[i].accs);
+        }
+        // 未命中: 键可能已 spill → 读回（take 移除, 保持内存/spill 不相交）。
+        if self.spill_index.contains(&hash) {
+            let taken = self
+                .spill
+                .as_mut()
+                .expect("spill_index 非空即有 store")
+                .take(hash)
+                .unwrap_or_else(|| {
+                    panic!("spill 索引与存储不一致(致命): hash {hash:#x} 索引在但 take 空")
+                });
+            if !comps_match(&taken.0, comps, 0, comps.len()) {
+                // hash 碰撞且非同一键：take 已移除，致命（绝不静默丢键）。
+                panic!("spill hash 碰撞(致命): {hash:#x} 键不匹配");
+            }
+            self.spill_index.remove(&hash);
+            self.spilled_bytes = self
+                .spilled_bytes
+                .saturating_sub(Self::bucket_allowance(plan));
+            // 读回入账后可能超限 → 先驱逐最老键（此刻尚未借用 chain）。
+            self.estimated_bytes += Self::bucket_allowance(plan);
+            if let Some(limit) = self.limit_bytes
+                && self.estimated_bytes > limit
+            {
+                self.evict_to_spill(plan);
+            }
+            let chain = self
+                .buckets
+                .entry(hash)
+                .or_insert_with(|| Vec::with_capacity(1));
+            chain.push(StatsBucket {
+                scope_key: taken.0,
+                accs: taken.1,
+                touched: true,
+            });
+            self.clock.push_back(hash);
+            return Some(&mut chain.last_mut().expect("just pushed").accs);
         }
         if !self.account_new_bucket(plan) {
             return None;
@@ -745,7 +1010,9 @@ impl StatsWindowState {
         chain.push(StatsBucket {
             scope_key,
             accs: StatsAccum::accs_for_plan(plan),
+            touched: false,
         });
+        self.clock.push_back(hash); // 创建序入队（队尾 = 最新）
         Some(&mut chain.last_mut().expect("just pushed").accs)
     }
 
@@ -759,7 +1026,9 @@ impl StatsWindowState {
 
     /// 清空并拍平全部桶（close 用）: `(ScopeKey, accs)` 按 ScopeKey 升序。
     /// 同时清零内存账本（新窗口重新累积; 拒收计数保留——指标用）。
+    /// spill 启用时先并入 spill 键（每个键恰好一次, 见 [`Self::merge_spill_into_buckets`]）。
     fn take_buckets(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+        self.merge_spill_into_buckets();
         let mut out: Vec<(ScopeKey, Vec<StatsAccum>)> = std::mem::take(&mut self.buckets)
             .into_values()
             .flat_map(|chain| chain.into_iter().map(|b| (b.scope_key, b.accs)))
@@ -1164,6 +1433,8 @@ impl StatsExecutor {
     /// 剩余重插新 HashMap（每批 O(剩余) 哈希 + 分配, 100M 30 批 ≈ 4.4 亿次重插
     /// close +~9s）; retain 每批 O(n) 轻量回调（无哈希重建, close ~3s）。
     pub fn take_buckets_up_to(&mut self, n: usize) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+        // spill 启用且还有 spill 键 → 首次取桶前并入（每个键恰好一次）。
+        self.window.merge_spill_into_buckets();
         let mut out = Vec::new();
         if n == 0 {
             return out;
@@ -1198,6 +1469,10 @@ impl StatsExecutor {
     }
 
     fn reset_window(&mut self) {
+        // cleanup 旧 spill（窗口文件删除）——新窗口由 spawn 层重新注入 store。
+        if let Some(spill) = &mut self.window.spill {
+            spill.cleanup();
+        }
         let mut buckets = EngineHashMap::default();
         if self.plan.keys.is_empty() {
             StatsWindowState::seed_empty_bucket(&mut buckets, &self.plan);
@@ -1207,6 +1482,7 @@ impl StatsExecutor {
         let over_limit = self.window.over_limit_new_buckets;
         self.window = StatsWindowState::new(buckets);
         // 保留限额配置 + 拒收计数跨窗口（guard 持续生效; 计数供指标/告警）。
+        // spill 不跨窗口（store 已 cleanup 丢弃, 文件删除）。
         self.window
             .set_memory_limit(&rule_name, limit.map(|b| b as usize));
         self.window.over_limit_new_buckets = over_limit;
@@ -1215,6 +1491,12 @@ impl StatsExecutor {
     /// 注入状态内存上限（字节; None = 不设防）——超限拒收新键桶, 已有桶继续。
     pub fn set_memory_limit(&mut self, rule_name: &str, bytes: Option<usize>) {
         self.window.set_memory_limit(rule_name, bytes);
+    }
+
+    /// 注入状态外溢存储（M3; 窗口开始时调用; None = 关闭 spill）。
+    /// `max_spill_bytes` = 落盘上限（None = 不限; 三层预算阶梯第二层）。
+    pub fn set_spill(&mut self, store: Option<Box<dyn SpillStore + Send + Sync>>, max_spill_bytes: Option<usize>) {
+        self.window.set_spill(store, max_spill_bytes);
     }
 
     /// 提取本片已关闭窗口的**原始累加状态**（输入分区分片归并用）并重置窗口。

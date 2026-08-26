@@ -41,6 +41,8 @@ mod stats_coverage_extra;
 #[cfg(test)]
 mod stats_exec_test;
 #[cfg(test)]
+mod stats_spill_test;
+#[cfg(test)]
 mod stats_exec_wiring_test;
 
 use std::collections::HashMap;
