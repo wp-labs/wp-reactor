@@ -1387,7 +1387,7 @@ fn q13_match_snapshot_join() {
             &step_plans,
             matched.trigger_event.as_deref(),
             &needed,
-                    None,
+            None,
         );
         std::hint::black_box(ctx);
     }
@@ -1405,7 +1405,7 @@ fn q13_match_snapshot_join() {
             &step_plans,
             matched.trigger_event.as_deref(),
             &needed,
-                    None,
+            None,
         );
         let ok = crate::match_engine::executor::execute_joins(&rule.joins, &mut ctx, &lookup, NOW);
         std::hint::black_box((ctx, ok));
@@ -1500,7 +1500,7 @@ fn q6_match_emit() {
             &step_plans,
             matched.trigger_event.as_deref(),
             &needed,
-                    None,
+            None,
         );
         std::hint::black_box(ctx);
     }
@@ -1516,7 +1516,7 @@ fn q6_match_emit() {
         &step_plans,
         matched.trigger_event.as_deref(),
         &needed,
-                None,
+        None,
     );
     let t3 = Instant::now();
     for _ in 0..N {
@@ -1547,7 +1547,14 @@ fn q6_match_emit_columnar() {
     let matched: Vec<MatchedContext> = events
         .iter()
         .enumerate()
-        .map(|(i, ev)| simple_matched("q6_bench", vec![num(20.0)], ev, NOW + i as i64 * EVENT_STEP_NS))
+        .map(|(i, ev)| {
+            simple_matched(
+                "q6_bench",
+                vec![num(20.0)],
+                ev,
+                NOW + i as i64 * EVENT_STEP_NS,
+            )
+        })
         .collect();
     let refs: Vec<&MatchedContext> = matched.iter().collect();
 
@@ -1558,19 +1565,14 @@ fn q6_match_emit_columnar() {
     let t0 = Instant::now();
     for _ in 0..4 {
         for seg in refs.chunks(SEG) {
-            let stats = exec.execute_match_direct_batch_columnar(
-                seg,
-                NOW,
-                &mut builder,
-                &mut appended_out,
-            );
+            let stats =
+                exec.execute_match_direct_batch_columnar(seg, NOW, &mut builder, &mut appended_out);
             std::hint::black_box(&stats);
         }
     }
     let col_ns = t0.elapsed().as_secs_f64() * 1e9 / (N as f64 * 4.0);
     report("q6 match emit(列式批)", col_ns, col_ns);
 }
-
 
 // ---------------------------------------------------------------------------
 // Bench 6：Q14 on each + bind filter + strftime/count_char
@@ -1895,13 +1897,11 @@ fn q4b_stats_group_avg() {
     // 行式：group by category + avg(final)
     let mut exec = StatsExecutor::with_row_fields(
         q4b_stats_plan(),
-        Some(
-            Arc::new(
-                ["category".to_string(), "final".to_string()]
-                    .into_iter()
-                    .collect(),
-            ),
-        ),
+        Some(Arc::new(
+            ["category".to_string(), "final".to_string()]
+                .into_iter()
+                .collect(),
+        )),
     );
     let t0 = Instant::now();
     exec.process_rows(&rows, |row, name| row.get(name).cloned());
@@ -2120,7 +2120,11 @@ fn q22_each_split() {
     let stats_row =
         exec_col.execute_each_direct_batch(&rows, &NoLookup, &[], NOW, &mut b_row, &mut app_row);
     assert_eq!(stats_row.appended, N, "行式输出行数 = N");
-    assert_eq!(b_col.finish().len(), b_row.finish().len(), "列式/行式输出行数一致");
+    assert_eq!(
+        b_col.finish().len(),
+        b_row.finish().len(),
+        "列式/行式输出行数一致"
+    );
 
     // ---- split 内部拆解（2026-08-26 q22 内存归因）：全分割 collect vs 惰性 nth ----
     // 生产 `split_index_vec` 每行 `text.split(sep).collect::<Vec<_>>()` 再索引——
@@ -2344,7 +2348,10 @@ fn q19_close_output_chain() {
 
     // ② 列式 close 全链（现状基线，detail = fmt）——含 yield 求值 / fmt / wfx_id / 落列
     let exec_full = RuleExecutor::new(q19_close_columnar_rule(true));
-    assert!(exec_full.close_plan_columnar_safe(), "q19 形状必须过列式 close 门控");
+    assert!(
+        exec_full.close_plan_columnar_safe(),
+        "q19 形状必须过列式 close 门控"
+    );
     let mut builder = AlertColumnBuilder::new(Arc::from("nexmark_alerts"));
     let t0 = Instant::now();
     let stats = exec_full.execute_close_direct_batch_columnar(&closes, &mut builder, W_END);
@@ -2525,10 +2532,22 @@ fn row_fields_heap_bytes(rf: &RowFields) -> usize {
 #[ignore = "release-only benchmark: cargo test --release -p wf-engine q18_stats_last_key_state -- --ignored --nocapture"]
 fn q18_stats_last_key_state() {
     eprintln!("[q18-state] === size_of（栈上，不含堆）===");
-    eprintln!("[q18-state] size_of::<StatsAccum>()     = {} B", size_of::<StatsAccum>());
-    eprintln!("[q18-state] size_of::<RowFields>()      = {} B", size_of::<RowFields>());
-    eprintln!("[q18-state] size_of::<RowFieldLayout>() = {} B", size_of::<RowFieldLayout>());
-    eprintln!("[q18-state] size_of::<ScopeKey>()       = {} B", size_of::<ScopeKey>());
+    eprintln!(
+        "[q18-state] size_of::<StatsAccum>()     = {} B",
+        size_of::<StatsAccum>()
+    );
+    eprintln!(
+        "[q18-state] size_of::<RowFields>()      = {} B",
+        size_of::<RowFields>()
+    );
+    eprintln!(
+        "[q18-state] size_of::<RowFieldLayout>() = {} B",
+        size_of::<RowFieldLayout>()
+    );
+    eprintln!(
+        "[q18-state] size_of::<ScopeKey>()       = {} B",
+        size_of::<ScopeKey>()
+    );
 
     let row_fields: Arc<HashSet<String>> = Arc::new(
         ["auction", "bidder", "price", "channel", "url", "dateTime"]
@@ -2538,11 +2557,18 @@ fn q18_stats_last_key_state() {
     );
     let mut exec = StatsExecutor::with_row_fields(q18_stats_last_plan(), Some(row_fields));
     let batch = q18_last_batch(N);
-    assert!(exec.process_batch(&batch), "列式前置应满足（Int64 键/值 + Utf8 字符串）");
+    assert!(
+        exec.process_batch(&batch),
+        "列式前置应满足（Int64 键/值 + Utf8 字符串）"
+    );
     let n_buckets: usize = exec.window.buckets.values().map(|c| c.len()).sum();
     let n_chains = exec.window.buckets.len();
     let estimated = exec.window.estimated_bytes();
-    let allowance = if n_chains > 0 { estimated / n_chains as u64 } else { 0 };
+    let allowance = if n_chains > 0 {
+        estimated / n_chains as u64
+    } else {
+        0
+    };
 
     // 真实每键内存求和：ScopeKey 栈+堆 / accs / 共享 RowFields 堆 / HashMap 槽估算
     let mut real_sum = 0usize;
@@ -2555,7 +2581,11 @@ fn q18_stats_last_key_state() {
             let shared = b.accs.iter().filter(|a| a.last().is_some()).count();
             if shared > 0 {
                 last_shared += 1;
-                let rf = b.accs.iter().find_map(|a| a.last().as_ref()).expect("is_some");
+                let rf = b
+                    .accs
+                    .iter()
+                    .find_map(|a| a.last().as_ref())
+                    .expect("is_some");
                 real_sum += 16 /* Arc 头 */ + row_fields_heap_bytes(rf);
             }
         }
@@ -2564,17 +2594,29 @@ fn q18_stats_last_key_state() {
     let slot_est = n_buckets * 40;
     let real_per_key = (real_sum + slot_est) as f64 / n_buckets as f64;
 
-    eprintln!("[q18-state] === 运行形态（N={} 列式，键域 bidder 1010 × auction 2M ≈ 每行唯一）===", N);
+    eprintln!(
+        "[q18-state] === 运行形态（N={} 列式，键域 bidder 1010 × auction 2M ≈ 每行唯一）===",
+        N
+    );
     eprintln!("[q18-state] 键数 n_buckets            = {}", n_buckets);
     eprintln!("[q18-state] 哈希链数 n_chains          = {}", n_chains);
-    eprintln!("[q18-state] 状态估算 estimated_bytes   = {} MB", estimated / 1024 / 1024);
+    eprintln!(
+        "[q18-state] 状态估算 estimated_bytes   = {} MB",
+        estimated / 1024 / 1024
+    );
     eprintln!("[q18-state] 预算/键（allowance 口径）  = {} B", allowance);
-    eprintln!("[q18-state] 真实/键（求和 + 槽估算）    = {:.0} B", real_per_key);
+    eprintln!(
+        "[q18-state] 真实/键（求和 + 槽估算）    = {:.0} B",
+        real_per_key
+    );
     eprintln!(
         "[q18-state] 预算高估倍数              = {:.2}×（guard 拒收阈值被低估）",
         allowance as f64 / real_per_key
     );
-    eprintln!("[q18-state] 共享 last_row 桶数/总桶   = {}/{}（多 last 度量 Arc 共享已生效）", last_shared, n_buckets);
+    eprintln!(
+        "[q18-state] 共享 last_row 桶数/总桶   = {}/{}（多 last 度量 Arc 共享已生效）",
+        last_shared, n_buckets
+    );
 
     // 推算 30M 真实数据（键数 ≈ 2300 万）：16GB 预算下的拒收阈值
     let keys_30m = 23_000_000u64;

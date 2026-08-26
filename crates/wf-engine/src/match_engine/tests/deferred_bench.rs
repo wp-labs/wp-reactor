@@ -331,7 +331,10 @@ fn q4a_auction_event() -> Event {
     fields.insert("id".into(), Value::Number(5.0));
     fields.insert("category".into(), Value::Number(3.0));
     fields.insert("dateTime".into(), Value::Number(NOW as f64));
-    fields.insert("expires".into(), Value::Number((NOW + 60_000_000_000) as f64));
+    fields.insert(
+        "expires".into(),
+        Value::Number((NOW + 60_000_000_000) as f64),
+    );
     Event { fields }
 }
 
@@ -400,8 +403,8 @@ fn q4a_deferred_eval_candidate_scan() {
 #[ignore = "release-only benchmark: cargo test --release -p wf-engine q4a_eval_cost_decomposition -- --ignored --nocapture"]
 fn q4a_eval_cost_decomposition() {
     use crate::match_engine::executor::{
-    enrich_join_row, enrich_join_row_bare, in_interval, row_matches_conds, select_reduce_row,
-};
+        enrich_join_row, enrich_join_row_bare, in_interval, row_matches_conds, select_reduce_row,
+    };
 
     let plan = q4a_deferred_plan();
     let exec = RuleExecutor::new(plan.clone());
@@ -486,8 +489,8 @@ fn q4a_eval_cost_decomposition() {
     report("q4a-⑤a-left-clone", clone_ns, clone_ns);
 
     // ⑤ enrich_join_row（全量：qualified + bare；eager 路径契约）。
-    let winner = select_reduce_row(rows.clone(), &join.reduce.as_ref().unwrap().measure)
-        .expect("winner");
+    let winner =
+        select_reduce_row(rows.clone(), &join.reduce.as_ref().unwrap().measure).expect("winner");
     let start = Instant::now();
     for _ in 0..N {
         let mut ctx = pending.left.clone();
@@ -530,8 +533,6 @@ fn q4a_eval_cost_decomposition() {
         build_ns
     );
 }
-
-
 
 // ---------------------------------------------------------------------------
 // 常规（debug 可跑）宽松回归测试
@@ -675,8 +676,9 @@ fn deferred_scan_strategy_bench() {
         // 到期比例：每 batch 到期一小部分（100M 数据 2740 batch，33M 挂起尾部
         // 到期——每 batch 到期 ~1/挂起总数比例；取 0.1% 模拟）。
         let expiry_step = 100i64;
-        let pending_init: Vec<(i64, i64)> =
-            (0..n_pending).map(|i| (i as i64 * expiry_step, i as i64 * 7)).collect();
+        let pending_init: Vec<(i64, i64)> = (0..n_pending)
+            .map(|i| (i as i64 * expiry_step, i as i64 * 7))
+            .collect();
         let batch_ns = n_pending as i64 * expiry_step / 1000; // wm 推进到 ~0.1% 到期
         let rounds = 100usize;
 
@@ -884,8 +886,7 @@ fn contention_case<I: ContendedIndex + Sync>(
             let stop = Arc::clone(&stop);
             let ops = Arc::clone(&reader_ops);
             scope.spawn(move || {
-                let mut state =
-                    0x9E37_79B9_7F4A_7C15u64 ^ ((r as u64) * 0x9E37_79B9_7F4A_7C15);
+                let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ ((r as u64) * 0x9E37_79B9_7F4A_7C15);
                 while !stop.load(AtomicOrdering::Relaxed) {
                     let key = pick_key(&mut state, n_keys);
                     std::hint::black_box(index.lookup(key));
@@ -952,8 +953,13 @@ fn deferred_index_contention_bench() {
         prefill(&single, n_keys);
         let _ = contention_case("single-noW", &single, n_keys, duration, false);
         // 单锁：有写者（当前生产形态）
-        let (single_mops, _, _) =
-            contention_case(&format!("single+W-{}", n_keys_m), &single, n_keys, duration, true);
+        let (single_mops, _, _) = contention_case(
+            &format!("single+W-{}", n_keys_m),
+            &single,
+            n_keys,
+            duration,
+            true,
+        );
 
         // 分片：有写者（候选修复）
         let sharded = ShardedIndex {
@@ -961,8 +967,13 @@ fn deferred_index_contention_bench() {
             mask: SHARDS - 1,
         };
         prefill(&sharded, n_keys);
-        let (shard_mops, _, _) =
-            contention_case(&format!("shard+W-{}", n_keys_m), &sharded, n_keys, duration, true);
+        let (shard_mops, _, _) = contention_case(
+            &format!("shard+W-{}", n_keys_m),
+            &sharded,
+            n_keys,
+            duration,
+            true,
+        );
         eprintln!(
             "[deferred-bench] 分片/单锁 读者吞吐比 = {:.2}×（keys={}M）",
             shard_mops / single_mops.max(1e-9),
@@ -1030,7 +1041,10 @@ fn deferred_remove_batch_strategy_bench() {
                     state = state
                         .wrapping_mul(6_364_136_223_846_793_005)
                         .wrapping_add(1_442_695_040_888_963_407);
-                    (k * 100 + i as i64, (k as u64 * seqs_per_key as u64 + i as u64))
+                    (
+                        k * 100 + i as i64,
+                        (k as u64 * seqs_per_key as u64 + i as u64),
+                    )
                 })
                 .collect();
             map.insert(k, rows);
@@ -1060,7 +1074,10 @@ fn deferred_remove_batch_strategy_bench() {
 
         // 一致性：两实现的「移除量」相同（本 seq 无既有行 → 0）。
         assert_eq!(remove_batch_full(&mut map_full.clone(), seq), 0);
-        assert_eq!(remove_batch_incr(&mut map_incr.clone(), &batch_keys, seq), 0);
+        assert_eq!(
+            remove_batch_incr(&mut map_incr.clone(), &batch_keys, seq),
+            0
+        );
 
         eprintln!(
             "[deferred-bench] 驱逐 keys={:>3}万 行={:>5}万: remove-full {:>10.1} µs/批; remove-incr {:>9.1} µs/批 → {:.0}×",

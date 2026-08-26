@@ -1693,7 +1693,11 @@ fn stats_last_top_columnar_matches_row_based() {
             assert_eq!(rm.len(), cm.len(), "条目数一致");
             for (re, ce) in rm.iter().zip(cm.iter()) {
                 assert_eq!(re.measure_value, ce.measure_value);
-                assert_eq!(re.row_fields.is_some(), ce.row_fields.is_some(), "行字段一致");
+                assert_eq!(
+                    re.row_fields.is_some(),
+                    ce.row_fields.is_some(),
+                    "行字段一致"
+                );
                 if let (Some(rf), Some(cf)) = (&re.row_fields, &ce.row_fields) {
                     let rv: Vec<Option<Value>> = rf.iter_values().collect();
                     let cv: Vec<Option<Value>> = cf.iter_values().collect();
@@ -1848,8 +1852,16 @@ fn stats_top_precheck_skips_below_cutoff_rows() {
     // 键 1: 300/200 进 top-2; 之后 50 行低 bid（150..101 递减, 全低于门槛 200）
     // → 全部被预检淘汰。键 2: 1 行（占位, 验证桶隔离）。
     let mut rows = vec![
-        row(&[("auction", num(1.0)), ("price", num(300.0)), ("bidder", num(1.0))]),
-        row(&[("auction", num(1.0)), ("price", num(200.0)), ("bidder", num(2.0))]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(300.0)),
+            ("bidder", num(1.0)),
+        ]),
+        row(&[
+            ("auction", num(1.0)),
+            ("price", num(200.0)),
+            ("bidder", num(2.0)),
+        ]),
     ];
     for p in (101..150).rev() {
         rows.push(row(&[
@@ -1858,7 +1870,11 @@ fn stats_top_precheck_skips_below_cutoff_rows() {
             ("bidder", num(p as f64)),
         ]));
     }
-    rows.push(row(&[("auction", num(2.0)), ("price", num(50.0)), ("bidder", num(9.0))]));
+    rows.push(row(&[
+        ("auction", num(2.0)),
+        ("price", num(50.0)),
+        ("bidder", num(9.0)),
+    ]));
 
     let batch = rows_to_batch(&rows);
     let mut row_exec = StatsExecutor::new(plan.clone());
@@ -1874,8 +1890,14 @@ fn stats_top_precheck_skips_below_cutoff_rows() {
         assert_eq!(top.measures[0][0].measure_value, 300.0, "{name}: rank1 300");
         assert_eq!(top.measures[0][1].measure_value, 200.0, "{name}: rank2 200");
         // 行字段仍携带原始 bidder（淘汰行不污染）。
-        let row = top.measures[0][0].row_fields.as_ref().expect("条目带行字段");
-        assert!(row.iter_values().any(|v| v == Some(num(1.0))), "{name}: rank1 bidder=1");
+        let row = top.measures[0][0]
+            .row_fields
+            .as_ref()
+            .expect("条目带行字段");
+        assert!(
+            row.iter_values().any(|v| v == Some(num(1.0))),
+            "{name}: rank1 bidder=1"
+        );
     }
 }
 
@@ -1922,7 +1944,10 @@ fn stats_top_precheck_random_stream_matches_reference() {
             Some(Value::Number(n)) => *n,
             _ => unreachable!(),
         };
-        reference.entry(auction).or_default().push((price, bidder, i));
+        reference
+            .entry(auction)
+            .or_default()
+            .push((price, bidder, i));
     }
     let names = sorted_bid_names();
     for (name, mut exec) in [
@@ -1953,11 +1978,22 @@ fn stats_top_precheck_random_stream_matches_reference() {
             });
             ref_entries.truncate(5);
             let entries = &b.measures[0];
-            assert_eq!(entries.len(), ref_entries.len(), "{name}: auction {auction} 条目数");
+            assert_eq!(
+                entries.len(),
+                ref_entries.len(),
+                "{name}: auction {auction} 条目数"
+            );
             for (k, (re, e)) in ref_entries.iter().zip(entries.iter()).enumerate() {
-                assert_eq!(e.measure_value, re.0, "{name}: auction {auction} rank {k} price");
                 assert_eq!(
-                    row_val(e.row_fields.as_ref().expect("条目带行字段"), &names, "bidder"),
+                    e.measure_value, re.0,
+                    "{name}: auction {auction} rank {k} price"
+                );
+                assert_eq!(
+                    row_val(
+                        e.row_fields.as_ref().expect("条目带行字段"),
+                        &names,
+                        "bidder"
+                    ),
                     Some(num(re.1)),
                     "{name}: auction {auction} rank {k} bidder"
                 );
@@ -1997,7 +2033,11 @@ fn stats_row_fields_compact_and_shared() {
         m0.as_ref().expect("last 行字段"),
         m1.as_ref().expect("last 行字段"),
     );
-    assert_eq!(r0.iter_values().count(), 2, "列数组长度 = 子集大小, 而非整行");
+    assert_eq!(
+        r0.iter_values().count(),
+        2,
+        "列数组长度 = 子集大小, 而非整行"
+    );
     assert!(
         std::sync::Arc::ptr_eq(r0, r1),
         "同桶多 last 度量共享同一列数组"
@@ -2156,7 +2196,10 @@ fn stats_memory_guard_no_limit_accepts_all() {
     // 未设限额（默认 None）→ 全部键放行, 拒收计数 0（不设防 = 原行为）。
     let plan = q19_like_plan();
     let mut exec = StatsExecutor::new(plan);
-    exec.process_rows(&auction_price_rows(&[(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]), extract);
+    exec.process_rows(
+        &auction_price_rows(&[(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]),
+        extract,
+    );
     assert_eq!(exec.window.over_limit_new_buckets(), 0);
     assert!(
         exec.window.estimated_bytes() > 0,
@@ -2178,7 +2221,11 @@ fn stats_memory_guard_resets_on_close() {
     // close（take_buckets + reset_window）→ 账本清零; 拒收计数保留（指标用）。
     let _ = exec.close_window_by_bucket_rows();
     assert_eq!(exec.window.estimated_bytes(), 0, "close 后状态清零");
-    assert_eq!(exec.window.over_limit_new_buckets(), 1, "拒收计数跨窗口保留");
+    assert_eq!(
+        exec.window.over_limit_new_buckets(),
+        1,
+        "拒收计数跨窗口保留"
+    );
 
     // 新窗口仍受 guard 保护（限额配置跨窗口保留）。
     exec.process_rows(&auction_price_rows(&[(3.0, 300.0), (4.0, 400.0)]), extract);
@@ -2250,12 +2297,21 @@ fn stats_memory_guard_event_count_counts_only_accumulated_rows() {
     col_exec.set_memory_limit("guard_test", Some(1200));
     assert!(col_exec.process_batch(&batch), "列式前置满足");
     assert_eq!(col_exec.window.over_limit_new_buckets(), 4);
-    assert_eq!(col_exec.window.event_count, 1, "被拒 4 行不计入 event_count");
+    assert_eq!(
+        col_exec.window.event_count, 1,
+        "被拒 4 行不计入 event_count"
+    );
 
     // 行式对拍: 同一输入 → 同样只归并 1 行。
     let mut row_exec = StatsExecutor::new(plan);
     row_exec.set_memory_limit("guard_test", Some(1200));
-    let rows = auction_price_rows(&[(1.0, 100.0), (2.0, 200.0), (3.0, 300.0), (4.0, 400.0), (5.0, 500.0)]);
+    let rows = auction_price_rows(&[
+        (1.0, 100.0),
+        (2.0, 200.0),
+        (3.0, 300.0),
+        (4.0, 400.0),
+        (5.0, 500.0),
+    ]);
     row_exec.process_rows(&rows, extract);
     assert_eq!(row_exec.window.over_limit_new_buckets(), 4);
     assert_eq!(row_exec.window.event_count, 1, "行式同口径");
@@ -2320,7 +2376,11 @@ fn stats_memory_guard_merge_partial_rejects_over_limit() {
         "协调片合并新键超限 → 拒收计数 +1"
     );
     assert_eq!(exec.window.event_count, 2, "partial 的 event_count 仍累计");
-    assert_eq!(exec.final_measure_values_by_bucket().len(), 1, "只有键 1 桶");
+    assert_eq!(
+        exec.final_measure_values_by_bucket().len(),
+        1,
+        "只有键 1 桶"
+    );
 }
 #[test]
 fn stats_memory_guard_q18_shape_budget_not_overcounted() {
@@ -2348,7 +2408,10 @@ fn stats_memory_guard_q18_shape_budget_not_overcounted() {
                 ("auction", num(i as f64)), // auction 唯一 → (bidder,auction) 唯一
                 ("price", num(100.0)),
                 ("channel", str_val("Google")),
-                ("url", str_val("https://www.nexmark.com/a/b/c/item.htm?query=1")),
+                (
+                    "url",
+                    str_val("https://www.nexmark.com/a/b/c/item.htm?query=1"),
+                ),
                 ("dateTime", num(1_700_000_000_000_000_000.0 + i as f64)),
             ])
         })
@@ -2389,11 +2452,7 @@ fn q18_columnar_layout_is_compact() {
         std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("auction", arrow::datatypes::DataType::Int64, false),
             arrow::datatypes::Field::new("price", arrow::datatypes::DataType::Int64, false),
-            arrow::datatypes::Field::new(
-                "channel",
-                arrow::datatypes::DataType::Utf8,
-                false,
-            ),
+            arrow::datatypes::Field::new("channel", arrow::datatypes::DataType::Utf8, false),
         ])),
         vec![
             std::sync::Arc::new(arrow::array::Int64Array::from(vec![1, 1, 2])),

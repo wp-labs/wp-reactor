@@ -191,7 +191,7 @@ fn build_wfx_id_iter<'a>(
 #[cfg(test)]
 mod split_tests {
     use super::*;
-    use crate::match_engine::match_engine::{CloseReason, StepData, EngineHashMap};
+    use crate::match_engine::match_engine::{CloseReason, EngineHashMap, StepData};
 
     /// `build_wfx_id_split` 必须与「先 combine 再 build_wfx_id」字节一致。
     #[test]
@@ -259,32 +259,42 @@ mod split_tests {
         let steps: Vec<StepData> = (0..10).map(|i| mk(i as f64 * 1.5, 100 + i)).collect();
         let mut cache = None::<WfxPrefixCache>;
         for sd in &steps {
-            let expected = build_wfx_id_split(rule, &scope, fired, &[], std::slice::from_ref(sd), &origin);
+            let expected =
+                build_wfx_id_split(rule, &scope, fired, &[], std::slice::from_ref(sd), &origin);
             let got = match &cache {
-                Some(c)
-                    if c.prefix_matches(
-                        &scope,
-                        fired,
-                        &[],
-                        std::slice::from_ref(sd),
-                    ) =>
-                {
+                Some(c) if c.prefix_matches(&scope, fired, &[], std::slice::from_ref(sd)) => {
                     c.finish(&[], std::slice::from_ref(sd), &origin)
                 }
                 _ => {
-                    let c = WfxPrefixCache::build(rule, &scope, fired, &[], std::slice::from_ref(sd));
+                    let c =
+                        WfxPrefixCache::build(rule, &scope, fired, &[], std::slice::from_ref(sd));
                     let id = c.finish(&[], std::slice::from_ref(sd), &origin);
                     cache = Some(c);
                     id
                 }
             };
-            assert_eq!(got, expected, "前缀缓存 wfx_id 必须与 split 一致 (price={})", sd.measure_value);
+            assert_eq!(
+                got, expected,
+                "前缀缓存 wfx_id 必须与 split 一致 (price={})",
+                sd.measure_value
+            );
         }
         // 换桶（scope_key 不同）→ 前缀不匹配 → 重建。
         let scope2 = vec![Value::Number(99.0)];
         let sd = mk(3.0, 7);
-        let expected = build_wfx_id_split(rule, &scope2, fired, &[], std::slice::from_ref(&sd), &origin);
-        assert!(!cache.unwrap().prefix_matches(&scope2, fired, &[], std::slice::from_ref(&sd)));
+        let expected = build_wfx_id_split(
+            rule,
+            &scope2,
+            fired,
+            &[],
+            std::slice::from_ref(&sd),
+            &origin,
+        );
+        assert!(
+            !cache
+                .unwrap()
+                .prefix_matches(&scope2, fired, &[], std::slice::from_ref(&sd))
+        );
         let c = WfxPrefixCache::build(rule, &scope2, fired, &[], std::slice::from_ref(&sd));
         assert_eq!(c.finish(&[], std::slice::from_ref(&sd), &origin), expected);
     }
@@ -360,11 +370,7 @@ mod split_tests {
     #[test]
     fn origin_arcs_match_as_str() {
         let arcs = OriginArcs::new();
-        for reason in [
-            CloseReason::Timeout,
-            CloseReason::Flush,
-            CloseReason::Eos,
-        ] {
+        for reason in [CloseReason::Timeout, CloseReason::Flush, CloseReason::Eos] {
             let origin = AlertOrigin::Close { reason };
             assert_eq!(&**arcs.origin(reason), origin.as_str(), "origin {reason:?}");
             assert_eq!(
@@ -659,9 +665,24 @@ pub(crate) struct OriginArcs {
 impl OriginArcs {
     pub(crate) fn new() -> Self {
         Self {
-            timeout: Arc::from(AlertOrigin::Close { reason: CloseReason::Timeout }.as_str()),
-            flush: Arc::from(AlertOrigin::Close { reason: CloseReason::Flush }.as_str()),
-            eos: Arc::from(AlertOrigin::Close { reason: CloseReason::Eos }.as_str()),
+            timeout: Arc::from(
+                AlertOrigin::Close {
+                    reason: CloseReason::Timeout,
+                }
+                .as_str(),
+            ),
+            flush: Arc::from(
+                AlertOrigin::Close {
+                    reason: CloseReason::Flush,
+                }
+                .as_str(),
+            ),
+            eos: Arc::from(
+                AlertOrigin::Close {
+                    reason: CloseReason::Eos,
+                }
+                .as_str(),
+            ),
             timeout_reason: Arc::from(CloseReason::Timeout.as_str()),
             flush_reason: Arc::from(CloseReason::Flush.as_str()),
             eos_reason: Arc::from(CloseReason::Eos.as_str()),

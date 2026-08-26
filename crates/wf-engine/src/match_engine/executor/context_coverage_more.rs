@@ -304,8 +304,7 @@ fn build_eval_context_named_bind_count_and_out_of_range_branch() {
         field_values: EngineHashMap::from_iter([("amount".to_string(), vec![num(1.0), num(2.0)])]),
     };
     let named = CloseCtxFields::Named(HashSet::from(["_bind_win_count".to_string()]));
-    let ctx = build_eval_context(&keys, &scope_key, &[], &[bd], &[], None, &named,
-        None);
+    let ctx = build_eval_context(&keys, &scope_key, &[], &[bd], &[], None, &named, None);
     assert_eq!(ctx.fields.get("_bind_win_count"), Some(&num(5.0)));
     // `amount` was not requested → absent (only the count field is wanted).
     assert!(!ctx.fields.contains_key("amount"));

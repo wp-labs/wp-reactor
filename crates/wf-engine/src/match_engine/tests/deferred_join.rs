@@ -100,7 +100,12 @@ impl WindowLookup for BidLookup {
     fn snapshot(&self, _w: &str) -> Option<Vec<JoinRow>> {
         Some(self.0.iter().map(|(_, r)| r.clone()).collect())
     }
-    fn asof_candidates(&self, _w: &str, key_field: &str, key: &Value) -> Option<Vec<(i64, JoinRow)>> {
+    fn asof_candidates(
+        &self,
+        _w: &str,
+        key_field: &str,
+        key: &Value,
+    ) -> Option<Vec<(i64, JoinRow)>> {
         // 契约（types.rs asof_candidates 文档）：候选 = key_field == key 的行。
         // 2026-08-26 q4a 条件复核冗余跳过后，测试 lookup 必须遵守该契约
         //（否则错误 key 的行会绕过复核被 reduce 选中）。

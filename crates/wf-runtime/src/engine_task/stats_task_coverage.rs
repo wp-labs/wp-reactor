@@ -432,7 +432,10 @@ fn build_stats_close_output_named_ctx_expands_first_row_only() {
     // 6 字段 Value/String/Vec 深拷贝 × 千万级条）——由 CloseOutput.row_fields
     // 携带 [`RowFields`] Arc 引用, 装载侧按需 `value_at` 读。
     for sd in &close.close_step_data {
-        assert!(sd.field_values.is_empty(), "Named 下 field_values 不注入行字段");
+        assert!(
+            sd.field_values.is_empty(),
+            "Named 下 field_values 不注入行字段"
+        );
     }
     let rf = close.row_fields.as_ref().expect("携带行字段引用");
     let names = close.row_field_names.as_ref().expect("携带列名");

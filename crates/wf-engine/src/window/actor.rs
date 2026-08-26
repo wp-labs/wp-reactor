@@ -849,7 +849,7 @@ mod tests {
     /// 演变成永久冻结（2026-08-25 线上：q19 30m 墙梯 rules 档 CPU 0% 永久冻结 2min+）。
     #[tokio::test]
     async fn over_budget_park_recovers_once_consumer_catches_up() {
-        use crate::window::{Evictor, EvictionGate, WindowDef, WindowParams, WindowRegistry};
+        use crate::window::{EvictionGate, Evictor, WindowDef, WindowParams, WindowRegistry};
         use std::sync::atomic::AtomicU64;
 
         const PER_BATCH: usize = 64;

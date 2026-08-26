@@ -1482,5 +1482,5 @@ mod tests {
         rx1.recv().await.unwrap();
         rx1.recv().await.unwrap();
         assert_eq!(fanout.queued_items("w"), Some((1, 8)), "消费后排队须回落");
-}
+    }
 }

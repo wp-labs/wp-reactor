@@ -2075,8 +2075,11 @@ impl RuleTask {
                         self.executor
                             .build_each_alert_pipe(&out_ctx, p.expiry_nanos)
                     } else {
-                        self.executor
-                            .build_deferred_output(&out_ctx, p.expiry_nanos, emit_time_nanos)
+                        self.executor.build_deferred_output(
+                            &out_ctx,
+                            p.expiry_nanos,
+                            emit_time_nanos,
+                        )
                     };
                     match record {
                         Ok(Some(record)) => {
@@ -2745,9 +2748,7 @@ impl RuleTask {
         // (The metric covers the record→columns append, the successor of the
         // old to_data_record conversion.)
         let time_this = {
-            let rem = self
-                .append_sample_remaining
-                .fetch_sub(1, Ordering::Relaxed);
+            let rem = self.append_sample_remaining.fetch_sub(1, Ordering::Relaxed);
             if rem == 1 {
                 self.append_sample_remaining
                     .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
@@ -2871,9 +2872,7 @@ impl RuleTask {
             return;
         }
         let time_this = {
-            let rem = self
-                .append_sample_remaining
-                .fetch_sub(1, Ordering::Relaxed);
+            let rem = self.append_sample_remaining.fetch_sub(1, Ordering::Relaxed);
             if rem == 1 {
                 self.append_sample_remaining
                     .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
@@ -2975,9 +2974,7 @@ impl RuleTask {
         // Append timing is sampled 1-in-N and scaled back up (same
         // pattern as `emit`; covers the eval + column append).
         let time_this = {
-            let rem = self
-                .append_sample_remaining
-                .fetch_sub(1, Ordering::Relaxed);
+            let rem = self.append_sample_remaining.fetch_sub(1, Ordering::Relaxed);
             if rem == 1 {
                 self.append_sample_remaining
                     .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
@@ -3092,9 +3089,7 @@ impl RuleTask {
             let segment = &rows[start..end];
             let calls = segment.len();
             let time_this = {
-                let rem = self
-                    .append_sample_remaining
-                    .fetch_sub(1, Ordering::Relaxed);
+                let rem = self.append_sample_remaining.fetch_sub(1, Ordering::Relaxed);
                 if rem == 1 {
                     self.append_sample_remaining
                         .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
@@ -3209,9 +3204,7 @@ impl RuleTask {
             let segment = &rows[start..end];
             let calls = segment.len();
             let time_this = {
-                let rem = self
-                    .append_sample_remaining
-                    .fetch_sub(1, Ordering::Relaxed);
+                let rem = self.append_sample_remaining.fetch_sub(1, Ordering::Relaxed);
                 if rem == 1 {
                     self.append_sample_remaining
                         .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
@@ -3317,9 +3310,7 @@ impl RuleTask {
             let segment = &rows[start..end];
             let calls = segment.len();
             let time_this = {
-                let rem = self
-                    .append_sample_remaining
-                    .fetch_sub(1, Ordering::Relaxed);
+                let rem = self.append_sample_remaining.fetch_sub(1, Ordering::Relaxed);
                 if rem == 1 {
                     self.append_sample_remaining
                         .store(EMIT_METRIC_SAMPLE_INTERVAL, Ordering::Relaxed);
@@ -3647,8 +3638,12 @@ impl RuleTask {
                             .iter()
                             .map(|f| Arc::from(f.name.as_str()))
                             .collect();
-                        let mut stager =
-                            PipeBatchStager::new_columnar(target, schema, time_col_index, &yield_names);
+                        let mut stager = PipeBatchStager::new_columnar(
+                            target,
+                            schema,
+                            time_col_index,
+                            &yield_names,
+                        );
                         if let Err(e) = stager.push_record_columnar(&record) {
                             wf_warn!(
                                 pipe,
@@ -4123,16 +4118,15 @@ impl PipeBatchStager {
         let event_time_nanos = record.event_time_nanos;
         for (idx, source) in self.col_sources.iter().enumerate() {
             let value: Option<&Value> = match source {
-                PipeColSource::Yield(yield_idx) => self
-                    .yield_names
-                    .get(*yield_idx)
-                    .and_then(|name| {
+                PipeColSource::Yield(yield_idx) => {
+                    self.yield_names.get(*yield_idx).and_then(|name| {
                         record
                             .yield_fields
                             .iter()
                             .find(|(n, _)| **n == **name)
                             .map(|(_, v)| v)
-                    }),
+                    })
+                }
                 PipeColSource::EventTime => None,
                 PipeColSource::MetaRuleName => Some(&meta_rule),
                 PipeColSource::MetaScore => Some(&Value::Number(record.score)),
@@ -4822,17 +4816,17 @@ mod pipe_stager_tests {
             Field::new("id", DataType::Int64, true),
             Field::new("category", DataType::Int64, true),
             Field::new("final", DataType::Float64, true),
-            Field::new("dateTime", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+            Field::new(
+                "dateTime",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
             Field::new(
                 WfuIntermediateMetaField::RuleName.name(),
                 DataType::Utf8,
                 true,
             ),
-            Field::new(
-                WfuIntermediateMetaField::Score.name(),
-                DataType::Utf8,
-                true,
-            ),
+            Field::new(WfuIntermediateMetaField::Score.name(), DataType::Utf8, true),
             Field::new(
                 WfuIntermediateMetaField::EntityType.name(),
                 DataType::Utf8,
@@ -4883,12 +4877,10 @@ mod pipe_stager_tests {
             (
                 "t".into(),
                 stager_schema(),
-                &[
-                    "event_time", "n_i", "n_f", "flag", "label", "blob",
-                ]
-                .iter()
-                .map(|s| Arc::from(*s))
-                .collect::<Vec<_>>(),
+                &["event_time", "n_i", "n_f", "flag", "label", "blob"]
+                    .iter()
+                    .map(|s| Arc::from(*s))
+                    .collect::<Vec<_>>(),
             ),
             (
                 "auction_finals".into(),
@@ -4900,12 +4892,11 @@ mod pipe_stager_tests {
             ),
         ];
         for (target, schema, yield_names) in schemas {
-            let records: Vec<OutputRecord> =
-                if **target == *"auction_finals" {
-                    q4a_records()
-                } else {
-                    varied_records()
-                };
+            let records: Vec<OutputRecord> = if **target == *"auction_finals" {
+                q4a_records()
+            } else {
+                varied_records()
+            };
             let mut row_stager =
                 PipeBatchStager::new(Arc::clone(target), Arc::clone(schema), Some(1));
             let mut col_stager = PipeBatchStager::new_columnar(

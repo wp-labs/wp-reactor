@@ -511,7 +511,9 @@ fn q15_rule_plan() -> wf_lang::plan::RulePlan {
 
 #[tokio::test]
 async fn q15_stats_task_12_measures_matches_cep_anchor() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // Q15 真实任务路径（StatsTask 列式归并 → 固定窗口 close → alert）:
     // 6 行覆盖 3 价格档, 期望 12 值（与 CEP 版 q15 锚点同构, 独立手算）。
     let (mut task, mut alert_rx) = make_q15_task();
@@ -543,7 +545,9 @@ async fn q15_stats_task_12_measures_matches_cep_anchor() {
 /// 统一 emit——输出与单实例锚点**字节一致**, 且非协调片不产出。
 #[tokio::test]
 async fn q15_input_shard_merge_emits_single_equivalent() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (alert_tx0, mut alert_rx0) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let (alert_tx1, mut alert_rx1) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let (merge_tx, merge_rx) = mpsc::channel::<StatsPartial>(8);
@@ -656,7 +660,9 @@ fn make_stats_shard_task(
 /// 两窗口输出与单实例（全批）逐字节一致。
 #[tokio::test]
 async fn q15_input_shard_merge_multi_window_matches_single() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (alert_tx0, mut alert_rx0) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let (alert_tx1, mut alert_rx1) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let (merge_tx, merge_rx) = mpsc::channel::<StatsPartial>(8);
@@ -718,7 +724,9 @@ async fn q15_input_shard_merge_multi_window_matches_single() {
 /// 输出 = 协调片自己的数据（空 partial 合并无效果）。
 #[tokio::test]
 async fn q15_input_shard_empty_shard_flush_sentinel_no_deadlock() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (alert_tx0, mut alert_rx0) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let (alert_tx1, _alert_rx1) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let (merge_tx, merge_rx) = mpsc::channel::<StatsPartial>(8);
@@ -752,7 +760,9 @@ async fn q15_input_shard_empty_shard_flush_sentinel_no_deadlock() {
 /// 剩余合并, 输出 = 已收到的 partial + 自己（2026-08-24 review 修复）。
 #[tokio::test]
 async fn q15_input_shard_partial_sender_exit_no_panic() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (alert_tx0, mut alert_rx0) = mpsc::channel::<crate::alert_task::AlertBatch>(64);
     let (merge_tx, merge_rx) = mpsc::channel::<StatsPartial>(8);
     let mut coord = make_stats_shard_task(0, alert_tx0, Some(merge_rx), None);
@@ -950,7 +960,9 @@ async fn push_batch(task: &mut StatsTask, batch: RecordBatch, seq: u64) {
 
 #[tokio::test]
 async fn stats_push_closes_window_on_watermark_and_emits_alert() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (mut task, mut alert_rx, progress) = make_stats_task();
 
     // batch1: 3 行, ts=5s（窗口 [0,10s) 内）→ 不 close, 无 alert
@@ -981,7 +993,9 @@ async fn stats_push_closes_window_on_watermark_and_emits_alert() {
 
 #[tokio::test]
 async fn stats_push_single_window_flush_emits() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (mut task, mut alert_rx, _progress) = make_stats_task();
     // 单批 10s 内 → 不 close; flush 收尾
     let b1 = make_batch(&["10.0.0.1", "10.0.0.1"], 5_000_000_000);
@@ -994,7 +1008,9 @@ async fn stats_push_single_window_flush_emits() {
 
 #[tokio::test]
 async fn stats_push_multiple_window_jump_emits_only_populated() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (mut task, mut alert_rx, _progress) = make_stats_task();
     // batch1: 5s（窗口 1）
     push_batch(&mut task, make_batch(&["10.0.0.1"], 5_000_000_000), 1).await;
@@ -1023,7 +1039,9 @@ async fn stats_push_multiple_window_jump_emits_only_populated() {
 
 #[tokio::test]
 async fn stats_push_columnar_fallback_row_path() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // 非列式 where（含函数调用）→ process_batch 返回 false → 回退行式, 语义等价
     // 用第 4 个度量（where 含 len(sip) > 4——不可列式化）验证不崩且 close 正确
     let plan = {
@@ -1125,7 +1143,9 @@ fn make_stats_task_with_plan(
 
 #[tokio::test]
 async fn stats_scan_timeouts_closes_tail_window() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // 墙钟兜底（对齐 CEP scan_timeouts）: 数据跨度未达窗口边界时, 周期性扫描用
     // wall elapsed 推进 watermark 关闭尾部窗口; 关闭后清空状态, 空窗口不得循环产出。
     let (mut task, mut alert_rx, _progress) = make_stats_task();
@@ -1277,7 +1297,9 @@ fn make_q12_task_sharded(
 
 #[tokio::test]
 async fn q12_stats_task_per_bucket_alert_with_key_injected() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // group by (b.sip): 每桶一条 alert（同一 close 批量合成一批）, detail 含分组
     // 键值 + 计数; 桶序 = ScopeKey 升序: 10.0.0.1 → 10.0.0.2
     let (mut task, mut alert_rx) = make_q12_task();
@@ -1298,7 +1320,9 @@ async fn q12_stats_task_per_bucket_alert_with_key_injected() {
 
 #[tokio::test]
 async fn stats_sharded_task_processes_only_own_rows() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // P2 分片回归（Blocker 1）: 带 key 任务每片只归并自己的 shard_rows 子集——
     // 否则每片处理全批, 每个键被 N 片各算一遍, close 重复输出 N 倍
     // （Q16 实测 EMIT 10 倍）。模拟 2 片: 片 0 拥有行 {0,1}（key A）,
@@ -1331,7 +1355,9 @@ async fn stats_sharded_task_processes_only_own_rows() {
 
 #[tokio::test]
 async fn stats_task_segments_keyed_batch_across_window_boundary() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // 回归（批跨窗口边界, Q12 根因）: 同一批的行按事件时间归属各自窗口。
     // 旧整批归并: batch max=11s → 先推进到窗口 2, 4 行全进窗口 2 → 单条 "A 4";
     // 新切段: 窗口 1 [0,10) A=2, 窗口 2 [10,20) A=2 → 两条 "A 2"。
@@ -1356,7 +1382,9 @@ async fn stats_task_segments_keyed_batch_across_window_boundary() {
 
 #[tokio::test]
 async fn stats_task_segments_empty_key_batch_across_window_boundary() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // 空键同样按窗口切段: 窗口 1 收 9s/9.5s 两行, 窗口 2 收 10.5s 一行。
     // 旧整批归并: 窗口 1 空（无产出）, 3 行全进窗口 2 → "3 1 2" 单条。
     let (mut task, mut alert_rx, _progress) = make_stats_task();
@@ -1384,7 +1412,9 @@ async fn stats_task_segments_empty_key_batch_across_window_boundary() {
 
 #[tokio::test]
 async fn stats_task_empty_key_jump_emits_no_zero_windows() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // 空键单批跨多窗跳变（5s → 35s, 10s 窗）: 窗口 1 收 5s 行, 窗口 4 收 35s 行,
     // 空窗口 2/3 不得产出。旧整批归并: 先按 max=35s 推进 → 窗口 1 空窗 close
     // 产出全 0 alert（空键预建 Empty 桶）, 两行全进窗口 4。
@@ -1449,7 +1479,9 @@ fn make_q19_cut_task() -> (StatsTask, mpsc::Receiver<crate::alert_task::AlertBat
 
 #[tokio::test]
 async fn stats_task_perf_cut_rules_no_emit() {
-    let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // cut_rules 单切（rules 档的 output 侧对照）: 归并直通 → 窗口无事件 →
     // 空窗不产出（无 EMIT）。恢复后同一数据正常归并 + 输出。全局门控跨
     // await 持锁（PERF_CUT_SERIAL）——否则并行测试期间其它 stats 测试被切。
@@ -1462,7 +1494,10 @@ async fn stats_task_perf_cut_rules_no_emit() {
     )
     .await;
     task.flush().await;
-    assert!(alert_rx.try_recv().is_err(), "cut_rules: 无归并 → 空窗无输出");
+    assert!(
+        alert_rx.try_recv().is_err(),
+        "cut_rules: 无归并 → 空窗无输出"
+    );
     crate::perf_diag::reset_perf_diag();
 
     // 恢复: 同数据重推 → 正常产出（窗口已重置, 重新开窗）。
@@ -1479,7 +1514,9 @@ async fn stats_task_perf_cut_rules_no_emit() {
 
 #[tokio::test]
 async fn stats_task_perf_cut_output_keeps_accumulate_no_emit() {
-    let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // full 档的对照: cut_output 只切输出链——归并照常（窗口 close 状态正确
     // 重置）, alert 不投递。恢复后正常输出。全局门控跨 await 持锁。
     crate::perf_diag::set_perf_cuts(false, true, false, false, false);
@@ -1509,7 +1546,9 @@ async fn stats_task_perf_cut_output_keeps_accumulate_no_emit() {
 
 #[tokio::test]
 async fn stats_task_perf_cut_alert_keeps_accumulate_no_emit() {
-    let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // 输出链消融（q19 同款列式 close + top 度量）: 只切 alert 构建——归并照常
     // （窗口 close 状态正确重置）, CloseOutput 构造照常, alert 不投递。恢复后
     // 正常输出。全局门控跨 await 持锁（PERF_CUT_SERIAL）。
@@ -1540,7 +1579,9 @@ async fn stats_task_perf_cut_alert_keeps_accumulate_no_emit() {
 
 #[tokio::test]
 async fn q18_stats_task_last_bid_fields_injected() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // Q18 形状: group by (bidder, auction), last(price) —— 每键一条 alert,
     // detail 读最后一条 bid 的 price（行字段经 field_values 注入 yield 的 b.price）。
     let detail = Expr::FuncCall {
@@ -1587,7 +1628,9 @@ async fn q18_stats_task_last_bid_fields_injected() {
 
 #[tokio::test]
 async fn q19_stats_task_top_n_emits_per_entry() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // Q19 形状: group by (auction), top(2, price) —— 每 auction 2 条 alert（rank 序）,
     // detail 读每条目的 bidder + price。
     let detail = Expr::FuncCall {
@@ -1639,7 +1682,9 @@ async fn q19_stats_task_top_n_emits_per_entry() {
 
 #[tokio::test]
 async fn stats_top_zero_emits_nothing() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // top(0, ...) 边界（P4 review 修复）: 无条目 → 整桶不产出（此前虚假产出
     // scalar(0.0) 记录）。
     let detail = Expr::StringLit("x".into());
@@ -1684,7 +1729,9 @@ const NEXMARK_BASE_NS: i64 = 1_767_225_600_000_000_000; // 2026-01-01T00:00:00Z
 
 #[tokio::test]
 async fn stats_task_window_bucket_epoch_aligned_large_ts() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // 真实 nexmark BASE_NS 级大时间戳: ts = BASE+25s, 10s 窗 → 窗口
     // [BASE+20s, BASE+30s), fired_at = BASE+30s —— 桶起点 = (t/dur)*dur,
     // 不是「首事件时间 + dur」（BASE 非 0 时两者的差会暴露）。
@@ -1707,7 +1754,9 @@ async fn stats_task_window_bucket_epoch_aligned_large_ts() {
 
 #[tokio::test]
 async fn stats_task_two_windows_large_ts_buckets() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // Q18/Q19 形态: 大时间戳下两窗口各自归属。同一批: BASE+25s（窗 1
     // [BASE+20s,+30s)）与 BASE+32s（窗 2 [BASE+30s,+40s)）; 窗 1 在事件推进中
     // close（32s 越过 30s 边界）, 窗 2 由 flush 收尾。
@@ -1749,7 +1798,9 @@ async fn stats_task_two_windows_large_ts_buckets() {
 
 #[tokio::test]
 async fn stats_task_window_not_closed_until_watermark_crosses() {
-        let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // 数据 max < window_end → 窗口未到点不产出（10m 数据 span < 30m 窗时
     // EMIT=0 的语义: 窗口只在事件时间越过边界 close, 否则等 flush/墙钟兜底）。
     let (mut task, mut alert_rx, _p) = make_stats_task();
@@ -1775,11 +1826,11 @@ async fn stats_task_window_not_closed_until_watermark_crosses() {
 /// CPU 0% 永久冻结 2min+，window 层已证自愈，本测试锁定 stats 层）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stats_pull_actor_evictor_over_budget_recovers() {
+    use tokio_util::sync::CancellationToken;
     use wf_engine::window::{
-        Evictor, EvictionGate, WINDOW_CHANNEL_DEPTH, WindowDef, WindowMsg, WindowRegistry,
+        EvictionGate, Evictor, WINDOW_CHANNEL_DEPTH, WindowDef, WindowMsg, WindowRegistry,
         acquire_window_budget, run_window_actor,
     };
-    use tokio_util::sync::CancellationToken;
 
     const ROWS_PER_BATCH: u64 = 100_000;
     const N_BATCHES: u64 = 12;
@@ -1814,7 +1865,10 @@ async fn stats_pull_actor_evictor_over_budget_recovers() {
     );
     let win = reg.get_window("bid_events").unwrap();
     let notify = reg.get_notifier("bid_events").unwrap();
-    let slot = reg.progress("bid_events").unwrap().register_row_partitioned();
+    let slot = reg
+        .progress("bid_events")
+        .unwrap()
+        .register_row_partitioned();
 
     // actor + mailbox（小预算）
     let (tx, rx) = mpsc::channel::<WindowMsg>(WINDOW_CHANNEL_DEPTH);
@@ -1913,7 +1967,8 @@ async fn stats_pull_actor_evictor_over_budget_recovers() {
                 panic!(
                     "producer blocked on mailbox budget at seq={seq}: acked={} gate_bytes={} cap={GLOBAL_CAP} win_batches={} win_rows={} win_bytes={}",
                     slot.load(std::sync::atomic::Ordering::Acquire),
-                    gate.current_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                    gate.current_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     win.batch_count(),
                     win.total_rows(),
                     win.memory_usage(),
@@ -1942,7 +1997,8 @@ async fn stats_pull_actor_evictor_over_budget_recovers() {
             let join = pull.await;
             panic!(
                 "pull task ended unexpectedly: {join:?} (acked={acked} gate_bytes={} cap={GLOBAL_CAP} win_batches={} win_rows={})",
-                gate.current_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                gate.current_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 win.batch_count(),
                 win.total_rows(),
             );
@@ -1950,14 +2006,17 @@ async fn stats_pull_actor_evictor_over_budget_recovers() {
         panic!(
             "死锁：stats 任务未在超时内追平全部批（acked={acked}/{} gate_bytes={} cap={GLOBAL_CAP} win_batches={} win_rows={})",
             N_BATCHES,
-            gate.current_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            gate.current_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
             win.batch_count(),
             win.total_rows(),
         );
     }
     // 外层 expect 解超时（L1909 已处理, 此处不可达）; 内层 expect 解
     // JoinError——pull 任务 panic 时暴露（不留静默吞错）。
-    result.expect("pull task timed out").expect("pull task panicked");
+    result
+        .expect("pull task timed out")
+        .expect("pull task panicked");
     assert_eq!(acked, N_BATCHES, "全部批次被消费并 ack");
 }
 
@@ -2046,7 +2105,11 @@ async fn stats_task_columnar_close_chunked_matches_full() {
     let full = run(1_000_000).await; // 一次性（原实现路径）
     super::stats_task::set_emit_chunk_for_test(1_000_000); // 恢复全局
 
-    assert_eq!(chunked.len(), full.len(), "分块与全量输出条数一致（不丢不重）");
+    assert_eq!(
+        chunked.len(),
+        full.len(),
+        "分块与全量输出条数一致（不丢不重）"
+    );
     // 无序比较: 流式分批打破批间全局排序（对拍只比每规则 EMIT 计数）, 逐条
     // zip 会因批间顺序差异错位——按 (entity_id, detail) 排序后逐条比对。
     let mut keyed_c: Vec<(String, String)> = chunked

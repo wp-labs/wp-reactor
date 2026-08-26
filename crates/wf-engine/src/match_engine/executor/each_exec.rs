@@ -25,11 +25,11 @@ use crate::match_engine::match_engine::{
 
 use super::RuleExecutor;
 use super::YieldKind;
-use super::close_exec::CloseBatchVecs;
 use super::alert::{
     EachWfxPrefix, build_each_wfx_id, build_each_wfx_id_reusing, format_nanos_utc, now_nanos,
     write_int64_value,
 };
+use super::close_exec::CloseBatchVecs;
 use super::context::execute_joins;
 use super::eval::{
     YieldMeta, eval_bool_expr, eval_entity_id, eval_expr_with_l3, eval_score,
@@ -724,7 +724,9 @@ impl RuleExecutor {
                 || expr_refs_let(&self.plan.score_plan.expr, &let_names)
                 || expr_refs_let(&self.plan.entity_plan.entity_id_expr, &let_names)
                 || !self.plan.binds.iter().all(|b| {
-                    b.filter.as_ref().is_none_or(|f| !expr_refs_let(f, &let_names))
+                    b.filter
+                        .as_ref()
+                        .is_none_or(|f| !expr_refs_let(f, &let_names))
                 })
             {
                 return false;
@@ -933,9 +935,12 @@ impl RuleExecutor {
             };
         }
         CloseBatchVecs {
-            general_cvecs: self.compile_general_slots(&ref_fields, n, |row, name| {
-                rows[row].0.fields.get(name).cloned()
-            }, &self.plan.lets),
+            general_cvecs: self.compile_general_slots(
+                &ref_fields,
+                n,
+                |row, name| rows[row].0.fields.get(name).cloned(),
+                &self.plan.lets,
+            ),
         }
     }
 
@@ -2145,7 +2150,9 @@ impl RuleExecutor {
                             EntityCol::Generic => match entity_left_idx
                                 .and_then(|eidx| event.value_at(eidx))
                             {
-                                Some(v) => (smol_str::SmolStr::from(value_to_string(&v)), Some(v), None),
+                                Some(v) => {
+                                    (smol_str::SmolStr::from(value_to_string(&v)), Some(v), None)
+                                }
                                 None => (smol_str::SmolStr::new(""), None, None),
                             },
                         }
@@ -2186,7 +2193,8 @@ impl RuleExecutor {
                             // entity 同一左列（q13b：id=m.bidder == entity bidder）
                             // 且目标数字类型 → stage 原始 f64 直接写，跳过每行
                             // `value_at` + Value 构造 + coerce 中转。
-                            if let (Some(FieldSrc::Left(yf)), Some(FieldSrc::Left(ef))) = (&src, &entity_src)
+                            if let (Some(FieldSrc::Left(yf)), Some(FieldSrc::Left(ef))) =
+                                (&src, &entity_src)
                                 && yf == ef
                                 && let Some(n) = entity_f64
                                 && is_numeric_yield_type(field_type.as_ref())
@@ -2928,9 +2936,7 @@ fn expr_refs_let(expr: &Expr, let_names: &std::collections::HashSet<&str>) -> bo
         Expr::Neg(inner) | Expr::Not(inner) => expr_refs_let(inner, let_names),
         Expr::Array(items) => items.iter().any(|i| expr_refs_let(i, let_names)),
         Expr::InList {
-            expr: inner,
-            list,
-            ..
+            expr: inner, list, ..
         } => expr_refs_let(inner, let_names) || list.iter().any(|i| expr_refs_let(i, let_names)),
         Expr::IfThenElse {
             cond,

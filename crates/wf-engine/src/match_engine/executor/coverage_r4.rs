@@ -1578,7 +1578,10 @@ fn pipe_light_build_ready_gate() {
         name: "id".into(),
         value: Expr::WfuMeta(WfuMetaField::Id),
     }];
-    assert!(!RuleExecutor::new(plan).pipe_light_build_ready(), "WfuMeta → 回退");
+    assert!(
+        !RuleExecutor::new(plan).pipe_light_build_ready(),
+        "WfuMeta → 回退"
+    );
 
     // SystemVar（score）→ light meta 提供真值，放行。
     let mut plan2 = simple_rule_plan(
@@ -1592,7 +1595,10 @@ fn pipe_light_build_ready_gate() {
         name: "s".into(),
         value: Expr::SystemVar(SystemVar::Score),
     }];
-    assert!(RuleExecutor::new(plan2).pipe_light_build_ready(), "SystemVar → 放行");
+    assert!(
+        RuleExecutor::new(plan2).pipe_light_build_ready(),
+        "SystemVar → 放行"
+    );
 
     // 纯 Field → 放行（q4a 同款）。
     let mut plan3 = simple_rule_plan(
@@ -1606,7 +1612,10 @@ fn pipe_light_build_ready_gate() {
         name: "f".into(),
         value: field("sip"),
     }];
-    assert!(RuleExecutor::new(plan3).pipe_light_build_ready(), "Field → 放行");
+    assert!(
+        RuleExecutor::new(plan3).pipe_light_build_ready(),
+        "Field → 放行"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2088,10 +2097,13 @@ fn columnar_match_general_fmt_matches_row_path() {
         trigger_event: Some(Arc::new(event(vec![
             ("auction", num(auction)),
             ("bidder", num(5.0)),
-            ("price", match price {
-                Some(p) => num(p),
-                None => Value::Str("".into()),
-            }),
+            (
+                "price",
+                match price {
+                    Some(p) => num(p),
+                    None => Value::Str("".into()),
+                },
+            ),
         ]))),
     };
     let m1 = mk(1001.0, 20.0, Some(300.0));
@@ -2131,7 +2143,11 @@ fn columnar_match_general_fmt_matches_row_path() {
             .unwrap_or_default()
     };
     assert_eq!(detail(&out_col[0]), "seller=5 price=300", "row 0 fmt");
-    assert_eq!(detail(&out_col[1]), "seller=5 price=", "row 1 缺 price → 空串");
+    assert_eq!(
+        detail(&out_col[1]),
+        "seller=5 price=",
+        "row 1 缺 price → 空串"
+    );
 }
 
 #[test]
@@ -2228,7 +2244,11 @@ fn columnar_match_general_materialize_fail_falls_back_matches_row_path() {
             .unwrap_or_default()
     };
     assert_eq!(detail(&out_col[0]), "price=300", "row 0 Number");
-    assert_eq!(detail(&out_col[1]), "price=abc", "row 1 Str（回退路径渲染）");
+    assert_eq!(
+        detail(&out_col[1]),
+        "price=abc",
+        "row 1 Str（回退路径渲染）"
+    );
 }
 
 #[test]

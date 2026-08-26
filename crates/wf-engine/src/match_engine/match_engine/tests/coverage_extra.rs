@@ -611,8 +611,8 @@ fn close_is_qualified_and_rate_limit_close_qualifying_modes() {
             window_start_time_nanos: 0,
             window_end_time_nanos: 0,
             last_event_nanos: 0,
-        row_fields: None,
-        row_field_names: None,
+            row_fields: None,
+            row_field_names: None,
         };
     // And mode: needs both event_ok and close_ok.
     assert!(close_is_qualified(&mk(true, true, CloseMode::And, vec![])));

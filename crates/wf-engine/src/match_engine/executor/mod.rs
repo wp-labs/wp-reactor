@@ -20,8 +20,7 @@ mod stats_exec;
 pub use each_exec::{EachDirectBatchStats, PipeEachRow, PipeRowSink};
 // 供 `match_engine::pub use executor::DistinctKey` 转发（stats distinct 键类型）。
 pub use stats_exec::{
-    DistinctKey, DistinctSet, RowFieldLayout, RowFields, StatsAccum, StatsCloseBucket,
-    StatsCloseEntry, StatsExecutor, StatsWindowState,
+    DistinctKey, DistinctSet, RowFieldLayout, RowFields, StatsAccum, StatsCloseBucket, StatsExecutor, StatsWindowState,
 };
 
 #[cfg(test)]
@@ -1198,9 +1197,7 @@ pub(crate) fn collect_general_plain_fields(expr: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::InList {
-            expr: inner,
-            list,
-            ..
+            expr: inner, list, ..
         } => {
             collect_general_plain_fields(inner, out);
             for item in list {
@@ -1253,9 +1250,7 @@ pub(crate) fn yield_general_columnar_safe(expr: &Expr) -> bool {
         Expr::Neg(inner) | Expr::Not(inner) => yield_general_columnar_safe(inner),
         Expr::Array(items) => items.iter().all(yield_general_columnar_safe),
         Expr::InList {
-            expr: inner,
-            list,
-            ..
+            expr: inner, list, ..
         } => yield_general_columnar_safe(inner) && list.iter().all(yield_general_columnar_safe),
         Expr::IfThenElse {
             cond,
@@ -1266,7 +1261,9 @@ pub(crate) fn yield_general_columnar_safe(expr: &Expr) -> bool {
                 && yield_general_columnar_safe(then_expr)
                 && yield_general_columnar_safe(else_expr)
         }
-        Expr::Object(items) => items.iter().all(|it| yield_general_columnar_safe(&it.value)),
+        Expr::Object(items) => items
+            .iter()
+            .all(|it| yield_general_columnar_safe(&it.value)),
         Expr::FuncCall { args, .. } => args.iter().all(yield_general_columnar_safe),
         // Number/StringLit/Bool/SystemVar/WfuMeta/PresetParam: 读字面量/
         // YieldMeta/参数体, 无 ctx 字段访问。

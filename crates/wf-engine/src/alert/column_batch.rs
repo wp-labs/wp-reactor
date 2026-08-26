@@ -352,10 +352,7 @@ impl AlertColumnBuilder {
         self.score.push(record.score);
         Self::push_system_row(&mut self.entity_type, Arc::clone(&record.entity_type));
         self.entity_id.push(SmolStr::from(record.entity_id.clone()));
-        Self::push_system_row(
-            &mut self.origin,
-            Arc::from(record.origin.as_str()),
-        );
+        Self::push_system_row(&mut self.origin, Arc::from(record.origin.as_str()));
         Self::push_system_row(
             &mut self.close_reason,
             Arc::from(

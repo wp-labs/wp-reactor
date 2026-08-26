@@ -6,19 +6,18 @@ use wf_lang::ast::{CloseMode, Expr, FieldRef};
 use crate::alert::{AlertColumnBuilder, AlertOrigin, OutputRecord};
 use crate::error::CoreResult;
 use crate::match_engine::columnar::{CVec, cscalar_to_value};
+use crate::match_engine::executor::StatsCloseBucket;
 use crate::match_engine::match_engine::{
     CloseOutput, CloseReason, Event, StepData, Value, WindowLookup, eval_field_value,
     field_ref_name, value_to_string,
 };
-use crate::match_engine::executor::StatsCloseBucket;
 
 use super::EachDirectBatchStats;
 use super::RuleExecutor;
 use super::YieldKind;
 use super::alert::{
-    build_summary, build_summary_from_labels, build_summary_split, build_wfx_id,
-    build_wfx_id_from_labels, format_nanos_utc, now_nanos, EntityIdCache, OriginArcs,
-    WfxPrefixCache,
+    EntityIdCache, OriginArcs, WfxPrefixCache, build_summary, build_summary_from_labels,
+    build_summary_split, build_wfx_id, build_wfx_id_from_labels, format_nanos_utc, now_nanos,
 };
 use super::context::{build_eval_context, execute_joins};
 use super::eval::{
@@ -360,8 +359,11 @@ impl RuleExecutor {
             }
             Expr::Neg(inner) | Expr::Not(inner) => Self::yield_general_columnar_safe(inner),
             Expr::Array(items) => items.iter().all(Self::yield_general_columnar_safe),
-            Expr::InList { expr: inner, list, .. } => {
-                Self::yield_general_columnar_safe(inner) && list.iter().all(Self::yield_general_columnar_safe)
+            Expr::InList {
+                expr: inner, list, ..
+            } => {
+                Self::yield_general_columnar_safe(inner)
+                    && list.iter().all(Self::yield_general_columnar_safe)
             }
             Expr::IfThenElse {
                 cond,
@@ -372,7 +374,9 @@ impl RuleExecutor {
                     && Self::yield_general_columnar_safe(then_expr)
                     && Self::yield_general_columnar_safe(else_expr)
             }
-            Expr::Object(items) => items.iter().all(|it| Self::yield_general_columnar_safe(&it.value)),
+            Expr::Object(items) => items
+                .iter()
+                .all(|it| Self::yield_general_columnar_safe(&it.value)),
             Expr::FuncCall { args, .. } => args.iter().all(Self::yield_general_columnar_safe),
             // Number/StringLit/Bool/SystemVar/WfuMeta/PresetParam: 读字面量/
             // YieldMeta/参数体, 无 ctx 字段访问。
@@ -579,8 +583,13 @@ impl RuleExecutor {
             // 字段, 跳过 per-record 路径的 combine_step_plans / annotate /
             // joins / where / OutputRecord（q15-q19 detail 的 fmt 批量列式化）。
             let mut ctx: Option<Event> = None;
-            for (field_idx, (field, (name, field_type))) in
-                self.plan.yield_plan.fields.iter().zip(yield_specs.iter()).enumerate()
+            for (field_idx, (field, (name, field_type))) in self
+                .plan
+                .yield_plan
+                .fields
+                .iter()
+                .zip(yield_specs.iter())
+                .enumerate()
             {
                 let value = match &field.value {
                     // const 列（Lit yield）已在 execute 顶部注册 + 校验——跳过
@@ -596,8 +605,10 @@ impl RuleExecutor {
                     Expr::Number(n) => Value::Number(*n),
                     Expr::StringLit(s) => Value::Str(s.clone().into()),
                     Expr::Bool(b) => Value::Bool(*b),
-                    Expr::Field(_) => resolve_close_field(close, keys, field_ref_name_of(&field.value))
-                        .unwrap_or_else(|| Value::Str(String::new().into())),
+                    Expr::Field(_) => {
+                        resolve_close_field(close, keys, field_ref_name_of(&field.value))
+                            .unwrap_or_else(|| Value::Str(String::new().into()))
+                    }
                     general => {
                         // 列式批级 cell：命中直接取（null 行 → 空串，同解释路径
                         // None→""）；槽位 None → 逐行回退（轻量 ctx 求值）。
@@ -624,24 +635,24 @@ impl RuleExecutor {
                                         close_row_fields(close),
                                     )
                                 });
-                        let yield_meta = YieldMeta {
-                            score: Some(score_const),
-                            wfx_id: Some(&wfx_id),
-                            rule_name: Some(&self.plan.name),
-                            entity_type: Some(&self.plan.entity_plan.entity_type),
-                            entity_id: Some(&entity_id),
-                            origin: Some(origin.as_str()),
-                            close_reason: Some(close.close_reason.as_str()),
-                            fired_at: Some(&fired_at),
-                            emit_time: Some(&emit_time),
-                            summary: Some(&summary),
-                            event_first_time_nanos: Some(close.event_first_time_nanos),
-                            event_last_time_nanos: Some(close.event_last_time_nanos),
-                            window_start_time_nanos: Some(close.window_start_time_nanos),
-                            window_end_time_nanos: Some(close.window_end_time_nanos),
-                            emit_time_nanos: Some(emit_time_nanos),
-                            time_format: Some(self.output_config().time_format.as_str()),
-                        };
+                                let yield_meta = YieldMeta {
+                                    score: Some(score_const),
+                                    wfx_id: Some(&wfx_id),
+                                    rule_name: Some(&self.plan.name),
+                                    entity_type: Some(&self.plan.entity_plan.entity_type),
+                                    entity_id: Some(&entity_id),
+                                    origin: Some(origin.as_str()),
+                                    close_reason: Some(close.close_reason.as_str()),
+                                    fired_at: Some(&fired_at),
+                                    emit_time: Some(&emit_time),
+                                    summary: Some(&summary),
+                                    event_first_time_nanos: Some(close.event_first_time_nanos),
+                                    event_last_time_nanos: Some(close.event_last_time_nanos),
+                                    window_start_time_nanos: Some(close.window_start_time_nanos),
+                                    window_end_time_nanos: Some(close.window_end_time_nanos),
+                                    emit_time_nanos: Some(emit_time_nanos),
+                                    time_format: Some(self.output_config().time_format.as_str()),
+                                };
                                 with_yield_eval_scope(|| {
                                     eval_yield_expr_with_meta(general, ctx, yield_meta)
                                 })
@@ -748,7 +759,9 @@ fn resolve_close_field(close: &CloseOutput, keys: &[FieldRef], name: &str) -> Op
 
 /// 2026-08-26 q18 close 内存: CloseOutput 行字段引用（Named 下 field_values 不
 /// 注入行字段, 装载/ctx 按需读）。返回 (RowFields Arc, 列名 Arc) 或 None。
-fn close_row_fields(close: &CloseOutput) -> Option<(
+fn close_row_fields(
+    close: &CloseOutput,
+) -> Option<(
     &std::sync::Arc<crate::match_engine::executor::RowFields>,
     &std::sync::Arc<Vec<String>>,
 )> {
@@ -774,7 +787,6 @@ fn combine_step_data(close: &CloseOutput) -> Vec<StepData> {
         .cloned()
         .collect()
 }
-
 
 /// 列式 close 的 General yield 批级求值状态（层 1，2026-08-25）：
 /// [`RuleExecutor::close_batch_prepare`] 把一批 `CloseOutput` 引用字段物化为
@@ -937,10 +949,15 @@ impl RuleExecutor {
         let mut origins: Vec<Arc<str>> = Vec::with_capacity(total);
         let mut close_reasons: Vec<Arc<str>> = Vec::with_capacity(total);
         let mut summaries: Vec<Arc<str>> = Vec::with_capacity(total);
-        let mut staged_rows: Vec<Vec<(usize, wp_model_core::model::DataType, wp_model_core::model::Value)>> =
-            Vec::with_capacity(total);
+        let mut staged_rows: Vec<
+            Vec<(
+                usize,
+                wp_model_core::model::DataType,
+                wp_model_core::model::Value,
+            )>,
+        > = Vec::with_capacity(total);
         let mut fired_at_cache: Option<(i64, String)> = None;
-        let mut wfx_cache: Option<WfxPrefixCache> = None;
+        let _wfx_cache: Option<WfxPrefixCache> = None;
         let mut entity_cache = EntityIdCache::new();
         let origin_arcs = OriginArcs::new();
         let mut global_row = 0usize;
@@ -1049,8 +1066,7 @@ impl RuleExecutor {
                         value,
                     ) {
                         Ok(Some(v)) => {
-                            if let Err(e) =
-                                builder.stage_yield_cell(name, field_type.as_ref(), &v)
+                            if let Err(e) = builder.stage_yield_cell(name, field_type.as_ref(), &v)
                             {
                                 log::warn!("alert export error: {e}");
                                 stats.failed += 1;
@@ -1099,7 +1115,6 @@ impl RuleExecutor {
         stats
     }
 }
-
 
 /// Σ桶行数（stats 直写失败计数用）。
 fn stats_bucket_rows(buckets: &[StatsCloseBucket]) -> usize {

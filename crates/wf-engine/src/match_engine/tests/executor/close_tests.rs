@@ -511,7 +511,8 @@ fn close_plan_columnar_safe_general_yield_plain_fields_only() {
         right: Box::new(Expr::Number(2.0)),
     };
     assert!(RuleExecutor::new(plan.clone()).close_plan_columnar_safe());
-    plan.yield_plan.fields[0].value = Expr::Field(wf_lang::ast::FieldRef::Simple("_step_0_measure".into()));
+    plan.yield_plan.fields[0].value =
+        Expr::Field(wf_lang::ast::FieldRef::Simple("_step_0_measure".into()));
     assert!(!RuleExecutor::new(plan).close_plan_columnar_safe());
 }
 
@@ -602,8 +603,7 @@ fn columnar_close_general_fmt_yield_matches_per_record() {
     let per_record = record.to_data_record().unwrap();
 
     let mut builder = AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
-    let stats =
-        exec.execute_close_direct_batch_columnar(&[close], &mut builder, 1_700_000_000_000);
+    let stats = exec.execute_close_direct_batch_columnar(&[close], &mut builder, 1_700_000_000_000);
     assert_eq!(stats.appended, 1);
     assert_eq!(stats.failed, 0);
     let batch = builder.finish();
@@ -647,17 +647,15 @@ fn columnar_close_general_fmt_columnar_cell_matches_per_record() {
     close.close_step_data[0]
         .field_values
         .insert("price".into(), vec![Value::Number(1234.5)]);
-    close.close_step_data[0].field_values.insert(
-        "extra".into(),
-        vec![Value::Str("x".to_string().into())],
-    );
+    close.close_step_data[0]
+        .field_values
+        .insert("extra".into(), vec![Value::Str("x".to_string().into())]);
 
     let record = exec.execute_close(&close).unwrap().unwrap();
     let per_record = record.to_data_record().unwrap();
 
     let mut builder = AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
-    let stats =
-        exec.execute_close_direct_batch_columnar(&[close], &mut builder, 1_700_000_000_000);
+    let stats = exec.execute_close_direct_batch_columnar(&[close], &mut builder, 1_700_000_000_000);
     assert_eq!(stats.appended, 1);
     assert_eq!(stats.failed, 0);
     let batch = builder.finish();
@@ -716,8 +714,7 @@ fn columnar_close_general_materialize_fail_falls_back_matches_per_record() {
         .unwrap();
 
     let mut b_col = AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
-    let stats =
-        exec.execute_close_direct_batch_columnar(&[c1, c2], &mut b_col, 1_700_000_000_000);
+    let stats = exec.execute_close_direct_batch_columnar(&[c1, c2], &mut b_col, 1_700_000_000_000);
     assert_eq!(stats.appended, 2);
     assert_eq!(stats.failed, 0);
     let out_col: Vec<DataRecord> = b_col
@@ -728,11 +725,7 @@ fn columnar_close_general_materialize_fail_falls_back_matches_per_record() {
 
     assert_eq!(out_row.len(), out_col.len());
     for (row, (ra, rb)) in out_row.iter().zip(out_col.iter()).enumerate() {
-        assert_eq!(
-            ra.items.len(),
-            rb.items.len(),
-            "row {row} field count"
-        );
+        assert_eq!(ra.items.len(), rb.items.len(), "row {row} field count");
         for (fa, fb) in ra.items.iter().zip(rb.items.iter()) {
             if fa.get_name() == wf_lang::wfu_meta::WFU_EMIT_TIME {
                 continue;
@@ -946,4 +939,3 @@ fn columnar_close_scope_key_short_falls_back_to_field_values() {
         .unwrap();
     assert_records_equal_ignoring_emit_time(&record.to_data_record().unwrap(), &rows[0]);
 }
-

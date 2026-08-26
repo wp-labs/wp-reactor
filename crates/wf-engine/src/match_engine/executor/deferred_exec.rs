@@ -92,7 +92,9 @@ impl RuleExecutor {
         emit_time_nanos: i64,
     ) -> CoreResult<Option<OutputRecord>> {
         match self.evaluate_deferred_join(join_idx, pending, windows)? {
-            Some(out_ctx) => self.build_deferred_output(&out_ctx, pending.expiry_nanos, emit_time_nanos),
+            Some(out_ctx) => {
+                self.build_deferred_output(&out_ctx, pending.expiry_nanos, emit_time_nanos)
+            }
             None => Ok(None),
         }
     }
@@ -123,8 +125,8 @@ impl RuleExecutor {
         // 单条件且右字段 == key_field → 条件复核恒真，跳过 `row_matches_conds`
         // （每候选一次 Event 字段查找+比较）。多条件（key 只来自第一个 cond，
         // 其余条件必须复核）/右字段非 key 字段 → 保留复核。
-        let cond_recheck_redundant = join.conds.len() == 1
-            && pending.key_field == field_ref_name(&join.conds[0].right);
+        let cond_recheck_redundant =
+            join.conds.len() == 1 && pending.key_field == field_ref_name(&join.conds[0].right);
         // 区间过滤 + 全部 join 条件复核（复刻 find_matching_row 语义）
         let matched: Vec<(i64, crate::match_engine::JoinRow)> = rows
             .into_iter()

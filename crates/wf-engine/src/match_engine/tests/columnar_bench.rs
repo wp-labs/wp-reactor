@@ -1162,8 +1162,9 @@ fn columnar_output_func_cell_beats_per_row() {
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(StringArray::from((0..n).map(|i| Some(format!("evt_{i}"))).collect::<Vec<_>>()))
-                as ArrayRef,
+            Arc::new(StringArray::from(
+                (0..n).map(|i| Some(format!("evt_{i}"))).collect::<Vec<_>>(),
+            )) as ArrayRef,
             Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())) as ArrayRef,
         ],
     )

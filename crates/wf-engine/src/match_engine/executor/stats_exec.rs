@@ -75,9 +75,7 @@ impl StatsAccum {
             | wf_lang::plan::StatsAggPlan::Avg
             | wf_lang::plan::StatsAggPlan::Min
             | wf_lang::plan::StatsAggPlan::Max => StatsAccum::Numeric(Box::default()),
-            wf_lang::plan::StatsAggPlan::DistinctCount => {
-                StatsAccum::Distinct(Box::default())
-            }
+            wf_lang::plan::StatsAggPlan::DistinctCount => StatsAccum::Distinct(Box::default()),
             wf_lang::plan::StatsAggPlan::Last => StatsAccum::Last(None),
             wf_lang::plan::StatsAggPlan::Top => StatsAccum::Top(Vec::new()),
         }
@@ -85,7 +83,10 @@ impl StatsAccum {
 
     /// 按 plan 度量列表构造累加器数组（索引对齐 `plan.measures`）。
     pub fn accs_for_plan(plan: &wf_lang::plan::StatsPlan) -> Vec<StatsAccum> {
-        plan.measures.iter().map(|m| StatsAccum::for_measure(&m.agg)).collect()
+        plan.measures
+            .iter()
+            .map(|m| StatsAccum::for_measure(&m.agg))
+            .collect()
     }
 
     // -- 热路径访问器（调用点已按 measure.agg 分派；变体不符 = 内部错误）--
@@ -94,7 +95,10 @@ impl StatsAccum {
     pub fn numeric(&self) -> &NumericAccum {
         match self {
             StatsAccum::Numeric(a) => a,
-            _ => panic!("StatsAccum 变体不符: 期望 Numeric, 实际 {:?}", std::mem::discriminant(self)),
+            _ => panic!(
+                "StatsAccum 变体不符: 期望 Numeric, 实际 {:?}",
+                std::mem::discriminant(self)
+            ),
         }
     }
 
@@ -567,7 +571,7 @@ impl StatsWindowState {
                     has_row_fields = true;
                 }
                 StatsAggPlan::DistinctCount => bytes += 96, // DistinctSet（Box 外）
-                _ => bytes += 80,                            // NumericAccum（Box 外）
+                _ => bytes += 80,                           // NumericAccum（Box 外）
             }
         }
         if has_row_fields {
@@ -628,11 +632,7 @@ impl StatsWindowState {
     /// 取/建一个桶（完整键路径: 行式回退 / 空键规则用）。哈希与列式
     /// `keyed_bucket_mut` 同值, 链内按 ScopeKey 完整比较消歧。
     /// 新桶先过限额检查（超限 → None, 调用方跳过该行——内存有界）。
-    fn bucket_mut(
-        &mut self,
-        key: &ScopeKey,
-        plan: &StatsPlan,
-    ) -> Option<&mut Vec<StatsAccum>> {
+    fn bucket_mut(&mut self, key: &ScopeKey, plan: &StatsPlan) -> Option<&mut Vec<StatsAccum>> {
         let hash = scope_key_hash(key);
         // 先只读查找（entry 可变借用会与限额记账的 &mut self 冲突）。
         let pos = self
@@ -734,7 +734,10 @@ impl StatsExecutor {
 
     /// 行字段 layout（2026-08-26）：列式已建 → 复用；否则按字段名全 Other
     /// （行式无静态 schema 类型——不紧凑但语义一致）。
-    fn row_fields_layout_for_row(&self, names: Option<&[String]>) -> std::sync::Arc<RowFieldLayout> {
+    fn row_fields_layout_for_row(
+        &self,
+        names: Option<&[String]>,
+    ) -> std::sync::Arc<RowFieldLayout> {
         if let Some(l) = &self.row_field_layout {
             return std::sync::Arc::clone(l);
         }
@@ -1077,7 +1080,12 @@ impl StatsExecutor {
     ) -> Vec<(ScopeKey, Vec<f64>)> {
         buckets
             .into_iter()
-            .map(|(key, accs)| (key, measure_values(&self.plan, &accs, &self.measure_field_idx)))
+            .map(|(key, accs)| {
+                (
+                    key,
+                    measure_values(&self.plan, &accs, &self.measure_field_idx),
+                )
+            })
             .collect()
     }
 
@@ -1097,7 +1105,11 @@ impl StatsExecutor {
             if out.len() >= n {
                 return true; // 已取够: 保留剩余
             }
-            out.extend(std::mem::take(chain).into_iter().map(|b| (b.scope_key, b.accs)));
+            out.extend(
+                std::mem::take(chain)
+                    .into_iter()
+                    .map(|b| (b.scope_key, b.accs)),
+            );
             false // 本链已取空: 删除
         });
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1128,7 +1140,8 @@ impl StatsExecutor {
         let over_limit = self.window.over_limit_new_buckets;
         self.window = StatsWindowState::new(buckets);
         // 保留限额配置 + 拒收计数跨窗口（guard 持续生效; 计数供指标/告警）。
-        self.window.set_memory_limit(&rule_name, limit.map(|b| b as usize));
+        self.window
+            .set_memory_limit(&rule_name, limit.map(|b| b as usize));
         self.window.over_limit_new_buckets = over_limit;
     }
 
@@ -1278,8 +1291,10 @@ impl StatsExecutor {
         for (idx, measure) in self.plan.measures.iter().enumerate() {
             let wi = self.measure_where[idx];
             // 空键规则恒单桶（预建, 不参与限额——guard 只针对键空间膨胀）。
-            let acc =
-                &mut self.window.bucket_mut(&ScopeKey::Empty, &self.plan).expect("Empty 桶恒存在")[idx];
+            let acc = &mut self
+                .window
+                .bucket_mut(&ScopeKey::Empty, &self.plan)
+                .expect("Empty 桶恒存在")[idx];
             let rows_in = count_domain(rows, n, &masks, wi);
             match measure.agg {
                 StatsAggPlan::Count => {
@@ -1323,8 +1338,10 @@ impl StatsExecutor {
                 continue;
             }
             let wi = self.measure_where[idx];
-            let acc =
-                &mut self.window.bucket_mut(&ScopeKey::Empty, &self.plan).expect("Empty 桶恒存在")[idx];
+            let acc = &mut self
+                .window
+                .bucket_mut(&ScopeKey::Empty, &self.plan)
+                .expect("Empty 桶恒存在")[idx];
             if matches!(measure.agg, StatsAggPlan::DistinctCount) {
                 let Some(field) = &measure.field else {
                     continue;
@@ -1337,7 +1354,8 @@ impl StatsExecutor {
                 // last/top: 逐行按行域 + where 更新（子集行字段提取; 空键 last 规则少用）
                 let passes = |r: usize| wi.is_none_or(|wi| masks[wi].value(r));
                 for r in domain_rows(rows, n).filter(|&r| passes(r)) {
-                    let row = row_fields_from_batch(batch, r, row_field_cols.as_deref(), &row_layout);
+                    let row =
+                        row_fields_from_batch(batch, r, row_field_cols.as_deref(), &row_layout);
                     let fidx = measure_field_position(
                         &self.plan,
                         &self.measure_field_idx,
@@ -1579,9 +1597,11 @@ fn accumulate_column_row(
                     if n == 0 {
                         continue; // top(0): 不保留任何条目, 无需行字段
                     }
-                    if let Some(ci) = measure_field_idx[idx]
-                        .and_then(|i| row_field_cols.and_then(|cols| cols.get(i).copied()).flatten())
-                        && let Some(key) = column_f64_at(batch, ci, row)
+                    if let Some(ci) = measure_field_idx[idx].and_then(|i| {
+                        row_field_cols
+                            .and_then(|cols| cols.get(i).copied())
+                            .flatten()
+                    }) && let Some(key) = column_f64_at(batch, ci, row)
                         && let entries = acc.top()
                         && entries.len() == n
                         && key <= entries[n - 1].key
@@ -1589,8 +1609,9 @@ fn accumulate_column_row(
                         continue;
                     }
                 }
-                let row = row_cache
-                    .get_or_insert_with(|| row_fields_from_batch(batch, row, row_field_cols, row_layout));
+                let row = row_cache.get_or_insert_with(|| {
+                    row_fields_from_batch(batch, row, row_field_cols, row_layout)
+                });
                 let fidx = measure_field_position(plan, measure_field_idx, idx, row_names);
                 apply_last_top(acc, measure, row, fidx);
             }

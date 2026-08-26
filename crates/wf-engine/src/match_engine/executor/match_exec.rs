@@ -15,7 +15,7 @@ use super::each_exec::EachDirectBatchStats;
 
 use super::RuleExecutor;
 use super::YieldKind;
-use super::alert::{build_summary, build_wfx_id, format_nanos_utc, now_nanos, EntityIdCache};
+use super::alert::{EntityIdCache, build_summary, build_wfx_id, format_nanos_utc, now_nanos};
 use super::context::{build_eval_context, execute_joins};
 use super::eval::{
     YieldMeta, eval_entity_id, eval_score, eval_yield_expr_with_meta, with_yield_eval_scope,
@@ -190,15 +190,11 @@ impl RuleExecutor {
             )
         };
         if !out_shape_ok(&plan.entity_plan.entity_id_expr)
-            || !plan
-                .yield_plan
-                .fields
-                .iter()
-                .all(|f| {
-                    out_shape_ok(&f.value)
-                        || (wf_lang::columnar::columnar_output_expr(&f.value)
-                            && super::yield_general_columnar_safe(&f.value))
-                })
+            || !plan.yield_plan.fields.iter().all(|f| {
+                out_shape_ok(&f.value)
+                    || (wf_lang::columnar::columnar_output_expr(&f.value)
+                        && super::yield_general_columnar_safe(&f.value))
+            })
         {
             return false;
         }
@@ -438,12 +434,8 @@ impl RuleExecutor {
                                 // 一致：step_plans 参与 ctx 构建（All 分支的
                                 // `_step_{i}_source`；General 门控不引用合成
                                 // 字段，主要保证注入语义逐位对齐）。
-                                let step_plans: Vec<&wf_lang::plan::StepPlan> = self
-                                    .plan
-                                    .match_plan
-                                    .event_steps
-                                    .iter()
-                                    .collect();
+                                let step_plans: Vec<&wf_lang::plan::StepPlan> =
+                                    self.plan.match_plan.event_steps.iter().collect();
                                 let ctx = ctx.get_or_insert_with(|| {
                                     build_eval_context(
                                         keys,
@@ -453,7 +445,7 @@ impl RuleExecutor {
                                         &step_plans,
                                         m.trigger_event.as_deref(),
                                         &self.close_ctx_fields,
-            None,
+                                        None,
                                     )
                                 });
                                 // 复用循环外已算的 wfx_id / summary（字节一致）。

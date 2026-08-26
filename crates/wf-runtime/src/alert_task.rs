@@ -318,7 +318,9 @@ mod tests {
     #[test]
     fn sentinel_columns_batch_is_exempt() {
         // 哨兵批必须豁免 cut_sink_write（驱动档位切换 + EPS 落盘）。
-        assert!(is_sentinel_batch(&columns_batch(crate::perf_diag::PERF_SENTINEL_WINDOW)));
+        assert!(is_sentinel_batch(&columns_batch(
+            crate::perf_diag::PERF_SENTINEL_WINDOW
+        )));
     }
 
     #[test]
