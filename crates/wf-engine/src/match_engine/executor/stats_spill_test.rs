@@ -157,16 +157,18 @@ fn spill_evicts_over_budget_and_reads_back() {
         .map(Vec::len)
         .sum::<usize>();
     let spilled = exec.window.spill_index.len();
+    let readback = exec.window.readback.len();
     assert_eq!(
         in_memory + spilled,
         10,
         "内存({in_memory}) + spill({spilled}) = 10（不相交不变量）"
     );
     assert!(in_memory > 0 && spilled > 0, "应有键在内存与 spill 两侧");
+    // take 只读化（M5-2）: 存储条目 = spill_index + 已读回（close 前仍在库中）
     assert_eq!(
         exec.window.spill.as_ref().unwrap().len(),
-        spilled,
-        "spill 存储与索引一致"
+        spilled + readback,
+        "存储条目 = spill_index + readback"
     );
 
     // close: 每键恰好一次、count=2、sum=3（读回键计数继续累积不丢）
@@ -400,6 +402,43 @@ fn spill_estimated_bytes_bounded_by_budget() {
 // ---------------------------------------------------------------------------
 // 6. M4 接线：set_spill_redb 延迟创建（layout 解析后建 store）
 // ---------------------------------------------------------------------------
+
+#[test]
+fn spill_touch_counter_protects_recently_hit_key() {
+    // 预算 2 桶（limit 672, 驱逐目标 336）: 键 1 创建后回访一次（touch=3）——
+    // 应存活 3 轮驱逐扫描（每轮 -1），未回访键立即被驱逐。
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let mut exec = exec_with_spill(
+        plan,
+        2,
+        None,
+        Some(Box::new(MemSpillStore::new())),
+        None,
+    );
+    exec.process_rows(&[bid_row(1, 1.0)], extract);
+    exec.process_rows(&[bid_row(1, 2.0)], extract); // 回访 → touch=TOUCH_MAX
+    for k in 2..=5 {
+        exec.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    // 键 1 已挺过 3 轮驱逐（每轮被扫描减计数）；键 2/3/4 已 spill
+    assert!(
+        exec.window.find_bucket(&ScopeKey::Int(1)).is_some(),
+        "回访键应存活 3 轮驱逐扫描"
+    );
+    assert_eq!(exec.window.spill_index.len(), 3, "键 2/3/4 已 spill");
+    // 第 4 轮驱逐后键 1 才被淘汰（计数耗尽）
+    exec.process_rows(&[bid_row(6, 1.0)], extract);
+    assert!(
+        exec.window.find_bucket(&ScopeKey::Int(1)).is_none(),
+        "计数耗尽后键 1 应被驱逐"
+    );
+    assert_eq!(exec.window.spill_index.len(), 4, "键 1/2/3/4 已 spill（键 5 未扫描仍驻留）");
+    // close: 全部 6 键恰好一次（含读回去重过滤）
+    let closed = exec.close_window_by_bucket_rows();
+    assert_eq!(closed.len(), 6);
+    let k1 = closed.iter().find(|b| b.key == ScopeKey::Int(1)).expect("键1");
+    assert_eq!(k1.measures[0][0].measure_value, 2.0, "键1 count=2（两次回访）");
+}
 
 #[test]
 fn spill_redb_deferred_create_via_executor() {

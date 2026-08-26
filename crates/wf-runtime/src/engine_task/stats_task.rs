@@ -130,6 +130,9 @@ pub(super) struct StatsTask {
     /// 已上报 metrics 的超限拒收累计值（delta 记账——`over_limit_new_buckets`
     /// 跨窗口累计, close 上报必须发增量, 否则重复计数）。
     last_reported_over_limit: u64,
+    /// 已上报的 spill 驱逐/读回累计值（delta 记账；抖动观测, M5-2）。
+    last_reported_spill_evictions: u64,
+    last_reported_spill_readbacks: u64,
 }
 
 impl StatsTask {
@@ -182,6 +185,8 @@ impl StatsTask {
             last_activity_wall: std::time::Instant::now(),
             timeout_scan_interval,
             last_reported_over_limit: 0,
+            last_reported_spill_evictions: 0,
+            last_reported_spill_readbacks: 0,
         };
         (task, cancel)
     }
@@ -679,6 +684,27 @@ impl StatsTask {
                 over_limit_rows = delta,
                 "stats 状态内存超限——本窗拒收 {} 行（新桶尝试; 累计 {} 行; 已有桶继续累积）",
                 delta, over_limit
+            );
+        }
+        // spill 抖动观测（M5-2）: 驱逐/读回增量——驱逐多 + 读回多 = 抖动
+        // （预算 < 活跃集, 键反复被踢出/读回）。
+        let evictions = self.stats.window.spill_evictions();
+        let readbacks = self.stats.window.spill_readbacks();
+        let ev_delta = evictions.saturating_sub(self.last_reported_spill_evictions);
+        let rb_delta = readbacks.saturating_sub(self.last_reported_spill_readbacks);
+        self.last_reported_spill_evictions = evictions;
+        self.last_reported_spill_readbacks = readbacks;
+        if ev_delta > 0 || rb_delta > 0 {
+            wf_warn!(pipe,
+                task_id = %self.task_id,
+                rule = %self.rule_name(),
+                window_start = window_start,
+                window_end = window_end,
+                spill_evictions = ev_delta,
+                spill_readbacks = rb_delta,
+                "spill 抖动: 本窗驱逐 {} 键 / 读回 {} 次（读回率 {:.1}%; 预算不足时升高 = 抖动）",
+                ev_delta, rb_delta,
+                if ev_delta > 0 { rb_delta as f64 * 100.0 / ev_delta as f64 } else { 0.0 }
             );
         }
     }

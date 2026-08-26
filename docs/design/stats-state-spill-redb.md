@@ -293,10 +293,34 @@ rule q18_last_bid_stats {
    `Durability::None` + `WF_SPILL_CACHE_MB` 默认 64MB）
 
 **下一步（未做）**：
-- 流式 close drain（trait drain 改迭代/分批，避免全量物化）——100M 的硬前提
+- 流式 close drain（trait drain 改迭代/分批，避免全量物化）——100M 的硬前提；
+  M5-2 实测 close 期 >60s 超时（run6 被强杀）确认这是主瓶颈
 - 读回摊销（批内去重回访、或读回键短时驻留缓存）——消 EPS 塌方
 - 预算与工作集匹配（q18 每键实内存 633B > 估算 432B；预算应 < 工作集×余量）
 - 完整逐行对拍（本验证以 EMIT 基数 + [clean] 为证据，未做逐字节）
+
+## 16. M5-2 实测（2026-08-26, q18 30M, 256MB/片）——抖动计数 + 阶段定位
+
+| 配置 | EPS | RSS_peak | 备注 |
+|---|---|---|---|
+| 无 spill 基线 | ~14M | 19.6GB | |
+| M5-1（None, 1GiB 缓存） | 941K | 17.5GB | |
+| M5-2 take只读+touch（None, 64MB） | 930K | 29GB | 处理期 RSS 爬升 = redb 脏页滞留 |
+| M5-2 + Immediate | 661K | 43GB | **close 期 >60s 超时被强杀** |
+
+**结论**：
+1. **take 只读化 + touch 计数器对 EPS 无明显改善**——回访写事务不是主瓶颈
+2. **主瓶颈 = close 期全量 drain**（run6 日志: `task group "rules" join timed out after 60s, aborting`）：
+   drain 5.6GB + 并入桶表 + 输出 8.8M alert 同驻留 → 内存/时间双爆
+3. redb 行为两个坑（已修/缓解）：
+   - `Durability::None` 脏页滞留内存（RSS 处理期爬升）→ 每 8 批一次 Immediate
+     周期 flush（redb 连带持久化之前所有 None 提交）
+   - 全量 `Immediate` 使 close drain 变磁盘读（更慢）→ 默认 None + 周期 flush
+4. **抖动观测已接入**：close 时 wf_warn 打「驱逐数/读回数/读回率」（
+   `spill_evictions`/`spill_readbacks` 计数器跨窗口保留）
+
+**定论**：先做**流式 close drain**（drain 分批 + 与 take_buckets_up_to 归并排序输出），
+其余优化（读回摊销/预算匹配）在其后按新数据决定。
 
 ## 14. 风险与缓解
 

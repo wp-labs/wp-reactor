@@ -53,6 +53,10 @@ impl std::error::Error for SpillError {}
 ///
 /// **不变量（M3）**：内存桶与 spill 存储**不相交**——驱逐（buckets → put_batch）
 /// 与读回（take → buckets）互逆；close 只需 drain + 并入内存，无需 flush。
+///
+/// **take 只读化（2026-08-26 M5-2）**：`take` **不删除**条目——读回是高频
+/// 路径（q18 每键回访 3.4 次），写事务成本不可接受；redb 中保留的旧条目由
+/// 调用方在 close 时按「已读回集合」过滤（内存副本更新）。
 pub trait SpillStore {
     /// 键是否已 spill（hot path 存在性检查，O(1) 内存操作）。
     fn contains(&self, hash: u64) -> bool;
@@ -64,8 +68,8 @@ pub trait SpillStore {
         entries: Vec<(u64, ScopeKey, Vec<StatsAccum>)>,
     ) -> Result<(), SpillError>;
 
-    /// 读回并**移除**一个键（take 语义，低频：spill 后键又来一条）。
-    /// 移除保证 close 的 drain 不含已读回键（防重复输出）。
+    /// 读回一个键（**只读**，低频语义但 q18 高频出现——每键回访 3.4 次）。
+    /// 不删除条目（redb 中旧条目由调用方 close 时按已读回集合过滤）。
     fn take(&mut self, hash: u64) -> Option<(ScopeKey, Vec<StatsAccum>)>;
 
     /// close：读回全部 spill 键并清空（顺序无要求，调用方排序）。
@@ -137,7 +141,7 @@ impl SpillStore for MemSpillStore {
         Ok(())
     }
     fn take(&mut self, hash: u64) -> Option<(ScopeKey, Vec<StatsAccum>)> {
-        self.map.remove(&hash)
+        self.map.get(&hash).map(|(k, a)| (k.clone(), a.clone()))
     }
     fn drain(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
         std::mem::take(&mut self.map)
@@ -174,6 +178,8 @@ pub struct RedbSpillStore {
     path: std::path::PathBuf,
     /// 读回时解释 RowFields 的 layout（executor 生命周期内不变）。
     layout: std::sync::Arc<RowFieldLayout>,
+    /// put_batch 调用计数（每 8 批一次 Immediate 周期 flush, 限脏页）。
+    put_batches: u64,
 }
 
 impl RedbSpillStore {
@@ -184,7 +190,8 @@ impl RedbSpillStore {
     /// 潜在 10GB 无谓 RSS。取 `WF_SPILL_CACHE_MB`（默认 64MB）。
     ///
     /// **无持久化语义**（设计 §8）：spill 是内存换磁盘的临时缓冲，崩溃即重
-    /// ingest——写事务用 `Durability::None`（无 fsync），正确性不依赖落盘。
+    /// ingest——正确性不依赖落盘；`put_batch` 用 `Immediate` 仅为了把脏页
+    /// 刷出页缓存（批量低频, fsync 成本可忽略）。
     pub fn create(
         path: impl AsRef<std::path::Path>,
         layout: std::sync::Arc<RowFieldLayout>,
@@ -208,14 +215,18 @@ impl RedbSpillStore {
             db: Some(db),
             path: path.as_ref().to_path_buf(),
             layout,
+            put_batches: 0,
         })
     }
 
-    /// 无 fsync 的写事务（spill 无持久化语义——崩溃重 ingest, §8）。
-    fn write_txn(&self) -> Result<redb::WriteTransaction, SpillError> {
+    /// 写事务（durability 由调用方指定）：
+    /// - `put_batch` 默认 `None`（无 fsync——close 期 drain 读内存页更快）,
+    ///   但每 8 批做一次 `Immediate` 周期 flush（redb 的 Immediate 提交会连带
+    ///   持久化之前所有 None 提交——脏页有界, 不会爬到 29GB RSS）。
+    fn write_txn(&self, durability: redb::Durability) -> Result<redb::WriteTransaction, SpillError> {
         let db = self.db.as_ref().expect("已 cleanup");
         let mut txn = db.begin_write().map_err(|e| SpillError::Redb(e.into()))?;
-        txn.set_durability(redb::Durability::None)
+        txn.set_durability(durability)
             .map_err(|e| SpillError::Redb(e.into()))?;
         Ok(txn)
     }
@@ -249,7 +260,15 @@ impl SpillStore for RedbSpillStore {
             return Ok(());
         }
         // 单事务批量写（驱逐批量事件——逐键事务/fsync 会压死 26M 键场景）。
-        let write_txn = self.write_txn()?;
+        // 默认 None（无 fsync, close drain 读内存页更快）; 每 8 批一次 Immediate
+        // 周期 flush（redb 连带持久化之前所有 None 提交——脏页有界）。
+        self.put_batches += 1;
+        let durability = if self.put_batches.is_multiple_of(8) {
+            redb::Durability::Immediate
+        } else {
+            redb::Durability::None
+        };
+        let write_txn = self.write_txn(durability)?;
         {
             let mut table = write_txn
                 .open_table(REDB_TABLE)
@@ -265,26 +284,23 @@ impl SpillStore for RedbSpillStore {
         Ok(())
     }
 
+    /// 只读读回（M5-2）：`begin_read + get`——无写事务/WAL/锁争用（读事务并发）。
+    /// **不删除条目**：redb 中旧条目由调用方 close 时按「已读回集合」过滤。
     fn take(&mut self, hash: u64) -> Option<(ScopeKey, Vec<StatsAccum>)> {
-        let write_txn = match self.write_txn() {
+        let db = self.db.as_ref().expect("已 cleanup");
+        let txn = match db.begin_read() {
             Ok(t) => t,
-            Err(e) => Self::redb_expect(&format!("write_txn: {e}")),
+            Err(e) => Self::redb_expect(&format!("begin_read: {e}")),
         };
-        let bytes = {
-            let mut table = match write_txn.open_table(REDB_TABLE) {
-                Ok(t) => t,
-                Err(e) => Self::redb_expect(&format!("open_table: {e}")),
-            };
-            let guard = match table.remove(hash) {
-                Ok(v) => v?,
-                Err(e) => Self::redb_expect(&format!("remove: {e}")),
-            };
-            guard.value().to_vec()
+        let table = match txn.open_table(REDB_TABLE) {
+            Ok(t) => t,
+            Err(e) => Self::redb_expect(&format!("open_table: {e}")),
         };
-        match write_txn.commit() {
-            Ok(()) => {}
-            Err(e) => Self::redb_expect(&format!("commit: {e}")),
-        }
+        let guard = match table.get(hash) {
+            Ok(v) => v?,
+            Err(e) => Self::redb_expect(&format!("get: {e}")),
+        };
+        let bytes = guard.value().to_vec();
         match deserialize_spill_value(&bytes, &self.layout) {
             Ok(v) => Some(v),
             Err(e) => panic!("spill 读回损坏(致命): {e}"),
@@ -318,26 +334,8 @@ impl SpillStore for RedbSpillStore {
                 out.push((key, accs));
             }
         }
-        // 清空（retain 全删）。
-        let db = self.db.as_ref().expect("已 cleanup");
-        let write_txn = match db.begin_write() {
-            Ok(t) => t,
-            Err(e) => Self::redb_expect(&format!("begin_write: {e}")),
-        };
-        {
-            let mut table = match write_txn.open_table(REDB_TABLE) {
-                Ok(t) => t,
-                Err(e) => Self::redb_expect(&format!("open_table: {e}")),
-            };
-            match table.retain(|_, _| false) {
-                Ok(()) => {}
-                Err(e) => Self::redb_expect(&format!("retain: {e}")),
-            }
-        }
-        match write_txn.commit() {
-            Ok(()) => {}
-            Err(e) => Self::redb_expect(&format!("commit: {e}")),
-        }
+        // 不做树重写清空（drain 后调用方随即 cleanup 删文件——retain 全删是
+        // 纯浪费: 5.6GB B+ 树重写分钟级, 而文件马上被 unlink）。
         out
     }
 
@@ -1164,11 +1162,13 @@ mod tests {
             .expect("put");
         assert!(s.contains(spill_hash(&key)));
         assert_eq!(s.len(), 1);
-        // take 读回并移除（不相交不变量）
+        // take 只读回（M5-2：不删除——close 由调用方按已读回集合过滤）
         let (k, a) = s.take(spill_hash(&key)).expect("take");
         assert_eq!(k, key);
         assert_eq!(a.len(), 1);
-        assert_eq!(s.len(), 0);
+        assert_eq!(s.len(), 1, "take 不删除条目");
+        assert!(s.contains(spill_hash(&key)));
+        // 覆盖更新后 drain 全部 + 清空
         s.put_batch(vec![(spill_hash(&key), key, vec![StatsAccum::Last(None)])])
             .expect("put");
         let drained = s.drain();
@@ -1228,21 +1228,21 @@ mod tests {
         assert!(!s.contains(u64::MAX));
         assert_eq!(s.len(), 2);
 
-        // take 读回并移除（不相交不变量）
+        // take 只读回（不删除——redb 旧条目 close 时按已读回集合过滤）
         let (gk, ga) = s.take(h1).expect("take1");
         assert_eq!(gk, k1);
         assert_eq!(ga[0].numeric().count, 2);
-        assert_eq!(s.len(), 1);
-        assert!(!s.contains(h1));
+        assert_eq!(s.len(), 2, "take 不删除条目");
+        assert!(s.contains(h1), "take 后条目仍在");
 
-        // 重新 put 后 drain 全部 + 清空
+        // 覆盖更新（读回键再驱逐会 put 覆盖旧条目）后 drain 全部
         s.put_batch(vec![(h1, k1, vec![StatsAccum::Last(None)])])
             .expect("put again");
         let mut drained = s.drain();
         drained.sort_by_key(|(k, _)| format!("{k:?}"));
         assert_eq!(drained.len(), 2);
-        assert_eq!(s.len(), 0);
-        assert!(!s.contains(h1));
+        // drain 不重写树（M5-2: 紧跟 cleanup 删文件）——条目仍在, cleanup 后消失
+        assert_eq!(s.len(), 2, "drain 后条目仍保留（cleanup 删文件）");
         s.cleanup();
         assert!(!path.exists());
     }
@@ -1267,6 +1267,7 @@ mod tests {
         let (k2, a2) = s2.take(h).expect("take");
         assert_eq!(k2, k);
         assert!(matches!(a2[0], StatsAccum::Last(None)));
+        assert!(s2.contains(h), "take 只读——条目保留");
         s2.cleanup();
         assert!(!path.exists());
     }
