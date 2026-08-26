@@ -399,3 +399,47 @@ over 同时调到 10m，窗口保留应显著缩小，RSS 应随之下落。
 ### 下一步（若要降 30M 内存）
 - 锁定 full 档内部消融：alert 构建段分配降 churn / 批量回收，或规则工作态
   复用。窗口/通道/over 已三轮排除，勿再动。
+
+---
+
+## 10. alert 构建段二分定位（2026-08-26，注释/短路消融）——主因 = 列装载
+
+### 方法
+在引擎加临时 env 消融 gate（`wf-engine`，跑完即撤）：逐段短路 alert 构建，
+每轮 `MEMORY=1 ./diag.sh q13 30m` 测 full 档 ΔRSS（30M，wall 墙梯同口径）：
+- `WF_DIAG_CUT_COLUMNS`：`commit_each_row` 只计数不 push 列（切列装载）
+- `WF_DIAG_CUT_STAGED`：`stage_yield_cell*` 不 stage（切 yield 值转换/持有）
+- `WF_DIAG_CUT_ROWVALS`：行值构建常量短路（切 entity_id/fired_at/yield eval）
+- `WF_DIAG_CUT_JOIN`：跳过 `execute_joins`（ctx 借用，切 join 消费段）
+- `WF_DIAG_CUT_ALERT`（已有）：emit 整段短路（基线）
+
+### 二分结果（30M，full 档增量）
+| 消融 | 短路内容 | full ΔRSS | 归因 |
+|---|---|---|---|
+| 无 | — | 10.5G | 现状 |
+| CUT_ALERT | emit 整段（含 join） | 0.8G | alert 段 ≈ 9.7G |
+| **CUT_COLUMNS** | **列 push** | **4.4G** | **列装载 ≈ 6.1G（主因 63%）** |
+| CUT_STAGED | yield stage | 10.6G | yield 值转换 ≈ 0 |
+| CUT_ROWVALS | 行值 eval | 10.3G | 行值 eval ≈ 0.2G |
+| CUT_JOIN | execute_joins/clone | 10.4G | join 消费 ≈ 0.1G |
+| COLUMNS+ROWVALS+STAGED | 组合 | 4.5G | 与 CUT_COLUMNS 一致（无叠加） |
+
+### 结论
+- **主元凶 = 列装载段**（`AlertColumnBuilder` 逐行 `commit_each_row` 的
+  分配/持有模式）≈ 6.1G：q13b 走 `execute_each_direct_batch`，每行 12 次
+  Vec push（10 系统列 + yield 列）→ 30M 行 3.6 亿次 push + 每 4096 行一次
+  flush 批构建（~7300 次）→ pending 列数组 + 批数据 + mimalloc 段区水位。
+  CUT_COLUMNS 把批数据量砍到 KB 级 → 水位塌缩。
+- **次因 ≈ 3.6G（列 push 之外）**：`reserve_rows` 预留 + flush 批封口 +
+  **sink 通道在途**（`channel_depth` 峰值 **743 批**，blackhole sink
+  `batch_size=1024/timeout=1s` 攒批限速）+ 水位。行值 eval / yield stage /
+  join 消费经独立短路实测 ≈ 0（fcb4630 的 per-row 消减已到顶，内存不归它）。
+- 与 fcb4630 结论一致：**per-row 分配数不是内存主因**（消到 1 次/行内存
+  只降 10%）；真正的主因是列装载的**批持有 + 水位**。
+
+### 下一步（优化方向，数据已定位）
+1. **列装载改无拷贝批式**：q13b 路径逐行 commit → 批式 bulk extend（fcb4630
+   从批式改回逐行是为消二次拷贝——需设计「列式直写 + 批末封批」不重建）。
+2. **sink 通道**：blackhole 攒批限速（batch_size=1024/1s）→ 积压 743 批；
+   blackhole 本可立即丢，调小 batch_size/超时或并行消费者，预计省 ~1G。
+3. 消融 gate 为临时手段，优化完成后撤除。
