@@ -300,6 +300,32 @@ cut_output = true
 - 完成判定信号 = 哨兵文件记录（事件驱动，`stage{current=k}`），替代 metrics
   轮询近似。
 
+### 4.6 诊断模式内存口径（隔离内存墙，防墙梯归因污染）
+
+**问题（q20 实证，2026-08-26）**：墙梯把同一份数据重发 N 档，人为放大窗口内存
+压力。全局 cap（`window_defaults.max_total_bytes`）过小时，`commit_append` 会在
+evictor 追不上的窗口（join 目标窗 `over_cap` 全保留、不可驱逐）上停车——
+**把内存墙错报成计算墙**：q20 在 2GB 下 rules 档假墙 +324ns/事件（CPU 仅 18%，
+等/供给墙）、emit 档负增量 −306ns；同一台机器 8GB 下 rules 真值 −0.5ns（近零）。
+内存背压的方向性污染会给出**完全相反**的归因。
+
+**方案（引擎侧，非 diag.sh 改配置）**：诊断模式（`--perf-diag`）启动时，全局
+窗口内存 cap 覆盖为 `max(配置值, 计算值)`：
+
+- 默认 = **物理内存 × 60%**（按机器比例放量，普适性优于固定 8GB——大内存机器
+  仍可能不够，小内存机器 8GB 又太奢）；
+- 环境变量 `WF_DIAG_MAX_TOTAL_BYTES` 可调：`"8GB"` / `"4096MB"` 显式字节；
+  `"60%"` 百分比；`"0"` = 不覆盖，沿用配置（测「生产内存约束」口径，复现
+  2GB 下的 gate 停车污染）；
+- 取 max 保证**诊断只放大不缩小**——内存口径永不比生产配置更紧；
+- **非诊断模式完全不读取**该 env，一律按标准配置走（生产零污染）；
+- 单窗 `max_window_bytes` 不变（各自窗口的 ack-floor 自我保护，非本次污染源）。
+
+**实现位置**：`wf_runtime::perf_diag::perf_diag_max_total_bytes(config_max)`，
+`Reactor::start` 创建 `EvictionGate` 时调用；启动日志打印实际口径
+（`perf-diag 内存口径: max_total_bytes=…（来源）`），bench 的 diag.sh 从日志
+抓取并写进报告口径行——**报告自证内存口径，防拿旧二进制跑出新假墙**。
+
 ---
 
 ## 5. wfgen 驱动（`perf-diag` 子命令）

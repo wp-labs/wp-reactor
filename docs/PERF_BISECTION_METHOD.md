@@ -18,6 +18,7 @@
 > | 规则子集 | `family_*` 档 | `runtime.rules` hot reload |
 > | ④ 预算 | `budget:X` 档（唯一重启例外） | `parse_buffer_bytes` |
 > | 计时 | `profiling=off` | `WF_RULE_PROFILING=0`（启动期环境变量，非诊断档） |
+> | 内存隔离 | 诊断档自动把全局窗口 cap 放到物理内存 60% | `WF_DIAG_MAX_TOTAL_BYTES`（引擎侧，`0`=沿用配置；防内存背压污染墙梯，q20 实证） |
 > | 完成信号 | 漂流瓶 sentinel `__wf_sentinel` | 哨兵任务等数据窗排空后写 `perf_sentinel{round,n,start_ns,emit_ns}` + `stage{current=k}` 记录 |
 >
 > 驱动：`wfgen perf-diag --diag conf/perf-diag.toml --frames ... --n-list ...`
@@ -128,3 +129,7 @@
    （move 进批级 Vec，零拷贝）后统一处理。
 8. **对照实验区分「改动」与「环境」**：回退特定文件（`git stash` pathspec）
    构建，同一环境测「有/无改动」基线；不要拿历史数字当基线。
+9. **内存背压会污染墙梯归因（q20 实证）**：墙梯把同一份数据重发 N 档，全局窗口
+   内存 cap 过小会让 gate 停车——低 CPU 假墙 + 负增量档同时出现时，先确认报告
+   口径行里的内存 cap = 物理内存 60%（`WF_DIAG_MAX_TOTAL_BYTES`，诊断模式自动
+   放量）；用旧二进制跑出的墙表会给出完全相反的归因方向。
