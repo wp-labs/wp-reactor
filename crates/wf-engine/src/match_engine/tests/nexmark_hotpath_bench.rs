@@ -1519,6 +1519,52 @@ fn q6_match_emit() {
     let alert_ns = t3.elapsed().as_secs_f64() * 1e9 / N as f64;
     report("q6 build_match_alert", alert_ns, exec_ns);
 }
+/// q6 列式批 emit（2026-08-26 对账）：生产 q6 过 `match_plan_columnar_safe`
+/// gate → `execute_match_direct_batch_columnar`（列式批，零 OutputRecord 物化），
+/// 而 `q6_match_emit` 测的是行式 `execute_match_with_joins`（484ns，非生产形态）。
+/// 本 bench 用生产分段（ALERT_BATCH_SIZE 级 chunk）测列式批成本——对账
+/// diag 实测 1576ns/evt 的构成。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine q6_match_emit_columnar -- --ignored --nocapture"]
+fn q6_match_emit_columnar() {
+    use crate::alert::AlertColumnBuilder;
+
+    let events = bid_events(N);
+    let rule = q6_rule();
+    let exec = RuleExecutor::new(rule.clone());
+    assert!(
+        exec.match_plan_columnar_safe(),
+        "q6 形状必须过列式 gate（生产走 execute_match_direct_batch_columnar）"
+    );
+
+    // 每事件命中 1 个 MatchedContext（q6 avg>=200 高频，近似生产 advance 命中）。
+    let matched: Vec<MatchedContext> = events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| simple_matched("q6_bench", vec![num(20.0)], ev, NOW + i as i64 * EVENT_STEP_NS))
+        .collect();
+    let refs: Vec<&MatchedContext> = matched.iter().collect();
+
+    // 批级列式装载（生产分段形态）。
+    const SEG: usize = 256;
+    let mut builder = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended_out = Vec::new();
+    let t0 = Instant::now();
+    for _ in 0..4 {
+        for seg in refs.chunks(SEG) {
+            let stats = exec.execute_match_direct_batch_columnar(
+                seg,
+                NOW,
+                &mut builder,
+                &mut appended_out,
+            );
+            std::hint::black_box(&stats);
+        }
+    }
+    let col_ns = t0.elapsed().as_secs_f64() * 1e9 / (N as f64 * 4.0);
+    report("q6 match emit(列式批)", col_ns, col_ns);
+}
+
 
 // ---------------------------------------------------------------------------
 // Bench 6：Q14 on each + bind filter + strftime/count_char
