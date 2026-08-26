@@ -558,3 +558,40 @@ f64 后两次 bench RSS_peak 分别 5.1G/14.2G——**RSS_peak 采样器不稳�
   （load 8.2）+ 窗口驱逐（evict 2005）→ 瞬时消化波动 → 在途堆积。
 - **降 100M 峰值 dirty 的方向**：detail 快车道（继续降每行 CPU → 突发吸收
   更好）+ 注入平滑（bench 侧）。
+
+---
+
+## 14. 常量列免每行 cell（2026-08-26，`a7383ab`）——q13 内存/性能双达标
+
+### 机制（通用，所有 on-each 规则共享）
+1. **系统常量列**：rule_name/entity_type/origin/close_reason/emit_time
+   （5 列）从 `Vec<Arc<str>>`（每行 8B cell + Arc clone/行）→
+   `SystemCol::Const` 单值（读时按行展开）。summary 保持 Rows（match 规则
+   per-row scope）；close 路径的 origin/close_reason/summary 保持 Rows；
+   record 路径（append_record）字段可能 per-row → 保持 Rows。
+2. **yield 字面量列**（alert_type/request_count）：const_value 机制免每行
+   cell——fill_row_gaps/批式 fill 跳过 const 列，values/metas 不逐行 push，
+   读时按行展开 const_value。
+
+### 实测（q13 replay，同一二进制/帧/配置）
+| 规模 | EPS（前 → 后） | RSS_peak（前 → 后） |
+|---|---|---|
+| 30M | 7.4-8.7M → **9.8-10.2M** | 11-14G → **3.5-3.9GB** |
+| 100M | 7.8M → **10.2M** | 20.4G → **4.9GB** |
+
+**q13 内存问题关闭**：30M/100M RSS 均 <10G 判据（且负载 8-10 下）；EPS 破
+10M。q1 无退化（EPS 19.9M、RSS 3.3GB）。
+
+### 机制拆解（为什么效果如此大）
+- 每行省：6 系统列 Arc clone（refcount 原子）+ fill_row_gaps 2 次 const
+  clone + 8 列 per-row 数组（~30-48B/行）→ 30M 行省 ~8-11GB 分配总量
+  → 段区水位崩 + 每行 CPU 降 → EPS 10M。
+- 与二分定位闭环：§10 列装载 6.1G 主因 = 列数组总量，免 cell 直接归零。
+
+### 踩坑（记录）
+- summary 不能当常量：match 规则 per-row（scope 嵌入 build_summary）——
+  debug 断言 ptr_eq 也过严（emit_time 跨段 Arc 不同值同）→ 无断言分支。
+- append_record（record 路径）字段可能 per-row → 保持 Rows，只优化 direct
+  路径（生产 hot path）。
+- commit_each_rows_batch 的 summary 参数是单值（on-each 常量）但保守
+  保持 Rows（n 行同一值）——未来 match 批式接入不踩坑。
