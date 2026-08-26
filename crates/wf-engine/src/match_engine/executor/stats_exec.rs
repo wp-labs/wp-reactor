@@ -32,23 +32,23 @@ pub struct StatsAccum {
     pub min: Option<i128>,
     pub max: Option<i128>,
     pub distinct_set: Option<DistinctSet>,
-    /// `last(field)` 用（Q18）: 最近合格行的**行字段列数组**（P5 紧凑化——按
-    /// `row_field_names` 列序存储, 缺失/null = `None`; 旧 `EngineHashMap` 每桶
-    /// 6 个 SmolStr key + hash 节点 ≈ 400B+/桶, 5.29M 桶直接顶到 ~19GB）。
-    /// 每次合格行替换（流有序 = 事件时间最新）。**Arc 跨同桶多个 last 度量共享**;
-    /// `Arc<[T]>` 单块分配（Arc 头 + 数组同块, 免 Arc→Box→数组两层间接）。
-    pub last_row: Option<std::sync::Arc<[Option<Value>]>>,
+    /// `last(field)` 用（Q18）: 最近合格行的**行字段紧凑存储**（2026-08-26
+    /// q18 内存——`Arc<[Option<Value>]>` 56B/字段 → [`RowFields`] 按类型槽
+    /// 分派：数字 8B/字符串 24B 内联；P5 列序语义保留）。**Arc 跨同桶多个
+    /// last 度量共享**；null 由内部 mask 标记。
+    pub last_row: Option<std::sync::Arc<RowFields>>,
     /// `top(N, field)` 用（Q19）: 按 key DESC 有序的 top-N 条目（含行字段列数组）。
     pub top_entries: Option<Vec<TopEntry>>,
 }
 
-/// top-N 条目: 排序键 + 行字段列数组（yield 经 field_values 注入读 `b.*`）。
+/// top-N 条目: 排序键 + 行字段紧凑存储（yield 经 field_values 注入读 `b.*`）。
 #[derive(Debug, Clone)]
 pub struct TopEntry {
     /// 排序键（数值; 与行式 `value_to_f64` 同口径）。
     pub key: f64,
-    /// 条目行字段列数组（null 跳过, 与行式 Event 一致; 列序 = `row_field_names`）。
-    pub row: Box<[Option<Value>]>,
+    /// 条目行字段（2026-08-26 紧凑化，同 [`RowFields`]；null 跳过, 与行式
+    /// Event 一致; 列序 = `row_field_names`）。
+    pub row: RowFields,
 }
 
 /// Distinct key: 从列式原生值构造（i64/timestamp 域内哈希, D7）——
@@ -59,6 +59,209 @@ pub enum DistinctKey {
     /// 非整数数值（小数）—— 保持原 f64 位（canonical）。
     Float(u64),
     Str(Box<str>),
+}
+
+/// 行字段槽型（2026-08-26 q18/q19：stats last/top 行字段紧凑化）。
+/// 每字段一个槽位：数字→`numeric`（f64 8B）、字符串→`strings`（SmolStr 24B
+/// 内联）、其它→`others`（原 `Option<Value>` 万能盒回退）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowFieldSlot {
+    Numeric(usize),
+    Str(usize),
+    Other(usize),
+}
+
+/// 字段类型分派表（executor 级，所有桶共享；列式从 batch schema 构建，
+/// 行式无静态类型时退化为全 Other——不紧凑但正确）。
+#[derive(Debug, Clone)]
+pub struct RowFieldLayout {
+    slots: Vec<RowFieldSlot>,
+    n_numeric: usize,
+    n_strings: usize,
+    n_others: usize,
+}
+
+impl RowFieldLayout {
+    /// 从 batch schema 构建（列式路径：字段类型静态已知）。
+    /// `names` = 行字段列序（P5 子集，或全部 schema 字段排序）。
+    pub fn from_schema(names: &[String], schema: &arrow::datatypes::Schema) -> Self {
+        let mut slots = Vec::with_capacity(names.len());
+        let (mut n_num, mut n_str, mut n_oth) = (0, 0, 0);
+        for name in names {
+            let slot = match schema.column_with_name(name).map(|(_, f)| f.data_type()) {
+                Some(arrow::datatypes::DataType::Int8)
+                | Some(arrow::datatypes::DataType::Int16)
+                | Some(arrow::datatypes::DataType::Int32)
+                | Some(arrow::datatypes::DataType::Int64)
+                | Some(arrow::datatypes::DataType::UInt8)
+                | Some(arrow::datatypes::DataType::UInt16)
+                | Some(arrow::datatypes::DataType::UInt32)
+                | Some(arrow::datatypes::DataType::UInt64)
+                | Some(arrow::datatypes::DataType::Float32)
+                | Some(arrow::datatypes::DataType::Float64)
+                | Some(arrow::datatypes::DataType::Timestamp(_, _)) => {
+                    let s = RowFieldSlot::Numeric(n_num);
+                    n_num += 1;
+                    s
+                }
+                Some(arrow::datatypes::DataType::Utf8)
+                | Some(arrow::datatypes::DataType::LargeUtf8) => {
+                    let s = RowFieldSlot::Str(n_str);
+                    n_str += 1;
+                    s
+                }
+                _ => {
+                    let s = RowFieldSlot::Other(n_oth);
+                    n_oth += 1;
+                    s
+                }
+            };
+            slots.push(slot);
+        }
+        Self {
+            slots,
+            n_numeric: n_num,
+            n_strings: n_str,
+            n_others: n_oth,
+        }
+    }
+
+    /// 全 Other 兜底（行式路径无静态 schema 类型时；不紧凑但语义一致）。
+    pub fn all_other(names: &[String]) -> Self {
+        Self {
+            slots: names
+                .iter()
+                .enumerate()
+                .map(|(i, _)| RowFieldSlot::Other(i))
+                .collect(),
+            n_numeric: 0,
+            n_strings: 0,
+            n_others: names.len(),
+        }
+    }
+
+    pub fn n_fields(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn n_numeric(&self) -> usize {
+        self.n_numeric
+    }
+
+    pub fn n_strings(&self) -> usize {
+        self.n_strings
+    }
+
+    pub fn n_others(&self) -> usize {
+        self.n_others
+    }
+
+    pub fn slot(&self, i: usize) -> RowFieldSlot {
+        self.slots[i]
+    }
+}
+
+/// 行字段紧凑存储（stats last/top 的行字段数组）。
+/// `Arc<[Option<Value>]>`（56B/字段）→ 按 [`RowFieldLayout`] 槽分派：
+/// 数字 8B / 字符串 24B（内联）/ 其它回退。null 由 `null_mask` 位标记
+/// （numeric 的 NaN 与 strings 的空串都是合法数据，不能作哨兵）。
+/// 自包含 layout（Arc），下游（stats_task 注入）可独立读取。
+#[derive(Debug, Clone)]
+pub struct RowFields {
+    layout: std::sync::Arc<RowFieldLayout>,
+    numeric: Box<[f64]>,
+    strings: Box<[smol_str::SmolStr]>,
+    others: Box<[Option<Value>]>,
+    null_mask: Box<[u64]>,
+}
+
+impl RowFields {
+    pub fn empty(layout: std::sync::Arc<RowFieldLayout>) -> Self {
+        let n = layout.n_fields();
+        let n_numeric = layout.n_numeric;
+        let n_strings = layout.n_strings;
+        let n_others = layout.n_others;
+        Self {
+            layout,
+            numeric: vec![0.0; n_numeric].into_boxed_slice(),
+            strings: vec![smol_str::SmolStr::default(); n_strings].into_boxed_slice(),
+            others: vec![None; n_others].into_boxed_slice(),
+            null_mask: vec![0u64; n.div_ceil(64)].into_boxed_slice(),
+        }
+    }
+
+    pub fn layout(&self) -> &std::sync::Arc<RowFieldLayout> {
+        &self.layout
+    }
+
+    fn mask_bit(&mut self, i: usize, is_null: bool) {
+        let word = i / 64;
+        let bit = i % 64;
+        if is_null {
+            self.null_mask[word] |= 1 << bit;
+        } else {
+            self.null_mask[word] &= !(1 << bit);
+        }
+    }
+
+    fn mask_get(&self, i: usize) -> bool {
+        (self.null_mask[i / 64] >> (i % 64)) & 1 == 1
+    }
+
+    /// 按字段位置写值（v = None → null）。
+    pub fn set(&mut self, i: usize, v: Option<Value>) {
+        match (self.layout.slot(i), v) {
+            (RowFieldSlot::Numeric(idx), Some(Value::Number(n))) => {
+                self.numeric[idx] = n;
+                self.mask_bit(i, false);
+            }
+            (RowFieldSlot::Str(idx), Some(Value::Str(s))) => {
+                self.strings[idx] = s;
+                self.mask_bit(i, false);
+            }
+            (RowFieldSlot::Other(idx), Some(v)) => {
+                self.others[idx] = Some(v);
+                self.mask_bit(i, false);
+            }
+            (_, None) => {
+                self.mask_bit(i, true);
+            }
+            // 值类型与槽型不符（行式路径按值路由的边界）→ null（与提取失败一致）。
+            (_, Some(_)) => {
+                self.mask_bit(i, true);
+            }
+        }
+    }
+
+    /// 按字段位置读值（null → None）。
+    pub fn value_at(&self, i: usize) -> Option<Value> {
+        if self.mask_get(i) {
+            return None;
+        }
+        match self.layout.slot(i) {
+            RowFieldSlot::Numeric(idx) => Some(Value::Number(self.numeric[idx])),
+            RowFieldSlot::Str(idx) => Some(Value::Str(self.strings[idx].clone())),
+            RowFieldSlot::Other(idx) => self.others[idx].clone(),
+        }
+    }
+
+    /// 按字段位置读数字（top 排序键 / last measure_value）。
+    pub fn f64_at(&self, i: usize) -> Option<f64> {
+        if self.mask_get(i) {
+            return None;
+        }
+        match self.layout.slot(i) {
+            RowFieldSlot::Numeric(idx) => Some(self.numeric[idx]),
+            RowFieldSlot::Other(idx) => self.others[idx].as_ref().and_then(value_to_f64),
+            RowFieldSlot::Str(_) => None,
+        }
+    }
+
+    /// 按字段位置迭代（下游 field_values 注入用；与 `Arc<[Option<Value>]>`
+    /// 的 iter 同构）。
+    pub fn iter_values(&self) -> impl Iterator<Item = Option<Value>> + '_ {
+        (0..self.layout.n_fields()).map(move |i| self.value_at(i))
+    }
 }
 
 /// distinct_count 的紧凑存储（2026-08-26 q16 内存）：整数键（q16 的
@@ -399,11 +602,50 @@ pub struct StatsExecutor {
     /// 每度量字段在行字段列数组中的位置（预计算, 热路径免字符串查找;
     /// last/top 且字段在子集内 → Some, 其余 None）。
     measure_field_idx: Vec<Option<usize>>,
+    /// 行字段类型分派（2026-08-26 q18/q19 紧凑化）：列式路径首次 `process_batch`
+    /// 从 batch schema 构建；行式路径（无静态类型）退化全 Other（不紧凑但正确）。
+    row_field_layout: Option<std::sync::Arc<RowFieldLayout>>,
 }
 
 impl StatsExecutor {
     pub fn new(plan: StatsPlan) -> Self {
         Self::with_row_fields(plan, None)
+    }
+
+    /// 行字段 layout（2026-08-26）：列式已建 → 复用；否则按字段名全 Other
+    /// （行式无静态 schema 类型——不紧凑但语义一致）。
+    fn row_fields_layout_for_row(&self, names: Option<&[String]>) -> std::sync::Arc<RowFieldLayout> {
+        if let Some(l) = &self.row_field_layout {
+            return std::sync::Arc::clone(l);
+        }
+        let names: Vec<String> = match names {
+            Some(ns) => ns.to_vec(),
+            None => vec![],
+        };
+        std::sync::Arc::new(RowFieldLayout::all_other(&names))
+    }
+
+    /// 列式路径确保 layout（首次从 batch schema 构建并缓存）。
+    fn ensure_row_field_layout(&mut self, batch: &RecordBatch) -> std::sync::Arc<RowFieldLayout> {
+        if let Some(l) = &self.row_field_layout {
+            return std::sync::Arc::clone(l);
+        }
+        let names: Vec<String> = match &self.row_field_names {
+            Some(ns) => ns.as_ref().clone(),
+            None => {
+                let mut ns: Vec<String> = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().to_string())
+                    .collect();
+                ns.sort();
+                ns
+            }
+        };
+        let layout = std::sync::Arc::new(RowFieldLayout::from_schema(&names, &batch.schema()));
+        self.row_field_layout = Some(std::sync::Arc::clone(&layout));
+        layout
     }
 
     /// 指定 last/top 行字段提取子集（None = 全部 schema 列）。
@@ -460,6 +702,7 @@ impl StatsExecutor {
             measure_where,
             row_field_names,
             measure_field_idx,
+            row_field_layout: None,
         }
     }
 
@@ -521,7 +764,9 @@ impl StatsExecutor {
             };
             // 行字段列数组懒提取（每行一次, 多 last/top 度量共享同一 Arc——与
             // accumulate_keyed_row 的 row_cache 对齐）。
-            let mut row_cache: Option<std::sync::Arc<[Option<Value>]>> = None;
+            let mut row_cache: Option<std::sync::Arc<RowFields>> = None;
+            // 2026-08-26 q18/q19：行式路径 layout（列式已建 → 复用；否则全 Other）。
+            let row_layout = self.row_fields_layout_for_row(row_names.as_deref());
             // 新桶超限（内存 guard）→ 该行跳过（与列式路径一致）。
             let Some(bucket) = self.window.bucket_mut(&bucket_key, &self.plan, n_measures) else {
                 continue;
@@ -586,7 +831,7 @@ impl StatsExecutor {
                                 // row_fields_from_batch 对齐; 同桶多 last 度量 Arc
                                 // 共享 1 份内存）。
                                 let row = row_cache.get_or_insert_with(|| {
-                                    row_fields_from_row(row, row_names.as_deref())
+                                    row_fields_from_row(row, row_names.as_deref(), &row_layout)
                                 });
                                 let fidx = measure_field_position(
                                     &self.plan,
@@ -601,7 +846,7 @@ impl StatsExecutor {
                         // 字段缺失: last 仍保留整行（yield 读其它字段）, top 无键跳过
                         if measure.agg == StatsAggPlan::Last {
                             let row = row_cache.get_or_insert_with(|| {
-                                row_fields_from_row(row, row_names.as_deref())
+                                row_fields_from_row(row, row_names.as_deref(), &row_layout)
                             });
                             acc.last_row = Some(std::sync::Arc::clone(row));
                         }
@@ -885,6 +1130,8 @@ impl StatsExecutor {
         }
         // 段 2: distinct/last/top 行式段（原生列值按行域 + where 过滤; last/top 提取
         // 行字段供 yield 注入）
+        // 2026-08-26 q18/q19：行字段 layout 在桶借用前 ensure（ensure 需 &mut self）。
+        let row_layout = self.ensure_row_field_layout(batch);
         for (idx, measure) in self.plan.measures.iter().enumerate() {
             if !matches!(
                 measure.agg,
@@ -907,7 +1154,7 @@ impl StatsExecutor {
                 // last/top: 逐行按行域 + where 更新（子集行字段提取; 空键 last 规则少用）
                 let passes = |r: usize| wi.is_none_or(|wi| masks[wi].value(r));
                 for r in domain_rows(rows, n).filter(|&r| passes(r)) {
-                    let row = row_fields_from_batch(batch, r, row_field_cols.as_deref());
+                    let row = row_fields_from_batch(batch, r, row_field_cols.as_deref(), &row_layout);
                     let fidx = measure_field_position(
                         &self.plan,
                         &self.measure_field_idx,
@@ -1015,6 +1262,9 @@ impl StatsExecutor {
         row_field_cols: Option<&[Option<usize>]>,
     ) -> bool {
         const MAX_STACK_KEYS: usize = 4;
+        // 2026-08-26 q18/q19：行字段 layout（首次从 schema 构建并缓存）；
+        // 在桶借用前取（ensure 需 &mut self）。
+        let row_layout = self.ensure_row_field_layout(batch);
         if key_columns.len() <= MAX_STACK_KEYS {
             let mut comps: [ScopeKey; MAX_STACK_KEYS] = std::array::from_fn(|_| ScopeKey::Empty);
             for (i, kc) in key_columns.iter().enumerate() {
@@ -1040,6 +1290,7 @@ impl StatsExecutor {
                 batch,
                 masks,
                 row,
+                &row_layout,
             );
             return true;
         }
@@ -1060,6 +1311,7 @@ impl StatsExecutor {
             batch,
             masks,
             row,
+            &row_layout,
         );
         true
     }
@@ -1081,8 +1333,9 @@ fn accumulate_column_row(
     batch: &RecordBatch,
     masks: &[BooleanArray],
     row: usize,
+    row_layout: &std::sync::Arc<RowFieldLayout>,
 ) {
-    let mut row_cache: Option<std::sync::Arc<[Option<Value>]>> = None;
+    let mut row_cache: Option<std::sync::Arc<RowFields>> = None;
     for (idx, measure) in plan.measures.iter().enumerate() {
         if let Some(wi) = measure_where[idx]
             && !masks[wi].value(row)
@@ -1148,7 +1401,7 @@ fn accumulate_column_row(
                     }
                 }
                 let row = row_cache
-                    .get_or_insert_with(|| row_fields_from_batch(batch, row, row_field_cols));
+                    .get_or_insert_with(|| row_fields_from_batch(batch, row, row_field_cols, row_layout));
                 let fidx = measure_field_position(plan, measure_field_idx, idx, row_names);
                 apply_last_top(acc, measure, row, fidx);
             }
@@ -1501,7 +1754,7 @@ fn value_to_f64(v: &Value) -> Option<f64> {
 fn apply_last_top(
     acc: &mut StatsAccum,
     measure: &StatsMeasurePlan,
-    row: &std::sync::Arc<[Option<Value>]>,
+    row: &std::sync::Arc<RowFields>,
     field_idx: Option<usize>,
 ) {
     match measure.agg {
@@ -1509,11 +1762,7 @@ fn apply_last_top(
             acc.last_row = Some(std::sync::Arc::clone(row));
         }
         StatsAggPlan::Top => {
-            let Some(key) = field_idx
-                .and_then(|i| row.get(i))
-                .and_then(|v| v.as_ref())
-                .and_then(value_to_f64)
-            else {
+            let Some(key) = field_idx.and_then(|i| row.f64_at(i)) else {
                 return; // 非数值键 → 跳过（与 sum 跳过非数值一致）
             };
             let n = measure.arg.unwrap_or(10) as usize;
@@ -1527,8 +1776,8 @@ fn apply_last_top(
             if entries.len() == n && key <= entries[n - 1].key {
                 return;
             }
-            // Arc<[T]> 深拷贝为独立 Box（top 条目各自的行, 不共享）
-            insert_top(entries, key, row.as_ref().to_vec().into_boxed_slice(), n);
+            // Arc 深拷贝为独立 Box（top 条目各自的行, 不共享）
+            insert_top(entries, key, row.as_ref().clone(), n);
         }
         _ => {}
     }
@@ -1536,7 +1785,7 @@ fn apply_last_top(
 
 /// top-N 插入: key DESC 有序保留前 N; 同 key 新条目插在已有同 key 条目之后
 /// （先到者在前）。n=0 时清空（top(0, ...) 边界）。
-fn insert_top(entries: &mut Vec<TopEntry>, key: f64, row: Box<[Option<Value>]>, n: usize) {
+fn insert_top(entries: &mut Vec<TopEntry>, key: f64, row: RowFields, n: usize) {
     if n == 0 {
         return;
     }
@@ -1595,11 +1844,7 @@ fn measure_values(
             StatsAggPlan::Max => acc.max.unwrap_or(0) as f64,
             StatsAggPlan::DistinctCount => acc.distinct_set.as_ref().map_or(0, DistinctSet::len) as f64,
             StatsAggPlan::Last => match (&acc.last_row, fidx) {
-                (Some(row), Some(i)) => row
-                    .get(*i)
-                    .and_then(|v| v.as_ref())
-                    .and_then(value_to_f64)
-                    .unwrap_or(0.0),
+                (Some(row), Some(i)) => row.f64_at(*i).unwrap_or(0.0),
                 _ => 0.0,
             },
             StatsAggPlan::Top => 0.0,
@@ -1607,13 +1852,13 @@ fn measure_values(
         .collect()
 }
 
-/// 每桶输出条目: 度量值 + 可选行字段列数组（last/top 注入 yield 用; 标量 =
-/// None）。行字段为 Arc（与状态共享, close 零拷贝; 构造 alert 时才逐值克隆）。
+/// 每桶输出条目: 度量值 + 可选行字段紧凑存储（last/top 注入 yield 用; 标量 =
+/// None）。行字段为 Arc（与状态共享, close 零拷贝; 构造 alert 时才逐值构造）。
 /// 列序 = `StatsExecutor::row_field_names()`（None 子集 = schema 列序）。
 #[derive(Debug, Clone)]
 pub struct StatsCloseEntry {
     pub measure_value: f64,
-    pub row_fields: Option<std::sync::Arc<[Option<Value>]>>,
+    pub row_fields: Option<std::sync::Arc<RowFields>>,
 }
 
 /// 每桶 close 输出: 每度量一个值列表（标量 = 1; top = N, 按 rank 序）。
@@ -1652,11 +1897,7 @@ fn bucket_measure_entries(
         }
         StatsAggPlan::Last => {
             let value = match (&acc.last_row, field_idx) {
-                (Some(row), Some(i)) => row
-                    .get(i)
-                    .and_then(|v| v.as_ref())
-                    .and_then(value_to_f64)
-                    .unwrap_or(0.0),
+                (Some(row), Some(i)) => row.f64_at(i).unwrap_or(0.0),
                 _ => 0.0,
             };
             vec![StatsCloseEntry {
@@ -1765,16 +2006,24 @@ fn tier_index(v: f64, bounds: &[f64]) -> i64 {
 fn row_fields_from_row(
     row: &HashMap<String, Value>,
     names: Option<&[String]>,
-) -> std::sync::Arc<[Option<Value>]> {
-    let vals: Vec<Option<Value>> = match names {
-        Some(ns) => ns.iter().map(|n| row.get(n).cloned()).collect(),
+    layout: &std::sync::Arc<RowFieldLayout>,
+) -> std::sync::Arc<RowFields> {
+    let mut fields = RowFields::empty(std::sync::Arc::clone(layout));
+    match names {
+        Some(ns) => {
+            for (i, n) in ns.iter().enumerate() {
+                fields.set(i, row.get(n).cloned());
+            }
+        }
         None => {
             let mut keys: Vec<&String> = row.keys().collect();
             keys.sort();
-            keys.into_iter().map(|k| row.get(k).cloned()).collect()
+            for (i, k) in keys.iter().enumerate() {
+                fields.set(i, row.get(*k).cloned());
+            }
         }
-    };
-    std::sync::Arc::from(vals) // 单块分配: Arc 头 + 数组同块
+    }
+    std::sync::Arc::new(fields)
 }
 
 /// 从 batch 行提取字段列数组（last/top 列式路径用, P5 紧凑化）: 按 `cols`
@@ -1785,12 +2034,13 @@ fn row_fields_from_batch(
     batch: &RecordBatch,
     row: usize,
     cols: Option<&[Option<usize>]>,
-) -> std::sync::Arc<[Option<Value>]> {
+    layout: &std::sync::Arc<RowFieldLayout>,
+) -> std::sync::Arc<RowFields> {
     let schema = batch.schema();
-    let mut fields: Vec<Option<Value>> = Vec::with_capacity(cols.map_or(0, |c| c.len()));
+    let mut fields = RowFields::empty(std::sync::Arc::clone(layout));
     match cols {
         Some(cols) => {
-            for ci in cols {
+            for (i, ci) in cols.iter().enumerate() {
                 let v = match ci {
                     Some(ci) => {
                         let col = batch.column(*ci);
@@ -1802,28 +2052,27 @@ fn row_fields_from_batch(
                     }
                     None => None, // 字段缺失 → None
                 };
-                fields.push(v);
+                fields.set(i, v);
             }
         }
         None => {
             let mut names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             names.sort();
-            for name in names {
+            for (i, name) in names.iter().enumerate() {
                 let col_idx = schema.index_of(name).expect("schema 字段必存在");
                 let col = batch.column(col_idx);
                 if col.is_null(row) {
-                    fields.push(None);
+                    fields.set(i, None);
                 } else {
-                    fields.push(extract_field_value(
-                        schema.field(col_idx),
-                        col.as_ref(),
-                        row,
-                    ));
+                    fields.set(
+                        i,
+                        extract_field_value(schema.field(col_idx), col.as_ref(), row),
+                    );
                 }
             }
         }
     }
-    std::sync::Arc::from(fields) // 单块分配: Arc 头 + 数组同块
+    std::sync::Arc::new(fields)
 }
 
 /// 从 batch 列读单行原生数值（Int64 原生 i64 → i128, 不走 f64——D8: ≥2^53 的

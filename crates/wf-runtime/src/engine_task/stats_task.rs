@@ -499,7 +499,7 @@ impl StatsTask {
                                 .map_or(0.0, |e| e.measure_value)
                         })
                         .collect();
-                    let row_fields: Vec<Option<&std::sync::Arc<[Option<Value>]>>> = bucket
+                    let row_fields: Vec<Option<&std::sync::Arc<wf_engine::match_engine::RowFields>>> = bucket
                         .measures
                         .iter()
                         .map(|m| {
@@ -527,7 +527,8 @@ impl StatsTask {
             }
         } else {
             // 标量快路径（Q12/16/17 原样）: 每桶 1 条
-            let none_rows: Vec<Option<&std::sync::Arc<[Option<Value>]>>> = vec![None; labels.len()];
+            let none_rows: Vec<Option<&std::sync::Arc<wf_engine::match_engine::RowFields>>> =
+                vec![None; labels.len()];
             for (scope_key, values) in self.stats.close_window_by_bucket() {
                 let close = build_stats_close_output(
                     self.rule_name(),
@@ -810,7 +811,7 @@ fn build_stats_close_output(
     rule_name: &str,
     values: &[f64],
     labels: &[String],
-    row_fields: &[Option<&std::sync::Arc<[Option<Value>]>>],
+    row_fields: &[Option<&std::sync::Arc<wf_engine::match_engine::RowFields>>],
     row_names: Option<&[String]>,
     window_start: i64,
     window_end: i64,
@@ -837,11 +838,11 @@ fn build_stats_close_output(
                 EngineHashMap::default()
             };
             if let (Some(names), Some(row)) = (row_names, row_fields.get(i).copied().flatten()) {
-                for (pos, val) in row.iter().enumerate() {
+                for (pos, val) in row.iter_values().enumerate() {
                     if let Some(v) = val
                         && let Some(name) = names.get(pos)
                     {
-                        fv.insert(name.clone(), vec![v.clone()]);
+                        fv.insert(name.clone(), vec![v]);
                     }
                 }
             }

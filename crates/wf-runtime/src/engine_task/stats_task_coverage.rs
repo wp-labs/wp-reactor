@@ -161,11 +161,17 @@ fn build_stats_close_output_empty_keys_no_injection() {
 #[test]
 fn build_stats_close_output_expands_row_fields() {
     // last/top row-field columns: one per measure, expanded by row_names order.
+    use wf_engine::match_engine::{RowFieldLayout, RowFields};
     let row_names = vec!["price".to_string(), "channel".to_string()];
-    let row_a: Arc<[Option<Value>]> =
-        Arc::new([Some(Value::Number(99.0)), Some(Value::Str("web".into()))]);
-    let row_b: Arc<[Option<Value>]> = Arc::new([None, Some(Value::Str("app".into()))]);
-    let row_fields: Vec<Option<&Arc<[Option<Value>]>>> = vec![Some(&row_a), Some(&row_b)];
+    let layout = std::sync::Arc::new(RowFieldLayout::all_other(&row_names));
+    let mut row_a = RowFields::empty(std::sync::Arc::clone(&layout));
+    row_a.set(0, Some(Value::Number(99.0)));
+    row_a.set(1, Some(Value::Str("web".into())));
+    let mut row_b = RowFields::empty(layout);
+    row_b.set(1, Some(Value::Str("app".into())));
+    let row_a = std::sync::Arc::new(row_a);
+    let row_b = std::sync::Arc::new(row_b);
+    let row_fields: Vec<Option<&std::sync::Arc<RowFields>>> = vec![Some(&row_a), Some(&row_b)];
 
     let close = build_stats_close_output(
         "stats_rule",

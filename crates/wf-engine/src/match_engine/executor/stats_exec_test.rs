@@ -10,7 +10,9 @@ use wf_lang::ast::{BinOp, Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan, WindowSpec};
 
 use crate::match_engine::Value;
-use crate::match_engine::executor::stats_exec::{StatsAccum, StatsExecutor, TopEntry};
+use crate::match_engine::executor::stats_exec::{
+    RowFieldLayout, RowFields, StatsAccum, StatsExecutor, TopEntry,
+};
 
 fn num(n: f64) -> Value {
     Value::Number(n)
@@ -108,12 +110,11 @@ fn extract(row: &HashMap<String, Value>, name: &str) -> Option<Value> {
 }
 
 /// 行字段列数组按名取值（P5 紧凑化测试辅助; `names` = 提取列序）。
-fn row_val<'a>(row: &'a [Option<Value>], names: &[String], name: &str) -> Option<&'a Value> {
+fn row_val(row: &std::sync::Arc<RowFields>, names: &[String], name: &str) -> Option<Value> {
     names
         .iter()
         .position(|n| n == name)
-        .and_then(|i| row.get(i))
-        .and_then(|v| v.as_ref())
+        .and_then(|i| row.value_at(i))
 }
 
 /// batch schema 字段名排序——与执行器 None 子集提取列序一致（行式/列式同序）。
@@ -1513,8 +1514,8 @@ fn stats_last_keeps_last_row_and_injects_fields() {
     assert_eq!(e.measure_value, 200.0, "最后一条 bid 的价格");
     let rf = e.row_fields.as_ref().expect("last 携带行字段");
     let names = sorted_bid_names();
-    assert_eq!(row_val(rf, &names, "price"), Some(&num(200.0)));
-    assert_eq!(row_val(rf, &names, "bidder"), Some(&num(8.0)));
+    assert_eq!(row_val(rf, &names, "price"), Some(num(200.0)));
+    assert_eq!(row_val(rf, &names, "bidder"), Some(num(8.0)));
     assert_eq!(buckets[1].key, ScopeKey::Int(2));
     assert_eq!(buckets[1].measures[0][0].measure_value, 300.0);
 }
@@ -1559,11 +1560,11 @@ fn stats_top_keeps_top_n_desc() {
     let names = sorted_bid_names();
     assert_eq!(
         row_val(entries[0].row_fields.as_ref().unwrap(), &names, "bidder"),
-        Some(&num(2.0))
+        Some(num(2.0))
     );
     assert_eq!(
         row_val(entries[1].row_fields.as_ref().unwrap(), &names, "bidder"),
-        Some(&num(4.0))
+        Some(num(4.0))
     );
 }
 
@@ -1599,12 +1600,12 @@ fn stats_top_tie_earlier_arrival_wins() {
     let names = sorted_bid_names();
     assert_eq!(
         row_val(entries[0].row_fields.as_ref().unwrap(), &names, "bidder"),
-        Some(&num(1.0)),
+        Some(num(1.0)),
         "同价先到者 rank1"
     );
     assert_eq!(
         row_val(entries[1].row_fields.as_ref().unwrap(), &names, "bidder"),
-        Some(&num(2.0)),
+        Some(num(2.0)),
         "同价后到者 rank2"
     );
 }
@@ -1639,7 +1640,7 @@ fn stats_last_top_where_filter_applies() {
     let names = sorted_bid_names();
     assert_eq!(
         row_val(e.row_fields.as_ref().unwrap(), &names, "bidder"),
-        Some(&num(3.0))
+        Some(num(3.0))
     );
 }
 
@@ -1692,7 +1693,12 @@ fn stats_last_top_columnar_matches_row_based() {
             assert_eq!(rm.len(), cm.len(), "条目数一致");
             for (re, ce) in rm.iter().zip(cm.iter()) {
                 assert_eq!(re.measure_value, ce.measure_value);
-                assert_eq!(re.row_fields, ce.row_fields, "行字段一致");
+                assert_eq!(re.row_fields.is_some(), ce.row_fields.is_some(), "行字段一致");
+                if let (Some(rf), Some(cf)) = (&re.row_fields, &ce.row_fields) {
+                    let rv: Vec<Option<Value>> = rf.iter_values().collect();
+                    let cv: Vec<Option<Value>> = cf.iter_values().collect();
+                    assert_eq!(rv, cv, "行字段一致");
+                }
             }
         }
     }
@@ -1756,7 +1762,7 @@ fn stats_top_full_cutoff_replaces_tail() {
     let names = sorted_bid_names();
     assert_eq!(
         row_val(entries[1].row_fields.as_ref().unwrap(), &names, "bidder"),
-        Some(&num(4.0))
+        Some(num(4.0))
     );
 }
 
@@ -1791,7 +1797,7 @@ fn stats_last_missing_field_keeps_row() {
         .collect::<Vec<_>>();
     assert_eq!(
         row_val(rf, &row_names, "bidder"),
-        Some(&num(8.0)),
+        Some(num(8.0)),
         "字段缺失仍保留行字段"
     );
     // 列式路径: price 列 null 对应行
@@ -1804,7 +1810,7 @@ fn stats_last_missing_field_keeps_row() {
     let col_names = sorted_schema_names(&batch); // [auction, bidder, price]
     assert_eq!(
         row_val(ce.row_fields.as_ref().unwrap(), &col_names, "bidder"),
-        Some(&num(8.0))
+        Some(num(8.0))
     );
 }
 
@@ -1869,7 +1875,7 @@ fn stats_top_precheck_skips_below_cutoff_rows() {
         assert_eq!(top.measures[0][1].measure_value, 200.0, "{name}: rank2 200");
         // 行字段仍携带原始 bidder（淘汰行不污染）。
         let row = top.measures[0][0].row_fields.as_ref().expect("条目带行字段");
-        assert!(row.iter().any(|v| v.as_ref() == Some(&num(1.0))), "{name}: rank1 bidder=1");
+        assert!(row.iter_values().any(|v| v == Some(num(1.0))), "{name}: rank1 bidder=1");
     }
 }
 
@@ -1952,7 +1958,7 @@ fn stats_top_precheck_random_stream_matches_reference() {
                 assert_eq!(e.measure_value, re.0, "{name}: auction {auction} rank {k} price");
                 assert_eq!(
                     row_val(e.row_fields.as_ref().expect("条目带行字段"), &names, "bidder"),
-                    Some(&num(re.1)),
+                    Some(num(re.1)),
                     "{name}: auction {auction} rank {k} bidder"
                 );
             }
@@ -1991,7 +1997,7 @@ fn stats_row_fields_compact_and_shared() {
         m0.as_ref().expect("last 行字段"),
         m1.as_ref().expect("last 行字段"),
     );
-    assert_eq!(r0.len(), 2, "列数组长度 = 子集大小, 而非整行");
+    assert_eq!(r0.iter_values().count(), 2, "列数组长度 = 子集大小, 而非整行");
     assert!(
         std::sync::Arc::ptr_eq(r0, r1),
         "同桶多 last 度量共享同一列数组"
@@ -2001,8 +2007,8 @@ fn stats_row_fields_compact_and_shared() {
         .into_iter()
         .map(String::from)
         .collect::<Vec<_>>();
-    assert_eq!(row_val(r0, &names, "price"), Some(&num(100.0)));
-    assert_eq!(row_val(r0, &names, "bidder"), Some(&num(7.0)));
+    assert_eq!(row_val(r0, &names, "price"), Some(num(100.0)));
+    assert_eq!(row_val(r0, &names, "bidder"), Some(num(7.0)));
     assert!(row_val(r0, &names, "auction").is_none(), "子集外不入列");
 }
 
@@ -2047,7 +2053,12 @@ fn stats_row_fields_subset_both_paths_match() {
             assert_eq!(rm.len(), cm.len());
             for (re, ce) in rm.iter().zip(cm.iter()) {
                 assert_eq!(re.measure_value, ce.measure_value);
-                assert_eq!(re.row_fields, ce.row_fields);
+                assert_eq!(re.row_fields.is_some(), ce.row_fields.is_some());
+                if let (Some(rf), Some(cf)) = (&re.row_fields, &ce.row_fields) {
+                    let rv: Vec<Option<Value>> = rf.iter_values().collect();
+                    let cv: Vec<Option<Value>> = cf.iter_values().collect();
+                    assert_eq!(rv, cv);
+                }
             }
         }
     }
@@ -2296,7 +2307,12 @@ fn stats_memory_guard_merge_partial_rejects_over_limit() {
             count: 1,
             top_entries: Some(vec![TopEntry {
                 key: 200.0,
-                row: Box::new([Some(Value::Number(200.0))]),
+                row: {
+                    let layout = std::sync::Arc::new(RowFieldLayout::all_other(&["price".to_string()]));
+                    let mut rf = RowFields::empty(layout);
+                    rf.set(0, Some(Value::Number(200.0)));
+                    rf
+                },
             }]),
             ..StatsAccum::default()
         }],
@@ -2309,4 +2325,51 @@ fn stats_memory_guard_merge_partial_rejects_over_limit() {
     );
     assert_eq!(exec.window.event_count, 2, "partial 的 event_count 仍累计");
     assert_eq!(exec.final_measure_values_by_bucket().len(), 1, "只有键 1 桶");
+}
+/// 快速验证：q18 形状列式路径的 RowFields layout 是否紧凑（2026-08-26）。
+#[test]
+fn q18_columnar_layout_is_compact() {
+    let plan = keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![
+            last_measure("last_price", "price"),
+            last_measure("last_channel", "channel"),
+        ],
+    );
+    let subset: std::sync::Arc<std::collections::HashSet<String>> = std::sync::Arc::new(
+        ["auction", "price", "channel"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    );
+    let mut exec = StatsExecutor::with_row_fields(plan, Some(subset));
+    // 列式批（bid_events 形状：auction/price Int64 + channel Utf8）。
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("auction", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("price", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new(
+                "channel",
+                arrow::datatypes::DataType::Utf8,
+                false,
+            ),
+        ])),
+        vec![
+            std::sync::Arc::new(arrow::array::Int64Array::from(vec![1, 1, 2])),
+            std::sync::Arc::new(arrow::array::Int64Array::from(vec![100, 200, 300])),
+            std::sync::Arc::new(arrow::array::StringArray::from(vec!["G", "G", "B"])),
+        ],
+    )
+    .expect("batch");
+    assert!(exec.process_batch(&batch), "列式前置应满足");
+    let buckets = exec.close_window_by_bucket_rows();
+    assert_eq!(buckets.len(), 2, "2 个 auction 桶");
+    // 行字段 layout：auction/price 数字槽 + channel 字符串槽。
+    let layout = buckets[0].measures[0][0]
+        .row_fields
+        .as_ref()
+        .expect("last 携带行字段")
+        .layout();
+    assert_eq!(layout.n_numeric(), 2, "auction/price 数字槽");
+    assert_eq!(layout.n_strings(), 1, "channel 字符串槽");
 }
