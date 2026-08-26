@@ -1061,6 +1061,10 @@ pub struct StatsExecutor {
     /// 行字段类型分派（2026-08-26 q18/q19 紧凑化）：列式路径首次 `process_batch`
     /// 从 batch schema 构建；行式路径（无静态类型）退化全 Other（不紧凑但正确）。
     row_field_layout: Option<std::sync::Arc<RowFieldLayout>>,
+    /// 待创建 redb spill store（M4）：路径 + 落盘上限。延迟到首次 `process_*`
+    /// （行字段 layout 解析后）创建——store 的 layout 必须与 executor 一致。
+    /// 窗口 reset 后保留（下一窗口沿用同路径, create 语义重建文件）。
+    spill_redb: Option<(std::path::PathBuf, Option<usize>)>,
 }
 
 impl StatsExecutor {
@@ -1161,6 +1165,7 @@ impl StatsExecutor {
             row_field_names,
             measure_field_idx,
             row_field_layout: None,
+            spill_redb: None,
         }
     }
 
@@ -1178,6 +1183,8 @@ impl StatsExecutor {
     where
         F: Fn(&HashMap<String, Value>, &str) -> Option<Value>,
     {
+        // 延迟创建 redb spill store（layout 已确定——行式 all_other 或列式缓存）。
+        self.ensure_spill_store();
         // where 结果缓存: 行间复用 buffer（无逐行分配）; 无 where 规则时保持空。
         let mut where_ok: Vec<bool> = Vec::with_capacity(self.unique_wheres.len());
         let has_row_measures = self
@@ -1496,7 +1503,47 @@ impl StatsExecutor {
     /// 注入状态外溢存储（M3; 窗口开始时调用; None = 关闭 spill）。
     /// `max_spill_bytes` = 落盘上限（None = 不限; 三层预算阶梯第二层）。
     pub fn set_spill(&mut self, store: Option<Box<dyn SpillStore + Send + Sync>>, max_spill_bytes: Option<usize>) {
+        self.spill_redb = None;
         self.window.set_spill(store, max_spill_bytes);
+    }
+
+    /// 便捷：redb spill（M4, `limits { spill = "redb" }`）——记录待创建配置,
+    /// **延迟到首次 `process_*`**（行字段 layout 解析后）创建 store：
+    /// store 的 layout 必须与 executor 一致（列式 from_schema / 行式 all_other）。
+    /// `max_spill_bytes` = 落盘上限（None = 不限）。
+    pub fn set_spill_redb(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        max_spill_bytes: Option<usize>,
+    ) {
+        self.spill_redb = Some((path.as_ref().to_path_buf(), max_spill_bytes));
+    }
+
+    /// 延迟创建 redb store（首次 process 时调用; layout 已解析）。
+    /// 创建失败 = 致命（panic——配置/磁盘错误, 绝不静默降级为拒收）。
+    fn ensure_spill_store(&mut self) {
+        let Some((path, max_spill_bytes)) = self.spill_redb.clone() else {
+            return;
+        };
+        if self.window.spill.is_some() {
+            return; // 已创建
+        }
+        let layout = match &self.row_field_layout {
+            Some(l) => std::sync::Arc::clone(l),
+            // 行式路径（无列式 schema）：按行字段子集 all_other（与
+            // `row_fields_layout_for_row` 同构; 生产恒有子集, 见其文档）。
+            None => {
+                let names: Vec<String> = self
+                    .row_field_names
+                    .clone()
+                    .map(|ns| ns.as_ref().clone())
+                    .unwrap_or_default();
+                std::sync::Arc::new(RowFieldLayout::all_other(&names))
+            }
+        };
+        let store = crate::match_engine::spill::RedbSpillStore::create(&path, layout)
+            .unwrap_or_else(|e| panic!("spill redb 创建失败(致命) {}: {e}", path.display()));
+        self.window.set_spill(Some(Box::new(store)), max_spill_bytes);
     }
 
     /// 提取本片已关闭窗口的**原始累加状态**（输入分区分片归并用）并重置窗口。
@@ -1575,6 +1622,10 @@ impl StatsExecutor {
         let Some(key_cols) = key_cols else {
             return false;
         };
+        // 延迟创建 redb spill store：先解析行字段 layout（列式 from_schema），
+        // 再建 store（layout 一致是读回正确性的前提）。幂等。
+        self.ensure_row_field_layout(batch);
+        self.ensure_spill_store();
         let n = batch.num_rows();
         // 行域（P2 分片）: `rows` = 本片拥有的行索引子集（绝对行号, 升序）。
         // 归并段（段 1d/段 2）改为**行域驱动**（count_domain/sum_domain/

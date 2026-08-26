@@ -11,8 +11,8 @@ use crate::plan::{
     AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, ConvWindowPlan, EachPlan,
     EntityPlan, ExceedAction, ExprPlan, JoinCondPlan, JoinKeyPlan, JoinPlan, KeyMapPlan, LetPlan,
     LimitsPlan, MatchPlan, PatternOriginPlan, RateSpec, RulePlan, ScorePlan, SeqPlan, SeqSkipPlan,
-    SeqStepPlan, SortKeyPlan, StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan,
-    StepPlan, WindowSpec, YieldField, YieldPlan,
+    SeqStepPlan, SortKeyPlan, SpillMode, StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan,
+    StatsPlan, StepPlan, WindowSpec, YieldField, YieldPlan,
 };
 use crate::schema::WindowSchema;
 use crate::yield_preset::expand_yield_args;
@@ -1329,6 +1329,8 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
     let mut max_instances = None;
     let mut max_throttle = None;
     let mut on_exceed = ExceedAction::Throttle; // default
+    let mut spill = None;
+    let mut max_spill_bytes = None;
 
     for item in &limits.items {
         match item.key.as_str() {
@@ -1349,6 +1351,15 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
                     _ => ExceedAction::Throttle,
                 };
             }
+            "spill" => {
+                spill = match item.value.as_str() {
+                    "redb" => Some(SpillMode::Redb),
+                    _ => None,
+                };
+            }
+            "max_spill_bytes" => {
+                max_spill_bytes = parse_byte_size(&item.value);
+            }
             _ => {}
         }
     }
@@ -1358,10 +1369,12 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
         max_instances,
         max_throttle,
         on_exceed,
+        spill,
+        max_spill_bytes,
     })
 }
 
-fn parse_byte_size(s: &str) -> Option<usize> {
+pub(crate) fn parse_byte_size(s: &str) -> Option<usize> {
     let s_upper = s.to_uppercase();
     if let Some(num_str) = s_upper.strip_suffix("GB") {
         num_str

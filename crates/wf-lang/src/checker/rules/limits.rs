@@ -2,9 +2,18 @@ use crate::ast::RuleDecl;
 
 use crate::checker::{CheckError, Severity};
 
-const VALID_LIMIT_KEYS: &[&str] = &["max_memory", "max_instances", "max_throttle", "on_exceed"];
+const VALID_LIMIT_KEYS: &[&str] = &[
+    "max_memory",
+    "max_instances",
+    "max_throttle",
+    "on_exceed",
+    "spill",
+    "max_spill_bytes",
+];
 
 const VALID_ON_EXCEED: &[&str] = &["throttle", "drop_oldest", "fail_rule"];
+
+const VALID_SPILL: &[&str] = &["redb"];
 
 pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckError>) {
     let limits = match &rule.limits {
@@ -49,6 +58,32 @@ pub fn check_limits(rule: &RuleDecl, rule_name: &str, errors: &mut Vec<CheckErro
                 });
             }
             "on_exceed" => {}
+            "spill" if !VALID_SPILL.contains(&item.value.as_str()) => {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "spill value `{}` invalid; valid values are: {}",
+                        item.value,
+                        VALID_SPILL.join(", ")
+                    ),
+                });
+            }
+            "spill" => {}
+            "max_spill_bytes" => {
+                if crate::compiler::parse_byte_size(&item.value).is_none() {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "max_spill_bytes value `{}` must be a byte size (e.g. \"8GB\")",
+                            item.value
+                        ),
+                    });
+                }
+            }
             "max_instances" => match item.value.parse::<usize>() {
                 Ok(0) | Err(_) => {
                     errors.push(CheckError {

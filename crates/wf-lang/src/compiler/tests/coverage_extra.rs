@@ -5,7 +5,7 @@
 use crate::ast::{Expr, FieldRef, PathSegment};
 use crate::compiler::{BindTracking, collect_bind_tracking, compile_wfl_after_semantic_checks};
 use crate::plan::{
-    ConvOpPlan, ExceedAction, JoinKeyPlan, RateSpec, SeqSkipPlan, StatsAggPlan,
+    ConvOpPlan, ExceedAction, JoinKeyPlan, RateSpec, SeqSkipPlan, SpillMode, StatsAggPlan,
     StatsOutputShapePlan, WindowSpec,
 };
 
@@ -265,6 +265,44 @@ rule r {
         })
     );
     assert_eq!(lp.on_exceed, ExceedAction::FailRule);
+}
+
+#[test]
+fn compile_limits_plan_spill_parsed() {
+    let src = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    limits {
+        max_memory = "1GB";
+        spill = "redb";
+        max_spill_bytes = "8GB";
+    }
+}
+"#;
+    let plans = compile_with(src, &[auth_events_window(), output_window()]);
+    let lp = plans[0].limits_plan.as_ref().expect("limits plan");
+    assert_eq!(lp.spill, Some(SpillMode::Redb));
+    assert_eq!(lp.max_spill_bytes, Some(8 * 1024 * 1024 * 1024));
+}
+
+#[test]
+fn compile_limits_plan_spill_off_by_default() {
+    let src = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    limits { max_memory = "1GB"; }
+}
+"#;
+    let plans = compile_with(src, &[auth_events_window(), output_window()]);
+    let lp = plans[0].limits_plan.as_ref().expect("limits plan");
+    assert_eq!(lp.spill, None);
+    assert_eq!(lp.max_spill_bytes, None);
 }
 
 #[test]

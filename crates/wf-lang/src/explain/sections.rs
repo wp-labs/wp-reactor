@@ -250,6 +250,12 @@ pub(super) fn explain_limits(lp: &LimitsPlan) -> String {
         ));
     }
     parts.push(format!("on_exceed={:?}", lp.on_exceed));
+    if let Some(spill) = &lp.spill {
+        parts.push(format!("spill={spill:?}"));
+        if let Some(b) = lp.max_spill_bytes {
+            parts.push(format!("max_spill_bytes={b}B"));
+        }
+    }
     parts.join(", ")
 }
 

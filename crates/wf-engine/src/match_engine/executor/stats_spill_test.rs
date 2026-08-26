@@ -396,3 +396,60 @@ fn spill_estimated_bytes_bounded_by_budget() {
     let closed = exec.close_window_by_bucket_rows();
     assert_eq!(closed.len(), 5000);
 }
+
+// ---------------------------------------------------------------------------
+// 6. M4 接线：set_spill_redb 延迟创建（layout 解析后建 store）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spill_redb_deferred_create_via_executor() {
+    let subset = Arc::new(HashSet::from(["price".to_string()]));
+    let plan = keyed_plan(
+        vec![field_key("b", "bidder")],
+        vec![last_measure("last_price", "price")],
+    );
+    let path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "wf_spill_m4_{}_{}.rb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    };
+
+    let mut exec = StatsExecutor::with_row_fields(plan, Some(subset));
+    exec.set_memory_limit("spill_test", Some(COUNT_ALLOWANCE as usize * 2));
+    exec.set_spill_redb(&path, None);
+    // 未处理任何数据前不建 store（延迟创建）
+    assert!(exec.window.spill.is_none(), "首次 process 前不创建 store");
+    assert!(!path.exists(), "首次 process 前不落文件");
+
+    // 首次 process（行式路径）→ 建 store（layout = all_other(子集)）
+    for k in 1..=6 {
+        exec.process_rows(&[bid_row(k, k as f64 * 10.0)], extract);
+    }
+    assert!(exec.window.spill.is_some(), "首次 process 后 store 已建");
+    assert!(path.exists(), "spill 文件已落盘");
+    assert_eq!(exec.window.over_limit_new_buckets(), 0, "spill 生效不拒收");
+    // 读回键 3 后 last 值正确（跨序列化往返）
+    exec.process_rows(&[bid_row(3, 333.0)], extract);
+
+    let closed = exec.close_window_by_bucket_rows();
+    assert_eq!(closed.len(), 6, "6 键全部输出");
+    let k3 = closed
+        .iter()
+        .find(|b| b.key == ScopeKey::Int(3))
+        .expect("键 3");
+    assert_eq!(k3.measures[0][0].measure_value, 333.0, "键3 读回后 last=333");
+    // close（reset_window → cleanup）→ 文件删除
+    assert!(!path.exists(), "close 后 redb 文件应删除");
+    // 下一窗口沿用同一路径（create 语义重建）——再 process 应重建 store
+    exec.set_spill_redb(&path, None);
+    exec.process_rows(&[bid_row(1, 1.0)], extract);
+    assert!(exec.window.spill.is_some(), "下一窗口重建 store");
+    assert!(path.exists());
+}

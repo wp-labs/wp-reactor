@@ -383,6 +383,19 @@ pub struct LimitsPlan {
     pub max_instances: Option<usize>,
     pub max_throttle: Option<RateSpec>,
     pub on_exceed: ExceedAction,
+    /// 状态外溢模式（M4，`docs/design/stats-state-spill-redb.md`）:
+    /// None = 关闭（默认，零开销）; Redb = 状态落盘、内存只留活跃子集。
+    pub spill: Option<SpillMode>,
+    /// 落盘字节上限（spill 启用时有效；None = 不限）。三层预算阶梯第二层。
+    pub max_spill_bytes: Option<usize>,
+}
+
+/// 状态外溢存储模式。
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangExePlan")]
+pub enum SpillMode {
+    /// redb 持久化（B+ 树单文件库）。
+    Redb,
 }
 
 /// What to do when a limit is exceeded.

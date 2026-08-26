@@ -238,6 +238,22 @@ pub(super) fn spawn_evictor_task(
 /// stats last/top（P4, Q18/Q19）的行字段提取子集: yield/entity 引用字段 ∪ 度量
 /// 字段。桶键字段不入行（close 已单独注入 scope_key）。`None` = 全部 schema 列
 /// （计划无 last/top 时无需提取——`None` 让执行器跳过整行提取）。
+/// stats spill 文件路径（M4）: `WF_SPILL_DIR`（默认 `spill`）下的
+/// `spill_{rule}_{pid}.rb`。窗口级生命周期：close 后 `cleanup` 删除；
+/// 进程异常退出残留由下次启动清理（设计 §8 时机④）。
+fn spill_file_path(rule_name: &str) -> PathBuf {
+    let dir = std::env::var("WF_SPILL_DIR").unwrap_or_else(|_| "spill".to_string());
+    let dir_path = Path::new(&dir);
+    if let Err(e) = std::fs::create_dir_all(dir_path) {
+        log::warn!("spill 目录创建失败 {}: {e}", dir_path.display());
+    }
+    let safe: String = rule_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    dir_path.join(format!("spill_{safe}_{}.rb", std::process::id()))
+}
+
 fn stats_row_fields(
     plan: &RulePlan,
     stats_plan: &wf_lang::plan::StatsPlan,
@@ -484,6 +500,16 @@ pub(super) fn spawn_rule_tasks(
                     .as_ref()
                     .and_then(|l| l.max_memory_bytes);
                 stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
+                // 状态外溢（M4, `docs/design/stats-state-spill-redb.md`）:
+                // `limits { spill = "redb" }` → redb 落盘、内存只留活跃子集。
+                // 仅**单实例**可用（分片组合暂不支持, 见设计 §10）——分片/输入分片
+                // 分支下配置了 spill 则告警并忽略。
+                let spill_cfg = rule.executor.plan().limits_plan.as_ref().and_then(|l| {
+                    l.spill.as_ref().map(|_| l.max_spill_bytes)
+                });
+                if let Some(max_spill_bytes) = spill_cfg {
+                    stats.set_spill_redb(spill_file_path(&rule.executor.plan().name), max_spill_bytes);
+                }
                 let field_keys: Vec<FieldRef> = stats
                     .plan
                     .keys
@@ -537,6 +563,12 @@ pub(super) fn spawn_rule_tasks(
                                 row_fields.clone(),
                             );
                         shard_stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
+                        if spill_cfg.is_some() {
+                            log::warn!(
+                                "stats spill 与分片组合暂不支持（规则 {}）——本片忽略 spill 配置",
+                                rule.executor.plan().name
+                            );
+                        }
                         let task_config = StatsTaskConfig {
                             stats: shard_stats,
                             executor: rule.executor.clone(),
@@ -589,6 +621,12 @@ pub(super) fn spawn_rule_tasks(
                                 row_fields.clone(),
                             );
                         shard_stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
+                        if spill_cfg.is_some() {
+                            log::warn!(
+                                "stats spill 与输入分片组合暂不支持（规则 {}）——本片忽略 spill 配置",
+                                rule.executor.plan().name
+                            );
+                        }
                         let task_config = StatsTaskConfig {
                             stats: shard_stats,
                             executor: rule.executor.clone(),
