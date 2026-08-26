@@ -443,3 +443,55 @@ over 同时调到 10m，窗口保留应显著缩小，RSS 应随之下落。
 2. **sink 通道**：blackhole 攒批限速（batch_size=1024/1s）→ 积压 743 批；
    blackhole 本可立即丢，调小 batch_size/超时或并行消费者，预计省 ~1G。
 3. 消融 gate 为临时手段，优化完成后撤除。
+
+---
+
+## 11. 无拷贝批式优化无效 + footprint 定案（2026-08-26）——内存 = 流水线在途积压
+
+### 实验 1：moved 无拷贝批式（按 §10 方向 1 实现）
+实现 `commit_each_rows_batch_moved`（owned Vec move-extend 进列，零二次拷贝）
+并接入 q13b 列式 join 路径（逐行 commit → 段末收集 + moved commit），新增
+字节等价守护测试。结果：
+| 指标 | 逐行（基线） | moved 批式 |
+|---|---|---|
+| q13b_join_bench（CPU） | 382.6 ns/row | 384.7 ns/row（持平） |
+| 30M full ΔRSS | 10.5G | 10.3G（无效） |
+
+**无效原因**：列装载的 6.1G 不是 push 方式（逐行 vs 块级），而是**值进列后的
+总量**（30M 行 × 12 列 ≈ 280B/行 = 8.4GB）——moved 只是改了 push 的组织方式，
+总量不变 → 内存不变。已回退（无收益的复杂度）。
+
+### 实验 2：footprint 决定性证据（30M 跑批 + 停止注入观察）
+```
+08:51:09（跑批中）  RSS=13.2GB  footprint=13GB   ← dirty 真持有
+08:51:10（停止注入）RSS=13.7GB  footprint=4.4GB  ← 1 秒内消化完
+```
+- 跑批期间 **dirty（物理真持有）峰值 13G**，不是段区水位/OS 伪影；
+- 停止注入后 1s 内 dirty 降到 4.4G——**13G 是流水线在途积压**（注入
+  rate=3M/s > 引擎消化速率 → 在途堆积），消化完即释放。
+- RSS 保持 13.7G（页表保留），footprint 骤降（页已释放）——RSS 是峰值
+  水位代理，dirty 才是真持有。
+
+### 机制链（完整闭环）
+1. 二分：alert 构建段 9.7G（列装载 6.1G + 3.6G）
+2. moved 无效 → 与 push 方式无关，与**分配总量**（∝ 行数 × 每行输出列值）有关
+3. footprint → **总量即真实在途**：引擎每行处理成本（q13b join 382ns，其中
+   fill 96% CPU）决定消化速率 → 消化 < 注入 → 在途积压 → dirty 高
+4. ⇒ **降内存 = 降每行处理成本（fill CPU）**：积压降 → 在途降 → dirty 降。
+   性能与内存同源，治本双赢。
+
+### 附带发现
+- `warp-fusion/crates/wfusion/src/main.rs` 的 mimalloc `#[global_allocator]`
+  仍被注释（临时诊断遗留，当前跑系统 malloc）——`alloc.peak_rss` 经
+  `mi_process_info` 读进程级 rss 仍有效，commit 系 0（无分配经 mimalloc）。
+- fp 探针（bench 期间 `footprint <pid>` 采样）是区分「真持有 vs 水位」的
+  现成手段，已记入可复用资产。
+
+### 下一步（真正方向）
+- **q13b fill CPU 优化（列式直写）**：stage 100ns + commit 81ns（q1 口径，
+  fill 占列式路径 96%）→ 输入已是 RecordBatch，字段可**列到列直写**（跳过
+  Value/coerce/export 中转）、常量列（alert_type/request_count）免每行
+  cell、`fill_row_gaps` 免扫（字段全齐路径）。目标 fill 96% → ~40%，
+  消化速率升 → 在途积压降 → 30M dirty 13G → 预计 ~8G。
+- 每步用 `cargo test --release each_bench / q13b_join_bench` 测 CPU，
+  `MEMORY=1 diag q13 30m` + fp 探针测内存，数据驱动。
