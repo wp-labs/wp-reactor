@@ -353,6 +353,37 @@ rule q18_last_bid_stats {
 4. **剩余成本 = close 读回反序列化**（8.8M 键 × 分配, EPS 1.01M 中 close 占
    大头）——下一步可优化反序列化分配（buffer 复用）
 
+## 18. M5-4 + sink drain 修复实测（2026-08-27, q18 100M, 256MB/片）
+
+| 配置 | EPS | RSS_peak | EMIT | drain_dropped | 完成 |
+|---|---|---|---|---|---|
+| 无 spill（100M 基线） | 12.6-15.9M | 35-40GB | ≈2935 万 | — | ✅ |
+| M5-3 spill 100M（60s join 超时） | — | 21.4GB | **0**（close 被 abort） | — | ❌ |
+| M5-4（GROUP_JOIN_TIMEOUT 300s, sink 30s） | 257K | 22.4GB | 2937 万（引擎侧） | **2534 万（98.6% 丢）** | ⚠️ 丢数据 |
+| **M5-4 + SINK_DRAIN_BUDGET 300s** | 144K | **20.6GB** | **29,370,378** | **0** | ✅ |
+
+**修复内容**：
+1. `GROUP_JOIN_TIMEOUT` 60s→300s（M5-4）——close 流式 drain 分钟级, 60s 会在
+   flush 完成前 abort rules/alert 组 → EMIT 0（§17 已见 30M close>60s 超时前兆）
+2. `SINK_DRAIN_BUDGET` 30s→300s（对齐 GROUP_JOIN_TIMEOUT, 直接引用常量防漂移）——
+   sink consumer 在 rules flush 投递完之前放弃排空 → 千万级 alert 在 shutdown 时
+   被 drop（`drain_dropped_records_total` 2534 万 ≈ 引擎 EMIT 的 98.6%）。300s 后
+   rules 结束 flush 并 drop sender → 通道关闭 → consumer 优雅退出, 零丢弃
+
+**关键时序（100M 实测, UTC）**：SIGTERM → rules close flush 145s（2940 万 alert
+流式产出, aborted=0）→ rules 结束瞬间 alert 组排空完毕（10ms 后优雅退出）——
+预算不再是瓶颈, 全链无 abort 无 drop。
+
+**结论**：
+1. **内存有界达成**：RSS 20.6GB（vs 无 spill 35-40GB; M5-2 挂死 43GB）
+2. **正确性达成**：EMIT 29,370,378 ≈ 预期去重基数 2935 万, drain_dropped=0, [clean]
+3. **EPS 144K 由 close 段主导**（2940 万 alert 构建+读回+排空 ≈ 695s 墙时）——
+   这是 q18 语义固有的输出量大所致（不是 spill 路径回归）; 后续优化点:
+   close 读回反序列化 buffer 复用（§17 结论 4）+ alert 构建段分配降 churn
+4. **时间预算链完整性**：sink drain ≥ rules flush（GROUP_JOIN_TIMEOUT）≥ bench
+   kill 宽限——三者必须同步调大, 否则各自成为丢数据的截断点（本轮教训: 只改
+   GROUP_JOIN_TIMEOUT 不改 sink budget, 丢 98.6% 输出）
+
 ## 14. 风险与缓解
 
 | 风险 | 缓解 |

@@ -20,12 +20,16 @@ pub const SINK_CHANNEL_CAPACITY: usize = 2048;
 /// Max wall time the sink consumers may keep flushing a buffered alert
 /// backlog after cancel before dropping the rest.
 ///
-/// 30s（原 1s）: stats 执行器的 close flush 在 shutdown 时构建百万级 alert
-/// （q18 10M ≈ 1.8M 条 ~3s; q19 30M ≈ 8M 条 ~13s）——若 budget 过短, sink
-/// consumer 在 stats flush 投递前退出（drop rx）→ 产出被丢（10M+30m 窗
-/// EMIT=0 根因）。30s 覆盖 stats flush 构建 + 投递 + sink 消费。正常 shutdown
-/// （无 flush 构建）不受影响: 通道 closed / 无数据时 consumer 立即退出。
-const SINK_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+/// 对齐 [`crate::lifecycle::types::GROUP_JOIN_TIMEOUT`]（300s）: stats 执行器
+/// 的 close flush 在 shutdown 时流式构建千万级 alert（q18 100M ≈ 2940 万条,
+/// 流式 drain 分钟级; q19 30M ≈ 8M 条 ~13s）——若 budget 短于 rules flush 时长,
+/// sink consumer 在 stats flush 投递完之前放弃排空（drop rx）→ 产出被丢
+/// （q18 100M spill 实测 drain_dropped_records_total≈2897 万 ≈ 引擎 EMIT 的
+/// 98.6%）。300s 覆盖 stats flush 构建 + 投递 + sink 消费; rules 在
+/// GROUP_JOIN_TIMEOUT 内结束 flush 并 drop sender → 通道关闭 → consumer
+/// 优雅退出（None 分支, 零丢弃）。正常 shutdown（无 flush 构建）不受影响:
+/// 通道 closed / 无数据时 consumer 立即退出。
+const SINK_DRAIN_BUDGET: Duration = crate::lifecycle::types::GROUP_JOIN_TIMEOUT;
 
 /// Resolved delivery fanout: `yield_target → sink senders`.
 ///

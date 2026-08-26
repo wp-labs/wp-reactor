@@ -25,7 +25,7 @@ use crate::error::{RuntimeReason, RuntimeResult};
 /// （q18 100M 实测 EMIT 0）。300s 覆盖 stats flush 构建 + sink 消费（正常
 /// 路径; 卡死任务仍会被 abort 兜底）。bench kill 宽限须同步调大
 /// （SIGTERM 后 ≥ 300s 再 SIGKILL, 见 bench.sh kill_daemon）。
-const GROUP_JOIN_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const GROUP_JOIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Max time to wait for an aborted task to actually unwind. `abort()` only
 /// cancels at the task's next yield point — a task chewing through a large
