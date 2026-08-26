@@ -110,6 +110,8 @@ fn throttle_limits(count: u64, on_exceed: ExceedAction) -> LimitsPlan {
             per: Duration::from_secs(60),
         }),
         on_exceed,
+        spill: None,
+        max_spill_bytes: None,
     }
 }
 

@@ -854,6 +854,8 @@ fn rate_limit_close_raw_conv_mode_skips_inline_throttle() {
             per: Duration::from_secs(60),
         }),
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm = CepStateMachine::with_limits("r".into(), plan, None, Some(limits));
     sm.set_raw_conv_mode();
@@ -889,6 +891,8 @@ fn rate_limit_close_fail_rule_latches_and_rejects() {
             per: Duration::from_secs(60),
         }),
         on_exceed: ExceedAction::FailRule,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm = CepStateMachine::with_limits("r".into(), plan, None, Some(limits));
     let e = event(vec![("sip", str_val("10.0.0.1"))]);

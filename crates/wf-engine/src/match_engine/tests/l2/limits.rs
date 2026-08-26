@@ -16,6 +16,8 @@ fn limits_max_instances_throttle() {
         max_instances: Some(2),
         max_throttle: None,
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm = CepStateMachine::with_limits("rule_lim".to_string(), plan, None, Some(limits));
 
@@ -51,6 +53,8 @@ fn limits_max_instances_drop_oldest() {
         max_instances: Some(2),
         max_throttle: None,
         on_exceed: ExceedAction::DropOldest,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm = CepStateMachine::with_limits("rule_lim".to_string(), plan, None, Some(limits));
 
@@ -91,6 +95,8 @@ fn limits_max_memory_bytes_throttle() {
         max_instances: None,
         max_throttle: None,
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm = CepStateMachine::with_limits("rule_state".to_string(), plan, None, Some(limits));
 
@@ -128,6 +134,8 @@ fn limits_max_memory_bytes_blocks_first_instance() {
         max_instances: None,
         max_throttle: None,
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm = CepStateMachine::with_limits("rule_tiny".to_string(), plan, None, Some(limits));
 
@@ -151,6 +159,8 @@ fn limits_max_memory_bytes_counts_tracked_source_alias_state() {
         max_instances: None,
         max_throttle: None,
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm =
         CepStateMachine::with_limits("rule_tracked_mem".to_string(), plan, None, Some(limits));
@@ -182,6 +192,8 @@ fn limits_max_throttle_throttle() {
             per: Duration::from_secs(60),
         }),
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm = CepStateMachine::with_limits("rule_rate".to_string(), plan, None, Some(limits));
 
@@ -222,6 +234,8 @@ fn limits_max_throttle_resets_window() {
             per: Duration::from_secs(10),
         }),
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm =
         CepStateMachine::with_limits("rule_rate_reset".to_string(), plan, None, Some(limits));
@@ -271,6 +285,8 @@ fn limits_max_throttle_close_path() {
             per: Duration::from_secs(60),
         }),
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm =
         CepStateMachine::with_limits("rule_close_rate".to_string(), plan, None, Some(limits));
@@ -318,6 +334,8 @@ fn limits_max_memory_bytes_drop_oldest_evicts_enough() {
         max_instances: None,
         max_throttle: None,
         on_exceed: ExceedAction::DropOldest,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm =
         CepStateMachine::with_limits("rule_drop_multi".to_string(), plan, None, Some(limits));
@@ -364,6 +382,8 @@ fn limits_max_memory_bytes_drop_oldest_no_instances() {
         max_instances: None,
         max_throttle: None,
         on_exceed: ExceedAction::DropOldest,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm =
         CepStateMachine::with_limits("rule_drop_empty".to_string(), plan, None, Some(limits));
@@ -400,6 +420,8 @@ fn limits_scan_expired_rate_limit_deterministic() {
             per: Duration::from_secs(60),
         }),
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm =
         CepStateMachine::with_limits("rule_scan_rate".to_string(), plan, None, Some(limits));
@@ -453,6 +475,8 @@ fn limits_max_memory_bytes_drop_oldest_evicts_current_key() {
         max_instances: None,
         max_throttle: None,
         on_exceed: ExceedAction::DropOldest,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm =
         CepStateMachine::with_limits("rule_drop_current".to_string(), plan, None, Some(limits));
@@ -501,6 +525,8 @@ fn recalibrate_memory_reanchors_after_state_growth() {
         max_instances: None,
         max_throttle: None,
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm = CepStateMachine::with_limits("rule_recal".to_string(), plan, None, Some(limits));
 
@@ -541,6 +567,8 @@ fn limits_close_all_rate_limit_deterministic() {
             per: Duration::from_secs(60),
         }),
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let mut sm =
         CepStateMachine::with_limits("rule_close_all_det".to_string(), plan, None, Some(limits));
@@ -594,6 +622,8 @@ fn shared_max_instances_capped_collectively_across_shards() {
         max_instances: Some(2),
         max_throttle: None,
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let shared = SharedLimits::new();
     let mut sm1 = CepStateMachine::with_limits_shared(
@@ -646,6 +676,8 @@ fn shared_throttle_capped_collectively_across_shards() {
             per: Duration::from_secs(60),
         }),
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let shared = SharedLimits::new();
     let mut sm1 = CepStateMachine::with_limits_shared(
@@ -694,6 +726,8 @@ fn shared_fail_rule_latches_all_shards() {
         max_instances: Some(1),
         max_throttle: None,
         on_exceed: ExceedAction::FailRule,
+        spill: None,
+        max_spill_bytes: None,
     };
     let shared = SharedLimits::new();
     let mut sm1 = CepStateMachine::with_limits_shared(
@@ -741,6 +775,8 @@ fn shared_max_instances_drop_oldest_evicts_local_and_rereserves() {
         max_instances: Some(1),
         max_throttle: None,
         on_exceed: ExceedAction::DropOldest,
+        spill: None,
+        max_spill_bytes: None,
     };
     let shared = SharedLimits::new();
     let mut sm = CepStateMachine::with_limits_shared(
@@ -777,6 +813,8 @@ fn shared_max_instances_drop_oldest_rejects_when_no_local_to_evict() {
         max_instances: Some(1),
         max_throttle: None,
         on_exceed: ExceedAction::DropOldest,
+        spill: None,
+        max_spill_bytes: None,
     };
     let shared = SharedLimits::new();
     let mut sm1 = CepStateMachine::with_limits_shared(
@@ -819,6 +857,8 @@ fn shared_max_instances_released_on_close_all() {
         max_instances: Some(3),
         max_throttle: None,
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let shared = SharedLimits::new();
     let mut sm = CepStateMachine::with_limits_shared(
@@ -857,6 +897,8 @@ fn shared_slot_released_when_memory_throttle_rejects_new_key() {
         max_instances: Some(10),
         max_throttle: None,
         on_exceed: ExceedAction::Throttle,
+        spill: None,
+        max_spill_bytes: None,
     };
     let shared = SharedLimits::new();
     let mut sm = CepStateMachine::with_limits_shared(
@@ -916,6 +958,8 @@ fn shared_slot_released_when_memory_fail_rule_rejects_new_key() {
         max_instances: Some(10),
         max_throttle: None,
         on_exceed: ExceedAction::FailRule,
+        spill: None,
+        max_spill_bytes: None,
     };
     let shared = SharedLimits::new();
     let mut sm = CepStateMachine::with_limits_shared(
@@ -970,6 +1014,8 @@ fn shared_slot_inherited_when_memory_drop_oldest_recreates_current() {
         max_instances: Some(10),
         max_throttle: None,
         on_exceed: ExceedAction::DropOldest,
+        spill: None,
+        max_spill_bytes: None,
     };
     let shared = SharedLimits::new();
     let mut sm = CepStateMachine::with_limits_shared(
