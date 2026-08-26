@@ -1556,3 +1556,13 @@ events）；存在 Single/Sharded 订阅 → `take_events` + `broadcast_with_bat
 - RSS 26GB ≠ 泄漏：footprint 显示 23GB reclaimable，dirty 仅 3.4GB。RSS 是峰值
   分配水位的代理指标。
 - 勿回退 q13a 分片（30M 已达标，回退是倒退）；100M 先看 lag 时间曲线再动手。
+
+## 2026-08-26 over 调小实验：`bid_events/bid_mod → 10m`——无效，已回退
+
+用户假设内存随数据量上升 ∝ over 保留量，要求把两窗都改 10m 实测。
+结果（30M，per-row churn 消减后）：**EPS 5.40M 不变、RSS 14,282MB vs 基线
+14.3GB（几乎不动）**；窗口预算仅省 3.68G→3.29G。over 调小对 RSS 杠杆率
+≈0——保留量由消费滞后（ack floor 门控）决定，第三次独立验证（1h/30m/10m/1m
+四档结论一致）。已回退 wfs 到 over=30m/1h；未归因 ~10G 的追查方向不变
+（alert 通道/构建器在途、规则任务工作态、rule channel）。完整记录在
+`issues/q13-memory-peak-scales-with-volume.md` §8。

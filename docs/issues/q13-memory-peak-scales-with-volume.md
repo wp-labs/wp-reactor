@@ -314,3 +314,50 @@ bid_mod 批，**存活占用 6.03MB**（差额 = null bitmap + offsets + builder
    分配器、小对象、alert 基数、per-row 分配足迹。剩余候选：alert 通道/构建器
    在途（无预算指标）、规则任务每批工作态、rule channel（Arc 重叠需小心）。
 3. 目标不变：100M 峰值 < 10GB。
+
+---
+
+## 8. over 调小实验（2026-08-26）——`over 30m/1h → 10m` 对内存**基本无效**，已回退
+
+### 动机
+用户假设「内存随数据量上升 ∝ over 保留量」→ 若把 `bid_events`/`bid_mod`
+over 同时调到 10m，窗口保留应显著缩小，RSS 应随之下落。
+
+### 改动（仅 nexmark_pk wfs，未提交，后已回退）
+```diff
+- bid_events  over = 30m
++ bid_events  over = 10m
+- bid_mod     over = 1h
++ bid_mod     over = 10m
+```
+
+### 实测（哨兵 EPS，同机同帧，30M，per-row churn 消减 fcb4630 之后）
+| 配置 | EPS | RSS_peak | bid_events | bid_mod | 窗口合计 |
+|---|---|---|---|---|---|
+| over=30m/1h（基线） | ~5.4M | ~14.3GB | 1.31G* | — | 3.68GB |
+| **over=10m/10m** | **5.40M** | **14,282MB** | 1.31G | **1.19G（lag 327）** | **3.29GB** |
+
+*10M 档对照：over=10m 下 10M EPS=5.18M / RSS=6,382MB（与 30M 的 14.3GB 呈次线性）。
+
+### 结论（测量定案）
+- **EPS 不变**（5.4M）：over 不是性能参数。
+- **窗口预算只省 ~0.4GB**（3.68→3.29G），且 **RSS 只降 ~0.8GB**（14.3→13.9GB）
+  ——窗口只解释 RSS 的 3.3/14.3 = 23%，调 over 对 RSS 的杠杆率不足 1:1 之外
+  的总量级也小（省 0.4G 窗口，RSS 却只动 0.8G）。
+- **未归因 ~10G 与 over 无关**：over=10m 后未归因部分几乎原样保留，再次确认
+  「保留量由消费滞后（ack floor 门控驱逐）决定，不由 over 决定」。
+- **与历史实验自洽**：§4 中 `bid_mod over 1h→1m` 同样无效（bid_mod 峰值
+  1.69→2.03GB、RSS 13.8→13.5GB）——三次不同 over（1h/30m/10m/1m）结论一致：
+  **over 不是内存杠杆**。
+
+### 决策
+- **回退 wfs 到 over=30m/1h**（nexmark_pk，已还原）：10m 无内存收益、EPS 不变，
+  且 30m 是与 q4/q9 deferred join 一起验证过的保守配置，不引入无谓差异。
+- **未归因 ~10G 的下一步不变**：继续 §7 剩余候选（alert 通道/构建器在途、
+  规则任务工作态、rule channel），用探针/直方图差分定位，而不是再调 over。
+
+### Pitfalls（本次新增）
+- **over 调小永远不是内存修复**：驱逐门控在消费侧（ack floor），不在时间侧；
+  同一结论已被 4 个 over 值（1h/30m/10m/1m）重复验证，勿再走。
+- 改共享 wfs 会影响 q4/q9（bid_events 是它们的 deferred join 目标窗）：
+  实验后必须还原，避免用 q13 的实验配置污染其他查询。
