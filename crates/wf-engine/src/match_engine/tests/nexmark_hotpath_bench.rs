@@ -23,6 +23,9 @@
 //!   q20_each_snapshot_join_where: on each + snapshot join + where 过滤（Q20）
 //!   q21_string_bind_filter      : bind filter channel_id != "" 字符串比较（Q21）
 //!   q22_each_split              : let split(url) + mvindex + concat 字符串投影（Q22）
+//!   q19_close_output_chain      : Q19 close 输出链分解（2026-08-25 采样定位的可压点
+//!                                 数据度量——逐条目 CloseOutput 结构开销 / fmt detail /
+//!                                 列式 close 全链基线，见 `q19_close_output_chain`）
 //!
 //! 数据域对齐（NEXMark 官方）：bidder ≈ 最近 1000 人、auction ≈ 最近 100 个、
 //! 价格对数均匀 ∈ [100, 1e8)；事件时间步长 = 30m 数据 / 27.6M bid ≈ 65.2µs/事件。
@@ -51,7 +54,7 @@ use crate::match_engine::match_engine::{
 };
 use crate::match_engine::{JoinRow, RuleExecutor, apply_conv};
 
-use super::helpers::{event, num, simple_rule_plan, str_val};
+use super::helpers::{event, num, simple_plan, simple_rule_plan, str_val};
 
 // ---------------------------------------------------------------------------
 // 常量与数据生成（确定性 LCG，失败可复现）
@@ -1901,6 +1904,7 @@ fn q21_string_bind_filter() {
 #[test]
 #[ignore = "release-only benchmark: cargo test --release -p wf-engine nexmark_hotpath_bench -- --ignored --nocapture"]
 fn q22_each_split() {
+    // 行式（既有）：逐事件解释（let 逐行 apply_lets + split/mvindex/concat）。
     let events = bid_events(N);
     let exec = RuleExecutor::new(q22_rule());
     let t0 = Instant::now();
@@ -1909,5 +1913,266 @@ fn q22_each_split() {
         let _ = std::hint::black_box(exec.execute_each(ev, ts));
     }
     let q22_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
-    report("q22 each+split", q22_ns, q22_ns);
+    report("q22 each+split 行式", q22_ns, q22_ns);
+
+    // 列式（层 2，2026-08-25）：let 内联 + SplitIndex/Concat 融合——同一规则
+    // 走 each 列式批路径（内联 `let parts = split(...)`），同批对拍 + 测加速比。
+    use crate::alert::AlertColumnBuilder;
+    use crate::match_engine::event_bridge::{ColumnarEvent, materialize_rows};
+    use arrow::array::StringArray;
+
+    let schema = Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("url", DataType::Utf8, false),
+    ]);
+    let auctions: Vec<i64> = (0..N).map(|i| AUCTION_BASE + i as i64).collect();
+    let urls: Vec<String> = (0..N).map(|_| nexmark_url().to_string()).collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int64Array::from(auctions)),
+            Arc::new(StringArray::from(urls)),
+        ],
+    )
+    .expect("batch");
+    let exec_col = RuleExecutor::new_with_yield_field_types(
+        q22_rule(),
+        HashMap::from([
+            ("id".into(), FieldType::Base(BaseType::Digit)),
+            ("detail".into(), FieldType::Base(BaseType::Chars)),
+        ]),
+    );
+    assert!(
+        exec_col.each_plan_columnar_safe(),
+        "q22 let+split+mvindex+concat 必须过 each 列式门控（层 2）"
+    );
+
+    let col_events: Vec<ColumnarEvent> = (0..N).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_rows: Vec<(&ColumnarEvent, i64)> = col_events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NOW + i as i64 * EVENT_STEP_NS))
+        .collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let t0 = Instant::now();
+    let stats_col =
+        exec_col.execute_each_direct_batch_columnar(&col_rows, NOW, &mut b_col, &mut app_col);
+    let col_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    assert_eq!(stats_col.appended, N, "列式输出行数 = N");
+    report("q22 each+split 列式", col_ns, q22_ns);
+
+    // 行式批路径同批对拍（层 2 防回归：内联展开与 apply_lets 逐位一致）。
+    let all: Vec<u32> = (0..N as u32).collect();
+    let row_events = materialize_rows(&batch, &all);
+    let rows: Vec<(&Event, i64)> = row_events
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| (ev, NOW + i as i64 * EVENT_STEP_NS))
+        .collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let stats_row =
+        exec_col.execute_each_direct_batch(&rows, &NoLookup, &[], NOW, &mut b_row, &mut app_row);
+    assert_eq!(stats_row.appended, N, "行式输出行数 = N");
+    assert_eq!(b_col.finish().len(), b_row.finish().len(), "列式/行式输出行数一致");
+}
+
+// ---------------------------------------------------------------------------
+// Bench 13：Q19 close 输出链分解（2026-08-25 daemon 采样定位可压点的数据度量）
+// ---------------------------------------------------------------------------
+//
+// 背景：q19 30m diag 墙表主墙 = full 档（+172 ns/evt，61.5%），daemon `sample`
+// 定位热点链为 close_current_window(49%) → execute_close_direct_batch_columnar
+// (39%)，其内部分项：build_eval_context 10%、commit_close_rows_batch 8% 、
+// memmove 8% + malloc 7%（落列/字符串分配）、fmt detail 求值链 5%、逐条目
+// CloseOutput 结构构建+析构 ≈13%（build_stats_close_output 5.2 + CloseOutput
+// drop 4.2 + Value drop 3.9）。本基准把这三处可压点固化为可复现基线：
+//
+//   entry_build_drop : 逐条目 CloseOutput 构建 + drop（复刻 build_stats_close_output
+//                      的分配形状：scope_key + StepData + field_values 3 键注入）
+//                       —— 结构开销（采样 ≈13% 的点）
+//   chain_full       : 列式 close 全链 execute_close_direct_batch_columnar（q19 形状
+//                      top-10 条目，detail = fmt("{} {}", bidder, price)）——现状基线
+//   chain_no_fmt     : 同上但 detail 为常量 → fmt 增量 = full − no_fmt
+//   fmt_blackbox     : 黑盒 format!（字符串分配下界参考）
+//
+// 对照口径：生产 30M 实测 full 档输出链 ≈ 573 ns/alert（172 ns/evt × 30M ÷ 9M
+// alert/档）。本基准 N = 50 万条目（≈ 5 万桶 × top-10，对齐 10m 窗桶量级）。
+
+/// q19 列式 close 的 RulePlan：常量 score + entity(Field b.auction) + yield
+/// id=Field(b.auction) / alert_type=Lit / detail=fmt 或 Lit / request_count=Number
+/// —— 通过 `close_plan_columnar_safe` 门控（与 stats_task 生产路径同形状）。
+fn q19_close_columnar_rule(fmt_detail: bool) -> RulePlan {
+    let mut plan = simple_rule_plan(
+        "q19_auction_top10_stats",
+        simple_plan(vec![], vec![]),
+        Expr::Number(10.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.binds[0].window = "bid_events".into();
+    plan.yield_plan.target = "nexmark_alerts".into();
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        },
+        YieldField {
+            name: "alert_type".into(),
+            value: Expr::StringLit("q19_top10_stats".into()),
+        },
+        YieldField {
+            name: "detail".into(),
+            value: if fmt_detail {
+                Expr::FuncCall {
+                    qualifier: None,
+                    name: "fmt".into(),
+                    args: vec![
+                        Expr::StringLit("{} {}".into()),
+                        b_field("bidder"),
+                        b_field("price"),
+                    ],
+                }
+            } else {
+                Expr::StringLit("q19_top10_stats".into())
+            },
+        },
+        YieldField {
+            name: "request_count".into(),
+            value: Expr::Number(1.0),
+        },
+    ];
+    plan
+}
+
+/// q19 top-10 条目 CloseOutput（复刻 stats_task::build_stats_close_output 的
+/// 分配形状：scope_key=[auction]、close_step_data=[top_price + field_values
+/// {auction,bidder,price}]——键字段 + row_fields 列数组展开注入）。
+fn q19_close_entry(
+    rule: &str,
+    auction: i64,
+    bidder: i64,
+    price: i64,
+    window_start: i64,
+    window_end: i64,
+) -> CloseOutput {
+    let mut field_values = EngineHashMap::default();
+    field_values.insert("auction".into(), vec![Value::Number(auction as f64)]);
+    field_values.insert("bidder".into(), vec![Value::Number(bidder as f64)]);
+    field_values.insert("price".into(), vec![Value::Number(price as f64)]);
+    CloseOutput {
+        rule_name: rule.to_string(),
+        scope_key: vec![Value::Number(auction as f64)],
+        close_reason: CloseReason::Timeout,
+        event_ok: true,
+        close_ok: true,
+        close_mode: CloseMode::And,
+        event_emitted: false,
+        event_step_data: vec![],
+        close_step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: Some("top_price".into()),
+            measure_value: price as f64,
+            event_first_time_nanos: Some(window_start),
+            event_last_time_nanos: Some(window_end),
+            collected_values: vec![],
+            field_values,
+        }],
+        bind_data: vec![],
+        watermark_nanos: window_end,
+        machine_id: String::new(),
+        event_first_time_nanos: window_start,
+        event_last_time_nanos: window_end,
+        window_start_time_nanos: window_start,
+        window_end_time_nanos: window_end,
+        last_event_nanos: window_end,
+    }
+}
+
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine nexmark_hotpath_bench -- --ignored --nocapture"]
+fn q19_close_output_chain() {
+    use crate::alert::AlertColumnBuilder;
+
+    const W_START: i64 = 1_750_000_000_000_000_000;
+    const W_END: i64 = W_START + 600_000_000_000; // 10m 窗
+    let rule = "q19_auction_top10_stats";
+    let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+    // 桶序：每 10 条目同 auction（top-10 rank 形状）；bidder 近 1000 人域、
+    // price 对数均匀（与 bid_events 同数据域）。
+    let auctions: Vec<i64> = (0..N).map(|i| AUCTION_BASE + (i / 10) as i64).collect();
+    let bidders: Vec<i64> = (0..N)
+        .map(|_| BIDDER_BASE + (next_u64(&mut rng) % BIDDER_DOMAIN) as i64)
+        .collect();
+    let prices: Vec<i64> = (0..N).map(|_| next_price(&mut rng) as i64).collect();
+
+    // ① 逐条目 CloseOutput 构建 + drop（结构分配/析构，采样 ≈13% 的点）
+    let t0 = Instant::now();
+    let mut guard = 0u64;
+    for i in 0..N {
+        let co = q19_close_entry(rule, auctions[i], bidders[i], prices[i], W_START, W_END);
+        guard = guard.wrapping_add(std::hint::black_box(co).scope_key.len() as u64);
+    }
+    let entry_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    std::hint::black_box(guard);
+    report("q19 entry 构建+drop", entry_ns, entry_ns);
+
+    // 预构造条目（不计时，供 close 链复用）
+    let closes: Vec<CloseOutput> = (0..N)
+        .map(|i| q19_close_entry(rule, auctions[i], bidders[i], prices[i], W_START, W_END))
+        .collect();
+
+    // ② 列式 close 全链（现状基线，detail = fmt）——含 yield 求值 / fmt / wfx_id / 落列
+    let exec_full = RuleExecutor::new(q19_close_columnar_rule(true));
+    assert!(exec_full.close_plan_columnar_safe(), "q19 形状必须过列式 close 门控");
+    let mut builder = AlertColumnBuilder::new(Arc::from("nexmark_alerts"));
+    let t0 = Instant::now();
+    let stats = exec_full.execute_close_direct_batch_columnar(&closes, &mut builder, W_END);
+    let full_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    assert_eq!(stats.appended, N, "输出行数 = 条目数");
+    report("q19 close链 full(fmt)", full_ns, full_ns);
+
+    // ③ 同上但 detail 常量 → fmt 增量 = full − no_fmt
+    let exec_nofmt = RuleExecutor::new(q19_close_columnar_rule(false));
+    assert!(exec_nofmt.close_plan_columnar_safe());
+    let mut builder2 = AlertColumnBuilder::new(Arc::from("nexmark_alerts"));
+    let t0 = Instant::now();
+    let stats2 = exec_nofmt.execute_close_direct_batch_columnar(&closes, &mut builder2, W_END);
+    let nofmt_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    assert_eq!(stats2.appended, N);
+    report("q19 close链 no-fmt", nofmt_ns, full_ns);
+
+    // ④ 黑盒 format!（fmt 字符串分配下界参考）
+    let t0 = Instant::now();
+    let mut len_acc = 0usize;
+    for i in 0..N {
+        let s = format!("{} {}", bidders[i], prices[i]);
+        len_acc = len_acc.wrapping_add(std::hint::black_box(&s).len());
+    }
+    let fmt_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    std::hint::black_box(len_acc);
+    report("q19 fmt黑盒 format!", fmt_ns, full_ns);
+
+    // ⑤ 列式 cell 准备段（close_batch_prepare：引用字段物化 + 编译 + eval_vec）
+    //    ——层 1 新增成本的单独归因（fmt 增量 = 准备 + 逐行 cell 读取）。
+    let t0 = Instant::now();
+    let prepared = exec_full.close_batch_prepare(&closes);
+    let prep_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    std::hint::black_box(&prepared);
+    report("q19 close prepare(物化)", prep_ns, full_ns);
+
+    // 归因（对齐 2026-08-25 采样占比；chain 计时不含 entry 构建——closes 预构造）
+    let fmt_delta = full_ns - nofmt_ns;
+    let exec_net = full_ns - entry_ns; // executor 侧净成本：yield 求值 + wfx_id + 落列
+    eprintln!(
+        "[hotpath] q19 归因: fmt增量={:.1}ns/entry({:.0}% of full) | entry结构={:.1}ns({:.0}%) | executor净成本={:.1}ns({:.0}%)",
+        fmt_delta,
+        fmt_delta / full_ns * 100.0,
+        entry_ns,
+        entry_ns / full_ns * 100.0,
+        exec_net,
+        exec_net / full_ns * 100.0
+    );
 }

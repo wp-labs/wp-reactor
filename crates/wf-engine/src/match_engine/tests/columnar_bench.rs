@@ -776,6 +776,7 @@ fn columnar_not_overhead_bounded() {
 /// （子网编译期解析一次；逐行只有 IP 字符串解析）。debug 模式时间噪声大，
 /// 用宽松界（列式相对解释 < 1.0x，即列式不慢于解释）守护回归。
 #[test]
+#[ignore = "性能断言（列式 vs 行式相对比例）：全量并发下比例失真会误报 → 隔离串行跑: cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture"]
 fn columnar_cidr_match_overhead_bounded() {
     use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
     use crate::match_engine::match_engine::eval_expr;
@@ -865,6 +866,7 @@ fn columnar_cidr_match_overhead_bounded() {
 /// 解释路径（解释路径每事件重编译正则，release 实测 ~19.6µs/ev vs 预编译
 /// 13ns/ev，相差 1465 倍；这里只需证明列式可用且明显更快）。
 #[test]
+#[ignore = "性能断言（列式 vs 行式相对比例）：全量并发下比例失真会误报 → 隔离串行跑: cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture"]
 fn columnar_regex_match_overhead_bounded() {
     use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
     use crate::match_engine::match_engine::eval_expr;
@@ -956,6 +958,7 @@ fn columnar_regex_match_overhead_bounded() {
 /// contains / startswith / endswith 性能保护：列式路径必须可用、mask 正确，
 /// 且吞吐不慢于解释路径（列式避免 per-event 的 Value 克隆 + 双次 eval 分发）。
 #[test]
+#[ignore = "性能断言（列式 vs 行式相对比例）：全量并发下比例失真会误报 → 隔离串行跑: cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture"]
 fn columnar_str_search_overhead_bounded() {
     use crate::match_engine::columnar::{ColumnarBatch, eval_guard_columnar};
     use crate::match_engine::match_engine::eval_expr;
@@ -1146,6 +1149,7 @@ fn compiled_guard_cache_beats_per_batch_compile() {
 /// （编译一次 + 整批 eval_vec）应快于逐行解释（每行 eval 分发 + 字段查找 +
 /// Value 构造）。
 #[test]
+#[ignore = "性能断言（列式 vs 行式相对比例）：全量并发下比例失真会误报 → 隔离串行跑: cargo test --release -p wf-engine columnar_bench -- --ignored --nocapture"]
 fn columnar_output_func_cell_beats_per_row() {
     use crate::match_engine::columnar::{ColumnarBatch, compile_guard, cscalar_to_value};
     use crate::match_engine::match_engine::eval_expr;
