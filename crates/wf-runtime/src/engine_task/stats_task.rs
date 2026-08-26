@@ -695,15 +695,14 @@ impl StatsTask {
         self.last_reported_spill_evictions = evictions;
         self.last_reported_spill_readbacks = readbacks;
         if ev_delta > 0 || rb_delta > 0 {
-            wf_warn!(pipe,
-                task_id = %self.task_id,
-                rule = %self.rule_name(),
-                window_start = window_start,
-                window_end = window_end,
-                spill_evictions = ev_delta,
-                spill_readbacks = rb_delta,
-                "spill 抖动: 本窗驱逐 {} 键 / 读回 {} 次（读回率 {:.1}%; 预算不足时升高 = 抖动）",
-                ev_delta, rb_delta,
+            // 用 log 而非 wf_warn（tracing）：daemon 日志过滤器未开
+            // wf_runtime::engine_task 目标——executor 的 log::warn 已验证可输出。
+            log::warn!(
+                "spill 抖动(规则 {}, task {}): 本窗驱逐 {} 键 / 读回 {} 次（读回率 {:.1}%; 预算不足时升高 = 抖动）",
+                self.rule_name(),
+                self.task_id,
+                ev_delta,
+                rb_delta,
                 if ev_delta > 0 { rb_delta as f64 * 100.0 / ev_delta as f64 } else { 0.0 }
             );
         }
