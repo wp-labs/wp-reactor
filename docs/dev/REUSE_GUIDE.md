@@ -170,3 +170,64 @@ bench 的 `RSS_peak` 单次不可信（运行间波动），对比用 `MEMORY=1 
 5. **测量设施自身会错**：键名（parse_budget_bytes 读成 0）、单位（MB vs 字节）、
    采样周期（漏峰）——用守护测试钉住指标导出
 6. **RSS 是水位代理**：判内存用 dirty（footprint），判峰值用内部 alloc 读数
+
+
+---
+
+## 7. 机制全清单（含成熟度）
+
+**成熟度定义**：
+- ★5 成熟：多查询验证 + 守护测试 + 文档化 + 生产路径默认启用
+- ★4 较成熟：单查询深度验证 + 守护测试
+- ★3 可用：验证过但收益/场景有限
+- ★2 雏形：有代码、验证不充分
+- ★1 实验：临时手段（用完即撤，设计如此）
+
+### A. 输出/列式化
+
+| 机制 | 成熟度 | 位置 | 能力 | 验证/局限 |
+|---|---|---|---|---|
+| **常量列折叠 `ColumnData<T>`** | ★5 | `alert/column_batch.rs` | 全列同值折叠单值，读时 O(1) 展开 | q13 30M/100M 双达标 + q1 无退化；⚠ summary/record 路径不折叠 |
+| **SmolStr 内联 + `StrSink` trait** | ★5 | `match_engine/key.rs`、`column_batch.rs` | ≤22B 短字符串零堆分配；String/SmolStrBuilder 统一渲染 | 多处使用；字节一致守护测试 |
+| 批式 commit（`commit_each_rows_batch`） | ★4 | `column_batch.rs` | 列式批量装载（bulk extend + 块级 fill） | q1 路径；q13b 用逐行（fcb4630 取舍，见 §3.5 教训） |
+| f64 快车道（`stage_yield_cell_f64`） | ★4 | `column_batch.rs` + `each_exec.rs` | yield 与 entity 同列数字 → 直写免 Value/coerce | q1/q13；EPS +40% 实证 |
+| `EntityCol` 列直读 | ★4 | `each_exec.rs` | Int64/TsNanos/Utf8/Generic 三态直读 | q13a/q13b |
+| 零拷贝 move 进列（`EachRowCells` owned） | ★4 | `column_batch.rs` | owned 值 move 进列，免二次拷贝 | fcb4630 核心；moved 批式已证分配总量不变则内存不变 |
+
+### B. Join / 正确性
+
+| 机制 | 成熟度 | 位置 | 能力 | 验证/局限 |
+|---|---|---|---|---|
+| **批级预查（key 分组去重）** | ★5 | `each_exec.rs` `key_rows` | 每唯一 key 一次 lookup，hot key 共享 | q13 卡死修复关键；集成对拍 |
+| **广播按订阅类型裁剪**（`round_robin_only`） | ★5 | `window/fanout.rs` | 无 pull 订阅 → 只广播不物化 events | q13 30M 达标；变异测试（写反即失败） |
+| **D4 保留 pin** | ★5 | `rule_task.rs` `publish_retention_floor` | 挂起实例保留 pin 闭环到时间驱逐 | deferred 正确性根治（q4/q9） |
+| **运行期评估 gate** | ★5 | `rule_task.rs` `scan_deferred` | 评估前沿 = 目标窗 append 位 | q4a 100M 欠发根治 |
+| **健全前沿 gate**（跨源提交乱序） | ★5 | `rule_task.rs` | 乱序提交防护 + lo_min 历史缓存修复 | 30M 三连根治（正确性/多发/内存） |
+| provider 预物化（`join_rows_lookup`） | ★3 | `window/provider/mod.rs` | 静态表 Arc<Event> 一次构建 | 收益有限（批级预查已压 lookup 频率） |
+
+### C. 测量 / 诊断
+
+| 机制 | 成熟度 | 位置 | 能力 | 验证/局限 |
+|---|---|---|---|---|
+| **perf-diag 墙梯（哨兵驱动五档）** | ★5 | `diag.sh` + `perf_diag.rs` | recv/decode/floor/rules/full 逐段切除 | 设计文档 + 用户指南；EPS/RSS/DIRTY 三列 |
+| **哨兵（漂流瓶）EPS 协议** | ★5 | `perf_diag.rs` | 帧尾哨兵 → 引擎回 emit_ns → 精确 EPS | bench/diag 共用 |
+| 内存墙 `MEMORY=1` | ★4 | `diag_mem_analyze.py` | 每档 ΔRSS/DIRTY + 成分分账 + 每窗明细 | 内存专项标配 |
+| 二分消融 env gate | ★3 | env `OnceLock` 模式 | 段内逐段短路定位子段 | 临时手段（用完即撤，设计如此） |
+| `mem_sample` footprint 采样 | ★4 | `perf-diag-wall.toml` | dirty 默认开（0.5s），非 macOS 降级 | 内存判据权威化 |
+| fp 探针（`footprint <pid>`） | ★4 | 外部命令 | dirty（真持有）vs RSS（水位） | 判"真持有 vs 伪影" |
+| 内部 alloc 峰值（`alloc.peak_rss_bytes`） | ★4 | metrics | 内部历史峰值不漏峰、零 spawn | mimalloc 禁用时 rss 仍有效（进程级） |
+| 组件分解 bench（cut A/B/C/D） | ★4 | `each_bench.rs` | 函数级 profile（fill/stage/commit 分桶） | fill 96% 定位依据 |
+| 内存分账指标（window/parse/fanout） | ★4 | metrics | 在途量对账等式 | 守护测试钉导出（防静默失效） |
+| `MemoryProbe`/`CountingAlloc` | ★4 | `memory_probe.rs` | 测试内分配峰值（N vs 3N 断言） | 路径消融 + 回归保护 |
+
+### D. 测试 / 窗口语义
+
+| 机制 | 成熟度 | 位置 | 能力 | 验证/局限 |
+|---|---|---|---|---|
+| **等价对拍测试**（列式 vs 行式字节一致） | ★5 | 各 `tests/*` | 两条路径逐字段对拍 | 本专项核心守护（每次列式化改动都靠它） |
+| **变异测试**（关键判定写反即失败） | ★5 | `fanout.rs` 等 | 防"看似正确实则失效" | round_robin_only 等 |
+| ack floor 门控驱逐 | ★5 | `evictor.rs` | 未读/未广播不驱逐（宁可超 cap） | 驱逐正确性 + D4 pin 闭环 |
+| 完成信号 + 生产/消费双分片（M-13） | ★4 | `rule_task.rs` | max_acked 追平语义、分片分组完成 | q13 分片根治 |
+| `completion_gap` 分组完成判定 | ★4 | `window/router.rs` | min/max 分片口径（keyed vs round-robin） | 慢分片尾部不截断 |
+
+---
