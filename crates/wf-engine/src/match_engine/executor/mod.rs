@@ -6,6 +6,10 @@ mod close_exec;
 mod context;
 #[cfg(test)]
 pub(crate) use context::{build_eval_context, execute_joins};
+#[cfg(test)]
+pub(crate) use context::{enrich_join_row, enrich_join_row_bare, in_interval, row_matches_conds};
+#[cfg(test)]
+pub(crate) use deferred_exec::select_reduce_row;
 mod deferred_exec;
 pub use deferred_exec::DeferredPending;
 mod each_exec;

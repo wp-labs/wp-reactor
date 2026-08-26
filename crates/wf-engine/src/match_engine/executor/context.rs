@@ -421,6 +421,25 @@ pub(crate) fn enrich_join_row(ctx: &mut Event, join: &JoinPlan, row: &JoinRow) {
     }
 }
 
+/// 只注入裸名字段（deferred 路径，2026-08-26 q4a）：`eval_field_value` 对
+/// `Qualified(_, name)` 读裸名键（`fields.get(field_ref_name)`），Path 引用也
+/// 丢弃 alias 读裸名——qualified 键（`右窗.字段`）对表达式求值**不可达**。
+/// deferred 的 where/yield/score/entity 全走裸名读取（evaluate_deferred_join
+/// 的 cond 复核直接读右行），qualified 注入纯死数据 → 省每字段一次
+/// format!（String 分配）+ insert + value clone（q4a 分解 ⑤ 685ns 的主头）。
+/// eager 路径（`execute_joins`）保留全量 [`Self::enrich_join_row`]（行为契约
+/// 测试锁定 qualified 键存在）。
+pub(crate) fn enrich_join_row_bare(ctx: &mut Event, row: &JoinRow) {
+    for field_name in row.field_names() {
+        let Some(value) = row.field_value(field_name) else {
+            continue;
+        };
+        ctx.fields
+            .entry(field_name.to_string().into())
+            .or_insert_with(|| value.clone());
+    }
+}
+
 /// Extract the first join condition's `(right key field, left value)`, so the
 /// join can use a hash-index lookup for the primary key condition before
 /// filtering by any remaining conditions.

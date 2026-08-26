@@ -21,7 +21,7 @@ use crate::match_engine::match_engine::{
 use crate::time::normalize_epoch_timestamp_float_nanos;
 
 use super::RuleExecutor;
-use super::context::{enrich_join_row, eval_interval_bound, in_interval, row_matches_conds};
+use super::context::{enrich_join_row_bare, eval_interval_bound, in_interval, row_matches_conds};
 
 /// 一个挂起的 deferred join 实例：驱动（左）行 + 预计算的区间与触发点。
 ///
@@ -152,7 +152,9 @@ impl RuleExecutor {
                 // 胜出行的字段以裸名富化（`winner.bidder` 编译成 Path{alias:"winner",
                 // segments:["bidder"]}，eval_field_value 丢弃 alias、把 segments[0]
                 // 当根字段名读 `fields["bidder"]`）。
-                enrich_join_row(&mut out_ctx, join, &row);
+                // 2026-08-26：bare 注入（省 qualified 死数据）——deferred 表达式
+                // 对 Qualified 引用也读裸名，qualified 键不可达。
+                enrich_join_row_bare(&mut out_ctx, &row);
                 // `as label`：归约整行以裸键 object value 注入（review R2）。
                 // 仅当规则真能读到该 object（裸 `winner` / `field_ref_name` 命中
                 // 标签名，见 plan_reduce_label_reads）时才物化——`label.field`
@@ -173,7 +175,7 @@ impl RuleExecutor {
                 let Some(row) = row else {
                     return Ok(None);
                 };
-                enrich_join_row(&mut out_ctx, join, &row);
+                enrich_join_row_bare(&mut out_ctx, &row);
             }
         }
 
@@ -215,7 +217,7 @@ fn first_join_key_local(ctx: &Event, conds: &[JoinCondPlan]) -> Option<(String, 
 /// - `minrow(field)`：field 值最小的行；
 /// - `last(field)`：右窗时间（ts）最新的行（v1 语义；field 参数保留）；
 /// - `top(N, field)`：按 field 降序取前 N，返回首行。
-fn select_reduce_row(
+pub(crate) fn select_reduce_row(
     rows: Vec<(i64, crate::match_engine::JoinRow)>,
     measure: &ReduceMeasure,
 ) -> Option<crate::match_engine::JoinRow> {
