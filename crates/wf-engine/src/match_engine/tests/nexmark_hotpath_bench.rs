@@ -2121,6 +2121,77 @@ fn q22_each_split() {
         exec_col.execute_each_direct_batch(&rows, &NoLookup, &[], NOW, &mut b_row, &mut app_row);
     assert_eq!(stats_row.appended, N, "行式输出行数 = N");
     assert_eq!(b_col.finish().len(), b_row.finish().len(), "列式/行式输出行数一致");
+
+    // ---- split 内部拆解（2026-08-26 q22 内存归因）：全分割 collect vs 惰性 nth ----
+    // 生产 `split_index_vec` 每行 `text.split(sep).collect::<Vec<_>>()` 再索引——
+    // url 3 段目录 + query（split 后 ≥6 段）全分割建 Vec 是纯浪费。量化惰性
+    // `split(sep).nth(k)`（只扫描到第 k 段）的加速空间。
+    let sep = "/";
+    let mut sum = 0usize;
+    let t0 = Instant::now();
+    for _ in 0..N {
+        let parts: Vec<&str> = nexmark_url().split(sep).collect();
+        let k = normalize_idx(3, parts.len());
+        if let Some(k) = k {
+            sum += parts[k].len();
+        }
+    }
+    let collect_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q22 split 全分割 collect", collect_ns, collect_ns);
+
+    let t0 = Instant::now();
+    for _ in 0..N {
+        let picked = nexmark_url().split(sep).nth(3);
+        if let Some(p) = picked {
+            sum += p.len();
+        }
+    }
+    let nth_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q22 split 惰性 nth(3)", nth_ns, collect_ns);
+
+    // ---- concat 内部拆解（2026-08-26 q22 内存归因 2）：String::new 无预分配 +
+    // 逐参 value_to_string 转换 vs 预分配 + 直接 push_str。q22 detail =
+    // concat(3 段 + 2 个 "/")，每行 5 参数。----
+    let segs: Vec<&str> = nexmark_url().split(sep).collect();
+    let mut sum2 = 0usize;
+    let t0 = Instant::now();
+    for _ in 0..N {
+        let mut s = String::new();
+        s.push_str(segs[3]);
+        s.push_str(sep);
+        s.push_str(segs[4]);
+        s.push_str(sep);
+        s.push_str(segs[5]);
+        sum2 += s.len();
+    }
+    let cat_naive_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q22 concat 无预分配", cat_naive_ns, cat_naive_ns);
+
+    let t0 = Instant::now();
+    for _ in 0..N {
+        let cap = segs[3].len() + 1 + segs[4].len() + 1 + segs[5].len();
+        let mut s = String::with_capacity(cap);
+        s.push_str(segs[3]);
+        s.push_str(sep);
+        s.push_str(segs[4]);
+        s.push_str(sep);
+        s.push_str(segs[5]);
+        sum2 += s.len();
+    }
+    let cat_cap_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q22 concat 预分配", cat_cap_ns, cat_naive_ns);
+    assert!(sum > 0 && sum2 > 0);
+}
+
+/// mvindex 负索引/越界归一（与 `normalize_index_simple` 同语义的 bench 内联版）。
+fn normalize_idx(index: i64, len: usize) -> Option<usize> {
+    let len = len as i64;
+    let normalized = if index < 0 { len + index } else { index };
+    if normalized < 0 || normalized >= len {
+        None
+    } else {
+        Some(normalized as usize)
+    }
 }
 
 // ---------------------------------------------------------------------------

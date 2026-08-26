@@ -1399,8 +1399,22 @@ impl ColumnarBatch<'_> {
                 normalize_index_simple(index, chars.len())
                     .map(|k| SmolStr::from(chars[k].to_string()))
             } else {
-                let parts: Vec<&str> = text.split(sep.as_str()).collect();
-                normalize_index_simple(index, parts.len()).map(|k| SmolStr::from(parts[k]))
+                // 惰性取段（2026-08-26 q22）：正索引不建 Vec、只扫描到第 k 段
+                // （url 3 段目录 + query 全分割是纯浪费——3×split 建 Vec 曾致
+                // 消费慢 → 驱逐被挡 → 输入窗全量驻留 24G）。负索引需总段数：
+                // `Split` 迭代器可 clone，count 不消耗原迭代器。
+                let mut it = text.split(sep.as_str());
+                let normalized = if index < 0 {
+                    let len = it.clone().count();
+                    len as i64 + index
+                } else {
+                    index
+                };
+                if normalized < 0 {
+                    None
+                } else {
+                    it.nth(normalized as usize).map(SmolStr::from)
+                }
             };
             out.push(picked);
         }
@@ -1408,16 +1422,31 @@ impl ColumnarBatch<'_> {
     }
 }
 
-/// `concat(a, b, ...)` 批量求值：per row 逐参 cell → `value_to_string` 拼接
+/// `concat(a, b, ...)` 批量求值：per row 逐参 cell → 字符串拼接
 /// （与解释路径逐参 eval + value_to_string 字节一致）；任一参数 cell null →
 /// 整行 null（解释路径 `?` 传播 → yield 空串）。
+/// 2026-08-26（q22 输出链加速）：两处 per-row 热点修复——① 按参数类型直接取
+/// 字符串（Str 零拷贝借用、Number/Bool 走 value_to_string），不再经
+/// `cscalar_to_value` 的 Value 克隆中转；② 结果 String 预分配（各参长度 + 余量），
+/// 避免逐 push 扩容（q22 每行 5 参数 concat）。字节一致对拍由既有
+/// `columnar_*_matches_interpreted_path` 测试钉死。
 fn concat_vec(args: &[CVec], n: usize) -> CVec {
     let mut out: Vec<Option<SmolStr>> = Vec::with_capacity(n);
+    // 每行结果长度下界（非 Str 参数无法预知长度，按 24B 余量估计）——
+    // 分配一次即够，避免扩容（q22 形态：3 段目录 + 2 个 "/"）。
+    let row_cap: usize = args
+        .iter()
+        .map(|a| match a {
+            CVec::Str(v) => v.first().map_or(0, |s| s.as_deref().map_or(0, str::len)),
+            CVec::Int(_) | CVec::Float(_) | CVec::Bool(_) | CVec::Scalar(_) => 24,
+        })
+        .sum();
     for row in 0..n {
-        let mut s = String::new();
+        let mut s = String::with_capacity(row_cap);
         let mut ok = true;
         for a in args {
             match a.scalar_at(row) {
+                Some(CScalar::Str(ss)) => s.push_str(&ss),
                 Some(c) => s.push_str(&value_to_string(&cscalar_to_value(&c))),
                 None => {
                     ok = false;
