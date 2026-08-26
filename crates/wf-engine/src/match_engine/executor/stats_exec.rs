@@ -875,10 +875,33 @@ impl StatsWindowState {
         }
         self.readback.clear();
     }
+    /// 分批读回 spill 键（流式 close, M5-3）：store 游标续读 + readback 过滤
+    /// （take 只读后 redb 残留旧条目, 内存副本更新——跳过）。批内顺序无要求
+    /// （调用方排序）。
+    fn spill_drain_up_to(&mut self, n: usize) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+        let Some(spill) = &mut self.spill else {
+            return Vec::new();
+        };
+        let drained = spill.drain_up_to(n);
+        let mut out = Vec::with_capacity(drained.len());
+        for (key, accs) in drained {
+            let hash = scope_key_hash(&key);
+            if self.readback.contains(&hash) {
+                continue; // 已读回且在内存（副本更新）——跳过 redb 旧条目
+            }
+            out.push((key, accs));
+        }
+        out
+    }
 }
 
 /// 时钟二次机会计数上限（M5-2）：命中置此值，驱逐扫描递减到 0 才驱逐。
 const TOUCH_MAX: u8 = 3;
+
+/// 流式 close drain 批大小上限（M5-3）：默认 5 万键/批（≈35MB 反序列化驻留）。
+/// `WF_SPILL_DRAIN_CHUNK` 可调。与输出 chunk 解耦——输出批大无妨, 读回批
+/// 必须小（q18 30M close 峰值 43GB → 22GB 的直接原因）。
+const SPILL_DRAIN_CHUNK: usize = 50_000;
 
 /// 单桶: 完整 [`ScopeKey`]（close 排序/输出; 每桶一次构建）+ 累加器数组。
 #[derive(Debug, Clone)]
@@ -1459,16 +1482,16 @@ impl StatsExecutor {
             .collect()
     }
 
-    /// 分批取桶（流式 close）: 从桶表取最多 n 个链并移除（链内桶拍平）, 批内
-    /// ScopeKey 升序（保持单批对拍契约）; 全部取完（返回空）后调用方须
+    /// 分批取内存桶（流式 close 的一部分）: 从桶表取最多 n 个链并移除（链内桶
+    /// 拍平）, 批内 ScopeKey 升序; 全部取完（返回空）后调用方须
     /// [`Self::finish_close_window`]。不 reset（还有剩余桶, 下一批继续）。
     ///
+    /// **M5-3**：不再并入 spill（流式 close 用 [`Self::take_next_close_batch`]
+    /// 从内存 + spill 两源归并取桶——避免 close 全量 drain 的内存峰值）。
     /// 2026-08-26 review: 用 `retain` 原地移除已取链——v1 用 `mem::take` 全表 +
     /// 剩余重插新 HashMap（每批 O(剩余) 哈希 + 分配, 100M 30 批 ≈ 4.4 亿次重插
     /// close +~9s）; retain 每批 O(n) 轻量回调（无哈希重建, close ~3s）。
     pub fn take_buckets_up_to(&mut self, n: usize) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
-        // spill 启用且还有 spill 键 → 首次取桶前并入（每个键恰好一次）。
-        self.window.merge_spill_into_buckets();
         let mut out = Vec::new();
         if n == 0 {
             return out;
@@ -1485,6 +1508,45 @@ impl StatsExecutor {
             false // 本链已取空: 删除
         });
         out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// **流式 close 取桶（M5-3）**：从内存桶（预算内, 小）与 spill（游标续读,
+    /// 分批）两源各取一批, 归并排序后返回（批内 ScopeKey 升序——对拍契约）。
+    /// 两源都空 → 返回空（close 循环终止）。close 峰值 = 批大小, 不再全量
+    /// drain 到内存（q18 30M 曾 43GB → swap 风暴挂死）。
+    ///
+    /// 批大小 clamp 到 [`SPILL_DRAIN_CHUNK`]（默认 5 万, `WF_SPILL_DRAIN_CHUNK`
+    /// 可调）——与输出 `emit_chunk`（默认 100 万）解耦: 输出批大没关系,
+    /// 但**从 redb 读回的批必须小**（反序列化驻留是 close 内存峰值的直接来源）。
+    pub fn take_next_close_batch(&mut self, n: usize) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+        let n = n.min(SPILL_DRAIN_CHUNK);
+        let mut out = Vec::with_capacity(n);
+        if n == 0 {
+            return out;
+        }
+        let mem = self.take_buckets_up_to(n);
+        // spill 批补足配额（两源之和 ≤ n）; 批内排序后与内存批归并。
+        let spill_n = n.saturating_sub(mem.len()).max(1);
+        let mut spill = self.window.spill_drain_up_to(spill_n);
+        spill.sort_by(|a, b| a.0.cmp(&b.0));
+        // 归并两个有序序列（peek 比较 + next 取走, 无 clone）。
+        let mut mem_iter = mem.into_iter().peekable();
+        let mut spill_iter = spill.into_iter().peekable();
+        loop {
+            match (mem_iter.peek(), spill_iter.peek()) {
+                (Some(x), Some(y)) => {
+                    if x.0 <= y.0 {
+                        out.push(mem_iter.next().expect("peek 即存在"));
+                    } else {
+                        out.push(spill_iter.next().expect("peek 即存在"));
+                    }
+                }
+                (Some(_), None) => out.push(mem_iter.next().expect("peek 即存在")),
+                (None, Some(_)) => out.push(spill_iter.next().expect("peek 即存在")),
+                (None, None) => break,
+            }
+        }
         out
     }
 

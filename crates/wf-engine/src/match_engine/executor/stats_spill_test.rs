@@ -492,3 +492,116 @@ fn spill_redb_deferred_create_via_executor() {
     assert!(exec.window.spill.is_some(), "下一窗口重建 store");
     assert!(path.exists());
 }
+
+// ---------------------------------------------------------------------------
+// 7. M5-3 流式 close drain：分批读回 + 归并排序 + 内存有界
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spill_streaming_close_matches_batch_close() {
+    // 流式 close（take_next_close_batch 循环）vs 非流式
+    // （close_window_by_bucket_rows 全量）输出逐键一致——对拍契约。
+    let subset = Arc::new(HashSet::from(["price".to_string()]));
+    let plan = keyed_plan(
+        vec![field_key("b", "bidder")],
+        vec![last_measure("last_price", "price"), count_measure("n")],
+    );
+    let make_rows = || {
+        let mut rows = Vec::new();
+        // 30 键（预算 3 桶 → 大量 spill）；键 5/7 回访（读回路径）
+        for k in 1..=30 {
+            rows.push(row(&[
+                ("bidder", num(k as f64)),
+                ("price", num(k as f64 * 10.0)),
+            ]));
+        }
+        rows.push(row(&[("bidder", num(5.0)), ("price", num(555.0))]));
+        rows.push(row(&[("bidder", num(7.0)), ("price", num(777.0))]));
+        rows
+    };
+
+    // A: 非流式（close_window_by_bucket_rows 全量）
+    let mut a = exec_with_spill(
+        plan.clone(),
+        3,
+        Some(subset.clone()),
+        Some(Box::new(MemSpillStore::new())),
+        None,
+    );
+    a.process_rows(&make_rows(), extract);
+    let a_out = a.close_window_by_bucket_rows();
+
+    // B: 流式（take_next_close_batch 分批, 批大小 5）
+    let mut b = exec_with_spill(
+        plan,
+        3,
+        Some(subset.clone()),
+        Some(Box::new(MemSpillStore::new())),
+        None,
+    );
+    b.process_rows(&make_rows(), extract);
+    let mut b_keys = Vec::new();
+    loop {
+        let batch = b.take_next_close_batch(5);
+        if batch.is_empty() {
+            break;
+        }
+        // 批内必须有序（对拍契约）
+        assert!(
+            batch.windows(2).all(|w| w[0].0 <= w[1].0),
+            "流式批内必须 ScopeKey 升序"
+        );
+        b_keys.extend(batch.into_iter().map(|(k, _)| k));
+    }
+    b.finish_close_window();
+
+    // 流式输出 = 非流式输出：**键集合一致 + 每键恰好一次**（批间无序是既有
+    // 契约——原 take_buckets_up_to 流式 close 同样批间无序, 设计 §9 已确认）。
+    let mut a_keys: Vec<ScopeKey> = a_out.iter().map(|c| c.key.clone()).collect();
+    a_keys.sort();
+    let mut b_sorted = b_keys.clone();
+    b_sorted.sort();
+    assert_eq!(b_sorted, a_keys, "流式 vs 非流式键集合一致");
+    assert_eq!(b_keys.len(), 30);
+    assert_eq!(
+        b_sorted.iter().collect::<std::collections::HashSet<_>>().len(),
+        30,
+        "每键恰好一次（无重复）"
+    );
+    // 读回键 5 在输出中（readback 过滤后不重复）
+    assert!(b_keys.contains(&ScopeKey::Int(5)), "键5 在输出中");
+}
+
+#[test]
+fn spill_streaming_close_memory_bounded() {
+    // 流式 close 内存有界：spill 分批进来, buckets 不膨胀（每次取走后再
+    // 读下一批）——close 峰值 = 批大小, 不是全量。
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let mut exec = exec_with_spill(
+        plan,
+        2,
+        None,
+        Some(Box::new(MemSpillStore::new())),
+        None,
+    );
+    for k in 1..=20 {
+        exec.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    let spilled = exec.window.spill_index.len();
+    assert!(spilled > 0, "spill 已生效");
+    // 流式 close：每批取走后 buckets 保持 ≤ 批大小（不累积全量）
+    let mut total = 0usize;
+    loop {
+        let batch = exec.take_next_close_batch(4);
+        if batch.is_empty() {
+            break;
+        }
+        total += batch.len();
+        let in_mem = exec.window.buckets.values().map(Vec::len).sum::<usize>();
+        assert!(
+            in_mem <= 4,
+            "close 中 buckets 应 ≤ 批大小, 实测 {in_mem}"
+        );
+    }
+    assert_eq!(total, 20, "全部键输出");
+}

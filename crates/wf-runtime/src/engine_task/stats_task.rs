@@ -532,7 +532,7 @@ impl StatsTask {
             // 每批 ~EMIT_CHUNK 桶, 峰值 ≈ 批大小×条均 + 分块装载缓冲。
             let chunk = emit_chunk();
             loop {
-                let buckets = self.stats.take_buckets_up_to(chunk);
+                let buckets = self.stats.take_next_close_batch(chunk);
                 if buckets.is_empty() {
                     break;
                 }
@@ -603,7 +603,7 @@ impl StatsTask {
                 .as_nanos() as i64;
             let chunk = emit_chunk();
             loop {
-                let buckets = self.stats.take_buckets_up_to(chunk);
+                let buckets = self.stats.take_next_close_batch(chunk);
                 if buckets.is_empty() {
                     break;
                 }

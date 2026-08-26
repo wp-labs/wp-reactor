@@ -22,7 +22,7 @@ use crate::match_engine::executor::{
     DistinctKey, DistinctSet, NumericAccum, RowFieldLayout, RowFields, StatsAccum, TopEntry,
 };
 use crate::match_engine::ScopeKey;
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
+use redb::{ReadableDatabase, ReadableTableMetadata};
 
 /// spill 存储错误。
 #[derive(Debug)]
@@ -72,8 +72,24 @@ pub trait SpillStore {
     /// 不删除条目（redb 中旧条目由调用方 close 时按已读回集合过滤）。
     fn take(&mut self, hash: u64) -> Option<(ScopeKey, Vec<StatsAccum>)>;
 
-    /// close：读回全部 spill 键并清空（顺序无要求，调用方排序）。
-    fn drain(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)>;
+    /// 分批读回 spill 键（**流式 close, M5-3**）：每批最多 `n` 个，内部游标
+    /// 保持位置，全部读完后返回空。批间顺序无要求（调用方排序）。
+    /// 实现须在每批间保持迭代状态（redb 游标 / mem 删除推进）。
+    fn drain_up_to(&mut self, n: usize) -> Vec<(ScopeKey, Vec<StatsAccum>)>;
+
+    /// close：读回全部 spill 键（非流式路径兼容；流式用 [`Self::drain_up_to`]
+    /// 循环——避免全量物化）。默认实现 = drain_up_to 循环。
+    fn drain(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+        let mut out = Vec::new();
+        loop {
+            let batch = self.drain_up_to(usize::MAX);
+            if batch.is_empty() {
+                break;
+            }
+            out.extend(batch);
+        }
+        out
+    }
 
     /// 窗口结束清理外部资源（redb 删除文件；Noop/Mem 空操作）。
     /// 调用后本 store 不再可用（新窗口重新 create）。
@@ -105,7 +121,7 @@ impl SpillStore for NoopSpillStore {
     fn take(&mut self, _hash: u64) -> Option<(ScopeKey, Vec<StatsAccum>)> {
         None
     }
-    fn drain(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+    fn drain_up_to(&mut self, _n: usize) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
         Vec::new()
     }
     fn cleanup(&mut self) {}
@@ -143,6 +159,17 @@ impl SpillStore for MemSpillStore {
     fn take(&mut self, hash: u64) -> Option<(ScopeKey, Vec<StatsAccum>)> {
         self.map.get(&hash).map(|(k, a)| (k.clone(), a.clone()))
     }
+    fn drain_up_to(&mut self, n: usize) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+        if n == 0 || self.map.is_empty() {
+            return Vec::new();
+        }
+        // 取前 n 个 hash（迭代序任意）→ remove（推进 = 删除, 分批幂等）。
+        let hashes: Vec<u64> = self.map.keys().take(n).copied().collect();
+        hashes
+            .into_iter()
+            .filter_map(|h| self.map.remove(&h))
+            .collect()
+    }
     fn drain(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
         std::mem::take(&mut self.map)
             .into_values()
@@ -169,7 +196,8 @@ const REDB_TABLE: redb::TableDefinition<u64, &[u8]> =
 ///
 /// - 文件按任务实例/窗口隔离（`spill_{rule}_{window_start}.rb`，M3/M4 接线）；
 ///   本结构只负责单库读写，`cleanup` 删文件（窗口结束/重置时调用）。
-/// - `take` 读回并移除（保证与内存桶不相交——close drain 无重复）。
+/// - `take` 只读（M5-2）：redb 旧条目由调用方 close 时按已读回集合过滤。
+/// - `drain_up_to` 流式（M5-3）：游标续读，close 峰值 = 批大小而非全量。
 /// - 读失败 = 致命：redb 错误在无 Result 通道的 trait 方法里直接 panic
 ///   （绝不静默丢键）；`put_batch` 保留 Result 供 M3 三层预算回退拒收。
 pub struct RedbSpillStore {
@@ -180,6 +208,8 @@ pub struct RedbSpillStore {
     layout: std::sync::Arc<RowFieldLayout>,
     /// put_batch 调用计数（每 8 批一次 Immediate 周期 flush, 限脏页）。
     put_batches: u64,
+    /// drain_up_to 游标：下一批从 `Excluded(cursor)` 续读（None = 从头）。
+    drain_cursor: Option<u64>,
 }
 
 impl RedbSpillStore {
@@ -216,6 +246,7 @@ impl RedbSpillStore {
             path: path.as_ref().to_path_buf(),
             layout,
             put_batches: 0,
+            drain_cursor: None,
         })
     }
 
@@ -307,35 +338,43 @@ impl SpillStore for RedbSpillStore {
         }
     }
 
-    fn drain(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
-        let mut out = Vec::new();
-        {
-            let db = self.db.as_ref().expect("已 cleanup");
-            let txn = match db.begin_read() {
-                Ok(t) => t,
-                Err(e) => Self::redb_expect(&format!("begin_read: {e}")),
-            };
-            let table = match txn.open_table(REDB_TABLE) {
-                Ok(t) => t,
-                Err(e) => Self::redb_expect(&format!("open_table: {e}")),
-            };
-            let iter = match table.iter() {
-                Ok(i) => i,
-                Err(e) => Self::redb_expect(&format!("iter: {e}")),
-            };
-            for entry in iter {
-                let (_, v) = match entry {
-                    Ok(e) => e,
-                    Err(e) => Self::redb_expect(&format!("iter 条目: {e}")),
-                };
-                let bytes = v.value().to_vec();
-                let (key, accs) = deserialize_spill_value(&bytes, &self.layout)
-                    .unwrap_or_else(|e| panic!("spill 读回损坏(致命): {e}"));
-                out.push((key, accs));
-            }
+    /// 流式分批读回（M5-3）：从 `Excluded(drain_cursor)` 起取最多 n 条，
+    /// 推进游标。全部读完后返回空（游标到尾部）。close 峰值 = 批大小。
+    /// 不删除条目（close 后 cleanup 删整个文件）。
+    fn drain_up_to(&mut self, n: usize) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+        if n == 0 {
+            return Vec::new();
         }
-        // 不做树重写清空（drain 后调用方随即 cleanup 删文件——retain 全删是
-        // 纯浪费: 5.6GB B+ 树重写分钟级, 而文件马上被 unlink）。
+        let db = self.db.as_ref().expect("已 cleanup");
+        let txn = match db.begin_read() {
+            Ok(t) => t,
+            Err(e) => Self::redb_expect(&format!("begin_read: {e}")),
+        };
+        let table = match txn.open_table(REDB_TABLE) {
+            Ok(t) => t,
+            Err(e) => Self::redb_expect(&format!("open_table: {e}")),
+        };
+        let start = match self.drain_cursor {
+            Some(last) => std::ops::Bound::Excluded(last),
+            None => std::ops::Bound::Unbounded,
+        };
+        let range = match table.range((start, std::ops::Bound::Unbounded)) {
+            Ok(r) => r,
+            Err(e) => Self::redb_expect(&format!("range: {e}")),
+        };
+        let mut out = Vec::new();
+        for entry in range.take(n) {
+            let (k, v) = match entry {
+                Ok(e) => e,
+                Err(e) => Self::redb_expect(&format!("range 条目: {e}")),
+            };
+            let hash = k.value();
+            let bytes = v.value().to_vec();
+            let (key, accs) = deserialize_spill_value(&bytes, &self.layout)
+                .unwrap_or_else(|e| panic!("spill 读回损坏(致命): {e}"));
+            self.drain_cursor = Some(hash);
+            out.push((key, accs));
+        }
         out
     }
 
@@ -1270,5 +1309,41 @@ mod tests {
         assert!(s2.contains(h), "take 只读——条目保留");
         s2.cleanup();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn redb_drain_up_to_streams_all() {
+        // 流式分批读回（M5-3）：分 3 批读完 5 键, 无重复无遗漏, 尾批后返回空。
+        let layout = sample_layout();
+        let path = spill_test_path("redb_drain_stream");
+        let mut s = RedbSpillStore::create(&path, std::sync::Arc::clone(&layout))
+            .expect("create");
+        let mut entries = Vec::new();
+        for i in 0..5i64 {
+            let k = ScopeKey::Int(1000 + i);
+            entries.push((spill_hash(&k), k, vec![StatsAccum::Last(None)]));
+        }
+        s.put_batch(entries).expect("put_batch");
+
+        let b1 = s.drain_up_to(2);
+        let b2 = s.drain_up_to(2);
+        let b3 = s.drain_up_to(2);
+        let b4 = s.drain_up_to(2);
+        assert_eq!(b1.len(), 2);
+        assert_eq!(b2.len(), 2);
+        assert_eq!(b3.len(), 1, "尾批 1 键");
+        assert!(b4.is_empty(), "读完后返回空");
+        let mut keys: Vec<i64> = b1
+            .into_iter()
+            .chain(b2)
+            .chain(b3)
+            .map(|(k, _)| match k {
+                ScopeKey::Int(v) => v,
+                _ => panic!("期望 Int"),
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec![1000, 1001, 1002, 1003, 1004], "全部键恰好一次");
+        s.cleanup();
     }
 }
