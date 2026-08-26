@@ -195,6 +195,8 @@ bench 的 `RSS_peak` 单次不可信（运行间波动），对比用 `MEMORY=1 
 | f64 快车道（`stage_yield_cell_f64`） | ★4 | `column_batch.rs` + `each_exec.rs` | yield 与 entity 同列数字 → 直写免 Value/coerce | q1/q13；EPS +40% 实证 |
 | `EntityCol` 列直读 | ★4 | `each_exec.rs` | Int64/TsNanos/Utf8/Generic 三态直读 | q13a/q13b |
 | 零拷贝 move 进列（`EachRowCells` owned） | ★4 | `column_batch.rs` | owned 值 move 进列，免二次拷贝 | fcb4630 核心；moved 批式已证分配总量不变则内存不变 |
+| **列式中间窗 staging**（`push_record_columnar`） | ★4 | `rule_task.rs` `PipeBatchStager` | col_sources 预计算 + SmolStr 内联 meta，免 `record_window_fields` 的 clone+HashSet+Arc::from 每行分配 | q4a 4.4×；deferred emit/行式 on-each 中间窗统一受益；push_record 退化为测试对拍用 |
+| **中间窗轻量 build**（`build_each_alert_pipe`） | ★4 | `each_exec.rs` | 跳过 wfx_id 哈希/fired_at ISO8601/machine_id（中间窗消费者按列读不需要）；yield 引用 `__wfu_*` meta 时回退全量 | q4a；复用 q13a `each_yield_meta_light` 空槽不可观测性；收益小（build 已薄）但机制通用 |
 
 ### B. Join / 正确性
 
@@ -205,6 +207,8 @@ bench 的 `RSS_peak` 单次不可信（运行间波动），对比用 `MEMORY=1 
 | **D4 保留 pin** | ★5 | `rule_task.rs` `publish_retention_floor` | 挂起实例保留 pin 闭环到时间驱逐 | deferred 正确性根治（q4/q9） |
 | **运行期评估 gate** | ★5 | `rule_task.rs` `scan_deferred` | 评估前沿 = 目标窗 append 位 | q4a 100M 欠发根治 |
 | **健全前沿 gate**（跨源提交乱序） | ★5 | `rule_task.rs` | 乱序提交防护 + lo_min 历史缓存修复 | 30M 三连根治（正确性/多发/内存） |
+| **条件复核冗余跳过**（`cond_recheck_redundant`） | ★4 | `deferred_exec.rs` | asof 契约保证候选 key 匹配 → 单条件规则跳过 `row_matches_conds`（~17ns/候选） | q4a/q9；⚠ 依赖 asof 契约，测试 lookup 必须同步按契约过滤 |
+| **enrich 裸名注入**（`enrich_join_row_bare`） | ★4 | `context.rs` | `eval_field_value` 对 Qualified 读裸名键 → qualified 键死数据，只注入裸名（or_insert 不覆盖）；省 457ns/实例（3.1×） | q4a 主墙（评估 56%）；eager 路径保留全量（契约测试锁定） |
 | provider 预物化（`join_rows_lookup`） | ★3 | `window/provider/mod.rs` | 静态表 Arc<Event> 一次构建 | 收益有限（批级预查已压 lookup 频率） |
 
 ### C. 测量 / 诊断
@@ -219,6 +223,7 @@ bench 的 `RSS_peak` 单次不可信（运行间波动），对比用 `MEMORY=1 
 | fp 探针（`footprint <pid>`） | ★4 | 外部命令 | dirty（真持有）vs RSS（水位） | 判"真持有 vs 伪影" |
 | 内部 alloc 峰值（`alloc.peak_rss_bytes`） | ★4 | metrics | 内部历史峰值不漏峰、零 spawn | mimalloc 禁用时 rss 仍有效（进程级） |
 | 组件分解 bench（cut A/B/C/D） | ★4 | `each_bench.rs` | 函数级 profile（fill/stage/commit 分桶） | fill 96% 定位依据 |
+| **评估成本分解 bench**（`q4a_eval_cost_decomposition`） | ★4 | `deferred_bench.rs` | 评估五段独立计时（asof/filter/reduce/enrich/build），合计与实测吻合 | q4a enrich 主墙（56%）定位；`in_interval`/`select_reduce_row`/`enrich_join_row` 独立可调 |
 | 内存分账指标（window/parse/fanout） | ★4 | metrics | 在途量对账等式 | 守护测试钉导出（防静默失效） |
 | `MemoryProbe`/`CountingAlloc` | ★4 | `memory_probe.rs` | 测试内分配峰值（N vs 3N 断言） | 路径消融 + 回归保护 |
 
