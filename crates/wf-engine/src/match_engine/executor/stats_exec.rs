@@ -645,7 +645,11 @@ impl StatsWindowState {
         if !self.account_new_bucket(plan) {
             return None;
         }
-        let chain = self.buckets.entry(hash).or_default();
+        // 链 Vec 容量精确 1（2026-08-26 q18 状态 2.3× 归因）：`or_default()`
+        // 空 Vec push 1 个后 capacity=4（Rust 标准库 0→4 起步）→ 每链占 4 桶
+        // 容量（192B）实装 1 桶（48B）——q18 每键独立 hash（链均长 1.0）→
+        // 2935 万链 × 144B ≈ 4.2G 纯浪费。`with_capacity(1)` 精确 1 桶。
+        let chain = self.buckets.entry(hash).or_insert_with(|| Vec::with_capacity(1));
         chain.push(StatsBucket {
             scope_key: key.clone(),
             accs: StatsAccum::accs_for_plan(plan),
@@ -673,7 +677,7 @@ impl StatsWindowState {
         if !self.account_new_bucket(plan) {
             return None;
         }
-        let chain = self.buckets.entry(hash).or_default();
+        let chain = self.buckets.entry(hash).or_insert_with(|| Vec::with_capacity(1));
         let scope_key = scope_key_from_comps(comps);
         chain.push(StatsBucket {
             scope_key,

@@ -1625,6 +1625,103 @@ fn q18_close_alloc_footprint() {
             probe.current()
         };
 
+        // 状态拆分：size_of 求和口径 vs CountingAlloc 实测口径——量化 777B vs
+        // 336B 差异（Vec 容量翻倍？HashMap 槽？RowFields 漏算？）。
+        {
+            let n_chains = exec.window.buckets.len();
+            let n_buckets: usize = exec.window.buckets.values().map(|c| c.len()).sum();
+            let mut sum_scopes = 0usize;
+            let mut sum_accs_cap = 0usize;
+            let mut sum_accs_len = 0usize;
+            let mut sum_bucket_stack = 0usize;
+            let mut sum_chain_cap = 0usize;
+            let mut sum_rowfields = 0usize;
+            let mut shared_rows = 0usize;
+            for chain in exec.window.buckets.values() {
+                sum_chain_cap += chain.capacity() * size_of_val(chain.first().unwrap_or_else(|| {
+                    // 空链不贡献桶内存; 用占位类型大小（不可能到达）
+                    return &exec.window.buckets.values().next().expect("非空")[0];
+                }));
+                for b in chain {
+                    sum_bucket_stack += size_of_val(b);
+                    sum_scopes += size_of_val(&b.scope_key) + scope_key_heap_bytes(&b.scope_key);
+                    sum_accs_cap += b.accs.capacity() * size_of_val(&b.accs[0]);
+                    sum_accs_len += b.accs.len() * size_of_val(&b.accs[0]);
+                    let shared = b.accs.iter().filter(|a| a.last().is_some()).count();
+                    if shared > 0 {
+                        shared_rows += 1;
+                        let rf = b.accs.iter().find_map(|a| a.last().as_ref()).expect("is_some");
+                        sum_rowfields += 16 + row_fields_heap_bytes_test(rf);
+                    }
+                }
+            }
+            // HashMap<u64, Vec<StatsBucket>>：槽位 + 控制字（foldhash 87.5% 满）。
+            let hashmap_slots = (n_chains as f64 / 0.875) as usize;
+            let hashmap_bytes = hashmap_slots * (8 + 16) /* key + bucket ptr/ctrl */;
+            let total_sum = sum_bucket_stack + sum_scopes + sum_accs_cap + sum_chain_cap
+                + sum_rowfields + hashmap_bytes;
+            eprintln!(
+                "[q18-state-hold] n_buckets={} n_chains={} 链均长={:.1}",
+                n_buckets,
+                n_chains,
+                n_buckets as f64 / n_chains.max(1) as f64,
+            );
+            eprintln!(
+                "[q18-state-hold] 求和口径: StatsBucket栈={:.0}MB scopeKey={:.0}MB accs_cap={:.0}MB accs_len={:.0}MB chain_cap={:.0}MB rowfields={:.0}MB hashmap={:.0}MB 合计={:.0}MB ({:.0}B/桶)",
+                sum_bucket_stack as f64 / 1e6,
+                sum_scopes as f64 / 1e6,
+                sum_accs_cap as f64 / 1e6,
+                sum_accs_len as f64 / 1e6,
+                sum_chain_cap as f64 / 1e6,
+                sum_rowfields as f64 / 1e6,
+                hashmap_bytes as f64 / 1e6,
+                total_sum as f64 / 1e6,
+                total_sum as f64 / n_buckets.max(1) as f64,
+            );
+            eprintln!(
+                "[q18-state-hold] CountingAlloc 实测 state_hold={:.1}MB ({:.0}B/桶) vs 求和 {:.1}MB——差 {:.1}MB",
+                state_hold as f64 / 1e6,
+                state_hold as f64 / n_buckets.max(1) as f64,
+                total_sum as f64 / 1e6,
+                (state_hold as f64 - total_sum as f64) / 1e6,
+            );
+            eprintln!(
+                "[q18-state-hold] accs 容量放大 = {:.2}×（len→cap），链 Vec 放大 = {:.2}×",
+                sum_accs_cap as f64 / sum_accs_len.max(1) as f64,
+                sum_chain_cap as f64
+                    / (n_buckets * (sum_bucket_stack as f64 / n_buckets.max(1) as f64) as usize)
+                        .max(1) as f64,
+            );
+
+            // HashMap 容器本身的开销（隔离测：同样的键数插空 Vec）——
+            // CountingAlloc 实测每 entry 的槽位+控制字+对齐真实成本。
+            let hm_overhead = {
+                use std::collections::HashMap as StdHashMap;
+                let probe = crate::memory_probe::MemoryProbe::exclusive();
+                let mut m: StdHashMap<u64, Vec<u8>> = StdHashMap::new();
+                for i in 0..n_chains {
+                    m.entry(i as u64)
+                        .or_insert_with(|| Vec::with_capacity(1))
+                        .push(0);
+                }
+                let peak = probe.peak_growth();
+                eprintln!(
+                    "[q18-state-hold] HashMap<u64,Vec<u8>> {} 链容器开销 = {:.1}MB ({:.0}B/链)",
+                    n_chains,
+                    peak as f64 / 1e6,
+                    peak as f64 / n_chains.max(1) as f64,
+                );
+                peak
+            };
+            eprintln!(
+                "[q18-state-hold] 容器差 = CountingAlloc {} - 求和链 {} = {:.1}MB",
+                hm_overhead as f64 / 1e6,
+                (sum_chain_cap + hashmap_bytes) as f64 / 1e6,
+                (hm_overhead as f64 - (sum_chain_cap + hashmap_bytes) as f64) / 1e6,
+            );
+            assert!(n_buckets > 0);
+        }
+
         // 阶段 ②：close_buckets_to_rows 全量转换（StatsCloseBucket）。
         let buckets = exec.take_buckets_up_to(n_buckets);
         let convert_peak = {
@@ -1807,6 +1904,28 @@ fn q18_close_fmt_vs_const() {
         (full_peak as f64 - const_peak as f64) / full_peak as f64 * 100.0,
     );
     assert!(full_peak >= const_peak);
+}
+
+/// RowFields 堆内存（Box 数组元素 + null_mask；layout Arc 全局共享不计）——
+/// 与 nexmark_hotpath_bench 的 row_fields_heap_bytes 同口径。
+fn row_fields_heap_bytes_test(rf: &wf_engine::match_engine::RowFields) -> usize {
+    let l = rf.layout();
+    l.n_numeric() * 8
+        + l.n_strings() * 24 // SmolStr 24B 内联
+        + l.n_others() * size_of::<Option<wf_engine::match_engine::Value>>()
+        + l.n_fields().div_ceil(64) * 8 // null_mask
+}
+
+/// ScopeKey 堆内存（Box 子节点；Str 长串堆分配忽略——q18 键为数字）。
+fn scope_key_heap_bytes(k: &wf_engine::match_engine::ScopeKey) -> usize {
+    use wf_engine::match_engine::ScopeKey;
+    match k {
+        ScopeKey::Pair(a, b) => {
+            size_of::<ScopeKey>() * 2 + scope_key_heap_bytes(a) + scope_key_heap_bytes(b)
+        }
+        ScopeKey::Str(s) if s.len() > 22 => s.len(),
+        _ => 0,
+    }
 }
 
 /// q18 同形 executor，detail 改 StringLit 常量（对照 fmt 增量）。
