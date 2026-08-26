@@ -1774,6 +1774,99 @@ fn q19_stats_group_topn() {
     report("q19 stats batch top10", col_ns, row_ns);
 }
 
+/// Q4b：stats `stats<1d:fixed> group by (f.category) { f | avg(f.final) }`——
+/// 消费 q4a 中间窗 auction_finals（id/category/final/dateTime）。group 键域
+/// 极小（category 0..4），avg 累加——测 stats executor 净成本（2026-08-26
+/// q4 归因：q4a staging 列式化后剩余差异主嫌疑）。
+fn q4b_stats_plan() -> StatsPlan {
+    StatsPlan {
+        window_spec: WindowSpec::Fixed(Duration::from_secs(86400)), // 1d
+        keys: vec![Expr::Field(FieldRef::Qualified(
+            "f".into(),
+            "category".into(),
+        ))],
+        output_shape: StatsOutputShapePlan::Rows,
+        measures: vec![StatsMeasurePlan {
+            label: "avg_final".into(),
+            source_alias: "f".into(),
+            where_expr: None,
+            agg: StatsAggPlan::Avg,
+            field: Some(FieldRef::Qualified("f".into(), "final".into())),
+            arg: None,
+        }],
+        tracked_bind_fields: {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "f".to_string(),
+                HashSet::from(["category".to_string(), "final".to_string()]),
+            );
+            m
+        },
+    }
+}
+
+/// Q4b stats 消费成本（2026-08-26 q4 归因）：1.67M auction_finals 行 →
+/// stats group by category avg（键域 5）。行式/列式双路径。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine q4b_stats_group_avg -- --ignored --nocapture"]
+fn q4b_stats_group_avg() {
+    // auction_finals 形状行（id/category/final；category 域 5，final 连续值）。
+    let rows: Vec<HashMap<String, Value>> = (0..N)
+        .map(|i| {
+            let mut m = HashMap::new();
+            m.insert("id".to_string(), num(i as f64));
+            m.insert("category".to_string(), num((i % 5) as f64));
+            m.insert("final".to_string(), num(10.0 + (i % 997) as f64));
+            m
+        })
+        .collect();
+    let batch = {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Int64, false),
+            Field::new("final", DataType::Int64, false),
+        ]);
+        let ids: Vec<i64> = (0..N as i64).collect();
+        let cats: Vec<i64> = (0..N as i64).map(|i| i % 5).collect();
+        let finals: Vec<i64> = (0..N as i64).map(|i| 10 + i % 997).collect();
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(cats)),
+                Arc::new(Int64Array::from(finals)),
+            ],
+        )
+        .expect("batch")
+    };
+
+    // 行式：group by category + avg(final)
+    let mut exec = StatsExecutor::with_row_fields(
+        q4b_stats_plan(),
+        Some(
+            Arc::new(
+                ["category".to_string(), "final".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+        ),
+    );
+    let t0 = Instant::now();
+    exec.process_rows(&rows, |row, name| row.get(name).cloned());
+    let row_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q4b stats rows avg", row_ns, row_ns);
+
+    // 列式：group by category + avg(final)
+    let mut exec2 = StatsExecutor::with_row_fields(q4b_stats_plan(), None);
+    let t1 = Instant::now();
+    assert!(
+        exec2.process_batch(&batch),
+        "列式前置应满足（Int64 category/final）"
+    );
+    let col_ns = t1.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("q4b stats batch avg", col_ns, row_ns);
+}
+
 // ---------------------------------------------------------------------------
 // Bench 10：Q20 on each + snapshot join + where
 // ---------------------------------------------------------------------------

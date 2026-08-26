@@ -371,8 +371,136 @@ fn q13a_pipe_columnar_bench() {
     let _ = empty_tracked_bind_fields();
 }
 
-/// q13a 双路径 对拍（2026-08-25 q13a 列式化正确性锁）：row path
-/// （`execute_each_with_joins` → `push_record`）与 columnar pipe path
+/// q4a deferred 中间窗 schema（`__wf_pipe_ts` + 4 yield 列 + 4 meta 列——
+/// `record_window_fields` 行式路径会补的四个 `__wfu_meta_*`）。
+fn q4a_stager_schema() -> Arc<arrow::datatypes::Schema> {
+    use wf_lang::wfu_meta::WfuIntermediateMetaField;
+    Arc::new(Schema::new(vec![
+        Field::new(
+            "__wf_pipe_ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("id", DataType::Int64, true),
+        Field::new("category", DataType::Int64, true),
+        Field::new("final", DataType::Float64, true),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new(
+            WfuIntermediateMetaField::RuleName.name(),
+            DataType::Utf8,
+            true,
+        ),
+        Field::new(
+            WfuIntermediateMetaField::Score.name(),
+            DataType::Utf8,
+            true,
+        ),
+        Field::new(
+            WfuIntermediateMetaField::EntityType.name(),
+            DataType::Utf8,
+            true,
+        ),
+        Field::new(
+            WfuIntermediateMetaField::EntityId.name(),
+            DataType::Utf8,
+            true,
+        ),
+    ]))
+}
+
+/// q4a deferred emit 中间窗 staging 对比（2026-08-26）：deferred 到期评估的
+/// `OutputRecord` → `push_record`（行式：`record_window_fields` 的
+/// yield_fields clone + HashSet + meta 名 Arc::from 每行分配）vs
+/// `push_record_columnar`（列式：col_sources 预计算 + SmolStr 内联 meta 值）。
+///
+/// 背景：q4 30M EPS 7.66M → 4.25M（回归），q4a 与 q9 deferred 部分同构但
+/// yield 到中间窗（q9 直出 sink）——staging 是 q4 掉速主嫌疑。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-runtime q4a_stage_bench -- --ignored --nocapture"]
+fn q4a_stage_bench() {
+    use wf_engine::alert::AlertOrigin;
+    use wf_engine::match_engine::Value;
+    let schema = q4a_stager_schema();
+    let yield_names: Vec<Arc<str>> = ["id", "category", "final", "dateTime"]
+        .iter()
+        .map(|s| Arc::from(*s))
+        .collect();
+    // q4a 产量形状的 OutputRecord（30M 数据 ≈ 1.67M 行，抽样 N）。
+    let records: Vec<OutputRecord> = (0..N)
+        .map(|i| {
+            let r = OutputRecord {
+                wfx_id: format!("id-{i}"),
+                rule_name: Arc::from("q4a_auction_finals"),
+                score: 20.0,
+                entity_type: Arc::from("digit"),
+                entity_id: (100_000 + i).to_string(),
+                origin: AlertOrigin::Deferred,
+                fired_at: "2026-08-26T00:00:00Z".to_string(),
+                emit_time: Arc::from("2026-08-26T00:00:00Z"),
+                matched_rows: Vec::new(),
+                summary: Arc::from(""),
+                yield_target: Arc::from("auction_finals"),
+                yield_fields: vec![
+                    (Arc::from("id"), Value::Number(i as f64)),
+                    (Arc::from("category"), Value::Number((i % 5) as f64)),
+                    (Arc::from("final"), Value::Number(10.0 + i as f64)),
+                    // dateTime 缺失 → 时间列回退 event_time_nanos
+                ],
+                yield_field_types: Vec::new().into(),
+                event_time_nanos: NANOS + i as i64,
+                machine_id: Arc::from(""),
+                scope_key: Arc::from(""),
+            };
+            r
+        })
+        .collect();
+
+    // 行式 staging（旧路径）。
+    let start = Instant::now();
+    for _ in 0..4 {
+        let mut stager = PipeBatchStager::new(Arc::from("auction_finals"), Arc::clone(&schema), Some(4));
+        for r in &records {
+            stager.push_record(r).expect("row stage");
+        }
+        let _ = stager.take_batch().expect("build").expect("rows");
+    }
+    let row_ns = start.elapsed().as_nanos() as f64 / (N as f64 * 4.0);
+
+    // 列式 staging（2026-08-26 新路径）。
+    let start = Instant::now();
+    for _ in 0..4 {
+        let mut stager = PipeBatchStager::new_columnar(
+            Arc::from("auction_finals"),
+            Arc::clone(&schema),
+            Some(4),
+            &yield_names,
+        );
+        for r in &records {
+            stager.push_record_columnar(r).expect("col stage");
+        }
+        let _ = stager.take_batch().expect("build").expect("rows");
+    }
+    let col_ns = start.elapsed().as_nanos() as f64 / (N as f64 * 4.0);
+
+    eprintln!(
+        "[q4a-stage-bench] N={N} 行式 push_record    {:>9.1} ns/row  ({:>7.2}M rows/s)",
+        row_ns,
+        1e9 / row_ns / 1e6
+    );
+    eprintln!(
+        "[q4a-stage-bench] N={N} 列式 push_record_columnar {:>9.1} ns/row  ({:>7.2}M rows/s)",
+        col_ns,
+        1e9 / col_ns / 1e6
+    );
+    eprintln!(
+        "[q4a-stage-bench] 列式/行式 = {:.1}x（staging 每行省 record_window_fields 分配）",
+        row_ns / col_ns
+    );
+}
 /// （`execute_each_pipe_batch_columnar` → `push_row`）产出的中间窗批次必须
 /// **字节一致**——含 meta 回退列（`__wfu_*`）与 `__wf_pipe_ts` 事件时间列。
 #[test]

@@ -18,7 +18,9 @@ use wf_engine::match_engine::{
 use wf_engine::normalize_epoch_timestamp_float_nanos;
 use wf_engine::window::{Router, RulePush};
 use wf_lang::plan::{ConvPlan, WindowSpec};
-use wf_lang::wfu_meta::{WFU_ID, WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
+use wf_lang::wfu_meta::WFU_ID;
+#[cfg(test)]
+use wf_lang::wfu_meta::{WFU_INTERMEDIATE_META_FIELDS, WfuIntermediateMetaField};
 
 use crate::alert_task::SinkFanout;
 use crate::engine_task::conv_stage::{ConvCloseBatch, ConvShardSink};
@@ -2055,32 +2057,73 @@ impl RuleTask {
         let lookup = RegistryLookup::new(&self.router);
         let mut stats = RuleBatchDebugStats::default();
         let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        // 中间窗轻量化（2026-08-26 q4a）：yield 到中间窗且 yield 表达式不引用
+        // `__wfu_*` meta → 评估后走轻量 build（`build_each_alert_pipe`，跳过
+        // wfx_id/fired_at/summary 构建——中间窗消费者按列读不需要；q4a 评估
+        // 1.7µs 的固定成本大头）。sink 目标 / 引用 meta 的 yield → 全量 build。
+        let pipe_light = self
+            .intermediate_targets
+            .contains(self.executor.static_yield_target().as_ref())
+            && self.executor.pipe_light_build_ready();
         // 到期 miss 的收集——join 目标窗口可能 append 滞后（引擎流式 vs oracle
         // 预加载），留到 EOS flush 重试（届时目标完整）；真 miss 重试后仍 miss。
         let mut missed_this = Vec::new();
         for p in due {
-            match self
-                .executor
-                .execute_deferred_join(join_idx, &p, &lookup, emit_time_nanos)
-            {
-                Ok(Some(record)) => {
-                    if debug_enabled {
-                        stats.count_output(&record, &self.intermediate_targets);
+            match self.executor.evaluate_deferred_join(join_idx, &p, &lookup) {
+                Ok(Some(out_ctx)) => {
+                    let record = if pipe_light {
+                        self.executor
+                            .build_each_alert_pipe(&out_ctx, p.expiry_nanos)
+                    } else {
+                        self.executor
+                            .build_deferred_output(&out_ctx, p.expiry_nanos, emit_time_nanos)
+                    };
+                    match record {
+                        Ok(Some(record)) => {
+                            if debug_enabled {
+                                stats.count_output(&record, &self.intermediate_targets);
+                            }
+                            if debug_enabled && stats.allow_detail() {
+                                log_output_emitted(
+                                    "execute_deferred",
+                                    "deferred",
+                                    output_kind(&record, &self.intermediate_targets),
+                                    &record,
+                                    &[],
+                                );
+                            }
+                            self.emit(record).await;
+                        }
+                        Ok(None) => {
+                            // 到期 miss：join 目标窗口可能未追平（append 滞后）——
+                            // 留到 EOS 重试（届时目标完整）。真 miss 重试后仍 miss。
+                            missed_this.push(p);
+                            if debug_enabled {
+                                stats.output_none += 1;
+                            }
+                            if debug_enabled && stats.allow_detail() {
+                                log_output_suppressed(self.rule_name(), "execute_deferred", None);
+                            }
+                        }
+                        Err(e) => {
+                            if debug_enabled {
+                                stats.errors += 1;
+                            }
+                            wf_warn!(
+                                pipe,
+                                task_id = %self.task_id,
+                                rule = %self.rule_name(),
+                                stage = 0,
+                                phase = "execute_deferred",
+                                error = %e,
+                                "deferred join output failed"
+                            );
+                        }
                     }
-                    if debug_enabled && stats.allow_detail() {
-                        log_output_emitted(
-                            "execute_deferred",
-                            "deferred",
-                            output_kind(&record, &self.intermediate_targets),
-                            &record,
-                            &[],
-                        );
-                    }
-                    self.emit(record).await;
                 }
                 Ok(None) => {
-                    // 到期 miss：join 目标窗口可能未追平（append 滞后）——
-                    // 留到 EOS 重试（届时目标完整）。真 miss 重试后仍 miss。
+                    // 到期 miss（评估无匹配）：join 目标窗口可能未追平（append
+                    // 滞后）——留到 EOS 重试（届时目标完整）。真 miss 重试后仍 miss。
                     missed_this.push(p);
                     if debug_enabled {
                         stats.output_none += 1;
@@ -3558,7 +3601,7 @@ impl RuleTask {
         match &mut *guard {
             PipeState::Dead => {}
             PipeState::Staging(stager) => {
-                if let Err(e) = stager.push_record(&record) {
+                if let Err(e) = stager.push_record_columnar(&record) {
                     wf_warn!(
                         pipe,
                         task_id = %self.task_id,
@@ -3577,8 +3620,22 @@ impl RuleTask {
                 let target = Arc::clone(&record.yield_target);
                 match resolve_pipe_shape(&self.pipe_registry, &self.router, &target) {
                     Some((schema, time_col_index)) => {
-                        let mut stager = PipeBatchStager::new(target, schema, time_col_index);
-                        if let Err(e) = stager.push_record(&record) {
+                        // 2026-08-26 q4a：列式装载（new_columnar 预计算列来源
+                        // 计划 + push_record_columnar）——deferred 中间窗产量
+                        // 大（q4a 每 auction 一条），行式 record_window_fields
+                        // 的 clone+HashSet+meta Arc::from 每行分配是 staging
+                        // 主成本（q13a row path stage≈476ns/行同源）。
+                        let yield_names: Vec<Arc<str>> = self
+                            .executor
+                            .plan()
+                            .yield_plan
+                            .fields
+                            .iter()
+                            .map(|f| Arc::from(f.name.as_str()))
+                            .collect();
+                        let mut stager =
+                            PipeBatchStager::new_columnar(target, schema, time_col_index, &yield_names);
+                        if let Err(e) = stager.push_record_columnar(&record) {
                             wf_warn!(
                                 pipe,
                                 task_id = %self.task_id,
@@ -3947,6 +4004,7 @@ impl PipeBatchStager {
             cols,
             rows: 0,
             col_sources: Vec::new(),
+            yield_names: Vec::new(),
         }
     }
 
@@ -3993,6 +4051,7 @@ impl PipeBatchStager {
                 PipeColSource::Missing
             })
             .collect();
+        stager.yield_names = yield_names.to_vec();
         stager
     }
 
@@ -4001,6 +4060,10 @@ impl PipeBatchStager {
     /// fallbacks for the pipe event-time field and the schema's time
     /// column), so a flushed batch is byte-identical to concatenating the
     /// per-row batches the old path produced.
+    ///
+    /// 2026-08-26 q4a：生产路径已切到 [`Self::push_record_columnar`]（列式），
+    /// 本行式实现仅服务对拍测试（字节一致锁）。
+    #[cfg(test)]
     fn push_record(&mut self, record: &OutputRecord) -> RuntimeResult<()> {
         let event_time_nanos = record.event_time_nanos;
         let fields = record_window_fields(record);
@@ -4010,6 +4073,60 @@ impl PipeBatchStager {
                 .find(|(name, _)| **name == *field.name())
                 .map(|(_, value)| value);
             let is_event_time = field.name() == PIPE_EVENT_TIME_FIELD;
+            let is_time_column = self.time_col_index == Some(idx);
+            push_pipe_col(
+                &mut self.cols[idx],
+                value,
+                is_event_time,
+                is_time_column,
+                event_time_nanos,
+            )?;
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// 列式装载一条 `OutputRecord`（2026-08-26 q4a deferred 中间窗）：复用
+    /// `new_columnar` 预计算的列来源计划，免 `push_record` 的
+    /// `record_window_fields`（yield_fields clone + HashSet + meta 名 Arc::from
+    /// 每行分配）。语义与 `push_record` 完全一致（meta/yield/EventTime 值来源
+    /// 逐分支对齐），对拍测试钉死字节一致。
+    ///
+    /// 注：`yield_fields` 与 yield 计划**顺序对齐但可能缺项**（Optional 字段
+    /// None 被过滤）→ 按名回退查找（yield 列数少，O(cols)）。
+    fn push_record_columnar(&mut self, record: &OutputRecord) -> RuntimeResult<()> {
+        use wf_engine::match_engine::Value;
+        debug_assert_eq!(
+            self.col_sources.len(),
+            self.schema.fields().len(),
+            "columnar stager 必须先 new_columnar 预计算来源计划"
+        );
+        // meta 值预构：SmolStr 内联（≤22B 无堆分配）——rule_name/entity_type/
+        // entity_id 典型值均内联，比 Arc::from 更省。
+        let meta_rule = Value::Str(record.rule_name.as_ref().into());
+        let meta_entity_type = Value::Str(record.entity_type.as_ref().into());
+        let meta_entity_id = Value::Str(record.entity_id.as_str().into());
+        let event_time_nanos = record.event_time_nanos;
+        for (idx, source) in self.col_sources.iter().enumerate() {
+            let value: Option<&Value> = match source {
+                PipeColSource::Yield(yield_idx) => self
+                    .yield_names
+                    .get(*yield_idx)
+                    .and_then(|name| {
+                        record
+                            .yield_fields
+                            .iter()
+                            .find(|(n, _)| **n == **name)
+                            .map(|(_, v)| v)
+                    }),
+                PipeColSource::EventTime => None,
+                PipeColSource::MetaRuleName => Some(&meta_rule),
+                PipeColSource::MetaScore => Some(&Value::Number(record.score)),
+                PipeColSource::MetaEntityType => Some(&meta_entity_type),
+                PipeColSource::MetaEntityId => Some(&meta_entity_id),
+                PipeColSource::Missing => None,
+            };
+            let is_event_time = matches!(source, PipeColSource::EventTime);
             let is_time_column = self.time_col_index == Some(idx);
             push_pipe_col(
                 &mut self.cols[idx],
@@ -4159,6 +4276,9 @@ struct PipeBatchStager {
     /// 列式装载（`new_columnar`）的列来源计划；行式 `push_record` 不填
     /// （按名查找），`push_row` 要求非空。
     col_sources: Vec<PipeColSource>,
+    /// yield 计划字段名（`new_columnar` 保存，供 `push_record_columnar`
+    /// 按名回退——yield_fields 与计划顺序对齐但 Optional 缺失被过滤）。
+    yield_names: Vec<Arc<str>>,
 }
 
 /// 共享的单列装载（q13a 列式化，2026-08-25）：`push_record` 与 `push_row`
@@ -4235,6 +4355,7 @@ fn push_pipe_col(
     Ok(())
 }
 
+#[cfg(test)]
 fn record_window_fields(
     record: &OutputRecord,
 ) -> Vec<(std::sync::Arc<str>, wf_engine::match_engine::Value)> {
@@ -4254,6 +4375,7 @@ fn record_window_fields(
     fields
 }
 
+#[cfg(test)]
 fn record_wfu_intermediate_meta_value(
     record: &OutputRecord,
     field: WfuIntermediateMetaField,
@@ -4669,6 +4791,135 @@ mod pipe_stager_tests {
                 Some(&Value::Str(format!("row-{i}").into()))
             );
             assert_eq!(event.fields.get("flag"), Some(&Value::Bool(i % 2 == 0)));
+        }
+    }
+
+    /// q4a 形状的含 meta 列 schema（deferred 中间窗 auction_finals + 管道 meta
+    /// 列——`record_window_fields` 会补的四个 `__wfu_meta_*`）：
+    /// `__wf_pipe_ts` + id/category/final/dateTime + meta×4。
+    fn q4a_stager_schema() -> arrow::datatypes::SchemaRef {
+        use wf_lang::wfu_meta::WfuIntermediateMetaField;
+        Arc::new(Schema::new(vec![
+            Field::new(
+                PIPE_EVENT_TIME_FIELD,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("id", DataType::Int64, true),
+            Field::new("category", DataType::Int64, true),
+            Field::new("final", DataType::Float64, true),
+            Field::new("dateTime", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+            Field::new(
+                WfuIntermediateMetaField::RuleName.name(),
+                DataType::Utf8,
+                true,
+            ),
+            Field::new(
+                WfuIntermediateMetaField::Score.name(),
+                DataType::Utf8,
+                true,
+            ),
+            Field::new(
+                WfuIntermediateMetaField::EntityType.name(),
+                DataType::Utf8,
+                true,
+            ),
+            Field::new(
+                WfuIntermediateMetaField::EntityId.name(),
+                DataType::Utf8,
+                true,
+            ),
+        ]))
+    }
+
+    /// q4a 形状的 OutputRecord 序列（含 meta 依赖：rule_name/score/entity_type/
+    /// entity_id 与 yield 字段均非空；dateTime 缺失由时间列回退补）。
+    fn q4a_records() -> Vec<OutputRecord> {
+        (0..64)
+            .map(|i| {
+                let mut r = record_with(
+                    "auction_finals",
+                    1_700_000_000_000_000_000 + i * 1_000,
+                    vec![
+                        ("id".into(), Value::Number(i as f64)),
+                        ("category".into(), Value::Number((i % 5) as f64)),
+                        ("final".into(), Value::Number(10.0 + i as f64)),
+                        // dateTime 缺失 → 时间列回退 event_time_nanos
+                    ],
+                );
+                r.rule_name = "q4a_auction_finals".into();
+                r.score = 20.0;
+                r.entity_type = "digit".into();
+                r.entity_id = (100_000 + i).to_string();
+                r
+            })
+            .collect()
+    }
+
+    /// 行式 `push_record` 与列式 `push_record_columnar` 必须产出**字节一致**的
+    /// 批次（2026-08-26 q4a：deferred 中间窗 staging 切列式后，行式路径只留
+    /// 测试对拍——本条钉死两条路径语义一致，防列式装载漏列/错源）。
+    ///
+    /// 覆盖：无 meta 列（stager_schema）+ q4a 形状（含 4 个 meta 列、时间列
+    /// 回退）；meta 值（rule_name/score/entity_type/entity_id）与 yield 字段
+    /// 逐一落入正确列。
+    #[test]
+    fn push_record_columnar_matches_row_path() {
+        let schemas: &[(Arc<str>, arrow::datatypes::SchemaRef, &[Arc<str>])] = &[
+            (
+                "t".into(),
+                stager_schema(),
+                &[
+                    "event_time", "n_i", "n_f", "flag", "label", "blob",
+                ]
+                .iter()
+                .map(|s| Arc::from(*s))
+                .collect::<Vec<_>>(),
+            ),
+            (
+                "auction_finals".into(),
+                q4a_stager_schema(),
+                &["id", "category", "final", "dateTime"]
+                    .iter()
+                    .map(|s| Arc::from(*s))
+                    .collect::<Vec<_>>(),
+            ),
+        ];
+        for (target, schema, yield_names) in schemas {
+            let records: Vec<OutputRecord> =
+                if **target == *"auction_finals" {
+                    q4a_records()
+                } else {
+                    varied_records()
+                };
+            let mut row_stager =
+                PipeBatchStager::new(Arc::clone(target), Arc::clone(schema), Some(1));
+            let mut col_stager = PipeBatchStager::new_columnar(
+                Arc::clone(target),
+                Arc::clone(schema),
+                Some(1),
+                yield_names,
+            );
+            for r in &records {
+                row_stager.push_record(r).expect("row path stage");
+                col_stager
+                    .push_record_columnar(r)
+                    .expect("columnar path stage");
+            }
+            let row_batch = row_stager
+                .take_batch()
+                .expect("build")
+                .expect("rows staged")
+                .1;
+            let col_batch = col_stager
+                .take_batch()
+                .expect("build")
+                .expect("rows staged")
+                .1;
+            assert_eq!(
+                row_batch, col_batch,
+                "target={target}: push_record 与 push_record_columnar 批次必须一致"
+            );
         }
     }
 }

@@ -294,6 +294,105 @@ fn deferred_join_hot_paths() {
     let eager_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
     report("eager-interval", eager_ns, eager_ns);
 }
+/// Q4a 形状：auction_finals yield 4 字段（id/category/final/dateTime=a.expires），
+/// deferred reduce maxrow(price) tie(dateTime asc) within [a.dateTime, a.expires]
+/// on a.id == bid_events.auction。候选数 = auction 生命周期内的 bid 数（q4a
+/// 30M 全流 ~16.5 bid/auction；生命周期内候选是评估成本主变量）。
+fn q4a_deferred_plan() -> RulePlan {
+    let mut plan = deferred_plan(true);
+    plan.name = "q4a_auction_finals".into();
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Simple("id".into())),
+        },
+        YieldField {
+            name: "category".into(),
+            value: Expr::Field(FieldRef::Simple("category".into())),
+        },
+        YieldField {
+            name: "final".into(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "winner".into(),
+                segments: vec![wf_lang::ast::PathSegment::Field("price".into())],
+            }),
+        },
+        YieldField {
+            name: "dateTime".into(),
+            value: Expr::Field(FieldRef::Qualified("a".into(), "expires".into())),
+        },
+    ];
+    plan
+}
+
+/// q4a 驱动 auction 事件（含 category）。
+fn q4a_auction_event() -> Event {
+    let mut fields = EngineHashMap::default();
+    fields.insert("id".into(), Value::Number(5.0));
+    fields.insert("category".into(), Value::Number(3.0));
+    fields.insert("dateTime".into(), Value::Number(NOW as f64));
+    fields.insert("expires".into(), Value::Number((NOW + 60_000_000_000) as f64));
+    Event { fields }
+}
+
+/// q4a 到期评估成本随候选数（auction 生命周期内 bid 数）扫描（2026-08-26
+/// q4 归因：q4a 与 q9 deferred 部分同构，候选数分布是评估成本主变量——
+/// eval-cand8 的 1330ns 是合成形状，q4a 实际候选数待定）。
+#[test]
+#[ignore = "release-only benchmark: cargo test --release -p wf-engine q4a_deferred_eval_candidate_scan -- --ignored --nocapture"]
+fn q4a_deferred_eval_candidate_scan() {
+    let exec = RuleExecutor::new(q4a_deferred_plan());
+    let event = q4a_auction_event();
+    let pending = exec.deferred_pending_for(0, &event, NOW).expect("pending");
+    let base_rows: Vec<(i64, JoinRow)> = (0..32usize)
+        .map(|i| {
+            timed_bid(
+                NOW + 1_000_000_000 + (i as i64) * 1_000_000_000,
+                5.0,
+                i as f64,
+                (i as f64) * 10.0,
+            )
+        })
+        .collect();
+    for &n_cand in &[1usize, 4, 8, 16, 32] {
+        let rows = base_rows[..n_cand].to_vec();
+        let lookup = BidLookup(rows);
+        let start = Instant::now();
+        for _ in 0..N {
+            let rec = exec
+                .execute_deferred_join(0, &pending, &lookup, NOW + 100_000_000_000)
+                .unwrap()
+                .expect("eval hits");
+            std::hint::black_box(&rec);
+        }
+        let per = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+        report(&format!("eval-q4a-cand{n_cand}"), per, per);
+    }
+
+    // ---- 中间窗轻量化对比（2026-08-26 q4a）：evaluate + build_each_alert_pipe
+    // （跳过 wfx_id/fired_at/summary 构建）vs 全量 execute_deferred_join ----
+    let rows4 = base_rows[..4].to_vec();
+    let lookup4 = BidLookup(rows4);
+    let start = Instant::now();
+    for _ in 0..N {
+        let out_ctx = exec
+            .evaluate_deferred_join(0, &pending, &lookup4)
+            .unwrap()
+            .expect("eval hits");
+        let rec = exec
+            .build_each_alert_pipe(&out_ctx, pending.expiry_nanos)
+            .unwrap()
+            .expect("light build");
+        std::hint::black_box(&rec);
+    }
+    let light_ns = start.elapsed().as_secs_f64() * 1e9 / N as f64;
+    report("eval-q4a-light-cand4", light_ns, light_ns);
+    eprintln!(
+        "[deferred-bench] 轻量/全量(cand4) = {:.1}x（中间窗跳过告警字段构建）",
+        1702.9 / light_ns.max(1.0)
+    );
+}
+
 
 // ---------------------------------------------------------------------------
 // 常规（debug 可跑）宽松回归测试

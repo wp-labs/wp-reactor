@@ -1472,6 +1472,138 @@ fn build_each_alert_with_deferred_origin() {
     assert_eq!(RuleExecutor::machine_id_of(&event(vec![])), "");
 }
 
+/// q4a 形状的 each plan：yield 4 字段（id/category/final=winner.price Path/
+/// dateTime=expires），entity=digit(id)——中间窗轻量化（build_each_alert_pipe）
+/// 的对拍对象。
+fn q4a_pipe_rule() -> RuleExecutor {
+    let mut plan = simple_rule_plan(
+        "q4a_pipe_r",
+        simple_plan(vec![], vec![]),
+        Expr::Number(20.0),
+        "digit",
+        field("id"),
+    );
+    plan.binds[0].alias = "a".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "a".into(),
+        filter: None,
+    });
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: field("id"),
+        },
+        YieldField {
+            name: "category".into(),
+            value: field("category"),
+        },
+        YieldField {
+            name: "final".into(),
+            value: Expr::Field(FieldRef::Path {
+                alias: "winner".into(),
+                segments: vec![wf_lang::ast::PathSegment::Field("price".into())],
+            }),
+        },
+        YieldField {
+            name: "dateTime".into(),
+            value: field("expires"),
+        },
+    ];
+    RuleExecutor::new(plan)
+}
+
+/// 中间窗轻量化对拍（2026-08-26 q4a）：`build_each_alert_pipe`（轻量）与
+/// `build_each_alert_with`（全量）产出的**中间窗相关字段逐位一致**——
+/// yield_fields（含 winner.price Path 读取）、event_time_nanos、meta
+/// （rule_name/score/entity_type/entity_id）、yield_target。轻量只跳过 sink
+/// 才需要的告警字段（wfx_id/fired_at/summary/machine_id 空值），不得影响
+/// 中间窗列内容。
+#[test]
+fn deferred_pipe_light_build_matches_full_build() {
+    let exec = q4a_pipe_rule();
+    assert!(
+        exec.pipe_light_build_ready(),
+        "q4a 形状（纯 Field/Path yield）必须走轻量 build"
+    );
+    let ctx = event(vec![
+        ("id", num(5.0)),
+        ("category", num(3.0)),
+        ("price", num(25.5)), // winner.price 富化后的裸名字段
+        ("expires", num(1_000.0)),
+    ]);
+    let full = exec
+        .build_each_alert_with(&ctx, 1_000, crate::alert::AlertOrigin::Deferred, &[], 1_000)
+        .unwrap()
+        .expect("full build");
+    let light = exec
+        .build_each_alert_pipe(&ctx, 1_000)
+        .unwrap()
+        .expect("light build");
+
+    // 中间窗消费者相关的字段必须逐位一致。
+    assert_eq!(full.yield_fields, light.yield_fields, "yield_fields");
+    assert_eq!(full.event_time_nanos, light.event_time_nanos, "event_time");
+    assert_eq!(full.rule_name, light.rule_name, "rule_name");
+    assert_eq!(full.score, light.score, "score");
+    assert_eq!(full.entity_type, light.entity_type, "entity_type");
+    assert_eq!(full.entity_id, light.entity_id, "entity_id");
+    assert_eq!(full.yield_target, light.yield_target, "yield_target");
+
+    // 轻量跳过的告警字段为空（语义：中间窗消费者不读这些列）。
+    assert_eq!(light.wfx_id, "");
+    assert_eq!(light.fired_at, "");
+    assert_eq!(light.summary.as_ref(), "");
+}
+
+/// 轻量门控判定（2026-08-26 q4a）：yield 引用 `__wfu_*` meta → 回退全量
+/// （light YieldMeta 的空槽不可观测性不成立）；SystemVar（light 提供真值）/
+/// 纯 Field/Path → 放行。
+#[test]
+fn pipe_light_build_ready_gate() {
+    use wf_lang::ast::WfuMetaField;
+    // 引用 wfx_id meta → 回退。
+    let mut plan = simple_rule_plan(
+        "gate_r",
+        simple_plan(vec![], vec![]),
+        Expr::Number(1.0),
+        "ip",
+        field("sip"),
+    );
+    plan.yield_plan.fields = vec![YieldField {
+        name: "id".into(),
+        value: Expr::WfuMeta(WfuMetaField::Id),
+    }];
+    assert!(!RuleExecutor::new(plan).pipe_light_build_ready(), "WfuMeta → 回退");
+
+    // SystemVar（score）→ light meta 提供真值，放行。
+    let mut plan2 = simple_rule_plan(
+        "gate_r2",
+        simple_plan(vec![], vec![]),
+        Expr::Number(1.0),
+        "ip",
+        field("sip"),
+    );
+    plan2.yield_plan.fields = vec![YieldField {
+        name: "s".into(),
+        value: Expr::SystemVar(SystemVar::Score),
+    }];
+    assert!(RuleExecutor::new(plan2).pipe_light_build_ready(), "SystemVar → 放行");
+
+    // 纯 Field → 放行（q4a 同款）。
+    let mut plan3 = simple_rule_plan(
+        "gate_r3",
+        simple_plan(vec![], vec![]),
+        Expr::Number(1.0),
+        "ip",
+        field("sip"),
+    );
+    plan3.yield_plan.fields = vec![YieldField {
+        name: "f".into(),
+        value: field("sip"),
+    }];
+    assert!(RuleExecutor::new(plan3).pipe_light_build_ready(), "Field → 放行");
+}
+
 // ---------------------------------------------------------------------------
 // executor/mod.rs — match-alert path (YieldKind::Field / General / Lit)
 // ---------------------------------------------------------------------------
