@@ -1508,6 +1508,37 @@ async fn stats_task_perf_cut_output_keeps_accumulate_no_emit() {
 }
 
 #[tokio::test]
+async fn stats_task_perf_cut_alert_keeps_accumulate_no_emit() {
+    let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // 输出链消融（q19 同款列式 close + top 度量）: 只切 alert 构建——归并照常
+    // （窗口 close 状态正确重置）, CloseOutput 构造照常, alert 不投递。恢复后
+    // 正常输出。全局门控跨 await 持锁（PERF_CUT_SERIAL）。
+    crate::perf_diag::set_perf_cut_alert_for_test(true);
+    let (mut task, mut alert_rx) = make_q19_cut_task();
+    push_batch(
+        &mut task,
+        make_bid_batch(&[(100, 1, 1), (300, 2, 1)], 5_000_000_000),
+        1,
+    )
+    .await;
+    task.flush().await;
+    assert!(alert_rx.try_recv().is_err(), "cut_alert: alert 构建被切");
+    crate::perf_diag::set_perf_cut_alert_for_test(false);
+
+    // 恢复: 新窗口数据正常产出（前窗已被 cut_alert 正确 close 重置——若泄漏
+    // 会污染本窗输出）。
+    push_batch(
+        &mut task,
+        make_bid_batch(&[(150, 1, 1), (250, 2, 1)], 11_000_000_000),
+        2,
+    )
+    .await;
+    task.flush().await;
+    let alerts = take_alerts(&mut alert_rx);
+    assert_eq!(alerts.len(), 2, "恢复后 top-2 两条（前窗无泄漏）");
+}
+
+#[tokio::test]
 async fn q18_stats_task_last_bid_fields_injected() {
         let _g = crate::perf_diag::PERF_CUT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     // Q18 形状: group by (bidder, auction), last(price) —— 每键一条 alert,

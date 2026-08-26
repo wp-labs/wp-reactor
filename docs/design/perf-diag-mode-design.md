@@ -172,9 +172,19 @@ cut_output = true
     **之前**——该路径的 emitted 计数与 append 耦合，切了 append 就**留不住计数**
     （实测：nexmark q1 `on each` 在 `rules` 档的 `emitted_total` 为 0；4 档墙梯
     warmup+floor+rules+full 的总 emitted = 2×9.2M 而非 3×9.2M）。
-  - **影响墙增量的解释口径**：on-each 类规则的 `rules → full` 增量**包含
-    `OutputRecord` 构造成本**（构造在门控之后）；而 match 类规则的构造成本已计入
+  - **影响墙增量的解释口径**：on-each 类规则的 `rules → full` 增量**包含**
+    `OutputRecord` 构造成本（构造在门控之后）；而 match 类规则的构造成本已计入
     `rules` 档——两类规则的「输出墙」不同口径，不可直接横向比。
+- **cut_alert（输出链消融，env 门控，2026-08-26 扩至 close/stats）**：
+  `WF_DIAG_CUT_ALERT=1` 只切 `AlertColumnBuilder` 装载（sink alert 构建），
+  **保留 pipe/join 消费**（与 cut_output「整条输出链一刀切」的细分：回答
+  「输出链增量里 alert 构建占多少」）。覆盖全部 emit 路径：on-each 直投
+  （`emit_each_direct` / `emit_each_direct_batch_columnar_join`）、CEP
+  close/match（`RuleTask::emit` / `emit_batch`，2026-08-26 补）、stats close
+  （`StatsTask::close_current_window` 列式装载 + `emit_close_record` 行式，
+  2026-08-26 补——q19 类 top/统计输出墙的构建成本隔离）。env 临时消融手段
+  （生产勿设），首次调用读 env 一次缓存（Once + 原子读，热路径零开销）；
+  测试经 `set_perf_cut_alert_for_test` 翻转。
 - 门控形态：`set_rule_profiling` 同款全局原子 + `pub fn set_perf_cuts(...)`，
   `Reactor::start` 时从 `--perf-diag` 加载的 `PerfConfig` 初始化（无参数 = 全关）。
   （`set_rule_profiling` 仅作形态参照，它本身不由诊断档翻转，见 §4.1。）

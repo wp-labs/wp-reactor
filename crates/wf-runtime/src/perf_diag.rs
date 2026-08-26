@@ -217,24 +217,38 @@ fn diag_mem_cap(config_max: usize, phys: Option<usize>, env: Option<&str>) -> (u
     }
 }
 
-/// **输出链消融**（2026-08-26 内存定位）：`WF_DIAG_CUT_ALERT=1` 时，规则仍照常
-/// 消费输入（pipe/join 全跑），但**跳过 sink alert 构建**（`AlertColumnBuilder`
-/// 装载）。与 `perf_cut_output` 的区别：后者把整个输出链（pipe 写入 + alert）
-/// 一刀切；本开关只切 alert 这一段，用来回答"那 12.5GB 输出链增量里，alert
-/// 构建占多少"。
+/// 输出链消融开关（Once 一次性读 env 缓存，之后纯原子读——热路径零开销）。
+/// 测试钩子 [`set_perf_cut_alert_for_test`] 消费 Once 后直接翻转（生产路径不调用）。
+static PERF_CUT_ALERT_INIT: std::sync::Once = std::sync::Once::new();
+static PERF_CUT_ALERT: AtomicBool = AtomicBool::new(false);
+
+/// 输出链消融：`WF_DIAG_CUT_ALERT=1` 时，规则仍照常消费输入（pipe/join 全跑），
+/// 但**跳过 sink alert 构建**（`AlertColumnBuilder` 装载）。与 `perf_cut_output`
+/// 的区别：后者把整个输出链（pipe 写入 + alert）一刀切；本开关只切 alert 这一段，
+/// 用来回答「那 12.5GB 输出链增量里，alert 构建占多少」。
 ///
 /// 设计为环境变量而非档位字段：它是临时消融手段（跑完即撤），不需要进
-/// 档状态机/配置。OnceLock 缓存，热路径零开销。
+/// 档状态机/配置。首次调用读 env 一次，之后纯原子读。
 ///
 /// ⚠ **生产勿设**：本开关不依赖 `--perf-diag`（env 直接生效），误设会静默
 /// 丢弃全部 alert 输出（emitted 计数仍走）。用完即撤。
 pub fn perf_cut_alert() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("WF_DIAG_CUT_ALERT")
+    PERF_CUT_ALERT_INIT.call_once(|| {
+        let on = std::env::var("WF_DIAG_CUT_ALERT")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+            .unwrap_or(false);
+        PERF_CUT_ALERT.store(on, Ordering::Relaxed);
+    });
+    PERF_CUT_ALERT.load(Ordering::Relaxed)
+}
+
+/// 测试专用钩子：直接翻转输出链消融开关（生产/正式路径不调用——env 由首次
+/// 访问读取一次）。与 `set_perf_cuts` 同款全局门控纪律：测试须在
+/// `PERF_CUT_SERIAL` 下使用，用完复位为 false。
+#[cfg(test)]
+pub(crate) fn set_perf_cut_alert_for_test(v: bool) {
+    PERF_CUT_ALERT_INIT.call_once(|| {}); // 消费 Once：之后不再读 env
+    PERF_CUT_ALERT.store(v, Ordering::Relaxed);
 }
 
 /// 是否禁止规则求值（cut_rules 门控）。
@@ -910,6 +924,17 @@ mod tests {
             "source={src}"
         );
         reset_perf_diag();
+    }
+
+    // -- 输出链消融开关（set_perf_cut_alert_for_test） ------------------------
+
+    #[test]
+    fn cut_alert_test_hook_flips_and_defaults_false() {
+        let _g = serial();
+        set_perf_cut_alert_for_test(true);
+        assert!(perf_cut_alert(), "测试钩子应能强制开启");
+        set_perf_cut_alert_for_test(false);
+        assert!(!perf_cut_alert(), "用完必须复位");
     }
 
     // -- 哨兵载荷解析 -------------------------------------------------------

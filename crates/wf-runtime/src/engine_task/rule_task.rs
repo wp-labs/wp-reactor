@@ -2680,6 +2680,14 @@ impl RuleTask {
         if crate::perf_diag::perf_cut_output() {
             return;
         }
+        // 输出链消融（2026-08-26）：只切 sink alert 构建，保留 pipe/join 消费。
+        // 与 cut_output 的区别见 perf_diag::perf_cut_alert 注释——CEP close/match
+        // 路径（q12 式）同款门控；stats 规则（q19 式）走 StatsTask 的列式装载/
+        // emit_close_record 门控。intermediate 目标在上面已 return（pipe 写入不受
+        // 影响）。emitted 计数已保留（上面）。
+        if crate::perf_diag::perf_cut_alert() {
+            return;
+        }
         // Append straight into the per-target columnar batch, sealed and
         // flushed to the sink writers when it fills (amortizing the
         // per-alert fan-out mechanics, matching the wp-motor batch model).
@@ -2811,6 +2819,12 @@ impl RuleTask {
             self.stage_pipe_record(record);
         }
         if sink_records.is_empty() {
+            return;
+        }
+        // 输出链消融（2026-08-26）：只切 sink alert 构建，保留 pipe/join 消费。
+        // 与 emit 的 cut_alert 同款（CEP close/match 批量路径）；emitted 计数已
+        // 保留（上面），pipe 已装载（上面）。
+        if crate::perf_diag::perf_cut_alert() {
             return;
         }
         let time_this = {
