@@ -427,31 +427,28 @@ fn q4a_stage_bench() {
         .collect();
     // q4a 产量形状的 OutputRecord（30M 数据 ≈ 1.67M 行，抽样 N）。
     let records: Vec<OutputRecord> = (0..N)
-        .map(|i| {
-            let r = OutputRecord {
-                wfx_id: format!("id-{i}"),
-                rule_name: Arc::from("q4a_auction_finals"),
-                score: 20.0,
-                entity_type: Arc::from("digit"),
-                entity_id: (100_000 + i).to_string(),
-                origin: AlertOrigin::Deferred,
-                fired_at: "2026-08-26T00:00:00Z".to_string(),
-                emit_time: Arc::from("2026-08-26T00:00:00Z"),
-                matched_rows: Vec::new(),
-                summary: Arc::from(""),
-                yield_target: Arc::from("auction_finals"),
-                yield_fields: vec![
-                    (Arc::from("id"), Value::Number(i as f64)),
-                    (Arc::from("category"), Value::Number((i % 5) as f64)),
-                    (Arc::from("final"), Value::Number(10.0 + i as f64)),
-                    // dateTime 缺失 → 时间列回退 event_time_nanos
-                ],
-                yield_field_types: Vec::new().into(),
-                event_time_nanos: NANOS + i as i64,
-                machine_id: Arc::from(""),
-                scope_key: Arc::from(""),
-            };
-            r
+        .map(|i| OutputRecord {
+            wfx_id: format!("id-{i}"),
+            rule_name: Arc::from("q4a_auction_finals"),
+            score: 20.0,
+            entity_type: Arc::from("digit"),
+            entity_id: (100_000 + i).to_string(),
+            origin: AlertOrigin::Deferred,
+            fired_at: "2026-08-26T00:00:00Z".to_string(),
+            emit_time: Arc::from("2026-08-26T00:00:00Z"),
+            matched_rows: Vec::new(),
+            summary: Arc::from(""),
+            yield_target: Arc::from("auction_finals"),
+            yield_fields: vec![
+                (Arc::from("id"), Value::Number(i as f64)),
+                (Arc::from("category"), Value::Number((i % 5) as f64)),
+                (Arc::from("final"), Value::Number(10.0 + i as f64)),
+                // dateTime 缺失 → 时间列回退 event_time_nanos
+            ],
+            yield_field_types: Vec::new().into(),
+            event_time_nanos: NANOS + i as i64,
+            machine_id: Arc::from(""),
+            scope_key: Arc::from(""),
         })
         .collect();
 
@@ -1533,8 +1530,14 @@ fn q18_close_stats_plan() -> StatsPlan {
     StatsPlan {
         window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(86400)),
         keys: vec![
-            wf_lang::ast::Expr::Field(wf_lang::ast::FieldRef::Qualified("b".into(), "bidder".into())),
-            wf_lang::ast::Expr::Field(wf_lang::ast::FieldRef::Qualified("b".into(), "auction".into())),
+            wf_lang::ast::Expr::Field(wf_lang::ast::FieldRef::Qualified(
+                "b".into(),
+                "bidder".into(),
+            )),
+            wf_lang::ast::Expr::Field(wf_lang::ast::FieldRef::Qualified(
+                "b".into(),
+                "auction".into(),
+            )),
         ],
         output_shape: StatsOutputShapePlan::Rows,
         measures: vec![
@@ -1578,13 +1581,13 @@ fn q18_close_batch(n: usize) -> RecordBatch {
             .wrapping_add(1_442_695_040_888_963_407);
         (rng >> 33) % range
     };
-    let auctions: Vec<i64> = (0..n)
-        .map(|_| 1_000 + next(2_000_000) as i64)
-        .collect();
+    let auctions: Vec<i64> = (0..n).map(|_| 1_000 + next(2_000_000) as i64).collect();
     let bidders: Vec<i64> = (0..n).map(|_| 1_000 + next(1010) as i64).collect();
     let prices: Vec<i64> = (0..n).map(|_| (next(10_000_000) + 1) as i64).collect();
     let channels: Vec<String> = (0..n).map(|_| "Google".to_string()).collect();
-    let urls: Vec<String> = (0..n).map(|_| "https://www.nexmark.com/aaaaa/bbbbb/ccccc/item.htm?query=1".to_string()).collect();
+    let urls: Vec<String> = (0..n)
+        .map(|_| "https://www.nexmark.com/aaaaa/bbbbb/ccccc/item.htm?query=1".to_string())
+        .collect();
     let times: Vec<i64> = (0..n).map(|i| NANOS + i as i64 * 65_217).collect();
     RecordBatch::try_new(
         schema,
@@ -1624,10 +1627,7 @@ fn q18_state_chain_capacity_bounded() {
         assert!(exec.process_batch(&batch), "列式前置应满足");
         let n_chains = exec.window.buckets.len();
         let growth = probe.current_growth();
-        (
-            n_chains,
-            growth as f64 / n_chains.max(1) as f64,
-        )
+        (n_chains, growth as f64 / n_chains.max(1) as f64)
     };
 
     // 链容量断言：每条链 capacity == 1（无碰撞时，每链 1 桶）。
@@ -1694,21 +1694,23 @@ fn q18_close_alloc_footprint() {
             let mut sum_bucket_stack = 0usize;
             let mut sum_chain_cap = 0usize;
             let mut sum_rowfields = 0usize;
-            let mut shared_rows = 0usize;
             for chain in exec.window.buckets.values() {
-                sum_chain_cap += chain.capacity() * size_of_val(chain.first().unwrap_or_else(|| {
-                    // 空链不贡献桶内存; 用占位类型大小（不可能到达）
-                    return &exec.window.buckets.values().next().expect("非空")[0];
-                }));
+                sum_chain_cap += chain.capacity()
+                    * size_of_val(chain.first().unwrap_or_else(|| {
+                        // 空链不贡献桶内存; 用占位类型大小（不可能到达）
+                        &exec.window.buckets.values().next().expect("非空")[0]
+                    }));
                 for b in chain {
                     sum_bucket_stack += size_of_val(b);
                     sum_scopes += size_of_val(&b.scope_key) + scope_key_heap_bytes(&b.scope_key);
                     sum_accs_cap += b.accs.capacity() * size_of_val(&b.accs[0]);
                     sum_accs_len += b.accs.len() * size_of_val(&b.accs[0]);
-                    let shared = b.accs.iter().filter(|a| a.last().is_some()).count();
-                    if shared > 0 {
-                        shared_rows += 1;
-                        let rf = b.accs.iter().find_map(|a| a.last().as_ref()).expect("is_some");
+                    if b.accs.iter().any(|a| a.last().is_some()) {
+                        let rf = b
+                            .accs
+                            .iter()
+                            .find_map(|a| a.last().as_ref())
+                            .expect("is_some");
                         sum_rowfields += 16 + row_fields_heap_bytes_test(rf);
                     }
                 }
@@ -1716,8 +1718,12 @@ fn q18_close_alloc_footprint() {
             // HashMap<u64, Vec<StatsBucket>>：槽位 + 控制字（foldhash 87.5% 满）。
             let hashmap_slots = (n_chains as f64 / 0.875) as usize;
             let hashmap_bytes = hashmap_slots * (8 + 16) /* key + bucket ptr/ctrl */;
-            let total_sum = sum_bucket_stack + sum_scopes + sum_accs_cap + sum_chain_cap
-                + sum_rowfields + hashmap_bytes;
+            let total_sum = sum_bucket_stack
+                + sum_scopes
+                + sum_accs_cap
+                + sum_chain_cap
+                + sum_rowfields
+                + hashmap_bytes;
             eprintln!(
                 "[q18-state-hold] n_buckets={} n_chains={} 链均长={:.1}",
                 n_buckets,
@@ -1812,11 +1818,14 @@ fn q18_close_alloc_footprint() {
 
         // 阶段 ②：close_buckets_to_rows 全量转换（StatsCloseBucket）。
         let buckets = exec.take_buckets_up_to(n_buckets);
-        let convert_peak = {
+        {
             let probe = crate::memory_probe::MemoryProbe::exclusive();
             let cb = exec.close_buckets_to_rows(buckets);
             let peak = probe.peak_growth();
-            let cb_bytes: usize = cb.iter().map(|b| b.measures.iter().map(Vec::capacity).sum::<usize>()).sum();
+            let cb_bytes: usize = cb
+                .iter()
+                .map(|b| b.measures.iter().map(Vec::capacity).sum::<usize>())
+                .sum();
             drop(cb);
             eprintln!(
                 "[q18-close] n_buckets={} state_hold={:.1}MB convert_peak={:.1}MB convert_measures_cap={:.1}MB",
@@ -1825,8 +1834,7 @@ fn q18_close_alloc_footprint() {
                 peak as f64 / 1e6,
                 cb_bytes as f64 / 1e6,
             );
-            peak
-        };
+        }
 
         // 阶段 ③：execute_stats_close_batch_columnar 直装载（alert 列）。
         // 需 RuleExecutor（spawn 侧由同一 stats 计划装配）——此处用
@@ -1849,12 +1857,7 @@ fn q18_close_alloc_footprint() {
         let mut exec3 = exec3;
         let b3 = exec3.take_buckets_up_to(n_buckets);
         let cb = exec3.close_buckets_to_rows(b3);
-        let labels: Vec<String> = exec
-            .plan
-            .measures
-            .iter()
-            .map(|m| m.label.clone())
-            .collect();
+        let labels: Vec<String> = exec.plan.measures.iter().map(|m| m.label.clone()).collect();
         let row_names = exec.row_field_names().cloned();
         let target: Arc<str> = Arc::from("nexmark_alerts");
         let load_peak = {
@@ -1877,7 +1880,11 @@ fn q18_close_alloc_footprint() {
                 n_buckets,
                 peak as f64 / 1e6,
                 outcome.appended,
-                if outcome.appended > 0 { peak as f64 / outcome.appended as f64 } else { 0.0 },
+                if outcome.appended > 0 {
+                    peak as f64 / outcome.appended as f64
+                } else {
+                    0.0
+                },
             );
             assert_eq!(built_bytes as usize, outcome.appended);
             peak
@@ -1926,7 +1933,11 @@ fn q18_close_fmt_vs_const() {
             "[q18-fmt] fmt_detail load_peak={:.1}MB rows={} (avg {:.0}B/row)",
             peak as f64 / 1e6,
             outcome.appended,
-            if outcome.appended > 0 { peak as f64 / outcome.appended as f64 } else { 0.0 },
+            if outcome.appended > 0 {
+                peak as f64 / outcome.appended as f64
+            } else {
+                0.0
+            },
         );
         peak
     };
@@ -1964,7 +1975,11 @@ fn q18_close_fmt_vs_const() {
             "[q18-fmt] const_detail load_peak={:.1}MB rows={} (avg {:.0}B/row)",
             peak as f64 / 1e6,
             outcome.appended,
-            if outcome.appended > 0 { peak as f64 / outcome.appended as f64 } else { 0.0 },
+            if outcome.appended > 0 {
+                peak as f64 / outcome.appended as f64
+            } else {
+                0.0
+            },
         );
         peak
     };
@@ -2001,9 +2016,9 @@ fn scope_key_heap_bytes(k: &wf_engine::match_engine::ScopeKey) -> usize {
 /// q18 同形 executor，detail 改 StringLit 常量（对照 fmt 增量）。
 fn stats_close_rule_executor_const_detail() -> wf_engine::match_engine::RuleExecutor {
     use wf_lang::ast::CloseMode;
+    use wf_lang::ast::Expr;
     use wf_lang::ast::MatchMode;
     use wf_lang::plan::{BindPlan, EntityPlan, MatchPlan, ScorePlan, YieldField, YieldPlan};
-    use wf_lang::ast::Expr;
     let plan = wf_lang::plan::RulePlan {
         conv_window: None,
         name: "q18_last_bid_stats".into(),
@@ -2076,10 +2091,22 @@ fn stats_close_rule_executor_const_detail() -> wf_engine::match_engine::RuleExec
     wf_engine::match_engine::RuleExecutor::new_with_yield_field_types(
         plan,
         std::collections::HashMap::from([
-            ("id".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Float)),
-            ("alert_type".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Chars)),
-            ("detail".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Chars)),
-            ("request_count".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Float)),
+            (
+                "id".into(),
+                wf_lang::FieldType::Base(wf_lang::BaseType::Float),
+            ),
+            (
+                "alert_type".into(),
+                wf_lang::FieldType::Base(wf_lang::BaseType::Chars),
+            ),
+            (
+                "detail".into(),
+                wf_lang::FieldType::Base(wf_lang::BaseType::Chars),
+            ),
+            (
+                "request_count".into(),
+                wf_lang::FieldType::Base(wf_lang::BaseType::Float),
+            ),
         ]),
     )
 }
@@ -2088,9 +2115,9 @@ fn stats_close_rule_executor_const_detail() -> wf_engine::match_engine::RuleExec
 /// detail=b.url / request_count=1——q18 输出形状）。
 fn stats_close_rule_executor() -> wf_engine::match_engine::RuleExecutor {
     use wf_lang::ast::CloseMode;
+    use wf_lang::ast::Expr;
     use wf_lang::ast::MatchMode;
     use wf_lang::plan::{BindPlan, EntityPlan, MatchPlan, ScorePlan, YieldField, YieldPlan};
-    use wf_lang::ast::Expr;
     let plan = wf_lang::plan::RulePlan {
         conv_window: None,
         name: "q18_last_bid_stats".into(),
@@ -2145,10 +2172,7 @@ fn stats_close_rule_executor() -> wf_engine::match_engine::RuleExecutor {
                 },
                 YieldField {
                     name: "detail".into(),
-                    value: Expr::Field(wf_lang::ast::FieldRef::Qualified(
-                        "b".into(),
-                        "url".into(),
-                    )),
+                    value: Expr::Field(wf_lang::ast::FieldRef::Qualified("b".into(), "url".into())),
                 },
                 YieldField {
                     name: "request_count".into(),
@@ -2166,10 +2190,22 @@ fn stats_close_rule_executor() -> wf_engine::match_engine::RuleExecutor {
     wf_engine::match_engine::RuleExecutor::new_with_yield_field_types(
         plan,
         std::collections::HashMap::from([
-            ("id".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Float)),
-            ("alert_type".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Chars)),
-            ("detail".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Chars)),
-            ("request_count".into(), wf_lang::FieldType::Base(wf_lang::BaseType::Float)),
+            (
+                "id".into(),
+                wf_lang::FieldType::Base(wf_lang::BaseType::Float),
+            ),
+            (
+                "alert_type".into(),
+                wf_lang::FieldType::Base(wf_lang::BaseType::Chars),
+            ),
+            (
+                "detail".into(),
+                wf_lang::FieldType::Base(wf_lang::BaseType::Chars),
+            ),
+            (
+                "request_count".into(),
+                wf_lang::FieldType::Base(wf_lang::BaseType::Float),
+            ),
         ]),
     )
 }

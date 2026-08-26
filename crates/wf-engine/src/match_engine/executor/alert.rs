@@ -341,26 +341,26 @@ mod split_tests {
             format!("id-{}", n)
         };
         // 首次 → 计算。
-        let a1 = cache.get_or(&key_a, || f());
+        let a1 = cache.get_or(&key_a, f);
         assert_eq!(a1, "id-1");
         assert_eq!(calls.get(), 1);
         // 同 key → 复用（f 不调用）。
-        let a2 = cache.get_or(&key_a, || f());
+        let a2 = cache.get_or(&key_a, f);
         assert_eq!(a2, "id-1");
         assert_eq!(calls.get(), 1, "同 key 不应重新计算");
         // 异 key → 重算。
-        let b1 = cache.get_or(&key_b, || f());
+        let b1 = cache.get_or(&key_b, f);
         assert_eq!(b1, "id-2");
         assert_eq!(calls.get(), 2);
         // 切回 key_a → 重算（缓存只保留最近一个）。
-        let a3 = cache.get_or(&key_a, || f());
+        let a3 = cache.get_or(&key_a, f);
         assert_eq!(a3, "id-3");
         assert_eq!(calls.get(), 3);
         // 空 key。
         let empty: [Value; 0] = [];
-        let e1 = cache.get_or(&empty, || f());
+        let e1 = cache.get_or(&empty, f);
         assert_eq!(e1, "id-4");
-        let e2 = cache.get_or(&empty, || f());
+        let e2 = cache.get_or(&empty, f);
         assert_eq!(e2, "id-4");
         assert_eq!(calls.get(), 4, "空 key 同值也应复用");
     }
@@ -618,7 +618,6 @@ fn hex_encode_smol(bytes: &[u8]) -> smol_str::SmolStr {
 /// entity_id 连续缓存（P6, 2026-08-26，通用）: 相邻输出（close/match/each）
 /// 同 scope_key 时复用 entity_id 字符串——免每行一次字段 resolve +
 /// value_to_string。q19 每桶 top-10 条 / q6 同 key 多 match 命中率高。
-
 pub(crate) struct EntityIdCache {
     key: Vec<Value>,
     id: String,

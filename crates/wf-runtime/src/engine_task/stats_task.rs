@@ -55,12 +55,11 @@ static EMIT_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 fn emit_chunk() -> usize {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        if let Ok(v) = std::env::var("WF_EMIT_CHUNK") {
-            if let Ok(n) = v.parse::<usize>() {
-                if n > 0 {
-                    EMIT_CHUNK.store(n, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
+        if let Ok(v) = std::env::var("WF_EMIT_CHUNK")
+            && let Ok(n) = v.parse::<usize>()
+            && n > 0
+        {
+            EMIT_CHUNK.store(n, std::sync::atomic::Ordering::Relaxed);
         }
     });
     EMIT_CHUNK.load(std::sync::atomic::Ordering::Relaxed)

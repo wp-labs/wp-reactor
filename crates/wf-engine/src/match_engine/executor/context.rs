@@ -53,6 +53,8 @@ impl CloseCtxFields {
 /// `needed` narrows the synthetic field set to what the rule's output
 /// expressions can actually read; `CloseCtxFields::All` reproduces the
 /// historical unconditional build.
+/// 8 参数为固有签名（调用点按位传，分组 struct 重构收益/风险不成比）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_eval_context(
     keys: &[FieldRef],
     scope_key: &[Value],

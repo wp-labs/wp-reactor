@@ -1177,10 +1177,9 @@ fn resolve_stats_bucket_field(
             m.get(usize::min(record, m.len().saturating_sub(1)))
                 .and_then(|e| e.row_fields.as_ref())
         }),
-    ) {
-        if let Some(pos) = names.iter().position(|n| n == name) {
-            return rf.value_at(pos);
-        }
+    ) && let Some(pos) = names.iter().position(|n| n == name)
+    {
+        return rf.value_at(pos);
     }
     None
 }

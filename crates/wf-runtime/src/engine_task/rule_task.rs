@@ -4872,6 +4872,7 @@ mod pipe_stager_tests {
     /// 回退）；meta 值（rule_name/score/entity_type/entity_id）与 yield 字段
     /// 逐一落入正确列。
     #[test]
+    #[allow(clippy::type_complexity)] // 测试局部三元组签名，alias 会引入生命周期问题
     fn push_record_columnar_matches_row_path() {
         let schemas: &[(Arc<str>, arrow::datatypes::SchemaRef, &[Arc<str>])] = &[
             (

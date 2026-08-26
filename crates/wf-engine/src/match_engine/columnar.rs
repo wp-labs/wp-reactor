@@ -493,7 +493,7 @@ pub(crate) fn compile_yield_cvec(
                 } if wf_lang::columnar::columnar_output_func(name).is_some()
             );
             if is_output_func {
-                compile_guard(&*value, view).map(|plan| plan.eval_vec(view, n))
+                compile_guard(&value, view).map(|plan| plan.eval_vec(view, n))
             } else {
                 None
             }

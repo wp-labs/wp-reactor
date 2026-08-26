@@ -706,8 +706,8 @@ impl RuleExecutor {
         // let）；Field yield 引用 let 变量 → 拒绝（列式字段读无 let 视图）。
         let let_names: std::collections::HashSet<&str> =
             self.plan.lets.iter().map(|l| l.name.as_str()).collect();
-        if !self.plan.lets.is_empty() {
-            if !self.live_joins.is_empty()
+        if !self.plan.lets.is_empty()
+            && (!self.live_joins.is_empty()
                 || !self.plan.lets.iter().all(|l| {
                     wf_lang::columnar::expr_is_columnar(&l.expr)
                         || wf_lang::columnar::columnar_output_expr(&l.expr)
@@ -727,10 +727,9 @@ impl RuleExecutor {
                     b.filter
                         .as_ref()
                         .is_none_or(|f| !expr_refs_let(f, &let_names))
-                })
-            {
-                return false;
-            }
+                }))
+        {
+            return false;
         }
         // 无活 join：形状检查走无 join 列式路径（后置 where 列式不执行——bind
         // filter 已下推为事件过滤，plan.r#where 非空 → 回退行式）。单活 join：
