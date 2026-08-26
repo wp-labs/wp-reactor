@@ -372,6 +372,46 @@ impl RowFields {
     pub fn iter_values(&self) -> impl Iterator<Item = Option<Value>> + '_ {
         (0..self.layout.n_fields()).map(move |i| self.value_at(i))
     }
+
+    // -- spill 序列化访问器（pub(crate)：仅 wf-engine 内部 spill 模块使用）--
+
+    /// 数字槽数组（layout 槽序）。
+    pub(crate) fn numeric(&self) -> &[f64] {
+        &self.numeric
+    }
+
+    /// 字符串槽数组（layout 槽序）。
+    pub(crate) fn strings(&self) -> &[smol_str::SmolStr] {
+        &self.strings
+    }
+
+    /// 其它槽数组（layout 槽序）。
+    pub(crate) fn others(&self) -> &[Option<Value>] {
+        &self.others
+    }
+
+    /// null 位掩码（layout 槽序，位 1 = null）。
+    pub(crate) fn null_mask(&self) -> &[u64] {
+        &self.null_mask
+    }
+
+    /// 从槽数组构造（spill 读回；槽序与 [`Self::empty`] 一致，布局由
+    /// `layout` 描述——序列化不落 layout，读回按当前 executor 的 layout 解释）。
+    pub(crate) fn from_parts(
+        layout: std::sync::Arc<RowFieldLayout>,
+        numeric: Box<[f64]>,
+        strings: Box<[smol_str::SmolStr]>,
+        others: Box<[Option<Value>]>,
+        null_mask: Box<[u64]>,
+    ) -> Self {
+        Self {
+            layout,
+            numeric,
+            strings,
+            others,
+            null_mask,
+        }
+    }
 }
 
 /// distinct_count 的紧凑存储（2026-08-26 q16 内存）：整数键（q16 的
@@ -426,6 +466,23 @@ impl DistinctSet {
     pub fn reserve(&mut self, additional: usize) {
         self.ints.reserve(additional);
         self.others.reserve(additional);
+    }
+
+    // -- spill 序列化访问器（pub(crate)：仅 wf-engine 内部 spill 模块使用）--
+
+    /// 整数键集合。
+    pub(crate) fn ints(&self) -> &EngineHashSet<i64> {
+        &self.ints
+    }
+
+    /// 非整数键集合（Float/Str）。
+    pub(crate) fn others(&self) -> &EngineHashSet<DistinctKey> {
+        &self.others
+    }
+
+    /// 从两集合构造（spill 读回）。
+    pub(crate) fn from_parts(ints: EngineHashSet<i64>, others: EngineHashSet<DistinctKey>) -> Self {
+        Self { ints, others }
     }
 }
 

@@ -20,9 +20,11 @@ mod stats_exec;
 pub use each_exec::{EachDirectBatchStats, PipeEachRow, PipeRowSink};
 // 供 `match_engine::pub use executor::DistinctKey` 转发（stats distinct 键类型）。
 pub use stats_exec::{
-    DistinctKey, DistinctSet, RowFieldLayout, RowFields, StatsAccum, StatsCloseBucket,
-    StatsExecutor, StatsWindowState,
+    DistinctKey, DistinctSet, NumericAccum, RowFieldLayout, RowFields, StatsAccum,
+    StatsCloseBucket, StatsExecutor, StatsWindowState, TopEntry,
 };
+// spill 序列化用（同 crate：executor::stats_exec 为私有模块，需经此转发）。
+pub(crate) use stats_exec::scope_key_hash;
 
 #[cfg(test)]
 mod close_coverage_more;

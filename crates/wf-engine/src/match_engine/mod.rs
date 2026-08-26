@@ -6,6 +6,7 @@ mod executor;
 #[allow(clippy::module_inception)]
 mod match_engine;
 mod regex_cache;
+pub mod spill;
 
 #[cfg(test)]
 mod tests;
