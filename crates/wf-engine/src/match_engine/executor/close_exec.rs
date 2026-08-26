@@ -5,6 +5,7 @@ use wf_lang::ast::{CloseMode, Expr, FieldRef};
 
 use crate::alert::{AlertColumnBuilder, AlertOrigin, OutputRecord};
 use crate::error::CoreResult;
+use crate::match_engine::columnar::{CVec, cscalar_to_value};
 use crate::match_engine::match_engine::{
     CloseOutput, Event, StepData, Value, WindowLookup, eval_field_value, field_ref_name,
     value_to_string,
@@ -13,7 +14,10 @@ use crate::match_engine::match_engine::{
 use super::EachDirectBatchStats;
 use super::RuleExecutor;
 use super::YieldKind;
-use super::alert::{build_summary, build_wfx_id, format_nanos_utc, now_nanos};
+use super::alert::{
+    build_summary, build_summary_split, build_wfx_id, format_nanos_utc, now_nanos, EntityIdCache,
+    OriginArcs, WfxPrefixCache,
+};
 use super::context::{build_eval_context, execute_joins};
 use super::eval::{
     YieldMeta, eval_entity_id, eval_score, eval_yield_expr_with_meta, with_yield_eval_scope,
@@ -415,6 +419,9 @@ impl RuleExecutor {
         // Batch-constant literal yields: coerced + exported once here and
         // registered as constant columns (per-row staging skipped, gap-filled
         // by the commit). Field yields register as ordinary columns.
+        // 记录已注册 const 的字段（层 2 Part B：主循环跳过这些字段的逐行
+        // stage——commit gap-fill 常量，字节一致）。
+        let mut const_yields: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (field, (name, field_type)) in
             self.plan.yield_plan.fields.iter().zip(yield_specs.iter())
         {
@@ -439,6 +446,7 @@ impl RuleExecutor {
                         stats.failed = closes.len();
                         return stats;
                     }
+                    const_yields.insert(field.name.as_str());
                 }
                 Some(Err(e)) => {
                     log::warn!("alert export error: {e}");
@@ -476,8 +484,25 @@ impl RuleExecutor {
         // format_nanos_utc（civil_from_days + 24B 分配）每窗算一次（q19 单窗
         // 百万级 close, 省百万次）。
         let mut fired_at_cache: Option<(i64, String)> = None;
+        // wfx_id 前缀缓存（P6）: q19 同桶 top-10 条共享
+        // rule/scope_key/fired_at/labels，FNV 前缀 state 缓存续算。
+        let mut wfx_cache: Option<WfxPrefixCache> = None;
+        // entity 连续缓存（通用 EntityIdCache）: 同 scope_key 相邻 close 复用
+        // entity_id（q19 同桶 top-10 条共享 auction, 免每 close 一次
+        // resolve + value_to_string）。
+        let mut entity_cache = EntityIdCache::new();
 
-        'close: for close in closes {
+        // 层 1（2026-08-25）：列式批级 General yield cell（fmt/strftime/
+        // count_char——close_batch_prepare 物化引用字段为 Arrow 列并编译求值，
+        // 与 each 列式路径同一编译入口）。槽位 None（无 General / 编译失败 /
+        // 类型不一致）→ 循环内逐行解释回退。
+        let prepared = self.close_batch_prepare(closes);
+
+        // origin/reason Arc 预建（P7, 2026-08-26）: 静态字符串免每 close 两次
+        // Arc::from 堆分配（二分定位 ~22ns/entry），循环内 Arc::clone。
+        let origin_arcs = OriginArcs::new();
+
+        'close: for (row_idx, close) in closes.iter().enumerate() {
             if !is_qualified(close) {
                 stats.rejected += 1;
                 continue;
@@ -493,32 +518,54 @@ impl RuleExecutor {
                     s
                 }
             };
-            // entity
+            // entity（连续缓存：q19 同桶 top-10 条共享 scope_key，复用字符串
+            // 免每 close 一次 resolve + value_to_string）
             let entity_id: String = if let Some(s) = entity_const {
                 s.to_string()
             } else {
-                // eval_entity_id → eval_yield_expr falls back to an empty
-                // string when the field is absent (never errors) — mirror that
-                // instead of failing the close.
-                resolve_close_field(close, keys, entity_field_name.unwrap_or(""))
-                    .map(|v| value_to_string(&v))
-                    .unwrap_or_default()
+                let key = close.scope_key.as_slice();
+                entity_cache.get_or(key, || {
+                    // eval_entity_id → eval_yield_expr falls back to an empty
+                    // string when the field is absent (never errors) — mirror that
+                    // instead of failing the close.
+                    resolve_close_field(close, keys, entity_field_name.unwrap_or(""))
+                        .map(|v| value_to_string(&v))
+                        .unwrap_or_default()
+                })
             };
-            // wfx_id / summary need the combined step data (same byte stream
-            // as build_wfx_id/build_summary on the per-record path).
-            let all_step_data = combine_step_data(close);
-            let wfx_id = build_wfx_id(
-                &self.plan.name,
-                &close.scope_key,
-                &fired_at,
-                &all_step_data,
-                &origin,
-            );
-            let summary = build_summary(
+            // wfx_id：前缀缓存（P6）——q19 每桶 top-10 条共享
+            // rule/scope_key/fired_at/labels，FNV 前缀 state 缓存续算，
+            // 每 close 只 hash 变化的 measure + origin。
+            let wfx_id = match &wfx_cache {
+                Some(c)
+                    if c.prefix_matches(
+                        &close.scope_key,
+                        &fired_at,
+                        &close.event_step_data,
+                        &close.close_step_data,
+                    ) =>
+                {
+                    c.finish(&close.event_step_data, &close.close_step_data, &origin)
+                }
+                _ => {
+                    let cache = WfxPrefixCache::build(
+                        &self.plan.name,
+                        &close.scope_key,
+                        &fired_at,
+                        &close.event_step_data,
+                        &close.close_step_data,
+                    );
+                    let id = cache.finish(&close.event_step_data, &close.close_step_data, &origin);
+                    wfx_cache = Some(cache);
+                    id
+                }
+            };
+            let summary = build_summary_split(
                 &self.plan.name,
                 keys,
                 &close.scope_key,
-                &all_step_data,
+                &close.event_step_data,
+                &close.close_step_data,
                 &origin,
             );
 
@@ -528,24 +575,50 @@ impl RuleExecutor {
             // 字段, 跳过 per-record 路径的 combine_step_plans / annotate /
             // joins / where / OutputRecord（q15-q19 detail 的 fmt 批量列式化）。
             let mut ctx: Option<Event> = None;
-            for (field, (name, field_type)) in
-                self.plan.yield_plan.fields.iter().zip(yield_specs.iter())
+            for (field_idx, (field, (name, field_type))) in
+                self.plan.yield_plan.fields.iter().zip(yield_specs.iter()).enumerate()
             {
                 let value = match &field.value {
+                    // const 列（Lit yield）已在 execute 顶部注册 + 校验——跳过
+                    // 逐行 stage（commit 对缺 staged cell 的行 gap-fill 常量，
+                    // 字节一致；2026-08-25 层 2 Part B：省 Lit 字段的
+                    // coerce/export/staged push，q12/q15-q19 通用）。
+                    // 防御：非 const 注册的 Lit（理论不可达）仍走取值 + stage。
+                    Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_)
+                        if const_yields.contains(field.name.as_str()) =>
+                    {
+                        continue;
+                    }
+                    Expr::Number(n) => Value::Number(*n),
+                    Expr::StringLit(s) => Value::Str(s.clone().into()),
+                    Expr::Bool(b) => Value::Bool(*b),
                     Expr::Field(_) => resolve_close_field(close, keys, field_ref_name_of(&field.value))
                         .unwrap_or_else(|| Value::Str(String::new().into())),
                     general => {
-                        let ctx = ctx.get_or_insert_with(|| {
-                            build_eval_context(
-                                keys,
-                                &close.scope_key,
-                                &all_step_data,
-                                &close.bind_data,
-                                &[],
-                                None,
-                                &self.close_ctx_fields,
-                            )
-                        });
+                        // 列式批级 cell：命中直接取（null 行 → 空串，同解释路径
+                        // None→""）；槽位 None → 逐行回退（轻量 ctx 求值）。
+                        match prepared
+                            .general_cvecs
+                            .get(field_idx)
+                            .and_then(|c| c.as_ref())
+                        {
+                            Some(cvec) => match cvec.scalar_at(row_idx) {
+                                Some(s) => cscalar_to_value(&s),
+                                None => Value::Str(SmolStr::default()),
+                            },
+                            None => {
+                                let ctx = ctx.get_or_insert_with(|| {
+                                    let all_step_data = combine_step_data(close);
+                                    build_eval_context(
+                                        keys,
+                                        &close.scope_key,
+                                        &all_step_data,
+                                        &close.bind_data,
+                                        &[],
+                                        None,
+                                        &self.close_ctx_fields,
+                                    )
+                                });
                         let yield_meta = YieldMeta {
                             score: Some(score_const),
                             wfx_id: Some(&wfx_id),
@@ -564,10 +637,12 @@ impl RuleExecutor {
                             emit_time_nanos: Some(emit_time_nanos),
                             time_format: Some(self.output_config().time_format.as_str()),
                         };
-                        with_yield_eval_scope(|| {
-                            eval_yield_expr_with_meta(general, ctx, yield_meta)
-                        })
-                        .expect("eval_yield_expr_with_meta never returns None")
+                                with_yield_eval_scope(|| {
+                                    eval_yield_expr_with_meta(general, ctx, yield_meta)
+                                })
+                                .expect("eval_yield_expr_with_meta never returns None")
+                            }
+                        }
                     }
                 };
                 match RuleExecutor::coerce_yield_field_value_with(name, field_type.as_ref(), value)
@@ -595,8 +670,8 @@ impl RuleExecutor {
             scores.push(score_const);
             entity_ids.push(SmolStr::from(entity_id));
             fired_ats.push(fired_at);
-            origins.push(Arc::from(origin.as_str()));
-            close_reasons.push(Arc::from(origin.close_reason().map_or("", |r| r.as_str())));
+            origins.push(Arc::clone(origin_arcs.origin(close.close_reason)));
+            close_reasons.push(Arc::clone(origin_arcs.close_reason(close.close_reason)));
             summaries.push(Arc::from(summary));
             stats.appended += 1;
         }
@@ -673,6 +748,58 @@ fn combine_step_data(close: &CloseOutput) -> Vec<StepData> {
         .chain(close.close_step_data.iter())
         .cloned()
         .collect()
+}
+
+
+/// 列式 close 的 General yield 批级求值状态（层 1，2026-08-25）：
+/// [`RuleExecutor::close_batch_prepare`] 把一批 `CloseOutput` 引用字段物化为
+/// Arrow 列 → `ColumnarBatch` 视图 → 编译 General yield（fmt/strftime/
+/// count_char 等）→ `eval_vec` 批量 cell。槽位按 **yield 字段位置** 索引
+/// （与 `yield_plan.fields` 对齐；Lit/Field 为 `None`）；`None` = 无 General /
+/// 编译失败 / 字段类型不一致 → 逐行解释回退（与 each 路径同款契约）。
+#[derive(Default)]
+pub(crate) struct CloseBatchVecs {
+    pub(crate) general_cvecs: Vec<Option<CVec>>,
+}
+
+impl RuleExecutor {
+    /// Compile + batch-evaluate the columnar close General-yield state for one
+    /// `closes` batch（窗口 close 一次调用，语义 = 解释路径的
+    /// `build_eval_context`（Named 窄化/All）+ `eval_yield_expr_with_meta`）。
+    ///
+    /// 只物化 General 表达式实际引用的普通字段 + 键名（ctx 恒注入键）；缺失
+    /// 字段 → 不建列 → `ColumnarBatch` 解析为 Null ColKind → null cell →
+    /// 空串，与解释路径 None→"" 一致。Number→Float64 / Str→Utf8 / Bool→
+    /// Boolean 列（`cscalar_to_value` 还原为原 `Value`，渲染字节一致）。
+    pub(crate) fn close_batch_prepare(&self, closes: &[CloseOutput]) -> CloseBatchVecs {
+        let n = closes.len();
+        let slots = self.plan.yield_plan.fields.len();
+        if n == 0 {
+            return CloseBatchVecs {
+                general_cvecs: (0..slots).map(|_| None).collect(),
+            };
+        }
+        // 1. 引用字段集 = 键名（ctx 无条件注入）∪ General yield 引用的普通字段
+        //    （close 编译不内联 let → 非内联收集，保持一致）
+        let ref_fields = self.yield_ref_fields(false);
+        if ref_fields.is_empty() {
+            return CloseBatchVecs {
+                general_cvecs: (0..slots).map(|_| None).collect(),
+            };
+        }
+        // 2. 统一物化器 + 槽位编译（层 2 收口，`RuleExecutor::compile_general_slots`）；
+        //    物化失败（类型不一致/结构化值）→ 整批回退逐行（保守）。close 传空
+        //    lets：解释 close 路径（build_eval_context）无 let 视图，内联会分叉。
+        let keys: &[FieldRef] = &self.plan.match_plan.keys;
+        CloseBatchVecs {
+            general_cvecs: self.compile_general_slots(
+                &ref_fields,
+                n,
+                |row, name| resolve_close_field(&closes[row], keys, name),
+                &[],
+            ),
+        }
+    }
 }
 
 fn combine_step_plans<'a>(

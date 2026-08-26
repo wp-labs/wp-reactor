@@ -2265,12 +2265,33 @@ fn each_plan_columnar_safe_gate_branches() {
     plan.each_plan = None;
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
 
-    // Lets → false.
+    // Lets（2026-08-25 层 2）：RHS 可列式编译 + 非 yield 表达式不引用 let →
+    // 放行（q22 形态）；非列式 RHS / 引用 let 的 filter → 拒绝。
     let mut plan = base();
     plan.lets = vec![LetPlan {
         name: "x".into(),
         expr: Expr::Number(1.0),
     }];
+    assert!(RuleExecutor::new(plan).each_plan_columnar_safe());
+    let mut plan = base();
+    plan.lets = vec![LetPlan {
+        name: "x".into(),
+        expr: Expr::FuncCall {
+            qualifier: None,
+            name: "bogus_fn".into(),
+            args: vec![],
+        },
+    }];
+    assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
+    let mut plan = base();
+    plan.lets = vec![LetPlan {
+        name: "x".into(),
+        expr: Expr::Number(1.0),
+    }];
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: Some(Expr::Field(FieldRef::Simple("x".into()))),
+    });
     assert!(!RuleExecutor::new(plan).each_plan_columnar_safe());
 
     // Joins → false.
@@ -3381,6 +3402,323 @@ fn each_columnar_output_funcs_match_row_path() {
     assert_eq!(label(&out_col[0]), "ip=10.1.1.1|n=3", "row 0 fmt");
     assert_eq!(label(&out_col[1]), "", "row 1 fmt null sip → 空串");
     assert_eq!(label(&out_col[2]), "", "row 2 fmt null count → 空串");
+}
+
+/// 层 2（2026-08-25，q22 形态）：`let parts = split(e.url, "/")` + yield
+/// `concat(mvindex(parts,3), "/", ...)`——列式 each（编译期内联 let + 融合
+/// SplitIndex）与行式 each（apply_lets 逐行注入）输出逐字段对拍（含 null /
+/// 越界 → 空串）。
+#[test]
+fn each_columnar_q22_split_mvindex_concat_matches_row_path() {
+    let schema = Arc::new(Schema::new(vec![ArrowField::new("url", DataType::Utf8, true)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vec![
+            Some("https://www.nexmark.com/aaaaa/bbbbb/ccccc/item.htm?query=1"),
+            None,           // null 行
+            Some("short"),  // mvindex 越界 → 空串
+            Some("a/b//d"), // 空段
+        ])) as ArrayRef],
+    )
+    .unwrap();
+
+    let mut plan = simple_rule_plan(
+        "q22_shape",
+        simple_plan(vec![], vec![]),
+        Expr::Number(50.0),
+        "chars",
+        Expr::Field(FieldRef::Qualified("e".into(), "url".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.lets = vec![LetPlan {
+        name: "parts".into(),
+        expr: Expr::FuncCall {
+            qualifier: None,
+            name: "split".into(),
+            args: vec![
+                Expr::Field(FieldRef::Qualified("e".into(), "url".into())),
+                Expr::StringLit("/".into()),
+            ],
+        },
+    }];
+    let mvindex = |idx: f64| Expr::FuncCall {
+        qualifier: None,
+        name: "mvindex".into(),
+        args: vec![Expr::Field(FieldRef::Simple("parts".into())), Expr::Number(idx)],
+    };
+    plan.yield_plan.fields = vec![YieldField {
+        name: "detail".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "concat".into(),
+            args: vec![
+                mvindex(3.0),
+                Expr::StringLit("/".into()),
+                mvindex(4.0),
+                Expr::StringLit("/".into()),
+                mvindex(5.0),
+            ],
+        },
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("detail".into(), FieldType::Base(BaseType::Chars))]),
+    );
+    assert!(exec.each_plan_columnar_safe(), "q22 let+split+mvindex+concat 应列式");
+
+    let t = 1_700_000_000_000_000_000i64;
+    let events = crate::match_engine::event_bridge::batch_to_events(&batch);
+    let row_refs: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_row = Vec::new();
+    let sr = exec.execute_each_direct_batch(&row_refs, &EmptyLookup, &[], 0, &mut b_row, &mut app_row);
+    assert_eq!(sr.appended, 4);
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let col_events: Vec<ColumnarEvent> = (0..4).map(|r| ColumnarEvent::new(&batch, r)).collect();
+    let col_refs: Vec<(&ColumnarEvent, i64)> = col_events.iter().map(|ev| (ev, t)).collect();
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app_col = Vec::new();
+    let sc = exec.execute_each_direct_batch_columnar(&col_refs, 0, &mut b_col, &mut app_col);
+    assert_eq!(sc.appended, 4);
+    assert_eq!(sc.failed, 0);
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(out_row, out_col);
+    // 语义抽查：row 0 三段拼接 aaaaa/bbbbb/ccccc；null row 1 与越界 row 2 → 空串。
+    let detail = |r: &wp_model_core::model::DataRecord| {
+        r.fields()
+            .find(|f| f.get_name() == "detail")
+            .and_then(|f| match f.get_value() {
+                wp_model_core::model::Value::Chars(v) => Some(v.to_string()),
+                _ => None,
+            })
+            .expect("detail field")
+    };
+    assert_eq!(detail(&out_col[0]), "aaaaa/bbbbb/ccccc", "row 0 concat");
+    assert_eq!(detail(&out_col[1]), "", "row 1 null url → 空串");
+    assert_eq!(detail(&out_col[2]), "", "row 2 mvindex 越界 → 空串");
+    assert_eq!(detail(&out_col[3]), "", "row 3 段数不足 → 空串");
+}
+
+/// 层 2 收口（2026-08-25）：**行式批路径**（`execute_each_direct_batch`，Event
+/// 数组——文件源 replay 等非 RecordBatch 源）的 General yield 走列式批级 cell
+/// （Event 数组物化 + let 内联），与逐事件 `execute_each` 逐字段字节一致。
+#[test]
+fn each_direct_batch_general_yield_matches_per_event() {
+    let mut plan = simple_rule_plan(
+        "each_fmt",
+        simple_plan(vec![], vec![]),
+        Expr::Number(50.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("e".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "e".into();
+    plan.each_plan = Some(EachPlan {
+        alias: "e".into(),
+        filter: None,
+    });
+    plan.lets = vec![LetPlan {
+        name: "parts".into(),
+        expr: Expr::FuncCall {
+            qualifier: None,
+            name: "split".into(),
+            args: vec![
+                Expr::Field(FieldRef::Qualified("e".into(), "url".into())),
+                Expr::StringLit("/".into()),
+            ],
+        },
+    }];
+    let mvindex = |idx: f64| Expr::FuncCall {
+        qualifier: None,
+        name: "mvindex".into(),
+        args: vec![Expr::Field(FieldRef::Simple("parts".into())), Expr::Number(idx)],
+    };
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("e".into(), "auction".into())),
+        },
+        YieldField {
+            name: "detail".into(),
+            value: Expr::FuncCall {
+                qualifier: None,
+                name: "concat".into(),
+                args: vec![
+                    mvindex(3.0),
+                    Expr::StringLit("/".into()),
+                    mvindex(4.0),
+                ],
+            },
+        },
+    ];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("id".into(), FieldType::Base(BaseType::Digit)),
+            ("detail".into(), FieldType::Base(BaseType::Chars)),
+        ]),
+    );
+
+    let t = 1_700_000_000_000_000_000i64;
+    let events = vec![
+        event(vec![
+            ("auction", num(1001.0)),
+            ("url", str_val("https://www.nexmark.com/aaaaa/bbbbb/ccccc/item.htm")),
+        ]),
+        event(vec![
+            ("auction", num(1002.0)),
+            ("url", str_val("short")),
+        ]),
+        event(vec![("auction", num(1003.0))]), // url 缺失 → mvindex null → 空串
+    ];
+
+    // 逐事件（解释路径，apply_lets 注入）。
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    for ev in &events {
+        let record = exec.execute_each(ev, t).unwrap().unwrap();
+        b_row.append_record(&record).unwrap();
+    }
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // 行式批路径（Event 数组 → 列式 cell）。
+    let rows: Vec<(&Event, i64)> = events.iter().map(|e| (e, t)).collect();
+    let mut b_batch = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut app = Vec::new();
+    let stats = exec.execute_each_direct_batch(&rows, &EmptyLookup, &[], 0, &mut b_batch, &mut app);
+    assert_eq!(stats.appended, 3);
+    assert_eq!(stats.failed, 0);
+    assert_eq!(app, vec![0, 1, 2]);
+    let out_batch: Vec<_> = b_batch
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // 逐字段字节一致（`__wfu_emit_time` 除外——批路径用传入的 emit_time，
+    // 逐事件用 now()，与列式批路径的文档化差异一致；emit_time 不喂语义）。
+    assert_eq!(out_row.len(), out_batch.len());
+    for (row, (ra, rb)) in out_row.iter().zip(out_batch.iter()).enumerate() {
+        for (fa, fb) in ra.items.iter().zip(rb.items.iter()) {
+            if fa.get_name() == wf_lang::wfu_meta::WFU_EMIT_TIME {
+                continue;
+            }
+            assert_eq!(
+                fa.get_name(),
+                fb.get_name(),
+                "row {row} field name"
+            );
+            assert_eq!(
+                fa.get_value(),
+                fb.get_value(),
+                "row {row} field {} value",
+                fa.get_name()
+            );
+        }
+    }
+    let detail = |r: &wp_model_core::model::DataRecord| {
+        r.fields()
+            .find(|f| f.get_name() == "detail")
+            .and_then(|f| match f.get_value() {
+                wp_model_core::model::Value::Chars(v) => Some(v.to_string()),
+                _ => None,
+            })
+            .expect("detail field")
+    };
+    assert_eq!(detail(&out_batch[0]), "aaaaa/bbbbb", "row 0 concat");
+    assert_eq!(detail(&out_batch[1]), "", "row 1 越界 → 空串");
+    assert_eq!(detail(&out_batch[2]), "", "row 2 url 缺失 → 空串");
+}
+
+#[test]
+fn close_ctx_fields_narrowed_for_output_funcs() {
+    // 层 2 收口 review：列式输出函数（fmt 等）是纯参数函数——
+    // `plan_close_ctx_fields` 应窄化为 Named（含引用的普通字段），而非
+    // force_all（行式/回退路径的全量 ctx 构建）。合成字段引用仍 force_all。
+    use super::CloseCtxFields;
+    use super::plan_close_ctx_fields;
+
+    let base = || {
+        let mut plan = simple_rule_plan(
+            "narrow",
+            simple_plan(vec![], vec![]),
+            Expr::Number(10.0),
+            "digit",
+            Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        );
+        plan.binds[0].alias = "b".into();
+        plan
+    };
+    let fmt = |args: Vec<Expr>| Expr::FuncCall {
+        qualifier: None,
+        name: "fmt".into(),
+        args,
+    };
+    let f = |n: &str| Expr::Field(FieldRef::Qualified("b".into(), n.into()));
+
+    // fmt detail（纯参数函数）→ Named，且含引用的字段。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "detail".into(),
+        value: fmt(vec![
+            Expr::StringLit("{} {}".into()),
+            f("bidder"),
+            f("price"),
+        ]),
+    }];
+    let fields = plan_close_ctx_fields(&plan);
+    match &fields {
+        CloseCtxFields::Named(set) => {
+            assert!(set.contains("bidder"), "fmt 参数 bidder 应收集");
+            assert!(set.contains("price"), "fmt 参数 price 应收集");
+        }
+        _ => panic!("fmt detail 应窄化为 Named，got {fields:?}"),
+    }
+
+    // L3 聚合（collect_set 读 `_step_*` 合成字段）→ 仍 force_all。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "agg".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "collect_set".into(),
+            args: vec![f("bidder")],
+        },
+    }];
+    assert!(
+        matches!(plan_close_ctx_fields(&plan), CloseCtxFields::All),
+        "L3 聚合必须 All（读合成字段）"
+    );
+
+    // fmt 引用合成字段 → 仍 force_all（Field 的 `_` 前缀检查）。
+    let mut plan = base();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "detail".into(),
+        value: fmt(vec![
+            Expr::StringLit("{}".into()),
+            Expr::Field(FieldRef::Simple("_step_0_measure".into())),
+        ]),
+    }];
+    assert!(
+        matches!(plan_close_ctx_fields(&plan), CloseCtxFields::All),
+        "fmt 引用合成字段必须 All"
+    );
 }
 
 /// fmt 参数为结构化（object）字段：形状 gate 放行，但编译失败 → 行式回退，

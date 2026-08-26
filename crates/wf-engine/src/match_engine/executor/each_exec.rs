@@ -14,7 +14,9 @@ use crate::alert::{AlertColumnBuilder, EachRowCells};
 use crate::alert::{AlertOrigin, OutputRecord};
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::MACHINE_ID;
-use crate::match_engine::columnar::{CVec, ColumnarBatch, compile_guard, cscalar_to_value};
+use crate::match_engine::columnar::{
+    CVec, ColumnarBatch, compile_guard, compile_yield_cvec, cscalar_to_value,
+};
 use crate::match_engine::event_bridge::{ColumnarEvent, JoinRow};
 use crate::match_engine::match_engine::{
     CepStateMachine, Event, FieldSource, JoinKey, Value, WindowLookup, eval_field_value,
@@ -23,6 +25,7 @@ use crate::match_engine::match_engine::{
 
 use super::RuleExecutor;
 use super::YieldKind;
+use super::close_exec::CloseBatchVecs;
 use super::alert::{
     EachWfxPrefix, build_each_wfx_id, build_each_wfx_id_reusing, format_nanos_utc, now_nanos,
     write_int64_value,
@@ -520,6 +523,18 @@ impl RuleExecutor {
             })
             .collect();
 
+        // 层 2 收口（2026-08-25）：行式批路径的 General yield 也走列式批级
+        // cell——Event 数组物化（resolve = 事件字段裸名直查，let 内联在编译层；
+        // 无活 join 才启用：join 富化字段不在物化视图，引用会静默读空 → 分叉，
+        // 有 join 保持逐行解释）。槽位 None → 循环内逐行回退。
+        let prepared = if self.live_joins.is_empty() {
+            self.event_batch_prepare(rows)
+        } else {
+            CloseBatchVecs {
+                general_cvecs: (0..yield_kinds.len()).map(|_| None).collect(),
+            }
+        };
+
         builder.reserve_rows(rows.len());
         let mut wfx_scratch = String::new();
 
@@ -596,13 +611,14 @@ impl RuleExecutor {
             // -- Yield staging (fallible work before any column push) ------
             builder.begin_row();
             let staged: CoreResult<()> = with_yield_eval_scope(|| {
-                for ((field, (name, field_type)), kind) in self
+                for (field_idx, ((field, (name, field_type)), kind)) in self
                     .plan
                     .yield_plan
                     .fields
                     .iter()
                     .zip(statics.yield_specs.iter())
                     .zip(yield_kinds.iter())
+                    .enumerate()
                 {
                     let value = match kind {
                         YieldKind::Lit(v) => v.clone(),
@@ -615,12 +631,21 @@ impl RuleExecutor {
                             eval_field_value(&ctx.fields, fr)
                                 .unwrap_or_else(|| Value::Str(SmolStr::default()))
                         }
-                        // Same fallback as the per-event path: a general
-                        // expression never yields None here (the wrapper
-                        // substitutes an empty string).
+                        // 层 2 收口：列式批级 cell（槽位命中直接取——null 行 →
+                        // 空串，同解释 None→""）；槽位 None → 逐行解释回退。
                         YieldKind::General => {
-                            eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
-                                .expect("eval_yield_expr_with_meta never returns None")
+                            match prepared
+                                .general_cvecs
+                                .get(field_idx)
+                                .and_then(|c| c.as_ref())
+                            {
+                                Some(cvec) => match cvec.scalar_at(idx) {
+                                    Some(s) => cscalar_to_value(&s),
+                                    None => Value::Str(SmolStr::default()),
+                                },
+                                None => eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
+                                    .expect("eval_yield_expr_with_meta never returns None"),
+                            }
                         }
                     };
                     let Some(value) = RuleExecutor::coerce_yield_field_value_with(
@@ -671,8 +696,39 @@ impl RuleExecutor {
         let Some(each_plan) = &self.plan.each_plan else {
             return false;
         };
+        // lets（2026-08-25 层 2，q22 形态）：允许 let 绑定——前提：无活 join
+        // （列式 join 富化路径未接 let）；每个 let RHS 可列式编译
+        // （expr_is_columnar / columnar_output_expr，split/mvindex/concat 等——
+        // yield 的 let 引用经编译期内联展开）；非 yield 表达式
+        // （score/entity/filter/where/bind filter）不得引用 let 变量（列式
+        // mask/score 无 let 视图，引用会静默读空 → 失真）。yield 的 let 引用
+        // 只允许出现在 General 表达式（内联 + 编译失败逐行回退，回退已注入
+        // let）；Field yield 引用 let 变量 → 拒绝（列式字段读无 let 视图）。
+        let let_names: std::collections::HashSet<&str> =
+            self.plan.lets.iter().map(|l| l.name.as_str()).collect();
         if !self.plan.lets.is_empty() {
-            return false;
+            if !self.live_joins.is_empty()
+                || !self.plan.lets.iter().all(|l| {
+                    wf_lang::columnar::expr_is_columnar(&l.expr)
+                        || wf_lang::columnar::columnar_output_expr(&l.expr)
+                })
+                || each_plan
+                    .filter
+                    .as_ref()
+                    .is_some_and(|f| expr_refs_let(f, &let_names))
+                || self
+                    .plan
+                    .r#where
+                    .as_ref()
+                    .is_some_and(|w| expr_refs_let(w, &let_names))
+                || expr_refs_let(&self.plan.score_plan.expr, &let_names)
+                || expr_refs_let(&self.plan.entity_plan.entity_id_expr, &let_names)
+                || !self.plan.binds.iter().all(|b| {
+                    b.filter.as_ref().is_none_or(|f| !expr_refs_let(f, &let_names))
+                })
+            {
+                return false;
+            }
         }
         // 无活 join：形状检查走无 join 列式路径（后置 where 列式不执行——bind
         // filter 已下推为事件过滤，plan.r#where 非空 → 回退行式）。单活 join：
@@ -752,7 +808,10 @@ impl RuleExecutor {
             .iter()
             .all(|field| match &field.value {
                 Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) => true,
-                Expr::Field(fr) => out_shape_ok(fr),
+                Expr::Field(fr) => {
+                    out_shape_ok(fr)
+                        && !matches!(fr, FieldRef::Simple(name) if let_names.contains(name.as_str()))
+                }
                 // 列式输出函数（fmt/strftime/count_char，参数为字面量/flat 字段）
                 // 走无 join 路径的批量 cell 求值；有活 join 时拒绝（列式 join
                 // 富化路径未接入批量 cell，回退行式避免 unreachable panic）。
@@ -860,6 +919,26 @@ pub struct EachBatchVecs {
 }
 
 impl RuleExecutor {
+    /// 列式批级 General yield 槽位（行式批路径，层 2 收口）：Event 数组物化
+    /// （resolve = 事件字段裸名直查——`field_ref_name` 与 each 列式视图一致；
+    /// let 内联在编译层，`yield_ref_fields` 已展开 let RHS 引用的 schema 字段）。
+    /// 调用方须保证无活 join（join 富化字段不在物化视图）。
+    pub(crate) fn event_batch_prepare(&self, rows: &[(&Event, i64)]) -> CloseBatchVecs {
+        let n = rows.len();
+        let slots = self.plan.yield_plan.fields.len();
+        let ref_fields = self.yield_ref_fields(true);
+        if n == 0 || ref_fields.is_empty() {
+            return CloseBatchVecs {
+                general_cvecs: (0..slots).map(|_| None).collect(),
+            };
+        }
+        CloseBatchVecs {
+            general_cvecs: self.compile_general_slots(&ref_fields, n, |row, name| {
+                rows[row].0.fields.get(name).cloned()
+            }, &self.plan.lets),
+        }
+    }
+
     /// Compile + batch-evaluate the on-each columnar output state for one
     /// `batch` (frame): general-yield cvecs (`fmt`/`strftime`/`count_char`,
     /// one slot per yield field, `None` = compile failed → per-row row
@@ -877,35 +956,13 @@ impl RuleExecutor {
             .yield_plan
             .fields
             .iter()
-            .map(|field| {
-                // 输出函数（fmt/strftime/count_char）与**任意可列式表达式**
-                // （expr_is_columnar：BinOp 如 q13a `auction % 10000`、
-                // 守卫函数）统一编译为批级 cvec——q13a 的 mod_key BinOp 因此
-                // 走列式 each 路径（2026-08-25 q13a 列式化）。Lit/Field 走
-                // 各自快通道（不编译）。编译失败（结构化列参数等）→ 槽位
-                // None → 行式回退。
-                match &field.value {
-                    Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) | Expr::Field(_) => None,
-                    other if wf_lang::columnar::expr_is_columnar(other) => {
-                        compile_guard(other, &view).map(|plan| plan.eval_vec(&view, n))
-                    }
-                    _ => {
-                        let is_output_func = matches!(
-                            &field.value,
-                            Expr::FuncCall {
-                                qualifier: None,
-                                name,
-                                ..
-                            } if wf_lang::columnar::columnar_output_func(name).is_some()
-                        );
-                        if is_output_func {
-                            compile_guard(&field.value, &view).map(|plan| plan.eval_vec(&view, n))
-                        } else {
-                            None
-                        }
-                    }
-                }
-            })
+            // 统一编译入口（compile_yield_cvec）：输出函数（fmt/strftime/
+            // count_char）与**任意可列式表达式**（expr_is_columnar：BinOp 如
+            // q13a `auction % 10000`、守卫函数）统一编译为批级 cvec——q13a 的
+            // mod_key BinOp 因此走列式 each 路径（2026-08-25 q13a 列式化）。
+            // Lit/Field 走各自快通道（不编译）。编译失败（结构化列参数等）→
+            // 槽位 None → 行式回退。close 列式路径共用同一入口。
+            .map(|field| compile_yield_cvec(field, &view, n, &self.plan.lets))
             .collect();
         // each filter：结构化字段（OBJECT/ARRAY 元数据列）比较在列式读原始
         // JSON 文本、解释器解析成 Object/Array，字节可分叉（与输出函数同源）
@@ -1383,12 +1440,23 @@ impl RuleExecutor {
                                     Some(s) => cscalar_to_value(&s),
                                     None => Value::Str(SmolStr::default()),
                                 },
-                                None => eval_yield_expr_with_meta(
-                                    &field.value,
-                                    &event.to_event(),
-                                    yield_meta.expect("need_yield_meta → meta 已构造"),
-                                )
-                                .expect("eval_yield_expr_with_meta never returns None"),
+                                None => {
+                                    // 逐行回退（编译失败）：有 let 绑定须先
+                                    // 注入——`to_event()` 是原始行，无 let 视图
+                                    // （q22 形态：let parts = split(...)，yield
+                                    // 引用 parts）。apply_lets 幂等，多字段回退
+                                    // 重复注入无害。
+                                    let mut ev = event.to_event();
+                                    if !self.plan.lets.is_empty() {
+                                        self.apply_lets(&mut ev);
+                                    }
+                                    eval_yield_expr_with_meta(
+                                        &field.value,
+                                        &ev,
+                                        yield_meta.expect("need_yield_meta → meta 已构造"),
+                                    )
+                                    .expect("eval_yield_expr_with_meta never returns None")
+                                }
                             }
                         }
                     };
@@ -2722,6 +2790,40 @@ fn join_cmp(op: BinOp, lv: &Value, rv: &Value) -> bool {
             },
             _ => false,
         },
+        _ => false,
+    }
+}
+
+/// 表达式是否引用（裸名）let 变量——列式 mask/score 无 let 视图，非 yield
+/// 表达式引用 let 变量会静默读空（失真）；只有 yield 的 let 引用经编译期
+/// 内联展开（安全）。只匹配 `FieldRef::Simple`（let 以裸名注入 ctx，限定
+/// 引用走窗口字段）。
+fn expr_refs_let(expr: &Expr, let_names: &std::collections::HashSet<&str>) -> bool {
+    match expr {
+        Expr::Field(fr) => {
+            matches!(fr, FieldRef::Simple(name) if let_names.contains(name.as_str()))
+        }
+        Expr::BinOp { left, right, .. } => {
+            expr_refs_let(left, let_names) || expr_refs_let(right, let_names)
+        }
+        Expr::Neg(inner) | Expr::Not(inner) => expr_refs_let(inner, let_names),
+        Expr::Array(items) => items.iter().any(|i| expr_refs_let(i, let_names)),
+        Expr::InList {
+            expr: inner,
+            list,
+            ..
+        } => expr_refs_let(inner, let_names) || list.iter().any(|i| expr_refs_let(i, let_names)),
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_refs_let(cond, let_names)
+                || expr_refs_let(then_expr, let_names)
+                || expr_refs_let(else_expr, let_names)
+        }
+        Expr::Object(items) => items.iter().any(|it| expr_refs_let(&it.value, let_names)),
+        Expr::FuncCall { args, .. } => args.iter().any(|a| expr_refs_let(a, let_names)),
         _ => false,
     }
 }

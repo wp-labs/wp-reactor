@@ -51,11 +51,13 @@ use self::eval::eval_bool_expr_with_lookup;
 use crate::alert::AlertOrigin;
 use crate::error::{CoreReason, CoreResult};
 use crate::match_engine::columnar::{
-    ColumnExpr, ColumnarBatch, GuardMasks, compile_guard, eval_compiled_guard,
+    CVec, ColumnExpr, ColumnarBatch, GuardMasks, compile_guard, compile_yield_cvec,
+    eval_compiled_guard,
 };
 use crate::match_engine::match_engine::{Event, FieldSource, Value, WindowLookup, field_ref_name};
 use crate::time::normalize_epoch_timestamp_float_nanos;
 use arrow::array::BooleanArray;
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
 /// Per-yield-field specialization, precomputed once at executor construction.
@@ -159,6 +161,21 @@ fn visit_expr_fields(
                 names.insert(name.to_string());
             }
         },
+        Expr::FuncCall {
+            qualifier: None,
+            name,
+            args,
+        } if wf_lang::columnar::columnar_output_func(name).is_some() => {
+            // 列式输出函数（fmt/strftime/count_char/split/mvindex/concat）：纯
+            // 参数函数——只读参数里的字段，不读 `_step_*`/`_bind_*` 合成字段 →
+            // 递归收集参数，不 force_all（2026-08-25 层 2 收口 review：q15-q19
+            // 的 fmt detail 因此从 All 降为 Named 窄化，行式/回退 ctx 构建省
+            // 全量注入）。引用合成字段的表达式仍由 Field 的 `_` 前缀检查
+            // force_all，安全。
+            for arg in args {
+                visit_expr_fields(arg, names, force_all);
+            }
+        }
         Expr::FuncCall { .. } | Expr::PresetParam(_) => *force_all = true,
         Expr::BinOp { left, right, .. } => {
             visit_expr_fields(left, names, force_all);
@@ -1075,6 +1092,170 @@ impl RuleExecutor {
             .chain(self.plan.match_plan.close_steps.iter())
             .flat_map(|step| step.branches.iter())
             .any(|branch| branch.source == alias)
+    }
+
+    /// 引用字段集 = 键名（ctx 恒注入）∪ General yield **内联 let 后**引用的普通
+    /// 字段（层 2 收口，close/match/行式批共用；去重保序）。内联展开保证物化
+    /// 视图包含 let RHS 引用的 schema 字段（q22：`let parts = split(url)` → 需
+    /// 物化 url，而非 let 名 parts）。
+    ///
+    /// `inline` 必须与 `compile_general_slots` 的 `lets` 参数一致：each/行式批
+    /// 传 true（编译也内联）；close/match 传 false（编译传空 lets——解释路径
+    /// 无 let 视图，内联会产生值 vs 解释空串的分叉；此时 let RHS 字段不收集，
+    /// 物化只含 yield 直接引用的字段，编译对 let 名读 Null → 空串，一致）。
+    pub(crate) fn yield_ref_fields(&self, inline: bool) -> Vec<String> {
+        let mut ref_fields: Vec<String> = Vec::new();
+        for k in &self.plan.match_plan.keys {
+            push_uniq(&mut ref_fields, field_ref_name(k));
+        }
+        for field in &self.plan.yield_plan.fields {
+            if !matches!(
+                field.value,
+                Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) | Expr::Field(_)
+            ) {
+                if inline && !self.plan.lets.is_empty() {
+                    let inlined = crate::match_engine::columnar::inline_lets(
+                        &field.value,
+                        &self.plan.lets,
+                        &mut Vec::new(),
+                    );
+                    collect_general_plain_fields(&inlined, &mut ref_fields);
+                } else {
+                    collect_general_plain_fields(&field.value, &mut ref_fields);
+                }
+            }
+        }
+        ref_fields
+    }
+
+    /// 统一列式 General yield 槽位编译（层 2 收口）：引用字段物化（统一
+    /// `materialize_fields`）→ `ColumnarBatch` 视图 → 逐 yield 字段
+    /// `compile_yield_cvec`。槽位按 yield 字段位置索引（Lit/Field → None）；
+    /// 物化失败（类型不一致/结构化）/ 编译失败 → None → 调用方逐行回退。
+    pub(crate) fn compile_general_slots<F>(
+        &self,
+        ref_fields: &[String],
+        n: usize,
+        resolve: F,
+        lets: &[wf_lang::plan::LetPlan],
+    ) -> Vec<Option<CVec>>
+    where
+        F: FnMut(usize, &str) -> Option<Value>,
+    {
+        let slots = self.plan.yield_plan.fields.len();
+        if n == 0 || ref_fields.is_empty() {
+            return (0..slots).map(|_| None).collect();
+        }
+        let Some((schema_fields, arrays)) =
+            crate::match_engine::columnar::materialize_fields(ref_fields, n, resolve)
+        else {
+            return (0..slots).map(|_| None).collect();
+        };
+        match RecordBatch::try_new(Arc::new(Schema::new(schema_fields)), arrays) {
+            Ok(batch) => {
+                let view = ColumnarBatch::from_all_fields(&batch);
+                self.plan
+                    .yield_plan
+                    .fields
+                    .iter()
+                    .map(|field| compile_yield_cvec(field, &view, n, lets))
+                    .collect()
+            }
+            Err(_) => (0..slots).map(|_| None).collect(),
+        }
+    }
+}
+
+/// General yield 表达式引用的普通字段名（非空、非 `_` 合成、非 Path）——与
+/// `yield_general_columnar_safe` 的门控形状一致（门控已保证只引用这些字段，
+/// 这里静态收集供物化用；去重保序）。close/match/行式批共用（层 2 收口）。
+pub(crate) fn collect_general_plain_fields(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Field(fr) => push_uniq(out, field_ref_name(fr)),
+        Expr::BinOp { left, right, .. } => {
+            collect_general_plain_fields(left, out);
+            collect_general_plain_fields(right, out);
+        }
+        Expr::Neg(inner) | Expr::Not(inner) => collect_general_plain_fields(inner, out),
+        Expr::Array(items) => {
+            for item in items {
+                collect_general_plain_fields(item, out);
+            }
+        }
+        Expr::InList {
+            expr: inner,
+            list,
+            ..
+        } => {
+            collect_general_plain_fields(inner, out);
+            for item in list {
+                collect_general_plain_fields(item, out);
+            }
+        }
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            collect_general_plain_fields(cond, out);
+            collect_general_plain_fields(then_expr, out);
+            collect_general_plain_fields(else_expr, out);
+        }
+        Expr::Object(items) => {
+            for it in items {
+                collect_general_plain_fields(&it.value, out);
+            }
+        }
+        Expr::FuncCall { args, .. } => {
+            for a in args {
+                collect_general_plain_fields(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn push_uniq(v: &mut Vec<String>, name: &str) {
+    if !name.is_empty() && !v.iter().any(|f| f == name) {
+        v.push(name.to_string());
+    }
+}
+
+/// General yield（fmt/strftime/count_char 等）在列式 close/match 路径可安全求值:
+/// 表达式引用的全部字段都是普通字段（非 `_step_*`/`_bind_*` 合成字段、非 Path、
+/// 非空名）——Named 窄化的 `build_eval_context` 才会注入这些字段。合成字段只
+/// 在 all 分支注入, 求值会读到空 → 输出失真, 门控拒绝。close/match 门控共用
+/// （层 2 收口）。
+pub(crate) fn yield_general_columnar_safe(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field(fr) => {
+            let n = field_ref_name(fr);
+            !n.is_empty() && !n.starts_with('_') && !matches!(fr, FieldRef::Path { .. })
+        }
+        Expr::BinOp { left, right, .. } => {
+            yield_general_columnar_safe(left) && yield_general_columnar_safe(right)
+        }
+        Expr::Neg(inner) | Expr::Not(inner) => yield_general_columnar_safe(inner),
+        Expr::Array(items) => items.iter().all(yield_general_columnar_safe),
+        Expr::InList {
+            expr: inner,
+            list,
+            ..
+        } => yield_general_columnar_safe(inner) && list.iter().all(yield_general_columnar_safe),
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            yield_general_columnar_safe(cond)
+                && yield_general_columnar_safe(then_expr)
+                && yield_general_columnar_safe(else_expr)
+        }
+        Expr::Object(items) => items.iter().all(|it| yield_general_columnar_safe(&it.value)),
+        Expr::FuncCall { args, .. } => args.iter().all(yield_general_columnar_safe),
+        // Number/StringLit/Bool/SystemVar/WfuMeta/PresetParam: 读字面量/
+        // YieldMeta/参数体, 无 ctx 字段访问。
+        _ => true,
     }
 }
 

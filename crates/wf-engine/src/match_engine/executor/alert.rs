@@ -1,9 +1,10 @@
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wf_lang::ast::FieldRef;
 
 use crate::alert::AlertOrigin;
 use crate::match_engine::match_engine::{
-    StepData, Value, field_ref_name, value_to_string,
+    CloseReason, StepData, Value, field_ref_name, push_i64_exact_decimal, value_to_string,
 };
 
 /// Format nanoseconds since epoch as ISO 8601 UTC string.
@@ -123,6 +124,41 @@ pub(super) fn build_wfx_id(
     step_data: &[StepData],
     origin: &AlertOrigin,
 ) -> String {
+    build_wfx_id_iter(rule_name, scope_key, fired_at, step_data.iter(), origin)
+}
+
+/// 列式 close 批量路径的 split 版本：直接引用 event/close 两段 step_data，
+/// 免 `combine_step_data` 的深克隆（StepData 含 `field_values` HashMap，q19
+/// top-10 每桶 10 条 → 每 close 一次全量深拷是纯浪费——wfx_id 只用
+/// label + measure_value）。字节流 = 原 `build_wfx_id`（event 段接 close 段，
+/// 测试 `build_wfx_id_split_matches_combined` 锁定）。
+/// 注：生产路径已改用 [`WfxPrefixCache`]（P6）——本函数保留为测试对拍的
+/// 参考实现（`wfx_prefix_cache_matches_split` 的 expected），故仅测试编译。
+#[cfg(test)]
+pub(super) fn build_wfx_id_split(
+    rule_name: &str,
+    scope_key: &[Value],
+    fired_at: &str,
+    event_step_data: &[StepData],
+    close_step_data: &[StepData],
+    origin: &AlertOrigin,
+) -> String {
+    build_wfx_id_iter(
+        rule_name,
+        scope_key,
+        fired_at,
+        event_step_data.iter().chain(close_step_data.iter()),
+        origin,
+    )
+}
+
+fn build_wfx_id_iter<'a>(
+    rule_name: &str,
+    scope_key: &[Value],
+    fired_at: &str,
+    step_data: impl Iterator<Item = &'a StepData>,
+    origin: &AlertOrigin,
+) -> String {
     let mut hasher = Fnv1a::new();
     hasher.update(rule_name.as_bytes());
     hasher.update(b"\x00");
@@ -152,6 +188,194 @@ pub(super) fn build_wfx_id(
     hex_encode(&hash.to_le_bytes())
 }
 
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    use crate::match_engine::match_engine::{CloseReason, StepData, EngineHashMap};
+
+    /// `build_wfx_id_split` 必须与「先 combine 再 build_wfx_id」字节一致。
+    #[test]
+    fn build_wfx_id_split_matches_combined() {
+        let rule = "q19_auction_top10_stats";
+        let scope = vec![Value::Number(42.0)];
+        let fired = "2026-08-25T00:00:00.000Z";
+        let origin = AlertOrigin::Close {
+            reason: CloseReason::Timeout,
+        };
+        let ev = StepData {
+            satisfied_branch_index: 0,
+            label: Some("top_price".into()),
+            measure_value: 3.5,
+            event_first_time_nanos: Some(1),
+            event_last_time_nanos: Some(2),
+            collected_values: vec![Value::Number(1.0), Value::Number(2.0)],
+            field_values: {
+                let mut m = EngineHashMap::default();
+                m.insert("price".into(), vec![Value::Number(99.0)]);
+                m
+            },
+        };
+        let cl = StepData {
+            satisfied_branch_index: 0,
+            label: Some("count".into()),
+            measure_value: 7.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
+            collected_values: vec![],
+            field_values: EngineHashMap::default(),
+        };
+        let combined: Vec<StepData> = vec![ev.clone(), cl.clone()];
+        let a = build_wfx_id(rule, &scope, fired, &combined, &origin);
+        let b = build_wfx_id_split(rule, &scope, fired, &[ev], &[cl], &origin);
+        assert_eq!(a, b);
+        // 空 event 段也要一致（仅 close 段）。
+        let c = build_wfx_id_split(rule, &scope, fired, &[], &combined, &origin);
+        assert_eq!(a, c);
+    }
+
+    /// wfx_id 前缀缓存（WfxPrefixCache）必须与 `build_wfx_id_split` 字节一致。
+    #[test]
+    fn wfx_prefix_cache_matches_split() {
+        let rule = "q19_auction_top10_stats";
+        let fired = "2026-08-25T00:00:00.000Z";
+        let origin = AlertOrigin::Close {
+            reason: CloseReason::Timeout,
+        };
+        let mk = |price: f64, bidder: i64| StepData {
+            satisfied_branch_index: 0,
+            label: Some("top_price".into()),
+            measure_value: price,
+            event_first_time_nanos: Some(1),
+            event_last_time_nanos: Some(2),
+            collected_values: vec![],
+            field_values: {
+                let mut m = EngineHashMap::default();
+                m.insert("bidder".into(), vec![Value::Number(bidder as f64)]);
+                m
+            },
+        };
+        // 同桶（scope_key 相同）top-10 条：只有 measure 变化。
+        let scope = vec![Value::Number(42.0)];
+        let steps: Vec<StepData> = (0..10).map(|i| mk(i as f64 * 1.5, 100 + i)).collect();
+        let mut cache = None::<WfxPrefixCache>;
+        for sd in &steps {
+            let expected = build_wfx_id_split(rule, &scope, fired, &[], std::slice::from_ref(sd), &origin);
+            let got = match &cache {
+                Some(c)
+                    if c.prefix_matches(
+                        &scope,
+                        fired,
+                        &[],
+                        std::slice::from_ref(sd),
+                    ) =>
+                {
+                    c.finish(&[], std::slice::from_ref(sd), &origin)
+                }
+                _ => {
+                    let c = WfxPrefixCache::build(rule, &scope, fired, &[], std::slice::from_ref(sd));
+                    let id = c.finish(&[], std::slice::from_ref(sd), &origin);
+                    cache = Some(c);
+                    id
+                }
+            };
+            assert_eq!(got, expected, "前缀缓存 wfx_id 必须与 split 一致 (price={})", sd.measure_value);
+        }
+        // 换桶（scope_key 不同）→ 前缀不匹配 → 重建。
+        let scope2 = vec![Value::Number(99.0)];
+        let sd = mk(3.0, 7);
+        let expected = build_wfx_id_split(rule, &scope2, fired, &[], std::slice::from_ref(&sd), &origin);
+        assert!(!cache.unwrap().prefix_matches(&scope2, fired, &[], std::slice::from_ref(&sd)));
+        let c = WfxPrefixCache::build(rule, &scope2, fired, &[], std::slice::from_ref(&sd));
+        assert_eq!(c.finish(&[], std::slice::from_ref(&sd), &origin), expected);
+    }
+
+    /// 同 scope+fired_at、labels 不同（内容 / 数量）→ 前缀必须不匹配：
+    /// `prefix_matches` 是逐 label 精确比较（review 2026-08-26 废弃 FNV-64
+    /// 近似后补的负例——hash 方案在碰撞时会静默产出与全量 build 不一致的
+    /// wfx_id）。
+    #[test]
+    fn wfx_prefix_matches_rejects_label_mismatch() {
+        let rule = "q19_auction_top10_stats";
+        let fired = "2026-08-25T00:00:00.000Z";
+        let scope = vec![Value::Number(42.0)];
+        let mk_label = |l: &str| StepData {
+            satisfied_branch_index: 0,
+            label: Some(l.to_string()),
+            measure_value: 1.0,
+            event_first_time_nanos: None,
+            event_last_time_nanos: None,
+            collected_values: vec![],
+            field_values: EngineHashMap::default(),
+        };
+        let sd_other = mk_label("other_label");
+        let c = WfxPrefixCache::build(rule, &scope, fired, &[], std::slice::from_ref(&sd_other));
+        // 自身必须匹配。
+        assert!(c.prefix_matches(&scope, fired, &[], std::slice::from_ref(&sd_other)));
+        // 同 scope/fired_at、label 内容不同 → 不匹配。
+        let sd_top = mk_label("top_price");
+        assert!(!c.prefix_matches(&scope, fired, &[], std::slice::from_ref(&sd_top)));
+        // label 数量不同（event 段 + close 段共 2 个 vs 缓存 1 个）→ 不匹配。
+        assert!(!c.prefix_matches(&scope, fired, &[sd_top], std::slice::from_ref(&sd_other)));
+    }
+
+    /// EntityIdCache: 同 key 复用（f 只调一次）、异 key 重算、空 key 边界。
+    #[test]
+    fn entity_id_cache_reuses_on_same_key() {
+        let mut cache = EntityIdCache::new();
+        let key_a = vec![Value::Number(42.0)];
+        let key_b = vec![Value::Number(99.0)];
+        let calls = std::cell::Cell::new(0usize);
+        let f = || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            format!("id-{}", n)
+        };
+        // 首次 → 计算。
+        let a1 = cache.get_or(&key_a, || f());
+        assert_eq!(a1, "id-1");
+        assert_eq!(calls.get(), 1);
+        // 同 key → 复用（f 不调用）。
+        let a2 = cache.get_or(&key_a, || f());
+        assert_eq!(a2, "id-1");
+        assert_eq!(calls.get(), 1, "同 key 不应重新计算");
+        // 异 key → 重算。
+        let b1 = cache.get_or(&key_b, || f());
+        assert_eq!(b1, "id-2");
+        assert_eq!(calls.get(), 2);
+        // 切回 key_a → 重算（缓存只保留最近一个）。
+        let a3 = cache.get_or(&key_a, || f());
+        assert_eq!(a3, "id-3");
+        assert_eq!(calls.get(), 3);
+        // 空 key。
+        let empty: [Value; 0] = [];
+        let e1 = cache.get_or(&empty, || f());
+        assert_eq!(e1, "id-4");
+        let e2 = cache.get_or(&empty, || f());
+        assert_eq!(e2, "id-4");
+        assert_eq!(calls.get(), 4, "空 key 同值也应复用");
+    }
+
+    /// OriginArcs: 预建 Arc 与 `AlertOrigin::as_str` / `CloseReason::as_str`
+    /// 字节一致（3 种 close reason 全覆盖）。
+    #[test]
+    fn origin_arcs_match_as_str() {
+        let arcs = OriginArcs::new();
+        for reason in [
+            CloseReason::Timeout,
+            CloseReason::Flush,
+            CloseReason::Eos,
+        ] {
+            let origin = AlertOrigin::Close { reason };
+            assert_eq!(&**arcs.origin(reason), origin.as_str(), "origin {reason:?}");
+            assert_eq!(
+                &**arcs.close_reason(reason),
+                reason.as_str(),
+                "reason {reason:?}"
+            );
+        }
+    }
+}
+
 /// Hash a [`Value`]'s canonical bytes for wfx_id (see [`build_wfx_id`]).
 /// Number hashes the f64 bits — byte-stable per value (same input → same ID),
 /// and distinct values stay distinct (f64 bits are injective).
@@ -162,6 +386,107 @@ fn hash_value_bytes(hasher: &mut Fnv1a, v: &Value) {
         Value::Bool(b) => hasher.update(&[*b as u8]),
         Value::Array(_) => hasher.update(b"[array]"),
         Value::Object(_) => hasher.update(b"[object]"),
+    }
+}
+
+/// wfx_id 前缀状态缓存（P6, 2026-08-26）: q19 每桶 top-10 条 close 共享
+/// `rule_name + scope_key + fired_at + step labels`——FNV-1a 是增量哈希，
+/// 前缀 state 可复制续算。命中时每 close 只续 hash `measure_value + origin`
+/// （免重新 hash 常量前缀：rule_name/scope_key/fired_at/labels）。
+/// 字节流 = `build_wfx_id_iter` 前段，测试锁定。
+pub(crate) struct WfxPrefixCache {
+    /// 前缀 state = 已 hash `rule \x00 scope... \x00 fired_at \x00 {label \x1e}*`
+    state: u64,
+    scope_key: Vec<Value>,
+    fired_at: String,
+    /// labels 序列（build 时克隆一次，每桶一次）。`prefix_matches` 逐 label
+    /// **借用**比较（不构造新 Vec、不克隆）——精确判定「labels 段字节流
+    /// 相同」，无哈希碰撞（review 2026-08-26：FNV-64 比较有 2^-64 静默
+    /// 错误风险，已废弃）。
+    labels: Vec<Option<String>>,
+}
+
+impl WfxPrefixCache {
+    /// 构建前缀 state（到 `fired_at \x00` 之后；labels/measure 由 finish 每步
+    /// hash——这样 finish 的字节流 = `{label \x1e measure \x1f}* \x00 origin`，
+    /// 与 `build_wfx_id_iter` 完全一致）。
+    pub(crate) fn build(
+        rule_name: &str,
+        scope_key: &[Value],
+        fired_at: &str,
+        event_step_data: &[StepData],
+        close_step_data: &[StepData],
+    ) -> Self {
+        let mut hasher = Fnv1a::new();
+        hasher.update(rule_name.as_bytes());
+        hasher.update(b"\x00");
+        for v in scope_key {
+            hash_value_bytes(&mut hasher, v);
+            hasher.update(b"\x1f");
+        }
+        hasher.update(b"\x00");
+        hasher.update(fired_at.as_bytes());
+        hasher.update(b"\x00");
+        let labels: Vec<Option<String>> = event_step_data
+            .iter()
+            .chain(close_step_data.iter())
+            .map(|sd| sd.label.clone())
+            .collect();
+        Self {
+            state: hasher.state,
+            scope_key: scope_key.to_vec(),
+            fired_at: fired_at.to_string(),
+            labels,
+        }
+    }
+
+    /// 前缀是否与当前 close 匹配（scope_key/fired_at/labels 全同）。labels
+    /// 逐 label **借用**比较（免每 close 克隆分配，可提前短路）：与 build
+    /// 时缓存的 labels 序列精确比较，无哈希碰撞。
+    pub(crate) fn prefix_matches(
+        &self,
+        scope_key: &[Value],
+        fired_at: &str,
+        event_step_data: &[StepData],
+        close_step_data: &[StepData],
+    ) -> bool {
+        if self.scope_key.as_slice() != scope_key || self.fired_at != fired_at {
+            return false;
+        }
+        let mut cached = self.labels.iter();
+        let mut cur = event_step_data.iter().chain(close_step_data.iter());
+        loop {
+            match (cached.next(), cur.next()) {
+                (Some(a), Some(b)) => {
+                    if a.as_deref() != b.label.as_deref() {
+                        return false;
+                    }
+                }
+                (None, None) => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    /// 从缓存前缀 state 续算完整 wfx_id（measure + origin 是变化部分）。
+    pub(crate) fn finish(
+        &self,
+        event_step_data: &[StepData],
+        close_step_data: &[StepData],
+        origin: &AlertOrigin,
+    ) -> String {
+        let mut hasher = Fnv1a { state: self.state };
+        for sd in event_step_data.iter().chain(close_step_data.iter()) {
+            if let Some(label) = &sd.label {
+                hasher.update(label.as_bytes());
+            }
+            hasher.update(b"\x1e");
+            hasher.update(&sd.measure_value.to_bits().to_le_bytes());
+            hasher.update(b"\x1f");
+        }
+        hasher.update(b"\x00");
+        hasher.update(origin.as_str().as_bytes());
+        hex_encode(&hasher.finalize().to_le_bytes())
     }
 }
 
@@ -284,9 +609,85 @@ fn hex_encode_smol(bytes: &[u8]) -> smol_str::SmolStr {
     }
     b.into()
 }
+/// entity_id 连续缓存（P6, 2026-08-26，通用）: 相邻输出（close/match/each）
+/// 同 scope_key 时复用 entity_id 字符串——免每行一次字段 resolve +
+/// value_to_string。q19 每桶 top-10 条 / q6 同 key 多 match 命中率高。
+
+pub(crate) struct EntityIdCache {
+    key: Vec<Value>,
+    id: String,
+    valid: bool,
+}
+
+impl EntityIdCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            key: Vec::new(),
+            id: String::new(),
+            valid: false,
+        }
+    }
+
+    /// 命中缓存（scope_key 与上次相同）直接复用；否则调用 `f` 计算并缓存。
+    pub(crate) fn get_or(&mut self, scope_key: &[Value], f: impl FnOnce() -> String) -> String {
+        if self.valid && self.key.as_slice() == scope_key {
+            self.id.clone()
+        } else {
+            let id = f();
+            self.key = scope_key.to_vec();
+            self.id = id.clone();
+            self.valid = true;
+            id
+        }
+    }
+}
+
+/// close 输出列的 origin/reason Arc 预建缓存（2026-08-26，通用）:
+/// `AlertOrigin::as_str` / `CloseReason::as_str` 是 `&'static str` 常量，逐条
+/// `Arc::from` 会每行一次堆分配（close 列式路径 27.6M 行实测 ~22ns/entry，
+/// 二分 SHIELD-D/TEMP-VERIFY 定位）。预建 6 个 Arc，循环内 `Arc::clone`
+/// （refcount inc，无分配）。字节与 `as_str` 完全一致，测试锁定。
+pub(crate) struct OriginArcs {
+    timeout: Arc<str>,
+    flush: Arc<str>,
+    eos: Arc<str>,
+    timeout_reason: Arc<str>,
+    flush_reason: Arc<str>,
+    eos_reason: Arc<str>,
+}
+
+impl OriginArcs {
+    pub(crate) fn new() -> Self {
+        Self {
+            timeout: Arc::from(AlertOrigin::Close { reason: CloseReason::Timeout }.as_str()),
+            flush: Arc::from(AlertOrigin::Close { reason: CloseReason::Flush }.as_str()),
+            eos: Arc::from(AlertOrigin::Close { reason: CloseReason::Eos }.as_str()),
+            timeout_reason: Arc::from(CloseReason::Timeout.as_str()),
+            flush_reason: Arc::from(CloseReason::Flush.as_str()),
+            eos_reason: Arc::from(CloseReason::Eos.as_str()),
+        }
+    }
+
+    /// 当前 close 的 origin Arc（`AlertOrigin::Close { reason }` 的 as_str）。
+    pub(crate) fn origin(&self, reason: CloseReason) -> &Arc<str> {
+        match reason {
+            CloseReason::Timeout => &self.timeout,
+            CloseReason::Flush => &self.flush,
+            CloseReason::Eos => &self.eos,
+        }
+    }
+
+    /// 当前 close 的 close_reason Arc（`CloseReason::as_str`）。
+    pub(crate) fn close_reason(&self, reason: CloseReason) -> &Arc<str> {
+        match reason {
+            CloseReason::Timeout => &self.timeout_reason,
+            CloseReason::Flush => &self.flush_reason,
+            CloseReason::Eos => &self.eos_reason,
+        }
+    }
+}
 
 /// Build a human-readable summary.
-///
 /// Writes directly into a single `String` (no intermediate `Vec<String>` or
 /// `join`) — byte-identical to the previous `format!`+`join` implementation,
 /// but one allocation per alert instead of one per part plus a final join.
@@ -297,10 +698,41 @@ pub(super) fn build_summary(
     step_data: &[StepData],
     origin: &AlertOrigin,
 ) -> String {
+    build_summary_iter(rule_name, keys, scope_key, step_data.iter(), origin)
+}
+
+/// 列式 close 批量路径的 split 版本：免 `combine_step_data` 深克隆（同
+/// `build_wfx_id_split`——summary 只用 label + measure_value）。字节流 =
+/// 原 `build_summary`（event 段接 close 段，测试锁定）。
+pub(super) fn build_summary_split(
+    rule_name: &str,
+    keys: &[FieldRef],
+    scope_key: &[Value],
+    event_step_data: &[StepData],
+    close_step_data: &[StepData],
+    origin: &AlertOrigin,
+) -> String {
+    build_summary_iter(
+        rule_name,
+        keys,
+        scope_key,
+        event_step_data.iter().chain(close_step_data.iter()),
+        origin,
+    )
+}
+
+fn build_summary_iter<'a>(
+    rule_name: &str,
+    keys: &[FieldRef],
+    scope_key: &[Value],
+    step_data: impl Iterator<Item = &'a StepData> + Clone,
+    origin: &AlertOrigin,
+) -> String {
     use std::fmt::Write as _;
 
     // Estimate capacity so the common case (a few keys / steps) never reallocates.
-    let mut out = String::with_capacity(64 + scope_key.len() * 12 + step_data.len() * 16);
+    let step_len = step_data.clone().count();
+    let mut out = String::with_capacity(64 + scope_key.len() * 12 + step_len * 16);
     let _ = write!(out, "rule={}; ", rule_name);
 
     if scope_key.is_empty() {
@@ -316,19 +748,44 @@ pub(super) fn build_summary(
         out.push_str("]; ");
     }
 
-    for (i, sd) in step_data.iter().enumerate() {
+    for (i, sd) in step_data.enumerate() {
         match &sd.label {
             Some(label) => {
-                let _ = write!(out, "{}={:.1}; ", label, sd.measure_value);
+                out.push_str(label);
+                out.push('=');
+                write_fixed1(&mut out, sd.measure_value);
+                out.push_str("; ");
             }
             None => {
-                let _ = write!(out, "step{}={:.1}; ", i, sd.measure_value);
+                let _ = write!(out, "step{}=", i);
+                write_fixed1(&mut out, sd.measure_value);
+                out.push_str("; ");
             }
         }
     }
 
     let _ = write!(out, "origin={}", origin.as_str());
     out
+}
+
+/// `write!(out, "{v:.1}")` 的定点精度快路径：`v` 为可精确表示的整数 f64 时
+/// （finite 且 fract==0 且 |v| <= 2^53），std 的 `{:.1}` 输出恰好是
+/// `itoa(v) + ".0"`（`-0.0` → `"-0.0"`）——直接字节写出，免 std flt2dec 的
+/// 定点精度求值（隔离对照实测：q19 close 链 641.5→557 ns/evt、q6 match emit
+/// 444→375 ns/evt，链上 -13%/-16%）。非整数 / 超范围回退
+/// `write!(out, "{:.1}", v)`，字节与 std 完全一致（测试逐值对拍锁定）。
+fn write_fixed1(out: &mut String, v: f64) {
+    use std::fmt::Write as _;
+    if v.is_finite() && v.fract() == 0.0 && v.abs() <= (1u64 << 53) as f64 {
+        if v == 0.0 && v.is_sign_negative() {
+            out.push_str("-0.0");
+        } else {
+            push_i64_exact_decimal(out, v as i64);
+            out.push_str(".0");
+        }
+    } else {
+        let _ = write!(out, "{:.1}", v);
+    }
 }
 
 #[cfg(test)]
@@ -604,5 +1061,62 @@ mod format_tests {
                 bytes
             );
         }
-}
+    }
+    /// `write_fixed1`（summary step 的 `{:.1}` 整数快路径）必须与 std
+    /// `format!("{:.1}")` 逐值字节一致——整数快路径命中（含 -0.0、2^53
+    /// 边界）与回退路径都要对拍。
+    #[test]
+    fn write_fixed1_matches_std_fixed1() {
+        let mut vals: Vec<f64> = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            2.5,
+            -2.5,
+            0.1,
+            99.9,
+            100.0,
+            -100.0,
+            123456789.0,
+            (1u64 << 53) as f64,
+            -((1u64 << 53) as f64),
+            ((1u64 << 53) + 1) as f64,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            1e300,
+            1e-300,
+        ];
+        // 伪随机扫描（确定性 LCG，覆盖整值/非整值/量级混合）。
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        for _ in 0..10_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let pick = state % 100;
+            let v = if pick < 40 {
+                // 整数域（快路径主战场）。
+                ((state >> 12) as i64 % 1_000_000_000) as f64
+            } else if pick < 70 {
+                // 非整数值。
+                ((state >> 8) as f64) / 10.0 - 1e8
+            } else if pick < 85 {
+                ((state >> 12) as i64 as f64) / 1e6
+            } else {
+                // 大数 / 边界。
+                [f64::MAX, f64::MIN_POSITIVE, 1e300, 1e-300, 2f64.powi(200)]
+                    [(state >> 8) as usize % 5]
+            };
+            vals.push(v);
+        }
+        for v in vals {
+            let mut fast = String::new();
+            write_fixed1(&mut fast, v);
+            let std_out = format!("{v:.1}");
+            assert_eq!(fast, std_out, "v={v:?} bits={:016x}", v.to_bits());
+        }
+    }
 }
