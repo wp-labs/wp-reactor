@@ -69,8 +69,10 @@ enum ColumnData<T> { Const(T), Rows(Vec<T>) }  // at(row): Const→唯一值, Ro
 ```
 
 **覆盖**：
-- 系统字段列：on-each 的 rule_name/entity_type/origin/close_reason/emit_time（计划/批常量）
-  → `Const`；summary / close 路径的 origin 等 per-row → `Rows`
+- 系统字段列：on-each 的 rule_name/entity_type/origin/close_reason（4 列计划常量）
+  → `Const`；**emit_time/summary 跨批/规则变化 → `Rows`**（emit_time 按
+  nanos 缓存跨批不同；summary 在 match 规则 per-row）、close 路径的 origin 等
+  per-row → `Rows`
 - yield 字面量列：`register_yield_column(name, Some((meta, value)))` → values/metas 免每行
   cell（`YieldCol::is_const_column()`），读时展开
 
@@ -187,7 +189,7 @@ bench 的 `RSS_peak` 单次不可信（运行间波动），对比用 `MEMORY=1 
 
 | 机制 | 成熟度 | 位置 | 能力 | 验证/局限 |
 |---|---|---|---|---|
-| **常量列折叠 `ColumnData<T>`** | ★5 | `alert/column_batch.rs` | 全列同值折叠单值，读时 O(1) 展开 | q13 30M/100M 双达标 + q1 无退化；⚠ summary/record 路径不折叠 |
+| **常量列折叠 `ColumnData<T>`** | ★5 | `alert/column_batch.rs` | 全列同值折叠单值，读时 O(1) 展开 | q13 30M/100M 双达标 + q1 无退化；⚠ 仅 4 计划常量列可折叠（emit_time 跨批变化、summary/record 路径 per-row，R1 修正） |
 | **SmolStr 内联 + `StrSink` trait** | ★5 | `match_engine/key.rs`、`column_batch.rs` | ≤22B 短字符串零堆分配；String/SmolStrBuilder 统一渲染 | 多处使用；字节一致守护测试 |
 | 批式 commit（`commit_each_rows_batch`） | ★4 | `column_batch.rs` | 列式批量装载（bulk extend + 块级 fill） | q1 路径；q13b 用逐行（fcb4630 取舍，见 §3.5 教训） |
 | f64 快车道（`stage_yield_cell_f64`） | ★4 | `column_batch.rs` + `each_exec.rs` | yield 与 entity 同列数字 → 直写免 Value/coerce | q1/q13；EPS +40% 实证 |

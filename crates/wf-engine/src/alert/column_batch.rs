@@ -46,8 +46,9 @@ use wf_lang::wfu_meta::{
 ///
 /// 覆盖两种列：
 /// - 系统字段列（`ColumnData<Arc<str>>`）：on-each 的 rule_name/entity_type/
-///   origin/close_reason/emit_time 是计划/批常量 → `Const`（免每行 cell 与
-///   Arc clone）；summary / close 路径的 origin 等 per-row → `Rows`。
+///   origin/close_reason（4 列计划常量）→ `Const`（免每行 cell 与 Arc clone）；
+///   emit_time/summary 跨批/规则语义变化、close 路径的 origin 等 per-row
+///   → `Rows`（emit_time 按 nanos 缓存跨批不同，R1 2026-08-26）。
 /// - yield 字面量列（`YieldCol::const_value`）：同样语义，values/metas 免
 ///   每行 cell，读时展开 const_value。
 #[derive(Clone)]
@@ -74,10 +75,12 @@ pub struct AlertColumnBatch {
     /// `entity_id` are per-row owned [`SmolStr`]（2026-08-26：内联 ≤22B，零堆
     /// 分配——q13b per-row churn 消减），`fired_at` 是 `String`（ISO 时间戳 24
     /// 字符超内联上限）。列式直接路径 move 进列、零额外分配（`Arc` 反而要每行
-    /// 一次分配 + 拷贝，且值从不共享）。其余六列是计划/批常量，用
-    /// 常量列折叠（见 [`ColumnData`]）：on-each 的 5 列计划/批常量 →
-    /// [`ColumnData::Const`]（免每行 cell 与 Arc clone）；summary / close 的
-    /// origin 等 per-row → [`ColumnData::Rows`]。
+    /// 一次分配 + 拷贝，且值从不共享）。常量列折叠（见 [`ColumnData`]）：
+    /// **4 列计划常量**（rule_name/entity_type/origin/close_reason）→
+    /// [`ColumnData::Const`]（免每行 cell 与 Arc clone）；**emit_time/summary
+    /// 跨批/规则语义变化 → [`ColumnData::Rows`]**（emit_time 按 nanos 缓存，
+    /// 不同批不同值；summary 在 match 规则 per-row——R1 2026-08-26 修正）。
+    /// close 路径的 origin 等 per-row → [`ColumnData::Rows`]。
     wfx_id: Vec<SmolStr>,
     rule_name: ColumnData<Arc<str>>,
     score: Vec<f64>,
@@ -669,7 +672,10 @@ impl AlertColumnBuilder {
         Self::set_system_const(&mut self.origin, cells.origin);
         Self::set_system_const(&mut self.close_reason, cells.close_reason);
         self.fired_at.push(cells.fired_at);
-        Self::set_system_const(&mut self.emit_time, cells.emit_time);
+        // emit_time 跨批变化（cached_emit_time 按 nanos 缓存，不同批不同值）
+        // → 不能常量折叠，逐行 Rows（R1 修复：Const 折叠会把后续批的
+        // emit_time 错读成第一批的值）。
+        Self::push_system_row(&mut self.emit_time, Arc::clone(cells.emit_time));
         // summary 可能 per-row（match 规则 scope 嵌入 build_summary）→ Rows。
         Self::push_system_row(&mut self.summary, Arc::clone(cells.summary));
         for (col_idx, meta, value) in self.staged.drain(..) {
@@ -716,12 +722,12 @@ impl AlertColumnBuilder {
         self.entity_id.reserve(n);
         self.fired_at.reserve(n);
         // 系统常量列免 per-row 数组——只 set 一次，不 reserve。
+        // ⚠ 只 set 跨批安全的计划常量（rule_name/entity_type/origin/
+        // close_reason）；emit_time/summary 走下方 Rows（跨批/规则语义变化）。
         Self::set_system_const(&mut self.rule_name, rule_name);
         Self::set_system_const(&mut self.entity_type, entity_type);
         Self::set_system_const(&mut self.origin, origin);
         Self::set_system_const(&mut self.close_reason, close_reason);
-        Self::set_system_const(&mut self.emit_time, emit_time);
-        Self::set_system_const(&mut self.summary, summary);
         // Bulk system columns.
         self.wfx_id.extend_from_slice(wfx_id);
         self.score.extend_from_slice(score);
@@ -729,6 +735,11 @@ impl AlertColumnBuilder {
         self.fired_at.extend_from_slice(fired_at);
         // 计划常量列：同一 Arc 值扩展 n 行（引用计数共享）——现改为列级
         // 常量（ColumnData::Const 一次存储），读时按行展开。
+        // emit_time：跨批变化（cached_emit_time 按 nanos 缓存）→ Rows（R1）。
+        match &mut self.emit_time {
+            Some(ColumnData::Rows(v)) => v.extend(std::iter::repeat_n(Arc::clone(emit_time), n)),
+            _ => self.emit_time = Some(ColumnData::Rows(vec![Arc::clone(emit_time); n])),
+        }
         // summary：调用方（on-each 批式）传计划常量单值，但 match 语义可能
         // per-row——保守保持 Rows（n 行同一值，语义一致）。
         match &mut self.summary {
@@ -824,11 +835,15 @@ impl AlertColumnBuilder {
         self.score.reserve(n);
         self.entity_id.reserve(n);
         self.fired_at.reserve(n);
-        // 系统列：rule_name/entity_type/emit_time 批级常量 → Const 一次存储；
-        // origin/close_reason/summary per-row（close 逐条变化）→ Rows。
+        // 系统列：rule_name/entity_type 批级常量 → Const；emit_time 跨批变化
+        //（cached_emit_time 按 nanos）→ Rows（R1）；origin/close_reason/
+        // summary per-row（close 逐条变化）→ Rows。
         Self::set_system_const(&mut self.rule_name, rule_name);
         Self::set_system_const(&mut self.entity_type, entity_type);
-        Self::set_system_const(&mut self.emit_time, emit_time);
+        match &mut self.emit_time {
+            Some(ColumnData::Rows(v)) => v.extend(std::iter::repeat_n(Arc::clone(emit_time), n)),
+            _ => self.emit_time = Some(ColumnData::Rows(vec![Arc::clone(emit_time); n])),
+        }
         match &mut self.origin {
             Some(ColumnData::Rows(v)) => v.extend_from_slice(origin),
             _ => self.origin = Some(ColumnData::Rows(origin.to_vec())),
@@ -1288,6 +1303,66 @@ mod tests {
         ]);
         assert!(builder.append_record(&dup).is_err());
         assert_eq!(builder.len(), 0);
+    }
+
+    #[test]
+    fn emit_time_varies_across_batches_reads_back_per_row() {
+        // R1 守护（2026-08-26）：emit_time 跨批变化（cached_emit_time 按 nanos
+        // 缓存，不同批不同值）——若被常量列折叠成 Const，builder 跨批累积时
+        // 后续批的 emit_time 会错读成第一批的值。必须逐行 Rows。
+        let target = Arc::from("alerts");
+        let rule_name = Arc::from("r1");
+        let entity_type = Arc::from("digit");
+        let origin = Arc::from("event");
+        let close_reason = Arc::from("");
+        let summary = Arc::from("summary");
+        let mut builder = AlertColumnBuilder::new(Arc::clone(&target));
+        // 批 1：emit_time = T1（两行）；批 2：emit_time = T2（一行）——模拟
+        // builder 跨批累积（< ALERT_BATCH_SIZE 不 flush 的场景）。
+        let t1 = Arc::from("2026-08-26T10:00:00Z");
+        let t2 = Arc::from("2026-08-26T10:00:01Z");
+        for _ in 0..2 {
+            builder.commit_each_row(EachRowCells {
+                wfx_id: SmolStr::from("id"),
+                score: 1.0,
+                entity_id: SmolStr::from("e"),
+                fired_at: String::from("ts"),
+                rule_name: &rule_name,
+                entity_type: &entity_type,
+                origin: &origin,
+                close_reason: &close_reason,
+                emit_time: &t1,
+                summary: &summary,
+            });
+        }
+        builder.commit_each_row(EachRowCells {
+            wfx_id: SmolStr::from("id3"),
+            score: 1.0,
+            entity_id: SmolStr::from("e3"),
+            fired_at: String::from("ts3"),
+            rule_name: &rule_name,
+            entity_type: &entity_type,
+            origin: &origin,
+            close_reason: &close_reason,
+            emit_time: &t2,
+            summary: &summary,
+        });
+        let batch = builder.finish();
+        assert_eq!(batch.len(), 3);
+        let rows: Vec<_> = batch.iter_data_records().collect();
+        for (i, row) in rows.iter().enumerate() {
+            let r = row.as_ref().unwrap();
+            let et = r
+                .field(WFU_EMIT_TIME)
+                .expect("emit_time field present")
+                .get_value();
+            let expected = if i < 2 { t1.as_ref() } else { t2.as_ref() };
+            assert_eq!(
+                et.to_string(),
+                expected,
+                "行 {i} 的 emit_time 必须逐行正确（跨批变化不得折叠）"
+            );
+        }
     }
 
     #[test]
