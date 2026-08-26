@@ -278,6 +278,14 @@ async fn commit_append(
         if gate.current_bytes.load(Ordering::Relaxed) <= gate.max_total_bytes {
             break;
         }
+        // 死锁打破（2026-08-26 q20 join 窗死锁修复）：evictor 评估的强制
+        // 放行——全部消费者已追平（规则无事可做）或 memory_pressure 持续
+        // 超时。继续停车只会让上游（mailbox/parse/receiver）数据流永久
+        // 冻结（join 目标窗不可驱逐时全局 cap 永不满足）。放行后窗口瞬时
+        // 超限驻留（min_acked 保护未读批，不丢数据），规则追平后驱逐恢复。
+        if gate.force_release() {
+            break;
+        }
         gate.freed.notified().await;
     }
 
@@ -958,5 +966,61 @@ mod tests {
             .expect("死锁：消费者未在超时内追平全部批（actor park 未自愈）")
             .expect("consumer task panicked");
         assert_eq!(consumed.load(Ordering::SeqCst), TOTAL);
+    }
+
+    // -- 死锁打破集成：force_release 时 commit_append 实际放行 ----------------
+
+    /// 复刻 q20 join 窗死锁的放行路径（2026-08-26）：gate 全局超限 + evictor
+    /// 评估置位 `force_release` 时，`commit_append` 必须**跳过停车直接 append**
+    /// ——否则 join 目标窗不可驱逐（over_cap=2d 全保留）时全局 cap 永不满足，
+    /// 停车退化为永久冻结（上游 mailbox/parse/receiver 全停）。单测只验证了
+    /// evictor 置位逻辑；本测试验证 actor 侧真正读取该标志并放行。
+    #[tokio::test]
+    async fn commit_append_skips_parking_when_gate_force_released() {
+        let win = make_window("w");
+        let gate = Arc::new(super::EvictionGate::new(100));
+        gate.current_bytes.store(200, Ordering::Relaxed); // 全局超限
+        gate.debug_set_force_release(true); // 模拟 evictor 死锁打破评估
+        let fanout = RuleFanout::new();
+        let notify = Arc::new(Notify::new());
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            commit_append(
+                &Arc::from("w"),
+                &win,
+                &gate,
+                &fanout,
+                &notify,
+                &None,
+                msg("s", 0, 1_000_000_000, 42),
+            ),
+        )
+        .await
+        .expect("force_release → commit_append 必须立即放行，不能 park 等 evictor");
+        assert_eq!(win.next_seq(), 1, "append 已生效");
+
+        // 对照：未置位时同样超限 → 会 park（等待 evictor 的 freed 通知）
+        let gate2 = Arc::new(super::EvictionGate::new(100));
+        gate2.current_bytes.store(200, Ordering::Relaxed);
+        let win2 = make_window("w2");
+        let notify2 = Arc::new(Notify::new());
+        let fanout2 = RuleFanout::new();
+        let name2: Arc<str> = Arc::from("w2");
+        let park = tokio::time::timeout(
+            Duration::from_millis(150),
+            commit_append(
+                &name2,
+                &win2,
+                &gate2,
+                &fanout2,
+                &notify2,
+                &None,
+                msg("s", 0, 1_000_000_000, 43),
+            ),
+        );
+        // 未置位 → 停车等待（超时 = 正确：它在等 evictor 通知而非直接放行）。
+        assert!(park.await.is_err(), "未置位 force_release → 必须停车等待");
+        assert_eq!(win2.next_seq(), 0, "停车期间未 append");
     }
 }

@@ -1,5 +1,7 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use super::registry::WindowRegistry;
 use tokio::sync::Notify;
@@ -32,6 +34,16 @@ pub struct EvictReport {
     pub memory_pressure: bool,
 }
 
+/// memory_pressure（全局超限且无可驱逐批）持续多久后强制放行 append。
+///
+/// 兜底判据（2026-08-26 q20 join 窗死锁修复）：主判据是「全部消费者追平」
+/// （规则无事可做 → 立即放行）；此超时防主判据失效的极端场景（如消费者
+/// 注册了但永不推进 ack）。10s 给规则追平留足时间（q13 式背压通常远快于
+/// 此），超过即视为死锁倾向。放行 = 宁可窗口瞬时超限驻留（`min_acked`
+/// 保护未读批，不丢数据），也不让上游（mailbox/parse/receiver）因 gate
+/// 永久停车而冻结。
+pub const GATE_PRESSURE_RELEASE_AFTER: Duration = Duration::from_secs(10);
+
 // ---------------------------------------------------------------------------
 // EvictionGate
 // ---------------------------------------------------------------------------
@@ -47,6 +59,14 @@ pub struct EvictReport {
 /// appending (the "conveyor belt stops") until the evictor's next sweep
 /// frees space. [`EvictionGate::freed`] is the [`Notify`] the evictor
 /// signals after each sweep; actors park on it while over budget.
+///
+/// **死锁打破（2026-08-26 q20 join 窗死锁修复）**：停车假设「规则最终追平 →
+/// 驱逐恢复」。当某窗不可驱逐（如 over_cap=2d 的 join 目标窗）时，全局 cap
+/// 永不满足，停车会退化为永久冻结（上游 mailbox/parse/receiver 全停）。
+/// 故 evictor 每轮额外评估 [`EvictionGate::force_release`]：全部消费者追平
+/// （规则无事可做）立即放行，memory_pressure 持续超时（默认 10s）兜底
+/// 放行——宁可窗口瞬时超限驻留（`min_acked` 保护未读批，不丢数据），
+/// 也不让数据流停死。全局回落 cap 以下后清除，恢复正常背压。
 pub struct EvictionGate {
     /// Global memory budget across all windows (bytes).
     pub max_total_bytes: usize,
@@ -58,6 +78,16 @@ pub struct EvictionGate {
     pub current_bytes: AtomicUsize,
     /// Signaled by the evictor after every sweep so parked actors re-check.
     pub freed: Notify,
+    /// memory_pressure 首次连续上报时刻（`None` = 当前无 pressure）。超时
+    /// 兜底放行判据，见 [`GATE_PRESSURE_RELEASE_AFTER`]。
+    pressure_since: Mutex<Option<Instant>>,
+    /// memory_pressure 持续多久后强制放行（超时兜底）。默认
+    /// [`GATE_PRESSURE_RELEASE_AFTER`]；测试可注入短值。
+    pub pressure_release_after: std::time::Duration,
+    /// 强制放行标志：窗口 actor 停车循环读取，置位则跳过停车继续 append。
+    /// 由 evictor 每轮评估（全部消费者追平 or pressure 超时兜底）；全局
+    /// 回落 cap 以下时清除。
+    force_release: AtomicBool,
 }
 
 impl EvictionGate {
@@ -66,7 +96,23 @@ impl EvictionGate {
             max_total_bytes,
             current_bytes: AtomicUsize::new(0),
             freed: Notify::new(),
+            pressure_since: Mutex::new(None),
+            pressure_release_after: GATE_PRESSURE_RELEASE_AFTER,
+            force_release: AtomicBool::new(false),
         }
+    }
+
+    /// 窗口 actor 停车循环的放行查询：`true` 表示跳过停车直接 append。
+    #[inline]
+    pub fn force_release(&self) -> bool {
+        self.force_release.load(Ordering::Relaxed)
+    }
+
+    /// 测试钩子：直接置位/清除放行标志（actor 集成测试用它模拟 evictor
+    /// 的评估结果，验证 `commit_append` 停车循环的实际放行行为）。
+    #[cfg(test)]
+    pub(crate) fn debug_set_force_release(&self, v: bool) {
+        self.force_release.store(v, Ordering::Relaxed);
     }
 }
 
@@ -217,6 +263,41 @@ impl Evictor {
                     break;
                 }
             }
+        }
+
+        // 死锁打破判定（2026-08-26 q20 join 窗死锁修复）。全局超限时：
+        // 1. 立即放行：所有窗口消费者已追平（`min_acked >= next_seq`，规则
+        //    无事可做）——继续停车只会让上游数据流永久冻结（join 目标窗如
+        //    over_cap=2d 的 auction_events 不可驱逐时，全局 cap 永不满足）。
+        // 2. 超时兜底：memory_pressure（无可驱逐批）持续超过
+        //    [`GATE_PRESSURE_RELEASE_AFTER`]。
+        // 放行 = 宁可窗口瞬时超限驻留（`min_acked` 保护未读批，不丢数据），
+        // 也不让 gate 永久停车；规则追平后驱逐恢复，内存自然回落。
+        // 全局回落 cap 以下 → 清除标志恢复正常背压。
+        if total > self.gate.max_total_bytes {
+            let all_caught_up = names.iter().all(|name| {
+                let win = registry.get_window(name).unwrap();
+                let floor = registry
+                    .progress(name)
+                    .map(|p| p.min_acked())
+                    .unwrap_or(u64::MAX);
+                // 无消费者窗口 `min_acked` = u64::MAX（天然追平，可驱逐）。
+                floor >= win.next_seq()
+            });
+            if all_caught_up {
+                self.gate.force_release.store(true, Ordering::Relaxed);
+                *self.gate.pressure_since.lock().unwrap() = None;
+            } else if report.memory_pressure {
+                let mut since = self.gate.pressure_since.lock().unwrap();
+                let now = Instant::now();
+                let first = since.get_or_insert(now);
+                if now.duration_since(*first) >= self.gate.pressure_release_after {
+                    self.gate.force_release.store(true, Ordering::Relaxed);
+                }
+            }
+        } else {
+            self.gate.force_release.store(false, Ordering::Relaxed);
+            *self.gate.pressure_since.lock().unwrap() = None;
         }
 
         // Publish the post-eviction aggregate so actors see the reclaimed
@@ -1108,5 +1189,174 @@ mod tests {
             "pinned untouched"
         );
         assert_eq!(reg.get_window("free").unwrap().batch_count(), 1);
+    }
+
+    // -- 12. gate 死锁打破（2026-08-26 q20 join 窗死锁修复） ----------------
+
+    /// 构造「全局超限 + 无可驱逐（pin 窗）+ 全部消费者已追平」：
+    /// evictor 每轮报 memory_pressure，但消费者追平 = 规则无事可做，继续
+    /// 停车只会让上游数据流永久冻结（join 目标窗不可驱逐时全局 cap 永不
+    /// 满足）→ 必须立即放行 append。
+    #[test]
+    fn gate_force_release_when_all_consumers_caught_up_but_over_cap() {
+        let schema = test_schema();
+        let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+        let one_batch_size = content_bytes(&probe);
+
+        let reg = WindowRegistry::build(vec![WindowDef {
+            params: WindowParams {
+                name: "win".into(),
+                schema: schema.clone(),
+                time_col_index: Some(0),
+                over: Duration::from_secs(3600),
+                materialize_fields: None,
+                defer_materialization: false,
+            },
+            streams: vec![],
+            config: test_config(),
+        }])
+        .unwrap();
+
+        // 2 批，cap = 1 批 → 超限；front 批被 pin 住（join 目标窗）→ 不可驱逐。
+        for ts in [1_000_000_000, 2_000_000_000] {
+            reg.get_window("win")
+                .unwrap()
+                .append(make_batch(&schema, &[ts], &[100]))
+                .unwrap();
+        }
+        let pin = reg
+            .get_window("win")
+            .unwrap()
+            .register_retention_pin()
+            .expect("wired");
+        pin.store(1_000_000_000, Ordering::Release);
+        // 消费者已 ack 全部 2 批（追平）——规则无事可做。slot 必须被持有
+        // （drop 后 strong_count=0 → min_acked 退化为 u64::MAX，会误触发
+        // 追平判据）。
+        let slot = reg.progress("win").unwrap().register();
+        slot.store(2, Ordering::Release);
+
+        let gate = Arc::new(EvictionGate::new(one_batch_size));
+        let evictor = Evictor::new(Arc::clone(&gate));
+        let report = evictor.run_once(&reg, 0);
+
+        assert!(report.memory_pressure, "无可驱逐 → pressure");
+        assert!(
+            gate.force_release(),
+            "全部消费者追平 + 全局超限 → 立即放行（死锁打破）"
+        );
+    }
+
+    /// 超时兜底：消费者**未**追平（规则慢）但 memory_pressure 持续超过
+    /// `pressure_release_after` → 仍须放行（防「消费者注册了但永不推进
+    /// ack」等追平判据失效的极端场景）。放行 = 宁可窗口超限驻留（min_acked
+    /// 保护未读批，不丢数据），也不让数据流停死。
+    #[test]
+    fn gate_pressure_timeout_force_releases() {
+        let schema = test_schema();
+        let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+        let one_batch_size = content_bytes(&probe);
+
+        let reg = WindowRegistry::build(vec![WindowDef {
+            params: WindowParams {
+                name: "win".into(),
+                schema: schema.clone(),
+                time_col_index: Some(0),
+                over: Duration::from_secs(3600),
+                materialize_fields: None,
+                defer_materialization: false,
+            },
+            streams: vec![],
+            config: test_config(),
+        }])
+        .unwrap();
+
+        for ts in [1_000_000_000, 2_000_000_000] {
+            reg.get_window("win")
+                .unwrap()
+                .append(make_batch(&schema, &[ts], &[100]))
+                .unwrap();
+        }
+        let pin = reg
+            .get_window("win")
+            .unwrap()
+            .register_retention_pin()
+            .expect("wired");
+        pin.store(1_000_000_000, Ordering::Release);
+        // 消费者只 ack 了第 1 批（未追平）→ 追平判据不触发，走超时兜底。
+        let slot = reg.progress("win").unwrap().register();
+        slot.store(1, Ordering::Release);
+
+        let mut gate = EvictionGate::new(one_batch_size);
+        gate.pressure_release_after = Duration::from_millis(50);
+        let gate = Arc::new(gate);
+        let evictor = Evictor::new(Arc::clone(&gate));
+
+        evictor.run_once(&reg, 0);
+        assert!(
+            !gate.force_release(),
+            "pressure 首轮 → 仅开始计时，不放行"
+        );
+
+        std::thread::sleep(Duration::from_millis(80));
+        evictor.run_once(&reg, 0);
+        assert!(
+            gate.force_release(),
+            "memory_pressure 持续超时 → 强制放行（死锁打破）"
+        );
+    }
+
+    /// 放行状态在全局回落 cap 以下时清除：恢复正常背压语义（后续若再超限
+    /// 且消费者在追，仍按原机制停车等待）。
+    #[test]
+    fn gate_release_cleared_when_under_cap() {
+        let schema = test_schema();
+        let probe = make_batch(&schema, &[1_000_000_000], &[100]);
+        let one_batch_size = content_bytes(&probe);
+
+        let reg = WindowRegistry::build(vec![WindowDef {
+            params: WindowParams {
+                name: "win".into(),
+                schema: schema.clone(),
+                time_col_index: Some(0),
+                over: Duration::from_secs(3600),
+                materialize_fields: None,
+                defer_materialization: false,
+            },
+            streams: vec![],
+            config: test_config(),
+        }])
+        .unwrap();
+
+        for ts in [1_000_000_000, 2_000_000_000] {
+            reg.get_window("win")
+                .unwrap()
+                .append(make_batch(&schema, &[ts], &[100]))
+                .unwrap();
+        }
+        let pin = reg
+            .get_window("win")
+            .unwrap()
+            .register_retention_pin()
+            .expect("wired");
+        pin.store(1_000_000_000, Ordering::Release);
+        let slot = reg.progress("win").unwrap().register();
+        slot.store(2, Ordering::Release);
+
+        let gate = Arc::new(EvictionGate::new(one_batch_size));
+        let evictor = Evictor::new(Arc::clone(&gate));
+
+        // 追平 + 超限 → 放行置位。
+        evictor.run_once(&reg, 0);
+        assert!(gate.force_release());
+
+        // pin 释放（join 读完后）→ 同一轮驱逐回收 → 全局回落 cap 以下。
+        pin.store(i64::MAX, Ordering::Release);
+        let report = evictor.run_once(&reg, 0);
+        assert!(!report.memory_pressure);
+        assert!(
+            !gate.force_release(),
+            "全局回落 cap 以下 → 清除放行标志，恢复正常背压"
+        );
     }
 }
