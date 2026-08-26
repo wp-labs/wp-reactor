@@ -1,10 +1,12 @@
 # stats 状态 spill 到 redb（大键状态内存有界化）
 
-> 状态：**M1-M3 已完成**（trait + 序列化 → redb 存储 → StatsWindowState 接入）·
-> 2026-08-26 · 优先级：高（q18 100M 状态 18.6G 是语义必然，
+> 状态：**M1-M5 已完成**（trait + 序列化 → redb 存储 → StatsWindowState 接入 →
+> wfl 声明 + spawn 注入 → 生产性修复 + 流式 close drain + 超时链对齐）
+> 2026-08-27 · 优先级：高（q18 100M 状态 18.6G 是语义必然，
 > 唯一的根治路径是让状态落盘，内存只保留活跃子集）
 > 实现：`crates/wf-engine/src/match_engine/spill.rs`（存储层）+
 > `stats_exec.rs`（StatsWindowState 接入：clock 驱逐/读回/close 合并）
+> 验证：§18 —— q18 100M spill EMIT 2937 万零丢弃、RSS 20.6GB 有界（vs 35-40GB）
 > 关联：`notes/q18-stats-key-state-memory.md`（q18 归因 + 键数线性增长根源 §10.4）、
 > `MEMORY_ISSUES_100M.md` M-18
 > 复现场景：`wf-examples/performance/nexmark_pk` → `./bench.sh q18 replay 100m`
