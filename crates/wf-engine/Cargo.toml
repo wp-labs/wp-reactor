@@ -33,6 +33,7 @@ regex = { workspace = true }
 wildmatch = { workspace = true }
 chrono = { workspace = true }
 moju-derive = { workspace = true }
+redb = "4"
 
 [dev-dependencies]
 arrow = { workspace = true }

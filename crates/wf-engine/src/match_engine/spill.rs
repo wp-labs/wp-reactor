@@ -19,9 +19,10 @@
 //! 静默丢键）。长度字段带上限校验（防恶意/损坏长度导致 OOM）。
 
 use crate::match_engine::executor::{
-    DistinctKey, DistinctSet, NumericAccum, RowFields, StatsAccum, TopEntry,
+    DistinctKey, DistinctSet, NumericAccum, RowFieldLayout, RowFields, StatsAccum, TopEntry,
 };
 use crate::match_engine::ScopeKey;
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
 /// spill 存储错误。
 #[derive(Debug)]
@@ -31,6 +32,9 @@ pub enum SpillError {
     /// 状态含 spill 不支持的形态（如 last 行的结构化 Array/Object 值）——
     /// 致命（显式拒绝，绝不静默改写）。
     Unsupported(String),
+    /// redb 存储错误（IO/损坏/类型不符）——写失败可回退拒收（§5 三层阶梯），
+    /// 读失败致命。
+    Redb(redb::Error),
 }
 
 impl std::fmt::Display for SpillError {
@@ -38,6 +42,7 @@ impl std::fmt::Display for SpillError {
         match self {
             SpillError::Corrupt(msg) => write!(f, "spill 数据损坏: {msg}"),
             SpillError::Unsupported(msg) => write!(f, "spill 不支持: {msg}"),
+            SpillError::Redb(e) => write!(f, "redb 错误: {e}"),
         }
     }
 }
@@ -120,6 +125,169 @@ impl SpillStore for MemSpillStore {
     }
     fn len(&self) -> usize {
         self.map.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// redb 持久化实现（M2）
+// ---------------------------------------------------------------------------
+
+/// redb 表：`u64 hash → 序列化 spill 值`（`serialize_spill_value` 字节）。
+/// 单键/单 hash（M1 trait 即单键语义）；两不同 ScopeKey 撞同一 u64 hash 的
+/// 概率 ~2.2e-11（29M 键生日界），put 覆盖旧值——文档化限制（§10），
+/// 不引入链式值（§7 的链为碰撞安全所设，实际概率可忽略）。
+const REDB_TABLE: redb::TableDefinition<u64, &[u8]> =
+    redb::TableDefinition::new("state");
+
+/// redb 持久化实现。
+///
+/// - 文件按任务实例/窗口隔离（`spill_{rule}_{window_start}.rb`，M3 接线）；
+///   本结构只负责单库读写。
+/// - `get` 是「读回」：返回后条目**仍留在库中**——close 前 M3 统一
+///   flush（put 覆盖同 hash）+ drain，单一来源防重复输出（§9）。
+/// - 读失败 = 致命：redb 错误在无 Result 通道的 trait 方法里直接 panic
+///   （绝不静默丢键）；`put` 保留 Result 供 M3 三层预算回退拒收。
+pub struct RedbSpillStore {
+    db: redb::Database,
+    /// 读回时解释 RowFields 的 layout（executor 生命周期内不变）。
+    layout: std::sync::Arc<RowFieldLayout>,
+}
+
+impl RedbSpillStore {
+    /// 打开/新建库（`Database::create` 语义：文件不存在则初始化，存在则打开）。
+    /// 初始化时确保 `state` 表存在（读事务 `open_table` 要求表已存在）。
+    pub fn create(
+        path: impl AsRef<std::path::Path>,
+        layout: std::sync::Arc<RowFieldLayout>,
+    ) -> Result<Self, SpillError> {
+        let db = redb::Database::create(path).map_err(|e| SpillError::Redb(e.into()))?;
+        let write_txn = db.begin_write().map_err(|e| SpillError::Redb(e.into()))?;
+        {
+            let _ = write_txn
+                .open_table(REDB_TABLE)
+                .map_err(|e| SpillError::Redb(e.into()))?;
+        }
+        write_txn.commit().map_err(|e| SpillError::Redb(e.into()))?;
+        Ok(Self { db, layout })
+    }
+
+    fn redb_expect(msg: &str) -> ! {
+        panic!("spill redb 失败(致命): {msg}")
+    }
+}
+
+impl SpillStore for RedbSpillStore {
+    fn contains(&self, hash: u64) -> bool {
+        let txn = match self.db.begin_read() {
+            Ok(t) => t,
+            Err(e) => Self::redb_expect(&format!("begin_read: {e}")),
+        };
+        let table = match txn.open_table(REDB_TABLE) {
+            Ok(t) => t,
+            Err(e) => Self::redb_expect(&format!("open_table: {e}")),
+        };
+        match table.get(hash) {
+            Ok(v) => v.is_some(),
+            Err(e) => Self::redb_expect(&format!("get: {e}")),
+        }
+    }
+
+    fn put(&mut self, hash: u64, key: &ScopeKey, accs: Vec<StatsAccum>) -> Result<(), SpillError> {
+        let bytes = serialize_spill_value(key, &accs)?;
+        let write_txn = self.db.begin_write().map_err(|e| SpillError::Redb(e.into()))?;
+        {
+            let mut table = write_txn
+                .open_table(REDB_TABLE)
+                .map_err(|e| SpillError::Redb(e.into()))?;
+            table
+                .insert(hash, bytes.as_slice())
+                .map_err(|e| SpillError::Redb(e.into()))?;
+        }
+        write_txn.commit().map_err(|e| SpillError::Redb(e.into()))?;
+        Ok(())
+    }
+
+    fn get(&mut self, hash: u64) -> Option<(ScopeKey, Vec<StatsAccum>)> {
+        let txn = match self.db.begin_read() {
+            Ok(t) => t,
+            Err(e) => Self::redb_expect(&format!("begin_read: {e}")),
+        };
+        let table = match txn.open_table(REDB_TABLE) {
+            Ok(t) => t,
+            Err(e) => Self::redb_expect(&format!("open_table: {e}")),
+        };
+        let guard = match table.get(hash) {
+            Ok(v) => v?,
+            Err(e) => Self::redb_expect(&format!("get: {e}")),
+        };
+        let bytes = guard.value().to_vec();
+        match deserialize_spill_value(&bytes, &self.layout) {
+            Ok(v) => Some(v),
+            Err(e) => panic!("spill 读回损坏(致命): {e}"),
+        }
+    }
+
+    fn drain(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+        let mut out = Vec::new();
+        {
+            let txn = match self.db.begin_read() {
+                Ok(t) => t,
+                Err(e) => Self::redb_expect(&format!("begin_read: {e}")),
+            };
+            let table = match txn.open_table(REDB_TABLE) {
+                Ok(t) => t,
+                Err(e) => Self::redb_expect(&format!("open_table: {e}")),
+            };
+            let iter = match table.iter() {
+                Ok(i) => i,
+                Err(e) => Self::redb_expect(&format!("iter: {e}")),
+            };
+            for entry in iter {
+                let (_, v) = match entry {
+                    Ok(e) => e,
+                    Err(e) => Self::redb_expect(&format!("iter 条目: {e}")),
+                };
+                let bytes = v.value().to_vec();
+                let (key, accs) = deserialize_spill_value(&bytes, &self.layout)
+                    .unwrap_or_else(|e| panic!("spill 读回损坏(致命): {e}"));
+                out.push((key, accs));
+            }
+        }
+        // 清空（retain 全删）。
+        let write_txn = match self.db.begin_write() {
+            Ok(t) => t,
+            Err(e) => Self::redb_expect(&format!("begin_write: {e}")),
+        };
+        {
+            let mut table = match write_txn.open_table(REDB_TABLE) {
+                Ok(t) => t,
+                Err(e) => Self::redb_expect(&format!("open_table: {e}")),
+            };
+            match table.retain(|_, _| false) {
+                Ok(()) => {}
+                Err(e) => Self::redb_expect(&format!("retain: {e}")),
+            }
+        }
+        match write_txn.commit() {
+            Ok(()) => {}
+            Err(e) => Self::redb_expect(&format!("commit: {e}")),
+        }
+        out
+    }
+
+    fn len(&self) -> usize {
+        let txn = match self.db.begin_read() {
+            Ok(t) => t,
+            Err(e) => Self::redb_expect(&format!("begin_read: {e}")),
+        };
+        let table = match txn.open_table(REDB_TABLE) {
+            Ok(t) => t,
+            Err(e) => Self::redb_expect(&format!("open_table: {e}")),
+        };
+        match table.len() {
+            Ok(n) => n as usize,
+            Err(e) => Self::redb_expect(&format!("len: {e}")),
+        }
     }
 }
 
@@ -921,5 +1089,91 @@ mod tests {
         let drained = s.drain();
         assert_eq!(drained.len(), 1);
         assert_eq!(s.len(), 0);
+    }
+
+    /// 测试用唯一路径（temp 目录 + 名称 + pid + 纳秒，防并行测试撞文件）。
+    fn spill_test_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "wf_spill_test_{}_{}_{}.rb",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    #[test]
+    fn redb_spill_roundtrip_and_drain() {
+        let layout = sample_layout();
+        let path = spill_test_path("redb_roundtrip");
+        let mut s = RedbSpillStore::create(&path, std::sync::Arc::clone(&layout))
+            .expect("create");
+
+        let k1 = ScopeKey::Int(1001);
+        let accs1 = vec![
+            StatsAccum::Numeric(Box::new(NumericAccum {
+                count: 2,
+                sum: 30,
+                min: Some(10),
+                max: Some(20),
+            })),
+            StatsAccum::Last(None),
+        ];
+        let h1 = spill_hash(&k1);
+        s.put(h1, &k1, accs1).expect("put1");
+
+        let k2 = ScopeKey::Pair(
+            Box::new(ScopeKey::Int(1)),
+            Box::new(ScopeKey::Str("auction".into())),
+        );
+        let mut rf = RowFields::empty(std::sync::Arc::clone(&layout));
+        rf.set(0, Some(crate::match_engine::Value::Number(9800.0)));
+        let accs2 = vec![StatsAccum::Top(vec![TopEntry { key: 1.5, row: rf }])];
+        let h2 = spill_hash(&k2);
+        s.put(h2, &k2, accs2).expect("put2");
+
+        assert!(s.contains(h1));
+        assert!(s.contains(h2));
+        assert!(!s.contains(u64::MAX));
+        assert_eq!(s.len(), 2);
+
+        // get 读回且**留在库中**（close 前统一 flush+drain 防重复的语义基础）
+        let (gk, ga) = s.get(h1).expect("get1");
+        assert_eq!(gk, k1);
+        assert_eq!(ga[0].numeric().count, 2);
+        assert_eq!(s.len(), 2);
+
+        // drain 全部 + 清空
+        let mut drained = s.drain();
+        drained.sort_by_key(|(k, _)| format!("{k:?}"));
+        assert_eq!(drained.len(), 2);
+        assert_eq!(s.len(), 0);
+        assert!(!s.contains(h1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn redb_persists_across_reopen() {
+        let layout = sample_layout();
+        let path = spill_test_path("redb_reopen");
+        let k = ScopeKey::Str("persist".into());
+        let h = spill_hash(&k);
+        {
+            let mut s = RedbSpillStore::create(&path, std::sync::Arc::clone(&layout))
+                .expect("create");
+            s.put(h, &k, vec![StatsAccum::Last(None)]).expect("put");
+        }
+        // 重开（create 对已存在文件 = open）：数据仍在
+        let mut s2 = RedbSpillStore::create(&path, std::sync::Arc::clone(&layout))
+            .expect("reopen");
+        assert!(s2.contains(h));
+        let (k2, a2) = s2.get(h).expect("get");
+        assert_eq!(k2, k);
+        assert!(matches!(a2[0], StatsAccum::Last(None)));
+        let _ = std::fs::remove_file(&path);
     }
 }
