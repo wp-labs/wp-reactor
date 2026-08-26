@@ -272,10 +272,11 @@ async fn dispatch_batch(
 ) {
     // perf-diag cut_serialize 门控：AlertBatch 到 sink 即丢（不序列化不写）——
     // 测「输出构建 + 通道投递」段; 增量（full − emit）= 序列化 + sink 写成本。
-    // 哨兵 sink（__wf_sentinel）豁免——哨兵记录经此落盘驱动档位切换/EPS。
-    if crate::perf_diag::perf_cut_serialize()
-        && sink.name != crate::perf_diag::PERF_SENTINEL_WINDOW
-    {
+    // 哨兵批（yield target = `__wf_sentinel`）豁免——测量协议（档位切换 + EPS）
+    // 必须落盘。旧判定按 sink 名（`sentinel_out` ≠ `__wf_sentinel`）不匹配：
+    // 7 档墙梯（emit 档 cut_serialize=true）下哨兵记录被切 → wfgen 等哨兵超时
+    // → 墙梯假死（2026-08-26 定位修复：改按 batch target 判定）。
+    if crate::perf_diag::perf_cut_serialize() && !is_sentinel_batch(&batch) {
         return;
     }
     let dispatch_started = Instant::now();
@@ -301,5 +302,51 @@ async fn dispatch_batch(
     if let Some(metrics) = metrics {
         metrics.inc_alert_dispatch();
         metrics.observe_alert_dispatch(dispatch_started.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wf_engine::alert::AlertColumnBuilder;
+
+    fn columns_batch(target: &str) -> AlertBatch {
+        let mut builder = AlertColumnBuilder::new(Arc::from(target));
+        AlertBatch::Columns(Arc::new(builder.finish()))
+    }
+
+    #[test]
+    fn sentinel_columns_batch_is_exempt() {
+        // 哨兵批必须豁免 cut_serialize（驱动档位切换 + EPS 落盘）。
+        assert!(is_sentinel_batch(&columns_batch(crate::perf_diag::PERF_SENTINEL_WINDOW)));
+    }
+
+    #[test]
+    fn normal_columns_batch_is_not_exempt() {
+        // 普通业务批（如 q19 top 输出）在 cut_serialize 下必须被切。
+        assert!(!is_sentinel_batch(&columns_batch("alerts")));
+        assert!(!is_sentinel_batch(&columns_batch("q19_top")));
+    }
+
+    #[test]
+    fn rows_batch_is_never_exempt() {
+        // 行式批不携带 target：cut_serialize 下一律切（升级/测试路径，非 emit 主链）。
+        let rows = AlertBatch::Rows(Arc::new(Vec::new()));
+        assert!(!is_sentinel_batch(&rows));
+    }
+}
+
+/// 哨兵批判定：测量协议（档位切换 + EPS）的落盘豁免唯一依据是**批次目标**
+/// （`AlertColumnBatch::target()` = 窗口名 `__wf_sentinel`），与 sink 名无关。
+///
+/// 历史教训：旧判定按 sink 名（`sentinel_out`）匹配，哨兵记录实际经名不同的
+/// sink 写出 → 匹配失败 → cut_serialize 档把哨兵切掉 → wfgen 等哨兵超时 →
+/// 7 档墙梯假死。改为按批次目标判定后，哨兵批无论经哪个 sink 都稳定豁免。
+pub fn is_sentinel_batch(batch: &AlertBatch) -> bool {
+    match batch {
+        AlertBatch::Columns(cols) => {
+            cols.target().as_ref() == crate::perf_diag::PERF_SENTINEL_WINDOW
+        }
+        AlertBatch::Rows(_) => false,
     }
 }
