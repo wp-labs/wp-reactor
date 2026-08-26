@@ -126,6 +126,22 @@ impl Router {
             .insert(window_name.to_string(), mailbox);
     }
 
+    /// 每窗 mailbox 的**在途字节**（已用预算, 容量）——在途量可观测性
+    /// （2026-08-25）。一个批次从 parse worker 派发起持有 permits，直到窗口
+    /// actor append（或丢弃）才释放，所以"已用"就是该窗当前在途内容字节。
+    ///
+    /// ❗ **与 `window.memory_bytes` 可能重叠**：Arrow 缓冲经 `Arc` 共享，一个
+    /// 已 append 但未释放 permits 的批次会同时计入两边——分账时不得直接相加
+    /// （曾因此得出"通道预算加 8.2GB"的错结论）。
+    pub fn mailbox_inflight(&self, window_name: &str) -> Option<(usize, usize)> {
+        let mailboxes = self.mailboxes.read().expect("mailbox lock poisoned");
+        let mb = mailboxes.get(window_name)?;
+        let used = mb
+            .budget_bytes
+            .saturating_sub(mb.budget.available_permits());
+        Some((used, mb.budget_bytes))
+    }
+
     /// Clone the actor mailbox for `window_name`, if one is registered.
     pub fn mailbox(&self, window_name: &str) -> Option<WindowMailbox> {
         self.mailboxes
@@ -966,6 +982,53 @@ mod tests {
                 .unwrap()
                 .total_rows(),
             0
+        );
+    }
+    /// `Router::mailbox_inflight`（2026-08-25 在途量分账新增 API）：报（已用, 容量）
+    /// 字节。
+    ///
+    /// 为何需要：`peak_commit − Σwindow_bytes` 有大额未归因，而「窗口 mailbox 在途」
+    /// 曾是主要嫌疑之一；靠这个读数才把它**实测排除**（生产峰值 0.00GB / 预算
+    /// 0.47GB）。若该 API 静默失效（永远返回 0 或 None），排除结论就失去依据。
+    #[tokio::test]
+    async fn mailbox_inflight_reports_used_and_capacity() {
+        use crate::window::actor::WindowMailbox;
+        use tokio::sync::{Semaphore, mpsc};
+
+        let router = Router::new(WindowRegistry::build(Vec::new()).unwrap());
+        assert!(
+            router.mailbox_inflight("nope").is_none(),
+            "未注册 mailbox 的窗口必须返回 None（而非 (0,0)，以便区分'无 mailbox'与'空闲'）"
+        );
+
+        let (tx, _rx) = mpsc::channel::<WindowMsg>(4);
+        let budget = Arc::new(Semaphore::new(1024));
+        router.register_mailbox(
+            "w1",
+            WindowMailbox {
+                tx,
+                budget: Arc::clone(&budget),
+                budget_bytes: 1024,
+            },
+        );
+        assert_eq!(
+            router.mailbox_inflight("w1"),
+            Some((0, 1024)),
+            "空闲 mailbox：已用 0、容量 1024"
+        );
+
+        // 持有 300 permits（模拟一批在途）→ 已用须反映出来。
+        let held = budget.clone().acquire_many_owned(300).await.unwrap();
+        assert_eq!(
+            router.mailbox_inflight("w1"),
+            Some((300, 1024)),
+            "在途 300 字节须计入已用"
+        );
+        drop(held);
+        assert_eq!(
+            router.mailbox_inflight("w1"),
+            Some((0, 1024)),
+            "permits 释放后已用须归零（否则分账会虚增）"
         );
     }
 }

@@ -1521,3 +1521,64 @@ stage_pipe_record 476ns = **1248ns/行**（0.80M/s 单核）。
 
 ### 回归
 wf-engine 1155 / wf-runtime 551 / clippy 0（+1 边界对拍）。
+
+
+## 2026-08-25 q13 分片内存根治：广播按订阅类型裁剪（30M 达标，100M 遗留）——未 commit
+
+### 一句话
+分片态 RSS 28.8GB 根因 = 每批 q13a 物化 events（≈18MB/批）× 广播携带 × 分片积压
+（bid_mod acked_lag 169 批）。修复 = **广播按订阅类型裁剪**：`RuleFanout::round_robin_only`
+（只有 RoundRobin 订阅或无订阅）→ `take_batch` + `broadcast_batch_only`（不物化
+events）；存在 Single/Sharded 订阅 → `take_events` + `broadcast_with_batch`
+（保留 row-path 契约）。`columnar_each` 门控 `events.is_none()` → `shard_rows.is_none()`
+（push 消费者也列式）。`spawn.rs` 放开 q13a 生产者分片。
+
+### 实测（30M 达标）
+| 配置 | EPS | RSS_peak |
+|------|-----|----------|
+| 单 worker（基线） | 1.52M | 5.9GB |
+| 分片（events 冗余） | 2.78–3.88M | 28.8GB ✗ |
+| **分片（裁剪后）** | **4.06M / 3.41M** | **9.87GB / 8.43GB** ✓ |
+
+回归：wf-engine 1156 / wf-runtime 552 / clippy 0（+`round_robin_only_classifies_subscriptions`，
+3 个被无条件裁剪 break 的测试恢复）。
+
+### ⚠ 100M 遗留 → **独立 issue**：`issues/q13-memory-peak-scales-with-volume.md`
+100M RSS_peak 26.4GB（平台期）：footprint 定案 23GB = mimalloc 段区（reclaimable，
+已 purge）、物理 dirty 仅 3.4GB、窗口有界 6.4GB、bid_mod acked_lag 峰值 765。
+机制判断 = RSS 是 mimalloc **峰值分配水位**，100M 下 q13b 消费滞后积压在途 batch
+把水位顶高。验证路径与候选修复见 issue 文档，**下次从那里继续**。
+
+### Pitfalls（本次新增）
+- 无条件广播裁剪 break row-path 中间窗契约（3 测试断言 `push.events`）——必须按
+  订阅类型（round_robin_only）裁剪。
+- 决策在 take 之前：`take_batch`/`take_events` 都消费 stager 缓冲，二者互斥。
+- RSS 26GB ≠ 泄漏：footprint 显示 23GB reclaimable，dirty 仅 3.4GB。RSS 是峰值
+  分配水位的代理指标。
+- 勿回退 q13a 分片（30M 已达标，回退是倒退）；100M 先看 lag 时间曲线再动手。
+
+## 2026-08-26 内存定位完结：机制闭环 + 首个有效修复（f64 快车道，EPS +40%、dirty −43%）
+
+**定位结论**：q13b 30M 内存 = 流水线在途积压（footprint：跑批中 dirty 13G、
+停止注入 1s 后 4.4G），∝ 每行 CPU（fill 占列式路径 96%）。二分（6 轮短路消融）：
+alert 构建段 9.7G = 列装载 6.1G（值进列总量，与 push 方式无关——moved 批式
+无效已证）+ 3.6G。
+
+**修复**：q13b 列式 join 路径对齐无 join 路径（939）的 f64 快车道 + entity
+值复用（`id=m.bidder` 与 entity 同列数字 → stage_yield_cell_f64 直写，跳过
+Value/coerce 中转）→ **EPS 5.40M→7.57M（+40%）、跑批中 dirty 13→7.4G
+（−43%）**。首次正向验证「每行 CPU → 在途 → 内存」闭环。
+
+**遗留**：bench RSS_peak 采样不稳定（5-14G 波动，判内存用 MEMORY=1 diag +
+fp 探针）；detail（Right join 值）无快车道；列值总量仍决定水位上限。
+完整记录 `issues/q13-memory-peak-scales-with-volume.md` §10-12。
+
+## 2026-08-26 over 调小实验：`bid_events/bid_mod → 10m`——无效，已回退
+
+用户假设内存随数据量上升 ∝ over 保留量，要求把两窗都改 10m 实测。
+结果（30M，per-row churn 消减后）：**EPS 5.40M 不变、RSS 14,282MB vs 基线
+14.3GB（几乎不动）**；窗口预算仅省 3.68G→3.29G。over 调小对 RSS 杠杆率
+≈0——保留量由消费滞后（ack floor 门控）决定，第三次独立验证（1h/30m/10m/1m
+四档结论一致）。已回退 wfs 到 over=30m/1h；未归因 ~10G 的追查方向不变
+（alert 通道/构建器在途、规则任务工作态、rule channel）。完整记录在
+`issues/q13-memory-peak-scales-with-volume.md` §8。

@@ -21,8 +21,9 @@ pub use types::{EngineHashMap, EngineHashSet};
 pub(crate) use eval::eval_expr;
 pub use eval::values_equal;
 pub use key::{ScopeKey, field_ref_name};
+#[allow(unused_imports)] // test-only（key.rs 内部用全限定路径，lib 构建无人消费）
 pub(crate) use key::{
-    eval_field_value, extract_key_simple, push_i64_exact_decimal, scope_key_from_values,
+    push_i64_exact_decimal, eval_field_value, extract_key_simple, scope_key_from_values,
     scope_key_shard_index, value_to_string,
 };
 

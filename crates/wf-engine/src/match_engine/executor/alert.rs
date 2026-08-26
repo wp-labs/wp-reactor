@@ -554,13 +554,16 @@ impl EachWfxPrefix {
 
     /// Per-row finish — byte stream identical to
     /// [`wfx_id_from_rule_and_time`] (locked by unit test).
-    pub(crate) fn wfx_id(&self, event_time_nanos: i64, origin: &AlertOrigin) -> String {
+    ///
+    /// 2026-08-26：返回 [`SmolStr`]（16 hex 内联，零堆分配）——q13b 每行
+    /// 构造 wfx_id 的 per-row churn 消减。
+    pub(crate) fn wfx_id(&self, event_time_nanos: i64, origin: &AlertOrigin) -> smol_str::SmolStr {
         let mut hasher = Fnv1a { state: self.state };
         hasher.update(&event_time_nanos.to_le_bytes());
         hasher.update(b"\x00");
         hasher.update(b"\x00");
         hasher.update(origin.as_str().as_bytes());
-        hex_encode(&hasher.finalize().to_le_bytes())
+        hex_encode_smol(&hasher.finalize().to_le_bytes())
     }
 }
 
@@ -571,12 +574,16 @@ impl EachWfxPrefix {
 /// path. Single source of the 2^53 rendering rule — used by the batch-typed
 /// entity column read in the columnar on-each path (locked by
 /// `flat_int64_fast_path_matches_f64_roundtrip_bytes`).
-pub(crate) fn write_int64_value(scratch: &mut String, v: i64) {
-    use std::fmt::Write;
+pub(crate) fn write_int64_value(
+    scratch: &mut impl crate::match_engine::match_engine::key::StrSink,
+    v: i64,
+) {
     if v.unsigned_abs() <= (1i64 << 53) as u64 {
-        push_i64_exact_decimal(scratch, v);
+        crate::match_engine::match_engine::key::push_i64_exact_decimal(scratch, v);
     } else {
-        let _ = write!(scratch, "{}", v as f64);
+        // |v| > 2^53：f64 Display 渲染（可能有 .0/科学计数——与 value_to_string 字节一致）。
+        let rendered = (v as f64).to_string();
+        scratch.push_str(&rendered);
     }
 }
 
@@ -590,10 +597,22 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// `hex_encode` 的 SmolStr 版本（2026-08-26 q13b per-row churn 消减）：
+/// fnv64 hex 固定 16 字符，落在 SmolStr 内联上限（22B）内 → 零堆分配。
+/// 仅用于 [`EachWfxPrefix::wfx_id`]（每行热路径）；其余调用方保持 String。
+fn hex_encode_smol(bytes: &[u8]) -> smol_str::SmolStr {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut b = smol_str::SmolStrBuilder::new();
+    for byte in bytes {
+        b.push(HEX[(byte >> 4) as usize] as char);
+        b.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    b.into()
+}
 /// entity_id 连续缓存（P6, 2026-08-26，通用）: 相邻输出（close/match/each）
 /// 同 scope_key 时复用 entity_id 字符串——免每行一次字段 resolve +
 /// value_to_string。q19 每桶 top-10 条 / q6 同 key 多 match 命中率高。
-/// 语义 = 逐行 resolve（同 key 同值），仅省重复计算，测试锁定。
+
 pub(crate) struct EntityIdCache {
     key: Vec<Value>,
     id: String,
@@ -669,7 +688,6 @@ impl OriginArcs {
 }
 
 /// Build a human-readable summary.
-///
 /// Writes directly into a single `String` (no intermediate `Vec<String>` or
 /// `join`) — byte-identical to the previous `format!`+`join` implementation,
 /// but one allocation per alert instead of one per part plus a final join.
@@ -982,6 +1000,68 @@ mod format_tests {
         );
     }
 
+    /// **StrSink 一致性**（2026-08-26 段 4）：`write_int64_value` 泛型化为
+    /// `StrSink`（String + SmolStrBuilder 两实现）后，两条路径必须渲染出
+    /// **相同的字节**——SmolStrBuilder 路径是 q13b entity_id 的新热路径
+    /// （数字内联零堆分配），若与 String 路径有偏差，alert 的 entity_id
+    /// 列会静默变值（下游序列化/sink 消费方按字符串处理）。
+    #[test]
+    fn str_sink_smol_builder_matches_string_rendering() {
+        let edge_vals: Vec<i64> = vec![
+            i64::MIN,
+            i64::MIN + 1,
+            -(1i64 << 53) - 1,
+            -(1i64 << 53),
+            -(1i64 << 53) + 1,
+            -1,
+            0,
+            1,
+            (1i64 << 53) - 1,
+            (1i64 << 53),
+            (1i64 << 53) + 1,
+            123_456_789,
+            999_999_999_999_999_999,
+            i64::MAX,
+        ];
+        for &v in edge_vals.iter() {
+            let mut string_sink = String::new();
+            write_int64_value(&mut string_sink, v);
+            let mut smol = smol_str::SmolStrBuilder::new();
+            write_int64_value(&mut smol, v);
+            let smol_str: smol_str::SmolStr = smol.into();
+            assert_eq!(
+                smol_str.as_str(),
+                string_sink,
+                "int64 v={v}：SmolStrBuilder 与 String 渲染必须字节一致"
+            );
+        }
+    }
+
+    /// **hex_encode_smol 字节一致**（2026-08-26 段 4）：fnv64 hex 的 SmolStr
+    /// 直写（内联 16 字符）与 String 版本输出必须相同——wfx_id 是下游去重/
+    /// 关联键，静默变值会破坏语义。
+    #[test]
+    fn hex_encode_smol_matches_string_version() {
+        // 覆盖全字节值域与典型 hash 输出（fnv64 → 8 字节）。
+        let cases: &[&[u8]] = &[
+            &[0u8; 8],
+            &[0xffu8; 8],
+            &[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+            &[0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33],
+            &[7u8],
+            &[],
+        ];
+        for bytes in cases {
+            let legacy = hex_encode(bytes);
+            let smol = hex_encode_smol(bytes);
+            assert_eq!(
+                smol.as_str(),
+                legacy,
+                "bytes {:02x?}：SmolStr 直写与 String 版本必须字节一致",
+                bytes
+            );
+        }
+    }
     /// `write_fixed1`（summary step 的 `{:.1}` 整数快路径）必须与 std
     /// `format!("{:.1}")` 逐值字节一致——整数快路径命中（含 -0.0、2^53
     /// 边界）与回退路径都要对拍。

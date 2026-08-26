@@ -1,6 +1,6 @@
 use crate::match_engine::{AsofLookup, JoinKey, Value};
-use crate::window::buffer::Window;
 use crate::window::buffer::JOIN_INDEX_SHARDS;
+use crate::window::buffer::Window;
 use crate::window::buffer::types::AppendOutcome;
 use crate::window::buffer::types::WindowParams;
 use crate::window::buffer::{content_bytes, events_bytes};
@@ -1967,7 +1967,8 @@ fn join_index_sharded_lookup_evict_and_asof_span_all_shards() {
     // 每个 key 两行（不同 ts）→ lookup 行数 = 2。
     for (i, key) in keys.iter().enumerate() {
         let ts = 1_000_000_000i64 + (i as i64) * 100;
-        win.append(make_batch(&test_schema(), &[ts], &[*key])).unwrap();
+        win.append(make_batch(&test_schema(), &[ts], &[*key]))
+            .unwrap();
         win.append(make_batch(&test_schema(), &[ts + 50], &[*key]))
             .unwrap();
     }
@@ -1978,12 +1979,7 @@ fn join_index_sharded_lookup_evict_and_asof_span_all_shards() {
             "key {key} must be found with both rows (regardless of shard)"
         );
         // asof：两行都在 [ts, ts+50]，event_time 取后行 → 命中后行。
-        match win.join_lookup_asof(
-            &JoinKey::Int(*key),
-            i64::MAX,
-            i64::MIN,
-            None,
-        ) {
+        match win.join_lookup_asof(&JoinKey::Int(*key), i64::MAX, i64::MIN, None) {
             AsofLookup::Hit(row) => {
                 assert_eq!(row.field_value("value"), Some(Value::Number(*key as f64)));
             }
@@ -2162,7 +2158,9 @@ fn join_index_remove_batch_fallback_when_registry_missing() {
     // 已注册 seq：增量删除 + registry 条目清理。
     index.remove_batch(7);
     assert!(
-        index.lookup(&JoinKey::Int(42), None).is_none_or(|v| v.is_empty()),
+        index
+            .lookup(&JoinKey::Int(42), None)
+            .is_none_or(|v| v.is_empty()),
         "registered seq removal must clear the rows"
     );
     assert!(
@@ -2189,8 +2187,9 @@ fn join_index_concurrent_append_evict_lookup_no_deadlock() {
     let writer = thread::spawn(move || {
         let mut k = 0i64;
         while !sw.load(Ordering::Relaxed) {
-            let times: Vec<i64> =
-                (0..32).map(|i| 1_000_000_000i64 + i * 1000 + k * 32).collect();
+            let times: Vec<i64> = (0..32)
+                .map(|i| 1_000_000_000i64 + i * 1000 + k * 32)
+                .collect();
             let vals: Vec<i64> = (0..32).map(|i| (k + i) % 16).collect();
             w.append(make_batch(w.schema(), &times, &vals)).unwrap();
             k += 1;
@@ -2536,4 +2535,144 @@ fn join_index_append_bench() {
         "[join-index-append-bench] set_join_key (empty) = {:.1} ns",
         set_key_ns
     );
+}
+
+/// 会计保真度（2026-08-25）：`allocated_usage()` 报**实际分配** Arrow 缓冲字节
+/// （含 null bitmap / offsets / 容量舍入），`memory_usage()` 报逻辑内容
+/// （`content_bytes`，驱逐与 mailbox 预算口径）。
+///
+/// 存在理由：内存分账需要一个不漏 bitmap/offsets 又不重复计共享缓冲的口径
+/// （`get_array_memory_size` 会按列重复计整块分配，实测把 content 1.58GB 的窗口
+/// 报成 17.97GB）。本测试钉死三条：分配 ≥ 内容、随 append 增长、随驱逐回落到 0
+/// （最后一条防止记账单调虚增造出假"泄漏"信号）。
+#[test]
+fn allocated_usage_tracks_real_buffers_and_drops_on_evict() {
+    let win = test_window(10, usize::MAX);
+    let schema = win.schema().clone();
+
+    assert_eq!(win.allocated_usage(), 0, "空窗分配字节为 0");
+
+    let t1 = 1_000_000_000;
+    let t2 = 5_000_000_000;
+    win.append(make_batch(&schema, &[t1], &[100])).unwrap();
+    let a1 = win.allocated_usage();
+    let c1 = win.memory_usage();
+    assert!(a1 > 0, "append 后分配字节须 > 0");
+    assert!(
+        a1 >= c1,
+        "实际分配 ({a1}) 必须 ≥ 逻辑内容 ({c1})——含 null bitmap/offsets/容量舍入"
+    );
+
+    win.append(make_batch(&schema, &[t2], &[200])).unwrap();
+    assert!(win.allocated_usage() > a1, "第二批 append 后分配字节须增长");
+
+    // 时间驱逐两批（now 推到 over 之后）→ 分配字节必须回落到 0（无泄漏记账）。
+    win.evict_expired(t2 + 11_000_000_000);
+    assert_eq!(win.batch_count(), 0, "sanity: 两批都已过期驱逐");
+    assert_eq!(
+        win.allocated_usage(),
+        0,
+        "驱逐后分配字节必须归零（记账与 current_bytes 同步）"
+    );
+    assert_eq!(win.memory_usage(), 0, "内容字节同样归零");
+}
+
+/// `allocated_bytes` 的两条硬约束（2026-08-25 会计保真度，两者都踩过坑）：
+///
+/// 1. **≥ content_bytes**：必须计入 null bitmap / offsets（`content_bytes` 漏掉，
+///    新建批次会低估这两项）。
+/// 2. **共享缓冲不得重复计**：IPC 解码批次各列是同一帧体的零拷贝切片，
+///    `RecordBatch::get_array_memory_size()` 按列累加整个底层容量 → 实测把
+///    content 1.58GB 的窗口报成 17.97GB（11.4×），甚至超过进程 peak_commit。
+///    本测试用 `slice()` 造出共享缓冲的多列批次，断言不出现成倍膨胀。
+#[test]
+fn allocated_bytes_counts_bitmaps_but_not_shared_buffers_twice() {
+    use crate::window::allocated_bytes;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    // ① 独立缓冲 + 含空值 → 必须 ≥ content（多出 null bitmap）。
+    let with_nulls = Int64Array::from(vec![Some(1i64), None, Some(3)]);
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    let b1 = RecordBatch::try_new(schema, vec![Arc::new(with_nulls) as ArrayRef]).unwrap();
+    let a1 = allocated_bytes(&b1);
+    let c1 = content_bytes(&b1);
+    assert!(
+        a1 >= c1,
+        "allocated ({a1}) 必须 ≥ content ({c1})：null bitmap/offsets 不能漏"
+    );
+
+    // ② 同一底层缓冲被两列共享（slice 零拷贝）→ 不得按列重复累加。
+    let base = Int64Array::from((0..1024i64).collect::<Vec<_>>());
+    let left = base.slice(0, 512);
+    let right = base.slice(512, 512);
+    let schema2 = Arc::new(Schema::new(vec![
+        Field::new("l", DataType::Int64, true),
+        Field::new("r", DataType::Int64, true),
+    ]));
+    let b2 = RecordBatch::try_new(
+        schema2,
+        vec![Arc::new(left) as ArrayRef, Arc::new(right) as ArrayRef],
+    )
+    .unwrap();
+    let a2 = allocated_bytes(&b2);
+    let naive = b2.get_array_memory_size();
+    // 两个 512 元素切片共享一个 1024×8B = 8KiB 分配；实际引用合计 ≈ 8KiB。
+    assert!(
+        a2 <= 12 * 1024,
+        "共享缓冲不得成倍膨胀（allocated={a2}，朴素 get_array_memory_size={naive}）"
+    );
+    assert!(
+        a2 >= 8 * 1024,
+        "两个 512×i64 切片实际引用应 ≈ 8KiB（allocated={a2}）"
+    );
+}
+
+/// R1 review 补盲（2026-08-25）：`allocated_bytes` 的两个**真实 IPC 形态**边界，
+/// 前一版测试用 `Array::slice()`（各列共享同一 Buffer 对象、ptr 相同 → 走去重
+/// 分支）覆盖不到：
+///
+/// 1. **同一分配的不同区间**（IPC 解码的真实形态：每列一个
+///    `Buffer::slice_with_length`，ptr 各异但同属一块分配）→ 必须**按引用长度
+///    求和**，不得把整块分配重复计入（`get_array_memory_size` 正是这么错的）。
+/// 2. **`RecordBatch::slice()` 后**：arrow-rs 的 slice 会收缩 buffer 的 ptr/len，
+///    所以本函数报的是**实际引用范围**（准确，不高报）。
+///    （review 时曾误以为会按整块高报，实测否定——此处钉死真实行为。）
+#[test]
+fn allocated_bytes_sums_disjoint_slices_and_tracks_sliced_extent() {
+    use crate::window::allocated_bytes;
+    use arrow::array::Int64Array;
+    use arrow::buffer::Buffer;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    // ① 一块 1024×i64 = 8KiB 分配，切成两段各 4KiB 供两列使用（ptr 不同）。
+    let base: Buffer = Buffer::from_vec((0..1024i64).collect::<Vec<_>>());
+    let left = base.slice_with_length(0, 4096);
+    let right = base.slice_with_length(4096, 4096);
+    let a_left = Int64Array::new(left.into(), None);
+    let a_right = Int64Array::new(right.into(), None);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l", DataType::Int64, false),
+        Field::new("r", DataType::Int64, false),
+    ]));
+    let b = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(a_left) as ArrayRef, Arc::new(a_right) as ArrayRef],
+    )
+    .unwrap();
+    let a = allocated_bytes(&b);
+    assert!(
+        (8192..=9216).contains(&a),
+        "两段不相交切片应求和 ≈8KiB（实际 {a}）——不得按列重复计整块分配"
+    );
+
+    // ② 切片后的批次：arrow-rs 的 slice 收缩 ptr/len → 本函数准确反映子集。
+    let sliced = b.slice(0, 256);
+    let a_sliced = allocated_bytes(&sliced);
+    assert_eq!(
+        a_sliced,
+        2 * 256 * 8,
+        "切片后应只计实际引用范围（两列 × 256 行 × 8B），实际 {a_sliced}"
+    );
+    assert!(a_sliced < a, "切片子集（{a_sliced}）必须小于全量（{a}）");
 }

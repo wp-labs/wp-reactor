@@ -510,9 +510,9 @@ impl RuleExecutor {
                 continue;
             }
             builder.commit_each_row(EachRowCells {
-                wfx_id,
+                wfx_id: SmolStr::from(wfx_id),
                 score: score_const,
-                entity_id,
+                entity_id: SmolStr::from(entity_id),
                 fired_at,
                 rule_name: &statics.rule_name,
                 entity_type: &statics.entity_type,

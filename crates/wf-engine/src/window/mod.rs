@@ -15,7 +15,9 @@ pub use actor::{
     WINDOW_CHANNEL_DEPTH, WindowAppendReport, WindowMailbox, WindowMsg, acquire_window_budget,
     run_window_actor,
 };
-pub use buffer::{AppendOutcome, Window, WindowParams, content_bytes, events_bytes};
+pub use buffer::{
+    AppendOutcome, Window, WindowParams, allocated_bytes, content_bytes, events_bytes,
+};
 pub use evictor::{EvictReport, EvictionGate, Evictor, WindowEvictCount};
 pub(crate) use fanout::scope_key_columnar;
 pub(crate) use fanout::scope_key_from_column;

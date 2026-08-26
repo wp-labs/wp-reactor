@@ -12,6 +12,7 @@ use chrono::Timelike;
 use wf_lang::{BaseType, FieldType};
 use wp_model_core::model::{DataRecord, DataType, Field, FieldStorage, Value as ModelValue};
 
+use smol_str::SmolStr;
 use crate::alert::column_batch::{AlertColumnBuilder, EachRowCells};
 use crate::alert::types::{AlertOrigin, OutputRecord, export_yield_f64, export_yield_value};
 use crate::alert::{WFU_PREFIX, data_record_to_json_string};
@@ -429,9 +430,9 @@ fn commit_close_rows_batch_matches_record_appended_rows() {
         .unwrap();
     let auction_col = 0usize;
     let price_col = 1usize;
-    let wfx: Vec<String> = (0..n).map(|i| format!("id{i}")).collect();
+    let wfx: Vec<SmolStr> = (0..n).map(|i| format!("id{i}").into()).collect();
     let scores: Vec<f64> = (0..n).map(|i| 42.5 + i as f64).collect();
-    let eids: Vec<String> = (0..n).map(|i| format!("10.0.0.{}", i + 1)).collect();
+    let eids: Vec<SmolStr> = (0..n).map(|i| format!("10.0.0.{}", i + 1).into()).collect();
     let fats: Vec<String> = (0..n).map(|i| format!("ts{i}")).collect();
     let origins_arc: Vec<Arc<str>> = origins.iter().map(|s| Arc::from(*s)).collect();
     let close_reasons_arc: Vec<Arc<str>> = ["timeout", "flush", "eos"]
@@ -682,9 +683,9 @@ fn staged_row_with_const_column_matches_append_path() {
             .stage_yield_cell(&v_name, Some(&ft_float), &Value::Number((10 + i) as f64))
             .unwrap();
         via_staged.commit_each_row(EachRowCells {
-            wfx_id: format!("id{i}"),
+            wfx_id: format!("id{i}").into(),
             score: 42.5,
-            entity_id: format!("e{i}"),
+            entity_id: format!("e{i}").into(),
             fired_at: format!("ts{i}"),
             rule_name: &rule_name,
             entity_type: &entity_type,

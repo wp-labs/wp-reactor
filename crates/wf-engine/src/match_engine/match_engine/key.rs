@@ -1,4 +1,4 @@
-use smol_str::SmolStr;
+use smol_str::{SmolStr, SmolStrBuilder};
 use wf_lang::ast::{FieldRef, PathSegment};
 
 use super::types::{EngineHashMap, FieldSource, Value};
@@ -429,13 +429,42 @@ pub(crate) fn eval_field_value_src(src: &dyn FieldSource, fr: &FieldRef) -> Opti
 /// `(v as f64).to_string()` when `|v| <= 2^53`, without the `fmt` machinery.
 /// Single source for the integer fast path shared by [`value_to_string`] and
 /// the columnar on-each path (`write_int64_value`).
-pub(crate) fn push_i64_exact_decimal(scratch: &mut String, mut v: i64) {
+/// 可追加字符/字符串的缓冲（String 或 SmolStr）——`push_i64_exact_decimal`
+/// / `write_int64_value` 泛型化的目标（2026-08-26 q13b per-row churn 消减：
+/// entity_id 直接写进 SmolStr 内联缓冲，免 String 中转）。smol_str 0.3 的
+/// `fmt::Write` 只给 `SmolStrBuilder`，故用自家小 trait 统一两个具体类型。
+pub(crate) trait StrSink {
+    fn push_str(&mut self, s: &str);
+    fn push_char(&mut self, c: char);
+}
+
+impl StrSink for String {
+    fn push_str(&mut self, s: &str) {
+        String::push_str(self, s);
+    }
+    fn push_char(&mut self, c: char) {
+        String::push(self, c);
+    }
+}
+
+// SmolStr 自身不可变（0.3.6 只有 new/as_str/len/is_empty）；可写的是
+// `SmolStrBuilder`（push/push_str，最后 `into() -> SmolStr` 零拷贝）。
+impl StrSink for SmolStrBuilder {
+    fn push_str(&mut self, s: &str) {
+        SmolStrBuilder::push_str(self, s);
+    }
+    fn push_char(&mut self, c: char) {
+        SmolStrBuilder::push(self, c);
+    }
+}
+
+pub(crate) fn push_i64_exact_decimal(scratch: &mut impl StrSink, mut v: i64) {
     if v == i64::MIN {
         scratch.push_str("-9223372036854775808");
         return;
     }
     if v < 0 {
-        scratch.push('-');
+        scratch.push_char('-');
         v = -v;
     }
     let mut buf = [0u8; 20];

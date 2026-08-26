@@ -5,8 +5,9 @@
 //! Join operations read from an in-memory HashMap — no per-event SQL queries.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::match_engine::{EngineHashMap, JoinKey, Value};
+use crate::match_engine::{EngineHashMap, Event, JoinKey, JoinRow, Value};
 
 /// A window whose data comes from an external provider rather than event streams.
 ///
@@ -28,6 +29,11 @@ pub struct ProviderWindow {
     /// [`JoinKey`] (same truncation semantics as the buffer-window join index).
     join_key: Option<String>,
     join_index: Option<EngineHashMap<JoinKey, Vec<usize>>>,
+    /// 预物化 join 行（`Arc<Event>`，静态表构建一次）——与 `join_index` 同步
+    /// 重建。join 命中返回 Arc clone，避免每行重建 `Event` + HashMap（q13b
+    /// 30M 行 × 每行 Arc 分配 + 2 字段 HashMap 构建 + Value clone 的 per-row
+    /// churn；对齐 q13b_join_bench `IndexedLookup` 的预物化模式）。
+    join_rows: Option<EngineHashMap<JoinKey, Vec<Arc<Event>>>>,
 }
 
 impl ProviderWindow {
@@ -40,6 +46,7 @@ impl ProviderWindow {
             rows: Vec::new(),
             join_key: None,
             join_index: None,
+            join_rows: None,
         }
     }
 
@@ -61,17 +68,29 @@ impl ProviderWindow {
     fn rebuild_join_index(&mut self) {
         let Some(key) = self.join_key.as_deref() else {
             self.join_index = None;
+            self.join_rows = None;
             return;
         };
         let mut index: EngineHashMap<JoinKey, Vec<usize>> = EngineHashMap::default();
+        let mut rows_idx: EngineHashMap<JoinKey, Vec<Arc<Event>>> = EngineHashMap::default();
         for (i, row) in self.rows.iter().enumerate() {
             if let Some(v) = row.get(key)
                 && let Some(join_key) = JoinKey::from_value(v)
             {
-                index.entry(join_key).or_default().push(i);
+                index.entry(join_key.clone()).or_default().push(i);
+                // 预物化：Arc<Event> 每行一次；字段构建与旧路径（window_lookup
+                // 每行重建）字节一致。静态表行不变，之后命中仅 Arc clone。
+                let ev = Arc::new(Event {
+                    fields: row
+                        .iter()
+                        .map(|(k, v)| (k.as_str().into(), v.clone()))
+                        .collect(),
+                });
+                rows_idx.entry(join_key).or_default().push(ev);
             }
         }
         self.join_index = Some(index);
+        self.join_rows = Some(rows_idx);
     }
 
     /// Indexed join lookup by the configured key. Returns row references for
@@ -85,6 +104,23 @@ impl ProviderWindow {
                 .get(&join_key)?
                 .iter()
                 .map(|&i| &self.rows[i])
+                .collect(),
+        )
+    }
+
+    /// 预物化 join 行 lookup（O(1)）：返回 `Arc<Event>` 行（构建一次，命中仅
+    /// Arc clone）——对齐 q13b_join_bench `IndexedLookup` 的预物化模式。
+    /// 生产此前（window_lookup）每行重建 Event + HashMap；本方法零重建。
+    /// `None` = 无索引 / key 未命中（调用方回退扫描，与原 `join_lookup` 一致）。
+    pub fn join_rows_lookup(&self, key: &Value) -> Option<Vec<JoinRow>> {
+        let join_key = JoinKey::from_value(key)?;
+        Some(
+            self.join_rows
+                .as_ref()?
+                .get(&join_key)?
+                .iter()
+                .cloned()
+                .map(JoinRow::Event)
                 .collect(),
         )
     }

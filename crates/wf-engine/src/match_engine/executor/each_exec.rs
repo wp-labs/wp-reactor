@@ -221,6 +221,19 @@ pub(crate) fn parse_each_join_columnar(
                     return None;
                 }
             }
+            // 2026-08-25 q13b 列式化：`fmt("{}", 左/右窗 flat 字段)` = 字段值的
+            // 字符串渲染（fmt 单参数恒等，模板恰为 "{}"）。列式 join 路径读
+            // 字段后按 fmt 语义渲染（Str 透传 / 非 Str `value_to_string`），
+            // 免 row path 的 Event clone + fmt 解释（q13b 1.3µs → 列式 462ns，
+            // 分配量大降——q13a 分片放开后 RSS 28.9GB 的分配大头）。
+            Expr::FuncCall {
+                qualifier: None,
+                name,
+                args,
+            } if name == "fmt"
+                && args.len() == 2
+                && matches!(&args[0], Expr::StringLit(t) if t == "{}")
+                && matches!(&args[1], Expr::Field(fr) if out_ok(fr)) => {}
             _ => return None,
         }
     }
@@ -655,9 +668,9 @@ impl RuleExecutor {
                 continue;
             }
             builder.commit_each_row(EachRowCells {
-                wfx_id,
+                wfx_id: SmolStr::from(wfx_id),
                 score,
-                entity_id,
+                entity_id: SmolStr::from(entity_id),
                 fired_at,
                 rule_name: &statics.rule_name,
                 entity_type: &statics.entity_type,
@@ -733,9 +746,7 @@ impl RuleExecutor {
         // 不复制）。
         let filter_ok = match &each_plan.filter {
             None => true,
-            Some(f) if self.live_joins.is_empty() => {
-                wf_lang::columnar::expr_is_columnar(f)
-            }
+            Some(f) if self.live_joins.is_empty() => wf_lang::columnar::expr_is_columnar(f),
             Some(_) => false,
         };
         if !join_ok || !filter_ok {
@@ -804,9 +815,13 @@ impl RuleExecutor {
                 // 列式输出函数（fmt/strftime/count_char，参数为字面量/flat 字段）
                 // 走无 join 路径的批量 cell 求值；有活 join 时拒绝（列式 join
                 // 富化路径未接入批量 cell，回退行式避免 unreachable panic）。
-                other => {
-                    self.live_joins.is_empty() && wf_lang::columnar::columnar_output_expr(other)
+                // **例外（2026-08-25 q13b 列式化）**：`fmt("{}", 限定字段)`
+                // 单参数恒等——列式 join 富化路径读字段后按 fmt 语义渲染
+                // （Str 透传 / 非 Str value_to_string），双侧门控校验字段限定。
+                other if !self.live_joins.is_empty() => {
+                    fmt_identity_field(other).is_some_and(&out_shape_ok)
                 }
+                other => wf_lang::columnar::columnar_output_expr(other),
             })
     }
 
@@ -862,6 +877,29 @@ impl RuleExecutor {
                 Expr::Field(fr) => flat(fr),
                 other => wf_lang::columnar::expr_is_columnar(other),
             })
+    }
+}
+
+/// `fmt("{}", fr)` 单参数恒等（q13b 列式化）：模板恰为 `"{}"` 且参数是
+/// 单字段引用。语义 = `value_to_string(字段值)`；Str 透传、非 Str 渲染——
+/// 与解释器 fmt 的 `apply_fmt_template` 逐字节一致（对拍锁定）。
+/// `None` = 不是该形状 → 行式回退。
+pub(crate) fn fmt_identity_field(expr: &Expr) -> Option<&FieldRef> {
+    match expr {
+        Expr::FuncCall {
+            qualifier: None,
+            name,
+            args,
+        } if name == "fmt"
+            && args.len() == 2
+            && matches!(&args[0], Expr::StringLit(t) if t == "{}") =>
+        {
+            match &args[1] {
+                Expr::Field(fr) => Some(fr),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1145,8 +1183,7 @@ impl RuleExecutor {
             "each_batch_prepare 必须来自 rows 的同一批"
         );
         debug_assert!(
-            prepared.num_rows == 0
-                || rows.iter().all(|(ev, _)| ev.row() < prepared.num_rows),
+            prepared.num_rows == 0 || rows.iter().all(|(ev, _)| ev.row() < prepared.num_rows),
             "rows 行号越界 prepared 批"
         );
         let resolve = |name: Option<&str>| -> Option<usize> {
@@ -1204,9 +1241,9 @@ impl RuleExecutor {
         // them once at the end (see function-level doc). Cell staging still runs
         // through the builder (same validation+export); only the final column
         // push is batched.
-        let mut wfx_ids: Vec<String> = Vec::new();
+        let mut wfx_ids: Vec<SmolStr> = Vec::new();
         let mut scores: Vec<f64> = Vec::new();
-        let mut entity_ids: Vec<String> = Vec::new();
+        let mut entity_ids: Vec<SmolStr> = Vec::new();
         let mut fired_ats: Vec<String> = Vec::new();
         // `Vec<(usize, DataType, ModelValue)>` — one row of staged yield cells
         // per segment row, drained via `builder.take_staged()`. Inferred here.
@@ -1330,7 +1367,10 @@ impl RuleExecutor {
             // pure overhead on this path.
             builder.begin_row();
             let staged: CoreResult<()> = (|| {
-                for (field_idx, ((((field, (name, field_type)), kind), _field_ref), field_idx_opt)) in self
+                for (
+                    field_idx,
+                    ((((field, (name, field_type)), kind), _field_ref), field_idx_opt),
+                ) in self
                     .plan
                     .yield_plan
                     .fields
@@ -1452,7 +1492,7 @@ impl RuleExecutor {
             // per-row). Commit all rows once after the loop.
             wfx_ids.push(wfx_id);
             scores.push(score);
-            entity_ids.push(entity_id);
+            entity_ids.push(SmolStr::from(entity_id));
             fired_ats.push(fired_at);
             staged_rows.push(builder.take_staged());
             if let Some(t) = t_commit {
@@ -1497,9 +1537,8 @@ impl RuleExecutor {
         &self,
         rows: &[(&ColumnarEvent<'_>, i64)],
         prepared: &EachBatchVecs,
-        out: &mut Vec<PipeEachRow>,
+        sink: &mut dyn PipeRowSink,
     ) -> EachDirectBatchStats {
-        out.clear();
         let mut stats = EachDirectBatchStats::default();
         let Some(_each_plan) = &self.plan.each_plan else {
             log::warn!(
@@ -1594,51 +1633,53 @@ impl RuleExecutor {
             _ => EntityCol::Generic,
         };
 
+        // 流式装载的可复用 scratch（**每批各一次分配**，而非每行）：
+        // 原实现每行新建 `Vec<Option<Value>>` + `String`（实测 404 B/行）。
+        let mut values: Vec<Option<Value>> = Vec::with_capacity(self.plan.yield_plan.fields.len());
+        let mut entity_scratch = String::with_capacity(24);
         for (event, event_time_nanos) in rows {
-            let entity_id = match &entity_const {
-                Some(s) => s.to_string(),
+            entity_scratch.clear();
+            match &entity_const {
+                Some(s) => entity_scratch.push_str(s),
                 None => match &entity_col {
-                    EntityCol::I64(i64col) => match i64col.read(event.row()) {
-                        Some(v) => {
-                            let mut es = String::with_capacity(20);
-                            write_int64_value(&mut es, v);
-                            es
-                        }
-                        None => String::new(),
-                    },
-                    EntityCol::Utf8(arr) => {
-                        let row = event.row();
-                        if arr.is_null(row) {
-                            String::new()
-                        } else {
-                            String::from(arr.value(row))
+                    EntityCol::I64(i64col) => {
+                        if let Some(v) = i64col.read(event.row()) {
+                            write_int64_value(&mut entity_scratch, v);
                         }
                     }
-                    EntityCol::Generic => match entity_idx.and_then(|idx| event.value_at(idx)) {
-                        Some(v) => value_to_string(&v),
-                        None => String::new(),
-                    },
+                    EntityCol::Utf8(arr) => {
+                        let row = event.row();
+                        if !arr.is_null(row) {
+                            entity_scratch.push_str(arr.value(row));
+                        }
+                    }
+                    EntityCol::Generic => {
+                        if let Some(v) = entity_idx.and_then(|idx| event.value_at(idx)) {
+                            entity_scratch.push_str(&value_to_string(&v));
+                        }
+                    }
                 },
-            };
+            }
+            let entity_id = &entity_scratch;
             // 门控无 General-编译失败？防御：构造一次 meta 供行式回退
             // （与 sink 路径的 need_yield_meta 同款，仅编译失败时真用到）。
             let yield_meta = yield_kinds
                 .iter()
                 .zip(prepared.general_cvecs.iter())
                 .any(|(kind, cvec)| matches!(kind, YieldKind::General) && cvec.is_none())
-                .then(|| self.each_yield_meta_light(&entity_id, score, *event_time_nanos));
-            let mut values = Vec::with_capacity(self.plan.yield_plan.fields.len());
+                .then(|| self.each_yield_meta_light(entity_id, score, *event_time_nanos));
+            values.clear();
             let mut row_ok = true;
-            for (field_idx, ((((field, (name, field_type)), kind), _field_ref), field_idx_opt)) in self
-                .plan
-                .yield_plan
-                .fields
-                .iter()
-                .zip(statics.yield_specs.iter())
-                .zip(yield_kinds.iter())
-                .zip(yield_field_refs.iter())
-                .zip(yield_field_idxs.iter().copied())
-                .enumerate()
+            for (field_idx, ((((field, (name, field_type)), kind), _field_ref), field_idx_opt)) in
+                self.plan
+                    .yield_plan
+                    .fields
+                    .iter()
+                    .zip(statics.yield_specs.iter())
+                    .zip(yield_kinds.iter())
+                    .zip(yield_field_refs.iter())
+                    .zip(yield_field_idxs.iter().copied())
+                    .enumerate()
             {
                 let value = match kind {
                     YieldKind::Lit(v) => v.clone(),
@@ -1680,13 +1721,21 @@ impl RuleExecutor {
                 stats.failed += 1;
                 continue;
             }
-            out.push(PipeEachRow {
+            match sink.push_pipe_row(
                 score,
-                entity_type: Arc::clone(&statics.entity_type),
+                &statics.entity_type,
                 entity_id,
-                values,
-            });
-            stats.appended += 1;
+                &values,
+                *event_time_nanos,
+            ) {
+                Ok(()) => stats.appended += 1,
+                Err(e) => {
+                    // sink 装载失败（coercion/JSON 渲染）——与求值失败同口径：
+                    // 记 failed 并继续下一行，不中断批次（同 sink 路径惯例）。
+                    log::warn!("pipe row stage error: {e}");
+                    stats.failed += 1;
+                }
+            }
         }
         stats
     }
@@ -1767,6 +1816,20 @@ impl RuleExecutor {
             .iter()
             .map(|field| match &field.value {
                 Expr::Field(fr) => field_src(fr),
+                // fmt("{}", fr) 恒等：按内部字段解析来源（值读回后渲染）。
+                Expr::FuncCall {
+                    qualifier: None,
+                    name,
+                    args,
+                } if name == "fmt"
+                    && args.len() == 2
+                    && matches!(&args[0], Expr::StringLit(t) if t == "{}") =>
+                {
+                    match &args[1] {
+                        Expr::Field(fr) => field_src(fr),
+                        _ => None,
+                    }
+                }
                 _ => None,
             })
             .collect();
@@ -1779,7 +1842,8 @@ impl RuleExecutor {
             Expr::StringLit(s) => Some(s.clone()),
             _ => None,
         };
-        // yield 字段种类（Lit/Field），同无 join 列式路径。
+        // yield 字段种类（Lit/Field），同无 join 列式路径。fmt("{}", 字段)
+        // 恒等归入 Field（读值后按 fmt 语义渲染——`yield_fmt_render` 标记）。
         let yield_kinds: Vec<YieldKind> = self
             .plan
             .yield_plan
@@ -1790,7 +1854,39 @@ impl RuleExecutor {
                 Expr::StringLit(s) => YieldKind::Lit(Value::Str(s.clone().into())),
                 Expr::Bool(b) => YieldKind::Lit(Value::Bool(*b)),
                 Expr::Field(_) => YieldKind::Field,
+                Expr::FuncCall {
+                    qualifier: None,
+                    name,
+                    args,
+                } if name == "fmt"
+                    && args.len() == 2
+                    && matches!(&args[0], Expr::StringLit(t) if t == "{}")
+                    && matches!(&args[1], Expr::Field(_)) =>
+                {
+                    YieldKind::Field
+                }
                 _ => unreachable!("columnar join gate excludes general yield exprs"),
+            })
+            .collect();
+        // fmt 单参数恒等标记：读值后非 Str → `value_to_string` 渲染（与解释器
+        // fmt 的 `apply_fmt_template` 渲染一致）；Str 透传（零成本，q13b
+        // side_input.value 是 Str）。
+        let yield_fmt_render: Vec<bool> = self
+            .plan
+            .yield_plan
+            .fields
+            .iter()
+            .map(|field| {
+                matches!(
+                    &field.value,
+                    Expr::FuncCall {
+                        qualifier: None,
+                        name,
+                        args,
+                    } if name == "fmt"
+                        && args.len() == 2
+                        && matches!(&args[0], Expr::StringLit(t) if t == "{}")
+                )
             })
             .collect();
 
@@ -1866,13 +1962,15 @@ impl RuleExecutor {
             }
         }
 
-        // -- 输出构建（复用无 join 列式模式：L3 批量提交）----------------
+        // -- 输出构建（复用无 join 列式模式；2026-08-26 改为**逐行 commit**）----
+        // 此前：5 个中转 Vec（wfx_ids/scores/entity_ids/fired_ats/staged_rows）
+        // 累积整批后 `commit_each_rows_batch`——该批式提交会**二次拷贝**
+        // （`extend_from_slice` clone 每行 3 个 String + staged cell clone）。
+        // 行式路径（`execute_each_direct`）一直用 `commit_each_row`（owned String
+        // move、零拷贝）；等价性由
+        // `commit_each_rows_batch_matches_repeated_commit_each_row` 守护。
+        // 这是 q13b 输出链内存的 per-row 分配 churn 的一部分（2026-08-26 定位）。
         let wfx_prefix = EachWfxPrefix::new(&self.plan.name);
-        let mut wfx_ids: Vec<String> = Vec::new();
-        let mut scores: Vec<f64> = Vec::new();
-        let mut entity_ids: Vec<String> = Vec::new();
-        let mut fired_ats: Vec<String> = Vec::new();
-        let mut staged_rows: Vec<Vec<_>> = Vec::new();
 
         // 批级解析 Left（驱动列）字段的列 index —— 循环内按列名 index_of 是
         // 每行开销；schema 批内共享（batch0）。
@@ -1888,6 +1986,34 @@ impl RuleExecutor {
         let entity_left_idx: Option<usize> = match &entity_src {
             Some(FieldSrc::Left(f)) => resolve_left(f),
             _ => None,
+        };
+        // entity 列直读（2026-08-26 移植无 join 列式路径的 `EntityCol`）：
+        // q13b 的 `entity(digit, m.bidder)` 是 Left Int64——原实现每行走
+        // `event.value_at` → `Value::Number(f64)` → `value_to_string`（SmolStr
+        // + 浮点 format，27.6M 行的 per-row 分配 churn 之一）。直读 Int64 列用
+        // `write_int64_value` 直写 String（整数格式化，无 Value/SmolStr 中转）。
+        let entity_col: EntityCol<'_> = match (entity_left_idx, batch0) {
+            (Some(idx), Some(b)) => {
+                let schema = b.schema();
+                let field = schema.field(idx);
+                let col = b.column(idx);
+                match field.data_type() {
+                    DataType::Int64 => col
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .map_or(EntityCol::Generic, |a| EntityCol::I64(I64Col::Int64(a))),
+                    DataType::Timestamp(TimeUnit::Nanosecond, _) => col
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .map_or(EntityCol::Generic, |a| EntityCol::I64(I64Col::TsNanos(a))),
+                    DataType::Utf8 if !crate::match_engine::is_wfl_structured_field(field) => col
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .map_or(EntityCol::Generic, EntityCol::Utf8),
+                    _ => EntityCol::Generic,
+                }
+            }
+            _ => EntityCol::Generic,
         };
 
         // 批级常量 yield 字段注册（同无 join 列式路径）：字面量字段
@@ -1979,19 +2105,62 @@ impl RuleExecutor {
                 stats.rejected += 1;
                 continue;
             }
-            // entity（来源：常量 / 左窗列 / 右窗 JoinRow；缺失 → 空串，同行式）。
-            let entity_id: String = match &entity_const {
-                Some(s) => s.clone(),
+            // entity（来源：常量 / 左窗列直读 / 左窗列通用 / 右窗 JoinRow；
+            // 缺失 → 空串，同行式）。2026-08-26：Left 来源优先列直读
+            // （EntityCol::I64/Utf8——零 Value/SmolStr 中转），仅通用类型回退
+            // `value_at` + `value_to_string`。三元组对齐无 join 列式路径：
+            // `entity_val`（同列 yield 复用）+ `entity_f64`（数字快车道 stage）。
+            let (entity_id, entity_val, entity_f64): (
+                smol_str::SmolStr,
+                Option<Value>,
+                Option<f64>,
+            ) = match &entity_const {
+                Some(s) => (smol_str::SmolStr::from(s.as_str()), None, None),
                 None => match &entity_src {
-                    Some(FieldSrc::Left(_)) => entity_left_idx
-                        .and_then(|eidx| event.value_at(eidx))
-                        .map(|v| value_to_string(&v))
-                        .unwrap_or_default(),
-                    Some(FieldSrc::Right(f)) => matched
-                        .and_then(|r| r.field_value(f))
-                        .map(|v| value_to_string(&v))
-                        .unwrap_or_default(),
-                    None => String::new(),
+                    Some(FieldSrc::Left(_)) => {
+                        let row = event.row();
+                        match &entity_col {
+                            // 2026-08-26：SmolStrBuilder 直写——bidder 等数字
+                            // ≤20 字符落在内联上限（22B），零堆分配（此前 String
+                            // 每行一次堆分配，q13b 27.6M 行的 churn 之一）。
+                            EntityCol::I64(i64col) => match i64col.read(row) {
+                                Some(v) => {
+                                    let mut b = smol_str::SmolStrBuilder::new();
+                                    write_int64_value(&mut b, v);
+                                    (b.into(), Some(Value::Number(v as f64)), Some(v as f64))
+                                }
+                                None => (smol_str::SmolStr::new(""), None, None),
+                            },
+                            EntityCol::Utf8(arr) => {
+                                if arr.is_null(row) {
+                                    (smol_str::SmolStr::new(""), None, None)
+                                } else {
+                                    (
+                                        smol_str::SmolStr::from(arr.value(row)),
+                                        Some(Value::Str(arr.value(row).into())),
+                                        None,
+                                    )
+                                }
+                            }
+                            EntityCol::Generic => match entity_left_idx
+                                .and_then(|eidx| event.value_at(eidx))
+                            {
+                                Some(v) => (smol_str::SmolStr::from(value_to_string(&v)), Some(v), None),
+                                None => (smol_str::SmolStr::new(""), None, None),
+                            },
+                        }
+                    }
+                    Some(FieldSrc::Right(f)) => (
+                        smol_str::SmolStr::from(
+                            matched
+                                .and_then(|r| r.field_value(f))
+                                .map(|v| value_to_string(&v))
+                                .unwrap_or_default(),
+                        ),
+                        None,
+                        None,
+                    ),
+                    None => (smol_str::SmolStr::new(""), None, None),
                 },
             };
             let fired_at = format_nanos_utc(*event_time_nanos);
@@ -2012,18 +2181,48 @@ impl RuleExecutor {
                 {
                     let value = match kind {
                         YieldKind::Lit(_) => continue, // 批级常量，fill_row_gaps 填充
-                        YieldKind::Field => match src {
-                            Some(FieldSrc::Left(_)) => yield_left_idxs
-                                .get(yield_i)
-                                .copied()
-                                .flatten()
-                                .and_then(|fidx| event.value_at(fidx))
-                                .unwrap_or_else(|| Value::Str(SmolStr::default())),
-                            Some(FieldSrc::Right(f)) => matched
-                                .and_then(|r| r.field_value(f))
-                                .unwrap_or_else(|| Value::Str(SmolStr::default())),
-                            None => Value::Str(SmolStr::default()),
-                        },
+                        YieldKind::Field => {
+                            // f64 快车道（对齐无 join 列式路径）：yield 字段与
+                            // entity 同一左列（q13b：id=m.bidder == entity bidder）
+                            // 且目标数字类型 → stage 原始 f64 直接写，跳过每行
+                            // `value_at` + Value 构造 + coerce 中转。
+                            if let (Some(FieldSrc::Left(yf)), Some(FieldSrc::Left(ef))) = (&src, &entity_src)
+                                && yf == ef
+                                && let Some(n) = entity_f64
+                                && is_numeric_yield_type(field_type.as_ref())
+                            {
+                                builder.stage_yield_cell_f64(name, field_type.as_ref(), n)?;
+                                continue;
+                            }
+                            let mut value = match src {
+                                Some(FieldSrc::Left(f)) => {
+                                    // 同列复用 entity 已读值（不重读列）；否则按
+                                    // 预解析列 index 直读（无每行 index_of）。
+                                    if matches!(&entity_src, Some(FieldSrc::Left(ef)) if ef == f)
+                                        && let Some(ev) = entity_val.clone()
+                                    {
+                                        ev
+                                    } else {
+                                        yield_left_idxs
+                                            .get(yield_i)
+                                            .copied()
+                                            .flatten()
+                                            .and_then(|fidx| event.value_at(fidx))
+                                            .unwrap_or_else(|| Value::Str(SmolStr::default()))
+                                    }
+                                }
+                                Some(FieldSrc::Right(f)) => matched
+                                    .and_then(|r| r.field_value(f))
+                                    .unwrap_or_else(|| Value::Str(SmolStr::default())),
+                                None => Value::Str(SmolStr::default()),
+                            };
+                            // fmt("{}", x) 恒等：非 Str 值按 fmt 语义渲染为字符串
+                            //（`apply_fmt_template` 的 value_to_string；Str 透传）。
+                            if yield_fmt_render[yield_i] && !matches!(value, Value::Str(_)) {
+                                value = Value::Str(value_to_string(&value).into());
+                            }
+                            value
+                        }
                         YieldKind::General => {
                             unreachable!("columnar join gate excludes general yield exprs")
                         }
@@ -2045,28 +2244,22 @@ impl RuleExecutor {
                 stats.failed += 1;
                 continue;
             }
-            wfx_ids.push(wfx_id);
-            scores.push(score_const);
-            entity_ids.push(entity_id);
-            fired_ats.push(fired_at);
-            staged_rows.push(builder.take_staged());
+            // 直连逐行 commit（owned 值 move 进列，零二次拷贝：wfx_id/entity_id
+            // 是 SmolStr、fired_at 是 String）。
+            builder.commit_each_row(EachRowCells {
+                wfx_id,
+                score: score_const,
+                entity_id,
+                fired_at,
+                rule_name: &statics.rule_name,
+                entity_type: &statics.entity_type,
+                origin: &statics.each_origin,
+                close_reason: &statics.each_close_reason,
+                emit_time: &emit_time,
+                summary: &summary,
+            });
             stats.appended += 1;
             appended_out.push(idx);
-        }
-        if !wfx_ids.is_empty() {
-            builder.commit_each_rows_batch(
-                &wfx_ids,
-                &scores,
-                &entity_ids,
-                &fired_ats,
-                &statics.rule_name,
-                &statics.entity_type,
-                &statics.each_origin,
-                &statics.each_close_reason,
-                &emit_time,
-                &summary,
-                &staged_rows,
-            );
         }
         stats
     }
@@ -2135,9 +2328,9 @@ impl RuleExecutor {
             Ok(())
         })?;
         builder.commit_each_row(EachRowCells {
-            wfx_id,
+            wfx_id: SmolStr::from(wfx_id),
             score,
-            entity_id,
+            entity_id: SmolStr::from(entity_id),
             fired_at,
             rule_name: &statics.rule_name,
             entity_type: &statics.entity_type,
@@ -2355,6 +2548,49 @@ pub struct PipeEachRow {
     pub entity_type: std::sync::Arc<str>,
     pub entity_id: String,
     pub values: Vec<Option<Value>>,
+}
+
+/// 中间管道行接收器（2026-08-25 pipe 写入分配足迹）。
+///
+/// executor **逐行回调**本 trait，实现方（wf-runtime 的 `PipeBatchStager`）直接
+/// 装列——避开先物化全批 `Vec<PipeEachRow>`（每行一个 `values` Vec + 一个
+/// `entity_id` String，实测 404 B/行）。`entity_id` / `values` 都是 executor 的
+/// **可复用 scratch 借用**，实现方不得跨行持有。
+///
+/// 与 sink 路径（`execute_each_direct_batch(..., &mut AlertColumnBuilder, ...)`）
+/// 同构：错误由 executor 记 `failed` 并继续下一行，不中断批次。
+pub trait PipeRowSink {
+    /// 装载一行。`values` 与 yield 字段顺序一一对应（`None` = 可选字段缺失）。
+    /// `Err` = 本行装载失败（executor 记 failed）。
+    fn push_pipe_row(
+        &mut self,
+        score: f64,
+        entity_type: &str,
+        entity_id: &str,
+        values: &[Option<Value>],
+        event_time_nanos: i64,
+    ) -> Result<(), String>;
+}
+
+/// 对照/兼容实现：按行物化成 `PipeEachRow`（每行两次堆分配，与流式改造前
+/// 等价）。仅用于 bench 对照与对拍测试，生产路径用 stager 直接实现。
+impl PipeRowSink for Vec<PipeEachRow> {
+    fn push_pipe_row(
+        &mut self,
+        score: f64,
+        entity_type: &str,
+        entity_id: &str,
+        values: &[Option<Value>],
+        _event_time_nanos: i64,
+    ) -> Result<(), String> {
+        self.push(PipeEachRow {
+            score,
+            entity_type: std::sync::Arc::from(entity_type),
+            entity_id: entity_id.to_string(),
+            values: values.to_vec(),
+        });
+        Ok(())
+    }
 }
 
 /// Outcome of [`RuleExecutor::execute_each_direct_batch`].

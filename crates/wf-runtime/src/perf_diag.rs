@@ -104,6 +104,26 @@ pub fn perf_diag_enabled() -> bool {
     PERF_DIAG_ENABLED.load(Ordering::Relaxed)
 }
 
+/// **输出链消融**（2026-08-26 内存定位）：`WF_DIAG_CUT_ALERT=1` 时，规则仍照常
+/// 消费输入（pipe/join 全跑），但**跳过 sink alert 构建**（`AlertColumnBuilder`
+/// 装载）。与 `perf_cut_output` 的区别：后者把整个输出链（pipe 写入 + alert）
+/// 一刀切；本开关只切 alert 这一段，用来回答"那 12.5GB 输出链增量里，alert
+/// 构建占多少"。
+///
+/// 设计为环境变量而非档位字段：它是临时消融手段（跑完即撤），不需要进
+/// 档状态机/配置。OnceLock 缓存，热路径零开销。
+///
+/// ⚠ **生产勿设**：本开关不依赖 `--perf-diag`（env 直接生效），误设会静默
+/// 丢弃全部 alert 输出（emitted 计数仍走）。用完即撤。
+pub fn perf_cut_alert() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("WF_DIAG_CUT_ALERT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 /// 是否禁止规则求值（cut_rules 门控）。
 #[inline]
 pub fn perf_cut_rules() -> bool {

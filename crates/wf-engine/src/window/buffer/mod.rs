@@ -414,6 +414,24 @@ pub struct Window {
     /// Aggregate retained content bytes (approximate under concurrency —
     /// exact in the single-writer steady state).
     current_bytes: AtomicUsize,
+    /// 存活批次的**实际分配** Arrow 缓冲字节（`get_array_memory_size` 求和）。
+    ///
+    /// 2026-08-25（会计保真度）：`current_bytes` 只计**逻辑列内容**
+    /// （`content_bytes`），不含 null bitmap / offsets；本口径按缓冲去重后累加
+    /// **实际引用长度**，补齐这两项。
+    ///
+    /// 生产实测（q13 30M）：两者**基本相等（1.00×）**——窗口主体是 IPC 零拷贝
+    /// 切片，其 bitmap/offsets 占比很小。所以本口径的价值是**证明 content_bytes
+    /// 没有系统性低估**（此前曾据单批测量误判为低估 1.75×，见 issue 文档），
+    /// 而非揭示新增内存。
+    ///
+    /// **不计入**：分配器容量宽余（builder 倍增长留在 buffer 尾部的未引用容量，
+    /// 单批实测 content 3.45MB → 存活 6.29MB）。那部分属于分配器行为、无法归属
+    /// 单个批次；预置容量的修法已被实测否决（峰值 +67%，见 `take_batch` 注释）。
+    ///
+    /// **专用于可观测性**：驱逐预算（`max_window_bytes`）与 mailbox 预算仍用
+    /// `content_bytes` 口径不变——改它会改变所有已调优的容量语义。
+    current_alloc_bytes: AtomicUsize,
     /// Aggregate row count (approximate under concurrency).
     total_rows: AtomicUsize,
     /// Number of batches currently in the log.
@@ -474,6 +492,7 @@ impl Window {
             max_event_time_nanos: AtomicI64::new(i64::MIN),
             per_source_max_event_time: std::sync::Mutex::new(std::collections::HashMap::new()),
             current_bytes: AtomicUsize::new(0),
+            current_alloc_bytes: AtomicUsize::new(0),
             total_rows: AtomicUsize::new(0),
             batch_count: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
@@ -581,9 +600,7 @@ impl Window {
             key_field,
             projection: self.materialize_fields.clone(),
             shards: (0..JOIN_INDEX_SHARDS)
-                .map(|_| {
-                    PLRwLock::new(crate::match_engine::EngineHashMap::default())
-                })
+                .map(|_| PLRwLock::new(crate::match_engine::EngineHashMap::default()))
                 .collect(),
             mask: JOIN_INDEX_SHARDS - 1,
             batch_keys: PLRwLock::new(crate::match_engine::EngineHashMap::default()),
@@ -788,6 +805,11 @@ impl Window {
         }
 
         self.current_bytes.fetch_add(byte_size, Ordering::Relaxed);
+        // 会计保真度（仅可观测性）：实际分配字节。`get_array_memory_size` 求和各列
+        // 缓冲容量，O(列数) 而非 O(行数)，每批一次可忽略。
+        let alloc_size = allocated_bytes(&batch);
+        self.current_alloc_bytes
+            .fetch_add(alloc_size, Ordering::Relaxed);
         self.total_rows.fetch_add(row_count, Ordering::Relaxed);
         self.batch_count.fetch_add(1, Ordering::Relaxed);
 
@@ -831,6 +853,7 @@ impl Window {
                     ingested_at: Instant::now(),
                     row_count,
                     byte_size,
+                    alloc_size,
                     seq,
                     parsed_events: parsed_lock,
                     shard_rows,
@@ -858,9 +881,12 @@ impl Window {
                 };
                 let byte_size = tb.byte_size;
                 let row_count = tb.row_count;
+                let alloc_size = tb.alloc_size;
                 self.remove_batch_from_index(&tb);
                 drop(tb);
                 self.current_bytes.fetch_sub(byte_size, Ordering::Relaxed);
+                self.current_alloc_bytes
+                    .fetch_sub(alloc_size, Ordering::Relaxed);
                 self.total_rows.fetch_sub(row_count, Ordering::Relaxed);
                 self.batch_count.fetch_sub(1, Ordering::Relaxed);
                 evicted_bytes += byte_size;
@@ -954,6 +980,14 @@ impl Window {
         self.current_bytes.load(Ordering::Relaxed)
     }
 
+    /// 存活批次的**实际分配** Arrow 缓冲字节（包含 null bitmap / offsets /
+    /// 缓冲容量舍入）。与 [`Self::memory_usage`]（逻辑内容口径，驱逐/mailbox
+    /// 预算用）并行维护，仅供内存分账与指标。生产实测两者基本相等（1.00×）：
+    /// 本口径的作用是**排除"content_bytes 系统性低估"这一假说**，而不是新增账目。
+    pub fn allocated_usage(&self) -> usize {
+        self.current_alloc_bytes.load(Ordering::Relaxed)
+    }
+
     pub fn max_window_bytes(&self) -> usize {
         self.config.max_window_bytes.as_bytes()
     }
@@ -1030,6 +1064,54 @@ impl Window {
         } else {
             (i64::MIN, i64::MAX)
         }
+    }
+}
+
+/// 批次**实际引用**的 Arrow 缓冲字节（按缓冲去重）——内存分账用口径。
+///
+/// 与另两个口径的区别（2026-08-25 会计保真度）：
+/// - [`content_bytes`]（驱逐/mailbox 预算用）：只算**逻辑列内容**，漏掉
+///   null bitmap / offsets——新建批次会低估这两项（IPC 切片批次影响很小）。
+/// - `RecordBatch::get_array_memory_size()`：按列累加**整个底层分配容量**，
+///   而 IPC 解码批次的各列是**同一帧体的零拷贝切片** → 每列重复计一遍
+///   （实测 bid_events content 1.58GB → 报 17.97GB，11.4×，甚至超过进程
+///   peak_commit）。**不可用于分账。**
+///
+/// 本函数：递归走所有列（含子数组与 null buffer），**按缓冲起始指针去重**，
+/// 累加各缓冲实际引用长度（`Buffer::len`）。共享帧体只计其被引用的部分，
+/// 既不重复计也不漏 bitmap/offsets。
+///
+/// 已知近似：不计底层分配的**容量宽余**（已分配未引用的尾部）——那部分在
+/// 多切片共享时无法归给单一批次；也不计跨窗口共享（各流帧独立，实路上
+/// 不重叠）。
+pub fn allocated_bytes(batch: &RecordBatch) -> usize {
+    // 去重集用 `Vec` 线性扫而非 `HashSet`（R3 review）：每批缓冲数量级是
+    // 列数 × (1~2 个数据缓冲 + null 缓冲) ≈ 20~35，线性扫比哈希快且只一次
+    // 分配。本函数在**单写者提交路径**上（每批 append 一次）。
+    let mut seen: Vec<usize> = Vec::with_capacity(32);
+    let mut total = 0usize;
+    for col in batch.columns() {
+        collect_data_buffers(&col.to_data(), &mut seen, &mut total);
+    }
+    total
+}
+
+fn collect_data_buffers(data: &arrow::array::ArrayData, seen: &mut Vec<usize>, total: &mut usize) {
+    let count_once = |ptr: usize, len: usize, seen: &mut Vec<usize>, total: &mut usize| {
+        if !seen.contains(&ptr) {
+            seen.push(ptr);
+            *total += len;
+        }
+    };
+    for buf in data.buffers() {
+        count_once(buf.as_ptr() as usize, buf.len(), seen, total);
+    }
+    if let Some(nulls) = data.nulls() {
+        let buf = nulls.buffer();
+        count_once(buf.as_ptr() as usize, buf.len(), seen, total);
+    }
+    for child in data.child_data() {
+        collect_data_buffers(child, seen, total);
     }
 }
 

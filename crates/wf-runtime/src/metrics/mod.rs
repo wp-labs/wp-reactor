@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use wf_config::MetricsConfig;
 use wf_engine::window::{EvictReport, RouteReport};
 
+/// 分配器/进程级内存分账（`window_bytes` 与进程峰值之间的缺口归因）。
+pub mod alloc_stats;
 #[cfg(test)]
 mod coverage_extra;
 #[cfg(test)]
@@ -160,6 +162,18 @@ pub(crate) struct MetricsSnapshot {
     evictor_time_evicted: u64,
     evictor_memory_evicted: u64,
     window_memory_bytes: BTreeMap<String, u64>,
+    /// 窗口实际分配字节（会计保真度，2026-08-25）。
+    window_allocated_bytes: BTreeMap<String, u64>,
+    /// 每窗 fanout 通道排队批数 / 总容量（输出链在途量，2026-08-26）。
+    window_fanout_queued: BTreeMap<String, u64>,
+    window_fanout_capacity: BTreeMap<String, u64>,
+    /// 每窗 mailbox 在途字节（已用预算）——在途量可观测性（2026-08-25）。
+    window_mailbox_inflight: BTreeMap<String, u64>,
+    /// 每窗 mailbox 预算容量。
+    window_mailbox_budget: BTreeMap<String, u64>,
+    /// parse pool 预读预算：（已用, 容量）字节。
+    parse_inflight_bytes: u64,
+    parse_budget_bytes: u64,
     window_capacity_bytes: BTreeMap<String, u64>,
     window_rows: BTreeMap<String, u64>,
     window_batches: BTreeMap<String, u64>,
@@ -172,6 +186,8 @@ pub(crate) struct MetricsSnapshot {
     event_e2e_latency: HistogramSnapshot,
     rule_scan_timeout: BTreeMap<String, HistogramSnapshot>,
     rule_flush: BTreeMap<String, HistogramSnapshot>,
+    /// 分配器读数（未装入 provider 时 `None`，快照略过这些指标）。
+    alloc: Option<alloc_stats::AllocStats>,
 }
 
 impl MetricsSnapshot {
@@ -272,6 +288,21 @@ impl MetricsSnapshot {
             "",
             self.evictor_memory_evicted,
         ));
+        // 内存分账（装入 provider 时才产出）：与各窗 `window.memory_bytes`
+        // 对比即可区分"引擎真持有"（peak_commit ≫ 窗口合计）与
+        // "段区/OS 伪影"（peak_commit ≈ 窗口合计但 peak_rss 远大）。
+        if let Some(a) = self.alloc {
+            out.push(metric("alloc", "current_rss_bytes", "", a.current_rss));
+            out.push(metric("alloc", "peak_rss_bytes", "", a.peak_rss));
+            out.push(metric(
+                "alloc",
+                "current_commit_bytes",
+                "",
+                a.current_commit,
+            ));
+            out.push(metric("alloc", "peak_commit_bytes", "", a.peak_commit));
+            out.push(metric("alloc", "page_faults_total", "", a.page_faults));
+        }
         out.push(metric(
             "alert",
             "channel_send_failed_total",
@@ -372,6 +403,38 @@ impl MetricsSnapshot {
         for (window, v) in &self.window_memory_bytes {
             out.push(metric("window", "memory_bytes", window, *v));
         }
+        // 会计保真度（2026-08-25）：`memory_bytes` 是 content_bytes（逻辑内容，
+        // 驱逐/mailbox 预算口径），不含 null bitmap / offsets；`allocated_bytes`
+        // 按缓冲去重后累加实际引用长度。生产实测两者基本相等（1.00×），该指标的
+        // 作用是持续证明 content 口径没有系统性低估。
+        for (window, v) in &self.window_allocated_bytes {
+            out.push(metric("window", "allocated_bytes", window, *v));
+        }
+        // 输出链在途量（2026-08-26）：规则分片通道排队批数/容量。diag 墙梯把
+        // q13 的 12.5GB 增量定位到输出链，而窗口会计只解释 4.1GB——这两个 gauge
+        // 判断"分片通道是否接近满"（10 分片 × 256 槽 × 3.45MB ≈ 8.8GB 满队）。
+        for (window, v) in &self.window_fanout_queued {
+            out.push(metric("window", "fanout_queued_batches", window, *v));
+        }
+        for (window, v) in &self.window_fanout_capacity {
+            out.push(metric("window", "fanout_capacity_batches", window, *v));
+        }
+        // 在途量分账（2026-08-25）：每窗 mailbox 已用预算 + parse pool 预读预算。
+        // ❗ mailbox 在途与 `memory_bytes` **可能重叠**（Arrow 缓冲经 Arc 共享：
+        // 已 append 但未释放 permits 的批次两边都算）——对账时不得直接相加。
+        for (window, v) in &self.window_mailbox_inflight {
+            out.push(metric("window", "mailbox_inflight_bytes", window, *v));
+        }
+        for (window, v) in &self.window_mailbox_budget {
+            out.push(metric("window", "mailbox_budget_bytes", window, *v));
+        }
+        out.push(metric(
+            "parse",
+            "inflight_bytes",
+            "",
+            self.parse_inflight_bytes,
+        ));
+        out.push(metric("parse", "budget_bytes", "", self.parse_budget_bytes));
         for (window, v) in &self.window_capacity_bytes {
             out.push(metric("window", "window_capacity_bytes", window, *v));
         }
@@ -755,6 +818,22 @@ pub struct RuntimeMetrics {
     evictor_memory_evicted_total: AtomicU64,
 
     window_memory_bytes: BTreeMap<String, AtomicU64>,
+    /// 每窗 fanout 通道排队批数 / 总容量（输出链在途量，2026-08-26）。
+    window_fanout_queued: BTreeMap<String, AtomicU64>,
+    window_fanout_capacity: BTreeMap<String, AtomicU64>,
+    /// 窗口**实际分配**字节（`Window::allocated_usage`）——`memory_bytes` 是逻辑
+    /// 内容口径（不含 bitmap/offsets）；内存分账用这个交叉校验。
+    window_allocated_bytes: BTreeMap<String, AtomicU64>,
+    /// 每窗 mailbox 在途字节 / 预算容量（周期采样，同 window 其他 gauge）。
+    window_mailbox_inflight: BTreeMap<String, AtomicU64>,
+    window_mailbox_budget: BTreeMap<String, AtomicU64>,
+    /// parse pool 预读预算的已用/容量字节（周期采样）。
+    parse_inflight_bytes: AtomicU64,
+    parse_budget_bytes: AtomicU64,
+    /// 读 parse 预算的 provider（由 bootstrap 装入；metrics 拿不到预算句柄）。
+    /// 返回（已用, 容量）字节。
+    #[allow(clippy::type_complexity)]
+    parse_inflight_provider: std::sync::OnceLock<Box<dyn Fn() -> (usize, usize) + Send + Sync>>,
     window_capacity_bytes: BTreeMap<String, AtomicU64>,
     window_rows: BTreeMap<String, AtomicU64>,
     window_batches: BTreeMap<String, AtomicU64>,
@@ -940,6 +1019,14 @@ impl RuntimeMetrics {
             evictor_time_evicted_total: AtomicU64::new(0),
             evictor_memory_evicted_total: AtomicU64::new(0),
             window_memory_bytes: make_window_map(),
+            window_allocated_bytes: make_window_map(),
+            window_fanout_queued: make_window_map(),
+            window_fanout_capacity: make_window_map(),
+            window_mailbox_inflight: make_window_map(),
+            window_mailbox_budget: make_window_map(),
+            parse_inflight_bytes: AtomicU64::new(0),
+            parse_budget_bytes: AtomicU64::new(0),
+            parse_inflight_provider: std::sync::OnceLock::new(),
             window_capacity_bytes: make_window_map(),
             window_rows: make_window_map(),
             window_batches: make_window_map(),
@@ -1344,6 +1431,13 @@ impl RuntimeMetrics {
             evictor_time_evicted: self.drain_counter(&self.evictor_time_evicted_total),
             evictor_memory_evicted: self.drain_counter(&self.evictor_memory_evicted_total),
             window_memory_bytes: self.read_map(&self.window_memory_bytes),
+            window_allocated_bytes: self.read_map(&self.window_allocated_bytes),
+            window_fanout_queued: self.read_map(&self.window_fanout_queued),
+            window_fanout_capacity: self.read_map(&self.window_fanout_capacity),
+            window_mailbox_inflight: self.read_map(&self.window_mailbox_inflight),
+            window_mailbox_budget: self.read_map(&self.window_mailbox_budget),
+            parse_inflight_bytes: self.parse_inflight_bytes.load(Ordering::Relaxed),
+            parse_budget_bytes: self.parse_budget_bytes.load(Ordering::Relaxed),
             window_capacity_bytes: self.read_map(&self.window_capacity_bytes),
             window_rows: self.read_map(&self.window_rows),
             window_batches: self.read_map(&self.window_batches),
@@ -1364,6 +1458,8 @@ impl RuntimeMetrics {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.snapshot()))
                 .collect(),
+            // 分配器读数（provider 未装入则 None）。
+            alloc: alloc_stats::read(),
         }
     }
     fn drain_counter(&self, c: &AtomicU64) -> u64 {

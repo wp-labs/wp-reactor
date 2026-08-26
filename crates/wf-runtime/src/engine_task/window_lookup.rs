@@ -178,19 +178,11 @@ impl<'a> WindowLookup for RegistryLookup<'a> {
         // 与 buffer 窗口同路径设置）；有索引走索引，无索引回退扫描。
         if let Some(pw) = self.router.registry().get_provider(window) {
             let pw = pw.read().expect("provider window lock poisoned");
-            if let Some(rows) = pw.join_lookup(key) {
-                return Some(
-                    rows.into_iter()
-                        .map(|row| {
-                            JoinRow::Event(Arc::new(Event {
-                                fields: row
-                                    .iter()
-                                    .map(|(k, v)| (k.as_str().into(), v.clone()))
-                                    .collect(),
-                            }))
-                        })
-                        .collect(),
-                );
+            // 预物化行 lookup（O(1)，Arc clone 零重建）：ProviderWindow 在
+            // set_join_key 时把静态行预转为 Arc<Event>（每行一次）——此前每行
+            // 命中重建 Event + HashMap（q13b 30M 行的 per-row churn）。
+            if let Some(rows) = pw.join_rows_lookup(key) {
+                return Some(rows);
             }
             // 无索引（或 key 未命中）：回退全表扫描（与 provider_snapshot 一致）。
             let rows = pw.snapshot();
