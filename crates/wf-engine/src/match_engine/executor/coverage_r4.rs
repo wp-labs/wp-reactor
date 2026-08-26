@@ -1877,6 +1877,224 @@ fn columnar_match_output_matches_row_path() {
 }
 
 #[test]
+fn columnar_match_general_fmt_matches_row_path() {
+    // 层 2 收口（2026-08-25）：match 列式批的 General yield（fmt detail，q6
+    // 真实形态——此前门控排除 General → unreachable，全走行式）——列式 cell
+    // vs 行式 Full ctx 逐字段字节一致（含 null 字段 → 空串）。
+    let mut plan = simple_rule_plan(
+        "match_fmt",
+        simple_plan(
+            vec![simple_key("seller")],
+            vec![step(vec![branch("b", count_ge(1.0))])],
+        ),
+        Expr::Number(20.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.binds[0].window = "bid_events".into();
+    plan.yield_plan.fields = vec![
+        YieldField {
+            name: "id".into(),
+            value: Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+        },
+        YieldField {
+            name: "alert_type".into(),
+            value: Expr::StringLit("q6_avg200".into()),
+        },
+        YieldField {
+            name: "detail".into(),
+            value: Expr::FuncCall {
+                qualifier: None,
+                name: "fmt".into(),
+                args: vec![
+                    Expr::StringLit("seller={} price={}".into()),
+                    Expr::Field(FieldRef::Qualified("b".into(), "bidder".into())),
+                    Expr::Field(FieldRef::Qualified("b".into(), "price".into())),
+                ],
+            },
+        },
+    ];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([
+            ("id".into(), FieldType::Base(BaseType::Digit)),
+            ("alert_type".into(), FieldType::Base(BaseType::Chars)),
+            ("detail".into(), FieldType::Base(BaseType::Chars)),
+        ]),
+    );
+    assert!(
+        exec.match_plan_columnar_safe(),
+        "match + fmt detail（普通字段）应过列式门控（层 2）"
+    );
+
+    const NOW: i64 = 1_700_000_000_000_000_000;
+    let mk = |auction: f64, seller: f64, price: Option<f64>| MatchedContext {
+        rule_name: "match_fmt".into(),
+        scope_key: vec![num(seller)],
+        step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: None,
+            measure_value: auction,
+            event_first_time_nanos: Some(NOW),
+            event_last_time_nanos: Some(NOW),
+            collected_values: vec![],
+            field_values: EngineHashMap::default(),
+        }],
+        bind_data: vec![],
+        event_time_nanos: NOW,
+        event_first_time_nanos: NOW,
+        event_last_time_nanos: NOW,
+        window_start_time_nanos: NOW - 600_000_000_000,
+        window_end_time_nanos: NOW,
+        machine_id: String::new(),
+        trigger_event: Some(Arc::new(event(vec![
+            ("auction", num(auction)),
+            ("bidder", num(5.0)),
+            ("price", match price {
+                Some(p) => num(p),
+                None => Value::Str("".into()),
+            }),
+        ]))),
+    };
+    let m1 = mk(1001.0, 20.0, Some(300.0));
+    let m2 = mk(1002.0, 21.0, None); // price 缺失 → fmt 空串（解释 None→""）
+
+    // 行式路径：execute_match_at（General → Full ctx）+ append_record。
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    for m in [&m1, &m2] {
+        let record = exec.execute_match_at(m, NOW).unwrap();
+        b_row.append_record(&record).unwrap();
+    }
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // 列式路径：match_batch_prepare 批级 cell。
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended = Vec::new();
+    let stats =
+        exec.execute_match_direct_batch_columnar(&[&m1, &m2], NOW, &mut b_col, &mut appended);
+    assert_eq!(stats.appended, 2);
+    assert_eq!(stats.failed, 0);
+    assert_eq!(appended, vec![0, 1]);
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(out_row, out_col);
+    let detail = |r: &wp_model_core::model::DataRecord| {
+        r.fields()
+            .find(|f| f.get_name() == "detail")
+            .and_then(|f| f.get_chars().map(str::to_string))
+            .unwrap_or_default()
+    };
+    assert_eq!(detail(&out_col[0]), "seller=5 price=300", "row 0 fmt");
+    assert_eq!(detail(&out_col[1]), "seller=5 price=", "row 1 缺 price → 空串");
+}
+
+#[test]
+fn columnar_match_general_materialize_fail_falls_back_matches_row_path() {
+    // 层 2 收口 review：物化失败（引用字段跨行类型不一致 → materialize_fields
+    // None）→ 整批回退逐行——回退路径（build_eval_context Full ctx + eval）
+    // 必须与解释路径（execute_match_at）逐位一致。
+    let mut plan = simple_rule_plan(
+        "match_fmt_fb",
+        simple_plan(
+            vec![simple_key("seller")],
+            vec![step(vec![branch("b", count_ge(1.0))])],
+        ),
+        Expr::Number(20.0),
+        "digit",
+        Expr::Field(FieldRef::Qualified("b".into(), "auction".into())),
+    );
+    plan.binds[0].alias = "b".into();
+    plan.binds[0].window = "bid_events".into();
+    plan.yield_plan.fields = vec![YieldField {
+        name: "detail".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "fmt".into(),
+            args: vec![
+                Expr::StringLit("price={}".into()),
+                Expr::Field(FieldRef::Qualified("b".into(), "price".into())),
+            ],
+        },
+    }];
+    let exec = RuleExecutor::new_with_yield_field_types(
+        plan,
+        HashMap::from([("detail".into(), FieldType::Base(BaseType::Chars))]),
+    );
+    assert!(exec.match_plan_columnar_safe(), "fmt 普通字段应过门控");
+
+    const NOW: i64 = 1_700_000_000_000_000_000;
+    let mk = |auction: f64, seller: f64, price: Value| MatchedContext {
+        rule_name: "match_fmt_fb".into(),
+        scope_key: vec![num(seller)],
+        step_data: vec![StepData {
+            satisfied_branch_index: 0,
+            label: None,
+            measure_value: auction,
+            event_first_time_nanos: Some(NOW),
+            event_last_time_nanos: Some(NOW),
+            collected_values: vec![],
+            field_values: EngineHashMap::default(),
+        }],
+        bind_data: vec![],
+        event_time_nanos: NOW,
+        event_first_time_nanos: NOW,
+        event_last_time_nanos: NOW,
+        window_start_time_nanos: NOW - 600_000_000_000,
+        window_end_time_nanos: NOW,
+        machine_id: String::new(),
+        trigger_event: Some(Arc::new(event(vec![
+            ("auction", num(auction)),
+            ("price", price),
+        ]))),
+    };
+    // price 跨行类型不一致（Number vs Str）→ 物化失败 → 整批回退逐行。
+    let m1 = mk(1001.0, 20.0, num(300.0));
+    let m2 = mk(1002.0, 21.0, str_val("abc"));
+
+    let mut b_row = AlertColumnBuilder::new(Arc::from("alerts"));
+    for m in [&m1, &m2] {
+        let record = exec.execute_match_at(m, NOW).unwrap();
+        b_row.append_record(&record).unwrap();
+    }
+    let out_row: Vec<_> = b_row
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let mut b_col = AlertColumnBuilder::new(Arc::from("alerts"));
+    let mut appended = Vec::new();
+    let stats =
+        exec.execute_match_direct_batch_columnar(&[&m1, &m2], NOW, &mut b_col, &mut appended);
+    assert_eq!(stats.appended, 2);
+    assert_eq!(stats.failed, 0);
+    let out_col: Vec<_> = b_col
+        .finish()
+        .iter_data_records()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(out_row, out_col);
+    let detail = |r: &wp_model_core::model::DataRecord| {
+        r.fields()
+            .find(|f| f.get_name() == "detail")
+            .and_then(|f| f.get_chars().map(str::to_string))
+            .unwrap_or_default()
+    };
+    assert_eq!(detail(&out_col[0]), "price=300", "row 0 Number");
+    assert_eq!(detail(&out_col[1]), "price=abc", "row 1 Str（回退路径渲染）");
+}
+
+#[test]
 fn columnar_match_gate_rejects_right_window_refs() {
     // join 存在时，输出字段引用右窗字段（Qualified 右窗名）→ 门控回退行式。
     let mut plan = simple_rule_plan(

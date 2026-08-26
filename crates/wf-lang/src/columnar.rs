@@ -86,14 +86,23 @@ pub enum ColumnarOutputFunc {
     Strftime,
     /// `count_char(text, ch)` — 数字符出现次数 → 数值。
     CountChar,
+    /// `split(text, sep)` — 字符串分割（只作为 `mvindex` 的 list 参数融合为
+    /// `SplitIndex`；列式无列表值类型，独立使用回落解释器）。
+    Split,
+    /// `mvindex(list, idx)` — 列表元素（list 为 `split` 时融合求值，q22 形态）。
+    MvIndex,
+    /// `concat(a, b, ...)` — 字符串拼接（`value_to_string` 渲染）。
+    Concat,
 }
 
-/// 返回 `name` 对应的列式输出函数分类（`None` = 非原生列式输出函数）。
 pub fn columnar_output_func(name: &str) -> Option<ColumnarOutputFunc> {
     match name {
         "fmt" => Some(ColumnarOutputFunc::Fmt),
         "strftime" => Some(ColumnarOutputFunc::Strftime),
         "count_char" => Some(ColumnarOutputFunc::CountChar),
+        "split" => Some(ColumnarOutputFunc::Split),
+        "mvindex" => Some(ColumnarOutputFunc::MvIndex),
+        "concat" => Some(ColumnarOutputFunc::Concat),
         _ => None,
     }
 }
@@ -143,6 +152,22 @@ pub fn columnar_output_expr(expr: &Expr) -> bool {
                 args.len() == 2
                     && columnar_output_expr(&args[0])
                     && columnar_output_expr(&args[1])
+            }
+            Some(ColumnarOutputFunc::Split) => {
+                // split(text, sep)：text 列式可求值（flat 字段/let 内联），sep 字面量。
+                args.len() == 2
+                    && columnar_output_expr(&args[0])
+                    && matches!(&args[1], Expr::StringLit(_))
+            }
+            Some(ColumnarOutputFunc::MvIndex) => {
+                // mvindex(list, idx)：2 参（q22 形态），list 列式可求值（split 或
+                // let 内联），idx 字面量数字（负数语义由 normalize_index 支持）。
+                args.len() == 2
+                    && columnar_output_expr(&args[0])
+                    && matches!(&args[1], Expr::Number(_))
+            }
+            Some(ColumnarOutputFunc::Concat) => {
+                !args.is_empty() && args.iter().all(columnar_output_expr)
             }
             None => false,
         },
@@ -653,10 +678,10 @@ mod tests {
 
     #[test]
     fn columnar_output_func_is_single_authoritative_list() {
-        for name in ["fmt", "strftime", "count_char"] {
+        for name in ["fmt", "strftime", "count_char", "split", "mvindex", "concat"] {
             assert!(columnar_output_func(name).is_some(), "{name} 应在输出清单");
         }
-        for name in ["lower", "concat", "contains", "cidr_match", "bogus"] {
+        for name in ["lower", "contains", "cidr_match", "bogus"] {
             assert_eq!(columnar_output_func(name), None, "{name} 不应在输出清单");
         }
     }

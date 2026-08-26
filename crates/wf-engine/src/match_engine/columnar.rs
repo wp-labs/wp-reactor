@@ -37,17 +37,20 @@
 //! change in §3.4. The differential tests assert 100% equivalence below `2^53`
 //! and lock the divergence above it.
 
+use std::sync::Arc;
+
 use arrow::array::{
-    Array, BooleanArray, BooleanBuilder, FixedSizeListArray, Float64Array, Int64Array,
-    LargeListArray, ListArray, StringArray, TimestampNanosecondArray,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, FixedSizeListArray, Float64Array,
+    Float64Builder, Int64Array, LargeListArray, ListArray, StringArray, StringBuilder,
+    TimestampNanosecondArray,
 };
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Field as ArrowField, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use smol_str::SmolStr;
 use wf_lang::ast::{BinOp, Expr, FieldRef, PathSegment};
 
 use super::match_engine::eval::cmp::{apply_fmt_template, timestamp_nanos_to_utc};
-use super::match_engine::{EngineHashMap, Value, field_ref_name, values_equal};
+use super::match_engine::{EngineHashMap, Value, field_ref_name, value_to_string, values_equal};
 use crate::match_engine::{WFL_FIELD_TYPE_ARRAY, wfl_structured_field_kind};
 use crate::time::normalize_epoch_timestamp_float_nanos;
 
@@ -396,6 +399,22 @@ pub(crate) enum ColumnExpr {
         text: Box<ColumnExpr>,
         needle: Box<ColumnExpr>,
     },
+    /// `mvindex(split(field, sep), idx)` — q22 let 形态融合节点（编译期内联
+    /// let 后得到）：per row 分割字符串一次、`normalize_index` 取第 idx 个元素。
+    /// 空 sep → 按字符切分（与解释 `split` 的 chars 分支一致）；非 Utf8 /
+    /// null cell / 越界 / 空串 → null（解释路径 `split` 非 Str → None、
+    /// `arr.get(idx)` 越界 → None）。
+    SplitIndex {
+        col: ColRef,
+        sep: SmolStr,
+        index: i64,
+    },
+    /// `concat(a, b, ...)` — 字符串拼接（`value_to_string` 渲染，与解释路径
+    /// 逐参 eval + value_to_string 字节一致）；任一参数 cell null → 整行 null
+    /// （解释路径 `?` 传播 → yield 空串）。
+    Concat {
+        args: Vec<ColumnExpr>,
+    },
     /// `expr in (lit, ...)` — per-row value membership over the compile-time
     /// literal list (`values_equal` semantics, `negated` flips). Target null /
     /// non-literal list items read null / false, matching the interpreted path.
@@ -437,6 +456,212 @@ pub fn eval_guard_columnar(expr: &Expr, view: &ColumnarBatch<'_>) -> BooleanArra
 /// reject, which reads as all-false, matching the interpreted path).
 pub(crate) fn compile_guard(expr: &Expr, view: &ColumnarBatch<'_>) -> Option<ColumnExpr> {
     compile_expr(expr, view)
+}
+
+/// 统一入口：把 yield 字段的 General 表达式（fmt/strftime/count_char/split/
+/// mvindex/concat 等输出函数 + 任意可列式表达式）编译为批级 cell。Lit/Field 走
+/// 各自快通道不编译；编译失败（结构化列参数等）→ `None` → 调用方逐行解释回退。
+///
+/// each（`each_batch_prepare`）与 close（`close_batch_prepare`）共用——同一
+/// 编译语义保证两条列式 emit 路径字节一致（2026-08-25 层 1：close 输出链
+/// 列式化；层 2：q22 let+split+mvindex+concat 形态）。`lets` 供编译期内联
+/// （`Field(Simple(let_name))` → let RHS，见 [`inline_lets`]）；close 路径传
+/// 空（解释 close 无 let 视图，内联会与解释路径分叉）。
+pub(crate) fn compile_yield_cvec(
+    field: &wf_lang::plan::YieldField,
+    view: &ColumnarBatch<'_>,
+    n: usize,
+    lets: &[wf_lang::plan::LetPlan],
+) -> Option<CVec> {
+    let value: std::borrow::Cow<'_, Expr> = if lets.is_empty() {
+        std::borrow::Cow::Borrowed(&field.value)
+    } else {
+        std::borrow::Cow::Owned(inline_lets(&field.value, lets, &mut Vec::new()))
+    };
+    match &*value {
+        Expr::Number(_) | Expr::StringLit(_) | Expr::Bool(_) | Expr::Field(_) => None,
+        other if wf_lang::columnar::expr_is_columnar(other) => {
+            compile_guard(other, view).map(|plan| plan.eval_vec(view, n))
+        }
+        _ => {
+            let is_output_func = matches!(
+                &*value,
+                Expr::FuncCall {
+                    qualifier: None,
+                    name,
+                    ..
+                } if wf_lang::columnar::columnar_output_func(name).is_some()
+            );
+            if is_output_func {
+                compile_guard(&*value, view).map(|plan| plan.eval_vec(view, n))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// 编译期内联 let 绑定（q22 形态）：把 `Field(Simple(let_name))` 替换为 let
+/// RHS 表达式（递归内联，let 可引用更早的 let）——列式视图只有 schema 列、无
+/// let 视图，解释路径 `apply_lets` 逐行注入的语义靠内联展开等价。`visiting`
+/// 防自引用死循环：引用自己时保持原 Field（编译成 Null ColRef → null），与
+/// 解释路径（自引用 let 求值读缺字段 → None → 不注入）同义。
+pub(crate) fn inline_lets(expr: &Expr, lets: &[wf_lang::plan::LetPlan], visiting: &mut Vec<String>) -> Expr {
+    match expr {
+        Expr::Field(FieldRef::Simple(name)) => {
+            if !visiting.iter().any(|v| v == name)
+                && let Some(rhs) = lets.iter().find(|l| &l.name == name)
+            {
+                visiting.push(name.clone());
+                let out = inline_lets(&rhs.expr, lets, visiting);
+                visiting.pop();
+                return out;
+            }
+            expr.clone()
+        }
+        Expr::BinOp { op, left, right } => Expr::BinOp {
+            op: *op,
+            left: Box::new(inline_lets(left, lets, visiting)),
+            right: Box::new(inline_lets(right, lets, visiting)),
+        },
+        Expr::Neg(inner) => Expr::Neg(Box::new(inline_lets(inner, lets, visiting))),
+        Expr::Not(inner) => Expr::Not(Box::new(inline_lets(inner, lets, visiting))),
+        Expr::Array(items) => Expr::Array(
+            items
+                .iter()
+                .map(|i| inline_lets(i, lets, visiting))
+                .collect(),
+        ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(inline_lets(expr, lets, visiting)),
+            list: list.iter().map(|i| inline_lets(i, lets, visiting)).collect(),
+            negated: *negated,
+        },
+        Expr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => Expr::IfThenElse {
+            cond: Box::new(inline_lets(cond, lets, visiting)),
+            then_expr: Box::new(inline_lets(then_expr, lets, visiting)),
+            else_expr: Box::new(inline_lets(else_expr, lets, visiting)),
+        },
+        Expr::Object(items) => Expr::Object(
+            items
+                .iter()
+                .map(|it| wf_lang::ast::ObjectItem {
+                    targets: it.targets.clone(),
+                    type_hint: it.type_hint.clone(),
+                    value: inline_lets(&it.value, lets, visiting),
+                })
+                .collect(),
+        ),
+        Expr::FuncCall {
+            qualifier,
+            name,
+            args,
+        } => Expr::FuncCall {
+            qualifier: qualifier.clone(),
+            name: name.clone(),
+            args: args.iter().map(|a| inline_lets(a, lets, visiting)).collect(),
+        },
+        _ => expr.clone(),
+    }
+}
+
+/// 统一字段物化器（层 2 收口，2026-08-25）：把任意行式输入（`CloseOutput` /
+/// `MatchedContext` / `Event` 数组）的引用字段物化为 Arrow 列，供
+/// `ColumnarBatch` 视图 + [`compile_yield_cvec`] 列式求值。
+///
+/// 两遍直推（类型探测 + 直写 builder，无 `Value` 中间态）。全 None 列 → 不建
+/// 列（视图解析为 Null ColKind → null cell，与 ctx 缺字段一致）；类型不一致 /
+/// 结构化值（Array/Object）→ `None` → 调用方整体回退逐行（保守）。
+/// Number→Float64 / Str→Utf8 / Bool→Boolean（`cscalar_to_value` 还原为原
+/// `Value`，渲染字节一致）。
+pub(crate) fn materialize_fields<F>(
+    ref_fields: &[String],
+    n: usize,
+    mut resolve: F,
+) -> Option<(Vec<ArrowField>, Vec<ArrayRef>)>
+where
+    F: FnMut(usize, &str) -> Option<Value>,
+{
+    #[derive(Clone, Copy)]
+    enum ColKind {
+        Num,
+        Str,
+        Bool,
+    }
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(ref_fields.len());
+    let mut schema_fields: Vec<ArrowField> = Vec::with_capacity(ref_fields.len());
+    for fname in ref_fields {
+        // pass 1：类型探测（第一个非 None 值变体）
+        let mut kind: Option<ColKind> = None;
+        for row in 0..n {
+            match resolve(row, fname) {
+                Some(Value::Number(_)) => {
+                    kind = Some(ColKind::Num);
+                    break;
+                }
+                Some(Value::Str(_)) => {
+                    kind = Some(ColKind::Str);
+                    break;
+                }
+                Some(Value::Bool(_)) => {
+                    kind = Some(ColKind::Bool);
+                    break;
+                }
+                Some(_) => return None, // 结构化 → 整批回退逐行
+                None => {}
+            }
+        }
+        let Some(kind) = kind else {
+            continue; // 全缺失 → 不建列（Null ColKind）
+        };
+        // pass 2：直写 builder（无 Value 中间态）
+        let array: ArrayRef = match kind {
+            ColKind::Num => {
+                let mut b = Float64Builder::with_capacity(n);
+                for row in 0..n {
+                    match resolve(row, fname) {
+                        Some(Value::Number(f)) => b.append_value(f),
+                        Some(_) => return None,
+                        None => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            ColKind::Str => {
+                let mut b = StringBuilder::with_capacity(n, n * 16);
+                for row in 0..n {
+                    match resolve(row, fname) {
+                        Some(Value::Str(s)) => b.append_value(s.as_str()),
+                        Some(_) => return None,
+                        None => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            ColKind::Bool => {
+                let mut b = BooleanBuilder::with_capacity(n);
+                for row in 0..n {
+                    match resolve(row, fname) {
+                        Some(Value::Bool(x)) => b.append_value(x),
+                        Some(_) => return None,
+                        None => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+        };
+        schema_fields.push(ArrowField::new(fname.as_str(), array.data_type().clone(), true));
+        arrays.push(array);
+    }
+    Some((schema_fields, arrays))
 }
 
 /// Evaluate a compiled guard tree over every row of `view` (one `BooleanArray`
@@ -719,6 +944,58 @@ fn compile_output_func(
                 needle: Box::new(compile_expr(&args[1], view)?),
             })
         }
+        wf_lang::columnar::ColumnarOutputFunc::Split => {
+            // split 只作为 mvindex 的 list 参数被融合（SplitIndex）；独立列式
+            // 无列表值类型 → 编译失败，调用方回落行式。
+            None
+        }
+        wf_lang::columnar::ColumnarOutputFunc::MvIndex => {
+            // mvindex(list, idx)：list 必须是 `split(flat_field, "lit")`（let
+            // 内联后的形态）→ 融合为 SplitIndex { col, sep, index }。其他
+            // list 形态（字段列表、Path 等）→ None → 行式回退。
+            if args.len() != 2 {
+                return None;
+            }
+            let index = match &args[1] {
+                Expr::Number(n) => n.trunc() as i64,
+                _ => return None,
+            };
+            let Expr::FuncCall {
+                qualifier: None,
+                name,
+                args: list_args,
+            } = &args[0]
+            else {
+                return None;
+            };
+            if name != "split" || list_args.len() != 2 {
+                return None;
+            }
+            let Expr::Field(text_field) = &list_args[0] else {
+                return None;
+            };
+            // 仅 flat 字段（Simple/Qualified/Bracketed）——Path 的语义在
+            // 解释路径作用于索引后的值，融合节点只读原始列，分叉 → 回退。
+            if !matches!(
+                text_field,
+                FieldRef::Simple(_) | FieldRef::Qualified(_, _) | FieldRef::Bracketed(_, _)
+            ) {
+                return None;
+            }
+            let Expr::StringLit(sep) = &list_args[1] else {
+                return None;
+            };
+            Some(ColumnExpr::SplitIndex {
+                col: view.resolve_field(text_field),
+                sep: sep.clone().into(),
+                index,
+            })
+        }
+        wf_lang::columnar::ColumnarOutputFunc::Concat => {
+            let cargs: Option<Vec<ColumnExpr>> =
+                args.iter().map(|a| compile_expr(a, view)).collect();
+            Some(ColumnExpr::Concat { args: cargs? })
+        }
     }
 }
 
@@ -822,6 +1099,13 @@ impl ColumnExpr {
             ColumnExpr::Strftime { ts, fmt } => strftime_vec(ts.eval_vec(view, n), fmt, n),
             ColumnExpr::CountChar { text, needle } => {
                 count_char_vec(text.eval_vec(view, n), needle.eval_vec(view, n), n)
+            }
+            ColumnExpr::SplitIndex { col, sep, index } => {
+                view.split_index_vec(col, sep, *index, n)
+            }
+            ColumnExpr::Concat { args } => {
+                let arg_vecs: Vec<CVec> = args.iter().map(|a| a.eval_vec(view, n)).collect();
+                concat_vec(&arg_vecs, n)
             }
             ColumnExpr::InList {
                 expr,
@@ -1067,8 +1351,11 @@ pub(crate) fn cscalar_to_value(s: &CScalar) -> Value {
 /// an empty string, exactly like the interpreted `eval_yield_expr_with_meta`.
 fn fmt_vec(template: &SmolStr, args: &[CVec], n: usize) -> CVec {
     let mut out = Vec::with_capacity(n);
+    // 复用临时值缓冲区（apply_fmt_template 只借用不持有）：避免每行一次
+    // Vec 分配——close/each 高输出量路径的 per-row 热点（2026-08-25 层 1）。
+    let mut values: Vec<Value> = Vec::with_capacity(args.len());
     for row in 0..n {
-        let mut values = Vec::with_capacity(args.len());
+        values.clear();
         let mut ok = true;
         for a in args {
             match a.scalar_at(row) {
@@ -1086,6 +1373,73 @@ fn fmt_vec(template: &SmolStr, args: &[CVec], n: usize) -> CVec {
         });
     }
     CVec::Str(out)
+}
+
+/// `mvindex(split(field, sep), idx)` 融合求值（q22 let 形态）：per row 读
+/// Utf8 cell → 按 sep 分割（空 sep 按字符）→ `normalize_index` 取第 idx 个
+/// 元素（负数从尾数；越界 / 空 / null / 非 Utf8 列 → null，与解释路径
+/// `split` 非 Str → None + `arr.get(idx)` 越界 → None 一致）。
+impl ColumnarBatch<'_> {
+    fn split_index_vec(&self, col: &ColRef, sep: &SmolStr, index: i64, n: usize) -> CVec {
+        let mut out: Vec<Option<SmolStr>> = Vec::with_capacity(n);
+        let Some(arr) = self
+            .column_at(col)
+            .and_then(|a| a.as_any().downcast_ref::<StringArray>())
+        else {
+            return CVec::Str(vec![None; n]);
+        };
+        for i in 0..n {
+            if arr.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let text = arr.value(i);
+            let picked: Option<SmolStr> = if sep.is_empty() {
+                let chars: Vec<char> = text.chars().collect();
+                normalize_index_simple(index, chars.len())
+                    .map(|k| SmolStr::from(chars[k].to_string()))
+            } else {
+                let parts: Vec<&str> = text.split(sep.as_str()).collect();
+                normalize_index_simple(index, parts.len()).map(|k| SmolStr::from(parts[k]))
+            };
+            out.push(picked);
+        }
+        CVec::Str(out)
+    }
+}
+
+/// `concat(a, b, ...)` 批量求值：per row 逐参 cell → `value_to_string` 拼接
+/// （与解释路径逐参 eval + value_to_string 字节一致）；任一参数 cell null →
+/// 整行 null（解释路径 `?` 传播 → yield 空串）。
+fn concat_vec(args: &[CVec], n: usize) -> CVec {
+    let mut out: Vec<Option<SmolStr>> = Vec::with_capacity(n);
+    for row in 0..n {
+        let mut s = String::new();
+        let mut ok = true;
+        for a in args {
+            match a.scalar_at(row) {
+                Some(c) => s.push_str(&value_to_string(&cscalar_to_value(&c))),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        out.push(if ok { Some(SmolStr::from(s)) } else { None });
+    }
+    CVec::Str(out)
+}
+
+/// `normalize_index`（负数从尾数；越界 → None）——与解释路径 `mvindex` 的
+/// `utils::normalize_index` 同语义（此处内联避免可见性纠缠）。
+fn normalize_index_simple(index: i64, len: usize) -> Option<usize> {
+    let len = len as i64;
+    let normalized = if index < 0 { len + index } else { index };
+    if normalized < 0 || normalized >= len {
+        None
+    } else {
+        Some(normalized as usize)
+    }
 }
 
 /// Vectorized `strftime(ts, fmt)` yield-cell evaluation: per row, a numeric
@@ -2730,6 +3084,60 @@ mod tests {
             &call("count_char", vec![f("action"), Expr::StringLit(String::new())]),
             &batch,
         );
+    }
+
+    #[test]
+    fn output_funcs_split_mvindex_concat_match_interpreted() {
+        // 层 2（2026-08-25，q22 形态）：`mvindex(split(field, sep), idx)` 融合
+        // 节点（SplitIndex）与 `concat` 必须与解释路径逐行对拍——含 null 行 /
+        // 越界 / 空 sep（按字符切分）/ 负数索引（从尾数）。
+        let schema = Arc::new(Schema::new(vec![Field::new("url", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                Some("https://www.nexmark.com/aaaaa/bbbbb/ccccc/item.htm?query=1"),
+                None,          // null 行
+                Some("short"), // 段数不足 → mvindex 越界 → null
+                Some("a/b//d"), // 空段
+            ])) as ArrayRef],
+        )
+        .unwrap();
+        let call = |name: &str, args: Vec<Expr>| Expr::FuncCall {
+            qualifier: None,
+            name: name.into(),
+            args,
+        };
+        let f = |n: &str| Expr::Field(FieldRef::Simple(n.into()));
+        let split = |text: Expr, sep: &str| {
+            call("split", vec![text, Expr::StringLit(sep.into())])
+        };
+        let mvindex = |list: Expr, idx: f64| call("mvindex", vec![list, Expr::Number(idx)]);
+
+        // mvindex(split(url, "/"), 3)——融合节点（正索引）。
+        let idx3 = mvindex(split(f("url"), "/"), 3.0);
+        assert!(wf_lang::columnar::columnar_output_expr(&idx3));
+        assert_value_equiv(&idx3, &batch);
+        // 负数索引（从尾数）。
+        assert_value_equiv(&mvindex(split(f("url"), "/"), -1.0), &batch);
+        // 空 sep → 按字符切分。
+        assert_value_equiv(&mvindex(split(f("url"), ""), 4.0), &batch);
+
+        // concat：字段 + 字面量；q22 detail 形态（3 段 mvindex 拼接）。
+        let concat_suffix = call("concat", vec![f("url"), Expr::StringLit("-suffix".into())]);
+        assert!(wf_lang::columnar::columnar_output_expr(&concat_suffix));
+        assert_output_equiv(&concat_suffix, &batch);
+        let q22_detail = call(
+            "concat",
+            vec![
+                mvindex(split(f("url"), "/"), 3.0),
+                Expr::StringLit("/".into()),
+                mvindex(split(f("url"), "/"), 4.0),
+                Expr::StringLit("/".into()),
+                mvindex(split(f("url"), "/"), 5.0),
+            ],
+        );
+        assert!(wf_lang::columnar::columnar_output_expr(&q22_detail));
+        assert_output_equiv(&q22_detail, &batch);
     }
 
     /// Exact per-cell parity (incl. null-ness and value type): columnar

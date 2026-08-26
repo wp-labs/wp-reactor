@@ -602,6 +602,139 @@ fn columnar_close_general_fmt_yield_matches_per_record() {
 }
 
 #[test]
+fn columnar_close_general_fmt_columnar_cell_matches_per_record() {
+    // 层 1（2026-08-25）：close_batch_prepare 的列式批级 cell 求值——fmt 引用
+    // 字段带真实值（键来源 + field_values 来源），输出必须与逐条解释路径
+    // 逐位一致（值 + 类型）。
+    use crate::alert::AlertColumnBuilder;
+    use crate::error::CoreResult;
+    use crate::match_engine::match_engine::Value;
+    use wf_lang::plan::YieldField;
+    use wp_model_core::model::DataRecord;
+
+    let mut plan = q12_like_plan();
+    plan.yield_plan.fields.push(YieldField {
+        name: "fmt_detail".to_string(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "fmt".to_string(),
+            args: vec![
+                Expr::StringLit("bidder={} price={}".to_string()),
+                Expr::Field(FieldRef::Simple("bidder".to_string())),
+                Expr::Field(FieldRef::Simple("price".to_string())),
+            ],
+        },
+    });
+    let exec = RuleExecutor::new(plan);
+    assert!(exec.close_plan_columnar_safe(), "fmt 引用普通字段应过门控");
+    let mut close = q12_like_close();
+    // bidder 是键（scope_key[0]=42）——键来源；price 走 field_values（非键）
+    // 来源；extra 是**未被引用**的字段——不应影响物化/求值。
+    close.close_step_data[0]
+        .field_values
+        .insert("price".into(), vec![Value::Number(1234.5)]);
+    close.close_step_data[0].field_values.insert(
+        "extra".into(),
+        vec![Value::Str("x".to_string().into())],
+    );
+
+    let record = exec.execute_close(&close).unwrap().unwrap();
+    let per_record = record.to_data_record().unwrap();
+
+    let mut builder = AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
+    let stats =
+        exec.execute_close_direct_batch_columnar(&[close], &mut builder, 1_700_000_000_000);
+    assert_eq!(stats.appended, 1);
+    assert_eq!(stats.failed, 0);
+    let batch = builder.finish();
+    let columnar_rows: Vec<DataRecord> = batch
+        .iter_data_records()
+        .collect::<CoreResult<Vec<_>>>()
+        .unwrap();
+    assert_eq!(columnar_rows.len(), 1);
+    assert_records_equal_ignoring_emit_time(&per_record, &columnar_rows[0]);
+}
+
+#[test]
+fn columnar_close_general_materialize_fail_falls_back_matches_per_record() {
+    // 层 2 收口 review：物化失败（引用字段跨 close 类型不一致 → 整批回退）
+    // 的回退路径（build_eval_context + eval）必须与逐条解释路径逐位一致。
+    use crate::alert::AlertColumnBuilder;
+    use crate::error::CoreResult;
+    use crate::match_engine::match_engine::Value;
+    use wf_lang::plan::YieldField;
+    use wp_model_core::model::DataRecord;
+
+    let mut plan = q12_like_plan();
+    plan.yield_plan.fields.push(YieldField {
+        name: "fmt_detail".into(),
+        value: Expr::FuncCall {
+            qualifier: None,
+            name: "fmt".into(),
+            args: vec![
+                Expr::StringLit("v={}".into()),
+                Expr::Field(FieldRef::Simple("v".into())),
+            ],
+        },
+    });
+    let exec = RuleExecutor::new(plan);
+    assert!(exec.close_plan_columnar_safe());
+
+    // 两个 close：v 分别为 Number 与 Str → 物化类型不一致 → 整批回退。
+    let mut c1 = q12_like_close();
+    c1.close_step_data[0]
+        .field_values
+        .insert("v".into(), vec![Value::Number(7.0)]);
+    let mut c2 = q12_like_close();
+    c2.close_step_data[0]
+        .field_values
+        .insert("v".into(), vec![Value::Str("x".to_string().into())]);
+
+    let mut b_row = AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
+    for c in [&c1, &c2] {
+        let record = exec.execute_close(c).unwrap().unwrap();
+        b_row.append_record(&record).unwrap();
+    }
+    let out_row: Vec<DataRecord> = b_row
+        .finish()
+        .iter_data_records()
+        .collect::<CoreResult<Vec<_>>>()
+        .unwrap();
+
+    let mut b_col = AlertColumnBuilder::new(std::sync::Arc::from("nexmark_alerts"));
+    let stats =
+        exec.execute_close_direct_batch_columnar(&[c1, c2], &mut b_col, 1_700_000_000_000);
+    assert_eq!(stats.appended, 2);
+    assert_eq!(stats.failed, 0);
+    let out_col: Vec<DataRecord> = b_col
+        .finish()
+        .iter_data_records()
+        .collect::<CoreResult<Vec<_>>>()
+        .unwrap();
+
+    assert_eq!(out_row.len(), out_col.len());
+    for (row, (ra, rb)) in out_row.iter().zip(out_col.iter()).enumerate() {
+        assert_eq!(
+            ra.items.len(),
+            rb.items.len(),
+            "row {row} field count"
+        );
+        for (fa, fb) in ra.items.iter().zip(rb.items.iter()) {
+            if fa.get_name() == wf_lang::wfu_meta::WFU_EMIT_TIME {
+                continue;
+            }
+            assert_eq!(fa.get_name(), fb.get_name(), "row {row} field name");
+            assert_eq!(
+                fa.get_value(),
+                fb.get_value(),
+                "row {row} field {} value",
+                fa.get_name()
+            );
+        }
+    }
+}
+
+#[test]
 fn columnar_close_resolves_field_from_step_label() {
     // entity = Field(label name) — the label's measure value is the ctx value
     // (build_eval_context inserts labels as Number(measure_value)).
@@ -799,3 +932,4 @@ fn columnar_close_scope_key_short_falls_back_to_field_values() {
         .unwrap();
     assert_records_equal_ignoring_emit_time(&record.to_data_record().unwrap(), &rows[0]);
 }
+

@@ -5,15 +5,17 @@ use wf_lang::ast::{Expr, FieldRef};
 
 use crate::alert::{AlertColumnBuilder, AlertOrigin, EachRowCells, OutputRecord};
 use crate::error::CoreResult;
+use crate::match_engine::columnar::cscalar_to_value;
 use crate::match_engine::match_engine::{
     Event, MatchedContext, Value, WindowLookup, eval_field_value, field_ref_name, value_to_string,
 };
 
+use super::close_exec::CloseBatchVecs;
 use super::each_exec::EachDirectBatchStats;
 
 use super::RuleExecutor;
 use super::YieldKind;
-use super::alert::{build_summary, build_wfx_id, format_nanos_utc, now_nanos};
+use super::alert::{build_summary, build_wfx_id, format_nanos_utc, now_nanos, EntityIdCache};
 use super::context::{build_eval_context, execute_joins};
 use super::eval::{
     YieldMeta, eval_entity_id, eval_score, eval_yield_expr_with_meta, with_yield_eval_scope,
@@ -190,7 +192,23 @@ impl RuleExecutor {
                 .yield_plan
                 .fields
                 .iter()
-                .all(|f| out_shape_ok(&f.value))
+                .all(|f| {
+                    out_shape_ok(&f.value)
+                        || (wf_lang::columnar::columnar_output_expr(&f.value)
+                            && super::yield_general_columnar_safe(&f.value))
+                })
+        {
+            return false;
+        }
+        // 有活 join 时 General 禁止（层 2 收口）：列式物化视图（resolve_match_field）
+        // 只有 keys/trigger/steps/bind，无 join 富化字段——General 引用右窗字段
+        // 会静默读空 → 与解释路径（Full ctx 含 enrich）分叉。
+        if !self.live_joins.is_empty()
+            && plan
+                .yield_plan
+                .fields
+                .iter()
+                .any(|f| !out_shape_ok(&f.value))
         {
             return false;
         }
@@ -227,6 +245,30 @@ impl RuleExecutor {
         })
     }
 
+    /// 列式批级 General yield 槽位（层 2 收口）：`resolve_match_field` 的字段
+    /// 解析与 `build_eval_context`（Named 窄化）注入优先级逐位对齐（keys →
+    /// trigger_event → step labels/field_values → bind），物化列与解释 ctx
+    /// 无分叉。match 传空 lets（解释 match 路径无 apply_lets）。
+    pub(crate) fn match_batch_prepare(&self, matched: &[&MatchedContext]) -> CloseBatchVecs {
+        let n = matched.len();
+        let slots = self.plan.yield_plan.fields.len();
+        let ref_fields = self.yield_ref_fields(false);
+        if n == 0 || ref_fields.is_empty() {
+            return CloseBatchVecs {
+                general_cvecs: (0..slots).map(|_| None).collect(),
+            };
+        }
+        let keys = &self.plan.match_plan.keys;
+        CloseBatchVecs {
+            general_cvecs: self.compile_general_slots(
+                &ref_fields,
+                n,
+                |row, name| resolve_match_field(matched[row], keys, name),
+                &[],
+            ),
+        }
+    }
+
     /// 批量 match 命中输出直写列式 builder（跳过 `OutputRecord` 中间物化）。
     /// 字段来源 = scope_key（键优先）∪ trigger_event；join 不在此执行（门控保证
     /// 输出不依赖非键右窗字段）。逐 ctx 构造 wfx_id/summary（依赖 step_data，
@@ -247,6 +289,9 @@ impl RuleExecutor {
         let keys = &self.plan.match_plan.keys;
         let origin = AlertOrigin::Event;
         let emit_time = self.cached_emit_time(emit_time_nanos);
+        // 层 2 收口：列式批级 General yield cell（match_batch_prepare——
+        // resolve_match_field 与解释 ctx 注入优先级逐位对齐）。
+        let prepared = self.match_batch_prepare(matched);
         let score_const = match &self.plan.score_plan.expr {
             Expr::Number(n) => n.clamp(0.0, 100.0),
             _ => unreachable!("columnar match gate requires a constant score"),
@@ -297,6 +342,9 @@ impl RuleExecutor {
             }
         }
         builder.reserve_rows(matched.len());
+        // entity 连续缓存（通用 EntityIdCache, P6）: 同 scope_key 相邻 matched
+        // 复用 entity_id（q6 同 key 多事件触发）, 免每行 resolve + value_to_string。
+        let mut entity_cache = EntityIdCache::new();
         for (idx, m) in matched.iter().enumerate() {
             let resolve = ResolveCtx::Free {
                 keys,
@@ -305,10 +353,12 @@ impl RuleExecutor {
             };
             let entity_id = match &entity_const {
                 Some(s) => s.clone(),
-                None => entity_field
-                    .and_then(|fr| resolve.resolve_field(fr))
-                    .map(|v| value_to_string(&v))
-                    .unwrap_or_default(),
+                None => entity_cache.get_or(&m.scope_key, || {
+                    entity_field
+                        .and_then(|fr| resolve.resolve_field(fr))
+                        .map(|v| value_to_string(&v))
+                        .unwrap_or_default()
+                }),
             };
             let fired_at = format_nanos_utc(m.event_time_nanos);
             let wfx_id = build_wfx_id(
@@ -325,15 +375,18 @@ impl RuleExecutor {
                 &m.step_data,
                 &origin,
             ));
-            // yield staging（Lit 由批级 const 列补齐；Field 逐行 resolve+stage）。
+            // yield staging（Lit 由批级 const 列补齐；Field 逐行 resolve+stage；
+            // General 列式 cell（槽位 None → 逐行 Full ctx 回退））。
             let mut row_failed = false;
-            for ((field, (name, field_type)), kind) in self
+            let mut ctx: Option<Event> = None;
+            for (field_idx, ((field, (name, field_type)), kind)) in self
                 .plan
                 .yield_plan
                 .fields
                 .iter()
                 .zip(statics.yield_specs.iter())
                 .zip(statics.yield_kinds.iter())
+                .enumerate()
             {
                 match kind {
                     YieldKind::Lit(_) => {}
@@ -365,7 +418,85 @@ impl RuleExecutor {
                         }
                     }
                     YieldKind::General => {
-                        unreachable!("columnar match gate excludes General yield")
+                        // 层 2 收口（2026-08-25）：列式批级 cell——槽位命中直接
+                        // 取（null 行 → 空串，同解释 None→""）；槽位 None（编译
+                        // 失败/物化类型不一致）→ 逐行回退：Full ctx（build_eval_
+                        // context 含 trigger_event，与解释路径一致）。
+                        let value = match prepared
+                            .general_cvecs
+                            .get(field_idx)
+                            .and_then(|c| c.as_ref())
+                        {
+                            Some(cvec) => match cvec.scalar_at(idx) {
+                                Some(s) => cscalar_to_value(&s),
+                                None => Value::Str(SmolStr::default()),
+                            },
+                            None => {
+                                // 与解释路径（execute_match_with_joins_at）
+                                // 一致：step_plans 参与 ctx 构建（All 分支的
+                                // `_step_{i}_source`；General 门控不引用合成
+                                // 字段，主要保证注入语义逐位对齐）。
+                                let step_plans: Vec<&wf_lang::plan::StepPlan> = self
+                                    .plan
+                                    .match_plan
+                                    .event_steps
+                                    .iter()
+                                    .collect();
+                                let ctx = ctx.get_or_insert_with(|| {
+                                    build_eval_context(
+                                        keys,
+                                        &m.scope_key,
+                                        &m.step_data,
+                                        &m.bind_data,
+                                        &step_plans,
+                                        m.trigger_event.as_deref(),
+                                        &self.close_ctx_fields,
+                                    )
+                                });
+                                // 复用循环外已算的 wfx_id / summary（字节一致）。
+                                let yield_meta = YieldMeta {
+                                    score: Some(score_const),
+                                    wfx_id: Some(&wfx_id),
+                                    rule_name: Some(&self.plan.name),
+                                    entity_type: Some(&self.plan.entity_plan.entity_type),
+                                    entity_id: Some(&entity_id),
+                                    origin: Some(origin.as_str()),
+                                    close_reason: Some(""),
+                                    fired_at: Some(&fired_at),
+                                    emit_time: Some(&emit_time),
+                                    summary: Some(&summary),
+                                    event_first_time_nanos: Some(m.event_first_time_nanos),
+                                    event_last_time_nanos: Some(m.event_last_time_nanos),
+                                    window_start_time_nanos: Some(m.window_start_time_nanos),
+                                    window_end_time_nanos: Some(m.window_end_time_nanos),
+                                    emit_time_nanos: Some(emit_time_nanos),
+                                    time_format: Some(self.output_config().time_format.as_str()),
+                                };
+                                with_yield_eval_scope(|| {
+                                    eval_yield_expr_with_meta(&field.value, ctx, yield_meta)
+                                })
+                                .expect("eval_yield_expr_with_meta never returns None")
+                            }
+                        };
+                        match RuleExecutor::coerce_yield_field_value_with(
+                            name,
+                            field_type.as_ref(),
+                            value,
+                        ) {
+                            Ok(Some(v)) => {
+                                if let Err(e) =
+                                    builder.stage_yield_cell(name, field_type.as_ref(), &v)
+                                {
+                                    log::warn!("alert export error: {e}");
+                                    row_failed = true;
+                                }
+                            }
+                            Ok(None) => { /* optional input field missing → omit */ }
+                            Err(e) => {
+                                log::warn!("alert export error: {e}");
+                                row_failed = true;
+                            }
+                        }
                     }
                 }
                 if row_failed {
@@ -537,4 +668,38 @@ impl RuleExecutor {
             scope_key,
         })
     }
+}
+
+/// match 字段解析（层 2 收口）：keys（scope_key）→ trigger_event → step
+/// labels/field_values → bind——与 `build_eval_context`（Named 窄化）注入
+/// 优先级逐位一致，物化列与解释 ctx 无分叉。
+fn resolve_match_field(m: &MatchedContext, keys: &[FieldRef], name: &str) -> Option<Value> {
+    for (i, k) in keys.iter().enumerate() {
+        if field_ref_name(k) == name
+            && let Some(v) = m.scope_key.get(i)
+        {
+            return Some(v.clone());
+        }
+    }
+    if let Some(ev) = m.trigger_event.as_deref()
+        && let Some(v) = ev.fields.get(name)
+    {
+        return Some(v.clone());
+    }
+    for sd in &m.step_data {
+        if let Some(label) = &sd.label
+            && label.as_str() == name
+        {
+            return Some(Value::Number(sd.measure_value));
+        }
+        if let Some(v) = sd.field_values.get(name).and_then(|vs| vs.last()) {
+            return Some(v.clone());
+        }
+    }
+    for bd in &m.bind_data {
+        if let Some(v) = bd.field_values.get(name).and_then(|vs| vs.last()) {
+            return Some(v.clone());
+        }
+    }
+    None
 }

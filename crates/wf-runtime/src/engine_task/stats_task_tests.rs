@@ -76,7 +76,7 @@ fn ranked_task_config(
     notify: Arc<tokio::sync::Notify>,
     progress: HashMap<String, Arc<AtomicU64>>,
 ) -> StatsTaskConfig {
-    let schema = win.schema().clone();
+    let _schema = win.schema().clone();
     let plan = StatsPlan {
         window_spec: WindowSpec::Fixed(Duration::from_secs(10)),
         keys,
@@ -1851,7 +1851,6 @@ async fn stats_pull_actor_evictor_over_budget_recovers() {
     // **必须先于生产者 spawn**（生产者会在 budget 上阻塞, 消费者要早就在跑）
     let notify_c = Arc::clone(&notify);
     let slot_pull = slot.clone();
-    let win_c = Arc::clone(&win);
     let mut pull = tokio::spawn(async move {
         let mut task = task;
         loop {
@@ -1925,7 +1924,9 @@ async fn stats_pull_actor_evictor_over_budget_recovers() {
             win.total_rows(),
         );
     }
-    result.expect("pull task panicked");
+    // 外层 expect 解超时（L1909 已处理, 此处不可达）; 内层 expect 解
+    // JoinError——pull 任务 panic 时暴露（不留静默吞错）。
+    result.expect("pull task timed out").expect("pull task panicked");
     assert_eq!(acked, N_BATCHES, "全部批次被消费并 ack");
 }
 
