@@ -1438,7 +1438,7 @@ fn merge_accum_cur(t: &mut StatsAccum, o: &StatsAccum) {
         (None, None) => None,
     };
     match (&mut t.distinct_set, &o.distinct_set) {
-        (Some(ts), Some(os)) => ts.extend(os.iter().cloned()),
+        (Some(ts), Some(os)) => ts.extend_other(os),
         (None, Some(os)) => t.distinct_set = Some(os.clone()),
         _ => {}
     }
@@ -1524,13 +1524,13 @@ fn merge_accum_move_small_into_big(t: &mut StatsAccum, o: StatsAccum) {
 /// 构造一个 `StatsAccum`：count + sum + min/max 固定值, distinct_set 填 `n` 个
 /// 确定性 i64 键（LCG, 域 = [0, domain)）。
 fn shard_accum(n: usize, domain: u64, seed: u64) -> StatsAccum {
-    use crate::match_engine::{DistinctKey, StatsAccum};
+    use crate::match_engine::{DistinctKey, DistinctSet, StatsAccum};
     let mut acc = StatsAccum {
         count: 1,
         sum_i128: 7,
         min: Some(1),
         max: Some(9),
-        distinct_set: Some(EngineHashSet::default()),
+        distinct_set: Some(DistinctSet::default()),
         last_row: None,
         top_entries: None,
     };

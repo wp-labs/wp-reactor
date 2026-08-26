@@ -31,7 +31,7 @@ pub struct StatsAccum {
     pub sum_i128: i128,
     pub min: Option<i128>,
     pub max: Option<i128>,
-    pub distinct_set: Option<EngineHashSet<DistinctKey>>,
+    pub distinct_set: Option<DistinctSet>,
     /// `last(field)` 用（Q18）: 最近合格行的**行字段列数组**（P5 紧凑化——按
     /// `row_field_names` 列序存储, 缺失/null = `None`; 旧 `EngineHashMap` 每桶
     /// 6 个 SmolStr key + hash 节点 ≈ 400B+/桶, 5.29M 桶直接顶到 ~19GB）。
@@ -59,6 +59,61 @@ pub enum DistinctKey {
     /// 非整数数值（小数）—— 保持原 f64 位（canonical）。
     Float(u64),
     Str(Box<str>),
+}
+
+/// distinct_count 的紧凑存储（2026-08-26 q16 内存）：整数键（q16 的
+/// bidder/auction 主战场）走 `HashSet<i64>`（8B/项）——原 enum `DistinctKey`
+/// 因 `Box<str>` 变体占 16B/项；Float/Str 键保留 enum 集合。两集合语义互斥
+/// （insert 按类型路由），len/merge 各自合并。
+#[derive(Debug, Clone, Default)]
+pub struct DistinctSet {
+    ints: EngineHashSet<i64>,
+    others: EngineHashSet<DistinctKey>,
+}
+
+impl DistinctSet {
+    /// 插入按类型路由；返回是否新值（供内存估算增量记账）。
+    pub fn insert(&mut self, key: DistinctKey) -> bool {
+        match key {
+            DistinctKey::Int(v) => self.ints.insert(v),
+            other => self.others.insert(other),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ints.len() + self.others.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ints.is_empty() && self.others.is_empty()
+    }
+
+    /// merge（分片 union）：整数/非整数分别 extend（跨片 hasher 可不同，
+    /// 与旧 `EngineHashSet::extend` 同语义）。
+    pub fn extend_other(&mut self, other: &DistinctSet) {
+        for v in &other.ints {
+            self.ints.insert(*v);
+        }
+        for k in &other.others {
+            self.others.insert(k.clone());
+        }
+    }
+
+    /// owned merge（merge 候选 bench 用；语义与 [`Self::extend_other`] 一致）。
+    pub fn extend(&mut self, other: DistinctSet) {
+        for v in other.ints {
+            self.ints.insert(v);
+        }
+        for k in other.others {
+            self.others.insert(k);
+        }
+    }
+
+    /// 预扩容（merge 候选 bench 用）。
+    pub fn reserve(&mut self, additional: usize) {
+        self.ints.reserve(additional);
+        self.others.reserve(additional);
+    }
 }
 
 impl DistinctKey {
@@ -145,6 +200,31 @@ impl StatsWindowState {
         self.estimated_bytes
     }
 
+    /// distinct 集合每项估算字节（2026-08-26 q16）：`HashSet<i64>` 8B/项 +
+    /// foldhash 控制字/负载因子（87.5% 满）≈ 12B；others（enum 16B + 同开销）
+    /// ≈ 24B。统一取 24B（保守上界，guard 宁可早拒）。
+    const DISTINCT_ENTRY_BYTES: u64 = 24;
+
+    /// 批末刷新状态内存估算（2026-08-26 q16）：
+    /// `estimated_bytes = 桶数×allowance + Σ桶 distinct len×DISTINCT_ENTRY_BYTES`
+    /// ——distinct 集合此前完全不计（q16 带 key + 8 distinct_count 的 19G 实际
+    /// vs 8GB 估算形同虚设）。O(桶数) 每批（q16 ~10k 桶 × 2857 批可接受）。
+    /// guard 检查（新建桶）用刷新后的值，反映真实。
+    fn refresh_estimated_bytes(&mut self, plan: &StatsPlan, n_measures: usize) {
+        let allowance = Self::bucket_allowance(plan, n_measures);
+        let mut distinct_bytes = 0u64;
+        for buckets in self.buckets.values() {
+            for bucket in buckets {
+                for acc in &bucket.accs {
+                    if let Some(set) = &acc.distinct_set {
+                        distinct_bytes += set.len() as u64 * Self::DISTINCT_ENTRY_BYTES;
+                    }
+                }
+            }
+        }
+        self.estimated_bytes = self.buckets.len() as u64 * allowance + distinct_bytes;
+    }
+
     /// 累计因超限被拒收的新桶数。
     pub fn over_limit_new_buckets(&self) -> u64 {
         self.over_limit_new_buckets
@@ -153,10 +233,10 @@ impl StatsWindowState {
     /// 新桶预算（保守上界）: 固定基数 + 每度量结构 + top/last 条目预算
     /// （含行字段列数组）。
     ///
-    /// **已知限制（文档注记）**: `distinct_set` 不在预算内——带 key + distinct 规则
-    /// 下每桶 distinct 集按值增长（无界）, guard 只限桶数不限每桶 distinct 集。
-    /// 这是有意取舍: 逐条目记账需侵入累加热路径且估算复杂; 现网规则集（q 系列）
-    /// 带 key 规则均无 distinct（q15 的 distinct 是空键单桶, 内存本身固定）。
+    /// **已知限制（2026-08-26 已修）**: `distinct_set` 原不在预算内（带 key +
+    /// distinct 规则下每桶 distinct 集按值增长, guard 只限桶数）——q16 带 key +
+    /// 8 distinct_count 打破旧假设（19G 实际 vs 8GB 估算）。现由
+    /// [`Self::refresh_estimated_bytes`] 批末按真实 len 计入（保守上界）。
     fn bucket_allowance(plan: &StatsPlan, n_measures: usize) -> u64 {
         let mut bytes = 512u64 + n_measures as u64 * 128;
         for m in &plan.measures {
@@ -482,7 +562,7 @@ impl StatsExecutor {
                             StatsAggPlan::DistinctCount => {
                                 let key = value_to_distinct_key(&val);
                                 acc.distinct_set
-                                    .get_or_insert_with(EngineHashSet::default)
+                                    .get_or_insert_with(DistinctSet::default)
                                     .insert(key);
                             }
                             StatsAggPlan::Last | StatsAggPlan::Top => {
@@ -530,6 +610,8 @@ impl StatsExecutor {
             }
             self.window.event_count += 1;
         }
+        // 2026-08-26 q16：批末刷新估算（distinct 集合计入真实 len）。
+        self.window.refresh_estimated_bytes(&self.plan, n_measures);
     }
 
     /// last/top 行字段列名（列数组列序; `None` = 无子集且未定——任务层仅在
@@ -656,6 +738,9 @@ impl StatsExecutor {
             }
         }
         self.window.event_count += event_count;
+        // 2026-08-26 q16：分片归并后刷新估算（distinct union 可能大幅增长）。
+        self.window
+            .refresh_estimated_bytes(&self.plan, self.plan.measures.len());
     }
 
     /// 列式批处理（P1.5, 设计 §6.2）: 消费 fanout 投递的 raw [`RecordBatch`]。
@@ -814,7 +899,7 @@ impl StatsExecutor {
                 let Some(field) = &measure.field else {
                     continue;
                 };
-                let set = acc.distinct_set.get_or_insert_with(EngineHashSet::default);
+                let set = acc.distinct_set.get_or_insert_with(DistinctSet::default);
                 if !insert_distinct_domain(batch, field_name(field), rows, n, &masks, wi, set) {
                     return false;
                 }
@@ -834,6 +919,9 @@ impl StatsExecutor {
             }
         }
         self.window.event_count += rows.map_or(n as u64, |rs| rs.len() as u64);
+        // 2026-08-26 q16：批末刷新估算（distinct 集合计入真实 len）。
+        self.window
+            .refresh_estimated_bytes(&self.plan, self.plan.measures.len());
         true
     }
 
@@ -1032,7 +1120,7 @@ fn accumulate_column_row(
             StatsAggPlan::DistinctCount => {
                 if let Some(k) = column_distinct_key(batch, field_name(field), row) {
                     acc.distinct_set
-                        .get_or_insert_with(EngineHashSet::default)
+                        .get_or_insert_with(DistinctSet::default)
                         .insert(k);
                 }
             }
@@ -1121,7 +1209,7 @@ fn merge_accum(t: &mut StatsAccum, o: &StatsAccum) {
         (None, None) => None,
     };
     match (&mut t.distinct_set, &o.distinct_set) {
-        (Some(ts), Some(os)) => ts.extend(os.iter().cloned()),
+        (Some(ts), Some(os)) => ts.extend_other(os),
         (None, Some(os)) => t.distinct_set = Some(os.clone()),
         _ => {}
     }
@@ -1505,7 +1593,7 @@ fn measure_values(
             }
             StatsAggPlan::Min => acc.min.unwrap_or(0) as f64,
             StatsAggPlan::Max => acc.max.unwrap_or(0) as f64,
-            StatsAggPlan::DistinctCount => acc.distinct_set.as_ref().map_or(0, HashSet::len) as f64,
+            StatsAggPlan::DistinctCount => acc.distinct_set.as_ref().map_or(0, DistinctSet::len) as f64,
             StatsAggPlan::Last => match (&acc.last_row, fidx) {
                 (Some(row), Some(i)) => row
                     .get(*i)
@@ -1559,7 +1647,7 @@ fn bucket_measure_entries(
         StatsAggPlan::Max => vec![scalar(acc.max.unwrap_or(0) as f64)],
         StatsAggPlan::DistinctCount => {
             vec![scalar(
-                acc.distinct_set.as_ref().map_or(0, HashSet::len) as f64
+                acc.distinct_set.as_ref().map_or(0, DistinctSet::len) as f64
             )]
         }
         StatsAggPlan::Last => {
@@ -1896,7 +1984,7 @@ fn insert_distinct_domain(
     n: usize,
     masks: &[BooleanArray],
     wi: Option<usize>,
-    set: &mut EngineHashSet<DistinctKey>,
+    set: &mut DistinctSet,
 ) -> bool {
     let Some(idx) = batch
         .schema()
