@@ -1604,6 +1604,8 @@ fn q18_close_batch(n: usize) -> RecordBatch {
 /// q18 每键独立 hash（链均长 1.0）时，每链容量必须精确 1（不能退回
 /// `or_default()` 的 capacity=4，否则 2935 万链 × 144B ≈ 4.2G 浪费）。
 /// 用 CountingAlloc 实测状态持有 vs 期望上界（宽松断言防平台差异）。
+/// ⚠ 测量必须在 `exclusive()` 段内建桶 + `current_growth()`（相对基线），
+/// 不能用 `current()`（进程全局累计含其他测试残留，并行跑会虚高）。
 #[test]
 fn q18_state_chain_capacity_bounded() {
     const N: usize = 200_000;
@@ -1613,13 +1615,29 @@ fn q18_state_chain_capacity_bounded() {
             .map(|s| s.to_string())
             .collect(),
     );
-    let mut exec = StatsExecutor::with_row_fields(q18_close_stats_plan(), Some(row_fields));
     let batch = q18_close_batch(N);
-    assert!(exec.process_batch(&batch), "列式前置应满足");
+
+    // 状态持有（CountingAlloc 相对基线增量）：exclusive 段内建桶。
+    let (n_chains, per_bucket) = {
+        let probe = crate::memory_probe::MemoryProbe::exclusive();
+        let mut exec = StatsExecutor::with_row_fields(q18_close_stats_plan(), Some(row_fields));
+        assert!(exec.process_batch(&batch), "列式前置应满足");
+        let n_chains = exec.window.buckets.len();
+        let growth = probe.current_growth();
+        (
+            n_chains,
+            growth as f64 / n_chains.max(1) as f64,
+        )
+    };
 
     // 链容量断言：每条链 capacity == 1（无碰撞时，每链 1 桶）。
     // q18 键域 auction 200 万 + bidder 1010 → N=20 万行几乎无碰撞。
-    let max_cap = exec
+    // 需在 exclusive 段外重新建桶（段内 exec 已 drop）——或直接断言上面
+    // 已建桶的形态：N=20 万 → 每链 1 桶，容量必为 1。重建一次独立验证。
+    let mut exec2 = StatsExecutor::with_row_fields(q18_close_stats_plan(), None);
+    let batch2 = q18_close_batch(N);
+    assert!(exec2.process_batch(&batch2), "列式前置应满足");
+    let max_cap = exec2
         .window
         .buckets
         .values()
@@ -1630,21 +1648,13 @@ fn q18_state_chain_capacity_bounded() {
         max_cap <= 2,
         "链 Vec 容量应精确 1（或碰撞链 2），实测 max_capacity={max_cap}——若退回 or_default() 会到 4"
     );
-    let n_chains = exec.window.buckets.len();
-    assert!(n_chains > N / 2, "N=20 万应几乎每行一键，实际 {n_chains}");
 
-    // 状态持有上界（CountingAlloc 实测）：每桶 ≤ 800B（633B 实测 + 余量）。
-    // 若退回 or_default()（capacity 4），每桶 ~777B 仍在此界内——本断言主要
-    // 防「未来把状态改成意外的大结构」导致回归无感知。
-    let per_bucket = {
-        let probe = crate::memory_probe::MemoryProbe::exclusive();
-        let _ = probe.peak_growth();
-        let current = probe.current();
-        current as f64 / n_chains.max(1) as f64
-    };
+    // 状态持有上界：每桶 ≤ 1000B（633B 实测 + 余量；CountingAlloc 口径
+    // 含 HashMap 容器 + 分配器元数据）。
+    assert!(n_chains > N / 2, "N=20 万应几乎每行一键，实际 {n_chains}");
     assert!(
         per_bucket < 1000.0,
-        "每桶状态持有应 < 1000B，实测 {per_bucket:.0}B/桶"
+        "每桶状态持有应 < 1000B，实测 {per_bucket:.0}B/桶（n_chains={n_chains}）"
     );
 }
 
