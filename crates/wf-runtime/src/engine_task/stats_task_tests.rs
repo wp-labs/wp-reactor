@@ -174,6 +174,7 @@ fn ranked_task_config(
         shard_count: 1,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     }
 }
 
@@ -427,6 +428,7 @@ fn make_q15_task() -> (StatsTask, mpsc::Receiver<crate::alert_task::AlertBatch>)
         shard_count: 1,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx)
@@ -578,6 +580,7 @@ async fn q15_input_shard_merge_emits_single_equivalent() {
             shard_count: 2,
             merge_rx,
             merge_tx,
+            mask_cache: None,
         };
         let (task, _cancel) = StatsTask::new(config);
         task
@@ -650,6 +653,7 @@ fn make_stats_shard_task(
         shard_count: 2,
         merge_rx,
         merge_tx,
+        mask_cache: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     task
@@ -941,6 +945,7 @@ fn make_stats_task() -> (
         shard_count: 1,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx, progress)
@@ -1136,6 +1141,7 @@ fn make_stats_task_with_plan(
         shard_count: 1,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx, progress)
@@ -1290,6 +1296,7 @@ fn make_q12_task_sharded(
         shard_count,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx)
@@ -2123,4 +2130,75 @@ async fn stats_task_columnar_close_chunked_matches_full() {
     keyed_c.sort();
     keyed_f.sort();
     assert_eq!(keyed_c, keyed_f, "分块与全量输出内容一致（无序比较）");
+}
+
+/// 单段快路径（2026-08-27 q17 优化 B）: 窗口已建 + 批内 max_time < window_end
+/// → 整批单段直接归并（跳过逐行段扫 + domain 构造）。组合共享缓存（优化 A:
+/// batch_max_time 分片共享）——结果语义与逐行段扫完全一致。
+#[tokio::test]
+async fn stats_push_single_segment_fast_path_with_shared_cache() {
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (mut task, mut alert_rx, _progress) = make_stats_task();
+    // 注入分片共享缓存（A + B 组合: max_time 缓存 + 单段快路径）
+    task.mask_cache =
+        Some(std::sync::Arc::new(wf_engine::match_engine::StatsMaskCache::new()));
+
+    // b1: 2 行 ts=5s → 首窗开窗 [0,10s)（window_end=None 分支, 快路径不触发——
+    // 开窗逻辑路径）
+    let b1 = make_batch(&["10.0.0.1", "10.0.0.1"], 5_000_000_000);
+    push_batch(&mut task, b1, 1).await;
+    // b2: 3 行 ts ∈ {6s, 6.5s, 7s} → max=7s < window_end 10s → 单段快路径触发
+    // （跳过逐行段扫）; max_time 走共享缓存（compute 一次, 第二次命中）
+    let b2 = make_ts_batch(&[
+        ("10.0.0.1", 6_000_000_000),
+        ("10.0.0.2", 6_500_000_000),
+        ("10.0.0.2", 7_000_000_000),
+    ]);
+    push_batch(&mut task, b2, 2).await;
+    assert!(alert_rx.try_recv().is_err(), "仍在窗口 [0,10s) 内不 close");
+
+    task.flush().await;
+    let alert = take_alert(&mut alert_rx);
+    assert_eq!(
+        field_str(&alert, "detail"),
+        "5 3 2",
+        "total=5（2+3）, r1=3, uniq=2——快路径归并正确"
+    );
+}
+
+/// 快路径不误伤多段窗口: 批跨窗口边界（max_time >= window_end）时快路径不触发,
+/// 走逐行段扫——跨窗数据正确归属（对照 stats_push_closes_window 的跨窗语义）。
+#[tokio::test]
+async fn stats_push_fast_path_skips_when_batch_crosses_window() {
+    let _g = crate::perf_diag::PERF_CUT_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (mut task, mut alert_rx, _progress) = make_stats_task();
+    task.mask_cache =
+        Some(std::sync::Arc::new(wf_engine::match_engine::StatsMaskCache::new()));
+
+    // b1: 2 行 ts=5s → 窗口 [0,10s)
+    let b1 = make_batch(&["10.0.0.1", "10.0.0.1"], 5_000_000_000);
+    push_batch(&mut task, b1, 1).await;
+    // b2: 3 行 ts ∈ {9.9s, 10.1s, 10.2s} → max=10.2s >= 10s → 快路径不触发,
+    // 逐行段扫: 9.9s 行归窗口 1, 10.1/10.2s 行触发 close 归窗口 2
+    let b2 = make_ts_batch(&[
+        ("10.0.0.1", 9_900_000_000),
+        ("10.0.0.2", 10_100_000_000),
+        ("10.0.0.3", 10_200_000_000),
+    ]);
+    push_batch(&mut task, b2, 2).await;
+    // 窗口 1 close: total=3（2+1）, r1=3, uniq=1
+    let alert = take_alert(&mut alert_rx);
+    assert_eq!(field_str(&alert, "detail"), "3 3 1", "窗口 1: 含 9.9s 行");
+
+    task.flush().await;
+    let alert2 = take_alert(&mut alert_rx);
+    assert_eq!(
+        field_str(&alert2, "detail"),
+        "2 0 2",
+        "窗口 2: 10.1/10.2s 两行（r1=0 非 10.0.0.1, uniq=2）"
+    );
 }

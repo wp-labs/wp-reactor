@@ -457,6 +457,7 @@ pub(super) fn spawn_rule_tasks(
     pipe_registry: std::sync::Arc<wf_engine::pipe::PipeRegistry>,
     sink_fanout: Arc<alert_task::SinkFanout>,
     cancel: CancellationToken,
+    root_cancel: CancellationToken,
     metrics: Option<Arc<RuntimeMetrics>>,
     eos_tx: watch::Sender<u64>,
     shard_count: usize,
@@ -626,6 +627,11 @@ pub(super) fn spawn_rule_tasks(
                         );
                     }
                     let mut shard_txs = Vec::with_capacity(shard_count);
+                    // 分片共享批级 where mask 缓存（2026-08-27 q17）: 同批被 S
+                    // 片各整批 eval 3 个 where mask（向量化）——首片算其余 Arc 命中,
+                    // 消除 S× 重复（q17 10 片: mask 占 rules CPU ~85%）。
+                    let mask_cache =
+                        std::sync::Arc::new(wf_engine::match_engine::StatsMaskCache::new());
                     for shard_idx in 0..shard_count {
                         let push_rx = if use_push {
                             let (push_tx, push_rx) =
@@ -675,10 +681,12 @@ pub(super) fn spawn_rule_tasks(
                             shard_count,
                             merge_rx: None,
                             merge_tx: None,
+                            mask_cache: Some(Arc::clone(&mask_cache)),
                         };
-                        group.push(tokio::spawn(
-                            async move { run_stats_task(task_config).await },
-                        ));
+                        let rc = root_cancel.clone();
+                        group.push(tokio::spawn(async move {
+                            run_stats_task(task_config, rc).await
+                        }));
                     }
                     if use_push {
                         for source in &window_sources {
@@ -699,6 +707,9 @@ pub(super) fn spawn_rule_tasks(
                     let (merge_tx, merge_rx) =
                         mpsc::channel::<crate::engine_task::StatsPartial>(shard_count.max(8));
                     let mut merge_rx_opt = Some(merge_rx);
+                    // 输入分区分片共享 mask 缓存（2026-08-27 q17, 同 shardable）。
+                    let mask_cache =
+                        std::sync::Arc::new(wf_engine::match_engine::StatsMaskCache::new());
                     for shard_idx in 0..shard_count {
                         let push_rx = None;
                         let progress = register_row_partitioned_progress(router, &window_sources);
@@ -747,10 +758,12 @@ pub(super) fn spawn_rule_tasks(
                             } else {
                                 Some(merge_tx.clone())
                             },
+                            mask_cache: Some(Arc::clone(&mask_cache)),
                         };
-                        group.push(tokio::spawn(
-                            async move { run_stats_task(task_config).await },
-                        ));
+                        let rc = root_cancel.clone();
+                        group.push(tokio::spawn(async move {
+                            run_stats_task(task_config, rc).await
+                        }));
                     }
                 } else {
                     let push_rx = if use_push {
@@ -784,10 +797,12 @@ pub(super) fn spawn_rule_tasks(
                         shard_count: 1,
                         merge_rx: None,
                         merge_tx: None,
+                        mask_cache: None, // 未分片: 无跨片重复, 不缓存
                     };
-                    group.push(tokio::spawn(
-                        async move { run_stats_task(task_config).await },
-                    ));
+                    let rc = root_cancel.clone();
+                    group.push(tokio::spawn(async move {
+                        run_stats_task(task_config, rc).await
+                    }));
                 }
             }
             RunRuleKind::Each { alias, time_field } => {
@@ -893,8 +908,9 @@ pub(super) fn spawn_rule_tasks(
                             progress: progress.clone(),
                             conv_sink: None,
                         };
+                        let rc = root_cancel.clone();
                         group.push(tokio::spawn(
-                            async move { run_rule_task(task_config).await },
+                            async move { run_rule_task(task_config, rc).await },
                         ));
                     }
                     if wants_push {
@@ -957,8 +973,9 @@ pub(super) fn spawn_rule_tasks(
                         progress: progress.clone(),
                         conv_sink: None,
                     };
+                    let rc = root_cancel.clone();
                     group.push(tokio::spawn(
-                        async move { run_rule_task(task_config).await },
+                        async move { run_rule_task(task_config, rc).await },
                     ));
                 }
             }
@@ -1093,8 +1110,9 @@ pub(super) fn spawn_rule_tasks(
                             progress: progress.clone(),
                             conv_sink,
                         };
+                        let rc = root_cancel.clone();
                         group.push(tokio::spawn(
-                            async move { run_rule_task(task_config).await },
+                            async move { run_rule_task(task_config, rc).await },
                         ));
                     }
                     if use_push {
@@ -1141,8 +1159,9 @@ pub(super) fn spawn_rule_tasks(
                         progress: progress.clone(),
                         conv_sink: None,
                     };
+                    let rc = root_cancel.clone();
                     group.push(tokio::spawn(
-                        async move { run_rule_task(task_config).await },
+                        async move { run_rule_task(task_config, rc).await },
                     ));
                 }
             }

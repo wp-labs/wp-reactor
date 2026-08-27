@@ -138,6 +138,7 @@ fn make_config(
         shard_count: 1,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     };
     let cancel = config.cancel.clone();
     (config, cancel)
@@ -231,7 +232,7 @@ async fn run_stats_task_push_loop_exits_on_cancel() {
     let (tx, rx) = mpsc::channel::<RulePush>(8);
     let (eos_tx, _) = watch::channel(0u64);
     let (config, cancel) = make_config(vec![], Some(rx), &eos_tx, HashSet::new());
-    let run = tokio::spawn(run_stats_task(config));
+    let run = tokio::spawn(run_stats_task(config, CancellationToken::new()));
 
     tx.send(RulePush {
         window_name: Arc::from("bid_events"),
@@ -255,7 +256,7 @@ async fn run_stats_task_push_loop_eos_flush_keeps_running() {
     let (tx, rx) = mpsc::channel::<RulePush>(8);
     let (eos_tx, _) = watch::channel(0u64);
     let (config, cancel) = make_config(vec![], Some(rx), &eos_tx, HashSet::new());
-    let run = tokio::spawn(run_stats_task(config));
+    let run = tokio::spawn(run_stats_task(config, CancellationToken::new()));
 
     // EOS → flush 尾部窗口后继续运行（不退出）。
     eos_tx.send(1).expect("eos");
@@ -282,7 +283,7 @@ async fn run_stats_task_push_loop_channel_close_exits() {
     let (tx, rx) = mpsc::channel::<RulePush>(8);
     let (eos_tx, _) = watch::channel(0u64);
     let (config, _cancel) = make_config(vec![], Some(rx), &eos_tx, HashSet::new());
-    let run = tokio::spawn(run_stats_task(config));
+    let run = tokio::spawn(run_stats_task(config, CancellationToken::new()));
 
     drop(tx); // 所有生产者退出 → 通道关闭 → drain + flush + 退出
     run.await
@@ -294,7 +295,7 @@ async fn run_stats_task_push_loop_channel_close_exits() {
 async fn run_stats_task_pull_loop_exits_on_cancel() {
     let (eos_tx, _) = watch::channel(0u64);
     let (config, cancel) = make_config(vec![], None, &eos_tx, HashSet::new());
-    let run = tokio::spawn(run_stats_task(config));
+    let run = tokio::spawn(run_stats_task(config, CancellationToken::new()));
     cancel.cancel();
     run.await
         .expect("task panicked")
@@ -312,11 +313,43 @@ async fn run_stats_task_pull_loop_with_window_exits_on_cancel() {
     }];
     let (eos_tx, _) = watch::channel(0u64);
     let (config, cancel) = make_config(sources, None, &eos_tx, HashSet::new());
-    let run = tokio::spawn(run_stats_task(config));
+    let run = tokio::spawn(run_stats_task(config, CancellationToken::new()));
     cancel.cancel();
     run.await
         .expect("task panicked")
         .expect("pull loop with window exits cleanly on cancel");
+}
+
+#[tokio::test]
+async fn stats_shutdown_drain_blocks_until_actor_drained_and_pulls_tail() {
+    // 同 rule task 的关停竞态：stats 任务的最终 flush 必须等 window actor
+    // 排空（否则尾部窗口漏收口）。
+    let (win, notify) = make_window();
+    win.set_actor_drained(false);
+    let sources = vec![WindowSource {
+        window_name: "bid_events".into(),
+        window: Arc::clone(&win),
+        notify,
+        aliases: vec!["b".into()],
+    }];
+    let (eos_tx, _) = watch::channel(0u64);
+    let (config, _cancel) = make_config(sources, None, &eos_tx, HashSet::new());
+    let (mut task, _cancel) = super::StatsTask::new(config);
+    // 尾部批次已提交到窗口但尚未被拉取（actor 排空前）。
+    win.append(window_batch(&[1_000_000_000, 2_000_000_000]))
+        .unwrap();
+
+    let mut drain = Box::pin(task.wait_shutdown_drain());
+    tokio::select! {
+        _ = &mut drain => panic!("stats drain must block while the actor is still draining"),
+        _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+    }
+    win.set_actor_drained(true);
+    drain.await;
+    assert!(
+        task.cursors.get("bid_events").copied().unwrap_or(0) > 0,
+        "tail must be pulled before the drain returns"
+    );
 }
 
 // ---------------------------------------------------------------------------

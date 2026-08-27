@@ -423,6 +423,7 @@ impl Reactor {
             pipe_registry,
             sink_fanout.clone(),
             rule_cancel.clone(),
+            cancel.clone(),
             metrics.clone(),
             eos_tx.clone(),
             config.runtime.rule_parallelism,
@@ -794,11 +795,17 @@ fn watch_receiver_group(
     tokio::spawn(async move {
         wf_debug!(sys, task_group = name, "watching task group");
         let result = receiver_group.wait(cancel.clone()).await;
-        if result.is_ok() {
+        if result.is_ok() && !auto_shutdown {
             // EOS-driven finalization: input sources reported the stream ended.
             // Rules flush their trailing instances but keep running (a daemon
             // can accept a subsequent finite input). The counter increments per
             // EOS so multiple finite inputs each trigger a flush.
+            //
+            // Batch mode skips the EOS signal: the automatic shutdown below
+            // (same function, immediately after) already drains the rule tasks
+            // and flushes — a premature EOS flush would race the window
+            // actors' tail commit and emit close:flush alerts at a stale
+            // machine watermark (e2e_datagen_brute_force CI flake).
             wf_info!(
                 sys,
                 task_group = name,

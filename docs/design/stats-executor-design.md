@@ -454,6 +454,17 @@ pub struct StatsWindowState {
 > 金额/计数字段（NEXMark `price` 为整数分）一律整数累加，不用 f64，避免
 > `>2^53` 丢精度（与 fanout.rs:1103 记载的分歧敏感度一致）。
 
+> **SoA 桶（2026-08-27 q17）**：纯数值计划（全 count/sum/avg/min/max 度量）
+> 的桶累加器改用平行数组 [`NumericSoA`]（counts/sums/mins/maxs 按类型紧凑存
+> 储，128B/桶 vs Classic 320B+）——热路径免 `StatsAccum` 枚举分派 + `Box` 解
+> 引用，且**同字段度量共享 1 次列值读取**（q17 的 sum/avg/min/max 4 度量同读
+> `price` 列，旧路径各自 `column_i128_at` 读 4 次）。对照 bench（`stats_soa_bench`）
+> 实测累积循环 38.8 → 15.6 ns/事件（−59.7%）；q17 30m 端到端 rules 核·s
+> 18.0 → 17.3（−3.9%，累积循环仅占每事件 0.58µs·核 的一部分，主墙在 180 万
+> 桶的哈希查找 cache miss）。含 distinct/last/top 的计划仍走 Classic。桶载体
+> 为 [`StatsBucketAccs`]（Numeric/Classic 双形态，分派在累积/读取/合并入口
+> 各一次）。
+
 ### 6.2 批处理流程（每 RecordBatch 8192 行）
 
 **分两段：列式段（整列归并）+ 行式段（distinct/last/top 逐行）**

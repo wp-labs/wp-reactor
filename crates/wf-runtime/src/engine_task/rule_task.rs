@@ -79,6 +79,13 @@ type PipeFlushBatch = (Arc<str>, Option<Arc<Vec<Arc<Event>>>>, RecordBatch);
 const EMIT_METRIC_SAMPLE_INTERVAL: u32 = 64;
 /// Flush size for the batched alert sink delivery (amortizes per-alert fan-out).
 const ALERT_BATCH_SIZE: usize = 4096;
+/// Full-shutdown drain: how long a rule task waits for its source windows'
+/// actors to commit their queued tail before flushing anyway (safety net —
+/// normally the drain completes in milliseconds). See
+/// [`RuleTask::wait_shutdown_drain`].
+pub(super) const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Full-shutdown drain poll interval while waiting for the actors.
+pub(super) const SHUTDOWN_DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Deferred-materialization row source for one batch (L2): the event time of
 /// every row (for the watermark/expiry scan) plus the bind-filter hit rows in
@@ -93,6 +100,43 @@ struct DeferredRows<'a> {
     /// `to_event()` materializes only these fields on emit, matching the eager
     /// deferred path's projected trigger event.
     projection: Option<Arc<HashSet<String>>>,
+}
+
+/// 批处理行域（P 批级临时 Vec 消减，2026-08-26，q5 采样归因）：原先每批构建
+/// `Vec<usize>`——分片批 = `shard_rows` 的 u32→usize 转换（q5 10k 行/批 × 300 批
+/// × 10 shard ≈ 240MB 分配+转换 churn），未分片 = 恒等 `(0..n)` 纯浪费。改为
+/// 借用枚举 + `row_at(i)` 索引（O(1)，语义同原 `row_domain[i]`）；仅 key_join
+/// 规则（q4/q6 形状）需要绝对行号切片时 `to_vec()` 物化。
+enum RowDomain<'a> {
+    /// 分片：本 shard 的行子集（绝对批行号，由 parse 阶段预计算）。
+    Sharded(&'a [u32]),
+    /// 未分片：全批恒等行域。
+    Full(usize),
+}
+
+impl<'a> RowDomain<'a> {
+    fn len(&self) -> usize {
+        match self {
+            RowDomain::Sharded(rows) => rows.len(),
+            RowDomain::Full(n) => *n,
+        }
+    }
+
+    /// 域内序号 i 对应的绝对批行号（与旧 `row_domain[i]` 一致）。
+    fn row_at(&self, i: usize) -> usize {
+        match self {
+            RowDomain::Sharded(rows) => rows[i] as usize,
+            RowDomain::Full(_) => i,
+        }
+    }
+
+    /// key_join 预解析需要绝对行号切片（q4/q6 形状；q5 无 key_join 不触达）。
+    fn to_vec(&self) -> Vec<usize> {
+        match self {
+            RowDomain::Sharded(rows) => rows.iter().map(|&r| r as usize).collect(),
+            RowDomain::Full(n) => (0..*n).collect(),
+        }
+    }
 }
 
 /// A per-row field source for the state-machine loop: either the eager
@@ -879,9 +923,9 @@ impl RuleTask {
         let num_rows = events
             .map(|e| e.len())
             .unwrap_or_else(|| batch.map(|b| b.num_rows()).unwrap_or(0));
-        let row_domain: Vec<usize> = match shard_rows {
-            Some(rows) => rows.iter().map(|&r| r as usize).collect(),
-            None => (0..num_rows).collect(),
+        let row_domain = match shard_rows {
+            Some(rows) => RowDomain::Sharded(rows),
+            None => RowDomain::Full(num_rows),
         };
 
         let deferred: Option<DeferredRows> = if defer_materialize {
@@ -899,11 +943,18 @@ impl RuleTask {
             // batch. Absolute batch rows are recovered from `row_domain` at the
             // point they are needed (materialization, hit matching below).
             let time_col_index = batch_time_col_index(batch, time_field);
-            let mut times = vec![0; row_domain.len()];
+            // 事件时间列存在时逐行 push（免 `vec![0; n]` 零填 + 覆盖的双写）。
+            let mut times = Vec::with_capacity(row_domain.len());
             if let Some(col_idx) = time_col_index {
-                for (i, &row) in row_domain.iter().enumerate() {
-                    times[i] = batch_event_time_nanos_at(batch, col_idx, row);
+                for i in 0..row_domain.len() {
+                    times.push(batch_event_time_nanos_at(
+                        batch,
+                        col_idx,
+                        row_domain.row_at(i),
+                    ));
                 }
+            } else {
+                times.resize(row_domain.len(), 0);
             }
             // Hit = any alias's columnar bind filter accepts this row. The
             // window-level defer flag guarantees every alias here is columnar;
@@ -912,8 +963,8 @@ impl RuleTask {
             for alias in aliases.iter() {
                 match columnar_masks.get(alias) {
                     Some(Some(mask)) => {
-                        for (i, &row) in row_domain.iter().enumerate() {
-                            hit[i] |= mask.value(row);
+                        for (i, h) in hit.iter_mut().enumerate() {
+                            *h |= mask.value(row_domain.row_at(i));
                         }
                     }
                     _ => {
@@ -1149,15 +1200,19 @@ impl RuleTask {
             .and_then(|m| m.plan().key_join.clone());
         let key_overrides: Option<Vec<Option<Vec<wf_engine::match_engine::Value>>>> =
             match (&key_join_plan, batch) {
-                (Some(kjp), Some(b)) => {
-                    Some(precompute_join_then_keys(b, &row_domain, kjp, &lookup))
-                }
+                (Some(kjp), Some(b)) => Some(precompute_join_then_keys(
+                    b,
+                    &row_domain.to_vec(),
+                    kjp,
+                    &lookup,
+                )),
                 _ => None,
             };
         // Iterate the row domain: `i` is the position within `row_domain`
         // (matches the row-domain-relative `DeferredRows` times/hit_indices),
         // `row_index` is the absolute batch row it maps to.
-        for (i, &row_index) in row_domain.iter().enumerate() {
+        for i in 0..row_domain.len() {
+            let row_index = row_domain.row_at(i);
             let event: Option<&Arc<Event>> = match (&deferred, &eager_events) {
                 // Deferred hit rows are served as ColumnarEvent views inside the
                 // machine branch — no materialized hit events here.
@@ -1936,6 +1991,44 @@ impl RuleTask {
             if delta != 0 {
                 metrics.adjust_rule_instances(rule_name, delta);
             }
+        }
+    }
+
+    /// Whether every source window's actor has finished its shutdown drain.
+    /// A window without an actor (embedded direct-append / provider) reports
+    /// drained by default, so the wait below never stalls on it.
+    fn sources_drained(&self) -> bool {
+        self.sources.iter().all(|s| s.window.actor_drained())
+    }
+
+    /// Full-shutdown drain: keep pulling until every source window's actor has
+    /// committed its queued tail, so the final flush runs against a complete
+    /// machine.
+    ///
+    /// Without this, a rule task can flush — and exit — while the window
+    /// actors are still committing their mailbox tail: the flush closes
+    /// instances at a stale machine watermark (close:flush alerts with a stale
+    /// `fired_at` and tail-triggered alerts lost entirely). That is the
+    /// `e2e_datagen_brute_force` CI flake (loaded macos-14 runners: the actor
+    /// lags at EOF, the rule task's cancel branch drained an empty channel and
+    /// flushed before the actor committed). The poll bound is a safety net for
+    /// a stuck actor; normally the drain completes in milliseconds.
+    pub(super) async fn wait_shutdown_drain(&mut self) {
+        let deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+        loop {
+            self.pull_and_advance().await;
+            if self.sources_drained() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                wf_warn!(
+                    pipe,
+                    task_id = %self.task_id,
+                    "shutdown drain timeout — window actor(s) did not report drained; flushing with possibly-stale machine"
+                );
+                break;
+            }
+            tokio::time::sleep(SHUTDOWN_DRAIN_POLL).await;
         }
     }
 
@@ -5034,6 +5127,62 @@ mod retention_pin_tests {
         let rt = runtime(&pin);
         rt.release_retention_floor();
         assert_eq!(pin.load(Ordering::Acquire), i64::MAX);
+    }
+}
+
+/// RowDomain（P 批级行域消减）契约：Sharded 与 Full 对同一逻辑行域产出相同的
+/// (域内序号, 绝对批行号) 序列；`to_vec` 与旧 `Vec<usize>` 行域逐位一致。
+#[cfg(test)]
+mod row_domain_tests {
+    use super::*;
+
+    #[test]
+    fn sharded_and_full_agree_on_iteration() {
+        // 同一逻辑行域：Sharded(绝对行号) 与 Full(n)（恒等）语义等价。
+        let rows: [u32; 4] = [2, 5, 7, 9];
+        let sharded = RowDomain::Sharded(&rows);
+        let full = RowDomain::Full(10);
+
+        // 只验证 Sharded 的 len 与其切片一致；Full 的 len 是独立输入。
+        assert_eq!(sharded.len(), 4);
+        assert_eq!(full.len(), 10);
+
+        // Sharded: (i, rows[i])。
+        for (i, &r) in rows.iter().enumerate() {
+            assert_eq!(sharded.row_at(i), r as usize);
+        }
+        // Full: (i, i)。
+        for i in 0..full.len() {
+            assert_eq!(full.row_at(i), i);
+        }
+        // 与旧 `(0..n)` 恒等行域逐位一致。
+        let legacy_full: Vec<usize> = (0..10).collect();
+        assert_eq!(full.to_vec(), legacy_full);
+    }
+
+    #[test]
+    fn to_vec_matches_legacy_row_domain() {
+        // to_vec 与旧 `Vec<usize>` 行域（分片转换 / 恒等）逐位一致。
+        let rows: [u32; 3] = [0, 4, 8];
+        let sharded = RowDomain::Sharded(&rows);
+        let legacy: Vec<usize> = rows.iter().map(|&r| r as usize).collect();
+        assert_eq!(sharded.to_vec(), legacy);
+
+        let full = RowDomain::Full(5);
+        assert_eq!(full.to_vec(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn empty_domains_are_coherent() {
+        // 空分片 / 空批：len 0，row_at 不可达（迭代 0 次）。
+        let empty_slice: [u32; 0] = [];
+        let sharded = RowDomain::Sharded(&empty_slice);
+        assert_eq!(sharded.len(), 0);
+        assert!(sharded.to_vec().is_empty());
+
+        let full = RowDomain::Full(0);
+        assert_eq!(full.len(), 0);
+        assert!(full.to_vec().is_empty());
     }
 }
 

@@ -23,8 +23,8 @@ pub use event_bridge::{
 };
 pub use executor::{
     DeferredPending, DistinctKey, DistinctSet, EachDirectBatchStats, PipeEachRow, PipeRowSink,
-    RowFieldLayout, RowFields, RuleExecutor, RuleExecutorOptions, StatsAccum, StatsExecutor,
-    StatsWindowState,
+    RowFieldLayout, RowFields, RuleExecutor, RuleExecutorOptions, StatsAccum, StatsBucketAccs,
+    StatsExecutor, StatsMaskCache, StatsWindowState,
 };
 pub use match_engine::apply_conv;
 pub use match_engine::close_is_qualified;

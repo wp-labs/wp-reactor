@@ -107,25 +107,38 @@ fn extract(row: &HashMap<String, Value>, name: &str) -> Option<Value> {
     row.get(name).cloned()
 }
 
-/// count 单度量桶预算（StatsWindowState::bucket_allowance 口径: (256 + 80) ×
-/// 2.2 校准系数——2026-08-27 q18 实测估算低估 2.2x, 与 bucket_allowance 同步）。
-const COUNT_ALLOWANCE: u64 = 739;
+/// 计划的实际桶预算（`bucket_allowance` 口径）——2026-08-27 远程 SoA 重构后
+/// count 单度量走 Numeric 载体（264B）, 含 last/top 走 Classic（2.2 校准后
+/// 739B）, 单一常量失效。预算语义是「桶数」, 用 allowance 换算。
+fn allowance_for(plan: &StatsPlan) -> u64 {
+    let soa = plan.measures.iter().all(|m| {
+        matches!(
+            m.agg,
+            StatsAggPlan::Count
+                | StatsAggPlan::Sum
+                | StatsAggPlan::Avg
+                | StatsAggPlan::Min
+                | StatsAggPlan::Max
+        )
+    });
+    crate::match_engine::executor::stats_exec::StatsWindowState::bucket_allowance(plan, soa)
+}
 
 /// 开启 spill 的 executor（row 路径）：
 /// `budget_buckets` = 内存可驻留桶数上限；`store` = 存储实现；
 /// `subset` = 行字段子集（None = 无 last/top 度量，`StatsExecutor::new`）。
 fn exec_with_spill(
-    plan: StatsPlan,
+    plan: &StatsPlan,
     budget_buckets: usize,
     subset: Option<Arc<HashSet<String>>>,
     store: Option<Box<dyn crate::match_engine::spill::SpillStore + Send + Sync>>,
     max_spill_bytes: Option<usize>,
 ) -> StatsExecutor {
     let mut exec = match subset {
-        Some(s) => StatsExecutor::with_row_fields(plan, Some(s)),
-        None => StatsExecutor::new(plan),
+        Some(s) => StatsExecutor::with_row_fields(plan.clone(), Some(s)),
+        None => StatsExecutor::new(plan.clone()),
     };
-    let budget = COUNT_ALLOWANCE as usize * budget_buckets;
+    let budget = allowance_for(plan) as usize * budget_buckets;
     exec.set_memory_limit("spill_test", Some(budget));
     exec.set_spill(store, max_spill_bytes, None);
     exec
@@ -147,7 +160,7 @@ fn spill_evicts_over_budget_and_reads_back() {
         vec![count_measure("n"), sum_measure("total", "price")],
     );
     // count+sum 桶预算 = 256+80+80 = 416; 预算 4 桶 → limit 1344（内存驻留 3 桶）
-    let mut exec = exec_with_spill(plan, 4, None, Some(Box::new(MemSpillStore::new())), None);
+    let mut exec = exec_with_spill(&plan, 4, None, Some(Box::new(MemSpillStore::new())), None);
 
     // 10 个键各 2 行（键 1..=10 创建后都再命中一次——第二次命中已 spill 的键走读回）
     for k in 1..=10 {
@@ -165,7 +178,7 @@ fn spill_evicts_over_budget_and_reads_back() {
     );
     // 内存有界: 估算 ≤ 预算上限（读回也驱逐，严格有界）
     let est = exec.window.estimated_bytes();
-    let limit = COUNT_ALLOWANCE * 4;
+    let limit = allowance_for(&plan) * 4;
     assert!(est <= limit, "内存估算应 ≤ 预算上限 {limit}: {est}");
     // 总数守恒: 内存桶 + spill 键 = 全部 10 键（不相交不变量）
     let in_memory = exec.window.buckets.values().map(Vec::len).sum::<usize>();
@@ -245,7 +258,7 @@ fn spill_output_matches_no_spill() {
 
     // B: spill（预算 4 桶, Mem store, 与 A 同行字段子集——布局一致才对拍）
     let mut b = exec_with_spill(
-        plan,
+        &plan,
         4,
         Some(subset.clone()),
         Some(Box::new(MemSpillStore::new())),
@@ -298,9 +311,9 @@ fn spill_output_matches_no_spill() {
 fn spill_budget_ladder_falls_back_to_reject() {
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
     // 落盘上限只够 2 键（预算 2 桶）——第 3 个键起 spill 满 → 拒收
-    let max_spill = COUNT_ALLOWANCE as usize * 2;
+    let max_spill = allowance_for(&plan) as usize * 2;
     let mut exec = exec_with_spill(
-        plan,
+        &plan,
         2,
         None,
         Some(Box::new(MemSpillStore::new())),
@@ -355,7 +368,7 @@ fn spill_redb_full_pipeline_and_file_lifecycle() {
     };
     let store = RedbSpillStore::create(&path, layout).expect("create redb store");
 
-    let mut exec = exec_with_spill(plan, 2, Some(subset.clone()), Some(Box::new(store)), None);
+    let mut exec = exec_with_spill(&plan, 2, Some(subset.clone()), Some(Box::new(store)), None);
     for k in 1..=8 {
         exec.process_rows(&[bid_row(k, k as f64 * 10.0)], extract);
     }
@@ -385,7 +398,7 @@ fn spill_redb_full_pipeline_and_file_lifecycle() {
 #[test]
 fn spill_estimated_bytes_bounded_by_budget() {
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
-    let mut exec = exec_with_spill(plan, 5, None, Some(Box::new(MemSpillStore::new())), None);
+    let mut exec = exec_with_spill(&plan, 5, None, Some(Box::new(MemSpillStore::new())), None);
     // 大量键（每次 process_rows 批末 refresh 重新核算——与增量账本对账）
     for batch in 0..50 {
         let rows: Vec<HashMap<String, Value>> = (1..=100)
@@ -394,7 +407,7 @@ fn spill_estimated_bytes_bounded_by_budget() {
         exec.process_rows(&rows, extract);
         let est = exec.window.estimated_bytes();
         assert!(
-            est <= COUNT_ALLOWANCE * 5 + COUNT_ALLOWANCE,
+            est <= allowance_for(&plan) * 5 + allowance_for(&plan),
             "批 {batch} 后内存估算有界: {est}"
         );
     }
@@ -413,7 +426,7 @@ fn spill_touch_counter_protects_recently_hit_key() {
     // 预算 2 桶（limit 672, 驱逐目标 336）: 键 1 创建后回访一次（touch=3）——
     // 应存活 3 轮驱逐扫描（每轮 -1），未回访键立即被驱逐。
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
-    let mut exec = exec_with_spill(plan, 2, None, Some(Box::new(MemSpillStore::new())), None);
+    let mut exec = exec_with_spill(&plan, 2, None, Some(Box::new(MemSpillStore::new())), None);
     exec.process_rows(&[bid_row(1, 1.0)], extract);
     exec.process_rows(&[bid_row(1, 2.0)], extract); // 回访 → touch=TOUCH_MAX
     for k in 2..=5 {
@@ -469,9 +482,10 @@ fn spill_redb_deferred_create_via_executor() {
         p
     };
 
-    let mut exec = StatsExecutor::with_row_fields(plan, Some(subset));
-    // last 度量每桶 allowance ≈ 845（含行字段共享）——3 键 2535 ≤ 预算 2956 不驱逐
-    exec.set_memory_limit("spill_test", Some(COUNT_ALLOWANCE as usize * 4));
+    let mut exec = StatsExecutor::with_row_fields(plan.clone(), Some(subset));
+    // last 度量每桶 allowance ≈ 845（含行字段共享 2.2 校准）——预算 3 桶:
+    // 3 键 2535 = 预算恰好不驱逐, 第 4 键超限触发驱逐。
+    exec.set_memory_limit("spill_test", Some(allowance_for(&plan) as usize * 3));
     exec.set_spill_redb(&path, None, None);
     // 未处理任何数据前不建 store（延迟创建）
     assert!(exec.window.spill.is_none(), "首次 process 前不创建 store");
@@ -547,7 +561,7 @@ fn spill_streaming_close_matches_batch_close() {
 
     // A: 非流式（close_window_by_bucket_rows 全量）
     let mut a = exec_with_spill(
-        plan.clone(),
+        &plan,
         3,
         Some(subset.clone()),
         Some(Box::new(MemSpillStore::new())),
@@ -558,7 +572,7 @@ fn spill_streaming_close_matches_batch_close() {
 
     // B: 流式（take_next_close_batch 分批, 批大小 5）
     let mut b = exec_with_spill(
-        plan,
+        &plan,
         3,
         Some(subset.clone()),
         Some(Box::new(MemSpillStore::new())),
@@ -605,7 +619,7 @@ fn spill_streaming_close_memory_bounded() {
     // 流式 close 内存有界：spill 分批进来, buckets 不膨胀（每次取走后再
     // 读下一批）——close 峰值 = 批大小, 不是全量。
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
-    let mut exec = exec_with_spill(plan, 2, None, Some(Box::new(MemSpillStore::new())), None);
+    let mut exec = exec_with_spill(&plan, 2, None, Some(Box::new(MemSpillStore::new())), None);
     for k in 1..=20 {
         exec.process_rows(&[bid_row(k, 1.0)], extract);
     }
@@ -632,13 +646,13 @@ fn spill_streaming_close_memory_bounded() {
 /// 开启 spill + 规则级共享落盘计数（模拟 spawn 层为同规则分片注入的同一个
 /// `Arc<AtomicU64>`）：预算仍按桶数给定, 计数跨 executor 共享。
 fn exec_with_shared_spill(
-    plan: StatsPlan,
+    plan: &StatsPlan,
     budget_buckets: usize,
     max_spill_bytes: Option<usize>,
     shared: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> StatsExecutor {
-    let mut exec = StatsExecutor::new(plan);
-    let budget = COUNT_ALLOWANCE as usize * budget_buckets;
+    let mut exec = StatsExecutor::new(plan.clone());
+    let budget = allowance_for(plan) as usize * budget_buckets;
     exec.set_memory_limit("spill_shared", Some(budget));
     exec.set_spill(
         Some(Box::new(MemSpillStore::new())),
@@ -649,7 +663,7 @@ fn exec_with_shared_spill(
 }
 
 /// 规则级共享预算语义（两个 executor 模拟同规则两个分片）：
-/// 1. 各自驱逐 → 落盘计数跨分片累计（a{1,2,3} + b{7,8} = 5×COUNT_ALLOWANCE）
+/// 1. 各自驱逐 → 落盘计数跨分片累计（a{1,2,3} + b{7,8} = 5×allowance_for(&plan)）
 /// 2. 共享预算耗尽 → 另一分片驱逐回退拒收（规则总上限, 与分片数无关）
 /// 3. 各自 close → 只扣减自己的份额（预算随窗口释放可复用）
 #[test]
@@ -658,9 +672,9 @@ fn spill_shared_counter_rule_budget() {
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
     // 规则总上限 = 5 桶（a 驱逐 3 + b 驱逐 2）, 与「每分片 3 桶内存预算」无关。
     let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let limit = (COUNT_ALLOWANCE * 5) as usize;
-    let mut a = exec_with_shared_spill(plan.clone(), 3, Some(limit), &shared);
-    let mut b = exec_with_shared_spill(plan.clone(), 3, Some(limit), &shared);
+    let limit = (allowance_for(&plan) * 5) as usize;
+    let mut a = exec_with_shared_spill(&plan, 3, Some(limit), &shared);
+    let mut b = exec_with_shared_spill(&plan, 3, Some(limit), &shared);
 
     // a: 6 键 → 内存 3 + spill {1,2,3}（第 6 键的驱逐仍在共享预算内）
     for k in 1..=6 {
@@ -669,7 +683,7 @@ fn spill_shared_counter_rule_budget() {
     assert_eq!(a.window.over_limit_new_buckets(), 0, "a 不应拒收");
     assert_eq!(
         shared.load(Ordering::SeqCst),
-        COUNT_ALLOWANCE * 3,
+        allowance_for(&plan) * 3,
         "a 落盘 3 键"
     );
 
@@ -680,7 +694,7 @@ fn spill_shared_counter_rule_budget() {
     }
     assert_eq!(
         shared.load(Ordering::SeqCst),
-        COUNT_ALLOWANCE * 5,
+        allowance_for(&plan) * 5,
         "a{{1,2,3}}+b{{7,8}} 跨分片累计"
     );
     assert_eq!(
@@ -694,7 +708,7 @@ fn spill_shared_counter_rule_budget() {
     assert_eq!(a_out.len(), 6, "a 输出 6 键（内存 3 + spill 3）");
     assert_eq!(
         shared.load(Ordering::SeqCst),
-        COUNT_ALLOWANCE * 2,
+        allowance_for(&plan) * 2,
         "close 后只剩 b 的落盘份额"
     );
 
@@ -718,7 +732,7 @@ fn mem_shared_counter_rule_budget() {
     use std::sync::atomic::Ordering;
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
     let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let limit = (COUNT_ALLOWANCE * 3) as usize; // 规则总内存 = 3 桶
+    let limit = (allowance_for(&plan) * 3) as usize; // 规则总内存 = 3 桶
 
     let mk = |with_spill: bool| -> StatsExecutor {
         let mut exec = StatsExecutor::new(plan.clone());
@@ -742,7 +756,7 @@ fn mem_shared_counter_rule_budget() {
     assert_eq!(a.window.spill_index.len(), 3, "A spill 3 键");
     assert_eq!(
         shared.load(Ordering::SeqCst),
-        COUNT_ALLOWANCE * 3,
+        allowance_for(&plan) * 3,
         "A 内存占满 3 桶（驱逐回落再建桶, 不破总量）"
     );
 
@@ -808,7 +822,7 @@ fn spill_distinct_readback_merges() {
     let a_out = a.close_window_by_bucket_rows();
 
     // B: spill（预算 4 桶）
-    let mut b = exec_with_spill(plan, 4, subset, Some(Box::new(MemSpillStore::new())), None);
+    let mut b = exec_with_spill(&plan, 4, subset, Some(Box::new(MemSpillStore::new())), None);
     b.process_rows(&make_rows(), extract);
     assert_eq!(b.window.over_limit_new_buckets(), 0, "spill 不拒收");
     let b_out = b.close_window_by_bucket_rows();
@@ -869,7 +883,7 @@ fn spill_top_readback_roundtrip() {
 
     // B: spill（预算 4 桶）
     let mut b = exec_with_spill(
-        plan,
+        &plan,
         4,
         Some(subset.clone()),
         Some(Box::new(MemSpillStore::new())),
@@ -937,11 +951,11 @@ fn spill_lazy_create_shared_counter_rule_budget() {
     use std::sync::atomic::Ordering;
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
     let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let limit = (COUNT_ALLOWANCE * 5) as usize; // 规则总落盘 = 5 桶
+    let limit = (allowance_for(&plan) * 5) as usize; // 规则总落盘 = 5 桶
 
     let mk = |tag: &str| -> (StatsExecutor, std::path::PathBuf) {
         let mut exec = StatsExecutor::new(plan.clone());
-        exec.set_memory_limit(tag, Some(COUNT_ALLOWANCE as usize * 3));
+        exec.set_memory_limit(tag, Some(allowance_for(&plan) as usize * 3));
         let path = {
             let mut p = std::env::temp_dir();
             p.push(format!(
@@ -975,7 +989,7 @@ fn spill_lazy_create_shared_counter_rule_budget() {
     assert_eq!(a.window.over_limit_new_buckets(), 0, "a 不应拒收");
     assert_eq!(
         shared.load(Ordering::SeqCst),
-        COUNT_ALLOWANCE * 3,
+        allowance_for(&plan) * 3,
         "a 落盘 3 键进共享计数（ensure 预置的计数生效）"
     );
 
@@ -986,7 +1000,7 @@ fn spill_lazy_create_shared_counter_rule_budget() {
     assert!(b.window.spill.is_some(), "b 驱逐时惰性创建");
     assert_eq!(
         shared.load(Ordering::SeqCst),
-        COUNT_ALLOWANCE * 5,
+        allowance_for(&plan) * 5,
         "a{{1,2,3}}+b{{7,8}} 跨分片累计"
     );
     assert_eq!(
@@ -1000,7 +1014,7 @@ fn spill_lazy_create_shared_counter_rule_budget() {
     assert_eq!(a_out.len(), 6, "a 输出 6 键（内存 3 + spill 3）");
     assert_eq!(
         shared.load(Ordering::SeqCst),
-        COUNT_ALLOWANCE * 2,
+        allowance_for(&plan) * 2,
         "close 后只剩 b 的落盘份额"
     );
     assert!(!path_a.exists(), "a close 后 redb 文件删除");
@@ -1043,7 +1057,7 @@ fn spill_consecutive_windows_same_rule_fresh_each_window() {
         p
     };
     let mut exec = StatsExecutor::new(plan.clone());
-    exec.set_memory_limit("spill_test", Some(COUNT_ALLOWANCE as usize * 3));
+    exec.set_memory_limit("spill_test", Some(allowance_for(&plan) as usize * 3));
     exec.set_spill_redb(&path, None, None);
 
     // 窗 1：键 1..=6（内存 3 桶 + 驱逐 3 桶）
@@ -1163,7 +1177,7 @@ fn spill_redb_streaming_close_full_pipeline() {
         vec![field_key("b", "bidder")],
         vec![last_measure("last_price", "price"), count_measure("n")],
     );
-    let mut exec = exec_with_spill(plan, 3, Some(subset), Some(Box::new(store)), None);
+    let mut exec = exec_with_spill(&plan, 3, Some(subset), Some(Box::new(store)), None);
     for k in 1..=30 {
         exec.process_rows(&[bid_row(k, k as f64 * 10.0)], extract);
     }
@@ -1171,7 +1185,7 @@ fn spill_redb_streaming_close_full_pipeline() {
     assert!(exec.window.spill_index.len() > 0, "spill 已生效");
 
     // 流式 close：小批 4 → redb 游标多轮续读
-    let mut keys: Vec<(ScopeKey, Vec<crate::match_engine::executor::StatsAccum>)> = Vec::new();
+    let mut keys: Vec<(ScopeKey, crate::match_engine::executor::StatsBucketAccs)> = Vec::new();
     loop {
         let batch = exec.take_next_close_batch(4);
         if batch.is_empty() {
@@ -1220,10 +1234,10 @@ fn spill_shared_counter_resets_across_windows() {
         p
     };
     let mut exec = StatsExecutor::new(plan.clone());
-    exec.set_memory_limit("spill_test", Some(COUNT_ALLOWANCE as usize * 3));
+    exec.set_memory_limit("spill_test", Some(allowance_for(&plan) as usize * 3));
     exec.set_spill_redb(
         &path,
-        Some((COUNT_ALLOWANCE * 10) as usize),
+        Some((allowance_for(&plan) * 10) as usize),
         Some(Arc::clone(&shared)),
     );
 
@@ -1233,7 +1247,7 @@ fn spill_shared_counter_resets_across_windows() {
     }
     assert_eq!(
         shared.load(Ordering::SeqCst),
-        COUNT_ALLOWANCE * 3,
+        allowance_for(&plan) * 3,
         "窗 1 落盘 3 键进共享计数"
     );
     exec.close_window_by_bucket_rows();
@@ -1249,7 +1263,7 @@ fn spill_shared_counter_resets_across_windows() {
     }
     assert_eq!(
         shared.load(Ordering::SeqCst),
-        COUNT_ALLOWANCE * 3,
+        allowance_for(&plan) * 3,
         "窗 2 驱逐重新累计到共享计数"
     );
     exec.close_window_by_bucket_rows();
@@ -1302,8 +1316,8 @@ fn spill_evicts_to_target_exact_overage() {
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
     let mem_shared = Arc::new(AtomicU64::new(0));
     let spill_shared = Arc::new(AtomicU64::new(0));
-    let limit = COUNT_ALLOWANCE * 100; // 100 桶
-    let target = COUNT_ALLOWANCE * 90; // 90 桶（90% 驱逐目标）
+    let limit = allowance_for(&plan) * 100; // 100 桶
+    let target = allowance_for(&plan) * 90; // 90 桶（90% 驱逐目标）
 
     let path = std::env::temp_dir().join(format!(
         "wf_spill_target_{}_{}.rb",
@@ -1313,7 +1327,7 @@ fn spill_evicts_to_target_exact_overage() {
             .unwrap()
             .as_nanos()
     ));
-    let mut exec = StatsExecutor::new(plan);
+    let mut exec = StatsExecutor::new(plan.clone());
     exec.set_memory_limit_shared("t1", Some(limit as usize), Some(Arc::clone(&mem_shared)));
     exec.set_spill_redb(&path, None, Some(Arc::clone(&spill_shared)));
     for k in 1..=150i64 {
@@ -1344,7 +1358,7 @@ fn spill_evicts_to_target_exact_overage() {
     );
     assert_eq!(
         spill_shared.load(Ordering::SeqCst),
-        exec.window.spill_evictions() * COUNT_ALLOWANCE,
+        exec.window.spill_evictions() * allowance_for(&plan),
         "落盘共享计数 = 驱逐量 × allowance"
     );
     // close 全键输出, 计数归零
@@ -1374,8 +1388,8 @@ fn spill_shared_memory_counter_no_over_eviction_under_concurrency() {
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
     let mem_shared = Arc::new(AtomicU64::new(0));
     let spill_shared = Arc::new(AtomicU64::new(0));
-    let limit = COUNT_ALLOWANCE * 100;
-    let target = COUNT_ALLOWANCE * 90;
+    let limit = allowance_for(&plan) * 100;
+    let target = allowance_for(&plan) * 90;
     let barrier = Arc::new(Barrier::new(2));
 
     let worker = |tag: String,
@@ -1427,7 +1441,7 @@ fn spill_shared_memory_counter_no_over_eviction_under_concurrency() {
 
     let used = mem_shared.load(Ordering::SeqCst);
     assert!(
-        used >= target.saturating_sub(10 * COUNT_ALLOWANCE),
+        used >= target.saturating_sub(10 * allowance_for(&plan)),
         "并发驱逐过度: 共享计数 {used}B < target {target}B - 竞态余量\
          （修复前每片各驱逐水位差, q18 实测 25GB 配置每片驱逐 2.5GB×10）"
     );
@@ -1486,7 +1500,7 @@ impl crate::match_engine::spill::SpillStore for FailingStore {
 fn spill_write_failure_returns_reserved_and_rejects() {
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
     let mut exec = exec_with_spill(
-        plan,
+        &plan,
         3,
         None,
         Some(Box::new(FailingStore)),
@@ -1499,7 +1513,7 @@ fn spill_write_failure_returns_reserved_and_rejects() {
     // 归还生效：estimated 恢复 = 内存 3 桶（驱逐尝试失败, 键未删）
     assert_eq!(
         exec.window.estimated_bytes(),
-        COUNT_ALLOWANCE * 3,
+        allowance_for(&plan) * 3,
         "写失败归还后 estimated 不虚降（键仍在内存记账）"
     );
     // 键全在内存（驱逐从未成功）
@@ -1528,9 +1542,9 @@ fn spill_write_failure_returns_reserved_and_rejects() {
 fn spill_disk_full_returns_reserved_and_rejects() {
     let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
     // 预算 3 桶, 落盘上限 1 键
-    let max_spill = COUNT_ALLOWANCE as usize;
+    let max_spill = allowance_for(&plan) as usize;
     let mut exec = exec_with_spill(
-        plan,
+        &plan,
         3,
         None,
         Some(Box::new(MemSpillStore::new())),
@@ -1543,7 +1557,7 @@ fn spill_disk_full_returns_reserved_and_rejects() {
     // 归还生效：estimated = 内存 3 桶（被 max_disk 挡下的驱逐未虚降）
     assert_eq!(
         exec.window.estimated_bytes(),
-        COUNT_ALLOWANCE * 3,
+        allowance_for(&plan) * 3,
         "落盘满归还后 estimated 不虚降"
     );
     // 落盘只够 1 键, 其余驱逐尝试被挡 → 拒收

@@ -81,7 +81,7 @@ pub(crate) type StatsPartial = (
     i64,
     Vec<(
         wf_engine::match_engine::ScopeKey,
-        Vec<wf_engine::match_engine::StatsAccum>,
+        wf_engine::match_engine::StatsBucketAccs,
     )>,
     u64,
 );
@@ -117,6 +117,9 @@ pub(super) struct StatsTask {
     /// 非协调片发送端; 未分片两者皆 None。
     merge_rx: Option<mpsc::Receiver<StatsPartial>>,
     merge_tx: Option<mpsc::Sender<StatsPartial>>,
+    /// 分片共享批级 where mask 缓存（2026-08-27 q17 分片去重）; None = 不缓存。
+    /// pub(crate) 供测试注入共享缓存验证。
+    pub(crate) mask_cache: Option<Arc<wf_engine::match_engine::StatsMaskCache>>,
     /// 当前窗口（fixed 桶, bucket 对齐首个事件; `None` = 尚未见事件）。
     window_start: Option<i64>,
     /// 当前窗口结束（= window_start + dur; close 判定 watermark >= window_end）。
@@ -161,6 +164,7 @@ impl StatsTask {
             shard_count,
             merge_rx,
             merge_tx,
+            mask_cache,
         } = config;
         let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
         let task_id = format!("{}#{}", executor.plan().name, seq);
@@ -184,6 +188,7 @@ impl StatsTask {
             shard_count,
             merge_rx,
             merge_tx,
+            mask_cache,
             window_start: None,
             window_end: None,
             last_watermark: i64::MIN,
@@ -254,6 +259,35 @@ impl StatsTask {
         }
     }
 
+    /// Whether every source window's actor has finished its shutdown drain
+    /// (mirrors [`super::rule_task::RuleTask::sources_drained`]).
+    fn sources_drained(&self) -> bool {
+        self.sources.iter().all(|s| s.window.actor_drained())
+    }
+
+    /// Full-shutdown drain: keep pulling until every source window's actor has
+    /// committed its queued tail, so the final flush runs against a complete
+    /// machine (same race as the rule task — stats windows' tail can still be
+    /// in the actors' mailboxes when the shutdown flush fires).
+    pub(super) async fn wait_shutdown_drain(&mut self) {
+        let deadline = std::time::Instant::now() + super::rule_task::SHUTDOWN_DRAIN_TIMEOUT;
+        loop {
+            self.pull_and_process().await;
+            if self.sources_drained() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                wf_warn!(
+                    pipe,
+                    task_id = %self.task_id,
+                    "stats shutdown drain timeout — window actor(s) did not report drained; flushing with possibly-stale machine"
+                );
+                break;
+            }
+            tokio::time::sleep(super::rule_task::SHUTDOWN_DRAIN_POLL).await;
+        }
+    }
+
     /// Push 模式: 消费一个投递批次（raw batch, events=None 走 defer 路径）。
     pub(super) async fn process_push(&mut self, push: RulePush) {
         let push_seq = push.seq;
@@ -290,7 +324,14 @@ impl StatsTask {
         shard_rows: Option<&[u32]>,
     ) {
         self.last_activity_wall = std::time::Instant::now();
-        let max_time = batch_max_time(batch, self.time_field.as_deref());
+        // 分片共享批级时间缓存: 首片扫全批时间 max, 其余片命中（q17 10 片原
+        // 各扫全批 10×——batch_max_time 是时间列读取的主要来源, sample 热点）。
+        let max_time = match &self.mask_cache {
+            Some(cache) => cache.get_or_compute_time(batch, || {
+                batch_max_time(batch, self.time_field.as_deref())
+            }),
+            None => batch_max_time(batch, self.time_field.as_deref()),
+        };
         if max_time > self.last_watermark {
             self.last_watermark = max_time; // 单调; scan_timeouts 兜底推进用
         }
@@ -303,6 +344,18 @@ impl StatsTask {
             let _ = window_name;
             return;
         };
+        // 单段快路径（2026-08-27 q17）: 窗口已建立且整批最大时间仍在窗内——
+        // 批内行全部同属当前窗口, 整批一段直接归并（跳过逐行段扫 + domain 构造）。
+        // 1d 窗口 + 批内跨度 << 窗长时恒命中（q17 批内 ~0.5s << 86400s）。
+        // 正确性: max_time < window_end ⇒ 首行（≤ max_time）也在窗内, 无需
+        // advance; 时间列单调保证段连续性（原逐行段扫的同窗口判定）。
+        if let Some(end) = self.window_end
+            && max_time < end
+        {
+            self.accumulate_segment(batch, shard_rows).await;
+            let _ = window_name;
+            return;
+        }
         // 行域（升序; 分片子集由 fanout 分区保序, 全批即 0..n）。
         let domain: Vec<u32> = match shard_rows {
             Some(rows) => rows.to_vec(),
@@ -348,7 +401,12 @@ impl StatsTask {
         if crate::perf_diag::perf_cut_rules() {
             return;
         }
-        let stats_ok = self.stats.process_batch_rows(batch, seg);
+        // 分片共享 mask 缓存: 首片算, 其余片 Arc 命中（q17 10 片 mask 占 rules
+        // CPU ~85%——2026-08-27 sample 定位）。语义与无缓存路径完全一致。
+        let stats_ok = match &self.mask_cache {
+            Some(cache) => self.stats.process_batch_rows_cached(batch, seg, cache),
+            None => self.stats.process_batch_rows(batch, seg),
+        };
         if !stats_ok {
             // 回退行式: 只物化行域内的行（与列式行域一致）。
             let events = match seg {
@@ -769,7 +827,7 @@ impl StatsTask {
         &self,
         buckets: Vec<(
             wf_engine::match_engine::ScopeKey,
-            Vec<wf_engine::match_engine::StatsAccum>,
+            wf_engine::match_engine::StatsBucketAccs,
         )>,
         labels: &[String],
         row_names: Option<std::sync::Arc<Vec<String>>>,
@@ -1154,7 +1212,12 @@ fn scope_key_to_values(key: &ScopeKey) -> Vec<wf_engine::match_engine::Value> {
 }
 
 /// 主循环: push 通道优先（WFUSION_WINDOW_DISPATCH=push）, 否则 pull window log。
-pub(crate) async fn run_stats_task(config: StatsTaskConfig) -> RuntimeResult<()> {
+/// `root_cancel` 语义同 [`run_rule_task`](super::run_rule_task): 全量关停时
+/// 等 window actor 排空后再 flush; 热重载（只 cancel 规则组）时跳过等待。
+pub(crate) async fn run_stats_task(
+    config: StatsTaskConfig,
+    root_cancel: CancellationToken,
+) -> RuntimeResult<()> {
     let (mut task, cancel) = StatsTask::new(config);
     let task_id = task.task_id.clone();
     let mut eos = task.eos_flush.clone();
@@ -1164,7 +1227,15 @@ pub(crate) async fn run_stats_task(config: StatsTaskConfig) -> RuntimeResult<()>
     if let Some(rx) = task.push_rx.take() {
         run_stats_push_loop(&mut task, rx, cancel, &mut eos, &mut timeout_tick, &task_id).await
     } else {
-        run_stats_pull_loop(&mut task, cancel, &mut eos, &mut timeout_tick, &task_id).await
+        run_stats_pull_loop(
+            &mut task,
+            cancel,
+            root_cancel,
+            &mut eos,
+            &mut timeout_tick,
+            &task_id,
+        )
+        .await
     }
 }
 
@@ -1211,6 +1282,7 @@ async fn run_stats_push_loop(
 async fn run_stats_pull_loop(
     task: &mut StatsTask,
     cancel: CancellationToken,
+    root_cancel: CancellationToken,
     eos: &mut watch::Receiver<u64>,
     timeout_tick: &mut tokio::time::Interval,
     task_id: &str,
@@ -1223,6 +1295,11 @@ async fn run_stats_pull_loop(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                // 同 rule task: 全量关停等 actor 排空（热重载跳过）。
+                if root_cancel.is_cancelled() {
+                    task.wait_shutdown_drain().await;
+                }
+                task.pull_and_process().await;
                 task.flush().await;
                 wf_debug!(pipe, task_id = %task_id, "stats task shutdown complete");
                 break;
@@ -1250,3 +1327,6 @@ mod stats_task_coverage_more;
 #[cfg(test)]
 #[path = "stats_task_r4.rs"]
 mod stats_task_r4;
+#[cfg(test)]
+#[path = "stats_task_bench.rs"]
+mod stats_task_bench;

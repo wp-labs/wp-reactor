@@ -6,6 +6,7 @@
 //! 设计依据: docs/stats-executor-design.md v6（§6 执行器）。
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -22,6 +23,135 @@ use crate::window::scope_key_columnar;
 use crate::window::scope_key_from_column;
 
 // ---------------------------------------------------------------------------
+// 批级 where mask 共享缓存（2026-08-27 q17 分片去重）
+// ---------------------------------------------------------------------------
+//
+// 背景: 分片（rule_parallelism=S）下每片 `process_batch_rows` 对**整批**计算
+// where mask（`eval_guard_columnar` 向量化全批）——同一批被 S 片重复 S 次
+// （q17 10 片: mask 占 rules 段 CPU ~85%, sample 顶栈 eval_vec 家族第一热点）。
+// 首片算完写缓存, 其余片复用（保持向量化, 总量 S×→1×）。
+//
+// 正确性: mask 是「批 + where 表达式」的纯函数（同一 executor 各片 where 相
+// 同）。key = 首列 Arc 指针 + 行数——各片持同一批的**列 Arc 共享**（window
+// 批存储 `Arc<RecordBatch>` 浅克隆, `read_since_with_shard` 每片拿值副本但列
+// 数组 Arc 同源）; 缓存**强持有批 Arc** → 列指针不会释放复用 → 无碰撞。
+//
+// 内存: 流式批下同窗口的批几乎同时被各片消费, 缓存持有最近 ~max_rows 行
+// （列数据 Arc 共享, 防释放不复制）; 超限整体清空（旧批已处理完, 安全）。
+
+/// 分片共享的批级 where mask 缓存（`Arc<RecordBatch>` 强持有防指针复用）。
+///
+/// key = (首列 Arc 指针, 行数); value = (批 Arc 防释放, mask 结果)。
+/// 2026-08-27 扩展: 同批的 [`batch_max_time`] 也是 10× 分片重复——并入本缓存
+/// （同 key 批身份, 复用同一 config 字段, 见 [`StatsMaskCache::get_or_compute_time`]）。
+type MaskCacheMap =
+    std::collections::HashMap<(usize, usize), (Arc<RecordBatch>, Arc<Vec<BooleanArray>>)>;
+/// 批级时间信息缓存表: key = (首列 Arc 指针, 行数), value = (批 Arc, max_time)。
+type TimeCacheMap = std::collections::HashMap<(usize, usize), (Arc<RecordBatch>, i64)>;
+
+#[derive(Debug)]
+pub struct StatsMaskCache {
+    inner: std::sync::Mutex<MaskCacheMap>,
+    time_inner: std::sync::Mutex<TimeCacheMap>,
+    /// 容量上限（总行数; 超限整体清空——流式批下旧批已消费完）。
+    /// pub(crate) 供测试缩容验证清理。
+    pub(crate) max_rows: usize,
+    total_rows: std::sync::atomic::AtomicUsize,
+    time_total_rows: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for StatsMaskCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StatsMaskCache {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            time_inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            max_rows: 4_000_000,
+            total_rows: std::sync::atomic::AtomicUsize::new(0),
+            time_total_rows: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// 取或算（算完写缓存）。`compute` = 批 → where mask 列表（仅未命中时调用）。
+    pub fn get_or_compute(
+        &self,
+        batch: &RecordBatch,
+        compute: impl FnOnce() -> Vec<BooleanArray>,
+    ) -> Arc<Vec<BooleanArray>> {
+        let rows = batch.num_rows();
+        if rows == 0 {
+            return Arc::new(compute()); // 空批不缓存
+        }
+        let key = (
+            std::sync::Arc::as_ptr(batch.column(0)) as *const () as usize,
+            rows,
+        );
+        let mut guard = self.inner.lock().expect("mask cache poisoned");
+        if let Some((_, masks)) = guard.get(&key) {
+            return Arc::clone(masks);
+        }
+        let masks = Arc::new(compute());
+        // 容量检查在插入前: 超限先清旧批（当前批正被各片消费, 保留）。
+        let new_total = self
+            .total_rows
+            .fetch_add(rows, std::sync::atomic::Ordering::Relaxed)
+            + rows;
+        if new_total > self.max_rows {
+            guard.clear();
+            self.total_rows
+                .store(rows, std::sync::atomic::Ordering::Relaxed);
+        }
+        guard.insert(key, (Arc::new(batch.clone()), Arc::clone(&masks)));
+        masks
+    }
+
+    /// 批级时间信息（batch_max_time）共享缓存（2026-08-27 q17）: 与 mask 同
+    /// key（批身份——首列 Arc 指针 + 行数）; 首片扫时间列 max 写缓存, 其余片
+    /// 命中（免 10× 全批时间扫描重复）。`compute` = 全批时间 max 求值。
+    pub fn get_or_compute_time(&self, batch: &RecordBatch, compute: impl FnOnce() -> i64) -> i64 {
+        let rows = batch.num_rows();
+        if rows == 0 {
+            return compute(); // 空批不缓存
+        }
+        let key = (
+            std::sync::Arc::as_ptr(batch.column(0)) as *const () as usize,
+            rows,
+        );
+        let mut guard = self.time_inner.lock().expect("mask cache poisoned");
+        if let Some((_, v)) = guard.get(&key) {
+            return *v;
+        }
+        let v = compute();
+        let new_total = self
+            .time_total_rows
+            .fetch_add(rows, std::sync::atomic::Ordering::Relaxed)
+            + rows;
+        if new_total > self.max_rows {
+            guard.clear();
+            self.time_total_rows
+                .store(rows, std::sync::atomic::Ordering::Relaxed);
+        }
+        guard.insert(key, (Arc::new(batch.clone()), v));
+        v
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.lock().expect("poisoned").len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn time_len(&self) -> usize {
+        self.time_inner.lock().expect("poisoned").len()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 状态结构（v6 §6.1 — 无匹配进度, 纯累加）
 // ---------------------------------------------------------------------------
 
@@ -33,6 +163,130 @@ pub struct NumericAccum {
     pub sum: i128,
     pub min: Option<i128>,
     pub max: Option<i128>,
+}
+
+/// 纯数值计划桶的 SoA 累加器（2026-08-27 q17）：counts/sums/mins/maxs 平行
+/// 数组按类型紧凑存储——免 [`StatsAccum`] 枚举分派 + `Box` 解引用（旧热路径每
+/// 度量 1 次 match + 1 次指针追逐 → 数组直写）。
+///
+/// 仅用于**全 Count/Sum/Avg/Min/Max** 计划（q17 形态）；含 distinct/last/top
+/// 的计划仍走 [`StatsAccum`]（[`StatsBucketAccs::Classic`]）。索引映射与同列分
+/// 组见 [`NumericSoALayout`]（executor 构造期预计算，热路径零计算）。
+#[derive(Debug, Clone, Default)]
+pub struct NumericSoA {
+    /// 每度量 count（索引 = 度量 idx；含 where 过滤；avg 输出时 sum/count）。
+    pub counts: Box<[u64]>,
+    /// sum/avg 度量的 sum（紧凑：仅 sum/avg 度量，索引 = `sum_slot[idx]`）。
+    pub sums: Box<[i128]>,
+    /// min 度量当前最小值（紧凑，索引 = `min_slot[idx]`）。
+    pub mins: Box<[Option<i128>]>,
+    /// max 度量当前最大值（紧凑，索引 = `max_slot[idx]`）。
+    pub maxs: Box<[Option<i128>]>,
+}
+
+/// 数值度量聚合类别（SoA 分派用——比 `StatsAggPlan` 全枚举窄的分支宽度）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericKind {
+    Sum,
+    Min,
+    Max,
+}
+
+/// 同列数值度量分组: 一次列值读取共享给同列多个度量（q17: price 列
+/// sum+avg+min+max 4 度量共享 1 次 [`column_i128_at`]——旧路径每度量 1 次
+/// 重复读取同一列）。组内度量同一字段（plan 静态, 构造期分组）；列索引运行
+/// 期从 `measure_field_cols[entries[0].0]` 取一次（组内共享）。
+#[derive(Debug, Clone)]
+pub struct SoAColGroup {
+    /// 该字段的 (度量 idx, 聚合类别) 列表。
+    pub entries: Box<[(usize, NumericKind)]>,
+}
+
+/// 纯数值计划的 SoA 布局（executor 构造期预计算一次）：每度量到紧凑数组的
+/// 槽映射 + 同字段分组。仅依赖 plan（无批依赖）——窗口重建后不变。
+#[derive(Debug, Clone)]
+pub struct NumericSoALayout {
+    /// 度量数（= `counts.len()`）。
+    pub n_measures: usize,
+    /// 每度量 → sums 槽（None = 非 sum/avg 度量）。
+    pub sum_slot: Box<[Option<u32>]>,
+    /// 每度量 → mins 槽（None = 非 min 度量）。
+    pub min_slot: Box<[Option<u32>]>,
+    /// 每度量 → maxs 槽（None = 非 max 度量）。
+    pub max_slot: Box<[Option<u32>]>,
+    /// 同字段数值度量分组（确定性字段序）。
+    pub groups: Box<[SoAColGroup]>,
+}
+
+impl NumericSoALayout {
+    /// 构建（仅全数值计划调用）。
+    pub fn build(plan: &StatsPlan) -> Self {
+        let n = plan.measures.len();
+        let mut sum_slot: Vec<Option<u32>> = vec![None; n];
+        let mut min_slot: Vec<Option<u32>> = vec![None; n];
+        let mut max_slot: Vec<Option<u32>> = vec![None; n];
+        let (mut n_sum, mut n_min, mut n_max) = (0u32, 0u32, 0u32);
+        for (i, m) in plan.measures.iter().enumerate() {
+            match m.agg {
+                StatsAggPlan::Sum | StatsAggPlan::Avg => {
+                    sum_slot[i] = Some(n_sum);
+                    n_sum += 1;
+                }
+                StatsAggPlan::Min => {
+                    min_slot[i] = Some(n_min);
+                    n_min += 1;
+                }
+                StatsAggPlan::Max => {
+                    max_slot[i] = Some(n_max);
+                    n_max += 1;
+                }
+                _ => {}
+            }
+        }
+        // 同字段分组: 按字段名聚合「有字段的数值度量」（sum/avg/min/max）。
+        let mut by_field: std::collections::HashMap<String, Vec<(usize, NumericKind)>> =
+            std::collections::HashMap::new();
+        for (i, m) in plan.measures.iter().enumerate() {
+            let kind = match m.agg {
+                StatsAggPlan::Sum | StatsAggPlan::Avg => NumericKind::Sum,
+                StatsAggPlan::Min => NumericKind::Min,
+                StatsAggPlan::Max => NumericKind::Max,
+                _ => continue,
+            };
+            let Some(fr) = &m.field else {
+                continue;
+            };
+            by_field
+                .entry(field_name(fr).to_string())
+                .or_default()
+                .push((i, kind));
+        }
+        let mut fields: Vec<String> = by_field.keys().cloned().collect();
+        fields.sort();
+        let groups: Vec<SoAColGroup> = fields
+            .into_iter()
+            .map(|f| SoAColGroup {
+                entries: by_field.remove(&f).unwrap().into_boxed_slice(),
+            })
+            .collect();
+        Self {
+            n_measures: n,
+            sum_slot: sum_slot.into_boxed_slice(),
+            min_slot: min_slot.into_boxed_slice(),
+            max_slot: max_slot.into_boxed_slice(),
+            groups: groups.into_boxed_slice(),
+        }
+    }
+
+    /// 全零 SoA（新桶首见）。
+    pub fn zeros(&self) -> NumericSoA {
+        NumericSoA {
+            counts: vec![0u64; self.n_measures].into_boxed_slice(),
+            sums: vec![0i128; self.sum_slot.iter().flatten().count()].into_boxed_slice(),
+            mins: vec![None; self.min_slot.iter().flatten().count()].into_boxed_slice(),
+            maxs: vec![None; self.max_slot.iter().flatten().count()].into_boxed_slice(),
+        }
+    }
 }
 
 /// 度量专用累加器（2026-08-26 q18 紧凑化）：全功能 `StatsAccum` 208B →
@@ -595,11 +849,34 @@ pub struct StatsWindowState {
     spill_write_ns: u64,
     /// 驱逐调用次数（分段耗时的分母）。
     spill_evict_calls: u64,
+    /// 纯数值计划 SoA 布局（None = 含 distinct/last/top, 走 Classic 累加器）。
+    /// 窗口重建（reset）后不变——按 plan 重算。
+    soa_layout: Option<NumericSoALayout>,
 }
 
 impl StatsWindowState {
-    /// 新建窗口状态（无内存限制, 由 spawn 层按规则 limits 注入）。
-    fn new(buckets: EngineHashMap<u64, Vec<StatsBucket>>) -> Self {
+    /// 新建窗口状态（无内存限制, 由 spawn 层按规则 limits 注入）。空键规则
+    /// 在此预建 Empty 单桶（快路径）。
+    fn new(buckets: EngineHashMap<u64, Vec<StatsBucket>>, plan: &StatsPlan) -> Self {
+        // 全数值计划（count/sum/avg/min/max）→ SoA 桶; 含 distinct/last/top → Classic。
+        let soa_layout = plan
+            .measures
+            .iter()
+            .all(|m| {
+                matches!(
+                    m.agg,
+                    StatsAggPlan::Count
+                        | StatsAggPlan::Sum
+                        | StatsAggPlan::Avg
+                        | StatsAggPlan::Min
+                        | StatsAggPlan::Max
+                )
+            })
+            .then(|| NumericSoALayout::build(plan));
+        let mut buckets = buckets;
+        if buckets.is_empty() && plan.keys.is_empty() {
+            StatsWindowState::seed_empty_bucket(&mut buckets, plan, soa_layout.as_ref());
+        }
         StatsWindowState {
             buckets,
             window_start_nanos: 0,
@@ -626,6 +903,7 @@ impl StatsWindowState {
             spill_clone_ns: 0,
             spill_write_ns: 0,
             spill_evict_calls: 0,
+            soa_layout,
         }
     }
 
@@ -687,13 +965,15 @@ impl StatsWindowState {
     /// vs 8GB 估算形同虚设）。O(桶数) 每批（q16 ~10k 桶 × 2857 批可接受）。
     /// guard 检查（新建桶）用刷新后的值，反映真实。
     fn refresh_estimated_bytes(&mut self, plan: &StatsPlan) {
-        let allowance = Self::bucket_allowance(plan);
+        let allowance = Self::bucket_allowance(plan, self.soa_layout.is_some());
         let mut distinct_bytes = 0u64;
         for buckets in self.buckets.values() {
             for bucket in buckets {
-                for acc in &bucket.accs {
-                    if let StatsAccum::Distinct(set) = acc {
-                        distinct_bytes += set.len() as u64 * Self::DISTINCT_ENTRY_BYTES;
+                if let StatsBucketAccs::Classic(accs) = &bucket.accs {
+                    for acc in accs {
+                        if let StatsAccum::Distinct(set) = acc {
+                            distinct_bytes += set.len() as u64 * Self::DISTINCT_ENTRY_BYTES;
+                        }
                     }
                 }
             }
@@ -715,7 +995,7 @@ impl StatsWindowState {
     }
 
     /// 新桶预算（保守上界）: 固定基数 + Σ每度量变体 + 行字段共享份额 +
-    /// top/last 条目预算。
+    /// top/last 条目预算。`soa` = 纯数值计划（SoA 桶）——平行数组紧凑口径。
     ///
     /// **2026-08-26 q18 校准**（对齐度量专用累加器）: 旧口径 512 + n×128 +
     /// last 160B/度量 → 1664B/键，高估真实 1.55× → 16GB 预算拒收阈值 961 万
@@ -723,12 +1003,32 @@ impl StatsWindowState {
     /// 现按变体实际求和 + 行字段**每桶共享 1 份**（last/top 度量同桶同一
     /// [`RowFields`] Arc——`row_cache` 每行 1 份）。
     ///
+    /// **2026-08-27 SoA 校准**: SoA 桶无 Box/枚举——固定基数 + counts n×8 +
+    /// sums n_sum×16 + mins n_min×16 + maxs n_max×16（q17 8 度量 → 384B, 旧
+    /// Classic 口径 896B 高估 2.3×——预算小/键多时误拒）。1.6× 余量同 Classic。
+    ///
     /// **已知限制**: `distinct_set` 值域增长不在固定基数内（q16 教训）——由
     /// [`Self::refresh_estimated_bytes`] 批末按真实 len 计入（保守上界）。
-    fn bucket_allowance(plan: &StatsPlan) -> u64 {
+    /// pub(crate) 供 stats_spill_test 按计划算桶预算（SoA/Classic 口径不同）。
+    pub(crate) fn bucket_allowance(plan: &StatsPlan, soa: bool) -> u64 {
         // 桶固定: ScopeKey 栈+堆(~72B) + StatsBucket 头 + accs Vec + HashMap
         // 槽(~64B) ≈ 160B → 取 256（1.6× 保守余量）。
         let mut bytes = 256u64;
+        if soa {
+            // SoA 桶: 平行数组紧凑布局（无 Box 无枚举）——按类型子集求和。
+            let n = plan.measures.len() as u64;
+            let (mut n_sum, mut n_min, mut n_max) = (0u64, 0u64, 0u64);
+            for m in &plan.measures {
+                match m.agg {
+                    StatsAggPlan::Sum | StatsAggPlan::Avg => n_sum += 1,
+                    StatsAggPlan::Min => n_min += 1,
+                    StatsAggPlan::Max => n_max += 1,
+                    StatsAggPlan::Count => {}
+                    _ => unreachable!("SoA 仅数值度量"),
+                }
+            }
+            return bytes + n * 8 + n_sum * 16 + n_min * 16 + n_max * 16;
+        }
         let mut has_row_fields = false;
         for m in &plan.measures {
             match m.agg {
@@ -755,7 +1055,6 @@ impl StatsWindowState {
         // 常量（非 env）：热路径每新键调用, 且避免测试 env 竞态。
         (bytes as f64 * 2.2).round() as u64
     }
-
     /// 新建桶前的限额检查: 超限 → 先尝试 spill 腾空间（M3 三层预算阶梯第二层）
     /// → 仍超限 → 计数 + 每窗口告警一次 + 拒绝（false）。
     ///
@@ -765,7 +1064,7 @@ impl StatsWindowState {
     /// 已在桶内的键不计数（命中）。告警/metrics 的 `over_limit_new_buckets`
     /// 实际含义是「被拒行数」。
     fn account_new_bucket(&mut self, plan: &StatsPlan) -> bool {
-        let allowance = Self::bucket_allowance(plan);
+        let allowance = Self::bucket_allowance(plan, self.soa_layout.is_some());
         if let Some(limit) = self.limit_bytes
             && self.mem_used_bytes() + allowance > limit
         {
@@ -862,7 +1161,6 @@ impl StatsWindowState {
         self.buckets.len()
     }
 
-    /// 驱逐分段耗时（跨窗口累计；性能定位）：(扫描 ns, clone ns, 写 ns, 调用次数)。
     /// 累计读回次数（跨窗口；抖动观测）。
     pub fn spill_readbacks(&self) -> u64 {
         self.spill_readbacks
@@ -897,19 +1195,30 @@ impl StatsWindowState {
                 + rf.others().len() as u64 * 56
                 + rf.null_mask().len() as u64 * 8
         }
+        fn soa_bytes(soa: &NumericSoA) -> u64 {
+            48 + soa.counts.len() as u64 * 8
+                + soa.sums.len() as u64 * 16
+                + soa.mins.len() as u64 * 16
+                + soa.maxs.len() as u64 * 16
+        }
         let mut total = 0u64;
         for chain in self.buckets.values() {
             for b in chain {
-                // StatsBucket: scope_key + touch + accs Vec 头 + 对齐
+                // StatsBucket: scope_key + touch + accs 载体 + 对齐
                 total += scope_key_bytes(&b.scope_key) + 64;
-                for acc in &b.accs {
-                    total += match acc {
-                        StatsAccum::Numeric(_) => 8 + 48,
-                        StatsAccum::Last(Some(rf)) => 16 + row_fields_bytes(rf),
-                        StatsAccum::Last(None) => 16,
-                        StatsAccum::Distinct(_) => 8 + 96,
-                        StatsAccum::Top(t) => 24 + t.len() as u64 * 176,
-                    };
+                match &b.accs {
+                    StatsBucketAccs::Numeric(soa) => total += soa_bytes(soa),
+                    StatsBucketAccs::Classic(accs) => {
+                        for acc in accs {
+                            total += match acc {
+                                StatsAccum::Numeric(_) => 8 + 48,
+                                StatsAccum::Last(Some(rf)) => 16 + row_fields_bytes(rf),
+                                StatsAccum::Last(None) => 16,
+                                StatsAccum::Distinct(_) => 8 + 96,
+                                StatsAccum::Top(t) => 24 + t.len() as u64 * 176,
+                            };
+                        }
+                    }
                 }
             }
             total += 24; // hashbrown 条目（hash + 值 + ctrl）
@@ -933,7 +1242,7 @@ impl StatsWindowState {
             self.warn_spill_full();
             return;
         }
-        let allowance = Self::bucket_allowance(plan);
+        let allowance = Self::bucket_allowance(plan, self.soa_layout.is_some());
         // 驱逐目标: 上限-单桶 与 上限 90% 取小（前者保证新桶放得下）。
         let target = limit
             .saturating_sub(allowance)
@@ -973,11 +1282,15 @@ impl StatsWindowState {
                 continue;
             }
             // 驱逐整链（先 clone 进 batch；落盘成功后才从桶表移除——写失败
-            // 不丢内存键）。
+            // 不丢内存键）。accs 载体 → spill 序列化向量（Classic clone / SoA 还原）。
             let c0 = std::time::Instant::now();
             let chain_len = chain.len();
             for b in chain.iter() {
-                batch.push((h, b.scope_key.clone(), b.accs.clone()));
+                batch.push((
+                    h,
+                    b.scope_key.clone(),
+                    accs_to_spill_vec(&b.accs, self.soa_layout.as_ref(), plan),
+                ));
             }
             batch_hashes.push(h);
             scan_ns += s0.elapsed().as_nanos() as u64;
@@ -1083,20 +1396,23 @@ impl StatsWindowState {
             // 不变量: 非 readback 的 spill 键与内存不相交——但防御性合并。
             match chain.iter_mut().find(|b| b.scope_key == key) {
                 Some(existing) => {
-                    for (t, o) in existing.accs.iter_mut().zip(accs.iter()) {
+                    // 双方统一转 spill 向量合并（Classic 直接; SoA 转出再转回）。
+                    let mut e = accs_to_spill_vec(&existing.accs, self.soa_layout.as_ref(), plan);
+                    for (t, o) in e.iter_mut().zip(accs.iter()) {
                         merge_accum(t, o);
                     }
+                    existing.accs = vec_to_bucket_accs(e, self.soa_layout.as_ref());
                 }
                 None => chain.push(StatsBucket {
                     scope_key: key,
-                    accs,
+                    accs: vec_to_bucket_accs(accs, self.soa_layout.as_ref()),
                     touch: TOUCH_MAX,
                 }),
             }
         }
         if let Some(u) = &self.spill_used {
             u.fetch_sub(
-                merged_n * Self::bucket_allowance(plan),
+                merged_n * Self::bucket_allowance(plan, self.soa_layout.is_some()),
                 std::sync::atomic::Ordering::SeqCst,
             );
         }
@@ -1125,12 +1441,72 @@ impl StatsWindowState {
         // 共享计数扣减：只扣实际读回的键（readback 键已在读回时扣过）。
         if let Some(u) = &self.spill_used {
             u.fetch_sub(
-                out.len() as u64 * Self::bucket_allowance(plan),
+                out.len() as u64 * Self::bucket_allowance(plan, self.soa_layout.is_some()),
                 std::sync::atomic::Ordering::SeqCst,
             );
         }
         out
     }
+}
+
+/// 累加器载体 → spill 序列化向量（Classic 直接 clone; Numeric SoA 按 plan
+/// 逐度量还原 [`NumericAccum`]——spill 序列化契约是 `Vec<StatsAccum>`）。
+/// 自由函数（非方法）: 驱逐/归并时 `buckets` 链被借用, 不可再借 `&self`。
+fn accs_to_spill_vec(
+    accs: &StatsBucketAccs,
+    layout: Option<&NumericSoALayout>,
+    plan: &StatsPlan,
+) -> Vec<StatsAccum> {
+    match accs {
+        StatsBucketAccs::Classic(v) => v.clone(),
+        StatsBucketAccs::Numeric(soa) => {
+            let layout = layout.expect("Numeric 载体即有布局");
+            (0..plan.measures.len())
+                .map(|i| {
+                    let count = soa.counts[i];
+                    let sum = layout.sum_slot[i]
+                        .map(|s| soa.sums[s as usize])
+                        .unwrap_or(0);
+                    let min = layout.min_slot[i].and_then(|s| soa.mins[s as usize]);
+                    let max = layout.max_slot[i].and_then(|s| soa.maxs[s as usize]);
+                    StatsAccum::Numeric(Box::new(NumericAccum {
+                        count,
+                        sum,
+                        min,
+                        max,
+                    }))
+                })
+                .collect()
+        }
+    }
+}
+
+/// spill 读回向量 → 累加器载体（按 soa_layout 分派：SoA 计划还原
+/// [`NumericSoA`], Classic 计划原样放回）。自由函数（同 [`accs_to_spill_vec`]）。
+fn vec_to_bucket_accs(
+    accs: Vec<StatsAccum>,
+    soa_layout: Option<&NumericSoALayout>,
+) -> StatsBucketAccs {
+    let Some(layout) = soa_layout else {
+        return StatsBucketAccs::Classic(accs);
+    };
+    let mut soa = layout.zeros();
+    for (i, acc) in accs.iter().enumerate() {
+        let StatsAccum::Numeric(n) = acc else {
+            panic!("SoA 计划 spill 读回应为 Numeric 累加器(致命)");
+        };
+        soa.counts[i] = n.count;
+        if let Some(s) = layout.sum_slot[i] {
+            soa.sums[s as usize] = n.sum;
+        }
+        if let Some(s) = layout.min_slot[i] {
+            soa.mins[s as usize] = n.min;
+        }
+        if let Some(s) = layout.max_slot[i] {
+            soa.maxs[s as usize] = n.max;
+        }
+    }
+    StatsBucketAccs::Numeric(soa)
 }
 
 /// 时钟二次机会计数上限（M5-2）：命中置此值，驱逐扫描递减到 0 才驱逐。
@@ -1141,26 +1517,83 @@ const TOUCH_MAX: u8 = 3;
 /// 必须小（q18 30M close 峰值 43GB → 22GB 的直接原因）。
 const SPILL_DRAIN_CHUNK: usize = 50_000;
 
-/// 单桶: 完整 [`ScopeKey`]（close 排序/输出; 每桶一次构建）+ 累加器数组。
+/// 限额记账（2026-08-27 拆为自由函数）: `entry` 匹配内 `buckets` 已被占用时,
+/// 限额字段（estimated_bytes/over_limit/limit_warned/rule_name）与 `buckets`
+/// 借用不相交, 可同时访问——语义与旧 `account_new_bucket` 方法完全一致。
+/// **碰撞路径专用**（同 hash 不同键, 概率 ~2e-11）：Vacant/未命中路径走
+/// `account_new_bucket`（含 spill 驱逐）——碰撞时链被借用, 无法调 &mut self。
+fn account_bucket_allowed(
+    limit_bytes: Option<u64>,
+    estimated_bytes: &mut u64,
+    over_limit_new_buckets: &mut u64,
+    limit_warned: &mut bool,
+    rule_name: &str,
+    allowance: u64,
+) -> bool {
+    if let Some(limit) = limit_bytes
+        && *estimated_bytes + allowance > limit
+    {
+        *over_limit_new_buckets += 1;
+        if !*limit_warned {
+            *limit_warned = true;
+            log::warn!(
+                "stats 状态内存超限（规则 {}, 估算 {}B / 上限 {}B）——拒绝新建键桶, 已有桶继续累积; 累计拒收 {} 行（新桶尝试）",
+                rule_name,
+                estimated_bytes,
+                limit,
+                over_limit_new_buckets
+            );
+        }
+        return false;
+    }
+    *estimated_bytes += allowance;
+    true
+}
+
+/// 桶累加器载体: 纯数值计划 → [`Numeric`](StatsBucketAccs::Numeric)（SoA, q17
+/// 形态）; 含 distinct/last/top → [`Classic`](StatsBucketAccs::Classic)（原有
+/// [`StatsAccum`] 数组）。分派在累积/读取/合并入口各一次（每行, 非每度量）。
+/// spill 序列化以 [`StatsWindowState::accs_to_spill_vec`] 统一转 `Vec<StatsAccum>`。
+#[derive(Debug, Clone)]
+pub enum StatsBucketAccs {
+    Numeric(NumericSoA),
+    Classic(Vec<StatsAccum>),
+}
+
+/// 单桶: 完整 [`ScopeKey`]（close 排序/输出; 每桶一次构建）+ 累加器载体 +
+/// 时钟二次机会计数。
 #[derive(Debug, Clone)]
 pub struct StatsBucket {
     pub scope_key: ScopeKey,
-    pub accs: Vec<StatsAccum>,
+    pub accs: StatsBucketAccs,
     /// 时钟（clock）算法的二次机会计数（M5-2：bool → u8，0..=TOUCH_MAX）。
     /// 命中置 TOUCH_MAX，驱逐扫描递减，到 0 才驱逐——活跃键最多保 3 轮
     /// （q18 每键回访 3.4 次，1 位二次机会过早踢掉活跃键致驱逐-回访抖动）。
-    /// spill 未启用时恒 0，零开销。
-    touch: u8,
+    /// spill 未启用时恒 0，零开销。pub(crate) 供 tests/ bench 构造。
+    pub(crate) touch: u8,
+}
+
+/// 新桶累加器载体（按计划形态分派）: 全数值 → SoA; 含 distinct/last/top →
+/// Classic（原有 [`StatsAccum`] 数组）。
+fn new_bucket_accs(plan: &StatsPlan, soa_layout: Option<&NumericSoALayout>) -> StatsBucketAccs {
+    match soa_layout {
+        Some(layout) => StatsBucketAccs::Numeric(layout.zeros()),
+        None => StatsBucketAccs::Classic(StatsAccum::accs_for_plan(plan)),
+    }
 }
 
 impl StatsWindowState {
     /// 预建空键单桶（`ScopeKey::Empty`）——哈希路径 `bucket_mut(&Empty)` 命中。
-    fn seed_empty_bucket(buckets: &mut EngineHashMap<u64, Vec<StatsBucket>>, plan: &StatsPlan) {
+    fn seed_empty_bucket(
+        buckets: &mut EngineHashMap<u64, Vec<StatsBucket>>,
+        plan: &StatsPlan,
+        soa_layout: Option<&NumericSoALayout>,
+    ) {
         buckets.insert(
             scope_key_hash(&ScopeKey::Empty),
             vec![StatsBucket {
                 scope_key: ScopeKey::Empty,
-                accs: StatsAccum::accs_for_plan(plan),
+                accs: new_bucket_accs(plan, soa_layout),
                 touch: 0,
             }],
         );
@@ -1170,19 +1603,14 @@ impl StatsWindowState {
     /// `keyed_bucket_mut` 同值, 链内按 ScopeKey 完整比较消歧。
     /// 新桶先过限额检查（超限 → spill 腾空间 → 仍超限 → None, 调用方跳过
     /// 该行——内存有界）。
-    fn bucket_mut(&mut self, key: &ScopeKey, plan: &StatsPlan) -> Option<&mut Vec<StatsAccum>> {
+    ///
+    /// **entry 借用取舍（2026-08-27 合并）**: 远程单查（`entry` 占用分支）在
+    /// spill 场景不适用——`Entry` 借用 `buckets` 期间无法调 `&mut self` 限额检查
+    /// （`account_new_bucket` 含 spill 驱逐）。命中路径退化为 get + get_mut 双查
+    /// （q18 每键回访 3.4 次, 2 次哈希 vs 1 次的开销可接受; q17 无 spill 时同）。
+    fn bucket_mut(&mut self, key: &ScopeKey, plan: &StatsPlan) -> Option<&mut StatsBucketAccs> {
         let hash = scope_key_hash(key);
-        // 先只读查找（entry 可变借用会与限额记账的 &mut self 冲突）。
-        let pos = self
-            .buckets
-            .get(&hash)
-            .and_then(|chain| chain.iter().position(|b| &b.scope_key == key));
-        if let Some(i) = pos {
-            let chain = self.buckets.get_mut(&hash).expect("命中即存在");
-            chain[i].touch = TOUCH_MAX; // 刷新时钟二次机会计数
-            return Some(&mut chain[i].accs);
-        }
-        // 未命中: 键可能已 spill → 读回（take 只读，M5-2）。
+        // 未命中前置检查: 键可能已 spill → 读回（take 只读，M5-2）。
         if self.spill_index.contains(&hash) {
             let taken = self
                 .spill
@@ -1198,20 +1626,29 @@ impl StatsWindowState {
             }
             return Some(self.readback_bucket_mut(hash, taken, plan));
         }
+        // 命中（不可变查 + 可变改）: 刷新二次机会计数。
+        if let Some(i) = self
+            .buckets
+            .get(&hash)
+            .and_then(|chain| chain.iter().position(|b| &b.scope_key == key))
+        {
+            let chain = self.buckets.get_mut(&hash).expect("命中即存在");
+            chain[i].touch = TOUCH_MAX;
+            return Some(&mut chain[i].accs);
+        }
+        // 未命中（新键）: 限额检查 + spill 驱逐（&mut self 自由）→ 建桶。
         if !self.account_new_bucket(plan) {
             return None;
         }
-        // 链 Vec 容量精确 1（2026-08-26 q18 状态 2.3× 归因）：`or_default()`
-        // 空 Vec push 1 个后 capacity=4（Rust 标准库 0→4 起步）→ 每链占 4 桶
-        // 容量（192B）实装 1 桶（48B）——q18 每键独立 hash（链均长 1.0）→
-        // 2935 万链 × 144B ≈ 4.2G 纯浪费。`with_capacity(1)` 精确 1 桶。
+        // 链 Vec 容量精确 1（2026-08-26 q18 状态 2.3× 归因）：空 Vec push
+        // 1 个后 capacity=4 → 每链 4 桶容量纯浪费。`with_capacity(1)` 精确 1 桶。
         let chain = self
             .buckets
             .entry(hash)
             .or_insert_with(|| Vec::with_capacity(1));
         chain.push(StatsBucket {
             scope_key: key.clone(),
-            accs: StatsAccum::accs_for_plan(plan),
+            accs: new_bucket_accs(plan, self.soa_layout.as_ref()),
             touch: 0,
         });
         self.clock.push_back(hash); // 创建序入队（队尾 = 最新）
@@ -1226,18 +1663,16 @@ impl StatsWindowState {
         hash: u64,
         taken: (ScopeKey, Vec<StatsAccum>),
         plan: &StatsPlan,
-    ) -> &mut Vec<StatsAccum> {
+    ) -> &mut StatsBucketAccs {
         self.spill_index.remove(&hash);
         self.readback.insert(hash);
         self.spill_readbacks += 1;
+        let allowance = Self::bucket_allowance(plan, self.soa_layout.is_some());
         if let Some(u) = &self.spill_used {
-            u.fetch_sub(
-                Self::bucket_allowance(plan),
-                std::sync::atomic::Ordering::SeqCst,
-            );
+            u.fetch_sub(allowance, std::sync::atomic::Ordering::SeqCst);
         }
-        self.estimated_bytes += Self::bucket_allowance(plan);
-        self.mem_add(Self::bucket_allowance(plan));
+        self.estimated_bytes += allowance;
+        self.mem_add(allowance);
         if let Some(limit) = self.limit_bytes
             && self.mem_used_bytes() > limit
         {
@@ -1249,7 +1684,7 @@ impl StatsWindowState {
             .or_insert_with(|| Vec::with_capacity(1));
         chain.push(StatsBucket {
             scope_key: taken.0,
-            accs: taken.1,
+            accs: vec_to_bucket_accs(taken.1, self.soa_layout.as_ref()),
             touch: TOUCH_MAX,
         });
         self.clock.push_back(hash);
@@ -1259,23 +1694,27 @@ impl StatsWindowState {
     /// 取/建一个桶（列式扁平键路径）: `hash` = 叶数组哈希, `comps` = 栈上叶
     /// 数组（列序）。链内按 `comps` 与完整键比较消歧; 未命中时构建完整键
     /// （每桶一次）。新桶先过限额检查（超限 → spill 腾空间 → 仍超限 → None）。
-    fn keyed_bucket_mut(
+    ///
+    /// **单次 entry 查找（2026-08-27 q17）**: 命中主流（在航 auction 窗口内
+    /// 重复引用 ~100%）, 旧 get + get_mut 双查找纯浪费。
+    /// pub(crate) 供 rules 段分解 bench（q17_rules_breakdown）。
+    pub(crate) fn keyed_bucket_mut(
         &mut self,
         hash: u64,
         comps: &[ScopeKey],
         plan: &StatsPlan,
-    ) -> Option<&mut Vec<StatsAccum>> {
-        let pos = self.buckets.get(&hash).and_then(|chain| {
+    ) -> Option<&mut StatsBucketAccs> {
+        // 命中检查（不可变查 + 可变改, 见 bucket_mut 的 entry 借用取舍注释）。
+        if let Some(i) = self.buckets.get(&hash).and_then(|chain| {
             chain
                 .iter()
                 .position(|b| comps_match(&b.scope_key, comps, 0, comps.len()))
-        });
-        if let Some(i) = pos {
+        }) {
             let chain = self.buckets.get_mut(&hash).expect("命中即存在");
             chain[i].touch = TOUCH_MAX; // 刷新时钟二次机会计数
             return Some(&mut chain[i].accs);
         }
-        // 未命中: 键可能已 spill → 读回（take 只读，M5-2）。
+        // 未命中前置检查: 键可能已 spill → 读回（take 只读，M5-2）。
         if self.spill_index.contains(&hash) {
             let taken = self
                 .spill
@@ -1294,14 +1733,14 @@ impl StatsWindowState {
         if !self.account_new_bucket(plan) {
             return None;
         }
+        let scope_key = scope_key_from_comps(comps);
         let chain = self
             .buckets
             .entry(hash)
             .or_insert_with(|| Vec::with_capacity(1));
-        let scope_key = scope_key_from_comps(comps);
         chain.push(StatsBucket {
             scope_key,
-            accs: StatsAccum::accs_for_plan(plan),
+            accs: new_bucket_accs(plan, self.soa_layout.as_ref()),
             touch: 0,
         });
         self.clock.push_back(hash); // 创建序入队（队尾 = 最新）
@@ -1309,7 +1748,7 @@ impl StatsWindowState {
     }
 
     /// 按完整键取桶（测试/调试用; 生产走哈希路径）。
-    pub fn find_bucket(&self, key: &ScopeKey) -> Option<&Vec<StatsAccum>> {
+    pub fn find_bucket(&self, key: &ScopeKey) -> Option<&StatsBucketAccs> {
         self.buckets
             .get(&scope_key_hash(key))
             .and_then(|chain| chain.iter().find(|b| &b.scope_key == key))
@@ -1319,9 +1758,9 @@ impl StatsWindowState {
     /// 清空并拍平全部桶（close 用）: `(ScopeKey, accs)` 按 ScopeKey 升序。
     /// 同时清零内存账本（新窗口重新累积; 拒收计数保留——指标用）。
     /// spill 启用时先并入 spill 键（每个键恰好一次, 见 [`Self::merge_spill_into_buckets`]）。
-    fn take_buckets(&mut self, plan: &StatsPlan) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+    fn take_buckets(&mut self, plan: &StatsPlan) -> Vec<(ScopeKey, StatsBucketAccs)> {
         self.merge_spill_into_buckets(plan);
-        let mut out: Vec<(ScopeKey, Vec<StatsAccum>)> = std::mem::take(&mut self.buckets)
+        let mut out: Vec<(ScopeKey, StatsBucketAccs)> = std::mem::take(&mut self.buckets)
             .into_values()
             .flat_map(|chain| chain.into_iter().map(|b| (b.scope_key, b.accs)))
             .collect();
@@ -1368,6 +1807,9 @@ pub struct StatsExecutor {
     /// 内部细节; None = 未配置共享 → 本片独立预算）。reset_window 用它恢复
     /// 新窗口的共享计数（与 `spill_redb` 同模式, 跨窗口保留）。
     mem_used_shared: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// 纯数值计划 SoA 布局（与 `window.soa_layout` 同源; executor 级副本——
+    /// 热路径在 `window` 被 `&mut` 借用时仍可读, 免借用冲突）。None = 非 SoA。
+    soa_layout: Option<NumericSoALayout>,
 }
 
 impl StatsExecutor {
@@ -1454,14 +1896,13 @@ impl StatsExecutor {
                 _ => None,
             })
             .collect();
-        // 空键规则预建 Empty 桶（快路径; 带 key 惰性建桶）。
-        let mut buckets = EngineHashMap::default();
-        if plan.keys.is_empty() {
-            StatsWindowState::seed_empty_bucket(&mut buckets, &plan);
-        }
+        // 空键规则预建 Empty 桶由 `StatsWindowState::new` 处理（快路径; 带 key
+        // 惰性建桶）。
+        let window = StatsWindowState::new(EngineHashMap::default(), &plan);
+        let soa_layout = window.soa_layout.clone();
         Self {
             plan,
-            window: StatsWindowState::new(buckets),
+            window,
             watermark_nanos: 0,
             unique_wheres,
             measure_where,
@@ -1470,6 +1911,7 @@ impl StatsExecutor {
             row_field_layout: None,
             spill_redb: None,
             mem_used_shared: None,
+            soa_layout,
         }
     }
 
@@ -1491,6 +1933,8 @@ impl StatsExecutor {
         self.ensure_spill_store();
         // where 结果缓存: 行间复用 buffer（无逐行分配）; 无 where 规则时保持空。
         let mut where_ok: Vec<bool> = Vec::with_capacity(self.unique_wheres.len());
+        // SoA 布局（纯数值计划; 行循环内 `self.window` 被 &mut 借用时仍可读）。
+        let soa_layout = self.soa_layout.as_ref();
         let has_row_measures = self
             .plan
             .measures
@@ -1539,99 +1983,140 @@ impl StatsExecutor {
             let Some(bucket) = self.window.bucket_mut(&bucket_key, &self.plan) else {
                 continue;
             };
-            for (idx, measure) in self.plan.measures.iter().enumerate() {
-                if let Some(wi) = self.measure_where[idx]
-                    && !where_ok[wi]
-                {
-                    continue;
+            // SoA 桶（纯数值计划）: 数组直写（无枚举/Box——行式路径同构）。
+            if let StatsBucketAccs::Numeric(soa) = bucket {
+                let layout = soa_layout.unwrap();
+                for (idx, measure) in self.plan.measures.iter().enumerate() {
+                    if let Some(wi) = self.measure_where[idx]
+                        && !where_ok[wi]
+                    {
+                        continue;
+                    }
+                    soa.counts[idx] += 1;
+                    if let Some(field) = &measure.field
+                        && let Some(val) = extract(row, field_name(field))
+                        && let Some(n) = value_to_i128(&val)
+                    {
+                        match measure.agg {
+                            StatsAggPlan::Sum | StatsAggPlan::Avg => {
+                                soa.sums[layout.sum_slot[idx].unwrap() as usize] += n;
+                            }
+                            StatsAggPlan::Min => {
+                                let s = layout.min_slot[idx].unwrap() as usize;
+                                let cur = &mut soa.mins[s];
+                                *cur = Some(match *cur {
+                                    Some(m) if m <= n => m,
+                                    _ => n,
+                                });
+                            }
+                            StatsAggPlan::Max => {
+                                let s = layout.max_slot[idx].unwrap() as usize;
+                                let cur = &mut soa.maxs[s];
+                                *cur = Some(match *cur {
+                                    Some(m) if m >= n => m,
+                                    _ => n,
+                                });
+                            }
+                            StatsAggPlan::Count => {}
+                            _ => unreachable!("SoA 桶仅数值度量"),
+                        }
+                    }
                 }
-                let acc = &mut bucket[idx];
-                // count 仅 Numeric 度量维护（avg 的 count/sum 同步——D6）;
-                // distinct/last/top 变体无 count（输出不读, 原字段为死状态）。
-                match measure.agg {
-                    StatsAggPlan::Count
-                    | StatsAggPlan::Sum
-                    | StatsAggPlan::Avg
-                    | StatsAggPlan::Min
-                    | StatsAggPlan::Max => {
-                        let nacc = acc.numeric_mut();
-                        nacc.count += 1;
-                        if let Some(field) = &measure.field
-                            && let Some(val) = extract(row, field_name(field))
-                        {
-                            match measure.agg {
-                                StatsAggPlan::Count => {}
-                                StatsAggPlan::Sum | StatsAggPlan::Avg => {
-                                    if let Some(n) = value_to_i128(&val) {
-                                        nacc.sum += n;
+            } else if let StatsBucketAccs::Classic(accs) = bucket {
+                for (idx, measure) in self.plan.measures.iter().enumerate() {
+                    if let Some(wi) = self.measure_where[idx]
+                        && !where_ok[wi]
+                    {
+                        continue;
+                    }
+                    let acc = &mut accs[idx];
+                    // count 仅 Numeric 度量维护（avg 的 count/sum 同步——D6）;
+                    // distinct/last/top 变体无 count（输出不读, 原字段为死状态）。
+                    match measure.agg {
+                        StatsAggPlan::Count
+                        | StatsAggPlan::Sum
+                        | StatsAggPlan::Avg
+                        | StatsAggPlan::Min
+                        | StatsAggPlan::Max => {
+                            let nacc = acc.numeric_mut();
+                            nacc.count += 1;
+                            if let Some(field) = &measure.field
+                                && let Some(val) = extract(row, field_name(field))
+                            {
+                                match measure.agg {
+                                    StatsAggPlan::Count => {}
+                                    StatsAggPlan::Sum | StatsAggPlan::Avg => {
+                                        if let Some(n) = value_to_i128(&val) {
+                                            nacc.sum += n;
+                                        }
                                     }
-                                }
-                                StatsAggPlan::Min => {
-                                    if let Some(n) = value_to_i128(&val) {
-                                        nacc.min = Some(match nacc.min {
-                                            Some(m) if m <= n => m,
-                                            _ => n,
-                                        });
+                                    StatsAggPlan::Min => {
+                                        if let Some(n) = value_to_i128(&val) {
+                                            nacc.min = Some(match nacc.min {
+                                                Some(m) if m <= n => m,
+                                                _ => n,
+                                            });
+                                        }
                                     }
-                                }
-                                StatsAggPlan::Max => {
-                                    if let Some(n) = value_to_i128(&val) {
-                                        nacc.max = Some(match nacc.max {
-                                            Some(m) if m >= n => m,
-                                            _ => n,
-                                        });
+                                    StatsAggPlan::Max => {
+                                        if let Some(n) = value_to_i128(&val) {
+                                            nacc.max = Some(match nacc.max {
+                                                Some(m) if m >= n => m,
+                                                _ => n,
+                                            });
+                                        }
                                     }
+                                    _ => unreachable!("Numeric 分派内仅数值度量"),
                                 }
-                                _ => unreachable!("Numeric 分派内仅数值度量"),
                             }
                         }
-                    }
-                    StatsAggPlan::DistinctCount => {
-                        if let Some(field) = &measure.field
-                            && let Some(val) = extract(row, field_name(field))
-                        {
-                            let key = value_to_distinct_key(&val);
-                            acc.distinct_mut().insert(key);
+                        StatsAggPlan::DistinctCount => {
+                            if let Some(field) = &measure.field
+                                && let Some(val) = extract(row, field_name(field))
+                            {
+                                let key = value_to_distinct_key(&val);
+                                acc.distinct_mut().insert(key);
+                            }
                         }
-                    }
-                    StatsAggPlan::Last | StatsAggPlan::Top => {
-                        if let Some(field) = &measure.field {
-                            if let Some(val) = extract(row, field_name(field)) {
-                                // 快速淘汰预检（在构建行字段前）: top 已满且 key 进不了
-                                // 前 N → 跳过, 免每行 row_fields 提取 + Arc 分配。
-                                // 与列式路径同一口径（value_to_f64 同义）。
-                                if measure.agg == StatsAggPlan::Top {
-                                    let n = measure.arg.unwrap_or(10) as usize;
-                                    if n == 0 {
-                                        continue; // top(0): 不保留任何条目
+                        StatsAggPlan::Last | StatsAggPlan::Top => {
+                            if let Some(field) = &measure.field {
+                                if let Some(val) = extract(row, field_name(field)) {
+                                    // 快速淘汰预检（在构建行字段前）: top 已满且 key 进不了
+                                    // 前 N → 跳过, 免每行 row_fields 提取 + Arc 分配。
+                                    // 与列式路径同一口径（value_to_f64 同义）。
+                                    if measure.agg == StatsAggPlan::Top {
+                                        let n = measure.arg.unwrap_or(10) as usize;
+                                        if n == 0 {
+                                            continue; // top(0): 不保留任何条目
+                                        }
+                                        if let Some(key) = value_to_f64(&val)
+                                            && let entries = acc.top()
+                                            && entries.len() == n
+                                            && key <= entries[n - 1].key
+                                        {
+                                            continue;
+                                        }
                                     }
-                                    if let Some(key) = value_to_f64(&val)
-                                        && let entries = acc.top()
-                                        && entries.len() == n
-                                        && key <= entries[n - 1].key
-                                    {
-                                        continue;
-                                    }
+                                    // 行式路径: 按 row_names 列序提取（与列式
+                                    // row_fields_from_batch 对齐; 同桶多 last 度量 Arc
+                                    // 共享 1 份内存）。
+                                    let row = row_cache.get_or_insert_with(|| {
+                                        row_fields_from_row(row, row_names.as_deref(), &row_layout)
+                                    });
+                                    let fidx = measure_field_position(
+                                        &self.plan,
+                                        &self.measure_field_idx,
+                                        idx,
+                                        row_names.as_deref(),
+                                    );
+                                    apply_last_top(acc, measure, row, fidx);
+                                } else if measure.agg == StatsAggPlan::Last {
+                                    // 字段缺失: last 仍保留整行（yield 读其它字段）
+                                    let row = row_cache.get_or_insert_with(|| {
+                                        row_fields_from_row(row, row_names.as_deref(), &row_layout)
+                                    });
+                                    *acc.last_mut() = Some(std::sync::Arc::clone(row));
                                 }
-                                // 行式路径: 按 row_names 列序提取（与列式
-                                // row_fields_from_batch 对齐; 同桶多 last 度量 Arc
-                                // 共享 1 份内存）。
-                                let row = row_cache.get_or_insert_with(|| {
-                                    row_fields_from_row(row, row_names.as_deref(), &row_layout)
-                                });
-                                let fidx = measure_field_position(
-                                    &self.plan,
-                                    &self.measure_field_idx,
-                                    idx,
-                                    row_names.as_deref(),
-                                );
-                                apply_last_top(acc, measure, row, fidx);
-                            } else if measure.agg == StatsAggPlan::Last {
-                                // 字段缺失: last 仍保留整行（yield 读其它字段）
-                                let row = row_cache.get_or_insert_with(|| {
-                                    row_fields_from_row(row, row_names.as_deref(), &row_layout)
-                                });
-                                *acc.last_mut() = Some(std::sync::Arc::clone(row));
                             }
                         }
                     }
@@ -1670,7 +2155,12 @@ impl StatsExecutor {
             .map(|b| {
                 (
                     b.scope_key.clone(),
-                    measure_values(&self.plan, &b.accs, &self.measure_field_idx),
+                    bucket_measure_values(
+                        &self.plan,
+                        &b.accs,
+                        self.window.soa_layout.as_ref(),
+                        &self.measure_field_idx,
+                    ),
                 )
             })
             .collect();
@@ -1695,20 +2185,18 @@ impl StatsExecutor {
     /// 批内桶序 = 传入序（调用方 `take_buckets_up_to` 已按 ScopeKey 升序）。
     pub fn close_buckets_to_rows(
         &self,
-        buckets: Vec<(ScopeKey, Vec<StatsAccum>)>,
+        buckets: Vec<(ScopeKey, StatsBucketAccs)>,
     ) -> Vec<StatsCloseBucket> {
         buckets
             .into_iter()
             .map(|(key, accs)| StatsCloseBucket {
                 key,
-                measures: self
-                    .plan
-                    .measures
-                    .iter()
-                    .zip(accs.iter())
-                    .zip(self.measure_field_idx.iter())
-                    .map(|((m, acc), fidx)| bucket_measure_entries(m, acc, *fidx))
-                    .collect(),
+                measures: bucket_close_entries(
+                    &self.plan,
+                    &accs,
+                    self.window.soa_layout.as_ref(),
+                    &self.measure_field_idx,
+                ),
             })
             .collect()
     }
@@ -1723,14 +2211,19 @@ impl StatsExecutor {
     /// 桶序 = 传入序（调用方 `take_buckets_up_to` 已按 ScopeKey 升序）。
     pub fn close_bucket_values(
         &self,
-        buckets: Vec<(ScopeKey, Vec<StatsAccum>)>,
+        buckets: Vec<(ScopeKey, StatsBucketAccs)>,
     ) -> Vec<(ScopeKey, Vec<f64>)> {
         buckets
             .into_iter()
             .map(|(key, accs)| {
                 (
                     key,
-                    measure_values(&self.plan, &accs, &self.measure_field_idx),
+                    bucket_measure_values(
+                        &self.plan,
+                        &accs,
+                        self.window.soa_layout.as_ref(),
+                        &self.measure_field_idx,
+                    ),
                 )
             })
             .collect()
@@ -1745,7 +2238,7 @@ impl StatsExecutor {
     /// 2026-08-26 review: 用 `retain` 原地移除已取链——v1 用 `mem::take` 全表 +
     /// 剩余重插新 HashMap（每批 O(剩余) 哈希 + 分配, 100M 30 批 ≈ 4.4 亿次重插
     /// close +~9s）; retain 每批 O(n) 轻量回调（无哈希重建, close ~3s）。
-    pub fn take_buckets_up_to(&mut self, n: usize) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+    pub fn take_buckets_up_to(&mut self, n: usize) -> Vec<(ScopeKey, StatsBucketAccs)> {
         let mut out = Vec::new();
         if n == 0 {
             return out;
@@ -1773,7 +2266,7 @@ impl StatsExecutor {
     /// 批大小 clamp 到 [`SPILL_DRAIN_CHUNK`]（默认 5 万, `WF_SPILL_DRAIN_CHUNK`
     /// 可调）——与输出 `emit_chunk`（默认 100 万）解耦: 输出批大没关系,
     /// 但**从 redb 读回的批必须小**（反序列化驻留是 close 内存峰值的直接来源）。
-    pub fn take_next_close_batch(&mut self, n: usize) -> Vec<(ScopeKey, Vec<StatsAccum>)> {
+    pub fn take_next_close_batch(&mut self, n: usize) -> Vec<(ScopeKey, StatsBucketAccs)> {
         let n = n.min(SPILL_DRAIN_CHUNK);
         let mut out = Vec::with_capacity(n);
         if n == 0 {
@@ -1783,6 +2276,11 @@ impl StatsExecutor {
         // spill 批补足配额（两源之和 ≤ n）; 批内排序后与内存批归并。
         let spill_n = n.saturating_sub(mem.len()).max(1);
         let mut spill = self.window.spill_drain_up_to(spill_n, &self.plan);
+        // spill 序列化契约是 Vec<StatsAccum> → 转回桶累加器载体（统一两源类型）。
+        let mut spill: Vec<(ScopeKey, StatsBucketAccs)> = spill
+            .into_iter()
+            .map(|(k, accs)| (k, vec_to_bucket_accs(accs, self.window.soa_layout.as_ref())))
+            .collect();
         spill.sort_by(|a, b| a.0.cmp(&b.0));
         // 归并两个有序序列（peek 比较 + next 取走, 无 clone）。
         let mut mem_iter = mem.into_iter().peekable();
@@ -1840,10 +2338,6 @@ impl StatsExecutor {
         // 释放本窗占用的共享内存计数（流式 close 分批取桶但账本未递减;
         // take_buckets 路径已扣, 此处为 0 幂等）。预算随窗口释放可复用。
         self.window.mem_sub(self.window.estimated_bytes);
-        let mut buckets = EngineHashMap::default();
-        if self.plan.keys.is_empty() {
-            StatsWindowState::seed_empty_bucket(&mut buckets, &self.plan);
-        }
         let limit = self.window.limit_bytes;
         let rule_name = self.window.rule_name.clone();
         let over_limit = self.window.over_limit_new_buckets;
@@ -1853,7 +2347,8 @@ impl StatsExecutor {
         let spill_clone_ns = self.window.spill_clone_ns;
         let spill_write_ns = self.window.spill_write_ns;
         let spill_evict_calls = self.window.spill_evict_calls;
-        self.window = StatsWindowState::new(buckets);
+        // 空键 Empty 桶由 new 预建（keys 空时）; SoA 布局按 plan 重算。
+        self.window = StatsWindowState::new(EngineHashMap::default(), &self.plan);
         // 保留限额配置 + 规则级共享内存计数（executor 字段持有）+ 拒收/抖动
         // 计数跨窗口（guard 持续生效; 计数供指标/告警）。spill 不跨窗口（store
         // 已 cleanup 丢弃, 文件删除; 共享落盘计数由 ensure_spill_store 重新注入）。
@@ -1958,7 +2453,7 @@ impl StatsExecutor {
     /// 返回 `(桶原始状态, 本片事件数)`——协调片把它合并进自己的窗口后再 close。
     /// 仅空键/可交换度量（count/sum/min/max/distinct）分片使用（last/top 被
     /// spawn 门控排除——行序敏感不可归并）。
-    pub fn take_partial(&mut self) -> (Vec<(ScopeKey, Vec<StatsAccum>)>, u64) {
+    pub fn take_partial(&mut self) -> (Vec<(ScopeKey, StatsBucketAccs)>, u64) {
         let buckets = self.window.take_buckets(&self.plan);
         let count = self.window.event_count;
         self.reset_window();
@@ -1973,15 +2468,13 @@ impl StatsExecutor {
     /// close 里阻塞 tokio worker, 与其余片 ingest 争核 → EPS 5.96~7.86M 波动
     /// （比串行 7.86M 更差）。q15 EOS 归并 ~883ms 是固定尾部成本; 若要并行须
     /// 走 `spawn_blocking`/异步任务（数据移出 `&mut self`, 未做）。
-    pub fn merge_partial(&mut self, buckets: Vec<(ScopeKey, Vec<StatsAccum>)>, event_count: u64) {
+    pub fn merge_partial(&mut self, buckets: Vec<(ScopeKey, StatsBucketAccs)>, event_count: u64) {
         for (key, accs) in buckets {
             // 超限（guard）→ 该片该键跳过（协调片侧同样受桶预算约束）。
             let Some(target) = self.window.bucket_mut(&key, &self.plan) else {
                 continue;
             };
-            for (t, o) in target.iter_mut().zip(accs.iter()) {
-                merge_accum(t, o);
-            }
+            merge_bucket_accs(target, accs);
         }
         self.window.event_count += event_count;
         // 2026-08-26 q16：分片归并后刷新估算（distinct union 可能大幅增长）。
@@ -2004,6 +2497,27 @@ impl StatsExecutor {
     /// 列式批处理（P1.5, 设计 §6.2）+ 行子集（P2 分片: `rows` = 本片拥有的
     /// 行索引; `None` = 全批）。归并只对行域内的行生效; where mask 仍整批计算。
     pub fn process_batch_rows(&mut self, batch: &RecordBatch, rows: Option<&[u32]>) -> bool {
+        self.process_batch_rows_impl(batch, rows, None)
+    }
+
+    /// 分片缓存版（2026-08-27 q17）: where mask 经 [`StatsMaskCache`] 分片共享——
+    /// 同一批被 S 片各自整批 eval 的重复（S×）消除为首片 1×（其余片 Arc 命中）。
+    /// 语义与 [`Self::process_batch_rows`] 完全一致（mask 为批的纯函数）。
+    pub fn process_batch_rows_cached(
+        &mut self,
+        batch: &RecordBatch,
+        rows: Option<&[u32]>,
+        cache: &StatsMaskCache,
+    ) -> bool {
+        self.process_batch_rows_impl(batch, rows, Some(cache))
+    }
+
+    fn process_batch_rows_impl(
+        &mut self,
+        batch: &RecordBatch,
+        rows: Option<&[u32]>,
+        mask_cache: Option<&StatsMaskCache>,
+    ) -> bool {
         // 前置（**必须在任何累加副作用之前**——返回 false 时调用方回退
         // process_rows, 部分应用会把已累加的计数再算一遍）:
         // 1. 全部 where 表达式可列式化（eval_guard_columnar 对不可列式表达式
@@ -2039,12 +2553,22 @@ impl StatsExecutor {
         // 归并段（段 1d/段 2）改为**行域驱动**（count_domain/sum_domain/
         // insert_distinct_domain 只遍历本片行）——不再构建全批 domain mask。
         let view = ColumnarBatch::from_all_fields(batch);
-        // 段 1: where 列式 mask（去重后唯一条件, 每批一次）
-        let masks: Vec<BooleanArray> = self
-            .unique_wheres
-            .iter()
-            .map(|e| eval_guard_columnar(e, &view))
-            .collect();
+        // 段 1: where 列式 mask（去重后唯一条件, 每批一次; 分片缓存版共享首片结果）。
+        let masks: Vec<BooleanArray> = match mask_cache {
+            Some(cache) => (*cache.get_or_compute(batch, || {
+                let view = ColumnarBatch::from_all_fields(batch);
+                self.unique_wheres
+                    .iter()
+                    .map(|e| eval_guard_columnar(e, &view))
+                    .collect()
+            }))
+            .clone(), // Vec<BooleanArray> clone = 列数组 Arc 浅拷贝
+            None => self
+                .unique_wheres
+                .iter()
+                .map(|e| eval_guard_columnar(e, &view))
+                .collect(),
+        };
         // 行字段列名（P5）: 子集 → 直接用; None → 排序的 schema 字段名（与行式
         // None 同序, 任务层注入同序）。仅 last/top 计划需要。
         let has_row_measures = self
@@ -2076,6 +2600,19 @@ impl StatsExecutor {
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
         });
+        // 度量字段列索引（2026-08-27 q17 修复）: 每批预解析一次, 免逐行逐度量
+        // `schema().index_of` 线性扫描——q17 4 个数值度量 min/max/avg/sum 全命中
+        // 旧缺陷（column_i128 每行 index_of + downcast）。count 无字段 → None。
+        let measure_field_cols: Vec<Option<usize>> = self
+            .plan
+            .measures
+            .iter()
+            .map(|m| {
+                m.field
+                    .as_ref()
+                    .and_then(|f| batch.schema().index_of(field_name(f)).ok())
+            })
+            .collect();
         // 带 key（P2）: 逐行按桶归并（mask 列式 + 桶键列式, 无解释器 eval）。
         // 空键保持整列归并快路径（P1.5）。
         if !self.plan.keys.is_empty() {
@@ -2090,47 +2627,91 @@ impl StatsExecutor {
                 rows,
                 row_names.as_deref(),
                 row_field_cols.as_deref(),
+                &measure_field_cols,
             );
         }
         // 段 1d: 纯归并度量整列累加（**行域驱动**——2026-08-24 分片裁剪: 只遍历
         // 本片行, 消除每片对全批的 O(n) 冗余扫描; 全批路径 `rows=None` 行为不变）。
         // 行式语义: 满足 where 的行对**每个**度量都 `count += 1`（在字段读取前）
         // ——avg 的 count 必须与 sum 同步累加, 否则 avg = sum/count 输出 0（D6）。
-        for (idx, measure) in self.plan.measures.iter().enumerate() {
-            let wi = self.measure_where[idx];
-            // 空键规则恒单桶（预建, 不参与限额——guard 只针对键空间膨胀）。
-            let acc = &mut self
-                .window
-                .bucket_mut(&ScopeKey::Empty, &self.plan)
-                .expect("Empty 桶恒存在")[idx];
-            let rows_in = count_domain(rows, n, &masks, wi);
-            match measure.agg {
-                StatsAggPlan::Count => {
-                    acc.numeric_mut().count += rows_in;
-                }
-                StatsAggPlan::Sum | StatsAggPlan::Avg => {
-                    let nacc = acc.numeric_mut();
-                    nacc.count += rows_in;
-                    if let Some(field) = &measure.field
-                        && let Some(col) = numeric_col(batch, field_name(field))
-                    {
-                        nacc.sum += sum_domain(&col, rows, n, &masks, wi);
+        let soa_layout = self.soa_layout.as_ref();
+        // 空键规则恒单桶（预建, 不参与限额——guard 只针对键空间膨胀）。
+        let bucket = self
+            .window
+            .bucket_mut(&ScopeKey::Empty, &self.plan)
+            .expect("Empty 桶恒存在");
+        if let StatsBucketAccs::Numeric(soa) = bucket {
+            let layout = soa_layout.unwrap();
+            for (idx, measure) in self.plan.measures.iter().enumerate() {
+                let wi = self.measure_where[idx];
+                let rows_in = count_domain(rows, n, &masks, wi);
+                match measure.agg {
+                    StatsAggPlan::Count => {
+                        soa.counts[idx] += rows_in;
                     }
-                }
-                StatsAggPlan::Min | StatsAggPlan::Max => {
-                    let nacc = acc.numeric_mut();
-                    nacc.count += rows_in;
-                    if let Some(field) = &measure.field
-                        && let Some(col) = numeric_col(batch, field_name(field))
-                    {
-                        minmax_domain(&col, rows, n, &masks, wi, &mut nacc.min, &mut nacc.max);
+                    StatsAggPlan::Sum | StatsAggPlan::Avg => {
+                        soa.counts[idx] += rows_in;
+                        if let Some(field) = &measure.field
+                            && let Some(col) = numeric_col(batch, field_name(field))
+                        {
+                            let s = layout.sum_slot[idx].unwrap() as usize;
+                            soa.sums[s] += sum_domain(&col, rows, n, &masks, wi);
+                        }
                     }
+                    StatsAggPlan::Min => {
+                        soa.counts[idx] += rows_in;
+                        if let Some(field) = &measure.field
+                            && let Some(col) = numeric_col(batch, field_name(field))
+                        {
+                            let s = layout.min_slot[idx].unwrap() as usize;
+                            minmax_domain_one(&col, rows, n, &masks, wi, true, &mut soa.mins[s]);
+                        }
+                    }
+                    StatsAggPlan::Max => {
+                        soa.counts[idx] += rows_in;
+                        if let Some(field) = &measure.field
+                            && let Some(col) = numeric_col(batch, field_name(field))
+                        {
+                            let s = layout.max_slot[idx].unwrap() as usize;
+                            minmax_domain_one(&col, rows, n, &masks, wi, false, &mut soa.maxs[s]);
+                        }
+                    }
+                    _ => unreachable!("SoA 桶仅数值度量"),
                 }
-                StatsAggPlan::DistinctCount => {
-                    // 输出只用 distinct_set（无 count 字段——原 count 维护为死状态）
-                }
-                StatsAggPlan::Last | StatsAggPlan::Top => {
-                    // P1 不实现（Q18/Q19 扩展）
+            }
+        } else if let StatsBucketAccs::Classic(accs) = bucket {
+            for (idx, measure) in self.plan.measures.iter().enumerate() {
+                let wi = self.measure_where[idx];
+                let acc = &mut accs[idx];
+                let rows_in = count_domain(rows, n, &masks, wi);
+                match measure.agg {
+                    StatsAggPlan::Count => {
+                        acc.numeric_mut().count += rows_in;
+                    }
+                    StatsAggPlan::Sum | StatsAggPlan::Avg => {
+                        let nacc = acc.numeric_mut();
+                        nacc.count += rows_in;
+                        if let Some(field) = &measure.field
+                            && let Some(col) = numeric_col(batch, field_name(field))
+                        {
+                            nacc.sum += sum_domain(&col, rows, n, &masks, wi);
+                        }
+                    }
+                    StatsAggPlan::Min | StatsAggPlan::Max => {
+                        let nacc = acc.numeric_mut();
+                        nacc.count += rows_in;
+                        if let Some(field) = &measure.field
+                            && let Some(col) = numeric_col(batch, field_name(field))
+                        {
+                            minmax_domain(&col, rows, n, &masks, wi, &mut nacc.min, &mut nacc.max);
+                        }
+                    }
+                    StatsAggPlan::DistinctCount => {
+                        // 输出只用 distinct_set（无 count 字段——原 count 维护为死状态）
+                    }
+                    StatsAggPlan::Last | StatsAggPlan::Top => {
+                        // P1 不实现（Q18/Q19 扩展）
+                    }
                 }
             }
         }
@@ -2146,10 +2727,19 @@ impl StatsExecutor {
                 continue;
             }
             let wi = self.measure_where[idx];
-            let acc = &mut self
+            // distinct/last/top 计划恒 Classic（soa_layout 仅纯数值计划）——
+            // 解包取数组（形态不符 = 内部错误）。
+            let accs = match self
                 .window
                 .bucket_mut(&ScopeKey::Empty, &self.plan)
-                .expect("Empty 桶恒存在")[idx];
+                .expect("Empty 桶恒存在")
+            {
+                StatsBucketAccs::Classic(accs) => accs,
+                StatsBucketAccs::Numeric(_) => {
+                    unreachable!("distinct/last/top 计划不走 SoA 桶")
+                }
+            };
+            let acc = &mut accs[idx];
             if matches!(measure.agg, StatsAggPlan::DistinctCount) {
                 let Some(field) = &measure.field else {
                     continue;
@@ -2198,6 +2788,7 @@ impl StatsExecutor {
         rows: Option<&[u32]>,
         row_names: Option<&[String]>,
         row_field_cols: Option<&[Option<usize>]>,
+        measure_field_cols: &[Option<usize>],
     ) -> bool {
         // 局部寄存器计数（F1 修复的 event_count 口径 + 零热路径开销）: 归并成功
         // 才计, 批末一次性写回——避免每行一次 `self.window.event_count += 1` 的
@@ -2217,6 +2808,7 @@ impl StatsExecutor {
                         r as usize,
                         row_names,
                         row_field_cols,
+                        measure_field_cols,
                     ) {
                         counted += 1;
                     }
@@ -2232,6 +2824,7 @@ impl StatsExecutor {
                         row,
                         row_names,
                         row_field_cols,
+                        measure_field_cols,
                     ) {
                         counted += 1;
                     }
@@ -2246,9 +2839,9 @@ impl StatsExecutor {
     /// 返回 `true` = 归并成功（行计入 event_count）; `false` = 键 null/超限拒收
     /// （行跳过, 不计入——F1 行式/列式对拍口径）。
     ///
-    /// 字段读取走**原生列值**（`column_i128`/`column_distinct_key`）——与空键
-    /// 列式段同精度（D7/D8: ≥2^53 的 Int64 不得经 `Value::Number(f64)` 舍入;
-    /// Timestamp 列 distinct 也走原生 i64, 不得静默跳过）。
+    /// 字段读取走**原生列值**（`column_i128_at`/`column_distinct_key_at`, 列索引
+    /// 批级预解析——与空键列式段同精度（D7/D8: ≥2^53 的 Int64 不得经
+    /// `Value::Number(f64)` 舍入; Timestamp 列 distinct 也走原生 i64, 不得静默跳过）。
     ///
     /// **复合键优化（P5+）**: 键数 ≤ 4 走扁平键路径——栈上叶数组（`key_column_comp`
     /// 预解析列, 无 Box 分配/无逐行 downcast）→ `comps_hash` → `keyed_bucket_mut`
@@ -2264,11 +2857,14 @@ impl StatsExecutor {
         row: usize,
         row_names: Option<&[String]>,
         row_field_cols: Option<&[Option<usize>]>,
+        measure_field_cols: &[Option<usize>],
     ) -> bool {
         const MAX_STACK_KEYS: usize = 4;
         // 2026-08-26 q18/q19：行字段 layout（首次从 schema 构建并缓存）；
-        // 在桶借用前取（ensure 需 &mut self）。
+        // 在桶借用前取（ensure 需 &mut self）。soa_layout 同源取——窗口被 &mut
+        // 借用时仍可读（字段级拆分借用）。
         let row_layout = self.ensure_row_field_layout(batch);
+        let soa_layout = self.soa_layout.as_ref();
         if key_columns.len() <= MAX_STACK_KEYS {
             let mut comps: [ScopeKey; MAX_STACK_KEYS] = std::array::from_fn(|_| ScopeKey::Empty);
             for (i, kc) in key_columns.iter().enumerate() {
@@ -2283,8 +2879,9 @@ impl StatsExecutor {
             let Some(bucket) = self.window.keyed_bucket_mut(hash, comps, &self.plan) else {
                 return false;
             };
-            accumulate_column_row(
+            accumulate_bucket_row(
                 bucket,
+                soa_layout,
                 &self.plan,
                 &self.measure_where,
                 &self.measure_field_idx,
@@ -2294,6 +2891,7 @@ impl StatsExecutor {
                 masks,
                 row,
                 &row_layout,
+                measure_field_cols,
             );
             return true;
         }
@@ -2304,8 +2902,9 @@ impl StatsExecutor {
         let Some(bucket) = self.window.bucket_mut(&key, &self.plan) else {
             return false;
         };
-        accumulate_column_row(
+        accumulate_bucket_row(
             bucket,
+            soa_layout,
             &self.plan,
             &self.measure_where,
             &self.measure_field_idx,
@@ -2315,18 +2914,119 @@ impl StatsExecutor {
             masks,
             row,
             &row_layout,
+            measure_field_cols,
         );
         true
     }
 }
 
+/// 单行桶累加入口（按桶形态分派一次）: SoA → [`accumulate_soa`]; Classic →
+/// [`accumulate_column_row`]（枚举/Box 循环）。分派每行一次（非每度量）——
+/// SoA 计划的热路径进入后无枚举分派无 Box 解引用。
+#[allow(clippy::too_many_arguments)] // 与 accumulate_column_row 同签名族 + soa_layout
+fn accumulate_bucket_row(
+    bucket: &mut StatsBucketAccs,
+    soa_layout: Option<&NumericSoALayout>,
+    plan: &StatsPlan,
+    measure_where: &[Option<usize>],
+    measure_field_idx: &[Option<usize>],
+    row_names: Option<&[String]>,
+    row_field_cols: Option<&[Option<usize>]>,
+    batch: &RecordBatch,
+    masks: &[BooleanArray],
+    row: usize,
+    row_layout: &std::sync::Arc<RowFieldLayout>,
+    measure_field_cols: &[Option<usize>],
+) {
+    match bucket {
+        StatsBucketAccs::Numeric(soa) => accumulate_soa(
+            soa,
+            soa_layout.unwrap(),
+            measure_where,
+            measure_field_cols,
+            batch,
+            masks,
+            row,
+        ),
+        StatsBucketAccs::Classic(accs) => accumulate_column_row(
+            accs,
+            plan,
+            measure_where,
+            measure_field_idx,
+            row_names,
+            row_field_cols,
+            batch,
+            masks,
+            row,
+            row_layout,
+            measure_field_cols,
+        ),
+    }
+}
+
+/// 单行 SoA 桶累加（纯数值计划; 2026-08-27 q17）: 段 1 counts 全度量（含 where
+/// 过滤）; 段 2 按字段分组数值更新——同字段度量共享 1 次 [`column_i128_at`]
+/// （旧路径 sum/avg/min/max 各自读取同一列, 每行 4 次重复）。免: 每度量枚举
+/// 分派 + `Box` 解引用 + 同列重复列读取。pub(crate) 供 SoA 对照 bench。
+pub(crate) fn accumulate_soa(
+    soa: &mut NumericSoA,
+    layout: &NumericSoALayout,
+    measure_where: &[Option<usize>],
+    measure_field_cols: &[Option<usize>],
+    batch: &RecordBatch,
+    masks: &[BooleanArray],
+    row: usize,
+) {
+    for (idx, wi) in measure_where.iter().enumerate() {
+        if let Some(wi) = wi
+            && !masks[*wi].value(row)
+        {
+            continue;
+        }
+        soa.counts[idx] += 1;
+    }
+    for g in layout.groups.iter() {
+        // 组内度量同字段 → 列索引相同; 取第一个度量的批级列索引读一次。
+        let Some(ci) = measure_field_cols[g.entries[0].0] else {
+            continue;
+        };
+        let Some(v) = column_i128_at(batch, ci, row) else {
+            continue;
+        };
+        for &(idx, kind) in g.entries.iter() {
+            match kind {
+                NumericKind::Sum => {
+                    soa.sums[layout.sum_slot[idx].unwrap() as usize] += v;
+                }
+                NumericKind::Min => {
+                    let s = layout.min_slot[idx].unwrap() as usize;
+                    let cur = &mut soa.mins[s];
+                    *cur = Some(match *cur {
+                        Some(m) if m <= v => m,
+                        _ => v,
+                    });
+                }
+                NumericKind::Max => {
+                    let s = layout.max_slot[idx].unwrap() as usize;
+                    let cur = &mut soa.maxs[s];
+                    *cur = Some(match *cur {
+                        Some(m) if m >= v => m,
+                        _ => v,
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// 单行桶累加主体（列式路径; 自由函数——调用点持有 `&mut self.window` 桶借用,
-/// 方法会整 self 借用冲突）。
+/// 方法会整 self 借用冲突）。**Classic 路径**（含 distinct/last/top 的计划）;
+/// 纯数值计划走 [`accumulate_soa`]。
 ///
 /// last/top 行字段每行懒提取一次, 多度量共享同一 Arc（Q18 4 个 last 度量内存
-/// 1 份; 提取列序 = row_names, 免整行 8 字段）。
+/// 1 份; 提取列序 = row_names, 免整行 8 字段）。pub(crate) 供 SoA 对照 bench。
 #[allow(clippy::too_many_arguments)] // 单行桶累加: 桶/计划/掩码索引/行字段/列/行号 6 组参数
-fn accumulate_column_row(
+pub(crate) fn accumulate_column_row(
     bucket: &mut [StatsAccum],
     plan: &StatsPlan,
     measure_where: &[Option<usize>],
@@ -2337,6 +3037,7 @@ fn accumulate_column_row(
     masks: &[BooleanArray],
     row: usize,
     row_layout: &std::sync::Arc<RowFieldLayout>,
+    measure_field_cols: &[Option<usize>],
 ) {
     let mut row_cache: Option<std::sync::Arc<RowFields>> = None;
     for (idx, measure) in plan.measures.iter().enumerate() {
@@ -2356,18 +3057,20 @@ fn accumulate_column_row(
             | StatsAggPlan::Max => {
                 let nacc = acc.numeric_mut();
                 nacc.count += 1;
-                let Some(field) = &measure.field else {
+                // 度量字段列索引（批级预解析, 免每行 schema.index_of——q17 修复）;
+                // count 无字段 → None → 只计数。
+                let Some(ci) = measure_field_cols[idx] else {
                     continue;
                 };
                 match measure.agg {
                     StatsAggPlan::Count => {}
                     StatsAggPlan::Sum | StatsAggPlan::Avg => {
-                        if let Some(nn) = column_i128(batch, field_name(field), row) {
+                        if let Some(nn) = column_i128_at(batch, ci, row) {
                             nacc.sum += nn;
                         }
                     }
                     StatsAggPlan::Min => {
-                        if let Some(nn) = column_i128(batch, field_name(field), row) {
+                        if let Some(nn) = column_i128_at(batch, ci, row) {
                             nacc.min = Some(match nacc.min {
                                 Some(m) if m <= nn => m,
                                 _ => nn,
@@ -2375,7 +3078,7 @@ fn accumulate_column_row(
                         }
                     }
                     StatsAggPlan::Max => {
-                        if let Some(nn) = column_i128(batch, field_name(field), row) {
+                        if let Some(nn) = column_i128_at(batch, ci, row) {
                             nacc.max = Some(match nacc.max {
                                 Some(m) if m >= nn => m,
                                 _ => nn,
@@ -2386,8 +3089,8 @@ fn accumulate_column_row(
                 }
             }
             StatsAggPlan::DistinctCount => {
-                if let Some(field) = &measure.field
-                    && let Some(k) = column_distinct_key(batch, field_name(field), row)
+                if let Some(ci) = measure_field_cols[idx]
+                    && let Some(k) = column_distinct_key_at(batch, ci, row)
                 {
                     acc.distinct_mut().insert(k);
                 }
@@ -2488,6 +3191,43 @@ fn merge_accum(t: &mut StatsAccum, o: &StatsAccum) {
             // 行序敏感度量不走分片归并（spawn 门控）; 防御性静默（对齐旧行为）。
         }
         _ => unreachable!("StatsAccum 归并变体不匹配（plan 与构造不一致的内部错误）"),
+    }
+}
+
+/// 归并两个桶累加器载体（分派按桶形态; 同 plan 两片恒同形态——不一致为内部
+/// 错误）。SoA: 平行数组逐元素合并; Classic: 走 [`merge_accum`]。
+fn merge_bucket_accs(t: &mut StatsBucketAccs, o: StatsBucketAccs) {
+    match (t, o) {
+        (StatsBucketAccs::Numeric(t), StatsBucketAccs::Numeric(o)) => {
+            for (i, c) in o.counts.iter().enumerate() {
+                t.counts[i] += c;
+            }
+            for (i, s) in o.sums.iter().enumerate() {
+                t.sums[i] += s;
+            }
+            for (i, m) in o.mins.iter().enumerate() {
+                if let Some(v) = *m {
+                    t.mins[i] = Some(match t.mins[i] {
+                        Some(x) if x <= v => x,
+                        _ => v,
+                    });
+                }
+            }
+            for (i, m) in o.maxs.iter().enumerate() {
+                if let Some(v) = *m {
+                    t.maxs[i] = Some(match t.maxs[i] {
+                        Some(x) if x >= v => x,
+                        _ => v,
+                    });
+                }
+            }
+        }
+        (StatsBucketAccs::Classic(t), StatsBucketAccs::Classic(o)) => {
+            for (t, o) in t.iter_mut().zip(o.iter()) {
+                merge_accum(t, o);
+            }
+        }
+        _ => unreachable!("StatsBucketAccs 归并形态不匹配（同 plan 两片恒同形态）"),
     }
 }
 
@@ -2844,6 +3584,81 @@ fn value_to_distinct_key(v: &Value) -> DistinctKey {
 /// 由 `plan.measures` + 桶累加器计算度量值（avg 输出时 sum/count, D6）。
 /// last 取字段数值（非数值 → 0; 无子集时 idx 未知 → 0, 标量访问器需子集）;
 /// top 为多值不适用, 返回 0（rich close 用）。
+/// SoA 桶 → 每度量 f64 值（语义与 [`measure_values`] 的 Numeric 分支一致:
+/// count/sum 直取、avg = sum/count（count==0 → 0.0）、min/max unwrap_or(0)）。
+/// pub(crate) 供 SoA 对照 bench。
+pub(crate) fn measure_values_soa(
+    plan: &StatsPlan,
+    soa: &NumericSoA,
+    layout: &NumericSoALayout,
+) -> Vec<f64> {
+    plan.measures
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| match m.agg {
+            StatsAggPlan::Count => soa.counts[idx] as f64,
+            StatsAggPlan::Sum => soa.sums[layout.sum_slot[idx].unwrap() as usize] as f64,
+            StatsAggPlan::Avg => {
+                let s = layout.sum_slot[idx].unwrap() as usize;
+                let n = soa.counts[idx];
+                if n == 0 {
+                    0.0
+                } else {
+                    soa.sums[s] as f64 / n as f64
+                }
+            }
+            StatsAggPlan::Min => {
+                soa.mins[layout.min_slot[idx].unwrap() as usize].unwrap_or(0) as f64
+            }
+            StatsAggPlan::Max => {
+                soa.maxs[layout.max_slot[idx].unwrap() as usize].unwrap_or(0) as f64
+            }
+            _ => unreachable!("SoA 桶仅数值度量（count/sum/avg/min/max）"),
+        })
+        .collect()
+}
+
+/// 桶累加器 → 每度量 f64 值（按桶形态分派）。
+fn bucket_measure_values(
+    plan: &StatsPlan,
+    accs: &StatsBucketAccs,
+    soa_layout: Option<&NumericSoALayout>,
+    measure_field_idx: &[Option<usize>],
+) -> Vec<f64> {
+    match accs {
+        StatsBucketAccs::Numeric(soa) => measure_values_soa(plan, soa, soa_layout.unwrap()),
+        StatsBucketAccs::Classic(accs) => measure_values(plan, accs, measure_field_idx),
+    }
+}
+
+/// 桶累加器 → close 条目列表（按桶形态分派）。SoA 全标量（无 row_fields——
+/// SoA 计划不含 last/top）; Classic 走 [`bucket_measure_entries`]。
+fn bucket_close_entries(
+    plan: &StatsPlan,
+    accs: &StatsBucketAccs,
+    soa_layout: Option<&NumericSoALayout>,
+    measure_field_idx: &[Option<usize>],
+) -> Vec<Vec<StatsCloseEntry>> {
+    match accs {
+        StatsBucketAccs::Numeric(soa) => measure_values_soa(plan, soa, soa_layout.unwrap())
+            .into_iter()
+            .map(|v| {
+                vec![StatsCloseEntry {
+                    measure_value: v,
+                    row_fields: None,
+                }]
+            })
+            .collect(),
+        StatsBucketAccs::Classic(accs) => plan
+            .measures
+            .iter()
+            .zip(accs.iter())
+            .zip(measure_field_idx.iter())
+            .map(|((m, acc), fidx)| bucket_measure_entries(m, acc, *fidx))
+            .collect(),
+    }
+}
+
 fn measure_values(
     plan: &StatsPlan,
     accs: &[StatsAccum],
@@ -3114,9 +3929,8 @@ fn row_fields_from_batch(
 /// 从 batch 列读单行原生数值（Int64 原生 i64 → i128, 不走 f64——D8: ≥2^53 的
 /// Int64 经 `Value::Number(f64)` 会丢精度; Float64 按 `sum_masked` 同口径截断）。
 /// null / 非数值列 → None（与行式 `value_to_i128` 的 None 一致）。
-fn column_i128(batch: &RecordBatch, name: &str, row: usize) -> Option<i128> {
-    let idx = batch.schema().index_of(name).ok()?;
-    let col = batch.column(idx);
+fn column_i128_at(batch: &RecordBatch, ci: usize, row: usize) -> Option<i128> {
+    let col = batch.column(ci);
     if col.is_null(row) {
         return None;
     }
@@ -3147,13 +3961,12 @@ fn column_f64_at(batch: &RecordBatch, ci: usize, row: usize) -> Option<f64> {
     None
 }
 
-/// 从 batch 列读单行原生 distinct 键（与列式段 `insert_distinct_column` 同类型
-/// 分派, 原生值构造——D7: 禁止 `Value::Number(f64)` 化 ≥2^53 的 Int64）。
-/// null / 类型不在支持集 → None（与行式 extract None 一致）。
-fn column_distinct_key(batch: &RecordBatch, name: &str, row: usize) -> Option<DistinctKey> {
+/// 索引版 distinct 键读取（列索引批级预解析, 免每行 schema.index_of——q17 同款修复）。
+/// 与列式段 `insert_distinct_column` 同类型分派, 原生值构造（D7: 禁止
+/// `Value::Number(f64)` 化 ≥2^53 的 Int64）。null / 类型不在支持集 → None。
+fn column_distinct_key_at(batch: &RecordBatch, ci: usize, row: usize) -> Option<DistinctKey> {
     use arrow::array::TimestampNanosecondArray;
-    let idx = batch.schema().index_of(name).ok()?;
-    let col = batch.column(idx);
+    let col = batch.column(ci);
     if col.is_null(row) {
         return None;
     }
@@ -3254,6 +4067,42 @@ fn minmax_domain(
             for r in domain_rows(rows, n) {
                 if passes(r) && !c.is_null(r) {
                     fold(c.value(r) as i128, min, max);
+                }
+            }
+        }
+    }
+}
+
+/// 行域驱动的单极值更新（SoA 用: Min 度量只写 min 槽, Max 度量只写 max 槽——
+/// SoA 无死状态; 语义 = [`minmax_domain`] 的对应半段）。
+fn minmax_domain_one(
+    col: &NumCol<'_>,
+    rows: Option<&[u32]>,
+    n: usize,
+    masks: &[BooleanArray],
+    wi: Option<usize>,
+    is_min: bool,
+    out: &mut Option<i128>,
+) {
+    let passes = |r: usize| wi.is_none_or(|wi| masks[wi].value(r));
+    let fold = |v: i128, out: &mut Option<i128>| {
+        *out = Some(match *out {
+            Some(x) if (is_min && x <= v) || (!is_min && x >= v) => x,
+            _ => v,
+        });
+    };
+    match col {
+        NumCol::Int64(c) => {
+            for r in domain_rows(rows, n) {
+                if passes(r) && !c.is_null(r) {
+                    fold(c.value(r) as i128, out);
+                }
+            }
+        }
+        NumCol::Float64(c) => {
+            for r in domain_rows(rows, n) {
+                if passes(r) && !c.is_null(r) {
+                    fold(c.value(r) as i128, out);
                 }
             }
         }

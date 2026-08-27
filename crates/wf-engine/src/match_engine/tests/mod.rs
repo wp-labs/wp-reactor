@@ -25,6 +25,7 @@ mod q13b_join_bench;
 mod seq_examples;
 mod seq_l2;
 mod spill_write_bench;
+mod stats_soa_bench;
 
 mod cep_core;
 mod close;

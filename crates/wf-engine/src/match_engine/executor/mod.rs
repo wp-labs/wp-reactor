@@ -20,8 +20,15 @@ mod stats_exec;
 pub use each_exec::{EachDirectBatchStats, PipeEachRow, PipeRowSink};
 // 供 `match_engine::pub use executor::DistinctKey` 转发（stats distinct 键类型）。
 pub use stats_exec::{
-    DistinctKey, DistinctSet, NumericAccum, RowFieldLayout, RowFields, StatsAccum,
-    StatsCloseBucket, StatsExecutor, StatsWindowState, TopEntry,
+    DistinctKey, DistinctSet, NumericAccum, RowFieldLayout, RowFields, StatsAccum, StatsBucketAccs,
+    StatsCloseBucket, StatsExecutor, StatsMaskCache, StatsWindowState, TopEntry,
+};
+
+// 供 crate 内 SoA 对照 bench（tests/）访问私有热路径函数。
+#[cfg(test)]
+pub(crate) use stats_exec::{
+    NumericSoALayout, StatsBucket, accumulate_column_row, accumulate_soa, comps_hash,
+    measure_values_soa,
 };
 // spill 序列化用（同 crate：executor::stats_exec 为私有模块，需经此转发）。
 pub(crate) use stats_exec::scope_key_hash;
@@ -41,9 +48,9 @@ mod stats_coverage_extra;
 #[cfg(test)]
 mod stats_exec_test;
 #[cfg(test)]
-mod stats_spill_test;
-#[cfg(test)]
 mod stats_exec_wiring_test;
+#[cfg(test)]
+mod stats_spill_test;
 
 use std::collections::HashMap;
 use std::net::IpAddr;

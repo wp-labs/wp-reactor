@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{Date32Array, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
+use arrow::array::{
+    BooleanArray, Date32Array, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
+};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use wf_lang::ast::{BinOp, Expr, FieldRef};
@@ -11,7 +13,10 @@ use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsP
 
 use crate::match_engine::Value;
 use crate::match_engine::executor::stats_exec::{
-    RowFieldLayout, RowFields, StatsAccum, StatsExecutor, TopEntry,
+    RowFieldLayout, RowFields, StatsAccum, StatsBucketAccs, StatsExecutor, StatsMaskCache, TopEntry,
+};
+use crate::match_engine::executor::{
+    accumulate_column_row, accumulate_soa, measure_values_soa, NumericSoALayout,
 };
 
 fn num(n: f64) -> Value {
@@ -1421,6 +1426,9 @@ fn stats_columnar_keyed_precision_matches_empty_key_native() {
     assert_eq!(buckets[0].1[0], 2.0, "≥2^53 的 distinct 不得 f64 化");
     // sum 精确断言（i128 累加器域）: 2^53 + (2^53+1) = 2^54+1
     let accs = keyed.window.find_bucket(&ScopeKey::Int(1)).unwrap();
+    let StatsBucketAccs::Classic(accs) = accs else {
+        panic!("distinct+sum 计划恒 Classic");
+    };
     assert_eq!(
         accs[1].numeric().sum,
         9_007_199_254_740_992i128 + 9_007_199_254_740_993i128,
@@ -2357,9 +2365,9 @@ fn stats_memory_guard_merge_partial_rejects_over_limit() {
     assert_eq!(exec.window.over_limit_new_buckets(), 0);
 
     // 分片 partial 带来键 2（分片侧限额内放行）——协调片合并时超限被拒。
-    let partial: Vec<(ScopeKey, Vec<StatsAccum>)> = vec![(
+    let partial: Vec<(ScopeKey, StatsBucketAccs)> = vec![(
         ScopeKey::Int(2),
-        vec![StatsAccum::Top(vec![TopEntry {
+        StatsBucketAccs::Classic(vec![StatsAccum::Top(vec![TopEntry {
             key: 200.0,
             row: {
                 let layout = std::sync::Arc::new(RowFieldLayout::all_other(&["price".to_string()]));
@@ -2367,7 +2375,7 @@ fn stats_memory_guard_merge_partial_rejects_over_limit() {
                 rf.set(0, Some(Value::Number(200.0)));
                 rf
             },
-        }])],
+        }])]),
     )];
     exec.merge_partial(partial, 1);
     assert_eq!(
@@ -2472,4 +2480,753 @@ fn q18_columnar_layout_is_compact() {
         .layout();
     assert_eq!(layout.n_numeric(), 2, "auction/price 数字槽");
     assert_eq!(layout.n_strings(), 1, "channel 字符串槽");
+}
+
+// ---------------------------------------------------------------------------
+// SoA 桶专项（2026-08-27 q17 优化）
+// ---------------------------------------------------------------------------
+//
+// 覆盖: 内部状态精确值 / null 语义 / 行式-列式对拍 / 底层累积对拍（SoA vs
+// Classic）/ 分片合并 / close 三路径一致 / 空键整列归并段 / 窗口重置 / 形态
+// 门控 / guard 记账口径。
+
+fn min_measure(label: &str, field: &str) -> StatsMeasurePlan {
+    StatsMeasurePlan {
+        label: label.into(),
+        source_alias: "b".into(),
+        where_expr: None,
+        agg: StatsAggPlan::Min,
+        field: Some(FieldRef::Qualified("b".into(), field.into())),
+        arg: None,
+    }
+}
+
+fn max_measure(label: &str, field: &str) -> StatsMeasurePlan {
+    StatsMeasurePlan {
+        label: label.into(),
+        source_alias: "b".into(),
+        where_expr: None,
+        agg: StatsAggPlan::Max,
+        field: Some(FieldRef::Qualified("b".into(), field.into())),
+        arg: None,
+    }
+}
+
+/// q17 形状计划: 带 auction 键 + 8 度量（total/r1/r2/r3 分档 count + min/max/avg/sum）。
+fn q17_shape_plan() -> StatsPlan {
+    let mk = |label: &str, agg: StatsAggPlan, field: Option<&str>, w: Option<Expr>| {
+        StatsMeasurePlan {
+            label: label.into(),
+            source_alias: "b".into(),
+            where_expr: w,
+            agg,
+            field: field.map(|f| FieldRef::Qualified("b".into(), f.into())),
+            arg: None,
+        }
+    };
+    keyed_plan(
+        vec![field_key("b", "auction")],
+        vec![
+            mk("total", StatsAggPlan::Count, None, None),
+            mk("r1", StatsAggPlan::Count, None, Some(price_lt(10_000.0))),
+            mk(
+                "r2",
+                StatsAggPlan::Count,
+                None,
+                Some(price_range(10_000.0, 1_000_000.0)),
+            ),
+            mk("r3", StatsAggPlan::Count, None, Some(price_ge(1_000_000.0))),
+            mk("minp", StatsAggPlan::Min, Some("price"), None),
+            mk("maxp", StatsAggPlan::Max, Some("price"), None),
+            mk("avgp", StatsAggPlan::Avg, Some("price"), None),
+            mk("sump", StatsAggPlan::Sum, Some("price"), None),
+        ],
+    )
+}
+
+/// q17 计划度量序: 0 total, 1 r1, 2 r2, 3 r3, 4 minp, 5 maxp, 6 avgp, 7 sump。
+/// SoA 槽映射: sum_slot avgp→0 sump→1; min_slot minp→0; max_slot maxp→0。
+#[test]
+fn stats_soa_internal_values_match_expected() {
+    let plan = q17_shape_plan();
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(
+        &auction_price_rows(&[
+            (1.0, 5_000.0),     // r1
+            (1.0, 15_000.0),    // r2
+            (1.0, 2_000_000.0), // r3
+            (1.0, 5_000.0),     // r1
+            (1.0, 15_000.0),    // r2
+            (2.0, 3_000.0),     // r1
+            (2.0, 3_000.0),     // r1
+        ]),
+        extract,
+    );
+
+    let StatsBucketAccs::Numeric(a1) = exec.window.find_bucket(&ScopeKey::Int(1)).unwrap() else {
+        panic!("纯数值计划应走 SoA 桶");
+    };
+    // counts（索引 = 度量 idx; 无条件度量 total/min/max/avg/sum 全计 5）
+    assert_eq!(&*a1.counts, &[5, 2, 2, 1, 5, 5, 5, 5], "auction 1 计数");
+    // sums: avgp→slot 0, sump→slot 1; 两度量同字段共享同一 price 累加
+    assert_eq!(&*a1.sums, &[2_040_000, 2_040_000], "auction 1 sum");
+    assert_eq!(a1.mins[0], Some(5_000), "auction 1 min");
+    assert_eq!(a1.maxs[0], Some(2_000_000), "auction 1 max");
+
+    let StatsBucketAccs::Numeric(a2) = exec.window.find_bucket(&ScopeKey::Int(2)).unwrap() else {
+        panic!("纯数值计划应走 SoA 桶");
+    };
+    assert_eq!(&*a2.counts, &[2, 2, 0, 0, 2, 2, 2, 2], "auction 2 计数");
+    assert_eq!(&*a2.sums, &[6_000, 6_000], "auction 2 sum");
+    assert_eq!(a2.mins[0], Some(3_000));
+    assert_eq!(a2.maxs[0], Some(3_000));
+
+    // 最终输出（avg = sum/count）
+    let vals = exec.final_measure_values_by_bucket();
+    assert_eq!(vals.len(), 2);
+    let v1 = &vals[0];
+    assert_eq!(v1.0, ScopeKey::Int(1));
+    assert_eq!(v1.1, vec![5.0, 2.0, 2.0, 1.0, 5_000.0, 2_000_000.0, 408_000.0, 2_040_000.0]);
+    let v2 = &vals[1];
+    assert_eq!(v2.0, ScopeKey::Int(2));
+    assert_eq!(v2.1, vec![2.0, 2.0, 0.0, 0.0, 3_000.0, 3_000.0, 3_000.0, 6_000.0]);
+}
+
+/// null price: count 仍 +1（where 对 null 不过——r1 不计数）, sum/min/max 不更新。
+#[test]
+fn stats_soa_null_price_count_only() {
+    let plan = q17_shape_plan();
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(
+        &[
+            row(&[("auction", num(1.0)), ("price", num(100.0))]),
+            row(&[("auction", num(1.0))]), // price 缺失 → null
+            row(&[("auction", num(1.0)), ("price", num(300.0))]),
+        ],
+        extract,
+    );
+    let StatsBucketAccs::Numeric(soa) = exec.window.find_bucket(&ScopeKey::Int(1)).unwrap() else {
+        panic!("纯数值计划应走 SoA 桶");
+    };
+    assert_eq!(soa.counts[0], 3, "total 计 3（含 null 行）");
+    assert_eq!(soa.counts[1], 2, "r1 只计 2（null 行 where 不过）");
+    assert_eq!(soa.sums[1], 400, "sum 只累非 null: 100+300");
+    assert_eq!(soa.mins[0], Some(100));
+    assert_eq!(soa.maxs[0], Some(300));
+
+    // 列式路径同口径（null 由数组 mask 标记）
+    let mut col = StatsExecutor::new(q17_shape_plan());
+    let batch = rows_to_batch_with_null_price(&[
+        row(&[("auction", num(1.0)), ("price", num(100.0))]),
+        row(&[("auction", num(1.0))]),
+        row(&[("auction", num(1.0)), ("price", num(300.0))]),
+    ]);
+    assert!(col.process_batch(&batch), "列式前置应满足");
+    assert_eq!(
+        exec.final_measure_values_by_bucket(),
+        col.final_measure_values_by_bucket(),
+        "行式与列式 null 语义一致"
+    );
+}
+
+/// 带 key 纯数值计划: 行式（process_rows）与列式（process_batch）最终值一致。
+#[test]
+fn stats_soa_row_and_columnar_agree() {
+    let rows = auction_price_rows(&[
+        (1.0, 100.0),
+        (1.0, 2_000_000.0),
+        (2.0, 50_000.0),
+        (3.0, 15_000.0),
+        (1.0, 7.0),
+    ]);
+    let plan = q17_shape_plan();
+    let mut row_exec = StatsExecutor::new(plan.clone());
+    row_exec.process_rows(&rows, extract);
+    let mut col_exec = StatsExecutor::new(plan);
+    assert!(col_exec.process_batch(&rows_to_batch(&rows)), "列式前置应满足");
+    assert_eq!(
+        row_exec.final_measure_values_by_bucket(),
+        col_exec.final_measure_values_by_bucket()
+    );
+}
+
+/// 底层累积函数对拍: 同一批/掩码喂 accumulate_soa（SoA 桶）与
+/// accumulate_column_row（Classic 桶）, 最终值逐度量一致——隔离验证两条热路径。
+#[test]
+fn stats_soa_classic_accumulate_agree() {
+    let rows = auction_price_rows(&[
+        (1.0, 5_000.0),
+        (1.0, 15_000.0),
+        (1.0, 2_000_000.0),
+        (2.0, 3_000.0),
+        (2.0, 3_000.0),
+    ]);
+    let plan = q17_shape_plan();
+    let batch = rows_to_batch(&rows);
+    let n = batch.num_rows();
+    // 批级预解析（同生产）
+    let price_col = batch.schema().index_of("price").unwrap();
+    let measure_field_cols: Vec<Option<usize>> = plan
+        .measures
+        .iter()
+        .map(|m| m.field.as_ref().map(|_| price_col))
+        .collect();
+    // 3 个唯一 where 的批级 mask
+    let price = batch
+        .column(price_col)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let masks = vec![
+        BooleanArray::from((0..n).map(|i| price.value(i) < 10_000).collect::<Vec<_>>()),
+        BooleanArray::from(
+            (0..n)
+                .map(|i| price.value(i) >= 10_000 && price.value(i) < 1_000_000)
+                .collect::<Vec<_>>(),
+        ),
+        BooleanArray::from((0..n).map(|i| price.value(i) >= 1_000_000).collect::<Vec<_>>()),
+    ];
+    let measure_where: Vec<Option<usize>> = vec![None, Some(0), Some(1), Some(2), None, None, None, None];
+    let measure_field_idx: Vec<Option<usize>> = vec![None; plan.measures.len()];
+    let row_layout = Arc::new(RowFieldLayout::all_other(&[]));
+
+    let layout = NumericSoALayout::build(&plan);
+    let mut soa = layout.zeros();
+    let mut classic: Vec<StatsAccum> = plan
+        .measures
+        .iter()
+        .map(|m| StatsAccum::for_measure(&m.agg))
+        .collect();
+    for row in 0..n {
+        accumulate_soa(
+            &mut soa,
+            &layout,
+            &measure_where,
+            &measure_field_cols,
+            &batch,
+            &masks,
+            row,
+        );
+        accumulate_column_row(
+            &mut classic,
+            &plan,
+            &measure_where,
+            &measure_field_idx,
+            None,
+            None,
+            &batch,
+            &masks,
+            row,
+            &row_layout,
+            &measure_field_cols,
+        );
+    }
+    let soa_vals = measure_values_soa(&plan, &soa, &layout);
+    let classic_vals: Vec<f64> = plan
+        .measures
+        .iter()
+        .zip(classic.iter())
+        .map(|(m, acc)| match m.agg {
+            StatsAggPlan::Count => acc.numeric().count as f64,
+            StatsAggPlan::Sum => acc.numeric().sum as f64,
+            StatsAggPlan::Avg => {
+                let n = acc.numeric().count;
+                if n == 0 {
+                    0.0
+                } else {
+                    acc.numeric().sum as f64 / n as f64
+                }
+            }
+            StatsAggPlan::Min => acc.numeric().min.unwrap_or(0) as f64,
+            StatsAggPlan::Max => acc.numeric().max.unwrap_or(0) as f64,
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(soa_vals, classic_vals, "SoA 与 Classic 累积逐度量一致");
+}
+
+/// 分片合并（merge_partial）: 两片 SoA 桶合并 = 手工和（计数相加/sum 相加/极值）。
+#[test]
+fn stats_soa_merge_partial_combines() {
+    let plan = q17_shape_plan();
+    let mut coord = StatsExecutor::new(plan.clone());
+    let mut shard = StatsExecutor::new(plan);
+    coord.process_rows(&auction_price_rows(&[(1.0, 100.0), (1.0, 200.0)]), extract);
+    shard.process_rows(
+        &auction_price_rows(&[(1.0, 300.0), (2.0, 50.0), (1.0, 400.0)]),
+        extract,
+    );
+    let (partial, cnt) = shard.take_partial();
+    coord.merge_partial(partial, cnt);
+
+    let vals = coord.final_measure_values_by_bucket();
+    assert_eq!(vals.len(), 2);
+    // auction 1: total 4, sum 1000, min 100, max 400, avg 250
+    let v1 = vals.iter().find(|(k, _)| *k == ScopeKey::Int(1)).unwrap();
+    assert_eq!(v1.1, vec![4.0, 4.0, 0.0, 0.0, 100.0, 400.0, 250.0, 1_000.0]);
+    // auction 2: total 1, sum 50, min 50, max 50
+    let v2 = vals.iter().find(|(k, _)| *k == ScopeKey::Int(2)).unwrap();
+    assert_eq!(v2.1, vec![1.0, 1.0, 0.0, 0.0, 50.0, 50.0, 50.0, 50.0]);
+}
+
+/// close 三路径输出一致: final_measure_values_by_bucket / close_window_by_bucket_rows
+/// / close_window_by_bucket——同一数据三种读取口径逐值相等。
+#[test]
+fn stats_soa_close_paths_emit_same() {
+    let rows = auction_price_rows(&[(1.0, 100.0), (1.0, 300.0), (2.0, 200.0)]);
+
+    let mut e1 = StatsExecutor::new(q17_shape_plan());
+    e1.process_rows(&rows, extract);
+    let by_bucket: Vec<(ScopeKey, Vec<f64>)> = e1.final_measure_values_by_bucket();
+
+    let mut e2 = StatsExecutor::new(q17_shape_plan());
+    e2.process_rows(&rows, extract);
+    let rich = e2.close_window_by_bucket_rows();
+    let rich_vals: Vec<(ScopeKey, Vec<f64>)> = rich
+        .into_iter()
+        .map(|b| {
+            (
+                b.key,
+                b.measures
+                    .iter()
+                    .map(|entries| entries[0].measure_value)
+                    .collect(),
+            )
+        })
+        .collect();
+
+    let mut e3 = StatsExecutor::new(q17_shape_plan());
+    e3.process_rows(&rows, extract);
+    let scalar = e3.close_window_by_bucket();
+
+    assert_eq!(by_bucket, rich_vals, "by_bucket 与 rich close 一致");
+    assert_eq!(by_bucket, scalar, "by_bucket 与标量 close 一致");
+}
+
+/// 空键纯数值计划: 段 1d 整列归并（count/sum/min/max 列式）与行式最终值一致。
+#[test]
+fn stats_soa_empty_key_columnar_matches_row() {
+    let plan = simple_plan(vec![
+        count_measure("n"),
+        sum_measure("s", "price"),
+        avg_measure("a", "price"),
+        min_measure("m", "price"),
+        max_measure("x", "price"),
+    ]);
+    let rows = auction_price_rows(&[(1.0, 100.0), (1.0, 300.0), (2.0, 200.0)]);
+
+    let mut col = StatsExecutor::new(plan.clone());
+    assert!(col.process_batch(&rows_to_batch(&rows)), "列式前置应满足");
+    let mut row = StatsExecutor::new(plan);
+    row.process_rows(&rows, extract);
+    assert_eq!(col.final_measure_values(), row.final_measure_values());
+    // 手工期望: n=3, s=600, a=200, m=100, x=300
+    assert_eq!(col.final_measure_values(), vec![3.0, 600.0, 200.0, 100.0, 300.0]);
+}
+
+/// 窗口 close 后重置: 桶从零开始（新窗口不残留旧计数）。
+#[test]
+fn stats_soa_reset_rebuilds_zeros() {
+    let mut exec = StatsExecutor::new(q17_shape_plan());
+    exec.process_rows(&auction_price_rows(&[(1.0, 100.0)]), extract);
+    assert_eq!(exec.window.event_count, 1);
+    exec.close_window_by_bucket();
+    assert_eq!(exec.window.event_count, 0, "reset 清空事件计数");
+
+    exec.process_rows(&auction_price_rows(&[(1.0, 200.0)]), extract);
+    let StatsBucketAccs::Numeric(soa) = exec.window.find_bucket(&ScopeKey::Int(1)).unwrap() else {
+        panic!("纯数值计划应走 SoA 桶");
+    };
+    assert_eq!(soa.counts[0], 1, "新窗口从零开始");
+    assert_eq!(soa.sums[1], 200, "新窗口 sum 不残留旧值");
+    assert_eq!(soa.mins[0], Some(200));
+}
+
+/// 形态门控: 含 distinct 的计划恒走 Classic 桶（SoA 仅纯数值计划）。
+#[test]
+fn stats_soa_mixed_plan_stays_classic() {
+    let plan = simple_plan(vec![
+        count_measure("n"),
+        distinct_measure("bidders", "bidder"),
+    ]);
+    let mut exec = StatsExecutor::new(plan);
+    exec.process_rows(
+        &[
+            row(&[("bidder", num(1.0))]),
+            row(&[("bidder", num(1.0))]),
+            row(&[("bidder", num(2.0))]),
+        ],
+        extract,
+    );
+    let bucket = exec.window.find_bucket(&ScopeKey::Empty).unwrap();
+    assert!(
+        matches!(bucket, StatsBucketAccs::Classic(_)),
+        "含 distinct 的计划应走 Classic"
+    );
+    assert_eq!(exec.final_measure_values(), vec![3.0, 2.0]);
+}
+
+/// SoA guard 记账口径: q17 形状 SoA allowance = 256 + 8×8 + 2×16 + 1×16 + 1×16
+/// = 384B——限额 384 恰好放 1 桶, 第 2 键拒收。
+#[test]
+fn stats_soa_guard_allowance_soa_budget() {
+    let mut exec = StatsExecutor::new(q17_shape_plan());
+    exec.set_memory_limit("soa_guard", Some(384));
+    exec.process_rows(
+        &auction_price_rows(&[(1.0, 100.0), (2.0, 200.0)]),
+        extract,
+    );
+    assert_eq!(exec.window.over_limit_new_buckets(), 1, "第 2 键超 384B 拒收");
+    assert_eq!(exec.window.event_count, 1, "只归并键 1");
+    let vals = exec.final_measure_values_by_bucket();
+    assert_eq!(vals.len(), 1, "只有键 1 桶");
+}
+
+/// SoA 空窗 avg 输出 0.0（count==0 防除零）。
+#[test]
+fn stats_soa_empty_window_avg_zero() {
+    let plan = simple_plan(vec![avg_measure("a", "price"), sum_measure("s", "price")]);
+    let exec = StatsExecutor::new(plan);
+    let vals = exec.final_measure_values();
+    assert_eq!(vals, vec![0.0, 0.0], "空窗 avg=0.0（非 NaN）");
+}
+
+// ---------------------------------------------------------------------------
+// 批级 where mask 共享缓存（2026-08-27 q17 分片去重）
+// ---------------------------------------------------------------------------
+
+/// 同批两次 get_or_compute: 第二次命中（compute 只调一次）——分片去重的核心契约。
+#[test]
+fn stats_mask_cache_hits_same_batch() {
+    let cache = StatsMaskCache::new();
+    let batch = rows_to_batch(&auction_price_rows(&[(1.0, 100.0), (1.0, 200.0)]));
+    // 模拟两片拿到同一批（值副本, 列 Arc 同源）
+    let batch2 = batch.clone();
+
+    let mut calls = 0usize;
+    let m1 = cache.get_or_compute(&batch, || {
+        calls += 1;
+        vec![BooleanArray::from(vec![true, false])]
+    });
+    assert_eq!(calls, 1);
+    assert_eq!(m1.len(), 1);
+
+    let m2 = cache.get_or_compute(&batch2, || {
+        calls += 1;
+        vec![]
+    });
+    assert_eq!(calls, 1, "同批（列 Arc 同源）第二次必须命中缓存");
+    assert_eq!(m2.len(), 1, "命中返回首片结果");
+    assert!(std::sync::Arc::ptr_eq(&m1, &m2), "两片共享同一 mask Arc");
+}
+
+/// 不同批不串: 各自 compute（key 含列 Arc 指针, 批不同列不同）。
+#[test]
+fn stats_mask_cache_distinct_batches() {
+    let cache = StatsMaskCache::new();
+    let b1 = rows_to_batch(&auction_price_rows(&[(1.0, 100.0)]));
+    let b2 = rows_to_batch(&auction_price_rows(&[(1.0, 999_999_999.0)]));
+
+    let mut calls = 0usize;
+    let m1 = cache.get_or_compute(&b1, || {
+        calls += 1;
+        vec![BooleanArray::from(vec![true])]
+    });
+    let m2 = cache.get_or_compute(&b2, || {
+        calls += 1;
+        vec![BooleanArray::from(vec![false])]
+    });
+    assert_eq!(calls, 2, "不同批各自 compute");
+    assert!(m1[0].value(0));
+    assert!(!m2[0].value(0));
+}
+
+/// 容量超限整体清空（流式批下旧批已消费, 清空安全; 之后新批正常重算）。
+#[test]
+fn stats_mask_cache_capacity_clears() {
+    let cache = StatsMaskCache::new();
+    // 缩小容量便于触发（pub(crate) 字段, 测试同 crate 可改）
+    let mut cache = cache;
+    cache.max_rows = 3;
+    let b1 = rows_to_batch(&auction_price_rows(&[(1.0, 100.0)]));
+    let b2 = rows_to_batch(&auction_price_rows(&[(1.0, 200.0)]));
+    let b3 = rows_to_batch(&auction_price_rows(&[(1.0, 300.0)]));
+    let b4 = rows_to_batch(&auction_price_rows(&[(1.0, 400.0)]));
+
+    let mut calls = 0usize;
+    for b in [&b1, &b2, &b3, &b4] {
+        cache.get_or_compute(b, || {
+            calls += 1;
+            vec![]
+        });
+    }
+    assert_eq!(calls, 4, "超限清空后每批都重算");
+    assert_eq!(cache.len(), 1, "清空后只留最后一批");
+}
+
+/// 分片缓存版 `process_batch_rows_cached` 与无缓存版语义一致（同批同结果）。
+#[test]
+fn stats_mask_cache_cached_path_agrees_with_plain() {
+    let plan = q17_shape_plan();
+    let rows = auction_price_rows(&[(1.0, 100.0), (1.0, 2_000_000.0), (2.0, 50_000.0)]);
+    let batch = rows_to_batch(&rows);
+
+    let cache = StatsMaskCache::new();
+    let mut cached = StatsExecutor::new(plan.clone());
+    let ok1 = cached.process_batch_rows_cached(&batch, None, &cache);
+    let mut plain = StatsExecutor::new(plan);
+    let ok2 = plain.process_batch_rows(&batch, None);
+    assert!(ok1 && ok2);
+    assert_eq!(
+        cached.final_measure_values_by_bucket(),
+        plain.final_measure_values_by_bucket(),
+        "缓存版与无缓存版同批结果一致"
+    );
+    // 再次同批（模拟第二片）: 命中缓存, 结果仍一致
+    let mut cached2 = StatsExecutor::new(q17_shape_plan());
+    let ok3 = cached2.process_batch_rows_cached(&batch, None, &cache);
+    assert!(ok3);
+    assert_eq!(
+        cached2.final_measure_values_by_bucket(),
+        plain.final_measure_values_by_bucket()
+    );
+}
+
+/// 并发正确性（第 2 轮 review 补）: 多线程（模拟 S 片）同时 get_or_compute 同批——
+/// compute 只执行 1 次, 所有线程拿到同一 mask Arc（结果一致）。
+#[test]
+fn stats_mask_cache_concurrent_shards() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let cache = std::sync::Arc::new(StatsMaskCache::new());
+    let batch = std::sync::Arc::new(rows_to_batch(&auction_price_rows(&[
+        (1.0, 100.0),
+        (1.0, 2_000_000.0),
+        (2.0, 50_000.0),
+        (3.0, 15_000.0),
+        (1.0, 7.0),
+    ])));
+    let compute_calls = AtomicUsize::new(0);
+
+    const THREADS: usize = 10;
+    std::thread::scope(|s| {
+        for _ in 0..THREADS {
+            let cache = std::sync::Arc::clone(&cache);
+            let batch = std::sync::Arc::clone(&batch);
+            let calls = &compute_calls;
+            s.spawn(move || {
+                let m = cache.get_or_compute(&batch, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    vec![BooleanArray::from(vec![true, true, false, false, true])]
+                });
+                assert_eq!(m.len(), 1, "所有线程拿到同一结果");
+                assert!(m[0].value(0), "mask 值正确");
+                assert!(!m[0].value(2));
+            });
+        }
+    });
+    assert_eq!(compute_calls.load(Ordering::SeqCst), 1, "10 片并发只算 1 次");
+    assert_eq!(cache.len(), 1);
+}
+
+/// 清空后重算一致性（第 3 轮 review 补）: 容量超限整体清空后, 同批再次
+/// get_or_compute 重算——结果与首次一致（清理不破坏正确性）。
+#[test]
+fn stats_mask_cache_recompute_after_clear_matches() {
+    let cache = StatsMaskCache::new();
+    let mut cache = cache;
+    cache.max_rows = 4;
+    let b1 = rows_to_batch(&auction_price_rows(&[(1.0, 100.0), (1.0, 200.0)])); // 2 行
+    let b2 = rows_to_batch(&auction_price_rows(&[(1.0, 300.0), (1.0, 400.0)])); // 2 行
+    let b3 = rows_to_batch(&auction_price_rows(&[(1.0, 500.0), (1.0, 600.0)])); // 2 行 → 触发清空
+
+    let m1 = cache.get_or_compute(&b1, || vec![BooleanArray::from(vec![true, true])]);
+    let m2 = cache.get_or_compute(&b2, || vec![BooleanArray::from(vec![false, false])]);
+    let m3 = cache.get_or_compute(&b3, || vec![BooleanArray::from(vec![true, false])]);
+    // 第 3 批: total 4+2=6 > 4 → 清空（b1/b2 被清）; 缓存只留 b3
+    assert_eq!(cache.len(), 1, "清空后只留当前批");
+
+    // b1 再次访问 → 重算（同一表达式 → 同一结果; 缓存设计下 compute 是纯函数）
+    let m1b = cache.get_or_compute(&b1, || vec![BooleanArray::from(vec![true, true])]);
+    assert!(m1b[0].value(0) && m1b[0].value(1), "重算结果与首次一致");
+    assert_eq!(m1[0].value(0), m1b[0].value(0));
+    assert_eq!(m1[0].value(1), m1b[0].value(1));
+    // b3 仍在缓存（未被重算影响）
+    let m3b = cache.get_or_compute(&b3, || vec![]);
+    assert_eq!(m3b.len(), 1);
+    assert!(m3b[0].value(0) && !m3b[0].value(1));
+}
+
+/// 批级时间信息共享（2026-08-27 q17 扩展 A）: 同批 get_or_compute_time 命中
+/// （compute 只调 1 次, 模拟 10 片共享 batch_max_time 扫描）; 不同批各自算。
+#[test]
+fn stats_mask_cache_time_shares_same_batch() {
+    let cache = StatsMaskCache::new();
+    let batch = Arc::new(rows_to_batch(&auction_price_rows(&[(1.0, 100.0), (1.0, 200.0)])));
+    let batch2 = batch.clone(); // 模拟另一片（值副本, 列 Arc 同源）
+
+    let mut calls = 0usize;
+    let t1 = cache.get_or_compute_time(&batch, || {
+        calls += 1;
+        1_750_000_000_000_000_000i64
+    });
+    let t2 = cache.get_or_compute_time(&batch2, || {
+        calls += 1;
+        -1
+    });
+    assert_eq!(calls, 1, "同批第二次命中（不重扫）");
+    assert_eq!(t1, t2);
+
+    // 不同批各自算
+    let b_other = Arc::new(rows_to_batch(&auction_price_rows(&[(2.0, 300.0)])));
+    let t3 = cache.get_or_compute_time(&b_other, || {
+        calls += 1;
+        2_000_000_000_000_000_000i64
+    });
+    assert_eq!(calls, 2);
+    assert_ne!(t1, t3);
+}
+
+/// time 并发正确性（第 2 轮 review 补）: 多线程并发 get_or_compute_time 同批——
+/// compute 只执行 1 次, 所有线程拿到同一 max_time。
+#[test]
+fn stats_mask_cache_time_concurrent_shards() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let cache = std::sync::Arc::new(StatsMaskCache::new());
+    let batch = std::sync::Arc::new(rows_to_batch(&auction_price_rows(&[
+        (1.0, 100.0),
+        (1.0, 200.0),
+    ])));
+    let compute_calls = AtomicUsize::new(0);
+
+    const THREADS: usize = 10;
+    std::thread::scope(|s| {
+        for _ in 0..THREADS {
+            let cache = std::sync::Arc::clone(&cache);
+            let batch = std::sync::Arc::clone(&batch);
+            let calls = &compute_calls;
+            s.spawn(move || {
+                let t = cache.get_or_compute_time(&batch, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    42_000_000_000i64
+                });
+                assert_eq!(t, 42_000_000_000);
+            });
+        }
+    });
+    assert_eq!(compute_calls.load(Ordering::SeqCst), 1, "10 片并发只扫 1 次");
+}
+
+/// time 表容量清理（第 3 轮 review 补）: 超限整体清空, 与 mask 表独立记账。
+#[test]
+fn stats_mask_cache_time_capacity_clears() {
+    let cache = StatsMaskCache::new();
+    let mut cache = cache;
+    cache.max_rows = 3;
+    let b1 = rows_to_batch(&auction_price_rows(&[(1.0, 100.0)]));
+    let b2 = rows_to_batch(&auction_price_rows(&[(1.0, 200.0)]));
+    let b3 = rows_to_batch(&auction_price_rows(&[(1.0, 300.0)]));
+
+    cache.get_or_compute_time(&b1, || 1);
+    cache.get_or_compute_time(&b2, || 2);
+    assert_eq!(cache.time_len(), 2);
+    // 第 3 批: total 3 > 3? —— 3 批各 1 行: 第 3 批 total=3 不超; 第 4 批才触发。
+    cache.get_or_compute_time(&b3, || 3);
+    assert_eq!(cache.time_len(), 3, "3 批各 1 行 ≤ 上限 3");
+    let b4 = rows_to_batch(&auction_price_rows(&[(1.0, 400.0)]));
+    cache.get_or_compute_time(&b4, || 4);
+    assert_eq!(cache.time_len(), 1, "超限清空后只留当前批");
+    // 清空后旧批重算（与 mask 表互不影响）
+    assert_eq!(cache.get_or_compute_time(&b1, || 1), 1);
+}
+
+/// 两表同批共享一致性（第 5 轮 review 补）: 同一批 mask 与 max_time 都在缓存中
+/// 命中（同 key 批身份, 两表独立但一致工作）。
+#[test]
+fn stats_mask_cache_mask_and_time_share_batch() {
+    let cache = StatsMaskCache::new();
+    let batch = rows_to_batch(&auction_price_rows(&[(1.0, 100.0), (1.0, 200.0)]));
+
+    let mut calls = 0usize;
+    // mask 首算
+    let m1 = cache.get_or_compute(&batch, || {
+        calls += 1;
+        vec![BooleanArray::from(vec![true, false])]
+    });
+    // time 首算（独立表）
+    let t1 = cache.get_or_compute_time(&batch, || {
+        calls += 1;
+        5_000_000_000i64
+    });
+    assert_eq!(calls, 2, "mask 与 time 各算 1 次");
+    // 第二片同批: 两表都命中
+    let batch2 = batch.clone();
+    let m2 = cache.get_or_compute(&batch2, || {
+        calls += 1;
+        vec![]
+    });
+    let t2 = cache.get_or_compute_time(&batch2, || {
+        calls += 1;
+        -1
+    });
+    assert_eq!(calls, 2, "第二片两表均命中");
+    assert!(std::sync::Arc::ptr_eq(&m1, &m2));
+    assert_eq!(t1, t2);
+}
+
+/// 空批不缓存（第 6 轮 review 补）: rows==0 直接 compute, 不写入缓存（避免
+/// key=(0,0) 与后续真实批碰撞）。
+#[test]
+fn stats_mask_cache_empty_batch_not_cached() {
+    let cache = StatsMaskCache::new();
+    let empty = rows_to_batch(&[]);
+    assert_eq!(empty.num_rows(), 0);
+    let m = cache.get_or_compute(&empty, || vec![BooleanArray::from(Vec::<bool>::new())]);
+    assert_eq!(m.len(), 1);
+    assert_eq!(cache.len(), 0, "空批不缓存");
+
+    // 空批后再来真实批: 正常缓存（key 不冲突）
+    let real = rows_to_batch(&auction_price_rows(&[(1.0, 100.0)]));
+    let m2 = cache.get_or_compute(&real, || vec![BooleanArray::from(vec![true])]);
+    assert_eq!(m2.len(), 1);
+    assert_eq!(cache.len(), 1);
+}
+
+/// 分片语义集成（第 5 轮 review 补）: 两片共享 cache, 各处理自己的行域子集,
+/// 合并后与单实例全批结果一致——缓存路径在真实分片语义下不破坏正确性。
+#[test]
+fn stats_mask_cache_two_shards_match_single() {
+    let plan = q17_shape_plan();
+    let rows = auction_price_rows(&[
+        (1.0, 100.0),
+        (1.0, 2_000_000.0),
+        (2.0, 50_000.0),
+        (3.0, 15_000.0),
+        (1.0, 7.0),
+    ]);
+    let batch = rows_to_batch(&rows);
+    let n = batch.num_rows() as u32;
+    // 行号 % 2 分区（与 fanout 的 shard_rows 口径一致）
+    let shard0: Vec<u32> = (0..n).filter(|i| i % 2 == 0).collect();
+    let shard1: Vec<u32> = (0..n).filter(|i| i % 2 == 1).collect();
+
+    let cache = StatsMaskCache::new();
+    let mut s0 = StatsExecutor::new(plan.clone());
+    let mut s1 = StatsExecutor::new(plan.clone());
+    assert!(s0.process_batch_rows_cached(&batch, Some(&shard0), &cache));
+    assert!(s1.process_batch_rows_cached(&batch, Some(&shard1), &cache));
+
+    // 两片桶值合并（键 1 的 count/sum 等相加——分片归并语义）
+    let mut merged = StatsExecutor::new(plan);
+    let (b0, c0) = s0.take_partial();
+    let (b1, c1) = s1.take_partial();
+    merged.merge_partial(b0, c0);
+    merged.merge_partial(b1, c1);
+
+    let mut single = StatsExecutor::new(q17_shape_plan());
+    assert!(single.process_batch_rows(&batch, None));
+    assert_eq!(
+        merged.final_measure_values_by_bucket(),
+        single.final_measure_values_by_bucket(),
+        "两片共享缓存 + 分片行域归并 = 单实例全批"
+    );
 }

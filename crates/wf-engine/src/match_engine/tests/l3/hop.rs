@@ -193,3 +193,76 @@ fn hop_on_event_fires_in_every_covering_window() {
         StepResult::Matched(_)
     ));
 }
+
+// ===========================================================================
+// H1（2026-08-26，q5 键 churn 优化）专项：advance 把 skey 构建提升到窗口扇出
+// 循环外后，MatchedContext.scope_key 由 `to_vec` 构建——下列测试锁定其值与
+// 输入事件键逐位一致（hop 扇出合并 / fixed 单窗口 / AND+close 事件路径不命中
+// 三形态），防止后续对签名/借用改动破坏字节一致契约。
+// ===========================================================================
+
+#[test]
+fn hop_match_context_scope_key_matches_input_key() {
+    // hop(10s,2s) M14（无 close）每事件命中 → 扇出 5 窗合并为 1 个 Matched，
+    // scope_key 必须与输入键一致（H1 的 to_vec 路径）。
+    let plan = hop_plan(
+        vec![simple_key("sip")],
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+        vec![step(vec![branch("fail", count_ge(1.0))])],
+    );
+    let mut sm = CepStateMachine::new("r_hop_ctx".to_string(), plan, None);
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    match sm.advance_at("fail", &e, 5_000_000_000) {
+        StepResult::Matched(ctx) => {
+            assert_eq!(ctx.scope_key, vec![Value::Str("10.0.0.1".into())]);
+        }
+        other => panic!("hop 每事件命中应返回 Matched，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn fixed_match_context_scope_key_matches_input_key() {
+    // fixed(10s) M14 单窗口命中 → 同样锁定 to_vec 值；数值键（q5 的 auction
+    // Int 形状）逐位一致。
+    let plan = fixed_plan(
+        vec![simple_key("auction")],
+        Duration::from_secs(10),
+        vec![step(vec![branch("fail", count_ge(1.0))])],
+    );
+    let mut sm = CepStateMachine::new("r_fixed_ctx".to_string(), plan, None);
+    let e = event(vec![("auction", num(42.0))]);
+    match sm.advance_at("fail", &e, 5_000_000_000) {
+        StepResult::Matched(ctx) => {
+            assert_eq!(ctx.scope_key, vec![Value::Number(42.0)]);
+        }
+        other => panic!("fixed 每事件命中应返回 Matched，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn and_close_event_path_accumulates_not_matches() {
+    // Q5 形状（on event + and close，AND 模式）：事件路径只 event_ok + Advance，
+    // 绝不 Matched——输出仅来自窗口收口（close/conv）。这也是 H1 的 to_vec
+    // 不在 q5 事件热路径上的语义依据（q5 命中发生在收口扫描，不经 ctx 构建）。
+    let mut plan = hop_plan(
+        vec![simple_key("sip")],
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+        vec![step(vec![branch("fail", count_ge(1.0))])],
+    );
+    plan.close_steps = vec![step(vec![branch("fail", count_ge(1.0))])];
+    plan.close_mode = CloseMode::And;
+    let mut sm = CepStateMachine::new("r_and_close".to_string(), plan, None);
+    let e = event(vec![("sip", str_val("10.0.0.1"))]);
+    assert_eq!(
+        sm.advance_at("fail", &e, 5_000_000_000),
+        StepResult::Advance,
+        "首个事件：event_ok 标记，不命中"
+    );
+    assert_eq!(
+        sm.advance_at("fail", &e, 5_000_000_000),
+        StepResult::Accumulate,
+        "后续事件：event_ok 后仅累积"
+    );
+}
