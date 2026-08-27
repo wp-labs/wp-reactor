@@ -1072,15 +1072,16 @@ impl StatsWindowState {
             // 惰性创建（P0 修复）：首次驱逐前才建 store——零驱逐窗口零开销
             // （不建 redb 库/不起写 worker, q19 100M 曾 RSS +6GB）。spec 由
             // executor 每窗口 process 时注册（layout 解析后）。
-            if self.spill.is_none() && !self.spill_failed {
-                if let Some(spec) = self.spill_create.take() {
-                    let store =
-                        crate::match_engine::spill::RedbSpillStore::create(&spec.path, spec.layout)
-                            .unwrap_or_else(|e| {
-                                panic!("spill redb 创建失败(致命) {}: {e}", spec.path.display())
-                            });
-                    self.spill = Some(Box::new(store));
-                }
+            if self.spill.is_none()
+                && !self.spill_failed
+                && let Some(spec) = self.spill_create.take()
+            {
+                let store =
+                    crate::match_engine::spill::RedbSpillStore::create(&spec.path, spec.layout)
+                        .unwrap_or_else(|e| {
+                            panic!("spill redb 创建失败(致命) {}: {e}", spec.path.display())
+                        });
+                self.spill = Some(Box::new(store));
             }
             // spill 启用且未失败: 先驱逐最老键腾空间（批量, 目标降到上限 90%）。
             if self.spill.is_some() && !self.spill_failed {
@@ -2421,7 +2422,7 @@ impl StatsExecutor {
         let mem = self.take_buckets_up_to(n);
         // spill 批补足配额（两源之和 ≤ n）; 批内排序后与内存批归并。
         let spill_n = n.saturating_sub(mem.len()).max(1);
-        let mut spill = self.window.spill_drain_up_to(spill_n, &self.plan);
+        let spill = self.window.spill_drain_up_to(spill_n, &self.plan);
         // spill 序列化契约是 Vec<StatsAccum> → 转回桶累加器载体（统一两源类型）。
         let mut spill: Vec<(ScopeKey, StatsBucketAccs)> = spill
             .into_iter()

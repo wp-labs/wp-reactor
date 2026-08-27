@@ -327,9 +327,8 @@ impl StatsTask {
         // 分片共享批级时间缓存: 首片扫全批时间 max, 其余片命中（q17 10 片原
         // 各扫全批 10×——batch_max_time 是时间列读取的主要来源, sample 热点）。
         let max_time = match &self.mask_cache {
-            Some(cache) => cache.get_or_compute_time(batch, || {
-                batch_max_time(batch, self.time_field.as_deref())
-            }),
+            Some(cache) => cache
+                .get_or_compute_time(batch, || batch_max_time(batch, self.time_field.as_deref())),
             None => batch_max_time(batch, self.time_field.as_deref()),
         };
         if max_time > self.last_watermark {
@@ -1319,6 +1318,9 @@ async fn run_stats_pull_loop(
 }
 
 #[cfg(test)]
+#[path = "stats_task_bench.rs"]
+mod stats_task_bench;
+#[cfg(test)]
 #[path = "stats_task_coverage.rs"]
 mod stats_task_coverage;
 #[cfg(test)]
@@ -1327,6 +1329,3 @@ mod stats_task_coverage_more;
 #[cfg(test)]
 #[path = "stats_task_r4.rs"]
 mod stats_task_r4;
-#[cfg(test)]
-#[path = "stats_task_bench.rs"]
-mod stats_task_bench;

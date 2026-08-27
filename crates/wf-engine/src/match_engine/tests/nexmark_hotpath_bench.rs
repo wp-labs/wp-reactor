@@ -47,7 +47,9 @@ use wf_lang::plan::{
 };
 use wf_lang::{BaseType, FieldType};
 
-use crate::match_engine::executor::{RowFieldLayout, RowFields, StatsAccum, StatsBucketAccs, StatsExecutor};
+use crate::match_engine::executor::{
+    RowFieldLayout, RowFields, StatsAccum, StatsBucketAccs, StatsExecutor,
+};
 use crate::match_engine::match_engine::{
     BindData, CepStateMachine, CloseOutput, CloseReason, EngineHashMap, Event, MatchedContext,
     ScopeKey, StepData, Value, WindowLookup,

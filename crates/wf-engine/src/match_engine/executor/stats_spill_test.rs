@@ -945,7 +945,7 @@ fn spill_top_readback_roundtrip() {
 /// 2. 首次驱逐 → 惰性创建 store, 驱逐记账走 ensure 预置的共享计数
 /// 3. 共享预算耗尽 → 另一分片驱逐回退拒收
 /// 4. 各自 close → 扣自身份额（预算跨窗口复用）
-/// 覆盖 spawn 注入路径（set_spill_redb）而非测试直连的 set_spill。
+///    覆盖 spawn 注入路径（set_spill_redb）而非测试直连的 set_spill。
 #[test]
 fn spill_lazy_create_shared_counter_rule_budget() {
     use std::sync::atomic::Ordering;
@@ -1182,7 +1182,7 @@ fn spill_redb_streaming_close_full_pipeline() {
         exec.process_rows(&[bid_row(k, k as f64 * 10.0)], extract);
     }
     exec.process_rows(&[bid_row(5, 555.0)], extract); // 键 5 读回（take 只读, 旧条目留库）
-    assert!(exec.window.spill_index.len() > 0, "spill 已生效");
+    assert!(!exec.window.spill_index.is_empty(), "spill 已生效");
 
     // 流式 close：小批 4 → redb 游标多轮续读
     let mut keys: Vec<(ScopeKey, crate::match_engine::executor::StatsBucketAccs)> = Vec::new();

@@ -23,14 +23,12 @@ use arrow::datatypes::{DataType, Field as ArrowField, Schema};
 use tokio_util::sync::CancellationToken;
 use wf_engine::match_engine::RuleExecutor;
 use wf_engine::pipe::PipeRegistry;
-use wf_engine::window::{Router, Window, WindowParams, WindowRegistry};
+use wf_engine::window::{Router, WindowRegistry};
 use wf_lang::ast::Expr;
 use wf_lang::plan::{
     BindPlan, EntityPlan, MatchPlan, ScorePlan, StatsAggPlan, StatsMeasurePlan,
     StatsOutputShapePlan, StatsPlan, WindowSpec, YieldField, YieldPlan,
 };
-
-use super::super::tests::test_window_config;
 
 const N: usize = 1_000_000;
 const AUCTIONS: i64 = 100;
@@ -41,17 +39,21 @@ const NANOS: i64 = 1_750_000_000_000_000_000;
 // ---------------------------------------------------------------------------
 
 fn q17_stats_plan() -> StatsPlan {
-    let mk = |label: &str, agg: StatsAggPlan, field: Option<&str>, w: Option<Expr>| {
-        StatsMeasurePlan {
+    let mk =
+        |label: &str, agg: StatsAggPlan, field: Option<&str>, w: Option<Expr>| StatsMeasurePlan {
             label: label.into(),
             source_alias: "b".into(),
             where_expr: w,
             agg,
             field: field.map(|f| wf_lang::ast::FieldRef::Qualified("b".into(), f.into())),
             arg: None,
-        }
+        };
+    let price = || {
+        Expr::Field(wf_lang::ast::FieldRef::Qualified(
+            "b".into(),
+            "price".into(),
+        ))
     };
-    let price = || Expr::Field(wf_lang::ast::FieldRef::Qualified("b".into(), "price".into()));
     let lt = |v: f64| Expr::BinOp {
         op: wf_lang::ast::BinOp::Lt,
         left: Box::new(price()),
@@ -169,10 +171,7 @@ fn q17_config(
     push_rx: Option<mpsc::Receiver<RulePush>>,
 ) -> (StatsTaskConfig, CancellationToken) {
     let config = StatsTaskConfig {
-        stats: wf_engine::match_engine::StatsExecutor::with_row_fields(
-            q17_stats_plan(),
-            None,
-        ),
+        stats: wf_engine::match_engine::StatsExecutor::with_row_fields(q17_stats_plan(), None),
         executor: RuleExecutor::new(q17_rule_plan()),
         window_sources: vec![],
         sink_fanout: SinkFanout::closed(),
@@ -250,9 +249,15 @@ async fn q17_framework_bench() {
     let drain_ns = t0.elapsed().as_secs_f64() * 1e9 / (n as f64 * rounds as f64);
 
     eprintln!("== q17 框架层归因（N={}, rounds={}）==", N, rounds);
-    eprintln!("  ① process_batch_from     : {:>6.2} ns/事件（归并链+时间扫描）", from_ns);
+    eprintln!(
+        "  ① process_batch_from     : {:>6.2} ns/事件（归并链+时间扫描）",
+        from_ns
+    );
     eprintln!("  ② process_push 完整      : {:>6.2} ns/事件", push_ns);
-    eprintln!("  ③ drain_push_channel     : {:>6.2} ns/事件（含 mpsc 投递）", drain_ns);
+    eprintln!(
+        "  ③ drain_push_channel     : {:>6.2} ns/事件（含 mpsc 投递）",
+        drain_ns
+    );
     eprintln!("  → wf-engine 归并链基线     : ~83 ns/事件（stats_task_layer）");
     eprintln!("  → diag 577 ns·核 剩余      : 多核协作/投递/窗口 close/ack 外围");
 }
