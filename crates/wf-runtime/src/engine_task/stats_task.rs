@@ -540,6 +540,23 @@ impl StatsTask {
             // （~5.9G）与状态数据/输出结构同时驻留 → close 期 RSS 峰值 30G+。
             // 每批 ~EMIT_CHUNK 桶, 峰值 ≈ 批大小×条均 + 分块装载缓冲。
             let chunk = emit_chunk();
+            // 状态内存估算 vs 实际（诊断，2026-08-27）：取桶前统计——估算低估
+            // 则实际超预算才驱逐（q18 RSS 校准）。
+            {
+                let est = self.stats.window.estimated_bytes();
+                let actual = self.stats.window.actual_bytes();
+                let n = self.stats.window.bucket_count();
+                log::info!(
+                    "stats 状态内存(规则 {}, task {}): 估算 {:>9.1}MB / 实际 {:>9.1}MB / 桶 {}（估算每键 {:.0}B / 实际每键 {:.0}B）",
+                    self.rule_name(),
+                    self.task_id,
+                    est as f64 / 1e6,
+                    actual as f64 / 1e6,
+                    n,
+                    if n > 0 { est as f64 / n as f64 } else { 0.0 },
+                    if n > 0 { actual as f64 / n as f64 } else { 0.0 },
+                );
+            }
             loop {
                 let buckets = self.stats.take_next_close_batch(chunk);
                 if buckets.is_empty() {

@@ -679,7 +679,20 @@ impl StatsWindowState {
         if has_row_fields {
             bytes += 112; // 共享 1 份 RowFields 堆（q18 6 字段 ≈ 104B + 余量）
         }
-        bytes
+        // 校准系数（2026-08-27 q18 实测）：估算 432B/键 vs 实际 960B/键
+        // （2.22x）——低估来源 = StatsAccum enum 实际 24B（估 16）+ RowFields
+        // 实测 168B（估 112）+ hashbrown 桶数组/容量 + mimalloc 16B 对齐×
+        // 每分配 + Vec 容量。估算低估 → 驱逐水位失真（实际 2.2× 预算才驱逐）。
+        // `WF_ALLOWANCE_MULT` 可调（A/B：1.0 = 原行为；2.2 = q18 实测校准）。
+        // OnceLock 缓存（热路径每新键调用, 不重复读 env）。
+        static MULT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        let mult: f64 = *MULT.get_or_init(|| {
+            std::env::var("WF_ALLOWANCE_MULT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2.2)
+        });
+        (bytes as f64 * mult).round() as u64
     }
 
     /// 新建桶前的限额检查: 超限 → 先尝试 spill 腾空间（M3 三层预算阶梯第二层）
@@ -751,6 +764,12 @@ impl StatsWindowState {
         self.spill_evictions
     }
 
+    /// 当前桶数（诊断）。
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// 驱逐分段耗时（跨窗口累计；性能定位）：(扫描 ns, clone ns, 写 ns, 调用次数)。
     /// 累计读回次数（跨窗口；抖动观测）。
     pub fn spill_readbacks(&self) -> u64 {
         self.spill_readbacks
@@ -764,6 +783,45 @@ impl StatsWindowState {
             self.spill_write_ns,
             self.spill_evict_calls,
         )
+    }
+
+    /// 实际内存字节（诊断/估算校准）：遍历桶表计算真实驻留（含树/盒堆、
+    /// 字符串、HashMap 条目），与 `estimated_bytes`（bucket_allowance 估算）
+    /// 对比，校准驱逐水位（估算低估 → 实际超预算才驱逐）。
+    pub fn actual_bytes(&self) -> u64 {
+        fn scope_key_bytes(key: &ScopeKey) -> u64 {
+            match key {
+                ScopeKey::Empty => 16,
+                ScopeKey::Int(_) | ScopeKey::Float(_) => 24,
+                ScopeKey::Str(s) => 40 + s.len() as u64,
+                ScopeKey::Pair(a, b) => 24 + scope_key_bytes(a) + scope_key_bytes(b),
+            }
+        }
+        fn row_fields_bytes(rf: &RowFields) -> u64 {
+            // 固定：struct 头(Arc 8 + 3 Box 8) + 4 Box 头(16×4) ≈ 112
+            112 + rf.numeric().len() as u64 * 8
+                + rf.strings().len() as u64 * 24 // SmolStr 内联
+                + rf.others().len() as u64 * 56
+                + rf.null_mask().len() as u64 * 8
+        }
+        let mut total = 0u64;
+        for chain in self.buckets.values() {
+            for b in chain {
+                // StatsBucket: scope_key + touch + accs Vec 头 + 对齐
+                total += scope_key_bytes(&b.scope_key) + 64;
+                for acc in &b.accs {
+                    total += match acc {
+                        StatsAccum::Numeric(_) => 8 + 48,
+                        StatsAccum::Last(Some(rf)) => 16 + row_fields_bytes(rf),
+                        StatsAccum::Last(None) => 16,
+                        StatsAccum::Distinct(_) => 8 + 96,
+                        StatsAccum::Top(t) => 24 + t.len() as u64 * 176,
+                    };
+                }
+            }
+            total += 24; // hashbrown 条目（hash + 值 + ctrl）
+        }
+        total
     }
 
     /// 驱逐最老未更新键到 spill（clock 二次机会近似 LRU），直到内存预算降到
@@ -1608,6 +1666,20 @@ impl StatsExecutor {
     }
 
     fn reset_window(&mut self) {
+        // 状态内存估算 vs 实际（诊断，2026-08-27 q18 RSS 校准）：bucket_allowance
+        // 估算（estimated_bytes）与 actual_bytes 对比——低估则实际超预算才驱逐。
+        log::info!(
+            "stats 状态内存(规则 {}): 估算 {:>9.1}MB / 实际 {:>9.1}MB / 桶 {}（估算每键 {:.0}B）",
+            self.window.rule_name,
+            self.window.estimated_bytes as f64 / 1e6,
+            self.window.actual_bytes() as f64 / 1e6,
+            self.window.buckets.len(),
+            if self.window.buckets.is_empty() {
+                0.0
+            } else {
+                self.window.estimated_bytes as f64 / self.window.buckets.len() as f64
+            },
+        );
         // cleanup 旧 spill（窗口文件删除）——新窗口由 spawn 层重新注入 store。
         if let Some(spill) = &mut self.window.spill {
             spill.cleanup();
