@@ -111,4 +111,8 @@ pub(crate) struct StatsTaskConfig {
     /// 窗口 close 时发送自身 partial 且不 emit; 未分片两者皆 `None`。
     pub merge_rx: Option<mpsc::Receiver<super::stats_task::StatsPartial>>,
     pub merge_tx: Option<mpsc::Sender<super::stats_task::StatsPartial>>,
+    /// 分片共享的批级 where mask 缓存（2026-08-27 q17）: 同一规则所有片共享
+    /// 一个 `Arc<StatsMaskCache>`——首片算 mask, 其余片 Arc 命中（免 S× 重复
+    /// 向量化求值）。None = 不缓存（未分片/单实例规则）。
+    pub mask_cache: Option<std::sync::Arc<wf_engine::match_engine::StatsMaskCache>>,
 }

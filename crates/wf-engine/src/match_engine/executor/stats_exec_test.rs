@@ -13,7 +13,7 @@ use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsP
 
 use crate::match_engine::Value;
 use crate::match_engine::executor::stats_exec::{
-    RowFieldLayout, RowFields, StatsAccum, StatsBucketAccs, StatsExecutor, TopEntry,
+    RowFieldLayout, RowFields, StatsAccum, StatsBucketAccs, StatsExecutor, StatsMaskCache, TopEntry,
 };
 use crate::match_engine::executor::{
     accumulate_column_row, accumulate_soa, measure_values_soa, NumericSoALayout,
@@ -2889,4 +2889,105 @@ fn stats_soa_empty_window_avg_zero() {
     let exec = StatsExecutor::new(plan);
     let vals = exec.final_measure_values();
     assert_eq!(vals, vec![0.0, 0.0], "空窗 avg=0.0（非 NaN）");
+}
+
+// ---------------------------------------------------------------------------
+// 批级 where mask 共享缓存（2026-08-27 q17 分片去重）
+// ---------------------------------------------------------------------------
+
+/// 同批两次 get_or_compute: 第二次命中（compute 只调一次）——分片去重的核心契约。
+#[test]
+fn stats_mask_cache_hits_same_batch() {
+    let cache = StatsMaskCache::new();
+    let batch = rows_to_batch(&auction_price_rows(&[(1.0, 100.0), (1.0, 200.0)]));
+    // 模拟两片拿到同一批（值副本, 列 Arc 同源）
+    let batch2 = batch.clone();
+
+    let mut calls = 0usize;
+    let m1 = cache.get_or_compute(&batch, || {
+        calls += 1;
+        vec![BooleanArray::from(vec![true, false])]
+    });
+    assert_eq!(calls, 1);
+    assert_eq!(m1.len(), 1);
+
+    let m2 = cache.get_or_compute(&batch2, || {
+        calls += 1;
+        vec![]
+    });
+    assert_eq!(calls, 1, "同批（列 Arc 同源）第二次必须命中缓存");
+    assert_eq!(m2.len(), 1, "命中返回首片结果");
+    assert!(std::sync::Arc::ptr_eq(&m1, &m2), "两片共享同一 mask Arc");
+}
+
+/// 不同批不串: 各自 compute（key 含列 Arc 指针, 批不同列不同）。
+#[test]
+fn stats_mask_cache_distinct_batches() {
+    let cache = StatsMaskCache::new();
+    let b1 = rows_to_batch(&auction_price_rows(&[(1.0, 100.0)]));
+    let b2 = rows_to_batch(&auction_price_rows(&[(1.0, 999_999_999.0)]));
+
+    let mut calls = 0usize;
+    let m1 = cache.get_or_compute(&b1, || {
+        calls += 1;
+        vec![BooleanArray::from(vec![true])]
+    });
+    let m2 = cache.get_or_compute(&b2, || {
+        calls += 1;
+        vec![BooleanArray::from(vec![false])]
+    });
+    assert_eq!(calls, 2, "不同批各自 compute");
+    assert!(m1[0].value(0));
+    assert!(!m2[0].value(0));
+}
+
+/// 容量超限整体清空（流式批下旧批已消费, 清空安全; 之后新批正常重算）。
+#[test]
+fn stats_mask_cache_capacity_clears() {
+    let cache = StatsMaskCache::new();
+    // 缩小容量便于触发（pub(crate) 字段, 测试同 crate 可改）
+    let mut cache = cache;
+    cache.max_rows = 3;
+    let b1 = rows_to_batch(&auction_price_rows(&[(1.0, 100.0)]));
+    let b2 = rows_to_batch(&auction_price_rows(&[(1.0, 200.0)]));
+    let b3 = rows_to_batch(&auction_price_rows(&[(1.0, 300.0)]));
+    let b4 = rows_to_batch(&auction_price_rows(&[(1.0, 400.0)]));
+
+    let mut calls = 0usize;
+    for b in [&b1, &b2, &b3, &b4] {
+        cache.get_or_compute(b, || {
+            calls += 1;
+            vec![]
+        });
+    }
+    assert_eq!(calls, 4, "超限清空后每批都重算");
+    assert_eq!(cache.len(), 1, "清空后只留最后一批");
+}
+
+/// 分片缓存版 `process_batch_rows_cached` 与无缓存版语义一致（同批同结果）。
+#[test]
+fn stats_mask_cache_cached_path_agrees_with_plain() {
+    let plan = q17_shape_plan();
+    let rows = auction_price_rows(&[(1.0, 100.0), (1.0, 2_000_000.0), (2.0, 50_000.0)]);
+    let batch = rows_to_batch(&rows);
+
+    let cache = StatsMaskCache::new();
+    let mut cached = StatsExecutor::new(plan.clone());
+    let ok1 = cached.process_batch_rows_cached(&batch, None, &cache);
+    let mut plain = StatsExecutor::new(plan);
+    let ok2 = plain.process_batch_rows(&batch, None);
+    assert!(ok1 && ok2);
+    assert_eq!(
+        cached.final_measure_values_by_bucket(),
+        plain.final_measure_values_by_bucket(),
+        "缓存版与无缓存版同批结果一致"
+    );
+    // 再次同批（模拟第二片）: 命中缓存, 结果仍一致
+    let mut cached2 = StatsExecutor::new(q17_shape_plan());
+    let ok3 = cached2.process_batch_rows_cached(&batch, None, &cache);
+    assert!(ok3);
+    assert_eq!(
+        cached2.final_measure_values_by_bucket(),
+        plain.final_measure_values_by_bucket()
+    );
 }

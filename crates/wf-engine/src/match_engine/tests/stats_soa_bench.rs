@@ -550,6 +550,20 @@ fn q17_stats_task_layer() {
     let ok2 = exec2.process_batch_rows(&batch, None);
     let none_ns = t0.elapsed().as_secs_f64() * 1e9 / n as f64;
 
+    // 5. 批大小效应（验证 sample 的 eval_vec 热点）: 生产 frame_mb=8 → 批 ~8192 行,
+    // eval_vec 的每批固定开销在小批下摊薄不足 → 每事件成本放大。
+    const BATCH_ROWS: usize = 8192;
+    let small_batch = q17_batch_with_time(BATCH_ROWS);
+    let mut exec3 = StatsExecutor::new(q17_plan());
+    // 多次小批（等价 30M 行）摊批数, 首批发热排除
+    let small_rounds = 30_000_000 / BATCH_ROWS;
+    let t0 = Instant::now();
+    for _ in 0..small_rounds {
+        let ok3 = exec3.process_batch_rows(&small_batch, None);
+        std::hint::black_box(ok3);
+    }
+    let small_ns = t0.elapsed().as_secs_f64() * 1e9 / (30_000_000 as f64);
+
     eprintln!("== q17 stats_task 层归因（N={}, 批内单段 1d 窗）==", N);
     eprintln!("  process_batch_rows None 基线 : {:>6.2} ns/事件（列式前置={}）", none_ns, ok2);
     eprintln!("  process_batch_rows Some(rows): {:>6.2} ns/事件（列式前置={}）", with_rows_ns, ok);
@@ -559,5 +573,8 @@ fn q17_stats_task_layer() {
     eprintln!("  段扫（时间列逐行）         : {:>6.2} ns/事件", seg_ns);
     let task_extra = (with_rows_ns - none_ns) + max_time_ns + domain_ns + seg_ns;
     eprintln!("  stats_task 层合计附加       : {:>6.2} ns/事件（None 基线 + 附加 = {:.1}）", task_extra, none_ns + task_extra);
+    eprintln!("  —— 批大小效应（sample 的 eval_vec 热点验证）——");
+    eprintln!("  8192 行小批 ×{} 批       : {:>6.2} ns/事件（vs 1M 行单批 {:.2}）", small_rounds, small_ns, none_ns);
+    eprintln!("  → 若小批显著更贵: eval_vec/guard 每批固定开销是主墙, 方向 = mask 计算优化");
     eprintln!("  → diag 577 ns·核 剩余差距   : 投递/多核/窗口 close/ack 等 wf-runtime 外围");
 }

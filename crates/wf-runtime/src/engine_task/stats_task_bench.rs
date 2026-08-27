@@ -192,6 +192,7 @@ fn q17_config(
         shard_count: 1,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     };
     let cancel = config.cancel.clone();
     (config, cancel)

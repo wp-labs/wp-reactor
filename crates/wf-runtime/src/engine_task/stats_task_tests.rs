@@ -174,6 +174,7 @@ fn ranked_task_config(
         shard_count: 1,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     }
 }
 
@@ -427,6 +428,7 @@ fn make_q15_task() -> (StatsTask, mpsc::Receiver<crate::alert_task::AlertBatch>)
         shard_count: 1,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx)
@@ -578,6 +580,7 @@ async fn q15_input_shard_merge_emits_single_equivalent() {
             shard_count: 2,
             merge_rx,
             merge_tx,
+            mask_cache: None,
         };
         let (task, _cancel) = StatsTask::new(config);
         task
@@ -650,6 +653,7 @@ fn make_stats_shard_task(
         shard_count: 2,
         merge_rx,
         merge_tx,
+        mask_cache: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     task
@@ -941,6 +945,7 @@ fn make_stats_task() -> (
         shard_count: 1,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx, progress)
@@ -1136,6 +1141,7 @@ fn make_stats_task_with_plan(
         shard_count: 1,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx, progress)
@@ -1290,6 +1296,7 @@ fn make_q12_task_sharded(
         shard_count,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     };
     let (task, _cancel) = StatsTask::new(config);
     (task, alert_rx)

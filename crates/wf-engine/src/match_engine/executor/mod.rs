@@ -21,7 +21,7 @@ pub use each_exec::{EachDirectBatchStats, PipeEachRow, PipeRowSink};
 // 供 `match_engine::pub use executor::DistinctKey` 转发（stats distinct 键类型）。
 pub use stats_exec::{
     DistinctKey, DistinctSet, RowFieldLayout, RowFields, StatsAccum, StatsBucketAccs,
-    StatsCloseBucket, StatsExecutor, StatsWindowState,
+    StatsCloseBucket, StatsExecutor, StatsMaskCache, StatsWindowState,
 };
 
 // 供 crate 内 SoA 对照 bench（tests/）访问私有热路径函数。

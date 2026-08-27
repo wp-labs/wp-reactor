@@ -6,6 +6,7 @@
 //! 设计依据: docs/stats-executor-design.md v6（§6 执行器）。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -19,6 +20,87 @@ use crate::match_engine::match_engine::{Event, ScopeKey, field_ref_name};
 use crate::match_engine::{EngineHashMap, EngineHashSet, Value};
 use crate::window::scope_key_columnar;
 use crate::window::scope_key_from_column;
+
+// ---------------------------------------------------------------------------
+// 批级 where mask 共享缓存（2026-08-27 q17 分片去重）
+// ---------------------------------------------------------------------------
+//
+// 背景: 分片（rule_parallelism=S）下每片 `process_batch_rows` 对**整批**计算
+// where mask（`eval_guard_columnar` 向量化全批）——同一批被 S 片重复 S 次
+// （q17 10 片: mask 占 rules 段 CPU ~85%, sample 顶栈 eval_vec 家族第一热点）。
+// 首片算完写缓存, 其余片复用（保持向量化, 总量 S×→1×）。
+//
+// 正确性: mask 是「批 + where 表达式」的纯函数（同一 executor 各片 where 相
+// 同）。key = 首列 Arc 指针 + 行数——各片持同一批的**列 Arc 共享**（window
+// 批存储 `Arc<RecordBatch>` 浅克隆, `read_since_with_shard` 每片拿值副本但列
+// 数组 Arc 同源）; 缓存**强持有批 Arc** → 列指针不会释放复用 → 无碰撞。
+//
+// 内存: 流式批下同窗口的批几乎同时被各片消费, 缓存持有最近 ~max_rows 行
+// （列数据 Arc 共享, 防释放不复制）; 超限整体清空（旧批已处理完, 安全）。
+
+/// 分片共享的批级 where mask 缓存（`Arc<RecordBatch>` 强持有防指针复用）。
+#[derive(Debug)]
+pub struct StatsMaskCache {
+    inner: std::sync::Mutex<std::collections::HashMap<(usize, usize), (Arc<RecordBatch>, Arc<Vec<BooleanArray>>)>>,
+    /// 容量上限（总行数; 超限整体清空——流式批下旧批已消费完）。
+    /// pub(crate) 供测试缩容验证清理。
+    pub(crate) max_rows: usize,
+    total_rows: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for StatsMaskCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StatsMaskCache {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            max_rows: 4_000_000,
+            total_rows: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// 取或算（算完写缓存）。`compute` = 批 → where mask 列表（仅未命中时调用）。
+    pub fn get_or_compute(
+        &self,
+        batch: &RecordBatch,
+        compute: impl FnOnce() -> Vec<BooleanArray>,
+    ) -> Arc<Vec<BooleanArray>> {
+        let rows = batch.num_rows();
+        if rows == 0 {
+            return Arc::new(compute()); // 空批不缓存
+        }
+        let key = (
+            std::sync::Arc::as_ptr(batch.column(0)) as *const () as usize,
+            rows,
+        );
+        let mut guard = self.inner.lock().expect("mask cache poisoned");
+        if let Some((_, masks)) = guard.get(&key) {
+            return Arc::clone(masks);
+        }
+        let masks = Arc::new(compute());
+        // 容量检查在插入前: 超限先清旧批（当前批正被各片消费, 保留）。
+        let new_total = self
+            .total_rows
+            .fetch_add(rows, std::sync::atomic::Ordering::Relaxed)
+            + rows;
+        if new_total > self.max_rows {
+            guard.clear();
+            self.total_rows
+                .store(rows, std::sync::atomic::Ordering::Relaxed);
+        }
+        guard.insert(key, (Arc::new(batch.clone()), Arc::clone(&masks)));
+        masks
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.lock().expect("poisoned").len()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 状态结构（v6 §6.1 — 无匹配进度, 纯累加）
@@ -1507,6 +1589,27 @@ impl StatsExecutor {
     /// 列式批处理（P1.5, 设计 §6.2）+ 行子集（P2 分片: `rows` = 本片拥有的
     /// 行索引; `None` = 全批）。归并只对行域内的行生效; where mask 仍整批计算。
     pub fn process_batch_rows(&mut self, batch: &RecordBatch, rows: Option<&[u32]>) -> bool {
+        self.process_batch_rows_impl(batch, rows, None)
+    }
+
+    /// 分片缓存版（2026-08-27 q17）: where mask 经 [`StatsMaskCache`] 分片共享——
+    /// 同一批被 S 片各自整批 eval 的重复（S×）消除为首片 1×（其余片 Arc 命中）。
+    /// 语义与 [`Self::process_batch_rows`] 完全一致（mask 为批的纯函数）。
+    pub fn process_batch_rows_cached(
+        &mut self,
+        batch: &RecordBatch,
+        rows: Option<&[u32]>,
+        cache: &StatsMaskCache,
+    ) -> bool {
+        self.process_batch_rows_impl(batch, rows, Some(cache))
+    }
+
+    fn process_batch_rows_impl(
+        &mut self,
+        batch: &RecordBatch,
+        rows: Option<&[u32]>,
+        mask_cache: Option<&StatsMaskCache>,
+    ) -> bool {
         // 前置（**必须在任何累加副作用之前**——返回 false 时调用方回退
         // process_rows, 部分应用会把已累加的计数再算一遍）:
         // 1. 全部 where 表达式可列式化（eval_guard_columnar 对不可列式表达式
@@ -1538,12 +1641,22 @@ impl StatsExecutor {
         // 归并段（段 1d/段 2）改为**行域驱动**（count_domain/sum_domain/
         // insert_distinct_domain 只遍历本片行）——不再构建全批 domain mask。
         let view = ColumnarBatch::from_all_fields(batch);
-        // 段 1: where 列式 mask（去重后唯一条件, 每批一次）
-        let masks: Vec<BooleanArray> = self
-            .unique_wheres
-            .iter()
-            .map(|e| eval_guard_columnar(e, &view))
-            .collect();
+        // 段 1: where 列式 mask（去重后唯一条件, 每批一次; 分片缓存版共享首片结果）。
+        let masks: Vec<BooleanArray> = match mask_cache {
+            Some(cache) => (*cache.get_or_compute(batch, || {
+                let view = ColumnarBatch::from_all_fields(batch);
+                self.unique_wheres
+                    .iter()
+                    .map(|e| eval_guard_columnar(e, &view))
+                    .collect()
+            }))
+            .clone(), // Vec<BooleanArray> clone = 列数组 Arc 浅拷贝
+            None => self
+                .unique_wheres
+                .iter()
+                .map(|e| eval_guard_columnar(e, &view))
+                .collect(),
+        };
         // 行字段列名（P5）: 子集 → 直接用; None → 排序的 schema 字段名（与行式
         // None 同序, 任务层注入同序）。仅 last/top 计划需要。
         let has_row_measures = self

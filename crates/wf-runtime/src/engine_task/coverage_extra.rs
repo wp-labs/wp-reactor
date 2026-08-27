@@ -94,6 +94,7 @@ async fn run_stats_task_push_channel_close_returns_ok() {
         shard_count: 1,
         merge_rx: None,
         merge_tx: None,
+        mask_cache: None,
     };
     drop(tx);
 

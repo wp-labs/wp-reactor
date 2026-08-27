@@ -117,6 +117,8 @@ pub(super) struct StatsTask {
     /// 非协调片发送端; 未分片两者皆 None。
     merge_rx: Option<mpsc::Receiver<StatsPartial>>,
     merge_tx: Option<mpsc::Sender<StatsPartial>>,
+    /// 分片共享批级 where mask 缓存（2026-08-27 q17 分片去重）; None = 不缓存。
+    mask_cache: Option<Arc<wf_engine::match_engine::StatsMaskCache>>,
     /// 当前窗口（fixed 桶, bucket 对齐首个事件; `None` = 尚未见事件）。
     window_start: Option<i64>,
     /// 当前窗口结束（= window_start + dur; close 判定 watermark >= window_end）。
@@ -153,6 +155,7 @@ impl StatsTask {
             shard_count,
             merge_rx,
             merge_tx,
+            mask_cache,
         } = config;
         let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
         let task_id = format!("{}#{}", executor.plan().name, seq);
@@ -176,6 +179,7 @@ impl StatsTask {
             shard_count,
             merge_rx,
             merge_tx,
+            mask_cache,
             window_start: None,
             window_end: None,
             last_watermark: i64::MIN,
@@ -363,7 +367,12 @@ impl StatsTask {
         if crate::perf_diag::perf_cut_rules() {
             return;
         }
-        let stats_ok = self.stats.process_batch_rows(batch, seg);
+        // 分片共享 mask 缓存: 首片算, 其余片 Arc 命中（q17 10 片 mask 占 rules
+        // CPU ~85%——2026-08-27 sample 定位）。语义与无缓存路径完全一致。
+        let stats_ok = match &self.mask_cache {
+            Some(cache) => self.stats.process_batch_rows_cached(batch, seg, cache),
+            None => self.stats.process_batch_rows(batch, seg),
+        };
         if !stats_ok {
             // 回退行式: 只物化行域内的行（与列式行域一致）。
             let events = match seg {
