@@ -1,3 +1,4 @@
+pub mod async_persist;
 mod cidr_cache;
 pub mod columnar;
 pub mod contract;
