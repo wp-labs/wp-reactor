@@ -2142,8 +2142,9 @@ async fn stats_push_single_segment_fast_path_with_shared_cache() {
         .unwrap_or_else(|e| e.into_inner());
     let (mut task, mut alert_rx, _progress) = make_stats_task();
     // 注入分片共享缓存（A + B 组合: max_time 缓存 + 单段快路径）
-    task.mask_cache =
-        Some(std::sync::Arc::new(wf_engine::match_engine::StatsMaskCache::new()));
+    task.mask_cache = Some(std::sync::Arc::new(
+        wf_engine::match_engine::StatsMaskCache::new(),
+    ));
 
     // b1: 2 行 ts=5s → 首窗开窗 [0,10s)（window_end=None 分支, 快路径不触发——
     // 开窗逻辑路径）
@@ -2176,8 +2177,9 @@ async fn stats_push_fast_path_skips_when_batch_crosses_window() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let (mut task, mut alert_rx, _progress) = make_stats_task();
-    task.mask_cache =
-        Some(std::sync::Arc::new(wf_engine::match_engine::StatsMaskCache::new()));
+    task.mask_cache = Some(std::sync::Arc::new(
+        wf_engine::match_engine::StatsMaskCache::new(),
+    ));
 
     // b1: 2 行 ts=5s → 窗口 [0,10s)
     let b1 = make_batch(&["10.0.0.1", "10.0.0.1"], 5_000_000_000);

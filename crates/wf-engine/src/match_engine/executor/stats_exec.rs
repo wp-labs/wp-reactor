@@ -43,10 +43,8 @@ use crate::window::scope_key_from_column;
 /// key = (首列 Arc 指针, 行数); value = (批 Arc 防释放, mask 结果)。
 /// 2026-08-27 扩展: 同批的 [`batch_max_time`] 也是 10× 分片重复——并入本缓存
 /// （同 key 批身份, 复用同一 config 字段, 见 [`StatsMaskCache::get_or_compute_time`]）。
-type MaskCacheMap = std::collections::HashMap<
-    (usize, usize),
-    (Arc<RecordBatch>, Arc<Vec<BooleanArray>>),
->;
+type MaskCacheMap =
+    std::collections::HashMap<(usize, usize), (Arc<RecordBatch>, Arc<Vec<BooleanArray>>)>;
 /// 批级时间信息缓存表: key = (首列 Arc 指针, 行数), value = (批 Arc, max_time)。
 type TimeCacheMap = std::collections::HashMap<(usize, usize), (Arc<RecordBatch>, i64)>;
 
@@ -753,7 +751,16 @@ impl StatsWindowState {
         let soa_layout = plan
             .measures
             .iter()
-            .all(|m| matches!(m.agg, StatsAggPlan::Count | StatsAggPlan::Sum | StatsAggPlan::Avg | StatsAggPlan::Min | StatsAggPlan::Max))
+            .all(|m| {
+                matches!(
+                    m.agg,
+                    StatsAggPlan::Count
+                        | StatsAggPlan::Sum
+                        | StatsAggPlan::Avg
+                        | StatsAggPlan::Min
+                        | StatsAggPlan::Max
+                )
+            })
             .then(|| NumericSoALayout::build(plan));
         let mut buckets = buckets;
         if buckets.is_empty() && plan.keys.is_empty() {
@@ -951,11 +958,7 @@ impl StatsWindowState {
     ///
     /// **单次 entry 查找（2026-08-27 q17）**: 旧实现 `get`（找 pos）+ `get_mut`
     /// （取链）两次哈希查找——已存在桶的每事件命中是主流, 双查找纯浪费。
-    fn bucket_mut(
-        &mut self,
-        key: &ScopeKey,
-        plan: &StatsPlan,
-    ) -> Option<&mut StatsBucketAccs> {
+    fn bucket_mut(&mut self, key: &ScopeKey, plan: &StatsPlan) -> Option<&mut StatsBucketAccs> {
         use std::collections::hash_map::Entry;
         let hash = scope_key_hash(key);
         let allowance = Self::bucket_allowance(plan, self.soa_layout.is_some());
@@ -1841,15 +1844,7 @@ impl StatsExecutor {
                         if let Some(field) = &measure.field
                             && let Some(col) = numeric_col(batch, field_name(field))
                         {
-                            minmax_domain(
-                                &col,
-                                rows,
-                                n,
-                                &masks,
-                                wi,
-                                &mut nacc.min,
-                                &mut nacc.max,
-                            );
+                            minmax_domain(&col, rows, n, &masks, wi, &mut nacc.min, &mut nacc.max);
                         }
                     }
                     StatsAggPlan::DistinctCount => {
@@ -2733,7 +2728,11 @@ fn value_to_distinct_key(v: &Value) -> DistinctKey {
 /// SoA 桶 → 每度量 f64 值（语义与 [`measure_values`] 的 Numeric 分支一致:
 /// count/sum 直取、avg = sum/count（count==0 → 0.0）、min/max unwrap_or(0)）。
 /// pub(crate) 供 SoA 对照 bench。
-pub(crate) fn measure_values_soa(plan: &StatsPlan, soa: &NumericSoA, layout: &NumericSoALayout) -> Vec<f64> {
+pub(crate) fn measure_values_soa(
+    plan: &StatsPlan,
+    soa: &NumericSoA,
+    layout: &NumericSoALayout,
+) -> Vec<f64> {
     plan.measures
         .iter()
         .enumerate()
@@ -3106,11 +3105,7 @@ fn column_f64_at(batch: &RecordBatch, ci: usize, row: usize) -> Option<f64> {
 /// 索引版 distinct 键读取（列索引批级预解析, 免每行 schema.index_of——q17 同款修复）。
 /// 与列式段 `insert_distinct_column` 同类型分派, 原生值构造（D7: 禁止
 /// `Value::Number(f64)` 化 ≥2^53 的 Int64）。null / 类型不在支持集 → None。
-fn column_distinct_key_at(
-    batch: &RecordBatch,
-    ci: usize,
-    row: usize,
-) -> Option<DistinctKey> {
+fn column_distinct_key_at(batch: &RecordBatch, ci: usize, row: usize) -> Option<DistinctKey> {
     use arrow::array::TimestampNanosecondArray;
     let col = batch.column(ci);
     if col.is_null(row) {

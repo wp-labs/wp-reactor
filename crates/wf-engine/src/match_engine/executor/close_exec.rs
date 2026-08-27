@@ -1012,11 +1012,15 @@ impl RuleExecutor {
                 // wfx_id: 前缀命中则只 hash 变化的 measure + origin（与
                 // `wfx_prefix_cache_matches_split` 同款判定; 换桶/窗自动重建）。
                 let wfx_id = match &wfx_cache {
-                    Some(c) if c.prefix_matches_labels(
-                        &scope_values,
-                        &fired_at,
-                        labels.iter().map(|l| Some(l.as_str())),
-                    ) => c.finish_from_labels(measures, &origin),
+                    Some(c)
+                        if c.prefix_matches_labels(
+                            &scope_values,
+                            &fired_at,
+                            labels.iter().map(|l| Some(l.as_str())),
+                        ) =>
+                    {
+                        c.finish_from_labels(measures, &origin)
+                    }
                     _ => {
                         let c = WfxPrefixCache::build_from_labels(
                             &self.plan.name,

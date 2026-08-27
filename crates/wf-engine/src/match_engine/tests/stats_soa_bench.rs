@@ -27,11 +27,11 @@ use wf_lang::ast::{BinOp, Expr, FieldRef};
 use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan, WindowSpec};
 
 use crate::match_engine::ScopeKey;
-use crate::match_engine::executor::{
-    RowFieldLayout, StatsAccum, StatsBucket, StatsBucketAccs, accumulate_column_row,
-    accumulate_soa, comps_hash, measure_values_soa, NumericSoALayout,
-};
 use crate::match_engine::executor::StatsExecutor;
+use crate::match_engine::executor::{
+    NumericSoALayout, RowFieldLayout, StatsAccum, StatsBucket, StatsBucketAccs,
+    accumulate_column_row, accumulate_soa, comps_hash, measure_values_soa,
+};
 
 const N: usize = 1_000_000;
 const AUCTIONS: i64 = 100; // 在航 auction 窗口（~100% 命中, 与 q17 同构）
@@ -66,19 +66,21 @@ fn price_range(lo: f64, hi: f64) -> Expr {
 
 /// q17 计划: 8 度量（total + r1/r2/r3 分档 + min/max/avg/sum）。
 fn q17_plan() -> StatsPlan {
-    let mk = |label: &str, agg: StatsAggPlan, field: Option<&str>, w: Option<Expr>| {
-        StatsMeasurePlan {
+    let mk =
+        |label: &str, agg: StatsAggPlan, field: Option<&str>, w: Option<Expr>| StatsMeasurePlan {
             label: label.into(),
             source_alias: "b".into(),
             where_expr: w,
             agg,
             field: field.map(|f| FieldRef::Qualified("b".into(), f.into())),
             arg: None,
-        }
-    };
+        };
     StatsPlan {
         window_spec: WindowSpec::Fixed(std::time::Duration::from_secs(86_400)),
-        keys: vec![Expr::Field(FieldRef::Qualified("b".into(), "auction".into()))],
+        keys: vec![Expr::Field(FieldRef::Qualified(
+            "b".into(),
+            "auction".into(),
+        ))],
         output_shape: StatsOutputShapePlan::Rows,
         measures: vec![
             mk("total", StatsAggPlan::Count, None, None),
@@ -139,7 +141,11 @@ fn q17_batch_with_time(n: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("auction", DataType::Int64, false),
         Field::new("price", DataType::Int64, false),
-        Field::new("dateTime", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
     ]));
     let auction: Vec<i64> = (0..n).map(|i| (i as i64) % AUCTIONS).collect();
     let price: Vec<i64> = (0..n)
@@ -148,7 +154,9 @@ fn q17_batch_with_time(n: usize) -> RecordBatch {
             (100.0 * 1e6f64.powf(t)).round() as i64
         })
         .collect();
-    let time: Vec<i64> = (0..n).map(|i| 1_750_000_000_000_000_000i64 + i as i64 * 65_200).collect();
+    let time: Vec<i64> = (0..n)
+        .map(|i| 1_750_000_000_000_000_000i64 + i as i64 * 65_200)
+        .collect();
     RecordBatch::try_new(
         schema,
         vec![
@@ -168,7 +176,11 @@ fn q17_masks(batch: &RecordBatch) -> Vec<BooleanArray> {
         .downcast_ref::<Int64Array>()
         .unwrap();
     let mk = |f: &dyn Fn(i64) -> bool| {
-        BooleanArray::from((0..price.len()).map(|i| f(price.value(i))).collect::<Vec<_>>())
+        BooleanArray::from(
+            (0..price.len())
+                .map(|i| f(price.value(i)))
+                .collect::<Vec<_>>(),
+        )
     };
     vec![
         mk(&|p| p < 10_000),
@@ -196,16 +208,8 @@ fn q17_stats_accum_soa() {
         .map(|m| m.field.as_ref().map(|_| price_col).flatten())
         .collect();
     // 去重后 where 索引（3 个唯一条件; 与 with_row_fields 同构）。
-    let measure_where: Vec<Option<usize>> = vec![
-        None,
-        Some(0),
-        Some(1),
-        Some(2),
-        None,
-        None,
-        None,
-        None,
-    ];
+    let measure_where: Vec<Option<usize>> =
+        vec![None, Some(0), Some(1), Some(2), None, None, None, None];
     let measure_field_idx: Vec<Option<usize>> = vec![None; n_measures]; // 无子集
     let row_layout = Arc::new(RowFieldLayout::all_other(&[]));
 
@@ -234,7 +238,15 @@ fn q17_stats_accum_soa() {
             &row_layout,
             &measure_field_cols,
         );
-        accumulate_soa(&mut soa, &layout, &measure_where, &measure_field_cols, &batch, &masks, row);
+        accumulate_soa(
+            &mut soa,
+            &layout,
+            &measure_where,
+            &measure_field_cols,
+            &batch,
+            &masks,
+            row,
+        );
     }
 
     // —— 旧路径（Classic）——
@@ -260,7 +272,13 @@ fn q17_stats_accum_soa() {
     let t0 = Instant::now();
     for row in 0..N {
         std::hint::black_box(accumulate_soa(
-            &mut soa, &layout, &measure_where, &measure_field_cols, &batch, &masks, row,
+            &mut soa,
+            &layout,
+            &measure_where,
+            &measure_field_cols,
+            &batch,
+            &masks,
+            row,
         ));
     }
     let new_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
@@ -299,14 +317,8 @@ fn q17_stats_accum_soa() {
         "== q17 stats 累积循环对照（N={}, 8 度量, 3 where 分档, 单桶重复命中）==",
         N
     );
-    eprintln!(
-        "  Classic (枚举+Box+同列4次读): {:.2} ns/事件",
-        old_ns
-    );
-    eprintln!(
-        "  SoA     (数组直写+同列1次读): {:.2} ns/事件",
-        new_ns
-    );
+    eprintln!("  Classic (枚举+Box+同列4次读): {:.2} ns/事件", old_ns);
+    eprintln!("  SoA     (数组直写+同列1次读): {:.2} ns/事件", new_ns);
     eprintln!(
         "  差值 {:.2} ns/事件（{:.1}%）",
         old_ns - new_ns,
@@ -328,7 +340,9 @@ fn q17_stats_accum_soa() {
         "  生产完整路径 process_batch_rows（含桶查找/哈希/分派）: {:.2} ns/事件（列式前置={}）",
         full_ns, ok
     );
-    let bucket = exec.window.find_bucket(&crate::match_engine::ScopeKey::Int(0));
+    let bucket = exec
+        .window
+        .find_bucket(&crate::match_engine::ScopeKey::Int(0));
     eprintln!(
         "  → 生产桶形态: {}",
         match bucket.map(|b| matches!(b, StatsBucketAccs::Numeric(_))) {
@@ -393,7 +407,11 @@ fn q17_rules_breakdown() {
     // 预热: 访问热点键若干次, 建立 TLB/cache 分布。
     for i in 0..100_000 {
         let a = auction_at(i);
-        let _ = exec.window.keyed_bucket_mut(comps_hash(&[ScopeKey::Int(a)]), &[ScopeKey::Int(a)], &plan);
+        let _ = exec.window.keyed_bucket_mut(
+            comps_hash(&[ScopeKey::Int(a)]),
+            &[ScopeKey::Int(a)],
+            &plan,
+        );
     }
 
     // 1. hash only
@@ -420,7 +438,13 @@ fn q17_rules_breakdown() {
     for i in 0..N_LOOKUP {
         let row = i % N;
         std::hint::black_box(accumulate_soa(
-            &mut soa, &layout, &measure_where, &measure_field_cols, &batch, &masks, row,
+            &mut soa,
+            &layout,
+            &measure_where,
+            &measure_field_cols,
+            &batch,
+            &masks,
+            row,
         ));
     }
     let accum_ns = t0.elapsed().as_secs_f64() * 1e9 / N_LOOKUP as f64;
@@ -435,7 +459,13 @@ fn q17_rules_breakdown() {
         {
             let row = i % N;
             std::hint::black_box(accumulate_soa(
-                soa, &layout, &measure_where, &measure_field_cols, &batch, &masks, row,
+                soa,
+                &layout,
+                &measure_where,
+                &measure_field_cols,
+                &batch,
+                &masks,
+                row,
             ));
         }
     }
@@ -445,7 +475,11 @@ fn q17_rules_breakdown() {
     let mut small = build_large_window(&plan, 100);
     for i in 0..10_000 {
         let a = auction_at(i);
-        let _ = small.window.keyed_bucket_mut(comps_hash(&[ScopeKey::Int(a)]), &[ScopeKey::Int(a)], &plan);
+        let _ = small.window.keyed_bucket_mut(
+            comps_hash(&[ScopeKey::Int(a)]),
+            &[ScopeKey::Int(a)],
+            &plan,
+        );
     }
     let t0 = Instant::now();
     for i in 0..N_LOOKUP {
@@ -468,7 +502,9 @@ fn q17_rules_breakdown() {
         cold_state ^= cold_state << 17;
         let k = (cold_state % N_BUCKETS as u64) as i64;
         let h = comps_hash(&[ScopeKey::Int(k)]);
-        let accs = cold_exec.window.keyed_bucket_mut(h, &[ScopeKey::Int(k)], &plan);
+        let accs = cold_exec
+            .window
+            .keyed_bucket_mut(h, &[ScopeKey::Int(k)], &plan);
         std::hint::black_box(accs);
     }
     let lookup_cold_ns = t0.elapsed().as_secs_f64() * 1e9 / N_COLD as f64;
@@ -479,17 +515,45 @@ fn q17_rules_breakdown() {
     let ok = prod.process_batch_rows(&batch, None);
     let prod_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
 
-    eprintln!("== q17 rules 段逐分量（N_LOOKUP={}, 大表 {} 桶, 热点 {} auction）==", N_LOOKUP, N_BUCKETS, AUCTIONS);
+    eprintln!(
+        "== q17 rules 段逐分量（N_LOOKUP={}, 大表 {} 桶, 热点 {} auction）==",
+        N_LOOKUP, N_BUCKETS, AUCTIONS
+    );
     eprintln!("  hash(comps_hash FNV)      : {:>6.2} ns/事件", hash_ns);
-    eprintln!("  bucket lookup 大表        : {:>6.2} ns/事件（{:.0}%）", lookup_large_ns, lookup_large_ns / (hash_ns + lookup_large_ns + accum_ns) * 100.0);
-    eprintln!("  bucket lookup 小表(对照)  : {:>6.2} ns/事件", lookup_small_ns);
-    eprintln!("  bucket lookup 冷随机(对照): {:>6.2} ns/事件", lookup_cold_ns);
-    eprintln!("  ├ 热点局部性收益(冷-热)   : {:>6.2} ns/事件（q17 活跃 ~100 auction → 热路径 ≈ 大表行）", lookup_cold_ns - lookup_large_ns);
-    eprintln!("  accumulate_soa            : {:>6.2} ns/事件（{:.0}%）", accum_ns, accum_ns / (hash_ns + lookup_large_ns + accum_ns) * 100.0);
-    eprintln!("  三件合计                  : {:>6.2} ns/事件", hash_ns + lookup_large_ns + accum_ns);
+    eprintln!(
+        "  bucket lookup 大表        : {:>6.2} ns/事件（{:.0}%）",
+        lookup_large_ns,
+        lookup_large_ns / (hash_ns + lookup_large_ns + accum_ns) * 100.0
+    );
+    eprintln!(
+        "  bucket lookup 小表(对照)  : {:>6.2} ns/事件",
+        lookup_small_ns
+    );
+    eprintln!(
+        "  bucket lookup 冷随机(对照): {:>6.2} ns/事件",
+        lookup_cold_ns
+    );
+    eprintln!(
+        "  ├ 热点局部性收益(冷-热)   : {:>6.2} ns/事件（q17 活跃 ~100 auction → 热路径 ≈ 大表行）",
+        lookup_cold_ns - lookup_large_ns
+    );
+    eprintln!(
+        "  accumulate_soa            : {:>6.2} ns/事件（{:.0}%）",
+        accum_ns,
+        accum_ns / (hash_ns + lookup_large_ns + accum_ns) * 100.0
+    );
+    eprintln!(
+        "  三件合计                  : {:>6.2} ns/事件",
+        hash_ns + lookup_large_ns + accum_ns
+    );
     eprintln!("  完整行(查找+累积,无hash)  : {:>6.2} ns/事件", full_ns);
-    eprintln!("  process_batch_rows 大表   : {:>6.2} ns/事件（列式前置={}）", prod_ns, ok);
-    eprintln!("  → diag 实测 rules 每事件   : ~577 ns·核（核·s 17.3 / 30M）——剩余差距在生产外围（批级/窗口/多核）");
+    eprintln!(
+        "  process_batch_rows 大表   : {:>6.2} ns/事件（列式前置={}）",
+        prod_ns, ok
+    );
+    eprintln!(
+        "  → diag 实测 rules 每事件   : ~577 ns·核（核·s 17.3 / 30M）——剩余差距在生产外围（批级/窗口/多核）"
+    );
 }
 
 /// stats_task 层归因（2026-08-27）: 量化 `process_batch_from` 在
@@ -565,16 +629,35 @@ fn q17_stats_task_layer() {
     let small_ns = t0.elapsed().as_secs_f64() * 1e9 / (30_000_000 as f64);
 
     eprintln!("== q17 stats_task 层归因（N={}, 批内单段 1d 窗）==", N);
-    eprintln!("  process_batch_rows None 基线 : {:>6.2} ns/事件（列式前置={}）", none_ns, ok2);
-    eprintln!("  process_batch_rows Some(rows): {:>6.2} ns/事件（列式前置={}）", with_rows_ns, ok);
-    eprintln!("  ├ 行域分支增量             : {:>6.2} ns/事件", with_rows_ns - none_ns);
-    eprintln!("  max_time 全批扫描          : {:>6.2} ns/事件", max_time_ns);
+    eprintln!(
+        "  process_batch_rows None 基线 : {:>6.2} ns/事件（列式前置={}）",
+        none_ns, ok2
+    );
+    eprintln!(
+        "  process_batch_rows Some(rows): {:>6.2} ns/事件（列式前置={}）",
+        with_rows_ns, ok
+    );
+    eprintln!(
+        "  ├ 行域分支增量             : {:>6.2} ns/事件",
+        with_rows_ns - none_ns
+    );
+    eprintln!(
+        "  max_time 全批扫描          : {:>6.2} ns/事件",
+        max_time_ns
+    );
     eprintln!("  domain Vec<u32> 构造       : {:>6.2} ns/事件", domain_ns);
     eprintln!("  段扫（时间列逐行）         : {:>6.2} ns/事件", seg_ns);
     let task_extra = (with_rows_ns - none_ns) + max_time_ns + domain_ns + seg_ns;
-    eprintln!("  stats_task 层合计附加       : {:>6.2} ns/事件（None 基线 + 附加 = {:.1}）", task_extra, none_ns + task_extra);
+    eprintln!(
+        "  stats_task 层合计附加       : {:>6.2} ns/事件（None 基线 + 附加 = {:.1}）",
+        task_extra,
+        none_ns + task_extra
+    );
     eprintln!("  —— 批大小效应（sample 的 eval_vec 热点验证）——");
-    eprintln!("  8192 行小批 ×{} 批       : {:>6.2} ns/事件（vs 1M 行单批 {:.2}）", small_rounds, small_ns, none_ns);
+    eprintln!(
+        "  8192 行小批 ×{} 批       : {:>6.2} ns/事件（vs 1M 行单批 {:.2}）",
+        small_rounds, small_ns, none_ns
+    );
     eprintln!("  → 若小批显著更贵: eval_vec/guard 每批固定开销是主墙, 方向 = mask 计算优化");
     eprintln!("  → diag 577 ns·核 剩余差距   : 投递/多核/窗口 close/ack 等 wf-runtime 外围");
 }

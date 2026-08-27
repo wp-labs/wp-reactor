@@ -311,18 +311,19 @@ mod split_tests {
         let labels = ["top_price", "count"];
         // 同桶（scope_key 相同）多条：只有 measure 变化。
         let scope = vec![Value::Number(42.0)];
-        let rows: Vec<Vec<f64>> = (0..10).map(|i| vec![i as f64 * 1.5, i as f64 * 2.0]).collect();
+        let rows: Vec<Vec<f64>> = (0..10)
+            .map(|i| vec![i as f64 * 1.5, i as f64 * 2.0])
+            .collect();
         let mut cache = None::<WfxPrefixCache>;
         for measures in &rows {
-            let steps = labels.iter().zip(measures.iter()).map(|(l, m)| (Some(*l), *m));
+            let steps = labels
+                .iter()
+                .zip(measures.iter())
+                .map(|(l, m)| (Some(*l), *m));
             let expected = build_wfx_id_from_labels(rule, &scope, fired, steps, &origin);
             let got = match &cache {
                 Some(c)
-                    if c.prefix_matches_labels(
-                        &scope,
-                        fired,
-                        labels.iter().map(|l| Some(*l)),
-                    ) =>
+                    if c.prefix_matches_labels(&scope, fired, labels.iter().map(|l| Some(*l))) =>
                 {
                     c.finish_from_labels(measures.iter().copied(), &origin)
                 }
@@ -338,12 +339,18 @@ mod split_tests {
                     id
                 }
             };
-            assert_eq!(got, expected, "前缀缓存 wfx_id 必须与 from_labels 一致 (measures={measures:?})");
+            assert_eq!(
+                got, expected,
+                "前缀缓存 wfx_id 必须与 from_labels 一致 (measures={measures:?})"
+            );
         }
         // 换桶（scope_key 不同）→ 前缀不匹配 → 重建。
         let scope2 = vec![Value::Number(99.0)];
         let measures = [3.0, 7.0];
-        let steps = labels.iter().zip(measures.iter()).map(|(l, m)| (Some(*l), *m));
+        let steps = labels
+            .iter()
+            .zip(measures.iter())
+            .map(|(l, m)| (Some(*l), *m));
         let expected = build_wfx_id_from_labels(rule, &scope2, fired, steps, &origin);
         assert!(!cache.unwrap().prefix_matches_labels(
             &scope2,
@@ -356,7 +363,10 @@ mod split_tests {
             fired,
             labels.iter().map(|l| Some(*l)),
         );
-        assert_eq!(c.finish_from_labels(measures.iter().copied(), &origin), expected);
+        assert_eq!(
+            c.finish_from_labels(measures.iter().copied(), &origin),
+            expected
+        );
     }
 
     /// 同 scope+fired_at、labels 不同（内容 / 数量）→ 前缀必须不匹配：
@@ -579,8 +589,7 @@ impl WfxPrefixCache {
         hasher.update(b"\x00");
         hasher.update(fired_at.as_bytes());
         hasher.update(b"\x00");
-        let labels: Vec<Option<String>> =
-            labels.map(|l| l.map(|s| s.to_string())).collect();
+        let labels: Vec<Option<String>> = labels.map(|l| l.map(|s| s.to_string())).collect();
         Self {
             state: hasher.state,
             scope_key: scope_key.to_vec(),
