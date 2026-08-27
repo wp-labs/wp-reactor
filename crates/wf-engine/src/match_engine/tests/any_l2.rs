@@ -69,6 +69,8 @@ fn any_mode_throttle_fail_rule_trips_failed() {
             per: Duration::from_secs(60),
         }),
         on_exceed: ExceedAction::FailRule,
+        disk_provider: None,
+        max_disk_bytes: None,
     };
     let mut sm = CepStateMachine::with_limits("any_throttle".into(), plan, None, Some(limits));
     let e = event(vec![("sip", str_val("10.0.0.1"))]);

@@ -11,8 +11,8 @@ use crate::plan::{
     AggPlan, BindPlan, BranchPlan, ConvChainPlan, ConvOpPlan, ConvPlan, ConvWindowPlan, EachPlan,
     EntityPlan, ExceedAction, ExprPlan, JoinCondPlan, JoinKeyPlan, JoinPlan, KeyMapPlan, LetPlan,
     LimitsPlan, MatchPlan, PatternOriginPlan, RateSpec, RulePlan, ScorePlan, SeqPlan, SeqSkipPlan,
-    SeqStepPlan, SortKeyPlan, StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsPlan,
-    StepPlan, WindowSpec, YieldField, YieldPlan,
+    SeqStepPlan, SortKeyPlan, SpillMode, StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan,
+    StatsPlan, StepPlan, WindowSpec, YieldField, YieldPlan,
 };
 use crate::schema::WindowSchema;
 use crate::yield_preset::expand_yield_args;
@@ -1338,6 +1338,8 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
     let mut max_instances = None;
     let mut max_throttle = None;
     let mut on_exceed = ExceedAction::Throttle; // default
+    let mut disk_provider = None;
+    let mut max_disk_bytes = None;
 
     for item in &limits.items {
         match item.key.as_str() {
@@ -1358,6 +1360,20 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
                     _ => ExceedAction::Throttle,
                 };
             }
+            "disk_provider" | "spill" => {
+                // `spill` 为兼容别名（2026-08-27 改名 disk_provider）: 旧键仍生效。
+                disk_provider = match item.value.as_str() {
+                    "redb" => Some(SpillMode::Redb),
+                    _ => None,
+                };
+            }
+            "max_disk" => {
+                max_disk_bytes = parse_byte_size(&item.value);
+            }
+            "max_spill_bytes" => {
+                // 兼容别名（2026-08-27 改名 max_disk）: 旧键仍生效。
+                max_disk_bytes = parse_byte_size(&item.value);
+            }
             _ => {}
         }
     }
@@ -1367,10 +1383,12 @@ fn compile_limits(limits: &Option<crate::ast::LimitsBlock>) -> Option<LimitsPlan
         max_instances,
         max_throttle,
         on_exceed,
+        disk_provider,
+        max_disk_bytes,
     })
 }
 
-fn parse_byte_size(s: &str) -> Option<usize> {
+pub(crate) fn parse_byte_size(s: &str) -> Option<usize> {
     let s_upper = s.to_uppercase();
     if let Some(num_str) = s_upper.strip_suffix("GB") {
         num_str

@@ -38,8 +38,9 @@ pub use signal::{ShutdownTrigger, wait_for_signal};
 
 use bootstrap::load_and_compile;
 use spawn::{
-    metrics_record_to_data_record, spawn_alert_task, spawn_evictor_task, spawn_metrics_task,
-    spawn_receiver_task, spawn_rule_tasks, spawn_window_actors,
+    cleanup_leftover_spill_files, metrics_record_to_data_record, spawn_alert_task,
+    spawn_evictor_task, spawn_metrics_task, spawn_receiver_task, spawn_rule_tasks,
+    spawn_window_actors,
 };
 use types::TaskGroup;
 
@@ -298,6 +299,10 @@ impl Reactor {
         let mut op = op_context!("engine-bootstrap").with_auto_log();
         op.record("mode", mode_name(config.mode));
         op.record("base_dir", base_dir.display().to_string().as_str());
+
+        // 启动清理 spill 崩溃残留（设计 §8 时机③）——不依赖编译产物, 最早执行;
+        // 残留只可能是旧进程崩溃/kill 遗留（spill 无持久化语义, 无保留价值）。
+        cleanup_leftover_spill_files();
 
         let cancel = CancellationToken::new();
         // Child of root: cancelling the root (shutdown) propagates to rules,

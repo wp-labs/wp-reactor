@@ -235,6 +235,81 @@ pub(super) fn spawn_evictor_task(
 /// The task acks `seq + 1` per processed batch; time-based eviction only
 /// removes batches every live consumer has acked, so sweeps can no longer
 /// drop unconsumed data.
+/// stats spill 文件路径（M4）: `WF_SPILL_DIR`（默认 `spill`）下的
+/// `spill_{rule}_{pid}{_shard}.rb`。生命周期：窗口 close 后 `cleanup` 删除,
+/// 下一窗口复用同一路径（create 删旧建新）; 崩溃残留由启动清理删除（设计
+/// §8 时机③）。
+/// `shard`：key 分片时每片独立文件（分片 executor 各自独立 spill）。
+fn spill_file_path(rule_name: &str, shard: Option<usize>) -> PathBuf {
+    let dir = std::env::var("WF_SPILL_DIR").unwrap_or_else(|_| "spill".to_string());
+    let dir_path = Path::new(&dir);
+    if let Err(e) = std::fs::create_dir_all(dir_path) {
+        log::warn!("spill 目录创建失败 {}: {e}", dir_path.display());
+    }
+    let safe: String = rule_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    match shard {
+        Some(s) => dir_path.join(format!("spill_{safe}_{}_{s}.rb", std::process::id())),
+        None => dir_path.join(format!("spill_{safe}_{}.rb", std::process::id())),
+    }
+}
+
+/// 清理指定目录下的 spill 残留文件（设计 §8 时机③ 的核心逻辑; 目录参数便于
+/// 单测）。删除 `spill_*.rb` / `spill_*.rbr`（redb 库 + 侧车 WAL），其余文件
+/// 与子目录不动。返回删除的文件数。
+fn cleanup_leftover_spill_files_in(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0; // 目录不存在 = 无残留
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_spill_file =
+            name.starts_with("spill_") && (name.ends_with(".rb") || name.ends_with(".rbr"));
+        if !is_spill_file {
+            continue;
+        }
+        // 只删普通文件——目录/符号链接不碰（remove_file 对目录会失败告警）。
+        let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) => log::warn!("spill 启动清理失败 {}: {e}", entry.path().display()),
+        }
+    }
+    removed
+}
+
+/// 启动清理崩溃残留的 spill 文件（设计 §8 时机③）: `WF_SPILL_DIR`（默认
+/// `spill`）下的 `spill_*.rb/.rbr` 一并删除——残留 = 旧窗口未 close 完（或
+/// cleanup rm 失败）的临时缓冲, 无保留价值（spill 无持久化语义, 重启 =
+/// 重新 ingest）。由 [`crate::lifecycle::Reactor::start`] 最早调用。
+///
+/// 假定每个 `WF_SPILL_DIR` 只有一个引擎实例——多实例共用同一目录时应为各
+/// 实例配置独立目录（`WF_SPILL_DIR` 环境变量）。
+pub(crate) fn cleanup_leftover_spill_files() -> usize {
+    let dir = std::env::var("WF_SPILL_DIR").unwrap_or_else(|_| "spill".to_string());
+    let removed = cleanup_leftover_spill_files_in(Path::new(&dir));
+    if removed > 0 {
+        log::info!(
+            "spill 启动清理: 删除 {removed} 个崩溃残留文件（{}）",
+            Path::new(&dir).display()
+        );
+    }
+    removed
+}
+
 /// stats last/top（P4, Q18/Q19）的行字段提取子集: yield/entity 引用字段 ∪ 度量
 /// 字段。桶键字段不入行（close 已单独注入 scope_key）。`None` = 全部 schema 列
 /// （计划无 last/top 时无需提取——`None` 让执行器跳过整行提取）。
@@ -477,14 +552,44 @@ pub(super) fn spawn_rule_tasks(
                 );
                 // 状态内存 guard（2026-08-25）: 规则 `limits.max_memory` →
                 // StatsExecutor 超限拒收新键桶（内存有界 + 每窗口告警 + 计数）。
-                // None = 不设防（未写 limits 的规则保持原行为）。
+                // **规则级共享预算**（2026-08-27）：`max_memory` 是规则总驻留上限
+                // ——同规则全部分片共用一个内存占用计数, 分片数是引擎内部细节
+                // （旧语义 2GB/片 × 10 = 20GB 违背用户直觉）。None = 不设防。
                 let state_mem_limit: Option<usize> = rule
                     .executor
                     .plan()
                     .limits_plan
                     .as_ref()
                     .and_then(|l| l.max_memory_bytes);
-                stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
+                let mem_used_shared = state_mem_limit.map(|_| Arc::new(AtomicU64::new(0)));
+                stats.set_memory_limit_shared(
+                    &rule.executor.plan().name,
+                    state_mem_limit,
+                    mem_used_shared.clone(),
+                );
+                // 状态外溢（M4, `docs/design/stats-state-spill-redb.md`）:
+                // `limits { disk_provider = "redb" }`（旧键 `spill` 为兼容别名）→
+                // redb 落盘、内存只留活跃子集。
+                // 支持单实例 + key 分片（每片独立文件 + 独立写 worker, M6）;
+                // **输入分片**（空键按行号切分）暂不支持——配置了 spill 则告警
+                // 并忽略（见下方 input_shardable 分支）。
+                let spill_cfg = rule
+                    .executor
+                    .plan()
+                    .limits_plan
+                    .as_ref()
+                    .and_then(|l| l.disk_provider.as_ref().map(|_| l.max_disk_bytes));
+                // `max_disk` = 规则级共享磁盘预算（2026-08-27）：同规则全部
+                // 分片共用一个落盘字节计数器——用户配置的是规则总上限, 分片数是
+                // 引擎内部细节（单实例 = 1 个分片, 共享语义自然退化为单片）。
+                let spill_used = spill_cfg.map(|_| Arc::new(AtomicU64::new(0)));
+                if let Some(max_spill_bytes) = spill_cfg {
+                    stats.set_spill_redb(
+                        spill_file_path(&rule.executor.plan().name, None),
+                        max_spill_bytes,
+                        spill_used.clone(),
+                    );
+                }
                 let field_keys: Vec<FieldRef> = stats
                     .plan
                     .keys
@@ -542,7 +647,21 @@ pub(super) fn spawn_rule_tasks(
                                 stats_plan.clone(),
                                 row_fields.clone(),
                             );
-                        shard_stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
+                        shard_stats.set_memory_limit_shared(
+                            &rule.executor.plan().name,
+                            state_mem_limit,
+                            mem_used_shared.clone(),
+                        );
+                        // key 分片: 每片独立 executor（无跨片 merge）——spill 按片独立
+                        // 启用（每片独立文件 + 每片独立写 worker = 多 worker 多文件）,
+                        // 落盘字节记账共享规则级计数（max_disk = 规则总上限）。
+                        if let Some(max_spill_bytes) = spill_cfg {
+                            shard_stats.set_spill_redb(
+                                spill_file_path(&rule.executor.plan().name, Some(shard_idx)),
+                                max_spill_bytes,
+                                spill_used.clone(),
+                            );
+                        }
                         let task_config = StatsTaskConfig {
                             stats: shard_stats,
                             executor: rule.executor.clone(),
@@ -599,7 +718,17 @@ pub(super) fn spawn_rule_tasks(
                                 stats_plan.clone(),
                                 row_fields.clone(),
                             );
-                        shard_stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
+                        shard_stats.set_memory_limit_shared(
+                            &rule.executor.plan().name,
+                            state_mem_limit,
+                            mem_used_shared.clone(),
+                        );
+                        if spill_cfg.is_some() {
+                            log::warn!(
+                                "stats spill 与输入分片组合暂不支持（规则 {}）——本片忽略 spill 配置",
+                                rule.executor.plan().name
+                            );
+                        }
                         let task_config = StatsTaskConfig {
                             stats: shard_stats,
                             executor: rule.executor.clone(),
@@ -1643,7 +1772,70 @@ pub(crate) fn metrics_record_to_data_record(record: &MetricsRecord) -> DataRecor
 
 #[cfg(test)]
 mod tests {
-    use super::source_param_to_json;
+    use super::{cleanup_leftover_spill_files_in, source_param_to_json};
+
+    #[test]
+    fn cleanup_leftover_spill_files_in_removes_only_spill_files() {
+        // 设计 §8 时机③：启动清理只删 `spill_*.rb/.rbr`（崩溃残留）, 不动目录
+        // 里其他文件（如用户/其他用途的数据文件）与子目录。
+        let base = std::env::temp_dir().join(format!(
+            "wf_spill_cleanup_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = base.join("spilldir");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        for f in [
+            "spill_q18_1234.rb",
+            "spill_q18_1234.rbr",
+            "spill_q18_1234_2.rb", // key 分片文件
+            "spill_q19_9999.rbr",
+        ] {
+            std::fs::write(dir.join(f), b"stale").expect("write stale file");
+        }
+        std::fs::write(dir.join("keep.rb"), b"data").expect("write unrelated");
+        std::fs::write(dir.join("spill_notes.txt"), b"data").expect("write unrelated");
+        // 名为 spill 文件的子目录不得被删（非普通文件）; 符号链接同理（unix）
+        std::fs::create_dir(dir.join("spill_dir_x.rb")).expect("create subdir");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("keep.rb", dir.join("spill_link_x.rbr")).expect("symlink");
+
+        let removed = cleanup_leftover_spill_files_in(&dir);
+        assert_eq!(removed, 4, "只删 4 个 spill 库/侧车文件");
+        assert!(!dir.join("spill_q18_1234.rb").exists());
+        assert!(!dir.join("spill_q18_1234.rbr").exists());
+        assert!(!dir.join("spill_q18_1234_2.rb").exists());
+        assert!(!dir.join("spill_q19_9999.rbr").exists());
+        assert!(dir.join("keep.rb").exists(), "非 spill 文件保留");
+        assert!(dir.join("spill_notes.txt").exists(), "非 .rb/.rbr 后缀保留");
+        assert!(
+            dir.join("spill_dir_x.rb").is_dir(),
+            "子目录不动（非普通文件）"
+        );
+        #[cfg(unix)]
+        assert!(
+            dir.join("spill_link_x.rbr").exists(),
+            "符号链接不动（非普通文件）"
+        );
+        std::fs::remove_dir_all(&base).expect("remove temp dir");
+    }
+
+    #[test]
+    fn cleanup_leftover_spill_files_in_missing_dir_returns_zero() {
+        // 首次运行无 spill 目录（或从未建过）→ 返回 0, 不报错。
+        let missing = std::env::temp_dir().join(format!(
+            "wf_spill_cleanup_missing_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert_eq!(cleanup_leftover_spill_files_in(&missing), 0);
+    }
 
     #[test]
     fn source_param_to_json_preserves_connector_types() {

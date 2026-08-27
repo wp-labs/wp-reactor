@@ -5,7 +5,7 @@
 use crate::ast::{Expr, FieldRef, PathSegment};
 use crate::compiler::{BindTracking, collect_bind_tracking, compile_wfl_after_semantic_checks};
 use crate::plan::{
-    ConvOpPlan, ExceedAction, JoinKeyPlan, RateSpec, SeqSkipPlan, StatsAggPlan,
+    ConvOpPlan, ExceedAction, JoinKeyPlan, RateSpec, SeqSkipPlan, SpillMode, StatsAggPlan,
     StatsOutputShapePlan, WindowSpec,
 };
 
@@ -265,6 +265,63 @@ rule r {
         })
     );
     assert_eq!(lp.on_exceed, ExceedAction::FailRule);
+}
+
+#[test]
+fn compile_limits_plan_disk_provider_parsed() {
+    let src = r#"
+rule r {
+    events { e : auth_events }
+    stats<10s:fixed> group by (e.sip) { e | count as n; }
+    entity(digit, e.sip)
+    yield out (y = fmt("{}", stat.value(final(n))))
+    limits {
+        max_memory = "1GB";
+        disk_provider = "redb";
+        max_disk = "8GB";
+    }
+}
+"#;
+    let plans = compile_with(src, &[auth_events_window(), output_window()]);
+    let lp = plans[0].limits_plan.as_ref().expect("limits plan");
+    assert_eq!(lp.disk_provider, Some(SpillMode::Redb));
+    assert_eq!(lp.max_disk_bytes, Some(8 * 1024 * 1024 * 1024));
+}
+
+/// 旧键兼容别名: `spill`（改名 disk_provider）与 `max_spill_bytes`（改名 max_disk）
+/// 编译仍解析到同一字段（2026-08-27 改名）。
+#[test]
+fn compile_limits_plan_spill_old_alias_still_parsed() {
+    let src = r#"
+rule r {
+    events { e : auth_events }
+    stats<10s:fixed> group by (e.sip) { e | count as n; }
+    entity(digit, e.sip)
+    yield out (y = fmt("{}", stat.value(final(n))))
+    limits { spill = "redb"; max_spill_bytes = "20GB"; }
+}
+"#;
+    let plans = compile_with(src, &[auth_events_window(), output_window()]);
+    let lp = plans[0].limits_plan.as_ref().expect("limits plan");
+    assert_eq!(lp.disk_provider, Some(SpillMode::Redb));
+    assert_eq!(lp.max_disk_bytes, Some(20 * 1024 * 1024 * 1024));
+}
+
+#[test]
+fn compile_limits_plan_spill_off_by_default() {
+    let src = r#"
+rule r {
+    events { e : auth_events }
+    match<sip:5m> { on event { e | count >= 1; } } -> score(50.0)
+    entity(ip, e.sip)
+    yield out (x = e.sip)
+    limits { max_memory = "1GB"; }
+}
+"#;
+    let plans = compile_with(src, &[auth_events_window(), output_window()]);
+    let lp = plans[0].limits_plan.as_ref().expect("limits plan");
+    assert_eq!(lp.disk_provider, None);
+    assert_eq!(lp.max_disk_bytes, None);
 }
 
 #[test]

@@ -19,12 +19,13 @@ use crate::error::{RuntimeReason, RuntimeResult};
 /// doesn't exit within this window. It is the guarantee that shutdown always
 /// terminates.
 ///
-/// 60s（原 3s）: stats 执行器在 shutdown 时执行 close flush（构建百万级
-/// alert——q19 30M ≈ 8M 条 ~13s）; 3s 会在 flush 完成前 abort rules/alert
-/// group → 尾部窗口产出丢失。60s 覆盖 stats flush 构建 + sink 消费（正常
+/// 300s（原 60s）: stats 执行器在 shutdown 时执行 close flush（构建千万级
+/// alert——q18 100M ≈ 2940 万条, 流式 drain 仍需分钟级; q19 30M ≈ 8M 条
+/// ~13s）。60s 会在 flush 完成前 abort rules/alert group → 尾部窗口产出丢失
+/// （q18 100M 实测 EMIT 0）。300s 覆盖 stats flush 构建 + sink 消费（正常
 /// 路径; 卡死任务仍会被 abort 兜底）。bench kill 宽限须同步调大
-/// （SIGTERM 后 ≥ 60s 再 SIGKILL, 见 bench.sh kill_daemon）。
-const GROUP_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// （SIGTERM 后 ≥ 300s 再 SIGKILL, 见 bench.sh kill_daemon）。
+pub(crate) const GROUP_JOIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Max time to wait for an aborted task to actually unwind. `abort()` only
 /// cancels at the task's next yield point — a task chewing through a large

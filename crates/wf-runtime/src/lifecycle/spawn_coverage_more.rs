@@ -454,6 +454,8 @@ async fn spawn_rule_tasks_match_sharded_with_limits() {
         max_instances: Some(100),
         max_throttle: None,
         on_exceed: wf_lang::plan::ExceedAction::DropOldest,
+        disk_provider: None,
+        max_disk_bytes: None,
     });
     let limits = plan.limits_plan.clone();
     let rule = make_rule(

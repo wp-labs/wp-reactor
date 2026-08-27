@@ -383,6 +383,22 @@ pub struct LimitsPlan {
     pub max_instances: Option<usize>,
     pub max_throttle: Option<RateSpec>,
     pub on_exceed: ExceedAction,
+    /// 磁盘提供者（状态落盘后端, 2026-08-27 改名自 `spill`, 键 `disk_provider`;
+    /// 旧键 `spill` 保留为兼容别名）:
+    /// None = 不落盘（默认, 超 `max_memory` 拒收新键）; Redb = 状态落盘、
+    /// 内存只留活跃子集（`docs/design/stats-state-spill-redb.md`）。
+    pub disk_provider: Option<SpillMode>,
+    /// 规则级磁盘占用上限（2026-08-27 改名自 `max_spill_bytes`, 键 `max_disk`;
+    /// 旧键保留为兼容别名）。用户配的是规则总量（分片数是引擎内部细节）。
+    pub max_disk_bytes: Option<usize>,
+}
+
+/// 状态外溢存储模式。
+#[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
+#[moju(kind = "state", domain = "Lang", module = "Lang.LangExePlan")]
+pub enum SpillMode {
+    /// redb 持久化（B+ 树单文件库）。
+    Redb,
 }
 
 /// What to do when a limit is exceeded.

@@ -250,6 +250,12 @@ pub(super) fn explain_limits(lp: &LimitsPlan) -> String {
         ));
     }
     parts.push(format!("on_exceed={:?}", lp.on_exceed));
+    if let Some(provider) = &lp.disk_provider {
+        parts.push(format!("disk_provider={provider:?}"));
+        if let Some(b) = lp.max_disk_bytes {
+            parts.push(format!("max_disk={b}B"));
+        }
+    }
     parts.join(", ")
 }
 

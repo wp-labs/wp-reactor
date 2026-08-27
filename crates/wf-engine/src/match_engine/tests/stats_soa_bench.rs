@@ -184,7 +184,7 @@ fn q17_masks(batch: &RecordBatch) -> Vec<BooleanArray> {
     };
     vec![
         mk(&|p| p < 10_000),
-        mk(&|p| p >= 10_000 && p < 1_000_000),
+        mk(&|p| (10_000..1_000_000).contains(&p)),
         mk(&|p| p >= 1_000_000),
     ]
 }
@@ -205,7 +205,7 @@ fn q17_stats_accum_soa() {
     let measure_field_cols: Vec<Option<usize>> = plan
         .measures
         .iter()
-        .map(|m| m.field.as_ref().map(|_| price_col).flatten())
+        .map(|m| if m.field.is_some() { price_col } else { None })
         .collect();
     // 去重后 where 索引（3 个唯一条件; 与 with_row_fields 同构）。
     let measure_where: Vec<Option<usize>> =
@@ -252,7 +252,7 @@ fn q17_stats_accum_soa() {
     // —— 旧路径（Classic）——
     let t0 = Instant::now();
     for row in 0..N {
-        std::hint::black_box(accumulate_column_row(
+        accumulate_column_row(
             &mut classic,
             &plan,
             &measure_where,
@@ -264,14 +264,14 @@ fn q17_stats_accum_soa() {
             row,
             &row_layout,
             &measure_field_cols,
-        ));
+        );
     }
     let old_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
 
     // —— 新路径（SoA）——
     let t0 = Instant::now();
     for row in 0..N {
-        std::hint::black_box(accumulate_soa(
+        accumulate_soa(
             &mut soa,
             &layout,
             &measure_where,
@@ -279,7 +279,7 @@ fn q17_stats_accum_soa() {
             &batch,
             &masks,
             row,
-        ));
+        );
     }
     let new_ns = t0.elapsed().as_secs_f64() * 1e9 / N as f64;
 
@@ -375,6 +375,7 @@ fn build_large_window(plan: &StatsPlan, n_buckets: usize) -> StatsExecutor {
             vec![StatsBucket {
                 scope_key: ScopeKey::Int(i as i64),
                 accs: StatsBucketAccs::Numeric(layout.zeros()),
+                touch: 0,
             }]
         });
     }
@@ -437,7 +438,7 @@ fn q17_rules_breakdown() {
     let t0 = Instant::now();
     for i in 0..N_LOOKUP {
         let row = i % N;
-        std::hint::black_box(accumulate_soa(
+        accumulate_soa(
             &mut soa,
             &layout,
             &measure_where,
@@ -445,7 +446,7 @@ fn q17_rules_breakdown() {
             &batch,
             &masks,
             row,
-        ));
+        );
     }
     let accum_ns = t0.elapsed().as_secs_f64() * 1e9 / N_LOOKUP as f64;
 
@@ -458,7 +459,7 @@ fn q17_rules_breakdown() {
             exec.window.keyed_bucket_mut(h, &[ScopeKey::Int(a)], &plan)
         {
             let row = i % N;
-            std::hint::black_box(accumulate_soa(
+            accumulate_soa(
                 soa,
                 &layout,
                 &measure_where,
@@ -466,7 +467,7 @@ fn q17_rules_breakdown() {
                 &batch,
                 &masks,
                 row,
-            ));
+            );
         }
     }
     let full_ns = t0.elapsed().as_secs_f64() * 1e9 / N_LOOKUP as f64;
@@ -495,7 +496,7 @@ fn q17_rules_breakdown() {
     let mut cold_exec = build_large_window(&plan, N_BUCKETS);
     let mut cold_state = 0x9E37_79B9_7F4A_7C15u64;
     let t0 = Instant::now();
-    for i in 0..N_COLD {
+    for _i in 0..N_COLD {
         // xorshift——确定性伪随机键（覆盖全表不同位置）
         cold_state ^= cold_state << 13;
         cold_state ^= cold_state >> 7;
@@ -564,7 +565,7 @@ fn q17_rules_breakdown() {
 fn q17_stats_task_layer() {
     use crate::match_engine::event_bridge::{batch_event_time_nanos_at, batch_time_col_index};
 
-    let plan = q17_plan();
+    let _plan = q17_plan();
     let batch = q17_batch_with_time(N);
     let time_col = batch_time_col_index(&batch, Some("dateTime")).unwrap();
     let n = batch.num_rows();
@@ -626,7 +627,7 @@ fn q17_stats_task_layer() {
         let ok3 = exec3.process_batch_rows(&small_batch, None);
         std::hint::black_box(ok3);
     }
-    let small_ns = t0.elapsed().as_secs_f64() * 1e9 / (30_000_000 as f64);
+    let small_ns = t0.elapsed().as_secs_f64() * 1e9 / 30_000_000_f64;
 
     eprintln!("== q17 stats_task 层归因（N={}, 批内单段 1d 窗）==", N);
     eprintln!(

@@ -23,14 +23,12 @@ use arrow::datatypes::{DataType, Field as ArrowField, Schema};
 use tokio_util::sync::CancellationToken;
 use wf_engine::match_engine::RuleExecutor;
 use wf_engine::pipe::PipeRegistry;
-use wf_engine::window::{Router, Window, WindowParams, WindowRegistry};
+use wf_engine::window::{Router, WindowRegistry};
 use wf_lang::ast::Expr;
 use wf_lang::plan::{
     BindPlan, EntityPlan, MatchPlan, ScorePlan, StatsAggPlan, StatsMeasurePlan,
     StatsOutputShapePlan, StatsPlan, WindowSpec, YieldField, YieldPlan,
 };
-
-use super::super::tests::test_window_config;
 
 const N: usize = 1_000_000;
 const AUCTIONS: i64 = 100;

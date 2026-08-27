@@ -133,6 +133,14 @@ pub(super) struct StatsTask {
     /// 已上报 metrics 的超限拒收累计值（delta 记账——`over_limit_new_buckets`
     /// 跨窗口累计, close 上报必须发增量, 否则重复计数）。
     last_reported_over_limit: u64,
+    /// 已上报的 spill 驱逐/读回累计值（delta 记账；抖动观测, M5-2）。
+    last_reported_spill_evictions: u64,
+    last_reported_spill_readbacks: u64,
+    /// 已上报的驱逐分段耗时（ns 累计值；delta 记账, 性能定位用）。
+    last_reported_spill_scan_ns: u64,
+    last_reported_spill_clone_ns: u64,
+    last_reported_spill_write_ns: u64,
+    last_reported_spill_calls: u64,
 }
 
 impl StatsTask {
@@ -187,6 +195,12 @@ impl StatsTask {
             last_activity_wall: std::time::Instant::now(),
             timeout_scan_interval,
             last_reported_over_limit: 0,
+            last_reported_spill_evictions: 0,
+            last_reported_spill_readbacks: 0,
+            last_reported_spill_scan_ns: 0,
+            last_reported_spill_clone_ns: 0,
+            last_reported_spill_write_ns: 0,
+            last_reported_spill_calls: 0,
         };
         (task, cancel)
     }
@@ -583,8 +597,25 @@ impl StatsTask {
             // （~5.9G）与状态数据/输出结构同时驻留 → close 期 RSS 峰值 30G+。
             // 每批 ~EMIT_CHUNK 桶, 峰值 ≈ 批大小×条均 + 分块装载缓冲。
             let chunk = emit_chunk();
+            // 状态内存估算 vs 实际（诊断，2026-08-27）：取桶前统计——估算低估
+            // 则实际超预算才驱逐（q18 RSS 校准）。
+            {
+                let est = self.stats.window.estimated_bytes();
+                let actual = self.stats.window.actual_bytes();
+                let n = self.stats.window.bucket_count();
+                log::info!(
+                    "stats 状态内存(规则 {}, task {}): 估算 {:>9.1}MB / 实际 {:>9.1}MB / 桶 {}（估算每键 {:.0}B / 实际每键 {:.0}B）",
+                    self.rule_name(),
+                    self.task_id,
+                    est as f64 / 1e6,
+                    actual as f64 / 1e6,
+                    n,
+                    if n > 0 { est as f64 / n as f64 } else { 0.0 },
+                    if n > 0 { actual as f64 / n as f64 } else { 0.0 },
+                );
+            }
             loop {
-                let buckets = self.stats.take_buckets_up_to(chunk);
+                let buckets = self.stats.take_next_close_batch(chunk);
                 if buckets.is_empty() {
                     break;
                 }
@@ -655,7 +686,7 @@ impl StatsTask {
                 .as_nanos() as i64;
             let chunk = emit_chunk();
             loop {
-                let buckets = self.stats.take_buckets_up_to(chunk);
+                let buckets = self.stats.take_next_close_batch(chunk);
                 if buckets.is_empty() {
                     break;
                 }
@@ -736,6 +767,53 @@ impl StatsTask {
                 over_limit_rows = delta,
                 "stats 状态内存超限——本窗拒收 {} 行（新桶尝试; 累计 {} 行; 已有桶继续累积）",
                 delta, over_limit
+            );
+        }
+        // spill 抖动观测（M5-2）: 驱逐/读回增量——驱逐多 + 读回多 = 抖动
+        // （预算 < 活跃集, 键反复被踢出/读回）。
+        let evictions = self.stats.window.spill_evictions();
+        let readbacks = self.stats.window.spill_readbacks();
+        let ev_delta = evictions.saturating_sub(self.last_reported_spill_evictions);
+        let rb_delta = readbacks.saturating_sub(self.last_reported_spill_readbacks);
+        self.last_reported_spill_evictions = evictions;
+        self.last_reported_spill_readbacks = readbacks;
+        if ev_delta > 0 || rb_delta > 0 {
+            // 用 log 而非 wf_warn（tracing）：daemon 日志过滤器未开
+            // wf_runtime::engine_task 目标——executor 的 log::warn 已验证可输出。
+            let (scan_ns, clone_ns, write_ns, calls) = self.stats.window.spill_profile_ns();
+            let scan_d = scan_ns.saturating_sub(self.last_reported_spill_scan_ns);
+            let clone_d = clone_ns.saturating_sub(self.last_reported_spill_clone_ns);
+            let write_d = write_ns.saturating_sub(self.last_reported_spill_write_ns);
+            let calls_d = calls.saturating_sub(self.last_reported_spill_calls);
+            self.last_reported_spill_scan_ns = scan_ns;
+            self.last_reported_spill_clone_ns = clone_ns;
+            self.last_reported_spill_write_ns = write_ns;
+            self.last_reported_spill_calls = calls;
+            let profile = if calls_d > 0 {
+                format!(
+                    " · 驱逐耗时(calls={}): scan={:.0}ms clone={:.0}ms write={:.0}ms (每批 scan+clone/write {:.2}ms/{:.2}ms)",
+                    calls_d,
+                    scan_d as f64 / 1e6,
+                    clone_d as f64 / 1e6,
+                    write_d as f64 / 1e6,
+                    (scan_d + clone_d) as f64 / 1e6 / calls_d as f64,
+                    write_d as f64 / 1e6 / calls_d as f64,
+                )
+            } else {
+                String::new()
+            };
+            log::warn!(
+                "spill 抖动(规则 {}, task {}): 本窗驱逐 {} 键 / 读回 {} 次（读回率 {:.1}%; 预算不足时升高 = 抖动）{}",
+                self.rule_name(),
+                self.task_id,
+                ev_delta,
+                rb_delta,
+                if ev_delta > 0 {
+                    rb_delta as f64 * 100.0 / ev_delta as f64
+                } else {
+                    0.0
+                },
+                profile
             );
         }
     }
