@@ -98,9 +98,10 @@ key insight：q18 的数据特征是**滑动窗口引用**——大多数键（�
 ```
 wfl：
     limits {
-        max_memory = "15GB"     // 状态内存上限（2026-08-27 起为规则级共享总量）
-        spill = "redb"          // 启用状态外溢（默认 off）
-        max_disk = "20GB"       // 规则总磁盘上限（2026-08-27 改名自 max_spill_bytes）
+        max_memory = "15GB"          // 状态内存上限（2026-08-27 起为规则级共享总量）
+        disk_provider = "redb"       // 状态落盘后端（2026-08-27 改名自 spill = "redb";
+                                     // 旧键仍生效但将废弃）。超 max_memory 时驱逐最老键落盘
+        max_disk = "20GB"            // 规则总磁盘上限（2026-08-27 改名自 max_spill_bytes）
     }
 ```
 
@@ -115,7 +116,8 @@ redb 写失败（磁盘满/IO 错）                    → 同拒收（计数 +
 ```
 
 - `over_limit_new_buckets` 保留为**兜底**（spill 满/写失败才触发）
-- 行为变更需文档化：配置 `spill` 后，内存换磁盘、不丢键；spill 满才丢
+- 行为变更需文档化：配置 `disk_provider` 后，内存换磁盘、不丢键；spill 满才丢
+- 旧键 `spill = "redb"` 为兼容别名（2026-08-27 改名 `disk_provider`）
 
 ## 6. 接口设计（SpillStore trait）
 
@@ -171,27 +173,48 @@ table "state": key = u64 hash（唯一），value = 序列化链
 > 且 redb 的 value 是 `&[u8]`——手写字节编码更可控（对拍契约 + 无中间 alloc）。
 > 若后续复杂度上升，可换 `bincode` + serde derive。
 
-## 8. 窗口生命周期与文件清除
+## 8. 文件生命周期与清除（2026-08-27 修正：文件 = 任务实例级, 非窗口级）
 
-**spill 文件 = 窗口级**：文件名带窗口 ID（`spill_{rule}_{window_start}.rb` + redb
-配套的 `.rbr` WAL 文件）。q18 单窗（1d）每任务实例一个文件；多窗规则（q12
-fixed）每窗独立文件。
+**spill 文件 = 每任务实例/每分片一个**：`spill_{rule}_{pid}{_shard}.rb`（redb
+配套 `.rbr` WAL 侧车）于 `WF_SPILL_DIR`（默认 `spill`）。文件名**不含
+window_start**——同一实例的连续窗口**复用同一路径**（窗口在单任务内严格串行：
+一个 `window` 状态, close 即 reset, 不存在两窗并发）。q18 单窗每任务实例一
+个文件; 多窗规则（q12 fixed）每实例一个文件跨窗复用; key 分片每片独立文件。
 
-**清除时机（4 个）**：
+**读取时机（3 个）**：
+
+| 时机 | 路径 | 说明 |
+|---|---|---|
+| ① 窗口进行中, 驱逐键再来 | `take(hash)` 读回单键 | 命中 `spill_index`（内存）→ redb 读回放回内存（`readback` 集）→ 继续累积; 每键回访 3.4 次（q18） |
+| ② 窗口 close | `drain_up_to(n)` 流式读回 | `take_next_close_batch` 分批（默认 5 万/批）取内存 + spill 两源归并输出; 读前 flush 异步写队列（已提交 = 已可见） |
+| ③ 诊断/测试 | `contains(hash)` | 热路径用内存 `spill_index`, 不碰持久层 |
+
+**清除时机（3 个, 全部已落地）**：
 
 | 时机 | 动作 | 说明 |
 |---|---|---|
-| ① 窗口正常 close 完成 | drain 全部键后删文件（`.rb` + `.rbr`） | q18 跑批结束即清，磁盘零残留 |
-| ② 窗口 reset（多窗规则） | 旧窗 close 完删旧文件，新窗开新文件 | 文件名带 window_start 天然隔离 |
-| ③ 进程正常关闭 | 所有窗口 close 完 → 文件已删；最后清空 spill 目录 | 正常路径无残留 |
-| ④ 进程异常退出（崩溃/kill） | **下次启动时清理 spill 目录残留** | redb 异常退出会留 `.rbr`；启动时 glob 删 `spill_*.rb/.rbr`（残留 = 旧窗口未 close 完，无保留价值） |
+| ① 窗口 close / reset | `cleanup()` 删文件（`.rb` + `.rbr`） | `close_window`/`close_window_by_bucket_rows`/`finish_close_window`/`take_partial` 均经 `reset_window`; 跑批结束即清, 正常路径磁盘零残留 |
+| ② 进程正常关闭 | Drop 只停写 worker（不删文件） | 文件已随①删除; 若退出时窗口未 close（异常路径）, 文件残留 |
+| ③ 启动清理（崩溃残留, 本次补上） | 启动时删 `WF_SPILL_DIR` 下全部 `spill_*.rb/.rbr` | 残留 = 旧窗口未 close 完（或 cleanup rm 失败）, 无保留价值; `Reactor::start` 最早执行 |
 
-**删除失败处理**：rm 失败（权限/占用）→ 告警 + 记入日志，不阻塞（下次启动 ④
-重试清理）。残留文件对正确性无影响（键已输出完，只是磁盘占用）。
+**冲突分析（同规则/不同窗口/分片）**：
+
+- **同规则连续窗口无冲突**：窗口串行 + close 即清理 + 打开前清空旧文件
+  （`RedbSpillStore::create` 删旧建新, 见下）——每窗从空库起步。
+- **key 分片**：每片独立文件（`{_shard}` 后缀）独立写 worker, 互不干扰。
+- **多进程/重启**：文件名含 pid, 新进程不撞旧文件; 崩溃残留由启动清理③兜底。
+- **rm 失败残留不污染**（2026-08-27 review 修复）：cleanup 删除失败时旧文件
+  残留, 若直接打开会把旧窗键混进新窗输出（close drain 遍历全表）。`create`
+  现在**打开前先删旧文件**（含 `.rbr`）, 删除失败返回致命错误——绝不打开脏库。
+- **同目录多实例**：启动清理③会删掉目录下**全部** spill 文件——多实例共用同一
+  `WF_SPILL_DIR` 时须为各实例配置独立目录。
+
+**删除失败处理**：rm 失败（权限/占用）→ 告警 + 记入日志, 不阻塞（下次启动③
+重试清理）。残留文件对正确性无影响（键已输出完, 只是磁盘占用）。
 
 > 设计取舍：不做「跨重启恢复 spill 状态」——spill 只是**内存换磁盘的临时
-> 缓冲**，不是持久化语义。进程重启 = 重新 ingest，spill 文件无保留价值，
-> 启动清理即可。若未来需要「断点续跑」，那是 checkpoint 范畴，另立设计。
+> 缓冲**, 不是持久化语义。进程重启 = 重新 ingest, spill 文件无保留价值,
+> 启动清理即可。若未来需要「断点续跑」, 那是 checkpoint 范畴, 另立设计。
 
 ## 9. close 流程（读回合并）
 
@@ -227,14 +250,14 @@ rule q18_last_bid_stats {
     ...
     limits {
         max_memory = "2GB"
-        spill = "redb"          // 启用状态外溢（默认 off）
+        disk_provider = "redb"   // 状态落盘后端（2026-08-27 改名自 spill = "redb"）
         // spill_path = "/tmp/wfusion-spill"  // 可选，默认工作目录
     }
 }
 ```
 
-解析：`LimitsPlan` 加 `spill: Option<SpillMode>`（None / Redb）；spawn 层按
-配置构造 SpillStore 注入 StatsExecutor。
+解析：`LimitsPlan` 加 `disk_provider: Option<SpillMode>`（None / Redb；键 `spill`
+为兼容别名）；spawn 层按配置构造 SpillStore 注入 StatsExecutor。
 
 ## 12. 测试计划
 
@@ -480,6 +503,6 @@ close（take_buckets / reset） → mem_sub(本片净占用)  // 预算跨窗口
 | close 读回 18.6G I/O 耗时 | 顺序扫描（B+树叶子链），分钟级跑批可接受；对拍验证耗时 |
 | 序列化 bug 丢数据 | 读回失败 → `SpillError::Corrupt` → panic（致命，不静默丢键） |
 | 与分片组合 | 初始禁用（§10），后续按需扩展 |
-| redb 文件膨胀 | 窗口级文件 + 4 个清除时机（§8）；`max_disk` 上限（§5） |
+| redb 文件膨胀 | 每实例一个文件 + close 清理 + 启动清理 3 个时机（§8）；`max_disk` 上限（§5） |
 | 磁盘满 | `max_disk` 预算 + 写失败回退拒收（§5 三层阶梯） |
-| 崩溃残留 `.rbr` | 启动时清理 spill 目录（§8 时机④）；残留无正确性影响 |
+| 崩溃残留 `.rbr` | 启动时清理 spill 目录（§8 时机③）；残留无正确性影响 |

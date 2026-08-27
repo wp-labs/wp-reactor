@@ -523,6 +523,14 @@ impl DistinctKey {
 /// Box 分配; 完整 `ScopeKey` 仅**每桶首见**时构建一次（Q18: 27.6M → 5.29M 次盒装）。
 /// 哈希为字节级同构 FNV 混合（`scope_key_hash` == `comps_hash`, 行式/列式两路径
 /// 同桶）; 碰撞由链内 `ScopeKey` 完整比较消歧（概率极低, 正确性不受影响）。
+/// 惰性 spill store 创建规格（P0 修复 2026-08-27）：路径 + 行字段 layout。
+/// 纯数据（`PathBuf` + `Arc<RowFieldLayout>`，天然 Send + Sync）——首次驱逐时
+/// 才 `RedbSpillStore::create`（零驱逐窗口不建库/不起写 worker，零开销）。
+struct SpillCreateSpec {
+    path: std::path::PathBuf,
+    layout: std::sync::Arc<RowFieldLayout>,
+}
+
 #[derive(Default)]
 pub struct StatsWindowState {
     pub buckets: EngineHashMap<u64, Vec<StatsBucket>>,
@@ -565,6 +573,11 @@ pub struct StatsWindowState {
     spill_failed: bool,
     /// 落盘满/写失败的告警标记（每窗口一次，防刷屏）。
     spill_warned: bool,
+    /// 惰性 spill store 创建规格（P0 修复 2026-08-27）：配置了 `spill` 但未驱逐
+    /// 的窗口不建 redb 库/写 worker——q19 100M 实测 17 窗口 × 10 片 = 170 次
+    /// create/cleanup churn → RSS +6GB。首次驱逐（`account_new_bucket` 超限
+    /// 落盘）时才 take 并创建；零驱逐窗口恒 None → 零开销。
+    spill_create: Option<SpillCreateSpec>,
     /// 时钟队列（近似 LRU）：桶**创建序**的 hash 环。驱逐扫描队首：
     /// 二次机会（touch > 0）→ 递减回队尾；否则驱逐。每在内存键至多一个条目。
     clock: VecDeque<u64>,
@@ -604,6 +617,7 @@ impl StatsWindowState {
             spill_used: None,
             spill_failed: false,
             spill_warned: false,
+            spill_create: None,
             clock: VecDeque::new(),
             readback: HashSet::new(),
             spill_evictions: 0,
@@ -755,6 +769,19 @@ impl StatsWindowState {
         if let Some(limit) = self.limit_bytes
             && self.mem_used_bytes() + allowance > limit
         {
+            // 惰性创建（P0 修复）：首次驱逐前才建 store——零驱逐窗口零开销
+            // （不建 redb 库/不起写 worker, q19 100M 曾 RSS +6GB）。spec 由
+            // executor 每窗口 process 时注册（layout 解析后）。
+            if self.spill.is_none() && !self.spill_failed {
+                if let Some(spec) = self.spill_create.take() {
+                    let store =
+                        crate::match_engine::spill::RedbSpillStore::create(&spec.path, spec.layout)
+                            .unwrap_or_else(|e| {
+                                panic!("spill redb 创建失败(致命) {}: {e}", spec.path.display())
+                            });
+                    self.spill = Some(Box::new(store));
+                }
+            }
             // spill 启用且未失败: 先驱逐最老键腾空间（批量, 目标降到上限 90%）。
             if self.spill.is_some() && !self.spill_failed {
                 self.evict_to_spill(plan);
@@ -913,14 +940,20 @@ impl StatsWindowState {
             .min(limit.saturating_mul(9) / 10);
         let mut batch: Vec<(u64, ScopeKey, Vec<StatsAccum>)> = Vec::new();
         let mut batch_hashes: Vec<u64> = Vec::new();
-        // 扫描期待驱逐字节（est 只在落盘后扣——循环条件用 est - pending）。
-        let mut pending = 0u64;
+        // **逐链预订驱逐**（2026-08-27 修复过度驱逐）：每选一个链就原子扣减
+        // 共享内存计数（`mem_sub`）——共享计数成为**单一事实源**, 循环条件用
+        // 实时值。修复前 `pending` 是每片局部：10 片并发超限时每片各驱逐水位差
+        // （25GB 配置下每片驱逐 2.5GB × 10 = 25GB, 需求仅 3.2GB——过度驱逐
+        // 10×, 驱逐耗时 scan+clone 2.6s/片同步阻塞热路径, EPS 反降）。
+        // 逐链原子扣减后: 多片并发时共享计数停在 target, 总驱逐 = 超限部分。
+        // 写盘失败/满时按 `reserved` 归还（驱逐未生效, 内存键未删）。
+        let mut reserved = 0u64;
         // 防活锁: 最多扫 (TOUCH_MAX+2)× 时钟长度（全活跃时停止——拒收兜底正确）。
         let max_scan = self.clock.len().saturating_mul(TOUCH_MAX as usize + 2);
         let mut scanned = 0usize;
         let mut scan_ns = 0u64;
         let mut clone_ns = 0u64;
-        while self.mem_used_bytes().saturating_sub(pending) > target && scanned < max_scan {
+        while self.mem_used_bytes() > target && scanned < max_scan {
             let s0 = std::time::Instant::now();
             let Some(h) = self.clock.pop_front() else {
                 break;
@@ -942,22 +975,33 @@ impl StatsWindowState {
             // 驱逐整链（先 clone 进 batch；落盘成功后才从桶表移除——写失败
             // 不丢内存键）。
             let c0 = std::time::Instant::now();
-            pending += allowance * chain.len() as u64;
+            let chain_len = chain.len();
             for b in chain.iter() {
                 batch.push((h, b.scope_key.clone(), b.accs.clone()));
             }
             batch_hashes.push(h);
             scan_ns += s0.elapsed().as_nanos() as u64;
             clone_ns += c0.elapsed().as_nanos() as u64;
+            // 预订驱逐（chain 借用已结束; 本片账本 + 共享计数同步扣减）。
+            let chain_bytes = allowance * chain_len as u64;
+            self.estimated_bytes = self.estimated_bytes.saturating_sub(chain_bytes);
+            self.mem_sub(chain_bytes);
+            reserved += chain_bytes;
         }
         if batch.is_empty() {
+            if reserved > 0 {
+                self.estimated_bytes = self.estimated_bytes.saturating_add(reserved);
+                self.mem_add(reserved);
+            }
             return;
         }
-        // 落盘预算检查（写入前）：超出则拒收兜底（规则级共享计数）。
+        // 落盘预算检查（写入前）：超出则归还预订 + 拒收兜底（规则级共享计数）。
         let add_bytes = batch_hashes.len() as u64 * allowance;
         if let Some(sl) = self.spill_limit_bytes
             && self.spill_used_bytes() + add_bytes > sl
         {
+            self.estimated_bytes = self.estimated_bytes.saturating_add(reserved);
+            self.mem_add(reserved);
             self.warn_spill_full();
             return;
         }
@@ -973,18 +1017,20 @@ impl StatsWindowState {
         self.spill_clone_ns += clone_ns;
         self.spill_evict_calls += 1;
         if let Err(e) = result {
-            // 写失败（磁盘满/IO）→ 回退拒收（§5 三层阶梯兜底），不丢内存键。
+            // 写失败（磁盘满/IO）→ 归还预订（驱逐未生效, 内存键未删）+
+            // 回退拒收（§5 三层阶梯兜底），不丢内存键。
+            self.estimated_bytes = self.estimated_bytes.saturating_add(reserved);
+            self.mem_add(reserved);
             self.spill_failed = true;
             log::error!("spill 写失败(规则 {}): {e}——回退拒收新键", self.rule_name);
             return;
         }
-        // 落盘成功 → 从桶表移除 + 记账（内存/spill 不相交不变量成立；落盘字节
-        // 记入规则级共享计数, 内存占用从共享计数扣减）。
+        // 落盘成功 → 从桶表移除 + 落盘记账（内存占用已在预订时从共享计数
+        // 扣减——此处只加落盘字节, 不再重复扣内存）。内存/spill 不相交不变量
+        // 成立。
         for h in &batch_hashes {
             if let Some(chain) = self.buckets.remove(h) {
                 let n = chain.len() as u64;
-                self.estimated_bytes = self.estimated_bytes.saturating_sub(allowance * n);
-                self.mem_sub(allowance * n);
                 if let Some(u) = &self.spill_used {
                     u.fetch_add(allowance * n, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -1858,7 +1904,8 @@ impl StatsExecutor {
         self.window.set_spill(store, max_spill_bytes, spill_used);
     }
 
-    /// 便捷：redb spill（M4, `limits { spill = "redb" }`）——记录待创建配置,
+    /// 便捷：redb spill（M4, `limits { disk_provider = "redb" }`, 旧键 `spill` 为
+    /// 兼容别名）——记录待创建配置,
     /// **延迟到首次 `process_*`**（行字段 layout 解析后）创建 store：
     /// store 的 layout 必须与 executor 一致（列式 from_schema / 行式 all_other）。
     /// `max_spill_bytes` = 落盘上限（None = 不限）。
@@ -1872,14 +1919,17 @@ impl StatsExecutor {
         self.spill_redb = Some((path.as_ref().to_path_buf(), max_spill_bytes, spill_used));
     }
 
-    /// 延迟创建 redb store（首次 process 时调用; layout 已解析）。
-    /// 创建失败 = 致命（panic——配置/磁盘错误, 绝不静默降级为拒收）。
+    /// 惰性注册 spill store 创建规格（P0 修复 2026-08-27）：不直接创建 redb 库——
+    /// 把创建推迟到**首次驱逐**（`account_new_bucket` 超限落盘时）。配置了
+    /// `spill` 但全程无驱逐的窗口不建库/不起写 worker（q19 100M 实测 170 次
+    /// create/cleanup churn → RSS +6GB）。预置落盘上限/共享计数（与创建后
+    /// `set_spill` 同参数）；spec 被 take 后直接 `RedbSpillStore::create`。
     fn ensure_spill_store(&mut self) {
         let Some((path, max_spill_bytes, spill_used)) = self.spill_redb.clone() else {
             return;
         };
-        if self.window.spill.is_some() {
-            return; // 已创建
+        if self.window.spill.is_some() || self.window.spill_create.is_some() {
+            return;
         }
         let layout = match &self.row_field_layout {
             Some(l) => std::sync::Arc::clone(l),
@@ -1894,10 +1944,14 @@ impl StatsExecutor {
                 std::sync::Arc::new(RowFieldLayout::all_other(&names))
             }
         };
-        let store = crate::match_engine::spill::RedbSpillStore::create(&path, layout)
-            .unwrap_or_else(|e| panic!("spill redb 创建失败(致命) {}: {e}", path.display()));
-        self.window
-            .set_spill(Some(Box::new(store)), max_spill_bytes, spill_used);
+        self.window.spill_limit_bytes = max_spill_bytes.map(|b| b as u64);
+        self.window.spill_used = match spill_used {
+            Some(u) => Some(u),
+            // 未注入规则级共享计数（测试/单片直连 set_spill_redb）→ 自建本片
+            // 独立计数, 与 `set_spill` 的退化语义一致。
+            None => Some(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
+        };
+        self.window.spill_create = Some(SpillCreateSpec { path, layout });
     }
 
     /// 提取本片已关闭窗口的**原始累加状态**（输入分区分片归并用）并重置窗口。

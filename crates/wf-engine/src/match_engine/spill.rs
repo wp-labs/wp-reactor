@@ -34,6 +34,8 @@ pub enum SpillError {
     /// 状态含 spill 不支持的形态（如 last 行的结构化 Array/Object 值）——
     /// 致命（显式拒绝，绝不静默改写）。
     Unsupported(String),
+    /// 文件 IO 错误（如打开前清空旧文件失败）——致命（绝不打开脏库）。
+    Io(std::io::Error),
     /// redb 存储错误（IO/损坏/类型不符）——写失败可回退拒收（§5 三层阶梯），
     /// 读失败致命。
     Redb(redb::Error),
@@ -46,6 +48,7 @@ impl std::fmt::Display for SpillError {
         match self {
             SpillError::Corrupt(msg) => write!(f, "spill 数据损坏: {msg}"),
             SpillError::Unsupported(msg) => write!(f, "spill 不支持: {msg}"),
+            SpillError::Io(e) => write!(f, "spill 文件 IO 错误: {e}"),
             SpillError::Redb(e) => write!(f, "redb 错误: {e}"),
             SpillError::Closed => write!(f, "spill 存储已关闭"),
         }
@@ -198,8 +201,9 @@ const REDB_TABLE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new
 
 /// redb 持久化实现。
 ///
-/// - 文件按任务实例/窗口隔离（`spill_{rule}_{window_start}.rb`，M3/M4 接线）；
-///   本结构只负责单库读写，`cleanup` 删文件（窗口结束/重置时调用）。
+/// - 文件按任务实例/分片隔离（`spill_{rule}_{pid}{_shard}.rb`，M3/M4 接线）；
+///   同一实例的连续窗口复用同一路径（窗口串行, close 即 cleanup 删文件,
+///   create 打开前删旧建新）——本结构只负责单库读写。
 /// - `take` 只读（M5-2）：redb 旧条目由调用方 close 时按已读回集合过滤。
 /// - `drain_up_to` 流式（M5-3）：游标续读，close 峰值 = 批大小而非全量。
 /// - 写侧异步（M6，`docs/design/async-persist.md`）：驱逐写事务由后台 worker
@@ -237,13 +241,24 @@ impl RedbSpillStore {
         path: impl AsRef<std::path::Path>,
         layout: std::sync::Arc<RowFieldLayout>,
     ) -> Result<Self, SpillError> {
+        let path = path.as_ref();
+        // **打开前清空旧文件**（2026-08-27 review）：spill 无持久化语义（设计 §8）
+        // ——库文件只服务当前窗口, close 后 cleanup 删除。若此处已存在文件, 只可
+        // 能是 ① 上一窗口 cleanup rm 失败残留 ② 崩溃/pid 复用残留。直接打开会把
+        // 旧窗口的键混进新窗口（close drain 遍历全表 → 旧窗键污染新窗输出）。
+        // 删除失败 → 致命（绝不打开脏库; 调用方视为创建失败 panic）。
+        for p in [path.to_path_buf(), path.with_extension("rbr")] {
+            if p.exists() {
+                std::fs::remove_file(&p).map_err(SpillError::Io)?;
+            }
+        }
         let cache_mb: usize = std::env::var("WF_SPILL_CACHE_MB")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64);
         let db = redb::Database::builder()
             .set_cache_size(cache_mb.saturating_mul(1024 * 1024))
-            .create(path.as_ref())
+            .create(path)
             .map_err(|e| SpillError::Redb(e.into()))?;
         let db = std::sync::Arc::new(db);
         let write_txn = db.begin_write().map_err(|e| SpillError::Redb(e.into()))?;
@@ -283,7 +298,7 @@ impl RedbSpillStore {
         );
         Ok(Self {
             db: Some(db),
-            path: path.as_ref().to_path_buf(),
+            path: path.to_path_buf(),
             layout,
             drain_cursor: None,
             writer: Some(writer),
@@ -525,6 +540,9 @@ impl SpillStore for RedbSpillStore {
     }
 
     fn len(&self) -> usize {
+        // 读前 flush 异步队列（M6）——与 contains/take/drain_up_to 一致：
+        // 刚驱逐未落盘的键必须可见（否则 close 前 `is_empty` 早退会丢 spill 键）。
+        self.flush_writer();
         let txn = match self.db.as_ref().expect("已 cleanup").begin_read() {
             Ok(t) => t,
             Err(e) => Self::redb_expect(&format!("begin_read: {e}")),
@@ -1496,7 +1514,10 @@ mod tests {
     }
 
     #[test]
-    fn redb_persists_across_reopen() {
+    fn redb_reopen_starts_fresh_and_drops_stale_file() {
+        // 2026-08-27 review 修正：spill **无持久化语义**（设计 §8）——create 对已
+        // 存在文件必须删旧建新（空库），绝不打开旧条目（旧窗键会污染新窗 close
+        // drain 的输出）。旧契约「重开 = open 保留数据」与设计相悖，已废弃。
         let layout = sample_layout();
         let path = spill_test_path("redb_reopen");
         let k = ScopeKey::Str("persist".into());
@@ -1507,16 +1528,14 @@ mod tests {
             s.put_batch(vec![(h, k.clone(), vec![StatsAccum::Last(None)])])
                 .expect("put");
             // 触发 flush（写队列排空——worker 的 db Arc 释放后文件才可重开）;
-            // 不 cleanup（模拟崩溃残留/跨窗口复用前重开）。
             assert!(s.contains(h), "put 后已落盘可见");
-        }
-        // 重开（create 对已存在文件 = open）：数据仍在
+        } // Drop 只停写 worker, 不删文件——模拟崩溃残留
+        assert!(path.exists(), "残留文件仍在");
+
+        // 重开（create）：删旧建新 → 空库起步, 旧条目不得被打开
         let mut s2 = RedbSpillStore::create(&path, std::sync::Arc::clone(&layout)).expect("reopen");
-        assert!(s2.contains(h));
-        let (k2, a2) = s2.take(h).expect("take");
-        assert_eq!(k2, k);
-        assert!(matches!(a2[0], StatsAccum::Last(None)));
-        assert!(s2.contains(h), "take 只读——条目保留");
+        assert_eq!(s2.len(), 0, "重开 = 空库（旧条目删除）");
+        assert!(!s2.contains(h), "旧键不可见");
         s2.cleanup();
         assert!(!path.exists());
     }

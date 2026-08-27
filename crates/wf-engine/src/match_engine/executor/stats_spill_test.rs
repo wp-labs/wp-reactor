@@ -17,7 +17,7 @@ use wf_lang::plan::{StatsAggPlan, StatsMeasurePlan, StatsOutputShapePlan, StatsP
 use crate::match_engine::Value;
 use crate::match_engine::executor::stats_exec::{RowFieldLayout, StatsExecutor};
 use crate::match_engine::match_engine::ScopeKey;
-use crate::match_engine::spill::{MemSpillStore, RedbSpillStore};
+use crate::match_engine::spill::{MemSpillStore, RedbSpillStore, SpillStore};
 
 // ---------------------------------------------------------------------------
 // helpers（与 stats_exec_test 同款）
@@ -470,38 +470,51 @@ fn spill_redb_deferred_create_via_executor() {
     };
 
     let mut exec = StatsExecutor::with_row_fields(plan, Some(subset));
-    exec.set_memory_limit("spill_test", Some(COUNT_ALLOWANCE as usize * 2));
+    // last 度量每桶 allowance ≈ 845（含行字段共享）——3 键 2535 ≤ 预算 2956 不驱逐
+    exec.set_memory_limit("spill_test", Some(COUNT_ALLOWANCE as usize * 4));
     exec.set_spill_redb(&path, None, None);
     // 未处理任何数据前不建 store（延迟创建）
     assert!(exec.window.spill.is_none(), "首次 process 前不创建 store");
     assert!(!path.exists(), "首次 process 前不落文件");
 
-    // 首次 process（行式路径）→ 建 store（layout = all_other(子集)）
-    for k in 1..=6 {
-        exec.process_rows(&[bid_row(k, k as f64 * 10.0)], extract);
-    }
-    assert!(exec.window.spill.is_some(), "首次 process 后 store 已建");
+    // 预算内 process（3 键, 不驱逐）→ 仍不建 store（P0 修复: 零驱逐窗口零开销）
+    exec.process_rows(
+        &[bid_row(1, 10.0), bid_row(2, 20.0), bid_row(3, 30.0)],
+        extract,
+    );
+    assert!(exec.window.spill.is_none(), "零驱逐窗口不建 store");
+    assert!(!path.exists(), "零驱逐窗口不落文件");
+    assert_eq!(exec.window.over_limit_new_buckets(), 0, "预算内不拒收");
+
+    // 第 4 键超限 → 驱逐 → 首次创建 store（惰性）
+    exec.process_rows(&[bid_row(4, 40.0)], extract);
+    assert!(exec.window.spill.is_some(), "首次驱逐时创建 store");
     assert!(path.exists(), "spill 文件已落盘");
     assert_eq!(exec.window.over_limit_new_buckets(), 0, "spill 生效不拒收");
-    // 读回键 3 后 last 值正确（跨序列化往返）
-    exec.process_rows(&[bid_row(3, 333.0)], extract);
+    // 键 1 被驱逐（最老）后回访 → 读回路径（跨序列化往返）
+    exec.process_rows(&[bid_row(1, 111.0)], extract);
 
     let closed = exec.close_window_by_bucket_rows();
-    assert_eq!(closed.len(), 6, "6 键全部输出");
-    let k3 = closed
+    assert_eq!(closed.len(), 4, "4 键全部输出");
+    let k1 = closed
         .iter()
-        .find(|b| b.key == ScopeKey::Int(3))
-        .expect("键 3");
+        .find(|b| b.key == ScopeKey::Int(1))
+        .expect("键 1");
     assert_eq!(
-        k3.measures[0][0].measure_value, 333.0,
-        "键3 读回后 last=333"
+        k1.measures[0][0].measure_value, 111.0,
+        "键1 读回后 last=111"
     );
     // close（reset_window → cleanup）→ 文件删除
     assert!(!path.exists(), "close 后 redb 文件应删除");
-    // 下一窗口沿用同一路径（create 语义重建）——再 process 应重建 store
+    // 下一窗口沿用同一路径（create 语义重建）——零驱逐不建, 驱逐时重建
     exec.set_spill_redb(&path, None, None);
     exec.process_rows(&[bid_row(1, 1.0)], extract);
-    assert!(exec.window.spill.is_some(), "下一窗口重建 store");
+    assert!(exec.window.spill.is_none(), "新窗口零驱逐不建 store");
+    exec.process_rows(
+        &[bid_row(2, 2.0), bid_row(3, 3.0), bid_row(4, 4.0)],
+        extract,
+    );
+    assert!(exec.window.spill.is_some(), "新窗口驱逐时重建 store");
     assert!(path.exists());
 }
 
@@ -907,4 +920,636 @@ fn spill_top_readback_roundtrip() {
             assert_eq!(nx, ny, "键 {:?} top 行字段一致", x.key);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 10. P0 惰性创建 × 规则级共享计数（set_spill_redb 路径, 2026-08-27 review 补）
+// ---------------------------------------------------------------------------
+
+/// 惰性创建与共享落盘计数的联动（两个 executor 模拟同规则两分片）:
+/// 1. 预算内零驱逐 → store 未创建（惰性）
+/// 2. 首次驱逐 → 惰性创建 store, 驱逐记账走 ensure 预置的共享计数
+/// 3. 共享预算耗尽 → 另一分片驱逐回退拒收
+/// 4. 各自 close → 扣自身份额（预算跨窗口复用）
+/// 覆盖 spawn 注入路径（set_spill_redb）而非测试直连的 set_spill。
+#[test]
+fn spill_lazy_create_shared_counter_rule_budget() {
+    use std::sync::atomic::Ordering;
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let limit = (COUNT_ALLOWANCE * 5) as usize; // 规则总落盘 = 5 桶
+
+    let mk = |tag: &str| -> (StatsExecutor, std::path::PathBuf) {
+        let mut exec = StatsExecutor::new(plan.clone());
+        exec.set_memory_limit(tag, Some(COUNT_ALLOWANCE as usize * 3));
+        let path = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "wf_spill_lazy_shared_{}_{}_{}.rb",
+                tag,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            p
+        };
+        exec.set_spill_redb(&path, Some(limit), Some(std::sync::Arc::clone(&shared)));
+        (exec, path)
+    };
+    let (mut a, path_a) = mk("lazy_a");
+    let (mut b, path_b) = mk("lazy_b");
+
+    // a 预算内（1 键 < 3 桶）: 零驱逐 → store 未创建（惰性）
+    a.process_rows(&[bid_row(1, 1.0)], extract);
+    assert!(a.window.spill.is_none(), "预算内不建 store");
+    assert!(!path_a.exists(), "预算内不落文件");
+
+    // a 驱逐 3 键（键 2..=6 触发）→ 首次驱逐惰性创建 + 共享计数 3 桶
+    for k in 2..=6 {
+        a.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    assert!(a.window.spill.is_some(), "驱逐时惰性创建 store");
+    assert!(path_a.exists(), "首次驱逐后落文件");
+    assert_eq!(a.window.over_limit_new_buckets(), 0, "a 不应拒收");
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        COUNT_ALLOWANCE * 3,
+        "a 落盘 3 键进共享计数（ensure 预置的计数生效）"
+    );
+
+    // b 驱逐 → 共享预算耗尽（5）→ 第 12 键拒收
+    for k in 7..=12 {
+        b.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    assert!(b.window.spill.is_some(), "b 驱逐时惰性创建");
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        COUNT_ALLOWANCE * 5,
+        "a{{1,2,3}}+b{{7,8}} 跨分片累计"
+    );
+    assert_eq!(
+        b.window.over_limit_new_buckets(),
+        1,
+        "b 第 12 键被共享上限拒收"
+    );
+
+    // a close → 扣 a 份额（3 键）; b close → 扣 b 份额 → 归零 + 文件删除
+    let a_out = a.close_window_by_bucket_rows();
+    assert_eq!(a_out.len(), 6, "a 输出 6 键（内存 3 + spill 3）");
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        COUNT_ALLOWANCE * 2,
+        "close 后只剩 b 的落盘份额"
+    );
+    assert!(!path_a.exists(), "a close 后 redb 文件删除");
+
+    let b_out = b.close_window_by_bucket_rows();
+    assert_eq!(b_out.len(), 5, "b 输出 5 键（内存 3 + spill 2, 拒收 1）");
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        0,
+        "全部 close 后共享计数归零"
+    );
+    assert!(!path_b.exists(), "b close 后 redb 文件删除");
+}
+
+// ---------------------------------------------------------------------------
+// 11. 文件生命周期（2026-08-27 review 补）：同规则连续窗口无冲突 + 旧文件防污染
+// ---------------------------------------------------------------------------
+
+/// 同一规则连续窗口（q12 型 fixed 多窗）：spill 文件**不按窗口命名**——每任务
+/// 实例每分片一个文件（`spill_{rule}_{pid}{_shard}.rb`），跨顺序窗口**复用同一
+/// 路径**。窗口在单任务内严格串行（一个 window 状态, close 即 reset）, 配合
+/// close 清理删文件 → 下一窗惰性重建空库, 正常路径无冲突。本测试用
+/// `set_spill_redb`（生产 spawn 注入路径）驱动两窗, 断言：
+/// 1. 窗 1 驱逐落盘 → close 后文件删除 + 输出仅窗 1 键
+/// 2. 窗 2 驱逐 → 同路径重建 store **必须为空库**（无窗 1 残留键）
+/// 3. 窗 2 close 输出仅窗 2 键（无旧窗键混入——close drain 遍历全表的污染场景）
+#[test]
+fn spill_consecutive_windows_same_rule_fresh_each_window() {
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "wf_spill_2win_{}_{}.rb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    };
+    let mut exec = StatsExecutor::new(plan.clone());
+    exec.set_memory_limit("spill_test", Some(COUNT_ALLOWANCE as usize * 3));
+    exec.set_spill_redb(&path, None, None);
+
+    // 窗 1：键 1..=6（内存 3 桶 + 驱逐 3 桶）
+    for k in 1..=6 {
+        exec.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    assert!(exec.window.spill.is_some(), "窗 1 驱逐 → 惰性创建 store");
+    assert!(path.exists(), "窗 1 驱逐后落文件");
+    let w1 = exec.close_window_by_bucket_rows();
+    assert_eq!(w1.len(), 6, "窗 1 输出 6 键（内存 3 + spill 3）");
+    assert!(!path.exists(), "窗 1 close 后文件删除");
+
+    // 窗 2：键 7..=12（同一路径重建 store）
+    for k in 7..=12 {
+        exec.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    assert!(exec.window.spill.is_some(), "窗 2 驱逐 → 同路径重建 store");
+    assert_eq!(
+        exec.window.spill.as_ref().unwrap().len(),
+        3,
+        "重建 store 仅含窗 2 驱逐的 3 键（无窗 1 残留——打开前清空旧文件生效）"
+    );
+    let w2 = exec.close_window_by_bucket_rows();
+    assert_eq!(w2.len(), 6, "窗 2 输出 6 键");
+    for b in &w2 {
+        let ScopeKey::Int(i) = b.key else {
+            panic!("键应为 Int");
+        };
+        assert!(
+            (7..=12).contains(&i),
+            "窗 2 输出不含窗 1 键（{i}）——无旧窗污染"
+        );
+    }
+    assert!(!path.exists(), "窗 2 close 后文件删除");
+    std::fs::remove_file(&path).ok(); // 幂等清理（失败忽略）
+}
+
+/// 打开前清空旧文件（2026-08-27 review）：路径上已存在的库文件（上一窗口
+/// cleanup rm 失败残留 / 崩溃残留）不得被打开——直接打开会把旧键混进新窗口
+/// （close drain 遍历全表）。`RedbSpillStore::create` 必须删旧建新（空库）。
+#[test]
+fn spill_create_over_stale_file_starts_fresh() {
+    use crate::match_engine::executor::StatsAccum;
+    let subset = Arc::new(HashSet::from(["price".to_string()]));
+    let mut names: Vec<String> = subset.iter().cloned().collect();
+    names.sort();
+    let layout = Arc::new(RowFieldLayout::all_other(&names));
+    let path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "wf_spill_stale_{}_{}.rb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    };
+
+    // 旧库：写入 2 键后**不 cleanup**（模拟 rm 失败/崩溃残留——文件留在磁盘）
+    let mut stale = RedbSpillStore::create(&path, Arc::clone(&layout)).expect("create stale");
+    stale
+        .put_batch(vec![
+            (1, ScopeKey::Int(1), Vec::<StatsAccum>::new()),
+            (2, ScopeKey::Int(2), Vec::<StatsAccum>::new()),
+        ])
+        .expect("put stale");
+    drop(stale); // Drop 只停写 worker, 不删文件
+    assert!(path.exists(), "残留文件仍在");
+    // 假 .rbr 侧车残留（模拟崩溃遗留的 WAL）——pre-delete 必须一并清掉:
+    // 不清的话 redb 打开时要么 WAL 损坏报错, 要么打开旧库带出旧键。
+    let rbr = path.with_extension("rbr");
+    std::fs::write(&rbr, b"junk wal").expect("write fake rbr");
+    assert!(rbr.exists(), "侧车残留仍在");
+
+    // 新建：同一路径 → pre-delete 清主库+侧车 → 空库起步（旧条目不得被打开）
+    let mut fresh = RedbSpillStore::create(&path, Arc::clone(&layout))
+        .expect("create fresh（侧车残留被清, 打开成功）");
+    assert_eq!(fresh.len(), 0, "旧库残留不得被打开（空库起步）");
+    assert!(!rbr.exists(), "create 后侧车残留已清");
+    fresh.cleanup();
+    assert!(!path.exists(), "cleanup 删除文件");
+}
+
+// ---------------------------------------------------------------------------
+// 12. 补充用例（2026-08-27 review 后）：redb 流式 close / 共享计数跨窗 /
+//     cleanup 幂等 / .rbr 侧车残留
+// ---------------------------------------------------------------------------
+
+/// redb + 流式 close（生产 q18 主路径: `take_next_close_batch` 分批 drain）。
+/// 现有流式 close 测试（§7）只用 Mem store——redb 的 `drain_up_to` 游标续读、
+/// 读前 flush、`drain_cursor` 状态在真实持久层上未被覆盖。断言：
+/// 1. 小批（4）多轮读完 30 键, 批内 ScopeKey 升序（对拍契约）
+/// 2. 每键恰好一次（readback 键 5 不重复）
+/// 3. close 后文件删除 + 窗口状态清空
+#[test]
+fn spill_redb_streaming_close_full_pipeline() {
+    let subset = Arc::new(HashSet::from(["price".to_string()]));
+    let mut names: Vec<String> = subset.iter().cloned().collect();
+    names.sort();
+    let layout = Arc::new(RowFieldLayout::all_other(&names));
+    let path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "wf_spill_redb_stream_{}_{}.rb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    };
+    let store = RedbSpillStore::create(&path, layout).expect("create redb store");
+    let plan = keyed_plan(
+        vec![field_key("b", "bidder")],
+        vec![last_measure("last_price", "price"), count_measure("n")],
+    );
+    let mut exec = exec_with_spill(plan, 3, Some(subset), Some(Box::new(store)), None);
+    for k in 1..=30 {
+        exec.process_rows(&[bid_row(k, k as f64 * 10.0)], extract);
+    }
+    exec.process_rows(&[bid_row(5, 555.0)], extract); // 键 5 读回（take 只读, 旧条目留库）
+    assert!(exec.window.spill_index.len() > 0, "spill 已生效");
+
+    // 流式 close：小批 4 → redb 游标多轮续读
+    let mut keys: Vec<(ScopeKey, Vec<crate::match_engine::executor::StatsAccum>)> = Vec::new();
+    loop {
+        let batch = exec.take_next_close_batch(4);
+        if batch.is_empty() {
+            break;
+        }
+        assert!(
+            batch.windows(2).all(|w| w[0].0 <= w[1].0),
+            "redb 流式批内必须 ScopeKey 升序"
+        );
+        keys.extend(batch);
+    }
+    exec.finish_close_window();
+    assert_eq!(keys.len(), 30, "30 键全部输出");
+    let unique = keys
+        .iter()
+        .map(|(k, _)| k.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert_eq!(unique, 30, "每键恰好一次（readback 键 5 不重复）");
+    assert!(
+        keys.iter().any(|(k, _)| *k == ScopeKey::Int(5)),
+        "键 5 在输出中"
+    );
+    assert!(exec.window.buckets.is_empty(), "close 后窗口状态清空");
+    assert!(!path.exists(), "流式 close 后文件删除");
+    std::fs::remove_file(&path).ok(); // 幂等清理（失败忽略）
+}
+
+/// 共享落盘计数跨窗口复用（§19 语义）：窗 1 close 归零 → 窗 2 驱逐重新累计
+/// → close 归零。`spill_consecutive_windows` 未注入共享计数, 本测试补上。
+#[test]
+fn spill_shared_counter_resets_across_windows() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let shared = Arc::new(AtomicU64::new(0));
+    let path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "wf_spill_shared_2win_{}_{}.rb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    };
+    let mut exec = StatsExecutor::new(plan.clone());
+    exec.set_memory_limit("spill_test", Some(COUNT_ALLOWANCE as usize * 3));
+    exec.set_spill_redb(
+        &path,
+        Some((COUNT_ALLOWANCE * 10) as usize),
+        Some(Arc::clone(&shared)),
+    );
+
+    // 窗 1：键 1..=6（内存 3 + 落盘 3）
+    for k in 1..=6 {
+        exec.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        COUNT_ALLOWANCE * 3,
+        "窗 1 落盘 3 键进共享计数"
+    );
+    exec.close_window_by_bucket_rows();
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        0,
+        "窗 1 close 后计数归零（预算跨窗口复用）"
+    );
+
+    // 窗 2：键 7..=12（同路径重建 store, 共享计数重新累计）
+    for k in 7..=12 {
+        exec.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        COUNT_ALLOWANCE * 3,
+        "窗 2 驱逐重新累计到共享计数"
+    );
+    exec.close_window_by_bucket_rows();
+    assert_eq!(shared.load(Ordering::SeqCst), 0, "窗 2 close 后计数归零");
+    assert!(!path.exists(), "窗 2 close 后文件删除");
+    std::fs::remove_file(&path).ok();
+}
+
+/// cleanup 幂等：二次调用不 panic（writer/db 已 take, 删文件幂等）——防回归
+/// （若 cleanup 二次进入 remove_file 流程或 worker shutdown 二次 join 会挂/崩）。
+#[test]
+fn spill_cleanup_idempotent() {
+    use crate::match_engine::executor::StatsAccum;
+    let subset = Arc::new(HashSet::from(["price".to_string()]));
+    let mut names: Vec<String> = subset.iter().cloned().collect();
+    names.sort();
+    let layout = Arc::new(RowFieldLayout::all_other(&names));
+    let path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "wf_spill_cleanup_idem_{}_{}.rb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    };
+    let mut store = RedbSpillStore::create(&path, layout).expect("create");
+    store
+        .put_batch(vec![(1, ScopeKey::Int(1), Vec::<StatsAccum>::new())])
+        .expect("put");
+    store.cleanup();
+    assert!(!path.exists(), "首次 cleanup 删文件");
+    store.cleanup(); // 幂等：不得 panic / 挂死
+    assert!(!path.exists());
+}
+
+// ---------------------------------------------------------------------------
+// 13. 驱逐记账一致 × 共享计数不过度（2026-08-27 修复回归）
+// ---------------------------------------------------------------------------
+
+/// 驱逐记账一致（单片语义）：驱逐 + 内存残留 = 注入总量（无拒收不丢键）,
+/// 驱逐后内存停在 [target, limit] 区间（不过度——修复前并发下每片各驱逐
+/// 水位差）。count 度量无 distinct, 估算 = 桶数×allowance 精确。
+#[test]
+fn spill_evicts_to_target_exact_overage() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let mem_shared = Arc::new(AtomicU64::new(0));
+    let spill_shared = Arc::new(AtomicU64::new(0));
+    let limit = COUNT_ALLOWANCE * 100; // 100 桶
+    let target = COUNT_ALLOWANCE * 90; // 90 桶（90% 驱逐目标）
+
+    let path = std::env::temp_dir().join(format!(
+        "wf_spill_target_{}_{}.rb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut exec = StatsExecutor::new(plan);
+    exec.set_memory_limit_shared("t1", Some(limit as usize), Some(Arc::clone(&mem_shared)));
+    exec.set_spill_redb(&path, None, Some(Arc::clone(&spill_shared)));
+    for k in 1..=150i64 {
+        exec.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+
+    // 驱逐后内存停在 [target, limit]（不过度）
+    let est = exec.window.estimated_bytes();
+    assert!(
+        est >= target && est <= limit,
+        "驱逐后内存应在 [target, limit], 实测 {est}"
+    );
+    // 记账一致：驱逐键 + 内存键 = 150（无拒收）
+    let mem_buckets = exec.window.buckets.len() as u64;
+    let total = exec.window.spill_evictions() + mem_buckets;
+    assert_eq!(
+        total,
+        150,
+        "驱逐({}) + 内存({}) = 150（无拒收）",
+        exec.window.spill_evictions(),
+        mem_buckets
+    );
+    // 内存共享计数与驱逐一致（= 本片估算）; 落盘计数 = 驱逐量
+    assert_eq!(
+        mem_shared.load(Ordering::SeqCst),
+        est,
+        "内存共享计数 = 本片估算"
+    );
+    assert_eq!(
+        spill_shared.load(Ordering::SeqCst),
+        exec.window.spill_evictions() * COUNT_ALLOWANCE,
+        "落盘共享计数 = 驱逐量 × allowance"
+    );
+    // close 全键输出, 计数归零
+    assert_eq!(
+        exec.close_window_by_bucket_rows().len(),
+        150,
+        "150 键全输出"
+    );
+    assert_eq!(mem_shared.load(Ordering::SeqCst), 0, "close 后内存计数归零");
+    assert_eq!(
+        spill_shared.load(Ordering::SeqCst),
+        0,
+        "close 后落盘计数归零"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// 多片**并发**超限（模拟 q18 10 片共享 25GB 同刻超限）：修复前每片各驱逐
+/// 水位差 → 总驱逐 = 水位差 × 片数（过度, 共享计数降到 target - 水位差）;
+/// 修复后逐链预订共享计数（单一事实源）, 总驱逐 = 超限部分, 共享计数停在
+/// target 附近。两线程 barrier 同步同刻注入。断言共享计数 ≥ target - 竞态
+/// 余量（10 链）——修复前并发下会显著低于 target。
+#[test]
+fn spill_shared_memory_counter_no_over_eviction_under_concurrency() {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let mem_shared = Arc::new(AtomicU64::new(0));
+    let spill_shared = Arc::new(AtomicU64::new(0));
+    let limit = COUNT_ALLOWANCE * 100;
+    let target = COUNT_ALLOWANCE * 90;
+    let barrier = Arc::new(Barrier::new(2));
+
+    let worker = |tag: String,
+                  base: i64,
+                  barrier: Arc<Barrier>,
+                  shared: Arc<AtomicU64>,
+                  spill: Arc<AtomicU64>| {
+        let plan = plan.clone();
+        std::thread::spawn(move || {
+            let path = std::env::temp_dir().join(format!(
+                "wf_spill_conc_{}_{}_{}.rb",
+                tag,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let mut exec = StatsExecutor::new(plan);
+            exec.set_memory_limit_shared(&tag, Some(limit as usize), Some(Arc::clone(&shared)));
+            exec.set_spill_redb(&path, None, Some(Arc::clone(&spill)));
+            // 第一波 80 键（共享 160 > 100, 注入过程已驱逐）
+            for k in 0..80i64 {
+                exec.process_rows(&[bid_row(base + k, 1.0)], extract);
+            }
+            barrier.wait(); // 两片都就位 → 同刻注入第二波触发并发驱逐
+            for k in 80..120i64 {
+                exec.process_rows(&[bid_row(base + k, 1.0)], extract);
+            }
+            (exec, path)
+        })
+    };
+    let h_a = worker(
+        "conc_a".to_string(),
+        1,
+        Arc::clone(&barrier),
+        Arc::clone(&mem_shared),
+        Arc::clone(&spill_shared),
+    );
+    let h_b = worker(
+        "conc_b".to_string(),
+        1001,
+        Arc::clone(&barrier),
+        Arc::clone(&mem_shared),
+        Arc::clone(&spill_shared),
+    );
+    let (a, path_a) = h_a.join().expect("a panicked");
+    let (b, path_b) = h_b.join().expect("b panicked");
+
+    let used = mem_shared.load(Ordering::SeqCst);
+    assert!(
+        used >= target.saturating_sub(10 * COUNT_ALLOWANCE),
+        "并发驱逐过度: 共享计数 {used}B < target {target}B - 竞态余量\
+         （修复前每片各驱逐水位差, q18 实测 25GB 配置每片驱逐 2.5GB×10）"
+    );
+    assert!(used <= limit, "共享计数有界");
+    // 驱逐不凭空产生：每片驱逐 ≤ 各自注入键数
+    assert!(a.window.spill_evictions() <= 120, "a 驱逐 ≤ 120");
+    assert!(b.window.spill_evictions() <= 120, "b 驱逐 ≤ 120");
+    std::fs::remove_file(&path_a).ok();
+    std::fs::remove_file(&path_b).ok();
+}
+
+// ---------------------------------------------------------------------------
+// 14. 预订归还路径（2026-08-27 逐链预订修复的失败分支）
+// ---------------------------------------------------------------------------
+
+/// put_batch 恒失败的 store——模拟写失败（磁盘满/IO 错），验证驱逐预订归还。
+struct FailingStore;
+
+impl crate::match_engine::spill::SpillStore for FailingStore {
+    fn contains(&self, _hash: u64) -> bool {
+        false
+    }
+    fn put_batch(
+        &mut self,
+        _entries: Vec<(
+            u64,
+            ScopeKey,
+            Vec<crate::match_engine::executor::StatsAccum>,
+        )>,
+    ) -> Result<(), crate::match_engine::spill::SpillError> {
+        Err(crate::match_engine::spill::SpillError::Closed)
+    }
+    fn take(
+        &mut self,
+        _hash: u64,
+    ) -> Option<(ScopeKey, Vec<crate::match_engine::executor::StatsAccum>)> {
+        None
+    }
+    fn drain_up_to(
+        &mut self,
+        _n: usize,
+    ) -> Vec<(ScopeKey, Vec<crate::match_engine::executor::StatsAccum>)> {
+        Vec::new()
+    }
+    fn cleanup(&mut self) {}
+    fn len(&self) -> usize {
+        0
+    }
+}
+
+/// 写失败归还路径（2026-08-27 逐链预订修复）：驱逐循环预订扣减共享计数 →
+/// `put_batch` 失败 → 按 `reserved` 归还（estimated_bytes + 共享计数恢复）→
+/// 键仍在内存（buckets 未删、clock 已 pop）→ spill_failed 置位 → 后续新键
+/// 拒收兜底。断言：归还后 estimated 不虚降、已建键不丢、close 输出完整。
+#[test]
+fn spill_write_failure_returns_reserved_and_rejects() {
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let mut exec = exec_with_spill(
+        plan,
+        3,
+        None,
+        Some(Box::new(FailingStore)),
+        None, // max_disk 不限——只看写失败分支
+    );
+    for k in 1..=10 {
+        exec.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+
+    // 归还生效：estimated 恢复 = 内存 3 桶（驱逐尝试失败, 键未删）
+    assert_eq!(
+        exec.window.estimated_bytes(),
+        COUNT_ALLOWANCE * 3,
+        "写失败归还后 estimated 不虚降（键仍在内存记账）"
+    );
+    // 键全在内存（驱逐从未成功）
+    assert_eq!(
+        exec.window.buckets.values().map(Vec::len).sum::<usize>(),
+        3,
+        "驱逐失败的键仍在内存"
+    );
+    assert_eq!(exec.window.spill_evictions(), 0, "写失败不算驱逐");
+    assert_eq!(exec.window.spill_index.len(), 0, "无键落盘");
+    // spill_failed 置位 → 后续键拒收（内存冻结, 不丢已建键）
+    assert!(exec.window.over_limit_new_buckets() > 0, "写失败后回退拒收");
+    // close 输出 = 已接收的 3 键（每个 count=1）——无半吊子
+    let closed = exec.close_window_by_bucket_rows();
+    assert_eq!(closed.len(), 3, "只输出被接收的 3 键");
+    for b in &closed {
+        assert_eq!(b.measures[0][0].measure_value, 1.0);
+    }
+}
+
+/// 落盘上限满时的预订归还（2026-08-27 逐链预订修复）：驱逐循环预订扣共享
+/// 计数 → 写前检查 `spill_used + add > max_disk` → 归还预订 + 拒收兜底。
+/// 断言：归还后 estimated 不虚降（与 [`spill_budget_ladder_falls_back_to_reject`]
+/// 互补——那个测拒收计数, 这个显式锁归还）。
+#[test]
+fn spill_disk_full_returns_reserved_and_rejects() {
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    // 预算 3 桶, 落盘上限 1 键
+    let max_spill = COUNT_ALLOWANCE as usize;
+    let mut exec = exec_with_spill(
+        plan,
+        3,
+        None,
+        Some(Box::new(MemSpillStore::new())),
+        Some(max_spill),
+    );
+    for k in 1..=10 {
+        exec.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+
+    // 归还生效：estimated = 内存 3 桶（被 max_disk 挡下的驱逐未虚降）
+    assert_eq!(
+        exec.window.estimated_bytes(),
+        COUNT_ALLOWANCE * 3,
+        "落盘满归还后 estimated 不虚降"
+    );
+    // 落盘只够 1 键, 其余驱逐尝试被挡 → 拒收
+    assert_eq!(exec.window.spill_index.len(), 1, "只落盘 1 键");
+    assert!(exec.window.over_limit_new_buckets() > 0, "落盘满回退拒收");
+    // close 输出 = 内存 3 + 落盘 1 = 4 键
+    let closed = exec.close_window_by_bucket_rows();
+    assert_eq!(closed.len(), 4, "只输出被接收的 4 键");
 }
