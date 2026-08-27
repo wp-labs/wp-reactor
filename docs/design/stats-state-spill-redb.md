@@ -61,28 +61,51 @@ key insight：q18 的数据特征是**滑动窗口引用**——大多数键（�
 ```
 事件 → hash(键)
   ├─ buckets 命中 → 更新（活跃键，99% 走这）
-  ├─ 未命中 & spill_index 含 hash → 读回（redb get）→ 更新 → 放回 buckets
+  ├─ 未命中 & spill_index 含 hash → 读回（redb take）→ 更新 → 放回 buckets
   │     （读回后可能再驱逐一个冷键腾空间）
   ├─ 未命中 & 无 → 新键 → 建桶（若超预算 → 先 spill 最老键）
-  └─ close → flush buckets → 读回 redb 全部 → 合并 → 排序输出
+  └─ close → 流式 drain（take_next_close_batch 分批取内存 + spill 两源归并）→ 输出
 ```
 
-## 4. 触发策略：超预算驱逐最老未更新键（LRU-时间混合）
+> 2026-08-27 合并说明：桶累加器载体为 [`StatsBucketAccs`]（纯数值计划 → SoA
+> `Numeric`，含 distinct/last/top → `Classic(Vec<StatsAccum>)`）。spill 序列化
+> 契约恒为 `Vec<StatsAccum>`——驱逐/读回经 `accs_to_spill_vec` /
+> `vec_to_bucket_accs` 双向转换（SoA 计划转出再还原，Classic 直接）。
 
-**语义**：当 `estimated_bytes` 超 `max_memory` 预算时，**驱逐「最后更新事件时间
-最老」的键**到 redb，直到预算回落。
+## 4. 触发策略：超预算驱逐最老未更新键（clock 二次机会近似 LRU）
 
-**实现**：StatsWindowState 维护一个**最近更新序**（LRU 链表或
-`(last_update_nanos, hash)` 最小堆）。列式路径每事件命中桶时更新该桶的
-时间戳（摊销：批内按行更新，或用 watermark 近似）。
+**语义**：当 `estimated_bytes` 超 `max_memory` 预算时，**驱逐「最久未碰」的键**
+到 redb，直到预算回落到驱逐目标（`min(上限-单桶, 上限 90%)`——滞后带：既
+放得下新桶，又避免每新键都驱逐）。
 
-**为什么 LRU 而非纯时间驱逐**：
-- q18 滑动窗口特征：冷键 = 早期创建且不再更新的键 → LRU 尾部恰好是它们
-- 纯时间驱逐（`last_update < watermark - X`）需要额外扫描，且 X 难定
-- LRU 在超限时精准驱逐「最久未碰」的键，与 q18 死键特征完美契合
+**实现（M5-2 演进）**：StatsWindowState 维护一个**创建序时钟** `clock: VecDeque<u64>`
+（桶创建序的 hash 环）+ **二次机会计数** `touch: u8`（每桶，0..=TOUCH_MAX=3）：
+
+```
+命中桶 → touch = TOUCH_MAX（刷新）
+驱逐扫描：pop_front → touch > 0 → 递减回队尾（二次机会）
+                     touch = 0 → 驱逐（clone 进 batch → 落盘）
+```
+
+- **为什么 touch 而非纯时间驱逐**：q18 每键回访 3.4 次（突发短窗）——纯 LRU
+  过早踢掉活跃键致驱逐-回访抖动；touch 给活跃键 3 轮保护，死键 3 轮内自然衰减
+- **防活锁**：驱逐循环最多扫 `clock.len() × (TOUCH_MAX+2)`（全活跃时停止——
+  拒收兜底正确）
+
+**驱逐 = 逐链预订（2026-08-27 修复并发过度驱逐）**：驱逐循环每选一个链就**原子
+扣减规则级共享内存计数**（`mem_sub`）——共享计数成为**单一事实源**，循环条件用
+实时值。多片并发超限时逐链原子扣减，共享计数停在驱逐目标，**总驱逐 = 超限部分**；
+修复前 `pending` 是每片局部：10 片并发各驱逐水位差（25GB 配置每片 2.5GB × 10 =
+25GB vs 需求 3.2GB，过度驱逐 10×，驱逐耗时 2.6s/片同步阻塞热路径，EPS 反降）。
+写盘失败/满时按 `reserved` 归还（驱逐未生效，内存键未删，不丢键）。
+
+**惰性创建（P0 修复）**：`RedbSpillStore` 不随规则启动创建——`ensure_spill_store`
+注册创建规格（`spill_create: Option<SpillCreateSpec>`），**首次驱逐**时才
+`RedbSpillStore::create`。零驱逐窗口不建 redb 库/不起写 worker（q19 100M 曾
+17 窗 × 10 片 = 170 次 create/cleanup churn → RSS +6GB）。
 
 **读回再驱逐**：被 spill 的键若又来一条（罕见）→ 从 redb 读回 → 若 buckets
-已满 → 驱逐当前 LRU 尾部 → 放回。读回是低频路径，redb 点查 + 一次驱逐可接受。
+已满 → 驱逐当前最老键 → 放回。读回是低频路径，redb 点查 + 一次驱逐可接受。
 
 ## 5. 限额语义：spill 替代拒收（带落盘上限）
 
@@ -119,7 +142,7 @@ redb 写失败（磁盘满/IO 错）                    → 同拒收（计数 +
 - 行为变更需文档化：配置 `disk_provider` 后，内存换磁盘、不丢键；spill 满才丢
 - 旧键 `spill = "redb"` 为兼容别名（2026-08-27 改名 `disk_provider`）
 
-## 6. 接口设计（SpillStore trait）
+## 6. 接口设计（SpillStore trait，2026-08-27 对齐实现）
 
 ```rust
 /// 状态外溢存储。`Noop` = 默认（无 spill 配置），`Redb` = redb 持久化。
@@ -127,36 +150,51 @@ pub trait SpillStore {
     /// 键是否已 spill（hot path 存在性检查，O(1) 内存操作）。
     fn contains(&self, hash: u64) -> bool;
 
-    /// spill 一个键（put 到持久层；buckets 中已移除）。
-    fn put(&mut self, hash: u64, key: &ScopeKey, accs: Vec<StatsAccum>) -> Result<(), SpillError>;
+    /// 批量 spill 多个键（**单次持久层事务**——驱逐是批量事件，逐键事务会
+    /// 产生 26M 次独立 txn/fsync）。键已从 buckets 移除后调用。
+    fn put_batch(&mut self, entries: Vec<(u64, ScopeKey, Vec<StatsAccum>)>) -> Result<(), SpillError>;
 
-    /// 读回一个键（低频：spill 后键又来一条）。
-    fn get(&mut self, hash: u64) -> Option<(ScopeKey, Vec<StatsAccum>)>;
+    /// 读回一个键（**只读**，M5-2：take 不删除——redb 中旧条目由调用方 close
+    /// 时按「已读回集合」过滤；内存副本更新）。读前 flush 异步写队列。
+    fn take(&mut self, hash: u64) -> Option<(ScopeKey, Vec<StatsAccum>)>;
 
-    /// close：读回全部 spill 键。
-    fn drain(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)>;
+    /// 分批读回（**流式 close, M5-3**）：游标续读，每批最多 n 个。
+    fn drain_up_to(&mut self, n: usize) -> Vec<(ScopeKey, Vec<StatsAccum>)>;
 
-    /// 当前已 spill 键数（诊断/指标）。
+    /// close：读回全部 spill 键（默认实现 = drain_up_to 循环）。
+    fn drain(&mut self) -> Vec<(ScopeKey, Vec<StatsAccum>)> { ... }
+
+    /// 窗口结束清理外部资源（redb 删文件；调用后 store 不再可用）。
+    fn cleanup(&mut self);
+
+    /// 当前已 spill 键数（诊断/指标）。读前 flush 异步写队列（2026-08-27:
+    /// 修复 close 前 `is_empty` 竞态丢 spill 键）。
     fn len(&self) -> usize;
 }
 
 pub enum SpillError {
-    Io(std::io::Error),
-    Redb(redb::Error),
-    Corrupt(String),   // 读回数据损坏（致命，绝不静默丢键）
+    Corrupt(String),       // 反序列化损坏——致命，调用方须 panic
+    Unsupported(String),   // 含 spill 不支持的形态（如 last 行结构化值）——致命
+    Io(std::io::Error),    // 文件 IO 错误（如打开前清空旧文件失败）——致命
+    Redb(redb::Error),     // redb 错误——写失败可回退拒收，读失败致命
+    Closed,                // 写通道已关闭（store 已 cleanup）——调用方回退拒收
 }
 ```
 
-**Noop 实现**：`contains` 恒 false，`put`/`get`/`drain` 空操作——hot path
-一个分支预测，零开销。
+**Noop 实现**：`contains` 恒 false，`put_batch`/`take`/`drain_up_to`/`cleanup`
+空操作，`len` 恒 0——hot path 一个分支预测，零开销。
+
+**异步写（M6）**：驱逐 `put_batch` 只入队（每分片独立写 worker），热路径
+O(1)；读侧（contains/take/drain_up_to/len）读前 flush 保证「已提交 = 已落盘」。
 
 ## 7. redb 表结构
 
 ```
-db: Database（单文件，按任务实例隔离：spill_{rule}_{shard}.rb）
+db: Database（单文件，按任务实例/分片隔离：spill_{rule}_{pid}{_shard}.rb, §8）
 
-table "state": key = u64 hash（唯一），value = 序列化链
-  └ 链：Vec<(serialized_scope_key, serialized_accs)>  // 同 hash 碰撞键合并
+table "state": key = u64 hash（唯一），value = 序列化 (ScopeKey, accs)
+  └ 单键/单 hash（M1 trait 即单键语义）——两不同 ScopeKey 撞同一 u64 hash 的
+    概率 ~2.2e-11（29M 键生日界），put 覆盖旧值（文档化限制 §10，不引入链）
 ```
 
 **序列化**（自包含，无需外部 schema）：
@@ -216,31 +254,39 @@ window_start**——同一实例的连续窗口**复用同一路径**（窗口�
 > 缓冲**, 不是持久化语义。进程重启 = 重新 ingest, spill 文件无保留价值,
 > 启动清理即可。若未来需要「断点续跑」, 那是 checkpoint 范畴, 另立设计。
 
-## 9. close 流程（读回合并）
+## 9. close 流程（流式读回，M5-3）
 
 ```
-close:
-  1. flush buckets 全部 → redb（内存键也落盘，单一来源防重复）
-  2. drain redb 全部 → Vec<(ScopeKey, Vec<StatsAccum>)>
-  3. 与原有逻辑合并：take_buckets_up_to 分批 → close_buckets_to_rows → 输出
-  4. 删 spill 文件
+close（流式，q18 100M 主路径）:
+  1. 内存桶分批取（take_buckets_up_to, retain 原地移除）
+  2. spill 分批读回（drain_up_to, 默认 5 万键/批——反序列化驻留是 close 内存
+     峰值的直接来源; 读前 flush 异步写队列）
+  3. 两源归并排序（批内 ScopeKey 升序）→ close_buckets_to_rows → 输出
+  4. 全部取完（返回空）→ finish_close_window → reset → cleanup 删文件
 ```
 
-**防重复**：close 时内存键先 flush 进 redb，再统一 drain——每个键只从 redb
-读一次，无「内存一份 + redb 一份」的重复输出。
+**不 flush 内存**（M5-3 演进）：不再「内存键也落盘再统一 drain」——内存桶
+直接分批取走，spill 游标续读，两源在 close 侧归并（每键恰好一次）。close
+峰值 = 批大小，不再全量 drain 到内存（q18 30M 曾 43GB → swap 风暴挂死）。
 
-**排序契约**：drain 出的键按 ScopeKey 排序（现有 `take_buckets_up_to` 批内
-排序逻辑复用），批间无序 OK（与现状一致，文档 §8 已确认）。
+**排序契约**：批内 ScopeKey 升序（对拍契约），批间无序 OK（与现状一致，
+文档 §8 已确认）。
 
-## 10. 与现有机制的关系
+**非流式路径**（标量快路径/诊断）：`take_buckets` 先 `merge_spill_into_buckets`
+（drain 全部并入内存，readback 过滤）再全量排序——语义同流式（每键恰好一次）。
+
+## 10. 与现有机制的关系（2026-08-27 合并 SoA 重构后）
 
 | 现有机制 | 关系 |
 |---|---|
-| `bucket_allowance` / `estimated_bytes` | spill 后**扣减已 spill 键**（不重复计预算） |
+| `StatsBucketAccs`（SoA 载体） | 桶累加器 = `Numeric(NumericSoA)`（纯数值计划）/ `Classic(Vec<StatsAccum>)`（含 distinct/last/top）。spill 序列化契约恒为 `Vec<StatsAccum>`——驱逐 `accs_to_spill_vec` / 读回 `vec_to_bucket_accs` 双向转换（SoA 转出还原，Classic 直接） |
+| `bucket_allowance(plan, soa)` | **双口径**：SoA 计划（纯数值）264B/桶（远程紧凑口径）；Classic 计划（2.2 校准后 739B+，q18 实测估算低估）×——驱逐/限额按载体口径记账 |
+| `bucket_mut`/`keyed_bucket_mut` | **无 spill 快速路径**（`spill.is_none() && spill_create.is_none()`，绝大多数规则）→ 远程 entry 单查（命中 1 次哈希，不查读回/不维护 touch/clock，q17 零退化）；spill 配置的规则命中双查（`get`+`get_mut`——`Entry` 借用 buckets 期间无法调 `&mut self` 限额驱逐） |
+| `account_bucket_allowed`（自由函数） | 无 spill 快速路径 + 碰撞路径的限额记账（`entry` 借用中不可调 `&mut self`）；**规则级共享计数口径**（`mem_used_shared` 参数——超限判断与入账走共享，否则无 spill 快速路径破坏「A 占满 B 拒收」规则语义） |
+| `estimated_bytes` / `mem_used_shared` | spill 后扣减已 spill 键；共享计数 = 规则级总驻留（§20），逐链预订实时扣（§4） |
 | `over_limit_new_buckets` 拒收 | 被 spill 替代（§5），保留为兜底 |
-| `take_buckets_up_to` / close 链 | close 读回后复用（§9） |
-| `comps_match` / `scope_key_from_comps` | spill 键序列化/读回复用（§7） |
-| `take_partial` / `merge_partial`（分片） | **暂不支持 spill+分片组合**（q18 单实例）；可交换度量分片（q15/q16）spill 需先读回再传——初始版本 spill 仅单实例/空键规则可用，分片规则禁用 |
+| `take_buckets_up_to` / `take_next_close_batch` | close 流式取桶（§9）；`take_next_close_batch` 返回 `StatsBucketAccs`（spill 读回转回载体后与内存桶归并） |
+| `take_partial` / `merge_partial` | **key 分片支持**（每片独立文件 + 独立写 worker，§8）；仅**输入分片**（空键按行号切分）暂不兼容（spawn 层 warn 并忽略 spill 配置） |
 | 键值类型 | `ScopeKey` 全形态支持（Int/Float/Str/Pair），不限于 int 键 |
 
 ## 11. wfl 声明
@@ -249,8 +295,10 @@ close:
 rule q18_last_bid_stats {
     ...
     limits {
-        max_memory = "2GB"
-        disk_provider = "redb"   // 状态落盘后端（2026-08-27 改名自 spill = "redb"）
+        max_memory = "22GB"        // 规则总驻留上限（100M 全量 28.2GB → 落盘 6.2GB）
+        disk_provider = "redb"     // 状态落盘后端（2026-08-27 改名自 spill = "redb";
+                                   // 旧键仍生效但将废弃）
+        max_disk = "20GB"          // 规则总磁盘上限（2026-08-27 改名自 max_spill_bytes）
         // spill_path = "/tmp/wfusion-spill"  // 可选，默认工作目录
     }
 }
@@ -258,6 +306,11 @@ rule q18_last_bid_stats {
 
 解析：`LimitsPlan` 加 `disk_provider: Option<SpillMode>`（None / Redb；键 `spill`
 为兼容别名）；spawn 层按配置构造 SpillStore 注入 StatsExecutor。
+
+**静态场景检查**（wf-lang checker，2026-08-27）：`disk_provider`/`max_disk` 仅
+**stats 规则**生效（其他规则 → Error 报错）；空键 stats（无 group by）无驱逐对象
+→ Error；`max_disk` 无 `disk_provider` → Warning（不生效）；旧键 `spill` →
+迁移 Warning。配置了但不支持的组合在编译期报错，不静默忽略。
 
 ## 12. 测试计划
 
@@ -462,8 +515,10 @@ close 并入/流式 drain        → fetch_sub(并入键数 × allowance) // 窗
 
 ```
 新建桶（account_new_bucket）   → mem_add(allowance)
-驱逐落盘（evict_to_spill）     → mem_sub(allowance × 链长)
-读回（readback_bucket_mut）    → mem_add(allowance)
+驱逐落盘（evict_to_spill）     → 逐链预订 mem_sub(allowance × 链长)（§4: 循环内
+                                 实时扣, 共享计数为单一事实源）; 写盘成功后再
+                                 fetch_add 落盘计数（§19）
+读回（readback_bucket_mut）    → mem_add(allowance) + 落盘计数 fetch_sub
 批末重算（refresh_estimated）  → mem_add/sub(差值)
 close（take_buckets / reset） → mem_sub(本片净占用)  // 预算跨窗口可复用
 ```
@@ -473,6 +528,9 @@ close（take_buckets / reset） → mem_sub(本片净占用)  // 预算跨窗口
 - `StatsExecutor` 持有共享计数（`mem_used_shared` 字段, 与 `spill_redb` 同模式）——
   reset_window 恢复新窗口, 跨窗口持续生效; 流式 close 不递减账本,
   reset 时统一 `mem_sub` 释放
+- **无 spill 快速路径**（§10）也走共享计数——`account_bucket_allowed` 带
+  `mem_used_shared` 参数（超限判断与入账同口径），否则无 spill 分片不感知
+  其他片占用, 破坏规则级预算语义
 - 未注入共享计数（测试/单片）→ 本片独立预算, 语义退化为旧行为
 
 **q18 100M 实测**（配置演进, 全部 `[clean]` + EMIT 对拍验证）：
@@ -502,7 +560,23 @@ close（take_buckets / reset） → mem_sub(本片净占用)  // 预算跨窗口
 | redb 点查慢（读回路径） | 读回是低频（死键不回来）；redb B+树点查 µs 级，close 前几乎不触发 |
 | close 读回 18.6G I/O 耗时 | 顺序扫描（B+树叶子链），分钟级跑批可接受；对拍验证耗时 |
 | 序列化 bug 丢数据 | 读回失败 → `SpillError::Corrupt` → panic（致命，不静默丢键） |
-| 与分片组合 | 初始禁用（§10），后续按需扩展 |
+| 与分片组合 | **key 分片支持**（每片独立文件独立写 worker, §8）；仅输入分片暂不兼容（§10） |
 | redb 文件膨胀 | 每实例一个文件 + close 清理 + 启动清理 3 个时机（§8）；`max_disk` 上限（§5） |
 | 磁盘满 | `max_disk` 预算 + 写失败回退拒收（§5 三层阶梯） |
 | 崩溃残留 `.rbr` | 启动时清理 spill 目录（§8 时机③）；残留无正确性影响 |
+| SoA/Classic 载体转换 bug | `accs_to_spill_vec`/`vec_to_bucket_accs` 转换经对拍契约锁定（SoA 计划 spill 读回还原 NumericSoA, Classic 直接; q18 EMIT 8,811,730 与无 spill 基线逐字节一致） |
+
+## 21. SoA 合并适配总结（2026-08-27）
+
+远程 stats SoA 重构（`StatsBucketAccs` 载体 + 时间缓存 + 段扫快路径）与本地
+spill 机制合并后的适配要点：
+
+| 适配点 | 结论 |
+|---|---|
+| 桶累加器载体 | `StatsBucketAccs::Numeric`（纯数值 SoA）/ `Classic`（distinct/last/top）。spill 序列化契约恒 `Vec<StatsAccum>`，`accs_to_spill_vec`/`vec_to_bucket_accs` 双向转换 |
+| `bucket_allowance` | 双口径：SoA 264B / Classic 2.2 校准（739B+）——驱逐/限额按载体口径 |
+| `bucket_mut`/`keyed_bucket_mut` | 无 spill 快速路径（entry 单查，q17 零退化）；spill 配置命中双查（entry 借用与 `&mut self` 限额互斥的取舍） |
+| 惰性创建 | 首次驱逐才建 store（零驱逐窗口零开销） |
+| 并发过度驱逐 | 逐链预订共享计数（§4）——总驱逐 = 超限部分，q18 25GB 配置 EPS 2.07M→10.34M |
+| 测试 | spill 测试 `COUNT_ALLOWANCE` 常量 → `allowance_for(plan)` 按载体口径换算；快速路径 4 用例（对拍/拒收/共享口径/惰性注册） |
+| 验证 | wf-engine 1258 / wf-runtime 593（串行）/ wf-lang 984；30M 全量 21 查询 `[clean]` + q18 EMIT 8,811,730 与无 spill 基线一致 |
