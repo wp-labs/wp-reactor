@@ -1520,18 +1520,25 @@ const SPILL_DRAIN_CHUNK: usize = 50_000;
 /// 限额记账（2026-08-27 拆为自由函数）: `entry` 匹配内 `buckets` 已被占用时,
 /// 限额字段（estimated_bytes/over_limit/limit_warned/rule_name）与 `buckets`
 /// 借用不相交, 可同时访问——语义与旧 `account_new_bucket` 方法完全一致。
-/// **碰撞路径专用**（同 hash 不同键, 概率 ~2e-11）：Vacant/未命中路径走
-/// `account_new_bucket`（含 spill 驱逐）——碰撞时链被借用, 无法调 &mut self。
+/// **碰撞路径 + 无 spill 快速路径专用**：链被借用时无法调 `&mut self`。
+/// **规则级共享计数（2026-08-27 合并修复）**：超限判断与入账走共享计数
+/// （`mem_used_shared` 传入, 与 `account_new_bucket`/`mem_add` 同口径）——
+/// 否则无 spill 快速路径下 B 片本片 0 键不超限, 破坏「A 占满 B 拒收」规则语义。
 fn account_bucket_allowed(
     limit_bytes: Option<u64>,
+    mem_used_shared: Option<&std::sync::atomic::AtomicU64>,
     estimated_bytes: &mut u64,
     over_limit_new_buckets: &mut u64,
     limit_warned: &mut bool,
     rule_name: &str,
     allowance: u64,
 ) -> bool {
+    // 超限判断口径 = `mem_used_bytes()`: 共享计数（规则级）或本片估算。
+    let used = mem_used_shared
+        .map(|u| u.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(*estimated_bytes);
     if let Some(limit) = limit_bytes
-        && *estimated_bytes + allowance > limit
+        && used + allowance > limit
     {
         *over_limit_new_buckets += 1;
         if !*limit_warned {
@@ -1539,7 +1546,7 @@ fn account_bucket_allowed(
             log::warn!(
                 "stats 状态内存超限（规则 {}, 估算 {}B / 上限 {}B）——拒绝新建键桶, 已有桶继续累积; 累计拒收 {} 行（新桶尝试）",
                 rule_name,
-                estimated_bytes,
+                used,
                 limit,
                 over_limit_new_buckets
             );
@@ -1547,6 +1554,9 @@ fn account_bucket_allowed(
         return false;
     }
     *estimated_bytes += allowance;
+    if let Some(u) = mem_used_shared {
+        u.fetch_add(allowance, std::sync::atomic::Ordering::SeqCst);
+    }
     true
 }
 
@@ -1606,10 +1616,18 @@ impl StatsWindowState {
     ///
     /// **entry 借用取舍（2026-08-27 合并）**: 远程单查（`entry` 占用分支）在
     /// spill 场景不适用——`Entry` 借用 `buckets` 期间无法调 `&mut self` 限额检查
-    /// （`account_new_bucket` 含 spill 驱逐）。命中路径退化为 get + get_mut 双查
-    /// （q18 每键回访 3.4 次, 2 次哈希 vs 1 次的开销可接受; q17 无 spill 时同）。
+    /// （`account_new_bucket` 含 spill 驱逐）。**无 spill 快速路径**（绝大多数
+    /// 规则, 如 q17 纯 SoA）走 [`Self::bucket_mut_no_spill`] 单查零退化; 仅
+    /// spill 配置的规则命中退化为 get + get_mut 双查（q18 回访 3.4 次/键, 2 次
+    /// 哈希 vs 1 次的开销相对驱逐/落盘成本可忽略）。
     fn bucket_mut(&mut self, key: &ScopeKey, plan: &StatsPlan) -> Option<&mut StatsBucketAccs> {
         let hash = scope_key_hash(key);
+        // 真无 spill（未配置且未注册惰性 spec）才走单查快速路径——惰性创建前
+        // `spill` 为 None 但 `spill_create` 已注册（配置了 spill）, 桶须维护
+        // touch/clock（首次驱逐时 store 才建）。
+        if self.spill.is_none() && self.spill_create.is_none() {
+            return self.bucket_mut_no_spill(key, hash, plan);
+        }
         // 未命中前置检查: 键可能已 spill → 读回（take 只读，M5-2）。
         if self.spill_index.contains(&hash) {
             let taken = self
@@ -1655,6 +1673,66 @@ impl StatsWindowState {
         Some(&mut chain.last_mut().expect("just pushed").accs)
     }
 
+    /// 无 spill 快速路径（远程原版 entry 单查, 命中 1 次哈希——q17 类命中
+    /// 主流零退化）。无 spill ⇒ `spill_index` 恒空（驱逐才插入）⇒ 不查读回;
+    /// touch/clock 无用（恒 0/空）⇒ 不维护。碰撞用自由函数限额（无 spill 时
+    /// 驱逐本就不存在, 与远程语义一致）。
+    fn bucket_mut_no_spill(
+        &mut self,
+        key: &ScopeKey,
+        hash: u64,
+        plan: &StatsPlan,
+    ) -> Option<&mut StatsBucketAccs> {
+        use std::collections::hash_map::Entry;
+        match self.buckets.entry(hash) {
+            Entry::Occupied(o) => {
+                let chain = o.into_mut();
+                if let Some(i) = chain.iter().position(|b| &b.scope_key == key) {
+                    return Some(&mut chain[i].accs);
+                }
+                // 碰撞（同 hash 不同键, 极罕见）: 记账 + push。
+                let allowance = Self::bucket_allowance(plan, self.soa_layout.is_some());
+                if !account_bucket_allowed(
+                    self.limit_bytes,
+                    self.mem_used_shared.as_deref(),
+                    &mut self.estimated_bytes,
+                    &mut self.over_limit_new_buckets,
+                    &mut self.limit_warned,
+                    &self.rule_name,
+                    allowance,
+                ) {
+                    return None;
+                }
+                chain.push(StatsBucket {
+                    scope_key: key.clone(),
+                    accs: new_bucket_accs(plan, self.soa_layout.as_ref()),
+                    touch: 0,
+                });
+                let last = chain.len() - 1;
+                Some(&mut chain[last].accs)
+            }
+            Entry::Vacant(v) => {
+                if !account_bucket_allowed(
+                    self.limit_bytes,
+                    self.mem_used_shared.as_deref(),
+                    &mut self.estimated_bytes,
+                    &mut self.over_limit_new_buckets,
+                    &mut self.limit_warned,
+                    &self.rule_name,
+                    Self::bucket_allowance(plan, self.soa_layout.is_some()),
+                ) {
+                    return None;
+                }
+                let chain = v.insert(vec![StatsBucket {
+                    scope_key: key.clone(),
+                    accs: new_bucket_accs(plan, self.soa_layout.as_ref()),
+                    touch: 0,
+                }]);
+                Some(&mut chain[0].accs)
+            }
+        }
+    }
+
     /// 读回已 spill 的键并放回内存（take 只读，M5-2）：
     /// 出 `spill_index` 入 `readback`（close 按此过滤 redb 旧条目）；入账
     /// allowance；超限先驱逐最老键（此刻未借用 chain）；建桶 touch=TOUCH_MAX。
@@ -1696,7 +1774,8 @@ impl StatsWindowState {
     /// （每桶一次）。新桶先过限额检查（超限 → spill 腾空间 → 仍超限 → None）。
     ///
     /// **单次 entry 查找（2026-08-27 q17）**: 命中主流（在航 auction 窗口内
-    /// 重复引用 ~100%）, 旧 get + get_mut 双查找纯浪费。
+    /// 重复引用 ~100%）。无 spill 快速路径（[`Self::keyed_bucket_mut_no_spill`]）
+    /// 单查零退化; spill 配置的规则命中双查（同 [`Self::bucket_mut`] 取舍）。
     /// pub(crate) 供 rules 段分解 bench（q17_rules_breakdown）。
     pub(crate) fn keyed_bucket_mut(
         &mut self,
@@ -1704,6 +1783,9 @@ impl StatsWindowState {
         comps: &[ScopeKey],
         plan: &StatsPlan,
     ) -> Option<&mut StatsBucketAccs> {
+        if self.spill.is_none() && self.spill_create.is_none() {
+            return self.keyed_bucket_mut_no_spill(hash, comps, plan);
+        }
         // 命中检查（不可变查 + 可变改, 见 bucket_mut 的 entry 借用取舍注释）。
         if let Some(i) = self.buckets.get(&hash).and_then(|chain| {
             chain
@@ -1745,6 +1827,69 @@ impl StatsWindowState {
         });
         self.clock.push_back(hash); // 创建序入队（队尾 = 最新）
         Some(&mut chain.last_mut().expect("just pushed").accs)
+    }
+
+    /// 无 spill 快速路径（远程原版 entry 单查）——同 [`Self::bucket_mut_no_spill`]
+    /// 取舍（不查读回/不维护 touch/clock, 碰撞用自由函数限额）。
+    pub(crate) fn keyed_bucket_mut_no_spill(
+        &mut self,
+        hash: u64,
+        comps: &[ScopeKey],
+        plan: &StatsPlan,
+    ) -> Option<&mut StatsBucketAccs> {
+        use std::collections::hash_map::Entry;
+        let allowance = Self::bucket_allowance(plan, self.soa_layout.is_some());
+        match self.buckets.entry(hash) {
+            Entry::Occupied(o) => {
+                let chain = o.into_mut();
+                if let Some(i) = chain
+                    .iter()
+                    .position(|b| comps_match(&b.scope_key, comps, 0, comps.len()))
+                {
+                    return Some(&mut chain[i].accs);
+                }
+                // 碰撞（同 hash 不同键 = 新桶, 极罕见）: 记账 + push。
+                if !account_bucket_allowed(
+                    self.limit_bytes,
+                    self.mem_used_shared.as_deref(),
+                    &mut self.estimated_bytes,
+                    &mut self.over_limit_new_buckets,
+                    &mut self.limit_warned,
+                    &self.rule_name,
+                    allowance,
+                ) {
+                    return None;
+                }
+                let scope_key = scope_key_from_comps(comps);
+                chain.push(StatsBucket {
+                    scope_key,
+                    accs: new_bucket_accs(plan, self.soa_layout.as_ref()),
+                    touch: 0,
+                });
+                let last = chain.len() - 1;
+                Some(&mut chain[last].accs)
+            }
+            Entry::Vacant(v) => {
+                if !account_bucket_allowed(
+                    self.limit_bytes,
+                    self.mem_used_shared.as_deref(),
+                    &mut self.estimated_bytes,
+                    &mut self.over_limit_new_buckets,
+                    &mut self.limit_warned,
+                    &self.rule_name,
+                    allowance,
+                ) {
+                    return None;
+                }
+                let scope_key = scope_key_from_comps(comps);
+                let chain = v.insert(vec![StatsBucket {
+                    scope_key,
+                    accs: new_bucket_accs(plan, self.soa_layout.as_ref()),
+                    touch: 0,
+                }]);
+                Some(&mut chain[0].accs)
+            }
+        }
     }
 
     /// 按完整键取桶（测试/调试用; 生产走哈希路径）。
