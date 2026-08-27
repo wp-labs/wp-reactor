@@ -6,12 +6,14 @@ All notable changes to wp-reactor will be documented in this file.
 
 ### Added
 
-- **wf-lang: `shared` 公共允许列表（issue #73）**——`shared <name> = ("a", "b", ...)` 顶层声明 + 规则内 `expr in <name>` / `expr not in <name>` 引用，一处定义、多处引用。
-  - 解析：`Expr::ListRef` 占位（仅 `in <ident>` 右值产出）；声明必须在规则之前（与 `yield preset`/`pattern` 同文法位置）。
-  - 编译：`compile_wfl` / `compile_wfl_with_diagnostics` 先 `resolve_shared_list_refs` 展开为字面列表——checker/运行时只见字面 InList，元素类型检查与手写列表逐字节等价。
-  - 错误面：未知名列表 → 编译错误（带规则名+列表名）；同名重复声明 → 编译错误；元素不支持嵌套 shared 引用。
-  - prelude：`_global.wfl` 允许 `shared` 声明，prelude 合并并入每个规则文件（wfgen `load_wfl_files` + wf-runtime `lifecycle/compile.rs` 同步，重名冲突报错）。
-  - lint：`wfl lint` 先展开再 check（不绕过编译期错误）。
+- **wf-lang: 顶层列表 + `use` 导入（issue #73）**——顶层裸绑定 `name = ("a", "b", ...)` 声明列表，规则内 `expr in <name>` / `expr not in <name>` 引用，`use "file.wfl"` include 导入目标文件全部顶层列表（一处定义、多处引用；无可见性控制）。
+  - 解析：`Expr::ListRef` 占位（仅 `in <ident>` 右值产出）；列表声明须在规则之前（与 `yield preset`/`pattern` 同文法位置）。
+  - use 导入：`lists::resolve_imports` 递归解析（相对被导入文件目录；`.wfs` 目标跳过；循环引用/缺失/重名报错）；加载层接线（wfgen `load_wfl_files`、wf-runtime `lifecycle/compile.rs`、wfl crate 四命令共用 `load_wfl_with_imports`）。
+  - 编译：`compile_wfl` / `compile_wfl_with_diagnostics` 先 `resolve_list_refs` 展开为字面列表——checker/运行时只见字面 InList，与手写列表逐字节等价。
+  - **类型检查（新增）**：InList 元素-左值类型比对（字面与命名列表统一）——元素混类型报错、左值类型不兼容报错、推断不出（函数调用/字段引用）跳过；顶层列表声明混类型在声明处报错。
+  - 错误面：未知名列表 → 编译错误（带规则名+列表名）；use 目标缺失/循环引用/重名 → 报错。
+  - prelude 回退：`_global.wfl` 只管 `yield preset`（列表走 `use`）；`pattern` 解析期展开不可导入（文档说明）。
+  - lint：`wfl lint` 先解析 use + 展开列表再 check（不绕过编译期错误）。
 
 - **wf-lang / wf-engine / wf-runtime**: HOP sliding window operator — `match<key:hop(size, slide)>`（`size % slide == 0`）。每个事件扇入 `size/slide` 个覆盖窗口（epoch slide 对齐），窗口在 `w_start + size` 收口（slide 对齐）。
   - 引擎：`advance_at_with_diagnostics` 尾部抽取为 `advance_window(scope_key, window_start)` 助手，HOP 逐窗口扇出并 `merge_step_outcome` 合并结果；`expire_time_for`/`close`/expiry 堆均按 hop 窗口收口。

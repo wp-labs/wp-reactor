@@ -108,8 +108,8 @@ pub fn compile_wfl_with_diagnostics(
     source: &str,
     path: impl AsRef<Path>,
 ) -> LangResult<Vec<RulePlan>> {
-    // 公共允许列表引用（issue #73）先展开（未知名/非法位置在此报错, 带文件路径）。
-    let file = crate::compiler::shared_list::resolve_shared_list_refs(file).map_err(|e| {
+    // 顶层列表引用（issue #73）先展开（未知名/非法位置在此报错, 带文件路径）。
+    let file = crate::compiler::lists::resolve_list_refs(file).map_err(|e| {
         crate::error::error(
             LangReason::Compile,
             format!(

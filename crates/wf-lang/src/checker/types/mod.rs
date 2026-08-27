@@ -3,7 +3,7 @@ mod check_funcs;
 mod infer;
 mod pipe;
 
-pub use check_expr::{check_expr_type, check_yield_expr_type_with_system_vars};
+pub(crate) use check_expr::{check_expr_type, check_yield_expr_type_with_system_vars, format_type};
 pub use infer::infer_type;
 pub use pipe::check_pipe_chain;
 

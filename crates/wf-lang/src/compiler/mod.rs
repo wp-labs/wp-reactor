@@ -19,7 +19,7 @@ use crate::yield_preset::expand_yield_args;
 use crate::{LangReason, LangResult};
 use orion_error::conversion::ToStructError;
 
-pub mod shared_list;
+pub mod lists;
 
 #[cfg(test)]
 mod tests;
@@ -33,9 +33,10 @@ mod tests;
 /// Contracts, use declarations, and meta blocks are stripped — only rule
 /// logic is compiled.
 pub fn compile_wfl(file: &WflFile, schemas: &[WindowSchema]) -> LangResult<Vec<RulePlan>> {
-    // 公共允许列表引用（issue #73）先展开——checker 只见到字面 InList（既有
-    // 类型检查原样生效）, 未知名/非法位置在此报错。
-    let file = shared_list::resolve_shared_list_refs(file)?;
+    // 顶层列表引用（issue #73）先展开——checker 只见到字面 InList（既有类型
+    // 检查原样生效）, 未知名/非法位置在此报错。use 导入在加载层完成
+    // （`lists::resolve_imports`）, 这里只管本文件内已合并的列表展开。
+    let file = lists::resolve_list_refs(file)?;
     let errors = check_wfl(&file, schemas);
     let hard_errors: Vec<_> = errors
         .iter()
@@ -1247,7 +1248,7 @@ fn rewrite_expr_label_refs(expr: &Expr, labels: &HashSet<String>) -> Expr {
         | Expr::SystemVar(_)
         | Expr::WfuMeta(_)
         | Expr::PresetParam(_)
-        // 编译期已展开（resolve_shared_list_refs 在 checker 前）; 防御性保留。
+        // 编译期已展开（resolve_list_refs 在 checker 前）; 防御性保留。
         | Expr::ListRef(_) => expr.clone(),
         Expr::Object(items) => Expr::Object(
             items

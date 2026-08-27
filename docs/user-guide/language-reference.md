@@ -537,18 +537,25 @@ yield scan_alerts : base_alerts, ioc_fields (
 - 必填参数不能排在带默认值参数之后；缺少必填参数、实参数量过多、未知 `$param` 都是编译错误
 - preset 中引用的事件 alias 在使用点解析；推荐 preset 优先放常量、`@score`、`@__wfu_*` 和时间系统变量
 
-项目级公共 preset 可集中放入规则根目录下的 `_global.wfl`。规则根目录由 `runtime.rules` glob 的非通配前缀推导，例如 `rules/**/*.wfl` 对应 `rules/_global.wfl`，`rules/current/*.wfl` 对应 `rules/current/_global.wfl`。运行时会自动把它作为 project prelude 加载，并从普通规则文件列表中排除；`_global.wfl` 只允许 `yield preset` 与 `shared` 声明，不会自动启用普通 `rule`。
+项目级公共 preset 可集中放入规则根目录下的 `_global.wfl`。规则根目录由 `runtime.rules` glob 的非通配前缀推导，例如 `rules/**/*.wfl` 对应 `rules/_global.wfl`，`rules/current/*.wfl` 对应 `rules/current/_global.wfl`。运行时会自动把它作为 project prelude 加载，并从普通规则文件列表中排除；`_global.wfl` 只允许 `yield preset` 声明，不会自动启用普通 `rule`（列表请走下面的 `use` 导入）。
 
-#### `shared` 公共允许列表
+#### 顶层列表 + `use` 导入
 
-`shared` 用于声明跨规则复用的公共允许列表（issue #73）——一组 `in (...)` 右值只定义一次，多条规则以 `expr in <name>`（或 `expr not in <name>`）引用：
+跨规则复用公共允许列表（issue #73）：一组 `in (...)` 右值只定义一次，多条规则以 `expr in <name>`（或 `expr not in <name>`）引用。列表声明是**顶层裸绑定**（无关键字、无可见性控制——WFL 规模小不做导出控制，use 导入的文件其全部顶层列表都可见）：
 
 ```wfl
-shared security_log_types = (
+// security_lists.wfl —— 列表定义文件（不含规则）
+security_log_types = (
     "360_active_defense_log",
     "edr_alert_log",
     "fw_ips_protect_log"
 )
+high_risk_types = ("attack", "malware")
+```
+
+```wfl
+// rules.wfl —— 规则文件 use 导入
+use "security_lists.wfl"
 
 rule alert_rule {
     events { s : sdm_event && s.log_type in security_log_types }
@@ -563,11 +570,14 @@ rule alert_entity_rule {
 
 语义：
 
-- 声明必须在规则之前（与 `yield preset` / `pattern` 同文法位置）；声明中的元素与手写 `in (...)` 列表同文法
+- 列表声明必须在规则之前（与 `yield preset` / `pattern` 同文法位置）；元素与手写 `in (...)` 列表同文法
+- `use "file.wfl"` 是 **include 语义**：目标文件的全部顶层列表并入当前作用域（flatten、无限定名）；递归传播（A use B、C use A → C 也可见 B 的列表）；相对路径以被导入文件所在目录为基准
+- `.wfs` 目标的 `use` 维持原样（schema 引用，由加载层另行加载，不在此导入）
 - 编译期把引用展开为字面列表——元素类型检查、运行时求值与手写列表**逐字节等价**，不引入新语义
-- 引用未声明的列表 → 编译错误（带规则名与列表名）；同名重复声明 → 编译错误
-- 支持 `not in <name>`；`shared` 列表元素不支持嵌套引用其他 `shared` 列表
-- 项目级共享：放入规则根目录的 `_global.wfl` 后自动并入每个规则文件（prelude 合并，规则文件内不允许重名覆盖）
+- **类型检查**：列表元素推断同类型（`in (...)` 字面列表与命名列表统一）；元素混合类型 → 报错；`expr in <list>` 左值类型与元素类型不兼容 → 报错（推断不出的元素如函数调用跳过，不误报）
+- 错误面：引用未声明列表 / use 目标缺失 / 循环引用（A↔B）/ 重名（文件内与导入、导入与导入）→ 编译错误，可定位
+- 支持 `not in <name>`；列表元素不支持嵌套引用其他列表
+- `use` 只导入顶层列表——`pattern` 在解析阶段展开（技术上不可导入）、`yield preset` 走 `_global.wfl` prelude
 
 #### 时间系统变量
 

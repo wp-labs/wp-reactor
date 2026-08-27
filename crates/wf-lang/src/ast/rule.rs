@@ -12,18 +12,19 @@ pub struct WflFile {
     pub uses: Vec<UseDecl>,
     pub patterns: Vec<PatternDecl>,
     pub yield_presets: Vec<YieldPresetDecl>,
-    /// 公共允许列表（issue #73）: `shared <name> = (items)` 顶层声明——供多个
-    /// 规则以 `expr in <name>` 引用, 编译期展开（一处定义、多处引用）。
-    pub shared_lists: Vec<SharedListDecl>,
+    /// 顶层列表声明（issue #73）: `name = (item, ...)` 裸绑定——供规则以
+    /// `expr in <name>` 引用, 编译期展开为字面列表。`use "file.wfl"` 把目标
+    /// 文件的列表并入当前文件（include 语义, 无可见性控制）。
+    pub lists: Vec<ListDecl>,
     pub rules: Vec<RuleDecl>,
     pub tests: Vec<TestBlock>,
 }
 
-/// `shared <name> = ("a", "b", ...)`——公共字符串/字面允许列表声明。
+/// `name = ("a", "b", ...)`——顶层命名字面列表声明。
 #[non_exhaustive]
 #[derive(::moju_derive::MoJu, Debug, Clone, PartialEq)]
 #[moju(kind = "struct", domain = "Lang", module = "Lang.LangRule")]
-pub struct SharedListDecl {
+pub struct ListDecl {
     pub name: String,
     /// 列表元素（字面量; 编译期检查元素类型与展开处 InList 的类型校验一致）。
     pub items: Vec<Expr>,

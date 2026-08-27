@@ -347,6 +347,46 @@ fn check_expr_type_inner(
                     errors,
                 );
             }
+
+            // issue #73 评审: 元素-左值类型比对。命名列表已在编译期展开为
+            // 字面 InList——字面与命名列表走同一条检查路径（行为一致）。
+            // 推断不出的元素（函数调用/字段引用/空列表）跳过, 不误报。
+            let mut elem_types: Vec<ValType> = Vec::new();
+            for item in list {
+                if let Some(t) = infer_type(item, scope) {
+                    elem_types.push(t);
+                }
+            }
+            for i in 1..elem_types.len() {
+                if !compatible(&elem_types[0], &elem_types[i]) {
+                    errors.push(CheckError {
+                        severity: Severity::Error,
+                        rule: Some(rule_name.to_string()),
+                        test: None,
+                        message: format!(
+                            "`in (...)` list mixes incompatible element types ({} and {})",
+                            format_type(&elem_types[0]),
+                            format_type(&elem_types[i])
+                        ),
+                    });
+                    break;
+                }
+            }
+            if let Some(lv) = infer_type(inner, scope)
+                && let Some(first) = elem_types.first()
+                && !compatible(&lv, first)
+            {
+                errors.push(CheckError {
+                    severity: Severity::Error,
+                    rule: Some(rule_name.to_string()),
+                    test: None,
+                    message: format!(
+                        "`in (...)` left-hand value type {} is not compatible with list element type {}",
+                        format_type(&lv),
+                        format_type(first)
+                    ),
+                });
+            }
         }
         Expr::SystemVar(_) if !allow_yield_context => {
             errors.push(CheckError {
@@ -393,7 +433,7 @@ fn check_expr_type_inner(
         | Expr::Bool(_)
         | Expr::SystemVar(_)
         | Expr::WfuMeta(_)
-        // 编译期已展开（resolve_shared_list_refs 在 checker 前）。
+        // 编译期已展开（resolve_list_refs 在 checker 前）。
         | Expr::ListRef(_) => {}
         Expr::IfThenElse {
             cond,
@@ -469,4 +509,17 @@ fn is_stat_selector_func(qualifier: Option<&str>, name: &str) -> bool {
             name,
             "window_event" | "match_event" | "match_distinct" | "trigger" | "final"
         )
+}
+
+/// 类型显示（错误消息用）。
+pub(crate) fn format_type(t: &ValType) -> String {
+    match t {
+        ValType::Base(b) => format!("{b:?}").to_lowercase(),
+        ValType::Bool => "bool".to_string(),
+        ValType::Numeric => "number".to_string(),
+        ValType::Object => "object".to_string(),
+        ValType::ArrayAny => "array".to_string(),
+        ValType::Array(b) => format!("array of {b:?}").to_lowercase(),
+        ValType::EmptyArray => "empty array".to_string(),
+    }
 }

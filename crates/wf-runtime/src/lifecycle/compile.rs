@@ -81,6 +81,17 @@ pub(crate) fn compile_rules(
             .map_err(lang_diagnostic)?;
         validate_rule_prelude_conflicts(&wfl_file, &preprocessed, full_path, prelude.as_ref())?;
         apply_rule_prelude(&mut wfl_file, prelude.as_ref());
+        // issue #73: `use "file.wfl"` 导入顶层列表（include 语义, 递归/循环/重名报错）。
+        wfl_file =
+            wf_lang::compiler::lists::resolve_imports(&wfl_file, full_path, &mut |import_path| {
+                load_wfl_with_context(import_path, ctx, Some(base_dir)).map_err(|e| {
+                    wf_lang::error::error(
+                        wf_lang::LangReason::Compile,
+                        e.detail().clone().unwrap_or_else(|| e.to_string()),
+                    )
+                })
+            })
+            .map_err(lang_diagnostic)?;
         all_rules.extend(wfl_file.rules.iter().cloned());
         parsed_files.push(ParsedRuleFile {
             path: full_path.clone(),
@@ -622,6 +633,9 @@ fn validate_rule_prelude(
         Some("use declarations")
     } else if !file.patterns.is_empty() {
         Some("pattern declarations")
+    } else if !file.lists.is_empty() {
+        // issue #73 定稿: 列表走 `use` 导入, prelude 只管 yield preset。
+        Some("list declarations (declare lists in a separate file and `use` it)")
     } else if !file.rules.is_empty() {
         Some("rule declarations")
     } else if !file.tests.is_empty() {
@@ -634,14 +648,13 @@ fn validate_rule_prelude(
         return RuntimeReason::Bootstrap
             .to_err()
             .with_detail(format!(
-                "{} is a rule prelude and only allows `yield preset` and `shared` declarations; found {}",
+                "{} is a rule prelude and only allows `yield preset` declarations; found {}",
                 path.display(),
                 kind
             ))
             .err();
     }
     validate_unique_yield_presets(file, source, path, "rule prelude")?;
-    validate_unique_shared_lists(file, source, path, "rule prelude")?;
     Ok(())
 }
 
@@ -675,25 +688,6 @@ fn validate_rule_prelude_conflicts(
                     line,
                     column,
                     source_line_snippet(source, line, column)
-                ))
-                .err();
-        }
-    }
-    // issue #73: 规则文件不得重定义 prelude 已有的 shared 列表。
-    for list in &file.shared_lists {
-        if prelude
-            .file
-            .shared_lists
-            .iter()
-            .any(|prelude_list| prelude_list.name == list.name)
-        {
-            return RuntimeReason::Bootstrap
-                .to_err()
-                .with_detail(format!(
-                    "{} defines shared list `{}` that already exists in prelude {}",
-                    path.display(),
-                    list.name,
-                    prelude.path.display()
                 ))
                 .err();
         }
@@ -738,40 +732,6 @@ fn apply_rule_prelude(file: &mut wf_lang::ast::WflFile, prelude: Option<&ParsedR
     let mut yield_presets = prelude.file.yield_presets.clone();
     yield_presets.extend(file.yield_presets.clone());
     file.yield_presets = yield_presets;
-    // issue #73: prelude 的 shared 列表并入规则文件（prelude 在前, 规则文件在后）。
-    let mut shared_lists = prelude.file.shared_lists.clone();
-    shared_lists.extend(file.shared_lists.clone());
-    file.shared_lists = shared_lists;
-}
-
-fn validate_unique_shared_lists(
-    file: &wf_lang::ast::WflFile,
-    source: &str,
-    path: &Path,
-    scope: &str,
-) -> RuntimeResult<()> {
-    let mut seen: HashMap<&str, usize> = HashMap::new();
-    for list in &file.shared_lists {
-        let count = seen.entry(list.name.as_str()).or_insert(0);
-        *count += 1;
-        if *count > 1 {
-            let (line, column) =
-                find_nth_yield_preset_decl_location(source, &list.name, *count).unwrap_or((1, 1));
-            return RuntimeReason::Bootstrap
-                .to_err()
-                .with_detail(format!(
-                    "{} duplicate shared list `{}` in {}\nlocation: line {}, column {}\n{}",
-                    path.display(),
-                    list.name,
-                    scope,
-                    line,
-                    column,
-                    source_line_snippet(source, line, column)
-                ))
-                .err();
-        }
-    }
-    Ok(())
 }
 
 fn lang_diagnostic(error: wf_lang::LangError) -> crate::error::RuntimeError {

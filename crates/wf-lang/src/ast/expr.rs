@@ -150,7 +150,7 @@ pub enum Expr {
         negated: bool,
     },
     /// 公共允许列表引用（issue #73）: `expr in <shared_name>` 的右值——解析期
-    /// 产出, 编译期由 `resolve_shared_list_refs` 展开为字面列表; checker/运行时
+    /// 产出, 编译期由 `resolve_list_refs` 展开为字面列表; checker/运行时
     /// 见不到本变体（展开后仅剩字面 InList）。
     ListRef(String),
     /// Conditional expression: `if cond then yes else no`.
