@@ -777,12 +777,23 @@ conv { sort(-score) ; where(count > 5) ; }
 
 ```wfl
 limits {
-    max_memory = "50MB";
+    max_memory = "15GB";    // 规则级状态内存总上限（同规则分片共享, 2026-08-27 起）
+    spill = "redb";         // 启用状态外溢到磁盘（默认 off）
+    max_disk = "20GB";      // 规则级磁盘总上限（2026-08-27 改名自 max_spill_bytes）
     max_instances = 10000;
     max_throttle = "100/min";
     on_exceed = throttle;
 }
 ```
+
+- `max_memory` / `max_disk` 都是**规则总量**——同规则全部分片共享一个占用计数,
+  分片数是引擎内部细节（旧语义 2GB/片 × 10 = 20GB 的陷阱已废弃）。
+- **三层预算阶梯**：状态估算 ≤ `max_memory` 全内存; 超限驱逐最老键落盘
+  （`spill = "redb"`）; 落盘超 `max_disk` 回退拒收新键（不丢已建桶）。
+  ⚠ 内存+磁盘预算之和必须 ≥ 状态总量, 否则拒收丢键（bench `[clean]` 不报）。
+- 旧键 `max_spill_bytes` 保留为兼容别名（lint 会给迁移 Warning）。
+- spill 仅适用 stats 规则（单实例 / key 分片; 输入分片暂不支持）。
+- 详见 `docs/design/stats-state-spill-redb.md` §19/§20。
 
 `on_exceed` 可选：
 
