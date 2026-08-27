@@ -502,14 +502,21 @@ pub(super) fn spawn_rule_tasks(
                 );
                 // 状态内存 guard（2026-08-25）: 规则 `limits.max_memory` →
                 // StatsExecutor 超限拒收新键桶（内存有界 + 每窗口告警 + 计数）。
-                // None = 不设防（未写 limits 的规则保持原行为）。
+                // **规则级共享预算**（2026-08-27）：`max_memory` 是规则总驻留上限
+                // ——同规则全部分片共用一个内存占用计数, 分片数是引擎内部细节
+                // （旧语义 2GB/片 × 10 = 20GB 违背用户直觉）。None = 不设防。
                 let state_mem_limit: Option<usize> = rule
                     .executor
                     .plan()
                     .limits_plan
                     .as_ref()
                     .and_then(|l| l.max_memory_bytes);
-                stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
+                let mem_used_shared = state_mem_limit.map(|_| Arc::new(AtomicU64::new(0)));
+                stats.set_memory_limit_shared(
+                    &rule.executor.plan().name,
+                    state_mem_limit,
+                    mem_used_shared.clone(),
+                );
                 // 状态外溢（M4, `docs/design/stats-state-spill-redb.md`）:
                 // `limits { spill = "redb" }` → redb 落盘、内存只留活跃子集。
                 // 仅**单实例**可用（分片组合暂不支持, 见设计 §10）——分片/输入分片
@@ -583,7 +590,11 @@ pub(super) fn spawn_rule_tasks(
                                 stats_plan.clone(),
                                 row_fields.clone(),
                             );
-                        shard_stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
+                        shard_stats.set_memory_limit_shared(
+                            &rule.executor.plan().name,
+                            state_mem_limit,
+                            mem_used_shared.clone(),
+                        );
                         // key 分片: 每片独立 executor（无跨片 merge）——spill 按片独立
                         // 启用（每片独立文件 + 每片独立写 worker = 多 worker 多文件）,
                         // 落盘字节记账共享规则级计数（max_spill_bytes = 规则总上限）。
@@ -645,7 +656,11 @@ pub(super) fn spawn_rule_tasks(
                                 stats_plan.clone(),
                                 row_fields.clone(),
                             );
-                        shard_stats.set_memory_limit(&rule.executor.plan().name, state_mem_limit);
+                        shard_stats.set_memory_limit_shared(
+                            &rule.executor.plan().name,
+                            state_mem_limit,
+                            mem_used_shared.clone(),
+                        );
                         if spill_cfg.is_some() {
                             log::warn!(
                                 "stats spill 与输入分片组合暂不支持（规则 {}）——本片忽略 spill 配置",

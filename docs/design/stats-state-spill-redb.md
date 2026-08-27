@@ -98,20 +98,20 @@ key insight：q18 的数据特征是**滑动窗口引用**——大多数键（�
 ```
 wfl：
     limits {
-        max_memory = "2GB"      // 状态内存上限（每分片, 2026-08-27 起）
+        max_memory = "10GB"     // 状态内存上限（2026-08-27 起为规则级共享总量）
         spill = "redb"          // 启用状态外溢（默认 off）
-        max_spill_bytes = "8GB" // 规则总落盘上限（2026-08-27 起为规则级共享）
+        max_spill_bytes = "20GB" // 规则总落盘上限（2026-08-27 起为规则级共享）
     }
 ```
 
 **三层预算阶梯**（内存 → 磁盘 → 兜底拒收）：
 
 ```
-内存 estimated_bytes ≤ max_memory（每分片）          → 全内存，不 spill
-内存超 max_memory 且 共享 spill_bytes ≤ max_spill（规则）→ spill 最老键（LRU）腾空间
-共享 spill_bytes ≥ max_spill_bytes                    → 停止 spill，回退拒收
-                                                     （over_limit_new_buckets 计数 + 告警）
-redb 写失败（磁盘满/IO 错）                         → 同拒收（计数 + 致命告警，不静默丢）
+内存 mem_used ≤ max_memory（规则共享）             → 全内存，不 spill
+内存超 max_memory 且 共享 spill_bytes ≤ max_spill → spill 最老键（LRU）腾空间
+共享 spill_bytes ≥ max_spill_bytes               → 停止 spill，回退拒收
+                                                 （over_limit_new_buckets 计数 + 告警）
+redb 写失败（磁盘满/IO 错）                     → 同拒收（计数 + 致命告警，不静默丢）
 ```
 
 - `over_limit_new_buckets` 保留为**兜底**（spill 满/写失败才触发）
@@ -424,6 +424,49 @@ close 并入/流式 drain        → fetch_sub(并入键数 × allowance) // 窗
 3. **RSS 28.3GB 仍高于 20GB 目标**：剩余 = 分片内存状态 19.5GB（2GB×10 上限
    几乎全占）+ 开销。压 20GB 需降 max_memory（如 1GB/片 → 状态 10GB）+ spill
    补足（~10GB 落盘）——即 §A「1GB 预算」方向, EPS 与 RSS 的权衡另行实测
+
+## 20. `max_memory` 规则级共享预算（2026-08-27）
+
+**语义变更**：`max_memory` 从「每分片上限」改为「规则总驻留上限」——同规则全部
+分片共享一个 `Arc<AtomicU64>` 内存占用计数（`spawn.rs` 规则级创建, 分片 clone
+注入）。旧语义 2GB/片 × 10 = 20GB 违背用户直觉——用户配 2GB 就是整个规则最多
+驻留 2GB 状态。
+
+**记账口径**（`stats_exec.rs` `StatsWindowState`）：与 spill 对称——
+
+```
+新建桶（account_new_bucket）   → mem_add(allowance)
+驱逐落盘（evict_to_spill）     → mem_sub(allowance × 链长)
+读回（readback_bucket_mut）    → mem_add(allowance)
+批末重算（refresh_estimated）  → mem_add/sub(差值)
+close（take_buckets / reset） → mem_sub(本片净占用)  // 预算跨窗口可复用
+```
+
+- 检查/驱逐全部走共享计数（`mem_used_bytes()`：共享读值, 未共享退化本地
+  `estimated_bytes`）——某分片用满后其余分片新键被拒（规则级兜底）
+- `StatsExecutor` 持有共享计数（`mem_used_shared` 字段, 与 `spill_redb` 同模式）——
+  reset_window 恢复新窗口, 跨窗口持续生效; 流式 close 不递减账本,
+  reset 时统一 `mem_sub` 释放
+- 未注入共享计数（测试/单片）→ 本片独立预算, 语义退化为旧行为
+
+**q18 100M 实测**（配置演进, 全部 `[clean]` + EMIT 对拍验证）：
+
+| max_memory | max_spill | RSS_peak | EPS | EMIT | 说明 |
+|---|---|---|---|---|---|
+| 2GB/片(旧) | 8GB/片(旧) | 28.3GB | 5.19M | 29,370,378 | 语义错误: 实际 20GB 驻留 + 80GB 磁盘 |
+| 2GB 规则 | 8GB 规则 | 25.9GB | 9.59M | **24,865,600** | 内存+落盘(2+8=10) < 状态 28GB → 拒收丢 451 万 |
+| 10GB 规则 | 12GB 规则 | 23.2GB | 2.08M | **24,865,599** | 10+12=22 < 28GB → 仍拒收丢 451 万 |
+| **10GB 规则** | **20GB 规则** | **22.4GB** | 1.38M | **29,370,378** | 10+20=30 > 28GB ✓ 正确; RSS 22.4GB（close 峰值）, 接近 20GB 目标 |
+
+**关键认知**：
+1. **状态总量才是分母**：100M q18 全量 2937 万键 × ~960B = **28.2GB**（不是
+   丢键后测的 19.5GB 假象）。内存+落盘预算之和必须 ≥ 状态总量, 否则拒收丢键
+   ——每次降低预算都要用 EMIT 对拍验证（bench `[clean]` 不可信）
+2. **EPS 与 RSS 的权衡**：spill 每写 1GB ≈ 背压。20GB 落盘 → EPS 1.38M（vs
+   无 spill 12.6M, -89%）; 要 EPS 高就得加大内存驻留（RSS 涨）。用户需按
+   「RSS ≤ 20GB 优先」或「EPS 优先」定配置取向
+3. **RSS 22.4GB 峰值出现在 close 期**（读回 18GB 分批 + 输出 2937 万 alert 同时
+   驻留）——稳态期 RSS ≈ 状态 10GB + 固定开销 ~8.8GB ≈ 18.8GB 已达标
 
 ## 14. 风险与缓解
 

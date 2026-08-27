@@ -532,9 +532,16 @@ pub struct StatsWindowState {
     /// 状态内存上限（字节; None = 不设防）。由规则 `limits.max_memory` 注入
     /// （spawn 层）。**超限后拒绝新建桶**（已有桶继续累积, 内存有界）——语义上
     /// 是「新键丢失」的优雅降级, 有日志 + 计数可观测, 不是静默膨胀到 OOM。
+    /// **规则级全局语义**（2026-08-27）：同规则全部分片共享一个 `mem_used`
+    /// 计数器——`max_memory` 是用户配置的规则总驻留上限（分片数是引擎内部
+    /// 细节, 用户不可见）。
     limit_bytes: Option<u64>,
+    /// 共享已用状态内存计数器（跨分片; None = 未配置共享 → 用本地
+    /// `estimated_bytes`, 测试/单片退化）。检查/驱逐/记账全部走它。
+    mem_used_shared: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// 估算的在用状态内存（桶级预算模型: 新桶固定 allowance, 含 top/last 条目
-    /// 预算——保守上界, 偏安全方向）。窗口 close 时清零。
+    /// 预算——保守上界, 偏安全方向）。窗口 close 时清零。**本片账本**——
+    /// 共享模式下与共享计数同步增减, 诊断/close 扣减用。
     estimated_bytes: u64,
     /// 累计超限拒收的新桶数（跨窗口累计, 供指标/告警）。
     over_limit_new_buckets: u64,
@@ -586,6 +593,7 @@ impl StatsWindowState {
             last_event_nanos: 0,
             event_count: 0,
             limit_bytes: None,
+            mem_used_shared: None,
             estimated_bytes: 0,
             over_limit_new_buckets: 0,
             limit_warned: false,
@@ -607,10 +615,46 @@ impl StatsWindowState {
         }
     }
 
-    /// 注入状态内存上限（字节; None = 不设防）。
+    /// 注入状态内存上限（字节; None = 不设防）。未注入共享计数（测试/直接
+    /// 调用）→ 本片独立预算（共享语义退化为单片, 与旧行为一致）。
     pub fn set_memory_limit(&mut self, rule_name: &str, bytes: Option<usize>) {
+        self.set_memory_limit_shared(rule_name, bytes, None);
+    }
+
+    /// 注入状态内存上限（规则级共享版）：`mem_used_shared` = 同规则全部分片
+    /// 共用一个内存占用计数——`max_memory` 是规则总驻留上限, 分片数是引擎
+    /// 内部细节（spawn 层规则级创建, 分片 clone 注入）。
+    pub fn set_memory_limit_shared(
+        &mut self,
+        rule_name: &str,
+        bytes: Option<usize>,
+        mem_used_shared: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    ) {
         self.rule_name = rule_name.to_string();
         self.limit_bytes = bytes.map(|b| b as u64);
+        self.mem_used_shared = mem_used_shared;
+    }
+
+    /// 已用状态内存（检查口径）：共享计数读值（规则级）或本片估算（未共享）。
+    fn mem_used_bytes(&self) -> u64 {
+        self.mem_used_shared
+            .as_ref()
+            .map(|u| u.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(self.estimated_bytes)
+    }
+
+    /// 已用状态内存入账（共享计数同步; 未共享时只走本地 `estimated_bytes`）。
+    fn mem_add(&self, n: u64) {
+        if let Some(u) = &self.mem_used_shared {
+            u.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 已用状态内存出账（共享计数同步; 未共享时只走本地）。
+    fn mem_sub(&self, n: u64) {
+        if let Some(u) = &self.mem_used_shared {
+            u.fetch_sub(n, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// 当前估算的在用状态内存（桶级预算）。
@@ -640,7 +684,15 @@ impl StatsWindowState {
                 }
             }
         }
-        self.estimated_bytes = self.buckets.len() as u64 * allowance + distinct_bytes;
+        let new = self.buckets.len() as u64 * allowance + distinct_bytes;
+        // 共享计数同步差值（本片账本刷新 → 共享计数跟随）。
+        let old = self.estimated_bytes;
+        if new >= old {
+            self.mem_add(new - old);
+        } else {
+            self.mem_sub(old - new);
+        }
+        self.estimated_bytes = new;
     }
 
     /// 累计因超限被拒收的新桶数。
@@ -701,13 +753,14 @@ impl StatsWindowState {
     fn account_new_bucket(&mut self, plan: &StatsPlan) -> bool {
         let allowance = Self::bucket_allowance(plan);
         if let Some(limit) = self.limit_bytes
-            && self.estimated_bytes + allowance > limit
+            && self.mem_used_bytes() + allowance > limit
         {
             // spill 启用且未失败: 先驱逐最老键腾空间（批量, 目标降到上限 90%）。
             if self.spill.is_some() && !self.spill_failed {
                 self.evict_to_spill(plan);
-                if self.estimated_bytes + allowance <= limit {
+                if self.mem_used_bytes() + allowance <= limit {
                     self.estimated_bytes += allowance;
+                    self.mem_add(allowance);
                     return true;
                 }
                 // 落盘满/写失败 → 落到拒收兜底（下面）
@@ -718,7 +771,7 @@ impl StatsWindowState {
                 log::warn!(
                     "stats 状态内存超限（规则 {}, 估算 {}B / 上限 {}B, spill {}{}）——拒绝新建键桶, 已有桶继续累积; 累计拒收 {} 行（新桶尝试）",
                     self.rule_name,
-                    self.estimated_bytes,
+                    self.mem_used_bytes(),
                     limit,
                     if self.spill.is_some() {
                         "已满/失败"
@@ -734,6 +787,7 @@ impl StatsWindowState {
             return false;
         }
         self.estimated_bytes += allowance;
+        self.mem_add(allowance);
         true
     }
 
@@ -866,7 +920,7 @@ impl StatsWindowState {
         let mut scanned = 0usize;
         let mut scan_ns = 0u64;
         let mut clone_ns = 0u64;
-        while self.estimated_bytes.saturating_sub(pending) > target && scanned < max_scan {
+        while self.mem_used_bytes().saturating_sub(pending) > target && scanned < max_scan {
             let s0 = std::time::Instant::now();
             let Some(h) = self.clock.pop_front() else {
                 break;
@@ -925,11 +979,12 @@ impl StatsWindowState {
             return;
         }
         // 落盘成功 → 从桶表移除 + 记账（内存/spill 不相交不变量成立；落盘字节
-        // 记入规则级共享计数）。
+        // 记入规则级共享计数, 内存占用从共享计数扣减）。
         for h in &batch_hashes {
             if let Some(chain) = self.buckets.remove(h) {
                 let n = chain.len() as u64;
                 self.estimated_bytes = self.estimated_bytes.saturating_sub(allowance * n);
+                self.mem_sub(allowance * n);
                 if let Some(u) = &self.spill_used {
                     u.fetch_add(allowance * n, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -1136,8 +1191,9 @@ impl StatsWindowState {
             );
         }
         self.estimated_bytes += Self::bucket_allowance(plan);
+        self.mem_add(Self::bucket_allowance(plan));
         if let Some(limit) = self.limit_bytes
-            && self.estimated_bytes > limit
+            && self.mem_used_bytes() > limit
         {
             self.evict_to_spill(plan);
         }
@@ -1224,6 +1280,9 @@ impl StatsWindowState {
             .flat_map(|chain| chain.into_iter().map(|b| (b.scope_key, b.accs)))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
+        // 本片账本清零 → 共享计数同步扣减（本片净占用 == estimated_bytes——
+        // 每次增减都已同步; 扣完预算随窗口释放可复用）。
+        self.mem_sub(self.estimated_bytes);
         self.estimated_bytes = 0;
         self.limit_warned = false;
         out
@@ -1259,6 +1318,10 @@ pub struct StatsExecutor {
         Option<usize>,
         Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     )>,
+    /// 规则级共享内存占用计数（`max_memory` = 规则总驻留上限, 分片数是引擎
+    /// 内部细节; None = 未配置共享 → 本片独立预算）。reset_window 用它恢复
+    /// 新窗口的共享计数（与 `spill_redb` 同模式, 跨窗口保留）。
+    mem_used_shared: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl StatsExecutor {
@@ -1360,6 +1423,7 @@ impl StatsExecutor {
             measure_field_idx,
             row_field_layout: None,
             spill_redb: None,
+            mem_used_shared: None,
         }
     }
 
@@ -1727,6 +1791,9 @@ impl StatsExecutor {
         if let Some(spill) = &mut self.window.spill {
             spill.cleanup();
         }
+        // 释放本窗占用的共享内存计数（流式 close 分批取桶但账本未递减;
+        // take_buckets 路径已扣, 此处为 0 幂等）。预算随窗口释放可复用。
+        self.window.mem_sub(self.window.estimated_bytes);
         let mut buckets = EngineHashMap::default();
         if self.plan.keys.is_empty() {
             StatsWindowState::seed_empty_bucket(&mut buckets, &self.plan);
@@ -1741,10 +1808,14 @@ impl StatsExecutor {
         let spill_write_ns = self.window.spill_write_ns;
         let spill_evict_calls = self.window.spill_evict_calls;
         self.window = StatsWindowState::new(buckets);
-        // 保留限额配置 + 拒收/抖动计数跨窗口（guard 持续生效; 计数供指标/告警）。
-        // spill 不跨窗口（store 已 cleanup 丢弃, 文件删除）。
-        self.window
-            .set_memory_limit(&rule_name, limit.map(|b| b as usize));
+        // 保留限额配置 + 规则级共享内存计数（executor 字段持有）+ 拒收/抖动
+        // 计数跨窗口（guard 持续生效; 计数供指标/告警）。spill 不跨窗口（store
+        // 已 cleanup 丢弃, 文件删除; 共享落盘计数由 ensure_spill_store 重新注入）。
+        self.window.set_memory_limit_shared(
+            &rule_name,
+            limit.map(|b| b as usize),
+            self.mem_used_shared.clone(),
+        );
         self.window.over_limit_new_buckets = over_limit;
         self.window.spill_evictions = spill_evictions;
         self.window.spill_readbacks = spill_readbacks;
@@ -1755,8 +1826,22 @@ impl StatsExecutor {
     }
 
     /// 注入状态内存上限（字节; None = 不设防）——超限拒收新键桶, 已有桶继续。
+    /// 未注入共享计数 → 本片独立预算（测试/单片, 与旧行为一致）。
     pub fn set_memory_limit(&mut self, rule_name: &str, bytes: Option<usize>) {
-        self.window.set_memory_limit(rule_name, bytes);
+        self.set_memory_limit_shared(rule_name, bytes, None);
+    }
+
+    /// 注入状态内存上限（规则级共享版）：`max_memory` = 规则总驻留上限——同
+    /// 规则全部分片共用一个内存占用计数（spawn 层规则级创建, 分片 clone 注入）。
+    pub fn set_memory_limit_shared(
+        &mut self,
+        rule_name: &str,
+        bytes: Option<usize>,
+        mem_used_shared: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    ) {
+        self.mem_used_shared = mem_used_shared;
+        self.window
+            .set_memory_limit_shared(rule_name, bytes, self.mem_used_shared.clone());
     }
 
     /// 注入状态外溢存储（M3; 窗口开始时调用; None = 关闭 spill）。

@@ -672,3 +672,65 @@ fn spill_shared_counter_rule_budget() {
         "全部 close 后共享计数归零"
     );
 }
+
+/// 规则级共享内存预算（两个 executor 模拟同规则两个分片）：
+/// 1. `max_memory` = 规则**总**驻留上限——A 用满后 B 的首个新键被拒收
+///    （旧语义 2GB/片 × 10 = 20GB, 用户配 2GB 实际给到 20GB, 语义错误）
+/// 2. spill 驱逐腾内存 → 共享内存计数回落（内存有界不破总量）
+/// 3. 各自 close → 释放自己的份额 → 预算归零, 后续可复用
+#[test]
+fn mem_shared_counter_rule_budget() {
+    use std::sync::atomic::Ordering;
+    let plan = keyed_plan(vec![field_key("b", "bidder")], vec![count_measure("n")]);
+    let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let limit = (COUNT_ALLOWANCE * 3) as usize; // 规则总内存 = 3 桶
+
+    let mk = |with_spill: bool| -> StatsExecutor {
+        let mut exec = StatsExecutor::new(plan.clone());
+        exec.set_memory_limit_shared(
+            "mem_shared",
+            Some(limit),
+            Some(std::sync::Arc::clone(&shared)),
+        );
+        if with_spill {
+            exec.set_spill(Some(Box::new(MemSpillStore::new())), None, None);
+        }
+        exec
+    };
+
+    // A: 有 spill, feed 6 键 → 内存 3 桶 + spill 3 键（驱逐回落共享计数）
+    let mut a = mk(true);
+    for k in 1..=6 {
+        a.process_rows(&[bid_row(k, 1.0)], extract);
+    }
+    assert_eq!(a.window.over_limit_new_buckets(), 0, "A 驱逐不拒收");
+    assert_eq!(a.window.spill_index.len(), 3, "A spill 3 键");
+    assert_eq!(
+        shared.load(Ordering::SeqCst),
+        COUNT_ALLOWANCE * 3,
+        "A 内存占满 3 桶（驱逐回落再建桶, 不破总量）"
+    );
+
+    // B: 无 spill, 首个键尝试建桶 → 共享已满（A 占 3 桶）→ 拒收（规则级语义）
+    let mut b = mk(false);
+    b.process_rows(&[bid_row(7, 1.0)], extract);
+    assert_eq!(
+        b.window.over_limit_new_buckets(),
+        1,
+        "B 首个键被共享总量拒收（规则内存满, 不是每片配额）"
+    );
+
+    // A close → 释放自身份额 → 共享归零 → B 可再建
+    let a_out = a.close_window_by_bucket_rows();
+    assert_eq!(a_out.len(), 6, "A 输出 6 键（内存 3 + spill 3）");
+    assert_eq!(shared.load(Ordering::SeqCst), 0, "A close 释放全部份额");
+    b.process_rows(&[bid_row(7, 1.0)], extract);
+    assert_eq!(
+        b.window.over_limit_new_buckets(),
+        1,
+        "释放后 B 键 7 建桶（拒收不增）"
+    );
+    let b_out = b.close_window_by_bucket_rows();
+    assert_eq!(b_out.len(), 1, "B 输出 1 键");
+    assert_eq!(shared.load(Ordering::SeqCst), 0, "B close 后共享归零");
+}
